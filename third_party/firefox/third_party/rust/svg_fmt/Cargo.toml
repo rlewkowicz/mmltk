@@ -1,0 +1,13 @@
+
+[package]
+edition = "2018"
+name = "svg_fmt"
+version = "0.4.1"
+authors = ["Nicolas Silva <nical@fastmail.com>"]
+description = "Very simple debugging utilities to dump shapes in SVG format."
+documentation = "https://docs.rs/svg_fmt/"
+keywords = ["2d", "graphics", "svg"]
+license = "MIT/Apache-2.0"
+repository = "https://github.com/nical/rust_debug"
+
+[dependencies]

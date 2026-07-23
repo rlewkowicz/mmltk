@@ -1,0 +1,282 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_temporal_Calendar_h
+#define builtin_temporal_Calendar_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+
+#include <stdint.h>
+#include <string_view>
+
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "vm/NativeObject.h"
+
+class JS_PUBLIC_API JSTracer;
+
+namespace js {
+struct ClassSpec;
+}  
+
+namespace js::temporal {
+
+enum class CalendarId : int32_t {
+  ISO8601,
+
+  Buddhist,
+
+  Chinese,
+
+  Coptic,
+
+  Dangi,
+
+  Ethiopian,
+
+  EthiopianAmeteAlem,
+
+  Gregorian,
+
+  Hebrew,
+
+  Indian,
+
+  IslamicCivil,
+  IslamicTabular,
+  IslamicUmmAlQura,
+
+  Japanese,
+
+  Persian,
+
+  ROC,
+};
+
+inline constexpr auto availableCalendars = {
+    CalendarId::ISO8601,
+    CalendarId::Buddhist,
+    CalendarId::Chinese,
+    CalendarId::Coptic,
+    CalendarId::Dangi,
+    CalendarId::Ethiopian,
+    CalendarId::EthiopianAmeteAlem,
+    CalendarId::Gregorian,
+    CalendarId::Hebrew,
+    CalendarId::Indian,
+    CalendarId::IslamicCivil,
+    CalendarId::IslamicTabular,
+    CalendarId::IslamicUmmAlQura,
+    CalendarId::Japanese,
+    CalendarId::Persian,
+    CalendarId::ROC,
+};
+
+constexpr auto& AvailableCalendars() { return availableCalendars; }
+
+class CalendarObject : public NativeObject {
+ public:
+  static const JSClass class_;
+  static const JSClass& protoClass_;
+
+  static constexpr uint32_t IDENTIFIER_SLOT = 0;
+  static constexpr uint32_t SLOT_COUNT = 1;
+
+  CalendarId identifier() const {
+    return static_cast<CalendarId>(getFixedSlot(IDENTIFIER_SLOT).toInt32());
+  }
+
+ private:
+  static const ClassSpec classSpec_;
+};
+
+class MOZ_STACK_CLASS CalendarValue final {
+  JS::Value value_;
+
+ public:
+  CalendarValue() = default;
+
+  explicit CalendarValue(const JS::Value& value) : value_(value) {
+    MOZ_ASSERT(value.isInt32());
+  }
+
+  explicit CalendarValue(CalendarId calendarId)
+      : value_(JS::Int32Value(static_cast<int32_t>(calendarId))) {}
+
+  explicit operator bool() const { return !value_.isUndefined(); }
+
+  JS::Value toSlotValue() const { return value_; }
+
+  CalendarId identifier() const {
+    return static_cast<CalendarId>(value_.toInt32());
+  }
+
+  void trace(JSTracer* trc);
+
+  JS::Value* valueDoNotUse() { return &value_; }
+  JS::Value const* valueDoNotUse() const { return &value_; }
+};
+
+struct DateDuration;
+struct ISODate;
+struct ISODateTime;
+class PlainDate;
+class PlainMonthDayObject;
+class PlainMonthDay;
+class PlainYearMonthObject;
+class PlainYearMonth;
+class CalendarFields;
+enum class TemporalOverflow;
+enum class TemporalUnit;
+
+int32_t ISODaysInMonth(int32_t year, int32_t month);
+
+int32_t MakeDay(const ISODate& date);
+
+int64_t MakeDate(const ISODateTime& dateTime);
+
+std::string_view CalendarIdentifier(CalendarId calendarId);
+
+inline std::string_view CalendarIdentifier(const CalendarValue& calendar) {
+  return CalendarIdentifier(calendar.identifier());
+}
+
+bool CanonicalizeCalendar(JSContext* cx, JS::Handle<JSString*> id,
+                          JS::MutableHandle<CalendarValue> result);
+
+bool ToTemporalCalendar(JSContext* cx,
+                        JS::Handle<JS::Value> temporalCalendarLike,
+                        JS::MutableHandle<CalendarValue> result);
+
+bool GetTemporalCalendarWithISODefault(JSContext* cx,
+                                       JS::Handle<JSObject*> item,
+                                       JS::MutableHandle<CalendarValue> result);
+
+bool CalendarDateAdd(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                     const ISODate& isoDate, const DateDuration& duration,
+                     TemporalOverflow overflow, ISODate* result);
+
+bool CalendarDateUntil(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                       const ISODate& one, const ISODate& two,
+                       TemporalUnit largestUnit, DateDuration* result);
+
+bool CalendarEra(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                 const ISODate& date, JS::MutableHandle<JS::Value> result);
+
+bool CalendarEraYear(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                     const ISODate& date, JS::MutableHandle<JS::Value> result);
+bool CalendarYear(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                  const ISODate& date, JS::MutableHandle<JS::Value> result);
+
+bool CalendarMonth(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                   const ISODate& date, JS::MutableHandle<JS::Value> result);
+
+bool CalendarMonthCode(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                       const ISODate& date,
+                       JS::MutableHandle<JS::Value> result);
+
+bool CalendarDay(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                 const ISODate& date, JS::MutableHandle<JS::Value> result);
+
+bool CalendarDayOfWeek(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                       const ISODate& date,
+                       JS::MutableHandle<JS::Value> result);
+
+bool CalendarDayOfYear(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                       const ISODate& date,
+                       JS::MutableHandle<JS::Value> result);
+
+bool CalendarWeekOfYear(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                        const ISODate& date,
+                        JS::MutableHandle<JS::Value> result);
+
+bool CalendarYearOfWeek(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                        const ISODate& date,
+                        JS::MutableHandle<JS::Value> result);
+
+bool CalendarDaysInWeek(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                        const ISODate& date,
+                        JS::MutableHandle<JS::Value> result);
+
+bool CalendarDaysInMonth(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                         const ISODate& date,
+                         JS::MutableHandle<JS::Value> result);
+
+bool CalendarDaysInYear(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                        const ISODate& date,
+                        JS::MutableHandle<JS::Value> result);
+
+bool CalendarMonthsInYear(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                          const ISODate& date,
+                          JS::MutableHandle<JS::Value> result);
+
+bool CalendarInLeapYear(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                        const ISODate& date,
+                        JS::MutableHandle<JS::Value> result);
+
+bool CalendarDateFromFields(JSContext* cx, JS::Handle<CalendarValue> calendar,
+                            JS::Handle<CalendarFields> fields,
+                            TemporalOverflow overflow,
+                            MutableHandle<PlainDate> result);
+
+bool CalendarYearMonthFromFields(JSContext* cx,
+                                 JS::Handle<CalendarValue> calendar,
+                                 JS::Handle<CalendarFields> fields,
+                                 TemporalOverflow overflow,
+                                 JS::MutableHandle<PlainYearMonth> result);
+
+bool CalendarMonthDayFromFields(JSContext* cx,
+                                JS::Handle<CalendarValue> calendar,
+                                JS::Handle<CalendarFields> fields,
+                                TemporalOverflow overflow,
+                                JS::MutableHandle<PlainMonthDay> result);
+
+inline bool CalendarEquals(const CalendarValue& one, const CalendarValue& two) {
+  return one.identifier() == two.identifier();
+}
+
+bool WrapCalendarValue(JSContext* cx, JS::MutableHandle<JS::Value> calendar);
+
+} 
+
+namespace js {
+
+template <typename Wrapper>
+class WrappedPtrOperations<temporal::CalendarValue, Wrapper> {
+  const auto& container() const {
+    return static_cast<const Wrapper*>(this)->get();
+  }
+
+ public:
+  explicit operator bool() const { return bool(container()); }
+
+  JS::Handle<JS::Value> toSlotValue() const {
+    return JS::Handle<JS::Value>::fromMarkedLocation(
+        container().valueDoNotUse());
+  }
+
+  temporal::CalendarId identifier() const { return container().identifier(); }
+};
+
+template <typename Wrapper>
+class MutableWrappedPtrOperations<temporal::CalendarValue, Wrapper>
+    : public WrappedPtrOperations<temporal::CalendarValue, Wrapper> {
+  auto& container() { return static_cast<Wrapper*>(this)->get(); }
+
+  JS::MutableHandle<JS::Value> toMutableValue() {
+    return JS::MutableHandle<JS::Value>::fromMarkedLocation(
+        container().valueDoNotUse());
+  }
+
+ public:
+  bool wrap(JSContext* cx) {
+    return temporal::WrapCalendarValue(cx, toMutableValue());
+  }
+};
+
+} 
+
+#endif /* builtin_temporal_Calendar_h */

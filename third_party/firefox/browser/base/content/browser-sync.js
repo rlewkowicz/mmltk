@@ -1,0 +1,2893 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const {
+  FX_MONITOR_OAUTH_CLIENT_ID,
+  FX_RELAY_OAUTH_CLIENT_ID,
+  SCOPE_APP_SYNC,
+  VPN_OAUTH_CLIENT_ID,
+} = ChromeUtils.importESModule(
+  "resource://gre/modules/FxAccountsCommon.sys.mjs"
+);
+
+const { UIState } = ChromeUtils.importESModule(
+  "resource://services-sync/UIState.sys.mjs"
+);
+
+ChromeUtils.defineESModuleGetters(this, {
+  ASRouter: "resource:///modules/asrouter/ASRouter.sys.mjs",
+  EnsureFxAccountsWebChannel:
+    "resource://gre/modules/FxAccountsWebChannel.sys.mjs",
+
+  ExperimentAPI: "resource://nimbus/ExperimentAPI.sys.mjs",
+  FxAccounts: "resource://gre/modules/FxAccounts.sys.mjs",
+  MenuMessage: "resource:///modules/asrouter/MenuMessage.sys.mjs",
+  PrivateBrowsingUtils: "resource://gre/modules/PrivateBrowsingUtils.sys.mjs",
+  SyncedTabs: "resource://services-sync/SyncedTabs.sys.mjs",
+  SyncedTabsManagement: "resource://services-sync/SyncedTabs.sys.mjs",
+  Weave: "resource://services-sync/main.sys.mjs",
+});
+
+var { DEVICE_TYPE_MOBILE, DEVICE_TYPE_TABLET } = ChromeUtils.importESModule(
+  "resource://services-sync/constants.sys.mjs"
+);
+
+const MIN_STATUS_ANIMATION_DURATION = 1600;
+
+this.SyncedTabsPanelList = class SyncedTabsPanelList {
+  static sRemoteTabsDeckIndices = {
+    DECKINDEX_TABS: 0,
+    DECKINDEX_FETCHING: 1,
+    DECKINDEX_TABSDISABLED: 2,
+    DECKINDEX_NOCLIENTS: 3,
+  };
+
+  static sRemoteTabsPerPage = 25;
+  static sRemoteTabsNextPageMinTabs = 5;
+
+  constructor(panelview, deck, tabsList, separator) {
+    this.QueryInterface = ChromeUtils.generateQI([
+      "nsIObserver",
+      "nsISupportsWeakReference",
+    ]);
+
+    Services.obs.addObserver(this, SyncedTabs.TOPIC_TABS_CHANGED, true);
+    this.deck = deck;
+    this.tabsList = tabsList;
+    this.separator = separator;
+    this._showSyncedTabsPromise = Promise.resolve();
+
+    this.createSyncedTabs();
+  }
+
+  observe(subject, topic) {
+    if (topic == SyncedTabs.TOPIC_TABS_CHANGED) {
+      this._showSyncedTabs();
+    }
+  }
+
+  createSyncedTabs() {
+    if (SyncedTabs.isConfiguredToSyncTabs) {
+      if (SyncedTabs.hasSyncedThisSession) {
+        this.deck.selectedIndex =
+          SyncedTabsPanelList.sRemoteTabsDeckIndices.DECKINDEX_TABS;
+      } else {
+        this.deck.selectedIndex =
+          SyncedTabsPanelList.sRemoteTabsDeckIndices.DECKINDEX_FETCHING;
+      }
+      SyncedTabs.syncTabs().catch(ex => {
+        console.error(ex);
+      });
+      this.deck.toggleAttribute("syncingtabs", true);
+      this._showSyncedTabs();
+      if (this.separator) {
+        this.separator.hidden = false;
+      }
+    } else {
+      this.deck.selectedIndex =
+        SyncedTabsPanelList.sRemoteTabsDeckIndices.DECKINDEX_TABSDISABLED;
+      this.deck.toggleAttribute("syncingtabs", false);
+      if (this.separator) {
+        this.separator.hidden = true;
+      }
+    }
+  }
+
+  _showSyncedTabs(paginationInfo) {
+    this._showSyncedTabsPromise = this._showSyncedTabsPromise.then(
+      () => {
+        return this.__showSyncedTabs(paginationInfo);
+      },
+      e => {
+        console.error(e);
+      }
+    );
+  }
+
+  __showSyncedTabs(paginationInfo) {
+    if (!this.tabsList) {
+      return undefined;
+    }
+    return SyncedTabs.getTabClients()
+      .then(clients => {
+        let noTabs = !UIState.get().syncEnabled || !clients.length;
+        this.deck.toggleAttribute("syncingtabs", !noTabs);
+        if (this.separator) {
+          this.separator.hidden = noTabs;
+        }
+
+        if (!this.tabsList) {
+          return;
+        }
+        if (clients.length === 0 && !SyncedTabs.hasSyncedThisSession) {
+          return;
+        }
+
+        if (clients.length === 0) {
+          this.deck.selectedIndex =
+            SyncedTabsPanelList.sRemoteTabsDeckIndices.DECKINDEX_NOCLIENTS;
+          return;
+        }
+        this.deck.selectedIndex =
+          SyncedTabsPanelList.sRemoteTabsDeckIndices.DECKINDEX_TABS;
+        this._clearSyncedTabList();
+        SyncedTabs.sortTabClientsByLastUsed(clients);
+        let fragment = document.createDocumentFragment();
+
+        let clientNumber = 0;
+        for (let client of clients) {
+          if (fragment.lastElementChild) {
+            let separator = document.createXULElement("toolbarseparator");
+            fragment.appendChild(separator);
+          }
+          let labelId = `synced-tabs-client-${clientNumber++}`;
+          let container = document.createXULElement("vbox");
+          container.classList.add("PanelUI-remotetabs-clientcontainer");
+          container.setAttribute("role", "group");
+          container.setAttribute("aria-labelledby", labelId);
+          let clientPaginationInfo =
+            paginationInfo && paginationInfo.clientId == client.id
+              ? paginationInfo
+              : { clientId: client.id };
+          this._appendSyncClient(
+            client,
+            container,
+            labelId,
+            clientPaginationInfo
+          );
+          fragment.appendChild(container);
+        }
+        this.tabsList.appendChild(fragment);
+      })
+      .catch(err => {
+        console.error(err);
+      })
+      .then(() => {
+        Services.obs.notifyObservers(
+          null,
+          "synced-tabs-menu:test:tabs-updated"
+        );
+      });
+  }
+
+  _clearSyncedTabList() {
+    let list = this.tabsList;
+    while (list.lastChild) {
+      list.lastChild.remove();
+    }
+  }
+
+  _createNoSyncedTabsElement(messageAttr, appendTo = null) {
+    if (!appendTo) {
+      appendTo = this.tabsList;
+    }
+
+    let messageLabel = document.createXULElement("label");
+    document.l10n.setAttributes(
+      messageLabel,
+      this.tabsList.getAttribute(messageAttr)
+    );
+    appendTo.appendChild(messageLabel);
+    return messageLabel;
+  }
+
+  _appendSyncClient(client, container, labelId, paginationInfo) {
+    let { maxTabs = SyncedTabsPanelList.sRemoteTabsPerPage } = paginationInfo;
+    let clientItem = document.createXULElement("label");
+    clientItem.setAttribute("id", labelId);
+    clientItem.className = "subview-subheader";
+    clientItem.setAttribute("itemtype", "client");
+    clientItem.setAttribute(
+      "tooltiptext",
+      gSync.fluentStrings.formatValueSync("appmenu-fxa-last-sync", {
+        time: gSync.formatLastSyncDate(new Date(client.lastModified)),
+      })
+    );
+    clientItem.textContent = client.name;
+
+    container.appendChild(clientItem);
+
+    if (!client.tabs.length) {
+      let label = this._createNoSyncedTabsElement(
+        "notabsforclientlabel",
+        container
+      );
+      label.setAttribute("class", "PanelUI-remotetabs-notabsforclient-label");
+    } else {
+      let device =
+        fxAccounts.device.recentDeviceList &&
+        fxAccounts.device.recentDeviceList.find(
+          d =>
+            d.id === Weave.Service.clientsEngine.getClientFxaDeviceId(client.id)
+        );
+      let remoteTabCloseAvailable =
+        device && fxAccounts.commands.closeTab.isDeviceCompatible(device);
+
+      let tabs = client.tabs.filter(t => !t.inactive);
+      let hasInactive = tabs.length != client.tabs.length;
+
+      if (hasInactive) {
+        container.append(this._createShowInactiveTabsElement(client, device));
+      }
+      let hasNextPage = tabs.length > maxTabs;
+      let nextPageIsLastPage =
+        hasNextPage &&
+        maxTabs + SyncedTabsPanelList.sRemoteTabsPerPage >= tabs.length;
+      if (nextPageIsLastPage) {
+        maxTabs = Math.min(
+          tabs.length - SyncedTabsPanelList.sRemoteTabsNextPageMinTabs,
+          maxTabs
+        );
+      }
+      if (hasNextPage) {
+        tabs = tabs.slice(0, maxTabs);
+      }
+      for (let [index, tab] of tabs.entries()) {
+        let tabEnt = this._createSyncedTabElement(
+          tab,
+          index,
+          device,
+          remoteTabCloseAvailable
+        );
+        container.appendChild(tabEnt);
+      }
+      if (hasNextPage) {
+        let showAllEnt = this._createShowMoreSyncedTabsElement(paginationInfo);
+        container.appendChild(showAllEnt);
+      }
+    }
+  }
+
+  _createSyncedTabElement(tabInfo, index, device, canCloseTabs) {
+    let tabContainer = document.createXULElement("hbox");
+    tabContainer.setAttribute(
+      "class",
+      "PanelUI-tabitem-container all-tabs-item"
+    );
+
+    let item = document.createXULElement("toolbarbutton");
+    let tooltipText = (tabInfo.title ? tabInfo.title + "\n" : "") + tabInfo.url;
+    item.setAttribute("itemtype", "tab");
+    item.classList.add(
+      "all-tabs-button",
+      "subviewbutton",
+      "subviewbutton-iconic"
+    );
+    item.setAttribute("targetURI", tabInfo.url);
+    item.setAttribute(
+      "label",
+      tabInfo.title != "" ? tabInfo.title : tabInfo.url
+    );
+    if (tabInfo.icon) {
+      item.setAttribute("image", tabInfo.icon);
+    }
+    item.setAttribute("tooltiptext", tooltipText);
+    item.addEventListener("click", e => {
+      let object = window.gSync._getEntryPointForElement(e.currentTarget);
+      SyncedTabs.recordSyncedTabsTelemetry(object, "click", {
+        tab_pos: index.toString(),
+      });
+      document.defaultView.openUILink(tabInfo.url, e, {
+        triggeringPrincipal: Services.scriptSecurityManager.createNullPrincipal(
+          {}
+        ),
+      });
+      if (BrowserUtils.whereToOpenLink(e) != "current") {
+        e.preventDefault();
+        e.stopPropagation();
+      } else {
+        CustomizableUI.hidePanelForNode(item);
+      }
+    });
+    tabContainer.appendChild(item);
+    if (canCloseTabs) {
+      let closeBtn = this._createCloseTabElement(tabInfo.url, device);
+      closeBtn.tab = item;
+      tabContainer.appendChild(closeBtn);
+      let undoBtn = this._createUndoCloseTabElement(tabInfo.url, device);
+      undoBtn.tab = item;
+      tabContainer.appendChild(undoBtn);
+    }
+    return tabContainer;
+  }
+
+  _createShowMoreSyncedTabsElement(paginationInfo) {
+    let showMoreItem = document.createXULElement("toolbarbutton");
+    showMoreItem.setAttribute("itemtype", "showmorebutton");
+    showMoreItem.setAttribute("closemenu", "none");
+    showMoreItem.classList.add("subviewbutton", "subviewbutton-nav-down");
+    document.l10n.setAttributes(showMoreItem, "appmenu-remote-tabs-showmore");
+
+    paginationInfo.maxTabs = Infinity;
+    showMoreItem.addEventListener("click", e => {
+      e.preventDefault();
+      e.stopPropagation();
+      this._showSyncedTabs(paginationInfo);
+    });
+    return showMoreItem;
+  }
+
+  _createShowInactiveTabsElement(client, device) {
+    let showItem = document.createXULElement("toolbarbutton");
+    showItem.setAttribute("itemtype", "showinactivebutton");
+    showItem.setAttribute("closemenu", "none");
+    showItem.classList.add("subviewbutton", "subviewbutton-nav");
+    document.l10n.setAttributes(
+      showItem,
+      "appmenu-remote-tabs-show-inactive-tabs"
+    );
+
+    let canClose =
+      device && fxAccounts.commands.closeTab.isDeviceCompatible(device);
+
+    showItem.addEventListener("click", e => {
+      let node = PanelMultiView.getViewNode(
+        document,
+        "PanelUI-fxa-menu-inactive-tabs"
+      );
+
+      let label = node.querySelector("label[itemtype='client']");
+      label.textContent = client.name;
+
+      let container = node.querySelector(".panel-subview-body");
+      container.replaceChildren(
+        ...client.tabs
+          .filter(t => t.inactive)
+          .map((tab, index) =>
+            this._createSyncedTabElement(tab, index, device, canClose)
+          )
+      );
+      PanelUI.showSubView("PanelUI-fxa-menu-inactive-tabs", showItem, e);
+    });
+    return showItem;
+  }
+
+  _createCloseTabElement(url, device) {
+    let closeBtn = document.createXULElement("toolbarbutton");
+    closeBtn.classList.add(
+      "remote-tabs-close-button",
+      "all-tabs-close-button",
+      "subviewbutton"
+    );
+    closeBtn.setAttribute("closemenu", "none");
+    closeBtn.setAttribute(
+      "tooltiptext",
+      gSync.fluentStrings.formatValueSync("synced-tabs-context-close-tab", {
+        deviceName: device.name,
+      })
+    );
+    closeBtn.addEventListener("click", e => {
+      e.stopPropagation();
+
+      let tabContainer = closeBtn.parentNode;
+      let tabList = tabContainer.parentNode;
+
+      let undoBtn = tabContainer.querySelector(".remote-tabs-undo-button");
+
+      let prevClose = tabList.querySelector(
+        ".remote-tabs-undo-button:not([hidden])"
+      );
+      if (prevClose) {
+        let prevCloseContainer = prevClose.parentNode;
+        prevCloseContainer.classList.add("tabitem-removed");
+        prevCloseContainer.addEventListener("transitionend", () => {
+          prevCloseContainer.remove();
+        });
+      }
+      closeBtn.hidden = true;
+      undoBtn.hidden = false;
+      if (closeBtn.tab) {
+        closeBtn.tab.disabled = true;
+      }
+      SyncedTabsManagement.enqueueTabToClose(device.id, url);
+    });
+    return closeBtn;
+  }
+
+  _createUndoCloseTabElement(url, device) {
+    let undoBtn = document.createXULElement("toolbarbutton");
+    undoBtn.classList.add("remote-tabs-undo-button", "subviewbutton");
+    undoBtn.setAttribute("closemenu", "none");
+    undoBtn.setAttribute("data-l10n-id", "text-action-undo");
+    undoBtn.hidden = true;
+
+    undoBtn.addEventListener("click", function (e) {
+      e.stopPropagation();
+
+      undoBtn.hidden = true;
+      let closeBtn = undoBtn.parentNode.querySelector(".all-tabs-close-button");
+      closeBtn.hidden = false;
+      if (undoBtn.tab) {
+        undoBtn.tab.disabled = false;
+      }
+
+      SyncedTabsManagement.removePendingTabToClose(device.id, url);
+    });
+    return undoBtn;
+  }
+
+  destroy() {
+    Services.obs.removeObserver(this, SyncedTabs.TOPIC_TABS_CHANGED);
+    this.tabsList = null;
+    this.deck = null;
+    this.separator = null;
+  }
+};
+
+var gSync = {
+  _initialized: false,
+  _isCurrentlySyncing: false,
+  _syncStartTime: 0,
+  _syncAnimationTimer: 0,
+  _obs: ["weave:engine:sync:finish", "quit-application", UIState.ON_UPDATE],
+  _sendTabExposureRecorded: new Set(),
+
+  get log() {
+    if (!this._log) {
+      const { Log } = ChromeUtils.importESModule(
+        "resource://gre/modules/Log.sys.mjs"
+      );
+      let syncLog = Log.repository.getLogger("Sync.Browser");
+      syncLog.manageLevelFromPref("services.sync.log.logger.browser");
+      this._log = syncLog;
+    }
+    return this._log;
+  },
+
+  get fluentStrings() {
+    delete this.fluentStrings;
+    return (this.fluentStrings = new Localization(
+      [
+        "branding/brand.ftl",
+        "browser/accounts.ftl",
+        "browser/appmenu.ftl",
+        "browser/browserContext.ftl",
+        "browser/sync.ftl",
+        "browser/syncedTabs.ftl",
+        "browser/newtab/asrouter.ftl",
+      ],
+      true
+    ));
+  },
+
+  get sendTabConfiguredAndLoading() {
+    const state = UIState.get();
+    return (
+      state.status == UIState.STATUS_SIGNED_IN &&
+      state.syncEnabled &&
+      !fxAccounts.device.recentDeviceList
+    );
+  },
+
+  get isSignedIn() {
+    return UIState.get().status == UIState.STATUS_SIGNED_IN;
+  },
+
+  get isUnverified() {
+    return UIState.get().status == UIState.STATUS_NOT_VERIFIED;
+  },
+
+  get isSignedInWithSyncDisabled() {
+    const state = UIState.get();
+    return state.status == UIState.STATUS_SIGNED_IN && !state.syncEnabled;
+  },
+
+  get hasNoSendTabTargets() {
+    return this.getSendTabTargets().length === 0;
+  },
+
+  shouldHideSendContextMenuItems(enabled) {
+    return !enabled || !this.FXA_ENABLED;
+  },
+
+  getSendTabTargets() {
+    const targets = [];
+    const state = UIState.get();
+    if (
+      state.status != UIState.STATUS_SIGNED_IN ||
+      !state.syncEnabled ||
+      !fxAccounts.device.recentDeviceList
+    ) {
+      return targets;
+    }
+    for (let d of fxAccounts.device.recentDeviceList) {
+      if (d.isCurrentDevice) {
+        continue;
+      }
+
+      if (fxAccounts.commands.sendTab.isDeviceCompatible(d)) {
+        targets.push(d);
+      }
+    }
+    return targets.sort((a, b) => b.lastAccessTime - a.lastAccessTime);
+  },
+
+  hasOnlyMobileSendTabTargets(targets = this.getSendTabTargets()) {
+    return (
+      !targets.length ||
+      targets.every(
+        target =>
+          target.type == DEVICE_TYPE_MOBILE || target.type == DEVICE_TYPE_TABLET
+      )
+    );
+  },
+
+  _definePrefGetters() {
+    XPCOMUtils.defineLazyPreferenceGetter(
+      this,
+      "FXA_ENABLED",
+      "identity.fxaccounts.enabled"
+    );
+    XPCOMUtils.defineLazyPreferenceGetter(
+      this,
+      "FXA_CTA_MENU_ENABLED",
+      "identity.fxaccounts.toolbar.pxiToolbarEnabled"
+    );
+  },
+
+  maybeUpdateUIState() {
+    if (UIState.isReady()) {
+      const state = UIState.get();
+      if (state.status != UIState.STATUS_NOT_CONFIGURED) {
+        this.updateAllUI(state);
+      }
+    }
+  },
+
+  init() {
+    if (this._initialized) {
+      return;
+    }
+
+    this._definePrefGetters();
+
+    if (!this.FXA_ENABLED) {
+      this.onFxaDisabled();
+      return;
+    }
+
+    MozXULElement.insertFTLIfNeeded("browser/sync.ftl");
+    MozXULElement.insertFTLIfNeeded("browser/newtab/asrouter.ftl");
+
+    const appMenuLabel = PanelMultiView.getViewNode(
+      document,
+      "appMenu-fxa-label2"
+    );
+    if (!appMenuLabel) {
+      return;
+    }
+    document.getElementById("sync-setup").hidden = false;
+    PanelMultiView.getViewNode(
+      document,
+      "PanelUI-remotetabs-setupsync"
+    ).hidden = false;
+
+    const appMenuHeaderTitle = PanelMultiView.getViewNode(
+      document,
+      "appMenu-header-title"
+    );
+    const appMenuHeaderDescription = PanelMultiView.getViewNode(
+      document,
+      "appMenu-header-description"
+    );
+    const appMenuHeaderText = PanelMultiView.getViewNode(
+      document,
+      "appMenu-fxa-text"
+    );
+    appMenuHeaderTitle.hidden = true;
+    const novaFxaLabel = PanelMultiView.getViewNode(
+      document,
+      "appMenu-nova-fxa-label"
+    );
+    const [headerDesc, headerText, novaSignIn] =
+      this.fluentStrings.formatValuesSync([
+        "appmenu-fxa-signed-in-label",
+        "appmenu-fxa-sync-and-save-data2",
+        "appmenu-nova-fxa-sign-in",
+      ]);
+    appMenuHeaderDescription.value = headerDesc;
+    appMenuHeaderText.textContent = headerText;
+    if (novaFxaLabel) {
+      novaFxaLabel.label = novaSignIn;
+    }
+
+    for (let topic of this._obs) {
+      Services.obs.addObserver(this, topic, true);
+    }
+
+    this.maybeUpdateUIState();
+
+    EnsureFxAccountsWebChannel();
+
+    let fxaPanelView = PanelMultiView.getViewNode(document, "PanelUI-fxa");
+    fxaPanelView.addEventListener("ViewShowing", this);
+    fxaPanelView.addEventListener("ViewHiding", this);
+    fxaPanelView.addEventListener("command", this);
+    PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-syncnow-button"
+    ).addEventListener("mouseover", this);
+    PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-sendtab-sign-in-button"
+    ).addEventListener("click", this);
+    PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-sendtab-enable-sync-button"
+    ).addEventListener("click", this);
+    PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-sendtab-verify-account-button"
+    ).addEventListener("click", this);
+    PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-sendtab-connect-phone-button"
+    ).addEventListener("click", this);
+    PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-sendtab-no-phone-button"
+    ).addEventListener("click", this);
+
+    PanelUI.mainView.addEventListener("ViewShowing", this);
+
+    if (this.FXA_CTA_MENU_ENABLED) {
+      this.updateFxAPanel(UIState.get());
+      this.updateCTAPanel();
+    }
+
+    const avatarIconVariant =
+      NimbusFeatures.fxaButtonVisibility.getVariable("avatarIconVariant");
+    if (avatarIconVariant) {
+      this.applyAvatarIconVariant(avatarIconVariant);
+    }
+
+    this._initialized = true;
+  },
+
+  uninit() {
+    if (!this._initialized) {
+      return;
+    }
+
+    for (let topic of this._obs) {
+      Services.obs.removeObserver(this, topic);
+    }
+
+    this._initialized = false;
+  },
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "mouseover":
+        this.refreshSyncButtonsTooltip();
+        break;
+      case "command":
+      case "click": {
+        this.onCommand(event.target);
+        break;
+      }
+      case "ViewShowing": {
+        if (event.target == PanelUI.mainView) {
+          this.onAppMenuShowing();
+        } else {
+          this.onFxAPanelViewShowing(event.target);
+        }
+        break;
+      }
+      case "ViewHiding": {
+        this.onFxAPanelViewHiding(event.target);
+      }
+    }
+  },
+
+  onAppMenuShowing() {
+    const appMenuHeaderText = PanelMultiView.getViewNode(
+      document,
+      "appMenu-fxa-text"
+    );
+
+    const ctaDefaultStringID = "appmenu-fxa-sync-and-save-data2";
+    const ctaStringID = this.getMenuCtaCopy(NimbusFeatures.fxaAppMenuItem);
+
+    document.l10n.setAttributes(
+      appMenuHeaderText,
+      ctaStringID || ctaDefaultStringID
+    );
+
+    if (NimbusFeatures.fxaAppMenuItem.getVariable("ctaCopyVariant")) {
+      NimbusFeatures.fxaAppMenuItem.recordExposureEvent();
+    }
+  },
+
+  onFxAPanelViewShowing(panelview) {
+    let messageId = panelview.getAttribute(
+      MenuMessage.SHOWING_FXA_MENU_MESSAGE_ATTR
+    );
+    if (messageId) {
+      MenuMessage.recordMenuMessageTelemetry(
+        "IMPRESSION",
+        MenuMessage.SOURCES.PXI_MENU,
+        messageId
+      );
+      let message = ASRouter.getMessageById(messageId);
+      ASRouter.addImpression(message);
+    }
+
+    let syncNowBtn = panelview.querySelector(".syncnow-label");
+    let l10nId = syncNowBtn.getAttribute(
+      this._isCurrentlySyncing
+        ? "syncing-data-l10n-id"
+        : "sync-now-data-l10n-id"
+    );
+    document.l10n.setAttributes(syncNowBtn, l10nId);
+
+    const syncPrefsButtonEl = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-sync-prefs-button"
+    );
+    const syncEnabled = UIState.get().syncEnabled;
+    syncPrefsButtonEl.hidden = !syncEnabled;
+    if (!syncEnabled) {
+      this._disableSyncOffIndicator();
+    }
+
+    const signOutButtonEl = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-account-signout-button"
+    );
+    signOutButtonEl.hidden = !this.isSignedIn;
+
+    panelview.syncedTabsPanelList = new SyncedTabsPanelList(
+      panelview,
+      PanelMultiView.getViewNode(document, "PanelUI-fxa-remotetabs-deck"),
+      PanelMultiView.getViewNode(document, "PanelUI-fxa-remotetabs-tabslist"),
+      PanelMultiView.getViewNode(document, "PanelUI-remote-tabs-separator")
+    );
+
+    const ctaCopyVariant =
+      NimbusFeatures.fxaAvatarMenuItem.getVariable("ctaCopyVariant");
+    if (ctaCopyVariant) {
+      NimbusFeatures.fxaAvatarMenuItem.recordExposureEvent();
+    }
+
+    const sendTabButton = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-sendtab-button"
+    );
+    if (sendTabButton && !sendTabButton.hidden) {
+      const targets = this.getSendTabTargets();
+      this.emitFxaToolbarTelemetry("send_tab_exposed", sendTabButton, {
+        device_count: String(targets.length),
+      });
+    }
+  },
+
+  onFxAPanelViewHiding(panelview) {
+    MenuMessage.hidePxiMenuMessage(gBrowser.selectedBrowser);
+    panelview.syncedTabsPanelList.destroy();
+    panelview.syncedTabsPanelList = null;
+  },
+
+  onCommand(button) {
+    switch (button.id) {
+      case "PanelUI-fxa-menu-sync-prefs-button":
+        this.openPrefsFromFxaMenu("sync_settings", button);
+        break;
+      case "PanelUI-fxa-menu-setup-sync-button":
+        this.openSyncSetup("sync_settings", button);
+        break;
+
+      case "PanelUI-fxa-menu-sendtab-connect-device-button":
+      // fall through
+      case "PanelUI-fxa-menu-connect-device-button":
+        this.clickOpenConnectAnotherDevice(button);
+        break;
+
+      case "fxa-manage-account-button":
+        this.clickFxAMenuHeaderButton(button);
+        break;
+      case "PanelUI-fxa-menu-syncnow-button":
+        this.doSyncFromFxaMenu(button);
+        break;
+      case "PanelUI-fxa-menu-sendtab-button":
+        this.showSendToDeviceViewFromFxaMenu(button);
+        break;
+      case "PanelUI-fxa-menu-account-signout-button":
+        this.disconnect();
+        break;
+      case "PanelUI-fxa-menu-monitor-button":
+        this.openMonitorLink(button);
+        break;
+      case "PanelUI-services-menu-relay-button":
+      case "PanelUI-fxa-menu-relay-button":
+        this.openRelayLink(button);
+        break;
+      case "PanelUI-fxa-menu-vpn-button":
+        this.openVPNLink(button);
+        break;
+      case "PanelUI-fxa-menu-sendtab-sign-in-button":
+        this.signInToSync(button);
+        break;
+      case "PanelUI-fxa-menu-sendtab-enable-sync-button":
+        this.enableSync();
+        break;
+      case "PanelUI-fxa-menu-sendtab-verify-account-button":
+        this.verifyAccount();
+        break;
+      case "PanelUI-fxa-menu-sendtab-connect-phone-button":
+        this.openPairDevice(button);
+        break;
+      case "PanelUI-fxa-menu-sendtab-no-phone-button":
+        this.openSendTabHelp();
+        break;
+    }
+  },
+
+  observe(subject, topic, data) {
+    if (!this._initialized) {
+      console.error("browser-sync observer called after unload: ", topic);
+      return;
+    }
+    switch (topic) {
+      case UIState.ON_UPDATE: {
+        const state = UIState.get();
+        this.updateAllUI(state);
+        break;
+      }
+      case "quit-application":
+        clearTimeout(this._syncAnimationTimer);
+        break;
+      case "weave:engine:sync:finish":
+        if (data != "clients") {
+          return;
+        }
+        this.onClientsSynced();
+        this.updateFxAPanel(UIState.get());
+        break;
+    }
+  },
+
+  updateAllUI(state) {
+    this.updatePanelPopup(state);
+    this.updateState(state);
+    this.updateSyncButtonsTooltip(state);
+    this.updateSyncStatus(state);
+    this.updateFxAPanel(state);
+    this.ensureFxaDevices();
+    this.fetchListOfOAuthClients();
+  },
+
+  async ensureFxaDevices() {
+    if (UIState.get().status != UIState.STATUS_SIGNED_IN) {
+      console.info("Skipping device list refresh; not signed in");
+      return;
+    }
+    if (!fxAccounts.device.recentDeviceList) {
+      if (await this.refreshFxaDevices()) {
+        if (!fxAccounts.device.recentDeviceList) {
+          console.warn("Refreshing device list didn't find any devices.");
+        }
+      }
+    }
+  },
+
+  async refreshFxaDevices() {
+    if (UIState.get().status != UIState.STATUS_SIGNED_IN) {
+      console.info("Skipping device list refresh; not signed in");
+      return false;
+    }
+    try {
+      await fxAccounts.device.refreshDeviceList({ ignoreCached: true });
+      return true;
+    } catch (e) {
+      this.log.error("Refreshing device list failed.", e);
+      return false;
+    }
+  },
+
+  async fetchListOfOAuthClients() {
+    if (!this.isSignedIn) {
+      console.info("Skipping fetching other attached clients");
+      return false;
+    }
+    try {
+      this._attachedClients = await fxAccounts.listAttachedOAuthClients();
+      return true;
+    } catch (e) {
+      this.log.error("Could not fetch attached OAuth clients", e);
+      return false;
+    }
+  },
+
+  updateSendToDeviceTitle() {
+    const tabCount = gBrowser.selectedTab.multiselected
+      ? gBrowser.selectedTabs.length
+      : 1;
+    document.l10n.setArgs(
+      PanelMultiView.getViewNode(document, "PanelUI-fxa-menu-sendtab-button"),
+      { tabCount }
+    );
+  },
+
+  showSendToDeviceView(anchor) {
+    PanelUI.showSubView("PanelUI-sendTabToDevice", anchor);
+    let panelViewNode = document.getElementById("PanelUI-sendTabToDevice");
+    this._populateSendTabToDevicesView(panelViewNode);
+  },
+
+  showSendToDeviceViewFromFxaMenu(anchor) {
+    (async () => {
+      switch (true) {
+        case this.isUnverified:
+          PanelUI.showSubView(
+            "PanelUI-fxa-menu-sendtab-verify-account",
+            anchor
+          );
+          return;
+        case this.isSignedIn === false:
+          PanelUI.showSubView("PanelUI-fxa-menu-sendtab-sign-in", anchor);
+          return;
+        case this.isSignedInWithSyncDisabled:
+          PanelUI.showSubView("PanelUI-fxa-menu-sendtab-enable-sync", anchor);
+          return;
+        case this.hasNoSendTabTargets:
+          PanelUI.showSubView("PanelUI-fxa-menu-sendtab-connect-phone", anchor);
+          return;
+        default:
+          this.showSendToDeviceView(anchor);
+          var targets = this.sendTabConfiguredAndLoading
+            ? []
+            : this.getSendTabTargets();
+          this.emitFxaToolbarTelemetry("send_tab_opened", anchor, {
+            device_count: String(targets.length),
+          });
+      }
+    })();
+  },
+
+  _populateSendTabToDevicesView(panelViewNode, reloadDevices = true) {
+    let bodyNode = panelViewNode.querySelector(".panel-subview-body");
+    let panelNode = panelViewNode.closest("panel");
+    let browser = gBrowser.selectedBrowser;
+    let uri = browser.currentURI;
+    let title = browser.contentTitle;
+    let multiselected = gBrowser.selectedTab.multiselected;
+
+    this.populateSendTabToDevicesMenu(bodyNode, uri, title, {
+      multiselected,
+      createDeviceNodeFn: (clientId, name, clientType, lastModified) => {
+        if (!name) {
+          return document.createXULElement("toolbarseparator");
+        }
+        let item = document.createXULElement("toolbarbutton");
+        item.setAttribute("wrap", true);
+        item.setAttribute("align", "start");
+        item.classList.add("sendToDevice-device", "subviewbutton");
+        if (clientId) {
+          item.classList.add("subviewbutton-iconic");
+          if (lastModified) {
+            let lastSyncDate = gSync.formatLastSyncDate(lastModified);
+            if (lastSyncDate) {
+              item.setAttribute(
+                "tooltiptext",
+                this.fluentStrings.formatValueSync("appmenu-fxa-last-sync", {
+                  time: lastSyncDate,
+                })
+              );
+            }
+          }
+        }
+
+        item.addEventListener("command", () => {
+          if (panelNode) {
+            PanelMultiView.hidePopup(panelNode);
+          }
+        });
+        return item;
+      },
+      isFxaMenu: true,
+    });
+
+    bodyNode.removeAttribute("state");
+    if (gSync.sendTabConfiguredAndLoading) {
+      bodyNode.setAttribute("state", "notready");
+    }
+    if (reloadDevices) {
+      this.refreshFxaDevices().then(_ => {
+        if (!window.closed) {
+          this._populateSendTabToDevicesView(panelViewNode, false);
+        }
+      });
+    }
+  },
+
+  async toggleAccountPanel(anchor = null, aEvent) {
+    if (document.documentElement.hasAttribute("customizing")) {
+      return;
+    }
+
+    if (
+      (aEvent.type == "mousedown" && aEvent.button != 0) ||
+      (aEvent.type == "keypress" &&
+        aEvent.charCode != KeyEvent.DOM_VK_SPACE &&
+        aEvent.keyCode != KeyEvent.DOM_VK_RETURN)
+    ) {
+      return;
+    }
+
+    const fxaToolbarMenuBtn = document.getElementById(
+      "fxa-toolbar-menu-button"
+    );
+    const sendTabButton = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-sendtab-button"
+    );
+
+    if (anchor === null) {
+      anchor = fxaToolbarMenuBtn;
+    }
+
+    if (anchor == fxaToolbarMenuBtn && anchor.getAttribute("open") != "true") {
+      if (ASRouter.initialized) {
+        await ASRouter.sendTriggerMessage({
+          browser: gBrowser.selectedBrowser,
+          id: "menuOpened",
+          context: { source: MenuMessage.SOURCES.PXI_MENU },
+        });
+      }
+    }
+
+    let fxaStatus = document.documentElement.getAttribute("fxastatus");
+
+    if (fxaStatus == "not_configured") {
+      if (
+        anchor.id == "appMenu-fxa-label2" ||
+        anchor.id == "appMenu-nova-fxa-label"
+      ) {
+        this.openFxAEmailFirstPageFromFxaMenu(anchor);
+        PanelUI.hide();
+        return;
+      }
+
+      sendTabButton.setAttribute("data-l10n-id", "fxa-menu-send-to-mobile");
+
+      if (this.FXA_CTA_MENU_ENABLED) {
+        this.updateFxAPanel(UIState.get());
+        this.updateCTAPanel(anchor);
+        PanelUI.showSubView("PanelUI-fxa", anchor, aEvent);
+      } else {
+        this.updateFxAPanel(UIState.get());
+        PanelUI.showSubView("PanelUI-fxa", anchor, aEvent);
+      }
+      this.enableSendTabIfValidTab();
+      return;
+    }
+    if (this.FXA_CTA_MENU_ENABLED) {
+      this.updateCTAPanel(anchor);
+    }
+
+    if (!gFxaToolbarAccessed) {
+      Services.prefs.setBoolPref("identity.fxaccounts.toolbar.accessed", true);
+    }
+
+    this.enableSendTabIfValidTab();
+    let sendTabTargets = this.getSendTabTargets();
+
+    if (fxaStatus === "unverified") {
+      const appMenuPanel = document.getElementById("appMenu-popup");
+      const anchorIsInAppMenu = appMenuPanel.contains(anchor);
+      sendTabButton.hidden = anchorIsInAppMenu;
+      sendTabButton.setAttribute("data-l10n-id", "fxa-menu-send-to-mobile");
+    } else if (
+      !sendTabTargets.length ||
+      this.hasOnlyMobileSendTabTargets(sendTabTargets)
+    ) {
+      sendTabButton.setAttribute("data-l10n-id", "fxa-menu-send-to-mobile");
+    } else {
+      sendTabButton.setAttribute("data-l10n-id", "fxa-menu-send-to-device");
+    }
+
+    if (anchor.getAttribute("open") == "true") {
+      PanelUI.hide();
+    } else {
+      this.emitFxaToolbarTelemetry("toolbar_icon", anchor);
+      PanelUI.showSubView("PanelUI-fxa", anchor, aEvent);
+    }
+  },
+
+  _disableSyncOffIndicator() {
+    const SYNC_PANEL_ACCESSED_PREF =
+      "identity.fxaccounts.toolbar.syncSetup.panelAccessed";
+    if (!Services.prefs.getBoolPref(SYNC_PANEL_ACCESSED_PREF, false)) {
+      Services.prefs.setBoolPref(SYNC_PANEL_ACCESSED_PREF, true);
+    }
+  },
+
+  updateFxAPanel(state = {}) {
+    const expandedSignInCopy =
+      NimbusFeatures.expandSignInButton.getVariable("ctaCopyVariant");
+    const mainWindowEl = document.documentElement;
+
+    const menuHeaderTitleEl = PanelMultiView.getViewNode(
+      document,
+      "fxa-menu-header-title"
+    );
+    const menuHeaderDescriptionEl = PanelMultiView.getViewNode(
+      document,
+      "fxa-menu-header-description"
+    );
+    const cadButtonEl = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-connect-device-button"
+    );
+    const syncNowButtonEl = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-syncnow-button"
+    );
+    const fxaMenuAccountButtonEl = PanelMultiView.getViewNode(
+      document,
+      "fxa-manage-account-button"
+    );
+    const signedInContainer = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-signedin-panel"
+    );
+    const signOutSeparator = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-sign-out-separator"
+    );
+    const emptyProfilesButton = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-empty-profiles-button"
+    );
+    const sendTabButton = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-sendtab-button"
+    );
+    const sendTabSeparator = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-sendtab-separator"
+    );
+    const profilesButton = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-profiles-button"
+    );
+    const profilesSeparator = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-profiles-separator"
+    );
+    const syncSetupEl = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-setup-sync-container"
+    );
+    const fxaToolbarMenuButton = document.getElementById(
+      "fxa-toolbar-menu-button"
+    );
+    const syncSetupSeparator = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-set-up-sync-separator"
+    );
+
+    let fxaAvatarLabelEl = document.getElementById("fxa-avatar-label");
+
+    cadButtonEl.setAttribute("disabled", true);
+    syncNowButtonEl.hidden = true;
+    signedInContainer.hidden = false;
+    cadButtonEl.hidden = true;
+    fxaMenuAccountButtonEl.classList.remove("subviewbutton-nav");
+    fxaMenuAccountButtonEl.removeAttribute("closemenu");
+    menuHeaderDescriptionEl.hidden = false;
+
+    if (fxaToolbarMenuButton) {
+      if (
+        state.status === UIState.STATUS_NOT_CONFIGURED &&
+        expandedSignInCopy
+      ) {
+        fxaAvatarLabelEl.setAttribute(
+          "value",
+          this.fluentStrings.formatValueSync(expandedSignInCopy)
+        );
+        fxaAvatarLabelEl.removeAttribute("hidden");
+        fxaToolbarMenuButton.setAttribute("data-l10n-id", "fxa-avatar-tooltip");
+        fxaToolbarMenuButton.classList.add("avatar-button-background");
+      } else {
+        fxaToolbarMenuButton.setAttribute(
+          "data-l10n-id",
+          "toolbar-button-account"
+        );
+        fxaToolbarMenuButton.classList.remove("avatar-button-background");
+        fxaAvatarLabelEl.hidden = true;
+      }
+    }
+
+    let stateValue = "not_configured";
+    let headerTitleL10nId;
+    let headerDescription;
+
+    switch (state.status) {
+      case UIState.STATUS_NOT_CONFIGURED:
+        signOutSeparator.hidden = true;
+        mainWindowEl.style.removeProperty("--avatar-image-url");
+        headerTitleL10nId = this.FXA_CTA_MENU_ENABLED
+          ? "synced-tabs-fxa-sign-in"
+          : "appmenuitem-sign-in-account";
+        headerDescription = this.fluentStrings.formatValueSync(
+          this.FXA_CTA_MENU_ENABLED
+            ? "fxa-menu-sync-description"
+            : "appmenu-fxa-signed-in-label"
+        );
+        if (this.FXA_CTA_MENU_ENABLED) {
+          const ctaCopy = this.getMenuCtaCopy(NimbusFeatures.fxaAvatarMenuItem);
+          if (ctaCopy) {
+            headerTitleL10nId = ctaCopy.headerTitleL10nId;
+            headerDescription = ctaCopy.headerDescription;
+          }
+        }
+
+        emptyProfilesButton.remove();
+        profilesButton.remove();
+        profilesSeparator.remove();
+        sendTabButton.remove();
+        sendTabSeparator.remove();
+
+        profilesSeparator.hidden = true;
+
+        signedInContainer.after(sendTabButton);
+        signedInContainer.after(sendTabSeparator);
+        signedInContainer.after(profilesSeparator);
+        signedInContainer.after(profilesButton);
+        signedInContainer.after(emptyProfilesButton);
+
+        break;
+
+      case UIState.STATUS_LOGIN_FAILED:
+        signOutSeparator.hidden = true;
+        stateValue = "login-failed";
+        headerTitleL10nId = "account-disconnected2";
+        headerDescription = state.displayName || state.email;
+        mainWindowEl.style.removeProperty("--avatar-image-url");
+        break;
+
+      case UIState.STATUS_NOT_VERIFIED:
+        signOutSeparator.hidden = true;
+        stateValue = "unverified";
+        headerTitleL10nId = "account-finish-account-setup";
+        headerDescription = state.displayName || state.email;
+        break;
+
+      case UIState.STATUS_SIGNED_IN:
+        stateValue = "signedin";
+        headerTitleL10nId = "appmenuitem-fxa-manage-account";
+        headerDescription = state.displayName || state.email;
+        this.updateAvatarURL(
+          mainWindowEl,
+          state.avatarURL,
+          state.avatarIsDefault
+        );
+        cadButtonEl.hidden = false;
+        signOutSeparator.hidden = false;
+        signedInContainer.hidden = false;
+        cadButtonEl.removeAttribute("disabled");
+
+        if (state.syncEnabled) {
+          syncNowButtonEl.removeAttribute("hidden");
+          cadButtonEl.removeAttribute("hidden");
+          syncSetupEl.setAttribute("hidden", "true");
+        } else {
+          syncSetupEl.removeAttribute("hidden");
+        }
+        if (state.syncEnabled) {
+          cadButtonEl.removeAttribute("hidden");
+          syncSetupSeparator.removeAttribute("hidden");
+        } else {
+          cadButtonEl.setAttribute("hidden", "true");
+          syncSetupSeparator.setAttribute("hidden", "true");
+        }
+
+        emptyProfilesButton.remove();
+        profilesButton.remove();
+        profilesSeparator.remove();
+
+        profilesSeparator.hidden = false;
+
+        fxaMenuAccountButtonEl.after(profilesSeparator);
+        fxaMenuAccountButtonEl.after(profilesButton);
+        fxaMenuAccountButtonEl.after(emptyProfilesButton);
+
+        break;
+
+      default:
+        headerTitleL10nId = this.FXA_CTA_MENU_ENABLED
+          ? "synced-tabs-fxa-sign-in"
+          : "appmenuitem-sign-in-account";
+        headerDescription = this.fluentStrings.formatValueSync(
+          "fxa-menu-turn-on-sync-default"
+        );
+        break;
+    }
+
+    mainWindowEl.setAttribute("fxastatus", stateValue);
+    menuHeaderTitleEl.value =
+      this.fluentStrings.formatValueSync(headerTitleL10nId);
+    menuHeaderDescriptionEl.hidden = !headerDescription;
+    menuHeaderDescriptionEl.value = headerDescription;
+    menuHeaderTitleEl.removeAttribute("data-l10n-id");
+    menuHeaderDescriptionEl.removeAttribute("data-l10n-id");
+  },
+
+  updateAvatarURL(mainWindowEl, avatarURL, avatarIsDefault) {
+    if (avatarURL && !avatarIsDefault) {
+      const bgImage = `url("${avatarURL}")`;
+      const img = new Image();
+      img.onload = () => {
+        mainWindowEl.style.setProperty("--avatar-image-url", bgImage);
+      };
+      img.onerror = () => {
+        mainWindowEl.style.removeProperty("--avatar-image-url");
+      };
+      img.src = avatarURL;
+    } else {
+      mainWindowEl.style.removeProperty("--avatar-image-url");
+    }
+  },
+
+  enableSendTabIfValidTab() {
+    let canSendAllURIs = gBrowser.selectedTabs.every(
+      t => !!BrowserUtils.getShareableURL(t.linkedBrowser.currentURI)
+    );
+
+    for (const id of [
+      "PanelUI-fxa-menu-sendtab-button",
+      "PanelUI-fxa-menu-sendtab-separator",
+    ]) {
+      PanelMultiView.getViewNode(document, id).hidden = !canSendAllURIs;
+    }
+  },
+
+  emitFxaToolbarTelemetry(type, sourceElement, extraOpts = {}) {
+    if (!UIState.isReady()) {
+      return;
+    }
+    const entryPoint = this._getEntryPointForElement(sourceElement);
+    let category = null;
+    if (entryPoint == "fxa_avatar_menu") {
+      category = "fxaAvatarMenu";
+    } else if (entryPoint == "fxa_app_menu") {
+      category = "fxaAppMenu";
+    } else {
+      return;
+    }
+
+    const state = UIState.get();
+    const hasAvatar = state.avatarURL && !state.avatarIsDefault;
+    const extraOptions = {
+      fxa_status: state.status,
+      fxa_avatar: hasAvatar ? "true" : "false",
+      fxa_sync_on: state.syncEnabled,
+      ...extraOpts,
+    };
+
+    const cap = w => w[0].toUpperCase() + w.slice(1);
+    const parts = type.split("_");
+    const methodName = type.startsWith("send_tab_")
+      ? parts[0] + parts.slice(1).map(cap).join("")
+      : "click" + parts.map(cap).join("");
+
+  },
+
+  updatePanelPopup({ email, displayName, status }) {
+    const appMenuStatus = PanelMultiView.getViewNode(
+      document,
+      "appMenu-fxa-status2"
+    );
+    const appMenuLabel = PanelMultiView.getViewNode(
+      document,
+      "appMenu-fxa-label2"
+    );
+    const appMenuHeaderText = PanelMultiView.getViewNode(
+      document,
+      "appMenu-fxa-text"
+    );
+    const appMenuHeaderTitle = PanelMultiView.getViewNode(
+      document,
+      "appMenu-header-title"
+    );
+    const appMenuHeaderDescription = PanelMultiView.getViewNode(
+      document,
+      "appMenu-header-description"
+    );
+    const fxaPanelView = PanelMultiView.getViewNode(document, "PanelUI-fxa");
+
+    let defaultLabel = this.fluentStrings.formatValueSync(
+      "appmenu-fxa-signed-in-label"
+    );
+    appMenuLabel.setAttribute("label", defaultLabel);
+    appMenuLabel.removeAttribute("aria-labelledby");
+    appMenuStatus.removeAttribute("fxastatus");
+
+    if (status == UIState.STATUS_NOT_CONFIGURED) {
+      appMenuHeaderText.hidden = false;
+      appMenuStatus.classList.add("toolbaritem-combined-buttons");
+      appMenuLabel.classList.remove("subviewbutton-nav");
+      appMenuHeaderTitle.hidden = true;
+      appMenuHeaderDescription.value = defaultLabel;
+      return;
+    }
+    appMenuLabel.classList.remove("subviewbutton-nav");
+
+    appMenuHeaderText.hidden = true;
+    appMenuStatus.classList.remove("toolbaritem-combined-buttons");
+
+    if (status == UIState.STATUS_LOGIN_FAILED) {
+      const [tooltipDescription, errorLabel] =
+        this.fluentStrings.formatValuesSync([
+          { id: "account-reconnect", args: { email } },
+          { id: "account-disconnected2" },
+        ]);
+      appMenuStatus.setAttribute("fxastatus", "login-failed");
+      appMenuStatus.setAttribute("tooltiptext", tooltipDescription);
+      appMenuLabel.classList.add("subviewbutton-nav");
+      appMenuHeaderTitle.hidden = false;
+      appMenuHeaderTitle.value = errorLabel;
+      appMenuHeaderDescription.value = displayName || email;
+
+      appMenuLabel.removeAttribute("label");
+      appMenuLabel.setAttribute(
+        "aria-labelledby",
+        `${appMenuHeaderTitle.id},${appMenuHeaderDescription.id}`
+      );
+      return;
+    } else if (status == UIState.STATUS_NOT_VERIFIED) {
+      const [tooltipDescription, unverifiedLabel] =
+        this.fluentStrings.formatValuesSync([
+          { id: "account-verify", args: { email } },
+          { id: "account-finish-account-setup" },
+        ]);
+      appMenuStatus.setAttribute("fxastatus", "unverified");
+      appMenuStatus.setAttribute("tooltiptext", tooltipDescription);
+      appMenuLabel.classList.add("subviewbutton-nav");
+      appMenuHeaderTitle.hidden = false;
+      appMenuHeaderTitle.value = unverifiedLabel;
+      appMenuHeaderDescription.value = email;
+
+      appMenuLabel.removeAttribute("label");
+      appMenuLabel.setAttribute(
+        "aria-labelledby",
+        `${appMenuHeaderTitle.id},${appMenuHeaderDescription.id}`
+      );
+      return;
+    }
+
+    appMenuHeaderTitle.hidden = true;
+    appMenuHeaderDescription.value = displayName || email;
+    appMenuStatus.setAttribute("fxastatus", "signedin");
+    appMenuLabel.setAttribute("label", displayName || email);
+    appMenuLabel.classList.add("subviewbutton-nav");
+    fxaPanelView.setAttribute(
+      "title",
+      this.fluentStrings.formatValueSync("appmenu-account-header")
+    );
+    appMenuStatus.removeAttribute("tooltiptext");
+  },
+
+  updateState(state) {
+    for (let [shown, menuId, boxId] of [
+      [
+        state.status == UIState.STATUS_NOT_CONFIGURED,
+        "sync-setup",
+        "PanelUI-remotetabs-setupsync",
+      ],
+      [
+        state.status == UIState.STATUS_SIGNED_IN && !state.syncEnabled,
+        "sync-enable",
+        "PanelUI-remotetabs-syncdisabled",
+      ],
+      [
+        state.status == UIState.STATUS_LOGIN_FAILED,
+        "sync-reauthitem",
+        "PanelUI-remotetabs-reauthsync",
+      ],
+      [
+        state.status == UIState.STATUS_NOT_VERIFIED,
+        "sync-unverifieditem",
+        "PanelUI-remotetabs-unverified",
+      ],
+      [
+        state.status == UIState.STATUS_SIGNED_IN && state.syncEnabled,
+        "sync-syncnowitem",
+        "PanelUI-remotetabs-main",
+      ],
+    ]) {
+      document.getElementById(menuId).hidden = PanelMultiView.getViewNode(
+        document,
+        boxId
+      ).hidden = !shown;
+    }
+  },
+
+  updateSyncStatus(state) {
+    let syncNow =
+      document.querySelector(".syncNowBtn") ||
+      document
+        .getElementById("appMenu-viewCache")
+        .content.querySelector(".syncNowBtn");
+    const syncingUI = syncNow.getAttribute("syncstatus") == "active";
+    if (state.syncing != syncingUI) {
+      state.syncing ? this.onActivityStart() : this.onActivityStop();
+    }
+  },
+
+  async openSignInAgainPage(entryPoint) {
+    if (!(await FxAccounts.canConnectAccount())) {
+      return;
+    }
+    const url = await FxAccounts.config.promiseConnectAccountURI(entryPoint);
+    switchToTabHavingURI(url, true, {
+      replaceQueryString: true,
+      triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
+    });
+  },
+
+  async openDevicesManagementPage(entryPoint) {
+    let url = await FxAccounts.config.promiseManageDevicesURI(entryPoint);
+    switchToTabHavingURI(url, true, {
+      replaceQueryString: true,
+      triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
+    });
+  },
+
+  async openConnectAnotherDevice(entryPoint) {
+    const url = await FxAccounts.config.promiseConnectDeviceURI(entryPoint);
+    openTrustedLinkIn(url, "tab");
+  },
+
+  async clickOpenConnectAnotherDevice(sourceElement) {
+    this.emitFxaToolbarTelemetry("cad", sourceElement);
+    let entryPoint = this._getEntryPointForElement(sourceElement);
+    this.openConnectAnotherDevice(entryPoint);
+  },
+
+  openSendToDevicePromo() {
+    const url = Services.urlFormatter.formatURLPref(
+      "identity.sendtabpromo.url"
+    );
+    switchToTabHavingURI(url, true, { replaceQueryString: true });
+  },
+
+  async clickFxAMenuHeaderButton(sourceElement) {
+    const { status } = UIState.get();
+    switch (status) {
+      case UIState.STATUS_NOT_CONFIGURED:
+        this.openFxAEmailFirstPageFromFxaMenu(sourceElement);
+        break;
+      case UIState.STATUS_LOGIN_FAILED:
+        this.openPrefsFromFxaMenu("sync_settings", sourceElement);
+        break;
+      case UIState.STATUS_NOT_VERIFIED:
+        this.openFxAEmailFirstPage("fxa_app_menu_reverify");
+        break;
+      case UIState.STATUS_SIGNED_IN:
+        this._openFxAManagePageFromElement(sourceElement);
+    }
+  },
+
+  _getEntryPointForElement(sourceElement) {
+    const appMenuPanel = document.getElementById("appMenu-popup");
+    if (appMenuPanel.contains(sourceElement)) {
+      return "fxa_app_menu";
+    }
+    if (sourceElement.id == "fxa-toolbar-menu-button") {
+      return "fxa_avatar_menu";
+    }
+    if (sourceElement.closest?.('[id^="PanelUI-fxa-menu"]')) {
+      return "fxa_avatar_menu";
+    }
+    return "fxa_discoverability_native";
+  },
+
+  async openFxAEmailFirstPage(entryPoint, extraParams = {}) {
+    if (!(await FxAccounts.canConnectAccount())) {
+      return;
+    }
+    const url = await FxAccounts.config.promiseConnectAccountURI(
+      entryPoint,
+      extraParams
+    );
+    switchToTabHavingURI(url, true, { replaceQueryString: true });
+  },
+
+  async openFxAEmailFirstPageFromFxaMenu(sourceElement, extraParams = {}) {
+    this.emitFxaToolbarTelemetry("login", sourceElement);
+    this.openFxAEmailFirstPage(
+      this._getEntryPointForElement(sourceElement),
+      extraParams
+    );
+  },
+
+  async openFxAManagePage(entryPoint) {
+    const url = await FxAccounts.config.promiseManageURI(entryPoint);
+    switchToTabHavingURI(url, true, { replaceQueryString: true });
+  },
+
+  async _openFxAManagePageFromElement(sourceElement) {
+    this.emitFxaToolbarTelemetry("account_settings", sourceElement);
+    this.openFxAManagePage(this._getEntryPointForElement(sourceElement));
+  },
+
+  async sendTabToDevice(tab, targets) {
+    const fxaCommandsDevices = [];
+    for (const target of targets) {
+      if (fxAccounts.commands.sendTab.isDeviceCompatible(target)) {
+        fxaCommandsDevices.push(target);
+      } else {
+        this.log.error(`Target ${target.id} unsuitable for send tab.`);
+      }
+    }
+    let cryptoSDR = Cc["@mozilla.org/login-manager/crypto/SDR;1"].getService(
+      Ci.nsILoginManagerCrypto
+    );
+    if (!cryptoSDR.isLoggedIn) {
+      if (cryptoSDR.uiBusy) {
+        this.log.info("Master password UI is busy - not sending the tabs");
+        return false;
+      }
+      try {
+        cryptoSDR.encrypt("bacon"); 
+      } catch (e) {
+        this.log.info(
+          "Master password remains unlocked - not sending the tabs"
+        );
+        return false;
+      }
+    }
+    let numFailed = 0;
+    if (fxaCommandsDevices.length) {
+      this.log.info(
+        `Sending a tab to ${fxaCommandsDevices
+          .map(d => d.id)
+          .join(", ")} using FxA commands.`
+      );
+      const report = await fxAccounts.commands.sendTab.send(
+        fxaCommandsDevices,
+        tab
+      );
+      for (let { device, error } of report.failed) {
+        this.log.error(
+          `Failed to send a tab with FxA commands for ${device.id}.`,
+          error
+        );
+        numFailed++;
+      }
+    }
+    return numFailed < targets.length; 
+  },
+
+  populateSendTabToDevicesMenu(devicesPopup, uri, title, options = {}) {
+    const {
+      multiselected = false,
+      createDeviceNodeFn = (targetId, name) => {
+        let eltName = name ? "menuitem" : "menuseparator";
+        return document.createXULElement(eltName);
+      },
+      isFxaMenu = false,
+      contextMenuType = null,
+    } = options;
+    uri = BrowserUtils.getShareableURL(uri);
+    if (!uri) {
+      this.log.error("Ignoring request to share a non-sharable URL");
+      return;
+    }
+
+    for (let i = devicesPopup.children.length - 1; i >= 0; --i) {
+      let child = devicesPopup.children[i];
+      if (child.classList.contains("sync-menuitem")) {
+        child.remove();
+      }
+    }
+
+    if (gSync.sendTabConfiguredAndLoading) {
+      return;
+    }
+
+    const fragment = document.createDocumentFragment();
+
+    const state = UIState.get();
+    if (this.isSignedInWithSyncDisabled) {
+      this._appendSignedInSyncDisabled(
+        fragment,
+        createDeviceNodeFn,
+        contextMenuType
+      );
+    } else if (state.status == UIState.STATUS_SIGNED_IN) {
+      const targets = this.getSendTabTargets();
+      if (targets.length) {
+        this._appendSendTabDeviceList(
+          targets,
+          fragment,
+          createDeviceNodeFn,
+          uri.spec,
+          title,
+          multiselected,
+          isFxaMenu,
+          contextMenuType
+        );
+
+        if (contextMenuType) {
+          this._recordSendTabTelemetry(
+            "send_tab_opened",
+            targets.length,
+            contextMenuType
+          );
+        }
+      } else {
+        this._appendSendTabSingleDevice(
+          fragment,
+          createDeviceNodeFn,
+          contextMenuType
+        );
+      }
+    } else if (
+      state.status == UIState.STATUS_NOT_VERIFIED ||
+      state.status == UIState.STATUS_LOGIN_FAILED
+    ) {
+      this._appendSendTabVerify(fragment, createDeviceNodeFn);
+    } else {
+      this._appendSendTabSignedOut(
+        fragment,
+        createDeviceNodeFn,
+        contextMenuType
+      );
+    }
+
+    devicesPopup.appendChild(fragment);
+  },
+
+  _appendSendTabDeviceList(
+    targets,
+    fragment,
+    createDeviceNodeFn,
+    url,
+    title,
+    multiselected,
+    isFxaMenu = false,
+    contextMenuType = null
+  ) {
+    let isPrivate = PrivateBrowsingUtils.isBrowserPrivate(gBrowser);
+    let tabsToSend = multiselected
+      ? gBrowser.selectedTabs.map(t => {
+          return {
+            url: t.linkedBrowser.currentURI.spec,
+            title: t.linkedBrowser.contentTitle,
+            private: isPrivate,
+          };
+        })
+      : [{ url, title, private: isPrivate }];
+
+    const send = to => {
+      Promise.all(
+        tabsToSend.map(t =>
+          this.sendTabToDevice(t, to)
+        )
+      ).then(results => {
+        if (results.includes(true)) {
+          let fxastatus = document.documentElement.getAttribute("fxastatus");
+          let anchorNode =
+            (fxastatus &&
+              fxastatus != "not_configured" &&
+              document.getElementById("fxa-toolbar-menu-button")?.parentNode
+                ?.id != "widget-overflow-list" &&
+              document.getElementById("fxa-toolbar-menu-button")) ||
+            document.getElementById("PanelUI-menu-button");
+          ConfirmationHint.show(anchorNode, "confirmation-hint-send-to-device");
+        }
+        fxAccounts.flushLogFile();
+      });
+    };
+    const onSendAllCommand = () => {
+      send(targets);
+      if (isFxaMenu) {
+        const sendTabButton = PanelMultiView.getViewNode(
+          document,
+          "PanelUI-fxa-menu-sendtab-button"
+        );
+        this.emitFxaToolbarTelemetry("send_tab", sendTabButton, {
+          device_count: String(targets.length),
+          action: "all_devices",
+        });
+      } else if (contextMenuType) {
+        this._recordSendTabTelemetry(
+          "click_send_tab",
+          targets.length,
+          contextMenuType,
+          "all_devices"
+        );
+      }
+    };
+    const onTargetDeviceCommand = event => {
+      const targetId = event.target.getAttribute("clientId");
+      const target = targets.find(t => t.id == targetId);
+      send([target]);
+      if (isFxaMenu) {
+        const sendTabButton = PanelMultiView.getViewNode(
+          document,
+          "PanelUI-fxa-menu-sendtab-button"
+        );
+        this.emitFxaToolbarTelemetry("send_tab", sendTabButton, {
+          device_count: String(targets.length),
+          action: "device",
+        });
+      } else if (contextMenuType) {
+        this._recordSendTabTelemetry(
+          "click_send_tab",
+          targets.length,
+          contextMenuType,
+          "device"
+        );
+      }
+    };
+
+    function addTargetDevice(targetId, name, targetType, lastModified) {
+      const targetDevice = createDeviceNodeFn(
+        targetId,
+        name,
+        targetType,
+        lastModified
+      );
+      targetDevice.addEventListener(
+        "command",
+        targetId ? onTargetDeviceCommand : onSendAllCommand,
+        true
+      );
+      targetDevice.classList.add("sync-menuitem", "sendtab-target");
+      targetDevice.setAttribute("clientId", targetId);
+      targetDevice.setAttribute("clientType", targetType);
+      targetDevice.setAttribute("label", name);
+      fragment.appendChild(targetDevice);
+    }
+
+    for (let target of targets) {
+      let type, lastModified;
+      if (target.clientRecord) {
+        type = Weave.Service.clientsEngine.getClientType(
+          target.clientRecord.id
+        );
+        lastModified = new Date(target.clientRecord.serverLastModified * 1000);
+      } else {
+        type = target.type == "mobile" ? "phone" : target.type;
+        lastModified = target.lastAccessTime
+          ? new Date(target.lastAccessTime)
+          : null;
+      }
+      addTargetDevice(target.id, target.name, type, lastModified);
+    }
+
+    if (targets.length > 1) {
+      const separator = createDeviceNodeFn();
+      separator.classList.add("sync-menuitem");
+      fragment.appendChild(separator);
+      const [allDevicesLabel, manageDevicesLabel] =
+        this.fluentStrings.formatValuesSync(
+          isFxaMenu
+            ? ["account-send-to-all-devices", "account-manage-devices"]
+            : [
+                "account-send-to-all-devices-titlecase",
+                "account-manage-devices-titlecase",
+              ]
+        );
+      addTargetDevice("", allDevicesLabel, "");
+
+      const targetDevice = createDeviceNodeFn(
+        null,
+        manageDevicesLabel,
+        null,
+        null
+      );
+      targetDevice.addEventListener(
+        "command",
+        () => {
+          gSync.openDevicesManagementPage("sendtab");
+          if (isFxaMenu) {
+            const sendTabButton = PanelMultiView.getViewNode(
+              document,
+              "PanelUI-fxa-menu-sendtab-button"
+            );
+            this.emitFxaToolbarTelemetry("send_tab", sendTabButton, {
+              device_count: String(targets.length),
+              action: "manage_devices",
+            });
+          } else if (contextMenuType) {
+            this._recordSendTabTelemetry(
+              "click_send_tab",
+              targets.length,
+              contextMenuType,
+              "manage_devices"
+            );
+          }
+        },
+        true
+      );
+      targetDevice.classList.add("sync-menuitem", "sendtab-target");
+      targetDevice.setAttribute("label", manageDevicesLabel);
+      fragment.appendChild(targetDevice);
+    }
+  },
+
+  _resetSendTabExposureTracking() {
+    this._sendTabExposureRecorded.clear();
+  },
+
+  _recordSendTabTelemetry(eventType, deviceCount, contextType, action = null) {
+    const extraParams = {
+      device_count: String(deviceCount),
+    };
+
+    if (action) {
+      extraParams.action = action;
+    }
+
+    const categoryMap = {
+      tab: "tabContextMenu",
+      page: "pageContextMenu",
+      link: "pageContextMenu",
+      toolbar: "sendTabToolbar",
+    };
+
+    const methodMap = {
+      send_tab_exposed: "sendTabExposed",
+      send_tab_opened: "sendTabOpened",
+      click_send_tab: "clickSendTab",
+    };
+
+    const category = categoryMap[contextType];
+    const method = methodMap[eventType];
+
+    if (
+      !category ||
+      !method ||
+      (category == "sendTabToolbar" && method == "sendTabExposed")
+    ) {
+      this.log.error(
+        `Invalid telemetry parameters: eventType=${eventType}, contextType=${contextType}`
+      );
+      return;
+    }
+
+    if (contextType === "page" || contextType === "link") {
+      extraParams.context_type = contextType;
+    }
+
+  },
+
+  _appendSignedInSyncDisabled(fragment, createDeviceNodeFn, contextMenuType) {
+    let enableSyncLabel;
+    if (contextMenuType == "link") {
+      enableSyncLabel = this.fluentStrings.formatValueSync(
+        "main-context-menu-send-to-mobile-enable-sync-from-link"
+      );
+    } else if (contextMenuType == "page") {
+      enableSyncLabel = this.fluentStrings.formatValueSync(
+        "main-context-menu-send-to-mobile-enable-sync-from-page"
+      );
+    } else {
+      enableSyncLabel = this.fluentStrings.formatValueSync(
+        "main-context-menu-send-to-mobile-enable-sync3"
+      );
+    }
+
+    const enableSyncMenuItem = createDeviceNodeFn(null, enableSyncLabel, null);
+    enableSyncMenuItem.setAttribute("label", enableSyncLabel);
+    enableSyncMenuItem.classList.add("sync-menuitem");
+    enableSyncMenuItem.addEventListener(
+      "command",
+      () => this.enableSync(),
+      true
+    );
+    fragment.appendChild(enableSyncMenuItem);
+  },
+
+  _appendSendTabSingleDevice(fragment, createDeviceNodeFn, contextMenuType) {
+    let entryPoint = {
+      toolbar: "send-tab-toolbar-icon",
+      link: "send-tab-link-context-menu",
+      page: "send-tab-page-context-menu",
+      tab: "send-tab-tab-context-menu",
+    }[contextMenuType];
+
+    let connectPhoneLabel, deviceMissingLabel;
+    if (contextMenuType == "link") {
+      [connectPhoneLabel, deviceMissingLabel] =
+        this.fluentStrings.formatValuesSync([
+          "main-context-menu-send-to-mobile-connect-phone-from-link",
+          "main-context-menu-send-to-mobile-device-missing2",
+        ]);
+    } else if (contextMenuType == "page") {
+      [connectPhoneLabel, deviceMissingLabel] =
+        this.fluentStrings.formatValuesSync([
+          "main-context-menu-send-to-mobile-connect-phone-from-page",
+          "main-context-menu-send-to-mobile-device-missing2",
+        ]);
+    } else {
+      [connectPhoneLabel, deviceMissingLabel] =
+        this.fluentStrings.formatValuesSync([
+          "main-context-menu-send-to-mobile-connect-phone3",
+          "main-context-menu-send-to-mobile-device-missing2",
+        ]);
+    }
+
+    const connectPhoneMenuItem = createDeviceNodeFn(
+      null,
+      connectPhoneLabel,
+      null
+    );
+    connectPhoneMenuItem.setAttribute("label", connectPhoneLabel);
+    connectPhoneMenuItem.classList.add("sync-menuitem");
+    connectPhoneMenuItem.addEventListener(
+      "command",
+      async () => {
+        const uri = await FxAccounts.config.promisePairingURI({
+          entrypoint: entryPoint,
+        });
+        switchToTabHavingURI(uri, true, {});
+      },
+      true
+    );
+    fragment.appendChild(connectPhoneMenuItem);
+
+    const separator = createDeviceNodeFn(null, null, null);
+    separator.classList.add("sync-menuitem");
+    fragment.appendChild(separator);
+
+    const deviceMissingMenuItem = createDeviceNodeFn(
+      null,
+      deviceMissingLabel,
+      null
+    );
+    deviceMissingMenuItem.setAttribute("label", deviceMissingLabel);
+    deviceMissingMenuItem.classList.add("sync-menuitem");
+    deviceMissingMenuItem.addEventListener(
+      "command",
+      () => this.openSendTabHelp(),
+      true
+    );
+    fragment.appendChild(deviceMissingMenuItem);
+  },
+
+  _appendSendTabVerify(fragment, createDeviceNodeFn) {
+    const [notVerified, verifyAccount] = this.fluentStrings.formatValuesSync([
+      "account-send-tab-to-device-verify-status",
+      "account-send-tab-to-device-verify2",
+    ]);
+    const actions = [
+      { label: verifyAccount, command: () => this.openPrefs("sendtab") },
+    ];
+    this._appendSendTabInfoItems(
+      fragment,
+      createDeviceNodeFn,
+      notVerified,
+      actions
+    );
+  },
+
+  _appendSendTabInfoItems(fragment, createDeviceNodeFn, statusLabel, actions) {
+    const status = createDeviceNodeFn(null, statusLabel, null);
+    status.setAttribute("label", statusLabel);
+    status.setAttribute("disabled", true);
+    status.classList.add("sync-menuitem");
+    fragment.appendChild(status);
+
+    const separator = createDeviceNodeFn(null, null, null);
+    separator.classList.add("sync-menuitem");
+    fragment.appendChild(separator);
+
+    for (let { label, command } of actions) {
+      const actionItem = createDeviceNodeFn(null, label, null);
+      actionItem.addEventListener("command", command, true);
+      actionItem.classList.add("sync-menuitem");
+      actionItem.setAttribute("label", label);
+      fragment.appendChild(actionItem);
+    }
+  },
+
+  _appendSendTabSignedOut(fragment, createDeviceNodeFn, contextMenuType) {
+    let entryPoint = {
+      toolbar: "send-tab-toolbar-icon",
+      link: "send-tab-link-context-menu",
+      page: "send-tab-page-context-menu",
+      tab: "send-tab-tab-context-menu",
+    }[contextMenuType];
+
+    let signInLabel;
+    if (contextMenuType == "link") {
+      signInLabel = this.fluentStrings.formatValueSync(
+        "main-context-menu-send-to-mobile-sign-in-from-link"
+      );
+    } else if (contextMenuType == "page") {
+      signInLabel = this.fluentStrings.formatValueSync(
+        "main-context-menu-send-to-mobile-sign-in-from-page"
+      );
+    } else {
+      signInLabel = this.fluentStrings.formatValueSync(
+        "main-context-menu-send-to-mobile-sign-in"
+      );
+    }
+
+    const signInMenuItem = createDeviceNodeFn(null, signInLabel, null);
+    signInMenuItem.setAttribute("label", signInLabel);
+    signInMenuItem.classList.add("sync-menuitem");
+    signInMenuItem.addEventListener(
+      "command",
+      async () => await this.openSignInAgainPage(entryPoint),
+      true
+    );
+    fragment.appendChild(signInMenuItem);
+  },
+
+  updateTabContextMenu(aPopupMenu, aTargetTab) {
+    this.init();
+
+    if (!this.FXA_ENABLED) {
+      return;
+    }
+    let hasASendableURI = false;
+    for (let tab of aTargetTab.multiselected
+      ? gBrowser.selectedTabs
+      : [aTargetTab]) {
+      if (BrowserUtils.getShareableURL(tab.linkedBrowser.currentURI)) {
+        hasASendableURI = true;
+        break;
+      }
+    }
+    const enabled = !this.sendTabConfiguredAndLoading && hasASendableURI;
+    const hideItems = this.shouldHideSendContextMenuItems(enabled);
+
+    let sendTabsToDevice = document.getElementById("context_sendTabToDevice");
+    sendTabsToDevice.disabled = !enabled;
+    let sendTabToDeviceSeparator = document.getElementById(
+      "context_sendTabToDeviceSeparator"
+    );
+
+    if (hideItems || !hasASendableURI) {
+      sendTabsToDevice.hidden = true;
+      sendTabToDeviceSeparator.hidden = true;
+    } else {
+      if (this.hasOnlyMobileSendTabTargets()) {
+        sendTabsToDevice.setAttribute(
+          "data-l10n-id",
+          "tab-context-send-to-mobile"
+        );
+      } else {
+        sendTabsToDevice.setAttribute(
+          "data-l10n-id",
+          "tab-context-send-to-device"
+        );
+      }
+      let tabCount = aTargetTab.multiselected
+        ? gBrowser.multiSelectedTabsCount
+        : 1;
+      sendTabsToDevice.setAttribute(
+        "data-l10n-args",
+        JSON.stringify({ tabCount })
+      );
+      sendTabsToDevice.hidden = false;
+      sendTabToDeviceSeparator.hidden = false;
+
+      if (enabled) {
+        const targets = this.getSendTabTargets();
+        const exposureKey = "tab-context";
+        if (targets.length && !this._sendTabExposureRecorded.has(exposureKey)) {
+          this._recordSendTabTelemetry(
+            "send_tab_exposed",
+            targets.length,
+            "tab"
+          );
+          this._sendTabExposureRecorded.add(exposureKey);
+        }
+      }
+    }
+  },
+
+  updateContentContextMenu(contextMenu) {
+    if (!this.FXA_ENABLED) {
+      return false;
+    }
+    const showSendLink =
+      contextMenu.onSaveableLink || contextMenu.onPlainTextLink;
+    const showSendPage =
+      !showSendLink &&
+      !(
+        contextMenu.isContentSelected ||
+        contextMenu.onImage ||
+        contextMenu.onCanvas ||
+        contextMenu.onVideo ||
+        contextMenu.onAudio ||
+        contextMenu.onLink ||
+        contextMenu.onTextInput
+      );
+
+    const targetURI = showSendLink
+      ? contextMenu.getLinkURI()
+      : contextMenu.browser.currentURI;
+    const enabled =
+      !this.sendTabConfiguredAndLoading &&
+      BrowserUtils.getShareableURL(targetURI);
+    const hideItems = this.shouldHideSendContextMenuItems(enabled);
+
+    contextMenu.showItem(
+      "context-sendpagetodevice",
+      !hideItems && showSendPage
+    );
+
+    let hasOnlyMobileTargets = this.hasOnlyMobileSendTabTargets();
+    let sendLinkToDevice = document.getElementById("context-sendlinktodevice");
+    let sendPageToDevice = document.getElementById("context-sendpagetodevice");
+
+    sendLinkToDevice.setAttribute(
+      "data-l10n-id",
+      hasOnlyMobileTargets
+        ? "main-context-menu-link-send-to-mobile"
+        : "main-context-menu-link-send-to-device"
+    );
+    sendPageToDevice.setAttribute(
+      "data-l10n-id",
+      hasOnlyMobileTargets
+        ? "main-context-menu-send-to-mobile-2"
+        : "main-context-menu-send-to-device-2"
+    );
+
+    for (const id of [
+      "context-sendlinktodevice",
+      "context-sep-sendlinktodevice",
+    ]) {
+      contextMenu.showItem(id, !hideItems && showSendLink);
+    }
+
+    if (!showSendLink && !showSendPage) {
+      return false;
+    }
+
+    contextMenu.setItemAttr(
+      showSendPage ? "context-sendpagetodevice" : "context-sendlinktodevice",
+      "disabled",
+      !enabled || null
+    );
+
+    if (!hideItems && enabled) {
+      const targets = this.getSendTabTargets();
+      const exposureKey = showSendLink ? "link-context" : "page-context";
+      if (targets.length && !this._sendTabExposureRecorded.has(exposureKey)) {
+        this._recordSendTabTelemetry(
+          "send_tab_exposed",
+          targets.length,
+          showSendLink ? "link" : "page"
+        );
+        this._sendTabExposureRecorded.add(exposureKey);
+      }
+    }
+
+    return !hideItems && (showSendPage || showSendLink);
+  },
+
+  onActivityStart() {
+    this._isCurrentlySyncing = true;
+    clearTimeout(this._syncAnimationTimer);
+    this._syncStartTime = Date.now();
+
+    document.querySelectorAll(".syncnow-label").forEach(el => {
+      let l10nId = el.getAttribute("syncing-data-l10n-id");
+      document.l10n.setAttributes(el, l10nId);
+    });
+
+    document.querySelectorAll(".syncNowBtn").forEach(el => {
+      el.setAttribute("syncstatus", "active");
+    });
+
+    document
+      .getElementById("appMenu-viewCache")
+      .content.querySelectorAll(".syncNowBtn")
+      .forEach(el => {
+        el.setAttribute("syncstatus", "active");
+      });
+  },
+
+  _onActivityStop() {
+    this._isCurrentlySyncing = false;
+    if (!gBrowser) {
+      return;
+    }
+
+    document.querySelectorAll(".syncnow-label").forEach(el => {
+      let l10nId = el.getAttribute("sync-now-data-l10n-id");
+      document.l10n.setAttributes(el, l10nId);
+    });
+
+    document.querySelectorAll(".syncNowBtn").forEach(el => {
+      el.removeAttribute("syncstatus");
+    });
+
+    document
+      .getElementById("appMenu-viewCache")
+      .content.querySelectorAll(".syncNowBtn")
+      .forEach(el => {
+        el.removeAttribute("syncstatus");
+      });
+
+    Services.obs.notifyObservers(null, "test:browser-sync:activity-stop");
+  },
+
+  onActivityStop() {
+    let now = Date.now();
+    let syncDuration = now - this._syncStartTime;
+
+    if (syncDuration < MIN_STATUS_ANIMATION_DURATION) {
+      let animationTime = MIN_STATUS_ANIMATION_DURATION - syncDuration;
+      clearTimeout(this._syncAnimationTimer);
+      this._syncAnimationTimer = setTimeout(
+        () => this._onActivityStop(),
+        animationTime
+      );
+    } else {
+      this._onActivityStop();
+    }
+  },
+
+  async disconnect({ confirm = true, disconnectAccount = true } = {}) {
+    if (disconnectAccount) {
+      let deleteLocalData = false;
+      if (confirm) {
+        let options = await this._confirmFxaAndSyncDisconnect();
+        if (!options.userConfirmedDisconnect) {
+          return false;
+        }
+        deleteLocalData = options.deleteLocalData;
+      }
+      return this._disconnectFxaAndSync(deleteLocalData);
+    }
+
+    if (confirm && !(await this._confirmSyncDisconnect())) {
+      return false;
+    }
+    return this._disconnectSync();
+  },
+
+  async _confirmFxaAndSyncDisconnect() {
+    let options = {
+      userConfirmedDisconnect: false,
+      deleteLocalData: false,
+    };
+
+    let [title, body, button, checkbox] = await document.l10n.formatValues([
+      { id: "fxa-signout-dialog-title2" },
+      { id: "fxa-signout-dialog-body" },
+      { id: "fxa-signout-dialog2-button" },
+      { id: "fxa-signout-dialog2-checkbox" },
+    ]);
+
+    const flags =
+      Services.prompt.BUTTON_TITLE_IS_STRING * Services.prompt.BUTTON_POS_0 +
+      Services.prompt.BUTTON_TITLE_CANCEL * Services.prompt.BUTTON_POS_1;
+
+    if (!UIState.get().syncEnabled) {
+      checkbox = null;
+    }
+
+    const result = await Services.prompt.asyncConfirmEx(
+      window.browsingContext,
+      Services.prompt.MODAL_TYPE_INTERNAL_WINDOW,
+      title,
+      body,
+      flags,
+      button,
+      null,
+      null,
+      checkbox,
+      false
+    );
+    const propBag = result.QueryInterface(Ci.nsIPropertyBag2);
+    options.userConfirmedDisconnect = propBag.get("buttonNumClicked") == 0;
+    options.deleteLocalData = propBag.get("checked");
+
+    return options;
+  },
+
+  async _disconnectFxaAndSync(deleteLocalData) {
+    const { SyncDisconnect } = ChromeUtils.importESModule(
+      "resource://services-sync/SyncDisconnect.sys.mjs"
+    );
+    await fxAccounts.telemetry.recordDisconnection(null, "ui");
+
+    await SyncDisconnect.disconnect(deleteLocalData).catch(e => {
+      console.error("Failed to disconnect.", e);
+    });
+
+    this._attachedClients = null;
+
+    return true;
+  },
+
+  async _confirmSyncDisconnect() {
+    const [title, body, button] = await document.l10n.formatValues([
+      { id: `sync-disconnect-dialog-title2` },
+      { id: `sync-disconnect-dialog-body` },
+      { id: "sync-disconnect-dialog-button" },
+    ]);
+
+    const flags =
+      Services.prompt.BUTTON_TITLE_IS_STRING * Services.prompt.BUTTON_POS_0 +
+      Services.prompt.BUTTON_TITLE_CANCEL * Services.prompt.BUTTON_POS_1;
+
+    const buttonPressed = Services.prompt.confirmEx(
+      window,
+      title,
+      body,
+      flags,
+      button,
+      null,
+      null,
+      null,
+      {}
+    );
+    return buttonPressed == 0;
+  },
+
+  async _disconnectSync() {
+    await fxAccounts.telemetry.recordDisconnection("sync", "ui");
+
+    await Weave.Service.promiseInitialized;
+    await Weave.Service.startOver();
+
+    return true;
+  },
+
+  doSync() {
+    if (!UIState.isReady()) {
+      return;
+    }
+    const state = UIState.get();
+    if (state.status == UIState.STATUS_SIGNED_IN) {
+      this.updateSyncStatus({ syncing: true });
+      Services.tm.dispatchToMainThread(() => {
+        fxAccounts.commands.pollDeviceCommands().catch(e => {
+          this.log.error("Fetching missed remote commands failed.", e);
+        });
+        Weave.Service.sync();
+      });
+    }
+  },
+
+  doSyncFromFxaMenu(sourceElement) {
+    this.doSync();
+    this.emitFxaToolbarTelemetry("sync_now", sourceElement);
+  },
+
+  openPrefs(entryPoint = "syncbutton", origin = undefined, urlParams = {}) {
+    window.openPreferences("paneSync", {
+      origin,
+      urlParams: { ...urlParams, entrypoint: entryPoint },
+    });
+  },
+
+  openPrefsFromFxaMenu(type, sourceElement) {
+    this.emitFxaToolbarTelemetry(type, sourceElement);
+    let entryPoint = this._getEntryPointForElement(sourceElement);
+    this.openPrefs(entryPoint);
+  },
+
+  openChooseWhatToSync(type, sourceElement) {
+    this.emitFxaToolbarTelemetry(type, sourceElement);
+    let entryPoint = this._getEntryPointForElement(sourceElement);
+    this.openPrefs(entryPoint, null, { action: "choose-what-to-sync" });
+  },
+
+  async openSyncSetup(type, sourceElement, extraParams = {}) {
+    this.emitFxaToolbarTelemetry(type, sourceElement);
+    const entryPoint = this._getEntryPointForElement(sourceElement);
+
+    try {
+      const hasKeys = await fxAccounts.keys.hasKeysForScope(SCOPE_APP_SYNC);
+
+      if (hasKeys) {
+        this.openPrefs(entryPoint, null, { action: "choose-what-to-sync" });
+      } else {
+        if (!(await FxAccounts.canConnectAccount())) {
+          return;
+        }
+        const url = await FxAccounts.config.promiseSetPasswordURI(
+          entryPoint,
+          extraParams
+        );
+        switchToTabHavingURI(url, true, { replaceQueryString: true });
+      }
+    } catch (err) {
+      this.log.error("Failed to determine sync setup flow", err);
+      this.openPrefs(entryPoint);
+    }
+  },
+
+  async signInToSync(sourceElement) {
+    const entryPoint =
+      this._getEntryPointForElement(sourceElement) === "fxa_app_menu"
+        ? "send-tab-app-menu"
+        : "send-tab-account-menu";
+    var url = await FxAccounts.config.promiseConnectAccountURI(entryPoint, {});
+    switchToTabHavingURI(url, true, {});
+  },
+
+  enableSync() {
+    openTrustedLinkIn("about:preferences#sync", "tab");
+  },
+
+  async openPairDevice(sourceElement) {
+    const entryPoint =
+      this._getEntryPointForElement(sourceElement) === "fxa_app_menu"
+        ? "send-tab-app-menu"
+        : "send-tab-account-menu";
+    const url = await FxAccounts.config.promisePairingURI({
+      entrypoint: entryPoint,
+    });
+    switchToTabHavingURI(url, true, {});
+  },
+
+  async verifyAccount() {
+    openTrustedLinkIn("about:preferences#sync", "tab");
+  },
+
+  openSendTabHelp() {
+    const url = Services.urlFormatter.formatURLPref(
+      "identity.sendtab.deviceissues.url"
+    );
+    switchToTabHavingURI(url, true, { replaceQueryString: true });
+  },
+
+  openSyncedTabsPanel() {
+    let placement = CustomizableUI.getPlacementOfWidget("sync-button");
+    let area = placement?.area;
+    let anchor = document.getElementById("sync-button");
+    if (area == CustomizableUI.AREA_FIXED_OVERFLOW_PANEL) {
+      let navbar = document.getElementById(CustomizableUI.AREA_NAVBAR);
+      navbar.overflowable.show().then(() => {
+        PanelUI.showSubView("PanelUI-remotetabs", anchor);
+      }, console.error);
+    } else {
+      if (
+        !anchor?.checkVisibility({ checkVisibilityCSS: true, flush: false })
+      ) {
+        anchor = document.getElementById("PanelUI-menu-button");
+      }
+      PanelUI.showSubView("PanelUI-remotetabs", anchor);
+    }
+  },
+
+  refreshSyncButtonsTooltip() {
+    const state = UIState.get();
+    this.updateSyncButtonsTooltip(state);
+  },
+
+  updateSyncButtonsTooltip(state) {
+    let l10nId, l10nArgs;
+    switch (state.status) {
+      case UIState.STATUS_NOT_VERIFIED:
+        l10nId = "account-verify";
+        l10nArgs = { email: state.email };
+        break;
+      case UIState.STATUS_LOGIN_FAILED:
+        l10nId = "account-reconnect";
+        l10nArgs = { email: state.email };
+        break;
+      case UIState.STATUS_NOT_CONFIGURED:
+        break;
+      default: {
+        let lastSyncDate = this.formatLastSyncDate(state.lastSync);
+        if (lastSyncDate) {
+          l10nId = "appmenu-fxa-last-sync";
+          l10nArgs = { time: lastSyncDate };
+        }
+      }
+    }
+    const tooltiptext = l10nId
+      ? this.fluentStrings.formatValueSync(l10nId, l10nArgs)
+      : null;
+
+    let syncNowBtns = [
+      "PanelUI-remotetabs-syncnow",
+      "PanelUI-fxa-menu-syncnow-button",
+    ];
+    syncNowBtns.forEach(id => {
+      let el = PanelMultiView.getViewNode(document, id);
+      if (tooltiptext) {
+        el.setAttribute("tooltiptext", tooltiptext);
+      } else {
+        el.removeAttribute("tooltiptext");
+      }
+    });
+  },
+
+  get relativeTimeFormat() {
+    delete this.relativeTimeFormat;
+    return (this.relativeTimeFormat = new Services.intl.RelativeTimeFormat(
+      undefined,
+      { style: "long" }
+    ));
+  },
+
+  formatLastSyncDate(date) {
+    if (!date) {
+      return null;
+    }
+    try {
+      let adjustedDate = new Date(Date.now() - 1000);
+      let relativeDateStr = this.relativeTimeFormat.formatBestUnit(
+        date < adjustedDate ? date : adjustedDate
+      );
+      return relativeDateStr;
+    } catch (ex) {
+      this.log.warn("failed to format lastSync time", date, ex);
+      return null;
+    }
+  },
+
+  onClientsSynced() {
+    let element = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-remotetabs-main"
+    );
+    if (element) {
+      if (Weave.Service.clientsEngine.stats.numClients > 1) {
+        element.setAttribute("devices-status", "multi");
+      } else {
+        element.setAttribute("devices-status", "single");
+      }
+    }
+  },
+
+  onFxaDisabled() {
+    document.documentElement.setAttribute("fxadisabled", true);
+
+    const toHide = [...document.querySelectorAll(".sync-ui-item")];
+    for (const item of toHide) {
+      item.hidden = true;
+    }
+  },
+
+  hasClientForId(clientId) {
+    return this._attachedClients?.some(c => !!c.id && c.id === clientId);
+  },
+
+  updateCTAPanel(anchor) {
+    const mainPanelEl = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-cta-menu"
+    );
+
+    if (
+      !this.FXA_CTA_MENU_ENABLED ||
+      (anchor &&
+        (anchor.id === "appMenu-fxa-label2" ||
+          anchor.id === "appMenu-nova-fxa-label"))
+    ) {
+      mainPanelEl.hidden = true;
+      return;
+    }
+
+    let monitorPanelEl = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-monitor-button"
+    );
+    let monitorEnabled = Services.prefs.getBoolPref(
+      "identity.fxaccounts.toolbar.pxiToolbarEnabled.monitorEnabled",
+      false
+    );
+    monitorPanelEl.hidden = !monitorEnabled;
+
+    let relayPanelEl = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-relay-button"
+    );
+    let relayEnabled =
+      BrowserUtils.shouldShowPromo(BrowserUtils.PromoType.RELAY) &&
+      Services.prefs.getBoolPref(
+        "identity.fxaccounts.toolbar.pxiToolbarEnabled.relayEnabled",
+        false
+      );
+    let myServicesRelayPanelEl = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-services-menu-relay-button"
+    );
+    let servicesContainerEl = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-services"
+    );
+    if (this.isSignedIn) {
+      const hasRelayClient = this.hasClientForId(FX_RELAY_OAUTH_CLIENT_ID);
+      relayPanelEl.hidden = hasRelayClient;
+      myServicesRelayPanelEl.hidden = !hasRelayClient;
+      servicesContainerEl.hidden = !hasRelayClient;
+    } else {
+      relayPanelEl.hidden = !relayEnabled;
+      myServicesRelayPanelEl.hidden = true;
+      servicesContainerEl.hidden = true;
+    }
+
+    let VpnPanelEl = PanelMultiView.getViewNode(
+      document,
+      "PanelUI-fxa-menu-vpn-button"
+    );
+    let vpnEnabled =
+      BrowserUtils.shouldShowPromo(BrowserUtils.PromoType.VPN) &&
+      Services.prefs.getBoolPref(
+        "identity.fxaccounts.toolbar.pxiToolbarEnabled.vpnEnabled",
+        false
+      );
+    VpnPanelEl.hidden = !vpnEnabled;
+
+    PanelMultiView.getViewNode(document, "PanelUI-products-separator").hidden =
+      !monitorEnabled && !relayEnabled && !vpnEnabled;
+    mainPanelEl.hidden = false;
+  },
+
+  async openMonitorLink(sourceElement) {
+    this.emitFxaToolbarTelemetry("monitor_cta", sourceElement);
+    await this.openCtaLink(
+      FX_MONITOR_OAUTH_CLIENT_ID,
+      new URL("https://monitor.firefox.com"),
+      new URL("https://monitor.firefox.com/user/breaches")
+    );
+  },
+
+  async openRelayLink(sourceElement) {
+    this.emitFxaToolbarTelemetry("relay_cta", sourceElement);
+    await this.openCtaLink(
+      FX_RELAY_OAUTH_CLIENT_ID,
+      new URL("https://relay.firefox.com"),
+      new URL("https://relay.firefox.com/accounts/profile")
+    );
+  },
+
+  async openVPNLink(sourceElement) {
+    this.emitFxaToolbarTelemetry("vpn_cta", sourceElement);
+    await this.openCtaLink(
+      VPN_OAUTH_CLIENT_ID,
+      new URL("https://www.mozilla.org/en-US/products/vpn/"),
+      new URL("https://www.mozilla.org/en-US/products/vpn/")
+    );
+  },
+
+  async openCtaLink(clientId, defaultUrl, signedInUrl) {
+    const params = {
+      utm_medium: "firefox-desktop",
+      utm_source: "toolbar",
+      utm_campaign: "discovery",
+    };
+    const searchParams = new URLSearchParams(params);
+
+    if (!this.isSignedIn) {
+      defaultUrl.search = searchParams.toString();
+      defaultUrl.searchParams.append("utm_content", "notsignedin");
+      this.openLink(defaultUrl);
+      PanelUI.hide();
+      return;
+    }
+
+    const url = this.hasClientForId(clientId) ? signedInUrl : defaultUrl;
+    url.search = searchParams.toString();
+    url.searchParams.append("utm_content", "signedIn");
+
+    this.openLink(url);
+    PanelUI.hide();
+  },
+
+  getMenuCtaCopy(feature) {
+    const ctaCopyVariant = feature.getVariable("ctaCopyVariant");
+    let headerTitleL10nId;
+    let headerDescription;
+    switch (ctaCopyVariant) {
+      case "sync-devices": {
+        if (feature === NimbusFeatures.fxaAppMenuItem) {
+          return "fxa-menu-message-sync-devices-collapsed-text";
+        }
+        headerTitleL10nId = "fxa-menu-message-sync-devices-primary-text";
+        headerDescription = this.fluentStrings.formatValueSync(
+          "fxa-menu-message-sync-devices-secondary-text"
+        );
+        break;
+      }
+      case "backup-data": {
+        if (feature === NimbusFeatures.fxaAppMenuItem) {
+          return "fxa-menu-message-backup-data-collapsed-text";
+        }
+        headerTitleL10nId = "fxa-menu-message-backup-data-primary-text";
+        headerDescription = this.fluentStrings.formatValueSync(
+          "fxa-menu-message-backup-data-secondary-text"
+        );
+        break;
+      }
+      case "backup-sync": {
+        if (feature === NimbusFeatures.fxaAppMenuItem) {
+          return "fxa-menu-message-backup-sync-collapsed-text";
+        }
+        headerTitleL10nId = "fxa-menu-message-backup-sync-primary-text";
+        headerDescription = this.fluentStrings.formatValueSync(
+          "fxa-menu-message-backup-sync-secondary-text"
+        );
+        break;
+      }
+      case "mobile": {
+        if (feature === NimbusFeatures.fxaAppMenuItem) {
+          return "fxa-menu-message-mobile-collapsed-text";
+        }
+        headerTitleL10nId = "fxa-menu-message-mobile-primary-text";
+        headerDescription = this.fluentStrings.formatValueSync(
+          "fxa-menu-message-mobile-secondary-text"
+        );
+        break;
+      }
+      default: {
+        return null;
+      }
+    }
+
+    return { headerTitleL10nId, headerDescription };
+  },
+
+  applyAvatarIconVariant(variant) {
+    const ICON_VARIANTS = ["control", "human-circle", "fox-circle"];
+
+    if (!ICON_VARIANTS.includes(variant)) {
+      return;
+    }
+
+    document.documentElement.setAttribute("fxa-avatar-icon-variant", variant);
+  },
+
+  openLink(url) {
+    switchToTabHavingURI(url, true, { replaceQueryString: true });
+  },
+
+  sendTabToolbarButtonShouldBeEnabled(uri) {
+    this.init();
+
+    if (!this.FXA_ENABLED) {
+      return false;
+    }
+
+    if (this.sendTabConfiguredAndLoading) {
+      return false;
+    }
+
+    return !!BrowserUtils.getShareableURL(uri);
+  },
+
+  async populateSendTabToolbarButton(menuPopup) {
+    this.populateSendTabToDevicesMenu(
+      menuPopup,
+      menuPopup.documentGlobal.gBrowser.currentURI,
+      menuPopup.documentGlobal.gBrowser.contentTitle,
+      { contextMenuType: "toolbar" }
+    );
+  },
+
+  QueryInterface: ChromeUtils.generateQI([
+    "nsIObserver",
+    "nsISupportsWeakReference",
+  ]),
+};

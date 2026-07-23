@@ -1,0 +1,78 @@
+<!-- This Source Code Form is subject to the terms of the Mozilla Public
+   - License, v. 2.0. If a copy of the MPL was not distributed with this
+   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+
+<panel id="widget-overflow"
+       class="panel-no-padding"
+       role="group"
+       type="arrow"
+       noautofocus="true"
+       position="bottomright topright"
+       hidden="true">
+  <panelmultiview mainViewId="widget-overflow-mainView">
+    <panelview id="widget-overflow-mainView"
+               context="toolbar-context-menu">
+      <vbox class="panel-subview-body">
+        <vbox id="widget-overflow-list" class="widget-overflow-list"
+              overflowfortoolbar="nav-bar"/>
+        <toolbarseparator id="widget-overflow-fixed-separator" hidden="true"/>
+        <vbox id="widget-overflow-fixed-list" class="widget-overflow-list" hidden="true" />
+      </vbox>
+      <toolbarseparator />
+      <toolbarbutton command="cmd_CustomizeToolbars"
+                      id="overflowMenu-customize-button"
+                      class="subviewbutton panel-subview-footer-button"
+                      data-l10n-id="toolbar-overflow-customize-button"/>
+    </panelview>
+  </panelmultiview>
+  <menupopup id="customizationPanelItemContextMenu">
+    <menuitem id="customizationPanelItemContextMenuPin"
+              data-lazy-l10n-id="toolbar-context-menu-pin-to-overflow-menu"
+              closemenu="single"
+              class="customize-context-moveToPanel"/>
+    <menuitem id="customizationPanelItemContextMenuUnpin"
+              closemenu="single"
+              class="customize-context-moveToToolbar"
+              data-l10n-id="customize-menu-unpin-from-overflowmenu"/>
+    <menuitem id="customizationPanelItemContextMenuRemove"
+              closemenu="single"
+              class="customize-context-removeFromPanel"
+              data-lazy-l10n-id="toolbar-context-menu-remove-from-toolbar"/>
+    <menuseparator/>
+    <menuitem command="cmd_CustomizeToolbars"
+              class="viewCustomizeToolbar"
+              data-lazy-l10n-id="toolbar-context-menu-view-customize-toolbar"/>
+  </menupopup>
+</panel>
+
+<html:template id="customModeWrapper">
+  <menupopup id="customizationPaletteItemContextMenu">
+    <menuitem id="customizationPaletteItemContextMenuAddToToolbar"
+              class="customize-context-addToToolbar"
+              data-l10n-id="customize-menu-add-to-toolbar"/>
+    <menuitem id="customizationPaletteItemContextMenuAddToPanel"
+              class="customize-context-addToPanel"
+              data-l10n-id="customize-menu-add-to-overflowmenu"/>
+  </menupopup>
+
+  <panel id="downloads-button-autohide-panel"
+         role="group"
+         type="arrow">
+    <checkbox id="downloads-button-autohide-checkbox"
+              data-l10n-id="customize-mode-downloads-button-autohide" checked="true"/>
+  </panel>
+</html:template>
+
+<panel id="appMenu-popup"
+       class="cui-widget-panel panel-no-padding"
+       role="group"
+       type="arrow"
+       hidden="true"
+       flip="slide"
+       position="bottomright topright"
+       hidepopovertail=""
+       noautofocus="true">
+  <panelmultiview id="appMenu-multiView" mainViewId="appMenu-mainView"
+                  viewCacheId="appMenu-viewCache">
+  </panelmultiview>
+</panel>

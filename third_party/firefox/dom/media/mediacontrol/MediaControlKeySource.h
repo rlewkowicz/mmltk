@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_MEDIACONTROL_MEDIACONTROLKEYSOURCE_H_
+#define DOM_MEDIA_MEDIACONTROL_MEDIACONTROLKEYSOURCE_H_
+
+#include "mozilla/Maybe.h"
+#include "mozilla/dom/MediaControllerBinding.h"
+#include "mozilla/dom/MediaMetadata.h"
+#include "mozilla/dom/MediaSession.h"
+#include "mozilla/dom/MediaSessionBinding.h"
+#include "nsISupportsImpl.h"
+#include "nsTArray.h"
+
+namespace mozilla::dom {
+
+struct AbsoluteSeek {
+  double mSeekTime;
+  bool mFastSeek;
+};
+struct MediaControlActionParams {
+  Maybe<AbsoluteSeek> mAbsolute;
+  Maybe<double> mRelativeSeekOffset;
+  Maybe<double> mVolume;
+
+  MediaControlActionParams() = default;
+  MediaControlActionParams(double aSeekTime, bool aFastSeek)
+      : mAbsolute(Some(AbsoluteSeek{aSeekTime, aFastSeek})) {}
+  explicit MediaControlActionParams(double aRelativeSeekOffset)
+      : mRelativeSeekOffset(Some(aRelativeSeekOffset)) {}
+
+  static MediaControlActionParams FromVolume(double aVolume) {
+    MediaControlActionParams params;
+    params.mVolume = Some(aVolume);
+    return params;
+  }
+};
+
+struct MediaControlAction {
+  MediaControlAction() = default;
+  explicit MediaControlAction(MediaControlKey aKey) : mKey(Some(aKey)) {}
+  MediaControlAction(MediaControlKey aKey,
+                     const MediaControlActionParams& aParams)
+      : mKey(Some(aKey)), mParams(aParams) {}
+  Maybe<MediaControlKey> mKey;
+  MediaControlActionParams mParams;
+};
+
+class MediaControlKeyListener {
+ public:
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+  MediaControlKeyListener() = default;
+
+  virtual void OnActionPerformed(const MediaControlAction& aAction) = 0;
+
+ protected:
+  virtual ~MediaControlKeyListener() = default;
+};
+
+class MediaControlKeyHandler final : public MediaControlKeyListener {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(MediaControlKeyHandler, override)
+  void OnActionPerformed(const MediaControlAction& aAction) override;
+
+ private:
+  virtual ~MediaControlKeyHandler() = default;
+};
+
+class MediaControlKeySource {
+ public:
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+  MediaControlKeySource();
+
+  using MediaKeysArray = nsTArray<MediaControlKey>;
+
+  virtual void AddListener(MediaControlKeyListener* aListener);
+  virtual void RemoveListener(MediaControlKeyListener* aListener);
+  size_t GetListenersNum() const;
+
+  virtual bool Open() = 0;
+  virtual void Close();
+  virtual bool IsOpened() const = 0;
+
+  virtual void SetPlaybackState(MediaSessionPlaybackState aState);
+  virtual MediaSessionPlaybackState GetPlaybackState() const;
+
+  virtual void SetMediaMetadata(const MediaMetadataBase& aMetadata) {}
+
+  virtual void SetSupportedMediaKeys(const MediaKeysArray& aSupportedKeys) = 0;
+
+  virtual void SetEnableFullScreen(bool aIsEnabled) {};
+  virtual void SetPositionState(const Maybe<PositionState>& aState) {};
+
+ protected:
+  virtual ~MediaControlKeySource() = default;
+  nsTArray<RefPtr<MediaControlKeyListener>> mListeners;
+  MediaSessionPlaybackState mPlaybackState;
+};
+
+}  
+
+#endif

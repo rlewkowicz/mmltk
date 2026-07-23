@@ -1,0 +1,1793 @@
+/*
+ * Copyright © 1998-2004  David Turner and Werner Lemberg
+ * Copyright © 2006  Behdad Esfahbod
+ * Copyright © 2007,2008,2009  Red Hat, Inc.
+ * Copyright © 2012,2013  Google, Inc.
+ *
+ *  This is part of HarfBuzz, a text shaping library.
+ *
+ * Permission is hereby granted, without written agreement and without
+ * license or royalty fees, to use, copy, modify, and distribute this
+ * software and its documentation for any purpose, provided that the
+ * above copyright notice and the following two paragraphs appear in
+ * all copies of this software.
+ *
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE TO ANY PARTY FOR
+ * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES
+ * ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN
+ * IF THE COPYRIGHT HOLDER HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ *
+ * THE COPYRIGHT HOLDER SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING,
+ * BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+ * FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ * ON AN "AS IS" BASIS, AND THE COPYRIGHT HOLDER HAS NO OBLIGATION TO
+ * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ *
+ * Red Hat Author(s): Behdad Esfahbod
+ * Google Author(s): Behdad Esfahbod
+ */
+
+#include "hb.hh"
+
+#ifndef HB_NO_OT_LAYOUT
+
+#ifdef HB_NO_OT_TAG
+#error "Cannot compile hb-ot-layout.cc with HB_NO_OT_TAG."
+#endif
+
+#include "hb-open-type.hh"
+#include "hb-ot-layout.hh"
+#include "hb-ot-face.hh"
+#include "hb-ot-map.hh"
+#include "hb-map.hh"
+
+#include "hb-ot-kern-table.hh"
+#include "hb-ot-layout-gdef-table.hh"
+#include "hb-ot-layout-gsub-table.hh"
+#include "hb-ot-layout-gpos-table.hh"
+#include "hb-ot-layout-base-table.hh"
+#include "hb-ot-layout-jstf-table.hh" // Just so we compile it; unused otherwise.
+#include "hb-ot-name-table.hh"
+#include "hb-ot-os2-table.hh"
+
+#include "hb-aat-layout-morx-table.hh"
+#include "hb-aat-layout-opbd-table.hh" // Just so we compile it; unused otherwise.
+
+using OT::Layout::GSUB;
+using OT::Layout::GPOS;
+
+
+
+
+#ifndef HB_NO_OT_KERN
+bool
+hb_ot_layout_has_kerning (hb_face_t *face)
+{
+  return face->table.kern->table->has_data ();
+}
+
+bool
+hb_ot_layout_has_machine_kerning (hb_face_t *face)
+{
+  return face->table.kern->table->has_state_machine ();
+}
+
+bool
+hb_ot_layout_has_cross_kerning (hb_face_t *face)
+{
+  return face->table.kern->table->has_cross_stream ();
+}
+
+void
+hb_ot_layout_kern (const hb_ot_shape_plan_t *plan,
+		   hb_font_t *font,
+		   hb_buffer_t  *buffer)
+{
+  auto &accel = *font->face->table.kern;
+  hb_blob_t *blob = accel.get_blob ();
+
+  AAT::hb_aat_apply_context_t c (plan, font, buffer, blob);
+
+  if (!buffer->message (font, "start table kern")) return;
+  c.buffer_glyph_set = accel.scratch.create_buffer_glyph_set ();
+  accel.apply (&c);
+  accel.scratch.destroy_buffer_glyph_set (c.buffer_glyph_set);
+  (void) buffer->message (font, "end table kern");
+}
+#endif
+
+
+
+bool
+OT::GDEF::is_blocklisted (hb_blob_t *blob,
+			  hb_face_t *face) const
+{
+#ifdef HB_NO_OT_LAYOUT_BLOCKLIST
+  return false;
+#endif
+  switch HB_CODEPOINT_ENCODE3(blob->length,
+			      face->table.GSUB->table.get_length (),
+			      face->table.GPOS->table.get_length ())
+  {
+    case HB_CODEPOINT_ENCODE3 (442, 2874, 42038):
+    case HB_CODEPOINT_ENCODE3 (430, 2874, 40662):
+    case HB_CODEPOINT_ENCODE3 (442, 2874, 39116):
+    case HB_CODEPOINT_ENCODE3 (430, 2874, 39374):
+    case HB_CODEPOINT_ENCODE3 (490, 3046, 41638):
+    case HB_CODEPOINT_ENCODE3 (478, 3046, 41902):
+    case HB_CODEPOINT_ENCODE3 (898, 12554, 46470):
+    case HB_CODEPOINT_ENCODE3 (910, 12566, 47732):
+    case HB_CODEPOINT_ENCODE3 (928, 23298, 59332):
+    case HB_CODEPOINT_ENCODE3 (940, 23310, 60732):
+    case HB_CODEPOINT_ENCODE3 (964, 23836, 60072):
+    case HB_CODEPOINT_ENCODE3 (976, 23832, 61456):
+    case HB_CODEPOINT_ENCODE3 (994, 24474, 60336):
+    case HB_CODEPOINT_ENCODE3 (1006, 24470, 61740):
+    case HB_CODEPOINT_ENCODE3 (1006, 24576, 61346):
+    case HB_CODEPOINT_ENCODE3 (1018, 24572, 62828):
+    case HB_CODEPOINT_ENCODE3 (1006, 24576, 61352):
+    case HB_CODEPOINT_ENCODE3 (1018, 24572, 62834):
+    case HB_CODEPOINT_ENCODE3 (832, 7324, 47162):
+    case HB_CODEPOINT_ENCODE3 (844, 7302, 45474):
+    case HB_CODEPOINT_ENCODE3 (180, 13054, 7254):
+    case HB_CODEPOINT_ENCODE3 (192, 12638, 7254):
+    case HB_CODEPOINT_ENCODE3 (192, 12690, 7254):
+    case HB_CODEPOINT_ENCODE3 (188, 248, 3852):
+    case HB_CODEPOINT_ENCODE3 (188, 264, 3426):
+    case HB_CODEPOINT_ENCODE3 (1058, 47032, 11818):
+    case HB_CODEPOINT_ENCODE3 (1046, 47030, 12600):
+    case HB_CODEPOINT_ENCODE3 (1058, 71796, 16770):
+    case HB_CODEPOINT_ENCODE3 (1046, 71790, 17862):
+    case HB_CODEPOINT_ENCODE3 (1046, 71788, 17112):
+    case HB_CODEPOINT_ENCODE3 (1058, 71794, 17514):
+    case HB_CODEPOINT_ENCODE3 (1330, 109904, 57938):
+    case HB_CODEPOINT_ENCODE3 (1330, 109904, 58972):
+    case HB_CODEPOINT_ENCODE3 (1004, 59092, 14836):
+    case HB_CODEPOINT_ENCODE3 (588, 5078, 14418):
+    case HB_CODEPOINT_ENCODE3 (588, 5078, 14238):
+    case HB_CODEPOINT_ENCODE3 (894, 17162, 33960):
+    case HB_CODEPOINT_ENCODE3 (894, 17154, 34472):
+    case HB_CODEPOINT_ENCODE3 (816, 7868, 17052):
+    case HB_CODEPOINT_ENCODE3 (816, 7868, 17138):
+      return true;
+  }
+  return false;
+}
+
+static void
+_hb_ot_layout_set_glyph_props (hb_font_t *font,
+			       hb_buffer_t *buffer)
+{
+  _hb_buffer_assert_gsubgpos_vars (buffer);
+
+  const auto &gdef = *font->face->table.GDEF;
+  unsigned int count = buffer->len;
+  hb_glyph_info_t *info = buffer->info;
+  for (unsigned int i = 0; i < count; i++)
+  {
+    _hb_glyph_info_set_glyph_props (&info[i], gdef.get_glyph_props (info[i].codepoint));
+    _hb_glyph_info_clear_lig_props (&info[i]);
+  }
+}
+
+
+hb_bool_t
+hb_ot_layout_has_glyph_classes (hb_face_t *face)
+{
+  return face->table.GDEF->table->has_glyph_classes ();
+}
+
+hb_ot_layout_glyph_class_t
+hb_ot_layout_get_glyph_class (hb_face_t      *face,
+			      hb_codepoint_t  glyph)
+{
+  return (hb_ot_layout_glyph_class_t) face->table.GDEF->table->get_glyph_class (glyph);
+}
+
+void
+hb_ot_layout_get_glyphs_in_class (hb_face_t                  *face,
+				  hb_ot_layout_glyph_class_t  klass,
+				  hb_set_t                   *glyphs )
+{
+  return face->table.GDEF->table->get_glyphs_in_class (klass, glyphs);
+}
+
+#ifndef HB_NO_LAYOUT_UNUSED
+unsigned int
+hb_ot_layout_get_attach_points (hb_face_t      *face,
+				hb_codepoint_t  glyph,
+				unsigned int    start_offset,
+				unsigned int   *point_count ,
+				unsigned int   *point_array )
+{
+  return face->table.GDEF->table->get_attach_points (glyph,
+						     start_offset,
+						     point_count,
+						     point_array);
+}
+unsigned int
+hb_ot_layout_get_ligature_carets (hb_font_t      *font,
+				  hb_direction_t  direction,
+				  hb_codepoint_t  glyph,
+				  unsigned int    start_offset,
+				  unsigned int   *caret_count ,
+				  hb_position_t  *caret_array )
+{
+  return font->face->table.GDEF->table->get_lig_carets (font, direction, glyph, start_offset, caret_count, caret_array);
+}
+#endif
+
+
+
+bool
+GSUB::is_blocklisted (hb_blob_t *blob HB_UNUSED,
+			  hb_face_t *face) const
+{
+#ifdef HB_NO_OT_LAYOUT_BLOCKLIST
+  return false;
+#endif
+  return false;
+}
+
+bool
+GPOS::is_blocklisted (hb_blob_t *blob HB_UNUSED,
+			  hb_face_t *face HB_UNUSED) const
+{
+#ifdef HB_NO_OT_LAYOUT_BLOCKLIST
+  return false;
+#endif
+  return false;
+}
+
+static const OT::GSUBGPOS&
+get_gsubgpos_table (hb_face_t *face,
+		    hb_tag_t   table_tag)
+{
+  switch (table_tag) {
+    case HB_OT_TAG_GSUB: return *face->table.GSUB->table;
+    case HB_OT_TAG_GPOS: return *face->table.GPOS->table;
+    default:             return Null (OT::GSUBGPOS);
+  }
+}
+
+
+unsigned int
+hb_ot_layout_table_get_script_tags (hb_face_t    *face,
+				    hb_tag_t      table_tag,
+				    unsigned int  start_offset,
+				    unsigned int *script_count ,
+				    hb_tag_t     *script_tags  )
+{
+  const OT::GSUBGPOS &g = get_gsubgpos_table (face, table_tag);
+
+  return g.get_script_tags (start_offset, script_count, script_tags);
+}
+
+#define HB_OT_TAG_LATIN_SCRIPT		HB_TAG ('l', 'a', 't', 'n')
+
+hb_bool_t
+hb_ot_layout_table_find_script (hb_face_t    *face,
+				hb_tag_t      table_tag,
+				hb_tag_t      script_tag,
+				unsigned int *script_index )
+{
+  static_assert ((OT::Index::NOT_FOUND_INDEX == HB_OT_LAYOUT_NO_SCRIPT_INDEX), "");
+  const OT::GSUBGPOS &g = get_gsubgpos_table (face, table_tag);
+
+  if (g.find_script_index (script_tag, script_index))
+    return true;
+
+  if (g.find_script_index (HB_OT_TAG_DEFAULT_SCRIPT, script_index))
+    return false;
+
+  if (g.find_script_index (HB_OT_TAG_DEFAULT_LANGUAGE, script_index))
+    return false;
+
+  if (g.find_script_index (HB_OT_TAG_LATIN_SCRIPT, script_index))
+    return false;
+
+  if (script_index) *script_index = HB_OT_LAYOUT_NO_SCRIPT_INDEX;
+  return false;
+}
+
+#ifndef HB_DISABLE_DEPRECATED
+hb_bool_t
+hb_ot_layout_table_choose_script (hb_face_t      *face,
+				  hb_tag_t        table_tag,
+				  const hb_tag_t *script_tags,
+				  unsigned int   *script_index  ,
+				  hb_tag_t       *chosen_script )
+{
+  const hb_tag_t *t;
+  for (t = script_tags; *t; t++);
+  return hb_ot_layout_table_select_script (face, table_tag, t - script_tags, script_tags, script_index, chosen_script);
+}
+#endif
+
+hb_bool_t
+hb_ot_layout_table_select_script (hb_face_t      *face,
+				  hb_tag_t        table_tag,
+				  unsigned int    script_count,
+				  const hb_tag_t *script_tags,
+				  unsigned int   *script_index  ,
+				  hb_tag_t       *chosen_script )
+{
+  static_assert ((OT::Index::NOT_FOUND_INDEX == HB_OT_LAYOUT_NO_SCRIPT_INDEX), "");
+  const OT::GSUBGPOS &g = get_gsubgpos_table (face, table_tag);
+  unsigned int i;
+
+  for (i = 0; i < script_count; i++)
+  {
+    if (g.find_script_index (script_tags[i], script_index))
+    {
+      if (chosen_script)
+	*chosen_script = script_tags[i];
+      return true;
+    }
+  }
+
+  if (g.find_script_index (HB_OT_TAG_DEFAULT_SCRIPT, script_index)) {
+    if (chosen_script)
+      *chosen_script = HB_OT_TAG_DEFAULT_SCRIPT;
+    return false;
+  }
+
+  if (g.find_script_index (HB_OT_TAG_DEFAULT_LANGUAGE, script_index)) {
+    if (chosen_script)
+      *chosen_script = HB_OT_TAG_DEFAULT_LANGUAGE;
+    return false;
+  }
+
+  if (g.find_script_index (HB_OT_TAG_LATIN_SCRIPT, script_index)) {
+    if (chosen_script)
+      *chosen_script = HB_OT_TAG_LATIN_SCRIPT;
+    return false;
+  }
+
+  if (script_index) *script_index = HB_OT_LAYOUT_NO_SCRIPT_INDEX;
+  if (chosen_script)
+    *chosen_script = HB_TAG_NONE;
+  return false;
+}
+
+
+unsigned int
+hb_ot_layout_table_get_feature_tags (hb_face_t    *face,
+				     hb_tag_t      table_tag,
+				     unsigned int  start_offset,
+				     unsigned int *feature_count ,
+				     hb_tag_t     *feature_tags  )
+{
+  const OT::GSUBGPOS &g = get_gsubgpos_table (face, table_tag);
+
+  return g.get_feature_tags (start_offset, feature_count, feature_tags);
+}
+
+
+bool
+hb_ot_layout_table_find_feature (hb_face_t    *face,
+				 hb_tag_t      table_tag,
+				 hb_tag_t      feature_tag,
+				 unsigned int *feature_index )
+{
+  static_assert ((OT::Index::NOT_FOUND_INDEX == HB_OT_LAYOUT_NO_FEATURE_INDEX), "");
+  const OT::GSUBGPOS &g = get_gsubgpos_table (face, table_tag);
+
+  unsigned int num_features = g.get_feature_count ();
+  for (unsigned int i = 0; i < num_features; i++)
+  {
+    if (feature_tag == g.get_feature_tag (i)) {
+      if (feature_index) *feature_index = i;
+      return true;
+    }
+  }
+
+  if (feature_index) *feature_index = HB_OT_LAYOUT_NO_FEATURE_INDEX;
+  return false;
+}
+
+
+unsigned int
+hb_ot_layout_script_get_language_tags (hb_face_t    *face,
+				       hb_tag_t      table_tag,
+				       unsigned int  script_index,
+				       unsigned int  start_offset,
+				       unsigned int *language_count ,
+				       hb_tag_t     *language_tags  )
+{
+  const OT::Script &s = get_gsubgpos_table (face, table_tag).get_script (script_index);
+
+  return s.get_lang_sys_tags (start_offset, language_count, language_tags);
+}
+
+
+#ifndef HB_DISABLE_DEPRECATED
+hb_bool_t
+hb_ot_layout_script_find_language (hb_face_t    *face,
+				   hb_tag_t      table_tag,
+				   unsigned int  script_index,
+				   hb_tag_t      language_tag,
+				   unsigned int *language_index)
+{
+  return hb_ot_layout_script_select_language (face,
+					      table_tag,
+					      script_index,
+					      1,
+					      &language_tag,
+					      language_index);
+}
+#endif
+
+
+hb_bool_t
+hb_ot_layout_script_select_language2 (hb_face_t      *face,
+				     hb_tag_t        table_tag,
+				     unsigned int    script_index,
+				     unsigned int    language_count,
+				     const hb_tag_t *language_tags,
+				     unsigned int   *language_index ,
+				     hb_tag_t       *chosen_language )
+{
+  static_assert ((OT::Index::NOT_FOUND_INDEX == HB_OT_LAYOUT_DEFAULT_LANGUAGE_INDEX), "");
+  const OT::Script &s = get_gsubgpos_table (face, table_tag).get_script (script_index);
+  unsigned int i;
+
+  for (i = 0; i < language_count; i++)
+  {
+    if (s.find_lang_sys_index (language_tags[i], language_index))
+    {
+      if (chosen_language)
+        *chosen_language = language_tags[i];
+      return true;
+    }
+  }
+
+  if (s.find_lang_sys_index (HB_OT_TAG_DEFAULT_LANGUAGE, language_index))
+  {
+    if (chosen_language)
+      *chosen_language = HB_OT_TAG_DEFAULT_LANGUAGE;
+    return false;
+  }
+
+  if (language_index)
+    *language_index = HB_OT_LAYOUT_DEFAULT_LANGUAGE_INDEX;
+  if (chosen_language)
+    *chosen_language = HB_TAG_NONE;
+  return false;
+}
+
+hb_bool_t
+hb_ot_layout_script_select_language (hb_face_t      *face,
+				     hb_tag_t        table_tag,
+				     unsigned int    script_index,
+				     unsigned int    language_count,
+				     const hb_tag_t *language_tags,
+				     unsigned int   *language_index )
+{
+  return hb_ot_layout_script_select_language2 (face, table_tag,
+					       script_index,
+					       language_count, language_tags,
+					       language_index, nullptr);
+}
+
+hb_bool_t
+hb_ot_layout_language_get_required_feature_index (hb_face_t    *face,
+						  hb_tag_t      table_tag,
+						  unsigned int  script_index,
+						  unsigned int  language_index,
+						  unsigned int *feature_index )
+{
+  return hb_ot_layout_language_get_required_feature (face,
+						     table_tag,
+						     script_index,
+						     language_index,
+						     feature_index,
+						     nullptr);
+}
+
+
+hb_bool_t
+hb_ot_layout_language_get_required_feature (hb_face_t    *face,
+					    hb_tag_t      table_tag,
+					    unsigned int  script_index,
+					    unsigned int  language_index,
+					    unsigned int *feature_index ,
+					    hb_tag_t     *feature_tag   )
+{
+  const OT::GSUBGPOS &g = get_gsubgpos_table (face, table_tag);
+  const OT::LangSys &l = g.get_script (script_index).get_lang_sys (language_index);
+
+  unsigned int index = l.get_required_feature_index ();
+  if (feature_index) *feature_index = index;
+  if (feature_tag) *feature_tag = g.get_feature_tag (index);
+
+  return l.has_required_feature ();
+}
+
+
+unsigned int
+hb_ot_layout_language_get_feature_indexes (hb_face_t    *face,
+					   hb_tag_t      table_tag,
+					   unsigned int  script_index,
+					   unsigned int  language_index,
+					   unsigned int  start_offset,
+					   unsigned int *feature_count   ,
+					   unsigned int *feature_indexes )
+{
+  const OT::GSUBGPOS &g = get_gsubgpos_table (face, table_tag);
+  const OT::LangSys &l = g.get_script (script_index).get_lang_sys (language_index);
+
+  return l.get_feature_indexes (start_offset, feature_count, feature_indexes);
+}
+
+
+unsigned int
+hb_ot_layout_language_get_feature_tags (hb_face_t    *face,
+					hb_tag_t      table_tag,
+					unsigned int  script_index,
+					unsigned int  language_index,
+					unsigned int  start_offset,
+					unsigned int *feature_count ,
+					hb_tag_t     *feature_tags  )
+{
+  const OT::GSUBGPOS &g = get_gsubgpos_table (face, table_tag);
+  const OT::LangSys &l = g.get_script (script_index).get_lang_sys (language_index);
+
+  static_assert ((sizeof (unsigned int) == sizeof (hb_tag_t)), "");
+  unsigned int ret = l.get_feature_indexes (start_offset, feature_count, (unsigned int *) feature_tags);
+
+  if (feature_tags) {
+    unsigned int count = *feature_count;
+    for (unsigned int i = 0; i < count; i++)
+      feature_tags[i] = g.get_feature_tag ((unsigned int) feature_tags[i]);
+  }
+
+  return ret;
+}
+
+
+hb_bool_t
+hb_ot_layout_language_find_feature (hb_face_t    *face,
+				    hb_tag_t      table_tag,
+				    unsigned int  script_index,
+				    unsigned int  language_index,
+				    hb_tag_t      feature_tag,
+				    unsigned int *feature_index )
+{
+  static_assert ((OT::Index::NOT_FOUND_INDEX == HB_OT_LAYOUT_NO_FEATURE_INDEX), "");
+  const OT::GSUBGPOS &g = get_gsubgpos_table (face, table_tag);
+  const OT::LangSys &l = g.get_script (script_index).get_lang_sys (language_index);
+
+  unsigned int num_features = l.get_feature_count ();
+  for (unsigned int i = 0; i < num_features; i++) {
+    unsigned int f_index = l.get_feature_index (i);
+
+    if (feature_tag == g.get_feature_tag (f_index)) {
+      if (feature_index) *feature_index = f_index;
+      return true;
+    }
+  }
+
+  if (feature_index) *feature_index = HB_OT_LAYOUT_NO_FEATURE_INDEX;
+  return false;
+}
+
+
+unsigned int
+hb_ot_layout_feature_get_lookups (hb_face_t    *face,
+				  hb_tag_t      table_tag,
+				  unsigned int  feature_index,
+				  unsigned int  start_offset,
+				  unsigned int *lookup_count   ,
+				  unsigned int *lookup_indexes )
+{
+  return hb_ot_layout_feature_with_variations_get_lookups (face,
+							   table_tag,
+							   feature_index,
+							   HB_OT_LAYOUT_NO_VARIATIONS_INDEX,
+							   start_offset,
+							   lookup_count,
+							   lookup_indexes);
+}
+
+
+unsigned int
+hb_ot_layout_table_get_lookup_count (hb_face_t    *face,
+				     hb_tag_t      table_tag)
+{
+  return get_gsubgpos_table (face, table_tag).get_lookup_count ();
+}
+
+
+struct hb_collect_features_context_t
+{
+  hb_collect_features_context_t (hb_face_t *face,
+				 hb_tag_t   table_tag,
+				 hb_set_t  *feature_indices_,
+				 const hb_tag_t *features)
+
+    : g (get_gsubgpos_table (face, table_tag)),
+      feature_indices (feature_indices_),
+      has_feature_filter (false),
+      script_count (0),langsys_count (0), feature_index_count (0)
+  {
+    compute_feature_filter (features);
+  }
+
+  void compute_feature_filter (const hb_tag_t *features)
+  {
+    if (features == nullptr)
+    {
+      has_feature_filter = false;
+      return;
+    }
+
+    has_feature_filter = true;
+    hb_set_t features_set;
+    for (; *features; features++)
+      features_set.add (*features);
+
+    for (unsigned i = 0; i < g.get_feature_count (); i++)
+    {
+      hb_tag_t tag = g.get_feature_tag (i);
+      if (features_set.has (tag))
+	feature_indices_filter.add(i);
+    }
+  }
+
+  bool visited (const OT::Script &s)
+  {
+    if (unlikely (!s.has_default_lang_sys () &&
+		  !s.get_lang_sys_count ()))
+      return true;
+
+    if (script_count++ > HB_MAX_SCRIPTS)
+      return true;
+
+    return visited (s, visited_script);
+  }
+  bool visited (const OT::LangSys &l)
+  {
+    if (unlikely (!l.has_required_feature () &&
+		  !l.get_feature_count ()))
+      return true;
+
+    if (langsys_count++ > HB_MAX_LANGSYS)
+      return true;
+
+    return visited (l, visited_langsys);
+  }
+
+  bool visited_feature_indices (unsigned count)
+  {
+    feature_index_count += count;
+    return feature_index_count > HB_MAX_FEATURE_INDICES;
+  }
+
+  private:
+  template <typename T>
+  bool visited (const T &p, hb_set_t &visited_set)
+  {
+    hb_codepoint_t delta = (hb_codepoint_t) ((uintptr_t) &p - (uintptr_t) &g);
+     if (visited_set.has (delta))
+      return true;
+
+    visited_set.add (delta);
+    return false;
+  }
+
+  public:
+  const OT::GSUBGPOS &g;
+  hb_set_t *feature_indices;
+  hb_set_t  feature_indices_filter;
+  bool has_feature_filter;
+
+  private:
+  hb_set_t visited_script;
+  hb_set_t visited_langsys;
+  unsigned int script_count;
+  unsigned int langsys_count;
+  unsigned int feature_index_count;
+};
+
+static void
+langsys_collect_features (hb_collect_features_context_t *c,
+			  const OT::LangSys  &l)
+{
+  if (c->visited (l)) return;
+
+  if (!c->has_feature_filter)
+  {
+    if (l.has_required_feature () && !c->visited_feature_indices (1))
+      c->feature_indices->add (l.get_required_feature_index ());
+
+    if (!c->visited_feature_indices (l.featureIndex.len))
+      l.add_feature_indexes_to (c->feature_indices);
+  }
+  else
+  {
+    if (c->feature_indices_filter.is_empty()) return;
+    unsigned int num_features = l.get_feature_count ();
+    for (unsigned int i = 0; i < num_features; i++)
+    {
+      unsigned int feature_index = l.get_feature_index (i);
+      if (!c->feature_indices_filter.has (feature_index)) continue;
+
+      c->feature_indices->add (feature_index);
+      c->feature_indices_filter.del (feature_index);
+    }
+  }
+}
+
+static void
+script_collect_features (hb_collect_features_context_t *c,
+			 const OT::Script   &s,
+			 const hb_tag_t *languages)
+{
+  if (c->visited (s)) return;
+
+  if (!languages)
+  {
+    if (s.has_default_lang_sys ())
+      langsys_collect_features (c,
+				s.get_default_lang_sys ());
+
+
+    unsigned int count = s.get_lang_sys_count ();
+    for (unsigned int language_index = 0; language_index < count; language_index++)
+      langsys_collect_features (c,
+				s.get_lang_sys (language_index));
+  }
+  else
+  {
+    for (; *languages; languages++)
+    {
+      unsigned int language_index;
+      if (s.find_lang_sys_index (*languages, &language_index))
+	langsys_collect_features (c,
+				  s.get_lang_sys (language_index));
+
+    }
+  }
+}
+
+
+void
+hb_ot_layout_collect_features (hb_face_t      *face,
+			       hb_tag_t        table_tag,
+			       const hb_tag_t *scripts,
+			       const hb_tag_t *languages,
+			       const hb_tag_t *features,
+			       hb_set_t       *feature_indexes )
+{
+  hb_collect_features_context_t c (face, table_tag, feature_indexes, features);
+  if (!scripts)
+  {
+    unsigned int count = c.g.get_script_count ();
+    for (unsigned int script_index = 0; script_index < count; script_index++)
+      script_collect_features (&c,
+			       c.g.get_script (script_index),
+			       languages);
+  }
+  else
+  {
+    for (; *scripts; scripts++)
+    {
+      unsigned int script_index;
+      if (c.g.find_script_index (*scripts, &script_index))
+	script_collect_features (&c,
+				 c.g.get_script (script_index),
+				 languages);
+    }
+  }
+}
+
+void
+hb_ot_layout_collect_features_map (hb_face_t      *face,
+				   hb_tag_t        table_tag,
+				   unsigned        script_index,
+				   unsigned        language_index,
+				   hb_map_t       *feature_map )
+{
+  const OT::GSUBGPOS &g = get_gsubgpos_table (face, table_tag);
+  const OT::LangSys &l = g.get_script (script_index).get_lang_sys (language_index);
+
+  unsigned int count = l.get_feature_indexes (0, nullptr, nullptr);
+  feature_map->alloc (count);
+
+  for (unsigned int i = count; i; i--)
+  {
+    unsigned feature_index = 0;
+    unsigned feature_count = 1;
+    l.get_feature_indexes (i - 1, &feature_count, &feature_index);
+    if (!feature_count)
+      break;
+    hb_tag_t feature_tag = g.get_feature_tag (feature_index);
+    feature_map->set (feature_tag, feature_index);
+  }
+}
+
+
+void
+hb_ot_layout_collect_lookups (hb_face_t      *face,
+			      hb_tag_t        table_tag,
+			      const hb_tag_t *scripts,
+			      const hb_tag_t *languages,
+			      const hb_tag_t *features,
+			      hb_set_t       *lookup_indexes )
+{
+  const OT::GSUBGPOS &g = get_gsubgpos_table (face, table_tag);
+
+  hb_set_t feature_indexes;
+  hb_ot_layout_collect_features (face, table_tag, scripts, languages, features, &feature_indexes);
+
+  for (auto feature_index : feature_indexes)
+    g.get_feature (feature_index).add_lookup_indexes_to (lookup_indexes);
+
+  g.feature_variation_collect_lookups (&feature_indexes, nullptr, lookup_indexes);
+}
+
+
+#ifndef HB_NO_LAYOUT_COLLECT_GLYPHS
+void
+hb_ot_layout_lookup_collect_glyphs (hb_face_t    *face,
+				    hb_tag_t      table_tag,
+				    unsigned int  lookup_index,
+				    hb_set_t     *glyphs_before, 
+				    hb_set_t     *glyphs_input,  
+				    hb_set_t     *glyphs_after,  
+				    hb_set_t     *glyphs_output  )
+{
+  OT::hb_collect_glyphs_context_t c (face,
+				     glyphs_before,
+				     glyphs_input,
+				     glyphs_after,
+				     glyphs_output);
+
+  switch (table_tag)
+  {
+    case HB_OT_TAG_GSUB:
+    {
+      const OT::SubstLookup& l = face->table.GSUB->table->get_lookup (lookup_index);
+      l.collect_glyphs (&c);
+      return;
+    }
+    case HB_OT_TAG_GPOS:
+    {
+      const OT::PosLookup& l = face->table.GPOS->table->get_lookup (lookup_index);
+      l.collect_glyphs (&c);
+      return;
+    }
+  }
+}
+#endif
+
+
+
+
+hb_bool_t
+hb_ot_layout_table_find_feature_variations (hb_face_t    *face,
+					    hb_tag_t      table_tag,
+					    const int    *coords,
+					    unsigned int  num_coords,
+					    unsigned int *variations_index )
+{
+  const OT::GSUBGPOS &g = get_gsubgpos_table (face, table_tag);
+  const OT::GDEF &gdef = *face->table.GDEF->table;
+
+  auto instancer = OT::ItemVarStoreInstancer(&gdef.get_var_store(), nullptr,
+					     hb_array (coords, num_coords));
+
+  return g.find_variations_index (coords, num_coords, variations_index, &instancer);
+}
+
+
+unsigned int
+hb_ot_layout_feature_with_variations_get_lookups (hb_face_t    *face,
+						  hb_tag_t      table_tag,
+						  unsigned int  feature_index,
+						  unsigned int  variations_index,
+						  unsigned int  start_offset,
+						  unsigned int *lookup_count ,
+						  unsigned int *lookup_indexes )
+{
+  static_assert ((OT::FeatureVariations::NOT_FOUND_INDEX == HB_OT_LAYOUT_NO_VARIATIONS_INDEX), "");
+  const OT::GSUBGPOS &g = get_gsubgpos_table (face, table_tag);
+
+  const OT::Feature &f = g.get_feature_variation (feature_index, variations_index);
+
+  return f.get_lookup_indexes (start_offset, lookup_count, lookup_indexes);
+}
+
+
+
+
+hb_bool_t
+hb_ot_layout_has_substitution (hb_face_t *face)
+{
+  return face->table.GSUB->table->has_data ();
+}
+
+
+hb_bool_t
+hb_ot_layout_lookup_would_substitute (hb_face_t            *face,
+				      unsigned int          lookup_index,
+				      const hb_codepoint_t *glyphs,
+				      unsigned int          glyphs_length,
+				      hb_bool_t             zero_context)
+{
+  auto &gsub = face->table.GSUB;
+  if (unlikely (lookup_index >= gsub->lookup_count)) return false;
+  OT::hb_would_apply_context_t c (face, glyphs, glyphs_length, (bool) zero_context);
+
+  const OT::SubstLookup& l = gsub->table->get_lookup (lookup_index);
+  auto *accel = gsub->get_accel (lookup_index);
+  return accel && l.would_apply (&c, accel);
+}
+
+
+void
+hb_ot_layout_substitute_start (hb_font_t    *font,
+			       hb_buffer_t  *buffer)
+{
+  _hb_ot_layout_set_glyph_props (font, buffer);
+}
+
+void
+hb_ot_layout_lookup_substitute_closure (hb_face_t    *face,
+					unsigned int  lookup_index,
+					hb_set_t     *glyphs )
+{
+  hb_map_t done_lookups_glyph_count;
+  hb_hashmap_t<unsigned, hb::unique_ptr<hb_set_t>> done_lookups_glyph_set;
+  OT::hb_closure_context_t c (face, glyphs, &done_lookups_glyph_count, &done_lookups_glyph_set);
+
+  const OT::SubstLookup& l = face->table.GSUB->table->get_lookup (lookup_index);
+
+  l.closure (&c, lookup_index);
+}
+
+void
+hb_ot_layout_lookups_substitute_closure (hb_face_t      *face,
+					 const hb_set_t *lookups,
+					 hb_set_t       *glyphs )
+{
+  hb_map_t done_lookups_glyph_count;
+  hb_hashmap_t<unsigned, hb::unique_ptr<hb_set_t>> done_lookups_glyph_set;
+  OT::hb_closure_context_t c (face, glyphs, &done_lookups_glyph_count, &done_lookups_glyph_set);
+  const GSUB& gsub = *face->table.GSUB->table;
+
+  unsigned int iteration_count = 0;
+  unsigned int glyphs_length;
+  do
+  {
+    c.reset_lookup_visit_count ();
+    glyphs_length = glyphs->get_population ();
+    if (lookups)
+    {
+      for (auto lookup_index : *lookups)
+	gsub.get_lookup (lookup_index).closure (&c, lookup_index);
+    }
+    else
+    {
+      for (unsigned int i = 0; i < gsub.get_lookup_count (); i++)
+	gsub.get_lookup (i).closure (&c, i);
+    }
+  } while (iteration_count++ <= HB_CLOSURE_MAX_STAGES &&
+	   glyphs_length != glyphs->get_population ());
+}
+
+
+
+hb_bool_t
+hb_ot_layout_has_positioning (hb_face_t *face)
+{
+  return face->table.GPOS->table->has_data ();
+}
+
+void
+hb_ot_layout_position_start (hb_font_t *font, hb_buffer_t *buffer)
+{
+  GPOS::position_start (font, buffer);
+}
+
+
+void
+hb_ot_layout_position_finish_advances (hb_font_t *font, hb_buffer_t *buffer)
+{
+  GPOS::position_finish_advances (font, buffer);
+}
+
+void
+hb_ot_layout_position_finish_offsets (hb_font_t *font, hb_buffer_t *buffer)
+{
+  GPOS::position_finish_offsets (font, buffer);
+}
+
+
+#ifndef HB_NO_LAYOUT_FEATURE_PARAMS
+hb_bool_t
+hb_ot_layout_get_size_params (hb_face_t       *face,
+			      unsigned int    *design_size,       
+			      unsigned int    *subfamily_id,      
+			      hb_ot_name_id_t *subfamily_name_id, 
+			      unsigned int    *range_start,       
+			      unsigned int    *range_end          )
+{
+  const GPOS &gpos = *face->table.GPOS->table;
+  const hb_tag_t tag = HB_TAG ('s','i','z','e');
+
+  unsigned int num_features = gpos.get_feature_count ();
+  for (unsigned int i = 0; i < num_features; i++)
+  {
+    if (tag == gpos.get_feature_tag (i))
+    {
+      const OT::Feature &f = gpos.get_feature (i);
+      const OT::FeatureParamsSize &params = f.get_feature_params ().get_size_params (tag);
+
+      if (params.designSize)
+      {
+	if (design_size) *design_size = params.designSize;
+	if (subfamily_id) *subfamily_id = params.subfamilyID;
+	if (subfamily_name_id) *subfamily_name_id = params.subfamilyNameID;
+	if (range_start) *range_start = params.rangeStart;
+	if (range_end) *range_end = params.rangeEnd;
+
+	return true;
+      }
+    }
+  }
+
+  if (design_size) *design_size = 0;
+  if (subfamily_id) *subfamily_id = 0;
+  if (subfamily_name_id) *subfamily_name_id = HB_OT_NAME_ID_INVALID;
+  if (range_start) *range_start = 0;
+  if (range_end) *range_end = 0;
+
+  return false;
+}
+
+
+hb_bool_t
+hb_ot_layout_feature_get_name_ids (hb_face_t       *face,
+				   hb_tag_t         table_tag,
+				   unsigned int     feature_index,
+				   hb_ot_name_id_t *label_id,             
+				   hb_ot_name_id_t *tooltip_id,           
+				   hb_ot_name_id_t *sample_id,            
+				   unsigned int    *num_named_parameters, 
+				   hb_ot_name_id_t *first_param_id        )
+{
+  const OT::GSUBGPOS &g = get_gsubgpos_table (face, table_tag);
+
+  hb_tag_t feature_tag = g.get_feature_tag (feature_index);
+  const OT::Feature &f = g.get_feature (feature_index);
+
+  const OT::FeatureParams &feature_params = f.get_feature_params ();
+  if (&feature_params != &Null (OT::FeatureParams))
+  {
+    const OT::FeatureParamsStylisticSet& ss_params =
+      feature_params.get_stylistic_set_params (feature_tag);
+    if (&ss_params != &Null (OT::FeatureParamsStylisticSet)) 
+    {
+      if (label_id) *label_id = ss_params.uiNameID;
+      if (tooltip_id) *tooltip_id = HB_OT_NAME_ID_INVALID;
+      if (sample_id) *sample_id = HB_OT_NAME_ID_INVALID;
+      if (num_named_parameters) *num_named_parameters = 0;
+      if (first_param_id) *first_param_id = HB_OT_NAME_ID_INVALID;
+      return true;
+    }
+    const OT::FeatureParamsCharacterVariants& cv_params =
+      feature_params.get_character_variants_params (feature_tag);
+    if (&cv_params != &Null (OT::FeatureParamsCharacterVariants)) 
+    {
+      if (label_id) *label_id = cv_params.featUILableNameID;
+      if (tooltip_id) *tooltip_id = cv_params.featUITooltipTextNameID;
+      if (sample_id) *sample_id = cv_params.sampleTextNameID;
+      if (num_named_parameters) *num_named_parameters = cv_params.numNamedParameters;
+      if (first_param_id) *first_param_id = cv_params.firstParamUILabelNameID;
+      return true;
+    }
+  }
+
+  if (label_id) *label_id = HB_OT_NAME_ID_INVALID;
+  if (tooltip_id) *tooltip_id = HB_OT_NAME_ID_INVALID;
+  if (sample_id) *sample_id = HB_OT_NAME_ID_INVALID;
+  if (num_named_parameters) *num_named_parameters = 0;
+  if (first_param_id) *first_param_id = HB_OT_NAME_ID_INVALID;
+  return false;
+}
+unsigned int
+hb_ot_layout_feature_get_characters (hb_face_t      *face,
+				     hb_tag_t        table_tag,
+				     unsigned int    feature_index,
+				     unsigned int    start_offset,
+				     unsigned int   *char_count, 
+				     hb_codepoint_t *characters  )
+{
+  const OT::GSUBGPOS &g = get_gsubgpos_table (face, table_tag);
+  return g.get_feature (feature_index)
+	  .get_feature_params ()
+	  .get_character_variants_params(g.get_feature_tag (feature_index))
+	  .get_characters (start_offset, char_count, characters);
+}
+#endif
+
+
+
+
+struct GSUBProxy
+{
+  static constexpr unsigned table_index = 0u;
+  static constexpr bool always_inplace = false;
+  typedef OT::SubstLookup Lookup;
+
+  GSUBProxy (hb_face_t *face) :
+    accel (*face->table.GSUB) {}
+
+  const GSUB::accelerator_t &accel;
+};
+
+struct GPOSProxy
+{
+  static constexpr unsigned table_index = 1u;
+  static constexpr bool always_inplace = true;
+  typedef OT::PosLookup Lookup;
+
+  GPOSProxy (hb_face_t *face) :
+    accel (*face->table.GPOS) {}
+
+  const GPOS::accelerator_t &accel;
+};
+
+
+static inline bool
+apply_forward (OT::hb_ot_apply_context_t *c,
+	       const OT::hb_ot_layout_lookup_accelerator_t &accel)
+{
+  bool use_hot_subtable_cache = accel.cache_enter (c);
+
+  bool ret = false;
+  hb_buffer_t *buffer = c->buffer;
+  while (buffer->successful)
+  {
+    hb_glyph_info_t *info = buffer->info;
+    unsigned j = buffer->idx;
+    while (j < buffer->len &&
+	   !(accel.digest.may_have (info[j].codepoint) &&
+	     (info[j].mask & c->lookup_mask) &&
+	     c->check_glyph_property (&info[j], c->lookup_props)))
+      j++;
+    if (unlikely (j > buffer->idx && !buffer->next_glyphs (j - buffer->idx)))
+      break;
+    if (buffer->idx >= buffer->len)
+      break;
+
+    if (accel.apply (c, use_hot_subtable_cache))
+      ret = true;
+    else
+      (void) buffer->next_glyph ();
+  }
+
+  if (use_hot_subtable_cache)
+    accel.cache_leave (c);
+
+  return ret;
+}
+
+static inline bool
+apply_backward (OT::hb_ot_apply_context_t *c,
+	       const OT::hb_ot_layout_lookup_accelerator_t &accel)
+{
+  bool ret = false;
+  hb_buffer_t *buffer = c->buffer;
+  do
+  {
+    auto &cur = buffer->cur();
+    if (accel.digest.may_have (cur.codepoint) &&
+	(cur.mask & c->lookup_mask) &&
+	c->check_glyph_property (&cur, c->lookup_props))
+      ret |= accel.apply (c, false);
+
+    buffer->idx--;
+  }
+  while ((int) buffer->idx >= 0);
+  return ret;
+}
+
+template <typename Proxy>
+static inline bool
+apply_string (OT::hb_ot_apply_context_t *c,
+	      const typename Proxy::Lookup &lookup,
+	      const OT::hb_ot_layout_lookup_accelerator_t &accel)
+{
+  hb_buffer_t *buffer = c->buffer;
+
+  if (unlikely (!buffer->len || !c->lookup_mask))
+    return false;
+
+  bool ret = false;
+
+  c->set_lookup_props (lookup.get_props ());
+
+  if (likely (!lookup.is_reverse ()))
+  {
+    if (!Proxy::always_inplace)
+      buffer->clear_output ();
+
+    buffer->idx = 0;
+    ret = apply_forward (c, accel);
+
+    if (!Proxy::always_inplace)
+      buffer->sync ();
+  }
+  else
+  {
+    assert (!buffer->have_output);
+    buffer->idx = buffer->len - 1;
+    ret = apply_backward (c, accel);
+  }
+
+  return ret;
+}
+
+template <typename Proxy>
+inline void hb_ot_map_t::apply (const Proxy &proxy,
+				const hb_ot_shape_plan_t *plan,
+				hb_font_t *font,
+				hb_buffer_t *buffer) const
+{
+  const unsigned int table_index = proxy.table_index;
+  unsigned int i = 0;
+
+  auto *font_data = font->data.ot.get ();
+  auto *var_store_cache = (OT::hb_scalar_cache_t *) font_data;
+
+  OT::hb_ot_apply_context_t c (table_index, font, buffer, proxy.accel.get_blob (), var_store_cache);
+  c.set_recurse_func (Proxy::Lookup::template dispatch_recurse_func<OT::hb_ot_apply_context_t>);
+
+  for (unsigned int stage_index = 0; stage_index < stages[table_index].length; stage_index++)
+  {
+    const stage_map_t *stage = &stages[table_index][stage_index];
+    for (; i < stage->last_lookup; i++)
+    {
+      auto &lookup = lookups[table_index][i];
+
+      unsigned int lookup_index = lookup.index;
+
+      auto *accel = proxy.accel.get_accel (lookup_index);
+      if (unlikely (!accel)) continue;
+
+      if (buffer->messaging () &&
+	  !buffer->message (font, "start lookup %u feature '%c%c%c%c'", lookup_index, HB_UNTAG (lookup.feature_tag))) continue;
+
+      if (accel->digest.may_intersect (buffer->digest))
+      {
+	c.set_lookup_index (lookup_index);
+	c.set_lookup_mask (lookup.mask, false);
+	c.set_auto_zwj (lookup.auto_zwj, false);
+	c.set_auto_zwnj (lookup.auto_zwnj, false);
+	c.set_random (lookup.random);
+	c.set_per_syllable (lookup.per_syllable, false);
+
+	apply_string<Proxy> (&c,
+			     proxy.accel.table->get_lookup (lookup_index),
+			     *accel);
+      }
+      else if (buffer->messaging ())
+	(void) buffer->message (font, "skipped lookup %u feature '%c%c%c%c' because no glyph matches", lookup_index, HB_UNTAG (lookup.feature_tag));
+
+      if (buffer->messaging ())
+	(void) buffer->message (font, "end lookup %u feature '%c%c%c%c'", lookup_index, HB_UNTAG (lookup.feature_tag));
+    }
+
+    if (stage->pause_func)
+    {
+      if (stage->pause_func (plan, font, buffer))
+      {
+	buffer->update_digest ();
+      }
+    }
+  }
+}
+
+void hb_ot_map_t::substitute (const hb_ot_shape_plan_t *plan, hb_font_t *font, hb_buffer_t *buffer) const
+{
+  GSUBProxy proxy (font->face);
+  char tag[5] = {0};
+  hb_tag_to_string (chosen_script[0], tag);
+  if (buffer->messaging () &&
+      !buffer->message (font, "start table GSUB script tag '%s'", tag)) return;
+  apply (proxy, plan, font, buffer);
+  if (buffer->messaging ())
+    (void) buffer->message (font, "end table GSUB script tag '%s'", tag);
+}
+
+void hb_ot_map_t::position (const hb_ot_shape_plan_t *plan, hb_font_t *font, hb_buffer_t *buffer) const
+{
+  GPOSProxy proxy (font->face);
+  char tag[5] = {0};
+  hb_tag_to_string (chosen_script[0], tag);
+  if (buffer->messaging () &&
+      !buffer->message (font, "start table GPOS script tag '%s'", tag)) return;
+  apply (proxy, plan, font, buffer);
+  if (buffer->messaging ())
+    (void) buffer->message (font, "end table GPOS script tag '%s'", tag);
+}
+
+void
+hb_ot_layout_substitute_lookup (OT::hb_ot_apply_context_t *c,
+				const OT::SubstLookup &lookup,
+				const OT::hb_ot_layout_lookup_accelerator_t &accel)
+{
+  apply_string<GSUBProxy> (c, lookup, accel);
+}
+
+#ifndef HB_NO_BASE
+
+static void
+choose_base_tags (hb_script_t    script,
+		  hb_language_t  language,
+		  hb_tag_t      *script_tag,
+		  hb_tag_t      *language_tag)
+{
+  hb_tag_t script_tags[HB_OT_MAX_TAGS_PER_SCRIPT];
+  unsigned script_count = ARRAY_LENGTH (script_tags);
+
+  hb_tag_t language_tags[HB_OT_MAX_TAGS_PER_LANGUAGE];
+  unsigned language_count = ARRAY_LENGTH (language_tags);
+
+  hb_ot_tags_from_script_and_language (script, language,
+				       &script_count, script_tags,
+				       &language_count, language_tags);
+
+  *script_tag = script_count ? script_tags[script_count - 1] : HB_OT_TAG_DEFAULT_SCRIPT;
+  *language_tag = language_count ? language_tags[language_count - 1] : HB_OT_TAG_DEFAULT_LANGUAGE;
+}
+
+hb_bool_t
+hb_ot_layout_get_font_extents (hb_font_t         *font,
+			       hb_direction_t     direction,
+			       hb_tag_t           script_tag,
+			       hb_tag_t           language_tag,
+			       hb_font_extents_t *extents)
+{
+  hb_position_t min = 0, max = 0;
+  if (font->face->table.BASE->get_min_max (font, direction, script_tag, language_tag, HB_TAG_NONE,
+					   &min, &max))
+  {
+    if (extents)
+    {
+      extents->ascender  = max;
+      extents->descender = min;
+      extents->line_gap  = 0;
+    }
+    return true;
+  }
+
+  hb_font_get_extents_for_direction (font, direction, extents);
+  return false;
+}
+
+hb_bool_t
+hb_ot_layout_get_font_extents2 (hb_font_t         *font,
+				hb_direction_t     direction,
+				hb_script_t        script,
+				hb_language_t      language,
+				hb_font_extents_t *extents)
+{
+  hb_tag_t script_tag, language_tag;
+  choose_base_tags (script, language, &script_tag, &language_tag);
+  return hb_ot_layout_get_font_extents (font,
+					direction,
+					script_tag,
+					language_tag,
+					extents);
+}
+
+hb_ot_layout_baseline_tag_t
+hb_ot_layout_get_horizontal_baseline_tag_for_script (hb_script_t script)
+{
+  switch ((int) script)
+  {
+    case HB_SCRIPT_BENGALI:
+    case HB_SCRIPT_DEVANAGARI:
+    case HB_SCRIPT_GUJARATI:
+    case HB_SCRIPT_GURMUKHI:
+    case HB_SCRIPT_TIBETAN:
+    case HB_SCRIPT_LIMBU:
+    case HB_SCRIPT_SYLOTI_NAGRI:
+    case HB_SCRIPT_PHAGS_PA:
+    case HB_SCRIPT_MEETEI_MAYEK:
+    case HB_SCRIPT_SHARADA:
+    case HB_SCRIPT_TAKRI:
+    case HB_SCRIPT_MODI:
+    case HB_SCRIPT_SIDDHAM:
+    case HB_SCRIPT_TIRHUTA:
+    case HB_SCRIPT_MARCHEN:
+    case HB_SCRIPT_NEWA:
+    case HB_SCRIPT_SOYOMBO:
+    case HB_SCRIPT_ZANABAZAR_SQUARE:
+    case HB_SCRIPT_DOGRA:
+    case HB_SCRIPT_GUNJALA_GONDI:
+    case HB_SCRIPT_NANDINAGARI:
+      return HB_OT_LAYOUT_BASELINE_TAG_HANGING;
+
+    case HB_SCRIPT_HANGUL:
+    case HB_SCRIPT_HAN:
+    case HB_SCRIPT_HIRAGANA:
+    case HB_SCRIPT_KATAKANA:
+    case HB_SCRIPT_BOPOMOFO:
+    case HB_SCRIPT_TANGUT:
+    case HB_SCRIPT_NUSHU:
+    case HB_SCRIPT_KHITAN_SMALL_SCRIPT:
+      return HB_OT_LAYOUT_BASELINE_TAG_IDEO_FACE_BOTTOM_OR_LEFT;
+
+    default:
+      return HB_OT_LAYOUT_BASELINE_TAG_ROMAN;
+  }
+}
+
+hb_bool_t
+hb_ot_layout_get_baseline (hb_font_t                   *font,
+			   hb_ot_layout_baseline_tag_t  baseline_tag,
+			   hb_direction_t               direction,
+			   hb_tag_t                     script_tag,
+			   hb_tag_t                     language_tag,
+			   hb_position_t               *coord        )
+{
+  return font->face->table.BASE->get_baseline (font, baseline_tag, direction, script_tag, language_tag, coord);
+}
+
+hb_bool_t
+hb_ot_layout_get_baseline2 (hb_font_t                   *font,
+			    hb_ot_layout_baseline_tag_t  baseline_tag,
+			    hb_direction_t               direction,
+			    hb_script_t                  script,
+			    hb_language_t                language,
+			    hb_position_t               *coord        )
+{
+  hb_tag_t script_tag, language_tag;
+  choose_base_tags (script, language, &script_tag, &language_tag);
+  return hb_ot_layout_get_baseline (font,
+				    baseline_tag,
+				    direction,
+				    script_tag,
+				    language_tag,
+				    coord);
+}
+
+void
+hb_ot_layout_get_baseline_with_fallback (hb_font_t                   *font,
+					 hb_ot_layout_baseline_tag_t  baseline_tag,
+					 hb_direction_t               direction,
+					 hb_tag_t                     script_tag,
+					 hb_tag_t                     language_tag,
+					 hb_position_t               *coord )
+{
+  if (hb_ot_layout_get_baseline (font,
+				 baseline_tag,
+				 direction,
+				 script_tag,
+				 language_tag,
+				 coord))
+    return;
+
+  switch (baseline_tag)
+  {
+  case HB_OT_LAYOUT_BASELINE_TAG_ROMAN:
+    *coord = 0; 
+    break;
+
+  case HB_OT_LAYOUT_BASELINE_TAG_MATH:
+    {
+      hb_codepoint_t glyph;
+      hb_glyph_extents_t extents;
+      if (HB_DIRECTION_IS_HORIZONTAL (direction) &&
+	  (hb_font_get_nominal_glyph (font, 0x2212u, &glyph) ||
+	   hb_font_get_nominal_glyph (font, '-', &glyph)) &&
+	  hb_font_get_glyph_extents (font, glyph, &extents))
+      {
+	*coord = extents.y_bearing + extents.height / 2;
+      }
+      else
+      {
+	hb_position_t x_height = font->y_scale / 2;
+#ifndef HB_NO_METRICS
+	hb_ot_metrics_get_position_with_fallback (font, HB_OT_METRICS_TAG_X_HEIGHT, &x_height);
+#endif
+	*coord = x_height / 2;
+      }
+    }
+    break;
+
+  case HB_OT_LAYOUT_BASELINE_TAG_IDEO_FACE_TOP_OR_RIGHT:
+  case HB_OT_LAYOUT_BASELINE_TAG_IDEO_FACE_BOTTOM_OR_LEFT:
+    {
+      hb_position_t embox_top, embox_bottom;
+
+      hb_ot_layout_get_baseline_with_fallback (font,
+					       HB_OT_LAYOUT_BASELINE_TAG_IDEO_EMBOX_TOP_OR_RIGHT,
+					       direction,
+					       script_tag,
+					       language_tag,
+					       &embox_top);
+      hb_ot_layout_get_baseline_with_fallback (font,
+					       HB_OT_LAYOUT_BASELINE_TAG_IDEO_EMBOX_BOTTOM_OR_LEFT,
+					       direction,
+					       script_tag,
+					       language_tag,
+					       &embox_bottom);
+
+      if (baseline_tag == HB_OT_LAYOUT_BASELINE_TAG_IDEO_FACE_TOP_OR_RIGHT)
+	*coord = embox_top + (embox_bottom - embox_top) / 10;
+      else
+	*coord = embox_bottom + (embox_top - embox_bottom) / 10;
+    }
+    break;
+
+  case HB_OT_LAYOUT_BASELINE_TAG_IDEO_EMBOX_TOP_OR_RIGHT:
+    if (hb_ot_layout_get_baseline (font,
+				   HB_OT_LAYOUT_BASELINE_TAG_IDEO_EMBOX_BOTTOM_OR_LEFT,
+				   direction,
+				   script_tag,
+				   language_tag,
+				   coord))
+      *coord += HB_DIRECTION_IS_HORIZONTAL (direction) ? font->y_scale : font->x_scale;
+    else
+    {
+      hb_font_extents_t font_extents;
+      hb_font_get_extents_for_direction (font, direction, &font_extents);
+      *coord = font_extents.ascender;
+    }
+    break;
+
+  case HB_OT_LAYOUT_BASELINE_TAG_IDEO_EMBOX_BOTTOM_OR_LEFT:
+    if (hb_ot_layout_get_baseline (font,
+				   HB_OT_LAYOUT_BASELINE_TAG_IDEO_EMBOX_TOP_OR_RIGHT,
+				   direction,
+				   script_tag,
+				   language_tag,
+				   coord))
+      *coord -= HB_DIRECTION_IS_HORIZONTAL (direction) ? font->y_scale : font->x_scale;
+    else
+    {
+      hb_font_extents_t font_extents;
+      hb_font_get_extents_for_direction (font, direction, &font_extents);
+      *coord = font_extents.descender;
+    }
+    break;
+
+  case HB_OT_LAYOUT_BASELINE_TAG_HANGING:
+    if (HB_DIRECTION_IS_HORIZONTAL (direction))
+    {
+      hb_codepoint_t ch;
+      hb_codepoint_t glyph;
+      hb_glyph_extents_t extents;
+
+      switch ((int) script_tag)
+      {
+      case HB_SCRIPT_BENGALI:          ch = 0x0995u; break;
+      case HB_SCRIPT_DEVANAGARI:       ch = 0x0915u; break;
+      case HB_SCRIPT_GUJARATI:         ch = 0x0a95u; break;
+      case HB_SCRIPT_GURMUKHI:         ch = 0x0a15u; break;
+      case HB_SCRIPT_TIBETAN:          ch = 0x0f40u; break;
+      case HB_SCRIPT_LIMBU:            ch = 0x1901u; break;
+      case HB_SCRIPT_SYLOTI_NAGRI:     ch = 0xa807u; break;
+      case HB_SCRIPT_PHAGS_PA:         ch = 0xa840u; break;
+      case HB_SCRIPT_MEETEI_MAYEK:     ch = 0xabc0u; break;
+      case HB_SCRIPT_SHARADA:          ch = 0x11191u; break;
+      case HB_SCRIPT_TAKRI:            ch = 0x1168cu; break;
+      case HB_SCRIPT_MODI:             ch = 0x1160eu;break;
+      case HB_SCRIPT_SIDDHAM:          ch = 0x11590u; break;
+      case HB_SCRIPT_TIRHUTA:          ch = 0x1148fu; break;
+      case HB_SCRIPT_MARCHEN:          ch = 0x11c72u; break;
+      case HB_SCRIPT_NEWA:             ch = 0x1140eu; break;
+      case HB_SCRIPT_SOYOMBO:          ch = 0x11a5cu; break;
+      case HB_SCRIPT_ZANABAZAR_SQUARE: ch = 0x11a0bu; break;
+      case HB_SCRIPT_DOGRA:            ch = 0x1180au; break;
+      case HB_SCRIPT_GUNJALA_GONDI:    ch = 0x11d6cu; break;
+      case HB_SCRIPT_NANDINAGARI:      ch = 0x119b0u; break;
+      default:                         ch = 0;        break;
+      }
+
+      if (ch &&
+	  hb_font_get_nominal_glyph (font, ch, &glyph) &&
+	  hb_font_get_glyph_extents (font, glyph, &extents))
+	*coord = extents.y_bearing;
+      else
+	*coord = font->y_scale * 6 / 10; 
+    }
+    else
+      *coord = font->x_scale * 6 / 10; 
+    break;
+
+  case HB_OT_LAYOUT_BASELINE_TAG_IDEO_EMBOX_CENTRAL:
+    {
+      hb_position_t top, bottom;
+      hb_ot_layout_get_baseline_with_fallback (font,
+					       HB_OT_LAYOUT_BASELINE_TAG_IDEO_EMBOX_TOP_OR_RIGHT,
+					       direction,
+					       script_tag,
+					       language_tag,
+					       &top);
+      hb_ot_layout_get_baseline_with_fallback (font,
+					       HB_OT_LAYOUT_BASELINE_TAG_IDEO_EMBOX_BOTTOM_OR_LEFT,
+					       direction,
+					       script_tag,
+					       language_tag,
+					       &bottom);
+      *coord = (top + bottom) / 2;
+
+    }
+    break;
+
+  case HB_OT_LAYOUT_BASELINE_TAG_IDEO_FACE_CENTRAL:
+    {
+      hb_position_t top, bottom;
+      hb_ot_layout_get_baseline_with_fallback (font,
+					       HB_OT_LAYOUT_BASELINE_TAG_IDEO_FACE_TOP_OR_RIGHT,
+					       direction,
+					       script_tag,
+					       language_tag,
+					       &top);
+      hb_ot_layout_get_baseline_with_fallback (font,
+					       HB_OT_LAYOUT_BASELINE_TAG_IDEO_FACE_BOTTOM_OR_LEFT,
+					       direction,
+					       script_tag,
+					       language_tag,
+					       &bottom);
+      *coord = (top + bottom) / 2;
+
+    }
+    break;
+
+  case _HB_OT_LAYOUT_BASELINE_TAG_MAX_VALUE:
+  default:
+    *coord = 0;
+    break;
+  }
+}
+
+void
+hb_ot_layout_get_baseline_with_fallback2 (hb_font_t                   *font,
+					  hb_ot_layout_baseline_tag_t  baseline_tag,
+					  hb_direction_t               direction,
+					  hb_script_t                  script,
+					  hb_language_t                language,
+					  hb_position_t               *coord        )
+{
+  hb_tag_t script_tag, language_tag;
+  choose_base_tags (script, language, &script_tag, &language_tag);
+  hb_ot_layout_get_baseline_with_fallback (font,
+					   baseline_tag,
+					   direction,
+					   script_tag,
+					   language_tag,
+					   coord);
+}
+
+#endif
+
+
+#ifndef HB_NO_LAYOUT_RARELY_USED
+struct hb_get_glyph_alternates_dispatch_t :
+       hb_dispatch_context_t<hb_get_glyph_alternates_dispatch_t, unsigned>
+{
+  static return_t default_return_value () { return 0; }
+  bool stop_sublookup_iteration (return_t r) const { return r; }
+
+  private:
+  template <typename T, typename ...Ts> auto
+  _dispatch (const T &obj, hb_priority<1>, Ts&&... ds) HB_AUTO_RETURN
+  ( obj.get_glyph_alternates (std::forward<Ts> (ds)...) )
+  template <typename T, typename ...Ts> auto
+  _dispatch (const T &obj, hb_priority<0>, Ts&&... ds) HB_AUTO_RETURN
+  ( default_return_value () )
+  public:
+  template <typename T, typename ...Ts> auto
+  dispatch (const T &obj, Ts&&... ds) HB_AUTO_RETURN
+  ( _dispatch (obj, hb_prioritize, std::forward<Ts> (ds)...) )
+};
+
+HB_EXTERN unsigned
+hb_ot_layout_lookup_get_glyph_alternates (hb_face_t      *face,
+					  unsigned        lookup_index,
+					  hb_codepoint_t  glyph,
+					  unsigned        start_offset,
+					  unsigned       *alternate_count  ,
+					  hb_codepoint_t *alternate_glyphs )
+{
+  hb_get_glyph_alternates_dispatch_t c;
+  const OT::SubstLookup &lookup = face->table.GSUB->table->get_lookup (lookup_index);
+  auto ret = lookup.dispatch (&c, glyph, start_offset, alternate_count, alternate_glyphs);
+  if (!ret && alternate_count) *alternate_count = 0;
+  return ret;
+}
+
+struct hb_collect_glyph_alternates_dispatch_t :
+       hb_dispatch_context_t<hb_collect_glyph_alternates_dispatch_t, bool>
+{
+  static return_t default_return_value () { return false; }
+  bool stop_sublookup_iteration (return_t r) const { return false; }
+
+  private:
+  template <typename T, typename ...Ts> auto
+  _dispatch (const T &obj, hb_priority<1>, Ts&&... ds) HB_AUTO_RETURN
+  ( (obj.collect_glyph_alternates (std::forward<Ts> (ds)...), true) )
+  template <typename T, typename ...Ts> auto
+  _dispatch (const T &obj, hb_priority<0>, Ts&&... ds) HB_AUTO_RETURN
+  ( default_return_value () )
+  public:
+  template <typename T, typename ...Ts> auto
+  dispatch (const T &obj, Ts&&... ds) HB_AUTO_RETURN
+  ( _dispatch (obj, hb_prioritize, std::forward<Ts> (ds)...) )
+};
+
+HB_EXTERN hb_bool_t
+hb_ot_layout_lookup_collect_glyph_alternates (hb_face_t *face,
+					      unsigned   lookup_index,
+					      hb_map_t  *alternate_count ,
+					      hb_map_t  *alternate_glyphs )
+{
+  hb_collect_glyph_alternates_dispatch_t c;
+  const OT::SubstLookup &lookup = face->table.GSUB->table->get_lookup (lookup_index);
+  return lookup.dispatch (&c, alternate_count, alternate_glyphs);
+}
+
+struct hb_position_single_dispatch_t :
+       hb_dispatch_context_t<hb_position_single_dispatch_t, bool>
+{
+  static return_t default_return_value () { return false; }
+  bool stop_sublookup_iteration (return_t r) const { return r; }
+
+  private:
+  template <typename T, typename ...Ts> auto
+  _dispatch (const T &obj, hb_priority<1>, Ts&&... ds) HB_AUTO_RETURN
+  ( obj.position_single (std::forward<Ts> (ds)...) )
+  template <typename T, typename ...Ts> auto
+  _dispatch (const T &obj, hb_priority<0>, Ts&&... ds) HB_AUTO_RETURN
+  ( default_return_value () )
+  public:
+  template <typename T, typename ...Ts> auto
+  dispatch (const T &obj, Ts&&... ds) HB_AUTO_RETURN
+  ( _dispatch (obj, hb_prioritize, std::forward<Ts> (ds)...) )
+};
+
+hb_position_t
+hb_ot_layout_lookup_get_optical_bound (hb_font_t      *font,
+				       unsigned        lookup_index,
+				       hb_direction_t  direction,
+				       hb_codepoint_t  glyph)
+{
+  const OT::PosLookup &lookup = font->face->table.GPOS->table->get_lookup (lookup_index);
+  hb_blob_t *blob = font->face->table.GPOS->get_blob ();
+  hb_glyph_position_t pos = {0};
+  hb_position_single_dispatch_t c;
+  lookup.dispatch (&c, font, blob, direction, glyph, pos);
+  hb_position_t ret = 0;
+  switch (direction)
+  {
+    case HB_DIRECTION_LTR:
+      ret = pos.x_offset;
+      break;
+    case HB_DIRECTION_RTL:
+      ret = pos.x_advance - pos.x_offset;
+      break;
+    case HB_DIRECTION_TTB:
+      ret = pos.y_offset;
+      break;
+    case HB_DIRECTION_BTT:
+      ret = pos.y_advance - pos.y_offset;
+      break;
+    case HB_DIRECTION_INVALID:
+    default:
+      break;
+  }
+  return ret;
+}
+#endif
+
+
+#endif

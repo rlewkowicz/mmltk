@@ -1,0 +1,255 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "PostMessageEvent.h"
+
+#include "MessageEvent.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/BrowsingContextGroup.h"
+#include "mozilla/dom/DocGroup.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/MessageEventBinding.h"
+#include "mozilla/dom/MessagePort.h"
+#include "mozilla/dom/RootedDictionary.h"
+#include "mozilla/dom/WindowContext.h"
+#include "nsDocShell.h"
+#include "nsGlobalWindowInner.h"
+#include "nsGlobalWindowOuter.h"
+#include "nsIConsoleService.h"
+#include "nsIPrincipal.h"
+#include "nsIScriptError.h"
+#include "nsPIDOMWindowInlines.h"
+#include "nsPresContext.h"
+#include "nsQueryObject.h"
+#include "nsServiceManagerUtils.h"
+
+namespace mozilla::dom {
+
+PostMessageEvent::PostMessageEvent(BrowsingContext* aSource,
+                                   const nsAString& aCallerOrigin,
+                                   nsGlobalWindowOuter* aTargetWindow,
+                                   nsIPrincipal* aProvidedPrincipal,
+                                   uint64_t aCallerWindowID, nsIURI* aCallerURI,
+                                   const nsCString& aScriptLocation,
+                                   bool aIsFromPrivateWindow,
+                                   const Maybe<nsID>& aCallerAgentClusterId)
+    : Runnable("dom::PostMessageEvent"),
+      mSource(aSource),
+      mCallerOrigin(aCallerOrigin),
+      mTargetWindow(aTargetWindow),
+      mProvidedPrincipal(aProvidedPrincipal),
+      mCallerWindowID(aCallerWindowID),
+      mCallerAgentClusterId(aCallerAgentClusterId),
+      mCallerURI(aCallerURI),
+      mScriptLocation(Some(aScriptLocation)),
+      mIsFromPrivateWindow(aIsFromPrivateWindow) {}
+
+PostMessageEvent::~PostMessageEvent() = default;
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHODIMP PostMessageEvent::Run() {
+  if (mCallerWindowID) {
+    RefPtr<WindowContext> wc = WindowContext::GetById(mCallerWindowID);
+    if (!wc || !wc->IsCurrent()) {
+      mSource = nullptr;
+    }
+  }
+  AutoJSAPI jsapi;
+  jsapi.Init();
+  JSContext* cx = jsapi.cx();
+
+  nsCOMPtr<nsIURI> callerURI = std::move(mCallerURI);
+
+
+  RefPtr<nsGlobalWindowInner> targetWindow =
+      nsGlobalWindowInner::Cast(mTargetWindow->GetCurrentInnerWindow());
+  if (mTargetWindow->IsClosedOrClosing() || !targetWindow ||
+      targetWindow->IsDying() || !targetWindow->IsFullyActive())
+    return NS_OK;
+
+  if (nsCOMPtr<nsPIDOMWindowOuter> topWindow =
+          targetWindow->GetOuterWindow()->GetInProcessTop()) {
+    if (nsCOMPtr<nsPIDOMWindowInner> topInner =
+            topWindow->GetCurrentInnerWindow()) {
+      if (topInner->GetExtantDoc() &&
+          topInner->GetExtantDoc()->SuspendPostMessageEvent(this)) {
+        return NS_OK;
+      }
+    }
+  }
+
+  JSAutoRealm ar(cx, targetWindow->GetWrapper());
+
+  if (mProvidedPrincipal) {
+    nsIPrincipal* targetPrin = targetWindow->GetPrincipal();
+    if (NS_WARN_IF(!targetPrin)) return NS_OK;
+
+    if (!targetPrin->Equals(mProvidedPrincipal)) {
+      OriginAttributes sourceAttrs = mProvidedPrincipal->OriginAttributesRef();
+      OriginAttributes targetAttrs = targetPrin->OriginAttributesRef();
+
+      MOZ_DIAGNOSTIC_ASSERT(
+          sourceAttrs.mUserContextId == targetAttrs.mUserContextId,
+          "Target and source should have the same userContextId attribute.");
+
+      nsAutoString providedOrigin, targetOrigin;
+      nsresult rv = nsContentUtils::GetWebExposedOriginSerialization(
+          targetPrin, targetOrigin);
+      NS_ENSURE_SUCCESS(rv, rv);
+      rv = nsContentUtils::GetWebExposedOriginSerialization(mProvidedPrincipal,
+                                                            providedOrigin);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      nsAutoString errorText;
+      nsContentUtils::FormatLocalizedString(
+          errorText, PropertiesFile::DOM_PROPERTIES,
+          "TargetPrincipalDoesNotMatch", providedOrigin, targetOrigin);
+
+      nsCOMPtr<nsIScriptError> errorObject =
+          do_CreateInstance(NS_SCRIPTERROR_CONTRACTID, &rv);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      if (mCallerWindowID == 0) {
+        rv = errorObject->Init(errorText, mScriptLocation.value(), 0, 0,
+                               nsIScriptError::errorFlag, "DOM Window"_ns,
+                               mIsFromPrivateWindow,
+                               mProvidedPrincipal->IsSystemPrincipal());
+      } else if (callerURI) {
+        rv = errorObject->InitWithSourceURI(errorText, callerURI, 0, 0,
+                                            nsIScriptError::errorFlag,
+                                            "DOM Window"_ns, mCallerWindowID);
+      } else {
+        rv = errorObject->InitWithWindowID(errorText, mScriptLocation.value(),
+                                           0, 0, nsIScriptError::errorFlag,
+                                           "DOM Window"_ns, mCallerWindowID);
+      }
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      nsCOMPtr<nsIConsoleService> consoleService =
+          do_GetService(NS_CONSOLESERVICE_CONTRACTID, &rv);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      return consoleService->LogMessage(errorObject);
+    }
+  }
+
+  IgnoredErrorResult rv;
+  JS::Rooted<JS::Value> messageData(cx);
+  nsCOMPtr<mozilla::dom::EventTarget> eventTarget =
+      do_QueryObject(targetWindow);
+
+  MOZ_DIAGNOSTIC_ASSERT(targetWindow);
+
+  if (mHolder.empty()) {
+    DispatchError(cx, targetWindow, eventTarget);
+    return NS_OK;
+  }
+
+  StructuredCloneHolder* holder;
+  if (mHolder.constructed<StructuredCloneHolder>()) {
+    holder = &mHolder.ref<StructuredCloneHolder>();
+  } else {
+    holder = mHolder.ref<RefPtr<ipc::StructuredCloneData>>().get();
+  }
+
+  JS::CloneDataPolicy cloneDataPolicy;
+  if (holder->CloneScope() != JS::StructuredCloneScope::DifferentProcess) {
+    if (mCallerAgentClusterId.isSome() && targetWindow->GetDocGroup() &&
+        targetWindow->GetDocGroup()->AgentClusterId().Equals(
+            mCallerAgentClusterId.ref())) {
+      cloneDataPolicy.allowIntraClusterClonableSharedObjects();
+    }
+
+    if (targetWindow->IsSharedMemoryAllowed()) {
+      cloneDataPolicy.allowSharedMemoryObjects();
+    }
+  }
+
+  holder->Read(cx, &messageData, cloneDataPolicy, rv);
+  if (NS_WARN_IF(rv.Failed())) {
+    DispatchError(cx, targetWindow, eventTarget);
+    return NS_OK;
+  }
+
+  RefPtr<MessageEvent> event = new MessageEvent(eventTarget, nullptr, nullptr);
+
+  Nullable<WindowProxyOrMessagePortOrServiceWorker> source;
+  if (mSource) {
+    source.SetValue().SetAsWindowProxy() = mSource;
+  }
+
+  Sequence<OwningNonNull<MessagePort>> ports;
+  if (!holder->TakeTransferredPortsAsSequence(ports)) {
+    DispatchError(cx, targetWindow, eventTarget);
+    return NS_OK;
+  }
+
+  event->InitMessageEvent(nullptr, u"message"_ns, CanBubble::eNo,
+                          Cancelable::eNo, messageData, mCallerOrigin, u""_ns,
+                          source, ports);
+
+  Dispatch(targetWindow, event);
+  return NS_OK;
+}
+
+void PostMessageEvent::DispatchError(JSContext* aCx,
+                                     nsGlobalWindowInner* aTargetWindow,
+                                     mozilla::dom::EventTarget* aEventTarget) {
+  RootedDictionary<MessageEventInit> init(aCx);
+  init.mBubbles = false;
+  init.mCancelable = false;
+  init.mOrigin = mCallerOrigin;
+
+  if (mSource) {
+    init.mSource.SetValue().SetAsWindowProxy() = mSource;
+  }
+
+  RefPtr<Event> event =
+      MessageEvent::Constructor(aEventTarget, u"messageerror"_ns, init);
+  Dispatch(aTargetWindow, event);
+}
+
+void PostMessageEvent::Dispatch(nsGlobalWindowInner* aTargetWindow,
+                                Event* aEvent) {
+
+  RefPtr<nsPresContext> presContext =
+      aTargetWindow->GetExtantDoc()->GetPresContext();
+
+  aEvent->SetTrusted(true);
+  WidgetEvent* internalEvent = aEvent->WidgetEventPtr();
+
+  nsEventStatus status = nsEventStatus_eIgnore;
+  EventDispatcher::Dispatch(aTargetWindow, presContext, internalEvent, aEvent,
+                            &status);
+}
+
+static nsresult MaybeThrottle(nsGlobalWindowOuter* aTargetWindow,
+                              PostMessageEvent* aEvent) {
+  BrowsingContext* bc = aTargetWindow->GetBrowsingContext();
+  if (!bc) {
+    return NS_ERROR_FAILURE;
+  }
+  bc = bc->Top();
+  if (!bc->IsLoading()) {
+    return NS_ERROR_FAILURE;
+  }
+  if (nsContentUtils::IsPDFJS(aTargetWindow->GetPrincipal())) {
+    return NS_ERROR_FAILURE;
+  }
+  if (!StaticPrefs::dom_separate_event_queue_for_post_message_enabled()) {
+    return NS_ERROR_FAILURE;
+  }
+  return bc->Group()->QueuePostMessageEvent(aEvent);
+}
+
+void PostMessageEvent::DispatchToTargetThread(ErrorResult& aError) {
+  if (NS_SUCCEEDED(MaybeThrottle(mTargetWindow, this))) {
+    return;
+  }
+  aError = mTargetWindow->Dispatch(do_AddRef(this));
+}
+
+}  

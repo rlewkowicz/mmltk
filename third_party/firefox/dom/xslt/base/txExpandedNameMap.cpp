@@ -1,0 +1,69 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "txExpandedNameMap.h"
+
+#include "txCore.h"
+
+class txMapItemComparator {
+ public:
+  bool Equals(const txExpandedNameMap_base::MapItem& aItem,
+              const txExpandedName& aKey) const {
+    return aItem.mNamespaceID == aKey.mNamespaceID &&
+           aItem.mLocalName == aKey.mLocalName;
+  }
+};
+
+nsresult txExpandedNameMap_base::addItem(const txExpandedName& aKey,
+                                         void* aValue) {
+  size_t pos = mItems.IndexOf(aKey, 0, txMapItemComparator());
+  if (pos != mItems.NoIndex) {
+    return NS_ERROR_XSLT_ALREADY_SET;
+  }
+
+  MapItem* item = mItems.AppendElement();
+  item->mNamespaceID = aKey.mNamespaceID;
+  item->mLocalName = aKey.mLocalName;
+  item->mValue = aValue;
+
+  return NS_OK;
+}
+
+nsresult txExpandedNameMap_base::setItem(const txExpandedName& aKey,
+                                         void* aValue, void** aOldValue) {
+  *aOldValue = nullptr;
+  size_t pos = mItems.IndexOf(aKey, 0, txMapItemComparator());
+  if (pos != mItems.NoIndex) {
+    *aOldValue = mItems[pos].mValue;
+    mItems[pos].mValue = aValue;
+    return NS_OK;
+  }
+
+  MapItem* item = mItems.AppendElement();
+  item->mNamespaceID = aKey.mNamespaceID;
+  item->mLocalName = aKey.mLocalName;
+  item->mValue = aValue;
+
+  return NS_OK;
+}
+
+void* txExpandedNameMap_base::getItem(const txExpandedName& aKey) const {
+  size_t pos = mItems.IndexOf(aKey, 0, txMapItemComparator());
+  if (pos != mItems.NoIndex) {
+    return mItems[pos].mValue;
+  }
+
+  return nullptr;
+}
+
+void* txExpandedNameMap_base::removeItem(const txExpandedName& aKey) {
+  void* value = nullptr;
+  size_t pos = mItems.IndexOf(aKey, 0, txMapItemComparator());
+  if (pos != mItems.NoIndex) {
+    value = mItems[pos].mValue;
+    mItems.RemoveElementAt(pos);
+  }
+
+  return value;
+}

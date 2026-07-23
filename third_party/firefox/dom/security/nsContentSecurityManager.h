@@ -1,0 +1,71 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsContentSecurityManager_h_
+#define nsContentSecurityManager_h_
+
+#include "mozilla/CORSMode.h"
+#include "nsIChannel.h"
+#include "nsIChannelEventSink.h"
+#include "nsIContentSecurityManager.h"
+#include "nsILoadInfo.h"
+
+class nsILoadInfo;
+class nsIStreamListener;
+
+#define NS_CONTENTSECURITYMANAGER_CONTRACTID \
+  "@mozilla.org/contentsecuritymanager;1"
+#define NS_CONTENTSECURITYMANAGER_CID \
+  {0xcdcc1ab8, 0x3cea, 0x4e6c, {0xa2, 0x94, 0xa6, 0x51, 0xfa, 0x35, 0x22, 0x7f}}
+
+class nsContentSecurityManager : public nsIContentSecurityManager,
+                                 public nsIChannelEventSink {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSICONTENTSECURITYMANAGER
+  NS_DECL_NSICHANNELEVENTSINK
+
+  nsContentSecurityManager() = default;
+
+  static nsresult doContentSecurityCheck(
+      nsIChannel* aChannel, nsCOMPtr<nsIStreamListener>& aInAndOutListener);
+
+  static bool AllowTopLevelNavigationToDataURI(nsIChannel* aChannel);
+  static void ReportBlockedDataURI(nsIURI* aURI, nsILoadInfo* aLoadInfo,
+                                   bool aIsRedirect = false);
+  static bool AllowInsecureRedirectToDataURI(nsIChannel* aNewChannel);
+  enum CORSSecurityMapping {
+    DISABLE_CORS_CHECKS,
+    CORS_NONE_MAPS_TO_DISABLED_CORS_CHECKS,
+    CORS_NONE_MAPS_TO_INHERITED_CONTEXT,
+    REQUIRE_CORS_CHECKS,
+  };
+
+  static nsSecurityFlags ComputeSecurityFlags(
+      mozilla::CORSMode aCORSMode, CORSSecurityMapping aCORSSecurityMapping);
+
+  static nsSecurityFlags ComputeSecurityMode(nsSecurityFlags aSecurityFlags);
+
+  static mozilla::dom::RequestMode SecurityModeToRequestMode(
+      uint32_t aSecurityMode);
+
+  static void GetSerializedOrigin(nsIPrincipal* aOrigin,
+                                  nsIPrincipal* aResourceOrigin,
+                                  nsACString& aResult, nsILoadInfo* aLoadInfo);
+
+  static bool IsCompatibleWithCrossOriginIsolation(
+      nsILoadInfo::CrossOriginEmbedderPolicy aPolicy);
+
+ private:
+  static nsresult CheckChannel(nsIChannel* aChannel);
+  static nsresult CheckAllowLoadInSystemPrivilegedContext(nsIChannel* aChannel);
+  static nsresult CheckAllowLoadInPrivilegedAboutContext(nsIChannel* aChannel);
+  static nsresult CheckChannelHasProtocolSecurityFlag(nsIChannel* aChannel);
+  static bool CrossOriginEmbedderPolicyAllowsCredentials(nsIChannel* aChannel);
+  static nsresult CheckForIncoherentResultPrincipal(nsIChannel* aChannel);
+
+  virtual ~nsContentSecurityManager() = default;
+};
+
+#endif /* nsContentSecurityManager_h_ */

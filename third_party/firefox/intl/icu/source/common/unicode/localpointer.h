@@ -1,0 +1,239 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+*
+*   Copyright (C) 2009-2016, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+*******************************************************************************
+*   file name:  localpointer.h
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+*   created on: 2009nov13
+*   created by: Markus W. Scherer
+*/
+
+#ifndef __LOCALPOINTER_H__
+#define __LOCALPOINTER_H__
+
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include <memory>
+
+U_NAMESPACE_BEGIN
+
+template<typename T>
+class LocalPointerBase {
+public:
+    static void* U_EXPORT2 operator new(size_t) = delete;
+    static void* U_EXPORT2 operator new[](size_t) = delete;
+    static void* U_EXPORT2 operator new(size_t, void*) = delete;
+
+    explicit LocalPointerBase(T *p=nullptr) : ptr(p) {}
+    ~LocalPointerBase() {  }
+    UBool isNull() const { return ptr==nullptr; }
+    UBool isValid() const { return ptr!=nullptr; }
+    bool operator==(const T *other) const { return ptr==other; }
+    bool operator!=(const T *other) const { return ptr!=other; }
+    T *getAlias() const { return ptr; }
+    T &operator*() const { return *ptr; }
+    T *operator->() const { return ptr; }
+    T *orphan() {
+        T *p=ptr;
+        ptr=nullptr;
+        return p;
+    }
+    void adoptInstead(T *p) {
+        ptr=p;
+    }
+protected:
+    T *ptr;
+private:
+    bool operator==(const LocalPointerBase<T> &other) = delete;
+    bool operator!=(const LocalPointerBase<T> &other) = delete;
+    LocalPointerBase(const LocalPointerBase<T> &other) = delete;
+    void operator=(const LocalPointerBase<T> &other) = delete;
+};
+
+template<typename T>
+class LocalPointer : public LocalPointerBase<T> {
+public:
+    using LocalPointerBase<T>::operator*;
+    using LocalPointerBase<T>::operator->;
+    explicit LocalPointer(T *p=nullptr) : LocalPointerBase<T>(p) {}
+    LocalPointer(T *p, UErrorCode &errorCode) : LocalPointerBase<T>(p) {
+        if(p==nullptr && U_SUCCESS(errorCode)) {
+            errorCode=U_MEMORY_ALLOCATION_ERROR;
+        }
+    }
+    LocalPointer(LocalPointer<T> &&src) noexcept : LocalPointerBase<T>(src.ptr) {
+        src.ptr=nullptr;
+    }
+
+    explicit LocalPointer(std::unique_ptr<T> &&p)
+        : LocalPointerBase<T>(p.release()) {}
+
+    ~LocalPointer() {
+        delete LocalPointerBase<T>::ptr;
+    }
+    LocalPointer<T> &operator=(LocalPointer<T> &&src) noexcept {
+        delete LocalPointerBase<T>::ptr;
+        LocalPointerBase<T>::ptr=src.ptr;
+        src.ptr=nullptr;
+        return *this;
+    }
+
+    LocalPointer<T> &operator=(std::unique_ptr<T> &&p) noexcept {
+        adoptInstead(p.release());
+        return *this;
+    }
+
+    void swap(LocalPointer<T> &other) noexcept {
+        T *temp=LocalPointerBase<T>::ptr;
+        LocalPointerBase<T>::ptr=other.ptr;
+        other.ptr=temp;
+    }
+    friend inline void swap(LocalPointer<T> &p1, LocalPointer<T> &p2) noexcept {
+        p1.swap(p2);
+    }
+    void adoptInstead(T *p) {
+        delete LocalPointerBase<T>::ptr;
+        LocalPointerBase<T>::ptr=p;
+    }
+    void adoptInsteadAndCheckErrorCode(T *p, UErrorCode &errorCode) {
+        if(U_SUCCESS(errorCode)) {
+            delete LocalPointerBase<T>::ptr;
+            LocalPointerBase<T>::ptr=p;
+            if(p==nullptr) {
+                errorCode=U_MEMORY_ALLOCATION_ERROR;
+            }
+        } else {
+            delete p;
+        }
+    }
+
+    operator std::unique_ptr<T> () && {
+        return std::unique_ptr<T>(LocalPointerBase<T>::orphan());
+    }
+};
+
+template<typename T>
+class LocalArray : public LocalPointerBase<T> {
+public:
+    using LocalPointerBase<T>::operator*;
+    using LocalPointerBase<T>::operator->;
+    explicit LocalArray(T *p=nullptr) : LocalPointerBase<T>(p) {}
+    LocalArray(T *p, UErrorCode &errorCode) : LocalPointerBase<T>(p) {
+        if(p==nullptr && U_SUCCESS(errorCode)) {
+            errorCode=U_MEMORY_ALLOCATION_ERROR;
+        }
+    }
+    LocalArray(LocalArray<T> &&src) noexcept : LocalPointerBase<T>(src.ptr) {
+        src.ptr=nullptr;
+    }
+
+    explicit LocalArray(std::unique_ptr<T[]> &&p)
+        : LocalPointerBase<T>(p.release()) {}
+
+    ~LocalArray() {
+        delete[] LocalPointerBase<T>::ptr;
+    }
+    LocalArray<T> &operator=(LocalArray<T> &&src) noexcept {
+        delete[] LocalPointerBase<T>::ptr;
+        LocalPointerBase<T>::ptr=src.ptr;
+        src.ptr=nullptr;
+        return *this;
+    }
+
+    LocalArray<T> &operator=(std::unique_ptr<T[]> &&p) noexcept {
+        adoptInstead(p.release());
+        return *this;
+    }
+
+    void swap(LocalArray<T> &other) noexcept {
+        T *temp=LocalPointerBase<T>::ptr;
+        LocalPointerBase<T>::ptr=other.ptr;
+        other.ptr=temp;
+    }
+    friend inline void swap(LocalArray<T> &p1, LocalArray<T> &p2) noexcept {
+        p1.swap(p2);
+    }
+    void adoptInstead(T *p) {
+        delete[] LocalPointerBase<T>::ptr;
+        LocalPointerBase<T>::ptr=p;
+    }
+    void adoptInsteadAndCheckErrorCode(T *p, UErrorCode &errorCode) {
+        if(U_SUCCESS(errorCode)) {
+            delete[] LocalPointerBase<T>::ptr;
+            LocalPointerBase<T>::ptr=p;
+            if(p==nullptr) {
+                errorCode=U_MEMORY_ALLOCATION_ERROR;
+            }
+        } else {
+            delete[] p;
+        }
+    }
+    T &operator[](ptrdiff_t i) const { return LocalPointerBase<T>::ptr[i]; }
+
+    operator std::unique_ptr<T[]> () && {
+        return std::unique_ptr<T[]>(LocalPointerBase<T>::orphan());
+    }
+};
+
+#define U_DEFINE_LOCAL_OPEN_POINTER(LocalPointerClassName, Type, closeFunction) \
+    using LocalPointerClassName = internal::LocalOpenPointer<Type, closeFunction>
+
+#ifndef U_IN_DOXYGEN
+namespace internal {
+template <typename Type, auto closeFunction>
+class LocalOpenPointer : public LocalPointerBase<Type> {
+    using LocalPointerBase<Type>::ptr;
+public:
+    using LocalPointerBase<Type>::operator*;
+    using LocalPointerBase<Type>::operator->;
+    explicit LocalOpenPointer(Type *p=nullptr) : LocalPointerBase<Type>(p) {}
+    LocalOpenPointer(LocalOpenPointer &&src) noexcept
+            : LocalPointerBase<Type>(src.ptr) {
+        src.ptr=nullptr;
+    }
+    explicit LocalOpenPointer(std::unique_ptr<Type, decltype(closeFunction)> &&p)
+            : LocalPointerBase<Type>(p.release()) {}
+    ~LocalOpenPointer() { if (ptr != nullptr) { closeFunction(ptr); } }
+    LocalOpenPointer &operator=(LocalOpenPointer &&src) noexcept {
+        if (ptr != nullptr) { closeFunction(ptr); }
+        LocalPointerBase<Type>::ptr=src.ptr;
+        src.ptr=nullptr;
+        return *this;
+    }
+    LocalOpenPointer &operator=(std::unique_ptr<Type, decltype(closeFunction)> &&p) {
+        adoptInstead(p.release());
+        return *this;
+    }
+    void swap(LocalOpenPointer &other) noexcept {
+        Type *temp=LocalPointerBase<Type>::ptr;
+        LocalPointerBase<Type>::ptr=other.ptr;
+        other.ptr=temp;
+    }
+    friend inline void swap(LocalOpenPointer &p1, LocalOpenPointer &p2) noexcept {
+        p1.swap(p2);
+    }
+    void adoptInstead(Type *p) {
+        if (ptr != nullptr) { closeFunction(ptr); }
+        ptr=p;
+    }
+    operator std::unique_ptr<Type, decltype(closeFunction)> () && {
+        return std::unique_ptr<Type, decltype(closeFunction)>(LocalPointerBase<Type>::orphan(), closeFunction);
+    }
+};
+}  
+#endif
+
+U_NAMESPACE_END
+
+#endif  /* U_SHOW_CPLUSPLUS_API */
+#endif  /* __LOCALPOINTER_H__ */

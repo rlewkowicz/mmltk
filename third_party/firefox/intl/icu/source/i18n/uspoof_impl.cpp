@@ -1,0 +1,798 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+*   Copyright (C) 2008-2016, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+**********************************************************************
+*/
+
+#include "unicode/utypes.h"
+#include "unicode/uspoof.h"
+#include "unicode/uchar.h"
+#include "unicode/uniset.h"
+#include "unicode/utf16.h"
+#include "utrie2.h"
+#include "cmemory.h"
+#include "cstring.h"
+#include "scriptset.h"
+#include "umutex.h"
+#include "udataswp.h"
+#include "uassert.h"
+#include "ucln_in.h"
+#include "uspoof_impl.h"
+
+#if !UCONFIG_NO_NORMALIZATION
+
+
+U_NAMESPACE_BEGIN
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(SpoofImpl)
+
+SpoofImpl::SpoofImpl(SpoofData *data, UErrorCode& status) {
+    construct(status);
+    fSpoofData = data;
+}
+
+SpoofImpl::SpoofImpl(UErrorCode& status) {
+    construct(status);
+
+    fSpoofData = SpoofData::getDefault(status);
+}
+
+SpoofImpl::SpoofImpl() {
+    UErrorCode status = U_ZERO_ERROR;
+    construct(status);
+
+    fSpoofData = SpoofData::getDefault(status);
+}
+
+void SpoofImpl::construct(UErrorCode& status) {
+    fChecks = USPOOF_ALL_CHECKS;
+    fSpoofData = nullptr;
+    fAllowedCharsSet = nullptr;
+    fAllowedLocales = nullptr;
+    fRestrictionLevel = USPOOF_HIGHLY_RESTRICTIVE;
+
+    if (U_FAILURE(status)) { return; }
+
+    UnicodeSet *allowedCharsSet = new UnicodeSet(0, 0x10ffff);
+    fAllowedCharsSet = allowedCharsSet;
+    fAllowedLocales  = uprv_strdup("");
+    if (fAllowedCharsSet == nullptr || fAllowedLocales == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    allowedCharsSet->freeze();
+}
+
+
+SpoofImpl::SpoofImpl(const SpoofImpl &src, UErrorCode &status)  :
+        fChecks(USPOOF_ALL_CHECKS), fSpoofData(nullptr), fAllowedCharsSet(nullptr) , 
+        fAllowedLocales(nullptr) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    fChecks = src.fChecks;
+    if (src.fSpoofData != nullptr) {
+        fSpoofData = src.fSpoofData->addReference();
+    }
+    fAllowedCharsSet = src.fAllowedCharsSet->clone();
+    fAllowedLocales = uprv_strdup(src.fAllowedLocales);
+    if (fAllowedCharsSet == nullptr || fAllowedLocales == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+    }
+    fRestrictionLevel = src.fRestrictionLevel;
+}
+
+SpoofImpl::~SpoofImpl() {
+    if (fSpoofData != nullptr) {
+        fSpoofData->removeReference();   
+    }
+    delete fAllowedCharsSet;
+    uprv_free((void *)fAllowedLocales);
+}
+
+USpoofChecker *SpoofImpl::asUSpoofChecker() {
+    return exportForC();
+}
+
+const SpoofImpl *SpoofImpl::validateThis(const USpoofChecker *sc, UErrorCode &status) {
+    const auto* This = validate(sc, status);
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    if (This->fSpoofData != nullptr && !This->fSpoofData->validateDataVersion(status)) {
+        return nullptr;
+    }
+    return This;
+}
+
+SpoofImpl *SpoofImpl::validateThis(USpoofChecker *sc, UErrorCode &status) {
+    return const_cast<SpoofImpl *>
+        (SpoofImpl::validateThis(const_cast<const USpoofChecker *>(sc), status));
+}
+
+
+void SpoofImpl::setAllowedLocales(const char *localesList, UErrorCode &status) {
+    UnicodeSet    allowedChars;
+    UnicodeSet    *tmpSet = nullptr;
+    const char    *locStart = localesList;
+    const char    *locEnd = nullptr;
+    const char    *localesListEnd = localesList + uprv_strlen(localesList);
+    int32_t        localeListCount = 0;   
+
+    do {
+        locEnd = uprv_strchr(locStart, ',');
+        if (locEnd == nullptr) {
+            locEnd = localesListEnd;
+        }
+        while (*locStart == ' ') {
+            locStart++;
+        }
+        const char *trimmedEnd = locEnd-1;
+        while (trimmedEnd > locStart && *trimmedEnd == ' ') {
+            trimmedEnd--;
+        }
+        if (trimmedEnd <= locStart) {
+            break;
+        }
+        const char* locale = uprv_strndup(locStart, static_cast<int32_t>(trimmedEnd + 1 - locStart));
+        localeListCount++;
+
+        addScriptChars(locale, &allowedChars, status);
+        uprv_free((void *)locale);
+        if (U_FAILURE(status)) {
+            break;
+        }
+        locStart = locEnd + 1;
+    } while (locStart < localesListEnd);
+
+    if (localeListCount == 0) {
+        uprv_free((void *)fAllowedLocales);
+        fAllowedLocales = uprv_strdup("");
+        tmpSet = new UnicodeSet(0, 0x10ffff);
+        if (fAllowedLocales == nullptr || tmpSet == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return;
+        } 
+        tmpSet->freeze();
+        delete fAllowedCharsSet;
+        fAllowedCharsSet = tmpSet;
+        fChecks &= ~USPOOF_CHAR_LIMIT;
+        return;
+    }
+
+        
+    UnicodeSet tempSet;
+    tempSet.applyIntPropertyValue(UCHAR_SCRIPT, USCRIPT_COMMON, status);
+    allowedChars.addAll(tempSet);
+    tempSet.applyIntPropertyValue(UCHAR_SCRIPT, USCRIPT_INHERITED, status);
+    allowedChars.addAll(tempSet);
+    
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    tmpSet = allowedChars.clone();
+    const char *tmpLocalesList = uprv_strdup(localesList);
+    if (tmpSet == nullptr || tmpLocalesList == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    uprv_free((void *)fAllowedLocales);
+    fAllowedLocales = tmpLocalesList;
+    tmpSet->freeze();
+    delete fAllowedCharsSet;
+    fAllowedCharsSet = tmpSet;
+    fChecks |= USPOOF_CHAR_LIMIT;
+}
+
+
+const char * SpoofImpl::getAllowedLocales(UErrorCode &) {
+    return fAllowedLocales;
+}
+
+
+
+void SpoofImpl::addScriptChars(const char *locale, UnicodeSet *allowedChars, UErrorCode &status) {
+    UScriptCode scripts[30];
+
+    int32_t numScripts = uscript_getCode(locale, scripts, UPRV_LENGTHOF(scripts), &status);
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (status == U_USING_DEFAULT_WARNING) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+    UnicodeSet tmpSet;
+    int32_t    i;
+    for (i=0; i<numScripts; i++) {
+        tmpSet.applyIntPropertyValue(UCHAR_SCRIPT, scripts[i], status);
+        allowedChars->addAll(tmpSet);
+    }
+}
+
+void SpoofImpl::getAugmentedScriptSet(UChar32 codePoint, ScriptSet& result, UErrorCode& status) {
+    result.resetAll();
+    result.setScriptExtensions(codePoint, status);
+    if (U_FAILURE(status)) { return; }
+
+    if (result.test(USCRIPT_HAN, status)) {
+        result.set(USCRIPT_HAN_WITH_BOPOMOFO, status);
+        result.set(USCRIPT_JAPANESE, status);
+        result.set(USCRIPT_KOREAN, status);
+    }
+    if (result.test(USCRIPT_HIRAGANA, status)) {
+        result.set(USCRIPT_JAPANESE, status);
+    }
+    if (result.test(USCRIPT_KATAKANA, status)) {
+        result.set(USCRIPT_JAPANESE, status);
+    }
+    if (result.test(USCRIPT_HANGUL, status)) {
+        result.set(USCRIPT_KOREAN, status);
+    }
+    if (result.test(USCRIPT_BOPOMOFO, status)) {
+        result.set(USCRIPT_HAN_WITH_BOPOMOFO, status);
+    }
+
+    if (result.test(USCRIPT_COMMON, status) || result.test(USCRIPT_INHERITED, status)) {
+        result.setAll();
+    }
+}
+
+void SpoofImpl::getResolvedScriptSet(const UnicodeString& input, ScriptSet& result, UErrorCode& status) const {
+    getResolvedScriptSetWithout(input, USCRIPT_CODE_LIMIT, result, status);
+}
+
+void SpoofImpl::getResolvedScriptSetWithout(const UnicodeString& input, UScriptCode script, ScriptSet& result, UErrorCode& status) const {
+    result.setAll();
+
+    ScriptSet temp;
+    UChar32 codePoint;
+    for (int32_t i = 0; i < input.length(); i += U16_LENGTH(codePoint)) {
+        codePoint = input.char32At(i);
+
+        getAugmentedScriptSet(codePoint, temp, status);
+        if (U_FAILURE(status)) { return; }
+
+        if (script == USCRIPT_CODE_LIMIT || !temp.test(script, status)) {
+            result.intersect(temp);
+        }
+    }
+}
+
+void SpoofImpl::getNumerics(const UnicodeString& input, UnicodeSet& result, UErrorCode& ) const {
+    result.clear();
+
+    UChar32 codePoint;
+    for (int32_t i = 0; i < input.length(); i += U16_LENGTH(codePoint)) {
+        codePoint = input.char32At(i);
+
+        if (u_charType(codePoint) == U_DECIMAL_DIGIT_NUMBER) {
+            result.add(codePoint - static_cast<UChar32>(u_getNumericValue(codePoint)));
+        }
+    }
+}
+
+URestrictionLevel SpoofImpl::getRestrictionLevel(const UnicodeString& input, UErrorCode& status) const {
+    if (!fAllowedCharsSet->containsAll(input)) {
+        return USPOOF_UNRESTRICTIVE;
+    }
+
+    UBool allASCII = true;
+    for (int32_t i=0, length=input.length(); i<length; i++) {
+        if (input.charAt(i) > 0x7f) {
+            allASCII = false;
+            break;
+        }
+    }
+    if (allASCII) {
+        return USPOOF_ASCII;
+    }
+
+    ScriptSet resolvedScriptSet;
+    getResolvedScriptSet(input, resolvedScriptSet, status);
+    if (U_FAILURE(status)) { return USPOOF_UNRESTRICTIVE; }
+
+    if (!resolvedScriptSet.isEmpty()) {
+        return USPOOF_SINGLE_SCRIPT_RESTRICTIVE;
+    }
+
+    ScriptSet resolvedNoLatn;
+    getResolvedScriptSetWithout(input, USCRIPT_LATIN, resolvedNoLatn, status);
+    if (U_FAILURE(status)) { return USPOOF_UNRESTRICTIVE; }
+
+    if (resolvedNoLatn.test(USCRIPT_HAN_WITH_BOPOMOFO, status)
+            || resolvedNoLatn.test(USCRIPT_JAPANESE, status)
+            || resolvedNoLatn.test(USCRIPT_KOREAN, status)) {
+        return USPOOF_HIGHLY_RESTRICTIVE;
+    }
+
+    if (!resolvedNoLatn.isEmpty()
+            && !resolvedNoLatn.test(USCRIPT_CYRILLIC, status)
+            && !resolvedNoLatn.test(USCRIPT_GREEK, status)
+            && !resolvedNoLatn.test(USCRIPT_CHEROKEE, status)) {
+        return USPOOF_MODERATELY_RESTRICTIVE;
+    }
+
+    return USPOOF_MINIMALLY_RESTRICTIVE;
+}
+
+int32_t SpoofImpl::findHiddenOverlay(const UnicodeString& input, UErrorCode&) const {
+    bool sawLeadCharacter = false;
+    for (int32_t i=0; i<input.length();) {
+        UChar32 cp = input.char32At(i);
+        if (sawLeadCharacter && cp == 0x0307) {
+            return i;
+        }
+        uint8_t combiningClass = u_getCombiningClass(cp);
+        U_ASSERT(u_getCombiningClass(0x0307) == 230);
+        if (combiningClass == 0 || combiningClass == 230) {
+            sawLeadCharacter = isIllegalCombiningDotLeadCharacter(cp);
+        }
+        i += U16_LENGTH(cp);
+    }
+    return -1;
+}
+
+static inline bool isIllegalCombiningDotLeadCharacterNoLookup(UChar32 cp) {
+    return cp == u'i' || cp == u'j' || cp == u'ı' || cp == u'ȷ' || cp == u'l' ||
+           u_hasBinaryProperty(cp, UCHAR_SOFT_DOTTED);
+}
+
+bool SpoofImpl::isIllegalCombiningDotLeadCharacter(UChar32 cp) const {
+    if (isIllegalCombiningDotLeadCharacterNoLookup(cp)) {
+        return true;
+    }
+    UnicodeString skelStr;
+    fSpoofData->confusableLookup(cp, skelStr);
+    UChar32 finalCp = skelStr.char32At(skelStr.moveIndex32(skelStr.length(), -1));
+    if (finalCp != cp && isIllegalCombiningDotLeadCharacterNoLookup(finalCp)) {
+        return true;
+    }
+    return false;
+}
+
+
+
+UChar32 SpoofImpl::ScanHex(const char16_t *s, int32_t start, int32_t limit, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    U_ASSERT(limit-start > 0);
+    uint32_t val = 0;
+    int i;
+    for (i=start; i<limit; i++) {
+        int digitVal = s[i] - 0x30;
+        if (digitVal>9) {
+            digitVal = 0xa + (s[i] - 0x41);  
+        }
+        if (digitVal>15) {
+            digitVal = 0xa + (s[i] - 0x61);  
+        }
+        U_ASSERT(digitVal <= 0xf);
+        val <<= 4;
+        val += digitVal;
+    }
+    if (val > 0x10ffff) {
+        status = U_PARSE_ERROR;
+        val = 0;
+    }
+    return static_cast<UChar32>(val);
+}
+
+
+
+CheckResult::CheckResult() {
+    clear();
+}
+
+USpoofCheckResult* CheckResult::asUSpoofCheckResult() {
+    return exportForC();
+}
+
+const CheckResult* CheckResult::validateThis(const USpoofCheckResult *ptr, UErrorCode &status) {
+    return validate(ptr, status);
+}
+
+CheckResult* CheckResult::validateThis(USpoofCheckResult *ptr, UErrorCode &status) {
+    return validate(ptr, status);
+}
+
+void CheckResult::clear() {
+    fChecks = 0;
+    fNumerics.clear();
+    fRestrictionLevel = USPOOF_UNDEFINED_RESTRICTIVE;
+}
+
+int32_t CheckResult::toCombinedBitmask(int32_t enabledChecks) {
+    if ((enabledChecks & USPOOF_AUX_INFO) != 0 && fRestrictionLevel != USPOOF_UNDEFINED_RESTRICTIVE) {
+        return fChecks | fRestrictionLevel;
+    } else {
+        return fChecks;
+    }
+}
+
+CheckResult::~CheckResult() {
+}
+
+
+
+UBool SpoofData::validateDataVersion(UErrorCode &status) const {
+    if (U_FAILURE(status) ||
+        fRawData == nullptr ||
+        fRawData->fMagic != USPOOF_MAGIC ||
+        fRawData->fFormatVersion[0] != USPOOF_CONFUSABLE_DATA_FORMAT_VERSION ||
+        fRawData->fFormatVersion[1] != 0 ||
+        fRawData->fFormatVersion[2] != 0 ||
+        fRawData->fFormatVersion[3] != 0) {
+            status = U_INVALID_FORMAT_ERROR;
+            return false;
+    }
+    return true;
+}
+
+static UBool U_CALLCONV
+spoofDataIsAcceptable(void *context,
+                        const char * , const char * ,
+                        const UDataInfo *pInfo) {
+    if(
+        pInfo->size >= 20 &&
+        pInfo->isBigEndian == U_IS_BIG_ENDIAN &&
+        pInfo->charsetFamily == U_CHARSET_FAMILY &&
+        pInfo->dataFormat[0] == 0x43 &&  
+        pInfo->dataFormat[1] == 0x66 &&
+        pInfo->dataFormat[2] == 0x75 &&
+        pInfo->dataFormat[3] == 0x20 &&
+        pInfo->formatVersion[0] == USPOOF_CONFUSABLE_DATA_FORMAT_VERSION
+    ) {
+        UVersionInfo *version = static_cast<UVersionInfo *>(context);
+        if(version != nullptr) {
+            uprv_memcpy(version, pInfo->dataVersion, 4);
+        }
+        return true;
+    } else {
+        return false;
+    }
+}
+
+
+static UInitOnce gSpoofInitDefaultOnce {};
+static SpoofData* gDefaultSpoofData;
+
+static UBool U_CALLCONV
+uspoof_cleanupDefaultData() {
+    if (gDefaultSpoofData) {
+        gDefaultSpoofData->removeReference();
+        gDefaultSpoofData = nullptr;
+        gSpoofInitDefaultOnce.reset();
+    }
+    return true;
+}
+
+static void U_CALLCONV uspoof_loadDefaultData(UErrorCode& status) {
+    UDataMemory *udm = udata_openChoice(nullptr, "cfu", "confusables",
+                                        spoofDataIsAcceptable, 
+                                        nullptr,       
+                                        &status);
+    if (U_FAILURE(status)) { return; }
+    gDefaultSpoofData = new SpoofData(udm, status);
+    if (U_FAILURE(status)) {
+        delete gDefaultSpoofData;
+        gDefaultSpoofData = nullptr;
+        return;
+    }
+    if (gDefaultSpoofData == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    ucln_i18n_registerCleanup(UCLN_I18N_SPOOFDATA, uspoof_cleanupDefaultData);
+}
+
+SpoofData* SpoofData::getDefault(UErrorCode& status) {
+    umtx_initOnce(gSpoofInitDefaultOnce, &uspoof_loadDefaultData, status);
+    if (U_FAILURE(status)) { return nullptr; }
+    gDefaultSpoofData->addReference();
+    return gDefaultSpoofData;
+}
+
+
+
+SpoofData::SpoofData(UDataMemory *udm, UErrorCode &status)
+{
+    reset();
+    if (U_FAILURE(status)) {
+        return;
+    }
+    fUDM = udm;
+    fRawData = reinterpret_cast<SpoofDataHeader *>(
+            const_cast<void *>(udata_getMemory(udm)));
+    validateDataVersion(status);
+    initPtrs(status);
+}
+
+
+SpoofData::SpoofData(const void *data, int32_t length, UErrorCode &status)
+{
+    reset();
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (static_cast<size_t>(length) < sizeof(SpoofDataHeader)) {
+        status = U_INVALID_FORMAT_ERROR;
+        return;
+    }
+    if (data == nullptr) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+    void *ncData = const_cast<void *>(data);
+    fRawData = static_cast<SpoofDataHeader *>(ncData);
+    if (length < fRawData->fLength) {
+        status = U_INVALID_FORMAT_ERROR;
+        return;
+    }
+    validateDataVersion(status);
+    initPtrs(status);
+}
+
+
+SpoofData::SpoofData(UErrorCode &status) {
+    reset();
+    if (U_FAILURE(status)) {
+        return;
+    }
+    fDataOwned = true;
+
+    uint32_t initialSize = (sizeof(SpoofDataHeader) + 15) & ~15;
+    U_ASSERT(initialSize == sizeof(SpoofDataHeader));
+    
+    fRawData = static_cast<SpoofDataHeader *>(uprv_malloc(initialSize));
+    fMemLimit = initialSize;
+    if (fRawData == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    uprv_memset(fRawData, 0, initialSize);
+
+    fRawData->fMagic = USPOOF_MAGIC;
+    fRawData->fFormatVersion[0] = USPOOF_CONFUSABLE_DATA_FORMAT_VERSION;
+    fRawData->fFormatVersion[1] = 0;
+    fRawData->fFormatVersion[2] = 0;
+    fRawData->fFormatVersion[3] = 0;
+    initPtrs(status);
+}
+
+void SpoofData::reset() {
+   fRawData = nullptr;
+   fDataOwned = false;
+   fUDM      = nullptr;
+   fMemLimit = 0;
+   fRefCount = 1;
+   fCFUKeys = nullptr;
+   fCFUValues = nullptr;
+   fCFUStrings = nullptr;
+}
+
+
+void SpoofData::initPtrs(UErrorCode &status) {
+    fCFUKeys = nullptr;
+    fCFUValues = nullptr;
+    fCFUStrings = nullptr;
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (fRawData->fCFUKeys != 0) {
+        fCFUKeys = reinterpret_cast<int32_t*>(reinterpret_cast<char*>(fRawData) + fRawData->fCFUKeys);
+    }
+    if (fRawData->fCFUStringIndex != 0) {
+        fCFUValues = reinterpret_cast<uint16_t*>(reinterpret_cast<char*>(fRawData) + fRawData->fCFUStringIndex);
+    }
+    if (fRawData->fCFUStringTable != 0) {
+        fCFUStrings = reinterpret_cast<char16_t*>(reinterpret_cast<char*>(fRawData) + fRawData->fCFUStringTable);
+    }
+}
+
+
+SpoofData::~SpoofData() {
+    if (fDataOwned) {
+        uprv_free(fRawData);
+    }
+    fRawData = nullptr;
+    if (fUDM != nullptr) {
+        udata_close(fUDM);
+    }
+    fUDM = nullptr;
+}
+
+
+void SpoofData::removeReference() {
+    if (umtx_atomic_dec(&fRefCount) == 0) {
+        delete this;
+    }
+}
+
+
+SpoofData *SpoofData::addReference() {
+    umtx_atomic_inc(&fRefCount);
+    return this;
+}
+
+
+void *SpoofData::reserveSpace(int32_t numBytes,  UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    if (!fDataOwned) {
+        UPRV_UNREACHABLE_EXIT;
+    }
+
+    numBytes = (numBytes + 15) & ~15;   
+    uint32_t returnOffset = fMemLimit;
+    fMemLimit += numBytes;
+    fRawData = static_cast<SpoofDataHeader *>(uprv_realloc(fRawData, fMemLimit));
+    fRawData->fLength = fMemLimit;
+    uprv_memset((char *)fRawData + returnOffset, 0, numBytes);
+    initPtrs(status);
+    return reinterpret_cast<char*>(fRawData) + returnOffset;
+}
+
+int32_t SpoofData::serialize(void *buf, int32_t capacity, UErrorCode &status) const {
+    int32_t dataSize = fRawData->fLength;
+    if (capacity < dataSize) {
+        status = U_BUFFER_OVERFLOW_ERROR;
+        return dataSize;
+    }
+    uprv_memcpy(buf, fRawData, dataSize);
+    return dataSize;
+}
+
+int32_t SpoofData::size() const {
+    return fRawData->fLength;
+}
+
+
+int32_t SpoofData::confusableLookup(UChar32 inChar, UnicodeString &dest) const {
+    int32_t lo = 0;
+    int32_t hi = length();
+    do {
+        int32_t mid = (lo + hi) / 2;
+        if (codePointAt(mid) > inChar) {
+            hi = mid;
+        } else if (codePointAt(mid) < inChar) {
+            lo = mid;
+        } else {
+            lo = mid;
+            break;
+        }
+    } while (hi - lo > 1);
+
+    if (codePointAt(lo) != inChar) {
+        dest.append(inChar);
+        return 1;
+    }
+
+    return appendValueTo(lo, dest);
+}
+
+int32_t SpoofData::length() const {
+    return fRawData->fCFUKeysSize;
+}
+
+UChar32 SpoofData::codePointAt(int32_t index) const {
+    return ConfusableDataUtils::keyToCodePoint(fCFUKeys[index]);
+}
+
+int32_t SpoofData::appendValueTo(int32_t index, UnicodeString& dest) const {
+    int32_t stringLength = ConfusableDataUtils::keyToLength(fCFUKeys[index]);
+
+    uint16_t value = fCFUValues[index];
+    if (stringLength == 1) {
+        dest.append(static_cast<char16_t>(value));
+    } else {
+        dest.append(fCFUStrings + value, stringLength);
+    }
+
+    return stringLength;
+}
+
+
+U_NAMESPACE_END
+
+U_NAMESPACE_USE
+
+U_CAPI int32_t U_EXPORT2
+uspoof_swap(const UDataSwapper *ds, const void *inData, int32_t length, void *outData,
+           UErrorCode *status) {
+
+    if (status == nullptr || U_FAILURE(*status)) {
+        return 0;
+    }
+    if(ds==nullptr || inData==nullptr || length<-1 || (length>0 && outData==nullptr)) {
+        *status=U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+
+    const UDataInfo *pInfo = (const UDataInfo *)((const char *)inData+4);
+    if(!(  pInfo->dataFormat[0]==0x43 &&   
+           pInfo->dataFormat[1]==0x66 &&
+           pInfo->dataFormat[2]==0x75 &&
+           pInfo->dataFormat[3]==0x20 &&
+           pInfo->formatVersion[0]==USPOOF_CONFUSABLE_DATA_FORMAT_VERSION &&
+           pInfo->formatVersion[1]==0 &&
+           pInfo->formatVersion[2]==0 &&
+           pInfo->formatVersion[3]==0  )) {
+        udata_printError(ds, "uspoof_swap(): data format %02x.%02x.%02x.%02x "
+                             "(format version %02x %02x %02x %02x) is not recognized\n",
+                         pInfo->dataFormat[0], pInfo->dataFormat[1],
+                         pInfo->dataFormat[2], pInfo->dataFormat[3],
+                         pInfo->formatVersion[0], pInfo->formatVersion[1],
+                         pInfo->formatVersion[2], pInfo->formatVersion[3]);
+        *status=U_UNSUPPORTED_ERROR;
+        return 0;
+    }
+
+    int32_t headerSize=udata_swapDataHeader(ds, inData, length, outData, status);
+
+
+    const uint8_t   *inBytes =(const uint8_t *)inData+headerSize;
+    SpoofDataHeader *spoofDH = (SpoofDataHeader *)inBytes;
+    if (ds->readUInt32(spoofDH->fMagic)   != USPOOF_MAGIC ||
+        ds->readUInt32(spoofDH->fLength)  <  sizeof(SpoofDataHeader)) 
+    {
+        udata_printError(ds, "uspoof_swap(): Spoof Data header is invalid.\n");
+        *status=U_UNSUPPORTED_ERROR;
+        return 0;
+    }
+
+    int32_t spoofDataLength = ds->readUInt32(spoofDH->fLength);
+    int32_t totalSize = headerSize + spoofDataLength;
+    if (length < 0) {
+        return totalSize;
+    }
+
+    if (length < totalSize) {
+        udata_printError(ds, "uspoof_swap(): too few bytes (%d after ICU Data header) for spoof data.\n",
+                            spoofDataLength);
+        *status=U_INDEX_OUTOFBOUNDS_ERROR;
+        return 0;
+        }
+
+
+    uint8_t          *outBytes = (uint8_t *)outData + headerSize;
+    SpoofDataHeader  *outputDH = (SpoofDataHeader *)outBytes;
+
+    int32_t   sectionStart;
+    int32_t   sectionLength;
+
+    if (inBytes != outBytes) {
+        uprv_memset(outBytes, 0, spoofDataLength);
+    }
+
+    sectionStart  = ds->readUInt32(spoofDH->fCFUKeys);
+    sectionLength = ds->readUInt32(spoofDH->fCFUKeysSize) * 4;
+    ds->swapArray32(ds, inBytes+sectionStart, sectionLength, outBytes+sectionStart, status);
+
+    sectionStart  = ds->readUInt32(spoofDH->fCFUStringIndex);
+    sectionLength = ds->readUInt32(spoofDH->fCFUStringIndexSize) * 2;
+    ds->swapArray16(ds, inBytes+sectionStart, sectionLength, outBytes+sectionStart, status);
+
+    sectionStart  = ds->readUInt32(spoofDH->fCFUStringTable);
+    sectionLength = ds->readUInt32(spoofDH->fCFUStringTableLen) * 2;
+    ds->swapArray16(ds, inBytes+sectionStart, sectionLength, outBytes+sectionStart, status);
+
+    uint32_t magic = ds->readUInt32(spoofDH->fMagic);
+    ds->writeUInt32((uint32_t *)&outputDH->fMagic, magic);
+
+    if (inBytes != outBytes) {
+        uprv_memcpy(outputDH->fFormatVersion, spoofDH->fFormatVersion, sizeof(spoofDH->fFormatVersion));
+    }
+    ds->swapArray32(ds, &spoofDH->fLength, sizeof(SpoofDataHeader)-8 , &outputDH->fLength, status);
+
+    return totalSize;
+}
+
+#endif
+
+

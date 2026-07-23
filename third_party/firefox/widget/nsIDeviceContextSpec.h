@@ -1,0 +1,75 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsIDeviceContextSpec_h_
+#define nsIDeviceContextSpec_h_
+
+#include "gfxPoint.h"
+#include "nsISupports.h"
+#include "mozilla/gfx/Point.h"
+#include "mozilla/gfx/PrintPromise.h"
+#include "mozilla/MoveOnlyFunction.h"
+
+class nsIWidget;
+class nsIPrintSettings;
+
+namespace mozilla {
+namespace gfx {
+class DrawEventRecorder;
+class PrintTarget;
+}  
+}  
+
+#define NS_IDEVICE_CONTEXT_SPEC_IID \
+  {0xf407cfba, 0xbe28, 0x46c9, {0x8a, 0xba, 0x04, 0x2d, 0xae, 0xbb, 0x4f, 0x23}}
+
+class nsIDeviceContextSpec : public nsISupports {
+ public:
+  typedef mozilla::gfx::PrintTarget PrintTarget;
+  using IntSize = mozilla::gfx::IntSize;
+
+  NS_INLINE_DECL_STATIC_IID(NS_IDEVICE_CONTEXT_SPEC_IID)
+
+  NS_IMETHOD Init(nsIPrintSettings* aPrintSettings, bool aIsPrintPreview) = 0;
+
+  virtual already_AddRefed<PrintTarget> MakePrintTarget() = 0;
+
+  NS_IMETHOD GetDrawEventRecorder(
+      mozilla::gfx::DrawEventRecorder** aDrawEventRecorder) {
+    MOZ_ASSERT(aDrawEventRecorder);
+    *aDrawEventRecorder = nullptr;
+    return NS_OK;
+  }
+
+  float GetDPI() { return 144.0f; }
+
+  float GetPrintingScale();
+
+  gfxPoint GetPrintingTranslate();
+
+  NS_IMETHOD BeginDocument(const nsAString& aTitle,
+                           const nsAString& aPrintToFileName,
+                           uint64_t aBrowsingContextId, int32_t aStartPage,
+                           int32_t aEndPage) = 0;
+
+  virtual RefPtr<mozilla::gfx::PrintEndDocumentPromise> EndDocument() = 0;
+  NS_IMETHOD BeginPage(const IntSize& aSizeInPoints) = 0;
+  NS_IMETHOD EndPage() = 0;
+
+ protected:
+  using AsyncEndDocumentFunction = mozilla::MoveOnlyFunction<nsresult()>;
+  static RefPtr<mozilla::gfx::PrintEndDocumentPromise> EndDocumentAsync(
+      const char* aCallSite, AsyncEndDocumentFunction aFunction);
+
+  static RefPtr<mozilla::gfx::PrintEndDocumentPromise>
+  EndDocumentPromiseFromResult(nsresult aResult, mozilla::StaticString aSite);
+
+  nsCOMPtr<nsIPrintSettings> mPrintSettings;
+
+#ifdef MOZ_ENABLE_SKIA_PDF
+  bool mPrintViaSkPDF = false;
+#endif
+};
+
+#endif

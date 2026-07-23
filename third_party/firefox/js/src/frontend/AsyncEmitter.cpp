@@ -1,0 +1,184 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "frontend/AsyncEmitter.h"
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+
+#include "frontend/BytecodeEmitter.h"  // BytecodeEmitter
+#include "frontend/NameOpEmitter.h"    // NameOpEmitter
+#include "frontend/ParserAtom.h"       // TaggedParserAtomIndex
+#include "vm/Opcodes.h"                // JSOp
+
+using namespace js;
+using namespace js::frontend;
+
+bool AsyncEmitter::prepareForParamsWithExpressionOrDestructuring() {
+  MOZ_ASSERT(state_ == State::Start);
+#ifdef DEBUG
+  state_ = State::Parameters;
+#endif
+
+  rejectTryCatch_.emplace(bce_, TryEmitter::Kind::TryCatch,
+                          TryEmitter::ControlKind::NonSyntactic);
+  return rejectTryCatch_->emitTry();
+}
+
+bool AsyncEmitter::prepareForParamsWithoutExpressionOrDestructuring() {
+  MOZ_ASSERT(state_ == State::Start);
+#ifdef DEBUG
+  state_ = State::Parameters;
+#endif
+  return true;
+}
+
+bool AsyncEmitter::emitParamsEpilogue() {
+  MOZ_ASSERT(state_ == State::Parameters);
+
+  if (rejectTryCatch_) {
+    if (!emitRejectCatch()) {
+      return false;
+    }
+  }
+
+#ifdef DEBUG
+  state_ = State::PostParams;
+#endif
+  return true;
+}
+
+bool AsyncEmitter::prepareForModule() {
+  MOZ_ASSERT(state_ == State::Start);
+  MOZ_ASSERT(
+      bce_->lookupName(TaggedParserAtomIndex::WellKnown::dot_generator_())
+          .hasKnownSlot());
+
+  NameOpEmitter noe(bce_, TaggedParserAtomIndex::WellKnown::dot_generator_(),
+                    NameOpEmitter::Kind::Initialize);
+  if (!noe.prepareForRhs()) {
+    return false;
+  }
+  if (!bce_->emit1(JSOp::Generator)) {
+    return false;
+  }
+  if (!noe.emitAssignment()) {
+    return false;
+  }
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::ModulePrologue;
+#endif
+
+  return true;
+}
+
+bool AsyncEmitter::prepareForBody() {
+  MOZ_ASSERT(state_ == State::PostParams || state_ == State::ModulePrologue);
+
+  rejectTryCatch_.emplace(bce_, TryEmitter::Kind::TryCatch,
+                          TryEmitter::ControlKind::NonSyntactic);
+#ifdef DEBUG
+  state_ = State::Body;
+#endif
+  return rejectTryCatch_->emitTry();
+}
+
+bool AsyncEmitter::emitEndFunction() {
+#ifdef DEBUG
+  MOZ_ASSERT(state_ == State::Body);
+#endif
+
+
+  if (!emitRejectCatch()) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::End;
+#endif
+  return true;
+}
+
+bool AsyncEmitter::emitEndModule() {
+#ifdef DEBUG
+  MOZ_ASSERT(state_ == State::Body);
+#endif
+
+  if (!emitFinalYield()) {
+    return false;
+  }
+
+  if (!emitRejectCatch()) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::End;
+#endif
+  return true;
+}
+
+bool AsyncEmitter::emitFinalYield() {
+  if (!bce_->emit1(JSOp::Undefined)) {
+    return false;
+  }
+
+  if (!bce_->emitGetDotGeneratorInInnermostScope()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::AsyncResolve)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::SetRval)) {
+    return false;
+  }
+
+  if (!bce_->emitGetDotGeneratorInInnermostScope()) {
+    return false;
+  }
+
+  if (!bce_->emitYieldOp(JSOp::FinalYieldRval)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool AsyncEmitter::emitRejectCatch() {
+  if (!rejectTryCatch_->emitCatch(TryEmitter::ExceptionStack::Yes)) {
+    return false;
+  }
+
+  if (!bce_->emitGetDotGeneratorInInnermostScope()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::AsyncReject)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::SetRval)) {
+    return false;
+  }
+
+  if (!bce_->emitGetDotGeneratorInInnermostScope()) {
+    return false;
+  }
+
+  if (!bce_->emitYieldOp(JSOp::FinalYieldRval)) {
+    return false;
+  }
+
+  if (!rejectTryCatch_->emitEnd()) {
+    return false;
+  }
+
+  rejectTryCatch_.reset();
+  return true;
+}

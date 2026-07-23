@@ -1,0 +1,211 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_intl_SharedIntlData_h
+#define builtin_intl_SharedIntlData_h
+
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Span.h"
+#include "mozilla/UniquePtr.h"
+
+#include <stddef.h>
+#include <string_view>
+
+#include "js/AllocPolicy.h"
+#include "js/GCAPI.h"
+#include "js/GCHashTable.h"
+#include "js/Result.h"
+#include "js/RootingAPI.h"
+#include "js/Utility.h"
+#include "util/LanguageId.h"
+#include "vm/StringType.h"
+
+namespace mozilla::intl {
+class DateTimePatternGenerator;
+}  
+
+namespace js {
+
+class ArrayObject;
+
+namespace intl {
+
+enum class AvailableLocaleKind {
+  Collator,
+  DateTimeFormat,
+  DisplayNames,
+  DurationFormat,
+  ListFormat,
+  NumberFormat,
+  PluralRules,
+  RelativeTimeFormat,
+  Segmenter,
+};
+
+class DateTimePatternGeneratorDeleter {
+ public:
+  void operator()(mozilla::intl::DateTimePatternGenerator* ptr);
+};
+
+class SharedIntlData {
+  struct LinearStringLookup {
+    union {
+      const JS::Latin1Char* latin1Chars;
+      const char16_t* twoByteChars;
+    };
+    bool isLatin1;
+    size_t length;
+    JS::AutoCheckCannotGC nogc;
+    HashNumber hash = 0;
+
+    explicit LinearStringLookup(const JSLinearString* string)
+        : isLatin1(string->hasLatin1Chars()), length(string->length()) {
+      if (isLatin1) {
+        latin1Chars = string->latin1Chars(nogc);
+      } else {
+        twoByteChars = string->twoByteChars(nogc);
+      }
+    }
+
+    explicit LinearStringLookup(std::string_view string)
+        : isLatin1(true), length(string.length()) {
+      latin1Chars = reinterpret_cast<const JS::Latin1Char*>(string.data());
+    }
+
+    explicit LinearStringLookup(std::u16string_view string)
+        : isLatin1(false), length(string.length()) {
+      twoByteChars = string.data();
+    }
+  };
+
+ public:
+
+  using TimeZoneName = JSAtom*;
+
+  struct AvailableTimeZoneHasher {
+    struct Lookup : LinearStringLookup {
+      explicit Lookup(const JSLinearString* timeZone);
+      explicit Lookup(std::string_view timeZone);
+      explicit Lookup(std::u16string_view timeZone);
+    };
+
+    static js::HashNumber hash(const Lookup& lookup) { return lookup.hash; }
+    static bool match(TimeZoneName key, const Lookup& lookup);
+  };
+
+  struct TimeZoneHasher {
+    using Lookup = TimeZoneName;
+
+    static js::HashNumber hash(const Lookup& lookup) { return lookup->hash(); }
+    static bool match(TimeZoneName key, const Lookup& lookup) {
+      return key == lookup;
+    }
+  };
+
+  using AvailableTimeZoneSet =
+      GCHashSet<TimeZoneName, AvailableTimeZoneHasher, SystemAllocPolicy>;
+  using TimeZoneSet =
+      GCHashSet<TimeZoneName, TimeZoneHasher, SystemAllocPolicy>;
+  using TimeZoneMap =
+      GCHashMap<TimeZoneName, TimeZoneName, TimeZoneHasher, SystemAllocPolicy>;
+
+ private:
+  AvailableTimeZoneSet availableTimeZones;
+
+  TimeZoneSet ianaZonesTreatedAsLinksByICU;
+
+  TimeZoneMap ianaLinksCanonicalizedDifferentlyByICU;
+
+  bool timeZoneDataInitialized = false;
+
+  bool ensureTimeZones(JSContext* cx);
+
+  JSAtom* tryCanonicalizeTimeZoneConsistentWithIANA(JSAtom* availableTimeZone);
+
+  JSAtom* canonicalizeAvailableTimeZone(JSContext* cx,
+                                        JS::Handle<JSAtom*> availableTimeZone);
+
+  bool validateAndCanonicalizeTimeZone(
+      JSContext* cx, const AvailableTimeZoneSet::Lookup& lookup,
+      JS::MutableHandle<JSAtom*> identifier,
+      JS::MutableHandle<JSAtom*> primary);
+
+ public:
+  JSLinearString* canonicalizeTimeZone(JSContext* cx,
+                                       JS::Handle<JSLinearString*> timeZone);
+
+  bool validateAndCanonicalizeTimeZone(JSContext* cx,
+                                       JS::Handle<JSLinearString*> timeZone,
+                                       JS::MutableHandle<JSAtom*> identifier,
+                                       JS::MutableHandle<JSAtom*> primary);
+
+  bool validateAndCanonicalizeTimeZone(JSContext* cx,
+                                       mozilla::Span<const char> timeZone,
+                                       JS::MutableHandle<JSAtom*> identifier,
+                                       JS::MutableHandle<JSAtom*> primary);
+
+  JS::Result<AvailableTimeZoneSet::Iterator> availableTimeZonesIteration(
+      JSContext* cx);
+
+ private:
+  using Locale = LanguageId;
+
+  struct LocaleHasher {
+    using Lookup = Locale;
+
+    static js::HashNumber hash(const Lookup& lookup) { return lookup.hash(); }
+
+    static bool match(Locale key, const Lookup& lookup) {
+      return key == lookup;
+    }
+  };
+
+  using LocaleSet = HashSet<Locale, LocaleHasher, SystemAllocPolicy>;
+
+  LocaleSet availableLocales;
+
+  LocaleSet collatorAvailableLocales;
+
+  bool availableLocalesInitialized = false;
+
+  using CountAvailable = int32_t (*)();
+  using GetAvailable = const char* (*)(int32_t localeIndex);
+
+  template <class AvailableLocales>
+  static bool getAvailableLocales(JSContext* cx, LocaleSet& locales,
+                                  const AvailableLocales& availableLocales);
+
+  bool ensureAvailableLocales(JSContext* cx);
+
+ public:
+  [[nodiscard]] bool isAvailableLocale(JSContext* cx, AvailableLocaleKind kind,
+                                       LanguageId locale, bool* available);
+
+  ArrayObject* availableLocalesOf(JSContext* cx, AvailableLocaleKind kind);
+
+ private:
+  using UniqueDateTimePatternGenerator =
+      mozilla::UniquePtr<mozilla::intl::DateTimePatternGenerator,
+                         DateTimePatternGeneratorDeleter>;
+
+  UniqueDateTimePatternGenerator dateTimePatternGenerator;
+  JS::UniqueChars dateTimePatternGeneratorLocale;
+
+ public:
+  mozilla::intl::DateTimePatternGenerator* getDateTimePatternGenerator(
+      JSContext* cx, const char* locale);
+
+ public:
+  void destroyInstance();
+
+  void trace(JSTracer* trc);
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+};
+
+}  
+
+}  
+
+#endif /* builtin_intl_SharedIntlData_h */

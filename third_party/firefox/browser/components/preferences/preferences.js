@@ -1,0 +1,920 @@
+/* - This Source Code Form is subject to the terms of the Mozilla Public
+   - License, v. 2.0. If a copy of the MPL was not distributed with this file,
+   - You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+
+
+
+"use strict";
+
+var { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+
+var { Downloads } = ChromeUtils.importESModule(
+  "resource://gre/modules/Downloads.sys.mjs"
+);
+var { Integration } = ChromeUtils.importESModule(
+  "resource://gre/modules/Integration.sys.mjs"
+);
+Integration.downloads.defineESModuleGetter(
+  this,
+  "DownloadIntegration",
+  "resource://gre/modules/DownloadIntegration.sys.mjs"
+);
+
+var { PrivateBrowsingUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/PrivateBrowsingUtils.sys.mjs"
+);
+
+var { FxAccounts, getFxAccountsSingleton } = ChromeUtils.importESModule(
+  "resource://gre/modules/FxAccounts.sys.mjs"
+);
+var fxAccounts = getFxAccountsSingleton();
+
+var TAB_SESSION_ID = crypto.randomUUID();
+
+XPCOMUtils.defineLazyServiceGetters(this, {
+  gApplicationUpdateService: [
+    "@mozilla.org/updates/update-service;1",
+    Ci.nsIApplicationUpdateService,
+  ],
+
+  listManager: [
+    "@mozilla.org/url-classifier/listmanager;1",
+    Ci.nsIUrlListManager,
+  ],
+  gHandlerService: [
+    "@mozilla.org/uriloader/handler-service;1",
+    Ci.nsIHandlerService,
+  ],
+  gMIMEService: ["@mozilla.org/mime;1", Ci.nsIMIMEService],
+});
+
+if (Cc["@mozilla.org/gio-service;1"]) {
+  XPCOMUtils.defineLazyServiceGetter(
+    this,
+    "gGIOService",
+    "@mozilla.org/gio-service;1",
+    Ci.nsIGIOService
+  );
+} else {
+  this.gGIOService = null;
+}
+
+ChromeUtils.defineESModuleGetters(this, {
+  BrowserUtils: "resource://gre/modules/BrowserUtils.sys.mjs",
+  ContextualIdentityService:
+    "moz-src:///toolkit/components/contextualidentity/ContextualIdentityService.sys.mjs",
+  DownloadUtils: "resource://gre/modules/DownloadUtils.sys.mjs",
+  ExperimentAPI: "resource://nimbus/ExperimentAPI.sys.mjs",
+  FileUtils: "resource://gre/modules/FileUtils.sys.mjs",
+  FirefoxRelay: "resource://gre/modules/FirefoxRelay.sys.mjs",
+  HomePage: "resource:///modules/HomePage.sys.mjs",
+  LangPackMatcher: "moz-src:///intl/locale/LangPackMatcher.sys.mjs",
+  LoginHelper: "resource://gre/modules/LoginHelper.sys.mjs",
+  NimbusFeatures: "resource://nimbus/ExperimentAPI.sys.mjs",
+  OSKeyStore: "resource://gre/modules/OSKeyStore.sys.mjs",
+  Region: "resource://gre/modules/Region.sys.mjs",
+  SelectionChangedMenulist:
+    "resource:///modules/SelectionChangedMenulist.sys.mjs",
+  ShortcutUtils: "resource://gre/modules/ShortcutUtils.sys.mjs",
+  SiteDataManager: "resource:///modules/SiteDataManager.sys.mjs",
+  TransientPrefs: "resource:///modules/TransientPrefs.sys.mjs",
+  UIState: "resource://services-sync/UIState.sys.mjs",
+  UpdateUtils: "resource://gre/modules/UpdateUtils.sys.mjs",
+});
+
+ChromeUtils.defineLazyGetter(this, "gSubDialog", function () {
+  const { SubDialogManager } = ChromeUtils.importESModule(
+    "resource://gre/modules/SubDialog.sys.mjs"
+  );
+  return new SubDialogManager({
+    dialogStack: document.getElementById("dialogStack"),
+    dialogTemplate: document.getElementById("dialogTemplate"),
+    dialogOptions: {
+      styleSheets: [
+        "chrome://browser/skin/preferences/dialog.css",
+        "chrome://browser/skin/preferences/preferences.css",
+      ],
+      resizeCallback: async ({ title, frame }) => {
+        await gSearchResultsPane.searchWithinNode(
+          title,
+          gSearchResultsPane.query
+        );
+
+        await gSearchResultsPane.searchWithinNode(
+          frame.contentDocument.firstElementChild,
+          gSearchResultsPane.query
+        );
+
+        for (let node of gSearchResultsPane.listSearchTooltips) {
+          if (!node.tooltipNode) {
+            gSearchResultsPane.createSearchTooltip(
+              node,
+              gSearchResultsPane.query
+            );
+          }
+        }
+      },
+    },
+  });
+});
+
+const srdSectionPrefs = {};
+XPCOMUtils.defineLazyPreferenceGetter(
+  srdSectionPrefs,
+  "all",
+  "browser.settings-redesign.enabled",
+  false
+);
+
+function srdSectionEnabled(section) {
+  if (!(section in srdSectionPrefs)) {
+    XPCOMUtils.defineLazyPreferenceGetter(
+      srdSectionPrefs,
+      section,
+      `browser.settings-redesign.${section}.enabled`,
+      false
+    );
+  }
+  return srdSectionPrefs.all || srdSectionPrefs[section];
+}
+
+var { SettingPaneManager, friendlyPrefCategoryNameToInternalName } =
+  ChromeUtils.importESModule(
+    "chrome://browser/content/preferences/config/SettingPaneManager.mjs",
+    {
+      global: "current",
+    }
+  );
+
+var SettingGroupManager = ChromeUtils.importESModule(
+  "chrome://browser/content/preferences/config/SettingGroupManager.mjs",
+  {
+    global: "current",
+  }
+).SettingGroupManager;
+
+let resolveLegacyCategory = ChromeUtils.importESModule(
+  "chrome://browser/content/preferences/config/LegacyPaneMappings.mjs",
+  {
+    global: "current",
+  }
+).resolveLegacyCategory;
+
+var { ScrollOffsets } = ChromeUtils.importESModule(
+  "chrome://global/content/ScrollOffsets.mjs",
+  {
+    global: "current",
+  }
+);
+
+var { FocusHistory } = ChromeUtils.importESModule(
+  "chrome://browser/content/preferences/FocusHistory.mjs",
+  {
+    global: "current",
+  }
+);
+
+var scrollOffsets;
+
+var focusHistory = new FocusHistory();
+
+var gCurrentHistoryEntryId = null;
+
+const CONFIG_PANES = Object.freeze({
+  about: {
+    l10nId: "about-firefox-header",
+    iconSrc: "chrome://browser/skin/sidebar/firefox.svg",
+    groupIds: ["updates", "support"],
+    module: "chrome://browser/content/preferences/config/about-firefox.mjs",
+    visible: () => srdSectionPrefs.all,
+  },
+  accessibility: {
+    l10nId: "preferences-accessibility-header",
+    groupIds: [
+      "zoom",
+      "fonts",
+      "contrast",
+      "keyboardAndScrolling",
+      "motionAndLink",
+    ],
+    module: "chrome://browser/content/preferences/config/accessibility.mjs",
+    iconSrc: "chrome://browser/skin/preferences/category-accessibility.svg",
+    visible: () => srdSectionPrefs.all,
+  },
+  appearance: {
+    l10nId: "preferences-appearance-header",
+    groupIds: [
+      "appearance",
+      "browserTheme",
+      "browserIconEntry",
+      "windowDensity",
+      "relatedSettings",
+    ],
+    module: "chrome://browser/content/preferences/config/appearance.mjs",
+    iconSrc: "chrome://global/skin/icons/eye.svg",
+    visible: () => srdSectionPrefs.all,
+  },
+  downloads: {
+    l10nId: "pane-downloads3",
+    iconSrc: "chrome://browser/skin/downloads/downloads.svg",
+    groupIds: ["downloads", "applications"],
+    module: "chrome://browser/content/preferences/config/downloads.mjs",
+    visible: () =>
+      Services.prefs.getBoolPref("browser.settings-redesign.enabled", false),
+  },
+  connectionSecurity: {
+    parent: "privacy",
+    l10nId: "preferences-connection-header",
+    groupIds: [
+      "httpsOnly",
+      "networkProxy",
+      "privacyPanel",
+      "browsingProtection",
+      "certificates",
+    ],
+    replaces: "privacy",
+  },
+  dnsOverHttps: {
+    parent: "privacy",
+    l10nId: "preferences-doh-header2",
+    groupIds: ["dnsOverHttpsAdvanced"],
+    replaces: "privacy",
+  },
+  etp: {
+    parent: "privacy",
+    l10nId: "preferences-etp-header",
+    groupIds: ["etpBanner", "etpAdvanced"],
+    replaces: "privacy",
+  },
+  etpCustomize: {
+    parent: "etp",
+    l10nId: "preferences-etp-customize-header",
+    groupIds: ["etpCustomize", "etpReset"],
+    replaces: "privacy",
+  },
+  experimental: {
+    l10nId: "settings-pane-labs-header",
+    iconSrc: "chrome://browser/skin/labs-16.svg",
+    groupIds: ["firefoxLabsFeatures"],
+    module: "chrome://browser/content/preferences/config/firefoxLabs.mjs",
+  },
+  general: {
+    l10nId: "pane-general-title",
+    groupIds: [],
+    visible: () => !srdSectionPrefs.all,
+  },
+  history: {
+    parent: "privacy",
+    l10nId: "history-header2",
+    groupIds: ["historyAdvanced"],
+    replaces: "privacy",
+  },
+  home: {
+    l10nId: "home-section",
+    iconSrc: "chrome://browser/skin/home.svg",
+    groupIds: ["defaultBrowserHome", "startupHome", "homepage", "home"],
+    module: "chrome://browser/content/preferences/config/home-startup.mjs",
+    replaces: "home",
+  },
+  languages: {
+    l10nId: "preferences-languages-header3",
+    iconSrc: "chrome://global/skin/icons/settings.svg",
+    groupIds: ["browserLanguage", "websiteLanguage"],
+    module: "chrome://browser/content/preferences/config/languages.mjs",
+    visible: () => srdSectionEnabled("languages"),
+  },
+  manageAddresses: {
+    parent: "passwordsAutofill",
+    l10nId: "autofill-addresses-manage-addresses-title",
+    groupIds: ["manageAddresses"],
+    iconSrc: "chrome://browser/skin/notification-icons/geo.svg",
+    module:
+      "chrome://browser/content/preferences/config/passwords-autofill.mjs",
+  },
+  managePayments: {
+    parent: "passwordsAutofill",
+    l10nId: "autofill-payment-methods-manage-payments-title",
+    groupIds: ["managePayments"],
+    iconSrc: "chrome://browser/skin/payment-methods-16.svg",
+    module:
+      "chrome://browser/content/preferences/config/passwords-autofill.mjs",
+  },
+  profiles: {
+    parent: srdSectionEnabled("sync") ? "sync" : "general",
+    l10nId: "preferences-profiles-group-header",
+    groupIds: ["profilePane"],
+  },
+  permissionsData: {
+    l10nId: "permissions-data-section",
+    iconSrc: "chrome://browser/skin/permissions.svg",
+    groupIds: ["permissions", "dataCollection"],
+    module: "chrome://browser/content/preferences/config/permissions-data.mjs",
+    visible: () => srdSectionEnabled("permissionsData"),
+  },
+  passwordsAutofill: {
+    l10nId: "preferences-passwords-autofill-header",
+    iconSrc: "chrome://browser/skin/login.svg",
+    groupIds: ["passwords", "payments", "addresses"],
+    module:
+      "chrome://browser/content/preferences/config/passwords-autofill.mjs",
+    visible: () => srdSectionEnabled("passwordsAutofill"),
+  },
+  privacy: {
+    l10nId: "pane-privacy-section",
+    iconSrc: "chrome://browser/skin/preferences/category-privacy-security.svg",
+    groupIds: [
+      "securityPrivacyStatus",
+      "securityPrivacyWarnings",
+      "etpStatus",
+      "ipprotection",
+      "cookiesAndSiteData2",
+      "history2",
+      "nonTechnicalPrivacy2",
+      "dnsOverHttps",
+      "connectionLink",
+    ],
+    module: "chrome://browser/content/preferences/config/privacy.mjs",
+    replaces: "privacy",
+  },
+  search: {
+    l10nId: "search-section",
+    groupIds: [
+      "defaultEngine",
+      "searchShortcuts",
+      "searchSuggestions",
+      "firefoxSuggest",
+    ],
+    iconSrc: "chrome://browser/skin/preferences/category-search.svg",
+    module: "chrome://browser/content/preferences/config/search.mjs",
+    replaces: "search",
+  },
+  sync: {
+    l10nId: "account-sync-section",
+    iconSrc: "chrome://browser/skin/fxa/avatar-empty.svg",
+    groupIds: [
+      "defaultBrowserSync",
+      "accountDisabled",
+      "account",
+      "sync",
+      "importBrowserData",
+      "profiles",
+      "backup",
+    ],
+    module: "chrome://browser/content/preferences/config/account-sync.mjs",
+    replaces: "sync",
+  },
+  moreFromMozilla: {
+    l10nId: "more-from-moz-page-header",
+    iconSrc: "chrome://browser/skin/preferences/mozilla-16.svg",
+    groupIds: ["moreFromMozillaPromo", "moreFromMozillaProducts"],
+    module: "chrome://browser/content/preferences/config/moreFromMozilla.mjs",
+    visible: () => NimbusFeatures.moreFromMozilla.getVariable("enabled"),
+    replaces: "moreFromMozilla",
+  },
+  tabsBrowsing: {
+    l10nId: "tabs-browsing-section",
+    groupIds: [
+      "browserLayout",
+      "tabs",
+      "pageNavigation",
+      "keyboardShortcuts",
+      "media",
+      "performance",
+      "recommendations",
+    ],
+    iconSrc: "chrome://global/skin/icons/cursor-arrow.svg",
+    module: "chrome://browser/content/preferences/config/tabs-browsing.mjs",
+    visible: () => srdSectionEnabled("tabsBrowsing"),
+  },
+  containers: {
+    parent: srdSectionEnabled("tabsBrowsing") ? "tabsBrowsing" : "general",
+    l10nId: "containers-section-header2",
+    groupIds: ["containers"],
+    module: "chrome://browser/content/preferences/config/containers.mjs",
+  },
+});
+
+var gLastCategory = { category: undefined, subcategory: undefined };
+const gXULDOMParser = new DOMParser();
+var gCategoryModules = new Map();
+var gCategoryInits = new Map();
+
+function register_module(categoryName, categoryObject) {
+  gCategoryModules.set(categoryName, categoryObject);
+  gCategoryInits.set(categoryName, {
+    _initted: false,
+    init() {
+      if (this._initted) {
+        return;
+      }
+      this._initted = true;
+      let template = document.getElementById("template-" + categoryName);
+      if (template && !srdSectionPrefs.all) {
+        template.replaceWith(template.content);
+
+        Preferences.queueUpdateOfAllElements();
+      }
+
+      categoryObject.init();
+    },
+  });
+}
+
+document.addEventListener("DOMContentLoaded", init_all, { once: true });
+
+function init_all() {
+  Preferences.forceEnableInstantApply();
+
+  Preferences.queueUpdateOfAllElements();
+
+  scrollOffsets = new ScrollOffsets(
+     (document.querySelector(".main-content"))
+  );
+
+  let redesignEnabled = srdSectionPrefs.all;
+
+  if (!redesignEnabled) {
+    register_module("paneGeneral", gMainPane);
+    document.getElementById("category-general").hidden = false;
+    document.getElementById("nav-separator").hidden = true;
+  }
+  register_module("paneHome", gHomePane);
+  register_module("paneSearch", gSearchPane);
+  register_module("panePrivacy", gPrivacyPane);
+
+  if (ExperimentAPI.labsEnabled) {
+    document.getElementById("category-experimental").hidden =
+      Services.prefs.getBoolPref(
+        "browser.preferences.experimental.hidden",
+        false
+      );
+  }
+
+  register_module("paneSearchResults", gSearchResultsPane);
+  for (let [id, config] of Object.entries(CONFIG_PANES)) {
+    if (
+      ["profiles", "sync"].includes(id) ||
+      (AppConstants.MOZ_MINIMAL_BROWSER && id == "accessibility")
+    ) {
+      continue;
+    }
+    if (!redesignEnabled && config.replaces) {
+      continue;
+    }
+
+    SettingPaneManager.registerPane(id, config);
+  }
+
+  if (redesignEnabled) {
+    SettingPaneManager.registerPane("customHomepage", {
+      parent: "home",
+      l10nId: "home-custom-homepage-subpage",
+      groupIds: ["customHomepage"],
+      module: "chrome://browser/content/preferences/config/home-startup.mjs",
+    });
+
+    if (
+      AppConstants.platform == "win" &&
+      Services.prefs.getBoolPref("browser.shell.customIcon.enabled", false) &&
+      !Services.sysinfo.getProperty("hasWinPackageId")
+    ) {
+      SettingPaneManager.registerPane("browserIcon", {
+        parent: "appearance",
+        l10nId: "appearance-browser-icon-subpage-title",
+        groupIds: ["browserIconBasic", "browserIconBonus"],
+        module: "chrome://browser/content/preferences/config/browser-icon.mjs",
+      });
+    }
+  } else {
+    NimbusFeatures.moreFromMozilla.recordExposureEvent({ once: true });
+    if (NimbusFeatures.moreFromMozilla.getVariable("enabled")) {
+      document.getElementById("category-more-from-mozilla").hidden = false;
+      gMoreFromMozillaPane.option =
+        NimbusFeatures.moreFromMozilla.getVariable("template");
+      register_module("paneMoreFromMozilla", gMoreFromMozillaPane);
+    }
+  }
+
+  gSearchResultsPane.init();
+  gMainPane.preInit();
+
+  let categories = document.getElementById("categories");
+  categories.addEventListener("change-view", event => {
+    gotoPref(event.target.view);
+  });
+
+  maybeDisplayPoliciesNotice();
+
+  window.addEventListener("hashchange", onHashChange);
+  window.addEventListener("beforeunload", onBeforeunload);
+
+  document.getElementById("focusSearch1").addEventListener("command", () => {
+    gSearchResultsPane.searchInput.focus();
+  });
+
+  gotoPref().then(() => {
+    document.getElementById("addonsButton").addEventListener("click", e => {
+      e.preventDefault();
+      if (e.button >= 2) {
+        return;
+      }
+      let mainWindow = window.browsingContext.topChromeWindow;
+      mainWindow.BrowserAddonUI.openAddonsMgr();
+    });
+
+    document.dispatchEvent(
+      new CustomEvent("Initialized", {
+        bubbles: true,
+        cancelable: true,
+      })
+    );
+  });
+}
+
+function onHashChange() {
+  gotoPref(null, "Hash");
+}
+
+function onBeforeunload() {
+}
+
+function recordSettingChangeTelemetry(id) {
+}
+
+async function gotoPref(
+  aCategory,
+  aShowReason = aCategory ? "Click" : "Initial"
+) {
+  let redesignEnabled = srdSectionPrefs.all;
+  let categories = document.getElementById("categories");
+  let kDefaultCategoryInternalName = "paneGeneral";
+  let kDefaultCategory = "general";
+  if (redesignEnabled) {
+    kDefaultCategoryInternalName = "paneHome";
+    kDefaultCategory = "home";
+  }
+  let hash = document.location.hash;
+  let category = aCategory || hash.substring(1) || kDefaultCategoryInternalName;
+
+  let breakIndex = category.indexOf("-");
+  let subcategory =
+    breakIndex != -1 ? category.substring(breakIndex + 1) : null;
+  if (subcategory) {
+    category = category.substring(0, breakIndex);
+  }
+
+  if (Services.prefs.getBoolPref("browser.settings-redesign.enabled")) {
+    let resolved = resolveLegacyCategory(category, subcategory);
+    category = resolved.category;
+    subcategory = resolved.subcategory;
+    if (category == "sync") {
+      category = "home";
+      subcategory = null;
+    }
+  }
+
+  category = friendlyPrefCategoryNameToInternalName(category);
+  if (category != "paneSearchResults") {
+    gSearchResultsPane.query = null;
+    gSearchResultsPane.searchInput.value = "";
+    gSearchResultsPane.removeAllSearchIndicators(window, true);
+  } else if (!gSearchResultsPane.searchInput.value) {
+    category = kDefaultCategoryInternalName;
+    document.location.hash = kDefaultCategory;
+    gSearchResultsPane.query = null;
+  }
+
+  if (gLastCategory.category == category && !subcategory) {
+    document.dispatchEvent(
+       (
+        new CustomEvent("paneshown", {
+          bubbles: true,
+          cancelable: true,
+          detail: {
+            category,
+            subcategory,
+          },
+        })
+      )
+    );
+    return;
+  }
+
+  let item;
+  let unknownCategory = false;
+  if (category != "paneSearchResults") {
+    for (let element of document.querySelectorAll(".search-header")) {
+      element.hidden = true;
+    }
+
+    item =  (
+      categories.querySelector(
+        'moz-page-nav-button[view="' + CSS.escape(category) + '"]'
+      )
+    );
+    if (!item || item.hidden) {
+      unknownCategory = true;
+      category = kDefaultCategoryInternalName;
+      item = categories.querySelector(
+        'moz-page-nav-button[view="' + category + '"]'
+      );
+    }
+  }
+
+  if (
+    gLastCategory.category ||
+    unknownCategory ||
+    category != kDefaultCategoryInternalName ||
+    subcategory
+  ) {
+    let friendlyName = internalPrefCategoryNameToFriendlyName(category);
+
+    if (
+      !(!document.location.hash && category == kDefaultCategoryInternalName)
+    ) {
+      let targetHash = "#" + friendlyName;
+      if (document.location.hash != targetHash) {
+        if (aShowReason == "Click") {
+          history.pushState(category, document.title, targetHash);
+        } else {
+          history.replaceState(category, document.title, targetHash);
+        }
+      }
+    }
+  }
+  let historyEntryId =
+    (aShowReason == "Hash" && history.state?.historyEntryId) ||
+    scrollOffsets.newHistoryEntryId();
+
+  let prevCategory = gLastCategory.category;
+
+  scrollOffsets.save();
+  scrollOffsets.setView(historyEntryId);
+  if (gCurrentHistoryEntryId != null) {
+    focusHistory.save(gCurrentHistoryEntryId);
+  }
+  gCurrentHistoryEntryId = historyEntryId;
+
+  gLastCategory.category = category;
+  gLastCategory.subcategory = subcategory;
+
+  let currentView = item ? item.getAttribute("view") : category;
+
+  try {
+    let paneLookupId = internalPrefCategoryNameToFriendlyName(currentView);
+    let parentPanes = SettingPaneManager.getWithParents(paneLookupId);
+    if (parentPanes.length > 1) {
+      let rootParent = parentPanes[0];
+      currentView = friendlyPrefCategoryNameToInternalName(rootParent.id);
+    }
+  } catch (ex) {
+  }
+
+  categories.currentView = currentView;
+
+  let previousCategory = null;
+  if (aShowReason == "Hash") {
+    previousCategory = history.state?.previousCategory ?? null;
+  } else if (aShowReason == "Click" && prevCategory) {
+    previousCategory = internalPrefCategoryNameToFriendlyName(prevCategory);
+  }
+  window.history.replaceState(
+    {
+      historyEntryId,
+      category: internalPrefCategoryNameToFriendlyName(category),
+      previousCategory,
+    },
+    document.title
+  );
+
+  let categoryInfo = gCategoryInits.get(category);
+  if (!categoryInfo) {
+    let err = new Error(
+      "Unknown in-content prefs category! Can't init " + category
+    );
+    console.error(err);
+    throw err;
+  }
+  categoryInfo.init();
+
+  if (document.hasPendingL10nMutations) {
+    await new Promise(r =>
+      document.addEventListener("L10nMutationsFinished", r, { once: true })
+    );
+    if (
+      gLastCategory.category !== category ||
+      gLastCategory.subcategory !== subcategory
+    ) {
+      return;
+    }
+  }
+
+  search(category, "data-category");
+
+  if (aShowReason != "Initial") {
+    scrollOffsets.restore();
+    focusHistory.restore(historyEntryId);
+  }
+
+  let categoryModule = gCategoryModules.get(category);
+  if (!categoryModule.handleSubcategory?.(subcategory)) {
+    spotlight(subcategory, category);
+  }
+
+  let gleanId =  (
+    "show" + aShowReason
+  );
+
+  document.dispatchEvent(
+     (
+      new CustomEvent("paneshown", {
+        bubbles: true,
+        cancelable: true,
+        detail: {
+          category,
+          subcategory,
+        },
+      })
+    )
+  );
+}
+
+function search(aQuery, aAttribute) {
+  let mainPrefPane = document.getElementById("mainPrefPane");
+  let elements =  (
+    Array.from(mainPrefPane.children)
+  );
+  for (let element of elements) {
+    if (
+      element.getAttribute("data-hidden-from-search") != "true" ||
+      element.getAttribute("data-subpanel") == "true"
+    ) {
+      let attributeValue = element.getAttribute(aAttribute);
+      if (attributeValue == aQuery) {
+        element.hidden = false;
+      } else {
+        element.hidden = true;
+      }
+    } else if (
+      element.getAttribute("data-hidden-from-search") == "true" &&
+      !element.hidden
+    ) {
+      element.hidden = true;
+    }
+    element.classList.remove("visually-hidden");
+
+    if (element.localName === "setting-pane") {
+       (element).onSearchPane = false;
+      for (let group of element.querySelectorAll("setting-group")) {
+        group.classList.remove("visually-hidden");
+      }
+    }
+  }
+}
+
+function spotlight(subcategory, category) {
+  let highlightedElements = document.querySelectorAll(".spotlight");
+  if (highlightedElements.length) {
+    for (let element of highlightedElements) {
+      element.classList.remove("spotlight");
+    }
+  }
+  if (subcategory) {
+    scrollAndHighlight(subcategory, category);
+  }
+}
+
+function scrollAndHighlight(subcategory) {
+  let elements = document.querySelectorAll(
+    `[data-subcategory~="${subcategory}"]`
+  );
+  if (!elements.length) {
+    return;
+  }
+
+  elements[0].scrollIntoView({
+    behavior: "smooth",
+    block: "center",
+  });
+  for (let element of elements) {
+    element.classList.add("spotlight");
+  }
+}
+
+function internalPrefCategoryNameToFriendlyName(aName) {
+  return (aName || "").replace(/^pane./, function (toReplace) {
+    return toReplace[4].toLowerCase();
+  });
+}
+
+const CONFIRM_RESTART_PROMPT_RESTART_NOW = 0;
+const CONFIRM_RESTART_PROMPT_CANCEL = 1;
+const CONFIRM_RESTART_PROMPT_RESTART_LATER = 2;
+async function confirmRestartPrompt(
+  aRestartToEnable,
+  aDefaultButtonIndex,
+  aWantRevertAsCancelButton,
+  aWantRestartLaterButton
+) {
+  let [
+    msg,
+    title,
+    restartButtonText,
+    noRestartButtonText,
+    restartLaterButtonText,
+  ] = await document.l10n.formatValues([
+    {
+      id: aRestartToEnable
+        ? "feature-enable-requires-restart"
+        : "feature-disable-requires-restart",
+    },
+    { id: "should-restart-title" },
+    { id: "should-restart-ok" },
+    { id: "cancel-no-restart-button" },
+    { id: "restart-later" },
+  ]);
+
+  let buttonFlags =
+    Services.prompt.BUTTON_POS_0 * Services.prompt.BUTTON_TITLE_IS_STRING;
+
+  if (aWantRevertAsCancelButton) {
+    buttonFlags +=
+      Services.prompt.BUTTON_POS_1 * Services.prompt.BUTTON_TITLE_IS_STRING;
+  } else {
+    noRestartButtonText = null;
+    buttonFlags +=
+      Services.prompt.BUTTON_POS_1 * Services.prompt.BUTTON_TITLE_CANCEL;
+  }
+
+  if (aWantRestartLaterButton) {
+    buttonFlags +=
+      Services.prompt.BUTTON_POS_2 * Services.prompt.BUTTON_TITLE_IS_STRING;
+  } else {
+    restartLaterButtonText = null;
+  }
+
+  switch (aDefaultButtonIndex) {
+    case 0:
+      buttonFlags += Services.prompt.BUTTON_POS_0_DEFAULT;
+      break;
+    case 1:
+      buttonFlags += Services.prompt.BUTTON_POS_1_DEFAULT;
+      break;
+    case 2:
+      buttonFlags += Services.prompt.BUTTON_POS_2_DEFAULT;
+      break;
+    default:
+      break;
+  }
+
+  let button = await Services.prompt.asyncConfirmEx(
+    window.browsingContext,
+    Ci.nsIPrompt.MODAL_TYPE_CONTENT,
+    title,
+    msg,
+    buttonFlags,
+    restartButtonText,
+    noRestartButtonText,
+    restartLaterButtonText,
+    null,
+    {}
+  );
+
+  let buttonIndex = button.get("buttonNumClicked");
+
+  if (buttonIndex == CONFIRM_RESTART_PROMPT_RESTART_NOW) {
+    let cancelQuit = Cc["@mozilla.org/supports-PRBool;1"].createInstance(
+      Ci.nsISupportsPRBool
+    );
+    Services.obs.notifyObservers(
+      cancelQuit,
+      "quit-application-requested",
+      "restart"
+    );
+    if (cancelQuit.data) {
+      buttonIndex = CONFIRM_RESTART_PROMPT_CANCEL;
+    }
+  }
+  return buttonIndex;
+}
+
+function appendSearchKeywords(aId, keywords) {
+  let element = document.getElementById(aId);
+  let searchKeywords = element.getAttribute("searchkeywords");
+  if (searchKeywords) {
+    keywords.push(searchKeywords);
+  }
+  element.setAttribute("searchkeywords", keywords.join(" "));
+}
+
+function maybeDisplayPoliciesNotice() {
+  if (Services.policies.status == Services.policies.ACTIVE) {
+    document
+      .getElementById("policies-container-content")
+      .removeAttribute("hidden");
+  }
+}

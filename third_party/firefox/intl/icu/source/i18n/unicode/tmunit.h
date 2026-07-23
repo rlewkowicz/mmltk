@@ -1,0 +1,72 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ *******************************************************************************
+ * Copyright (C) 2009-2016, International Business Machines Corporation,       *
+ * Google, and others. All Rights Reserved.                                    *
+ *******************************************************************************
+ */
+
+#ifndef __TMUNIT_H__
+#define __TMUNIT_H__
+
+
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/measunit.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+U_NAMESPACE_BEGIN
+
+class U_I18N_API TimeUnit: public MeasureUnit {
+public:
+    enum UTimeUnitFields {
+        UTIMEUNIT_YEAR,
+        UTIMEUNIT_MONTH,
+        UTIMEUNIT_DAY,
+        UTIMEUNIT_WEEK,
+        UTIMEUNIT_HOUR,
+        UTIMEUNIT_MINUTE,
+        UTIMEUNIT_SECOND,
+#ifndef U_HIDE_DEPRECATED_API
+        UTIMEUNIT_FIELD_COUNT
+#endif  // U_HIDE_DEPRECATED_API
+    };
+
+    static TimeUnit* U_EXPORT2 createInstance(UTimeUnitFields timeUnitField,
+                                              UErrorCode& status);
+
+
+    virtual TimeUnit* clone() const override;
+
+    TimeUnit(const TimeUnit& other);
+
+    TimeUnit& operator=(const TimeUnit& other);
+
+    virtual UClassID getDynamicClassID() const override;
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+
+    UTimeUnitFields getTimeUnitField() const;
+
+    virtual ~TimeUnit();
+
+private:
+    UTimeUnitFields fTimeUnitField;
+
+    TimeUnit(UTimeUnitFields timeUnitField);
+
+};
+
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // __TMUNIT_H__

@@ -1,0 +1,525 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "vm/OffThreadPromiseRuntimeState.h"
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT{,_IF}
+
+#include <utility>  // mozilla::Swap
+
+#include "jspubtd.h"  // js::CurrentThreadCanAccessRuntime
+
+#include "js/AllocPolicy.h"  // js::ReportOutOfMemory
+#include "js/HeapAPI.h"      // JS::shadow::Zone
+#include "js/Promise.h"  // JS::Dispatchable, JS::DispatchToEventLoopCallback,
+#include "js/Utility.h"  // js_delete, js::AutoEnterOOMUnsafeRegion
+#include "threading/ProtectedData.h"  // js::UnprotectedData
+#include "vm/HelperThreads.h"         // js::AutoLockHelperThreadState
+#include "vm/JSContext.h"             // JSContext
+#include "vm/PromiseObject.h"         // js::PromiseObject
+#include "vm/Realm.h"                 // js::AutoRealm
+#include "vm/Runtime.h"               // JSRuntime
+
+#include "vm/Realm-inl.h"  // js::AutoRealm::AutoRealm
+
+using JS::Handle;
+
+using js::OffThreadPromiseRuntimeState;
+using js::OffThreadPromiseTask;
+
+OffThreadPromiseTask::OffThreadPromiseTask(JSContext* cx,
+                                           JS::Handle<PromiseObject*> promise)
+    : runtime_(cx->runtime()), promise_(cx, promise), cancellable_(false) {
+  MOZ_ASSERT(runtime_ == promise_->zone()->runtimeFromMainThread());
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(runtime_));
+  MOZ_ASSERT(cx->runtime()->offThreadPromiseState.ref().initialized());
+}
+
+OffThreadPromiseTask::~OffThreadPromiseTask() {
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(runtime_));
+
+  OffThreadPromiseRuntimeState& state = runtime_->offThreadPromiseState.ref();
+  MOZ_ASSERT(state.initialized());
+
+  if (registered_) {
+    unregister(state);
+  }
+}
+
+bool OffThreadPromiseTask::init(JSContext* cx) {
+  AutoLockHelperThreadState lock;
+  return init(cx, lock);
+}
+
+bool OffThreadPromiseTask::init(JSContext* cx,
+                                const AutoLockHelperThreadState& lock) {
+  MOZ_ASSERT(cx->runtime() == runtime_);
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(runtime_));
+
+  OffThreadPromiseRuntimeState& state = runtime_->offThreadPromiseState.ref();
+  MOZ_ASSERT(state.initialized());
+
+  state.registerTask(cx, this);
+  return true;
+}
+
+bool OffThreadPromiseTask::InitCancellable(
+    JSContext* cx, js::UniquePtr<OffThreadPromiseTask>&& task) {
+  AutoLockHelperThreadState lock;
+  return InitCancellable(cx, lock, std::move(task));
+}
+
+bool OffThreadPromiseTask::InitCancellable(
+    JSContext* cx, const AutoLockHelperThreadState& lock,
+    js::UniquePtr<OffThreadPromiseTask>&& task) {
+  MOZ_ASSERT(cx->runtime() == task->runtime_);
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(task->runtime_));
+  OffThreadPromiseRuntimeState& state =
+      task->runtime_->offThreadPromiseState.ref();
+  MOZ_ASSERT(state.initialized());
+
+  if (!task->init(cx, lock)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  if (!state.cancellable().putNew(task.get())) {
+    task->unregister(state, lock);
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  OffThreadPromiseTask* rawTask = task.release();
+
+  rawTask->cancellable_ = true;
+
+  return true;
+}
+
+void OffThreadPromiseTask::unregister(OffThreadPromiseRuntimeState& state) {
+  AutoLockHelperThreadState lock;
+  unregister(state, lock);
+}
+void OffThreadPromiseTask::unregister(OffThreadPromiseRuntimeState& state,
+                                      const AutoLockHelperThreadState& lock) {
+  MOZ_ASSERT(registered_);
+  state.unregisterTask(this);
+}
+
+void OffThreadPromiseTask::run(JSContext* cx,
+                               MaybeShuttingDown maybeShuttingDown) {
+  MOZ_ASSERT(cx->runtime() == runtime_);
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(runtime_));
+  MOZ_ASSERT(registered_);
+
+  OffThreadPromiseRuntimeState& state = runtime_->offThreadPromiseState.ref();
+  MOZ_ASSERT(state.initialized());
+  unregister(state);
+
+  if (maybeShuttingDown == JS::Dispatchable::NotShuttingDown) {
+    AutoRealm ar(cx, promise_);
+    if (!resolve(cx, promise_)) {
+      cx->clearPendingException();
+    }
+  }
+
+  js_delete(this);
+}
+
+void OffThreadPromiseTask::transferToRuntime() {
+  MOZ_ASSERT(registered_);
+
+  OffThreadPromiseRuntimeState& state = runtime_->offThreadPromiseState.ref();
+  MOZ_ASSERT(state.initialized());
+
+  state.stealFailedTask(this);
+}
+
+void OffThreadPromiseTask::DestroyUndispatchedTask(
+    OffThreadPromiseTask* task, OffThreadPromiseRuntimeState& state,
+    const AutoLockHelperThreadState& lock) {
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(task->runtime_));
+  MOZ_ASSERT(task->registered_);
+  MOZ_ASSERT(task->cancellable_);
+  task->prepareForCancel();
+  task->unregister(state, lock);
+  js_delete(task);
+}
+
+void OffThreadPromiseTask::dispatchResolveAndDestroy() {
+  AutoLockHelperThreadState lock;
+  js::UniquePtr<OffThreadPromiseTask> task(this);
+  DispatchResolveAndDestroy(std::move(task), lock);
+}
+
+void OffThreadPromiseTask::dispatchResolveAndDestroy(
+    const AutoLockHelperThreadState& lock) {
+  js::UniquePtr<OffThreadPromiseTask> task(this);
+  DispatchResolveAndDestroy(std::move(task), lock);
+}
+
+void OffThreadPromiseTask::removeFromCancellableListAndDispatch() {
+  AutoLockHelperThreadState lock;
+  removeFromCancellableListAndDispatch(lock);
+}
+
+void OffThreadPromiseTask::removeFromCancellableListAndDispatch(
+    const AutoLockHelperThreadState& lock) {
+  OffThreadPromiseRuntimeState& state = runtime_->offThreadPromiseState.ref();
+  MOZ_ASSERT(state.initialized());
+  MOZ_ASSERT(state.cancellable().has(this));
+
+  MOZ_ASSERT(registered_);
+  MOZ_ASSERT(cancellable_);
+  cancellable_ = false;
+  state.cancellable().remove(this);
+
+  js::UniquePtr<OffThreadPromiseTask> task;
+  task.reset(this);
+  DispatchResolveAndDestroy(std::move(task), lock);
+}
+
+void OffThreadPromiseTask::DispatchResolveAndDestroy(
+    js::UniquePtr<OffThreadPromiseTask>&& task) {
+  AutoLockHelperThreadState lock;
+  DispatchResolveAndDestroy(std::move(task), lock);
+}
+
+void OffThreadPromiseTask::DispatchResolveAndDestroy(
+    js::UniquePtr<OffThreadPromiseTask>&& task,
+    const AutoLockHelperThreadState& lock) {
+  OffThreadPromiseRuntimeState& state =
+      task->runtime()->offThreadPromiseState.ref();
+  MOZ_ASSERT(state.initialized());
+
+  MOZ_ASSERT(task->registered_);
+  MOZ_ASSERT(!task->cancellable_);
+  {
+    JS::AutoSuppressGCAnalysis nogc;
+    if (state.dispatchToEventLoop(std::move(task))) {
+      return;
+    }
+  }
+
+  if (state.failed().length() == state.numRegistered_) {
+    state.allFailed().notify_one();
+  }
+}
+
+OffThreadPromiseRuntimeState::OffThreadPromiseRuntimeState()
+    : dispatchToEventLoopCallback_(nullptr),
+      delayedDispatchToEventLoopCallback_(nullptr),
+      asyncTaskStartedCallback_(nullptr),
+      asyncTaskFinishedCallback_(nullptr),
+      dispatchToEventLoopClosure_(nullptr),
+#ifdef DEBUG
+      forceQuitting_(false),
+#endif
+      numRegistered_(0),
+      internalDispatchQueueClosed_(false) {
+}
+
+OffThreadPromiseRuntimeState::~OffThreadPromiseRuntimeState() {
+  MOZ_ASSERT_IF(!forceQuitting_, numRegistered_ == 0);
+  MOZ_ASSERT_IF(!forceQuitting_, numDelayed_ == 0);
+  MOZ_ASSERT_IF(!forceQuitting_, internalDispatchQueue_.refNoCheck().empty());
+  MOZ_ASSERT(!initialized());
+}
+
+void OffThreadPromiseRuntimeState::init(
+    JS::DispatchToEventLoopCallback dispatchCallback,
+    JS::DelayedDispatchToEventLoopCallback delayedDispatchCallback,
+    JS::AsyncTaskStartedCallback asyncTaskStartedCallback,
+    JS::AsyncTaskFinishedCallback asyncTaskFinishedCallback, void* closure) {
+  MOZ_ASSERT(!initialized());
+
+  dispatchToEventLoopCallback_ = dispatchCallback;
+  delayedDispatchToEventLoopCallback_ = delayedDispatchCallback;
+  asyncTaskStartedCallback_ = asyncTaskStartedCallback;
+  asyncTaskFinishedCallback_ = asyncTaskFinishedCallback;
+  dispatchToEventLoopClosure_ = closure;
+
+  MOZ_ASSERT(initialized());
+}
+
+bool OffThreadPromiseRuntimeState::dispatchToEventLoop(
+    js::UniquePtr<JS::Dispatchable>&& dispatchable) {
+  return dispatchToEventLoopCallback_(dispatchToEventLoopClosure_,
+                                      std::move(dispatchable));
+}
+
+bool OffThreadPromiseRuntimeState::delayedDispatchToEventLoop(
+    js::UniquePtr<JS::Dispatchable>&& dispatchable, uint32_t delay) {
+  return delayedDispatchToEventLoopCallback_(dispatchToEventLoopClosure_,
+                                             std::move(dispatchable), delay);
+}
+
+void OffThreadPromiseRuntimeState::registerTask(JSContext* cx,
+                                                OffThreadPromiseTask* task) {
+  numRegistered_++;
+
+  task->registered_ = true;
+
+  if (!asyncTaskStartedCallback_) {
+    return;
+  }
+
+  JS::AutoSuppressGCAnalysis nogc(cx);
+  asyncTaskStartedCallback_(dispatchToEventLoopClosure_, task);
+}
+
+void OffThreadPromiseRuntimeState::unregisterTask(OffThreadPromiseTask* task) {
+  MOZ_ASSERT(numRegistered_ != 0);
+  numRegistered_--;
+
+  task->registered_ = false;
+
+  if (task->cancellable_) {
+    task->cancellable_ = false;
+    cancellable().remove(task);
+  }
+
+  if (!asyncTaskFinishedCallback_) {
+    return;
+  }
+
+  JS::AutoSuppressGCAnalysis nogc;
+  asyncTaskFinishedCallback_(dispatchToEventLoopClosure_, task);
+}
+
+bool OffThreadPromiseRuntimeState::internalDispatchToEventLoop(
+    void* closure, js::UniquePtr<JS::Dispatchable>&& d) {
+  OffThreadPromiseRuntimeState& state =
+      *reinterpret_cast<OffThreadPromiseRuntimeState*>(closure);
+  MOZ_ASSERT(state.usingInternalDispatchQueue());
+  gHelperThreadLock.assertOwnedByCurrentThread();
+
+  if (state.internalDispatchQueueClosed_) {
+    JS::Dispatchable::ReleaseFailedTask(std::move(d));
+    return false;
+  }
+
+  state.dispatchDelayedTasks();
+
+  AutoEnterOOMUnsafeRegion noOOM;
+  if (!state.internalDispatchQueue().pushBack(std::move(d))) {
+    noOOM.crash("internalDispatchToEventLoop");
+  }
+
+  state.internalDispatchQueueAppended().notify_one();
+  return true;
+}
+
+bool OffThreadPromiseRuntimeState::internalDelayedDispatchToEventLoop(
+    void* closure, js::UniquePtr<JS::Dispatchable>&& d, uint32_t delay) {
+  OffThreadPromiseRuntimeState& state =
+      *reinterpret_cast<OffThreadPromiseRuntimeState*>(closure);
+  MOZ_ASSERT(state.usingInternalDispatchQueue());
+  gHelperThreadLock.assertOwnedByCurrentThread();
+
+  if (state.internalDispatchQueueClosed_) {
+    return false;
+  }
+
+  state.dispatchDelayedTasks();
+
+  mozilla::TimeStamp endTime = mozilla::TimeStamp::Now() +
+                               mozilla::TimeDuration::FromMilliseconds(delay);
+  if (!state.internalDelayedDispatchPriorityQueue().reserveOne()) {
+    JS::Dispatchable::ReleaseFailedTask(std::move(d));
+    return false;
+  }
+
+  state.internalDelayedDispatchPriorityQueue().infallibleInsert(
+      DelayedDispatchable(std::move(d), endTime));
+
+  return true;
+}
+
+void OffThreadPromiseRuntimeState::dispatchDelayedTasks() {
+  MOZ_ASSERT(usingInternalDispatchQueue());
+  gHelperThreadLock.assertOwnedByCurrentThread();
+
+  if (internalDispatchQueueClosed_) {
+    return;
+  }
+
+  auto& queue = internalDelayedDispatchPriorityQueue();
+
+  if (queue.empty()) {
+    return;
+  }
+
+  mozilla::TimeStamp now = mozilla::TimeStamp::Now();
+
+  while (!queue.empty() && queue.highest().endTime() <= now) {
+    DelayedDispatchable d(std::move(queue.highest()));
+    queue.popHighest();
+
+    AutoEnterOOMUnsafeRegion noOOM;
+    numDelayed_++;
+    if (!internalDispatchQueue().pushBack(d.dispatchable())) {
+      noOOM.crash("dispatchDelayedTasks");
+    }
+    internalDispatchQueueAppended().notify_one();
+  }
+}
+
+bool OffThreadPromiseRuntimeState::usingInternalDispatchQueue() const {
+  return dispatchToEventLoopCallback_ == internalDispatchToEventLoop;
+}
+
+void OffThreadPromiseRuntimeState::initInternalDispatchQueue() {
+  init(internalDispatchToEventLoop, internalDelayedDispatchToEventLoop, nullptr,
+       nullptr, this);
+  MOZ_ASSERT(usingInternalDispatchQueue());
+}
+
+bool OffThreadPromiseRuntimeState::initialized() const {
+  return !!dispatchToEventLoopCallback_;
+}
+
+void OffThreadPromiseRuntimeState::internalDrain(JSContext* cx) {
+  MOZ_ASSERT(usingInternalDispatchQueue());
+
+  for (;;) {
+    js::UniquePtr<JS::Dispatchable> d;
+    {
+      AutoLockHelperThreadState lock;
+      dispatchDelayedTasks();
+
+      MOZ_ASSERT(!internalDispatchQueueClosed_);
+      MOZ_ASSERT_IF(!internalDispatchQueue().empty(),
+                    numRegistered_ + numDelayed_ > 0);
+      if (internalDispatchQueue().empty() && !internalHasPending(lock)) {
+        return;
+      }
+
+      while (internalDispatchQueue().empty()) {
+        internalDispatchQueueAppended().wait(lock);
+      }
+
+      d = std::move(internalDispatchQueue().front());
+      internalDispatchQueue().popFront();
+      if (!d->registered()) {
+        numDelayed_--;
+      }
+    }
+
+    OffThreadPromiseTask::Run(cx, std::move(d),
+                              JS::Dispatchable::NotShuttingDown);
+  }
+}
+
+bool OffThreadPromiseRuntimeState::internalHasPending() {
+  AutoLockHelperThreadState lock;
+  return internalHasPending(lock);
+}
+
+bool OffThreadPromiseRuntimeState::internalHasPending(
+    AutoLockHelperThreadState& lock) {
+  MOZ_ASSERT(usingInternalDispatchQueue());
+
+  MOZ_ASSERT(!internalDispatchQueueClosed_);
+  MOZ_ASSERT_IF(!internalDispatchQueue().empty(),
+                numRegistered_ + numDelayed_ > 0);
+  return numDelayed_ > 0 || numRegistered_ > cancellable().count();
+}
+
+void OffThreadPromiseRuntimeState::stealFailedTask(JS::Dispatchable* task) {
+  js::AutoEnterOOMUnsafeRegion noOOM;
+  if (!failed().pushBack(task)) {
+    noOOM.crash("stealFailedTask");
+  }
+}
+
+void OffThreadPromiseRuntimeState::cancelTasks(
+    js::AutoLockHelperThreadState& lock, JSContext* cx) {
+  MOZ_ASSERT(initialized());
+  if (!initialized()) {
+    return;
+  }
+
+  for (auto iter = cancellable().modIter(); !iter.done(); iter.next()) {
+    OffThreadPromiseTask* task = iter.get();
+    MOZ_ASSERT(task->cancellable_);
+    iter.remove();
+
+    OffThreadPromiseTask::DestroyUndispatchedTask(task, *this, lock);
+  }
+}
+
+void OffThreadPromiseRuntimeState::cancelTasks(JSContext* cx) {
+  if (!initialized()) {
+    return;
+  }
+
+  AutoLockHelperThreadState lock;
+  cancelTasks(lock, cx);
+}
+
+void OffThreadPromiseRuntimeState::shutdown(JSContext* cx) {
+  if (!initialized()) {
+    return;
+  }
+
+  AutoLockHelperThreadState lock;
+
+  cancelTasks(lock, cx);
+  MOZ_ASSERT(cancellable().empty());
+
+  if (usingInternalDispatchQueue()) {
+    DispatchableFifo dispatchQueue;
+    {
+      std::swap(dispatchQueue, internalDispatchQueue());
+      MOZ_ASSERT(internalDispatchQueue().empty());
+      internalDispatchQueueClosed_ = true;
+    }
+
+    AutoUnlockHelperThreadState unlock(lock);
+    while (!dispatchQueue.empty()) {
+      js::UniquePtr<JS::Dispatchable> d = std::move(dispatchQueue.front());
+      dispatchQueue.popFront();
+      OffThreadPromiseTask::Run(cx, std::move(d),
+                                JS::Dispatchable::ShuttingDown);
+    }
+  }
+
+  while (numRegistered_ != failed().length()) {
+    MOZ_ASSERT(failed().length() < numRegistered_);
+    allFailed().wait(lock);
+  }
+
+  {
+    DispatchableFifo failedQueue;
+    {
+      std::swap(failedQueue, failed());
+      MOZ_ASSERT(failed().empty());
+    }
+
+    AutoUnlockHelperThreadState unlock(lock);
+    while (!failedQueue.empty()) {
+      js::UniquePtr<JS::Dispatchable> d = std::move(failedQueue.front());
+      failedQueue.popFront();
+      js_delete(d.release());
+    }
+  }
+
+  MOZ_ASSERT(numRegistered_ == 0);
+
+  dispatchToEventLoopCallback_ = nullptr;
+  MOZ_ASSERT(!initialized());
+}
+
+js::PromiseObject* OffThreadPromiseTask::ExtractAndForget(
+    OffThreadPromiseTask* task, const AutoLockHelperThreadState& lock) {
+  OffThreadPromiseRuntimeState& state =
+      task->runtime()->offThreadPromiseState.ref();
+  MOZ_ASSERT(state.initialized());
+  MOZ_ASSERT(task->registered_);
+  js::PromiseObject* promise = task->promise_;
+  task->unregister(state, lock);
+  js_delete(task);
+  return promise;
+}

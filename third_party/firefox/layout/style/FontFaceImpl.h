@@ -1,0 +1,226 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_FontFaceImpl_h
+#define mozilla_dom_FontFaceImpl_h
+
+#include "gfxUserFontSet.h"
+#include "mozilla/RWLock.h"
+#include "mozilla/dom/FontFaceBinding.h"
+#include "nsTHashSet.h"
+
+class gfxFontFaceBufferSource;
+
+namespace mozilla {
+class PostTraversalTask;
+struct StyleLockedFontFaceRule;
+namespace dom {
+class CSSFontFaceRule;
+class FontFace;
+class FontFaceBufferSource;
+struct FontFaceDescriptors;
+class FontFaceSetImpl;
+class UTF8StringOrArrayBufferOrArrayBufferView;
+}  
+}  
+
+namespace mozilla::dom {
+
+class FontFaceImpl final {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(FontFaceImpl)
+
+  friend class mozilla::PostTraversalTask;
+  friend class FontFaceBufferSource;
+  friend class Entry;
+
+ public:
+  class Entry final : public gfxUserFontEntry {
+    friend class FontFaceImpl;
+
+   public:
+    Entry(gfxUserFontSet* aFontSet, nsTArray<gfxFontFaceSrc>&& aFontFaceSrcList,
+          gfxUserFontAttributes&& aAttr)
+        : gfxUserFontEntry(std::move(aFontFaceSrcList), std::move(aAttr)),
+          mFontSet(aFontSet) {}
+
+    void SetLoadState(UserFontLoadState aLoadState) override;
+    void GetUserFontSets(nsTArray<RefPtr<gfxUserFontSet>>& aResult) override;
+    already_AddRefed<gfxUserFontSet> GetUserFontSet() const override;
+
+#ifdef DEBUG
+    bool HasUserFontSet(gfxUserFontSet* aFontSet) const {
+      AutoReadLock lock(mLock);
+      return mFontSet == aFontSet;
+    }
+#endif
+
+    void AddFontFace(FontFaceImpl* aOwner);
+    void RemoveFontFace(FontFaceImpl* aOwner);
+    void FindFontFaceOwners(nsTHashSet<FontFace*>& aOwners);
+
+    RWLock& Lock() const MOZ_RETURN_CAPABILITY(mLock) { return mLock; }
+
+   protected:
+    void CheckUserFontSetLocked() MOZ_REQUIRES(mLock);
+
+    gfxUserFontSet* MOZ_NON_OWNING_REF mFontSet MOZ_GUARDED_BY(mLock);
+
+    AutoTArray<FontFaceImpl*, 1> mFontFaces MOZ_GUARDED_BY(mLock);
+  };
+
+#ifdef DEBUG
+  void AssertIsOnOwningThread() const;
+#else
+  void AssertIsOnOwningThread() const {}
+#endif
+
+  FontFace* GetOwner() const {
+    AssertIsOnOwningThread();
+    return mOwner;
+  }
+
+  void StopKeepingOwnerAlive();
+
+  static already_AddRefed<FontFaceImpl> CreateForRule(
+      FontFace* aOwner, FontFaceSetImpl* aFontFaceSet,
+      StyleLockedFontFaceRule* aRule);
+
+  StyleLockedFontFaceRule* GetRule() { return mRule; }
+
+  static bool GetAttributesFromRule(
+      StyleLockedFontFaceRule*, gfxUserFontAttributes& aAttr,
+      const Maybe<gfxCharacterMap*>& aKnownCharMap = Nothing());
+  bool GetAttributes(gfxUserFontAttributes& aAttr);
+  gfxUserFontEntry* CreateUserFontEntry();
+  gfxUserFontEntry* GetUserFontEntry() const { return mUserFontEntry; }
+  void SetUserFontEntry(gfxUserFontEntry* aEntry);
+
+  bool IsInFontFaceSet(FontFaceSetImpl* aFontFaceSet) const;
+
+  void AddFontFaceSet(FontFaceSetImpl* aFontFaceSet);
+  void RemoveFontFaceSet(FontFaceSetImpl* aFontFaceSet);
+
+  FontFaceSetImpl* GetPrimaryFontFaceSet() const { return mFontFaceSet; }
+
+  nsAtom* GetFamilyName() const;
+
+  bool HasRule() const { return mRule; }
+
+  void SetRule(StyleLockedFontFaceRule* aData) {
+    MOZ_ASSERT(HasRule());
+    AssertIsOnOwningThread();
+    mRule = aData;
+  }
+
+  void DisconnectFromRule();
+
+  bool HasFontData() const;
+
+  already_AddRefed<gfxFontFaceBufferSource> TakeBufferSource();
+
+  bool GetData(uint8_t*& aBuffer, uint32_t& aLength);
+
+  gfxCharacterMap* GetUnicodeRangeAsCharacterMap();
+
+  void GetFamily(nsACString& aResult);
+  void SetFamily(const nsACString& aValue, ErrorResult& aRv);
+  void GetStyle(nsACString& aResult);
+  void SetStyle(const nsACString& aValue, ErrorResult& aRv);
+  void GetWeight(nsACString& aResult);
+  void SetWeight(const nsACString& aValue, ErrorResult& aRv);
+  void GetStretch(nsACString& aResult);
+  void SetStretch(const nsACString& aValue, ErrorResult& aRv);
+  void GetUnicodeRange(nsACString& aResult);
+  void SetUnicodeRange(const nsACString& aValue, ErrorResult& aRv);
+  void GetVariant(nsACString& aResult);
+  void SetVariant(const nsACString& aValue, ErrorResult& aRv);
+  void GetFeatureSettings(nsACString& aResult);
+  void SetFeatureSettings(const nsACString& aValue, ErrorResult& aRv);
+  void GetVariationSettings(nsACString& aResult);
+  void SetVariationSettings(const nsACString& aValue, ErrorResult& aRv);
+  void GetDisplay(nsACString& aResult);
+  void SetDisplay(const nsACString& aValue, ErrorResult& aRv);
+  void GetAscentOverride(nsACString& aResult);
+  void SetAscentOverride(const nsACString& aValue, ErrorResult& aRv);
+  void GetDescentOverride(nsACString& aResult);
+  void SetDescentOverride(const nsACString& aValue, ErrorResult& aRv);
+  void GetLineGapOverride(nsACString& aResult);
+  void SetLineGapOverride(const nsACString& aValue, ErrorResult& aRv);
+  void GetSizeAdjust(nsACString& aResult);
+  void SetSizeAdjust(const nsACString& aValue, ErrorResult& aRv);
+
+  FontFaceLoadStatus Status();
+  void Load();
+
+  void Destroy();
+
+  FontFaceImpl(FontFace* aOwner, FontFaceSetImpl* aFontFaceSet);
+
+  void InitializeSourceURL(const nsACString& aURL);
+  void InitializeSourceBuffer(uint8_t* aBuffer, uint32_t aLength);
+
+  void UpdateOwnerKeepAlive();
+
+  bool SetDescriptors(const nsACString& aFamily,
+                      const FontFaceDescriptors& aDescriptors);
+
+  StyleLockedFontFaceRule* GetData() const {
+    AssertIsOnOwningThread();
+    return HasRule() ? mRule : mDescriptors;
+  }
+
+ private:
+  ~FontFaceImpl();
+
+  void DoLoad();
+  void UpdateOwnerPromise();
+  void UpdateOwnerPromiseSync();
+
+  bool SetDescriptor(FontFaceDescriptorId aFontDesc, const nsACString& aValue,
+                     ErrorResult& aRv);
+
+  void DescriptorUpdated();
+
+  void SetStatus(FontFaceLoadStatus aStatus);
+
+  void GetDesc(FontFaceDescriptorId aDescID, nsACString& aResult) const;
+
+  void TakeBuffer(uint8_t*& aBuffer, uint32_t& aLength);
+
+  FontFace* MOZ_NON_OWNING_REF mOwner;
+
+  RefPtr<StyleLockedFontFaceRule> mRule;
+
+  RefPtr<Entry> mUserFontEntry;
+
+  FontFaceLoadStatus mStatus;
+
+  enum SourceType {
+    eSourceType_FontFaceRule = 1,
+    eSourceType_URLs,
+    eSourceType_Buffer
+  };
+
+  SourceType mSourceType;
+
+  RefPtr<FontFaceBufferSource> mBufferSource;
+
+  RefPtr<StyleLockedFontFaceRule> mDescriptors;
+
+  RefPtr<gfxCharacterMap> mUnicodeRange;
+
+  RefPtr<FontFaceSetImpl> mFontFaceSet;
+
+  nsTArray<RefPtr<FontFaceSetImpl>> mOtherFontFaceSets;
+
+  bool mUnicodeRangeDirty = true;
+
+  bool mInFontFaceSet = false;
+
+  bool mKeepingOwnerAlive = false;
+};
+
+}  
+
+#endif  // !defined(mozilla_dom_FontFaceImpl_h)

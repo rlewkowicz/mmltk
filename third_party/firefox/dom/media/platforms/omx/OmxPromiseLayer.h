@@ -1,0 +1,181 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(OmxPromiseLayer_h_)
+#  define OmxPromiseLayer_h_
+
+#  include "OMX_Core.h"
+#  include "OMX_Types.h"
+#  include "mozilla/MozPromise.h"
+#  include "mozilla/TaskQueue.h"
+
+namespace mozilla {
+
+namespace layers {
+class ImageContainer;
+}
+
+class MediaData;
+class MediaRawData;
+class OmxDataDecoder;
+class OmxPlatformLayer;
+class TrackInfo;
+
+class OmxPromiseLayer {
+ protected:
+  virtual ~OmxPromiseLayer() = default;
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(OmxPromiseLayer)
+
+  OmxPromiseLayer(TaskQueue* aTaskQueue, OmxDataDecoder* aDataDecoder,
+                  layers::ImageContainer* aImageContainer);
+
+  class BufferData;
+
+  typedef nsTArray<RefPtr<BufferData>> BUFFERLIST;
+
+  class OmxBufferFailureHolder {
+   public:
+    OmxBufferFailureHolder(OMX_ERRORTYPE aError, BufferData* aBuffer)
+        : mError(aError), mBuffer(aBuffer) {}
+
+    OMX_ERRORTYPE mError;
+    BufferData* mBuffer;
+  };
+
+  typedef MozPromise<BufferData*, OmxBufferFailureHolder,
+                      false>
+      OmxBufferPromise;
+
+  class OmxCommandFailureHolder {
+   public:
+    OmxCommandFailureHolder(OMX_ERRORTYPE aErrorType,
+                            OMX_COMMANDTYPE aCommandType)
+        : mErrorType(aErrorType), mCommandType(aCommandType) {}
+
+    OMX_ERRORTYPE mErrorType;
+    OMX_COMMANDTYPE mCommandType;
+  };
+
+  typedef MozPromise<OMX_COMMANDTYPE, OmxCommandFailureHolder,
+                      true>
+      OmxCommandPromise;
+
+  typedef MozPromise<uint32_t, bool,  true>
+      OmxPortConfigPromise;
+
+  RefPtr<OmxCommandPromise> Init(const TrackInfo* aInfo);
+
+  OMX_ERRORTYPE Config();
+
+  RefPtr<OmxBufferPromise> FillBuffer(BufferData* aData);
+
+  RefPtr<OmxBufferPromise> EmptyBuffer(BufferData* aData);
+
+  RefPtr<OmxCommandPromise> SendCommand(OMX_COMMANDTYPE aCmd, OMX_U32 aParam1,
+                                        OMX_PTR aCmdData);
+
+  nsresult AllocateOmxBuffer(OMX_DIRTYPE aType, BUFFERLIST* aBuffers);
+
+  nsresult ReleaseOmxBuffer(OMX_DIRTYPE aType, BUFFERLIST* aBuffers);
+
+  OMX_STATETYPE GetState();
+
+  OMX_ERRORTYPE GetParameter(OMX_INDEXTYPE aParamIndex,
+                             OMX_PTR aComponentParameterStructure,
+                             OMX_U32 aComponentParameterSize);
+
+  OMX_ERRORTYPE SetParameter(OMX_INDEXTYPE nIndex,
+                             OMX_PTR aComponentParameterStructure,
+                             OMX_U32 aComponentParameterSize);
+
+  OMX_U32 InputPortIndex();
+
+  OMX_U32 OutputPortIndex();
+
+  nsresult Shutdown();
+
+  class BufferData {
+   protected:
+    virtual ~BufferData() = default;
+
+   public:
+    explicit BufferData(OMX_BUFFERHEADERTYPE* aBuffer)
+        : mEos(false), mStatus(BufferStatus::FREE), mBuffer(aBuffer) {}
+
+    typedef void* BufferID;
+
+    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(BufferData)
+
+    virtual BufferID ID() { return mBuffer; }
+
+    virtual already_AddRefed<MediaData> GetPlatformMediaData() {
+      return nullptr;
+    }
+
+    enum BufferStatus {
+      FREE,
+      OMX_COMPONENT,
+      OMX_CLIENT,
+      OMX_CLIENT_OUTPUT,
+      INVALID
+    };
+
+    bool mEos;
+
+    RefPtr<MediaRawData> mRawData;
+
+    MozPromiseHolder<OmxBufferPromise> mPromise;
+    BufferStatus mStatus;
+    OMX_BUFFERHEADERTYPE* mBuffer;
+  };
+
+  void EmptyFillBufferDone(OMX_DIRTYPE aType, BufferData::BufferID aID);
+
+  void EmptyFillBufferDone(OMX_DIRTYPE aType, BufferData* aData);
+
+  already_AddRefed<BufferData> FindBufferById(OMX_DIRTYPE aType,
+                                              BufferData::BufferID aId);
+
+  already_AddRefed<BufferData> FindAndRemoveBufferHolder(
+      OMX_DIRTYPE aType, BufferData::BufferID aId);
+
+  bool Event(OMX_EVENTTYPE aEvent, OMX_U32 aData1, OMX_U32 aData2);
+
+ protected:
+  struct FlushCommand {
+    OMX_DIRTYPE type;
+    OMX_PTR cmd;
+  };
+
+  BUFFERLIST* GetBufferHolders(OMX_DIRTYPE aType);
+
+  already_AddRefed<MediaRawData> FindAndRemoveRawData(OMX_TICKS aTimecode);
+
+  RefPtr<TaskQueue> mTaskQueue;
+
+  MozPromiseHolder<OmxCommandPromise> mCommandStatePromise;
+
+  MozPromiseHolder<OmxCommandPromise> mPortDisablePromise;
+
+  MozPromiseHolder<OmxCommandPromise> mPortEnablePromise;
+
+  MozPromiseHolder<OmxCommandPromise> mFlushPromise;
+
+  nsTArray<FlushCommand> mFlushCommands;
+
+  UniquePtr<OmxPlatformLayer> mPlatformLayer;
+
+ private:
+  BUFFERLIST mInbufferHolders;
+
+  BUFFERLIST mOutbufferHolders;
+
+  nsTArray<RefPtr<MediaRawData>> mRawDatas;
+};
+
+}  
+
+#endif /* OmxPromiseLayer_h_ */

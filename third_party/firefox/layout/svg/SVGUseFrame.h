@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_SVGUSEFRAME_H_
+#define LAYOUT_SVG_SVGUSEFRAME_H_
+
+#include "SVGGFrame.h"
+
+namespace mozilla {
+class PresShell;
+}  
+
+nsIFrame* NS_NewSVGUseFrame(mozilla::PresShell* aPresShell,
+                            mozilla::ComputedStyle* aStyle);
+
+namespace mozilla {
+
+class SVGUseFrame final : public SVGGFrame {
+  friend nsIFrame* ::NS_NewSVGUseFrame(mozilla::PresShell* aPresShell,
+                                       ComputedStyle* aStyle);
+
+ protected:
+  explicit SVGUseFrame(ComputedStyle* aStyle, nsPresContext* aPresContext)
+      : SVGGFrame(aStyle, aPresContext, kClassID), mHasValidDimensions(true) {}
+
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(SVGUseFrame)
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+
+  void HrefChanged();
+
+  void DimensionAttributeChanged(bool aHadValidDimensions,
+                                 bool aAttributeIsUsed);
+
+  void DidSetComputedStyle(ComputedStyle* aOldComputedStyle) override;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override {
+    return MakeFrameName(u"SVGUse"_ns, aResult);
+  }
+#endif
+
+  void ReflowSVG() override;
+  void NotifySVGChanged(ChangeFlags aFlags) override;
+
+ private:
+  bool mHasValidDimensions;
+};
+
+}  
+
+#endif  // LAYOUT_SVG_SVGUSEFRAME_H_

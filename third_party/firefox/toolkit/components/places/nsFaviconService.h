@@ -1,0 +1,87 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsFaviconService_h_
+#define nsFaviconService_h_
+
+#include "Database.h"
+#include "FaviconHelpers.h"
+#include "imgITools.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/storage.h"
+#include "nsCOMPtr.h"
+#include "nsComponentManagerUtils.h"
+#include "nsIFaviconService.h"
+#include "nsServiceManagerUtils.h"
+#include "nsString.h"
+#include "nsTHashtable.h"
+#include "nsToolkitCompsCID.h"
+#include "nsURIHashKey.h"
+#include "prtime.h"
+
+extern const uint16_t gFaviconSizes[7];
+
+class mozIStorageStatementCallback;
+
+class nsFaviconService final : public nsIFaviconService {
+ public:
+  nsFaviconService();
+
+  static already_AddRefed<nsFaviconService> GetSingleton();
+
+  nsresult Init();
+
+  static nsFaviconService* GetFaviconService() {
+    if (!gFaviconService) {
+      nsCOMPtr<nsIFaviconService> serv =
+          do_GetService(NS_FAVICONSERVICE_CONTRACTID);
+      NS_ENSURE_TRUE(serv, nullptr);
+      NS_ASSERTION(gFaviconService, "Should have static instance pointer now");
+    }
+    return gFaviconService;
+  }
+
+  nsresult GetFaviconLinkForIconString(const nsCString& aSpec,
+                                       nsIURI** aOutput);
+
+  nsresult OptimizeIconSizes(mozilla::places::IconData& aIcon);
+
+  RefPtr<mozilla::places::FaviconPromise> AsyncGetFaviconForPage(
+      nsIURI* aPageURI, uint16_t aPreferredWidth = 0,
+      bool aOnConcurrentConn = false);
+
+  RefPtr<mozilla::places::BoolPromise> AsyncTryCopyFavicons(
+      nsCOMPtr<nsIURI> aFromPageURI, nsCOMPtr<nsIURI> aToPageURI,
+      uint32_t aFaviconLoadType);
+
+  void ClearImageCache(nsIURI* aImageURI);
+
+  static mozilla::Atomic<int64_t> sLastInsertedIconId;
+  static void StoreLastInsertedId(const nsACString& aTable,
+                                  const int64_t aLastInsertedId);
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIFAVICONSERVICE
+
+ private:
+  imgITools* GetImgTools() {
+    if (!mImgTools) {
+      mImgTools = do_CreateInstance("@mozilla.org/image/tools;1");
+    }
+    return mImgTools;
+  }
+
+  ~nsFaviconService();
+
+  RefPtr<mozilla::places::Database> mDB;
+
+  nsCOMPtr<imgITools> mImgTools;
+
+  static nsFaviconService* gFaviconService;
+
+  nsCOMPtr<nsIURI> mDefaultIcon;
+  uint16_t mDefaultIconURIPreferredSize;
+};
+
+#endif  // nsFaviconService_h_

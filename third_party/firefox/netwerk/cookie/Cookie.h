@@ -1,0 +1,161 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_Cookie_h
+#define mozilla_net_Cookie_h
+
+#include "nsICookie.h"
+#include "nsIMemoryReporter.h"
+#include "nsString.h"
+
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/net/NeckoChannelParams.h"
+#include "nsIMemoryReporter.h"
+
+using mozilla::OriginAttributes;
+
+namespace mozilla {
+namespace net {
+
+
+
+class Cookie final : public nsICookie {
+  MOZ_DEFINE_MALLOC_SIZE_OF(MallocSizeOf)
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSICOOKIE
+
+  static Cookie* Cast(nsICookie* aCookie) {
+    return static_cast<Cookie*>(aCookie);
+  }
+
+  static const Cookie* Cast(const nsICookie* aCookie) {
+    return static_cast<const Cookie*>(aCookie);
+  }
+
+ private:
+  Cookie(const CookieStruct& aCookieData,
+         const OriginAttributes& aOriginAttributes);
+
+  static already_AddRefed<Cookie> FromCookieStruct(
+      const CookieStruct& aCookieData,
+      const OriginAttributes& aOriginAttributes);
+
+ public:
+  static int64_t GenerateUniqueCreationTimeInUSec(int64_t aCreationTimeInUSec);
+
+  static uint32_t ComputeKeyHash(const nsACString& aName,
+                                 const nsACString& aHost,
+                                 const nsACString& aPath);
+
+  static already_AddRefed<Cookie> Create(
+      const CookieStruct& aCookieData,
+      const OriginAttributes& aOriginAttributes);
+
+  static already_AddRefed<Cookie> CreateValidated(
+      const CookieStruct& aCookieData,
+      const OriginAttributes& aOriginAttributes);
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+  inline const nsCString& Name() const { return mData.name(); }
+  inline const nsCString& Value() const { return mData.value(); }
+  inline const nsCString& Host() const { return mData.host(); }
+  inline nsDependentCSubstring RawHost() const {
+    return nsDependentCSubstring(mData.host(), IsDomain() ? 1 : 0);
+  }
+  inline const nsCString& Path() const { return mData.path(); }
+  inline int64_t ExpiryInMSec() const { return mData.expiryInMSec(); }
+  inline int64_t LastAccessedInUSec() const {
+    return mData.lastAccessedInUSec();
+  }
+  inline int64_t CreationTimeInUSec() const {
+    return mData.creationTimeInUSec();
+  }
+  inline int64_t UpdateTimeInUSec() const { return mData.updateTimeInUSec(); }
+  inline bool IsSession() const { return mData.isSession(); }
+  inline bool IsDomain() const { return *mData.host().get() == '.'; }
+  inline bool IsSecure() const { return mData.isSecure(); }
+  inline bool IsHttpOnly() const { return mData.isHttpOnly(); }
+  inline bool IsPartitioned() const {
+    return !mOriginAttributes.mPartitionKey.IsEmpty();
+  }
+  inline bool RawIsPartitioned() const { return mData.isPartitioned(); }
+  inline const OriginAttributes& OriginAttributesRef() const {
+    return mOriginAttributes;
+  }
+  inline int32_t SameSite() const { return mData.sameSite(); }
+  inline uint8_t SchemeMap() const { return mData.schemeMap(); }
+
+  inline void SetExpiryInMSec(int64_t aExpiryInMSec) {
+    mData.expiryInMSec() = aExpiryInMSec;
+  }
+  inline void SetLastAccessedInUSec(int64_t aTimeInUSec) {
+    mData.lastAccessedInUSec() = aTimeInUSec;
+  }
+  inline void SetIsSession(bool aIsSession) { mData.isSession() = aIsSession; }
+  inline bool SetIsHttpOnly(bool aIsHttpOnly) {
+    return mData.isHttpOnly() = aIsHttpOnly;
+  }
+  inline void SetCreationTimeInUSec(int64_t aTimeInUSec) {
+    mData.creationTimeInUSec() = aTimeInUSec;
+  }
+  inline void SetUpdateTimeInUSec(int64_t aTimeInUSec) {
+    mData.updateTimeInUSec() = aTimeInUSec;
+  }
+  inline void SetSchemeMap(uint8_t aSchemeMap) {
+    mData.schemeMap() = aSchemeMap;
+  }
+  inline void SetSameSite(int32_t aSameSite) { mData.sameSite() = aSameSite; }
+  inline void SetHost(const nsACString& aHost) {
+    mData.host() = aHost;
+    mKeyHash = ComputeKeyHash(mData.name(), mData.host(), mData.path());
+  }
+
+  inline uint32_t KeyHash() const { return mKeyHash; }
+
+  uint32_t NameAndValueBytes() {
+    return mData.name().Length() + mData.value().Length();
+  }
+
+  bool IsStale() const;
+
+  const CookieStruct& ToIPC() const { return mData; }
+
+  already_AddRefed<Cookie> Clone() const;
+
+ protected:
+  virtual ~Cookie() = default;
+
+ private:
+  CookieStruct mData;
+  OriginAttributes mOriginAttributes;
+  uint32_t mKeyHash{0};
+};
+
+class CompareCookiesForSending {
+ public:
+  bool Equals(const nsICookie* aCookie1, const nsICookie* aCookie2) const {
+    return Cookie::Cast(aCookie1)->CreationTimeInUSec() ==
+               Cookie::Cast(aCookie2)->CreationTimeInUSec() &&
+           Cookie::Cast(aCookie2)->Path().Length() ==
+               Cookie::Cast(aCookie1)->Path().Length();
+  }
+
+  bool LessThan(const nsICookie* aCookie1, const nsICookie* aCookie2) const {
+    int32_t result = Cookie::Cast(aCookie2)->Path().Length() -
+                     Cookie::Cast(aCookie1)->Path().Length();
+    if (result != 0) return result < 0;
+
+    return Cookie::Cast(aCookie1)->CreationTimeInUSec() <
+           Cookie::Cast(aCookie2)->CreationTimeInUSec();
+  }
+};
+
+}  
+}  
+
+#endif  // mozilla_net_Cookie_h

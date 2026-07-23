@@ -1,0 +1,131 @@
+/*
+ * Copyright 2014 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkRecord_DEFINED)
+#define SkRecord_DEFINED
+
+#include "include/core/SkRefCnt.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkTemplates.h"
+#include "src/base/SkArenaAlloc.h"
+#include "src/core/SkRecords.h"
+
+#include <cstddef>
+#include <type_traits>
+
+
+class SkRecord : public SkRefCnt {
+public:
+    SkRecord() = default;
+    ~SkRecord() override;
+
+    int count() const { return fCount; }
+
+    template <typename F>
+    auto visit(int i, F&& f) const -> decltype(f(SkRecords::NoOp())) {
+        return fRecords[i].visit(f);
+    }
+
+    template <typename F>
+    auto mutate(int i, F&& f) -> decltype(f((SkRecords::NoOp*)nullptr)) {
+        return fRecords[i].mutate(f);
+    }
+
+    template <typename T>
+    T* alloc(size_t count = 1) {
+        struct RawBytes {
+            alignas(T) char data[sizeof(T)];
+        };
+        fApproxBytesAllocated += count * sizeof(T) + alignof(T);
+        return (T*)fAlloc.makeArrayDefault<RawBytes>(count);
+    }
+
+    template <typename T>
+    T* append() {
+        if (fCount == fReserved) {
+            this->grow();
+        }
+        return fRecords[fCount++].set(this->allocCommand<T>());
+    }
+
+    template <typename T>
+    T* replace(int i) {
+        SkASSERT(i < this->count());
+
+        Destroyer destroyer;
+        this->mutate(i, destroyer);
+
+        return fRecords[i].set(this->allocCommand<T>());
+    }
+
+    size_t bytesUsed() const;
+
+    void defrag();
+
+private:
+
+    struct Destroyer {
+        template <typename T>
+        void operator()(T* record) { record->~T(); }
+    };
+
+    template <typename T>
+    std::enable_if_t<std::is_empty<T>::value, T*> allocCommand() {
+        static T singleton = {};
+        return &singleton;
+    }
+
+    template <typename T>
+    std::enable_if_t<!std::is_empty<T>::value, T*> allocCommand() { return this->alloc<T>(); }
+
+    void grow();
+
+    struct Record {
+        SkRecords::Type fType;
+        void*           fPtr;
+
+        template <typename T>
+        T* set(T* ptr) {
+            fType = T::kType;
+            fPtr  = ptr;
+            SkASSERT(this->ptr() == ptr && this->type() == T::kType);
+            return ptr;
+        }
+
+        SkRecords::Type type() const { return fType; }
+        void* ptr() const { return fPtr; }
+
+        template <typename F>
+        auto visit(F&& f) const -> decltype(f(SkRecords::NoOp())) {
+        #define CASE(T) case SkRecords::T##_Type: return f(*(const SkRecords::T*)this->ptr());
+            switch(this->type()) { SK_RECORD_TYPES(CASE) }
+        #undef CASE
+            SkDEBUGFAIL("Unreachable");
+            static const SkRecords::NoOp noop{};
+            return f(noop);
+        }
+
+        template <typename F>
+        auto mutate(F&& f) -> decltype(f((SkRecords::NoOp*)nullptr)) {
+        #define CASE(T) case SkRecords::T##_Type: return f((SkRecords::T*)this->ptr());
+            switch(this->type()) { SK_RECORD_TYPES(CASE) }
+        #undef CASE
+            SkDEBUGFAIL("Unreachable");
+            static const SkRecords::NoOp noop{};
+            return f(const_cast<SkRecords::NoOp*>(&noop));
+        }
+    };
+
+    int fCount{0},
+        fReserved{0};
+    skia_private::AutoTMalloc<Record> fRecords;
+
+    SkArenaAlloc fAlloc{256};
+    size_t       fApproxBytesAllocated{0};
+};
+
+#endif

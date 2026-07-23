@@ -1,0 +1,193 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+// Portions of this file were originally under the following license:
+// Copyright (C) 2006-2008 Jason Evans <jasone@FreeBSD.org>.
+// All rights reserved.
+// Redistribution and use in source and binary forms, with or without
+// 1. Redistributions of source code must retain the above copyright
+//    addition of one or more copyright notices.
+// 2. Redistributions in binary form must reproduce the above copyright
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER(S) ``AS IS'' AND ANY
+// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDER(S) BE
+
+#ifndef JEMALLOC_TYPES_H_
+#define JEMALLOC_TYPES_H_
+
+#include <stdint.h>
+
+#ifdef _MSC_VER
+#  include <crtdefs.h>
+#else
+#  include <stddef.h>
+#endif
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#ifndef MALLOC_USABLE_SIZE_CONST_PTR
+#  define MALLOC_USABLE_SIZE_CONST_PTR const
+#endif
+
+typedef MALLOC_USABLE_SIZE_CONST_PTR void* usable_ptr_t;
+
+typedef size_t arena_id_t;
+
+typedef struct chunk_allocator_s {
+  void* (*map)(size_t aSize, size_t aAlignment);
+
+  void (*unmap)(void* aAddr, size_t aSize);
+
+  bool (*commit)(void* aAddr, size_t aSize);
+
+  void (*decommit)(void* aAddr, size_t aSize);
+} chunk_allocator_t;
+
+#define ARENA_FLAG_RANDOMIZE_SMALL_MASK 0x3
+#define ARENA_FLAG_RANDOMIZE_SMALL_DEFAULT 0
+#define ARENA_FLAG_RANDOMIZE_SMALL_ENABLED 1
+#define ARENA_FLAG_RANDOMIZE_SMALL_DISABLED 2
+
+#define ARENA_FLAG_THREAD_MASK 0x4
+#define ARENA_FLAG_THREAD_MAIN_THREAD_ONLY 0x4
+#define ARENA_FLAG_THREAD_SAFE 0x0
+
+typedef struct arena_params_s {
+  size_t mMaxDirty;
+  int32_t mMaxDirtyIncreaseOverride;
+  int32_t mMaxDirtyDecreaseOverride;
+
+  uint32_t mFlags;
+
+  const char* mLabel;
+
+  chunk_allocator_t* mChunkAllocator;
+
+#ifdef __cplusplus
+  arena_params_s()
+      : mMaxDirty(0),
+        mMaxDirtyIncreaseOverride(0),
+        mMaxDirtyDecreaseOverride(0),
+        mFlags(0),
+        mLabel(nullptr),
+        mChunkAllocator(nullptr) {}
+#endif
+} arena_params_t;
+
+typedef struct {
+  bool opt_junk;             
+  bool opt_randomize_small;  
+  bool opt_zero;             
+  size_t narenas;            
+  size_t quantum;            
+  size_t quantum_max;        
+  size_t quantum_wide;       
+  size_t quantum_wide_max;   
+  size_t subpage_max;        
+  size_t large_max;          
+  size_t chunksize;          
+  size_t page_size;          
+  size_t real_page_size;     
+  size_t dirty_max;          
+
+  size_t mapped;          
+  size_t allocated;       
+  size_t waste;           
+  size_t pages_dirty;     
+  size_t pages_fresh;     
+  size_t pages_madvised;  
+  size_t bookkeeping;     
+  size_t bin_unused;      
+
+  size_t num_operations;  
+  size_t arena_run_header;
+} jemalloc_stats_t;
+
+typedef struct {
+  size_t size;               
+  size_t num_non_full_runs;  
+  size_t num_runs;           
+  size_t bytes_unused;       
+  size_t bytes_total;        
+  size_t bytes_per_run;      
+  size_t regions_per_run;    
+} jemalloc_bin_stats_t;
+
+typedef struct {
+  size_t allocated_bytes;
+
+  uint64_t num_operations;
+} jemalloc_stats_lite_t;
+
+enum PtrInfoTag {
+  TagUnknown,
+
+  TagLiveAlloc,
+
+  TagFreedAlloc,
+
+  TagFreedPage,
+};
+
+typedef struct jemalloc_ptr_info_s {
+  enum PtrInfoTag tag;
+  void* addr;   
+  size_t size;  
+
+#ifdef MOZ_DEBUG
+  arena_id_t arenaId;  
+#endif
+
+#ifdef __cplusplus
+  jemalloc_ptr_info_s() = default;
+  jemalloc_ptr_info_s(enum PtrInfoTag aTag, void* aAddr, size_t aSize,
+                      arena_id_t aArenaId)
+      : tag(aTag),
+        addr(aAddr),
+        size(aSize)
+#  ifdef MOZ_DEBUG
+        ,
+        arenaId(aArenaId)
+#  endif
+  {
+  }
+#endif
+} jemalloc_ptr_info_t;
+
+static inline bool jemalloc_ptr_is_live(jemalloc_ptr_info_t* info) {
+  return info->tag == TagLiveAlloc;
+}
+
+static inline bool jemalloc_ptr_is_freed(jemalloc_ptr_info_t* info) {
+  return info->tag == TagFreedAlloc || info->tag == TagFreedPage;
+}
+
+static inline bool jemalloc_ptr_is_freed_page(jemalloc_ptr_info_t* info) {
+  return info->tag == TagFreedPage;
+}
+
+enum ArenaPurgeResult {
+  ReachedThresholdOrBusy,
+
+  NotDone,
+
+  Dying,
+};
+
+enum may_purge_now_result_t {
+  Done,
+
+  NeedsMore,
+
+  WantsLater,
+};
+
+#ifdef __cplusplus
+}  
+#endif
+
+#endif  // JEMALLOC_TYPES_H_

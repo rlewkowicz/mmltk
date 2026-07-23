@@ -1,0 +1,122 @@
+{
+  "version": 4,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "container-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "environment": {
+        "LD_LIBRARY_PATH": "/usr/local/cuda-13.0/lib64:/opt/pytorch/lib:/opt/onnx/lib:/opt/onnxruntime/lib"
+      },
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "/usr/bin/gcc-14",
+        "CMAKE_CXX_COMPILER": "/usr/bin/g++-14",
+        "CMAKE_CUDA_HOST_COMPILER": "/usr/bin/g++-14",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "MMLTK_BROWSER_APP_STAGE_DIR": "${sourceDir}/build/browser-app",
+        "MMLTK_BROWSER_APP_STATE_DIR": "${sourceDir}/.cache/browser-app",
+        "MMLTK_CUDA_ARCHITECTURES": "86;87;89;90;100;103;110;120;121",
+        "MMLTK_CUDA_TOOLKIT_ROOT": "/usr/local/cuda-13.0",
+        "MMLTK_CUDA_VERSION": "13.0",
+        "MMLTK_FIREFOX_CACHE_ROOT": "${sourceDir}/.cache/firefox",
+        "MMLTK_ONNXRUNTIME_ROOT": "/opt/onnxruntime",
+        "MMLTK_ONNX_ROOT": "/opt/onnx",
+        "MMLTK_TORCH_CUDA_ARCH_LIST": "8.6 8.7 8.9 9.0 10.0 10.3 11.0 12.0 12.1",
+        "MMLTK_TORCH_ROOT": "/opt/pytorch",
+        "Protobuf_PROTOC_EXECUTABLE": "/usr/bin/protoc",
+        "Python3_EXECUTABLE": "/usr/bin/python3"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "container-base",
+      "binaryDir": "${sourceDir}/.cache/cmake/release",
+      "cacheVariables": {
+        "BUILD_MMLTK_BROWSER_APP": "ON",
+        "BUILD_MMLTK_BROWSER_HOST": "ON",
+        "BUILD_MMLTK_FIREFOX_RUNTIME": "ON",
+        "BUILD_RFDETR_NATIVE": "ON",
+        "BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER": "ON",
+        "BUILD_TESTS": "ON",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "gui",
+      "inherits": "container-base",
+      "binaryDir": "${sourceDir}/.cache/cmake/gui",
+      "cacheVariables": {
+        "BUILD_MMLTK_BROWSER_APP": "ON",
+        "BUILD_MMLTK_BROWSER_HOST": "OFF",
+        "BUILD_MMLTK_FIREFOX_RUNTIME": "OFF",
+        "BUILD_RFDETR_NATIVE": "OFF",
+        "BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER": "OFF",
+        "BUILD_TESTS": "OFF",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "dev",
+      "inherits": "container-base",
+      "binaryDir": "${sourceDir}/.cache/cmake/dev",
+      "cacheVariables": {
+        "BUILD_MMLTK_BROWSER_APP": "ON",
+        "BUILD_MMLTK_BROWSER_HOST": "ON",
+        "BUILD_MMLTK_FIREFOX_RUNTIME": "OFF",
+        "BUILD_RFDETR_NATIVE": "ON",
+        "BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER": "ON",
+        "BUILD_TESTS": "ON",
+        "CMAKE_BUILD_TYPE": "Dev"
+      }
+    },
+    {
+      "name": "analysis",
+      "inherits": "container-base",
+      "binaryDir": "${sourceDir}/.cache/cmake/analysis",
+      "cacheVariables": {
+        "BUILD_MMLTK_BROWSER_APP": "ON",
+        "BUILD_MMLTK_BROWSER_HOST": "ON",
+        "BUILD_MMLTK_FIREFOX_RUNTIME": "OFF",
+        "BUILD_RFDETR_NATIVE": "ON",
+        "BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER": "ON",
+        "BUILD_TESTS": "ON",
+        "CMAKE_BUILD_TYPE": "Dev"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "gui",
+      "configurePreset": "gui",
+      "targets": [
+        "mmltk_browser_app"
+      ]
+    },
+    {
+      "name": "dev",
+      "configurePreset": "dev"
+    },
+    {
+      "name": "analysis",
+      "configurePreset": "analysis"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "tests",
+      "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

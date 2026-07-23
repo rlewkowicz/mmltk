@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ProcessIsolation_h
+#define mozilla_dom_ProcessIsolation_h
+
+#include <stdint.h>
+
+#include "mozilla/Logging.h"
+#include "mozilla/dom/RemoteType.h"
+#include "mozilla/dom/SessionHistoryEntry.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "nsIPrincipal.h"
+#include "nsIURI.h"
+#include "nsString.h"
+
+namespace mozilla::dom {
+
+class CanonicalBrowsingContext;
+class WindowGlobalParent;
+
+extern mozilla::LazyLogModule gProcessIsolationLog;
+
+constexpr nsLiteralCString kHighValueCOOPPermission = "highValueCOOP"_ns;
+constexpr nsLiteralCString kHighValueHasSavedLoginPermission =
+    "highValueHasSavedLogin"_ns;
+constexpr nsLiteralCString kHighValueIsLoggedInPermission =
+    "highValueIsLoggedIn"_ns;
+
+nsCString SharedWebRemoteType(const OriginAttributes& aAttrs,
+                              bool aDisableJit = false);
+
+struct NavigationIsolationOptions {
+  nsCString mRemoteType;
+  bool mReplaceBrowsingContext = false;
+  uint64_t mSpecificGroupId = 0;
+  bool mShouldCrossOriginIsolate = false;
+  bool mTryUseBFCache = false;
+  RefPtr<SessionHistoryEntry> mActiveSessionHistoryEntry;
+};
+
+Result<NavigationIsolationOptions, nsresult> IsolationOptionsForNavigation(
+    CanonicalBrowsingContext* aTopBC, WindowGlobalParent* aParentWindow,
+    nsIURI* aChannelCreationURI, nsIChannel* aChannel,
+    const nsACString& aCurrentRemoteType, bool aHasCOOPMismatch,
+    bool aForNewTab, uint32_t aLoadStateLoadType,
+    const Maybe<uint64_t>& aChannelId,
+    const Maybe<nsCString>& aRemoteTypeOverride);
+
+struct WorkerIsolationOptions {
+  nsCString mRemoteType;
+};
+
+Result<WorkerIsolationOptions, nsresult> IsolationOptionsForWorker(
+    nsIPrincipal* aPrincipal, WorkerKind aWorkerKind,
+    const nsACString& aCurrentRemoteType, bool aUseRemoteSubframes);
+
+Result<nsCString, nsresult> PredictRemoteTypeForURI(
+    nsIURI* aURI, const OriginAttributes& aOriginAttributes,
+    const nsACString& aPreferredRemoteType, bool aUseRemoteSubframes);
+
+void AddHighValuePermission(nsIPrincipal* aResultPrincipal,
+                            const nsACString& aPermissionType);
+
+void AddHighValuePermission(const nsACString& aOrigin,
+                            const nsACString& aPermissionType);
+
+bool IsIsolateHighValueSiteEnabled();
+
+enum class ValidatePrincipalOptions {
+  AllowNullPtr,  
+  AllowSystem,
+  AllowExpanded,
+};
+bool ValidatePrincipalCouldPotentiallyBeLoadedBy(
+    nsIPrincipal* aPrincipal, const nsACString& aRemoteType,
+    const EnumSet<ValidatePrincipalOptions>& aOptions = {});
+
+}  
+
+#endif

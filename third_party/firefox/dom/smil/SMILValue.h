@@ -1,0 +1,61 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SMIL_SMILVALUE_H_
+#define DOM_SMIL_SMILVALUE_H_
+
+#include "mozilla/SMILNullType.h"
+#include "mozilla/SMILType.h"
+
+namespace mozilla {
+
+class SMILValue {
+ public:
+  SMILValue() : mU(), mType(SMILNullType::Singleton()) {}
+  explicit SMILValue(const SMILType* aType);
+  SMILValue(const SMILValue& aVal);
+
+  ~SMILValue() { mType->DestroyValue(*this); }
+
+  const SMILValue& operator=(const SMILValue& aVal);
+
+  SMILValue(SMILValue&& aVal) noexcept;
+  SMILValue& operator=(SMILValue&& aVal) noexcept;
+
+  bool operator==(const SMILValue& aVal) const;
+  bool operator!=(const SMILValue& aVal) const { return !(*this == aVal); }
+
+  bool IsNull() const { return (mType == SMILNullType::Singleton()); }
+
+  nsresult Add(const SMILValue& aValueToAdd, uint32_t aCount = 1);
+  nsresult SandwichAdd(const SMILValue& aValueToAdd);
+  nsresult ComputeDistance(const SMILValue& aTo, double& aDistance) const;
+  nsresult Interpolate(const SMILValue& aEndVal, double aUnitDistance,
+                       SMILValue& aResult) const;
+
+  union {
+    bool mBool;
+    uint64_t mUint;
+    int64_t mInt;
+    double mDouble;
+    struct {
+      float mAngle;
+      uint16_t mUnit;
+      uint16_t mOrientType;
+    } mOrient;
+    int32_t mIntPair[2];
+    float mNumberPair[2];
+    void* mPtr;
+  } mU;
+  const SMILType* mType;
+
+ protected:
+  void InitAndCheckPostcondition(const SMILType* aNewType);
+  void DestroyAndCheckPostcondition();
+  void DestroyAndReinit(const SMILType* aNewType);
+};
+
+}  
+
+#endif  // DOM_SMIL_SMILVALUE_H_

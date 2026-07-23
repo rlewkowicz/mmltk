@@ -1,0 +1,1669 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ServiceWorkerPrivate.h"
+
+#include <utility>
+
+#include "MainThreadUtils.h"
+#include "ServiceWorkerManager.h"
+#include "ServiceWorkerRegistrationInfo.h"
+#include "ServiceWorkerUtils.h"
+#include "js/ErrorReport.h"
+#include "mozIThirdPartyUtil.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/ContentBlockingAllowList.h"
+#include "mozilla/CycleCollectedJSContext.h"  // for MicroTaskRunnable
+#include "mozilla/ErrorResult.h"
+#include "mozilla/JSObjectHolder.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/OriginAttributes.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/RemoteLazyInputStreamStorage.h"
+#include "mozilla/Result.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/Services.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_privacy.h"
+#include "mozilla/StoragePrincipalHelper.h"
+#include "mozilla/dom/Client.h"
+#include "mozilla/dom/ClientIPCTypes.h"
+#include "mozilla/dom/ClientManager.h"
+#include "mozilla/dom/DOMTypes.h"
+#include "mozilla/dom/FetchEventOpChild.h"
+#include "mozilla/dom/FetchUtil.h"
+#include "mozilla/dom/IndexedDatabaseManager.h"
+#include "mozilla/dom/InternalHeaders.h"
+#include "mozilla/dom/InternalRequest.h"
+#include "mozilla/dom/PromiseNativeHandler.h"
+#include "mozilla/dom/ReferrerInfo.h"
+#include "mozilla/dom/RemoteType.h"
+#include "mozilla/dom/RemoteWorkerControllerChild.h"
+#include "mozilla/dom/RemoteWorkerManager.h"  // RemoteWorkerManager::GetRemoteType
+#include "mozilla/dom/RequestBinding.h"
+#include "mozilla/dom/RootedDictionary.h"
+#include "mozilla/dom/ServiceWorkerBinding.h"
+#include "mozilla/dom/ServiceWorkerLifetimeExtension.h"
+#include "mozilla/dom/WorkerDebugger.h"
+#include "mozilla/dom/WorkerRef.h"
+#include "mozilla/dom/WorkerRunnable.h"
+#include "mozilla/dom/WorkerScope.h"
+#include "mozilla/dom/ipc/StructuredCloneData.h"
+#include "mozilla/ipc/BackgroundChild.h"
+#include "mozilla/ipc/BackgroundUtils.h"
+#include "mozilla/ipc/IPCStreamUtils.h"
+#include "mozilla/ipc/PBackgroundChild.h"
+#include "mozilla/ipc/PBackgroundSharedTypes.h"
+#include "mozilla/ipc/URIUtils.h"
+#include "mozilla/net/CookieJarSettings.h"
+#include "mozilla/net/CookieService.h"
+#include "mozilla/net/NeckoChannelParams.h"
+#include "nsContentUtils.h"
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsICacheInfoChannel.h"
+#include "nsIChannel.h"
+#include "nsIHttpChannel.h"
+#include "nsIHttpChannelInternal.h"
+#include "nsIHttpHeaderVisitor.h"
+#include "nsINamed.h"
+#include "nsINetworkInterceptController.h"
+#include "nsIObserverService.h"
+#include "nsIRedirectHistoryEntry.h"
+#include "nsIReferrerInfo.h"
+#include "nsIScriptError.h"
+#include "nsIScriptSecurityManager.h"
+#include "nsISupportsImpl.h"
+#include "nsISupportsPriority.h"
+#include "nsIURI.h"
+#include "nsIUploadChannel2.h"
+#include "nsNetUtil.h"
+#include "nsProxyRelease.h"
+#include "nsQueryObject.h"
+#include "nsRFPService.h"
+#include "nsStreamUtils.h"
+#include "nsStringStream.h"
+#include "nsThreadUtils.h"
+
+extern mozilla::LazyLogModule sWorkerTelemetryLog;
+
+#ifdef LOG
+#  undef LOG
+#endif
+#define LOG(_args) MOZ_LOG(sWorkerTelemetryLog, LogLevel::Debug, _args);
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using namespace mozilla::ipc;
+
+namespace mozilla::dom {
+
+uint32_t ServiceWorkerPrivate::sRunningServiceWorkers = 0;
+uint32_t ServiceWorkerPrivate::sRunningServiceWorkersFetch = 0;
+
+KeepAliveToken::KeepAliveToken(ServiceWorkerPrivate* aPrivate)
+    : mPrivate(aPrivate) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aPrivate);
+  mPrivate->AddToken();
+}
+
+KeepAliveToken::~KeepAliveToken() {
+  MOZ_ASSERT(NS_IsMainThread());
+  mPrivate->ReleaseToken();
+}
+
+NS_IMPL_ISUPPORTS0(KeepAliveToken)
+
+ServiceWorkerPrivate::RAIIActorPtrHolder::RAIIActorPtrHolder(
+    already_AddRefed<RemoteWorkerControllerChild> aActor)
+    : mActor(aActor) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(mActor);
+  MOZ_ASSERT(mActor->Manager());
+}
+
+ServiceWorkerPrivate::RAIIActorPtrHolder::~RAIIActorPtrHolder() {
+  AssertIsOnMainThread();
+
+  mDestructorPromiseHolder.ResolveIfExists(true, __func__);
+
+  mActor->MaybeSendDelete();
+}
+
+RemoteWorkerControllerChild*
+ServiceWorkerPrivate::RAIIActorPtrHolder::operator->() const {
+  AssertIsOnMainThread();
+
+  return get();
+}
+
+RemoteWorkerControllerChild* ServiceWorkerPrivate::RAIIActorPtrHolder::get()
+    const {
+  AssertIsOnMainThread();
+
+  return mActor.get();
+}
+
+RefPtr<GenericPromise>
+ServiceWorkerPrivate::RAIIActorPtrHolder::OnDestructor() {
+  AssertIsOnMainThread();
+
+  return mDestructorPromiseHolder.Ensure(__func__);
+}
+
+ServiceWorkerPrivate::PendingFunctionalEvent::PendingFunctionalEvent(
+    ServiceWorkerPrivate* aOwner,
+    RefPtr<ServiceWorkerRegistrationInfo>&& aRegistration)
+    : mOwner(aOwner), mRegistration(std::move(aRegistration)) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(mOwner);
+  MOZ_ASSERT(mOwner->mInfo);
+  MOZ_ASSERT(mOwner->mInfo->State() == ServiceWorkerState::Activating);
+  MOZ_ASSERT(mRegistration);
+}
+
+ServiceWorkerPrivate::PendingFunctionalEvent::~PendingFunctionalEvent() {
+  AssertIsOnMainThread();
+}
+
+ServiceWorkerPrivate::PendingCookieChangeEvent::PendingCookieChangeEvent(
+    ServiceWorkerPrivate* aOwner,
+    RefPtr<ServiceWorkerRegistrationInfo>&& aRegistration,
+    ServiceWorkerCookieChangeEventOpArgs&& aArgs)
+    : PendingFunctionalEvent(aOwner, std::move(aRegistration)),
+      mArgs(std::move(aArgs)) {
+  AssertIsOnMainThread();
+}
+
+nsresult ServiceWorkerPrivate::PendingCookieChangeEvent::Send() {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(mOwner);
+  MOZ_ASSERT(mOwner->mInfo);
+
+  return mOwner->SendCookieChangeEventInternal(std::move(mRegistration),
+                                               std::move(mArgs));
+}
+
+ServiceWorkerPrivate::PendingFetchEvent::PendingFetchEvent(
+    ServiceWorkerPrivate* aOwner,
+    RefPtr<ServiceWorkerRegistrationInfo>&& aRegistration,
+    ParentToParentServiceWorkerFetchEventOpArgs&& aArgs,
+    nsCOMPtr<nsIInterceptedChannel>&& aChannel,
+    RefPtr<FetchServicePromises>&& aPreloadResponseReadyPromises)
+    : PendingFunctionalEvent(aOwner, std::move(aRegistration)),
+      mArgs(std::move(aArgs)),
+      mChannel(std::move(aChannel)),
+      mPreloadResponseReadyPromises(std::move(aPreloadResponseReadyPromises)) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(mChannel);
+}
+
+nsresult ServiceWorkerPrivate::PendingFetchEvent::Send() {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(mOwner);
+  MOZ_ASSERT(mOwner->mInfo);
+
+  return mOwner->SendFetchEventInternal(
+      std::move(mRegistration), std::move(mArgs), std::move(mChannel),
+      std::move(mPreloadResponseReadyPromises));
+}
+
+ServiceWorkerPrivate::PendingFetchEvent::~PendingFetchEvent() {
+  AssertIsOnMainThread();
+
+  if (NS_WARN_IF(mChannel)) {
+    mChannel->CancelInterception(NS_ERROR_INTERCEPTION_FAILED);
+  }
+}
+
+namespace {
+
+class HeaderFiller final : public nsIHttpHeaderVisitor {
+ public:
+  NS_DECL_ISUPPORTS
+
+  explicit HeaderFiller(HeadersGuardEnum aGuard)
+      : mInternalHeaders(new InternalHeaders(aGuard)) {
+    MOZ_ASSERT(mInternalHeaders);
+  }
+
+  NS_IMETHOD
+  VisitHeader(const nsACString& aHeader, const nsACString& aValue) override {
+    ErrorResult result;
+    mInternalHeaders->Append(aHeader, aValue, result);
+
+    if (NS_WARN_IF(result.Failed())) {
+      return result.StealNSResult();
+    }
+
+    return NS_OK;
+  }
+
+  RefPtr<InternalHeaders> Extract() {
+    return RefPtr<InternalHeaders>(std::move(mInternalHeaders));
+  }
+
+ private:
+  ~HeaderFiller() = default;
+
+  RefPtr<InternalHeaders> mInternalHeaders;
+};
+
+NS_IMPL_ISUPPORTS(HeaderFiller, nsIHttpHeaderVisitor)
+
+Result<IPCInternalRequest, nsresult> GetIPCInternalRequest(
+    nsIInterceptedChannel* aChannel) {
+  AssertIsOnMainThread();
+
+  nsCOMPtr<nsIURI> uri;
+  MOZ_TRY(aChannel->GetSecureUpgradedChannelURI(getter_AddRefs(uri)));
+
+  nsCOMPtr<nsIURI> uriNoFragment;
+  MOZ_TRY(NS_GetURIWithoutRef(uri, getter_AddRefs(uriNoFragment)));
+
+  nsCOMPtr<nsIChannel> underlyingChannel;
+  MOZ_TRY(aChannel->GetChannel(getter_AddRefs(underlyingChannel)));
+
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(underlyingChannel);
+  MOZ_ASSERT(httpChannel, "How come we don't have an HTTP channel?");
+
+  nsCOMPtr<nsIHttpChannelInternal> internalChannel =
+      do_QueryInterface(httpChannel);
+  NS_ENSURE_TRUE(internalChannel, Err(NS_ERROR_NOT_AVAILABLE));
+
+  nsCOMPtr<nsICacheInfoChannel> cacheInfoChannel =
+      do_QueryInterface(underlyingChannel);
+
+  nsAutoCString fragment;
+  MOZ_TRY(uri->GetRef(fragment));
+
+  nsAutoCString method;
+  MOZ_TRY(httpChannel->GetRequestMethod(method));
+
+  uint32_t cacheModeInt;
+  MOZ_ALWAYS_SUCCEEDS(internalChannel->GetFetchCacheMode(&cacheModeInt));
+  RequestCache cacheMode = static_cast<RequestCache>(cacheModeInt);
+
+  RequestMode requestMode =
+      InternalRequest::MapChannelToRequestMode(underlyingChannel);
+
+  uint32_t redirectMode;
+  MOZ_ALWAYS_SUCCEEDS(internalChannel->GetRedirectMode(&redirectMode));
+  RequestRedirect requestRedirect = static_cast<RequestRedirect>(redirectMode);
+
+  RequestPriority requestPriority = RequestPriority::Auto;
+
+  RequestCredentials requestCredentials =
+      InternalRequest::MapChannelToRequestCredentials(underlyingChannel);
+
+  nsAutoCString referrer;
+  ReferrerPolicy referrerPolicy = ReferrerPolicy::_empty;
+  ReferrerPolicy environmentReferrerPolicy = ReferrerPolicy::_empty;
+
+  nsCOMPtr<nsIReferrerInfo> referrerInfo = httpChannel->GetReferrerInfo();
+  if (referrerInfo) {
+    referrerPolicy = referrerInfo->ReferrerPolicy();
+    (void)referrerInfo->GetComputedReferrerSpec(referrer);
+  }
+
+  uint32_t loadFlags;
+  MOZ_TRY(underlyingChannel->GetLoadFlags(&loadFlags));
+
+  nsCOMPtr<nsILoadInfo> loadInfo = underlyingChannel->LoadInfo();
+  nsContentPolicyType contentPolicyType = loadInfo->InternalContentPolicyType();
+
+  int32_t internalPriority = nsISupportsPriority::PRIORITY_NORMAL;
+  if (nsCOMPtr<nsISupportsPriority> p = do_QueryInterface(underlyingChannel)) {
+    p->GetPriority(&internalPriority);
+  }
+
+  nsAutoString integrity;
+  MOZ_TRY(loadInfo->GetIntegrityMetadata(integrity));
+
+  RefPtr<HeaderFiller> headerFiller =
+      MakeRefPtr<HeaderFiller>(HeadersGuardEnum::Request);
+  MOZ_TRY(httpChannel->VisitNonDefaultRequestHeaders(headerFiller));
+
+  RefPtr<InternalHeaders> internalHeaders = headerFiller->Extract();
+
+  ErrorResult result;
+  internalHeaders->SetGuard(HeadersGuardEnum::Immutable, result);
+  if (NS_WARN_IF(result.Failed())) {
+    return Err(result.StealNSResult());
+  }
+
+  nsTArray<HeadersEntry> ipcHeaders;
+  HeadersGuardEnum ipcHeadersGuard;
+  internalHeaders->ToIPC(ipcHeaders, ipcHeadersGuard);
+
+  nsAutoCString alternativeDataType;
+  if (cacheInfoChannel &&
+      !cacheInfoChannel->PreferredAlternativeDataTypes().IsEmpty()) {
+    alternativeDataType.Assign(
+        cacheInfoChannel->PreferredAlternativeDataTypes()[0].type());
+  }
+
+  Maybe<PrincipalInfo> principalInfo;
+  Maybe<PrincipalInfo> interceptionPrincipalInfo;
+  if (loadInfo->TriggeringPrincipal()) {
+    principalInfo.emplace();
+    interceptionPrincipalInfo.emplace();
+    MOZ_ALWAYS_SUCCEEDS(PrincipalToPrincipalInfo(
+        loadInfo->TriggeringPrincipal(), principalInfo.ptr()));
+    MOZ_ALWAYS_SUCCEEDS(PrincipalToPrincipalInfo(
+        loadInfo->TriggeringPrincipal(), interceptionPrincipalInfo.ptr()));
+  }
+
+  nsTArray<RedirectHistoryEntryInfo> redirectChain;
+  for (const nsCOMPtr<nsIRedirectHistoryEntry>& redirectEntry :
+       loadInfo->RedirectChain()) {
+    RedirectHistoryEntryInfo* entry = redirectChain.AppendElement();
+    MOZ_ALWAYS_SUCCEEDS(RHEntryToRHEntryInfo(redirectEntry, entry));
+  }
+
+  bool isThirdPartyChannel;
+  nsCOMPtr<mozIThirdPartyUtil> thirdPartyUtil =
+      do_GetService(THIRDPARTYUTIL_CONTRACTID);
+  if (thirdPartyUtil) {
+    nsCOMPtr<nsIURI> uri;
+    MOZ_TRY(underlyingChannel->GetURI(getter_AddRefs(uri)));
+    MOZ_TRY(thirdPartyUtil->IsThirdPartyChannel(underlyingChannel, uri,
+                                                &isThirdPartyChannel));
+  }
+
+  nsILoadInfo::CrossOriginEmbedderPolicy embedderPolicy =
+      loadInfo->GetLoadingEmbedderPolicy();
+
+  return IPCInternalRequest(
+      method, {WrapNotNull(uriNoFragment.get())}, ipcHeadersGuard, ipcHeaders,
+      Nothing(), -1, alternativeDataType, contentPolicyType, internalPriority,
+      referrer, referrerPolicy, environmentReferrerPolicy, requestMode,
+      requestCredentials, cacheMode, requestRedirect, requestPriority,
+      integrity, false, fragment, principalInfo, interceptionPrincipalInfo,
+      contentPolicyType, redirectChain, isThirdPartyChannel, embedderPolicy);
+}
+
+nsresult MaybeStoreStreamForBackgroundThread(nsIInterceptedChannel* aChannel,
+                                             IPCInternalRequest& aIPCRequest) {
+  nsCOMPtr<nsIChannel> channel;
+  MOZ_ALWAYS_SUCCEEDS(aChannel->GetChannel(getter_AddRefs(channel)));
+
+  Maybe<BodyStreamVariant> body;
+  nsCOMPtr<nsIUploadChannel2> uploadChannel = do_QueryInterface(channel);
+
+  if (uploadChannel) {
+    nsCOMPtr<nsIInputStream> uploadStream;
+    MOZ_TRY(uploadChannel->CloneUploadStream(&aIPCRequest.bodySize(),
+                                             getter_AddRefs(uploadStream)));
+
+    if (uploadStream) {
+      Maybe<BodyStreamVariant>& body = aIPCRequest.body();
+      body.emplace(ParentToParentStream());
+
+      MOZ_TRY(
+          nsID::GenerateUUIDInPlace(body->get_ParentToParentStream().uuid()));
+
+      auto storageOrErr = RemoteLazyInputStreamStorage::Get();
+      if (NS_WARN_IF(storageOrErr.isErr())) {
+        return storageOrErr.unwrapErr();
+      }
+
+      auto storage = storageOrErr.unwrap();
+      storage->AddStream(uploadStream, body->get_ParentToParentStream().uuid());
+    }
+  }
+
+  return NS_OK;
+}
+
+}  
+
+ServiceWorkerPrivate::ServiceWorkerPrivate(ServiceWorkerInfo* aInfo)
+    : mInfo(aInfo),
+      mPendingSpawnLifetime(
+          ServiceWorkerLifetimeExtension(NoLifetimeExtension{})),
+      mDebuggerCount(0),
+      mTokenCount(0),
+      mLaunchCount(0) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aInfo);
+  MOZ_ASSERT(!mControllerChild);
+
+  mIdleWorkerTimer = NS_NewTimer();
+  MOZ_ASSERT(mIdleWorkerTimer);
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  MOZ_DIAGNOSTIC_ASSERT(NS_SUCCEEDED(Initialize()));
+#else
+  MOZ_ALWAYS_SUCCEEDS(Initialize());
+#endif
+}
+
+ServiceWorkerPrivate::~ServiceWorkerPrivate() {
+  MOZ_ASSERT(!mTokenCount);
+  MOZ_ASSERT(!mInfo);
+  MOZ_ASSERT(!mControllerChild);
+  MOZ_ASSERT(mIdlePromiseHolder.IsEmpty());
+
+  mIdleWorkerTimer->Cancel();
+}
+
+nsresult ServiceWorkerPrivate::Initialize() {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(mInfo);
+
+  nsCOMPtr<nsIPrincipal> principal = mInfo->Principal();
+
+  nsCOMPtr<nsIURI> uri;
+  auto* basePrin = BasePrincipal::Cast(principal);
+  nsresult rv = basePrin->GetURI(getter_AddRefs(uri));
+
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  if (NS_WARN_IF(!uri)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  URIParams baseScriptURL;
+  SerializeURI(uri, baseScriptURL);
+
+  nsString id;
+  rv = mInfo->GetId(id);
+
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  PrincipalInfo principalInfo;
+  rv = PrincipalToPrincipalInfo(principal, &principalInfo);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+
+  if (NS_WARN_IF(!swm)) {
+    return NS_ERROR_DOM_ABORT_ERR;
+  }
+
+  RefPtr<ServiceWorkerRegistrationInfo> regInfo =
+      swm->GetRegistration(principal, mInfo->Scope());
+
+  if (NS_WARN_IF(!regInfo)) {
+    return NS_ERROR_DOM_INVALID_STATE_ERR;
+  }
+
+  nsCOMPtr<nsICookieJarSettings> cookieJarSettings =
+      net::CookieJarSettings::Create(principal);
+  MOZ_ASSERT(cookieJarSettings);
+
+  Maybe<RFPTargetSet> overriddenFingerprintingSettingsArg;
+  Maybe<RFPTargetSet> overriddenFingerprintingSettings;
+  nsCOMPtr<nsIURI> firstPartyURI;
+  bool foreignByAncestorContext = false;
+  bool isOn3PCBExceptionList = false;
+  bool isPBM = principal->GetIsInPrivateBrowsing();
+  if (!principal->OriginAttributesRef().mPartitionKey.IsEmpty()) {
+    net::CookieJarSettings::Cast(cookieJarSettings)
+        ->SetPartitionKey(principal->OriginAttributesRef().mPartitionKey);
+
+    nsAutoString scheme;
+    nsAutoString pkBaseDomain;
+    int32_t unused;
+    bool _foreignByAncestorContext;
+
+    if (OriginAttributes::ParsePartitionKey(
+            principal->OriginAttributesRef().mPartitionKey, scheme,
+            pkBaseDomain, unused, _foreignByAncestorContext)) {
+      foreignByAncestorContext = _foreignByAncestorContext;
+      rv = NS_NewURI(getter_AddRefs(firstPartyURI),
+                     scheme + u"://"_ns + pkBaseDomain);
+      if (NS_SUCCEEDED(rv)) {
+        overriddenFingerprintingSettings =
+            nsRFPService::GetOverriddenFingerprintingSettingsForURI(
+                firstPartyURI, uri, isPBM);
+        if (overriddenFingerprintingSettings.isSome()) {
+          overriddenFingerprintingSettingsArg.emplace(
+              overriddenFingerprintingSettings.ref());
+        }
+
+        RefPtr<net::CookieService> csSingleton =
+            net::CookieService::GetSingleton();
+        isOn3PCBExceptionList =
+            csSingleton->ThirdPartyCookieBlockingExceptionsRef()
+                .CheckExceptionForURIs(firstPartyURI, uri);
+      }
+    }
+  } else if (!principal->OriginAttributesRef().mFirstPartyDomain.IsEmpty()) {
+    rv = NS_NewURI(
+        getter_AddRefs(firstPartyURI),
+        u"https://"_ns + principal->OriginAttributesRef().mFirstPartyDomain);
+    if (NS_SUCCEEDED(rv)) {
+      bool isThirdParty;
+      rv = principal->IsThirdPartyURI(firstPartyURI, &isThirdParty);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      overriddenFingerprintingSettings =
+          isThirdParty
+              ? nsRFPService::GetOverriddenFingerprintingSettingsForURI(
+                    firstPartyURI, uri, isPBM)
+              : nsRFPService::GetOverriddenFingerprintingSettingsForURI(
+                    uri, nullptr, isPBM);
+
+      RefPtr<net::CookieService> csSingleton =
+          net::CookieService::GetSingleton();
+      isOn3PCBExceptionList =
+          isThirdParty ? csSingleton->ThirdPartyCookieBlockingExceptionsRef()
+                             .CheckExceptionForURIs(firstPartyURI, uri)
+                       : false;
+
+      if (overriddenFingerprintingSettings.isSome()) {
+        overriddenFingerprintingSettingsArg.emplace(
+            overriddenFingerprintingSettings.ref());
+      }
+    }
+  } else {
+    net::CookieJarSettings::Cast(cookieJarSettings)->SetPartitionKey(uri);
+    firstPartyURI = uri;
+
+    overriddenFingerprintingSettings =
+        nsRFPService::GetOverriddenFingerprintingSettingsForURI(uri, nullptr,
+                                                                isPBM);
+
+    if (overriddenFingerprintingSettings.isSome()) {
+      overriddenFingerprintingSettingsArg.emplace(
+          overriddenFingerprintingSettings.ref());
+    }
+  }
+
+  if (ContentBlockingAllowList::Check(principal, isPBM)) {
+    net::CookieJarSettings::Cast(cookieJarSettings)
+        ->SetIsOnContentBlockingAllowList(true);
+  }
+
+  bool shouldResistFingerprinting =
+      nsContentUtils::ShouldResistFingerprinting_dangerous(
+          principal,
+          "Service Workers exist outside a Document or Channel; as a property "
+          "of the domain (and origin attributes). We don't have a "
+          "CookieJarSettings to perform the *nested check*, but we can rely on"
+          "the FPI/dFPI partition key check. The WorkerPrivate's "
+          "ShouldResistFingerprinting function for the ServiceWorker depends "
+          "on this boolean and will also consider an explicit RFPTarget.",
+          RFPTarget::IsAlwaysEnabledForPrecompute) &&
+      !nsContentUtils::ETPSaysShouldNotResistFingerprinting(cookieJarSettings,
+                                                            isPBM);
+
+  if (shouldResistFingerprinting && NS_SUCCEEDED(rv) && firstPartyURI) {
+    auto rfpKey = nsRFPService::GenerateKeyForServiceWorker(
+        firstPartyURI, principal, foreignByAncestorContext);
+    if (rfpKey.isSome()) {
+      net::CookieJarSettings::Cast(cookieJarSettings)
+          ->SetFingerprintingRandomizationKey(rfpKey.ref());
+    }
+  }
+
+  net::CookieJarSettingsArgs cjsData;
+  net::CookieJarSettings::Cast(cookieJarSettings)->Serialize(cjsData);
+
+  nsCOMPtr<nsIPrincipal> partitionedPrincipal;
+  rv = StoragePrincipalHelper::CreatePartitionedPrincipalForServiceWorker(
+      principal, cookieJarSettings, getter_AddRefs(partitionedPrincipal));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  PrincipalInfo partitionedPrincipalInfo;
+  rv =
+      PrincipalToPrincipalInfo(partitionedPrincipal, &partitionedPrincipalInfo);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  StorageAccess storageAccess =
+      StorageAllowedForServiceWorker(principal, cookieJarSettings);
+
+  ServiceWorkerData serviceWorkerData;
+  serviceWorkerData.cacheName() = mInfo->CacheName();
+  serviceWorkerData.loadFlags() = static_cast<uint32_t>(
+      mInfo->GetImportsLoadFlags() | nsIChannel::LOAD_BYPASS_SERVICE_WORKER);
+  serviceWorkerData.id() = std::move(id);
+
+  nsAutoCString domain;
+  rv = uri->GetHost(domain);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  auto remoteType = RemoteWorkerManager::GetRemoteType(
+      principal, WorkerKind::WorkerKindService,
+      SharedWebRemoteType(principal->OriginAttributesRef()));
+  if (NS_WARN_IF(remoteType.isErr())) {
+    return remoteType.unwrapErr();
+  }
+
+  bool isThirdPartyContextToTopWindow =
+      !principal->OriginAttributesRef().mPartitionKey.IsEmpty();
+
+  mClientInfo = ClientManager::CreateInfo(
+      ClientType::Serviceworker,
+      isThirdPartyContextToTopWindow ? partitionedPrincipal : principal);
+  if (NS_WARN_IF(!mClientInfo.isSome())) {
+    return NS_ERROR_DOM_INVALID_STATE_ERR;
+  }
+
+  mClientInfo->SetAgentClusterId(regInfo->AgentClusterId());
+  mClientInfo->SetURL(mInfo->ScriptSpec());
+  mClientInfo->SetFrameType(FrameType::None);
+
+  WorkerOptions workerOptions;
+  workerOptions.mCredentials = RequestCredentials::Omit;
+  workerOptions.mType = mInfo->Type();
+
+  ClientInfo ipcClientInfo = mClientInfo.ref();
+  mozilla::ipc::PolicyContainerArgs policyContainerArgs;
+  policyContainerArgs.ipAddressSpace() =
+      static_cast<nsILoadInfo::IPAddressSpace>(regInfo->GetIPAddressSpace());
+  ipcClientInfo.SetPolicyContainerArgs(policyContainerArgs);
+
+  mRemoteWorkerData = RemoteWorkerData(
+      NS_ConvertUTF8toUTF16(mInfo->ScriptSpec()), baseScriptURL, baseScriptURL,
+      workerOptions,
+       principalInfo, principalInfo,
+      partitionedPrincipalInfo,
+       true,
+
+       false,
+
+      cjsData, domain,
+       true,
+       Some(ipcClientInfo.ToIPC()),
+
+       nullptr,
+
+      storageAccess, isThirdPartyContextToTopWindow, shouldResistFingerprinting,
+      overriddenFingerprintingSettingsArg, isOn3PCBExceptionList,
+      OriginTrials(), std::move(serviceWorkerData), regInfo->AgentClusterId(),
+      remoteType.unwrap(),
+      ""_ns, nsTArray<nsString>(),
+      u""_ns);
+
+  mRemoteWorkerData.referrerInfo() = MakeAndAddRef<ReferrerInfo>(nullptr);
+
+  RefreshRemoteWorkerData(regInfo);
+
+  return NS_OK;
+}
+
+void ServiceWorkerPrivate::RegenerateClientInfo() {
+  MOZ_DIAGNOSTIC_ASSERT(mClientInfo.isSome());
+
+  nsILoadInfo::IPAddressSpace ipAddressSpace = nsILoadInfo::Unknown;
+  if (mRemoteWorkerData.clientInfo().isSome()) {
+    ClientInfo current(mRemoteWorkerData.clientInfo().ref());
+    if (auto args = current.GetPolicyContainerArgs()) {
+      ipAddressSpace = args->ipAddressSpace();
+    }
+  }
+
+  mClientInfo = ClientManager::CreateInfo(
+      ClientType::Serviceworker, mClientInfo->GetPrincipal().unwrap().get());
+
+  if (ipAddressSpace != nsILoadInfo::Unknown) {
+    ClientInfo ipcClientInfo = mClientInfo.ref();
+    mozilla::ipc::PolicyContainerArgs policyContainerArgs;
+    policyContainerArgs.ipAddressSpace() = ipAddressSpace;
+    ipcClientInfo.SetPolicyContainerArgs(policyContainerArgs);
+    mRemoteWorkerData.clientInfo().ref() = ipcClientInfo.ToIPC();
+  } else {
+    mRemoteWorkerData.clientInfo().ref() = mClientInfo.ref().ToIPC();
+  }
+}
+
+nsresult ServiceWorkerPrivate::CheckScriptEvaluation(
+    const ServiceWorkerLifetimeExtension& aLifetimeExtension,
+    RefPtr<LifeCycleEventCallback> aCallback) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aCallback);
+
+  RefPtr<ServiceWorkerPrivate> self = this;
+
+  nsresult rv = SpawnWorkerIfNeeded(aLifetimeExtension);
+
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aCallback->SetResult(false);
+    aCallback->Run();
+
+    return rv;
+  }
+
+  MOZ_ASSERT(mControllerChild);
+
+  RefPtr<RAIIActorPtrHolder> holder = mControllerChild;
+
+  return ExecServiceWorkerOp(
+      ServiceWorkerCheckScriptEvaluationOpArgs(), aLifetimeExtension,
+      [self = std::move(self), holder = std::move(holder),
+       callback = aCallback](ServiceWorkerOpResult&& aResult) mutable {
+        if (aResult.type() == ServiceWorkerOpResult::
+                                  TServiceWorkerCheckScriptEvaluationOpResult) {
+          auto& result =
+              aResult.get_ServiceWorkerCheckScriptEvaluationOpResult();
+
+          if (result.workerScriptExecutedSuccessfully()) {
+            self->SetHandlesFetch(result.fetchHandlerWasAdded());
+            if (self->mHandlesFetch == Unknown) {
+              self->mHandlesFetch =
+                  result.fetchHandlerWasAdded() ? Enabled : Disabled;
+              if (self->mHandlesFetch == Enabled) {
+                self->UpdateRunning(0, 1);
+              }
+            }
+
+            callback->SetResult(result.workerScriptExecutedSuccessfully());
+            callback->Run();
+            return;
+          }
+        }
+
+        MOZ_ASSERT_IF(aResult.type() == ServiceWorkerOpResult::Tnsresult,
+                      NS_FAILED(aResult.get_nsresult()));
+
+        if (self->mControllerChild != holder) {
+          holder->OnDestructor()->Then(
+              GetCurrentSerialEventTarget(), __func__,
+              [callback = std::move(callback)](
+                  const GenericPromise::ResolveOrRejectValue&) {
+                callback->SetResult(false);
+                callback->Run();
+              });
+
+          return;
+        }
+
+        RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+        MOZ_ASSERT(swm);
+
+        auto shutdownStateId = swm->MaybeInitServiceWorkerShutdownProgress();
+
+        RefPtr<GenericNonExclusivePromise> promise =
+            self->ShutdownInternal(shutdownStateId);
+
+        swm->BlockShutdownOn(promise, shutdownStateId);
+
+        promise->Then(
+            GetCurrentSerialEventTarget(), __func__,
+            [callback = std::move(callback)](
+                const GenericNonExclusivePromise::ResolveOrRejectValue&) {
+              callback->SetResult(false);
+              callback->Run();
+            });
+      },
+      [callback = aCallback] {
+        callback->SetResult(false);
+        callback->Run();
+      });
+}
+
+nsresult ServiceWorkerPrivate::SendMessageEvent(
+    ipc::StructuredCloneData* aData,
+    const ServiceWorkerLifetimeExtension& aLifetimeExtension,
+    const PostMessageSource& aSource) {
+  AssertIsOnMainThread();
+
+  auto scopeExit = MakeScopeExit([&] { Shutdown(); });
+
+  PBackgroundChild* bgChild = BackgroundChild::GetForCurrentThread();
+
+  if (NS_WARN_IF(!bgChild)) {
+    return NS_ERROR_DOM_INVALID_STATE_ERR;
+  }
+
+  ServiceWorkerMessageEventOpArgs args;
+  args.source() = aSource;
+  args.clonedData() = aData;
+
+  scopeExit.release();
+
+  return ExecServiceWorkerOp(
+      std::move(args), aLifetimeExtension, [](ServiceWorkerOpResult&& aResult) {
+        MOZ_ASSERT(aResult.type() == ServiceWorkerOpResult::Tnsresult);
+      });
+}
+
+nsresult ServiceWorkerPrivate::SendLifeCycleEvent(
+    const nsAString& aEventType,
+    const ServiceWorkerLifetimeExtension& aLifetimeExtension,
+    const RefPtr<LifeCycleEventCallback>& aCallback) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(aCallback);
+
+  return ExecServiceWorkerOp(
+      ServiceWorkerLifeCycleEventOpArgs(nsString(aEventType)),
+      aLifetimeExtension,
+      [callback = aCallback](ServiceWorkerOpResult&& aResult) {
+        MOZ_ASSERT(aResult.type() == ServiceWorkerOpResult::Tnsresult);
+
+        callback->SetResult(NS_SUCCEEDED(aResult.get_nsresult()));
+        callback->Run();
+      },
+      [callback = aCallback] {
+        callback->SetResult(false);
+        callback->Run();
+      });
+}
+
+nsresult ServiceWorkerPrivate::SendCookieChangeEvent(
+    const net::CookieStruct& aCookie, bool aCookieDeleted,
+    RefPtr<ServiceWorkerRegistrationInfo> aRegistration) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(mInfo);
+  MOZ_ASSERT(aRegistration);
+
+  ServiceWorkerCookieChangeEventOpArgs args;
+  args.cookie() = aCookie;
+  args.deleted() = aCookieDeleted;
+
+  if (mInfo->State() == ServiceWorkerState::Activating) {
+    UniquePtr<PendingFunctionalEvent> pendingEvent =
+        MakeUnique<PendingCookieChangeEvent>(this, std::move(aRegistration),
+                                             std::move(args));
+
+    mPendingFunctionalEvents.AppendElement(std::move(pendingEvent));
+
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(mInfo->State() == ServiceWorkerState::Activated);
+
+  return SendCookieChangeEventInternal(std::move(aRegistration),
+                                       std::move(args));
+}
+
+nsresult ServiceWorkerPrivate::SendCookieChangeEventInternal(
+    RefPtr<ServiceWorkerRegistrationInfo>&& aRegistration,
+    ServiceWorkerCookieChangeEventOpArgs&& aArgs) {
+  MOZ_ASSERT(aRegistration);
+
+  return ExecServiceWorkerOp(
+      std::move(aArgs), ServiceWorkerLifetimeExtension(FullLifetimeExtension{}),
+      [registration = aRegistration](ServiceWorkerOpResult&& aResult) {
+        MOZ_ASSERT(aResult.type() == ServiceWorkerOpResult::Tnsresult);
+
+        registration->MaybeScheduleTimeCheckAndUpdate();
+      },
+      [registration = aRegistration]() {
+        registration->MaybeScheduleTimeCheckAndUpdate();
+      });
+}
+
+nsresult ServiceWorkerPrivate::SendFetchEvent(
+    nsCOMPtr<nsIInterceptedChannel> aChannel, nsILoadGroup* aLoadGroup,
+    const nsAString& aClientId, const nsAString& aResultingClientId) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aChannel);
+
+  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+  if (NS_WARN_IF(!mInfo || !swm)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsIChannel> channel;
+  nsresult rv = aChannel->GetChannel(getter_AddRefs(channel));
+  NS_ENSURE_SUCCESS(rv, rv);
+  bool isNonSubresourceRequest =
+      nsContentUtils::IsNonSubresourceRequest(channel);
+
+  RefPtr<ServiceWorkerRegistrationInfo> registration;
+  if (isNonSubresourceRequest) {
+    registration = swm->GetRegistration(mInfo->Principal(), mInfo->Scope());
+  } else {
+    nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+
+    (void)swm->GetClientRegistration(loadInfo->GetClientInfo().ref(),
+                                     getter_AddRefs(registration));
+  }
+
+  if (!registration) {
+    nsresult rv = aChannel->ResetInterception(false);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("Failed to resume intercepted network request");
+      aChannel->CancelInterception(rv);
+    }
+    return NS_OK;
+  }
+
+  if (!mInfo->HandlesFetch()) {
+    nsresult rv = aChannel->ResetInterception(false);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("Failed to resume intercepted network request");
+      aChannel->CancelInterception(rv);
+    }
+
+    registration->MaybeScheduleTimeCheckAndUpdate();
+
+    return NS_OK;
+  }
+
+  auto scopeExit = MakeScopeExit([&] {
+    aChannel->CancelInterception(NS_ERROR_INTERCEPTION_FAILED);
+    Shutdown();
+  });
+
+  IPCInternalRequest request = MOZ_TRY(GetIPCInternalRequest(aChannel));
+
+  scopeExit.release();
+
+  bool preloadNavigation = isNonSubresourceRequest &&
+                           request.method().LowerCaseEqualsASCII("get") &&
+                           registration->GetNavigationPreloadState().enabled();
+
+  RefPtr<FetchServicePromises> preloadResponsePromises;
+  if (preloadNavigation) {
+    preloadResponsePromises = SetupNavigationPreload(aChannel, registration);
+  }
+
+  ParentToParentServiceWorkerFetchEventOpArgs args(
+      ServiceWorkerFetchEventOpArgsCommon(
+          mInfo->ScriptSpec(), request, nsString(aClientId),
+          nsString(aResultingClientId), isNonSubresourceRequest,
+          preloadNavigation, mInfo->TestingInjectCancellation()),
+      Nothing(), Nothing(), Nothing());
+
+  if (mInfo->State() == ServiceWorkerState::Activating) {
+    UniquePtr<PendingFunctionalEvent> pendingEvent =
+        MakeUnique<PendingFetchEvent>(this, std::move(registration),
+                                      std::move(args), std::move(aChannel),
+                                      std::move(preloadResponsePromises));
+
+    mPendingFunctionalEvents.AppendElement(std::move(pendingEvent));
+
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(mInfo->State() == ServiceWorkerState::Activated);
+
+  return SendFetchEventInternal(std::move(registration), std::move(args),
+                                std::move(aChannel),
+                                std::move(preloadResponsePromises));
+}
+
+nsresult ServiceWorkerPrivate::SendFetchEventInternal(
+    RefPtr<ServiceWorkerRegistrationInfo>&& aRegistration,
+    ParentToParentServiceWorkerFetchEventOpArgs&& aArgs,
+    nsCOMPtr<nsIInterceptedChannel>&& aChannel,
+    RefPtr<FetchServicePromises>&& aPreloadResponseReadyPromises) {
+  AssertIsOnMainThread();
+
+  auto scopeExit = MakeScopeExit([&] { Shutdown(); });
+
+  if (NS_WARN_IF(!mInfo)) {
+    return NS_ERROR_DOM_INVALID_STATE_ERR;
+  }
+
+  MOZ_TRY(SpawnWorkerIfNeeded(
+      ServiceWorkerLifetimeExtension(FullLifetimeExtension{})));
+  MOZ_TRY(MaybeStoreStreamForBackgroundThread(
+      aChannel, aArgs.common().internalRequest()));
+
+  scopeExit.release();
+
+  MOZ_ASSERT(mControllerChild);
+
+  RefPtr<RAIIActorPtrHolder> holder = mControllerChild;
+
+  FetchEventOpChild::SendFetchEvent(
+      mControllerChild->get(), std::move(aArgs), std::move(aChannel),
+      std::move(aRegistration), std::move(aPreloadResponseReadyPromises),
+      CreateEventKeepAliveToken())
+      ->Then(GetCurrentSerialEventTarget(), __func__,
+             [holder = std::move(holder)](
+                 const GenericPromise::ResolveOrRejectValue& aResult) {
+               (void)NS_WARN_IF(aResult.IsReject());
+             });
+
+  return NS_OK;
+}
+
+nsresult ServiceWorkerPrivate::SpawnWorkerIfNeeded(
+    const ServiceWorkerLifetimeExtension& aLifetimeExtension) {
+  AssertIsOnMainThread();
+
+  if (mControllerChild) {
+    if (aLifetimeExtension.LifetimeExtendsIntoTheFuture()) {
+      RenewKeepAliveToken(aLifetimeExtension);
+    }
+    return NS_OK;
+  }
+
+  if (!mInfo) {
+    return NS_ERROR_DOM_INVALID_STATE_ERR;
+  }
+
+  if (NS_WARN_IF(!aLifetimeExtension.LifetimeExtendsIntoTheFuture())) {
+    return NS_ERROR_DOM_TIMEOUT_ERR;
+  }
+
+  mServiceWorkerLaunchTimeStart = TimeStamp::Now();
+
+  PBackgroundChild* bgChild = BackgroundChild::GetForCurrentThread();
+
+  if (NS_WARN_IF(!bgChild)) {
+    return NS_ERROR_DOM_INVALID_STATE_ERR;
+  }
+
+  auto* principal = mInfo->Principal();
+  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+
+  if (NS_WARN_IF(!swm)) {
+    return NS_ERROR_DOM_ABORT_ERR;
+  }
+
+  RefPtr<ServiceWorkerRegistrationInfo> regInfo =
+      swm->GetRegistration(principal, mInfo->Scope());
+
+  if (NS_WARN_IF(!regInfo)) {
+    return NS_ERROR_DOM_INVALID_STATE_ERR;
+  }
+
+  RefreshRemoteWorkerData(regInfo);
+
+  mLaunchCount++;
+
+  RefPtr<RemoteWorkerControllerChild> controllerChild =
+      new RemoteWorkerControllerChild(this);
+
+  if (NS_WARN_IF(!bgChild->SendPRemoteWorkerControllerConstructor(
+          controllerChild, mRemoteWorkerData))) {
+    return NS_ERROR_DOM_INVALID_STATE_ERR;
+  }
+
+  mPendingSpawnLifetime = aLifetimeExtension;
+
+  mControllerChild = new RAIIActorPtrHolder(controllerChild.forget());
+
+  UpdateRunning(1, mHandlesFetch == Enabled ? 1 : 0);
+
+  return NS_OK;
+}
+
+void ServiceWorkerPrivate::TerminateWorker(
+    Maybe<RefPtr<Promise>> aMaybePromise) {
+  MOZ_ASSERT(NS_IsMainThread());
+  mIdleWorkerTimer->Cancel();
+  mIdleDeadline = TimeStamp();
+  Shutdown(std::move(aMaybePromise));
+  mIdleKeepAliveToken = nullptr;
+}
+
+void ServiceWorkerPrivate::NoteDeadServiceWorkerInfo() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  TerminateWorker();
+  mInfo = nullptr;
+}
+
+void ServiceWorkerPrivate::UpdateState(ServiceWorkerState aState) {
+  AssertIsOnMainThread();
+
+  if (!mControllerChild) {
+    return;
+  }
+
+  nsresult rv = ExecServiceWorkerOp(
+      ServiceWorkerUpdateStateOpArgs(aState),
+      ServiceWorkerLifetimeExtension(NoLifetimeExtension{}),
+      [](ServiceWorkerOpResult&& aResult) {
+        MOZ_ASSERT(aResult.type() == ServiceWorkerOpResult::Tnsresult);
+      });
+
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    Shutdown();
+    return;
+  }
+
+  if (aState != ServiceWorkerState::Activated) {
+    return;
+  }
+
+  for (auto& event : mPendingFunctionalEvents) {
+    (void)NS_WARN_IF(NS_FAILED(event->Send()));
+  }
+
+  mPendingFunctionalEvents.Clear();
+}
+
+void ServiceWorkerPrivate::UpdateIsOnContentBlockingAllowList(
+    bool aOnContentBlockingAllowList) {
+  AssertIsOnMainThread();
+
+  if (!mControllerChild) {
+    return;
+  }
+
+  ExecServiceWorkerOp(
+      ServiceWorkerUpdateIsOnContentBlockingAllowListOpArgs(
+          aOnContentBlockingAllowList),
+      ServiceWorkerLifetimeExtension(NoLifetimeExtension{}),
+      [](ServiceWorkerOpResult&& aResult) {
+        MOZ_ASSERT(aResult.type() == ServiceWorkerOpResult::Tnsresult);
+      });
+}
+
+nsresult ServiceWorkerPrivate::GetDebugger(nsIWorkerDebugger** aResult) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aResult);
+
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+nsresult ServiceWorkerPrivate::AttachDebugger() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!mDebuggerCount) {
+    nsresult rv = SpawnWorkerIfNeeded(
+        ServiceWorkerLifetimeExtension(FullLifetimeExtension{}));
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    RenewKeepAliveToken(
+        ServiceWorkerLifetimeExtension(FullLifetimeExtension{}));
+    mIdleWorkerTimer->Cancel();
+  }
+
+  ++mDebuggerCount;
+
+  return NS_OK;
+}
+
+nsresult ServiceWorkerPrivate::DetachDebugger() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!mDebuggerCount) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  --mDebuggerCount;
+
+  if (!mDebuggerCount) {
+    if (mTokenCount) {
+      ResetIdleTimeout(ServiceWorkerLifetimeExtension(FullLifetimeExtension{}));
+    } else {
+      TerminateWorker();
+    }
+  }
+
+  return NS_OK;
+}
+
+bool ServiceWorkerPrivate::IsIdle() const {
+  MOZ_ASSERT(NS_IsMainThread());
+  return mTokenCount == 0 || (mTokenCount == 1 && mIdleKeepAliveToken);
+}
+
+RefPtr<GenericPromise> ServiceWorkerPrivate::GetIdlePromise() {
+#ifdef DEBUG
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!IsIdle());
+  MOZ_ASSERT(!mIdlePromiseObtained, "Idle promise may only be obtained once!");
+  mIdlePromiseObtained = true;
+#endif
+
+  RefPtr<GenericPromise> promise = mIdlePromiseHolder.Ensure(__func__);
+  mIdlePromiseHolder.UseDirectTaskDispatch(__func__);
+
+  return promise;
+}
+
+namespace {
+
+class ServiceWorkerPrivateTimerCallback final : public nsITimerCallback,
+                                                public nsINamed {
+ public:
+  using Method = void (ServiceWorkerPrivate::*)(nsITimer*);
+
+  ServiceWorkerPrivateTimerCallback(ServiceWorkerPrivate* aServiceWorkerPrivate,
+                                    Method aMethod)
+      : mServiceWorkerPrivate(aServiceWorkerPrivate), mMethod(aMethod) {}
+
+  NS_IMETHOD
+  Notify(nsITimer* aTimer) override {
+    (mServiceWorkerPrivate->*mMethod)(aTimer);
+    mServiceWorkerPrivate = nullptr;
+    return NS_OK;
+  }
+
+  NS_IMETHOD
+  GetName(nsACString& aName) override {
+    aName.AssignLiteral("ServiceWorkerPrivateTimerCallback");
+    return NS_OK;
+  }
+
+ private:
+  ~ServiceWorkerPrivateTimerCallback() = default;
+
+  RefPtr<ServiceWorkerPrivate> mServiceWorkerPrivate;
+  Method mMethod;
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+};
+
+NS_IMPL_ISUPPORTS(ServiceWorkerPrivateTimerCallback, nsITimerCallback,
+                  nsINamed);
+
+}  
+
+void ServiceWorkerPrivate::NoteIdleWorkerCallback(nsITimer* aTimer) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  MOZ_ASSERT(aTimer == mIdleWorkerTimer, "Invalid timer!");
+
+  mIdleKeepAliveToken = nullptr;
+  mIdleDeadline = TimeStamp();
+
+  if (mControllerChild) {
+    uint32_t timeout =
+        Preferences::GetInt("dom.serviceWorkers.idle_extended_timeout");
+    nsCOMPtr<nsITimerCallback> cb = new ServiceWorkerPrivateTimerCallback(
+        this, &ServiceWorkerPrivate::TerminateWorkerCallback);
+    DebugOnly<nsresult> rv = mIdleWorkerTimer->InitWithCallback(
+        cb, timeout, nsITimer::TYPE_ONE_SHOT);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+  }
+}
+
+void ServiceWorkerPrivate::TerminateWorkerCallback(nsITimer* aTimer) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  MOZ_ASSERT(aTimer == this->mIdleWorkerTimer, "Invalid timer!");
+
+  ServiceWorkerManager::LocalizeAndReportToAllClients(
+      mInfo->Scope(), "ServiceWorkerGraceTimeoutTermination",
+      nsTArray<nsString>{NS_ConvertUTF8toUTF16(mInfo->Scope())});
+
+  TerminateWorker();
+}
+
+void ServiceWorkerPrivate::RenewKeepAliveToken(
+    const ServiceWorkerLifetimeExtension& aLifetimeExtension) {
+  MOZ_ASSERT(mControllerChild);
+
+  if (!mDebuggerCount) {
+    ResetIdleTimeout(aLifetimeExtension);
+  }
+
+  if (!mIdleKeepAliveToken) {
+    mIdleKeepAliveToken = new KeepAliveToken(this);
+  }
+}
+
+void ServiceWorkerPrivate::ResetIdleTimeout(
+    const ServiceWorkerLifetimeExtension& aLifetimeExtension) {
+  TimeStamp now = TimeStamp::NowLoRes();
+  TimeStamp existing = mIdleDeadline;
+  TimeStamp normalizedExtension = aLifetimeExtension.match(
+      [](const NoLifetimeExtension& nle) { return TimeStamp(); },
+      [&existing, &now](const PropagatedLifetimeExtension& ple) {
+        if (ple.mDeadline.IsNull() || ple.mDeadline < now) {
+          return TimeStamp();
+        }
+        if (existing.IsNull() || ple.mDeadline > existing) {
+          return ple.mDeadline;
+        }
+        return TimeStamp();
+      },
+      [&now](const FullLifetimeExtension& fle) {
+        return now + TimeDuration::FromMilliseconds(Preferences::GetInt(
+                         "dom.serviceWorkers.idle_timeout"));
+      });
+
+  if (normalizedExtension.IsNull()) {
+    MOZ_ASSERT(!existing.IsNull());
+    if (NS_WARN_IF(existing.IsNull())) {
+      normalizedExtension = now;
+    } else {
+      return;
+    }
+  }
+
+  mIdleDeadline = normalizedExtension;
+
+  nsCOMPtr<nsITimerCallback> cb = new ServiceWorkerPrivateTimerCallback(
+      this, &ServiceWorkerPrivate::NoteIdleWorkerCallback);
+  DebugOnly<nsresult> rv = mIdleWorkerTimer->InitHighResolutionWithCallback(
+      cb, mIdleDeadline - now, nsITimer::TYPE_ONE_SHOT);
+  MOZ_ASSERT(NS_SUCCEEDED(rv));
+}
+
+void ServiceWorkerPrivate::AddToken() {
+  MOZ_ASSERT(NS_IsMainThread());
+  ++mTokenCount;
+}
+
+void ServiceWorkerPrivate::ReleaseToken() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  MOZ_ASSERT(mTokenCount > 0);
+  --mTokenCount;
+
+  if (IsIdle()) {
+    mIdlePromiseHolder.ResolveIfExists(true, __func__);
+
+    if (!mTokenCount) {
+      TerminateWorker();
+    }
+
+    else if (mInfo) {
+      RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+      if (swm) {
+        swm->WorkerIsIdle(mInfo);
+      }
+    }
+  }
+}
+
+already_AddRefed<KeepAliveToken>
+ServiceWorkerPrivate::CreateEventKeepAliveToken() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  MOZ_ASSERT(mIdleKeepAliveToken || mControllerChild);
+
+  RefPtr<KeepAliveToken> ref = new KeepAliveToken(this);
+  return ref.forget();
+}
+
+void ServiceWorkerPrivate::SetHandlesFetch(bool aValue) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (NS_WARN_IF(!mInfo)) {
+    return;
+  }
+
+  mInfo->SetHandlesFetch(aValue);
+}
+
+RefPtr<GenericPromise> ServiceWorkerPrivate::SetSkipWaitingFlag() {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(mInfo);
+
+  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+
+  if (!swm) {
+    return GenericPromise::CreateAndReject(NS_ERROR_FAILURE, __func__);
+  }
+
+  RefPtr<ServiceWorkerRegistrationInfo> regInfo =
+      swm->GetRegistration(mInfo->Principal(), mInfo->Scope());
+
+  if (!regInfo) {
+    return GenericPromise::CreateAndReject(NS_ERROR_FAILURE, __func__);
+  }
+
+  mInfo->SetSkipWaitingFlag();
+
+  RefPtr<GenericPromise::Private> promise =
+      new GenericPromise::Private(__func__);
+
+  auto lifetime = ServiceWorkerLifetimeExtension(NoLifetimeExtension{});
+
+  regInfo->TryToActivateAsync(lifetime,
+                              [promise] { promise->Resolve(true, __func__); });
+
+  return promise;
+}
+
+void ServiceWorkerPrivate::UpdateRunning(int32_t aDelta, int32_t aFetchDelta) {
+  MOZ_ASSERT(((int64_t)sRunningServiceWorkers) + aDelta >= 0);
+  sRunningServiceWorkers += aDelta;
+  MOZ_ASSERT(((int64_t)sRunningServiceWorkersFetch) + aFetchDelta >= 0);
+  sRunningServiceWorkersFetch += aFetchDelta;
+  LOG(("ServiceWorkers running now %d/%d", sRunningServiceWorkers,
+       sRunningServiceWorkersFetch));
+}
+
+void ServiceWorkerPrivate::CreationFailed() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mControllerChild);
+
+  if (mRemoteWorkerData.remoteType().Find(SERVICEWORKER_REMOTE_TYPE) !=
+      kNotFound) {
+
+  } else {
+
+  }
+
+  mPendingSpawnLifetime = ServiceWorkerLifetimeExtension(NoLifetimeExtension{});
+  Shutdown();
+}
+
+void ServiceWorkerPrivate::CreationSucceeded() {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mInfo);
+
+  if (NS_WARN_IF(!mControllerChild)) {
+    mPendingSpawnLifetime =
+        ServiceWorkerLifetimeExtension(NoLifetimeExtension{});
+    return;
+  }
+
+  if (mRemoteWorkerData.remoteType().Find(SERVICEWORKER_REMOTE_TYPE) !=
+      kNotFound) {
+
+  } else {
+
+  }
+
+  RenewKeepAliveToken(mPendingSpawnLifetime);
+  mPendingSpawnLifetime = ServiceWorkerLifetimeExtension(NoLifetimeExtension{});
+
+  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+  nsCOMPtr<nsIPrincipal> principal = mInfo->Principal();
+  RefPtr<ServiceWorkerRegistrationInfo> regInfo =
+      swm->GetRegistration(principal, mInfo->Scope());
+  if (regInfo) {
+    if (mHandlesFetch == Unknown) {
+      if (regInfo->GetActive()) {
+        mHandlesFetch =
+            regInfo->GetActive()->HandlesFetch() ? Enabled : Disabled;
+        if (mHandlesFetch == Enabled) {
+          UpdateRunning(0, 1);
+        }
+      }
+    }
+  }
+}
+
+void ServiceWorkerPrivate::ErrorReceived(const ErrorValue& aError) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(mInfo);
+  MOZ_ASSERT(mControllerChild);
+
+  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+  MOZ_ASSERT(swm);
+
+  ServiceWorkerInfo* info = mInfo;
+
+  swm->HandleError(nullptr, info->Principal(), info->Scope(),
+                   info->ScriptSpec(), u""_ns, ""_ns, u""_ns, 0, 0,
+                   nsIScriptError::errorFlag, JSEXN_ERR);
+}
+
+void ServiceWorkerPrivate::Terminated() {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(mInfo);
+  MOZ_ASSERT(mControllerChild);
+
+  Shutdown();
+}
+
+void ServiceWorkerPrivate::RefreshRemoteWorkerData(
+    const RefPtr<ServiceWorkerRegistrationInfo>& aRegistration) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(mInfo);
+
+  ServiceWorkerData& serviceWorkerData =
+      mRemoteWorkerData.serviceWorkerData().get_ServiceWorkerData();
+  serviceWorkerData.descriptor() = mInfo->Descriptor().ToIPC();
+  serviceWorkerData.registrationDescriptor() =
+      aRegistration->Descriptor().ToIPC();
+}
+
+RefPtr<FetchServicePromises> ServiceWorkerPrivate::SetupNavigationPreload(
+    nsCOMPtr<nsIInterceptedChannel>& aChannel,
+    const RefPtr<ServiceWorkerRegistrationInfo>& aRegistration) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  AssertIsOnMainThread();
+
+  auto result = GetIPCInternalRequest(aChannel);
+  if (result.isErr()) {
+    return nullptr;
+  }
+  IPCInternalRequest ipcRequest = result.unwrap();
+
+  SafeRefPtr<InternalRequest> preloadRequest =
+      MakeSafeRefPtr<InternalRequest>(ipcRequest);
+  nsCOMPtr<nsIUploadChannel2> uploadChannel = do_QueryInterface(aChannel);
+  if (uploadChannel) {
+    nsCOMPtr<nsIInputStream> uploadStream;
+    nsresult rv = uploadChannel->CloneUploadStream(
+        &ipcRequest.bodySize(), getter_AddRefs(uploadStream));
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return FetchService::NetworkErrorResponse(rv);
+    }
+    preloadRequest->SetBody(uploadStream, ipcRequest.bodySize());
+  }
+
+  preloadRequest->SetSkipServiceWorker();
+
+  IgnoredErrorResult err;
+  auto headersGuard = preloadRequest->Headers()->Guard();
+  preloadRequest->Headers()->SetGuard(HeadersGuardEnum::None, err);
+  preloadRequest->Headers()->Append(
+      "Service-Worker-Navigation-Preload"_ns,
+      aRegistration->GetNavigationPreloadState().headerValue(), err);
+  preloadRequest->Headers()->SetGuard(headersGuard, err);
+
+  if (!err.Failed()) {
+    nsCOMPtr<nsIChannel> underlyingChannel;
+    MOZ_ALWAYS_SUCCEEDS(
+        aChannel->GetChannel(getter_AddRefs(underlyingChannel)));
+    RefPtr<FetchService> fetchService = FetchService::GetInstance();
+    return fetchService->Fetch(AsVariant(FetchService::NavigationPreloadArgs{
+        std::move(preloadRequest), underlyingChannel}));
+  }
+  return FetchService::NetworkErrorResponse(NS_ERROR_UNEXPECTED);
+}
+
+void ServiceWorkerPrivate::Shutdown(Maybe<RefPtr<Promise>>&& aMaybePromise) {
+  AssertIsOnMainThread();
+
+  if (mControllerChild) {
+    RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+
+    MOZ_ASSERT(swm,
+               "All Service Workers should start shutting down before the "
+               "ServiceWorkerManager does!");
+
+    auto shutdownStateId = swm->MaybeInitServiceWorkerShutdownProgress();
+
+    RefPtr<GenericNonExclusivePromise> promise =
+        ShutdownInternal(shutdownStateId);
+    swm->BlockShutdownOn(promise, shutdownStateId);
+    if (aMaybePromise.isSome() && aMaybePromise.ref()) {
+      promise->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [listener = aMaybePromise.ref()] {
+            listener->MaybeResolveWithUndefined();
+          },
+          [listener = aMaybePromise.ref()] {
+            listener->MaybeResolveWithUndefined();
+          });
+    }
+  } else if (aMaybePromise.isSome() && aMaybePromise.ref()) {
+    aMaybePromise.ref()->MaybeResolveWithUndefined();
+  }
+
+  MOZ_ASSERT(!mControllerChild);
+}
+
+RefPtr<GenericNonExclusivePromise> ServiceWorkerPrivate::ShutdownInternal(
+    uint32_t aShutdownStateId) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(mControllerChild);
+
+  mPendingFunctionalEvents.Clear();
+
+  mControllerChild->get()->RevokeObserver(this);
+
+  RefPtr<GenericNonExclusivePromise::Private> promise =
+      new GenericNonExclusivePromise::Private(__func__);
+
+  (void)ExecServiceWorkerOp(
+      ServiceWorkerTerminateWorkerOpArgs(aShutdownStateId),
+      ServiceWorkerLifetimeExtension(NoLifetimeExtension{}),
+      [promise](ServiceWorkerOpResult&& aResult) {
+        MOZ_ASSERT(aResult.type() == ServiceWorkerOpResult::Tnsresult);
+        promise->Resolve(true, __func__);
+      },
+      [promise]() { promise->Reject(NS_ERROR_DOM_ABORT_ERR, __func__); });
+
+  mControllerChild = nullptr;
+  RegenerateClientInfo();
+
+  UpdateRunning(-1, mHandlesFetch == Enabled ? -1 : 0);
+
+  return promise;
+}
+
+nsresult ServiceWorkerPrivate::ExecServiceWorkerOp(
+    ServiceWorkerOpArgs&& aArgs,
+    const ServiceWorkerLifetimeExtension& aLifetimeExtension,
+    std::function<void(ServiceWorkerOpResult&&)>&& aSuccessCallback,
+    std::function<void()>&& aFailureCallback) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(
+      aArgs.type() !=
+          ServiceWorkerOpArgs::TParentToChildServiceWorkerFetchEventOpArgs,
+      "FetchEvent operations should be sent through FetchEventOp(Proxy) "
+      "actors!");
+  MOZ_ASSERT(aSuccessCallback);
+
+  nsresult rv = SpawnWorkerIfNeeded(aLifetimeExtension);
+
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aFailureCallback();
+    return rv;
+  }
+
+  MOZ_ASSERT(mControllerChild);
+
+  RefPtr<ServiceWorkerPrivate> self = this;
+  RefPtr<RAIIActorPtrHolder> holder = mControllerChild;
+  RefPtr<KeepAliveToken> token =
+      aArgs.type() == ServiceWorkerOpArgs::TServiceWorkerTerminateWorkerOpArgs
+          ? nullptr
+          : CreateEventKeepAliveToken();
+
+  mControllerChild->get()->SendExecServiceWorkerOp(aArgs)->Then(
+      GetCurrentSerialEventTarget(), __func__,
+      [self = std::move(self), holder = std::move(holder),
+       token = std::move(token), onSuccess = std::move(aSuccessCallback),
+       onFailure = std::move(aFailureCallback)](
+          PRemoteWorkerControllerChild::ExecServiceWorkerOpPromise::
+              ResolveOrRejectValue&& aResult) {
+        if (NS_WARN_IF(aResult.IsReject())) {
+          onFailure();
+          return;
+        }
+
+        onSuccess(std::move(aResult.ResolveValue()));
+      });
+
+  return NS_OK;
+}
+
+}  

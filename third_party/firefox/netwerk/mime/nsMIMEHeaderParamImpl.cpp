@@ -1,0 +1,1150 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include <string.h>
+#include "prprf.h"
+#include "prmem.h"
+#include "plbase64.h"
+#include "nsCRT.h"
+#include "nsTArray.h"
+#include "nsEscape.h"
+#include "nsMIMEHeaderParamImpl.h"
+#include "nsNativeCharsetUtils.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/TextUtils.h"
+#include "mozilla/Utf8.h"
+
+using mozilla::Encoding;
+using mozilla::IsAscii;
+using mozilla::IsUtf8;
+
+
+static char* DecodeQ(const char*, uint32_t);
+static bool Is7bitNonAsciiString(const char*, uint32_t);
+static void CopyRawHeader(const char*, uint32_t, const nsACString&,
+                          nsACString&);
+static nsresult DecodeRFC2047Str(const char*, const nsACString&, bool,
+                                 nsACString&);
+static nsresult internalDecodeParameter(const nsACString&, const nsACString&,
+                                        const nsACString&, bool, bool,
+                                        nsACString&);
+
+static nsresult ToUTF8(const nsACString& aString, const nsACString& aCharset,
+                       bool aAllowSubstitution, nsACString& aResult) {
+  if (aCharset.IsEmpty()) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  const auto* encoding = Encoding::ForLabelNoReplacement(aCharset);
+  if (!encoding) {
+    return NS_ERROR_UCONV_NOCONV;
+  }
+  if (aAllowSubstitution) {
+    nsresult rv = encoding->DecodeWithoutBOMHandling(aString, aResult);
+    if (NS_SUCCEEDED(rv)) {
+      return NS_OK;
+    }
+    return rv;
+  }
+  return encoding->DecodeWithoutBOMHandlingAndWithoutReplacement(aString,
+                                                                 aResult);
+}
+
+static nsresult ConvertStringToUTF8(const nsACString& aString,
+                                    const nsACString& aCharset, bool aSkipCheck,
+                                    bool aAllowSubstitution,
+                                    nsACString& aUTF8String) {
+  if (!aSkipCheck && (IsAscii(aString) || IsUtf8(aString))) {
+    aUTF8String = aString;
+    return NS_OK;
+  }
+
+  aUTF8String.Truncate();
+
+  nsresult rv = ToUTF8(aString, aCharset, aAllowSubstitution, aUTF8String);
+
+  if (aSkipCheck && NS_FAILED(rv) && IsUtf8(aString)) {
+    aUTF8String = aString;
+    return NS_OK;
+  }
+
+  return rv;
+}
+
+#define IS_7BIT_NON_ASCII_CHARSET(cset)          \
+  (!nsCRT::strncasecmp((cset), "ISO-2022", 8) || \
+   !nsCRT::strncasecmp((cset), "HZ-GB", 5) ||    \
+   !nsCRT::strncasecmp((cset), "UTF-7", 5))
+
+NS_IMPL_ISUPPORTS(nsMIMEHeaderParamImpl, nsIMIMEHeaderParam)
+
+NS_IMETHODIMP
+nsMIMEHeaderParamImpl::GetParameter(const nsACString& aHeaderVal,
+                                    const char* aParamName,
+                                    const nsACString& aFallbackCharset,
+                                    bool aTryLocaleCharset, char** aLang,
+                                    nsAString& aResult) {
+  return DoGetParameter(aHeaderVal, aParamName, MIME_FIELD_ENCODING,
+                        aFallbackCharset, aTryLocaleCharset, aLang, aResult);
+}
+
+NS_IMETHODIMP
+nsMIMEHeaderParamImpl::GetParameterHTTP(const nsACString& aHeaderVal,
+                                        const char* aParamName,
+                                        const nsACString& aFallbackCharset,
+                                        bool aTryLocaleCharset, char** aLang,
+                                        nsAString& aResult) {
+  return DoGetParameter(aHeaderVal, aParamName, HTTP_FIELD_ENCODING,
+                        aFallbackCharset, aTryLocaleCharset, aLang, aResult);
+}
+
+nsresult nsMIMEHeaderParamImpl::GetParameterHTTP(const nsACString& aHeaderVal,
+                                                 const char* aParamName,
+                                                 nsAString& aResult) {
+  return DoGetParameter(aHeaderVal, aParamName, HTTP_FIELD_ENCODING, ""_ns,
+                        false, nullptr, aResult);
+}
+
+bool nsMIMEHeaderParamImpl::ContainsTrailingCharPastNull(
+    const nsACString& aVal) {
+  nsACString::const_iterator first;
+  aVal.BeginReading(first);
+  nsACString::const_iterator end;
+  aVal.EndReading(end);
+
+  if (FindCharInReadable(L'\0', first, end)) {
+    while (first != end) {
+      if (*first != '\0') {
+        return true;
+      }
+      ++first;
+    }
+  }
+  return false;
+}
+
+nsresult nsMIMEHeaderParamImpl::DoGetParameter(
+    const nsACString& aHeaderVal, const char* aParamName,
+    ParamDecoding aDecoding, const nsACString& aFallbackCharset,
+    bool aTryLocaleCharset, char** aLang, nsAString& aResult) {
+  aResult.Truncate();
+  nsresult rv;
+
+  nsCString med;
+  nsCString charset;
+  rv = DoParameterInternal(aHeaderVal, aParamName, aDecoding,
+                           getter_Copies(charset), aLang, getter_Copies(med));
+  if (NS_FAILED(rv)) return rv;
+
+
+  nsAutoCString str1;
+  rv = internalDecodeParameter(med, charset, ""_ns, false,
+                               true, str1);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (!aFallbackCharset.IsEmpty()) {
+    const Encoding* encoding = Encoding::ForLabel(aFallbackCharset);
+    nsAutoCString str2;
+    if (NS_SUCCEEDED(ConvertStringToUTF8(str1, aFallbackCharset, false,
+                                         encoding != UTF_8_ENCODING, str2))) {
+      CopyUTF8toUTF16(str2, aResult);
+      return NS_OK;
+    }
+  }
+
+  if (IsUtf8(str1)) {
+    CopyUTF8toUTF16(str1, aResult);
+    return NS_OK;
+  }
+
+  if (aTryLocaleCharset && !NS_IsNativeUTF8()) {
+    return NS_CopyNativeToUnicode(str1, aResult);
+  }
+
+  CopyASCIItoUTF16(str1, aResult);
+  return NS_OK;
+}
+
+void RemoveQuotedStringEscapes(char* src) {
+  char* dst = src;
+
+  for (char* c = src; *c; ++c) {
+    if (c[0] == '\\' && c[1]) {
+      ++c;
+    }
+    *dst++ = *c;
+  }
+  *dst = 0;
+}
+
+bool IsHexDigit(char aChar) {
+  char c = aChar;
+
+  return (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') ||
+         (c >= '0' && c <= '9');
+}
+
+bool IsValidPercentEscaped(const char* aValue, int32_t len) {
+  for (int32_t i = 0; i < len; i++) {
+    if (aValue[i] == '%') {
+      if (!IsHexDigit(aValue[i + 1]) || !IsHexDigit(aValue[i + 2])) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+
+#define MAX_CONTINUATIONS 999
+
+
+class Continuation {
+ public:
+  Continuation(const char* aValue, uint32_t aLength, bool aNeedsPercentDecoding,
+               bool aWasQuotedString) {
+    value = aValue;
+    length = aLength;
+    needsPercentDecoding = aNeedsPercentDecoding;
+    wasQuotedString = aWasQuotedString;
+  }
+  Continuation() {
+    value = nullptr;
+    length = 0;
+    needsPercentDecoding = false;
+    wasQuotedString = false;
+  }
+  ~Continuation() = default;
+
+  const char* value;
+  uint32_t length;
+  bool needsPercentDecoding;
+  bool wasQuotedString;
+};
+
+char* combineContinuations(nsTArray<Continuation>& aArray) {
+  if (aArray.Length() == 0) return nullptr;
+
+  uint32_t length = 0;
+  for (uint32_t i = 0; i < aArray.Length(); i++) {
+    length += aArray[i].length;
+  }
+
+  char* result = (char*)moz_xmalloc(length + 1);
+
+  *result = '\0';
+
+  for (uint32_t i = 0; i < aArray.Length(); i++) {
+    Continuation cont = aArray[i];
+    if (!cont.value) break;
+
+    char* c = result + strlen(result);
+    strncat(result, cont.value, cont.length);
+    if (cont.needsPercentDecoding) {
+      nsUnescape(c);
+    }
+    if (cont.wasQuotedString) {
+      RemoveQuotedStringEscapes(c);
+    }
+  }
+
+  if (*result == '\0') {
+    free(result);
+    result = nullptr;
+  }
+
+  return result;
+}
+
+bool addContinuation(nsTArray<Continuation>& aArray, uint32_t aIndex,
+                     const char* aValue, uint32_t aLength,
+                     bool aNeedsPercentDecoding, bool aWasQuotedString) {
+  if (aIndex < aArray.Length() && aArray[aIndex].value) {
+    NS_WARNING("duplicate RC2231 continuation segment #");
+    return false;
+  }
+
+  if (aIndex > MAX_CONTINUATIONS) {
+    NS_WARNING("RC2231 continuation segment # exceeds limit");
+    return false;
+  }
+
+  if (aNeedsPercentDecoding && aWasQuotedString) {
+    NS_WARNING(
+        "RC2231 continuation segment can't use percent encoding and quoted "
+        "string form at the same time");
+    return false;
+  }
+
+  Continuation cont(aValue, aLength, aNeedsPercentDecoding, aWasQuotedString);
+
+  if (aArray.Length() <= aIndex) {
+    aArray.SetLength(aIndex + 1);
+  }
+  aArray[aIndex] = cont;
+
+  return true;
+}
+
+int32_t parseSegmentNumber(const char* aValue, int32_t aLen) {
+  if (aLen < 1) {
+    NS_WARNING("segment number missing");
+    return -1;
+  }
+
+  if (aLen > 1 && aValue[0] == '0') {
+    NS_WARNING("leading '0' not allowed in segment number");
+    return -1;
+  }
+
+  int32_t segmentNumber = 0;
+
+  for (int32_t i = 0; i < aLen; i++) {
+    if (!(aValue[i] >= '0' && aValue[i] <= '9')) {
+      NS_WARNING("invalid characters in segment number");
+      return -1;
+    }
+
+    segmentNumber *= 10;
+    segmentNumber += aValue[i] - '0';
+    if (segmentNumber > MAX_CONTINUATIONS) {
+      NS_WARNING("Segment number exceeds sane size");
+      return -1;
+    }
+  }
+
+  return segmentNumber;
+}
+
+bool IsValidOctetSequenceForCharset(const nsACString& aCharset,
+                                    const char* aOctets) {
+  nsAutoCString tmpRaw;
+  tmpRaw.Assign(aOctets);
+  nsAutoCString tmpDecoded;
+
+  nsresult rv = ConvertStringToUTF8(tmpRaw, aCharset, false, false, tmpDecoded);
+
+  if (rv != NS_OK) {
+    NS_WARNING(
+        "RFC2231/5987 parameter value does not decode according to specified "
+        "charset");
+    return false;
+  }
+
+  return true;
+}
+
+NS_IMETHODIMP
+nsMIMEHeaderParamImpl::GetParameterInternal(const nsACString& aHeaderValue,
+                                            const char* aParamName,
+                                            char** aCharset, char** aLang,
+                                            char** aResult) {
+  return DoParameterInternal(aHeaderValue, aParamName, MIME_FIELD_ENCODING,
+                             aCharset, aLang, aResult);
+}
+
+nsresult nsMIMEHeaderParamImpl::DoParameterInternal(
+    const nsACString& aHeaderValue, const char* aParamName,
+    ParamDecoding aDecoding, char** aCharset, char** aLang, char** aResult) {
+  if (aHeaderValue.IsEmpty() || !aResult) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (ContainsTrailingCharPastNull(aHeaderValue)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  const nsCString& flat = PromiseFlatCString(aHeaderValue);
+  const char* str = flat.get();
+
+  if (!*str) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  *aResult = nullptr;
+
+  if (aCharset) *aCharset = nullptr;
+  if (aLang) *aLang = nullptr;
+
+  nsAutoCString charset;
+
+  bool acceptContinuations = true;
+
+  for (; *str && nsCRT::IsAsciiSpace(*str); ++str) {
+    ;
+  }
+  const char* start = str;
+
+  if (!aParamName || !*aParamName) {
+    for (; *str && *str != ';' && !nsCRT::IsAsciiSpace(*str); ++str) {
+      ;
+    }
+    if (str == start) return NS_ERROR_FIRST_HEADER_FIELD_COMPONENT_EMPTY;
+
+    *aResult = (char*)moz_xmemdup(start, (str - start) + 1);
+    (*aResult)[str - start] = '\0';  
+    return NS_OK;
+  }
+
+  for (; *str && *str != ';' && *str != ','; ++str) {
+    ;
+  }
+  if (*str) str++;
+  for (; *str && nsCRT::IsAsciiSpace(*str); ++str) {
+    ;
+  }
+
+
+  if (!*str) str = start;
+
+
+  char* caseAResult = nullptr;
+  char* caseBResult = nullptr;
+  char* caseCDResult = nullptr;
+
+  nsTArray<Continuation> segments;
+
+  nsDependentCSubstring charsetB, charsetCD;
+
+  nsDependentCSubstring lang;
+
+  int32_t paramLen = strlen(aParamName);
+
+  while (*str) {
+
+    const char* nameStart = str;
+    const char* nameEnd = nullptr;
+    const char* valueStart = nullptr;
+    const char* valueEnd = nullptr;
+    bool isQuotedString = false;
+
+    NS_ASSERTION(!nsCRT::IsAsciiSpace(*str), "should be after whitespace.");
+
+    for (; *str && !nsCRT::IsAsciiSpace(*str) && *str != '=' && *str != ';';
+         str++) {
+      ;
+    }
+    nameEnd = str;
+
+    int32_t nameLen = nameEnd - nameStart;
+
+    while (nsCRT::IsAsciiSpace(*str)) ++str;
+    if (!*str) {
+      break;
+    }
+    if (*str != '=') {
+      goto increment_str;
+    }
+    str++;
+    while (nsCRT::IsAsciiSpace(*str)) ++str;
+
+    if (*str != '"') {
+      valueStart = str;
+      for (valueEnd = str; *valueEnd && *valueEnd != ';'; valueEnd++) {
+        ;
+      }
+      while (valueEnd > valueStart && nsCRT::IsAsciiSpace(*(valueEnd - 1))) {
+        valueEnd--;
+      }
+      str = valueEnd;
+    } else {
+      isQuotedString = true;
+
+      ++str;
+      valueStart = str;
+      for (valueEnd = str; *valueEnd; ++valueEnd) {
+        if (*valueEnd == '\\' && *(valueEnd + 1)) {
+          ++valueEnd;
+        } else if (*valueEnd == '"') {
+          break;
+        }
+      }
+      str = valueEnd;
+      if (*valueEnd) str++;
+    }
+
+    if (nameLen == paramLen &&
+        !nsCRT::strncasecmp(nameStart, aParamName, paramLen)) {
+      if (caseAResult) {
+        goto increment_str;
+      }
+
+      nsAutoCString tempStr(valueStart, valueEnd - valueStart);
+      tempStr.StripCRLF();
+      char* res = ToNewCString(tempStr, mozilla::fallible);
+      NS_ENSURE_TRUE(res, NS_ERROR_OUT_OF_MEMORY);
+
+      if (isQuotedString) RemoveQuotedStringEscapes(res);
+
+      caseAResult = res;
+    }
+    else if (nameLen > paramLen &&
+             !nsCRT::strncasecmp(nameStart, aParamName, paramLen) &&
+             *(nameStart + paramLen) == '*') {
+      const char* cp = nameStart + paramLen + 1;
+
+      bool needExtDecoding = *(nameEnd - 1) == '*';
+
+      bool caseB = nameLen == paramLen + 1;
+      bool caseCStart = (*cp == '0') && needExtDecoding;
+
+      int32_t segmentNumber = -1;
+      if (!caseB) {
+        int32_t segLen = (nameEnd - cp) - (needExtDecoding ? 1 : 0);
+        segmentNumber = parseSegmentNumber(cp, segLen);
+
+        if (segmentNumber == -1) {
+          acceptContinuations = false;
+          goto increment_str;
+        }
+      }
+
+      if (caseB || (caseCStart && acceptContinuations)) {
+        const char* sQuote1 = strchr(valueStart, 0x27);
+        const char* sQuote2 = sQuote1 ? strchr(sQuote1 + 1, 0x27) : nullptr;
+
+        if (!sQuote1 || !sQuote2) {
+          NS_WARNING(
+              "Mandatory two single quotes are missing in header parameter");
+        }
+
+        const char* charsetStart = nullptr;
+        int32_t charsetLength = 0;
+        const char* langStart = nullptr;
+        int32_t langLength = 0;
+        const char* rawValStart = nullptr;
+        int32_t rawValLength = 0;
+
+        if (sQuote2 && sQuote1) {
+          rawValStart = sQuote2 + 1;
+          rawValLength = valueEnd - rawValStart;
+
+          langStart = sQuote1 + 1;
+          langLength = sQuote2 - langStart;
+
+          charsetStart = valueStart;
+          charsetLength = sQuote1 - charsetStart;
+        } else if (sQuote1) {
+          rawValStart = sQuote1 + 1;
+          rawValLength = valueEnd - rawValStart;
+
+          charsetStart = valueStart;
+          charsetLength = sQuote1 - valueStart;
+        } else {
+          rawValStart = valueStart;
+          rawValLength = valueEnd - valueStart;
+        }
+
+        if (langLength != 0) {
+          lang.Assign(langStart, langLength);
+        }
+
+        if (caseB) {
+          charsetB.Assign(charsetStart, charsetLength);
+        } else {
+          charsetCD.Assign(charsetStart, charsetLength);
+        }
+
+        if (rawValLength > 0) {
+          if (!caseBResult && caseB) {
+            if (!IsValidPercentEscaped(rawValStart, rawValLength)) {
+              goto increment_str;
+            }
+
+            char* tmpResult = (char*)moz_xmemdup(rawValStart, rawValLength + 1);
+            *(tmpResult + rawValLength) = 0;
+
+            nsUnescape(tmpResult);
+            caseBResult = tmpResult;
+          } else {
+            bool added = addContinuation(segments, 0, rawValStart, rawValLength,
+                                         needExtDecoding, isQuotedString);
+
+            if (!added) {
+              acceptContinuations = false;
+            }
+          }
+        }
+      }  
+      else if (acceptContinuations && segmentNumber != -1) {
+        uint32_t valueLength = valueEnd - valueStart;
+
+        bool added =
+            addContinuation(segments, segmentNumber, valueStart, valueLength,
+                            needExtDecoding, isQuotedString);
+
+        if (!added) {
+          acceptContinuations = false;
+        }
+      }  
+    }
+
+  increment_str:
+    while (nsCRT::IsAsciiSpace(*str)) ++str;
+    if (*str == ';') {
+      ++str;
+    } else {
+      break;
+    }
+    while (nsCRT::IsAsciiSpace(*str)) ++str;
+  }
+
+  caseCDResult = combineContinuations(segments);
+
+  if (caseBResult && !charsetB.IsEmpty()) {
+    if (!IsValidOctetSequenceForCharset(charsetB, caseBResult)) {
+      free(caseBResult);
+      caseBResult = nullptr;
+    }
+  }
+
+  if (caseCDResult && !charsetCD.IsEmpty()) {
+    if (!IsValidOctetSequenceForCharset(charsetCD, caseCDResult)) {
+      free(caseCDResult);
+      caseCDResult = nullptr;
+    }
+  }
+
+  if (caseBResult) {
+    *aResult = caseBResult;
+    caseBResult = nullptr;
+    charset.Assign(charsetB);
+  } else if (caseCDResult) {
+    *aResult = caseCDResult;
+    caseCDResult = nullptr;
+    charset.Assign(charsetCD);
+  } else if (caseAResult) {
+    *aResult = caseAResult;
+    caseAResult = nullptr;
+  }
+
+  free(caseAResult);
+  free(caseBResult);
+  free(caseCDResult);
+
+  if (*aResult) {
+    if (aLang && !lang.IsEmpty()) {
+      *aLang = ToNewCString(lang);
+    }
+    if (aCharset && !charset.IsEmpty()) {
+      *aCharset = ToNewCString(charset);
+    }
+  }
+
+  return *aResult ? NS_OK : NS_ERROR_INVALID_ARG;
+}
+
+nsresult internalDecodeRFC2047Header(const char* aHeaderVal,
+                                     const nsACString& aDefaultCharset,
+                                     bool aOverrideCharset,
+                                     bool aEatContinuations,
+                                     nsACString& aResult) {
+  aResult.Truncate();
+  if (!aHeaderVal) return NS_ERROR_INVALID_ARG;
+  if (!*aHeaderVal) return NS_OK;
+
+  if (strstr(aHeaderVal, "=?") ||
+      (!aDefaultCharset.IsEmpty() &&
+       (!IsUtf8(nsDependentCString(aHeaderVal)) ||
+        Is7bitNonAsciiString(aHeaderVal, strlen(aHeaderVal))))) {
+    DecodeRFC2047Str(aHeaderVal, aDefaultCharset, aOverrideCharset, aResult);
+  } else if (aEatContinuations &&
+             (strchr(aHeaderVal, '\n') || strchr(aHeaderVal, '\r'))) {
+    aResult = aHeaderVal;
+  } else {
+    aEatContinuations = false;
+    aResult = aHeaderVal;
+  }
+
+  if (aEatContinuations) {
+    nsAutoCString temp(aResult);
+    temp.ReplaceSubstring("\n\t", " ");
+    temp.ReplaceSubstring("\r\t", " ");
+    temp.StripCRLF();
+    aResult = temp;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsMIMEHeaderParamImpl::DecodeRFC2047Header(const char* aHeaderVal,
+                                           const char* aDefaultCharset,
+                                           bool aOverrideCharset,
+                                           bool aEatContinuations,
+                                           nsACString& aResult) {
+  return internalDecodeRFC2047Header(aHeaderVal, nsCString(aDefaultCharset),
+                                     aOverrideCharset, aEatContinuations,
+                                     aResult);
+}
+
+bool IsRFC5987AttrChar(char aChar) {
+  char c = aChar;
+
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= '0' && c <= '9') ||
+         (c == '!' || c == '#' || c == '$' || c == '&' || c == '+' ||
+          c == '-' || c == '.' || c == '^' || c == '_' || c == '`' ||
+          c == '|' || c == '~');
+}
+
+bool PercentDecode(nsACString& aValue) {
+  char* c = (char*)moz_xmalloc(aValue.Length() + 1);
+
+  strcpy(c, PromiseFlatCString(aValue).get());
+  nsUnescape(c);
+  aValue.Assign(c);
+  free(c);
+
+  return true;
+}
+
+NS_IMETHODIMP
+nsMIMEHeaderParamImpl::DecodeRFC5987Param(const nsACString& aParamVal,
+                                          nsACString& aLang,
+                                          nsAString& aResult) {
+  nsAutoCString charset;
+  nsAutoCString language;
+  nsAutoCString value;
+
+  uint32_t delimiters = 0;
+  const nsCString& encoded = PromiseFlatCString(aParamVal);
+  const char* c = encoded.get();
+
+  while (*c) {
+    char tc = *c++;
+
+    if (tc == '\'') {
+      delimiters++;
+    } else if (((unsigned char)tc) >= 128) {
+      NS_WARNING("non-US-ASCII character in RFC5987-encoded param");
+      return NS_ERROR_INVALID_ARG;
+    } else {
+      if (delimiters == 0) {
+        charset.Append(tc);
+      } else if (delimiters == 1) {
+        language.Append(tc);
+      } else if (delimiters == 2) {
+        if (IsRFC5987AttrChar(tc)) {
+          value.Append(tc);
+        } else if (tc == '%') {
+          if (!IsHexDigit(c[0]) || !IsHexDigit(c[1])) {
+            NS_WARNING("broken %-escape in RFC5987-encoded param");
+            return NS_ERROR_INVALID_ARG;
+          }
+          value.Append(tc);
+          value.Append(*c++);
+          value.Append(*c++);
+        } else {
+          NS_WARNING("invalid character in RFC5987-encoded param");
+          return NS_ERROR_INVALID_ARG;
+        }
+      }
+    }
+  }
+
+  if (delimiters != 2) {
+    NS_WARNING("missing delimiters in RFC5987-encoded param");
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (!charset.LowerCaseEqualsLiteral("utf-8")) {
+    NS_WARNING("unsupported charset in RFC5987-encoded param");
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (!PercentDecode(value)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  aLang.Assign(language);
+
+  nsAutoCString utf8;
+  nsresult rv = ConvertStringToUTF8(value, charset, true, false, utf8);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  CopyUTF8toUTF16(utf8, aResult);
+  return NS_OK;
+}
+
+nsresult internalDecodeParameter(const nsACString& aParamValue,
+                                 const nsACString& aCharset,
+                                 const nsACString& aDefaultCharset,
+                                 bool aOverrideCharset, bool aDecode2047,
+                                 nsACString& aResult) {
+  aResult.Truncate();
+  if (!aCharset.IsEmpty()) {
+    return ConvertStringToUTF8(aParamValue, aCharset, true, true, aResult);
+  }
+
+  const nsCString& param = PromiseFlatCString(aParamValue);
+  nsAutoCString unQuoted;
+  nsACString::const_iterator s, e;
+  param.BeginReading(s);
+  param.EndReading(e);
+
+  for (; s != e; ++s) {
+    if ((*s == '\\')) {
+      if (++s == e) {
+        --s;  
+      } else if (*s != nsCRT::CR && *s != nsCRT::LF && *s != '"' &&
+                 *s != '\\') {
+        --s;  
+      }
+    }
+    unQuoted.Append(*s);
+  }
+
+  aResult = unQuoted;
+  nsresult rv = NS_OK;
+
+  if (aDecode2047) {
+    nsAutoCString decoded;
+
+    rv = internalDecodeRFC2047Header(unQuoted.get(), aDefaultCharset,
+                                     aOverrideCharset, true, decoded);
+
+    if (NS_SUCCEEDED(rv) && !decoded.IsEmpty()) aResult = decoded;
+  }
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsMIMEHeaderParamImpl::DecodeParameter(const nsACString& aParamValue,
+                                       const char* aCharset,
+                                       const char* aDefaultCharset,
+                                       bool aOverrideCharset,
+                                       nsACString& aResult) {
+  return internalDecodeParameter(aParamValue, nsCString(aCharset),
+                                 nsCString(aDefaultCharset), aOverrideCharset,
+                                 true, aResult);
+}
+
+#define ISHEXCHAR(c)                             \
+  ((0x30 <= uint8_t(c) && uint8_t(c) <= 0x39) || \
+   (0x41 <= uint8_t(c) && uint8_t(c) <= 0x46) || \
+   (0x61 <= uint8_t(c) && uint8_t(c) <= 0x66))
+
+char* DecodeQ(const char* in, uint32_t length) {
+  char *out, *dest = nullptr;
+
+  out = dest = (char*)calloc(length + 1, sizeof(char));
+  if (dest == nullptr) return nullptr;
+  while (length > 0) {
+    unsigned c = 0;
+    switch (*in) {
+      case '=':
+        if (length < 3 || !ISHEXCHAR(in[1]) || !ISHEXCHAR(in[2])) {
+          goto badsyntax;
+        }
+        (void)PR_sscanf(in + 1, "%2X", &c);
+        *out++ = (char)c;
+        in += 3;
+        length -= 3;
+        break;
+
+      case '_':
+        *out++ = ' ';
+        in++;
+        length--;
+        break;
+
+      default:
+        if (*in & 0x80) goto badsyntax;
+        *out++ = *in++;
+        length--;
+    }
+  }
+  *out++ = '\0';
+
+  for (out = dest; *out; ++out) {
+    if (*out == '\t') *out = ' ';
+  }
+
+  return dest;
+
+badsyntax:
+  free(dest);
+  return nullptr;
+}
+
+bool Is7bitNonAsciiString(const char* input, uint32_t len) {
+  int32_t c;
+
+  enum {
+    hz_initial,    
+    hz_escaped,    
+    hz_seen,       
+    hz_notpresent  
+  } hz_state;
+
+  hz_state = hz_initial;
+  while (len) {
+    c = uint8_t(*input++);
+    len--;
+    if (c & 0x80) return false;
+    if (c == 0x1B) return true;
+    if (c == '~') {
+      switch (hz_state) {
+        case hz_initial:
+        case hz_seen:
+          if (*input == '{') {
+            hz_state = hz_escaped;
+          } else if (*input == '~') {
+            hz_state = hz_seen;
+            input++;
+            len--;
+          } else {
+            hz_state = hz_notpresent;
+          }
+          break;
+
+        case hz_escaped:
+          if (*input == '}') hz_state = hz_seen;
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  return hz_state == hz_seen;
+}
+
+#define REPLACEMENT_CHAR "\357\277\275"  // EF BF BD (UTF-8 encoding of U+FFFD)
+
+void CopyRawHeader(const char* aInput, uint32_t aLen,
+                   const nsACString& aDefaultCharset, nsACString& aOutput) {
+  int32_t c;
+
+  if (aDefaultCharset.IsEmpty()) {
+    aOutput.Append(aInput, aLen);
+    return;
+  }
+
+  while (aLen && (c = uint8_t(*aInput++)) != 0x1B && c != '~' && !(c & 0x80)) {
+    aOutput.Append(char(c));
+    aLen--;
+  }
+  if (!aLen) {
+    return;
+  }
+  aInput--;
+
+  bool skipCheck =
+      (c == 0x1B || c == '~') &&
+      IS_7BIT_NON_ASCII_CHARSET(PromiseFlatCString(aDefaultCharset).get());
+
+  nsAutoCString utf8Text;
+  if (NS_SUCCEEDED(ConvertStringToUTF8(Substring(aInput, aInput + aLen),
+                                       PromiseFlatCString(aDefaultCharset),
+                                       skipCheck, true, utf8Text))) {
+    aOutput.Append(utf8Text);
+  } else {  
+    for (uint32_t i = 0; i < aLen; i++) {
+      c = uint8_t(*aInput++);
+      if (c & 0x80) {
+        aOutput.Append(REPLACEMENT_CHAR);
+      } else {
+        aOutput.Append(char(c));
+      }
+    }
+  }
+}
+
+nsresult DecodeQOrBase64Str(const char* aEncoded, size_t aLen, char aQOrBase64,
+                            const nsACString& aCharset, nsACString& aResult) {
+  char* decodedText;
+  bool b64alloc = false;
+  NS_ASSERTION(aQOrBase64 == 'Q' || aQOrBase64 == 'B', "Should be 'Q' or 'B'");
+  if (aQOrBase64 == 'Q') {
+    decodedText = DecodeQ(aEncoded, aLen);
+  } else if (aQOrBase64 == 'B') {
+    decodedText = PL_Base64Decode(aEncoded, aLen, nullptr);
+    b64alloc = true;
+  } else {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (!decodedText) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  nsAutoCString utf8Text;
+  nsresult rv = ConvertStringToUTF8(
+      nsDependentCString(decodedText), aCharset,
+      IS_7BIT_NON_ASCII_CHARSET(PromiseFlatCString(aCharset).get()), true,
+      utf8Text);
+  if (b64alloc) {
+    PR_Free(decodedText);
+  } else {
+    free(decodedText);
+  }
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  aResult.Append(utf8Text);
+
+  return NS_OK;
+}
+
+static const char especials[] = R"(()<>@,;:\"/[]?.=)";
+
+nsresult DecodeRFC2047Str(const char* aHeader,
+                          const nsACString& aDefaultCharset,
+                          bool aOverrideCharset, nsACString& aResult) {
+  const char *p, *q = nullptr, *r;
+  const char* begin;  
+  int32_t isLastEncodedWord = 0;
+  const char *charsetStart, *charsetEnd;
+  nsAutoCString prevCharset, curCharset;
+  nsAutoCString encodedText;
+  char prevEncoding = '\0', curEncoding;
+  nsresult rv;
+
+  begin = aHeader;
+
+  aResult.SetCapacity(3 * strlen(aHeader));
+
+  while ((p = strstr(begin, "=?")) != nullptr) {
+    if (isLastEncodedWord) {
+      for (q = begin; q < p; ++q) {
+        if (!strchr(" \t\r\n", *q)) {
+          break;
+        }
+      }
+    }
+
+    if (!isLastEncodedWord || q < p) {
+      if (!encodedText.IsEmpty()) {
+        rv = DecodeQOrBase64Str(encodedText.get(), encodedText.Length(),
+                                prevEncoding, prevCharset, aResult);
+        if (NS_FAILED(rv)) {
+          aResult.Append(encodedText);
+        }
+        encodedText.Truncate();
+        prevCharset.Truncate();
+        prevEncoding = '\0';
+      }
+      CopyRawHeader(begin, p - begin, aDefaultCharset, aResult);
+      begin = p;
+    }
+
+    p += 2;
+
+    charsetStart = p;
+    charsetEnd = nullptr;
+    for (q = p; *q != '?'; q++) {
+      if (*q <= ' ' || strchr(especials, *q)) {
+        goto badsyntax;
+      }
+
+      if (!charsetEnd && *q == '*') {
+        charsetEnd = q;
+      }
+    }
+    if (!charsetEnd) {
+      charsetEnd = q;
+    }
+
+    q++;
+    curEncoding = nsCRT::ToUpper(*q);
+    if (curEncoding != 'Q' && curEncoding != 'B') goto badsyntax;
+
+    if (q[1] != '?') goto badsyntax;
+
+    for (r = q + 2; *r != '?' || r[1] != '='; r++) {
+      if (*r < ' ') goto badsyntax;
+    }
+    if (r == q + 2) {
+      begin = r + 2;
+      isLastEncodedWord = 1;
+      continue;
+    }
+
+    curCharset.Assign(charsetStart, charsetEnd - charsetStart);
+    if ((aOverrideCharset &&
+         0 != nsCRT::strcasecmp(curCharset.get(), "UTF-8")) ||
+        (!aDefaultCharset.IsEmpty() &&
+         0 == nsCRT::strcasecmp(curCharset.get(), "UNKNOWN-8BIT"))) {
+      curCharset = aDefaultCharset;
+    }
+
+    const char* R;
+    R = r;
+    if (curEncoding == 'B') {
+      int32_t n = r - (q + 2);
+      R -= (n % 4 == 1 && !strncmp(r - 3, "===", 3)) ? 1 : 0;
+    }
+    if (R[-1] != '=' &&
+        (prevCharset.IsEmpty() ||
+         (curCharset == prevCharset && curEncoding == prevEncoding))) {
+      encodedText.Append(q + 2, R - (q + 2));
+      prevCharset = curCharset;
+      prevEncoding = curEncoding;
+
+      begin = r + 2;
+      isLastEncodedWord = 1;
+      continue;
+    }
+
+    bool bDecoded;  
+    bDecoded = false;
+    if (!encodedText.IsEmpty()) {
+      if (curCharset == prevCharset && curEncoding == prevEncoding) {
+        encodedText.Append(q + 2, R - (q + 2));
+        bDecoded = true;
+      }
+      rv = DecodeQOrBase64Str(encodedText.get(), encodedText.Length(),
+                              prevEncoding, prevCharset, aResult);
+      if (NS_FAILED(rv)) {
+        aResult.Append(encodedText);
+      }
+      encodedText.Truncate();
+      prevCharset.Truncate();
+      prevEncoding = '\0';
+    }
+    if (!bDecoded) {
+      rv = DecodeQOrBase64Str(q + 2, R - (q + 2), curEncoding, curCharset,
+                              aResult);
+      if (NS_FAILED(rv)) {
+        aResult.Append(encodedText);
+      }
+    }
+
+    begin = r + 2;
+    isLastEncodedWord = 1;
+    continue;
+
+  badsyntax:
+    if (!encodedText.IsEmpty()) {
+      rv = DecodeQOrBase64Str(encodedText.get(), encodedText.Length(),
+                              prevEncoding, prevCharset, aResult);
+      if (NS_FAILED(rv)) {
+        aResult.Append(encodedText);
+      }
+      encodedText.Truncate();
+      prevCharset.Truncate();
+    }
+    aResult.Append(begin, p - begin);
+    begin = p;
+    isLastEncodedWord = 0;
+  }
+
+  if (!encodedText.IsEmpty()) {
+    rv = DecodeQOrBase64Str(encodedText.get(), encodedText.Length(),
+                            prevEncoding, prevCharset, aResult);
+    if (NS_FAILED(rv)) {
+      aResult.Append(encodedText);
+    }
+  }
+
+  CopyRawHeader(begin, strlen(begin), aDefaultCharset, aResult);
+
+  nsAutoCString tempStr(aResult);
+  tempStr.ReplaceChar('\t', ' ');
+  aResult = tempStr;
+
+  return NS_OK;
+}

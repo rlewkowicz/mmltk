@@ -1,0 +1,360 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_WEBRENDERSCROLLDATAWRAPPER_H
+#define GFX_WEBRENDERSCROLLDATAWRAPPER_H
+
+#include "FrameMetrics.h"
+#include "mozilla/layers/APZUpdater.h"
+#include "mozilla/layers/CompositorBridgeParent.h"
+#include "mozilla/layers/WebRenderBridgeParent.h"
+#include "mozilla/layers/WebRenderScrollData.h"
+
+namespace mozilla {
+namespace layers {
+
+class MOZ_STACK_CLASS WebRenderScrollDataWrapper final {
+ public:
+  explicit WebRenderScrollDataWrapper(
+      const APZUpdater& aUpdater, const WebRenderScrollData* aData = nullptr)
+      : mUpdater(&aUpdater),
+        mData(aData),
+        mLayerIndex(0),
+        mContainingSubtreeLastIndex(0),
+        mLayer(nullptr),
+        mMetadataIndex(0) {
+    if (!mData) {
+      return;
+    }
+    mLayer = mData->GetLayerData(mLayerIndex);
+    if (!mLayer) {
+      return;
+    }
+
+    MOZ_ASSERT(mData->GetLayerCount() ==
+               (size_t)(1 + mLayer->GetDescendantCount()));
+    mContainingSubtreeLastIndex = mData->GetLayerCount();
+
+    mMetadataIndex = mLayer->GetScrollMetadataCount();
+    if (mMetadataIndex > 0) {
+      mMetadataIndex--;
+    }
+  }
+
+ private:
+  WebRenderScrollDataWrapper(const APZUpdater* aUpdater,
+                             const WebRenderScrollData* aData,
+                             size_t aLayerIndex,
+                             size_t aContainingSubtreeLastIndex)
+      : mUpdater(aUpdater),
+        mData(aData),
+        mLayerIndex(aLayerIndex),
+        mContainingSubtreeLastIndex(aContainingSubtreeLastIndex),
+        mLayer(nullptr),
+        mMetadataIndex(0) {
+    MOZ_ASSERT(mData);
+    mLayer = mData->GetLayerData(mLayerIndex);
+    MOZ_ASSERT(mLayer);
+
+    mMetadataIndex = mLayer->GetScrollMetadataCount();
+    if (mMetadataIndex > 0) {
+      mMetadataIndex--;
+    }
+  }
+
+  WebRenderScrollDataWrapper(const APZUpdater* aUpdater,
+                             const WebRenderScrollData* aData,
+                             size_t aLayerIndex,
+                             size_t aContainingSubtreeLastIndex,
+                             const WebRenderLayerScrollData* aLayer,
+                             uint32_t aMetadataIndex)
+      : mUpdater(aUpdater),
+        mData(aData),
+        mLayerIndex(aLayerIndex),
+        mContainingSubtreeLastIndex(aContainingSubtreeLastIndex),
+        mLayer(aLayer),
+        mMetadataIndex(aMetadataIndex) {
+    MOZ_ASSERT(mData);
+    MOZ_ASSERT(mLayer);
+    MOZ_ASSERT(mLayer == mData->GetLayerData(mLayerIndex));
+    MOZ_ASSERT(mMetadataIndex == 0 ||
+               mMetadataIndex < mLayer->GetScrollMetadataCount());
+  }
+
+ public:
+  bool IsValid() const { return mLayer != nullptr; }
+
+  explicit operator bool() const { return IsValid(); }
+
+  WebRenderScrollDataWrapper GetLastChild() const {
+    MOZ_ASSERT(IsValid());
+
+    if (!AtBottomLayer()) {
+      return WebRenderScrollDataWrapper(mUpdater, mData, mLayerIndex,
+                                        mContainingSubtreeLastIndex, mLayer,
+                                        mMetadataIndex - 1);
+    }
+
+
+    if (mLayer->GetDescendantCount() > 0) {
+      size_t prevSiblingIndex = mLayerIndex + 1 + mLayer->GetDescendantCount();
+      MOZ_ASSERT(prevSiblingIndex <= mContainingSubtreeLastIndex);
+      size_t subtreeLastIndex =
+          std::min(mContainingSubtreeLastIndex, prevSiblingIndex);
+      return WebRenderScrollDataWrapper(mUpdater, mData, mLayerIndex + 1,
+                                        subtreeLastIndex);
+    }
+
+    if (mLayer->GetReferentId()) {
+      return WebRenderScrollDataWrapper(
+          *mUpdater, mUpdater->GetScrollData(*mLayer->GetReferentId()));
+    }
+
+    return WebRenderScrollDataWrapper(*mUpdater);
+  }
+
+  WebRenderScrollDataWrapper GetPrevSibling() const {
+    MOZ_ASSERT(IsValid());
+
+    if (!AtTopLayer()) {
+      return WebRenderScrollDataWrapper(*mUpdater);
+    }
+
+    size_t prevSiblingIndex = mLayerIndex + 1 + mLayer->GetDescendantCount();
+    if (prevSiblingIndex < mContainingSubtreeLastIndex) {
+      return WebRenderScrollDataWrapper(mUpdater, mData, prevSiblingIndex,
+                                        mContainingSubtreeLastIndex);
+    }
+    return WebRenderScrollDataWrapper(*mUpdater);
+  }
+
+  const ScrollMetadata& Metadata() const {
+    MOZ_ASSERT(IsValid());
+
+    if (mMetadataIndex >= mLayer->GetScrollMetadataCount()) {
+      return *ScrollMetadata::sNullMetadata;
+    }
+    return mLayer->GetScrollMetadata(*mData, mMetadataIndex);
+  }
+
+  const FrameMetrics& Metrics() const { return Metadata().GetMetrics(); }
+
+  AsyncPanZoomController* GetApzc() const { return nullptr; }
+
+  void SetApzc(AsyncPanZoomController* aApzc) const {}
+
+  const char* Name() const { return "WebRenderScrollDataWrapper"; }
+
+  gfx::Matrix4x4 GetTransform() const {
+    MOZ_ASSERT(IsValid());
+
+
+    gfx::Matrix4x4 transform;
+    bool emitAncestorTransform =
+        !Metrics().IsScrollable() ||
+        Metrics().GetScrollId() == mLayer->GetAncestorTransformId();
+    if (emitAncestorTransform) {
+      transform = mLayer->GetAncestorTransform();
+    }
+    if (AtBottomLayer()) {
+      transform = mLayer->GetTransform() * transform;
+    }
+    return transform;
+  }
+
+  CSSTransformMatrix GetTransformTyped() const {
+    return ViewAs<CSSTransformMatrix>(GetTransform());
+  }
+
+  bool TransformIsPerspective() const {
+    MOZ_ASSERT(IsValid());
+
+    if (AtBottomLayer()) {
+      return mLayer->GetTransformIsPerspective();
+    }
+    return false;
+  }
+
+  LayerIntRect GetVisibleRect() const {
+    MOZ_ASSERT(IsValid());
+
+    if (AtBottomLayer()) {
+      return mLayer->GetVisibleRect();
+    }
+
+    return ViewAs<LayerPixel>(
+        TransformBy(mLayer->GetTransformTyped(), mLayer->GetVisibleRect()),
+        PixelCastJustification::MovingDownToChildren);
+  }
+
+  LayerIntSize GetRemoteDocumentSize() const {
+    MOZ_ASSERT(IsValid());
+
+    if (mLayer->GetReferentId().isNothing()) {
+      return LayerIntSize();
+    }
+
+    if (AtBottomLayer()) {
+      return mLayer->GetRemoteDocumentSize();
+    }
+
+    return ViewAs<LayerPixel>(mLayer->GetRemoteDocumentSize(),
+                              PixelCastJustification::MovingDownToChildren);
+  }
+
+  Maybe<LayersId> GetReferentId() const {
+    MOZ_ASSERT(IsValid());
+
+    if (AtBottomLayer()) {
+      return mLayer->GetReferentId();
+    }
+    return Nothing();
+  }
+
+  EventRegionsOverride GetEventRegionsOverride() const {
+    MOZ_ASSERT(IsValid());
+    if (GetReferentId()) {
+      return mLayer->GetEventRegionsOverride();
+    }
+    return EventRegionsOverride::NoOverride;
+  }
+
+  const ScrollbarData& GetScrollbarData() const {
+    MOZ_ASSERT(IsValid());
+    return mLayer->GetScrollbarData();
+  }
+
+  Maybe<uint64_t> GetScrollbarAnimationId() const {
+    MOZ_ASSERT(IsValid());
+    return mLayer->GetScrollbarAnimationId();
+  }
+
+  Maybe<uint64_t> GetFixedPositionAnimationId() const {
+    MOZ_ASSERT(IsValid());
+
+    if (AtBottomLayer()) {
+      return mLayer->GetFixedPositionAnimationId();
+    }
+    return Nothing();
+  }
+
+  ScrollableLayerGuid::ViewID GetFixedPositionScrollContainerId() const {
+    MOZ_ASSERT(IsValid());
+
+    if (AtBottomLayer()) {
+      return mLayer->GetFixedPositionScrollContainerId();
+    }
+    return ScrollableLayerGuid::NULL_SCROLL_ID;
+  }
+
+  SideBits GetFixedPositionSides() const {
+    MOZ_ASSERT(IsValid());
+
+    if (AtBottomLayer()) {
+      return mLayer->GetFixedPositionSides();
+    }
+    return SideBits::eNone;
+  }
+
+  ScrollableLayerGuid::ViewID GetStickyScrollContainerId() const {
+    MOZ_ASSERT(IsValid());
+
+    if (AtBottomLayer()) {
+      return mLayer->GetStickyPositionScrollContainerId();
+    }
+    return ScrollableLayerGuid::NULL_SCROLL_ID;
+  }
+
+  const LayerRectAbsolute& GetStickyScrollRangeOuter() const {
+    MOZ_ASSERT(IsValid());
+
+    if (AtBottomLayer()) {
+      return mLayer->GetStickyScrollRangeOuter();
+    }
+
+    static const LayerRectAbsolute empty;
+    return empty;
+  }
+
+  const LayerRectAbsolute& GetStickyScrollRangeInner() const {
+    MOZ_ASSERT(IsValid());
+
+    if (AtBottomLayer()) {
+      return mLayer->GetStickyScrollRangeInner();
+    }
+
+    static const LayerRectAbsolute empty;
+    return empty;
+  }
+
+  Maybe<uint64_t> GetStickyPositionAnimationId() const {
+    MOZ_ASSERT(IsValid());
+
+    if (AtBottomLayer()) {
+      return mLayer->GetStickyPositionAnimationId();
+    }
+    return Nothing();
+  }
+
+  Maybe<uint64_t> GetZoomAnimationId() const {
+    MOZ_ASSERT(IsValid());
+    return mLayer->GetZoomAnimationId();
+  }
+
+  Maybe<ScrollableLayerGuid::ViewID> GetAsyncZoomContainerId() const {
+    MOZ_ASSERT(IsValid());
+    return mLayer->GetAsyncZoomContainerId();
+  }
+
+  const void* GetLayer() const {
+    MOZ_ASSERT(IsValid());
+    return mLayer;
+  }
+
+  template <int Level>
+  size_t Dump(gfx::TreeLog<Level>& aOut) const {
+    std::string result = "(invalid)";
+    if (!IsValid()) {
+      aOut << result;
+      return result.length();
+    }
+    if (AtBottomLayer()) {
+      if (mData != nullptr) {
+        const WebRenderLayerScrollData* layerData =
+            mData->GetLayerData(mLayerIndex);
+        if (layerData != nullptr) {
+          std::stringstream ss;
+          layerData->Dump(ss, *mData);
+          result = ss.str();
+          aOut << result;
+          return result.length();
+        }
+      }
+    }
+    return 0;
+  }
+
+  bool IsFirstPaint() const { return mData ? mData->IsFirstPaint() : false; }
+
+ private:
+  bool AtBottomLayer() const { return mMetadataIndex == 0; }
+
+  bool AtTopLayer() const {
+    return mLayer->GetScrollMetadataCount() == 0 ||
+           mMetadataIndex == mLayer->GetScrollMetadataCount() - 1;
+  }
+
+ private:
+  const APZUpdater* mUpdater;
+  const WebRenderScrollData* mData;
+  size_t mLayerIndex;
+  size_t mContainingSubtreeLastIndex;
+  const WebRenderLayerScrollData* mLayer;
+  uint32_t mMetadataIndex;
+};
+
+}  
+}  
+
+#endif /* GFX_WEBRENDERSCROLLDATAWRAPPER_H */

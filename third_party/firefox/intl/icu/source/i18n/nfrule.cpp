@@ -1,0 +1,1117 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+*   Copyright (C) 1997-2015, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+******************************************************************************
+*   file name:  nfrule.cpp
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+* Modification history
+* Date        Name      Comments
+* 10/11/2001  Doug      Ported from ICU4J
+*/
+
+#include "nfrule.h"
+
+#if U_HAVE_RBNF
+
+#include "unicode/localpointer.h"
+#include "unicode/rbnf.h"
+#include "unicode/tblcoll.h"
+#include "unicode/plurfmt.h"
+#include "unicode/upluralrules.h"
+#include "unicode/coleitr.h"
+#include "unicode/uchar.h"
+#include "nfrs.h"
+#include "nfrlist.h"
+#include "nfsubs.h"
+#include "patternprops.h"
+#include "putilimp.h"
+
+U_NAMESPACE_BEGIN
+
+NFRule::NFRule(const RuleBasedNumberFormat* _rbnf, const UnicodeString &_ruleText, UErrorCode &status)
+  : baseValue(static_cast<int32_t>(0))
+  , radix(10)
+  , exponent(0)
+  , decimalPoint(0)
+  , fRuleText(_ruleText)
+  , sub1(nullptr)
+  , sub2(nullptr)
+  , formatter(_rbnf)
+  , rulePatternFormat(nullptr)
+{
+    if (!fRuleText.isEmpty()) {
+        parseRuleDescriptor(fRuleText, status);
+    }
+}
+
+NFRule::~NFRule()
+{
+    if (sub1 != sub2) {
+        delete sub2;
+        sub2 = nullptr;
+    }
+    delete sub1;
+    sub1 = nullptr;
+    delete rulePatternFormat;
+    rulePatternFormat = nullptr;
+}
+
+static const char16_t gLeftBracket = 0x005b;
+static const char16_t gRightBracket = 0x005d;
+static const char16_t gVerticalLine = 0x007C;
+static const char16_t gColon = 0x003a;
+static const char16_t gZero = 0x0030;
+static const char16_t gNine = 0x0039;
+static const char16_t gSpace = 0x0020;
+static const char16_t gSlash = 0x002f;
+static const char16_t gGreaterThan = 0x003e;
+static const char16_t gLessThan = 0x003c;
+static const char16_t gComma = 0x002c;
+static const char16_t gDot = 0x002e;
+static const char16_t gTick = 0x0027;
+static const char16_t gSemicolon = 0x003b;
+static const char16_t gX = 0x0078;
+
+static const char16_t gMinusX[] =                  {0x2D, 0x78, 0};    
+static const char16_t gInf[] =                     {0x49, 0x6E, 0x66, 0}; 
+static const char16_t gNaN[] =                     {0x4E, 0x61, 0x4E, 0}; 
+
+static const char16_t gDollarOpenParenthesis[] =   {0x24, 0x28, 0}; 
+static const char16_t gClosedParenthesisDollar[] = {0x29, 0x24, 0}; 
+
+static const char16_t gLessLess[] =                {0x3C, 0x3C, 0};    
+static const char16_t gLessPercent[] =             {0x3C, 0x25, 0};    
+static const char16_t gLessHash[] =                {0x3C, 0x23, 0};    
+static const char16_t gLessZero[] =                {0x3C, 0x30, 0};    
+static const char16_t gGreaterGreater[] =          {0x3E, 0x3E, 0};    
+static const char16_t gGreaterPercent[] =          {0x3E, 0x25, 0};    
+static const char16_t gGreaterHash[] =             {0x3E, 0x23, 0};    
+static const char16_t gGreaterZero[] =             {0x3E, 0x30, 0};    
+static const char16_t gEqualPercent[] =            {0x3D, 0x25, 0};    
+static const char16_t gEqualHash[] =               {0x3D, 0x23, 0};    
+static const char16_t gEqualZero[] =               {0x3D, 0x30, 0};    
+static const char16_t gGreaterGreaterGreater[] =   {0x3E, 0x3E, 0x3E, 0}; 
+
+static const char16_t * const RULE_PREFIXES[] = {
+    gLessLess, gLessPercent, gLessHash, gLessZero,
+    gGreaterGreater, gGreaterPercent,gGreaterHash, gGreaterZero,
+    gEqualPercent, gEqualHash, gEqualZero, nullptr
+};
+
+void
+NFRule::makeRules(UnicodeString& description,
+                  NFRuleSet *owner,
+                  const NFRule *predecessor,
+                  const RuleBasedNumberFormat *rbnf,
+                  NFRuleList& rules,
+                  UErrorCode& status)
+{
+    if (U_FAILURE(status)) {
+        return;
+    }
+    LocalPointer<NFRule> rule1(new NFRule(rbnf, description, status));
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (rule1.isNull()) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    description = rule1->fRuleText;
+
+    int32_t brack1 = description.indexOf(gLeftBracket);
+    int32_t brack2 = brack1 < 0 ? -1 : description.indexOf(gRightBracket);
+
+    if (brack2 < 0 || brack1 > brack2
+        || rule1->getType() == kProperFractionRule
+        || rule1->getType() == kNegativeNumberRule
+        || rule1->getType() == kInfinityRule
+        || rule1->getType() == kNaNRule)
+    {
+        rule1->extractSubstitutions(owner, description, predecessor, status);
+        if (U_FAILURE(status)) {
+            return;
+        }
+    }
+    else {
+        LocalPointer<NFRule> rule2;
+        UnicodeString sbuf;
+        int32_t orElseOp = description.indexOf(gVerticalLine);
+
+        uint64_t mod = util64_pow(rule1->radix, rule1->exponent);
+        if (rule1->baseValue > 0 && rule1->radix != 0 && mod == 0) {
+            status = U_NUMBER_ARG_OUTOFBOUNDS_ERROR;
+            return;
+        }
+        if ((rule1->baseValue > 0
+            && (rule1->radix != 0) 
+            && (rule1->baseValue % mod == 0))
+            || rule1->getType() == kImproperFractionRule
+            || rule1->getType() == kDefaultRule) {
+
+            rule2.adoptInstead(new NFRule(rbnf, UnicodeString(), status));
+            if (U_FAILURE(status)) {
+                return;
+            }
+            if (rule2.isNull()) {
+                status = U_MEMORY_ALLOCATION_ERROR;
+                return;
+            }
+            if (rule1->baseValue >= 0) {
+                rule2->baseValue = rule1->baseValue;
+                if (!owner->isFractionRuleSet()) {
+                    ++rule1->baseValue;
+                }
+            }
+
+            else if (rule1->getType() == kImproperFractionRule) {
+                rule2->setType(kProperFractionRule);
+            }
+
+            else if (rule1->getType() == kDefaultRule) {
+                rule2->baseValue = rule1->baseValue;
+                rule1->setType(kImproperFractionRule);
+            }
+
+            rule2->radix = rule1->radix;
+            rule2->exponent = rule1->exponent;
+
+            sbuf.append(description, 0, brack1);
+            if (orElseOp >= 0) {
+                sbuf.append(description, orElseOp + 1, brack2 - orElseOp - 1);
+            }
+            if (brack2 + 1 < description.length()) {
+                sbuf.append(description, brack2 + 1, description.length() - brack2 - 1);
+            }
+            rule2->extractSubstitutions(owner, sbuf, predecessor, status);
+            if (U_FAILURE(status)) {
+                return;
+            }
+        }
+
+        sbuf.setTo(description, 0, brack1);
+        if (orElseOp >= 0) {
+            sbuf.append(description, brack1 + 1, orElseOp - brack1 - 1);
+        }
+        else {
+            sbuf.append(description, brack1 + 1, brack2 - brack1 - 1);
+        }
+        if (brack2 + 1 < description.length()) {
+            sbuf.append(description, brack2 + 1, description.length() - brack2 - 1);
+        }
+        rule1->extractSubstitutions(owner, sbuf, predecessor, status);
+        if (U_FAILURE(status)) {
+            return;
+        }
+
+        if (!rule2.isNull()) {
+            if (rule2->baseValue >= kNoBase) {
+                rules.add(rule2.orphan());
+            }
+            else {
+                owner->setNonNumericalRule(rule2.orphan());
+            }
+        }
+    }
+    if (rule1->baseValue >= kNoBase) {
+        rules.add(rule1.orphan());
+    }
+    else {
+        owner->setNonNumericalRule(rule1.orphan());
+    }
+}
+
+void
+NFRule::parseRuleDescriptor(UnicodeString& description, UErrorCode& status)
+{
+    int32_t p = description.indexOf(gColon);
+    if (p != -1) {
+        UnicodeString descriptor;
+        descriptor.setTo(description, 0, p);
+
+        ++p;
+        while (p < description.length() && PatternProps::isWhiteSpace(description.charAt(p))) {
+            ++p;
+        }
+        description.removeBetween(0, p);
+
+        int descriptorLength = descriptor.length();
+        char16_t firstChar = descriptor.charAt(0);
+        char16_t lastChar = descriptor.charAt(descriptorLength - 1);
+        if (firstChar >= gZero && firstChar <= gNine && lastChar != gX) {
+            int64_t val = 0;
+            p = 0;
+            char16_t c = gSpace;
+
+            while (p < descriptorLength) {
+                c = descriptor.charAt(p);
+                if (c >= gZero && c <= gNine) {
+                    int64_t digit = static_cast<int64_t>(c - gZero);
+                    if ((val > 0 && val > (INT64_MAX - digit) / 10) ||
+                        (val < 0 && val < (INT64_MIN - digit) / 10)) {
+                        status = U_PARSE_ERROR;
+                        return;
+                    }
+                    val = val * 10 + digit;
+                }
+                else if (c == gSlash || c == gGreaterThan) {
+                    break;
+                }
+                else if (PatternProps::isWhiteSpace(c) || c == gComma || c == gDot) {
+                }
+                else {
+                    status = U_PARSE_ERROR;
+                    return;
+                }
+                ++p;
+            }
+
+            setBaseValue(val, status);
+
+            if (c == gSlash) {
+                val = 0;
+                ++p;
+                while (p < descriptorLength) {
+                    c = descriptor.charAt(p);
+                    if (c >= gZero && c <= gNine) {
+                        int64_t digit = static_cast<int64_t>(c - gZero);
+                        if ((val > 0 && val > (INT64_MAX - digit) / 10) ||
+                            (val < 0 && val < (INT64_MIN - digit) / 10)) {
+                            status = U_PARSE_ERROR;
+                            return;
+                        }
+                        val = val * 10 + digit;
+                    }
+                    else if (c == gGreaterThan) {
+                        break;
+                    }
+                    else if (PatternProps::isWhiteSpace(c) || c == gComma || c == gDot) {
+                    }
+                    else {
+                        status = U_PARSE_ERROR;
+                        return;
+                    }
+                    ++p;
+                }
+
+                radix = static_cast<int32_t>(val);
+                if (radix == 0) {
+                    status = U_PARSE_ERROR;
+                }
+
+                exponent = expectedExponent();
+            }
+
+            if (c == gGreaterThan) {
+                while (p < descriptor.length()) {
+                    c = descriptor.charAt(p);
+                    if (c == gGreaterThan && exponent > 0) {
+                        --exponent;
+                    } else {
+                        status = U_PARSE_ERROR;
+                        return;
+                    }
+                    ++p;
+                }
+            }
+        }
+        else if (0 == descriptor.compare(gMinusX, 2)) {
+            setType(kNegativeNumberRule);
+        }
+        else if (descriptorLength == 3) {
+            if (firstChar == gZero && lastChar == gX) {
+                setBaseValue(kProperFractionRule, status);
+                decimalPoint = descriptor.charAt(1);
+            }
+            else if (firstChar == gX && lastChar == gX) {
+                setBaseValue(kImproperFractionRule, status);
+                decimalPoint = descriptor.charAt(1);
+            }
+            else if (firstChar == gX && lastChar == gZero) {
+                setBaseValue(kDefaultRule, status);
+                decimalPoint = descriptor.charAt(1);
+            }
+            else if (descriptor.compare(gNaN, 3) == 0) {
+                setBaseValue(kNaNRule, status);
+            }
+            else if (descriptor.compare(gInf, 3) == 0) {
+                setBaseValue(kInfinityRule, status);
+            }
+        }
+    }
+
+    if (!description.isEmpty() && description.charAt(0) == gTick) {
+        description.removeBetween(0, 1);
+    }
+
+}
+
+void
+NFRule::extractSubstitutions(const NFRuleSet* ruleSet,
+                             const UnicodeString &ruleText,
+                             const NFRule* predecessor,
+                             UErrorCode& status)
+{
+    if (U_FAILURE(status)) {
+        return;
+    }
+    fRuleText = ruleText;
+    sub1 = extractSubstitution(ruleSet, predecessor, status);
+    if (sub1 == nullptr) {
+        sub2 = nullptr;
+    }
+    else {
+        sub2 = extractSubstitution(ruleSet, predecessor, status);
+    }
+    int32_t pluralRuleStart = fRuleText.indexOf(gDollarOpenParenthesis, -1, 0);
+    int32_t pluralRuleEnd = (pluralRuleStart >= 0 ? fRuleText.indexOf(gClosedParenthesisDollar, -1, pluralRuleStart) : -1);
+    if (pluralRuleEnd >= 0) {
+        int32_t endType = fRuleText.indexOf(gComma, pluralRuleStart);
+        if (endType < 0) {
+            status = U_PARSE_ERROR;
+            return;
+        }
+        UnicodeString type(fRuleText.tempSubString(pluralRuleStart + 2, endType - pluralRuleStart - 2));
+        UPluralType pluralType;
+        if (type.startsWith(UNICODE_STRING_SIMPLE("cardinal"))) {
+            pluralType = UPLURAL_TYPE_CARDINAL;
+        }
+        else if (type.startsWith(UNICODE_STRING_SIMPLE("ordinal"))) {
+            pluralType = UPLURAL_TYPE_ORDINAL;
+        }
+        else {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return;
+        }
+        rulePatternFormat = formatter->createPluralFormat(pluralType,
+                fRuleText.tempSubString(endType + 1, pluralRuleEnd - endType - 1), status);
+    }
+}
+
+NFSubstitution *
+NFRule::extractSubstitution(const NFRuleSet* ruleSet,
+                            const NFRule* predecessor,
+                            UErrorCode& status)
+{
+    NFSubstitution* result = nullptr;
+
+    int32_t subStart = indexOfAnyRulePrefix();
+    int32_t subEnd = subStart;
+
+    if (subStart == -1) {
+        return nullptr;
+    }
+
+    if (fRuleText.indexOf(gGreaterGreaterGreater, 3, 0) == subStart) {
+        subEnd = subStart + 2;
+
+    } else {
+        char16_t c = fRuleText.charAt(subStart);
+        subEnd = fRuleText.indexOf(c, subStart + 1);
+        if (c == gLessThan && subEnd != -1 && subEnd < fRuleText.length() - 1 && fRuleText.charAt(subEnd+1) == c) {
+            ++subEnd;
+        }
+   }
+
+    if (subEnd == -1) {
+        return nullptr;
+    }
+
+    UnicodeString subToken;
+    subToken.setTo(fRuleText, subStart, subEnd + 1 - subStart);
+    result = NFSubstitution::makeSubstitution(subStart, this, predecessor, ruleSet,
+        this->formatter, subToken, status);
+
+    fRuleText.removeBetween(subStart, subEnd+1);
+
+    return result;
+}
+
+void
+NFRule::setBaseValue(int64_t newBaseValue, UErrorCode& status)
+{
+    baseValue = newBaseValue;
+    radix = 10;
+
+    if (baseValue >= 1) {
+        exponent = expectedExponent();
+
+        if (sub1 != nullptr) {
+            sub1->setDivisor(radix, exponent, status);
+        }
+        if (sub2 != nullptr) {
+            sub2->setDivisor(radix, exponent, status);
+        }
+
+    } else {
+        exponent = 0;
+    }
+}
+
+int16_t
+NFRule::expectedExponent() const
+{
+    if (radix == 0 || baseValue < 1) {
+        return 0;
+    }
+
+    int16_t tempResult = static_cast<int16_t>(uprv_log(static_cast<double>(baseValue)) /
+                                              uprv_log(static_cast<double>(radix)));
+    int64_t temp = util64_pow(radix, tempResult + 1);
+    if (temp <= baseValue) {
+        tempResult += 1;
+    }
+    return tempResult;
+}
+
+int32_t
+NFRule::indexOfAnyRulePrefix() const
+{
+    int result = -1;
+    for (int i = 0; RULE_PREFIXES[i]; i++) {
+        int32_t pos = fRuleText.indexOf(*RULE_PREFIXES[i]);
+        if (pos != -1 && (result == -1 || pos < result)) {
+            result = pos;
+        }
+    }
+    return result;
+}
+
+
+static UBool
+util_equalSubstitutions(const NFSubstitution* sub1, const NFSubstitution* sub2)
+{
+    if (sub1) {
+        if (sub2) {
+            return *sub1 == *sub2;
+        }
+    } else if (!sub2) {
+        return true;
+    }
+    return false;
+}
+
+bool
+NFRule::operator==(const NFRule& rhs) const
+{
+    return baseValue == rhs.baseValue
+        && radix == rhs.radix
+        && exponent == rhs.exponent
+        && fRuleText == rhs.fRuleText
+        && util_equalSubstitutions(sub1, rhs.sub1)
+        && util_equalSubstitutions(sub2, rhs.sub2);
+}
+
+static void util_append64(UnicodeString& result, int64_t n)
+{
+    char16_t buffer[256];
+    int32_t len = util64_tou(n, buffer, sizeof(buffer));
+    UnicodeString temp(buffer, len);
+    result.append(temp);
+}
+
+void
+NFRule::_appendRuleText(UnicodeString& result) const
+{
+    switch (getType()) {
+    case kNegativeNumberRule: result.append(gMinusX, 2); break;
+    case kImproperFractionRule: result.append(gX).append(decimalPoint == 0 ? gDot : decimalPoint).append(gX); break;
+    case kProperFractionRule: result.append(gZero).append(decimalPoint == 0 ? gDot : decimalPoint).append(gX); break;
+    case kDefaultRule: result.append(gX).append(decimalPoint == 0 ? gDot : decimalPoint).append(gZero); break;
+    case kInfinityRule: result.append(gInf, 3); break;
+    case kNaNRule: result.append(gNaN, 3); break;
+    default:
+        util_append64(result, baseValue);
+        if (radix != 10) {
+            result.append(gSlash);
+            util_append64(result, radix);
+        }
+        int numCarets = expectedExponent() - exponent;
+        for (int i = 0; i < numCarets; i++) {
+            result.append(gGreaterThan);
+        }
+        break;
+    }
+    result.append(gColon);
+    result.append(gSpace);
+
+    if (fRuleText.charAt(0) == gSpace && (sub1 == nullptr || sub1->getPos() != 0)) {
+        result.append(gTick);
+    }
+
+    UnicodeString ruleTextCopy;
+    ruleTextCopy.setTo(fRuleText);
+
+    UnicodeString temp;
+    if (sub2 != nullptr) {
+        sub2->toString(temp);
+        ruleTextCopy.insert(sub2->getPos(), temp);
+    }
+    if (sub1 != nullptr) {
+        sub1->toString(temp);
+        ruleTextCopy.insert(sub1->getPos(), temp);
+    }
+
+    result.append(ruleTextCopy);
+
+    result.append(gSemicolon);
+}
+
+int64_t NFRule::getDivisor() const
+{
+    return util64_pow(radix, exponent);
+}
+
+bool NFRule::hasModulusSubstitution() const
+{
+    return (sub1 != nullptr && sub1->isModulusSubstitution()) || (sub2 != nullptr && sub2->isModulusSubstitution());
+}
+
+
+
+void
+NFRule::doFormat(int64_t number, UnicodeString& toInsertInto, int32_t pos, int32_t recursionCount, UErrorCode& status) const
+{
+    int32_t pluralRuleStart = fRuleText.length();
+    int32_t lengthOffset = 0;
+    if (!rulePatternFormat) {
+        toInsertInto.insert(pos, fRuleText);
+    }
+    else {
+        pluralRuleStart = fRuleText.indexOf(gDollarOpenParenthesis, -1, 0);
+        int pluralRuleEnd = fRuleText.indexOf(gClosedParenthesisDollar, -1, pluralRuleStart);
+        int initialLength = toInsertInto.length();
+        if (pluralRuleEnd < fRuleText.length() - 1) {
+            toInsertInto.insert(pos, fRuleText.tempSubString(pluralRuleEnd + 2));
+        }
+        toInsertInto.insert(pos,
+            rulePatternFormat->format(static_cast<int32_t>(number / util64_pow(radix, exponent)), status));
+        if (pluralRuleStart > 0) {
+            toInsertInto.insert(pos, fRuleText.tempSubString(0, pluralRuleStart));
+        }
+        lengthOffset = fRuleText.length() - (toInsertInto.length() - initialLength);
+    }
+
+    if (sub2 != nullptr) {
+        sub2->doSubstitution(number, toInsertInto, pos - (sub2->getPos() > pluralRuleStart ? lengthOffset : 0), recursionCount, status);
+    }
+    if (sub1 != nullptr) {
+        sub1->doSubstitution(number, toInsertInto, pos - (sub1->getPos() > pluralRuleStart ? lengthOffset : 0), recursionCount, status);
+    }
+}
+
+void
+NFRule::doFormat(double number, UnicodeString& toInsertInto, int32_t pos, int32_t recursionCount, UErrorCode& status) const
+{
+    int32_t pluralRuleStart = fRuleText.length();
+    int32_t lengthOffset = 0;
+    if (!rulePatternFormat) {
+        toInsertInto.insert(pos, fRuleText);
+    }
+    else {
+        pluralRuleStart = fRuleText.indexOf(gDollarOpenParenthesis, -1, 0);
+        int pluralRuleEnd = fRuleText.indexOf(gClosedParenthesisDollar, -1, pluralRuleStart);
+        int initialLength = toInsertInto.length();
+        if (pluralRuleEnd < fRuleText.length() - 1) {
+            toInsertInto.insert(pos, fRuleText.tempSubString(pluralRuleEnd + 2));
+        }
+        double pluralVal = number;
+        if (0 <= pluralVal && pluralVal < 1) {
+            pluralVal = uprv_round(pluralVal * util64_pow(radix, exponent));
+        }
+        else {
+            pluralVal = pluralVal / util64_pow(radix, exponent);
+        }
+        toInsertInto.insert(pos, rulePatternFormat->format(static_cast<int32_t>(pluralVal), status));
+        if (pluralRuleStart > 0) {
+            toInsertInto.insert(pos, fRuleText.tempSubString(0, pluralRuleStart));
+        }
+        lengthOffset = fRuleText.length() - (toInsertInto.length() - initialLength);
+    }
+
+    if (sub2 != nullptr) {
+        sub2->doSubstitution(number, toInsertInto, pos - (sub2->getPos() > pluralRuleStart ? lengthOffset : 0), recursionCount, status);
+    }
+    if (sub1 != nullptr) {
+        sub1->doSubstitution(number, toInsertInto, pos - (sub1->getPos() > pluralRuleStart ? lengthOffset : 0), recursionCount, status);
+    }
+}
+
+UBool
+NFRule::shouldRollBack(int64_t number) const
+{
+    if ((sub1 != nullptr && sub1->isModulusSubstitution()) || (sub2 != nullptr && sub2->isModulusSubstitution())) {
+        int64_t re = util64_pow(radix, exponent);
+        return (number % re) == 0 && (baseValue % re) != 0;
+    }
+    return false;
+}
+
+
+#ifdef RBNF_DEBUG
+#include <stdio.h>
+
+static void dumpUS(FILE* f, const UnicodeString& us) {
+  int len = us.length();
+  char* buf = (char *)uprv_malloc((len+1)*sizeof(char)); 
+  if (buf != nullptr) {
+	  us.extract(0, len, buf);
+	  buf[len] = 0;
+	  fprintf(f, "%s", buf);
+	  uprv_free(buf); 
+  }
+}
+#endif
+UBool
+NFRule::doParse(const UnicodeString& text,
+                ParsePosition& parsePosition,
+                UBool isFractionRule,
+                double upperBound,
+                uint32_t nonNumericalExecutedRuleMask,
+                int32_t recursionCount,
+                Formattable& resVal) const
+{
+    ParsePosition pp;
+    UnicodeString workText(text);
+
+    int32_t sub1Pos = sub1 != nullptr ? sub1->getPos() : fRuleText.length();
+    int32_t sub2Pos = sub2 != nullptr ? sub2->getPos() : fRuleText.length();
+
+    UnicodeString prefix;
+    prefix.setTo(fRuleText, 0, sub1Pos);
+
+#ifdef RBNF_DEBUG
+    fprintf(stderr, "doParse %p ", this);
+    {
+        UnicodeString rt;
+        _appendRuleText(rt);
+        dumpUS(stderr, rt);
+    }
+
+    fprintf(stderr, " text: '");
+    dumpUS(stderr, text);
+    fprintf(stderr, "' prefix: '");
+    dumpUS(stderr, prefix);
+#endif
+    stripPrefix(workText, prefix, pp);
+    int32_t prefixLength = text.length() - workText.length();
+
+#ifdef RBNF_DEBUG
+    fprintf(stderr, "' pl: %d ppi: %d s1p: %d\n", prefixLength, pp.getIndex(), sub1Pos);
+#endif
+
+    if (pp.getIndex() == 0 && sub1Pos != 0) {
+        parsePosition.setErrorIndex(pp.getErrorIndex());
+        resVal.setLong(0);
+        return true;
+    }
+    if (baseValue == kInfinityRule) {
+        parsePosition.setIndex(pp.getIndex());
+        resVal.setDouble(uprv_getInfinity());
+        return true;
+    }
+    if (baseValue == kNaNRule) {
+        parsePosition.setIndex(pp.getIndex());
+        resVal.setDouble(uprv_getNaN());
+        return true;
+    }
+
+    int highWaterMark = 0;
+    double result = 0;
+    int start = 0;
+    double tempBaseValue = static_cast<double>(baseValue <= 0 ? 0 : baseValue);
+
+    UnicodeString temp;
+    do {
+        pp.setIndex(0);
+
+        temp.setTo(fRuleText, sub1Pos, sub2Pos - sub1Pos);
+        double partialResult = matchToDelimiter(workText, start, tempBaseValue,
+            temp, pp, sub1,
+            nonNumericalExecutedRuleMask,
+            recursionCount,
+            upperBound);
+
+        if (pp.getIndex() != 0 || sub1 == nullptr) {
+            start = pp.getIndex();
+
+            UnicodeString workText2;
+            workText2.setTo(workText, pp.getIndex(), workText.length() - pp.getIndex());
+            ParsePosition pp2;
+
+            temp.setTo(fRuleText, sub2Pos, fRuleText.length() - sub2Pos);
+            partialResult = matchToDelimiter(workText2, 0, partialResult,
+                temp, pp2, sub2,
+                nonNumericalExecutedRuleMask,
+                recursionCount,
+                upperBound);
+
+            if (pp2.getIndex() != 0 || sub2 == nullptr) {
+                if (prefixLength + pp.getIndex() + pp2.getIndex() > highWaterMark) {
+                    highWaterMark = prefixLength + pp.getIndex() + pp2.getIndex();
+                    result = partialResult;
+                }
+            }
+            else {
+                int32_t i_temp = pp2.getErrorIndex() + sub1Pos + pp.getIndex();
+                if (i_temp> parsePosition.getErrorIndex()) {
+                    parsePosition.setErrorIndex(i_temp);
+                }
+            }
+        }
+        else {
+            int32_t i_temp = sub1Pos + pp.getErrorIndex();
+            if (i_temp > parsePosition.getErrorIndex()) {
+                parsePosition.setErrorIndex(i_temp);
+            }
+        }
+    } while (sub1Pos != sub2Pos
+        && pp.getIndex() > 0
+        && pp.getIndex() < workText.length()
+        && pp.getIndex() != start);
+
+    parsePosition.setIndex(highWaterMark);
+    if (highWaterMark > 0) {
+        parsePosition.setErrorIndex(0);
+    }
+
+    if (isFractionRule && highWaterMark > 0 && sub1 == nullptr) {
+        result = 1 / result;
+    }
+
+    resVal.setDouble(result);
+    return true; 
+}
+
+void
+NFRule::stripPrefix(UnicodeString& text, const UnicodeString& prefix, ParsePosition& pp) const
+{
+    if (prefix.length() != 0) {
+    	UErrorCode status = U_ZERO_ERROR;
+        int32_t pfl = prefixLength(text, prefix, status);
+        if (U_FAILURE(status)) { 
+        	return;
+        }
+        if (pfl != 0) {
+            pp.setIndex(pp.getIndex() + pfl);
+            text.remove(0, pfl);
+        }
+    }
+}
+
+double
+NFRule::matchToDelimiter(const UnicodeString& text,
+                         int32_t startPos,
+                         double _baseValue,
+                         const UnicodeString& delimiter,
+                         ParsePosition& pp,
+                         const NFSubstitution* sub,
+                         uint32_t nonNumericalExecutedRuleMask,
+                         int32_t recursionCount,
+                         double upperBound) const
+{
+	UErrorCode status = U_ZERO_ERROR;
+    if (!allIgnorable(delimiter, status)) {
+    	if (U_FAILURE(status)) { 
+    		return 0;
+    	}
+        ParsePosition tempPP;
+        Formattable result;
+
+        int32_t dLen;
+        int32_t dPos = findText(text, delimiter, startPos, &dLen);
+
+        while (dPos >= 0) {
+            UnicodeString subText;
+            subText.setTo(text, 0, dPos);
+            if (subText.length() > 0) {
+                UBool success = sub->doParse(subText, tempPP, _baseValue, upperBound,
+#if UCONFIG_NO_COLLATION
+                    false,
+#else
+                    formatter->isLenient(),
+#endif
+                    nonNumericalExecutedRuleMask,
+                    recursionCount,
+                    result);
+
+                if (success && tempPP.getIndex() == dPos) {
+                    pp.setIndex(dPos + dLen);
+                    return result.getDouble();
+                }
+                else {
+                    if (tempPP.getErrorIndex() > 0) {
+                        pp.setErrorIndex(tempPP.getErrorIndex());
+                    } else {
+                        pp.setErrorIndex(tempPP.getIndex());
+                    }
+                }
+            }
+
+            tempPP.setIndex(0);
+            dPos = findText(text, delimiter, dPos + dLen, &dLen);
+        }
+        pp.setIndex(0);
+        return 0;
+
+    }
+    else if (sub == nullptr) {
+        return _baseValue;
+    }
+    else {
+        ParsePosition tempPP;
+        Formattable result;
+
+        UBool success = sub->doParse(text, tempPP, _baseValue, upperBound,
+#if UCONFIG_NO_COLLATION
+            false,
+#else
+            formatter->isLenient(),
+#endif
+            nonNumericalExecutedRuleMask,
+            recursionCount,
+            result);
+        if (success && (tempPP.getIndex() != 0)) {
+            pp.setIndex(tempPP.getIndex());
+            return result.getDouble();
+        }
+        else {
+            pp.setErrorIndex(tempPP.getErrorIndex());
+        }
+
+        return 0;
+    }
+}
+
+int32_t
+NFRule::prefixLength(const UnicodeString& str, const UnicodeString& prefix, UErrorCode& status) const
+{
+    if (prefix.length() == 0) {
+        return 0;
+    }
+
+#if !UCONFIG_NO_COLLATION
+    if (formatter->isLenient()) {
+        if (str.startsWith(prefix)) {
+            return prefix.length();
+        }
+        const RuleBasedCollator* collator = formatter->getCollator();
+        if (collator == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return 0;
+        }
+        LocalPointer<CollationElementIterator> strIter(collator->createCollationElementIterator(str));
+        LocalPointer<CollationElementIterator> prefixIter(collator->createCollationElementIterator(prefix));
+        if (strIter.isNull() || prefixIter.isNull()) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return 0;
+        }
+
+        UErrorCode err = U_ZERO_ERROR;
+
+
+        int32_t oStr = strIter->next(err);
+        int32_t oPrefix = prefixIter->next(err);
+
+        while (oPrefix != CollationElementIterator::NULLORDER) {
+            while (CollationElementIterator::primaryOrder(oStr) == 0
+                && oStr != CollationElementIterator::NULLORDER) {
+                oStr = strIter->next(err);
+            }
+
+            while (CollationElementIterator::primaryOrder(oPrefix) == 0
+                && oPrefix != CollationElementIterator::NULLORDER) {
+                oPrefix = prefixIter->next(err);
+            }
+
+
+            if (oPrefix == CollationElementIterator::NULLORDER) {
+                break;
+            }
+
+            if (oStr == CollationElementIterator::NULLORDER) {
+                return 0;
+            }
+
+            if (CollationElementIterator::primaryOrder(oStr)
+                != CollationElementIterator::primaryOrder(oPrefix)) {
+                return 0;
+
+            } else {
+                oStr = strIter->next(err);
+                oPrefix = prefixIter->next(err);
+            }
+        }
+
+        int32_t result = strIter->getOffset();
+        if (oStr != CollationElementIterator::NULLORDER) {
+            --result; 
+        }
+
+#ifdef RBNF_DEBUG
+        fprintf(stderr, "prefix length: %d\n", result);
+#endif
+        return result;
+#if 0
+
+        collator->setStrength(Collator::PRIMARY);
+        if (str.length() >= prefix.length()) {
+            UnicodeString temp;
+            temp.setTo(str, 0, prefix.length());
+            if (collator->equals(temp, prefix)) {
+#ifdef RBNF_DEBUG
+                fprintf(stderr, "returning: %d\n", prefix.length());
+#endif
+                return prefix.length();
+            }
+        }
+
+        int32_t p = 1;
+        while (p <= str.length()) {
+            UnicodeString temp;
+            temp.setTo(str, 0, p);
+            if (collator->equals(temp, prefix)) {
+                return p;
+            } else {
+                ++p;
+            }
+        }
+
+        return 0;
+#endif
+
+  } else
+#endif
+  {
+      if (str.startsWith(prefix)) {
+          return prefix.length();
+      } else {
+          return 0;
+      }
+  }
+}
+
+int32_t
+NFRule::findText(const UnicodeString& str,
+                 const UnicodeString& key,
+                 int32_t startingAt,
+                 int32_t* length) const
+{
+    if (rulePatternFormat) {
+        Formattable result;
+        FieldPosition position(UNUM_INTEGER_FIELD);
+        position.setBeginIndex(startingAt);
+        rulePatternFormat->parseType(str, this, result, position);
+        int start = position.getBeginIndex();
+        if (start >= 0) {
+            int32_t pluralRuleStart = fRuleText.indexOf(gDollarOpenParenthesis, -1, 0);
+            int32_t pluralRuleSuffix = fRuleText.indexOf(gClosedParenthesisDollar, -1, pluralRuleStart) + 2;
+            int32_t matchLen = position.getEndIndex() - start;
+            UnicodeString prefix(fRuleText.tempSubString(0, pluralRuleStart));
+            UnicodeString suffix(fRuleText.tempSubString(pluralRuleSuffix));
+            if (str.compare(start - prefix.length(), prefix.length(), prefix, 0, prefix.length()) == 0
+                    && str.compare(start + matchLen, suffix.length(), suffix, 0, suffix.length()) == 0)
+            {
+                *length = matchLen + prefix.length() + suffix.length();
+                return start - prefix.length();
+            }
+        }
+        *length = 0;
+        return -1;
+    }
+    if (!formatter->isLenient()) {
+        *length = key.length();
+        return str.indexOf(key, startingAt);
+    }
+    else {
+        *length = key.length();
+        int32_t pos = str.indexOf(key, startingAt);
+        if(pos >= 0) {
+            return pos;
+        } else {
+            return findTextLenient(str, key, startingAt, length);
+        }
+    }
+}
+
+int32_t
+NFRule::findTextLenient(const UnicodeString& str,
+                 const UnicodeString& key,
+                 int32_t startingAt,
+                 int32_t* length) const
+{
+
+    int32_t p = startingAt;
+    int32_t keyLen = 0;
+
+    UnicodeString temp;
+    UErrorCode status = U_ZERO_ERROR;
+    while (p < str.length() && keyLen == 0) {
+        temp.setTo(str, p, str.length() - p);
+        keyLen = prefixLength(temp, key, status);
+        if (U_FAILURE(status)) {
+            break;
+        }
+        if (keyLen != 0) {
+            *length = keyLen;
+            return p;
+        }
+        ++p;
+    }
+    *length = 0;
+    return -1;
+}
+
+UBool
+NFRule::allIgnorable(const UnicodeString& str, UErrorCode& status) const
+{
+    if (str.length() == 0) {
+        return true;
+    }
+
+#if !UCONFIG_NO_COLLATION
+    if (formatter->isLenient()) {
+        const RuleBasedCollator* collator = formatter->getCollator();
+        if (collator == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return false;
+        }
+        LocalPointer<CollationElementIterator> iter(collator->createCollationElementIterator(str));
+
+        if (iter.isNull()) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return false;
+        }
+
+        UErrorCode err = U_ZERO_ERROR;
+        int32_t o = iter->next(err);
+        while (o != CollationElementIterator::NULLORDER
+            && CollationElementIterator::primaryOrder(o) == 0) {
+            o = iter->next(err);
+        }
+
+        return o == CollationElementIterator::NULLORDER;
+    }
+#endif
+
+    return false;
+}
+
+void
+NFRule::setDecimalFormatSymbols(const DecimalFormatSymbols& newSymbols, UErrorCode& status) {
+    if (sub1 != nullptr) {
+        sub1->setDecimalFormatSymbols(newSymbols, status);
+    }
+    if (sub2 != nullptr) {
+        sub2->setDecimalFormatSymbols(newSymbols, status);
+    }
+}
+
+U_NAMESPACE_END
+
+#endif

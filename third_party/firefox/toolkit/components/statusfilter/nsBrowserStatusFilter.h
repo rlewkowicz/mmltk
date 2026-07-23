@@ -1,0 +1,73 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsBrowserStatusFilter_h_
+#define nsBrowserStatusFilter_h_
+
+#include "nsIWebProgressListener.h"
+#include "nsIWebProgressListener2.h"
+#include "nsIWebProgress.h"
+#include "nsWeakReference.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsITimer.h"
+#include "nsCOMPtr.h"
+#include "nsString.h"
+
+
+class nsBrowserStatusFilter : public nsIWebProgress,
+                              public nsIWebProgressListener2,
+                              public nsSupportsWeakReference {
+ public:
+  explicit nsBrowserStatusFilter(bool aDisableStateChangeFilters = false);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsBrowserStatusFilter,
+                                           nsIWebProgress)
+  NS_DECL_NSIWEBPROGRESS
+  NS_DECL_NSIWEBPROGRESSLISTENER
+  NS_DECL_NSIWEBPROGRESSLISTENER2
+
+ protected:
+  virtual ~nsBrowserStatusFilter();
+
+ private:
+  nsresult StartDelayTimer();
+  void CallDelayedProgressListeners();
+  void MaybeSendProgress();
+  void MaybeSendStatus();
+  void ResetMembers();
+  bool DelayInEffect() { return mDelayedStatus || mDelayedProgress; }
+
+  static void TimeoutHandler(nsITimer* aTimer, void* aClosure);
+
+ private:
+  nsCOMPtr<nsIWebProgressListener> mListener;
+  nsCOMPtr<nsIEventTarget> mTarget;
+  nsCOMPtr<nsITimer> mTimer;
+
+  nsString mStatusMsg;
+  int64_t mCurProgress;
+  int64_t mMaxProgress;
+
+  nsString mCurrentStatusMsg;
+  int32_t mCurrentPercentage;
+  bool mStatusIsDirty;
+  bool mIsLoadingDocument;
+
+  bool mDelayedStatus;
+  bool mDelayedProgress;
+
+  bool mDisableStateChangeFilters;
+};
+
+#define NS_BROWSERSTATUSFILTER_CONTRACTID \
+  "@mozilla.org/appshell/component/browser-status-filter;1"
+#define NS_BROWSERSTATUSFILTER_CID            \
+  { \
+   0x6356aa16,                                \
+   0x7916,                                    \
+   0x4215,                                    \
+   {0xa8, 0x25, 0xcb, 0xc2, 0x69, 0x2c, 0xa8, 0x7a}}
+
+#endif  // !nsBrowserStatusFilter_h_

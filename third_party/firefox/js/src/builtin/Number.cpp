@@ -1,0 +1,2103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "builtin/Number.h"
+
+#include "mozilla/Casting.h"
+#include "mozilla/FloatingPoint.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/RangedPtr.h"
+#include "mozilla/TextUtils.h"
+#include "mozilla/Utf8.h"
+
+#include <algorithm>
+#include <charconv>
+#include <iterator>
+#include <limits>
+#ifdef HAVE_LOCALECONV
+#  include <locale.h>
+#endif
+#include <math.h>
+#include <string.h>  // memmove
+#include <string_view>
+
+#include "jstypes.h"
+
+#if JS_HAS_INTL_API
+#  include "builtin/intl/GlobalIntlData.h"
+#  include "builtin/intl/NumberFormat.h"
+#endif
+#include "builtin/String.h"
+#include "double-conversion/double-conversion.h"
+#include "frontend/ParserAtom.h"  // frontend::{ParserAtomsTable, TaggedParserAtomIndex}
+#include "jit/InlinableNatives.h"
+#include "js/CharacterEncoding.h"
+#include "js/Conversions.h"
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#include "js/GCAPI.h"
+#if !JS_HAS_INTL_API
+#  include "js/LocaleSensitive.h"
+#endif
+#include "js/PropertyAndElement.h"  // JS_DefineFunctions
+#include "js/PropertySpec.h"
+#include "util/DoubleToString.h"
+#include "util/Memory.h"
+#include "util/StringBuilder.h"
+#include "vm/BigIntType.h"
+#include "vm/GlobalObject.h"
+#include "vm/JSAtomUtils.h"  // Atomize, AtomizeString
+#include "vm/JSContext.h"
+#include "vm/JSObject.h"
+#include "vm/StaticStrings.h"
+
+#include "vm/Compartment-inl.h"  // For js::UnwrapAndTypeCheckThis
+#include "vm/GeckoProfiler-inl.h"
+#include "vm/NativeObject-inl.h"
+#include "vm/NumberObject-inl.h"
+#include "vm/StringType-inl.h"
+
+using namespace js;
+
+using mozilla::Abs;
+using mozilla::AsciiAlphanumericToNumber;
+using mozilla::IsAsciiAlphanumeric;
+using mozilla::IsAsciiDigit;
+using mozilla::MaxNumberValue;
+using mozilla::Maybe;
+using mozilla::MinNumberValue;
+using mozilla::NegativeInfinity;
+using mozilla::NumberEqualsInt32;
+using mozilla::PositiveInfinity;
+using mozilla::RangedPtr;
+using mozilla::Utf8AsUnsignedChars;
+using mozilla::Utf8Unit;
+
+using JS::AutoCheckCannotGC;
+using JS::GenericNaN;
+using JS::ToInt16;
+using JS::ToInt32;
+using JS::ToInt64;
+using JS::ToInt8;
+using JS::ToUint16;
+using JS::ToUint32;
+using JS::ToUint64;
+using JS::ToUint8;
+
+static bool EnsureDtoaState(JSContext* cx) {
+  if (!cx->dtoaState) {
+    cx->dtoaState = NewDtoaState();
+    if (!cx->dtoaState) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename CharT>
+static inline void AssertWellPlacedNumericSeparator(const CharT* s,
+                                                    const CharT* start,
+                                                    const CharT* end) {
+  MOZ_ASSERT(start < end, "string is non-empty");
+  MOZ_ASSERT(s > start, "number can't start with a separator");
+  MOZ_ASSERT(s + 1 < end,
+             "final character in a numeric literal can't be a separator");
+  MOZ_ASSERT(*(s + 1) != '_',
+             "separator can't be followed by another separator");
+  MOZ_ASSERT(*(s - 1) != '_',
+             "separator can't be preceded by another separator");
+}
+
+namespace {
+
+template <typename CharT>
+class BinaryDigitReader {
+  const int base;     
+  int digit;          
+  int digitMask;      
+  const CharT* cur;   
+  const CharT* start; 
+  const CharT* end;   
+
+ public:
+  BinaryDigitReader(int base, const CharT* start, const CharT* end)
+      : base(base),
+        digit(0),
+        digitMask(0),
+        cur(start),
+        start(start),
+        end(end) {}
+
+  int nextDigit() {
+    if (digitMask == 0) {
+      if (cur == end) {
+        return -1;
+      }
+
+      int c = *cur++;
+      if (c == '_') {
+        AssertWellPlacedNumericSeparator(cur - 1, start, end);
+        c = *cur++;
+      }
+
+      MOZ_ASSERT(IsAsciiAlphanumeric(c));
+      digit = AsciiAlphanumericToNumber(c);
+      digitMask = base >> 1;
+    }
+
+    int bit = (digit & digitMask) != 0;
+    digitMask >>= 1;
+    return bit;
+  }
+};
+
+} 
+
+template <typename CharT>
+static double ComputeAccurateBinaryBaseInteger(const CharT* start,
+                                               const CharT* end, int base) {
+  BinaryDigitReader<CharT> bdr(base, start, end);
+
+  int bit;
+  do {
+    bit = bdr.nextDigit();
+  } while (bit == 0);
+
+  MOZ_ASSERT(bit == 1);  
+
+  double value = 1.0;
+  for (int j = 52; j > 0; j--) {
+    bit = bdr.nextDigit();
+    if (bit < 0) {
+      return value;
+    }
+    value = value * 2 + bit;
+  }
+
+  int bit2 = bdr.nextDigit();
+  if (bit2 >= 0) {
+    double factor = 2.0;
+    int sticky = 0; 
+    int bit3;
+
+    while ((bit3 = bdr.nextDigit()) >= 0) {
+      sticky |= bit3;
+      factor *= 2;
+    }
+    value += bit2 & (bit | sticky);
+    value *= factor;
+  }
+
+  return value;
+}
+
+template <typename CharT>
+double js::ParseDecimalNumber(const mozilla::Range<const CharT> chars) {
+  MOZ_ASSERT(chars.length() > 0);
+  uint64_t dec = 0;
+  RangedPtr<const CharT> s = chars.begin(), end = chars.end();
+  do {
+    CharT c = *s;
+    MOZ_ASSERT('0' <= c && c <= '9');
+    uint8_t digit = c - '0';
+    uint64_t next = dec * 10 + digit;
+    MOZ_ASSERT(next < DOUBLE_INTEGRAL_PRECISION_LIMIT,
+               "next value won't be an integrally-precise double");
+    dec = next;
+  } while (++s < end);
+  return static_cast<double>(dec);
+}
+
+template double js::ParseDecimalNumber(
+    const mozilla::Range<const Latin1Char> chars);
+
+template double js::ParseDecimalNumber(
+    const mozilla::Range<const char16_t> chars);
+
+template <typename CharT>
+static bool GetPrefixIntegerImpl(const CharT* start, const CharT* end, int base,
+                                 IntegerSeparatorHandling separatorHandling,
+                                 const CharT** endp, double* dp) {
+  MOZ_ASSERT(start <= end);
+  MOZ_ASSERT(2 <= base && base <= 36);
+
+  const CharT* s = start;
+  double d = 0.0;
+  for (; s < end; s++) {
+    CharT c = *s;
+    if (!IsAsciiAlphanumeric(c)) {
+      if (c == '_' &&
+          separatorHandling == IntegerSeparatorHandling::SkipUnderscore) {
+        AssertWellPlacedNumericSeparator(s, start, end);
+        continue;
+      }
+      break;
+    }
+
+    uint8_t digit = AsciiAlphanumericToNumber(c);
+    if (digit >= base) {
+      break;
+    }
+
+    d = d * base + digit;
+  }
+
+  *endp = s;
+  *dp = d;
+
+  if (d < DOUBLE_INTEGRAL_PRECISION_LIMIT) {
+    return true;
+  }
+
+  if (base == 10) {
+    return false;
+  }
+
+  if ((base & (base - 1)) == 0) {
+    *dp = ComputeAccurateBinaryBaseInteger(start, s, base);
+  }
+
+  return true;
+}
+
+template <typename CharT>
+bool js::GetPrefixInteger(const CharT* start, const CharT* end, int base,
+                          IntegerSeparatorHandling separatorHandling,
+                          const CharT** endp, double* dp) {
+  if (GetPrefixIntegerImpl(start, end, base, separatorHandling, endp, dp)) {
+    return true;
+  }
+
+  MOZ_ASSERT(base == 10);
+
+  return GetDecimal(start, *endp, dp);
+}
+
+namespace js {
+
+template bool GetPrefixInteger(const char16_t* start, const char16_t* end,
+                               int base,
+                               IntegerSeparatorHandling separatorHandling,
+                               const char16_t** endp, double* dp);
+
+template bool GetPrefixInteger(const Latin1Char* start, const Latin1Char* end,
+                               int base,
+                               IntegerSeparatorHandling separatorHandling,
+                               const Latin1Char** endp, double* dp);
+
+}  
+
+template <typename CharT>
+bool js::GetDecimalInteger(const CharT* start, const CharT* end, double* dp) {
+  MOZ_ASSERT(start <= end);
+
+  double d = 0.0;
+  for (const CharT* s = start; s < end; s++) {
+    CharT c = *s;
+    if (c == '_') {
+      AssertWellPlacedNumericSeparator(s, start, end);
+      continue;
+    }
+    MOZ_ASSERT(IsAsciiDigit(c));
+    int digit = c - '0';
+    d = d * 10 + digit;
+  }
+
+  if (d < DOUBLE_INTEGRAL_PRECISION_LIMIT) {
+    *dp = d;
+    return true;
+  }
+
+  return GetDecimal(start, end, dp);
+}
+
+namespace js {
+
+template bool GetDecimalInteger(const char16_t* start, const char16_t* end,
+                                double* dp);
+
+template bool GetDecimalInteger(const Latin1Char* start, const Latin1Char* end,
+                                double* dp);
+
+template <>
+bool GetDecimalInteger<Utf8Unit>(const Utf8Unit* start, const Utf8Unit* end,
+                                 double* dp) {
+  return GetDecimalInteger(Utf8AsUnsignedChars(start), Utf8AsUnsignedChars(end),
+                           dp);
+}
+
+}  
+
+template <typename CharT>
+bool js::GetDecimal(const CharT* start, const CharT* end, double* dp) {
+  MOZ_ASSERT(start <= end);
+
+  size_t length = end - start;
+
+  auto convert = [](auto* chars, size_t length) -> double {
+    using SToDConverter = double_conversion::StringToDoubleConverter;
+    SToDConverter converter( 0,  0.0,
+                             0.0,
+                             nullptr,
+                             nullptr);
+    int lengthInt = mozilla::AssertedCast<int>(length);
+    int processed = 0;
+    double d = converter.StringToDouble(chars, lengthInt, &processed);
+    MOZ_ASSERT(processed >= 0);
+    MOZ_ASSERT(size_t(processed) == length);
+    return d;
+  };
+
+  bool hasUnderscore = std::any_of(start, end, [](auto c) { return c == '_'; });
+  if (!hasUnderscore) {
+    if constexpr (std::is_same_v<CharT, char16_t>) {
+      *dp = convert(reinterpret_cast<const uc16*>(start), length);
+    } else {
+      static_assert(std::is_same_v<CharT, Latin1Char>);
+      *dp = convert(reinterpret_cast<const char*>(start), length);
+    }
+    return true;
+  }
+
+  Vector<char, 32, SystemAllocPolicy> chars;
+  if (!chars.growByUninitialized(length)) {
+    return false;
+  }
+
+  const CharT* s = start;
+  size_t i = 0;
+  for (; s < end; s++) {
+    CharT c = *s;
+    if (c == '_') {
+      AssertWellPlacedNumericSeparator(s, start, end);
+      continue;
+    }
+    MOZ_ASSERT(IsAsciiDigit(c) || c == '.' || c == 'e' || c == 'E' ||
+               c == '+' || c == '-');
+    chars[i++] = char(c);
+  }
+
+  *dp = convert(chars.begin(), i);
+  return true;
+}
+
+namespace js {
+
+template bool GetDecimal(const char16_t* start, const char16_t* end,
+                         double* dp);
+
+template bool GetDecimal(const Latin1Char* start, const Latin1Char* end,
+                         double* dp);
+
+template <>
+bool GetDecimal<Utf8Unit>(const Utf8Unit* start, const Utf8Unit* end,
+                          double* dp) {
+  return GetDecimal(Utf8AsUnsignedChars(start), Utf8AsUnsignedChars(end), dp);
+}
+
+}  
+
+static bool num_parseFloat(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (args.length() == 0) {
+    args.rval().setNaN();
+    return true;
+  }
+
+  if (args[0].isNumber()) {
+    if (args[0].isDouble() && args[0].toDouble() == 0.0) {
+      args.rval().setInt32(0);
+    } else {
+      args.rval().set(args[0]);
+    }
+    return true;
+  }
+
+  JSString* str = ToString<CanGC>(cx, args[0]);
+  if (!str) {
+    return false;
+  }
+
+  if (str->hasIndexValue()) {
+    args.rval().setNumber(str->getIndexValue());
+    return true;
+  }
+
+  JSLinearString* linear = str->ensureLinear(cx);
+  if (!linear) {
+    return false;
+  }
+
+  double d;
+  AutoCheckCannotGC nogc;
+  if (linear->hasLatin1Chars()) {
+    const Latin1Char* begin = linear->latin1Chars(nogc);
+    const Latin1Char* end;
+    d = js_strtod(begin, begin + linear->length(), &end);
+    if (end == begin) {
+      d = GenericNaN();
+    }
+  } else {
+    const char16_t* begin = linear->twoByteChars(nogc);
+    const char16_t* end;
+    d = js_strtod(begin, begin + linear->length(), &end);
+    if (end == begin) {
+      d = GenericNaN();
+    }
+  }
+
+  args.rval().setDouble(d);
+  return true;
+}
+
+template <typename CharT>
+static bool ParseIntImpl(JSContext* cx, const CharT* chars, size_t length,
+                         bool stripPrefix, int32_t radix, double* res) {
+  const CharT* end = chars + length;
+  const CharT* s = SkipSpace(chars, end);
+
+  MOZ_ASSERT(chars <= s);
+  MOZ_ASSERT(s <= end);
+
+  bool negative = (s != end && s[0] == '-');
+
+  if (s != end && (s[0] == '-' || s[0] == '+')) {
+    s++;
+  }
+
+  if (stripPrefix) {
+    if (end - s >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+      s += 2;
+      radix = 16;
+    }
+  }
+
+  const CharT* actualEnd;
+  double d;
+  if (!js::GetPrefixInteger(s, end, radix, IntegerSeparatorHandling::None,
+                            &actualEnd, &d)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  if (s == actualEnd) {
+    *res = GenericNaN();
+  } else {
+    *res = negative ? -d : d;
+  }
+  return true;
+}
+
+bool js::NumberParseInt(JSContext* cx, HandleString str, int32_t radix,
+                        MutableHandleValue result) {
+  bool stripPrefix = true;
+
+  if (radix != 0) {
+    if (radix < 2 || radix > 36) {
+      result.setNaN();
+      return true;
+    }
+
+    if (radix != 16) {
+      stripPrefix = false;
+    }
+  } else {
+    radix = 10;
+  }
+  MOZ_ASSERT(2 <= radix && radix <= 36);
+
+  JSLinearString* linear = str->ensureLinear(cx);
+  if (!linear) {
+    return false;
+  }
+
+  AutoCheckCannotGC nogc;
+  size_t length = linear->length();
+  double number;
+  if (linear->hasLatin1Chars()) {
+    if (!ParseIntImpl(cx, linear->latin1Chars(nogc), length, stripPrefix, radix,
+                      &number)) {
+      return false;
+    }
+  } else {
+    if (!ParseIntImpl(cx, linear->twoByteChars(nogc), length, stripPrefix,
+                      radix, &number)) {
+      return false;
+    }
+  }
+
+  result.setNumber(number);
+  return true;
+}
+
+static bool num_parseInt(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (args.length() == 0) {
+    args.rval().setNaN();
+    return true;
+  }
+
+  if (args.length() == 1 || (args[1].isInt32() && (args[1].toInt32() == 0 ||
+                                                   args[1].toInt32() == 10))) {
+    if (args[0].isInt32()) {
+      args.rval().set(args[0]);
+      return true;
+    }
+
+    if (args[0].isDouble()) {
+      double d = args[0].toDouble();
+      if (DOUBLE_DECIMAL_IN_SHORTEST_LOW <= d &&
+          d < DOUBLE_DECIMAL_IN_SHORTEST_HIGH) {
+        args.rval().setNumber(floor(d));
+        return true;
+      }
+      if (-DOUBLE_DECIMAL_IN_SHORTEST_HIGH < d &&
+          d <= -DOUBLE_DECIMAL_IN_SHORTEST_LOW) {
+        args.rval().setNumber(-floor(-d));
+        return true;
+      }
+      if (d == 0.0) {
+        args.rval().setInt32(0);
+        return true;
+      }
+    }
+
+    if (args[0].isString()) {
+      JSString* str = args[0].toString();
+      if (str->hasIndexValue()) {
+        args.rval().setNumber(str->getIndexValue());
+        return true;
+      }
+    }
+  }
+
+  RootedString inputString(cx, ToString<CanGC>(cx, args[0]));
+  if (!inputString) {
+    return false;
+  }
+
+  int32_t radix = 0;
+  if (args.hasDefined(1)) {
+    if (!ToInt32(cx, args[1], &radix)) {
+      return false;
+    }
+  }
+
+  return NumberParseInt(cx, inputString, radix, args.rval());
+}
+
+static constexpr JSFunctionSpec number_functions[] = {
+    JS_SELF_HOSTED_FN("isNaN", "Global_isNaN", 1, JSPROP_RESOLVING),
+    JS_SELF_HOSTED_FN("isFinite", "Global_isFinite", 1, JSPROP_RESOLVING),
+    JS_FS_END,
+};
+
+const JSClass NumberObject::class_ = {
+    "Number",
+    JSCLASS_HAS_RESERVED_SLOTS(1) | JSCLASS_HAS_CACHED_PROTO(JSProto_Number),
+    JS_NULL_CLASS_OPS,
+    &NumberObject::classSpec_,
+};
+
+static bool Number(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (args.length() > 0) {
+    if (!ToNumeric(cx, args[0])) {
+      return false;
+    }
+    if (args[0].isBigInt()) {
+      args[0].setNumber(BigInt::numberValue(args[0].toBigInt()));
+    }
+    MOZ_ASSERT(args[0].isNumber());
+  }
+
+  if (!args.isConstructing()) {
+    if (args.length() > 0) {
+      args.rval().set(args[0]);
+    } else {
+      args.rval().setInt32(0);
+    }
+    return true;
+  }
+
+  RootedObject proto(cx);
+  if (!GetPrototypeFromBuiltinConstructor(cx, args, JSProto_Number, &proto)) {
+    return false;
+  }
+
+  double d = args.length() > 0 ? args[0].toNumber() : 0;
+  JSObject* obj = NumberObject::create(cx, d, proto);
+  if (!obj) {
+    return false;
+  }
+  args.rval().setObject(*obj);
+  return true;
+}
+
+MOZ_ALWAYS_INLINE
+static bool ThisNumberValue(JSContext* cx, const CallArgs& args,
+                            const char* methodName, double* number) {
+  HandleValue thisv = args.thisv();
+
+  if (thisv.isNumber()) {
+    *number = thisv.toNumber();
+    return true;
+  }
+
+  auto* obj = UnwrapAndTypeCheckThis<NumberObject>(cx, args, methodName);
+  if (!obj) {
+    return false;
+  }
+
+  *number = obj->unbox();
+  return true;
+}
+
+static bool num_toSource(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  double d;
+  if (!ThisNumberValue(cx, args, "toSource", &d)) {
+    return false;
+  }
+
+  JSStringBuilder sb(cx);
+  if (!sb.append("(new Number(") ||
+      !NumberValueToStringBuilder(NumberValue(d), sb) || !sb.append("))")) {
+    return false;
+  }
+
+  JSString* str = sb.finishString();
+  if (!str) {
+    return false;
+  }
+  args.rval().setString(str);
+  return true;
+}
+
+static_assert(
+    double_conversion::DoubleToStringConverter::kMaxCharsEcmaScriptShortest ==
+        DTOSTR_STANDARD_BUFFER_SIZE - 1,
+    "double_conversion and dtoa both agree how large the longest string "
+    "can be");
+
+static_assert(DTOSTR_STANDARD_BUFFER_SIZE <= JS::MaximumNumberToStringLength,
+              "MaximumNumberToStringLength is large enough to hold the longest "
+              "string produced by a conversion");
+
+MOZ_ALWAYS_INLINE
+static JSLinearString* LookupInt32ToString(JSContext* cx, int32_t si) {
+  if (StaticStrings::hasInt(si)) {
+    return cx->staticStrings().getInt(si);
+  }
+  return cx->realm()->dtoaCache.lookup(10, si);
+}
+
+template <AllowGC allowGC>
+JSLinearString* js::Int32ToString(JSContext* cx, int32_t si) {
+  return js::Int32ToStringWithHeap<allowGC>(cx, si, gc::Heap::Default);
+}
+template JSLinearString* js::Int32ToString<CanGC>(JSContext* cx, int32_t si);
+template JSLinearString* js::Int32ToString<NoGC>(JSContext* cx, int32_t si);
+
+template <AllowGC allowGC>
+JSLinearString* js::Int32ToStringWithHeap(JSContext* cx, int32_t si,
+                                          gc::Heap heap) {
+  if (JSLinearString* str = LookupInt32ToString(cx, si)) {
+    return str;
+  }
+
+  char buffer[JSFatInlineString::MAX_LENGTH_LATIN1];
+
+  auto result = std::to_chars(buffer, std::end(buffer), si, 10);
+  MOZ_ASSERT(result.ec == std::errc());
+
+  size_t length = result.ptr - buffer;
+  const auto& latin1Chars =
+      reinterpret_cast<const JS::Latin1Char(&)[std::size(buffer)]>(buffer);
+  JSInlineString* str = NewInlineString<allowGC>(cx, latin1Chars, length, heap);
+  if (!str) {
+    return nullptr;
+  }
+  if (si >= 0) {
+    str->maybeInitializeIndexValue(si);
+  }
+
+  cx->realm()->dtoaCache.cache(10, si, str);
+  return str;
+}
+template JSLinearString* js::Int32ToStringWithHeap<CanGC>(JSContext* cx,
+                                                          int32_t si,
+                                                          gc::Heap heap);
+template JSLinearString* js::Int32ToStringWithHeap<NoGC>(JSContext* cx,
+                                                         int32_t si,
+                                                         gc::Heap heap);
+
+JSLinearString* js::Int32ToStringPure(JSContext* cx, int32_t si) {
+  AutoUnsafeCallWithABI unsafe;
+  return Int32ToString<NoGC>(cx, si);
+}
+
+JSAtom* js::Int32ToAtom(JSContext* cx, int32_t si) {
+  if (JSLinearString* str = LookupInt32ToString(cx, si)) {
+    return js::AtomizeString(cx, str);
+  }
+
+  Int32ToCStringBuf cbuf;
+  auto result = std::to_chars(cbuf.sbuf, std::end(cbuf.sbuf), si, 10);
+  MOZ_ASSERT(result.ec == std::errc());
+
+  Maybe<uint32_t> indexValue;
+  if (si >= 0) {
+    indexValue.emplace(si);
+  }
+
+  size_t length = result.ptr - cbuf.sbuf;
+  JSAtom* atom = Atomize(cx, cbuf.sbuf, length, indexValue);
+  if (!atom) {
+    return nullptr;
+  }
+
+  cx->realm()->dtoaCache.cache(10, si, atom);
+  return atom;
+}
+
+frontend::TaggedParserAtomIndex js::Int32ToParserAtom(
+    FrontendContext* fc, frontend::ParserAtomsTable& parserAtoms, int32_t si) {
+  Int32ToCStringBuf cbuf;
+  auto result = std::to_chars(cbuf.sbuf, std::end(cbuf.sbuf), si, 10);
+  MOZ_ASSERT(result.ec == std::errc());
+
+  size_t length = result.ptr - cbuf.sbuf;
+  return parserAtoms.internAscii(fc, cbuf.sbuf, length);
+}
+
+template <typename T, size_t Base, size_t Length>
+static size_t Int32ToCString(char (&out)[Length], T i) {
+  if constexpr (Base == 10) {
+    static_assert(std::numeric_limits<T>::digits10 + 1 + std::is_signed_v<T> <
+                  Length);
+  } else {
+    static_assert(Base == 16);
+    static_assert(((std::numeric_limits<T>::digits + std::is_signed_v<T>) / 4 +
+                   std::is_signed_v<T>) < Length);
+  }
+
+  auto result = std::to_chars(out, std::end(out) - 1, i, Base);
+  MOZ_ASSERT(result.ec == std::errc());
+
+  *result.ptr = '\0';
+
+  return result.ptr - out;
+}
+
+template <typename T, size_t Base = 10>
+static size_t Int32ToCString(ToCStringBuf* cbuf, T i) {
+  return Int32ToCString<T, Base>(cbuf->sbuf, i);
+}
+
+template <typename T, size_t Base = 10>
+static size_t Int32ToCString(Int32ToCStringBuf* cbuf, T i) {
+  return Int32ToCString<T, Base>(cbuf->sbuf, i);
+}
+
+template <AllowGC allowGC>
+static JSString* NumberToStringWithBase(JSContext* cx, double d, int32_t base);
+
+static bool num_toString(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  double d;
+  if (!ThisNumberValue(cx, args, "toString", &d)) {
+    return false;
+  }
+
+  int32_t base = 10;
+  if (args.hasDefined(0)) {
+    double d2;
+    if (!ToInteger(cx, args[0], &d2)) {
+      return false;
+    }
+
+    if (d2 < 2 || d2 > 36) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_BAD_RADIX);
+      return false;
+    }
+
+    base = int32_t(d2);
+  }
+  JSString* str = NumberToStringWithBase<CanGC>(cx, d, base);
+  if (!str) {
+    return false;
+  }
+  args.rval().setString(str);
+  return true;
+}
+
+static bool num_toLocaleString(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "Number.prototype",
+                                        "toLocaleString");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  double d;
+  if (!ThisNumberValue(cx, args, "toLocaleString", &d)) {
+    return false;
+  }
+
+#if JS_HAS_INTL_API
+  HandleValue locales = args.get(0);
+  HandleValue options = args.get(1);
+
+  Rooted<intl::NumberFormatObject*> numberFormat(
+      cx, intl::GetOrCreateNumberFormat(cx, locales, options));
+  if (!numberFormat) {
+    return false;
+  }
+
+  JSString* str = intl::FormatNumber(cx, numberFormat, d);
+  if (!str) {
+    return false;
+  }
+  args.rval().setString(str);
+  return true;
+#else
+  RootedString str(cx, NumberToStringWithBase<CanGC>(cx, d, 10));
+  if (!str) {
+    return false;
+  }
+
+  UniqueChars numBytes = EncodeAscii(cx, str);
+  if (!numBytes) {
+    return false;
+  }
+  const char* num = numBytes.get();
+  if (!num) {
+    return false;
+  }
+
+  const char* nint = num;
+  if (*nint == '-') {
+    nint++;
+  }
+  while (*nint >= '0' && *nint <= '9') {
+    nint++;
+  }
+  int digits = nint - num;
+  const char* end = num + digits;
+  if (!digits) {
+    args.rval().setString(str);
+    return true;
+  }
+
+  JSRuntime* rt = cx->runtime();
+  size_t thousandsLength = strlen(rt->thousandsSeparator);
+  size_t decimalLength = strlen(rt->decimalSeparator);
+
+  int buflen = strlen(num);
+  if (*nint == '.') {
+    buflen += decimalLength - 1; 
+  }
+
+  const char* numGrouping;
+  const char* tmpGroup;
+  numGrouping = tmpGroup = rt->numGrouping;
+  int remainder = digits;
+  if (*num == '-') {
+    remainder--;
+  }
+
+  while (*tmpGroup != CHAR_MAX && *tmpGroup != '\0') {
+    if (*tmpGroup >= remainder) {
+      break;
+    }
+    buflen += thousandsLength;
+    remainder -= *tmpGroup;
+    tmpGroup++;
+  }
+
+  int nrepeat;
+  if (*tmpGroup == '\0' && *numGrouping != '\0') {
+    nrepeat = (remainder - 1) / tmpGroup[-1];
+    buflen += thousandsLength * nrepeat;
+    remainder -= nrepeat * tmpGroup[-1];
+  } else {
+    nrepeat = 0;
+  }
+  tmpGroup--;
+
+  char* buf = cx->pod_malloc<char>(buflen + 1);
+  if (!buf) {
+    return false;
+  }
+
+  char* tmpDest = buf;
+  const char* tmpSrc = num;
+
+  while (*tmpSrc == '-' || remainder--) {
+    MOZ_ASSERT(tmpDest - buf < buflen);
+    *tmpDest++ = *tmpSrc++;
+  }
+  while (tmpSrc < end) {
+    MOZ_ASSERT(tmpDest - buf + ptrdiff_t(thousandsLength) <= buflen);
+    strcpy(tmpDest, rt->thousandsSeparator);
+    tmpDest += thousandsLength;
+    MOZ_ASSERT(tmpDest - buf + *tmpGroup <= buflen);
+    js_memcpy(tmpDest, tmpSrc, *tmpGroup);
+    tmpDest += *tmpGroup;
+    tmpSrc += *tmpGroup;
+    if (--nrepeat < 0) {
+      tmpGroup--;
+    }
+  }
+
+  if (*nint == '.') {
+    MOZ_ASSERT(tmpDest - buf + ptrdiff_t(decimalLength) <= buflen);
+    strcpy(tmpDest, rt->decimalSeparator);
+    tmpDest += decimalLength;
+    MOZ_ASSERT(tmpDest - buf + ptrdiff_t(strlen(nint + 1)) <= buflen);
+    strcpy(tmpDest, nint + 1);
+  } else {
+    MOZ_ASSERT(tmpDest - buf + ptrdiff_t(strlen(nint)) <= buflen);
+    strcpy(tmpDest, nint);
+  }
+
+  if (cx->runtime()->localeCallbacks &&
+      cx->runtime()->localeCallbacks->localeToUnicode) {
+    Rooted<Value> v(cx, StringValue(str));
+    bool ok = !!cx->runtime()->localeCallbacks->localeToUnicode(cx, buf, &v);
+    if (ok) {
+      args.rval().set(v);
+    }
+    js_free(buf);
+    return ok;
+  }
+
+  str = NewStringCopyN<CanGC>(cx, buf, buflen);
+  js_free(buf);
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+#endif
+}
+
+bool js::num_valueOf(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  double d;
+  if (!ThisNumberValue(cx, args, "valueOf", &d)) {
+    return false;
+  }
+
+  args.rval().setNumber(d);
+  return true;
+}
+
+static const unsigned MAX_PRECISION = 100;
+
+static bool ComputePrecisionInRange(JSContext* cx, int minPrecision,
+                                    int maxPrecision, double prec,
+                                    int* precision) {
+  if (minPrecision <= prec && prec <= maxPrecision) {
+    *precision = int(prec);
+    return true;
+  }
+
+  ToCStringBuf cbuf;
+  char* numStr = NumberToCString(&cbuf, prec);
+  MOZ_ASSERT(numStr);
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_PRECISION_RANGE,
+                            numStr);
+  return false;
+}
+
+static constexpr size_t DoubleToStrResultBufSize = 128;
+
+template <typename Op>
+[[nodiscard]] static bool DoubleToStrResult(JSContext* cx, const CallArgs& args,
+                                            Op op) {
+  char buf[DoubleToStrResultBufSize];
+
+  const auto& converter =
+      double_conversion::DoubleToStringConverter::EcmaScriptConverter();
+  double_conversion::StringBuilder builder(buf, sizeof(buf));
+
+  bool ok = op(converter, builder);
+  MOZ_RELEASE_ASSERT(ok);
+
+  size_t numStrLen = builder.position();
+  const char* numStr = builder.Finalize();
+  MOZ_ASSERT(numStr == buf);
+  MOZ_ASSERT(numStrLen == strlen(numStr));
+
+  JSString* str = NewStringCopyN<CanGC>(cx, numStr, numStrLen);
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+static bool num_toFixed(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "Number.prototype", "toFixed");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  double d;
+  if (!ThisNumberValue(cx, args, "toFixed", &d)) {
+    return false;
+  }
+
+  int precision;
+  if (args.length() == 0) {
+    precision = 0;
+  } else {
+    double prec = 0;
+    if (!ToInteger(cx, args[0], &prec)) {
+      return false;
+    }
+
+    if (!ComputePrecisionInRange(cx, 0, MAX_PRECISION, prec, &precision)) {
+      return false;
+    }
+  }
+
+  if (std::isnan(d)) {
+    args.rval().setString(cx->names().NaN);
+    return true;
+  }
+  if (std::isinf(d)) {
+    if (d > 0) {
+      args.rval().setString(cx->names().Infinity);
+      return true;
+    }
+
+    args.rval().setString(cx->names().NegativeInfinity_);
+    return true;
+  }
+
+  if (d <= -1e21 || d >= 1e+21) {
+    JSString* s = NumberToString<CanGC>(cx, d);
+    if (!s) {
+      return false;
+    }
+
+    args.rval().setString(s);
+    return true;
+  }
+
+
+  static_assert(1 + 21 + 1 + MAX_PRECISION + 1 <= DoubleToStrResultBufSize);
+
+  using DToSConverter = double_conversion::DoubleToStringConverter;
+  static_assert(DToSConverter::kMaxFixedDigitsAfterPoint >= MAX_PRECISION);
+
+  return DoubleToStrResult(cx, args, [&](auto& converter, auto& builder) {
+    return converter.ToFixed(d, precision, &builder);
+  });
+}
+
+static bool num_toExponential(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "Number.prototype",
+                                        "toExponential");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  double d;
+  if (!ThisNumberValue(cx, args, "toExponential", &d)) {
+    return false;
+  }
+
+  double prec = 0;
+  if (args.hasDefined(0)) {
+    if (!ToInteger(cx, args[0], &prec)) {
+      return false;
+    }
+  }
+
+  MOZ_ASSERT_IF(!args.hasDefined(0), prec == 0);
+
+  if (std::isnan(d)) {
+    args.rval().setString(cx->names().NaN);
+    return true;
+  }
+  if (std::isinf(d)) {
+    if (d > 0) {
+      args.rval().setString(cx->names().Infinity);
+      return true;
+    }
+
+    args.rval().setString(cx->names().NegativeInfinity_);
+    return true;
+  }
+
+  int precision = 0;
+  if (!ComputePrecisionInRange(cx, 0, MAX_PRECISION, prec, &precision)) {
+    return false;
+  }
+
+
+  static_assert(MAX_PRECISION + 8 + 1 <= DoubleToStrResultBufSize);
+
+  return DoubleToStrResult(cx, args, [&](auto& converter, auto& builder) {
+    int requestedDigits = args.hasDefined(0) ? precision : -1;
+    return converter.ToExponential(d, requestedDigits, &builder);
+  });
+}
+
+static bool num_toPrecision(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "Number.prototype", "toPrecision");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  double d;
+  if (!ThisNumberValue(cx, args, "toPrecision", &d)) {
+    return false;
+  }
+
+  if (!args.hasDefined(0)) {
+    JSString* str = NumberToStringWithBase<CanGC>(cx, d, 10);
+    if (!str) {
+      return false;
+    }
+    args.rval().setString(str);
+    return true;
+  }
+
+  double prec = 0;
+  if (!ToInteger(cx, args[0], &prec)) {
+    return false;
+  }
+
+  if (std::isnan(d)) {
+    args.rval().setString(cx->names().NaN);
+    return true;
+  }
+  if (std::isinf(d)) {
+    if (d > 0) {
+      args.rval().setString(cx->names().Infinity);
+      return true;
+    }
+
+    args.rval().setString(cx->names().NegativeInfinity_);
+    return true;
+  }
+
+  int precision = 0;
+  if (!ComputePrecisionInRange(cx, 1, MAX_PRECISION, prec, &precision)) {
+    return false;
+  }
+
+
+  static_assert(MAX_PRECISION + 7 + 1 <= DoubleToStrResultBufSize);
+
+  return DoubleToStrResult(cx, args, [&](auto& converter, auto& builder) {
+    return converter.ToPrecision(d, precision, &builder);
+  });
+}
+
+static constexpr JSFunctionSpec number_methods[] = {
+    JS_FN("toSource", num_toSource, 0, 0),
+    JS_INLINABLE_FN("toString", num_toString, 1, 0, NumberToString),
+    JS_FN("toLocaleString", num_toLocaleString, 0, 0),
+    JS_FN("valueOf", num_valueOf, 0, 0),
+    JS_FN("toFixed", num_toFixed, 1, 0),
+    JS_FN("toExponential", num_toExponential, 1, 0),
+    JS_FN("toPrecision", num_toPrecision, 1, 0),
+    JS_FS_END,
+};
+
+bool js::IsInteger(double d) {
+  return std::isfinite(d) && JS::ToInteger(d) == d;
+}
+
+static constexpr JSFunctionSpec number_static_methods[] = {
+    JS_SELF_HOSTED_FN("isFinite", "Number_isFinite", 1, 0),
+    JS_SELF_HOSTED_FN("isInteger", "Number_isInteger", 1, 0),
+    JS_SELF_HOSTED_FN("isNaN", "Number_isNaN", 1, 0),
+    JS_SELF_HOSTED_FN("isSafeInteger", "Number_isSafeInteger", 1, 0),
+    JS_FS_END,
+};
+
+static constexpr JSPropertySpec number_static_properties[] = {
+    JS_DOUBLE_PS("POSITIVE_INFINITY", mozilla::PositiveInfinity<double>(),
+                 JSPROP_READONLY | JSPROP_PERMANENT),
+    JS_DOUBLE_PS("NEGATIVE_INFINITY", mozilla::NegativeInfinity<double>(),
+                 JSPROP_READONLY | JSPROP_PERMANENT),
+    JS_DOUBLE_PS("MAX_VALUE", MaxNumberValue<double>(),
+                 JSPROP_READONLY | JSPROP_PERMANENT),
+    JS_DOUBLE_PS("MIN_VALUE", MinNumberValue<double>(),
+                 JSPROP_READONLY | JSPROP_PERMANENT),
+    JS_DOUBLE_PS("MAX_SAFE_INTEGER", 9007199254740991,
+                 JSPROP_READONLY | JSPROP_PERMANENT),
+    JS_DOUBLE_PS("MIN_SAFE_INTEGER", -9007199254740991,
+                 JSPROP_READONLY | JSPROP_PERMANENT),
+    JS_DOUBLE_PS("EPSILON", 2.2204460492503130808472633361816e-16,
+                 JSPROP_READONLY | JSPROP_PERMANENT),
+    JS_PS_END,
+};
+
+bool js::InitRuntimeNumberState(JSRuntime* rt) {
+#if !JS_HAS_INTL_API
+  const char* thousandsSeparator;
+  const char* decimalPoint;
+  const char* grouping;
+#  ifdef HAVE_LOCALECONV
+  struct lconv* locale = localeconv();
+  thousandsSeparator = locale->thousands_sep;
+  decimalPoint = locale->decimal_point;
+  grouping = locale->grouping;
+#  else
+  thousandsSeparator = getenv("LOCALE_THOUSANDS_SEP");
+  decimalPoint = getenv("LOCALE_DECIMAL_POINT");
+  grouping = getenv("LOCALE_GROUPING");
+#  endif
+  if (!thousandsSeparator) {
+    thousandsSeparator = "'";
+  }
+  if (!decimalPoint) {
+    decimalPoint = ".";
+  }
+  if (!grouping) {
+    grouping = "\3\0";
+  }
+
+  size_t thousandsSeparatorSize = strlen(thousandsSeparator) + 1;
+  size_t decimalPointSize = strlen(decimalPoint) + 1;
+  size_t groupingSize = strlen(grouping) + 1;
+
+  char* storage = js_pod_malloc<char>(thousandsSeparatorSize +
+                                      decimalPointSize + groupingSize);
+  if (!storage) {
+    return false;
+  }
+
+  js_memcpy(storage, thousandsSeparator, thousandsSeparatorSize);
+  rt->thousandsSeparator = storage;
+  storage += thousandsSeparatorSize;
+
+  js_memcpy(storage, decimalPoint, decimalPointSize);
+  rt->decimalSeparator = storage;
+  storage += decimalPointSize;
+
+  js_memcpy(storage, grouping, groupingSize);
+  rt->numGrouping = storage;
+#endif /* !JS_HAS_INTL_API */
+  return true;
+}
+
+void js::FinishRuntimeNumberState(JSRuntime* rt) {
+#if !JS_HAS_INTL_API
+  char* storage = const_cast<char*>(rt->thousandsSeparator.ref());
+  js_free(storage);
+#endif  // !JS_HAS_INTL_API
+}
+
+JSObject* NumberObject::createPrototype(JSContext* cx, JSProtoKey key) {
+  NumberObject* numberProto =
+      GlobalObject::createBlankPrototype<NumberObject>(cx, cx->global());
+  if (!numberProto) {
+    return nullptr;
+  }
+  numberProto->setPrimitiveValue(0);
+  return numberProto;
+}
+
+static bool NumberClassFinish(JSContext* cx, HandleObject ctor,
+                              HandleObject proto) {
+  Handle<GlobalObject*> global = cx->global();
+
+  if (!JS_DefineFunctions(cx, global, number_functions)) {
+    return false;
+  }
+
+  RootedId parseIntId(cx, NameToId(cx->names().parseInt));
+  JSFunction* parseInt =
+      DefineFunction(cx, global, parseIntId, num_parseInt, 2, JSPROP_RESOLVING);
+  if (!parseInt) {
+    return false;
+  }
+  parseInt->setJitInfo(&jit::JitInfo_NumberParseInt);
+
+  RootedValue parseIntValue(cx, ObjectValue(*parseInt));
+  if (!DefineDataProperty(cx, ctor, parseIntId, parseIntValue, 0)) {
+    return false;
+  }
+
+  RootedId parseFloatId(cx, NameToId(cx->names().parseFloat));
+  JSFunction* parseFloat = DefineFunction(cx, global, parseFloatId,
+                                          num_parseFloat, 1, JSPROP_RESOLVING);
+  if (!parseFloat) {
+    return false;
+  }
+  RootedValue parseFloatValue(cx, ObjectValue(*parseFloat));
+  if (!DefineDataProperty(cx, ctor, parseFloatId, parseFloatValue, 0)) {
+    return false;
+  }
+
+  RootedValue valueNaN(cx, JS::NaNValue());
+  RootedValue valueInfinity(cx, JS::InfinityValue());
+
+  if (!DefineDataProperty(
+          cx, ctor, cx->names().NaN, valueNaN,
+          JSPROP_PERMANENT | JSPROP_READONLY | JSPROP_RESOLVING)) {
+    return false;
+  }
+
+  if (!NativeDefineDataProperty(
+          cx, global, cx->names().NaN, valueNaN,
+          JSPROP_PERMANENT | JSPROP_READONLY | JSPROP_RESOLVING) ||
+      !NativeDefineDataProperty(
+          cx, global, cx->names().Infinity, valueInfinity,
+          JSPROP_PERMANENT | JSPROP_READONLY | JSPROP_RESOLVING)) {
+    return false;
+  }
+
+  return true;
+}
+
+const ClassSpec NumberObject::classSpec_ = {
+    GenericCreateConstructor<Number, 1, gc::AllocKind::FUNCTION,
+                             &jit::JitInfo_Number>,
+    NumberObject::createPrototype,
+    number_static_methods,
+    number_static_properties,
+    number_methods,
+    nullptr,
+    NumberClassFinish,
+};
+
+static size_t FracNumberToCString(ToCStringBuf* cbuf, double d) {
+#ifdef DEBUG
+  {
+    int32_t _;
+    MOZ_ASSERT(!NumberEqualsInt32(d, &_));
+  }
+#endif
+
+  const double_conversion::DoubleToStringConverter& converter =
+      double_conversion::DoubleToStringConverter::EcmaScriptConverter();
+  double_conversion::StringBuilder builder(cbuf->sbuf, std::size(cbuf->sbuf));
+  MOZ_ALWAYS_TRUE(converter.ToShortest(d, &builder));
+
+  size_t len = builder.position();
+#ifdef DEBUG
+  char* result =
+#endif
+      builder.Finalize();
+  MOZ_ASSERT(cbuf->sbuf == result);
+  return len;
+}
+
+void JS::NumberToString(double d, char (&out)[MaximumNumberToStringLength]) {
+  int32_t i;
+  if (NumberEqualsInt32(d, &i)) {
+    Int32ToCStringBuf cbuf;
+    size_t len = ::Int32ToCString(&cbuf, i);
+    memmove(out, cbuf.sbuf, len);
+    out[len] = '\0';
+  } else {
+    const double_conversion::DoubleToStringConverter& converter =
+        double_conversion::DoubleToStringConverter::EcmaScriptConverter();
+
+    double_conversion::StringBuilder builder(out, sizeof(out));
+    MOZ_ALWAYS_TRUE(converter.ToShortest(d, &builder));
+
+#ifdef DEBUG
+    char* result =
+#endif
+        builder.Finalize();
+    MOZ_ASSERT(out == result);
+  }
+}
+
+char* js::NumberToCString(ToCStringBuf* cbuf, double d, size_t* length) {
+  int32_t i;
+  size_t len = NumberEqualsInt32(d, &i) ? ::Int32ToCString(cbuf, i)
+                                        : FracNumberToCString(cbuf, d);
+  if (length) {
+    *length = len;
+  }
+  return cbuf->sbuf;
+}
+
+char* js::Int32ToCString(Int32ToCStringBuf* cbuf, int32_t value,
+                         size_t* length) {
+  size_t len = ::Int32ToCString(cbuf, value);
+  if (length) {
+    *length = len;
+  }
+  return cbuf->sbuf;
+}
+
+char* js::Uint32ToCString(Int32ToCStringBuf* cbuf, uint32_t value,
+                          size_t* length) {
+  size_t len = ::Int32ToCString(cbuf, value);
+  if (length) {
+    *length = len;
+  }
+  return cbuf->sbuf;
+}
+
+char* js::Uint32ToHexCString(Int32ToCStringBuf* cbuf, uint32_t value,
+                             size_t* length) {
+  size_t len = ::Int32ToCString<uint32_t, 16>(cbuf, value);
+  if (length) {
+    *length = len;
+  }
+  return cbuf->sbuf;
+}
+
+template <AllowGC allowGC>
+static JSLinearString* Int32ToStringWithBase(JSContext* cx, int32_t i,
+                                             int32_t base) {
+  MOZ_ASSERT(2 <= base && base <= 36);
+
+  bool isBase10Int = (base == 10);
+  if (isBase10Int) {
+    static_assert(StaticStrings::INT_STATIC_LIMIT > 10 * 10);
+    if (StaticStrings::hasInt(i)) {
+      return cx->staticStrings().getInt(i);
+    }
+  } else if (unsigned(i) < unsigned(base)) {
+    if (i < 10) {
+      return cx->staticStrings().getInt(i);
+    }
+    char16_t c = 'a' + i - 10;
+    MOZ_ASSERT(StaticStrings::hasUnit(c));
+    return cx->staticStrings().getUnit(c);
+  } else if (unsigned(i) < unsigned(base * base)) {
+    static constexpr char digits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    char chars[] = {digits[i / base], digits[i % base]};
+    JSLinearString* str = cx->staticStrings().lookup(chars, 2);
+    MOZ_ASSERT(str);
+    return str;
+  }
+
+  auto& dtoaCache = cx->realm()->dtoaCache;
+  double d = i;
+  if (JSLinearString* str = dtoaCache.lookup(base, d)) {
+    return str;
+  }
+
+  constexpr size_t MaximumLength = std::numeric_limits<int32_t>::digits + 2;
+
+  char buf[MaximumLength] = {};
+
+  std::to_chars_result result;
+  switch (base) {
+    case 10: {
+      result = std::to_chars(buf, std::end(buf), i, 10);
+      break;
+    }
+    case 16: {
+      result = std::to_chars(buf, std::end(buf), i, 16);
+      break;
+    }
+    default: {
+      MOZ_ASSERT(base >= 2 && base <= 36);
+      result = std::to_chars(buf, std::end(buf), i, base);
+      break;
+    }
+  }
+  MOZ_ASSERT(result.ec == std::errc());
+
+  size_t length = result.ptr - buf;
+  MOZ_ASSERT(i < 0 || length > 2, "small static strings are handled above");
+
+  auto* latin1Chars = reinterpret_cast<JS::Latin1Char*>(buf);
+  JSLinearString* s = NewStringCopyNDontDeflateNonStaticValidLength<allowGC>(
+      cx, latin1Chars, length);
+  if (!s) {
+    return nullptr;
+  }
+
+  if (isBase10Int && i >= 0) {
+    s->maybeInitializeIndexValue(i);
+  }
+
+  dtoaCache.cache(base, d, s);
+  return s;
+}
+
+template <AllowGC allowGC>
+static JSString* NumberToStringWithBase(JSContext* cx, double d, int32_t base) {
+  MOZ_ASSERT(2 <= base && base <= 36);
+
+  int32_t i;
+  if (NumberEqualsInt32(d, &i)) {
+    return ::Int32ToStringWithBase<allowGC>(cx, i, base);
+  }
+
+  auto& dtoaCache = cx->realm()->dtoaCache;
+  if (JSLinearString* str = dtoaCache.lookup(base, d)) {
+    return str;
+  }
+
+  JSLinearString* s;
+  if (base == 10) {
+    ToCStringBuf cbuf;
+    size_t numStrLen = FracNumberToCString(&cbuf, d);
+    MOZ_ASSERT(numStrLen == strlen(cbuf.sbuf));
+
+    s = NewStringCopyN<allowGC>(cx, cbuf.sbuf, numStrLen);
+    if (!s) {
+      return nullptr;
+    }
+  } else {
+    if (!EnsureDtoaState(cx)) {
+      if constexpr (allowGC) {
+        ReportOutOfMemory(cx);
+      }
+      return nullptr;
+    }
+
+    UniqueChars numStr(js_dtobasestr(cx->dtoaState, base, d));
+    if (!numStr) {
+      if constexpr (allowGC) {
+        ReportOutOfMemory(cx);
+      }
+      return nullptr;
+    }
+
+    s = NewStringCopyZ<allowGC>(cx, numStr.get());
+    if (!s) {
+      return nullptr;
+    }
+  }
+
+  dtoaCache.cache(base, d, s);
+  return s;
+}
+
+template <AllowGC allowGC>
+JSString* js::NumberToString(JSContext* cx, double d) {
+  return NumberToStringWithBase<allowGC>(cx, d, 10);
+}
+
+template JSString* js::NumberToString<CanGC>(JSContext* cx, double d);
+
+template JSString* js::NumberToString<NoGC>(JSContext* cx, double d);
+
+JSString* js::NumberToStringPure(JSContext* cx, double d) {
+  AutoUnsafeCallWithABI unsafe;
+  return NumberToString<NoGC>(cx, d);
+}
+
+JSAtom* js::NumberToAtom(JSContext* cx, double d) {
+  int32_t si;
+  if (NumberEqualsInt32(d, &si)) {
+    return Int32ToAtom(cx, si);
+  }
+
+  auto& dtoaCache = cx->realm()->dtoaCache;
+  if (JSLinearString* str = dtoaCache.lookup(10, d)) {
+    return AtomizeString(cx, str);
+  }
+
+  ToCStringBuf cbuf;
+  size_t length = FracNumberToCString(&cbuf, d);
+  MOZ_ASSERT(length == strlen(cbuf.sbuf));
+
+  JSAtom* atom = Atomize(cx, cbuf.sbuf, length);
+  if (!atom) {
+    return nullptr;
+  }
+
+  dtoaCache.cache(10, d, atom);
+  return atom;
+}
+
+frontend::TaggedParserAtomIndex js::NumberToParserAtom(
+    FrontendContext* fc, frontend::ParserAtomsTable& parserAtoms, double d) {
+  int32_t si;
+  if (NumberEqualsInt32(d, &si)) {
+    return Int32ToParserAtom(fc, parserAtoms, si);
+  }
+
+  ToCStringBuf cbuf;
+  size_t length = FracNumberToCString(&cbuf, d);
+  MOZ_ASSERT(length == strlen(cbuf.sbuf));
+
+  return parserAtoms.internAscii(fc, cbuf.sbuf, length);
+}
+
+JSLinearString* js::IndexToString(JSContext* cx, uint32_t index) {
+  if (StaticStrings::hasUint(index)) {
+    return cx->staticStrings().getUint(index);
+  }
+
+  char buffer[JSFatInlineString::MAX_LENGTH_LATIN1];
+
+  auto result = std::to_chars(buffer, std::end(buffer), index, 10);
+  MOZ_ASSERT(result.ec == std::errc());
+
+  size_t length = result.ptr - buffer;
+  const auto& latin1Chars =
+      reinterpret_cast<const JS::Latin1Char(&)[std::size(buffer)]>(buffer);
+  return NewInlineString<CanGC>(cx, latin1Chars, length);
+}
+
+template <AllowGC allowGC>
+JSLinearString* js::Int32ToStringWithBase(JSContext* cx, int32_t i,
+                                          int32_t base, bool lowerCase) {
+  JSLinearString* str = ::Int32ToStringWithBase<allowGC>(cx, i, base);
+  if (!str) {
+    return nullptr;
+  }
+
+  if constexpr (allowGC == NoGC) {
+    MOZ_ASSERT(lowerCase, "upper case conversion not allowed for NoGC");
+    return str;
+  } else {
+    if (lowerCase) {
+      return str;
+    }
+    return StringToUpperCase(cx, str);
+  }
+}
+template JSLinearString* js::Int32ToStringWithBase<CanGC>(JSContext* cx,
+                                                          int32_t i,
+                                                          int32_t base,
+                                                          bool lowerCase);
+template JSLinearString* js::Int32ToStringWithBase<NoGC>(JSContext* cx,
+                                                         int32_t i,
+                                                         int32_t base,
+                                                         bool lowerCase);
+
+bool js::NumberValueToStringBuilder(const Value& v, StringBuilder& sb) {
+  ToCStringBuf cbuf;
+  const char* cstr;
+  size_t cstrlen;
+  if (v.isInt32()) {
+    cstrlen = ::Int32ToCString(&cbuf, v.toInt32());
+    cstr = cbuf.sbuf;
+  } else {
+    cstr = NumberToCString(&cbuf, v.toDouble(), &cstrlen);
+  }
+  MOZ_ASSERT(cstr);
+  MOZ_ASSERT(cstrlen == strlen(cstr));
+
+  MOZ_ASSERT(cstrlen < std::size(cbuf.sbuf));
+  return sb.append(cstr, cstrlen);
+}
+
+template <typename CharT>
+inline double CharToNumber(CharT c) {
+  if ('0' <= c && c <= '9') {
+    return c - '0';
+  }
+  if (unicode::IsSpace(c)) {
+    return 0.0;
+  }
+  return GenericNaN();
+}
+
+template <typename CharT>
+inline bool CharsToNonDecimalNumber(const CharT* start, const CharT* end,
+                                    double* result) {
+  MOZ_ASSERT(end - start >= 2);
+  MOZ_ASSERT(start[0] == '0');
+
+  int radix = 0;
+  if (start[1] == 'b' || start[1] == 'B') {
+    radix = 2;
+  } else if (start[1] == 'o' || start[1] == 'O') {
+    radix = 8;
+  } else if (start[1] == 'x' || start[1] == 'X') {
+    radix = 16;
+  } else {
+    return false;
+  }
+
+  const CharT* endptr;
+  double d;
+  MOZ_ALWAYS_TRUE(GetPrefixIntegerImpl(
+      start + 2, end, radix, IntegerSeparatorHandling::None, &endptr, &d));
+  if (endptr == start + 2 || SkipSpace(endptr, end) != end) {
+    *result = GenericNaN();
+  } else {
+    *result = d;
+  }
+  return true;
+}
+
+template <typename CharT>
+double js::CharsToNumber(const CharT* chars, size_t length) {
+  if (length == 1) {
+    return CharToNumber(chars[0]);
+  }
+
+  const CharT* end = chars + length;
+  const CharT* start = SkipSpace(chars, end);
+
+  if (end - start >= 2 && start[0] == '0') {
+    double d;
+    if (CharsToNonDecimalNumber(start, end, &d)) {
+      return d;
+    }
+  }
+
+  const CharT* ep;
+  double d = js_strtod(start, end, &ep);
+  if (SkipSpace(ep, end) != end) {
+    return GenericNaN();
+  }
+  return d;
+}
+
+template double js::CharsToNumber(const Latin1Char* chars, size_t length);
+
+template double js::CharsToNumber(const char16_t* chars, size_t length);
+
+template <class StringT>
+static double StringToNumberImpl(const StringT* str) {
+  if (str->hasIndexValue()) {
+    return str->getIndexValue();
+  }
+
+  AutoCheckCannotGC nogc;
+  return str->hasLatin1Chars()
+             ? CharsToNumber(str->latin1Chars(nogc), str->length())
+             : CharsToNumber(str->twoByteChars(nogc), str->length());
+}
+
+double js::LinearStringToNumber(const JSLinearString* str) {
+  return StringToNumberImpl<JSLinearString>(str);
+}
+double js::OffThreadAtomToNumber(const JSOffThreadAtom* str) {
+  return StringToNumberImpl<JSOffThreadAtom>(str);
+}
+
+bool js::StringToNumber(JSContext* cx, JSString* str, double* result) {
+  JSLinearString* linearStr = str->ensureLinear(cx);
+  if (!linearStr) {
+    return false;
+  }
+
+  *result = LinearStringToNumber(linearStr);
+  return true;
+}
+
+bool js::StringToNumberPure(JSContext* cx, JSString* str, double* result) {
+  AutoUnsafeCallWithABI unsafe;
+
+  if (!StringToNumber(cx, str, result)) {
+    cx->recoverFromOutOfMemory();
+    return false;
+  }
+  return true;
+}
+
+JS_PUBLIC_API bool js::ToNumberSlow(JSContext* cx, HandleValue v_,
+                                    double* out) {
+  RootedValue v(cx, v_);
+  MOZ_ASSERT(!v.isNumber());
+
+  if (!v.isPrimitive()) {
+    if (!ToPrimitive(cx, JSTYPE_NUMBER, &v)) {
+      return false;
+    }
+
+    if (v.isNumber()) {
+      *out = v.toNumber();
+      return true;
+    }
+  }
+  if (v.isString()) {
+    return StringToNumber(cx, v.toString(), out);
+  }
+  if (v.isBoolean()) {
+    *out = v.toBoolean() ? 1.0 : 0.0;
+    return true;
+  }
+  if (v.isNull()) {
+    *out = 0.0;
+    return true;
+  }
+  if (v.isUndefined()) {
+    *out = GenericNaN();
+    return true;
+  }
+
+  MOZ_ASSERT(v.isSymbol() || v.isBigInt());
+  unsigned errnum = JSMSG_SYMBOL_TO_NUMBER;
+  if (v.isBigInt()) {
+    errnum = JSMSG_BIGINT_TO_NUMBER;
+  }
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, errnum);
+  return false;
+}
+
+bool js::ToNumericSlow(JSContext* cx, MutableHandleValue vp) {
+  MOZ_ASSERT(!vp.isNumeric());
+
+  if (!vp.isPrimitive()) {
+    if (!ToPrimitive(cx, JSTYPE_NUMBER, vp)) {
+      return false;
+    }
+  }
+
+  if (vp.isBigInt()) {
+    return true;
+  }
+
+  return ToNumber(cx, vp);
+}
+
+JS_PUBLIC_API bool js::ToInt8Slow(JSContext* cx, const HandleValue v,
+                                  int8_t* out) {
+  MOZ_ASSERT(!v.isInt32());
+  double d;
+  if (v.isDouble()) {
+    d = v.toDouble();
+  } else {
+    if (!ToNumberSlow(cx, v, &d)) {
+      return false;
+    }
+  }
+  *out = ToInt8(d);
+  return true;
+}
+
+JS_PUBLIC_API bool js::ToUint8Slow(JSContext* cx, const HandleValue v,
+                                   uint8_t* out) {
+  MOZ_ASSERT(!v.isInt32());
+  double d;
+  if (v.isDouble()) {
+    d = v.toDouble();
+  } else {
+    if (!ToNumberSlow(cx, v, &d)) {
+      return false;
+    }
+  }
+  *out = ToUint8(d);
+  return true;
+}
+
+JS_PUBLIC_API bool js::ToInt16Slow(JSContext* cx, const HandleValue v,
+                                   int16_t* out) {
+  MOZ_ASSERT(!v.isInt32());
+  double d;
+  if (v.isDouble()) {
+    d = v.toDouble();
+  } else {
+    if (!ToNumberSlow(cx, v, &d)) {
+      return false;
+    }
+  }
+  *out = ToInt16(d);
+  return true;
+}
+
+JS_PUBLIC_API bool js::ToInt64Slow(JSContext* cx, const HandleValue v,
+                                   int64_t* out) {
+  MOZ_ASSERT(!v.isInt32());
+  double d;
+  if (v.isDouble()) {
+    d = v.toDouble();
+  } else {
+    if (!ToNumberSlow(cx, v, &d)) {
+      return false;
+    }
+  }
+  *out = ToInt64(d);
+  return true;
+}
+
+JS_PUBLIC_API bool js::ToUint64Slow(JSContext* cx, const HandleValue v,
+                                    uint64_t* out) {
+  MOZ_ASSERT(!v.isInt32());
+  double d;
+  if (v.isDouble()) {
+    d = v.toDouble();
+  } else {
+    if (!ToNumberSlow(cx, v, &d)) {
+      return false;
+    }
+  }
+  *out = ToUint64(d);
+  return true;
+}
+
+JS_PUBLIC_API bool js::ToInt32Slow(JSContext* cx, const HandleValue v,
+                                   int32_t* out) {
+  MOZ_ASSERT(!v.isInt32());
+  double d;
+  if (v.isDouble()) {
+    d = v.toDouble();
+  } else {
+    if (!ToNumberSlow(cx, v, &d)) {
+      return false;
+    }
+  }
+  *out = ToInt32(d);
+  return true;
+}
+
+bool js::ToInt32OrBigIntSlow(JSContext* cx, MutableHandleValue vp) {
+  MOZ_ASSERT(!vp.isInt32());
+  if (vp.isDouble()) {
+    vp.setInt32(ToInt32(vp.toDouble()));
+    return true;
+  }
+
+  if (!ToNumeric(cx, vp)) {
+    return false;
+  }
+
+  if (vp.isBigInt()) {
+    return true;
+  }
+
+  vp.setInt32(ToInt32(vp.toNumber()));
+  return true;
+}
+
+JS_PUBLIC_API bool js::ToUint32Slow(JSContext* cx, const HandleValue v,
+                                    uint32_t* out) {
+  MOZ_ASSERT(!v.isInt32());
+  double d;
+  if (v.isDouble()) {
+    d = v.toDouble();
+  } else {
+    if (!ToNumberSlow(cx, v, &d)) {
+      return false;
+    }
+  }
+  *out = ToUint32(d);
+  return true;
+}
+
+JS_PUBLIC_API bool js::ToUint16Slow(JSContext* cx, const HandleValue v,
+                                    uint16_t* out) {
+  MOZ_ASSERT(!v.isInt32());
+  double d;
+  if (v.isDouble()) {
+    d = v.toDouble();
+  } else if (!ToNumberSlow(cx, v, &d)) {
+    return false;
+  }
+  *out = ToUint16(d);
+  return true;
+}
+
+bool js::ToIndexSlow(JSContext* cx, JS::HandleValue v,
+                     const unsigned errorNumber, uint64_t* index) {
+  MOZ_ASSERT_IF(v.isInt32(), v.toInt32() < 0);
+
+  if (v.isUndefined()) {
+    *index = 0;
+    return true;
+  }
+
+  double integerIndex;
+  if (!ToInteger(cx, v, &integerIndex)) {
+    return false;
+  }
+
+  if (integerIndex < 0 || integerIndex >= DOUBLE_INTEGRAL_PRECISION_LIMIT) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, errorNumber);
+    return false;
+  }
+
+  *index = uint64_t(integerIndex);
+  return true;
+}
+
+template <typename ArrayLength>
+bool js::ToIntegerIndexSlow(JSContext* cx, Handle<Value> value,
+                            ArrayLength length, ArrayLength* result) {
+  MOZ_ASSERT(!value.isInt32());
+
+  double relative;
+  if (!ToInteger(cx, value, &relative)) {
+    return false;
+  }
+
+  if (relative >= 0) {
+    *result = ArrayLength(std::min(relative, double(length)));
+  } else {
+    *result = ArrayLength(std::max(relative + double(length), 0.0));
+  }
+  return true;
+}
+
+struct Dummy {
+  explicit Dummy(double) {}
+  explicit operator double() { return 0; }
+};
+
+
+using Uint64OrDummy =
+    std::conditional_t<!std::is_same_v<uint64_t, size_t>, uint64_t, Dummy>;
+
+template bool js::ToIntegerIndexSlow<size_t>(JSContext*, Handle<Value>, size_t,
+                                             size_t*);
+
+template bool js::ToIntegerIndexSlow<Uint64OrDummy>(JSContext*, Handle<Value>,
+                                                    Uint64OrDummy,
+                                                    Uint64OrDummy*);
+
+template <typename CharT>
+double js_strtod(const CharT* begin, const CharT* end, const CharT** dEnd) {
+  const CharT* s = SkipSpace(begin, end);
+  size_t length = end - s;
+
+  {
+    JS::AutoSuppressGCAnalysis nogc;
+
+    using SToDConverter = double_conversion::StringToDoubleConverter;
+    SToDConverter converter(SToDConverter::ALLOW_TRAILING_JUNK,
+                             0.0,
+                             GenericNaN(),
+                             nullptr,
+                             nullptr);
+    int lengthInt = mozilla::AssertedCast<int>(length);
+    double d;
+    int processed = 0;
+    if constexpr (std::is_same_v<CharT, char16_t>) {
+      d = converter.StringToDouble(reinterpret_cast<const uc16*>(s), lengthInt,
+                                   &processed);
+    } else {
+      static_assert(std::is_same_v<CharT, Latin1Char>);
+      d = converter.StringToDouble(reinterpret_cast<const char*>(s), lengthInt,
+                                   &processed);
+    }
+    MOZ_ASSERT(processed >= 0);
+    MOZ_ASSERT(processed <= lengthInt);
+
+    if (processed > 0) {
+      *dEnd = s + processed;
+      return d;
+    }
+  }
+
+  static constexpr std::string_view Infinity = "Infinity";
+  if (length >= Infinity.length()) {
+    const CharT* afterSign = s;
+    bool negative = (*afterSign == '-');
+    if (negative || *afterSign == '+') {
+      afterSign++;
+    }
+    MOZ_ASSERT(afterSign < end);
+    if (*afterSign == 'I' && size_t(end - afterSign) >= Infinity.length() &&
+        EqualChars(afterSign, Infinity.data(), Infinity.length())) {
+      *dEnd = afterSign + Infinity.length();
+      return negative ? NegativeInfinity<double>() : PositiveInfinity<double>();
+    }
+  }
+
+  *dEnd = begin;
+  return 0.0;
+}
+
+template double js_strtod(const char16_t* begin, const char16_t* end,
+                          const char16_t** dEnd);
+
+template double js_strtod(const Latin1Char* begin, const Latin1Char* end,
+                          const Latin1Char** dEnd);

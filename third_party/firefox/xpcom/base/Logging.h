@@ -1,0 +1,211 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_logging_h
+#define mozilla_logging_h
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Likely.h"
+#include "mozilla/LoggingCore.h"
+
+#include "fmt/format.h"
+
+#define MOZ_LOGGING_ENABLED 1
+
+#define MOZ_LOG_FILE_EXTENSION ".moz_log"
+
+#define MOZ_LOG_PID_TOKEN "%PID"
+
+namespace mozilla {
+
+class TimeStamp;
+
+class LogModule {
+ public:
+  ~LogModule() { ::free(mName); }
+
+  static LogModule* Get(const char* aName);
+
+  static void Init(int argc, char* argv[]);
+
+  static void SetLogFile(const char* aFilename);
+
+  static uint32_t GetLogFile(char* aBuffer, size_t aLength);
+
+  static void SetAddTimestamp(bool aAddTimestamp);
+
+  static void SetIsSync(bool aIsSync);
+
+  static bool GetLogJSStacks();
+
+  bool ShouldLog(LogLevel aLevel) const { return mLevel >= aLevel; }
+
+  LogLevel Level() const { return mLevel; }
+
+  void SetLevel(LogLevel level);
+
+  void Printv(LogLevel aLevel, const char* aFmt, va_list aArgs) const
+      MOZ_FORMAT_PRINTF(3, 0);
+
+  void Printv(LogLevel aLevel, const TimeStamp* aStart, const char* aFmt,
+              va_list aArgs) const MOZ_FORMAT_PRINTF(4, 0);
+
+  void PrintvFmt(LogLevel aLevel, fmt::string_view aFmt,
+                 fmt::format_args aArgs) const;
+
+  const char* Name() const { return mName; }
+
+  AtomicLogLevel& LevelRef() { return mLevel; }
+
+ private:
+  friend class LogModuleManager;
+
+  explicit LogModule(const char* aName, LogLevel aLevel)
+      : mName(strdup(aName)), mLevel(aLevel) {}
+
+  LogModule(LogModule&) = delete;
+  LogModule& operator=(const LogModule&) = delete;
+
+  char* mName;
+
+  AtomicLogLevel mLevel;
+};
+
+class LazyLogModule final {
+ public:
+  explicit constexpr LazyLogModule(const char* aLogName)
+      : mLogName(aLogName), mLog(nullptr) {}
+
+  MOZ_NEVER_INLINE_DEBUG operator LogModule*() {
+    LogModule* tmp = mLog;
+    if (MOZ_UNLIKELY(!tmp)) {
+      tmp = LogModule::Get(mLogName);
+      mLog = tmp;
+    }
+
+    return tmp;
+  }
+
+ private:
+  const char* const mLogName;
+
+  Atomic<LogModule*, ReleaseAcquire> mLog;
+};
+
+namespace detail {
+
+inline bool log_test(const LogModule* module, LogLevel level) {
+  MOZ_ASSERT(level != LogLevel::Disabled);
+  return module && module->ShouldLog(level);
+}
+
+void log_print(const LogModule* aModule, LogLevel aLevel, const char* aFmt, ...)
+    MOZ_FORMAT_PRINTF(3, 4);
+
+template <typename... T>
+inline void log_print_fmt(const LogModule* aModule, LogLevel aLevel,
+                          fmt::format_string<T...> aFmt, T&&... aArgs) {
+  aModule->PrintvFmt(aLevel, aFmt, fmt::make_format_args(aArgs...));
+}
+
+void log_print(const LogModule* aModule, LogLevel aLevel, TimeStamp* aStart,
+               const char* aFmt, ...) MOZ_FORMAT_PRINTF(4, 5);
+}  
+
+}  
+
+#define MOZ_LOG_EXPAND_ARGS(...) __VA_ARGS__
+
+#if MOZ_LOGGING_ENABLED
+#  define MOZ_LOG_TEST(_module, _level) \
+    MOZ_UNLIKELY(mozilla::detail::log_test(_module, _level))
+#else
+#  define MOZ_LOG_TEST(_module, _level) false
+#endif
+
+#if MOZ_LOGGING_ENABLED
+#  define MOZ_LOG(_module, _level, _args)                      \
+    do {                                                       \
+      const ::mozilla::LogModule* moz_real_module = _module;   \
+      if (MOZ_LOG_TEST(moz_real_module, _level)) {             \
+        mozilla::detail::log_print(moz_real_module, _level,    \
+                                   MOZ_LOG_EXPAND_ARGS _args); \
+      }                                                        \
+    } while (0)
+#  define MOZ_LOG_DURATION(_module, _level, start, _args)          \
+    do {                                                           \
+      const ::mozilla::LogModule* moz_real_module = _module;       \
+      if (MOZ_LOG_TEST(moz_real_module, _level)) {                 \
+        mozilla::detail::log_print(moz_real_module, _level, start, \
+                                   MOZ_LOG_EXPAND_ARGS _args);     \
+      }                                                            \
+    } while (0)
+#  define MOZ_LOG_FMT(_module, _level, _fmt, ...)                     \
+    do {                                                              \
+      const ::mozilla::LogModule* moz_real_module = _module;          \
+      if (MOZ_LOG_TEST(moz_real_module, _level)) {                    \
+        mozilla::detail::log_print_fmt(moz_real_module, _level, _fmt, \
+                                       ##__VA_ARGS__);                \
+      }                                                               \
+    } while (0)
+#else
+#  define MOZ_LOG(_module, _level, _args)                      \
+    do {                                                       \
+      if (MOZ_LOG_TEST(_module, _level)) {                     \
+        mozilla::detail::log_print(_module, _level,            \
+                                   MOZ_LOG_EXPAND_ARGS _args); \
+      }                                                        \
+    } while (0)
+#  define MOZ_LOG_DURATION(_module, _level, start, _args)      \
+    do {                                                       \
+      if (MOZ_LOG_TEST(_module, _level)) {                     \
+        mozilla::detail::log_print(_module, _level, start,     \
+                                   MOZ_LOG_EXPAND_ARGS _args); \
+      }                                                        \
+    } while (0)
+#  define MOZ_LOG_FMT(_module, _level, _fmt, ...)                             \
+    do {                                                                      \
+      if (MOZ_LOG_TEST(_module, _level)) {                                    \
+        mozilla::detail::log_print_fmt(_module, _level, _fmt, ##__VA_ARGS__); \
+      }                                                                       \
+    } while (0)
+#endif
+
+#ifdef DEBUG
+#  define MOZ_LOG_DEBUG_ONLY(...) MOZ_LOG(__VA_ARGS__)
+#  define MOZ_LOG_DURATION_DEBUG_ONLY(...) MOZ_LOG_DURATION(__VA_ARGS__)
+#  define MOZ_LOG_FMT_DEBUG_ONLY(...) MOZ_LOG_FMT(__VA_ARGS__)
+#else
+#  define MOZ_LOG_DEBUG_ONLY(...)
+#  define MOZ_LOG_DURATION_DEBUG_ONLY(...)
+#  define MOZ_LOG_FMT_DEBUG_ONLY(...)
+#endif
+
+#undef MOZ_LOGGING_ENABLED
+
+#define MOZ_DEFINE_BOOL_PRETTY_PRINTER(_method_name, _true_str, _false_str) \
+  inline const char* _method_name(bool aBool) {                             \
+    return aBool ? #_true_str : #_false_str;                                \
+  }
+
+namespace mozilla {
+MOZ_DEFINE_BOOL_PRETTY_PRINTER(TrueOrFalse, true, false);
+MOZ_DEFINE_BOOL_PRETTY_PRINTER(YesOrNo, Yes, No);
+MOZ_DEFINE_BOOL_PRETTY_PRINTER(OnOrOff, On, Off);
+MOZ_DEFINE_BOOL_PRETTY_PRINTER(SucceededOrFailed, Succeeded, Failed);
+MOZ_DEFINE_BOOL_PRETTY_PRINTER(OkOrError, OK, Failed);
+MOZ_DEFINE_BOOL_PRETTY_PRINTER(DoneOrIgnored, Done, Ignored);
+MOZ_DEFINE_BOOL_PRETTY_PRINTER(HandledOrIgnored, Handled, Ignored);
+MOZ_DEFINE_BOOL_PRETTY_PRINTER(DoneOrCanceled, Done, Canceled);
+MOZ_DEFINE_BOOL_PRETTY_PRINTER(HandledOrCanceled, Handled, Canceled);
+}  
+
+#endif  // mozilla_logging_h

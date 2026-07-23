@@ -1,0 +1,159 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGPOINTLIST_H_
+#define DOM_SVG_SVGPOINTLIST_H_
+
+#include <string.h>
+
+#include "SVGElement.h"
+#include "mozilla/gfx/Point.h"
+#include "nsCOMPtr.h"
+#include "nsDebug.h"
+#include "nsIContent.h"
+#include "nsINode.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+namespace dom {
+class DOMSVGPoint;
+class DOMSVGPointList;
+}  
+
+class SVGPointList {
+  using Point = gfx::Point;
+  friend class SVGAnimatedPointList;
+  friend class dom::DOMSVGPointList;
+  friend class dom::DOMSVGPoint;
+
+ public:
+  SVGPointList() = default;
+  ~SVGPointList() = default;
+
+  SVGPointList& operator=(const SVGPointList& aOther) {
+    mItems.ClearAndRetainStorage();
+    (void)mItems.AppendElements(aOther.mItems, fallible);
+    return *this;
+  }
+
+  SVGPointList(const SVGPointList& aOther) { *this = aOther; }
+
+
+  void GetValueAsString(nsAString& aValue) const;
+
+  bool IsEmpty() const { return mItems.IsEmpty(); }
+
+  uint32_t Length() const { return mItems.Length(); }
+
+  const Point& operator[](uint32_t aIndex) const { return mItems[aIndex]; }
+
+  [[nodiscard]] FallibleTArray<Point>::const_iterator begin() const {
+    return mItems.begin();
+  }
+  [[nodiscard]] FallibleTArray<Point>::const_iterator end() const {
+    return mItems.end();
+  }
+
+  bool operator==(const SVGPointList& rhs) const {
+    return mItems.Length() == rhs.mItems.Length() &&
+           memcmp(mItems.Elements(), rhs.mItems.Elements(),
+                  mItems.Length() * sizeof(Point)) == 0;
+  }
+
+  bool SetCapacity(uint32_t aSize) {
+    return mItems.SetCapacity(aSize, fallible);
+  }
+
+  void Compact() { mItems.Compact(); }
+
+
+ protected:
+  nsresult CopyFrom(const SVGPointList& rhs);
+  void SwapWith(SVGPointList& aRhs) { mItems.SwapElements(aRhs.mItems); }
+
+  Point& operator[](uint32_t aIndex) { return mItems[aIndex]; }
+
+  bool SetLength(uint32_t aNumberOfItems) {
+    return mItems.SetLength(aNumberOfItems, fallible);
+  }
+
+ private:
+
+  nsresult SetValueFromString(const nsAString& aValue);
+
+  void Clear() { mItems.Clear(); }
+
+  bool InsertItem(uint32_t aIndex, const Point& aPoint) {
+    if (aIndex >= mItems.Length()) {
+      aIndex = mItems.Length();
+    }
+    return !!mItems.InsertElementAt(aIndex, aPoint, fallible);
+  }
+
+  void ReplaceItem(uint32_t aIndex, const Point& aPoint) {
+    MOZ_ASSERT(aIndex < mItems.Length(),
+               "DOM wrapper caller should have raised INDEX_SIZE_ERR");
+    mItems[aIndex] = aPoint;
+  }
+
+  void RemoveItem(uint32_t aIndex) {
+    MOZ_ASSERT(aIndex < mItems.Length(),
+               "DOM wrapper caller should have raised INDEX_SIZE_ERR");
+    mItems.RemoveElementAt(aIndex);
+  }
+
+  bool AppendItem(const Point& aPoint) {
+    return !!mItems.AppendElement(aPoint, fallible);
+  }
+
+ protected:
+  [[nodiscard]] FallibleTArray<Point>::iterator begin() {
+    return mItems.begin();
+  }
+  [[nodiscard]] FallibleTArray<Point>::iterator end() { return mItems.end(); }
+  FallibleTArray<Point> mItems;
+};
+
+class SVGPointListAndInfo : public SVGPointList {
+ public:
+  explicit SVGPointListAndInfo(dom::SVGElement* aElement = nullptr)
+      : mElement(do_GetWeakReference(static_cast<nsINode*>(aElement))) {}
+
+  void SetInfo(dom::SVGElement* aElement) {
+    mElement = do_GetWeakReference(static_cast<nsINode*>(aElement));
+  }
+
+  dom::SVGElement* Element() const {
+    nsCOMPtr<nsIContent> e = do_QueryReferent(mElement);
+    return static_cast<dom::SVGElement*>(e.get());
+  }
+
+  bool IsIdentity() const {
+    if (!mElement) {
+      MOZ_ASSERT(IsEmpty(), "target element propagation failure");
+      return true;
+    }
+    return false;
+  }
+
+  nsresult CopyFrom(const SVGPointListAndInfo& rhs) {
+    mElement = rhs.mElement;
+    return SVGPointList::CopyFrom(rhs);
+  }
+
+  using SVGPointList::CopyFrom;
+  using SVGPointList::operator[];
+  using SVGPointList::begin;
+  using SVGPointList::end;
+  using SVGPointList::SetLength;
+
+ private:
+  nsWeakPtr mElement;
+};
+
+}  
+
+#endif  // DOM_SVG_SVGPOINTLIST_H_

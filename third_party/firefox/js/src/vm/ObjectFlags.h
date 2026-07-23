@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_ObjectFlags_h
+#define vm_ObjectFlags_h
+
+#include <stdint.h>
+
+#include "util/EnumFlags.h"  // js::EnumFlags
+
+namespace js {
+
+enum class ObjectFlag : uint32_t {
+  IsUsedAsPrototype = 1 << 0,
+  NotExtensible = 1 << 1,
+  Indexed = 1 << 2,
+  HasInterestingSymbol = 1 << 3,
+
+  HasEnumerable = 1 << 4,
+
+  FrozenElements = 1 << 5,  
+
+  InvalidatedTeleporting = 1 << 6,
+
+  ImmutablePrototype = 1 << 7,
+
+  QualifiedVarObj = 1 << 8,
+
+  HasNonWritableOrAccessorPropExclProto = 1 << 9,
+
+  HadGetterSetterChange = 1 << 10,
+
+  UseWatchtowerTestingLog = 1 << 11,
+
+  GenerationCountedGlobal = 1 << 12,
+
+  NeedsProxyGetSetResultValidation = 1 << 13,
+
+  HasRealmFuseProperty = 1 << 14,
+
+  HasObjectFuse = 1 << 15,
+
+  HasPreservedWrapper = 1 << 16,
+
+  HasNonFunctionAccessor = 1 << 17,
+
+  LegacyFeaturesDisabled = 1 << 18,
+};
+
+using ObjectFlags = EnumFlags<ObjectFlag>;
+
+}  
+
+#endif /* vm_ObjectFlags_h */

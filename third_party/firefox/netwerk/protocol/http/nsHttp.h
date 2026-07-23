@@ -1,0 +1,427 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsHttp_h_
+#define nsHttp_h_
+
+#include <stdint.h>
+#include "prtime.h"
+#include "nsString.h"
+#include "nsError.h"
+#include "nsTArray.h"
+#include "mozilla/OriginAttributes.h"
+#include "mozilla/TimeStamp.h"
+
+#include "mozilla/UniquePtr.h"
+#include "NSSErrorsService.h"
+#include "nsIHttpChannelInternal.h"
+
+class nsICacheEntry;
+
+namespace mozilla {
+
+namespace net {
+class nsHttpResponseHead;
+class nsHttpRequestHead;
+class CacheControlParser;
+
+enum class HttpVersion {
+  UNKNOWN = 0,
+  v0_9 = 9,
+  v1_0 = 10,
+  v1_1 = 11,
+  v2_0 = 20,
+  v3_0 = 30
+};
+
+enum class SpdyVersion { NONE = 0, HTTP_2 = 5 };
+
+enum class SupportedAlpnRank : uint8_t {
+  NOT_SUPPORTED = 0,
+  HTTP_1_1 = 1,
+  HTTP_2 = 2,
+  HTTP_3_VER_1 = 3,
+};
+
+enum class ConnectionCloseReason : uint32_t {
+  UNSET = 0,
+  OK,
+  IDLE_TIMEOUT,
+  TLS_TIMEOUT,
+  GO_AWAY,
+  DNS_ERROR,
+  NET_RESET,
+  NET_TIMEOUT,
+  NET_REFUSED,
+  NET_INTERRUPT,
+  NET_INADEQ_SEQURITY,
+  SOCKET_ADDRESS_NOT_SUPPORTED,
+  OUT_OF_MEMORY,
+  SOCKET_ADDRESS_IN_USE,
+  BINDING_ABORTED,
+  BINDING_REDIRECTED,
+  ERROR_ABORT,
+  CLOSE_EXISTING_CONN_FOR_COALESCING,
+  CLOSE_NEW_CONN_FOR_COALESCING,
+  CANT_REUSED,
+  OTHER_NET_ERROR,
+  SECURITY_ERROR,
+};
+
+ConnectionCloseReason ToCloseReason(nsresult aErrorCode);
+
+inline bool IsHttp3(SupportedAlpnRank aRank) {
+  return aRank == SupportedAlpnRank::HTTP_3_VER_1;
+}
+
+
+#define NS_HTTP_ALLOW_KEEPALIVE (1 << 0)
+#define NS_HTTP_LARGE_KEEPALIVE (1 << 1)
+
+#define NS_HTTP_STICKY_CONNECTION (1 << 2)
+
+#define NS_HTTP_REFRESH_DNS (1 << 3)
+
+#define NS_HTTP_LOAD_ANONYMOUS (1 << 4)
+
+#define NS_HTTP_LOAD_AS_BLOCKING (1 << 6)
+
+#define NS_HTTP_DISALLOW_SPDY (1 << 7)
+
+#define NS_HTTP_LOAD_UNBLOCKED (1 << 8)
+
+#define NS_HTTP_ONPUSH_LISTENER (1 << 9)
+
+#define NS_HTTP_ERROR_SOFTLY (1 << 10)
+
+#define NS_HTTP_BE_CONSERVATIVE (1 << 11)
+
+#define NS_HTTP_URGENT_START (1 << 12)
+
+#define NS_HTTP_CONNECTION_RESTARTABLE (1 << 13)
+
+#define NS_HTTP_ALLOW_SPDY_WITHOUT_KEEPALIVE (1 << 15)
+
+#define NS_HTTP_CONNECT_ONLY (1 << 16)
+
+#define NS_HTTP_DISABLE_IPV4 (1 << 17)
+
+#define NS_HTTP_DISABLE_IPV6 (1 << 18)
+
+#define NS_HTTP_TRR_MODE_MASK ((1 << 19) | (1 << 20))
+
+#define NS_HTTP_DISALLOW_HTTP3 (1 << 21)
+
+#define NS_HTTP_FORCE_WAIT_HTTP_RR (1 << 22)
+
+#define NS_HTTP_LOAD_ANONYMOUS_CONNECT_ALLOW_CLIENT_CERT (1 << 23)
+
+#define NS_HTTP_DISALLOW_HTTPS_RR (1 << 24)
+
+#define NS_HTTP_DISALLOW_ECH (1 << 25)
+
+#define NS_HTTP_USE_RFP (1 << 26)
+
+#define NS_HTTP_IS_RETRY (1 << 27)
+
+#define NS_HTTP_DISALLOW_HTTP2_PROXY (1 << 28)
+
+#define NS_HTTP_TLS_TUNNEL (1 << 29)
+
+#define NS_HTTP_USE_HAPPY_EYEBALLS (1 << 30)
+
+#define NS_HTTP_TRR_FLAGS_FROM_MODE(x) ((static_cast<uint32_t>(x) & 3) << 19)
+
+#define NS_HTTP_TRR_MODE_FROM_FLAGS(x) \
+  (static_cast<nsIRequest::TRRMode>((((x) & NS_HTTP_TRR_MODE_MASK) >> 19) & 3))
+
+
+#define NS_HTTP_DEFAULT_PORT 80
+#define NS_HTTPS_DEFAULT_PORT 443
+
+#define NS_HTTP_HEADER_SEP ','
+
+
+struct nsHttpAtom;
+struct nsHttpAtomLiteral;
+
+namespace nsHttp {
+[[nodiscard]] nsresult CreateAtomTable();
+void DestroyAtomTable();
+
+nsHttpAtom ResolveAtom(const nsACString& s);
+
+bool IsValidToken(const char* start, const char* end);
+
+inline bool IsValidToken(const nsACString& s) {
+  return IsValidToken(s.BeginReading(), s.EndReading());
+}
+
+void TrimHTTPWhitespace(const nsACString& aSource, nsACString& aDest);
+
+bool IsReasonableHeaderValue(const nsACString& s);
+
+const char* FindToken(const char* input, const char* token, const char* seps);
+
+[[nodiscard]] bool ParseInt64(const char* input, const char** next,
+                              int64_t* result);
+
+[[nodiscard]] inline bool ParseInt64(const char* input, int64_t* result) {
+  const char* next;
+  return ParseInt64(input, &next, result) && *next == '\0';
+}
+
+bool IsPermanentRedirect(uint32_t httpStatus);
+
+const char* GetProtocolVersion(HttpVersion pv);
+
+bool ValidationRequired(bool isForcedValid,
+                        nsHttpResponseHead* cachedResponseHead,
+                        uint32_t loadFlags, bool allowStaleCacheContent,
+                        bool forceValidateCacheContent, bool isImmutable,
+                        bool customConditionalRequest,
+                        nsHttpRequestHead& requestHead, nsICacheEntry* entry,
+                        CacheControlParser& cacheControlRequest,
+                        bool fromPreviousSession,
+                        bool* performBackgroundRevalidation = nullptr);
+
+nsresult GetHttpResponseHeadFromCacheEntry(
+    nsICacheEntry* entry, nsHttpResponseHead* cachedResponseHead);
+
+nsresult CheckPartial(nsICacheEntry* aEntry, int64_t* aSize,
+                      int64_t* aContentLength,
+                      nsHttpResponseHead* responseHead);
+
+void DetermineFramingAndImmutability(nsICacheEntry* entry,
+                                     nsHttpResponseHead* cachedResponseHead,
+                                     bool isHttps, bool* weaklyFramed,
+                                     bool* isImmutable);
+
+void NotifyActiveTabLoadOptimization();
+TimeStamp GetLastActiveTabLoadOptimizationHit();
+void SetLastActiveTabLoadOptimizationHit(TimeStamp const& when);
+bool IsBeforeLastActiveTabLoadOptimization(TimeStamp const& when);
+
+nsCString ConvertRequestHeadToString(nsHttpRequestHead& aRequestHead,
+                                     bool aHasRequestBody,
+                                     bool aRequestBodyHasHeaders,
+                                     bool aUsingConnect);
+
+template <typename T>
+using SendFunc = std::function<bool(const T&, uint64_t, uint32_t)>;
+
+template <typename T>
+bool SendDataInChunks(const nsCString& aData, uint64_t aOffset, uint32_t aCount,
+                      const SendFunc<T>& aSendFunc) {
+  static uint32_t const kCopyChunkSize = 128 * 1024;
+  uint32_t toRead = std::min<uint32_t>(aCount, kCopyChunkSize);
+
+  uint32_t start = 0;
+  while (aCount) {
+    T data(Substring(aData, start, toRead));
+
+    if (!aSendFunc(data, aOffset, toRead)) {
+      return false;
+    }
+
+    aOffset += toRead;
+    start += toRead;
+    aCount -= toRead;
+    toRead = std::min<uint32_t>(aCount, kCopyChunkSize);
+  }
+
+  return true;
+}
+
+}  
+
+struct nsHttpAtomLiteral;
+struct nsHttpAtom {
+  nsHttpAtom() = default;
+  nsHttpAtom(const nsHttpAtom& other) = default;
+
+  explicit operator bool() const { return !_val.IsEmpty(); }
+
+  const char* get() const {
+    if (_val.IsEmpty()) {
+      return nullptr;
+    }
+    return _val.get();
+  }
+
+  const nsCString& val() const { return _val; }
+
+  void operator=(const nsHttpAtom& a) { _val = a._val; }
+
+  explicit nsHttpAtom(const nsACString& val) : _val(val) {}
+
+ private:
+  nsCString _val;
+  friend nsHttpAtom nsHttp::ResolveAtom(const nsACString& s);
+};
+
+struct nsHttpAtomLiteral {
+  const char* get() const { return _data.get(); }
+  nsLiteralCString const& val() const { return _data; }
+
+  template <size_t N>
+  constexpr explicit nsHttpAtomLiteral(const char (&val)[N]) : _data(val) {}
+
+  operator nsHttpAtom() const { return nsHttpAtom(_data); }
+
+ private:
+  nsLiteralCString _data;
+};
+
+inline bool operator==(nsHttpAtomLiteral const& self,
+                       nsHttpAtomLiteral const& other) {
+  return self.get() == other.get();
+}
+inline bool operator!=(nsHttpAtomLiteral const& self,
+                       nsHttpAtomLiteral const& other) {
+  return self.get() != other.get();
+}
+
+inline bool operator==(nsHttpAtom const& self, nsHttpAtomLiteral const& other) {
+  return self.val() == other.val();
+}
+inline bool operator!=(nsHttpAtom const& self, nsHttpAtomLiteral const& other) {
+  return self.val() != other.val();
+}
+
+inline bool operator==(nsHttpAtomLiteral const& self, nsHttpAtom const& other) {
+  return self.val() == other.val();
+}
+inline bool operator!=(nsHttpAtomLiteral const& self, nsHttpAtom const& other) {
+  return self.val() != other.val();
+}
+
+inline bool operator==(nsHttpAtom const& self, nsHttpAtom const& other) {
+  return self.val() == other.val();
+}
+inline bool operator!=(nsHttpAtom const& self, nsHttpAtom const& other) {
+  return self.val() != other.val();
+}
+
+namespace nsHttp {
+
+// and all support logic will be auto-generated.
+#define HTTP_ATOM(_name, _value) \
+  inline constexpr nsHttpAtomLiteral _name(_value);
+#include "nsHttpAtomList.inc"
+#undef HTTP_ATOM
+}  
+
+
+static inline uint32_t PRTimeToSeconds(PRTime t_usec) {
+  return uint32_t(t_usec / PR_USEC_PER_SEC);
+}
+
+#define NowInSeconds() PRTimeToSeconds(PR_Now())
+
+#define QVAL_TO_UINT(q) ((unsigned int)(((q) + 0.005) * 100.0))
+
+#define HTTP_LWS " \t"
+#define HTTP_HEADER_VALUE_SEPS HTTP_LWS ","
+
+void EnsureBuffer(UniquePtr<char[]>& buf, uint32_t newSize, uint32_t preserve,
+                  uint32_t& objSize);
+void EnsureBuffer(UniquePtr<uint8_t[]>& buf, uint32_t newSize,
+                  uint32_t preserve, uint32_t& objSize);
+
+
+class ParsedHeaderPair {
+ public:
+  ParsedHeaderPair(const char* name, int32_t nameLen, const char* val,
+                   int32_t valLen, bool isQuotedValue);
+
+  ParsedHeaderPair(ParsedHeaderPair const& copy)
+      : mName(copy.mName),
+        mValue(copy.mValue),
+        mUnquotedValue(copy.mUnquotedValue),
+        mIsQuotedValue(copy.mIsQuotedValue) {
+    if (mIsQuotedValue) {
+      mValue.Rebind(mUnquotedValue.BeginReading(), mUnquotedValue.Length());
+    }
+  }
+
+  nsDependentCSubstring mName;
+  nsDependentCSubstring mValue;
+
+ private:
+  nsCString mUnquotedValue;
+  bool mIsQuotedValue;
+
+  void RemoveQuotedStringEscapes(const char* val, int32_t valLen);
+};
+
+class ParsedHeaderValueList {
+ public:
+  ParsedHeaderValueList(const char* t, uint32_t len, bool allowInvalidValue);
+  nsTArray<ParsedHeaderPair> mValues;
+
+ private:
+  void ParseNameAndValue(const char* input, bool allowInvalidValue);
+};
+
+class ParsedHeaderValueListList {
+ public:
+  explicit ParsedHeaderValueListList(const nsCString& fullHeader,
+                                     bool allowInvalidValue = true);
+  nsTArray<ParsedHeaderValueList> mValues;
+
+ private:
+  nsCString mFull;
+};
+
+void LogHeaders(const char* lineStart);
+
+nsresult HttpProxyResponseToErrorCode(uint32_t aStatusCode);
+
+SupportedAlpnRank IsAlpnSupported(const nsACString& aAlpn);
+
+static inline bool AllowedErrorForTransactionRetry(nsresult aError) {
+  return psm::IsNSSErrorCode(-1 * NS_ERROR_GET_CODE(aError)) ||
+         aError == NS_ERROR_NET_RESET ||
+         aError == NS_ERROR_CONNECTION_REFUSED ||
+         aError == NS_ERROR_UNKNOWN_HOST || aError == NS_ERROR_NET_TIMEOUT ||
+         aError == NS_ERROR_NOT_CONNECTED ||
+         aError == NS_ERROR_SOCKET_ADDRESS_IN_USE ||
+         aError == NS_ERROR_FILE_ALREADY_EXISTS ||
+         aError == NS_ERROR_NET_INTERRUPT;
+}
+
+[[nodiscard]] nsresult MakeOriginURL(const nsACString& origin,
+                                     nsCOMPtr<nsIURI>& url);
+
+[[nodiscard]] nsresult MakeOriginURL(const nsACString& scheme,
+                                     const nsACString& origin,
+                                     nsCOMPtr<nsIURI>& url);
+
+void CreatePushHashKey(const nsCString& scheme, const nsCString& hostHeader,
+                       const mozilla::OriginAttributes& originAttributes,
+                       uint64_t serial, const nsACString& pathInfo,
+                       nsCString& outOrigin, nsCString& outKey);
+
+nsresult GetNSResultFromWebTransportError(uint8_t aErrorCode);
+
+uint8_t GetWebTransportErrorFromNSResult(nsresult aResult);
+
+uint64_t WebTransportErrorToHttp3Error(uint8_t aErrorCode);
+
+uint8_t Http3ErrorToWebTransportError(uint64_t aErrorCode);
+
+bool PossibleZeroRTTRetryError(nsresult aReason);
+
+void DisallowHTTPSRR(uint32_t& aCaps);
+
+nsLiteralCString HttpVersionToTelemetryLabel(HttpVersion version);
+
+nsIHttpChannelInternal::ProxyDNSStrategy GetProxyDNSStrategyHelper(
+    const char* aType, uint32_t aFlag);
+
+}  
+}  
+
+#endif  // nsHttp_h_

@@ -1,0 +1,374 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DeleteRangeTransaction.h"
+
+#include "DeleteContentTransactionBase.h"
+#include "DeleteNodeTransaction.h"
+#include "DeleteTextTransaction.h"
+#include "EditTransactionBase.h"
+#include "EditorBase.h"
+#include "EditorDOMPoint.h"
+#include "EditorUtils.h"
+#include "HTMLEditUtils.h"
+
+#include "mozilla/Assertions.h"
+#include "mozilla/ContentIterator.h"
+#include "mozilla/Logging.h"
+#include "mozilla/mozalloc.h"
+#include "mozilla/RangeBoundary.h"
+#include "mozilla/StaticPrefs_editor.h"
+#include "mozilla/dom/Selection.h"
+
+#include "nsAtom.h"
+#include "nsCOMPtr.h"
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsGkAtoms.h"
+#include "nsIContent.h"
+#include "nsINode.h"
+#include "nsAString.h"
+
+namespace mozilla {
+
+using namespace dom;
+
+using EditorType = EditorUtils::EditorType;
+
+DeleteRangeTransaction::DeleteRangeTransaction(EditorBase& aEditorBase,
+                                               const nsRange& aRangeToDelete)
+    : mEditorBase(&aEditorBase), mRangeToDelete(aRangeToDelete.CloneRange()) {}
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(DeleteRangeTransaction,
+                                   EditAggregateTransaction, mEditorBase,
+                                   mRangeToDelete, mPointToPutCaret)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(DeleteRangeTransaction)
+NS_INTERFACE_MAP_END_INHERITING(EditAggregateTransaction)
+
+void DeleteRangeTransaction::AppendChild(
+    DeleteContentTransactionBase& aTransaction) {
+  mChildren.AppendElement(aTransaction);
+}
+
+nsresult
+DeleteRangeTransaction::MaybeExtendDeletingRangeWithSurroundingWhitespace(
+    nsRange& aRange) const {
+  if (!mEditorBase->mEditActionData->SelectionCreatedByDoubleclick() ||
+      !StaticPrefs::
+          editor_word_select_delete_space_after_doubleclick_selection()) {
+    return NS_OK;
+  }
+  EditorRawDOMPoint startPoint(aRange.StartRef());
+  EditorRawDOMPoint endPoint(aRange.EndRef());
+  const bool maybeRangeStartsAfterWhiteSpace =
+      startPoint.IsInTextNode() && !startPoint.IsStartOfContainer();
+  const bool maybeRangeEndsAtWhiteSpace =
+      endPoint.IsInTextNode() && !endPoint.IsEndOfContainer();
+
+  if (!maybeRangeStartsAfterWhiteSpace && !maybeRangeEndsAtWhiteSpace) {
+    return NS_OK;
+  }
+
+  const bool precedingCharIsWhitespace =
+      maybeRangeStartsAfterWhiteSpace
+          ? startPoint.IsPreviousCharASCIISpaceOrNBSP()
+          : false;
+  const bool trailingCharIsWhitespace =
+      maybeRangeEndsAtWhiteSpace ? endPoint.IsCharASCIISpaceOrNBSP() : false;
+
+  if (precedingCharIsWhitespace) {
+    ErrorResult err;
+    aRange.SetStart(startPoint.PreviousPoint(), err);
+    if (auto rv = err.StealNSResult(); NS_FAILED(rv)) {
+      NS_WARNING(
+          "DeleteRangeTransaction::"
+          "MaybeExtendDeletingRangeWithSurroundingWhitespace"
+          " failed to update the start of the deleting range");
+      return rv;
+    }
+  } else if (trailingCharIsWhitespace) {
+    ErrorResult err;
+    aRange.SetEnd(endPoint.NextPoint(), err);
+    if (auto rv = err.StealNSResult(); NS_FAILED(rv)) {
+      NS_WARNING(
+          "DeleteRangeTransaction::"
+          "MaybeExtendDeletingRangeWithSurroundingWhitespace"
+          " failed to update the end of the deleting range");
+      return rv;
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP DeleteRangeTransaction::DoTransaction() {
+  MOZ_LOG(GetLogModule(), LogLevel::Info,
+          ("%p DeleteRangeTransaction::%s this={ mName=%s } "
+           "Start==============================",
+           this, __FUNCTION__,
+           nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+
+  if (NS_WARN_IF(!mEditorBase) || NS_WARN_IF(!mRangeToDelete)) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  RefPtr<nsRange> rangeToDelete;
+  rangeToDelete.swap(mRangeToDelete);
+
+  MaybeExtendDeletingRangeWithSurroundingWhitespace(*rangeToDelete);
+
+  {
+    EditorRawDOMRange extendedRange(*rangeToDelete);
+    MOZ_ASSERT(extendedRange.IsPositionedAndValid());
+
+    if (extendedRange.InSameContainer()) {
+      nsresult rv = AppendTransactionsToDeleteIn(extendedRange);
+      if (NS_FAILED(rv)) {
+        NS_WARNING(
+            "DeleteRangeTransaction::AppendTransactionsToDeleteIn() failed");
+        return rv;
+      }
+    } else {
+      for (EditorRawDOMPoint endOfRange = extendedRange.EndRef();
+           endOfRange.IsInContentNode() && endOfRange.IsEndOfContainer() &&
+           endOfRange.GetContainer() != extendedRange.StartRef().GetContainer();
+           endOfRange = extendedRange.EndRef()) {
+        extendedRange.SetEnd(
+            EditorRawDOMPoint::After(*endOfRange.ContainerAs<nsIContent>()));
+      }
+
+      nsresult rv = AppendTransactionToDeleteText(extendedRange.StartRef(),
+                                                  nsIEditor::eNext);
+      if (NS_FAILED(rv)) {
+        NS_WARNING(
+            "DeleteRangeTransaction::AppendTransactionToDeleteText() failed");
+        return rv;
+      }
+      rv = AppendTransactionsToDeleteNodesWhoseEndBoundaryIn(extendedRange);
+      if (NS_FAILED(rv)) {
+        NS_WARNING(
+            "DeleteRangeTransaction::"
+            "AppendTransactionsToDeleteNodesWhoseEndBoundaryIn() failed");
+        return rv;
+      }
+      rv = AppendTransactionToDeleteText(extendedRange.EndRef(),
+                                         nsIEditor::ePrevious);
+      if (NS_FAILED(rv)) {
+        NS_WARNING(
+            "DeleteRangeTransaction::AppendTransactionToDeleteText() failed");
+        return rv;
+      }
+    }
+  }
+
+  nsresult rv = EditAggregateTransaction::DoTransaction();
+  if (NS_FAILED(rv)) {
+    NS_WARNING("EditAggregateTransaction::DoTransaction() failed");
+    return rv;
+  }
+
+  MOZ_LOG(GetLogModule(), LogLevel::Info,
+          ("%p DeleteRangeTransaction::%s this={ mName=%s } "
+           "End==============================",
+           this, __FUNCTION__,
+           nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+
+  mPointToPutCaret = rangeToDelete->StartRef();
+  if (MOZ_UNLIKELY(!mPointToPutCaret.IsSetAndValid())) {
+    for (const OwningNonNull<EditTransactionBase>& transaction :
+         Reversed(mChildren)) {
+      if (const DeleteContentTransactionBase* deleteContentTransaction =
+              transaction->GetAsDeleteContentTransactionBase()) {
+        mPointToPutCaret = deleteContentTransaction->SuggestPointToPutCaret();
+        if (mPointToPutCaret.IsSetAndValid()) {
+          break;
+        }
+        continue;
+      }
+      MOZ_ASSERT_UNREACHABLE(
+          "Child transactions must be DeleteContentTransactionBase");
+    }
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP DeleteRangeTransaction::UndoTransaction() {
+  MOZ_LOG(GetLogModule(), LogLevel::Info,
+          ("%p DeleteRangeTransaction::%s this={ mName=%s } "
+           "Start==============================",
+           this, __FUNCTION__,
+           nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+
+  nsresult rv = EditAggregateTransaction::UndoTransaction();
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditAggregateTransaction::UndoTransaction() failed");
+
+  MOZ_LOG(GetLogModule(), LogLevel::Info,
+          ("%p DeleteRangeTransaction::%s this={ mName=%s } "
+           "End==============================",
+           this, __FUNCTION__,
+           nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+  return rv;
+}
+
+NS_IMETHODIMP DeleteRangeTransaction::RedoTransaction() {
+  MOZ_LOG(GetLogModule(), LogLevel::Info,
+          ("%p DeleteRangeTransaction::%s this={ mName=%s } "
+           "Start==============================",
+           this, __FUNCTION__,
+           nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+
+  nsresult rv = EditAggregateTransaction::RedoTransaction();
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditAggregateTransaction::RedoTransaction() failed");
+
+  MOZ_LOG(GetLogModule(), LogLevel::Info,
+          ("%p DeleteRangeTransaction::%s this={ mName=%s } "
+           "End==============================",
+           this, __FUNCTION__,
+           nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+  return rv;
+}
+
+nsresult DeleteRangeTransaction::AppendTransactionsToDeleteIn(
+    const EditorRawDOMRange& aRangeToDelete) {
+  if (NS_WARN_IF(!aRangeToDelete.IsPositionedAndValid())) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  MOZ_ASSERT(aRangeToDelete.InSameContainer());
+
+  if (NS_WARN_IF(!mEditorBase)) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  if (Text* textNode = aRangeToDelete.StartRef().GetContainerAs<Text>()) {
+    if (mEditorBase->IsHTMLEditor() &&
+        NS_WARN_IF(
+            !EditorUtils::IsEditableContent(*textNode, EditorType::HTML))) {
+      return NS_OK;
+    }
+    uint32_t textLengthToDelete;
+    if (aRangeToDelete.Collapsed()) {
+      textLengthToDelete = 1;
+    } else {
+      textLengthToDelete =
+          aRangeToDelete.EndRef().Offset() - aRangeToDelete.StartRef().Offset();
+      MOZ_DIAGNOSTIC_ASSERT(textLengthToDelete > 0);
+    }
+
+    RefPtr<DeleteTextTransaction> deleteTextTransaction =
+        DeleteTextTransaction::MaybeCreate(*mEditorBase, *textNode,
+                                           aRangeToDelete.StartRef().Offset(),
+                                           textLengthToDelete);
+    if (!deleteTextTransaction) {
+      NS_WARNING("DeleteTextTransaction::MaybeCreate() failed");
+      return NS_ERROR_FAILURE;
+    }
+    AppendChild(*deleteTextTransaction);
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(mEditorBase->IsHTMLEditor());
+
+  for (nsIContent* child = aRangeToDelete.StartRef().GetChild();
+       child && child != aRangeToDelete.EndRef().GetChild();
+       child = child->GetNextSibling()) {
+    if (NS_WARN_IF(!HTMLEditUtils::IsRemovableNode(*child))) {
+      continue;  
+    }
+    RefPtr<DeleteNodeTransaction> deleteNodeTransaction =
+        DeleteNodeTransaction::MaybeCreate(*mEditorBase, *child);
+    if (deleteNodeTransaction) {
+      AppendChild(*deleteNodeTransaction);
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult DeleteRangeTransaction::AppendTransactionToDeleteText(
+    const EditorRawDOMPoint& aMaybePointInText, nsIEditor::EDirection aAction) {
+  if (NS_WARN_IF(!aMaybePointInText.IsSetAndValid())) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (NS_WARN_IF(!mEditorBase)) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  if (!aMaybePointInText.IsInTextNode()) {
+    return NS_OK;
+  }
+
+  Text& textNode = *aMaybePointInText.ContainerAs<Text>();
+  uint32_t startOffset, numToDelete;
+  if (nsIEditor::eNext == aAction) {
+    startOffset = aMaybePointInText.Offset();
+    numToDelete = textNode.TextDataLength() - startOffset;
+  } else {
+    startOffset = 0;
+    numToDelete = aMaybePointInText.Offset();
+  }
+
+  if (!numToDelete) {
+    return NS_OK;
+  }
+
+  RefPtr<DeleteTextTransaction> deleteTextTransaction =
+      DeleteTextTransaction::MaybeCreate(*mEditorBase, textNode, startOffset,
+                                         numToDelete);
+  if (MOZ_UNLIKELY(!deleteTextTransaction)) {
+    NS_WARNING("DeleteTextTransaction::MaybeCreate() failed");
+    return NS_ERROR_FAILURE;
+  }
+  AppendChild(*deleteTextTransaction);
+  return NS_OK;
+}
+
+nsresult
+DeleteRangeTransaction::AppendTransactionsToDeleteNodesWhoseEndBoundaryIn(
+    const EditorRawDOMRange& aRangeToDelete) {
+  if (NS_WARN_IF(!mEditorBase)) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  ContentSubtreeIterator subtreeIter;
+  nsresult rv = subtreeIter.Init(aRangeToDelete.StartRef().ToRawRangeBoundary(),
+                                 aRangeToDelete.EndRef().ToRawRangeBoundary());
+  if (NS_FAILED(rv)) {
+    NS_WARNING("ContentSubtreeIterator::Init() failed");
+    return rv;
+  }
+
+  for (; !subtreeIter.IsDone(); subtreeIter.Next()) {
+    nsINode* node = subtreeIter.GetCurrentNode();
+    if (NS_WARN_IF(!node) || NS_WARN_IF(!node->IsContent())) {
+      return NS_ERROR_FAILURE;
+    }
+
+    if (NS_WARN_IF(!HTMLEditUtils::IsRemovableNode(*node->AsContent()))) {
+      continue;
+    }
+    RefPtr<DeleteNodeTransaction> deleteNodeTransaction =
+        DeleteNodeTransaction::MaybeCreate(*mEditorBase, *node->AsContent());
+    if (deleteNodeTransaction) {
+      AppendChild(*deleteNodeTransaction);
+    }
+  }
+  return NS_OK;
+}
+
+EditorDOMPoint DeleteRangeTransaction::SuggestPointToPutCaret() const {
+  if (!mPointToPutCaret.IsSetAndValidInComposedDoc()) {
+    return EditorDOMPoint();
+  }
+  if (!mPointToPutCaret.IsInNativeAnonymousSubtreeInTextControl() &&
+      !HTMLEditUtils::IsSimplyEditableNode(*mPointToPutCaret.GetContainer())) {
+    return EditorDOMPoint();
+  }
+  return mPointToPutCaret;
+}
+
+}  

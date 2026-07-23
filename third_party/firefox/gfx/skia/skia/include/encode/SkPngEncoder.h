@@ -1,0 +1,65 @@
+/*
+ * Copyright 2017 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPngEncoder_DEFINED)
+#define SkPngEncoder_DEFINED
+
+#include "include/core/SkDataTable.h"
+#include "include/core/SkRefCnt.h"
+#include "include/private/SkHdrMetadata.h"
+#include "include/private/base/SkAPI.h"
+
+#include "include/encode/SkEncoder.h"  // IWYU pragma: keep
+
+#include <memory>
+
+class GrDirectContext;
+class SkData;
+class SkImage;
+class SkPixmap;
+class SkWStream;
+struct skcms_ICCProfile;
+struct SkGainmapInfo;
+
+namespace SkPngEncoder {
+
+enum class FilterFlag : int {
+    kZero = 0x00,
+    kNone = 0x08,
+    kSub = 0x10,
+    kUp = 0x20,
+    kAvg = 0x40,
+    kPaeth = 0x80,
+    kAll = kNone | kSub | kUp | kAvg | kPaeth,
+};
+
+inline FilterFlag operator|(FilterFlag x, FilterFlag y) { return (FilterFlag)((int)x | (int)y); }
+
+struct Options {
+    FilterFlag fFilterFlags = FilterFlag::kAll;
+
+    int fZLibLevel = 6;
+
+    sk_sp<SkDataTable> fComments;
+
+    skhdr::Metadata fHdrMetadata;
+
+    const SkPixmap* fGainmap = nullptr;
+    const SkGainmapInfo* fGainmapInfo = nullptr;
+};
+
+SK_API bool Encode(SkWStream* dst, const SkPixmap& src, const Options& options);
+
+SK_API sk_sp<SkData> Encode(const SkPixmap& src, const Options& options);
+
+SK_API sk_sp<SkData> Encode(GrDirectContext* ctx, const SkImage* img, const Options& options);
+
+SK_API std::unique_ptr<SkEncoder> Make(SkWStream* dst, const SkPixmap& src, const Options& options);
+
+}  
+
+#endif

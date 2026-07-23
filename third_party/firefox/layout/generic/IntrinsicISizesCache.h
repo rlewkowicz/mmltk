@@ -1,0 +1,168 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_IntrinsicISizesCache_h
+#define mozilla_IntrinsicISizesCache_h
+
+#include "nsIFrame.h"
+
+namespace mozilla {
+
+struct IntrinsicISizesCache final {
+  IntrinsicISizesCache() {
+    new (&mInline) InlineCache();
+    MOZ_ASSERT(IsInline());
+  }
+
+  ~IntrinsicISizesCache() { delete GetOutOfLine(); }
+
+  template <typename Compute>
+  nscoord GetOrSet(nsIFrame& aFrame, IntrinsicISizeType aType,
+                   const IntrinsicSizeInput& aInput, Compute aCompute) {
+    bool dependentOnPercentBSize = aFrame.HasAnyStateBits(
+        NS_FRAME_DESCENDANT_INTRINSIC_ISIZE_DEPENDS_ON_BSIZE);
+    nscoord value = Get(dependentOnPercentBSize, aType, aInput);
+    if (value != kNotFound) {
+      return value;
+    }
+    value = aCompute();
+    dependentOnPercentBSize = aFrame.HasAnyStateBits(
+        NS_FRAME_DESCENDANT_INTRINSIC_ISIZE_DEPENDS_ON_BSIZE);
+    Set(dependentOnPercentBSize, aType, aInput, value);
+    return value;
+  }
+
+  void Clear() {
+    if (auto* ool = GetOutOfLine()) {
+      ool->mCacheWithPercentageBasis.Clear();
+      ool->mCacheWithoutPercentageBasis.Clear();
+      ool->mLastPercentageBasis.reset();
+    } else {
+      mInline.Clear();
+    }
+  }
+
+ private:
+  static constexpr nscoord kNotFound = nscoord_MAX;
+
+  nscoord Get(bool aDependentOnPercentBSize, IntrinsicISizeType aType,
+              const IntrinsicSizeInput& aInput) const {
+    const bool usePercentageAwareCache =
+        aDependentOnPercentBSize && aInput.HasSomePercentageBasisForChildren();
+    if (!usePercentageAwareCache) {
+      if (auto* ool = GetOutOfLine()) {
+        return ool->mCacheWithoutPercentageBasis.Get(aType);
+      }
+      return mInline.Get(aType);
+    }
+    if (auto* ool = GetOutOfLine()) {
+      if (ool->mLastPercentageBasis == aInput.mPercentageBasisForChildren) {
+        return ool->mCacheWithPercentageBasis.Get(aType);
+      }
+    }
+    return kNotFound;
+  }
+
+  void Set(bool aDependentOnPercentBSize, IntrinsicISizeType aType,
+           const IntrinsicSizeInput& aInput, nscoord aValue) {
+    aValue = std::max(aValue, 0);
+    const bool usePercentageAwareCache =
+        aDependentOnPercentBSize && aInput.HasSomePercentageBasisForChildren();
+    if (usePercentageAwareCache) {
+      auto* ool = EnsureOutOfLine();
+      if (ool->mLastPercentageBasis != aInput.mPercentageBasisForChildren) {
+        ool->mLastPercentageBasis = aInput.mPercentageBasisForChildren;
+        ool->mCacheWithPercentageBasis.Clear();
+      }
+      ool->mCacheWithPercentageBasis.Set(aType, aValue);
+    } else if (auto* ool = GetOutOfLine()) {
+      ool->mCacheWithoutPercentageBasis.Set(aType, aValue);
+    } else {
+      mInline.Set(aType, aValue);
+      MOZ_DIAGNOSTIC_ASSERT(IsInline());
+    }
+  }
+
+  struct InlineCache {
+    nscoord mCachedMinISize = kNotFound;
+    nscoord mCachedPrefISize = kNotFound;
+
+    nscoord Get(IntrinsicISizeType aType) const {
+      return aType == IntrinsicISizeType::MinISize ? mCachedMinISize
+                                                   : mCachedPrefISize;
+    }
+    void Set(IntrinsicISizeType aType, nscoord aValue) {
+      MOZ_ASSERT(aValue >= 0);
+      if (aType == IntrinsicISizeType::MinISize) {
+        mCachedMinISize = aValue;
+      } else {
+        mCachedPrefISize = aValue;
+      }
+    }
+
+    void Clear() { *this = {}; }
+  };
+
+  struct OutOfLineCache {
+    InlineCache mCacheWithoutPercentageBasis;
+    InlineCache mCacheWithPercentageBasis;
+    Maybe<LogicalSize> mLastPercentageBasis;
+  };
+
+  union {
+    InlineCache mInline;
+    struct {
+#ifndef HAVE_64BIT_BUILD
+      uintptr_t mPadding = 0;
+#endif
+      uintptr_t mOutOfLine = 0;
+    };
+  };
+
+  static constexpr uintptr_t kHighBit = uintptr_t(1)
+                                        << (sizeof(void*) * CHAR_BIT - 1);
+
+  bool IsOutOfLine() const {
+#ifdef HAVE_64BIT_BUILD
+    return mOutOfLine & kHighBit;
+#else
+    return mPadding & kHighBit;
+#endif
+  }
+  bool IsInline() const { return !IsOutOfLine(); }
+  OutOfLineCache* EnsureOutOfLine() {
+    if (auto* ool = GetOutOfLine()) {
+      return ool;
+    }
+    auto inlineCache = mInline;
+    auto* ool = new OutOfLineCache();
+    ool->mCacheWithoutPercentageBasis = inlineCache;
+#ifdef HAVE_64BIT_BUILD
+    MOZ_ASSERT((reinterpret_cast<uintptr_t>(ool) & kHighBit) == 0);
+    mOutOfLine = reinterpret_cast<uintptr_t>(ool) | kHighBit;
+#else
+    mOutOfLine = reinterpret_cast<uintptr_t>(ool);
+    mPadding = kHighBit;
+#endif
+    MOZ_ASSERT(IsOutOfLine());
+    return ool;
+  }
+
+  OutOfLineCache* GetOutOfLine() const {
+    if (!IsOutOfLine()) {
+      return nullptr;
+    }
+#ifdef HAVE_64BIT_BUILD
+    return reinterpret_cast<OutOfLineCache*>(mOutOfLine & ~kHighBit);
+#else
+    return reinterpret_cast<OutOfLineCache*>(mOutOfLine);
+#endif
+  }
+};
+
+static_assert(sizeof(IntrinsicISizesCache) == 8, "Unexpected cache size");
+
+}  
+
+#endif

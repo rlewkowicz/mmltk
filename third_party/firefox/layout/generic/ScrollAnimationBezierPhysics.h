@@ -1,0 +1,70 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layout_ScrollAnimationBezierPhysics_h_
+#define mozilla_layout_ScrollAnimationBezierPhysics_h_
+
+#include "ScrollAnimationPhysics.h"
+#include "mozilla/SMILKeySpline.h"
+
+namespace mozilla {
+
+struct ScrollAnimationBezierPhysicsSettings {
+  int32_t mMinMS;
+  int32_t mMaxMS;
+  double mIntervalRatio;
+};
+
+class ScrollAnimationBezierPhysics final : public ScrollAnimationPhysics {
+ public:
+  explicit ScrollAnimationBezierPhysics(
+      const nsPoint& aStartPos,
+      const ScrollAnimationBezierPhysicsSettings& aSettings);
+
+  void Update(const TimeStamp& aTime, const nsPoint& aDestination,
+              const nsSize& aCurrentVelocity) override;
+
+  void ApplyContentShift(const CSSPoint& aShiftDelta) override;
+
+  nsSize VelocityAt(const TimeStamp& aTime) override;
+
+  nsPoint PositionAt(const TimeStamp& aTime) override;
+
+  bool IsFinished(const TimeStamp& aTime) override {
+    return mDuration.IsZero() || aTime > mStartTime + mDuration;
+  }
+
+ protected:
+  double ProgressAt(const TimeStamp& aTime) const {
+    return std::clamp((aTime - mStartTime) / mDuration, 0.0, 1.0);
+  }
+
+  nscoord VelocityComponent(double aTimeProgress,
+                            const SMILKeySpline& aTimingFunction,
+                            nscoord aStart, nscoord aDestination) const;
+
+  TimeDuration ComputeDuration(const TimeStamp& aTime);
+
+  void InitTimingFunction(SMILKeySpline& aTimingFunction, nscoord aCurrentPos,
+                          nscoord aCurrentVelocity, nscoord aDestination);
+
+  void InitializeHistory(const TimeStamp& aTime);
+
+  ScrollAnimationBezierPhysicsSettings mSettings;
+
+  TimeStamp mPrevEventTime[3];
+
+  TimeStamp mStartTime;
+
+  nsPoint mStartPos;
+  nsPoint mDestination;
+  TimeDuration mDuration;
+  SMILKeySpline mTimingFunctionX;
+  SMILKeySpline mTimingFunctionY;
+  bool mIsFirstIteration;
+};
+
+}  
+
+#endif  // mozilla_layout_ScrollAnimationBezierPhysics_h_

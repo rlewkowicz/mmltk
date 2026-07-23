@@ -1,0 +1,71 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_CUBEBINPUTSTREAM_H_
+#define DOM_MEDIA_CUBEBINPUTSTREAM_H_
+
+#include "CubebUtils.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
+#include "nsISupportsImpl.h"
+
+namespace mozilla {
+
+class CubebInputStream final {
+ public:
+  ~CubebInputStream() = default;
+
+  class Listener {
+   public:
+    NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING;
+
+    virtual long DataCallback(const void* aBuffer, long aFrames) = 0;
+    virtual void StateCallback(cubeb_state aState) = 0;
+    virtual void DeviceChangedCallback() = 0;
+
+   protected:
+    Listener() = default;
+    virtual ~Listener() = default;
+  };
+
+  static UniquePtr<CubebInputStream> Create(cubeb_devid aDeviceId,
+                                            uint32_t aChannels, uint32_t aRate,
+                                            bool aIsVoice, Listener* aListener);
+
+  int Start();
+
+  int Stop();
+
+  int SetProcessingParams(cubeb_input_processing_params aParams);
+
+  int Latency(uint32_t* aLatencyFrames);
+
+ private:
+  struct CubebDestroyPolicy {
+    void operator()(cubeb_stream* aStream) const;
+  };
+  CubebInputStream(already_AddRefed<Listener> aListener,
+                   already_AddRefed<CubebUtils::CubebHandle> aCubeb,
+                   UniquePtr<cubeb_stream, CubebDestroyPolicy>&& aStream);
+
+  void Init();
+
+  template <typename Function, typename... Args>
+  int InvokeCubeb(Function aFunction, Args&&... aArgs);
+
+  static long DataCallback_s(cubeb_stream* aStream, void* aUser,
+                             const void* aInputBuffer, void* aOutputBuffer,
+                             long aFrames);
+  static void StateCallback_s(cubeb_stream* aStream, void* aUser,
+                              cubeb_state aState);
+  static void DeviceChangedCallback_s(void* aUser);
+
+  const RefPtr<Listener> mListener;
+  const RefPtr<CubebUtils::CubebHandle> mCubeb;
+  const UniquePtr<cubeb_stream, CubebDestroyPolicy> mStream;
+};
+
+}  
+
+#endif  // DOM_MEDIA_CUBEBINPUTSTREAM_H_

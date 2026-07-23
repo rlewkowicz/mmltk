@@ -1,0 +1,765 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ImportMap.h"
+
+#include "js/Array.h"                 // IsArrayObject
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#include "js/JSON.h"                  // JS_ParseJSON
+#include "js/PropertyDescriptor.h"    // JS::PropertyDescriptor
+#include "mozilla/StaticPrefs_dom.h"
+#include "LoadedScript.h"
+#include "ModuleLoaderBase.h"  // ScriptLoaderInterface
+#include "nsContentUtils.h"
+#include "nsIScriptElement.h"
+#include "nsIScriptError.h"
+#include "nsJSUtils.h"  // nsAutoJSString
+#include "nsNetUtil.h"  // NS_NewURI
+#include "ScriptLoadRequest.h"
+
+using JS::SourceText;
+using mozilla::Err;
+using mozilla::LazyLogModule;
+using mozilla::MakeUnique;
+using mozilla::UniquePtr;
+using mozilla::WrapNotNull;
+
+namespace JS::loader {
+
+LazyLogModule ImportMap::gImportMapLog("ImportMap");
+
+#undef LOG
+#define LOG(args) \
+  MOZ_LOG(ImportMap::gImportMapLog, mozilla::LogLevel::Debug, args)
+
+#define LOG_ENABLED() \
+  MOZ_LOG_TEST(ImportMap::gImportMapLog, mozilla::LogLevel::Debug)
+
+template <typename... Args>
+void ReportWarningHelper::Report(const char* aMessageName,
+                                 Args&&... aArgs) const {
+  AutoTArray<nsString, sizeof...(aArgs)> array;
+  (array.AppendElement(aArgs), ...);
+  mLoader->ReportWarningToConsole(mRequest, aMessageName, array);
+}
+
+using ResolveURLLikeResult =
+    mozilla::Result<mozilla::NotNull<nsCOMPtr<nsIURI>>, ResolveError>;
+
+static ResolveURLLikeResult ResolveURLLikeModuleSpecifier(
+    const nsAString& aSpecifier, nsIURI* aBaseURL) {
+  nsCOMPtr<nsIURI> uri;
+  nsresult rv;
+
+  if (StringBeginsWith(aSpecifier, u"/"_ns) ||
+      StringBeginsWith(aSpecifier, u"./"_ns) ||
+      StringBeginsWith(aSpecifier, u"../"_ns)) {
+    rv = NS_NewURI(getter_AddRefs(uri), aSpecifier, nullptr, aBaseURL);
+    if (NS_FAILED(rv)) {
+      return Err(ResolveError::Failure);
+    }
+
+    return WrapNotNull(uri);
+  }
+
+  rv = NS_NewURI(getter_AddRefs(uri), aSpecifier);
+  if (NS_FAILED(rv)) {
+    return Err(ResolveError::FailureMayBeBare);
+  }
+
+  return WrapNotNull(uri);
+}
+
+static void NormalizeSpecifierKey(const nsAString& aSpecifierKey,
+                                  nsIURI* aBaseURL,
+                                  const ReportWarningHelper& aWarning,
+                                  nsAString& aRetVal) {
+  if (aSpecifierKey.IsEmpty()) {
+    aWarning.Report("ImportMapEmptySpecifierKeys");
+
+    aRetVal = EmptyString();
+    return;
+  }
+
+  auto parseResult = ResolveURLLikeModuleSpecifier(aSpecifierKey, aBaseURL);
+
+  if (parseResult.isOk()) {
+    nsCOMPtr<nsIURI> url = parseResult.unwrap();
+    aRetVal = NS_ConvertUTF8toUTF16(url->GetSpecOrDefault());
+    return;
+  }
+
+  aRetVal = aSpecifierKey;
+}
+
+static UniquePtr<SpecifierMap> SortAndNormalizeSpecifierMap(
+    JSContext* aCx, HandleObject aOriginalMap, nsIURI* aBaseURL,
+    const ReportWarningHelper& aWarning) {
+  UniquePtr<SpecifierMap> normalized = MakeUnique<SpecifierMap>();
+
+  Rooted<IdVector> specifierKeys(aCx, IdVector(aCx));
+  if (!JS_Enumerate(aCx, aOriginalMap, &specifierKeys)) {
+    return nullptr;
+  }
+
+  for (size_t i = 0; i < specifierKeys.length(); i++) {
+    const RootedId specifierId(aCx, specifierKeys[i]);
+    nsAutoJSString specifierKey;
+    NS_ENSURE_TRUE(specifierKey.init(aCx, specifierId), nullptr);
+
+    nsString normalizedSpecifierKey;
+    NormalizeSpecifierKey(specifierKey, aBaseURL, aWarning,
+                          normalizedSpecifierKey);
+
+    if (normalizedSpecifierKey.IsEmpty()) {
+      continue;
+    }
+
+    RootedValue idVal(aCx);
+    NS_ENSURE_TRUE(JS_GetPropertyById(aCx, aOriginalMap, specifierId, &idVal),
+                   nullptr);
+    if (!idVal.isString()) {
+      aWarning.Report("ImportMapAddressesNotStrings");
+
+      normalized->insert_or_assign(normalizedSpecifierKey, nullptr);
+
+      continue;
+    }
+
+    nsAutoJSString value;
+    NS_ENSURE_TRUE(value.init(aCx, idVal), nullptr);
+
+    auto parseResult = ResolveURLLikeModuleSpecifier(value, aBaseURL);
+
+    if (parseResult.isErr()) {
+      aWarning.Report("ImportMapInvalidAddress", value);
+
+      normalized->insert_or_assign(normalizedSpecifierKey, nullptr);
+
+      continue;
+    }
+
+    nsCOMPtr<nsIURI> addressURL = parseResult.unwrap();
+    nsCString address = addressURL->GetSpecOrDefault();
+    if (StringEndsWith(specifierKey, u"/"_ns) &&
+        !StringEndsWith(address, "/"_ns)) {
+      aWarning.Report("ImportMapAddressNotEndsWithSlash", specifierKey,
+                      NS_ConvertUTF8toUTF16(address));
+
+      normalized->insert_or_assign(normalizedSpecifierKey, nullptr);
+
+      continue;
+    }
+
+    LOG(("ImportMap::SortAndNormalizeSpecifierMap {%s, %s}",
+         NS_ConvertUTF16toUTF8(normalizedSpecifierKey).get(),
+         addressURL->GetSpecOrDefault().get()));
+
+    normalized->insert_or_assign(normalizedSpecifierKey, addressURL);
+  }
+
+  return normalized;
+}
+
+static bool IsMapObject(JSContext* aCx, HandleValue aMapVal, bool* aIsMap) {
+  MOZ_ASSERT(aIsMap);
+
+  *aIsMap = false;
+  if (!aMapVal.isObject()) {
+    return true;
+  }
+
+  bool isArray;
+  if (!IsArrayObject(aCx, aMapVal, &isArray)) {
+    return false;
+  }
+
+  *aIsMap = !isArray;
+  return true;
+}
+
+static UniquePtr<ScopeMap> SortAndNormalizeScopes(
+    JSContext* aCx, HandleObject aOriginalMap, nsIURI* aBaseURL,
+    const ReportWarningHelper& aWarning) {
+  Rooted<IdVector> scopeKeys(aCx, IdVector(aCx));
+  if (!JS_Enumerate(aCx, aOriginalMap, &scopeKeys)) {
+    return nullptr;
+  }
+
+  UniquePtr<ScopeMap> normalized = MakeUnique<ScopeMap>();
+
+  for (size_t i = 0; i < scopeKeys.length(); i++) {
+    const RootedId scopeKey(aCx, scopeKeys[i]);
+    nsAutoJSString scopePrefix;
+    NS_ENSURE_TRUE(scopePrefix.init(aCx, scopeKey), nullptr);
+
+    RootedValue mapVal(aCx);
+    NS_ENSURE_TRUE(JS_GetPropertyById(aCx, aOriginalMap, scopeKey, &mapVal),
+                   nullptr);
+
+    bool isMap;
+    if (!IsMapObject(aCx, mapVal, &isMap)) {
+      return nullptr;
+    }
+    if (!isMap) {
+      const char16_t* scope = scopePrefix.get();
+      JS_ReportErrorNumberUC(aCx, js::GetErrorMessage, nullptr,
+                             JSMSG_IMPORT_MAPS_SCOPE_VALUE_NOT_A_MAP, scope);
+      return nullptr;
+    }
+
+    nsCOMPtr<nsIURI> scopePrefixURL;
+    nsresult rv = NS_NewURI(getter_AddRefs(scopePrefixURL), scopePrefix,
+                            nullptr, aBaseURL);
+
+    if (NS_FAILED(rv)) {
+      aWarning.Report("ImportMapScopePrefixNotParseable", scopePrefix);
+
+      continue;
+    }
+
+    nsCString normalizedScopePrefix = scopePrefixURL->GetSpecOrDefault();
+
+    RootedObject potentialSpecifierMap(aCx, &mapVal.toObject());
+    UniquePtr<SpecifierMap> specifierMap = SortAndNormalizeSpecifierMap(
+        aCx, potentialSpecifierMap, aBaseURL, aWarning);
+    if (!specifierMap) {
+      return nullptr;
+    }
+
+    normalized->insert_or_assign(normalizedScopePrefix,
+                                 std::move(specifierMap));
+  }
+
+  return normalized;
+}
+
+static UniquePtr<IntegrityMap> NormalizeIntegrity(
+    JSContext* aCx, HandleObject aOriginalMap, nsIURI* aBaseURL,
+    const ReportWarningHelper& aWarning) {
+  UniquePtr<IntegrityMap> normalized = MakeUnique<IntegrityMap>();
+
+  Rooted<IdVector> keys(aCx, IdVector(aCx));
+  if (!JS_Enumerate(aCx, aOriginalMap, &keys)) {
+    return nullptr;
+  }
+
+  for (size_t i = 0; i < keys.length(); i++) {
+    const RootedId keyId(aCx, keys[i]);
+    nsAutoJSString key;
+    NS_ENSURE_TRUE(key.init(aCx, keyId), nullptr);
+
+    auto parseResult = ResolveURLLikeModuleSpecifier(key, aBaseURL);
+
+    if (parseResult.isErr()) {
+      aWarning.Report("ImportMapInvalidAddress", key);
+
+      continue;
+    }
+
+    nsCOMPtr<nsIURI> resolvedURL = parseResult.unwrap();
+
+    RootedValue idVal(aCx);
+    NS_ENSURE_TRUE(JS_GetPropertyById(aCx, aOriginalMap, keyId, &idVal),
+                   nullptr);
+
+    if (!idVal.isString()) {
+      aWarning.Report("ImportMapIntegrityValuesNotStrings");
+      continue;
+    }
+
+    nsAutoJSString value;
+    NS_ENSURE_TRUE(value.init(aCx, idVal), nullptr);
+
+    normalized->insert_or_assign(resolvedURL->GetSpecOrDefault(), value);
+  }
+
+  return normalized;
+}
+
+static bool GetOwnProperty(JSContext* aCx, Handle<JSObject*> aObj,
+                           const char* aName, MutableHandle<Value> aValueOut) {
+  JS::Rooted<mozilla::Maybe<JS::PropertyDescriptor>> desc(aCx);
+  if (!JS_GetOwnPropertyDescriptor(aCx, aObj, aName, &desc)) {
+    return false;
+  }
+
+  if (desc.isNothing()) {
+    return true;
+  }
+  MOZ_ASSERT(!desc->isAccessorDescriptor());
+  aValueOut.set(desc->value());
+  return true;
+}
+
+bool ImportMap::IsMultipleImportMapsSupported() {
+  return NS_IsMainThread() &&
+         mozilla::StaticPrefs::dom_multiple_import_maps_enabled();
+}
+
+UniquePtr<ImportMap> ImportMap::ParseString(
+    JSContext* aCx, SourceText<char16_t>& aInput, nsIURI* aBaseURL,
+    const ReportWarningHelper& aWarning) {
+  Rooted<Value> parsedVal(aCx);
+  if (!JS_ParseJSON(aCx, aInput.get(), aInput.length(), &parsedVal)) {
+    NS_WARNING("Parsing Import map string failed");
+
+    MOZ_ASSERT(JS_IsExceptionPending(aCx));
+    Rooted<Value> exn(aCx);
+    if (!JS_GetPendingException(aCx, &exn)) {
+      return nullptr;
+    }
+    MOZ_ASSERT(exn.isObject());
+    Rooted<JSObject*> obj(aCx, &exn.toObject());
+    JS::BorrowedErrorReport err(aCx);
+    MOZ_ALWAYS_TRUE(JS_ErrorFromException(aCx, obj, err));
+    if (err->exnType == JSEXN_SYNTAXERR) {
+      JS_ClearPendingException(aCx);
+      JS_ReportErrorNumberASCII(aCx, js::GetErrorMessage, nullptr,
+                                JSMSG_IMPORT_MAPS_PARSE_FAILED,
+                                err->message().c_str());
+    }
+
+    return nullptr;
+  }
+
+  bool isMap;
+  if (!IsMapObject(aCx, parsedVal, &isMap)) {
+    return nullptr;
+  }
+  if (!isMap) {
+    JS_ReportErrorNumberASCII(aCx, js::GetErrorMessage, nullptr,
+                              JSMSG_IMPORT_MAPS_NOT_A_MAP);
+    return nullptr;
+  }
+
+  RootedObject parsedObj(aCx, &parsedVal.toObject());
+  RootedValue importsVal(aCx);
+  if (!GetOwnProperty(aCx, parsedObj, "imports", &importsVal)) {
+    return nullptr;
+  }
+
+  UniquePtr<SpecifierMap> sortedAndNormalizedImports = nullptr;
+
+  if (!importsVal.isUndefined()) {
+    bool isMap;
+    if (!IsMapObject(aCx, importsVal, &isMap)) {
+      return nullptr;
+    }
+    if (!isMap) {
+      JS_ReportErrorNumberASCII(aCx, js::GetErrorMessage, nullptr,
+                                JSMSG_IMPORT_MAPS_IMPORTS_NOT_A_MAP);
+      return nullptr;
+    }
+
+    RootedObject importsObj(aCx, &importsVal.toObject());
+    sortedAndNormalizedImports =
+        SortAndNormalizeSpecifierMap(aCx, importsObj, aBaseURL, aWarning);
+    if (!sortedAndNormalizedImports) {
+      return nullptr;
+    }
+  }
+
+  RootedValue scopesVal(aCx);
+  if (!GetOwnProperty(aCx, parsedObj, "scopes", &scopesVal)) {
+    return nullptr;
+  }
+
+  UniquePtr<ScopeMap> sortedAndNormalizedScopes = nullptr;
+
+  if (!scopesVal.isUndefined()) {
+    bool isMap;
+    if (!IsMapObject(aCx, scopesVal, &isMap)) {
+      return nullptr;
+    }
+    if (!isMap) {
+      JS_ReportErrorNumberASCII(aCx, js::GetErrorMessage, nullptr,
+                                JSMSG_IMPORT_MAPS_SCOPES_NOT_A_MAP);
+      return nullptr;
+    }
+
+    RootedObject scopesObj(aCx, &scopesVal.toObject());
+    sortedAndNormalizedScopes =
+        SortAndNormalizeScopes(aCx, scopesObj, aBaseURL, aWarning);
+    if (!sortedAndNormalizedScopes) {
+      return nullptr;
+    }
+  }
+
+  RootedValue integrityVal(aCx);
+  if (!GetOwnProperty(aCx, parsedObj, "integrity", &integrityVal)) {
+    return nullptr;
+  }
+
+  UniquePtr<IntegrityMap> normalizedIntegrity = nullptr;
+
+  if (!integrityVal.isUndefined()) {
+    bool isMap;
+    if (!IsMapObject(aCx, integrityVal, &isMap)) {
+      return nullptr;
+    }
+    if (!isMap) {
+      JS_ReportErrorNumberASCII(aCx, js::GetErrorMessage, nullptr,
+                                JSMSG_IMPORT_MAPS_INTEGRITY_NOT_A_MAP);
+      return nullptr;
+    }
+
+    RootedObject integrityObj(aCx, &integrityVal.toObject());
+    normalizedIntegrity =
+        NormalizeIntegrity(aCx, integrityObj, aBaseURL, aWarning);
+    if (!normalizedIntegrity) {
+      return nullptr;
+    }
+  }
+
+  Rooted<IdVector> keys(aCx, IdVector(aCx));
+  if (!JS_Enumerate(aCx, parsedObj, &keys)) {
+    return nullptr;
+  }
+
+  for (size_t i = 0; i < keys.length(); i++) {
+    const RootedId key(aCx, keys[i]);
+    nsAutoJSString val;
+    NS_ENSURE_TRUE(val.init(aCx, key), nullptr);
+    if (val.EqualsLiteral("imports") || val.EqualsLiteral("scopes") ||
+        val.EqualsLiteral("integrity")) {
+      continue;
+    }
+
+    aWarning.Report("ImportMapInvalidTopLevelKey", val);
+  }
+
+  return MakeUnique<ImportMap>(std::move(sortedAndNormalizedImports),
+                               std::move(sortedAndNormalizedScopes),
+                               std::move(normalizedIntegrity));
+}
+
+static bool IsSpecialScheme(nsIURI* aURI) {
+  nsAutoCString scheme;
+  aURI->GetScheme(scheme);
+  return scheme.EqualsLiteral("ftp") || scheme.EqualsLiteral("file") ||
+         scheme.EqualsLiteral("http") || scheme.EqualsLiteral("https") ||
+         scheme.EqualsLiteral("ws") || scheme.EqualsLiteral("wss");
+}
+
+static UniquePtr<SpecifierMap> MergeSpecifierMaps(
+    SpecifierMap* newMap, SpecifierMap* oldMap,
+    const ReportWarningHelper& aWarning) {
+  UniquePtr<SpecifierMap> mergedMap = MakeUnique<SpecifierMap>();
+  for (auto&& [k, v] : *oldMap) {
+    mergedMap->emplace(k, v);
+  }
+
+  for (auto&& [specifier, url] : *newMap) {
+    auto iter = oldMap->find(specifier);
+    if (iter != oldMap->end()) {
+      aWarning.Report("ImportMapSpecifierMapEntryIgnored", specifier);
+
+      continue;
+    }
+
+    if (LOG_ENABLED()) {
+      nsAutoCString urlSpec;
+      if (url) {
+        url->GetSpec(urlSpec);
+      }
+      LOG(("ImportMap::MergeSpecifierMaps, added entry {%s, %s}",
+           NS_ConvertUTF16toUTF8(specifier).get(), urlSpec.get()));
+    }
+
+    mergedMap->insert_or_assign(specifier, url);
+  }
+
+  return mergedMap;
+}
+
+void ImportMap::Merge(ModuleLoaderBase* aModuleLoader,
+                      mozilla::UniquePtr<ImportMap> aNewMap,
+                      const ReportWarningHelper& aWarning) {
+  UniquePtr<ScopeMap> newScopes =
+      aNewMap->mScopes ? std::move(aNewMap->mScopes) : MakeUnique<ScopeMap>();
+  MOZ_ASSERT(newScopes);
+
+  if (!aModuleLoader->GetImportMap()) {
+    aModuleLoader->mImportMap = ImportMap::CreateEmpty();
+  }
+  ImportMap* oldMap = aModuleLoader->GetImportMap();
+  MOZ_ASSERT(oldMap);
+
+  UniquePtr<SpecifierMap> newImports = aNewMap->mImports
+                                           ? std::move(aNewMap->mImports)
+                                           : MakeUnique<SpecifierMap>();
+  MOZ_ASSERT(newImports);
+
+  for (auto&& [scopePrefix, scopeImports] : *newScopes) {
+    for (auto resolvedIter = aModuleLoader->GetResolvedModuleSet()->iter();
+         !resolvedIter.done(); resolvedIter.next()) {
+      const auto& record = resolvedIter.get();
+
+      if (scopePrefix.Equals(record->SerializedBaseURL()) ||
+          (StringEndsWith(scopePrefix, "/"_ns) &&
+           StringBeginsWith(record->SerializedBaseURL(), scopePrefix))) {
+        for (auto iter = scopeImports->begin(); iter != scopeImports->end();) {
+          const auto& specifierKey = iter->first;
+          if (specifierKey.Equals(record->NormalizedSpecifier()) ||
+              (StringEndsWith(specifierKey, u"/"_ns) &&
+               StringBeginsWith(record->NormalizedSpecifier(), specifierKey) &&
+               (record->IsAsURLNull() || record->IsSpecialScheme()))) {
+            LOG(
+                ("ImportMap::Merge, scopes map: prefix:{%s}, specifier:{%s} "
+                 "matches the resolved module specifier {%s} and will be "
+                 "ignored",
+                 scopePrefix.get(), NS_ConvertUTF16toUTF8(specifierKey).get(),
+                 NS_ConvertUTF16toUTF8(record->NormalizedSpecifier()).get()));
+
+            aWarning.Report("ImportMapScopeEntryIgnored",
+                            NS_ConvertUTF8toUTF16(scopePrefix), specifierKey,
+                            record->NormalizedSpecifier());
+
+            iter = scopeImports->erase(iter);
+          } else {
+            ++iter;
+          }
+        }
+      }
+    }
+
+    auto scopeIter = oldMap->mScopes->find(scopePrefix);
+    if ((scopeIter != oldMap->mScopes->end())) {
+      UniquePtr<SpecifierMap> result = MergeSpecifierMaps(
+          scopeImports.get(), scopeIter->second.get(), aWarning);
+      MOZ_ASSERT(result);
+
+      oldMap->mScopes->insert_or_assign(scopePrefix, std::move(result));
+    } else {
+      oldMap->mScopes->insert(
+          std::make_pair(scopePrefix, std::move(scopeImports)));
+    }
+  }
+
+  for (auto&& [url, integrity] : *aNewMap->mIntegrity) {
+    auto it = oldMap->mIntegrity->find(url);
+    if (it != oldMap->mIntegrity->end()) {
+      LOG(
+          ("ImportMap::Merge, integrity map: entry {%s} exists and will be "
+           "ignored",
+           url.get()));
+      aWarning.Report("ImportMapIntegrityEntryIgnored",
+                      NS_ConvertUTF8toUTF16(url));
+
+      continue;
+    }
+
+    oldMap->mIntegrity->insert(std::make_pair(url, integrity));
+  }
+
+  for (auto resolvedIter = aModuleLoader->GetResolvedModuleSet()->iter();
+       !resolvedIter.done(); resolvedIter.next()) {
+    const auto& record = resolvedIter.get();
+
+    for (auto iter = newImports->begin(); iter != newImports->end();) {
+      const auto& specifier = iter->first;
+
+      if (StringBeginsWith(record->NormalizedSpecifier(), specifier)) {
+        LOG(
+            ("ImportMap::Merge, imports map: specifier {%s} matches the "
+             "resolved module specifier {%s} and will be ignored",
+             NS_ConvertUTF16toUTF8(specifier).get(),
+             NS_ConvertUTF16toUTF8(record->NormalizedSpecifier()).get()));
+        aWarning.Report("ImportMapImportsEntryIgnored", specifier,
+                        record->NormalizedSpecifier());
+
+        iter = newImports->erase(iter);
+      } else {
+        ++iter;
+      }
+    }
+  }
+
+  UniquePtr<SpecifierMap> result =
+      MergeSpecifierMaps(newImports.get(), oldMap->mImports.get(), aWarning);
+  MOZ_ASSERT(result);
+
+  oldMap->mImports = std::move(result);
+}
+
+static mozilla::Result<nsCOMPtr<nsIURI>, ResolveError> ResolveImportsMatch(
+    nsString& aNormalizedSpecifier, nsIURI* aAsURL,
+    const SpecifierMap* aSpecifierMap) {
+  for (auto&& [specifierKey, resolutionResult] : *aSpecifierMap) {
+    if (specifierKey.Equals(aNormalizedSpecifier)) {
+      if (!resolutionResult) {
+        LOG(
+            ("ImportMap::ResolveImportsMatch normalizedSpecifier: %s, "
+             "specifierKey: %s, but resolution is null.",
+             NS_ConvertUTF16toUTF8(aNormalizedSpecifier).get(),
+             NS_ConvertUTF16toUTF8(specifierKey).get()));
+        return Err(ResolveError::BlockedByNullEntry);
+      }
+
+      MOZ_ASSERT(resolutionResult);
+
+      return resolutionResult;
+    }
+
+    if (StringEndsWith(specifierKey, u"/"_ns) &&
+        StringBeginsWith(aNormalizedSpecifier, specifierKey) &&
+        (!aAsURL || IsSpecialScheme(aAsURL))) {
+      if (!resolutionResult) {
+        LOG(
+            ("ImportMap::ResolveImportsMatch normalizedSpecifier: %s, "
+             "specifierKey: %s, but resolution is null.",
+             NS_ConvertUTF16toUTF8(aNormalizedSpecifier).get(),
+             NS_ConvertUTF16toUTF8(specifierKey).get()));
+        return Err(ResolveError::BlockedByNullEntry);
+      }
+
+      MOZ_ASSERT(resolutionResult);
+
+      nsAutoString afterPrefix(
+          Substring(aNormalizedSpecifier, specifierKey.Length()));
+
+      MOZ_ASSERT(StringEndsWith(resolutionResult->GetSpecOrDefault(), "/"_ns));
+
+      nsCOMPtr<nsIURI> url;
+      nsresult rv = NS_NewURI(getter_AddRefs(url), afterPrefix, nullptr,
+                              resolutionResult);
+
+      if (NS_FAILED(rv)) {
+        LOG(
+            ("ImportMap::ResolveImportsMatch normalizedSpecifier: %s, "
+             "specifierKey: %s, resolutionResult: %s, afterPrefix: %s, "
+             "but URL is not parsable.",
+             NS_ConvertUTF16toUTF8(aNormalizedSpecifier).get(),
+             NS_ConvertUTF16toUTF8(specifierKey).get(),
+             resolutionResult->GetSpecOrDefault().get(),
+             NS_ConvertUTF16toUTF8(afterPrefix).get()));
+        return Err(ResolveError::BlockedByAfterPrefix);
+      }
+
+      MOZ_ASSERT(url);
+
+      if (!StringBeginsWith(url->GetSpecOrDefault(),
+                            resolutionResult->GetSpecOrDefault())) {
+        LOG(
+            ("ImportMap::ResolveImportsMatch normalizedSpecifier: %s, "
+             "specifierKey: %s, "
+             "url %s does not start with resolutionResult %s.",
+             NS_ConvertUTF16toUTF8(aNormalizedSpecifier).get(),
+             NS_ConvertUTF16toUTF8(specifierKey).get(),
+             url->GetSpecOrDefault().get(),
+             resolutionResult->GetSpecOrDefault().get()));
+        return Err(ResolveError::BlockedByBacktrackingPrefix);
+      }
+
+      return std::move(url);
+    }
+  }
+
+  return nsCOMPtr<nsIURI>(nullptr);
+}
+
+static UniquePtr<SpecifierResolutionRecord> CreateResolutionRecord(
+    ScriptLoaderInterface* aLoader, nsCString& aSerializedBaseURL,
+    nsString& aNormalizedSpecifier, nsIURI* aAsURL, nsIURI* aResult) {
+  bool isURLLike = !!aAsURL;
+  bool isSpecial = aAsURL ? IsSpecialScheme(aAsURL) : false;
+
+  return mozilla::MakeUnique<SpecifierResolutionRecord>(
+      aSerializedBaseURL, aNormalizedSpecifier, aResult, isURLLike, isSpecial);
+}
+
+ResolveResult ImportMap::ResolveModuleSpecifier(ImportMap* aImportMap,
+                                                ScriptLoaderInterface* aLoader,
+                                                ScriptFetchInfo* aFetchInfo,
+                                                const nsAString& aSpecifier) {
+  nsCOMPtr<nsIURI> baseURL;
+  if (aFetchInfo && !aFetchInfo->IsForEvent()) {
+    baseURL = aFetchInfo->BaseURL();
+  } else {
+    baseURL = aLoader->GetBaseURI();
+  }
+
+  nsCString serializedBaseURL = baseURL->GetSpecOrDefault();
+
+  LOG(("ResolveModuleSpecifier baseURL:%s, specifier: %s",
+       serializedBaseURL.get(), NS_ConvertUTF16toUTF8(aSpecifier).get()));
+
+  auto parseResult = ResolveURLLikeModuleSpecifier(aSpecifier, baseURL);
+  nsCOMPtr<nsIURI> asURL;
+  if (parseResult.isOk()) {
+    asURL = parseResult.unwrap();
+  }
+
+  nsAutoString normalizedSpecifier =
+      asURL ? NS_ConvertUTF8toUTF16(asURL->GetSpecOrDefault())
+            : nsAutoString{aSpecifier};
+
+  nsCOMPtr<nsIURI> result;
+
+  if (aImportMap) {
+    for (auto&& [scopePrefix, scopeImports] : *aImportMap->mScopes) {
+      if (scopePrefix.Equals(serializedBaseURL) ||
+          (StringEndsWith(scopePrefix, "/"_ns) &&
+           StringBeginsWith(serializedBaseURL, scopePrefix))) {
+        auto resolveResult =
+            ResolveImportsMatch(normalizedSpecifier, asURL, scopeImports.get());
+        if (resolveResult.isErr()) {
+          return resolveResult.propagateErr();
+        }
+
+        nsCOMPtr<nsIURI> scopeImportsMatch = resolveResult.unwrap();
+        if (scopeImportsMatch) {
+          result = scopeImportsMatch;
+          break;
+        }
+      }
+    }
+
+    if (!result) {
+      auto resolveResult = ResolveImportsMatch(normalizedSpecifier, asURL,
+                                               aImportMap->mImports.get());
+      if (resolveResult.isErr()) {
+        return resolveResult.propagateErr();
+      }
+
+      result = resolveResult.unwrap();
+    }
+  }
+
+  if (!result) {
+    result = asURL;
+  }
+
+  if (result) {
+    LOG(("ResolveModuleSpecifier returns result: %s",
+         result->GetSpecOrDefault().get()));
+
+    return CreateResolutionRecord(aLoader, serializedBaseURL,
+                                  normalizedSpecifier, asURL, result);
+  }
+
+  LOG(("ResolveModuleSpecifier failed to resolve specifier: %s",
+       NS_ConvertUTF16toUTF8(aSpecifier).get()));
+
+  if (parseResult.unwrapErr() != ResolveError::FailureMayBeBare) {
+    return Err(ResolveError::Failure);
+  }
+
+  return Err(ResolveError::InvalidBareSpecifier);
+}
+
+mozilla::Maybe<nsString> ImportMap::LookupIntegrity(ImportMap* aImportMap,
+                                                    nsIURI* aURL) {
+  auto it = aImportMap->mIntegrity->find(aURL->GetSpecOrDefault());
+  if (it == aImportMap->mIntegrity->end()) {
+    return mozilla::Nothing();
+  }
+
+  return mozilla::Some(it->second);
+}
+
+#undef LOG
+#undef LOG_ENABLED
+}  

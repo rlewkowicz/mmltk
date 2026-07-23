@@ -1,0 +1,38 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_ScrollLinkedEffectDetector_h
+#define mozilla_layers_ScrollLinkedEffectDetector_h
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/TimeStamp.h"
+
+namespace mozilla {
+
+namespace dom {
+class Document;
+}
+
+namespace layers {
+
+class MOZ_STACK_CLASS ScrollLinkedEffectDetector final {
+ private:
+  static uint32_t sDepth;
+  static bool sFoundScrollLinkedEffect;
+
+ public:
+  static void PositioningPropertyMutated();
+
+  ScrollLinkedEffectDetector(dom::Document*, const TimeStamp& aTimeStamp);
+  ~ScrollLinkedEffectDetector();
+
+ private:
+  RefPtr<dom::Document> mDocument;
+  TimeStamp mTimeStamp;
+};
+
+}  
+}  
+
+#endif /* mozilla_layers_ScrollLinkedEffectDetector_h */

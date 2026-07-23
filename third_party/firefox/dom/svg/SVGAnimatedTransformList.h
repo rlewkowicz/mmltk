@@ -1,0 +1,110 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGANIMATEDTRANSFORMLIST_H_
+#define DOM_SVG_SVGANIMATEDTRANSFORMLIST_H_
+
+#include <memory>
+
+#include "mozilla/SMILAttr.h"
+#include "mozilla/dom/SVGTransformList.h"
+
+class nsAtom;
+
+namespace mozilla {
+
+class SMILValue;
+
+namespace dom {
+class SVGAnimationElement;
+class SVGElement;
+class DOMSVGTransform;
+}  
+
+class SVGAnimatedTransformList {
+  friend class dom::DOMSVGTransform;
+  friend class dom::DOMSVGTransformList;
+
+ public:
+  SVGAnimatedTransformList()
+      : mIsBaseSet(false), mCreatedOrRemovedOnLastChange(true) {}
+
+  SVGAnimatedTransformList& operator=(const SVGAnimatedTransformList& aOther) {
+    mBaseVal = aOther.mBaseVal;
+    if (aOther.mAnimVal) {
+      mAnimVal = std::make_unique<SVGTransformList>(*aOther.mAnimVal);
+    }
+    mIsBaseSet = aOther.mIsBaseSet;
+    mCreatedOrRemovedOnLastChange = aOther.mCreatedOrRemovedOnLastChange;
+    return *this;
+  }
+
+  const SVGTransformList& GetBaseValue() const { return mBaseVal; }
+
+  nsresult SetBaseValue(const SVGTransformList& aValue,
+                        dom::SVGElement* aSVGElement);
+
+  nsresult SetBaseValueString(const nsAString& aValue,
+                              dom::SVGElement* aSVGElement);
+
+  void ClearBaseValue();
+
+  const SVGTransformList& GetAnimValue() const {
+    return mAnimVal ? *mAnimVal : mBaseVal;
+  }
+
+  nsresult SetAnimValue(const SVGTransformList& aValue,
+                        dom::SVGElement* aElement);
+
+  void ClearAnimValue(dom::SVGElement* aElement);
+
+  bool IsExplicitlySet() const;
+
+  bool HasTransform() const {
+    return (mAnimVal && !mAnimVal->IsEmpty()) || !mBaseVal.IsEmpty();
+  }
+
+  bool IsAnimating() const { return !!mAnimVal; }
+
+  bool CreatedOrRemovedOnLastChange() const {
+    return mCreatedOrRemovedOnLastChange;
+  }
+
+  std::unique_ptr<SMILAttr> ToSMILAttr(dom::SVGElement* aSVGElement);
+
+ private:
+
+  SVGTransformList mBaseVal;
+  std::unique_ptr<SVGTransformList> mAnimVal;
+  bool mIsBaseSet;
+  bool mCreatedOrRemovedOnLastChange;
+
+  struct SMILAnimatedTransformList : public SMILAttr {
+   public:
+    SMILAnimatedTransformList(SVGAnimatedTransformList* aVal,
+                              dom::SVGElement* aSVGElement)
+        : mVal(aVal), mElement(aSVGElement) {}
+
+    nsresult ValueFromString(const nsAString& aStr,
+                             const dom::SVGAnimationElement* aSrcElement,
+                             SMILValue& aValue,
+                             bool& aPreventCachingOfSandwich) const override;
+    SMILValue GetBaseValue() const override;
+    void ClearAnimValue() override;
+    nsresult SetAnimValue(const SMILValue& aNewAnimValue) override;
+
+   protected:
+    static void ParseValue(const nsAString& aSpec, uint16_t aTransformType,
+                           SMILValue& aResult);
+    static int32_t ParseParameterList(
+        const nsAString& aSpec, SVGTransformSMILData::SimpleParams& aParams);
+
+    SVGAnimatedTransformList* mVal;
+    dom::SVGElement* mElement;
+  };
+};
+
+}  
+
+#endif  // DOM_SVG_SVGANIMATEDTRANSFORMLIST_H_

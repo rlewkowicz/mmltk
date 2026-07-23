@@ -1,0 +1,546 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#if !defined(PLDHashTable_h)
+#define PLDHashTable_h
+
+#include <utility>
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/CheckedArithmetic.h"
+#include "mozilla/HashFunctions.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/fallible.h"
+#include "nscore.h"
+
+using PLDHashNumber = mozilla::HashNumber;
+static const uint32_t kPLDHashNumberBits = mozilla::kHashNumberBits;
+
+#if defined(DEBUG) || 0
+#  define MOZ_HASH_TABLE_CHECKS_ENABLED 1
+#endif
+
+class PLDHashTable;
+struct PLDHashTableOps;
+
+struct PLDHashEntryHdr {
+  PLDHashEntryHdr() = default;
+  PLDHashEntryHdr(const PLDHashEntryHdr&) = delete;
+  PLDHashEntryHdr& operator=(const PLDHashEntryHdr&) = delete;
+  PLDHashEntryHdr(PLDHashEntryHdr&&) = default;
+  PLDHashEntryHdr& operator=(PLDHashEntryHdr&&) = default;
+
+ private:
+  friend class PLDHashTable;
+};
+
+#if defined(MOZ_HASH_TABLE_CHECKS_ENABLED)
+
+class Checker {
+ public:
+  constexpr Checker() : mState(kIdle), mIsWritable(true) {}
+
+  Checker& operator=(Checker&& aOther) {
+    mState = uint32_t(aOther.mState);
+    mIsWritable = bool(aOther.mIsWritable);
+
+    aOther.mState = kIdle;
+
+    return *this;
+  }
+
+  static bool IsIdle(uint32_t aState) { return aState == kIdle; }
+  static bool IsRead(uint32_t aState) {
+    return kRead1 <= aState && aState <= kReadMax;
+  }
+  static bool IsRead1(uint32_t aState) { return aState == kRead1; }
+  static bool IsWrite(uint32_t aState) { return aState == kWrite; }
+
+  bool IsIdle() const { return mState == kIdle; }
+
+  bool IsWritable() const { return mIsWritable; }
+
+  void SetNonWritable() { mIsWritable = false; }
+
+
+  void StartReadOp() {
+    uint32_t oldState = mState++;  
+    MOZ_RELEASE_ASSERT(IsIdle(oldState) || IsRead(oldState));
+    MOZ_RELEASE_ASSERT(oldState < kReadMax);  
+  }
+
+  void EndReadOp() {
+    uint32_t oldState = mState--;  
+    MOZ_RELEASE_ASSERT(IsRead(oldState));
+  }
+
+  void StartWriteOp() {
+    MOZ_RELEASE_ASSERT(IsWritable());
+    uint32_t oldState = mState.exchange(kWrite);
+    MOZ_RELEASE_ASSERT(IsIdle(oldState));
+  }
+
+  void EndWriteOp() {
+    MOZ_RELEASE_ASSERT(IsWritable());
+    uint32_t oldState = mState.exchange(kIdle);
+    MOZ_RELEASE_ASSERT(IsWrite(oldState));
+  }
+
+  void StartIteratorRemovalOp() {
+    MOZ_RELEASE_ASSERT(IsWritable());
+    uint32_t oldState = mState.exchange(kWrite);
+    MOZ_RELEASE_ASSERT(IsRead1(oldState));
+  }
+
+  void EndIteratorRemovalOp() {
+    MOZ_RELEASE_ASSERT(IsWritable());
+    uint32_t oldState = mState.exchange(kRead1);
+    MOZ_RELEASE_ASSERT(IsWrite(oldState));
+  }
+
+  void StartDestructorOp() {
+    uint32_t oldState = mState.exchange(kWrite);
+    MOZ_RELEASE_ASSERT(IsIdle(oldState));
+  }
+
+  void EndDestructorOp() {
+    uint32_t oldState = mState.exchange(kIdle);
+    MOZ_RELEASE_ASSERT(IsWrite(oldState));
+  }
+
+ private:
+  static const uint32_t kIdle = 0;
+  static const uint32_t kRead1 = 1;
+  static const uint32_t kReadMax = 9999;
+  static const uint32_t kWrite = 10000;
+
+  mozilla::Atomic<uint32_t, mozilla::SequentiallyConsistent> mState;
+  mozilla::Atomic<bool, mozilla::SequentiallyConsistent> mIsWritable;
+};
+#endif
+
+class PLDHashTable {
+ private:
+  struct Slot {
+    Slot(PLDHashEntryHdr* aEntry, PLDHashNumber* aKeyHash)
+        : mEntry(aEntry), mKeyHash(aKeyHash) {}
+
+    Slot(const Slot&) = default;
+    Slot(Slot&& aOther) = default;
+
+    Slot& operator=(Slot&& aOther) = default;
+
+    bool operator==(const Slot& aOther) const {
+      return mEntry == aOther.mEntry;
+    }
+
+    PLDHashNumber KeyHash() const { return *HashPtr(); }
+    void SetKeyHash(PLDHashNumber aHash) { *HashPtr() = aHash; }
+
+    PLDHashEntryHdr* ToEntry() const { return mEntry; }
+
+    bool IsFree() const { return KeyHash() == 0; }
+    bool IsRemoved() const { return KeyHash() == 1; }
+    bool IsLive() const { return IsLiveHash(KeyHash()); }
+    static bool IsLiveHash(uint32_t aHash) { return aHash >= 2; }
+
+    void MarkFree() { *HashPtr() = 0; }
+    void MarkRemoved() { *HashPtr() = 1; }
+    void MarkColliding() { *HashPtr() |= kCollisionFlag; }
+
+    void Next(uint32_t aEntrySize) {
+      char* p = reinterpret_cast<char*>(mEntry);
+      p += aEntrySize;
+      mEntry = reinterpret_cast<PLDHashEntryHdr*>(p);
+      mKeyHash++;
+    }
+    PLDHashNumber* HashPtr() const { return mKeyHash; }
+
+   private:
+    PLDHashEntryHdr* mEntry;
+    PLDHashNumber* mKeyHash;
+  };
+
+  class EntryStore {
+   private:
+    char* mEntryStore;
+
+    static char* Entries(char* aStore, uint32_t aCapacity) {
+      return aStore + aCapacity * sizeof(PLDHashNumber);
+    }
+
+    char* Entries(uint32_t aCapacity) const {
+      return Entries(Get(), aCapacity);
+    }
+
+   public:
+    constexpr EntryStore() : mEntryStore(nullptr) {}
+
+    ~EntryStore() {
+      free(mEntryStore);
+      mEntryStore = nullptr;
+    }
+
+    char* Get() const { return mEntryStore; }
+    bool IsAllocated() const { return !!mEntryStore; }
+
+    Slot SlotForIndex(uint32_t aIndex, uint32_t aEntrySize,
+                      uint32_t aCapacity) const {
+      char* entries = Entries(aCapacity);
+      auto entry =
+          reinterpret_cast<PLDHashEntryHdr*>(entries + aIndex * aEntrySize);
+      auto hashes = reinterpret_cast<PLDHashNumber*>(Get());
+      return Slot(entry, &hashes[aIndex]);
+    }
+
+    Slot SlotForPLDHashEntry(PLDHashEntryHdr* aEntry, uint32_t aCapacity,
+                             uint32_t aEntrySize) {
+      char* entries = Entries(aCapacity);
+      char* entry = reinterpret_cast<char*>(aEntry);
+      uint32_t entryOffset = entry - entries;
+      uint32_t slotIndex = entryOffset / aEntrySize;
+      return SlotForIndex(slotIndex, aEntrySize, aCapacity);
+    }
+
+    template <typename F>
+    void ForEachSlot(uint32_t aCapacity, uint32_t aEntrySize, F&& aFunc) {
+      ForEachSlot(Get(), aCapacity, aEntrySize, std::forward<F>(aFunc));
+    }
+
+    template <typename F>
+    static void ForEachSlot(char* aStore, uint32_t aCapacity,
+                            uint32_t aEntrySize, F&& aFunc) {
+      char* entries = Entries(aStore, aCapacity);
+      Slot slot(reinterpret_cast<PLDHashEntryHdr*>(entries),
+                reinterpret_cast<PLDHashNumber*>(aStore));
+      for (size_t i = 0; i < aCapacity; ++i) {
+        aFunc(slot);
+        slot.Next(aEntrySize);
+      }
+    }
+
+    void Set(char* aEntryStore, uint16_t* aGeneration) {
+      mEntryStore = aEntryStore;
+      *aGeneration += 1;
+    }
+  };
+
+  const PLDHashTableOps* const mOps =
+      nullptr;                   
+  EntryStore mEntryStore;        
+  uint16_t mGeneration = 0;      
+  uint8_t mHashShift = 0;        
+  const uint8_t mEntrySize = 0;  
+  uint32_t mEntryCount = 0;      
+  uint32_t mRemovedCount = 0;    
+
+#if defined(MOZ_HASH_TABLE_CHECKS_ENABLED)
+  mutable Checker mChecker;
+#endif
+
+ public:
+  static const uint32_t kMaxCapacity = ((uint32_t)1 << 26);
+
+  static const uint32_t kMinCapacity = 8;
+
+  static const uint32_t kMaxInitialLength = kMaxCapacity / 2;
+
+  static const uint32_t kDefaultInitialLength = 4;
+
+  constexpr PLDHashTable(const PLDHashTableOps* aOps, uint32_t aEntrySize,
+                         uint32_t aLength = kDefaultInitialLength)
+      : mOps(aOps),
+        mHashShift(HashShift(aEntrySize, aLength)),
+        mEntrySize(static_cast<uint8_t>(aEntrySize)) {
+    if (aEntrySize > std::numeric_limits<uint8_t>::max()) {
+      MOZ_CRASH("Entry size is too large");
+    }
+  }
+
+  PLDHashTable(PLDHashTable&& aOther)
+  {
+    *this = std::move(aOther);
+  }
+
+  PLDHashTable& operator=(PLDHashTable&& aOther);
+
+  PLDHashTable(const PLDHashTable& aOther) = delete;
+  PLDHashTable& operator=(const PLDHashTable& aOther) = delete;
+
+  ~PLDHashTable();
+
+  const PLDHashTableOps* Ops() const { return mOps; }
+
+  uint32_t Capacity() const {
+    return mEntryStore.IsAllocated() ? CapacityFromHashShift() : 0;
+  }
+
+  uint32_t EntrySize() const { return mEntrySize; }
+  uint32_t EntryCount() const { return mEntryCount; }
+  bool IsEmpty() const { return mEntryCount == 0; }
+  uint32_t Generation() const { return mGeneration; }
+
+  PLDHashEntryHdr* Search(const void* aKey) const;
+
+  PLDHashEntryHdr* Add(const void* aKey, const mozilla::fallible_t&);
+
+  PLDHashEntryHdr* Add(const void* aKey);
+
+  void Remove(const void* aKey);
+
+  void RemoveEntry(PLDHashEntryHdr* aEntry);
+
+  void RawRemove(PLDHashEntryHdr* aEntry);
+
+  void Clear();
+
+  void ClearAndRetainStorage();
+
+  void ClearAndPrepareForLength(uint32_t aLength);
+
+  size_t ShallowSizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+  size_t ShallowSizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+  void MarkImmutable() {
+#if defined(MOZ_HASH_TABLE_CHECKS_ENABLED)
+    mChecker.SetNonWritable();
+#endif
+  }
+
+  static const PLDHashTableOps* StubOps();
+
+  static PLDHashNumber HashVoidPtrKeyStub(const void* aKey);
+  static bool MatchEntryStub(const PLDHashEntryHdr* aEntry, const void* aKey);
+  static void MoveEntryStub(PLDHashTable* aTable, const PLDHashEntryHdr* aFrom,
+                            PLDHashEntryHdr* aTo);
+  static void ClearEntryStub(PLDHashTable* aTable, PLDHashEntryHdr* aEntry);
+
+  static PLDHashNumber HashStringKey(const void* aKey);
+  static bool MatchStringKey(const PLDHashEntryHdr* aEntry, const void* aKey);
+
+  class EntryHandle {
+   public:
+    EntryHandle(EntryHandle&& aOther) noexcept;
+#if defined(MOZ_HASH_TABLE_CHECKS_ENABLED)
+    ~EntryHandle();
+#endif
+
+    EntryHandle(const EntryHandle&) = delete;
+    EntryHandle& operator=(const EntryHandle&) = delete;
+    EntryHandle& operator=(EntryHandle&& aOther) = delete;
+
+    bool HasEntry() const { return mSlot.IsLive(); }
+
+    explicit operator bool() const { return HasEntry(); }
+
+    PLDHashEntryHdr* Entry() {
+      MOZ_ASSERT(HasEntry());
+      return mSlot.ToEntry();
+    }
+
+    template <class F>
+    void Insert(F&& aInitEntry) {
+      MOZ_ASSERT(!HasEntry());
+      OccupySlot();
+      std::forward<F>(aInitEntry)(Entry());
+    }
+
+    template <class F>
+    PLDHashEntryHdr* OrInsert(F&& aInitEntry) {
+      if (!HasEntry()) {
+        Insert(std::forward<F>(aInitEntry));
+      }
+      return Entry();
+    }
+
+    void Remove();
+
+    void OrRemove();
+
+   private:
+    friend class PLDHashTable;
+
+    EntryHandle(PLDHashTable* aTable, PLDHashNumber aKeyHash, Slot aSlot);
+
+    void OccupySlot();
+
+    PLDHashTable* mTable;
+    PLDHashNumber mKeyHash;
+    Slot mSlot;
+  };
+
+  template <class F>
+  auto WithEntryHandle(const void* aKey, F&& aFunc)
+      -> std::invoke_result_t<F, EntryHandle&&> {
+    return std::forward<F>(aFunc)(MakeEntryHandle(aKey));
+  }
+
+  template <class F>
+  auto WithEntryHandle(const void* aKey, const mozilla::fallible_t& aFallible,
+                       F&& aFunc)
+      -> std::invoke_result_t<F, mozilla::Maybe<EntryHandle>&&> {
+    return std::forward<F>(aFunc)(MakeEntryHandle(aKey, aFallible));
+  }
+
+  class Iterator {
+   public:
+    explicit Iterator(PLDHashTable* aTable);
+    Iterator() = delete;
+    Iterator& operator=(const Iterator&) = delete;
+    Iterator& operator=(const Iterator&&) = delete;
+
+    struct EndIteratorTag {};
+    Iterator(PLDHashTable* aTable, EndIteratorTag aTag);
+    Iterator(Iterator&& aOther);
+    ~Iterator();
+
+    bool Done() const { return mNexts == mNextsLimit; }
+
+    PLDHashEntryHdr* Get() const {
+      MOZ_ASSERT(!Done());
+      MOZ_ASSERT(mCurrent.IsLive());
+      return mCurrent.ToEntry();
+    }
+
+    void Next();
+
+    void Remove();
+
+    bool operator==(const Iterator& aOther) const {
+      MOZ_ASSERT(mTable == aOther.mTable);
+      return mNexts == aOther.mNexts;
+    }
+
+    Iterator Clone() const { return {*this}; }
+
+   protected:
+    PLDHashTable* mTable;  
+
+   private:
+    Slot mCurrent;         
+    uint32_t mNexts;       
+    uint32_t mNextsLimit;  
+
+    bool mHaveRemoved;   
+    uint8_t mEntrySize;  
+
+    bool IsOnNonLiveEntry() const;
+
+    void MoveToNextLiveEntry();
+
+    Iterator(const Iterator&);
+  };
+
+  Iterator Iter() { return Iterator(this); }
+
+  Iterator ConstIter() const {
+    return Iterator(const_cast<PLDHashTable*>(this));
+  }
+
+ private:
+  static constexpr std::tuple<uint32_t, uint32_t> BestCapacity(
+      uint32_t aLength) {
+    MOZ_ASSERT(aLength <= PLDHashTable::kMaxInitialLength);
+
+    uint32_t capacity =
+        (aLength * 4 + (3 - 1)) / 3;  
+    if (capacity < PLDHashTable::kMinCapacity) {
+      capacity = PLDHashTable::kMinCapacity;
+    }
+
+    uint32_t log2 = mozilla::CeilingLog2(capacity);
+    capacity = 1u << log2;
+    MOZ_ASSERT(capacity <= PLDHashTable::kMaxCapacity);
+
+    return std::make_tuple(capacity, log2);
+  }
+
+  static constexpr bool SizeOfEntryStore(uint32_t aCapacity,
+                                         uint32_t aEntrySize,
+                                         uint32_t* aNbytes) {
+    uint32_t slotSize = aEntrySize + sizeof(PLDHashNumber);
+    return mozilla::SafeMul(aCapacity, slotSize, aNbytes);
+  }
+
+  static constexpr uint8_t HashShift(uint32_t aEntrySize, uint32_t aLength) {
+    if (aLength > kMaxInitialLength) {
+      MOZ_CRASH("Initial length is too large");
+    }
+
+    auto [capacity, log2] = BestCapacity(aLength);
+
+    [[maybe_unused]] uint32_t nbytes;
+    if (!SizeOfEntryStore(capacity, aEntrySize, &nbytes)) {
+      MOZ_CRASH("Initial entry store size is too large");
+    }
+
+    return static_cast<uint8_t>(kPLDHashNumberBits - log2);
+  }
+
+  static const PLDHashNumber kCollisionFlag = 1;
+
+  PLDHashNumber Hash1(PLDHashNumber aHash0) const;
+  void Hash2(PLDHashNumber aHash, uint32_t& aHash2Out,
+             uint32_t& aSizeMaskOut) const;
+
+  static bool MatchSlotKeyhash(Slot& aSlot, const PLDHashNumber aHash);
+  Slot SlotForIndex(uint32_t aIndex) const;
+
+  uint32_t CapacityFromHashShift() const {
+    return ((uint32_t)1 << (kPLDHashNumberBits - mHashShift));
+  }
+
+  PLDHashNumber ComputeKeyHash(const void* aKey) const;
+
+  enum SearchReason { ForSearchOrRemove, ForAdd };
+
+  template <SearchReason Reason, typename PLDSuccess, typename PLDFailure>
+  auto SearchTable(const void* aKey, PLDHashNumber aKeyHash,
+                   PLDSuccess&& aSucess, PLDFailure&& aFailure) const;
+
+  Slot FindFreeSlot(PLDHashNumber aKeyHash) const;
+
+  bool ChangeTable(int aDeltaLog2);
+
+  void RawRemove(Slot& aSlot);
+  void ShrinkIfAppropriate();
+
+  mozilla::Maybe<EntryHandle> MakeEntryHandle(const void* aKey,
+                                              const mozilla::fallible_t&);
+
+  EntryHandle MakeEntryHandle(const void* aKey);
+};
+
+typedef PLDHashNumber (*PLDHashHashKey)(const void* aKey);
+
+typedef bool (*PLDHashMatchEntry)(const PLDHashEntryHdr* aEntry,
+                                  const void* aKey);
+
+typedef void (*PLDHashMoveEntry)(PLDHashTable* aTable,
+                                 const PLDHashEntryHdr* aFrom,
+                                 PLDHashEntryHdr* aTo);
+
+typedef void (*PLDHashClearEntry)(PLDHashTable* aTable,
+                                  PLDHashEntryHdr* aEntry);
+
+typedef void (*PLDHashInitEntry)(PLDHashEntryHdr* aEntry, const void* aKey);
+
+struct PLDHashTableOps {
+  PLDHashHashKey hashKey;
+  PLDHashMatchEntry matchEntry;
+  PLDHashMoveEntry moveEntry;
+
+  PLDHashClearEntry clearEntry;
+  PLDHashInitEntry initEntry;
+};
+
+struct PLDHashEntryStub : public PLDHashEntryHdr {
+  const void* key;
+};
+
+#endif

@@ -1,0 +1,187 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsSliderFrame_h_
+#define nsSliderFrame_h_
+
+#include "mozilla/Attributes.h"
+#include "nsAtom.h"
+#include "nsCOMPtr.h"
+#include "nsContainerFrame.h"
+#include "nsIDOMEventListener.h"
+#include "nsITimer.h"
+#include "nsRepeatService.h"
+
+class nsITimer;
+class nsScrollbarFrame;
+class nsSliderFrame;
+
+namespace mozilla {
+class nsDisplaySliderMarks;
+class PresShell;
+class ScrollContainerFrame;
+}  
+
+nsIFrame* NS_NewSliderFrame(mozilla::PresShell* aPresShell,
+                            mozilla::ComputedStyle* aStyle);
+
+class nsSliderMediator final : public nsIDOMEventListener {
+ public:
+  NS_DECL_ISUPPORTS
+
+  nsSliderFrame* mSlider;
+
+  explicit nsSliderMediator(nsSliderFrame* aSlider) { mSlider = aSlider; }
+
+  void SetSlider(nsSliderFrame* aSlider) { mSlider = aSlider; }
+
+  NS_DECL_NSIDOMEVENTLISTENER
+
+ protected:
+  virtual ~nsSliderMediator() = default;
+};
+
+class nsSliderFrame final : public nsContainerFrame {
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(nsSliderFrame)
+  NS_DECL_QUERYFRAME
+
+  friend class nsSliderMediator;
+  friend class mozilla::nsDisplaySliderMarks;
+
+  explicit nsSliderFrame(ComputedStyle* aStyle, nsPresContext* aPresContext);
+  virtual ~nsSliderFrame();
+
+  bool GetEventPoint(mozilla::WidgetGUIEvent* aEvent, nsPoint& aPoint);
+  bool GetEventPoint(mozilla::WidgetGUIEvent* aEvent,
+                     mozilla::LayoutDeviceIntPoint& aPoint);
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override {
+    return MakeFrameName(u"SliderFrame"_ns, aResult);
+  }
+#endif
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  void Destroy(DestroyContext&) override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  void BuildDisplayListForThumb(nsDisplayListBuilder* aBuilder,
+                                nsIFrame* aThumb,
+                                const nsDisplayListSet& aLists);
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+
+  nsresult HandleEvent(nsPresContext* aPresContext,
+                       mozilla::WidgetGUIEvent* aEvent,
+                       nsEventStatus* aEventStatus) override;
+
+  void SetInitialChildList(ChildListID aListID,
+                           nsFrameList&& aChildList) override;
+  void AppendFrames(ChildListID aListID, nsFrameList&& aFrameList) override;
+  void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                    const nsLineList::iterator* aPrevFrameLine,
+                    nsFrameList&& aFrameList) override;
+  void RemoveFrame(DestroyContext&, ChildListID, nsIFrame*) override;
+
+  nsresult StartDrag(mozilla::dom::Event* aEvent);
+  nsresult StopDrag();
+  bool ClickAndHoldActive() const;
+
+  void StartAPZDrag(mozilla::WidgetGUIEvent* aEvent);
+
+  NS_IMETHOD HandlePress(nsPresContext* aPresContext,
+                         mozilla::WidgetGUIEvent* aEvent,
+                         nsEventStatus* aEventStatus) override;
+
+  NS_IMETHOD HandleMultiplePress(nsPresContext* aPresContext,
+                                 mozilla::WidgetGUIEvent* aEvent,
+                                 nsEventStatus* aEventStatus,
+                                 bool aControlHeld) override {
+    return NS_OK;
+  }
+
+  MOZ_CAN_RUN_SCRIPT
+  NS_IMETHOD HandleDrag(nsPresContext* aPresContext,
+                        mozilla::WidgetGUIEvent* aEvent,
+                        nsEventStatus* aEventStatus) override {
+    return NS_OK;
+  }
+
+  NS_IMETHOD HandleRelease(nsPresContext* aPresContext,
+                           mozilla::WidgetGUIEvent* aEvent,
+                           nsEventStatus* aEventStatus) override;
+
+  float GetThumbRatio() const;
+
+  void AsyncScrollbarDragInitiated(uint64_t aDragBlockId);
+
+  void AsyncScrollbarDragRejected();
+
+  bool OnlySystemGroupDispatch(mozilla::EventMessage aMessage) const override;
+
+  mozilla::ScrollContainerFrame* GetScrollContainerFrame();
+  void CurrentPositionChanged();
+
+ private:
+  bool GetScrollToClick();
+  nsScrollbarFrame* Scrollbar() const;
+  bool ShouldScrollForEvent(mozilla::WidgetGUIEvent* aEvent);
+  bool ShouldScrollToClickForEvent(mozilla::WidgetGUIEvent* aEvent);
+  bool IsEventOverThumb(mozilla::WidgetGUIEvent* aEvent);
+
+  void SetCurrentThumbPosition(nscoord aNewPos);
+
+  void DragThumb(bool aGrabMouseEvents);
+  void AddListener();
+  void RemoveListener();
+  bool IsDraggingThumb() const;
+
+  void SuppressDisplayport();
+  void UnsuppressDisplayport();
+
+  void StartRepeat();
+  void StopRepeat() {
+    nsRepeatService::GetInstance()->Stop(Notify, this);
+    mCurrentClickHoldDestination = Nothing();
+  }
+  void Notify();
+  static void Notify(void* aData) {
+    (static_cast<nsSliderFrame*>(aData))->Notify();
+  }
+  void PageScroll(bool aClickAndHold);
+
+  void SetupDrag(mozilla::WidgetGUIEvent* aEvent, nsIFrame* aThumbFrame,
+                 nscoord aPos, bool aIsHorizontal);
+
+  nsPoint mDestinationPoint;
+  Maybe<nsPoint> mCurrentClickHoldDestination;
+  RefPtr<nsSliderMediator> mMediator;
+
+  float mRatio;
+
+  nscoord mDragStart;
+  nscoord mThumbStart;
+  nscoord mRepeatDirection;
+
+  bool mDragInProgress = false;
+
+  bool mScrollingWithAPZ;
+
+  bool mSuppressionActive;
+
+  Maybe<uint64_t> mAPZDragInitiated;
+
+  nscoord mThumbMinLength;
+
+  static bool gMiddlePref;
+};  
+
+#endif

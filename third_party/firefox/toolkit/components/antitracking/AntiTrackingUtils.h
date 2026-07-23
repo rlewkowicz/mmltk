@@ -1,0 +1,116 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_antitrackingutils_h
+#define mozilla_antitrackingutils_h
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Maybe.h"
+#include "nsStringFwd.h"
+#include "ContentBlockingNotifier.h"
+
+#include "nsILoadInfo.h"
+
+class nsPIDOMWindowInner;
+class nsPIDOMWindowOuter;
+class nsIChannel;
+class nsIPermission;
+class nsIPrincipal;
+class nsIURI;
+
+namespace mozilla {
+namespace dom {
+class BrowsingContext;
+class CanonicalBrowsingContext;
+class Document;
+class WindowGlobalParent;
+}  
+
+class AntiTrackingUtils final {
+ public:
+  static already_AddRefed<nsPIDOMWindowInner> GetInnerWindow(
+      dom::BrowsingContext* aBrowsingContext);
+
+  static already_AddRefed<nsPIDOMWindowOuter> GetTopWindow(
+      nsPIDOMWindowInner* aWindow);
+
+  static already_AddRefed<nsIURI> MaybeGetDocumentURIBeingLoaded(
+      nsIChannel* aChannel);
+
+  static void CreateStoragePermissionKey(const nsACString& aTrackingOrigin,
+                                         nsACString& aPermissionKey);
+
+  static bool CreateStoragePermissionKey(nsIPrincipal* aPrincipal,
+                                         nsACString& aKey);
+
+  static void CreateStorageFramePermissionKey(const nsACString& aTrackingSite,
+                                              nsACString& aPermissionKey);
+
+  static bool CreateStorageFramePermissionKey(nsIPrincipal* aPrincipal,
+                                              nsACString& aKey);
+
+  static bool IsStorageAccessPermission(nsIPermission* aPermission,
+                                        nsIPrincipal* aPrincipal);
+
+  static bool CheckStoragePermission(nsIPrincipal* aPrincipal,
+                                     const nsAutoCString& aType,
+                                     bool aIsInPrivateBrowsing);
+
+  static Maybe<size_t> CountSitesAllowStorageAccess(nsIPrincipal* aPrincipal);
+
+  static nsresult TestStoragePermissionInParent(nsIPrincipal* aTopPrincipal,
+                                                nsIPrincipal* aPrincipal,
+                                                uint32_t* aResult);
+
+  static nsILoadInfo::StoragePermissionState GetStoragePermissionStateInParent(
+      nsIChannel* aChannel);
+
+  static nsresult ActivateStoragePermissionStateInParent(nsIChannel* aChannel);
+
+  static bool ProcessStorageAccessHeadersShouldRetry(nsIChannel* aChannel);
+
+ private:
+  static nsresult ProcessStorageAccessHeaders(nsIChannel* aChannel,
+                                              bool* aOutReload);
+
+ public:
+  static uint64_t GetTopLevelAntiTrackingWindowId(
+      dom::BrowsingContext* aBrowsingContext);
+
+  static uint64_t GetTopLevelStorageAreaWindowId(
+      dom::BrowsingContext* aBrowsingContext);
+
+  static already_AddRefed<nsIPrincipal> GetPrincipal(
+      dom::BrowsingContext* aBrowsingContext);
+
+  static bool GetPrincipalAndTrackingOrigin(
+      dom::BrowsingContext* aBrowsingContext, nsIPrincipal** aPrincipal,
+      nsACString& aTrackingOrigin);
+
+  static uint32_t GetCookieBehavior(dom::BrowsingContext* aBrowsingContext);
+
+  static void ComputeIsThirdPartyToTopWindow(nsIChannel* aChannel);
+
+  static bool IsThirdPartyChannel(nsIChannel* aChannel);
+
+  static bool IsThirdPartyWindow(nsPIDOMWindowInner* aWindow, nsIURI* aURI);
+
+  static bool IsThirdPartyDocument(dom::Document* aDocument);
+
+  static bool IsThirdPartyContext(dom::BrowsingContext* aBrowsingContext);
+
+  static nsCString GrantedReasonToString(
+      ContentBlockingNotifier::StorageAccessPermissionGrantedReason aReason);
+
+  static void UpdateAntiTrackingInfoForChannel(nsIChannel* aChannel);
+
+ private:
+  static nsresult IsThirdPartyToPartitionKeySite(nsIChannel* aChannel,
+                                                 const nsCOMPtr<nsIURI>& aURI,
+                                                 bool* aIsThirdParty);
+};
+
+}  
+
+#endif  // mozilla_antitrackingutils_h

@@ -1,0 +1,1077 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+"use strict";
+
+{
+  const { AppConstants } = ChromeUtils.importESModule(
+    "resource://gre/modules/AppConstants.sys.mjs"
+  );
+
+  let imports = {};
+  ChromeUtils.defineESModuleGetters(imports, {
+    DeferredTask: "resource://gre/modules/DeferredTask.sys.mjs",
+    KeyboardLockUtils: "resource://gre/modules/KeyboardLockUtils.sys.mjs",
+    ShortcutUtils: "resource://gre/modules/ShortcutUtils.sys.mjs",
+  });
+
+  const DIRECTION_BACKWARD = -1;
+  const DIRECTION_FORWARD = 1;
+
+  class MozTabbox extends MozXULElement {
+    constructor() {
+      super();
+      this._handleMetaAltArrows = AppConstants.platform == "macosx";
+      this.disconnectedCallback = this.disconnectedCallback.bind(this);
+    }
+
+    connectedCallback() {
+      document.addEventListener("keydown", this, { mozSystemGroup: true });
+      window.addEventListener("unload", this.disconnectedCallback, {
+        once: true,
+      });
+    }
+
+    disconnectedCallback() {
+      document.removeEventListener("keydown", this, { mozSystemGroup: true });
+      window.removeEventListener("unload", this.disconnectedCallback);
+    }
+
+    set handleCtrlTab(val) {
+      this.setAttribute("handleCtrlTab", val);
+    }
+
+    get handleCtrlTab() {
+      return this.getAttribute("handleCtrlTab") != "false";
+    }
+
+    get tabs() {
+      if (this.hasAttribute("tabcontainer")) {
+        return document.getElementById(this.getAttribute("tabcontainer"));
+      }
+      return this.getElementsByTagNameNS(
+        "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul",
+        "tabs"
+      ).item(0);
+    }
+
+    get tabpanels() {
+      return this.getElementsByTagNameNS(
+        "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul",
+        "tabpanels"
+      ).item(0);
+    }
+
+    set selectedIndex(val) {
+      let tabs = this.tabs;
+      if (tabs) {
+        tabs.selectedIndex = val;
+      }
+      this.setAttribute("selectedIndex", val);
+    }
+
+    get selectedIndex() {
+      let tabs = this.tabs;
+      return tabs ? tabs.selectedIndex : -1;
+    }
+
+    set selectedTab(val) {
+      if (val) {
+        let tabs = this.tabs;
+        if (tabs) {
+          tabs.selectedItem = val;
+        }
+      }
+    }
+
+    get selectedTab() {
+      let tabs = this.tabs;
+      return tabs && tabs.selectedItem;
+    }
+
+    set selectedPanel(val) {
+      if (val) {
+        let tabpanels = this.tabpanels;
+        if (tabpanels) {
+          tabpanels.selectedPanel = val;
+        }
+      }
+    }
+
+    get selectedPanel() {
+      let tabpanels = this.tabpanels;
+      return tabpanels && tabpanels.selectedPanel;
+    }
+
+    handleEvent(event) {
+      if (!event.isTrusted) {
+        return;
+      }
+
+      if (event.defaultCancelled) {
+        return;
+      }
+
+      if (event.defaultPrevented) {
+        return;
+      }
+
+
+      const { KeyboardLockUtils, ShortcutUtils } = imports;
+
+      const action = ShortcutUtils.getSystemActionForEvent(event);
+      if (
+        action != null &&
+        KeyboardLockUtils.mustWaitForKeyboardLockRequestedReply(event)
+      ) {
+        return;
+      }
+
+      switch (action) {
+        case ShortcutUtils.CYCLE_TABS:
+          Services.prefs.setBoolPref(
+            "browser.engagement.ctrlTab.has-used",
+            true
+          );
+          if (this.tabs && this.handleCtrlTab) {
+            this.tabs.advanceSelectedTab(
+              event.shiftKey ? DIRECTION_BACKWARD : DIRECTION_FORWARD,
+              true,
+              event
+            );
+            event.preventDefault();
+          }
+          break;
+        case ShortcutUtils.PREVIOUS_TAB:
+          if (this.tabs) {
+            this.tabs.advanceSelectedTab(DIRECTION_BACKWARD, true, event);
+            event.preventDefault();
+          }
+          break;
+        case ShortcutUtils.NEXT_TAB:
+          if (this.tabs) {
+            this.tabs.advanceSelectedTab(DIRECTION_FORWARD, true, event);
+            event.preventDefault();
+          }
+          break;
+      }
+    }
+  }
+
+  customElements.define("tabbox", MozTabbox);
+
+  class MozDeck extends MozXULElement {
+    get isAsync() {
+      return this.getAttribute("async") == "true";
+    }
+
+    connectedCallback() {
+      if (this.delayConnectedCallback()) {
+        return;
+      }
+      this._selectedPanel = null;
+      this._inAsyncOperation = false;
+
+      let selectCurrentIndex = () => {
+        let index = this.selectedIndex;
+        let oldPanel = this._selectedPanel;
+        this._selectedPanel = this.children.item(index) || null;
+        this.updateSelectedIndex(index, oldPanel);
+      };
+
+      this._mutationObserver = new MutationObserver(records => {
+        let anyRemovals = records.some(record => !!record.removedNodes.length);
+        if (anyRemovals) {
+          let index = Array.from(this.children).indexOf(this._selectedPanel);
+          if (index != -1) {
+            this.setAttribute("selectedIndex", index);
+          }
+        }
+        if (!this._inAsyncOperation) {
+          selectCurrentIndex();
+        }
+      });
+
+      this._mutationObserver.observe(this, {
+        childList: true,
+      });
+
+      selectCurrentIndex();
+    }
+
+    disconnectedCallback() {
+      this._mutationObserver?.disconnect();
+      this._mutationObserver = null;
+    }
+
+    updateSelectedIndex(
+      val,
+      oldPanel = this.querySelector(":scope > .deck-selected")
+    ) {
+      this._inAsyncOperation = false;
+      if (oldPanel != this._selectedPanel) {
+        oldPanel?.classList.remove("deck-selected");
+        this._selectedPanel?.classList.add("deck-selected");
+      }
+      this.setAttribute("selectedIndex", val);
+    }
+
+    set selectedIndex(val) {
+      if (val < 0 || val >= this.children.length) {
+        return;
+      }
+
+      let oldPanel = this._selectedPanel;
+      this._selectedPanel = this.children[val];
+
+      this._inAsyncOperation = this.isAsync;
+      if (!this._inAsyncOperation) {
+        this.updateSelectedIndex(val, oldPanel);
+      }
+
+      if (this._selectedPanel != oldPanel) {
+        let event = document.createEvent("Events");
+        event.initEvent("select", true, true);
+        this.dispatchEvent(event);
+      }
+    }
+
+    get selectedIndex() {
+      let indexStr = this.getAttribute("selectedIndex");
+      return indexStr ? parseInt(indexStr) : 0;
+    }
+
+    set selectedPanel(val) {
+      this.selectedIndex = Array.from(this.children).indexOf(val);
+    }
+
+    get selectedPanel() {
+      return this._selectedPanel;
+    }
+  }
+
+  customElements.define("deck", MozDeck);
+
+  class MozTabpanels extends MozDeck {
+    #splitViewPanels = [];
+
+    #splitViewSplitter = null;
+    #splitterWasDragging = false;
+    #splitterAriaUpdateTask = null;
+    #splitViewSplitterObserver = new MutationObserver(() => {
+      const splitterState = this.#splitViewSplitter.getAttribute("state");
+      if (splitterState === "dragging") {
+        this.#splitterWasDragging = true;
+        gBrowser.activeSplitView.resetRightPanelWidth();
+      } else {
+        const wasDragging = this.#splitterWasDragging;
+        this.#splitterWasDragging = false;
+        if (wasDragging) {
+          window.promiseDocumentFlushed(() =>
+            this.#recordSplitViewResizeTelemetry()
+          );
+        }
+        this.#splitterAriaUpdateTask.arm();
+      }
+    });
+
+    static #SPLIT_VIEW_PANEL_EVENTS = Object.freeze([
+      "click",
+      "mouseover",
+      "mouseout",
+    ]);
+
+    constructor() {
+      super();
+      this._tabbox = null;
+    }
+
+    connectedCallback() {
+      super.connectedCallback();
+      this.#splitterAriaUpdateTask = new imports.DeferredTask(
+        () => this.updateSplitterAriaAttributes(),
+        0
+      );
+    }
+
+    disconnectedCallback() {
+      super.disconnectedCallback();
+      this.#splitViewSplitterObserver.disconnect();
+      this.#splitterAriaUpdateTask.finalize();
+    }
+
+    #recordSplitViewResizeTelemetry() {
+      if (!this.#splitViewPanels.length) {
+        return;
+      }
+
+      const leftPanel = document.getElementById(this.#splitViewPanels[0]);
+      if (!leftPanel) {
+        return;
+      }
+
+      const leftWidth = leftPanel.getBoundingClientRect().width;
+      const totalWidth = this.getBoundingClientRect().width;
+      const widthPercentage = Math.round((leftWidth / totalWidth) * 100);
+
+    }
+
+    handleEvent(e) {
+      const browser =
+        e.currentTarget.tagName === "browser"
+          ? e.currentTarget
+          : e.currentTarget.querySelector("browser");
+      let elToFocus = null;
+      switch (e.type) {
+        case "click":
+          if (e.target.tagName !== "browser") {
+            elToFocus = e.target;
+          }
+        case "focus": {
+          const tab = gBrowser.getTabForBrowser(browser);
+          const tabstrip = this.tabbox.tabs;
+          tabstrip.selectedItem = tab;
+          break;
+        }
+        case "mouseover":
+          gBrowser.appendStatusPanel(browser);
+          break;
+        case "mouseout":
+          StatusPanel.panel.setAttribute("inactive", true);
+          gBrowser.appendStatusPanel();
+          break;
+      }
+      elToFocus?.focus();
+    }
+
+    get tabbox() {
+      if (this._tabbox) {
+        return this._tabbox;
+      }
+
+      return (this._tabbox = this.closest("tabbox"));
+    }
+
+    get splitViewSplitter() {
+      if (!this.#splitViewSplitter) {
+        this.#splitViewSplitter = this.#createSplitViewSplitter();
+      }
+      return this.#splitViewSplitter;
+    }
+
+    #createSplitViewSplitter() {
+      const splitter = document.createXULElement("splitter");
+      splitter.className = "split-view-splitter";
+      splitter.setAttribute("resizebefore", "sibling");
+      splitter.setAttribute("resizeafter", "none");
+      splitter.setAttribute("tabindex", "0");
+      splitter.setAttribute("role", "separator");
+      splitter.setAttribute("data-l10n-id", "tab-splitview-splitter");
+      this.#splitterWasDragging = false;
+      splitter.addEventListener("command", () => {
+        gBrowser.activeSplitView.resetRightPanelWidth();
+        window.promiseDocumentFlushed(() =>
+          this.#recordSplitViewResizeTelemetry()
+        );
+        this.#splitterAriaUpdateTask.arm();
+      });
+      this.#splitViewSplitterObserver.observe(splitter, {
+        attributeFilter: ["state"],
+      });
+      return splitter;
+    }
+
+    async updateSplitterAriaAttributes() {
+      const splitter = this.#splitViewSplitter;
+      if (!splitter) {
+        return;
+      }
+      const controlledPanel =
+        this.#splitViewPanels.length &&
+        document.getElementById(this.splitViewPanels[0]);
+      if (controlledPanel) {
+        splitter.setAttribute("aria-controls", controlledPanel.id);
+
+        const [containerWidth, currentWidth] =
+          await window.promiseDocumentFlushed(() => [
+            this.clientWidth,
+            controlledPanel.clientWidth,
+          ]);
+        const minWidth = parseFloat(getComputedStyle(controlledPanel).minWidth);
+        const maxWidth = containerWidth - minWidth;
+        if (controlledPanel.hasAttribute("width")) {
+          const storedWidth = Number(controlledPanel.getAttribute("width"));
+          if (storedWidth > maxWidth) {
+            controlledPanel.setAttribute("width", currentWidth);
+            controlledPanel.style.width = currentWidth + "px";
+          }
+        }
+
+        splitter.setAttribute("aria-valuemin", String(minWidth));
+        splitter.setAttribute("aria-valuemax", String(maxWidth));
+        splitter.setAttribute("aria-valuenow", String(currentWidth));
+      } else {
+        splitter.removeAttribute("aria-controls");
+        splitter.removeAttribute("aria-valuenow");
+        splitter.removeAttribute("aria-valuemin");
+        splitter.removeAttribute("aria-valuemax");
+      }
+    }
+
+    getRelatedElement(aTabPanelElm) {
+      if (!aTabPanelElm) {
+        return null;
+      }
+
+      let tabboxElm = this.tabbox;
+      if (!tabboxElm) {
+        return null;
+      }
+
+      let tabsElm = tabboxElm.tabs;
+      if (!tabsElm) {
+        return null;
+      }
+
+      let tabpanelIdx = Array.prototype.indexOf.call(
+        this.children,
+        aTabPanelElm
+      );
+      if (tabpanelIdx == -1) {
+        return null;
+      }
+
+      let tabElms = tabsElm.allTabs;
+      let tabElmFromIndex = tabElms[tabpanelIdx];
+
+      let tabpanelId = aTabPanelElm.id;
+      if (tabpanelId) {
+        for (let idx = 0; idx < tabElms.length; idx++) {
+          let tabElm = tabElms[idx];
+          if (tabElm.linkedPanel == tabpanelId) {
+            return tabElm;
+          }
+        }
+      }
+
+      return tabElmFromIndex;
+    }
+
+    set splitViewPanels(newPanels) {
+      for (const [i, panel] of newPanels.entries()) {
+        const panelEl = document.getElementById(panel);
+        panelEl?.classList.add("split-view-panel");
+        panelEl?.setAttribute("column", i);
+        const browser = panelEl?.querySelector("browser");
+        const browserContainer = panelEl?.querySelector(".browserContainer");
+        for (const eventType of MozTabpanels.#SPLIT_VIEW_PANEL_EVENTS) {
+          browserContainer?.addEventListener(eventType, this);
+        }
+        browser?.addEventListener("focus", this);
+      }
+      this.#splitViewPanels = newPanels;
+      this.setSplitViewActive(!!newPanels.length);
+    }
+
+    get splitViewPanels() {
+      return this.#splitViewPanels;
+    }
+
+    removeTabsFromSplitview(tabs) {
+      for (const tab of tabs) {
+        let panel = tab.linkedPanel;
+        const panelEl = document.getElementById(panel);
+        panelEl?.classList.remove("split-view-panel");
+        panelEl?.classList.remove("split-view-panel-active");
+        panelEl?.removeAttribute("column");
+        const browser = panelEl?.querySelector("browser");
+        const browserContainer = panelEl?.querySelector(".browserContainer");
+
+        for (const eventType of MozTabpanels.#SPLIT_VIEW_PANEL_EVENTS) {
+          browserContainer?.removeEventListener(eventType, this);
+        }
+        browser?.removeEventListener("focus", this);
+        const index = this.#splitViewPanels.indexOf(panel);
+
+        if (index !== -1) {
+          this.#splitViewPanels.splice(index, 1);
+        }
+      }
+
+      this.setSplitViewActive(!!this.#splitViewPanels.length);
+    }
+
+    suspendSplitViewPanels(tabs) {
+      for (const tab of tabs) {
+        const panelEl = document.getElementById(tab.linkedPanel);
+        panelEl?.classList.remove("split-view-panel-active");
+      }
+      this.setSplitViewActive(!!this.#splitViewPanels.length);
+    }
+
+    setSplitViewActive(updatedValue) {
+      const splitViewTabSelected =
+        gBrowser.selectedTab.splitview && updatedValue;
+      this.toggleAttribute("splitview", updatedValue);
+      this.splitViewSplitter.hidden = !splitViewTabSelected;
+      const selectedPanel = this.selectedPanel;
+
+      if (splitViewTabSelected) {
+        const firstPanel = document.getElementById(this.splitViewPanels[0]);
+        const secondPanel = document.getElementById(this.splitViewPanels[1]);
+        if (firstPanel && secondPanel) {
+          if (
+            !(
+              firstPanel.compareDocumentPosition(secondPanel) &
+              Node.DOCUMENT_POSITION_FOLLOWING
+            )
+          ) {
+            firstPanel.parentElement.moveBefore(firstPanel, secondPanel);
+          }
+        }
+        if (
+          firstPanel &&
+          firstPanel.nextElementSibling !== this.#splitViewSplitter
+        ) {
+          firstPanel.after(this.#splitViewSplitter);
+        }
+      }
+      this.selectedPanel = selectedPanel;
+      this.#splitterAriaUpdateTask.arm();
+    }
+  }
+
+  MozXULElement.implementCustomInterface(MozTabpanels, [
+    Ci.nsIDOMXULRelatedElement,
+  ]);
+  customElements.define("tabpanels", MozTabpanels);
+
+  MozElements.MozTab = class MozTab extends MozElements.BaseText {
+    static get markup() {
+      return `
+        <hbox class="tab-middle box-inherit" flex="1">
+          <image class="tab-icon" role="presentation"></image>
+          <label class="tab-text" flex="1" role="presentation"></label>
+        </hbox>
+      `;
+    }
+
+    constructor() {
+      super();
+
+      this.addEventListener("mousedown", this);
+      this.addEventListener("keydown", this);
+
+      this.arrowKeysShouldWrap = AppConstants.platform == "macosx";
+    }
+
+    static get inheritedAttributes() {
+      return {
+        ".tab-middle": "align,dir,pack,orient,selected,visuallyselected",
+        ".tab-icon": "validate,src=image",
+        ".tab-text": "value=label,accesskey,crop,disabled",
+      };
+    }
+
+    connectedCallback() {
+      if (!this._initialized) {
+        this.textContent = "";
+        this.appendChild(this.constructor.fragment);
+        this.initializeAttributeInheritance();
+        this._initialized = true;
+      }
+    }
+
+    on_mousedown(event) {
+      if (event.button != 0 || this.disabled) {
+        return;
+      }
+
+      this.container.ariaFocusedItem = null;
+
+      if (this == this.container.selectedItem) {
+        return;
+      }
+
+      this.container._selectNewTab(this);
+
+      var isTabFocused = false;
+      try {
+        isTabFocused = document.commandDispatcher.focusedElement == this;
+      } catch (e) {}
+
+      if (!isTabFocused) {
+        this.setAttribute("ignorefocus", "true");
+        setTimeout(tab => tab.removeAttribute("ignorefocus"), 0, this);
+      }
+
+    }
+
+    #getDirection() {
+      return window.getComputedStyle(this).direction;
+    }
+
+    on_keydown(event) {
+      if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) {
+        return;
+      }
+
+      switch (event.keyCode) {
+        case KeyEvent.DOM_VK_LEFT: {
+          this.container.advanceSelectedItem(
+            this.#getDirection() == "ltr"
+              ? DIRECTION_BACKWARD
+              : DIRECTION_FORWARD,
+            this.arrowKeysShouldWrap
+          );
+          event.preventDefault();
+          break;
+        }
+
+        case KeyEvent.DOM_VK_RIGHT: {
+          this.container.advanceSelectedItem(
+            this.#getDirection() == "ltr"
+              ? DIRECTION_FORWARD
+              : DIRECTION_BACKWARD,
+            this.arrowKeysShouldWrap
+          );
+          event.preventDefault();
+          break;
+        }
+
+        case KeyEvent.DOM_VK_UP:
+          this.container.advanceSelectedItem(
+            DIRECTION_BACKWARD,
+            this.arrowKeysShouldWrap
+          );
+          event.preventDefault();
+          break;
+
+        case KeyEvent.DOM_VK_DOWN:
+          this.container.advanceSelectedItem(
+            DIRECTION_FORWARD,
+            this.arrowKeysShouldWrap
+          );
+          event.preventDefault();
+          break;
+
+        case KeyEvent.DOM_VK_HOME:
+          this.container._selectNewTab(this.allTabs.at(0), DIRECTION_FORWARD);
+          event.preventDefault();
+          break;
+
+        case KeyEvent.DOM_VK_END: {
+          this.container._selectNewTab(this.allTabs.at(-1), DIRECTION_BACKWARD);
+          event.preventDefault();
+          break;
+        }
+      }
+    }
+
+    set value(val) {
+      this.setAttribute("value", val);
+    }
+
+    get value() {
+      return this.getAttribute("value") || "";
+    }
+
+    get container() {
+      return this.closest("tabs");
+    }
+
+    get control() {
+      return this.container;
+    }
+
+    get selected() {
+      return this.hasAttribute("selected");
+    }
+
+    set _selected(val) {
+      this.toggleAttribute("selected", val);
+      this.toggleAttribute("visuallyselected", val);
+    }
+
+    get visible() {
+      return !this.hidden;
+    }
+
+    set linkedPanel(val) {
+      this.setAttribute("linkedpanel", val);
+    }
+
+    get linkedPanel() {
+      return this.getAttribute("linkedpanel");
+    }
+  };
+
+  MozXULElement.implementCustomInterface(MozElements.MozTab, [
+    Ci.nsIDOMXULSelectControlItemElement,
+  ]);
+  customElements.define("tab", MozElements.MozTab);
+
+  const ARIA_FOCUSED_CLASS_NAME = "tablist-keyboard-focus";
+
+  class TabsBase extends MozElements.BaseControl {
+    constructor() {
+      super();
+
+      this.addEventListener("DOMMouseScroll", event => {
+        if (Services.prefs.getBoolPref("toolkit.tabbox.switchByScrolling")) {
+          if (event.detail > 0) {
+            this.advanceSelectedTab(DIRECTION_FORWARD, false, event);
+          } else {
+            this.advanceSelectedTab(DIRECTION_BACKWARD, false, event);
+          }
+          event.stopPropagation();
+        }
+      });
+    }
+
+    baseConnect() {
+      this._tabbox = null;
+      this.ACTIVE_DESCENDANT_ID = `${ARIA_FOCUSED_CLASS_NAME}-${Math.trunc(
+        Math.random() * 1000000
+      )}`;
+
+      if (!this.hasAttribute("orient")) {
+        this.setAttribute("orient", "horizontal");
+      }
+
+      if (this.tabbox && this.tabbox.hasAttribute("selectedIndex")) {
+        let selectedIndex = parseInt(this.tabbox.getAttribute("selectedIndex"));
+        this.selectedIndex = selectedIndex > 0 ? selectedIndex : 0;
+        return;
+      }
+
+      let children = this.allTabs;
+      let length = children.length;
+      for (var i = 0; i < length; i++) {
+        if (children[i].hasAttribute("selected")) {
+          this.selectedIndex = i;
+          return;
+        }
+      }
+
+      var value = this.value;
+      if (value) {
+        this.value = value;
+      } else {
+        this.selectedIndex = 0;
+      }
+    }
+
+    get itemCount() {
+      return this.allTabs.length;
+    }
+
+    set value(val) {
+      this.setAttribute("value", val);
+      var children = this.allTabs;
+      for (var c = children.length - 1; c >= 0; c--) {
+        if (children[c].value == val) {
+          this.selectedIndex = c;
+          break;
+        }
+      }
+    }
+
+    get value() {
+      return this.getAttribute("value") || "";
+    }
+
+    get tabbox() {
+      if (!this._tabbox) {
+        this._tabbox = this.closest("tabbox");
+      }
+
+      return this._tabbox;
+    }
+
+    set selectedIndex(val) {
+      var tab = this.getItemAtIndex(val);
+      if (!tab) {
+        return;
+      }
+      for (let otherTab of this.allTabs) {
+        if (otherTab != tab && otherTab.selected) {
+          otherTab._selected = false;
+        }
+      }
+      tab._selected = true;
+
+      this.setAttribute("value", tab.value);
+
+      let linkedPanel = this.getRelatedElement(tab);
+      if (linkedPanel) {
+        this.tabbox.setAttribute("selectedIndex", val);
+
+        this.tabbox.tabpanels.selectedPanel = linkedPanel;
+      }
+    }
+
+    get selectedIndex() {
+      const tabs = this.allTabs;
+      for (var i = 0; i < tabs.length; i++) {
+        if (tabs[i].selected) {
+          return i;
+        }
+      }
+      return -1;
+    }
+
+    set selectedItem(val) {
+      if (val && !val.selected) {
+        this.selectedIndex = this.getIndexOfItem(val);
+      }
+    }
+
+    get selectedItem() {
+      const tabs = this.allTabs;
+      for (var i = 0; i < tabs.length; i++) {
+        if (tabs[i].selected) {
+          return tabs[i];
+        }
+      }
+      return null;
+    }
+
+    get ariaFocusableItems() {
+      return this.allTabs;
+    }
+
+    get ariaFocusedIndex() {
+      const items = this.ariaFocusableItems;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].id == this.ACTIVE_DESCENDANT_ID) {
+          return i;
+        }
+      }
+      return -1;
+    }
+
+    set ariaFocusedItem(val) {
+      let setNewItem = val && this.ariaFocusableItems.includes(val);
+      let clearExistingItem = this.ariaFocusedItem && (!val || setNewItem);
+
+      if (clearExistingItem) {
+        let ariaFocusedItem = this.ariaFocusedItem;
+        ariaFocusedItem.classList.remove(ARIA_FOCUSED_CLASS_NAME);
+        ariaFocusedItem.id = "";
+        this.selectedItem.removeAttribute("aria-activedescendant");
+        let evt = new CustomEvent("AriaFocus");
+        this.selectedItem.dispatchEvent(evt);
+      }
+
+      if (setNewItem) {
+        val.id = this.ACTIVE_DESCENDANT_ID;
+        val.classList.add(ARIA_FOCUSED_CLASS_NAME);
+        this.selectedItem.setAttribute(
+          "aria-activedescendant",
+          this.ACTIVE_DESCENDANT_ID
+        );
+        let evt = new CustomEvent("AriaFocus");
+        val.dispatchEvent(evt);
+      }
+    }
+
+    get ariaFocusedItem() {
+      return document.getElementById(this.ACTIVE_DESCENDANT_ID);
+    }
+
+    getRelatedElement(aTabElm) {
+      if (!aTabElm) {
+        return null;
+      }
+
+      let tabboxElm = this.tabbox;
+      if (!tabboxElm) {
+        return null;
+      }
+
+      let tabpanelsElm = tabboxElm.tabpanels;
+      if (!tabpanelsElm) {
+        return null;
+      }
+
+      let linkedPanelId = aTabElm.linkedPanel;
+      if (linkedPanelId) {
+        return this.ownerDocument.getElementById(linkedPanelId);
+      }
+
+      let tabElmIdx = this.getIndexOfItem(aTabElm);
+      return tabpanelsElm.children[tabElmIdx];
+    }
+
+    getIndexOfItem(item) {
+      return Array.prototype.indexOf.call(this.allTabs, item);
+    }
+
+    getItemAtIndex(index) {
+      return this.allTabs[index] || null;
+    }
+
+    findNextTab(startTab, opts = {}) {
+      let {
+        direction = 1,
+        wrap = false,
+        startWithAdjacent = true,
+        filter = () => true,
+      } = opts;
+
+      let tab = startTab;
+      if (!startWithAdjacent && filter(tab)) {
+        return tab;
+      }
+
+      let children = this.allTabs;
+      let i = children.indexOf(tab);
+      if (i < 0) {
+        return null;
+      }
+
+      while (true) {
+        i += direction;
+        if (wrap) {
+          if (i < 0) {
+            i = children.length - 1;
+          } else if (i >= children.length) {
+            i = 0;
+          }
+        } else if (i < 0 || i >= children.length) {
+          return null;
+        }
+
+        tab = children[i];
+        if (tab == startTab) {
+          return null;
+        }
+        if (filter(tab)) {
+          return tab;
+        }
+      }
+    }
+
+    _selectNewTab(aNewTab, aFallbackDir, aWrap) {
+      this.ariaFocusedItem = null;
+
+      aNewTab = this.findNextTab(aNewTab, {
+        direction: aFallbackDir,
+        wrap: aWrap,
+        startWithAdjacent: false,
+        filter: tab =>
+          !tab.hidden && !tab.disabled && this._canAdvanceToTab(tab),
+      });
+
+      var isTabFocused = false;
+      try {
+        isTabFocused =
+          document.commandDispatcher.focusedElement == this.selectedItem;
+      } catch (e) {}
+      this.selectedItem = aNewTab;
+      if (isTabFocused) {
+        aNewTab.focus();
+      } else if (this.getAttribute("setfocus") != "false") {
+        let selectedPanel = this.tabbox.selectedPanel;
+        document.commandDispatcher.advanceFocusIntoSubtree(selectedPanel);
+
+        if (this.tabbox) {
+          try {
+            let el = document.commandDispatcher.focusedElement;
+            while (el && el != this.tabbox.tabpanels) {
+              if (el == this.tabbox || el == selectedPanel) {
+                return;
+              }
+              el = el.parentNode;
+            }
+            aNewTab.focus();
+          } catch (e) {}
+        }
+      }
+    }
+
+    _canAdvanceToTab() {
+      return true;
+    }
+
+    // eslint-disable-next-line no-unused-vars
+    advanceSelectedTab(aDir, aWrap, aEvent) {
+      let { ariaFocusedItem } = this;
+      let startTab = ariaFocusedItem;
+      if (!ariaFocusedItem || !this.allTabs.includes(ariaFocusedItem)) {
+        startTab = this.selectedItem;
+      }
+      let newTab = null;
+
+      if (startTab.hidden) {
+        if (aDir == 1) {
+          newTab = this.allTabs.find(tab => tab.visible);
+        } else {
+          newTab = this.allTabs.findLast(tab => tab.visible);
+        }
+      } else {
+        newTab = this.findNextTab(startTab, {
+          direction: aDir,
+          wrap: aWrap,
+          filter: tab => tab.visible,
+        });
+      }
+
+      if (newTab && newTab != startTab) {
+        this._selectNewTab(newTab, aDir, aWrap);
+      }
+    }
+
+    advanceSelectedItem(aDir, aWrap) {
+      this.advanceSelectedTab(aDir, aWrap);
+    }
+
+    appendItem(label, value) {
+      var tab = document.createXULElement("tab");
+      tab.setAttribute("label", label);
+      tab.setAttribute("value", value);
+      this.appendChild(tab);
+      return tab;
+    }
+  }
+
+  MozXULElement.implementCustomInterface(TabsBase, [
+    Ci.nsIDOMXULSelectControlElement,
+    Ci.nsIDOMXULRelatedElement,
+  ]);
+
+  MozElements.TabsBase = TabsBase;
+
+  class MozTabs extends TabsBase {
+    connectedCallback() {
+      if (this.delayConnectedCallback()) {
+        return;
+      }
+
+      let start = MozXULElement.parseXULToFragment(
+        `<spacer class="tabs-left"/>`
+      );
+      this.insertBefore(start, this.firstChild);
+
+      let end = MozXULElement.parseXULToFragment(
+        `<spacer class="tabs-right"/>`
+      );
+      this.insertBefore(end, null);
+
+      this.baseConnect();
+    }
+
+    get allTabs() {
+      let children = Array.from(this.children);
+      return children.splice(1, children.length - 2);
+    }
+
+    appendChild(tab) {
+      this.insertBefore(tab, this.lastChild);
+    }
+  }
+
+  customElements.define("tabs", MozTabs);
+}

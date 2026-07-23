@@ -1,0 +1,73 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+//! Add [TypeNode::ffi_type]
+
+use super::*;
+
+pub fn pass(namespace: &mut Namespace) -> Result<()> {
+    let namespace_name = namespace.name.clone();
+    namespace.visit_mut(|node: &mut TypeNode| {
+        node.ffi_type = FfiTypeNode::from(generate_ffi_type(&node.ty, &namespace_name));
+    });
+    Ok(())
+}
+
+fn generate_ffi_type(ty: &Type, current_namespace: &str) -> FfiType {
+    match ty {
+        Type::UInt8 => FfiType::UInt8,
+        Type::Int8 => FfiType::Int8,
+        Type::UInt16 => FfiType::UInt16,
+        Type::Int16 => FfiType::Int16,
+        Type::UInt32 => FfiType::UInt32,
+        Type::Int32 => FfiType::Int32,
+        Type::UInt64 => FfiType::UInt64,
+        Type::Int64 => FfiType::Int64,
+        Type::Float32 => FfiType::Float32,
+        Type::Float64 => FfiType::Float64,
+        Type::Boolean => FfiType::Int8,
+        Type::String => FfiType::RustBuffer(None),
+        Type::Bytes => FfiType::RustBuffer(None),
+        Type::Interface {
+            namespace,
+            name,
+            imp,
+            ..
+        } => FfiType::Handle(if imp.has_struct() {
+            HandleKind::StructInterface {
+                namespace: namespace.clone(),
+                interface_name: name.clone(),
+            }
+        } else {
+            HandleKind::TraitInterface {
+                namespace: namespace.clone(),
+                interface_name: name.clone(),
+            }
+        }),
+        Type::CallbackInterface { namespace, name } => {
+            FfiType::Handle(HandleKind::TraitInterface {
+                namespace: namespace.clone(),
+                interface_name: name.clone(),
+            })
+        }
+        Type::Enum { namespace, .. } | Type::Record { namespace, .. } => {
+            FfiType::RustBuffer((namespace != current_namespace).then_some(namespace.clone()))
+        }
+        Type::Optional { .. }
+        | Type::Sequence { .. }
+        | Type::Map { .. }
+        | Type::Timestamp
+        | Type::Duration => FfiType::RustBuffer(None),
+        Type::Custom {
+            namespace, builtin, ..
+        } => {
+            match generate_ffi_type(builtin, current_namespace) {
+                FfiType::RustBuffer(None) if namespace != current_namespace => {
+                    FfiType::RustBuffer(Some(namespace.clone()))
+                }
+                ffi_type => ffi_type,
+            }
+        }
+    }
+}

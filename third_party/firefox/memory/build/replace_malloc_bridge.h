@@ -1,0 +1,132 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(replace_malloc_bridge_h)
+#define replace_malloc_bridge_h
+
+
+struct ReplaceMallocBridge;
+
+#include "mozilla/Types.h"
+
+typedef int platform_handle_t;
+
+#include "malloc_decls.h"
+
+MOZ_BEGIN_EXTERN_C
+
+#if !defined(REPLACE_MALLOC_IMPL)
+MFBT_API ReplaceMallocBridge* get_bridge();
+#endif
+
+
+#define MALLOC_DECL(name, return_type, ...) \
+  typedef return_type(name##_impl_t)(__VA_ARGS__);
+
+#include "malloc_decls.h"
+
+#define MALLOC_DECL(name, return_type, ...) name##_impl_t* name;
+
+typedef struct {
+#include "malloc_decls.h"
+} malloc_table_t;
+
+MOZ_END_EXTERN_C
+
+#if defined(__cplusplus)
+
+namespace mozilla {
+namespace detail {
+template <typename R, typename... Args>
+struct AllocHookType {
+  using Type = R (*)(R, Args...);
+};
+
+template <typename... Args>
+struct AllocHookType<void, Args...> {
+  using Type = void (*)(Args...);
+};
+
+}  
+}  
+
+#  define MALLOC_DECL(name, return_type, ...)                                 \
+    typename mozilla::detail::AllocHookType<return_type, ##__VA_ARGS__>::Type \
+        name##_hook;
+
+typedef struct {
+#  include "malloc_decls.h"
+  void (*realloc_hook_before)(void* aPtr);
+} malloc_hook_table_t;
+
+namespace mozilla {
+namespace dmd {
+struct DMDFuncs;
+}  
+
+namespace phc {
+
+class AddrInfo;
+
+}  
+
+struct DebugFdRegistry {
+  virtual void RegisterHandle(platform_handle_t aFd);
+
+  virtual void UnRegisterHandle(platform_handle_t aFd);
+};
+}  
+
+struct ReplaceMallocBridge {
+  ReplaceMallocBridge() : mVersion(6) {}
+
+  virtual mozilla::dmd::DMDFuncs* GetDMDFuncs() { return nullptr; }
+
+  virtual void InitDebugFd(mozilla::DebugFdRegistry&) {}
+
+  virtual const malloc_table_t* RegisterHook(
+      const char* aName, const malloc_table_t* aTable,
+      const malloc_hook_table_t* aHookTable) {
+    return nullptr;
+  }
+
+#if !defined(REPLACE_MALLOC_IMPL)
+  static ReplaceMallocBridge* Get(int aMinimumVersion) {
+    static ReplaceMallocBridge* sSingleton = get_bridge();
+    return (sSingleton && sSingleton->mVersion >= aMinimumVersion) ? sSingleton
+                                                                   : nullptr;
+  }
+#endif
+
+ protected:
+  const int mVersion;
+};
+
+#if !defined(REPLACE_MALLOC_IMPL)
+struct ReplaceMalloc {
+  static mozilla::dmd::DMDFuncs* GetDMDFuncs() {
+    auto singleton = ReplaceMallocBridge::Get( 1);
+    return singleton ? singleton->GetDMDFuncs() : nullptr;
+  }
+
+  static void InitDebugFd(mozilla::DebugFdRegistry& aRegistry) {
+    auto singleton = ReplaceMallocBridge::Get( 2);
+    if (singleton) {
+      singleton->InitDebugFd(aRegistry);
+    }
+  }
+
+  static const malloc_table_t* RegisterHook(
+      const char* aName, const malloc_table_t* aTable,
+      const malloc_hook_table_t* aHookTable) {
+    auto singleton = ReplaceMallocBridge::Get( 3);
+    return singleton ? singleton->RegisterHook(aName, aTable, aHookTable)
+                     : nullptr;
+  }
+};
+#endif
+
+#endif
+
+#endif

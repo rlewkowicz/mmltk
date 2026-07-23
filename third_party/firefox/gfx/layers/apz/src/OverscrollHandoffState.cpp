@@ -1,0 +1,206 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "OverscrollHandoffState.h"
+
+#include <algorithm>  // for std::stable_sort
+#include "mozilla/Assertions.h"
+#include "AsyncPanZoomController.h"
+
+namespace mozilla {
+namespace layers {
+
+OverscrollHandoffChain::~OverscrollHandoffChain() = default;
+
+void OverscrollHandoffChain::Add(AsyncPanZoomController* aApzc) {
+  mChain.push_back(aApzc);
+}
+
+const RefPtr<AsyncPanZoomController>& OverscrollHandoffChain::GetApzcAtIndex(
+    uint32_t aIndex) const {
+  MOZ_ASSERT(aIndex < Length());
+  return mChain[aIndex];
+}
+
+uint32_t OverscrollHandoffChain::IndexOf(
+    const AsyncPanZoomController* aApzc) const {
+  uint32_t i;
+  for (i = 0; i < Length(); ++i) {
+    if (mChain[i] == aApzc) {
+      break;
+    }
+  }
+  return i;
+}
+
+void OverscrollHandoffChain::ForEachApzc(APZCMethod aMethod) const {
+  for (uint32_t i = 0; i < Length(); ++i) {
+    (mChain[i]->*aMethod)();
+  }
+}
+
+bool OverscrollHandoffChain::AnyApzc(APZCPredicate aPredicate) const {
+  MOZ_ASSERT(Length() > 0);
+  for (uint32_t i = 0; i < Length(); ++i) {
+    if ((mChain[i]->*aPredicate)()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void OverscrollHandoffChain::FlushRepaints() const {
+  ForEachApzc(&AsyncPanZoomController::FlushRepaintForOverscrollHandoff);
+}
+
+void OverscrollHandoffChain::CancelAnimations(
+    CancelAnimationFlags aFlags) const {
+  MOZ_ASSERT(Length() > 0);
+  for (uint32_t i = 0; i < Length(); ++i) {
+    mChain[i]->CancelAnimation(aFlags);
+  }
+}
+
+void OverscrollHandoffChain::ClearOverscroll() const {
+  ForEachApzc(&AsyncPanZoomController::ClearOverscroll);
+}
+
+void OverscrollHandoffChain::SnapBackOverscrolledApzc(
+    const AsyncPanZoomController* aStart) const {
+  uint32_t i = IndexOf(aStart);
+  for (; i < Length(); ++i) {
+    AsyncPanZoomController* apzc = mChain[i];
+    if (!apzc->IsDestroyed()) {
+      apzc->SnapBackIfOverscrolled();
+    }
+  }
+}
+
+void OverscrollHandoffChain::SnapBackOverscrolledApzcForMomentum(
+    const AsyncPanZoomController* aStart,
+    const ParentLayerPoint& aVelocity) const {
+  uint32_t i = IndexOf(aStart);
+  for (; i < Length(); ++i) {
+    AsyncPanZoomController* apzc = mChain[i];
+    if (!apzc->IsDestroyed()) {
+      apzc->SnapBackIfOverscrolledForMomentum(aVelocity);
+    }
+  }
+}
+
+bool OverscrollHandoffChain::CanBePanned(
+    const AsyncPanZoomController* aApzc) const {
+  uint32_t i = IndexOf(aApzc);
+
+  for (uint32_t j = i; j < Length(); ++j) {
+    if (mChain[j]->IsPannable()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool OverscrollHandoffChain::CanScrollInDirection(
+    const AsyncPanZoomController* aApzc, ScrollDirection aDirection) const {
+  uint32_t i = IndexOf(aApzc);
+
+  for (uint32_t j = i; j < Length(); ++j) {
+    if (mChain[j]->CanScroll(aDirection)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool OverscrollHandoffChain::HasOverscrolledApzc() const {
+  return AnyApzc(&AsyncPanZoomController::IsOverscrolled);
+}
+
+bool OverscrollHandoffChain::HasFastFlungApzc() const {
+  return AnyApzc(&AsyncPanZoomController::IsFlingingFast);
+}
+
+bool OverscrollHandoffChain::HasAutoscrollApzc() const {
+  return AnyApzc(&AsyncPanZoomController::IsAutoscroll);
+}
+
+RefPtr<AsyncPanZoomController> OverscrollHandoffChain::FindFirstScrollable(
+    const InputData& aInput, ScrollDirections* aOutAllowedScrollDirections,
+    IncludeOverscroll aIncludeOverscroll) const {
+  *aOutAllowedScrollDirections += ScrollDirection::eVertical;
+  *aOutAllowedScrollDirections += ScrollDirection::eHorizontal;
+
+  for (size_t i = 0; i < Length(); i++) {
+    if (mChain[i]->CanScroll(aInput)) {
+      return mChain[i];
+    }
+
+    if (StaticPrefs::apz_overscroll_enabled() && bool(aIncludeOverscroll) &&
+        aInput.mInputType == PANGESTURE_INPUT && mChain[i]->IsRootContent()) {
+      ScrollDirections allowedOverscrollDirections =
+          mChain[i]->GetOverscrollableDirections();
+      ParentLayerPoint delta = mChain[i]->GetDeltaForEvent(aInput);
+      if (mChain[i]->IsZero(delta.x)) {
+        allowedOverscrollDirections -= ScrollDirection::eHorizontal;
+      }
+      if (mChain[i]->IsZero(delta.y)) {
+        allowedOverscrollDirections -= ScrollDirection::eVertical;
+      }
+
+      allowedOverscrollDirections &= *aOutAllowedScrollDirections;
+      if (!allowedOverscrollDirections.isEmpty()) {
+        *aOutAllowedScrollDirections = allowedOverscrollDirections;
+        return mChain[i];
+      }
+    }
+
+    *aOutAllowedScrollDirections &= mChain[i]->GetAllowedHandoffDirections();
+    if (aOutAllowedScrollDirections->isEmpty()) {
+      return nullptr;
+    }
+  }
+  return nullptr;
+}
+
+std::tuple<bool, const AsyncPanZoomController*>
+OverscrollHandoffChain::ScrollingDownWillMoveDynamicToolbar(
+    const AsyncPanZoomController* aApzc) const {
+  MOZ_ASSERT(aApzc && !aApzc->IsRootContent(),
+             "Should be used for non-root APZC");
+
+  for (uint32_t i = IndexOf(aApzc); i < Length(); i++) {
+    if (mChain[i]->IsRootContent()) {
+      bool scrollable = mChain[i]->CanVerticalScrollWithDynamicToolbar();
+      return {scrollable, scrollable ? mChain[i].get() : nullptr};
+    }
+
+    if (mChain[i]->CanScrollDownwards()) {
+      return {false, nullptr};
+    }
+  }
+
+  return {false, nullptr};
+}
+
+bool OverscrollHandoffChain::ScrollingUpWillTriggerPullToRefresh(
+    const AsyncPanZoomController* aApzc) const {
+  MOZ_ASSERT(aApzc && !aApzc->IsRootContent(),
+             "Should be used for non-root APZC");
+
+  for (uint32_t i = IndexOf(aApzc); i < Length(); i++) {
+    if (mChain[i]->IsRootContent()) {
+      return mChain[i]->CanOverscrollUpwards(HandoffConsumer::PullToRefresh);
+    }
+
+    if (!mChain[i]->CanOverscrollUpwards(HandoffConsumer::PullToRefresh)) {
+      return false;
+    }
+  }
+  return false;
+}
+
+}  
+}  

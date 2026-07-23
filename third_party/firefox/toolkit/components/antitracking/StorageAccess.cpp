@@ -1,0 +1,704 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "StorageAccess.h"
+
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/Components.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/net/CookieJarSettings.h"
+#include "mozilla/PermissionManager.h"
+#include "mozilla/StaticPrefs_browser.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/StaticPrefs_privacy.h"
+#include "mozilla/StorageAccess.h"
+#include "nsAboutProtocolUtils.h"
+#include "nsContentUtils.h"
+#include "nsGlobalWindowInner.h"
+#include "nsICookiePermission.h"
+#include "nsICookieService.h"
+#include "nsICookieJarSettings.h"
+#include "nsIHttpChannel.h"
+#include "nsIPermission.h"
+#include "nsIWebProgressListener.h"
+#include "nsIClassifiedChannel.h"
+#include "nsNetUtil.h"
+#include "nsScriptSecurityManager.h"
+#include "nsSandboxFlags.h"
+#include "AntiTrackingUtils.h"
+#include "AntiTrackingLog.h"
+#include "ContentBlockingAllowList.h"
+#include "mozIThirdPartyUtil.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using mozilla::net::CookieJarSettings;
+
+uint32_t mozilla::detail::CheckCookiePermissionForPrincipal(
+    nsICookieJarSettings* aCookieJarSettings, nsIPrincipal* aPrincipal) {
+  MOZ_ASSERT(aCookieJarSettings);
+  MOZ_ASSERT(aPrincipal);
+
+  uint32_t cookiePermission = nsICookiePermission::ACCESS_DEFAULT;
+  if (!aPrincipal->GetIsContentPrincipal()) {
+    return cookiePermission;
+  }
+
+  nsresult rv =
+      aCookieJarSettings->CookiePermission(aPrincipal, &cookiePermission);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return nsICookiePermission::ACCESS_DEFAULT;
+  }
+
+  return cookiePermission;
+}
+
+static StorageAccess InternalStorageAllowedCheck(
+    nsIPrincipal* aPrincipal, nsPIDOMWindowInner* aWindow, nsIURI* aURI,
+    nsIChannel* aChannel, nsICookieJarSettings* aCookieJarSettings,
+    uint32_t& aRejectedReason) {
+  MOZ_ASSERT(aPrincipal);
+
+  aRejectedReason = 0;
+
+  StorageAccess access = StorageAccess::eAllow;
+
+  if (aPrincipal->GetIsNullPrincipal()) {
+    return StorageAccess::eDeny;
+  }
+
+  nsCOMPtr<nsIURI> documentURI;
+  if (aWindow) {
+    Document* document = aWindow->GetExtantDoc();
+    if (document && document->GetSandboxFlags() & SANDBOXED_ORIGIN) {
+      return StorageAccess::eDeny;
+    }
+
+    if (document && document->IsInPrivateBrowsing()) {
+      access = StorageAccess::ePrivateBrowsing;
+    }
+
+    documentURI = document ? document->GetDocumentURI() : nullptr;
+  }
+
+  if ((aURI && aURI->SchemeIs("about") &&
+       !NS_IsContentAccessibleAboutURI(aURI)) ||
+      (documentURI && documentURI->SchemeIs("about") &&
+       !NS_IsContentAccessibleAboutURI(documentURI)) ||
+      aPrincipal->SchemeIs("about")) {
+    return access;
+  }
+
+  bool disabled = true;
+  if (aWindow) {
+    nsIURI* documentURI = aURI ? aURI : aWindow->GetDocumentURI();
+    disabled = !documentURI || !ShouldAllowAccessFor(aWindow, documentURI, true,
+                                                     &aRejectedReason);
+
+    uint32_t rejectedReason = aRejectedReason;
+    if (aRejectedReason ==
+            static_cast<uint32_t>(
+                nsIWebProgressListener::STATE_COOKIES_PARTITIONED_FOREIGN) &&
+        nsContentUtils::IsThirdPartyTrackingResourceWindow(aWindow)) {
+      rejectedReason =
+          nsIWebProgressListener::STATE_COOKIES_PARTITIONED_TRACKER;
+    }
+
+    ContentBlockingNotifier::OnDecision(
+        aWindow,
+        disabled ? ContentBlockingNotifier::BlockingDecision::eBlock
+                 : ContentBlockingNotifier::BlockingDecision::eAllow,
+        rejectedReason);
+  } else if (aChannel) {
+    disabled = false;
+    nsCOMPtr<nsIURI> uri;
+    nsresult rv = aChannel->GetURI(getter_AddRefs(uri));
+    if (!NS_WARN_IF(NS_FAILED(rv))) {
+      disabled = !ShouldAllowAccessFor(aChannel, uri, &aRejectedReason);
+    }
+
+    uint32_t rejectedReason = aRejectedReason;
+    nsCOMPtr<nsIClassifiedChannel> classifiedChannel =
+        do_QueryInterface(aChannel);
+
+    if (classifiedChannel &&
+        classifiedChannel->IsThirdPartyTrackingResource() &&
+        aRejectedReason ==
+            static_cast<uint32_t>(
+                nsIWebProgressListener::STATE_COOKIES_PARTITIONED_FOREIGN)) {
+      rejectedReason =
+          nsIWebProgressListener::STATE_COOKIES_PARTITIONED_TRACKER;
+    }
+
+    ContentBlockingNotifier::OnDecision(
+        aChannel,
+        disabled ? ContentBlockingNotifier::BlockingDecision::eBlock
+                 : ContentBlockingNotifier::BlockingDecision::eAllow,
+        rejectedReason);
+  } else {
+    MOZ_ASSERT(aPrincipal);
+    nsCOMPtr<nsICookieJarSettings> cookieJarSettings = aCookieJarSettings;
+    if (!cookieJarSettings) {
+      cookieJarSettings = net::CookieJarSettings::Create(aPrincipal);
+    }
+    disabled = !ShouldAllowAccessFor(aPrincipal, aCookieJarSettings);
+  }
+
+  if (!disabled) {
+    return access;
+  }
+
+  if (aRejectedReason ==
+          static_cast<uint32_t>(
+              nsIWebProgressListener::STATE_COOKIES_BLOCKED_TRACKER) ||
+      aRejectedReason ==
+          static_cast<uint32_t>(
+              nsIWebProgressListener::STATE_COOKIES_BLOCKED_SOCIALTRACKER)) {
+    return StorageAccess::ePartitionTrackersOrDeny;
+  }
+
+  if (aRejectedReason ==
+      static_cast<uint32_t>(
+          nsIWebProgressListener::STATE_COOKIES_PARTITIONED_FOREIGN)) {
+    return StorageAccess::ePartitionForeignOrDeny;
+  }
+
+  return StorageAccess::eDeny;
+}
+
+static StorageAccess InternalStorageAllowedCheckCached(
+    nsIPrincipal* aPrincipal, nsPIDOMWindowInner* aWindow, nsIURI* aURI,
+    nsIChannel* aChannel, nsICookieJarSettings* aCookieJarSettings,
+    uint32_t& aRejectedReason) {
+  nsGlobalWindowInner* win = nullptr;
+  if (aWindow) {
+    win = nsGlobalWindowInner::Cast(aWindow);
+
+    Maybe<StorageAccess> storageAccess =
+        win->GetStorageAllowedCache(aRejectedReason);
+    if (storageAccess.isSome()) {
+      return storageAccess.value();
+    }
+  }
+
+  StorageAccess result = InternalStorageAllowedCheck(
+      aPrincipal, aWindow, aURI, aChannel, aCookieJarSettings, aRejectedReason);
+  if (win) {
+    win->SetStorageAllowedCache(result, aRejectedReason);
+  }
+
+  return result;
+}
+
+namespace mozilla {
+
+StorageAccess StorageAllowedForWindow(nsPIDOMWindowInner* aWindow,
+                                      uint32_t* aRejectedReason) {
+  uint32_t rejectedReason;
+  if (!aRejectedReason) {
+    aRejectedReason = &rejectedReason;
+  }
+
+  *aRejectedReason = 0;
+
+  if (Document* document = aWindow->GetExtantDoc()) {
+    nsCOMPtr<nsIPrincipal> principal = document->NodePrincipal();
+    nsIChannel* channel = document->GetChannel();
+    return InternalStorageAllowedCheckCached(
+        principal, aWindow, nullptr, channel, document->CookieJarSettings(),
+        *aRejectedReason);
+  }
+
+  if (const nsCOMPtr<nsIGlobalObject> global = aWindow->AsGlobal()) {
+    if (const nsCOMPtr<nsIPrincipal> principal = global->PrincipalOrNull()) {
+      if (principal->GetIsInPrivateBrowsing()) {
+        return StorageAccess::ePrivateBrowsing;
+      }
+    }
+  }
+
+  return StorageAccess::eDeny;
+}
+
+StorageAccess StorageAllowedForDocument(const Document* aDoc) {
+  StorageAccess cookieAllowed = CookieAllowedForDocument(aDoc);
+  if (!aDoc->IsTopLevelContentDocument() &&
+      cookieAllowed > StorageAccess::eDeny) {
+    return StorageAccess::ePartitionForeignOrDeny;
+  }
+  return cookieAllowed;
+}
+
+StorageAccess CookieAllowedForDocument(const Document* aDoc) {
+  MOZ_ASSERT(aDoc);
+
+  if (nsPIDOMWindowInner* inner = aDoc->GetInnerWindow()) {
+    nsCOMPtr<nsIPrincipal> principal = aDoc->NodePrincipal();
+    nsIChannel* channel = aDoc->GetChannel();
+
+    uint32_t rejectedReason = 0;
+    return InternalStorageAllowedCheckCached(
+        principal, inner, nullptr, channel,
+        const_cast<Document*>(aDoc)->CookieJarSettings(), rejectedReason);
+  }
+
+  return StorageAccess::eDeny;
+}
+
+StorageAccess StorageAllowedForNewWindow(nsIPrincipal* aPrincipal, nsIURI* aURI,
+                                         nsPIDOMWindowInner* aParent) {
+  MOZ_ASSERT(aPrincipal);
+  MOZ_ASSERT(aURI);
+
+  uint32_t rejectedReason = 0;
+  nsCOMPtr<nsICookieJarSettings> cjs;
+  if (aParent && aParent->GetExtantDoc()) {
+    cjs = aParent->GetExtantDoc()->CookieJarSettings();
+  } else {
+    cjs = net::CookieJarSettings::Create(aPrincipal);
+  }
+  return InternalStorageAllowedCheck(aPrincipal, aParent, aURI, nullptr, cjs,
+                                     rejectedReason);
+}
+
+StorageAccess StorageAllowedForChannel(nsIChannel* aChannel) {
+  MOZ_DIAGNOSTIC_ASSERT(nsContentUtils::GetSecurityManager());
+  MOZ_DIAGNOSTIC_ASSERT(aChannel);
+
+  nsCOMPtr<nsIPrincipal> principal;
+  (void)nsContentUtils::GetSecurityManager()->GetChannelResultPrincipal(
+      aChannel, getter_AddRefs(principal));
+  NS_ENSURE_TRUE(principal, StorageAccess::eDeny);
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  nsCOMPtr<nsICookieJarSettings> cookieJarSettings;
+  nsresult rv =
+      loadInfo->GetCookieJarSettings(getter_AddRefs(cookieJarSettings));
+  NS_ENSURE_SUCCESS(rv, StorageAccess::eDeny);
+
+  uint32_t rejectedReason = 0;
+  StorageAccess result = InternalStorageAllowedCheck(
+      principal, nullptr, nullptr, aChannel, cookieJarSettings, rejectedReason);
+
+  return result;
+}
+
+StorageAccess StorageAllowedForServiceWorker(
+    nsIPrincipal* aPrincipal, nsICookieJarSettings* aCookieJarSettings) {
+  uint32_t rejectedReason = 0;
+  return InternalStorageAllowedCheck(aPrincipal, nullptr, nullptr, nullptr,
+                                     aCookieJarSettings, rejectedReason);
+}
+
+bool ShouldPartitionStorage(StorageAccess aAccess) {
+  return aAccess == StorageAccess::ePartitionTrackersOrDeny ||
+         aAccess == StorageAccess::ePartitionForeignOrDeny;
+}
+
+bool ShouldPartitionStorage(uint32_t aRejectedReason) {
+  return aRejectedReason ==
+             static_cast<uint32_t>(
+                 nsIWebProgressListener::STATE_COOKIES_BLOCKED_TRACKER) ||
+         aRejectedReason ==
+             static_cast<uint32_t>(
+                 nsIWebProgressListener::STATE_COOKIES_BLOCKED_SOCIALTRACKER) ||
+         aRejectedReason ==
+             static_cast<uint32_t>(
+                 nsIWebProgressListener::STATE_COOKIES_PARTITIONED_FOREIGN);
+}
+
+bool StoragePartitioningEnabled(StorageAccess aAccess,
+                                nsICookieJarSettings* aCookieJarSettings) {
+  return aAccess == StorageAccess::ePartitionForeignOrDeny &&
+         aCookieJarSettings->GetCookieBehavior() ==
+             nsICookieService::BEHAVIOR_PARTITION_FOREIGN;
+}
+
+bool StoragePartitioningEnabled(uint32_t aRejectedReason,
+                                nsICookieJarSettings* aCookieJarSettings) {
+  return aRejectedReason ==
+             static_cast<uint32_t>(
+                 nsIWebProgressListener::STATE_COOKIES_PARTITIONED_FOREIGN) &&
+         aCookieJarSettings->GetCookieBehavior() ==
+             nsICookieService::BEHAVIOR_PARTITION_FOREIGN;
+}
+
+int32_t CookiesBehavior(Document* a3rdPartyDocument) {
+  MOZ_ASSERT(a3rdPartyDocument);
+
+  return a3rdPartyDocument->CookieJarSettings()->GetCookieBehavior();
+}
+
+bool CookiesBehaviorRejectsThirdPartyContexts(Document* aDocument) {
+  MOZ_ASSERT(aDocument);
+
+  return aDocument->CookieJarSettings()->GetRejectThirdPartyContexts();
+}
+
+int32_t CookiesBehavior(nsILoadInfo* aLoadInfo, nsIURI* a3rdPartyURI) {
+  MOZ_ASSERT(aLoadInfo);
+  MOZ_ASSERT(a3rdPartyURI);
+
+  nsCOMPtr<nsICookieJarSettings> cookieJarSettings;
+  nsresult rv =
+      aLoadInfo->GetCookieJarSettings(getter_AddRefs(cookieJarSettings));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return nsICookieService::BEHAVIOR_REJECT;
+  }
+
+  return cookieJarSettings->GetCookieBehavior();
+}
+
+int32_t CookiesBehavior(nsIPrincipal* aPrincipal,
+                        nsICookieJarSettings* aCookieJarSettings) {
+  MOZ_ASSERT(aPrincipal);
+  MOZ_ASSERT(aCookieJarSettings);
+
+  return aCookieJarSettings->GetCookieBehavior();
+}
+
+bool ShouldAllowAccessFor(nsPIDOMWindowInner* aWindow, nsIURI* aURI,
+                          bool aCookies, uint32_t* aRejectedReason) {
+  MOZ_ASSERT(aWindow);
+  MOZ_ASSERT(aURI);
+
+  uint32_t rejectedReason = 0;
+  if (!aRejectedReason) {
+    aRejectedReason = &rejectedReason;
+  }
+
+  LOG_SPEC(("Computing whether window %p has access to URI %s", aWindow, _spec),
+           aURI);
+
+  nsGlobalWindowInner* innerWindow = nsGlobalWindowInner::Cast(aWindow);
+  Document* document = innerWindow->GetExtantDoc();
+  if (!document) {
+    LOG(("Our window has no document"));
+    return false;
+  }
+
+  uint32_t cookiePermission = detail::CheckCookiePermissionForPrincipal(
+      document->CookieJarSettings(), document->NodePrincipal());
+  if (cookiePermission != nsICookiePermission::ACCESS_DEFAULT) {
+    LOG(
+        ("CheckCookiePermissionForPrincipal() returned a non-default access "
+         "code (%d) for window's principal, returning %s",
+         int(cookiePermission),
+         cookiePermission != nsICookiePermission::ACCESS_DENY ? "success"
+                                                              : "failure"));
+    if (cookiePermission != nsICookiePermission::ACCESS_DENY) {
+      return true;
+    }
+
+    *aRejectedReason =
+        nsIWebProgressListener::STATE_COOKIES_BLOCKED_BY_PERMISSION;
+    return false;
+  }
+
+  int32_t behavior = CookiesBehavior(document);
+  if (behavior == nsICookieService::BEHAVIOR_ACCEPT) {
+    LOG(("The cookie behavior pref mandates accepting all cookies!"));
+    return true;
+  }
+
+  if (ContentBlockingAllowList::Check(aWindow)) {
+    return true;
+  }
+
+  if (behavior == nsICookieService::BEHAVIOR_REJECT) {
+    LOG(("The cookie behavior pref mandates rejecting all cookies!"));
+    *aRejectedReason = nsIWebProgressListener::STATE_COOKIES_BLOCKED_ALL;
+    return false;
+  }
+
+  if (behavior != nsICookieService::BEHAVIOR_REJECT_TRACKER &&
+      behavior != nsICookieService::BEHAVIOR_PARTITION_FOREIGN) {
+    if (!AntiTrackingUtils::IsThirdPartyWindow(aWindow, aURI)) {
+      LOG(("Our window isn't a third-party window"));
+      return true;
+    }
+  }
+
+  if (behavior == nsICookieService::BEHAVIOR_REJECT_FOREIGN ||
+      behavior == nsICookieService::BEHAVIOR_LIMIT_FOREIGN) {
+    LOG(("Nothing more to do due to the behavior code %d", int(behavior)));
+    *aRejectedReason = nsIWebProgressListener::STATE_COOKIES_BLOCKED_FOREIGN;
+    return false;
+  }
+
+  if (document->HasStorageAccessPermissionGrantedByAllowList()) {
+    return true;
+  }
+
+  MOZ_ASSERT(behavior == nsICookieService::BEHAVIOR_REJECT_TRACKER ||
+             behavior == nsICookieService::BEHAVIOR_PARTITION_FOREIGN);
+
+  uint32_t blockedReason =
+      nsIWebProgressListener::STATE_COOKIES_BLOCKED_TRACKER;
+
+  if (behavior == nsICookieService::BEHAVIOR_REJECT_TRACKER) {
+    if (!nsContentUtils::IsThirdPartyTrackingResourceWindow(aWindow)) {
+      LOG(("Our window isn't a third-party tracking window"));
+      return true;
+    }
+
+    nsCOMPtr<nsIClassifiedChannel> classifiedChannel =
+        do_QueryInterface(document->GetChannel());
+    if (classifiedChannel) {
+      uint32_t classificationFlags =
+          classifiedChannel->GetThirdPartyClassificationFlags();
+      if (classificationFlags & nsIClassifiedChannel::ClassificationFlags::
+                                    CLASSIFIED_SOCIALTRACKING) {
+        blockedReason =
+            nsIWebProgressListener::STATE_COOKIES_BLOCKED_SOCIALTRACKER;
+      }
+    }
+  } else if (behavior == nsICookieService::BEHAVIOR_PARTITION_FOREIGN) {
+    if (nsContentUtils::IsThirdPartyTrackingResourceWindow(aWindow) ||
+        AntiTrackingUtils::IsThirdPartyWindow(aWindow, aURI)) {
+      LOG(("We're in the third-party context, storage should be partitioned"));
+      // fall through, but remember that we're partitioning.
+      blockedReason = nsIWebProgressListener::STATE_COOKIES_PARTITIONED_FOREIGN;
+    } else {
+      LOG(("Our window isn't a third-party window, storage is allowed"));
+      return true;
+    }
+  } else {
+    MOZ_ASSERT_UNREACHABLE(
+        "This should be an exhaustive list of cookie behaviors possible "
+        "here.");
+  }
+
+  Document* doc = aWindow->GetExtantDoc();
+  if (doc && (doc->StorageAccessSandboxed())) {
+    LOG(("Our document is sandboxed"));
+    *aRejectedReason = blockedReason;
+    return false;
+  }
+
+  bool allowed = aCookies && document->UsingStorageAccess();
+
+  if (!allowed) {
+    *aRejectedReason = blockedReason;
+  } else {
+    if (MOZ_LOG_TEST(gAntiTrackingLog, mozilla::LogLevel::Debug) &&
+        aWindow->UsingStorageAccess()) {
+      LOG(("Permission stored in the window. All good."));
+    }
+  }
+
+  return allowed;
+}
+
+bool ShouldAllowAccessFor(nsIChannel* aChannel, nsIURI* aURI,
+                          uint32_t* aRejectedReason) {
+  MOZ_ASSERT(aURI);
+  MOZ_ASSERT(aChannel);
+
+  uint32_t rejectedReason = 0;
+  if (!aRejectedReason) {
+    aRejectedReason = &rejectedReason;
+  }
+
+  nsIScriptSecurityManager* ssm =
+      nsScriptSecurityManager::GetScriptSecurityManager();
+  MOZ_ASSERT(ssm);
+
+  nsCOMPtr<nsIURI> channelURI;
+  nsresult rv = NS_GetFinalChannelURI(aChannel, getter_AddRefs(channelURI));
+  if (NS_FAILED(rv)) {
+    LOG(("Failed to get the channel final URI, bail out early"));
+    return true;
+  }
+  LOG_SPEC(
+      ("Computing whether channel %p has access to URI %s", aChannel, _spec),
+      channelURI);
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  nsCOMPtr<nsICookieJarSettings> cookieJarSettings;
+  rv = loadInfo->GetCookieJarSettings(getter_AddRefs(cookieJarSettings));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    LOG(
+        ("Failed to get the cookie jar settings from the loadinfo, bail out "
+         "early"));
+    return true;
+  }
+
+  nsCOMPtr<nsIPrincipal> channelPrincipal;
+  rv = ssm->GetChannelURIPrincipal(aChannel, getter_AddRefs(channelPrincipal));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    LOG(("No channel principal, bail out early"));
+    return false;
+  }
+
+  uint32_t cookiePermission = detail::CheckCookiePermissionForPrincipal(
+      cookieJarSettings, channelPrincipal);
+  if (cookiePermission != nsICookiePermission::ACCESS_DEFAULT) {
+    LOG(
+        ("CheckCookiePermissionForPrincipal() returned a non-default access "
+         "code (%d) for channel's principal, returning %s",
+         int(cookiePermission),
+         cookiePermission != nsICookiePermission::ACCESS_DENY ? "success"
+                                                              : "failure"));
+    if (cookiePermission != nsICookiePermission::ACCESS_DENY) {
+      return true;
+    }
+
+    *aRejectedReason =
+        nsIWebProgressListener::STATE_COOKIES_BLOCKED_BY_PERMISSION;
+    return false;
+  }
+
+  if (!channelURI) {
+    LOG(("No channel uri, bail out early"));
+    return false;
+  }
+
+  int32_t behavior = CookiesBehavior(loadInfo, channelURI);
+  if (behavior == nsICookieService::BEHAVIOR_ACCEPT) {
+    LOG(("The cookie behavior pref mandates accepting all cookies!"));
+    return true;
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(aChannel);
+
+  if (httpChannel && ContentBlockingAllowList::Check(httpChannel)) {
+    return true;
+  }
+
+  if (behavior == nsICookieService::BEHAVIOR_REJECT) {
+    LOG(("The cookie behavior pref mandates rejecting all cookies!"));
+    *aRejectedReason = nsIWebProgressListener::STATE_COOKIES_BLOCKED_ALL;
+    return false;
+  }
+
+  nsCOMPtr<mozIThirdPartyUtil> thirdPartyUtil =
+      components::ThirdPartyUtil::Service();
+  if (!thirdPartyUtil) {
+    LOG(("No thirdPartyUtil, bail out early"));
+    return true;
+  }
+
+  bool thirdParty = false;
+  rv = thirdPartyUtil->IsThirdPartyChannel(aChannel, aURI, &thirdParty);
+  if (NS_SUCCEEDED(rv) && !thirdParty) {
+    LOG(("Our channel isn't a third-party channel"));
+    return true;
+  }
+
+  if (behavior == nsICookieService::BEHAVIOR_REJECT_FOREIGN ||
+      behavior == nsICookieService::BEHAVIOR_LIMIT_FOREIGN) {
+    LOG(("Nothing more to do due to the behavior code %d", int(behavior)));
+    *aRejectedReason = nsIWebProgressListener::STATE_COOKIES_BLOCKED_FOREIGN;
+    return false;
+  }
+
+  if (loadInfo->GetStoragePermission() ==
+      nsILoadInfo::StoragePermissionAllowListed) {
+    return true;
+  }
+
+  MOZ_ASSERT(behavior == nsICookieService::BEHAVIOR_REJECT_TRACKER ||
+             behavior == nsICookieService::BEHAVIOR_PARTITION_FOREIGN);
+
+  uint32_t blockedReason =
+      nsIWebProgressListener::STATE_COOKIES_BLOCKED_TRACKER;
+
+  nsCOMPtr<nsIClassifiedChannel> classifiedChannel =
+      do_QueryInterface(aChannel);
+  if (behavior == nsICookieService::BEHAVIOR_REJECT_TRACKER) {
+    if (classifiedChannel) {
+      if (!classifiedChannel->IsThirdPartyTrackingResource()) {
+        LOG(("Our channel isn't a third-party tracking channel"));
+        return true;
+      }
+
+      uint32_t classificationFlags =
+          classifiedChannel->GetThirdPartyClassificationFlags();
+      if (classificationFlags & nsIClassifiedChannel::ClassificationFlags::
+                                    CLASSIFIED_SOCIALTRACKING) {
+        blockedReason =
+            nsIWebProgressListener::STATE_COOKIES_BLOCKED_SOCIALTRACKER;
+      }
+    }
+  } else if (behavior == nsICookieService::BEHAVIOR_PARTITION_FOREIGN) {
+    if ((classifiedChannel &&
+         classifiedChannel->IsThirdPartyTrackingResource()) ||
+        AntiTrackingUtils::IsThirdPartyChannel(aChannel)) {
+      LOG(("We're in the third-party context, storage should be partitioned"));
+      // fall through but remember that we're partitioning.
+      blockedReason = nsIWebProgressListener::STATE_COOKIES_PARTITIONED_FOREIGN;
+    } else {
+      LOG(("Our channel isn't a third-party channel, storage is allowed"));
+      return true;
+    }
+  } else {
+    MOZ_ASSERT_UNREACHABLE(
+        "This should be an exhaustive list of cookie behaviors possible "
+        "here.");
+  }
+
+  RefPtr<BrowsingContext> targetBC;
+  rv = loadInfo->GetTargetBrowsingContext(getter_AddRefs(targetBC));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    LOG(("Failed to get the channel's target browsing context"));
+    return false;
+  }
+
+  if (!targetBC) {
+    rv = loadInfo->GetAssociatedBrowsingContext(getter_AddRefs(targetBC));
+  }
+
+  if (!targetBC) {
+    LOG(("No browsing context is available for the channel."));
+  }
+
+  if (targetBC &&
+      Document::StorageAccessSandboxed(targetBC->GetSandboxFlags())) {
+    LOG(("Our document is sandboxed"));
+    *aRejectedReason = blockedReason;
+    return false;
+  }
+
+
+  bool isDocument = false;
+  aChannel->GetIsDocument(&isDocument);
+
+  if (targetBC && isDocument) {
+    nsCOMPtr<nsPIDOMWindowInner> inner =
+        AntiTrackingUtils::GetInnerWindow(targetBC);
+    if (inner && inner->UsingStorageAccess()) {
+      LOG(("Permission stored in the window. All good."));
+      return true;
+    }
+  }
+
+  nsILoadInfo::StoragePermissionState storageAccess =
+      loadInfo->GetStoragePermission();
+  bool allowed = storageAccess == nsILoadInfo::HasStoragePermission ||
+                 storageAccess == nsILoadInfo::StoragePermissionAllowListed;
+  if (!allowed) {
+    *aRejectedReason = blockedReason;
+  }
+
+  return allowed;
+}
+
+bool ShouldAllowAccessFor(nsIPrincipal* aPrincipal,
+                          nsICookieJarSettings* aCookieJarSettings) {
+  MOZ_ASSERT(aPrincipal);
+  MOZ_ASSERT(aCookieJarSettings);
+
+  uint32_t access =
+      detail::CheckCookiePermissionForPrincipal(aCookieJarSettings, aPrincipal);
+
+  if (access != nsICookiePermission::ACCESS_DEFAULT) {
+    return access != nsICookiePermission::ACCESS_DENY;
+  }
+
+  int32_t behavior = CookiesBehavior(aPrincipal, aCookieJarSettings);
+  return behavior != nsICookieService::BEHAVIOR_REJECT;
+}
+
+}  

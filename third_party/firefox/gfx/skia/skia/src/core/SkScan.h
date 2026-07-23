@@ -1,0 +1,107 @@
+/*
+ * Copyright 2011 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+
+#if !defined(SkScan_DEFINED)
+#define SkScan_DEFINED
+
+#include "include/core/SkPoint.h"
+#include "include/core/SkRect.h"
+#include "include/private/base/SkFixed.h"
+
+class SkBlitter;
+class SkPath;
+struct SkPathRaw;
+class SkRasterClip;
+class SkRegion;
+
+typedef SkIRect SkXRect;
+
+class SkScan {
+public:
+    typedef void (*HairRgnProc)(SkSpan<const SkPoint>, const SkRegion*, SkBlitter*);
+    typedef void (*HairRCProc)(SkSpan<const SkPoint>, const SkRasterClip&, SkBlitter*);
+
+    static bool PathRequiresTiling(const SkIRect& bounds);
+
+
+    static void FillIRect(const SkIRect&, const SkRasterClip&, SkBlitter*);
+    static void FillXRect(const SkXRect&, const SkRasterClip&, SkBlitter*);
+    static void FillRect(const SkRect&, const SkRasterClip&, SkBlitter*);
+    static void AntiFillRect(const SkRect&, const SkRasterClip&, SkBlitter*);
+    static void AntiFillXRect(const SkXRect&, const SkRasterClip&, SkBlitter*);
+
+    static void FillPath(const SkPathRaw&, const SkRasterClip&, SkBlitter*);
+    static void FillPath(const SkPathRaw&, const SkRegion& clip, SkBlitter*);
+    static void AntiFillPath(const SkPathRaw&, const SkRasterClip&, SkBlitter*);
+
+    static void FrameRect(const SkRect&, const SkPoint& strokeSize,
+                          const SkRasterClip&, SkBlitter*);
+    static void AntiFrameRect(const SkRect&, const SkPoint& strokeSize,
+                              const SkRasterClip&, SkBlitter*);
+    static void FillTriangle(const SkPoint pts[], const SkRasterClip&, SkBlitter*);
+    static void HairLine(SkSpan<const SkPoint>, const SkRasterClip&, SkBlitter*);
+    static void AntiHairLine(SkSpan<const SkPoint>, const SkRasterClip&, SkBlitter*);
+    static void HairRect(const SkRect&, const SkRasterClip&, SkBlitter*);
+    static void AntiHairRect(const SkRect&, const SkRasterClip&, SkBlitter*);
+
+    static void HairPath(const SkPathRaw&, const SkRasterClip&, SkBlitter*);
+    static void AntiHairPath(const SkPathRaw&, const SkRasterClip&, SkBlitter*);
+    static void HairSquarePath(const SkPathRaw&, const SkRasterClip&, SkBlitter*);
+    static void AntiHairSquarePath(const SkPathRaw&, const SkRasterClip&, SkBlitter*);
+    static void HairRoundPath(const SkPathRaw&, const SkRasterClip&, SkBlitter*);
+    static void AntiHairRoundPath(const SkPathRaw&, const SkRasterClip&, SkBlitter*);
+
+private:
+    friend class SkAAClip;
+    friend class SkRegion;
+
+    static void FillIRect(const SkIRect&, const SkRegion* clip, SkBlitter*);
+    static void FillXRect(const SkXRect&, const SkRegion* clip, SkBlitter*);
+    static void FillRect(const SkRect&, const SkRegion* clip, SkBlitter*);
+    static void AntiFillRect(const SkRect&, const SkRegion* clip, SkBlitter*);
+    static void AntiFillXRect(const SkXRect&, const SkRegion*, SkBlitter*);
+    static void AntiFillPath(const SkPathRaw&, const SkRegion& clip, SkBlitter*, bool forceRLE);
+    static void FillTriangle(const SkPoint pts[], const SkRegion*, SkBlitter*);
+
+    static void AntiFrameRect(const SkRect&, const SkPoint& strokeSize,
+                              const SkRegion*, SkBlitter*);
+    static void HairLineRgn(SkSpan<const SkPoint>, const SkRegion*, SkBlitter*);
+    static void AntiHairLineRgn(SkSpan<const SkPoint>, const SkRegion*, SkBlitter*);
+    static void AAAFillPath(const SkPathRaw&, SkBlitter* blitter, const SkIRect& pathIR,
+                            const SkIRect& clipBounds, bool forceRLE);
+};
+
+static inline void XRect_set(SkXRect* xr, const SkIRect& src) {
+    xr->fLeft = SkIntToFixed(src.fLeft);
+    xr->fTop = SkIntToFixed(src.fTop);
+    xr->fRight = SkIntToFixed(src.fRight);
+    xr->fBottom = SkIntToFixed(src.fBottom);
+}
+
+static inline void XRect_set(SkXRect* xr, const SkRect& src) {
+    xr->fLeft = SkScalarToFixed(src.fLeft);
+    xr->fTop = SkScalarToFixed(src.fTop);
+    xr->fRight = SkScalarToFixed(src.fRight);
+    xr->fBottom = SkScalarToFixed(src.fBottom);
+}
+
+static inline void XRect_round(const SkXRect& xr, SkIRect* dst) {
+    dst->fLeft = SkFixedRoundToInt(xr.fLeft);
+    dst->fTop = SkFixedRoundToInt(xr.fTop);
+    dst->fRight = SkFixedRoundToInt(xr.fRight);
+    dst->fBottom = SkFixedRoundToInt(xr.fBottom);
+}
+
+static inline void XRect_roundOut(const SkXRect& xr, SkIRect* dst) {
+    dst->fLeft = SkFixedFloorToInt(xr.fLeft);
+    dst->fTop = SkFixedFloorToInt(xr.fTop);
+    dst->fRight = SkFixedCeilToInt(xr.fRight);
+    dst->fBottom = SkFixedCeilToInt(xr.fBottom);
+}
+
+#endif

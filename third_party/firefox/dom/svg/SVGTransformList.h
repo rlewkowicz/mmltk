@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGTRANSFORMLIST_H_
+#define DOM_SVG_SVGTRANSFORMLIST_H_
+
+#include "gfxMatrix.h"
+#include "mozilla/dom/SVGTransform.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+namespace dom {
+class DOMSVGTransform;
+class DOMSVGTransformList;
+}  
+
+class SVGTransformList {
+  friend class SVGAnimatedTransformList;
+  friend class dom::DOMSVGTransform;
+  friend class dom::DOMSVGTransformList;
+
+ public:
+  SVGTransformList() = default;
+  ~SVGTransformList() = default;
+
+  SVGTransformList& operator=(const SVGTransformList& aOther) {
+    mItems.ClearAndRetainStorage();
+    (void)mItems.AppendElements(aOther.mItems, fallible);
+    return *this;
+  }
+
+  SVGTransformList(const SVGTransformList& aOther) { *this = aOther; }
+
+
+  void GetValueAsString(nsAString& aValue) const;
+
+  bool IsEmpty() const { return mItems.IsEmpty(); }
+
+  uint32_t Length() const { return mItems.Length(); }
+
+  const SVGTransform& operator[](uint32_t aIndex) const {
+    return mItems[aIndex];
+  }
+
+  bool operator==(const SVGTransformList& rhs) const {
+    return mItems == rhs.mItems;
+  }
+
+  bool SetCapacity(uint32_t size) { return mItems.SetCapacity(size, fallible); }
+
+  void Compact() { mItems.Compact(); }
+
+  gfxMatrix GetConsolidationMatrix() const;
+
+
+ protected:
+  nsresult CopyFrom(const SVGTransformList& rhs);
+  nsresult CopyFrom(const nsTArray<SVGTransform>& aTransformArray);
+
+  SVGTransform& operator[](uint32_t aIndex) { return mItems[aIndex]; }
+
+  bool SetLength(uint32_t aNumberOfItems) {
+    return mItems.SetLength(aNumberOfItems, fallible);
+  }
+
+ private:
+
+  nsresult SetValueFromString(const nsAString& aValue);
+
+  void Clear() { mItems.Clear(); }
+
+  bool InsertItem(uint32_t aIndex, const SVGTransform& aTransform) {
+    if (aIndex >= mItems.Length()) {
+      aIndex = mItems.Length();
+    }
+    return !!mItems.InsertElementAt(aIndex, aTransform, fallible);
+  }
+
+  void ReplaceItem(uint32_t aIndex, const SVGTransform& aTransform) {
+    MOZ_ASSERT(aIndex < mItems.Length(),
+               "DOM wrapper caller should have raised INDEX_SIZE_ERR");
+    mItems[aIndex] = aTransform;
+  }
+
+  void RemoveItem(uint32_t aIndex) {
+    MOZ_ASSERT(aIndex < mItems.Length(),
+               "DOM wrapper caller should have raised INDEX_SIZE_ERR");
+    mItems.RemoveElementAt(aIndex);
+  }
+
+  bool AppendItem(const SVGTransform& aTransform) {
+    return !!mItems.AppendElement(aTransform, fallible);
+  }
+
+ protected:
+  FallibleTArray<SVGTransform> mItems;
+};
+
+}  
+
+#endif  // DOM_SVG_SVGTRANSFORMLIST_H_

@@ -1,0 +1,453 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+var { Sanitizer } = ChromeUtils.importESModule(
+  "resource:///modules/Sanitizer.sys.mjs"
+);
+
+const { XPCOMUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/XPCOMUtils.sys.mjs"
+);
+
+const lazy = {};
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  DownloadUtils: "resource://gre/modules/DownloadUtils.sys.mjs",
+  SiteDataManager: "resource:///modules/SiteDataManager.sys.mjs",
+});
+
+Preferences.addAll([
+  { id: "privacy.cpd.history", type: "bool" },
+  { id: "privacy.cpd.formdata", type: "bool" },
+  { id: "privacy.cpd.downloads", type: "bool", disabled: true },
+  { id: "privacy.cpd.cookies", type: "bool" },
+  { id: "privacy.cpd.cache", type: "bool" },
+  { id: "privacy.cpd.sessions", type: "bool" },
+  { id: "privacy.cpd.offlineApps", type: "bool" },
+  { id: "privacy.cpd.siteSettings", type: "bool" },
+  { id: "privacy.sanitize.timeSpan", type: "int" },
+  { id: "privacy.clearOnShutdown.history", type: "bool" },
+  { id: "privacy.clearHistory.browsingHistoryAndDownloads", type: "bool" },
+  { id: "privacy.clearHistory.cookiesAndStorage", type: "bool" },
+  { id: "privacy.clearHistory.cache", type: "bool" },
+  { id: "privacy.clearHistory.siteSettings", type: "bool" },
+  { id: "privacy.clearHistory.formdata", type: "bool" },
+  { id: "privacy.clearSiteData.browsingHistoryAndDownloads", type: "bool" },
+  { id: "privacy.clearSiteData.cookiesAndStorage", type: "bool" },
+  { id: "privacy.clearSiteData.cache", type: "bool" },
+  { id: "privacy.clearSiteData.siteSettings", type: "bool" },
+  { id: "privacy.clearSiteData.formdata", type: "bool" },
+  {
+    id: "privacy.clearOnShutdown_v2.browsingHistoryAndDownloads",
+    type: "bool",
+  },
+  { id: "privacy.clearOnShutdown.formdata", type: "bool" },
+  { id: "privacy.clearOnShutdown_v2.formdata", type: "bool" },
+  { id: "privacy.clearOnShutdown.downloads", type: "bool" },
+  { id: "privacy.clearOnShutdown_v2.downloads", type: "bool" },
+  { id: "privacy.clearOnShutdown.cookies", type: "bool" },
+  { id: "privacy.clearOnShutdown_v2.cookiesAndStorage", type: "bool" },
+  { id: "privacy.clearOnShutdown.cache", type: "bool" },
+  { id: "privacy.clearOnShutdown_v2.cache", type: "bool" },
+  { id: "privacy.clearOnShutdown.offlineApps", type: "bool" },
+  { id: "privacy.clearOnShutdown.sessions", type: "bool" },
+  { id: "privacy.clearOnShutdown.siteSettings", type: "bool" },
+  { id: "privacy.clearOnShutdown_v2.siteSettings", type: "bool" },
+]);
+
+var gSanitizePromptDialog = {
+  get selectedTimespan() {
+    var durList = document.getElementById("sanitizeDurationChoice");
+    return parseInt(durList.value);
+  },
+
+  get warningBox() {
+    return document.getElementById("sanitizeEverythingWarningBox");
+  },
+
+  async init() {
+    this._inited = true;
+    this._dialog = document.querySelector("dialog");
+    this.siteDataSizes = {};
+    this.cacheSize = [];
+
+    let arg = window.arguments?.[0] || {};
+
+    this._inClearOnShutdownNewDialog = false;
+    this._inClearSiteDataNewDialog = false;
+    this._inBrowserWindow = !!arg.inBrowserWindow;
+    if (arg.mode) {
+      this._inClearOnShutdownNewDialog = arg.mode == "clearOnShutdown";
+      this._inClearSiteDataNewDialog = arg.mode == "clearSiteData";
+    }
+
+    if (arg.inBrowserWindow) {
+      this._dialog.setAttribute("inbrowserwindow", "true");
+      this._observeTitleForChanges();
+    } else if (arg.wrappedJSObject?.needNativeUI) {
+      document
+        .getElementById("sanitizeDurationChoice")
+        .setAttribute("native", "true");
+      for (let cb of document.querySelectorAll("checkbox")) {
+        cb.setAttribute("native", "true");
+      }
+    }
+
+    this._dataSizesUpdated = false;
+    this.dataSizesFinishedUpdatingPromise = this.getAndUpdateDataSizes(); 
+
+    let OKButton = this._dialog.getButton("accept");
+    let clearOnShutdownGroupbox = document.getElementById(
+      "clearOnShutdownGroupbox"
+    );
+    let clearPrivateDataGroupbox = document.getElementById(
+      "clearPrivateDataGroupbox"
+    );
+    let clearSiteDataGroupbox = document.getElementById(
+      "clearSiteDataGroupbox"
+    );
+
+    let okButtonl10nID = "sanitize-button-ok";
+    if (this._inClearOnShutdownNewDialog) {
+      okButtonl10nID = "sanitize-button-ok-on-shutdown";
+      this._dialog.setAttribute("inClearOnShutdown", "true");
+
+      clearPrivateDataGroupbox.remove();
+      clearSiteDataGroupbox.remove();
+      Sanitizer.maybeMigratePrefs("clearOnShutdown");
+    } else {
+      okButtonl10nID = "sanitize-button-ok2";
+      clearOnShutdownGroupbox.remove();
+      if (this._inClearSiteDataNewDialog) {
+        clearPrivateDataGroupbox.remove();
+      } else {
+        clearSiteDataGroupbox.remove();
+        Sanitizer.maybeMigratePrefs("cpd");
+      }
+    }
+    document.l10n.setAttributes(OKButton, okButtonl10nID);
+
+    this._sinceMidnightSanitizeDurationOption = document.getElementById(
+      "sanitizeSinceMidnight"
+    );
+    this._cookiesAndSiteDataCheckbox =
+      document.getElementById("cookiesAndStorage");
+    this._cacheCheckbox = document.getElementById("cache");
+    this._cookiesLoading = document.getElementById("cookiesAndStorage-loading");
+    this._cacheLoading = document.getElementById("cache-loading");
+
+    let midnightTime = Intl.DateTimeFormat(navigator.language, {
+      hour: "numeric",
+      minute: "numeric",
+    }).format(new Date().setHours(0, 0, 0, 0));
+    document.l10n.setAttributes(
+      this._sinceMidnightSanitizeDurationOption,
+      "clear-time-duration-value-since-midnight",
+      { midnightTime }
+    );
+
+    this.showLoadingSpinners();
+
+    document
+      .getElementById("sanitizeDurationChoice")
+      .addEventListener("select", () => this.selectByTimespan());
+
+    document.addEventListener("dialogaccept", e => {
+      if (this._inClearOnShutdownNewDialog) {
+        this.updatePrefs();
+      } else {
+        this.sanitize(e);
+      }
+    });
+
+    const { onAccept, onCancel } = arg.wrappedJSObject ?? arg;
+    if (typeof onAccept === "function") {
+      document.addEventListener("dialogaccept", onAccept);
+    }
+    if (typeof onCancel === "function") {
+      document.addEventListener("dialogcancel", onCancel);
+    }
+
+    this._allCheckboxes = document.querySelectorAll("checkbox[preference]");
+
+    this.registerSyncFromPrefListeners();
+
+    if (
+      this.selectedTimespan === Sanitizer.TIMESPAN_EVERYTHING &&
+      !this._inClearOnShutdownNewDialog
+    ) {
+      this.prepareWarning();
+      this.warningBox.hidden = false;
+      let warningDesc = document.getElementById("sanitizeEverythingWarning");
+      await document.l10n.translateFragment(warningDesc);
+      let rootWin = window.browsingContext.topChromeWindow;
+      await rootWin.promiseDocumentFlushed(() => {});
+    } else {
+      this.warningBox.hidden = true;
+    }
+  },
+
+  updateAcceptButtonState() {
+    let noneChecked = Array.from(this._allCheckboxes).every(cb => !cb.checked);
+    let acceptButton = this._dialog.getButton("accept");
+
+    acceptButton.disabled = noneChecked;
+  },
+
+  async selectByTimespan() {
+    if (!this._inited) {
+      return;
+    }
+
+    var warningBox = this.warningBox;
+
+    if (this.selectedTimespan === Sanitizer.TIMESPAN_EVERYTHING) {
+      this.prepareWarning();
+      if (warningBox.hidden) {
+        warningBox.hidden = false;
+        let diff =
+          warningBox.nextElementSibling.getBoundingClientRect().top -
+          warningBox.previousElementSibling.getBoundingClientRect().bottom;
+        window.resizeBy(0, diff);
+      }
+
+      await this.updateDataSizesInUI();
+      return;
+    }
+
+    if (!warningBox.hidden) {
+      let diff =
+        warningBox.nextElementSibling.getBoundingClientRect().top -
+        warningBox.previousElementSibling.getBoundingClientRect().bottom;
+      window.resizeBy(0, -diff);
+      warningBox.hidden = true;
+    }
+    document.l10n.setAttributes(
+      document.documentElement,
+      "sanitize-dialog-title2"
+    );
+
+    await this.updateDataSizesInUI();
+  },
+
+  sanitize(event) {
+    this.updatePrefs();
+
+    let acceptButton = this._dialog.getButton("accept");
+    acceptButton.disabled = true;
+    document.l10n.setAttributes(acceptButton, "sanitize-button-clearing");
+    this._dialog.getButton("cancel").disabled = true;
+
+    try {
+      let range = Sanitizer.getClearRange(this.selectedTimespan);
+      let options = {
+        ignoreTimespan: !range,
+        range,
+      };
+
+      let itemsToClear = this.getItemsToClear();
+      Sanitizer.sanitize(itemsToClear, options)
+        .catch(console.error)
+        .then(() => {
+          if (!this._inBrowserWindow) {
+            lazy.SiteDataManager.updateSites();
+          }
+          window.close();
+        })
+        .catch(console.error);
+      event.preventDefault();
+    } catch (er) {
+      console.error("Exception during sanitize: ", er);
+    }
+  },
+
+  prepareWarning() {
+
+    var warningDesc = document.getElementById("sanitizeEverythingWarning");
+    if (this.hasNonSelectedItems()) {
+      document.l10n.setAttributes(warningDesc, "sanitize-selected-warning");
+    } else {
+      document.l10n.setAttributes(warningDesc, "sanitize-everything-warning");
+    }
+  },
+
+  _getItemPrefs() {
+    return Array.from(this._allCheckboxes).map(checkbox =>
+      checkbox.getAttribute("preference")
+    );
+  },
+
+  onReadGeneric() {
+    var found = this._getItemPrefs().some(
+      pref => Preferences.get(pref).value === true
+    );
+
+    try {
+      this._dialog.getButton("accept").disabled = !found;
+    } catch (e) {}
+
+    this.prepareWarning();
+
+    return undefined;
+  },
+
+  showLoadingSpinners() {
+    if (this._cookiesLoading) {
+      this._cookiesLoading.hidden = false;
+    }
+    if (this._cacheLoading) {
+      this._cacheLoading.hidden = false;
+    }
+  },
+
+  hideLoadingSpinners() {
+    if (this._cookiesLoading) {
+      this._cookiesLoading.hidden = true;
+    }
+    if (this._cacheLoading) {
+      this._cacheLoading.hidden = true;
+    }
+  },
+
+  async getAndUpdateDataSizes() {
+    if (this._inBrowserWindow) {
+      await lazy.SiteDataManager.updateSites();
+    }
+    const ALL_TIMESPANS = [
+      "TIMESPAN_HOUR",
+      "TIMESPAN_2HOURS",
+      "TIMESPAN_4HOURS",
+      "TIMESPAN_TODAY",
+      "TIMESPAN_EVERYTHING",
+    ];
+
+    let [quotaUsage, cacheSize] = await Promise.all([
+      lazy.SiteDataManager.getQuotaUsageForTimeRanges(ALL_TIMESPANS),
+      lazy.SiteDataManager.getCacheSize(),
+    ]);
+    for (const timespan in quotaUsage) {
+      this.siteDataSizes[timespan] = lazy.DownloadUtils.convertByteUnits(
+        quotaUsage[timespan]
+      );
+    }
+    this.cacheSize = lazy.DownloadUtils.convertByteUnits(cacheSize);
+
+    this._dataSizesUpdated = true;
+    await this.updateDataSizesInUI();
+
+    this.hideLoadingSpinners();
+  },
+
+  updatePrefs() {
+    Services.prefs.setIntPref(Sanitizer.PREF_TIMESPAN, this.selectedTimespan);
+
+    var prefs = this._getItemPrefs();
+    for (let i = 0; i < prefs.length; ++i) {
+      var p = Preferences.get(prefs[i]);
+      Services.prefs.setBoolPref(p.id, p.value);
+    }
+  },
+
+  hasNonSelectedItems() {
+    let checkboxes = document.querySelectorAll("checkbox[preference]");
+    for (let i = 0; i < checkboxes.length; ++i) {
+      let pref = Preferences.get(checkboxes[i].getAttribute("preference"));
+      if (!pref.value) {
+        return true;
+      }
+    }
+    return false;
+  },
+
+  registerSyncFromPrefListeners() {
+    let checkboxes = document.querySelectorAll("checkbox[preference]");
+    for (let checkbox of checkboxes) {
+      Preferences.addSyncFromPrefListener(checkbox, () => this.onReadGeneric());
+    }
+  },
+
+  _titleChanged() {
+    let title = document.documentElement.getAttribute("title");
+    if (title) {
+      document.getElementById("titleText").textContent = title;
+    }
+  },
+
+  _observeTitleForChanges() {
+    this._titleChanged();
+    this._mutObs = new MutationObserver(() => {
+      this._titleChanged();
+    });
+    this._mutObs.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["title"],
+    });
+  },
+
+  async updateDataSizesInUI() {
+    if (!this._dataSizesUpdated) {
+      return;
+    }
+
+    const TIMESPAN_SELECTION_MAP = {
+      0: "TIMESPAN_EVERYTHING",
+      1: "TIMESPAN_HOUR",
+      2: "TIMESPAN_2HOURS",
+      3: "TIMESPAN_4HOURS",
+      4: "TIMESPAN_TODAY",
+      5: "TIMESPAN_5MINS",
+      6: "TIMESPAN_24HOURS",
+    };
+    let index = this.selectedTimespan;
+    let timeSpanSelected = TIMESPAN_SELECTION_MAP[index];
+    let [amount, unit] = this.siteDataSizes[timeSpanSelected];
+
+    document.l10n.pauseObserving();
+    document.l10n.setAttributes(
+      this._cookiesAndSiteDataCheckbox,
+      "item-cookies-site-data-with-size",
+      { amount, unit }
+    );
+
+    [amount, unit] = this.cacheSize;
+    document.l10n.setAttributes(
+      this._cacheCheckbox,
+      "item-cached-content-with-size",
+      { amount, unit }
+    );
+
+    await document.l10n.translateElements([
+      this._sinceMidnightSanitizeDurationOption,
+      this._cookiesAndSiteDataCheckbox,
+      this._cacheCheckbox,
+    ]);
+
+    document.l10n.resumeObserving();
+
+    await window.resizeDialog();
+  },
+
+  getItemsToClear() {
+    let items = [];
+    for (let cb of this._allCheckboxes) {
+      if (cb.checked) {
+        items.push(cb.id);
+      }
+    }
+    return items;
+  },
+};
+
+document.mozSubdialogReady = new Promise(resolve => {
+  window.addEventListener(
+    "load",
+    function () {
+      gSanitizePromptDialog.init().then(resolve);
+    },
+    {
+      once: true,
+    }
+  );
+});

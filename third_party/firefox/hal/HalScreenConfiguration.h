@@ -1,0 +1,30 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_HalScreenConfiguration_h
+#define mozilla_HalScreenConfiguration_h
+
+#include "mozilla/Observer.h"
+#include "mozilla/TypedEnumBits.h"
+
+#undef None
+
+namespace mozilla::hal {
+
+enum class ScreenOrientation : uint32_t {
+  None = 0,
+  PortraitPrimary = 1u << 0,
+  PortraitSecondary = 1u << 1,
+  LandscapePrimary = 1u << 2,
+  LandscapeSecondary = 1u << 3,
+  Default = 1u << 4,
+};
+
+constexpr auto kAllScreenOrientationBits = ScreenOrientation((1 << 5) - 1);
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(ScreenOrientation);
+
+}  
+
+#endif  // mozilla_HalScreenConfiguration_h

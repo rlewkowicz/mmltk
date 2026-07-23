@@ -1,0 +1,142 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/SVGGraphicsElement.h"
+
+#include "mozilla/ISVGDisplayableFrame.h"
+#include "mozilla/SVGContentUtils.h"
+#include "mozilla/SVGTextFrame.h"
+#include "mozilla/SVGUtils.h"
+#include "mozilla/dom/BindContext.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/SVGAnimatedLength.h"
+#include "mozilla/dom/SVGGraphicsElementBinding.h"
+#include "mozilla/dom/SVGMatrix.h"
+#include "mozilla/dom/SVGRect.h"
+#include "mozilla/dom/SVGSVGElement.h"
+#include "nsIContentInlines.h"
+#include "nsLayoutUtils.h"
+
+namespace mozilla::dom {
+
+
+NS_IMPL_ADDREF_INHERITED(SVGGraphicsElement, SVGGraphicsElementBase)
+NS_IMPL_RELEASE_INHERITED(SVGGraphicsElement, SVGGraphicsElementBase)
+
+NS_INTERFACE_MAP_BEGIN(SVGGraphicsElement)
+  NS_INTERFACE_MAP_ENTRY(mozilla::dom::SVGTests)
+NS_INTERFACE_MAP_END_INHERITING(SVGGraphicsElementBase)
+
+
+SVGGraphicsElement::SVGGraphicsElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+    : SVGGraphicsElementBase(std::move(aNodeInfo)) {}
+
+static already_AddRefed<SVGRect> ZeroBBox(SVGGraphicsElement& aOwner) {
+  return MakeAndAddRef<SVGRect>(&aOwner, gfx::Rect{0, 0, 0, 0});
+}
+
+already_AddRefed<SVGRect> SVGGraphicsElement::GetBBox(
+    const SVGBoundingBoxOptions& aOptions) {
+  nsIFrame* frame = GetPrimaryFrame(FlushType::Layout);
+
+  if (!frame || frame->HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+    return ZeroBBox(*this);
+  }
+  ISVGDisplayableFrame* svgframe = do_QueryFrame(frame);
+
+  if (!svgframe) {
+    if (!frame->IsInSVGTextSubtree()) {
+      return ZeroBBox(*this);
+    }
+
+    SVGTextFrame* text =
+        static_cast<SVGTextFrame*>(nsLayoutUtils::GetClosestFrameOfType(
+            frame->GetParent(), LayoutFrameType::SVGText));
+
+    if (text->HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+      return ZeroBBox(*this);
+    }
+
+    gfxRect rec = text->TransformFrameRectFromTextChild(
+        frame->GetRectRelativeToSelf(), frame);
+
+    rec.x += float(text->GetPosition().x) / AppUnitsPerCSSPixel();
+    rec.y += float(text->GetPosition().y) / AppUnitsPerCSSPixel();
+
+    rec.Scale(1 / dom::UserSpaceMetrics::GetZoom(this));
+
+    return MakeAndAddRef<SVGRect>(this, ToRect(rec));
+  }
+
+  if (!NS_SVGNewGetBBoxEnabled()) {
+    return MakeAndAddRef<SVGRect>(
+        this,
+        ToRect(SVGUtils::GetBBox(frame, {SVGBBoxFlag::IncludeFillGeometry,
+                                         SVGBBoxFlag::UseUserSpaceOfUseElement,
+                                         SVGBBoxFlag::DisregardCSSZoom})));
+  }
+  SVGBBoxFlags flags;
+  if (aOptions.mFill) {
+    flags += SVGBBoxFlag::IncludeFillGeometry;
+  }
+  if (aOptions.mStroke) {
+    flags += SVGBBoxFlag::IncludeStroke;
+  }
+  if (aOptions.mMarkers) {
+    flags += {SVGBBoxFlag::IncludeFillGeometry, SVGBBoxFlag::IncludeMarkers};
+  }
+  if (aOptions.mClipped) {
+    flags += {SVGBBoxFlag::IncludeFillGeometry, SVGBBoxFlag::IncludeClipped};
+  }
+  if (flags.isEmpty()) {
+    return MakeAndAddRef<SVGRect>(this, gfx::Rect());
+  }
+  flags +=
+      {SVGBBoxFlag::UseUserSpaceOfUseElement, SVGBBoxFlag::DisregardCSSZoom};
+  return MakeAndAddRef<SVGRect>(this, ToRect(SVGUtils::GetBBox(frame, flags)));
+}
+
+already_AddRefed<SVGMatrix> SVGGraphicsElement::GetCTM() {
+  if (auto* currentDoc = GetComposedDoc()) {
+    currentDoc->FlushPendingNotifications(FlushType::Layout);
+  }
+  gfx::Matrix m = SVGContentUtils::GetCTM(this);
+  if (m.IsSingular()) {
+    m = {};
+  }
+  return MakeAndAddRef<SVGMatrix>(ThebesMatrix(m));
+}
+
+already_AddRefed<SVGMatrix> SVGGraphicsElement::GetScreenCTM() {
+  if (auto* currentDoc = GetComposedDoc()) {
+    currentDoc->FlushPendingNotifications(FlushType::Layout);
+  }
+  gfx::Matrix m = SVGContentUtils::GetScreenCTM(this);
+  if (m.IsSingular()) {
+    m = {};
+  }
+  return MakeAndAddRef<SVGMatrix>(ThebesMatrix(m));
+}
+
+bool SVGGraphicsElement::IsSVGFocusable(bool* aIsFocusable,
+                                        int32_t* aTabIndex) {
+  if (!IsInComposedDoc() || IsInDesignMode()) {
+    *aTabIndex = -1;
+    *aIsFocusable = false;
+    return true;
+  }
+
+  *aTabIndex = TabIndex();
+  *aIsFocusable = *aTabIndex >= 0 || GetTabIndexAttrValue().isSome();
+  return false;
+}
+
+Focusable SVGGraphicsElement::IsFocusableWithoutStyle(IsFocusableFlags) {
+  Focusable result;
+  IsSVGFocusable(&result.mFocusable, &result.mTabIndex);
+  return result;
+}
+
+}  

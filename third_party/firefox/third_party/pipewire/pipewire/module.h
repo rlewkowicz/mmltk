@@ -1,0 +1,84 @@
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
+
+#ifndef PIPEWIRE_MODULE_H
+#define PIPEWIRE_MODULE_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <spa/utils/defs.h>
+#include <spa/utils/hook.h>
+
+#include <pipewire/proxy.h>
+
+
+#define PW_TYPE_INTERFACE_Module	PW_TYPE_INFO_INTERFACE_BASE "Module"
+
+#define PW_MODULE_PERM_MASK		PW_PERM_R|PW_PERM_M
+
+#define PW_VERSION_MODULE		3
+struct pw_module;
+
+#ifndef PW_API_MODULE_IMPL
+#define PW_API_MODULE_IMPL static inline
+#endif
+
+struct pw_module_info {
+	uint32_t id;		
+	const char *name;	
+	const char *filename;	
+	const char *args;	
+#define PW_MODULE_CHANGE_MASK_PROPS	(1 << 0)
+#define PW_MODULE_CHANGE_MASK_ALL	((1 << 1)-1)
+	uint64_t change_mask;	
+	struct spa_dict *props;	
+};
+
+struct pw_module_info *
+pw_module_info_update(struct pw_module_info *info,
+		const struct pw_module_info *update);
+struct pw_module_info *
+pw_module_info_merge(struct pw_module_info *info,
+		const struct pw_module_info *update, bool reset);
+void pw_module_info_free(struct pw_module_info *info);
+
+#define PW_MODULE_EVENT_INFO		0
+#define PW_MODULE_EVENT_NUM		1
+
+struct pw_module_events {
+#define PW_VERSION_MODULE_EVENTS	0
+	uint32_t version;
+	void (*info) (void *data, const struct pw_module_info *info);
+};
+
+#define PW_MODULE_METHOD_ADD_LISTENER	0
+#define PW_MODULE_METHOD_NUM		1
+
+struct pw_module_methods {
+#define PW_VERSION_MODULE_METHODS	0
+	uint32_t version;
+
+	int (*add_listener) (void *object,
+			struct spa_hook *listener,
+			const struct pw_module_events *events,
+			void *data);
+};
+
+PW_API_MODULE_IMPL int pw_module_add_listener(struct pw_module *object,
+			struct spa_hook *listener,
+			const struct pw_module_events *events,
+			void *data)
+{
+	return spa_api_method_r(int, -ENOTSUP,
+			pw_module, (struct spa_interface*)object, add_listener, 0,
+			listener, events, data);
+}
+
+
+#ifdef __cplusplus
+}  
+#endif
+
+#endif /* PIPEWIRE_MODULE_H */

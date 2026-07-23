@@ -1,0 +1,91 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsPropertyTable_h_
+#define nsPropertyTable_h_
+
+#include "mozilla/MemoryReporting.h"
+#include "nscore.h"
+
+class nsAtom;
+
+using NSPropertyFunc = void (*)(void* aObject, nsAtom* aPropertyName,
+                                void* aPropertyValue, void* aData);
+
+using NSPropertyDtorFunc = NSPropertyFunc;
+class nsINode;
+class nsIFrame;
+
+class nsPropertyOwner {
+ public:
+  nsPropertyOwner(const nsPropertyOwner& aOther) = default;
+
+  MOZ_IMPLICIT nsPropertyOwner(const nsINode* aObject) : mObject(aObject) {}
+  MOZ_IMPLICIT nsPropertyOwner(const nsIFrame* aObject) : mObject(aObject) {}
+
+  operator const void*() { return mObject; }
+  const void* get() { return mObject; }
+
+ private:
+  const void* mObject;
+};
+
+class nsPropertyTable {
+ public:
+  void* GetProperty(const nsPropertyOwner& aObject, const nsAtom* aPropertyName,
+                    nsresult* aResult = nullptr) {
+    return GetPropertyInternal(aObject, aPropertyName, false, aResult);
+  }
+
+  nsresult SetProperty(const nsPropertyOwner& aObject, nsAtom* aPropertyName,
+                       void* aPropertyValue, NSPropertyDtorFunc aDtor,
+                       void* aDtorData, bool aTransfer = false) {
+    return SetPropertyInternal(aObject, aPropertyName, aPropertyValue, aDtor,
+                               aDtorData, aTransfer);
+  }
+
+  nsresult RemoveProperty(nsPropertyOwner aObject, const nsAtom* aPropertyName);
+
+  void* TakeProperty(const nsPropertyOwner& aObject,
+                     const nsAtom* aPropertyName, nsresult* aStatus = nullptr) {
+    return GetPropertyInternal(aObject, aPropertyName, true, aStatus);
+  }
+
+  void RemoveAllPropertiesFor(nsPropertyOwner aObject);
+
+  nsresult TransferOrRemoveAllPropertiesFor(nsPropertyOwner aObject,
+                                            nsPropertyTable& aOtherTable);
+
+  void Enumerate(nsPropertyOwner aObject, NSPropertyFunc aCallback,
+                 void* aData);
+
+  void EnumerateAll(NSPropertyFunc aCallback, void* aData);
+
+  void RemoveAllProperties();
+
+  nsPropertyTable() : mPropertyList(nullptr) {}
+  ~nsPropertyTable() { RemoveAllProperties(); }
+
+  static void SupportsDtorFunc(void* aObject, nsAtom* aPropertyName,
+                               void* aPropertyValue, void* aData);
+
+  class PropertyList;
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+ private:
+  void DestroyPropertyList();
+  PropertyList* GetPropertyListFor(const nsAtom* aPropertyName) const;
+  void* GetPropertyInternal(nsPropertyOwner aObject,
+                            const nsAtom* aPropertyName, bool aRemove,
+                            nsresult* aStatus);
+  nsresult SetPropertyInternal(nsPropertyOwner aObject, nsAtom* aPropertyName,
+                               void* aPropertyValue, NSPropertyDtorFunc aDtor,
+                               void* aDtorData, bool aTransfer);
+
+  PropertyList* mPropertyList;
+};
+#endif

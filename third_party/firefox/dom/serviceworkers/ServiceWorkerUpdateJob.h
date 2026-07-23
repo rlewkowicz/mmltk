@@ -1,0 +1,75 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_serviceworkerupdatejob_h
+#define mozilla_dom_serviceworkerupdatejob_h
+
+#include "ServiceWorkerJob.h"
+#include "ServiceWorkerRegistration.h"
+#include "mozilla/dom/ServiceWorkerLifetimeExtension.h"
+#include "nsIRequest.h"
+
+namespace mozilla::dom {
+
+namespace serviceWorkerScriptCache {
+enum class OnFailure : uint8_t;
+}  
+
+class ServiceWorkerManager;
+class ServiceWorkerRegistrationInfo;
+
+class ServiceWorkerUpdateJob : public ServiceWorkerJob {
+ public:
+  ServiceWorkerUpdateJob(
+      nsIPrincipal* aPrincipal, const nsACString& aScope, nsCString aScriptSpec,
+      ServiceWorkerUpdateViaCache aUpdateViaCache,
+      const ServiceWorkerLifetimeExtension& aLifetimeExtension);
+
+  already_AddRefed<ServiceWorkerRegistrationInfo> GetRegistration() const;
+
+ protected:
+  ServiceWorkerUpdateJob(
+      Type aType, nsIPrincipal* aPrincipal, const nsACString& aScope,
+      nsCString aScriptSpec, ServiceWorkerUpdateViaCache aUpdateViaCache,
+      const ServiceWorkerLifetimeExtension& aLifetimeExtension);
+
+  virtual ~ServiceWorkerUpdateJob();
+
+  void FailUpdateJob(ErrorResult& aRv);
+
+  void FailUpdateJob(nsresult aRv);
+
+  virtual void AsyncExecute() override;
+
+  void SetRegistration(ServiceWorkerRegistrationInfo* aRegistration);
+
+  void Update();
+
+  ServiceWorkerUpdateViaCache GetUpdateViaCache() const;
+
+ private:
+  class CompareCallback;
+  class ContinueUpdateRunnable;
+  class ContinueInstallRunnable;
+
+  void ComparisonResult(nsresult aStatus, bool aInCacheAndEqual,
+                        serviceWorkerScriptCache::OnFailure aOnFailure,
+                        const nsAString& aNewCacheName,
+                        const nsACString& aMaxScope, nsLoadFlags aLoadFlags);
+
+  void ContinueUpdateAfterScriptEval(bool aScriptEvaluationResult);
+
+  void Install();
+
+  void ContinueAfterInstallEvent(bool aInstallEventSuccess);
+
+  RefPtr<ServiceWorkerRegistrationInfo> mRegistration;
+  ServiceWorkerUpdateViaCache mUpdateViaCache;
+  ServiceWorkerLifetimeExtension mLifetimeExtension;
+  serviceWorkerScriptCache::OnFailure mOnFailure;
+};
+
+}  
+
+#endif  // mozilla_dom_serviceworkerupdatejob_h

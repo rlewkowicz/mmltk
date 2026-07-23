@@ -1,0 +1,83 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_Label_h
+#define jit_Label_h
+
+#include "mozilla/Assertions.h"
+
+#include <stdint.h>
+
+namespace js {
+namespace jit {
+
+struct LabelBase {
+ private:
+  uint32_t bound_ : 1;
+
+  uint32_t offset_ : 31;
+
+#if defined(JS_CODEGEN_MIPS64) || defined(JS_CODEGEN_LOONG64) || \
+    defined(JS_CODEGEN_RISCV64)
+ public:
+#endif
+  static const uint32_t INVALID_OFFSET = 0x7fffffff;  
+
+ public:
+  LabelBase() : bound_(false), offset_(INVALID_OFFSET) {}
+
+  void operator=(const LabelBase& label) = delete;
+
+  bool bound() const { return bound_; }
+  int32_t offset() const {
+    MOZ_ASSERT(bound() || used());
+    return offset_;
+  }
+  bool used() const { return !bound() && offset_ < INVALID_OFFSET; }
+  void bind(int32_t offset) {
+    MOZ_ASSERT(!bound());
+    MOZ_ASSERT(offset >= 0);
+    MOZ_ASSERT(uint32_t(offset) < INVALID_OFFSET);
+    offset_ = offset;
+    bound_ = true;
+    MOZ_ASSERT(offset_ == offset, "offset fits in 31 bits");
+  }
+  void reset() {
+    offset_ = INVALID_OFFSET;
+    bound_ = false;
+  }
+  void use(int32_t offset) {
+    MOZ_ASSERT(!bound());
+    MOZ_ASSERT(offset >= 0);
+    MOZ_ASSERT(uint32_t(offset) < INVALID_OFFSET);
+    offset_ = offset;
+    MOZ_ASSERT(offset_ == offset, "offset fits in 31 bits");
+  }
+};
+
+class Label : public LabelBase {
+ public:
+#ifdef DEBUG
+  ~Label();
+#endif
+};
+
+static_assert(sizeof(Label) == sizeof(uint32_t),
+              "Label should have same size as uint32_t");
+
+class NonAssertingLabel : public Label {
+ public:
+#ifdef DEBUG
+  ~NonAssertingLabel() {
+    if (used()) {
+      bind(0);
+    }
+  }
+#endif
+};
+
+}  
+}  
+
+#endif  // jit_Label_h

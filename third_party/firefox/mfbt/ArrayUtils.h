@@ -1,0 +1,79 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_ArrayUtils_h
+#define mozilla_ArrayUtils_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+#  include <algorithm>
+#  include <type_traits>
+
+namespace mozilla {
+
+template <class T>
+MOZ_ALWAYS_INLINE size_t PointerRangeSize(T* aBegin, T* aEnd) {
+  MOZ_ASSERT(aEnd >= aBegin);
+  return (size_t(aEnd) - size_t(aBegin)) / sizeof(T);
+}
+
+
+template <typename T, typename U, size_t N>
+bool ArrayEqual(const T (&a)[N], const U (&b)[N]) {
+  return std::equal(a, a + N, b);
+}
+
+template <typename T, typename U>
+bool ArrayEqual(const T* const a, const U* const b, const size_t n) {
+  return std::equal(a, a + n, b);
+}
+
+namespace detail {
+
+template <typename AlignType, typename Pointee, typename = void>
+struct AlignedChecker {
+  static void test(const Pointee* aPtr) {
+    MOZ_ASSERT((uintptr_t(aPtr) % alignof(AlignType)) == 0,
+               "performing a range-check with a misaligned pointer");
+  }
+};
+
+template <typename AlignType, typename Pointee>
+struct AlignedChecker<AlignType, Pointee,
+                      std::enable_if_t<std::is_void_v<AlignType>>> {
+  static void test(const Pointee* aPtr) {}
+};
+
+}  
+
+template <typename T, typename U>
+inline std::enable_if_t<std::is_same_v<T, U> || std::is_base_of<T, U>::value ||
+                            std::is_void_v<T>,
+                        bool>
+IsInRange(const T* aPtr, const U* aBegin, const U* aEnd) {
+  MOZ_ASSERT(aBegin <= aEnd);
+  detail::AlignedChecker<U, T>::test(aPtr);
+  detail::AlignedChecker<U, U>::test(aBegin);
+  detail::AlignedChecker<U, U>::test(aEnd);
+  return aBegin <= reinterpret_cast<const U*>(aPtr) &&
+         reinterpret_cast<const U*>(aPtr) < aEnd;
+}
+
+template <typename T>
+inline bool IsInRange(const T* aPtr, uintptr_t aBegin, uintptr_t aEnd) {
+  return IsInRange(aPtr, reinterpret_cast<const T*>(aBegin),
+                   reinterpret_cast<const T*>(aEnd));
+}
+
+} 
+
+#endif /* __cplusplus */
+
+#endif /* mozilla_ArrayUtils_h */

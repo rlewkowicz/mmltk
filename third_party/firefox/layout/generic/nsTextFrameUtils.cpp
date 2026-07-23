@@ -1,0 +1,425 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsTextFrameUtils.h"
+
+#include <algorithm>
+
+#include "mozilla/Utf16.h"
+#include "mozilla/dom/CharacterDataBuffer.h"
+#include "mozilla/dom/Text.h"
+#include "nsBidiUtils.h"
+#include "nsCharTraits.h"
+#include "nsIContent.h"
+#include "nsStyleStruct.h"
+#include "nsUnicharUtils.h"
+#include "nsUnicodeProperties.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using namespace mozilla::unicode;
+
+bool nsTextFrameUtils::IsSpaceCombiningSequenceTail(const char16_t* aChars,
+                                                    int32_t aLength) {
+  return aLength > 0 &&
+         (IsClusterExtenderExcludingJoiners(aChars[0]) ||
+          (IsBidiControl(aChars[0]) &&
+           IsSpaceCombiningSequenceTail(aChars + 1, aLength - 1)));
+}
+
+static bool IsDiscardable(char16_t ch, nsTextFrameUtils::Flags* aFlags) {
+  if (ch == CH_SHY) {
+    *aFlags |= nsTextFrameUtils::Flags::HasShy;
+    return true;
+  }
+  return IsBidiControl(ch);
+}
+
+static bool IsDiscardable(uint8_t ch, nsTextFrameUtils::Flags* aFlags) {
+  if (ch == CH_SHY) {
+    *aFlags |= nsTextFrameUtils::Flags::HasShy;
+    return true;
+  }
+  return false;
+}
+
+static bool IsSegmentBreak(char16_t aCh) { return aCh == '\n'; }
+
+static bool IsSpaceOrTab(char16_t aCh) { return aCh == ' ' || aCh == '\t'; }
+
+static bool IsSpaceOrTabOrSegmentBreak(char16_t aCh) {
+  return IsSpaceOrTab(aCh) || IsSegmentBreak(aCh);
+}
+
+template <typename CharT>
+bool nsTextFrameUtils::IsSkippableCharacterForTransformText(CharT aChar) {
+  return aChar == ' ' || aChar == '\t' || aChar == '\n' || aChar == CH_SHY ||
+         (aChar > 0xFF && IsBidiControl(aChar));
+}
+
+#ifdef DEBUG
+template <typename CharT>
+static void AssertSkippedExpectedChars(const CharT* aText,
+                                       const gfxSkipChars& aSkipChars,
+                                       int32_t aSkipCharsOffset) {
+  gfxSkipCharsIterator it(aSkipChars);
+  it.AdvanceOriginal(aSkipCharsOffset);
+  while (it.GetOriginalOffset() < it.GetOriginalEnd()) {
+    CharT ch = aText[it.GetOriginalOffset() - aSkipCharsOffset];
+    MOZ_ASSERT(!it.IsOriginalCharSkipped() ||
+                   nsTextFrameUtils::IsSkippableCharacterForTransformText(ch),
+               "skipped unexpected character; need to update "
+               "IsSkippableCharacterForTransformText?");
+    it.AdvanceOriginal(1);
+  }
+}
+#endif
+
+template <class CharT>
+static CharT* TransformWhiteSpaces(
+    const CharT* aText, uint32_t aLength, uint32_t aBegin, uint32_t aEnd,
+    bool aHasSegmentBreak, bool& aInWhitespace, CharT* aOutput,
+    nsTextFrameUtils::Flags& aFlags,
+    nsTextFrameUtils::CompressionMode aCompression, gfxSkipChars* aSkipChars,
+    bool aLangIsJapaneseOrChinese) {
+  MOZ_ASSERT(aCompression == nsTextFrameUtils::COMPRESS_WHITESPACE ||
+                 aCompression == nsTextFrameUtils::COMPRESS_WHITESPACE_NEWLINE,
+             "whitespaces should be skippable!!");
+  bool isSegmentBreakSkippable = false;
+  if constexpr (sizeof(CharT) > 1) {
+    if ((aBegin > 0 && IS_ZERO_WIDTH_SPACE(aText[aBegin - 1])) ||
+        (aEnd < aLength && IS_ZERO_WIDTH_SPACE(aText[aEnd]))) {
+      isSegmentBreakSkippable = true;
+    } else if (aBegin > 0 && aEnd < aLength) {
+      uint32_t ucs4before, ucs4after;
+      uint32_t pos = aBegin;
+      do {
+        if (pos > 1 &&
+            mozilla::IsSurrogatePair(aText[pos - 2], aText[pos - 1])) {
+          ucs4before = mozilla::SurrogateToUCS4(aText[pos - 2], aText[pos - 1]);
+          pos -= 2;
+        } else {
+          ucs4before = aText[pos - 1];
+          pos -= 1;
+        }
+      } while (IsDefaultIgnorable(ucs4before) && pos > 0);
+
+      pos = aEnd;
+      do {
+        if (pos + 1 < aLength &&
+            mozilla::IsSurrogatePair(aText[pos], aText[pos + 1])) {
+          ucs4after = mozilla::SurrogateToUCS4(aText[pos], aText[pos + 1]);
+          pos += 2;
+        } else {
+          ucs4after = aText[pos];
+          pos += 1;
+        }
+      } while (IsDefaultIgnorable(ucs4after) && pos < aLength);
+
+      isSegmentBreakSkippable =
+          (IsSegmentBreakSkipChar(ucs4before) &&
+           IsSegmentBreakSkipChar(ucs4after)) ||
+          (aLangIsJapaneseOrChinese && (IsEastAsianPunctuation(ucs4before) ||
+                                        IsEastAsianPunctuation(ucs4after)));
+    }
+  }
+
+  for (uint32_t i = aBegin; i < aEnd; ++i) {
+    const CharT ch = aText[i];
+    bool keepChar = false;
+    bool keepTransformedWhiteSpace = false;
+    if (IsDiscardable(ch, &aFlags)) {
+      aSkipChars->SkipChar();
+      continue;
+    }
+    if (IsSpaceOrTab(ch)) {
+      if (aHasSegmentBreak) {
+        aSkipChars->SkipChar();
+        continue;
+      }
+
+      if (aInWhitespace) {
+        aSkipChars->SkipChar();
+        continue;
+      } else {
+        keepTransformedWhiteSpace = true;
+      }
+    } else {
+      if (aCompression == nsTextFrameUtils::COMPRESS_WHITESPACE ||
+          ch == '\r') {
+        keepChar = true;
+      } else {
+
+        if (isSegmentBreakSkippable || aInWhitespace) {
+          aSkipChars->SkipChar();
+          continue;
+        }
+        isSegmentBreakSkippable = true;
+        keepTransformedWhiteSpace = true;
+      }
+    }
+
+    if (keepChar) {
+      *aOutput++ = ch;
+      aSkipChars->KeepChar();
+      aInWhitespace = IsSpaceOrTab(ch);
+    } else if (keepTransformedWhiteSpace) {
+      *aOutput++ = ' ';
+      aSkipChars->KeepChar();
+      aInWhitespace = true;
+    } else {
+      MOZ_ASSERT_UNREACHABLE("Should've skipped the character!!");
+    }
+  }
+  return aOutput;
+}
+
+template <class CharT>
+CharT* nsTextFrameUtils::TransformText(
+    const CharT* aText, uint32_t aLength, CharT* aOutput,
+    CompressionMode aCompression, uint8_t* aIncomingFlags,
+    gfxSkipChars* aSkipChars, Flags* aAnalysisFlags, const nsAtom* aLanguage) {
+  Flags flags = Flags();
+#ifdef DEBUG
+  int32_t skipCharsOffset = aSkipChars->GetOriginalCharCount();
+#endif
+
+  bool lastCharArabic = false;
+  if (aCompression == COMPRESS_NONE ||
+      aCompression == COMPRESS_NONE_TRANSFORM_TO_SPACE) {
+    for (uint32_t i = 0; i < aLength; ++i) {
+      CharT ch = aText[i];
+
+      if (ch >= ' ' && !IsDiscardable(ch, &flags)) {
+        uint32_t batchStart = i;
+        while (i + 1 < aLength) {
+          const CharT next = aText[i + 1];
+          if (next < ' ' || IsDiscardable(next, &flags)) {
+            break;
+          }
+          i++;
+        }
+        if constexpr (sizeof(CharT) > 1) {
+          lastCharArabic = IS_ARABIC_CHAR(aText[i]);
+        }
+        const uint32_t batchLen = i - batchStart + 1;
+        memcpy(aOutput, aText + batchStart, batchLen * sizeof(CharT));
+        aOutput += batchLen;
+        aSkipChars->KeepChars(batchLen);
+        continue;
+      }
+
+      if (IsDiscardable(ch, &flags)) {
+        aSkipChars->SkipChar();
+      } else {
+        aSkipChars->KeepChar();
+        if (ch > ' ') {
+          if constexpr (sizeof(CharT) > 1) {
+            lastCharArabic = IS_ARABIC_CHAR(ch);
+          }
+        } else if (aCompression == COMPRESS_NONE_TRANSFORM_TO_SPACE) {
+          if (ch == '\t' || ch == '\n') {
+            ch = ' ';
+          }
+        } else {
+          if (ch == '\t') {
+            flags |= Flags::HasTab;
+          } else if (ch == '\n') {
+            flags |= Flags::HasNewline;
+          }
+        }
+        *aOutput++ = ch;
+      }
+    }
+    *aIncomingFlags &= ~INCOMING_WHITESPACE;
+  } else {
+    bool langIsJapaneseOrChinese = [=]() {
+      if (!aLanguage || aLanguage->GetLength() < 2) {
+        return false;
+      }
+      const char16_t* text = aLanguage->GetUTF16String();
+      if ((ToLowerCaseASCII(text[0]) == char16_t('j') &&
+           ToLowerCaseASCII(text[1]) == char16_t('a')) ||
+          (ToLowerCaseASCII(text[0]) == char16_t('z') &&
+           ToLowerCaseASCII(text[1]) == char16_t('h'))) {
+        return aLanguage->GetLength() == 2 || text[2] == '-';
+      }
+      return false;
+    }();
+    bool inWhitespace = (*aIncomingFlags & INCOMING_WHITESPACE) != 0;
+    for (uint32_t i = 0; i < aLength; ++i) {
+      const CharT ch = aText[i];
+
+      if (!IsSpaceOrTabOrSegmentBreak(ch) && !IsDiscardable(ch, &flags)) {
+        const uint32_t batchStart = i;
+        while (i + 1 < aLength) {
+          const CharT next = aText[i + 1];
+          if (IsSpaceOrTabOrSegmentBreak(next) || IsDiscardable(next, &flags)) {
+            break;
+          }
+          i++;
+        }
+        if constexpr (sizeof(CharT) > 1) {
+          lastCharArabic = IS_ARABIC_CHAR(aText[i]);
+        }
+        const uint32_t batchLen = i - batchStart + 1;
+        memcpy(aOutput, aText + batchStart, batchLen * sizeof(CharT));
+        aOutput += batchLen;
+        aSkipChars->KeepChars(batchLen);
+        inWhitespace = false;
+        continue;
+      }
+
+      if (IsSpaceOrTabOrSegmentBreak(ch)) {
+        bool keepLastSpace = false;
+        bool hasSegmentBreak = IsSegmentBreak(ch);
+        uint32_t countTrailingDiscardables = 0;
+        uint32_t j;
+        for (j = i + 1; j < aLength && (IsSpaceOrTabOrSegmentBreak(aText[j]) ||
+                                        IsDiscardable(aText[j], &flags));
+             j++) {
+          if (IsSegmentBreak(aText[j])) {
+            hasSegmentBreak = true;
+          }
+        }
+        for (; IsDiscardable(aText[j - 1], &flags); j--) {
+          countTrailingDiscardables++;
+        }
+        if constexpr (sizeof(CharT) > 1) {
+          if (aText[j - 1] == ' ' && j < aLength &&
+              IsSpaceCombiningSequenceTail(&aText[j], aLength - j)) {
+            keepLastSpace = true;
+            j--;
+          }
+        }
+        if (j > i) {
+          aOutput = TransformWhiteSpaces(
+              aText, aLength, i, j, hasSegmentBreak, inWhitespace, aOutput,
+              flags, aCompression, aSkipChars, langIsJapaneseOrChinese);
+        }
+        if (keepLastSpace) {
+          keepLastSpace = false;
+          *aOutput++ = ' ';
+          aSkipChars->KeepChar();
+          if constexpr (sizeof(CharT) > 1) {
+            lastCharArabic = false;
+          }
+          j++;
+        }
+        for (; countTrailingDiscardables > 0; countTrailingDiscardables--) {
+          aSkipChars->SkipChar();
+          j++;
+        }
+        i = j - 1;
+        continue;
+      }
+      if (IsDiscardable(ch, &flags)) {
+        aSkipChars->SkipChar();
+      } else {
+        *aOutput++ = ch;
+        aSkipChars->KeepChar();
+      }
+      if constexpr (sizeof(CharT) > 1) {
+        lastCharArabic = IS_ARABIC_CHAR(ch);
+      }
+      inWhitespace = false;
+    }
+
+    if (inWhitespace) {
+      *aIncomingFlags |= INCOMING_WHITESPACE;
+    } else {
+      *aIncomingFlags &= ~INCOMING_WHITESPACE;
+    }
+  }
+
+  if (lastCharArabic) {
+    *aIncomingFlags |= INCOMING_ARABICCHAR;
+  } else {
+    *aIncomingFlags &= ~INCOMING_ARABICCHAR;
+  }
+
+  *aAnalysisFlags = flags;
+
+#ifdef DEBUG
+  AssertSkippedExpectedChars(aText, *aSkipChars, skipCharsOffset);
+#endif
+  return aOutput;
+}
+
+template uint8_t* nsTextFrameUtils::TransformText(
+    const uint8_t* aText, uint32_t aLength, uint8_t* aOutput,
+    CompressionMode aCompression, uint8_t* aIncomingFlags,
+    gfxSkipChars* aSkipChars, Flags* aAnalysisFlags, const nsAtom* aLanguage);
+template char16_t* nsTextFrameUtils::TransformText(
+    const char16_t* aText, uint32_t aLength, char16_t* aOutput,
+    CompressionMode aCompression, uint8_t* aIncomingFlags,
+    gfxSkipChars* aSkipChars, Flags* aAnalysisFlags, const nsAtom* aLanguage);
+template bool nsTextFrameUtils::IsSkippableCharacterForTransformText(
+    uint8_t aChar);
+template bool nsTextFrameUtils::IsSkippableCharacterForTransformText(
+    char16_t aChar);
+
+template <typename CharT>
+static uint32_t DoComputeApproximateLengthWithWhitespaceCompression(
+    const CharT* aChars, uint32_t aLength, const nsStyleText* aStyleText) {
+  uint32_t len;
+  if (aStyleText->WhiteSpaceIsSignificant()) {
+    return aLength;
+  }
+  bool prevWS = true;  
+  len = 0;
+  for (uint32_t i = 0; i < aLength; ++i) {
+    CharT c = aChars[i];
+    if (c == ' ' || c == '\n' || c == '\t' || c == '\r') {
+      if (!prevWS) {
+        ++len;
+      }
+      prevWS = true;
+    } else {
+      ++len;
+      prevWS = false;
+    }
+  }
+  return len;
+}
+
+uint32_t nsTextFrameUtils::ComputeApproximateLengthWithWhitespaceCompression(
+    Text* aText, const nsStyleText* aStyleText) {
+  const CharacterDataBuffer* characterDataBuffer = &aText->DataBuffer();
+  if (characterDataBuffer->Is2b()) {
+    return DoComputeApproximateLengthWithWhitespaceCompression(
+        characterDataBuffer->Get2b(), characterDataBuffer->GetLength(),
+        aStyleText);
+  }
+  return DoComputeApproximateLengthWithWhitespaceCompression(
+      characterDataBuffer->Get1b(), characterDataBuffer->GetLength(),
+      aStyleText);
+}
+
+uint32_t nsTextFrameUtils::ComputeApproximateLengthWithWhitespaceCompression(
+    const nsAString& aString, const nsStyleText* aStyleText) {
+  return DoComputeApproximateLengthWithWhitespaceCompression(
+      aString.BeginReading(), aString.Length(), aStyleText);
+}
+
+bool nsSkipCharsRunIterator::NextRun() {
+  do {
+    if (mRunLength) {
+      mIterator.AdvanceOriginal(mRunLength);
+      NS_ASSERTION(mRunLength > 0,
+                   "No characters in run (initial length too large?)");
+      if (!mSkipped || mLengthIncludesSkipped) {
+        mRemainingLength -= mRunLength;
+      }
+    }
+    if (!mRemainingLength) {
+      return false;
+    }
+    int32_t length;
+    mSkipped = mIterator.IsOriginalCharSkipped(&length);
+    mRunLength = std::min(length, mRemainingLength);
+  } while (!mVisitSkipped && mSkipped);
+
+  return true;
+}

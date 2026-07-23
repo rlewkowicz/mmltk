@@ -1,0 +1,711 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "SSLServerCertVerification.h"
+
+#include <cstring>
+
+#include "CertVerifier.h"
+#include "CryptoTask.h"
+#include "ExtendedValidation.h"
+#include "NSSCertDBTrustDomain.h"
+#include "NSSSocketControl.h"
+#include "ScopedNSSTypes.h"
+#include "SharedCertVerifier.h"
+#include "VerifySSLServerCertChild.h"
+#include "cert.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/StaticPrefs_security.h"
+#include "mozilla/UniquePtr.h"
+#include "nsComponentManagerUtils.h"
+#include "nsContentUtils.h"
+#include "nsICertOverrideService.h"
+#include "nsIPublicKeyPinningService.h"
+#include "nsISiteSecurityService.h"
+#include "nsISocketProvider.h"
+#include "nsThreadPool.h"
+#include "nsNetUtil.h"
+#include "nsNSSCertificate.h"
+#include "nsNSSComponent.h"
+#include "nsNSSIOLayer.h"
+#include "nsServiceManagerUtils.h"
+#include "nsString.h"
+#include "nsURLHelper.h"
+#include "nsXPCOMCIDInternal.h"
+#include "mozpkix/pkix.h"
+#include "mozpkix/pkixcheck.h"
+#include "mozpkix/pkixnss.h"
+#include "mozpkix/pkixutil.h"
+#include "secerr.h"
+#include "secport.h"
+#include "ssl.h"
+#include "sslerr.h"
+#include "sslexp.h"
+
+extern mozilla::LazyLogModule gPIPNSSLog;
+
+using namespace mozilla::pkix;
+
+namespace mozilla {
+namespace psm {
+
+nsIThreadPool* gCertVerificationThreadPool = nullptr;
+
+void InitializeSSLServerCertVerificationThreads() {
+  gCertVerificationThreadPool = new nsThreadPool();
+  NS_ADDREF(gCertVerificationThreadPool);
+
+  (void)gCertVerificationThreadPool->SetThreadLimit(5);
+  (void)gCertVerificationThreadPool->SetIdleThreadLimit(1);
+  (void)gCertVerificationThreadPool->SetIdleThreadMaximumTimeout(30 * 1000);
+  (void)gCertVerificationThreadPool->SetIdleThreadGraceTimeout(500);
+  (void)gCertVerificationThreadPool->SetName("SSL Cert"_ns);
+}
+
+void StopSSLServerCertVerificationThreads() {
+  if (gCertVerificationThreadPool) {
+    gCertVerificationThreadPool->Shutdown();
+    NS_RELEASE(gCertVerificationThreadPool);
+  }
+}
+
+Maybe<nsITransportSecurityInfo::OverridableErrorCategory>
+CategorizeCertificateError(PRErrorCode certificateError) {
+  switch (certificateError) {
+    case SEC_ERROR_CA_CERT_INVALID:
+    case SEC_ERROR_CERT_SIGNATURE_ALGORITHM_DISABLED:
+    case SEC_ERROR_EXPIRED_ISSUER_CERTIFICATE:
+    case SEC_ERROR_UNKNOWN_ISSUER:
+    case mozilla::pkix::MOZILLA_PKIX_ERROR_CA_CERT_USED_AS_END_ENTITY:
+    case mozilla::pkix::MOZILLA_PKIX_ERROR_EMPTY_ISSUER_NAME:
+    case mozilla::pkix::MOZILLA_PKIX_ERROR_INADEQUATE_KEY_SIZE:
+    case mozilla::pkix::
+        MOZILLA_PKIX_ERROR_INSUFFICIENT_CERTIFICATE_TRANSPARENCY:
+    case mozilla::pkix::MOZILLA_PKIX_ERROR_MITM_DETECTED:
+    case mozilla::pkix::MOZILLA_PKIX_ERROR_NOT_YET_VALID_ISSUER_CERTIFICATE:
+    case mozilla::pkix::MOZILLA_PKIX_ERROR_SELF_SIGNED_CERT:
+    case mozilla::pkix::MOZILLA_PKIX_ERROR_V1_CERT_USED_AS_CA:
+      return Some(
+          nsITransportSecurityInfo::OverridableErrorCategory::ERROR_TRUST);
+
+    case SSL_ERROR_BAD_CERT_DOMAIN:
+      return Some(
+          nsITransportSecurityInfo::OverridableErrorCategory::ERROR_DOMAIN);
+
+    case SEC_ERROR_EXPIRED_CERTIFICATE:
+    case SEC_ERROR_INVALID_TIME:
+    case mozilla::pkix::MOZILLA_PKIX_ERROR_NOT_YET_VALID_CERTIFICATE:
+      return Some(
+          nsITransportSecurityInfo::OverridableErrorCategory::ERROR_TIME);
+
+    default:
+      break;
+  }
+  return Nothing();
+}
+
+static nsresult OverrideAllowedForHost(
+    uint64_t aPtrForLog, const nsACString& aHostname,
+    const OriginAttributes& aOriginAttributes,  bool& aOverrideAllowed) {
+  aOverrideAllowed = false;
+
+  if (net_IsValidIPv6Addr(aHostname)) {
+    aOverrideAllowed = true;
+    return NS_OK;
+  }
+
+  bool strictTransportSecurityEnabled = false;
+  bool isStaticallyPinned = false;
+  nsCOMPtr<nsISiteSecurityService> sss(do_GetService(NS_SSSERVICE_CONTRACTID));
+  if (!sss) {
+    MOZ_LOG(
+        gPIPNSSLog, LogLevel::Debug,
+        ("[0x%" PRIx64 "] Couldn't get nsISiteSecurityService to check HSTS",
+         aPtrForLog));
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  nsresult rv = NS_NewURI(getter_AddRefs(uri), "https://"_ns + aHostname);
+  if (NS_FAILED(rv)) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("[0x%" PRIx64 "] Creating new URI failed", aPtrForLog));
+    return rv;
+  }
+
+  rv =
+      sss->IsSecureURI(uri, aOriginAttributes, &strictTransportSecurityEnabled);
+  if (NS_FAILED(rv)) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("[0x%" PRIx64 "] checking for HSTS failed", aPtrForLog));
+    return rv;
+  }
+
+  nsCOMPtr<nsIPublicKeyPinningService> pkps =
+      do_GetService(NS_PKPSERVICE_CONTRACTID, &rv);
+  if (!pkps) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("[0x%" PRIx64
+             "] Couldn't get nsIPublicKeyPinningService to check pinning",
+             aPtrForLog));
+    return NS_ERROR_FAILURE;
+  }
+  rv = pkps->HostHasPins(uri, &isStaticallyPinned);
+  if (NS_FAILED(rv)) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("[0x%" PRIx64 "] checking for static pin failed", aPtrForLog));
+    return rv;
+  }
+
+  aOverrideAllowed = !strictTransportSecurityEnabled && !isStaticallyPinned;
+  return NS_OK;
+}
+
+static SECStatus BlockServerCertChangeForSpdy(
+    NSSSocketControl* socketControl, const UniqueCERTCertificate& serverCert) {
+  if (!socketControl->IsHandshakeCompleted()) {
+    return SECSuccess;
+  }
+
+  nsCOMPtr<nsITransportSecurityInfo> securityInfo;
+  nsresult rv = socketControl->GetSecurityInfo(getter_AddRefs(securityInfo));
+  MOZ_ASSERT(NS_SUCCEEDED(rv), "GetSecurityInfo() failed during renegotiation");
+  if (NS_FAILED(rv) || !securityInfo) {
+    PR_SetError(SEC_ERROR_LIBRARY_FAILURE, 0);
+    return SECFailure;
+  }
+  nsAutoCString negotiatedNPN;
+  rv = securityInfo->GetNegotiatedNPN(negotiatedNPN);
+  MOZ_ASSERT(NS_SUCCEEDED(rv),
+             "GetNegotiatedNPN() failed during renegotiation");
+
+  if (NS_SUCCEEDED(rv) && !StringBeginsWith(negotiatedNPN, "spdy/"_ns)) {
+    return SECSuccess;
+  }
+  if (NS_FAILED(rv)) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("BlockServerCertChangeForSpdy failed GetNegotiatedNPN() call."
+             " Assuming spdy."));
+  }
+
+  nsCOMPtr<nsIX509Cert> cert(socketControl->GetServerCert());
+  if (!cert) {
+    PR_SetError(SEC_ERROR_LIBRARY_FAILURE, 0);
+    return SECFailure;
+  }
+  nsTArray<uint8_t> certDER;
+  if (NS_FAILED(cert->GetRawDER(certDER))) {
+    PR_SetError(SEC_ERROR_LIBRARY_FAILURE, 0);
+    return SECFailure;
+  }
+  if (certDER.Length() == serverCert->derCert.len &&
+      memcmp(certDER.Elements(), serverCert->derCert.data, certDER.Length()) ==
+          0) {
+    return SECSuccess;
+  }
+
+  MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+          ("SPDY refused to allow new cert during renegotiation"));
+  PR_SetError(SSL_ERROR_RENEGOTIATION_NOT_ALLOWED, 0);
+  return SECFailure;
+}
+
+Result AuthCertificate(
+    CertVerifier& certVerifier, void* aPinArg,
+    const nsTArray<uint8_t>& certBytes,
+    const nsTArray<nsTArray<uint8_t>>& peerCertChain,
+    const nsACString& aHostName, const OriginAttributes& aOriginAttributes,
+    const Maybe<nsTArray<uint8_t>>& stapledOCSPResponse,
+    const Maybe<nsTArray<uint8_t>>& sctsFromTLSExtension,
+    const Maybe<DelegatedCredentialInfo>& dcInfo, uint32_t providerFlags,
+    Time time, uint32_t certVerifierFlags,
+     nsTArray<nsTArray<uint8_t>>& builtCertChain,
+     EVStatus& evStatus,
+     CertificateTransparencyInfo& certificateTransparencyInfo,
+     bool& aIsBuiltCertChainRootBuiltInRoot,
+     bool& aMadeOCSPRequests) {
+  CertVerifier::OCSPStaplingStatus ocspStaplingStatus =
+      CertVerifier::OCSP_STAPLING_NEVER_CHECKED;
+  KeySizeStatus keySizeStatus = KeySizeStatus::NeverChecked;
+
+  nsTArray<nsTArray<uint8_t>> peerCertsBytes;
+  if (!peerCertChain.IsEmpty()) {
+    std::transform(
+        peerCertChain.cbegin() + 1, peerCertChain.cend(),
+        MakeBackInserter(peerCertsBytes),
+        [](const auto& elementArray) { return elementArray.Clone(); });
+  }
+
+  IssuerSources issuerSources;
+  Result rv = certVerifier.VerifySSLServerCert(
+      certBytes, time, aPinArg, aHostName, builtCertChain, certVerifierFlags,
+      Some(std::move(peerCertsBytes)), stapledOCSPResponse,
+      sctsFromTLSExtension, dcInfo, aOriginAttributes, &evStatus,
+      &ocspStaplingStatus, &keySizeStatus,
+      &certificateTransparencyInfo, &aIsBuiltCertChainRootBuiltInRoot,
+      &aMadeOCSPRequests, &issuerSources);
+
+  return rv;
+}
+
+PRErrorCode AuthCertificateParseResults(
+    uint64_t aPtrForLog, const nsACString& aHostName, int32_t aPort,
+    const OriginAttributes& aOriginAttributes,
+    const nsCOMPtr<nsIX509Cert>& aCert, mozilla::pkix::Time aTime,
+    PRErrorCode aCertVerificationError,
+    nsITransportSecurityInfo::OverridableErrorCategory&
+        aOverridableErrorCategory) {
+  Maybe<nsITransportSecurityInfo::OverridableErrorCategory>
+      maybeOverridableErrorCategory =
+          CategorizeCertificateError(aCertVerificationError);
+  if (!maybeOverridableErrorCategory.isSome()) {
+    return aCertVerificationError;
+  }
+  aOverridableErrorCategory = *maybeOverridableErrorCategory;
+
+  bool overrideAllowed = false;
+  nsresult rv = OverrideAllowedForHost(aPtrForLog, aHostName, aOriginAttributes,
+                                       overrideAllowed);
+  if (NS_FAILED(rv)) {
+    return aCertVerificationError;
+  }
+
+  if (!overrideAllowed) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("[0x%" PRIx64 "] HSTS or pinned host - no overrides allowed",
+             aPtrForLog));
+    return aCertVerificationError;
+  }
+
+  nsCOMPtr<nsICertOverrideService> overrideService =
+      do_GetService(NS_CERTOVERRIDE_CONTRACTID);
+  if (!overrideService) {
+    return aCertVerificationError;
+  }
+  bool haveOverride;
+  bool isTemporaryOverride;
+  rv = overrideService->HasMatchingOverride(aHostName, aPort, aOriginAttributes,
+                                            aCert, &isTemporaryOverride,
+                                            &haveOverride);
+  if (NS_FAILED(rv)) {
+    return aCertVerificationError;
+  }
+  (void)isTemporaryOverride;
+  if (haveOverride) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("[0x%" PRIx64 "] certificate error overridden", aPtrForLog));
+    return 0;
+  }
+
+  return aCertVerificationError;
+}
+
+static nsTArray<nsTArray<uint8_t>> CreateCertBytesArray(
+    const UniqueSECItemArray& aCertChain) {
+  nsTArray<nsTArray<uint8_t>> certsBytes;
+  for (size_t i = 0; i < aCertChain->len; i++) {
+    nsTArray<uint8_t> certBytes;
+    certBytes.AppendElements(aCertChain->items[i].data,
+                             aCertChain->items[i].len);
+    certsBytes.AppendElement(std::move(certBytes));
+  }
+  return certsBytes;
+}
+
+SECStatus SSLServerCertVerificationJob::Dispatch(
+    uint64_t addrForLogging, void* aPinArg,
+    nsTArray<nsTArray<uint8_t>>&& peerCertChain, const nsACString& aHostName,
+    int32_t aPort, const OriginAttributes& aOriginAttributes,
+    Maybe<nsTArray<uint8_t>>& stapledOCSPResponse,
+    Maybe<nsTArray<uint8_t>>& sctsFromTLSExtension,
+    Maybe<DelegatedCredentialInfo>& dcInfo, uint32_t providerFlags, Time time,
+    uint32_t certVerifierFlags,
+    BaseSSLServerCertVerificationResult* aResultTask) {
+  if (!aResultTask || peerCertChain.IsEmpty()) {
+    MOZ_ASSERT_UNREACHABLE(
+        "must have result task and non-empty peer cert chain");
+    PR_SetError(SEC_ERROR_LIBRARY_FAILURE, 0);
+    return SECFailure;
+  }
+
+  if (!gCertVerificationThreadPool) {
+    PR_SetError(PR_INVALID_STATE_ERROR, 0);
+    return SECFailure;
+  }
+
+  RefPtr<SSLServerCertVerificationJob> job(new SSLServerCertVerificationJob(
+      addrForLogging, aPinArg, std::move(peerCertChain), aHostName, aPort,
+      aOriginAttributes, stapledOCSPResponse, sctsFromTLSExtension, dcInfo,
+      providerFlags, time, certVerifierFlags, aResultTask));
+
+  nsresult nrv = gCertVerificationThreadPool->Dispatch(job, NS_DISPATCH_NORMAL);
+  if (NS_FAILED(nrv)) {
+    PRErrorCode error = nrv == NS_ERROR_OUT_OF_MEMORY ? PR_OUT_OF_MEMORY_ERROR
+                                                      : PR_INVALID_STATE_ERROR;
+    PR_SetError(error, 0);
+    return SECFailure;
+  }
+
+  PR_SetError(PR_WOULD_BLOCK_ERROR, 0);
+  return SECWouldBlock;
+}
+
+NS_IMETHODIMP
+SSLServerCertVerificationJob::Run() {
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+          ("[%" PRIx64 "] SSLServerCertVerificationJob::Run", mAddrForLogging));
+
+  RefPtr<SharedCertVerifier> certVerifier(GetDefaultCertVerifier());
+  if (!certVerifier) {
+    mResultTask.forget().leak();
+    return NS_ERROR_FAILURE;
+  }
+
+  EVStatus evStatus;
+  CertificateTransparencyInfo certificateTransparencyInfo;
+  bool isCertChainRootBuiltInRoot = false;
+  bool madeOCSPRequests = false;
+  nsTArray<nsTArray<uint8_t>> builtChainBytesArray;
+  nsTArray<uint8_t> certBytes(mPeerCertChain.ElementAt(0).Clone());
+  Result result = AuthCertificate(
+      *certVerifier, mPinArg, certBytes, mPeerCertChain, mHostName,
+      mOriginAttributes, mStapledOCSPResponse, mSCTsFromTLSExtension, mDCInfo,
+      mProviderFlags, mTime, mCertVerifierFlags, builtChainBytesArray, evStatus,
+      certificateTransparencyInfo, isCertChainRootBuiltInRoot,
+      madeOCSPRequests);
+
+  if (result == Success) {
+
+
+
+    nsresult rv = mResultTask->Dispatch(
+        std::move(builtChainBytesArray), std::move(mPeerCertChain),
+        TransportSecurityInfo::ConvertCertificateTransparencyInfoToStatus(
+            certificateTransparencyInfo),
+        evStatus, true, 0,
+        nsITransportSecurityInfo::OverridableErrorCategory::ERROR_UNSET,
+        isCertChainRootBuiltInRoot, mProviderFlags, madeOCSPRequests);
+    if (NS_FAILED(rv)) {
+      mResultTask.forget().leak();
+    }
+    return rv;
+  }
+
+
+
+  PRErrorCode error = MapResultToPRErrorCode(result);
+  nsITransportSecurityInfo::OverridableErrorCategory overridableErrorCategory =
+      nsITransportSecurityInfo::OverridableErrorCategory::ERROR_UNSET;
+  nsCOMPtr<nsIX509Cert> cert(new nsNSSCertificate(std::move(certBytes)));
+  PRErrorCode finalError = AuthCertificateParseResults(
+      mAddrForLogging, mHostName, mPort, mOriginAttributes, cert, mTime, error,
+      overridableErrorCategory);
+
+  nsresult rv = mResultTask->Dispatch(
+      std::move(builtChainBytesArray), std::move(mPeerCertChain),
+      TransportSecurityInfo::ConvertCertificateTransparencyInfoToStatus(
+          certificateTransparencyInfo),
+      EVStatus::NotEV, false, finalError, overridableErrorCategory,
+      result == Result::ERROR_BAD_CERT_DOMAIN ? isCertChainRootBuiltInRoot
+                                              : false,
+      mProviderFlags, madeOCSPRequests);
+  if (NS_FAILED(rv)) {
+    mResultTask.forget().leak();
+  }
+  return rv;
+}
+
+SECStatus AuthCertificateHookInternal(
+    CommonSocketControl* socketControl, const void* aPtrForLogging,
+    const nsACString& hostName, nsTArray<nsTArray<uint8_t>>&& peerCertChain,
+    Maybe<nsTArray<uint8_t>>& stapledOCSPResponse,
+    Maybe<nsTArray<uint8_t>>& sctsFromTLSExtension,
+    Maybe<DelegatedCredentialInfo>& dcInfo, uint32_t providerFlags,
+    uint32_t certVerifierFlags) {
+
+  MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+          ("[%p] starting AuthCertificateHookInternal\n", aPtrForLogging));
+
+  if (!socketControl || peerCertChain.IsEmpty()) {
+    PR_SetError(PR_INVALID_STATE_ERROR, 0);
+    return SECFailure;
+  }
+
+  bool onSTSThread;
+  nsresult nrv;
+  nsCOMPtr<nsIEventTarget> sts =
+      do_GetService(NS_SOCKETTRANSPORTSERVICE_CONTRACTID, &nrv);
+  if (NS_SUCCEEDED(nrv)) {
+    nrv = sts->IsOnCurrentThread(&onSTSThread);
+  }
+
+  if (NS_FAILED(nrv)) {
+    NS_ERROR("Could not get STS service or IsOnCurrentThread failed");
+    PR_SetError(PR_UNKNOWN_ERROR, 0);
+    return SECFailure;
+  }
+
+  MOZ_ASSERT(onSTSThread);
+
+  if (!onSTSThread) {
+    PR_SetError(PR_INVALID_STATE_ERROR, 0);
+    return SECFailure;
+  }
+
+  uint64_t addr = reinterpret_cast<uintptr_t>(aPtrForLogging);
+  RefPtr resultTask =
+      MakeRefPtr<SSLServerCertVerificationResult>(socketControl);
+
+  if (XRE_IsSocketProcess()) {
+    return RemoteProcessCertVerification(
+        std::move(peerCertChain), hostName, socketControl->GetPort(),
+        socketControl->GetOriginAttributes(), stapledOCSPResponse,
+        sctsFromTLSExtension, dcInfo, providerFlags, certVerifierFlags,
+        resultTask);
+  }
+
+  return SSLServerCertVerificationJob::Dispatch(
+      addr, socketControl, std::move(peerCertChain), hostName,
+      socketControl->GetPort(), socketControl->GetOriginAttributes(),
+      stapledOCSPResponse, sctsFromTLSExtension, dcInfo, providerFlags, Now(),
+      certVerifierFlags, resultTask);
+}
+
+SECStatus AuthCertificateHook(void* arg, PRFileDesc* fd, PRBool checkSig,
+                              PRBool isServer) {
+  MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+          ("[%p] starting AuthCertificateHook\n", fd));
+
+  MOZ_ASSERT(checkSig, "AuthCertificateHook: checkSig unexpectedly false");
+
+  MOZ_ASSERT(!isServer, "AuthCertificateHook: isServer unexpectedly true");
+
+  NSSSocketControl* socketInfo = static_cast<NSSSocketControl*>(arg);
+
+  UniqueCERTCertificate serverCert(SSL_PeerCertificate(fd));
+
+  if (!checkSig || isServer || !socketInfo || !serverCert) {
+    PR_SetError(PR_INVALID_STATE_ERROR, 0);
+    return SECFailure;
+  }
+  socketInfo->SetFullHandshake();
+
+  if (BlockServerCertChangeForSpdy(socketInfo, serverCert) != SECSuccess) {
+    return SECFailure;
+  }
+
+  UniqueSECItemArray peerCertChain;
+  SECStatus rv =
+      SSL_PeerCertificateChainDER(fd, TempPtrToSetter(&peerCertChain));
+  if (rv != SECSuccess) {
+    PR_SetError(PR_INVALID_STATE_ERROR, 0);
+    return SECFailure;
+  }
+  MOZ_ASSERT(peerCertChain,
+             "AuthCertificateHook: peerCertChain unexpectedly null");
+
+  nsTArray<nsTArray<uint8_t>> peerCertsBytes =
+      CreateCertBytesArray(peerCertChain);
+
+  const SECItemArray* csa = SSL_PeerStapledOCSPResponses(fd);
+  Maybe<nsTArray<uint8_t>> stapledOCSPResponse;
+  if (csa && csa->len == 1) {
+    stapledOCSPResponse.emplace();
+    stapledOCSPResponse->SetCapacity(csa->items[0].len);
+    stapledOCSPResponse->AppendElements(csa->items[0].data, csa->items[0].len);
+  }
+
+  Maybe<nsTArray<uint8_t>> sctsFromTLSExtension;
+  const SECItem* sctsFromTLSExtensionSECItem = SSL_PeerSignedCertTimestamps(fd);
+  if (sctsFromTLSExtensionSECItem) {
+    sctsFromTLSExtension.emplace();
+    sctsFromTLSExtension->SetCapacity(sctsFromTLSExtensionSECItem->len);
+    sctsFromTLSExtension->AppendElements(sctsFromTLSExtensionSECItem->data,
+                                         sctsFromTLSExtensionSECItem->len);
+  }
+
+  uint32_t providerFlags = 0;
+  socketInfo->GetProviderFlags(&providerFlags);
+
+  uint32_t certVerifierFlags = 0;
+  if (!StaticPrefs::security_ssl_enable_ocsp_stapling() ||
+      !StaticPrefs::security_ssl_enable_ocsp_must_staple()) {
+    certVerifierFlags |= CertVerifier::FLAG_TLS_IGNORE_STATUS_REQUEST;
+  }
+
+  Maybe<DelegatedCredentialInfo> dcInfo;
+  SSLPreliminaryChannelInfo channelPreInfo;
+  rv = SSL_GetPreliminaryChannelInfo(fd, &channelPreInfo,
+                                     sizeof(channelPreInfo));
+  if (rv != SECSuccess) {
+    PR_SetError(PR_INVALID_STATE_ERROR, 0);
+    return SECFailure;
+  }
+  if (channelPreInfo.peerDelegCred) {
+    dcInfo.emplace(DelegatedCredentialInfo(channelPreInfo.signatureScheme,
+                                           channelPreInfo.authKeyBits));
+  }
+
+  nsCString echConfig;
+  nsresult nsrv = socketInfo->GetEchConfig(echConfig);
+  bool verifyToEchPublicName =
+      NS_SUCCEEDED(nsrv) && echConfig.Length() && channelPreInfo.echPublicName;
+
+  const nsCString echPublicName(channelPreInfo.echPublicName);
+  const nsACString& hostname =
+      verifyToEchPublicName ? echPublicName : socketInfo->GetHostName();
+  socketInfo->SetCertVerificationWaiting();
+  rv = AuthCertificateHookInternal(socketInfo, static_cast<const void*>(fd),
+                                   hostname, std::move(peerCertsBytes),
+                                   stapledOCSPResponse, sctsFromTLSExtension,
+                                   dcInfo, providerFlags, certVerifierFlags);
+  return rv;
+}
+
+SECStatus AuthCertificateHookWithInfo(
+    CommonSocketControl* socketControl, const nsACString& aHostName,
+    const void* aPtrForLogging, nsTArray<nsTArray<uint8_t>>&& peerCertChain,
+    Maybe<nsTArray<nsTArray<uint8_t>>>& stapledOCSPResponses,
+    Maybe<nsTArray<uint8_t>>& sctsFromTLSExtension, uint32_t providerFlags) {
+  if (peerCertChain.IsEmpty()) {
+    PR_SetError(PR_INVALID_STATE_ERROR, 0);
+    return SECFailure;
+  }
+
+  Maybe<nsTArray<uint8_t>> stapledOCSPResponse;
+  if (stapledOCSPResponses && (stapledOCSPResponses->Length() == 1)) {
+    stapledOCSPResponse.emplace(stapledOCSPResponses->ElementAt(0).Clone());
+  }
+
+  uint32_t certVerifierFlags = 0;
+  if (!StaticPrefs::security_ssl_enable_ocsp_stapling() ||
+      !StaticPrefs::security_ssl_enable_ocsp_must_staple()) {
+    certVerifierFlags |= CertVerifier::FLAG_TLS_IGNORE_STATUS_REQUEST;
+  }
+
+  Maybe<DelegatedCredentialInfo> dcInfo;
+
+  return AuthCertificateHookInternal(socketControl, aPtrForLogging, aHostName,
+                                     std::move(peerCertChain),
+                                     stapledOCSPResponse, sctsFromTLSExtension,
+                                     dcInfo, providerFlags, certVerifierFlags);
+}
+
+NS_IMPL_ISUPPORTS_INHERITED0(SSLServerCertVerificationResult, Runnable)
+
+SSLServerCertVerificationResult::SSLServerCertVerificationResult(
+    CommonSocketControl* socketControl)
+    : Runnable("psm::SSLServerCertVerificationResult"),
+      mSocketControl(socketControl),
+      mCertificateTransparencyStatus(0),
+      mEVStatus(EVStatus::NotEV),
+      mSucceeded(false),
+      mFinalError(0),
+      mOverridableErrorCategory(
+          nsITransportSecurityInfo::OverridableErrorCategory::ERROR_UNSET),
+      mIsBuiltCertChainRootBuiltInRoot(false),
+      mProviderFlags(0),
+      mMadeOCSPRequests(false) {}
+
+nsresult SSLServerCertVerificationResult::Dispatch(
+    nsTArray<nsTArray<uint8_t>>&& aBuiltChain,
+    nsTArray<nsTArray<uint8_t>>&& aPeerCertChain,
+    uint16_t aCertificateTransparencyStatus, EVStatus aEVStatus,
+    bool aSucceeded, PRErrorCode aFinalError,
+    nsITransportSecurityInfo::OverridableErrorCategory
+        aOverridableErrorCategory,
+    bool aIsBuiltCertChainRootBuiltInRoot, uint32_t aProviderFlags,
+    bool aMadeOCSPRequests) {
+  mBuiltChain = std::move(aBuiltChain);
+  mPeerCertChain = std::move(aPeerCertChain);
+  mCertificateTransparencyStatus = aCertificateTransparencyStatus;
+  mEVStatus = aEVStatus;
+  mSucceeded = aSucceeded;
+  mFinalError = aFinalError;
+  mOverridableErrorCategory = aOverridableErrorCategory;
+  mIsBuiltCertChainRootBuiltInRoot = aIsBuiltCertChainRootBuiltInRoot;
+  mProviderFlags = aProviderFlags;
+  mMadeOCSPRequests = aMadeOCSPRequests;
+
+  if (mSucceeded &&
+      (mBuiltChain.IsEmpty() || mFinalError != 0 ||
+       mOverridableErrorCategory !=
+           nsITransportSecurityInfo::OverridableErrorCategory::ERROR_UNSET)) {
+    MOZ_ASSERT_UNREACHABLE(
+        "if certificate verification succeeded without overridden errors, the "
+        "built chain shouldn't be empty and any error bits should be unset");
+    mSucceeded = false;
+    mFinalError = SEC_ERROR_LIBRARY_FAILURE;
+  }
+  if (!mSucceeded && mPeerCertChain.IsEmpty()) {
+    MOZ_ASSERT_UNREACHABLE(
+        "if certificate verification failed, the peer chain shouldn't be "
+        "empty");
+    mFinalError = SEC_ERROR_LIBRARY_FAILURE;
+  }
+
+  nsresult rv;
+  nsCOMPtr<nsIEventTarget> stsTarget =
+      do_GetService(NS_SOCKETTRANSPORTSERVICE_CONTRACTID, &rv);
+  MOZ_ASSERT(stsTarget, "Failed to get socket transport service event target");
+  if (!stsTarget) {
+    mSocketControl.forget().leak();
+    return NS_ERROR_FAILURE;
+  }
+  rv = stsTarget->Dispatch(this, NS_DISPATCH_NORMAL);
+  MOZ_ASSERT(NS_SUCCEEDED(rv),
+             "Failed to dispatch SSLServerCertVerificationResult");
+  return rv;
+}
+
+NS_IMETHODIMP
+SSLServerCertVerificationResult::Run() {
+#ifdef DEBUG
+  bool onSTSThread = false;
+  nsresult nrv;
+  nsCOMPtr<nsIEventTarget> sts =
+      do_GetService(NS_SOCKETTRANSPORTSERVICE_CONTRACTID, &nrv);
+  if (NS_SUCCEEDED(nrv)) {
+    nrv = sts->IsOnCurrentThread(&onSTSThread);
+  }
+
+  MOZ_ASSERT(onSTSThread);
+#endif
+
+  mSocketControl->SetMadeOCSPRequests(mMadeOCSPRequests);
+  mSocketControl->SetIsBuiltCertChainRootBuiltInRoot(
+      mIsBuiltCertChainRootBuiltInRoot);
+  mSocketControl->SetCertificateTransparencyStatus(
+      mCertificateTransparencyStatus);
+
+  if (mSucceeded) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("SSLServerCertVerificationResult::Run setting NEW cert"));
+    nsTArray<uint8_t> certBytes(mBuiltChain.ElementAt(0).Clone());
+    nsCOMPtr<nsIX509Cert> cert(new nsNSSCertificate(std::move(certBytes)));
+    mSocketControl->SetServerCert(cert, mEVStatus);
+    mSocketControl->SetSucceededCertChain(std::move(mBuiltChain));
+  } else {
+    nsTArray<uint8_t> certBytes(mPeerCertChain.ElementAt(0).Clone());
+    nsCOMPtr<nsIX509Cert> cert(new nsNSSCertificate(std::move(certBytes)));
+    mSocketControl->SetServerCert(cert, EVStatus::NotEV);
+    if (mOverridableErrorCategory !=
+        nsITransportSecurityInfo::OverridableErrorCategory::ERROR_UNSET) {
+      mSocketControl->SetStatusErrorBits(mOverridableErrorCategory);
+    }
+  }
+
+  mSocketControl->SetHandshakeCertificates(std::move(mPeerCertChain));
+  mSocketControl->SetCertVerificationResult(mFinalError);
+  mSocketControl = nullptr;
+  return NS_OK;
+}
+
+}  
+}  

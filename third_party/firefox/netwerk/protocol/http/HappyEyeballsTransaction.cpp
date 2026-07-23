@@ -1,0 +1,275 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HttpLog.h"
+
+#include "HappyEyeballsTransaction.h"
+
+#include "ConnectionHandle.h"
+#include "HttpConnectionBase.h"
+#include "Http2Session.h"
+#include "Http3Session.h"
+#include "nsHttpConnection.h"
+#include "nsHttpTransaction.h"
+#include "nsITLSSocketControl.h"
+#include "nsITransportSecurityInfo.h"
+#include "nsQueryObject.h"
+
+#undef LOG
+#define LOG(args) LOG5(args)
+#undef LOG_ENABLED
+#define LOG_ENABLED() LOG5_ENABLED()
+
+namespace mozilla::net {
+
+HappyEyeballsTransaction::HappyEyeballsTransaction(
+    nsHttpConnectionInfo* aConnInfo, nsIInterfaceRequestor* aCallbacks,
+    uint32_t aCaps, uint64_t aBrowserId, StatusForwarder&& aStatusForwarder,
+    ClientAuthForwarder&& aClientAuthRequestedForwarder,
+    ClientAuthForwarder&& aClientAuthSelectedForwarder,
+    ZeroRttHandle* aZeroRttHandle)
+    : SpeculativeTransaction(aConnInfo, aCallbacks, aCaps,
+                              nullptr,
+                              false),
+      mStatusForwarder(std::move(aStatusForwarder)),
+      mClientAuthRequestedForwarder(std::move(aClientAuthRequestedForwarder)),
+      mClientAuthSelectedForwarder(std::move(aClientAuthSelectedForwarder)),
+      mZeroRttHandle(aZeroRttHandle),
+      mBrowserId(aBrowserId) {
+  LOG1(("HappyEyeballsTransaction ctor %p handle=%p", this,
+        mZeroRttHandle.get()));
+}
+
+void HappyEyeballsTransaction::OnClientAuthCertificateRequested() {
+  LOG(("HappyEyeballsTransaction::OnClientAuthCertificateRequested %p", this));
+  if (mClientAuthRequestedForwarder) {
+    mClientAuthRequestedForwarder();
+  }
+}
+
+void HappyEyeballsTransaction::OnClientAuthCertificateSelected() {
+  LOG(("HappyEyeballsTransaction::OnClientAuthCertificateSelected %p", this));
+  if (mClientAuthSelectedForwarder) {
+    mClientAuthSelectedForwarder();
+  }
+}
+
+HappyEyeballsTransaction::~HappyEyeballsTransaction() {
+  LOG(("HappyEyeballsTransaction dtor %p", this));
+}
+
+void HappyEyeballsTransaction::Adopt(nsHttpTransaction* aRealTxn) {
+  MOZ_ASSERT(aRealTxn, "Adopt with null real transaction");
+  LOG(("HappyEyeballsTransaction::Adopt %p realTxn=%p entered0RTT=%d", this,
+       aRealTxn, Entered0RTT()));
+  Transition(State::Adopted, aRealTxn);
+}
+
+void HappyEyeballsTransaction::OnTransportStatus(nsITransport* aTransport,
+                                                 nsresult aStatus,
+                                                 int64_t aProgress) {
+  NullHttpTransaction::OnTransportStatus(aTransport, aStatus, aProgress);
+
+  if (mStatusForwarder) {
+    mStatusForwarder(aTransport, aStatus, aProgress);
+  }
+}
+
+bool HappyEyeballsTransaction::Do0RTT(bool aCanSendEarlyData) {
+  if (!mZeroRttHandle) {
+    return false;
+  }
+
+  if (nsHttpTransaction* real = mZeroRttHandle->RealTxn()) {
+    if (real->IsWebsocketUpgrade() || real->IsForWebTransport()) {
+      nsAHttpConnection* handle = Connection();
+      RefPtr<HttpConnectionBase> base =
+          handle ? handle->HttpConnection() : nullptr;
+      if (base && (base->UsingSpdy() || base->UsingHttp3())) {
+        return false;
+      }
+    }
+  }
+
+  return mZeroRttHandle->Do0RTT(this, aCanSendEarlyData);
+}
+
+nsresult HappyEyeballsTransaction::ReadSegments(nsAHttpSegmentReader* aReader,
+                                                uint32_t aCount,
+                                                uint32_t* aCountRead) {
+  if (Entered0RTT()) {
+    return mZeroRttHandle->ReadSegments(Request0RttStreamOffset(), aReader,
+                                        aCount, aCountRead);
+  }
+
+  if (nsAHttpConnection* aHandle = Connection()) {
+    RefPtr<HttpConnectionBase> base = aHandle->HttpConnection();
+    if (RefPtr<nsHttpConnection> conn = do_QueryObject(base)) {
+      if (nsresult tlsErr = conn->HandshakeError(); NS_FAILED(tlsErr)) {
+        nsHttpTransaction* real =
+            mZeroRttHandle ? mZeroRttHandle->RealTxn() : nullptr;
+        nsCOMPtr<nsITLSSocketControl> tlsCtrl;
+        conn->GetTLSSocketControl(getter_AddRefs(tlsCtrl));
+        nsCOMPtr<nsITransportSecurityInfo> secInfo;
+        if (tlsCtrl) {
+          tlsCtrl->GetSecurityInfo(getter_AddRefs(secInfo));
+        }
+        if (real && secInfo) {
+          real->SetSecurityInfo(secInfo);
+        }
+        LOG(
+            ("HappyEyeballsTransaction::ReadSegments %p surfacing handshake "
+             "error rv=%" PRIx32 " real=%p secInfo=%p",
+             this, static_cast<uint32_t>(tlsErr), real, secInfo.get()));
+        *aCountRead = 0;
+        return tlsErr;
+      }
+    }
+  }
+
+  return SpeculativeTransaction::ReadSegments(aReader, aCount, aCountRead);
+}
+
+nsresult HappyEyeballsTransaction::WriteSegments(nsAHttpSegmentWriter* aWriter,
+                                                 uint32_t aCount,
+                                                 uint32_t* aCountWritten) {
+  if (mState == State::Closed) {
+    return NS_BASE_STREAM_CLOSED;
+  }
+  MOZ_ASSERT_UNREACHABLE("Should not be called");
+  return NullHttpTransaction::WriteSegments(aWriter, aCount, aCountWritten);
+}
+
+void HappyEyeballsTransaction::Close(nsresult aReason) {
+  LOG(
+      ("HappyEyeballsTransaction::Close %p reason=%x mState=%d adopted=%d "
+       "entered0RTT=%d",
+       this, static_cast<uint32_t>(aReason), static_cast<int>(mState),
+       IsAdopted(), Entered0RTT()));
+  if (mState == State::Closed) {
+    return;
+  }
+  if (NS_SUCCEEDED(aReason) && mZeroRttHandle &&
+      mZeroRttHandle->ShouldDisqualify(this)) {
+    LOG(("HappyEyeballsTransaction::Close %p disqualifying non-0-RTT attempt",
+         this));
+    aReason = NS_ERROR_FAILURE;
+  }
+  Transition(State::Closed, nullptr, aReason);
+}
+
+void HappyEyeballsTransaction::Transition(State aNext,
+                                          nsHttpTransaction* aRealTxn,
+                                          nsresult aReason) {
+  LOG(("HappyEyeballsTransaction::Transition %p mState=%d aNext=%d", this,
+       static_cast<int>(mState), static_cast<int>(aNext)));
+  switch (aNext) {
+    case State::Racing:
+      MOZ_ASSERT_UNREACHABLE(
+          "Racing is the constructed state; cannot transition into it");
+      break;
+
+    case State::Adopted: {
+      MOZ_ASSERT(mState == State::Racing, "Racing -> Adopted only");
+      MOZ_ASSERT(aRealTxn, "Adopted entry requires real txn");
+      mState = State::Adopted;
+      mRealTxn = aRealTxn;
+
+      nsAHttpConnection* ourHandle = Connection();
+      MOZ_ASSERT(ourHandle);
+
+      RefPtr<HttpConnectionBase> conn = ourHandle->HttpConnection();
+      if (conn && conn->UsingHttp3()) {
+        mRealTxn->SetConnection(ourHandle);
+        if (RefPtr<Http3Session> h3 = do_QueryObject(ourHandle)) {
+          h3->SwapTransaction(this, mRealTxn);
+        }
+      } else if (conn && conn->UsingSpdy()) {
+        mRealTxn->SetConnection(ourHandle);
+        if (RefPtr<Http2Session> h2 = do_QueryObject(ourHandle)) {
+          h2->SwapTransaction(this, mRealTxn);
+        }
+      } else if (conn) {
+        RefPtr<ConnectionHandle> fresh = new ConnectionHandle(conn);
+        mRealTxn->SetConnection(fresh);
+        if (RefPtr<nsHttpConnection> h1 = do_QueryObject(conn)) {
+          h1->SwapTransaction(this, mRealTxn);
+        }
+      }
+
+      SetConnection(nullptr);
+      mZeroRttHandle = nullptr;
+      break;
+    }
+
+    case State::Closed:
+      MOZ_ASSERT(mState == State::Racing || mState == State::Adopted,
+                 "Closed entry from Racing or Adopted only");
+      mState = State::Closed;
+      SpeculativeTransaction::Close(aReason);
+      break;
+  }
+}
+
+nsHttpTransaction* HappyEyeballsTransaction::QueryHttpTransaction() {
+  return mRealTxn;
+}
+
+bool HappyEyeballsTransaction::AllowedToConnectToIpAddressSpace(
+    nsILoadInfo::IPAddressSpace aTargetIpAddressSpace) {
+  nsHttpTransaction* real = mRealTxn;
+  if (!real && mZeroRttHandle) {
+    real = mZeroRttHandle->RealTxn();
+  }
+  if (!real) {
+    return true;
+  }
+  return real->AllowedToConnectToIpAddressSpace(aTargetIpAddressSpace);
+}
+
+const nsHttpRequestHead* HappyEyeballsTransaction::RequestHead() {
+  if (mZeroRttHandle) {
+    if (nsHttpTransaction* real = mZeroRttHandle->RealTxn()) {
+      return real->RequestHead();
+    }
+  }
+  return SpeculativeTransaction::RequestHead();
+}
+
+void HappyEyeballsTransaction::MaybeRemoveSSLTokens() {
+  nsAHttpConnection* handle = Connection();
+  if (!handle) {
+    return;
+  }
+  RefPtr<HttpConnectionBase> base = handle->HttpConnection();
+  RefPtr<nsHttpConnection> conn = do_QueryObject(base);
+  if (!conn) {
+    return;
+  }
+  nsCOMPtr<nsITLSSocketControl> tlsCtrl;
+  conn->GetTLSSocketControl(getter_AddRefs(tlsCtrl));
+  nsCOMPtr<nsITransportSecurityInfo> secInfo;
+  if (tlsCtrl) {
+    tlsCtrl->GetSecurityInfo(getter_AddRefs(secInfo));
+  }
+  if (mZeroRttHandle) {
+    if (nsHttpTransaction* realTxn = mZeroRttHandle->RealTxn()) {
+      realTxn->RemoveSSLTokens(secInfo);
+    }
+  }
+}
+
+nsresult HappyEyeballsTransaction::FetchHTTPSRR() {
+  MOZ_ASSERT_UNREACHABLE("Should not be called");
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+nsresult HappyEyeballsTransaction::OnHTTPSRRAvailable(
+    nsIDNSHTTPSSVCRecord* aHTTPSSVCRecord,
+    nsISVCBRecord* aHighestPriorityRecord, const nsACString& aCname) {
+  MOZ_ASSERT_UNREACHABLE("Should not be called");
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+}  

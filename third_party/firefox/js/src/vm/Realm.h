@@ -1,0 +1,775 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_Realm_h
+#define vm_Realm_h
+
+#include "mozilla/Array.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/XorShift128PlusRNG.h"
+
+#include <stddef.h>
+
+#include "builtin/Array.h"
+#include "ds/IdValuePair.h"
+#include "gc/Barrier.h"
+#include "gc/WeakMap.h"
+#include "jit/BaselineCompileQueue.h"
+#include "js/GCVariant.h"
+#include "js/RealmOptions.h"
+#include "js/ExecutionTimers.h"
+#include "js/UniquePtr.h"
+#include "util/LanguageId.h"
+#include "vm/ArrayBufferObject.h"
+#include "vm/GuardFuse.h"
+#include "vm/InvalidatingFuse.h"
+#include "vm/JSContext.h"
+#include "vm/RealmFuses.h"
+#include "vm/SavedStacks.h"
+#include "wasm/WasmRealm.h"
+
+namespace js {
+
+namespace coverage {
+class LCovRealm;
+}  
+
+namespace jit {
+class BaselineCompileQueue;
+}  
+
+class AutoRestoreRealmDebugMode;
+class DateTimeInfo;
+class Debugger;
+class GlobalObject;
+class GlobalObjectData;
+class GlobalLexicalEnvironmentObject;
+class NonSyntacticLexicalEnvironmentObject;
+struct IdValuePair;
+struct NativeIterator;
+
+class DtoaCache {
+  double dbl = 0.0;
+  int base = 0;
+  JSLinearString* str;  
+
+ public:
+  DtoaCache() : str(nullptr) {}
+  void purge() { str = nullptr; }
+
+  JSLinearString* lookup(int b, double d) {
+    return str && b == base && d == dbl ? str : nullptr;
+  }
+
+  void cache(int b, double d, JSLinearString* s) {
+    base = b;
+    dbl = d;
+    str = s;
+  }
+
+#ifdef JSGC_HASH_TABLE_CHECKS
+  void checkCacheAfterMovingGC();
+#endif
+};
+
+class NewProxyCache {
+  struct Entry {
+    Shape* shape;
+  };
+  static const size_t NumEntries = 4;
+  mozilla::UniquePtr<Entry[], JS::FreePolicy> entries_;
+
+ public:
+  MOZ_ALWAYS_INLINE bool lookup(const JSClass* clasp, TaggedProto proto,
+                                Shape** shape) const {
+    if (!entries_) {
+      return false;
+    }
+    for (size_t i = 0; i < NumEntries; i++) {
+      const Entry& entry = entries_[i];
+      if (entry.shape && entry.shape->getObjectClass() == clasp &&
+          entry.shape->proto() == proto) {
+        *shape = entry.shape;
+        return true;
+      }
+    }
+    return false;
+  }
+  void add(Shape* shape) {
+    MOZ_ASSERT(shape);
+    if (!entries_) {
+      entries_.reset(js_pod_calloc<Entry>(NumEntries));
+      if (!entries_) {
+        return;
+      }
+    } else {
+      for (size_t i = NumEntries - 1; i > 0; i--) {
+        entries_[i] = entries_[i - 1];
+      }
+    }
+    entries_[0].shape = shape;
+  }
+  void purge() { entries_.reset(); }
+};
+
+class NewPlainObjectWithPropsCache {
+  static const size_t NumEntries = 4;
+  mozilla::Array<SharedShape*, NumEntries> entries_;
+
+ public:
+  NewPlainObjectWithPropsCache() { purge(); }
+
+  SharedShape* lookup(Handle<IdValueVector> properties) const;
+  void add(SharedShape* shape);
+
+  void purge() {
+    for (size_t i = 0; i < NumEntries; i++) {
+      entries_[i] = nullptr;
+    }
+  }
+};
+
+class MOZ_NON_TEMPORARY_CLASS PlainObjectAssignCache {
+  SharedShape* emptyToShape_ = nullptr;
+  SharedShape* fromShape_ = nullptr;
+  SharedShape* newToShape_ = nullptr;
+
+#ifdef DEBUG
+  void assertValid() const;
+#else
+  void assertValid() const {}
+#endif
+
+ public:
+  PlainObjectAssignCache() = default;
+  PlainObjectAssignCache(const PlainObjectAssignCache&) = delete;
+  void operator=(const PlainObjectAssignCache&) = delete;
+
+  SharedShape* lookup(Shape* emptyToShape, Shape* fromShape) const {
+    if (emptyToShape_ == emptyToShape && fromShape_ == fromShape) {
+      assertValid();
+      return newToShape_;
+    }
+    return nullptr;
+  }
+  void fill(SharedShape* emptyToShape, SharedShape* fromShape,
+            SharedShape* newToShape) {
+    emptyToShape_ = emptyToShape;
+    fromShape_ = fromShape;
+    newToShape_ = newToShape;
+    assertValid();
+  }
+  void purge() {
+    emptyToShape_ = nullptr;
+    fromShape_ = nullptr;
+    newToShape_ = nullptr;
+  }
+};
+
+
+class PropertyIteratorObject;
+
+struct IteratorHashPolicy {
+  struct Lookup {
+    Shape* objShape;
+    Shape** protoShapes;
+    size_t numProtoShapes;
+    HashNumber shapesHash;
+
+    Lookup(Shape* objShape, Shape** protoShapes, size_t numProtoShapes,
+           HashNumber shapesHash)
+        : objShape(objShape),
+          protoShapes(protoShapes),
+          numProtoShapes(numProtoShapes),
+          shapesHash(shapesHash) {
+      MOZ_ASSERT(objShape);
+    }
+  };
+  static HashNumber hash(const Lookup& lookup) { return lookup.shapesHash; }
+  static bool match(PropertyIteratorObject* obj, const Lookup& lookup);
+};
+
+class DebugEnvironments;
+class NonSyntacticVariablesObject;
+class ScriptSourceObject;
+class WithEnvironmentObject;
+
+class ObjectRealm {
+  using NonSyntacticLexialEnvironmentsMap =
+      WeakMap<JSObject*, JSObject*, ZoneAllocPolicy>;
+  js::UniquePtr<NonSyntacticLexialEnvironmentsMap>
+      nonSyntacticLexicalEnvironments_;
+
+ public:
+  JS::WeakCache<js::InnerViewTable> innerViews;
+
+  using ModuleScriptSourceSet =
+      JS::GCHashSet<js::WeakHeapPtr<ScriptSourceObject*>,
+                    js::DefaultHasher<js::WeakHeapPtr<ScriptSourceObject*>>,
+                    js::ZoneAllocPolicy>;
+  JS::WeakCache<ModuleScriptSourceSet> moduleScriptSources;
+
+  using ObjectMetadataTable = WeakMap<JSObject*, JSObject*, ZoneAllocPolicy>;
+  js::UniquePtr<ObjectMetadataTable> objectMetadataTable;
+
+  using IteratorCache =
+      js::HashSet<js::PropertyIteratorObject*, js::IteratorHashPolicy,
+                  js::ZoneAllocPolicy>;
+  IteratorCache iteratorCache;
+
+  static inline ObjectRealm& get(const JSObject* obj);
+
+  explicit ObjectRealm(JS::Zone* zone);
+
+  ObjectRealm(const ObjectRealm&) = delete;
+  void operator=(const ObjectRealm&) = delete;
+
+  void finishRoots();
+  void trace(JSTracer* trc);
+  void sweepAfterMinorGC(JSTracer* trc);
+
+  void addSizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf,
+                              size_t* innerViewsArg,
+                              size_t* objectMetadataTablesArg,
+                              size_t* nonSyntacticLexicalEnvironmentsArg);
+
+  NonSyntacticLexicalEnvironmentObject*
+  getOrCreateNonSyntacticLexicalEnvironment(
+      JSContext* cx, Handle<NonSyntacticVariablesObject*> enclosing);
+
+  NonSyntacticLexicalEnvironmentObject*
+  getOrCreateNonSyntacticLexicalEnvironment(
+      JSContext* cx, Handle<WithEnvironmentObject*> enclosing);
+
+  NonSyntacticLexicalEnvironmentObject*
+  getOrCreateNonSyntacticLexicalEnvironment(
+      JSContext* cx, Handle<WithEnvironmentObject*> enclosing,
+      Handle<NonSyntacticVariablesObject*> key);
+
+ private:
+  NonSyntacticLexicalEnvironmentObject*
+  getOrCreateNonSyntacticLexicalEnvironment(JSContext* cx,
+                                            HandleObject enclosing,
+                                            HandleObject key,
+                                            HandleObject thisv);
+
+ public:
+  NonSyntacticLexicalEnvironmentObject* getNonSyntacticLexicalEnvironment(
+      JSObject* key) const;
+};
+
+}  
+
+class JS::Realm : public JS::shadow::Realm {
+  JS::Zone* zone_;
+  JSRuntime* runtime_;
+
+  const JS::RealmCreationOptions creationOptions_;
+  JS::RealmBehaviors behaviors_;
+
+  friend struct ::JSContext;
+  js::WeakHeapPtr<js::GlobalObject*> global_;
+
+  js::ObjectRealm objects_;
+  friend js::ObjectRealm& js::ObjectRealm::get(const JSObject*);
+
+  JSObject* objectPendingMetadata_ = nullptr;
+#ifdef DEBUG
+  uint32_t numActiveAutoSetNewObjectMetadata_ = 0;
+#endif
+
+  mozilla::Maybe<mozilla::non_crypto::XorShift128PlusRNG>
+      randomNumberGenerator_;
+
+  mozilla::non_crypto::XorShift128PlusRNG randomKeyGenerator_;
+
+  JSPrincipals* principals_ = nullptr;
+
+  js::jit::BaselineCompileQueue baselineCompileQueue_;
+
+  js::UniquePtr<js::DebugEnvironments> debugEnvs_;
+
+  js::SavedStacks savedStacks_;
+
+  JS::RealmStats* realmStats_ = nullptr;
+
+  const js::AllocationMetadataBuilder* allocationMetadataBuilder_ = nullptr;
+  void* realmPrivate_ = nullptr;
+
+  js::LanguageId localeId_ = js::LanguageId::und();
+
+#if JS_HAS_INTL_API
+  js::UniquePtr<js::DateTimeInfo> dateTimeInfo_;
+#endif
+
+  unsigned enterRealmDepthIgnoringJit_ = 0;
+
+ public:
+  JS::JSTimers timers;
+
+  struct DebuggerVectorEntry {
+    js::WeakHeapPtr<js::Debugger*> dbg;
+
+    js::HeapPtr<JSObject*> debuggerLink;
+
+    DebuggerVectorEntry(js::Debugger* dbg_, JSObject* link);
+  };
+  using DebuggerVector =
+      js::Vector<DebuggerVectorEntry, 0, js::ZoneAllocPolicy>;
+
+ private:
+  DebuggerVector debuggers_;
+
+  enum {
+    IsDebuggee = 1 << 0,
+    DebuggerObservesAllExecution = 1 << 1,
+    DebuggerObservesCoverage = 1 << 2,
+    DebuggerObservesWasm = 1 << 3,
+    DebuggerObservesNativeCall = 1 << 4,
+  };
+  uint32_t debugModeBits_ = 0;
+  friend class js::AutoRestoreRealmDebugMode;
+
+  bool isSystem_ = false;
+  bool allocatedDuringIncrementalGC_;
+  bool initializingGlobal_ = true;
+
+  bool isTracingExecution_ = false;
+
+  js::UniquePtr<js::coverage::LCovRealm> lcovRealm_ = nullptr;
+
+ public:
+  js::wasm::Realm wasm;
+
+  js::DtoaCache dtoaCache;
+  js::NewProxyCache newProxyCache;
+  js::NewPlainObjectWithPropsCache newPlainObjectWithPropsCache;
+  js::PlainObjectAssignCache plainObjectAssignCache;
+
+  js::MainThreadData<mozilla::TimeStamp> lastAnimationTime;
+
+  uint32_t globalWriteBarriered = 0;
+
+  uint16_t numStacksCapturedForThrow_ = 0;
+
+  uint16_t numAllocSitesPretenured = 0;
+
+#ifdef DEBUG
+  bool firedOnNewGlobalObject = false;
+#endif
+
+  bool nukedIncomingWrappers = false;
+
+  bool isAsyncStackCapturingEnabled = false;
+
+  bool isUnlimitedStacksCapturingEnabled = false;
+
+ private:
+  void updateDebuggerObservesFlag(unsigned flag);
+  void restoreDebugModeBitsOnOOM(uint32_t bits);
+
+ public:
+  Realm(JS::Compartment* comp, const JS::RealmOptions& options);
+  ~Realm();
+
+  Realm(const Realm&) = delete;
+  void operator=(const Realm&) = delete;
+
+  void init(JSContext* cx, JSPrincipals* principals);
+  void destroy(JS::GCContext* gcx);
+
+  void addSizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf,
+                              size_t* realmObject, size_t* realmTables,
+                              size_t* innerViewsArg,
+                              size_t* objectMetadataTablesArg,
+                              size_t* savedStacksSet,
+                              size_t* nonSyntacticLexicalEnvironmentsArg);
+
+  JS::Zone* zone() { return zone_; }
+  const JS::Zone* zone() const { return zone_; }
+
+  JSRuntime* runtimeFromMainThread() const {
+    MOZ_ASSERT(js::CurrentThreadCanAccessRuntime(runtime_));
+    return runtime_;
+  }
+
+  JSRuntime* runtimeFromAnyThread() const { return runtime_; }
+
+  const JS::RealmCreationOptions& creationOptions() const {
+    return creationOptions_;
+  }
+
+  const JS::RealmBehaviors& behaviors() const { return behaviors_; }
+
+  void setNonLive() { behaviors_.setNonLive(); }
+  void setReduceTimerPrecisionCallerType(JS::RTPCallerTypeToken type) {
+    behaviors_.setReduceTimerPrecisionCallerType(type);
+  }
+
+  bool preserveJitCode() { return creationOptions_.preserveJitCode(); }
+
+  inline js::GlobalObject* maybeGlobal() const;
+
+  js::GlobalObject* unsafeUnbarrieredMaybeGlobal() const {
+    return global_.unbarrieredGet();
+  }
+
+  inline bool hasLiveGlobal() const;
+
+  inline bool hasInitializedGlobal() const;
+
+  inline void initGlobal(js::GlobalObject& global);
+  void clearInitializingGlobal() { initializingGlobal_ = false; }
+
+  void traceGlobalData(JSTracer* trc);
+
+  void traceGlobalRoot(JSTracer* trc, const char* name);
+
+  void traceWeakGlobalEdge(JSTracer* trc);
+
+  void traceRoots(JSTracer* trc,
+                  js::gc::GCRuntime::TraceOrMarkRuntime traceOrMark);
+  void finishRoots();
+
+  void sweepAfterMinorGC(JSTracer* trc);
+  void traceWeakDebugEnvironmentEdges(JSTracer* trc);
+
+  void clearScriptCounts();
+  void clearScriptLCov();
+
+  void purge();
+
+  void fixupAfterMovingGC(JSTracer* trc);
+
+  void enter() { enterRealmDepthIgnoringJit_++; }
+  void leave() {
+    MOZ_ASSERT(enterRealmDepthIgnoringJit_ > 0);
+    enterRealmDepthIgnoringJit_--;
+  }
+  bool hasBeenEnteredIgnoringJit() const {
+    return enterRealmDepthIgnoringJit_ > 0;
+  }
+  bool shouldTraceGlobal() const {
+    return hasBeenEnteredIgnoringJit();
+  }
+
+  bool hasAllocationMetadataBuilder() const {
+    return allocationMetadataBuilder_;
+  }
+  const js::AllocationMetadataBuilder* getAllocationMetadataBuilder() const {
+    return allocationMetadataBuilder_;
+  }
+  const void* addressOfMetadataBuilder() const {
+    return &allocationMetadataBuilder_;
+  }
+  bool isRecordingAllocations();
+  void setAllocationMetadataBuilder(
+      const js::AllocationMetadataBuilder* builder);
+  void forgetAllocationMetadataBuilder();
+  void setNewObjectMetadata(JSContext* cx, JS::HandleObject obj);
+
+  bool hasObjectPendingMetadata() const {
+    MOZ_ASSERT_IF(objectPendingMetadata_, hasAllocationMetadataBuilder());
+    return objectPendingMetadata_ != nullptr;
+  }
+  void setObjectPendingMetadata(JSObject* obj) {
+    MOZ_ASSERT(numActiveAutoSetNewObjectMetadata_ > 0,
+               "Must not use JSCLASS_DELAY_METADATA_BUILDER without "
+               "AutoSetNewObjectMetadata");
+    MOZ_ASSERT(!objectPendingMetadata_);
+    MOZ_ASSERT(obj);
+    if (MOZ_UNLIKELY(hasAllocationMetadataBuilder())) {
+      objectPendingMetadata_ = obj;
+    }
+  }
+  JSObject* getAndClearObjectPendingMetadata() {
+    MOZ_ASSERT(hasAllocationMetadataBuilder());
+    JSObject* obj = objectPendingMetadata_;
+    objectPendingMetadata_ = nullptr;
+    return obj;
+  }
+
+#ifdef DEBUG
+  bool hasActiveAutoSetNewObjectMetadata() const {
+    return numActiveAutoSetNewObjectMetadata_ > 0;
+  }
+  void incNumActiveAutoSetNewObjectMetadata() {
+    numActiveAutoSetNewObjectMetadata_++;
+  }
+  void decNumActiveAutoSetNewObjectMetadata() {
+    MOZ_ASSERT(numActiveAutoSetNewObjectMetadata_ > 0);
+    numActiveAutoSetNewObjectMetadata_--;
+  }
+#endif
+
+  void* realmPrivate() const { return realmPrivate_; }
+  void setRealmPrivate(void* p) { realmPrivate_ = p; }
+
+  JS::RealmStats& realmStats() {
+    MOZ_RELEASE_ASSERT(realmStats_);
+    return *realmStats_;
+  }
+  void nullRealmStats() {
+    MOZ_ASSERT(realmStats_);
+    realmStats_ = nullptr;
+  }
+  void setRealmStats(JS::RealmStats* newStats) {
+    MOZ_ASSERT(!realmStats_ && newStats);
+    realmStats_ = newStats;
+  }
+
+  inline bool marked() const;
+  void clearAllocatedDuringGC() { allocatedDuringIncrementalGC_ = false; }
+
+  JSPrincipals* principals() { return principals_; }
+  void setPrincipals(JSPrincipals* principals) { principals_ = principals; }
+
+  bool isSystem() const { return isSystem_; }
+
+  bool isDebuggee() const { return !!(debugModeBits_ & IsDebuggee); }
+
+  void setIsDebuggee();
+  void unsetIsDebuggee();
+
+  bool isTracingExecution() { return isTracingExecution_; }
+
+  void enableExecutionTracing() {
+    MOZ_ASSERT(!debuggerObservesCoverage());
+
+    isTracingExecution_ = true;
+    setIsDebuggee();
+    updateDebuggerObservesAllExecution();
+  }
+
+  void disableExecutionTracing() {
+    if (!isTracingExecution_) {
+      return;
+    }
+
+    isTracingExecution_ = false;
+    updateDebuggerObservesAllExecution();
+    if (!hasDebuggers()) {
+      unsetIsDebuggee();
+    }
+  }
+
+  DebuggerVector& getDebuggers(const JS::AutoRequireNoGC& nogc) {
+    return debuggers_;
+  };
+  bool hasDebuggers() const { return !debuggers_.empty(); }
+
+  bool debuggerObservesAllExecution() const {
+    static const unsigned Mask = IsDebuggee | DebuggerObservesAllExecution;
+    return (debugModeBits_ & Mask) == Mask;
+  }
+  void updateDebuggerObservesAllExecution() {
+    updateDebuggerObservesFlag(DebuggerObservesAllExecution);
+  }
+
+  bool debuggerObservesWasm() const {
+    static const unsigned Mask = IsDebuggee | DebuggerObservesWasm;
+    return (debugModeBits_ & Mask) == Mask;
+  }
+  void updateDebuggerObservesWasm() {
+    updateDebuggerObservesFlag(DebuggerObservesWasm);
+  }
+
+  bool debuggerObservesNativeCall() const {
+    static const unsigned Mask = IsDebuggee | DebuggerObservesNativeCall;
+    return (debugModeBits_ & Mask) == Mask;
+  }
+  void updateDebuggerObservesNativeCall() {
+    updateDebuggerObservesFlag(DebuggerObservesNativeCall);
+  }
+
+  bool debuggerObservesCoverage() const {
+    static const unsigned Mask = DebuggerObservesCoverage;
+    return (debugModeBits_ & Mask) == Mask;
+  }
+  void updateDebuggerObservesCoverage();
+
+  bool collectCoverageForDebug() const;
+
+  js::coverage::LCovRealm* lcovRealm();
+
+  bool shouldCaptureStackForThrow();
+
+  js::LanguageId getLocale();
+
+  void setLocaleOverride(const char* locale);
+
+  js::DateTimeInfo* getDateTimeInfo();
+
+  void setTimeZoneOverride(const char* timeZone);
+
+  mozilla::non_crypto::XorShift128PlusRNG& getOrCreateRandomNumberGenerator();
+
+  const mozilla::non_crypto::XorShift128PlusRNG*
+  addressOfRandomNumberGenerator() const {
+    return randomNumberGenerator_.ptr();
+  }
+
+  mozilla::HashCodeScrambler randomHashCodeScrambler();
+
+  js::jit::BaselineCompileQueue& baselineCompileQueue() {
+    return baselineCompileQueue_;
+  }
+  static constexpr size_t offsetOfBaselineCompileQueue() {
+    return offsetof(Realm, baselineCompileQueue_);
+  }
+  void removeFromCompileQueue(JSScript* script);
+
+  js::DebugEnvironments* debugEnvs() { return debugEnvs_.get(); }
+  js::UniquePtr<js::DebugEnvironments>& debugEnvsRef() { return debugEnvs_; }
+
+  js::SavedStacks& savedStacks() { return savedStacks_; }
+
+  void chooseAllocationSamplingProbability() {
+    savedStacks_.chooseSamplingProbability(this);
+  }
+
+  void traceWeakSavedStacks(JSTracer* trc);
+
+  static constexpr size_t offsetOfCompartment() {
+    return offsetof(JS::Realm, compartment_);
+  }
+  static constexpr size_t offsetOfAllocationMetadataBuilder() {
+    return offsetof(JS::Realm, allocationMetadataBuilder_);
+  }
+  static constexpr size_t offsetOfDebugModeBits() {
+    return offsetof(JS::Realm, debugModeBits_);
+  }
+  static constexpr uint32_t debugModeIsDebuggeeBit() { return IsDebuggee; }
+
+  static constexpr size_t offsetOfActiveGlobal() {
+    static_assert(sizeof(global_) == sizeof(uintptr_t),
+                  "JIT code assumes field is pointer-sized");
+    return offsetof(JS::Realm, global_);
+  }
+
+  js::RealmFuses realmFuses;
+
+  js::gc::AllocSite* localAllocSite = nullptr;
+
+  static size_t offsetOfLocalAllocSite() {
+    return offsetof(JS::Realm, localAllocSite);
+  }
+};
+
+inline js::Handle<js::GlobalObject*> JSContext::global() const {
+  MOZ_ASSERT(realm_, "Caller needs to enter a realm first");
+  return js::Handle<js::GlobalObject*>::fromMarkedLocation(
+      realm_->global_.unbarrieredAddress());
+}
+
+namespace js {
+
+class MOZ_RAII AssertRealmUnchanged {
+ public:
+  explicit AssertRealmUnchanged(JSContext* cx)
+      : cx(cx), oldRealm(cx->realm()) {}
+
+  ~AssertRealmUnchanged() { MOZ_ASSERT(cx->realm() == oldRealm); }
+
+ protected:
+  JSContext* const cx;
+  JS::Realm* const oldRealm;
+};
+
+class AutoRealm {
+  JSContext* const cx_;
+  JS::Realm* const origin_;
+
+ public:
+  template <typename T>
+  inline AutoRealm(JSContext* cx, const T& target);
+  inline ~AutoRealm();
+
+  AutoRealm(const AutoRealm&) = delete;
+  AutoRealm& operator=(const AutoRealm&) = delete;
+
+  JSContext* context() const { return cx_; }
+  JS::Realm* origin() const { return origin_; }
+
+ protected:
+  inline AutoRealm(JSContext* cx, JS::Realm* target);
+};
+
+class MOZ_RAII AutoAllocInAtomsZone {
+  JSContext* const cx_;
+  JS::Realm* const origin_;
+
+ public:
+  inline explicit AutoAllocInAtomsZone(JSContext* cx);
+  inline ~AutoAllocInAtomsZone();
+  AutoAllocInAtomsZone(const AutoAllocInAtomsZone&) = delete;
+  AutoAllocInAtomsZone& operator=(const AutoAllocInAtomsZone&) = delete;
+};
+
+class MOZ_RAII AutoMaybeLeaveAtomsZone {
+  JSContext* const cx_;
+  bool wasInAtomsZone_;
+
+ public:
+  inline explicit AutoMaybeLeaveAtomsZone(JSContext* cx);
+  inline ~AutoMaybeLeaveAtomsZone();
+  AutoMaybeLeaveAtomsZone(const AutoMaybeLeaveAtomsZone&) = delete;
+  AutoMaybeLeaveAtomsZone& operator=(const AutoMaybeLeaveAtomsZone&) = delete;
+};
+
+class AutoRealmUnchecked : protected AutoRealm {
+ public:
+  inline AutoRealmUnchecked(JSContext* cx, JS::Realm* target);
+};
+
+class AutoFunctionOrCurrentRealm {
+  mozilla::Maybe<AutoRealmUnchecked> ar_;
+
+ public:
+  inline AutoFunctionOrCurrentRealm(JSContext* cx, js::HandleObject fun);
+  ~AutoFunctionOrCurrentRealm() = default;
+
+  AutoFunctionOrCurrentRealm(const AutoFunctionOrCurrentRealm&) = delete;
+  AutoFunctionOrCurrentRealm& operator=(const AutoFunctionOrCurrentRealm&) =
+      delete;
+};
+
+class ErrorCopier {
+  mozilla::Maybe<AutoRealm>& ar;
+
+ public:
+  explicit ErrorCopier(mozilla::Maybe<AutoRealm>& ar) : ar(ar) {}
+  ~ErrorCopier();
+};
+
+class MOZ_RAII AutoSetNewObjectMetadata {
+  JSContext* cx_;
+
+  void setPendingMetadata();
+
+ public:
+  explicit inline AutoSetNewObjectMetadata(JSContext* cx) : cx_(cx) {
+#ifdef DEBUG
+    MOZ_ASSERT(!cx->realm()->hasObjectPendingMetadata());
+    cx_->realm()->incNumActiveAutoSetNewObjectMetadata();
+#endif
+  }
+  inline ~AutoSetNewObjectMetadata() {
+#ifdef DEBUG
+    cx_->realm()->decNumActiveAutoSetNewObjectMetadata();
+#endif
+    if (MOZ_UNLIKELY(cx_->realm()->hasAllocationMetadataBuilder())) {
+      setPendingMetadata();
+    }
+  }
+
+  AutoSetNewObjectMetadata(const AutoSetNewObjectMetadata& aOther) = delete;
+  void operator=(const AutoSetNewObjectMetadata& aOther) = delete;
+};
+
+} 
+
+#endif /* vm_Realm_h */

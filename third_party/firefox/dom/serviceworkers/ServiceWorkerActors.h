@@ -1,0 +1,34 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_serviceworkeractors_h_
+#define mozilla_dom_serviceworkeractors_h_
+
+namespace mozilla::dom {
+
+
+class IPCServiceWorkerDescriptor;
+class PServiceWorkerParent;
+
+void InitServiceWorkerParent(PServiceWorkerParent* aActor,
+                             const IPCServiceWorkerDescriptor& aDescriptor);
+
+
+class PServiceWorkerContainerParent;
+
+void InitServiceWorkerContainerParent(PServiceWorkerContainerParent* aActor);
+
+
+class IPCClientInfo;
+class IPCServiceWorkerRegistrationDescriptor;
+class PServiceWorkerRegistrationParent;
+
+void InitServiceWorkerRegistrationParent(
+    PServiceWorkerRegistrationParent* aActor,
+    const IPCServiceWorkerRegistrationDescriptor& aDescriptor,
+    const IPCClientInfo& aForClient);
+
+}  
+
+#endif  // mozilla_dom_serviceworkeractors_h_

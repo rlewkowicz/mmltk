@@ -1,0 +1,57 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_AutoClose_h
+#define mozilla_net_AutoClose_h
+
+#include "nsCOMPtr.h"
+#include "mozilla/Mutex.h"
+
+namespace mozilla {
+namespace net {
+
+template <typename T>
+class AutoClose {
+ public:
+  AutoClose() : mMutex("net::AutoClose.mMutex") {}
+  ~AutoClose() { CloseAndRelease(); }
+
+  explicit operator bool() {
+    MutexAutoLock lock(mMutex);
+    return mPtr;
+  }
+
+  already_AddRefed<T> forget() {
+    MutexAutoLock lock(mMutex);
+    return mPtr.forget();
+  }
+
+  void takeOver(nsCOMPtr<T>& rhs) { TakeOverInternal(rhs.forget()); }
+
+  void CloseAndRelease() { TakeOverInternal(nullptr); }
+
+ private:
+  void TakeOverInternal(already_AddRefed<T> aOther) {
+    nsCOMPtr<T> ptr(std::move(aOther));
+    {
+      MutexAutoLock lock(mMutex);
+      ptr.swap(mPtr);
+    }
+
+    if (ptr) {
+      ptr->Close();
+    }
+  }
+
+  void operator=(const AutoClose<T>&) = delete;
+  AutoClose(const AutoClose<T>&) = delete;
+
+  nsCOMPtr<T> mPtr MOZ_GUARDED_BY(mMutex);
+  Mutex mMutex;
+};
+
+}  
+}  
+
+#endif  // mozilla_net_AutoClose_h

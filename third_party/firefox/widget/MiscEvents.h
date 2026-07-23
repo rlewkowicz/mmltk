@@ -1,0 +1,137 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_MiscEvents_h_
+#define mozilla_MiscEvents_h_
+
+#include <stdint.h>
+
+#include "mozilla/BasicEvents.h"
+#include "mozilla/Maybe.h"
+#include "nsCOMPtr.h"
+#include "nsAtom.h"
+#include "nsGkAtoms.h"
+#include "nsITransferable.h"
+#include "nsString.h"
+
+namespace mozilla {
+
+namespace dom {
+class PBrowserParent;
+class PBrowserChild;
+}  
+
+
+class WidgetContentCommandEvent final : public WidgetGUIEvent {
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, ContentCommandEvent);
+
+  WidgetContentCommandEvent(bool aIsTrusted, EventMessage aMessage,
+                            nsIWidget* aWidget, bool aOnlyEnabledCheck = false)
+      : WidgetGUIEvent(aIsTrusted, aMessage, aWidget,
+                       eContentCommandEventClass),
+        mOnlyEnabledCheck(aOnlyEnabledCheck),
+        mSucceeded(false),
+        mIsEnabled(false) {}
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(WidgetContentCommandEvent,
+                                                    eContentCommandEventClass,
+                                                    eGUIEventClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    NS_ASSERTION(!IsAllowedToDispatchDOMEvent(),
+                 "WidgetQueryContentEvent needs to support Duplicate()");
+    MOZ_CRASH("WidgetQueryContentEvent doesn't support Duplicate()");
+    return nullptr;
+  }
+
+  mozilla::Maybe<nsString> mString;  
+
+  nsCOMPtr<nsITransferable> mTransferable;  
+
+  enum { eCmdScrollUnit_Line, eCmdScrollUnit_Page, eCmdScrollUnit_Whole };
+
+  struct ScrollInfo {
+    ScrollInfo()
+        : mAmount(0), mUnit(eCmdScrollUnit_Line), mIsHorizontal(false) {}
+
+    int32_t mAmount;     
+    uint8_t mUnit;       
+    bool mIsHorizontal;  
+  } mScroll;
+
+  struct Selection {
+    nsString mReplaceSrcString;  
+    uint32_t mOffset = 0;  
+    bool mPreventSetSelection = false;  
+  } mSelection;
+
+  bool mOnlyEnabledCheck;  
+
+  bool mSucceeded;  
+
+  bool mIsEnabled;  
+
+  void AssignContentCommandEventData(const WidgetContentCommandEvent& aEvent,
+                                     bool aCopyTargets) {
+    AssignGUIEventData(aEvent, aCopyTargets);
+
+    mString = aEvent.mString;
+    mScroll = aEvent.mScroll;
+    mSelection = aEvent.mSelection;
+    mOnlyEnabledCheck = aEvent.mOnlyEnabledCheck;
+    mSucceeded = aEvent.mSucceeded;
+    mIsEnabled = aEvent.mIsEnabled;
+  }
+};
+
+
+class WidgetCommandEvent final : public WidgetGUIEvent {
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, CommandEvent);
+
+ protected:
+  WidgetCommandEvent(bool aIsTrusted, nsAtom* aEventType, nsAtom* aCommand,
+                     nsIWidget* aWidget, const WidgetEventTime* aTime = nullptr)
+      : WidgetGUIEvent(aIsTrusted, eUnidentifiedEvent, aWidget,
+                       eCommandEventClass, aTime),
+        mCommand(aCommand) {
+    mSpecifiedEventType = aEventType;
+  }
+
+ public:
+  WidgetCommandEvent(bool aIsTrusted, nsAtom* aCommand, nsIWidget* aWidget,
+                     const WidgetEventTime* aTime = nullptr)
+      : WidgetCommandEvent(aIsTrusted, nsGkAtoms::onAppCommand, aCommand,
+                           aWidget, aTime) {}
+
+  WidgetCommandEvent()
+      : WidgetCommandEvent(false, nullptr, nullptr, nullptr, nullptr) {}
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(WidgetCommandEvent,
+                                                    eCommandEventClass,
+                                                    eGUIEventClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == eCommandEventClass,
+               "Duplicate() must be overridden by sub class");
+    WidgetCommandEvent* result = new WidgetCommandEvent(
+        false, mSpecifiedEventType, mCommand, nullptr, this);
+    result->AssignCommandEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  RefPtr<nsAtom> mCommand;
+
+  void AssignCommandEventData(const WidgetCommandEvent& aEvent,
+                              bool aCopyTargets) {
+    AssignGUIEventData(aEvent, aCopyTargets);
+
+  }
+};
+
+}  
+
+#endif  // mozilla_MiscEvents_h_

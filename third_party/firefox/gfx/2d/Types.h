@@ -1,0 +1,1222 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(MOZILLA_GFX_TYPES_H_)
+#define MOZILLA_GFX_TYPES_H_
+
+#include "mozilla/DefineEnum.h"  // for MOZ_DEFINE_ENUM_CLASS_WITH_BASE
+#include "mozilla/EnumeratedRange.h"
+#include "mozilla/MacroArgs.h"  // for MOZ_CONCAT
+#include "mozilla/Maybe.h"
+#include "mozilla/TypedEnumBits.h"
+
+#include <bit>
+#include <iosfwd>  // for ostream
+#include <stddef.h>
+#include <stdint.h>
+#include <optional>
+
+namespace mozilla {
+namespace gfx {
+
+typedef float Float;
+typedef double Double;
+
+enum class SurfaceType : int8_t {
+  DATA,                   
+  CAIRO,                  
+  CAIRO_IMAGE,            
+  COREGRAPHICS_IMAGE,     
+  COREGRAPHICS_CGCONTEXT, 
+  SKIA,                   
+  RECORDING,              
+  CANVAS_RECORDING,       
+  DATA_SHARED,            
+  DATA_RECYCLING_SHARED,  
+  OFFSET,                 
+  DATA_ALIGNED,           
+  DATA_SHARED_WRAPPER,    
+  BLOB_IMAGE,             
+  DATA_MAPPED,            
+  WEBGL,                  
+  D3D11_TEXTURE,          
+};
+
+enum class SurfaceFormat : int8_t {
+  B8G8R8A8,  
+  B8G8R8X8,  
+  R8G8B8A8,  
+  R8G8B8X8,  
+  A8R8G8B8,  
+  X8R8G8B8,  
+
+  R8G8B8,
+  B8G8R8,
+
+  R5G6B5_UINT16,  
+
+  A8,
+  A16,
+
+  R8G8,
+  R16G16,
+
+  YUV420,     
+  YUV420P10,  
+  YUV422P10,  
+  NV12,       
+  P016,       
+  P010,       
+  NV16,       
+  P210,       
+  YUY2,       
+  HSV,
+  Lab,
+  Depth,
+
+  R10G10B10A2_UINT32,  
+  R10G10B10X2_UINT32,  
+  R16G16B16A16F,
+
+  UNKNOWN,  
+
+  A8R8G8B8_UINT32 = std::endian::native == std::endian::little
+                        ? B8G8R8A8
+                        : A8R8G8B8,  
+  X8R8G8B8_UINT32 = std::endian::native == std::endian::little
+                        ? B8G8R8X8
+                        : X8R8G8B8,  
+
+  OS_RGBA = A8R8G8B8_UINT32,
+  OS_RGBX = X8R8G8B8_UINT32
+};
+
+enum class SubpixelOrder : uint8_t {
+  UNKNOWN,
+  RGB,
+  BGR,
+  VRGB,
+  VBGR,
+};
+
+struct SurfaceFormatInfo {
+  bool hasColor;
+  bool hasAlpha;
+  bool isYuv;
+  std::optional<uint8_t> bytesPerPixel;
+};
+inline std::optional<SurfaceFormatInfo> Info(const SurfaceFormat aFormat) {
+  auto info = SurfaceFormatInfo{};
+
+  switch (aFormat) {
+    case SurfaceFormat::B8G8R8A8:
+    case SurfaceFormat::R8G8B8A8:
+    case SurfaceFormat::A8R8G8B8:
+    case SurfaceFormat::R10G10B10A2_UINT32:
+    case SurfaceFormat::R16G16B16A16F:
+      info.hasColor = true;
+      info.hasAlpha = true;
+      break;
+
+    case SurfaceFormat::B8G8R8X8:
+    case SurfaceFormat::R8G8B8X8:
+    case SurfaceFormat::X8R8G8B8:
+    case SurfaceFormat::R8G8B8:
+    case SurfaceFormat::B8G8R8:
+    case SurfaceFormat::R5G6B5_UINT16:
+    case SurfaceFormat::R10G10B10X2_UINT32:
+    case SurfaceFormat::R8G8:
+    case SurfaceFormat::R16G16:
+    case SurfaceFormat::HSV:
+    case SurfaceFormat::Lab:
+      info.hasColor = true;
+      info.hasAlpha = false;
+      break;
+
+    case SurfaceFormat::A8:
+    case SurfaceFormat::A16:
+      info.hasColor = false;
+      info.hasAlpha = true;
+      break;
+
+    case SurfaceFormat::YUV420:
+    case SurfaceFormat::YUV420P10:
+    case SurfaceFormat::YUV422P10:
+    case SurfaceFormat::NV12:
+    case SurfaceFormat::P016:
+    case SurfaceFormat::P010:
+    case SurfaceFormat::NV16:
+    case SurfaceFormat::P210:
+    case SurfaceFormat::YUY2:
+      info.hasColor = true;
+      info.hasAlpha = false;
+      info.isYuv = true;
+      break;
+
+    case SurfaceFormat::Depth:
+      info.hasColor = false;
+      info.hasAlpha = false;
+      info.isYuv = false;
+      break;
+
+    case SurfaceFormat::UNKNOWN:
+      break;
+  }
+
+
+  switch (aFormat) {
+    case SurfaceFormat::B8G8R8A8:
+    case SurfaceFormat::R8G8B8A8:
+    case SurfaceFormat::A8R8G8B8:
+    case SurfaceFormat::B8G8R8X8:
+    case SurfaceFormat::R8G8B8X8:
+    case SurfaceFormat::X8R8G8B8:
+    case SurfaceFormat::R16G16:
+      info.bytesPerPixel = 4;
+      break;
+
+    case SurfaceFormat::R8G8B8:
+    case SurfaceFormat::B8G8R8:
+      info.bytesPerPixel = 3;
+      break;
+
+    case SurfaceFormat::R5G6B5_UINT16:
+    case SurfaceFormat::R8G8:
+    case SurfaceFormat::A16:
+    case SurfaceFormat::Depth:  
+      info.bytesPerPixel = 2;
+      break;
+
+    case SurfaceFormat::A8:
+      info.bytesPerPixel = 1;
+      break;
+
+    case SurfaceFormat::R10G10B10A2_UINT32:
+    case SurfaceFormat::R10G10B10X2_UINT32:
+      info.bytesPerPixel = 4;
+      break;
+
+    case SurfaceFormat::R16G16B16A16F:
+      info.bytesPerPixel = 8;
+      break;
+
+    case SurfaceFormat::HSV:
+    case SurfaceFormat::Lab:
+      info.bytesPerPixel = 3 * sizeof(float);
+      break;
+
+    case SurfaceFormat::YUV420:
+    case SurfaceFormat::YUV420P10:
+    case SurfaceFormat::YUV422P10:
+    case SurfaceFormat::NV12:
+    case SurfaceFormat::P016:
+    case SurfaceFormat::P010:
+    case SurfaceFormat::NV16:
+    case SurfaceFormat::P210:
+    case SurfaceFormat::YUY2:
+    case SurfaceFormat::UNKNOWN:
+      break;  
+  }
+
+
+  if (aFormat == SurfaceFormat::UNKNOWN) {
+    return {};
+  }
+  return info;
+}
+
+std::ostream& operator<<(std::ostream& aOut, const SurfaceFormat& aFormat);
+
+enum class SurfaceFormatBit : uint32_t {
+  R8G8B8A8_R = std::endian::native == std::endian::little ? 0 : 24,
+  R8G8B8A8_G = std::endian::native == std::endian::little ? 8 : 16,
+  R8G8B8A8_B = std::endian::native == std::endian::little ? 16 : 8,
+  R8G8B8A8_A = std::endian::native == std::endian::little ? 24 : 0,
+
+  A8R8G8B8_UINT32_B = 0,
+  A8R8G8B8_UINT32_G = 8,
+  A8R8G8B8_UINT32_R = 16,
+  A8R8G8B8_UINT32_A = 24,
+
+  OS_R = A8R8G8B8_UINT32_R,
+  OS_G = A8R8G8B8_UINT32_G,
+  OS_B = A8R8G8B8_UINT32_B,
+  OS_A = A8R8G8B8_UINT32_A,
+};
+
+inline uint32_t operator<<(uint8_t a, SurfaceFormatBit b) {
+  return a << static_cast<uint32_t>(b);
+}
+
+inline uint32_t operator>>(uint32_t a, SurfaceFormatBit b) {
+  return a >> static_cast<uint32_t>(b);
+}
+
+static inline int BytesPerPixel(SurfaceFormat aFormat) {
+  switch (aFormat) {
+    case SurfaceFormat::A8:
+      return 1;
+    case SurfaceFormat::R5G6B5_UINT16:
+    case SurfaceFormat::A16:
+      return 2;
+    case SurfaceFormat::R8G8B8:
+    case SurfaceFormat::B8G8R8:
+      return 3;
+    case SurfaceFormat::HSV:
+    case SurfaceFormat::Lab:
+      return 3 * sizeof(float);
+    case SurfaceFormat::Depth:
+      return sizeof(uint16_t);
+    case SurfaceFormat::B8G8R8A8:
+    case SurfaceFormat::B8G8R8X8:
+    case SurfaceFormat::R8G8B8A8:
+    case SurfaceFormat::R8G8B8X8:
+    case SurfaceFormat::A8R8G8B8:
+    case SurfaceFormat::X8R8G8B8:
+    case SurfaceFormat::R10G10B10A2_UINT32:
+    case SurfaceFormat::R10G10B10X2_UINT32:
+    case SurfaceFormat::R16G16:
+      return 4;
+    case SurfaceFormat::R16G16B16A16F:
+      return 8;
+    case SurfaceFormat::R8G8:
+      return 2;
+    case SurfaceFormat::YUV420:
+    case SurfaceFormat::YUV420P10:
+    case SurfaceFormat::YUV422P10:
+    case SurfaceFormat::NV12:
+    case SurfaceFormat::NV16:
+    case SurfaceFormat::YUY2:
+      return 0;
+    case SurfaceFormat::P016:
+    case SurfaceFormat::P010:
+    case SurfaceFormat::P210:
+      return 0;
+    case SurfaceFormat::UNKNOWN:
+      MOZ_ASSERT_UNREACHABLE("unhandled gfx::SurfaceFormat::UNKNOWN");
+      return 4;
+  }
+  MOZ_ASSERT_UNREACHABLE("unhandled enum value for gfx::SurfaceFormat");
+  return 4;
+}
+
+inline bool IsOpaque(SurfaceFormat aFormat) {
+  switch (aFormat) {
+    case SurfaceFormat::B8G8R8X8:
+    case SurfaceFormat::R8G8B8X8:
+    case SurfaceFormat::X8R8G8B8:
+    case SurfaceFormat::R5G6B5_UINT16:
+    case SurfaceFormat::R10G10B10X2_UINT32:
+    case SurfaceFormat::R8G8B8:
+    case SurfaceFormat::B8G8R8:
+    case SurfaceFormat::R8G8:
+    case SurfaceFormat::HSV:
+    case SurfaceFormat::Lab:
+    case SurfaceFormat::Depth:
+    case SurfaceFormat::YUV420:
+    case SurfaceFormat::NV12:
+    case SurfaceFormat::P010:
+    case SurfaceFormat::P016:
+    case SurfaceFormat::NV16:
+    case SurfaceFormat::P210:
+    case SurfaceFormat::YUY2:
+      return true;
+    case SurfaceFormat::B8G8R8A8:
+    case SurfaceFormat::R8G8B8A8:
+    case SurfaceFormat::A8R8G8B8:
+    case SurfaceFormat::R10G10B10A2_UINT32:
+    case SurfaceFormat::R16G16B16A16F:
+    case SurfaceFormat::A8:
+    case SurfaceFormat::A16:
+    case SurfaceFormat::R16G16:
+    case SurfaceFormat::YUV420P10:
+    case SurfaceFormat::YUV422P10:
+    case SurfaceFormat::UNKNOWN:
+      return false;
+  }
+  MOZ_ASSERT_UNREACHABLE("unhandled enum value for gfx::SurfaceFormat");
+  return false;
+}
+
+namespace CICP {
+enum ColourPrimaries : uint8_t {
+  CP_RESERVED_MIN = 0,  
+  CP_BT709 = 1,
+  CP_UNSPECIFIED = 2,
+  CP_BT470M = 4,
+  CP_BT470BG = 5,
+  CP_BT601 = 6,
+  CP_SMPTE240 = 7,
+  CP_GENERIC_FILM = 8,
+  CP_BT2020 = 9,
+  CP_XYZ = 10,
+  CP_SMPTE431 = 11,
+  CP_SMPTE432 = 12,
+  CP_EBU3213 = 22,
+};
+
+inline bool IsReserved(ColourPrimaries aIn) {
+  switch (aIn) {
+    case CP_BT709:
+    case CP_UNSPECIFIED:
+    case CP_BT470M:
+    case CP_BT470BG:
+    case CP_BT601:
+    case CP_SMPTE240:
+    case CP_GENERIC_FILM:
+    case CP_BT2020:
+    case CP_XYZ:
+    case CP_SMPTE431:
+    case CP_SMPTE432:
+    case CP_EBU3213:
+      return false;
+    default:
+      return true;
+  }
+}
+
+enum TransferCharacteristics : uint8_t {
+  TC_RESERVED_MIN = 0,  
+  TC_BT709 = 1,
+  TC_UNSPECIFIED = 2,
+  TC_BT470M = 4,
+  TC_BT470BG = 5,
+  TC_BT601 = 6,
+  TC_SMPTE240 = 7,
+  TC_LINEAR = 8,
+  TC_LOG_100 = 9,
+  TC_LOG_100_SQRT10 = 10,
+  TC_IEC61966 = 11,
+  TC_BT_1361 = 12,
+  TC_SRGB = 13,
+  TC_BT2020_10BIT = 14,
+  TC_BT2020_12BIT = 15,
+  TC_SMPTE2084 = 16,
+  TC_SMPTE428 = 17,
+  TC_HLG = 18,
+};
+
+inline bool IsReserved(TransferCharacteristics aIn) {
+  switch (aIn) {
+    case TC_BT709:
+    case TC_UNSPECIFIED:
+    case TC_BT470M:
+    case TC_BT470BG:
+    case TC_BT601:
+    case TC_SMPTE240:
+    case TC_LINEAR:
+    case TC_LOG_100:
+    case TC_LOG_100_SQRT10:
+    case TC_IEC61966:
+    case TC_BT_1361:
+    case TC_SRGB:
+    case TC_BT2020_10BIT:
+    case TC_BT2020_12BIT:
+    case TC_SMPTE2084:
+    case TC_SMPTE428:
+    case TC_HLG:
+      return false;
+    default:
+      return true;
+  }
+}
+
+enum MatrixCoefficients : uint8_t {
+  MC_IDENTITY = 0,
+  MC_BT709 = 1,
+  MC_UNSPECIFIED = 2,
+  MC_RESERVED_MIN = 3,  
+  MC_FCC = 4,
+  MC_BT470BG = 5,
+  MC_BT601 = 6,
+  MC_SMPTE240 = 7,
+  MC_YCGCO = 8,
+  MC_BT2020_NCL = 9,
+  MC_BT2020_CL = 10,
+  MC_SMPTE2085 = 11,
+  MC_CHROMAT_NCL = 12,
+  MC_CHROMAT_CL = 13,
+  MC_ICTCP = 14,
+};
+
+inline bool IsReserved(MatrixCoefficients aIn) {
+  switch (aIn) {
+    case MC_IDENTITY:
+    case MC_BT709:
+    case MC_UNSPECIFIED:
+    case MC_RESERVED_MIN:
+    case MC_FCC:
+    case MC_BT470BG:
+    case MC_BT601:
+    case MC_SMPTE240:
+    case MC_YCGCO:
+    case MC_BT2020_NCL:
+    case MC_BT2020_CL:
+    case MC_SMPTE2085:
+    case MC_CHROMAT_NCL:
+    case MC_CHROMAT_CL:
+    case MC_ICTCP:
+      return false;
+    default:
+      return true;
+  }
+}
+}  
+
+enum class YUVColorSpace : uint8_t {
+  BT601,
+  BT709,
+  BT2020,
+  Identity,  
+  Default = BT709,
+  _First = BT601,
+  _Last = Identity,
+};
+
+enum class ColorDepth : uint8_t {
+  COLOR_8,
+  COLOR_10,
+  COLOR_12,
+  COLOR_16,
+  _First = COLOR_8,
+  _Last = COLOR_16,
+};
+
+std::ostream& operator<<(std::ostream& aOut, const ColorDepth& aColorDepth);
+
+enum class TransferFunction : uint8_t {
+  BT709,
+  SRGB,
+  PQ,
+  HLG,
+  LINEAR,
+  _First = BT709,
+  _Last = LINEAR,
+  Default = BT709,
+};
+
+enum class ColorRange : uint8_t {
+  LIMITED,
+  FULL,
+  _First = LIMITED,
+  _Last = FULL,
+};
+
+struct Chromaticity {
+  float x = 0.0f;
+  float y = 0.0f;
+  bool operator==(const Chromaticity&) const = default;
+};
+
+struct Smpte2086Metadata {
+  Chromaticity displayPrimaryRed;
+  Chromaticity displayPrimaryGreen;
+  Chromaticity displayPrimaryBlue;
+  Chromaticity whitePoint;
+  float maxLuminance = 0.0f;  
+  float minLuminance = 0.0f;  
+  bool operator==(const Smpte2086Metadata&) const = default;
+};
+
+struct ContentLightLevel {
+  uint16_t maxContentLightLevel = 0;
+  uint16_t maxFrameAverageLightLevel = 0;
+  bool operator==(const ContentLightLevel&) const = default;
+};
+
+struct HDRMetadata {
+  Maybe<Smpte2086Metadata> mSmpte2086;
+  Maybe<ContentLightLevel> mContentLightLevel;
+  bool operator==(const HDRMetadata&) const = default;
+  bool IsValid() const {
+    return mSmpte2086.isSome() || mContentLightLevel.isSome();
+  }
+};
+
+enum class YUVRangedColorSpace : uint8_t {
+  BT601_Narrow = 0,
+  BT601_Full,
+  BT709_Narrow,
+  BT709_Full,
+  BT2020_Narrow,
+  BT2020_Full,
+  BT2100_HLG_Narrow,
+  BT2100_HLG_Full,
+  BT2100_PQ_Narrow,
+  BT2100_PQ_Full,
+  GbrIdentity,
+
+  _First = BT601_Narrow,
+  _Last = GbrIdentity,
+  Default = BT709_Narrow,
+};
+
+enum class ColorSpace2 : uint8_t {
+  Display,
+  UNKNOWN = Display,  
+  SRGB,
+  DISPLAY_P3,
+  BT601_525,
+  BT709,
+  BT601_625 = BT709,
+  BT2020,
+  _First = Display,
+  _Last = BT2020,
+};
+
+inline ColorSpace2 ToColorSpace2(const YUVColorSpace in) {
+  switch (in) {
+    case YUVColorSpace::BT601:
+      return ColorSpace2::BT601_525;
+    case YUVColorSpace::BT709:
+      return ColorSpace2::BT709;
+    case YUVColorSpace::BT2020:
+      return ColorSpace2::BT2020;
+    case YUVColorSpace::Identity:
+      return ColorSpace2::SRGB;
+  }
+  MOZ_ASSERT_UNREACHABLE();
+}
+
+inline YUVColorSpace ToYUVColorSpace(const ColorSpace2 in) {
+  switch (in) {
+    case ColorSpace2::BT601_525:
+      return YUVColorSpace::BT601;
+    case ColorSpace2::BT709:
+      return YUVColorSpace::BT709;
+    case ColorSpace2::BT2020:
+      return YUVColorSpace::BT2020;
+    case ColorSpace2::SRGB:
+      return YUVColorSpace::Identity;
+
+    case ColorSpace2::UNKNOWN:
+    case ColorSpace2::DISPLAY_P3:
+      MOZ_CRASH("Bad ColorSpace2 for ToYUVColorSpace");
+  }
+  MOZ_ASSERT_UNREACHABLE();
+}
+
+struct FromYUVRangedColorSpaceT final {
+  const YUVColorSpace space;
+  const ColorRange range;
+  const TransferFunction transferFunction;
+};
+
+inline FromYUVRangedColorSpaceT FromYUVRangedColorSpace(
+    const YUVRangedColorSpace s) {
+  switch (s) {
+    case YUVRangedColorSpace::BT601_Narrow:
+      return {YUVColorSpace::BT601, ColorRange::LIMITED,
+              TransferFunction::BT709};
+    case YUVRangedColorSpace::BT601_Full:
+      return {YUVColorSpace::BT601, ColorRange::FULL, TransferFunction::BT709};
+
+    case YUVRangedColorSpace::BT709_Narrow:
+      return {YUVColorSpace::BT709, ColorRange::LIMITED,
+              TransferFunction::BT709};
+    case YUVRangedColorSpace::BT709_Full:
+      return {YUVColorSpace::BT709, ColorRange::FULL, TransferFunction::BT709};
+
+    case YUVRangedColorSpace::BT2020_Narrow:
+      return {YUVColorSpace::BT2020, ColorRange::LIMITED,
+              TransferFunction::BT709};
+    case YUVRangedColorSpace::BT2020_Full:
+      return {YUVColorSpace::BT2020, ColorRange::FULL, TransferFunction::BT709};
+    case YUVRangedColorSpace::BT2100_HLG_Narrow:
+      return {YUVColorSpace::BT2020, ColorRange::LIMITED,
+              TransferFunction::HLG};
+    case YUVRangedColorSpace::BT2100_HLG_Full:
+      return {YUVColorSpace::BT2020, ColorRange::FULL, TransferFunction::HLG};
+    case YUVRangedColorSpace::BT2100_PQ_Narrow:
+      return {YUVColorSpace::BT2020, ColorRange::LIMITED, TransferFunction::PQ};
+    case YUVRangedColorSpace::BT2100_PQ_Full:
+      return {YUVColorSpace::BT2020, ColorRange::FULL, TransferFunction::PQ};
+
+    case YUVRangedColorSpace::GbrIdentity:
+      return {YUVColorSpace::Identity, ColorRange::FULL,
+              TransferFunction::BT709};
+  }
+  MOZ_CRASH("bad YUVRangedColorSpace");
+}
+
+inline YUVRangedColorSpace ToYUVRangedColorSpace(
+    const YUVColorSpace space, const ColorRange range,
+    const gfx::TransferFunction transferFunction) {
+  bool narrow;
+  switch (range) {
+    case ColorRange::FULL:
+      narrow = false;
+      break;
+    case ColorRange::LIMITED:
+      narrow = true;
+      break;
+  }
+
+  switch (space) {
+    case YUVColorSpace::Identity:
+      MOZ_ASSERT(range == ColorRange::FULL);
+      return YUVRangedColorSpace::GbrIdentity;
+
+    case YUVColorSpace::BT601:
+      return narrow ? YUVRangedColorSpace::BT601_Narrow
+                    : YUVRangedColorSpace::BT601_Full;
+
+    case YUVColorSpace::BT709:
+      return narrow ? YUVRangedColorSpace::BT709_Narrow
+                    : YUVRangedColorSpace::BT709_Full;
+
+    case YUVColorSpace::BT2020:
+      switch (transferFunction) {
+        case gfx::TransferFunction::PQ:
+          return narrow ? YUVRangedColorSpace::BT2100_PQ_Narrow
+                        : YUVRangedColorSpace::BT2100_PQ_Full;
+        case gfx::TransferFunction::HLG:
+          return narrow ? YUVRangedColorSpace::BT2100_HLG_Narrow
+                        : YUVRangedColorSpace::BT2100_HLG_Full;
+        case gfx::TransferFunction::SRGB:
+          return narrow ? YUVRangedColorSpace::BT2020_Narrow
+                        : YUVRangedColorSpace::BT2020_Full;
+        case gfx::TransferFunction::BT709:
+          return narrow ? YUVRangedColorSpace::BT2020_Narrow
+                        : YUVRangedColorSpace::BT2020_Full;
+        default:
+          MOZ_CRASH("bad TransferFunction for BT2020");
+      }
+  }
+  MOZ_CRASH("bad YUVColorSpace");
+}
+
+template <typename DescriptorT>
+inline YUVRangedColorSpace GetYUVRangedColorSpace(const DescriptorT& d) {
+  return ToYUVRangedColorSpace(d.yUVColorSpace(), d.colorRange(),
+                               d.transferFunction());
+}
+
+static inline SurfaceFormat SurfaceFormatForColorDepth(ColorDepth aColorDepth) {
+  SurfaceFormat format = SurfaceFormat::A8;
+  switch (aColorDepth) {
+    case ColorDepth::COLOR_8:
+      break;
+    case ColorDepth::COLOR_10:
+    case ColorDepth::COLOR_12:
+    case ColorDepth::COLOR_16:
+      format = SurfaceFormat::A16;
+      break;
+  }
+  return format;
+}
+
+static inline uint8_t BitDepthForColorDepth(ColorDepth aColorDepth) {
+  uint8_t depth = 8;
+  switch (aColorDepth) {
+    case ColorDepth::COLOR_8:
+      break;
+    case ColorDepth::COLOR_10:
+      depth = 10;
+      break;
+    case ColorDepth::COLOR_12:
+      depth = 12;
+      break;
+    case ColorDepth::COLOR_16:
+      depth = 16;
+      break;
+  }
+  return depth;
+}
+
+static inline ColorDepth ColorDepthForBitDepth(uint8_t aBitDepth) {
+  ColorDepth depth = ColorDepth::COLOR_8;
+  switch (aBitDepth) {
+    case 8:
+      break;
+    case 10:
+      depth = ColorDepth::COLOR_10;
+      break;
+    case 12:
+      depth = ColorDepth::COLOR_12;
+      break;
+    case 16:
+      depth = ColorDepth::COLOR_16;
+      break;
+  }
+  return depth;
+}
+
+static inline uint32_t RescalingFactorForColorDepth(ColorDepth aColorDepth) {
+  uint32_t factor = 1;
+  switch (aColorDepth) {
+    case ColorDepth::COLOR_8:
+      break;
+    case ColorDepth::COLOR_10:
+      break;
+    case ColorDepth::COLOR_12:
+      break;
+    case ColorDepth::COLOR_16:
+      break;
+  }
+  return factor;
+}
+
+static inline bool IsHDRTransferFunction(
+    gfx::TransferFunction aTransferFunction) {
+  switch (aTransferFunction) {
+    case gfx::TransferFunction::PQ:
+    case gfx::TransferFunction::HLG:
+    case gfx::TransferFunction::LINEAR:
+      return true;
+    case gfx::TransferFunction::BT709:
+    case gfx::TransferFunction::SRGB:
+      return false;
+  }
+  MOZ_CRASH("bad TransferFunction");
+}
+
+enum class ChromaSubsampling : uint8_t {
+  FULL,
+  HALF_WIDTH,
+  HALF_WIDTH_AND_HEIGHT,
+  _First = FULL,
+  _Last = HALF_WIDTH_AND_HEIGHT,
+};
+
+template <typename T>
+static inline T ChromaSize(const T& aYSize, ChromaSubsampling aSubsampling) {
+  switch (aSubsampling) {
+    case ChromaSubsampling::FULL:
+      return aYSize;
+    case ChromaSubsampling::HALF_WIDTH:
+      return T((aYSize.width + 1) / 2, aYSize.height);
+    case ChromaSubsampling::HALF_WIDTH_AND_HEIGHT:
+      return T((aYSize.width + 1) / 2, (aYSize.height + 1) / 2);
+  }
+  MOZ_CRASH("bad ChromaSubsampling");
+}
+
+enum class FilterType : int8_t {
+  BLEND = 0,
+  TRANSFORM,
+  MORPHOLOGY,
+  COLOR_MATRIX,
+  FLOOD,
+  TILE,
+  TABLE_TRANSFER,
+  DISCRETE_TRANSFER,
+  LINEAR_TRANSFER,
+  GAMMA_TRANSFER,
+  CONVOLVE_MATRIX,
+  DISPLACEMENT_MAP,
+  TURBULENCE,
+  ARITHMETIC_COMBINE,
+  COMPOSITE,
+  DIRECTIONAL_BLUR,
+  GAUSSIAN_BLUR,
+  POINT_DIFFUSE,
+  POINT_SPECULAR,
+  SPOT_DIFFUSE,
+  SPOT_SPECULAR,
+  DISTANT_DIFFUSE,
+  DISTANT_SPECULAR,
+  CROP,
+  PREMULTIPLY,
+  UNPREMULTIPLY,
+  OPACITY
+};
+
+enum class DrawTargetType : int8_t {
+  SOFTWARE_RASTER = 0,
+  HARDWARE_RASTER,
+  VECTOR
+};
+
+enum class BackendType : int8_t {
+  NONE = 0,
+  CAIRO,
+  SKIA,
+  RECORDING,
+  WEBRENDER_TEXT,
+  WEBGL,
+
+  BACKEND_LAST
+};
+
+enum class RecorderType : int8_t {
+  UNKNOWN,
+  PRIVATE,
+  MEMORY,
+  CANVAS,
+  PRFILEDESC,
+  WEBRENDER
+};
+
+enum class FontType : int8_t {
+  DWRITE,
+  GDI,
+  MAC,
+  FONTCONFIG,
+  FREETYPE,
+  UNKNOWN
+};
+
+enum class NativeSurfaceType : int8_t {
+  D3D10_TEXTURE,
+  CAIRO_CONTEXT,
+  CGCONTEXT,
+  CGCONTEXT_ACCELERATED,
+  OPENGL_TEXTURE,
+  WEBGL_CONTEXT
+};
+
+enum class FontStyle : int8_t { NORMAL, ITALIC, BOLD, BOLD_ITALIC };
+
+enum class FontHinting : int8_t { NONE, LIGHT, NORMAL, FULL };
+
+enum class CompositionOp : int8_t {
+  OP_CLEAR,
+  OP_OVER,
+  OP_ADD,
+  OP_ATOP,
+  OP_OUT,
+  OP_IN,
+  OP_SOURCE,
+  OP_DEST_IN,
+  OP_DEST_OUT,
+  OP_DEST_OVER,
+  OP_DEST_ATOP,
+  OP_XOR,
+  OP_MULTIPLY,
+  OP_SCREEN,
+  OP_OVERLAY,
+  OP_DARKEN,
+  OP_LIGHTEN,
+  OP_COLOR_DODGE,
+  OP_COLOR_BURN,
+  OP_HARD_LIGHT,
+  OP_SOFT_LIGHT,
+  OP_DIFFERENCE,
+  OP_EXCLUSION,
+  OP_HUE,
+  OP_SATURATION,
+  OP_COLOR,
+  OP_LUMINOSITY,
+  OP_COUNT
+};
+
+enum class Axis : int8_t { X_AXIS, Y_AXIS, BOTH };
+
+enum class ExtendMode : int8_t {
+  CLAMP,     
+  REPEAT,    
+  REPEAT_X,  
+  REPEAT_Y,  
+  REFLECT    
+};
+
+enum class FillRule : int8_t { FILL_WINDING, FILL_EVEN_ODD };
+
+enum class AntialiasMode : int8_t { NONE, GRAY, SUBPIXEL, DEFAULT };
+
+enum class SamplingFilter : int8_t {
+  GOOD,
+  LINEAR,
+  POINT,
+  SENTINEL  
+};
+
+std::ostream& operator<<(std::ostream& aOut, const SamplingFilter& aFilter);
+
+// clang-format off
+MOZ_DEFINE_ENUM_CLASS_WITH_BASE(PatternType, int8_t, (
+  COLOR,
+  SURFACE,
+  LINEAR_GRADIENT,
+  RADIAL_GRADIENT,
+  CONIC_GRADIENT
+));
+// clang-format on
+
+enum class JoinStyle : int8_t {
+  BEVEL,
+  ROUND,
+  MITER,  
+  MITER_OR_BEVEL  
+};
+
+enum class CapStyle : int8_t { BUTT, ROUND, SQUARE };
+
+enum class SamplingBounds : int8_t { UNBOUNDED, BOUNDED };
+
+enum class LuminanceType : int8_t {
+  LUMINANCE,
+  LINEARRGB,
+};
+
+struct sRGBColor {
+ public:
+  constexpr sRGBColor() : r(0.0f), g(0.0f), b(0.0f), a(0.0f) {}
+  constexpr sRGBColor(Float aR, Float aG, Float aB, Float aA)
+      : r(aR), g(aG), b(aB), a(aA) {}
+  constexpr sRGBColor(Float aR, Float aG, Float aB)
+      : r(aR), g(aG), b(aB), a(1.0f) {}
+
+  static constexpr sRGBColor White(float aA) {
+    return sRGBColor(1.f, 1.f, 1.f, aA);
+  }
+
+  static constexpr sRGBColor Black(float aA) {
+    return sRGBColor(0.f, 0.f, 0.f, aA);
+  }
+
+  static constexpr sRGBColor OpaqueWhite() { return White(1.f); }
+
+  static constexpr sRGBColor OpaqueBlack() { return Black(1.f); }
+
+  static constexpr sRGBColor FromU8(uint8_t aR, uint8_t aG, uint8_t aB,
+                                    uint8_t aA) {
+    return sRGBColor(float(aR) / 255.f, float(aG) / 255.f, float(aB) / 255.f,
+                     float(aA) / 255.f);
+  }
+
+  static constexpr sRGBColor FromABGR(uint32_t aColor) {
+    return sRGBColor(((aColor >> 0) & 0xff) * (1.0f / 255.0f),
+                     ((aColor >> 8) & 0xff) * (1.0f / 255.0f),
+                     ((aColor >> 16) & 0xff) * (1.0f / 255.0f),
+                     ((aColor >> 24) & 0xff) * (1.0f / 255.0f));
+  }
+
+  static constexpr sRGBColor UnusualFromARGB(uint32_t aColor) {
+    return sRGBColor(((aColor >> 16) & 0xff) * (1.0f / 255.0f),
+                     ((aColor >> 8) & 0xff) * (1.0f / 255.0f),
+                     ((aColor >> 0) & 0xff) * (1.0f / 255.0f),
+                     ((aColor >> 24) & 0xff) * (1.0f / 255.0f));
+  }
+
+  constexpr uint32_t ToABGR() const {
+    return uint32_t(r * 255.0f) | uint32_t(g * 255.0f) << 8 |
+           uint32_t(b * 255.0f) << 16 | uint32_t(a * 255.0f) << 24;
+  }
+
+  constexpr sRGBColor Premultiplied() const {
+    return sRGBColor(r * a, g * a, b * a, a);
+  }
+
+  constexpr sRGBColor Unpremultiplied() const {
+    return a > 0.f ? sRGBColor(r / a, g / a, b / a, a) : *this;
+  }
+
+  uint32_t UnusualToARGB() const {
+    return uint32_t(b * 255.0f) | uint32_t(g * 255.0f) << 8 |
+           uint32_t(r * 255.0f) << 16 | uint32_t(a * 255.0f) << 24;
+  }
+
+  bool operator==(const sRGBColor& aColor) const {
+    return r == aColor.r && g == aColor.g && b == aColor.b && a == aColor.a;
+  }
+
+  bool operator!=(const sRGBColor& aColor) const { return !(*this == aColor); }
+
+  Float r, g, b, a;
+};
+
+struct DeviceColor {
+ public:
+  constexpr DeviceColor() : r(0.0f), g(0.0f), b(0.0f), a(0.0f) {}
+  constexpr DeviceColor(Float aR, Float aG, Float aB, Float aA)
+      : r(aR), g(aG), b(aB), a(aA) {}
+  constexpr DeviceColor(Float aR, Float aG, Float aB)
+      : r(aR), g(aG), b(aB), a(1.0f) {}
+
+  static DeviceColor Mask(float aC, float aA) {
+    return DeviceColor(aC, aC, aC, aA);
+  }
+
+  static DeviceColor MaskWhite(float aA) { return Mask(1.f, aA); }
+
+  static DeviceColor MaskBlack(float aA) { return Mask(0.f, aA); }
+
+  static DeviceColor MaskOpaqueWhite() { return MaskWhite(1.f); }
+
+  static DeviceColor MaskOpaqueBlack() { return MaskBlack(1.f); }
+
+  static DeviceColor FromU8(uint8_t aR, uint8_t aG, uint8_t aB, uint8_t aA) {
+    return DeviceColor(float(aR) / 255.f, float(aG) / 255.f, float(aB) / 255.f,
+                       float(aA) / 255.f);
+  }
+
+  static DeviceColor FromABGR(uint32_t aColor) {
+    DeviceColor newColor(((aColor >> 0) & 0xff) * (1.0f / 255.0f),
+                         ((aColor >> 8) & 0xff) * (1.0f / 255.0f),
+                         ((aColor >> 16) & 0xff) * (1.0f / 255.0f),
+                         ((aColor >> 24) & 0xff) * (1.0f / 255.0f));
+
+    return newColor;
+  }
+
+  static DeviceColor UnusualFromARGB(uint32_t aColor) {
+    DeviceColor newColor(((aColor >> 16) & 0xff) * (1.0f / 255.0f),
+                         ((aColor >> 8) & 0xff) * (1.0f / 255.0f),
+                         ((aColor >> 0) & 0xff) * (1.0f / 255.0f),
+                         ((aColor >> 24) & 0xff) * (1.0f / 255.0f));
+
+    return newColor;
+  }
+
+  uint32_t ToABGR() const {
+    return uint32_t(r * 255.0f) | uint32_t(g * 255.0f) << 8 |
+           uint32_t(b * 255.0f) << 16 | uint32_t(a * 255.0f) << 24;
+  }
+
+  uint32_t UnusualToARGB() const {
+    return uint32_t(b * 255.0f) | uint32_t(g * 255.0f) << 8 |
+           uint32_t(r * 255.0f) << 16 | uint32_t(a * 255.0f) << 24;
+  }
+
+  bool operator==(const DeviceColor& aColor) const {
+    return r == aColor.r && g == aColor.g && b == aColor.b && a == aColor.a;
+  }
+
+  bool operator!=(const DeviceColor& aColor) const {
+    return !(*this == aColor);
+  }
+
+  friend std::ostream& operator<<(std::ostream& aOut,
+                                  const DeviceColor& aColor);
+
+  Float r, g, b, a;
+};
+
+struct GradientStop {
+  bool operator<(const GradientStop& aOther) const {
+    return offset < aOther.offset;
+  }
+
+  Float offset;
+  DeviceColor color;
+};
+
+enum class JobStatus { Complete, Wait, Yield, Error };
+
+enum class DeviceResetReason {
+  OK = 0,        
+  HUNG,          
+  REMOVED,       
+  RESET,         
+  DRIVER_ERROR,  
+  INVALID_CALL,  
+  OUT_OF_MEMORY,
+  FORCED_RESET,  
+  OTHER,         
+  NVIDIA_VIDEO,  
+  UNKNOWN,       
+  _First = OK,
+  _Last = UNKNOWN,
+};
+
+enum class DeviceResetDetectPlace {
+  WR_BEGIN_FRAME = 0,
+  WR_WAIT_FOR_GPU,
+  WR_POST_UPDATE,
+  WR_SYNC_OBJRCT,
+  WR_SIMULATE,
+  WIDGET,
+  CANVAS_TRANSLATOR,
+  _First = WR_BEGIN_FRAME,
+  _Last = CANVAS_TRANSLATOR,
+};
+
+enum class ForcedDeviceResetReason {
+  OPENSHAREDHANDLE = 0,
+  COMPOSITOR_UPDATED,
+};
+
+}  
+}  
+
+typedef mozilla::gfx::SurfaceFormat gfxImageFormat;
+
+#  define GFX2D_API
+
+namespace mozilla {
+
+enum Side : uint8_t { eSideTop, eSideRight, eSideBottom, eSideLeft };
+
+std::ostream& operator<<(std::ostream&, const mozilla::Side&);
+
+constexpr auto AllPhysicalSides() {
+  return mozilla::MakeInclusiveEnumeratedRange(eSideTop, eSideLeft);
+}
+
+enum class SideBits {
+  eNone = 0,
+  eTop = 1 << eSideTop,
+  eRight = 1 << eSideRight,
+  eBottom = 1 << eSideBottom,
+  eLeft = 1 << eSideLeft,
+  eTopBottom = SideBits::eTop | SideBits::eBottom,
+  eLeftRight = SideBits::eLeft | SideBits::eRight,
+  eAll = SideBits::eTopBottom | SideBits::eLeftRight
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(SideBits)
+
+inline constexpr SideBits SideToSideBit(mozilla::Side aSide) {
+  return SideBits(1 << aSide);
+}
+
+enum Corner : uint8_t {
+  eCornerTopLeft = 0,
+  eCornerTopRight = 1,
+  eCornerBottomRight = 2,
+  eCornerBottomLeft = 3
+};
+
+constexpr int eCornerCount = 4;
+
+constexpr auto AllPhysicalCorners() {
+  return mozilla::MakeInclusiveEnumeratedRange(eCornerTopLeft,
+                                               eCornerBottomLeft);
+}
+
+enum HalfCorner : uint8_t {
+  eCornerTopLeftX = 0,
+  eCornerTopLeftY = 1,
+  eCornerTopRightX = 2,
+  eCornerTopRightY = 3,
+  eCornerBottomRightX = 4,
+  eCornerBottomRightY = 5,
+  eCornerBottomLeftX = 6,
+  eCornerBottomLeftY = 7
+};
+
+constexpr auto AllPhysicalHalfCorners() {
+  return mozilla::MakeInclusiveEnumeratedRange(eCornerTopLeftX,
+                                               eCornerBottomLeftY);
+}
+
+
+constexpr bool HalfCornerIsX(HalfCorner aHalfCorner) {
+  return !(aHalfCorner % 2);
+}
+
+constexpr Corner HalfToFullCorner(HalfCorner aHalfCorner) {
+  return Corner(aHalfCorner / 2);
+}
+
+constexpr HalfCorner FullToHalfCorner(Corner aCorner, bool aIsVertical) {
+  return HalfCorner(aCorner * 2 + aIsVertical);
+}
+
+constexpr bool SideIsVertical(mozilla::Side aSide) { return aSide % 2; }
+
+constexpr Corner SideToFullCorner(mozilla::Side aSide, bool aIsSecond) {
+  return Corner((aSide + aIsSecond) % 4);
+}
+
+constexpr HalfCorner SideToHalfCorner(mozilla::Side aSide, bool aIsSecond,
+                                      bool aIsParallel) {
+  return HalfCorner(((aSide + aIsSecond) * 2 + (aSide + !aIsParallel) % 2) % 8);
+}
+
+}  
+
+#endif

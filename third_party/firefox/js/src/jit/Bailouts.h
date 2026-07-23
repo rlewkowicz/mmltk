@@ -1,0 +1,151 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_Bailouts_h
+#define jit_Bailouts_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+
+#include <stddef.h>  // size_t
+#include <stdint.h>  // uint8_t, uint32_t
+
+#include "jstypes.h"
+
+#include "jit/IonTypes.h"  // js::jit::Bailout{Id,Kind}, js::jit::SnapshotOffset
+#include "jit/MachineState.h"  // js::jit::MachineState
+#include "js/TypeDecls.h"      // jsbytecode
+#include "vm/JSContext.h"      // JSContext
+
+namespace js {
+
+class AbstractFramePtr;
+
+namespace jit {
+
+
+class BailoutStack;
+class InvalidationBailoutStack;
+
+class IonScript;
+class InlineFrameIterator;
+class JitActivation;
+class JitActivationIterator;
+class JSJitFrameIter;
+struct ResumeFromException;
+
+
+class BailoutFrameInfo {
+  MachineState machine_;
+  uint8_t* framePointer_;
+  IonScript* topIonScript_;
+  uint32_t snapshotOffset_;
+  JitActivation* activation_;
+
+  void attachOnJitActivation(const JitActivationIterator& activations);
+
+ public:
+  BailoutFrameInfo(const JitActivationIterator& activations, BailoutStack* sp);
+  BailoutFrameInfo(const JitActivationIterator& activations,
+                   InvalidationBailoutStack* sp);
+  BailoutFrameInfo(const JitActivationIterator& activations,
+                   const JSJitFrameIter& frame);
+  ~BailoutFrameInfo();
+
+  uint8_t* fp() const { return framePointer_; }
+  SnapshotOffset snapshotOffset() const { return snapshotOffset_; }
+  const MachineState* machineState() const { return &machine_; }
+  IonScript* ionScript() const { return topIonScript_; }
+  JitActivation* activation() const { return activation_; }
+};
+
+[[nodiscard]] bool EnsureHasEnvironmentObjects(JSContext* cx,
+                                               AbstractFramePtr fp);
+
+struct BaselineBailoutInfo;
+
+[[nodiscard]] bool Bailout(BailoutStack* sp, BaselineBailoutInfo** info);
+
+[[nodiscard]] bool InvalidationBailout(InvalidationBailoutStack* sp,
+                                       BaselineBailoutInfo** info);
+
+class ExceptionBailoutInfo {
+  size_t frameNo_;
+  jsbytecode* resumePC_;
+  size_t numExprSlots_;
+  bool isFinally_ = false;
+  RootedValue finallyException_;
+  RootedValue finallyExceptionStack_;
+  bool forcedReturn_;
+
+ public:
+  ExceptionBailoutInfo(JSContext* cx, size_t frameNo, jsbytecode* resumePC,
+                       size_t numExprSlots)
+      : frameNo_(frameNo),
+        resumePC_(resumePC),
+        numExprSlots_(numExprSlots),
+        finallyException_(cx),
+        finallyExceptionStack_(cx),
+        forcedReturn_(cx->isPropagatingForcedReturn()) {}
+
+  explicit ExceptionBailoutInfo(JSContext* cx)
+      : frameNo_(0),
+        resumePC_(nullptr),
+        numExprSlots_(0),
+        finallyException_(cx),
+        finallyExceptionStack_(cx),
+        forcedReturn_(cx->isPropagatingForcedReturn()) {}
+
+  bool catchingException() const { return !!resumePC_; }
+  bool propagatingIonExceptionForDebugMode() const { return !resumePC_; }
+
+  size_t frameNo() const {
+    MOZ_ASSERT(catchingException());
+    return frameNo_;
+  }
+  jsbytecode* resumePC() const {
+    MOZ_ASSERT(catchingException());
+    return resumePC_;
+  }
+  size_t numExprSlots() const {
+    MOZ_ASSERT(catchingException());
+    return numExprSlots_;
+  }
+
+  bool isFinally() const { return isFinally_; }
+  void setFinallyException(const JS::Value& exception,
+                           const JS::Value& exceptionStack) {
+    MOZ_ASSERT(!isFinally());
+    isFinally_ = true;
+    finallyException_ = exception;
+    finallyExceptionStack_ = exceptionStack;
+  }
+  HandleValue finallyException() const {
+    MOZ_ASSERT(isFinally());
+    return finallyException_;
+  }
+  HandleValue finallyExceptionStack() const {
+    MOZ_ASSERT(isFinally());
+    return finallyExceptionStack_;
+  }
+
+  bool forcedReturn() const { return forcedReturn_; }
+};
+
+[[nodiscard]] bool ExceptionHandlerBailout(JSContext* cx,
+                                           const InlineFrameIterator& frame,
+                                           ResumeFromException* rfe,
+                                           const ExceptionBailoutInfo& excInfo);
+
+[[nodiscard]] bool FinishBailoutToBaseline(BaselineBailoutInfo* bailoutInfoArg);
+
+#ifdef DEBUG
+[[nodiscard]] bool AssertBailoutStackDepth(JSContext* cx, JSScript* script,
+                                           jsbytecode* pc, ResumeMode mode,
+                                           uint32_t exprStackSlots);
+#endif
+
+}  
+}  
+
+#endif /* jit_Bailouts_h */

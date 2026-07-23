@@ -1,0 +1,4530 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ScriptLoader.h"
+#include "ModuleLoader.h"
+#include "ReferrerInfo.h"
+#include "ScriptCompression.h"
+#include "ScriptLoadHandler.h"
+#include "SharedScriptCache.h"
+#include "js/ColumnNumber.h"  // JS::ColumnNumberOneOrigin
+#include "js/CompilationAndEvaluation.h"
+#include "js/CompileOptions.h"  // JS::CompileOptions, JS::OwningCompileOptions, JS::DecodeOptions, JS::OwningDecodeOptions, JS::DelazificationOption
+#include "js/ContextOptions.h"  // JS::ContextOptionsRef
+#include "js/MemoryFunctions.h"
+#include "js/Modules.h"
+#include "js/PropertyAndElement.h"  // JS_DefineProperty
+#include "js/Transcoding.h"  // JS::TranscodeRange, JS::TranscodeResult, JS::IsTranscodeFailureResult
+#include "js/Utility.h"
+#include "js/experimental/CompileScript.h"  // JS::FrontendContext, JS::NewFrontendContext, JS::DestroyFrontendContext, JS::SetNativeStackQuota, JS::ThreadStackQuotaForSize, JS::CompilationStorage, JS::CompileGlobalScriptToStencil, JS::CompileModuleScriptToStencil, JS::DecodeStencil, JS::PrepareForInstantiate
+#include "js/experimental/JSStencil.h"  // JS::Stencil, JS::InstantiationStorage, JS::StartCollectingDelazifications, JS::IsStencilCacheable
+#include "js/loader/LoadedScript.h"
+#include "js/loader/ModuleLoadRequest.h"
+#include "js/loader/ModuleLoaderBase.h"
+#include "js/loader/ScriptLoadRequest.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/ConsoleReportCollector.h"
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/EventQueue.h"
+#include "mozilla/LoadInfo.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Mutex.h"  // mozilla::Mutex
+#include "mozilla/ScopeExit.h"
+#include "mozilla/StaticPrefs_browser.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_javascript.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/TaskController.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/Utf8.h"  // mozilla::Utf8Unit
+#include "mozilla/dom/AutoEntryScript.h"
+#include "mozilla/dom/DocGroup.h"
+#include "mozilla/dom/DocumentInlines.h"  // Document::GetPresContext
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/FetchPriority.h"
+#include "mozilla/dom/SpeculationRules.h"
+#ifdef NIGHTLY_BUILD
+#  include "mozilla/dom/IntegrityPolicyWAICT.h"
+#endif
+#include "mozilla/dom/JSExecutionUtils.h"  // mozilla::dom::Compile, mozilla::dom::InstantiateStencil, mozilla::dom::EvaluationExceptionToNSResult
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/dom/RequestBinding.h"
+#include "mozilla/dom/SRILogHelper.h"
+#include "mozilla/dom/ScriptDecoding.h"  // mozilla::dom::ScriptDecoding
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/SpeculationRuleSet.h"
+#include "mozilla/dom/WindowContext.h"
+#include "mozilla/net/HttpBaseChannel.h"
+#include "nsAboutProtocolUtils.h"
+#include "nsCRT.h"
+#include "nsContentCreatorFunctions.h"
+#include "nsContentPolicyUtils.h"
+#include "nsContentSecurityManager.h"
+#include "nsContentSecurityUtils.h"
+#include "nsContentUtils.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsError.h"
+#include "nsGenericHTMLElement.h"
+#include "nsGkAtoms.h"
+#include "nsIAsyncOutputStream.h"
+#include "nsICacheInfoChannel.h"
+#include "nsIClassOfService.h"
+#include "nsIClassifiedChannel.h"
+#include "nsIContent.h"
+#include "nsIContentSecurityPolicy.h"
+#include "nsIDocShell.h"
+#include "nsIHttpChannel.h"
+#include "nsIHttpChannelInternal.h"
+#include "nsIPrincipal.h"
+#include "nsIScriptContext.h"
+#include "nsIScriptElement.h"
+#include "nsIScriptError.h"
+#include "nsIScriptGlobalObject.h"
+#include "nsISupportsPriority.h"
+#include "nsITimedChannel.h"
+#include "nsITimer.h"
+#include "nsJSPrincipals.h"
+#include "nsJSUtils.h"
+#include "nsNetUtil.h"
+#include "nsPresContext.h"  // nsPresContext
+#include "nsProxyRelease.h"
+#include "nsQueryObject.h"
+#include "nsThreadUtils.h"
+#include "nsUnicharUtils.h"
+#include "prsystem.h"
+#include "xpcpublic.h"
+
+using namespace JS::loader;
+
+namespace mozilla::dom {
+
+LazyLogModule ScriptLoader::gCspPRLog("CSP");
+LazyLogModule ScriptLoader::gScriptLoaderLog("ScriptLoader");
+
+#undef LOG
+#define LOG(args) \
+  MOZ_LOG(ScriptLoader::gScriptLoaderLog, mozilla::LogLevel::Debug, args)
+
+#define LOG_ENABLED() \
+  MOZ_LOG_TEST(ScriptLoader::gScriptLoaderLog, mozilla::LogLevel::Debug)
+
+static constexpr auto kNullMimeType = "javascript/null"_ns;
+
+
+NS_IMPL_ISUPPORTS(ShutdownAndMemoryPressureObserver, nsIObserver)
+
+void ShutdownAndMemoryPressureObserver::OnShutdown() {
+  if (mScriptLoader) {
+    mScriptLoader->Destroy();
+    MOZ_ASSERT(!mScriptLoader);
+  }
+}
+
+void ShutdownAndMemoryPressureObserver::OnMemoryPressure() {
+  if (mScriptLoader) {
+    mScriptLoader->OnMemoryPressure();
+  }
+}
+
+void ShutdownAndMemoryPressureObserver::Unregister() {
+  if (mScriptLoader) {
+    mScriptLoader = nullptr;
+    nsContentUtils::UnregisterShutdownObserver(this);
+
+    nsCOMPtr<nsIObserverService> obsService = services::GetObserverService();
+    if (obsService) {
+      obsService->RemoveObserver(this, "memory-pressure");
+    }
+  }
+}
+
+NS_IMETHODIMP
+ShutdownAndMemoryPressureObserver::Observe(nsISupports* aSubject,
+                                           const char* aTopic,
+                                           const char16_t* aData) {
+  if (strcmp(aTopic, "xpcom-shutdown") == 0) {
+    OnShutdown();
+    return NS_OK;
+  }
+
+  if (strcmp(aTopic, "memory-pressure") == 0) {
+    OnMemoryPressure();
+    return NS_OK;
+  }
+
+  return NS_OK;
+}
+
+
+inline void ImplCycleCollectionUnlink(ScriptLoader::PreloadInfo& aField) {
+  ImplCycleCollectionUnlink(aField.mRequest);
+}
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    ScriptLoader::PreloadInfo& aField, const char* aName, uint32_t aFlags = 0) {
+  ImplCycleCollectionTraverse(aCallback, aField.mRequest, aName, aFlags);
+}
+
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ScriptLoader)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(ScriptLoader)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(ScriptLoader)
+  if (tmp->mDocument) {
+    tmp->DropDocumentReference();
+  }
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(
+      mNonAsyncExternalScriptInsertedRequests, mLoadingAsyncRequests,
+      mLoadedAsyncRequests, mDeferRequests, mXSLTRequests,
+      mParserBlockingRequest, mOffThreadCompilingRequests,
+      mDiskCacheableDependencyModules, mDiskCacheQueue, mPreloads,
+      mPendingChildLoaders, mModuleLoader)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(ScriptLoader)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(
+      mNonAsyncExternalScriptInsertedRequests, mLoadingAsyncRequests,
+      mLoadedAsyncRequests, mDeferRequests, mXSLTRequests,
+      mParserBlockingRequest, mOffThreadCompilingRequests,
+      mDiskCacheableDependencyModules, mDiskCacheQueue, mPreloads,
+      mPendingChildLoaders, mModuleLoader)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN(ScriptLoader)
+  for (size_t i = 0; i < tmp->mDelazificationCollectingScripts.Length(); ++i) {
+    NS_IMPL_CYCLE_COLLECTION_TRACE_JS_MEMBER_CALLBACK(
+        mDelazificationCollectingScripts[i])
+  }
+  for (size_t i = 0; i < tmp->mDelazificationCollectingModules.Length(); ++i) {
+    NS_IMPL_CYCLE_COLLECTION_TRACE_JS_MEMBER_CALLBACK(
+        mDelazificationCollectingModules[i])
+  }
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(ScriptLoader)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(ScriptLoader)
+
+ScriptLoader::ScriptLoader(Document* aDocument)
+    : mDocument(aDocument), mReporter(new ConsoleReportCollector()) {
+  LOG(("ScriptLoader::ScriptLoader %p", this));
+
+  mSpeculativeOMTParsingEnabled = StaticPrefs::
+      dom_script_loader_external_scripts_speculative_omt_parse_enabled();
+
+  if (!LoaderPrincipal()->IsSystemPrincipal() &&
+      StaticPrefs::dom_script_loader_experimental_navigation_cache()) {
+    mCache = SharedScriptCache::Get();
+    RegisterToCache();
+    LOG(("ScriptLoader (%p): Using in-memory cache.", this));
+  }
+
+  mObserver = new ShutdownAndMemoryPressureObserver(this);
+  nsContentUtils::RegisterShutdownObserver(mObserver);
+
+  nsCOMPtr<nsIObserverService> obsService = services::GetObserverService();
+  if (obsService) {
+    obsService->AddObserver(mObserver, "memory-pressure", false);
+  }
+}
+
+ScriptLoader::~ScriptLoader() {
+  LOG(("ScriptLoader::~ScriptLoader %p", this));
+
+  if (!mDelazificationCollectingScripts.IsEmpty() ||
+      !mDelazificationCollectingModules.IsEmpty()) {
+    mDelazificationCollectingScripts.Clear();
+    mDelazificationCollectingModules.Clear();
+
+    mozilla::DropJSObjects(this);
+  }
+
+  mObservers.Clear();
+
+  if (mParserBlockingRequest) {
+    FireScriptAvailable(NS_ERROR_ABORT, mParserBlockingRequest);
+  }
+
+  for (ScriptLoadRequest* req = mXSLTRequests.getFirst(); req;
+       req = req->getNext()) {
+    FireScriptAvailable(NS_ERROR_ABORT, req);
+  }
+
+  for (ScriptLoadRequest* req = mDeferRequests.getFirst(); req;
+       req = req->getNext()) {
+    FireScriptAvailable(NS_ERROR_ABORT, req);
+  }
+
+  for (ScriptLoadRequest* req = mLoadingAsyncRequests.getFirst(); req;
+       req = req->getNext()) {
+    FireScriptAvailable(NS_ERROR_ABORT, req);
+  }
+
+  for (ScriptLoadRequest* req = mLoadedAsyncRequests.getFirst(); req;
+       req = req->getNext()) {
+    FireScriptAvailable(NS_ERROR_ABORT, req);
+  }
+
+  for (ScriptLoadRequest* req =
+           mNonAsyncExternalScriptInsertedRequests.getFirst();
+       req; req = req->getNext()) {
+    FireScriptAvailable(NS_ERROR_ABORT, req);
+  }
+
+  for (uint32_t j = 0; j < mPendingChildLoaders.Length(); ++j) {
+    mPendingChildLoaders[j]->RemoveParserBlockingScriptExecutionBlocker();
+  }
+
+  if (mObserver) {
+    mObserver->Unregister();
+    mObserver = nullptr;
+  }
+
+  mModuleLoader = nullptr;
+
+  if (mProcessPendingRequestsAsyncBypassParserBlocking) {
+    mProcessPendingRequestsAsyncBypassParserBlocking->Cancel();
+  }
+}
+
+void ScriptLoader::SetGlobalObject(nsIGlobalObject* aGlobalObject) {
+  if (!aGlobalObject) {
+    CancelAndClearScriptLoadRequests();
+    return;
+  }
+
+  MOZ_ASSERT(!HasPendingRequests());
+
+  if (!mModuleLoader) {
+    mModuleLoader = new ModuleLoader(this, aGlobalObject);
+  }
+
+  MOZ_ASSERT(mModuleLoader->GetGlobalObject() == aGlobalObject);
+  MOZ_ASSERT(aGlobalObject->GetModuleLoader(dom::danger::GetJSContext()) ==
+             mModuleLoader);
+}
+
+void ScriptLoader::DropDocumentReference() {
+  if (mDocument && mCache) {
+    DeregisterFromCache();
+  }
+
+  mDocument = nullptr;
+}
+
+void ScriptLoader::RegisterToCache() {
+  if (mCache) {
+    MOZ_ASSERT(mDocument);
+    mCache->RegisterLoader(*this);
+  }
+}
+
+void ScriptLoader::DeregisterFromCache() {
+  if (mCache) {
+    MOZ_ASSERT(mDocument);
+    mCache->CancelLoadsForLoader(*this);
+    mCache->UnregisterLoader(*this);
+  }
+}
+
+nsIPrincipal* ScriptLoader::LoaderPrincipal() const {
+  return mDocument->NodePrincipal();
+}
+
+nsIPrincipal* ScriptLoader::PartitionedPrincipal() const {
+  return mDocument->PartitionedPrincipal();
+}
+
+bool ScriptLoader::ShouldBypassCache() const {
+  return mDocument && nsContentUtils::ShouldBypassSubResourceCache(mDocument);
+}
+
+#ifdef NIGHTLY_BUILD
+bool ScriptLoader::WAICTHandlesScripts() const {
+  if (!mDocument) {
+    return false;
+  }
+  auto* policy =
+      PolicyContainer::GetIntegrityPolicyWAICT(mDocument->GetPolicyContainer());
+  return policy &&
+         policy->ShouldHandle(IntegrityPolicy::DestinationType::Script);
+}
+#endif
+
+
+static bool IsScriptEventHandler(ScriptKind kind, nsIContent* aScriptElement) {
+  if (kind != ScriptKind::eClassic) {
+    return false;
+  }
+
+  if (!aScriptElement->IsHTMLElement()) {
+    return false;
+  }
+
+  nsAutoString forAttr, eventAttr;
+  if (!aScriptElement->AsElement()->GetAttr(nsGkAtoms::_for, forAttr) ||
+      !aScriptElement->AsElement()->GetAttr(nsGkAtoms::event, eventAttr)) {
+    return false;
+  }
+
+  const nsAString& for_str =
+      nsContentUtils::TrimWhitespace<nsContentUtils::IsHTMLWhitespace>(forAttr);
+  if (!for_str.LowerCaseEqualsLiteral("window")) {
+    return true;
+  }
+
+  const nsAString& event_str =
+      nsContentUtils::TrimWhitespace<nsContentUtils::IsHTMLWhitespace>(
+          eventAttr);
+  if (!event_str.LowerCaseEqualsLiteral("onload") &&
+      !event_str.LowerCaseEqualsLiteral("onload()")) {
+    return true;
+  }
+
+  return false;
+}
+
+nsContentPolicyType ScriptLoadRequestToContentPolicyType(
+    ScriptLoadRequest* aRequest) {
+  if (aRequest->GetScriptLoadContext()->IsPreload()) {
+    if (aRequest->IsModuleRequest()) {
+      switch (aRequest->AsModuleRequest()->mModuleType) {
+        case JS::ModuleType::JavaScript:
+          return nsIContentPolicy::TYPE_INTERNAL_MODULE_PRELOAD;
+        case JS::ModuleType::JSON:
+          return nsIContentPolicy::TYPE_INTERNAL_JSON_PRELOAD;
+        case JS::ModuleType::CSS:
+          return nsIContentPolicy::TYPE_INTERNAL_STYLESHEET_PRELOAD;
+        case JS::ModuleType::Text:
+          return nsIContentPolicy::TYPE_INTERNAL_TEXT_PRELOAD;
+        case JS::ModuleType::Bytes:
+        case JS::ModuleType::Unknown:
+          MOZ_ASSERT_UNREACHABLE("Unknown module type");
+      }
+    }
+
+    return nsIContentPolicy::TYPE_INTERNAL_SCRIPT_PRELOAD;
+  }
+
+  if (aRequest->IsModuleRequest()) {
+    switch (aRequest->AsModuleRequest()->mModuleType) {
+      case JS::ModuleType::Unknown:
+      case JS::ModuleType::Bytes:
+        MOZ_CRASH("Unexpected module type");
+      case JS::ModuleType::JavaScript:
+        return nsIContentPolicy::TYPE_INTERNAL_MODULE;
+      case JS::ModuleType::JSON:
+        return nsIContentPolicy::TYPE_JSON;
+      case JS::ModuleType::CSS:
+        return nsIContentPolicy::TYPE_STYLESHEET;
+      case JS::ModuleType::Text:
+        return nsIContentPolicy::TYPE_TEXT;
+    }
+  }
+
+  return nsIContentPolicy::TYPE_INTERNAL_SCRIPT;
+}
+
+RequestMode ComputeRequestModeForContentPolicy(
+    const ScriptLoadRequest* aRequest, ScriptFetchOptions* aFetchOptions) {
+  auto corsMapping =
+      aRequest->IsModuleRequest()
+          ? nsContentSecurityManager::REQUIRE_CORS_CHECKS
+          : nsContentSecurityManager::CORS_NONE_MAPS_TO_DISABLED_CORS_CHECKS;
+  return nsContentSecurityManager::SecurityModeToRequestMode(
+      nsContentSecurityManager::ComputeSecurityMode(
+          nsContentSecurityManager::ComputeSecurityFlags(
+              aFetchOptions->mCORSMode, corsMapping)));
+}
+
+nsresult ScriptLoader::CheckContentPolicy(nsIScriptElement* aElement,
+                                          const nsAString& aNonce,
+                                          ScriptLoadRequest* aRequest,
+                                          ScriptFetchOptions* aFetchOptions,
+                                          nsIURI* aURI) {
+  MOZ_ASSERT(aRequest);
+  MOZ_ASSERT(aFetchOptions);
+  MOZ_ASSERT(aURI);
+
+  nsContentPolicyType contentPolicyType =
+      ScriptLoadRequestToContentPolicyType(aRequest);
+
+  nsCOMPtr<nsINode> requestingNode;
+  if (aElement) {
+    requestingNode = do_QueryInterface(aElement);
+  }
+  nsCOMPtr<nsILoadInfo> secCheckLoadInfo = MOZ_TRY(net::LoadInfo::Create(
+      mDocument->NodePrincipal(),  
+      mDocument->NodePrincipal(),  
+      requestingNode, nsILoadInfo::SEC_ONLY_FOR_EXPLICIT_CONTENTSEC_CHECK,
+      contentPolicyType));
+  secCheckLoadInfo->SetParserCreatedScript(aElement &&
+                                           aElement->GetParserCreated() !=
+                                               mozilla::dom::NOT_FROM_PARSER);
+  Maybe<RequestMode> requestMode =
+      Some(ComputeRequestModeForContentPolicy(aRequest, aFetchOptions));
+  secCheckLoadInfo->SetRequestMode(requestMode);
+  secCheckLoadInfo->SetCspNonce(aNonce);
+  secCheckLoadInfo->SetIntegrityMetadata(
+      aRequest->mIntegrity.GetIntegrityString());
+
+  int16_t shouldLoad = nsIContentPolicy::ACCEPT;
+  nsresult rv = NS_CheckContentLoadPolicy(aURI, secCheckLoadInfo, &shouldLoad,
+                                          nsContentUtils::GetContentPolicy());
+  if (NS_FAILED(rv) || NS_CP_REJECTED(shouldLoad)) {
+    if (NS_FAILED(rv) || shouldLoad != nsIContentPolicy::REJECT_TYPE) {
+      return NS_ERROR_CONTENT_BLOCKED;
+    }
+    return NS_ERROR_CONTENT_BLOCKED_SHOW_ALT;
+  }
+
+  return NS_OK;
+}
+
+bool ScriptLoader::IsAboutPageLoadingChromeURI(ScriptLoadRequest* aRequest,
+                                               Document* aDocument) {
+  if (!aRequest->URI()->SchemeIs("chrome")) {
+    return false;
+  }
+
+  uint32_t aboutModuleFlags = 0;
+  nsresult rv = NS_OK;
+
+  nsCOMPtr<nsIPrincipal> triggeringPrincipal = aRequest->TriggeringPrincipal();
+  if (triggeringPrincipal->GetIsContentPrincipal()) {
+    if (!triggeringPrincipal->SchemeIs("about")) {
+      return false;
+    }
+    rv = triggeringPrincipal->GetAboutModuleFlags(&aboutModuleFlags);
+    NS_ENSURE_SUCCESS(rv, false);
+  } else if (triggeringPrincipal->GetIsNullPrincipal()) {
+    nsCOMPtr<nsIURI> docURI = aDocument->GetDocumentURI();
+    if (!docURI->SchemeIs("about")) {
+      return false;
+    }
+
+    nsCOMPtr<nsIAboutModule> aboutModule;
+    rv = NS_GetAboutModule(docURI, getter_AddRefs(aboutModule));
+    if (NS_FAILED(rv) || !aboutModule) {
+      return false;
+    }
+    rv = aboutModule->GetURIFlags(docURI, &aboutModuleFlags);
+    NS_ENSURE_SUCCESS(rv, false);
+  } else {
+    return false;
+  }
+
+  if (aboutModuleFlags & nsIAboutModule::MAKE_LINKABLE) {
+    return false;
+  }
+
+  return true;
+}
+
+nsIURI* ScriptLoader::GetBaseURI() const {
+  MOZ_ASSERT(mDocument);
+  return mDocument->GetDocBaseURI();
+}
+
+class ScriptRequestProcessor : public Runnable {
+ private:
+  RefPtr<ScriptLoader> mLoader;
+  RefPtr<ScriptLoadRequest> mRequest;
+
+ public:
+  ScriptRequestProcessor(ScriptLoader* aLoader, ScriptLoadRequest* aRequest)
+      : Runnable("dom::ScriptRequestProcessor"),
+        mLoader(aLoader),
+        mRequest(aRequest) {}
+  NS_IMETHOD Run() override { return mLoader->ProcessRequest(mRequest); }
+};
+
+void ScriptLoader::RunScriptWhenSafe(ScriptLoadRequest* aRequest) {
+  auto* runnable = new ScriptRequestProcessor(this, aRequest);
+  nsContentUtils::AddScriptRunner(runnable);
+}
+
+nsresult ScriptLoader::RestartLoad(ScriptLoadRequest* aRequest) {
+  aRequest->getLoadedScript()->DropSRIOrSRIAndSerializedStencil();
+
+  aRequest->GetScriptLoadContext()->NotifyRestart(mDocument);
+
+  aRequest->mFetchSourceOnly = true;
+  nsresult rv;
+  if (aRequest->IsModuleRequest()) {
+    rv = aRequest->AsModuleRequest()->RestartModuleLoad();
+  } else {
+    rv = StartLoad(aRequest, Nothing());
+  }
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  return NS_BINDING_RETARGETED;
+}
+
+nsresult ScriptLoader::StartLoad(
+    ScriptLoadRequest* aRequest,
+    const Maybe<nsAutoString>& aCharsetForPreload) {
+  if (aRequest->IsModuleRequest()) {
+    return aRequest->AsModuleRequest()->StartModuleLoad();
+  }
+
+  return StartClassicLoad(aRequest, aCharsetForPreload);
+}
+
+static nsSecurityFlags CORSModeToSecurityFlags(CORSMode aCORSMode) {
+  nsSecurityFlags securityFlags =
+      nsContentSecurityManager::ComputeSecurityFlags(
+          aCORSMode, nsContentSecurityManager::CORSSecurityMapping::
+                         CORS_NONE_MAPS_TO_DISABLED_CORS_CHECKS);
+
+  securityFlags |= nsILoadInfo::SEC_ALLOW_CHROME;
+
+  return securityFlags;
+}
+
+void ScriptLoader::OnDelayedReady(
+    ScriptLoadRequest* aRequest,
+    const Maybe<nsAutoString>& aCharsetForPreload) {
+  if (!mDocument) {
+    return;
+  }
+
+  if (aRequest->IsCanceled()) {
+    return;
+  }
+
+  MOZ_ASSERT(aRequest->IsRetrievedFromMemoryCache());
+  MOZ_ASSERT(aRequest->IsDelayingReady());
+
+  aRequest->SetReady();
+  MaybeMoveToLoadedList(aRequest);
+  ProcessPendingRequests();
+}
+
+nsresult ScriptLoader::StartClassicLoad(
+    ScriptLoadRequest* aRequest,
+    const Maybe<nsAutoString>& aCharsetForPreload) {
+  if (aRequest->IsRetrievedFromMemoryCache()) {
+    EmulateNetworkEvents(aRequest, aCharsetForPreload);
+
+    nsCOMPtr<nsIRunnable> runnable =
+        mozilla::NewRunnableMethod<RefPtr<ScriptLoadRequest>,
+                                   const Maybe<nsAutoString>>(
+            "ScriptLoader::OnDelayedReady", this, &ScriptLoader::OnDelayedReady,
+            aRequest, aCharsetForPreload);
+    mDocument->Dispatch(runnable.forget());
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(aRequest->IsFetching());
+  NS_ENSURE_TRUE(mDocument, NS_ERROR_NULL_POINTER);
+  aRequest->SetUnknownDataType();
+
+  if (mDocument->HasScriptsBlockedBySandbox()) {
+    return NS_OK;
+  }
+
+  if (LOG_ENABLED()) {
+    nsAutoCString url;
+    aRequest->URI()->GetAsciiSpec(url);
+    LOG(("ScriptLoadRequest (%p): Start Classic Load (url = %s)", aRequest,
+         url.get()));
+  }
+
+  nsSecurityFlags securityFlags = CORSModeToSecurityFlags(aRequest->CORSMode());
+
+  nsresult rv = StartLoadInternal(aRequest, securityFlags, aCharsetForPreload);
+
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+static nsresult CreateChannelForScriptLoading(
+    nsIChannel** aOutChannel, Document* aDocument, nsIURI* aURI,
+    nsINode* aContext, nsIPrincipal* aTriggeringPrincipal,
+    nsSecurityFlags aSecurityFlags, nsContentPolicyType aContentPolicyType) {
+  nsCOMPtr<nsILoadGroup> loadGroup = aDocument->GetDocumentLoadGroup();
+  nsCOMPtr<nsPIDOMWindowOuter> window = aDocument->GetWindow();
+  NS_ENSURE_TRUE(window, NS_ERROR_NULL_POINTER);
+  nsIDocShell* docshell = window->GetDocShell();
+  nsCOMPtr<nsIInterfaceRequestor> prompter(do_QueryInterface(docshell));
+
+  return NS_NewChannelWithTriggeringPrincipal(
+      aOutChannel, aURI, aContext, aTriggeringPrincipal, aSecurityFlags,
+      aContentPolicyType,
+       nullptr, loadGroup, prompter);
+}
+
+static nsresult CreateChannelForScriptLoading(nsIChannel** aOutChannel,
+                                              Document* aDocument,
+                                              ScriptLoadRequest* aRequest,
+                                              nsSecurityFlags aSecurityFlags) {
+  nsContentPolicyType contentPolicyType =
+      ScriptLoadRequestToContentPolicyType(aRequest);
+  nsCOMPtr<nsINode> context;
+  if (aRequest->GetScriptLoadContext()->HasScriptElement()) {
+    context = do_QueryInterface(
+        aRequest->GetScriptLoadContext()->GetScriptElementForLoadingNode());
+  } else {
+    context = aDocument;
+  }
+
+  return CreateChannelForScriptLoading(aOutChannel, aDocument, aRequest->URI(),
+                                       context, aRequest->TriggeringPrincipal(),
+                                       aSecurityFlags, contentPolicyType);
+}
+
+static void PrepareLoadInfoForScriptLoading(nsIChannel* aChannel,
+                                            const ScriptLoadRequest* aRequest) {
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  loadInfo->SetParserCreatedScript(aRequest->ParserMetadata() ==
+                                   ParserMetadata::ParserInserted);
+  loadInfo->SetCspNonce(aRequest->Nonce());
+  loadInfo->SetIntegrityMetadata(aRequest->mIntegrity.GetIntegrityString());
+}
+
+void ScriptLoader::PrepareCacheInfoChannel(nsIChannel* aChannel,
+                                           ScriptLoadRequest* aRequest) {
+  aRequest->getLoadedScript()->DropDiskCacheReference();
+  nsCOMPtr<nsICacheInfoChannel> cic(do_QueryInterface(aChannel));
+  if (cic && StaticPrefs::dom_script_loader_bytecode_cache_enabled()) {
+    if (!aRequest->mFetchSourceOnly) {
+      LOG(("ScriptLoadRequest (%p): Maybe request the disk cache", aRequest));
+      cic->PreferAlternativeDataType(
+          ScriptLoader::BytecodeMimeTypeFor(aRequest), ""_ns,
+          nsICacheInfoChannel::PreferredAlternativeDataDeliveryType::ASYNC);
+    } else {
+      LOG(("ScriptLoadRequest (%p): Request saving to the disk cache later",
+           aRequest));
+      cic->PreferAlternativeDataType(
+          kNullMimeType, ""_ns,
+          nsICacheInfoChannel::PreferredAlternativeDataDeliveryType::ASYNC);
+    }
+  }
+}
+
+static void AdjustPriorityAndClassOfServiceForLinkPreloadScripts(
+    nsIChannel* aChannel, ScriptLoadRequest* aRequest) {
+  MOZ_ASSERT(aRequest->GetScriptLoadContext()->IsLinkPreloadScript());
+
+  ScriptLoadContext::PrioritizeAsPreload(aChannel);
+
+  if (!StaticPrefs::network_fetchpriority_enabled()) {
+    return;
+  }
+
+  const auto fetchPriority = ToFetchPriority(aRequest->FetchPriority());
+  if (nsCOMPtr<nsISupportsPriority> supportsPriority =
+          do_QueryInterface(aChannel)) {
+    LOG(("Is <link rel=[module]preload"));
+
+    const int32_t supportsPriorityDelta =
+        FETCH_PRIORITY_ADJUSTMENT_FOR(link_preload_script, fetchPriority);
+    supportsPriority->AdjustPriority(supportsPriorityDelta);
+#ifdef DEBUG
+    int32_t adjustedPriority;
+    supportsPriority->GetPriority(&adjustedPriority);
+    LogPriorityMapping(ScriptLoader::gScriptLoaderLog, fetchPriority,
+                       adjustedPriority);
+#endif
+  }
+
+  if (nsCOMPtr<nsIClassOfService> cos = do_QueryInterface(aChannel)) {
+    cos->SetFetchPriorityDOM(fetchPriority);
+  }
+}
+
+void AdjustPriorityForNonLinkPreloadScripts(nsIChannel* aChannel,
+                                            ScriptLoadRequest* aRequest) {
+  MOZ_ASSERT(!aRequest->GetScriptLoadContext()->IsLinkPreloadScript());
+
+  if (!StaticPrefs::network_fetchpriority_enabled()) {
+    return;
+  }
+
+  const auto fetchPriority = ToFetchPriority(aRequest->FetchPriority());
+  if (nsCOMPtr<nsISupportsPriority> supportsPriority =
+          do_QueryInterface(aChannel)) {
+    LOG(("Is not <link rel=[module]preload"));
+
+    const int32_t supportsPriorityDelta = [&]() {
+      const ScriptLoadContext* scriptLoadContext =
+          aRequest->GetScriptLoadContext();
+      if (aRequest->IsModuleRequest()) {
+        return FETCH_PRIORITY_ADJUSTMENT_FOR(module_script, fetchPriority);
+      }
+
+      if (scriptLoadContext->IsAsyncScript() ||
+          scriptLoadContext->IsDeferredScript()) {
+        return FETCH_PRIORITY_ADJUSTMENT_FOR(async_or_defer_script,
+                                             fetchPriority);
+      }
+
+      if (scriptLoadContext->mScriptFromHead) {
+        return FETCH_PRIORITY_ADJUSTMENT_FOR(script_in_head, fetchPriority);
+      }
+
+      return FETCH_PRIORITY_ADJUSTMENT_FOR(other_script, fetchPriority);
+    }();
+
+    if (supportsPriorityDelta) {
+      supportsPriority->AdjustPriority(supportsPriorityDelta);
+#ifdef DEBUG
+      int32_t adjustedPriority;
+      supportsPriority->GetPriority(&adjustedPriority);
+      LogPriorityMapping(ScriptLoader::gScriptLoaderLog, fetchPriority,
+                         adjustedPriority);
+#endif
+    }
+  }
+  if (nsCOMPtr<nsIClassOfService> cos = do_QueryInterface(aChannel)) {
+    cos->SetFetchPriorityDOM(fetchPriority);
+  }
+}
+
+void ScriptLoader::PrepareRequestPriorityAndRequestDependencies(
+    nsIChannel* aChannel, ScriptLoadRequest* aRequest) {
+  if (aRequest->GetScriptLoadContext()->IsLinkPreloadScript()) {
+    AdjustPriorityAndClassOfServiceForLinkPreloadScripts(aChannel, aRequest);
+    ScriptLoadContext::AddLoadBackgroundFlag(aChannel);
+  } else if (nsCOMPtr<nsIClassOfService> cos = do_QueryInterface(aChannel)) {
+    AdjustPriorityForNonLinkPreloadScripts(aChannel, aRequest);
+
+    if (aRequest->GetScriptLoadContext()->mScriptFromHead &&
+        aRequest->GetScriptLoadContext()->IsBlockingScript()) {
+      cos->AddClassFlags(nsIClassOfService::Leader);
+    } else if (aRequest->GetScriptLoadContext()->IsDeferredScript() &&
+               !StaticPrefs::network_http_tailing_enabled()) {
+
+      cos->AddClassFlags(nsIClassOfService::TailForbidden);
+    } else {
+      cos->AddClassFlags(nsIClassOfService::Unblocked);
+
+      if (aRequest->GetScriptLoadContext()->IsAsyncScript()) {
+        cos->AddClassFlags(nsIClassOfService::TailAllowed);
+      }
+    }
+  }
+}
+
+inline nsLiteralString GetInitiatorType(ScriptLoadRequest* aRequest) {
+  if (aRequest->mEarlyHintPreloaderId) {
+    return u"early-hints"_ns;
+  }
+
+  if (aRequest->GetScriptLoadContext()->IsLinkPreloadScript()) {
+    return u"link"_ns;
+  }
+
+  return u"script"_ns;
+}
+
+nsresult ScriptLoader::PrepareHttpRequestAndInitiatorType(
+    nsIChannel* aChannel, ScriptLoadRequest* aRequest,
+    const Maybe<nsAutoString>& aCharsetForPreload) {
+  nsCOMPtr<nsIHttpChannel> httpChannel(do_QueryInterface(aChannel));
+  nsresult rv = NS_OK;
+
+  if (httpChannel) {
+
+    nsCOMPtr<nsIReferrerInfo> referrerInfo =
+        new ReferrerInfo(aRequest->mReferrer, aRequest->ReferrerPolicy());
+    rv = httpChannel->SetReferrerInfoWithoutClone(referrerInfo);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+    nsAutoString hintCharset;
+    if (!aRequest->GetScriptLoadContext()->IsPreload() &&
+        aRequest->GetScriptLoadContext()->HasScriptElement()) {
+      aRequest->GetScriptLoadContext()->GetHintCharset(hintCharset);
+    } else if (aCharsetForPreload.isSome()) {
+      hintCharset = aCharsetForPreload.ref();
+    }
+
+    rv = httpChannel->SetClassicScriptHintCharset(hintCharset);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  nsCOMPtr<nsITimedChannel> timedChannel(do_QueryInterface(httpChannel));
+  if (timedChannel) {
+    timedChannel->SetInitiatorType(GetInitiatorType(aRequest));
+  }
+
+  return rv;
+}
+
+nsresult ScriptLoader::PrepareIncrementalStreamLoader(
+    nsIIncrementalStreamLoader** aOutLoader, nsIChannel* aChannel,
+    ScriptLoadRequest* aRequest) {
+  UniquePtr<mozilla::dom::SRICheckDataVerifier> sriDataVerifier;
+  if (!aRequest->mIntegrity.IsEmpty()) {
+    sriDataVerifier = MakeUnique<SRICheckDataVerifier>(aRequest->mIntegrity,
+                                                       aChannel, mReporter);
+  }
+
+  RefPtr<ScriptLoadHandler> handler =
+      new ScriptLoadHandler(this, aRequest, std::move(sriDataVerifier));
+
+  aChannel->SetNotificationCallbacks(handler);
+
+  nsresult rv = NS_NewIncrementalStreamLoader(aOutLoader, handler);
+  NS_ENSURE_SUCCESS(rv, rv);
+  return rv;
+}
+
+nsresult ScriptLoader::StartLoadInternal(
+    ScriptLoadRequest* aRequest, nsSecurityFlags securityFlags,
+    const Maybe<nsAutoString>& aCharsetForPreload) {
+  nsCOMPtr<nsIChannel> channel;
+  nsresult rv = CreateChannelForScriptLoading(
+      getter_AddRefs(channel), mDocument, aRequest, securityFlags);
+
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (aRequest->mEarlyHintPreloaderId) {
+    nsCOMPtr<nsIHttpChannelInternal> channelInternal =
+        do_QueryInterface(channel);
+    NS_ENSURE_TRUE(channelInternal != nullptr, NS_ERROR_FAILURE);
+
+    rv = channelInternal->SetEarlyHintPreloaderId(
+        aRequest->mEarlyHintPreloaderId);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  PrepareLoadInfoForScriptLoading(channel, aRequest);
+
+  nsCOMPtr<nsIScriptGlobalObject> scriptGlobal = GetScriptGlobalObject();
+  if (!scriptGlobal) {
+    return NS_ERROR_FAILURE;
+  }
+
+#ifdef NIGHTLY_BUILD
+  if (WAICTHandlesScripts()) {
+    aRequest->mFetchSourceOnly = true;
+  }
+#endif
+
+  ScriptLoader::PrepareCacheInfoChannel(channel, aRequest);
+
+  LOG(("ScriptLoadRequest (%p): mode=%u", aRequest,
+       unsigned(aRequest->GetScriptLoadContext()->mScriptMode)));
+
+  PrepareRequestPriorityAndRequestDependencies(channel, aRequest);
+
+  rv =
+      PrepareHttpRequestAndInitiatorType(channel, aRequest, aCharsetForPreload);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIIncrementalStreamLoader> loader;
+  rv =
+      PrepareIncrementalStreamLoader(getter_AddRefs(loader), channel, aRequest);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  auto key = PreloadHashKey::CreateAsScript(
+      aRequest->URI(), aRequest->CORSMode(), aRequest->mKind);
+  aRequest->GetScriptLoadContext()->NotifyOpen(
+      key, channel, mDocument,
+      aRequest->GetScriptLoadContext()->IsLinkPreloadScript(),
+      aRequest->IsModuleRequest());
+
+  rv = channel->AsyncOpen(loader);
+
+  if (NS_FAILED(rv)) {
+    aRequest->GetScriptLoadContext()->NotifyStart(channel);
+    aRequest->GetScriptLoadContext()->NotifyStop(rv);
+    if (aRequest->GetScriptLoadContext()->IsPreload()) {
+      mDocument->Preloads().DeregisterPreload(key);
+    }
+  }
+
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+bool ScriptLoader::PreloadURIComparator::Equals(const PreloadInfo& aPi,
+                                                nsIURI* const& aURI) const {
+  bool same;
+  return NS_SUCCEEDED(aPi.mRequest->URI()->Equals(aURI, &same)) && same;
+}
+
+static bool CSPAllowsInlineScript(nsIScriptElement* aElement,
+                                  const nsAString& aSourceText,
+                                  const nsAString& aNonce,
+                                  Document* aDocument) {
+  nsCOMPtr<nsIContentSecurityPolicy> csp =
+      PolicyContainer::GetCSP(aDocument->GetPolicyContainer());
+  if (!csp) {
+    return true;
+  }
+
+  bool parserCreated =
+      aElement->GetParserCreated() != mozilla::dom::NOT_FROM_PARSER;
+  nsCOMPtr<Element> element = do_QueryInterface(aElement);
+
+  bool allowInlineScript = false;
+  nsresult rv = csp->GetAllowsInline(
+      nsIContentSecurityPolicy::SCRIPT_SRC_ELEM_DIRECTIVE,
+      false , aNonce, parserCreated, element,
+      nullptr , aSourceText,
+      aElement->GetScriptLineNumber(),
+      aElement->GetScriptColumnNumber().oneOriginValue(), &allowInlineScript);
+  return NS_SUCCEEDED(rv) && allowInlineScript;
+}
+
+namespace {
+RequestPriority FetchPriorityToRequestPriority(
+    const FetchPriority aFetchPriority) {
+  switch (aFetchPriority) {
+    case FetchPriority::High:
+      return RequestPriority::High;
+    case FetchPriority::Low:
+      return RequestPriority::Low;
+    case FetchPriority::Auto:
+      return RequestPriority::Auto;
+  }
+
+  MOZ_ASSERT_UNREACHABLE();
+  return RequestPriority::Auto;
+}
+}  
+
+void ScriptLoader::NotifyObserversForCachedScript(
+    ScriptLoadRequest* aRequest,
+    const Maybe<nsAutoString>& aCharsetForPreload) {
+  nsCOMPtr<nsIObserverService> obsService = services::GetObserverService();
+
+  if (!obsService->HasObservers("http-on-resource-cache-response")) {
+    return;
+  }
+
+  nsIScriptElement* element = aRequest->GetScriptLoadContext()->mScriptElement;
+
+  nsCOMPtr<nsINode> context;
+  if (element) {
+    context = do_QueryInterface(element);
+  } else {
+    context = mDocument;
+  }
+
+  nsCOMPtr<nsIChannel> channel;
+  nsresult rv = CreateChannelForScriptLoading(
+      getter_AddRefs(channel), mDocument, aRequest->URI(), context,
+      aRequest->FetchOptions()->mTriggeringPrincipal,
+      CORSModeToSecurityFlags(aRequest->FetchOptions()->mCORSMode),
+      nsIContentPolicy::TYPE_INTERNAL_SCRIPT);
+  if (NS_FAILED(rv)) {
+    return;
+  }
+
+  RefPtr<net::HttpBaseChannel> httpBaseChannel = do_QueryObject(channel);
+  if (httpBaseChannel) {
+    const net::nsHttpResponseHead* responseHead = nullptr;
+    if (aRequest->mNetworkMetadata) {
+      responseHead = aRequest->mNetworkMetadata->GetResponseHead();
+    }
+    httpBaseChannel->SetDummyChannelForCachedResource(responseHead);
+  }
+
+
+  PrepareLoadInfoForScriptLoading(channel, aRequest);
+
+  rv =
+      PrepareHttpRequestAndInitiatorType(channel, aRequest, aCharsetForPreload);
+  if (NS_FAILED(rv)) {
+    return;
+  }
+
+  ScriptHashKey key(this, aRequest, aRequest->ReferrerPolicy(),
+                    aRequest->FetchOptions(),
+                    aRequest->getLoadedScript()->GetURI());
+  nsAutoCString keyStr;
+  key.ToStringForLookup(keyStr);
+
+  obsService->NotifyObservers(channel, "http-on-resource-cache-response",
+                              NS_ConvertUTF8toUTF16(keyStr).get());
+}
+
+already_AddRefed<ScriptLoadRequest> ScriptLoader::CreateLoadRequest(
+    ScriptKind aKind, nsIURI* aURI, nsIScriptElement* aElement,
+    const nsAString& aScriptContent, nsIPrincipal* aTriggeringPrincipal,
+    CORSMode aCORSMode, const nsAString& aNonce,
+    RequestPriority aRequestPriority, const SRIMetadata& aIntegrity,
+    ReferrerPolicy aReferrerPolicy, ParserMetadata aParserMetadata,
+    ScriptLoadRequestType aRequestType) {
+  nsIURI* referrer = mDocument->GetDocumentURIAsReferrer();
+  RefPtr<ScriptFetchOptions> fetchOptions =
+      new ScriptFetchOptions(aCORSMode, aNonce, aRequestPriority,
+                             aParserMetadata, aTriggeringPrincipal);
+  RefPtr<ScriptLoadContext> context =
+      new ScriptLoadContext(aElement, aScriptContent);
+
+  if (aKind == ScriptKind::eModule) {
+    RefPtr<ModuleLoadRequest> request = mModuleLoader->CreateTopLevel(
+        aURI, aElement, aReferrerPolicy, fetchOptions, aIntegrity, referrer,
+        context, aRequestType);
+
+    return request.forget();
+  }
+
+  MOZ_ASSERT(aKind == ScriptKind::eClassic || aKind == ScriptKind::eImportMap ||
+             (StaticPrefs::dom_speculation_rules_enabled() &&
+              aKind == ScriptKind::eSpeculationRules));
+
+  RefPtr<ScriptLoadRequest> request =
+      new ScriptLoadRequest(aKind, aIntegrity, referrer, context);
+
+  TryUseCache(aReferrerPolicy, fetchOptions, aURI, request, aElement, aNonce,
+              aRequestType);
+
+  return request.forget();
+}
+
+void ScriptLoader::TryUseCache(ReferrerPolicy aReferrerPolicy,
+                               ScriptFetchOptions* aFetchOptions, nsIURI* aURI,
+                               ScriptLoadRequest* aRequest,
+                               nsIScriptElement* aElement,
+                               const nsAString& aNonce,
+                               ScriptLoadRequestType aRequestType) {
+  if (aRequestType == ScriptLoadRequestType::Inline) {
+    aRequest->NoCacheEntryFound(aReferrerPolicy, aFetchOptions, aURI);
+    LOG(
+        ("ScriptLoader (%p): Created LoadedScript (%p) for "
+         "ScriptLoadRequest(%p) because inline %s.",
+         this, aRequest->getLoadedScript(), aRequest,
+         aRequest->URI()->GetSpecOrDefault().get()));
+    return;
+  }
+
+  if (!mCache) {
+    aRequest->NoCacheEntryFound(aReferrerPolicy, aFetchOptions, aURI);
+    LOG(
+        ("ScriptLoader (%p): Created LoadedScript (%p) for "
+         "ScriptLoadRequest(%p) %s.",
+         this, aRequest->getLoadedScript(), aRequest,
+         aRequest->URI()->GetSpecOrDefault().get()));
+    return;
+  }
+
+  ScriptHashKey key(this, aRequest, aReferrerPolicy, aFetchOptions, aURI);
+  auto cacheResult = mCache->Lookup(*this, key,  true);
+  MOZ_ASSERT_IF(cacheResult.mState == CachedSubResourceState::Complete,
+                cacheResult.mCompleteValue->IsCachedStencil() ||
+                    cacheResult.mCompleteValue->IsInvalidatedCachedStencil());
+  if (cacheResult.mState != CachedSubResourceState::Complete ||
+      !cacheResult.mCompleteValue->IsCachedStencil()) {
+    aRequest->NoCacheEntryFound(aReferrerPolicy, aFetchOptions, aURI);
+    LOG(
+        ("ScriptLoader (%p): Created LoadedScript (%p) for "
+         "ScriptLoadRequest(%p) because cache is not found %s.",
+         this, aRequest->getLoadedScript(), aRequest,
+         aRequest->URI()->GetSpecOrDefault().get()));
+    return;
+  }
+
+  if (!cacheResult.mCompleteValue->IsSRIMetadataReusableBy(
+          aRequest->mIntegrity)) {
+    mCache->Evict(key);
+    aRequest->NoCacheEntryFound(aReferrerPolicy, aFetchOptions, aURI);
+    LOG(
+        ("ScriptLoader (%p): Created LoadedScript (%p) for "
+         "ScriptLoadRequest(%p) because of SRI metadata mismatch %s",
+         this, aRequest->getLoadedScript(), aRequest,
+         aRequest->URI()->GetSpecOrDefault().get()));
+    return;
+  }
+
+  if (cacheResult.mCompleteValue->IsDirty()) {
+    aRequest->SetHasDirtyCache();
+    aRequest->NoCacheEntryFound(aReferrerPolicy, aFetchOptions, aURI);
+    LOG(
+        ("ScriptLoader (%p): Created LoadedScript (%p) for "
+         "ScriptLoadRequest(%p) because of dirty flag %s.",
+         this, aRequest->getLoadedScript(), aRequest,
+         aRequest->URI()->GetSpecOrDefault().get()));
+    return;
+  }
+
+  if (aRequestType == ScriptLoadRequestType::External) {
+    if (NS_FAILED(CheckContentPolicy(aElement, aNonce, aRequest, aFetchOptions,
+                                     aURI))) {
+      aRequest->NoCacheEntryFound(aReferrerPolicy, aFetchOptions, aURI);
+      LOG(
+          ("ScriptLoader (%p): Created LoadedScript (%p) for "
+           "ScriptLoadRequest(%p) because content policy violation %s.",
+           this, aRequest->getLoadedScript(), aRequest,
+           aRequest->URI()->GetSpecOrDefault().get()));
+      return;
+    }
+  }
+
+  aRequest->mNetworkMetadata = cacheResult.mNetworkMetadata;
+
+  MOZ_ASSERT(cacheResult.mCompleteValue->CachedReferrerPolicy() ==
+             aReferrerPolicy);
+
+  if (!cacheResult.mCompleteValue->IsEverHitFromMemoryCache()) {
+    cacheResult.mCompleteValue->SetIsEverHitFromMemoryCache();
+  }
+  aRequest->CacheEntryFound(cacheResult.mCompleteValue, aFetchOptions);
+  MOZ_ASSERT_IF(!aRequest->IsModuleRequest(), aRequest->IsDelayingReady());
+  MOZ_ASSERT_IF(aRequest->IsModuleRequest(), aRequest->IsFetching());
+  LOG(
+      ("ScriptLoader (%p): Found in-memory cache LoadedScript (%p) for "
+       "ScriptLoadRequest(%p) %s.",
+       this, aRequest->getLoadedScript(), aRequest,
+       aRequest->URI()->GetSpecOrDefault().get()));
+
+  cacheResult.mCompleteValue->AddFetchCount();
+  return;
+}
+
+void ScriptLoader::EmulateNetworkEvents(
+    ScriptLoadRequest* aRequest,
+    const Maybe<nsAutoString>& aCharsetForPreload) {
+  MOZ_ASSERT(aRequest->IsRetrievedFromMemoryCache());
+  MOZ_ASSERT(aRequest->mNetworkMetadata);
+  MOZ_ASSERT(!aRequest->IsWasmBytes());
+
+  NotifyObserversForCachedScript(aRequest, aCharsetForPreload);
+
+  {
+    nsAutoCString name;
+    nsString entryName;
+    aRequest->URI()->GetSpec(name);
+    CopyUTF8toUTF16(name, entryName);
+
+    auto now = TimeStamp::Now();
+
+    SharedSubResourceCacheUtils::AddPerformanceEntryForCache(
+        entryName, GetInitiatorType(aRequest), aRequest->mNetworkMetadata, now,
+        now, mDocument);
+  }
+}
+
+bool ScriptLoader::ProcessScriptElement(nsIScriptElement* aElement,
+                                        const nsAString& aSourceText) {
+  NS_ENSURE_TRUE(mDocument, false);
+
+  if (!mEnabled || !mDocument->IsScriptEnabled()) {
+    return false;
+  }
+
+  NS_ASSERTION(!aElement->IsMalformed(), "Executing malformed script");
+
+  nsCOMPtr<nsIContent> scriptContent = do_QueryInterface(aElement);
+
+  ScriptKind scriptKind;
+  if (aElement->GetScriptIsModule()) {
+    scriptKind = ScriptKind::eModule;
+  } else if (aElement->GetScriptIsImportMap()) {
+    scriptKind = ScriptKind::eImportMap;
+  } else if (aElement->GetScriptIsSpeculationRules()) {
+    scriptKind = ScriptKind::eSpeculationRules;
+  } else {
+    scriptKind = ScriptKind::eClassic;
+  }
+
+  if (IsScriptEventHandler(scriptKind, scriptContent)) {
+    return false;
+  }
+
+  if (scriptKind == ScriptKind::eClassic && scriptContent->IsHTMLElement() &&
+      scriptContent->AsElement()->HasAttr(nsGkAtoms::nomodule)) {
+    return false;
+  }
+
+  if (aElement->GetScriptExternal()) {
+    return ProcessExternalScript(aElement, scriptKind, scriptContent);
+  }
+
+  return ProcessInlineScript(aElement, scriptKind, aSourceText);
+}
+
+static ParserMetadata GetParserMetadata(nsIScriptElement* aElement) {
+  return aElement->GetParserCreated() == mozilla::dom::NOT_FROM_PARSER
+             ? ParserMetadata::NotParserInserted
+             : ParserMetadata::ParserInserted;
+}
+
+bool ScriptLoader::ProcessExternalScript(nsIScriptElement* aElement,
+                                         ScriptKind aScriptKind,
+                                         nsIContent* aScriptContent) {
+  LOG(("ScriptLoader (%p): Process external script for element %p", this,
+       aElement));
+
+  if (aScriptKind == ScriptKind::eImportMap ||
+      aScriptKind == ScriptKind::eSpeculationRules) {
+    NS_DispatchToCurrentThread(
+        NewRunnableMethod("nsIScriptElement::FireErrorEvent", aElement,
+                          &nsIScriptElement::FireErrorEvent));
+    nsContentUtils::ReportToConsole(
+        nsIScriptError::warningFlag, "Script Loader"_ns, mDocument,
+        PropertiesFile::DOM_PROPERTIES,
+        aScriptKind == ScriptKind::eImportMap
+            ? "ImportMapExternalNotSupported"
+            : "SpeculationRulesExternalNotSupported");
+    return false;
+  }
+
+  nsCOMPtr<nsIURI> scriptURI = aElement->GetScriptURI();
+  if (!scriptURI) {
+    NS_DispatchToCurrentThread(
+        NewRunnableMethod("nsIScriptElement::FireErrorEvent", aElement,
+                          &nsIScriptElement::FireErrorEvent));
+    return false;
+  }
+
+  nsString nonce = nsContentSecurityUtils::GetIsElementNonceableNonce(
+      *aScriptContent->AsElement());
+  SRIMetadata sriMetadata;
+  {
+    nsAutoString integrity;
+    if (aScriptContent->AsElement()->GetAttr(nsGkAtoms::integrity, integrity)) {
+      GetSRIMetadata(integrity, &sriMetadata);
+    } else if (aScriptKind == ScriptKind::eModule) {
+      mModuleLoader->GetImportMapSRI(scriptURI,
+                                     mDocument->GetDocumentURIAsReferrer(),
+                                     mReporter, &sriMetadata);
+    }
+  }
+
+  RefPtr<ScriptLoadRequest> request =
+      LookupPreloadRequest(aElement, aScriptKind, sriMetadata);
+  if (request) {
+
+    if (NS_FAILED(CheckContentPolicy(aElement, nonce, request,
+                                     request->FetchOptions(),
+                                     request->URI()))) {
+      LOG(("ScriptLoader (%p): content policy check failed for preload", this));
+
+      request->Cancel();
+      return false;
+    }
+
+
+    LOG(("ScriptLoadRequest (%p): Using preload request", request.get()));
+
+    if (request->IsModuleRequest() &&
+        !StaticPrefs::dom_multiple_import_maps_enabled()) {
+      LOG(("ScriptLoadRequest (%p): Disallow further import maps.",
+           request.get()));
+      mModuleLoader->DisallowImportMaps();
+    }
+
+    request->GetScriptLoadContext()->SetScriptMode(
+        aElement->GetScriptDeferred(), aElement->GetScriptAsync(), false);
+
+    if (request->GetScriptLoadContext()->mInCompilingList) {
+      mOffThreadCompilingRequests.Remove(request);
+      request->GetScriptLoadContext()->mInCompilingList = false;
+    }
+  } else {
+
+    nsCOMPtr<nsIPrincipal> principal =
+        aElement->GetScriptURITriggeringPrincipal();
+    if (!principal) {
+      principal = aScriptContent->NodePrincipal();
+    }
+
+    CORSMode ourCORSMode = aElement->GetCORSMode();
+    const FetchPriority fetchPriority = aElement->GetFetchPriority();
+    ReferrerPolicy referrerPolicy = GetReferrerPolicy(aElement);
+    ParserMetadata parserMetadata = GetParserMetadata(aElement);
+
+    request = CreateLoadRequest(
+        aScriptKind, scriptURI, aElement, VoidString(), principal, ourCORSMode,
+        nonce, FetchPriorityToRequestPriority(fetchPriority), sriMetadata,
+        referrerPolicy, parserMetadata, ScriptLoadRequestType::External);
+
+
+    request->GetScriptLoadContext()->mIsInline = false;
+    request->GetScriptLoadContext()->SetScriptMode(
+        aElement->GetScriptDeferred(), aElement->GetScriptAsync(), false);
+
+    LOG(("ScriptLoadRequest (%p): Created request for external script",
+         request.get()));
+
+    nsresult rv = StartLoad(request, Nothing());
+    if (NS_FAILED(rv)) {
+      ReportErrorToConsole(request, rv);
+
+      bool block = !(request->GetScriptLoadContext()->IsAsyncScript() ||
+                     !aElement->GetParserCreated() ||
+                     request->GetScriptLoadContext()->IsDeferredScript());
+
+      nsCOMPtr<nsIRunnable> runnable;
+      if (block) {
+        mParserBlockingRequest = request;
+        runnable = NewRunnableMethod<RefPtr<ScriptLoadRequest>, nsresult>(
+            "ScriptLoader::HandleLoadErrorAndProcessPendingRequests", this,
+            &ScriptLoader::HandleLoadErrorAndProcessPendingRequests, request,
+            rv);
+      } else {
+        runnable =
+            NewRunnableMethod("nsIScriptElement::FireErrorEvent", aElement,
+                              &nsIScriptElement::FireErrorEvent);
+      }
+
+      if (mDocument) {
+        mDocument->Dispatch(runnable.forget());
+      } else {
+        NS_DispatchToCurrentThread(runnable.forget());
+      }
+      return block;
+    }
+
+    if (request->IsRetrievedFromMemoryCache()) {
+      if (request->GetScriptLoadContext()->IsAsyncScript() ||
+          parserMetadata == ParserMetadata::NotParserInserted) {
+        request->GetScriptLoadContext()->BlockOnload(mDocument);
+      }
+    }
+  }
+
+  NS_ASSERTION(SpeculativeOMTParsingEnabled() ||
+                   !request->GetScriptLoadContext()->CompileStarted() ||
+                   request->IsModuleRequest(),
+               "Request should not yet be in compiling stage.");
+
+  if (request->GetScriptLoadContext()->IsAsyncScript()) {
+    AddAsyncRequest(request);
+    if (request->IsFinished()) {
+
+      ProcessPendingRequestsAsync();
+    }
+    return false;
+  }
+  if (!aElement->GetParserCreated()) {
+    request->GetScriptLoadContext()->mIsNonAsyncScriptInserted = true;
+    mNonAsyncExternalScriptInsertedRequests.AppendElement(request);
+    if (request->IsFinished()) {
+      ProcessPendingRequestsAsync();
+    }
+    return false;
+  }
+  if (request->GetScriptLoadContext()->IsDeferredScript()) {
+    NS_ASSERTION(mDocument->GetCurrentContentSink() ||
+                     aElement->GetParserCreated() == FROM_PARSER_XSLT,
+                 "Non-XSLT Defer script on a document without an active "
+                 "parser; bug 592366.");
+    AddDeferRequest(request);
+    return false;
+  }
+
+  if (aElement->GetParserCreated() == FROM_PARSER_XSLT) {
+    NS_ASSERTION(!mParserBlockingRequest,
+                 "Parser-blocking scripts and XSLT scripts in the same doc!");
+    request->GetScriptLoadContext()->mIsXSLT = true;
+    mXSLTRequests.AppendElement(request);
+    if (request->IsFinished()) {
+      ProcessPendingRequestsAsync();
+    }
+    return true;
+  }
+
+  if (request->IsFinished() && ReadyToExecuteParserBlockingScripts()) {
+    if (aElement->GetParserCreated() == FROM_PARSER_NETWORK) {
+      return ProcessRequest(request) == NS_ERROR_HTMLPARSER_BLOCK;
+    }
+    NS_ASSERTION(!mParserBlockingRequest,
+                 "There can be only one parser-blocking script at a time");
+    NS_ASSERTION(mXSLTRequests.isEmpty(),
+                 "Parser-blocking scripts and XSLT scripts in the same doc!");
+    mParserBlockingRequest = request;
+    ProcessPendingRequestsAsync();
+    return true;
+  }
+
+  NS_ASSERTION(!mParserBlockingRequest,
+               "There can be only one parser-blocking script at a time");
+  NS_ASSERTION(mXSLTRequests.isEmpty(),
+               "Parser-blocking scripts and XSLT scripts in the same doc!");
+  mParserBlockingRequest = request;
+  return true;
+}
+
+bool ScriptLoader::ProcessInlineScript(nsIScriptElement* aElement,
+                                       ScriptKind aScriptKind,
+                                       const nsAString& aSourceText) {
+  if (mDocument->HasScriptsBlockedBySandbox()) {
+    return false;
+  }
+
+  nsCOMPtr<Element> element = do_QueryInterface(aElement);
+  nsString nonce = nsContentSecurityUtils::GetIsElementNonceableNonce(*element);
+
+  if (!CSPAllowsInlineScript(aElement, aSourceText, nonce, mDocument)) {
+    return false;
+  }
+
+  if (aScriptKind == ScriptKind::eImportMap) {
+    if (!mModuleLoader->IsImportMapAllowed()) {
+      NS_WARNING("ScriptLoader: import maps allowed is false.");
+      const char* msg = mModuleLoader->HasImportMapRegistered()
+                            ? "ImportMapNotAllowedMultiple"
+                            : "ImportMapNotAllowedAfterModuleLoad";
+      nsContentUtils::ReportToConsole(nsIScriptError::warningFlag,
+                                      "Script Loader"_ns, mDocument,
+                                      PropertiesFile::DOM_PROPERTIES, msg);
+      NS_DispatchToCurrentThread(
+          NewRunnableMethod("nsIScriptElement::FireErrorEvent", aElement,
+                            &nsIScriptElement::FireErrorEvent));
+      return false;
+    }
+  }
+
+  CORSMode corsMode = CORS_NONE;
+  if (aScriptKind == ScriptKind::eModule) {
+    corsMode = aElement->GetCORSMode();
+  }
+  const auto fetchPriority = aElement->GetFetchPriority();
+
+  ReferrerPolicy referrerPolicy = GetReferrerPolicy(aElement);
+  ParserMetadata parserMetadata = GetParserMetadata(aElement);
+
+  RefPtr<ScriptLoadRequest> request = CreateLoadRequest(
+      aScriptKind, mDocument->GetDocumentURI(), aElement, aSourceText,
+      mDocument->NodePrincipal(), corsMode, nonce,
+      FetchPriorityToRequestPriority(fetchPriority),
+      SRIMetadata(),  
+      referrerPolicy, parserMetadata, ScriptLoadRequestType::Inline);
+  request->GetScriptLoadContext()->mIsInline = true;
+  request->GetScriptLoadContext()->mLineNo = aElement->GetScriptLineNumber();
+  request->GetScriptLoadContext()->mColumnNo =
+      aElement->GetScriptColumnNumber();
+  request->mFetchSourceOnly = true;
+  request->SetTextSource(request->mLoadContext.get());
+  MOZ_ASSERT(!aElement->GetScriptDeferred());
+  MOZ_ASSERT_IF(!request->IsModuleRequest(), !aElement->GetScriptAsync());
+  request->GetScriptLoadContext()->SetScriptMode(
+      false, aElement->GetScriptAsync(), false);
+
+  LOG(("ScriptLoadRequest (%p): Created request for inline script",
+       request.get()));
+
+  request->SetBaseURL(mDocument->GetDocBaseURI());
+
+  const bool multiImportMapsEnabled =
+      StaticPrefs::dom_multiple_import_maps_enabled();
+  if (request->IsModuleRequest()) {
+    if (!multiImportMapsEnabled) {
+      mModuleLoader->DisallowImportMaps();
+    }
+
+    ModuleLoadRequest* modReq = request->AsModuleRequest();
+    if (aElement->GetParserCreated() != NOT_FROM_PARSER) {
+      if (aElement->GetScriptAsync()) {
+        AddAsyncRequest(modReq);
+      } else {
+        AddDeferRequest(modReq);
+      }
+    }
+
+    nsresult rv = modReq->OnFetchComplete(NS_OK);
+    if (NS_FAILED(rv)) {
+      ReportErrorToConsole(modReq, rv);
+      HandleLoadError(modReq, rv);
+    }
+
+    return false;
+  }
+
+  if (request->IsImportMapRequest()) {
+    if (!multiImportMapsEnabled) {
+      MOZ_ASSERT(mModuleLoader->IsImportMapAllowed());
+
+      mModuleLoader->DisallowImportMaps();
+    }
+
+    UniquePtr<ImportMap> importMap = mModuleLoader->ParseImportMap(request);
+    if (!importMap) {
+      return false;
+    }
+
+    mPreloads.RemoveElementsBy(
+        [this, multiImportMapsEnabled](const PreloadInfo& info) {
+          if (!info.mRequest->IsModuleRequest()) {
+            return false;
+          }
+
+          info.mRequest->Cancel();
+          if (multiImportMapsEnabled) {
+            mModuleLoader->ClearPreloadedModuleGraph(
+                info.mRequest->AsModuleRequest());
+          }
+
+          return true;
+        });
+
+    mModuleLoader->RegisterImportMap(std::move(importMap), request);
+    return false;
+  }
+
+  if (request->IsSpeculationRulesRequest()) {
+    MOZ_ASSERT(StaticPrefs::dom_speculation_rules_enabled());
+
+    nsAutoString source;
+    aElement->GetScriptText(source);
+    auto speculationRuleSetResult = SpeculationRuleSet::Parse(
+        NS_ConvertUTF16toUTF8(source), request->BaseURL(), request->BaseURL());
+
+
+    if (speculationRuleSetResult.isErr()) {
+      nsCOMPtr<nsIScriptGlobalObject> global = GetScriptGlobalObject();
+      if (!global) {
+        return false;
+      }
+      SpeculationRuleSet::ReportParseError(
+          global, speculationRuleSetResult.unwrapErr());
+      return false;
+    }
+
+    mDocument->SpeculationRules().RegisterFromScript(
+        aElement, speculationRuleSetResult.unwrap());
+    return false;
+  }
+
+  request->mState = ScriptLoadRequest::State::Ready;
+  if (aElement->GetParserCreated() == FROM_PARSER_XSLT &&
+      (!ReadyToExecuteParserBlockingScripts() || !mXSLTRequests.isEmpty())) {
+    NS_ASSERTION(!mParserBlockingRequest,
+                 "Parser-blocking scripts and XSLT scripts in the same doc!");
+    mXSLTRequests.AppendElement(request);
+    return true;
+  }
+  if (aElement->GetParserCreated() == NOT_FROM_PARSER) {
+    RunScriptWhenSafe(request);
+    return false;
+  }
+  if (aElement->GetParserCreated() == FROM_PARSER_NETWORK &&
+      !ReadyToExecuteParserBlockingScripts()) {
+    NS_ASSERTION(!mParserBlockingRequest,
+                 "There can be only one parser-blocking script at a time");
+    mParserBlockingRequest = request;
+    NS_ASSERTION(mXSLTRequests.isEmpty(),
+                 "Parser-blocking scripts and XSLT scripts in the same doc!");
+    return true;
+  }
+  NS_ASSERTION(nsContentUtils::IsSafeToRunScript(),
+               "Not safe to run a parser-inserted script?");
+  return ProcessRequest(request) == NS_ERROR_HTMLPARSER_BLOCK;
+}
+
+ScriptLoadRequest* ScriptLoader::LookupPreloadRequest(
+    nsIScriptElement* aElement, ScriptKind aScriptKind,
+    const SRIMetadata& aSRIMetadata) {
+  MOZ_ASSERT(aElement);
+
+  nsTArray<PreloadInfo>::index_type i =
+      mPreloads.IndexOf(aElement->GetScriptURI(), 0, PreloadURIComparator());
+  if (i == nsTArray<PreloadInfo>::NoIndex) {
+    return nullptr;
+  }
+  RefPtr<ScriptLoadRequest> request = mPreloads[i].mRequest;
+  if (aScriptKind != request->mKind) {
+    return nullptr;
+  }
+
+#ifdef NIGHTLY_BUILD
+  if (WAICTHandlesScripts()) {
+    return nullptr;
+  }
+#endif
+
+  request->GetScriptLoadContext()->SetIsLoadRequest(aElement);
+
+  if (request->GetScriptLoadContext()->mWasCompiledOMT &&
+      !request->IsModuleRequest()) {
+    request->SetReady();
+  }
+
+  nsString preloadCharset(mPreloads[i].mCharset);
+  mPreloads.RemoveElementAt(i);
+
+  nsAutoString elementCharset;
+  aElement->GetScriptCharset(elementCharset);
+
+  if (!request->IsModuleRequest() &&
+      (!elementCharset.Equals(preloadCharset) ||
+       aElement->GetCORSMode() != request->CORSMode())) {
+    request->Cancel();
+    return nullptr;
+  }
+
+  if (!aSRIMetadata.CanTrustBeDelegatedTo(request->mIntegrity)) {
+    if (!request->GetScriptLoadContext()->IsLinkPreloadScript()) {
+      request->Cancel();
+    }
+    return nullptr;
+  }
+
+  if (StaticPrefs::dom_multiple_import_maps_enabled()) {
+    if (request->IsModuleRequest()) {
+      mModuleLoader->MovePreloadedSetToResolvedSet(request->AsModuleRequest());
+    }
+  }
+
+  ReportPreloadErrorsToConsole(request);
+
+  request->GetScriptLoadContext()->NotifyUsage(mDocument);
+  request->GetScriptLoadContext()->RemoveSelf(mDocument);
+
+  return request;
+}
+
+void ScriptLoader::GetSRIMetadata(const nsAString& aIntegrityAttr,
+                                  SRIMetadata* aMetadataOut) {
+  MOZ_ASSERT(aMetadataOut->IsEmpty());
+
+  if (aIntegrityAttr.IsEmpty()) {
+    return;
+  }
+
+  MOZ_LOG(SRILogHelper::GetSriLog(), mozilla::LogLevel::Debug,
+          ("ScriptLoader::GetSRIMetadata, integrity=%s",
+           NS_ConvertUTF16toUTF8(aIntegrityAttr).get()));
+
+  nsAutoCString sourceUri;
+  if (mDocument->GetDocumentURI()) {
+    mDocument->GetDocumentURI()->GetAsciiSpec(sourceUri);
+  }
+  SRICheck::IntegrityMetadata(aIntegrityAttr, sourceUri, mReporter,
+                              aMetadataOut);
+}
+
+ReferrerPolicy ScriptLoader::GetReferrerPolicy(nsIScriptElement* aElement) {
+  ReferrerPolicy scriptReferrerPolicy = aElement->GetReferrerPolicy();
+  if (scriptReferrerPolicy != ReferrerPolicy::_empty) {
+    return scriptReferrerPolicy;
+  }
+  return mDocument->GetReferrerPolicy();
+}
+
+void ScriptLoader::CancelAndClearScriptLoadRequests() {
+
+  if (mParserBlockingRequest) {
+    mParserBlockingRequest->Cancel();
+    mParserBlockingRequest = nullptr;
+  }
+
+  mDeferRequests.CancelRequestsAndClear();
+  mLoadingAsyncRequests.CancelRequestsAndClear();
+  mLoadedAsyncRequests.CancelRequestsAndClear();
+  mNonAsyncExternalScriptInsertedRequests.CancelRequestsAndClear();
+  mXSLTRequests.CancelRequestsAndClear();
+  mOffThreadCompilingRequests.CancelRequestsAndClear();
+
+  if (mModuleLoader) {
+    mModuleLoader->CancelFetchingModules();
+    mModuleLoader->CancelAndClearDynamicImports();
+  }
+
+  for (size_t i = 0; i < mPreloads.Length(); i++) {
+    mPreloads[i].mRequest->Cancel();
+  }
+  mPreloads.Clear();
+}
+
+nsresult ScriptLoader::CompileOffThreadOrProcessRequest(
+    ScriptLoadRequest* aRequest) {
+  NS_ASSERTION(nsContentUtils::IsSafeToRunScript(),
+               "Processing requests when running scripts is unsafe.");
+
+  if (!aRequest->IsRetrievedFromMemoryCache() &&
+      !aRequest->GetScriptLoadContext()->mCompileOrDecodeTask &&
+      !aRequest->GetScriptLoadContext()->CompileStarted()) {
+    bool couldCompile = false;
+    nsresult rv = AttemptOffThreadScriptCompile(aRequest, &couldCompile);
+    if (NS_FAILED(rv)) {
+      HandleLoadError(aRequest, rv);
+      return rv;
+    }
+
+    if (couldCompile) {
+      return NS_OK;
+    }
+  }
+
+  return ProcessRequest(aRequest);
+}
+
+namespace {
+
+class OffThreadCompilationCompleteTask : public Task {
+ public:
+  OffThreadCompilationCompleteTask(ScriptLoadRequest* aRequest,
+                                   ScriptLoader* aLoader)
+      : Task(Kind::MainThreadOnly, EventQueuePriority::Normal),
+        mRequest(aRequest),
+        mLoader(aLoader) {
+    MOZ_ASSERT(NS_IsMainThread());
+  }
+
+  void RecordStartTime() { mStartTime = TimeStamp::Now(); }
+  void RecordStopTime() { mStopTime = TimeStamp::Now(); }
+
+#ifdef MOZ_COLLECTING_RUNNABLE_TELEMETRY
+  bool GetName(nsACString& aName) override {
+    aName.AssignLiteral("dom::OffThreadCompilationCompleteTask");
+    return true;
+  }
+#endif
+
+  TaskResult Run() override {
+    MOZ_ASSERT(NS_IsMainThread());
+
+    RefPtr<ScriptLoadContext> context = mRequest->GetScriptLoadContext();
+
+    if (!context->mCompileOrDecodeTask) {
+      return TaskResult::Complete;
+    }
+
+    RecordStopTime();
+
+    (void)mLoader->ProcessOffThreadRequest(mRequest);
+
+    mRequest = nullptr;
+    mLoader = nullptr;
+    return TaskResult::Complete;
+  }
+
+ private:
+  RefPtr<ScriptLoadRequest> mRequest;
+  RefPtr<ScriptLoader> mLoader;
+
+  TimeStamp mStartTime;
+  TimeStamp mStopTime;
+};
+
+} 
+
+static constexpr size_t OffThreadMinimumTextLength = 5 * 1000;
+static constexpr size_t OffThreadMinimumSerializedStencilLength = 5 * 1000;
+
+nsresult ScriptLoader::AttemptOffThreadScriptCompile(
+    ScriptLoadRequest* aRequest, bool* aCouldCompileOut) {
+  MOZ_ASSERT_IF(!SpeculativeOMTParsingEnabled() && !aRequest->IsModuleRequest(),
+                aRequest->IsFinished());
+  MOZ_ASSERT(!aRequest->GetScriptLoadContext()->mWasCompiledOMT);
+  MOZ_ASSERT(aCouldCompileOut && !*aCouldCompileOut);
+
+  if (aRequest->GetScriptLoadContext()->mIsInline) {
+    return NS_OK;
+  }
+
+  if (aRequest->IsRetrievedFromMemoryCache()) {
+    return NS_OK;
+  }
+
+  if (aRequest->IsModuleRequest() &&
+      (aRequest->AsModuleRequest()->mModuleType == JS::ModuleType::JSON ||
+       aRequest->AsModuleRequest()->mModuleType == JS::ModuleType::CSS)) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIGlobalObject> globalObject = GetGlobalForRequest(aRequest);
+  if (!globalObject) {
+    return NS_ERROR_FAILURE;
+  }
+
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(globalObject)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  JSContext* cx = jsapi.cx();
+  JS::CompileOptions options(cx);
+
+  JS::Rooted<JSScript*> dummyIntroductionScript(cx);
+  nsresult rv = FillCompileOptionsForRequest(cx, aRequest, &options,
+                                             &dummyIntroductionScript);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  if (aRequest->IsFetchedAsTextSource()) {
+    if (!StaticPrefs::javascript_options_parallel_parsing() ||
+        aRequest->ScriptTextLength() < OffThreadMinimumTextLength) {
+      return NS_OK;
+    }
+  } else if (aRequest->IsWasmBytes()) {
+    return NS_OK;
+  } else {
+    MOZ_ASSERT(aRequest->IsRetrievedAsSerializedStencil());
+
+    JS::TranscodeRange range = aRequest->SerializedStencil();
+    if (!StaticPrefs::javascript_options_parallel_parsing() ||
+        range.length() < OffThreadMinimumSerializedStencilLength) {
+      return NS_OK;
+    }
+  }
+
+  RefPtr<CompileOrDecodeTask> compileOrDecodeTask;
+  rv = CreateOffThreadTask(cx, aRequest, options,
+                           getter_AddRefs(compileOrDecodeTask));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  RefPtr<OffThreadCompilationCompleteTask> completeTask =
+      new OffThreadCompilationCompleteTask(aRequest, this);
+
+  completeTask->RecordStartTime();
+
+  aRequest->GetScriptLoadContext()->mCompileOrDecodeTask = compileOrDecodeTask;
+  completeTask->AddDependency(compileOrDecodeTask);
+
+  TaskController::Get()->AddTask(compileOrDecodeTask.forget());
+  TaskController::Get()->AddTask(completeTask.forget());
+
+  aRequest->GetScriptLoadContext()->BlockOnload(mDocument);
+
+  aRequest->mState = ScriptLoadRequest::State::Compiling;
+
+  if (aRequest->IsTopLevel() && !aRequest->isInList()) {
+    mOffThreadCompilingRequests.AppendElement(aRequest);
+    aRequest->GetScriptLoadContext()->mInCompilingList = true;
+  }
+
+  *aCouldCompileOut = true;
+
+  return NS_OK;
+}
+
+CompileOrDecodeTask::CompileOrDecodeTask()
+    : Task(Kind::OffMainThreadOnly, EventQueuePriority::Normal),
+      mMutex("CompileOrDecodeTask"),
+      mOptions(JS::OwningCompileOptions::ForFrontendContext()) {}
+
+CompileOrDecodeTask::~CompileOrDecodeTask() {
+  if (mFrontendContext) {
+    JS::DestroyFrontendContext(mFrontendContext);
+    mFrontendContext = nullptr;
+  }
+}
+
+nsresult CompileOrDecodeTask::InitFrontendContext() {
+  mFrontendContext = JS::NewFrontendContext();
+  if (!mFrontendContext) {
+    mIsCancelled = true;
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  return NS_OK;
+}
+
+void CompileOrDecodeTask::DidRunTask(const MutexAutoLock& aProofOfLock,
+                                     RefPtr<JS::Stencil>&& aStencil) {
+  if (aStencil) {
+    if (!JS::PrepareForInstantiate(mFrontendContext, *aStencil,
+                                   mInstantiationStorage)) {
+      aStencil = nullptr;
+    }
+  }
+
+  mStencil = std::move(aStencil);
+}
+
+already_AddRefed<JS::Stencil> CompileOrDecodeTask::StealResult(
+    JSContext* aCx, JS::InstantiationStorage* aInstantiationStorage) {
+  JS::FrontendContext* fc = mFrontendContext;
+  mFrontendContext = nullptr;
+  auto destroyFrontendContext =
+      mozilla::MakeScopeExit([&]() { JS::DestroyFrontendContext(fc); });
+
+  MOZ_ASSERT(fc);
+
+  if (JS::HadFrontendErrors(fc)) {
+    (void)JS::ConvertFrontendErrorsToRuntimeErrors(aCx, fc, mOptions);
+    return nullptr;
+  }
+
+  if (!mStencil && JS::IsTranscodeFailureResult(mResult)) {
+    JS_ReportErrorASCII(aCx, "failed to decode cache");
+    return nullptr;
+  }
+
+  if (!JS::ConvertFrontendErrorsToRuntimeErrors(aCx, fc, mOptions)) {
+    return nullptr;
+  }
+
+  MOZ_ASSERT(mStencil,
+             "If this task is cancelled, StealResult shouldn't be called");
+
+  *aInstantiationStorage = std::move(mInstantiationStorage);
+
+  return mStencil.forget();
+}
+
+void CompileOrDecodeTask::Cancel() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  MutexAutoLock lock(mMutex);
+
+  mIsCancelled = true;
+}
+
+enum class CompilationTarget { Script, Module };
+
+template <CompilationTarget target>
+class ScriptOrModuleCompileTask final : public CompileOrDecodeTask {
+ public:
+  explicit ScriptOrModuleCompileTask(
+      ScriptLoader::MaybeSourceText&& aMaybeSource)
+      : CompileOrDecodeTask(), mMaybeSource(std::move(aMaybeSource)) {}
+
+  nsresult Init(JS::CompileOptions& aOptions) {
+    nsresult rv = InitFrontendContext();
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    if (!mOptions.copy(mFrontendContext, aOptions)) {
+      mIsCancelled = true;
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    return NS_OK;
+  }
+
+  TaskResult Run() override {
+    MutexAutoLock lock(mMutex);
+
+    if (IsCancelled(lock)) {
+      return TaskResult::Complete;
+    }
+    RefPtr<JS::Stencil> stencil = Compile();
+
+    DidRunTask(lock, std::move(stencil));
+    return TaskResult::Complete;
+  }
+
+ private:
+  already_AddRefed<JS::Stencil> Compile() {
+    size_t stackSize = TaskController::GetThreadStackSize();
+    JS::SetNativeStackQuota(mFrontendContext,
+                            JS::ThreadStackQuotaForSize(stackSize));
+
+    auto compile = [&](auto& source) {
+      if constexpr (target == CompilationTarget::Script) {
+        return JS::CompileGlobalScriptToStencil(mFrontendContext, mOptions,
+                                                source);
+      }
+      return JS::CompileModuleScriptToStencil(mFrontendContext, mOptions,
+                                              source);
+    };
+    return mMaybeSource.mapNonEmpty(compile);
+  }
+
+ public:
+#ifdef MOZ_COLLECTING_RUNNABLE_TELEMETRY
+  bool GetName(nsACString& aName) override {
+    if constexpr (target == CompilationTarget::Script) {
+      aName.AssignLiteral("ScriptCompileTask");
+    } else {
+      aName.AssignLiteral("ModuleCompileTask");
+    }
+    return true;
+  }
+#endif
+
+ private:
+  ScriptLoader::MaybeSourceText mMaybeSource;
+};
+
+using ScriptCompileTask =
+    class ScriptOrModuleCompileTask<CompilationTarget::Script>;
+using ModuleCompileTask =
+    class ScriptOrModuleCompileTask<CompilationTarget::Module>;
+
+class ScriptDecodeTask final : public CompileOrDecodeTask {
+ public:
+  explicit ScriptDecodeTask(const JS::TranscodeRange& aRange)
+      : mRange(aRange) {}
+
+  nsresult Init(JS::DecodeOptions& aOptions) {
+    nsresult rv = InitFrontendContext();
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    if (!mDecodeOptions.copy(mFrontendContext, aOptions)) {
+      mIsCancelled = true;
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    return NS_OK;
+  }
+
+  TaskResult Run() override {
+    MutexAutoLock lock(mMutex);
+
+    if (IsCancelled(lock)) {
+      return TaskResult::Complete;
+    }
+
+    RefPtr<JS::Stencil> stencil = Decode();
+
+    JS::OwningCompileOptions compileOptions(
+        (JS::OwningCompileOptions::ForFrontendContext()));
+    mOptions.steal(std::move(mDecodeOptions));
+
+    DidRunTask(lock, std::move(stencil));
+    return TaskResult::Complete;
+  }
+
+ private:
+  already_AddRefed<JS::Stencil> Decode() {
+
+    RefPtr<JS::Stencil> stencil;
+    mResult = JS::DecodeStencil(mFrontendContext, mDecodeOptions, mRange,
+                                getter_AddRefs(stencil));
+    return stencil.forget();
+  }
+
+ public:
+#ifdef MOZ_COLLECTING_RUNNABLE_TELEMETRY
+  bool GetName(nsACString& aName) override {
+    aName.AssignLiteral("ScriptDecodeTask");
+    return true;
+  }
+#endif
+
+ private:
+  JS::OwningDecodeOptions mDecodeOptions;
+
+  JS::TranscodeRange mRange;
+};
+
+nsresult ScriptLoader::CreateOffThreadTask(
+    JSContext* aCx, ScriptLoadRequest* aRequest, JS::CompileOptions& aOptions,
+    CompileOrDecodeTask** aCompileOrDecodeTask) {
+  if (aRequest->IsRetrievedAsSerializedStencil()) {
+    JS::TranscodeRange range = aRequest->SerializedStencil();
+    JS::DecodeOptions decodeOptions(aOptions);
+    RefPtr<ScriptDecodeTask> decodeTask = new ScriptDecodeTask(range);
+    nsresult rv = decodeTask->Init(decodeOptions);
+    NS_ENSURE_SUCCESS(rv, rv);
+    decodeTask.forget(aCompileOrDecodeTask);
+    return NS_OK;
+  }
+
+  MaybeSourceText maybeSource;
+  nsresult rv = aRequest->GetScriptSource(aCx, &maybeSource,
+                                          aRequest->mLoadContext.get());
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (ShouldApplyDelazifyStrategy(aRequest)) {
+    ApplyDelazifyStrategy(&aOptions);
+    mTotalFullParseSize +=
+        aRequest->ScriptTextLength() > 0
+            ? static_cast<uint32_t>(aRequest->ScriptTextLength())
+            : 0;
+
+    LOG(
+        ("ScriptLoadRequest (%p): non-on-demand-only (omt) Parsing Enabled "
+         "for url=%s mTotalFullParseSize=%u",
+         aRequest, aRequest->URI()->GetSpecOrDefault().get(),
+         mTotalFullParseSize));
+  }
+
+  if (aRequest->IsModuleRequest()) {
+    RefPtr<ModuleCompileTask> compileTask =
+        new ModuleCompileTask(std::move(maybeSource));
+    rv = compileTask->Init(aOptions);
+    NS_ENSURE_SUCCESS(rv, rv);
+    compileTask.forget(aCompileOrDecodeTask);
+    return NS_OK;
+  }
+  MOZ_ASSERT(!aRequest->IsWasmBytes());
+
+  RefPtr<ScriptCompileTask> compileTask =
+      new ScriptCompileTask(std::move(maybeSource));
+  rv = compileTask->Init(aOptions);
+  NS_ENSURE_SUCCESS(rv, rv);
+  compileTask.forget(aCompileOrDecodeTask);
+  return NS_OK;
+}
+
+nsresult ScriptLoader::ProcessOffThreadRequest(ScriptLoadRequest* aRequest) {
+  MOZ_ASSERT(aRequest->IsCompiling());
+  MOZ_ASSERT(!aRequest->GetScriptLoadContext()->mWasCompiledOMT);
+
+
+  if (aRequest->IsCanceled()) {
+    return NS_OK;
+  }
+
+  aRequest->GetScriptLoadContext()->mWasCompiledOMT = true;
+
+  if (aRequest->GetScriptLoadContext()->mInCompilingList) {
+    mOffThreadCompilingRequests.Remove(aRequest);
+    aRequest->GetScriptLoadContext()->mInCompilingList = false;
+  }
+
+  if (aRequest->IsModuleRequest()) {
+    MOZ_ASSERT(aRequest->GetScriptLoadContext()->mCompileOrDecodeTask);
+    ModuleLoadRequest* request = aRequest->AsModuleRequest();
+    return request->OnFetchComplete(NS_OK);
+  }
+
+  MOZ_ASSERT_IF(!SpeculativeOMTParsingEnabled(),
+                aRequest->GetScriptLoadContext()->HasScriptElement());
+  if (!aRequest->GetScriptLoadContext()->HasScriptElement()) {
+    aRequest->GetScriptLoadContext()->MaybeUnblockOnload();
+    return NS_OK;
+  }
+
+  aRequest->SetReady();
+
+  if (aRequest != mParserBlockingRequest &&
+      (aRequest->GetScriptLoadContext()->IsAsyncScript() ||
+       aRequest->GetScriptLoadContext()->IsBlockingScript()) &&
+      !aRequest->isInList()) {
+    if (aRequest->GetScriptLoadContext()->IsAsyncScript()) {
+      aRequest->GetScriptLoadContext()->mInAsyncList = false;
+      AddAsyncRequest(aRequest);
+    } else {
+      MOZ_ASSERT(
+          false,
+          "This should not run ever with the current default prefs. The "
+          "request should not run synchronously but added to some queue.");
+      return ProcessRequest(aRequest);
+    }
+  } else if (aRequest->GetScriptLoadContext()->mInAsyncList) {
+    MaybeMoveToLoadedList(aRequest);
+  }
+
+  ProcessPendingRequests();
+  return NS_OK;
+}
+
+nsresult ScriptLoader::ProcessRequest(ScriptLoadRequest* aRequest) {
+  LOG(("ScriptLoadRequest (%p): Process request", aRequest));
+
+  NS_ASSERTION(nsContentUtils::IsSafeToRunScript(),
+               "Processing requests when running scripts is unsafe.");
+  NS_ASSERTION(aRequest->IsFinished(),
+               "Processing a request that is not ready to run.");
+
+  NS_ENSURE_ARG(aRequest);
+
+  auto unblockOnload = MakeScopeExit(
+      [&] { aRequest->GetScriptLoadContext()->MaybeUnblockOnload(); });
+
+  if (aRequest->IsModuleRequest()) {
+    ModuleLoadRequest* request = aRequest->AsModuleRequest();
+    if (request->IsDynamicImport()) {
+      request->ProcessDynamicImport();
+      return NS_OK;
+    }
+
+    if (request->mModuleScript &&
+        !request->mModuleScript->HasErrorToRethrow()) {
+      if (!request->InstantiateModuleGraph()) {
+        request->mModuleScript = nullptr;
+      }
+    }
+
+    if (!request->mModuleScript) {
+      LOG(("ScriptLoadRequest (%p):   Error loading request, firing error",
+           aRequest));
+      FireScriptAvailable(NS_ERROR_FAILURE, aRequest);
+      return NS_OK;
+    }
+  }
+
+  nsCOMPtr<nsIScriptElement> oldParserInsertedScript;
+  uint32_t parserCreated = aRequest->GetScriptLoadContext()->GetParserCreated();
+  if (parserCreated) {
+    oldParserInsertedScript = mCurrentParserInsertedScript;
+    mCurrentParserInsertedScript =
+        aRequest->GetScriptLoadContext()
+            ->GetScriptElementForCurrentParserInsertedScript();
+  }
+
+  aRequest->GetScriptLoadContext()->BeginEvaluatingTopLevel();
+
+  FireScriptAvailable(NS_OK, aRequest);
+
+  {
+    nsAutoMicroTask mt;
+  }
+
+  nsresult rv = EvaluateScriptElement(aRequest);
+
+  FireScriptEvaluated(rv, aRequest);
+
+  aRequest->GetScriptLoadContext()->EndEvaluatingTopLevel();
+
+  if (parserCreated) {
+    mCurrentParserInsertedScript = oldParserInsertedScript;
+  }
+
+  if (aRequest->GetScriptLoadContext()->mCompileOrDecodeTask) {
+    MOZ_ASSERT(!aRequest->IsModuleRequest());
+    aRequest->GetScriptLoadContext()->MaybeCancelOffThreadScript();
+  }
+
+  if (aRequest->getLoadedScript()->IsTextSource()) {
+    aRequest->getLoadedScript()->ClearScriptText();
+    aRequest->getLoadedScript()->DropSRI();
+  } else if (aRequest->getLoadedScript()->IsSerializedStencil()) {
+    MOZ_ASSERT(!aRequest->HasStencil());
+    aRequest->getLoadedScript()->DropSRIOrSRIAndSerializedStencil();
+  }
+
+  return rv;
+}
+
+void ScriptLoader::FireScriptAvailable(nsresult aResult,
+                                       ScriptLoadRequest* aRequest) {
+  for (int32_t i = 0; i < mObservers.Count(); i++) {
+    nsCOMPtr<nsIScriptLoaderObserver> obs = mObservers[i];
+    obs->ScriptAvailable(
+        aResult,
+        aRequest->GetScriptLoadContext()->GetScriptElementForObserver(),
+        aRequest->GetScriptLoadContext()->mIsInline, aRequest->URI(),
+        aRequest->GetScriptLoadContext()->mLineNo);
+  }
+
+  bool isInlineClassicScript = aRequest->GetScriptLoadContext()->mIsInline &&
+                               !aRequest->IsModuleRequest();
+  RefPtr<nsIScriptElement> scriptElement =
+      aRequest->GetScriptLoadContext()->GetScriptElementForObserver();
+  scriptElement->ScriptAvailable(aResult, scriptElement, isInlineClassicScript,
+                                 aRequest->URI(),
+                                 aRequest->GetScriptLoadContext()->mLineNo);
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY void ScriptLoader::FireScriptEvaluated(
+    nsresult aResult, ScriptLoadRequest* aRequest) {
+  for (int32_t i = 0; i < mObservers.Count(); i++) {
+    nsCOMPtr<nsIScriptLoaderObserver> obs = mObservers[i];
+    RefPtr<nsIScriptElement> scriptElement =
+        aRequest->GetScriptLoadContext()->GetScriptElementForObserver();
+    obs->ScriptEvaluated(aResult, scriptElement,
+                         aRequest->GetScriptLoadContext()->mIsInline);
+  }
+
+  RefPtr<nsIScriptElement> scriptElement =
+      aRequest->GetScriptLoadContext()->GetScriptElementForObserver();
+  scriptElement->ScriptEvaluated(aResult, scriptElement,
+                                 aRequest->GetScriptLoadContext()->mIsInline);
+}
+
+already_AddRefed<nsIGlobalObject> ScriptLoader::GetGlobalForRequest(
+    ScriptLoadRequest* aRequest) {
+  if (aRequest->IsModuleRequest()) {
+    ModuleLoader* loader =
+        ModuleLoader::From(aRequest->AsModuleRequest()->mLoader);
+    nsCOMPtr<nsIGlobalObject> global = loader->GetGlobalObject();
+    return global.forget();
+  }
+
+  return GetScriptGlobalObject();
+}
+
+already_AddRefed<nsIScriptGlobalObject> ScriptLoader::GetScriptGlobalObject() {
+  if (!mDocument) {
+    return nullptr;
+  }
+
+  nsPIDOMWindowInner* pwin = mDocument->GetInnerWindow();
+  if (!pwin) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIScriptGlobalObject> globalObject = do_QueryInterface(pwin);
+  NS_ASSERTION(globalObject, "windows must be global objects");
+
+  nsresult rv = globalObject->EnsureScriptEnvironment();
+  if (NS_FAILED(rv)) {
+    return nullptr;
+  }
+
+  return globalObject.forget();
+}
+
+static void ApplyEagerBaselineStrategy(JS::CompileOptions* aOptions) {
+  uint32_t strategyIndex = StaticPrefs::
+      javascript_options_baselinejit_offthread_compilation_strategy();
+
+  JS::EagerBaselineOption strategy;
+  switch (strategyIndex) {
+    case 2:
+    case 3:
+      strategy = JS::EagerBaselineOption::JitHints;
+      break;
+    case 4:
+      strategy = JS::EagerBaselineOption::Aggressive;
+      break;
+    default:
+      strategy = JS::EagerBaselineOption::None;
+      break;
+  }
+
+  aOptions->setEagerBaselineStrategy(strategy);
+}
+
+nsresult ScriptLoader::FillCompileOptionsForRequest(
+    JSContext* aCx, ScriptLoadRequest* aRequest, JS::CompileOptions* aOptions,
+    JS::MutableHandle<JSScript*> aIntroductionScript) {
+  nsresult rv = aRequest->URI()->GetSpec(aRequest->mURL);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  const char* introductionType;
+  if (aRequest->IsModuleRequest() &&
+      !aRequest->AsModuleRequest()->IsTopLevel()) {
+    introductionType = "importedModule";
+  } else if (!aRequest->GetScriptLoadContext()->mIsInline) {
+    introductionType = "srcScript";
+  } else if (aRequest->GetScriptLoadContext()->GetParserCreated() ==
+             FROM_PARSER_NETWORK) {
+    introductionType = "inlineScript";
+  } else {
+    introductionType = "injectedScript";
+  }
+  aOptions->setIntroductionInfoToCaller(aCx, introductionType,
+                                        aIntroductionScript);
+  aOptions->setFileAndLine(aRequest->mURL.get(),
+                           aRequest->GetScriptLoadContext()->mLineNo);
+  if (aRequest->GetScriptLoadContext()->mIsInline &&
+      aRequest->GetScriptLoadContext()->GetParserCreated() ==
+          FROM_PARSER_NETWORK) {
+    aOptions->setColumn(aRequest->GetScriptLoadContext()->mColumnNo);
+  }
+  aOptions->setIsRunOnce(true);
+  aOptions->setNoScriptRval(true);
+  if (aRequest->HasSourceMapURL()) {
+    aOptions->setSourceMapURL(aRequest->GetSourceMapURL().get());
+  }
+  if (aRequest->mOriginPrincipal) {
+    nsCOMPtr<nsIGlobalObject> globalObject = GetGlobalForRequest(aRequest);
+    nsIPrincipal* scriptPrin = globalObject->PrincipalOrNull();
+    MOZ_ASSERT(scriptPrin);
+    bool subsumes = scriptPrin->Subsumes(aRequest->mOriginPrincipal);
+    aOptions->setMutedErrors(!subsumes);
+  }
+
+  aOptions->setDeferDebugMetadata(true);
+
+  if (!mCache) {
+    aOptions->borrowBuffer = true;
+  }
+
+  ApplyEagerBaselineStrategy(aOptions);
+
+  return NS_OK;
+}
+
+ScriptLoader::DiskCacheStrategy ScriptLoader::GetDiskCacheStrategy() {
+  int32_t strategyPref =
+      StaticPrefs::dom_script_loader_bytecode_cache_strategy();
+  LOG(("Bytecode-cache: disk cache strategy = %d.", strategyPref));
+
+  DiskCacheStrategy strategy;
+  switch (strategyPref) {
+    case -2: {
+      strategy.mIsDisabled = true;
+      break;
+    }
+    case -1: {
+      strategy.mHasSourceLengthMin = false;
+      strategy.mHasFetchCountMin = false;
+      break;
+    }
+    case 1: {
+      strategy.mHasSourceLengthMin = true;
+      strategy.mHasFetchCountMin = true;
+      strategy.mSourceLengthMin = 1024;
+      strategy.mFetchCountMin = 2;
+      break;
+    }
+    default:
+    case 0: {
+      strategy.mHasSourceLengthMin = true;
+      strategy.mHasFetchCountMin = true;
+      strategy.mSourceLengthMin = 1024;
+      strategy.mFetchCountMin = 4;
+      break;
+    }
+  }
+
+  return strategy;
+}
+
+void ScriptLoader::CalculateCacheFlag(ScriptLoadRequest* aRequest) {
+  using mozilla::TimeDuration;
+  using mozilla::TimeStamp;
+
+#ifdef NIGHTLY_BUILD
+  if (WAICTHandlesScripts()) {
+    aRequest->MarkNotCacheable();
+    return;
+  }
+#endif
+
+  if (aRequest->GetScriptLoadContext()->mIsInline) {
+    LOG(("ScriptLoadRequest (%p): Bytecode-cache: Skip all: Inline script",
+         aRequest));
+    aRequest->MarkNotCacheable();
+    MOZ_ASSERT(!aRequest->getLoadedScript()->HasDiskCacheReference());
+    MOZ_ASSERT(aRequest->HasNoSRIOrSRIAndSerializedStencil());
+    return;
+  }
+
+  if (!aRequest->URI()->SchemeIs("http") &&
+      !aRequest->URI()->SchemeIs("https")) {
+    LOG(("ScriptLoadRequest (%p): Bytecode-cache: Skip all: Unsupported scheme",
+         aRequest));
+    aRequest->MarkNotCacheable();
+    MOZ_ASSERT(!aRequest->getLoadedScript()->HasDiskCacheReference());
+    MOZ_ASSERT(aRequest->HasNoSRIOrSRIAndSerializedStencil());
+    return;
+  }
+
+  if (aRequest->IsModuleRequest()) {
+    ModuleLoadRequest* moduleLoadRequest = aRequest->AsModuleRequest();
+    if (moduleLoadRequest->mModuleType == JS::ModuleType::JavaScriptOrWasm) {
+#ifdef NIGHTLY_BUILD
+      if (moduleLoadRequest->HasWasmMimeTypeEssence()) {
+        MOZ_ASSERT(aRequest->IsWasmBytes());
+        LOG(("ScriptLoadRequest (%p): Bytecode-cache: Skip all: wasm module",
+             aRequest));
+        aRequest->MarkNotCacheable();
+        MOZ_ASSERT(!aRequest->getLoadedScript()->HasDiskCacheReference());
+        return;
+      }
+#endif
+    } else {
+      LOG(("ScriptLoadRequest (%p): Bytecode-cache: Skip all: synthetic module",
+           aRequest));
+      aRequest->MarkNotCacheable();
+      MOZ_ASSERT(!aRequest->getLoadedScript()->HasDiskCacheReference());
+      MOZ_ASSERT_IF(aRequest->IsFetchedAsTextSource(),
+                    aRequest->HasNoSRIOrSRIAndSerializedStencil());
+      return;
+    }
+  }
+
+  MOZ_ASSERT(!aRequest->IsWasmBytes());
+
+  if (!aRequest->IsRetrievedFromMemoryCache() &&
+      aRequest->ExpirationTime().IsExpired()) {
+    LOG(("ScriptLoadRequest (%p): Bytecode-cache: Skip all: Expired",
+         aRequest));
+    aRequest->MarkSkippedAllCaching();
+    aRequest->getLoadedScript()->DropDiskCacheReferenceAndSRI();
+    return;
+  }
+
+  if (strcmp(aRequest->URI()->GetSpecOrDefault().get(),
+             "https://snap.licdn.com/li.lms-analytics/insight.min.js") == 0) {
+    LOG(("ScriptLoadRequest (%p): Bytecode-cache: Skip all: bug 2042605",
+         aRequest));
+    aRequest->MarkNotCacheable();
+    aRequest->getLoadedScript()->DropDiskCacheReferenceAndSRI();
+    return;
+  }
+
+  if (mCache) {
+    if (mCache->IsLowMemory()) {
+      LOG(
+          ("ScriptLoadRequest (%p): Bytecode-cache: Skip in-memory: memory "
+           "pressure",
+           aRequest));
+      aRequest->MarkSkippedMemoryCaching();
+    } else {
+      LOG(("ScriptLoadRequest (%p): Bytecode-cache: Mark in-memory: Stencil",
+           aRequest));
+      aRequest->MarkPassedConditionForMemoryCache();
+    }
+
+    return;
+  }
+
+  aRequest->MarkSkippedMemoryCaching();
+
+
+  if (aRequest->IsRetrievedAsSerializedStencil()) {
+    LOG(
+        ("ScriptLoadRequest (%p): Bytecode-cache: Skip disk: "
+         "IsRetrievedAsSerializedStencil",
+         aRequest));
+    aRequest->MarkSkippedDiskCaching();
+    MOZ_ASSERT(!aRequest->getLoadedScript()->HasDiskCacheReference());
+    return;
+  }
+
+  if (!aRequest->getLoadedScript()->HasDiskCacheReference()) {
+    LOG(
+        ("ScriptLoadRequest (%p): Bytecode-cache: Skip disk: "
+         "!LoadedScript::HasDiskCacheReference",
+         aRequest));
+    aRequest->MarkSkippedDiskCaching();
+    MOZ_ASSERT_IF(aRequest->IsFetchedAsTextSource(),
+                  aRequest->HasNoSRIOrSRIAndSerializedStencil());
+    return;
+  }
+
+  auto strategy = GetDiskCacheStrategy();
+
+  if (strategy.mIsDisabled) {
+    LOG(
+        ("ScriptLoadRequest (%p): Bytecode-cache: Skip disk: Disabled by "
+         "pref.",
+         aRequest));
+    aRequest->MarkSkippedDiskCaching();
+
+    aRequest->getLoadedScript()->DropDiskCacheReferenceAndSRI();
+    return;
+  }
+
+  size_t sourceLength;
+  if (aRequest->IsRetrievedFromMemoryCache()) {
+    sourceLength = JS::GetScriptSourceLength(aRequest->GetStencil());
+  } else {
+    MOZ_ASSERT(aRequest->IsFetchedAsTextSource());
+    sourceLength = aRequest->ReceivedScriptTextLength();
+  }
+  if (strategy.mHasSourceLengthMin) {
+    if (sourceLength < strategy.mSourceLengthMin) {
+      LOG(
+          ("ScriptLoadRequest (%p): Bytecode-cache: Skip disk: Script is too "
+           "small.",
+           aRequest));
+      aRequest->MarkSkippedDiskCaching();
+      aRequest->getLoadedScript()->DropDiskCacheReferenceAndSRI();
+      return;
+    }
+  }
+
+  size_t expectedDiskCacheSize = sourceLength * 5;
+  int32_t diskCacheMaxSizeInKb =
+      StaticPrefs::browser_cache_disk_max_entry_size();
+  if (diskCacheMaxSizeInKb > 0) {
+    if (expectedDiskCacheSize > size_t(diskCacheMaxSizeInKb) * 1024) {
+      LOG(
+          ("ScriptLoadRequest (%p): Bytecode-cache: Skip disk: Script is too "
+           "large.",
+           aRequest));
+      aRequest->MarkSkippedDiskCaching();
+      aRequest->getLoadedScript()->DropDiskCacheReferenceAndSRI();
+      return;
+    }
+  }
+
+  if (strategy.mHasFetchCountMin) {
+    uint8_t fetchCount = aRequest->mLoadedScript->mFetchCount;
+    LOG(("ScriptLoadRequest (%p): Bytecode-cache: fetchCount = %d.", aRequest,
+         fetchCount));
+    if (fetchCount < strategy.mFetchCountMin) {
+      LOG(("ScriptLoadRequest (%p): Bytecode-cache: Skip disk: fetchCount",
+           aRequest));
+      aRequest->MarkSkippedDiskCaching();
+
+      if (!mCache) {
+        aRequest->getLoadedScript()->DropDiskCacheReferenceAndSRI();
+      }
+      return;
+    }
+  }
+
+  LOG(("ScriptLoadRequest (%p): Bytecode-cache: Mark disk: Passed condition",
+       aRequest));
+  aRequest->MarkPassedConditionForDiskCache();
+
+  if (aRequest->IsModuleRequest() &&
+      aRequest->AsModuleRequest()->IsStaticImport()) {
+    MOZ_ASSERT(!aRequest->isInList());
+    mDiskCacheableDependencyModules.AppendElement(aRequest);
+  }
+}
+
+class MOZ_RAII AutoSetProcessingScriptTag {
+  nsCOMPtr<nsIScriptContext> mContext;
+  bool mOldTag;
+
+ public:
+  explicit AutoSetProcessingScriptTag(nsIScriptContext* aContext)
+      : mContext(aContext), mOldTag(mContext->GetProcessingScriptTag()) {
+    mContext->SetProcessingScriptTag(true);
+  }
+
+  ~AutoSetProcessingScriptTag() { mContext->SetProcessingScriptTag(mOldTag); }
+};
+
+static void ExecuteCompiledScript(JSContext* aCx, JS::Handle<JSScript*> aScript,
+                                  ErrorResult& aRv) {
+  if (!aScript) {
+    return;
+  }
+
+  if (!JS_ExecuteScript(aCx, aScript)) {
+    aRv.NoteJSContextException(aCx);
+  }
+}
+
+nsresult ScriptLoader::EvaluateScriptElement(ScriptLoadRequest* aRequest) {
+  MOZ_ASSERT(aRequest->IsFinished());
+  MOZ_ASSERT(mDocument);
+
+  if (!mDocument->GetInnerWindow()) {
+    return NS_OK;
+  }
+
+  Document* ownerDoc =
+      aRequest->GetScriptLoadContext()->GetScriptOwnerDocument();
+  if (ownerDoc != mDocument) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsIGlobalObject> globalObject;
+  nsCOMPtr<nsIScriptContext> context;
+  nsCOMPtr<nsIScriptGlobalObject> scriptGlobal = GetScriptGlobalObject();
+  if (!scriptGlobal) {
+    return NS_ERROR_FAILURE;
+  }
+
+  MOZ_ASSERT_IF(aRequest->IsModuleRequest(),
+                aRequest->AsModuleRequest()->GetGlobalObject() == scriptGlobal);
+
+  context = scriptGlobal->GetScriptContext();
+  if (!context) {
+    return NS_ERROR_FAILURE;
+  }
+
+  globalObject = scriptGlobal;
+
+  const bool ignoreDestructiveWrites =
+      !aRequest->GetScriptLoadContext()->mIsInline ||
+      aRequest->IsModuleRequest();
+  if (ignoreDestructiveWrites) {
+    if (mDocument) {
+      mDocument->IncrementIgnoreDestructiveWritesCounter();
+    }
+  }
+
+  auto afterScript = MakeScopeExit([&] {
+    if (mContinueParsingDocumentAfterCurrentScript) {
+      mContinueParsingDocumentAfterCurrentScript = false;
+      if (mDocument) {
+        nsCOMPtr<nsIParser> parser = mDocument->CreatorParserOrNull();
+        if (parser) {
+          parser->ContinueInterruptedParsingAsync();
+        }
+      }
+    }
+    if (ignoreDestructiveWrites) {
+      if (mDocument) {
+        mDocument->DecrementIgnoreDestructiveWritesCounter();
+      }
+    }
+  });
+
+  nsIScriptElement* currentScript =
+      aRequest->IsModuleRequest() ? nullptr
+                                  : aRequest->GetScriptLoadContext()
+                                        ->GetScriptElementForCurrentScript();
+  AutoCurrentScriptUpdater scriptUpdater(this, currentScript);
+
+  Maybe<AutoSetProcessingScriptTag> setProcessingScriptTag;
+  if (context) {
+    setProcessingScriptTag.emplace(context);
+  }
+
+  MOZ_ASSERT(!aRequest->IsImportMapRequest());
+
+  auto start = TimeStamp::Now();
+
+  nsresult rv;
+  if (aRequest->IsModuleRequest()) {
+    rv = aRequest->AsModuleRequest()->EvaluateModule();
+  } else {
+    MOZ_ASSERT(!aRequest->IsWasmBytes());
+    rv = EvaluateScript(globalObject, aRequest);
+  }
+
+  auto end = TimeStamp::Now();
+  auto duration = (end - start).ToMilliseconds();
+
+  static constexpr double LongScriptThresholdInMilliseconds = 1.0;
+  if (duration > LongScriptThresholdInMilliseconds) {
+    aRequest->SetTookLongInPreviousRuns();
+  }
+
+  return rv;
+}
+
+void ScriptLoader::Decode(JSContext* aCx, JS::CompileOptions& aCompileOptions,
+                          const JS::TranscodeRange& aRange,
+                          RefPtr<JS::Stencil>& aStencil, ErrorResult& aRv) {
+  JS::DecodeOptions decodeOptions(aCompileOptions);
+  if (!mCache) {
+    decodeOptions.borrowBuffer = true;
+  }
+
+  MOZ_ASSERT(aCompileOptions.noScriptRval);
+  JS::TranscodeResult tr =
+      JS::DecodeStencil(aCx, decodeOptions, aRange, getter_AddRefs(aStencil));
+  MOZ_ASSERT(tr != JS::TranscodeResult::Failure_BadBuildId);
+  if (tr != JS::TranscodeResult::Ok) {
+    aRv = NS_ERROR_DOM_JS_DECODING_ERROR;
+    return;
+  }
+}
+
+bool ScriptLoader::StartCollectingDelazifications(JSContext* aCx,
+                                                  JS::Handle<JSScript*> aScript,
+                                                  JS::Stencil* aStencil) {
+  JS::CollectDelazificationsResult result;
+  if (!JS::StartCollectingDelazifications(aCx, aScript, aStencil, result)) {
+    return false;
+  }
+  if (result == JS::CollectDelazificationsResult::NewlyStarted) {
+    AppendDelazificationCollection(aScript);
+  }
+  return true;
+}
+
+bool ScriptLoader::StartCollectingDelazifications(JSContext* aCx,
+                                                  JS::Handle<JSObject*> aModule,
+                                                  JS::Stencil* aStencil) {
+  JS::CollectDelazificationsResult result;
+  if (!JS::StartCollectingDelazifications(aCx, aModule, aStencil, result)) {
+    return false;
+  }
+  if (result == JS::CollectDelazificationsResult::NewlyStarted) {
+    AppendDelazificationCollection(aModule);
+  }
+  return true;
+}
+
+void ScriptLoader::AppendDelazificationCollection(
+    JS::Handle<JSScript*> aScript) {
+  if (mDelazificationCollectingScripts.IsEmpty() &&
+      mDelazificationCollectingModules.IsEmpty()) {
+    mozilla::HoldJSObjects(this);
+  }
+  mDelazificationCollectingScripts.AppendElement(aScript);
+}
+
+void ScriptLoader::AppendDelazificationCollection(
+    JS::Handle<JSObject*> aModule) {
+  if (mDelazificationCollectingScripts.IsEmpty() &&
+      mDelazificationCollectingModules.IsEmpty()) {
+    mozilla::HoldJSObjects(this);
+  }
+  mDelazificationCollectingModules.AppendElement(aModule);
+}
+
+// Instantiate (on main-thread) a JS::Stencil generated by off-thread or
+void ScriptLoader::InstantiateStencil(
+    JSContext* aCx, JS::CompileOptions& aCompileOptions, JS::Stencil* aStencil,
+    JS::MutableHandle<JSScript*> aScript,
+    JS::Handle<JSScript*> aDebuggerIntroductionScript, ErrorResult& aRv,
+    JS::InstantiationStorage* aStorage ,
+    CollectDelazifications aCollectDelazifications
+    ) {
+
+  JS::InstantiateOptions instantiateOptions(aCompileOptions);
+  JS::Rooted<JSScript*> script(
+      aCx, JS::InstantiateGlobalStencil(aCx, instantiateOptions, aStencil,
+                                        aStorage));
+  if (!script) {
+    aRv.NoteJSContextException(aCx);
+    return;
+  }
+
+  if (aCollectDelazifications == CollectDelazifications::Yes) {
+    if (!StartCollectingDelazifications(aCx, script, aStencil)) {
+      aRv.NoteJSContextException(aCx);
+      return;
+    }
+  }
+
+  aScript.set(script);
+
+  if (instantiateOptions.deferDebugMetadata) {
+    JS::Rooted<JS::Value> unused(aCx);
+    if (!JS::UpdateDebugMetadata(aCx, aScript, instantiateOptions, unused,
+                                 nullptr, aDebuggerIntroductionScript,
+                                 nullptr)) {
+      aRv = NS_ERROR_OUT_OF_MEMORY;
+    }
+  }
+}
+
+void ScriptLoader::InstantiateClassicScriptFromMaybeEncodedSource(
+    JSContext* aCx, JS::CompileOptions& aCompileOptions,
+    ScriptLoadRequest* aRequest, JS::MutableHandle<JSScript*> aScript,
+    JS::Handle<JSScript*> aDebuggerIntroductionScript, ErrorResult& aRv) {
+  MOZ_ASSERT(!aRequest->IsWasmBytes());
+  CalculateCacheFlag(aRequest);
+
+  if (aRequest->IsRetrievedAsSerializedStencil()) {
+    if (aRequest->GetScriptLoadContext()->mCompileOrDecodeTask) {
+      LOG(("ScriptLoadRequest (%p): Decode & instantiate and Execute",
+           aRequest));
+      RefPtr<JS::Stencil> stencil;
+      JS::InstantiationStorage storage;
+      MOZ_ASSERT(aCompileOptions.noScriptRval);
+      stencil =
+          aRequest->GetScriptLoadContext()->StealOffThreadResult(aCx, &storage);
+      if (!stencil) {
+        aRv.NoteJSContextException(aCx);
+        return;
+      }
+
+      aRequest->SetStencil(stencil);
+
+      InstantiateStencil(aCx, aCompileOptions, stencil, aScript,
+                         aDebuggerIntroductionScript, aRv, &storage);
+    } else {
+      LOG(("ScriptLoadRequest (%p): Decode and Execute", aRequest));
+
+      RefPtr<JS::Stencil> stencil;
+      {
+        Decode(aCx, aCompileOptions, aRequest->SerializedStencil(), stencil,
+               aRv);
+      }
+
+      if (stencil) {
+        aRequest->SetStencil(stencil);
+
+        InstantiateStencil(aCx, aCompileOptions, stencil, aScript,
+                           aDebuggerIntroductionScript, aRv);
+      }
+    }
+
+    MOZ_ASSERT(!aRequest->getLoadedScript()->HasDiskCacheReference());
+    return;
+  }
+
+  MOZ_ASSERT(aRequest->IsFetchedAsTextSource());
+  CollectDelazifications collectDelazifications =
+      aRequest->PassedConditionForEitherCache() ? CollectDelazifications::Yes
+                                                : CollectDelazifications::No;
+
+  if (aRequest->GetScriptLoadContext()->mCompileOrDecodeTask) {
+    LOG(
+        ("ScriptLoadRequest (%p): instantiate off-thread result and "
+         "Execute",
+         aRequest));
+    MOZ_ASSERT(aRequest->IsFetchedAsTextSource());
+    RefPtr<JS::Stencil> stencil;
+    JS::InstantiationStorage storage;
+    MOZ_ASSERT(aCompileOptions.noScriptRval);
+    stencil =
+        aRequest->GetScriptLoadContext()->StealOffThreadResult(aCx, &storage);
+    if (!stencil) {
+      aRv.NoteJSContextException(aCx);
+      return;
+    }
+
+    aRequest->SetStencil(stencil);
+
+    InstantiateStencil(aCx, aCompileOptions, stencil, aScript,
+                       aDebuggerIntroductionScript, aRv, &storage,
+                       collectDelazifications);
+  } else {
+    LOG(("ScriptLoadRequest (%p): Compile And Exec", aRequest));
+    MOZ_ASSERT(aRequest->IsFetchedAsTextSource());
+    MaybeSourceText maybeSource;
+    aRv = aRequest->GetScriptSource(aCx, &maybeSource,
+                                    aRequest->mLoadContext.get());
+    if (!aRv.Failed()) {
+      RefPtr<JS::Stencil> stencil;
+      ErrorResult erv;
+      auto compile = [&](auto& source) {
+
+        stencil = CompileGlobalScriptToStencil(aCx, aCompileOptions, source);
+        if (!stencil) {
+          erv.NoteJSContextException(aCx);
+        }
+      };
+
+      MOZ_ASSERT(!maybeSource.empty());
+      maybeSource.mapNonEmpty(compile);
+
+      if (stencil) {
+        aRequest->SetStencil(stencil);
+
+        InstantiateStencil(aCx, aCompileOptions, stencil, aScript,
+                           aDebuggerIntroductionScript, erv,
+                            nullptr,
+                           collectDelazifications);
+      }
+
+      aRv = std::move(erv);
+    }
+  }
+}
+
+void ScriptLoader::InstantiateClassicScriptFromCachedStencil(
+    JSContext* aCx, JS::CompileOptions& aCompileOptions,
+    ScriptLoadRequest* aRequest, JS::Stencil* aStencil,
+    JS::MutableHandle<JSScript*> aScript,
+    JS::Handle<JSScript*> aDebuggerIntroductionScript, ErrorResult& aRv) {
+  MOZ_ASSERT(!aRequest->IsWasmBytes());
+  CalculateCacheFlag(aRequest);
+
+  MOZ_ASSERT(aRequest->PassedConditionForMemoryCache());
+
+  InstantiateStencil(aCx, aCompileOptions, aStencil, aScript,
+                     aDebuggerIntroductionScript, aRv,
+                      nullptr, CollectDelazifications::Yes);
+}
+
+void ScriptLoader::InstantiateClassicScriptFromAny(
+    JSContext* aCx, JS::CompileOptions& aCompileOptions,
+    ScriptLoadRequest* aRequest, JS::MutableHandle<JSScript*> aScript,
+    JS::Handle<JSScript*> aDebuggerIntroductionScript, ErrorResult& aRv) {
+  MOZ_ASSERT(!aRequest->IsWasmBytes());
+  if (aRequest->IsRetrievedFromMemoryCache()) {
+    RefPtr<JS::Stencil> stencil = aRequest->GetStencil();
+    InstantiateClassicScriptFromCachedStencil(aCx, aCompileOptions, aRequest,
+                                              stencil, aScript,
+                                              aDebuggerIntroductionScript, aRv);
+    return;
+  }
+
+  InstantiateClassicScriptFromMaybeEncodedSource(
+      aCx, aCompileOptions, aRequest, aScript, aDebuggerIntroductionScript,
+      aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  TryCacheRequest(aRequest);
+}
+
+ScriptLoader::CacheBehavior ScriptLoader::GetCacheBehavior(
+    ScriptLoadRequest* aRequest) {
+  if (!mCache) {
+    return CacheBehavior::DoNothingDisabled;
+  }
+
+  if (aRequest->ExpirationTime().IsExpired()) {
+    return CacheBehavior::Evict;
+  }
+
+  if (ShouldBypassCache()) {
+    return CacheBehavior::Insert;
+  }
+
+  ScriptHashKey key(this, aRequest, aRequest->ReferrerPolicy(),
+                    aRequest->FetchOptions(),
+                    aRequest->getLoadedScript()->GetURI());
+  auto cacheResult = mCache->Lookup(*this, key,
+                                     true);
+  MOZ_ASSERT_IF(cacheResult.mState == CachedSubResourceState::Complete,
+                cacheResult.mCompleteValue->IsCachedStencil() ||
+                    cacheResult.mCompleteValue->IsInvalidatedCachedStencil());
+  if (cacheResult.mState == CachedSubResourceState::Complete &&
+      cacheResult.mCompleteValue->IsCachedStencil()) {
+    if (!cacheResult.mCompleteValue->IsSRIMetadataReusableBy(
+            aRequest->mIntegrity)) {
+      mCache->Evict(key);
+      return CacheBehavior::Insert;
+    }
+
+    return CacheBehavior::DoNothingExisting;
+  }
+
+  return CacheBehavior::Insert;
+}
+
+void ScriptLoader::TryCacheRequest(ScriptLoadRequest* aRequest) {
+  MOZ_ASSERT(aRequest->HasStencil());
+  MOZ_ASSERT(!aRequest->IsWasmBytes());
+
+  if (aRequest->IsMarkedNotCacheable()) {
+    aRequest->ClearStencil();
+    return;
+  }
+
+  CacheBehavior cacheBehavior = GetCacheBehavior(aRequest);
+
+  if (cacheBehavior == CacheBehavior::DoNothingDisabled) {
+    if (!aRequest->PassedConditionForDiskCache()) {
+      aRequest->ClearStencil();
+    }
+    return;
+  }
+
+  if (cacheBehavior == CacheBehavior::DoNothingExisting) {
+    aRequest->ClearStencil();
+    return;
+  }
+
+  MOZ_ASSERT(mCache);
+
+  if (mCache->IsLowMemory()) {
+    aRequest->ClearStencil();
+    return;
+  }
+
+  if (!JS::IsStencilCacheable(aRequest->GetStencil())) {
+    cacheBehavior = CacheBehavior::Evict;
+  }
+
+  if (cacheBehavior == CacheBehavior::Insert) {
+    LoadedScript* loadedScript = aRequest->getLoadedScript();
+    CacheExpirationTime expirationTime = aRequest->ExpirationTime();
+    loadedScript->ConvertToCachedStencil(aRequest->GetStencil(),
+                                         aRequest->ReferrerPolicy(),
+                                         aRequest->BaseURL());
+    if (loadedScript->mFetchCount == 0) {
+      loadedScript->mFetchCount = 1;
+    }
+    loadedScript->SetSRIMetadata(aRequest->mIntegrity);
+    auto loadData = MakeRefPtr<ScriptLoadData>(this, aRequest, expirationTime,
+                                               loadedScript);
+    mCache->Insert(*loadData);
+    LOG(("ScriptLoader (%p): Inserting in-memory cache for %s.", this,
+         aRequest->URI()->GetSpecOrDefault().get()));
+  } else {
+
+    MOZ_ASSERT(cacheBehavior == CacheBehavior::Evict);
+    ScriptHashKey key(this, aRequest, aRequest->ReferrerPolicy(),
+                      aRequest->FetchOptions(), aRequest->URI());
+    mCache->Evict(key);
+    LOG(("ScriptLoader (%p): Evicting in-memory cache for %s.", this,
+         aRequest->URI()->GetSpecOrDefault().get()));
+
+  }
+
+  aRequest->ClearStencil();
+}
+
+nsCString& ScriptLoader::BytecodeMimeTypeFor(
+    const ScriptLoadRequest* aRequest) {
+  if (aRequest->IsModuleRequest()) {
+    return nsContentUtils::JSModuleBytecodeMimeType();
+  }
+  return nsContentUtils::JSScriptBytecodeMimeType();
+}
+
+nsCString& ScriptLoader::BytecodeMimeTypeFor(
+    const JS::loader::LoadedScript* aLoadedScript) {
+  if (aLoadedScript->IsModuleScript()) {
+    return nsContentUtils::JSModuleBytecodeMimeType();
+  }
+  return nsContentUtils::JSScriptBytecodeMimeType();
+}
+
+nsresult ScriptLoader::MaybePrepareForDiskCacheAfterExecute(
+    ScriptLoadRequest* aRequest, nsresult aRv) {
+  MOZ_ASSERT(!aRequest->IsWasmBytes());
+  if (mCache) {
+    return NS_OK;
+  }
+
+  if (!aRequest->PassedConditionForDiskCache() || !aRequest->HasStencil()) {
+    LOG(("ScriptLoadRequest (%p): Bytecode-cache: disabled (rv = %X)", aRequest,
+         unsigned(aRv)));
+
+    if (aRequest->HasStencil()) {
+      MOZ_ASSERT_IF(!aRequest->PassedConditionForMemoryCache(),
+                    !aRequest->getLoadedScript()->HasDiskCacheReference());
+    } else {
+      aRequest->getLoadedScript()->DropDiskCacheReferenceAndSRI();
+    }
+
+    return aRv;
+  }
+
+  MOZ_ASSERT(aRequest->GetSRILength() == aRequest->SRI().length());
+  RegisterForDiskCache(aRequest);
+
+  return aRv;
+}
+
+nsresult ScriptLoader::MaybePrepareModuleForDiskCacheAfterExecute(
+    ModuleLoadRequest* aRequest, nsresult aRv) {
+  MOZ_ASSERT(aRequest->IsTopLevel() || aRequest->IsDynamicImport());
+  MOZ_ASSERT(!aRequest->IsWasmBytes());
+
+  if (mCache) {
+    return NS_OK;
+  }
+
+
+  aRv = MaybePrepareForDiskCacheAfterExecute(aRequest, aRv);
+
+  for (auto* r = mDiskCacheableDependencyModules.getFirst(); r;) {
+    auto* dep = r->AsModuleRequest();
+    MOZ_ASSERT(dep->PassedConditionForDiskCache());
+
+    r = r->getNext();
+
+    if (dep->GetRootModule() != aRequest) {
+      continue;
+    }
+
+    mDiskCacheableDependencyModules.Remove(dep);
+
+    aRv = MaybePrepareForDiskCacheAfterExecute(dep, aRv);
+  }
+
+  return aRv;
+}
+
+nsresult ScriptLoader::EvaluateScript(nsIGlobalObject* aGlobalObject,
+                                      ScriptLoadRequest* aRequest) {
+  MOZ_ASSERT(!aRequest->IsWasmBytes());
+  nsAutoMicroTask mt;
+  AutoEntryScript aes(aGlobalObject, "EvaluateScript", true);
+  JSContext* cx = aes.cx();
+
+  MOZ_ASSERT(aRequest->mLoadedScript->IsClassicScript());
+
+  JS::CompileOptions options(cx);
+  JS::Rooted<JSScript*> introductionScript(cx);
+  nsresult rv =
+      FillCompileOptionsForRequest(cx, aRequest, &options, &introductionScript);
+
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (!aRequest->IsRetrievedFromMemoryCache() &&
+      aRequest->IsFetchedAsTextSource() &&
+      aRequest->ScriptTextLength() < OffThreadMinimumTextLength &&
+      ShouldApplyDelazifyStrategy(aRequest)) {
+    ApplyDelazifyStrategy(&options);
+    mTotalFullParseSize +=
+        aRequest->ScriptTextLength() > 0
+            ? static_cast<uint32_t>(aRequest->ScriptTextLength())
+            : 0;
+
+    LOG(
+        ("ScriptLoadRequest (%p): non-on-demand-only (non-omt) Parsing Enabled "
+         "for url=%s mTotalFullParseSize=%u",
+         aRequest, aRequest->URI()->GetSpecOrDefault().get(),
+         mTotalFullParseSize));
+  }
+
+  JS::Rooted<JSObject*> global(cx, aGlobalObject->GetGlobalJSObject());
+  if (MOZ_UNLIKELY(!xpc::Scriptability::Get(global).Allowed())) {
+    return NS_OK;
+  }
+  ErrorResult erv;
+  JSAutoRealm autoRealm(cx, global);
+  JS::Rooted<JSScript*> script(cx);
+  InstantiateClassicScriptFromAny(cx, options, aRequest, &script,
+                                  introductionScript, erv);
+
+  if (!erv.Failed()) {
+    LOG(("ScriptLoadRequest (%p): Evaluate Script", aRequest));
+
+    MOZ_ASSERT(options.noScriptRval);
+
+    if (script && JS::GetScriptPrivate(script).isUndefined()) {
+      aRequest->FetchInfo()->AssociateWithScript(script);
+    }
+
+    ExecuteCompiledScript(cx, script, erv);
+  }
+  rv = EvaluationExceptionToNSResult(erv);
+
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  rv = MaybePrepareForDiskCacheAfterExecute(aRequest, rv);
+
+  LOG(("ScriptLoadRequest (%p): ScriptLoader = %p", aRequest, this));
+  MaybeUpdateDiskCache();
+
+  return rv;
+}
+
+ScriptFetchInfo* ScriptLoader::GetActiveScriptFetchInfo(JSContext* aCx) {
+  JS::Value value = JS::GetScriptedCallerPrivate(aCx);
+  if (value.isUndefined()) {
+    return nullptr;
+  }
+
+  return static_cast<ScriptFetchInfo*>(value.toPrivate());
+}
+
+void ScriptLoader::RegisterForDiskCache(ScriptLoadRequest* aRequest) {
+  MOZ_ASSERT(!mCache);
+  MOZ_ASSERT(aRequest->PassedConditionForDiskCache());
+  MOZ_ASSERT(aRequest->HasStencil());
+  MOZ_ASSERT(aRequest->getLoadedScript()->HasDiskCacheReference());
+  MOZ_DIAGNOSTIC_ASSERT(!aRequest->isInList());
+
+  LoadedScript* loadedScript = aRequest->getLoadedScript();
+  MOZ_ASSERT(loadedScript->IsTextSource(),
+             "Serialized stencil case shouldn't be saved again");
+  loadedScript->ConvertToCachedStencil(
+      aRequest->GetStencil(), aRequest->ReferrerPolicy(), aRequest->BaseURL());
+  mDiskCacheQueue.AppendElement(loadedScript);
+
+  aRequest->ClearStencil();
+}
+
+void ScriptLoader::LoadEventFired() {
+  mLoadEventFired = true;
+  MaybeUpdateDiskCache();
+}
+
+void ScriptLoader::Destroy() {
+  if (mObserver) {
+    mObserver->Unregister();
+    mObserver = nullptr;
+  }
+
+  CancelAndClearScriptLoadRequests();
+  GiveUpDiskCaching();
+  StopCollectingDelazifications();
+}
+
+void ScriptLoader::OnMemoryPressure() {
+
+  StopCollectingDelazifications();
+}
+
+void ScriptLoader::StopCollectingDelazifications() {
+
+  for (size_t i = 0; i < mDelazificationCollectingScripts.Length(); ++i) {
+    JSScript* script = mDelazificationCollectingScripts[i];
+    JS::AbortCollectingDelazifications(script);
+  }
+  mDelazificationCollectingScripts.Clear();
+
+  for (size_t i = 0; i < mDelazificationCollectingModules.Length(); ++i) {
+    JSObject* module = mDelazificationCollectingModules[i];
+    JS::AbortCollectingDelazifications(module);
+  }
+  mDelazificationCollectingModules.Clear();
+
+  mozilla::DropJSObjects(this);
+}
+
+void ScriptLoader::MaybeUpdateDiskCache() {
+  if (!mLoadEventFired) {
+    LOG(("ScriptLoader (%p): Wait for the load-end event to fire.", this));
+    return;
+  }
+
+  if (HasPendingRequests()) {
+    LOG(("ScriptLoader (%p): Wait for other pending request to finish.", this));
+    return;
+  }
+
+  if (mCache) {
+    if (!mCache->MaybeScheduleUpdateDiskCache()) {
+    }
+
+    StopCollectingDelazifications();
+    return;
+  }
+
+  if (mGiveUpDiskCaching) {
+    LOG(("ScriptLoader (%p): Keep giving-up saving to the disk cache.", this));
+    GiveUpDiskCaching();
+    return;
+  }
+
+  if (mDiskCacheQueue.IsEmpty()) {
+    LOG(("ScriptLoader (%p): No script in queue to be saved to the disk.",
+         this));
+    return;
+  }
+
+  nsCOMPtr<nsIRunnable> encoder = NewRunnableMethod(
+      "ScriptLoader::UpdateCache", this, &ScriptLoader::UpdateDiskCache);
+  if (NS_FAILED(NS_DispatchToCurrentThreadQueue(encoder.forget(),
+                                                EventQueuePriority::Idle))) {
+    GiveUpDiskCaching();
+    return;
+  }
+
+  StopCollectingDelazifications();
+
+  LOG(("ScriptLoader (%p): Schedule the disk cache encoding.", this));
+}
+
+void ScriptLoader::UpdateDiskCache() {
+  MOZ_ASSERT(!mCache);
+  LOG(("ScriptLoader (%p): Start the disk cache encoding.", this));
+
+  if (HasPendingRequests()) {
+    return;
+  }
+
+  JS::FrontendContext* fc = JS::NewFrontendContext();
+  if (!fc) {
+    LOG(
+        ("ScriptLoader (%p): Cannot create FrontendContext for the disk cache "
+         "encoding.",
+         this));
+    return;
+  }
+
+  int32_t diskCacheMaxSizeInKb =
+      StaticPrefs::browser_cache_disk_max_entry_size();
+
+  for (auto& loadedScript : mDiskCacheQueue) {
+    if (!loadedScript->HasDiskCacheReference()) {
+      continue;
+    }
+
+    if (loadedScript->IsInvalidatedCachedStencil()) {
+      continue;
+    }
+
+    RefPtr<JS::Stencil> stencil = loadedScript->GetCachedStencil();
+
+    Vector<uint8_t> compressed;
+    if (!EncodeAndCompress(fc, loadedScript, stencil, loadedScript->SRI(),
+                           compressed)) {
+      loadedScript->DropDiskCacheReference();
+      loadedScript->DropSRIOrSRIAndSerializedStencil();
+      continue;
+    }
+
+    if (diskCacheMaxSizeInKb > 0) {
+      size_t sourceLength = JS::GetScriptSourceLength(stencil);
+      size_t expectedDiskCacheSize = sourceLength + compressed.length();
+      if (expectedDiskCacheSize > size_t(diskCacheMaxSizeInKb) * 1024) {
+        loadedScript->DropDiskCacheReference();
+        loadedScript->DropSRIOrSRIAndSerializedStencil();
+        continue;
+      }
+    }
+
+    if (!SaveToDiskCache(loadedScript, compressed)) {
+      loadedScript->DropDiskCacheReference();
+      loadedScript->DropSRIOrSRIAndSerializedStencil();
+      continue;
+    }
+
+    loadedScript->DropDiskCacheReference();
+    loadedScript->DropSRIOrSRIAndSerializedStencil();
+  }
+  mDiskCacheQueue.Clear();
+
+  JS::DestroyFrontendContext(fc);
+}
+
+bool ScriptLoader::EncodeAndCompress(
+    JS::FrontendContext* aFc, const JS::loader::LoadedScript* aLoadedScript,
+    JS::Stencil* aStencil, const JS::TranscodeBuffer& aSRI,
+    Vector<uint8_t>& aCompressed) {
+  size_t SRILength = aSRI.length();
+  MOZ_ASSERT(JS::IsTranscodingBytecodeOffsetAligned(SRILength));
+
+  JS::TranscodeBuffer SRIAndSerializedStencil;
+  if (!SRIAndSerializedStencil.appendAll(aSRI)) {
+    LOG(("LoadedScript (%p): Cannot allocate buffer", aLoadedScript));
+    return false;
+  }
+
+  JS::TranscodeResult result =
+      JS::EncodeStencil(aFc, aStencil, SRIAndSerializedStencil);
+
+  if (result != JS::TranscodeResult::Ok) {
+    JS::ClearFrontendErrors(aFc);
+
+    LOG(("LoadedScript (%p): Cannot encode stencil", aLoadedScript));
+    return false;
+  }
+
+  if (!ScriptBytecodeCompress(SRIAndSerializedStencil, SRILength,
+                              aCompressed)) {
+    return false;
+  }
+
+  if (aCompressed.length() >= UINT32_MAX) {
+    LOG(
+        ("LoadedScript (%p): Serialized stencil is too large to be decoded "
+         "correctly.",
+         aLoadedScript));
+    return false;
+  }
+
+  return true;
+}
+
+bool ScriptLoader::SaveToDiskCache(
+    const JS::loader::LoadedScript* aLoadedScript,
+    const Vector<uint8_t>& aCompressed) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  nsCOMPtr<nsIAsyncOutputStream> output;
+  nsresult rv = aLoadedScript->mCacheEntry->OpenAlternativeOutputStream(
+      BytecodeMimeTypeFor(aLoadedScript),
+      static_cast<int64_t>(aCompressed.length()), getter_AddRefs(output));
+  if (NS_FAILED(rv)) {
+    LOG(
+        ("LoadedScript (%p): Cannot open the disk cache (rv = %X, output "
+         "= %p)",
+         aLoadedScript, unsigned(rv), output.get()));
+    return false;
+  }
+  MOZ_ASSERT(output);
+
+  auto closeOutStream = mozilla::MakeScopeExit([&]() {
+    rv = output->CloseWithStatus(rv);
+    LOG(("LoadedScript (%p): Closing (rv = %X)", aLoadedScript, unsigned(rv)));
+  });
+
+  uint32_t n;
+  rv = output->Write(reinterpret_cast<const char*>(aCompressed.begin()),
+                     aCompressed.length(), &n);
+  LOG(
+      ("LoadedScript (%p): Write the disk cache (rv = %X, length = %u, "
+       "written = %u)",
+       aLoadedScript, unsigned(rv), unsigned(aCompressed.length()), n));
+  if (NS_FAILED(rv)) {
+    return false;
+  }
+
+  MOZ_RELEASE_ASSERT(aCompressed.length() == n);
+  return true;
+}
+
+void ScriptLoader::GiveUpDiskCaching() {
+  if (mCache) {
+    MOZ_ASSERT(mDiskCacheQueue.IsEmpty());
+    MOZ_ASSERT(mDiskCacheableDependencyModules.isEmpty());
+    return;
+  }
+
+  mGiveUpDiskCaching = true;
+
+  for (auto& loadedScript : mDiskCacheQueue) {
+    LOG(("LoadedScript (%p): Giving up encoding the disk cache",
+         loadedScript.get()));
+
+    loadedScript->DropDiskCacheReference();
+    loadedScript->DropSRIOrSRIAndSerializedStencil();
+  }
+  mDiskCacheQueue.Clear();
+
+  while (!mDiskCacheableDependencyModules.isEmpty()) {
+    RefPtr<ScriptLoadRequest> request =
+        mDiskCacheableDependencyModules.StealFirst();
+  }
+}
+
+bool ScriptLoader::HasPendingRequests() const {
+  return mParserBlockingRequest || !mXSLTRequests.isEmpty() ||
+         !mLoadedAsyncRequests.isEmpty() ||
+         !mNonAsyncExternalScriptInsertedRequests.isEmpty() ||
+         !mDeferRequests.isEmpty() || HasPendingDynamicImports() ||
+         !mPendingChildLoaders.IsEmpty();
+}
+
+bool ScriptLoader::HasPendingDynamicImports() const {
+  if (mModuleLoader && mModuleLoader->HasPendingDynamicImports()) {
+    return true;
+  }
+
+  return false;
+}
+
+void ScriptLoader::ProcessPendingRequestsAsync() {
+  if (HasPendingRequests()) {
+    nsCOMPtr<nsIRunnable> task = NewRunnableMethod<bool>(
+        "dom::ScriptLoader::ProcessPendingRequests", this,
+        &ScriptLoader::ProcessPendingRequests, false);
+    if (mDocument) {
+      mDocument->Dispatch(task.forget());
+    } else {
+      NS_DispatchToCurrentThread(task.forget());
+    }
+  }
+}
+
+void ProcessPendingRequestsCallback(nsITimer* aTimer, void* aClosure) {
+  RefPtr<ScriptLoader> sl = static_cast<ScriptLoader*>(aClosure);
+  sl->ProcessPendingRequests(true);
+}
+
+void ScriptLoader::ProcessPendingRequestsAsyncBypassParserBlocking() {
+  MOZ_ASSERT(HasPendingRequests());
+
+  if (!mProcessPendingRequestsAsyncBypassParserBlocking) {
+    mProcessPendingRequestsAsyncBypassParserBlocking = NS_NewTimer();
+  }
+
+  mProcessPendingRequestsAsyncBypassParserBlocking->InitWithNamedFuncCallback(
+      ProcessPendingRequestsCallback, this, 2500, nsITimer::TYPE_ONE_SHOT,
+      "ProcessPendingRequestsAsyncBypassParserBlocking"_ns);
+}
+
+void ScriptLoader::ProcessPendingRequests(bool aAllowBypassingParserBlocking) {
+  RefPtr<ScriptLoadRequest> request;
+
+  if (mProcessPendingRequestsAsyncBypassParserBlocking) {
+    mProcessPendingRequestsAsyncBypassParserBlocking->Cancel();
+  }
+
+  if (mParserBlockingRequest) {
+    if (mParserBlockingRequest->IsFinished() &&
+        ReadyToExecuteParserBlockingScripts()) {
+      request.swap(mParserBlockingRequest);
+      UnblockParser(request);
+      ProcessRequest(request);
+      ContinueParserAsync(request);
+      ProcessPendingRequestsAsync();
+      return;
+    }
+
+    if (!aAllowBypassingParserBlocking) {
+      ProcessPendingRequestsAsyncBypassParserBlocking();
+      return;
+    }
+  }
+
+  while (ReadyToExecuteParserBlockingScripts() && !mXSLTRequests.isEmpty() &&
+         mXSLTRequests.getFirst()->IsFinished()) {
+    request = mXSLTRequests.StealFirst();
+    ProcessRequest(request);
+  }
+
+  while (ReadyToExecuteScripts() && !mLoadedAsyncRequests.isEmpty()) {
+    if (mLoadedAsyncRequests.getFirst()->TookLongInPreviousRuns() &&
+        !mLoadedAsyncRequests.getFirst()->HadPostponed() && IsBeforeFCP()) {
+      mLoadedAsyncRequests.getFirst()->SetHadPostponed();
+      ProcessPendingRequestsAsync();
+      return;
+    }
+
+    request = mLoadedAsyncRequests.StealFirst();
+    if (request->IsModuleRequest()) {
+      ProcessRequest(request);
+    } else {
+      CompileOffThreadOrProcessRequest(request);
+    }
+  }
+
+  while (ReadyToExecuteScripts() &&
+         !mNonAsyncExternalScriptInsertedRequests.isEmpty() &&
+         mNonAsyncExternalScriptInsertedRequests.getFirst()->IsFinished()) {
+    request = mNonAsyncExternalScriptInsertedRequests.StealFirst();
+    ProcessRequest(request);
+  }
+
+  if (mDeferCheckpointReached && mXSLTRequests.isEmpty()) {
+    while (ReadyToExecuteScripts() && !mDeferRequests.isEmpty() &&
+           mDeferRequests.getFirst()->IsFinished()) {
+      if (mDeferRequests.getFirst()->TookLongInPreviousRuns() &&
+          !mDeferRequests.getFirst()->HadPostponed() && IsBeforeFCP()) {
+        mDeferRequests.getFirst()->SetHadPostponed();
+        ProcessPendingRequestsAsync();
+        return;
+      }
+
+      request = mDeferRequests.StealFirst();
+      ProcessRequest(request);
+    }
+  }
+
+  while (!mPendingChildLoaders.IsEmpty() &&
+         ReadyToExecuteParserBlockingScripts()) {
+    RefPtr<ScriptLoader> child = mPendingChildLoaders[0];
+    mPendingChildLoaders.RemoveElementAt(0);
+    child->RemoveParserBlockingScriptExecutionBlocker();
+  }
+
+  if (mDeferCheckpointReached && mDocument && !mParserBlockingRequest &&
+      mNonAsyncExternalScriptInsertedRequests.isEmpty() &&
+      mXSLTRequests.isEmpty() && mDeferRequests.isEmpty() &&
+      MaybeRemovedDeferRequests()) {
+    return ProcessPendingRequests();
+  }
+
+  if (mDeferCheckpointReached && mDocument && !mParserBlockingRequest &&
+      mLoadingAsyncRequests.isEmpty() && mLoadedAsyncRequests.isEmpty() &&
+      mNonAsyncExternalScriptInsertedRequests.isEmpty() &&
+      mXSLTRequests.isEmpty() && mDeferRequests.isEmpty()) {
+    mDeferCheckpointReached = false;
+    mDocument->UnblockOnload(true);
+  }
+}
+
+bool ScriptLoader::IsBeforeFCP() {
+  if (mHadFCPDoNotUseDirectly) {
+    return false;
+  }
+
+  if (mLoadEventFired) {
+    return false;
+  }
+
+  if (!mDocument) {
+    return false;
+  }
+
+  nsPresContext* context = mDocument->GetPresContext();
+  if (!context) {
+    return false;
+  }
+
+  if (context->HadFirstContentfulPaint()) {
+    mHadFCPDoNotUseDirectly = true;
+    return false;
+  }
+
+  return true;
+}
+
+bool ScriptLoader::ReadyToExecuteParserBlockingScripts() {
+  if (!SelfReadyToExecuteParserBlockingScripts()) {
+    return false;
+  }
+
+  if (mDocument && mDocument->GetWindowContext()) {
+    for (WindowContext* wc =
+             mDocument->GetWindowContext()->GetParentWindowContext();
+         wc; wc = wc->GetParentWindowContext()) {
+      if (Document* doc = wc->GetDocument()) {
+        ScriptLoader* ancestor = doc->GetScriptLoader();
+        if (ancestor && !ancestor->SelfReadyToExecuteParserBlockingScripts() &&
+            ancestor->AddPendingChildLoader(this)) {
+          AddParserBlockingScriptExecutionBlocker();
+          return false;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+template <typename Unit>
+static nsresult ConvertToUnicode(nsIChannel* aChannel, const uint8_t* aData,
+                                 uint32_t aLength,
+                                 const nsAString& aHintCharset,
+                                 Document* aDocument, Unit*& aBufOut,
+                                 size_t& aLengthOut) {
+  if (!aLength) {
+    aBufOut = nullptr;
+    aLengthOut = 0;
+    return NS_OK;
+  }
+
+  auto data = Span(aData, aLength);
+
+
+  UniquePtr<Decoder> unicodeDecoder;
+
+  const Encoding* encoding;
+  std::tie(encoding, std::ignore) = Encoding::ForBOM(data);
+  if (encoding) {
+    unicodeDecoder = encoding->NewDecoderWithBOMRemoval();
+  }
+
+  if (!unicodeDecoder && aChannel) {
+    nsAutoCString label;
+    if (NS_SUCCEEDED(aChannel->GetContentCharset(label)) &&
+        (encoding = Encoding::ForLabel(label))) {
+      unicodeDecoder = encoding->NewDecoderWithoutBOMHandling();
+    }
+  }
+
+  if (!unicodeDecoder && (encoding = Encoding::ForLabel(aHintCharset))) {
+    unicodeDecoder = encoding->NewDecoderWithoutBOMHandling();
+  }
+
+  if (!unicodeDecoder && aDocument) {
+    unicodeDecoder =
+        aDocument->GetDocumentCharacterSet()->NewDecoderWithoutBOMHandling();
+  }
+
+  if (!unicodeDecoder) {
+    unicodeDecoder = WINDOWS_1252_ENCODING->NewDecoderWithoutBOMHandling();
+  }
+
+  auto signalOOM = mozilla::MakeScopeExit([&aBufOut, &aLengthOut]() {
+    aBufOut = nullptr;
+    aLengthOut = 0;
+  });
+
+  CheckedInt<size_t> bufferLength =
+      ScriptDecoding<Unit>::MaxBufferLength(unicodeDecoder, aLength);
+  if (!bufferLength.isValid()) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  CheckedInt<size_t> bufferByteSize = bufferLength * sizeof(Unit);
+  if (!bufferByteSize.isValid()) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  aBufOut = static_cast<Unit*>(js_malloc(bufferByteSize.value()));
+  if (!aBufOut) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  signalOOM.release();
+  aLengthOut = ScriptDecoding<Unit>::DecodeInto(
+      unicodeDecoder, data, Span(aBufOut, bufferLength.value()),
+       true);
+  return NS_OK;
+}
+
+nsresult ScriptLoader::ConvertToUTF16(
+    nsIChannel* aChannel, const uint8_t* aData, uint32_t aLength,
+    const nsAString& aHintCharset, Document* aDocument,
+    UniquePtr<char16_t[], JS::FreePolicy>& aBufOut, size_t& aLengthOut) {
+  char16_t* bufOut;
+  nsresult rv = ConvertToUnicode(aChannel, aData, aLength, aHintCharset,
+                                 aDocument, bufOut, aLengthOut);
+  if (NS_SUCCEEDED(rv)) {
+    aBufOut.reset(bufOut);
+  }
+  return rv;
+}
+
+nsresult ScriptLoader::ConvertToUTF8(
+    nsIChannel* aChannel, const uint8_t* aData, uint32_t aLength,
+    const nsAString& aHintCharset, Document* aDocument,
+    UniquePtr<Utf8Unit[], JS::FreePolicy>& aBufOut, size_t& aLengthOut) {
+  Utf8Unit* bufOut;
+  nsresult rv = ConvertToUnicode(aChannel, aData, aLength, aHintCharset,
+                                 aDocument, bufOut, aLengthOut);
+  if (NS_SUCCEEDED(rv)) {
+    aBufOut.reset(bufOut);
+  }
+  return rv;
+}
+
+nsresult ScriptLoader::OnStreamComplete(
+    nsIChannel* aChannel, ScriptLoadRequest* aRequest, nsresult aChannelStatus,
+    nsresult aSRIStatus, SRICheckDataVerifier* aSRIDataVerifier) {
+  NS_ASSERTION(aRequest, "null request in stream complete handler");
+  NS_ENSURE_TRUE(aRequest, NS_ERROR_FAILURE);
+
+  if (aRequest->IsCanceled()) {
+    return NS_BINDING_ABORTED;
+  }
+
+  nsresult rv = VerifySRI(aRequest, aChannel, aSRIStatus, aSRIDataVerifier);
+
+  if (NS_SUCCEEDED(rv)) {
+    bool IsFetchedAsTextSource = aRequest->IsFetchedAsTextSource();
+    nsCOMPtr<nsICacheInfoChannel> cacheInfo = do_QueryInterface(aChannel);
+    nsCOMPtr<nsICacheEntryWriteHandle> cacheEntry;
+    if (cacheInfo && NS_SUCCEEDED(cacheInfo->GetCacheEntryWriteHandle(
+                         getter_AddRefs(cacheEntry)))) {
+      uint64_t id;
+      nsresult rv = cacheInfo->GetCacheEntryId(&id);
+      if (NS_SUCCEEDED(rv)) {
+        LOG(("ScriptLoadRequest (%p): cacheEntryId = %zx", aRequest,
+             size_t(id)));
+
+        if (aRequest->HasDirtyCache()) {
+          ScriptHashKey key(this, aRequest, aRequest->ReferrerPolicy(),
+                            aRequest->FetchOptions(), aRequest->URI());
+          auto cacheResult = mCache->Lookup(*this, key,  true);
+          MOZ_ASSERT_IF(
+              cacheResult.mState == CachedSubResourceState::Complete,
+              cacheResult.mCompleteValue->IsCachedStencil() ||
+                  cacheResult.mCompleteValue->IsInvalidatedCachedStencil());
+          if (cacheResult.mState == CachedSubResourceState::Complete &&
+              cacheResult.mCompleteValue->IsCachedStencil() &&
+              cacheResult.mCompleteValue->IsSRIMetadataReusableBy(
+                  aRequest->mIntegrity) &&
+              cacheResult.mCompleteValue->CacheEntryId() == id) {
+            cacheResult.mCompleteValue->UnsetDirty();
+            aRequest->CacheEntryRevived(cacheResult.mCompleteValue);
+
+            MOZ_ASSERT(aRequest->IsFetching());
+
+            cacheResult.mCompleteValue->AddFetchCount();
+
+          } else {
+            mCache->Evict(key);
+          }
+        }
+
+        aRequest->getLoadedScript()->SetCacheEntryId(id);
+      }
+
+      if (!aRequest->IsRetrievedFromMemoryCache() && IsFetchedAsTextSource &&
+          StaticPrefs::dom_script_loader_bytecode_cache_enabled()) {
+        uint32_t fetchCount;
+        if (NS_SUCCEEDED(cacheInfo->GetCacheTokenFetchCount(&fetchCount))) {
+          if (fetchCount < UINT8_MAX) {
+            aRequest->getLoadedScript()->mFetchCount = fetchCount;
+          } else {
+            aRequest->getLoadedScript()->mFetchCount = UINT8_MAX;
+          }
+        }
+
+        aRequest->getLoadedScript()->mCacheEntry = cacheEntry;
+        LOG(("ScriptLoadRequest (%p): nsICacheEntryWriteHandle = %p", aRequest,
+             (void*)cacheEntry));
+
+        rv = SaveSRIHash(aRequest, aSRIDataVerifier);
+      }
+    }
+
+    if (NS_SUCCEEDED(rv)) {
+      rv = PrepareLoadedRequest(aRequest, aChannel, aChannelStatus);
+    }
+
+    if (NS_FAILED(rv)) {
+      aRequest->getLoadedScript()->DropDiskCacheReference();
+      ReportErrorToConsole(aRequest, rv);
+    }
+  }
+
+  if (NS_FAILED(rv)) {
+    if (aChannelStatus != NS_BINDING_RETARGETED) {
+      HandleLoadError(aRequest, rv);
+    }
+  }
+
+  ProcessPendingRequests();
+
+  return rv;
+}
+
+nsresult ScriptLoader::VerifySRI(ScriptLoadRequest* aRequest,
+                                 nsIChannel* aChannel, nsresult aSRIStatus,
+                                 SRICheckDataVerifier* aSRIDataVerifier) const {
+  nsresult rv = NS_OK;
+
+  if (!aRequest->mIntegrity.IsEmpty() && NS_SUCCEEDED((rv = aSRIStatus))) {
+    MOZ_ASSERT(aSRIDataVerifier);
+    MOZ_ASSERT(mReporter);
+    rv = aSRIDataVerifier->Verify(aRequest->mIntegrity, aChannel, mReporter);
+
+    mReporter->FlushReportsToConsole(
+        nsContentUtils::GetInnerWindowID(aChannel));
+
+    if (NS_FAILED(rv)) {
+      rv = NS_ERROR_SRI_CORRUPT;
+    }
+  }
+
+  return rv;
+}
+
+nsresult ScriptLoader::SaveSRIHash(
+    ScriptLoadRequest* aRequest, SRICheckDataVerifier* aSRIDataVerifier) const {
+  MOZ_ASSERT(aRequest->IsFetchedAsTextSource());
+  JS::TranscodeBuffer& sri = aRequest->SRI();
+  MOZ_ASSERT(sri.empty());
+
+  uint32_t len = 0;
+
+  if (!aRequest->mIntegrity.IsEmpty() && aSRIDataVerifier->IsComplete()) {
+    MOZ_ASSERT(sri.length() == 0);
+
+    len = aSRIDataVerifier->DataSummaryLength();
+
+    if (!sri.resize(len)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    DebugOnly<nsresult> res =
+        aSRIDataVerifier->ExportDataSummary(len, sri.begin());
+    MOZ_ASSERT(NS_SUCCEEDED(res));
+  } else {
+    MOZ_ASSERT(sri.length() == 0);
+
+    len = SRICheckDataVerifier::EmptyDataSummaryLength();
+
+    if (!sri.resize(len)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    DebugOnly<nsresult> res =
+        SRICheckDataVerifier::ExportEmptyDataSummary(len, sri.begin());
+    MOZ_ASSERT(NS_SUCCEEDED(res));
+  }
+
+  DebugOnly<uint32_t> srilen{};
+  MOZ_ASSERT(NS_SUCCEEDED(
+      SRICheckDataVerifier::DataSummaryLength(len, sri.begin(), &srilen)));
+  MOZ_ASSERT(srilen == len);
+
+  MOZ_ASSERT(sri.length() == len);
+  aRequest->SetSRILength(len);
+
+  if (aRequest->GetSRILength() != len) {
+    if (!sri.resize(aRequest->GetSRILength())) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+  }
+
+  return NS_OK;
+}
+
+void ScriptLoader::ReportErrorToConsole(ScriptLoadRequest* aRequest,
+                                        nsresult aResult) const {
+  MOZ_ASSERT(aRequest);
+
+  if (aRequest->GetScriptLoadContext()->IsPreload()) {
+    aRequest->GetScriptLoadContext()->mUnreportedPreloadError = aResult;
+    return;
+  }
+
+  if (!mDocument) {
+    return;
+  }
+
+  bool isScript = !aRequest->IsModuleRequest();
+  const char* message;
+  if (aResult == NS_ERROR_MALFORMED_URI) {
+    message = isScript ? "ScriptSourceMalformed" : "ModuleSourceMalformed";
+  } else if (aResult == NS_ERROR_DOM_BAD_URI) {
+    message = isScript ? "ScriptSourceNotAllowed" : "ModuleSourceNotAllowed";
+  } else {
+    message = isScript ? "ScriptSourceLoadFailed" : "ModuleSourceLoadFailed";
+  }
+
+  AutoTArray<nsString, 1> params;
+  CopyUTF8toUTF16(aRequest->URI()->GetSpecOrDefault(), *params.AppendElement());
+
+  Maybe<SourceLocation> loc;
+  if (!isScript && !aRequest->IsTopLevel()) {
+    MOZ_ASSERT(aRequest->mReferrer);
+    loc.emplace(aRequest->mReferrer.get());
+  } else {
+    uint32_t lineNo = aRequest->GetScriptLoadContext()->GetScriptLineNumber();
+    JS::ColumnNumberOneOrigin columnNo =
+        aRequest->GetScriptLoadContext()->GetScriptColumnNumber();
+    loc.emplace(mDocument->GetDocumentURI(), lineNo, columnNo.oneOriginValue());
+  }
+
+  nsContentUtils::ReportToConsole(
+      nsIScriptError::warningFlag, "Script Loader"_ns, mDocument,
+      PropertiesFile::DOM_PROPERTIES, message, params, loc.ref());
+}
+
+void ScriptLoader::ReportWarningToConsole(
+    ScriptLoadRequest* aRequest, const char* aMessageName,
+    const nsTArray<nsString>& aParams) const {
+  if (!mDocument) {
+    return;
+  }
+  uint32_t lineNo = aRequest->GetScriptLoadContext()->GetScriptLineNumber();
+  JS::ColumnNumberOneOrigin columnNo =
+      aRequest->GetScriptLoadContext()->GetScriptColumnNumber();
+  nsContentUtils::ReportToConsole(
+      nsIScriptError::warningFlag, "Script Loader"_ns, mDocument,
+      PropertiesFile::DOM_PROPERTIES, aMessageName, aParams,
+      SourceLocation{mDocument->GetDocumentURI(), lineNo,
+                     columnNo.oneOriginValue()});
+}
+
+void ScriptLoader::ReportPreloadErrorsToConsole(ScriptLoadRequest* aRequest) {
+  if (NS_FAILED(aRequest->GetScriptLoadContext()->mUnreportedPreloadError)) {
+    ReportErrorToConsole(
+        aRequest, aRequest->GetScriptLoadContext()->mUnreportedPreloadError);
+    aRequest->GetScriptLoadContext()->mUnreportedPreloadError = NS_OK;
+  }
+
+}
+
+void ScriptLoader::HandleLoadError(ScriptLoadRequest* aRequest,
+                                   nsresult aResult) {
+  bool wasHandled = false;
+
+  if (aRequest->IsModuleRequest()) {
+    MOZ_ASSERT(!aRequest->GetScriptLoadContext()->mIsInline);
+    wasHandled = true;
+
+    ModuleLoadRequest* modReq = aRequest->AsModuleRequest();
+    modReq->OnFetchComplete(aResult);
+
+    MOZ_ASSERT(modReq->IsErrored());
+  } else if (aRequest->GetScriptLoadContext()->mInDeferList) {
+    wasHandled = true;
+    if (aRequest->isInList()) {
+      RefPtr<ScriptLoadRequest> req = mDeferRequests.Steal(aRequest);
+      FireScriptAvailable(aResult, req);
+    }
+  } else if (aRequest->GetScriptLoadContext()->mInAsyncList) {
+    wasHandled = true;
+    if (aRequest->isInList()) {
+      RefPtr<ScriptLoadRequest> req = mLoadingAsyncRequests.Steal(aRequest);
+      FireScriptAvailable(aResult, req);
+    }
+  }
+
+  if (aRequest->GetScriptLoadContext()->mIsNonAsyncScriptInserted) {
+    if (aRequest->isInList()) {
+      RefPtr<ScriptLoadRequest> req =
+          mNonAsyncExternalScriptInsertedRequests.Steal(aRequest);
+      FireScriptAvailable(aResult, req);
+    }
+  } else if (aRequest->GetScriptLoadContext()->mIsXSLT) {
+    if (aRequest->isInList()) {
+      RefPtr<ScriptLoadRequest> req = mXSLTRequests.Steal(aRequest);
+      FireScriptAvailable(aResult, req);
+    }
+  } else if (aRequest->GetScriptLoadContext()->IsPreload()) {
+    if (aRequest->IsTopLevel()) {
+      mPreloads.RemoveElement(aRequest, PreloadRequestComparator());
+    }
+    MOZ_ASSERT(!aRequest->isInList());
+  } else if (mParserBlockingRequest == aRequest) {
+    MOZ_ASSERT(!aRequest->isInList());
+    mParserBlockingRequest = nullptr;
+    UnblockParser(aRequest);
+
+    MOZ_ASSERT(aRequest->GetScriptLoadContext()->GetParserCreated());
+    nsCOMPtr<nsIScriptElement> oldParserInsertedScript =
+        mCurrentParserInsertedScript;
+    mCurrentParserInsertedScript =
+        aRequest->GetScriptLoadContext()
+            ->GetScriptElementForCurrentParserInsertedScript();
+    FireScriptAvailable(aResult, aRequest);
+    ContinueParserAsync(aRequest);
+    mCurrentParserInsertedScript = std::move(oldParserInsertedScript);
+  } else if (!wasHandled) {
+    MOZ_ASSERT(aRequest->IsCanceled() ||
+               aRequest->GetScriptLoadContext()->IsLinkPreloadScript());
+    MOZ_ASSERT(!aRequest->isInList());
+  }
+}
+
+void ScriptLoader::HandleLoadErrorAndProcessPendingRequests(
+    ScriptLoadRequest* aRequest, nsresult aResult) {
+  HandleLoadError(aRequest, aResult);
+  ProcessPendingRequests();
+}
+
+void ScriptLoader::UnblockParser(ScriptLoadRequest* aParserBlockingRequest) {
+  aParserBlockingRequest->GetScriptLoadContext()->UnblockParser();
+}
+
+void ScriptLoader::ContinueParserAsync(
+    ScriptLoadRequest* aParserBlockingRequest) {
+  aParserBlockingRequest->GetScriptLoadContext()->ContinueParserAsync();
+}
+
+uint32_t ScriptLoader::NumberOfProcessors() {
+  if (mNumberOfProcessors > 0) {
+    return mNumberOfProcessors;
+  }
+
+  int32_t numProcs = PR_GetNumberOfProcessors();
+  if (numProcs > 0) {
+    mNumberOfProcessors = numProcs;
+  }
+  return mNumberOfProcessors;
+}
+
+int32_t ScriptLoader::PhysicalSizeOfMemoryInGB() {
+  if (mPhysicalSizeOfMemory >= 0) {
+    return mPhysicalSizeOfMemory;
+  }
+
+  mPhysicalSizeOfMemory =
+      static_cast<int32_t>(PR_GetPhysicalMemorySize() >> 30);
+  return mPhysicalSizeOfMemory;
+}
+
+bool ScriptLoader::ShouldApplyDelazifyStrategy(ScriptLoadRequest* aRequest) {
+  if (StaticPrefs::dom_script_loader_delazification_max_size() < 0) {
+    return true;
+  }
+
+  if (PhysicalSizeOfMemoryInGB() <=
+      StaticPrefs::dom_script_loader_delazification_min_mem()) {
+    return false;
+  }
+
+  uint32_t max_size = static_cast<uint32_t>(
+      StaticPrefs::dom_script_loader_delazification_max_size());
+  uint32_t script_size =
+      aRequest->ScriptTextLength() > 0
+          ? static_cast<uint32_t>(aRequest->ScriptTextLength())
+          : 0;
+
+  if (mTotalFullParseSize + script_size < max_size) {
+    return true;
+  }
+
+  if (LOG_ENABLED()) {
+    nsCString url = aRequest->URI()->GetSpecOrDefault();
+    LOG(
+        ("ScriptLoadRequest (%p): non-on-demand-only Parsing Disabled for (%s) "
+         "with size=%u because mTotalFullParseSize=%u would exceed max_size=%u",
+         aRequest, url.get(), script_size, mTotalFullParseSize, max_size));
+  }
+
+  return false;
+}
+
+void ScriptLoader::ApplyDelazifyStrategy(JS::CompileOptions* aOptions) {
+  JS::DelazificationOption strategy =
+      JS::DelazificationOption::ParseEverythingEagerly;
+  uint32_t strategyIndex =
+      StaticPrefs::dom_script_loader_delazification_strategy();
+
+#ifdef DEBUG
+  uint32_t count = 0;
+  uint32_t mask = 0;
+#  define _COUNT_ENTRIES(Name) count++;
+#  define _MASK_ENTRIES(Name) \
+    mask |= 1 << uint32_t(JS::DelazificationOption::Name);
+
+  FOREACH_DELAZIFICATION_STRATEGY(_COUNT_ENTRIES);
+  MOZ_ASSERT(count == uint32_t(strategy) + 1);
+  FOREACH_DELAZIFICATION_STRATEGY(_MASK_ENTRIES);
+  MOZ_ASSERT(((mask + 1) & mask) == 0);
+#  undef _COUNT_ENTRIES
+#  undef _MASK_ENTRIES
+#endif
+
+  if (strategyIndex <= uint32_t(strategy)) {
+    strategy = JS::DelazificationOption(uint8_t(strategyIndex));
+  }
+
+  aOptions->setEagerDelazificationStrategy(strategy);
+}
+
+bool ScriptLoader::ShouldCompileOffThread(ScriptLoadRequest* aRequest) {
+  if (NumberOfProcessors() <= 1) {
+    return false;
+  }
+  if (aRequest == mParserBlockingRequest) {
+    return true;
+  }
+  if (SpeculativeOMTParsingEnabled()) {
+    if (aRequest->GetScriptLoadContext()->mIsNonAsyncScriptInserted &&
+        !StaticPrefs::
+            dom_script_loader_external_scripts_speculate_non_parser_inserted_enabled()) {
+      return false;
+    }
+
+    if (aRequest->GetScriptLoadContext()->IsAsyncScript() &&
+        !StaticPrefs::
+            dom_script_loader_external_scripts_speculate_async_enabled()) {
+      return false;
+    }
+
+    if (aRequest->GetScriptLoadContext()->IsLinkPreloadScript() &&
+        !StaticPrefs::
+            dom_script_loader_external_scripts_speculate_link_preload_enabled()) {
+      return false;
+    }
+
+    return true;
+  }
+  return false;
+}
+
+static bool MimeTypeMatchesExpectedModuleType(
+    nsIChannel* aChannel, JS::ModuleType expectedModuleType) {
+  nsAutoCString mimeType;
+  aChannel->GetContentType(mimeType);
+  NS_ConvertUTF8toUTF16 typeString(mimeType);
+
+  switch (expectedModuleType) {
+    case JS::ModuleType::JavaScriptOrWasm:
+#ifdef NIGHTLY_BUILD
+      if (StaticPrefs::javascript_options_experimental_wasm_esm_integration()) {
+        return nsContentUtils::IsJavascriptMIMEType(typeString) ||
+               nsContentUtils::HasWasmMimeTypeEssence(typeString);
+      }
+#endif
+      return nsContentUtils::IsJavascriptMIMEType(typeString);
+    case JS::ModuleType::JSON:
+      return nsContentUtils::IsJsonMimeType(typeString);
+    case JS::ModuleType::CSS:
+      return nsContentUtils::HasCssMimeTypeEssence(typeString);
+    case JS::ModuleType::Text:
+      return true;
+    case JS::ModuleType::Unknown:
+    case JS::ModuleType::Bytes:
+      break;
+  }
+
+  return false;
+}
+
+nsresult ScriptLoader::PrepareLoadedRequest(ScriptLoadRequest* aRequest,
+                                            nsIChannel* aChannel,
+                                            nsresult aStatus) {
+
+  if (NS_FAILED(aStatus)) {
+    return aStatus;
+  }
+
+  MOZ_ASSERT(aRequest->IsFetching());
+  if (!mDocument) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  if (nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(aChannel)) {
+    bool requestSucceeded;
+    if (NS_SUCCEEDED(httpChannel->GetRequestSucceeded(&requestSucceeded)) &&
+        !requestSucceeded) {
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+
+    if (aRequest->IsModuleRequest()) {
+      ReferrerPolicy policy =
+          nsContentUtils::GetReferrerPolicyFromChannel(httpChannel);
+      if (policy != ReferrerPolicy::_empty) {
+        aRequest->AsModuleRequest()->UpdateReferrerPolicy(policy);
+      }
+    }
+
+    nsAutoCString sourceMapURL;
+    if (nsContentUtils::GetSourceMapURL(httpChannel, sourceMapURL)) {
+      aRequest->SetSourceMapURL(NS_ConvertUTF8toUTF16(sourceMapURL));
+    }
+
+  }
+
+  if (!aRequest->IsModuleRequest() && aRequest->CORSMode() == CORS_NONE) {
+    MOZ_TRY(nsContentUtils::GetSecurityManager()->GetChannelResultPrincipal(
+        aChannel, getter_AddRefs(aRequest->mOriginPrincipal)));
+  }
+
+  NS_ASSERTION(mDeferRequests.Contains(aRequest) ||
+                   mLoadingAsyncRequests.Contains(aRequest) ||
+                   mNonAsyncExternalScriptInsertedRequests.Contains(aRequest) ||
+                   mXSLTRequests.Contains(aRequest) ||
+                   (aRequest->IsModuleRequest() &&
+                    (aRequest->AsModuleRequest()->IsRegisteredDynamicImport() ||
+                     !aRequest->AsModuleRequest()->IsTopLevel())) ||
+                   mPreloads.Contains(aRequest, PreloadRequestComparator()) ||
+                   mParserBlockingRequest == aRequest,
+               "aRequest should be pending!");
+
+  nsCOMPtr<nsIURI> uri;
+  MOZ_TRY(aChannel->GetOriginalURI(getter_AddRefs(uri)));
+
+  aRequest->SetBaseURLFromChannelAndOriginalURI(aChannel, uri);
+
+  if (aRequest->IsModuleRequest()) {
+    ModuleLoadRequest* request = aRequest->AsModuleRequest();
+
+    if (!MimeTypeMatchesExpectedModuleType(aChannel, request->mModuleType)) {
+      if (LOG_ENABLED()) {
+        nsAutoCString spec;
+        uri->GetAsciiSpec(spec);
+        LOG(
+            ("ScriptLoadRequest (%p): MimeTypeMatchesExpectedModuleType check "
+             "failed for: %s",
+             aRequest, spec.get()));
+      }
+      return NS_ERROR_FAILURE;
+    }
+
+    bool couldCompile = false;
+    MOZ_TRY(AttemptOffThreadScriptCompile(request, &couldCompile));
+    if (couldCompile) {
+      return NS_OK;
+    }
+
+    return request->OnFetchComplete(NS_OK);
+  }
+
+  aRequest->SetReady();
+
+  if (ShouldCompileOffThread(aRequest)) {
+    MOZ_ASSERT(!aRequest->IsModuleRequest());
+    bool couldCompile = false;
+    MOZ_TRY(AttemptOffThreadScriptCompile(aRequest, &couldCompile));
+    if (couldCompile) {
+      MOZ_ASSERT(aRequest->mState == ScriptLoadRequest::State::Compiling,
+                 "Request should be off-thread compiling now.");
+      return NS_OK;
+    }
+
+  }
+
+  MaybeMoveToLoadedList(aRequest);
+
+  return NS_OK;
+}
+
+void ScriptLoader::DeferCheckpointReached() {
+  if (mDeferEnabled) {
+    mDeferCheckpointReached = true;
+  }
+
+  mDeferEnabled = false;
+  ProcessPendingRequests();
+}
+
+void ScriptLoader::ParsingComplete(bool aTerminated) {
+  if (aTerminated) {
+    CancelAndClearScriptLoadRequests();
+
+    DeferCheckpointReached();
+  }
+}
+
+void ScriptLoader::PreloadURI(
+    nsIURI* aURI, const nsAString& aCharset, const nsAString& aType,
+    const nsAString& aCrossOrigin, const nsAString& aNonce,
+    const nsAString& aFetchPriority, const nsAString& aIntegrity,
+    bool aScriptFromHead, bool aAsync, bool aDefer, bool aLinkPreload,
+    const ReferrerPolicy aReferrerPolicy, uint64_t aEarlyHintPreloaderId) {
+  NS_ENSURE_TRUE_VOID(mDocument);
+  if (!mEnabled || !mDocument->IsScriptEnabled()) {
+    return;
+  }
+
+  ScriptKind scriptKind = ScriptKind::eClassic;
+
+  static const char kASCIIWhitespace[] = "\t\n\f\r ";
+
+  nsAutoString type(aType);
+  type.Trim(kASCIIWhitespace);
+  if (type.LowerCaseEqualsASCII("module")) {
+    scriptKind = ScriptKind::eModule;
+  }
+
+  if (scriptKind == ScriptKind::eClassic && !aType.IsEmpty() &&
+      !nsContentUtils::IsJavascriptMIMEType(aType)) {
+    return;
+  }
+
+  SRIMetadata sriMetadata;
+  GetSRIMetadata(aIntegrity, &sriMetadata);
+  if (aIntegrity.IsVoid() && scriptKind == ScriptKind::eModule) {
+    mModuleLoader->GetImportMapSRI(aURI, mDocument->GetDocumentURIAsReferrer(),
+                                   mReporter, &sriMetadata);
+  }
+
+  const auto requestPriority = FetchPriorityToRequestPriority(
+      nsGenericHTMLElement::ToFetchPriority(aFetchPriority));
+
+  RefPtr<ScriptLoadRequest> request = CreateLoadRequest(
+      scriptKind, aURI, nullptr, VoidString(), mDocument->NodePrincipal(),
+      Element::StringToCORSMode(aCrossOrigin), aNonce, requestPriority,
+      sriMetadata, aReferrerPolicy,
+      aLinkPreload ? ParserMetadata::NotParserInserted
+                   : ParserMetadata::ParserInserted,
+      ScriptLoadRequestType::Preload);
+  request->GetScriptLoadContext()->mIsInline = false;
+  request->GetScriptLoadContext()->mScriptFromHead = aScriptFromHead;
+  request->GetScriptLoadContext()->SetScriptMode(aDefer, aAsync, aLinkPreload);
+  request->GetScriptLoadContext()->SetIsPreloadRequest();
+  request->mEarlyHintPreloaderId = aEarlyHintPreloaderId;
+
+  if (LOG_ENABLED()) {
+    nsAutoCString url;
+    aURI->GetAsciiSpec(url);
+    LOG(("ScriptLoadRequest (%p): Created preload request for %s",
+         request.get(), url.get()));
+  }
+
+  nsAutoString charset(aCharset);
+  nsresult rv = StartLoad(request, Some(charset));
+  if (NS_FAILED(rv)) {
+    return;
+  }
+
+  PreloadInfo* pi = mPreloads.AppendElement();
+  pi->mRequest = request;
+  pi->mCharset = aCharset;
+}
+
+void ScriptLoader::AddDeferRequest(ScriptLoadRequest* aRequest) {
+  MOZ_ASSERT(aRequest->GetScriptLoadContext()->IsDeferredScript());
+  MOZ_ASSERT(!aRequest->GetScriptLoadContext()->mInDeferList &&
+             !aRequest->GetScriptLoadContext()->mInAsyncList);
+  MOZ_ASSERT(!aRequest->GetScriptLoadContext()->mInCompilingList);
+
+  aRequest->GetScriptLoadContext()->mInDeferList = true;
+  mDeferRequests.AppendElement(aRequest);
+  if (mDeferEnabled && aRequest == mDeferRequests.getFirst() && mDocument &&
+      !mBlockingDOMContentLoaded) {
+    MOZ_ASSERT(mDocument->GetReadyStateEnum() == Document::READYSTATE_LOADING);
+    mBlockingDOMContentLoaded = true;
+    mDocument->BlockDOMContentLoaded();
+  }
+}
+
+void ScriptLoader::AddAsyncRequest(ScriptLoadRequest* aRequest) {
+  MOZ_ASSERT(aRequest->GetScriptLoadContext()->IsAsyncScript());
+  MOZ_ASSERT(!aRequest->GetScriptLoadContext()->mInDeferList &&
+             !aRequest->GetScriptLoadContext()->mInAsyncList);
+  MOZ_ASSERT(!aRequest->GetScriptLoadContext()->mInCompilingList);
+
+  aRequest->GetScriptLoadContext()->mInAsyncList = true;
+  if (aRequest->IsFinished()) {
+    mLoadedAsyncRequests.AppendElement(aRequest);
+  } else {
+    mLoadingAsyncRequests.AppendElement(aRequest);
+  }
+}
+
+void ScriptLoader::MaybeMoveToLoadedList(ScriptLoadRequest* aRequest) {
+  MOZ_ASSERT(aRequest->IsFinished());
+
+  bool isDynamicImport = false;
+  if (aRequest->IsModuleRequest()) {
+    ModuleLoadRequest* modReq = aRequest->AsModuleRequest();
+    isDynamicImport = modReq->IsDynamicImport();
+  }
+
+  MOZ_ASSERT(aRequest->IsTopLevel() || isDynamicImport);
+
+  if (aRequest->GetScriptLoadContext()->mInAsyncList) {
+    MOZ_ASSERT(aRequest->isInList());
+    if (aRequest->isInList()) {
+      RefPtr<ScriptLoadRequest> req = mLoadingAsyncRequests.Steal(aRequest);
+      mLoadedAsyncRequests.AppendElement(req);
+    }
+  } else if (isDynamicImport) {
+    MOZ_ASSERT(!aRequest->isInList());
+    mLoadedAsyncRequests.AppendElement(aRequest);
+  }
+}
+
+bool ScriptLoader::MaybeRemovedDeferRequests() {
+  if (mDeferRequests.isEmpty() && mDocument && mBlockingDOMContentLoaded) {
+    mBlockingDOMContentLoaded = false;
+    mDocument->UnblockDOMContentLoaded();
+    return true;
+  }
+  return false;
+}
+
+DocGroup* ScriptLoader::GetDocGroup() const { return mDocument->GetDocGroup(); }
+
+void ScriptLoader::BeginDeferringScripts() {
+  if (mDeferEnabled || mDeferCheckpointReached) {
+    mDeferCheckpointReached = false;
+  } else if (mDocument) {
+    mDocument->BlockOnload();
+  }
+  mDeferEnabled = true;
+}
+
+nsAutoScriptLoaderDisabler::nsAutoScriptLoaderDisabler(Document* aDoc) {
+  mLoader = aDoc->GetScriptLoader();
+  mWasEnabled = mLoader && mLoader->GetEnabled();
+  if (mWasEnabled) {
+    mLoader->SetEnabled(false);
+  }
+}
+
+nsAutoScriptLoaderDisabler::~nsAutoScriptLoaderDisabler() {
+  if (mWasEnabled) {
+    MOZ_ASSERT(mLoader, "mWasEnabled can be true only if we have a loader");
+    mLoader->SetEnabled(true);
+  }
+}
+
+#undef LOG
+
+}  

@@ -1,0 +1,214 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ImageBitmap_h
+#define mozilla_dom_ImageBitmap_h
+
+#include "ImageData.h"
+#include "gfxTypes.h"  // for gfxAlphaType
+#include "mozilla/Maybe.h"
+#include "mozilla/SurfaceFromElementResult.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/ImageBitmapBinding.h"
+#include "mozilla/dom/ImageBitmapSource.h"
+#include "mozilla/dom/TypedArray.h"
+#include "mozilla/gfx/Rect.h"
+#include "nsCycleCollectionParticipant.h"
+
+struct JSContext;
+struct JSStructuredCloneReader;
+struct JSStructuredCloneWriter;
+
+class nsIGlobalObject;
+
+namespace mozilla {
+
+class ErrorResult;
+
+namespace gfx {
+class DataSourceSurface;
+class DrawTarget;
+class SourceSurface;
+}  
+
+namespace layers {
+class Image;
+}
+
+namespace dom {
+class OffscreenCanvas;
+
+class ArrayBufferViewOrArrayBuffer;
+class CanvasRenderingContext2D;
+class CreateImageBitmapFromBlob;
+class CreateImageBitmapFromBlobTask;
+class CreateImageBitmapFromBlobWorkerTask;
+class ImageBitmapShutdownObserver;
+class File;
+class HTMLCanvasElement;
+class HTMLImageElement;
+class HTMLVideoElement;
+class ImageData;
+class ImageUtils;
+class Promise;
+class PostMessageEvent;  
+class SVGImageElement;
+class VideoFrame;
+class SendShutdownToWorkerThread;
+
+struct ImageBitmapCloneData final {
+  RefPtr<gfx::DataSourceSurface> mSurface;
+  gfx::IntRect mPictureRect;
+  gfxAlphaType mAlphaType;
+  bool mWriteOnly;
+};
+
+class ImageBitmap final : public nsISupports, public nsWrapperCache {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(ImageBitmap)
+
+  nsCOMPtr<nsIGlobalObject> GetParentObject() const { return mParent; }
+
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  uint32_t Width() const { return mPictureRect.Width(); }
+
+  uint32_t Height() const { return mPictureRect.Height(); }
+
+  void Close();
+
+  SurfaceFromElementResult SurfaceFrom(uint32_t aSurfaceFlags);
+
+  already_AddRefed<gfx::SourceSurface> PrepareForDrawTarget(
+      gfx::DrawTarget* aTarget);
+
+  already_AddRefed<layers::Image> TransferAsImage();
+
+  UniquePtr<ImageBitmapCloneData> ToCloneData() const;
+
+  static already_AddRefed<ImageBitmap> CreateFromSourceSurface(
+      nsIGlobalObject* aGlobal, gfx::SourceSurface* aSource, ErrorResult& aRv);
+
+  static already_AddRefed<ImageBitmap> CreateFromCloneData(
+      nsIGlobalObject* aGlobal, ImageBitmapCloneData* aData);
+
+  static already_AddRefed<ImageBitmap> CreateFromOffscreenCanvas(
+      nsIGlobalObject* aGlobal, OffscreenCanvas& aOffscreenCanvas,
+      ErrorResult& aRv);
+
+  static already_AddRefed<Promise> Create(nsIGlobalObject* aGlobal,
+                                          const ImageBitmapSource& aSrc,
+                                          const Maybe<gfx::IntRect>& aCropRect,
+                                          const ImageBitmapOptions& aOptions,
+                                          ErrorResult& aRv);
+
+  static JSObject* ReadStructuredClone(
+      JSContext* aCx, JSStructuredCloneReader* aReader,
+      nsIGlobalObject* aParent,
+      const nsTArray<RefPtr<gfx::DataSourceSurface>>& aClonedSurfaces,
+      uint32_t aIndex);
+
+  static void WriteStructuredClone(
+      JSStructuredCloneWriter* aWriter,
+      nsTArray<RefPtr<gfx::DataSourceSurface>>& aClonedSurfaces,
+      ImageBitmap* aImageBitmap, ErrorResult& aRv);
+
+  friend CreateImageBitmapFromBlob;
+  friend CreateImageBitmapFromBlobTask;
+  friend CreateImageBitmapFromBlobWorkerTask;
+  friend ImageBitmapShutdownObserver;
+
+  size_t GetAllocatedSize() const;
+
+  void OnShutdown();
+
+  bool IsWriteOnly() const { return mWriteOnly; }
+  bool IsClosed() const { return !mData; };
+
+ protected:
+  ImageBitmap(nsIGlobalObject* aGlobal, layers::Image* aData,
+              bool aAllocatedImageData, bool aWriteOnly,
+              gfxAlphaType aAlphaType = gfxAlphaType::Premult);
+
+  virtual ~ImageBitmap();
+
+  void SetPictureRect(const gfx::IntRect& aRect, ErrorResult& aRv);
+
+  void RemoveAssociatedMemory();
+
+  static already_AddRefed<ImageBitmap> CreateImageBitmapInternal(
+      nsIGlobalObject* aGlobal, gfx::SourceSurface* aSurface,
+      const Maybe<gfx::IntRect>& aCropRect, const ImageBitmapOptions& aOptions,
+      const bool aWriteOnly, const bool aAllocatedImageData,
+      const bool aMustCopy, const gfxAlphaType aAlphaType, ErrorResult& aRv);
+
+  static already_AddRefed<ImageBitmap> CreateInternal(
+      nsIGlobalObject* aGlobal, HTMLImageElement& aImageEl,
+      const Maybe<gfx::IntRect>& aCropRect, const ImageBitmapOptions& aOptions,
+      ErrorResult& aRv);
+
+  static already_AddRefed<ImageBitmap> CreateInternal(
+      nsIGlobalObject* aGlobal, SVGImageElement& aImageEl,
+      const Maybe<gfx::IntRect>& aCropRect, const ImageBitmapOptions& aOptions,
+      ErrorResult& aRv);
+
+  static already_AddRefed<ImageBitmap> CreateInternal(
+      nsIGlobalObject* aGlobal, HTMLVideoElement& aVideoEl,
+      const Maybe<gfx::IntRect>& aCropRect, const ImageBitmapOptions& aOptions,
+      ErrorResult& aRv);
+
+  static already_AddRefed<ImageBitmap> CreateInternal(
+      nsIGlobalObject* aGlobal, HTMLCanvasElement& aCanvasEl,
+      const Maybe<gfx::IntRect>& aCropRect, const ImageBitmapOptions& aOptions,
+      ErrorResult& aRv);
+
+  static already_AddRefed<ImageBitmap> CreateInternal(
+      nsIGlobalObject* aGlobal, OffscreenCanvas& aOffscreenCanvas,
+      const Maybe<gfx::IntRect>& aCropRect, const ImageBitmapOptions& aOptions,
+      ErrorResult& aRv);
+
+  static already_AddRefed<ImageBitmap> CreateInternal(
+      nsIGlobalObject* aGlobal, ImageData& aImageData,
+      const Maybe<gfx::IntRect>& aCropRect, const ImageBitmapOptions& aOptions,
+      ErrorResult& aRv);
+
+  static already_AddRefed<ImageBitmap> CreateInternal(
+      nsIGlobalObject* aGlobal, CanvasRenderingContext2D& aCanvasCtx,
+      const Maybe<gfx::IntRect>& aCropRect, const ImageBitmapOptions& aOptions,
+      ErrorResult& aRv);
+
+  static already_AddRefed<ImageBitmap> CreateInternal(
+      nsIGlobalObject* aGlobal, ImageBitmap& aImageBitmap,
+      const Maybe<gfx::IntRect>& aCropRect, const ImageBitmapOptions& aOptions,
+      ErrorResult& aRv);
+
+  static already_AddRefed<ImageBitmap> CreateInternal(
+      nsIGlobalObject* aGlobal, VideoFrame& aVideoFrame,
+      const Maybe<gfx::IntRect>& aCropRect, const ImageBitmapOptions& aOptions,
+      ErrorResult& aRv);
+
+  nsCOMPtr<nsIGlobalObject> mParent;
+
+  RefPtr<layers::Image> mData;
+  RefPtr<gfx::SourceSurface> mSurface;
+
+  gfx::IntRect mPictureRect;
+
+  gfxAlphaType mAlphaType;
+
+  RefPtr<SendShutdownToWorkerThread> mShutdownRunnable;
+
+  bool mAllocatedImageData;
+
+  bool mWriteOnly;
+};
+
+size_t BindingJSObjectMallocBytes(ImageBitmap* aBitmap);
+
+}  
+}  
+
+#endif  // mozilla_dom_ImageBitmap_h

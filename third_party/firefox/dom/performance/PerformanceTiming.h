@@ -1,0 +1,383 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_PerformanceTiming_h
+#define mozilla_dom_PerformanceTiming_h
+
+#include "CacheablePerformanceTimingData.h"
+#include "Performance.h"
+#include "ipc/EnumSerializer.h"
+#include "ipc/IPCMessageUtils.h"
+#include "ipc/IPCMessageUtilsSpecializations.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/PerformanceResourceTimingBinding.h"
+#include "mozilla/dom/PerformanceTimingTypes.h"
+#include "mozilla/net/nsServerTiming.h"
+#include "nsContentUtils.h"
+#include "nsDOMNavigationTiming.h"
+#include "nsITimedChannel.h"
+#include "nsRFPService.h"
+#include "nsWrapperCache.h"
+
+class nsIHttpChannel;
+
+namespace mozilla::dom {
+
+class PerformanceTiming;
+enum class RenderBlockingStatusType : uint8_t;
+
+class PerformanceTimingData final : public CacheablePerformanceTimingData {
+  friend class PerformanceTiming;
+  friend struct IPC::ParamTraits<mozilla::dom::PerformanceTimingData>;
+
+  static constexpr uint64_t kLocalCacheTransferSize = 0;
+
+ public:
+  PerformanceTimingData() = default;  
+  static UniquePtr<PerformanceTimingData> Create(nsITimedChannel* aChannel,
+                                                 nsIHttpChannel* aHttpChannel,
+                                                 DOMHighResTimeStamp aZeroTime,
+                                                 nsAString& aInitiatorType,
+                                                 nsAString& aEntryName);
+
+  PerformanceTimingData(nsITimedChannel* aChannel, nsIHttpChannel* aHttpChannel,
+                        DOMHighResTimeStamp aZeroTime);
+
+  static UniquePtr<PerformanceTimingData> Create(
+      const CacheablePerformanceTimingData& aCachedData,
+      DOMHighResTimeStamp aZeroTime, TimeStamp aStartTime, TimeStamp aEndTime,
+      RenderBlockingStatusType aRenderBlockingStatus);
+
+ private:
+  PerformanceTimingData(const CacheablePerformanceTimingData& aCachedData,
+                        DOMHighResTimeStamp aZeroTime, TimeStamp aStartTime,
+                        TimeStamp aEndTime,
+                        RenderBlockingStatusType aRenderBlockingStatus);
+
+ public:
+  explicit PerformanceTimingData(const IPCPerformanceTimingData& aIPCData);
+
+  IPCPerformanceTimingData ToIPC();
+
+  void SetPropertiesFromHttpChannel(nsIHttpChannel* aHttpChannel,
+                                    nsITimedChannel* aChannel);
+
+ private:
+  void SetTransferSizeFromHttpChannel(nsIHttpChannel* aHttpChannel);
+
+ public:
+  uint64_t TransferSize() const { return mTransferSize; }
+
+  inline DOMHighResTimeStamp TimeStampToReducedDOMHighResOrFetchStart(
+      Performance* aPerformance, TimeStamp aStamp) {
+    MOZ_ASSERT(aPerformance);
+
+    if (aStamp.IsNull()) {
+      return FetchStartHighRes(aPerformance);
+    }
+
+    DOMHighResTimeStamp rawTimestamp =
+        TimeStampToDOMHighRes(aPerformance, aStamp);
+
+    return nsRFPService::ReduceTimePrecisionAsMSecs(
+        rawTimestamp, aPerformance->GetRandomTimelineSeed(),
+        aPerformance->GetRTPCallerType());
+  }
+
+  inline DOMHighResTimeStamp TimeStampToDOMHighRes(Performance* aPerformance,
+                                                   TimeStamp aStamp) const {
+    MOZ_ASSERT(aPerformance);
+    MOZ_ASSERT(!aStamp.IsNull());
+
+    TimeDuration duration = aStamp - aPerformance->CreationTimeStamp();
+    return duration.ToMilliseconds() + mZeroTime;
+  }
+
+  DOMHighResTimeStamp AsyncOpenHighRes(Performance* aPerformance);
+
+  DOMHighResTimeStamp WorkerStartHighRes(Performance* aPerformance);
+  DOMHighResTimeStamp FetchStartHighRes(Performance* aPerformance);
+  DOMHighResTimeStamp RedirectStartHighRes(Performance* aPerformance);
+  DOMHighResTimeStamp RedirectEndHighRes(Performance* aPerformance);
+  DOMHighResTimeStamp DomainLookupStartHighRes(Performance* aPerformance);
+  DOMHighResTimeStamp DomainLookupEndHighRes(Performance* aPerformance);
+  DOMHighResTimeStamp ConnectStartHighRes(Performance* aPerformance);
+  DOMHighResTimeStamp SecureConnectionStartHighRes(Performance* aPerformance);
+  DOMHighResTimeStamp ConnectEndHighRes(Performance* aPerformance);
+  DOMHighResTimeStamp RequestStartHighRes(Performance* aPerformance);
+  DOMHighResTimeStamp ResponseStartHighRes(Performance* aPerformance);
+  DOMHighResTimeStamp FirstInterimResponseStartHighRes(
+      Performance* aPerformance);
+  DOMHighResTimeStamp FinalResponseHeadersStartHighRes(
+      Performance* aPerformance);
+  DOMHighResTimeStamp ResponseEndHighRes(Performance* aPerformance);
+
+  DOMHighResTimeStamp ZeroTime() const { return mZeroTime; }
+
+  bool ShouldReportCrossOriginRedirect(
+      bool aEnsureSameOriginAndIgnoreTAO) const;
+
+  RenderBlockingStatusType RenderBlockingStatus() const {
+    return mRenderBlockingStatus;
+  }
+
+ private:
+  TimeStamp mAsyncOpen;
+  TimeStamp mRedirectStart;
+  TimeStamp mRedirectEnd;
+  TimeStamp mDomainLookupStart;
+  TimeStamp mDomainLookupEnd;
+  TimeStamp mConnectStart;
+  TimeStamp mSecureConnectionStart;
+  TimeStamp mConnectEnd;
+  TimeStamp mRequestStart;
+  TimeStamp mResponseStart;
+  TimeStamp mFirstInterimResponseStart;
+  TimeStamp mFinalResponseHeadersStart;
+  TimeStamp mCacheReadStart;
+  TimeStamp mResponseEnd;
+  TimeStamp mCacheReadEnd;
+
+  TimeStamp mWorkerStart;
+  TimeStamp mWorkerRequestStart;
+  TimeStamp mWorkerResponseEnd;
+
+  DOMHighResTimeStamp mZeroTime = 0;
+
+  DOMHighResTimeStamp mFetchStart = 0;
+
+  uint64_t mTransferSize = 0;
+
+  RenderBlockingStatusType mRenderBlockingStatus =
+      RenderBlockingStatusType::Non_blocking;
+};
+
+class PerformanceTiming final : public nsWrapperCache {
+ public:
+  PerformanceTiming(Performance* aPerformance, nsITimedChannel* aChannel,
+                    nsIHttpChannel* aHttpChannel,
+                    DOMHighResTimeStamp aZeroTime);
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(PerformanceTiming)
+  NS_DECL_CYCLE_COLLECTION_NATIVE_WRAPPERCACHE_CLASS(PerformanceTiming)
+
+  nsDOMNavigationTiming* GetDOMTiming() const {
+    return mPerformance->GetDOMTiming();
+  }
+
+  Performance* GetParentObject() const { return mPerformance; }
+
+  virtual JSObject* WrapObject(JSContext* cx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  DOMTimeMilliSec NavigationStart() const {
+    if (!StaticPrefs::dom_enable_performance()) {
+      return 0;
+    }
+    return nsRFPService::ReduceTimePrecisionAsMSecs(
+        GetDOMTiming()->GetNavigationStart(),
+        mPerformance->GetRandomTimelineSeed(),
+        mPerformance->GetRTPCallerType());
+  }
+
+  DOMTimeMilliSec UnloadEventStart() {
+    if (!StaticPrefs::dom_enable_performance()) {
+      return 0;
+    }
+    return nsRFPService::ReduceTimePrecisionAsMSecs(
+        GetDOMTiming()->GetUnloadEventStart(),
+        mPerformance->GetRandomTimelineSeed(),
+        mPerformance->GetRTPCallerType());
+  }
+
+  DOMTimeMilliSec UnloadEventEnd() {
+    if (!StaticPrefs::dom_enable_performance()) {
+      return 0;
+    }
+    return nsRFPService::ReduceTimePrecisionAsMSecs(
+        GetDOMTiming()->GetUnloadEventEnd(),
+        mPerformance->GetRandomTimelineSeed(),
+        mPerformance->GetRTPCallerType());
+  }
+
+  DOMTimeMilliSec FetchStart();
+  DOMTimeMilliSec RedirectStart();
+  DOMTimeMilliSec RedirectEnd();
+  DOMTimeMilliSec DomainLookupStart();
+  DOMTimeMilliSec DomainLookupEnd();
+  DOMTimeMilliSec ConnectStart();
+  DOMTimeMilliSec SecureConnectionStart();
+  DOMTimeMilliSec ConnectEnd();
+  DOMTimeMilliSec RequestStart();
+  DOMTimeMilliSec ResponseStart();
+  DOMTimeMilliSec ResponseEnd();
+
+  DOMTimeMilliSec DomLoading() {
+    if (!StaticPrefs::dom_enable_performance()) {
+      return 0;
+    }
+    return nsRFPService::ReduceTimePrecisionAsMSecs(
+        GetDOMTiming()->GetDomLoading(), mPerformance->GetRandomTimelineSeed(),
+        mPerformance->GetRTPCallerType());
+  }
+
+  DOMTimeMilliSec DomInteractive() const {
+    if (!StaticPrefs::dom_enable_performance()) {
+      return 0;
+    }
+    return nsRFPService::ReduceTimePrecisionAsMSecs(
+        GetDOMTiming()->GetDomInteractive(),
+        mPerformance->GetRandomTimelineSeed(),
+        mPerformance->GetRTPCallerType());
+  }
+
+  DOMTimeMilliSec DomContentLoadedEventStart() const {
+    if (!StaticPrefs::dom_enable_performance()) {
+      return 0;
+    }
+    return nsRFPService::ReduceTimePrecisionAsMSecs(
+        GetDOMTiming()->GetDomContentLoadedEventStart(),
+        mPerformance->GetRandomTimelineSeed(),
+        mPerformance->GetRTPCallerType());
+  }
+
+  DOMTimeMilliSec DomContentLoadedEventEnd() const {
+    if (!StaticPrefs::dom_enable_performance()) {
+      return 0;
+    }
+    return nsRFPService::ReduceTimePrecisionAsMSecs(
+        GetDOMTiming()->GetDomContentLoadedEventEnd(),
+        mPerformance->GetRandomTimelineSeed(),
+        mPerformance->GetRTPCallerType());
+  }
+
+  DOMTimeMilliSec DomComplete() const {
+    if (!StaticPrefs::dom_enable_performance()) {
+      return 0;
+    }
+    return nsRFPService::ReduceTimePrecisionAsMSecs(
+        GetDOMTiming()->GetDomComplete(), mPerformance->GetRandomTimelineSeed(),
+        mPerformance->GetRTPCallerType());
+  }
+
+  DOMTimeMilliSec LoadEventStart() const {
+    if (!StaticPrefs::dom_enable_performance()) {
+      return 0;
+    }
+    return nsRFPService::ReduceTimePrecisionAsMSecs(
+        GetDOMTiming()->GetLoadEventStart(),
+        mPerformance->GetRandomTimelineSeed(),
+        mPerformance->GetRTPCallerType());
+  }
+
+  DOMTimeMilliSec LoadEventEnd() const {
+    if (!StaticPrefs::dom_enable_performance()) {
+      return 0;
+    }
+    return nsRFPService::ReduceTimePrecisionAsMSecs(
+        GetDOMTiming()->GetLoadEventEnd(),
+        mPerformance->GetRandomTimelineSeed(),
+        mPerformance->GetRTPCallerType());
+  }
+
+  DOMTimeMilliSec TimeToNonBlankPaint() const {
+    if (!StaticPrefs::dom_enable_performance()) {
+      return 0;
+    }
+    return nsRFPService::ReduceTimePrecisionAsMSecs(
+        GetDOMTiming()->GetTimeToNonBlankPaint(),
+        mPerformance->GetRandomTimelineSeed(),
+        mPerformance->GetRTPCallerType());
+  }
+
+  DOMTimeMilliSec TimeToContentfulPaint() const {
+    if (!StaticPrefs::dom_enable_performance()) {
+      return 0;
+    }
+    return nsRFPService::ReduceTimePrecisionAsMSecs(
+        GetDOMTiming()->GetTimeToContentfulComposite(),
+        mPerformance->GetRandomTimelineSeed(),
+        mPerformance->GetRTPCallerType());
+  }
+
+  DOMTimeMilliSec TimeToFirstInteractive() const {
+    if (!StaticPrefs::dom_enable_performance()) {
+      return 0;
+    }
+    return nsRFPService::ReduceTimePrecisionAsMSecs(
+        GetDOMTiming()->GetTimeToTTFI(), mPerformance->GetRandomTimelineSeed(),
+        mPerformance->GetRTPCallerType());
+  }
+
+  PerformanceTimingData* Data() const { return mTimingData.get(); }
+
+ private:
+  ~PerformanceTiming();
+
+  bool IsTopLevelContentDocument() const;
+
+  RefPtr<Performance> mPerformance;
+
+  UniquePtr<PerformanceTimingData> mTimingData;
+};
+
+}  
+
+namespace IPC {
+
+template <>
+struct ParamTraits<mozilla::dom::RenderBlockingStatusType>
+    : public ContiguousEnumSerializerInclusive<
+          mozilla::dom::RenderBlockingStatusType,
+          mozilla::dom::RenderBlockingStatusType::Blocking,
+          mozilla::dom::RenderBlockingStatusType::Non_blocking> {};
+
+DEFINE_IPC_SERIALIZER_WITH_FIELDS(
+    mozilla::dom::PerformanceTimingData, mServerTiming, mNextHopProtocol,
+    mAsyncOpen, mRedirectStart, mRedirectEnd, mDomainLookupStart,
+    mDomainLookupEnd, mConnectStart, mSecureConnectionStart, mConnectEnd,
+    mRequestStart, mResponseStart, mFirstInterimResponseStart,
+    mFinalResponseHeadersStart, mCacheReadStart, mResponseEnd, mCacheReadEnd,
+    mWorkerStart, mWorkerRequestStart, mWorkerResponseEnd, mZeroTime,
+    mFetchStart, mEncodedBodySize, mTransferSize, mDecodedBodySize,
+    mResponseStatus, mRedirectCount, mContentType, mAllRedirectsSameOrigin,
+    mAllRedirectsPassTAO, mSecureConnection, mBodyInfoAccessAllowed,
+    mTimingAllowed, mInitialized, mRenderBlockingStatus);
+
+template <>
+struct ParamTraits<nsIServerTiming*> {
+  static void Write(IPC::MessageWriter* aWriter, nsIServerTiming* aParam) {
+    nsAutoCString name;
+    (void)aParam->GetName(name);
+    double duration = 0;
+    (void)aParam->GetDuration(&duration);
+    nsAutoCString description;
+    (void)aParam->GetDescription(description);
+    WriteParam(aWriter, name);
+    WriteParam(aWriter, duration);
+    WriteParam(aWriter, description);
+  }
+
+  static bool Read(IPC::MessageReader* aReader,
+                   RefPtr<nsIServerTiming>* aResult) {
+    nsAutoCString name;
+    double duration;
+    nsAutoCString description;
+    if (!ReadParam(aReader, &name) || !ReadParam(aReader, &duration) ||
+        !ReadParam(aReader, &description)) {
+      return false;
+    }
+
+    RefPtr<nsServerTiming> timing = new nsServerTiming();
+    timing->SetName(name);
+    timing->SetDuration(duration);
+    timing->SetDescription(description);
+    *aResult = timing.forget();
+    return true;
+  }
+};
+
+}  
+
+#endif  // mozilla_dom_PerformanceTiming_h

@@ -1,0 +1,141 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef gfx_src_DriverCrashGuard_h_
+#define gfx_src_DriverCrashGuard_h_
+
+#include "nsCOMPtr.h"
+#include "nsIGfxInfo.h"
+#include "nsIFile.h"
+#include "nsString.h"
+#include <functional>
+#include <string>
+
+namespace mozilla {
+
+namespace dom {
+class ContentParent;
+}  
+
+namespace gfx {
+
+enum class DriverInitStatus {
+  Unknown,
+
+  Attempting,
+
+  Okay,
+
+  Crashed
+};
+
+enum class CrashGuardType : uint32_t {
+  D3D11Layers,
+  GLContext,
+  WMFVPXVideo,
+
+  NUM_TYPES
+};
+
+class DriverCrashGuard {
+ public:
+  DriverCrashGuard(CrashGuardType aType, dom::ContentParent* aContentParent);
+  virtual ~DriverCrashGuard();
+
+  bool Crashed();
+  void NotifyCrashed();
+
+  enum class TelemetryState {
+    Okay = 0,
+    EnvironmentChanged = 1,
+    RecoveredFromCrash = 2,
+    FeatureDisabled = 3
+  };
+
+  enum class Mode {
+    Normal,
+
+    Proxy
+  };
+
+  typedef std::function<void(const char* aName, const char* aPrefName)>
+      CrashGuardCallback;
+  static void ForEachActiveCrashGuard(const CrashGuardCallback& aCallback);
+
+ protected:
+  virtual void Initialize();
+  virtual bool UpdateEnvironment() {
+    return false;
+  }
+  virtual void LogCrashRecovery() = 0;
+  virtual void LogFeatureDisabled() = 0;
+
+  bool FeatureEnabled(int aFeature, bool aDefault = true);
+  bool CheckAndUpdatePref(const char* aPrefName,
+                          const nsAString& aCurrentValue);
+  bool CheckAndUpdateBoolPref(const char* aPrefName, bool aCurrentValue);
+  std::string GetFullPrefName(const char* aPref);
+
+ private:
+  void InitializeIfNeeded();
+  bool CheckOrRefreshEnvironment();
+  bool UpdateBaseEnvironment();
+  DriverInitStatus GetStatus() const;
+
+  nsCOMPtr<nsIFile> GetGuardFile();
+  bool RecoverFromCrash();
+  void ActivateGuard();
+  void FlushPreferences();
+  void SetStatus(DriverInitStatus aStatus);
+
+ private:
+  CrashGuardType mType;
+  Mode mMode;
+  bool mInitialized;
+  bool mGuardActivated;
+  bool mCrashDetected;
+  nsCOMPtr<nsIFile> mGuardFile;
+
+ protected:
+  nsCString mStatusPref;
+  nsCOMPtr<nsIGfxInfo> mGfxInfo;
+};
+
+class D3D11LayersCrashGuard final : public DriverCrashGuard {
+ public:
+  explicit D3D11LayersCrashGuard(dom::ContentParent* aContentParent = nullptr);
+
+ protected:
+  void Initialize() override;
+  bool UpdateEnvironment() override;
+  void LogCrashRecovery() override;
+  void LogFeatureDisabled() override;
+
+ private:
+  void RecordTelemetry(TelemetryState aState);
+};
+
+class GLContextCrashGuard final : public DriverCrashGuard {
+ public:
+  explicit GLContextCrashGuard(dom::ContentParent* aContentParent = nullptr);
+  void Initialize() override;
+
+ protected:
+  bool UpdateEnvironment() override;
+  void LogCrashRecovery() override;
+  void LogFeatureDisabled() override;
+};
+
+class WMFVPXVideoCrashGuard final : public DriverCrashGuard {
+ public:
+  explicit WMFVPXVideoCrashGuard(dom::ContentParent* aContentParent = nullptr);
+
+ protected:
+  void LogCrashRecovery() override;
+  void LogFeatureDisabled() override;
+};
+
+}  
+}  
+
+#endif  // gfx_src_DriverCrashGuard_h_

@@ -1,0 +1,723 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "PositionedEventTargeting.h"
+
+#include <algorithm>
+
+#include "Units.h"
+#include "mozilla/EventListenerManager.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/Result.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_ui.h"
+#include "mozilla/ToString.h"
+#include "mozilla/ViewportUtils.h"
+#include "mozilla/dom/DOMIntersectionObserver.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/MouseEventBinding.h"
+#include "mozilla/dom/TouchEvent.h"
+#include "mozilla/gfx/Matrix.h"
+#include "mozilla/layers/LayersTypes.h"
+#include "nsContainerFrame.h"
+#include "nsCoord.h"
+#include "nsDeviceContext.h"
+#include "nsFontMetrics.h"
+#include "nsFrameList.h"  // for DEBUG_FRAME_DUMP
+#include "nsGkAtoms.h"
+#include "nsHTMLParts.h"
+#include "nsIContentInlines.h"
+#include "nsIFrame.h"
+#include "nsLayoutUtils.h"
+#include "nsPresContext.h"
+#include "nsPrintfCString.h"
+#include "nsRect.h"
+#include "nsRegion.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+static mozilla::LazyLogModule sEvtTgtLog("event.retarget");
+#define PET_LOG(...) MOZ_LOG(sEvtTgtLog, LogLevel::Debug, (__VA_ARGS__))
+#define PET_LOG_ENABLED() MOZ_LOG_TEST(sEvtTgtLog, LogLevel::Debug)
+
+namespace mozilla {
+
+
+enum class SearchType {
+  None,
+  Clickable,
+  Touchable,
+  TouchableOrClickable,
+};
+
+struct EventRadiusPrefs {
+  bool mEnabled;            
+  uint32_t mVisitedWeight;  
+  uint32_t mRadiusTopmm;
+  uint32_t mRadiusRightmm;
+  uint32_t mRadiusBottommm;
+  uint32_t mRadiusLeftmm;
+  bool mTouchOnly;
+  bool mReposition;
+  SearchType mSearchType;
+
+  explicit EventRadiusPrefs(WidgetGUIEvent* aMouseOrTouchEvent) {
+    if (aMouseOrTouchEvent->mClass == eTouchEventClass) {
+      mEnabled = StaticPrefs::ui_touch_radius_enabled();
+      mVisitedWeight = StaticPrefs::ui_touch_radius_visitedWeight();
+      mRadiusTopmm = StaticPrefs::ui_touch_radius_topmm();
+      mRadiusRightmm = StaticPrefs::ui_touch_radius_rightmm();
+      mRadiusBottommm = StaticPrefs::ui_touch_radius_bottommm();
+      mRadiusLeftmm = StaticPrefs::ui_touch_radius_leftmm();
+      mTouchOnly = false;   
+      mReposition = false;  
+      if (StaticPrefs::
+              ui_touch_radius_single_touch_treat_clickable_as_touchable() &&
+          aMouseOrTouchEvent->mMessage == eTouchStart &&
+          aMouseOrTouchEvent->AsTouchEvent()->mTouches.Length() == 1) {
+        mSearchType = SearchType::TouchableOrClickable;
+      } else {
+        mSearchType = SearchType::Touchable;
+      }
+
+    } else if (aMouseOrTouchEvent->mClass == eMouseEventClass) {
+      mEnabled = StaticPrefs::ui_mouse_radius_enabled();
+      mVisitedWeight = StaticPrefs::ui_mouse_radius_visitedWeight();
+      mRadiusTopmm = StaticPrefs::ui_mouse_radius_topmm();
+      mRadiusRightmm = StaticPrefs::ui_mouse_radius_rightmm();
+      mRadiusBottommm = StaticPrefs::ui_mouse_radius_bottommm();
+      mRadiusLeftmm = StaticPrefs::ui_mouse_radius_leftmm();
+      mTouchOnly = StaticPrefs::ui_mouse_radius_inputSource_touchOnly();
+      mReposition = StaticPrefs::ui_mouse_radius_reposition();
+      mSearchType = SearchType::Clickable;
+
+    } else {
+      mEnabled = false;
+      mVisitedWeight = 0;
+      mRadiusTopmm = 0;
+      mRadiusRightmm = 0;
+      mRadiusBottommm = 0;
+      mRadiusLeftmm = 0;
+      mTouchOnly = false;
+      mReposition = false;
+      mSearchType = SearchType::None;
+    }
+  }
+};
+
+static bool HasMouseListener(const nsIContent* aContent) {
+  if (EventListenerManager* elm = aContent->GetExistingListenerManager()) {
+    return elm->HasListenersFor(nsGkAtoms::onclick) ||
+           elm->HasListenersFor(nsGkAtoms::onmousedown) ||
+           elm->HasListenersFor(nsGkAtoms::onmouseup);
+  }
+
+  return false;
+}
+
+static bool HasTouchListener(const nsIContent* aContent) {
+  EventListenerManager* elm = aContent->GetExistingListenerManager();
+  if (!elm) {
+    return false;
+  }
+
+  if (!TouchEvent::PrefEnabled(aContent->OwnerDoc()->GetDocShell())) {
+    return false;
+  }
+
+  return elm->HasNonSystemGroupListenersFor(nsGkAtoms::ontouchstart) ||
+         elm->HasNonSystemGroupListenersFor(nsGkAtoms::ontouchend);
+}
+
+static bool HasPointerListener(const nsIContent* aContent) {
+  EventListenerManager* elm = aContent->GetExistingListenerManager();
+  if (!elm) {
+    return false;
+  }
+
+  return elm->HasListenersFor(nsGkAtoms::onpointerdown) ||
+         elm->HasListenersFor(nsGkAtoms::onpointerup);
+}
+
+static bool IsDescendant(nsIFrame* aFrame, nsIContent* aAncestor,
+                         nsAutoString* aLabelTargetId) {
+  for (nsIContent* content = aFrame->GetContent(); content;
+       content = content->GetFlattenedTreeParent()) {
+    if (aLabelTargetId && content->IsHTMLElement(nsGkAtoms::label)) {
+      content->AsElement()->GetAttr(nsGkAtoms::_for, *aLabelTargetId);
+    }
+    if (content == aAncestor) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static nsIContent* GetTouchableAncestor(nsIFrame* aFrame,
+                                        nsAtom* aStopAt = nullptr) {
+  for (nsIContent* content = aFrame->GetContent(); content;
+       content = content->GetFlattenedTreeParent()) {
+    if (aStopAt && content->IsHTMLElement(aStopAt)) {
+      break;
+    }
+    if (HasTouchListener(content)) {
+      return content;
+    }
+  }
+  return nullptr;
+}
+
+static bool IsClickableContent(const nsIContent* aContent,
+                               nsAutoString* aLabelTargetId = nullptr) {
+  if (HasTouchListener(aContent) || HasMouseListener(aContent) ||
+      HasPointerListener(aContent)) {
+    return true;
+  }
+  if (aContent->IsAnyOfHTMLElements(nsGkAtoms::button, nsGkAtoms::input,
+                                    nsGkAtoms::select, nsGkAtoms::textarea)) {
+    return true;
+  }
+  if (aContent->IsHTMLElement(nsGkAtoms::label)) {
+    if (aLabelTargetId) {
+      aContent->AsElement()->GetAttr(nsGkAtoms::_for, *aLabelTargetId);
+    }
+    return aContent;
+  }
+
+  if (aContent->IsAnyOfXULElements(
+          nsGkAtoms::button, nsGkAtoms::checkbox, nsGkAtoms::radio,
+          nsGkAtoms::menu, nsGkAtoms::menuitem, nsGkAtoms::menulist,
+          nsGkAtoms::scrollbarbutton, nsGkAtoms::resizer)) {
+    return true;
+  }
+
+  static Element::AttrValuesArray clickableRoles[] = {nsGkAtoms::button,
+                                                      nsGkAtoms::key, nullptr};
+  if (const auto* element = Element::FromNode(*aContent)) {
+    if (element->IsLink()) {
+      return true;
+    }
+    if (element->FindAttrValueIn(kNameSpaceID_None, nsGkAtoms::role,
+                                 clickableRoles, eIgnoreCase) >= 0) {
+      return true;
+    }
+  }
+  return aContent->IsEditable();
+}
+
+static nsIContent* GetMostDistantAncestorWhoseCursorIsPointer(
+    nsIFrame* aFrame, nsINode* aAncestorLimiter = nullptr,
+    nsAtom* aStopAt = nullptr) {
+  nsIFrame* lastCursorPointerFrame = nullptr;
+  for (nsIFrame* frame = aFrame; frame; frame = frame->GetParent()) {
+    if (frame->StyleUI()->Cursor().keyword != StyleCursorKind::Pointer) {
+      break;
+    }
+    nsIContent* content = frame->GetContent();
+    if (MOZ_UNLIKELY(!content)) {
+      break;
+    }
+    lastCursorPointerFrame = frame;
+    if (content == aAncestorLimiter ||
+        (aStopAt && content->IsHTMLElement(aStopAt))) {
+      break;
+    }
+  }
+  return lastCursorPointerFrame ? lastCursorPointerFrame->GetContent()
+                                : nullptr;
+}
+
+static nsIContent* GetClickableAncestor(
+    nsIFrame* aFrame, nsAtom* aStopAt = nullptr,
+    nsAutoString* aLabelTargetId = nullptr) {
+  nsIContent* deepestClickableTarget = nullptr;
+  for (nsIContent* content = aFrame->GetContent(); content;
+       content = content->GetFlattenedTreeParent()) {
+    if (aStopAt && content->IsHTMLElement(aStopAt)) {
+      break;
+    }
+    if (IsClickableContent(content, aLabelTargetId)) {
+      deepestClickableTarget = content;
+      break;
+    }
+  }
+
+  if (nsIContent* const mostDistantCursorPointerContent =
+          GetMostDistantAncestorWhoseCursorIsPointer(
+              aFrame, deepestClickableTarget, aStopAt)) {
+    if (!deepestClickableTarget ||
+        (mostDistantCursorPointerContent != deepestClickableTarget &&
+         mostDistantCursorPointerContent->IsInclusiveFlatTreeDescendantOf(
+             deepestClickableTarget))) {
+      if (aLabelTargetId) {
+        aLabelTargetId->Truncate();
+      }
+      return mostDistantCursorPointerContent;
+    }
+  }
+  return deepestClickableTarget;
+}
+
+static nsIContent* GetTouchableOrClickableAncestor(
+    nsIFrame* aFrame, nsAtom* aStopAt = nullptr,
+    nsAutoString* aLabelTargetId = nullptr) {
+  nsIContent* deepestClickableTarget = nullptr;
+  for (nsIContent* content = aFrame->GetContent(); content;
+       content = content->GetFlattenedTreeParent()) {
+    if (aStopAt && content->IsHTMLElement(aStopAt)) {
+      break;
+    }
+    if (HasTouchListener(content)) {
+      if (aLabelTargetId) {
+        aLabelTargetId->Truncate();
+      }
+      return content;
+    }
+    if (!deepestClickableTarget &&
+        IsClickableContent(content, aLabelTargetId)) {
+      deepestClickableTarget = content;
+    }
+  }
+
+  if (nsIContent* const mostDistantCursorPointerContent =
+          GetMostDistantAncestorWhoseCursorIsPointer(
+              aFrame, deepestClickableTarget, aStopAt)) {
+    if (!deepestClickableTarget ||
+        (mostDistantCursorPointerContent != deepestClickableTarget &&
+         mostDistantCursorPointerContent->IsInclusiveFlatTreeDescendantOf(
+             deepestClickableTarget))) {
+      if (aLabelTargetId) {
+        aLabelTargetId->Truncate();
+      }
+      return mostDistantCursorPointerContent;
+    }
+  }
+  return deepestClickableTarget;
+}
+
+static Scale2D AppUnitsToMMScale(RelativeTo aFrame) {
+  nsPresContext* presContext = aFrame.mFrame->PresContext();
+
+  const int32_t appUnitsPerInch =
+      presContext->DeviceContext()->AppUnitsPerPhysicalInch();
+  const float appUnits =
+      static_cast<float>(appUnitsPerInch) / MM_PER_INCH_FLOAT;
+
+  if (aFrame.mViewportType != ViewportType::Layout) {
+    const nscoord scale = NSToCoordRound(appUnits);
+    return Scale2D{static_cast<float>(scale), static_cast<float>(scale)};
+  }
+
+  Scale2D localResolution{1.0f, 1.0f};
+  Scale2D enclosingResolution{1.0f, 1.0f};
+
+  if (auto* pc = presContext->GetInProcessRootContentDocumentPresContext()) {
+    PresShell* presShell = pc->PresShell();
+    localResolution = {presShell->GetResolution(), presShell->GetResolution()};
+    enclosingResolution = ViewportUtils::TryInferEnclosingResolution(presShell);
+  }
+
+  const gfx::MatrixScales parentScale =
+      nsLayoutUtils::GetTransformToAncestorScale(aFrame.mFrame);
+  const Scale2D resolution =
+      localResolution * parentScale * enclosingResolution;
+
+  const nscoord scaleX = NSToCoordRound(appUnits / resolution.xScale);
+  const nscoord scaleY = NSToCoordRound(appUnits / resolution.yScale);
+
+  return {static_cast<float>(scaleX), static_cast<float>(scaleY)};
+}
+
+static nsRect ClipToFrame(RelativeTo aRootFrame, const nsIFrame* aFrame,
+                          nsRect& aRect) {
+  nsRect bound = nsLayoutUtils::TransformFrameRectToAncestor(
+      aFrame, nsRect(nsPoint(0, 0), aFrame->GetSize()), aRootFrame);
+  nsRect result = bound.Intersect(aRect);
+  return result;
+}
+
+static nsRect GetTargetRect(RelativeTo aRootFrame,
+                            const nsPoint& aPointRelativeToRootFrame,
+                            const nsIFrame* aRestrictToDescendants,
+                            const EventRadiusPrefs& aPrefs, uint32_t aFlags) {
+  const Scale2D scale = AppUnitsToMMScale(aRootFrame);
+  nsMargin m(aPrefs.mRadiusTopmm * scale.yScale,
+             aPrefs.mRadiusRightmm * scale.xScale,
+             aPrefs.mRadiusBottommm * scale.yScale,
+             aPrefs.mRadiusLeftmm * scale.xScale);
+  nsRect r(aPointRelativeToRootFrame, nsSize(0, 0));
+  r.Inflate(m);
+  if (!(aFlags & INPUT_IGNORE_ROOT_SCROLL_FRAME)) {
+    r = ClipToFrame(aRootFrame, aRestrictToDescendants, r);
+  }
+  return r;
+}
+
+static double ComputeDistanceFromRect(const nsPoint& aPoint,
+                                      const nsRect& aRect) {
+  nscoord dx =
+      std::max(0, std::max(aRect.x - aPoint.x, aPoint.x - aRect.XMost()));
+  nscoord dy =
+      std::max(0, std::max(aRect.y - aPoint.y, aPoint.y - aRect.YMost()));
+  return NS_hypot(dx, dy);
+}
+
+static double ComputeDistanceFromRegion(const nsPoint& aPoint,
+                                        const nsRegion& aRegion) {
+  MOZ_ASSERT(!aRegion.IsEmpty(),
+             "can't compute distance between point and empty region");
+  double minDist = std::numeric_limits<double>::infinity();
+  for (auto iter = aRegion.RectIter(); !iter.Done(); iter.Next()) {
+    double dist = ComputeDistanceFromRect(aPoint, iter.Get());
+    if (dist < minDist) {
+      minDist = dist;
+      if (minDist == 0.0) {
+        break;
+      }
+    }
+  }
+  return minDist;
+}
+
+static void SubtractFromExposedRegion(nsRegion* aExposedRegion,
+                                      const nsRegion& aRegion) {
+  if (aRegion.IsEmpty()) {
+    return;
+  }
+
+  nsRegion tmp;
+  tmp.Sub(*aExposedRegion, aRegion);
+  if (tmp.GetNumRects() <= 15 || tmp.Area() <= aExposedRegion->Area() / 2) {
+    *aExposedRegion = std::move(tmp);
+  }
+}
+
+static Result<nsRect, nsresult> GetClippedBorderBox(
+    RelativeTo aRoot, nsIFrame* aFrame, const IntersectionInput& aInput,
+    bool* aPreservesAxisAlignedRectangles) {
+  MOZ_ASSERT(aPreservesAxisAlignedRectangles);
+
+  const IntersectionOutput intersectionOutput =
+      DOMIntersectionObserver::Intersect(
+          aInput, aFrame, DOMIntersectionObserver::BoxToUse::Border);
+  if (!intersectionOutput.Intersects()) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  *aPreservesAxisAlignedRectangles =
+      intersectionOutput.mPreservesAxisAlignedRectangles;
+  nsIFrame* const containerBlock =
+      nsLayoutUtils::GetContainingBlockForClientRect(aInput.mRootFrame);
+  const nsRect& clippedBorderBoxRelativeToContainerBlock =
+      intersectionOutput.mIntersectionRect.ref();
+  if (containerBlock == aRoot.mFrame) {
+    return clippedBorderBoxRelativeToContainerBlock;
+  }
+  nsRect clippedBorderBoxRelativeToRoot(
+      clippedBorderBoxRelativeToContainerBlock);
+  nsLayoutUtils::TransformRect(containerBlock, aRoot.mFrame,
+                               clippedBorderBoxRelativeToRoot);
+  return clippedBorderBoxRelativeToRoot;
+}
+
+class MOZ_STACK_CLASS FramePrettyPrinter : public nsAutoCString {
+ public:
+  explicit FramePrettyPrinter(const nsIFrame* aFrame) {
+#ifdef DEBUG_FRAME_DUMP
+    if (!aFrame) {
+      Assign(nsPrintfCString("%p", aFrame));
+      return;
+    }
+    Assign(aFrame->ListTag());
+#else
+    Assign(nsPrintfCString("%p", aFrame));
+#endif
+  }
+};
+
+static void LogClippedBorderBoxOfCandidateFrame(
+    RelativeTo aRoot, nsIFrame* aFrame, const nsRect& aClippedBorderBox,
+    bool aPreservesAxisAlignedRectangles) {
+  const nsRect borderBox = nsLayoutUtils::TransformFrameRectToAncestor(
+      aFrame, nsRect(nsPoint(0, 0), aFrame->GetSize()), aRoot);
+  PET_LOG(
+      "Checking candidate %s with clipped border box %s%s "
+      "(preservesAxisAlignedRectangles=%s)\n",
+      FramePrettyPrinter(aFrame).get(), ToString(aClippedBorderBox).c_str(),
+      aClippedBorderBox == borderBox
+          ? ""
+          : nsPrintfCString(" (non-clipped border box: %s)",
+                            ToString(borderBox).c_str())
+                .get(),
+      TrueOrFalse(aPreservesAxisAlignedRectangles));
+}
+
+static nsIFrame* GetClosest(RelativeTo aRoot,
+                            const nsPoint& aPointRelativeToRootFrame,
+                            const nsRect& aTargetRect,
+                            const EventRadiusPrefs& aPrefs,
+                            const nsIFrame* aRestrictToDescendants,
+                            nsIContent* aClickableAncestor,
+                            nsTArray<nsIFrame*>& aCandidates) {
+  nsIFrame* bestTarget = nullptr;
+  nsIContent* bestTargetHandler = nullptr;
+  double bestDistance = std::numeric_limits<double>::infinity();
+  nsRegion exposedRegion(aTargetRect);
+  MOZ_ASSERT(aRestrictToDescendants);
+  Document* const doc = aRestrictToDescendants->PresContext()->Document();
+  MOZ_ASSERT(doc);
+  const IntersectionInput intersectionInput =
+      DOMIntersectionObserver::ComputeInput(*doc, doc, nullptr, nullptr);
+  for (nsIFrame* const f : aCandidates) {
+    bool preservesAxisAlignedRectangles = false;
+    Result<nsRect, nsresult> clippedBorderBoxOrError = GetClippedBorderBox(
+        aRoot, f, intersectionInput, &preservesAxisAlignedRectangles);
+    if (MOZ_UNLIKELY(clippedBorderBoxOrError.isErr())) {
+      PET_LOG("  candidate %s is not visible\n", FramePrettyPrinter(f).get());
+      continue;
+    }
+    const nsRect clippedBorderBox = clippedBorderBoxOrError.unwrap();
+    if (MOZ_UNLIKELY(PET_LOG_ENABLED())) {
+      LogClippedBorderBoxOfCandidateFrame(aRoot, f, clippedBorderBox,
+                                          preservesAxisAlignedRectangles);
+    }
+    nsRegion region;
+    region.And(exposedRegion, clippedBorderBox);
+    if (region.IsEmpty()) {
+      PET_LOG("  candidate %s had empty hit region\n",
+              FramePrettyPrinter(f).get());
+      continue;
+    }
+
+    if (MOZ_LIKELY(preservesAxisAlignedRectangles)) {
+      SubtractFromExposedRegion(&exposedRegion, region);
+    }
+
+    nsAutoString labelTargetId;
+    if (aClickableAncestor &&
+        !IsDescendant(f, aClickableAncestor, &labelTargetId)) {
+      PET_LOG("  candidate %s is not a descendant of required ancestor\n",
+              FramePrettyPrinter(f).get());
+      continue;
+    }
+
+    nsIContent* handlerContent = nullptr;
+    switch (aPrefs.mSearchType) {
+      case SearchType::Clickable: {
+        nsIContent* clickableContent =
+            GetClickableAncestor(f, nsGkAtoms::body, &labelTargetId);
+        if (!aClickableAncestor && !clickableContent) {
+          PET_LOG("  candidate %s was not clickable\n",
+                  FramePrettyPrinter(f).get());
+          continue;
+        }
+        handlerContent =
+            clickableContent ? clickableContent : aClickableAncestor;
+        break;
+      }
+      case SearchType::Touchable: {
+        nsIContent* touchableContent = GetTouchableAncestor(f, nsGkAtoms::body);
+        if (!touchableContent) {
+          PET_LOG("  candidate %s was not touchable\n",
+                  FramePrettyPrinter(f).get());
+          continue;
+        }
+        handlerContent = touchableContent;
+        break;
+      }
+      case SearchType::TouchableOrClickable: {
+        nsIContent* touchableOrClickableContent =
+            GetTouchableOrClickableAncestor(f, nsGkAtoms::body, &labelTargetId);
+        if (!touchableOrClickableContent) {
+          PET_LOG("  candidate %s was not touchable nor clickable\n",
+                  FramePrettyPrinter(f).get());
+          continue;
+        }
+        handlerContent = touchableOrClickableContent;
+        break;
+      }
+      case SearchType::None:
+        MOZ_ASSERT_UNREACHABLE("Why is it enabled with seaching none?");
+        break;
+    }
+
+    if (bestTarget && nsLayoutUtils::IsProperAncestorFrameCrossDoc(
+                          f, bestTarget, aRoot.mFrame)) {
+      if (!bestTargetHandler || handlerContent != bestTargetHandler) {
+        PET_LOG(
+            "  candidate %s (handler: %s) was ancestor for bestTarget %s "
+            "(handler: %s)\n",
+            FramePrettyPrinter(f).get(), ToString(*handlerContent).c_str(),
+            FramePrettyPrinter(bestTarget).get(),
+            ToString(RefPtr{bestTargetHandler}).c_str());
+        continue;
+      }
+    }
+
+    if (!aClickableAncestor && !nsLayoutUtils::IsAncestorFrameCrossDoc(
+                                   aRestrictToDescendants, f, aRoot.mFrame)) {
+      PET_LOG("  candidate %s was not descendant of restrictroot %s\n",
+              FramePrettyPrinter(f).get(),
+              FramePrettyPrinter(aRestrictToDescendants).get());
+      continue;
+    }
+
+    double distance =
+        ComputeDistanceFromRegion(aPointRelativeToRootFrame, region);
+    nsIContent* content = f->GetContent();
+    if (content && content->IsElement() &&
+        content->AsElement()->State().HasState(
+            ElementState(ElementState::VISITED))) {
+      distance *= aPrefs.mVisitedWeight / 100.0;
+    }
+    if (distance < bestDistance) {
+      PET_LOG("  candidate %s is the new best (%f)\n",
+              FramePrettyPrinter(f).get(), distance);
+      bestDistance = distance;
+      bestTarget = f;
+      bestTargetHandler = handlerContent;
+      if (bestDistance == 0.0) {
+        break;
+      }
+    }
+  }
+  return bestTarget;
+}
+
+static const nsIFrame* FindZIndexAncestor(const nsIFrame* aTarget,
+                                          const nsIFrame* aRoot) {
+  const nsIFrame* candidate = aTarget;
+  while (candidate && candidate != aRoot) {
+    if (candidate->ZIndex().valueOr(0) > 0) {
+      PET_LOG("Restricting search to z-index root %s\n",
+              FramePrettyPrinter(candidate).get());
+      return candidate;
+    }
+    candidate = candidate->GetParent();
+  }
+  return aRoot;
+}
+
+nsIFrame* FindFrameTargetedByInputEvent(
+    WidgetGUIEvent* aEvent, RelativeTo aRootFrame,
+    const nsPoint& aPointRelativeToRootFrame, uint32_t aFlags) {
+  using FrameForPointOption = nsLayoutUtils::FrameForPointOption;
+  EnumSet<FrameForPointOption> options;
+  if (aFlags & INPUT_IGNORE_ROOT_SCROLL_FRAME) {
+    options += FrameForPointOption::IgnoreRootScrollFrame;
+  }
+  nsIFrame* target = nsLayoutUtils::GetFrameForPoint(
+      aRootFrame, aPointRelativeToRootFrame, options);
+  nsIFrame* initialTarget = target;
+  PET_LOG(
+      "Found initial target %s for event class %s message %s point %s "
+      "relative to root frame %s\n",
+      FramePrettyPrinter(target).get(), ToChar(aEvent->mClass),
+      ToChar(aEvent->mMessage), ToString(aPointRelativeToRootFrame).c_str(),
+      ToString(aRootFrame).c_str());
+
+  EventRadiusPrefs prefs(aEvent);
+  if (!prefs.mEnabled || EventRetargetSuppression::IsActive()) {
+    PET_LOG("Retargeting disabled\n");
+    return target;
+  }
+
+  // Do not modify targeting for actual mouse hardware; only for mouse
+  // events generated by touch-screen hardware.
+  if (aEvent->mClass == eMouseEventClass && prefs.mTouchOnly &&
+      aEvent->AsMouseEvent()->mInputSource !=
+          MouseEvent_Binding::MOZ_SOURCE_TOUCH) {
+    PET_LOG("Mouse input event is not from a touch source\n");
+    return target;
+  }
+
+  const nsIFrame* restrictToDescendants = [&]() -> const nsIFrame* {
+    if (target && target->PresContext() != aRootFrame.mFrame->PresContext()) {
+      return target->PresShell()->GetRootFrame();
+    }
+    return aRootFrame.mFrame;
+  }();
+
+  nsIContent* targetContent = target ? target->GetContent() : nullptr;
+  if (targetContent && targetContent->IsEditable()) {
+    PET_LOG("Target %s is editable\n", FramePrettyPrinter(target).get());
+    return target;
+  }
+
+  restrictToDescendants = FindZIndexAncestor(target, restrictToDescendants);
+
+  nsRect targetRect = GetTargetRect(aRootFrame, aPointRelativeToRootFrame,
+                                    restrictToDescendants, prefs, aFlags);
+  PET_LOG("Expanded point to target rect %s\n", ToString(targetRect).c_str());
+  AutoTArray<nsIFrame*, 8> candidates;
+  nsresult rv = nsLayoutUtils::GetFramesForArea(aRootFrame, targetRect,
+                                                candidates, options);
+  if (NS_FAILED(rv)) {
+    return target;
+  }
+
+  nsIContent* clickableAncestor = nullptr;
+  if (target) {
+    clickableAncestor = GetClickableAncestor(target, nsGkAtoms::body);
+    if (clickableAncestor) {
+      PET_LOG("Target %s is clickable\n", FramePrettyPrinter(target).get());
+      clickableAncestor = target->GetContent();
+    }
+  }
+
+  nsIFrame* closest =
+      GetClosest(aRootFrame, aPointRelativeToRootFrame, targetRect, prefs,
+                 restrictToDescendants, clickableAncestor, candidates);
+  if (closest) {
+    target = closest;
+  }
+
+  PET_LOG("Final target is %s\n", FramePrettyPrinter(target).get());
+
+#ifdef DEBUG_FRAME_DUMP
+  if (MOZ_LOG_TEST(sEvtTgtLog, LogLevel::Verbose)) {
+    if (target) {
+      target->DumpFrameTree();
+    } else {
+      aRootFrame.mFrame->DumpFrameTree();
+    }
+  }
+#endif
+
+  if (!target || !prefs.mReposition || target == initialTarget) {
+    return target;
+  }
+
+  nsPoint point = aPointRelativeToRootFrame;
+  if (nsLayoutUtils::TRANSFORM_SUCCEEDED !=
+      nsLayoutUtils::TransformPoint(aRootFrame, RelativeTo{target}, point)) {
+    return target;
+  }
+  point = target->GetRectRelativeToSelf().ClampPoint(point);
+  if (nsLayoutUtils::TRANSFORM_SUCCEEDED !=
+      nsLayoutUtils::TransformPoint(RelativeTo{target}, aRootFrame, point)) {
+    return target;
+  }
+  nsPresContext* pc = aRootFrame.mFrame->PresContext();
+  point = nsLayoutUtils::TransformFramePointToRoot(ViewportType::Visual,
+                                                   aRootFrame, point);
+  if (auto widgetPoint = nsLayoutUtils::FrameToWidgetOffset(aRootFrame.mFrame,
+                                                            aEvent->mWidget)) {
+    aEvent->mRefPoint = LayoutDeviceIntPoint::FromAppUnitsRounded(
+        *widgetPoint + point, pc->AppUnitsPerDevPixel());
+  }
+  return target;
+}
+
+uint32_t EventRetargetSuppression::sSuppressionCount = 0;
+
+EventRetargetSuppression::EventRetargetSuppression() { sSuppressionCount++; }
+
+EventRetargetSuppression::~EventRetargetSuppression() { sSuppressionCount--; }
+
+bool EventRetargetSuppression::IsActive() { return sSuppressionCount > 0; }
+
+}  

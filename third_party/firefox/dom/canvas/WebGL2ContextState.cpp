@@ -1,0 +1,98 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "GLContext.h"
+#include "WebGL2Context.h"
+#include "WebGLBuffer.h"
+#include "WebGLContextUtils.h"
+#include "WebGLFramebuffer.h"
+#include "WebGLSampler.h"
+#include "WebGLTransformFeedback.h"
+#include "WebGLVertexArray.h"
+
+namespace mozilla {
+
+Maybe<double> WebGL2Context::GetParameter(GLenum pname) {
+  const FuncScope funcScope(*this, "getParameter");
+
+  if (IsContextLost()) return Nothing();
+
+  switch (pname) {
+    case LOCAL_GL_RASTERIZER_DISCARD:
+    case LOCAL_GL_SAMPLE_ALPHA_TO_COVERAGE:
+    case LOCAL_GL_SAMPLE_COVERAGE: {
+      realGLboolean b = 0;
+      gl->fGetBooleanv(pname, &b);
+      return Some(bool(b));
+    }
+
+    case LOCAL_GL_TRANSFORM_FEEDBACK_ACTIVE:
+      return Some(mBoundTransformFeedback->mIsActive);
+    case LOCAL_GL_TRANSFORM_FEEDBACK_PAUSED:
+      return Some(mBoundTransformFeedback->mIsPaused);
+
+    case LOCAL_GL_READ_BUFFER: {
+      if (!mBoundReadFramebuffer) return Some(mDefaultFB_ReadBuffer);
+
+      if (!mBoundReadFramebuffer->ColorReadBuffer()) return Some(LOCAL_GL_NONE);
+
+      return Some(mBoundReadFramebuffer->ColorReadBuffer()->mAttachmentPoint);
+    }
+
+    case LOCAL_GL_FRAGMENT_SHADER_DERIVATIVE_HINT:
+      /* fall through */
+
+    case LOCAL_GL_MAX_COMBINED_UNIFORM_BLOCKS:
+    case LOCAL_GL_MAX_ELEMENTS_INDICES:
+    case LOCAL_GL_MAX_ELEMENTS_VERTICES:
+    case LOCAL_GL_MAX_FRAGMENT_INPUT_COMPONENTS:
+    case LOCAL_GL_MAX_FRAGMENT_UNIFORM_BLOCKS:
+    case LOCAL_GL_MAX_FRAGMENT_UNIFORM_COMPONENTS:
+    case LOCAL_GL_MAX_PROGRAM_TEXEL_OFFSET:
+    case LOCAL_GL_MAX_SAMPLES:
+    case LOCAL_GL_MAX_TEXTURE_LOD_BIAS:
+    case LOCAL_GL_MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS:
+    case LOCAL_GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS:
+    case LOCAL_GL_MAX_VERTEX_OUTPUT_COMPONENTS:
+    case LOCAL_GL_MAX_VERTEX_UNIFORM_BLOCKS:
+    case LOCAL_GL_MAX_VERTEX_UNIFORM_COMPONENTS:
+    case LOCAL_GL_MIN_PROGRAM_TEXEL_OFFSET: {
+      GLint val;
+      gl->fGetIntegerv(pname, &val);
+      return Some(val);
+    }
+
+    case LOCAL_GL_MAX_VARYING_COMPONENTS: {
+      GLint val;
+      gl->fGetIntegerv(LOCAL_GL_MAX_VARYING_VECTORS, &val);
+      return Some(4 * val);
+    }
+
+    case LOCAL_GL_MAX_ELEMENT_INDEX:
+      if (!gl->IsSupported(gl::GLFeature::ES3_compatibility))
+        return Some(UINT32_MAX);
+
+      /*** fall through to fGetInteger64v ***/
+      [[fallthrough]];
+
+    case LOCAL_GL_MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS:
+    case LOCAL_GL_MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS:
+    case LOCAL_GL_MAX_UNIFORM_BLOCK_SIZE: {
+      GLint64 val;
+      gl->fGetInteger64v(pname, &val);
+      return Some(static_cast<double>(val));
+    }
+
+    case LOCAL_GL_MAX_SERVER_WAIT_TIMEOUT: {
+      GLuint64 val;
+      gl->fGetInteger64v(pname, (GLint64*)&val);
+      return Some(static_cast<double>(val));
+    }
+
+    default:
+      return WebGLContext::GetParameter(pname);
+  }
+}
+
+}  

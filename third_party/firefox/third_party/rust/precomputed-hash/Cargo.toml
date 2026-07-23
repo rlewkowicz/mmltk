@@ -1,0 +1,10 @@
+
+[package]
+name = "precomputed-hash"
+version = "0.1.1"
+authors = ["Emilio Cobos Álvarez <emilio@crisal.io>"]
+description = "A library intending to be a base dependency to expose a precomputed hash"
+license = "MIT"
+repository = "https://github.com/emilio/precomputed-hash"
+
+[dependencies]

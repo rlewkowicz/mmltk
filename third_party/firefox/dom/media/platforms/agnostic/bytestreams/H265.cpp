@@ -1,0 +1,1598 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "H265.h"
+
+#include <stdint.h>
+
+#include "AnnexB.h"
+#include "BitReader.h"
+#include "BitWriter.h"
+#include "BufferReader.h"
+#include "ByteStreamsUtils.h"
+#include "ByteWriter.h"
+#include "MediaData.h"
+#include "MediaInfo.h"
+#include "mozilla/Span.h"
+#include "nsFmtString.h"
+
+mozilla::LazyLogModule gH265("H265");
+
+#define LOG(msg, ...) MOZ_LOG_FMT(gH265, LogLevel::Debug, msg, ##__VA_ARGS__)
+#define LOGV(msg, ...) MOZ_LOG_FMT(gH265, LogLevel::Verbose, msg, ##__VA_ARGS__)
+
+#define TRUE_OR_RETURN(condition)            \
+  do {                                       \
+    if (!(condition)) {                      \
+      LOG(#condition " should be true!");    \
+      return mozilla::Err(NS_ERROR_FAILURE); \
+    }                                        \
+  } while (0)
+
+#define IN_RANGE_OR_RETURN(val, min, max)                      \
+  do {                                                         \
+    int64_t temp = AssertedCast<int64_t>(val);                 \
+    if ((temp) < (min) || (max) < (temp)) {                    \
+      LOG(#val " is not in the range of [" #min "," #max "]"); \
+      return mozilla::Err(NS_ERROR_FAILURE);                   \
+    }                                                          \
+  } while (0)
+
+#define NON_ZERO_OR_RETURN(dest, val)          \
+  do {                                         \
+    int64_t temp = AssertedCast<int64_t>(val); \
+    if ((temp) != 0) {                         \
+      (dest) = (temp);                         \
+    } else {                                   \
+      LOG(#dest " should be non-zero");        \
+      return mozilla::Err(NS_ERROR_FAILURE);   \
+    }                                          \
+  } while (0)
+
+#define COMPARE_FIELD(field) ((field) == aOther.field)
+#define COMPARE_ARRAY(field) \
+  std::equal(std::begin(field), std::end(field), std::begin(aOther.field))
+
+namespace mozilla {
+
+H265NALU::H265NALU(const uint8_t* aData, uint32_t aByteSize)
+    : mNALU(aData, aByteSize) {
+  BitReader reader(aData, aByteSize * 8);
+  (void)reader.ReadBit();  
+  mNalUnitType = reader.ReadBits(6);
+  mNuhLayerId = reader.ReadBits(6);
+  mNuhTemporalIdPlus1 = reader.ReadBits(3);
+  LOGV("Created H265NALU, type={}, size={}", mNalUnitType, aByteSize);
+}
+
+ Result<HVCCConfig, nsresult> HVCCConfig::Parse(
+    const mozilla::MediaRawData* aSample) {
+  if (!aSample) {
+    LOG("No sample");
+    return mozilla::Err(NS_ERROR_FAILURE);
+  }
+  if (aSample->Size() < 3) {
+    LOG("Incorrect sample size {}", aSample->Size());
+    return mozilla::Err(NS_ERROR_FAILURE);
+  }
+  if (aSample->mTrackInfo &&
+      !aSample->mTrackInfo->mMimeType.EqualsLiteral("video/hevc")) {
+    LOG("Only allow 'video/hevc' (mimeType={})",
+        aSample->mTrackInfo->mMimeType.get());
+    return mozilla::Err(NS_ERROR_FAILURE);
+  }
+  return HVCCConfig::Parse(aSample->mExtraData);
+}
+
+Result<HVCCConfig, nsresult> HVCCConfig::Parse(
+    const mozilla::MediaByteBuffer* aExtraData) {
+  if (!aExtraData) {
+    LOG("No extra-data");
+    return mozilla::Err(NS_ERROR_FAILURE);
+  }
+  if (aExtraData->Length() < 23) {
+    LOG("Incorrect extra-data size {}", aExtraData->Length());
+    return mozilla::Err(NS_ERROR_FAILURE);
+  }
+  const auto& byteBuffer = *aExtraData;
+  if (byteBuffer[0] != 1) {
+    LOG("Version should always be 1");
+    return mozilla::Err(NS_ERROR_FAILURE);
+  }
+  HVCCConfig hvcc;
+
+  BitReader reader(aExtraData);
+  hvcc.configurationVersion = reader.ReadBits(8);
+  hvcc.general_profile_space = reader.ReadBits(2);
+  hvcc.general_tier_flag = reader.ReadBit();
+  hvcc.general_profile_idc = reader.ReadBits(5);
+  hvcc.general_profile_compatibility_flags = reader.ReadU32();
+
+  uint32_t flagHigh = reader.ReadU32();
+  uint16_t flagLow = reader.ReadBits(16);
+  hvcc.general_constraint_indicator_flags =
+      ((uint64_t)(flagHigh) << 16) | (uint64_t)(flagLow);
+
+  hvcc.general_level_idc = reader.ReadBits(8);
+  (void)reader.ReadBits(4);  
+  hvcc.min_spatial_segmentation_idc = reader.ReadBits(12);
+  (void)reader.ReadBits(6);  
+  hvcc.parallelismType = reader.ReadBits(2);
+  (void)reader.ReadBits(6);  
+  hvcc.chroma_format_idc = reader.ReadBits(2);
+  (void)reader.ReadBits(5);  
+  hvcc.bit_depth_luma_minus8 = reader.ReadBits(3);
+  (void)reader.ReadBits(5);  
+  hvcc.bit_depth_chroma_minus8 = reader.ReadBits(3);
+  hvcc.avgFrameRate = reader.ReadBits(16);
+  hvcc.constantFrameRate = reader.ReadBits(2);
+  hvcc.numTemporalLayers = reader.ReadBits(3);
+  hvcc.temporalIdNested = reader.ReadBit();
+  hvcc.lengthSizeMinusOne = reader.ReadBits(2);
+  const uint8_t numOfArrays = reader.ReadBits(8);
+  for (uint8_t idx = 0; idx < numOfArrays; idx++) {
+    (void)reader.ReadBits(2);  
+    const uint8_t nalUnitType = reader.ReadBits(6);
+    const uint16_t numNalus = reader.ReadBits(16);
+    LOGV("nalu-type={}, nalu-num={}", nalUnitType, numNalus);
+    for (uint16_t nIdx = 0; nIdx < numNalus; nIdx++) {
+      const uint16_t nalUnitLength = reader.ReadBits(16);
+      if (reader.BitsLeft() < nalUnitLength * 8) {
+        LOG("Aborting parsing, NALU size ({} bits) is larger than remaining "
+            "({} bits)!",
+            nalUnitLength * 8u, reader.BitsLeft());
+        hvcc.mByteBuffer = aExtraData;
+        return hvcc;
+      }
+      const uint8_t* currentPtr =
+          aExtraData->Elements() + reader.BitCount() / 8;
+      H265NALU nalu(currentPtr, nalUnitLength);
+      uint32_t nalBitsLength = nalUnitLength * 8;
+      (void)reader.AdvanceBits(nalBitsLength);
+      if (nalu.IsSPS() || nalu.IsPPS() || nalu.IsVPS() || nalu.IsSEI()) {
+        hvcc.mNALUs.AppendElement(nalu);
+      } else {
+        LOG("Ignore NALU ({}) which is not SPS/PPS/VPS or SEI",
+            nalu.mNalUnitType);
+      }
+    }
+  }
+  hvcc.mByteBuffer = aExtraData;
+  return hvcc;
+}
+
+uint32_t HVCCConfig::NumSPS() const {
+  uint32_t spsCounter = 0;
+  for (const auto& nalu : mNALUs) {
+    if (nalu.IsSPS()) {
+      spsCounter++;
+    }
+  }
+  return spsCounter;
+}
+
+bool HVCCConfig::HasSPS() const {
+  bool hasSPS = false;
+  for (const auto& nalu : mNALUs) {
+    if (nalu.IsSPS()) {
+      hasSPS = true;
+      break;
+    }
+  }
+  return hasSPS;
+}
+
+nsCString HVCCConfig::ToString() const {
+  return nsFmtCString(
+      "HVCCConfig - version={}, profile_space={}, tier={}, "
+      "profile_idc={}, profile_compatibility_flags={:#08x}, "
+      "constraint_indicator_flags={:#016x}, level_idc={}, "
+      "min_spatial_segmentation_idc={}, parallelismType={}, "
+      "chroma_format_idc={}, bit_depth_luma_minus8={}, "
+      "bit_depth_chroma_minus8={}, avgFrameRate={}, constantFrameRate={}, "
+      "numTemporalLayers={}, temporalIdNested={}, lengthSizeMinusOne={}, "
+      "nalus={}, buffer={}(bytes), NaluSize={}, NumSPS={}",
+      configurationVersion, general_profile_space, general_tier_flag,
+      general_profile_idc, general_profile_compatibility_flags,
+      general_constraint_indicator_flags, general_level_idc,
+      min_spatial_segmentation_idc, parallelismType, chroma_format_idc,
+      bit_depth_luma_minus8, bit_depth_chroma_minus8, avgFrameRate,
+      constantFrameRate, numTemporalLayers, temporalIdNested,
+      lengthSizeMinusOne, mNALUs.Length(),
+      mByteBuffer ? mByteBuffer->Length() : 0, NALUSize(), NumSPS());
+}
+
+Maybe<H265NALU> HVCCConfig::GetFirstAvaiableNALU(
+    H265NALU::NAL_TYPES aType) const {
+  for (const auto& nalu : mNALUs) {
+    if (nalu.mNalUnitType == aType) {
+      return Some(nalu);
+    }
+  }
+  return Nothing();
+}
+
+Result<H265SPS, nsresult> H265::DecodeSPSFromSPSNALU(const H265NALU& aSPSNALU) {
+  MOZ_ASSERT(aSPSNALU.IsSPS());
+  RefPtr<MediaByteBuffer> rbsp = H265::DecodeNALUnit(aSPSNALU.mNALU);
+  if (!rbsp) {
+    LOG("Failed to decode NALU");
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  H265SPS sps;
+  BitReader reader(rbsp);
+  sps.sps_video_parameter_set_id = reader.ReadBits(4);
+  IN_RANGE_OR_RETURN(sps.sps_video_parameter_set_id, 0, 15);
+  sps.sps_max_sub_layers_minus1 = reader.ReadBits(3);
+  IN_RANGE_OR_RETURN(sps.sps_max_sub_layers_minus1, 0, 6);
+  sps.sps_temporal_id_nesting_flag = reader.ReadBit();
+
+  if (auto rv = ParseProfileTierLevel(
+          reader, true ,
+          sps.sps_max_sub_layers_minus1, sps.profile_tier_level);
+      rv.isErr()) {
+    LOG("Failed to parse the profile tier level.");
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  sps.sps_seq_parameter_set_id = reader.ReadUE();
+  IN_RANGE_OR_RETURN(sps.sps_seq_parameter_set_id, 0, 15);
+  sps.chroma_format_idc = reader.ReadUE();
+  IN_RANGE_OR_RETURN(sps.chroma_format_idc, 0, 3);
+
+  if (sps.chroma_format_idc == 3) {
+    sps.separate_colour_plane_flag = reader.ReadBit();
+  }
+
+  if (sps.chroma_format_idc == 1) {
+    sps.subWidthC = sps.subHeightC = 2;
+  } else if (sps.chroma_format_idc == 2) {
+    sps.subWidthC = 2;
+    sps.subHeightC = 1;
+  } else {
+    sps.subWidthC = sps.subHeightC = 1;
+  }
+
+  NON_ZERO_OR_RETURN(sps.pic_width_in_luma_samples, reader.ReadUE());
+  NON_ZERO_OR_RETURN(sps.pic_height_in_luma_samples, reader.ReadUE());
+  {
+    const auto maxLumaPs = sps.profile_tier_level.GetMaxLumaPs();
+    CheckedUint32 picSize = sps.pic_height_in_luma_samples;
+    picSize *= sps.pic_width_in_luma_samples;
+    if (!picSize.isValid()) {
+      LOG("Invalid picture size");
+      return Err(NS_ERROR_FAILURE);
+    }
+    const auto picSizeInSamplesY = picSize.value();
+    const auto maxDpbPicBuf = sps.profile_tier_level.GetDpbMaxPicBuf();
+    if (picSizeInSamplesY <= (maxLumaPs >> 2)) {
+      sps.maxDpbSize = std::min(4 * maxDpbPicBuf, 16u);
+    } else if (picSizeInSamplesY <= (maxLumaPs >> 1)) {
+      sps.maxDpbSize = std::min(2 * maxDpbPicBuf, 16u);
+    } else if (picSizeInSamplesY <= ((3 * maxLumaPs) >> 2)) {
+      sps.maxDpbSize = std::min((4 * maxDpbPicBuf) / 3, 16u);
+    } else {
+      sps.maxDpbSize = maxDpbPicBuf;
+    }
+  }
+
+  sps.conformance_window_flag = reader.ReadBit();
+  if (sps.conformance_window_flag) {
+    sps.conf_win_left_offset = reader.ReadUE();
+    sps.conf_win_right_offset = reader.ReadUE();
+    sps.conf_win_top_offset = reader.ReadUE();
+    sps.conf_win_bottom_offset = reader.ReadUE();
+    CheckedUint32 width = sps.pic_width_in_luma_samples;
+    width -=
+        sps.subWidthC * (sps.conf_win_right_offset - sps.conf_win_left_offset);
+    if (!width.isValid()) {
+      LOG("width overflow when applying the conformance window!");
+      return Err(NS_ERROR_FAILURE);
+    }
+    IN_RANGE_OR_RETURN(width.value(), 0, sps.pic_width_in_luma_samples);
+    CheckedUint32 height = sps.pic_height_in_luma_samples;
+    height -=
+        sps.subHeightC * (sps.conf_win_bottom_offset - sps.conf_win_top_offset);
+    if (!height.isValid()) {
+      LOG("height overflow when applying the conformance window!");
+      return Err(NS_ERROR_FAILURE);
+    }
+    IN_RANGE_OR_RETURN(height.value(), 0, sps.pic_height_in_luma_samples);
+    sps.mCroppedWidth = Some(width.value());
+    sps.mCroppedHeight = Some(height.value());
+  }
+  sps.bit_depth_luma_minus8 = reader.ReadUE();
+  IN_RANGE_OR_RETURN(sps.bit_depth_luma_minus8, 0, 8);
+  sps.bit_depth_chroma_minus8 = reader.ReadUE();
+  IN_RANGE_OR_RETURN(sps.bit_depth_chroma_minus8, 0, 8);
+  sps.log2_max_pic_order_cnt_lsb_minus4 = reader.ReadUE();
+  IN_RANGE_OR_RETURN(sps.log2_max_pic_order_cnt_lsb_minus4, 0, 12);
+  sps.sps_sub_layer_ordering_info_present_flag = reader.ReadBit();
+  for (auto i = sps.sps_sub_layer_ordering_info_present_flag
+                    ? 0
+                    : sps.sps_max_sub_layers_minus1;
+       i <= sps.sps_max_sub_layers_minus1; i++) {
+    sps.sps_max_dec_pic_buffering_minus1[i] = reader.ReadUE();
+    IN_RANGE_OR_RETURN(sps.sps_max_dec_pic_buffering_minus1[i], 0,
+                       sps.maxDpbSize - 1);
+    sps.sps_max_num_reorder_pics[i] = reader.ReadUE();
+    IN_RANGE_OR_RETURN(sps.sps_max_num_reorder_pics[i], 0,
+                       sps.sps_max_dec_pic_buffering_minus1[i]);
+    if (i > 0) {
+      TRUE_OR_RETURN(sps.sps_max_dec_pic_buffering_minus1[i] >=
+                     sps.sps_max_dec_pic_buffering_minus1[i - 1]);
+      TRUE_OR_RETURN(sps.sps_max_num_reorder_pics[i] >=
+                     sps.sps_max_num_reorder_pics[i - 1]);
+    }
+    sps.sps_max_latency_increase_plus1[i] = reader.ReadUE();
+    IN_RANGE_OR_RETURN(sps.sps_max_latency_increase_plus1[i], 0, 0xFFFFFFFE);
+  }
+  sps.log2_min_luma_coding_block_size_minus3 = reader.ReadUE();
+  sps.log2_diff_max_min_luma_coding_block_size = reader.ReadUE();
+  sps.log2_min_luma_transform_block_size_minus2 = reader.ReadUE();
+  sps.log2_diff_max_min_luma_transform_block_size = reader.ReadUE();
+  sps.max_transform_hierarchy_depth_inter = reader.ReadUE();
+  sps.max_transform_hierarchy_depth_intra = reader.ReadUE();
+  const auto scaling_list_enabled_flag = reader.ReadBit();
+  if (scaling_list_enabled_flag) {
+    const auto sps_scaling_list_data_present_flag = reader.ReadBit();
+    if (sps_scaling_list_data_present_flag) {
+      if (auto rv = ParseAndIgnoreScalingListData(reader); rv.isErr()) {
+        LOG("Failed to parse scaling list data.");
+        return Err(NS_ERROR_FAILURE);
+      }
+    }
+  }
+
+  (void)reader.ReadBits(2);
+
+  sps.pcm_enabled_flag = reader.ReadBit();
+  if (sps.pcm_enabled_flag) {
+    sps.pcm_sample_bit_depth_luma_minus1 = reader.ReadBits(3);
+    IN_RANGE_OR_RETURN(sps.pcm_sample_bit_depth_luma_minus1, 0,
+                       sps.BitDepthLuma());
+    sps.pcm_sample_bit_depth_chroma_minus1 = reader.ReadBits(3);
+    IN_RANGE_OR_RETURN(sps.pcm_sample_bit_depth_chroma_minus1, 0,
+                       sps.BitDepthChroma());
+    sps.log2_min_pcm_luma_coding_block_size_minus3 = reader.ReadUE();
+    IN_RANGE_OR_RETURN(sps.log2_min_pcm_luma_coding_block_size_minus3, 0, 2);
+    uint32_t log2MinIpcmCbSizeY{sps.log2_min_pcm_luma_coding_block_size_minus3 +
+                                3};
+    sps.log2_diff_max_min_pcm_luma_coding_block_size = reader.ReadUE();
+    {
+      CheckedUint32 log2MaxIpcmCbSizeY{
+          sps.log2_diff_max_min_pcm_luma_coding_block_size};
+      log2MaxIpcmCbSizeY += log2MinIpcmCbSizeY;
+      CheckedUint32 minCbLog2SizeY{sps.log2_min_luma_coding_block_size_minus3};
+      minCbLog2SizeY += 3;  
+      CheckedUint32 ctbLog2SizeY{minCbLog2SizeY};
+      ctbLog2SizeY += sps.log2_diff_max_min_luma_coding_block_size;  
+      IN_RANGE_OR_RETURN(log2MaxIpcmCbSizeY.value(), 0,
+                         std::min(ctbLog2SizeY.value(), uint32_t(5)));
+    }
+    sps.pcm_loop_filter_disabled_flag = reader.ReadBit();
+  }
+
+  sps.num_short_term_ref_pic_sets = reader.ReadUE();
+  IN_RANGE_OR_RETURN(sps.num_short_term_ref_pic_sets, 0,
+                     kMaxShortTermRefPicSets);
+  for (auto i = 0; i < sps.num_short_term_ref_pic_sets; i++) {
+    if (auto rv = ParseStRefPicSet(reader, i, sps); rv.isErr()) {
+      LOG("Failed to parse short-term reference picture set.");
+      return Err(NS_ERROR_FAILURE);
+    }
+  }
+  const auto long_term_ref_pics_present_flag = reader.ReadBit();
+  if (long_term_ref_pics_present_flag) {
+    uint32_t num_long_term_ref_pics_sps;
+    num_long_term_ref_pics_sps = reader.ReadUE();
+    IN_RANGE_OR_RETURN(num_long_term_ref_pics_sps, 0, kMaxLongTermRefPicSets);
+    for (auto i = 0; i < num_long_term_ref_pics_sps; i++) {
+      (void)reader.ReadBits(sps.log2_max_pic_order_cnt_lsb_minus4 +
+                            4);  
+      (void)reader.ReadBit();    
+    }
+  }
+  sps.sps_temporal_mvp_enabled_flag = reader.ReadBit();
+  sps.strong_intra_smoothing_enabled_flag = reader.ReadBit();
+  const auto vui_parameters_present_flag = reader.ReadBit();
+  if (vui_parameters_present_flag) {
+    if (auto rv = ParseVuiParameters(reader, sps); rv.isErr()) {
+      LOG("Failed to parse VUI parameter.");
+      return Err(NS_ERROR_FAILURE);
+    }
+  }
+
+  return sps;
+}
+
+Result<H265SPS, nsresult> H265::DecodeSPSFromHVCCExtraData(
+    const mozilla::MediaByteBuffer* aExtraData) {
+  auto rv = HVCCConfig::Parse(aExtraData);
+  if (rv.isErr()) {
+    LOG("Only support HVCC extra-data");
+    return Err(NS_ERROR_FAILURE);
+  }
+  const auto& hvcc = rv.unwrap();
+  const H265NALU* spsNALU = nullptr;
+  for (const auto& nalu : hvcc.mNALUs) {
+    if (nalu.IsSPS()) {
+      spsNALU = &nalu;
+      break;
+    }
+  }
+  if (!spsNALU) {
+    LOG("No sps found");
+    return Err(NS_ERROR_FAILURE);
+  }
+  return DecodeSPSFromSPSNALU(*spsNALU);
+}
+
+Result<Ok, nsresult> H265::ParseProfileTierLevel(
+    BitReader& aReader, bool aProfilePresentFlag,
+    uint8_t aMaxNumSubLayersMinus1, H265ProfileTierLevel& aProfile) {
+  if (aProfilePresentFlag) {
+    aProfile.general_profile_space = aReader.ReadBits(2);
+    aProfile.general_tier_flag = aReader.ReadBit();
+    aProfile.general_profile_idc = aReader.ReadBits(5);
+    IN_RANGE_OR_RETURN(aProfile.general_profile_idc, 0, 11);
+    aProfile.general_profile_compatibility_flags = aReader.ReadU32();
+    aProfile.general_progressive_source_flag = aReader.ReadBit();
+    aProfile.general_interlaced_source_flag = aReader.ReadBit();
+    aProfile.general_non_packed_constraint_flag = aReader.ReadBit();
+    aProfile.general_frame_only_constraint_flag = aReader.ReadBit();
+    (void)aReader.ReadBits(32);
+    (void)aReader.ReadBits(11);
+    (void)aReader.ReadBit();
+  }
+  aProfile.general_level_idc = aReader.ReadBits(8);
+
+  bool sub_layer_profile_present_flag[8];
+  bool sub_layer_level_present_flag[8];
+  for (auto i = 0; i < aMaxNumSubLayersMinus1; i++) {
+    sub_layer_profile_present_flag[i] = aReader.ReadBit();
+    sub_layer_level_present_flag[i] = aReader.ReadBit();
+  }
+  if (aMaxNumSubLayersMinus1 > 0) {
+    for (auto i = aMaxNumSubLayersMinus1; i < 8; i++) {
+      (void)aReader.ReadBits(2);
+    }
+  }
+  for (auto i = 0; i < aMaxNumSubLayersMinus1; i++) {
+    if (sub_layer_profile_present_flag[i]) {
+      (void)aReader.ReadBits(8);
+      (void)aReader.ReadBits(32);
+      (void)aReader.ReadBits(4);
+      (void)aReader.ReadBits(32);
+      (void)aReader.ReadBits(11);
+      (void)aReader.ReadBit();
+    }
+    if (sub_layer_level_present_flag[i]) {
+      (void)aReader.ReadBits(8);  
+    }
+  }
+  return Ok();
+}
+
+uint32_t H265ProfileTierLevel::GetMaxLumaPs() const {
+  if (general_level_idc <= 30) {  
+    return 36864;
+  }
+  if (general_level_idc <= 60) {  
+    return 122880;
+  }
+  if (general_level_idc <= 63) {  
+    return 245760;
+  }
+  if (general_level_idc <= 90) {  
+    return 552960;
+  }
+  if (general_level_idc <= 93) {  
+    return 983040;
+  }
+  if (general_level_idc <= 123) {  
+    return 2228224;
+  }
+  if (general_level_idc <= 156) {  
+    return 8912896;
+  }
+  return 35651584;
+}
+
+uint32_t H265ProfileTierLevel::GetDpbMaxPicBuf() const {
+  return (general_profile_idc >= H265ProfileIdc::kProfileIdcMain &&
+          general_profile_idc <= H265ProfileIdc::kProfileIdcHighThroughput)
+             ? 6
+             : 7;
+}
+
+bool H265ProfileTierLevel::operator==(
+    const H265ProfileTierLevel& aOther) const {
+  return COMPARE_FIELD(general_profile_space) &&
+         COMPARE_FIELD(general_tier_flag) &&
+         COMPARE_FIELD(general_profile_idc) &&
+         COMPARE_FIELD(general_profile_compatibility_flags) &&
+         COMPARE_FIELD(general_progressive_source_flag) &&
+         COMPARE_FIELD(general_interlaced_source_flag) &&
+         COMPARE_FIELD(general_non_packed_constraint_flag) &&
+         COMPARE_FIELD(general_frame_only_constraint_flag) &&
+         COMPARE_FIELD(general_level_idc);
+}
+
+bool H265StRefPicSet::operator==(const H265StRefPicSet& aOther) const {
+  return COMPARE_FIELD(num_negative_pics) && COMPARE_FIELD(num_positive_pics) &&
+         COMPARE_FIELD(numDeltaPocs) && COMPARE_ARRAY(usedByCurrPicS0) &&
+         COMPARE_ARRAY(usedByCurrPicS1) && COMPARE_ARRAY(deltaPocS0) &&
+         COMPARE_ARRAY(deltaPocS1);
+}
+
+bool H265VUIParameters::operator==(const H265VUIParameters& aOther) const {
+  return COMPARE_FIELD(sar_width) && COMPARE_FIELD(sar_height) &&
+         COMPARE_FIELD(video_full_range_flag) &&
+         COMPARE_FIELD(colour_primaries) &&
+         COMPARE_FIELD(transfer_characteristics) &&
+         COMPARE_FIELD(matrix_coeffs);
+}
+
+bool H265VUIParameters::HasValidAspectRatio() const {
+  return aspect_ratio_info_present_flag && mIsSARValid;
+}
+
+double H265VUIParameters::GetPixelAspectRatio() const {
+  MOZ_ASSERT(HasValidAspectRatio(),
+             "Shouldn't call this for an invalid ratio!");
+  if (MOZ_UNLIKELY(!sar_height)) {
+    return 0.0;
+  }
+  return static_cast<double>(sar_width) / static_cast<double>(sar_height);
+}
+
+Result<Ok, nsresult> H265::ParseAndIgnoreScalingListData(BitReader& aReader) {
+  for (auto sizeIdx = 0; sizeIdx < 4; sizeIdx++) {
+    for (auto matrixIdx = 0; matrixIdx < 6;
+         matrixIdx += (sizeIdx == 3) ? 3 : 1) {
+      const auto scaling_list_pred_mode_flag = aReader.ReadBit();
+      if (!scaling_list_pred_mode_flag) {
+        (void)aReader.ReadUE();  
+      } else {
+        int32_t coefNum = std::min(64, (1 << (4 + (sizeIdx << 1))));
+        if (sizeIdx > 1) {
+          (void)aReader.ReadSE();  
+        }
+        for (auto i = 0; i < coefNum; i++) {
+          (void)aReader.ReadSE();  
+        }
+      }
+    }
+  }
+  return Ok();
+}
+
+Result<Ok, nsresult> H265::ParseStRefPicSet(BitReader& aReader,
+                                            uint32_t aStRpsIdx, H265SPS& aSPS) {
+  MOZ_ASSERT(aStRpsIdx < kMaxShortTermRefPicSets);
+  bool inter_ref_pic_set_prediction_flag = false;
+  H265StRefPicSet& curStRefPicSet = aSPS.st_ref_pic_set[aStRpsIdx];
+  if (aStRpsIdx != 0) {
+    inter_ref_pic_set_prediction_flag = aReader.ReadBit();
+  }
+  const uint32_t spsMaxDecPicBufferingMinus1 =
+      aSPS.sps_max_dec_pic_buffering_minus1[aSPS.sps_max_sub_layers_minus1];
+  if (inter_ref_pic_set_prediction_flag) {
+    int delta_idx_minus1 = 0;
+    if (aStRpsIdx == aSPS.num_short_term_ref_pic_sets) {
+      delta_idx_minus1 = aReader.ReadUE();
+      IN_RANGE_OR_RETURN(delta_idx_minus1, 0, aStRpsIdx - 1);
+    }
+    const uint32_t RefRpsIdx = aStRpsIdx - (delta_idx_minus1 + 1);  
+    const bool delta_rps_sign = aReader.ReadBit();
+    const uint32_t abs_delta_rps_minus1 = aReader.ReadUE();
+    IN_RANGE_OR_RETURN(abs_delta_rps_minus1, 0, 0x7FFF);
+    const int32_t deltaRps =
+        (1 - 2 * delta_rps_sign) *
+        AssertedCast<int32_t>(abs_delta_rps_minus1 + 1);  
+
+    bool used_by_curr_pic_flag[kMaxShortTermRefPicSets] = {};
+    bool use_delta_flag[kMaxShortTermRefPicSets] = {};
+    std::fill_n(use_delta_flag, kMaxShortTermRefPicSets, true);
+    const H265StRefPicSet& refSet = aSPS.st_ref_pic_set[RefRpsIdx];
+    for (auto j = 0; j <= refSet.numDeltaPocs; j++) {
+      used_by_curr_pic_flag[j] = aReader.ReadBit();
+      if (!used_by_curr_pic_flag[j]) {
+        use_delta_flag[j] = aReader.ReadBit();
+      }
+    }
+    uint32_t i = 0;
+    for (int64_t j = static_cast<int64_t>(refSet.num_positive_pics) - 1; j >= 0;
+         j--) {
+      MOZ_DIAGNOSTIC_ASSERT(j < kMaxShortTermRefPicSets);
+      int64_t d_poc = refSet.deltaPocS1[j] + deltaRps;
+      if (d_poc < 0 && use_delta_flag[refSet.num_negative_pics + j]) {
+        curStRefPicSet.deltaPocS0[i] = d_poc;
+        curStRefPicSet.usedByCurrPicS0[i++] =
+            used_by_curr_pic_flag[refSet.num_negative_pics + j];
+      }
+    }
+    if (deltaRps < 0 && use_delta_flag[refSet.numDeltaPocs]) {
+      curStRefPicSet.deltaPocS0[i] = deltaRps;
+      curStRefPicSet.usedByCurrPicS0[i++] =
+          used_by_curr_pic_flag[refSet.numDeltaPocs];
+    }
+    for (auto j = 0; j < refSet.num_negative_pics; j++) {
+      MOZ_DIAGNOSTIC_ASSERT(j < kMaxShortTermRefPicSets);
+      int64_t d_poc = refSet.deltaPocS0[j] + deltaRps;
+      if (d_poc < 0 && use_delta_flag[j]) {
+        curStRefPicSet.deltaPocS0[i] = d_poc;
+        curStRefPicSet.usedByCurrPicS0[i++] = used_by_curr_pic_flag[j];
+      }
+    }
+    curStRefPicSet.num_negative_pics = i;
+    i = 0;
+    for (int64_t j = static_cast<int64_t>(refSet.num_negative_pics) - 1; j >= 0;
+         j--) {
+      MOZ_DIAGNOSTIC_ASSERT(j < kMaxShortTermRefPicSets);
+      int64_t d_poc = refSet.deltaPocS0[j] + deltaRps;
+      if (d_poc > 0 && use_delta_flag[j]) {
+        curStRefPicSet.deltaPocS1[i] = d_poc;
+        curStRefPicSet.usedByCurrPicS1[i++] = used_by_curr_pic_flag[j];
+      }
+    }
+    if (deltaRps > 0 && use_delta_flag[refSet.numDeltaPocs]) {
+      curStRefPicSet.deltaPocS1[i] = deltaRps;
+      curStRefPicSet.usedByCurrPicS1[i++] =
+          used_by_curr_pic_flag[refSet.numDeltaPocs];
+    }
+    for (auto j = 0; j < refSet.num_positive_pics; j++) {
+      MOZ_DIAGNOSTIC_ASSERT(j < kMaxShortTermRefPicSets);
+      int64_t d_poc = refSet.deltaPocS1[j] + deltaRps;
+      if (d_poc > 0 && use_delta_flag[refSet.num_negative_pics + j]) {
+        curStRefPicSet.deltaPocS1[i] = d_poc;
+        curStRefPicSet.usedByCurrPicS1[i++] =
+            used_by_curr_pic_flag[refSet.num_negative_pics + j];
+      }
+    }
+    curStRefPicSet.num_positive_pics = i;
+    IN_RANGE_OR_RETURN(curStRefPicSet.num_negative_pics, 0,
+                       spsMaxDecPicBufferingMinus1);
+    CheckedUint32 maxPositivePics{spsMaxDecPicBufferingMinus1};
+    maxPositivePics -= curStRefPicSet.num_negative_pics;
+    IN_RANGE_OR_RETURN(curStRefPicSet.num_positive_pics, 0,
+                       maxPositivePics.value());
+  } else {
+    curStRefPicSet.num_negative_pics = aReader.ReadUE();
+    curStRefPicSet.num_positive_pics = aReader.ReadUE();
+    IN_RANGE_OR_RETURN(curStRefPicSet.num_negative_pics, 0,
+                       spsMaxDecPicBufferingMinus1);
+    CheckedUint32 maxPositivePics{spsMaxDecPicBufferingMinus1};
+    maxPositivePics -= curStRefPicSet.num_negative_pics;
+    IN_RANGE_OR_RETURN(curStRefPicSet.num_positive_pics, 0,
+                       maxPositivePics.value());
+    for (auto i = 0; i < curStRefPicSet.num_negative_pics; i++) {
+      const uint32_t delta_poc_s0_minus1 = aReader.ReadUE();
+      IN_RANGE_OR_RETURN(delta_poc_s0_minus1, 0, 0x7FFF);
+      if (i == 0) {
+        curStRefPicSet.deltaPocS0[i] = -(delta_poc_s0_minus1 + 1);
+      } else {
+        curStRefPicSet.deltaPocS0[i] =
+            curStRefPicSet.deltaPocS0[i - 1] - (delta_poc_s0_minus1 + 1);
+      }
+      curStRefPicSet.usedByCurrPicS0[i] = aReader.ReadBit();
+    }
+    for (auto i = 0; i < curStRefPicSet.num_positive_pics; i++) {
+      const int delta_poc_s1_minus1 = aReader.ReadUE();
+      IN_RANGE_OR_RETURN(delta_poc_s1_minus1, 0, 0x7FFF);
+      if (i == 0) {
+        curStRefPicSet.deltaPocS1[i] = delta_poc_s1_minus1 + 1;
+      } else {
+        curStRefPicSet.deltaPocS1[i] =
+            curStRefPicSet.deltaPocS1[i - 1] + delta_poc_s1_minus1 + 1;
+      }
+      curStRefPicSet.usedByCurrPicS1[i] = aReader.ReadBit();
+    }
+  }
+  curStRefPicSet.numDeltaPocs =
+      curStRefPicSet.num_negative_pics + curStRefPicSet.num_positive_pics;
+  IN_RANGE_OR_RETURN(curStRefPicSet.numDeltaPocs, 0,
+                     spsMaxDecPicBufferingMinus1);
+  return Ok();
+}
+
+Result<Ok, nsresult> H265::ParseVuiParameters(BitReader& aReader,
+                                              H265SPS& aSPS) {
+  static constexpr int kTableSarWidth[] = {0,  1,  12, 10, 16,  40, 24, 20, 32,
+                                           80, 18, 15, 64, 160, 4,  3,  2};
+  static constexpr int kTableSarHeight[] = {0,  1,  11, 11, 11, 33, 11, 11, 11,
+                                            33, 11, 11, 33, 99, 3,  2,  1};
+  static_assert(std::size(kTableSarWidth) == std::size(kTableSarHeight),
+                "sar tables must have the same size");
+  aSPS.vui_parameters = Some(H265VUIParameters());
+  H265VUIParameters* vui = aSPS.vui_parameters.ptr();
+
+  vui->aspect_ratio_info_present_flag = aReader.ReadBit();
+  if (vui->aspect_ratio_info_present_flag) {
+    const auto aspect_ratio_idc = aReader.ReadBits(8);
+    constexpr int kExtendedSar = 255;
+    if (aspect_ratio_idc == kExtendedSar) {
+      vui->sar_width = aReader.ReadBits(16);
+      vui->sar_height = aReader.ReadBits(16);
+    } else {
+      const auto max_aspect_ratio_idc = std::size(kTableSarWidth) - 1;
+      IN_RANGE_OR_RETURN(aspect_ratio_idc, 0, max_aspect_ratio_idc);
+      vui->sar_width = kTableSarWidth[aspect_ratio_idc];
+      vui->sar_height = kTableSarHeight[aspect_ratio_idc];
+    }
+    vui->mIsSARValid = vui->sar_width && vui->sar_height;
+    if (!vui->mIsSARValid) {
+      LOG("sar_width or sar_height should not be zero!");
+    }
+  }
+
+  const auto overscan_info_present_flag = aReader.ReadBit();
+  if (overscan_info_present_flag) {
+    (void)aReader.ReadBit();  
+  }
+
+  const auto video_signal_type_present_flag = aReader.ReadBit();
+  if (video_signal_type_present_flag) {
+    (void)aReader.ReadBits(3);  
+    vui->video_full_range_flag = aReader.ReadBit();
+    const auto colour_description_present_flag = aReader.ReadBit();
+    if (colour_description_present_flag) {
+      vui->colour_primaries.emplace(aReader.ReadBits(8));
+      vui->transfer_characteristics.emplace(aReader.ReadBits(8));
+      vui->matrix_coeffs.emplace(aReader.ReadBits(8));
+    }
+  }
+
+  const auto chroma_loc_info_present_flag = aReader.ReadBit();
+  if (chroma_loc_info_present_flag) {
+    (void)aReader.ReadUE();  
+    (void)aReader.ReadUE();  
+  }
+
+  (void)aReader.ReadBits(3);
+
+  const auto default_display_window_flag = aReader.ReadBit();
+  if (default_display_window_flag) {
+    uint32_t def_disp_win_left_offset = aReader.ReadUE();
+    uint32_t def_disp_win_right_offset = aReader.ReadUE();
+    uint32_t def_disp_win_top_offset = aReader.ReadUE();
+    uint32_t def_disp_win_bottom_offset = aReader.ReadUE();
+    aSPS.mDisplayWidth = aSPS.subWidthC;
+    aSPS.mDisplayWidth *=
+        (aSPS.conf_win_left_offset + def_disp_win_left_offset);
+    aSPS.mDisplayWidth *=
+        (aSPS.conf_win_right_offset + def_disp_win_right_offset);
+    if (!aSPS.mDisplayWidth.isValid()) {
+      LOG("mDisplayWidth overflow!");
+      return Err(NS_ERROR_FAILURE);
+    }
+    IN_RANGE_OR_RETURN(aSPS.mDisplayWidth.value(), 0,
+                       aSPS.pic_width_in_luma_samples);
+
+    aSPS.mDisplayHeight = aSPS.subHeightC;
+    aSPS.mDisplayHeight *= (aSPS.conf_win_top_offset + def_disp_win_top_offset);
+    aSPS.mDisplayHeight *=
+        (aSPS.conf_win_bottom_offset + def_disp_win_bottom_offset);
+    if (!aSPS.mDisplayHeight.isValid()) {
+      LOG("mDisplayHeight overflow!");
+      return Err(NS_ERROR_FAILURE);
+    }
+    IN_RANGE_OR_RETURN(aSPS.mDisplayHeight.value(), 0,
+                       aSPS.pic_height_in_luma_samples);
+  }
+
+  const auto vui_timing_info_present_flag = aReader.ReadBit();
+  if (vui_timing_info_present_flag) {
+    (void)aReader.ReadU32();  
+    (void)aReader.ReadU32();  
+    const auto vui_poc_proportional_to_timing_flag = aReader.ReadBit();
+    if (vui_poc_proportional_to_timing_flag) {
+      (void)aReader.ReadUE();  
+    }
+    const auto vui_hrd_parameters_present_flag = aReader.ReadBit();
+    if (vui_hrd_parameters_present_flag) {
+      if (auto rv = ParseAndIgnoreHrdParameters(aReader, true,
+                                                aSPS.sps_max_sub_layers_minus1);
+          rv.isErr()) {
+        LOG("Failed to parse Hrd parameters");
+        return rv;
+      }
+    }
+  }
+
+  const auto bitstream_restriction_flag = aReader.ReadBit();
+  if (bitstream_restriction_flag) {
+    (void)aReader.ReadBits(3);
+    (void)aReader.ReadUE();  
+    (void)aReader.ReadUE();  
+    (void)aReader.ReadUE();  
+    (void)aReader.ReadUE();  
+    (void)aReader.ReadUE();  
+  }
+  return Ok();
+}
+
+Result<Ok, nsresult> H265::ParseAndIgnoreHrdParameters(
+    BitReader& aReader, bool aCommonInfPresentFlag,
+    int aMaxNumSubLayersMinus1) {
+  bool nal_hrd_parameters_present_flag = false;
+  bool vcl_hrd_parameters_present_flag = false;
+  bool sub_pic_hrd_params_present_flag = false;
+  if (aCommonInfPresentFlag) {
+    nal_hrd_parameters_present_flag = aReader.ReadBit();
+    vcl_hrd_parameters_present_flag = aReader.ReadBit();
+    if (nal_hrd_parameters_present_flag || vcl_hrd_parameters_present_flag) {
+      sub_pic_hrd_params_present_flag = aReader.ReadBit();
+      if (sub_pic_hrd_params_present_flag) {
+        (void)aReader.ReadBits(8);  
+        (void)aReader.ReadBits(5);
+        (void)aReader.ReadBits(1);
+        (void)aReader.ReadBits(5);  
+      }
+
+      (void)aReader.ReadBits(4);  
+      (void)aReader.ReadBits(4);  
+      if (sub_pic_hrd_params_present_flag) {
+        (void)aReader.ReadBits(4);  
+      }
+      (void)aReader.ReadBits(5);  
+      (void)aReader.ReadBits(5);  
+      (void)aReader.ReadBits(5);  
+    }
+  }
+  for (int i = 0; i <= aMaxNumSubLayersMinus1; i++) {
+    bool fixed_pic_rate_within_cvs_flag = false;
+    if (auto fixed_pic_rate_general_flag = aReader.ReadBit();
+        !fixed_pic_rate_general_flag) {
+      fixed_pic_rate_within_cvs_flag = aReader.ReadBit();
+    }
+    bool low_delay_hrd_flag = false;
+    if (fixed_pic_rate_within_cvs_flag) {
+      (void)aReader.ReadUE();  
+    } else {
+      low_delay_hrd_flag = aReader.ReadBit();
+    }
+    int cpb_cnt_minus1 = 0;
+    if (!low_delay_hrd_flag) {
+      cpb_cnt_minus1 = aReader.ReadUE();
+      IN_RANGE_OR_RETURN(cpb_cnt_minus1, 0, 31);
+    }
+    if (nal_hrd_parameters_present_flag) {
+      if (auto rv = ParseAndIgnoreSubLayerHrdParameters(
+              aReader, cpb_cnt_minus1 + 1, sub_pic_hrd_params_present_flag);
+          rv.isErr()) {
+        LOG("Failed to parse nal Hrd parameters");
+        return rv;
+      };
+    }
+    if (vcl_hrd_parameters_present_flag) {
+      if (auto rv = ParseAndIgnoreSubLayerHrdParameters(
+              aReader, cpb_cnt_minus1 + 1, sub_pic_hrd_params_present_flag);
+          rv.isErr()) {
+        LOG("Failed to parse vcl Hrd parameters");
+        return rv;
+      }
+    }
+  }
+  return Ok();
+}
+
+Result<Ok, nsresult> H265::ParseAndIgnoreSubLayerHrdParameters(
+    BitReader& aReader, int aCpbCnt, bool aSubPicHrdParamsPresentFlag) {
+  for (auto i = 0; i < aCpbCnt; i++) {
+    (void)aReader.ReadUE();  
+    (void)aReader.ReadUE();  
+    if (aSubPicHrdParamsPresentFlag) {
+      (void)aReader.ReadUE();  
+      (void)aReader.ReadUE();  
+    }
+    (void)aReader.ReadBit();  
+  }
+  return Ok();
+}
+
+bool H265SPS::operator==(const H265SPS& aOther) const {
+  return COMPARE_FIELD(sps_video_parameter_set_id) &&
+         COMPARE_FIELD(sps_max_sub_layers_minus1) &&
+         COMPARE_FIELD(sps_temporal_id_nesting_flag) &&
+         COMPARE_FIELD(profile_tier_level) &&
+         COMPARE_FIELD(sps_seq_parameter_set_id) &&
+         COMPARE_FIELD(chroma_format_idc) &&
+         COMPARE_FIELD(separate_colour_plane_flag) &&
+         COMPARE_FIELD(pic_width_in_luma_samples) &&
+         COMPARE_FIELD(pic_height_in_luma_samples) &&
+         COMPARE_FIELD(conformance_window_flag) &&
+         COMPARE_FIELD(conf_win_left_offset) &&
+         COMPARE_FIELD(conf_win_right_offset) &&
+         COMPARE_FIELD(conf_win_top_offset) &&
+         COMPARE_FIELD(conf_win_bottom_offset) &&
+         COMPARE_FIELD(bit_depth_luma_minus8) &&
+         COMPARE_FIELD(bit_depth_chroma_minus8) &&
+         COMPARE_FIELD(log2_max_pic_order_cnt_lsb_minus4) &&
+         COMPARE_FIELD(sps_sub_layer_ordering_info_present_flag) &&
+         COMPARE_ARRAY(sps_max_dec_pic_buffering_minus1) &&
+         COMPARE_ARRAY(sps_max_num_reorder_pics) &&
+         COMPARE_ARRAY(sps_max_latency_increase_plus1) &&
+         COMPARE_FIELD(log2_min_luma_coding_block_size_minus3) &&
+         COMPARE_FIELD(log2_diff_max_min_luma_coding_block_size) &&
+         COMPARE_FIELD(log2_min_luma_transform_block_size_minus2) &&
+         COMPARE_FIELD(log2_diff_max_min_luma_transform_block_size) &&
+         COMPARE_FIELD(max_transform_hierarchy_depth_inter) &&
+         COMPARE_FIELD(max_transform_hierarchy_depth_intra) &&
+         COMPARE_FIELD(pcm_enabled_flag) &&
+         COMPARE_FIELD(pcm_sample_bit_depth_luma_minus1) &&
+         COMPARE_FIELD(pcm_sample_bit_depth_chroma_minus1) &&
+         COMPARE_FIELD(log2_min_pcm_luma_coding_block_size_minus3) &&
+         COMPARE_FIELD(log2_diff_max_min_pcm_luma_coding_block_size) &&
+         COMPARE_FIELD(pcm_loop_filter_disabled_flag) &&
+         COMPARE_FIELD(num_short_term_ref_pic_sets) &&
+         COMPARE_ARRAY(st_ref_pic_set) &&
+         COMPARE_FIELD(sps_temporal_mvp_enabled_flag) &&
+         COMPARE_FIELD(strong_intra_smoothing_enabled_flag) &&
+         COMPARE_FIELD(vui_parameters) && COMPARE_FIELD(subWidthC) &&
+         COMPARE_FIELD(subHeightC) && COMPARE_FIELD(mDisplayWidth) &&
+         COMPARE_FIELD(mDisplayHeight) && COMPARE_FIELD(maxDpbSize);
+}
+
+bool H265SPS::operator!=(const H265SPS& aOther) const {
+  return !(operator==(aOther));
+}
+
+gfx::IntSize H265SPS::GetImageSize() const {
+  if (mCroppedWidth && mCroppedHeight) {
+    return gfx::IntSize(*mCroppedWidth, *mCroppedHeight);
+  }
+  return gfx::IntSize(pic_width_in_luma_samples, pic_height_in_luma_samples);
+}
+
+gfx::IntSize H265SPS::GetDisplaySize() const {
+  if (mDisplayWidth.value() == 0 || mDisplayHeight.value() == 0) {
+    return GetImageSize();
+  }
+  return gfx::IntSize(mDisplayWidth.value(), mDisplayHeight.value());
+}
+
+gfx::ColorDepth H265SPS::ColorDepth() const {
+  if (bit_depth_luma_minus8 != 0 && bit_depth_luma_minus8 != 2 &&
+      bit_depth_luma_minus8 != 4) {
+    return gfx::ColorDepth::COLOR_8;
+  }
+  return gfx::ColorDepthForBitDepth(BitDepthLuma());
+}
+
+static PrimaryID GetPrimaryID(const Maybe<uint8_t>& aPrimary) {
+  if (!aPrimary || *aPrimary < 1 || *aPrimary > 22 || *aPrimary == 3) {
+    return PrimaryID::INVALID;
+  }
+  if (*aPrimary > 12 && *aPrimary < 22) {
+    return PrimaryID::INVALID;
+  }
+  return static_cast<PrimaryID>(*aPrimary);
+}
+
+static TransferID GetTransferID(const Maybe<uint8_t>& aTransfer) {
+  if (!aTransfer || *aTransfer < 1 || *aTransfer > 18 || *aTransfer == 3) {
+    return TransferID::INVALID;
+  }
+  return static_cast<TransferID>(*aTransfer);
+}
+
+static MatrixID GetMatrixID(const Maybe<uint8_t>& aMatrix) {
+  if (!aMatrix || *aMatrix > 11 || *aMatrix == 3) {
+    return MatrixID::INVALID;
+  }
+  return static_cast<MatrixID>(*aMatrix);
+}
+
+gfx::YUVColorSpace H265SPS::ColorSpace() const {
+  enum Guess {
+    GUESS_BT601 = 1 << 0,
+    GUESS_BT709 = 1 << 1,
+    GUESS_BT2020 = 1 << 2,
+  };
+
+  uint32_t guess = 0;
+  if (vui_parameters) {
+    switch (GetPrimaryID(vui_parameters->colour_primaries)) {
+      case PrimaryID::BT709:
+        guess |= GUESS_BT709;
+        break;
+      case PrimaryID::BT470M:
+      case PrimaryID::BT470BG:
+      case PrimaryID::SMPTE170M:
+      case PrimaryID::SMPTE240M:
+        guess |= GUESS_BT601;
+        break;
+      case PrimaryID::BT2020:
+        guess |= GUESS_BT2020;
+        break;
+      case PrimaryID::FILM:
+      case PrimaryID::SMPTEST428_1:
+      case PrimaryID::SMPTEST431_2:
+      case PrimaryID::SMPTEST432_1:
+      case PrimaryID::EBU_3213_E:
+      case PrimaryID::INVALID:
+      case PrimaryID::UNSPECIFIED:
+        break;
+    }
+
+    switch (GetTransferID(vui_parameters->transfer_characteristics)) {
+      case TransferID::BT709:
+        guess |= GUESS_BT709;
+        break;
+      case TransferID::GAMMA22:
+      case TransferID::GAMMA28:
+      case TransferID::SMPTE170M:
+      case TransferID::SMPTE240M:
+        guess |= GUESS_BT601;
+        break;
+      case TransferID::BT2020_10:
+      case TransferID::BT2020_12:
+        guess |= GUESS_BT2020;
+        break;
+      case TransferID::LINEAR:
+      case TransferID::LOG:
+      case TransferID::LOG_SQRT:
+      case TransferID::IEC61966_2_4:
+      case TransferID::BT1361_ECG:
+      case TransferID::IEC61966_2_1:
+      case TransferID::SMPTEST2084:
+      case TransferID::SMPTEST428_1:
+      case TransferID::ARIB_STD_B67:
+      case TransferID::INVALID:
+      case TransferID::UNSPECIFIED:
+        break;
+    }
+
+    switch (GetMatrixID(vui_parameters->matrix_coeffs)) {
+      case MatrixID::BT709:
+        guess |= GUESS_BT709;
+        break;
+      case MatrixID::BT470BG:
+      case MatrixID::SMPTE170M:
+      case MatrixID::SMPTE240M:
+        guess |= GUESS_BT601;
+        break;
+      case MatrixID::BT2020_NCL:
+      case MatrixID::BT2020_CL:
+        guess |= GUESS_BT2020;
+        break;
+      case MatrixID::RGB:
+      case MatrixID::FCC:
+      case MatrixID::YCOCG:
+      case MatrixID::YDZDX:
+      case MatrixID::INVALID:
+      case MatrixID::UNSPECIFIED:
+        break;
+    }
+  }
+
+  while (guess & (guess - 1)) {
+    guess &= guess - 1;
+  }
+  if (!guess) {
+    guess = GUESS_BT709;
+  }
+
+  switch (guess) {
+    case GUESS_BT601:
+      return gfx::YUVColorSpace::BT601;
+    case GUESS_BT709:
+      return gfx::YUVColorSpace::BT709;
+    default:
+      MOZ_DIAGNOSTIC_ASSERT(guess == GUESS_BT2020);
+      return gfx::YUVColorSpace::BT2020;
+  }
+}
+
+bool H265SPS::IsFullColorRange() const {
+  return vui_parameters ? vui_parameters->video_full_range_flag : false;
+}
+
+uint8_t H265SPS::ColorPrimaries() const {
+  if (!vui_parameters || !vui_parameters->colour_primaries) {
+    return 2;
+  }
+  return vui_parameters->colour_primaries.value();
+}
+
+uint8_t H265SPS::TransferFunction() const {
+  if (!vui_parameters || !vui_parameters->transfer_characteristics) {
+    return 2;
+  }
+  return vui_parameters->transfer_characteristics.value();
+}
+
+already_AddRefed<mozilla::MediaByteBuffer> H265::DecodeNALUnit(
+    const Span<const uint8_t>& aNALU) {
+  RefPtr<mozilla::MediaByteBuffer> rbsp = new mozilla::MediaByteBuffer;
+  BufferReader reader(aNALU.Elements(), aNALU.Length());
+  auto header = reader.ReadU16();
+  if (header.isErr()) {
+    return nullptr;
+  }
+  uint32_t lastbytes = 0xffff;
+  while (reader.Remaining()) {
+    auto res = reader.ReadU8();
+    if (res.isErr()) {
+      return nullptr;
+    }
+    uint8_t byte = res.unwrap();
+    if ((lastbytes & 0xffff) == 0 && byte == 0x03) {
+      lastbytes = 0xffff;
+    } else {
+      rbsp->AppendElement(byte);
+    }
+    lastbytes = (lastbytes << 8) | byte;
+  }
+  return rbsp.forget();
+}
+
+mozilla::Maybe<mozilla::gfx::HDRMetadata> H265::ParseSEIHDRMetadata(
+    const H265NALU& aNALU) {
+  MOZ_ASSERT(aNALU.mNalUnitType == H265NALU::NAL_TYPES::PREFIX_SEI_NUT ||
+             aNALU.mNalUnitType == H265NALU::NAL_TYPES::SUFFIX_SEI_NUT);
+
+  RefPtr<MediaByteBuffer> rbsp = H265::DecodeNALUnit(aNALU.mNALU);
+  if (!rbsp) {
+    return Nothing();
+  }
+
+  const Span<const uint8_t> data(rbsp->Elements(), rbsp->Length());
+  size_t offset = 0;
+
+  static constexpr uint8_t kSEIMasteringDisplayType = 137;
+  static constexpr uint8_t kSEIContentLightLevelType = 144;
+  static constexpr float kPrimariesDivisor = 50000.0f;
+  static constexpr float kLuminanceDivisor = 10000.0f;
+
+  gfx::HDRMetadata hdr;
+  bool hasMasteringDisplay = false;
+  bool hasCLL = false;
+
+  while (offset < data.Length()) {
+    if (offset + 1 == data.Length() && data[offset] == 0x80) {
+      break;
+    }
+
+    size_t payloadType = 0;
+    while (offset < data.Length() && data[offset] == 0xff) {
+      payloadType += 0xff;
+      offset++;
+    }
+    if (offset >= data.Length()) {
+      break;
+    }
+    payloadType += data[offset++];
+
+    size_t payloadSize = 0;
+    while (offset < data.Length() && data[offset] == 0xff) {
+      payloadSize += 0xff;
+      offset++;
+    }
+    if (offset >= data.Length()) {
+      break;
+    }
+    payloadSize += data[offset++];
+
+    if (offset + payloadSize > data.Length()) {
+      break;
+    }
+
+    if (payloadType == kSEIMasteringDisplayType) {
+      if (payloadSize != 24) {
+        NS_WARNING("H265 SEI mastering display: unexpected payload size");
+        offset += payloadSize;
+        continue;
+      }
+      BufferReader br(data.Elements() + offset, payloadSize);
+      auto g0x = br.ReadU16();
+      auto g0y = br.ReadU16();
+      auto b1x = br.ReadU16();
+      auto b1y = br.ReadU16();
+      auto r2x = br.ReadU16();
+      auto r2y = br.ReadU16();
+      auto wpx = br.ReadU16();
+      auto wpy = br.ReadU16();
+      auto maxL = br.ReadU32();
+      auto minL = br.ReadU32();
+      if (g0x.isErr() || g0y.isErr() || b1x.isErr() || b1y.isErr() ||
+          r2x.isErr() || r2y.isErr() || wpx.isErr() || wpy.isErr() ||
+          maxL.isErr() || minL.isErr()) {
+        LOG("H265 SEI mastering display: failed to read fields");
+        offset += payloadSize;
+        continue;
+      }
+      gfx::Chromaticity green{g0x.unwrap() / kPrimariesDivisor,
+                              g0y.unwrap() / kPrimariesDivisor};
+      gfx::Chromaticity blue{b1x.unwrap() / kPrimariesDivisor,
+                             b1y.unwrap() / kPrimariesDivisor};
+      gfx::Chromaticity red{r2x.unwrap() / kPrimariesDivisor,
+                            r2y.unwrap() / kPrimariesDivisor};
+      gfx::Chromaticity whitePoint{wpx.unwrap() / kPrimariesDivisor,
+                                   wpy.unwrap() / kPrimariesDivisor};
+      float maxLuminance = maxL.unwrap() / kLuminanceDivisor;
+      float minLuminance = minL.unwrap() / kLuminanceDivisor;
+
+      hdr.mSmpte2086 = Some(gfx::Smpte2086Metadata{red, green, blue, whitePoint,
+                                                   maxLuminance, minLuminance});
+      hasMasteringDisplay = true;
+    } else if (payloadType == kSEIContentLightLevelType) {
+      if (payloadSize != 4) {
+        NS_WARNING("H265 SEI content light level: unexpected payload size");
+        offset += payloadSize;
+        continue;
+      }
+      BufferReader br(data.Elements() + offset, payloadSize);
+      auto maxCLL = br.ReadU16();
+      auto maxFALL = br.ReadU16();
+      if (maxCLL.isErr() || maxFALL.isErr()) {
+        LOG("H265 SEI content light level: failed to read fields");
+        offset += payloadSize;
+        continue;
+      }
+      hdr.mContentLightLevel =
+          Some(gfx::ContentLightLevel{maxCLL.unwrap(), maxFALL.unwrap()});
+      hasCLL = true;
+    }
+
+    offset += payloadSize;
+  }
+
+  if (!hasMasteringDisplay && !hasCLL) {
+    return Nothing();
+  }
+  MOZ_ASSERT(hdr.IsValid());
+  return Some(hdr);
+}
+
+
+already_AddRefed<mozilla::MediaByteBuffer> H265::ExtractHVCCExtraData(
+    const mozilla::MediaRawData* aSample) {
+  size_t sampleSize = aSample->Size();
+  if (aSample->mCrypto.IsEncrypted()) {
+    MOZ_ASSERT(aSample->mCrypto.mPlainSizes.Length() > 0);
+    if (aSample->mCrypto.mPlainSizes.Length() == 0 ||
+        aSample->mCrypto.mPlainSizes[0] > sampleSize) {
+      LOG("Invalid crypto content");
+      return nullptr;
+    }
+    sampleSize = aSample->mCrypto.mPlainSizes[0];
+  }
+
+  auto hvcc = HVCCConfig::Parse(aSample);
+  if (hvcc.isErr()) {
+    LOG("Only support extracting extradata from HVCC");
+    return nullptr;
+  }
+  const auto nalLenSize = hvcc.unwrap().NALUSize();
+  BufferReader reader(aSample->Data(), sampleSize);
+
+  nsTHashMap<uint8_t, nsTArray<H265NALU>> nalusMap;
+
+  nsTArray<Maybe<H265SPS>> spsRefTable;
+  bool checkDuplicate = true;
+  Maybe<uint8_t> firstSPSId;
+
+  RefPtr<mozilla::MediaByteBuffer> extradata = new mozilla::MediaByteBuffer;
+  while (reader.Remaining() > nalLenSize) {
+    uint32_t nalLen = 0;
+    switch (nalLenSize) {
+      case 1:
+        (void)reader.ReadU8().map(
+            [&](uint8_t x) mutable { return nalLen = x; });
+        break;
+      case 2:
+        (void)reader.ReadU16().map(
+            [&](uint16_t x) mutable { return nalLen = x; });
+        break;
+      case 3:
+        (void)reader.ReadU24().map(
+            [&](uint32_t x) mutable { return nalLen = x; });
+        break;
+      default:
+        MOZ_DIAGNOSTIC_ASSERT(nalLenSize == 4);
+        (void)reader.ReadU32().map(
+            [&](uint32_t x) mutable { return nalLen = x; });
+        break;
+    }
+    const uint8_t* p = reader.Read(nalLen);
+    if (!p) {
+      break;
+    }
+    const H265NALU nalu(p, nalLen);
+    LOGV("Found NALU, type={}", nalu.mNalUnitType);
+    if (nalu.IsSPS()) {
+      auto rv = H265::DecodeSPSFromSPSNALU(nalu);
+      if (rv.isErr()) {
+        LOG("Ignore invalid SPS");
+        continue;
+      }
+      const H265SPS sps = rv.unwrap();
+      const uint8_t spsId = sps.sps_seq_parameter_set_id;  
+      if (spsId >= spsRefTable.Length()) {
+        if (!spsRefTable.SetLength(spsId + 1, fallible)) {
+          NS_WARNING("OOM while expanding spsRefTable!");
+          return nullptr;
+        }
+      }
+      if (checkDuplicate && spsRefTable[spsId] &&
+          *(spsRefTable[spsId]) == sps) {
+        continue;
+      }
+      if (spsRefTable[spsId]) {
+        checkDuplicate = false;
+      } else {
+        spsRefTable[spsId] = Some(sps);
+        nalusMap.LookupOrInsert(nalu.mNalUnitType).AppendElement(nalu);
+        if (!firstSPSId) {
+          firstSPSId.emplace(spsId);
+        }
+      }
+    } else if (nalu.IsVPS() || nalu.IsPPS()) {
+      nalusMap.LookupOrInsert(nalu.mNalUnitType).AppendElement(nalu);
+    }
+  }
+
+  auto spsEntry = nalusMap.Lookup(H265NALU::SPS_NUT);
+  auto vpsEntry = nalusMap.Lookup(H265NALU::VPS_NUT);
+  auto ppsEntry = nalusMap.Lookup(H265NALU::PPS_NUT);
+
+  LOGV("Found {} SPS NALU, {} VPS NALU, {} PPS NALU",
+       spsEntry ? spsEntry.Data().Length() : 0,
+       vpsEntry ? vpsEntry.Data().Length() : 0,
+       ppsEntry ? ppsEntry.Data().Length() : 0);
+  if (firstSPSId) {
+    BitWriter writer(extradata);
+    const H265SPS* firstSPS = spsRefTable[*firstSPSId].ptr();
+    MOZ_ASSERT(firstSPS);
+
+    writer.WriteBits(1, 8);  
+    const auto& profile = firstSPS->profile_tier_level;
+    writer.WriteBits(profile.general_profile_space, 2);
+    writer.WriteBits(profile.general_tier_flag, 1);
+    writer.WriteBits(profile.general_profile_idc, 5);
+    writer.WriteU32(profile.general_profile_compatibility_flags);
+
+    writer.WriteBit(profile.general_progressive_source_flag);
+    writer.WriteBit(profile.general_interlaced_source_flag);
+    writer.WriteBit(profile.general_non_packed_constraint_flag);
+    writer.WriteBit(profile.general_frame_only_constraint_flag);
+    writer.WriteBits(0, 44); 
+
+    writer.WriteU8(profile.general_level_idc);
+    writer.WriteBits(0, 4);   
+    writer.WriteBits(0, 12);  
+    writer.WriteBits(0, 6);   
+    writer.WriteBits(0, 2);   
+    writer.WriteBits(0, 6);   
+    writer.WriteBits(firstSPS->chroma_format_idc, 2);
+    writer.WriteBits(0, 5);  
+    writer.WriteBits(firstSPS->bit_depth_luma_minus8, 3);
+    writer.WriteBits(0, 5);  
+    writer.WriteBits(firstSPS->bit_depth_chroma_minus8, 3);
+    writer.WriteBits(0, 22);
+    writer.WriteBits(nalLenSize - 1, 2);  
+    writer.WriteU8(static_cast<uint8_t>(nalusMap.Count()));  
+
+    auto keys = ToTArray<nsTArray<uint8_t>>(nalusMap.Keys());
+    keys.Sort();
+
+    for (const uint8_t& naluType : keys) {
+      auto entry = nalusMap.Lookup(naluType);
+      const auto& naluArray = entry.Data();
+      writer.WriteBits(0, 2);         
+      writer.WriteBits(naluType, 6);  
+      writer.WriteBits(naluArray.Length(), 16);  
+      for (const auto& nalu : naluArray) {
+        writer.WriteBits(nalu.mNALU.Length(), 16);  
+        MOZ_ASSERT(writer.BitCount() % 8 == 0);
+        extradata->AppendElements(nalu.mNALU.Elements(), nalu.mNALU.Length());
+        writer.AdvanceBytes(nalu.mNALU.Length());
+      }
+    }
+  }
+
+  return extradata.forget();
+}
+
+bool AreTwoSPSIdentical(const H265NALU& aLhs, const H265NALU& aRhs) {
+  MOZ_ASSERT(aLhs.IsSPS() && aRhs.IsSPS());
+  auto rv1 = H265::DecodeSPSFromSPSNALU(aLhs);
+  auto rv2 = H265::DecodeSPSFromSPSNALU(aRhs);
+  if (rv1.isErr() || rv2.isErr()) {
+    return false;
+  }
+  return rv1.unwrap() == rv2.unwrap();
+}
+
+bool H265::CompareExtraData(const mozilla::MediaByteBuffer* aExtraData1,
+                            const mozilla::MediaByteBuffer* aExtraData2) {
+  if (aExtraData1 == aExtraData2) {
+    return true;
+  }
+
+  auto rv1 = HVCCConfig::Parse(aExtraData1);
+  auto rv2 = HVCCConfig::Parse(aExtraData2);
+  if (rv1.isErr() || rv2.isErr()) {
+    return false;
+  }
+
+  const auto config1 = rv1.unwrap();
+  const auto config2 = rv2.unwrap();
+  uint8_t numSPS = config1.NumSPS();
+  if (numSPS != config2.NumSPS()) {
+    return false;
+  }
+
+  SPSIterator it1(config1);
+  SPSIterator it2(config2);
+  while (it1 && it2) {
+    const H265NALU* nalu1 = *it1;
+    const H265NALU* nalu2 = *it2;
+    if (!nalu1 || !nalu2) {
+      return false;
+    }
+    if (!AreTwoSPSIdentical(*nalu1, *nalu2)) {
+      return false;
+    }
+    ++it1;
+    ++it2;
+  }
+  return true;
+}
+
+uint32_t H265::ComputeMaxRefFrames(const mozilla::MediaByteBuffer* aExtraData) {
+  auto rv = DecodeSPSFromHVCCExtraData(aExtraData);
+  if (rv.isErr()) {
+    return 0;
+  }
+  return rv.unwrap().sps_max_dec_pic_buffering_minus1[0] + 1;
+}
+
+already_AddRefed<mozilla::MediaByteBuffer> H265::CreateFakeExtraData() {
+  static const uint8_t sFakeVPS[] = {
+      0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00,
+      0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3F, 0x95, 0x98, 0x09};
+  static const uint8_t sFakeSPS[] = {
+      0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00,
+      0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3F, 0xA0, 0x05, 0x02, 0x01,
+      0x69, 0x65, 0x95, 0x9A, 0x49, 0x32, 0xBC, 0x04, 0x04, 0x00, 0x00,
+      0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0x78, 0x20};
+  static const uint8_t sFakePPS[] = {0x44, 0x01, 0xC1, 0x72, 0xB4, 0x62, 0x40};
+  nsTArray<H265NALU> nalus;
+  nalus.AppendElement(H265NALU{sFakeVPS, sizeof(sFakeVPS)});
+  nalus.AppendElement(H265NALU{sFakeSPS, sizeof(sFakeSPS)});
+  nalus.AppendElement(H265NALU{sFakePPS, sizeof(sFakePPS)});
+
+  const uint8_t nalLenSize = 4;
+  auto extradata = MakeRefPtr<mozilla::MediaByteBuffer>();
+  BitWriter writer(extradata);
+  writer.WriteBits(1, 8);               
+  writer.WriteBits(0, 2);               
+  writer.WriteBits(0, 1);               
+  writer.WriteBits(1 , 5);    
+  writer.WriteU32(0);                   
+  writer.WriteBits(0, 48);              
+  writer.WriteU8(1 );      
+  writer.WriteBits(0, 4);               
+  writer.WriteBits(0, 12);              
+  writer.WriteBits(0, 6);               
+  writer.WriteBits(0, 2);               
+  writer.WriteBits(0, 6);               
+  writer.WriteBits(0, 2);               
+  writer.WriteBits(0, 5);               
+  writer.WriteBits(0, 3);               
+  writer.WriteBits(0, 5);               
+  writer.WriteBits(0, 3);               
+  writer.WriteBits(0, 22);              
+  writer.WriteBits(nalLenSize - 1, 2);  
+  writer.WriteU8(nalus.Length());       
+  for (auto& nalu : nalus) {
+    writer.WriteBits(0, 2);                     
+    writer.WriteBits(nalu.mNalUnitType, 6);     
+    writer.WriteBits(1, 16);                    
+    writer.WriteBits(nalu.mNALU.Length(), 16);  
+    MOZ_ASSERT(writer.BitCount() % 8 == 0);
+    extradata->AppendElements(nalu.mNALU.Elements(), nalu.mNALU.Length());
+    writer.AdvanceBytes(nalu.mNALU.Length());
+  }
+  MOZ_ASSERT(HVCCConfig::Parse(extradata).isOk());
+  return extradata.forget();
+}
+
+already_AddRefed<mozilla::MediaByteBuffer> H265::CreateNewExtraData(
+    const HVCCConfig& aConfig, const nsTArray<H265NALU>& aNALUs) {
+  auto extradata = MakeRefPtr<mozilla::MediaByteBuffer>();
+  BitWriter writer(extradata);
+  writer.WriteBits(aConfig.configurationVersion, 8);
+  writer.WriteBits(aConfig.general_profile_space, 2);
+  writer.WriteBits(aConfig.general_tier_flag, 1);
+  writer.WriteBits(aConfig.general_profile_idc, 5);
+  writer.WriteU32(aConfig.general_profile_compatibility_flags);
+  writer.WriteBits(aConfig.general_constraint_indicator_flags, 48);
+  writer.WriteU8(aConfig.general_level_idc);
+  writer.WriteBits(0, 4);  
+  writer.WriteBits(aConfig.min_spatial_segmentation_idc, 12);
+  writer.WriteBits(0, 6);  
+  writer.WriteBits(aConfig.parallelismType, 2);
+  writer.WriteBits(0, 6);  
+  writer.WriteBits(aConfig.chroma_format_idc, 2);
+  writer.WriteBits(0, 5);  
+  writer.WriteBits(aConfig.bit_depth_luma_minus8, 3);
+  writer.WriteBits(0, 5);  
+  writer.WriteBits(aConfig.bit_depth_chroma_minus8, 3);
+  writer.WriteBits(aConfig.avgFrameRate, 16);
+  writer.WriteBits(aConfig.constantFrameRate, 2);
+  writer.WriteBits(aConfig.numTemporalLayers, 3);
+  writer.WriteBits(aConfig.temporalIdNested, 1);
+  writer.WriteBits(aConfig.lengthSizeMinusOne, 2);
+  writer.WriteU8(aNALUs.Length());  
+  for (auto& nalu : aNALUs) {
+    writer.WriteBits(0, 2);                     
+    writer.WriteBits(nalu.mNalUnitType, 6);     
+    writer.WriteBits(1, 16);                    
+    writer.WriteBits(nalu.mNALU.Length(), 16);  
+    MOZ_ASSERT(writer.BitCount() % 8 == 0);
+    extradata->AppendElements(nalu.mNALU.Elements(), nalu.mNALU.Length());
+    writer.AdvanceBytes(nalu.mNALU.Length());
+  }
+  MOZ_ASSERT(HVCCConfig::Parse(extradata).isOk());
+  return extradata.forget();
+}
+
+Result<bool, nsresult> H265::IsKeyFrame(const mozilla::MediaRawData* aSample) {
+  if (aSample->mCrypto.IsEncrypted()) {
+    LOG("Can't check if encrypted sample is keyframe");
+    return Err(NS_ERROR_DOM_MEDIA_DEMUXER_ERR);
+  }
+
+  size_t sampleSize = aSample->Size();
+  auto hvcc = HVCCConfig::Parse(aSample);
+  if (hvcc.isErr()) {
+    LOG("Only support extracting extradata from HVCC");
+    return Err(NS_ERROR_DOM_MEDIA_DEMUXER_ERR);
+  }
+  const auto nalLenSize = hvcc.unwrap().NALUSize();
+  BufferReader reader(aSample->Data(), sampleSize);
+  RefPtr<mozilla::MediaByteBuffer> extradata = new mozilla::MediaByteBuffer;
+  while (reader.Remaining() > nalLenSize) {
+    uint32_t nalLen = 0;
+    switch (nalLenSize) {
+      case 1:
+        (void)reader.ReadU8().map(
+            [&](uint8_t x) mutable { return nalLen = x; });
+        break;
+      case 2:
+        (void)reader.ReadU16().map(
+            [&](uint16_t x) mutable { return nalLen = x; });
+        break;
+      case 3:
+        (void)reader.ReadU24().map(
+            [&](uint32_t x) mutable { return nalLen = x; });
+        break;
+      default:
+        MOZ_DIAGNOSTIC_ASSERT(nalLenSize == 4);
+        (void)reader.ReadU32().map(
+            [&](uint32_t x) mutable { return nalLen = x; });
+        break;
+    }
+    const uint8_t* p = reader.Read(nalLen);
+    if (!p) {
+      break;
+    }
+    const H265NALU nalu(p, nalLen);
+    if (nalu.IsIframe()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+#undef LOG
+#undef LOGV
+
+}  

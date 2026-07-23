@@ -1,0 +1,132 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_css_ImageLoader_h_
+#define mozilla_css_ImageLoader_h_
+
+#include "mozilla/CORSMode.h"
+#include "nsClassHashtable.h"
+#include "nsHashKeys.h"
+#include "nsRect.h"
+#include "nsTArray.h"
+
+class nsIFrame;
+class imgIContainer;
+class imgIRequest;
+class imgRequestProxy;
+class nsPresContext;
+class nsIURI;
+class nsIPrincipal;
+class nsIRequest;
+
+namespace mozilla {
+struct MediaFeatureChange;
+struct StyleComputedUrl;
+namespace dom {
+class Document;
+}
+
+namespace css {
+
+class ImageLoader final {
+ public:
+  static void Init();
+  static void Shutdown();
+
+  enum class Flags : uint32_t {
+    RequiresReflowOnSizeAvailable = 1u << 0,
+
+    RequiresReflowOnFirstFrameCompleteAndLoadEventBlocking = 1u << 1,
+
+    IsBlockingLoadEvent = 1u << 2,
+  };
+
+  explicit ImageLoader(dom::Document* aDocument) : mDocument(aDocument) {
+    MOZ_ASSERT(mDocument);
+  }
+
+  NS_INLINE_DECL_REFCOUNTING(ImageLoader)
+
+  void DropDocumentReference();
+
+  void AssociateRequestToFrame(imgIRequest*, nsIFrame*, Flags = Flags(0));
+  void DisassociateRequestFromFrame(imgIRequest*, nsIFrame*);
+  void DropRequestsForFrame(nsIFrame*);
+
+  void SetAnimationMode(uint16_t aMode);
+
+  void ClearFrames(nsPresContext* aPresContext);
+
+  static already_AddRefed<imgRequestProxy> LoadImage(const StyleComputedUrl&,
+                                                     dom::Document&);
+
+  static void NoteSharedLoad(imgRequestProxy*);
+
+  static void UnloadImage(imgRequestProxy*);
+
+  void Notify(imgIRequest*, int32_t aType, const nsIntRect* aData);
+
+ private:
+  void DeregisterImageRequest(imgIRequest*, nsPresContext*);
+  struct ImageReflowCallback;
+
+  ~ImageLoader() = default;
+
+
+  struct FrameWithFlags {
+    explicit FrameWithFlags(nsIFrame* aFrame) : mFrame(aFrame) {
+      MOZ_ASSERT(mFrame);
+    }
+    nsIFrame* const mFrame;
+    Flags mFlags{0};
+  };
+
+  class FrameOnlyComparator {
+   public:
+    bool Equals(const FrameWithFlags& aElem1,
+                const FrameWithFlags& aElem2) const {
+      return aElem1.mFrame == aElem2.mFrame;
+    }
+
+    bool LessThan(const FrameWithFlags& aElem1,
+                  const FrameWithFlags& aElem2) const {
+      return aElem1.mFrame < aElem2.mFrame;
+    }
+  };
+
+  typedef nsTArray<FrameWithFlags> FrameSet;
+  typedef nsTArray<nsCOMPtr<imgIRequest>> RequestSet;
+  typedef nsClassHashtable<nsISupportsHashKey, FrameSet> RequestToFrameMap;
+  typedef nsClassHashtable<nsPtrHashKey<nsIFrame>, RequestSet>
+      FrameToRequestMap;
+
+  nsPresContext* GetPresContext();
+
+  void ImageFrameChanged(imgIRequest*, bool aFirstFrame);
+  void UnblockOnloadIfNeeded(nsIFrame*, imgIRequest*);
+  void UnblockOnloadIfNeeded(FrameWithFlags&);
+
+  void OnSizeAvailable(imgIRequest* aRequest, imgIContainer* aImage);
+  void OnFrameComplete(imgIRequest* aRequest);
+  void OnImageIsAnimated(imgIRequest* aRequest);
+  void OnFrameUpdate(imgIRequest* aRequest);
+  void OnLoadComplete(imgIRequest* aRequest);
+
+  void RemoveRequestToFrameMapping(imgIRequest* aRequest, nsIFrame* aFrame);
+  void RemoveFrameToRequestMapping(imgIRequest* aRequest, nsIFrame* aFrame);
+
+  RequestToFrameMap mRequestToFrameMap;
+
+  FrameToRequestMap mFrameToRequestMap;
+
+  dom::Document* mDocument;
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(ImageLoader::Flags)
+
+}  
+}  
+
+#endif /* mozilla_css_ImageLoader_h_ */

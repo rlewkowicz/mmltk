@@ -1,0 +1,706 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+
+
+const MozButtonClass = customElements.get("button");
+class HighlightableButton extends MozButtonClass {
+  static get inheritedAttributes() {
+    // @ts-expect-error super is MozButton from toolkit/content/widgets/button.js
+    return Object.assign({}, super.inheritedAttributes, {
+      ".button-text": "text=label,accesskey,crop",
+    });
+  }
+}
+customElements.define("highlightable-button", HighlightableButton, {
+  extends: "button",
+});
+
+var gSearchResultsPane = {
+  query: undefined,
+  listSearchTooltips: new Set(),
+  listSearchMenuitemIndicators: new Set(),
+  searchInput: null,
+  searchTooltipContainer: null,
+  searchKeywords: new WeakMap(),
+  inited: false,
+
+  subItems: new Map(),
+
+  searchResultsHighlighted: false,
+
+  searchableNodes: new Set([
+    "button",
+    "label",
+    "description",
+    "menulist",
+    "menuitem",
+    "checkbox",
+  ]),
+
+  init() {
+    if (this.inited) {
+      return;
+    }
+    this.inited = true;
+    this.searchInput =  (
+      document.getElementById("searchInput")
+    );
+    this.searchTooltipContainer =  (
+      document.getElementById("search-tooltip-container")
+    );
+
+    window.addEventListener("resize", () => {
+      this._recomputeTooltipPositions();
+    });
+
+    if (!this.searchInput.hidden) {
+      this.searchInput.addEventListener("input", this);
+      document
+        .getElementById("search-results-back-button")
+        .addEventListener("click", () => this.handleSearchResultsBack());
+      window.addEventListener("DOMContentLoaded", () => {
+        this.searchInput.updateComplete.then(() => {
+          this.searchInput.focus();
+        });
+        window.requestIdleCallback(() => this.initializeCategories());
+      });
+    }
+  },
+
+  async handleEvent(event) {
+    await this.initializeCategories();
+    this.searchFunction(event);
+  },
+
+  async handleSearchResultsBack() {
+    await this.initializeCategories();
+    this.searchInput.value = "";
+    this.query = null;
+    await this.searchFunction({ target: this.searchInput });
+  },
+
+  queryMatchesContent(content, query) {
+    if (!content || !query) {
+      return false;
+    }
+    return content.toLowerCase().includes(query.toLowerCase());
+  },
+
+  _categoriesInitialized: null,
+
+  initializeCategories() {
+    if (!this._categoriesInitialized) {
+      this._categoriesInitialized = this.runCategoryInitialization();
+    }
+    return this._categoriesInitialized;
+  },
+
+  async runCategoryInitialization() {
+    for (let category of gCategoryInits.values()) {
+      category.init();
+    }
+    await Promise.all(
+      [...document.querySelectorAll("setting-pane, setting-group")].map(
+        el => el.updateComplete
+      )
+    );
+    if (document.hasPendingL10nMutations) {
+      await new Promise(r =>
+        document.addEventListener("L10nMutationsFinished", r, { once: true })
+      );
+    }
+    queueMicrotask(() =>
+      Services.obs.notifyObservers(
+        window,
+        "preferences-MaybeCategoriesInitializedSLOW"
+      )
+    );
+  },
+
+  textNodeDescendants(node) {
+    if (!node) {
+      return [];
+    }
+    let all = [];
+    let originalNode = node;
+    for (node = node.firstChild; node; node = node.nextSibling) {
+      if (node.nodeType === node.TEXT_NODE) {
+        all.push(node);
+      } else if (!node.hidden) {
+        all = all.concat(this.textNodeDescendants(node));
+      }
+    }
+    if (originalNode.shadowRoot) {
+      all = all.concat(this.textNodeDescendants(originalNode.shadowRoot));
+    }
+    return all;
+  },
+
+  highlightMatches(textNodes, nodeSizes, textSearch, searchPhrase) {
+    if (!searchPhrase) {
+      return false;
+    }
+
+    let indices = [];
+    let i = -1;
+    while ((i = textSearch.indexOf(searchPhrase, i + 1)) >= 0) {
+      indices.push(i);
+    }
+
+    for (let startValue of indices) {
+      let endValue = startValue + searchPhrase.length;
+      let startNode = null;
+      let endNode = null;
+      let nodeStartIndex = null;
+
+      for (let index = 0; index < nodeSizes.length; index++) {
+        let lengthNodes = nodeSizes[index];
+        if (!startNode && lengthNodes >= startValue) {
+          startNode = textNodes[index];
+          nodeStartIndex = index;
+          if (index > 0) {
+            startValue -= nodeSizes[index - 1];
+          }
+        }
+        if (!endNode && lengthNodes >= endValue) {
+          endNode = textNodes[index];
+          if (index != nodeStartIndex || index > 0) {
+            endValue -= nodeSizes[index - 1];
+          }
+        }
+      }
+      try {
+        let range = document.createRange();
+        range.setStart(startNode, startValue);
+        range.setEnd(endNode, endValue);
+        this.getFindSelection(startNode.documentGlobal).addRange(range);
+
+        this.searchResultsHighlighted = true;
+      } catch (ex) {
+      }
+    }
+
+    return !!indices.length;
+  },
+
+  getFindSelection(win) {
+    let docShell = win.docShell;
+
+    let controller = docShell
+      .QueryInterface(Ci.nsIInterfaceRequestor)
+      .getInterface(Ci.nsISelectionDisplay)
+      .QueryInterface(Ci.nsISelectionController);
+
+    let selection = controller.getSelection(
+      Ci.nsISelectionController.SELECTION_FIND
+    );
+    selection.setColors("currentColor", "#ffe900", "currentColor", "#003eaa");
+
+    return selection;
+  },
+
+  async searchFunction(event) {
+    let query = event.target.value.trim().toLowerCase();
+    if (this.query == query) {
+      return;
+    }
+
+    let subQuery = this.query && query.includes(this.query);
+    this.query = query;
+
+    this.removeAllSearchIndicators(window, !query.length);
+
+    let srHeader = document.getElementById("header-searchResults");
+    let noResultsEl = document.getElementById("no-results-message");
+    if (this.query) {
+      await gotoPref("paneSearchResults");
+      srHeader.hidden = false;
+
+      let resultsFound = false;
+
+      let rootPreferencesChildren = [
+        ...document.querySelectorAll(
+          "#mainPrefPane > *:not([data-hidden-from-search], script, stringbundle)"
+        ),
+      ];
+
+      if (subQuery) {
+        rootPreferencesChildren = rootPreferencesChildren.filter(
+          el => !el.hidden
+        );
+      }
+
+      for (let child of rootPreferencesChildren) {
+        if (child.hidden) {
+          child.classList.add("visually-hidden");
+          child.hidden = false;
+        }
+        if (child.localName === "setting-pane") {
+          for (let group of child.querySelectorAll("setting-group")) {
+            if (group.hidden || group.hasAttribute("data-hidden-from-search")) {
+              group.classList.add("visually-hidden");
+            }
+          }
+        }
+      }
+
+      let ts = performance.now();
+      let FRAME_THRESHOLD = 1000 / 60;
+
+      for (let child of rootPreferencesChildren) {
+        if (performance.now() - ts > FRAME_THRESHOLD) {
+          for (let anchorNode of this.listSearchTooltips) {
+            this.createSearchTooltip(anchorNode, this.query);
+          }
+          ts = await new Promise(resolve =>
+            window.requestAnimationFrame(resolve)
+          );
+          if (query !== this.query) {
+            return;
+          }
+        }
+
+        if (child.localName === "setting-pane") {
+          const BASE_SELECTOR =
+            "setting-group:not([data-hidden-from-search]):not([hidden]):not([data-hidden-by-setting-group])";
+          let groupSelector = subQuery
+            ? `${BASE_SELECTOR}:not(.visually-hidden)`
+            : BASE_SELECTOR;
+
+          let groups = child.querySelectorAll(groupSelector);
+          let anyGroupMatched = false;
+          for (let group of groups) {
+            let matched = await this.searchWithinNode(group, this.query);
+            if (matched) {
+              group.classList.remove("visually-hidden");
+              anyGroupMatched = true;
+            } else {
+              group.classList.add("visually-hidden");
+            }
+          }
+          let paneMatched = anyGroupMatched;
+          if (!paneMatched) {
+            paneMatched = await this.searchWithinNode(child, this.query);
+            if (paneMatched) {
+              for (let group of child.querySelectorAll(BASE_SELECTOR)) {
+                group.classList.remove("visually-hidden");
+              }
+            }
+          }
+          if (paneMatched) {
+            child.classList.remove("visually-hidden");
+            child.onSearchPane = true;
+            resultsFound = true;
+          } else {
+            child.classList.add("visually-hidden");
+          }
+          continue;
+        }
+
+        if (
+          !child.classList.contains("header") &&
+          (!child.classList.contains("subcategory") ||
+            child.localName == "setting-group") &&
+          (await this.searchWithinNode(child, this.query))
+        ) {
+          child.classList.remove("visually-hidden");
+
+          let groupbox =
+            child.closest("groupbox") || child.closest("[data-category]");
+          let groupHeader =
+            groupbox && groupbox.querySelector(".search-header");
+          if (groupHeader) {
+            groupHeader.hidden = false;
+          }
+
+          resultsFound = true;
+        } else {
+          child.classList.add("visually-hidden");
+        }
+      }
+
+      if (this.subItems.size) {
+        for (let [subItem, matches] of this.subItems) {
+          subItem.classList.toggle("visually-hidden", !matches);
+        }
+      }
+
+      noResultsEl.hidden = !!resultsFound;
+      noResultsEl.setAttribute("query", this.query);
+      let msgQueryElem = document.getElementById("sorry-message-query");
+      msgQueryElem.textContent = this.query;
+      if (resultsFound) {
+        for (let anchorNode of this.listSearchTooltips) {
+          this.createSearchTooltip(anchorNode, this.query);
+        }
+        await new Promise(resolve => requestAnimationFrame(resolve));
+        if (query !== this.query) {
+          return;
+        }
+        this._recomputeTooltipPositions();
+      }
+    } else {
+      noResultsEl.hidden = true;
+      document.getElementById("sorry-message-query").textContent = "";
+      if (window.navigation?.canGoBack ?? true) {
+        let paneRestored = new Promise(resolve =>
+          document.addEventListener("paneshown", resolve, { once: true })
+        );
+        window.history.back();
+        await paneRestored;
+      } else {
+        let redesignEnabled = Services.prefs.getBoolPref(
+          "browser.settings-redesign.enabled"
+        );
+        let defaultPane = redesignEnabled ? "paneSync" : "paneGeneral";
+        await gotoPref(defaultPane);
+      }
+      srHeader.hidden = true;
+
+      for (let element of document.querySelectorAll(".search-header")) {
+        element.hidden = true;
+      }
+    }
+
+    window.dispatchEvent(
+      new CustomEvent("PreferencesSearchCompleted", { detail: query })
+    );
+  },
+
+  _isAnchor(el) {
+    return (el.prefix === null || el.prefix === "html") && el.localName === "a";
+  },
+
+  async searchWithinNode(nodeObject, searchPhrase, forceSearch = false) {
+    let matchesFound = false;
+    if (
+      Element.isInstance(nodeObject) &&
+      (nodeObject.childElementCount == 0 ||
+        (typeof nodeObject.children !== "undefined" &&
+          Array.prototype.every.call(nodeObject.children, this._isAnchor)) ||
+        forceSearch ||
+        this.searchableNodes.has(nodeObject.localName) ||
+        (nodeObject.localName?.startsWith("moz-") &&
+          nodeObject.localName !== "moz-input-box"))
+    ) {
+      let simpleTextNodes = this.textNodeDescendants(nodeObject);
+      for (let node of simpleTextNodes) {
+        let result = this.highlightMatches(
+          [node],
+          [node.length],
+          node.textContent.toLowerCase(),
+          searchPhrase
+        );
+        matchesFound = matchesFound || result;
+      }
+
+      let nodeSizes = [];
+      let allNodeText = "";
+      let runningSize = 0;
+
+      let accessKeyTextNodes = [];
+
+      if (
+        nodeObject.localName == "label" ||
+        nodeObject.localName == "description" ||
+        nodeObject.localName.startsWith("moz-")
+      ) {
+        accessKeyTextNodes.push(...simpleTextNodes);
+      }
+
+      for (let node of accessKeyTextNodes) {
+        runningSize += node.textContent.length;
+        allNodeText += node.textContent;
+        nodeSizes.push(runningSize);
+      }
+
+      let complexTextNodesResult = this.highlightMatches(
+        accessKeyTextNodes,
+        nodeSizes,
+        allNodeText.toLowerCase(),
+        searchPhrase
+      );
+
+      let labelResult = this.queryMatchesContent(
+        nodeObject.getAttribute("label"),
+        searchPhrase
+      );
+
+      let valueResult =
+        nodeObject.localName !== "menuitem" && nodeObject.localName !== "radio"
+          ? this.queryMatchesContent(
+              nodeObject.getAttribute("value"),
+              searchPhrase
+            )
+          : false;
+
+      let keywordsResult =
+        nodeObject.hasAttribute("search-l10n-ids") &&
+        (await this.matchesSearchL10nIDs(nodeObject, searchPhrase));
+
+      if (!keywordsResult && nodeObject.getAttribute("data-load-pane")) {
+        let subPane = document.querySelector(
+          `setting-pane[data-category="${nodeObject.getAttribute("data-load-pane")}"]`
+        );
+        if (subPane) {
+          for (let group of subPane.querySelectorAll("setting-group")) {
+            keywordsResult = await this.searchWithinNode(
+              group,
+              searchPhrase,
+              true
+            );
+            if (keywordsResult) {
+              break;
+            }
+          }
+        }
+      }
+
+      if (!keywordsResult) {
+        keywordsResult =
+          !keywordsResult &&
+          nodeObject.hasAttribute("searchkeywords") &&
+          this.queryMatchesContent(
+            nodeObject.getAttribute("searchkeywords"),
+            searchPhrase
+          );
+      }
+
+      if (
+        keywordsResult &&
+        (HTMLElement.isInstance(nodeObject) ||
+          nodeObject.localName === "button" ||
+          nodeObject.localName == "menulist")
+      ) {
+        this.listSearchTooltips.add(nodeObject);
+      }
+
+      if (keywordsResult && nodeObject.localName === "menuitem") {
+        nodeObject.setAttribute("indicator", "true");
+        this.listSearchMenuitemIndicators.add(nodeObject);
+        let menulist = nodeObject.closest("menulist");
+
+        menulist.setAttribute("indicator", "true");
+        this.listSearchMenuitemIndicators.add(menulist);
+      }
+
+      if (
+        (nodeObject.localName == "menulist" ||
+          nodeObject.localName == "menuitem") &&
+        (labelResult || valueResult || keywordsResult)
+      ) {
+        nodeObject.setAttribute("highlightable", "true");
+      }
+
+      matchesFound =
+        matchesFound ||
+        complexTextNodesResult ||
+        labelResult ||
+        valueResult ||
+        keywordsResult;
+    }
+
+    if (nodeObject.localName == "deck" && nodeObject.id != "historyPane") {
+      let index = nodeObject.selectedIndex;
+      if (index != -1) {
+        let result = await this.searchChildNodeIfVisible(
+          nodeObject,
+          index,
+          searchPhrase
+        );
+        matchesFound = matchesFound || result;
+      }
+    } else {
+      for (let i = 0; i < nodeObject.childNodes.length; i++) {
+        let result = await this.searchChildNodeIfVisible(
+          nodeObject,
+          i,
+          searchPhrase
+        );
+        matchesFound = matchesFound || result;
+      }
+    }
+    return matchesFound;
+  },
+
+  async searchChildNodeIfVisible(nodeObject, index, searchPhrase) {
+    let result = false;
+    let child = nodeObject.childNodes[index];
+    if (
+      !child.hidden &&
+      nodeObject.getAttribute("data-hidden-from-search") !== "true"
+    ) {
+      result = await this.searchWithinNode(child, searchPhrase);
+      if (
+        result &&
+        (nodeObject.localName === "menulist" ||
+          nodeObject.localName === "moz-select")
+      ) {
+        this.listSearchTooltips.add(nodeObject);
+      }
+
+      if (
+        Element.isInstance(child) &&
+        (child.classList.contains("featureGate") ||
+          child.classList.contains("mozilla-product-item"))
+      ) {
+        this.subItems.set(child, result);
+      }
+    }
+    return result;
+  },
+
+  async matchesSearchL10nIDs(nodeObject, searchPhrase) {
+    if (!this.searchKeywords.has(nodeObject)) {
+      const refs = nodeObject
+        .getAttribute("search-l10n-ids")
+        .split(",")
+        .map(s => s.trim().split("."))
+        .filter(s => !!s[0].length);
+
+      const messages = await document.l10n.formatMessages(
+        refs.map(ref => ({ id: ref[0] }))
+      );
+
+      let keywords = messages
+        .map((msg, i) => {
+          let [refId, refAttr] = refs[i];
+          if (!msg) {
+            console.error(`Missing search l10n id "${refId}"`);
+            return null;
+          }
+          if (refAttr) {
+            let attr =
+              msg.attributes && msg.attributes.find(a => a.name === refAttr);
+            if (!attr) {
+              console.error(`Missing search l10n id "${refId}.${refAttr}"`);
+              return null;
+            }
+            if (attr.value === "") {
+              console.error(
+                `Empty value added to search-l10n-ids "${refId}.${refAttr}"`
+              );
+            }
+            return attr.value;
+          }
+          if (msg.value === "") {
+            console.error(`Empty value added to search-l10n-ids "${refId}"`);
+          }
+          return msg.value;
+        })
+        .filter(keyword => keyword !== null)
+        .join(" ");
+
+      this.searchKeywords.set(nodeObject, keywords);
+      return this.queryMatchesContent(keywords, searchPhrase);
+    }
+
+    return this.queryMatchesContent(
+      this.searchKeywords.get(nodeObject),
+      searchPhrase
+    );
+  },
+
+  createSearchTooltip(anchorNode, query) {
+    if (anchorNode.tooltipNode) {
+      return;
+    }
+    let searchTooltip = anchorNode.ownerDocument.createElement("span");
+    let searchTooltipText = anchorNode.ownerDocument.createElement("span");
+    searchTooltip.className = "search-tooltip";
+    searchTooltipText.textContent = query;
+    searchTooltip.appendChild(searchTooltipText);
+
+    anchorNode.tooltipNode = searchTooltip;
+    anchorNode.parentElement.classList.add("search-tooltip-parent");
+    this.searchTooltipContainer.append(searchTooltip);
+
+    this._applyTooltipPosition(
+      searchTooltip,
+      this._computeTooltipPosition(anchorNode, searchTooltip)
+    );
+  },
+
+  _recomputeTooltipPositions() {
+    let positions = [];
+    for (let anchorNode of this.listSearchTooltips) {
+      let searchTooltip = anchorNode.tooltipNode;
+      if (!searchTooltip) {
+        continue;
+      }
+      let position = this._computeTooltipPosition(anchorNode, searchTooltip);
+      positions.push({ searchTooltip, position });
+    }
+    for (let { searchTooltip, position } of positions) {
+      this._applyTooltipPosition(searchTooltip, position);
+    }
+  },
+
+  _applyTooltipPosition(searchTooltip, position) {
+    searchTooltip.style.left = position.left + "px";
+    searchTooltip.style.top = position.top + "px";
+  },
+
+  _computeTooltipPosition(anchorNode, searchTooltip) {
+    let positioningNode = anchorNode;
+    if (anchorNode.localName == "moz-select") {
+      positioningNode =
+        anchorNode.shadowRoot?.querySelector(".select-wrapper") ?? anchorNode;
+    }
+    let anchorRect = positioningNode.getBoundingClientRect();
+    let tooltipContainerRect =
+      this.searchTooltipContainer.getBoundingClientRect();
+    let tooltipRect = searchTooltip.getBoundingClientRect();
+
+    let top = anchorRect.top - tooltipContainerRect.top;
+
+    let left;
+    if (anchorRect.left <= tooltipContainerRect.left + 20) {
+      left = 8;
+    } else {
+      left =
+        anchorRect.left -
+        tooltipContainerRect.left +
+        anchorRect.width / 2 -
+        tooltipRect.width / 2;
+    }
+    return { left, top };
+  },
+
+  removeAllSearchIndicators(window, showSubItems) {
+    if (this.searchResultsHighlighted) {
+      this.getFindSelection(window).removeAllRanges();
+      this.searchResultsHighlighted = false;
+    }
+    this.removeAllSearchTooltips();
+    this.removeAllSearchMenuitemIndicators();
+
+    if (showSubItems && this.subItems.size) {
+      for (let subItem of this.subItems.keys()) {
+        subItem.classList.remove("visually-hidden");
+      }
+      this.subItems.clear();
+    }
+  },
+
+  removeAllSearchTooltips() {
+    for (let anchorNode of this.listSearchTooltips) {
+      anchorNode.parentElement.classList.remove("search-tooltip-parent");
+      if (anchorNode.tooltipNode) {
+        anchorNode.tooltipNode.remove();
+      }
+      anchorNode.tooltipNode = null;
+    }
+    this.listSearchTooltips.clear();
+  },
+
+  removeAllSearchMenuitemIndicators() {
+    for (let node of this.listSearchMenuitemIndicators) {
+      node.removeAttribute("indicator");
+    }
+    this.listSearchMenuitemIndicators.clear();
+  },
+};

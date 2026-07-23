@@ -1,0 +1,198 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_StencilXdr_h
+#define frontend_StencilXdr_h
+
+#include "mozilla/RefPtr.h"  // RefPtr
+
+#include "frontend/ParserAtom.h"  // ParserAtom, ParserAtomSpan
+#include "frontend/Stencil.h"  // BitIntStencil, ScopeStencil, BaseParserScopeData
+#include "js/CompileOptions.h"  // JS::ReadOnlyDecodeOptions, JS::ReadOnlyDecodeOptions
+#include "js/Transcoding.h"  // JS::TranscodeBuffer, JS::TranscodeRange, JS::TranscodeResult
+#include "vm/Xdr.h"  // XDRMode, XDRResult, XDRState
+
+namespace JS {
+
+class ReadOnlyDecodeOptions;
+
+}  
+
+namespace js {
+
+class LifoAlloc;
+class ObjLiteralStencil;
+class ScriptSource;
+class SharedImmutableScriptData;
+
+class XDRStencilDecoder;
+class XDRStencilEncoder;
+
+namespace frontend {
+
+struct CompilationStencil;
+struct ExtensibleCompilationStencil;
+struct SharedDataContainer;
+
+template <typename DataT>
+struct CanCopyDataToDisk {
+  static constexpr bool unique_repr =
+      std::has_unique_object_representations<DataT>();
+
+  static constexpr bool no_pointer =
+      alignof(DataT) < alignof(void*) || sizeof(void*) == sizeof(uint32_t);
+
+  static constexpr bool value = unique_repr && no_pointer;
+};
+
+class StencilXDR {
+ private:
+  template <XDRMode mode>
+  [[nodiscard]] static XDRResult codeSourceUnretrievableUncompressed(
+      XDRState<mode>* xdr, ScriptSource* ss, uint8_t sourceCharSize,
+      uint32_t uncompressedLength);
+
+  template <typename Unit,
+            template <typename U, SourceRetrievable CanRetrieve> class Data,
+            XDRMode mode>
+  static void codeSourceRetrievable(ScriptSource* ss);
+
+  template <typename Unit, XDRMode mode>
+  [[nodiscard]] static XDRResult codeSourceUncompressedData(
+      XDRState<mode>* const xdr, ScriptSource* const ss);
+
+  template <typename Unit, XDRMode mode>
+  [[nodiscard]] static XDRResult codeSourceCompressedData(
+      XDRState<mode>* const xdr, ScriptSource* const ss);
+
+  template <typename Unit, XDRMode mode>
+  static void codeSourceRetrievableData(ScriptSource* ss);
+
+  template <XDRMode mode>
+  [[nodiscard]] static XDRResult codeSourceData(XDRState<mode>* const xdr,
+                                                ScriptSource* const ss);
+
+ public:
+  template <XDRMode mode>
+  static XDRResult codeSource(XDRState<mode>* xdr,
+                              const JS::ReadOnlyDecodeOptions* maybeOptions,
+                              RefPtr<ScriptSource>& source);
+
+  template <XDRMode mode>
+  static XDRResult codeBigInt(XDRState<mode>* xdr, LifoAlloc& alloc,
+                              BigIntStencil& stencil);
+
+  template <XDRMode mode>
+  static XDRResult codeObjLiteral(XDRState<mode>* xdr, LifoAlloc& alloc,
+                                  ObjLiteralStencil& stencil);
+
+  template <XDRMode mode>
+  static XDRResult codeScopeData(XDRState<mode>* xdr, LifoAlloc& alloc,
+                                 ScopeStencil& stencil,
+                                 BaseParserScopeData*& baseScopeData);
+
+  template <XDRMode mode>
+  static XDRResult codeSharedData(XDRState<mode>* xdr,
+                                  RefPtr<SharedImmutableScriptData>& sisd);
+
+  template <XDRMode mode>
+  static XDRResult codeSharedDataContainer(XDRState<mode>* xdr,
+                                           SharedDataContainer& sharedData);
+
+  template <XDRMode mode>
+  static XDRResult codeParserAtom(XDRState<mode>* xdr, LifoAlloc& alloc,
+                                  ParserAtom** atomp);
+
+  template <XDRMode mode>
+  static XDRResult codeParserAtomSpan(XDRState<mode>* xdr, LifoAlloc& alloc,
+                                      ParserAtomSpan& parserAtomData);
+
+  template <XDRMode mode>
+  static XDRResult codeModuleRequest(XDRState<mode>* xdr,
+                                     StencilModuleRequest& stencil);
+
+  template <XDRMode mode>
+  static XDRResult codeModuleRequestVector(
+      XDRState<mode>* xdr, StencilModuleMetadata::RequestVector& vector);
+
+  template <XDRMode mode>
+  static XDRResult codeModuleEntry(XDRState<mode>* xdr,
+                                   StencilModuleEntry& stencil);
+
+  template <XDRMode mode>
+  static XDRResult codeModuleEntryVector(
+      XDRState<mode>* xdr, StencilModuleMetadata::EntryVector& vector);
+
+  template <XDRMode mode>
+  static XDRResult codeModuleMetadata(XDRState<mode>* xdr,
+                                      StencilModuleMetadata& stencil);
+
+  static XDRResult checkCompilationStencil(XDRStencilEncoder* encoder,
+                                           const CompilationStencil& stencil);
+
+  static XDRResult checkCompilationStencil(
+      const ExtensibleCompilationStencil& stencil);
+
+  template <XDRMode mode>
+  static XDRResult codeCompilationStencil(XDRState<mode>* xdr,
+                                          CompilationStencil& stencil);
+};
+
+} 
+
+
+class XDRStencilDecoder : public XDRState<XDR_DECODE> {
+  using Base = XDRState<XDR_DECODE>;
+
+ public:
+  XDRStencilDecoder(FrontendContext* fc, const JS::TranscodeRange& range)
+      : Base(fc, range) {
+    MOZ_ASSERT(JS::IsTranscodingBytecodeAligned(range.begin().get()));
+  }
+
+  XDRResult codeStencil(const JS::ReadOnlyDecodeOptions& options,
+                        frontend::CompilationStencil& stencil);
+
+  const JS::ReadOnlyDecodeOptions& options() {
+    MOZ_ASSERT(options_);
+    return *options_;
+  }
+
+ private:
+  const JS::ReadOnlyDecodeOptions* options_ = nullptr;
+};
+
+class XDRStencilEncoder : public XDRState<XDR_ENCODE> {
+  using Base = XDRState<XDR_ENCODE>;
+
+ public:
+  XDRStencilEncoder(FrontendContext* fc, JS::TranscodeBuffer& buffer)
+      : Base(fc, buffer, buffer.length()) {
+    MOZ_ASSERT_IF(!buffer.empty(),
+                  JS::IsTranscodingBytecodeAligned(buffer.begin()));
+    MOZ_ASSERT(JS::IsTranscodingBytecodeOffsetAligned(buffer.length()));
+  }
+
+  XDRResult codeStencil(const RefPtr<ScriptSource>& source,
+                        const frontend::CompilationStencil& stencil);
+
+  XDRResult codeStencil(const frontend::CompilationStencil& stencil);
+};
+
+JS::TranscodeResult EncodeStencil(JSContext* cx,
+                                  frontend::CompilationStencil* stencil,
+                                  JS::TranscodeBuffer& buffer);
+
+JS::TranscodeResult EncodeStencil(JS::FrontendContext* fc,
+                                  frontend::CompilationStencil* stencil,
+                                  JS::TranscodeBuffer& buffer);
+
+JS::TranscodeResult DecodeStencil(JS::FrontendContext* fc,
+                                  const JS::ReadOnlyDecodeOptions& options,
+                                  const JS::TranscodeRange& range,
+                                  frontend::CompilationStencil** stencilOut);
+
+} 
+
+#endif /* frontend_StencilXdr_h */

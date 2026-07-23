@@ -1,0 +1,59 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_cache_StreamControl_h
+#define mozilla_dom_cache_StreamControl_h
+
+#include "mozilla/dom/cache/ReadStream.h"
+#include "mozilla/dom/cache/Types.h"
+#include "nsTObserverArray.h"
+
+struct nsID;
+
+namespace mozilla::dom::cache {
+
+class CacheReadStream;
+
+class StreamControl {
+ public:
+  virtual void SerializeControl(CacheReadStream* aReadStreamOut) = 0;
+
+  virtual void SerializeStream(CacheReadStream* aReadStreamOut,
+                               nsIInputStream* aStream) = 0;
+
+  virtual void OpenStream(const nsID& aId, InputStreamResolver&& aResolver) = 0;
+
+
+  void AddReadStream(SafeRefPtr<ReadStream::Controllable> aReadStream);
+
+  void ForgetReadStream(SafeRefPtr<ReadStream::Controllable> aReadStream);
+
+  void NoteClosed(SafeRefPtr<ReadStream::Controllable> aReadStream,
+                  const nsID& aId);
+
+ protected:
+  ~StreamControl();
+
+  void CloseAllReadStreams();
+
+  void CloseAllReadStreamsWithoutReporting();
+
+  bool HasEverBeenRead() const;
+
+  virtual void NoteClosedAfterForget(const nsID& aId) = 0;
+
+#ifdef DEBUG
+  virtual void AssertOwningThread() = 0;
+#else
+  void AssertOwningThread() {}
+#endif
+
+ private:
+  using ReadStreamList = nsTObserverArray<SafeRefPtr<ReadStream::Controllable>>;
+  ReadStreamList mReadStreamList;
+};
+
+}  
+
+#endif  // mozilla_dom_cache_StreamControl_h

@@ -1,0 +1,151 @@
+/*
+ * cryptohi.h - public prototypes for the crypto library
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _CRYPTOHI_H_
+#define _CRYPTOHI_H_
+
+#include "blapit.h"
+
+#include "seccomon.h"
+#include "secoidt.h"
+#include "secdert.h"
+#include "cryptoht.h"
+#include "keythi.h"
+#include "certt.h"
+
+SEC_BEGIN_PROTOS
+
+
+extern SECStatus DSAU_EncodeDerSig(SECItem *dest, SECItem *src);
+extern SECItem *DSAU_DecodeDerSig(const SECItem *item);
+
+extern SECStatus DSAU_EncodeDerSigWithLen(SECItem *dest, SECItem *src,
+                                          unsigned int len);
+extern SECItem *DSAU_DecodeDerSigToLen(const SECItem *item, unsigned int len);
+
+
+extern SGNContext *SGN_NewContext(SECOidTag alg, SECKEYPrivateKey *privKey);
+
+extern SGNContext *SGN_NewContextWithAlgorithmID(SECAlgorithmID *alg,
+                                                 SECKEYPrivateKey *privKey);
+
+extern void SGN_DestroyContext(SGNContext *cx, PRBool freeit);
+
+extern SECStatus SGN_Begin(SGNContext *cx);
+
+extern SECStatus SGN_Update(SGNContext *cx, const unsigned char *input,
+                            unsigned int inputLen);
+
+extern SECStatus SGN_End(SGNContext *cx, SECItem *result);
+
+extern SECStatus SEC_SignData(SECItem *result,
+                              const unsigned char *buf, int len,
+                              SECKEYPrivateKey *pk, SECOidTag algid);
+
+extern SECStatus SEC_SignDataWithAlgorithmID(SECItem *result,
+                                             const unsigned char *buf, int len,
+                                             SECKEYPrivateKey *pk,
+                                             SECAlgorithmID *algid);
+
+extern SECStatus SGN_Digest(SECKEYPrivateKey *privKey,
+                            SECOidTag algtag, SECItem *result, SECItem *digest);
+
+extern SECStatus SEC_DerSignData(PLArenaPool *arena, SECItem *result,
+                                 const unsigned char *buf, int len,
+                                 SECKEYPrivateKey *pk, SECOidTag algid);
+
+extern SECStatus SEC_DerSignDataWithAlgorithmID(PLArenaPool *arena,
+                                                SECItem *result,
+                                                const unsigned char *buf,
+                                                int len,
+                                                SECKEYPrivateKey *pk,
+                                                SECAlgorithmID *algid);
+
+extern void SEC_DestroySignedData(CERTSignedData *sd, PRBool freeit);
+
+extern SECOidTag SEC_GetSignatureAlgorithmOidTag(KeyType keyType,
+                                                 SECOidTag hashAlgTag);
+
+extern SECOidTag SEC_GetSignatureAlgorithmOidTagByKey(const SECKEYPrivateKey *privKey,
+                                                      const SECKEYPublicKey *pubKey,
+                                                      SECOidTag hashAlgTag);
+
+extern SECItem *SEC_CreateSignatureAlgorithmParameters(PLArenaPool *arena,
+                                                       SECItem *result,
+                                                       SECOidTag signAlgTag,
+                                                       SECOidTag hashAlgTag,
+                                                       const SECItem *params,
+                                                       const SECKEYPrivateKey *key);
+
+extern SECItem *SEC_CreateVerifyAlgorithmParameters(PLArenaPool *arena,
+                                                    SECItem *result,
+                                                    SECOidTag signAlgTag,
+                                                    SECOidTag hashAlgTag,
+                                                    const SECItem *params,
+                                                    const SECKEYPublicKey *key);
+extern SECStatus SEC_CreateSignatureAlgorithmID(PLArenaPool *arena,
+                                                SECAlgorithmID *sigAlgID,
+                                                SECOidTag sigAlgTag,
+                                                SECOidTag hashAlgTag,
+                                                const SECItem *params,
+                                                const SECKEYPrivateKey *privKey,
+                                                const SECKEYPublicKey *pubKey);
+
+
+extern VFYContext *VFY_CreateContext(SECKEYPublicKey *key, SECItem *sig,
+                                     SECOidTag sigAlg, void *wincx);
+extern VFYContext *VFY_CreateContextDirect(const SECKEYPublicKey *key,
+                                           const SECItem *sig,
+                                           SECOidTag pubkAlg,
+                                           SECOidTag hashAlg,
+                                           SECOidTag *hash, void *wincx);
+extern VFYContext *VFY_CreateContextWithAlgorithmID(const SECKEYPublicKey *key,
+                                                    const SECItem *sig,
+                                                    const SECAlgorithmID *algid,
+                                                    SECOidTag *hash,
+                                                    void *wincx);
+
+extern void VFY_DestroyContext(VFYContext *cx, PRBool freeit);
+
+extern SECStatus VFY_Begin(VFYContext *cx);
+
+extern SECStatus VFY_Update(VFYContext *cx, const unsigned char *input,
+                            unsigned int inputLen);
+
+extern SECStatus VFY_End(VFYContext *cx);
+
+extern SECStatus VFY_EndWithSignature(VFYContext *cx, SECItem *sig);
+
+extern SECStatus VFY_VerifyDigest(SECItem *dig, SECKEYPublicKey *key,
+                                  SECItem *sig, SECOidTag sigAlg, void *wincx);
+extern SECStatus VFY_VerifyDigestDirect(const SECItem *dig,
+                                        const SECKEYPublicKey *key,
+                                        const SECItem *sig, SECOidTag pubkAlg,
+                                        SECOidTag hashAlg, void *wincx);
+extern SECStatus VFY_VerifyDigestWithAlgorithmID(const SECItem *dig,
+                                                 const SECKEYPublicKey *key, const SECItem *sig,
+                                                 const SECAlgorithmID *algid, SECOidTag hash,
+                                                 void *wincx);
+
+extern SECStatus VFY_VerifyData(const unsigned char *buf, int len,
+                                const SECKEYPublicKey *key, const SECItem *sig,
+                                SECOidTag sigAlg, void *wincx);
+extern SECStatus VFY_VerifyDataDirect(const unsigned char *buf, int len,
+                                      const SECKEYPublicKey *key,
+                                      const SECItem *sig,
+                                      SECOidTag pubkAlg, SECOidTag hashAlg,
+                                      SECOidTag *hash, void *wincx);
+
+extern SECStatus VFY_VerifyDataWithAlgorithmID(const unsigned char *buf,
+                                               int len, const SECKEYPublicKey *key,
+                                               const SECItem *sig,
+                                               const SECAlgorithmID *algid, SECOidTag *hash,
+                                               void *wincx);
+
+SEC_END_PROTOS
+
+#endif /* _CRYPTOHI_H_ */

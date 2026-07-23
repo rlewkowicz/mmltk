@@ -1,0 +1,111 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_ServoCSSParser_h
+#define mozilla_ServoCSSParser_h
+
+#include "NonCustomCSSPropertyId.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/gfx/Matrix.h"
+#include "nsColor.h"
+#include "nsDOMCSSDeclaration.h"
+#include "nsStringFwd.h"
+
+struct nsCSSRect;
+template <class T>
+class RefPtr;
+
+namespace mozilla {
+
+struct CSSPropertyId;
+class ServoStyleSet;
+struct URLExtraData;
+struct StyleAbsoluteColor;
+struct StyleFontFamilyList;
+struct StyleFontStretch;
+struct StyleFontWeight;
+struct StyleFontStyle;
+struct StyleLockedDeclarationBlock;
+struct StyleParsingMode;
+struct StylePerDocumentStyleData;
+enum class StyleColorSpace : uint8_t;
+
+template <typename Integer, typename Number, typename LinearStops>
+struct StyleTimingFunction;
+struct StylePiecewiseLinearFunction;
+using StyleComputedTimingFunction =
+    StyleTimingFunction<int32_t, float, StylePiecewiseLinearFunction>;
+
+template <typename LengthPercent>
+struct StyleGenericViewTimelineInset;
+struct StyleLengthPercentage;
+using StyleViewTimelineInset =
+    StyleGenericViewTimelineInset<StyleLengthPercentage>;
+
+namespace css {
+class Loader;
+}
+
+namespace dom {
+class Document;
+}
+
+class ServoCSSParser {
+ public:
+  using ParsingEnvironment = nsDOMCSSDeclaration::ParsingEnvironment;
+
+  static bool IsValidCSSColor(const nsACString& aValue);
+
+  static bool IsValidCSSImage(const nsACString& aValue);
+
+  static bool ComputeColor(const StylePerDocumentStyleData* aStyleData,
+                           nscolor aCurrentColor, const nsACString& aValue,
+                           nscolor* aResultColor,
+                           bool* aWasCurrentColor = nullptr,
+                           css::Loader* aLoader = nullptr);
+
+  static Maybe<StyleAbsoluteColor> ComputeAbsoluteColor(
+      const StylePerDocumentStyleData* aStyleData, const nsACString& aValue);
+
+  static bool ColorTo(const nsACString& aFromColor,
+                      const nsACString& aToColorSpace, nsACString* aResultColor,
+                      nsTArray<float>* aResultComponents, bool* aResultAdjusted,
+                      css::Loader* aLoader = nullptr);
+
+  static already_AddRefed<StyleLockedDeclarationBlock> ParseProperty(
+      NonCustomCSSPropertyId aProperty, const nsACString& aValue,
+      const ParsingEnvironment& aParsingEnvironment,
+      const StyleParsingMode& aParsingMode);
+  static already_AddRefed<StyleLockedDeclarationBlock> ParseProperty(
+      const CSSPropertyId& aProperty, const nsACString& aValue,
+      const ParsingEnvironment& aParsingEnvironment,
+      const StyleParsingMode& aParsingMode);
+
+  static bool ParseEasing(const nsACString& aValue,
+                          StyleComputedTimingFunction& aResult);
+
+  static bool ParseAndComputeViewTimelineInset(
+      const nsACString& aValue, const dom::Element* aSubject,
+      const ComputedStyle* aStyle, const StylePerDocumentStyleData* aRawData,
+      StyleViewTimelineInset& aResult);
+
+  static bool ParseTransformIntoMatrix(const nsACString& aValue,
+                                       bool& aContains3DTransform,
+                                       gfx::Matrix4x4& aResult);
+
+  static bool ParseFontShorthandForMatching(
+      const nsACString& aValue, URLExtraData* aUrl, StyleFontFamilyList& aList,
+      StyleFontStyle& aStyle, StyleFontStretch& aStretch,
+      StyleFontWeight& aWeight, float* aSize = nullptr,
+      bool* aSmallCaps = nullptr);
+
+  static already_AddRefed<URLExtraData> GetURLExtraData(dom::Document*);
+
+  static ParsingEnvironment GetParsingEnvironment(dom::Document*);
+};
+
+}  
+
+#endif  // mozilla_ServoCSSParser_h

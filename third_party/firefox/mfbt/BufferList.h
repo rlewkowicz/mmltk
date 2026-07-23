@@ -1,0 +1,506 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_BufferList_h
+#define mozilla_BufferList_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Vector.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <utility>
+#ifdef DEBUG
+#  include <type_traits>
+#endif
+
+
+class InfallibleAllocPolicy;
+
+namespace mozilla {
+
+template <typename AllocPolicy>
+class BufferList : private AllocPolicy {
+  struct Segment {
+    char* mData;
+    size_t mSize;
+    size_t mCapacity;
+
+    Segment(char* aData, size_t aSize, size_t aCapacity)
+        : mData(aData), mSize(aSize), mCapacity(aCapacity) {}
+
+    Segment(const Segment&) = delete;
+    Segment& operator=(const Segment&) = delete;
+
+    Segment(Segment&&) = default;
+    Segment& operator=(Segment&&) = default;
+
+    char* Start() const { return mData; }
+    char* End() const { return mData + mSize; }
+  };
+
+  template <typename OtherAllocPolicy>
+  friend class BufferList;
+
+ public:
+  static const size_t kSegmentAlignment = 8;
+
+  BufferList(size_t aInitialSize, size_t aInitialCapacity,
+             size_t aStandardCapacity, AllocPolicy aAP = AllocPolicy())
+      : AllocPolicy(aAP),
+        mOwning(true),
+        mSegments(aAP),
+        mSize(0),
+        mStandardCapacity(aStandardCapacity) {
+    MOZ_ASSERT(aInitialCapacity % kSegmentAlignment == 0);
+    MOZ_ASSERT(aStandardCapacity % kSegmentAlignment == 0);
+
+    if (aInitialCapacity) {
+      MOZ_ASSERT((aInitialSize == 0 ||
+                  std::is_same_v<AllocPolicy, InfallibleAllocPolicy>),
+                 "BufferList may only be constructed with an initial size when "
+                 "using an infallible alloc policy");
+
+      AllocateSegment(aInitialSize, aInitialCapacity);
+    }
+  }
+
+  BufferList(const BufferList& aOther) = delete;
+
+  BufferList(BufferList&& aOther)
+      : mOwning(aOther.mOwning),
+        mSegments(std::move(aOther.mSegments)),
+        mSize(aOther.mSize),
+        mStandardCapacity(aOther.mStandardCapacity) {
+    aOther.mSegments.clear();
+    aOther.mSize = 0;
+  }
+
+  BufferList& operator=(const BufferList& aOther) = delete;
+
+  BufferList& operator=(BufferList&& aOther) {
+    Clear();
+
+    mOwning = aOther.mOwning;
+    mSegments = std::move(aOther.mSegments);
+    mSize = aOther.mSize;
+    aOther.mSegments.clear();
+    aOther.mSize = 0;
+    return *this;
+  }
+
+  ~BufferList() { Clear(); }
+
+  bool Init(size_t aInitialSize, size_t aInitialCapacity) {
+    MOZ_ASSERT(mSegments.empty());
+    MOZ_ASSERT(aInitialCapacity != 0);
+    MOZ_ASSERT(aInitialCapacity % kSegmentAlignment == 0);
+
+    return AllocateSegment(aInitialSize, aInitialCapacity);
+  }
+
+  bool CopyFrom(const BufferList& aOther) {
+    MOZ_ASSERT(mOwning);
+
+    Clear();
+
+    if (!Init(aOther.mSize, (aOther.mSize + kSegmentAlignment - 1) &
+                                ~(kSegmentAlignment - 1))) {
+      return false;
+    }
+
+    size_t offset = 0;
+    for (const Segment& segment : aOther.mSegments) {
+      memcpy(Start() + offset, segment.mData, segment.mSize);
+      offset += segment.mSize;
+    }
+    MOZ_ASSERT(offset == mSize);
+
+    return true;
+  }
+
+  size_t Size() const { return mSize; }
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) {
+    size_t size = mSegments.sizeOfExcludingThis(aMallocSizeOf);
+    for (Segment& segment : mSegments) {
+      size += aMallocSizeOf(segment.Start());
+    }
+    return size;
+  }
+
+  void Clear() {
+    if (mOwning) {
+      for (Segment& segment : mSegments) {
+        this->free_(segment.mData, segment.mCapacity);
+      }
+    }
+    mSegments.clear();
+
+    mSize = 0;
+  }
+
+  class IterImpl {
+    uintptr_t mSegment{0};
+    char* mData{nullptr};
+    char* mDataEnd{nullptr};
+    size_t mAbsoluteOffset{0};
+
+    friend class BufferList;
+
+   public:
+    explicit IterImpl(const BufferList& aBuffers) {
+      if (!aBuffers.mSegments.empty()) {
+        mData = aBuffers.mSegments[0].Start();
+        mDataEnd = aBuffers.mSegments[0].End();
+      }
+    }
+
+    char* Data() const {
+      MOZ_RELEASE_ASSERT(!Done());
+      return mData;
+    }
+
+    bool operator==(const IterImpl& other) const {
+      return mAbsoluteOffset == other.mAbsoluteOffset;
+    }
+    bool operator!=(const IterImpl& other) const { return !(*this == other); }
+
+    bool HasRoomFor(size_t aBytes) const {
+      return RemainingInSegment() >= aBytes;
+    }
+
+    size_t RemainingInSegment() const {
+      MOZ_RELEASE_ASSERT(mData <= mDataEnd);
+      return mDataEnd - mData;
+    }
+
+    bool HasBytesAvailable(const BufferList& aBuffers, size_t aBytes) const {
+      return TotalBytesAvailable(aBuffers) >= aBytes;
+    }
+
+    size_t TotalBytesAvailable(const BufferList& aBuffers) const {
+      return aBuffers.mSize - mAbsoluteOffset;
+    }
+
+    void Advance(const BufferList& aBuffers, size_t aBytes) {
+      const Segment& segment = aBuffers.mSegments[mSegment];
+      MOZ_RELEASE_ASSERT(segment.Start() <= mData);
+      MOZ_RELEASE_ASSERT(mData <= mDataEnd);
+      MOZ_RELEASE_ASSERT(mDataEnd == segment.End());
+
+      MOZ_RELEASE_ASSERT(HasRoomFor(aBytes));
+      mData += aBytes;
+      mAbsoluteOffset += aBytes;
+
+      if (mData == mDataEnd && mSegment + 1 < aBuffers.mSegments.length()) {
+        mSegment++;
+        const Segment& nextSegment = aBuffers.mSegments[mSegment];
+        mData = nextSegment.Start();
+        mDataEnd = nextSegment.End();
+        MOZ_RELEASE_ASSERT(mData < mDataEnd);
+      }
+    }
+
+    bool AdvanceAcrossSegments(const BufferList& aBuffers, size_t aBytes) {
+      if (MOZ_LIKELY(aBytes <= RemainingInSegment())) {
+        Advance(aBuffers, aBytes);
+        return true;
+      }
+
+      if (!HasBytesAvailable(aBuffers, aBytes)) {
+        return false;
+      }
+
+      size_t targetOffset = mAbsoluteOffset + aBytes;
+      size_t fromEnd = aBuffers.mSize - targetOffset;
+      if (aBytes - RemainingInSegment() < fromEnd) {
+        while (mAbsoluteOffset < targetOffset) {
+          Advance(aBuffers, std::min(targetOffset - mAbsoluteOffset,
+                                     RemainingInSegment()));
+        }
+        MOZ_ASSERT(mAbsoluteOffset == targetOffset);
+        return true;
+      }
+
+      mSegment = aBuffers.mSegments.length() - 1;
+      while (fromEnd > aBuffers.mSegments[mSegment].mSize) {
+        fromEnd -= aBuffers.mSegments[mSegment].mSize;
+        mSegment--;
+      }
+      mDataEnd = aBuffers.mSegments[mSegment].End();
+      mData = mDataEnd - fromEnd;
+      mAbsoluteOffset = targetOffset;
+      MOZ_ASSERT_IF(Done(), mSegment == aBuffers.mSegments.length() - 1);
+      MOZ_ASSERT_IF(Done(), mAbsoluteOffset == aBuffers.mSize);
+      return true;
+    }
+
+    bool Done() const { return mData == mDataEnd; }
+
+    size_t AbsoluteOffset() const { return mAbsoluteOffset; }
+
+   private:
+    bool IsIn(const BufferList& aBuffers) const {
+      return mSegment < aBuffers.mSegments.length() &&
+             mData >= aBuffers.mSegments[mSegment].mData &&
+             mData < aBuffers.mSegments[mSegment].End();
+    }
+  };
+
+  char* Start() {
+    MOZ_RELEASE_ASSERT(!mSegments.empty());
+    return mSegments[0].mData;
+  }
+  const char* Start() const { return mSegments[0].mData; }
+
+  IterImpl Iter() const { return IterImpl(*this); }
+
+  [[nodiscard]] inline bool WriteBytes(const char* aData, size_t aSize);
+
+  inline char* AllocateBytes(size_t aMaxSize, size_t* aSize);
+
+  inline bool ReadBytes(IterImpl& aIter, char* aData, size_t aSize) const;
+
+  template <typename BorrowingAllocPolicy>
+  BufferList<BorrowingAllocPolicy> Borrow(
+      IterImpl& aIter, size_t aSize, bool* aSuccess,
+      BorrowingAllocPolicy aAP = BorrowingAllocPolicy()) const;
+
+  template <typename OtherAllocPolicy>
+  BufferList<OtherAllocPolicy> MoveFallible(
+      bool* aSuccess, OtherAllocPolicy aAP = OtherAllocPolicy());
+
+  size_t RangeLength(const IterImpl& start, const IterImpl& end) const {
+    MOZ_ASSERT(start.IsIn(*this) && end.IsIn(*this));
+    return end.mAbsoluteOffset - start.mAbsoluteOffset;
+  }
+
+  [[nodiscard]] bool WriteBytesZeroCopy(char* aData, size_t aSize,
+                                        size_t aCapacity) {
+    MOZ_ASSERT(mOwning);
+    MOZ_ASSERT(aSize <= aCapacity);
+
+    if (aSize == 0) {
+      this->free_(aData, aCapacity);
+      return true;
+    }
+
+    if (!mSegments.append(Segment(aData, aSize, aCapacity))) {
+      this->free_(aData, aCapacity);
+      return false;
+    }
+    mSize += aSize;
+    return true;
+  }
+
+  size_t Truncate(IterImpl& aIter);
+
+ private:
+  explicit BufferList(AllocPolicy aAP)
+      : AllocPolicy(aAP), mOwning(false), mSize(0), mStandardCapacity(0) {}
+
+  char* AllocateSegment(size_t aSize, size_t aCapacity) {
+    MOZ_RELEASE_ASSERT(mOwning);
+    MOZ_ASSERT(aCapacity != 0);
+    MOZ_ASSERT(aSize <= aCapacity);
+
+    char* data = this->template pod_malloc<char>(aCapacity);
+    if (!data) {
+      return nullptr;
+    }
+    if (!mSegments.append(Segment(data, aSize, aCapacity))) {
+      this->free_(data, aCapacity);
+      return nullptr;
+    }
+    mSize += aSize;
+    return data;
+  }
+
+  void AssertConsistentSize() const {
+#ifdef DEBUG
+    size_t realSize = 0;
+    for (const auto& segment : mSegments) {
+      realSize += segment.mSize;
+    }
+    MOZ_ASSERT(realSize == mSize, "cached size value is inconsistent!");
+#endif
+  }
+
+  bool mOwning;
+  Vector<Segment, 1, AllocPolicy> mSegments;
+  size_t mSize;
+  size_t mStandardCapacity;
+};
+
+template <typename AllocPolicy>
+[[nodiscard]] bool BufferList<AllocPolicy>::WriteBytes(const char* aData,
+                                                       size_t aSize) {
+  MOZ_RELEASE_ASSERT(mOwning);
+  MOZ_RELEASE_ASSERT(mStandardCapacity);
+
+  size_t copied = 0;
+  while (copied < aSize) {
+    size_t toCopy;
+    char* data = AllocateBytes(aSize - copied, &toCopy);
+    if (!data) {
+      return false;
+    }
+    memcpy(data, aData + copied, toCopy);
+    copied += toCopy;
+  }
+
+  return true;
+}
+
+template <typename AllocPolicy>
+char* BufferList<AllocPolicy>::AllocateBytes(size_t aMaxSize, size_t* aSize) {
+  MOZ_RELEASE_ASSERT(mOwning);
+  MOZ_RELEASE_ASSERT(mStandardCapacity);
+
+  if (!mSegments.empty()) {
+    Segment& lastSegment = mSegments.back();
+
+    size_t capacity = lastSegment.mCapacity - lastSegment.mSize;
+    if (capacity) {
+      size_t size = std::min(aMaxSize, capacity);
+      char* data = lastSegment.mData + lastSegment.mSize;
+
+      lastSegment.mSize += size;
+      mSize += size;
+
+      *aSize = size;
+      return data;
+    }
+  }
+
+  size_t size = std::min(aMaxSize, mStandardCapacity);
+  char* data = AllocateSegment(size, mStandardCapacity);
+  if (data) {
+    *aSize = size;
+  }
+  return data;
+}
+
+template <typename AllocPolicy>
+bool BufferList<AllocPolicy>::ReadBytes(IterImpl& aIter, char* aData,
+                                        size_t aSize) const {
+  size_t copied = 0;
+  size_t remaining = aSize;
+  while (remaining) {
+    size_t toCopy = std::min(aIter.RemainingInSegment(), remaining);
+    if (!toCopy) {
+      return false;
+    }
+    memcpy(aData + copied, aIter.Data(), toCopy);
+    copied += toCopy;
+    remaining -= toCopy;
+
+    aIter.Advance(*this, toCopy);
+  }
+
+  return true;
+}
+
+template <typename AllocPolicy>
+template <typename BorrowingAllocPolicy>
+BufferList<BorrowingAllocPolicy> BufferList<AllocPolicy>::Borrow(
+    IterImpl& aIter, size_t aSize, bool* aSuccess,
+    BorrowingAllocPolicy aAP) const {
+  BufferList<BorrowingAllocPolicy> result(aAP);
+
+  size_t size = aSize;
+  while (size) {
+    size_t toAdvance = std::min(size, aIter.RemainingInSegment());
+
+    if (!toAdvance || !result.mSegments.append(
+                          typename BufferList<BorrowingAllocPolicy>::Segment(
+                              aIter.mData, toAdvance, toAdvance))) {
+      *aSuccess = false;
+      return result;
+    }
+    aIter.Advance(*this, toAdvance);
+    size -= toAdvance;
+  }
+
+  result.mSize = aSize;
+  *aSuccess = true;
+  return result;
+}
+
+template <typename AllocPolicy>
+template <typename OtherAllocPolicy>
+BufferList<OtherAllocPolicy> BufferList<AllocPolicy>::MoveFallible(
+    bool* aSuccess, OtherAllocPolicy aAP) {
+  BufferList<OtherAllocPolicy> result(0, 0, mStandardCapacity, aAP);
+
+  IterImpl iter = Iter();
+  while (!iter.Done()) {
+    size_t toAdvance = iter.RemainingInSegment();
+
+    if (!toAdvance ||
+        !result.mSegments.append(typename BufferList<OtherAllocPolicy>::Segment(
+            iter.mData, toAdvance, toAdvance))) {
+      *aSuccess = false;
+      result.mSegments.clear();
+      return result;
+    }
+    iter.Advance(*this, toAdvance);
+  }
+
+  result.mSize = mSize;
+  mSegments.clear();
+  mSize = 0;
+  *aSuccess = true;
+  return result;
+}
+
+template <typename AllocPolicy>
+size_t BufferList<AllocPolicy>::Truncate(IterImpl& aIter) {
+  MOZ_ASSERT(aIter.IsIn(*this) || aIter.Done());
+  if (aIter.Done()) {
+    return 0;
+  }
+
+  size_t prevSize = mSize;
+
+  while (mSegments.length() > aIter.mSegment + 1) {
+    Segment& toFree = mSegments.back();
+    mSize -= toFree.mSize;
+    if (mOwning) {
+      this->free_(toFree.mData, toFree.mCapacity);
+    }
+    mSegments.popBack();
+  }
+
+  Segment& seg = mSegments.back();
+  MOZ_ASSERT(aIter.mDataEnd == seg.End());
+  mSize -= aIter.RemainingInSegment();
+  seg.mSize -= aIter.RemainingInSegment();
+  if (!seg.mSize) {
+    if (mOwning) {
+      this->free_(seg.mData, seg.mCapacity);
+    }
+    mSegments.popBack();
+  }
+
+  if (mSegments.empty()) {
+    MOZ_ASSERT(mSize == 0);
+    aIter.mSegment = 0;
+    aIter.mData = aIter.mDataEnd = nullptr;
+  } else {
+    aIter.mSegment = mSegments.length() - 1;
+    aIter.mData = aIter.mDataEnd = mSegments.back().End();
+  }
+  MOZ_ASSERT(aIter.Done());
+
+  AssertConsistentSize();
+  return prevSize - mSize;
+}
+
+}  
+
+#endif /* mozilla_BufferList_h */

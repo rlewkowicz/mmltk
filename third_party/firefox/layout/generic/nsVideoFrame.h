@@ -1,0 +1,120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsVideoFrame_h_
+#define nsVideoFrame_h_
+
+#include "nsContainerFrame.h"
+#include "nsIAnonymousContentCreator.h"
+#include "nsIReflowCallback.h"
+#include "nsStringFwd.h"
+#include "nsTArrayForwardDeclare.h"
+
+class nsPresContext;
+class nsDisplayItem;
+
+class nsVideoFrame : public nsContainerFrame,
+                     public nsIReflowCallback,
+                     public nsIAnonymousContentCreator {
+ public:
+  template <typename T>
+  using Maybe = mozilla::Maybe<T>;
+  using Nothing = mozilla::Nothing;
+  using Visibility = mozilla::Visibility;
+
+  nsVideoFrame(ComputedStyle* aStyle, nsPresContext* aPc)
+      : nsVideoFrame(aStyle, aPc, kClassID) {}
+  nsVideoFrame(ComputedStyle*, nsPresContext*, ClassID);
+
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsVideoFrame)
+
+  void ReflowCallbackCanceled() final { mReflowCallbackPosted = false; }
+  bool ReflowFinished() final;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) final;
+
+  nsresult AttributeChanged(int32_t aNameSpaceID, nsAtom* aAttribute,
+                            AttrModType aModType) final;
+
+  void OnVisibilityChange(
+      Visibility aNewVisibility,
+      const Maybe<OnNonvisible>& aNonvisibleAction = Nothing()) final;
+
+  mozilla::IntrinsicSize GetIntrinsicSize() final;
+  mozilla::IntrinsicSize GetIntrinsicSize(bool aIgnoreContainment) const;
+  mozilla::AspectRatio GetIntrinsicRatio() const final;
+  mozilla::AspectRatio GetIntrinsicRatio(bool aIgnoreContainment) const;
+  SizeComputationResult ComputeSize(
+      const SizeComputationInput& aSizingInput, mozilla::WritingMode aWM,
+      const mozilla::LogicalSize& aCBSize, nscoord aAvailableISize,
+      const mozilla::LogicalSize& aMargin,
+      const mozilla::LogicalSize& aBorderPadding,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      mozilla::ComputeSizeFlags aFlags) final;
+
+  nscoord IntrinsicISize(const mozilla::IntrinsicSizeInput& aInput,
+                         mozilla::IntrinsicISizeType aType) final;
+
+  nsRect GetDestRect(const nsRect& aContentBox) const;
+
+  void Destroy(DestroyContext&) final;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput, nsReflowStatus& aStatus) final;
+
+#ifdef ACCESSIBILITY
+  mozilla::a11y::AccType AccessibleType() final;
+#endif
+
+  nsresult CreateAnonymousContent(nsTArray<ContentInfo>& aElements) final;
+  void AppendAnonymousContentTo(nsTArray<nsIContent*>& aElements,
+                                uint32_t aFilters) final;
+
+  mozilla::dom::Element* GetPosterImage() const { return mPosterImage; }
+
+  bool ShouldDisplayPoster() const;
+
+  nsIContent* GetCaptionOverlay() const { return mCaptionDiv; }
+  nsIContent* GetVideoControls() const;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+ protected:
+  bool HasVideoElement() const { return !mIsAudio; }
+
+  bool HasVideoData() const;
+
+  mozilla::Maybe<nsSize> PosterImageSize() const;
+
+  void UpdatePosterSource(bool aNotify);
+
+  void UpdateTextTrack();
+
+  virtual ~nsVideoFrame();
+
+  RefPtr<mozilla::dom::Element> mPosterImage;
+
+  nsCOMPtr<nsIContent> mCaptionDiv;
+
+  nsSize mControlsTrackedSize{-1, -1};
+  nsSize mCaptionTrackedSize{-1, -1};
+  bool mReflowCallbackPosted = false;
+  const bool mIsAudio;
+};
+
+class nsAudioFrame final : public nsVideoFrame {
+ public:
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsAudioFrame)
+
+  nsAudioFrame(ComputedStyle*, nsPresContext*);
+  virtual ~nsAudioFrame();
+};
+
+#endif /* nsVideoFrame_h_ */

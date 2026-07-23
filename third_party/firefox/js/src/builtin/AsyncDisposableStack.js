@@ -1,0 +1,40 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+async function AsyncDisposableStackDisposeAsyncImpl() {
+  var asyncDisposableStack = this;
+
+  if (!IsObject(asyncDisposableStack) || (asyncDisposableStack = GuardToAsyncDisposableStackHelper(asyncDisposableStack)) === null) {
+    return callFunction(
+      CallAsyncDisposableStackMethodIfWrapped,
+      this,
+      "$AsyncDisposableStackDisposeAsync"
+    );
+  }
+
+  var state = UnsafeGetReservedSlot(asyncDisposableStack, DISPOSABLE_STACK_STATE_SLOT);
+  if (state === undefined) {
+    ThrowTypeError(JSMSG_INCOMPATIBLE_METHOD, 'disposeAsync', 'method', 'AsyncDisposableStack');
+  }
+
+  if (state === DISPOSABLE_STACK_STATE_DISPOSED) {
+    return undefined;
+  }
+
+  UnsafeSetReservedSlot(asyncDisposableStack, DISPOSABLE_STACK_STATE_SLOT, DISPOSABLE_STACK_STATE_DISPOSED);
+
+  var disposeCapability = UnsafeGetReservedSlot(asyncDisposableStack, DISPOSABLE_STACK_DISPOSABLE_RESOURCE_STACK_SLOT);
+  UnsafeSetReservedSlot(asyncDisposableStack, DISPOSABLE_STACK_DISPOSABLE_RESOURCE_STACK_SLOT, undefined);
+  if (disposeCapability === undefined) {
+    return undefined;
+  }
+  DisposeResourcesAsync(disposeCapability, disposeCapability.length);
+
+  return undefined;
+}
+
+function $AsyncDisposableStackDisposeAsync() {
+  return callFunction(AsyncDisposableStackDisposeAsyncImpl, this);
+}
+SetCanonicalName($AsyncDisposableStackDisposeAsync, "disposeAsync");

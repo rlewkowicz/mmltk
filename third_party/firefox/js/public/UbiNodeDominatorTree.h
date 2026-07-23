@@ -1,0 +1,479 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_UbiNodeDominatorTree_h
+#define js_UbiNodeDominatorTree_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/UniquePtr.h"
+
+#include <utility>
+
+#include "js/AllocPolicy.h"
+#include "js/UbiNode.h"
+#include "js/UbiNodePostOrder.h"
+#include "js/Utility.h"
+#include "js/Vector.h"
+
+namespace JS {
+namespace ubi {
+
+class JS_PUBLIC_API DominatorTree {
+ private:
+
+  using PredecessorSets = js::HashMap<Node, NodeSetPtr, js::DefaultHasher<Node>,
+                                      js::SystemAllocPolicy>;
+  using NodeToIndexMap = js::HashMap<Node, uint32_t, js::DefaultHasher<Node>,
+                                     js::SystemAllocPolicy>;
+  class DominatedSets;
+
+ public:
+  class DominatedSetRange;
+
+  class DominatedNodePtr {
+    friend class DominatedSetRange;
+
+    const JS::ubi::Vector<Node>& postOrder;
+    const uint32_t* ptr;
+
+    DominatedNodePtr(const JS::ubi::Vector<Node>& postOrder,
+                     const uint32_t* ptr)
+        : postOrder(postOrder), ptr(ptr) {}
+
+   public:
+    bool operator!=(const DominatedNodePtr& rhs) const {
+      return ptr != rhs.ptr;
+    }
+    void operator++() { ptr++; }
+    const Node& operator*() const { return postOrder[*ptr]; }
+  };
+
+  class DominatedSetRange {
+    friend class DominatedSets;
+
+    const JS::ubi::Vector<Node>& postOrder;
+    const uint32_t* beginPtr;
+    const uint32_t* endPtr;
+
+    DominatedSetRange(JS::ubi::Vector<Node>& postOrder, const uint32_t* begin,
+                      const uint32_t* end)
+        : postOrder(postOrder), beginPtr(begin), endPtr(end) {
+      MOZ_ASSERT(begin <= end);
+    }
+
+   public:
+    DominatedNodePtr begin() const {
+      MOZ_ASSERT(beginPtr <= endPtr);
+      return DominatedNodePtr(postOrder, beginPtr);
+    }
+
+    DominatedNodePtr end() const { return DominatedNodePtr(postOrder, endPtr); }
+
+    size_t length() const {
+      MOZ_ASSERT(beginPtr <= endPtr);
+      return endPtr - beginPtr;
+    }
+
+    void skip(size_t n) {
+      beginPtr += n;
+      if (beginPtr > endPtr) {
+        beginPtr = endPtr;
+      }
+    }
+  };
+
+ private:
+  class DominatedSets {
+    JS::ubi::Vector<uint32_t> dominated;
+    JS::ubi::Vector<uint32_t> indices;
+
+    DominatedSets(JS::ubi::Vector<uint32_t>&& dominated,
+                  JS::ubi::Vector<uint32_t>&& indices)
+        : dominated(std::move(dominated)), indices(std::move(indices)) {}
+
+   public:
+    DominatedSets(const DominatedSets& rhs) = delete;
+    DominatedSets& operator=(const DominatedSets& rhs) = delete;
+
+    DominatedSets(DominatedSets&& rhs)
+        : dominated(std::move(rhs.dominated)), indices(std::move(rhs.indices)) {
+      MOZ_ASSERT(this != &rhs, "self-move not allowed");
+    }
+    DominatedSets& operator=(DominatedSets&& rhs) {
+      this->~DominatedSets();
+      new (this) DominatedSets(std::move(rhs));
+      return *this;
+    }
+
+    static mozilla::Maybe<DominatedSets> Create(
+        const JS::ubi::Vector<uint32_t>& doms) {
+      auto length = doms.length();
+      MOZ_ASSERT(length < UINT32_MAX);
+
+
+      JS::ubi::Vector<uint32_t> dominated;
+      JS::ubi::Vector<uint32_t> indices;
+      if (!dominated.growBy(length) || !indices.growBy(length)) {
+        return mozilla::Nothing();
+      }
+
+      memset(indices.begin(), 0, length * sizeof(uint32_t));
+      for (uint32_t i = 0; i < length; i++) {
+        indices[doms[i]]++;
+      }
+
+      uint32_t sumOfSizes = 0;
+      for (uint32_t i = 0; i < length; i++) {
+        sumOfSizes += indices[i];
+        MOZ_ASSERT(sumOfSizes <= length);
+        indices[i] = sumOfSizes;
+      }
+
+      for (uint32_t i = 0; i < length; i++) {
+        auto idxOfDom = doms[i];
+        indices[idxOfDom]--;
+        dominated[indices[idxOfDom]] = i;
+      }
+
+#ifdef DEBUG
+      uint32_t lastIndex = 0;
+      for (uint32_t i = 0; i < length; i++) {
+        MOZ_ASSERT(indices[i] >= lastIndex);
+        MOZ_ASSERT(indices[i] < length);
+        lastIndex = indices[i];
+      }
+#endif
+
+      return mozilla::Some(
+          DominatedSets(std::move(dominated), std::move(indices)));
+    }
+
+    DominatedSetRange dominatedSet(JS::ubi::Vector<Node>& postOrder,
+                                   uint32_t nodeIndex) const {
+      MOZ_ASSERT(postOrder.length() == indices.length());
+      MOZ_ASSERT(nodeIndex < indices.length());
+      auto end = nodeIndex == indices.length() - 1
+                     ? dominated.end()
+                     : &dominated[indices[nodeIndex + 1]];
+      return DominatedSetRange(postOrder, &dominated[indices[nodeIndex]], end);
+    }
+  };
+
+ private:
+  JS::ubi::Vector<Node> postOrder;
+  NodeToIndexMap nodeToPostOrderIndex;
+  JS::ubi::Vector<uint32_t> doms;
+  DominatedSets dominatedSets;
+  mozilla::Maybe<JS::ubi::Vector<JS::ubi::Node::Size>> retainedSizes;
+
+ private:
+  static const uint32_t UNDEFINED = UINT32_MAX;
+
+  DominatorTree(JS::ubi::Vector<Node>&& postOrder,
+                NodeToIndexMap&& nodeToPostOrderIndex,
+                JS::ubi::Vector<uint32_t>&& doms, DominatedSets&& dominatedSets)
+      : postOrder(std::move(postOrder)),
+        nodeToPostOrderIndex(std::move(nodeToPostOrderIndex)),
+        doms(std::move(doms)),
+        dominatedSets(std::move(dominatedSets)),
+        retainedSizes(mozilla::Nothing()) {}
+
+  static uint32_t intersect(JS::ubi::Vector<uint32_t>& doms, uint32_t finger1,
+                            uint32_t finger2) {
+    while (finger1 != finger2) {
+      if (finger1 < finger2) {
+        finger1 = doms[finger1];
+      } else if (finger2 < finger1) {
+        finger2 = doms[finger2];
+      }
+    }
+    return finger1;
+  }
+
+  [[nodiscard]] static bool doTraversal(JSContext* cx, AutoCheckCannotGC& noGC,
+                                        const Node& root,
+                                        JS::ubi::Vector<Node>& postOrder,
+                                        PredecessorSets& predecessorSets) {
+    uint32_t nodeCount = 0;
+    auto onNode = [&](const Node& node) {
+      nodeCount++;
+      if (MOZ_UNLIKELY(nodeCount == UINT32_MAX)) {
+        return false;
+      }
+      return postOrder.append(node);
+    };
+
+    auto onEdge = [&](const Node& origin, const Edge& edge) {
+      auto p = predecessorSets.lookupForAdd(edge.referent);
+      if (!p) {
+        mozilla::UniquePtr<NodeSet, DeletePolicy<NodeSet>> set(
+            js_new<NodeSet>());
+        if (!set || !predecessorSets.add(p, edge.referent, std::move(set))) {
+          return false;
+        }
+      }
+      MOZ_ASSERT(p && p->value());
+      return p->value()->put(origin);
+    };
+
+    PostOrder traversal(cx, noGC);
+    return traversal.addStart(root) && traversal.traverse(onNode, onEdge);
+  }
+
+  [[nodiscard]] static bool mapNodesToTheirIndices(
+      JS::ubi::Vector<Node>& postOrder, NodeToIndexMap& map) {
+    MOZ_ASSERT(map.empty());
+    MOZ_ASSERT(postOrder.length() < UINT32_MAX);
+    uint32_t length = postOrder.length();
+    if (!map.reserve(length)) {
+      return false;
+    }
+    for (uint32_t i = 0; i < length; i++) {
+      map.putNewInfallible(postOrder[i], i);
+    }
+    return true;
+  }
+
+  [[nodiscard]] static bool convertPredecessorSetsToVectors(
+      const Node& root, JS::ubi::Vector<Node>& postOrder,
+      PredecessorSets& predecessorSets, NodeToIndexMap& nodeToPostOrderIndex,
+      JS::ubi::Vector<JS::ubi::Vector<uint32_t>>& predecessorVectors) {
+    MOZ_ASSERT(postOrder.length() < UINT32_MAX);
+    uint32_t length = postOrder.length();
+
+    MOZ_ASSERT(predecessorVectors.length() == 0);
+    if (!predecessorVectors.growBy(length)) {
+      return false;
+    }
+
+    for (uint32_t i = 0; i < length - 1; i++) {
+      auto& node = postOrder[i];
+      MOZ_ASSERT(node != root,
+                 "Only the last node should be root, since this was a post "
+                 "order traversal.");
+
+      auto ptr = predecessorSets.lookup(node);
+      MOZ_ASSERT(ptr,
+                 "Because this isn't the root, it had better have "
+                 "predecessors, or else how "
+                 "did we even find it.");
+
+      auto& predecessors = ptr->value();
+      if (!predecessorVectors[i].reserve(predecessors->count())) {
+        return false;
+      }
+      for (auto iter = predecessors->iter(); !iter.done(); iter.next()) {
+        auto ptr = nodeToPostOrderIndex.lookup(iter.get());
+        MOZ_ASSERT(ptr);
+        predecessorVectors[i].infallibleAppend(ptr->value());
+      }
+    }
+    predecessorSets.clearAndCompact();
+    return true;
+  }
+
+  [[nodiscard]] static bool initializeDominators(
+      JS::ubi::Vector<uint32_t>& doms, uint32_t length) {
+    MOZ_ASSERT(doms.length() == 0);
+    if (!doms.growByUninitialized(length)) {
+      return false;
+    }
+    doms[length - 1] = length - 1;
+    for (uint32_t i = 0; i < length - 1; i++) {
+      doms[i] = UNDEFINED;
+    }
+    return true;
+  }
+
+  void assertSanity() const {
+    MOZ_ASSERT(postOrder.length() == doms.length());
+    MOZ_ASSERT(postOrder.length() == nodeToPostOrderIndex.count());
+    MOZ_ASSERT_IF(retainedSizes.isSome(),
+                  postOrder.length() == retainedSizes->length());
+  }
+
+  [[nodiscard]] bool computeRetainedSizes(mozilla::MallocSizeOf mallocSizeOf) {
+    MOZ_ASSERT(retainedSizes.isNothing());
+    auto length = postOrder.length();
+
+    retainedSizes.emplace();
+    if (!retainedSizes->growBy(length)) {
+      retainedSizes = mozilla::Nothing();
+      return false;
+    }
+
+
+    for (uint32_t i = 0; i < length; i++) {
+      auto size = postOrder[i].size(mallocSizeOf);
+
+      for (const auto& dominated : dominatedSets.dominatedSet(postOrder, i)) {
+        if (dominated == postOrder[length - 1]) {
+          MOZ_ASSERT(i == length - 1);
+          continue;
+        }
+
+        auto ptr = nodeToPostOrderIndex.lookup(dominated);
+        MOZ_ASSERT(ptr);
+        auto idxOfDominated = ptr->value();
+        MOZ_ASSERT(idxOfDominated < i);
+        size += retainedSizes.ref()[idxOfDominated];
+      }
+
+      retainedSizes.ref()[i] = size;
+    }
+
+    return true;
+  }
+
+ public:
+  DominatorTree(const DominatorTree&) = delete;
+  DominatorTree& operator=(const DominatorTree&) = delete;
+
+  DominatorTree(DominatorTree&& rhs)
+      : postOrder(std::move(rhs.postOrder)),
+        nodeToPostOrderIndex(std::move(rhs.nodeToPostOrderIndex)),
+        doms(std::move(rhs.doms)),
+        dominatedSets(std::move(rhs.dominatedSets)),
+        retainedSizes(std::move(rhs.retainedSizes)) {
+    MOZ_ASSERT(this != &rhs, "self-move is not allowed");
+  }
+  DominatorTree& operator=(DominatorTree&& rhs) {
+    this->~DominatorTree();
+    new (this) DominatorTree(std::move(rhs));
+    return *this;
+  }
+
+  static mozilla::Maybe<DominatorTree> Create(JSContext* cx,
+                                              AutoCheckCannotGC& noGC,
+                                              const Node& root) {
+    JS::ubi::Vector<Node> postOrder;
+    PredecessorSets predecessorSets;
+    if (!doTraversal(cx, noGC, root, postOrder, predecessorSets)) {
+      return mozilla::Nothing();
+    }
+
+    MOZ_ASSERT(postOrder.length() < UINT32_MAX);
+    uint32_t length = postOrder.length();
+    MOZ_ASSERT(postOrder[length - 1] == root);
+
+
+    NodeToIndexMap nodeToPostOrderIndex(postOrder.length());
+    if (!mapNodesToTheirIndices(postOrder, nodeToPostOrderIndex)) {
+      return mozilla::Nothing();
+    }
+
+    JS::ubi::Vector<JS::ubi::Vector<uint32_t>> predecessorVectors;
+    if (!convertPredecessorSetsToVectors(root, postOrder, predecessorSets,
+                                         nodeToPostOrderIndex,
+                                         predecessorVectors))
+      return mozilla::Nothing();
+
+    JS::ubi::Vector<uint32_t> doms;
+    if (!initializeDominators(doms, length)) {
+      return mozilla::Nothing();
+    }
+
+    bool changed = true;
+    while (changed) {
+      changed = false;
+
+      for (uint32_t indexPlusOne = length - 1; indexPlusOne > 0;
+           indexPlusOne--) {
+        MOZ_ASSERT(postOrder[indexPlusOne - 1] != root);
+
+
+        uint32_t newIDomIdx = UNDEFINED;
+
+        auto& predecessors = predecessorVectors[indexPlusOne - 1];
+        auto range = predecessors.all();
+        for (; !range.empty(); range.popFront()) {
+          auto idx = range.front();
+          if (doms[idx] != UNDEFINED) {
+            newIDomIdx = idx;
+            break;
+          }
+        }
+
+        MOZ_ASSERT(newIDomIdx != UNDEFINED,
+                   "Because the root is initialized to dominate itself and is "
+                   "the first "
+                   "node in every path, there must exist a predecessor to this "
+                   "node that "
+                   "also has a dominator.");
+
+        for (; !range.empty(); range.popFront()) {
+          auto idx = range.front();
+          if (doms[idx] != UNDEFINED) {
+            newIDomIdx = intersect(doms, newIDomIdx, idx);
+          }
+        }
+
+        if (newIDomIdx != doms[indexPlusOne - 1]) {
+          doms[indexPlusOne - 1] = newIDomIdx;
+          changed = true;
+        }
+      }
+    }
+
+    auto maybeDominatedSets = DominatedSets::Create(doms);
+    if (maybeDominatedSets.isNothing()) {
+      return mozilla::Nothing();
+    }
+
+    return mozilla::Some(
+        DominatorTree(std::move(postOrder), std::move(nodeToPostOrderIndex),
+                      std::move(doms), std::move(*maybeDominatedSets)));
+  }
+
+  const Node& root() const { return postOrder[postOrder.length() - 1]; }
+
+  Node getImmediateDominator(const Node& node) const {
+    assertSanity();
+    auto ptr = nodeToPostOrderIndex.lookup(node);
+    if (!ptr) {
+      return Node();
+    }
+
+    auto idx = ptr->value();
+    MOZ_ASSERT(idx < postOrder.length());
+    return postOrder[doms[idx]];
+  }
+
+  mozilla::Maybe<DominatedSetRange> getDominatedSet(const Node& node) {
+    assertSanity();
+    auto ptr = nodeToPostOrderIndex.lookup(node);
+    if (!ptr) {
+      return mozilla::Nothing();
+    }
+
+    auto idx = ptr->value();
+    MOZ_ASSERT(idx < postOrder.length());
+    return mozilla::Some(dominatedSets.dominatedSet(postOrder, idx));
+  }
+
+  [[nodiscard]] bool getRetainedSize(const Node& node,
+                                     mozilla::MallocSizeOf mallocSizeOf,
+                                     Node::Size& outSize) {
+    assertSanity();
+    auto ptr = nodeToPostOrderIndex.lookup(node);
+    if (!ptr) {
+      outSize = 0;
+      return true;
+    }
+
+    if (retainedSizes.isNothing() && !computeRetainedSizes(mallocSizeOf)) {
+      return false;
+    }
+
+    auto idx = ptr->value();
+    MOZ_ASSERT(idx < postOrder.length());
+    outSize = retainedSizes.ref()[idx];
+    return true;
+  }
+};
+
+}  
+}  
+
+#endif  // js_UbiNodeDominatorTree_h

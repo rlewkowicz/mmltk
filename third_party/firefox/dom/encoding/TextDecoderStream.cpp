@@ -1,0 +1,173 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/TextDecoderStream.h"
+
+#include "mozilla/Encoding.h"
+#include "mozilla/dom/BufferSourceBinding.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/TextDecoderStreamBinding.h"
+#include "mozilla/dom/TransformStream.h"
+#include "mozilla/dom/TransformerCallbackHelpers.h"
+#include "mozilla/dom/UnionTypes.h"
+#include "nsContentUtils.h"
+#include "nsIGlobalObject.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(TextDecoderStream, mGlobal, mStream)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(TextDecoderStream)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(TextDecoderStream)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(TextDecoderStream)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+TextDecoderStream::TextDecoderStream(nsISupports* aGlobal,
+                                     const Encoding& aEncoding, bool aFatal,
+                                     bool aIgnoreBOM, TransformStream& aStream)
+    : mGlobal(aGlobal), mStream(&aStream) {
+  mFatal = aFatal;
+  mIgnoreBOM = aIgnoreBOM;
+  aEncoding.Name(mEncoding);
+  if (aIgnoreBOM) {
+    mDecoder = aEncoding.NewDecoderWithoutBOMHandling();
+  } else {
+    mDecoder = aEncoding.NewDecoderWithBOMRemoval();
+  }
+}
+
+TextDecoderStream::~TextDecoderStream() = default;
+
+JSObject* TextDecoderStream::WrapObject(JSContext* aCx,
+                                        JS::Handle<JSObject*> aGivenProto) {
+  return TextDecoderStream_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+class TextDecoderStreamAlgorithms : public TransformerAlgorithmsWrapper {
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(TextDecoderStreamAlgorithms,
+                                           TransformerAlgorithmsBase)
+
+  void SetDecoderStream(TextDecoderStream& aStream) {
+    mDecoderStream = &aStream;
+  }
+
+  MOZ_CAN_RUN_SCRIPT void DecodeBufferSourceAndEnqueue(
+      JSContext* aCx, OwningBufferSource* aInput, bool aFlush,
+      TransformStreamDefaultController& aController, ErrorResult& aRv) {
+    nsString outDecodedString;
+    if (aInput) {
+      ProcessTypedArrays(*aInput, [&](const Span<const uint8_t>& aData,
+                                      JS::AutoCheckCannotGC&&) {
+        mDecoderStream->DecodeNative(aData, !aFlush, outDecodedString, aRv);
+      });
+    } else {
+      mDecoderStream->DecodeNative(Span<const uint8_t>(), !aFlush,
+                                   outDecodedString, aRv);
+    }
+
+    if (aRv.Failed()) {
+      return;
+    }
+
+    if (outDecodedString.Length()) {
+      JS::Rooted<JS::Value> outputChunk(aCx);
+      if (!ToJSValue(aCx, outDecodedString, &outputChunk)) {
+        JS_ClearPendingException(aCx);
+        aRv.Throw(NS_ERROR_UNEXPECTED);
+        return;
+      }
+      aController.Enqueue(aCx, outputChunk, aRv);
+    }
+  }
+
+  MOZ_CAN_RUN_SCRIPT void TransformCallbackImpl(
+      JS::Handle<JS::Value> aChunk,
+      TransformStreamDefaultController& aController,
+      ErrorResult& aRv) override {
+
+
+    AutoJSAPI jsapi;
+    if (!jsapi.Init(aController.GetParentObject())) {
+      aRv.ThrowUnknownError("Internal error");
+      return;
+    }
+    JSContext* cx = jsapi.cx();
+
+    RootedUnion<OwningBufferSource> bufferSource(cx);
+    if (!bufferSource.Init(cx, aChunk)) {
+      aRv.MightThrowJSException();
+      aRv.StealExceptionFromJSContext(cx);
+      return;
+    }
+
+    DecodeBufferSourceAndEnqueue(cx, &bufferSource, false, aController, aRv);
+  }
+
+  MOZ_CAN_RUN_SCRIPT void FlushCallbackImpl(
+      TransformStreamDefaultController& aController,
+      ErrorResult& aRv) override {
+
+    AutoJSAPI jsapi;
+    if (!jsapi.Init(aController.GetParentObject())) {
+      aRv.ThrowUnknownError("Internal error");
+      return;
+    }
+    JSContext* cx = jsapi.cx();
+
+    DecodeBufferSourceAndEnqueue(cx, nullptr, true, aController, aRv);
+  }
+
+ private:
+  ~TextDecoderStreamAlgorithms() override = default;
+
+  RefPtr<TextDecoderStream> mDecoderStream;
+};
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(TextDecoderStreamAlgorithms,
+                                   TransformerAlgorithmsBase, mDecoderStream)
+NS_IMPL_ADDREF_INHERITED(TextDecoderStreamAlgorithms, TransformerAlgorithmsBase)
+NS_IMPL_RELEASE_INHERITED(TextDecoderStreamAlgorithms,
+                          TransformerAlgorithmsBase)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(TextDecoderStreamAlgorithms)
+NS_INTERFACE_MAP_END_INHERITING(TransformerAlgorithmsBase)
+
+already_AddRefed<TextDecoderStream> TextDecoderStream::Constructor(
+    const GlobalObject& aGlobal, const nsAString& aLabel,
+    const TextDecoderOptions& aOptions, ErrorResult& aRv) {
+  const Encoding* encoding = Encoding::ForLabelNoReplacement(aLabel);
+
+  if (!encoding) {
+    NS_ConvertUTF16toUTF8 label(aLabel);
+    label.Trim(" \t\n\f\r");
+    aRv.ThrowRangeError<MSG_ENCODING_NOT_SUPPORTED>(label);
+    return nullptr;
+  }
+
+
+  auto algorithms = MakeRefPtr<TextDecoderStreamAlgorithms>();
+
+  RefPtr<TransformStream> transformStream =
+      TransformStream::CreateGeneric(aGlobal, *algorithms, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  auto decoderStream = MakeRefPtr<TextDecoderStream>(
+      aGlobal.GetAsSupports(), *encoding, aOptions.mFatal, aOptions.mIgnoreBOM,
+      *transformStream);
+  algorithms->SetDecoderStream(*decoderStream);
+  return decoderStream.forget();
+}
+
+ReadableStream* TextDecoderStream::Readable() const {
+  return mStream->Readable();
+}
+
+WritableStream* TextDecoderStream::Writable() const {
+  return mStream->Writable();
+}
+
+}  

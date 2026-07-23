@@ -1,0 +1,43 @@
+/*
+ * Copyright 2022 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkAPI_DEFINED)
+#define SkAPI_DEFINED
+
+#include "include/private/base/SkLoadUserConfig.h" // IWYU pragma: keep
+
+#if !defined(SKIA_IMPLEMENTATION)
+    #define SKIA_IMPLEMENTATION 0
+#endif
+
+#if !defined(SK_API)
+    #if defined(SKIA_DLL)
+        #if defined(_MSC_VER)
+            #if SKIA_IMPLEMENTATION
+                #define SK_API __declspec(dllexport)
+            #else
+                #define SK_API __declspec(dllimport)
+            #endif
+        #else
+            #define SK_API __attribute__((visibility("default")))
+        #endif
+    #else
+        #define SK_API
+    #endif
+#endif
+
+#if !defined(SK_SPI)
+    #define SK_SPI SK_API
+#endif
+
+#if defined(SK_ENABLE_API_AVAILABLE)
+#   define SK_API_AVAILABLE API_AVAILABLE
+#else
+#   define SK_API_AVAILABLE(...)
+#endif
+
+#endif

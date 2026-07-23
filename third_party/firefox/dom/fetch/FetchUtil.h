@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_FetchUtil_h
+#define mozilla_dom_FetchUtil_h
+
+#include "mozilla/dom/File.h"
+#include "mozilla/dom/FormData.h"
+#include "nsError.h"
+#include "nsString.h"
+
+#define WASM_CONTENT_TYPE "application/wasm"
+
+class nsIPrincipal;
+class nsIHttpChannel;
+
+namespace mozilla::dom {
+
+class Document;
+class InternalRequest;
+class WorkerPrivate;
+
+#define FETCH_KEEPALIVE_MAX_SIZE 65536
+
+class FetchUtil final {
+ private:
+  static nsCString WasmAltDataType;
+
+ public:
+  FetchUtil() = delete;
+
+  static nsresult GetValidRequestMethod(const nsACString& aMethod,
+                                        nsCString& outMethod);
+  static bool ExtractHeader(nsACString::const_iterator& aStart,
+                            nsACString::const_iterator& aEnd,
+                            nsCString& aHeaderName, nsCString& aHeaderValue,
+                            bool* aWasEmptyHeader);
+
+  static nsresult SetRequestReferrer(nsIPrincipal* aPrincipal, Document* aDoc,
+                                     nsIHttpChannel* aChannel,
+                                     InternalRequest& aRequest);
+
+  static inline const nsCString& GetWasmAltDataType() {
+    MOZ_ASSERT(!WasmAltDataType.IsEmpty());
+    return WasmAltDataType;
+  }
+  static void InitWasmAltDataType();
+
+  static bool StreamResponseToJS(JSContext* aCx, JS::Handle<JSObject*> aObj,
+                                 JS::MimeType aMimeType,
+                                 JS::StreamConsumer* aConsumer,
+                                 WorkerPrivate* aMaybeWorker);
+
+  static void ReportJSStreamError(JSContext* aCx, size_t aErrorCode);
+
+  static bool IncrementPendingKeepaliveRequestSize(nsILoadGroup* aLoadGroup,
+                                                   const uint64_t aBodyLength);
+
+  static void DecrementPendingKeepaliveRequestSize(nsILoadGroup* aLoadGroup,
+                                                   const uint64_t aBodyLength);
+
+  static nsCOMPtr<nsILoadGroup> GetLoadGroupFromGlobal(
+      nsIGlobalObject* aGlobal);
+};
+
+}  
+#endif

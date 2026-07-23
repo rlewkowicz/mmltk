@@ -1,0 +1,280 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_Compartment_inl_h
+#define vm_Compartment_inl_h
+
+#include "vm/Compartment.h"
+
+#include "jsapi.h"
+#include "jsfriendapi.h"
+
+#include "builtin/Number.h"
+#include "js/CallArgs.h"
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#include "js/Wrapper.h"
+#include "vm/Iteration.h"
+#include "vm/JSObject.h"
+
+#include "vm/JSContext-inl.h"
+
+struct JSClass;
+
+inline js::StringWrapperMap::Ptr JS::Compartment::lookupWrapper(
+    JSString* str) const {
+  return zone()->crossZoneStringWrappers().lookup(str);
+}
+
+inline bool JS::Compartment::wrap(JSContext* cx, JS::MutableHandleValue vp) {
+  if (!vp.isGCThing()) {
+    return true;
+  }
+
+  if (vp.isSymbol()) {
+    cx->markAtomValue(vp);
+    return true;
+  }
+
+  if (vp.isString()) {
+    JS::RootedString str(cx, vp.toString());
+    if (!wrap(cx, &str)) {
+      return false;
+    }
+    vp.setString(str);
+    return true;
+  }
+
+  if (vp.isBigInt()) {
+    JS::RootedBigInt bi(cx, vp.toBigInt());
+    if (!wrap(cx, &bi)) {
+      return false;
+    }
+    vp.setBigInt(bi);
+    return true;
+  }
+
+  MOZ_ASSERT(vp.isObject());
+
+#ifdef DEBUG
+  JS::AssertValueIsNotGray(vp);
+  JS::RootedObject cacheResult(cx);
+#endif
+  if (js::ObjectWrapperMap::Ptr p = lookupWrapper(&vp.toObject())) {
+#ifdef DEBUG
+    cacheResult = p->value().get();
+#else
+    vp.setObject(*p->value().get());
+    return true;
+#endif
+  }
+
+  JS::RootedObject obj(cx, &vp.toObject());
+  if (!wrap(cx, &obj)) {
+    return false;
+  }
+  vp.setObject(*obj);
+  MOZ_ASSERT_IF(cacheResult, obj == cacheResult);
+  return true;
+}
+
+inline bool JS::Compartment::wrap(JSContext* cx,
+                                  MutableHandle<mozilla::Maybe<Value>> vp) {
+  if (vp.get().isNothing()) {
+    return true;
+  }
+
+  return wrap(cx, MutableHandle<Value>::fromMarkedLocation(vp.get().ptr()));
+}
+
+namespace js {
+namespace detail {
+
+template <class T>
+const char* ClassName() {
+  return T::class_.name;
+}
+
+template <class T, class ErrorCallback>
+[[nodiscard]] T* UnwrapAndTypeCheckValueSlowPath(JSContext* cx,
+                                                 HandleValue value,
+                                                 ErrorCallback throwTypeError) {
+  JSObject* obj = nullptr;
+  if (value.isObject()) {
+    obj = &value.toObject();
+    if (IsWrapper(obj)) {
+      obj = CheckedUnwrapStatic(obj);
+      if (!obj) {
+        ReportAccessDenied(cx);
+        return nullptr;
+      }
+    }
+  }
+
+  if (!obj || !obj->is<T>()) {
+    throwTypeError();
+    return nullptr;
+  }
+
+  return &obj->as<T>();
+}
+
+template <class ErrorCallback>
+[[nodiscard]] JSObject* UnwrapAndTypeCheckValueSlowPath(
+    JSContext* cx, HandleValue value, const JSClass* clasp,
+    ErrorCallback throwTypeError) {
+  JSObject* obj = nullptr;
+  if (value.isObject()) {
+    obj = &value.toObject();
+    if (IsWrapper(obj)) {
+      obj = CheckedUnwrapStatic(obj);
+      if (!obj) {
+        ReportAccessDenied(cx);
+        return nullptr;
+      }
+    }
+  }
+
+  if (!obj || !obj->hasClass(clasp)) {
+    throwTypeError();
+    return nullptr;
+  }
+
+  return obj;
+}
+
+}  
+
+template <class T, class ErrorCallback>
+[[nodiscard]] inline T* UnwrapAndTypeCheckValue(JSContext* cx,
+                                                HandleValue value,
+                                                ErrorCallback throwTypeError) {
+  cx->check(value);
+
+  static_assert(!std::is_convertible_v<T*, Wrapper*>,
+                "T can't be a Wrapper type; this function discards wrappers");
+
+  if (value.isObject() && value.toObject().is<T>()) {
+    return &value.toObject().as<T>();
+  }
+
+  return detail::UnwrapAndTypeCheckValueSlowPath<T>(cx, value, throwTypeError);
+}
+
+template <class ErrorCallback>
+[[nodiscard]] inline JSObject* UnwrapAndTypeCheckValue(
+    JSContext* cx, HandleValue value, const JSClass* clasp,
+    ErrorCallback throwTypeError) {
+  cx->check(value);
+
+  if (value.isObject() && value.toObject().hasClass(clasp)) {
+    return &value.toObject();
+  }
+
+  return detail::UnwrapAndTypeCheckValueSlowPath(cx, value, clasp,
+                                                 throwTypeError);
+}
+
+template <class T>
+[[nodiscard]] inline T* UnwrapAndTypeCheckThis(JSContext* cx,
+                                               const CallArgs& args,
+                                               const char* methodName) {
+  HandleValue thisv = args.thisv();
+  return UnwrapAndTypeCheckValue<T>(cx, thisv, [cx, methodName, thisv] {
+    JS_ReportErrorNumberLatin1(cx, GetErrorMessage, nullptr,
+                               JSMSG_INCOMPATIBLE_PROTO, detail::ClassName<T>(),
+                               methodName, InformalValueTypeName(thisv));
+  });
+}
+
+template <class T>
+[[nodiscard]] inline T* UnwrapAndTypeCheckArgument(JSContext* cx,
+                                                   CallArgs& args,
+                                                   const char* methodName,
+                                                   int argIndex) {
+  HandleValue val = args.get(argIndex);
+  return UnwrapAndTypeCheckValue<T>(cx, val, [cx, val, methodName, argIndex] {
+    Int32ToCStringBuf cbuf;
+    char* numStr = Int32ToCString(&cbuf, argIndex + 1);
+    MOZ_ASSERT(numStr);
+    JS_ReportErrorNumberLatin1(
+        cx, GetErrorMessage, nullptr, JSMSG_WRONG_TYPE_ARG, numStr, methodName,
+        detail::ClassName<T>(), InformalValueTypeName(val));
+  });
+}
+
+template <class T>
+[[nodiscard]] inline T* UnwrapAndDowncastObject(JSContext* cx, JSObject* obj) {
+  static_assert(!std::is_convertible_v<T*, Wrapper*>,
+                "T can't be a Wrapper type; this function discards wrappers");
+
+  if (IsProxy(obj)) {
+    if (JS_IsDeadWrapper(obj)) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                JSMSG_DEAD_OBJECT);
+      return nullptr;
+    }
+
+    obj = obj->maybeUnwrapAs<T>();
+    if (!obj) {
+      ReportAccessDenied(cx);
+      return nullptr;
+    }
+  }
+
+  return &obj->as<T>();
+}
+
+[[nodiscard]] inline JSObject* UnwrapAndDowncastObject(JSContext* cx,
+                                                       JSObject* obj,
+                                                       const JSClass* clasp) {
+  if (IsProxy(obj)) {
+    if (JS_IsDeadWrapper(obj)) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                JSMSG_DEAD_OBJECT);
+      return nullptr;
+    }
+
+    obj = obj->maybeUnwrapAs(clasp);
+    if (!obj) {
+      ReportAccessDenied(cx);
+      return nullptr;
+    }
+  }
+
+  MOZ_ASSERT(obj->hasClass(clasp));
+  return obj;
+}
+
+template <class T>
+[[nodiscard]] inline T* UnwrapAndDowncastValue(JSContext* cx,
+                                               const Value& value) {
+  return UnwrapAndDowncastObject<T>(cx, &value.toObject());
+}
+
+[[nodiscard]] inline JSObject* UnwrapAndDowncastValue(JSContext* cx,
+                                                      const Value& value,
+                                                      const JSClass* clasp) {
+  return UnwrapAndDowncastObject(cx, &value.toObject(), clasp);
+}
+
+}  
+
+MOZ_ALWAYS_INLINE bool JS::Compartment::objectMaybeInIteration(JSObject* obj) {
+  MOZ_ASSERT(obj->compartment() == this);
+
+  js::NativeIteratorListIter iter(&enumerators_);
+
+  if (iter.done()) {
+    return false;
+  }
+
+  js::NativeIterator* next = iter.next();
+  if (iter.done()) {
+    return next->objectBeingIterated() == obj;
+  }
+
+  return true;
+}
+
+#endif /* vm_Compartment_inl_h */

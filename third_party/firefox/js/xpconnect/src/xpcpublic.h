@@ -1,0 +1,690 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef xpcpublic_h
+#define xpcpublic_h
+
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+#include "ErrorList.h"
+#include "js/BuildId.h"
+#include "js/ErrorReport.h"
+#include "js/friend/Wrapper.h"
+#include "js/GCAPI.h"
+#include "js/Object.h"
+#include "js/RootingAPI.h"
+#include "js/String.h"
+#include "js/TypeDecls.h"
+#include "js/Utility.h"
+#include "js/Value.h"
+#include "jsapi.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/TextUtils.h"
+#include "mozilla/StringBuffer.h"
+#include "mozilla/fallible.h"
+#include "nsCOMPtr.h"
+#include "nsISupports.h"
+#include "nsIURI.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "nsWrapperCache.h"
+
+class JSObject;
+class JSString;
+class JSTracer;
+class nsGlobalWindowInner;
+class nsIGlobalObject;
+class nsIHandleReportCallback;
+class nsIPrincipal;
+class nsPIDOMWindowInner;
+struct JSContext;
+struct nsID;
+struct nsXPTInterfaceInfo;
+
+namespace JS {
+class Compartment;
+class ContextOptions;
+class PrefableCompileOptions;
+class Realm;
+class RealmOptions;
+class Value;
+struct RuntimeStats;
+}  
+
+namespace mozilla {
+class BasePrincipal;
+
+namespace dom {
+class Exception;
+}  
+}  
+
+namespace xpc {
+
+class Scriptability {
+ public:
+  explicit Scriptability(JS::Realm* realm);
+  bool Allowed();
+  bool IsImmuneToScriptPolicy();
+
+  void Block();
+  void Unblock();
+  void SetWindowAllowsScript(bool aAllowed);
+
+  static Scriptability& Get(JSObject* aScope);
+
+  static bool AllowedIfExists(JSObject* aScope);
+
+ private:
+  uint32_t mScriptBlocks;
+
+  bool mWindowAllowsScript;
+
+  bool mImmuneToScriptPolicy;
+
+  bool mScriptBlockedByPolicy;
+};
+
+JSObject* TransplantObjectNukingXrayWaiver(JSContext* cx,
+                                           JS::Handle<JSObject*> origObj,
+                                           JS::Handle<JSObject*> target);
+
+bool IsUAWidgetCompartment(JS::Compartment* compartment);
+bool IsUAWidgetScope(JS::Realm* realm);
+bool IsInUAWidgetScope(JSObject* obj);
+
+bool MightBeWebContentCompartment(JS::Compartment* compartment);
+
+void SetCompartmentChangedDocumentDomain(JS::Compartment* compartment);
+
+JSObject* GetUAWidgetScope(JSContext* cx, nsIPrincipal* principal);
+
+JSObject* GetUAWidgetScope(JSContext* cx, JSObject* contentScope);
+
+bool AllowContentXBLScope(JS::Realm* realm);
+
+JSObject* NACScope(JSObject* global);
+
+bool IsSandboxPrototypeProxy(JSObject* obj);
+
+bool IsReflector(JSObject* obj, JSContext* cx);
+
+bool IsXrayWrapper(JSObject* obj);
+
+JSObject* XrayAwareCalleeGlobal(JSObject* fun);
+
+void TraceXPCGlobal(JSTracer* trc, JSObject* obj);
+
+nsresult InitClassesWithNewWrappedGlobal(
+    JSContext* aJSContext, nsISupports* aCOMObj, nsIPrincipal* aPrincipal,
+    uint32_t aFlags, JS::RealmOptions& aOptions,
+    JS::MutableHandle<JSObject*> aNewGlobal);
+
+enum InitClassesFlag {
+  DONT_FIRE_ONNEWGLOBALHOOK = 1 << 0,
+  OMIT_COMPONENTS_OBJECT = 1 << 1,
+};
+
+} 
+
+namespace JS {
+
+struct RuntimeStats;
+
+}  
+
+static_assert(JSCLASS_GLOBAL_APPLICATION_SLOTS > 0,
+              "Need at least one slot for JSCLASS_SLOT0_IS_NSISUPPORTS");
+
+#define XPCONNECT_GLOBAL_FLAGS_WITH_EXTRA_SLOTS(n)    \
+  JSCLASS_DOM_GLOBAL | JSCLASS_SLOT0_IS_NSISUPPORTS | \
+      JSCLASS_GLOBAL_FLAGS_WITH_SLOTS(DOM_GLOBAL_SLOTS + n)
+
+#define XPCONNECT_GLOBAL_EXTRA_SLOT_OFFSET \
+  (JSCLASS_GLOBAL_SLOT_COUNT + DOM_GLOBAL_SLOTS)
+
+#define XPCONNECT_GLOBAL_FLAGS XPCONNECT_GLOBAL_FLAGS_WITH_EXTRA_SLOTS(0)
+
+inline JSObject* xpc_FastGetCachedWrapper(JSContext* cx, nsWrapperCache* cache,
+                                          JS::MutableHandle<JS::Value> vp) {
+  if (cache) {
+    JSObject* wrapper = cache->GetWrapper();
+    if (wrapper &&
+        JS::GetCompartment(wrapper) == js::GetContextCompartment(cx)) {
+      vp.setObject(*wrapper);
+      return wrapper;
+    }
+  }
+
+  return nullptr;
+}
+
+extern void xpc_TryUnmarkWrappedGrayObject(nsISupports* aWrappedJS);
+
+extern void xpc_UnmarkSkippableJSHolders();
+
+extern bool xpc_DumpJSStack(bool showArgs, bool showLocals, bool showThisProps);
+
+extern JS::UniqueChars xpc_PrintJSStack(JSContext* cx, bool showArgs,
+                                        bool showLocals, bool showThisProps);
+
+class XPCStringConvert {
+ public:
+  static MOZ_ALWAYS_INLINE bool UCStringBufferToJSVal(
+      JSContext* cx, mozilla::StringBuffer* buf, uint32_t length,
+      JS::MutableHandle<JS::Value> rval) {
+    JSString* str = JS::NewStringFromKnownLiveTwoByteBuffer(cx, buf, length);
+    if (!str) {
+      return false;
+    }
+    rval.setString(str);
+    return true;
+  }
+
+  static MOZ_ALWAYS_INLINE bool Latin1StringBufferToJSVal(
+      JSContext* cx, mozilla::StringBuffer* buf, uint32_t length,
+      JS::MutableHandle<JS::Value> rval) {
+    JSString* str = JS::NewStringFromKnownLiveLatin1Buffer(cx, buf, length);
+    if (!str) {
+      return false;
+    }
+    rval.setString(str);
+    return true;
+  }
+
+  static MOZ_ALWAYS_INLINE bool UTF8StringBufferToJSVal(
+      JSContext* cx, mozilla::StringBuffer* buf, uint32_t length,
+      JS::MutableHandle<JS::Value> rval) {
+    JSString* str = JS::NewStringFromKnownLiveUTF8Buffer(cx, buf, length);
+    if (!str) {
+      return false;
+    }
+    rval.setString(str);
+    return true;
+  }
+
+  static inline bool StringLiteralToJSVal(JSContext* cx,
+                                          const char16_t* literal,
+                                          uint32_t length,
+                                          JS::MutableHandle<JS::Value> rval) {
+    bool ignored;
+    JSString* str = JS_NewMaybeExternalUCString(
+        cx, literal, length, &sLiteralExternalString, &ignored);
+    if (!str) {
+      return false;
+    }
+    rval.setString(str);
+    return true;
+  }
+
+  static inline bool StringLiteralToJSVal(JSContext* cx,
+                                          const JS::Latin1Char* literal,
+                                          uint32_t length,
+                                          JS::MutableHandle<JS::Value> rval) {
+    bool ignored;
+    JSString* str = JS_NewMaybeExternalStringLatin1(
+        cx, literal, length, &sLiteralExternalString, &ignored);
+    if (!str) {
+      return false;
+    }
+    rval.setString(str);
+    return true;
+  }
+
+  static inline bool UTF8StringLiteralToJSVal(
+      JSContext* cx, const JS::UTF8Chars& chars,
+      JS::MutableHandle<JS::Value> rval) {
+    bool ignored;
+    JSString* str = JS_NewMaybeExternalStringUTF8(
+        cx, chars, &sLiteralExternalString, &ignored);
+    if (!str) {
+      return false;
+    }
+    rval.setString(str);
+    return true;
+  }
+
+ private:
+  static MOZ_ALWAYS_INLINE bool MaybeGetExternalStringChars(
+      JSString* str, const JSExternalStringCallbacks** callbacks,
+      const char16_t** chars) {
+    return JS::IsExternalUCString(str, callbacks, chars);
+  }
+  static MOZ_ALWAYS_INLINE bool MaybeGetExternalStringChars(
+      JSString* str, const JSExternalStringCallbacks** callbacks,
+      const JS::Latin1Char** chars) {
+    return JS::IsExternalStringLatin1(str, callbacks, chars);
+  }
+
+  static MOZ_ALWAYS_INLINE bool IsStringWithStringBuffer(
+      JSString* str, mozilla::StringBuffer** buffer, const char16_t** chars) {
+    if (!JS::IsTwoByteStringWithStringBuffer(str, buffer)) {
+      return false;
+    }
+    *chars = static_cast<const char16_t*>((*buffer)->Data());
+    return true;
+  }
+  static MOZ_ALWAYS_INLINE bool IsStringWithStringBuffer(
+      JSString* str, mozilla::StringBuffer** buffer,
+      const JS::Latin1Char** chars) {
+    if (!JS::IsLatin1StringWithStringBuffer(str, buffer)) {
+      return false;
+    }
+    *chars = static_cast<const JS::Latin1Char*>((*buffer)->Data());
+    return true;
+  }
+
+  enum class AcceptedEncoding { All, ASCII };
+
+  template <typename SrcCharT, typename DestCharT, AcceptedEncoding encoding,
+            typename T>
+  static MOZ_ALWAYS_INLINE bool MaybeAssignStringChars(JSString* s, size_t len,
+                                                       T& dest) {
+    MOZ_ASSERT(len == JS::GetStringLength(s));
+    static_assert(sizeof(SrcCharT) == sizeof(DestCharT));
+    if constexpr (encoding == AcceptedEncoding::ASCII) {
+      static_assert(
+          std::is_same_v<DestCharT, char>,
+          "AcceptedEncoding::ASCII can be used only with single byte");
+    }
+
+    const DestCharT* chars;
+    {
+      mozilla::StringBuffer* buf;
+      if (IsStringWithStringBuffer(
+              s, &buf, reinterpret_cast<const SrcCharT**>(&chars))) {
+        if constexpr (encoding == AcceptedEncoding::ASCII) {
+          if (!mozilla::IsAscii(mozilla::Span(chars, len))) {
+            return false;
+          }
+        }
+
+        if (chars[len] == '\0') {
+          dest.Assign(buf, len);
+          return true;
+        }
+        return false;
+      }
+    }
+
+    const JSExternalStringCallbacks* callbacks;
+    if (!MaybeGetExternalStringChars(
+            s, &callbacks, reinterpret_cast<const SrcCharT**>(&chars))) {
+      return false;
+    }
+    if (callbacks == &sLiteralExternalString) {
+      if constexpr (encoding == AcceptedEncoding::ASCII) {
+        if (!mozilla::IsAscii(mozilla::Span(chars, len))) {
+          return false;
+        }
+      }
+
+      dest.AssignLiteral(chars, len);
+      return true;
+    }
+
+    return false;
+  }
+
+ public:
+  template <typename T>
+  static MOZ_ALWAYS_INLINE bool MaybeAssignUCStringChars(JSString* s,
+                                                         size_t len, T& dest) {
+    return MaybeAssignStringChars<char16_t, char16_t, AcceptedEncoding::All>(
+        s, len, dest);
+  }
+
+  template <typename T>
+  static MOZ_ALWAYS_INLINE bool MaybeAssignLatin1StringChars(JSString* s,
+                                                             size_t len,
+                                                             T& dest) {
+    return MaybeAssignStringChars<JS::Latin1Char, char, AcceptedEncoding::All>(
+        s, len, dest);
+  }
+
+  template <typename T>
+  static MOZ_ALWAYS_INLINE bool MaybeAssignUTF8StringChars(JSString* s,
+                                                           size_t len,
+                                                           T& dest) {
+    return MaybeAssignStringChars<JS::Latin1Char, char,
+                                  AcceptedEncoding::ASCII>(s, len, dest);
+  }
+
+ private:
+  struct LiteralExternalString : public JSExternalStringCallbacks {
+    void finalize(JS::Latin1Char* aChars) const override;
+    void finalize(char16_t* aChars) const override;
+    size_t sizeOfBuffer(const JS::Latin1Char* aChars,
+                        mozilla::MallocSizeOf aMallocSizeOf) const override;
+    size_t sizeOfBuffer(const char16_t* aChars,
+                        mozilla::MallocSizeOf aMallocSizeOf) const override;
+  };
+  static const LiteralExternalString sLiteralExternalString;
+
+  XPCStringConvert() = delete;
+};
+
+namespace xpc {
+
+bool Base64Encode(JSContext* cx, JS::Handle<JS::Value> val,
+                  JS::MutableHandle<JS::Value> out);
+bool Base64Decode(JSContext* cx, JS::Handle<JS::Value> val,
+                  JS::MutableHandle<JS::Value> out);
+
+[[nodiscard]] inline bool NonVoidStringToJsval(JSContext* cx,
+                                               const nsAString& readable,
+                                               JS::MutableHandleValue vp) {
+  uint32_t length = readable.Length();
+  if (auto* buf = readable.GetStringBuffer()) {
+    return XPCStringConvert::UCStringBufferToJSVal(cx, buf, length, vp);
+  }
+  if (readable.IsLiteral()) {
+    return XPCStringConvert::StringLiteralToJSVal(cx, readable.BeginReading(),
+                                                  length, vp);
+  }
+  JSString* str = JS_NewUCStringCopyN(cx, readable.BeginReading(), length);
+  if (!str) {
+    return false;
+  }
+  vp.setString(str);
+  return true;
+}
+
+[[nodiscard]] inline bool NonVoidLatin1StringToJsval(
+    JSContext* cx, const nsACString& latin1, JS::MutableHandleValue vp) {
+  uint32_t length = latin1.Length();
+  if (auto* buf = latin1.GetStringBuffer()) {
+    return XPCStringConvert::Latin1StringBufferToJSVal(cx, buf, length, vp);
+  }
+  if (latin1.IsLiteral()) {
+    return XPCStringConvert::StringLiteralToJSVal(
+        cx, reinterpret_cast<const JS::Latin1Char*>(latin1.BeginReading()),
+        length, vp);
+  }
+  JSString* str = JS_NewStringCopyN(cx, latin1.BeginReading(), length);
+  if (!str) {
+    return false;
+  }
+  vp.setString(str);
+  return true;
+}
+
+[[nodiscard]] inline bool NonVoidUTF8StringToJsval(JSContext* cx,
+                                                   const nsACString& utf8,
+                                                   JS::MutableHandleValue vp) {
+  uint32_t length = utf8.Length();
+  if (auto* buf = utf8.GetStringBuffer()) {
+    return XPCStringConvert::UTF8StringBufferToJSVal(cx, buf, length, vp);
+  }
+  if (utf8.IsLiteral()) {
+    return XPCStringConvert::UTF8StringLiteralToJSVal(
+        cx, JS::UTF8Chars(utf8.BeginReading(), length), vp);
+  }
+  JSString* str =
+      JS_NewStringCopyUTF8N(cx, JS::UTF8Chars(utf8.BeginReading(), length));
+  if (!str) {
+    return false;
+  }
+  vp.setString(str);
+  return true;
+}
+
+[[nodiscard]] MOZ_ALWAYS_INLINE bool StringToJsval(
+    JSContext* cx, const nsAString& str, JS::MutableHandle<JS::Value> rval) {
+  if (str.IsVoid()) {
+    rval.setNull();
+    return true;
+  }
+  return NonVoidStringToJsval(cx, str, rval);
+}
+
+[[nodiscard]] MOZ_ALWAYS_INLINE bool Latin1StringToJsval(
+    JSContext* cx, const nsACString& str, JS::MutableHandle<JS::Value> rval) {
+  if (str.IsVoid()) {
+    rval.setNull();
+    return true;
+  }
+  return NonVoidLatin1StringToJsval(cx, str, rval);
+}
+
+[[nodiscard]] MOZ_ALWAYS_INLINE bool UTF8StringToJsval(
+    JSContext* cx, const nsACString& str, JS::MutableHandle<JS::Value> rval) {
+  if (str.IsVoid()) {
+    rval.setNull();
+    return true;
+  }
+  return NonVoidUTF8StringToJsval(cx, str, rval);
+}
+
+mozilla::BasePrincipal* GetRealmPrincipal(JS::Realm* realm);
+
+void NukeAllWrappersForRealm(JSContext* cx, JS::Realm* realm,
+                             js::NukeReferencesToWindow nukeReferencesToWindow =
+                                 js::NukeWindowReferences);
+
+void SetLocationForGlobal(JSObject* global, const nsACString& location);
+void SetLocationForGlobal(JSObject* global, nsIURI* locationURI);
+
+class ZoneStatsExtras {
+ public:
+  ZoneStatsExtras() = default;
+
+  nsCString zoneName;
+  nsCString pathPrefix;
+
+ private:
+  ZoneStatsExtras(const ZoneStatsExtras& other) = delete;
+  ZoneStatsExtras& operator=(const ZoneStatsExtras& other) = delete;
+};
+
+class RealmStatsExtras {
+ public:
+  RealmStatsExtras() = default;
+
+  nsCString jsPathPrefix;
+  nsCString domPathPrefix;
+  nsCOMPtr<nsIURI> location;
+
+ private:
+  RealmStatsExtras(const RealmStatsExtras& other) = delete;
+  RealmStatsExtras& operator=(const RealmStatsExtras& other) = delete;
+};
+
+void ReportJSRuntimeExplicitTreeStats(const JS::RuntimeStats& rtStats,
+                                      const nsACString& rtPath,
+                                      nsIHandleReportCallback* handleReport,
+                                      nsISupports* data, bool anonymize,
+                                      size_t* rtTotal = nullptr);
+
+bool Throw(JSContext* cx, nsresult rv);
+
+already_AddRefed<nsISupports> ReflectorToISupportsStatic(JSObject* reflector);
+
+already_AddRefed<nsISupports> ReflectorToISupportsDynamic(JSObject* reflector,
+                                                          JSContext* cx);
+
+JSObject* UnprivilegedJunkScope();
+
+JSObject* UnprivilegedJunkScope(const mozilla::fallible_t&);
+
+bool IsUnprivilegedJunkScope(JSObject*);
+
+JSObject* PrivilegedJunkScope();
+
+JSObject* CompilationScope();
+
+nsIGlobalObject* NativeGlobal(JSObject* obj);
+
+nsIGlobalObject* CurrentNativeGlobal(JSContext* cx);
+
+nsGlobalWindowInner* WindowOrNull(JSObject* aObj);
+
+nsGlobalWindowInner* WindowGlobalOrNull(JSObject* aObj);
+
+JSObject* SandboxPrototypeOrNull(JSContext* aCx, JSObject* aObj);
+
+inline nsGlobalWindowInner* SandboxWindowOrNull(JSObject* aObj,
+                                                JSContext* aCx) {
+  JSObject* proto = SandboxPrototypeOrNull(aCx, aObj);
+  return proto ? WindowOrNull(proto) : nullptr;
+}
+
+nsGlobalWindowInner* CurrentWindowOrNull(JSContext* cx);
+
+class MOZ_RAII AutoScriptActivity {
+  bool mActive;
+  bool mOldValue;
+
+ public:
+  explicit AutoScriptActivity(bool aActive);
+  ~AutoScriptActivity();
+};
+
+bool ShouldDiscardSystemSource();
+
+void SetPrefableRealmOptions(JS::RealmOptions& options);
+void SetPrefableContextOptions(JS::ContextOptions& options);
+
+void SetPrefableCompileOptions(JS::PrefableCompileOptions& options);
+
+void InitGlobalObjectOptions(JS::RealmOptions& aOptions,
+                             bool aIsSystemPrincipal, bool aSecureContext,
+                             bool aForceUTC, bool aAlwaysUseFdlibm,
+                             bool aLocaleEnUS,
+                             const nsACString& aLanguageOverride,
+                             const nsAString& aTimezoneOverride);
+
+class ErrorBase {
+ public:
+  nsString mErrorMsg;
+  nsCString mFileName;
+  uint32_t mSourceId;
+  uint32_t mLineNumber;
+  uint32_t mColumn;
+
+  ErrorBase() : mSourceId(0), mLineNumber(0), mColumn(0) {}
+
+  void Init(JSErrorBase* aReport);
+
+  void AppendErrorDetailsTo(nsCString& error);
+};
+
+class ErrorNote : public ErrorBase {
+ public:
+  void Init(JSErrorNotes::Note* aNote);
+
+  static void ErrorNoteToMessageString(JSErrorNotes::Note* aNote,
+                                       nsAString& aString);
+
+  void LogToStderr();
+};
+
+class ErrorReport : public ErrorBase {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ErrorReport);
+
+  nsTArray<ErrorNote> mNotes;
+
+  nsCString mCategory;
+  nsString mErrorMsgName;
+  uint64_t mWindowID;
+  bool mIsWarning;
+  bool mIsMuted;
+  bool mIsPromiseRejection;
+
+  ErrorReport()
+      : mWindowID(0),
+        mIsWarning(false),
+        mIsMuted(false),
+        mIsPromiseRejection(false) {}
+
+  void Init(JSErrorReport* aReport, const char* aToStringResult, bool aIsChrome,
+            uint64_t aWindowID);
+  void Init(JSContext* aCx, mozilla::dom::Exception* aException, bool aIsChrome,
+            uint64_t aWindowID);
+
+  void LogToConsole();
+  void LogToConsoleWithStack(nsGlobalWindowInner* aWin,
+                             JS::Handle<mozilla::Maybe<JS::Value>> aException,
+                             JS::Handle<JSObject*> aStack,
+                             JS::Handle<JSObject*> aStackGlobal);
+
+  static void ErrorReportToMessageString(JSErrorReport* aReport,
+                                         nsAString& aString);
+
+  void LogToStderr();
+
+  bool IsWarning() const { return mIsWarning; };
+
+ private:
+  ~ErrorReport() = default;
+};
+
+void DispatchScriptErrorEvent(nsPIDOMWindowInner* win,
+                              JS::RootingContext* rootingCx,
+                              xpc::ErrorReport* xpcReport,
+                              JS::Handle<JS::Value> exception,
+                              JS::Handle<JSObject*> exceptionStack);
+
+void FindExceptionStackForConsoleReport(
+    nsPIDOMWindowInner* win, JS::Handle<JS::Value> exceptionValue,
+    JS::Handle<JSObject*> exceptionStack, JS::MutableHandle<JSObject*> stackObj,
+    JS::MutableHandle<JSObject*> stackGlobal);
+
+extern void GetCurrentRealmName(JSContext*, nsCString& name);
+
+nsCString GetFunctionName(JSContext* cx, JS::Handle<JSObject*> obj);
+
+void InitializeJSContext();
+
+mozilla::Maybe<nsID> JSValue2ID(JSContext* aCx, JS::Handle<JS::Value> aVal);
+
+bool ID2JSValue(JSContext* aCx, const nsID& aId,
+                JS::MutableHandle<JS::Value> aVal);
+
+bool IfaceID2JSValue(JSContext* aCx, const nsXPTInterfaceInfo& aInfo,
+                     JS::MutableHandle<JS::Value> aVal);
+
+bool ContractID2JSValue(JSContext* aCx, JSString* aContract,
+                        JS::MutableHandle<JS::Value> aVal);
+
+class JSStackFrameBase {
+ public:
+  virtual void Clear() = 0;
+};
+
+void RegisterJSStackFrame(JS::Realm* aRealm, JSStackFrameBase* aStackFrame);
+void UnregisterJSStackFrame(JS::Realm* aRealm, JSStackFrameBase* aStackFrame);
+void NukeJSStackFrames(JS::Realm* aRealm);
+
+bool IsCrossOriginWhitelistedProp(JSContext* cx,
+                                  JS::Handle<JS::PropertyKey> id);
+
+bool AppendCrossOriginWhitelistedPropNames(
+    JSContext* cx, JS::MutableHandle<JS::StackGCVector<JS::PropertyKey>> props);
+}  
+
+namespace mozilla {
+namespace dom {
+
+bool IsNotUAWidget(JSContext* cx, JSObject* );
+
+bool IsChromeOrUAWidget(JSContext* cx, JSObject* );
+
+bool IsChromeOrWorkerDebugger(JSContext* cx, JSObject* );
+
+bool ThreadSafeIsChromeOrUAWidget(JSContext* cx, JSObject* obj);
+
+}  
+
+bool GetBuildId(JS::BuildIdCharVector* aBuildID);
+
+}  
+
+#endif

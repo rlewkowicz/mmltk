@@ -1,0 +1,154 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_timeout_h
+#define mozilla_dom_timeout_h
+#include "mozilla/LinkedList.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/PopupBlocker.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsGlobalWindowInner.h"
+#include "nsTHashMap.h"
+
+namespace mozilla::dom {
+
+class TimeoutHandler;
+
+class Timeout final : protected LinkedListElement<RefPtr<Timeout>> {
+ public:
+  Timeout();
+
+  NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(Timeout)
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(Timeout)
+
+  enum class Reason : uint8_t {
+    eTimeoutOrInterval,
+    eIdleCallbackTimeout,
+    eAbortSignalTimeout,
+    eDelayedWebTaskTimeout,
+    eJSTimeout,
+  };
+
+  struct TimeoutIdAndReason {
+    int32_t mId;
+    Reason mReason;
+  };
+
+  class TimeoutHashKey : public PLDHashEntryHdr {
+   public:
+    typedef const TimeoutIdAndReason& KeyType;
+    typedef const TimeoutIdAndReason* KeyTypePointer;
+
+    explicit TimeoutHashKey(KeyTypePointer aKey) : mValue(*aKey) {}
+    TimeoutHashKey(TimeoutHashKey&& aOther)
+        : PLDHashEntryHdr(std::move(aOther)),
+          mValue(std::move(aOther.mValue)) {}
+    ~TimeoutHashKey() = default;
+
+    KeyType GetKey() const { return mValue; }
+    bool KeyEquals(KeyTypePointer aKey) const {
+      return aKey->mId == mValue.mId && aKey->mReason == mValue.mReason;
+    }
+
+    static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+    static PLDHashNumber HashKey(KeyTypePointer aKey) {
+      return aKey->mId | (static_cast<uint8_t>(aKey->mReason) << 31);
+    }
+    enum { ALLOW_MEMMOVE = true };
+
+   private:
+    const TimeoutIdAndReason mValue;
+  };
+
+  class TimeoutSet : public nsTHashMap<TimeoutHashKey, Timeout*> {
+   public:
+    NS_INLINE_DECL_REFCOUNTING(TimeoutSet);
+
+   private:
+    ~TimeoutSet() = default;
+  };
+
+  void SetWhenOrTimeRemaining(const TimeStamp& aBaseTime,
+                              const TimeDuration& aDelay);
+
+  const TimeStamp& When() const;
+
+  const TimeStamp& SubmitTime() const;
+
+  const TimeDuration& TimeRemaining() const;
+
+  void SetTimeoutContainer(TimeoutSet* aTimeouts) {
+    MOZ_ASSERT(mTimeoutId != 0);
+    TimeoutIdAndReason key = {mTimeoutId, mReason};
+    if (mTimeouts) {
+      mTimeouts->Remove(key);
+    }
+    mTimeouts = aTimeouts;
+    if (mTimeouts) {
+      mTimeouts->InsertOrUpdate(key, this);
+    }
+  }
+
+  Timeout* getNext() { return LinkedListElement<RefPtr<Timeout>>::getNext(); }
+
+  void setNext(Timeout* aNext) {
+    return LinkedListElement<RefPtr<Timeout>>::setNext(aNext);
+  }
+
+  Timeout* getPrevious() {
+    return LinkedListElement<RefPtr<Timeout>>::getPrevious();
+  }
+
+  void remove() {
+    SetTimeoutContainer(nullptr);
+    LinkedListElement<RefPtr<Timeout>>::remove();
+  }
+
+ private:
+  TimeStamp mWhen;
+
+  TimeDuration mTimeRemaining;
+
+  TimeStamp mSubmitTime;
+
+  ~Timeout();
+
+ public:
+
+  RefPtr<nsIGlobalObject> mGlobal;
+
+  RefPtr<TimeoutHandler> mScriptHandler;
+
+  RefPtr<TimeoutSet> mTimeouts;
+
+  TimeDuration mInterval;
+
+  int32_t mTimeoutId;
+
+  uint32_t mFiringId;
+
+#ifdef DEBUG
+  int64_t mFiringIndex;
+#endif
+
+  PopupBlocker::PopupControlState mPopupState;
+
+  Reason mReason;
+
+  uint8_t mNestingLevel;
+
+  bool mCleared;
+
+  bool mRunning;
+
+  bool mIsInterval;
+
+ protected:
+  friend class LinkedList<RefPtr<Timeout>>;
+  friend class LinkedListElement<RefPtr<Timeout>>;
+};
+
+}  
+
+#endif  // mozilla_dom_timeout_h

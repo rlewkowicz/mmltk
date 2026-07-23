@@ -1,0 +1,327 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/core/SkRect.h"
+
+#include "include/core/SkM44.h"
+#include "include/private/base/SkDebug.h"
+#include "include/private/base/SkTPin.h"
+#include "src/core/SkRectPriv.h"
+
+class SkMatrix;
+
+bool SkIRect::intersect(const SkIRect& a, const SkIRect& b) {
+    SkIRect tmp = {
+        std::max(a.fLeft,   b.fLeft),
+        std::max(a.fTop,    b.fTop),
+        std::min(a.fRight,  b.fRight),
+        std::min(a.fBottom, b.fBottom)
+    };
+    if (tmp.isEmpty()) {
+        return false;
+    }
+    *this = tmp;
+    return true;
+}
+
+void SkIRect::join(const SkIRect& r) {
+    if (r.fLeft >= r.fRight || r.fTop >= r.fBottom) {
+        return;
+    }
+
+    if (fLeft >= fRight || fTop >= fBottom) {
+        *this = r;
+    } else {
+        if (r.fLeft < fLeft)     fLeft = r.fLeft;
+        if (r.fTop < fTop)       fTop = r.fTop;
+        if (r.fRight > fRight)   fRight = r.fRight;
+        if (r.fBottom > fBottom) fBottom = r.fBottom;
+    }
+}
+
+
+std::optional<SkRect> SkRect::Bounds(SkSpan<const SkPoint> points) {
+    if (points.empty()) {
+        return SkRect::MakeEmpty();
+    }
+
+
+    if constexpr (sizeof(void*) == 8) {
+        float L = points[0].fX, T = points[0].fY, R = points[0].fX, B = points[0].fY;
+        float nx = 0, ny = 0;
+        for (auto p : points) {
+            L = std::fminf(p.fX, L);
+            T = std::fminf(p.fY, T);
+            R = std::fmaxf(p.fX, R);
+            B = std::fmaxf(p.fY, B);
+
+            nx *= p.fX;
+            ny *= p.fY;
+        }
+
+        if (nx == 0 && ny == 0) {
+            return {{L, T, R, B}};
+        }
+    } else {
+        auto count = points.size();
+        auto pts = points.data();
+
+        skvx::float4 min, max;
+        if (count & 1) {
+            min = max = skvx::float2::Load(pts).xyxy();
+            pts   += 1;
+            count -= 1;
+        } else {
+            min = max = skvx::float4::Load(pts);
+            pts   += 2;
+            count -= 2;
+        }
+
+        skvx::float4 accum = min * 0;
+        while (count) {
+            skvx::float4 xy = skvx::float4::Load(pts);
+            accum = accum * xy;
+            min = skvx::min(min, xy);
+            max = skvx::max(max, xy);
+            pts   += 2;
+            count -= 2;
+        }
+
+        const bool all_finite = all(accum * 0 == 0);
+        if (all_finite) {
+            return MakeLTRB(std::min(min[0], min[2]), std::min(min[1], min[3]),
+                            std::max(max[0], max[2]), std::max(max[1], max[3]));
+        }
+    }
+
+    return {};
+}
+
+bool SkRect::setBoundsCheck(SkSpan<const SkPoint> pts) {
+    if (auto bounds = Bounds(pts)) {
+        *this = bounds.value();
+        return true;
+    } else {
+        *this = MakeEmpty();
+        return false;
+    }
+}
+
+void SkRect::setBoundsNoCheck(SkSpan<const SkPoint> pts) {
+    if (auto bounds = Bounds(pts)) {
+        *this = bounds.value();
+    } else {
+        this->setLTRB(SK_FloatNaN, SK_FloatNaN, SK_FloatNaN, SK_FloatNaN);
+    }
+}
+
+#define CHECK_INTERSECT(al, at, ar, ab, bl, bt, br, bb) \
+    float L = std::max(al, bl);                         \
+    float R = std::min(ar, br);                         \
+    float T = std::max(at, bt);                         \
+    float B = std::min(ab, bb);                         \
+    do { if (!(L < R && T < B)) return false; } while (0)
+
+bool SkRect::intersect(const SkRect& r) {
+    CHECK_INTERSECT(r.fLeft, r.fTop, r.fRight, r.fBottom, fLeft, fTop, fRight, fBottom);
+    this->setLTRB(L, T, R, B);
+    return true;
+}
+
+bool SkRect::intersect(const SkRect& a, const SkRect& b) {
+    CHECK_INTERSECT(a.fLeft, a.fTop, a.fRight, a.fBottom, b.fLeft, b.fTop, b.fRight, b.fBottom);
+    this->setLTRB(L, T, R, B);
+    return true;
+}
+
+void SkRect::join(const SkRect& r) {
+    if (r.isEmpty()) {
+        return;
+    }
+
+    if (this->isEmpty()) {
+        *this = r;
+    } else {
+        fLeft   = std::min(fLeft, r.fLeft);
+        fTop    = std::min(fTop, r.fTop);
+        fRight  = std::max(fRight, r.fRight);
+        fBottom = std::max(fBottom, r.fBottom);
+    }
+}
+
+
+#include "include/core/SkString.h"
+#include "src/core/SkStringUtils.h"
+
+static const char* set_scalar(SkString* storage, float value, SkScalarAsStringType asType) {
+    storage->reset();
+    SkAppendScalar(storage, value, asType);
+    return storage->c_str();
+}
+
+SkString SkRect::dumpToString(bool asHex) const {
+    SkScalarAsStringType asType = asHex ? kHex_SkScalarAsStringType : kDec_SkScalarAsStringType;
+
+    SkString line;
+    if (asHex) {
+        SkString tmp;
+        line.printf( "SkRect::MakeLTRB(%s, /* %f */\n", set_scalar(&tmp, fLeft, asType), fLeft);
+        line.appendf("                 %s, /* %f */\n", set_scalar(&tmp, fTop, asType), fTop);
+        line.appendf("                 %s, /* %f */\n", set_scalar(&tmp, fRight, asType), fRight);
+        line.appendf("                 %s  /* %f */);", set_scalar(&tmp, fBottom, asType), fBottom);
+    } else {
+        SkString strL, strT, strR, strB;
+        SkAppendScalarDec(&strL, fLeft);
+        SkAppendScalarDec(&strT, fTop);
+        SkAppendScalarDec(&strR, fRight);
+        SkAppendScalarDec(&strB, fBottom);
+        line.printf("SkRect::MakeLTRB(%s, %s, %s, %s);",
+                    strL.c_str(), strT.c_str(), strR.c_str(), strB.c_str());
+    }
+    return line;
+}
+
+void SkRect::dump(bool asHex) const {
+    SkDebugf("%s\n", this->dumpToString(asHex).c_str());
+}
+
+
+template<typename R>
+static bool subtract(const R& a, const R& b, R* out) {
+    if (a.isEmpty() || b.isEmpty() || !R::Intersects(a, b)) {
+        *out = a;
+        return true;
+    }
+
+    float aHeight = (float) a.height();
+    float aWidth = (float) a.width();
+    float leftArea = 0.f, rightArea = 0.f, topArea = 0.f, bottomArea = 0.f;
+    int positiveCount = 0;
+    if (b.fLeft > a.fLeft) {
+        leftArea = (b.fLeft - a.fLeft) / aWidth;
+        positiveCount++;
+    }
+    if (a.fRight > b.fRight) {
+        rightArea = (a.fRight - b.fRight) / aWidth;
+        positiveCount++;
+    }
+    if (b.fTop > a.fTop) {
+        topArea = (b.fTop - a.fTop) / aHeight;
+        positiveCount++;
+    }
+    if (a.fBottom > b.fBottom) {
+        bottomArea = (a.fBottom - b.fBottom) / aHeight;
+        positiveCount++;
+    }
+
+    if (positiveCount == 0) {
+        SkASSERT(b.contains(a));
+        *out = R::MakeEmpty();
+        return true;
+    }
+
+    *out = a;
+    if (leftArea > rightArea && leftArea > topArea && leftArea > bottomArea) {
+        out->fRight = b.fLeft;
+    } else if (rightArea > topArea && rightArea > bottomArea) {
+        out->fLeft = b.fRight;
+    } else if (topArea > bottomArea) {
+        out->fBottom = b.fTop;
+    } else {
+        SkASSERT(bottomArea > 0.f);
+        out->fTop = b.fBottom;
+    }
+
+    SkASSERT(!R::Intersects(*out, b));
+    return positiveCount == 1;
+}
+
+bool SkRectPriv::Subtract(const SkRect& a, const SkRect& b, SkRect* out) {
+    return subtract<SkRect>(a, b, out);
+}
+
+bool SkRectPriv::Subtract(const SkIRect& a, const SkIRect& b, SkIRect* out) {
+    return subtract<SkIRect>(a, b, out);
+}
+
+
+bool SkRectPriv::QuadContainsRect(const SkMatrix& m,
+                                  const SkIRect& a,
+                                  const SkIRect& b,
+                                  float tol) {
+    return QuadContainsRect(SkM44(m), SkRect::Make(a), SkRect::Make(b), tol);
+}
+
+bool SkRectPriv::QuadContainsRect(const SkM44& m, const SkRect& a, const SkRect& b, float tol) {
+    return all(QuadContainsRectMask(m, a, b, tol));
+}
+
+skvx::int4 SkRectPriv::QuadContainsRectMask(const SkM44& m,
+                                            const SkRect& a,
+                                            const SkRect& b,
+                                            float tol) {
+    SkDEBUGCODE(SkM44 inverse;)
+    SkASSERT(m.invert(&inverse));
+    if (a.isEmpty()) {
+        return skvx::int4(0); 
+    }
+
+    auto ax = skvx::float4{a.fLeft, a.fRight, a.fRight, a.fLeft};
+    auto ay = skvx::float4{a.fTop, a.fTop, a.fBottom, a.fBottom};
+
+    auto max = m.rc(0,0)*ax + m.rc(0,1)*ay + m.rc(0,3);
+    auto may = m.rc(1,0)*ax + m.rc(1,1)*ay + m.rc(1,3);
+    auto maw = m.rc(3,0)*ax + m.rc(3,1)*ay + m.rc(3,3);
+
+    if (all(maw < 0.f)) {
+        return skvx::int4(0); 
+    }
+
+    auto lA = may*skvx::shuffle<1,2,3,0>(maw) - maw*skvx::shuffle<1,2,3,0>(may);
+    auto lB = maw*skvx::shuffle<1,2,3,0>(max) - max*skvx::shuffle<1,2,3,0>(maw);
+    auto lC = max*skvx::shuffle<1,2,3,0>(may) - may*skvx::shuffle<1,2,3,0>(max);
+
+    float sign = (lA[0]*lB[1] - lB[0]*lA[1]) < 0 ? -1.f : 1.f;
+
+    SkRect bInset = b.makeInset(tol, tol);
+    auto d0 = sign * (lA*bInset.fLeft  + lB*bInset.fTop    + lC);
+    auto d1 = sign * (lA*bInset.fRight + lB*bInset.fTop    + lC);
+    auto d2 = sign * (lA*bInset.fRight + lB*bInset.fBottom + lC);
+    auto d3 = sign * (lA*bInset.fLeft  + lB*bInset.fBottom + lC);
+
+    return (d0 >= 0.f) & (d1 >= 0.f) & (d2 >= 0.f) & (d3 >= 0.f);
+}
+
+SkIRect SkRectPriv::ClosestDisjointEdge(const SkIRect& src, const SkIRect& dst) {
+    if (src.isEmpty() || dst.isEmpty()) {
+        return SkIRect::MakeEmpty();
+    }
+
+    int l = src.fLeft;
+    int r = src.fRight;
+    if (r <= dst.fLeft) {
+        l = r - 1;
+    } else if (l >= dst.fRight) {
+        r = l + 1;
+    } else {
+        l = SkTPin(l, dst.fLeft, dst.fRight);
+        r = SkTPin(r, dst.fLeft, dst.fRight);
+    }
+
+    int t = src.fTop;
+    int b = src.fBottom;
+    if (b <= dst.fTop) {
+        t = b - 1;
+    } else if (t >= dst.fBottom) {
+        b = t + 1;
+    } else {
+        t = SkTPin(t, dst.fTop, dst.fBottom);
+        b = SkTPin(b, dst.fTop, dst.fBottom);
+    }
+
+    return SkIRect::MakeLTRB(l,t,r,b);
+}

@@ -1,0 +1,33 @@
+
+[package]
+edition = "2018"
+rust-version = "1.48.0"
+name = "base64"
+version = "0.22.1"
+authors = ["Marshall Pierce <marshall@mpierce.org>"]
+description = "encodes and decodes base64 as bytes or utf8"
+documentation = "https://docs.rs/base64"
+keywords = [
+    "base64",
+    "utf8",
+    "encode",
+    "decode",
+    "no_std",
+]
+categories = ["encoding"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/marshallpierce/rust-base64"
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--generate-link-to-definition"]
+
+[profile.bench]
+debug = 2
+
+[profile.test]
+opt-level = 3
+
+[features]
+alloc = []
+default = ["std"]
+std = ["alloc"]

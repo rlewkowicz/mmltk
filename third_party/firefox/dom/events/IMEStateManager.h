@@ -1,0 +1,272 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(mozilla_IMEStateManager_h_)
+#define mozilla_IMEStateManager_h_
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/dom/BrowserParent.h"
+#include "nsIWidget.h"
+
+class nsIContent;
+class nsINode;
+class nsIURI;
+class nsPresContext;
+
+namespace mozilla {
+
+class EditorBase;
+class EventDispatchingCallback;
+class IMEContentObserver;
+class PseudoFocusChangeRunnable;
+class TextCompositionArray;
+class TextComposition;
+
+namespace dom {
+class Element;
+class Selection;
+}  
+
+
+class IMEStateManager {
+  using BrowserParent = dom::BrowserParent;
+  using IMEMessage = widget::IMEMessage;
+  using IMENotification = widget::IMENotification;
+  using IMEState = widget::IMEState;
+  using InputContext = widget::InputContext;
+  using InputContextAction = widget::InputContextAction;
+
+ public:
+  static void Init();
+  static void Shutdown();
+
+  static BrowserParent* GetActiveBrowserParent() {
+    if (sInstalledMenuKeyboardListener) {
+      return nullptr;
+    }
+    if (sFocusedIMEBrowserParent) {
+      return sFocusedIMEBrowserParent;
+    }
+    return BrowserParent::GetFocused();
+  }
+
+  static bool DoesBrowserParentHaveIMEFocus(
+      const BrowserParent* aBrowserParent) {
+    MOZ_ASSERT(aBrowserParent);
+    return sFocusedIMEBrowserParent == aBrowserParent;
+  }
+
+  static bool CanSendNotificationToWidget() {
+    return !sCleaningUpForStoppingIMEStateManagement;
+  }
+
+  static void OnFocusMovedBetweenBrowsers(BrowserParent* aBlur,
+                                          BrowserParent* aFocus);
+
+  static void WidgetDestroyed(nsIWidget* aWidget);
+
+  static void WidgetOnQuit(nsIWidget* aWidget);
+
+  static nsIWidget* GetWidgetForActiveInputContext() {
+    return sActiveInputContextWidget;
+  }
+
+  static nsIWidget* GetWidgetForTextInputHandling() {
+    return sTextInputHandlingWidget;
+  }
+
+  static void SetInputContextForChildProcess(BrowserParent* aBrowserParent,
+                                             const InputContext& aInputContext,
+                                             const InputContextAction& aAction);
+
+  static void StopIMEStateManagement();
+
+  static void MaybeStartOffsetUpdatedInChild(nsIWidget* aWidget,
+                                             uint32_t aStartOffset);
+
+  MOZ_CAN_RUN_SCRIPT static nsresult OnDestroyPresContext(
+      nsPresContext& aPresContext);
+  MOZ_CAN_RUN_SCRIPT static nsresult OnRemoveContent(
+      nsPresContext& aPresContext, dom::Element& aElement);
+  MOZ_CAN_RUN_SCRIPT static void OnParentChainChangedOfObservingElement(
+      IMEContentObserver& aObserver, nsIContent& aContent);
+
+  MOZ_CAN_RUN_SCRIPT static void OnUpdateHTMLEditorRootElement(
+      HTMLEditor& aHTMLEditor, dom::Element* aNewRootElement);
+
+  MOZ_CAN_RUN_SCRIPT static nsresult OnChangeFocus(
+      nsPresContext* aPresContext, dom::Element* aElement,
+      InputContextAction::Cause aCause);
+
+  MOZ_CAN_RUN_SCRIPT static void OnInstalledMenuKeyboardListener(
+      bool aInstalling);
+
+
+  static nsresult GetFocusSelectionAndRootElement(dom::Selection** aSel,
+                                                  dom::Element** aRootElement);
+  enum class UpdateIMEStateOption {
+    ForceUpdate,
+    DontCommitComposition,
+  };
+  using UpdateIMEStateOptions = EnumSet<UpdateIMEStateOption, uint32_t>;
+  MOZ_CAN_RUN_SCRIPT static void UpdateIMEState(
+      const IMEState& aNewIMEState, dom::Element* aElement,
+      EditorBase& aEditorBase, const UpdateIMEStateOptions& aOptions = {});
+
+  MOZ_CAN_RUN_SCRIPT static bool OnMouseButtonEventInEditor(
+      nsPresContext& aPresContext, dom::Element* aElement,
+      WidgetMouseEvent& aMouseEvent);
+
+  MOZ_CAN_RUN_SCRIPT static void OnClickInEditor(
+      nsPresContext& aPresContext, dom::Element* aElement,
+      const WidgetMouseEvent& aMouseEvent);
+
+  static void OnFocusInEditor(nsPresContext& aPresContext,
+                              dom::Element* aElement, EditorBase& aEditorBase);
+
+  static void OnEditorInitialized(EditorBase& aEditorBase);
+
+  static void OnEditorDestroying(EditorBase& aEditorBase);
+
+  MOZ_CAN_RUN_SCRIPT static void OnReFocus(nsPresContext& aPresContext,
+                                           dom::Element& aElement);
+
+  MOZ_CAN_RUN_SCRIPT static void MaybeOnEditableStateDisabled(
+      nsPresContext& aPresContext, dom::Element* aElement);
+
+  MOZ_CAN_RUN_SCRIPT static void DispatchCompositionEvent(
+      nsINode* aEventTargetNode, nsPresContext* aPresContext,
+      BrowserParent* aBrowserParent, WidgetCompositionEvent* aCompositionEvent,
+      nsEventStatus* aStatus, EventDispatchingCallback* aCallBack,
+      bool aIsSynthesized = false);
+
+  MOZ_CAN_RUN_SCRIPT
+  static void HandleSelectionEvent(nsPresContext* aPresContext,
+                                   nsIContent* aEventTargetContent,
+                                   WidgetSelectionEvent* aSelectionEvent);
+
+  static void OnCompositionEventDiscarded(
+      WidgetCompositionEvent* aCompositionEvent);
+
+  static TextComposition* GetTextCompositionFor(nsIWidget* aWidget);
+
+  static TextComposition* GetTextCompositionFor(
+      const WidgetCompositionEvent* aCompositionEvent);
+
+  static TextComposition* GetTextCompositionFor(nsPresContext* aPresContext);
+
+  static nsresult NotifyIME(const IMENotification& aNotification,
+                            nsIWidget* aWidget,
+                            BrowserParent* aBrowserParent = nullptr);
+  static nsresult NotifyIME(IMEMessage aMessage, nsIWidget* aWidget,
+                            BrowserParent* aBrowserParent = nullptr);
+  static nsresult NotifyIME(IMEMessage aMessage, nsPresContext* aPresContext,
+                            BrowserParent* aBrowserParent = nullptr);
+
+  static IMEContentObserver* GetActiveContentObserver();
+
+  static dom::Element* GetFocusedElement();
+
+ protected:
+  MOZ_CAN_RUN_SCRIPT static nsresult OnChangeFocusInternal(
+      nsPresContext* aPresContext, dom::Element* aElement,
+      InputContextAction aAction);
+  MOZ_CAN_RUN_SCRIPT static void SetIMEState(const IMEState& aState,
+                                             const nsPresContext* aPresContext,
+                                             dom::Element* aElement,
+                                             nsIWidget& aWidget,
+                                             InputContextAction aAction,
+                                             InputContext::Origin aOrigin);
+  static void SetInputContext(nsIWidget& aWidget,
+                              const InputContext& aInputContext,
+                              const InputContextAction& aAction);
+  static IMEState GetNewIMEState(const nsPresContext& aPresContext,
+                                 dom::Element* aElement);
+
+  static already_AddRefed<nsIURI> GetExposableURL(
+      const nsPresContext* aPresContext);
+
+  static void EnsureTextCompositionArray();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY static void CreateIMEContentObserver(
+      EditorBase& aEditorBase, dom::Element* aFocusedElement);
+
+  [[nodiscard]] static bool IsFocusedElement(
+      const nsPresContext& aPresContext, const dom::Element* aFocusedElement);
+
+  static void DestroyIMEContentObserver();
+
+  [[nodiscard]] static bool IsIMEObserverNeeded(const IMEState& aState);
+
+  [[nodiscard]] static nsIContent* GetRootContent(nsPresContext* aPresContext);
+
+  [[nodiscard]] static bool CanHandleWith(const nsPresContext* aPresContext);
+
+  static void ResetActiveChildInputContext();
+
+  static bool HasActiveChildSetInputContext();
+
+  MOZ_CAN_RUN_SCRIPT static void SetMenubarPseudoFocus(
+      PseudoFocusChangeRunnable* aCaller, bool aSetPseudoFocus,
+      nsPresContext* aFocusedPresContextAtRequested);
+
+  static StaticRefPtr<dom::Element> sFocusedElement;
+  static StaticRefPtr<nsPresContext> sFocusedPresContext;
+  static nsIWidget* sTextInputHandlingWidget;
+  static nsIWidget* sFocusedIMEWidget;
+  static StaticRefPtr<BrowserParent> sFocusedIMEBrowserParent;
+  static nsIWidget* sActiveInputContextWidget;
+  static StaticRefPtr<IMEContentObserver> sActiveIMEContentObserver;
+
+  static TextCompositionArray* sTextCompositions;
+
+  static InputContext::Origin sOrigin;
+
+  static InputContext sActiveChildInputContext;
+
+  static bool sInstalledMenuKeyboardListener;
+
+  static bool sIsGettingNewIMEState;
+  static bool sCheckForIMEUnawareWebApps;
+
+  static bool sCleaningUpForStoppingIMEStateManagement;
+
+  static bool sIsActive;
+
+  struct PendingFocusedBrowserSwitchingData final {
+    RefPtr<BrowserParent> mBrowserParentBlurred;
+    RefPtr<BrowserParent> mBrowserParentFocused;
+
+    PendingFocusedBrowserSwitchingData() = delete;
+    explicit PendingFocusedBrowserSwitchingData(BrowserParent* aBlur,
+                                                BrowserParent* aFocus)
+        : mBrowserParentBlurred(aBlur), mBrowserParentFocused(aFocus) {}
+  };
+  static Maybe<PendingFocusedBrowserSwitchingData>
+      sPendingFocusedBrowserSwitchingData;
+
+  class MOZ_STACK_CLASS GettingNewIMEStateBlocker final {
+   public:
+    GettingNewIMEStateBlocker()
+        : mOldValue(IMEStateManager::sIsGettingNewIMEState) {
+      IMEStateManager::sIsGettingNewIMEState = true;
+    }
+    ~GettingNewIMEStateBlocker() {
+      IMEStateManager::sIsGettingNewIMEState = mOldValue;
+    }
+
+   private:
+    bool mOldValue;
+  };
+
+  static StaticRefPtr<PseudoFocusChangeRunnable> sPseudoFocusChangeRunnable;
+  friend class PseudoFocusChangeRunnable;
+};
+
+}  
+
+#endif

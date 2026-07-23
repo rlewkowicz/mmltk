@@ -1,0 +1,166 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef AudioPacketizer_h_
+#define AudioPacketizer_h_
+
+#include <AudioSampleFormat.h>
+#include <mozilla/Assertions.h>
+#include <mozilla/Casting.h>
+#include <mozilla/CheckedInt.h>
+#include <mozilla/PodOperations.h>
+#include <mozilla/UniquePtr.h>
+#include <mozilla/UniquePtrExtensions.h>
+
+#include "nsDebug.h"
+#include "nsError.h"
+
+
+namespace mozilla {
+template <typename InputType, typename OutputType>
+class AudioPacketizer {
+ public:
+  AudioPacketizer(uint32_t aPacketSize, uint32_t aChannels)
+      : mPacketSize(aPacketSize),
+        mChannels(aChannels),
+        mReadIndex(0),
+        mWriteIndex(0),
+        mStorage(new InputType[aPacketSize * aChannels]),
+        mLength(aPacketSize * aChannels) {
+    MOZ_ASSERT(aPacketSize > 0 && aChannels > 0,
+               "The packet size and the number of channel should be strictly "
+               "positive");
+  }
+
+  [[nodiscard]] nsresult Input(const InputType* aFrames, uint32_t aFrameCount) {
+    CheckedUint32 inputSamples = CheckedUint32(aFrameCount) * mChannels;
+    if (!inputSamples.isValid()) {
+      NS_WARNING("AudioPacketizer::Input: frame count too large to buffer");
+      return NS_ERROR_DOM_MEDIA_OVERFLOW_ERR;
+    }
+    if (inputSamples.value() > EmptySlots()) {
+      CheckedUint32 newLength =
+          CheckedUint32(AvailableSamples()) + inputSamples;
+      if (!newLength.isValid()) {
+        NS_WARNING("AudioPacketizer::Input: buffer size too large to grow");
+        return NS_ERROR_DOM_MEDIA_OVERFLOW_ERR;
+      }
+      UniquePtr<InputType[]> newStorage =
+          mozilla::MakeUniqueFallible<InputType[]>(newLength.value());
+      if (!newStorage) {
+        NS_WARNING("AudioPacketizer::Input: buffer allocation failed");
+        return NS_ERROR_OUT_OF_MEMORY;
+      }
+      if (WriteIndex() >= ReadIndex()) {
+        PodCopy(newStorage.get(), mStorage.get() + ReadIndex(),
+                AvailableSamples());
+      } else {
+        uint32_t firstPartLength = mLength - ReadIndex();
+        uint32_t secondPartLength = AvailableSamples() - firstPartLength;
+        PodCopy(newStorage.get(), mStorage.get() + ReadIndex(),
+                firstPartLength);
+        PodCopy(newStorage.get() + firstPartLength, mStorage.get(),
+                secondPartLength);
+      }
+      mStorage = std::move(newStorage);
+      mWriteIndex -= mReadIndex;
+      mReadIndex = 0;
+      mLength = newLength.value();
+    }
+
+    if (WriteIndex() + inputSamples.value() <= mLength) {
+      PodCopy(mStorage.get() + WriteIndex(), aFrames, inputSamples.value());
+    } else {
+      uint32_t firstPartLength = mLength - WriteIndex();
+      uint32_t secondPartLength = inputSamples.value() - firstPartLength;
+      PodCopy(mStorage.get() + WriteIndex(), aFrames, firstPartLength);
+      PodCopy(mStorage.get(), aFrames + firstPartLength, secondPartLength);
+    }
+
+    mWriteIndex += inputSamples.value();
+    return NS_OK;
+  }
+
+  OutputType* Output() {
+    uint32_t samplesNeeded = mPacketSize * mChannels;
+    OutputType* out = new OutputType[samplesNeeded];
+
+    Output(out);
+
+    return out;
+  }
+
+  size_t Output(OutputType* aOutputBuffer) {
+    uint32_t samplesNeeded = mPacketSize * mChannels;
+    size_t rv = 0;
+
+    if (AvailableSamples() < samplesNeeded) {
+      rv = AvailableSamples() / mChannels;
+#ifdef LOG_PACKETIZER_UNDERRUN
+      char buf[256];
+      snprintf(buf, 256,
+               "AudioPacketizer %p underrun: available: %u, needed: %u\n", this,
+               AvailableSamples(), samplesNeeded);
+      NS_WARNING(buf);
+#endif
+      uint32_t zeros = samplesNeeded - AvailableSamples();
+      PodZero(aOutputBuffer + AvailableSamples(), zeros);
+      samplesNeeded -= zeros;
+    } else {
+      rv = mPacketSize;
+    }
+    if (ReadIndex() + samplesNeeded <= mLength) {
+      ConvertAudioSamples<InputType, OutputType>(mStorage.get() + ReadIndex(),
+                                                 aOutputBuffer, samplesNeeded);
+    } else {
+      uint32_t firstPartLength = mLength - ReadIndex();
+      uint32_t secondPartLength = samplesNeeded - firstPartLength;
+      ConvertAudioSamples<InputType, OutputType>(
+          mStorage.get() + ReadIndex(), aOutputBuffer, firstPartLength);
+      ConvertAudioSamples<InputType, OutputType>(
+          mStorage.get(), aOutputBuffer + firstPartLength, secondPartLength);
+    }
+    mReadIndex += samplesNeeded;
+    return rv;
+  }
+
+  void Clear() {
+    mReadIndex = 0;
+    mWriteIndex = 0;
+  }
+
+  uint32_t PacketsAvailable() const {
+    return AvailableSamples() / mChannels / mPacketSize;
+  }
+
+  uint32_t FramesAvailable() const { return AvailableSamples() / mChannels; }
+
+  bool Empty() const { return mWriteIndex == mReadIndex; }
+
+  bool Full() const { return mWriteIndex - mReadIndex == mLength; }
+
+  const uint32_t mPacketSize;
+  const uint32_t mChannels;
+
+ private:
+  uint32_t ReadIndex() const { return mReadIndex % mLength; }
+
+  uint32_t WriteIndex() const { return mWriteIndex % mLength; }
+
+  uint32_t AvailableSamples() const {
+    MOZ_DIAGNOSTIC_ASSERT(mWriteIndex >= mReadIndex);
+    return AssertedCast<uint32_t>(mWriteIndex - mReadIndex);
+  }
+
+  uint32_t EmptySlots() const { return mLength - AvailableSamples(); }
+
+  uint64_t mReadIndex;
+  uint64_t mWriteIndex;
+  mozilla::UniquePtr<InputType[]> mStorage;
+  uint32_t mLength;
+};
+
+}  
+
+#endif  // AudioPacketizer_h_

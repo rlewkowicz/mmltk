@@ -1,0 +1,1203 @@
+/*
+ * Copyright 2016 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "wasm/WasmPI.h"
+
+#include "jsfriendapi.h"
+#include "builtin/Promise.h"
+#include "debugger/DebugAPI.h"
+#include "debugger/Debugger.h"
+#include "jit/MIRGenerator.h"
+#include "js/CallAndConstruct.h"
+#include "js/Printf.h"
+#include "js/Wrapper.h"
+#include "vm/Compartment.h"
+#include "vm/Iteration.h"
+#include "vm/JSContext.h"
+#include "vm/JSFunction.h"
+#include "vm/JSObject.h"
+#include "vm/NativeObject.h"
+#include "vm/PromiseObject.h"
+#include "wasm/WasmAnyRef.h"
+#include "wasm/WasmConstants.h"
+#include "wasm/WasmContext.h"
+#include "wasm/WasmFeatures.h"
+#include "wasm/WasmGcObject.h"
+#include "wasm/WasmGenerator.h"
+#include "wasm/WasmIonCompile.h"  // IonPlatformSupport
+#include "wasm/WasmJS.h"
+#include "wasm/WasmStacks.h"
+#include "wasm/WasmValidate.h"
+
+#include "vm/Compartment-inl.h"
+#include "vm/JSObject-inl.h"
+#include "wasm/WasmGcObject-inl.h"
+#include "wasm/WasmInstance-inl.h"
+
+using namespace js;
+using namespace js::jit;
+
+#ifdef ENABLE_WASM_JSPI
+namespace js::wasm {
+
+const size_t WRAPPED_FN_SLOT = 0;
+
+const size_t CONT_SLOT = 0;
+const size_t REACTION_SLOT = 1;
+const size_t PROMISING_PROMISE_SLOT = 2;
+
+
+class SuspendingFunctionModuleFactory {
+ public:
+  enum TypeIdx {
+    ResultsTypeIndex,
+    TagFuncTypeIndex,
+    Count,
+  };
+
+  enum TagIdx {
+    OnSuspendTagIndex,
+  };
+
+  enum FnIdx {
+    WrappedFnIndex,
+    ExportedFnIndex,
+  };
+
+  uint32_t baseTypeIndex_ = 0;
+
+ private:
+  bool encodeExportedFunction(CodeMetadata& codeMeta, uint32_t paramsSize,
+                              uint32_t resultSize, uint32_t paramsOffset,
+                              RefType resultType, Bytes& bytecode) {
+    Encoder encoder(bytecode, *codeMeta.types);
+
+    const uint32_t promiseIndex = paramsSize;
+    const uint32_t resultsIndex = paramsSize + 1;
+
+    ValTypeVector locals;
+    if (!locals.emplaceBack(RefType::extern_()) ||
+        !locals.emplaceBack(resultType)) {
+      return false;
+    }
+    if (!EncodeLocalEntries(encoder, locals)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Opcode(MozOp::GuardSuspending)) ||
+        !encoder.writeVarU32(OnSuspendTagIndex)) {
+      return false;
+    }
+
+    for (uint32_t i = 0; i < paramsSize; i++) {
+      if (!encoder.writeOp(Op::LocalGet) ||
+          !encoder.writeVarU32(i + paramsOffset)) {
+        return false;
+      }
+    }
+    if (!encoder.writeOp(Op::Call) || !encoder.writeVarU32(WrappedFnIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(MozOp::CallBuiltinModuleFunc) ||
+        !encoder.writeVarU32((uint32_t)BuiltinModuleFuncId::PromiseResolve)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::LocalTee) || !encoder.writeVarU32(promiseIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::Suspend) ||
+        !encoder.writeVarU32(OnSuspendTagIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::LocalGet) || !encoder.writeVarU32(promiseIndex)) {
+      return false;
+    }
+    if (!encoder.writeOp(Op::I32Const) ||
+        !encoder.writeVarS32(int32_t(baseTypeIndex_ + ResultsTypeIndex))) {
+      return false;
+    }
+    if (!encoder.writeOp(MozOp::CallBuiltinModuleFunc) ||
+        !encoder.writeVarU32(
+            (uint32_t)BuiltinModuleFuncId::GetPromiseResults)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(GcOp::RefCast) ||
+        !encoder.writeVarS32(baseTypeIndex_ + ResultsTypeIndex) ||
+        !encoder.writeOp(Op::LocalSet) || !encoder.writeVarU32(resultsIndex)) {
+      return false;
+    }
+
+    for (uint32_t i = 0; i < resultSize; i++) {
+      if (!encoder.writeOp(Op::LocalGet) ||
+          !encoder.writeVarU32(resultsIndex) ||
+          !encoder.writeOp(GcOp::StructGet) ||
+          !encoder.writeVarU32(baseTypeIndex_ + ResultsTypeIndex) ||
+          !encoder.writeVarU32(i)) {
+        return false;
+      }
+    }
+
+    return encoder.writeOp(Op::End);
+  }
+
+ public:
+  SharedModule build(JSContext* cx, HandleObject func,
+                     const SharedTypeContext& foreignTypes,
+                     uint32_t funcTypeIndex) {
+    FeatureOptions options;
+    options.isBuiltinModule = true;
+
+    SharedCompileArgs compileArgs = CompileArgs::buildAndReport(
+        cx, ScriptedCaller::selfHosted(cx), options);
+    if (!compileArgs) {
+      return nullptr;
+    }
+
+    MutableModuleMetadata moduleMeta = js_new<ModuleMetadata>();
+    if (!moduleMeta || !moduleMeta->init(*compileArgs)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    MutableCodeMetadata codeMeta = moduleMeta->codeMeta;
+
+    codeMeta->funcImportsAreJS = true;
+
+    MOZ_ASSERT(IonPlatformSupport());
+    CompilerEnvironment compilerEnv(CompileMode::Once, Tier::Optimized,
+                                    DebugEnabled::False);
+    compilerEnv.computeParameters();
+
+    if (!codeMeta->types->clone(*foreignTypes)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    baseTypeIndex_ = codeMeta->types->length();
+
+    if (codeMeta->types->length() > MaxTypes - TypeIdx::Count) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    const FuncType& importFuncType =
+        codeMeta->types->type(funcTypeIndex).funcType();
+    ValTypeVector params, results;
+    if (!params.append(importFuncType.args().begin(),
+                       importFuncType.args().end()) ||
+        !results.append(importFuncType.results().begin(),
+                        importFuncType.results().end())) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    const size_t resultsSize = results.length();
+    const size_t paramsSize = params.length();
+    const size_t paramsOffset = 0;
+
+    StructType boxedResultType;
+    if (!StructType::createImmutable(results, &boxedResultType)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    MOZ_ASSERT(codeMeta->types->length() == baseTypeIndex_ + ResultsTypeIndex);
+    if (!codeMeta->types->addType(std::move(boxedResultType))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    ValTypeVector tagParams, tagResults;
+    if (!tagParams.emplaceBack(RefType::extern_())) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    MOZ_ASSERT(codeMeta->types->length() == baseTypeIndex_ + TagFuncTypeIndex);
+    if (!codeMeta->types->addType(
+            FuncType(std::move(tagParams), std::move(tagResults)))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    MutableTagType tagType = js_new<TagType>();
+    if (!tagType || !tagType->initialize(&(
+                        *codeMeta->types)[baseTypeIndex_ + TagFuncTypeIndex])) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    if (!codeMeta->tags.emplaceBack(TagKind::Exception, tagType)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    ValTypeVector wrappedParams, wrappedResults;
+    if (!wrappedParams.append(params.begin(), params.end()) ||
+        !wrappedResults.emplaceBack(RefType::extern_())) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    MOZ_ASSERT(codeMeta->funcs.length() == WrappedFnIndex);
+    if (!moduleMeta->addDefinedFunc(std::move(wrappedParams),
+                                    std::move(wrappedResults))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    codeMeta->numFuncImports = codeMeta->funcs.length();
+
+    MOZ_ASSERT(codeMeta->funcs.length() == ExportedFnIndex);
+    MOZ_ASSERT(funcTypeIndex < baseTypeIndex_);
+    MOZ_ASSERT((*codeMeta->types)[funcTypeIndex].isFuncType());
+    if (!moduleMeta->addDefinedFuncWithType(funcTypeIndex,
+                                             true,
+                                            mozilla::Some(CacheableName()))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    if (!moduleMeta->prepareForCompile(compilerEnv.mode())) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    ModuleGenerator mg(*codeMeta, compilerEnv, compilerEnv.initialState(),
+                       nullptr, nullptr, nullptr);
+    if (!mg.initializeCompleteTier()) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    uint32_t funcBytecodeOffset = CallSite::FIRST_VALID_BYTECODE_OFFSET;
+    Bytes bytecode;
+    if (!encodeExportedFunction(
+            *codeMeta, paramsSize, resultsSize, paramsOffset,
+            RefType::fromTypeDef(
+                &(*codeMeta->types)[baseTypeIndex_ + ResultsTypeIndex], false),
+            bytecode)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    if (!mg.compileFuncDef(ExportedFnIndex, funcBytecodeOffset,
+                           bytecode.begin(),
+                           bytecode.begin() + bytecode.length())) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    if (!mg.finishFuncDefs()) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    SharedModule module =
+        mg.finishModule(BytecodeBufferOrSource(), *moduleMeta,
+                        nullptr);
+    if (!module) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    return module;
+  }
+};
+
+JSFunction* WasmSuspendingFunctionCreate(JSContext* cx, HandleObject func,
+                                         uint32_t funcTypeIndex,
+                                         const SharedTypeContext& typeContext) {
+  if (!JSPromiseIntegrationAvailable(cx)) {
+    JS_ReportErrorASCII(cx, "JS-PI is not enabled");
+    return nullptr;
+  }
+
+  MOZ_ASSERT(IsCallable(ObjectValue(*func)) &&
+             !IsCrossCompartmentWrapper(func));
+
+  SuspendingFunctionModuleFactory moduleFactory;
+  SharedModule module =
+      moduleFactory.build(cx, func, typeContext, funcTypeIndex);
+  if (!module) {
+    return nullptr;
+  }
+
+  Rooted<ImportValues> imports(cx);
+
+  if (!imports.get().funcs.append(func)) {
+    ReportOutOfMemory(cx);
+    return nullptr;
+  }
+
+  Rooted<WasmNamespaceObject*> wasmNamespace(
+      cx, WasmNamespaceObject::getOrCreate(cx));
+  if (!wasmNamespace) {
+    ReportOutOfMemory(cx);
+    return nullptr;
+  }
+  if (!imports.get().tagObjs.append(wasmNamespace->jsPromiseTag())) {
+    ReportOutOfMemory(cx);
+    return nullptr;
+  }
+
+  Rooted<WasmInstanceObject*> instance(cx);
+  if (!module->instantiate(cx, imports.get(), nullptr, &instance)) {
+    return nullptr;
+  }
+
+  RootedFunction wasmFunc(cx);
+  if (!WasmInstanceObject::getExportedFunction(
+          cx, instance, SuspendingFunctionModuleFactory::ExportedFnIndex,
+          &wasmFunc)) {
+    return nullptr;
+  }
+  return wasmFunc;
+}
+
+
+class PromisingFunctionModuleFactory {
+  uint32_t baseTypeIndex_ = 0;
+
+ public:
+  enum TypeIdx {
+    ParamsTypeIndex = 0,
+    ResultsTypeIndex = 1,
+    TrampolineFuncTypeIndex = 3,
+    ContTypeIndex = 5,
+    TagFuncTypeIndex = 6,
+    SuspendBlockTypeIndex = 7,
+    Count = 9,
+  };
+
+  enum TagIdx {
+    OnSuspendTagIndex,
+  };
+
+  enum GlobalIdx {
+    PromisingPromiseGlobalIndex,
+    ParamsGlobalIndex,
+  };
+
+  enum FnIdx {
+    WrappedFnIndex,
+    ExportedFnIndex,
+    TrampolineFnIndex,
+    ReactionFnIndex,
+  };
+
+ private:
+  bool encodeExportedFunction(CodeMetadata& codeMeta, uint32_t paramsSize,
+                              Bytes& bytecode) {
+    Encoder encoder(bytecode, *codeMeta.types);
+
+    const uint32_t promisingPromiseIndex = paramsSize;
+
+    ValTypeVector locals;
+    if (!locals.emplaceBack(RefType::extern_())) {
+      return false;
+    }
+    if (!EncodeLocalEntries(encoder, locals)) {
+      return false;
+    }
+
+#  ifdef DEBUG
+    if (!encoder.writeOp(Op::GlobalGet) ||
+        !encoder.writeVarU32(PromisingPromiseGlobalIndex)) {
+      return false;
+    }
+    if (!encoder.writeOp(Op::RefIsNull) || !encoder.writeOp(Op::I32Eqz)) {
+      return false;
+    }
+    if (!encoder.writeOp(Op::If) ||
+        !encoder.writeFixedU8((uint8_t)TypeCode::BlockVoid) ||
+        !encoder.writeOp(Op::Unreachable) || !encoder.writeOp(Op::End)) {
+      return false;
+    }
+#  endif
+
+    if (!encoder.writeOp(MozOp::CallBuiltinModuleFunc) ||
+        !encoder.writeVarU32((uint32_t)BuiltinModuleFuncId::CreatePromise)) {
+      return false;
+    }
+    if (!encoder.writeOp(Op::LocalSet) ||
+        !encoder.writeVarU32(promisingPromiseIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::Block) ||
+        !encoder.writeVarS32(int32_t(baseTypeIndex_ + SuspendBlockTypeIndex))) {
+      return false;
+    }
+
+    for (uint32_t i = 0; i < paramsSize; i++) {
+      if (!encoder.writeOp(Op::LocalGet) || !encoder.writeVarU32(i)) {
+        return false;
+      }
+    }
+    if (!encoder.writeOp(GcOp::StructNew) ||
+        !encoder.writeVarU32(baseTypeIndex_ + ParamsTypeIndex)) {
+      return false;
+    }
+    if (!encoder.writeOp(Op::GlobalSet) ||
+        !encoder.writeVarU32(ParamsGlobalIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::LocalGet) ||
+        !encoder.writeVarU32(promisingPromiseIndex)) {
+      return false;
+    }
+    if (!encoder.writeOp(Op::GlobalSet) ||
+        !encoder.writeVarU32(PromisingPromiseGlobalIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::RefFunc) ||
+        !encoder.writeVarU32(TrampolineFnIndex)) {
+      return false;
+    }
+    if (!encoder.writeOp(Op::ContNew) ||
+        !encoder.writeVarU32(baseTypeIndex_ + ContTypeIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::Resume) ||
+        !encoder.writeVarU32(baseTypeIndex_ + ContTypeIndex) ||
+        !encoder.writeVarU32(1) ||
+        !encoder.writeFixedU8(uint8_t(HandlerKind::Suspend)) ||
+        !encoder.writeVarU32(OnSuspendTagIndex) || !encoder.writeVarU32(0)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::LocalGet) ||
+        !encoder.writeVarU32(promisingPromiseIndex)) {
+      return false;
+    }
+    if (!encoder.writeOp(Op::Return)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::End)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::RefFunc) ||
+        !encoder.writeVarU32(ReactionFnIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::LocalGet) ||
+        !encoder.writeVarU32(promisingPromiseIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(MozOp::CallBuiltinModuleFunc) ||
+        !encoder.writeVarU32(
+            (uint32_t)BuiltinModuleFuncId::AddPromiseReactions)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::LocalGet) ||
+        !encoder.writeVarU32(promisingPromiseIndex)) {
+      return false;
+    }
+
+    return encoder.writeOp(Op::End);
+  }
+
+  bool encodeTrampolineFunction(CodeMetadata& codeMeta, uint32_t paramsSize,
+                                Bytes& bytecode) {
+    Encoder encoder(bytecode, *codeMeta.types);
+
+    const uint32_t paramsLocalIndex = 0;
+    const uint32_t promisingPromiseLocalIndex = 1;
+
+    ValTypeVector locals;
+    if (!locals.emplaceBack(RefType::fromTypeDef(
+            &codeMeta.types->type(baseTypeIndex_ + ParamsTypeIndex), true)) ||
+        !locals.emplaceBack(RefType::extern_())) {
+      return false;
+    }
+    if (!EncodeLocalEntries(encoder, locals)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::GlobalGet) ||
+        !encoder.writeVarU32(ParamsGlobalIndex)) {
+      return false;
+    }
+    if (!encoder.writeOp(Op::LocalSet) ||
+        !encoder.writeVarU32(paramsLocalIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::RefNull) ||
+        !encoder.writeVarS32(int32_t(baseTypeIndex_ + ParamsTypeIndex))) {
+      return false;
+    }
+    if (!encoder.writeOp(Op::GlobalSet) ||
+        !encoder.writeVarU32(ParamsGlobalIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::GlobalGet) ||
+        !encoder.writeVarU32(PromisingPromiseGlobalIndex)) {
+      return false;
+    }
+    if (!encoder.writeOp(Op::LocalSet) ||
+        !encoder.writeVarU32(promisingPromiseLocalIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::RefNull) ||
+        !encoder.writeFixedU8(uint8_t(TypeCode::ExternRef))) {
+      return false;
+    }
+    if (!encoder.writeOp(Op::GlobalSet) ||
+        !encoder.writeVarU32(PromisingPromiseGlobalIndex)) {
+      return false;
+    }
+
+    for (uint32_t i = 0; i < paramsSize; i++) {
+      if (!encoder.writeOp(Op::LocalGet) ||
+          !encoder.writeVarU32(paramsLocalIndex)) {
+        return false;
+      }
+      if (!encoder.writeOp(GcOp::StructGet) ||
+          !encoder.writeVarU32(baseTypeIndex_ + ParamsTypeIndex) ||
+          !encoder.writeVarU32(i)) {
+        return false;
+      }
+    }
+
+    if (!encoder.writeOp(Op::RefNull) ||
+        !encoder.writeVarS32(int32_t(baseTypeIndex_ + ParamsTypeIndex))) {
+      return false;
+    }
+    if (!encoder.writeOp(Op::LocalSet) ||
+        !encoder.writeVarU32(paramsLocalIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::Call) || !encoder.writeVarU32(WrappedFnIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(GcOp::StructNew) ||
+        !encoder.writeVarU32(baseTypeIndex_ + ResultsTypeIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::LocalGet) ||
+        !encoder.writeVarU32(promisingPromiseLocalIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(MozOp::CallBuiltinModuleFunc) ||
+        !encoder.writeVarU32(
+            (uint32_t)BuiltinModuleFuncId::ResolvePromiseWithResults)) {
+      return false;
+    }
+
+    return encoder.writeOp(Op::End);
+  }
+
+  bool encodeReactionFunction(CodeMetadata& codeMeta, Bytes& bytecode) {
+    Encoder encoder(bytecode, *codeMeta.types);
+
+    const uint32_t contIndex = 0;
+    const uint32_t promisingPromiseIndex = 1;
+
+    if (!EncodeLocalEntries(encoder, ValTypeVector())) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::Block) ||
+        !encoder.writeVarS32(int32_t(baseTypeIndex_ + SuspendBlockTypeIndex))) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::LocalGet) || !encoder.writeVarU32(contIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::Resume) ||
+        !encoder.writeVarU32(baseTypeIndex_ + ContTypeIndex) ||
+        !encoder.writeVarU32(1) ||
+        !encoder.writeFixedU8(uint8_t(HandlerKind::Suspend)) ||
+        !encoder.writeVarU32(OnSuspendTagIndex) || !encoder.writeVarU32(0)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::Return)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::End)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::RefFunc) ||
+        !encoder.writeVarU32(ReactionFnIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(Op::LocalGet) ||
+        !encoder.writeVarU32(promisingPromiseIndex)) {
+      return false;
+    }
+
+    if (!encoder.writeOp(MozOp::CallBuiltinModuleFunc) ||
+        !encoder.writeVarU32(
+            (uint32_t)BuiltinModuleFuncId::AddPromiseReactions)) {
+      return false;
+    }
+
+    return encoder.writeOp(Op::End);
+  }
+
+ public:
+  SharedModule build(JSContext* cx, HandleFunction fn) {
+    const FuncType& fnType = fn->wasmTypeDef()->funcType();
+    size_t paramsSize = fnType.args().length();
+    uint32_t funcTypeIndex =
+        fn->wasmInstance().codeMeta().funcs[fn->wasmFuncIndex()].typeIndex;
+
+    FeatureOptions options;
+    options.isBuiltinModule = true;
+
+    SharedCompileArgs compileArgs = CompileArgs::buildAndReport(
+        cx, ScriptedCaller::selfHosted(cx), options);
+    if (!compileArgs) {
+      return nullptr;
+    }
+
+    MutableModuleMetadata moduleMeta = js_new<ModuleMetadata>();
+    if (!moduleMeta || !moduleMeta->init(*compileArgs)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    MutableCodeMetadata codeMeta = moduleMeta->codeMeta;
+
+    MOZ_ASSERT(IonPlatformSupport());
+    CompilerEnvironment compilerEnv(CompileMode::Once, Tier::Optimized,
+                                    DebugEnabled::False);
+    compilerEnv.computeParameters();
+
+    const SharedTypeContext& foreignTypes = fn->wasmInstance().codeMeta().types;
+    if (!codeMeta->types->clone(*foreignTypes)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    baseTypeIndex_ = codeMeta->types->length();
+
+    if (codeMeta->types->length() > MaxTypes - TypeIdx::Count) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    StructType boxedParamsStruct;
+    if (!StructType::createImmutable(fnType.args(), &boxedParamsStruct)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    MOZ_ASSERT(codeMeta->types->length() == baseTypeIndex_ + ParamsTypeIndex);
+    if (!codeMeta->types->addType(std::move(boxedParamsStruct))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    StructType boxedResultType;
+    if (!StructType::createImmutable(fnType.results(), &boxedResultType)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    MOZ_ASSERT(codeMeta->types->length() == baseTypeIndex_ + ResultsTypeIndex);
+    if (!codeMeta->types->addType(std::move(boxedResultType))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    MOZ_ASSERT(funcTypeIndex < baseTypeIndex_);
+    MOZ_ASSERT((*codeMeta->types)[funcTypeIndex].isFuncType());
+    MOZ_ASSERT(codeMeta->funcs.length() == WrappedFnIndex);
+    if (!moduleMeta->addDefinedFuncWithType(funcTypeIndex)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    codeMeta->numFuncImports = codeMeta->funcs.length();
+
+    ValTypeVector exportedParams, exportedResults;
+    if (!exportedParams.append(fnType.args().begin(), fnType.args().end()) ||
+        !exportedResults.emplaceBack(RefType::extern_())) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    MOZ_ASSERT(codeMeta->funcs.length() == ExportedFnIndex);
+    if (!moduleMeta->addDefinedFunc(
+            std::move(exportedParams), std::move(exportedResults),
+             true, mozilla::Some(CacheableName()))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    MOZ_ASSERT(codeMeta->types->length() ==
+               baseTypeIndex_ + TrampolineFuncTypeIndex);
+    if (!codeMeta->types->addType(FuncType(ValTypeVector(), ValTypeVector()))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    ValTypeVector trampolineParams, trampolineResults;
+    MOZ_ASSERT(codeMeta->funcs.length() == TrampolineFnIndex);
+    if (!moduleMeta->addDefinedFunc(std::move(trampolineParams),
+                                    std::move(trampolineResults),
+                                     true)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    MOZ_ASSERT(codeMeta->types->length() == baseTypeIndex_ + ContTypeIndex);
+    if (!codeMeta->types->addType(ContType(&codeMeta->types->type(
+            baseTypeIndex_ + TrampolineFuncTypeIndex)))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    ValTypeVector tagParams, tagResults;
+    if (!tagParams.emplaceBack(RefType::extern_())) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    MOZ_ASSERT(codeMeta->types->length() == baseTypeIndex_ + TagFuncTypeIndex);
+    if (!codeMeta->types->addType(
+            FuncType(std::move(tagParams), std::move(tagResults)))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    ValTypeVector suspendBlockParams, suspendBlockResults;
+    if (!suspendBlockResults.emplaceBack(RefType::extern_()) ||
+        !suspendBlockResults.emplaceBack(RefType::fromTypeDef(
+            &codeMeta->types->type(baseTypeIndex_ + ContTypeIndex), false))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    MOZ_ASSERT(codeMeta->types->length() ==
+               baseTypeIndex_ + SuspendBlockTypeIndex);
+    if (!codeMeta->types->addType(FuncType(std::move(suspendBlockParams),
+                                           std::move(suspendBlockResults)))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    ValTypeVector reactionParams, reactionResults;
+    if (!reactionParams.emplaceBack(RefType::fromTypeDef(
+            &codeMeta->types->type(baseTypeIndex_ + ContTypeIndex), true)) ||
+        !reactionParams.emplaceBack(RefType::extern_())) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    MOZ_ASSERT(codeMeta->funcs.length() == ReactionFnIndex);
+    if (!moduleMeta->addDefinedFunc(std::move(reactionParams),
+                                    std::move(reactionResults),
+                                     true)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    MutableTagType tagType = js_new<TagType>();
+    if (!tagType || !tagType->initialize(&(
+                        *codeMeta->types)[baseTypeIndex_ + TagFuncTypeIndex])) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    if (!codeMeta->tags.emplaceBack(TagKind::Exception, tagType)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    if (!codeMeta->globals.append(
+            GlobalDesc(InitExpr(LitVal(ValType(RefType::extern_()))),
+                        true))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    if (!codeMeta->globals.append(GlobalDesc(
+            InitExpr(LitVal(ValType(RefType::fromTypeDef(
+                &codeMeta->types->type(baseTypeIndex_ + ParamsTypeIndex),
+                true)))),
+             true))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    if (!moduleMeta->prepareForCompile(compilerEnv.mode())) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    ModuleGenerator mg(*codeMeta, compilerEnv, compilerEnv.initialState(),
+                       nullptr, nullptr, nullptr);
+    if (!mg.initializeCompleteTier()) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    uint32_t funcBytecodeOffset = CallSite::FIRST_VALID_BYTECODE_OFFSET;
+
+    Bytes bytecode;
+    if (!encodeExportedFunction(*codeMeta, paramsSize, bytecode)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    if (!mg.compileFuncDef(ExportedFnIndex, funcBytecodeOffset,
+                           bytecode.begin(),
+                           bytecode.begin() + bytecode.length())) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    funcBytecodeOffset += bytecode.length();
+
+    Bytes bytecode2;
+    if (!encodeTrampolineFunction(*codeMeta, paramsSize, bytecode2)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    if (!mg.compileFuncDef(TrampolineFnIndex, funcBytecodeOffset,
+                           bytecode2.begin(),
+                           bytecode2.begin() + bytecode2.length())) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    funcBytecodeOffset += bytecode2.length();
+
+    Bytes bytecode3;
+    if (!encodeReactionFunction(*codeMeta, bytecode3)) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    if (!mg.compileFuncDef(ReactionFnIndex, funcBytecodeOffset,
+                           bytecode3.begin(),
+                           bytecode3.begin() + bytecode3.length())) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    if (!mg.finishFuncDefs()) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    SharedModule m = mg.finishModule(BytecodeBufferOrSource(), *moduleMeta,
+                                     nullptr);
+    if (!m) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    return m;
+  }
+};
+
+static bool WasmPromisingFunction(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  Rooted<JSFunction*> callee(cx, &args.callee().as<JSFunction>());
+  RootedFunction fn(
+      cx,
+      &callee->getExtendedSlot(WRAPPED_FN_SLOT).toObject().as<JSFunction>());
+
+  if (Call(cx, UndefinedHandleValue, fn, args, args.rval())) {
+    return true;
+  }
+
+  MOZ_RELEASE_ASSERT(!cx->wasm().currentStack());
+
+  JSObject* newPromise = NewPromiseObject(cx, nullptr);
+  if (!newPromise) {
+    return false;
+  }
+  Rooted<PromiseObject*> promiseObject(cx, &newPromise->as<PromiseObject>());
+  args.rval().setObject(*promiseObject);
+  return RejectPromiseWithPendingError(cx, promiseObject);
+}
+
+JSFunction* WasmPromisingFunctionCreate(JSContext* cx, HandleObject func) {
+  RootedFunction wrappedWasmFunc(cx, &func->as<JSFunction>());
+  MOZ_ASSERT(wrappedWasmFunc->isWasm());
+
+  PromisingFunctionModuleFactory moduleFactory;
+  SharedModule module = moduleFactory.build(cx, wrappedWasmFunc);
+  if (!module) {
+    return nullptr;
+  }
+  Rooted<ImportValues> imports(cx);
+
+  if (!imports.get().funcs.append(func)) {
+    ReportOutOfMemory(cx);
+    return nullptr;
+  }
+
+  Rooted<WasmNamespaceObject*> wasmNamespace(
+      cx, WasmNamespaceObject::getOrCreate(cx));
+  if (!wasmNamespace) {
+    ReportOutOfMemory(cx);
+    return nullptr;
+  }
+  if (!imports.get().tagObjs.append(wasmNamespace->jsPromiseTag())) {
+    ReportOutOfMemory(cx);
+    return nullptr;
+  }
+
+  Rooted<WasmInstanceObject*> instance(cx);
+  if (!module->instantiate(cx, imports.get(), nullptr, &instance)) {
+    MOZ_ASSERT(cx->isThrowingOutOfMemory());
+    return nullptr;
+  }
+
+  RootedFunction wasmFunc(cx);
+  if (!WasmInstanceObject::getExportedFunction(
+          cx, instance, PromisingFunctionModuleFactory::ExportedFnIndex,
+          &wasmFunc)) {
+    return nullptr;
+  }
+
+  RootedFunction wasmFuncWrapper(
+      cx, NewNativeFunction(cx, WasmPromisingFunction, 0, nullptr,
+                            gc::AllocKind::FUNCTION_EXTENDED, GenericObject));
+  if (!wasmFuncWrapper) {
+    return nullptr;
+  }
+  wasmFuncWrapper->initExtendedSlot(WRAPPED_FN_SLOT, ObjectValue(*wasmFunc));
+  return wasmFuncWrapper;
+}
+
+static bool WasmPromiseReaction(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  Rooted<JSFunction*> callee(cx, &args.callee().as<JSFunction>());
+  RootedFunction reactionFunc(
+      cx, &callee->getExtendedSlot(REACTION_SLOT).toObject().as<JSFunction>());
+  Rooted<PromiseObject*> promisingPromiseObject(
+      cx, &callee->getExtendedSlot(PROMISING_PROMISE_SLOT)
+               .toObject()
+               .as<PromiseObject>());
+  JS::RootedValueArray<2> argv(cx);
+  JS::Rooted<JS::Value> rval(cx);
+  argv[0].set(callee->getExtendedSlot(CONT_SLOT));
+  argv[1].set(ObjectValue(*promisingPromiseObject));
+
+  if (Call(cx, UndefinedHandleValue, reactionFunc, argv, &rval)) {
+    return true;
+  }
+
+  MOZ_RELEASE_ASSERT(!cx->wasm().currentStack());
+
+  return RejectPromiseWithPendingError(cx, promisingPromiseObject);
+}
+
+void* CreatePromise(Instance* instance) {
+  MOZ_ASSERT(SASigCreatePromise.failureMode == FailureMode::FailOnNullPtr);
+  JSContext* cx = instance->cx();
+  JSObject* promise = NewPromiseObject(cx, nullptr);
+  if (!promise) {
+    MOZ_ASSERT(cx->isExceptionPending());
+    return nullptr;
+  }
+  return AnyRef::fromJSObject(*promise).forCompiledCode();
+}
+
+void* GetPromiseResults(Instance* instance, void* promiseRef,
+                        uint32_t typeIndex) {
+  MOZ_ASSERT(SASigGetPromiseResults.failureMode == FailureMode::FailOnNullPtr);
+  JSContext* cx = instance->cx();
+
+  JSObject* promiseObj = &AnyRef::fromCompiledCode(promiseRef).toJSObject();
+  Rooted<PromiseObject*> promise(
+      cx, UnwrapAndDowncastObject<PromiseObject>(cx, promiseObj));
+  if (!promise) {
+    return nullptr;
+  }
+
+  if (promise->state() == JS::PromiseState::Pending) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_JSPI_INVALID_STATE);
+    return nullptr;
+  }
+
+  bool promiseRejected = promise->state() == JS::PromiseState::Rejected;
+  RootedValue promiseReasonOrValue(cx, promise->valueOrReason());
+  if (!cx->compartment()->wrap(cx, &promiseReasonOrValue)) {
+    return nullptr;
+  }
+
+  if (promiseRejected) {
+    cx->setPendingException(promiseReasonOrValue, ShouldCaptureStack::Maybe);
+    return nullptr;
+  }
+
+  MOZ_ASSERT(promise->state() == JS::PromiseState::Fulfilled);
+  RootedValue jsValue(cx, promiseReasonOrValue);
+
+  Rooted<WasmStructObject*> results(
+      cx, instance->constantStructNewDefault(cx, typeIndex));
+  if (!results) {
+    return nullptr;
+  }
+  const FieldTypeVector& fields = results->typeDef().structType().fields_;
+
+  if (fields.length() > 0) {
+    const wasm::FuncType& sig = instance->codeMeta().getFuncType(
+        SuspendingFunctionModuleFactory::ExportedFnIndex);
+
+    if (fields.length() == 1) {
+      RootedVal val(cx);
+      MOZ_ASSERT(sig.result(0).storageType() == fields[0].type);
+      if (!Val::fromJSValue(cx, sig.result(0), jsValue, &val)) {
+        return nullptr;
+      }
+      results->storeVal(val, 0);
+    } else {
+      Rooted<ArrayObject*> array(cx, IterableToArray(cx, jsValue));
+      if (!array) {
+        return nullptr;
+      }
+      if (fields.length() != array->length()) {
+        UniqueChars expected(JS_smprintf("%zu", fields.length()));
+        UniqueChars got(JS_smprintf("%u", array->length()));
+        if (!expected || !got) {
+          ReportOutOfMemory(cx);
+          return nullptr;
+        }
+
+        JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                                 JSMSG_WASM_WRONG_NUMBER_OF_VALUES,
+                                 expected.get(), got.get());
+        return nullptr;
+      }
+
+      for (size_t i = 0; i < fields.length(); i++) {
+        RootedVal val(cx);
+        RootedValue v(cx, array->getDenseElement(i));
+        MOZ_ASSERT(sig.result(i).storageType() == fields[i].type);
+        if (!Val::fromJSValue(cx, sig.result(i), v, &val)) {
+          return nullptr;
+        }
+        results->storeVal(val, i);
+      }
+    }
+  }
+
+  return AnyRef::fromCompiledCode(results).forCompiledCode();
+}
+
+int32_t AddPromiseReactions(Instance* instance, void* promiseRef, void* contRef,
+                            void* reactionRef, void* promisingPromiseRef) {
+  MOZ_ASSERT(SASigAddPromiseReactions.failureMode == FailureMode::FailOnNegI32);
+  JSContext* cx = instance->cx();
+  RootedObject promiseObject(
+      cx, &AnyRef::fromCompiledCode(promiseRef).toJSObject());
+  if (IsProxy(promiseObject) &&
+      JS_IsDeadWrapper(UncheckedUnwrap(promiseObject))) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_DEAD_OBJECT);
+    return -1;
+  }
+  Rooted<ContObject*> contObject(
+      cx, &AnyRef::fromCompiledCode(contRef).toJSObject().as<ContObject>());
+  RootedFunction reactionFunc(
+      cx, &AnyRef::fromCompiledCode(reactionRef).toJSObject().as<JSFunction>());
+  Rooted<PromiseObject*> promisingPromise(
+      cx, &AnyRef::fromCompiledCode(promisingPromiseRef)
+               .toJSObject()
+               .as<PromiseObject>());
+
+  RootedFunction then_(
+      cx, NewNativeFunction(cx, WasmPromiseReaction, 1, nullptr,
+                            gc::AllocKind::FUNCTION_EXTENDED, GenericObject));
+  if (!then_) {
+    return -1;
+  }
+  then_->initExtendedSlot(CONT_SLOT, ObjectValue(*contObject));
+  then_->initExtendedSlot(REACTION_SLOT, ObjectValue(*reactionFunc));
+  then_->initExtendedSlot(PROMISING_PROMISE_SLOT,
+                          ObjectValue(*promisingPromise));
+
+  if (!JS::AddPromiseReactions(cx, promiseObject, then_, then_)) {
+    MOZ_ASSERT(cx->isExceptionPending());
+    return -1;
+  }
+  return 0;
+}
+
+void* PromiseResolve(Instance* instance, void* valueRef) {
+  MOZ_ASSERT(SASigPromiseResolve.failureMode == FailureMode::FailOnNullPtr);
+  JSContext* cx = instance->cx();
+  RootedObject promiseConstructor(cx, GetPromiseConstructor(cx));
+  RootedValue value(cx, AnyRef::fromCompiledCode(valueRef).toJSValue());
+  RootedObject promise(cx, PromiseResolve(cx, promiseConstructor, value));
+  if (!promise) {
+    MOZ_ASSERT(cx->isExceptionPending());
+    return nullptr;
+  }
+  return AnyRef::fromJSObject(*promise).forCompiledCode();
+}
+
+int32_t ResolvePromiseWithResults(Instance* instance, void* resultsRef,
+                                  void* promiseRef) {
+  MOZ_ASSERT(SASigResolvePromiseWithResults.failureMode ==
+             FailureMode::FailOnNegI32);
+  JSContext* cx = instance->cx();
+  RootedObject promise(cx, &AnyRef::fromCompiledCode(promiseRef).toJSObject());
+  Rooted<WasmStructObject*> results(cx, &AnyRef::fromCompiledCode(resultsRef)
+                                             .toJSObject()
+                                             .as<WasmStructObject>());
+
+  const StructType& resultType = results->typeDef().structType();
+
+  RootedValue val(cx);
+  switch (resultType.fields_.length()) {
+    case 0:
+      break;
+    case 1: {
+      if (!results->getField(cx, 0, &val)) {
+        return -1;
+      }
+    } break;
+    default: {
+      Rooted<ArrayObject*> array(cx, NewDenseEmptyArray(cx));
+      if (!array) {
+        return -1;
+      }
+      for (size_t i = 0; i < resultType.fields_.length(); i++) {
+        RootedValue item(cx);
+        if (!results->getField(cx, i, &item)) {
+          return -1;
+        }
+        if (!NewbornArrayPush(cx, array, item)) {
+          return -1;
+        }
+      }
+      val.setObject(*array);
+    } break;
+  }
+
+  if (!ResolvePromise(cx, promise, val)) {
+    MOZ_ASSERT(cx->isExceptionPending());
+    return -1;
+  }
+  return 0;
+}
+
+}  
+#endif  // ENABLE_WASM_JSPI

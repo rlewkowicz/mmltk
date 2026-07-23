@@ -1,0 +1,138 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(DOM_MEDIA_MEDIACONTROL_MEDIAPLAYBACKSTATUS_H_)
+#define DOM_MEDIA_MEDIACONTROL_MEDIAPLAYBACKSTATUS_H_
+
+#include "mozilla/DefineEnum.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/dom/AudioSessionBinding.h"
+#include "mozilla/dom/MediaSession.h"
+#include "nsID.h"
+#include "nsISupportsImpl.h"
+#include "nsTArray.h"
+#include "nsTHashMap.h"
+
+namespace mozilla::dom {
+
+MOZ_DEFINE_ENUM_CLASS_WITH_BASE_AND_TOSTRING(MediaPlaybackState, uint32_t,
+                                             (eStarted, ePlayed, ePaused,
+                                              eStopped));
+
+MOZ_DEFINE_ENUM_CLASS_WITH_BASE_AND_TOSTRING(MediaAudibleState, bool,
+                                             (eInaudible, eAudible));
+
+MOZ_DEFINE_ENUM_CLASS_WITH_BASE_AND_TOSTRING(ControlType, bool,
+                                             (eControllable, eUncontrollable));
+
+struct AudibleSource {
+  ControlType mControlType;
+  AudioSessionType mSessionType;
+};
+
+class MediaPlaybackStatus final {
+ public:
+  void UpdateMediaPlaybackState(uint64_t aContextId, MediaPlaybackState aState);
+
+  bool UpdateMediaAudibleState(uint64_t aContextId, MediaAudibleState aState,
+                               ControlType aControlType,
+                               AudioSessionType aSessionType);
+
+  void UpdateGuessedPositionState(uint64_t aContextId, const nsID& aElementId,
+                                  const Maybe<PositionState>& aState);
+
+  bool IsPlaying() const;
+  bool IsAudible() const;
+  bool IsAnyMediaBeingControlled() const;
+  Maybe<PositionState> GuessedMediaPositionState(
+      Maybe<uint64_t> aPreferredContextId) const;
+
+  Maybe<uint64_t> GetActiveAudibleControllableContextId() const;
+
+  bool IsBcAudible(uint64_t aBcId) const;
+
+  AudioSessionType EffectiveTypeForBc(uint64_t aBcId) const;
+
+  const nsTArray<AudibleSource>* GetAudibleSourcesForTesting(
+      uint64_t aBcId) const;
+
+  void ClearBrowsingContext(uint64_t aContextId);
+
+ private:
+  class ContextMediaInfo final {
+   public:
+    explicit ContextMediaInfo(uint64_t aContextId) : mContextId(aContextId) {}
+    ~ContextMediaInfo() = default;
+
+    void IncreaseControlledMediaNum() {
+      MOZ_DIAGNOSTIC_ASSERT(mControlledMediaNum < UINT_MAX);
+      mControlledMediaNum++;
+    }
+    void DecreaseControlledMediaNum() {
+      MOZ_DIAGNOSTIC_ASSERT(mControlledMediaNum > 0);
+      mControlledMediaNum--;
+    }
+    void IncreasePlayingMediaNum() {
+      MOZ_DIAGNOSTIC_ASSERT(mPlayingMediaNum < mControlledMediaNum);
+      mPlayingMediaNum++;
+    }
+    void DecreasePlayingMediaNum() {
+      MOZ_DIAGNOSTIC_ASSERT(mPlayingMediaNum > 0);
+      mPlayingMediaNum--;
+    }
+
+    void AddAudibleSource(ControlType aControlType,
+                          AudioSessionType aSessionType);
+    void RemoveAudibleSource(ControlType aControlType,
+                             AudioSessionType aSessionType);
+    bool IsAudible() const { return !mAudibleSources.IsEmpty(); }
+    bool HasAudibleSourceOfControlType(ControlType aControlType) const;
+
+    bool IsPlaying() const { return mPlayingMediaNum > 0; }
+    bool IsAnyMediaBeingControlled() const { return mControlledMediaNum > 0; }
+    uint32_t ControlledMediaNum() const { return mControlledMediaNum; }
+    size_t AudibleSourceCount() const { return mAudibleSources.Length(); }
+    uint64_t Id() const { return mContextId; }
+
+    Maybe<PositionState> GuessedPositionState() const;
+    void UpdateGuessedPositionState(const nsID& aElementId,
+                                    const Maybe<PositionState>& aState);
+
+    const nsTArray<AudibleSource>& AudibleSourcesForTesting() const {
+      return mAudibleSources;
+    }
+
+    AudioSessionType PriorityTypeFromAudibleSources() const;
+
+   private:
+    uint32_t mControlledMediaNum = 0;
+    uint32_t mPlayingMediaNum = 0;
+    uint64_t mContextId = 0;
+
+    nsTArray<AudibleSource> mAudibleSources;
+
+    nsTHashMap<nsID, PositionState> mGuessedPositionStateMap;
+  };
+
+  ContextMediaInfo& GetNotNullContextInfo(uint64_t aContextId);
+  void DestroyContextInfo(uint64_t aContextId);
+  void MaybeDestroyContextInfo(uint64_t aContextId,
+                               const ContextMediaInfo& aInfo);
+
+  void ChooseNewActiveAudibleControllableContext();
+  void SetActiveAudibleControllableContextId(Maybe<uint64_t>&& aContextId);
+  bool IsActiveAudibleControllableContext(uint64_t aContextId) const;
+  bool ShouldClaimActiveAudibleControllableContextForInfo(
+      const ContextMediaInfo& aInfo, ControlType aControlType) const;
+  bool ShouldHandOffActiveAudibleControllableContextForInfo(
+      const ContextMediaInfo& aInfo, ControlType aControlType) const;
+  bool HasAnyControllableAudibleSource() const;
+
+  nsTHashMap<uint64_t, UniquePtr<ContextMediaInfo>> mContextInfoMap;
+  Maybe<uint64_t> mActiveAudibleControllableContextId;
+};
+
+}  
+
+#endif

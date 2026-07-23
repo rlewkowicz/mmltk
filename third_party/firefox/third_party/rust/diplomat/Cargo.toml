@@ -1,0 +1,50 @@
+
+[package]
+edition = "2021"
+rust-version = "1.81"
+name = "diplomat"
+version = "0.14.0"
+authors = [
+    "Shadaj Laddad <shadaj@users.noreply.github.com>",
+    "Manish Goregaokar <manishsmail@gmail.com>",
+    "Quinn Okabayashi <QnnOkabayashi@users.noreply.github.com>",
+]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "The diplomat FFI generation macro"
+keywords = [
+    "ffi",
+    "codegen",
+]
+categories = [
+    "development-tools",
+    "compilers",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-diplomat/diplomat"
+
+[lib]
+name = "diplomat"
+path = "src/lib.rs"
+proc-macro = true
+
+[dependencies.diplomat_core]
+version = "0.14.0"
+default-features = false
+
+[dependencies.proc-macro2]
+version = "1.0.27"
+
+[dependencies.quote]
+version = "1.0"
+
+[dependencies.syn]
+version = "2.0"
+features = [
+    "full",
+    "extra-traits",
+]

@@ -1,0 +1,1983 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "AccessCheck.h"
+#include "jsfriendapi.h"
+#include "js/Array.h"             // JS::GetArrayLength, JS::IsArrayObject
+#include "js/CallAndConstruct.h"  // JS::Call, JS::IsCallable
+#include "js/CharacterEncoding.h"
+#include "js/CompilationAndEvaluation.h"
+#include "js/Object.h"  // JS::GetClass, JS::GetCompartment, JS::GetReservedSlot
+#include "js/PropertyAndElement.h"  // JS_DefineFunction, JS_DefineFunctions, JS_DefineProperty, JS_GetElement, JS_GetProperty, JS_HasProperty, JS_SetProperty, JS_SetPropertyById
+#include "js/PropertyDescriptor.h"  // JS::PropertyDescriptor, JS_GetOwnPropertyDescriptorById, JS_GetPropertyDescriptorById
+#include "js/PropertySpec.h"
+#include "js/Proxy.h"
+#include "js/SourceText.h"
+#include "js/StructuredClone.h"
+#include "nsContentUtils.h"
+#include "nsGlobalWindowInner.h"
+#include "nsIException.h"  // for nsIStackFrame
+#include "nsIScriptContext.h"
+#include "nsIScriptObjectPrincipal.h"
+#include "nsIURI.h"
+#include "nsJSUtils.h"
+#include "nsNetUtil.h"
+#include "nsPIDOMWindowInlines.h"
+#include "ExpandedPrincipal.h"
+#include "WrapperFactory.h"
+#include "xpcprivate.h"
+#include "xpc_make_class.h"
+#include "XPCWrapper.h"
+#include "Crypto.h"
+#include "mozilla/Result.h"
+#include "mozilla/dom/AbortControllerBinding.h"
+#include "mozilla/dom/AutoEntryScript.h"
+#include "mozilla/dom/BindingCallContext.h"
+#include "mozilla/dom/BindingUtils.h"
+#include "mozilla/dom/BlobBinding.h"
+#include "mozilla/dom/cache/CacheStorage.h"
+#include "mozilla/dom/ChromeUtilsBinding.h"
+#include "mozilla/dom/CSSBinding.h"
+#include "mozilla/dom/CSSPositionTryDescriptorsBinding.h"
+#include "mozilla/dom/CSSRuleBinding.h"
+#include "mozilla/dom/DirectoryBinding.h"
+#include "mozilla/dom/DocumentBinding.h"
+#include "mozilla/dom/DOMExceptionBinding.h"
+#include "mozilla/dom/DOMParserBinding.h"
+#include "mozilla/dom/DOMTokenListBinding.h"
+#include "mozilla/dom/ElementBinding.h"
+#include "mozilla/dom/ElementInternalsBinding.h"
+#include "mozilla/dom/EventBinding.h"
+#include "mozilla/dom/Exceptions.h"
+#include "mozilla/dom/IndexedDatabaseManager.h"
+#include "mozilla/dom/Fetch.h"
+#include "mozilla/dom/FileBinding.h"
+#include "mozilla/dom/HeadersBinding.h"
+#include "mozilla/dom/IOUtilsBinding.h"
+#include "mozilla/dom/InspectorUtilsBinding.h"
+#include "mozilla/dom/LockManager.h"
+#include "mozilla/dom/MessageChannelBinding.h"
+#include "mozilla/dom/MessagePortBinding.h"
+#include "mozilla/dom/NodeBinding.h"
+#include "mozilla/dom/NodeFilterBinding.h"
+#include "mozilla/dom/PathUtilsBinding.h"
+#include "mozilla/dom/PerformanceBinding.h"
+#include "mozilla/dom/PromiseBinding.h"
+#include "mozilla/dom/PromiseDebuggingBinding.h"
+#include "mozilla/dom/RangeBinding.h"
+#include "mozilla/dom/RequestBinding.h"
+#include "mozilla/dom/ReadableStreamBinding.h"
+#include "mozilla/dom/ResponseBinding.h"
+#include "mozilla/dom/FileReaderBinding.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/SelectionBinding.h"
+#include "mozilla/dom/StorageManager.h"
+#include "mozilla/dom/StorageManagerBinding.h"
+#include "mozilla/dom/TextDecoderBinding.h"
+#include "mozilla/dom/TextEncoderBinding.h"
+#include "mozilla/dom/TrustedHTML.h"
+#include "mozilla/dom/TrustedScript.h"
+#include "mozilla/dom/TrustedScriptURL.h"
+#include "mozilla/dom/URLBinding.h"
+#include "mozilla/dom/URLSearchParamsBinding.h"
+#include "mozilla/dom/XMLHttpRequest.h"
+#include "mozilla/dom/WebSocketBinding.h"
+#include "mozilla/dom/WindowBinding.h"
+#include "mozilla/dom/XMLSerializerBinding.h"
+#include "mozilla/dom/FormDataBinding.h"
+#include "mozilla/dom/nsCSPContext.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/ipc/BackgroundUtils.h"
+#include "mozilla/ipc/PBackgroundSharedTypes.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/DeferredFinalize.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/NullPrincipal.h"
+#include "mozilla/ResultExtensions.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using namespace JS;
+using namespace JS::loader;
+using namespace xpc;
+
+using mozilla::dom::DestroyProtoAndIfaceCache;
+using mozilla::dom::IndexedDatabaseManager;
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(SandboxPrivate)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(SandboxPrivate)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_REFERENCE
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_PTR
+  tmp->UnlinkObjectsInGlobal();
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(SandboxPrivate)
+  tmp->TraverseObjectsInGlobal(cb);
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(SandboxPrivate)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(SandboxPrivate)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(SandboxPrivate)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIScriptObjectPrincipal)
+  NS_INTERFACE_MAP_ENTRY(nsIScriptObjectPrincipal)
+  NS_INTERFACE_MAP_ENTRY(nsIGlobalObject)
+  NS_INTERFACE_MAP_ENTRY(nsISupportsWeakReference)
+NS_INTERFACE_MAP_END
+
+class nsXPCComponents_utils_Sandbox : public nsIXPCComponents_utils_Sandbox,
+                                      public nsIXPCScriptable {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIXPCCOMPONENTS_UTILS_SANDBOX
+  NS_DECL_NSIXPCSCRIPTABLE
+
+ public:
+  nsXPCComponents_utils_Sandbox();
+
+ private:
+  virtual ~nsXPCComponents_utils_Sandbox();
+
+  static nsresult CallOrConstruct(nsIXPConnectWrappedNative* wrapper,
+                                  JSContext* cx, HandleObject obj,
+                                  const CallArgs& args, bool* _retval);
+};
+
+already_AddRefed<nsIXPCComponents_utils_Sandbox> xpc::NewSandboxConstructor() {
+  nsCOMPtr<nsIXPCComponents_utils_Sandbox> sbConstructor =
+      new nsXPCComponents_utils_Sandbox();
+  return sbConstructor.forget();
+}
+
+static bool SandboxDump(JSContext* cx, unsigned argc, Value* vp) {
+  if (!nsJSUtils::DumpEnabled()) {
+    return true;
+  }
+
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (args.length() == 0) {
+    return true;
+  }
+
+  RootedString str(cx, ToString(cx, args[0]));
+  if (!str) {
+    return false;
+  }
+
+  JS::UniqueChars utf8str = JS_EncodeStringToUTF8(cx, str);
+  char* cstr = utf8str.get();
+  if (!cstr) {
+    return false;
+  }
+
+  MOZ_LOG(nsContentUtils::DOMDumpLog(), mozilla::LogLevel::Debug,
+          ("[Sandbox.Dump] %s", cstr));
+  fputs(cstr, stdout);
+  fflush(stdout);
+  args.rval().setBoolean(true);
+  return true;
+}
+
+static bool SandboxDebug(JSContext* cx, unsigned argc, Value* vp) {
+#if defined(DEBUG)
+  return SandboxDump(cx, argc, vp);
+#else
+  return true;
+#endif
+}
+
+static bool SandboxImport(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (args.length() < 1 || args[0].isPrimitive()) {
+    XPCThrower::Throw(NS_ERROR_INVALID_ARG, cx);
+    return false;
+  }
+
+  RootedString funname(cx);
+  if (args.length() > 1) {
+    funname = ToString(cx, args[1]);
+    if (!funname) {
+      return false;
+    }
+  } else {
+    RootedObject funobj(cx, &args[0].toObject());
+    if (js::IsProxy(funobj)) {
+      funobj = XPCWrapper::UnsafeUnwrapSecurityWrapper(funobj);
+    }
+
+    JSAutoRealm ar(cx, funobj);
+
+    RootedValue funval(cx, ObjectValue(*funobj));
+    JS::Rooted<JSFunction*> fun(cx, JS_ValueToFunction(cx, funval));
+    if (!fun) {
+      XPCThrower::Throw(NS_ERROR_INVALID_ARG, cx);
+      return false;
+    }
+
+    if (!JS_GetFunctionId(cx, fun, &funname)) {
+      return false;
+    }
+    if (!funname) {
+      XPCThrower::Throw(NS_ERROR_INVALID_ARG, cx);
+      return false;
+    }
+  }
+  JS_MarkCrossZoneIdValue(cx, StringValue(funname));
+
+  RootedId id(cx);
+  if (!JS_StringToId(cx, funname, &id)) {
+    return false;
+  }
+
+
+  RootedObject thisObject(cx);
+  if (!args.computeThis(cx, &thisObject)) {
+    return false;
+  }
+
+  if (!JS_SetPropertyById(cx, thisObject, id, args[0])) {
+    return false;
+  }
+
+  args.rval().setUndefined();
+  return true;
+}
+
+bool xpc::SandboxCreateCrypto(JSContext* cx, JS::Handle<JSObject*> obj) {
+  MOZ_ASSERT(JS_IsGlobalObject(obj));
+
+  nsIGlobalObject* native = xpc::NativeGlobal(obj);
+  MOZ_ASSERT(native);
+
+  dom::Crypto* crypto = new dom::Crypto(native);
+  JS::RootedObject wrapped(cx, crypto->WrapObject(cx, nullptr));
+  return JS_DefineProperty(cx, obj, "crypto", wrapped, JSPROP_ENUMERATE);
+}
+
+
+static bool SandboxFetch(JSContext* cx, JS::HandleObject scope,
+                         const CallArgs& args) {
+  if (args.length() < 1) {
+    JS_ReportErrorASCII(cx, "fetch requires at least 1 argument");
+    return false;
+  }
+
+  BindingCallContext callCx(cx, "fetch");
+  RequestOrUTF8String request;
+  if (!request.Init(callCx, args[0], "Argument 1")) {
+    return false;
+  }
+  RootedDictionary<dom::RequestInit> options(cx);
+  if (!options.Init(callCx, args.hasDefined(1) ? args[1] : JS::NullHandleValue,
+                    "Argument 2", false)) {
+    return false;
+  }
+  nsCOMPtr<nsIGlobalObject> global = xpc::NativeGlobal(scope);
+  if (!global) {
+    return false;
+  }
+  dom::CallerType callerType = nsContentUtils::IsSystemCaller(cx)
+                                   ? dom::CallerType::System
+                                   : dom::CallerType::NonSystem;
+  ErrorResult rv;
+  RefPtr<dom::Promise> response = FetchRequest(
+      global, Constify(request), Constify(options), callerType, rv);
+  if (rv.MaybeSetPendingException(cx)) {
+    return false;
+  }
+
+  args.rval().setObject(*response->PromiseObj());
+  return true;
+}
+
+static bool SandboxFetchPromise(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  RootedObject scope(cx, JS::CurrentGlobalOrNull(cx));
+  if (SandboxFetch(cx, scope, args)) {
+    return true;
+  }
+  return ConvertExceptionToPromise(cx, args.rval());
+}
+
+bool xpc::SandboxCreateFetch(JSContext* cx, JS::Handle<JSObject*> obj) {
+  MOZ_ASSERT(JS_IsGlobalObject(obj));
+
+  return JS_DefineFunction(cx, obj, "fetch", SandboxFetchPromise, 2, 0) &&
+         Request_Binding::CreateAndDefineOnGlobal(cx) &&
+         Response_Binding::CreateAndDefineOnGlobal(cx) &&
+         Headers_Binding::CreateAndDefineOnGlobal(cx);
+}
+
+static bool SandboxCreateStorage(JSContext* cx, JS::HandleObject obj) {
+  MOZ_ASSERT(JS_IsGlobalObject(obj));
+
+  nsIGlobalObject* native = xpc::NativeGlobal(obj);
+  MOZ_ASSERT(native);
+
+  if (!StorageManager_Binding::CreateAndDefineOnGlobal(cx)) {
+    return false;
+  }
+
+  dom::StorageManager* storageManager = new dom::StorageManager(native);
+  JS::RootedObject wrapped(cx, storageManager->WrapObject(cx, nullptr));
+  return JS_DefineProperty(cx, obj, "storage", wrapped, JSPROP_ENUMERATE);
+}
+
+static bool SandboxStructuredClone(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (!args.requireAtLeast(cx, "structuredClone", 1)) {
+    return false;
+  }
+
+  RootedDictionary<dom::StructuredSerializeOptions> options(cx);
+  if (!options.Init(cx, args.hasDefined(1) ? args[1] : JS::NullHandleValue,
+                    "Argument 2", false)) {
+    return false;
+  }
+
+  nsCOMPtr<nsIGlobalObject> global = CurrentNativeGlobal(cx);
+  if (!global) {
+    JS_ReportErrorASCII(cx, "structuredClone: Missing global");
+    return false;
+  }
+
+  JS::Rooted<JS::Value> result(cx);
+  ErrorResult rv;
+  nsContentUtils::StructuredClone(cx, global, args[0], options, &result, rv);
+  if (rv.MaybeSetPendingException(cx)) {
+    return false;
+  }
+
+  if (!mozilla::dom::MaybeWrapValue(cx, &result)) {
+    return false;
+  }
+
+  MOZ_ASSERT_IF(result.isGCThing(),
+                !JS::GCThingIsMarkedGray(result.toGCCellPtr()));
+  args.rval().set(result);
+  return true;
+}
+
+bool xpc::SandboxCreateStructuredClone(JSContext* cx, HandleObject obj) {
+  MOZ_ASSERT(JS_IsGlobalObject(obj));
+
+  return JS_DefineFunction(cx, obj, "structuredClone", SandboxStructuredClone,
+                           1, 0);
+}
+
+bool xpc::SandboxCreateLocks(JSContext* cx, JS::Handle<JSObject*> obj) {
+  MOZ_ASSERT(JS_IsGlobalObject(obj));
+
+  nsIGlobalObject* native = xpc::NativeGlobal(obj);
+  MOZ_ASSERT(native);
+
+  RefPtr<dom::LockManager> lockManager = dom::LockManager::Create(*native);
+  JS::RootedObject wrapped(cx, lockManager->WrapObject(cx, nullptr));
+  return JS_DefineProperty(cx, obj, "locks", wrapped, JSPROP_ENUMERATE);
+}
+
+static bool SandboxIsProxy(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (args.length() < 1) {
+    JS_ReportErrorASCII(cx, "Function requires at least 1 argument");
+    return false;
+  }
+  if (!args[0].isObject()) {
+    args.rval().setBoolean(false);
+    return true;
+  }
+
+  RootedObject obj(cx, &args[0].toObject());
+  obj = js::CheckedUnwrapStatic(obj);
+  if (!obj) {
+    args.rval().setBoolean(false);
+    return true;
+  }
+
+  args.rval().setBoolean(js::IsScriptedProxy(obj));
+  return true;
+}
+
+static bool SandboxExportFunction(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (args.length() < 2) {
+    JS_ReportErrorASCII(cx, "Function requires at least 2 arguments");
+    return false;
+  }
+
+  RootedValue options(cx, args.length() > 2 ? args[2] : UndefinedValue());
+  return ExportFunction(cx, args[0], args[1], options, args.rval());
+}
+
+static bool SandboxCreateObjectIn(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (args.length() < 1) {
+    JS_ReportErrorASCII(cx, "Function requires at least 1 argument");
+    return false;
+  }
+
+  RootedObject optionsObj(cx);
+  bool calledWithOptions = args.length() > 1;
+  if (calledWithOptions) {
+    if (!args[1].isObject()) {
+      JS_ReportErrorASCII(
+          cx, "Expected the 2nd argument (options) to be an object");
+      return false;
+    }
+    optionsObj = &args[1].toObject();
+  }
+
+  CreateObjectInOptions options(cx, optionsObj);
+  if (calledWithOptions && !options.Parse()) {
+    return false;
+  }
+
+  return xpc::CreateObjectIn(cx, args[0], options, args.rval());
+}
+
+static bool SandboxCloneInto(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (args.length() < 2) {
+    JS_ReportErrorASCII(cx, "Function requires at least 2 arguments");
+    return false;
+  }
+
+  RootedValue options(cx, args.length() > 2 ? args[2] : UndefinedValue());
+  return xpc::CloneInto(cx, args[0], args[1], options, args.rval());
+}
+
+static void sandbox_finalize(JS::GCContext* gcx, JSObject* obj) {
+  SandboxPrivate* priv = SandboxPrivate::GetPrivate(obj);
+  if (!priv) {
+    return;
+  }
+
+  priv->ForgetGlobalObject(obj);
+  DestroyProtoAndIfaceCache(obj);
+  DeferredFinalize(static_cast<nsIScriptObjectPrincipal*>(priv));
+}
+
+static size_t sandbox_moved(JSObject* obj, JSObject* old) {
+  SandboxPrivate* priv = SandboxPrivate::GetPrivate(obj);
+  if (!priv) {
+    return 0;
+  }
+
+  return priv->ObjectMoved(obj, old);
+}
+
+#define XPCONNECT_SANDBOX_CLASS_METADATA_SLOT \
+  (XPCONNECT_GLOBAL_EXTRA_SLOT_OFFSET)
+
+static const JSClassOps SandboxClassOps = {
+    .newEnumerate = JS_NewEnumerateStandardClasses,
+    .resolve = JS_ResolveStandardClass,
+    .mayResolve = JS_MayResolveStandardClass,
+    .finalize = sandbox_finalize,
+    .trace = JS_GlobalObjectTraceHook,
+};
+
+static const js::ClassExtension SandboxClassExtension = {
+    sandbox_moved,  
+};
+
+static const JSClass SandboxClass = {
+    "Sandbox",
+    XPCONNECT_GLOBAL_FLAGS_WITH_EXTRA_SLOTS(1) | JSCLASS_FOREGROUND_FINALIZE,
+    &SandboxClassOps,
+    JS_NULL_CLASS_SPEC,
+    &SandboxClassExtension,
+    JS_NULL_OBJECT_OPS};
+
+static const JSFunctionSpec SandboxFunctions[] = {
+    JS_FN("dump", SandboxDump, 1, 0), JS_FN("debug", SandboxDebug, 1, 0),
+    JS_FN("importFunction", SandboxImport, 1, 0), JS_FS_END};
+
+bool xpc::IsSandbox(JSObject* obj) {
+  const JSClass* clasp = JS::GetClass(obj);
+  return clasp == &SandboxClass;
+}
+
+nsXPCComponents_utils_Sandbox::nsXPCComponents_utils_Sandbox() = default;
+
+nsXPCComponents_utils_Sandbox::~nsXPCComponents_utils_Sandbox() = default;
+
+NS_IMPL_QUERY_INTERFACE(nsXPCComponents_utils_Sandbox,
+                        nsIXPCComponents_utils_Sandbox, nsIXPCScriptable)
+
+NS_IMPL_ADDREF(nsXPCComponents_utils_Sandbox)
+NS_IMPL_RELEASE(nsXPCComponents_utils_Sandbox)
+
+#define XPC_MAP_CLASSNAME nsXPCComponents_utils_Sandbox
+#define XPC_MAP_QUOTED_CLASSNAME "nsXPCComponents_utils_Sandbox"
+#define XPC_MAP_FLAGS (XPC_SCRIPTABLE_WANT_CALL | XPC_SCRIPTABLE_WANT_CONSTRUCT)
+#include "xpc_map_end.h" /* This #undef's the above. */
+
+class SandboxProxyHandler : public js::Wrapper {
+ public:
+  constexpr SandboxProxyHandler() : js::Wrapper(0) {}
+
+  virtual bool getOwnPropertyDescriptor(
+      JSContext* cx, JS::Handle<JSObject*> proxy, JS::Handle<jsid> id,
+      JS::MutableHandle<Maybe<JS::PropertyDescriptor>> desc) const override;
+
+  virtual bool has(JSContext* cx, JS::Handle<JSObject*> proxy,
+                   JS::Handle<jsid> id, bool* bp) const override;
+  virtual bool get(JSContext* cx, JS::Handle<JSObject*> proxy,
+                   JS::HandleValue receiver, JS::Handle<jsid> id,
+                   JS::MutableHandle<JS::Value> vp) const override;
+  virtual bool set(JSContext* cx, JS::Handle<JSObject*> proxy,
+                   JS::Handle<jsid> id, JS::Handle<JS::Value> v,
+                   JS::Handle<JS::Value> receiver,
+                   JS::ObjectOpResult& result) const override;
+
+  virtual bool hasOwn(JSContext* cx, JS::Handle<JSObject*> proxy,
+                      JS::Handle<jsid> id, bool* bp) const override;
+  virtual bool getOwnEnumerablePropertyKeys(
+      JSContext* cx, JS::Handle<JSObject*> proxy,
+      JS::MutableHandleIdVector props) const override;
+  virtual bool enumerate(JSContext* cx, JS::Handle<JSObject*> proxy,
+                         JS::MutableHandleIdVector props) const override;
+
+ private:
+  bool getPropertyDescriptorImpl(
+      JSContext* cx, JS::Handle<JSObject*> proxy, JS::Handle<jsid> id,
+      bool getOwn, JS::MutableHandle<Maybe<JS::PropertyDescriptor>> desc) const;
+};
+
+static const SandboxProxyHandler sandboxProxyHandler;
+
+namespace xpc {
+
+bool IsSandboxPrototypeProxy(JSObject* obj) {
+  return js::IsProxy(obj) && js::GetProxyHandler(obj) == &sandboxProxyHandler;
+}
+
+}  
+
+class SandboxCallableProxyHandler : public js::Wrapper {
+ public:
+  constexpr SandboxCallableProxyHandler() : js::Wrapper(0) {}
+
+  virtual bool call(JSContext* cx, JS::Handle<JSObject*> proxy,
+                    const JS::CallArgs& args) const override;
+
+  static const size_t SandboxProxySlot = 0;
+
+  static inline JSObject* getSandboxProxy(JS::Handle<JSObject*> proxy) {
+    return &js::GetProxyReservedSlot(proxy, SandboxProxySlot).toObject();
+  }
+};
+
+static const SandboxCallableProxyHandler sandboxCallableProxyHandler;
+
+bool SandboxCallableProxyHandler::call(JSContext* cx,
+                                       JS::Handle<JSObject*> proxy,
+                                       const JS::CallArgs& args) const {
+
+  RootedObject sandboxProxy(cx, getSandboxProxy(proxy));
+  MOZ_ASSERT(js::IsProxy(sandboxProxy) &&
+             js::GetProxyHandler(sandboxProxy) == &sandboxProxyHandler);
+
+  RootedObject sandboxGlobal(cx, JS::GetNonCCWObjectGlobal(sandboxProxy));
+  MOZ_ASSERT(IsSandbox(sandboxGlobal));
+
+  bool isXray = WrapperFactory::IsXrayWrapper(sandboxProxy);
+  RootedValue thisVal(cx, args.thisv());
+  if (isXray) {
+    RootedObject thisObject(cx);
+    if (!args.computeThis(cx, &thisObject)) {
+      return false;
+    }
+    thisVal.setObject(*thisObject);
+  }
+
+  if (thisVal == ObjectValue(*sandboxGlobal)) {
+    thisVal = ObjectValue(*js::GetProxyTargetObject(sandboxProxy));
+  }
+
+  RootedValue func(cx, js::GetProxyPrivate(proxy));
+  return JS::Call(cx, thisVal, func, args, args.rval());
+}
+
+static JSObject* WrapCallable(JSContext* cx, HandleObject callable,
+                              HandleObject sandboxProtoProxy) {
+  MOZ_ASSERT(JS::IsCallable(callable));
+  MOZ_ASSERT(js::IsProxy(sandboxProtoProxy) &&
+             js::GetProxyHandler(sandboxProtoProxy) == &sandboxProxyHandler);
+
+  RootedValue priv(cx, ObjectValue(*callable));
+  js::ProxyOptions options;
+  options.setLazyProto(true);
+  JSObject* obj = js::NewProxyObject(cx, &sandboxCallableProxyHandler, priv,
+                                     nullptr, options);
+  if (obj) {
+    js::SetProxyReservedSlot(obj, SandboxCallableProxyHandler::SandboxProxySlot,
+                             ObjectValue(*sandboxProtoProxy));
+  }
+
+  return obj;
+}
+
+bool WrapAccessorFunction(JSContext* cx, MutableHandleObject accessor,
+                          HandleObject sandboxProtoProxy) {
+  if (!accessor) {
+    return true;
+  }
+
+  accessor.set(WrapCallable(cx, accessor, sandboxProtoProxy));
+  return !!accessor;
+}
+
+static bool IsMaybeWrappedDOMConstructor(JSObject* obj) {
+  obj = js::CheckedUnwrapStatic(obj);
+  if (!obj) {
+    return false;
+  }
+
+  return dom::IsDOMConstructor(obj);
+}
+
+bool SandboxProxyHandler::getPropertyDescriptorImpl(
+    JSContext* cx, JS::Handle<JSObject*> proxy, JS::Handle<jsid> id,
+    bool getOwn, MutableHandle<Maybe<PropertyDescriptor>> desc_) const {
+  JS::RootedObject obj(cx, wrappedObject(proxy));
+
+  MOZ_ASSERT(JS::GetCompartment(obj) == JS::GetCompartment(proxy));
+
+  if (getOwn) {
+    if (!JS_GetOwnPropertyDescriptorById(cx, obj, id, desc_)) {
+      return false;
+    }
+  } else {
+    Rooted<JSObject*> holder(cx);
+    if (!JS_GetPropertyDescriptorById(cx, obj, id, desc_, &holder)) {
+      return false;
+    }
+  }
+
+  if (desc_.isNothing()) {
+    return true;
+  }
+
+  Rooted<PropertyDescriptor> desc(cx, *desc_);
+
+  if (desc.hasGetter() && !WrapAccessorFunction(cx, desc.getter(), proxy)) {
+    return false;
+  }
+  if (desc.hasSetter() && !WrapAccessorFunction(cx, desc.setter(), proxy)) {
+    return false;
+  }
+  if (desc.hasValue() && desc.value().isObject()) {
+    RootedObject val(cx, &desc.value().toObject());
+    if (JS::IsCallable(val) &&
+        !IsMaybeWrappedDOMConstructor(val)) {
+      val = WrapCallable(cx, val, proxy);
+      if (!val) {
+        return false;
+      }
+      desc.value().setObject(*val);
+    }
+  }
+
+  desc_.set(Some(desc.get()));
+  return true;
+}
+
+bool SandboxProxyHandler::getOwnPropertyDescriptor(
+    JSContext* cx, JS::Handle<JSObject*> proxy, JS::Handle<jsid> id,
+    MutableHandle<Maybe<PropertyDescriptor>> desc) const {
+  return getPropertyDescriptorImpl(cx, proxy, id,  true, desc);
+}
+
+
+bool SandboxProxyHandler::has(JSContext* cx, JS::Handle<JSObject*> proxy,
+                              JS::Handle<jsid> id, bool* bp) const {
+  Rooted<Maybe<PropertyDescriptor>> desc(cx);
+  if (!getPropertyDescriptorImpl(cx, proxy, id,  false, &desc)) {
+    return false;
+  }
+
+  *bp = desc.isSome();
+  return true;
+}
+bool SandboxProxyHandler::hasOwn(JSContext* cx, JS::Handle<JSObject*> proxy,
+                                 JS::Handle<jsid> id, bool* bp) const {
+  return BaseProxyHandler::hasOwn(cx, proxy, id, bp);
+}
+
+bool SandboxProxyHandler::get(JSContext* cx, JS::Handle<JSObject*> proxy,
+                              JS::Handle<JS::Value> receiver,
+                              JS::Handle<jsid> id,
+                              JS::MutableHandle<Value> vp) const {
+  Rooted<Maybe<PropertyDescriptor>> desc(cx);
+  if (!getPropertyDescriptorImpl(cx, proxy, id,  false, &desc)) {
+    return false;
+  }
+
+  if (desc.isNothing()) {
+    vp.setUndefined();
+    return true;
+  } else {
+    desc->assertComplete();
+  }
+
+  if (desc->isDataDescriptor()) {
+    vp.set(desc->value());
+    return true;
+  }
+
+  MOZ_ASSERT(desc->isAccessorDescriptor());
+  RootedObject getter(cx, desc->getter());
+
+  if (!getter) {
+    vp.setUndefined();
+    return true;
+  }
+
+  return Call(cx, receiver, getter, HandleValueArray::empty(), vp);
+}
+
+bool SandboxProxyHandler::set(JSContext* cx, JS::Handle<JSObject*> proxy,
+                              JS::Handle<jsid> id, JS::Handle<Value> v,
+                              JS::Handle<Value> receiver,
+                              JS::ObjectOpResult& result) const {
+  return BaseProxyHandler::set(cx, proxy, id, v, receiver, result);
+}
+
+bool SandboxProxyHandler::getOwnEnumerablePropertyKeys(
+    JSContext* cx, JS::Handle<JSObject*> proxy,
+    MutableHandleIdVector props) const {
+  return BaseProxyHandler::getOwnEnumerablePropertyKeys(cx, proxy, props);
+}
+
+bool SandboxProxyHandler::enumerate(JSContext* cx, JS::Handle<JSObject*> proxy,
+                                    JS::MutableHandleIdVector props) const {
+  return BaseProxyHandler::enumerate(cx, proxy, props);
+}
+
+bool xpc::GlobalProperties::Parse(JSContext* cx, JS::HandleObject obj) {
+  uint32_t length;
+  bool ok = JS::GetArrayLength(cx, obj, &length);
+  NS_ENSURE_TRUE(ok, false);
+  for (uint32_t i = 0; i < length; i++) {
+    RootedValue nameValue(cx);
+    ok = JS_GetElement(cx, obj, i, &nameValue);
+    NS_ENSURE_TRUE(ok, false);
+    if (!nameValue.isString()) {
+      JS_ReportErrorASCII(cx, "Property names must be strings");
+      return false;
+    }
+    JSLinearString* nameStr = JS_EnsureLinearString(cx, nameValue.toString());
+    if (!nameStr) {
+      return false;
+    }
+
+    if (JS_LinearStringEqualsLiteral(nameStr, "AbortController")) {
+      AbortController = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "Blob")) {
+      Blob = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "ChromeUtils")) {
+      ChromeUtils = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "CSS")) {
+      CSS = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr,
+                                            "CSSPositionTryDescriptors")) {
+      CSSPositionTryDescriptors = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "CSSRule")) {
+      CSSRule = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "CustomStateSet")) {
+      CustomStateSet = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "Document")) {
+      Document = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "Directory")) {
+      Directory = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "DOMException")) {
+      DOMException = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "DOMParser")) {
+      DOMParser = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "DOMTokenList")) {
+      DOMTokenList = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "Element")) {
+      Element = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "Event")) {
+      Event = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "File")) {
+      File = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "FileReader")) {
+      FileReader = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "FormData")) {
+      FormData = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "Headers")) {
+      Headers = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "IOUtils")) {
+      IOUtils = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "InspectorCSSParser")) {
+      InspectorCSSParser = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "InspectorUtils")) {
+      InspectorUtils = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "MessageChannel")) {
+      MessageChannel = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "Node")) {
+      Node = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "NodeFilter")) {
+      NodeFilter = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "PathUtils")) {
+      PathUtils = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "Performance")) {
+      Performance = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "PromiseDebugging")) {
+      PromiseDebugging = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "Range")) {
+      Range = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "Selection")) {
+      Selection = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "TextDecoder")) {
+      TextDecoder = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "TextEncoder")) {
+      TextEncoder = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "TrustedHTML")) {
+      TrustedHTML = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "TrustedScript")) {
+      TrustedScript = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "TrustedScriptURL")) {
+      TrustedScriptURL = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "URL")) {
+      URL = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "URLSearchParams")) {
+      URLSearchParams = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "XMLHttpRequest")) {
+      XMLHttpRequest = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "WebSocket")) {
+      WebSocket = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "Window")) {
+      Window = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "XMLSerializer")) {
+      XMLSerializer = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "ReadableStream")) {
+      ReadableStream = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "atob")) {
+      atob = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "btoa")) {
+      btoa = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "caches")) {
+      caches = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "crypto")) {
+      crypto = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "fetch")) {
+      fetch = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "storage")) {
+      storage = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "structuredClone")) {
+      structuredClone = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "locks")) {
+      locks = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "indexedDB")) {
+      indexedDB = true;
+    } else if (JS_LinearStringEqualsLiteral(nameStr, "isSecureContext")) {
+      isSecureContext = true;
+    } else {
+      RootedString nameStr(cx, nameValue.toString());
+      JS::UniqueChars name = JS_EncodeStringToUTF8(cx, nameStr);
+      if (!name) {
+        return false;
+      }
+
+      JS_ReportErrorUTF8(cx, "Unknown property name: %s", name.get());
+      return false;
+    }
+  }
+  return true;
+}
+
+bool xpc::GlobalProperties::Define(JSContext* cx, JS::HandleObject obj) {
+  MOZ_ASSERT(js::GetContextCompartment(cx) == JS::GetCompartment(obj));
+
+#define DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(_iface)                     \
+  if ((_iface) && !dom::_iface##_Binding::CreateAndDefineOnGlobal(cx)) { \
+    return false;                                                        \
+  }
+
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(AbortController)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(ChromeUtils)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(Blob)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(CSS)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(CSSPositionTryDescriptors)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(CSSRule)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(CustomStateSet)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(Directory)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(Document)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(DOMException)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(DOMParser)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(DOMTokenList)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(Element)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(Event)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(File)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(FileReader)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(FormData)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(Headers)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(IOUtils)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(InspectorCSSParser)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(InspectorUtils)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(MessageChannel)
+  if (MessageChannel && !MessagePort_Binding::CreateAndDefineOnGlobal(cx)) {
+    return false;
+  }
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(Node)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(NodeFilter)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(PathUtils)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(Performance)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(PromiseDebugging)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(Range)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(ReadableStream)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(Selection)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(TextDecoder)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(TextEncoder)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(TrustedHTML)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(TrustedScript)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(TrustedScriptURL)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(URL)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(URLSearchParams)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(WebSocket)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(Window)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(XMLHttpRequest)
+  DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE(XMLSerializer)
+
+#undef DEFINE_WEBIDL_INTERFACE_OR_NAMESPACE
+
+  if (atob && !JS_DefineFunction(cx, obj, "atob", Atob, 1, 0)) return false;
+
+  if (btoa && !JS_DefineFunction(cx, obj, "btoa", Btoa, 1, 0)) return false;
+
+  if (caches && !dom::cache::CacheStorage::DefineCachesForSandbox(cx, obj)) {
+    return false;
+  }
+
+  if (crypto && !SandboxCreateCrypto(cx, obj)) {
+    return false;
+  }
+
+  if (fetch && !SandboxCreateFetch(cx, obj)) {
+    return false;
+  }
+
+  if (storage && !SandboxCreateStorage(cx, obj)) {
+    return false;
+  }
+
+  if (structuredClone && !SandboxCreateStructuredClone(cx, obj)) {
+    return false;
+  }
+
+  if (locks && !SandboxCreateLocks(cx, obj)) {
+    return false;
+  }
+
+  if (isSecureContext) {
+    bool hasSecureContext = IsSecureContextOrObjectIsFromSecureContext(cx, obj);
+    JS::Rooted<JS::Value> secureJsValue(cx, JS::BooleanValue(hasSecureContext));
+    return JS_DefineProperty(cx, obj, "isSecureContext", secureJsValue,
+                             JSPROP_ENUMERATE);
+  }
+
+
+  return true;
+}
+
+bool xpc::GlobalProperties::DefineInXPCComponents(JSContext* cx,
+                                                  JS::HandleObject obj) {
+  if (indexedDB && !IndexedDatabaseManager::DefineIndexedDB(cx, obj))
+    return false;
+
+  return Define(cx, obj);
+}
+
+bool xpc::GlobalProperties::DefineInSandbox(JSContext* cx,
+                                            JS::HandleObject obj) {
+  MOZ_ASSERT(IsSandbox(obj));
+  MOZ_ASSERT(js::GetContextCompartment(cx) == JS::GetCompartment(obj));
+
+  if (indexedDB && !(IndexedDatabaseManager::ResolveSandboxBinding(cx) &&
+                     IndexedDatabaseManager::DefineIndexedDB(cx, obj)))
+    return false;
+
+  return Define(cx, obj);
+}
+
+nsresult SetSandboxCSP(nsISupports* prinOrSop, const nsAString& cspString) {
+  nsCOMPtr<nsIPrincipal> principal = do_QueryInterface(prinOrSop);
+  if (!principal) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  auto* basePrin = BasePrincipal::Cast(principal);
+  if (!basePrin->Is<ExpandedPrincipal>()) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  auto* expanded = basePrin->As<ExpandedPrincipal>();
+
+  nsCOMPtr<nsIContentSecurityPolicy> csp;
+
+  nsCOMPtr<nsIURI> selfURI;
+  MOZ_TRY(NS_NewURI(getter_AddRefs(selfURI), "about:blank"_ns));
+
+#if defined(MOZ_DEBUG)
+  expanded->GetCsp(getter_AddRefs(csp));
+  if (csp) {
+    uint32_t count = 0;
+    csp->GetPolicyCount(&count);
+    if (count > 0) {
+      nsAutoString parsedPolicyStr;
+      for (uint32_t i = 0; i < count; i++) {
+        csp->GetPolicyString(i, parsedPolicyStr);
+        MOZ_ASSERT(!parsedPolicyStr.Equals(cspString));
+      }
+    }
+  }
+#endif
+
+  RefPtr<ExpandedPrincipal> clonedPrincipal = ExpandedPrincipal::Create(
+      expanded->AllowList(), expanded->OriginAttributesRef());
+  MOZ_ASSERT(clonedPrincipal);
+
+  csp = new nsCSPContext();
+  MOZ_TRY(
+      csp->SetRequestContextWithPrincipal(clonedPrincipal, selfURI, ""_ns, 0));
+
+  MOZ_TRY(csp->AppendPolicy(cspString, false, false));
+
+  expanded->SetCsp(csp);
+  return NS_OK;
+}
+
+nsresult xpc::CreateSandboxObject(JSContext* cx, MutableHandleValue vp,
+                                  nsISupports* prinOrSop,
+                                  SandboxOptions& options) {
+  nsCOMPtr<nsIPrincipal> principal = do_QueryInterface(prinOrSop);
+  nsCOMPtr<nsIGlobalObject> obj = do_QueryInterface(prinOrSop);
+  if (obj) {
+    nsGlobalWindowInner* window =
+        WindowOrNull(js::UncheckedUnwrap(obj->GetGlobalJSObject(), false));
+    if (window && window->IsSecureContext()) {
+      options.forceSecureContext = true;
+    }
+  }
+  if (!principal) {
+    nsCOMPtr<nsIScriptObjectPrincipal> sop = do_QueryInterface(prinOrSop);
+    if (sop) {
+      principal = sop->GetPrincipal();
+    } else {
+      RefPtr<NullPrincipal> nullPrin =
+          NullPrincipal::CreateWithoutOriginAttributes();
+      principal = nullPrin;
+    }
+  }
+  MOZ_ASSERT(principal);
+
+  nsGlobalWindowInner* windowOfProto = nullptr;
+  if (options.proto) {
+    RootedObject unwrappedProto(cx, js::UncheckedUnwrap(options.proto, false));
+    if (principal->Subsumes(nsContentUtils::ObjectPrincipal(unwrappedProto))) {
+      windowOfProto = WindowGlobalOrNull(unwrappedProto);
+    }
+  }
+
+  JS::RealmOptions realmOptions;
+
+  auto& creationOptions = realmOptions.creationOptions();
+
+  bool isSystemPrincipal = principal->IsSystemPrincipal();
+
+  if (isSystemPrincipal) {
+    options.forceSecureContext = true;
+  }
+
+  if (options.forceSecureContext) {
+    creationOptions.setSecureContext(true);
+  }
+
+  xpc::SetPrefableRealmOptions(realmOptions);
+  if (!isSystemPrincipal &&
+      (!windowOfProto || !windowOfProto->CrossOriginIsolated())) {
+    creationOptions.setDefineSharedArrayBufferConstructor(false);
+  }
+  if (options.sameZoneAs) {
+    creationOptions.setNewCompartmentInExistingZone(
+        js::UncheckedUnwrap(options.sameZoneAs));
+  } else if (options.freshZone) {
+    creationOptions.setNewCompartmentAndZone();
+  } else if (isSystemPrincipal && !options.invisibleToDebugger &&
+             !options.freshCompartment) {
+    creationOptions.setExistingCompartment(xpc::PrivilegedJunkScope());
+  } else {
+    creationOptions.setNewCompartmentInSystemZone();
+  }
+
+  bool freezeBuiltins = isSystemPrincipal;
+  if (options.freezeBuiltins.isSome()) {
+    freezeBuiltins = options.freezeBuiltins.value();
+  }
+  if (freezeBuiltins) {
+    creationOptions.setFreezeBuiltins(true);
+  }
+
+  if (options.alwaysUseFdlibm) {
+    creationOptions.setAlwaysUseFdlibm(true);
+  }
+
+  creationOptions.setInvisibleToDebugger(options.invisibleToDebugger)
+      .setTrace(TraceXPCGlobal);
+
+  realmOptions.behaviors().setDiscardSource(options.discardSource);
+
+  if (isSystemPrincipal) {
+    realmOptions.behaviors().setClampAndJitterTime(false);
+  }
+
+  if (obj) {
+    nsGlobalWindowInner* window =
+        WindowOrNull(js::UncheckedUnwrap(obj->GetGlobalJSObject(), false));
+    if (window) {
+      const nsCString& localeOverride =
+          window->GetBrowsingContext()->Top()->GetLanguageOverride();
+      if (!localeOverride.IsEmpty()) {
+        realmOptions.behaviors().setLocaleOverride(
+            PromiseFlatCString(localeOverride).get());
+      }
+
+      const nsAString& timezoneOverride =
+          window->GetBrowsingContext()->Top()->GetTimezoneOverride();
+      if (!timezoneOverride.IsEmpty()) {
+        realmOptions.behaviors().setTimeZoneOverride(
+            NS_ConvertUTF16toUTF8(timezoneOverride).get());
+      }
+    }
+  }
+
+  const JSClass* clasp = &SandboxClass;
+
+  RootedObject sandbox(
+      cx, xpc::CreateGlobalObject(cx, clasp, principal, realmOptions));
+  if (!sandbox) {
+    return NS_ERROR_FAILURE;
+  }
+
+  bool hasExclusiveExpandos = !isSystemPrincipal;
+
+  bool wantXrays = AccessCheck::isChrome(sandbox) ? false : options.wantXrays;
+
+  if (creationOptions.compartmentSpecifier() ==
+      JS::CompartmentSpecifier::ExistingCompartment) {
+    CompartmentPrivate* priv = CompartmentPrivate::Get(sandbox);
+    MOZ_RELEASE_ASSERT(priv->allowWaivers == options.allowWaivers);
+    MOZ_RELEASE_ASSERT(priv->isUAWidgetCompartment == options.isUAWidgetScope);
+    MOZ_RELEASE_ASSERT(priv->hasExclusiveExpandos == hasExclusiveExpandos);
+    MOZ_RELEASE_ASSERT(priv->wantXrays == wantXrays);
+  } else {
+    CompartmentPrivate* priv = CompartmentPrivate::Get(sandbox);
+    priv->allowWaivers = options.allowWaivers;
+    priv->isUAWidgetCompartment = options.isUAWidgetScope;
+    priv->hasExclusiveExpandos = hasExclusiveExpandos;
+    priv->wantXrays = wantXrays;
+  }
+
+  {
+    JSAutoRealm ar(cx, sandbox);
+
+    SandboxPrivate::Create(principal, sandbox);
+
+    if (!JS::GetRealmObjectPrototype(cx)) {
+      return NS_ERROR_XPC_UNEXPECTED;
+    }
+
+    if (options.proto) {
+      bool ok = JS_WrapObject(cx, &options.proto);
+      if (!ok) {
+        return NS_ERROR_XPC_UNEXPECTED;
+      }
+
+      bool useSandboxProxy =
+          !!WindowOrNull(js::UncheckedUnwrap(options.proto, false));
+      if (!useSandboxProxy) {
+        JSObject* unwrappedProto =
+            js::CheckedUnwrapDynamic(options.proto, cx, false);
+        if (!unwrappedProto) {
+          JS_ReportErrorASCII(cx, "Sandbox must subsume sandboxPrototype");
+          return NS_ERROR_INVALID_ARG;
+        }
+        const JSClass* unwrappedClass = JS::GetClass(unwrappedProto);
+        useSandboxProxy = unwrappedClass->isWrappedNative() ||
+                          mozilla::dom::IsDOMClass(unwrappedClass);
+      }
+
+      if (useSandboxProxy) {
+        RootedValue priv(cx, ObjectValue(*options.proto));
+        options.proto =
+            js::NewProxyObject(cx, &sandboxProxyHandler, priv, nullptr);
+        if (!options.proto) {
+          return NS_ERROR_OUT_OF_MEMORY;
+        }
+      }
+
+      ok = JS_SetPrototype(cx, sandbox, options.proto);
+      if (!ok) {
+        return NS_ERROR_XPC_UNEXPECTED;
+      }
+    }
+
+    bool allowComponents = principal->IsSystemPrincipal();
+    if (options.wantComponents && allowComponents) {
+      if (!ObjectScope(sandbox)->AttachComponentsObject(cx)) {
+        return NS_ERROR_XPC_UNEXPECTED;
+      }
+
+      if (!ObjectScope(sandbox)->AttachJSServices(cx)) {
+        return NS_ERROR_XPC_UNEXPECTED;
+      }
+    }
+
+    if (!XPCNativeWrapper::AttachNewConstructorObject(cx, sandbox)) {
+      return NS_ERROR_XPC_UNEXPECTED;
+    }
+
+    if (!JS_DefineFunctions(cx, sandbox, SandboxFunctions)) {
+      return NS_ERROR_XPC_UNEXPECTED;
+    }
+
+    if (options.wantExportHelpers &&
+        (!JS_DefineFunction(cx, sandbox, "exportFunction",
+                            SandboxExportFunction, 3, 0) ||
+         !JS_DefineFunction(cx, sandbox, "createObjectIn",
+                            SandboxCreateObjectIn, 2, 0) ||
+         !JS_DefineFunction(cx, sandbox, "cloneInto", SandboxCloneInto, 3, 0) ||
+         !JS_DefineFunction(cx, sandbox, "isProxy", SandboxIsProxy, 1, 0)))
+      return NS_ERROR_XPC_UNEXPECTED;
+
+    if (!options.globalProperties.DefineInSandbox(cx, sandbox)) {
+      return NS_ERROR_XPC_UNEXPECTED;
+    }
+  }
+
+  vp.setObject(*sandbox);
+  if (js::GetContextCompartment(cx) && !JS_WrapValue(cx, vp)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  xpc::SetLocationForGlobal(sandbox, options.sandboxName);
+
+  nsresult rv = xpc::SetSandboxMetadata(cx, sandbox, options.metadata);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  JSAutoRealm ar(cx, sandbox);
+  JS_FireOnNewGlobalObject(cx, sandbox);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsXPCComponents_utils_Sandbox::Call(nsIXPConnectWrappedNative* wrapper,
+                                    JSContext* cx, JSObject* objArg,
+                                    const CallArgs& args, bool* _retval) {
+  RootedObject obj(cx, objArg);
+  return CallOrConstruct(wrapper, cx, obj, args, _retval);
+}
+
+NS_IMETHODIMP
+nsXPCComponents_utils_Sandbox::Construct(nsIXPConnectWrappedNative* wrapper,
+                                         JSContext* cx, JSObject* objArg,
+                                         const CallArgs& args, bool* _retval) {
+  RootedObject obj(cx, objArg);
+  return CallOrConstruct(wrapper, cx, obj, args, _retval);
+}
+
+bool ParsePrincipal(JSContext* cx, HandleString contentUrl,
+                    const OriginAttributes& aAttrs, nsIPrincipal** principal) {
+  MOZ_ASSERT(principal);
+  MOZ_ASSERT(contentUrl);
+  nsCOMPtr<nsIURI> uri;
+  nsAutoJSString contentStr;
+  NS_ENSURE_TRUE(contentStr.init(cx, contentUrl), false);
+  nsresult rv = NS_NewURI(getter_AddRefs(uri), contentStr);
+  if (NS_FAILED(rv)) {
+    JS_ReportErrorASCII(cx, "Creating URI from string failed");
+    return false;
+  }
+
+  nsCOMPtr<nsIPrincipal> prin =
+      BasePrincipal::CreateContentPrincipal(uri, aAttrs);
+  prin.forget(principal);
+
+  if (!*principal) {
+    JS_ReportErrorASCII(cx, "Creating Principal from URI failed");
+    return false;
+  }
+  return true;
+}
+
+static bool GetPrincipalOrSOP(JSContext* cx, HandleObject from,
+                              nsISupports** out) {
+  MOZ_ASSERT(out);
+  *out = nullptr;
+
+  nsCOMPtr<nsISupports> native = ReflectorToISupportsDynamic(from, cx);
+
+  if (nsCOMPtr<nsIScriptObjectPrincipal> sop = do_QueryInterface(native)) {
+    sop.forget(out);
+    return true;
+  }
+
+  nsCOMPtr<nsIPrincipal> principal = do_QueryInterface(native);
+  principal.forget(out);
+  NS_ENSURE_TRUE(*out, false);
+
+  return true;
+}
+
+static bool GetExpandedPrincipal(JSContext* cx, HandleObject arrayObj,
+                                 const SandboxOptions& options,
+                                 nsIExpandedPrincipal** out) {
+  MOZ_ASSERT(out);
+  uint32_t length;
+
+  if (!JS::GetArrayLength(cx, arrayObj, &length)) {
+    return false;
+  }
+  if (!length) {
+    JS_ReportErrorASCII(cx, "Expected an array of URI strings");
+    return false;
+  }
+
+  nsTArray<nsCOMPtr<nsIPrincipal>> allowedDomains(length);
+  allowedDomains.SetLength(length);
+
+  Maybe<OriginAttributes> attrs;
+  if (options.originAttributes) {
+    attrs.emplace();
+    JS::RootedValue val(cx, JS::ObjectValue(*options.originAttributes));
+    if (!attrs->Init(cx, val)) {
+      JS_ReportErrorASCII(cx, "Expected a valid OriginAttributes object");
+      return false;
+    }
+  }
+
+
+  for (uint32_t i = 0; i < length; ++i) {
+    RootedValue allowed(cx);
+    if (!JS_GetElement(cx, arrayObj, i, &allowed)) {
+      return false;
+    }
+
+    nsCOMPtr<nsIPrincipal> principal;
+    if (allowed.isObject()) {
+      nsCOMPtr<nsISupports> prinOrSop;
+      RootedObject obj(cx, &allowed.toObject());
+      if (!GetPrincipalOrSOP(cx, obj, getter_AddRefs(prinOrSop))) {
+        return false;
+      }
+
+      nsCOMPtr<nsIScriptObjectPrincipal> sop(do_QueryInterface(prinOrSop));
+      principal = do_QueryInterface(prinOrSop);
+      if (sop) {
+        principal = sop->GetPrincipal();
+      }
+      NS_ENSURE_TRUE(principal, false);
+
+      if (!options.originAttributes) {
+        const OriginAttributes prinAttrs = principal->OriginAttributesRef();
+        if (attrs.isNothing()) {
+          attrs.emplace(prinAttrs);
+        } else if (prinAttrs != attrs.ref()) {
+          return false;
+        }
+      }
+
+      bool isSystem = principal->IsSystemPrincipal();
+      if (isSystem) {
+        JS_ReportErrorASCII(
+            cx, "System principal is not allowed in an expanded principal");
+        return false;
+      }
+      allowedDomains[i] = principal;
+    } else if (allowed.isString()) {
+    } else {
+      return false;
+    }
+  }
+
+  if (attrs.isNothing()) {
+    attrs.emplace();
+  }
+
+  for (uint32_t i = 0; i < length; ++i) {
+    RootedValue allowed(cx);
+    if (!JS_GetElement(cx, arrayObj, i, &allowed)) {
+      return false;
+    }
+
+    nsCOMPtr<nsIPrincipal> principal;
+    if (allowed.isString()) {
+      RootedString str(cx, allowed.toString());
+
+      if (!ParsePrincipal(cx, str, attrs.ref(), getter_AddRefs(principal))) {
+        return false;
+      }
+      NS_ENSURE_TRUE(principal, false);
+      allowedDomains[i] = principal;
+    } else {
+      MOZ_ASSERT(allowed.isObject());
+    }
+  }
+
+  RefPtr<ExpandedPrincipal> result =
+      ExpandedPrincipal::Create(allowedDomains, attrs.ref());
+  result.forget(out);
+  return true;
+}
+
+bool OptionsBase::ParseValue(const char* name, MutableHandleValue prop,
+                             bool* aFound) {
+  bool found;
+  bool ok = JS_HasProperty(mCx, mObject, name, &found);
+  NS_ENSURE_TRUE(ok, false);
+
+  if (aFound) {
+    *aFound = found;
+  }
+
+  if (!found) {
+    return true;
+  }
+
+  return JS_GetProperty(mCx, mObject, name, prop);
+}
+
+bool OptionsBase::ParseBoolean(const char* name, bool* prop) {
+  MOZ_ASSERT(prop);
+  RootedValue value(mCx);
+  bool found;
+  bool ok = ParseValue(name, &value, &found);
+  NS_ENSURE_TRUE(ok, false);
+
+  if (!found) {
+    return true;
+  }
+
+  if (!value.isBoolean()) {
+    JS_ReportErrorASCII(mCx, "Expected a boolean value for property %s", name);
+    return false;
+  }
+
+  *prop = value.toBoolean();
+  return true;
+}
+
+bool OptionsBase::ParseOptionalBoolean(const char* name, Maybe<bool>& prop) {
+  RootedValue value(mCx);
+  bool found;
+  bool ok = ParseValue(name, &value, &found);
+  NS_ENSURE_TRUE(ok, false);
+
+  if (!found) {
+    return true;
+  }
+
+  if (!value.isBoolean()) {
+    JS_ReportErrorASCII(mCx, "Expected a boolean value for property %s", name);
+    return false;
+  }
+
+  prop = Some(value.toBoolean());
+  return true;
+}
+
+bool OptionsBase::ParseObject(const char* name, MutableHandleObject prop) {
+  RootedValue value(mCx);
+  bool found;
+  bool ok = ParseValue(name, &value, &found);
+  NS_ENSURE_TRUE(ok, false);
+
+  if (!found) {
+    return true;
+  }
+
+  if (!value.isObject()) {
+    JS_ReportErrorASCII(mCx, "Expected an object value for property %s", name);
+    return false;
+  }
+  prop.set(&value.toObject());
+  return true;
+}
+
+bool OptionsBase::ParseJSString(const char* name, MutableHandleString prop) {
+  RootedValue value(mCx);
+  bool found;
+  bool ok = ParseValue(name, &value, &found);
+  NS_ENSURE_TRUE(ok, false);
+
+  if (!found) {
+    return true;
+  }
+
+  if (!value.isString()) {
+    JS_ReportErrorASCII(mCx, "Expected a string value for property %s", name);
+    return false;
+  }
+  prop.set(value.toString());
+  return true;
+}
+
+bool OptionsBase::ParseString(const char* name, nsCString& prop) {
+  RootedValue value(mCx);
+  bool found;
+  bool ok = ParseValue(name, &value, &found);
+  NS_ENSURE_TRUE(ok, false);
+
+  if (!found) {
+    return true;
+  }
+
+  if (!value.isString()) {
+    JS_ReportErrorASCII(mCx, "Expected a string value for property %s", name);
+    return false;
+  }
+
+  JS::UniqueChars tmp = JS_EncodeStringToLatin1(mCx, value.toString());
+  NS_ENSURE_TRUE(tmp, false);
+  prop.Assign(tmp.get(), strlen(tmp.get()));
+  return true;
+}
+
+bool OptionsBase::ParseString(const char* name, nsString& prop) {
+  RootedValue value(mCx);
+  bool found;
+  bool ok = ParseValue(name, &value, &found);
+  NS_ENSURE_TRUE(ok, false);
+
+  if (!found) {
+    return true;
+  }
+
+  if (!value.isString()) {
+    JS_ReportErrorASCII(mCx, "Expected a string value for property %s", name);
+    return false;
+  }
+
+  nsAutoJSString strVal;
+  if (!strVal.init(mCx, value.toString())) {
+    return false;
+  }
+
+  prop = strVal;
+  return true;
+}
+
+bool OptionsBase::ParseOptionalString(const char* name, Maybe<nsString>& prop) {
+  RootedValue value(mCx);
+  bool found;
+  bool ok = ParseValue(name, &value, &found);
+  NS_ENSURE_TRUE(ok, false);
+
+  if (!found || value.isUndefined()) {
+    return true;
+  }
+
+  if (!value.isString()) {
+    JS_ReportErrorASCII(mCx, "Expected a string value for property %s", name);
+    return false;
+  }
+
+  nsAutoJSString strVal;
+  if (!strVal.init(mCx, value.toString())) {
+    return false;
+  }
+
+  prop = Some(strVal);
+  return true;
+}
+
+bool OptionsBase::ParseId(const char* name, MutableHandleId prop) {
+  RootedValue value(mCx);
+  bool found;
+  bool ok = ParseValue(name, &value, &found);
+  NS_ENSURE_TRUE(ok, false);
+
+  if (!found) {
+    return true;
+  }
+
+  return JS_ValueToId(mCx, value, prop);
+}
+
+bool OptionsBase::ParseUInt32(const char* name, uint32_t* prop) {
+  MOZ_ASSERT(prop);
+  RootedValue value(mCx);
+  bool found;
+  bool ok = ParseValue(name, &value, &found);
+  NS_ENSURE_TRUE(ok, false);
+
+  if (!found) {
+    return true;
+  }
+
+  if (!JS::ToUint32(mCx, value, prop)) {
+    JS_ReportErrorASCII(mCx, "Expected a uint32_t value for property %s", name);
+    return false;
+  }
+
+  return true;
+}
+
+bool SandboxOptions::ParseGlobalProperties() {
+  RootedValue value(mCx);
+  bool found;
+  bool ok = ParseValue("wantGlobalProperties", &value, &found);
+  NS_ENSURE_TRUE(ok, false);
+  if (!found) {
+    return true;
+  }
+
+  if (!value.isObject()) {
+    JS_ReportErrorASCII(mCx,
+                        "Expected an array value for wantGlobalProperties");
+    return false;
+  }
+
+  RootedObject ctors(mCx, &value.toObject());
+  bool isArray;
+  if (!JS::IsArrayObject(mCx, ctors, &isArray)) {
+    return false;
+  }
+  if (!isArray) {
+    JS_ReportErrorASCII(mCx,
+                        "Expected an array value for wantGlobalProperties");
+    return false;
+  }
+
+  return globalProperties.Parse(mCx, ctors);
+}
+
+bool SandboxOptions::Parse() {
+  bool ok = ParseObject("sandboxPrototype", &proto) &&
+            ParseBoolean("wantXrays", &wantXrays) &&
+            ParseBoolean("allowWaivers", &allowWaivers) &&
+            ParseBoolean("wantComponents", &wantComponents) &&
+            ParseBoolean("wantExportHelpers", &wantExportHelpers) &&
+            ParseBoolean("forceSecureContext", &forceSecureContext) &&
+            ParseOptionalString("sandboxContentSecurityPolicy",
+                                sandboxContentSecurityPolicy) &&
+            ParseString("sandboxName", sandboxName) &&
+            ParseObject("sameZoneAs", &sameZoneAs) &&
+            ParseOptionalBoolean("freezeBuiltins", freezeBuiltins) &&
+            ParseBoolean("freshCompartment", &freshCompartment) &&
+            ParseBoolean("freshZone", &freshZone) &&
+            ParseBoolean("invisibleToDebugger", &invisibleToDebugger) &&
+            ParseBoolean("discardSource", &discardSource) &&
+            ParseGlobalProperties() && ParseValue("metadata", &metadata) &&
+            ParseUInt32("userContextId", &userContextId) &&
+            ParseObject("originAttributes", &originAttributes) &&
+            ParseBoolean("alwaysUseFdlibm", &alwaysUseFdlibm);
+  if (!ok) {
+    return false;
+  }
+
+  if (freshZone && sameZoneAs) {
+    JS_ReportErrorASCII(mCx, "Cannot use both sameZoneAs and freshZone");
+    return false;
+  }
+
+  return true;
+}
+
+static nsresult AssembleSandboxMemoryReporterName(JSContext* cx,
+                                                  nsCString& sandboxName) {
+  if (sandboxName.IsEmpty()) {
+    sandboxName = "[anonymous sandbox]"_ns;
+  } else {
+#if !defined(DEBUG)
+    return NS_OK;
+#endif
+  }
+
+  XPCCallContext* cc = XPCJSContext::Get()->GetCallContext();
+  NS_ENSURE_TRUE(cc, NS_ERROR_INVALID_ARG);
+
+  nsCOMPtr<nsIStackFrame> frame = dom::GetCurrentJSStack();
+
+  if (frame) {
+    nsAutoCString location;
+    frame->GetFilename(cx, location);
+    int32_t lineNumber = frame->GetLineNumber(cx);
+
+    sandboxName.AppendLiteral(" (from: ");
+    sandboxName.Append(location);
+    sandboxName.Append(':');
+    sandboxName.AppendInt(lineNumber);
+    sandboxName.Append(')');
+  }
+
+  return NS_OK;
+}
+
+nsresult nsXPCComponents_utils_Sandbox::CallOrConstruct(
+    nsIXPConnectWrappedNative* wrapper, JSContext* cx, HandleObject obj,
+    const CallArgs& args, bool* _retval) {
+  if (args.length() < 1) {
+    return ThrowAndFail(NS_ERROR_XPC_NOT_ENOUGH_ARGS, cx, _retval);
+  }
+
+  nsresult rv;
+  bool ok = false;
+  bool calledWithOptions = args.length() > 1;
+  if (calledWithOptions && !args[1].isObject()) {
+    return ThrowAndFail(NS_ERROR_INVALID_ARG, cx, _retval);
+  }
+
+  RootedObject optionsObject(cx,
+                             calledWithOptions ? &args[1].toObject() : nullptr);
+
+  SandboxOptions options(cx, optionsObject);
+  if (calledWithOptions && !options.Parse()) {
+    return ThrowAndFail(NS_ERROR_INVALID_ARG, cx, _retval);
+  }
+
+  nsCOMPtr<nsIPrincipal> principal;
+  nsCOMPtr<nsIExpandedPrincipal> expanded;
+  nsCOMPtr<nsISupports> prinOrSop;
+
+  if (args[0].isString()) {
+    RootedString str(cx, args[0].toString());
+    OriginAttributes attrs;
+    if (options.originAttributes) {
+      JS::RootedValue val(cx, JS::ObjectValue(*options.originAttributes));
+      if (!attrs.Init(cx, val)) {
+        JS_ReportErrorASCII(cx, "Expected a valid OriginAttributes object");
+        return ThrowAndFail(NS_ERROR_INVALID_ARG, cx, _retval);
+      }
+    }
+    attrs.mUserContextId = options.userContextId;
+    ok = ParsePrincipal(cx, str, attrs, getter_AddRefs(principal));
+    prinOrSop = principal;
+  } else if (args[0].isObject()) {
+    RootedObject obj(cx, &args[0].toObject());
+    bool isArray;
+    if (!JS::IsArrayObject(cx, obj, &isArray)) {
+      ok = false;
+    } else if (isArray) {
+      if (options.userContextId != 0) {
+        ok = false;
+      } else {
+        ok = GetExpandedPrincipal(cx, obj, options, getter_AddRefs(expanded));
+        prinOrSop = expanded;
+      }
+    } else {
+      ok = GetPrincipalOrSOP(cx, obj, getter_AddRefs(prinOrSop));
+    }
+  } else if (args[0].isNull()) {
+    ok = true;
+  }
+
+  if (!ok) {
+    return ThrowAndFail(NS_ERROR_INVALID_ARG, cx, _retval);
+  }
+
+  if (options.sandboxContentSecurityPolicy.isSome()) {
+    if (!expanded) {
+      JS_ReportErrorASCII(cx,
+                          "sandboxContentSecurityPolicy is currently only "
+                          "supported with ExpandedPrincipals");
+      return ThrowAndFail(NS_ERROR_INVALID_ARG, cx, _retval);
+    }
+    rv = SetSandboxCSP(prinOrSop, options.sandboxContentSecurityPolicy.value());
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+  }
+
+  if (NS_FAILED(AssembleSandboxMemoryReporterName(cx, options.sandboxName))) {
+    return ThrowAndFail(NS_ERROR_INVALID_ARG, cx, _retval);
+  }
+
+  if (options.metadata.isNullOrUndefined()) {
+    RootedObject callerGlobal(cx, JS::GetScriptedCallerGlobal(cx));
+    if (IsSandbox(callerGlobal)) {
+      rv = GetSandboxMetadata(cx, callerGlobal, &options.metadata);
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        return rv;
+      }
+    }
+  }
+
+  rv = CreateSandboxObject(cx, args.rval(), prinOrSop, options);
+
+  if (NS_FAILED(rv)) {
+    return ThrowAndFail(rv, cx, _retval);
+  }
+
+  *_retval = true;
+  return NS_OK;
+}
+
+nsresult xpc::EvalInSandbox(JSContext* cx, HandleObject sandboxArg,
+                            const nsAString& source, const nsACString& filename,
+                            int32_t lineNo, bool enforceFilenameRestrictions,
+                            MutableHandleValue rval) {
+  JS_AbortIfWrongThread(cx);
+  rval.set(UndefinedValue());
+
+  bool waiveXray = xpc::WrapperFactory::HasWaiveXrayFlag(sandboxArg);
+  RootedObject sandbox(cx, js::CheckedUnwrapStatic(sandboxArg));
+  if (!sandbox || !IsSandbox(sandbox)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  SandboxPrivate* priv = SandboxPrivate::GetPrivate(sandbox);
+  nsIScriptObjectPrincipal* sop = priv;
+  MOZ_ASSERT(sop, "Invalid sandbox passed");
+  nsCOMPtr<nsIPrincipal> prin = sop->GetPrincipal();
+  NS_ENSURE_TRUE(prin, NS_ERROR_FAILURE);
+
+  nsAutoCString filenameBuf;
+  if (!filename.IsVoid() && filename.Length() != 0) {
+    filenameBuf.Assign(filename);
+  } else {
+    nsresult rv = nsJSPrincipals::get(prin)->GetScriptLocation(filenameBuf);
+    NS_ENSURE_SUCCESS(rv, rv);
+    lineNo = 1;
+  }
+
+  RootedValue v(cx, UndefinedValue());
+  RootedValue exn(cx, UndefinedValue());
+  bool ok = true;
+  {
+    mozilla::dom::AutoEntryScript aes(priv, "XPConnect sandbox evaluation");
+    JSContext* sandcx = aes.cx();
+    JSAutoRealm ar(sandcx, sandbox);
+
+    JS::CompileOptions options(sandcx);
+    options.setFileAndLine(filenameBuf.get(), lineNo);
+    options.setSkipFilenameValidation(!enforceFilenameRestrictions);
+    MOZ_ASSERT(JS_IsGlobalObject(sandbox));
+
+    const nsPromiseFlatString& flat = PromiseFlatString(source);
+
+    JS::SourceText<char16_t> buffer;
+    ok = buffer.init(sandcx, flat.get(), flat.Length(),
+                     JS::SourceOwnership::Borrowed) &&
+         JS::Evaluate(sandcx, options, buffer, &v);
+
+    if (aes.HasException()) {
+      if (!aes.StealException(&exn)) {
+        return NS_ERROR_OUT_OF_MEMORY;
+      }
+    }
+  }
+
+
+  if (!ok) {
+    if (exn.isUndefined() || !JS_WrapValue(cx, &exn)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    JS_SetPendingException(cx, exn);
+    return NS_ERROR_FAILURE;
+  }
+
+  if (waiveXray) {
+    ok = xpc::WrapperFactory::WaiveXrayAndWrap(cx, &v);
+  } else {
+    ok = JS_WrapValue(cx, &v);
+  }
+  NS_ENSURE_TRUE(ok, NS_ERROR_FAILURE);
+
+  rval.set(v);
+  return NS_OK;
+}
+
+nsresult xpc::GetSandboxMetadata(JSContext* cx, HandleObject sandbox,
+                                 MutableHandleValue rval) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(IsSandbox(sandbox));
+
+  RootedValue metadata(cx);
+  {
+    JSAutoRealm ar(cx, sandbox);
+    metadata =
+        JS::GetReservedSlot(sandbox, XPCONNECT_SANDBOX_CLASS_METADATA_SLOT);
+  }
+
+  if (!JS_WrapValue(cx, &metadata)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  rval.set(metadata);
+  return NS_OK;
+}
+
+nsresult xpc::SetSandboxLocaleOverride(JSContext* cx, HandleObject sandbox,
+                                       const char* locale) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(IsSandbox(sandbox));
+
+  JS::SetRealmLocaleOverride(JS::GetObjectRealmOrNull(sandbox), locale);
+
+  return NS_OK;
+}
+
+nsresult xpc::SetSandboxTimezoneOverride(JSContext* cx, HandleObject sandbox,
+                                         const char* timezone) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(IsSandbox(sandbox));
+
+  JS::SetRealmTimezoneOverride(JS::GetObjectRealmOrNull(sandbox), timezone);
+
+  return NS_OK;
+}
+
+nsresult xpc::SetSandboxMetadata(JSContext* cx, HandleObject sandbox,
+                                 HandleValue metadataArg) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(IsSandbox(sandbox));
+
+  RootedValue metadata(cx);
+
+  JSAutoRealm ar(cx, sandbox);
+  if (!JS_StructuredClone(cx, metadataArg, &metadata, nullptr, nullptr)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  JS_SetReservedSlot(sandbox, XPCONNECT_SANDBOX_CLASS_METADATA_SLOT, metadata);
+
+  return NS_OK;
+}
+
+ModuleLoaderBase* SandboxPrivate::GetModuleLoader(JSContext*) {
+  return nullptr;
+}
+
+mozilla::Result<mozilla::ipc::PrincipalInfo, nsresult>
+SandboxPrivate::GetStorageKey() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  mozilla::ipc::PrincipalInfo principalInfo;
+  nsresult rv = PrincipalToPrincipalInfo(mPrincipal, &principalInfo);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return mozilla::Err(rv);
+  }
+
+  if (principalInfo.type() !=
+          mozilla::ipc::PrincipalInfo::TContentPrincipalInfo &&
+      principalInfo.type() !=
+          mozilla::ipc::PrincipalInfo::TSystemPrincipalInfo) {
+    return Err(NS_ERROR_DOM_SECURITY_ERR);
+  }
+
+  return std::move(principalInfo);
+}

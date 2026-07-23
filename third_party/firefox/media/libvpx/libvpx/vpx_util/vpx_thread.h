@@ -1,0 +1,49 @@
+// Copyright 2013 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#if !defined(VPX_VPX_UTIL_VPX_THREAD_H_)
+#define VPX_VPX_UTIL_VPX_THREAD_H_
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+typedef enum {
+  VPX_WORKER_STATUS_NOT_OK = 0,  
+  VPX_WORKER_STATUS_OK,          
+  VPX_WORKER_STATUS_WORKING      
+} VPxWorkerStatus;
+
+typedef int (*VPxWorkerHook)(void *, void *);
+
+typedef struct VPxWorkerImpl VPxWorkerImpl;
+
+typedef struct {
+  VPxWorkerImpl *impl_;
+  VPxWorkerStatus status_;
+  const char *thread_name;
+  VPxWorkerHook hook;  
+  void *data1;         
+  void *data2;         
+  int had_error;       
+} VPxWorker;
+
+typedef struct {
+  void (*init)(VPxWorker *const worker);
+  int (*reset)(VPxWorker *const worker);
+  int (*sync)(VPxWorker *const worker);
+  void (*launch)(VPxWorker *const worker);
+  void (*execute)(VPxWorker *const worker);
+  void (*end)(VPxWorker *const worker);
+} VPxWorkerInterface;
+
+int vpx_set_worker_interface(const VPxWorkerInterface *const winterface);
+
+const VPxWorkerInterface *vpx_get_worker_interface(void);
+
+
+#if defined(__cplusplus)
+}  
+#endif
+
+#endif

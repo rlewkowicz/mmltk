@@ -1,0 +1,2459 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/Ion.h"
+#include "mozilla/ScopeExit.h"
+
+#include "mozilla/CheckedInt.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/IntegerPrintfMacros.h"
+#include "mozilla/MemoryReporting.h"
+
+#include "gc/GCContext.h"
+#include "gc/PublicIterators.h"
+#include "jit/AliasAnalysis.h"
+#include "jit/AutoWritableJitCode.h"
+#include "jit/BacktrackingAllocator.h"
+#include "jit/BaselineFrame.h"
+#include "jit/BaselineJIT.h"
+#include "jit/BranchHinting.h"
+#include "jit/BranchPruning.h"
+#include "jit/CodeGenerator.h"
+#include "jit/CompileInfo.h"
+#include "jit/DominatorTree.h"
+#include "jit/EdgeCaseAnalysis.h"
+#include "jit/EffectiveAddressAnalysis.h"
+#include "jit/ExecutableAllocator.h"
+#include "jit/FoldLinearArithConstants.h"
+#include "jit/InlineScriptTree.h"
+#include "jit/InstructionReordering.h"
+#include "jit/Invalidation.h"
+#include "jit/InvalidationScriptSet.h"
+#include "jit/IonAnalysis.h"
+#include "jit/IonCompileTask.h"
+#include "jit/IonIC.h"
+#include "jit/IonOptimizationLevels.h"
+#include "jit/IonScript.h"
+#include "jit/JitcodeMap.h"
+#include "jit/JitFrames.h"
+#include "jit/JitRuntime.h"
+#include "jit/JitSpewer.h"
+#include "jit/JitZone.h"
+#include "jit/LICM.h"
+#include "jit/Linker.h"
+#include "jit/LIR.h"
+#include "jit/Lowering.h"
+#include "jit/PerfSpewer.h"
+#include "jit/RangeAnalysis.h"
+#include "jit/ScalarReplacement.h"
+#include "jit/ScriptFromCalleeToken.h"
+#include "jit/SimpleAllocator.h"
+#include "jit/Sink.h"
+#include "jit/TypeAnalysis.h"
+#include "jit/UnrollLoops.h"
+#include "jit/ValueNumbering.h"
+#include "jit/WarpBuilder.h"
+#include "jit/WarpOracle.h"
+#include "jit/WasmBCE.h"
+#include "jit/WasmRefTypeAnalysis.h"
+#include "js/Printf.h"
+#include "js/UniquePtr.h"
+#include "util/Memory.h"
+#include "vm/HelperThreads.h"
+#include "vm/Realm.h"
+#if defined(MOZ_VTUNE)
+#  include "vtune/VTuneWrapper.h"
+#endif
+
+#include "gc/GC-inl.h"
+#include "gc/StableCellHasher-inl.h"
+#include "jit/InlineScriptTree-inl.h"
+#include "jit/MacroAssembler-inl.h"
+#include "jit/SafepointIndex-inl.h"
+#include "vm/GeckoProfiler-inl.h"
+#include "vm/JSContext-inl.h"
+#include "vm/JSScript-inl.h"
+#include "vm/Realm-inl.h"
+
+
+using mozilla::CheckedInt;
+using mozilla::DebugOnly;
+
+using namespace js;
+using namespace js::jit;
+
+JitRuntime::~JitRuntime() {
+  MOZ_ASSERT(numFinishedOffThreadTasks_ == 0);
+  MOZ_ASSERT(ionLazyLinkListSize_ == 0);
+  MOZ_ASSERT(ionLazyLinkList_.ref().isEmpty());
+
+  MOZ_ASSERT(ionFreeTaskBatch_.ref().empty());
+
+  MOZ_ASSERT_IF(jitcodeGlobalTable_, jitcodeGlobalTable_->empty());
+  js_delete(jitcodeGlobalTable_.ref());
+
+  js_delete(jitHintsMap_.ref());
+}
+
+uint32_t JitRuntime::startTrampolineCode(MacroAssembler& masm) {
+  AutoCreatedBy acb(masm, "startTrampolineCode");
+
+  masm.assumeUnreachable("Shouldn't get here");
+  masm.flushBuffer();
+  masm.haltingAlign(CodeAlignment);
+  masm.setFramePushed(0);
+  return masm.currentOffset();
+}
+
+bool JitRuntime::initialize(JSContext* cx) {
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(cx->runtime()));
+
+  AutoAllocInAtomsZone az(cx);
+  JitContext jctx(cx);
+
+  if (!generateTrampolines(cx)) {
+    return false;
+  }
+
+  if (!generateBaselineICFallbackCode(cx)) {
+    return false;
+  }
+
+  jitcodeGlobalTable_ = cx->new_<JitcodeGlobalTable>();
+  if (!jitcodeGlobalTable_) {
+    return false;
+  }
+
+  if (!JitOptions.disableJitHints) {
+    jitHintsMap_ = cx->new_<JitHintsMap>();
+    if (!jitHintsMap_) {
+      return false;
+    }
+  }
+
+  if (!GenerateBaselineInterpreter(cx, baselineInterpreter_)) {
+    return false;
+  }
+
+  cx->runtime()->selfHostedLazyScript.ref().jitCodeRaw_ =
+      interpreterStub().value;
+
+  return true;
+}
+
+bool JitRuntime::generateTrampolines(JSContext* cx) {
+  TempAllocator temp(&cx->tempLifoAlloc());
+  StackMacroAssembler masm(cx, temp);
+  PerfSpewerRangeRecorder rangeRecorder(masm);
+
+  Label bailoutTail;
+  JitSpew(JitSpew_Codegen, "# Emitting bailout tail stub");
+  generateBailoutTailStub(masm, &bailoutTail);
+
+  JitSpew(JitSpew_Codegen, "# Emitting bailout handler");
+  generateBailoutHandler(masm, &bailoutTail);
+  rangeRecorder.recordOffset("Trampoline: Bailout");
+
+  JitSpew(JitSpew_Codegen, "# Emitting invalidator");
+  generateInvalidator(masm, &bailoutTail);
+  rangeRecorder.recordOffset("Trampoline: Invalidator");
+
+  JitSpew(JitSpew_Codegen, "# Emitting EnterJIT sequence");
+  generateEnterJIT(cx, masm);
+  rangeRecorder.recordOffset("Trampoline: EnterJIT");
+
+  JitSpew(JitSpew_Codegen, "# Emitting Pre Barrier for Value");
+  valuePreBarrierOffset_ = generatePreBarrier(cx, masm, MIRType::Value);
+  rangeRecorder.recordOffset("Trampoline: PreBarrier Value");
+
+  JitSpew(JitSpew_Codegen, "# Emitting Pre Barrier for String");
+  stringPreBarrierOffset_ = generatePreBarrier(cx, masm, MIRType::String);
+  rangeRecorder.recordOffset("Trampoline: PreBarrier String");
+
+  JitSpew(JitSpew_Codegen, "# Emitting Pre Barrier for Object");
+  objectPreBarrierOffset_ = generatePreBarrier(cx, masm, MIRType::Object);
+  rangeRecorder.recordOffset("Trampoline: PreBarrier Object");
+
+  JitSpew(JitSpew_Codegen, "# Emitting Pre Barrier for Shape");
+  shapePreBarrierOffset_ = generatePreBarrier(cx, masm, MIRType::Shape);
+  rangeRecorder.recordOffset("Trampoline: PreBarrier Shape");
+
+  JitSpew(JitSpew_Codegen, "# Emitting Pre Barrier for WasmAnyRef");
+  wasmAnyRefPreBarrierOffset_ =
+      generatePreBarrier(cx, masm, MIRType::WasmAnyRef);
+  rangeRecorder.recordOffset("Trampoline: PreBarrier WasmAnyRef");
+
+  JitSpew(JitSpew_Codegen, "# Emitting lazy link stub");
+  generateLazyLinkStub(masm);
+  rangeRecorder.recordOffset("Trampoline: LazyLinkStub");
+
+  JitSpew(JitSpew_Codegen, "# Emitting interpreter stub");
+  generateInterpreterStub(masm);
+  rangeRecorder.recordOffset("Trampoline: Interpreter");
+
+  JitSpew(JitSpew_Codegen, "# Emitting double-to-int32-value stub");
+  generateDoubleToInt32ValueStub(masm);
+  rangeRecorder.recordOffset("Trampoline: DoubleToInt32ValueStub");
+
+  JitSpew(JitSpew_Codegen, "# Emitting VM function wrappers");
+  if (!generateVMWrappers(cx, masm, rangeRecorder)) {
+    return false;
+  }
+
+  JitSpew(JitSpew_Codegen, "# Emitting profiler exit frame tail stub");
+  Label profilerExitTail;
+  generateProfilerExitFrameTailStub(masm, &profilerExitTail);
+  rangeRecorder.recordOffset("Trampoline: ProfilerExitFrameTailStub");
+
+  JitSpew(JitSpew_Codegen, "# Emitting exception tail stub");
+  generateExceptionTailStub(masm, &profilerExitTail, &bailoutTail);
+  rangeRecorder.recordOffset("Trampoline: ExceptionTailStub");
+
+  JitSpew(JitSpew_Codegen, "# Emitting Ion generic call stub");
+  generateIonGenericCallStub(masm, IonGenericCallKind::Call);
+  rangeRecorder.recordOffset("Trampoline: IonGenericCall");
+
+  JitSpew(JitSpew_Codegen, "# Emitting Ion generic construct stub");
+  generateIonGenericCallStub(masm, IonGenericCallKind::Construct);
+  rangeRecorder.recordOffset("Trampoline: IonGenericConstruct");
+
+  JitSpew(JitSpew_Codegen, "# Emitting megamorphic load stub");
+  generateMegamorphicLoadStub(masm);
+  rangeRecorder.recordOffset("Trampoline: MegamorphicLoad");
+
+  JitSpew(JitSpew_Codegen, "# Emitting permissive megamorphic load stub");
+  generateMegamorphicLoadStubPermissive(masm);
+  rangeRecorder.recordOffset("Trampoline: MegamorphicLoadPermissive");
+
+  JitSpew(JitSpew_Codegen, "# Emitting trampoline natives");
+  TrampolineNativeJitEntryOffsets nativeOffsets;
+  generateTrampolineNatives(masm, nativeOffsets, rangeRecorder);
+
+  Linker linker(masm);
+  trampolineCode_ = linker.newCode(cx, CodeKind::Other);
+  if (!trampolineCode_) {
+    return false;
+  }
+
+  rangeRecorder.collectRangesForJitCode(trampolineCode_);
+#if defined(MOZ_VTUNE)
+  vtune::MarkStub(trampolineCode_, "Trampolines");
+#endif
+
+  for (size_t i = 0; i < size_t(TrampolineNative::Count); i++) {
+    TrampolineNative native = TrampolineNative(i);
+    uint32_t offset = nativeOffsets[native];
+    MOZ_ASSERT(offset > 0 && offset < trampolineCode_->instructionsSize());
+    trampolineNativeJitEntries_[native] = trampolineCode_->raw() + offset;
+  }
+
+  return true;
+}
+
+bool JitRuntime::ensureDebugTrapHandler(JSContext* cx,
+                                        DebugTrapHandlerKind kind) {
+  if (debugTrapHandlers_[kind]) {
+    return true;
+  }
+
+  mozilla::Maybe<AutoAllocInAtomsZone> az;
+  if (!cx->zone()->isAtomsZone()) {
+    az.emplace(cx);
+  }
+  debugTrapHandlers_[kind] = generateDebugTrapHandler(cx, kind);
+  return debugTrapHandlers_[kind];
+}
+
+JitRuntime::IonCompileTaskList& JitRuntime::ionLazyLinkList(JSRuntime* rt) {
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(rt),
+             "Should only be mutated by the main thread.");
+  return ionLazyLinkList_.ref();
+}
+
+void JitRuntime::ionLazyLinkListRemove(JSRuntime* rt,
+                                       jit::IonCompileTask* task) {
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(rt),
+             "Should only be mutated by the main thread.");
+  MOZ_ASSERT(rt == task->script()->runtimeFromMainThread());
+  MOZ_ASSERT(ionLazyLinkListSize_ > 0);
+
+  task->removeFrom(ionLazyLinkList(rt));
+  ionLazyLinkListSize_--;
+
+  MOZ_ASSERT(ionLazyLinkList(rt).isEmpty() == (ionLazyLinkListSize_ == 0));
+}
+
+void JitRuntime::ionLazyLinkListAdd(JSRuntime* rt, jit::IonCompileTask* task) {
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(rt),
+             "Should only be mutated by the main thread.");
+  MOZ_ASSERT(rt == task->script()->runtimeFromMainThread());
+  ionLazyLinkList(rt).insertFront(task);
+  ionLazyLinkListSize_++;
+}
+
+uint8_t* JitRuntime::allocateIonOsrTempData(size_t size) {
+  MOZ_ASSERT(size > 0);
+
+  uint8_t* prevBuffer = ionOsrTempData_.ref().get();
+  size_t prevSize = ionOsrTempDataSize_.ref();
+  MOZ_ASSERT((prevSize > 0) == !!prevBuffer);
+
+  if (prevSize >= size) {
+    return prevBuffer;
+  }
+
+  uint8_t* buffer = js_pod_realloc<uint8_t>(prevBuffer, prevSize, size);
+  if (!buffer) {
+    return nullptr;
+  }
+  (void)ionOsrTempData_.ref().release();
+  ionOsrTempData_.ref().reset(buffer);
+  ionOsrTempDataSize_ = size;
+  return buffer;
+}
+
+void JitRuntime::freeIonOsrTempData() {
+  ionOsrTempData_.ref().reset();
+  ionOsrTempDataSize_ = 0;
+}
+
+static bool LinkCodeGen(JSContext* cx, CodeGenerator* codegen,
+                        HandleScript script) {
+  if (!codegen->link(cx)) {
+    return false;
+  }
+
+  return true;
+}
+
+static bool LinkBackgroundCodeGen(JSContext* cx, IonCompileTask* task) {
+  CodeGenerator* codegen = task->backgroundCodegen();
+  if (!codegen) {
+    return false;
+  }
+
+  JitContext jctx(cx);
+  RootedScript script(cx, task->script());
+  return LinkCodeGen(cx, codegen, script);
+}
+
+void jit::LinkIonScript(JSContext* cx, HandleScript calleeScript) {
+  MOZ_ASSERT(calleeScript->hasBaselineScript());
+  IonCompileTask* task =
+      calleeScript->baselineScript()->pendingIonCompileTask();
+  calleeScript->baselineScript()->removePendingIonCompileTask(cx->runtime(),
+                                                              calleeScript);
+
+  cx->runtime()->jitRuntime()->ionLazyLinkListRemove(cx->runtime(), task);
+
+  {
+    gc::AutoSuppressGC suppressGC(cx);
+    if (!LinkBackgroundCodeGen(cx, task)) {
+      cx->clearPendingException();
+    }
+  }
+
+  AutoStartIonFreeTask freeTask(cx->runtime()->jitRuntime());
+  FinishOffThreadTask(cx->runtime(), freeTask, task);
+}
+
+uint8_t* jit::LazyLinkTopActivation(JSContext* cx,
+                                    LazyLinkExitFrameLayout* frame) {
+  RootedScript calleeScript(
+      cx, ScriptFromCalleeToken(frame->jsFrame()->calleeToken()));
+
+  LinkIonScript(cx, calleeScript);
+
+  MOZ_ASSERT(calleeScript->hasBaselineScript());
+  MOZ_ASSERT(calleeScript->jitCodeRaw());
+
+  return calleeScript->jitCodeRaw();
+}
+
+void JitRuntime::TraceAtomZoneRoots(JSTracer* trc) {
+  if (trc->runtime()->atomsAreFinished()) {
+    return;
+  }
+
+  Zone* zone = trc->runtime()->atomsZone();
+  for (auto i = zone->cellIterUnsafe<JitCode>(); !i.done(); i.next()) {
+    JitCode* code = i;
+    TraceRoot(trc, &code, "wrapper");
+  }
+}
+
+void JitRuntime::TraceWeakJitcodeGlobalTable(JSRuntime* rt, JSTracer* trc) {
+  if (rt->hasJitRuntime() && rt->jitRuntime()->hasJitcodeGlobalTable()) {
+    rt->jitRuntime()->getJitcodeGlobalTable()->traceWeak(rt, trc);
+  }
+}
+
+bool JitZone::addInlinedCompilation(const IonScriptKey& ionScriptKey,
+                                    JSScript* inlined) {
+  MOZ_ASSERT(inlined != ionScriptKey.script());
+
+  auto p = inlinedCompilations_.lookupForAdd(inlined);
+  if (p) {
+    auto& compilations = p->value();
+    if (!compilations.empty() && compilations.back() == ionScriptKey) {
+      return true;
+    }
+    return compilations.append(ionScriptKey);
+  }
+
+  IonScriptKeyVector compilations;
+  if (!compilations.append(ionScriptKey)) {
+    return false;
+  }
+  return inlinedCompilations_.add(p, inlined, std::move(compilations));
+}
+
+void jit::AddPendingInvalidation(IonScriptKeyVector& invalid,
+                                 JSScript* script) {
+  MOZ_ASSERT(script);
+
+  CancelOffThreadIonCompile(script);
+
+  script->resetWarmUpCounterToDelayIonCompilation();
+
+  JitScript* jitScript = script->maybeJitScript();
+  if (!jitScript) {
+    return;
+  }
+
+  auto addPendingInvalidation = [&invalid](const IonScriptKey& ionScriptKey) {
+    AutoEnterOOMUnsafeRegion oomUnsafe;
+    if (!invalid.append(ionScriptKey)) {
+      size_t allocSize = 2 * sizeof(IonScriptKey) * invalid.capacity();
+      oomUnsafe.crash(allocSize, "Could not update IonScriptKeyVector");
+    }
+  };
+
+  if (jitScript->hasIonScript()) {
+    IonScriptKey ionScriptKey(script, jitScript->ionScript()->compilationId());
+    addPendingInvalidation(ionScriptKey);
+  }
+
+  auto* inlinedCompilations =
+      script->zone()->jitZone()->maybeInlinedCompilations(script);
+  if (inlinedCompilations) {
+    for (const auto& ionScriptKey : *inlinedCompilations) {
+      addPendingInvalidation(ionScriptKey);
+    }
+    script->zone()->jitZone()->removeInlinedCompilations(script);
+  }
+}
+
+IonScript* IonScriptKey::maybeIonScriptToInvalidate() const {
+  MOZ_ASSERT(CurrentThreadIsMainThread() || CurrentThreadIsGCSweeping());
+
+#if defined(DEBUG)
+  auto* jitZone = script_->zoneFromAnyThread()->jitZone();
+  MOZ_ASSERT_IF(jitZone->currentCompilationId(),
+                jitZone->currentCompilationId().ref() != id_);
+#endif
+
+  if (!script_->hasIonScript() ||
+      script_->ionScript()->compilationId() != id_) {
+    return nullptr;
+  }
+
+  return script_->ionScript();
+}
+
+bool IonScriptKey::traceWeak(JSTracer* trc) {
+
+  if (!TraceManuallyBarrieredWeakEdge(trc, &script_, "IonScriptKey::script")) {
+    return false;
+  }
+
+  return maybeIonScriptToInvalidate() != nullptr;
+}
+
+void JitZone::traceWeak(JSTracer* trc, Zone* zone) {
+  MOZ_ASSERT(this == zone->jitZone());
+
+  for (WeakHeapPtr<JitCode*>& stub : stubs_) {
+    TraceOrClearWeakEdge(trc, &stub, "JitZone::stubs_");
+  }
+
+  baselineCacheIRStubCodes_.traceWeak(trc);
+  inlinedCompilations_.traceWeak(trc);
+
+  TraceOrClearWeakEdge(trc, &lastStubFoldingBailoutInner_,
+                       "JitZone::lastStubFoldingBailoutInner_");
+  TraceOrClearWeakEdge(trc, &lastStubFoldingBailoutOuter_,
+                       "JitZone::lastStubFoldingBailoutOuter_");
+}
+
+void JitZone::traceScriptTableRoots(JSTracer* trc) {
+  if (interpreterEntryMap) {
+    interpreterEntryMap->trace(trc);
+  }
+}
+
+void JitZone::finishScriptTableRoots() {
+  if (interpreterEntryMap) {
+    interpreterEntryMap->clear();
+    interpreterEntryMap.reset();
+  }
+}
+
+void JitZone::addSizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf,
+                                     JS::CodeSizes* code, size_t* jitZone,
+                                     size_t* cacheIRStubs) const {
+  *jitZone += mallocSizeOf(this);
+  *jitZone +=
+      baselineCacheIRStubCodes_.shallowSizeOfExcludingThis(mallocSizeOf);
+  *jitZone += ionCacheIRStubInfoSet_.shallowSizeOfExcludingThis(mallocSizeOf);
+
+  execAlloc().addSizeOfCode(code);
+
+  *cacheIRStubs += stubSpace_.sizeOfExcludingThis(mallocSizeOf);
+}
+
+void JitCodeHeader::init(JitCode* jitCode) {
+  MOZ_ASSERT(!gc::IsMovableKind(gc::AllocKind::JITCODE));
+  jitCode_ = jitCode;
+}
+
+template <AllowGC allowGC>
+JitCode* JitCode::New(JSContext* cx, uint8_t* code, uint32_t totalSize,
+                      uint32_t headerSize, ExecutablePool* pool,
+                      CodeKind kind) {
+  uint32_t bufferSize = totalSize - headerSize;
+  JitCode* codeObj =
+      cx->newCell<JitCode, allowGC>(code, bufferSize, headerSize, pool, kind);
+  if (!codeObj) {
+    pool->release(totalSize, kind);
+    return nullptr;
+  }
+
+  cx->zone()->incJitMemory(totalSize);
+
+  return codeObj;
+}
+
+template JitCode* JitCode::New<CanGC>(JSContext* cx, uint8_t* code,
+                                      uint32_t bufferSize, uint32_t headerSize,
+                                      ExecutablePool* pool, CodeKind kind);
+
+template JitCode* JitCode::New<NoGC>(JSContext* cx, uint8_t* code,
+                                     uint32_t bufferSize, uint32_t headerSize,
+                                     ExecutablePool* pool, CodeKind kind);
+
+void JitCode::copyFrom(MacroAssembler& masm) {
+  JitCodeHeader::FromExecutable(raw())->init(this);
+
+  insnSize_ = masm.instructionsSize();
+  masm.executableCopy(raw());
+
+  jumpRelocTableBytes_ = masm.jumpRelocationTableBytes();
+  masm.copyJumpRelocationTable(raw() + jumpRelocTableOffset());
+
+  dataRelocTableBytes_ = masm.dataRelocationTableBytes();
+  masm.copyDataRelocationTable(raw() + dataRelocTableOffset());
+
+  masm.processCodeLabels(raw());
+}
+
+void JitCode::traceChildren(JSTracer* trc) {
+  if (invalidated()) {
+    return;
+  }
+
+  if (jumpRelocTableBytes_) {
+    uint8_t* start = raw() + jumpRelocTableOffset();
+    CompactBufferReader reader(start, start + jumpRelocTableBytes_);
+    MacroAssembler::TraceJumpRelocations(trc, this, reader);
+  }
+  if (dataRelocTableBytes_) {
+    uint8_t* start = raw() + dataRelocTableOffset();
+    CompactBufferReader reader(start, start + dataRelocTableBytes_);
+    MacroAssembler::TraceDataRelocations(trc, this, reader);
+  }
+}
+
+void JitCode::finalize(JS::GCContext* gcx) {
+#if defined(DEBUG)
+  JSRuntime* rt = gcx->runtime();
+  if (hasBytecodeMap_) {
+    MOZ_ASSERT(rt->jitRuntime()->hasJitcodeGlobalTable());
+    auto* entry = rt->jitRuntime()->getJitcodeGlobalTable()->lookup(raw());
+    MOZ_ASSERT(!entry || !entry->hasJitcode());
+  }
+#endif
+
+#if defined(MOZ_VTUNE)
+  vtune::UnmarkCode(this);
+#endif
+
+  MOZ_ASSERT(pool_);
+
+  if (gcx->appendJitPoisonRange(JitPoisonRange(pool_, raw() - headerSize_,
+                                               headerSize_ + bufferSize_))) {
+    pool_->addRef();
+  }
+  setHeaderPtr(nullptr);
+
+  pool_->release(headerSize_ + bufferSize_, CodeKind(kind_));
+  zone()->decJitMemory(headerSize_ + bufferSize_);
+
+  pool_ = nullptr;
+}
+
+IonScript::IonScript(IonCompilationId compilationId, uint32_t localSlotsSize,
+                     uint32_t argumentSlotsSize, uint32_t frameSize)
+    : localSlotsSize_(localSlotsSize),
+      argumentSlotsSize_(argumentSlotsSize),
+      frameSize_(frameSize),
+      compilationId_(compilationId) {}
+
+IonScript* IonScript::New(JSContext* cx, IonCompilationId compilationId,
+                          uint32_t localSlotsSize, uint32_t argumentSlotsSize,
+                          uint32_t frameSize, size_t snapshotsListSize,
+                          size_t snapshotsRVATableSize, size_t recoversSize,
+                          size_t constants, size_t nurseryObjects,
+                          size_t safepointIndices, size_t osiIndices,
+                          size_t icEntries, size_t runtimeSize,
+                          size_t safepointsSize) {
+  if (snapshotsListSize >= MAX_BUFFER_SIZE) {
+    ReportOutOfMemory(cx);
+    return nullptr;
+  }
+
+  static_assert(SizeOf_OsiIndex == sizeof(OsiIndex),
+                "IonScript has wrong size for OsiIndex");
+  static_assert(SizeOf_SafepointIndex == sizeof(SafepointIndex),
+                "IonScript has wrong size for SafepointIndex");
+
+  CheckedInt<Offset> allocSize = sizeof(IonScript);
+  allocSize += CheckedInt<Offset>(constants) * sizeof(HeapPtr<Value>);
+  allocSize += CheckedInt<Offset>(runtimeSize);
+  allocSize += CheckedInt<Offset>(nurseryObjects) * sizeof(HeapPtr<JSObject*>);
+  allocSize += CheckedInt<Offset>(osiIndices) * sizeof(OsiIndex);
+  allocSize += CheckedInt<Offset>(safepointIndices) * sizeof(SafepointIndex);
+  allocSize += CheckedInt<Offset>(icEntries) * sizeof(uint32_t);
+  allocSize += CheckedInt<Offset>(safepointsSize);
+  allocSize += CheckedInt<Offset>(snapshotsListSize);
+  allocSize += CheckedInt<Offset>(snapshotsRVATableSize);
+  allocSize += CheckedInt<Offset>(recoversSize);
+
+  if (!allocSize.isValid()) {
+    ReportAllocationOverflow(cx);
+    return nullptr;
+  }
+
+  void* raw = cx->pod_malloc<uint8_t>(allocSize.value());
+  MOZ_ASSERT(uintptr_t(raw) % alignof(IonScript) == 0);
+  if (!raw) {
+    return nullptr;
+  }
+  IonScript* script = new (raw)
+      IonScript(compilationId, localSlotsSize, argumentSlotsSize, frameSize);
+
+  Offset offsetCursor = sizeof(IonScript);
+
+  MOZ_ASSERT(offsetCursor % alignof(HeapPtr<Value>) == 0);
+  script->initElements<HeapPtr<Value>>(offsetCursor, constants);
+  script->constantTableOffset_ = offsetCursor;
+  offsetCursor += constants * sizeof(HeapPtr<Value>);
+
+  MOZ_ASSERT(offsetCursor % alignof(uint64_t) == 0);
+  script->runtimeDataOffset_ = offsetCursor;
+  offsetCursor += runtimeSize;
+
+  MOZ_ASSERT(offsetCursor % alignof(HeapPtr<JSObject*>) == 0);
+  script->initElements<HeapPtr<JSObject*>>(offsetCursor, nurseryObjects);
+  script->nurseryObjectsOffset_ = offsetCursor;
+  offsetCursor += nurseryObjects * sizeof(HeapPtr<JSObject*>);
+
+  MOZ_ASSERT(offsetCursor % alignof(OsiIndex) == 0);
+  script->osiIndexOffset_ = offsetCursor;
+  offsetCursor += osiIndices * sizeof(OsiIndex);
+
+  MOZ_ASSERT(offsetCursor % alignof(SafepointIndex) == 0);
+  script->safepointIndexOffset_ = offsetCursor;
+  offsetCursor += safepointIndices * sizeof(SafepointIndex);
+
+  MOZ_ASSERT(offsetCursor % alignof(uint32_t) == 0);
+  script->icIndexOffset_ = offsetCursor;
+  offsetCursor += icEntries * sizeof(uint32_t);
+
+  script->safepointsOffset_ = offsetCursor;
+  offsetCursor += safepointsSize;
+
+  script->snapshotsOffset_ = offsetCursor;
+  offsetCursor += snapshotsListSize;
+
+  script->rvaTableOffset_ = offsetCursor;
+  offsetCursor += snapshotsRVATableSize;
+
+  script->recoversOffset_ = offsetCursor;
+  offsetCursor += recoversSize;
+
+  script->allocBytes_ = offsetCursor;
+
+  MOZ_ASSERT(script->numConstants() == constants);
+  MOZ_ASSERT(script->runtimeSize() == runtimeSize);
+  MOZ_ASSERT(script->numNurseryObjects() == nurseryObjects);
+  MOZ_ASSERT(script->numOsiIndices() == osiIndices);
+  MOZ_ASSERT(script->numSafepointIndices() == safepointIndices);
+  MOZ_ASSERT(script->numICs() == icEntries);
+  MOZ_ASSERT(script->safepointsSize() == safepointsSize);
+  MOZ_ASSERT(script->snapshotsListSize() == snapshotsListSize);
+  MOZ_ASSERT(script->snapshotsRVATableSize() == snapshotsRVATableSize);
+  MOZ_ASSERT(script->recoversSize() == recoversSize);
+  MOZ_ASSERT(script->endOffset() == offsetCursor);
+
+  return script;
+}
+
+void IonScript::trace(JSTracer* trc) {
+  if (method_) {
+    TraceEdge(trc, &method_, "method");
+  }
+
+  for (size_t i = 0; i < numConstants(); i++) {
+    TraceEdge(trc, &getConstant(i), "constant");
+  }
+
+  for (size_t i = 0; i < numNurseryObjects(); i++) {
+    TraceEdge(trc, &nurseryObjects()[i], "nursery-object");
+  }
+
+  for (size_t i = 0; i < numICs(); i++) {
+    getICFromIndex(i).trace(trc, this);
+  }
+}
+
+void IonScript::traceWeak(JSTracer* trc) {
+}
+
+void IonScript::preWriteBarrier(Zone* zone, IonScript* ionScript) {
+  PreWriteBarrier(zone, ionScript);
+}
+
+void IonScript::copySnapshots(const SnapshotWriter* writer) {
+  MOZ_ASSERT(writer->listSize() == snapshotsListSize());
+  memcpy(offsetToPointer<uint8_t>(snapshotsOffset()), writer->listBuffer(),
+         snapshotsListSize());
+
+  MOZ_ASSERT(snapshotsRVATableSize());
+  MOZ_ASSERT(writer->RVATableSize() == snapshotsRVATableSize());
+  memcpy(offsetToPointer<uint8_t>(rvaTableOffset()), writer->RVATableBuffer(),
+         snapshotsRVATableSize());
+}
+
+void IonScript::copyRecovers(const RecoverWriter* writer) {
+  MOZ_ASSERT(writer->size() == recoversSize());
+  memcpy(offsetToPointer<uint8_t>(recoversOffset()), writer->buffer(),
+         recoversSize());
+}
+
+void IonScript::copySafepoints(const SafepointWriter* writer) {
+  MOZ_ASSERT(writer->size() == safepointsSize());
+  memcpy(offsetToPointer<uint8_t>(safepointsOffset()), writer->buffer(),
+         safepointsSize());
+}
+
+void IonScript::copyConstants(const Value* vp) {
+  for (size_t i = 0; i < numConstants(); i++) {
+    constants()[i].init(vp[i]);
+  }
+}
+
+void IonScript::copySafepointIndices(const CodegenSafepointIndex* si) {
+  SafepointIndex* table = safepointIndices();
+  for (size_t i = 0; i < numSafepointIndices(); ++i) {
+    table[i] = SafepointIndex(si[i]);
+  }
+}
+
+void IonScript::copyOsiIndices(const OsiIndex* oi) {
+  memcpy(osiIndices(), oi, numOsiIndices() * sizeof(OsiIndex));
+}
+
+void IonScript::copyRuntimeData(const uint8_t* data) {
+  memcpy(runtimeData(), data, runtimeSize());
+}
+
+void IonScript::copyICEntries(const uint32_t* icEntries) {
+  memcpy(icIndex(), icEntries, numICs() * sizeof(uint32_t));
+
+  for (size_t i = 0; i < numICs(); i++) {
+    getICFromIndex(i).resetCodeRaw(this);
+  }
+}
+
+const SafepointIndex* IonScript::getSafepointIndex(uint32_t disp) const {
+  MOZ_RELEASE_ASSERT(numSafepointIndices() > 0);
+
+  const SafepointIndex* table = safepointIndices();
+  if (numSafepointIndices() == 1) {
+    MOZ_ASSERT(disp == table[0].displacement());
+    return &table[0];
+  }
+
+  size_t minEntry = 0;
+  size_t maxEntry = numSafepointIndices() - 1;
+  uint32_t min = table[minEntry].displacement();
+  uint32_t max = table[maxEntry].displacement();
+
+  MOZ_RELEASE_ASSERT(min <= disp && disp <= max);
+
+  size_t guess = (disp - min) * (maxEntry - minEntry) / (max - min) + minEntry;
+  uint32_t guessDisp = table[guess].displacement();
+
+  if (table[guess].displacement() == disp) {
+    return &table[guess];
+  }
+
+  if (guessDisp > disp) {
+    while (--guess >= minEntry) {
+      guessDisp = table[guess].displacement();
+      MOZ_ASSERT(guessDisp >= disp);
+      if (guessDisp == disp) {
+        return &table[guess];
+      }
+    }
+  } else {
+    while (++guess <= maxEntry) {
+      guessDisp = table[guess].displacement();
+      MOZ_ASSERT(guessDisp <= disp);
+      if (guessDisp == disp) {
+        return &table[guess];
+      }
+    }
+  }
+
+  MOZ_CRASH("displacement not found.");
+}
+
+const OsiIndex* IonScript::getOsiIndex(uint32_t disp) const {
+  const OsiIndex* end = osiIndices() + numOsiIndices();
+  for (const OsiIndex* it = osiIndices(); it != end; ++it) {
+    if (it->returnPointDisplacement() == disp) {
+      return it;
+    }
+  }
+
+  MOZ_CRASH("Failed to find OSI point return address");
+}
+
+const OsiIndex* IonScript::getOsiIndex(uint8_t* retAddr) const {
+  JitSpew(JitSpew_IonInvalidate, "IonScript %p has method %p raw %p",
+          (void*)this, (void*)method(), method()->raw());
+
+  MOZ_ASSERT(containsCodeAddress(retAddr));
+  uint32_t disp = retAddr - method()->raw();
+  return getOsiIndex(disp);
+}
+
+void IonScript::Destroy(JS::GCContext* gcx, IonScript* script) {
+  mozilla::Maybe<gc::AutoLockSweepingLock> lock;
+  for (size_t i = 0, len = script->numNurseryObjects(); i < len; i++) {
+    JSObject* obj = script->nurseryObjects()[i];
+    if (lock.isNothing() && IsInsideNursery(obj)) {
+      lock.emplace(gcx->runtimeFromAnyThread());
+    }
+    script->nurseryObjects()[i].~HeapPtr<JSObject*>();
+  }
+  for (size_t i = 0, len = script->numConstants(); i < len; i++) {
+    Value v = script->getConstant(i);
+    if (lock.isNothing() && v.isGCThing() && IsInsideNursery(v.toGCThing())) {
+      lock.emplace(gcx->runtimeFromAnyThread());
+    }
+    script->getConstant(i).~HeapPtr<Value>();
+  }
+
+  gcx->deleteUntracked(script);
+}
+
+void JS::DeletePolicy<js::jit::IonScript>::operator()(
+    const js::jit::IonScript* script) {
+  IonScript::Destroy(rt_->gcContext(), const_cast<IonScript*>(script));
+}
+
+void IonScript::purgeICs(Zone* zone) {
+  for (size_t i = 0; i < numICs(); i++) {
+    getICFromIndex(i).reset(zone, this);
+  }
+}
+
+namespace js {
+namespace jit {
+
+bool OptimizeMIR(MIRGenerator* mir) {
+  MIRGraph& graph = mir->graph();
+
+  if (mir->shouldCancel("Start")) {
+    return false;
+  }
+
+  mir->spewPass("BuildSSA");
+  AssertBasicGraphCoherency(graph);
+
+  if (JitSpewEnabled(JitSpew_MIRExpressions)) {
+    JitSpew(JitSpew_MIRExpressions, "\n");
+    AutoJitSpewMessage msg(JitSpew_MIRExpressions);
+    DumpMIRExpressions(msg.printer(), graph, mir->outerInfo(),
+                       "BuildSSA (== input to OptimizeMIR)");
+  }
+
+  if (!JitOptions.disablePruning && !mir->compilingWasm()) {
+    JitSpew(JitSpew_Prune, "\n");
+    if (!PruneUnusedBranches(mir, graph)) {
+      return false;
+    }
+    mir->spewPass("Prune Unused Branches");
+    AssertBasicGraphCoherency(graph);
+
+    if (mir->shouldCancel("Prune Unused Branches")) {
+      return false;
+    }
+  }
+
+  {
+    bool dummy;
+    if (!FoldEmptyBlocks(graph, &dummy)) {
+      return false;
+    }
+    mir->spewPass("Fold Empty Blocks");
+    AssertBasicGraphCoherency(graph);
+
+    if (mir->shouldCancel("Fold Empty Blocks")) {
+      return false;
+    }
+  }
+
+  if (!mir->compilingWasm()) {
+    if (!EliminateTriviallyDeadResumePointOperands(mir, graph)) {
+      return false;
+    }
+    mir->spewPass("Eliminate trivially dead resume point operands");
+    AssertBasicGraphCoherency(graph);
+
+    if (mir->shouldCancel("Eliminate trivially dead resume point operands")) {
+      return false;
+    }
+  }
+
+  {
+    mir->spewPass("Fold Tests");
+    AssertBasicGraphCoherency(graph);
+
+    if (mir->shouldCancel("Fold Tests")) {
+      return false;
+    }
+  }
+
+  {
+    if (!SplitCriticalEdges(graph)) {
+      return false;
+    }
+    mir->spewPass("Split Critical Edges");
+    AssertGraphCoherency(graph);
+
+    if (mir->shouldCancel("Split Critical Edges")) {
+      return false;
+    }
+  }
+
+  {
+    RenumberBlocks(graph);
+    mir->spewPass("Renumber Blocks");
+    AssertGraphCoherency(graph);
+
+    if (mir->shouldCancel("Renumber Blocks")) {
+      return false;
+    }
+  }
+
+  {
+    if (!BuildDominatorTree(mir, graph)) {
+      return false;
+    }
+
+    if (mir->shouldCancel("Dominator Tree")) {
+      return false;
+    }
+  }
+
+  {
+    Observability observability = graph.hasTryBlock()
+                                      ? ConservativeObservability
+                                      : AggressiveObservability;
+    if (!EliminatePhis(mir, graph, observability)) {
+      return false;
+    }
+    mir->spewPass("Eliminate phis");
+    AssertGraphCoherency(graph);
+
+    if (mir->shouldCancel("Eliminate phis")) {
+      return false;
+    }
+
+    if (!BuildPhiReverseMapping(graph)) {
+      return false;
+    }
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("Phi reverse mapping")) {
+      return false;
+    }
+  }
+
+  if (!JitOptions.disableRecoverIns &&
+      mir->optimizationInfo().scalarReplacementEnabled() &&
+      !JitOptions.disableObjectKeysScalarReplacement) {
+    JitSpew(JitSpew_Escape, "\n");
+    if (!ReplaceObjectKeys(mir, graph)) {
+      return false;
+    }
+    mir->spewPass("Replace ObjectKeys");
+    AssertGraphCoherency(graph);
+
+    if (mir->shouldCancel("Replace ObjectKeys")) {
+      return false;
+    }
+  }
+
+  if (!mir->compilingWasm() && !JitOptions.disableIteratorIndices) {
+    if (!OptimizeIteratorIndices(mir, graph)) {
+      return false;
+    }
+    mir->spewPass("Iterator Indices");
+    AssertGraphCoherency(graph);
+
+    if (mir->shouldCancel("Iterator Indices")) {
+      return false;
+    }
+  }
+
+  if (!JitOptions.disableRecoverIns &&
+      mir->optimizationInfo().scalarReplacementEnabled()) {
+    JitSpew(JitSpew_Escape, "\n");
+    if (!ScalarReplacement(mir, graph)) {
+      return false;
+    }
+    mir->spewPass("Scalar Replacement");
+    AssertGraphCoherency(graph);
+
+    if (mir->shouldCancel("Scalar Replacement")) {
+      return false;
+    }
+  }
+
+  if (!mir->compilingWasm()) {
+    if (!ApplyTypeInformation(mir, graph)) {
+      return false;
+    }
+    mir->spewPass("Apply types");
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("Apply types")) {
+      return false;
+    }
+  }
+
+  if (mir->compilingWasm()) {
+    if (!TrackWasmRefTypes(graph)) {
+      return false;
+    }
+    mir->spewPass("Track Wasm ref types");
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("Track Wasm ref types")) {
+      return false;
+    }
+  }
+
+  ValueNumberer gvn(mir, graph);
+
+  if (mir->optimizationInfo().licmEnabled() ||
+      mir->optimizationInfo().gvnEnabled() ||
+      mir->optimizationInfo().eliminateRedundantShapeGuardsEnabled()) {
+    {
+      AliasAnalysis analysis(mir, graph);
+      JitSpew(JitSpew_Alias, "\n");
+      if (!analysis.analyze()) {
+        return false;
+      }
+
+      mir->spewPass("Alias analysis");
+      AssertExtendedGraphCoherency(graph);
+
+      if (mir->shouldCancel("Alias analysis")) {
+        return false;
+      }
+    }
+
+    if (!mir->compilingWasm()) {
+      if (!EliminateDeadResumePointOperands(mir, graph)) {
+        return false;
+      }
+
+      mir->spewPass("Eliminate dead resume point operands");
+      AssertExtendedGraphCoherency(graph);
+
+      if (mir->shouldCancel("Eliminate dead resume point operands")) {
+        return false;
+      }
+    }
+  }
+
+  if (mir->compilingWasm()) {
+    if (!OptimizeWasmCasts(graph)) {
+      return false;
+    }
+    mir->spewPass("Optimize Wasm tests and casts");
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("Optimize Wasm tests and casts")) {
+      return false;
+    }
+  }
+
+  if (mir->optimizationInfo().gvnEnabled()) {
+    JitSpew(JitSpew_GVN, "\n");
+    if (!gvn.run(ValueNumberer::UpdateAliasAnalysis)) {
+      return false;
+    }
+    mir->spewPass("GVN");
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("GVN")) {
+      return false;
+    }
+  }
+
+  if (!JitOptions.disableCanonicalizeNaNAtUses && !mir->compilingWasm()) {
+    if (!CanonicalizeNaNAtUses(mir, graph)) {
+      return false;
+    }
+    mir->spewPass("CanonicalizeNaN");
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("CanonicalizeNaN")) {
+      return false;
+    }
+  }
+
+  if (mir->branchHintingEnabled()) {
+    JitSpew(JitSpew_BranchHint, "\n");
+    if (!BranchHinting(mir, graph)) {
+      return false;
+    }
+    mir->spewPass("BranchHinting");
+    AssertBasicGraphCoherency(graph);
+
+    if (mir->shouldCancel("BranchHinting")) {
+      return false;
+    }
+  }
+
+  if (mir->licmEnabled()) {
+    JitSpew(JitSpew_LICM, "\n");
+    if (!LICM(mir, graph)) {
+      return false;
+    }
+    mir->spewPass("LICM");
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("LICM")) {
+      return false;
+    }
+  }
+
+  RangeAnalysis r(mir, graph);
+  if (mir->optimizationInfo().rangeAnalysisEnabled()) {
+    JitSpew(JitSpew_Range, "\n");
+    if (!r.addBetaNodes()) {
+      return false;
+    }
+    mir->spewPass("Beta");
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("RA Beta")) {
+      return false;
+    }
+
+    if (!r.analyze() || !r.addRangeAssertions()) {
+      return false;
+    }
+    mir->spewPass("Range Analysis");
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("Range Analysis")) {
+      return false;
+    }
+
+    if (!r.removeBetaNodes()) {
+      return false;
+    }
+    mir->spewPass("De-Beta");
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("RA De-Beta")) {
+      return false;
+    }
+
+    if (mir->optimizationInfo().gvnEnabled()) {
+      bool shouldRunUCE = false;
+      if (!r.prepareForUCE(&shouldRunUCE)) {
+        return false;
+      }
+      mir->spewPass("RA check UCE");
+      AssertExtendedGraphCoherency(graph);
+
+      if (mir->shouldCancel("RA check UCE")) {
+        return false;
+      }
+
+      if (shouldRunUCE) {
+        if (!gvn.run(ValueNumberer::DontUpdateAliasAnalysis)) {
+          return false;
+        }
+        mir->spewPass("UCE After RA");
+        AssertExtendedGraphCoherency(graph);
+
+        if (mir->shouldCancel("UCE After RA")) {
+          return false;
+        }
+      }
+    }
+
+    if (mir->optimizationInfo().autoTruncateEnabled()) {
+      if (!r.truncate()) {
+        return false;
+      }
+      mir->spewPass("Truncate Doubles");
+      AssertExtendedGraphCoherency(graph);
+
+      if (mir->shouldCancel("Truncate Doubles")) {
+        return false;
+      }
+    }
+  }
+
+  if (!JitOptions.disableRecoverIns) {
+    JitSpew(JitSpew_Sink, "\n");
+    if (!Sink(mir, graph)) {
+      return false;
+    }
+    mir->spewPass("Sink");
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("Sink")) {
+      return false;
+    }
+  }
+
+  if (!JitOptions.disableRecoverIns &&
+      mir->optimizationInfo().rangeAnalysisEnabled()) {
+    JitSpew(JitSpew_Range, "\n");
+    if (!r.removeUnnecessaryBitops()) {
+      return false;
+    }
+    mir->spewPass("Remove Unnecessary Bitops");
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("Remove Unnecessary Bitops")) {
+      return false;
+    }
+  }
+
+  {
+    JitSpew(JitSpew_FLAC, "\n");
+    if (!FoldLinearArithConstants(mir, graph)) {
+      return false;
+    }
+    mir->spewPass("Fold Linear Arithmetic Constants");
+    AssertBasicGraphCoherency(graph);
+
+    if (mir->shouldCancel("Fold Linear Arithmetic Constants")) {
+      return false;
+    }
+  }
+
+  if (mir->compilingWasm() && mir->optimizationInfo().eaaEnabled()) {
+    EffectiveAddressAnalysis eaa(graph);
+    JitSpew(JitSpew_EAA, "\n");
+    if (!eaa.analyze()) {
+      return false;
+    }
+    mir->spewPass("Effective Address Analysis");
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("Effective Address Analysis")) {
+      return false;
+    }
+  }
+
+  if (mir->compilingWasm()) {
+    JitSpew(JitSpew_WasmBCE, "\n");
+    if (!EliminateBoundsChecks(mir, graph)) {
+      return false;
+    }
+    mir->spewPass("Redundant Bounds Check Elimination");
+    AssertGraphCoherency(graph);
+
+    if (mir->shouldCancel("BCE")) {
+      return false;
+    }
+  }
+
+  {
+    if (!EliminateDeadCode(mir, graph)) {
+      return false;
+    }
+    mir->spewPass("DCE");
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("DCE")) {
+      return false;
+    }
+  }
+
+  if (!JitOptions.disableMarkLoadsUsedAsPropertyKeys && !mir->compilingWasm()) {
+    JitSpew(JitSpew_MarkLoadsUsedAsPropertyKeys, "\n");
+    if (!MarkLoadsUsedAsPropertyKeys(graph)) {
+      return false;
+    }
+    if (mir->shouldCancel("MarkLoadsUsedAsPropertyKeys")) {
+      return false;
+    }
+  }
+
+  if (mir->optimizationInfo().instructionReorderingEnabled() &&
+      !mir->outerInfo().hadReorderingBailout()) {
+    if (!ReorderInstructions(mir, graph)) {
+      return false;
+    }
+    mir->spewPass("Reordering");
+
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("Reordering")) {
+      return false;
+    }
+  }
+
+  {
+    if (!MakeLoopsContiguous(graph)) {
+      return false;
+    }
+    mir->spewPass("Make loops contiguous");
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("Make loops contiguous")) {
+      return false;
+    }
+  }
+  AssertExtendedGraphCoherency(graph,  false,
+                                true);
+
+  if (mir->compilingWasm() && JS::Prefs::wasm_unroll_loops()) {
+    bool loopsChanged;
+    if (!UnrollLoops(mir, graph, &loopsChanged)) {
+      return false;
+    }
+
+    mir->spewPass("Unroll loops");
+
+    AssertExtendedGraphCoherency(graph);
+
+    if (mir->shouldCancel("Unroll loops")) {
+      return false;
+    }
+
+    if (loopsChanged) {
+      if (!gvn.run(ValueNumberer::DontUpdateAliasAnalysis)) {
+        return false;
+      }
+
+      if (!EliminatePhis(mir, graph, ConservativeObservability)) {
+        return false;
+      }
+
+      AssertExtendedGraphCoherency(graph);
+
+      bool blocksFolded;
+      if (!FoldEmptyBlocks(graph, &blocksFolded)) {
+        return false;
+      }
+      if (blocksFolded) {
+        ClearDominatorTree(graph);
+        if (!BuildDominatorTree(mir, graph)) {
+          return false;
+        }
+      }
+
+      AssertExtendedGraphCoherency(graph);
+
+      if (mir->shouldCancel("Rerun GVN after loop unrolling")) {
+        return false;
+      }
+    }
+  }
+
+  if (!mir->compilingWasm() && graph.osrBlock()) {
+    graph.removeFakeLoopPredecessors();
+    mir->spewPass("Remove fake loop predecessors");
+    AssertGraphCoherency(graph);
+
+    if (mir->shouldCancel("Remove fake loop predecessors")) {
+      return false;
+    }
+  }
+
+
+  if (mir->optimizationInfo().edgeCaseAnalysisEnabled()) {
+    EdgeCaseAnalysis edgeCaseAnalysis(mir, graph);
+    if (!edgeCaseAnalysis.analyzeLate()) {
+      return false;
+    }
+    mir->spewPass("Edge Case Analysis (Late)");
+    AssertGraphCoherency(graph);
+
+    if (mir->shouldCancel("Edge Case Analysis (Late)")) {
+      return false;
+    }
+  }
+
+  if (mir->optimizationInfo().eliminateRedundantChecksEnabled()) {
+    if (!EliminateRedundantChecks(graph)) {
+      return false;
+    }
+    mir->spewPass("Bounds Check Elimination");
+    AssertGraphCoherency(graph);
+
+    if (mir->shouldCancel("Bounds Check Elimination")) {
+      return false;
+    }
+  }
+
+  if (mir->optimizationInfo().eliminateRedundantShapeGuardsEnabled()) {
+    if (!EliminateRedundantShapeGuards(graph)) {
+      return false;
+    }
+    mir->spewPass("Shape Guard Elimination");
+    AssertGraphCoherency(graph);
+
+    if (mir->shouldCancel("Shape Guard Elimination")) {
+      return false;
+    }
+  }
+
+  if (mir->optimizationInfo().eliminateRedundantGCBarriersEnabled()) {
+    if (!EliminateRedundantGCBarriers(graph)) {
+      return false;
+    }
+    mir->spewPass("GC Barrier Elimination");
+    AssertGraphCoherency(graph);
+
+    if (mir->shouldCancel("GC Barrier Elimination")) {
+      return false;
+    }
+  }
+
+  if (!mir->compilingWasm() && !mir->outerInfo().hadUnboxFoldingBailout()) {
+    if (!FoldLoadsWithUnbox(mir, graph)) {
+      return false;
+    }
+    mir->spewPass("FoldLoadsWithUnbox");
+    AssertGraphCoherency(graph);
+
+    if (mir->shouldCancel("FoldLoadsWithUnbox")) {
+      return false;
+    }
+  }
+
+  if (!mir->compilingWasm()) {
+    if (!AddKeepAliveInstructions(graph)) {
+      return false;
+    }
+    mir->spewPass("Add KeepAlive Instructions");
+    AssertGraphCoherency(graph);
+
+    if (mir->shouldCancel("Add KeepAlive Instructions")) {
+      return false;
+    }
+  }
+
+  AssertGraphCoherency(graph,  true);
+
+  if (JitSpewEnabled(JitSpew_MIRExpressions)) {
+    JitSpew(JitSpew_MIRExpressions, "\n");
+    AutoJitSpewMessage msg(JitSpew_MIRExpressions);
+    DumpMIRExpressions(msg.printer(), graph, mir->outerInfo(),
+                       "BeforeLIR (== result of OptimizeMIR)");
+  }
+
+  return true;
+}
+
+LIRGraph* GenerateLIR(MIRGenerator* mir) {
+  MIRGraph& graph = mir->graph();
+
+  LIRGraph* lir = mir->alloc().lifoAlloc()->new_<LIRGraph>(&graph);
+  if (!lir || !lir->init()) {
+    return nullptr;
+  }
+
+  LIRGenerator lirgen(mir, graph, *lir);
+  {
+    if (!lirgen.generate()) {
+      return nullptr;
+    }
+    mir->spewPass("Generate LIR");
+
+    if (mir->shouldCancel("Generate LIR")) {
+      return nullptr;
+    }
+  }
+
+#if defined(DEBUG)
+  AllocationIntegrityState integrity(*lir);
+  if (JitOptions.fullDebugChecks) {
+    if (!integrity.record()) {
+      return nullptr;
+    }
+  }
+#endif
+
+  IonRegisterAllocator allocator = mir->optimizationInfo().registerAllocator();
+  switch (allocator) {
+    case RegisterAllocator_Backtracking: {
+      BacktrackingAllocator regalloc(mir, &lirgen, *lir);
+      if (!regalloc.go()) {
+        return nullptr;
+      }
+      mir->spewPass("Allocate Registers [Backtracking]", &regalloc);
+      break;
+    }
+    case RegisterAllocator_Simple: {
+      SimpleAllocator regalloc(mir, &lirgen, *lir);
+      if (!regalloc.go()) {
+        return nullptr;
+      }
+      mir->spewPass("Allocate Registers [Simple]");
+      break;
+    }
+    default:
+      MOZ_CRASH("Bad regalloc");
+  }
+
+#if defined(DEBUG)
+  if (JitOptions.fullDebugChecks) {
+    if (!integrity.check()) {
+      return nullptr;
+    }
+  }
+#endif
+
+  if (mir->shouldCancel("Allocate Registers")) {
+    return nullptr;
+  }
+
+  return lir;
+}
+
+static CodeGenerator* GenerateCode(MIRGenerator* mir, LIRGraph* lir,
+                                   const WarpSnapshot* snapshot) {
+  auto codegen = MakeUnique<CodeGenerator>(mir, lir);
+  if (!codegen) {
+    return nullptr;
+  }
+
+  if (!codegen->generate(snapshot)) {
+    return nullptr;
+  }
+
+  return codegen.release();
+}
+
+CodeGenerator* CompileBackEnd(MIRGenerator* mir, WarpSnapshot* snapshot) {
+  AutoEnterIonBackend enter;
+  AutoSpewEndFunction spewEndFunction(mir);
+  {
+    WarpCompilation comp(mir->alloc());
+    WarpBuilder builder(*snapshot, *mir, &comp);
+    if (!builder.build()) {
+      return nullptr;
+    }
+  }
+
+  if (!OptimizeMIR(mir)) {
+    return nullptr;
+  }
+
+  LIRGraph* lir = GenerateLIR(mir);
+  if (!lir) {
+    return nullptr;
+  }
+
+  return GenerateCode(mir, lir, snapshot);
+}
+
+static AbortReasonOr<WarpSnapshot*> CreateWarpSnapshot(JSContext* cx,
+                                                       MIRGenerator* mirGen,
+                                                       HandleScript script) {
+  gc::AutoSuppressGC suppressGC(cx);
+
+  mirGen->spewBeginFunction(script);
+
+  WarpOracle oracle(cx, *mirGen, script);
+
+  AbortReasonOr<WarpSnapshot*> result = oracle.createSnapshot();
+
+  MOZ_ASSERT_IF(result.isErr(), result.unwrapErr() == AbortReason::Alloc ||
+                                    result.unwrapErr() == AbortReason::Error ||
+                                    result.unwrapErr() == AbortReason::Disable);
+  MOZ_ASSERT_IF(!result.isErr(), result.unwrap());
+
+  return result;
+}
+
+UniquePtr<LifoAlloc> JitRuntime::tryReuseIonLifoAlloc() {
+
+  auto& batch = ionFreeTaskBatch_.ref();
+  IonCompileTask* bestTask = nullptr;
+  size_t bestTaskIndex = 0;
+  size_t bestTaskSize = 0;
+
+  for (size_t i = 0, len = batch.length(); i < len; i++) {
+    IonCompileTask* task = batch[i];
+    if (task->alloc().lifoAlloc()->isHuge()) {
+      continue;
+    }
+    size_t taskSize = task->alloc().lifoAlloc()->computedSizeOfExcludingThis();
+    if (!bestTask || taskSize >= bestTaskSize) {
+      bestTask = task;
+      bestTaskIndex = i;
+      bestTaskSize = taskSize;
+    }
+  }
+
+  if (bestTask) {
+    batch.erase(&batch[bestTaskIndex]);
+    return FreeIonCompileTaskAndReuseLifoAlloc(bestTask);
+  }
+
+  return nullptr;
+}
+
+static AbortReason IonCompile(JSContext* cx, HandleScript script,
+                              jsbytecode* osrPc) {
+  cx->check(script);
+
+  if (!cx->zone()->ensureJitZoneExists(cx)) {
+    return AbortReason::Error;
+  }
+
+  UniquePtr<LifoAlloc> alloc =
+      cx->runtime()->jitRuntime()->tryReuseIonLifoAlloc();
+  if (!alloc) {
+    alloc = cx->make_unique<LifoAlloc>(TempAllocator::PreferredLifoChunkSize,
+                                       js::MallocArena);
+    if (!alloc) {
+      return AbortReason::Error;
+    }
+  }
+
+  TempAllocator* temp = alloc->new_<TempAllocator>(alloc.get());
+  if (!temp) {
+    return AbortReason::Alloc;
+  }
+
+  MIRGraph* graph = alloc->new_<MIRGraph>(temp);
+  if (!graph) {
+    return AbortReason::Alloc;
+  }
+
+  InlineScriptTree* inlineScriptTree =
+      InlineScriptTree::New(temp, nullptr, nullptr, script);
+  if (!inlineScriptTree) {
+    return AbortReason::Alloc;
+  }
+
+  CompileInfo* info =
+      alloc->new_<CompileInfo>(CompileRuntime::get(cx->runtime()), script,
+                               osrPc, script->needsArgsObj(), inlineScriptTree);
+  if (!info) {
+    return AbortReason::Alloc;
+  }
+
+  const OptimizationInfo* optimizationInfo =
+      IonOptimizations.get(OptimizationLevel::Normal);
+  const JitCompileOptions options(cx);
+
+  MIRGenerator* mirGen =
+      alloc->new_<MIRGenerator>(CompileRealm::get(cx->realm()), options, temp,
+                                graph, info, optimizationInfo);
+  if (!mirGen) {
+    return AbortReason::Alloc;
+  }
+
+  auto clearDependencies =
+      mozilla::MakeScopeExit([mirGen]() { mirGen->cleanup(); });
+
+  MOZ_ASSERT(!script->baselineScript()->hasPendingIonCompileTask());
+  MOZ_ASSERT(!script->hasIonScript());
+  MOZ_ASSERT(script->canIonCompile());
+
+  if (osrPc) {
+    script->jitScript()->setHadIonOSR();
+  }
+
+  AbortReasonOr<WarpSnapshot*> result = CreateWarpSnapshot(cx, mirGen, script);
+  if (result.isErr()) {
+    return result.unwrapErr();
+  }
+  WarpSnapshot* snapshot = result.unwrap();
+
+  if (options.offThreadCompilationAvailable()) {
+    JitSpew(JitSpew_IonSyncLogs,
+            "Can't log script %s:%u:%u"
+            ". (Compiled on background thread.)",
+            script->filename(), script->lineno(),
+            script->column().oneOriginValue());
+
+    IonCompileTask* task = alloc->new_<IonCompileTask>(cx, *mirGen, snapshot);
+    if (!task) {
+      return AbortReason::Alloc;
+    }
+
+    AutoLockHelperThreadState lock;
+    if (!StartOffThreadIonCompile(task, lock)) {
+      JitSpew(JitSpew_IonAbort, "Unable to start off-thread ion compilation.");
+      mirGen->spewEndFunction();
+      return AbortReason::Alloc;
+    }
+
+    script->jitScript()->setIsIonCompilingOffThread(script);
+
+    (void)alloc.release();
+    clearDependencies.release();
+
+    return AbortReason::NoAbort;
+  }
+
+  bool succeeded = false;
+  {
+    gc::AutoSuppressGC suppressGC(cx);
+    JitContext jctx(cx);
+    UniquePtr<CodeGenerator> codegen(CompileBackEnd(mirGen, snapshot));
+    if (!codegen) {
+      JitSpew(JitSpew_IonAbort, "Failed during back-end compilation.");
+      if (cx->isExceptionPending()) {
+        return AbortReason::Error;
+      }
+      return AbortReason::Disable;
+    }
+
+    succeeded = LinkCodeGen(cx, codegen.get(), script);
+  }
+
+  if (succeeded) {
+    return AbortReason::NoAbort;
+  }
+  if (cx->isExceptionPending()) {
+    return AbortReason::Error;
+  }
+  return AbortReason::Disable;
+}
+
+static void AssertBaselineFrameCanEnterIon(JSContext* cx,
+                                           BaselineFrame* frame) {
+  MOZ_ASSERT(jit::IsIonEnabled(cx));
+  MOZ_ASSERT(!frame->isEvalFrame());
+  MOZ_ASSERT(frame->script()->canIonCompile());
+  MOZ_ASSERT(!frame->script()->isIonCompilingOffThread());
+
+  MOZ_ASSERT_IF(frame->isFunctionFrame(),
+                !TooManyActualArguments(frame->numActualArgs()));
+
+  MOZ_ASSERT_IF(frame->isFunctionFrame(),
+                !TooManyFormalArguments(frame->numFormalArgs()));
+}
+
+static bool ScriptIsTooLarge(JSContext* cx, JSScript* script) {
+  if (!JitOptions.limitScriptSize) {
+    return false;
+  }
+
+  size_t numLocalsAndArgs = NumLocalsAndArgs(script);
+
+  bool canCompileOffThread = OffThreadCompilationAvailable(cx);
+  size_t maxScriptSize = canCompileOffThread
+                             ? JitOptions.ionMaxScriptSize
+                             : JitOptions.ionMaxScriptSizeMainThread;
+  size_t maxLocalsAndArgs = canCompileOffThread
+                                ? JitOptions.ionMaxLocalsAndArgs
+                                : JitOptions.ionMaxLocalsAndArgsMainThread;
+
+  if (script->length() > maxScriptSize || numLocalsAndArgs > maxLocalsAndArgs) {
+    JitSpew(JitSpew_IonAbort,
+            "Script too large (%zu bytes) (%zu locals/args) @ %s:%u:%u",
+            script->length(), numLocalsAndArgs, script->filename(),
+            script->lineno(), script->column().oneOriginValue());
+    return true;
+  }
+
+  return false;
+}
+
+bool CanIonCompileScript(JSContext* cx, JSScript* script) {
+  if (!script->canIonCompile()) {
+    return false;
+  }
+
+  if (script->isForEval()) {
+    JitSpew(JitSpew_IonAbort, "eval script");
+    script->disableIon();
+    return false;
+  }
+
+  if (script->isAsync() && script->isModule()) {
+    JitSpew(JitSpew_IonAbort, "async module");
+    script->disableIon();
+    return false;
+  }
+
+  if (script->hasNonSyntacticScope() && !script->function()) {
+    JitSpew(JitSpew_IonAbort, "has non-syntactic global scope");
+    script->disableIon();
+    return false;
+  }
+
+  if (script->function() &&
+      TooManyFormalArguments(script->function()->nargs())) {
+    JitSpew(JitSpew_IonAbort, "too many formal arguments");
+    script->disableIon();
+    return false;
+  }
+
+  if (ScriptIsTooLarge(cx, script)) {
+    script->disableIon();
+    return false;
+  }
+
+  return true;
+}
+
+static MethodStatus Compile(JSContext* cx, HandleScript script,
+                            BaselineFrame* osrFrame, jsbytecode* osrPc) {
+  MOZ_ASSERT(jit::IsIonEnabled(cx));
+  MOZ_ASSERT(jit::IsBaselineJitEnabled(cx));
+
+  MOZ_ASSERT(script->hasBaselineScript());
+  MOZ_ASSERT(!script->baselineScript()->hasPendingIonCompileTask());
+  MOZ_ASSERT(!script->hasIonScript());
+
+  AutoGeckoProfilerEntry pseudoFrame(
+      cx, "Ion script compilation",
+      JS::ProfilingCategoryPair::JS_IonCompilation);
+
+  if (script->isDebuggee() || (osrFrame && osrFrame->isDebuggee())) {
+    JitSpew(JitSpew_IonAbort, "debugging");
+    return Method_Skipped;
+  }
+
+  if (!CanIonCompileScript(cx, script)) {
+    JitSpew(JitSpew_IonAbort, "Aborted compilation of %s:%u:%u",
+            script->filename(), script->lineno(),
+            script->column().oneOriginValue());
+    return Method_CantCompile;
+  }
+
+  OptimizationLevel optimizationLevel =
+      IonOptimizations.levelForScript(cx, script, osrPc);
+  if (optimizationLevel == OptimizationLevel::DontCompile) {
+    return Method_Skipped;
+  }
+
+  MOZ_ASSERT(optimizationLevel == OptimizationLevel::Normal);
+
+  if (!CanLikelyAllocateMoreExecutableMemory()) {
+    script->resetWarmUpCounterToDelayIonCompilation();
+    return Method_Skipped;
+  }
+
+  MOZ_ASSERT(!script->hasIonScript());
+
+  AbortReason reason = IonCompile(cx, script, osrPc);
+  if (reason == AbortReason::Error) {
+    MOZ_ASSERT(cx->isExceptionPending());
+    return Method_Error;
+  }
+
+  if (reason == AbortReason::Disable) {
+    return Method_CantCompile;
+  }
+
+  if (reason == AbortReason::Alloc) {
+    ReportOutOfMemory(cx);
+    return Method_Error;
+  }
+
+  if (script->hasIonScript()) {
+    return Method_Compiled;
+  }
+  return Method_Skipped;
+}
+
+}  
+}  
+
+bool jit::OffThreadCompilationAvailable(JSContext* cx) {
+  return cx->runtime()->canUseOffthreadIonCompilation() &&
+         GetHelperThreadCPUCount() > 1 && CanUseExtraThreads();
+}
+
+MethodStatus jit::CanEnterIon(JSContext* cx, RunState& state) {
+  MOZ_ASSERT(jit::IsIonEnabled(cx));
+
+  HandleScript script = state.script();
+  MOZ_ASSERT(!script->hasIonScript());
+
+  if (!script->canIonCompile()) {
+    return Method_Skipped;
+  }
+
+  if (script->isIonCompilingOffThread()) {
+    return Method_Skipped;
+  }
+
+  if (state.isInvoke()) {
+    InvokeState& invoke = *state.asInvoke();
+
+    if (TooManyActualArguments(invoke.args().length())) {
+      JitSpew(JitSpew_IonAbort, "too many actual args");
+      ForbidCompilation(cx, script);
+      return Method_CantCompile;
+    }
+  }
+
+  if (JitOptions.eagerIonCompilation() && !script->hasBaselineScript()) {
+    MethodStatus status =
+        CanEnterBaselineMethod<BaselineTier::Compiler>(cx, state);
+    if (status != Method_Compiled) {
+      return status;
+    }
+    if (!script->canIonCompile()) {
+      return Method_CantCompile;
+    }
+  }
+
+  if (!script->hasBaselineScript()) {
+    return Method_Skipped;
+  }
+
+  MOZ_ASSERT(!script->isIonCompilingOffThread());
+  MOZ_ASSERT(script->canIonCompile());
+
+  MethodStatus status = Compile(cx, script,  nullptr,
+                                 nullptr);
+  if (status != Method_Compiled) {
+    if (status == Method_CantCompile) {
+      ForbidCompilation(cx, script);
+    }
+    return status;
+  }
+
+  if (state.script()->baselineScript()->hasPendingIonCompileTask()) {
+    LinkIonScript(cx, state.script());
+    if (!state.script()->hasIonScript()) {
+      return jit::Method_Skipped;
+    }
+  }
+
+  return Method_Compiled;
+}
+
+static MethodStatus BaselineCanEnterAtEntry(JSContext* cx, HandleScript script,
+                                            BaselineFrame* frame) {
+  AssertBaselineFrameCanEnterIon(cx, frame);
+  MOZ_ASSERT(!script->hasIonScript());
+  MOZ_ASSERT(frame->isFunctionFrame());
+
+  if (script->baselineScript()->hasPendingIonCompileTask()) {
+    LinkIonScript(cx, script);
+    if (script->hasIonScript()) {
+      return Method_Compiled;
+    }
+  }
+
+  MethodStatus status = Compile(cx, script, frame, nullptr);
+  if (status != Method_Compiled) {
+    if (status == Method_CantCompile) {
+      ForbidCompilation(cx, script);
+    }
+    return status;
+  }
+
+  return Method_Compiled;
+}
+
+static MethodStatus BaselineCanEnterAtBranch(JSContext* cx, HandleScript script,
+                                             BaselineFrame* osrFrame,
+                                             jsbytecode* pc) {
+  AssertBaselineFrameCanEnterIon(cx, osrFrame);
+  MOZ_ASSERT((JSOp)*pc == JSOp::LoopHead);
+
+  if (!JitOptions.osr) {
+    return Method_Skipped;
+  }
+
+  if (script->baselineScript()->hasPendingIonCompileTask()) {
+    LinkIonScript(cx, script);
+  }
+
+  if (script->hasIonScript()) {
+    if (pc == script->ionScript()->osrPc()) {
+      return Method_Compiled;
+    }
+
+    uint32_t count = script->ionScript()->incrOsrPcMismatchCounter();
+    if (count <= JitOptions.osrPcMismatchesBeforeRecompile &&
+        !JitOptions.eagerIonCompilation()) {
+      return Method_Skipped;
+    }
+
+    JitSpew(JitSpew_IonScripts, "Forcing OSR Mismatch Compilation");
+    Invalidate(cx, script,  false);
+  }
+
+  MethodStatus status = Compile(cx, script, osrFrame, pc);
+  if (status != Method_Compiled) {
+    if (status == Method_CantCompile) {
+      ForbidCompilation(cx, script);
+    }
+    return status;
+  }
+
+  if (script->hasIonScript() && pc != script->ionScript()->osrPc()) {
+    return Method_Skipped;
+  }
+
+  return Method_Compiled;
+}
+
+static bool IonCompileScriptForBaseline(JSContext* cx, BaselineFrame* frame,
+                                        jsbytecode* pc) {
+  MOZ_ASSERT(IsIonEnabled(cx));
+
+  RootedScript script(cx, frame->script());
+  bool isLoopHead = JSOp(*pc) == JSOp::LoopHead;
+
+  MOZ_ASSERT(script->canIonCompile());
+  MOZ_ASSERT(!script->isIonCompilingOffThread());
+
+  if (script->hasIonScript() && !isLoopHead) {
+    JitSpew(JitSpew_BaselineOSR, "IonScript exists, but not at loop entry!");
+    return true;
+  }
+
+  JitSpew(JitSpew_BaselineOSR,
+          "WarmUpCounter for %s:%u:%u reached %d at pc %p, trying to switch to "
+          "Ion!",
+          script->filename(), script->lineno(),
+          script->column().oneOriginValue(), (int)script->getWarmUpCount(),
+          (void*)pc);
+
+  MethodStatus stat;
+  if (isLoopHead) {
+    JitSpew(JitSpew_BaselineOSR, "  Compile at loop head!");
+    stat = BaselineCanEnterAtBranch(cx, script, frame, pc);
+  } else if (frame->isFunctionFrame()) {
+    JitSpew(JitSpew_BaselineOSR,
+            "  Compile function from top for later entry!");
+    stat = BaselineCanEnterAtEntry(cx, script, frame);
+  } else {
+    return true;
+  }
+
+  if (stat == Method_Error) {
+    JitSpew(JitSpew_BaselineOSR, "  Compile with Ion errored!");
+    return false;
+  }
+
+  if (stat == Method_CantCompile) {
+    MOZ_ASSERT(!script->canIonCompile());
+    JitSpew(JitSpew_BaselineOSR, "  Can't compile with Ion!");
+  } else if (stat == Method_Skipped) {
+    JitSpew(JitSpew_BaselineOSR, "  Skipped compile with Ion!");
+  } else if (stat == Method_Compiled) {
+    JitSpew(JitSpew_BaselineOSR, "  Compiled with Ion!");
+  } else {
+    MOZ_CRASH("Invalid MethodStatus!");
+  }
+
+  return true;
+}
+
+bool jit::IonCompileScriptForBaselineAtEntry(JSContext* cx,
+                                             BaselineFrame* frame) {
+  JSScript* script = frame->script();
+  return IonCompileScriptForBaseline(cx, frame, script->code());
+}
+
+/* clang-format off */
+/* clang-format on */
+
+static IonOsrTempData* PrepareOsrTempData(JSContext* cx, BaselineFrame* frame,
+                                          uint32_t frameSize, void* jitcode) {
+  uint32_t numValueSlots = frame->numValueSlots(frameSize);
+
+
+  size_t frameSpace = sizeof(BaselineFrame) + sizeof(Value) * numValueSlots;
+  size_t ionOsrTempDataSpace = sizeof(IonOsrTempData);
+
+  size_t totalSpace = AlignBytes(frameSpace, sizeof(Value)) +
+                      AlignBytes(ionOsrTempDataSpace, sizeof(Value));
+
+  JitRuntime* jrt = cx->runtime()->jitRuntime();
+  uint8_t* buf = jrt->allocateIonOsrTempData(totalSpace);
+  if (!buf) {
+    ReportOutOfMemory(cx);
+    return nullptr;
+  }
+
+  IonOsrTempData* info = new (buf) IonOsrTempData();
+  info->jitcode = jitcode;
+
+  uint8_t* frameStart =
+      (uint8_t*)info + AlignBytes(ionOsrTempDataSpace, sizeof(Value));
+  info->baselineFrame = frameStart + frameSpace;
+
+  memcpy(frameStart, (uint8_t*)frame - numValueSlots * sizeof(Value),
+         frameSpace);
+
+  JitSpew(JitSpew_BaselineOSR, "Allocated IonOsrTempData at %p", info);
+  JitSpew(JitSpew_BaselineOSR, "Jitcode is %p", info->jitcode);
+
+  return info;
+}
+
+bool jit::IonCompileScriptForBaselineOSR(JSContext* cx, BaselineFrame* frame,
+                                         uint32_t frameSize, jsbytecode* pc,
+                                         IonOsrTempData** infoPtr) {
+  MOZ_ASSERT(infoPtr);
+  *infoPtr = nullptr;
+
+  MOZ_ASSERT(frame->debugFrameSize() == frameSize);
+  MOZ_ASSERT(JSOp(*pc) == JSOp::LoopHead);
+
+  if (!IonCompileScriptForBaseline(cx, frame, pc)) {
+    return false;
+  }
+
+  JSScript* script = frame->script();
+  if (!script->hasIonScript() || script->ionScript()->osrPc() != pc ||
+      frame->isDebuggee()) {
+    return true;
+  }
+
+  IonScript* ion = script->ionScript();
+  MOZ_ASSERT(cx->runtime()->geckoProfiler().enabled() ==
+             ion->hasProfilingInstrumentation());
+  MOZ_ASSERT(ion->osrPc() == pc);
+
+  ion->resetOsrPcMismatchCounter();
+
+  JitSpew(JitSpew_BaselineOSR, "  OSR possible!");
+  void* jitcode = ion->method()->raw() + ion->osrEntryOffset();
+
+  JitSpew(JitSpew_BaselineOSR, "Got jitcode.  Preparing for OSR into ion.");
+  IonOsrTempData* info = PrepareOsrTempData(cx, frame, frameSize, jitcode);
+  if (!info) {
+    return false;
+  }
+
+  *infoPtr = info;
+  return true;
+}
+
+static void InvalidateActivation(JS::GCContext* gcx,
+                                 const JitActivationIterator& activations,
+                                 bool invalidateAll) {
+  JitSpew(JitSpew_IonInvalidate, "BEGIN invalidating activation");
+
+#if defined(CHECK_OSIPOINT_REGISTERS)
+  if (JitOptions.checkOsiPointRegisters) {
+    activations->asJit()->setCheckRegs(false);
+  }
+#endif
+
+  size_t frameno = 1;
+
+  for (OnlyJSJitFrameIter iter(activations); !iter.done(); ++iter, ++frameno) {
+    const JSJitFrameIter& frame = iter.frame();
+    MOZ_ASSERT_IF(frameno == 1,
+                  frame.isExitFrame() || frame.type() == FrameType::Bailout);
+
+#if defined(JS_JITSPEW)
+    switch (frame.type()) {
+      case FrameType::Exit:
+        JitSpew(JitSpew_IonInvalidate, "#%zu exit frame @ %p", frameno,
+                frame.fp());
+        break;
+      case FrameType::BaselineJS:
+      case FrameType::IonJS:
+      case FrameType::Bailout: {
+        MOZ_ASSERT(frame.isScripted());
+        const char* type = "Unknown";
+        if (frame.isIonJS()) {
+          type = "Optimized";
+        } else if (frame.isBaselineJS()) {
+          type = "Baseline";
+        } else if (frame.isBailoutJS()) {
+          type = "Bailing";
+        }
+        JSScript* script = frame.maybeForwardedScript();
+        JitSpew(JitSpew_IonInvalidate,
+                "#%zu %s JS frame @ %p, %s:%u:%u (fun: %p, script: %p, pc %p)",
+                frameno, type, frame.fp(), script->maybeForwardedFilename(),
+                script->lineno(), script->column().oneOriginValue(),
+                frame.maybeCallee(), script, frame.resumePCinCurrentFrame());
+        break;
+      }
+      case FrameType::BaselineStub:
+        JitSpew(JitSpew_IonInvalidate, "#%zu baseline stub frame @ %p", frameno,
+                frame.fp());
+        break;
+      case FrameType::BaselineInterpreterEntry:
+        JitSpew(JitSpew_IonInvalidate,
+                "#%zu baseline interpreter entry frame @ %p", frameno,
+                frame.fp());
+        break;
+      case FrameType::TrampolineNative:
+        JitSpew(JitSpew_IonInvalidate, "#%zu TrampolineNative frame @ %p",
+                frameno, frame.fp());
+        break;
+      case FrameType::IonICCall:
+        JitSpew(JitSpew_IonInvalidate, "#%zu ion IC call frame @ %p", frameno,
+                frame.fp());
+        break;
+      case FrameType::CppToJSJit:
+        JitSpew(JitSpew_IonInvalidate, "#%zu entry frame @ %p", frameno,
+                frame.fp());
+        break;
+      case FrameType::WasmToJSJit:
+        JitSpew(JitSpew_IonInvalidate, "#%zu wasm frames @ %p", frameno,
+                frame.fp());
+        break;
+    }
+#endif
+
+    if (!frame.isIonScripted()) {
+      continue;
+    }
+
+    if (frame.checkInvalidation()) {
+      continue;
+    }
+
+    JSScript* script = frame.maybeForwardedScript();
+    if (!script->hasIonScript()) {
+      continue;
+    }
+
+    if (!invalidateAll && !script->ionScript()->invalidated()) {
+      continue;
+    }
+
+    IonScript* ionScript = script->ionScript();
+
+    ionScript->purgeICs(script->zone());
+
+
+    ionScript->incrementInvalidationCount();
+
+    JitCode* ionCode = ionScript->method();
+
+    PreWriteBarrier(script->zone(), ionCode, [](JSTracer* trc, JitCode* code) {
+      code->traceChildren(trc);
+    });
+
+    ionCode->setInvalidated();
+
+    if (frame.isBailoutJS()) {
+      continue;
+    }
+
+    AutoWritableJitCode awjc(ionCode);
+    const SafepointIndex* si =
+        ionScript->getSafepointIndex(frame.resumePCinCurrentFrame());
+    CodeLocationLabel dataLabelToMunge(frame.resumePCinCurrentFrame());
+    ptrdiff_t delta = ionScript->invalidateEpilogueDataOffset() -
+                      (frame.resumePCinCurrentFrame() - ionCode->raw());
+    Assembler::PatchWrite_Imm32(dataLabelToMunge, Imm32(delta));
+
+    CodeLocationLabel osiPatchPoint =
+        SafepointReader::InvalidationPatchPoint(ionScript, si);
+    CodeLocationLabel invalidateEpilogue(
+        ionCode, CodeOffset(ionScript->invalidateEpilogueOffset()));
+
+    JitSpew(
+        JitSpew_IonInvalidate,
+        "   ! Invalidate ionScript %p (inv count %zu) -> patching osipoint %p",
+        ionScript, ionScript->invalidationCount(), (void*)osiPatchPoint.raw());
+    Assembler::PatchWrite_NearCall(osiPatchPoint, invalidateEpilogue);
+  }
+
+  JitSpew(JitSpew_IonInvalidate, "END invalidating activation");
+}
+
+void jit::InvalidateAll(JS::GCContext* gcx, Zone* zone) {
+  MOZ_ASSERT(!HasOffThreadIonCompile(zone));
+  if (zone->isAtomsZone()) {
+    return;
+  }
+  JSContext* cx = TlsContext.get();
+  for (JitActivationIterator iter(cx); !iter.done(); ++iter) {
+    if (iter->compartment()->zone() == zone) {
+      JitSpew(JitSpew_IonInvalidate, "Invalidating all frames for GC");
+      InvalidateActivation(gcx, iter, true);
+    }
+  }
+}
+
+static void ClearIonScriptAfterInvalidation(JSContext* cx, JSScript* script,
+                                            IonScript* ionScript,
+                                            bool resetUses) {
+  DebugOnly<IonScript*> clearedIonScript =
+      script->jitScript()->clearIonScript(cx->gcContext(), script);
+  MOZ_ASSERT(clearedIonScript == ionScript);
+
+  if (resetUses) {
+    script->resetWarmUpCounterToDelayIonCompilation();
+  }
+}
+
+void jit::Invalidate(JSContext* cx, const IonScriptKeyVector& invalid,
+                     bool resetUses, bool cancelOffThread) {
+  JitSpew(JitSpew_IonInvalidate, "Start invalidation.");
+
+  size_t numInvalidations = 0;
+  for (const auto& ionScriptKey : invalid) {
+    JSScript* script = ionScriptKey.script();
+    if (cancelOffThread) {
+      CancelOffThreadIonCompile(script);
+    }
+
+    IonScript* ionScript = ionScriptKey.maybeIonScriptToInvalidate();
+    if (!ionScript) {
+      continue;
+    }
+
+    JitSpew(JitSpew_IonInvalidate, " Invalidate %s:%u:%u, IonScript %p",
+            script->filename(), script->lineno(),
+            script->column().oneOriginValue(), ionScript);
+
+    ionScript->incrementInvalidationCount();
+    numInvalidations++;
+  }
+
+  if (!numInvalidations) {
+    JitSpew(JitSpew_IonInvalidate, " No IonScript invalidation.");
+    return;
+  }
+
+  JS::GCContext* gcx = cx->gcContext();
+  for (JitActivationIterator iter(cx); !iter.done(); ++iter) {
+    InvalidateActivation(gcx, iter, false);
+  }
+
+  for (const auto& ionScriptKey : invalid) {
+    IonScript* ionScript = ionScriptKey.maybeIonScriptToInvalidate();
+    if (!ionScript) {
+      continue;
+    }
+
+    if (ionScript->invalidationCount() == 1) {
+      ClearIonScriptAfterInvalidation(cx, ionScriptKey.script(), ionScript,
+                                      resetUses);
+    }
+
+    ionScript->decrementInvalidationCount(gcx);
+    numInvalidations--;
+  }
+
+  MOZ_ASSERT(!numInvalidations);
+
+  for (const auto& ionScriptKey : invalid) {
+    if (IonScript* ionScript = ionScriptKey.maybeIonScriptToInvalidate()) {
+      ClearIonScriptAfterInvalidation(cx, ionScriptKey.script(), ionScript,
+                                      resetUses);
+    }
+  }
+}
+
+void jit::IonScript::invalidate(JSContext* cx, JSScript* script, bool resetUses,
+                                const char* reason) {
+  MOZ_RELEASE_ASSERT(invalidated() || script->ionScript() == this);
+
+  JitSpew(JitSpew_IonInvalidate, " Invalidate IonScript %p: %s", this, reason);
+
+  IonScriptKeyVector list;
+  MOZ_RELEASE_ASSERT(list.reserve(1));
+  list.infallibleEmplaceBack(script, compilationId());
+
+  Invalidate(cx, list, resetUses, true);
+}
+
+void jit::Invalidate(JSContext* cx, JSScript* script, bool resetUses,
+                     bool cancelOffThread) {
+  MOZ_ASSERT(script->hasIonScript());
+
+  IonScriptKeyVector scripts;
+  MOZ_ASSERT(script->hasIonScript());
+  MOZ_RELEASE_ASSERT(scripts.reserve(1));
+  scripts.infallibleEmplaceBack(script, script->ionScript()->compilationId());
+
+  Invalidate(cx, scripts, resetUses, cancelOffThread);
+}
+
+void jit::FinishInvalidation(JS::GCContext* gcx, JSScript* script) {
+  if (!script->hasIonScript()) {
+    return;
+  }
+
+  IonScript* ion = script->jitScript()->clearIonScript(gcx, script);
+
+  if (!ion->invalidated()) {
+    jit::IonScript::Destroy(gcx, ion);
+  }
+}
+
+void jit::ForbidCompilation(JSContext* cx, JSScript* script) {
+  JitSpew(JitSpew_IonAbort, "Disabling Ion compilation of script %s:%u:%u",
+          script->filename(), script->lineno(),
+          script->column().oneOriginValue());
+
+  CancelOffThreadIonCompile(script);
+
+  if (script->hasIonScript()) {
+    Invalidate(cx, script, false);
+  }
+
+  script->disableIon();
+}
+
+size_t jit::SizeOfIonData(JSScript* script,
+                          mozilla::MallocSizeOf mallocSizeOf) {
+  size_t result = 0;
+
+  if (script->hasIonScript()) {
+    result += script->ionScript()->sizeOfIncludingThis(mallocSizeOf);
+  }
+
+  return result;
+}
+
+ const size_t TempAllocator::BallastSize = 16 * 1024;
+ const size_t TempAllocator::PreferredLifoChunkSize = 32 * 1024;

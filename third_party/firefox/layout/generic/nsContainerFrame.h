@@ -1,0 +1,464 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsContainerFrame_h_
+#define nsContainerFrame_h_
+
+#include "LayoutConstants.h"
+#include "mozilla/Attributes.h"
+#include "nsFrameList.h"
+#include "nsISelectionDisplay.h"
+#include "nsLineBox.h"
+#include "nsSplittableFrame.h"
+#include "nsTHashSet.h"
+
+class nsOverflowContinuationTracker;
+
+namespace mozilla {
+class PresShell;
+struct StylePositionArea;
+}  
+
+#ifdef DEBUG
+#  define ABSURD_COORD (10000000 * 60)
+#  define ABSURD_SIZE(_x) (((_x) < -ABSURD_COORD) || ((_x) > ABSURD_COORD))
+#endif
+
+class nsContainerFrame : public nsSplittableFrame {
+ public:
+  NS_DECL_ABSTRACT_FRAME(nsContainerFrame)
+  NS_DECL_QUERYFRAME_TARGET(nsContainerFrame)
+  NS_DECL_QUERYFRAME
+
+  nsContainerFrame* GetContentInsertionFrame() override { return this; }
+
+  const nsFrameList& GetChildList(ChildListID aList) const override;
+  void GetChildLists(nsTArray<ChildList>* aLists) const override;
+  void Destroy(DestroyContext&) override;
+
+  void ChildIsDirty(nsIFrame* aChild) override;
+
+  FrameSearchResult PeekOffsetNoAmount(bool aForward,
+                                       int32_t* aOffset) override;
+  FrameSearchResult PeekOffsetCharacter(
+      bool aForward, int32_t* aOffset,
+      PeekOffsetCharacterOptions aOptions =
+          PeekOffsetCharacterOptions()) override;
+
+#ifdef DEBUG_FRAME_DUMP
+  void List(FILE* out = stderr, const char* aPrefix = "",
+            ListFlags aFlags = ListFlags()) const override;
+  void ListWithMatchedRules(FILE* out = stderr,
+                            const char* aPrefix = "") const override;
+  void ListChildLists(FILE* aOut, const char* aPrefix, ListFlags aFlags,
+                      ChildListIDs aSkippedListIDs) const;
+  virtual void ExtraContainerFrameInfo(nsACString& aTo,
+                                       bool aListOnlyDeterministic) const;
+#endif
+
+
+  virtual void SetInitialChildList(ChildListID aListID,
+                                   nsFrameList&& aChildList);
+
+  virtual void AppendFrames(ChildListID aListID, nsFrameList&& aFrameList);
+
+  virtual void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                            const nsLineList::iterator* aPrevFrameLine,
+                            nsFrameList&& aFrameList);
+
+  virtual void RemoveFrame(DestroyContext&, ChildListID, nsIFrame*);
+
+  nsIFrame* CreateNextInFlow(nsIFrame* aFrame);
+
+  virtual void DeleteNextInFlowChild(DestroyContext&, nsIFrame* aNextInFlow,
+                                     bool aDeletingEmptyFrames);
+
+  static void ReparentFrame(nsIFrame* aFrame, nsContainerFrame* aOldParent,
+                            nsContainerFrame* aNewParent);
+
+  static void ReparentFrames(nsFrameList& aFrameList,
+                             nsContainerFrame* aOldParent,
+                             nsContainerFrame* aNewParent);
+
+  static void SetSizeConstraints(nsPresContext* aPresContext,
+                                 nsIWidget* aWidget, const nsSize& aMinSize,
+                                 const nsSize& aMaxSize);
+
+  template <typename ISizeData, typename F>
+  void DoInlineIntrinsicISize(ISizeData* aData, F& aHandleChildren);
+
+  void DoInlineMinISize(const mozilla::IntrinsicSizeInput& aInput,
+                        InlineMinISizeData* aData);
+  void DoInlinePrefISize(const mozilla::IntrinsicSizeInput& aInput,
+                         InlinePrefISizeData* aData);
+
+  virtual mozilla::LogicalSize ComputeAutoSize(
+      const SizeComputationInput& aSizingInput, mozilla::WritingMode aWM,
+      const mozilla::LogicalSize& aCBSize, nscoord aAvailableISize,
+      const mozilla::LogicalSize& aMargin,
+      const mozilla::LogicalSize& aBorderPadding,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      mozilla::ComputeSizeFlags aFlags) override;
+
+  void ReflowChild(nsIFrame* aKidFrame, nsPresContext* aPresContext,
+                   ReflowOutput& aDesiredSize, const ReflowInput& aReflowInput,
+                   const mozilla::WritingMode& aWM,
+                   const mozilla::LogicalPoint& aPos,
+                   const nsSize& aContainerSize, ReflowChildFlags aFlags,
+                   nsReflowStatus& aStatus,
+                   nsOverflowContinuationTracker* aTracker = nullptr);
+
+  static void FinishReflowChild(
+      nsIFrame* aKidFrame, nsPresContext* aPresContext,
+      const ReflowOutput& aDesiredSize, const ReflowInput* aReflowInput,
+      const mozilla::WritingMode& aWM, const mozilla::LogicalPoint& aPos,
+      const nsSize& aContainerSize, ReflowChildFlags aFlags);
+
+  void ReflowChild(nsIFrame* aKidFrame, nsPresContext* aPresContext,
+                   ReflowOutput& aDesiredSize, const ReflowInput& aReflowInput,
+                   nscoord aX, nscoord aY, ReflowChildFlags aFlags,
+                   nsReflowStatus& aStatus,
+                   nsOverflowContinuationTracker* aTracker = nullptr);
+
+  static void FinishReflowChild(nsIFrame* aKidFrame,
+                                nsPresContext* aPresContext,
+                                const ReflowOutput& aDesiredSize,
+                                const ReflowInput* aReflowInput, nscoord aX,
+                                nscoord aY, ReflowChildFlags aFlags);
+
+  void ReflowAbsoluteFrames(nsPresContext* aPresContext,
+                            ReflowOutput& aDesiredSize,
+                            const ReflowInput& aReflowInput,
+                            nsReflowStatus& aStatus);
+
+  void FinishReflowWithAbsoluteFrames(nsPresContext* aPresContext,
+                                      ReflowOutput& aDesiredSize,
+                                      const ReflowInput& aReflowInput,
+                                      nsReflowStatus& aStatus);
+
+
+  friend class nsOverflowContinuationTracker;
+
+  typedef void (*ChildFrameMerger)(nsFrameList& aDest, nsFrameList& aSrc,
+                                   nsContainerFrame* aParent);
+  static inline void DefaultChildFrameMerge(nsFrameList& aDest,
+                                            nsFrameList& aSrc,
+                                            nsContainerFrame* aParent) {
+    aDest.AppendFrames(nullptr, std::move(aSrc));
+  }
+
+  void ReflowOverflowContainerChildren(
+      nsPresContext* aPresContext, const ReflowInput& aReflowInput,
+      mozilla::OverflowAreas& aOverflowRects, ReflowChildFlags aFlags,
+      nsReflowStatus& aStatus,
+      ChildFrameMerger aMergeFunc = DefaultChildFrameMerge,
+      Maybe<nsSize> aContainerSize = Nothing());
+
+  virtual bool DrainSelfOverflowList() override;
+
+  nsFrameList* DrainExcessOverflowContainersList(
+      ChildFrameMerger aMergeFunc = DefaultChildFrameMerge);
+
+  virtual void StealFrame(nsIFrame* aChild);
+
+  nsFrameList StealFramesAfter(nsIFrame* aChild);
+
+  void DisplayOverflowContainers(nsDisplayListBuilder* aBuilder,
+                                 const nsDisplayListSet& aLists);
+
+  void DisplayAbsoluteFramesNotBuiltByPlaceholder(
+      nsDisplayListBuilder* aBuilder, const nsDisplayListSet& aLists);
+
+  virtual void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                                const nsDisplayListSet& aLists) override;
+
+  virtual mozilla::StyleAlignFlags CSSAlignmentForAbsPosChild(
+      const ReflowInput& aChildRI, mozilla::LogicalAxis aLogicalAxis) const;
+
+  mozilla::StyleAlignFlags CSSAlignmentForAbsPosChildWithinContainingBlock(
+      const SizeComputationInput& aSizingInput,
+      mozilla::LogicalAxis aLogicalAxis,
+      const mozilla::StylePositionArea& aResolvedPositionArea,
+      const mozilla::LogicalSize& aContainingBlockSize) const;
+
+#define NS_DECLARE_FRAME_PROPERTY_FRAMELIST(prop) \
+  NS_DECLARE_FRAME_PROPERTY_WITH_DTOR_NEVER_CALLED(prop, nsFrameList)
+
+  using FrameListPropertyDescriptor =
+      mozilla::FrameProperties::Descriptor<nsFrameList>;
+
+  NS_DECLARE_FRAME_PROPERTY_FRAMELIST(OverflowProperty)
+  NS_DECLARE_FRAME_PROPERTY_FRAMELIST(OverflowContainersProperty)
+  NS_DECLARE_FRAME_PROPERTY_FRAMELIST(ExcessOverflowContainersProperty)
+
+  NS_DECLARE_FRAME_PROPERTY_WITHOUT_DTOR(FirstLetterProperty, nsIFrame)
+
+  void SetHasFirstLetterChild() { mHasFirstLetterChild = true; }
+
+  void ClearHasFirstLetterChild() { mHasFirstLetterChild = false; }
+
+#ifdef DEBUG
+  NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(DebugReflowingWithInfiniteISize, bool)
+  bool IsAbsurdSizeAssertSuppressed() const {
+    return GetProperty(DebugReflowingWithInfiniteISize());
+  }
+#endif
+
+  void ConsiderChildOverflow(mozilla::OverflowAreas& aOverflowAreas,
+                             nsIFrame* aChildFrame,
+                             mozilla::OverflowAreaUnionFlags aFlags =
+                                 mozilla::OverflowAreaUnionFlags::None);
+
+ protected:
+  nsContainerFrame(ComputedStyle* aStyle, nsPresContext* aPresContext,
+                   ClassID aID)
+      : nsSplittableFrame(aStyle, aPresContext, aID) {}
+
+  ~nsContainerFrame();
+
+  void DestroyAbsoluteFrames(DestroyContext&);
+
+  bool MaybeStealOverflowContainerFrame(nsIFrame* aChild);
+
+  void BuildDisplayListForNonBlockChildren(nsDisplayListBuilder* aBuilder,
+                                           const nsDisplayListSet& aLists,
+                                           DisplayChildFlags aFlags = {});
+
+  void BuildDisplayListForInline(nsDisplayListBuilder* aBuilder,
+                                 const nsDisplayListSet& aLists) {
+    DisplayBorderBackgroundOutline(aBuilder, aLists);
+    BuildDisplayListForNonBlockChildren(aBuilder, aLists,
+                                        DisplayChildFlag::Inline);
+  }
+
+
+  [[nodiscard]] nsFrameList* GetOverflowFrames() const {
+    nsFrameList* list = GetProperty(OverflowProperty());
+    NS_ASSERTION(!list || !list->IsEmpty(), "Unexpected empty overflow list");
+    return list;
+  }
+  [[nodiscard]] nsFrameList* GetOverflowContainers() const {
+    nsFrameList* list = GetProperty(OverflowContainersProperty());
+    NS_ASSERTION(!list || !list->IsEmpty(),
+                 "Unexpected empty overflow containers list");
+    return list;
+  }
+  [[nodiscard]] nsFrameList* GetExcessOverflowContainers() const {
+    nsFrameList* list = GetProperty(ExcessOverflowContainersProperty());
+    NS_ASSERTION(!list || !list->IsEmpty(),
+                 "Unexpected empty overflow containers list");
+    return list;
+  }
+
+  [[nodiscard]] nsFrameList* StealOverflowFrames() {
+    nsFrameList* list = TakeProperty(OverflowProperty());
+    NS_ASSERTION(!list || !list->IsEmpty(), "Unexpected empty overflow list");
+    return list;
+  }
+  [[nodiscard]] nsFrameList* StealOverflowContainers() {
+    nsFrameList* list = TakeProperty(OverflowContainersProperty());
+    NS_ASSERTION(!list || !list->IsEmpty(), "Unexpected empty overflow list");
+    return list;
+  }
+  [[nodiscard]] nsFrameList* StealExcessOverflowContainers() {
+    nsFrameList* list = TakeProperty(ExcessOverflowContainersProperty());
+    NS_ASSERTION(!list || !list->IsEmpty(), "Unexpected empty overflow list");
+    return list;
+  }
+
+  nsFrameList* SetOverflowFrames(nsFrameList&& aOverflowFrames) {
+    MOZ_ASSERT(aOverflowFrames.NotEmpty(), "Shouldn't be called");
+    auto* list = new (PresShell()) nsFrameList(std::move(aOverflowFrames));
+    SetProperty(OverflowProperty(), list);
+    return list;
+  }
+  nsFrameList* SetOverflowContainers(nsFrameList&& aOverflowContainers) {
+    MOZ_ASSERT(aOverflowContainers.NotEmpty(), "Shouldn't set an empty list!");
+    MOZ_ASSERT(!GetProperty(OverflowContainersProperty()),
+               "Shouldn't override existing list!");
+    MOZ_ASSERT(CanContainOverflowContainers(),
+               "This type of frame can't have overflow containers!");
+    auto* list = new (PresShell()) nsFrameList(std::move(aOverflowContainers));
+    SetProperty(OverflowContainersProperty(), list);
+    return list;
+  }
+  nsFrameList* SetExcessOverflowContainers(
+      nsFrameList&& aExcessOverflowContainers) {
+    MOZ_ASSERT(aExcessOverflowContainers.NotEmpty(),
+               "Shouldn't set an empty list!");
+    MOZ_ASSERT(!GetProperty(ExcessOverflowContainersProperty()),
+               "Shouldn't override existing list!");
+    MOZ_ASSERT(CanContainOverflowContainers(),
+               "This type of frame can't have overflow containers!");
+    auto* list =
+        new (PresShell()) nsFrameList(std::move(aExcessOverflowContainers));
+    SetProperty(ExcessOverflowContainersProperty(), list);
+    return list;
+  }
+
+  void DestroyOverflowList() {
+    nsFrameList* list = TakeProperty(OverflowProperty());
+    MOZ_ASSERT(list && list->IsEmpty());
+    list->Delete(PresShell());
+  }
+  void DestroyOverflowContainers() {
+    nsFrameList* list = TakeProperty(OverflowContainersProperty());
+    MOZ_ASSERT(list && list->IsEmpty());
+    list->Delete(PresShell());
+  }
+  void DestroyExcessOverflowContainers() {
+    nsFrameList* list = TakeProperty(ExcessOverflowContainersProperty());
+    MOZ_ASSERT(list && list->IsEmpty());
+    list->Delete(PresShell());
+  }
+
+  bool MoveOverflowToChildList();
+
+  void MergeSortedOverflow(nsFrameList& aList);
+
+  void MergeSortedExcessOverflowContainers(nsFrameList& aList);
+
+  static void MergeSortedFrameLists(nsFrameList& aDest, nsFrameList& aSrc,
+                                    nsIContent* aCommonAncestor);
+
+  static inline void MergeSortedFrameListsFor(nsFrameList& aDest,
+                                              nsFrameList& aSrc,
+                                              nsContainerFrame* aParent) {
+    MergeSortedFrameLists(aDest, aSrc, aParent->GetContent());
+  }
+
+  bool MoveInlineOverflowToChildList(nsIFrame* aLineContainer);
+
+  void PushChildrenToOverflow(nsIFrame* aFromChild, nsIFrame* aPrevSibling);
+
+  using FrameHashtable = nsTHashSet<nsIFrame*>;
+  bool PushIncompleteChildren(const FrameHashtable& aPushedItems,
+                              const FrameHashtable& aIncompleteItems,
+                              const FrameHashtable& aOverflowIncompleteItems);
+
+  void NormalizeChildLists();
+
+  void NoteNewChildren(ChildListID aListID, const nsFrameList& aFrameList);
+
+  bool DrainAndMergeSelfOverflowList();
+
+  static nsIFrame* GetFirstNonAnonBoxInSubtree(nsIFrame* aFrame);
+
+  static void ReparentFloatsForInlineChild(nsIFrame* aOurBlock,
+                                           nsIFrame* aFrame,
+                                           bool aReparentSiblings);
+
+  bool TryRemoveFrame(FrameListPropertyDescriptor aProp,
+                      nsIFrame* aChildToRemove);
+
+
+  struct ContinuationTraversingState {
+    nsContainerFrame* mNextInFlow;
+    explicit ContinuationTraversingState(nsContainerFrame* aFrame)
+        : mNextInFlow(static_cast<nsContainerFrame*>(aFrame->GetNextInFlow())) {
+    }
+  };
+
+  nsIFrame* GetNextInFlowChild(ContinuationTraversingState& aState,
+                               bool* aIsInOverflow = nullptr);
+
+  nsIFrame* PullNextInFlowChild(ContinuationTraversingState& aState);
+
+  void SafelyDestroyFrameListProp(DestroyContext&,
+                                  mozilla::PresShell* aPresShell,
+                                  FrameListPropertyDescriptor aProp);
+
+
+  bool ResolvedOrientationIsVertical() const;
+
+  mozilla::LogicalSize ComputeSizeWithIntrinsicDimensions(
+      gfxContext* aRenderingContext, mozilla::WritingMode aWM,
+      const mozilla::IntrinsicSize& aIntrinsicSize,
+      const mozilla::AspectRatio& aAspectRatio,
+      const mozilla::LogicalSize& aCBSize, const mozilla::LogicalSize& aMargin,
+      const mozilla::LogicalSize& aBorderPadding,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      mozilla::ComputeSizeFlags aFlags);
+
+  nsRect ComputeSimpleTightBounds(mozilla::gfx::DrawTarget* aDrawTarget) const;
+
+  void PushDirtyBitToAbsoluteFrames();
+
+  bool IsFrameTreeTooDeep(const ReflowInput& aReflowInput,
+                          ReflowOutput& aMetrics, nsReflowStatus& aStatus);
+
+  bool ShouldAvoidBreakInside(const ReflowInput& aReflowInput) const;
+
+  void DisplaySelectionOverlay(
+      nsDisplayListBuilder* aBuilder, nsDisplayList* aList,
+      uint16_t aContentType = nsISelectionDisplay::DISPLAY_FRAMES);
+
+  mozilla::RubyMetrics RubyMetricsIncludingChildren(
+      float aRubyMetricsFactor) const;
+
+
+#ifdef DEBUG
+  void SanityCheckChildListsBeforeReflow() const;
+
+  void SetDidPushItemsBitIfNeeded(ChildListID aListID, nsIFrame* aOldFrame);
+
+  bool mDidPushItemsBitMayLie{false};
+#endif
+
+  nsFrameList mFrames;
+};
+
+
+class nsOverflowContinuationTracker {
+ public:
+  nsOverflowContinuationTracker(nsContainerFrame* aFrame, bool aWalkOOFFrames,
+                                bool aSkipOverflowContainerChildren = true);
+  nsresult Insert(nsIFrame* aOverflowCont, nsReflowStatus& aReflowStatus);
+  class MOZ_RAII AutoFinish {
+   public:
+    AutoFinish(nsOverflowContinuationTracker* aTracker, nsIFrame* aChild)
+        : mTracker(aTracker), mChild(aChild) {
+      if (mTracker) {
+        mTracker->BeginFinish(mChild);
+      }
+    }
+    ~AutoFinish() {
+      if (mTracker) {
+        mTracker->EndFinish(mChild);
+      }
+    }
+
+   private:
+    nsOverflowContinuationTracker* mTracker;
+    nsIFrame* mChild;
+  };
+
+  void Skip(nsIFrame* aChild, nsReflowStatus& aReflowStatus) {
+    MOZ_ASSERT(aChild, "null ptr");
+    if (aChild == mSentry) {
+      StepForward();
+      if (aReflowStatus.IsComplete()) {
+        aReflowStatus.SetOverflowIncomplete();
+      }
+    }
+  }
+
+ private:
+  void BeginFinish(nsIFrame* aChild);
+  void EndFinish(nsIFrame* aChild);
+
+  void SetupOverflowContList();
+  void SetUpListWalker();
+  void StepForward();
+
+  nsFrameList* mOverflowContList;
+  nsIFrame* mPrevOverflowCont;
+  nsIFrame* mSentry;
+  nsContainerFrame* mParent;
+  bool mSkipOverflowContainerChildren;
+  bool mWalkOOFFrames;
+};
+
+#endif /* nsContainerFrame_h_ */

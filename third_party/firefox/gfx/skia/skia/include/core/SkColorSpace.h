@@ -1,0 +1,264 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkColorSpace_DEFINED)
+#define SkColorSpace_DEFINED
+
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkFixed.h"
+#include "include/private/base/SkOnce.h"
+#include "modules/skcms/skcms.h"
+
+#include <cstddef>
+#include <cstdint>
+
+class SkData;
+
+struct SK_API SkColorSpacePrimaries {
+    float fRX;
+    float fRY;
+    float fGX;
+    float fGY;
+    float fBX;
+    float fBY;
+    float fWX;
+    float fWY;
+
+    bool toXYZD50(skcms_Matrix3x3* toXYZD50) const;
+
+    bool operator==(const SkColorSpacePrimaries& other) const {
+        return fRX == other.fRX && fRY == other.fRY && fGX == other.fGX && fGY == other.fGY &&
+               fBX == other.fBX && fBY == other.fBY && fWX == other.fWX && fWY == other.fWY;
+    }
+};
+
+#define SKIA_COLOR_SPACE_PRIMARIES_OPERATOR_EQUAL
+
+namespace SkNamedPrimaries {
+
+
+static constexpr SkColorSpacePrimaries kRec709 = {
+        0.64f, 0.33f, 0.3f, 0.6f, 0.15f, 0.06f, 0.3127f, 0.329f};
+
+static constexpr SkColorSpacePrimaries kRec470SystemM = {
+        0.67f, 0.33f, 0.21f, 0.71f, 0.14f, 0.08f, 0.31f, 0.316f};
+
+static constexpr SkColorSpacePrimaries kRec470SystemBG = {
+        0.64f, 0.33f, 0.29f, 0.60f, 0.15f, 0.06f, 0.3127f, 0.3290f};
+
+static constexpr SkColorSpacePrimaries kRec601 = {
+        0.630f, 0.340f, 0.310f, 0.595f, 0.155f, 0.070f, 0.3127f, 0.3290f};
+
+static constexpr SkColorSpacePrimaries kSMPTE_ST_240 = kRec601;
+
+static constexpr SkColorSpacePrimaries kGenericFilm = {
+        0.681f, 0.319f, 0.243f, 0.692f, 0.145f, 0.049f, 0.310f, 0.316f};
+
+static constexpr SkColorSpacePrimaries kRec2020{
+        0.708f, 0.292f, 0.170f, 0.797f, 0.131f, 0.046f, 0.3127f, 0.3290f};
+
+static constexpr SkColorSpacePrimaries kSMPTE_ST_428_1 = {
+        1.f, 0.f, 0.f, 1.f, 0.f, 0.f, 1.f / 3.f, 1.f / 3.f};
+
+static constexpr SkColorSpacePrimaries kSMPTE_RP_431_2 = {
+        0.680f, 0.320f, 0.265f, 0.690f, 0.150f, 0.060f, 0.314f, 0.351f};
+
+static constexpr SkColorSpacePrimaries kSMPTE_EG_432_1 = {
+        0.680f, 0.320f, 0.265f, 0.690f, 0.150f, 0.060f, 0.3127f, 0.3290f};
+
+static constexpr SkColorSpacePrimaries kITU_T_H273_Value22 = {
+        0.630f, 0.340f, 0.295f, 0.605f, 0.155f, 0.077f, 0.3127f, 0.3290f};
+
+enum class CicpId : uint8_t {
+    kRec709 = 1,
+    kRec470SystemM = 4,
+    kRec470SystemBG = 5,
+    kRec601 = 6,
+    kSMPTE_ST_240 = 7,
+    kGenericFilm = 8,
+    kRec2020 = 9,
+    kSMPTE_ST_428_1 = 10,
+    kSMPTE_RP_431_2 = 11,
+    kSMPTE_EG_432_1 = 12,
+    kITU_T_H273_Value22 = 22,
+};
+
+static constexpr SkColorSpacePrimaries kProPhotoRGB = {
+        0.7347f, 0.2653f, 0.1596f, 0.8404f, 0.0366f, 0.0001f, 0.34567f, 0.35850f};
+
+}  
+
+namespace SkNamedTransferFn {
+
+static constexpr skcms_TransferFunction kSRGB =
+    { 2.4f, (float)(1/1.055), (float)(0.055/1.055), (float)(1/12.92), 0.04045f, 0.0f, 0.0f };
+
+static constexpr skcms_TransferFunction k2Dot2 =
+    { 2.2f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+
+static constexpr skcms_TransferFunction kRec2020 = {
+        2.22222f, 0.909672f, 0.0903276f, 0.222222f, 0.0812429f, 0, 0};
+
+
+static constexpr skcms_TransferFunction kRec709 = {2.4f, 1.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+static constexpr skcms_TransferFunction kRec470SystemM = {2.2f, 1.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+static constexpr skcms_TransferFunction kRec470SystemBG = {2.8f, 1.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+static constexpr skcms_TransferFunction kRec601 = kRec709;
+
+static constexpr skcms_TransferFunction kSMPTE_ST_240 = {
+        2.222222222222f, 0.899626676224f, 0.100373323776f, 0.25f, 0.091286342118f, 0.f, 0.f};
+
+static constexpr skcms_TransferFunction kLinear =
+    { 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+
+static constexpr skcms_TransferFunction kIEC61966_2_4 = kRec709;
+
+static constexpr skcms_TransferFunction kIEC61966_2_1 = kSRGB;
+
+static constexpr skcms_TransferFunction kRec2020_10bit = kRec709;
+
+static constexpr skcms_TransferFunction kRec2020_12bit = kRec709;
+
+static constexpr skcms_TransferFunction kPQ =
+    {-5.0f, 203.f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+
+static constexpr skcms_TransferFunction kSMPTE_ST_428_1 = {
+        2.6f, 1.034080527699f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+static constexpr skcms_TransferFunction kHLG =
+    {-6.0f, 203.f, 1000.0f, 1.2f, 0.0f, 0.0f, 0.0f };
+
+enum class CicpId : uint8_t {
+    kRec709 = 1,
+    kRec470SystemM = 4,
+    kRec470SystemBG = 5,
+    kRec601 = 6,
+    kSMPTE_ST_240 = 7,
+    kLinear = 8,
+    kIEC61966_2_4 = 11,
+    kIEC61966_2_1 = 13,
+    kSRGB = kIEC61966_2_1,
+    kRec2020_10bit = 14,
+    kRec2020_12bit = 15,
+    kPQ = 16,
+    kSMPTE_ST_428_1 = 17,
+    kHLG = 18,
+};
+
+static constexpr skcms_TransferFunction kProPhotoRGB = {1.8f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+static constexpr skcms_TransferFunction kA98RGB = k2Dot2;
+
+}  
+
+namespace SkNamedGamut {
+
+static constexpr skcms_Matrix3x3 kSRGB = {{
+    { SkFixedToFloat(0x6FA2), SkFixedToFloat(0x6299), SkFixedToFloat(0x24A0) },
+    { SkFixedToFloat(0x38F5), SkFixedToFloat(0xB785), SkFixedToFloat(0x0F84) },
+    { SkFixedToFloat(0x0390), SkFixedToFloat(0x18DA), SkFixedToFloat(0xB6CF) },
+}};
+
+static constexpr skcms_Matrix3x3 kAdobeRGB = {{
+    { SkFixedToFloat(0x9c18), SkFixedToFloat(0x348d), SkFixedToFloat(0x2631) },
+    { SkFixedToFloat(0x4fa5), SkFixedToFloat(0xa02c), SkFixedToFloat(0x102f) },
+    { SkFixedToFloat(0x04fc), SkFixedToFloat(0x0f95), SkFixedToFloat(0xbe9c) },
+}};
+
+static constexpr skcms_Matrix3x3 kDisplayP3 = {{
+    {  0.515102f,   0.291965f,  0.157153f  },
+    {  0.241182f,   0.692236f,  0.0665819f },
+    { -0.00104941f, 0.0418818f, 0.784378f  },
+}};
+
+static constexpr skcms_Matrix3x3 kRec2020 = {{
+    {  0.673459f,   0.165661f,  0.125100f  },
+    {  0.279033f,   0.675338f,  0.0456288f },
+    { -0.00193139f, 0.0299794f, 0.797162f  },
+}};
+
+static constexpr skcms_Matrix3x3 kXYZ = {{
+    { 1.0f, 0.0f, 0.0f },
+    { 0.0f, 1.0f, 0.0f },
+    { 0.0f, 0.0f, 1.0f },
+}};
+
+}  
+
+class SK_API SkColorSpace : public SkNVRefCnt<SkColorSpace> {
+public:
+    static sk_sp<SkColorSpace> MakeSRGB();
+
+    static sk_sp<SkColorSpace> MakeSRGBLinear();
+
+    static sk_sp<SkColorSpace> MakeRGB(const skcms_TransferFunction& transferFn,
+                                       const skcms_Matrix3x3& toXYZ);
+
+    static sk_sp<SkColorSpace> MakeCICP(SkNamedPrimaries::CicpId color_primaries,
+                                        SkNamedTransferFn::CicpId transfer_characteristics);
+
+    static sk_sp<SkColorSpace> Make(const skcms_ICCProfile&);
+
+    void toProfile(skcms_ICCProfile*) const;
+
+    bool gammaCloseToSRGB() const;
+
+    bool gammaIsLinear() const;
+
+    bool isNumericalTransferFn(skcms_TransferFunction* fn) const;
+
+    bool toXYZD50(skcms_Matrix3x3* toXYZD50) const;
+
+    uint32_t toXYZD50Hash() const { return fToXYZD50Hash; }
+
+    sk_sp<SkColorSpace> makeLinearGamma() const;
+
+    sk_sp<SkColorSpace> makeSRGBGamma() const;
+
+    sk_sp<SkColorSpace> makeColorSpin() const;
+
+    bool isSRGB() const;
+
+    sk_sp<SkData> serialize() const;
+
+    size_t writeToMemory(void* memory) const;
+
+    static sk_sp<SkColorSpace> Deserialize(const void* data, size_t length);
+
+    static bool Equals(const SkColorSpace*, const SkColorSpace*);
+
+    void       transferFn(float gabcdef[7]) const;  
+    void       transferFn(skcms_TransferFunction* fn) const;
+    void    invTransferFn(skcms_TransferFunction* fn) const;
+    void gamutTransformTo(const SkColorSpace* dst, skcms_Matrix3x3* src_to_dst) const;
+
+    uint32_t transferFnHash() const { return fTransferFnHash; }
+    uint64_t           hash() const { return (uint64_t)fTransferFnHash << 32 | fToXYZD50Hash; }
+
+private:
+    friend class SkColorSpaceSingletonFactory;
+
+    SkColorSpace(const skcms_TransferFunction& transferFn, const skcms_Matrix3x3& toXYZ);
+
+    void computeLazyDstFields() const;
+
+    uint32_t                            fTransferFnHash;
+    uint32_t                            fToXYZD50Hash;
+
+    skcms_TransferFunction              fTransferFn;
+    skcms_Matrix3x3                     fToXYZD50;
+
+    mutable skcms_TransferFunction      fInvTransferFn;
+    mutable skcms_Matrix3x3             fFromXYZD50;
+    mutable SkOnce                      fLazyDstFieldsOnce;
+};
+
+#endif

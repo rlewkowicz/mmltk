@@ -1,0 +1,41 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef SimpleURIUnknownSchemes_h_
+#define SimpleURIUnknownSchemes_h_
+
+#include "nsString.h"
+#include "mozilla/RWLock.h"
+#include "nsTArray.h"
+#include "nsTHashSet.h"
+
+#define SIMPLE_URI_SCHEMES_PREF "network.url.simple_uri_unknown_schemes"
+
+namespace mozilla::net {
+
+class SimpleURIUnknownSchemes {
+ public:
+  SimpleURIUnknownSchemes() = default;
+
+  void ParseAndMergePrefSchemes();
+
+  void SetAndMergeRemoteSchemes(const nsTArray<nsCString>& remoteSettingsList);
+
+  bool IsSimpleURIUnknownScheme(const nsACString& aScheme);
+  void GetRemoteSchemes(nsTArray<nsCString>& aArray);
+
+ private:
+  void ParseAndMergePrefSchemesLocked() MOZ_REQUIRES(mSchemeLock);
+  void MergeSimpleURISchemes(const nsTArray<nsCString>& prefList,
+                             const nsTArray<nsCString>& remoteSettingsList)
+      MOZ_REQUIRES(mSchemeLock);
+
+  mutable RWLock mSchemeLock{"SimpleURIUnknownSchemes"};
+  nsTHashSet<nsCString> mSimpleURISchemes MOZ_GUARDED_BY(mSchemeLock);
+
+  nsTArray<nsCString> mRemoteSettingsURISchemes MOZ_GUARDED_BY(mSchemeLock);
+};
+
+}  
+#endif  // SimpleURIUnknownSchemes_h_

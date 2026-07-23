@@ -1,0 +1,376 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "PreferenceSheet.h"
+#include "mozilla/GeckoBindings.h"
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/RelativeLuminanceUtils.h"
+#include "mozilla/StaticPrefs_browser.h"
+#include "mozilla/StaticPrefs_gfx.h"
+#include "mozilla/StyleSheet.h"
+#include "mozilla/StyleSheetInlines.h"
+#include "mozilla/dom/BrowsingContextBinding.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/ScreenBinding.h"
+#include "mozilla/gfx/gfxVars.h"
+#include "nsCSSProps.h"
+#include "nsCSSValue.h"
+#include "nsContentUtils.h"
+#include "nsDeviceContext.h"
+#include "nsGlobalWindowOuter.h"
+#include "nsIBaseWindow.h"
+#include "nsIDocShell.h"
+#include "nsIPrintSettings.h"
+#include "nsIWidget.h"
+#include "nsPresContext.h"
+#include "nsStyleConsts.h"
+
+using namespace mozilla;
+using mozilla::dom::DisplayMode;
+using mozilla::dom::Document;
+
+static nsSize GetSize(const Document& aDocument) {
+  nsPresContext* pc = aDocument.GetPresContext();
+
+  if (!pc) {
+    return {};
+  }
+
+  if (pc->IsRootPaginatedDocument()) {
+    return pc->GetPageSize();
+  }
+
+  return pc->GetVisibleArea().Size();
+}
+
+static nsSize GetDeviceSize(const Document& aDocument) {
+  if (aDocument.ShouldResistFingerprinting(RFPTarget::CSSDeviceSize)) {
+    return GetSize(aDocument);
+  }
+
+  Maybe<CSSIntSize> deviceSize =
+      nsGlobalWindowOuter::GetRDMDeviceSize(aDocument);
+  if (deviceSize.isSome()) {
+    return CSSPixel::ToAppUnits(deviceSize.value());
+  }
+
+  if (dom::BrowsingContext* bc = aDocument.GetBrowsingContext()) {
+    Maybe<CSSIntSize> screenSize = bc->GetScreenAreaOverride();
+    if (screenSize.isSome()) {
+      return CSSPixel::ToAppUnits(screenSize.value());
+    }
+  }
+
+  nsPresContext* pc = aDocument.GetPresContext();
+  if (!pc) {
+    return {};
+  }
+
+  if (pc->IsRootPaginatedDocument()) {
+    return pc->GetPageSize();
+  }
+
+  return pc->DeviceContext()->GetDeviceSurfaceDimensions();
+}
+
+bool Gecko_MediaFeatures_IsResourceDocument(const Document* aDocument) {
+  return aDocument->IsResourceDoc();
+}
+
+bool Gecko_MediaFeatures_InAndroidPipMode(const Document* aDocument) {
+  return aDocument->InAndroidPipMode();
+}
+
+bool Gecko_MediaFeatures_UseOverlayScrollbars(const Document* aDocument) {
+  nsPresContext* pc = aDocument->GetPresContext();
+  return pc && pc->UseOverlayScrollbars();
+}
+
+static nsDeviceContext* GetDeviceContextFor(const Document* aDocument) {
+  nsPresContext* pc = aDocument->GetPresContext();
+  if (!pc) {
+    return nullptr;
+  }
+
+  return pc->DeviceContext();
+}
+
+void Gecko_MediaFeatures_GetDeviceSize(const Document* aDocument,
+                                       nscoord* aWidth, nscoord* aHeight) {
+  nsSize size = GetDeviceSize(*aDocument);
+  *aWidth = size.width;
+  *aHeight = size.height;
+}
+
+int32_t Gecko_MediaFeatures_GetMonochromeBitsPerPixel(
+    const Document* aDocument) {
+  static constexpr int32_t kDefaultMonochromeBpp = 8;
+
+  nsPresContext* pc = aDocument->GetPresContext();
+  if (!pc) {
+    return 0;
+  }
+  nsIPrintSettings* ps = pc->GetPrintSettings();
+  if (!ps) {
+    return 0;
+  }
+  bool color = true;
+  ps->GetPrintInColor(&color);
+  return color ? 0 : kDefaultMonochromeBpp;
+}
+
+StyleColorGamut Gecko_MediaFeatures_ColorGamut(const Document* aDocument) {
+  auto* dx = GetDeviceContextFor(aDocument);
+  if (!dx || aDocument->ShouldResistFingerprinting(RFPTarget::CSSColorInfo)) {
+    return StyleColorGamut::Srgb;
+  }
+  switch (dx->GetColorGamut()) {
+    case dom::ScreenColorGamut::Srgb:
+      return StyleColorGamut::Srgb;
+    case dom::ScreenColorGamut::Rec2020:
+      return StyleColorGamut::Rec2020;
+    case dom::ScreenColorGamut::P3:
+      return StyleColorGamut::P3;
+  }
+  return StyleColorGamut::Srgb;
+}
+
+int32_t Gecko_MediaFeatures_GetColorDepth(const Document* aDocument) {
+  if (Gecko_MediaFeatures_GetMonochromeBitsPerPixel(aDocument) != 0) {
+    return 0;
+  }
+
+  int32_t depth = 24;
+
+  if (!aDocument->ShouldResistFingerprinting(RFPTarget::CSSColorInfo)) {
+    if (nsDeviceContext* dx = GetDeviceContextFor(aDocument)) {
+      depth = dx->GetDepth();
+    }
+  }
+
+  return depth / 3;
+}
+
+float Gecko_MediaFeatures_GetResolution(const Document* aDocument) {
+  nsPresContext* pc = aDocument->GetPresContext();
+  if (!pc) {
+    return 1.;
+  }
+
+  if (pc->GetOverrideDPPX() > 0.) {
+    return pc->GetOverrideDPPX();
+  }
+
+  if (aDocument->ShouldResistFingerprinting(RFPTarget::CSSResolution)) {
+    return float(nsRFPService::GetDevicePixelRatioAtZoom(pc->GetFullZoom()));
+  }
+  return float(AppUnitsPerCSSPixel()) /
+         pc->DeviceContext()->AppUnitsPerDevPixel();
+}
+
+static const Document* TopDocument(const Document* aDocument) {
+  const Document* current = aDocument;
+  while (const Document* parent = current->GetInProcessParentDocument()) {
+    current = parent;
+  }
+  return current;
+}
+
+StyleDisplayMode Gecko_MediaFeatures_GetDisplayMode(const Document* aDocument) {
+  const Document* rootDocument = TopDocument(aDocument);
+
+  nsCOMPtr<nsISupports> container = rootDocument->GetContainer();
+  if (nsCOMPtr<nsIBaseWindow> baseWindow = do_QueryInterface(container)) {
+    nsCOMPtr<nsIWidget> mainWidget = baseWindow->GetMainWidget();
+    if (mainWidget && mainWidget->SizeMode() == nsSizeMode_Fullscreen) {
+      return StyleDisplayMode::Fullscreen;
+    }
+  }
+
+  static_assert(
+      static_cast<int32_t>(DisplayMode::Browser) ==
+              static_cast<int32_t>(StyleDisplayMode::Browser) &&
+          static_cast<int32_t>(DisplayMode::Minimal_ui) ==
+              static_cast<int32_t>(StyleDisplayMode::MinimalUi) &&
+          static_cast<int32_t>(DisplayMode::Standalone) ==
+              static_cast<int32_t>(StyleDisplayMode::Standalone) &&
+          static_cast<int32_t>(DisplayMode::Fullscreen) ==
+              static_cast<int32_t>(StyleDisplayMode::Fullscreen) &&
+          static_cast<int32_t>(DisplayMode::Picture_in_picture) ==
+              static_cast<int32_t>(StyleDisplayMode::PictureInPicture),
+      "DisplayMode must mach nsStyleConsts.h");
+
+  dom::BrowsingContext* browsingContext = aDocument->GetBrowsingContext();
+  if (!browsingContext) {
+    return StyleDisplayMode::Browser;
+  }
+  return static_cast<StyleDisplayMode>(browsingContext->DisplayMode());
+}
+
+bool Gecko_MediaFeatures_MatchesPlatform(StylePlatform aPlatform) {
+  switch (aPlatform) {
+#if defined(MOZ_WIDGET_GTK)
+    case StylePlatform::Linux:
+      return true;
+#else
+#  error "Unknown platform?"
+#endif
+    default:
+      return false;
+  }
+}
+
+bool Gecko_MediaFeatures_PrefersReducedMotion(const Document* aDocument) {
+  if (aDocument->ShouldResistFingerprinting(
+          RFPTarget::CSSPrefersReducedMotion)) {
+    return false;
+  }
+
+  if (dom::BrowsingContext* bc = aDocument->GetBrowsingContext()) {
+    auto* top = bc->Top();
+    switch (top->GetPrefersReducedMotionOverride()) {
+      case dom::PrefersReducedMotionOverride::Reduce:
+        return true;
+      case dom::PrefersReducedMotionOverride::No_preference:
+        return false;
+      case dom::PrefersReducedMotionOverride::None:
+        break;
+    }
+  }
+
+  return LookAndFeel::GetInt(LookAndFeel::IntID::PrefersReducedMotion, 0) == 1;
+}
+
+bool Gecko_MediaFeatures_PrefersReducedTransparency(const Document* aDocument) {
+  if (aDocument->ShouldResistFingerprinting(
+          RFPTarget::CSSPrefersReducedTransparency)) {
+    return false;
+  }
+  return LookAndFeel::GetInt(LookAndFeel::IntID::PrefersReducedTransparency,
+                             0) == 1;
+}
+
+StylePrefersColorScheme Gecko_MediaFeatures_PrefersColorScheme(
+    const Document* aDocument, bool aUseContent) {
+  auto scheme = aUseContent ? PreferenceSheet::ContentPrefs().mColorScheme
+                            : aDocument->PreferredColorScheme();
+  return scheme == ColorScheme::Dark ? StylePrefersColorScheme::Dark
+                                     : StylePrefersColorScheme::Light;
+}
+
+bool Gecko_MediaFeatures_MacRTL(const Document* aDocument) {
+  auto* widget = nsContentUtils::WidgetForDocument(aDocument);
+  return widget && widget->IsMacTitlebarDirectionRTL();
+}
+
+StylePrefersContrast Gecko_MediaFeatures_PrefersContrast(
+    const Document* aDocument) {
+  if (aDocument->ShouldResistFingerprinting(RFPTarget::CSSPrefersContrast)) {
+    return StylePrefersContrast::NoPreference;
+  }
+  const auto& prefs = PreferenceSheet::PrefsFor(*aDocument);
+  if (!prefs.mUseAccessibilityTheme && prefs.mUseDocumentColors) {
+    return StylePrefersContrast::NoPreference;
+  }
+  const auto& colors = prefs.ColorsFor(ColorScheme::Light);
+  float ratio = RelativeLuminanceUtils::ContrastRatio(colors.mDefaultBackground,
+                                                      colors.mDefault);
+  if (ratio < 4.5f) {
+    return StylePrefersContrast::Less;
+  }
+  if (ratio >= 7.0f) {
+    return StylePrefersContrast::More;
+  }
+  return StylePrefersContrast::Custom;
+}
+
+bool Gecko_MediaFeatures_InvertedColors(const Document* aDocument) {
+  if (aDocument->ShouldResistFingerprinting(RFPTarget::CSSInvertedColors)) {
+    return false;
+  }
+  return LookAndFeel::GetInt(LookAndFeel::IntID::InvertedColors, 0) == 1;
+}
+
+StyleScripting Gecko_MediaFeatures_Scripting(const Document* aDocument) {
+  const auto* doc = aDocument;
+  if (aDocument->IsStaticDocument()) {
+    doc = aDocument->GetOriginalDocument();
+  }
+
+  return doc->IsScriptEnabled() ? StyleScripting::Enabled
+                                : StyleScripting::None;
+}
+
+StyleDynamicRange Gecko_MediaFeatures_DynamicRange(const Document* aDocument) {
+  return StyleDynamicRange::Standard;
+}
+
+StyleDynamicRange Gecko_MediaFeatures_VideoDynamicRange(
+    const Document* aDocument) {
+  if (aDocument->ShouldResistFingerprinting(RFPTarget::CSSVideoDynamicRange)) {
+    return StyleDynamicRange::Standard;
+  }
+  if (StaticPrefs::gfx_color_management_hdr_force_enabled()) {
+    return StyleDynamicRange::High;
+  }
+  if (!StaticPrefs::gfx_color_management_hdr() || !gfx::gfxVars::VideoHDR()) {
+    return StyleDynamicRange::Standard;
+  }
+
+  if (nsDeviceContext* dx = GetDeviceContextFor(aDocument)) {
+    if (dx->GetScreenIsHDR()) {
+      return StyleDynamicRange::High;
+    }
+  }
+
+  return StyleDynamicRange::Standard;
+}
+
+static PointerCapabilities GetPointerCapabilities(const Document* aDocument,
+                                                  LookAndFeel::IntID aID) {
+  MOZ_ASSERT(aID == LookAndFeel::IntID::PrimaryPointerCapabilities ||
+             aID == LookAndFeel::IntID::AllPointerCapabilities);
+  MOZ_ASSERT(aDocument);
+
+  if (dom::BrowsingContext* bc = aDocument->GetBrowsingContext()) {
+    if (bc->TouchEventsOverride() == dom::TouchEventsOverride::Enabled) {
+      return PointerCapabilities::Coarse;
+    }
+  }
+
+  const PointerCapabilities kDefaultCapabilities =
+      PointerCapabilities::Fine | PointerCapabilities::Hover;
+  if (aDocument->ShouldResistFingerprinting(
+          RFPTarget::CSSPointerCapabilities)) {
+    return kDefaultCapabilities;
+  }
+
+  int32_t intValue;
+  nsresult rv = LookAndFeel::GetInt(aID, &intValue);
+  if (NS_FAILED(rv)) {
+    return kDefaultCapabilities;
+  }
+
+  return static_cast<PointerCapabilities>(intValue);
+}
+
+PointerCapabilities Gecko_MediaFeatures_PrimaryPointerCapabilities(
+    const Document* aDocument) {
+  return GetPointerCapabilities(aDocument,
+                                LookAndFeel::IntID::PrimaryPointerCapabilities);
+}
+
+PointerCapabilities Gecko_MediaFeatures_AllPointerCapabilities(
+    const Document* aDocument) {
+  return GetPointerCapabilities(aDocument,
+                                LookAndFeel::IntID::AllPointerCapabilities);
+}
+
+StyleGtkThemeFamily Gecko_MediaFeatures_GtkThemeFamily() {
+  static_assert(int32_t(StyleGtkThemeFamily::Unknown) == 0);
+  return StyleGtkThemeFamily(
+      LookAndFeel::GetInt(LookAndFeel::IntID::GTKThemeFamily));
+}

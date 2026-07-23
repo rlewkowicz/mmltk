@@ -1,0 +1,743 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ProcessPriorityManager.h"
+
+#include "StaticPtr.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/Hal.h"
+#include "mozilla/IntegerPrintfMacros.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/Services.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_threads.h"
+#include "mozilla/dom/BrowserHost.h"
+#include "mozilla/dom/BrowserParent.h"
+#include "mozilla/dom/CanonicalBrowsingContext.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/Element.h"
+#include "nsCRT.h"
+#include "nsComponentManagerUtils.h"
+#include "nsFrameLoader.h"
+#include "nsINamed.h"
+#include "nsIObserver.h"
+#include "nsIObserverService.h"
+#include "nsIPropertyBag2.h"
+#include "nsITimer.h"
+#include "nsPrintfCString.h"
+#include "nsQueryObject.h"
+#include "nsTHashMap.h"
+#include "nsTHashSet.h"
+#include "nsXULAppAPI.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using namespace mozilla::hal;
+
+#  include <unistd.h>
+
+#if defined(LOG)
+#  undef LOG
+#endif
+
+
+
+#if defined(ENABLE_LOGGING)
+#  define LOG(fmt, ...) \
+    printf("ProcessPriorityManager - " fmt "\n", ##__VA_ARGS__)
+#  define LOGP(fmt, ...)                                                   \
+    printf("ProcessPriorityManager[%schild-id=%" PRIu64 ", pid=%d] - " fmt \
+           "\n",                                                           \
+           NameWithComma().get(), static_cast<uint64_t>(ChildID()), Pid(), \
+           ##__VA_ARGS__)
+#else
+static LogModule* GetPPMLog() {
+  static LazyLogModule sLog("ProcessPriorityManager");
+  return sLog;
+}
+#  define LOG(fmt, ...)                   \
+    MOZ_LOG(GetPPMLog(), LogLevel::Debug, \
+            ("ProcessPriorityManager - " fmt, ##__VA_ARGS__))
+#  define LOGP(fmt, ...)                                                      \
+    MOZ_LOG(GetPPMLog(), LogLevel::Debug,                                     \
+            ("ProcessPriorityManager[%schild-id=%" PRIu64 ", pid=%d] - " fmt, \
+             NameWithComma().get(), static_cast<uint64_t>(ChildID()), Pid(),  \
+             ##__VA_ARGS__))
+#endif
+
+namespace {
+
+class ParticularProcessPriorityManager;
+
+class ProcessPriorityManagerImpl final : public nsIObserver,
+                                         public nsSupportsWeakReference {
+ public:
+  static ProcessPriorityManagerImpl* GetSingleton();
+
+  static void StaticInit();
+  static bool PrefsEnabled();
+  static void SetProcessPriorityIfEnabled(int aPid, ProcessPriority aPriority);
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  void SetProcessPriority(ContentParent* aContentParent,
+                          ProcessPriority aPriority);
+
+  void NotifyProcessPriorityChanged(
+      ParticularProcessPriorityManager* aParticularManager,
+      hal::ProcessPriority aOldPriority);
+
+  void BrowserPriorityChanged(CanonicalBrowsingContext* aBC, bool aPriority);
+  void BrowserPriorityChanged(BrowserParent* aBrowserParent, bool aPriority);
+
+  ProcessPriorityManagerImpl(const ProcessPriorityManagerImpl&) = delete;
+
+  const ProcessPriorityManagerImpl& operator=(
+      const ProcessPriorityManagerImpl&) = delete;
+
+ private:
+  static bool sPrefListenersRegistered;
+  static bool sInitialized;
+  static StaticRefPtr<ProcessPriorityManagerImpl> sSingleton;
+
+  static void PrefChangedCallback(const char* aPref, void* aClosure);
+
+  ProcessPriorityManagerImpl();
+  ~ProcessPriorityManagerImpl();
+
+  void Init();
+
+  already_AddRefed<ParticularProcessPriorityManager>
+  GetParticularProcessPriorityManager(ContentParent* aContentParent);
+
+  void ObserveContentParentDestroyed(nsISupports* aSubject);
+
+  nsTHashMap<uint64_t, RefPtr<ParticularProcessPriorityManager> >
+      mParticularManagers;
+
+  nsTHashSet<uint64_t> mHighPriorityChildIDs;
+};
+
+class ProcessPriorityManagerChild final : public nsIObserver {
+ public:
+  static void StaticInit();
+  static ProcessPriorityManagerChild* Singleton();
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  bool CurrentProcessIsForeground();
+
+  ProcessPriorityManagerChild(const ProcessPriorityManagerChild&) = delete;
+
+  const ProcessPriorityManagerChild& operator=(
+      const ProcessPriorityManagerChild&) = delete;
+
+ private:
+  static StaticRefPtr<ProcessPriorityManagerChild> sSingleton;
+
+  ProcessPriorityManagerChild();
+  ~ProcessPriorityManagerChild() = default;
+
+  void Init();
+
+  hal::ProcessPriority mCachedPriority;
+};
+
+class ParticularProcessPriorityManager final : public WakeLockObserver,
+                                               public nsITimerCallback,
+                                               public nsINamed,
+                                               public nsSupportsWeakReference {
+  ~ParticularProcessPriorityManager();
+
+ public:
+  explicit ParticularProcessPriorityManager(ContentParent* aContentParent);
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSITIMERCALLBACK
+
+  virtual void Notify(const WakeLockInformation& aInfo) override;
+  void Init();
+
+  int32_t Pid() const;
+  uint64_t ChildID() const;
+
+  const nsAutoCString& NameWithComma();
+
+  ProcessPriority CurrentPriority();
+  ProcessPriority ComputePriority();
+
+  enum TimeoutPref {
+    BACKGROUND_PERCEIVABLE_GRACE_PERIOD,
+    BACKGROUND_GRACE_PERIOD,
+  };
+
+  void ScheduleResetPriority(TimeoutPref aTimeoutPref);
+  void ResetPriority();
+  void ResetPriorityNow();
+  void SetPriorityNow(ProcessPriority aPriority);
+
+  void BrowserPriorityChanged(BrowserParent* aBrowserParent, bool aPriority);
+
+  void ShutDown();
+
+  NS_IMETHOD GetName(nsACString& aName) override {
+    aName.AssignLiteral("ParticularProcessPriorityManager");
+    return NS_OK;
+  }
+
+ private:
+  bool IsHoldingWakeLock(const nsAString& aTopic);
+
+  ContentParent* mContentParent;
+  uint64_t mChildID;
+  ProcessPriority mPriority;
+  bool mHoldsCPUWakeLock;
+  bool mHoldsHighPriorityWakeLock;
+  bool mHoldsPlayingAudioWakeLock;
+  bool mHoldsPlayingVideoWakeLock;
+
+  nsAutoCString mNameWithComma;
+
+  nsCOMPtr<nsITimer> mResetPriorityTimer;
+
+  nsTHashSet<uint64_t> mHighPriorityBrowserParents;
+};
+
+bool ProcessPriorityManagerImpl::sInitialized = false;
+bool ProcessPriorityManagerImpl::sPrefListenersRegistered = false;
+StaticRefPtr<ProcessPriorityManagerImpl> ProcessPriorityManagerImpl::sSingleton;
+
+NS_IMPL_ISUPPORTS(ProcessPriorityManagerImpl, nsIObserver,
+                  nsISupportsWeakReference);
+
+void ProcessPriorityManagerImpl::PrefChangedCallback(const char* aPref,
+                                                     void* aClosure) {
+  StaticInit();
+  if (!PrefsEnabled() && sSingleton) {
+    sSingleton = nullptr;
+    sInitialized = false;
+  }
+}
+
+bool ProcessPriorityManagerImpl::PrefsEnabled() {
+  return StaticPrefs::dom_ipc_processPriorityManager_enabled();
+}
+
+void ProcessPriorityManagerImpl::SetProcessPriorityIfEnabled(
+    int aPid, ProcessPriority aPriority) {
+  if (PrefsEnabled()) {
+    hal::SetProcessPriority(aPid, aPriority);
+  }
+}
+
+void ProcessPriorityManagerImpl::StaticInit() {
+  if (sInitialized) {
+    return;
+  }
+
+  if (!XRE_IsParentProcess()) {
+    sInitialized = true;
+    return;
+  }
+
+  if (!sPrefListenersRegistered) {
+    sPrefListenersRegistered = true;
+    Preferences::RegisterCallback(PrefChangedCallback,
+                                  "dom.ipc.processPriorityManager.enabled");
+  }
+
+  sInitialized = true;
+
+  sSingleton = new ProcessPriorityManagerImpl();
+  sSingleton->Init();
+  ClearOnShutdown(&sSingleton);
+}
+
+ProcessPriorityManagerImpl* ProcessPriorityManagerImpl::GetSingleton() {
+  if (!sSingleton) {
+    StaticInit();
+  }
+
+  return sSingleton;
+}
+
+ProcessPriorityManagerImpl::ProcessPriorityManagerImpl() {
+  MOZ_ASSERT(XRE_IsParentProcess());
+}
+
+ProcessPriorityManagerImpl::~ProcessPriorityManagerImpl() = default;
+
+void ProcessPriorityManagerImpl::Init() {
+  LOG("Starting up.  This is the parent process.");
+
+  SetProcessPriorityIfEnabled(getpid(), PROCESS_PRIORITY_PARENT_PROCESS);
+
+  nsCOMPtr<nsIObserverService> os = services::GetObserverService();
+  if (os) {
+    os->AddObserver(this, "ipc:content-shutdown",  true);
+  }
+}
+
+NS_IMETHODIMP
+ProcessPriorityManagerImpl::Observe(nsISupports* aSubject, const char* aTopic,
+                                    const char16_t* aData) {
+  nsDependentCString topic(aTopic);
+  if (topic.EqualsLiteral("ipc:content-shutdown")) {
+    ObserveContentParentDestroyed(aSubject);
+  } else {
+    MOZ_ASSERT(false);
+  }
+
+  return NS_OK;
+}
+
+already_AddRefed<ParticularProcessPriorityManager>
+ProcessPriorityManagerImpl::GetParticularProcessPriorityManager(
+    ContentParent* aContentParent) {
+  if (aContentParent->IsDead()) {
+    return nullptr;
+  }
+
+  const uint64_t cpId = aContentParent->ChildID();
+  return mParticularManagers.WithEntryHandle(cpId, [&](auto&& entry) {
+    if (!entry) {
+      entry.Insert(new ParticularProcessPriorityManager(aContentParent));
+      entry.Data()->Init();
+    }
+    return do_AddRef(entry.Data());
+  });
+}
+
+void ProcessPriorityManagerImpl::SetProcessPriority(
+    ContentParent* aContentParent, ProcessPriority aPriority) {
+  MOZ_ASSERT(aContentParent);
+  if (RefPtr pppm = GetParticularProcessPriorityManager(aContentParent)) {
+    pppm->SetPriorityNow(aPriority);
+  }
+}
+
+void ProcessPriorityManagerImpl::ObserveContentParentDestroyed(
+    nsISupports* aSubject) {
+  nsCOMPtr<nsIPropertyBag2> props = do_QueryInterface(aSubject);
+  NS_ENSURE_TRUE_VOID(props);
+
+  uint64_t childID = CONTENT_PROCESS_ID_UNKNOWN;
+  props->GetPropertyAsUint64(u"childID"_ns, &childID);
+  NS_ENSURE_TRUE_VOID(childID != CONTENT_PROCESS_ID_UNKNOWN);
+
+  if (auto entry = mParticularManagers.Lookup(childID)) {
+    entry.Data()->ShutDown();
+    mHighPriorityChildIDs.Remove(childID);
+    entry.Remove();
+  }
+}
+
+void ProcessPriorityManagerImpl::NotifyProcessPriorityChanged(
+    ParticularProcessPriorityManager* aParticularManager,
+    ProcessPriority aOldPriority) {
+  ProcessPriority newPriority = aParticularManager->CurrentPriority();
+
+  if (newPriority >= PROCESS_PRIORITY_FOREGROUND_HIGH &&
+      aOldPriority < PROCESS_PRIORITY_FOREGROUND_HIGH) {
+    mHighPriorityChildIDs.Insert(aParticularManager->ChildID());
+  } else if (newPriority < PROCESS_PRIORITY_FOREGROUND_HIGH &&
+             aOldPriority >= PROCESS_PRIORITY_FOREGROUND_HIGH) {
+    mHighPriorityChildIDs.Remove(aParticularManager->ChildID());
+  }
+}
+
+static nsCString BCToString(dom::CanonicalBrowsingContext* aBC) {
+  nsCOMPtr<nsIURI> uri = aBC->GetCurrentURI();
+  return nsPrintfCString("id=%" PRIu64 " uri=%s active=%d pactive=%d",
+                         aBC->Id(),
+                         uri ? uri->GetSpecOrDefault().get() : "(no uri)",
+                         aBC->IsActive(), aBC->IsPriorityActive());
+}
+
+void ProcessPriorityManagerImpl::BrowserPriorityChanged(
+    dom::CanonicalBrowsingContext* aBC, bool aPriority) {
+  MOZ_ASSERT(aBC->IsTop());
+
+  LOG("BrowserPriorityChanged(%s, %d)\n", BCToString(aBC).get(), aPriority);
+
+  bool alreadyActive = aBC->IsPriorityActive();
+  if (alreadyActive == aPriority) {
+    return;
+  }
+
+
+
+  aBC->SetPriorityActive(aPriority);
+
+  aBC->PreOrderWalk([&](BrowsingContext* aContext) {
+    CanonicalBrowsingContext* canonical = aContext->Canonical();
+    LOG("PreOrderWalk for %p: %p -> %p, %p\n", aBC, canonical,
+        canonical->GetContentParent(), canonical->GetBrowserParent());
+    if (ContentParent* cp = canonical->GetContentParent()) {
+      if (RefPtr pppm = GetParticularProcessPriorityManager(cp)) {
+        if (auto* bp = canonical->GetBrowserParent()) {
+          pppm->BrowserPriorityChanged(bp, aPriority);
+        }
+      }
+    }
+  });
+}
+
+void ProcessPriorityManagerImpl::BrowserPriorityChanged(
+    BrowserParent* aBrowserParent, bool aPriority) {
+  LOG("BrowserPriorityChanged(bp=%p, %d)\n", aBrowserParent, aPriority);
+
+  if (RefPtr pppm =
+          GetParticularProcessPriorityManager(aBrowserParent->Manager())) {
+
+    pppm->BrowserPriorityChanged(aBrowserParent, aPriority);
+  }
+}
+
+NS_IMPL_ISUPPORTS(ParticularProcessPriorityManager, nsITimerCallback,
+                  nsISupportsWeakReference, nsINamed);
+
+ParticularProcessPriorityManager::ParticularProcessPriorityManager(
+    ContentParent* aContentParent)
+    : mContentParent(aContentParent),
+      mChildID(aContentParent->ChildID()),
+      mPriority(PROCESS_PRIORITY_UNKNOWN),
+      mHoldsCPUWakeLock(false),
+      mHoldsHighPriorityWakeLock(false),
+      mHoldsPlayingAudioWakeLock(false),
+      mHoldsPlayingVideoWakeLock(false) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  MOZ_RELEASE_ASSERT(!aContentParent->IsDead());
+  LOGP("Creating ParticularProcessPriorityManager.");
+}
+
+void ParticularProcessPriorityManager::Init() {
+  RegisterWakeLockObserver(this);
+
+  mHoldsCPUWakeLock = IsHoldingWakeLock(u"cpu"_ns);
+  mHoldsHighPriorityWakeLock = IsHoldingWakeLock(u"high-priority"_ns);
+  mHoldsPlayingAudioWakeLock = IsHoldingWakeLock(u"audio-playing"_ns);
+  mHoldsPlayingVideoWakeLock = IsHoldingWakeLock(u"video-playing"_ns);
+
+  LOGP(
+      "Done starting up.  mHoldsCPUWakeLock=%d, "
+      "mHoldsHighPriorityWakeLock=%d, mHoldsPlayingAudioWakeLock=%d, "
+      "mHoldsPlayingVideoWakeLock=%d",
+      mHoldsCPUWakeLock, mHoldsHighPriorityWakeLock, mHoldsPlayingAudioWakeLock,
+      mHoldsPlayingVideoWakeLock);
+}
+
+bool ParticularProcessPriorityManager::IsHoldingWakeLock(
+    const nsAString& aTopic) {
+  WakeLockInformation info;
+  GetWakeLockInfo(aTopic, &info);
+  return info.lockingProcesses().Contains(ChildID());
+}
+
+ParticularProcessPriorityManager::~ParticularProcessPriorityManager() {
+  LOGP("Destroying ParticularProcessPriorityManager.");
+
+  ShutDown();
+}
+
+void ParticularProcessPriorityManager::Notify(
+    const WakeLockInformation& aInfo) {
+  if (!mContentParent) {
+    return;
+  }
+
+  bool* dest = nullptr;
+  if (aInfo.topic().EqualsLiteral("cpu")) {
+    dest = &mHoldsCPUWakeLock;
+  } else if (aInfo.topic().EqualsLiteral("high-priority")) {
+    dest = &mHoldsHighPriorityWakeLock;
+  } else if (aInfo.topic().EqualsLiteral("audio-playing")) {
+    dest = &mHoldsPlayingAudioWakeLock;
+  } else if (aInfo.topic().EqualsLiteral("video-playing")) {
+    dest = &mHoldsPlayingVideoWakeLock;
+  }
+
+  if (dest) {
+    bool thisProcessLocks = aInfo.lockingProcesses().Contains(ChildID());
+    if (thisProcessLocks != *dest) {
+      *dest = thisProcessLocks;
+      LOGP(
+          "Got wake lock changed event. "
+          "Now mHoldsCPUWakeLock=%d, mHoldsHighPriorityWakeLock=%d, "
+          "mHoldsPlayingAudioWakeLock=%d, mHoldsPlayingVideoWakeLock=%d",
+          mHoldsCPUWakeLock, mHoldsHighPriorityWakeLock,
+          mHoldsPlayingAudioWakeLock, mHoldsPlayingVideoWakeLock);
+      ResetPriority();
+    }
+  }
+}
+
+uint64_t ParticularProcessPriorityManager::ChildID() const {
+  return mChildID;
+}
+
+int32_t ParticularProcessPriorityManager::Pid() const {
+  return mContentParent ? mContentParent->Pid() : -1;
+}
+
+const nsAutoCString& ParticularProcessPriorityManager::NameWithComma() {
+  mNameWithComma.Truncate();
+  if (!mContentParent) {
+    return mNameWithComma;  
+  }
+
+  nsAutoString name;
+  mContentParent->FriendlyName(name);
+  if (name.IsEmpty()) {
+    return mNameWithComma;  
+  }
+
+  CopyUTF16toUTF8(name, mNameWithComma);
+  mNameWithComma.AppendLiteral(", ");
+  return mNameWithComma;
+}
+
+void ParticularProcessPriorityManager::ResetPriority() {
+  ProcessPriority processPriority = ComputePriority();
+  if (mPriority == PROCESS_PRIORITY_UNKNOWN || mPriority > processPriority) {
+    if (mPriority == PROCESS_PRIORITY_BACKGROUND_PERCEIVABLE) {
+      ScheduleResetPriority(BACKGROUND_PERCEIVABLE_GRACE_PERIOD);
+    } else {
+      ScheduleResetPriority(BACKGROUND_GRACE_PERIOD);
+    }
+    return;
+  }
+
+  SetPriorityNow(processPriority);
+}
+
+void ParticularProcessPriorityManager::ResetPriorityNow() {
+  SetPriorityNow(ComputePriority());
+}
+
+void ParticularProcessPriorityManager::ScheduleResetPriority(
+    TimeoutPref aTimeoutPref) {
+  if (mResetPriorityTimer) {
+    LOGP("ScheduleResetPriority bailing; the timer is already running.");
+    return;
+  }
+
+  uint32_t timeout = 0;
+  switch (aTimeoutPref) {
+    case BACKGROUND_PERCEIVABLE_GRACE_PERIOD:
+      timeout = StaticPrefs::
+          dom_ipc_processPriorityManager_backgroundPerceivableGracePeriodMS();
+      break;
+    case BACKGROUND_GRACE_PERIOD:
+      timeout =
+          StaticPrefs::dom_ipc_processPriorityManager_backgroundGracePeriodMS();
+      break;
+    default:
+      MOZ_ASSERT(false, "Unrecognized timeout pref");
+      break;
+  }
+
+  LOGP("Scheduling reset timer to fire in %dms.", timeout);
+  NS_NewTimerWithCallback(getter_AddRefs(mResetPriorityTimer), this, timeout,
+                          nsITimer::TYPE_ONE_SHOT);
+}
+
+NS_IMETHODIMP
+ParticularProcessPriorityManager::Notify(nsITimer* aTimer) {
+  LOGP("Reset priority timer callback; about to ResetPriorityNow.");
+  ResetPriorityNow();
+  mResetPriorityTimer = nullptr;
+  return NS_OK;
+}
+
+ProcessPriority ParticularProcessPriorityManager::CurrentPriority() {
+  return mPriority;
+}
+
+ProcessPriority ParticularProcessPriorityManager::ComputePriority() {
+  if (!mHighPriorityBrowserParents.IsEmpty() ||
+      mContentParent->GetRemoteType() == EXTENSION_REMOTE_TYPE ||
+      mHoldsPlayingAudioWakeLock) {
+    return PROCESS_PRIORITY_FOREGROUND;
+  }
+
+  if (mHoldsCPUWakeLock || mHoldsHighPriorityWakeLock ||
+      mHoldsPlayingVideoWakeLock) {
+    return PROCESS_PRIORITY_BACKGROUND_PERCEIVABLE;
+  }
+
+  return PROCESS_PRIORITY_BACKGROUND;
+}
+
+
+void ParticularProcessPriorityManager::SetPriorityNow(
+    ProcessPriority aPriority) {
+  if (aPriority == PROCESS_PRIORITY_UNKNOWN) {
+    MOZ_ASSERT(false);
+    return;
+  }
+
+  LOGP("Changing priority from %s to %s (cp=%p).",
+       ProcessPriorityToString(mPriority), ProcessPriorityToString(aPriority),
+       mContentParent);
+
+  if (!mContentParent || mPriority == aPriority) {
+    return;
+  }
+
+
+  ProcessPriority oldPriority = mPriority;
+
+  mPriority = aPriority;
+
+  if (oldPriority < mPriority && oldPriority != PROCESS_PRIORITY_UNKNOWN) {
+
+  } else if (oldPriority > mPriority) {
+
+  }
+
+  ProcessPriorityManagerImpl::SetProcessPriorityIfEnabled(Pid(), mPriority);
+
+  if (oldPriority != mPriority) {
+    ProcessPriorityManagerImpl::GetSingleton()->NotifyProcessPriorityChanged(
+        this, oldPriority);
+
+
+    (void)mContentParent->SendNotifyProcessPriorityChanged(mPriority);
+  }
+
+}
+
+void ParticularProcessPriorityManager::BrowserPriorityChanged(
+    BrowserParent* aBrowserParent, bool aPriority) {
+  MOZ_ASSERT(aBrowserParent);
+
+  if (!aPriority) {
+    mHighPriorityBrowserParents.Remove(aBrowserParent->GetTabId());
+  } else {
+    mHighPriorityBrowserParents.Insert(aBrowserParent->GetTabId());
+  }
+
+  ResetPriority();
+}
+
+void ParticularProcessPriorityManager::ShutDown() {
+  LOGP("shutdown for %p (mContentParent %p)", this, mContentParent);
+
+  if (mContentParent) {
+    UnregisterWakeLockObserver(this);
+  }
+
+  if (mResetPriorityTimer) {
+    mResetPriorityTimer->Cancel();
+    mResetPriorityTimer = nullptr;
+  }
+
+  mContentParent = nullptr;
+}
+
+StaticRefPtr<ProcessPriorityManagerChild>
+    ProcessPriorityManagerChild::sSingleton;
+
+void ProcessPriorityManagerChild::StaticInit() {
+  if (!sSingleton) {
+    sSingleton = new ProcessPriorityManagerChild();
+    sSingleton->Init();
+    ClearOnShutdown(&sSingleton);
+  }
+}
+
+ProcessPriorityManagerChild* ProcessPriorityManagerChild::Singleton() {
+  StaticInit();
+  return sSingleton;
+}
+
+NS_IMPL_ISUPPORTS(ProcessPriorityManagerChild, nsIObserver)
+
+ProcessPriorityManagerChild::ProcessPriorityManagerChild() {
+  if (XRE_IsParentProcess()) {
+    mCachedPriority = PROCESS_PRIORITY_PARENT_PROCESS;
+  } else {
+    mCachedPriority = PROCESS_PRIORITY_UNKNOWN;
+  }
+}
+
+void ProcessPriorityManagerChild::Init() {
+  if (!XRE_IsParentProcess()) {
+    nsCOMPtr<nsIObserverService> os = services::GetObserverService();
+    NS_ENSURE_TRUE_VOID(os);
+    os->AddObserver(this, "ipc:process-priority-changed",  false);
+  }
+}
+
+NS_IMETHODIMP
+ProcessPriorityManagerChild::Observe(nsISupports* aSubject, const char* aTopic,
+                                     const char16_t* aData) {
+  MOZ_ASSERT(!strcmp(aTopic, "ipc:process-priority-changed"));
+
+  nsCOMPtr<nsIPropertyBag2> props = do_QueryInterface(aSubject);
+  NS_ENSURE_TRUE(props, NS_OK);
+
+  int32_t priority = static_cast<int32_t>(PROCESS_PRIORITY_UNKNOWN);
+  props->GetPropertyAsInt32(u"priority"_ns, &priority);
+  NS_ENSURE_TRUE(ProcessPriority(priority) != PROCESS_PRIORITY_UNKNOWN, NS_OK);
+
+  mCachedPriority = static_cast<ProcessPriority>(priority);
+
+  return NS_OK;
+}
+
+bool ProcessPriorityManagerChild::CurrentProcessIsForeground() {
+  return mCachedPriority == PROCESS_PRIORITY_UNKNOWN ||
+         mCachedPriority >= PROCESS_PRIORITY_FOREGROUND;
+}
+
+}  
+
+namespace mozilla {
+
+void ProcessPriorityManager::Init() {
+  ProcessPriorityManagerImpl::StaticInit();
+  ProcessPriorityManagerChild::StaticInit();
+}
+
+void ProcessPriorityManager::SetProcessPriority(ContentParent* aContentParent,
+                                                ProcessPriority aPriority) {
+  MOZ_ASSERT(aContentParent);
+  MOZ_ASSERT(aContentParent->Pid() != -1);
+
+  ProcessPriorityManagerImpl* singleton =
+      ProcessPriorityManagerImpl::GetSingleton();
+  if (singleton) {
+    singleton->SetProcessPriority(aContentParent, aPriority);
+  }
+}
+
+bool ProcessPriorityManager::CurrentProcessIsForeground() {
+  return ProcessPriorityManagerChild::Singleton()->CurrentProcessIsForeground();
+}
+
+void ProcessPriorityManager::BrowserPriorityChanged(
+    CanonicalBrowsingContext* aBC, bool aPriority) {
+  if (auto* singleton = ProcessPriorityManagerImpl::GetSingleton()) {
+    singleton->BrowserPriorityChanged(aBC, aPriority);
+  }
+}
+
+void ProcessPriorityManager::BrowserPriorityChanged(
+    BrowserParent* aBrowserParent, bool aPriority) {
+  MOZ_ASSERT(aBrowserParent);
+
+  ProcessPriorityManagerImpl* singleton =
+      ProcessPriorityManagerImpl::GetSingleton();
+  if (!singleton) {
+    return;
+  }
+  singleton->BrowserPriorityChanged(aBrowserParent, aPriority);
+}
+
+}  

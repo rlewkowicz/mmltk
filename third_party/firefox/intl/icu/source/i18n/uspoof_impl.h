@@ -1,0 +1,214 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+***************************************************************************
+* Copyright (C) 2008-2013, International Business Machines Corporation
+* and others. All Rights Reserved.
+***************************************************************************
+*
+*  uspoof_impl.h
+*
+*    Implementation header for spoof detection
+*
+*/
+
+#ifndef USPOOFIM_H
+#define USPOOFIM_H
+
+#include "uassert.h"
+#include "unicode/utypes.h"
+#include "unicode/uspoof.h"
+#include "unicode/uscript.h"
+#include "unicode/udata.h"
+#include "udataswp.h"
+#include "utrie2.h"
+
+#if !UCONFIG_NO_NORMALIZATION
+
+#ifdef __cplusplus
+
+#include "capi_helper.h"
+#include "umutex.h"
+
+U_NAMESPACE_BEGIN
+
+#define USPOOF_MAX_SKELETON_EXPANSION 20
+
+#define USPOOF_STACK_BUFFER_SIZE 100
+
+#define USPOOF_MAGIC 0x3845fdef
+
+#define USPOOF_CHECK_MAGIC 0x2734ecde
+
+class ScriptSet;
+class SpoofData;
+struct SpoofDataHeader;
+class ConfusableDataUtils;
+
+class SpoofImpl : public UObject,
+        public IcuCApiHelper<USpoofChecker, SpoofImpl, USPOOF_MAGIC> {
+public:
+    SpoofImpl(SpoofData *data, UErrorCode& status);
+    SpoofImpl(UErrorCode& status);
+    SpoofImpl();
+    void construct(UErrorCode& status);
+    virtual ~SpoofImpl();
+
+    SpoofImpl(const SpoofImpl &src, UErrorCode &status);
+    
+    USpoofChecker *asUSpoofChecker();
+    static SpoofImpl *validateThis(USpoofChecker *sc, UErrorCode &status);
+    static const SpoofImpl *validateThis(const USpoofChecker *sc, UErrorCode &status);
+
+    void setAllowedLocales(const char *localesList, UErrorCode &status);
+    const char * getAllowedLocales(UErrorCode &status);
+
+    void addScriptChars(const char *locale, UnicodeSet *allowedChars, UErrorCode &status);
+
+    static void getAugmentedScriptSet(UChar32 codePoint, ScriptSet& result, UErrorCode& status);
+    void getResolvedScriptSet(const UnicodeString& input, ScriptSet& result, UErrorCode& status) const;
+    void getResolvedScriptSetWithout(const UnicodeString& input, UScriptCode script, ScriptSet& result, UErrorCode& status) const;
+    void getNumerics(const UnicodeString& input, UnicodeSet& result, UErrorCode& status) const;
+    URestrictionLevel getRestrictionLevel(const UnicodeString& input, UErrorCode& status) const;
+
+    int32_t findHiddenOverlay(const UnicodeString& input, UErrorCode& status) const;
+    bool isIllegalCombiningDotLeadCharacter(UChar32 cp) const;
+
+    static UChar32 ScanHex(const char16_t *s, int32_t start, int32_t limit, UErrorCode &status);
+
+    static UClassID U_EXPORT2 getStaticClassID();
+    virtual UClassID getDynamicClassID() const override;
+
+
+    int32_t           fChecks;            
+
+    SpoofData        *fSpoofData;
+    
+    const UnicodeSet *fAllowedCharsSet;   
+
+    const char       *fAllowedLocales;    
+    URestrictionLevel fRestrictionLevel;  
+};
+
+class CheckResult : public UObject,
+        public IcuCApiHelper<USpoofCheckResult, CheckResult, USPOOF_CHECK_MAGIC> {
+public:
+    CheckResult();
+    virtual ~CheckResult();
+
+    USpoofCheckResult *asUSpoofCheckResult();
+    static CheckResult *validateThis(USpoofCheckResult *ptr, UErrorCode &status);
+    static const CheckResult *validateThis(const USpoofCheckResult *ptr, UErrorCode &status);
+
+    void clear();
+
+    int32_t toCombinedBitmask(int32_t expectedChecks);
+
+    int32_t fChecks;                       
+    UnicodeSet fNumerics;                  
+    URestrictionLevel fRestrictionLevel;   
+};
+
+
+
+
+
+#define USPOOF_CONFUSABLE_DATA_FORMAT_VERSION 2  // version for ICU 58
+class ConfusableDataUtils {
+public:
+    inline static UChar32 keyToCodePoint(int32_t key) {
+        return key & 0x00ffffff;
+    }
+    inline static int32_t keyToLength(int32_t key) {
+        return ((key & 0xff000000) >> 24) + 1;
+    }
+    inline static int32_t codePointAndLengthToKey(UChar32 codePoint, int32_t length) {
+        U_ASSERT((codePoint & 0x00ffffff) == codePoint);
+        U_ASSERT(length <= 256);
+        return codePoint | ((length - 1) << 24);
+    }
+};
+
+
+class SpoofData: public UMemory {
+  public:
+    static SpoofData* getDefault(UErrorCode &status);   
+    static void releaseDefault();   
+
+    SpoofData(UErrorCode &status);   
+    
+    SpoofData(UDataMemory *udm, UErrorCode &status);
+
+    SpoofData(const void *serializedData, int32_t length, UErrorCode &status);
+
+    UBool validateDataVersion(UErrorCode &status) const;
+
+    ~SpoofData();                    
+    SpoofData *addReference(); 
+    void removeReference();
+
+    void reset();
+
+    int32_t serialize(void *buf, int32_t capacity, UErrorCode &status) const;
+
+    int32_t size() const;
+
+    int32_t confusableLookup(UChar32 inChar, UnicodeString &dest) const;
+
+    int32_t length() const;
+
+    UChar32 codePointAt(int32_t index) const;
+
+    int32_t appendValueTo(int32_t index, UnicodeString& dest) const;
+
+  private:
+    void *reserveSpace(int32_t numBytes, UErrorCode &status);
+
+    void initPtrs(UErrorCode &status);
+
+    SpoofDataHeader             *fRawData;          
+    UBool                       fDataOwned;         
+    UDataMemory                 *fUDM;              
+
+    uint32_t                    fMemLimit;          
+    u_atomic_int32_t            fRefCount;
+
+    int32_t                     *fCFUKeys;
+    uint16_t                    *fCFUValues;
+    char16_t                    *fCFUStrings;
+
+    friend class ConfusabledataBuilder;
+};
+
+struct SpoofDataHeader {
+    int32_t       fMagic;                
+    uint8_t       fFormatVersion[4];     
+    int32_t       fLength;               
+
+
+    int32_t       fCFUKeys;               
+    int32_t       fCFUKeysSize;           
+
+    int32_t       fCFUStringIndex;        
+    int32_t       fCFUStringIndexSize;    
+
+    int32_t       fCFUStringTable;        
+    int32_t       fCFUStringTableLen;     
+
+
+    int32_t       unused[15];              
+};
+
+
+
+U_NAMESPACE_END
+#endif /* __cplusplus */
+
+U_CAPI int32_t U_EXPORT2
+uspoof_swap(const UDataSwapper *ds, const void *inData, int32_t length, void *outData,
+            UErrorCode *status);
+
+
+#endif
+
+#endif  /* USPOOFIM_H */
+

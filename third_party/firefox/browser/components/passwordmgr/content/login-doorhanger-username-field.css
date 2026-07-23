@@ -1,0 +1,41 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+.login-doorhanger-field {
+  margin-block-start: var(--space-large);
+
+  &:first-child {
+    margin-block-start: var(--space-small);
+  }
+}
+
+.autocomplete-container {
+  position: relative;
+
+  &.has-dropmarker #input {
+    --input-padding-from-arrow-side: calc(2 * var(--space-small) + var(--icon-size)); 
+    padding-inline-end: var(--input-padding-from-arrow-side);
+    text-overflow: ellipsis;
+
+    &:-moz-locale-dir(rtl):dir(ltr) {
+      padding-inline-end: var(--space-medium);
+      padding-left: var(--input-padding-from-arrow-side);
+    }
+
+    &:-moz-locale-dir(ltr):dir(rtl) {
+      padding-inline-end: var(--space-medium);
+      padding-right: var(--input-padding-from-arrow-side);
+    }
+  }
+}
+
+.ac-dropmarker {
+  position: absolute;
+  inset-inline-end: var(--space-small);
+  top: 50%;
+  translate: 0 -50%;
+  content: url(chrome://global/skin/icons/arrow-down-12.svg);
+  -moz-context-properties: fill;
+  fill: var(--icon-color);
+}

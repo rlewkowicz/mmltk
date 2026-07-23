@@ -1,0 +1,5727 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/dom/Element.h"
+
+#include <inttypes.h>
+
+#include <cstddef>
+#include <utility>
+
+#include "DOMMatrix.h"
+#include "ExpandedPrincipal.h"
+#include "PresShellInlines.h"
+#include "PseudoStyleType.h"
+#include "jsapi.h"
+#include "mozAutoDocUpdate.h"
+#include "mozilla/AnimationComparator.h"
+#include "mozilla/AnimationTarget.h"
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/Components.h"
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/ContentEvents.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/DeclarationBlock.h"
+#include "mozilla/EditorBase.h"
+#include "mozilla/EffectCompositor.h"
+#include "mozilla/EffectSet.h"
+#include "mozilla/ElementAnimationData.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/EventListenerManager.h"
+#include "mozilla/EventStateManager.h"
+#include "mozilla/FloatingPoint.h"
+#include "mozilla/FullscreenChange.h"
+#include "mozilla/HTMLEditor.h"
+#include "mozilla/Likely.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/MappedDeclarationsBuilder.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/PointerLockManager.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/PresShellForwards.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/ReflowOutput.h"
+#include "mozilla/RelativeTo.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/ScrollTypes.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/ServoStyleConstsInlines.h"
+#include "mozilla/SizeOfState.h"
+#include "mozilla/SourceLocation.h"
+#include "mozilla/StaticAnalysisFunctions.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_full_screen_api.h"
+#include "mozilla/StaticString.h"
+#include "mozilla/TextControlElement.h"
+#include "mozilla/TextEditor.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/Try.h"
+#include "mozilla/dom/AnimatableBinding.h"
+#include "mozilla/dom/Animation.h"
+#include "mozilla/dom/Attr.h"
+#include "mozilla/dom/BindContext.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/CSPViolationData.h"
+#include "mozilla/dom/ChildIterator.h"
+#include "mozilla/dom/CloseWatcher.h"
+#include "mozilla/dom/ContentList.h"
+#include "mozilla/dom/CustomElementRegistry.h"
+#include "mozilla/dom/DOMIntersectionObserver.h"
+#include "mozilla/dom/DOMRect.h"
+#include "mozilla/dom/DirectionalityUtils.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentFragment.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/DocumentTimeline.h"
+#include "mozilla/dom/EditContext.h"
+#include "mozilla/dom/ElementBinding.h"
+#include "mozilla/dom/ElementInlines.h"
+#include "mozilla/dom/FragmentOrElement.h"
+#include "mozilla/dom/FromParser.h"
+#include "mozilla/dom/HTMLDivElement.h"
+#include "mozilla/dom/HTMLElement.h"
+#include "mozilla/dom/HTMLParagraphElement.h"
+#include "mozilla/dom/HTMLPreElement.h"
+#include "mozilla/dom/HTMLSpanElement.h"
+#include "mozilla/dom/HTMLTableCellElement.h"
+#include "mozilla/dom/HTMLTemplateElement.h"
+#include "mozilla/dom/KeyframeAnimationOptionsBinding.h"
+#include "mozilla/dom/KeyframeEffect.h"
+#include "mozilla/dom/LifecycleCallbackArgs.h"
+#include "mozilla/dom/MouseEvent.h"
+#include "mozilla/dom/MouseEventBinding.h"
+#include "mozilla/dom/MutationObservers.h"
+#include "mozilla/dom/NodeInfo.h"
+#include "mozilla/dom/PointerEventHandler.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/SVGElement.h"
+#include "mozilla/dom/Sanitizer.h"
+#include "mozilla/dom/ScriptLoader.h"
+#include "mozilla/dom/ShadowRoot.h"
+#include "mozilla/dom/StylePropertyMapReadOnly.h"
+#include "mozilla/dom/Text.h"
+#include "mozilla/dom/TreeIterator.h"
+#include "mozilla/dom/TrustedHTML.h"
+#include "mozilla/dom/TrustedTypeUtils.h"
+#include "mozilla/dom/TrustedTypesConstants.h"
+#include "mozilla/dom/UnbindContext.h"
+#include "mozilla/dom/ViewTransition.h"
+#include "mozilla/dom/WindowBinding.h"
+#include "mozilla/dom/XULCommandEvent.h"
+#include "mozilla/dom/nsCSPContext.h"
+#include "mozilla/dom/nsCSPUtils.h"
+#include "mozilla/gfx/BasePoint.h"
+#include "mozilla/gfx/BaseRect.h"
+#include "mozilla/gfx/BaseSize.h"
+#include "mozilla/gfx/Matrix.h"
+#include "mozilla/widget/Screen.h"
+#include "nsAtom.h"
+#include "nsAttrName.h"
+#include "nsAttrValueInlines.h"
+#include "nsAttrValueOrString.h"
+#include "nsBaseHashtable.h"
+#include "nsBlockFrame.h"
+#include "nsCOMPtr.h"
+#include "nsCompatibility.h"
+#include "nsComputedDOMStyle.h"
+#include "nsContainerFrame.h"
+#include "nsContentListDeclarations.h"
+#include "nsContentUtils.h"
+#include "nsCoord.h"
+#include "nsDOMAttributeMap.h"
+#include "nsDOMCSSAttrDeclaration.h"
+#include "nsDOMMutationObserver.h"
+#include "nsDOMString.h"
+#include "nsDOMStringMap.h"
+#include "nsDOMTokenList.h"
+#include "nsDocShell.h"
+#include "nsError.h"
+#include "nsFocusManager.h"
+#include "nsFrameState.h"
+#include "nsGenericHTMLElement.h"
+#include "nsGkAtoms.h"
+#include "nsIAutoCompletePopup.h"
+#include "nsIBrowser.h"
+#include "nsIContentInlines.h"
+#include "nsIContentSecurityPolicy.h"
+#include "nsIDOMXULButtonElement.h"
+#include "nsIDOMXULContainerElement.h"
+#include "nsIDOMXULControlElement.h"
+#include "nsIDOMXULMenuListElement.h"
+#include "nsIDOMXULMultSelectCntrlEl.h"
+#include "nsIDOMXULRadioGroupElement.h"
+#include "nsIDOMXULRelatedElement.h"
+#include "nsIDOMXULSelectCntrlEl.h"
+#include "nsIDOMXULSelectCntrlItemEl.h"
+#include "nsIDocShell.h"
+#include "nsIFocusManager.h"
+#include "nsIFrame.h"
+#include "nsIFrameInlines.h"
+#include "nsIGlobalObject.h"
+#include "nsIIOService.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIMemoryReporter.h"
+#include "nsIMutationObserver.h"
+#include "nsIPrincipal.h"
+#include "nsIScriptError.h"
+#include "nsISpeculativeConnect.h"
+#include "nsISupports.h"
+#include "nsISupportsUtils.h"
+#include "nsIURI.h"
+#include "nsLayoutUtils.h"
+#include "nsLineBox.h"
+#include "nsLiteralString.h"
+#include "nsNameSpaceManager.h"
+#include "nsNodeInfoManager.h"
+#include "nsPIDOMWindow.h"
+#include "nsPoint.h"
+#include "nsPresContext.h"
+#include "nsQueryFrame.h"
+#include "nsRefPtrHashtable.h"
+#include "nsSize.h"
+#include "nsString.h"
+#include "nsStyleConsts.h"
+#include "nsStyleStruct.h"
+#include "nsStyledElement.h"
+#include "nsTArray.h"
+#include "nsTextNode.h"
+#include "nsThreadUtils.h"
+#include "nsWindowSizes.h"
+#include "nsXULElement.h"
+
+#ifdef DEBUG
+#  include "nsRange.h"
+#endif
+
+#ifdef ACCESSIBILITY
+#  include "nsAccessibilityService.h"
+#endif
+
+using mozilla::gfx::Matrix4x4;
+
+namespace mozilla::dom {
+
+#ifdef MOZ_THREAD_SAFETY_OWNERSHIP_CHECKS_SUPPORTED
+#  define EXTRA_DOM_NODE_BYTES 8
+#else
+#  define EXTRA_DOM_NODE_BYTES 0
+#endif
+
+#define ASSERT_NODE_SIZE(type, opt_size_64, opt_size_32)              \
+  template <int a, int sizeOn64, int sizeOn32>                        \
+  struct Check##type##Size {                                          \
+    static_assert((sizeof(void*) == 8 && a == sizeOn64) ||            \
+                      (sizeof(void*) == 4 && a <= sizeOn32),          \
+                  "DOM size changed");                                \
+  };                                                                  \
+  Check##type##Size<sizeof(type), opt_size_64 + EXTRA_DOM_NODE_BYTES, \
+                    opt_size_32 + EXTRA_DOM_NODE_BYTES>               \
+      g##type##CES;
+
+ASSERT_NODE_SIZE(Element, 136, 84);
+ASSERT_NODE_SIZE(HTMLDivElement, 136, 84);
+ASSERT_NODE_SIZE(HTMLElement, 136, 84);
+ASSERT_NODE_SIZE(HTMLParagraphElement, 136, 84);
+ASSERT_NODE_SIZE(HTMLPreElement, 136, 84);
+ASSERT_NODE_SIZE(HTMLSpanElement, 136, 84);
+ASSERT_NODE_SIZE(HTMLTableCellElement, 136, 84);
+ASSERT_NODE_SIZE(Text, 128, 84);
+
+#undef ASSERT_NODE_SIZE
+#undef EXTRA_DOM_NODE_BYTES
+
+}  
+
+nsAtom* nsIContent::DoGetID() const {
+  MOZ_ASSERT(HasID(), "Unexpected call");
+  MOZ_ASSERT(IsElement(), "Only elements can have IDs");
+
+  return AsElement()->GetParsedAttr(nsGkAtoms::id)->GetAtomValue();
+}
+
+nsIFrame* nsIContent::GetPrimaryFrame(mozilla::FlushType aType) {
+  Document* doc = GetComposedDoc();
+  if (!doc) {
+    return nullptr;
+  }
+
+  if (aType != mozilla::FlushType::None) {
+    doc->FlushPendingNotifications(aType);
+  }
+
+  auto* frame = GetPrimaryFrame();
+  if (!frame) {
+    return nullptr;
+  }
+
+  RefPtr<mozilla::PresShell> presShell = frame->PresShell();
+  if (aType == mozilla::FlushType::Layout) {
+    presShell->EnsureReflowIfFrameHasHiddenContent(frame);
+    frame = GetPrimaryFrame();
+  }
+
+  return frame;
+}
+
+bool nsIContent::IsSelectable() const {
+  if (!IsInComposedDoc() ||
+      IsGeneratedContentContainerForBefore() ||
+      IsGeneratedContentContainerForAfter() ||
+      (!IsElement() && !IsText() && !IsShadowRoot())) {
+    return false;
+  }
+  if (IsEditable()) {
+    return true;
+  }
+  if (const auto* const textControlElement =
+          mozilla::TextControlElement::FromNode(this)) {
+    if (textControlElement->IsSingleLineTextControlOrTextArea()) {
+      return true;
+    }
+  }
+  for (const nsIContent* content = this; content;
+       content = content->GetFlattenedTreeParent()) {
+    if (nsIFrame* const frame = content->GetPrimaryFrame()) {
+      return frame->IsSelectable();
+    }
+    if (!content->IsElement()) {
+      continue;
+    }
+    const RefPtr<const mozilla::ComputedStyle> elementStyle =
+        nsComputedDOMStyle::GetComputedStyleNoFlush(content->AsElement());
+    if (elementStyle &&
+        elementStyle->UserSelect() != mozilla::StyleUserSelect::Auto) {
+      return elementStyle->UserSelect() != mozilla::StyleUserSelect::None;
+    }
+  }
+  return false;
+}
+
+namespace mozilla::dom {
+
+const DOMTokenListSupportedToken Element::sSupportedBlockingValues[] = {
+    "render", nullptr};
+
+nsDOMAttributeMap* Element::Attributes() {
+  nsDOMSlots* slots = DOMSlots();
+  if (!slots->mAttributeMap) {
+    slots->mAttributeMap = new nsDOMAttributeMap(this);
+  }
+
+  return slots->mAttributeMap;
+}
+
+void Element::SetPointerCapture(int32_t aPointerId, ErrorResult& aError) {
+  const PointerInfo* pointerInfo =
+      PointerEventHandler::GetPointerInfo(aPointerId);
+  if (!pointerInfo) {
+    aError.ThrowNotFoundError("Invalid pointer id");
+    return;
+  }
+  if (!IsInComposedDoc()) {
+    aError.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+    return;
+  }
+  if (OwnerDoc()->GetPointerLockElement()) {
+    aError.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+    return;
+  }
+  if (!pointerInfo->mIsActive || pointerInfo->mActiveDocument != OwnerDoc()) {
+    return;
+  }
+  PointerEventHandler::RequestPointerCaptureById(aPointerId, this);
+}
+
+void Element::ReleasePointerCapture(int32_t aPointerId, ErrorResult& aError) {
+  if (!PointerEventHandler::GetPointerInfo(aPointerId)) {
+    aError.ThrowNotFoundError("Invalid pointer id");
+    return;
+  }
+  if (HasPointerCapture(aPointerId)) {
+    PointerEventHandler::ReleasePointerCaptureById(aPointerId);
+  }
+}
+
+bool Element::HasPointerCapture(long aPointerId) {
+  PointerCaptureInfo* pointerCaptureInfo =
+      PointerEventHandler::GetPointerCaptureInfo(aPointerId);
+  if (pointerCaptureInfo && pointerCaptureInfo->mPendingElement == this) {
+    return true;
+  }
+  return false;
+}
+
+const nsAttrValue* Element::GetSVGAnimatedClass() const {
+  MOZ_ASSERT(MayHaveClass() && IsSVGElement(), "Unexpected call");
+  return static_cast<const SVGElement*>(this)->GetAnimatedClassName();
+}
+
+NS_IMETHODIMP
+Element::QueryInterface(REFNSIID aIID, void** aInstancePtr) {
+  if (aIID.Equals(NS_GET_IID(Element))) {
+    NS_ADDREF_THIS();
+    *aInstancePtr = this;
+    return NS_OK;
+  }
+
+  NS_ASSERTION(aInstancePtr, "QueryInterface requires a non-NULL destination!");
+  nsresult rv = FragmentOrElement::QueryInterface(aIID, aInstancePtr);
+  if (NS_SUCCEEDED(rv)) {
+    return NS_OK;
+  }
+
+  return NS_NOINTERFACE;
+}
+
+void Element::NotifyStateChange(ElementState aStates) {
+  MOZ_ASSERT(!aStates.IsEmpty());
+  if (Document* doc = GetComposedDoc()) {
+    nsAutoScriptBlocker scriptBlocker;
+    doc->ElementStateChanged(this, aStates);
+  }
+}
+
+}  
+
+void nsIContent::UpdateEditableState(bool aNotify) {
+  if (IsInNativeAnonymousSubtree()) {
+    if (IsRootOfNativeAnonymousSubtree()) {
+      return;
+    }
+
+    if (HasFlag(NODE_IS_EDITABLE)) {
+      return;
+    }
+  }
+
+  nsINode* parent = GetParentNode();
+  SetEditableFlag(parent && parent->HasFlag(NODE_IS_EDITABLE));
+}
+
+namespace mozilla::dom {
+
+void Element::UpdateEditableState(bool aNotify) {
+  nsIContent::UpdateEditableState(aNotify);
+  UpdateReadOnlyState(aNotify);
+}
+
+bool Element::IsReadOnlyInternal() const { return !IsEditable(); }
+
+void Element::UpdateReadOnlyState(bool aNotify) {
+  auto oldState = State();
+  if (IsReadOnlyInternal()) {
+    RemoveStatesSilently(ElementState::READWRITE);
+    AddStatesSilently(ElementState::READONLY);
+  } else {
+    RemoveStatesSilently(ElementState::READONLY);
+    AddStatesSilently(ElementState::READWRITE);
+  }
+  if (!aNotify) {
+    return;
+  }
+  const auto newState = State();
+  if (newState != oldState) {
+    NotifyStateChange(newState ^ oldState);
+  }
+}
+
+Maybe<int32_t> Element::GetTabIndexAttrValue() {
+  const nsAttrValue* attrVal = GetParsedAttr(nsGkAtoms::tabindex);
+  if (attrVal && attrVal->Type() == nsAttrValue::eInteger) {
+    return Some(attrVal->GetIntegerValue());
+  }
+
+  return Nothing();
+}
+
+int32_t Element::TabIndex() {
+  Maybe<int32_t> attrVal = GetTabIndexAttrValue();
+  if (attrVal.isSome()) {
+    return attrVal.value();
+  }
+
+  return TabIndexDefault();
+}
+
+void Element::TraverseCustomElementRegistry(
+    Element* aElement, nsCycleCollectionTraversalCallback& aCb) {
+  if (aElement->GetCustomElementRegistryState() ==
+      CustomElementRegistryState::Scoped) {
+    RefPtr<CustomElementRegistry> registry =
+        CustomElementRegistry::GetScopedRegistry(*aElement);
+    if (registry) {
+      NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(aCb, "scoped CustomElementRegistry");
+      aCb.NoteXPCOMChild(registry.get());
+    }
+  }
+}
+
+void Element::UnlinkCustomElementRegistry(Element* aElement) {
+  if (aElement->GetCustomElementRegistryState() ==
+      CustomElementRegistryState::Scoped) {
+    CustomElementRegistry::RemoveScopedRegistry(*aElement);
+    aElement->SetCustomElementRegistryState(CustomElementRegistryState::Global);
+  }
+}
+
+void Element::Focus(const FocusOptions& aOptions, CallerType aCallerType,
+                    ErrorResult& aError) {
+  const RefPtr<nsFocusManager> fm = nsFocusManager::GetFocusManager();
+  if (MOZ_UNLIKELY(!fm)) {
+    return;
+  }
+  const OwningNonNull<Element> kungFuDeathGrip(*this);
+  if (fm->CanSkipFocus(this)) {
+    fm->NotifyOfReFocus(kungFuDeathGrip);
+    fm->NeedsFlushBeforeEventHandling(this);
+    return;
+  }
+  uint32_t fmFlags = nsFocusManager::ProgrammaticFocusFlags(aOptions);
+  if (aCallerType == CallerType::NonSystem) {
+    fmFlags |= nsIFocusManager::FLAG_NONSYSTEMCALLER;
+  }
+  aError = fm->SetFocus(kungFuDeathGrip, fmFlags);
+}
+
+void Element::SetTabIndex(int32_t aTabIndex, mozilla::ErrorResult& aError) {
+  nsAutoString value;
+  value.AppendInt(aTabIndex);
+
+  SetAttr(nsGkAtoms::tabindex, value, aError);
+}
+
+void Element::SetShadowRoot(ShadowRoot* aShadowRoot) {
+  nsExtendedDOMSlots* slots = ExtendedDOMSlots();
+  MOZ_ASSERT(!aShadowRoot || !slots->mShadowRoot,
+             "We shouldn't clear the shadow root without unbind first");
+  slots->mShadowRoot = aShadowRoot;
+}
+
+void Element::SetCustomElementRegistry(
+    CustomElementRegistry* aCustomElementRegistry) {
+  MOZ_ASSERT(StaticPrefs::dom_scoped_custom_element_registries_enabled());
+  MOZ_ASSERT(!!aCustomElementRegistry,
+             "We shouldn't be setting a null custom element registry");
+  MOZ_ASSERT(
+      GetCustomElementRegistryState() != CustomElementRegistryState::Scoped,
+      "We shouldn't override an already assigned scoped registry");
+
+  if (aCustomElementRegistry->IsScoped()) {
+    SetCustomElementRegistryState(CustomElementRegistryState::Scoped);
+    CustomElementRegistry::SetScopedRegistry(*this, *aCustomElementRegistry);
+  } else {
+    SetCustomElementRegistryState(CustomElementRegistryState::Global);
+  }
+}
+
+void Element::SetKeepCustomElementRegistryNull() {
+  MOZ_ASSERT(StaticPrefs::dom_scoped_custom_element_registries_enabled());
+  MOZ_ASSERT(!HasCustomElementRegistry(),
+             "We shouldn't set a custom element registry without clearing "
+             "first");
+  SetCustomElementRegistryState(CustomElementRegistryState::Null);
+}
+
+CustomElementRegistry* Element::GetCustomElementRegistry() {
+  switch (GetCustomElementRegistryState()) {
+    case CustomElementRegistryState::Global:
+      return OwnerDoc()->GetEffectiveGlobalCustomElementRegistry();
+    case CustomElementRegistryState::Null:
+      return nullptr;
+    case CustomElementRegistryState::Scoped: {
+      RefPtr<CustomElementRegistry> registry =
+          CustomElementRegistry::GetScopedRegistry(*this);
+      return registry;
+    }
+  }
+  MOZ_ASSERT_UNREACHABLE("Invalid CustomElementRegistryState");
+  return nullptr;
+}
+
+void Element::SetLastRememberedBSize(float aBSize) {
+  ExtendedDOMSlots()->mLastRememberedBSize = Some(aBSize);
+}
+
+void Element::SetLastRememberedISize(float aISize) {
+  ExtendedDOMSlots()->mLastRememberedISize = Some(aISize);
+}
+
+void Element::RemoveLastRememberedBSize() {
+  if (nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots()) {
+    slots->mLastRememberedBSize.reset();
+  }
+}
+
+void Element::RemoveLastRememberedISize() {
+  if (nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots()) {
+    slots->mLastRememberedISize.reset();
+  }
+}
+
+void Element::Blur(mozilla::ErrorResult& aError) {
+  if (!ShouldBlur(this)) {
+    return;
+  }
+
+  Document* doc = GetComposedDoc();
+  if (!doc) {
+    return;
+  }
+
+  if (nsCOMPtr<nsPIDOMWindowOuter> win = doc->GetWindow()) {
+    if (RefPtr<nsFocusManager> fm = nsFocusManager::GetFocusManager()) {
+      aError = fm->ClearFocus(win);
+    }
+  }
+}
+
+ElementState Element::StyleStateFromLocks() const {
+  StyleStateLocks locksAndValues = LockedStyleStates();
+  ElementState locks = locksAndValues.mLocks;
+  ElementState values = locksAndValues.mValues;
+  ElementState state = (mState & ~locks) | (locks & values);
+
+  if (state.HasState(ElementState::VISITED)) {
+    return state & ~ElementState::UNVISITED;
+  }
+  if (state.HasState(ElementState::UNVISITED)) {
+    return state & ~ElementState::VISITED;
+  }
+
+  return state;
+}
+
+Element::StyleStateLocks Element::LockedStyleStates() const {
+  StyleStateLocks* locks =
+      static_cast<StyleStateLocks*>(GetProperty(nsGkAtoms::lockedStyleStates));
+  if (locks) {
+    return *locks;
+  }
+  return StyleStateLocks();
+}
+
+void Element::NotifyStyleStateChange(ElementState aStates) {
+  if (RefPtr<Document> doc = GetComposedDoc()) {
+    if (RefPtr<PresShell> presShell = doc->GetPresShell()) {
+      nsAutoScriptBlocker scriptBlocker;
+      presShell->ElementStateChanged(doc, this, aStates);
+    }
+  }
+}
+
+void Element::LockStyleStates(ElementState aStates, bool aEnabled) {
+  StyleStateLocks* locks = new StyleStateLocks(LockedStyleStates());
+
+  locks->mLocks |= aStates;
+  if (aEnabled) {
+    locks->mValues |= aStates;
+  } else {
+    locks->mValues &= ~aStates;
+  }
+
+  if (aStates.HasState(ElementState::VISITED)) {
+    locks->mLocks &= ~ElementState::UNVISITED;
+  }
+  if (aStates.HasState(ElementState::UNVISITED)) {
+    locks->mLocks &= ~ElementState::VISITED;
+  }
+
+  SetProperty(nsGkAtoms::lockedStyleStates, locks,
+              nsINode::DeleteProperty<StyleStateLocks>);
+  SetHasLockedStyleStates();
+
+  NotifyStyleStateChange(aStates);
+}
+
+void Element::UnlockStyleStates(ElementState aStates) {
+  StyleStateLocks* locks = new StyleStateLocks(LockedStyleStates());
+
+  locks->mLocks &= ~aStates;
+
+  if (locks->mLocks.IsEmpty()) {
+    RemoveProperty(nsGkAtoms::lockedStyleStates);
+    ClearHasLockedStyleStates();
+    delete locks;
+  } else {
+    SetProperty(nsGkAtoms::lockedStyleStates, locks,
+                nsINode::DeleteProperty<StyleStateLocks>);
+  }
+
+  NotifyStyleStateChange(aStates);
+}
+
+void Element::ClearStyleStateLocks() {
+  StyleStateLocks locks = LockedStyleStates();
+
+  RemoveProperty(nsGkAtoms::lockedStyleStates);
+  ClearHasLockedStyleStates();
+
+  NotifyStyleStateChange(locks.mLocks);
+}
+
+nsINode* Element::GetScopeChainParent() const { return OwnerDoc(); }
+
+JSObject* Element::WrapNode(JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return Element_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+nsDOMTokenList* Element::ClassList() {
+  nsDOMSlots* slots = DOMSlots();
+  if (!slots->mClassList) {
+    slots->mClassList = new nsDOMTokenList(this, nsGkAtoms::_class);
+  }
+  return slots->mClassList;
+}
+
+nsDOMTokenList* Element::Part() {
+  nsExtendedDOMSlots* slots = ExtendedDOMSlots();
+  if (!slots->mPart) {
+    slots->mPart = new nsDOMTokenList(this, nsGkAtoms::part);
+  }
+  return slots->mPart;
+}
+
+void Element::RecompileScriptEventListeners() {
+  for (uint32_t i = 0, count = mAttrs.AttrCount(); i < count; ++i) {
+    BorrowedAttrInfo attrInfo = mAttrs.AttrInfoAt(i);
+
+    if (!attrInfo.mName->IsAtom()) {
+      continue;
+    }
+
+    nsAtom* attr = attrInfo.mName->Atom();
+    if (!IsEventAttributeName(attr)) {
+      continue;
+    }
+
+    nsAutoString value;
+    attrInfo.mValue->ToString(value);
+    SetEventHandler(GetEventNameForAttr(attr), value, true);
+  }
+}
+
+void Element::GetAttributeNames(nsTArray<nsString>& aResult) {
+  uint32_t count = mAttrs.AttrCount();
+  for (uint32_t i = 0; i < count; ++i) {
+    const nsAttrName* name = mAttrs.AttrNameAt(i);
+    name->GetQualifiedName(*aResult.AppendElement());
+  }
+}
+
+already_AddRefed<HTMLCollection> Element::GetElementsByTagName(
+    const nsAString& aLocalName) {
+  return NS_GetContentList(this, kNameSpaceID_Unknown, aLocalName);
+}
+
+ScrollContainerFrame* Element::GetScrollContainerFrame(nsIFrame** aFrame,
+                                                       FlushType aFlushType) {
+  nsIFrame* frame = GetPrimaryFrame(aFlushType);
+  if (aFrame) {
+    *aFrame = frame;
+  }
+  if (frame) {
+    if (frame->HasAnyStateBits(NS_FRAME_SVG_LAYOUT)) {
+      return nullptr;
+    }
+
+    if (ScrollContainerFrame* scrollContainerFrame =
+            frame->GetScrollTargetFrame()) {
+      MOZ_ASSERT(!OwnerDoc()->IsScrollingElement(this),
+                 "How can we have a scroll container frame if we're the "
+                 "scrollingElement for our document?");
+      return scrollContainerFrame;
+    }
+  }
+
+  Document* doc = OwnerDoc();
+  const bool isScrollingElement = doc->IsScrollingElement(this);
+  if (isScrollingElement) {
+    if (PresShell* presShell = doc->GetPresShell()) {
+      if (ScrollContainerFrame* rootScrollContainerFrame =
+              presShell->GetRootScrollContainerFrame()) {
+        if (aFrame) {
+          *aFrame = rootScrollContainerFrame;
+        }
+        return rootScrollContainerFrame;
+      }
+    }
+  }
+  if (aFrame) {
+    *aFrame = GetPrimaryFrame(FlushType::None);
+  }
+  return nullptr;
+}
+
+bool Element::CheckVisibility(const CheckVisibilityOptions& aOptions) {
+  nsIFrame* f =
+      GetPrimaryFrame(aOptions.mFlush ? FlushType::Frames : FlushType::None);
+  if (!f) {
+    return false;
+  }
+
+  EnumSet includeContentVisibility = {
+      nsIFrame::IncludeContentVisibility::Hidden};
+  if (aOptions.mContentVisibilityAuto) {
+    includeContentVisibility += nsIFrame::IncludeContentVisibility::Auto;
+  }
+  if (f->IsHiddenByContentVisibilityOnAnyAncestor(includeContentVisibility)) {
+    return false;
+  }
+
+  if ((aOptions.mOpacityProperty || aOptions.mCheckOpacity) &&
+      f->Style()->IsInOpacityZeroSubtree()) {
+    return false;
+  }
+
+  if ((aOptions.mVisibilityProperty || aOptions.mCheckVisibilityCSS) &&
+      !f->StyleVisibility()->IsVisible()) {
+    return false;
+  }
+
+  return true;
+}
+
+void Element::ScrollIntoView(const BooleanOrScrollIntoViewOptions& aObject) {
+  if (aObject.IsScrollIntoViewOptions()) {
+    return ScrollIntoView(aObject.GetAsScrollIntoViewOptions());
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(aObject.IsBoolean());
+
+  ScrollIntoViewOptions options;
+  if (aObject.GetAsBoolean()) {
+    options.mBlock = ScrollLogicalPosition::Start;
+    options.mInline = ScrollLogicalPosition::Nearest;
+  } else {
+    options.mBlock = ScrollLogicalPosition::End;
+    options.mInline = ScrollLogicalPosition::Nearest;
+  }
+  return ScrollIntoView(options);
+}
+
+void Element::ScrollIntoView(const ScrollIntoViewOptions& aOptions) {
+  Document* document = GetComposedDoc();
+  if (!document) {
+    return;
+  }
+
+  RefPtr<PresShell> presShell = document->GetPresShell();
+  if (!presShell) {
+    return;
+  }
+
+  const auto ToWhereToScroll =
+      [](ScrollLogicalPosition aPosition) -> WhereToScroll {
+    switch (aPosition) {
+      case ScrollLogicalPosition::Start:
+        return WhereToScroll::Start;
+      case ScrollLogicalPosition::Center:
+        return WhereToScroll::Center;
+      case ScrollLogicalPosition::End:
+        return WhereToScroll::End;
+      case ScrollLogicalPosition::Auto:
+        return WhereToScroll::Auto;
+      case ScrollLogicalPosition::Nearest:
+        break;
+    }
+    return WhereToScroll::Nearest;
+  };
+
+  const auto block = ToWhereToScroll(aOptions.mBlock);
+  const auto inline_ = ToWhereToScroll(aOptions.mInline);
+
+  ScrollFlags scrollFlags = ScrollFlags::ScrollOverflowHidden |
+                            ScrollFlags::TriggeredByScript |
+                            ScrollFlags::AxesAreLogical;
+  if (aOptions.mBehavior == ScrollBehavior::Smooth) {
+    scrollFlags |= ScrollFlags::ScrollSmooth;
+  } else if (aOptions.mBehavior == ScrollBehavior::Auto) {
+    scrollFlags |= ScrollFlags::ScrollSmoothAuto;
+  }
+
+  presShell->ScrollContentIntoView(
+      this, AxisScrollParams(block, WhenToScroll::Always),
+      AxisScrollParams(inline_, WhenToScroll::Always), scrollFlags);
+}
+
+void Element::ScrollTo(double aXScroll, double aYScroll) {
+  ScrollToOptions options;
+  options.mLeft.Construct(aXScroll);
+  options.mTop.Construct(aYScroll);
+  ScrollTo(options);
+}
+
+void Element::ScrollTo(const ScrollToOptions& aOptions) {
+  const bool needsLayoutFlush =
+      aOptions.mLeft.WasPassed() ||
+      (aOptions.mTop.WasPassed() && aOptions.mTop.Value() != 0.0);
+
+  nsIFrame* frame;
+  ScrollContainerFrame* sf = GetScrollContainerFrame(
+      &frame, needsLayoutFlush ? FlushType::Layout : FlushType::Frames);
+  if (!sf) {
+    return;
+  }
+
+  CSSPoint scrollPos = sf->GetScrollPositionCSSPixels();
+  if (aOptions.mLeft.WasPassed()) {
+    scrollPos.x = ToZeroIfNonfinite(
+        frame->Style()->EffectiveZoom().Zoom(aOptions.mLeft.Value()));
+  }
+  if (aOptions.mTop.WasPassed()) {
+    scrollPos.y = ToZeroIfNonfinite(
+        frame->Style()->EffectiveZoom().Zoom(aOptions.mTop.Value()));
+  }
+  ScrollMode scrollMode = sf->ScrollModeForScrollBehavior(aOptions.mBehavior);
+  sf->ScrollToCSSPixels(scrollPos, scrollMode);
+}
+
+void Element::ScrollBy(double aXScrollDif, double aYScrollDif) {
+  ScrollToOptions options;
+  options.mLeft.Construct(aXScrollDif);
+  options.mTop.Construct(aYScrollDif);
+  ScrollBy(options);
+}
+
+void Element::ScrollBy(const ScrollToOptions& aOptions) {
+  nsIFrame* frame;
+  ScrollContainerFrame* sf = GetScrollContainerFrame(&frame);
+  if (!sf) {
+    return;
+  }
+
+  CSSPoint scrollDelta;
+  if (aOptions.mLeft.WasPassed()) {
+    scrollDelta.x = ToZeroIfNonfinite(
+        frame->Style()->EffectiveZoom().Zoom(aOptions.mLeft.Value()));
+  }
+
+  if (aOptions.mTop.WasPassed()) {
+    scrollDelta.y = ToZeroIfNonfinite(
+        frame->Style()->EffectiveZoom().Zoom(aOptions.mTop.Value()));
+  }
+
+  auto scrollMode = sf->ScrollModeForScrollBehavior(aOptions.mBehavior);
+  sf->ScrollByCSSPixels(scrollDelta, scrollMode);
+}
+
+double Element::ScrollTop() {
+  return CSSPixel::FromAppUnits(GetScrollOrigin().y);
+}
+
+void Element::SetScrollTop(double aScrollTop) {
+  ScrollToOptions options;
+  options.mTop.Construct(aScrollTop);
+  ScrollTo(options);
+}
+
+double Element::ScrollLeft() {
+  return CSSPixel::FromAppUnits(GetScrollOrigin().x);
+}
+
+void Element::SetScrollLeft(double aScrollLeft) {
+  ScrollToOptions options;
+  options.mLeft.Construct(aScrollLeft);
+  ScrollTo(options);
+}
+
+void Element::MozScrollSnap() {
+  if (ScrollContainerFrame* sf =
+          GetScrollContainerFrame(nullptr, FlushType::None)) {
+    sf->ScrollSnap();
+  }
+}
+
+nsRect Element::GetScrollRange() {
+  nsIFrame* frame;
+  ScrollContainerFrame* sf = GetScrollContainerFrame(&frame);
+  if (!sf) {
+    return nsRect();
+  }
+  return frame->Style()->EffectiveZoom().Unzoom(sf->GetScrollRange());
+}
+
+double Element::ScrollTopMin() {
+  return CSSPixel::FromAppUnits(GetScrollRange().Y());
+}
+
+double Element::ScrollTopMax() {
+  return CSSPixel::FromAppUnits(GetScrollRange().YMost());
+}
+
+double Element::ScrollLeftMin() {
+  return CSSPixel::FromAppUnits(GetScrollRange().X());
+}
+
+double Element::ScrollLeftMax() {
+  return CSSPixel::FromAppUnits(GetScrollRange().XMost());
+}
+
+static nsSize GetScrollRectSizeForOverflowVisibleFrame(nsIFrame* aFrame) {
+  if (!aFrame || aFrame->HasAnyStateBits(NS_FRAME_SVG_LAYOUT)) {
+    return nsSize();
+  }
+
+  const nsRect paddingRect = aFrame->GetPaddingRectRelativeToSelf();
+  const nsRect overflowRect = [&] {
+    OverflowAreas overflowAreas(paddingRect, paddingRect);
+    aFrame->UnionChildOverflow(overflowAreas,  true);
+    return overflowAreas.ScrollableOverflow().UnionEdges(paddingRect);
+  }();
+
+  auto directions =
+      ScrollContainerFrame::ComputePerAxisScrollDirections(aFrame);
+  const nscoord height = directions.mToBottom
+                             ? overflowRect.YMost() - paddingRect.Y()
+                             : paddingRect.YMost() - overflowRect.Y();
+  const nscoord width = directions.mToRight
+                            ? overflowRect.XMost() - paddingRect.X()
+                            : paddingRect.XMost() - overflowRect.X();
+  return nsSize(width, height);
+}
+
+nsSize Element::GetScrollSize() {
+  nsIFrame* frame;
+  nsSize size;
+  if (ScrollContainerFrame* sf = GetScrollContainerFrame(&frame)) {
+    size = sf->GetScrollRange().Size() + sf->GetScrollPortRect().Size();
+  } else {
+    size = GetScrollRectSizeForOverflowVisibleFrame(frame);
+  }
+  if (!frame) {
+    return size;
+  }
+  return frame->Style()->EffectiveZoom().Unzoom(size);
+}
+
+nsPoint Element::GetScrollOrigin() {
+  nsIFrame* frame;
+  ScrollContainerFrame* sf = GetScrollContainerFrame(&frame);
+  if (!sf) {
+    return nsPoint();
+  }
+  return frame->Style()->EffectiveZoom().Unzoom(sf->GetScrollPosition());
+}
+
+int32_t Element::ScrollHeight() {
+  return nsPresContext::AppUnitsToIntCSSPixels(GetScrollSize().height);
+}
+
+int32_t Element::ScrollWidth() {
+  return nsPresContext::AppUnitsToIntCSSPixels(GetScrollSize().width);
+}
+
+nsRect Element::GetClientAreaRect() {
+  Document* doc = OwnerDoc();
+  nsPresContext* presContext = doc->GetPresContext();
+
+  if (presContext && presContext->UseOverlayScrollbars() &&
+      !doc->StyleOrLayoutObservablyDependsOnParentDocumentLayout() &&
+      doc->IsScrollingElement(this)) {
+    if (RefPtr ps = doc->GetPresShell()) {
+      return nsRect(nsPoint(), ps->MaybePendingLayoutViewportSize());
+    }
+  }
+
+  nsIFrame* frame;
+  if (ScrollContainerFrame* sf = GetScrollContainerFrame(&frame)) {
+    nsRect scrollPort = sf->GetScrollPortRect();
+
+    if (!sf->IsRootScrollFrameOfDocument()) {
+      MOZ_ASSERT(frame);
+      if (frame != sf) {
+        scrollPort.MoveBy(sf->GetOffsetTo(frame));
+      }
+    }
+
+    scrollPort.SizeTo(sf->GetLayoutSize());
+    return frame->Style()->EffectiveZoom().Unzoom(scrollPort);
+  }
+
+  if (frame &&
+      (!frame->StyleDisplay()->IsInlineFlow() || frame->IsReplaced())) {
+    return frame->Style()->EffectiveZoom().Unzoom(
+        frame->GetPaddingRect() - frame->GetPositionIgnoringScrolling());
+  }
+
+  return nsRect();
+}
+
+int32_t Element::ScreenX() {
+  nsIFrame* frame = GetPrimaryFrame(FlushType::Layout);
+  return frame ? frame->GetScreenRect().x : 0;
+}
+
+int32_t Element::ScreenY() {
+  nsIFrame* frame = GetPrimaryFrame(FlushType::Layout);
+  return frame ? frame->GetScreenRect().y : 0;
+}
+
+already_AddRefed<nsIScreen> Element::GetScreen() {
+  (void)GetPrimaryFrame(FlushType::Frames);
+  if (nsIWidget* widget = nsContentUtils::WidgetForContent(this)) {
+    return widget->GetWidgetScreen();
+  }
+  return nullptr;
+}
+
+double Element::CurrentCSSZoom() {
+  nsIFrame* f = GetPrimaryFrame(FlushType::Frames);
+  if (!f) {
+    return 1.0;
+  }
+  return f->Style()->EffectiveZoom().ToFloat();
+}
+
+already_AddRefed<DOMRect> Element::GetBoundingClientRect() {
+  RefPtr<DOMRect> rect = new DOMRect(ToSupports(OwnerDoc()));
+
+  nsIFrame* frame = GetPrimaryFrame(FlushType::Layout);
+  if (!frame) {
+    return rect.forget();
+  }
+
+  rect->SetLayoutRect(frame->GetBoundingClientRect());
+  return rect.forget();
+}
+
+already_AddRefed<DOMRectList> Element::GetClientRects() {
+  RefPtr<DOMRectList> rectList = new DOMRectList(this);
+
+  nsIFrame* frame = GetPrimaryFrame(FlushType::Layout);
+  if (!frame) {
+    return rectList.forget();
+  }
+
+  nsLayoutUtils::RectListBuilder builder(rectList);
+  nsLayoutUtils::GetAllInFlowRects(
+      frame, nsLayoutUtils::GetContainingBlockForClientRect(frame), &builder,
+      nsLayoutUtils::GetAllInFlowRectsFlag::AccountForTransforms);
+  return rectList.forget();
+}
+
+const DOMTokenListSupportedToken Element::sAnchorAndFormRelValues[] = {
+    "noreferrer", "noopener", "opener", nullptr};
+
+static constexpr nsAttrValue::EnumTableEntry kLoadingTable[] = {
+    {"eager", Element::Loading::Eager},
+    {"lazy", Element::Loading::Lazy},
+};
+
+void Element::GetLoading(nsAString& aValue) const {
+  GetEnumAttr(nsGkAtoms::loading, kLoadingTable[0].tag, aValue);
+}
+
+bool Element::ParseLoadingAttribute(const nsAString& aValue,
+                                    nsAttrValue& aResult) {
+  return aResult.ParseEnumValue(aValue, kLoadingTable,
+                                 false,
+                                &kLoadingTable[0]);
+}
+
+Element::Loading Element::LoadingState() const {
+  const nsAttrValue* val = mAttrs.GetAttr(nsGkAtoms::loading);
+  if (!val) {
+    return Loading::Eager;
+  }
+  return static_cast<Loading>(val->GetEnumValue());
+}
+
+MOZ_ALWAYS_INLINE void AssertNotObservedByLazyLoadObserver(Element& aElement) {
+  MOZ_ASSERT_IF(
+      aElement.OwnerDoc()->GetLazyLoadObserver(),
+      !aElement.OwnerDoc()->GetLazyLoadObserver()->Observes(aElement));
+}
+
+bool Element::MaybeStartLazyLoading() {
+  auto* doc = OwnerDoc();
+  if (!doc->IsScriptEnabled() || doc->IsStaticDocument()) {
+    AssertNotObservedByLazyLoadObserver(*this);
+    return false;
+  }
+  if (IsInComposedDoc()) {
+    doc->EnsureLazyLoadObserver().Observe(*this);
+  }
+  return true;
+}
+
+void Element::StopLazyLoading() {
+  if (!IsInComposedDoc()) {
+    AssertNotObservedByLazyLoadObserver(*this);
+    return;
+  }
+  auto* observer = OwnerDoc()->GetLazyLoadObserver();
+  if (!observer) [[unlikely]] {
+    MOZ_ASSERT_UNREACHABLE("Forgot to call LazyLoadingElementBindToTree?");
+    return;
+  }
+  observer->Unobserve(*this);
+}
+
+void Element::LazyLoadingElementBindToTree(BindContext& aContext) {
+  if (!aContext.InComposedDoc()) {
+    AssertNotObservedByLazyLoadObserver(*this);
+    return;
+  }
+  aContext.OwnerDoc().EnsureLazyLoadObserver().Observe(*this);
+}
+
+void Element::LazyLoadingElementUnbindFromTree(UnbindContext& aContext) {
+  if (!aContext.WasInComposedDoc()) {
+    AssertNotObservedByLazyLoadObserver(*this);
+    return;
+  }
+  auto* observer = aContext.OwnerDoc().GetLazyLoadObserver();
+  if (!observer) [[unlikely]] {
+    MOZ_ASSERT_UNREACHABLE("Forgot to call LazyLoadingElementBindToTree?");
+    return;
+  }
+  observer->Unobserve(*this);
+}
+
+namespace {
+static constexpr nsAttrValue::EnumTableEntry kFetchPriorityEnumTable[] = {
+    {kFetchPriorityAttributeValueHigh, FetchPriority::High},
+    {kFetchPriorityAttributeValueLow, FetchPriority::Low},
+    {kFetchPriorityAttributeValueAuto, FetchPriority::Auto}};
+
+static constexpr const nsAttrValue::EnumTableEntry*
+    kFetchPriorityEnumTableInvalidValueDefault = &kFetchPriorityEnumTable[2];
+}  
+
+void Element::ParseFetchPriority(const nsAString& aValue,
+                                 nsAttrValue& aResult) {
+  aResult.ParseEnumValue(aValue, kFetchPriorityEnumTable,
+                         false ,
+                         kFetchPriorityEnumTableInvalidValueDefault);
+}
+
+FetchPriority Element::GetFetchPriority() const {
+  const nsAttrValue* fetchpriorityAttribute =
+      GetParsedAttr(nsGkAtoms::fetchpriority);
+  if (fetchpriorityAttribute) {
+    MOZ_ASSERT(fetchpriorityAttribute->Type() == nsAttrValue::eEnum);
+    return FetchPriority(fetchpriorityAttribute->GetEnumValue());
+  }
+
+  return FetchPriority::Auto;
+}
+
+
+void Element::AddToIdTable(nsAtom* aId) {
+  NS_ASSERTION(HasID(), "Node doesn't have an ID?");
+  if (IsInShadowTree()) {
+    ShadowRoot* containingShadow = GetContainingShadow();
+    containingShadow->AddToIdTable(this, aId);
+  } else {
+    Document* doc = GetUncomposedDoc();
+    if (doc && !IsInNativeAnonymousSubtree()) {
+      doc->AddToIdTable(this, aId);
+    }
+  }
+}
+
+void Element::RemoveFromIdTable() {
+  if (!HasID()) {
+    return;
+  }
+
+  nsAtom* id = DoGetID();
+  if (IsInShadowTree()) {
+    ShadowRoot* containingShadow = GetContainingShadow();
+    if (containingShadow) {
+      containingShadow->RemoveFromIdTable(this, id);
+    }
+  } else {
+    Document* doc = GetUncomposedDoc();
+    if (doc && !IsInNativeAnonymousSubtree()) {
+      doc->RemoveFromIdTable(this, id);
+    }
+  }
+}
+
+void Element::SetSlot(const nsAString& aName, ErrorResult& aError) {
+  aError = SetAttr(kNameSpaceID_None, nsGkAtoms::slot, aName, true);
+}
+
+void Element::GetSlot(nsAString& aName) { GetAttr(nsGkAtoms::slot, aName); }
+
+ShadowRoot* Element::GetShadowRootForBindings() const {
+  ShadowRoot* shadowRoot = GetShadowRoot();
+  if (!shadowRoot || shadowRoot->IsClosed()) {
+    return nullptr;
+  }
+
+  return shadowRoot;
+}
+
+ShadowRoot* Element::GetOpenOrClosedShadowRoot(nsIPrincipal& aSubject) const {
+  ShadowRoot* shadowRoot = GetShadowRoot();
+  if (!shadowRoot) {
+    return nullptr;
+  }
+  if (!aSubject.IsSystemPrincipal() && shadowRoot->IsUAWidget()) {
+    return nullptr;
+  }
+  return shadowRoot;
+}
+
+bool Element::CanAttachShadowDOM() const {
+  if (!IsHTMLElement() &&
+      !(IsXULElement() &&
+        nsContentUtils::AllowXULXBLForPrincipal(NodePrincipal()))) {
+    return false;
+  }
+
+  nsAtom* nameAtom = NodeInfo()->NameAtom();
+  uint32_t namespaceID = NodeInfo()->NamespaceID();
+  if (!nsContentUtils::IsValidShadowHostName(nameAtom, namespaceID)) {
+    return false;
+  }
+
+  if (CustomElementData* ceData = GetCustomElementData()) {
+    CustomElementDefinition* definition = ceData->GetCustomElementDefinition();
+    if (!definition) {
+      definition = nsContentUtils::LookupCustomElementDefinition(
+          NodeInfo()->GetDocument(), nameAtom, namespaceID,
+          ceData->GetCustomElementType());
+    }
+
+    if (definition && definition->mDisableShadow) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+already_AddRefed<ShadowRoot> Element::AttachShadow(const ShadowRootInit& aInit,
+                                                   ErrorResult& aError) {
+  Maybe<RefPtr<CustomElementRegistry>> registry;
+  if (StaticPrefs::dom_scoped_custom_element_registries_enabled()) {
+    CustomElementRegistry* docRegistry = OwnerDoc()->GetCustomElementRegistry();
+    if (aInit.mCustomElementRegistry.WasPassed()) {
+      CustomElementRegistry* passedRegistry =
+          aInit.mCustomElementRegistry.Value();
+      if (passedRegistry && !passedRegistry->IsScoped() &&
+          passedRegistry != docRegistry) {
+        aError.ThrowNotSupportedError(
+            "Must use a scoped CustomElementRegistry or the document's "
+            "registry");
+        return nullptr;
+      }
+      registry = Some(passedRegistry);
+    } else {
+      registry = Some(docRegistry);
+    }
+  }
+
+  if (!CanAttachShadowDOM()) {
+    aError.ThrowNotSupportedError("Unable to attach ShadowDOM");
+    return nullptr;
+  }
+
+  if (RefPtr<ShadowRoot> root = GetShadowRoot()) {
+    if (!root->IsDeclarative() || root->Mode() != aInit.mMode) {
+      aError.ThrowNotSupportedError(
+          "Unable to re-attach to existing ShadowDOM");
+      return nullptr;
+    }
+    root->ReplaceChildren(nullptr, aError);
+    root->SetIsDeclarative(ShadowRootDeclarative::No);
+    return root.forget();
+  }
+
+  if (StaticPrefs::dom_webcomponents_shadowdom_report_usage()) {
+    OwnerDoc()->ReportShadowDOMUsage();
+  }
+
+  return AttachShadowWithoutNameChecks(aInit, registry, CustomSlotDispatch::No,
+                                       true);
+}
+
+already_AddRefed<ShadowRoot> Element::AttachShadowWithoutNameChecks(
+    const ShadowRootInit& aInit,
+    const Maybe<RefPtr<CustomElementRegistry>>& aRegistry,
+    CustomSlotDispatch aCustomSlotDispatch, bool aNotify) {
+  nsAutoScriptBlocker scriptBlocker;
+
+  auto* nim = NodeInfoManager();
+  RefPtr<mozilla::dom::NodeInfo> nodeInfo = nim->GetDocumentFragmentNodeInfo();
+
+  if (aNotify) {
+    if (Document* doc = GetComposedDoc()) {
+      if (PresShell* presShell = doc->GetPresShell()) {
+        presShell->ShadowRootWillBeAttached(*this);
+      }
+    }
+  }
+
+  RefPtr<ShadowRoot> shadowRoot = new (nim) ShadowRoot(
+      this, aInit.mMode, DelegatesFocus(aInit.mDelegatesFocus),
+      aInit.mSlotAssignment, ShadowRootClonable(aInit.mClonable),
+      ShadowRootSerializable(aInit.mSerializable), ShadowRootDeclarative::No,
+      aCustomSlotDispatch, aRegistry, nodeInfo.forget());
+  if (aInit.mReferenceTarget.WasPassed()) {
+    shadowRoot->SetReferenceTarget(aInit.mReferenceTarget.Value());
+  }
+
+  if (NodeOrAncestorHasDirAuto()) {
+    shadowRoot->SetAncestorHasDirAuto();
+  }
+
+  CustomElementData* ceData = GetCustomElementData();
+  if (ceData && (ceData->mState == CustomElementData::State::ePrecustomized ||
+                 ceData->mState == CustomElementData::State::eCustom)) {
+    shadowRoot->SetAvailableToElementInternals();
+  }
+
+  SetShadowRoot(shadowRoot);
+
+  if (MOZ_UNLIKELY(
+          nim->GetDocument()->DevToolsAnonymousAndShadowEventsEnabled())) {
+    AsyncEventDispatcher* dispatcher = new AsyncEventDispatcher(
+        this, u"shadowrootattached"_ns, CanBubble::eYes,
+        ChromeOnlyDispatch::eYes, Composed::eYes);
+    dispatcher->PostDOMEvent();
+  }
+
+  const LinkedList<AbstractRange>* ranges =
+      GetExistingClosestCommonInclusiveAncestorRanges();
+  if (ranges) {
+    for (const AbstractRange* range : *ranges) {
+      if (range->MayCrossShadowBoundary()) {
+        MOZ_ASSERT(range->IsDynamicRange());
+        CrossShadowBoundaryRange* crossBoundaryRange =
+            range->AsDynamicRange()->GetCrossShadowBoundaryRange();
+        MOZ_ASSERT(crossBoundaryRange);
+        crossBoundaryRange->NotifyNodeBecomesShadowHost(this);
+      }
+    }
+  }
+  return shadowRoot.forget();
+}
+
+void Element::AttachAndSetUAShadowRoot(NotifyUAWidget aNotifyUAWidget,
+                                       DelegatesFocus aDelegatesFocus,
+                                       CustomSlotDispatch aCustomSlotDispatch,
+                                       bool aNotify) {
+  MOZ_DIAGNOSTIC_ASSERT(!CanAttachShadowDOM(),
+                        "Cannot be used to attach UA shadow DOM");
+  if (OwnerDoc()->IsStaticDocument()) {
+    return;
+  }
+
+  if (!GetShadowRoot()) {
+    ShadowRootInit init;
+    init.mMode = ShadowRootMode::Closed;
+    init.mDelegatesFocus = aDelegatesFocus == DelegatesFocus::Yes;
+    RefPtr<ShadowRoot> shadowRoot = AttachShadowWithoutNameChecks(
+        init, Nothing(), aCustomSlotDispatch, aNotify);
+    shadowRoot->SetIsUAWidget();
+  }
+
+  MOZ_ASSERT(GetShadowRoot()->IsUAWidget());
+  if (aNotifyUAWidget == NotifyUAWidget::Yes) {
+    NotifyUAWidgetSetupOrChange();
+  }
+}
+
+void Element::NotifyUAWidgetSetupOrChange() {
+  MOZ_ASSERT(IsInComposedDoc());
+  Document* doc = OwnerDoc();
+  if (doc->IsStaticDocument()) {
+    return;
+  }
+
+  nsContentUtils::AddScriptRunner(NS_NewRunnableFunction(
+      "Element::NotifyUAWidgetSetupOrChange::UAWidgetSetupOrChange",
+      [self = RefPtr<Element>(this), doc = RefPtr<Document>(doc)]() {
+        nsContentUtils::DispatchChromeEvent(doc, self,
+                                            u"UAWidgetSetupOrChange"_ns,
+                                            CanBubble::eYes, Cancelable::eNo);
+      }));
+}
+
+void Element::TeardownUAShadowRoot(NotifyUAWidget aNotify,
+                                   UnattachShadowRoot aUnattachShadowRoot) {
+  MOZ_ASSERT(IsInComposedDoc());
+  if (!GetShadowRoot()) {
+    return;
+  }
+  MOZ_ASSERT(GetShadowRoot()->IsUAWidget());
+  if (aUnattachShadowRoot == UnattachShadowRoot::Yes) {
+    UnattachShadow();
+  }
+
+  if (aNotify == NotifyUAWidget::No) {
+    return;
+  }
+
+  Document* doc = OwnerDoc();
+  if (doc->IsStaticDocument()) {
+    return;
+  }
+
+  nsContentUtils::AddScriptRunner(NS_NewRunnableFunction(
+      "Element::NotifyUAWidgetTeardownAndUnattachShadow::UAWidgetTeardown",
+      [self = RefPtr<Element>(this), doc = RefPtr<Document>(doc)]() {
+        bool hasHadScriptObject = true;
+        nsIScriptGlobalObject* scriptObject =
+            doc->GetScriptHandlingObject(hasHadScriptObject);
+        if (!scriptObject && hasHadScriptObject) {
+          return;
+        }
+
+        (void)nsContentUtils::DispatchChromeEvent(
+            doc, self, u"UAWidgetTeardown"_ns, CanBubble::eYes,
+            Cancelable::eNo);
+      }));
+}
+
+void Element::UnattachShadow() {
+  RefPtr<ShadowRoot> shadowRoot = GetShadowRoot();
+  if (!shadowRoot) {
+    return;
+  }
+
+  nsAutoScriptBlocker scriptBlocker;
+
+  if (RefPtr<Document> doc = GetComposedDoc()) {
+    if (PresShell* presShell = doc->GetPresShell()) {
+      presShell->DestroyFramesForAndRestyle(this);
+#ifdef ACCESSIBILITY
+      if (nsAccessibilityService* accService = GetAccService()) {
+        accService->ContentRemoved(presShell, shadowRoot);
+      }
+#endif
+    }
+    [&]() MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+      if (RefPtr<nsFocusManager> fm = nsFocusManager::GetFocusManager()) {
+        fm->ContentRemoved(doc, shadowRoot, {});
+      }
+    }();
+  }
+  MOZ_ASSERT(!GetPrimaryFrame());
+
+  shadowRoot->Unattach();
+  SetShadowRoot(nullptr);
+}
+
+Element* Element::ResolveReferenceTarget() const {
+  if (!StaticPrefs::dom_shadowdom_referenceTarget_enabled()) {
+    return const_cast<Element*>(this);
+  }
+
+  const Element* element = this;
+  ShadowRoot* shadow = GetShadowRoot();
+
+  while (shadow && shadow->HasReferenceTarget()) {
+    element = shadow->GetReferenceTargetElement();
+    shadow = element ? element->GetShadowRoot() : nullptr;
+  }
+  return const_cast<Element*>(element);
+}
+
+Element* Element::RetargetReferenceTargetForBindings(Element* aElement) const {
+  if (!StaticPrefs::dom_shadowdom_referenceTarget_enabled()) {
+    return aElement;
+  }
+
+  return Element::FromNodeOrNull(nsContentUtils::Retarget(aElement, this));
+}
+
+void Element::GetAttribute(const nsAString& aName, DOMString& aReturn) {
+  const nsAttrValue* val = mAttrs.GetAttr(
+      aName,
+      IsHTMLElement() && IsInHTMLDocument() ? eIgnoreCase : eCaseMatters);
+  if (val) {
+    val->ToString(aReturn);
+  } else {
+    aReturn.SetNull();
+  }
+}
+
+bool Element::ToggleAttribute(const nsAString& aName,
+                              const Optional<bool>& aForce,
+                              nsIPrincipal* aTriggeringPrincipal,
+                              ErrorResult& aError) {
+  if (!nsContentUtils::IsValidAttributeLocalName(aName)) {
+    aError.ThrowInvalidCharacterError("Invalid attribute name");
+    return false;
+  }
+
+  nsAutoString nameToUse;
+  const nsAttrName* name = InternalGetAttrNameFromQName(aName, &nameToUse);
+  if (!name) {
+    if (aForce.WasPassed() && !aForce.Value()) {
+      return false;
+    }
+    RefPtr<nsAtom> nameAtom = NS_AtomizeMainThread(nameToUse);
+    if (!nameAtom) {
+      aError.Throw(NS_ERROR_OUT_OF_MEMORY);
+      return false;
+    }
+    aError = SetAttr(kNameSpaceID_None, nameAtom, u""_ns, aTriggeringPrincipal,
+                     true);
+    return true;
+  }
+  if (aForce.WasPassed() && aForce.Value()) {
+    return true;
+  }
+  nsAttrName tmp(*name);
+
+  aError = UnsetAttr(name->NamespaceID(), name->LocalName(), true);
+  return false;
+}
+
+void Element::SetAttribute(const nsAString& aName, const nsAString& aValue,
+                           nsIPrincipal* aTriggeringPrincipal,
+                           ErrorResult& aError) {
+  if (!nsContentUtils::IsValidAttributeLocalName(aName)) {
+    aError.ThrowInvalidCharacterError("Invalid attribute name");
+    return;
+  }
+
+  nsAutoString nameToUse;
+  RefPtr<nsAtom> nameAtom;
+  const nsAttrName* name =
+      InternalGetAttrNameFromQName(aName, &nameToUse, &nameAtom);
+  if (!name) {
+    if (!nameAtom) {
+      nameAtom = NS_AtomizeMainThread(nameToUse);
+    }
+    aError = SetAttr(kNameSpaceID_None, nameAtom, nullptr, aValue,
+                     aTriggeringPrincipal, true, IsKnownNewAttr::Yes);
+    return;
+  }
+
+  aError = SetAttr(name->NamespaceID(), name->LocalName(), name->GetPrefix(),
+                   aValue, aTriggeringPrincipal, true, IsKnownNewAttr::No);
+}
+
+void Element::RemoveAttribute(const nsAString& aName, ErrorResult& aError) {
+  const nsAttrName* name = InternalGetAttrNameFromQName(aName);
+
+  if (!name) {
+    return;
+  }
+
+  nsAttrName tmp(*name);
+
+  aError = UnsetAttr(name->NamespaceID(), name->LocalName(), true);
+}
+
+Attr* Element::GetAttributeNode(const nsAString& aName) {
+  return Attributes()->GetNamedItem(aName);
+}
+
+already_AddRefed<Attr> Element::SetAttributeNode(
+    Attr& aNewAttr, nsIPrincipal* aSubjectPrincipal, ErrorResult& aError) {
+  RefPtr<nsDOMAttributeMap> attrMap = Attributes();
+  return attrMap->SetNamedItemNS(aNewAttr, aSubjectPrincipal, aError);
+}
+
+already_AddRefed<Attr> Element::RemoveAttributeNode(Attr& aAttribute,
+                                                    ErrorResult& aError) {
+  Element* elem = aAttribute.GetElement();
+  if (elem != this) {
+    aError.Throw(NS_ERROR_DOM_NOT_FOUND_ERR);
+    return nullptr;
+  }
+
+  nsAutoString nameSpaceURI;
+  aAttribute.NodeInfo()->GetNamespaceURI(nameSpaceURI);
+  return Attributes()->RemoveNamedItemNS(
+      nameSpaceURI, aAttribute.NodeInfo()->LocalName(), aError);
+}
+
+void Element::GetAttributeNS(const nsAString& aNamespaceURI,
+                             const nsAString& aLocalName, nsAString& aReturn) {
+  int32_t nsid = nsNameSpaceManager::GetInstance()->GetNameSpaceID(
+      aNamespaceURI, nsContentUtils::IsChromeDoc(OwnerDoc()));
+
+  if (nsid == kNameSpaceID_Unknown) {
+    SetDOMStringToNull(aReturn);
+    return;
+  }
+
+  RefPtr<nsAtom> name = NS_AtomizeMainThread(aLocalName);
+  bool hasAttr = GetAttr(nsid, name, aReturn);
+  if (!hasAttr) {
+    SetDOMStringToNull(aReturn);
+  }
+}
+
+void Element::SetAttributeNS(const nsAString& aNamespaceURI,
+                             const nsAString& aQualifiedName,
+                             const nsAString& aValue,
+                             nsIPrincipal* aTriggeringPrincipal,
+                             ErrorResult& aError) {
+  RefPtr<mozilla::dom::NodeInfo> ni;
+  aError = nsContentUtils::GetNodeInfoFromQName(
+      aNamespaceURI, aQualifiedName, NodeInfoManager(), ATTRIBUTE_NODE,
+      getter_AddRefs(ni));
+  if (aError.Failed()) {
+    return;
+  }
+
+  aError = SetAttr(ni->NamespaceID(), ni->NameAtom(), ni->GetPrefixAtom(),
+                   aValue, aTriggeringPrincipal, true, IsKnownNewAttr::No);
+}
+
+void Element::SetAttribute(
+    const nsAString& aName,
+    const TrustedHTMLOrTrustedScriptOrTrustedScriptURLOrString& aValue,
+    nsIPrincipal* aTriggeringPrincipal, ErrorResult& aError) {
+  if (!nsContentUtils::IsValidAttributeLocalName(aName)) {
+    aError.ThrowInvalidCharacterError("Invalid attribute name");
+    return;
+  }
+
+  nsAutoString nameToUse;
+  RefPtr<nsAtom> nameAtom;
+  const nsAttrName* name =
+      InternalGetAttrNameFromQName(aName, &nameToUse, &nameAtom);
+  if (!name) {
+    if (!nameAtom) {
+      nameAtom = NS_AtomizeMainThread(nameToUse);
+    }
+    Maybe<nsAutoString> compliantStringHolder;
+    nsMutationGuard guard;
+    const nsAString* compliantString =
+        TrustedTypeUtils::GetTrustedTypesCompliantAttributeValue(
+            *this, nameAtom, kNameSpaceID_None, aValue, aTriggeringPrincipal,
+            compliantStringHolder, aError);
+    if (aError.Failed()) {
+      return;
+    }
+    const IsKnownNewAttr isKnownNew =
+        guard.Mutated(0) ? IsKnownNewAttr::No : IsKnownNewAttr::Yes;
+    aError = SetAttr(kNameSpaceID_None, nameAtom, nullptr, *compliantString,
+                     aTriggeringPrincipal, true, isKnownNew);
+    return;
+  }
+
+  Maybe<nsAutoString> compliantStringHolder;
+  RefPtr<nsAtom> attributeName = name->LocalName();
+  nsMutationGuard guard;
+  const nsAString* compliantString =
+      TrustedTypeUtils::GetTrustedTypesCompliantAttributeValue(
+          *this, attributeName, name->NamespaceID(), aValue,
+          aTriggeringPrincipal, compliantStringHolder, aError);
+  if (aError.Failed()) {
+    return;
+  }
+  if (!guard.Mutated(0)) {
+    aError = SetAttr(name->NamespaceID(), name->LocalName(), name->GetPrefix(),
+                     *compliantString, aTriggeringPrincipal, true,
+                     IsKnownNewAttr::No);
+    return;
+  }
+
+  SetAttribute(aName, *compliantString, aTriggeringPrincipal, aError);
+}
+
+void Element::SetAttributeNS(
+    const nsAString& aNamespaceURI, const nsAString& aQualifiedName,
+    const TrustedHTMLOrTrustedScriptOrTrustedScriptURLOrString& aValue,
+    nsIPrincipal* aTriggeringPrincipal, ErrorResult& aError) {
+  RefPtr<mozilla::dom::NodeInfo> ni;
+  aError = nsContentUtils::GetNodeInfoFromQName(
+      aNamespaceURI, aQualifiedName, NodeInfoManager(), ATTRIBUTE_NODE,
+      getter_AddRefs(ni));
+  if (aError.Failed()) {
+    return;
+  }
+
+  Maybe<nsAutoString> compliantStringHolder;
+  RefPtr<nsAtom> attributeName = ni->NameAtom();
+  const nsAString* compliantString =
+      TrustedTypeUtils::GetTrustedTypesCompliantAttributeValue(
+          *this, attributeName, ni->NamespaceID(), aValue, aTriggeringPrincipal,
+          compliantStringHolder, aError);
+  if (aError.Failed()) {
+    return;
+  }
+  aError =
+      SetAttr(ni->NamespaceID(), ni->NameAtom(), ni->GetPrefixAtom(),
+              *compliantString, aTriggeringPrincipal, true, IsKnownNewAttr::No);
+}
+
+void Element::RemoveAttributeNS(const nsAString& aNamespaceURI,
+                                const nsAString& aLocalName,
+                                ErrorResult& aError) {
+  RefPtr<nsAtom> name = NS_AtomizeMainThread(aLocalName);
+  int32_t nsid = nsNameSpaceManager::GetInstance()->GetNameSpaceID(
+      aNamespaceURI, nsContentUtils::IsChromeDoc(OwnerDoc()));
+
+  if (nsid == kNameSpaceID_Unknown) {
+    return;
+  }
+
+  aError = UnsetAttr(nsid, name, true);
+}
+
+Attr* Element::GetAttributeNodeNS(const nsAString& aNamespaceURI,
+                                  const nsAString& aLocalName) {
+  return GetAttributeNodeNSInternal(aNamespaceURI, aLocalName);
+}
+
+Attr* Element::GetAttributeNodeNSInternal(const nsAString& aNamespaceURI,
+                                          const nsAString& aLocalName) {
+  return Attributes()->GetNamedItemNS(aNamespaceURI, aLocalName);
+}
+
+already_AddRefed<Attr> Element::SetAttributeNodeNS(
+    Attr& aNewAttr, nsIPrincipal* aSubjectPrincipal, ErrorResult& aError) {
+  RefPtr<nsDOMAttributeMap> attrMap = Attributes();
+  return attrMap->SetNamedItemNS(aNewAttr, aSubjectPrincipal, aError);
+}
+
+already_AddRefed<HTMLCollection> Element::GetElementsByTagNameNS(
+    const nsAString& aNamespaceURI, const nsAString& aLocalName,
+    ErrorResult& aError) {
+  int32_t nameSpaceId = kNameSpaceID_Wildcard;
+
+  if (!aNamespaceURI.EqualsLiteral("*")) {
+    aError = nsNameSpaceManager::GetInstance()->RegisterNameSpace(aNamespaceURI,
+                                                                  nameSpaceId);
+    if (aError.Failed()) {
+      return nullptr;
+    }
+  }
+
+  NS_ASSERTION(nameSpaceId != kNameSpaceID_Unknown, "Unexpected namespace ID!");
+
+  return NS_GetContentList(this, nameSpaceId, aLocalName);
+}
+
+bool Element::HasAttributeNS(const nsAString& aNamespaceURI,
+                             const nsAString& aLocalName) const {
+  int32_t nsid = nsNameSpaceManager::GetInstance()->GetNameSpaceID(
+      aNamespaceURI, nsContentUtils::IsChromeDoc(OwnerDoc()));
+
+  if (nsid == kNameSpaceID_Unknown) {
+    return false;
+  }
+
+  RefPtr<nsAtom> name = NS_AtomizeMainThread(aLocalName);
+  return HasAttr(nsid, name);
+}
+
+already_AddRefed<HTMLCollection> Element::GetElementsByClassName(
+    const nsAString& aClassNames) {
+  return nsContentUtils::GetElementsByClassName(this, aClassNames);
+}
+
+bool Element::HasSharedRoot(const Element* aElement) const {
+  nsINode* root = SubtreeRoot();
+  nsINode* attrSubtreeRoot = aElement->SubtreeRoot();
+  do {
+    if (root == attrSubtreeRoot) {
+      return true;
+    }
+    auto* shadow = ShadowRoot::FromNode(root);
+    if (!shadow || !shadow->GetHost()) {
+      break;
+    }
+    root = shadow->GetHost()->SubtreeRoot();
+  } while (true);
+  return false;
+}
+
+Element* Element::GetElementByIdInDocOrSubtree(nsAtom* aID) const {
+  if (auto* docOrShadowRoot = GetContainingDocumentOrShadowRoot()) {
+    return docOrShadowRoot->GetElementById(aID);
+  }
+
+  return nsContentUtils::MatchElementId(SubtreeRoot()->AsContent(), aID);
+}
+
+Element* Element::GetAttrAssociatedElementInternal(nsAtom* aAttr,
+                                                   bool aForBindings) const {
+  Element* attrEl = nullptr;
+  bool hasExplicitEl = false;
+
+  if (const nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots()) {
+    nsWeakPtr weakExplicitEl = slots->mExplicitlySetAttrElementMap.Get(aAttr);
+    if (nsCOMPtr<Element> explicitEl = do_QueryReferent(weakExplicitEl)) {
+      hasExplicitEl = true;
+
+      if (HasSharedRoot(explicitEl)) {
+        attrEl = explicitEl;
+      }
+    }
+  }
+
+  if (!hasExplicitEl) {
+    const nsAttrValue* value = GetParsedAttr(aAttr);
+    if (!value) {
+      return nullptr;
+    }
+
+    MOZ_ASSERT(value->Type() == nsAttrValue::eAtom,
+               "Attribute used for attr associated element must be parsed");
+
+    attrEl = GetElementByIdInDocOrSubtree(value->GetAtomValue());
+  }
+
+  if (!attrEl) {
+    return nullptr;
+  }
+
+  Element* resolved = attrEl->ResolveReferenceTarget();
+  if (resolved && aForBindings) {
+    return attrEl;
+  }
+
+  return resolved;
+}
+
+Element* Element::GetAttrAssociatedElementForBindings(nsAtom* aAttr) const {
+  return GetAttrAssociatedElementInternal(aAttr, true);
+}
+
+Maybe<nsTArray<RefPtr<Element>>> Element::GetAttrAssociatedElementsInternal(
+    nsAtom* aAttr, bool aForBindings) {
+  nsTArray<RefPtr<Element>> elements;
+  auto& [explicitlySetAttrElements, _] =
+      ExtendedDOMSlots()->mAttrElementsMap.LookupOrInsert(aAttr);
+
+  if (explicitlySetAttrElements) {
+    for (const nsWeakPtr& weakEl : *explicitlySetAttrElements) {
+      if (RefPtr<Element> attrEl = do_QueryReferent(weakEl)) {
+        if (!HasSharedRoot(attrEl)) {
+          continue;
+        }
+        elements.AppendElement(std::move(attrEl));
+      }
+    }
+  } else {
+    const nsAttrValue* value = GetParsedAttr(aAttr);
+    if (!value || value->GetAtomCount() == 0) {
+      return Nothing();
+    }
+
+    MOZ_ASSERT(value->Type() == nsAttrValue::eAtomArray ||
+                   value->Type() == nsAttrValue::eAtom,
+               "Attribute used for accessible relations must be parsed.");
+    for (uint32_t i = 0; i < value->GetAtomCount(); i++) {
+      if (auto* candidate = GetElementByIdInDocOrSubtree(
+              value->AtomAt(static_cast<int32_t>(i)))) {
+        elements.AppendElement(candidate);
+      }
+    }
+  }
+  if (!StaticPrefs::dom_shadowdom_referenceTarget_enabled()) {
+    return Some(std::move(elements));
+  }
+
+  nsTArray<RefPtr<Element>> resolvedElements;
+  for (const RefPtr<Element>& element : elements) {
+    if (Element* resolvedCandidate = element->ResolveReferenceTarget()) {
+      if (aForBindings) {
+        resolvedElements.AppendElement(element);
+      } else {
+        resolvedElements.AppendElement(resolvedCandidate);
+      }
+    }
+  }
+  return Some(std::move(resolvedElements));
+}
+
+void Element::GetAttrAssociatedElementsForBindings(
+    nsAtom* aAttr, bool* aUseCachedValue,
+    Nullable<nsTArray<RefPtr<Element>>>& aElements) {
+  MOZ_ASSERT(aElements.IsNull());
+
+  Maybe<nsTArray<RefPtr<Element>>> elements =
+      GetAttrAssociatedElementsInternal(aAttr, true);
+
+  auto& [_, cachedAttrElements] =
+      ExtendedDOMSlots()->mAttrElementsMap.LookupOrInsert(aAttr);
+  if (elements && elements == cachedAttrElements) {
+    MOZ_ASSERT(!*aUseCachedValue);
+    *aUseCachedValue = true;
+    return;
+  }
+
+  if (elements) {
+    aElements.SetValue(elements->Clone());
+  }
+
+  cachedAttrElements = std::move(elements);
+}
+
+void Element::ClearExplicitlySetAttrElement(nsAtom* aAttr) {
+  if (auto* slots = GetExistingExtendedDOMSlots()) {
+    slots->mExplicitlySetAttrElementMap.Remove(aAttr);
+  }
+}
+
+void Element::ClearExplicitlySetAttrElements(nsAtom* aAttr) {
+  if (auto* slots = GetExistingExtendedDOMSlots()) {
+    slots->mAttrElementsMap.Remove(aAttr);
+  }
+}
+
+void Element::ExplicitlySetAttrElement(nsAtom* aAttr, Element* aElement) {
+#ifdef ACCESSIBILITY
+  nsAccessibilityService* accService = GetAccService();
+#endif
+  nsAutoScriptBlocker scriptBlocker;
+  if (aElement) {
+#ifdef ACCESSIBILITY
+    if (accService) {
+      accService->NotifyAttrElementWillChange(this, aAttr);
+    }
+#endif
+    SetAttr(aAttr, EmptyString(), IgnoreErrors());
+    nsExtendedDOMSlots* slots = ExtendedDOMSlots();
+    slots->mExplicitlySetAttrElementMap.InsertOrUpdate(
+        aAttr, do_GetWeakReference(aElement));
+#ifdef ACCESSIBILITY
+    if (accService) {
+      accService->NotifyAttrElementChanged(this, aAttr);
+    }
+#endif
+    return;
+  }
+
+#ifdef ACCESSIBILITY
+  if (accService) {
+    accService->NotifyAttrElementWillChange(this, aAttr);
+  }
+#endif
+  ClearExplicitlySetAttrElement(aAttr);
+  UnsetAttr(aAttr, IgnoreErrors());
+#ifdef ACCESSIBILITY
+  if (accService) {
+    accService->NotifyAttrElementChanged(this, aAttr);
+  }
+#endif
+}
+
+void Element::ExplicitlySetAttrElements(
+    nsAtom* aAttr,
+    const Nullable<Sequence<OwningNonNull<Element>>>& aElements) {
+#ifdef ACCESSIBILITY
+  nsAccessibilityService* accService = GetAccService();
+#endif
+  nsAutoScriptBlocker scriptBlocker;
+
+#ifdef ACCESSIBILITY
+  if (accService) {
+    accService->NotifyAttrElementWillChange(this, aAttr);
+  }
+#endif
+
+  if (aElements.IsNull()) {
+    ClearExplicitlySetAttrElements(aAttr);
+    UnsetAttr(aAttr, IgnoreErrors());
+  } else {
+    SetAttr(aAttr, EmptyString(), IgnoreErrors());
+    auto& entry = ExtendedDOMSlots()->mAttrElementsMap.LookupOrInsert(aAttr);
+    entry.first.emplace(nsTArray<nsWeakPtr>());
+    for (Element* el : aElements.Value()) {
+      entry.first->AppendElement(do_GetWeakReference(el));
+    }
+  }
+
+#ifdef ACCESSIBILITY
+  if (accService) {
+    accService->NotifyAttrElementChanged(this, aAttr);
+  }
+#endif
+}
+
+Element* Element::GetExplicitlySetAttrElement(nsAtom* aAttr) const {
+  if (const nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots()) {
+    nsWeakPtr weakAttrEl = slots->mExplicitlySetAttrElementMap.Get(aAttr);
+    if (nsCOMPtr<Element> attrEl = do_QueryReferent(weakAttrEl)) {
+      return attrEl;
+    }
+  }
+  return nullptr;
+}
+
+Maybe<nsTArray<RefPtr<dom::Element>>> Element::GetExplicitlySetAttrElements(
+    nsAtom* aAttr) const {
+  if (const nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots()) {
+    if (auto attrElementsMaybeEntry = slots->mAttrElementsMap.Lookup(aAttr)) {
+      auto& [attrElements, cachedAttrElements] = attrElementsMaybeEntry.Data();
+      if (attrElements) {
+        nsTArray<RefPtr<dom::Element>> elements;
+        for (const nsWeakPtr& weakEl : *attrElements) {
+          if (nsCOMPtr<Element> attrEl = do_QueryReferent(weakEl)) {
+            elements.AppendElement(attrEl);
+          }
+        }
+        return Some(std::move(elements));
+      }
+    }
+  }
+  return Nothing();
+}
+
+bool ReferenceTargetChangedAttrAssociatedElementCallback(void* aData) {
+  using AttrElementObserverCallbackData =
+      FragmentOrElement::nsExtendedDOMSlots::AttrElementObserverCallbackData;
+
+  AttrElementObserverCallbackData* data =
+      static_cast<AttrElementObserverCallbackData*>(aData);
+  nsWeakPtr weakElement = data->mElement;
+
+  if (nsCOMPtr<Element> element = do_QueryReferent(weakElement)) {
+    return element->AttrAssociatedElementUpdated(data->mAttr);
+  }
+
+  return false;
+}
+
+bool IDTargetChangedAttrAssociatedElementCallback(Element* aOldElement,
+                                                  Element* aNewElement,
+                                                  void* aData) {
+  using AttrElementObserverCallbackData =
+      FragmentOrElement::nsExtendedDOMSlots::AttrElementObserverCallbackData;
+
+  AttrElementObserverCallbackData* data =
+      static_cast<AttrElementObserverCallbackData*>(aData);
+
+  nsWeakPtr weakElement = data->mElement;
+  if (nsCOMPtr<Element> element = do_QueryReferent(weakElement)) {
+    if (aOldElement) {
+      aOldElement->RemoveReferenceTargetChangeObserver(
+          ReferenceTargetChangedAttrAssociatedElementCallback, aData);
+    }
+    if (aNewElement) {
+      aNewElement->AddReferenceTargetChangeObserver(
+          ReferenceTargetChangedAttrAssociatedElementCallback, aData);
+    }
+
+    return element->AttrAssociatedElementUpdated(data->mAttr);
+  }
+
+  return false;
+}
+
+Element* Element::AddAttrAssociatedElementObserver(
+    nsAtom* aAttr, AttrTargetObserver aObserver) {
+  using AttrElementObserverData =
+      FragmentOrElement::nsExtendedDOMSlots::AttrElementObserverData;
+  using AttrElementObserverCallbackData =
+      FragmentOrElement::nsExtendedDOMSlots::AttrElementObserverCallbackData;
+
+  AttrElementObserverData& observerData =
+      ExtendedDOMSlots()->mAttrElementObserverMap.LookupOrInsert(aAttr);
+
+
+  if (!observerData.mCallbackData) {
+    observerData.mCallbackData.reset(new AttrElementObserverCallbackData());
+    observerData.mCallbackData->mAttr = aAttr;
+    observerData.mCallbackData->mElement = do_GetWeakReference(this);
+
+    const nsAttrValue* value = GetParsedAttr(aAttr);
+    MOZ_ASSERT(value);
+    if (!value->IsEmptyString()) {
+      RefPtr<nsAtom> idValue = value->GetAsAtom();
+      observerData.mLastKnownAttrValue = idValue;
+    }
+
+    DocumentOrShadowRoot* docOrShadow = GetUncomposedDocOrConnectedShadowRoot();
+    if (docOrShadow) {
+      AddDocOrShadowObserversForAttrAssociatedElement(*docOrShadow, aAttr);
+    }
+  }
+
+  Element* lastAttrElement;
+  if (nsCOMPtr<Element> element =
+          do_QueryReferent(observerData.mLastKnownAttrElement)) {
+    lastAttrElement = element.get();
+  } else {
+    lastAttrElement = GetAttrAssociatedElementInternal(aAttr);
+    observerData.mLastKnownAttrElement = do_GetWeakReference(lastAttrElement);
+  }
+
+  observerData.mObservers.Insert(aObserver);
+
+  return lastAttrElement;
+}
+
+void Element::RemoveAttrAssociatedElementObserver(
+    nsAtom* aAttr, AttrTargetObserver aObserver) {
+  using AttrElementObserverData =
+      FragmentOrElement::nsExtendedDOMSlots::AttrElementObserverData;
+
+  AttrElementObserverData* observerData = GetAttrElementObserverData(aAttr);
+  if (!observerData) {
+    return;
+  }
+
+  DocumentOrShadowRoot* docOrShadow = GetUncomposedDocOrConnectedShadowRoot();
+  if (docOrShadow) {
+    RemoveDocOrShadowObserversForAttrAssociatedElement(*docOrShadow, aAttr);
+  }
+  observerData->mObservers.Remove(aObserver);
+
+  if (observerData->mObservers.IsEmpty()) {
+    DeleteAttrAssociatedElementObserverData(aAttr);
+  }
+}
+
+bool Element::AttrAssociatedElementUpdated(nsAtom* aAttr) {
+  using AttrElementObserverData =
+      FragmentOrElement::nsExtendedDOMSlots::AttrElementObserverData;
+
+  AttrElementObserverData* observerData = GetAttrElementObserverData(aAttr);
+  if (!observerData) {
+    return false;
+  }
+
+  Element* newAttrElement = GetAttrAssociatedElementInternal(aAttr);
+
+  nsCOMPtr<Element> oldAttrElement =
+      do_QueryReferent(observerData->mLastKnownAttrElement);
+
+  for (auto iter = observerData->mObservers.begin();
+       iter != observerData->mObservers.end(); ++iter) {
+    AttrTargetObserver observer = *iter;
+    bool keep = observer(oldAttrElement.get(), newAttrElement, this);
+    if (!keep) {
+      observerData->mObservers.Remove(iter);
+    }
+  }
+
+  if (observerData->mObservers.IsEmpty()) {
+    DeleteAttrAssociatedElementObserverData(aAttr);
+    return false;
+  }
+
+  return true;
+}
+
+void Element::IDREFAttributeValueChanged(nsAtom* aAttr,
+                                         const nsAttrValue* aValue) {
+  using AttrElementObserverData =
+      FragmentOrElement::nsExtendedDOMSlots::AttrElementObserverData;
+  using AttrElementObserverCallbackData =
+      FragmentOrElement::nsExtendedDOMSlots::AttrElementObserverCallbackData;
+
+  if (!AttrAssociatedElementUpdated(aAttr)) {
+    return;
+  }
+
+  DocumentOrShadowRoot* docOrShadow = GetUncomposedDocOrConnectedShadowRoot();
+  if (!docOrShadow) {
+    return;
+  }
+
+  AttrElementObserverData* observerData = GetAttrElementObserverData(aAttr);
+  if (!observerData) {
+    return;
+  }
+
+  AttrElementObserverCallbackData* callbackData =
+      observerData->mCallbackData.get();
+  if (observerData->mLastKnownAttrValue) {
+    docOrShadow->RemoveIDTargetObserver(
+        observerData->mLastKnownAttrValue,
+        IDTargetChangedAttrAssociatedElementCallback, callbackData, false);
+    Element* oldIdTarget =
+        docOrShadow->GetElementById(observerData->mLastKnownAttrValue);
+    if (oldIdTarget) {
+      oldIdTarget->RemoveReferenceTargetChangeObserver(
+          ReferenceTargetChangedAttrAssociatedElementCallback, callbackData);
+    }
+  }
+
+  if (!aValue || aValue->GetAtomValue()->IsEmpty()) {
+    observerData->mLastKnownAttrValue = nullptr;
+    return;
+  }
+
+  RefPtr<nsAtom> idValue = aValue->GetAsAtom();
+  observerData->mLastKnownAttrValue = idValue;
+  docOrShadow->AddIDTargetObserver(idValue,
+                                   IDTargetChangedAttrAssociatedElementCallback,
+                                   callbackData, false);
+
+  Element* newIdTarget = docOrShadow->GetElementById(idValue);
+  if (newIdTarget) {
+    newIdTarget->AddReferenceTargetChangeObserver(
+        ReferenceTargetChangedAttrAssociatedElementCallback, callbackData);
+  }
+}
+
+FragmentOrElement::nsExtendedDOMSlots::AttrElementObserverData*
+Element::GetAttrElementObserverData(nsAtom* aAttr) {
+  if (const nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots()) {
+    if (auto entry = slots->mAttrElementObserverMap.Lookup(aAttr)) {
+      return &entry.Data();
+    }
+  }
+  return nullptr;
+}
+
+void Element::DeleteAttrAssociatedElementObserverData(nsAtom* aAttr) {
+  DocumentOrShadowRoot* docOrShadow = GetUncomposedDocOrConnectedShadowRoot();
+  if (docOrShadow) {
+    RemoveDocOrShadowObserversForAttrAssociatedElement(*docOrShadow, aAttr);
+  }
+
+  ExtendedDOMSlots()->mAttrElementObserverMap.Remove(aAttr);
+}
+
+void Element::AddDocOrShadowObserversForAttrAssociatedElement(
+    DocumentOrShadowRoot& aContainingDocOrShadow, nsAtom* aAttr) {
+  using AttrElementObserverData =
+      FragmentOrElement::nsExtendedDOMSlots::AttrElementObserverData;
+  using AttrElementObserverCallbackData =
+      FragmentOrElement::nsExtendedDOMSlots::AttrElementObserverCallbackData;
+
+  AttrElementObserverData* observerData = GetAttrElementObserverData(aAttr);
+  if (!observerData) {
+    return;
+  }
+
+  Element* explicitlySetAttrElement = GetExplicitlySetAttrElement(aAttr);
+  AttrElementObserverCallbackData* callbackData =
+      observerData->mCallbackData.get();
+
+  if (explicitlySetAttrElement) {
+    explicitlySetAttrElement->AddReferenceTargetChangeObserver(
+        ReferenceTargetChangedAttrAssociatedElementCallback, callbackData);
+  } else {
+    MOZ_ASSERT(observerData->mLastKnownAttrValue);
+    Element* idTarget = aContainingDocOrShadow.AddIDTargetObserver(
+        observerData->mLastKnownAttrValue,
+        IDTargetChangedAttrAssociatedElementCallback, callbackData, false);
+
+    if (idTarget) {
+      if (nsCOMPtr<Element> element =
+              do_QueryReferent(observerData->mLastKnownAttrElement)) {
+        Element* lastAttrElement = element.get();
+        if (idTarget != lastAttrElement) {
+          IDTargetChangedAttrAssociatedElementCallback(lastAttrElement,
+                                                       idTarget, callbackData);
+        }
+      }
+      idTarget->AddReferenceTargetChangeObserver(
+          ReferenceTargetChangedAttrAssociatedElementCallback, callbackData);
+    }
+  }
+}
+
+void Element::RemoveDocOrShadowObserversForAttrAssociatedElement(
+    DocumentOrShadowRoot& aContainingDocOrShadow, nsAtom* aAttr) {
+  using AttrElementObserverData =
+      FragmentOrElement::nsExtendedDOMSlots::AttrElementObserverData;
+  using AttrElementObserverCallbackData =
+      FragmentOrElement::nsExtendedDOMSlots::AttrElementObserverCallbackData;
+
+  AttrElementObserverData* observerData = GetAttrElementObserverData(aAttr);
+  if (!observerData) {
+    return;
+  }
+
+  Element* explicitlySetAttrElement = GetExplicitlySetAttrElement(aAttr);
+  AttrElementObserverCallbackData* callbackData =
+      observerData->mCallbackData.get();
+
+  if (explicitlySetAttrElement) {
+    explicitlySetAttrElement->RemoveReferenceTargetChangeObserver(
+        ReferenceTargetChangedAttrAssociatedElementCallback, callbackData);
+  } else if (observerData->mLastKnownAttrValue) {
+    aContainingDocOrShadow.RemoveIDTargetObserver(
+        observerData->mLastKnownAttrValue,
+        IDTargetChangedAttrAssociatedElementCallback,
+        observerData->mCallbackData.get(), false);
+
+    Element* idTarget = aContainingDocOrShadow.GetElementById(
+        observerData->mLastKnownAttrValue);
+    if (idTarget) {
+      idTarget->RemoveReferenceTargetChangeObserver(
+          ReferenceTargetChangedAttrAssociatedElementCallback, callbackData);
+    }
+  }
+}
+
+void Element::BindAttrAssociatedElementObservers(
+    DocumentOrShadowRoot& aContainingDocOrShadow) {
+  if (const nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots()) {
+    for (const RefPtr<nsAtom>& attr : slots->mAttrElementObserverMap.Keys()) {
+      AddDocOrShadowObserversForAttrAssociatedElement(aContainingDocOrShadow,
+                                                      attr);
+    }
+  }
+}
+
+void Element::UnbindAttrAssociatedElementObservers(
+    DocumentOrShadowRoot& aContainingDocOrShadow) {
+  if (const nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots()) {
+    for (const RefPtr<nsAtom>& attr : slots->mAttrElementObserverMap.Keys()) {
+      RemoveDocOrShadowObserversForAttrAssociatedElement(aContainingDocOrShadow,
+                                                         attr);
+    }
+  }
+}
+
+void Element::AddReferenceTargetChangeObserver(
+    ReferenceTargetChangeObserver aObserver, void* aData) {
+  if (!StaticPrefs::dom_shadowdom_referenceTarget_enabled()) {
+    return;
+  }
+  ExtendedDOMSlots()->mReferenceTargetObservers.Insert({aObserver, aData});
+}
+
+void Element::RemoveReferenceTargetChangeObserver(
+    ReferenceTargetChangeObserver aObserver, void* aData) {
+  if (!StaticPrefs::dom_shadowdom_referenceTarget_enabled()) {
+    return;
+  }
+  nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots();
+  if (!slots) {
+    return;
+  }
+  slots->mReferenceTargetObservers.Remove({aObserver, aData});
+}
+
+void Element::NotifyReferenceTargetChanged() {
+  using ReferenceTargetChangeCallback =
+      FragmentOrElement::nsExtendedDOMSlots::ReferenceTargetChangeCallback;
+
+  nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots();
+  if (!slots) {
+    return;
+  }
+
+  AutoTArray<ReferenceTargetChangeCallback, 2> callbacks;
+  callbacks.SetCapacity(slots->mReferenceTargetObservers.Count());
+  for (auto iter = slots->mReferenceTargetObservers.begin();
+       iter != slots->mReferenceTargetObservers.end(); ++iter) {
+    const ReferenceTargetChangeCallback& from = *iter;
+    ReferenceTargetChangeCallback callback({from.mObserver, from.mData});
+    callbacks.AppendElement(callback);
+  }
+
+  for (const ReferenceTargetChangeCallback& callback : callbacks) {
+    if (!slots->mReferenceTargetObservers.Contains(callback)) {
+      continue;
+    }
+    bool keep = callback.mObserver(callback.mData);
+    if (!keep) {
+      slots->mReferenceTargetObservers.Remove(callback);
+    }
+  }
+}
+
+bool Element::HasVisibleScrollbars() {
+  ScrollContainerFrame* scrollFrame = GetScrollContainerFrame();
+  return scrollFrame && !scrollFrame->GetScrollbarVisibility().isEmpty();
+}
+
+void Element::PropagateBloomFilterToParents() {
+  Element* toUpdate = this;
+  Element* parent = GetParentElement();
+
+  while (parent) {
+    uint64_t childBloom = toUpdate->mAttrs.GetSubtreeBloomFilter();
+    uint64_t parentBloom = parent->mAttrs.GetSubtreeBloomFilter();
+
+    if ((parentBloom & childBloom) == childBloom) {
+      break;
+    }
+    parent->mAttrs.SetSubtreeBloomFilter(parentBloom | childBloom);
+    toUpdate = parent;
+    parent = toUpdate->GetParentElement();
+  }
+}
+
+static uint64_t HashClassesForBloom(const nsAttrValue* aValue) {
+  uint64_t filter = 1ULL;  
+  if (!aValue) {
+    return filter;
+  }
+
+  if (aValue->Type() == nsAttrValue::eAtomArray) {
+    const mozilla::AttrAtomArray* array = aValue->GetAtomArrayValue();
+    if (array) {
+      for (const RefPtr<nsAtom>& className : array->mArray) {
+        filter |= AttrArray::HashForBloomFilter(className);
+      }
+    }
+  } else if (aValue->Type() == nsAttrValue::eAtom) {
+    filter |= AttrArray::HashForBloomFilter(aValue->GetAtomValue());
+  }
+#ifdef DEBUG
+  else {
+    nsAutoString value;
+    aValue->ToString(value);
+    bool isOnlyWhitespace = true;
+    for (uint32_t i = 0; i < value.Length(); i++) {
+      if (!nsContentUtils::IsHTMLWhitespace(value[i])) {
+        isOnlyWhitespace = false;
+        break;
+      }
+    }
+    MOZ_ASSERT(isOnlyWhitespace, "Expecting only empty strings here.");
+  }
+#endif
+
+  return filter;
+}
+
+#ifdef DEBUG
+void Element::VerifySubtreeBloomFilter() const {
+  uint64_t expectedBloom = 1ULL;
+
+  uint32_t attrCount = GetAttrCount();
+  for (uint32_t i = 0; i < attrCount; i++) {
+    const nsAttrName* attrName = GetAttrNameAt(i);
+    MOZ_ASSERT(attrName, "Attribute name should not be null");
+    if (attrName->NamespaceEquals(kNameSpaceID_None)) {
+      nsAtom* localName = attrName->LocalName();
+      expectedBloom |= AttrArray::HashForBloomFilter(localName);
+
+      if (!localName->IsAsciiLowercase()) {
+        Document* doc = OwnerDoc();
+        if (!IsHTMLElement() && doc->IsHTMLDocument()) {
+          RefPtr<nsAtom> lowercaseAttr(localName);
+          ToLowerCaseASCII(lowercaseAttr);
+          expectedBloom |= AttrArray::HashForBloomFilter(lowercaseAttr);
+        }
+      }
+    }
+  }
+
+  expectedBloom |= HashClassesForBloom(GetClasses());
+
+  uint64_t localNameHash = NodeInfo()->NameBloomFilterHash();
+  MOZ_ASSERT(localNameHash ==
+             AttrArray::HashForBloomFilter(NodeInfo()->NameAtom()));
+  expectedBloom |= localNameHash;
+
+  for (Element* child = GetFirstElementChild(); child;
+       child = child->GetNextElementSibling()) {
+    expectedBloom |= child->mAttrs.GetSubtreeBloomFilter();
+  }
+
+  uint64_t actualBloom = mAttrs.GetSubtreeBloomFilter();
+  MOZ_ASSERT((actualBloom & expectedBloom) == expectedBloom,
+             "Bloom filter missing required bits");
+}
+#endif
+
+void Element::UpdateSubtreeBloomFilterForClass(const nsAttrValue* aClassValue) {
+  if (!aClassValue) {
+    return;
+  }
+  mAttrs.UpdateSubtreeBloomFilter(HashClassesForBloom(aClassValue));
+}
+
+void Element::UpdateSubtreeBloomFilterForAttribute(nsAtom* aAttribute) {
+  MOZ_ASSERT(aAttribute, "Attribute should not be null");
+  mAttrs.UpdateSubtreeBloomFilter(AttrArray::HashForBloomFilter(aAttribute));
+
+  if (!aAttribute->IsAsciiLowercase() && !IsHTMLElement()) {
+    RefPtr<nsAtom> lowercaseAttr(aAttribute);
+    ToLowerCaseASCII(lowercaseAttr);
+    mAttrs.UpdateSubtreeBloomFilter(
+        AttrArray::HashForBloomFilter(lowercaseAttr));
+  }
+}
+
+nsresult Element::BindToTree(BindContext& aContext, nsINode& aParent) {
+  MOZ_ASSERT(aParent.IsContent() || aParent.IsDocument(),
+             "Must have content or document parent!");
+  MOZ_ASSERT(aParent.OwnerDoc() == OwnerDoc(),
+             "Must have the same owner document");
+  MOZ_ASSERT(OwnerDoc() == &aContext.OwnerDoc(), "These should match too");
+  MOZ_ASSERT(!IsInUncomposedDoc(), "Already have a document.  Unbind first!");
+  MOZ_ASSERT(!IsInComposedDoc(), "Already have a document.  Unbind first!");
+  MOZ_ASSERT(!GetParentNode() || &aParent == GetParentNode(),
+             "Already have a parent.  Unbind first!");
+
+  const bool hadParent = !!GetParentNode();
+
+  if (aParent.IsInNativeAnonymousSubtree()) {
+    SetFlags(NODE_IS_IN_NATIVE_ANONYMOUS_SUBTREE);
+  }
+  if (IsRootOfNativeAnonymousSubtree()) {
+    aParent.SetMayHaveAnonymousChildren();
+  } else if (aParent.HasFlag(NODE_HAS_BEEN_IN_UA_WIDGET)) {
+    SetFlags(NODE_HAS_BEEN_IN_UA_WIDGET);
+  }
+  if (aParent.HasFlag(ELEMENT_IS_DATALIST_OR_HAS_DATALIST_ANCESTOR)) {
+    SetFlags(ELEMENT_IS_DATALIST_OR_HAS_DATALIST_ANCESTOR);
+  }
+  aParent.SetFlags(NODE_MAY_HAVE_ELEMENT_CHILDREN);
+
+  mParent = &aParent;
+  if (!hadParent && aParent.IsContent()) {
+    SetParentIsContent(true);
+    NS_ADDREF(mParent);
+  }
+  MOZ_ASSERT(!!GetParent() == aParent.IsContent());
+
+  MOZ_ASSERT_IF(!aContext.IsMove(),
+                !HasAnyOfFlags(Element::kAllServoDescendantBits));
+
+  SetSubtreeRootPointer(aParent.SubtreeRoot());
+  const bool connected = aParent.IsInComposedDoc();
+  SetIsConnected(connected);
+  if (connected) {
+    UnsetFlags(NODE_NEEDS_FRAME | NODE_DESCENDANTS_NEED_FRAMES);
+  }
+  if (aParent.IsInUncomposedDoc()) {
+    SetIsInDocument();
+  } else if (aParent.IsInShadowTree()) {
+    SetFlags(NODE_IS_IN_SHADOW_TREE);
+  }
+
+  if (connected) {
+    if (IsPendingMappedAttributeEvaluation()) {
+      aContext.OwnerDoc().ScheduleForPresAttrEvaluation(this);
+    }
+    if (CustomElementData* data = GetCustomElementData()) {
+      if (data->mState == CustomElementData::State::eCustom) {
+        nsContentUtils::EnqueueLifecycleCallback(
+            aContext.IsMove() ? ElementCallbackType::eConnectedMove
+                              : ElementCallbackType::eConnected,
+            this, {});
+      } else {
+        nsContentUtils::TryToUpgradeElement(this);
+      }
+    }
+  }
+
+  SetDirOnBind(this, nsIContent::FromNode(aParent));
+
+  UpdateEditableState(false);
+
+  nsresult rv;
+  if (ShadowRoot* shadowRoot = GetShadowRoot()) {
+    rv = shadowRoot->Bind();
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  {
+    for (nsIContent* child = GetFirstChild(); child;
+         child = child->GetNextSibling()) {
+      rv = child->BindToTree(aContext, *this);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+  }
+
+  MutationObservers::NotifyParentChainChanged(this);
+
+  if (aContext.SubtreeRootChanges()) {
+    if (HasPartAttribute()) {
+      if (ShadowRoot* shadow = GetContainingShadow()) {
+        shadow->PartAdded(*this);
+      }
+    }
+    if (HasID()) {
+      AddToIdTable(DoGetID());
+    }
+    HandleShadowDOMRelatedInsertionSteps(hadParent);
+  }
+
+  if (MayHaveStyle()) {
+    static_cast<nsStyledElement*>(this)->ReparseStyleAttribute(
+         false);
+  }
+
+  DocumentOrShadowRoot* containingDocOrShadow =
+      GetUncomposedDocOrConnectedShadowRoot();
+  if (containingDocOrShadow) {
+    BindAttrAssociatedElementObservers(*containingDocOrShadow);
+  }
+
+  MOZ_ASSERT(OwnerDoc() == aParent.OwnerDoc(), "Bound to wrong document");
+  MOZ_ASSERT(IsInComposedDoc() == aContext.InComposedDoc());
+  MOZ_ASSERT(IsInUncomposedDoc() == aContext.InUncomposedDoc());
+  MOZ_ASSERT(&aParent == GetParentNode(), "Bound to wrong parent node");
+  MOZ_ASSERT(aParent.IsInUncomposedDoc() == IsInUncomposedDoc());
+  MOZ_ASSERT(aParent.IsInComposedDoc() == IsInComposedDoc());
+  MOZ_ASSERT(aParent.IsInShadowTree() == IsInShadowTree());
+  MOZ_ASSERT(aParent.SubtreeRoot() == SubtreeRoot());
+
+#ifdef DEBUG
+  VerifySubtreeBloomFilter();
+#endif
+
+  PropagateBloomFilterToParents();
+  return NS_OK;
+}
+
+static bool WillDetachFromShadowOnUnbind(const Element& aElement,
+                                         bool aNullParent) {
+  return aElement.IsInShadowTree() &&
+         (aNullParent || !aElement.GetParent()->IsInShadowTree());
+}
+
+void Element::UnbindFromTree(UnbindContext& aContext) {
+  const bool nullParent = aContext.IsUnbindRoot(this);
+
+  DocumentOrShadowRoot* containingDocOrShadow =
+      GetUncomposedDocOrConnectedShadowRoot();
+  if (containingDocOrShadow) {
+    UnbindAttrAssociatedElementObservers(*containingDocOrShadow);
+  }
+
+  HandleShadowDOMRelatedRemovalSteps(nullParent);
+
+  if (HasFlag(ELEMENT_IN_CONTENT_IDENTIFIER_FOR_LCP)) {
+    OwnerDoc()->ContentIdentifiersForLCP().Remove(this);
+    UnsetFlags(ELEMENT_IN_CONTENT_IDENTIFIER_FOR_LCP);
+  }
+
+  if (HasFlag(ELEMENT_IS_DATALIST_OR_HAS_DATALIST_ANCESTOR) &&
+      !IsHTMLElement(nsGkAtoms::datalist)) {
+    if (nullParent) {
+      UnsetFlags(ELEMENT_IS_DATALIST_OR_HAS_DATALIST_ANCESTOR);
+    } else {
+      nsIContent* parent = GetParent();
+      MOZ_ASSERT(parent);
+      if (!parent->HasFlag(ELEMENT_IS_DATALIST_OR_HAS_DATALIST_ANCESTOR)) {
+        UnsetFlags(ELEMENT_IS_DATALIST_OR_HAS_DATALIST_ANCESTOR);
+      }
+    }
+  }
+
+  const bool detachingFromShadow =
+      WillDetachFromShadowOnUnbind(*this, nullParent);
+  if (IsInUncomposedDoc() || detachingFromShadow) {
+    RemoveFromIdTable();
+  }
+
+  if (detachingFromShadow && HasPartAttribute()) {
+    if (ShadowRoot* shadow = GetContainingShadow()) {
+      shadow->PartRemoved(*this);
+    }
+  }
+
+  Document* document = GetComposedDoc();
+
+  if (HasPointerLock()) {
+    PointerLockManager::Unlock("Element::UnbindFromTree");
+  }
+  if (!aContext.IsMove() && mState.HasState(ElementState::FULLSCREEN)) {
+    nsContentUtils::ReportToConsole(nsIScriptError::warningFlag, "DOM"_ns,
+                                    OwnerDoc(), PropertiesFile::DOM_PROPERTIES,
+                                    "RemovedFullscreenElement");
+    Document::ExitFullscreenInDocTree(OwnerDoc());
+  }
+
+  MOZ_ASSERT_IF(HasServoData(), document);
+  MOZ_ASSERT_IF(HasServoData() && !aContext.IsMove(),
+                IsInNativeAnonymousSubtree());
+  if (document && !aContext.IsMove()) {
+    ClearServoData(document);
+  }
+
+  if (!aContext.IsMove()) {
+    if (auto* data = GetAnimationData()) {
+      data->ClearAllAnimationCollections();
+    }
+  }
+
+  if (nullParent) {
+    if (GetParent()) {
+      RefPtr<nsINode> p;
+      p.swap(mParent);
+    } else {
+      mParent = nullptr;
+    }
+    SetParentIsContent(false);
+  }
+
+#ifdef DEBUG
+  if (document) {
+    nsPresContext* presContext = document->GetPresContext();
+    if (presContext) {
+      MOZ_ASSERT(this != presContext->GetViewportScrollStylesOverrideElement(),
+                 "Leaving behind a raw pointer to this element (as having "
+                 "propagated scrollbar styles) - that's dangerous...");
+    }
+  }
+
+#  ifdef ACCESSIBILITY
+  MOZ_ASSERT(!GetAccService() || !GetAccService()->HasAccessible(this),
+             "An accessible for this element still exists!");
+#  endif
+#endif
+
+  ClearInDocument();
+  SetIsConnected(false);
+  if (HasElementCreatedFromPrototypeAndHasUnmodifiedL10n()) {
+    if (document) {
+      document->mL10nProtoElements.Remove(this);
+    }
+    ClearElementCreatedFromPrototypeAndHasUnmodifiedL10n();
+  }
+
+  if (nullParent || !mParent->IsInShadowTree()) {
+    UnsetFlags(NODE_IS_IN_SHADOW_TREE);
+  }
+
+  SetSubtreeRootPointer(nullParent ? this : mParent->SubtreeRoot());
+
+  if (document) {
+    if (CustomElementData* data = GetCustomElementData()) {
+      if (data->mState == CustomElementData::State::eCustom) {
+        if (!aContext.IsMove()) {
+          nsContentUtils::EnqueueLifecycleCallback(
+              ElementCallbackType::eDisconnected, this, {});
+        }
+      } else {
+        nsContentUtils::UnregisterUnresolvedElement(this);
+      }
+    }
+
+    if (IsPendingMappedAttributeEvaluation()) {
+      document->UnscheduleForPresAttrEvaluation(this);
+    }
+
+    if (HasLastRememberedBSize() || HasLastRememberedISize()) {
+      document->ObserveForLastRememberedSize(*this);
+    }
+  }
+
+  ResetDir(this);
+
+  for (nsIContent* child = GetFirstChild(); child;
+       child = child->GetNextSibling()) {
+    child->UnbindFromTree(aContext);
+  }
+
+  MutationObservers::NotifyParentChainChanged(this);
+
+  if (ShadowRoot* shadowRoot = GetShadowRoot()) {
+    shadowRoot->Unbind();
+  }
+
+  MOZ_ASSERT_IF(!aContext.IsMove(), !HasAnyOfFlags(kAllServoDescendantBits));
+  MOZ_ASSERT_IF(!aContext.IsMove(),
+                !document || document->GetServoRestyleRoot() != this);
+}
+
+UniquePtr<SMILAttr> Element::GetAnimatedAttr(int32_t aNamespaceID,
+                                             nsAtom* aName) {
+  return nullptr;
+}
+
+nsDOMCSSAttributeDeclaration* Element::SMILOverrideStyle() {
+  Element::nsExtendedDOMSlots* slots = ExtendedDOMSlots();
+
+  if (!slots->mSMILOverrideStyle) {
+    slots->mSMILOverrideStyle = new nsDOMCSSAttributeDeclaration(this, true);
+  }
+
+  return slots->mSMILOverrideStyle;
+}
+
+StyleLockedDeclarationBlock* Element::GetSMILOverrideStyleDeclaration() {
+  Element::nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots();
+  return slots ? slots->mSMILOverrideStyleDeclaration.get() : nullptr;
+}
+
+void Element::SetSMILOverrideStyleDeclaration(
+    StyleLockedDeclarationBlock& aDeclaration) {
+  ExtendedDOMSlots()->mSMILOverrideStyleDeclaration = &aDeclaration;
+
+  if (Document* doc = GetComposedDoc()) {
+    if (PresShell* presShell = doc->GetPresShell()) {
+      presShell->RestyleForAnimation(this, RestyleHint::RESTYLE_SMIL);
+    }
+  }
+}
+
+bool Element::IsLabelable() const { return false; }
+
+bool Element::IsInteractiveHTMLContent() const { return false; }
+
+StyleLockedDeclarationBlock* Element::GetInlineStyleDeclaration() const {
+  if (!MayHaveStyle()) {
+    return nullptr;
+  }
+  const nsAttrValue* attrVal = mAttrs.GetAttr(nsGkAtoms::style);
+  if (!attrVal || attrVal->Type() != nsAttrValue::eCSSDeclaration) {
+    return nullptr;
+  }
+  return attrVal->GetCSSDeclarationValue()->Raw();
+}
+
+void Element::InlineStyleDeclarationWillChange(MutationClosureData& aData) {
+  MOZ_ASSERT_UNREACHABLE("Element::InlineStyleDeclarationWillChange");
+}
+
+nsresult Element::SetInlineStyleDeclaration(StyleLockedDeclarationBlock&,
+                                            MutationClosureData& aData) {
+  MOZ_ASSERT_UNREACHABLE("Element::SetInlineStyleDeclaration");
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP_(bool)
+Element::IsAttributeMapped(const nsAtom* aAttribute) const { return false; }
+
+nsMapRuleToAttributesFunc Element::GetAttributeMappingFunction() const {
+  return &MapNoAttributesInto;
+}
+
+void Element::MapNoAttributesInto(mozilla::MappedDeclarationsBuilder&) {}
+
+nsChangeHint Element::GetAttributeChangeHint(const nsAtom* aAttribute,
+                                             AttrModType) const {
+  return nsChangeHint(0);
+}
+
+void Element::SetMappedDeclarationBlock(
+    already_AddRefed<StyleLockedDeclarationBlock> aDeclarations) {
+  MOZ_ASSERT(IsPendingMappedAttributeEvaluation());
+  mAttrs.SetMappedDeclarationBlock(std::move(aDeclarations));
+  MOZ_ASSERT(!IsPendingMappedAttributeEvaluation());
+}
+
+bool Element::FindAttributeDependence(const nsAtom* aAttribute,
+                                      const MappedAttributeEntry* const aMaps[],
+                                      uint32_t aMapCount) {
+  for (uint32_t mapindex = 0; mapindex < aMapCount; ++mapindex) {
+    for (const MappedAttributeEntry* map = aMaps[mapindex]; map->attribute;
+         ++map) {
+      if (aAttribute == map->attribute) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+already_AddRefed<mozilla::dom::NodeInfo> Element::GetExistingAttrNameFromQName(
+    const nsAString& aStr) const {
+  const nsAttrName* name = InternalGetAttrNameFromQName(aStr);
+  if (!name) {
+    return nullptr;
+  }
+
+  RefPtr<mozilla::dom::NodeInfo> nodeInfo;
+  if (name->IsAtom()) {
+    nodeInfo = NodeInfoManager()->GetNodeInfo(
+        name->Atom(), nullptr, kNameSpaceID_None, ATTRIBUTE_NODE);
+  } else {
+    nodeInfo = name->NodeInfo();
+  }
+
+  return nodeInfo.forget();
+}
+
+bool Element::ShouldBlur(nsIContent* aContent) {
+  Document* document = aContent->GetComposedDoc();
+  if (!document) return false;
+
+  nsCOMPtr<nsPIDOMWindowOuter> window = document->GetWindow();
+  if (!window) return false;
+
+  nsCOMPtr<nsPIDOMWindowOuter> focusedFrame;
+  nsIContent* contentToBlur = nsFocusManager::GetFocusedDescendant(
+      window, nsFocusManager::eOnlyCurrentWindow, getter_AddRefs(focusedFrame));
+
+  if (!contentToBlur) {
+    return false;
+  }
+
+  if (contentToBlur == aContent) {
+    return true;
+  }
+
+  ShadowRoot* root = aContent->GetShadowRoot();
+  if (root && root->DelegatesFocus() &&
+      contentToBlur->IsShadowIncludingInclusiveDescendantOf(root)) {
+    return true;
+  }
+  return false;
+}
+
+nsresult Element::DispatchEvent(nsPresContext* aPresContext,
+                                WidgetEvent* aEvent, nsIContent* aTarget,
+                                bool aFullDispatch, nsEventStatus* aStatus) {
+  MOZ_ASSERT(aTarget, "Must have target");
+  MOZ_ASSERT(aEvent, "Must have source event");
+  MOZ_ASSERT(aStatus, "Null out param?");
+
+  if (!aPresContext) {
+    return NS_OK;
+  }
+
+  RefPtr<PresShell> presShell = aPresContext->GetPresShell();
+  if (!presShell) {
+    return NS_OK;
+  }
+
+  if (aFullDispatch) {
+    return presShell->HandleEventWithTarget(aEvent, nullptr, aTarget, aStatus);
+  }
+
+  return presShell->HandleDOMEventWithTarget(aTarget, aEvent, aStatus);
+}
+
+nsresult Element::DispatchClickEvent(nsPresContext* aPresContext,
+                                     WidgetInputEvent* aSourceEvent,
+                                     nsIContent* aTarget, bool aFullDispatch,
+                                     const EventFlags* aExtraEventFlags,
+                                     nsEventStatus* aStatus) {
+  MOZ_ASSERT(aTarget, "Must have target");
+  MOZ_ASSERT(aSourceEvent, "Must have source event");
+  MOZ_ASSERT(aStatus, "Null out param?");
+
+  WidgetPointerEvent event(aSourceEvent->IsTrusted(), ePointerClick,
+                           aSourceEvent->mWidget);
+  event.mRefPoint = aSourceEvent->mRefPoint;
+  uint32_t clickCount = 1;
+  float pressure = 0;
+  uint32_t pointerId = 0;  
+  uint16_t inputSource = 0;
+  WidgetMouseEvent* sourceMouseEvent = aSourceEvent->AsMouseEvent();
+  if (sourceMouseEvent) {
+    clickCount = sourceMouseEvent->mClickCount;
+    pressure = sourceMouseEvent->mPressure;
+    pointerId = sourceMouseEvent->pointerId;
+    inputSource = sourceMouseEvent->mInputSource;
+  } else if (aSourceEvent->mClass == eKeyboardEventClass) {
+    event.mFlags.mIsPositionless = true;
+    inputSource = MouseEvent_Binding::MOZ_SOURCE_KEYBOARD;
+    // > that were generated by something other than a pointing device.
+    pointerId = -1;
+  }
+  event.mPressure = pressure;
+  event.mClickCount = clickCount;
+  event.pointerId = pointerId;
+  event.mInputSource = inputSource;
+  event.mModifiers = aSourceEvent->mModifiers;
+  if (aExtraEventFlags) {
+    event.mFlags.Union(*aExtraEventFlags);
+  }
+
+  return DispatchEvent(aPresContext, &event, aTarget, aFullDispatch, aStatus);
+}
+
+nsresult Element::LeaveLink(nsPresContext* aPresContext) {
+  if (!aPresContext || !aPresContext->Document()->LinkHandlingEnabled()) {
+    return NS_OK;
+  }
+  nsIDocShell* shell = aPresContext->Document()->GetDocShell();
+  if (!shell) {
+    return NS_OK;
+  }
+  aPresContext->EventStateManager()->SetLinkOverFrame(nullptr);
+  return nsDocShell::Cast(shell)->OnLeaveLink();
+}
+
+void Element::SetEventHandler(nsAtom* aEventName, const nsAString& aValue,
+                              bool aDefer) {
+  Document* ownerDoc = OwnerDoc();
+  if (ownerDoc->IsLoadedAsData()) {
+    return;
+  }
+
+  MOZ_ASSERT(aEventName, "Must have event name!");
+  bool defer = true;
+  EventListenerManager* manager =
+      GetEventListenerManagerForAttr(aEventName, &defer);
+  if (!manager) {
+    return;
+  }
+
+  defer = defer && aDefer;  
+  manager->SetEventHandler(aEventName, aValue, defer,
+                           !nsContentUtils::IsChromeDoc(ownerDoc), this);
+}
+
+
+const nsAttrName* Element::InternalGetAttrNameFromQName(
+    const nsAString& aStr, nsAutoString* aNameToUse,
+    RefPtr<nsAtom>* aOutAtom) const {
+  MOZ_ASSERT(!aNameToUse || aNameToUse->IsEmpty());
+  const nsAttrName* val = nullptr;
+  if (IsHTMLElement() && IsInHTMLDocument()) {
+    nsAutoString lower;
+    nsAutoString& outStr = aNameToUse ? *aNameToUse : lower;
+    nsContentUtils::ASCIIToLower(aStr, outStr);
+    val = mAttrs.GetExistingAttrNameFromQName(outStr, aOutAtom);
+    if (val) {
+      outStr.Truncate();
+    }
+  } else {
+    val = mAttrs.GetExistingAttrNameFromQName(aStr, aOutAtom);
+    if (!val && aNameToUse) {
+      *aNameToUse = aStr;
+    }
+  }
+
+  return val;
+}
+
+bool Element::MaybeCheckSameAttrVal(int32_t aNamespaceID, const nsAtom* aName,
+                                    const nsAtom* aPrefix,
+                                    const nsAttrValueOrString& aValue,
+                                    bool aNotify, nsAttrValue& aOldValue,
+                                    AttrModType* aModType, bool* aOldValueSet) {
+  bool modification = false;
+  *aOldValueSet = false;
+
+  if (aNotify) {
+    BorrowedAttrInfo info(GetAttrInfo(aNamespaceID, aName));
+    if (info.mValue) {
+      if (GetCustomElementData()) {
+        aOldValue.SetToSerialized(*info.mValue);
+        *aOldValueSet = true;
+      }
+      bool valueMatches = aValue.EqualsAsStrings(*info.mValue);
+      if (valueMatches && aPrefix == info.mName->GetPrefix()) {
+        return true;
+      }
+      modification = true;
+    }
+  }
+  *aModType = modification ? AttrModType::Modification : AttrModType::Addition;
+  return false;
+}
+
+bool Element::OnlyNotifySameValueSet(int32_t aNamespaceID, nsAtom* aName,
+                                     nsAtom* aPrefix,
+                                     const nsAttrValueOrString& aValue,
+                                     bool aNotify, nsAttrValue& aOldValue,
+                                     AttrModType* aModType,
+                                     bool* aOldValueSet) {
+  if (!MaybeCheckSameAttrVal(aNamespaceID, aName, aPrefix, aValue, aNotify,
+                             aOldValue, aModType, aOldValueSet)) {
+    return false;
+  }
+
+  nsAutoScriptBlocker scriptBlocker;
+  OnAttrSetButNotChanged(aNamespaceID, aName, aValue, aNotify);
+  MutationObservers::NotifyAttributeSetToCurrentValue(this, aNamespaceID,
+                                                      aName);
+  return true;
+}
+
+nsresult Element::SetClassAttrFromParser(nsAtom* aValue) {
+
+  nsAttrValue value;
+  value.ParseAtomArray(aValue);
+
+  Document* document = GetComposedDoc();
+  mozAutoDocUpdate updateBatch(document, false);
+
+  SetMayHaveClass();
+
+  return SetAttrAndNotify(kNameSpaceID_None, nsGkAtoms::_class,
+                          nullptr,  
+                          nullptr,  
+                          value, nullptr, AttrModType::Addition,
+                          false,  
+                          kCallAfterSetAttr, document, updateBatch,
+                          IsKnownNewAttr::Yes);
+}
+
+nsresult Element::SetAttr(int32_t aNamespaceID, nsAtom* aName, nsAtom* aPrefix,
+                          const nsAString& aValue,
+                          nsIPrincipal* aSubjectPrincipal, bool aNotify,
+                          IsKnownNewAttr aIsKnownNew) {
+  const nsAttrValueOrString valueForComparison(aValue);
+  return SetAttrInternal(
+      aNamespaceID, aName, aPrefix, valueForComparison, aSubjectPrincipal,
+      aNotify,
+      [&](nsAttrValue& attrValue) {
+        if (!ParseAttribute(aNamespaceID, aName, aValue, aSubjectPrincipal,
+                            attrValue)) {
+          attrValue.SetTo(aValue);
+        }
+      },
+      aIsKnownNew);
+}
+
+nsresult Element::SetAndSwapAttr(nsAtom* aLocalName, nsAttrValue& aValue,
+                                 bool* aHadValue, IsKnownNewAttr aIsKnownNew) {
+  MOZ_TRY(mAttrs.SetAndSwapAttr(aLocalName, aValue, aHadValue, aIsKnownNew));
+
+  if (aLocalName == nsGkAtoms::_class) {
+    UpdateSubtreeBloomFilterForClass(GetClasses());
+  }
+  UpdateSubtreeBloomFilterForAttribute(aLocalName);
+  PropagateBloomFilterToParents();
+
+  return NS_OK;
+}
+
+nsresult Element::SetAndSwapAttr(mozilla::dom::NodeInfo* aName,
+                                 nsAttrValue& aValue, bool* aHadValue,
+                                 IsKnownNewAttr aIsKnownNew) {
+  MOZ_TRY(mAttrs.SetAndSwapAttr(aName, aValue, aHadValue, aIsKnownNew));
+
+  if (aName->NamespaceEquals(kNameSpaceID_None)) {
+    nsAtom* localName = aName->NameAtom();
+    if (localName == nsGkAtoms::_class) {
+      UpdateSubtreeBloomFilterForClass(GetClasses());
+    }
+    UpdateSubtreeBloomFilterForAttribute(localName);
+    PropagateBloomFilterToParents();
+  }
+
+  return NS_OK;
+}
+
+nsresult Element::SetAttr(int32_t aNamespaceID, nsAtom* aName, nsAtom* aPrefix,
+                          nsAtom* aValue, nsIPrincipal* aSubjectPrincipal,
+                          bool aNotify) {
+  const nsDependentAtomString valueString(aValue);
+  const nsAttrValueOrString valueForComparison(valueString);
+  return SetAttrInternal(
+      aNamespaceID, aName, aPrefix, valueForComparison, aSubjectPrincipal,
+      aNotify,
+      [&](nsAttrValue& attrValue) {
+        if (!ParseAttribute(aNamespaceID, aName, valueString, aSubjectPrincipal,
+                            attrValue)) {
+          attrValue.SetTo(aValue);
+        }
+      },
+      IsKnownNewAttr::No);
+}
+
+template <typename ParseFunc>
+nsresult Element::SetAttrInternal(int32_t aNamespaceID, nsAtom* aName,
+                                  nsAtom* aPrefix,
+                                  const nsAttrValueOrString& aValue,
+                                  nsIPrincipal* aSubjectPrincipal, bool aNotify,
+                                  ParseFunc&& aParseFn,
+                                  IsKnownNewAttr aIsKnownNew) {
+  NS_ENSURE_ARG_POINTER(aName);
+  NS_ASSERTION(aNamespaceID != kNameSpaceID_Unknown,
+               "Don't call SetAttr with unknown namespace");
+
+  AttrModType modType{0};  
+  nsAttrValue oldValue;
+  bool oldValueSet = false;
+
+  if (aIsKnownNew == IsKnownNewAttr::Yes) {
+    MOZ_ASSERT(mAttrs.IndexOfAttr(aName, aNamespaceID) == -1,
+               "Caller asserted attribute is new but it already exists");
+    modType = AttrModType::Addition;
+  } else if (OnlyNotifySameValueSet(aNamespaceID, aName, aPrefix, aValue,
+                                    aNotify, oldValue, &modType,
+                                    &oldValueSet)) {
+    return NS_OK;
+  }
+
+  Document* document = GetComposedDoc();
+  mozAutoDocUpdate updateBatch(document, aNotify);
+
+  if (aNotify) {
+    MutationObservers::NotifyAttributeWillChange(this, aNamespaceID, aName,
+                                                 modType);
+  }
+
+  nsAttrValue attrValue;
+  aParseFn(attrValue);
+
+  if (aName->IsStatic()) {
+    BeforeSetAttr(aNamespaceID, aName, &attrValue, aNotify);
+  }
+
+  return SetAttrAndNotify(
+      aNamespaceID, aName, aPrefix, oldValueSet ? &oldValue : nullptr,
+      attrValue, aSubjectPrincipal, modType, aNotify, kCallAfterSetAttr,
+      document, updateBatch, aIsKnownNew);
+}
+
+nsresult Element::SetParsedAttr(int32_t aNamespaceID, nsAtom* aName,
+                                nsAtom* aPrefix, nsAttrValue& aParsedValue,
+                                bool aNotify, IsKnownNewAttr aIsKnownNew) {
+
+  NS_ENSURE_ARG_POINTER(aName);
+  NS_ASSERTION(aNamespaceID != kNameSpaceID_Unknown,
+               "Don't call SetAttr with unknown namespace");
+
+  AttrModType modType{0};  
+  nsAttrValue oldValue;
+  bool oldValueSet = false;
+
+  if (aIsKnownNew == IsKnownNewAttr::Yes) {
+    MOZ_ASSERT(mAttrs.IndexOfAttr(aName, aNamespaceID) == -1,
+               "Caller asserted attribute is new but it already exists");
+    modType = AttrModType::Addition;
+  } else {
+    const nsAttrValueOrString value(aParsedValue);
+    if (OnlyNotifySameValueSet(aNamespaceID, aName, aPrefix, value, aNotify,
+                               oldValue, &modType, &oldValueSet)) {
+      return NS_OK;
+    }
+  }
+
+  Document* document = GetComposedDoc();
+  mozAutoDocUpdate updateBatch(document, aNotify);
+
+  if (aNotify) {
+    MutationObservers::NotifyAttributeWillChange(this, aNamespaceID, aName,
+                                                 modType);
+  }
+
+  if (aName->IsStatic()) {
+    BeforeSetAttr(aNamespaceID, aName, &aParsedValue, aNotify);
+  }
+
+  return SetAttrAndNotify(aNamespaceID, aName, aPrefix,
+                          oldValueSet ? &oldValue : nullptr, aParsedValue,
+                          nullptr, modType, aNotify, kCallAfterSetAttr,
+                          document, updateBatch, aIsKnownNew);
+}
+
+static MOZ_ALWAYS_INLINE void SetLifecycleCallbackNamespaceURI(
+    LifecycleCallbackArgs& aArgs, int32_t aNamespaceID) {
+  if (aNamespaceID == kNameSpaceID_None) {
+    aArgs.mNamespaceURI = VoidString();
+    return;
+  }
+  nsNameSpaceManager::GetInstance()->GetNameSpaceURI(aNamespaceID,
+                                                     aArgs.mNamespaceURI);
+  if (aArgs.mNamespaceURI.IsEmpty()) {
+    aArgs.mNamespaceURI.SetIsVoid(true);
+  }
+}
+
+nsresult Element::SetNoNameSpaceAttrOnNewlyCreatedElement(
+    already_AddRefed<nsAtom> aName, nsHtml5String& aValue,
+    bool& aIsPendingMappedAttributeEvaluation) {
+  MOZ_ASSERT(aValue);
+  MOZ_ASSERT(IsHTMLElement());
+  MOZ_ASSERT(!GetParentNode());
+  RefPtr<nsAtom> nameRef = aName;
+  MOZ_ASSERT(nameRef);
+  nsAtom* namePtr = nameRef.get();
+  nsAttrValue value;
+
+
+  if (aValue.IsAtom()) {
+    if (NS_IS_ATOM_ARRAY_ATTRIBUTE(namePtr) ||
+        NS_IS_ATOM_ARRAY_ATTRIBUTE_HTML(namePtr) ||
+        (namePtr == nsGkAtoms::_for && IsHTMLElement(nsGkAtoms::output))) {
+      value.ParseAtomArray(aValue.AsAtom());
+      if (namePtr == nsGkAtoms::_class) {
+        SetMayHaveClass();
+        UpdateSubtreeBloomFilterForClass(&value);
+      }
+    } else {
+      RefPtr<nsAtom> valueAtom = aValue.ForgetAtom();
+      if (namePtr == nsGkAtoms::contenteditable) {
+        SetMayHaveContentEditableAttr();
+      } else {
+        if (valueAtom->GetLength() == 1) {
+          if (namePtr != nsGkAtoms::data_priority) {
+            const char16_t* strPtr = valueAtom->GetUTF16String();
+            char16_t c = *strPtr;
+            if (c >= u'0' && c <= u'9') {
+              nsString str;  
+              valueAtom->ToString(str);
+              if (ParseAttribute(kNameSpaceID_None, namePtr, str, nullptr,
+                                 value)) {
+                valueAtom = nullptr;
+              } else if (namePtr == nsGkAtoms::selected &&
+                         IsHTMLElement(nsGkAtoms::option)) {
+                SetStates(ElementState::CHECKED, true, false);
+              }
+            }
+          }
+        } else {
+          MOZ_ASSERT(NS_IS_ATOM_ATTRIBUTE(namePtr) ||
+                     NS_IS_ATOM_ATTRIBUTE_HTML(namePtr));
+        }
+      }
+      if (valueAtom) {
+        value.SetToAssumeUnset(valueAtom.forget());
+      }  
+    }
+  } else {
+    if (namePtr == nsGkAtoms::style) {
+      SetMayHaveStyle();
+    }
+    nsString str;          
+    aValue.ToString(str);  
+    if (!ParseAttribute(kNameSpaceID_None, namePtr, str, nullptr, value)) {
+      if (aValue.IsStringBuffer()) {
+        MOZ_ASSERT(!(NS_IS_ATOM_ARRAY_ATTRIBUTE(namePtr) ||
+                     NS_IS_ATOM_ARRAY_ATTRIBUTE_HTML(namePtr) ||
+                     NS_IS_ATOM_ATTRIBUTE(namePtr) ||
+                     NS_IS_ATOM_ATTRIBUTE_HTML(namePtr)));
+        value.SetToAssumeUnset(aValue.ForgetStringBuffer());
+      }  
+      if (namePtr == nsGkAtoms::selected && IsHTMLElement(nsGkAtoms::option)) {
+        SetStates(ElementState::CHECKED, true, false);
+      }
+    } else if (namePtr == nsGkAtoms::contenteditable) {
+      SetMayHaveContentEditableAttr();
+    }
+  }
+
+
+  const nsAttrValue* valuePtr =
+      mAttrs.AddNewAttributeAssumeAvailableSlot(nameRef, value);
+  UpdateSubtreeBloomFilterForAttribute(namePtr);
+  if (!aIsPendingMappedAttributeEvaluation && IsAttributeMapped(namePtr)) {
+    aIsPendingMappedAttributeEvaluation = true;
+    mAttrs.InfallibleMarkAsPendingPresAttributeEvaluation();
+  }
+
+
+
+  if (namePtr->IsStatic()) {
+    AfterSetAttr(kNameSpaceID_None, namePtr, valuePtr, nullptr, nullptr, false);
+  }
+
+  return NS_OK;
+}
+
+nsresult Element::SetAttrAndNotify(
+    int32_t aNamespaceID, nsAtom* aName, nsAtom* aPrefix,
+    const nsAttrValue* aOldValue, nsAttrValue& aParsedValue,
+    nsIPrincipal* aSubjectPrincipal, AttrModType aModType, bool aNotify,
+    bool aCallAfterSetAttr, Document* aComposedDocument,
+    const mozAutoDocUpdate& aGuard, IsKnownNewAttr aIsKnownNew) {
+  nsMutationGuard::DidMutate();
+
+  nsAttrValue valueForAfterSetAttr;
+  if (aCallAfterSetAttr || GetCustomElementData()) {
+    valueForAfterSetAttr.SetTo(aParsedValue);
+  }
+
+  bool hadValidDir = false;
+  bool hadDirAuto = false;
+  bool oldValueSet;
+
+  if (aNamespaceID == kNameSpaceID_None) {
+    if (aName == nsGkAtoms::dir) {
+      hadValidDir = HasValidDir() || IsHTMLElement(nsGkAtoms::bdi);
+      hadDirAuto = HasDirAuto();  
+    }
+
+    MOZ_TRY(SetAndSwapAttr(aName, aParsedValue, &oldValueSet, aIsKnownNew));
+    if (IsAttributeMapped(aName) && !IsPendingMappedAttributeEvaluation()) {
+      mAttrs.InfallibleMarkAsPendingPresAttributeEvaluation();
+      if (Document* doc = GetComposedDoc()) {
+        doc->ScheduleForPresAttrEvaluation(this);
+      }
+    }
+  } else {
+    RefPtr<mozilla::dom::NodeInfo> ni = NodeInfoManager()->GetNodeInfo(
+        aName, aPrefix, aNamespaceID, ATTRIBUTE_NODE);
+    MOZ_TRY(SetAndSwapAttr(ni, aParsedValue, &oldValueSet, aIsKnownNew));
+  }
+
+  const nsAttrValue* oldValue;
+  if (aParsedValue.StoresOwnData()) {
+    if (oldValueSet) {
+      oldValue = &aParsedValue;
+    } else {
+      oldValue = nullptr;
+    }
+  } else {
+    oldValue = aOldValue;
+  }
+
+  if (HasElementCreatedFromPrototypeAndHasUnmodifiedL10n() &&
+      aNamespaceID == kNameSpaceID_None &&
+      (aName == nsGkAtoms::datal10nid || aName == nsGkAtoms::datal10nargs)) {
+    ClearElementCreatedFromPrototypeAndHasUnmodifiedL10n();
+    if (aComposedDocument) {
+      aComposedDocument->mL10nProtoElements.Remove(this);
+    }
+  }
+
+  const CustomElementData* data = GetCustomElementData();
+  if (data && data->mState == CustomElementData::State::eCustom) {
+    CustomElementDefinition* definition = data->GetCustomElementDefinition();
+    MOZ_ASSERT(definition, "Should have a valid CustomElementDefinition");
+
+    if (definition->IsInObservedAttributeList(aName)) {
+      LifecycleCallbackArgs args;
+      args.mName = aName;
+      if (aModType == AttrModType::Addition) {
+        args.mOldValue = VoidString();
+      } else {
+        if (oldValue) {
+          oldValue->ToString(args.mOldValue);
+        } else {
+          aParsedValue.ToString(args.mOldValue);
+        }
+      }
+      valueForAfterSetAttr.ToString(args.mNewValue);
+      SetLifecycleCallbackNamespaceURI(args, aNamespaceID);
+
+      nsContentUtils::EnqueueLifecycleCallback(
+          ElementCallbackType::eAttributeChanged, this, args, definition);
+    }
+  }
+
+  if (aCallAfterSetAttr && aName->IsStatic()) {
+    AfterSetAttr(aNamespaceID, aName, &valueForAfterSetAttr, oldValue,
+                 aSubjectPrincipal, aNotify);
+
+    if (aNamespaceID == kNameSpaceID_None && aName == nsGkAtoms::dir) {
+      OnSetDirAttr(this, &valueForAfterSetAttr, hadValidDir, hadDirAuto,
+                   aNotify);
+    }
+  }
+
+  if (aNotify) {
+    MutationObservers::NotifyAttributeChanged(
+        this, aNamespaceID, aName, aModType,
+        aParsedValue.StoresOwnData() ? &aParsedValue : nullptr);
+  }
+
+  return NS_OK;
+}
+
+void Element::ReserveAttributeCount(uint32_t aAttributeCount) {
+  if (!mAttrs.GrowTo(aAttributeCount)) {
+    MOZ_CRASH("Could not allocate memory for attributes.");
+  }
+}
+
+bool Element::ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                             const nsAString& aValue,
+                             nsIPrincipal* aMaybeScriptedPrincipal,
+                             nsAttrValue& aResult) {
+  if (aAttribute == nsGkAtoms::lang) {
+    aResult.ParseAtom(aValue);
+    return true;
+  }
+
+  if (aAttribute == nsGkAtoms::form || aAttribute == nsGkAtoms::_for) {
+    aResult.ParseAtom(aValue);
+    return true;
+  }
+
+  if (aNamespaceID == kNameSpaceID_None) {
+    if (NS_IS_ATOM_ARRAY_ATTRIBUTE(aAttribute)) {
+      aResult.ParseAtomArray(aValue);
+      return true;
+    }
+
+    if (aAttribute == nsGkAtoms::exportparts) {
+      aResult.ParsePartMapping(aValue);
+      return true;
+    }
+
+    if (aAttribute == nsGkAtoms::aria_activedescendant) {
+      aResult.ParseAtom(aValue);
+      return true;
+    }
+
+    if (aAttribute == nsGkAtoms::id) {
+      if (aValue.IsEmpty()) {
+        return false;
+      }
+      aResult.ParseAtom(aValue);
+      return true;
+    }
+    MOZ_ASSERT(!(NS_IS_ATOM_ATTRIBUTE(aAttribute) ||
+                 NS_IS_ATOM_ARRAY_ATTRIBUTE(aAttribute)));
+  }
+  return false;
+}
+
+void Element::BeforeSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                            const nsAttrValue* aValue, bool aNotify) {
+  MOZ_ASSERT(aName->IsStatic());
+  if (aNamespaceID != kNameSpaceID_None) {
+    return;
+  }
+  if (aName == nsGkAtoms::_class && aValue) {
+    SetMayHaveClass();
+  }
+  if (aName == nsGkAtoms::id) {
+    PreIdMaybeChange(aValue);
+  }
+}
+
+void Element::AfterSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                           const nsAttrValue* aValue,
+                           const nsAttrValue* aOldValue,
+                           nsIPrincipal* aMaybeScriptedPrincipal,
+                           bool aNotify) {
+  MOZ_ASSERT(aName->IsStatic());
+  if (aNamespaceID != kNameSpaceID_None) {
+    return;
+  }
+  if (aName == nsGkAtoms::id) {
+    PostIdMaybeChange(aValue);
+  } else if (aName == nsGkAtoms::part) {
+    bool isPart = !!aValue;
+    if (HasPartAttribute() != isPart) {
+      SetHasPartAttribute(isPart);
+      if (ShadowRoot* shadow = GetContainingShadow()) {
+        if (isPart) {
+          shadow->PartAdded(*this);
+        } else {
+          shadow->PartRemoved(*this);
+        }
+      }
+    }
+    MOZ_ASSERT(HasPartAttribute() == isPart);
+  } else if (aName == nsGkAtoms::slot && GetParent()) {
+    if (ShadowRoot* shadow = GetParent()->GetShadowRoot()) {
+      shadow->MaybeReassignContent(*this);
+    }
+  } else if (aName == nsGkAtoms::aria_activedescendant) {
+    ClearExplicitlySetAttrElement(aName);
+    IDREFAttributeValueChanged(aName, aValue);
+  } else if (aName == nsGkAtoms::aria_controls ||
+             aName == nsGkAtoms::aria_describedby ||
+             aName == nsGkAtoms::aria_details ||
+             aName == nsGkAtoms::aria_errormessage ||
+             aName == nsGkAtoms::aria_flowto ||
+             aName == nsGkAtoms::aria_labelledby ||
+             aName == nsGkAtoms::aria_owns) {
+    ClearExplicitlySetAttrElements(aName);
+  }
+}
+
+void Element::PreIdMaybeChange(const nsAttrValue* aValue) {
+  RemoveFromIdTable();
+}
+
+void Element::PostIdMaybeChange(const nsAttrValue* aValue) {
+  if (aValue && !aValue->IsEmptyString()) {
+    SetHasID();
+    AddToIdTable(aValue->GetAtomValue());
+  } else {
+    ClearHasID();
+  }
+}
+
+void Element::OnAttrSetButNotChanged(int32_t aNamespaceID, nsAtom* aName,
+                                     const nsAttrValueOrString& aValue,
+                                     bool aNotify) {
+  const CustomElementData* data = GetCustomElementData();
+  if (data && data->mState == CustomElementData::State::eCustom) {
+    CustomElementDefinition* definition = data->GetCustomElementDefinition();
+    MOZ_ASSERT(definition, "Should have a valid CustomElementDefinition");
+
+    if (definition->IsInObservedAttributeList(aName)) {
+      nsAutoString value(aValue.String());
+      LifecycleCallbackArgs args;
+      args.mName = aName;
+      args.mOldValue = value;
+      args.mNewValue = std::move(value);
+      SetLifecycleCallbackNamespaceURI(args, aNamespaceID);
+
+      nsContentUtils::EnqueueLifecycleCallback(
+          ElementCallbackType::eAttributeChanged, this, args, definition);
+    }
+  }
+
+  if (aNamespaceID == kNameSpaceID_None &&
+      aName == nsGkAtoms::aria_activedescendant) {
+    ClearExplicitlySetAttrElement(aName);
+  }
+
+  if (aNamespaceID == kNameSpaceID_None &&
+      (aName == nsGkAtoms::aria_controls ||
+       aName == nsGkAtoms::aria_describedby ||
+       aName == nsGkAtoms::aria_details ||
+       aName == nsGkAtoms::aria_errormessage ||
+       aName == nsGkAtoms::aria_flowto || aName == nsGkAtoms::aria_labelledby ||
+       aName == nsGkAtoms::aria_owns)) {
+    ClearExplicitlySetAttrElements(aName);
+  }
+}
+
+EventListenerManager* Element::GetEventListenerManagerForAttr(nsAtom* aAttrName,
+                                                              bool* aDefer) {
+  *aDefer = true;
+  return GetOrCreateListenerManager();
+}
+
+bool Element::GetAttr(const nsAtom* aName, nsAString& aResult) const {
+  const nsAttrValue* val = mAttrs.GetAttr(aName);
+  if (!val) {
+    aResult.Truncate();
+    return false;
+  }
+  val->ToString(aResult);
+  return true;
+}
+
+bool Element::GetAttr(int32_t aNameSpaceID, const nsAtom* aName,
+                      nsAString& aResult) const {
+  const nsAttrValue* val = mAttrs.GetAttr(aName, aNameSpaceID);
+  if (!val) {
+    aResult.Truncate();
+    return false;
+  }
+  val->ToString(aResult);
+  return true;
+}
+
+int32_t Element::FindAttrValueIn(int32_t aNameSpaceID, const nsAtom* aName,
+                                 AttrArray::AttrValuesArray* aValues,
+                                 nsCaseTreatment aCaseSensitive) const {
+  return mAttrs.FindAttrValueIn(aNameSpaceID, aName, aValues, aCaseSensitive);
+}
+
+nsresult Element::UnsetAttr(int32_t aNameSpaceID, nsAtom* aName, bool aNotify) {
+  NS_ASSERTION(nullptr != aName, "must have attribute name");
+
+  int32_t index = mAttrs.IndexOfAttr(aName, aNameSpaceID);
+  if (index < 0) {
+    return NS_OK;
+  }
+
+  Document* document = GetComposedDoc();
+  mozAutoDocUpdate updateBatch(document, aNotify);
+
+  if (aNotify) {
+    MutationObservers::NotifyAttributeWillChange(this, aNameSpaceID, aName,
+                                                 AttrModType::Removal);
+  }
+
+  if (aName->IsStatic()) {
+    BeforeSetAttr(aNameSpaceID, aName, nullptr, aNotify);
+  }
+
+  nsDOMSlots* slots = GetExistingDOMSlots();
+  if (slots && slots->mAttributeMap) {
+    slots->mAttributeMap->DropAttribute(aNameSpaceID, aName);
+  }
+
+  nsMutationGuard::DidMutate();
+
+  bool hadValidDir = false;
+  bool hadDirAuto = false;
+
+  if (aNameSpaceID == kNameSpaceID_None) {
+    if (aName == nsGkAtoms::dir) {
+      hadValidDir = HasValidDir() || IsHTMLElement(nsGkAtoms::bdi);
+      hadDirAuto = HasDirAuto();  
+    }
+    if (IsAttributeMapped(aName) && !IsPendingMappedAttributeEvaluation()) {
+      mAttrs.InfallibleMarkAsPendingPresAttributeEvaluation();
+      if (Document* doc = GetComposedDoc()) {
+        doc->ScheduleForPresAttrEvaluation(this);
+      }
+    }
+  }
+
+  nsAttrValue oldValue;
+  MOZ_TRY(mAttrs.RemoveAttrAt(index, oldValue));
+
+  const CustomElementData* data = GetCustomElementData();
+  if (data && data->mState == CustomElementData::State::eCustom) {
+    CustomElementDefinition* definition = data->GetCustomElementDefinition();
+    MOZ_ASSERT(definition, "Should have a valid CustomElementDefinition");
+    if (definition->IsInObservedAttributeList(aName)) {
+      LifecycleCallbackArgs args;
+      args.mName = aName;
+      oldValue.ToString(args.mOldValue);
+      args.mNewValue = VoidString();
+      SetLifecycleCallbackNamespaceURI(args, aNameSpaceID);
+      nsContentUtils::EnqueueLifecycleCallback(
+          ElementCallbackType::eAttributeChanged, this, args, definition);
+    }
+  }
+
+  if (aName->IsStatic()) {
+    AfterSetAttr(aNameSpaceID, aName, nullptr, &oldValue, nullptr, aNotify);
+  }
+
+  if (aNotify) {
+    MutationObservers::NotifyAttributeChanged(this, aNameSpaceID, aName,
+                                              AttrModType::Removal, &oldValue);
+  }
+
+  if (aNameSpaceID == kNameSpaceID_None && aName == nsGkAtoms::dir) {
+    OnSetDirAttr(this, nullptr, hadValidDir, hadDirAuto, aNotify);
+  }
+
+  return NS_OK;
+}
+
+void Element::DescribeAttribute(uint32_t index,
+                                nsAString& aOutDescription) const {
+  mAttrs.AttrNameAt(index)->GetQualifiedName(aOutDescription);
+
+  aOutDescription.AppendLiteral("=\"");
+  nsAutoString value;
+  mAttrs.AttrAt(index)->ToString(value);
+  for (uint32_t i = value.Length(); i > 0; --i) {
+    if (value[i - 1] == char16_t('"')) value.Insert(char16_t('\\'), i - 1);
+  }
+  aOutDescription.Append(value);
+  aOutDescription.Append('"');
+}
+
+#ifdef MOZ_DOM_LIST
+void Element::ListAttributes(FILE* out) const {
+  uint32_t index, count = mAttrs.AttrCount();
+  for (index = 0; index < count; index++) {
+    nsAutoString attributeDescription;
+    DescribeAttribute(index, attributeDescription);
+
+    fputs(" ", out);
+    fputs(NS_LossyConvertUTF16toASCII(attributeDescription).get(), out);
+  }
+}
+
+void Element::List(FILE* out, int32_t aIndent, const nsCString& aPrefix) const {
+  int32_t indent;
+  for (indent = aIndent; --indent >= 0;) fputs("  ", out);
+
+  fputs(aPrefix.get(), out);
+
+  fputs(NS_LossyConvertUTF16toASCII(mNodeInfo->QualifiedName()).get(), out);
+
+  fprintf(out, "@%p", (void*)this);
+
+  ListAttributes(out);
+
+  fprintf(out, " state=[%llx]",
+          static_cast<unsigned long long>(State().GetInternalValue()));
+  fprintf(out, " flags=[%08x]", static_cast<unsigned int>(GetFlags()));
+  fprintf(out, " selectorflags=[%08x]",
+          static_cast<unsigned int>(GetSelectorFlags()));
+  if (IsClosestCommonInclusiveAncestorForRangeInSelection()) {
+    const LinkedList<AbstractRange>* ranges =
+        GetExistingClosestCommonInclusiveAncestorRanges();
+    int32_t count = 0;
+    if (ranges) {
+      for (const AbstractRange* r = ranges->getFirst(); r; r = r->getNext()) {
+        ++count;
+      }
+    }
+    fprintf(out, " ranges:%d", count);
+  }
+  fprintf(out, " primaryframe=%p", static_cast<void*>(GetPrimaryFrame()));
+  fprintf(out, " refcount=%" PRIuPTR "<", mRefCnt.get());
+
+  nsIContent* child = GetFirstChild();
+  if (child) {
+    fputs("\n", out);
+
+    for (; child; child = child->GetNextSibling()) {
+      child->List(out, aIndent + 1);
+    }
+
+    for (indent = aIndent; --indent >= 0;) fputs("  ", out);
+  }
+
+  fputs(">\n", out);
+}
+
+void Element::DumpContent(FILE* out, int32_t aIndent, bool aDumpAll) const {
+  int32_t indent;
+  for (indent = aIndent; --indent >= 0;) fputs("  ", out);
+
+  const nsString& buf = mNodeInfo->QualifiedName();
+  fputs("<", out);
+  fputs(NS_LossyConvertUTF16toASCII(buf).get(), out);
+
+  if (aDumpAll) ListAttributes(out);
+
+  fputs(">", out);
+
+  if (aIndent) fputs("\n", out);
+
+  for (nsIContent* child = GetFirstChild(); child;
+       child = child->GetNextSibling()) {
+    int32_t indent = aIndent ? aIndent + 1 : 0;
+    child->DumpContent(out, indent, aDumpAll);
+  }
+  for (indent = aIndent; --indent >= 0;) fputs("  ", out);
+  fputs("</", out);
+  fputs(NS_LossyConvertUTF16toASCII(buf).get(), out);
+  fputs(">", out);
+
+  if (aIndent) fputs("\n", out);
+}
+#endif
+
+void Element::Describe(nsAString& aOutDescription,
+                       DescriptionKind aKind) const {
+  aOutDescription.Append(mNodeInfo->QualifiedName());
+  aOutDescription.AppendPrintf("@%p", (void*)this);
+
+  uint32_t index, count = mAttrs.AttrCount();
+  for (index = 0; index < count; index++) {
+    if (aKind != DescriptionKind::AllAttributes) {
+      bool includeClass = (aKind == DescriptionKind::IdAndClass);
+      const nsAttrName* name = mAttrs.AttrNameAt(index);
+      if (!name->Equals(nsGkAtoms::id) &&
+          !(includeClass && name->Equals(nsGkAtoms::_class))) {
+        continue;
+      }
+    }
+    aOutDescription.Append(' ');
+    nsAutoString attributeDescription;
+    DescribeAttribute(index, attributeDescription);
+    aOutDescription.Append(attributeDescription);
+  }
+}
+
+bool Element::CheckHandleEventForLinksPrecondition(
+    EventChainVisitor& aVisitor) const {
+  if (!IsLink()) {
+    return false;
+  }
+  if (aVisitor.mEventStatus == nsEventStatus_eConsumeNoDefault ||
+      (!aVisitor.mEvent->IsTrusted() &&
+       (aVisitor.mEvent->mMessage != ePointerClick) &&
+       (aVisitor.mEvent->mMessage != eKeyPress) &&
+       (aVisitor.mEvent->mMessage != eLegacyDOMActivate)) ||
+      aVisitor.mEvent->mFlags.mMultipleActionsPrevented) {
+    return false;
+  }
+  return true;
+}
+
+void Element::GetEventTargetParentForLinks(EventChainPreVisitor& aVisitor) {
+  switch (aVisitor.mEvent->mMessage) {
+    case eMouseOver:
+    case eFocus:
+    case eMouseOut:
+    case eBlur:
+      break;
+    default:
+      return;
+  }
+
+  if (!CheckHandleEventForLinksPrecondition(aVisitor)) {
+    return;
+  }
+
+  nsCOMPtr<nsIURI> absURI = GetHrefURI();
+  if (!absURI) {
+    return;
+  }
+
+  switch (aVisitor.mEvent->mMessage) {
+    case eMouseOver:
+      aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+      [[fallthrough]];
+    case eFocus: {
+      InternalFocusEvent* focusEvent = aVisitor.mEvent->AsFocusEvent();
+      if (!focusEvent || !focusEvent->mIsRefocus) {
+        nsAutoString target;
+        GetLinkTarget(target);
+        nsContentUtils::TriggerLinkMouseOver(this, absURI, target);
+        aVisitor.mEvent->mFlags.mMultipleActionsPrevented = true;
+      }
+      break;
+    }
+    case eMouseOut:
+      aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+      [[fallthrough]];
+    case eBlur: {
+      nsresult rv = LeaveLink(aVisitor.mPresContext);
+      if (NS_SUCCEEDED(rv)) {
+        aVisitor.mEvent->mFlags.mMultipleActionsPrevented = true;
+      }
+      break;
+    }
+
+    default:
+      MOZ_ASSERT_UNREACHABLE("switch statements not in sync");
+  }
+}
+
+void Element::DispatchChromeOnlyLinkClickEvent(
+    EventChainPostVisitor& aVisitor) {
+  MOZ_ASSERT(aVisitor.mEvent->mMessage == ePointerAuxClick ||
+                 aVisitor.mEvent->mMessage == ePointerClick,
+             "DispatchChromeOnlyLinkClickEvent supports only click and "
+             "auxclick source events");
+  Document* doc = OwnerDoc();
+  RefPtr<XULCommandEvent> event =
+      new XULCommandEvent(doc, aVisitor.mPresContext, nullptr);
+  RefPtr<dom::Event> mouseDOMEvent = aVisitor.mDOMEvent;
+  if (!mouseDOMEvent) {
+    mouseDOMEvent = EventDispatcher::CreateEvent(
+        aVisitor.mEvent->mOriginalTarget, aVisitor.mPresContext,
+        aVisitor.mEvent, u""_ns);
+    NS_ADDREF(aVisitor.mDOMEvent = mouseDOMEvent);
+  }
+
+  MouseEvent* mouseEvent = mouseDOMEvent->AsMouseEvent();
+  event->InitCommandEvent(
+      u"chromelinkclick"_ns,  true,
+       true, nsGlobalWindowInner::Cast(doc->GetInnerWindow()),
+      0, mouseEvent->CtrlKey(), mouseEvent->AltKey(), mouseEvent->ShiftKey(),
+      mouseEvent->MetaKey(), mouseEvent->Button(), mouseDOMEvent,
+      mouseEvent->InputSource(CallerType::System), IgnoreErrors());
+  event->SetTrusted(true);
+  event->WidgetEventPtr()->mFlags.mOnlyChromeDispatch = true;
+  DispatchEvent(*event);
+}
+
+nsresult Element::PostHandleEventForLinks(EventChainPostVisitor& aVisitor) {
+  switch (aVisitor.mEvent->mMessage) {
+    case eMouseDown:
+    case ePointerClick:
+    case ePointerAuxClick:
+    case eLegacyDOMActivate:
+    case eKeyPress:
+      break;
+    default:
+      return NS_OK;
+  }
+
+  if (!CheckHandleEventForLinksPrecondition(aVisitor)) {
+    return NS_OK;
+  }
+
+  nsresult rv = NS_OK;
+
+  switch (aVisitor.mEvent->mMessage) {
+    case eMouseDown: {
+      if (!OwnerDoc()->LinkHandlingEnabled()) {
+        break;
+      }
+
+      WidgetMouseEvent* const mouseEvent = aVisitor.mEvent->AsMouseEvent();
+      mouseEvent->mFlags.mMultipleActionsPrevented |=
+          mouseEvent->mButton == MouseButton::ePrimary ||
+          mouseEvent->mButton == MouseButton::eMiddle;
+
+      if (mouseEvent->mButton == MouseButton::ePrimary) {
+        if (IsInComposedDoc()) {
+          Element* targetElement = Element::FromEventTargetOrNull(
+              aVisitor.mEvent->GetDOMEventTarget());
+          if (targetElement && targetElement->IsInclusiveDescendantOf(this) &&
+              (!targetElement->IsEditable() ||
+               targetElement->GetEditingHost() == this)) {
+            if (RefPtr<nsFocusManager> fm = nsFocusManager::GetFocusManager()) {
+              RefPtr<Element> kungFuDeathGrip(this);
+              fm->SetFocus(kungFuDeathGrip, nsIFocusManager::FLAG_BYMOUSE |
+                                                nsIFocusManager::FLAG_NOSCROLL);
+            }
+          }
+        }
+
+        if (aVisitor.mPresContext) {
+          EventStateManager::SetActiveManager(
+              aVisitor.mPresContext->EventStateManager(), this);
+        }
+
+        if (nsIDocShell* shell = OwnerDoc()->GetDocShell()) {
+          if (nsCOMPtr<nsIURI> absURI = GetHrefURI()) {
+            if (nsCOMPtr<nsISpeculativeConnect> sc =
+                    mozilla::components::IO::Service()) {
+              nsCOMPtr<nsIInterfaceRequestor> ir = do_QueryInterface(shell);
+              sc->SpeculativeConnect(absURI, NodePrincipal(), ir, false);
+            }
+          }
+        }
+      }
+    } break;
+
+    case ePointerClick: {
+      WidgetMouseEvent* mouseEvent = aVisitor.mEvent->AsMouseEvent();
+      if (mouseEvent->IsLeftClickEvent()) {
+        if (!mouseEvent->IsControl() && !mouseEvent->IsMeta() &&
+            !mouseEvent->IsAlt() && !mouseEvent->IsShift()) {
+          if (OwnerDoc()->MayHaveDOMActivateListeners()) {
+            nsEventStatus status = nsEventStatus_eIgnore;
+            InternalUIEvent actEvent(true, eLegacyDOMActivate, mouseEvent);
+            actEvent.mDetail = 1;
+            rv = EventDispatcher::Dispatch(this, aVisitor.mPresContext,
+                                           &actEvent, nullptr, &status);
+            if (NS_SUCCEEDED(rv)) {
+              aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+            }
+          } else {
+            if (nsCOMPtr<nsIURI> absURI = GetHrefURI()) {
+              nsAutoString target;
+              GetLinkTarget(target);
+              UserNavigationInvolvement userInvolvement =
+                  mouseEvent->IsTrusted()
+                      ? UserNavigationInvolvement::Activation
+                      : UserNavigationInvolvement::None;
+              nsContentUtils::TriggerLinkClick(this, absURI, target,
+                                               userInvolvement);
+            }
+            aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+          }
+        }
+
+        DispatchChromeOnlyLinkClickEvent(aVisitor);
+      }
+      break;
+    }
+    case ePointerAuxClick: {
+      DispatchChromeOnlyLinkClickEvent(aVisitor);
+      break;
+    }
+    case eLegacyDOMActivate: {
+      if (aVisitor.mEvent->mOriginalTarget == this) {
+        if (nsCOMPtr<nsIURI> absURI = GetHrefURI()) {
+          nsAutoString target;
+          GetLinkTarget(target);
+          UserNavigationInvolvement userInvolvement =
+              aVisitor.mEvent->IsTrusted()
+                  ? UserNavigationInvolvement::Activation
+                  : UserNavigationInvolvement::None;
+          nsContentUtils::TriggerLinkClick(this, absURI, target,
+                                           userInvolvement);
+          aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+        }
+      }
+    } break;
+
+    case eKeyPress: {
+      WidgetKeyboardEvent* keyEvent = aVisitor.mEvent->AsKeyboardEvent();
+      if (keyEvent && keyEvent->mKeyCode == NS_VK_RETURN) {
+        nsEventStatus status = nsEventStatus_eIgnore;
+        rv = DispatchClickEvent(aVisitor.mPresContext, keyEvent, this, false,
+                                nullptr, &status);
+        if (NS_SUCCEEDED(rv)) {
+          aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+        }
+      }
+    } break;
+
+    default:
+      MOZ_ASSERT_UNREACHABLE("switch statements not in sync");
+      return NS_ERROR_UNEXPECTED;
+  }
+
+  return rv;
+}
+
+void Element::SanitizeLinkOrFormTarget(nsAString& aTarget) {
+  if (!aTarget.IsEmpty() && aTarget.FindCharInSet(u"\t\n\r") != kNotFound &&
+      aTarget.Contains('<')) {
+    aTarget.AssignLiteral("_blank");
+  }
+}
+
+void Element::GetLinkTarget(nsAString& aTarget) {
+  GetLinkTargetImpl(aTarget);
+  SanitizeLinkOrFormTarget(aTarget);
+}
+
+void Element::GetLinkTargetImpl(nsAString& aTarget) { aTarget.Truncate(); }
+
+nsresult Element::CopyInnerTo(Element* aDst) {
+  MOZ_TRY(aDst->mAttrs.EnsureCapacityToClone(mAttrs));
+
+  const bool isSVG = IsSVGElement();
+
+  uint32_t count = mAttrs.AttrCount();
+  for (uint32_t i = 0; i < count; ++i) {
+    BorrowedAttrInfo info = mAttrs.AttrInfoAt(i);
+    const nsAttrName* name = info.mName;
+    const nsAttrValue* value = info.mValue;
+    if (value->Type() == nsAttrValue::eCSSDeclaration) {
+      value->GetCSSDeclarationValue()->SetImmutable();
+    } else if (isSVG) {
+      nsAutoString valStr;
+      value->ToString(valStr);
+      MOZ_TRY(aDst->SetAttr(name->NamespaceID(), name->LocalName(),
+                            name->GetPrefix(), valStr, nullptr, false,
+                            IsKnownNewAttr::Yes));
+      continue;
+    }
+    MOZ_ASSERT(value->StoresOwnData());
+    nsAttrValue valueCopy(*info.mValue);
+    MOZ_TRY(aDst->SetParsedAttr(name->NamespaceID(), name->LocalName(),
+                                name->GetPrefix(), valueCopy, false,
+                                IsKnownNewAttr::Yes));
+  }
+
+  CustomElementRegistryState state = GetCustomElementRegistryState();
+  if (state == CustomElementRegistryState::Scoped) {
+    MOZ_ASSERT(StaticPrefs::dom_scoped_custom_element_registries_enabled());
+    RefPtr<CustomElementRegistry> scopedRegistry =
+        CustomElementRegistry::GetScopedRegistry(*this);
+    aDst->SetCustomElementRegistry(scopedRegistry);
+  } else {
+    MOZ_ASSERT(state == CustomElementRegistryState::Global ||
+               StaticPrefs::dom_scoped_custom_element_registries_enabled());
+    aDst->SetCustomElementRegistryState(state);
+  }
+
+  dom::NodeInfo* dstNodeInfo = aDst->NodeInfo();
+  if (CustomElementData* data = GetCustomElementData()) {
+    if (nsAtom* typeAtom = data->GetCustomElementType()) {
+      aDst->SetCustomElementData(MakeUnique<CustomElementData>(typeAtom));
+      MOZ_ASSERT(dstNodeInfo->NameAtom()->Equals(dstNodeInfo->LocalName()));
+      CustomElementDefinition* definition =
+          nsContentUtils::LookupCustomElementDefinition(
+              dstNodeInfo->GetDocument(), dstNodeInfo->NameAtom(),
+              dstNodeInfo->NamespaceID(), typeAtom);
+      if (definition) {
+        nsContentUtils::EnqueueUpgradeReaction(aDst, definition);
+      }
+    }
+  }
+
+  if (dstNodeInfo->GetDocument()->IsStaticDocument()) {
+    if (State().HasState(ElementState::DEFINED)) {
+      aDst->SetDefined(true);
+    }
+    auto pseudo = GetPseudoElementType();
+    if (pseudo != PseudoStyleType::NotPseudo) {
+      aDst->SetPseudoElementType(pseudo);
+    }
+  }
+
+  return NS_OK;
+}
+
+Element* Element::Closest(const nsACString& aSelector, ErrorResult& aResult) {
+  const StyleSelectorList* list = ParseSelectorList(aSelector, aResult);
+  if (!list) {
+    return nullptr;
+  }
+
+  return const_cast<Element*>(Servo_SelectorList_Closest(this, list));
+}
+
+bool Element::Matches(const nsACString& aSelector, ErrorResult& aResult) {
+  const StyleSelectorList* list = ParseSelectorList(aSelector, aResult);
+  if (!list) {
+    return false;
+  }
+
+  return Servo_SelectorList_Matches(this, list);
+}
+
+static constexpr nsAttrValue::EnumTableEntry kCORSAttributeTable[] = {
+    {"anonymous", CORS_ANONYMOUS},
+    {"use-credentials", CORS_USE_CREDENTIALS}};
+
+void Element::ParseCORSValue(const nsAString& aValue, nsAttrValue& aResult) {
+  DebugOnly<bool> success =
+      aResult.ParseEnumValue(aValue, kCORSAttributeTable, false,
+                             &kCORSAttributeTable[0]);
+  MOZ_ASSERT(success);
+}
+
+CORSMode Element::StringToCORSMode(const nsAString& aValue) {
+  if (aValue.IsVoid()) {
+    return CORS_NONE;
+  }
+
+  nsAttrValue val;
+  Element::ParseCORSValue(aValue, val);
+  return CORSMode(val.GetEnumValue());
+}
+
+CORSMode Element::AttrValueToCORSMode(const nsAttrValue* aValue) {
+  if (!aValue) {
+    return CORS_NONE;
+  }
+
+  return CORSMode(aValue->GetEnumValue());
+}
+
+static const char* GetFullscreenError(CallerType aCallerType,
+                                      Document* aDocument) {
+  MOZ_ASSERT(aDocument);
+
+  if (aCallerType == CallerType::System) {
+    return nullptr;
+  }
+
+  if (nsContentUtils::IsPDFJS(aDocument->GetPrincipal())) {
+    return nullptr;
+  }
+
+  if (const char* error = aDocument->GetFullscreenError(aCallerType)) {
+    return error;
+  }
+
+  if (!StaticPrefs::full_screen_api_allow_trusted_requests_only()) {
+    return nullptr;
+  }
+
+  if (!aDocument->ConsumeTransientUserGestureActivation()) {
+    return "FullscreenDeniedNotInputDriven";
+  }
+
+  if (StaticPrefs::full_screen_api_mouse_event_allow_left_button_only() &&
+      (EventStateManager::sCurrentMouseBtn == MouseButton::eMiddle ||
+       EventStateManager::sCurrentMouseBtn == MouseButton::eSecondary)) {
+    return "FullscreenDeniedMouseEventOnlyLeftBtn";
+  }
+
+  return nullptr;
+}
+
+void Element::SetCapture(bool aRetargetToElement) {
+  if (!PresShell::GetCapturingContent()) {
+    PresShell::SetCapturingContent(
+        this, CaptureFlags::PreventDragStart |
+                  (aRetargetToElement ? CaptureFlags::RetargetToElement
+                                      : CaptureFlags::None));
+  }
+}
+
+void Element::SetCaptureAlways(bool aRetargetToElement) {
+  PresShell::SetCapturingContent(
+      this, CaptureFlags::PreventDragStart | CaptureFlags::IgnoreAllowedState |
+                (aRetargetToElement ? CaptureFlags::RetargetToElement
+                                    : CaptureFlags::None));
+}
+
+void Element::ReleaseCapture() {
+  if (PresShell::GetCapturingContent() == this) {
+    PresShell::ReleaseCapturingContent();
+  }
+}
+
+already_AddRefed<Promise> Element::RequestFullscreen(
+    const FullscreenOptions& aOptions, CallerType aCallerType,
+    ErrorResult& aRv) {
+  auto request =
+      FullscreenRequest::Create(this, aOptions.mKeyboardLock, aCallerType, aRv);
+  RefPtr<Promise> promise = request->GetPromise();
+
+  if (const char* error = GetFullscreenError(aCallerType, OwnerDoc())) {
+    request->Reject(error);
+  } else {
+    OwnerDoc()->RequestFullscreen(std::move(request));
+  }
+  return promise.forget();
+}
+
+already_AddRefed<Promise> Element::RequestPointerLock(
+    const PointerLockOptions& aOptions, CallerType aCallerType,
+    ErrorResult& aRv) {
+  RefPtr<Promise> promise = Promise::CreateInfallible(GetRelevantGlobal());
+  PointerLockManager::RequestLock(this, aOptions, aCallerType, promise);
+  return promise.forget();
+}
+
+already_AddRefed<DOMMatrixReadOnly> Element::GetTransformToAncestor(
+    Element& aAncestor) {
+  nsIFrame* primaryFrame = GetPrimaryFrame();
+  nsIFrame* ancestorFrame = aAncestor.GetPrimaryFrame();
+
+  Matrix4x4 transform;
+  if (primaryFrame) {
+    transform = nsLayoutUtils::GetTransformToAncestor(RelativeTo{primaryFrame},
+                                                      RelativeTo{ancestorFrame},
+                                                      nsIFrame::IN_CSS_UNITS)
+                    .GetMatrix();
+  }
+
+  DOMMatrixReadOnly* matrix = new DOMMatrix(this, transform);
+  RefPtr<DOMMatrixReadOnly> result(matrix);
+  return result.forget();
+}
+
+already_AddRefed<DOMMatrixReadOnly> Element::GetTransformToParent() {
+  nsIFrame* primaryFrame = GetPrimaryFrame();
+
+  Matrix4x4 transform;
+  if (primaryFrame) {
+    nsIFrame* parentFrame = primaryFrame->GetParent();
+    transform = nsLayoutUtils::GetTransformToAncestor(RelativeTo{primaryFrame},
+                                                      RelativeTo{parentFrame},
+                                                      nsIFrame::IN_CSS_UNITS)
+                    .GetMatrix();
+  }
+
+  DOMMatrixReadOnly* matrix = new DOMMatrix(this, transform);
+  RefPtr<DOMMatrixReadOnly> result(matrix);
+  return result.forget();
+}
+
+already_AddRefed<DOMMatrixReadOnly> Element::GetTransformToViewport() {
+  nsIFrame* primaryFrame = GetPrimaryFrame();
+  Matrix4x4 transform;
+  if (primaryFrame) {
+    transform =
+        nsLayoutUtils::GetTransformToAncestor(
+            RelativeTo{primaryFrame},
+            RelativeTo{nsLayoutUtils::GetDisplayRootFrame(primaryFrame)},
+            nsIFrame::IN_CSS_UNITS)
+            .GetMatrix();
+  }
+
+  DOMMatrixReadOnly* matrix = new DOMMatrix(this, transform);
+  RefPtr<DOMMatrixReadOnly> result(matrix);
+  return result.forget();
+}
+
+already_AddRefed<Animation> Element::Animate(
+    JSContext* aContext, JS::Handle<JSObject*> aKeyframes,
+    const UnrestrictedDoubleOrKeyframeAnimationOptions& aOptions,
+    ErrorResult& aError) {
+  nsCOMPtr<nsIGlobalObject> relevantGlobal = GetRelevantGlobal();
+  if (!relevantGlobal) {
+    aError.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+  GlobalObject global(aContext, relevantGlobal->GetGlobalJSObject());
+  MOZ_ASSERT(!global.Failed());
+
+
+
+  RefPtr<KeyframeEffect> effect =
+      KeyframeEffect::Constructor(global, this, aKeyframes, aOptions, aError);
+  if (aError.Failed()) {
+    return nullptr;
+  }
+
+  JSAutoRealm ar(aContext, global.Get());
+
+  Optional<AnimationTimeline*> timeline;
+  if (aOptions.IsKeyframeAnimationOptions()) {
+    const auto& tl = aOptions.GetAsKeyframeAnimationOptions().mTimeline;
+    timeline.Construct(tl.WasPassed() ? tl.Value().get()
+                                      : OwnerDoc()->Timeline());
+  }
+
+  RefPtr<Animation> animation =
+      Animation::Constructor(global, effect, timeline, aError);
+  if (aError.Failed()) {
+    return nullptr;
+  }
+
+  if (aOptions.IsKeyframeAnimationOptions()) {
+    animation->SetId(aOptions.GetAsKeyframeAnimationOptions().mId);
+  }
+
+  animation->Play(aError, Animation::LimitBehavior::AutoRewind);
+  if (aError.Failed()) {
+    return nullptr;
+  }
+
+  return animation.forget();
+}
+
+void Element::GetAnimations(const GetAnimationsOptions& aOptions,
+                            nsTArray<RefPtr<Animation>>& aAnimations,
+                            ErrorResult& aError) {
+  if (Document* doc = GetComposedDoc()) {
+    doc->FlushPendingNotifications(
+        ChangesToFlush(FlushType::Style,  false,
+                        false));
+  }
+
+  GetAnimationsWithoutFlush(aOptions, aAnimations, aError);
+}
+
+static void GetAnimationsUnsorted(const Element* aElement,
+                                  const PseudoStyleRequest& aPseudoRequest,
+                                  nsTArray<RefPtr<Animation>>& aAnimations) {
+  MOZ_ASSERT(aPseudoRequest.IsNotPseudo() ||
+                 AnimationUtils::IsSupportedPseudoForAnimations(aPseudoRequest),
+             "Unsupported pseudo type");
+  MOZ_ASSERT(aElement, "Null element");
+
+  EffectSet* effects = EffectSet::Get(aElement, aPseudoRequest);
+  if (!effects) {
+    return;
+  }
+
+  for (KeyframeEffect* effect : *effects) {
+    MOZ_ASSERT(effect && effect->GetAnimation(),
+               "Only effects associated with an animation should be "
+               "added to an element's effect set");
+    Animation* animation = effect->GetAnimation();
+
+    MOZ_ASSERT(animation->IsRelevant(),
+               "Only relevant animations should be added to an element's "
+               "effect set");
+    aAnimations.AppendElement(animation);
+  }
+}
+
+static inline bool IsSupportedForGetAnimationsSubtree(PseudoStyleType aType) {
+  return aType == PseudoStyleType::NotPseudo ||
+         aType == PseudoStyleType::MozSnapshotContainingBlock ||
+         PseudoStyle::IsViewTransitionPseudoElement(aType);
+}
+
+static void GetAnimationsUnsortedForSubtree(
+    const Element* aRootElement, nsTArray<RefPtr<Animation>>& aAnimations) {
+  const PseudoStyleType type = aRootElement->GetPseudoElementType();
+  if (MOZ_UNLIKELY(!IsSupportedForGetAnimationsSubtree(type))) {
+    return;
+  }
+
+  if (type == PseudoStyleType::NotPseudo) {
+    for (const nsIContent* node = aRootElement; node;
+         node = node->GetNextNode(aRootElement)) {
+      if (!node->IsElement()) {
+        continue;
+      }
+      const Element* element = node->AsElement();
+      GetAnimationsUnsorted(element, PseudoStyleRequest::NotPseudo(),
+                            aAnimations);
+      GetAnimationsUnsorted(element, PseudoStyleRequest::Before(), aAnimations);
+      GetAnimationsUnsorted(element, PseudoStyleRequest::After(), aAnimations);
+      GetAnimationsUnsorted(element, PseudoStyleRequest::Marker(), aAnimations);
+      GetAnimationsUnsorted(element, PseudoStyleRequest::Backdrop(),
+                            aAnimations);
+    }
+  }
+
+  if (!aRootElement->IsRootElement() && type == PseudoStyleType::NotPseudo) {
+    return;
+  }
+
+  const Document* doc = aRootElement->OwnerDoc();
+  const Element* originatingElement = doc->GetRootElement();
+  if (!originatingElement) {
+    return;
+  }
+
+  const Element* rootForTraversal = [&]() -> const Element* {
+    if (!aRootElement->IsRootElement()) {
+      return aRootElement;
+    }
+    const ViewTransition* vt = doc->GetActiveViewTransition();
+    return vt ? vt->GetViewTransitionTreeRoot() : nullptr;
+  }();
+
+  for (const nsIContent* node = rootForTraversal; node;
+       node = node->GetNextNode(rootForTraversal)) {
+    if (!node->IsElement()) {
+      continue;
+    }
+    const Element* pseudo = node->AsElement();
+    const PseudoStyleRequest request(
+        pseudo->GetPseudoElementType(),
+        pseudo->HasName()
+            ? pseudo->GetParsedAttr(nsGkAtoms::name)->GetAtomValue()
+            : nullptr);
+    GetAnimationsUnsorted(originatingElement, request, aAnimations);
+  }
+}
+
+void Element::GetAnimationsWithoutFlush(
+    const GetAnimationsOptions& aOptions,
+    nsTArray<RefPtr<Animation>>& aAnimations, ErrorResult& aError) {
+  Element* elem = this;
+  PseudoStyleRequest pseudoRequest;
+  if (DOMStringIsNull(aOptions.mPseudoElement)) {
+    if (IsGeneratedContentContainerForBefore()) {
+      elem = GetParentElement();
+      pseudoRequest.mType = PseudoStyleType::Before;
+    } else if (IsGeneratedContentContainerForAfter()) {
+      elem = GetParentElement();
+      pseudoRequest.mType = PseudoStyleType::After;
+    } else if (IsGeneratedContentContainerForMarker()) {
+      elem = GetParentElement();
+      pseudoRequest.mType = PseudoStyleType::Marker;
+    } else if (IsGeneratedContentContainerForBackdrop()) {
+      elem = GetParentElement();
+      pseudoRequest.mType = PseudoStyleType::Backdrop;
+    } else if (IsGeneratedContentContainerForCheckmark()) {
+      elem = GetParentElement();
+      pseudoRequest.mType = PseudoStyleType::Checkmark;
+    } else if (IsGeneratedContentContainerForPickerIcon()) {
+      elem = GetParentElement();
+      pseudoRequest.mType = PseudoStyleType::PickerIcon;
+    }
+
+    if (!elem) {
+      return;
+    }
+  } else {
+    if (aOptions.mPseudoElement.IsEmpty()) {
+      aError.ThrowSyntaxError("The pseudo-element selector cannot be empty.");
+      return;
+    }
+    Maybe<PseudoStyleRequest> request = PseudoStyleRequest::Parse(
+        aOptions.mPseudoElement, OwnerDoc()->DefaultStyleAttrURLData());
+    if (request.isNothing()) {
+      aError.ThrowSyntaxError("The pseudo-element selector is not valid.");
+      return;
+    }
+    pseudoRequest = request.value();
+  }
+
+  if (!pseudoRequest.IsNotPseudo() &&
+      !AnimationUtils::IsSupportedPseudoForAnimations(pseudoRequest)) {
+    return;
+  }
+
+  if (aOptions.mSubtree &&
+      (pseudoRequest.IsNotPseudo() || pseudoRequest.IsViewTransition())) {
+    const auto* subtreeRoot =
+        pseudoRequest.IsNotPseudo() ? this : GetPseudoElement(pseudoRequest);
+    if (!subtreeRoot) {
+      return;
+    }
+    GetAnimationsUnsortedForSubtree(subtreeRoot, aAnimations);
+  } else {
+    GetAnimationsUnsorted(elem, pseudoRequest, aAnimations);
+  }
+  aAnimations.Sort(AnimationPtrComparator<RefPtr<Animation>>());
+}
+
+void Element::CloneAnimationsFrom(const Element& aOther) {
+  AnimationTimeline* const timeline = OwnerDoc()->Timeline();
+  MOZ_ASSERT(timeline, "Timeline has not been set on the document yet");
+  for (PseudoStyleType pseudoType :
+       {PseudoStyleType::NotPseudo, PseudoStyleType::Before,
+        PseudoStyleType::After, PseudoStyleType::Marker,
+        PseudoStyleType::Backdrop}) {
+    const PseudoStyleRequest request(pseudoType);
+    if (auto* const effects = EffectSet::Get(&aOther, request)) {
+      auto* const clonedEffects = EffectSet::GetOrCreate(this, request);
+      for (KeyframeEffect* const effect : *effects) {
+        auto* animation = effect->GetAnimation();
+        if (animation->AsCSSTransition()) {
+          continue;
+        }
+        RefPtr<KeyframeEffect> clonedEffect = new KeyframeEffect(
+            OwnerDoc(), OwningAnimationTarget{this, request}, *effect);
+
+        RefPtr<Animation> clonedAnimation = Animation::ClonePausedAnimation(
+            OwnerDoc()->GetParentObject(), *animation, *clonedEffect,
+            *timeline);
+        if (!clonedAnimation) {
+          continue;
+        }
+        clonedEffects->AddEffect(*clonedEffect);
+      }
+    }
+  }
+}
+
+void Element::GetInnerHTML(nsAString& aInnerHTML, OOMReporter& aError) {
+  GetMarkup(false, aInnerHTML);
+}
+
+void Element::GetInnerHTML(OwningTrustedHTMLOrNullIsEmptyString& aInnerHTML,
+                           OOMReporter& aError) {
+  GetInnerHTML(aInnerHTML.SetAsNullIsEmptyString(), aError);
+}
+
+void Element::SetInnerHTML(const TrustedHTMLOrNullIsEmptyString& aInnerHTML,
+                           nsIPrincipal* aSubjectPrincipal,
+                           ErrorResult& aError) {
+  constexpr nsLiteralString sink = u"Element innerHTML"_ns;
+
+  Maybe<nsAutoString> compliantStringHolder;
+  const nsAString* compliantString =
+      TrustedTypeUtils::GetTrustedTypesCompliantString(
+          aInnerHTML, sink, kTrustedTypesOnlySinkGroup, *this,
+          aSubjectPrincipal, compliantStringHolder, aError);
+
+  if (aError.Failed()) {
+    return;
+  }
+
+  SetInnerHTMLTrusted(*compliantString, aSubjectPrincipal, aError);
+}
+
+void Element::SetInnerHTMLTrusted(const nsAString& aInnerHTML,
+                                  nsIPrincipal* aSubjectPrincipal,
+                                  ErrorResult& aError) {
+  SetInnerHTMLInternal(aInnerHTML, aError);
+}
+
+void Element::GetOuterHTML(OwningTrustedHTMLOrNullIsEmptyString& aOuterHTML) {
+  GetMarkup(true, aOuterHTML.SetAsNullIsEmptyString());
+}
+
+void Element::SetOuterHTML(const TrustedHTMLOrNullIsEmptyString& aOuterHTML,
+                           nsIPrincipal* aSubjectPrincipal,
+                           ErrorResult& aError) {
+  constexpr nsLiteralString sink = u"Element outerHTML"_ns;
+
+  Maybe<nsAutoString> compliantStringHolder;
+  const nsAString* compliantString =
+      TrustedTypeUtils::GetTrustedTypesCompliantString(
+          aOuterHTML, sink, kTrustedTypesOnlySinkGroup, *this,
+          aSubjectPrincipal, compliantStringHolder, aError);
+  if (aError.Failed()) {
+    return;
+  }
+
+  nsCOMPtr<nsINode> parent = GetParentNode();
+  if (!parent) {
+    return;
+  }
+
+  if (parent->NodeType() == DOCUMENT_NODE) {
+    aError.Throw(NS_ERROR_DOM_NO_MODIFICATION_ALLOWED_ERR);
+    return;
+  }
+
+  if (OwnerDoc()->IsHTMLDocument()) {
+    nsAtom* localName;
+    int32_t namespaceID;
+    if (parent->IsElement()) {
+      localName = parent->NodeInfo()->NameAtom();
+      namespaceID = parent->NodeInfo()->NamespaceID();
+    } else {
+      NS_ASSERTION(
+          parent->NodeType() == DOCUMENT_FRAGMENT_NODE,
+          "How come the parent isn't a document, a fragment or an element?");
+      localName = nsGkAtoms::body;
+      namespaceID = kNameSpaceID_XHTML;
+    }
+    auto* nim = NodeInfoManager();
+    RefPtr<DocumentFragment> fragment = new (nim) DocumentFragment(nim);
+    nsContentUtils::ParseFragmentHTML(
+        *compliantString, fragment, localName, namespaceID,
+        OwnerDoc()->GetCompatibilityMode() == eCompatibility_NavQuirks, true);
+    parent->ReplaceChild(*fragment, *this, aError);
+    return;
+  }
+
+  nsCOMPtr<nsINode> context;
+  if (parent->IsElement()) {
+    context = parent;
+  } else {
+    NS_ASSERTION(
+        parent->NodeType() == DOCUMENT_FRAGMENT_NODE,
+        "How come the parent isn't a document, a fragment or an element?");
+    RefPtr<mozilla::dom::NodeInfo> info = NodeInfoManager()->GetNodeInfo(
+        nsGkAtoms::body, nullptr, kNameSpaceID_XHTML, ELEMENT_NODE);
+    context = NS_NewHTMLBodyElement(info.forget(), FROM_PARSER_FRAGMENT);
+  }
+
+  RefPtr<DocumentFragment> fragment = nsContentUtils::CreateContextualFragment(
+      context, *compliantString, true, aError);
+  if (aError.Failed()) {
+    return;
+  }
+  parent->ReplaceChild(*fragment, *this, aError);
+}
+
+enum nsAdjacentPosition { eBeforeBegin, eAfterBegin, eBeforeEnd, eAfterEnd };
+
+void Element::InsertAdjacentHTML(
+    const nsAString& aPosition, const TrustedHTMLOrString& aTrustedHTMLOrString,
+    nsIPrincipal* aSubjectPrincipal, ErrorResult& aError) {
+  constexpr nsLiteralString kSink = u"Element insertAdjacentHTML"_ns;
+
+  Maybe<nsAutoString> compliantStringHolder;
+  const nsAString* compliantString =
+      TrustedTypeUtils::GetTrustedTypesCompliantString(
+          aTrustedHTMLOrString, kSink, kTrustedTypesOnlySinkGroup, *this,
+          aSubjectPrincipal, compliantStringHolder, aError);
+
+  if (aError.Failed()) {
+    return;
+  }
+
+  nsAdjacentPosition position;
+  if (aPosition.LowerCaseEqualsLiteral("beforebegin")) {
+    position = eBeforeBegin;
+  } else if (aPosition.LowerCaseEqualsLiteral("afterbegin")) {
+    position = eAfterBegin;
+  } else if (aPosition.LowerCaseEqualsLiteral("beforeend")) {
+    position = eBeforeEnd;
+  } else if (aPosition.LowerCaseEqualsLiteral("afterend")) {
+    position = eAfterEnd;
+  } else {
+    aError.Throw(NS_ERROR_DOM_SYNTAX_ERR);
+    return;
+  }
+
+  nsCOMPtr<nsIContent> destination;
+  if (position == eBeforeBegin || position == eAfterEnd) {
+    destination = GetParent();
+    if (!destination) {
+      aError.Throw(NS_ERROR_DOM_NO_MODIFICATION_ALLOWED_ERR);
+      return;
+    }
+  } else {
+    destination = this;
+  }
+
+  Document* const doc = OwnerDoc();
+
+  mozAutoDocUpdate updateBatch(doc, true);
+  nsAutoScriptLoaderDisabler sld(doc);
+
+  nsIContent* oldLastChild = destination->GetLastChild();
+  bool oldLastChildIsText = oldLastChild && oldLastChild->IsText();
+  if (doc->IsHTMLDocument() && !OwnerDoc()->MayHaveDOMMutationObservers() &&
+      ((position == eBeforeEnd && !oldLastChildIsText) ||
+       (position == eAfterEnd && !GetNextSibling()) ||
+       (position == eAfterBegin && !GetFirstChild()))) {
+    doc->SuspendDOMNotifications();
+    int32_t contextNs = destination->GetNameSpaceID();
+    nsAtom* contextLocal = destination->NodeInfo()->NameAtom();
+    if (contextLocal == nsGkAtoms::html && contextNs == kNameSpaceID_XHTML) {
+      contextLocal = nsGkAtoms::body;
+    }
+    aError = nsContentUtils::ParseFragmentHTML(
+        *compliantString, destination, contextLocal, contextNs,
+        doc->GetCompatibilityMode() == eCompatibility_NavQuirks, true);
+    doc->ResumeDOMNotifications();
+    nsIContent* firstNewChild = oldLastChild ? oldLastChild->GetNextSibling()
+                                             : destination->GetFirstChild();
+    if (firstNewChild) {
+      MutationObservers::NotifyContentAppended(destination, firstNewChild, {});
+    }
+    return;
+  }
+
+  RefPtr<DocumentFragment> fragment = nsContentUtils::CreateContextualFragment(
+      destination, *compliantString, true, aError);
+  if (aError.Failed()) {
+    return;
+  }
+
+  nsAutoScriptBlockerSuppressNodeRemoved scriptBlocker;
+
+  switch (position) {
+    case eBeforeBegin:
+      destination->InsertBefore(*fragment, this, aError);
+      break;
+    case eAfterBegin:
+      static_cast<nsINode*>(this)->InsertBefore(*fragment, GetFirstChild(),
+                                                aError);
+      break;
+    case eBeforeEnd:
+      static_cast<nsINode*>(this)->AppendChild(*fragment, aError);
+      break;
+    case eAfterEnd:
+      destination->InsertBefore(*fragment, GetNextSibling(), aError);
+      break;
+  }
+}
+
+nsINode* Element::InsertAdjacent(const nsAString& aWhere, nsINode* aNode,
+                                 ErrorResult& aError) {
+  if (aWhere.LowerCaseEqualsLiteral("beforebegin")) {
+    nsCOMPtr<nsINode> parent = GetParentNode();
+    if (!parent) {
+      return nullptr;
+    }
+    parent->InsertBefore(*aNode, this, aError);
+  } else if (aWhere.LowerCaseEqualsLiteral("afterbegin")) {
+    nsCOMPtr<nsINode> refNode = GetFirstChild();
+    static_cast<nsINode*>(this)->InsertBefore(*aNode, refNode, aError);
+  } else if (aWhere.LowerCaseEqualsLiteral("beforeend")) {
+    static_cast<nsINode*>(this)->AppendChild(*aNode, aError);
+  } else if (aWhere.LowerCaseEqualsLiteral("afterend")) {
+    nsCOMPtr<nsINode> parent = GetParentNode();
+    if (!parent) {
+      return nullptr;
+    }
+    nsCOMPtr<nsINode> refNode = GetNextSibling();
+    parent->InsertBefore(*aNode, refNode, aError);
+  } else {
+    aError.Throw(NS_ERROR_DOM_SYNTAX_ERR);
+    return nullptr;
+  }
+
+  return aError.Failed() ? nullptr : aNode;
+}
+
+Element* Element::InsertAdjacentElement(const nsAString& aWhere,
+                                        Element& aElement,
+                                        ErrorResult& aError) {
+  nsINode* newNode = InsertAdjacent(aWhere, &aElement, aError);
+  MOZ_ASSERT(!newNode || newNode->IsElement());
+
+  return newNode ? newNode->AsElement() : nullptr;
+}
+
+void Element::InsertAdjacentText(const nsAString& aWhere,
+                                 const nsAString& aData, ErrorResult& aError) {
+  RefPtr<nsTextNode> textNode = OwnerDoc()->CreateTextNode(aData);
+  InsertAdjacent(aWhere, textNode, aError);
+}
+
+TextEditor* Element::GetTextEditorInternal() {
+  TextControlElement* textControlElement = TextControlElement::FromNode(this);
+  return textControlElement ? MOZ_KnownLive(textControlElement)->GetTextEditor()
+                            : nullptr;
+}
+
+void Element::ClearEditContext() {
+  MOZ_ASSERT(HasFlag(ELEMENT_HAS_EDIT_CONTEXT));
+  UnsetFlags(ELEMENT_HAS_EDIT_CONTEXT);
+  EditContext::SetForElement(*this, nullptr);
+}
+
+nsresult Element::SetBoolAttr(nsAtom* aAttr, bool aValue) {
+  if (aValue) {
+    return SetAttr(kNameSpaceID_None, aAttr, u""_ns, true);
+  }
+
+  return UnsetAttr(kNameSpaceID_None, aAttr, true);
+}
+
+void Element::GetEnumAttr(nsAtom* aAttr, const char* aDefault,
+                          nsAString& aResult) const {
+  GetEnumAttr(aAttr, aDefault, aDefault, aResult);
+}
+
+void Element::GetEnumAttr(nsAtom* aAttr, const char* aDefaultMissing,
+                          const char* aDefaultInvalid,
+                          nsAString& aResult) const {
+  const nsAttrValue* attrVal = mAttrs.GetAttr(aAttr);
+
+  aResult.Truncate();
+
+  if (!attrVal) {
+    if (aDefaultMissing) {
+      AppendASCIItoUTF16(nsDependentCString(aDefaultMissing), aResult);
+    } else {
+      SetDOMStringToNull(aResult);
+    }
+  } else {
+    if (attrVal->Type() == nsAttrValue::eEnum) {
+      attrVal->GetEnumString(aResult, true);
+    } else if (aDefaultInvalid) {
+      AppendASCIItoUTF16(nsDependentCString(aDefaultInvalid), aResult);
+    }
+  }
+}
+
+void Element::SetOrRemoveNullableStringAttr(nsAtom* aName,
+                                            const nsAString& aValue,
+                                            ErrorResult& aError) {
+  if (DOMStringIsNull(aValue)) {
+    UnsetAttr(aName, aError);
+  } else {
+    SetAttr(aName, aValue, aError);
+  }
+}
+
+Directionality Element::GetComputedDirectionality() const {
+  if (nsIFrame* frame = GetPrimaryFrame()) {
+    return frame->StyleVisibility()->mDirection == StyleDirection::Ltr
+               ? Directionality::Ltr
+               : Directionality::Rtl;
+  }
+
+  return GetDirectionality();
+}
+
+float Element::FontSizeInflation() {
+  nsIFrame* frame = GetPrimaryFrame();
+  if (!frame) {
+    return -1.0;
+  }
+
+  if (nsLayoutUtils::FontSizeInflationEnabled(frame->PresContext())) {
+    return nsLayoutUtils::FontSizeInflationFor(frame);
+  }
+
+  return 1.0;
+}
+
+void Element::GetImplementedPseudoElement(nsAString& aPseudo) const {
+  PseudoStyleType pseudoType = GetPseudoElementType();
+  if (pseudoType == PseudoStyleType::NotPseudo) {
+    return SetDOMStringToNull(aPseudo);
+  }
+  nsDependentAtomString pseudo(PseudoStyle::GetAtom(pseudoType));
+
+  MOZ_ASSERT(pseudo.Length() > 2 && pseudo[0] == ':' && pseudo[1] != ':');
+
+  aPseudo.Truncate();
+  aPseudo.SetCapacity(pseudo.Length() + 1);
+  aPseudo.Append(':');
+  aPseudo.Append(pseudo);
+}
+
+static Element* SearchViewTransitionPseudo(const Element* aElement,
+                                           const PseudoStyleRequest& aRequest) {
+  if (!aElement->IsRootElement()) {
+    return nullptr;
+  }
+
+  const Document* doc = aElement->OwnerDoc();
+  const ViewTransition* vt = doc->GetActiveViewTransition();
+  if (!vt) {
+    return nullptr;
+  }
+
+  return vt->FindPseudo(aRequest);
+}
+
+Element* Element::GetPseudoElement(const PseudoStyleRequest& aRequest) const {
+  switch (aRequest.mType) {
+    case PseudoStyleType::NotPseudo:
+      return const_cast<Element*>(this);
+    case PseudoStyleType::Before:
+      return nsLayoutUtils::GetBeforePseudo(this);
+    case PseudoStyleType::After:
+      return nsLayoutUtils::GetAfterPseudo(this);
+    case PseudoStyleType::Marker:
+      return nsLayoutUtils::GetMarkerPseudo(this);
+    case PseudoStyleType::Backdrop:
+      return nsLayoutUtils::GetBackdropPseudo(this);
+    case PseudoStyleType::Checkmark:
+      return nsLayoutUtils::GetCheckmarkPseudo(this);
+    case PseudoStyleType::PickerIcon:
+      return nsLayoutUtils::GetPickerIconPseudo(this);
+    case PseudoStyleType::ViewTransition:
+    case PseudoStyleType::ViewTransitionGroup:
+    case PseudoStyleType::ViewTransitionImagePair:
+    case PseudoStyleType::ViewTransitionOld:
+    case PseudoStyleType::ViewTransitionNew: {
+      Element* result = SearchViewTransitionPseudo(this, aRequest);
+      MOZ_ASSERT(!result || result->GetPseudoElementType() == aRequest.mType,
+                 "The type should match");
+      MOZ_ASSERT(!result || !result->HasName() ||
+                     result->GetParsedAttr(nsGkAtoms::name)->GetAtomValue() ==
+                         aRequest.mIdentifier,
+                 "The identifier should match");
+      return result;
+    }
+    default:
+      return nullptr;
+  }
+}
+
+ReferrerPolicy Element::GetReferrerPolicyAsEnum() const {
+  if (IsHTMLElement()) {
+    return ReferrerPolicyFromAttr(GetParsedAttr(nsGkAtoms::referrerpolicy));
+  }
+  return ReferrerPolicy::_empty;
+}
+
+ReferrerPolicy Element::ReferrerPolicyFromAttr(
+    const nsAttrValue* aValue) const {
+  if (aValue && aValue->Type() == nsAttrValue::eEnum) {
+    return ReferrerPolicy(aValue->GetEnumValue());
+  }
+  return ReferrerPolicy::_empty;
+}
+
+already_AddRefed<nsDOMStringMap> Element::Dataset() {
+  nsExtendedDOMSlots* slots = ExtendedDOMSlots();
+  if (!slots->mDataset) {
+    slots->mDataset = new nsDOMStringMap(this);
+  }
+  return do_AddRef(slots->mDataset);
+}
+
+void Element::ClearDataset() {
+  nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots();
+  MOZ_ASSERT(slots && slots->mDataset,
+             "Slots should exist and dataset should not be null.");
+  slots->mDataset = nullptr;
+}
+
+template <class T>
+void Element::GetCustomInterface(nsGetterAddRefs<T> aResult) {
+  nsCOMPtr<nsISupports> iface =
+      CustomElementRegistry::CallGetCustomInterface(this, NS_GET_IID(T));
+  if (iface) {
+    if (NS_SUCCEEDED(CallQueryInterface(iface, static_cast<T**>(aResult)))) {
+      return;
+    }
+  }
+}
+
+void Element::ClearServoData(Document* aDoc) {
+  MOZ_ASSERT(aDoc);
+  if (HasServoData()) {
+    Servo_Element_ClearData(this);
+  } else {
+    UnsetFlags(kAllServoDescendantBits | NODE_NEEDS_FRAME);
+  }
+  if (aDoc->GetServoRestyleRoot() == this) {
+    aDoc->ClearServoRestyleRoot();
+  }
+}
+
+bool Element::IsPopoverOpenedInMode(PopoverAttributeState aMode) const {
+  const auto* htmlElement = nsGenericHTMLElement::FromNode(this);
+  return htmlElement && htmlElement->PopoverOpen() &&
+         htmlElement->GetPopoverData()->GetOpenedInMode() == aMode;
+}
+
+bool Element::IsPopoverOpen() const {
+  const auto* htmlElement = nsGenericHTMLElement::FromNode(this);
+  return htmlElement && htmlElement->PopoverOpen();
+}
+
+void Element::SetAssociatedPopover(nsGenericHTMLElement& aPopover) {
+  MOZ_ASSERT(IsHTMLElement());
+  MOZ_ASSERT(aPopover.IsHTMLElement());
+  auto* slots = ExtendedDOMSlots();
+  slots->mAssociatedPopover = do_GetWeakReference(&aPopover);
+}
+
+nsGenericHTMLElement* Element::GetAssociatedPopover() const {
+  if (const nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots()) {
+    if (nsCOMPtr<nsGenericHTMLElement> popover =
+            do_QueryReferent(slots->mAssociatedPopover)) {
+      if (popover->GetPopoverData() &&
+          popover->GetPopoverData()->GetInvoker() == this) {
+        return popover;
+      }
+    }
+  }
+  return nullptr;
+}
+
+Element* Element::GetTopmostPopoverAncestor(const Element* aInvoker,
+                                            bool isPopover) const {
+  AutoTArray<RefPtr<Element>, 16> combinedPopovers;
+  combinedPopovers.AppendElements(
+      OwnerDoc()->PopoverListOf(PopoverAttributeState::Auto));
+  combinedPopovers.AppendElements(
+      OwnerDoc()->PopoverListOf(PopoverAttributeState::Hint));
+
+  auto lastAncestorIdx = [&](const nsINode* aNode) -> intptr_t {
+    for (intptr_t i = (intptr_t)combinedPopovers.Length() - 1; i >= 0; --i) {
+      if (aNode->IsInclusiveFlatTreeDescendantOf(combinedPopovers[i])) {
+        return i;
+      }
+    }
+    return -1;
+  };
+
+  intptr_t popoverAncestorIndex = lastAncestorIdx(this);
+  intptr_t sourceAncestorIndex = aInvoker ? lastAncestorIdx(aInvoker) : -1;
+  intptr_t ancestorIndex = std::max(popoverAncestorIndex, sourceAncestorIndex);
+  return ancestorIndex >= 0 ? combinedPopovers[ancestorIndex].get() : nullptr;
+}
+
+ElementAnimationData& Element::CreateAnimationData() {
+  MOZ_ASSERT(!GetAnimationData());
+  SetMayHaveAnimations();
+  auto* slots = ExtendedDOMSlots();
+  slots->mAnimations = MakeUnique<ElementAnimationData>();
+  return *slots->mAnimations;
+}
+
+PopoverData& Element::CreatePopoverData() {
+  MOZ_ASSERT(!GetPopoverData());
+  auto* slots = ExtendedDOMSlots();
+  slots->mPopoverData = MakeUnique<PopoverData>();
+  return *slots->mPopoverData;
+}
+
+void Element::ClearPopoverData() {
+  nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots();
+  if (slots) {
+    slots->mPopoverData = nullptr;
+  }
+}
+
+void Element::SetCustomElementData(UniquePtr<CustomElementData> aData) {
+  SetHasCustomElementData();
+
+  if (aData->mState != CustomElementData::State::eCustom) {
+    SetDefined(false);
+  }
+
+  nsExtendedDOMSlots* slots = ExtendedDOMSlots();
+  MOZ_ASSERT(!slots->mCustomElementData,
+             "Custom element data may not be changed once set.");
+#if DEBUG
+  if (NodeInfo()->NamespaceID() == kNameSpaceID_XUL) {
+    nsAtom* name = NodeInfo()->NameAtom();
+    nsAtom* type = aData->GetCustomElementType();
+    if (nsContentUtils::IsNameWithDash(name)) {
+      MOZ_ASSERT(type == name);
+    } else {
+      if (type != name) {
+        MOZ_ASSERT(nsContentUtils::IsNameWithDash(type));
+      }
+    }
+  }
+#endif
+  slots->mCustomElementData = std::move(aData);
+}
+
+void Element::ClearCustomElementData() {
+  MOZ_ASSERT(HasCustomElementData());
+
+  ClearHasCustomElementData();
+
+  SetDefined(!nsContentUtils::IsCustomElementName(NodeInfo()->NameAtom(),
+                                                  NodeInfo()->NamespaceID()));
+
+  nsExtendedDOMSlots* slots = ExtendedDOMSlots();
+  slots->mCustomElementData = nullptr;
+}
+
+nsTArray<RefPtr<nsAtom>>& Element::EnsureCustomStates() {
+  MOZ_ASSERT(IsHTMLElement());
+  nsExtendedDOMSlots* slots = ExtendedDOMSlots();
+  return slots->mCustomStates;
+}
+
+CustomElementDefinition* Element::GetCustomElementDefinition() const {
+  CustomElementData* data = GetCustomElementData();
+  if (!data) {
+    return nullptr;
+  }
+
+  return data->GetCustomElementDefinition();
+}
+
+void Element::SetCustomElementDefinition(CustomElementDefinition* aDefinition) {
+  CustomElementData* data = GetCustomElementData();
+  MOZ_ASSERT(data);
+
+  data->SetCustomElementDefinition(aDefinition);
+}
+
+already_AddRefed<nsIDOMXULButtonElement> Element::AsXULButton() {
+  nsCOMPtr<nsIDOMXULButtonElement> value;
+  GetCustomInterface(getter_AddRefs(value));
+  return value.forget();
+}
+
+already_AddRefed<nsIDOMXULContainerElement> Element::AsXULContainer() {
+  nsCOMPtr<nsIDOMXULContainerElement> value;
+  GetCustomInterface(getter_AddRefs(value));
+  return value.forget();
+}
+
+already_AddRefed<nsIDOMXULContainerItemElement> Element::AsXULContainerItem() {
+  nsCOMPtr<nsIDOMXULContainerItemElement> value;
+  GetCustomInterface(getter_AddRefs(value));
+  return value.forget();
+}
+
+already_AddRefed<nsIDOMXULControlElement> Element::AsXULControl() {
+  nsCOMPtr<nsIDOMXULControlElement> value;
+  GetCustomInterface(getter_AddRefs(value));
+  return value.forget();
+}
+
+already_AddRefed<nsIDOMXULMenuListElement> Element::AsXULMenuList() {
+  nsCOMPtr<nsIDOMXULMenuListElement> value;
+  GetCustomInterface(getter_AddRefs(value));
+  return value.forget();
+}
+
+already_AddRefed<nsIDOMXULMultiSelectControlElement>
+Element::AsXULMultiSelectControl() {
+  nsCOMPtr<nsIDOMXULMultiSelectControlElement> value;
+  GetCustomInterface(getter_AddRefs(value));
+  return value.forget();
+}
+
+already_AddRefed<nsIDOMXULRadioGroupElement> Element::AsXULRadioGroup() {
+  nsCOMPtr<nsIDOMXULRadioGroupElement> value;
+  GetCustomInterface(getter_AddRefs(value));
+  return value.forget();
+}
+
+already_AddRefed<nsIDOMXULRelatedElement> Element::AsXULRelated() {
+  nsCOMPtr<nsIDOMXULRelatedElement> value;
+  GetCustomInterface(getter_AddRefs(value));
+  return value.forget();
+}
+
+already_AddRefed<nsIDOMXULSelectControlElement> Element::AsXULSelectControl() {
+  nsCOMPtr<nsIDOMXULSelectControlElement> value;
+  GetCustomInterface(getter_AddRefs(value));
+  return value.forget();
+}
+
+already_AddRefed<nsIDOMXULSelectControlItemElement>
+Element::AsXULSelectControlItem() {
+  nsCOMPtr<nsIDOMXULSelectControlItemElement> value;
+  GetCustomInterface(getter_AddRefs(value));
+  return value.forget();
+}
+
+already_AddRefed<nsIBrowser> Element::AsBrowser() {
+  nsCOMPtr<nsIBrowser> value;
+  GetCustomInterface(getter_AddRefs(value));
+  return value.forget();
+}
+
+already_AddRefed<nsIAutoCompletePopup> Element::AsAutoCompletePopup() {
+  nsCOMPtr<nsIAutoCompletePopup> value;
+  GetCustomInterface(getter_AddRefs(value));
+  return value.forget();
+}
+
+nsPresContext* Element::GetPresContext(PresContextFor aFor) const {
+  Document* doc =
+      (aFor == eForComposedDoc) ? GetComposedDoc() : GetUncomposedDoc();
+  if (doc) {
+    return doc->GetPresContext();
+  }
+
+  return nullptr;
+}
+
+MOZ_DEFINE_MALLOC_SIZE_OF(ServoElementMallocSizeOf)
+MOZ_DEFINE_MALLOC_ENCLOSING_SIZE_OF(ServoElementMallocEnclosingSizeOf)
+
+void Element::AddSizeOfExcludingThis(nsWindowSizes& aSizes,
+                                     size_t* aNodeSize) const {
+  FragmentOrElement::AddSizeOfExcludingThis(aSizes, aNodeSize);
+  *aNodeSize += mAttrs.SizeOfExcludingThis(aSizes.mState.mMallocSizeOf);
+
+  if (HasServoData()) {
+    aSizes.mLayoutElementDataObjects +=
+        aSizes.mState.mMallocSizeOf(mServoData.Get());
+
+    *aNodeSize += Servo_Element_SizeOfExcludingThisAndCVs(
+        ServoElementMallocSizeOf, ServoElementMallocEnclosingSizeOf,
+        &aSizes.mState.mSeenPtrs, this);
+
+    if (auto* style = Servo_Element_GetMaybeOutOfDateStyle(this)) {
+      if (!aSizes.mState.HaveSeenPtr(style)) {
+        style->AddSizeOfIncludingThis(aSizes, &aSizes.mLayoutComputedValuesDom);
+      }
+
+      for (size_t i = 0; i < PseudoStyle::kEagerPseudoCount; i++) {
+        if (auto* style = Servo_Element_GetMaybeOutOfDatePseudoStyle(this, i)) {
+          if (!aSizes.mState.HaveSeenPtr(style)) {
+            style->AddSizeOfIncludingThis(aSizes,
+                                          &aSizes.mLayoutComputedValuesDom);
+          }
+        }
+      }
+    }
+  }
+}
+
+#ifdef DEBUG
+static bool BitsArePropagated(const Element* aElement, uint32_t aBits,
+                              nsINode* aRestyleRoot) {
+  const Element* curr = aElement;
+  while (curr) {
+    if (curr == aRestyleRoot) {
+      return true;
+    }
+    if (!curr->HasAllFlags(aBits)) {
+      return false;
+    }
+    nsINode* parentNode = curr->GetParentNode();
+    curr = curr->GetFlattenedTreeParentElementForStyle();
+    MOZ_ASSERT_IF(!curr,
+                  parentNode == aElement->OwnerDoc() ||
+                      parentNode == parentNode->OwnerDoc()->GetRootElement());
+  }
+  return true;
+}
+#endif
+
+static inline void AssertNoBitsPropagatedFrom(nsINode* aRoot) {
+#ifdef DEBUG
+  if (!aRoot || !aRoot->IsElement()) {
+    return;
+  }
+
+  auto* element = aRoot->GetFlattenedTreeParentElementForStyle();
+  while (element) {
+    MOZ_ASSERT(!element->HasAnyOfFlags(Element::kAllServoDescendantBits));
+    element = element->GetFlattenedTreeParentElementForStyle();
+  }
+#endif
+}
+
+static inline Element* PropagateBits(Element* aElement, uint32_t aBits,
+                                     nsINode* aStopAt, uint32_t aBitsToStopAt) {
+  Element* curr = aElement;
+  while (curr && !curr->HasAllFlags(aBitsToStopAt)) {
+    curr->SetFlags(aBits);
+    if (curr == aStopAt) {
+      break;
+    }
+    curr = curr->GetFlattenedTreeParentElementForStyle();
+  }
+
+  if (aBitsToStopAt != aBits && curr) {
+    curr->SetFlags(aBits);
+  }
+
+  return curr;
+}
+
+static void NoteDirtyElement(Element* aElement, uint32_t aBits) {
+  MOZ_ASSERT(aElement->IsInComposedDoc());
+
+  Document* doc = aElement->GetComposedDoc();
+  nsINode* existingRoot = doc->GetServoRestyleRoot();
+  if (existingRoot == aElement) {
+    doc->SetServoRestyleRootDirtyBits(doc->GetServoRestyleRootDirtyBits() |
+                                      aBits);
+    return;
+  }
+
+  nsINode* parent = aElement->GetFlattenedTreeParentNodeForStyle();
+  if (!parent) {
+    return;
+  }
+
+  if (MOZ_LIKELY(parent->IsElement())) {
+    if (!parent->AsElement()->HasServoData()) {
+      return;
+    }
+
+    if (parent->HasAllFlags(aBits)) {
+      return;
+    }
+
+    if (Servo_Element_IsDisplayNone(parent->AsElement())) {
+      return;
+    }
+  }
+
+  if (PresShell* presShell = doc->GetPresShell()) {
+    presShell->EnsureStyleFlush();
+  }
+
+  MOZ_ASSERT(parent->IsElement() || parent == doc);
+
+  AssertNoBitsPropagatedFrom(existingRoot);
+
+  if (!existingRoot) {
+    doc->SetServoRestyleRoot(aElement, aBits);
+    return;
+  }
+
+  const bool reachedDocRoot =
+      !parent->IsElement() ||
+      !PropagateBits(parent->AsElement(), aBits, existingRoot, aBits);
+
+  uint32_t existingBits = doc->GetServoRestyleRootDirtyBits();
+  if (!reachedDocRoot || existingRoot == doc) {
+    doc->SetServoRestyleRoot(existingRoot, existingBits | aBits);
+  } else {
+    Element* rootParent = existingRoot->GetFlattenedTreeParentElementForStyle();
+    if (Element* commonAncestor =
+            PropagateBits(rootParent, existingBits, aElement, aBits)) {
+      MOZ_ASSERT(commonAncestor == aElement ||
+                 commonAncestor ==
+                     nsContentUtils::GetCommonFlattenedTreeAncestorForStyle(
+                         aElement, rootParent));
+
+      doc->SetServoRestyleRoot(commonAncestor, existingBits | aBits);
+      Element* curr = commonAncestor;
+      while ((curr = curr->GetFlattenedTreeParentElementForStyle())) {
+        MOZ_ASSERT(curr->HasAllFlags(aBits));
+        curr->UnsetFlags(aBits);
+      }
+      AssertNoBitsPropagatedFrom(commonAncestor);
+    } else {
+      doc->SetServoRestyleRoot(doc, existingBits | aBits);
+    }
+  }
+
+  MOZ_ASSERT(aElement == doc->GetServoRestyleRoot() ||
+             !doc->GetServoRestyleRoot()->IsElement() ||
+             nsContentUtils::ContentIsFlattenedTreeDescendantOfForStyle(
+                 aElement, doc->GetServoRestyleRoot()));
+  MOZ_ASSERT(aElement == doc->GetServoRestyleRoot() ||
+             !doc->GetServoRestyleRoot()->IsElement() || !parent->IsElement() ||
+             BitsArePropagated(parent->AsElement(), aBits,
+                               doc->GetServoRestyleRoot()));
+  MOZ_ASSERT(doc->GetServoRestyleRootDirtyBits() & aBits);
+}
+
+void Element::NoteDirtySubtreeForServo() {
+  MOZ_ASSERT(IsInComposedDoc());
+  MOZ_ASSERT(HasServoData());
+
+  Document* doc = GetComposedDoc();
+  nsINode* existingRoot = doc->GetServoRestyleRoot();
+  uint32_t existingBits =
+      existingRoot ? doc->GetServoRestyleRootDirtyBits() : 0;
+
+  if (existingRoot && existingRoot->IsElement() && existingRoot != this &&
+      nsContentUtils::ContentIsFlattenedTreeDescendantOfForStyle(
+          existingRoot->AsElement(), this)) {
+    PropagateBits(
+        existingRoot->AsElement()->GetFlattenedTreeParentElementForStyle(),
+        existingBits, this, existingBits);
+
+    doc->ClearServoRestyleRoot();
+  }
+
+  NoteDirtyElement(this,
+                   existingBits | ELEMENT_HAS_DIRTY_DESCENDANTS_FOR_SERVO);
+}
+
+void Element::NoteDirtyForServo() {
+  NoteDirtyElement(this, ELEMENT_HAS_DIRTY_DESCENDANTS_FOR_SERVO);
+}
+
+void Element::NoteAnimationOnlyDirtyForServo() {
+  NoteDirtyElement(this,
+                   ELEMENT_HAS_ANIMATION_ONLY_DIRTY_DESCENDANTS_FOR_SERVO);
+}
+
+void Element::NoteDescendantsNeedFramesForServo() {
+  NoteDirtyElement(this, NODE_DESCENDANTS_NEED_FRAMES);
+  SetFlags(NODE_DESCENDANTS_NEED_FRAMES);
+}
+
+double Element::FirstLineBoxBSize() const {
+  const nsBlockFrame* frame = do_QueryFrame(GetPrimaryFrame());
+  if (!frame) {
+    return 0.0;
+  }
+  nsBlockFrame::ConstLineIterator line = frame->LinesBegin();
+  nsBlockFrame::ConstLineIterator lineEnd = frame->LinesEnd();
+  return line != lineEnd
+             ? nsPresContext::AppUnitsToDoubleCSSPixels(line->BSize())
+             : 0.0;
+}
+
+nsAtom* Element::GetEventNameForAttr(nsAtom* aAttr) {
+  if (aAttr == nsGkAtoms::onwebkitanimationend) {
+    return nsGkAtoms::onwebkitAnimationEnd;
+  }
+  if (aAttr == nsGkAtoms::onwebkitanimationiteration) {
+    return nsGkAtoms::onwebkitAnimationIteration;
+  }
+  if (aAttr == nsGkAtoms::onwebkitanimationstart) {
+    return nsGkAtoms::onwebkitAnimationStart;
+  }
+  if (aAttr == nsGkAtoms::onwebkittransitionend) {
+    return nsGkAtoms::onwebkitTransitionEnd;
+  }
+  return aAttr;
+}
+
+void Element::RegUnRegAccessKey(bool aDoReg) {
+  nsAutoString accessKey;
+  GetAttr(nsGkAtoms::accesskey, accessKey);
+  if (accessKey.IsEmpty()) {
+    return;
+  }
+
+  if (nsPresContext* presContext = GetPresContext(eForComposedDoc)) {
+    EventStateManager* esm = presContext->EventStateManager();
+
+    if (aDoReg) {
+      esm->RegisterAccessKey(this, (uint32_t)accessKey.First());
+    } else {
+      esm->UnregisterAccessKey(this, (uint32_t)accessKey.First());
+    }
+  }
+}
+
+void Element::SetHTML(const nsAString& aHTML, const SetHTMLOptions& aOptions,
+                      ErrorResult& aError) {
+  nsContentUtils::SetHTML(this, this, aHTML, aOptions, aError);
+}
+
+void Element::GetHTML(const GetHTMLOptions& aOptions, nsAString& aResult) {
+  if (aOptions.mSerializableShadowRoots || !aOptions.mShadowRoots.IsEmpty()) {
+    nsContentUtils::SerializeNodeToMarkup<SerializeShadowRoots::Yes>(
+        this, true, aResult, aOptions.mSerializableShadowRoots,
+        aOptions.mShadowRoots);
+  } else {
+    nsContentUtils::SerializeNodeToMarkup<SerializeShadowRoots::No>(
+        this, true, aResult, aOptions.mSerializableShadowRoots,
+        aOptions.mShadowRoots);
+  }
+}
+
+StylePropertyMapReadOnly* Element::ComputedStyleMap() {
+  nsDOMSlots* slots = DOMSlots();
+
+  if (!slots->mComputedStyleMap) {
+    slots->mComputedStyleMap = MakeRefPtr<StylePropertyMapReadOnly>(this);
+  }
+
+  return slots->mComputedStyleMap;
+}
+
+bool Element::Translate() const {
+  if (const auto* parent = Element::FromNodeOrNull(mParent)) {
+    return parent->Translate();
+  }
+  return true;
+}
+
+EditorBase* Element::GetExtantEditor() const {
+  if (!IsInComposedDoc()) {
+    return nullptr;
+  }
+  const bool isInDesignMode = IsInDesignMode();
+  if (!isInDesignMode) {
+    if (const auto* textControlElement = TextControlElement::FromNode(this)) {
+      if (textControlElement->IsSingleLineTextControlOrTextArea()) {
+        return textControlElement->GetExtantTextEditor();
+      }
+    }
+  }
+
+  if (!isInDesignMode && !IsEditable()) {
+    return nullptr;
+  }
+  nsDocShell* const docShell = nsDocShell::Cast(OwnerDoc()->GetDocShell());
+  return docShell ? docShell->GetHTMLEditorInternal() : nullptr;
+}
+
+void Element::SetHTMLUnsafe(const TrustedHTMLOrString& aHTML,
+                            const SetHTMLUnsafeOptions& aOptions,
+                            nsIPrincipal* aSubjectPrincipal,
+                            ErrorResult& aError) {
+  nsContentUtils::SetHTMLUnsafe(this, this, aHTML, aOptions,
+                                false , aSubjectPrincipal,
+                                aError);
+}
+
+void Element::FireBeforematchEvent(ErrorResult& aRv) {
+  RefPtr<Event> event = NS_NewDOMEvent(this, nullptr, nullptr);
+  event->InitEvent(u"beforematch"_ns,
+                   true,
+                   false);
+
+  event->SetTrusted(true);
+  DispatchEvent(*event, aRv);
+}
+
+bool Element::BlockingContainsRender() const {
+  const nsAttrValue* attrValue = GetParsedAttr(nsGkAtoms::blocking);
+  if (!attrValue || !StaticPrefs::dom_element_blocking_enabled()) {
+    return false;
+  }
+  MOZ_ASSERT(attrValue->Type() == nsAttrValue::eAtomArray,
+             "Checking blocking attribute on element that doesn't parse it?");
+  return attrValue->Contains(nsGkAtoms::render, eIgnoreCase);
+}
+
+static bool IsOffsetParent(nsIFrame* aFrame) {
+  LayoutFrameType frameType = aFrame->Type();
+
+  if (frameType == LayoutFrameType::TableCell ||
+      frameType == LayoutFrameType::TableWrapper) {
+    nsIContent* content = aFrame->GetContent();
+
+    return content->IsAnyOfHTMLElements(nsGkAtoms::table, nsGkAtoms::td,
+                                        nsGkAtoms::th);
+  }
+  return false;
+}
+
+struct OffsetResult {
+  Element* mParent = nullptr;
+  nsRect mRect;
+};
+
+static OffsetResult GetUnretargetedOffsetsFor(const Element& aElement) {
+  nsIFrame* frame = aElement.GetPrimaryFrame();
+  if (!frame) {
+    return {};
+  }
+
+  nsIFrame* styleFrame = nsLayoutUtils::GetStyleFrame(frame);
+
+  nsIFrame* parent = frame->GetParent();
+  nsPoint origin(0, 0);
+
+  nsIContent* offsetParent = nullptr;
+  Element* docElement = aElement.GetComposedDoc()->GetRootElement();
+  nsIContent* content = frame->GetContent();
+  const auto effectiveZoom = frame->Style()->EffectiveZoom();
+
+  if (content &&
+      (content->IsHTMLElement(nsGkAtoms::body) || content == docElement)) {
+    parent = frame;
+  } else {
+    const bool isPositioned = styleFrame->IsAbsPosContainingBlock();
+    const bool isAbsolutelyPositioned = frame->IsAbsolutelyPositioned();
+    origin += frame->GetPositionIgnoringScrolling();
+
+    for (; parent; parent = parent->GetParent()) {
+      content = parent->GetContent();
+
+      if (parent->IsAbsPosContainingBlock()) {
+        offsetParent = content;
+        break;
+      }
+
+      if (effectiveZoom != parent->Style()->EffectiveZoom()) {
+        offsetParent = content;
+        break;
+      }
+
+      const bool isOffsetParent = !isPositioned && IsOffsetParent(parent);
+      if (!isOffsetParent) {
+        origin += parent->GetPositionIgnoringScrolling();
+      }
+
+      if (content) {
+        if (content == docElement) {
+          break;
+        }
+
+        if (isOffsetParent || content->IsHTMLElement(nsGkAtoms::body)) {
+          offsetParent = content;
+          break;
+        }
+      }
+    }
+
+    if (isAbsolutelyPositioned && !offsetParent &&
+        !frame->GetParent()->IsViewportFrame()) {
+      offsetParent = aElement.GetComposedDoc()->GetBodyElement();
+    }
+  }
+
+  if (parent) {
+    const nsStyleBorder* border = parent->StyleBorder();
+    origin.x -= border->GetComputedBorderWidth(eSideLeft);
+    origin.y -= border->GetComputedBorderWidth(eSideTop);
+  }
+
+  nsRect rcFrame = nsLayoutUtils::GetAllInFlowRectsUnion(frame, frame);
+  rcFrame.MoveTo(origin);
+  return {Element::FromNodeOrNull(offsetParent), rcFrame};
+}
+
+static bool ShouldBeRetargeted(const Element& aReferenceElement,
+                               const Element& aElementToMaybeRetarget) {
+  ShadowRoot* shadow = aElementToMaybeRetarget.GetContainingShadow();
+  if (!shadow) {
+    return false;
+  }
+  for (ShadowRoot* scope = aReferenceElement.GetContainingShadow(); scope;
+       scope = scope->Host()->GetContainingShadow()) {
+    if (scope == shadow) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+Element* Element::GetOffsetRect(CSSIntRect& aRect) {
+  aRect = CSSIntRect();
+
+  nsIFrame* frame = GetPrimaryFrame(FlushType::Layout);
+  if (!frame) {
+    return nullptr;
+  }
+
+  OffsetResult thisResult = GetUnretargetedOffsetsFor(*this);
+  nsRect rect = thisResult.mRect;
+  Element* parent = thisResult.mParent;
+  while (parent && ShouldBeRetargeted(*this, *parent)) {
+    OffsetResult result = GetUnretargetedOffsetsFor(*parent);
+    rect += result.mRect.TopLeft();
+    parent = result.mParent;
+  }
+
+  aRect = CSSIntRect::FromAppUnitsRounded(
+      frame->Style()->EffectiveZoom().Unzoom(rect));
+  return parent;
+}
+
+}  

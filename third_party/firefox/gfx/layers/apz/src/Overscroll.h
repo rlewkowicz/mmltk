@@ -1,0 +1,218 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_Overscroll_h
+#define mozilla_layers_Overscroll_h
+
+#include "AsyncPanZoomAnimation.h"
+#include "AsyncPanZoomController.h"
+#include "mozilla/TimeStamp.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla {
+namespace layers {
+
+class OverscrollAnimation : public AsyncPanZoomAnimation {
+ public:
+  OverscrollAnimation(AsyncPanZoomController& aApzc,
+                      const ParentLayerPoint& aVelocity,
+                      SideBits aOverscrollSideBits)
+      : mApzc(aApzc), mOverscrollSideBits(aOverscrollSideBits) {
+    MOZ_ASSERT(
+        (mOverscrollSideBits & SideBits::eTopBottom) != SideBits::eTopBottom &&
+            (mOverscrollSideBits & SideBits::eLeftRight) !=
+                SideBits::eLeftRight,
+        "Don't allow overscrolling on both sides at the same time");
+    if ((aOverscrollSideBits & SideBits::eLeftRight) != SideBits::eNone) {
+      mApzc.mX.StartOverscrollAnimation(aVelocity.x);
+    }
+    if ((aOverscrollSideBits & SideBits::eTopBottom) != SideBits::eNone) {
+      mApzc.mY.StartOverscrollAnimation(aVelocity.y);
+    }
+  }
+  virtual ~OverscrollAnimation() {
+    mApzc.mX.EndOverscrollAnimation();
+    mApzc.mY.EndOverscrollAnimation();
+  }
+
+  virtual bool DoSample(FrameMetrics& aFrameMetrics,
+                        const TimeDuration& aDelta) override {
+    bool continueX = mApzc.mX.IsOverscrollAnimationAlive() &&
+                     mApzc.mX.SampleOverscrollAnimation(
+                         aDelta, mOverscrollSideBits & SideBits::eLeftRight);
+    bool continueY = mApzc.mY.IsOverscrollAnimationAlive() &&
+                     mApzc.mY.SampleOverscrollAnimation(
+                         aDelta, mOverscrollSideBits & SideBits::eTopBottom);
+    if (!continueX && !continueY) {
+      mDeferredTasks.AppendElement(NewRunnableMethod<ScrollSnapFlags>(
+          "layers::AsyncPanZoomController::ScrollSnap", &mApzc,
+          &AsyncPanZoomController::ScrollSnap,
+          ScrollSnapFlags::IntendedEndPosition));
+      return false;
+    }
+    return true;
+  }
+
+  virtual bool WantsRepaints() override { return false; }
+
+  void HandlePanMomentum(const ParentLayerPoint& aDisplacement) {
+    float xOverscroll = mApzc.mX.GetOverscroll();
+    if ((xOverscroll > 0 && aDisplacement.x > 0) ||
+        (xOverscroll < 0 && aDisplacement.x < 0)) {
+      if (!mApzc.mX.IsOverscrollAnimationRunning()) {
+        mApzc.mX.StartOverscrollAnimation(mApzc.mX.GetVelocity());
+        mOverscrollSideBits |=
+            xOverscroll > 0 ? SideBits::eRight : SideBits::eLeft;
+      }
+    } else if ((xOverscroll > 0 && aDisplacement.x < 0) ||
+               (xOverscroll < 0 && aDisplacement.x > 0)) {
+      mApzc.mX.EndOverscrollAnimation();
+    }
+
+    float yOverscroll = mApzc.mY.GetOverscroll();
+    if ((yOverscroll > 0 && aDisplacement.y > 0) ||
+        (yOverscroll < 0 && aDisplacement.y < 0)) {
+      if (!mApzc.mY.IsOverscrollAnimationRunning()) {
+        mApzc.mY.StartOverscrollAnimation(mApzc.mY.GetVelocity());
+        mOverscrollSideBits |=
+            yOverscroll > 0 ? SideBits::eBottom : SideBits::eTop;
+      }
+    } else if ((yOverscroll > 0 && aDisplacement.y < 0) ||
+               (yOverscroll < 0 && aDisplacement.y > 0)) {
+      mApzc.mY.EndOverscrollAnimation();
+    }
+  }
+
+  ScrollDirections GetDirections() const {
+    ScrollDirections directions;
+    if (mApzc.mX.IsOverscrollAnimationRunning()) {
+      directions += ScrollDirection::eHorizontal;
+    }
+    if (mApzc.mY.IsOverscrollAnimationRunning()) {
+      directions += ScrollDirection::eVertical;
+    }
+    return directions;
+  };
+
+  OverscrollAnimation* AsOverscrollAnimation() override { return this; }
+
+  bool IsManagingXAxis() const {
+    return mApzc.mX.IsOverscrollAnimationRunning();
+  }
+  bool IsManagingYAxis() const {
+    return mApzc.mY.IsOverscrollAnimationRunning();
+  }
+
+ private:
+  AsyncPanZoomController& mApzc;
+  SideBits mOverscrollSideBits;
+};
+
+class OverscrollEffectBase {
+ public:
+  virtual ~OverscrollEffectBase() = default;
+
+  virtual void ConsumeOverscroll(
+      ParentLayerPoint& aOverscroll,
+      ScrollDirections aOverscrollableDirections) = 0;
+
+  virtual void RelieveOverscroll(const ParentLayerPoint& aVelocity,
+                                 SideBits aOverscrollSideBits) = 0;
+
+  virtual bool IsOverscrolled() const = 0;
+
+  virtual void ClearOverscroll() = 0;
+};
+
+class GenericOverscrollEffect : public OverscrollEffectBase {
+ public:
+  explicit GenericOverscrollEffect(AsyncPanZoomController& aApzc)
+      : mApzc(aApzc) {}
+
+  void ConsumeOverscroll(ParentLayerPoint& aOverscroll,
+                         ScrollDirections aOverscrollableDirections) override {
+    if (aOverscrollableDirections.contains(ScrollDirection::eHorizontal)) {
+      mApzc.mX.OverscrollBy(aOverscroll.x);
+      aOverscroll.x = 0;
+    }
+
+    if (aOverscrollableDirections.contains(ScrollDirection::eVertical)) {
+      mApzc.mY.OverscrollBy(aOverscroll.y);
+      aOverscroll.y = 0;
+    }
+
+    if (!aOverscrollableDirections.isEmpty()) {
+      mApzc.ScheduleComposite();
+    }
+  }
+
+  void RelieveOverscroll(const ParentLayerPoint& aVelocity,
+                         SideBits aOverscrollSideBits) override {
+    mApzc.StartOverscrollAnimation(aVelocity, aOverscrollSideBits);
+  }
+
+  bool IsOverscrolled() const override {
+    return mApzc.IsPhysicallyOverscrolled();
+  }
+
+  void ClearOverscroll() override { mApzc.ClearPhysicalOverscroll(); }
+
+ private:
+  AsyncPanZoomController& mApzc;
+};
+
+class WidgetOverscrollEffect : public OverscrollEffectBase {
+ public:
+  explicit WidgetOverscrollEffect(AsyncPanZoomController& aApzc)
+      : mApzc(aApzc), mIsOverscrolled(false) {}
+
+  void ConsumeOverscroll(ParentLayerPoint& aOverscroll,
+                         ScrollDirections aOverscrollableDirections) override {
+    RefPtr<GeckoContentController> controller =
+        mApzc.GetGeckoContentController();
+    if (!aOverscrollableDirections.contains(ScrollDirection::eHorizontal)) {
+      aOverscroll.x = 0;
+    }
+
+    if (!aOverscrollableDirections.contains(ScrollDirection::eVertical)) {
+      aOverscroll.y = 0;
+    }
+
+    if (controller && !aOverscrollableDirections.isEmpty()) {
+      mIsOverscrolled = true;
+      controller->UpdateOverscrollOffset(mApzc.GetGuid(), aOverscroll.x,
+                                         aOverscroll.y, mApzc.IsRootContent());
+      aOverscroll = ParentLayerPoint();
+    }
+  }
+
+  void RelieveOverscroll(const ParentLayerPoint& aVelocity,
+                         SideBits aOverscrollSideBits) override {
+    if (!mIsOverscrolled) {
+      return;
+    }
+    RefPtr<GeckoContentController> controller =
+        mApzc.GetGeckoContentController();
+    mIsOverscrolled = false;
+    if (controller) {
+      controller->UpdateOverscrollVelocity(mApzc.GetGuid(), aVelocity.x,
+                                           aVelocity.y, mApzc.IsRootContent());
+    }
+  }
+
+  bool IsOverscrolled() const override { return mIsOverscrolled; }
+
+  void ClearOverscroll() override {
+    RelieveOverscroll(ParentLayerPoint(), SideBits() );
+  }
+
+ private:
+  AsyncPanZoomController& mApzc;
+  bool mIsOverscrolled;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_Overscroll_h

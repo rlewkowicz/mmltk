@@ -1,0 +1,116 @@
+// Copyright 2011 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#if !defined(WEBP_UTILS_BIT_WRITER_UTILS_H_)
+#define WEBP_UTILS_BIT_WRITER_UTILS_H_
+
+#include <stddef.h>
+
+#include "src/webp/types.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+
+typedef struct VP8BitWriter VP8BitWriter;
+struct VP8BitWriter {
+  int32_t  range;      
+  int32_t  value;
+  int      run;        
+  int      nb_bits;    
+  uint8_t* buf;        
+  size_t   pos;
+  size_t   max_pos;
+  int      error;      
+};
+
+int VP8BitWriterInit(VP8BitWriter* const bw, size_t expected_size);
+uint8_t* VP8BitWriterFinish(VP8BitWriter* const bw);
+void VP8BitWriterWipeOut(VP8BitWriter* const bw);
+
+int VP8PutBit(VP8BitWriter* const bw, int bit, int prob);
+int VP8PutBitUniform(VP8BitWriter* const bw, int bit);
+void VP8PutBits(VP8BitWriter* const bw, uint32_t value, int nb_bits);
+void VP8PutSignedBits(VP8BitWriter* const bw, int value, int nb_bits);
+
+int VP8BitWriterAppend(VP8BitWriter* const bw,
+                       const uint8_t* data, size_t size);
+
+static WEBP_INLINE uint64_t VP8BitWriterPos(const VP8BitWriter* const bw) {
+  const uint64_t nb_bits = 8 + bw->nb_bits;   
+  return (bw->pos + bw->run) * 8 + nb_bits;
+}
+
+static WEBP_INLINE uint8_t* VP8BitWriterBuf(const VP8BitWriter* const bw) {
+  return bw->buf;
+}
+static WEBP_INLINE size_t VP8BitWriterSize(const VP8BitWriter* const bw) {
+  return bw->pos;
+}
+
+
+#if defined(__x86_64__) || defined(_M_X64)   // 64bit
+typedef uint64_t vp8l_atype_t;   
+typedef uint32_t vp8l_wtype_t;   
+#define WSWAP HToLE32
+#define VP8L_WRITER_BYTES    4   // sizeof(vp8l_wtype_t)
+#define VP8L_WRITER_BITS     32  // 8 * sizeof(vp8l_wtype_t)
+#define VP8L_WRITER_MAX_BITS 64  // 8 * sizeof(vp8l_atype_t)
+#else
+typedef uint32_t vp8l_atype_t;
+typedef uint16_t vp8l_wtype_t;
+#define WSWAP HToLE16
+#define VP8L_WRITER_BYTES    2
+#define VP8L_WRITER_BITS     16
+#define VP8L_WRITER_MAX_BITS 32
+#endif
+
+typedef struct {
+  vp8l_atype_t bits;   
+  int          used;   
+  uint8_t*     buf;    
+  uint8_t*     cur;    
+  uint8_t*     end;    
+
+  int error;
+} VP8LBitWriter;
+
+static WEBP_INLINE size_t VP8LBitWriterNumBytes(const VP8LBitWriter* const bw) {
+  return (bw->cur - bw->buf) + ((bw->used + 7) >> 3);
+}
+
+int VP8LBitWriterInit(VP8LBitWriter* const bw, size_t expected_size);
+int VP8LBitWriterClone(const VP8LBitWriter* const src,
+                       VP8LBitWriter* const dst);
+uint8_t* VP8LBitWriterFinish(VP8LBitWriter* const bw);
+void VP8LBitWriterWipeOut(VP8LBitWriter* const bw);
+void VP8LBitWriterReset(const VP8LBitWriter* const bw_init,
+                        VP8LBitWriter* const bw);
+void VP8LBitWriterSwap(VP8LBitWriter* const src, VP8LBitWriter* const dst);
+
+void VP8LPutBitsFlushBits(VP8LBitWriter* const bw);
+
+void VP8LPutBitsInternal(VP8LBitWriter* const bw, uint32_t bits, int n_bits);
+
+static WEBP_INLINE void VP8LPutBits(VP8LBitWriter* const bw,
+                                    uint32_t bits, int n_bits) {
+  if (sizeof(vp8l_wtype_t) == 4) {
+    if (n_bits > 0) {
+      if (bw->used >= 32) {
+        VP8LPutBitsFlushBits(bw);
+      }
+      bw->bits |= (vp8l_atype_t)bits << bw->used;
+      bw->used += n_bits;
+    }
+  } else {
+    VP8LPutBitsInternal(bw, bits, n_bits);
+  }
+}
+
+
+#if defined(__cplusplus)
+}    
+#endif
+
+#endif

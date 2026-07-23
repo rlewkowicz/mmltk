@@ -1,0 +1,196 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsDOMStringMap.h"
+
+#include "jsapi.h"
+#include "mozilla/dom/DOMStringMapBinding.h"
+#include "nsContentUtils.h"
+#include "nsError.h"
+#include "nsGenericHTMLElement.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(nsDOMStringMap)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsDOMStringMap)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mElement)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsDOMStringMap)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+  if (tmp->mElement) {
+    tmp->mElement->ClearDataset();
+    tmp->mElement->RemoveMutationObserver(tmp);
+    tmp->mElement = nullptr;
+  }
+  tmp->mExpandoAndGeneration.OwnerUnlinked();
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsDOMStringMap)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsIMutationObserver)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(nsDOMStringMap)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(nsDOMStringMap)
+
+nsDOMStringMap::nsDOMStringMap(Element* aElement)
+    : mElement(aElement), mRemovingProp(false) {
+  mElement->AddMutationObserver(this);
+}
+
+nsDOMStringMap::~nsDOMStringMap() {
+  if (mElement) {
+    mElement->ClearDataset();
+    mElement->RemoveMutationObserver(this);
+  }
+}
+
+DocGroup* nsDOMStringMap::GetDocGroup() const {
+  return mElement ? mElement->GetDocGroup() : nullptr;
+}
+
+JSObject* nsDOMStringMap::WrapObject(JSContext* cx,
+                                     JS::Handle<JSObject*> aGivenProto) {
+  return DOMStringMap_Binding::Wrap(cx, this, aGivenProto);
+}
+
+void nsDOMStringMap::NamedGetter(const nsAString& aProp, bool& found,
+                                 DOMString& aResult) const {
+  nsAutoString attr;
+
+  if (!DataPropToAttr(aProp, attr)) {
+    found = false;
+    return;
+  }
+
+  found = mElement->GetAttr(attr, aResult);
+}
+
+void nsDOMStringMap::NamedSetter(const nsAString& aProp,
+                                 const nsAString& aValue, ErrorResult& rv) {
+  nsAutoString attr;
+  if (!DataPropToAttr(aProp, attr)) {
+    rv.Throw(NS_ERROR_DOM_SYNTAX_ERR);
+    return;
+  }
+
+  if (!nsContentUtils::IsValidAttributeLocalName(attr)) {
+    rv.ThrowInvalidCharacterError("Invalid attribute name");
+    return;
+  }
+
+  RefPtr<nsAtom> attrAtom = NS_Atomize(attr);
+  MOZ_ASSERT(attrAtom, "Should be infallible");
+
+  nsresult res = mElement->SetAttr(kNameSpaceID_None, attrAtom, aValue, true);
+  if (NS_FAILED(res)) {
+    rv.Throw(res);
+  }
+}
+
+void nsDOMStringMap::NamedDeleter(const nsAString& aProp, bool& found) {
+  if (mRemovingProp) {
+    found = false;
+    return;
+  }
+
+  nsAutoString attr;
+  if (!DataPropToAttr(aProp, attr)) {
+    found = false;
+    return;
+  }
+
+  RefPtr<nsAtom> attrAtom = NS_Atomize(attr);
+  MOZ_ASSERT(attrAtom, "Should be infallible");
+
+  found = mElement->HasAttr(attrAtom);
+
+  if (found) {
+    mRemovingProp = true;
+    mElement->UnsetAttr(kNameSpaceID_None, attrAtom, true);
+    mRemovingProp = false;
+  }
+}
+
+void nsDOMStringMap::GetSupportedNames(nsTArray<nsString>& aNames) {
+  uint32_t attrCount = mElement->GetAttrCount();
+
+  for (uint32_t i = 0; i < attrCount; ++i) {
+    const nsAttrName* attrName = mElement->GetAttrNameAt(i);
+    if (attrName->NamespaceID() != kNameSpaceID_None) {
+      continue;
+    }
+
+    nsAutoString prop;
+    if (!AttrToDataProp(nsDependentAtomString(attrName->LocalName()), prop)) {
+      continue;
+    }
+
+    aNames.AppendElement(prop);
+  }
+}
+
+bool nsDOMStringMap::DataPropToAttr(const nsAString& aProp,
+                                    nsAutoString& aResult) {
+  aResult.AppendLiteral("data-");
+
+  const char16_t* start = aProp.BeginReading();
+  const char16_t* end = aProp.EndReading();
+  const char16_t* cur = start;
+  for (; cur < end; ++cur) {
+    const char16_t* next = cur + 1;
+    if (char16_t('-') == *cur && next < end && char16_t('a') <= *next &&
+        *next <= char16_t('z')) {
+      return false;
+    }
+
+    if (char16_t('A') <= *cur && *cur <= char16_t('Z')) {
+      aResult.Append(start, cur - start);
+      aResult.Append(char16_t('-'));
+      aResult.Append(*cur - 'A' + 'a');
+      start = next;  
+    }
+  }
+
+  aResult.Append(start, cur - start);
+
+  return true;
+}
+
+bool nsDOMStringMap::AttrToDataProp(const nsAString& aAttr,
+                                    nsAutoString& aResult) {
+  if (!StringBeginsWith(aAttr, u"data-"_ns)) {
+    return false;
+  }
+
+  const char16_t* cur = aAttr.BeginReading() + 5;
+  const char16_t* end = aAttr.EndReading();
+
+
+  for (; cur < end; ++cur) {
+    const char16_t* next = cur + 1;
+    if (char16_t('-') == *cur && next < end && char16_t('a') <= *next &&
+        *next <= char16_t('z')) {
+      aResult.Append(*next - 'a' + 'A');
+      ++cur;
+    } else {
+      aResult.Append(*cur);
+    }
+  }
+
+  return true;
+}
+
+void nsDOMStringMap::AttributeChanged(Element* aElement, int32_t aNameSpaceID,
+                                      nsAtom* aAttribute, AttrModType aModType,
+                                      const nsAttrValue* aOldValue) {
+  if (IsAdditionOrRemoval(aModType) && aNameSpaceID == kNameSpaceID_None &&
+      StringBeginsWith(nsDependentAtomString(aAttribute), u"data-"_ns)) {
+    ++mExpandoAndGeneration.generation;
+  }
+}

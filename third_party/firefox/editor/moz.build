@@ -1,0 +1,26 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+DIRS += [
+    "libeditor",
+    "txmgr",
+    "composer",
+]
+
+XPIDL_SOURCES += [
+    "nsIDocumentStateListener.idl",
+    "nsIEditActionListener.idl",
+    "nsIEditor.idl",
+    "nsIEditorMailSupport.idl",
+    "nsIHTMLAbsPosEditor.idl",
+    "nsIHTMLEditor.idl",
+    "nsIHTMLInlineTableEditor.idl",
+    "nsIHTMLObjectResizer.idl",
+    "nsITableEditor.idl",
+]
+
+XPIDL_MODULE = "editor"
+
+
+CXXFLAGS += CONFIG["MOZ_TRIVIAL_AUTO_VAR_INIT"]

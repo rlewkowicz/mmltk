@@ -1,0 +1,90 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ChangeStyleTransaction_h
+#define ChangeStyleTransaction_h
+
+#include "EditTransactionBase.h"  // base class
+
+#include "EditorForwards.h"
+
+#include "nsCycleCollectionParticipant.h"  // various macros
+#include "nsString.h"                      // nsString members
+
+class nsAtom;
+class nsStyledElement;
+
+namespace mozilla {
+
+namespace dom {
+class Element;
+}  
+
+class ChangeStyleTransaction final : public EditTransactionBase {
+ protected:
+  ChangeStyleTransaction(HTMLEditor& aHTMLEditor,
+                         nsStyledElement& aStyledElement, nsAtom& aProperty,
+                         const nsAString& aValue, bool aRemove);
+
+ public:
+  static already_AddRefed<ChangeStyleTransaction> Create(
+      HTMLEditor& aHTMLEditor, nsStyledElement& aStyledElement,
+      nsAtom& aProperty, const nsAString& aValue);
+
+  static already_AddRefed<ChangeStyleTransaction> CreateToRemove(
+      HTMLEditor& aHTMLEditor, nsStyledElement& aStyledElement,
+      nsAtom& aProperty, const nsAString& aValue);
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(ChangeStyleTransaction,
+                                           EditTransactionBase)
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+  NS_DECL_EDITTRANSACTIONBASE
+  NS_DECL_EDITTRANSACTIONBASE_GETASMETHODS_OVERRIDE(ChangeStyleTransaction)
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD RedoTransaction() override;
+
+  static bool ValueIncludes(const nsACString& aValueList,
+                            const nsACString& aValue);
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const ChangeStyleTransaction& aTransaction);
+
+ private:
+  virtual ~ChangeStyleTransaction() = default;
+
+  void BuildTextDecorationValueToSet(const nsACString& aCurrentValues,
+                                     const nsACString& aAddingValues,
+                                     nsACString& aOutValues);
+  void BuildTextDecorationValueToRemove(const nsACString& aCurrentValues,
+                                        const nsACString& aRemovingValues,
+                                        nsACString& aOutValues);
+
+  void BuildTextDecorationValue(bool aUnderline, bool aOverline,
+                                bool aLineThrough, nsACString& aOutValues);
+
+  MOZ_CAN_RUN_SCRIPT nsresult SetStyle(bool aAttributeWasSet,
+                                       nsACString& aValue);
+
+  RefPtr<HTMLEditor> mHTMLEditor;
+
+  RefPtr<nsStyledElement> mStyledElement;
+
+  RefPtr<nsAtom> mProperty;
+
+  nsCString mValue;
+
+  nsCString mUndoValue;
+  nsCString mRedoValue;
+
+  bool mRemoveProperty;
+
+  bool mUndoAttributeWasSet;
+  bool mRedoAttributeWasSet;
+};
+
+}  
+
+#endif  // #ifndef ChangeStyleTransaction_h

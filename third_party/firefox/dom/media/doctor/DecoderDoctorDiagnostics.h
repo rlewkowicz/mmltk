@@ -1,0 +1,143 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DecoderDoctorDiagnostics_h_
+#define DecoderDoctorDiagnostics_h_
+
+#include "MediaResult.h"
+#include "mozilla/DefineEnum.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/EnumTypeTraits.h"
+#include "mozilla/dom/DecoderDoctorNotificationBinding.h"
+#include "nsString.h"
+
+namespace IPC {
+template <typename T>
+struct ParamTraits;
+}  
+
+namespace mozilla {
+
+namespace dom {
+class Document;
+}
+
+struct DecoderDoctorEvent {
+  enum Domain {
+    eAudioSinkStartup,
+  } mDomain;
+  nsresult mResult;
+};
+
+
+class DecoderDoctorDiagnostics {
+  friend struct IPC::ParamTraits<mozilla::DecoderDoctorDiagnostics>;
+
+ public:
+  void StoreFormatDiagnostics(dom::Document* aDocument,
+                              const nsAString& aFormat, bool aCanPlay,
+                              const char* aCallSite);
+
+  void StoreMediaKeySystemAccess(dom::Document* aDocument,
+                                 const nsAString& aKeySystem, bool aIsSupported,
+                                 const char* aCallSite);
+
+  void StoreEvent(dom::Document* aDocument, const DecoderDoctorEvent& aEvent,
+                  const char* aCallSite);
+
+  void StoreDecodeError(dom::Document* aDocument, const MediaResult& aError,
+                        const nsString& aMediaSrc, const char* aCallSite);
+
+  void StoreDecodeWarning(dom::Document* aDocument, const MediaResult& aWarning,
+                          const nsString& aMediaSrc, const char* aCallSite);
+
+  enum DiagnosticsType {
+    eUnsaved,
+    eFormatSupportCheck,
+    eMediaKeySystemAccessRequest,
+    eEvent,
+    eDecodeError,
+    eDecodeWarning
+  };
+  DiagnosticsType Type() const { return mDiagnosticsType; }
+
+  nsCString GetDescription() const;
+
+
+  MOZ_DEFINE_ENUM_CLASS_AT_CLASS_SCOPE(
+      Flags, (CanPlay, WMFFailedToLoad, FFmpegNotFound, LibAVCodecUnsupported,
+              GMPPDMFailedToStartup, VideoNotSupported, AudioNotSupported));
+  using FlagsSet = mozilla::EnumSet<Flags>;
+
+  const nsAString& Format() const { return mFormat; }
+  bool CanPlay() const { return mFlags.contains(Flags::CanPlay); }
+
+  void SetFailureFlags(const FlagsSet& aFlags) { mFlags = aFlags; }
+  void SetWMFFailedToLoad() { mFlags += Flags::WMFFailedToLoad; }
+  bool DidWMFFailToLoad() const {
+    return mFlags.contains(Flags::WMFFailedToLoad);
+  }
+
+  void SetFFmpegNotFound() { mFlags += Flags::FFmpegNotFound; }
+  bool DidFFmpegNotFound() const {
+    return mFlags.contains(Flags::FFmpegNotFound);
+  }
+
+  void SetLibAVCodecUnsupported() { mFlags += Flags::LibAVCodecUnsupported; }
+  bool IsLibAVCodecUnsupported() const {
+    return mFlags.contains(Flags::LibAVCodecUnsupported);
+  }
+
+  void SetGMPPDMFailedToStartup() { mFlags += Flags::GMPPDMFailedToStartup; }
+  bool DidGMPPDMFailToStartup() const {
+    return mFlags.contains(Flags::GMPPDMFailedToStartup);
+  }
+
+  void SetVideoNotSupported() { mFlags += Flags::VideoNotSupported; }
+  void SetAudioNotSupported() { mFlags += Flags::AudioNotSupported; }
+
+  void SetGMP(const nsACString& aGMP) { mGMP = aGMP; }
+  const nsACString& GMP() const { return mGMP; }
+
+  const nsAString& KeySystem() const { return mKeySystem; }
+  bool IsKeySystemSupported() const { return mIsKeySystemSupported; }
+  enum KeySystemIssue { eUnset, eWidevineWithNoWMF };
+  void SetKeySystemIssue(KeySystemIssue aKeySystemIssue) {
+    mKeySystemIssue = aKeySystemIssue;
+  }
+  KeySystemIssue GetKeySystemIssue() const { return mKeySystemIssue; }
+
+  DecoderDoctorEvent event() const { return mEvent; }
+
+  const MediaResult& DecodeIssue() const { return mDecodeIssue; }
+  const nsString& DecodeIssueMediaSrc() const { return mDecodeIssueMediaSrc; }
+
+  void SetDecoderDoctorReportType(const dom::DecoderDoctorReportType& aType);
+
+ private:
+  DiagnosticsType mDiagnosticsType = eUnsaved;
+
+  nsString mFormat;
+  FlagsSet mFlags;
+  nsCString mGMP;
+
+  nsString mKeySystem;
+  bool mIsKeySystemSupported = false;
+  KeySystemIssue mKeySystemIssue = eUnset;
+
+  DecoderDoctorEvent mEvent;
+
+  MediaResult mDecodeIssue = NS_OK;
+  nsString mDecodeIssueMediaSrc;
+};
+
+template <>
+struct MaxEnumValue<::mozilla::DecoderDoctorDiagnostics::Flags> {
+  static constexpr unsigned int value =
+      static_cast<unsigned int>(DecoderDoctorDiagnostics::sFlagsCount);
+};
+
+}  
+
+#endif

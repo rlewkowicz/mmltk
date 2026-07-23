@@ -1,0 +1,46 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/shaders/SkTransformShader.h"
+
+#include "include/core/SkMatrix.h"
+#include "src/core/SkEffectPriv.h"
+#include "src/core/SkRasterPipeline.h"
+#include "src/core/SkRasterPipelineOpList.h"
+
+#include <optional>
+
+SkTransformShader::SkTransformShader(const SkShaderBase& shader, bool allowPerspective)
+        : fShader{shader}, fAllowPerspective{allowPerspective} {
+    SkMatrix::I().get9(fMatrixStorage);
+}
+
+bool SkTransformShader::update(const SkMatrix& matrix) {
+    if (!fAllowPerspective && matrix.hasPerspective()) {
+        return false;
+    }
+
+    matrix.get9(fMatrixStorage);
+    return true;
+}
+
+bool SkTransformShader::appendStages(const SkStageRec& rec,
+                                     const SkShaders::MatrixRec& mRec) const {
+    SkASSERT(!mRec.hasPendingMatrix());
+    std::optional<SkShaders::MatrixRec> childMRec = mRec.apply(rec);
+    if (!childMRec.has_value()) {
+        return false;
+    }
+    childMRec->markTotalMatrixInvalid();
+
+    auto type = fAllowPerspective ? SkRasterPipelineOp::matrix_perspective
+                                  : SkRasterPipelineOp::matrix_2x3;
+    rec.fPipeline->append(type, fMatrixStorage);
+
+    fShader.appendStages(rec, *childMRec);
+    return true;
+}

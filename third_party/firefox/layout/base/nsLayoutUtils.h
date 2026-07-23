@@ -1,0 +1,1627 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsLayoutUtils_h_
+#define nsLayoutUtils_h_
+
+#include <algorithm>
+#include <limits>
+
+#include "LayoutConstants.h"
+#include "Units.h"
+#include "gfxPoint.h"
+#include "mozilla/LayoutStructs.h"
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/RelativeTo.h"
+#include "mozilla/SVGImageContext.h"
+#include "mozilla/Span.h"
+#include "mozilla/StaticPrefs_nglayout.h"
+#include "mozilla/SurfaceFromElementResult.h"
+#include "mozilla/ToString.h"
+#include "mozilla/TypedEnumBits.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/WritingModes.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/layers/LayersTypes.h"
+#include "mozilla/layers/ScrollableLayerGuid.h"
+#include "nsBoundingMetrics.h"
+#include "nsCSSPropertyIDSet.h"
+#include "nsFrameList.h"
+#include "nsPoint.h"
+#include "nsThreadUtils.h"
+
+class gfxContext;
+class gfxFontEntry;
+class imgIContainer;
+class nsFrameList;
+class nsPresContext;
+class nsIContent;
+class nsIPrincipal;
+class nsIWidget;
+class nsAtom;
+class nsRegion;
+enum nsChangeHint : uint32_t;
+class nsFontMetrics;
+class nsFontFaceList;
+class nsIImageLoadingContent;
+class nsBlockFrame;
+class nsContainerFrame;
+class nsView;
+class nsIFrame;
+class nsPIDOMWindowOuter;
+class imgIRequest;
+struct nsStyleFont;
+
+namespace mozilla {
+class nsDisplayItem;
+class nsDisplayList;
+class nsDisplayListBuilder;
+enum class nsDisplayListBuilderMode : uint8_t;
+class RetainedDisplayListBuilder;
+struct AspectRatio;
+class ComputedStyle;
+class DisplayPortUtils;
+class PresShell;
+enum class PseudoStyleType : uint8_t;
+class EventListenerManager;
+enum class LayoutFrameType : uint8_t;
+struct IntrinsicSize;
+class ReflowOutput;
+class WritingMode;
+class DisplayItemClip;
+class EffectSet;
+struct ActiveScrolledRoot;
+class ScrollContainerFrame;
+enum class ScrollOrigin : uint8_t;
+enum class StyleImageOrientation : uint8_t;
+enum class StyleSystemFont : uint8_t;
+enum class StyleScrollbarWidth : uint8_t;
+struct OverflowAreas;
+namespace dom {
+class CanvasRenderingContext2D;
+class DOMRectList;
+class Document;
+class Element;
+class Event;
+class HTMLImageElement;
+class HTMLCanvasElement;
+class HTMLVideoElement;
+class ImageBitmap;
+class InspectorFontFace;
+class OffscreenCanvas;
+class Selection;
+class VideoFrame;
+}  
+namespace gfx {
+struct RectCornerRadii;
+enum class ShapedTextFlags : uint16_t;
+}  
+namespace image {
+class ImageIntRegion;
+struct Resolution;
+}  
+namespace layers {
+struct FrameMetrics;
+struct ScrollMetadata;
+class Image;
+class StackingContextHelper;
+class Layer;
+class WebRenderLayerManager;
+}  
+namespace widget {
+enum class TransparencyMode : uint8_t;
+}
+}  
+
+enum class DrawStringFlags {
+  Default = 0x0,
+  ForceHorizontal = 0x1  
+};
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(DrawStringFlags)
+
+namespace mozilla {
+
+class RectCallback {
+ public:
+  virtual void AddRect(const nsRect& aRect) = 0;
+};
+
+}  
+
+class nsLayoutUtils {
+  typedef mozilla::AspectRatio AspectRatio;
+  typedef mozilla::ComputedStyle ComputedStyle;
+  typedef mozilla::LengthPercentage LengthPercentage;
+  typedef mozilla::LengthPercentageOrAuto LengthPercentageOrAuto;
+  typedef mozilla::dom::DOMRectList DOMRectList;
+  typedef mozilla::layers::StackingContextHelper StackingContextHelper;
+  typedef mozilla::IntrinsicSize IntrinsicSize;
+  typedef mozilla::RelativeTo RelativeTo;
+  typedef mozilla::ScrollOrigin ScrollOrigin;
+  typedef mozilla::ViewportType ViewportType;
+  typedef mozilla::gfx::SourceSurface SourceSurface;
+  typedef mozilla::gfx::sRGBColor sRGBColor;
+  typedef mozilla::gfx::DrawTarget DrawTarget;
+  typedef mozilla::gfx::ExtendMode ExtendMode;
+  typedef mozilla::gfx::SamplingFilter SamplingFilter;
+  typedef mozilla::gfx::Float Float;
+  typedef mozilla::gfx::Point Point;
+  typedef mozilla::gfx::Rect Rect;
+  typedef mozilla::gfx::RectDouble RectDouble;
+  typedef mozilla::gfx::Size Size;
+  typedef mozilla::gfx::Matrix4x4 Matrix4x4;
+  typedef mozilla::gfx::Matrix4x4Flagged Matrix4x4Flagged;
+  typedef mozilla::gfx::MatrixScales MatrixScales;
+  typedef mozilla::gfx::MatrixScalesDouble MatrixScalesDouble;
+  typedef mozilla::gfx::RectCornerRadii RectCornerRadii;
+  typedef mozilla::gfx::StrokeOptions StrokeOptions;
+  typedef mozilla::image::ImgDrawResult ImgDrawResult;
+  using imgDrawingParams = mozilla::image::imgDrawingParams;
+
+  using nsDisplayItem = mozilla::nsDisplayItem;
+  using nsDisplayList = mozilla::nsDisplayList;
+  using nsDisplayListBuilder = mozilla::nsDisplayListBuilder;
+  using nsDisplayListBuilderMode = mozilla::nsDisplayListBuilderMode;
+  using RetainedDisplayListBuilder = mozilla::RetainedDisplayListBuilder;
+
+ public:
+  typedef mozilla::layers::FrameMetrics FrameMetrics;
+  typedef mozilla::layers::ScrollMetadata ScrollMetadata;
+  typedef mozilla::layers::ScrollableLayerGuid::ViewID ViewID;
+  typedef mozilla::CSSPoint CSSPoint;
+  typedef mozilla::CSSSize CSSSize;
+  typedef mozilla::CSSIntSize CSSIntSize;
+  typedef mozilla::CSSRect CSSRect;
+  typedef mozilla::ScreenMargin ScreenMargin;
+  typedef mozilla::LayoutDeviceIntSize LayoutDeviceIntSize;
+  typedef mozilla::LayoutDeviceRect LayoutDeviceRect;
+  typedef mozilla::PresShell PresShell;
+  typedef mozilla::StyleGeometryBox StyleGeometryBox;
+  typedef mozilla::SVGImageContext SVGImageContext;
+  typedef mozilla::LogicalSize LogicalSize;
+
+  static bool FindIDFor(const nsIContent* aContent, ViewID* aOutViewId);
+
+  static ViewID FindOrCreateIDFor(nsIContent* aContent);
+
+  static nsIContent* FindContentFor(ViewID aId);
+
+  static mozilla::ScrollContainerFrame* FindScrollContainerFrameFor(
+      nsIContent* aContent);
+
+  static mozilla::ScrollContainerFrame* FindScrollContainerFrameFor(ViewID aId);
+
+  static nsIFrame* GetScrollContainerFrameFromContent(nsIContent* aContent);
+
+  static ViewID FindIDForScrollContainerFrame(
+      mozilla::ScrollContainerFrame* aScrollContainerFrame);
+
+  static void NotifyPaintSkipTransaction(ViewID aScrollId);
+
+  static void NotifyApzTransaction(ViewID aScrollId);
+
+  static mozilla::FrameChildListID GetChildListNameFor(nsIFrame* aChildFrame);
+
+  static mozilla::dom::Element* GetBeforePseudo(const nsIContent* aContent);
+
+  static nsIFrame* GetBeforeFrame(const nsIContent* aContent);
+
+  static mozilla::dom::Element* GetAfterPseudo(const nsIContent* aContent);
+
+  static nsIFrame* GetAfterFrame(const nsIContent* aContent);
+
+  static mozilla::dom::Element* GetMarkerPseudo(const nsIContent* aContent);
+
+  static nsIFrame* GetMarkerFrame(const nsIContent* aContent);
+
+  static mozilla::dom::Element* GetBackdropPseudo(const nsIContent* aContent);
+  static nsIFrame* GetBackdropFrame(const nsIContent* aContent);
+
+  static mozilla::dom::Element* GetCheckmarkPseudo(const nsIContent* aContent);
+  static nsIFrame* GetCheckmarkFrame(const nsIContent* aContent);
+
+  static mozilla::dom::Element* GetPickerIconPseudo(const nsIContent* aContent);
+  static nsIFrame* GetPickerIconFrame(const nsIContent* aContent);
+
+  static void AppendGeneratedContentPseudos(
+      const mozilla::dom::Element* aElement, nsTArray<nsIContent*>& aPseudos);
+
+#ifdef ACCESSIBILITY
+  static void GetMarkerSpokenText(const nsIContent* aContent, nsAString& aText);
+#endif
+
+  static const nsIFrame* GetClosestFrameOfType(
+      const nsIFrame* aFrame, mozilla::LayoutFrameType aFrameType,
+      const nsIFrame* aStopAt = nullptr);
+  static nsIFrame* GetClosestFrameOfType(nsIFrame* aFrame,
+                                         mozilla::LayoutFrameType aFrameType,
+                                         const nsIFrame* aStopAt = nullptr);
+
+  static nsIFrame* GetPageFrame(nsIFrame* aFrame);
+  static const nsIFrame* GetPageFrame(const nsIFrame* aFrame);
+
+  static nsIFrame* GetStyleFrame(nsIFrame* aPrimaryFrame);
+  static const nsIFrame* GetStyleFrame(const nsIFrame* aPrimaryFrame);
+
+  static nsIFrame* GetStyleFrame(const nsIContent* aContent);
+
+  static mozilla::CSSIntCoord UnthemedScrollbarSize(
+      mozilla::StyleScrollbarWidth);
+
+  static nsIFrame* GetPrimaryFrameFromStyleFrame(nsIFrame* aStyleFrame);
+  static const nsIFrame* GetPrimaryFrameFromStyleFrame(
+      const nsIFrame* aStyleFrame);
+
+  static bool IsPrimaryStyleFrame(const nsIFrame* aFrame);
+
+  static int32_t CompareTreePosition(
+      const nsIFrame* aFrame1, const nsIFrame* aFrame2,
+      const nsIFrame* aCommonAncestor = nullptr) {
+    return DoCompareTreePosition(aFrame1, aFrame2, aCommonAncestor);
+  }
+
+  static int32_t CompareTreePosition(
+      const nsIFrame* aFrame1, const nsIFrame* aFrame2,
+      const nsTArray<const nsIFrame*>& aFrame2Ancestors,
+      const nsIFrame* aCommonAncestor = nullptr) {
+    return DoCompareTreePosition(aFrame1, aFrame2, aFrame2Ancestors,
+                                 aCommonAncestor);
+  }
+
+  static const nsIFrame* FillAncestors(const nsIFrame* aFrame,
+                                       const nsIFrame* aStopAtAncestor,
+                                       nsTArray<const nsIFrame*>* aAncestors);
+
+  static int32_t DoCompareTreePosition(const nsIFrame* aFrame1,
+                                       const nsIFrame* aFrame2,
+                                       const nsIFrame* aCommonAncestor);
+  static int32_t DoCompareTreePosition(
+      const nsIFrame* aFrame1, const nsIFrame* aFrame2,
+      const nsTArray<const nsIFrame*>& aFrame2Ancestors,
+      const nsIFrame* aCommonAncestor);
+
+  static nsContainerFrame* LastContinuationWithChild(nsContainerFrame* aFrame);
+
+  static nsIFrame* GetLastSibling(nsIFrame* aFrame);
+
+  static nsView* FindSiblingViewFor(nsView* aParentView, nsIFrame* aFrame);
+
+  static nsIFrame* GetCrossDocParentFrameInProcess(
+      const nsIFrame* aFrame, nsPoint* aCrossDocOffset = nullptr);
+
+  static nsIFrame* GetCrossDocParentFrame(const nsIFrame* aFrame,
+                                          nsPoint* aCrossDocOffset = nullptr);
+
+  static bool IsProperAncestorFrame(const nsIFrame* aAncestorFrame,
+                                    const nsIFrame* aFrame,
+                                    const nsIFrame* aCommonAncestor = nullptr);
+
+  static bool IsProperAncestorFrameConsideringContinuations(
+      const nsIFrame* aAncestorFrame, const nsIFrame* aFrame,
+      const nsIFrame* aCommonAncestor = nullptr);
+
+  static bool IsProperAncestorFrameCrossDoc(
+      const nsIFrame* aAncestorFrame, const nsIFrame* aFrame,
+      const nsIFrame* aCommonAncestor = nullptr);
+
+  static bool IsProperAncestorFrameCrossDocInProcess(
+      const nsIFrame* aAncestorFrame, const nsIFrame* aFrame,
+      const nsIFrame* aCommonAncestor = nullptr);
+
+  static bool IsAncestorFrameCrossDoc(
+      const nsIFrame* aAncestorFrame, const nsIFrame* aFrame,
+      const nsIFrame* aCommonAncestor = nullptr);
+
+  static bool IsAncestorFrameCrossDocInProcess(
+      const nsIFrame* aAncestorFrame, const nsIFrame* aFrame,
+      const nsIFrame* aCommonAncestor = nullptr);
+
+  static bool IsAncestorFrameCrossDocInProcessConsideringContinuations(
+      const nsIFrame* aAncestorFrame, const nsIFrame* aFrame,
+      const nsIFrame* aCommonAncestor = nullptr);
+
+  static mozilla::SideBits GetSideBitsForFixedPositionContent(
+      const nsIFrame* aFixedPosFrame);
+
+  static ViewID ScrollIdForRootScrollFrame(nsPresContext* aPresContext);
+
+  static mozilla::ScrollContainerFrame* GetScrollContainerFrameFor(
+      const nsIFrame* aScrolledFrame);
+
+  static mozilla::ScrollContainerFrame* GetNearestScrollableFrameForDirection(
+      nsIFrame* aFrame, mozilla::layers::ScrollDirections aDirections);
+
+  enum {
+    SCROLLABLE_SAME_DOC = 0x01,
+    SCROLLABLE_INCLUDE_HIDDEN = 0x02,
+    SCROLLABLE_ONLY_ASYNC_SCROLLABLE = 0x04,
+    SCROLLABLE_ALWAYS_MATCH_ROOT = 0x08,
+    SCROLLABLE_FIXEDPOS_FINDS_ROOT = 0x10,
+    SCROLLABLE_STOP_AT_PAGE = 0x20,
+  };
+  static mozilla::ScrollContainerFrame* GetNearestScrollContainerFrame(
+      nsIFrame* aFrame, uint32_t aFlags = 0);
+
+  static mozilla::layers::ScrollableLayerGuid::ViewID GetNearestScrollIdFor(
+      nsIFrame* aSearchFrame);
+
+  static nsRect GetScrolledRect(nsIFrame* aScrolledFrame,
+                                const nsRect& aScrolledFrameOverflowArea,
+                                const nsSize& aScrollPortSize,
+                                mozilla::StyleDirection);
+
+  static bool HasPseudoStyle(nsIContent* aContent,
+                             ComputedStyle* aComputedStyle,
+                             mozilla::PseudoStyleType aPseudoElement,
+                             nsPresContext* aPresContext);
+
+  static nsIFrame* GetFloatFromPlaceholder(nsIFrame* aPlaceholder);
+
+  static mozilla::UsedClear CombineClearType(mozilla::UsedClear aOrigClearType,
+                                             mozilla::UsedClear aNewClearType);
+
+  /**
+   * Get the coordinates of a given DOM mouse event, relative to a given
+   * frame. Works only for DOM events generated by WidgetGUIEvents.
+   * @param aDOMEvent the event
+   * @param aFrame the frame to make coordinates relative to
+   * @return the point, or (NS_UNCONSTRAINEDSIZE, NS_UNCONSTRAINEDSIZE) if
+   * for some reason the coordinates for the mouse are not known (e.g.,
+   * the event is not a GUI event).
+   */
+  static nsPoint GetDOMEventCoordinatesRelativeTo(
+      mozilla::dom::Event* aDOMEvent, nsIFrame* aFrame);
+
+  static nsPoint GetEventCoordinatesRelativeTo(
+      const mozilla::WidgetEvent* aEvent, RelativeTo aFrame);
+
+  static nsPoint GetEventCoordinatesRelativeTo(
+      const mozilla::WidgetEvent* aEvent,
+      const mozilla::LayoutDeviceIntPoint& aPoint, RelativeTo aFrame);
+
+  static nsPoint GetEventCoordinatesRelativeTo(
+      nsIWidget* aWidget, const mozilla::LayoutDeviceIntPoint& aPoint,
+      RelativeTo aFrame);
+
+  static nsIFrame* GetPopupFrameForEventCoordinates(
+      nsPresContext* aRootPresContext, const mozilla::WidgetEvent* aEvent);
+
+  enum class GetPopupFrameForPointFlags : uint8_t {
+    OnlyReturnFramesWithWidgets = 0x1,
+  };
+  static nsMenuPopupFrame* GetPopupFrameForPoint(
+      nsPresContext* aRootPresContext, nsIWidget* aWidget,
+      const mozilla::LayoutDeviceIntPoint& aPoint,
+      GetPopupFrameForPointFlags aFlags = GetPopupFrameForPointFlags(0));
+
+  MOZ_CAN_RUN_SCRIPT
+  static void GetContainerAndOffsetAtEvent(PresShell* aPresShell,
+                                           const mozilla::WidgetEvent* aEvent,
+                                           nsIContent** aContainer,
+                                           int32_t* aOffset);
+
+  static mozilla::LayoutDeviceIntPoint WidgetToWidgetOffset(
+      nsIWidget* aFromWidget, nsIWidget* aToWidget);
+
+  static mozilla::Maybe<nsPoint> FrameToWidgetOffset(const nsIFrame* aFrame,
+                                                     nsIWidget* aWidget);
+
+  enum class FrameForPointOption {
+    IgnorePaintSuppression = 1,
+    IgnoreRootScrollFrame,
+    IgnoreCrossDoc,
+    OnlyVisible,
+  };
+
+  struct FrameForPointOptions {
+    using Bits = mozilla::EnumSet<FrameForPointOption>;
+
+    Bits mBits;
+    float mVisibleThreshold;
+
+    FrameForPointOptions(Bits aBits, float aVisibleThreshold)
+        : mBits(aBits), mVisibleThreshold(aVisibleThreshold) {};
+
+    MOZ_IMPLICIT FrameForPointOptions(Bits aBits)
+        : FrameForPointOptions(aBits, 1.0f) {}
+
+    FrameForPointOptions() : FrameForPointOptions(Bits()) {};
+  };
+
+  static nsIFrame* GetFrameForPoint(RelativeTo aRelativeTo, nsPoint aPt,
+                                    const FrameForPointOptions& = {});
+
+  static nsresult GetFramesForArea(RelativeTo aRelativeTo, const nsRect& aRect,
+                                   nsTArray<nsIFrame*>& aOutFrames,
+                                   const FrameForPointOptions& = {});
+
+  static nsRect TransformFrameRectToAncestor(
+      const nsIFrame* aFrame, const nsRect& aRect, const nsIFrame* aAncestor,
+      bool* aPreservesAxisAlignedRectangles = nullptr,
+      mozilla::Maybe<Matrix4x4Flagged>* aMatrixCache = nullptr,
+      bool aStopAtStackingContextAndDisplayPortAndOOFFrame = false,
+      nsIFrame** aOutAncestor = nullptr) {
+    return TransformFrameRectToAncestor(
+        aFrame, aRect, RelativeTo{aAncestor}, aPreservesAxisAlignedRectangles,
+        aMatrixCache, aStopAtStackingContextAndDisplayPortAndOOFFrame,
+        aOutAncestor);
+  }
+  static nsRect TransformFrameRectToAncestor(
+      const nsIFrame* aFrame, const nsRect& aRect, RelativeTo aAncestor,
+      bool* aPreservesAxisAlignedRectangles = nullptr,
+      mozilla::Maybe<Matrix4x4Flagged>* aMatrixCache = nullptr,
+      bool aStopAtStackingContextAndDisplayPortAndOOFFrame = false,
+      nsIFrame** aOutAncestor = nullptr);
+
+  static Matrix4x4Flagged GetTransformToAncestor(
+      RelativeTo aFrame, RelativeTo aAncestor, uint32_t aFlags = 0,
+      nsIFrame** aOutAncestor = nullptr);
+
+  static MatrixScales GetTransformToAncestorScale(const nsIFrame* aFrame);
+
+  static MatrixScales GetTransformToAncestorScaleExcludingAnimated(
+      nsIFrame* aFrame);
+
+  static mozilla::ParentLayerToScreenScale2D
+  GetTransformToAncestorScaleCrossProcessForFrameMetrics(
+      const nsIFrame* aFrame);
+
+  static const nsIFrame* FindNearestCommonAncestorFrame(
+      const nsIFrame* aFrame1, const nsIFrame* aFrame2);
+
+  static const nsIFrame* FindNearestCommonAncestorFrameWithinBlock(
+      const nsTextFrame* aFrame1, const nsTextFrame* aFrame2);
+
+  static bool AuthorSpecifiedBorderBackgroundDisablesTheming(
+      mozilla::StyleAppearance);
+
+  enum TransformResult {
+    TRANSFORM_SUCCEEDED,
+    NO_COMMON_ANCESTOR,
+    NONINVERTIBLE_TRANSFORM
+  };
+  static TransformResult TransformPoints(RelativeTo aFromFrame,
+                                         RelativeTo aToFrame,
+                                         uint32_t aPointCount,
+                                         CSSPoint* aPoints);
+
+  static TransformResult TransformPoint(RelativeTo aFromFrame,
+                                        RelativeTo aToFrame, nsPoint& aPoint);
+
+  static TransformResult TransformRect(const nsIFrame* aFromFrame,
+                                       const nsIFrame* aToFrame, nsRect& aRect);
+
+  static void PostTranslate(Matrix4x4& aTransform, const nsPoint& aOrigin,
+                            float aAppUnitsPerPixel, bool aRounded);
+
+  static bool ShouldSnapToGrid(const nsIFrame* aFrame,
+                               const nsDisplayListBuilder* aBuilder = nullptr);
+
+  static nsRect GetRectRelativeToFrame(const mozilla::dom::Element* aElement,
+                                       const nsIFrame* aFrame);
+
+  static bool ContainsPoint(const nsRect& aRect, const nsPoint& aPoint,
+                            nscoord aInflateSize);
+
+  static nsRect ClampRectToScrollFrames(nsIFrame* aFrame, const nsRect& aRect);
+
+  static nsPoint TransformRootPointToFrame(ViewportType aFromType,
+                                           RelativeTo aFrame,
+                                           const nsPoint& aPoint) {
+    return TransformAncestorPointToFrame(aFrame, aPoint,
+                                         RelativeTo{nullptr, aFromType});
+  }
+
+  static nsPoint TransformAncestorPointToFrame(RelativeTo aFrame,
+                                               const nsPoint& aPoint,
+                                               RelativeTo aAncestor);
+
+  static nsPoint TransformFramePointToRoot(ViewportType aToType,
+                                           RelativeTo aFromFrame,
+                                           const nsPoint& aPoint);
+
+  static nsRect MatrixTransformRect(const nsRect& aBounds,
+                                    const Matrix4x4& aMatrix, float aFactor);
+  static nsRect MatrixTransformRect(const nsRect& aBounds,
+                                    const Matrix4x4Flagged& aMatrix,
+                                    float aFactor);
+
+  static nsPoint MatrixTransformPoint(const nsPoint& aPoint,
+                                      const Matrix4x4& aMatrix, float aFactor);
+
+  template <typename T>
+  static nsRect RoundGfxRectToAppRect(const T& aRect, const float aFactor);
+
+  template <typename T>
+  static nsRect ScaleThenRoundGfxRectToAppRect(const T& aRect,
+                                               const float aFactor);
+
+  static nsRegion RoundedRectIntersectRect(const nsRect& aRoundedRect,
+                                           const nsRectCornerRadii&,
+                                           const nsRect& aContainedRect);
+  static nsIntRegion RoundedRectIntersectIntRect(
+      const nsIntRect& aRoundedRect, const RectCornerRadii& aCornerRadii,
+      const nsIntRect& aContainedRect);
+
+  static bool RoundedRectIntersectsRect(const nsRect& aRoundedRect,
+                                        const nsRectCornerRadii&,
+                                        const nsRect& aTestRect);
+
+  enum class PaintFrameFlags : uint32_t {
+    InTransform = 0x01,
+    SyncDecodeImages = 0x02,
+    WidgetLayers = 0x04,
+    IgnoreSuppression = 0x08,
+    DocumentRelative = 0x10,
+    HideCaret = 0x20,
+    ToWindow = 0x40,
+    ExistingTransaction = 0x80,
+    ForWebRender = 0x100,
+    UseHighQualityScaling = 0x200,
+    ResetViewportScrolling = 0x400,
+    CompositeOffscreen = 0x800,
+  };
+
+  static void PaintFrame(gfxContext* aRenderingContext, nsIFrame* aFrame,
+                         const nsRegion& aDirtyRegion, nscolor aBackstop,
+                         nsDisplayListBuilderMode aBuilderMode,
+                         PaintFrameFlags aFlags = PaintFrameFlags(0));
+
+  static bool BinarySearchForPosition(DrawTarget* aDrawTarget,
+                                      nsFontMetrics& aFontMetrics,
+                                      const char16_t* aText, int32_t aBaseWidth,
+                                      int32_t aBaseInx, int32_t aStartInx,
+                                      int32_t aEndInx, int32_t aCursorPos,
+                                      int32_t& aIndex, int32_t& aTextWidth);
+
+  class BoxCallback {
+   public:
+    BoxCallback() = default;
+    virtual void AddBox(nsIFrame* aFrame) = 0;
+    bool mIncludeCaptionBoxForTable = true;
+    bool mInTargetContinuation = false;
+  };
+  static void GetAllInFlowBoxes(nsIFrame* aFrame, BoxCallback* aCallback);
+
+  static void AddBoxesForFrame(nsIFrame* aFrame, BoxCallback* aCallback);
+
+  static nsIFrame* GetFirstNonAnonymousFrame(nsIFrame* aFrame);
+
+  struct RectAccumulator : public mozilla::RectCallback {
+    nsRect mResultRect;
+    nsRect mFirstRect;
+    bool mSeenFirstRect;
+
+    RectAccumulator();
+
+    virtual void AddRect(const nsRect& aRect) override;
+  };
+
+  struct RectListBuilder : public mozilla::RectCallback {
+    DOMRectList* mRectList;
+
+    explicit RectListBuilder(DOMRectList* aList);
+    virtual void AddRect(const nsRect& aRect) override;
+  };
+
+  static nsIFrame* GetContainingBlockForClientRect(nsIFrame* aFrame);
+
+  enum class GetAllInFlowRectsFlag : uint8_t {
+    AccountForTransforms,
+    UseContentBox,
+    UsePaddingBox,
+    UseMarginBox,
+    UseMarginBoxWithAutoResolvedAsZero,
+    UseInkOverflowAsBox
+  };
+  using GetAllInFlowRectsFlags = mozilla::EnumSet<GetAllInFlowRectsFlag>;
+  static void GetAllInFlowRects(nsIFrame* aFrame, const nsIFrame* aRelativeTo,
+                                mozilla::RectCallback* aCallback,
+                                GetAllInFlowRectsFlags aFlags = {});
+
+  static void GetAllInFlowRectsAndTexts(
+      nsIFrame* aFrame, const nsIFrame* aRelativeTo,
+      mozilla::RectCallback* aCallback,
+      mozilla::dom::Sequence<nsString>* aTextList,
+      GetAllInFlowRectsFlags aFlags = {});
+
+  static nsRect GetAllInFlowRectsUnion(nsIFrame* aFrame,
+                                       const nsIFrame* aRelativeTo,
+                                       GetAllInFlowRectsFlags aFlags = {});
+
+  enum { EXCLUDE_BLUR_SHADOWS = 0x01 };
+  static nsRect GetTextShadowRectsUnion(const nsRect& aTextAndDecorationsRect,
+                                        nsIFrame* aFrame, uint32_t aFlags = 0);
+
+  static nsRect ComputeObjectDestRect(const nsRect& aConstraintRect,
+                                      const IntrinsicSize& aIntrinsicSize,
+                                      const AspectRatio& aIntrinsicRatio,
+                                      const nsStylePosition* aStylePos,
+                                      nsPoint* aAnchorPoint = nullptr);
+
+  static already_AddRefed<nsFontMetrics> GetFontMetricsForFrame(
+      const nsIFrame* aFrame, float aSizeInflation);
+
+  static already_AddRefed<nsFontMetrics> GetInflatedFontMetricsForFrame(
+      const nsIFrame* aFrame) {
+    return GetFontMetricsForFrame(aFrame, FontSizeInflationFor(aFrame));
+  }
+
+  static already_AddRefed<nsFontMetrics> GetFontMetricsForComputedStyle(
+      const ComputedStyle* aComputedStyle, nsPresContext* aPresContext,
+      float aSizeInflation = 1.0f,
+      uint8_t aVariantWidth = NS_FONT_VARIANT_WIDTH_NORMAL,
+      bool aForceHorizontalMetrics = false);
+
+  static already_AddRefed<nsFontMetrics> GetFontMetricsOfEmphasisMarks(
+      ComputedStyle* aComputedStyle, nsPresContext* aPresContext,
+      float aInflation) {
+    return GetFontMetricsForComputedStyle(aComputedStyle, aPresContext,
+                                          aInflation * 0.5f);
+  }
+
+  static nsIFrame* FindChildContainingDescendant(nsIFrame* aParent,
+                                                 nsIFrame* aDescendantFrame);
+
+  static bool HasAbsolutelyPositionedDescendants(const nsIFrame* aFrame);
+
+  static nsBlockFrame* FindNearestBlockAncestor(nsIFrame* aFrame);
+
+  static bool IsNonWrapperBlock(nsIFrame* aFrame);
+
+  static nsIFrame* GetParentOrPlaceholderFor(const nsIFrame* aFrame);
+
+  static nsIFrame* GetParentOrPlaceholderForCrossDoc(const nsIFrame* aFrame);
+
+  static nsIFrame* GetDisplayListParent(nsIFrame* aFrame);
+
+  static nsIFrame* GetPrevContinuationOrIBSplitSibling(const nsIFrame* aFrame);
+
+  static nsIFrame* GetNextContinuationOrIBSplitSibling(const nsIFrame* aFrame);
+
+  static nsIFrame* FirstContinuationOrIBSplitSibling(const nsIFrame* aFrame);
+
+  static nsIFrame* LastContinuationOrIBSplitSibling(const nsIFrame* aFrame);
+
+  static bool IsFirstContinuationOrIBSplitSibling(const nsIFrame* aFrame);
+
+  static bool IsViewportScrollbarFrame(nsIFrame* aFrame);
+
+  template <typename LengthPercentageLike>
+  static mozilla::Maybe<nscoord> GetAbsoluteSize(
+      const LengthPercentageLike& aSize) {
+    if (!aSize.ConvertsToLength()) {
+      return mozilla::Nothing();
+    }
+    return mozilla::Some(std::max(0, aSize.ToLength()));
+  }
+
+  enum {
+    IGNORE_PADDING = 0x01,
+    BAIL_IF_REFLOW_NEEDED = 0x02,  
+  };
+  static nscoord IntrinsicForAxis(
+      mozilla::PhysicalAxis aAxis, gfxContext* aRenderingContext,
+      nsIFrame* aFrame, mozilla::IntrinsicISizeType aType,
+      const mozilla::Maybe<LogicalSize>& aPercentageBasis = mozilla::Nothing(),
+      uint32_t aFlags = 0, nscoord aMarginBoxMinSizeClamp = NS_MAXSIZE,
+      const mozilla::StyleSizeOverrides& aSizeOverrides = {});
+  static nscoord IntrinsicForContainer(
+      gfxContext* aRenderingContext, nsIFrame* aFrame,
+      mozilla::IntrinsicISizeType aType,
+      const mozilla::Maybe<LogicalSize>& aPercentageBasis = mozilla::Nothing(),
+      uint32_t aFlags = 0,
+      const mozilla::StyleSizeOverrides& aSizeOverrides = {});
+
+  static nscoord MinSizeContributionForAxis(mozilla::PhysicalAxis aAxis,
+                                            gfxContext* aRC, nsIFrame* aFrame,
+                                            mozilla::IntrinsicISizeType aType,
+                                            const LogicalSize& aPercentageBasis,
+                                            uint32_t aFlags = 0);
+
+  static nscoord ComputeCBDependentValue(nscoord aPercentBasis,
+                                         const LengthPercentage& aCoord) {
+    NS_ASSERTION(aPercentBasis != NS_UNCONSTRAINEDSIZE || !aCoord.HasPercent(),
+                 "Have unconstrained percentage basis when percentage "
+                 "resolution needed; this should only result from very "
+                 "large sizes, not attempts at intrinsic size calculation");
+    return aCoord.Resolve(aPercentBasis);
+  }
+  static nscoord ComputeCBDependentValue(nscoord aPercentBasis,
+                                         const LengthPercentageOrAuto& aCoord) {
+    if (aCoord.IsAuto()) {
+      return 0;
+    }
+    return ComputeCBDependentValue(aPercentBasis, aCoord.AsLengthPercentage());
+  }
+
+  static nscoord ComputeCBDependentValue(nscoord aPercentBasis,
+                                         const AnchorResolvedInset& aInset) {
+    if (aInset->IsAuto()) {
+      return 0;
+    }
+    NS_ASSERTION(aPercentBasis != NS_UNCONSTRAINEDSIZE || !aInset->HasPercent(),
+                 "Have unconstrained percentage basis when percentage "
+                 "resolution needed; this should only result from very "
+                 "large sizes, not attempts at intrinsic size calculation");
+    return aInset->AsLengthPercentage().Resolve(aPercentBasis);
+  }
+
+  static nscoord ComputeCBDependentValue(nscoord aPercentBasis,
+                                         const AnchorResolvedMargin& aMargin) {
+    if (!aMargin->IsLengthPercentage()) {
+      MOZ_ASSERT(aMargin->IsAuto(), "Didn't resolve anchor functions first?");
+      return 0;
+    }
+    return ComputeCBDependentValue(aPercentBasis,
+                                   aMargin->AsLengthPercentage());
+  }
+
+  static nscoord ComputeBSizeValue(nscoord aContainingBlockBSize,
+                                   nscoord aContentEdgeToBoxSizingBoxEdge,
+                                   const LengthPercentage& aCoord) {
+    MOZ_ASSERT(aContainingBlockBSize != nscoord_MAX || !aCoord.HasPercent(),
+               "caller must deal with %% of unconstrained block-size");
+
+    nscoord result = aCoord.Resolve(aContainingBlockBSize);
+    return std::max(0, result - aContentEdgeToBoxSizingBoxEdge);
+  }
+
+  template <typename SizeOrMaxSize>
+  static nscoord ComputeBSizeValueHandlingStretch(
+      nscoord aContainingBlockBSize, nscoord aMargin, nscoord aBorderPadding,
+      nscoord aContentEdgeToBoxSizingBoxEdge, const SizeOrMaxSize& aSize) {
+    if (aSize.BehavesLikeStretchOnBlockAxis()) {
+      return ComputeStretchContentBoxBSize(aContainingBlockBSize, aMargin,
+                                           aBorderPadding);
+    }
+    return ComputeBSizeValue(aContainingBlockBSize,
+                             aContentEdgeToBoxSizingBoxEdge,
+                             aSize.AsLengthPercentage());
+  }
+
+  static inline nscoord ComputeStretchBSize(
+      nscoord aSizeToFill, nscoord aMargin, nscoord aBorderPadding,
+      mozilla::StyleBoxSizing aBoxSizing) {
+    NS_ASSERTION(aSizeToFill != NS_UNCONSTRAINEDSIZE,
+                 "We don't handle situations with unconstrained "
+                 "aSizeToFill; caller should handle that!");
+    nscoord stretchSize = aSizeToFill - aMargin;
+    if (aBoxSizing == mozilla::StyleBoxSizing::ContentBox) {
+      stretchSize -= aBorderPadding;
+    }
+    return std::max(0, stretchSize);
+  }
+  static inline nscoord ComputeStretchContentBoxBSize(nscoord aSizeToFill,
+                                                      nscoord aMargin,
+                                                      nscoord aBorderPadding) {
+    return ComputeStretchBSize(aSizeToFill, aMargin, aBorderPadding,
+                               mozilla::StyleBoxSizing::ContentBox);
+  }
+  static inline nscoord ComputeStretchContentBoxISize(nscoord aSizeToFill,
+                                                      nscoord aMargin,
+                                                      nscoord aBorderPadding) {
+    return std::max(0, aSizeToFill - aMargin - aBorderPadding);
+  }
+
+  template <typename SizeOrMaxSize>
+  static bool IsAutoBSize(const SizeOrMaxSize& aCoord, nscoord aCBBSize) {
+    return aCoord.BehavesLikeInitialValueOnBlockAxis() ||
+           (aCBBSize == nscoord_MAX &&
+            (aCoord.HasPercent() || aCoord.BehavesLikeStretchOnBlockAxis()));
+  }
+
+  static bool IsPaddingZero(const LengthPercentage& aLength) {
+    return aLength.Resolve(nscoord_MAX) <= 0 && aLength.Resolve(0) <= 0;
+  }
+
+  static void MarkDescendantsDirty(nsIFrame* aSubtreeRoot);
+
+  static void MarkIntrinsicISizesDirtyIfDependentOnBSize(nsIFrame* aFrame);
+
+  static nsSize ComputeAutoSizeWithIntrinsicDimensions(
+      nscoord minWidth, nscoord minHeight, nscoord maxWidth, nscoord maxHeight,
+      nscoord tentWidth, nscoord tentHeight);
+
+  static nscolor DarkenColorIfNeeded(nsIFrame* aFrame, nscolor aColor);
+
+  template <typename Frame, typename T, typename S>
+  static nscolor GetTextColor(Frame* aFrame, T S::* aField) {
+    nscolor color = aFrame->GetVisitedDependentColor(aField);
+    return DarkenColorIfNeeded(aFrame, color);
+  }
+
+  static gfxFloat GetMaybeSnappedBaselineY(nsIFrame* aFrame,
+                                           gfxContext* aContext, nscoord aY,
+                                           nscoord aAscent);
+  static gfxFloat GetMaybeSnappedBaselineX(nsIFrame* aFrame,
+                                           gfxContext* aContext, nscoord aX,
+                                           nscoord aAscent);
+
+  static nscoord AppUnitWidthOfString(char16_t aC, nsFontMetrics& aFontMetrics,
+                                      DrawTarget* aDrawTarget) {
+    return AppUnitWidthOfString(&aC, 1, aFontMetrics, aDrawTarget);
+  }
+  static nscoord AppUnitWidthOfString(mozilla::Span<const char16_t> aString,
+                                      nsFontMetrics& aFontMetrics,
+                                      DrawTarget* aDrawTarget) {
+    return nsLayoutUtils::AppUnitWidthOfString(
+        aString.Elements(), aString.Length(), aFontMetrics, aDrawTarget);
+  }
+  static nscoord AppUnitWidthOfString(const char16_t* aString, uint32_t aLength,
+                                      nsFontMetrics& aFontMetrics,
+                                      DrawTarget* aDrawTarget);
+  static nscoord AppUnitWidthOfStringBidi(const nsString& aString,
+                                          const nsIFrame* aFrame,
+                                          nsFontMetrics& aFontMetrics,
+                                          gfxContext& aContext) {
+    return nsLayoutUtils::AppUnitWidthOfStringBidi(
+        aString.get(), aString.Length(), aFrame, aFontMetrics, aContext);
+  }
+  static nscoord AppUnitWidthOfStringBidi(const char16_t* aString,
+                                          uint32_t aLength,
+                                          const nsIFrame* aFrame,
+                                          nsFontMetrics& aFontMetrics,
+                                          gfxContext& aContext);
+
+  static bool StringWidthIsGreaterThan(const nsString& aString,
+                                       nsFontMetrics& aFontMetrics,
+                                       DrawTarget* aDrawTarget, nscoord aWidth);
+
+  static nsBoundingMetrics AppUnitBoundsOfString(const char16_t* aString,
+                                                 uint32_t aLength,
+                                                 nsFontMetrics& aFontMetrics,
+                                                 DrawTarget* aDrawTarget);
+
+  static void DrawString(const nsIFrame* aFrame, nsFontMetrics& aFontMetrics,
+                         gfxContext* aContext, const char16_t* aString,
+                         int32_t aLength, nsPoint aPoint,
+                         ComputedStyle* aComputedStyle = nullptr,
+                         DrawStringFlags aFlags = DrawStringFlags::Default);
+
+  static nsPoint GetBackgroundFirstTilePos(const nsPoint& aDest,
+                                           const nsPoint& aFill,
+                                           const nsSize& aRepeatSize);
+
+  static void DrawUniDirString(const char16_t* aString, uint32_t aLength,
+                               const nsPoint& aPoint,
+                               nsFontMetrics& aFontMetrics,
+                               gfxContext& aContext);
+
+  typedef void (*TextShadowCallback)(gfxContext* aCtx,
+                                     imgDrawingParams& aImgParams,
+                                     const nsPoint& aShadowOffset,
+                                     const nscolor& aShadowColor, void* aData);
+
+  static void PaintTextShadow(const nsIFrame* aFrame, gfxContext* aContext,
+                              imgDrawingParams& aImgParams,
+                              const nsRect& aTextRect, const nsRect& aDirtyRect,
+                              const nscolor& aForegroundColor,
+                              TextShadowCallback aCallback,
+                              void* aCallbackData);
+
+  static nscoord GetCenteredFontBaseline(nsFontMetrics* aFontMetrics,
+                                         nscoord aLineHeight, bool aIsInverted);
+
+  static bool GetFirstLineBaseline(mozilla::WritingMode aWritingMode,
+                                   const nsIFrame* aFrame, nscoord* aResult);
+
+  struct LinePosition {
+    nscoord mBStart{nscoord_MAX};
+    nscoord mBaseline{nscoord_MAX};
+    nscoord mBEnd{nscoord_MAX};
+
+    LinePosition operator+(nscoord aOffset) const {
+      LinePosition result;
+      result.mBStart = mBStart + aOffset;
+      result.mBaseline = mBaseline + aOffset;
+      result.mBEnd = mBEnd + aOffset;
+      return result;
+    }
+  };
+  static bool GetFirstLinePosition(mozilla::WritingMode aWritingMode,
+                                   const nsIFrame* aFrame,
+                                   LinePosition* aResult);
+
+  static bool GetLastLineBaseline(mozilla::WritingMode aWritingMode,
+                                  const nsIFrame* aFrame, nscoord* aResult);
+
+  static nscoord CalculateContentBEnd(mozilla::WritingMode aWritingMode,
+                                      nsIFrame* aFrame);
+
+  static nsIFrame* GetClosestLayer(nsIFrame* aFrame);
+
+  static SamplingFilter GetSamplingFilterForFrame(nsIFrame* aFrame);
+
+  static inline void InitDashPattern(StrokeOptions& aStrokeOptions,
+                                     mozilla::StyleBorderStyle aBorderStyle) {
+    if (aBorderStyle == mozilla::StyleBorderStyle::Dotted) {
+      static Float dot[] = {1.f, 1.f};
+      aStrokeOptions.mDashLength = std::size(dot);
+      aStrokeOptions.mDashPattern = dot;
+    } else if (aBorderStyle == mozilla::StyleBorderStyle::Dashed) {
+      static Float dash[] = {5.f, 5.f};
+      aStrokeOptions.mDashLength = std::size(dash);
+      aStrokeOptions.mDashPattern = dash;
+    } else {
+      aStrokeOptions.mDashLength = 0;
+      aStrokeOptions.mDashPattern = nullptr;
+    }
+  }
+
+  static gfxRect RectToGfxRect(const nsRect& aRect,
+                               int32_t aAppUnitsPerDevPixel);
+
+  static gfxPoint PointToGfxPoint(const nsPoint& aPoint,
+                                  int32_t aAppUnitsPerPixel) {
+    return gfxPoint(gfxFloat(aPoint.x) / aAppUnitsPerPixel,
+                    gfxFloat(aPoint.y) / aAppUnitsPerPixel);
+  }
+
+
+  static ImgDrawResult DrawBackgroundImage(
+      gfxContext& aContext, nsIFrame* aForFrame, nsPresContext* aPresContext,
+      imgIContainer* aImage, SamplingFilter aSamplingFilter,
+      const nsRect& aDest, const nsRect& aFill, const nsSize& aRepeatSize,
+      const nsPoint& aAnchor, const nsRect& aDirty, uint32_t aImageFlags,
+      ExtendMode aExtendMode, float aOpacity);
+
+  static ImgDrawResult DrawImage(gfxContext& aContext,
+                                 ComputedStyle* aComputedStyle,
+                                 nsPresContext* aPresContext,
+                                 imgIContainer* aImage,
+                                 const SamplingFilter aSamplingFilter,
+                                 const nsRect& aDest, const nsRect& aFill,
+                                 const nsPoint& aAnchor, const nsRect& aDirty,
+                                 uint32_t aImageFlags, float aOpacity = 1.0);
+
+  static ImgDrawResult DrawSingleUnscaledImage(
+      gfxContext& aContext, nsPresContext* aPresContext, imgIContainer* aImage,
+      const SamplingFilter aSamplingFilter, const nsPoint& aDest,
+      const nsRect* aDirty, const mozilla::SVGImageContext& aSVGContext,
+      uint32_t aImageFlags, const nsRect* aSourceArea = nullptr);
+
+  static ImgDrawResult DrawSingleImage(
+      gfxContext& aContext, nsPresContext* aPresContext, imgIContainer* aImage,
+      SamplingFilter aSamplingFilter, const nsRect& aDest, const nsRect& aDirty,
+      const mozilla::SVGImageContext& aSVGContext, uint32_t aImageFlags,
+      const nsPoint* aAnchorPoint = nullptr);
+
+  static void ComputeSizeForDrawing(imgIContainer* aImage,
+                                    const mozilla::image::Resolution&,
+                                    CSSIntSize& aImageSize,
+                                    AspectRatio& aIntrinsicRatio,
+                                    bool& aGotWidth, bool& aGotHeight);
+
+  static CSSIntSize ComputeSizeForDrawingWithFallback(
+      imgIContainer* aImage, const mozilla::image::Resolution&,
+      const nsSize& aFallbackSize);
+
+  static mozilla::gfx::IntSize ComputeImageContainerDrawingParameters(
+      imgIContainer* aImage, nsIFrame* aForFrame,
+      const LayoutDeviceRect& aDestRect, const LayoutDeviceRect& aFillRect,
+      const StackingContextHelper& aSc, uint32_t aFlags,
+      mozilla::SVGImageContext& aSVGContext,
+      mozilla::Maybe<mozilla::image::ImageIntRegion>& aRegion);
+
+  static nsRect GetWholeImageDestination(const nsSize& aWholeImageSize,
+                                         const nsRect& aImageSourceArea,
+                                         const nsRect& aDestArea);
+
+  static already_AddRefed<imgIContainer> OrientImage(
+      imgIContainer* aContainer,
+      const mozilla::StyleImageOrientation& aOrientation);
+
+  static bool ImageRequestUsesCORS(imgIRequest* aRequest);
+
+  static bool HasNonZeroCorner(const mozilla::BorderRadius& aCorners);
+
+  static bool HasNonZeroCornerOnSide(const mozilla::BorderRadius& aCorners,
+                                     mozilla::Side aSide);
+
+  using TransparencyMode = mozilla::widget::TransparencyMode;
+  static TransparencyMode GetFrameTransparency(const nsIFrame* aBackgroundFrame,
+                                               const nsIFrame* aCSSRootFrame);
+
+  static bool IsPopup(const nsIFrame* aFrame);
+
+  static nsIFrame* GetDisplayRootFrame(nsIFrame* aFrame);
+  static const nsIFrame* GetDisplayRootFrame(const nsIFrame* aFrame);
+
+  static nsIFrame* GetReferenceFrame(nsIFrame* aFrame);
+
+  static mozilla::gfx::ShapedTextFlags GetTextRunFlagsForStyle(
+      const ComputedStyle*, nsPresContext*, const nsStyleFont*,
+      const nsStyleText*, nscoord aLetterSpacing);
+
+  static mozilla::gfx::ShapedTextFlags GetTextRunOrientFlagsForStyle(
+      const ComputedStyle*);
+
+  static void GetRectDifferenceStrips(const nsRect& aR1, const nsRect& aR2,
+                                      nsRect* aHStrip, nsRect* aVStrip);
+
+  static nsDeviceContext* GetDeviceContextForScreenInfo(
+      nsPIDOMWindowOuter* aWindow);
+
+  static bool IsReallyFixedPos(const nsIFrame* aFrame);
+
+  static bool MayBeReallyFixedPos(const nsIFrame* aFrame);
+
+  static bool IsInPositionFixedSubtree(const nsIFrame* aFrame);
+
+
+  enum {
+    SFE_WANT_FIRST_FRAME_IF_IMAGE = 1 << 0,
+    SFE_NO_COLORSPACE_CONVERSION = 1 << 1,
+    SFE_ALLOW_NON_PREMULT = 1 << 2,
+    SFE_NO_RASTERIZING_VECTORS = 1 << 3,
+    SFE_USE_ELEMENT_SIZE_IF_VECTOR = 1 << 4,
+    SFE_EXACT_SIZE_SURFACE = 1 << 6,
+    SFE_ORIENTATION_FROM_IMAGE = 1 << 7,
+    SFE_ALLOW_UNCROPPED_UNSCALED = 1 << 8,
+  };
+
+  static mozilla::SurfaceFromElementResult SurfaceFromOffscreenCanvas(
+      mozilla::dom::OffscreenCanvas* aOffscreenCanvas, uint32_t aSurfaceFlags,
+      RefPtr<DrawTarget>& aTarget);
+  static mozilla::SurfaceFromElementResult SurfaceFromOffscreenCanvas(
+      mozilla::dom::OffscreenCanvas* aOffscreenCanvas,
+      uint32_t aSurfaceFlags = 0) {
+    RefPtr<DrawTarget> target = nullptr;
+    return SurfaceFromOffscreenCanvas(aOffscreenCanvas, aSurfaceFlags, target);
+  }
+  static mozilla::SurfaceFromElementResult SurfaceFromVideoFrame(
+      mozilla::dom::VideoFrame* aVideoFrame, uint32_t aSurfaceFlags,
+      RefPtr<DrawTarget>& aTarget);
+  static mozilla::SurfaceFromElementResult SurfaceFromVideoFrame(
+      mozilla::dom::VideoFrame* aVideoFrame, uint32_t aSurfaceFlags = 0) {
+    RefPtr<DrawTarget> target = nullptr;
+    return SurfaceFromVideoFrame(aVideoFrame, aSurfaceFlags, target);
+  }
+  static mozilla::SurfaceFromElementResult SurfaceFromImageBitmap(
+      mozilla::dom::ImageBitmap* aImageBitmap, uint32_t aSurfaceFlags);
+
+  static mozilla::SurfaceFromElementResult SurfaceFromElement(
+      mozilla::dom::Element* aElement,
+      const mozilla::Maybe<int32_t>& aResizeWidth,
+      const mozilla::Maybe<int32_t>& aResizeHeight, uint32_t aSurfaceFlags,
+      RefPtr<DrawTarget>& aTarget);
+  static mozilla::SurfaceFromElementResult SurfaceFromElement(
+      mozilla::dom::Element* aElement, uint32_t aSurfaceFlags = 0) {
+    RefPtr<DrawTarget> target = nullptr;
+    return SurfaceFromElement(aElement, mozilla::Nothing(), mozilla::Nothing(),
+                              aSurfaceFlags, target);
+  }
+  static mozilla::SurfaceFromElementResult SurfaceFromElement(
+      mozilla::dom::Element* aElement, uint32_t aSurfaceFlags,
+      RefPtr<DrawTarget>& aTarget) {
+    return SurfaceFromElement(aElement, mozilla::Nothing(), mozilla::Nothing(),
+                              aSurfaceFlags, aTarget);
+  }
+  static mozilla::SurfaceFromElementResult SurfaceFromElement(
+      mozilla::dom::Element* aElement,
+      const mozilla::Maybe<int32_t>& aResizeWidth,
+      const mozilla::Maybe<int32_t>& aResizeHeight,
+      uint32_t aSurfaceFlags = 0) {
+    RefPtr<DrawTarget> target = nullptr;
+    return SurfaceFromElement(aElement, aResizeWidth, aResizeHeight,
+                              aSurfaceFlags, target);
+  }
+
+  static mozilla::Maybe<mozilla::gfx::IntSize> ComputeResizedSize(
+      const mozilla::gfx::IntSize& aSrcSize,
+      const mozilla::Maybe<int32_t>& aResizeWidth,
+      const mozilla::Maybe<int32_t>& aResizeHeight);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  static mozilla::SurfaceFromElementResult SurfaceFromElement(
+      nsIImageLoadingContent* aElement,
+      const mozilla::Maybe<int32_t>& aResizeWidth,
+      const mozilla::Maybe<int32_t>& aResizeHeight, uint32_t aSurfaceFlags,
+      RefPtr<DrawTarget>& aTarget);
+  static mozilla::SurfaceFromElementResult SurfaceFromElement(
+      mozilla::dom::HTMLImageElement* aElement, uint32_t aSurfaceFlags,
+      RefPtr<DrawTarget>& aTarget);
+  static mozilla::SurfaceFromElementResult SurfaceFromElement(
+      mozilla::dom::HTMLCanvasElement* aElement, uint32_t aSurfaceFlags,
+      RefPtr<DrawTarget>& aTarget);
+  static mozilla::SurfaceFromElementResult SurfaceFromElement(
+      mozilla::dom::HTMLCanvasElement* aElement, uint32_t aSurfaceFlags) {
+    RefPtr<DrawTarget> target = nullptr;
+    return SurfaceFromElement(aElement, aSurfaceFlags, target);
+  }
+  static mozilla::SurfaceFromElementResult SurfaceFromElement(
+      mozilla::dom::HTMLVideoElement* aElement, uint32_t aSurfaceFlags,
+      RefPtr<DrawTarget>& aTarget, bool aOptimizeSourceSurface = true);
+
+  static mozilla::dom::Element* GetEditableRootContentByContentEditable(
+      mozilla::dom::Document* aDocument);
+
+  static void AddExtraBackgroundItems(nsDisplayListBuilder* aBuilder,
+                                      nsDisplayList* aList, nsIFrame* aFrame,
+                                      const nsRect& aCanvasArea,
+                                      const nsRegion& aVisibleRegion,
+                                      nscolor aBackstop);
+
+  static bool NeedsPrintPreviewBackground(nsPresContext* aPresContext);
+
+  using UsedFontFaceList =
+      nsTArray<mozilla::UniquePtr<mozilla::dom::InspectorFontFace>>;
+  using UsedFontFaceTable =
+      nsTHashMap<nsPtrHashKey<gfxFontEntry>, mozilla::dom::InspectorFontFace*>;
+
+  static nsresult GetFontFacesForFrames(nsIFrame* aFrame,
+                                        UsedFontFaceList& aResult,
+                                        UsedFontFaceTable& aFontFaces,
+                                        uint32_t aMaxRanges,
+                                        bool aSkipCollapsedWhitespace);
+
+  static void GetFontFacesForText(nsIFrame* aFrame, int32_t aStartOffset,
+                                  int32_t aEndOffset, bool aFollowContinuations,
+                                  UsedFontFaceList& aResult,
+                                  UsedFontFaceTable& aFontFaces,
+                                  uint32_t aMaxRanges,
+                                  bool aSkipCollapsedWhitespace);
+
+  static size_t SizeOfTextRunsForFrames(nsIFrame* aFrame,
+                                        mozilla::MallocSizeOf aMallocSizeOf,
+                                        bool clear);
+
+  static bool HasAnimationOfPropertySet(const nsIFrame* aFrame,
+                                        const nsCSSPropertyIDSet& aPropertySet);
+
+  static bool HasAnimationOfPropertySet(const nsIFrame* aFrame,
+                                        const nsCSSPropertyIDSet& aPropertySet,
+                                        mozilla::EffectSet* aEffectSet);
+
+  static bool HasAnimationOfTransformAndMotionPath(const nsIFrame* aFrame);
+
+  static bool HasEffectiveAnimation(const nsIFrame* aFrame,
+                                    NonCustomCSSPropertyId aProperty);
+
+  static bool HasEffectiveAnimation(const nsIFrame* aFrame,
+                                    const nsCSSPropertyIDSet& aPropertySet);
+
+  static nsCSSPropertyIDSet GetAnimationPropertiesForCompositor(
+      const nsIFrame* aStyleFrame);
+
+  static bool AreAsyncAnimationsEnabled();
+
+  static bool AreRetainedDisplayListsEnabled();
+
+  static bool DisplayRootHasRetainedDisplayListBuilder(nsIFrame* aFrame);
+
+  static RetainedDisplayListBuilder* GetRetainedDisplayListBuilder(
+      nsIFrame* aFrame);
+
+  static MatrixScales ComputeSuitableScaleForAnimation(
+      const nsIFrame* aFrame, const nsSize& aVisibleSize,
+      const nsSize& aDisplaySize);
+
+  static void UnionChildOverflow(
+      nsIFrame* aFrame, mozilla::OverflowAreas& aOverflowAreas,
+      mozilla::FrameChildListIDs aSkipChildLists = {});
+
+  static float FontSizeInflationFor(const nsIFrame* aFrame);
+
+  static nscoord InflationMinFontSizeFor(const nsIFrame* aFrame);
+
+  static float FontSizeInflationInner(const nsIFrame* aFrame,
+                                      nscoord aMinFontSize);
+
+  static bool FontSizeInflationEnabled(nsPresContext* aPresContext);
+
+  static bool InvalidationDebuggingIsEnabled() {
+    return mozilla::StaticPrefs::nglayout_debug_invalidation() ||
+           getenv("MOZ_DUMP_INVALIDATION") != nullptr;
+  }
+
+  static void Initialize();
+  static void Shutdown();
+
+  static void RegisterImageRequest(nsPresContext* aPresContext,
+                                   imgIRequest* aRequest,
+                                   bool* aRequestRegistered);
+
+  static void RegisterImageRequestIfAnimated(nsPresContext* aPresContext,
+                                             imgIRequest* aRequest,
+                                             bool* aRequestRegistered);
+
+  static void DeregisterImageRequest(nsPresContext* aPresContext,
+                                     imgIRequest* aRequest,
+                                     bool* aRequestRegistered);
+
+  static void PostRestyleEvent(mozilla::dom::Element*, mozilla::RestyleHint,
+                               nsChangeHint aMinChangeHint);
+
+  template <typename PointType, typename RectType, typename CoordType>
+  static bool PointIsCloserToRect(PointType aPoint, const RectType& aRect,
+                                  CoordType& aClosestXDistance,
+                                  CoordType& aClosestYDistance);
+  static nsRect GetBoxShadowRectForFrame(nsIFrame* aFrame,
+                                         const nsSize& aFrameSize);
+
+#ifdef DEBUG
+  static void AssertNoDuplicateContinuations(nsIFrame* aContainer,
+                                             const nsFrameList& aFrameList);
+
+  static void AssertTreeOnlyEmptyNextInFlows(nsIFrame* aSubtreeRoot);
+#endif
+
+  static void TransformToAncestorAndCombineRegions(
+      const nsRegion& aRegion, nsIFrame* aFrame, const nsIFrame* aAncestorFrame,
+      nsRegion* aPreciseTargetDest, nsRegion* aImpreciseTargetDest,
+      mozilla::Maybe<Matrix4x4Flagged>* aMatrixCache,
+      const mozilla::DisplayItemClip* aClip);
+
+  enum class SubtractDynamicToolbar { No, Yes };
+  static bool GetDocumentViewerSize(
+      const nsPresContext* aPresContext, LayoutDeviceIntSize& aOutSize,
+      SubtractDynamicToolbar = SubtractDynamicToolbar::Yes);
+
+  enum class IncludeDynamicToolbar { Auto, Force };
+
+ private:
+  static bool UpdateCompositionBoundsForRCDRSF(
+      mozilla::ParentLayerRect& aCompBounds, const nsPresContext* aPresContext,
+      IncludeDynamicToolbar aIncludeDynamicToolbar =
+          IncludeDynamicToolbar::Auto);
+
+ public:
+  static nsSize CalculateCompositionSizeForFrame(
+      nsIFrame* aFrame, bool aSubtractScrollbars = true,
+      const nsSize* aOverrideScrollPortSize = nullptr,
+      IncludeDynamicToolbar aIncludeDynamicToolbar =
+          IncludeDynamicToolbar::Auto);
+
+  static CSSSize CalculateBoundingCompositionSize(
+      const nsIFrame* aFrame, bool aIsRootContentDocRootScrollFrame,
+      const FrameMetrics& aMetrics);
+
+  static nsRect CalculateScrollableRectForFrame(
+      const mozilla::ScrollContainerFrame* aScrollContainerFrame,
+      const nsIFrame* aRootFrame);
+
+  static nsRect CalculateExpandedScrollableRect(nsIFrame* aFrame);
+
+  static bool UsesAsyncScrolling(nsIFrame* aFrame);
+
+  static bool AsyncPanZoomEnabled(const nsIFrame* aFrame);
+
+  static bool AllowZoomingForDocument(const mozilla::dom::Document* aDocument);
+
+  static bool ShouldDisableApzForElement(nsIContent* aContent);
+
+  static FrameMetrics CalculateBasicFrameMetrics(
+      mozilla::ScrollContainerFrame* aScrollContainerFrame);
+
+  static mozilla::ScrollContainerFrame* GetAsyncScrollableAncestorFrame(
+      nsIFrame* aTarget);
+
+  static void SetBSizeFromFontMetrics(
+      const nsIFrame* aFrame, mozilla::ReflowOutput& aMetrics,
+      const mozilla::LogicalMargin& aFramePadding, mozilla::WritingMode aLineWM,
+      mozilla::WritingMode aFrameWM);
+
+  static bool HasDocumentLevelListenersForApzAwareEvents(PresShell* aPresShell);
+
+  static bool CanScrollOriginClobberApz(ScrollOrigin aScrollOrigin);
+
+  static ScrollMetadata ComputeScrollMetadata(
+      const nsIFrame* aForFrame, const nsIFrame* aScrollFrame,
+      nsIContent* aContent, const nsIFrame* aItemFrame,
+      const nsPoint& aOffsetToReferenceFrame,
+      mozilla::layers::WebRenderLayerManager* aLayerManager,
+      ViewID aScrollParentId, const nsSize& aScrollPortSize, bool aIsRoot);
+
+  static mozilla::Maybe<ScrollMetadata> GetRootMetadata(
+      nsDisplayListBuilder* aBuilder,
+      mozilla::layers::WebRenderLayerManager* aLayerManager,
+      const std::function<bool(ViewID& aScrollId)>& aCallback);
+
+  static nsMargin ScrollbarAreaToExcludeFromCompositionBoundsFor(
+      const nsIFrame* aScrollFrame);
+
+  static bool ShouldUseNoFramesSheet(mozilla::dom::Document*);
+
+  static void GetFrameTextContent(nsIFrame* aFrame, nsAString& aResult);
+
+  static void AppendFrameTextContent(nsIFrame* aFrame, nsAString& aResult);
+
+  static nsRect GetSelectionBoundingRect(const mozilla::dom::Selection* aSel);
+
+  static CSSRect GetBoundingContentRect(
+      const nsIContent* aContent,
+      const mozilla::ScrollContainerFrame* aRootScrollContainerFrame,
+      mozilla::Maybe<CSSRect>* aOutNearestScrollClip = nullptr);
+
+  static CSSRect GetBoundingFrameRect(
+      nsIFrame* aFrame,
+      const mozilla::ScrollContainerFrame* aRootScrollContainerFrame,
+      mozilla::Maybe<CSSRect>* aOutNearestScrollClip = nullptr);
+
+  static nsBlockFrame* GetFloatContainingBlock(nsIFrame* aFrame);
+
+  static bool IsTransformed(nsIFrame* aForFrame, nsIFrame* aTopFrame = nullptr);
+
+  static CSSPoint GetCumulativeApzCallbackTransform(nsIFrame* aFrame);
+
+  static nsRect ComputePartialPrerenderArea(nsIFrame* aFrame,
+                                            const nsRect& aDirtyRect,
+                                            const nsRect& aOverflow,
+                                            const nsSize& aPrerenderSize);
+
+  static bool IsInvisibleBreak(const nsINode* aNode,
+                               nsIFrame** aNextLineFrame = nullptr);
+
+  static nsRect ComputeSVGOriginBox(mozilla::dom::SVGViewportElement*);
+
+  enum class MayHaveNonScalingStrokeCyclicDependency : bool { No, Yes };
+  static nsRect ComputeSVGReferenceRect(
+      nsIFrame*, StyleGeometryBox,
+      MayHaveNonScalingStrokeCyclicDependency =
+          MayHaveNonScalingStrokeCyclicDependency::No);
+
+  static nsRect ComputeHTMLReferenceRect(const nsIFrame*, StyleGeometryBox);
+
+  static nsRect ComputeClipPathGeometryBox(
+      nsIFrame*, const mozilla::StyleShapeGeometryBox&);
+
+  static nsPoint ComputeOffsetToUserSpace(nsDisplayListBuilder* aBuilder,
+                                          nsIFrame* aFrame);
+
+  static already_AddRefed<nsFontMetrics> GetMetricsFor(
+      nsPresContext* aPresContext, bool aIsVertical,
+      const nsStyleFont* aStyleFont, mozilla::Length aFontSize,
+      bool aUseUserFontSet);
+
+  static void ComputeSystemFont(nsFont* aSystemFont,
+                                mozilla::StyleSystemFont aFontID,
+                                const nsFont& aDefaultVariableFont,
+                                const mozilla::dom::Document* aDocument);
+
+  static uint32_t ParseFontLanguageOverride(const nsAString& aLangTag);
+
+  static bool ShouldHandleMetaViewport(const mozilla::dom::Document*);
+
+  template <bool clampNegativeResultToZero>
+  static nscoord ResolveToLength(const LengthPercentage& aLengthPercentage,
+                                 nscoord aPercentageBasis) {
+    nscoord value = (aPercentageBasis == NS_UNCONSTRAINEDSIZE)
+                        ? aLengthPercentage.Resolve(0)
+                        : aLengthPercentage.Resolve(aPercentageBasis);
+    return clampNegativeResultToZero ? std::max(0, value) : value;
+  }
+
+  static nscoord ResolveGapToLength(
+      const mozilla::NonNegativeLengthPercentageOrNormal& aGap,
+      nscoord aPercentageBasis) {
+    if (aGap.IsNormal()) {
+      return nscoord(0);
+    }
+    return ResolveToLength<true>(aGap.AsLengthPercentage(), aPercentageBasis);
+  }
+
+  static ComputedStyle* StyleForScrollbar(const nsIFrame* aScrollbarPart);
+
+  static bool UseOverlayScrollbars(const nsIFrame* aScrollbarPart);
+
+  static mozilla::StyleScrollbarWidth ScrollbarWidthFor(
+      const nsIFrame* aScrollbarPart);
+
+  static bool FrameRectIsScrolledOutOfViewInCrossProcess(
+      const nsIFrame* aFrame, const nsRect& aFrameRect);
+
+  static bool FrameIsMostlyScrolledOutOfViewInCrossProcess(
+      const nsIFrame* aFrame, nscoord aMargin);
+
+  static nsSize ExpandHeightForViewportUnits(nsPresContext* aPresContext,
+                                             const nsSize& aSize);
+
+  static CSSSize ExpandHeightForDynamicToolbar(
+      const nsPresContext* aPresContext, const CSSSize& aSize);
+  static nsSize ExpandHeightForDynamicToolbar(const nsPresContext* aPresContext,
+                                              const nsSize& aSize);
+
+  static nsIFrame* GetNearestOverflowClipFrame(nsIFrame* aFrame);
+
+  static bool IsSmoothScrollingEnabled();
+
+  static void RecomputeSmoothScrollDefault();
+
+  struct CombinedFragments {
+    const nsIFrame* mSkippedPrevContinuation = nullptr;
+    const nsIFrame* mSkippedNextContinuation = nullptr;
+    nsRect mRect;
+  };
+  static CombinedFragments GetCombinedFragmentRects(
+      const nsIFrame* aFrame, const nsIFrame* aContainingBlock = nullptr);
+
+ private:
+  static void ConstrainToCoordValues(double& aStart, double& aSize);
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(nsLayoutUtils::PaintFrameFlags)
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(nsLayoutUtils::GetPopupFrameForPointFlags)
+
+template <typename PointType, typename RectType, typename CoordType>
+ bool nsLayoutUtils::PointIsCloserToRect(
+    PointType aPoint, const RectType& aRect, CoordType& aClosestXDistance,
+    CoordType& aClosestYDistance) {
+  CoordType fromLeft = aPoint.x - aRect.x;
+  CoordType fromRight = aPoint.x - aRect.XMost();
+
+  CoordType xDistance;
+  if (fromLeft >= 0 && fromRight <= 0) {
+    xDistance = 0;
+  } else {
+    xDistance = std::min(abs(fromLeft), abs(fromRight));
+  }
+
+  if (xDistance <= aClosestXDistance) {
+    if (xDistance < aClosestXDistance) {
+      aClosestYDistance = std::numeric_limits<CoordType>::max();
+    }
+
+    CoordType fromTop = aPoint.y - aRect.y;
+    CoordType fromBottom = aPoint.y - aRect.YMost();
+
+    CoordType yDistance;
+    if (fromTop >= 0 && fromBottom <= 0) {
+      yDistance = 0;
+    } else {
+      yDistance = std::min(abs(fromTop), abs(fromBottom));
+    }
+
+    if (yDistance < aClosestYDistance) {
+      aClosestXDistance = xDistance;
+      aClosestYDistance = yDistance;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+template <typename T>
+nsRect nsLayoutUtils::RoundGfxRectToAppRect(const T& aRect,
+                                            const float aFactor) {
+  T scaledRect = aRect;
+  scaledRect.ScaleRoundOut(aFactor);
+
+  nsRect retval;
+
+  double start = double(scaledRect.x);
+  double size = double(scaledRect.width);
+  ConstrainToCoordValues(start, size);
+  retval.x = nscoord(start);
+  retval.width = nscoord(size);
+
+  start = double(scaledRect.y);
+  size = double(scaledRect.height);
+  ConstrainToCoordValues(start, size);
+  retval.y = nscoord(start);
+  retval.height = nscoord(size);
+
+  if (!aRect.Width()) {
+    retval.SetWidth(0);
+  }
+
+  if (!aRect.Height()) {
+    retval.SetHeight(0);
+  }
+
+  return retval;
+}
+
+template <typename T>
+nsRect nsLayoutUtils::ScaleThenRoundGfxRectToAppRect(const T& aRect,
+                                                     const float aFactor) {
+  T scaledRect = aRect;
+  scaledRect.Scale(aFactor);
+
+  nsRect retval;
+
+  double start = double(scaledRect.x);
+  double size = double(scaledRect.width);
+  ConstrainToCoordValues(start, size);
+  retval.x = NSToCoordRoundWithClamp(start);
+  retval.width = NSToCoordRoundWithClamp(size);
+
+  start = double(scaledRect.y);
+  size = double(scaledRect.height);
+  ConstrainToCoordValues(start, size);
+  retval.y = NSToCoordRoundWithClamp(start);
+  retval.height = NSToCoordRoundWithClamp(size);
+
+  if (!aRect.Width()) {
+    retval.SetWidth(0);
+  }
+
+  if (!aRect.Height()) {
+    retval.SetHeight(0);
+  }
+
+  return retval;
+}
+
+namespace mozilla {
+
+inline gfx::Point NSPointToPoint(const nsPoint& aPoint,
+                                 int32_t aAppUnitsPerPixel) {
+  return gfx::Point(gfx::Float(aPoint.x) / aAppUnitsPerPixel,
+                    gfx::Float(aPoint.y) / aAppUnitsPerPixel);
+}
+
+gfx::Rect NSRectToRect(const nsRect& aRect, double aAppUnitsPerPixel);
+
+gfx::Rect NSRectToSnappedRect(const nsRect& aRect, double aAppUnitsPerPixel,
+                              const gfx::DrawTarget& aSnapDT);
+
+gfx::Rect NSRectToNonEmptySnappedRect(const nsRect& aRect,
+                                      double aAppUnitsPerPixel,
+                                      const gfx::DrawTarget& aSnapDT);
+
+void StrokeLineWithSnapping(
+    const nsPoint& aP1, const nsPoint& aP2, int32_t aAppUnitsPerDevPixel,
+    gfx::DrawTarget& aDrawTarget, const gfx::Pattern& aPattern,
+    const gfx::StrokeOptions& aStrokeOptions = gfx::StrokeOptions(),
+    const gfx::DrawOptions& aDrawOptions = gfx::DrawOptions());
+
+namespace layout {
+
+class AutoMaybeDisableFontInflation {
+ public:
+  explicit AutoMaybeDisableFontInflation(nsIFrame* aFrame);
+
+  ~AutoMaybeDisableFontInflation();
+
+ private:
+  nsPresContext* mPresContext;
+  bool mOldValue;
+};
+
+}  
+}  
+
+class nsSetAttrRunnable : public mozilla::Runnable {
+ public:
+  nsSetAttrRunnable(mozilla::dom::Element* aElement, nsAtom* aAttrName,
+                    const nsAString& aValue);
+  nsSetAttrRunnable(mozilla::dom::Element* aElement, nsAtom* aAttrName,
+                    int32_t aValue);
+
+  NS_DECL_NSIRUNNABLE
+
+  RefPtr<mozilla::dom::Element> mElement;
+  RefPtr<nsAtom> mAttrName;
+  nsAutoString mValue;
+};
+
+class nsUnsetAttrRunnable : public mozilla::Runnable {
+ public:
+  nsUnsetAttrRunnable(mozilla::dom::Element* aElement, nsAtom* aAttrName);
+
+  NS_DECL_NSIRUNNABLE
+
+  RefPtr<mozilla::dom::Element> mElement;
+  RefPtr<nsAtom> mAttrName;
+};
+
+template <typename T>
+class MOZ_RAII SetAndNullOnExit {
+ public:
+  SetAndNullOnExit(T*& aVariable, T* aValue) {
+    aVariable = aValue;
+    mVariable = &aVariable;
+  }
+  ~SetAndNullOnExit() { *mVariable = nullptr; }
+
+ private:
+  T** mVariable;
+};
+
+#endif  // nsLayoutUtils_h_

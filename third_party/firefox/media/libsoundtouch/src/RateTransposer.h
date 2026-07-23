@@ -1,0 +1,109 @@
+/// Author        : Copyright (c) Olli Parviainen
+// License :
+//  Copyright (c) Olli Parviainen
+//  License as published by the Free Software Foundation; either
+//  version 2.1 of the License, or (at your option) any later version.
+//  Lesser General Public License for more details.
+//  License along with this library; if not, write to the Free Software
+
+#ifndef RateTransposer_H
+#define RateTransposer_H
+
+#include <stddef.h>
+#include "AAFilter.h"
+#include "FIFOSamplePipe.h"
+#include "FIFOSampleBuffer.h"
+
+#include "STTypes.h"
+
+namespace soundtouch
+{
+
+class TransposerBase
+{
+public:
+        enum ALGORITHM {
+        LINEAR = 0,
+        CUBIC,
+        SHANNON
+    };
+
+protected:
+    virtual int transposeMono(SAMPLETYPE *dest,
+                        const SAMPLETYPE *src,
+                        int &srcSamples)  = 0;
+    virtual int transposeStereo(SAMPLETYPE *dest,
+                        const SAMPLETYPE *src,
+                        int &srcSamples) = 0;
+    virtual int transposeMulti(SAMPLETYPE *dest,
+                        const SAMPLETYPE *src,
+                        int &srcSamples) = 0;
+
+    static ALGORITHM algorithm;
+
+public:
+    double rate;
+    int numChannels;
+
+    TransposerBase();
+    virtual ~TransposerBase();
+
+    virtual int transpose(FIFOSampleBuffer &dest, FIFOSampleBuffer &src);
+    virtual void setRate(double newRate);
+    virtual void setChannels(int channels);
+    virtual int getLatency() const = 0;
+
+    virtual void resetRegisters() = 0;
+
+    static TransposerBase *newInstance();
+
+    static void setAlgorithm(ALGORITHM a);
+};
+
+
+class RateTransposer : public FIFOProcessor
+{
+protected:
+    AAFilter *pAAFilter;
+    TransposerBase *pTransposer;
+
+    FIFOSampleBuffer inputBuffer;
+
+    FIFOSampleBuffer midBuffer;
+
+    FIFOSampleBuffer outputBuffer;
+
+    bool bUseAAFilter;
+
+
+    void processSamples(const SAMPLETYPE *src,
+                        uint numSamples);
+
+public:
+    RateTransposer();
+    virtual ~RateTransposer() override;
+
+    FIFOSamplePipe *getOutput() { return &outputBuffer; };
+
+    AAFilter *getAAFilter();
+
+    void enableAAFilter(bool newMode);
+
+    bool isAAFilterEnabled() const;
+
+    virtual void setRate(double newRate);
+
+    void setChannels(int channels);
+
+    void putSamples(const SAMPLETYPE *samples, uint numSamples) override;
+
+    void clear() override;
+
+    int isEmpty() const override;
+
+    int getLatency() const;
+};
+
+}
+
+#endif

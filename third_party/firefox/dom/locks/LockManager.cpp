@@ -1,0 +1,235 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/LockManager.h"
+
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/dom/AutoEntryScript.h"
+#include "mozilla/dom/LockManagerBinding.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/WorkerCommon.h"
+#include "mozilla/dom/locks/LockManagerChild.h"
+#include "mozilla/dom/locks/LockRequestChild.h"
+#include "mozilla/dom/locks/PLockManager.h"
+#include "mozilla/ipc/BackgroundChild.h"
+#include "mozilla/ipc/BackgroundUtils.h"
+#include "mozilla/ipc/PBackgroundChild.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(LockManager, mGlobal)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(LockManager)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(LockManager)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(LockManager)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+JSObject* LockManager::WrapObject(JSContext* aCx,
+                                  JS::Handle<JSObject*> aGivenProto) {
+  return LockManager_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+LockManager::LockManager(nsIGlobalObject* aGlobal) : mGlobal(aGlobal) {
+  Maybe<nsID> clientID;
+  nsCOMPtr<nsIPrincipal> principal;
+
+  if (XRE_IsParentProcess() && aGlobal->PrincipalOrNull() &&
+      aGlobal->PrincipalOrNull()->IsSystemPrincipal()) {
+    clientID = Nothing();
+    principal = aGlobal->PrincipalOrNull();
+  } else {
+    Maybe<ClientInfo> clientInfo = aGlobal->GetClientInfo();
+    if (!clientInfo) {
+      return;
+    }
+
+    principal = clientInfo->GetPrincipal().unwrapOr(nullptr);
+    if (!principal) {
+      return;
+    }
+
+    if (!principal->GetIsContentPrincipal()) {
+      return;
+    }
+
+    clientID = Some(clientInfo->Id());
+  }
+
+  mozilla::ipc::PBackgroundChild* backgroundActor =
+      mozilla::ipc::BackgroundChild::GetOrCreateForCurrentThread();
+  mActor = new locks::LockManagerChild(aGlobal);
+
+  if (!backgroundActor->SendPLockManagerConstructor(
+          mActor, WrapNotNull(principal), clientID)) {
+    mActor = nullptr;
+    return;
+  }
+}
+
+already_AddRefed<LockManager> LockManager::Create(nsIGlobalObject& aGlobal) {
+  RefPtr<LockManager> manager = new LockManager(&aGlobal);
+
+  if (!NS_IsMainThread()) {
+    manager->mWorkerRef =
+        WeakWorkerRef::Create(GetCurrentThreadWorkerPrivate(), [manager]() {
+          manager->Shutdown();
+          manager->mWorkerRef = nullptr;
+        });
+  }
+
+  return manager.forget();
+}
+
+static bool ValidateRequestArguments(const nsAString& name,
+                                     const LockOptions& options,
+                                     ErrorResult& aRv) {
+  if (name.Length() > 0 && name.First() == u'-') {
+    aRv.ThrowNotSupportedError("Names starting with `-` are reserved");
+    return false;
+  }
+  if (options.mSteal) {
+    if (options.mIfAvailable) {
+      aRv.ThrowNotSupportedError(
+          "`steal` and `ifAvailable` cannot be used together");
+      return false;
+    }
+    if (options.mMode != LockMode::Exclusive) {
+      aRv.ThrowNotSupportedError(
+          "`steal` is only supported for exclusive lock requests");
+      return false;
+    }
+  }
+  if (options.mSignal.WasPassed()) {
+    if (options.mSteal) {
+      aRv.ThrowNotSupportedError(
+          "`steal` and `signal` cannot be used together");
+      return false;
+    }
+    if (options.mIfAvailable) {
+      aRv.ThrowNotSupportedError(
+          "`ifAvailable` and `signal` cannot be used together");
+      return false;
+    }
+    if (options.mSignal.Value().Aborted()) {
+      AutoJSAPI jsapi;
+      if (!jsapi.Init(options.mSignal.Value().GetParentObject())) {
+        aRv.ThrowNotSupportedError("Signal's realm isn't active anymore.");
+        return false;
+      }
+
+      JSContext* cx = jsapi.cx();
+      JS::Rooted<JS::Value> reason(cx);
+      options.mSignal.Value().GetReason(cx, &reason);
+      aRv.MightThrowJSException();
+      aRv.ThrowJSException(cx, reason);
+      return false;
+    }
+  }
+  return true;
+}
+
+already_AddRefed<Promise> LockManager::Request(const nsAString& aName,
+                                               LockGrantedCallback& aCallback,
+                                               ErrorResult& aRv) {
+  return Request(aName, LockOptions(), aCallback, aRv);
+};
+already_AddRefed<Promise> LockManager::Request(const nsAString& aName,
+                                               const LockOptions& aOptions,
+                                               LockGrantedCallback& aCallback,
+                                               ErrorResult& aRv) {
+  if (!mGlobal->PrincipalOrNull() ||
+      !mGlobal->PrincipalOrNull()->IsSystemPrincipal()) {
+    if (!mGlobal->GetClientInfo()) {
+      aRv.ThrowInvalidStateError(
+          "The document of the lock manager is not fully active");
+      return nullptr;
+    }
+  }
+
+  const StorageAccess access = mGlobal->GetStorageAccess();
+  bool allowed =
+      access > StorageAccess::eDeny || ShouldPartitionStorage(access);
+  if (!allowed) {
+    aRv.ThrowSecurityError("request() is not allowed in this context");
+    return nullptr;
+  }
+
+  if (!mActor) {
+    aRv.ThrowNotSupportedError(
+        "Web Locks API is not enabled for this kind of document");
+    return nullptr;
+  }
+
+  if (!NS_IsMainThread() && !mWorkerRef) {
+    aRv.ThrowInvalidStateError("request() is not allowed at this point");
+    return nullptr;
+  }
+
+  if (!ValidateRequestArguments(aName, aOptions, aRv)) {
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  mActor->RequestLock({nsString(aName), promise, &aCallback}, aOptions);
+  return promise.forget();
+};
+
+already_AddRefed<Promise> LockManager::Query(ErrorResult& aRv) {
+  if (!mGlobal->PrincipalOrNull() ||
+      !mGlobal->PrincipalOrNull()->IsSystemPrincipal()) {
+    if (!mGlobal->GetClientInfo()) {
+      aRv.ThrowInvalidStateError(
+          "The document of the lock manager is not fully active");
+      return nullptr;
+    }
+  }
+
+  if (mGlobal->GetStorageAccess() <= StorageAccess::eDeny) {
+    aRv.ThrowSecurityError("query() is not allowed in this context");
+    return nullptr;
+  }
+
+  if (!mActor) {
+    aRv.ThrowNotSupportedError(
+        "Web Locks API is not enabled for this kind of document");
+    return nullptr;
+  }
+
+  if (!NS_IsMainThread() && !mWorkerRef) {
+    aRv.ThrowInvalidStateError("query() is not allowed at this point");
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  mActor->SendQuery()->Then(
+      GetCurrentSerialEventTarget(), __func__,
+      [promise](locks::LockManagerChild::QueryPromise::ResolveOrRejectValue&&
+                    aResult) {
+        if (aResult.IsResolve()) {
+          promise->MaybeResolve(aResult.ResolveValue());
+        } else {
+          promise->MaybeRejectWithUnknownError("Query failed");
+        }
+      });
+  return promise.forget();
+};
+
+void LockManager::Shutdown() {
+  if (mActor) {
+    locks::PLockManagerChild::Send__delete__(mActor);
+    mActor = nullptr;
+  }
+}
+
+}  

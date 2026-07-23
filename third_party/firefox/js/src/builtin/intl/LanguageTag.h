@@ -1,0 +1,71 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef builtin_intl_LanguageTag_h
+#define builtin_intl_LanguageTag_h
+
+#include "mozilla/intl/Locale.h"
+#include "mozilla/Span.h"
+
+#include "js/Result.h"
+#include "js/RootingAPI.h"
+#include "js/Utility.h"
+
+struct JS_PUBLIC_API JSContext;
+class JSLinearString;
+class JS_PUBLIC_API JSTracer;
+
+namespace js::intl {
+
+[[nodiscard]] bool ParseLocale(JSContext* cx, JS::Handle<JSLinearString*> str,
+                               mozilla::intl::Locale& result);
+
+[[nodiscard]] bool ParseStandaloneLanguageTag(
+    JS::Handle<JSLinearString*> str, mozilla::intl::LanguageSubtag& result);
+
+[[nodiscard]] bool ParseStandaloneScriptTag(
+    JS::Handle<JSLinearString*> str, mozilla::intl::ScriptSubtag& result);
+
+[[nodiscard]] bool ParseStandaloneRegionTag(
+    JS::Handle<JSLinearString*> str, mozilla::intl::RegionSubtag& result);
+
+[[nodiscard]] bool ParseStandaloneVariantTag(
+    JS::Handle<JSLinearString*> str,
+    mozilla::intl::Locale::VariantsVector& result, bool* success);
+
+JS::Result<JSLinearString*> ParseStandaloneISO639LanguageTag(
+    JSContext* cx, JS::Handle<JSLinearString*> str);
+
+class UnicodeExtensionKeyword final {
+  char key_[mozilla::intl::LanguageTagLimits::UnicodeKeyLength];
+  JSLinearString* type_;
+
+ public:
+  using UnicodeKey =
+      const char (&)[mozilla::intl::LanguageTagLimits::UnicodeKeyLength + 1];
+  using UnicodeKeySpan =
+      mozilla::Span<const char,
+                    mozilla::intl::LanguageTagLimits::UnicodeKeyLength>;
+
+  UnicodeExtensionKeyword(UnicodeKey key, JSLinearString* type)
+      : key_{key[0], key[1]}, type_(type) {}
+
+  UnicodeKeySpan key() const { return {key_, sizeof(key_)}; }
+  JSLinearString* type() const { return type_; }
+
+  void trace(JSTracer* trc);
+};
+
+[[nodiscard]] extern bool ApplyUnicodeExtensionToTag(
+    JSContext* cx, mozilla::intl::Locale& tag,
+    JS::HandleVector<UnicodeExtensionKeyword> keywords);
+
+JS::UniqueChars FormatLocale(
+    JSContext* cx, JS::Handle<JSLinearString*> locale,
+    JS::HandleVector<UnicodeExtensionKeyword> keywords);
+
+}  
+
+#endif /* builtin_intl_LanguageTag_h */

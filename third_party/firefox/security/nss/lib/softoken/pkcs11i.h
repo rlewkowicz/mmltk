@@ -1,0 +1,764 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef _PKCS11I_H_
+#define _PKCS11I_H_ 1
+
+#include "prlock.h"
+#include "seccomon.h"
+#include "secoidt.h"
+#include "lowkeyti.h"
+#include "pkcs11t.h"
+
+#include "sftkdbt.h"
+#include "chacha20poly1305.h"
+#include "hasht.h"
+
+#include "alghmac.h"
+#include "cmac.h"
+
+
+#define MAX_OBJS_ATTRS 45 /* number of attributes to preallocate in \
+                           * the object (must me the absolute max) */
+#define ATTR_SPACE 50     /* Maximum size of attribute data before extra \
+                           * data needs to be allocated. This is set to  \
+                           * enough space to hold an SSL MASTER secret */
+
+#define NSC_STRICT PR_FALSE /* forces the code to do strict template     \
+                             * matching when doing C_FindObject on token \
+                             * objects. This will slow down search in    \
+                             * NSS. */
+#define NSC_CERT_BLOCK_SIZE 50
+#define NSC_SEARCH_BLOCK_SIZE 5
+#define NSC_SLOT_LIST_BLOCK_SIZE 10
+
+#define NSC_MIN_SESSION_OBJECT_HANDLE 1U
+
+#define NSC_FIPS_MODULE 1
+#define NSC_NON_FIPS_MODULE 0
+
+#define SPACE_ATTRIBUTE_HASH_SIZE 32
+#define SPACE_SESSION_OBJECT_HASH_SIZE 32
+#define SPACE_SESSION_HASH_SIZE 32
+#define TIME_ATTRIBUTE_HASH_SIZE 32
+#define TIME_SESSION_OBJECT_HASH_SIZE 1024
+#define TIME_SESSION_HASH_SIZE 1024
+#define MAX_OBJECT_LIST_SIZE 800
+#define MAX_KEY_LEN 256 /* maximum symmetric key length in bytes */
+
+#define LOG2_BUCKETS_PER_SESSION_LOCK 0
+#define BUCKETS_PER_SESSION_LOCK (1 << (LOG2_BUCKETS_PER_SESSION_LOCK))
+
+typedef struct SFTKAttributeStr SFTKAttribute;
+typedef struct SFTKObjectListStr SFTKObjectList;
+typedef struct SFTKObjectFreeListStr SFTKObjectFreeList;
+typedef struct SFTKObjectListElementStr SFTKObjectListElement;
+typedef struct SFTKObjectStr SFTKObject;
+typedef struct SFTKSessionObjectStr SFTKSessionObject;
+typedef struct SFTKTokenObjectStr SFTKTokenObject;
+typedef struct SFTKSessionStr SFTKSession;
+typedef struct SFTKSlotStr SFTKSlot;
+typedef struct SFTKSessionContextStr SFTKSessionContext;
+typedef struct SFTKSearchResultsStr SFTKSearchResults;
+typedef struct SFTKHashVerifyInfoStr SFTKHashVerifyInfo;
+typedef struct SFTKHashSignInfoStr SFTKHashSignInfo;
+typedef struct SFTKOAEPInfoStr SFTKOAEPInfo;
+typedef struct SFTKPSSSignInfoStr SFTKPSSSignInfo;
+typedef struct SFTKPSSVerifyInfoStr SFTKPSSVerifyInfo;
+typedef struct SFTKSSLMACInfoStr SFTKSSLMACInfo;
+typedef struct SFTKChaCha20Poly1305InfoStr SFTKChaCha20Poly1305Info;
+typedef struct SFTKChaCha20CtrInfoStr SFTKChaCha20CtrInfo;
+typedef struct SFTKItemTemplateStr SFTKItemTemplate;
+
+typedef void (*SFTKDestroy)(void *, PRBool);
+typedef void (*SFTKBegin)(void *);
+typedef SECStatus (*SFTKCipher)(void *, unsigned char *, unsigned int *, unsigned int,
+                                const unsigned char *, unsigned int);
+typedef SECStatus (*SFTKAEADCipher)(void *, void *, unsigned int *,
+                                    unsigned int, void *, unsigned int,
+                                    void *, unsigned int, void *, unsigned int);
+typedef SECStatus (*SFTKVerify)(void *, const unsigned char *, unsigned int, const unsigned char *, unsigned int);
+typedef void (*SFTKHash)(void *, const unsigned char *, unsigned int);
+typedef void (*SFTKEnd)(void *, unsigned char *, unsigned int *, unsigned int);
+typedef void (*SFTKFree)(void *);
+
+typedef enum {
+    SFTK_NEVER = 0,
+    SFTK_ONCOPY = 1,
+    SFTK_SENSITIVE = 2,
+    SFTK_ALWAYS = 3
+} SFTKModifyType;
+
+typedef enum {
+    SFTK_DestroyFailure,
+    SFTK_Destroyed,
+    SFTK_Busy
+} SFTKFreeStatus;
+
+typedef enum {
+    SFTK_SOURCE_DEFAULT = 0,
+    SFTK_SOURCE_KEA,
+    SFTK_SOURCE_HKDF_EXPAND,
+    SFTK_SOURCE_HKDF_EXTRACT
+} SFTKSource;
+
+struct SFTKAttributeStr {
+    SFTKAttribute *next;
+    SFTKAttribute *prev;
+    PRBool freeAttr;
+    PRBool freeData;
+    CK_ATTRIBUTE_TYPE handle;
+    CK_ATTRIBUTE attrib;
+    unsigned char space[ATTR_SPACE];
+};
+
+struct SFTKObjectListStr {
+    SFTKObjectList *next;
+    SFTKObjectList *prev;
+    SFTKObject *parent;
+};
+
+struct SFTKObjectFreeListStr {
+    SFTKObject *head;
+    PRLock *lock;
+    int count;
+};
+
+struct SFTKObjectStr {
+    SFTKObject *next;
+    SFTKObject *prev;
+    CK_OBJECT_CLASS objclass;
+    CK_OBJECT_HANDLE handle;
+    int refCount;
+    PRUint32 type; 
+    PRLock *refLock;
+    SFTKSlot *slot;
+    void *objectInfo;
+    SFTKFree infoFree;
+    CK_FLAGS validation_value;
+    SFTKAttribute validation_attribute;
+    SFTKSource source;
+};
+
+struct SFTKTokenObjectStr {
+    SFTKObject obj;
+    SECItem dbKey;
+};
+
+struct SFTKSessionObjectStr {
+    SFTKObject obj;
+    SFTKObjectList sessionList;
+    PRLock *attributeLock;
+    SFTKSession *session;
+    PRBool wasDerived;
+    int nextAttr;
+    SFTKAttribute attrList[MAX_OBJS_ATTRS];
+    PRBool optimizeSpace;
+    unsigned int hashSize;
+    SFTKAttribute *head[1];
+};
+
+struct SFTKObjectListElementStr {
+    SFTKObjectListElement *next;
+    SFTKObject *object;
+};
+
+struct SFTKSearchResultsStr {
+    CK_OBJECT_HANDLE *handles;
+    int size;
+    int index;
+    int array_size;
+};
+
+typedef enum {
+    SFTK_ENCRYPT,
+    SFTK_DECRYPT,
+    SFTK_HASH,
+    SFTK_SIGN,
+    SFTK_SIGN_RECOVER,
+    SFTK_VERIFY,
+    SFTK_VERIFY_RECOVER,
+    SFTK_MESSAGE_ENCRYPT,
+    SFTK_MESSAGE_DECRYPT,
+    SFTK_MESSAGE_SIGN,
+    SFTK_MESSAGE_VERIFY
+} SFTKContextType;
+
+#define SFTK_MAX_BLOCK_SIZE 16
+#define SFTK_MAX_MAC_LENGTH 64
+#define SFTK_INVALID_MAC_SIZE 0xffffffff
+
+struct SFTKSessionContextStr {
+    SFTKContextType type;
+    PRBool multi;               
+    PRBool rsa;                 
+    PRBool doPad;               
+    PRBool isXCBC;              
+    PRBool isFIPS;              
+    unsigned int blockSize;     
+    unsigned int padDataLength; 
+    unsigned char padBuf[SFTK_MAX_BLOCK_SIZE];
+    unsigned char macBuf[SFTK_MAX_BLOCK_SIZE];
+    unsigned char k2[SFTK_MAX_BLOCK_SIZE];
+    unsigned char k3[SFTK_MAX_BLOCK_SIZE];
+    CK_ULONG macSize; 
+    void *cipherInfo;
+    void *hashInfo;
+    unsigned int cipherInfoLen;
+    CK_MECHANISM_TYPE currentMech;
+    SFTKCipher update;
+    SFTKAEADCipher aeadUpdate;
+    SFTKHash hashUpdate;
+    SFTKEnd end;
+    SFTKDestroy destroy;
+    SFTKDestroy hashdestroy;
+    SFTKVerify verify;
+    unsigned int maxLen;
+    SFTKObject *key;
+    SECItem *signature;
+};
+
+struct SFTKSessionStr {
+    SFTKSession *next;
+    SFTKSession *prev;
+    CK_SESSION_HANDLE handle;
+    int refCount; 
+    PRLock *objectLock;
+    int objectIDCount;
+    CK_SESSION_INFO info;
+    CK_NOTIFY notify;
+    CK_VOID_PTR appData;
+    SFTKSlot *slot;
+    SFTKSearchResults *search;
+    SFTKSessionContext *enc_context;
+    SFTKSessionContext *hash_context;
+    PRBool lastOpWasFIPS;
+    SFTKObjectList *objects[1];
+};
+
+struct SFTKSlotStr {
+    CK_SLOT_ID slotID;             
+    PRLock *slotLock;              
+    PRLock **sessionLock;          
+    unsigned int numSessionLocks;  
+    unsigned long sessionLockMask; 
+    PRLock *objectLock;            
+    PRLock *pwCheckLock;           
+    PRBool present;                
+    PRBool hasTokens;              
+    PRBool isLoggedIn;             
+    PRBool ssoLoggedIn;            
+    PRBool needLogin;              
+    PRBool DB_loaded;              
+    PRBool readOnly;               
+    PRBool optimizeSpace;          
+    SFTKDBHandle *certDB;          
+    SFTKDBHandle *keyDB;           
+    int minimumPinLen;             
+    PRInt32 sessionIDCount;        
+    int sessionIDConflict;         
+    int sessionCount;              
+    int rwSessionCount;            
+    int sessionObjectHandleCount;  
+    CK_ULONG index;                
+    PLHashTable *tokObjHashTable;  
+    SFTKObject **sessObjHashTable; 
+    unsigned int sessObjHashSize;  
+    SFTKSession **head;            
+    unsigned int sessHashSize;     
+    char tokDescription[33];       
+    char updateTokDescription[33]; 
+    char slotDescription[65];      
+    SFTKSession moduleObjects;     
+};
+
+struct SFTKHashVerifyInfoStr {
+    SECOidTag hashOid;
+    void *params;
+    NSSLOWKEYPublicKey *key;
+};
+
+struct SFTKHashSignInfoStr {
+    SECOidTag hashOid;
+    void *params;
+    NSSLOWKEYPrivateKey *key;
+};
+
+struct SFTKPSSVerifyInfoStr {
+    size_t size; 
+    CK_RSA_PKCS_PSS_PARAMS params;
+    NSSLOWKEYPublicKey *key;
+};
+
+struct SFTKPSSSignInfoStr {
+    size_t size; 
+    CK_RSA_PKCS_PSS_PARAMS params;
+    NSSLOWKEYPrivateKey *key;
+};
+
+struct SFTKOAEPInfoStr {
+    CK_RSA_PKCS_OAEP_PARAMS params;
+    PRBool isEncrypt;
+    union {
+        NSSLOWKEYPublicKey *pub;
+        NSSLOWKEYPrivateKey *priv;
+    } key;
+};
+
+struct SFTKSSLMACInfoStr {
+    size_t size; 
+    void *hashContext;
+    SFTKBegin begin;
+    SFTKHash update;
+    SFTKEnd end;
+    CK_ULONG macSize;
+    int padSize;
+    unsigned char key[MAX_KEY_LEN];
+    unsigned int keySize;
+};
+
+struct SFTKChaCha20Poly1305InfoStr {
+    ChaCha20Poly1305Context freeblCtx;
+    unsigned char nonce[12];
+    unsigned char ad[16];
+    unsigned char *adOverflow;
+    unsigned int adLen;
+};
+
+struct SFTKChaCha20CtrInfoStr {
+    PRUint8 key[32];
+    PRUint8 nonce[12];
+    PRUint32 counter;
+};
+
+struct SFTKItemTemplateStr {
+    CK_ATTRIBUTE_TYPE type;
+    SECItem *item;
+};
+
+#define SFTK_SET_ITEM_TEMPLATE(templ, count, itemPtr, attr) \
+    templ[count].type = attr;                               \
+    templ[count].item = itemPtr
+
+#define SFTK_MAX_ITEM_TEMPLATE 10
+
+#define SFTK_SESSION_SLOT_MASK 0xff000000L
+
+#define SFTK_TOKEN_MASK 0x80000000L
+#define SFTK_TOKEN_MAGIC 0x80000000L
+#define SFTK_TOKEN_TYPE_MASK 0x70000000L
+#define SFTK_TOKEN_TYPE_PRIV 0x10000000L
+#define SFTK_TOKEN_TYPE_PUB 0x20000000L
+#define SFTK_TOKEN_TYPE_KEY 0x30000000L
+#define SFTK_TOKEN_TYPE_TRUST 0x40000000L
+#define SFTK_TOKEN_TYPE_CRL 0x50000000L
+#define SFTK_TOKEN_TYPE_SMIME 0x60000000L
+#define SFTK_TOKEN_TYPE_CERT 0x70000000L
+
+#define SFTK_TOKEN_KRL_HANDLE (SFTK_TOKEN_MAGIC | SFTK_TOKEN_TYPE_CRL | 1)
+#define SFTK_MAX_PIN 500
+#define FIPS_MIN_PIN 7
+
+#define NETSCAPE_SLOT_ID 1
+#define PRIVATE_KEY_SLOT_ID 2
+#define FIPS_SLOT_ID 3
+
+#define sftk_SlotFromSession(sp) ((sp)->slot)
+#define sftk_isToken(id) (((id)&SFTK_TOKEN_MASK) == SFTK_TOKEN_MAGIC)
+
+#define SFTK_SESSION_OBJECT_TYPE 0xFFFFFFFFU
+#define SFTK_TOKEN_OBJECT_TYPE 0x00000000U
+
+#define sftk_isFIPS(id) \
+    (((id) == FIPS_SLOT_ID) || ((id) >= SFTK_MIN_FIPS_USER_SLOT_ID))
+
+#define SFTK_VALIDATION_FIPS_FLAG 0x00000001L
+
+#define SHMULTIPLIER 1791398085
+
+#define sftk_hash(value, size) \
+    ((PRUint32)((value)*SHMULTIPLIER) & (size - 1))
+#define sftkqueue_add(element, id, head, hash_size) \
+    {                                               \
+        int tmp = sftk_hash(id, hash_size);         \
+        (element)->next = (head)[tmp];              \
+        (element)->prev = NULL;                     \
+        if ((head)[tmp])                            \
+            (head)[tmp]->prev = (element);          \
+        (head)[tmp] = (element);                    \
+    }
+#define sftkqueue_find(element, id, head, hash_size)                      \
+    for ((element) = (head)[sftk_hash(id, hash_size)]; (element) != NULL; \
+         (element) = (element)->next) {                                   \
+        if ((element)->handle == (id)) {                                  \
+            break;                                                        \
+        }                                                                 \
+    }
+#define sftkqueue_is_queued(element, id, head, hash_size) \
+    (((element)->next) || ((element)->prev) ||            \
+     ((head)[sftk_hash(id, hash_size)] == (element)))
+#define sftkqueue_delete(element, id, head, hash_size)        \
+    if ((element)->next)                                      \
+        (element)->next->prev = (element)->prev;              \
+    if ((element)->prev)                                      \
+        (element)->prev->next = (element)->next;              \
+    else                                                      \
+        (head)[sftk_hash(id, hash_size)] = ((element)->next); \
+    (element)->next = NULL;                                   \
+    (element)->prev = NULL;
+
+#define sftkqueue_init_element(element) \
+    (element)->prev = NULL;
+
+#define sftkqueue_add2(element, id, index, head) \
+    {                                            \
+        (element)->next = (head)[index];         \
+        if ((head)[index])                       \
+            (head)[index]->prev = (element);     \
+        (head)[index] = (element);               \
+    }
+
+#define sftkqueue_find2(element, id, index, head) \
+    for ((element) = (head)[index];               \
+         (element) != NULL;                       \
+         (element) = (element)->next) {           \
+        if ((element)->handle == (id)) {          \
+            break;                                \
+        }                                         \
+    }
+
+#define sftkqueue_delete2(element, id, index, head) \
+    if ((element)->next)                            \
+        (element)->next->prev = (element)->prev;    \
+    if ((element)->prev)                            \
+        (element)->prev->next = (element)->next;    \
+    else                                            \
+        (head)[index] = ((element)->next);
+
+#define sftkqueue_clear_deleted_element(element) \
+    (element)->next = NULL;                      \
+    (element)->prev = NULL;
+
+#define SFTK_HEAD_BUCKET_LOCK(slot, bucket) \
+    ((slot)->sessionLock[((bucket) >> LOG2_BUCKETS_PER_SESSION_LOCK) & (slot)->sessionLockMask])
+#define SFTK_SESSION_LOCK(slot, handle) \
+    SFTK_HEAD_BUCKET_LOCK(slot, sftk_hash((handle), (slot)->sessHashSize))
+
+#define sftk_attr_expand(ap) (ap)->type, (ap)->pValue, (ap)->ulValueLen
+#define sftk_item_expand(ip) (ip)->data, (ip)->len
+
+typedef struct sftk_token_parametersStr {
+    CK_SLOT_ID slotID;
+    char *configdir;
+    char *certPrefix;
+    char *keyPrefix;
+    char *updatedir;
+    char *updCertPrefix;
+    char *updKeyPrefix;
+    char *updateID;
+    char *tokdes;
+    char *slotdes;
+    char *updtokdes;
+    int minPW;
+    PRBool readOnly;
+    PRBool noCertDB;
+    PRBool noKeyDB;
+    PRBool forceOpen;
+    PRBool pwRequired;
+    PRBool optimizeSpace;
+} sftk_token_parameters;
+
+typedef struct sftk_parametersStr {
+    char *configdir;
+    char *updatedir;
+    char *updateID;
+    char *secmodName;
+    char *man;
+    char *libdes;
+    PRBool readOnly;
+    PRBool noModDB;
+    PRBool noCertDB;
+    PRBool forceOpen;
+    PRBool pwRequired;
+    PRBool optimizeSpace;
+    sftk_token_parameters *tokens;
+    int token_count;
+} sftk_parameters;
+
+#define CERT_DB_FMT "%scert%s.db"
+#define KEY_DB_FMT "%skey%s.db"
+
+struct sftk_MACConstantTimeCtxStr {
+    const SECHashObject *hash;
+    unsigned char mac[64];
+    unsigned char secret[64];
+    unsigned int headerLength;
+    unsigned int secretLength;
+    unsigned int totalLength;
+    unsigned char header[75];
+};
+typedef struct sftk_MACConstantTimeCtxStr sftk_MACConstantTimeCtx;
+
+struct sftk_MACCtxStr {
+
+    CK_MECHANISM_TYPE mech;
+    unsigned int mac_size;
+
+    union {
+        HMACContext *hmac;
+        CMACContext *cmac;
+
+        void *raw;
+    } mac;
+
+    void (*destroy_func)(void *ctx, PRBool free_it);
+};
+typedef struct sftk_MACCtxStr sftk_MACCtx;
+
+extern CK_NSS_MODULE_FUNCTIONS sftk_module_funcList;
+extern CK_NSS_FIPS_FUNCTIONS sftk_fips_funcList;
+
+SEC_BEGIN_PROTOS
+
+extern PRBool nsf_init;
+extern CK_RV nsc_CommonInitialize(CK_VOID_PTR pReserved, PRBool isFIPS);
+extern CK_RV nsc_CommonFinalize(CK_VOID_PTR pReserved, PRBool isFIPS);
+extern PRBool sftk_ForkReset(CK_VOID_PTR pReserved, CK_RV *crv);
+extern CK_RV nsc_CommonGetSlotList(CK_BBOOL tokPresent,
+                                   CK_SLOT_ID_PTR pSlotList,
+                                   CK_ULONG_PTR pulCount,
+                                   unsigned int moduleIndex);
+
+extern CK_RV SFTK_SlotInit(char *configdir, char *updatedir, char *updateID,
+                           sftk_token_parameters *params,
+                           unsigned int moduleIndex);
+extern CK_RV SFTK_SlotReInit(SFTKSlot *slot, char *configdir,
+                             char *updatedir, char *updateID,
+                             sftk_token_parameters *params,
+                             unsigned int moduleIndex);
+extern CK_RV SFTK_DestroySlotData(SFTKSlot *slot);
+extern CK_RV SFTK_ShutdownSlot(SFTKSlot *slot);
+extern CK_RV sftk_CloseAllSessions(SFTKSlot *slot, PRBool logout);
+
+extern CK_RV sftk_MapCryptError(int error);
+extern CK_RV sftk_MapDecryptError(int error);
+extern CK_RV sftk_MapVerifyError(int error);
+extern SFTKAttribute *sftk_FindAttribute(SFTKObject *object,
+                                         CK_ATTRIBUTE_TYPE type);
+extern void sftk_FreeAttribute(SFTKAttribute *attribute);
+extern CK_RV sftk_AddAttributeType(SFTKObject *object, CK_ATTRIBUTE_TYPE type,
+                                   const void *valPtr, CK_ULONG length);
+extern CK_RV sftk_Attribute2SecItem(PLArenaPool *arena, SECItem *item,
+                                    SFTKObject *object, CK_ATTRIBUTE_TYPE type);
+extern CK_RV sftk_MultipleAttribute2SecItem(PLArenaPool *arena,
+                                            SFTKObject *object,
+                                            SFTKItemTemplate *templ, int count);
+extern unsigned int sftk_GetLengthInBits(unsigned char *buf,
+                                         unsigned int bufLen);
+extern CK_RV sftk_ConstrainAttribute(SFTKObject *object,
+                                     CK_ATTRIBUTE_TYPE type, int minLength,
+                                     int maxLength, int minMultiple);
+extern PRBool sftk_hasAttribute(SFTKObject *object, CK_ATTRIBUTE_TYPE type);
+extern PRBool sftk_isTrue(SFTKObject *object, CK_ATTRIBUTE_TYPE type);
+extern void sftk_DeleteAttributeType(SFTKObject *object,
+                                     CK_ATTRIBUTE_TYPE type);
+extern CK_RV sftk_Attribute2SecItem(PLArenaPool *arena, SECItem *item,
+                                    SFTKObject *object, CK_ATTRIBUTE_TYPE type);
+extern CK_RV sftk_Attribute2SSecItem(PLArenaPool *arena, SECItem *item,
+                                     SFTKObject *object,
+                                     CK_ATTRIBUTE_TYPE type);
+extern SFTKModifyType sftk_modifyType(CK_ATTRIBUTE_TYPE type,
+                                      CK_OBJECT_CLASS inClass);
+extern PRBool sftk_isSensitive(CK_ATTRIBUTE_TYPE type, CK_OBJECT_CLASS inClass);
+extern CK_RV sftk_GetULongAttribute(SFTKObject *object, CK_ATTRIBUTE_TYPE type,
+                                    CK_ULONG *longData);
+extern CK_RV sftk_ReadAttribute(SFTKObject *object, CK_ATTRIBUTE_TYPE type,
+                                unsigned char *data, unsigned int maxlen,
+                                unsigned int *lenp);
+extern CK_RV sftk_forceAttribute(SFTKObject *object, CK_ATTRIBUTE_TYPE type,
+                                 const void *value, unsigned int len);
+extern CK_RV sftk_defaultAttribute(SFTKObject *object, CK_ATTRIBUTE_TYPE type,
+                                   const void *value, unsigned int len);
+extern unsigned int sftk_MapTrust(CK_TRUST trust, PRBool clientAuth);
+
+extern SFTKObject *sftk_NewObject(SFTKSlot *slot);
+extern CK_RV sftk_CopyObject(SFTKObject *destObject, SFTKObject *srcObject);
+extern SFTKFreeStatus sftk_FreeObject(SFTKObject *object);
+extern CK_RV sftk_DeleteObject(SFTKSession *session, SFTKObject *object);
+extern void sftk_ReferenceObject(SFTKObject *object);
+extern SFTKObject *sftk_ObjectFromHandle(CK_OBJECT_HANDLE handle,
+                                         SFTKSession *session);
+extern CK_OBJECT_HANDLE sftk_getNextHandle(SFTKSlot *slot);
+extern void sftk_AddSlotObject(SFTKSlot *slot, SFTKObject *object);
+extern void sftk_AddObject(SFTKSession *session, SFTKObject *object);
+extern CK_RV SFTK_ClearTokenKeyHashTable(SFTKSlot *slot);
+
+extern CK_RV sftk_searchObjectList(SFTKSearchResults *search,
+                                   SFTKObject **head, unsigned int size,
+                                   PRLock *lock, CK_ATTRIBUTE_PTR inTemplate,
+                                   int count, PRBool isLoggedIn);
+extern SFTKObjectListElement *sftk_FreeObjectListElement(
+    SFTKObjectListElement *objectList);
+extern void sftk_FreeObjectList(SFTKObjectListElement *objectList);
+extern void sftk_FreeSearch(SFTKSearchResults *search);
+extern CK_RV sftk_handleObject(SFTKObject *object, SFTKSession *session);
+
+extern SFTKSlot *sftk_SlotFromID(CK_SLOT_ID slotID, PRBool all);
+extern SFTKSlot *sftk_SlotFromSessionHandle(CK_SESSION_HANDLE handle);
+extern CK_SLOT_ID sftk_SlotIDFromSessionHandle(CK_SESSION_HANDLE handle);
+extern SFTKSession *sftk_SessionFromHandle(CK_SESSION_HANDLE handle);
+extern void sftk_FreeSession(SFTKSession *session);
+extern void sftk_ClearSession(SFTKSession *session);
+extern CK_RV sftk_InitSession(SFTKSession *session, SFTKSlot *slot,
+                              CK_SLOT_ID slotID, CK_NOTIFY notify,
+                              CK_VOID_PTR pApplication, CK_FLAGS flags);
+extern SFTKSession *sftk_NewSession(CK_SLOT_ID slotID, CK_NOTIFY notify,
+                                    CK_VOID_PTR pApplication, CK_FLAGS flags);
+extern void sftk_update_state(SFTKSlot *slot, SFTKSession *session);
+extern void sftk_update_all_states(SFTKSlot *slot);
+extern void sftk_InitFreeLists(void);
+extern void sftk_CleanupFreeLists(void);
+
+extern CK_RV sftk_InitGeneric(SFTKSession *session,
+                              CK_MECHANISM *pMechanism,
+                              SFTKSessionContext **contextPtr,
+                              SFTKContextType ctype, SFTKObject **keyPtr,
+                              CK_OBJECT_HANDLE hKey, CK_KEY_TYPE *keyTypePtr,
+                              CK_OBJECT_CLASS pubKeyType,
+                              CK_ATTRIBUTE_TYPE operation);
+void sftk_SetContextByType(SFTKSession *session, SFTKContextType type,
+                           SFTKSessionContext *context);
+extern CK_RV sftk_InstallContext(SFTKSession *session, SFTKContextType type,
+                                 SFTKSessionContext *context);
+extern void sftk_UninstallContext(SFTKSession *session, SFTKContextType type);
+extern CK_RV sftk_GetContext(CK_SESSION_HANDLE handle,
+                             SFTKSessionContext **contextPtr,
+                             SFTKContextType type, PRBool needMulti,
+                             SFTKSession **sessionPtr);
+extern void sftk_TerminateOp(SFTKSession *session, SFTKContextType ctype);
+extern void sftk_FreeContext(SFTKSessionContext *context);
+
+extern NSSLOWKEYPublicKey *sftk_GetPubKey(SFTKObject *object,
+                                          CK_KEY_TYPE key_type, CK_RV *crvp);
+extern NSSLOWKEYPrivateKey *sftk_GetPrivKey(SFTKObject *object,
+                                            CK_KEY_TYPE key_type, CK_RV *crvp);
+extern CK_RV sftk_PutPubKey(SFTKObject *publicKey, SFTKObject *privKey, CK_KEY_TYPE keyType,
+                            NSSLOWKEYPublicKey *pubKey);
+extern void sftk_FormatDESKey(unsigned char *key, int length);
+extern PRBool sftk_CheckDESKey(unsigned char *key);
+extern PRBool sftk_IsWeakKey(unsigned char *key, CK_KEY_TYPE key_type);
+extern void sftk_EncodeInteger(PRUint64 integer, CK_ULONG num_bits, CK_BBOOL littleEndian,
+                               CK_BYTE_PTR output, CK_ULONG_PTR output_len);
+
+extern CK_RV sftk_ike_prf(CK_SESSION_HANDLE hSession,
+                          const SFTKAttribute *inKey,
+                          const CK_IKE_PRF_DERIVE_PARAMS *params, SFTKObject *outKey);
+extern CK_RV sftk_ike1_prf(CK_SESSION_HANDLE hSession,
+                           const SFTKAttribute *inKey,
+                           const CK_IKE1_PRF_DERIVE_PARAMS *params, SFTKObject *outKey,
+                           unsigned int keySize);
+extern CK_RV sftk_ike1_appendix_b_prf(CK_SESSION_HANDLE hSession,
+                                      const SFTKAttribute *inKey,
+                                      const CK_IKE1_EXTENDED_DERIVE_PARAMS *params,
+                                      SFTKObject *outKey,
+                                      unsigned int keySize);
+extern CK_RV sftk_ike_prf_plus(CK_SESSION_HANDLE hSession,
+                               const SFTKAttribute *inKey,
+                               const CK_IKE2_PRF_PLUS_DERIVE_PARAMS *params, SFTKObject *outKey,
+                               unsigned int keySize);
+extern CK_RV sftk_aes_xcbc_new_keys(CK_SESSION_HANDLE hSession,
+                                    CK_OBJECT_HANDLE hKey, CK_OBJECT_HANDLE_PTR phKey,
+                                    unsigned char *k2, unsigned char *k3);
+extern CK_RV sftk_xcbc_mac_pad(unsigned char *padBuf, unsigned int bufLen,
+                               unsigned int blockSize, const unsigned char *k2,
+                               const unsigned char *k3);
+extern SECStatus sftk_fips_IKE_PowerUpSelfTests(void);
+
+extern CK_RV sftk_MechAllowsOperation(CK_MECHANISM_TYPE type, CK_ATTRIBUTE_TYPE op);
+
+NSSLOWKEYPrivateKey *sftk_FindKeyByPublicKey(SFTKSlot *slot, SECItem *dbKey);
+
+CK_RV sftk_parseParameters(char *param, sftk_parameters *parsed, PRBool isFIPS);
+void sftk_freeParams(sftk_parameters *params);
+PRBool sftk_RawArgHasFlag(const char *entry, const char *flag, const void *pReserved);
+
+SFTKSessionObject *sftk_narrowToSessionObject(SFTKObject *);
+SFTKTokenObject *sftk_narrowToTokenObject(SFTKObject *);
+
+void sftk_addHandle(SFTKSearchResults *search, CK_OBJECT_HANDLE handle);
+PRBool sftk_poisonHandle(SFTKSlot *slot, SECItem *dbkey,
+                         CK_OBJECT_HANDLE handle);
+SFTKObject *sftk_NewTokenObject(SFTKSlot *slot, SECItem *dbKey,
+                                CK_OBJECT_HANDLE handle);
+CK_RV sftk_convertSessionToToken(SFTKObject *so);
+
+extern CK_RV jpake_Round1(HASH_HashType hashType,
+                          CK_NSS_JPAKERound1Params *params,
+                          SFTKObject *key);
+extern CK_RV jpake_Round2(HASH_HashType hashType,
+                          CK_NSS_JPAKERound2Params *params,
+                          SFTKObject *sourceKey, SFTKObject *key);
+extern CK_RV jpake_Final(HASH_HashType hashType,
+                         const CK_NSS_JPAKEFinalParams *params,
+                         SFTKObject *sourceKey, SFTKObject *key);
+
+sftk_MACConstantTimeCtx *sftk_HMACConstantTime_New(
+    CK_MECHANISM_PTR mech, SFTKObject *key);
+sftk_MACConstantTimeCtx *sftk_SSLv3MACConstantTime_New(
+    CK_MECHANISM_PTR mech, SFTKObject *key);
+void sftk_HMACConstantTime_Update(void *pctx, const unsigned char *data, unsigned int len);
+void sftk_SSLv3MACConstantTime_Update(void *pctx, const unsigned char *data, unsigned int len);
+void sftk_MACConstantTime_EndHash(
+    void *pctx, unsigned char *out, unsigned int *outLength, unsigned int maxLength);
+void sftk_MACConstantTime_DestroyContext(void *pctx, PRBool);
+
+HASH_HashType sftk_GetHashTypeFromMechanism(CK_MECHANISM_TYPE mech);
+
+
+extern CK_RV
+sftk_TLSPRFInit(SFTKSessionContext *context,
+                SFTKObject *key,
+                CK_KEY_TYPE key_type,
+                HASH_HashType hash_alg,
+                unsigned int out_len);
+
+HASH_HashType sftk_HMACMechanismToHash(CK_MECHANISM_TYPE mech);
+CK_RV sftk_MAC_Create(CK_MECHANISM_TYPE mech, SFTKObject *key, sftk_MACCtx **ret_ctx);
+CK_RV sftk_MAC_Init(sftk_MACCtx *ctx, CK_MECHANISM_TYPE mech, SFTKObject *key);
+CK_RV sftk_MAC_InitRaw(sftk_MACCtx *ctx, CK_MECHANISM_TYPE mech, const unsigned char *key, unsigned int key_len, PRBool isFIPS);
+CK_RV sftk_MAC_Update(sftk_MACCtx *ctx, const CK_BYTE *data, unsigned int data_len);
+CK_RV sftk_MAC_End(sftk_MACCtx *ctx, CK_BYTE_PTR result, unsigned int *result_len, unsigned int max_result_len);
+CK_RV sftk_MAC_Reset(sftk_MACCtx *ctx);
+void sftk_MAC_DestroyContext(sftk_MACCtx *ctx, PRBool free_it);
+
+unsigned int sftk_CKRVToMask(CK_RV rv);
+CK_RV sftk_CheckCBCPadding(CK_BYTE_PTR pBuf, unsigned int bufLen,
+                           unsigned int blockSize, unsigned int *outPadSize);
+
+extern CK_RV kbkdf_Dispatch(CK_MECHANISM_TYPE mech, CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism, SFTKObject *base_key, SFTKObject *ret_key, CK_ULONG keySize);
+extern SECStatus sftk_fips_SP800_108_PowerUpSelfTests(void);
+
+CK_RV sftk_HKDF(CK_HKDF_PARAMS_PTR params, CK_SESSION_HANDLE hSession,
+                SFTKObject *sourceKey, const unsigned char *sourceKeyBytes,
+                int sourceKeyLen, SFTKObject *key,
+                unsigned char *outKeyBytes, int keySize,
+                PRBool canBeData, PRBool isFIPS);
+
+char **NSC_ModuleDBFunc(unsigned long function, char *parameters, void *args);
+
+const SECItem *sftk_VerifyDH_Prime(SECItem *dhPrime, SECItem *generator, PRBool isFIPS);
+SECStatus sftk_IsSafePrime(SECItem *dhPrime, SECItem *dhSubPrime, PRBool *isSafe);
+CK_FLAGS sftk_AttributeToFlags(CK_ATTRIBUTE_TYPE op);
+PRBool sftk_operationIsFIPS(SFTKSlot *slot, CK_MECHANISM *mech,
+                            CK_ATTRIBUTE_TYPE op, SFTKObject *source,
+                            CK_ULONG targetKeySize);
+void sftk_setFIPS(SFTKObject *obj, PRBool isFIPS);
+PRBool sftk_hasFIPS(SFTKObject *obj);
+
+CK_RV sftk_CreateValidationObjects(SFTKSlot *slot);
+
+unsigned int sftk_MLDSAGetSigLen(CK_ML_DSA_PARAMETER_SET_TYPE paramSet);
+
+SEC_END_PROTOS
+
+#endif /* _PKCS11I_H_ */

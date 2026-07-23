@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SECURITY_TRUSTED_TYPES_TRUSTEDTYPEPOLICYFACTORY_H_
+#define DOM_SECURITY_TRUSTED_TYPES_TRUSTEDTYPEPOLICYFACTORY_H_
+
+#include "js/TypeDecls.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/BindingUtils.h"
+#include "mozilla/dom/TrustedHTML.h"
+#include "mozilla/dom/TrustedScript.h"
+#include "mozilla/dom/TrustedScriptURL.h"
+#include "nsIGlobalObject.h"
+#include "nsISupportsImpl.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "nsWrapperCache.h"
+
+class DOMString;
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+class TrustedTypePolicy;
+
+class TrustedTypePolicyFactory : public nsWrapperCache {
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(TrustedTypePolicyFactory)
+  NS_DECL_CYCLE_COLLECTION_NATIVE_WRAPPERCACHE_CLASS(TrustedTypePolicyFactory)
+
+  explicit TrustedTypePolicyFactory(nsIGlobalObject* aGlobalObject);
+
+  nsIGlobalObject* GetParentObject() const { return mGlobalObject; }
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  already_AddRefed<TrustedTypePolicy> CreatePolicy(
+      JSContext* aJSContext, const nsAString& aPolicyName,
+      const TrustedTypePolicyOptions& aPolicyOptions, ErrorResult& aRv);
+
+  bool IsHTML(JSContext* aJSContext, const JS::Handle<JS::Value>& aValue) const;
+
+  bool IsScript(JSContext* aJSContext,
+                const JS::Handle<JS::Value>& aValue) const;
+
+  bool IsScriptURL(JSContext* aJSContext,
+                   const JS::Handle<JS::Value>& aValue) const;
+
+  already_AddRefed<TrustedHTML> EmptyHTML();
+
+  already_AddRefed<TrustedScript> EmptyScript();
+
+  void GetAttributeType(const nsAString& aTagName, const nsAString& aAttribute,
+                        const nsAString& aElementNs, const nsAString& aAttrNs,
+                        DOMString& aResult);
+
+  void GetPropertyType(const nsAString& aTagName, const nsAString& aProperty,
+                       const nsAString& aElementNs, DOMString& aResult);
+
+  TrustedTypePolicy* GetDefaultPolicy() const { return mDefaultPolicy; }
+
+ private:
+  virtual ~TrustedTypePolicyFactory();
+
+  enum class PolicyCreation { Blocked, Allowed };
+
+  PolicyCreation ShouldTrustedTypePolicyCreationBeBlockedByCSP(
+      JSContext* aJSContext, const nsAString& aPolicyName) const;
+
+  RefPtr<nsIGlobalObject> mGlobalObject;
+
+  nsTArray<nsString> mCreatedPolicyNames;
+
+  RefPtr<TrustedTypePolicy> mDefaultPolicy;
+};
+
+}  
+}  
+
+#endif  // DOM_SECURITY_TRUSTED_TYPES_TRUSTEDTYPEPOLICYFACTORY_H_

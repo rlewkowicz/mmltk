@@ -1,0 +1,220 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsFileStreams_h_
+#define nsFileStreams_h_
+
+#include "mozilla/UniquePtr.h"
+#include "nsIFileStreams.h"
+#include "nsIFile.h"
+#include "nsICloneableInputStream.h"
+#include "nsIInputStream.h"
+#include "nsIOutputStream.h"
+#include "nsIRandomAccessStream.h"
+#include "nsISafeOutputStream.h"
+#include "nsISeekableStream.h"
+#include "nsILineInputStream.h"
+#include "nsCOMPtr.h"
+#include "nsIIPCSerializableInputStream.h"
+#include "nsReadLine.h"
+
+namespace mozilla {
+namespace ipc {
+class FileDescriptor;
+}  
+}  
+
+
+class nsFileStreamBase : public nsISeekableStream, public nsIFileMetadata {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSISEEKABLESTREAM
+  NS_DECL_NSITELLABLESTREAM
+  NS_DECL_NSIFILEMETADATA
+
+  nsFileStreamBase() = default;
+
+ protected:
+  virtual ~nsFileStreamBase();
+
+  nsresult Close();
+  nsresult Available(uint64_t* aResult);
+  nsresult Read(char* aBuf, uint32_t aCount, uint32_t* aResult);
+  nsresult ReadSegments(nsWriteSegmentFun aWriter, void* aClosure,
+                        uint32_t aCount, uint32_t* _retval);
+  nsresult IsNonBlocking(bool* aNonBlocking);
+  nsresult Flush();
+  nsresult StreamStatus();
+  nsresult Write(const char* aBuf, uint32_t aCount, uint32_t* result);
+  nsresult WriteFrom(nsIInputStream* aFromStream, uint32_t aCount,
+                     uint32_t* _retval);
+  nsresult WriteSegments(nsReadSegmentFun aReader, void* aClosure,
+                         uint32_t aCount, uint32_t* _retval);
+
+  PRFileDesc* mFD{nullptr};
+
+  int32_t mBehaviorFlags{0};
+
+  enum {
+    eUnitialized,
+    eDeferredOpen,
+    eOpened,
+    eClosed,
+    eError
+  } mState{eUnitialized};
+
+  struct OpenParams {
+    nsCOMPtr<nsIFile> localFile;
+    int32_t ioFlags = 0;
+    int32_t perm = 0;
+  };
+
+  OpenParams mOpenParams;
+
+  nsresult mErrorValue{NS_ERROR_FAILURE};
+
+  nsresult MaybeOpen(nsIFile* aFile, int32_t aIoFlags, int32_t aPerm,
+                     bool aDeferred);
+
+  void CleanUpOpen();
+
+  virtual nsresult DoOpen();
+
+  inline nsresult DoPendingOpen();
+};
+
+
+
+class nsFileInputStream : public nsFileStreamBase,
+                          public nsIFileInputStream,
+                          public nsILineInputStream,
+                          public nsIIPCSerializableInputStream,
+                          public nsICloneableInputStream {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIFILEINPUTSTREAM
+  NS_DECL_NSILINEINPUTSTREAM
+  NS_DECL_NSIIPCSERIALIZABLEINPUTSTREAM
+  NS_DECL_NSICLONEABLEINPUTSTREAM
+
+  NS_IMETHOD Close() override;
+  NS_IMETHOD Tell(int64_t* aResult) override;
+  NS_IMETHOD Available(uint64_t* _retval) override;
+  NS_IMETHOD StreamStatus() override;
+  NS_IMETHOD Read(char* aBuf, uint32_t aCount, uint32_t* _retval) override;
+  NS_IMETHOD ReadSegments(nsWriteSegmentFun aWriter, void* aClosure,
+                          uint32_t aCount, uint32_t* _retval) override {
+    return nsFileStreamBase::ReadSegments(aWriter, aClosure, aCount, _retval);
+  }
+  NS_IMETHOD IsNonBlocking(bool* _retval) override {
+    return nsFileStreamBase::IsNonBlocking(_retval);
+  }
+
+  NS_IMETHOD Seek(int32_t aWhence, int64_t aOffset) override;
+
+  nsFileInputStream() : mLineBuffer(nullptr) {}
+
+  static nsresult Create(REFNSIID aIID, void** aResult);
+
+ protected:
+  virtual ~nsFileInputStream() = default;
+
+  nsresult SeekInternal(int32_t aWhence, int64_t aOffset,
+                        bool aClearBuf = true);
+
+  mozilla::UniquePtr<nsLineBuffer<char>> mLineBuffer;
+
+  nsCOMPtr<nsIFile> mFile;
+  int32_t mIOFlags{0};
+  int32_t mPerm{0};
+
+  int64_t mCachedPosition{0};
+
+ protected:
+  nsresult Open(nsIFile* file, int32_t ioFlags, int32_t perm);
+
+  bool IsCloneable() const;
+};
+
+
+class nsFileOutputStream : public nsFileStreamBase, public nsIFileOutputStream {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIFILEOUTPUTSTREAM
+  NS_FORWARD_NSIOUTPUTSTREAM(nsFileStreamBase::)
+
+  static nsresult Create(REFNSIID aIID, void** aResult);
+  nsresult InitWithFileDescriptor(const mozilla::ipc::FileDescriptor& aFd);
+
+ protected:
+  virtual ~nsFileOutputStream() = default;
+};
+
+
+class nsAtomicFileOutputStream : public nsFileOutputStream,
+                                 public nsISafeOutputStream {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSISAFEOUTPUTSTREAM
+
+  nsAtomicFileOutputStream() = default;
+
+  virtual nsresult DoOpen() override;
+
+  NS_IMETHOD Close() override;
+  NS_IMETHOD Write(const char* buf, uint32_t count, uint32_t* result) override;
+  NS_IMETHOD Init(nsIFile* file, int32_t ioFlags, int32_t perm,
+                  int32_t behaviorFlags) override;
+
+ protected:
+  virtual ~nsAtomicFileOutputStream() = default;
+
+  nsCOMPtr<nsIFile> mTargetFile;
+  nsCOMPtr<nsIFile> mTempFile;
+
+  bool mTargetFileExists{true};
+  nsresult mWriteResult{NS_OK};  
+};
+
+
+class nsSafeFileOutputStream : public nsAtomicFileOutputStream {
+ public:
+  NS_IMETHOD Finish() override;
+};
+
+
+class nsFileRandomAccessStream : public nsFileStreamBase,
+                                 public nsIFileRandomAccessStream,
+                                 public nsIInputStream,
+                                 public nsIOutputStream {
+ public:
+  static nsresult Create(REFNSIID aIID, void** aResult);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_FORWARD_NSITELLABLESTREAM(nsFileStreamBase::)
+  NS_FORWARD_NSISEEKABLESTREAM(nsFileStreamBase::)
+  NS_DECL_NSIRANDOMACCESSSTREAM
+  NS_DECL_NSIFILERANDOMACCESSSTREAM
+  NS_FORWARD_NSIINPUTSTREAM(nsFileStreamBase::)
+
+  NS_IMETHOD Flush() override { return nsFileStreamBase::Flush(); }
+  NS_IMETHOD Write(const char* aBuf, uint32_t aCount,
+                   uint32_t* _retval) override {
+    return nsFileStreamBase::Write(aBuf, aCount, _retval);
+  }
+  NS_IMETHOD WriteFrom(nsIInputStream* aFromStream, uint32_t aCount,
+                       uint32_t* _retval) override {
+    return nsFileStreamBase::WriteFrom(aFromStream, aCount, _retval);
+  }
+  NS_IMETHOD WriteSegments(nsReadSegmentFun aReader, void* aClosure,
+                           uint32_t aCount, uint32_t* _retval) override {
+    return nsFileStreamBase::WriteSegments(aReader, aClosure, aCount, _retval);
+  }
+
+ protected:
+  virtual ~nsFileRandomAccessStream() = default;
+};
+
+
+#endif  // nsFileStreams_h_

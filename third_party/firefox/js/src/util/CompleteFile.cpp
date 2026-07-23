@@ -1,0 +1,111 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "util/CompleteFile.h"
+
+#include <cstring>     // std::strcmp
+#include <stdio.h>     // FILE, fileno, fopen, fread
+#include <sys/stat.h>  // stat, fstat
+
+#if defined(__wasi__)
+#  include "js/Vector.h"
+#endif
+
+#include "js/CharacterEncoding.h"     // EncodeUtf8ToWide, EncodeUtf8ToNarrow
+#include "js/ErrorReport.h"           // JS_ReportErrorNumberUTF8
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_CANT_OPEN
+
+bool js::ReadCompleteFile(JSContext* cx, FILE* fp, FileContents& buffer) {
+  struct stat st;
+  int ok = fstat(fileno(fp), &st);
+  if (ok != 0) {
+    JS_ReportErrorLatin1(cx, "error reading file: %s", strerror(errno));
+    errno = 0;
+    return false;
+  }
+  if ((st.st_mode & S_IFDIR) != 0) {
+    JS_ReportErrorLatin1(cx, "error reading file: %s", strerror(EISDIR));
+    return false;
+  }
+
+  if (st.st_size > 0) {
+    if (!buffer.reserve(st.st_size)) {
+      return false;
+    }
+  }
+
+  for (;;) {
+    uint8_t chunk[4096];
+    size_t nread = fread(chunk, 1, sizeof(chunk), fp);
+    if (nread == 0) {
+      break;
+    }
+    if (!buffer.append(chunk, nread)) {
+      return false;
+    }
+  }
+
+  if (ferror(fp)) {
+    JS_ReportErrorLatin1(cx, "error reading file: %s", strerror(errno));
+    errno = 0;
+    return false;
+  }
+
+  return true;
+}
+
+#if defined(__wasi__)
+static bool NormalizeWASIPath(const char* filename,
+                              js::Vector<char>* normalized, JSContext* cx) {
+  for (const char* cur = filename; *cur; ++cur) {
+    if (std::strncmp(cur, "/../", 4) == 0) {
+      do {
+        if (normalized->empty()) {
+          JS_ReportErrorASCII(cx, "Path processing error");
+          return false;
+        }
+      } while (normalized->popCopy() != '/');
+      cur += 2;
+      continue;
+    }
+    if (!normalized->append(*cur)) {
+      return false;
+    }
+  }
+  if (!normalized->append('\0')) {
+    return false;
+  }
+  return true;
+}
+#endif
+
+static FILE* OpenFile(JSContext* cx, const char* filename) {
+  JS::UniqueChars narrowFilename = JS::EncodeUtf8ToNarrow(cx, filename);
+  if (!narrowFilename) {
+    return nullptr;
+  }
+  return fopen(narrowFilename.get(), "r");
+}
+
+bool js::AutoFile::open(JSContext* cx, const char* filename) {
+  if (!filename || std::strcmp(filename, "-") == 0) {
+    fp_ = stdin;
+  } else {
+#if defined(__wasi__)
+    js::Vector<char> normalized(cx);
+    if (!NormalizeWASIPath(filename, &normalized, cx)) {
+      return false;
+    }
+    fp_ = OpenFile(cx, normalized.begin());
+#else
+    fp_ = OpenFile(cx, filename);
+#endif
+    if (!fp_) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr, JSMSG_CANT_OPEN,
+                               filename, "No such file or directory");
+      return false;
+    }
+  }
+  return true;
+}

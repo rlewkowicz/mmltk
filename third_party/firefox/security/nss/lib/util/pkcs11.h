@@ -1,0 +1,95 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+/*
+ * Copyright (C) 1994-1999 RSA Security Inc. Licence to copy this document
+ * is granted provided that it is identified as "RSA Security In.c Public-Key
+ * Cryptography Standards (PKCS)" in all material mentioning or referencing
+ * this document.
+ *
+ * The latest version of this header can be found at:
+ *    http://www.rsalabs.com/pkcs/pkcs-11/index.html
+ */
+#ifndef _PKCS11_H_
+#define _PKCS11_H_ 1
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+#include "pkcs11t.h"
+
+#define __PASTE(x, y) x##y
+
+#ifndef CK_PKCS11_3_2
+#define __NSS_CK_PKCS11_3_2_IMPLICIT 1
+#define CK_PKCS11_3_2 1
+#endif
+
+
+#define CK_NEED_ARG_LIST 1
+#define CK_PKCS11_FUNCTION_INFO(name) \
+    CK_DECLARE_FUNCTION(CK_RV, name)
+
+#include "pkcs11f.h"
+
+#undef CK_NEED_ARG_LIST
+#undef CK_PKCS11_FUNCTION_INFO
+
+
+#define CK_NEED_ARG_LIST 1
+#define CK_PKCS11_FUNCTION_INFO(name) \
+    typedef CK_DECLARE_FUNCTION_POINTER(CK_RV, __PASTE(CK_, name))
+
+#include "pkcs11f.h"
+
+#undef CK_NEED_ARG_LIST
+#undef CK_PKCS11_FUNCTION_INFO
+
+
+#define CK_PKCS11_FUNCTION_INFO(name) \
+    __PASTE(CK_, name)                \
+    name;
+
+#include "pkcs11p.h"
+struct CK_FUNCTION_LIST_3_2 {
+
+    CK_VERSION version; 
+
+#include "pkcs11f.h"
+};
+
+#define CK_PKCS11_3_0_ONLY 1
+struct CK_FUNCTION_LIST_3_0 {
+
+    CK_VERSION version; 
+
+#include "pkcs11f.h"
+};
+#undef CK_PKCS11_3_0_ONLY
+
+#define CK_PKCS11_2_0_ONLY 1
+
+struct CK_FUNCTION_LIST {
+
+    CK_VERSION version; 
+
+#include "pkcs11f.h"
+};
+#include "pkcs11u.h"
+
+#undef CK_PKCS11_FUNCTION_INFO
+#undef CK_PKCS11_2_0_ONLY
+
+#ifdef __NSS_CK_PKCS11_3_2_IMPLICIT
+#undef CK_PKCS11_3_2
+#undef __NSS_CK_PKCS11_3_2_IMPLICIT
+#endif
+#undef __PASTE
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

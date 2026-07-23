@@ -1,0 +1,175 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_workers_WorkerRef_h
+#define mozilla_dom_workers_WorkerRef_h
+
+#include "mozilla/MoveOnlyFunction.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/WorkerStatus.h"
+#include "nsISupports.h"
+#include "nsTString.h"
+
+#ifdef DEBUG
+#  include "mozilla/Mutex.h"
+#endif
+
+namespace mozilla::dom {
+
+
+class WorkerPrivate;
+class StrongWorkerRef;
+class ThreadSafeWorkerRef;
+
+#ifdef DEBUG  // In debug mode, provide a way for clients to annotate WorkerRefs
+#  define SET_WORKERREF_DEBUG_STATUS(workerref, str) \
+    ((workerref)->DebugSetWorkerRefStatus(str))
+#  define GET_WORKERREF_DEBUG_STATUS(workerref) \
+    ((workerref)->DebugGetWorkerRefStatus())
+#else
+#  define SET_WORKERREF_DEBUG_STATUS(workerref, str) (void())
+#  define GET_WORKERREF_DEBUG_STATUS(workerref) (EmptyCString())
+#endif
+
+class WorkerRef {
+  friend class WorkerPrivate;
+
+ public:
+  NS_INLINE_DECL_REFCOUNTING(WorkerRef)
+
+#ifdef DEBUG
+  mutable Mutex mDebugMutex;
+  nsCString mDebugStatus MOZ_GUARDED_BY(mDebugMutex);
+
+  void DebugSetWorkerRefStatus(const nsCString& aStatus) {
+    MutexAutoLock lock(mDebugMutex);
+    mDebugStatus = aStatus;
+  }
+
+  const nsCString DebugGetWorkerRefStatus() const {
+    MutexAutoLock lock(mDebugMutex);
+    return mDebugStatus;
+  }
+#endif
+
+ protected:
+  WorkerRef(WorkerPrivate* aWorkerPrivate, const char* aName,
+            bool aIsPreventingShutdown);
+  virtual ~WorkerRef();
+
+  virtual void Notify();
+
+  bool HoldWorker(WorkerStatus aStatus);
+  void ReleaseWorker();
+
+  bool IsPreventingShutdown() const { return mIsPreventingShutdown; }
+
+  const char* Name() const { return mName; }
+
+  WorkerPrivate* mWorkerPrivate;
+
+  MoveOnlyFunction<void()> mCallback;
+  const char* const mName;
+  const bool mIsPreventingShutdown;
+
+  bool mHolding;
+};
+
+class WeakWorkerRef final : public WorkerRef {
+ public:
+  static already_AddRefed<WeakWorkerRef> Create(
+      WorkerPrivate* aWorkerPrivate,
+      MoveOnlyFunction<void()>&& aCallback = nullptr);
+
+  WorkerPrivate* GetPrivate() const;
+
+  WorkerPrivate* GetUnsafePrivate() const;
+
+ private:
+  friend class ThreadSafeWeakWorkerRef;
+
+  explicit WeakWorkerRef(WorkerPrivate* aWorkerPrivate);
+  ~WeakWorkerRef();
+
+  void Notify() override;
+};
+
+class StrongWorkerRef final : public WorkerRef {
+ public:
+  static already_AddRefed<StrongWorkerRef> Create(
+      WorkerPrivate* aWorkerPrivate, const char* aName,
+      MoveOnlyFunction<void()>&& aCallback = nullptr);
+
+  static already_AddRefed<StrongWorkerRef> CreateForcibly(
+      WorkerPrivate* aWorkerPrivate, const char* aName);
+
+  WorkerPrivate* Private() const;
+
+ private:
+  friend class WeakWorkerRef;
+  friend class ThreadSafeWorkerRef;
+
+  static already_AddRefed<StrongWorkerRef> CreateImpl(
+      WorkerPrivate* aWorkerPrivate, const char* aName,
+      WorkerStatus aFailStatus);
+
+  StrongWorkerRef(WorkerPrivate* aWorkerPrivate, const char* aName);
+  ~StrongWorkerRef();
+};
+
+class ThreadSafeWorkerRef final {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ThreadSafeWorkerRef)
+
+  explicit ThreadSafeWorkerRef(StrongWorkerRef* aRef);
+
+  WorkerPrivate* Private() const;
+
+#ifdef DEBUG
+  RefPtr<StrongWorkerRef>& Ref() { return mRef; }
+#endif
+
+ private:
+  friend class StrongWorkerRef;
+
+  ~ThreadSafeWorkerRef();
+
+  RefPtr<StrongWorkerRef> mRef;
+};
+
+class IPCWorkerRef final : public WorkerRef {
+ public:
+  static already_AddRefed<IPCWorkerRef> Create(
+      WorkerPrivate* aWorkerPrivate, const char* aName,
+      MoveOnlyFunction<void()>&& aCallback = nullptr);
+
+  WorkerPrivate* Private() const;
+
+  void SetActorCount(uint32_t aCount);
+
+ private:
+  IPCWorkerRef(WorkerPrivate* aWorkerPrivate, const char* aName);
+  ~IPCWorkerRef();
+
+  uint32_t mActorCount;
+};
+
+template <class ActorPtr>
+class IPCWorkerRefHelper final {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(IPCWorkerRefHelper);
+
+  explicit IPCWorkerRefHelper(ActorPtr* aActor) : mActor(aActor) {}
+
+  ActorPtr* Actor() const { return mActor; }
+
+ private:
+  ~IPCWorkerRefHelper() = default;
+
+  ActorPtr* mActor;
+};
+
+}  
+
+#endif /* mozilla_dom_workers_WorkerRef_h */

@@ -1,0 +1,48 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+EXPORTS.mozilla.dom += [
+    "Serial.h",
+    "SerialManagerChild.h",
+    "SerialManagerParent.h",
+    "SerialPlatformService.h",
+    "SerialPort.h",
+    "SerialPortChild.h",
+    "SerialPortInfo.h",
+    "SerialPortIPCTypes.h",
+    "SerialPortParent.h",
+]
+
+UNIFIED_SOURCES += [
+    "PosixSerialPlatformService.cpp",
+]
+
+CXXFLAGS += CONFIG["GLIB_CFLAGS"]
+
+UNIFIED_SOURCES += [
+    "Serial.cpp",
+    "SerialManagerChild.cpp",
+    "SerialManagerParent.cpp",
+    "SerialPermissionRequest.cpp",
+    "SerialPlatformService.cpp",
+    "SerialPort.cpp",
+    "SerialPortChild.cpp",
+    "SerialPortParent.cpp",
+    "SerialPortPumps.cpp",
+    "SerialPortStreamAlgorithms.cpp",
+]
+
+IPDL_SOURCES += [
+    "PSerialManager.ipdl",
+    "PSerialPort.ipdl",
+    "SerialTypes.ipdlh",
+]
+
+FINAL_LIBRARY = "xul"
+
+LOCAL_INCLUDES += [
+    "/dom/base",
+]
+
+include("/ipc/chromium/chromium-config.mozbuild")

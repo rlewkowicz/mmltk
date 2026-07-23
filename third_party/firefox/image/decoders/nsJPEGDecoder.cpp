@@ -1,0 +1,785 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsJPEGDecoder.h"
+
+#include <cstdint>
+
+#include "EXIF.h"
+#include "ImageLogging.h"  // Must appear first.
+#include "Orientation.h"
+#include "SurfacePipeFactory.h"
+#include "gfxColor.h"
+#include "gfxPlatform.h"
+#include "imgFrame.h"
+#include "jerror.h"
+#include "mozilla/gfx/Types.h"
+#include "nsCRT.h"
+#include "nspr.h"
+
+static void cmyk_convert_bgra(uint32_t* aInput, uint32_t* aOutput,
+                              int32_t aWidth, bool aIsInverted);
+
+using mozilla::gfx::SurfaceFormat;
+
+namespace mozilla {
+namespace image {
+
+static mozilla::LazyLogModule sJPEGLog("JPEGDecoder");
+
+static mozilla::LazyLogModule sJPEGDecoderAccountingLog(
+    "JPEGDecoderAccounting");
+
+static qcms_profile* GetICCProfile(struct jpeg_decompress_struct& info) {
+  JOCTET* profilebuf;
+  uint32_t profileLength;
+  qcms_profile* profile = nullptr;
+
+  if (jpeg_read_icc_profile(&info, &profilebuf, &profileLength)) {
+    profile = qcms_profile_from_memory(profilebuf, profileLength);
+    free(profilebuf);
+  }
+
+  return profile;
+}
+
+METHODDEF(void) init_source(j_decompress_ptr jd);
+METHODDEF(boolean) fill_input_buffer(j_decompress_ptr jd);
+METHODDEF(void) skip_input_data(j_decompress_ptr jd, long num_bytes);
+METHODDEF(void) term_source(j_decompress_ptr jd);
+METHODDEF(void) my_error_exit(j_common_ptr cinfo);
+METHODDEF(void) progress_monitor(j_common_ptr info);
+
+#define MAX_JPEG_MARKER_LENGTH (((uint32_t)1 << 16) - 1)
+
+nsJPEGDecoder::nsJPEGDecoder(RasterImage* aImage,
+                             Decoder::DecodeStyle aDecodeStyle, bool aIsPDF)
+    : Decoder(aImage),
+      mLexer(Transition::ToUnbuffered(State::FINISHED_JPEG_DATA,
+                                      State::JPEG_DATA, SIZE_MAX),
+             Transition::TerminateSuccess()),
+      mProfile(nullptr),
+      mProfileLength(0),
+      mCMSLine(nullptr),
+      mDecodeStyle(aDecodeStyle),
+      mIsPDF(aIsPDF) {
+  this->mErr.pub.error_exit = nullptr;
+  this->mErr.pub.emit_message = nullptr;
+  this->mErr.pub.output_message = nullptr;
+  this->mErr.pub.format_message = nullptr;
+  this->mErr.pub.reset_error_mgr = nullptr;
+  this->mErr.pub.msg_code = 0;
+  this->mErr.pub.trace_level = 0;
+  this->mErr.pub.num_warnings = 0;
+  this->mErr.pub.jpeg_message_table = nullptr;
+  this->mErr.pub.last_jpeg_message = 0;
+  this->mErr.pub.addon_message_table = nullptr;
+  this->mErr.pub.first_addon_message = 0;
+  this->mErr.pub.last_addon_message = 0;
+  mState = JPEG_HEADER;
+  mReading = true;
+  mImageData = nullptr;
+
+  mBytesToSkip = 0;
+  memset(&mInfo, 0, sizeof(jpeg_decompress_struct));
+  memset(&mSourceMgr, 0, sizeof(mSourceMgr));
+  memset(&mProgressMgr, 0, sizeof(mProgressMgr));
+  mInfo.client_data = (void*)this;
+
+  mSegment = nullptr;
+  mSegmentLen = 0;
+
+  mBackBuffer = nullptr;
+  mBackBufferLen = mBackBufferSize = mBackBufferUnreadLen = 0;
+
+  MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+          ("nsJPEGDecoder::nsJPEGDecoder: Creating JPEG decoder %p", this));
+}
+
+nsJPEGDecoder::~nsJPEGDecoder() {
+  mInfo.src = nullptr;
+  jpeg_destroy_decompress(&mInfo);
+
+  free(mBackBuffer);
+  mBackBuffer = nullptr;
+
+  delete[] mCMSLine;
+
+  MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+          ("nsJPEGDecoder::~nsJPEGDecoder: Destroying JPEG decoder %p", this));
+}
+
+nsresult nsJPEGDecoder::InitInternal() {
+  mInfo.err = jpeg_std_error(&mErr.pub);
+  mErr.pub.error_exit = my_error_exit;
+  if (setjmp(mErr.setjmp_buffer)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  jpeg_create_decompress(&mInfo);
+  mInfo.src = &mSourceMgr;
+
+
+  mSourceMgr.init_source = init_source;
+  mSourceMgr.fill_input_buffer = fill_input_buffer;
+  mSourceMgr.skip_input_data = skip_input_data;
+  mSourceMgr.resync_to_restart = jpeg_resync_to_restart;
+  mSourceMgr.term_source = term_source;
+
+  mInfo.mem->max_memory_to_use = static_cast<long>(
+      std::min<size_t>(SurfaceCache::MaximumCapacity(), LONG_MAX));
+
+  mProgressMgr.progress_monitor = &progress_monitor;
+  mInfo.progress = &mProgressMgr;
+
+  for (uint32_t m = 0; m < 16; m++) {
+    jpeg_save_markers(&mInfo, JPEG_APP0 + m, 0xFFFF);
+  }
+
+  return NS_OK;
+}
+
+nsresult nsJPEGDecoder::FinishInternal() {
+  if ((mState != JPEG_DONE && mState != JPEG_SINK_NON_JPEG_TRAILER) &&
+      (mState != JPEG_ERROR) && !IsMetadataDecode()) {
+    mState = JPEG_DONE;
+  }
+
+  return NS_OK;
+}
+
+LexerResult nsJPEGDecoder::DoDecode(SourceBufferIterator& aIterator,
+                                    IResumable* aOnResume) {
+  MOZ_ASSERT(!HasError(), "Shouldn't call DoDecode after error!");
+
+  return mLexer.Lex(aIterator, aOnResume,
+                    [this](State aState, const char* aData, size_t aLength) {
+                      switch (aState) {
+                        case State::JPEG_DATA:
+                          return ReadJPEGData(aData, aLength);
+                        case State::FINISHED_JPEG_DATA:
+                          return FinishedJPEGData();
+                      }
+                      MOZ_CRASH("Unknown State");
+                    });
+}
+
+LexerTransition<nsJPEGDecoder::State> nsJPEGDecoder::ReadJPEGData(
+    const char* aData, size_t aLength) {
+  mSegment = reinterpret_cast<const JOCTET*>(aData);
+  mSegmentLen = aLength;
+
+  nsresult error_code;
+  if ((error_code = static_cast<nsresult>(setjmp(mErr.setjmp_buffer))) !=
+      NS_OK) {
+    bool fatal = true;
+    if (error_code == NS_ERROR_FAILURE) {
+      mState = JPEG_SINK_NON_JPEG_TRAILER;
+      MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+              ("} (setjmp returned NS_ERROR_FAILURE)"));
+    } else if (error_code == NS_ERROR_ILLEGAL_VALUE) {
+      mInfo.unread_marker = 0;
+      fatal = false;
+    } else if (error_code == NS_ERROR_INVALID_CONTENT_ENCODING) {
+      MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+              ("} (setjmp returned NS_ERROR_INVALID_CONTENT_ENCODING)"));
+      bool inDoneState = (mState == JPEG_DONE);
+      mState = JPEG_SINK_NON_JPEG_TRAILER;
+
+      // display the content we've already received. Otherwise, we fallthrough
+      if (inDoneState) {
+        return Transition::TerminateSuccess();
+      }
+    } else {
+      mState = JPEG_ERROR;
+      MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+              ("} (setjmp returned an error)"));
+    }
+
+    if (fatal) {
+      return Transition::TerminateFailure();
+    }
+  }
+
+  MOZ_LOG(sJPEGLog, LogLevel::Debug,
+          ("[this=%p] nsJPEGDecoder::Write -- processing JPEG data\n", this));
+
+  switch (mState) {
+    case JPEG_HEADER: {
+      LOG_SCOPE((mozilla::LogModule*)sJPEGLog,
+                "nsJPEGDecoder::Write -- entering JPEG_HEADER"
+                " case");
+
+      if (jpeg_read_header(&mInfo, TRUE) == JPEG_SUSPENDED) {
+        MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+                ("} (JPEG_SUSPENDED)"));
+        return Transition::ContinueUnbuffered(
+            State::JPEG_DATA);  
+      }
+
+      EXIFData exif = ReadExifData();
+      PostSize(mInfo.image_width, mInfo.image_height, exif.orientation,
+               exif.resolution);
+      if (WantsFrameCount()) {
+        PostFrameCount( 1);
+      }
+      if (HasError()) {
+        mState = JPEG_ERROR;
+        return Transition::TerminateFailure();
+      }
+
+      if (IsMetadataDecode()) {
+        return Transition::TerminateSuccess();
+      }
+
+      switch (mInfo.jpeg_color_space) {
+        case JCS_GRAYSCALE:
+        case JCS_RGB:
+        case JCS_YCbCr:
+          switch (SurfaceFormat::OS_RGBX) {
+            case SurfaceFormat::B8G8R8X8:
+              mInfo.out_color_space = JCS_EXT_BGRX;
+              break;
+            case SurfaceFormat::X8R8G8B8:
+              mInfo.out_color_space = JCS_EXT_XRGB;
+              break;
+            case SurfaceFormat::R8G8B8X8:
+              mInfo.out_color_space = JCS_EXT_RGBX;
+              break;
+            default:
+              mState = JPEG_ERROR;
+              return Transition::TerminateFailure();
+          }
+          break;
+        case JCS_CMYK:
+        case JCS_YCCK:
+          mInfo.out_color_space = JCS_CMYK;
+          break;
+        default:
+          mState = JPEG_ERROR;
+          MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+                  ("} (unknown colorspace (3))"));
+          return Transition::TerminateFailure();
+      }
+
+      if (mCMSMode != CMSMode::Off) {
+        if ((mInProfile = GetICCProfile(mInfo)) != nullptr &&
+            GetCMSOutputProfile()) {
+          uint32_t profileSpace = qcms_profile_get_color_space(mInProfile);
+
+          qcms_data_type outputType = gfxPlatform::GetCMSOSRGBAType();
+          Maybe<qcms_data_type> inputType;
+          if (profileSpace == icSigRgbData) {
+            inputType.emplace(outputType);
+          } else if (profileSpace == icSigGrayData &&
+                     mInfo.jpeg_color_space == JCS_GRAYSCALE) {
+            mInfo.out_color_space = JCS_GRAYSCALE;
+            inputType.emplace(QCMS_DATA_GRAY_8);
+          }
+
+#if 0
+
+          if (mInfo.out_color_space == JCS_CMYK) {
+            type |= FLAVOR_SH(mInfo.saw_Adobe_marker ? 1 : 0);
+          }
+#endif
+
+          if (inputType) {
+            int intent = gfxPlatform::GetRenderingIntent();
+            if (intent == -1) {
+              intent = qcms_profile_get_rendering_intent(mInProfile);
+            }
+
+            mTransform = qcms_transform_create(mInProfile, *inputType,
+                                               GetCMSOutputProfile(),
+                                               outputType, (qcms_intent)intent);
+          }
+        } else if (mCMSMode == CMSMode::All) {
+          mTransform = GetCMSsRGBTransform(SurfaceFormat::OS_RGBX);
+        }
+      }
+
+      if (mInfo.out_color_space == JCS_GRAYSCALE ||
+          mInfo.out_color_space == JCS_CMYK) {
+        mCMSLine = new (std::nothrow) uint32_t[mInfo.image_width];
+        if (!mCMSLine) {
+          mState = JPEG_ERROR;
+          MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+                  ("} (could allocate buffer for color conversion)"));
+          return Transition::TerminateFailure();
+        }
+      }
+
+      mInfo.buffered_image =
+          mDecodeStyle == PROGRESSIVE && jpeg_has_multiple_scans(&mInfo);
+
+      jpeg_calc_output_dimensions(&mInfo);
+
+      qcms_transform* pipeTransform =
+          mInfo.out_color_space != JCS_GRAYSCALE ? mTransform : nullptr;
+
+      Maybe<SurfacePipe> pipe = SurfacePipeFactory::CreateReorientSurfacePipe(
+          this, Size(), OutputSize(), SurfaceFormat::OS_RGBX,
+          SurfaceFormat::OS_RGBX, pipeTransform, GetOrientation(),
+          SurfacePipeFlags());
+      if (!pipe) {
+        mState = JPEG_ERROR;
+        MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+                ("} (could not initialize surface pipe)"));
+        return Transition::TerminateFailure();
+      }
+
+      mPipe = std::move(*pipe);
+
+      MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+              ("        JPEGDecoderAccounting: nsJPEGDecoder::"
+               "Write -- created image frame with %ux%u pixels",
+               mInfo.image_width, mInfo.image_height));
+
+      mState = JPEG_START_DECOMPRESS;
+      [[fallthrough]];  
+    }
+
+    case JPEG_START_DECOMPRESS: {
+      LOG_SCOPE((mozilla::LogModule*)sJPEGLog,
+                "nsJPEGDecoder::Write -- entering"
+                " JPEG_START_DECOMPRESS case");
+
+
+      mInfo.dct_method = JDCT_ISLOW;
+      mInfo.dither_mode = JDITHER_FS;
+      mInfo.do_fancy_upsampling = TRUE;
+      mInfo.enable_2pass_quant = FALSE;
+      mInfo.do_block_smoothing = TRUE;
+
+      if (jpeg_start_decompress(&mInfo) == FALSE) {
+        MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+                ("} (I/O suspension after jpeg_start_decompress())"));
+        return Transition::ContinueUnbuffered(
+            State::JPEG_DATA);  
+      }
+
+      mState = mInfo.buffered_image ? JPEG_DECOMPRESS_PROGRESSIVE
+                                    : JPEG_DECOMPRESS_SEQUENTIAL;
+      [[fallthrough]];  
+    }
+
+    case JPEG_DECOMPRESS_SEQUENTIAL: {
+      if (mState == JPEG_DECOMPRESS_SEQUENTIAL) {
+        LOG_SCOPE((mozilla::LogModule*)sJPEGLog,
+                  "nsJPEGDecoder::Write -- "
+                  "JPEG_DECOMPRESS_SEQUENTIAL case");
+
+        switch (OutputScanlines()) {
+          case WriteState::NEED_MORE_DATA:
+            MOZ_LOG(
+                sJPEGDecoderAccountingLog, LogLevel::Debug,
+                ("} (I/O suspension after OutputScanlines() - SEQUENTIAL)"));
+            return Transition::ContinueUnbuffered(
+                State::JPEG_DATA);  
+          case WriteState::FINISHED:
+            NS_ASSERTION(mInfo.output_scanline == mInfo.output_height,
+                         "We didn't process all of the data!");
+            mState = JPEG_DONE;
+            break;
+          case WriteState::FAILURE:
+            mState = JPEG_ERROR;
+            MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+                    ("} (Error in pipeline from OutputScalines())"));
+            return Transition::TerminateFailure();
+        }
+      }
+      [[fallthrough]];  
+    }
+
+    case JPEG_DECOMPRESS_PROGRESSIVE: {
+      if (mState == JPEG_DECOMPRESS_PROGRESSIVE) {
+        LOG_SCOPE((mozilla::LogModule*)sJPEGLog,
+                  "nsJPEGDecoder::Write -- JPEG_DECOMPRESS_PROGRESSIVE case");
+        auto AllComponentsSeen = [](jpeg_decompress_struct& info) {
+          bool all_components_seen = true;
+          if (info.coef_bits) {
+            for (int c = 0; c < info.num_components; ++c) {
+              bool current_component_seen = info.coef_bits[c][0] != -1;
+              all_components_seen &= current_component_seen;
+            }
+          }
+          return all_components_seen;
+        };
+        int status;
+        int scan_to_display_first = 0;
+        bool all_components_seen;
+        all_components_seen = AllComponentsSeen(mInfo);
+        if (all_components_seen) {
+          scan_to_display_first = mInfo.input_scan_number;
+        }
+
+        do {
+          status = jpeg_consume_input(&mInfo);
+
+          if (status == JPEG_REACHED_SOS || status == JPEG_REACHED_EOI ||
+              status == JPEG_SUSPENDED) {
+            all_components_seen = AllComponentsSeen(mInfo);
+            if (!scan_to_display_first && all_components_seen) {
+              scan_to_display_first = mInfo.input_scan_number;
+            }
+          }
+        } while ((status != JPEG_SUSPENDED) && (status != JPEG_REACHED_EOI));
+
+        if (!all_components_seen) {
+          return Transition::ContinueUnbuffered(
+              State::JPEG_DATA);  
+        }
+        if (!scan_to_display_first) {
+          scan_to_display_first = 1;
+        }
+        while (mState != JPEG_DONE) {
+          if (mInfo.output_scanline == 0) {
+            int scan = mInfo.input_scan_number;
+
+            if ((mInfo.output_scan_number == 0) &&
+                (scan > scan_to_display_first) &&
+                (status != JPEG_REACHED_EOI)) {
+              scan--;
+            }
+            MOZ_ASSERT(scan > 0, "scan number to small!");
+            if (!jpeg_start_output(&mInfo, scan)) {
+              MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+                      ("} (I/O suspension after jpeg_start_output() -"
+                       " PROGRESSIVE)"));
+              return Transition::ContinueUnbuffered(
+                  State::JPEG_DATA);  
+            }
+          }
+
+          if (mInfo.output_scanline == 0xffffff) {
+            mInfo.output_scanline = 0;
+          }
+
+          switch (OutputScanlines()) {
+            case WriteState::NEED_MORE_DATA:
+              if (mInfo.output_scanline == 0) {
+                mInfo.output_scanline = 0xffffff;
+              }
+              MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+                      ("} (I/O suspension after OutputScanlines() - "
+                       "PROGRESSIVE)"));
+              return Transition::ContinueUnbuffered(
+                  State::JPEG_DATA);  
+            case WriteState::FINISHED:
+              NS_ASSERTION(mInfo.output_scanline == mInfo.output_height,
+                           "We didn't process all of the data!");
+
+              if (!jpeg_finish_output(&mInfo)) {
+                MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+                        ("} (I/O suspension after jpeg_finish_output() -"
+                         " PROGRESSIVE)"));
+                return Transition::ContinueUnbuffered(
+                    State::JPEG_DATA);  
+              }
+
+              if (jpeg_input_complete(&mInfo) &&
+                  (mInfo.input_scan_number == mInfo.output_scan_number)) {
+                mState = JPEG_DONE;
+              } else {
+                mInfo.output_scanline = 0;
+                mPipe.ResetToFirstRow();
+              }
+              break;
+            case WriteState::FAILURE:
+              mState = JPEG_ERROR;
+              MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+                      ("} (Error in pipeline from OutputScalines())"));
+              return Transition::TerminateFailure();
+          }
+        }
+      }
+      [[fallthrough]];  
+    }
+
+    case JPEG_DONE: {
+      LOG_SCOPE((mozilla::LogModule*)sJPEGLog,
+                "nsJPEGDecoder::ProcessData -- entering"
+                " JPEG_DONE case");
+
+
+      if (jpeg_finish_decompress(&mInfo) == FALSE) {
+        MOZ_LOG(sJPEGDecoderAccountingLog, LogLevel::Debug,
+                ("} (I/O suspension after jpeg_finish_decompress() - DONE)"));
+        return Transition::ContinueUnbuffered(
+            State::JPEG_DATA);  
+      }
+
+      mState = JPEG_SINK_NON_JPEG_TRAILER;
+
+      return Transition::TerminateSuccess();
+    }
+    case JPEG_SINK_NON_JPEG_TRAILER:
+      MOZ_LOG(sJPEGLog, LogLevel::Debug,
+              ("[this=%p] nsJPEGDecoder::ProcessData -- entering"
+               " JPEG_SINK_NON_JPEG_TRAILER case\n",
+               this));
+
+      MOZ_ASSERT_UNREACHABLE(
+          "Should stop getting data after entering state "
+          "JPEG_SINK_NON_JPEG_TRAILER");
+
+      return Transition::TerminateSuccess();
+
+    case JPEG_ERROR:
+      MOZ_ASSERT_UNREACHABLE(
+          "Should stop getting data after entering state "
+          "JPEG_ERROR");
+
+      return Transition::TerminateFailure();
+  }
+
+  MOZ_ASSERT_UNREACHABLE("Escaped the JPEG decoder state machine");
+  return Transition::TerminateFailure();
+}  
+
+LexerTransition<nsJPEGDecoder::State> nsJPEGDecoder::FinishedJPEGData() {
+  MOZ_ASSERT_UNREACHABLE("Read the entire address space?");
+  return Transition::TerminateFailure();
+}
+
+EXIFData nsJPEGDecoder::ReadExifData() const {
+  jpeg_saved_marker_ptr marker;
+
+  for (marker = mInfo.marker_list; marker != nullptr; marker = marker->next) {
+    if (marker->marker == JPEG_APP0 + 1) {
+      break;
+    }
+  }
+
+  if (!marker) {
+    return EXIFData();
+  }
+
+  return EXIFParser::Parse( true, marker->data,
+                           static_cast<uint32_t>(marker->data_length),
+                           gfx::IntSize(mInfo.image_width, mInfo.image_height));
+}
+
+void nsJPEGDecoder::NotifyDone() {
+  PostFrameStop(Opacity::FULLY_OPAQUE);
+  PostDecodeDone();
+}
+
+WriteState nsJPEGDecoder::OutputScanlines() {
+  auto result = mPipe.WritePixelBlocks<uint32_t>(
+      [&](uint32_t* aPixelBlock, int32_t aBlockSize) {
+        JSAMPROW sampleRow = (JSAMPROW)(mCMSLine ? mCMSLine : aPixelBlock);
+        if (jpeg_read_scanlines(&mInfo, &sampleRow, 1) != 1) {
+          return std::make_tuple( 0,
+                                 Some(WriteState::NEED_MORE_DATA));
+        }
+
+        switch (mInfo.out_color_space) {
+          default:
+            MOZ_ASSERT(!mCMSLine);
+            break;
+          case JCS_GRAYSCALE:
+            MOZ_ASSERT(mCMSLine);
+            qcms_transform_data(mTransform, mCMSLine, aPixelBlock,
+                                mInfo.output_width);
+            break;
+          case JCS_CMYK:
+            MOZ_ASSERT(mCMSLine);
+            cmyk_convert_bgra(mCMSLine, aPixelBlock, aBlockSize, mIsPDF);
+            break;
+        }
+
+        return std::make_tuple(aBlockSize, Maybe<WriteState>());
+      });
+
+  Maybe<SurfaceInvalidRect> invalidRect = mPipe.TakeInvalidRect();
+  if (invalidRect) {
+    PostInvalidation(invalidRect->mInputSpaceRect,
+                     Some(invalidRect->mOutputSpaceRect));
+  }
+
+  return result;
+}
+
+METHODDEF(void)
+my_error_exit(j_common_ptr cinfo) {
+  decoder_error_mgr* err = (decoder_error_mgr*)cinfo->err;
+
+  nsresult error_code;
+  switch (err->pub.msg_code) {
+    case JERR_OUT_OF_MEMORY:
+      error_code = NS_ERROR_OUT_OF_MEMORY;
+      break;
+    case JERR_UNKNOWN_MARKER:
+      error_code = NS_ERROR_ILLEGAL_VALUE;
+      break;
+    case JERR_SOF_UNSUPPORTED:
+      error_code = NS_ERROR_INVALID_CONTENT_ENCODING;
+      break;
+    default:
+      error_code = NS_ERROR_FAILURE;
+  }
+
+#ifdef DEBUG
+  char buffer[JMSG_LENGTH_MAX];
+
+  (*err->pub.format_message)(cinfo, buffer);
+
+  fprintf(stderr, "JPEG decoding error:\n%s\n", buffer);
+#endif
+
+  longjmp(err->setjmp_buffer, static_cast<int>(error_code));
+}
+
+static void progress_monitor(j_common_ptr info) {
+  int scan = ((j_decompress_ptr)info)->input_scan_number;
+  if (scan >= 1000) {
+    my_error_exit(info);
+  }
+}
+
+
+
+METHODDEF(void)
+init_source(j_decompress_ptr jd) {}
+
+METHODDEF(void)
+skip_input_data(j_decompress_ptr jd, long num_bytes) {
+  struct jpeg_source_mgr* src = jd->src;
+  nsJPEGDecoder* decoder = (nsJPEGDecoder*)(jd->client_data);
+
+  if (num_bytes > (long)src->bytes_in_buffer) {
+    decoder->mBytesToSkip = (size_t)num_bytes - src->bytes_in_buffer;
+    src->next_input_byte += src->bytes_in_buffer;
+    src->bytes_in_buffer = 0;
+
+  } else {
+
+    src->bytes_in_buffer -= (size_t)num_bytes;
+    src->next_input_byte += num_bytes;
+  }
+}
+
+METHODDEF(boolean)
+fill_input_buffer(j_decompress_ptr jd) {
+  struct jpeg_source_mgr* src = jd->src;
+  nsJPEGDecoder* decoder = (nsJPEGDecoder*)(jd->client_data);
+
+  if (decoder->mReading) {
+    const JOCTET* new_buffer = decoder->mSegment;
+    uint32_t new_buflen = decoder->mSegmentLen;
+
+    if (!new_buffer || new_buflen == 0) {
+      return false;  
+    }
+
+    decoder->mSegmentLen = 0;
+
+    if (decoder->mBytesToSkip) {
+      if (decoder->mBytesToSkip < new_buflen) {
+        new_buffer += decoder->mBytesToSkip;
+        new_buflen -= decoder->mBytesToSkip;
+        decoder->mBytesToSkip = 0;
+      } else {
+        decoder->mBytesToSkip -= (size_t)new_buflen;
+        return false;  
+      }
+    }
+
+    decoder->mBackBufferUnreadLen = src->bytes_in_buffer;
+
+    src->next_input_byte = new_buffer;
+    src->bytes_in_buffer = (size_t)new_buflen;
+    decoder->mReading = false;
+
+    return true;
+  }
+
+  if (src->next_input_byte != decoder->mSegment) {
+    decoder->mBackBufferUnreadLen = 0;
+    decoder->mBackBufferLen = 0;
+  }
+
+  const uint32_t new_backtrack_buflen =
+      src->bytes_in_buffer + decoder->mBackBufferLen;
+
+  if (decoder->mBackBufferSize < new_backtrack_buflen) {
+    if (new_backtrack_buflen > MAX_JPEG_MARKER_LENGTH) {
+      my_error_exit((j_common_ptr)(&decoder->mInfo));
+    }
+
+    const size_t roundup_buflen = ((new_backtrack_buflen + 255) >> 8) << 8;
+    JOCTET* buf = (JOCTET*)realloc(decoder->mBackBuffer, roundup_buflen);
+    if (!buf) {
+      decoder->mInfo.err->msg_code = JERR_OUT_OF_MEMORY;
+      my_error_exit((j_common_ptr)(&decoder->mInfo));
+    }
+    decoder->mBackBuffer = buf;
+    decoder->mBackBufferSize = roundup_buflen;
+  }
+
+  if (decoder->mBackBuffer) {
+    memmove(decoder->mBackBuffer + decoder->mBackBufferLen,
+            src->next_input_byte, src->bytes_in_buffer);
+  } else {
+    MOZ_ASSERT(src->bytes_in_buffer == 0);
+    MOZ_ASSERT(decoder->mBackBufferLen == 0);
+    MOZ_ASSERT(decoder->mBackBufferUnreadLen == 0);
+  }
+
+  src->next_input_byte = decoder->mBackBuffer + decoder->mBackBufferLen -
+                         decoder->mBackBufferUnreadLen;
+  src->bytes_in_buffer += decoder->mBackBufferUnreadLen;
+  decoder->mBackBufferLen = (size_t)new_backtrack_buflen;
+  decoder->mReading = true;
+
+  return false;
+}
+
+METHODDEF(void)
+term_source(j_decompress_ptr jd) {
+  nsJPEGDecoder* decoder = (nsJPEGDecoder*)(jd->client_data);
+
+  MOZ_ASSERT(decoder->mState != JPEG_ERROR,
+             "Calling term_source on a JPEG with mState == JPEG_ERROR!");
+
+  decoder->NotifyDone();
+}
+
+}  
+}  
+
+static void cmyk_convert_bgra(uint32_t* aInput, uint32_t* aOutput,
+                              int32_t aWidth, bool aIsInverted) {
+  uint8_t* input = reinterpret_cast<uint8_t*>(aInput);
+
+  for (int32_t i = 0; i < aWidth; ++i) {
+
+
+
+
+    uint32_t iC = input[0];
+    uint32_t iM = input[1];
+    uint32_t iY = input[2];
+    uint32_t iK = input[3];
+    if (MOZ_UNLIKELY(aIsInverted)) {
+      iC = 255 - iC;
+      iM = 255 - iM;
+      iY = 255 - iY;
+      iK = 255 - iK;
+    }
+
+    const uint8_t r = iC * iK / 255;
+    const uint8_t g = iM * iK / 255;
+    const uint8_t b = iY * iK / 255;
+
+    *aOutput++ = (0xFF << mozilla::gfx::SurfaceFormatBit::OS_A) |
+                 (r << mozilla::gfx::SurfaceFormatBit::OS_R) |
+                 (g << mozilla::gfx::SurfaceFormatBit::OS_G) |
+                 (b << mozilla::gfx::SurfaceFormatBit::OS_B);
+    input += 4;
+  }
+}

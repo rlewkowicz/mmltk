@@ -1,0 +1,53 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ImageBitmapFormatUtils_h
+#define mozilla_dom_ImageBitmapFormatUtils_h
+
+#include <cstdint>
+
+#include "nsTArrayForwardDeclare.h"
+
+namespace mozilla {
+
+template <typename T>
+class Maybe;
+
+namespace layers {
+class Image;
+}
+
+class ErrorResult;
+
+namespace dom {
+
+struct ChannelPixelLayout;
+enum class ImageBitmapFormat : uint8_t;
+
+typedef nsTArray<ChannelPixelLayout> ImagePixelLayout;
+
+class ImageUtils {
+ public:
+  class Impl;
+  ImageUtils() = delete;
+  ImageUtils(const ImageUtils&) = delete;
+  ImageUtils(ImageUtils&&) = delete;
+  ImageUtils& operator=(const ImageUtils&) = delete;
+  ImageUtils& operator=(ImageUtils&&) = delete;
+
+  explicit ImageUtils(layers::Image* aImage);
+  ~ImageUtils();
+
+  Maybe<ImageBitmapFormat> GetFormat() const;
+
+  uint32_t GetBufferLength() const;
+
+ protected:
+  Impl* mImpl;
+};
+
+}  
+}  
+
+#endif /* mozilla_dom_ImageBitmapFormatUtils_h */

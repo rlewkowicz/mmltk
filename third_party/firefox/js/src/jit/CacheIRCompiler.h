@@ -1,0 +1,1212 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_CacheIRCompiler_h
+#define jit_CacheIRCompiler_h
+
+#include "mozilla/Casting.h"
+#include "mozilla/Maybe.h"
+
+#include "jit/CacheIR.h"
+#include "jit/CacheIRReader.h"
+#include "jit/CacheIRWriter.h"
+#include "jit/JitOptions.h"
+#include "jit/MacroAssembler.h"
+#include "jit/PerfSpewer.h"
+#include "jit/SharedICRegisters.h"
+#include "js/ScalarType.h"  // js::Scalar::Type
+
+namespace JS {
+class BigInt;
+}
+
+namespace js {
+
+class TypedArrayObject;
+enum class UnaryMathFunction : uint8_t;
+
+namespace jit {
+
+class BaselineCacheIRCompiler;
+class ICCacheIRStub;
+class IonCacheIRCompiler;
+class IonScript;
+
+enum class ICStubEngine : uint8_t;
+
+
+class BaselineFrameSlot {
+  uint32_t slot_;
+
+ public:
+  explicit BaselineFrameSlot(uint32_t slot) : slot_(slot) {}
+  uint32_t slot() const { return slot_; }
+
+  bool operator==(const BaselineFrameSlot& other) const {
+    return slot_ == other.slot_;
+  }
+  bool operator!=(const BaselineFrameSlot& other) const {
+    return slot_ != other.slot_;
+  }
+};
+
+class OperandLocation {
+ public:
+  enum Kind {
+    Uninitialized = 0,
+    PayloadReg,
+    DoubleReg,
+    ValueReg,
+    PayloadStack,
+    ValueStack,
+    BaselineFrame,
+    Constant,
+  };
+
+ private:
+  Kind kind_;
+
+  union Data {
+    struct {
+      Register reg;
+      JSValueType type;
+    } payloadReg;
+    FloatRegister doubleReg;
+    ValueOperand valueReg;
+    struct {
+      uint32_t stackPushed;
+      JSValueType type;
+    } payloadStack;
+    uint32_t valueStackPushed;
+    BaselineFrameSlot baselineFrameSlot;
+    Value constant;
+
+    Data() : valueStackPushed(0) {}
+  };
+  Data data_;
+
+ public:
+  OperandLocation() : kind_(Uninitialized) {}
+
+  Kind kind() const { return kind_; }
+
+  void setUninitialized() { kind_ = Uninitialized; }
+
+  ValueOperand valueReg() const {
+    MOZ_ASSERT(kind_ == ValueReg);
+    return data_.valueReg;
+  }
+  Register payloadReg() const {
+    MOZ_ASSERT(kind_ == PayloadReg);
+    return data_.payloadReg.reg;
+  }
+  FloatRegister doubleReg() const {
+    MOZ_ASSERT(kind_ == DoubleReg);
+    return data_.doubleReg;
+  }
+  uint32_t payloadStack() const {
+    MOZ_ASSERT(kind_ == PayloadStack);
+    return data_.payloadStack.stackPushed;
+  }
+  uint32_t valueStack() const {
+    MOZ_ASSERT(kind_ == ValueStack);
+    return data_.valueStackPushed;
+  }
+  JSValueType payloadType() const {
+    if (kind_ == PayloadReg) {
+      return data_.payloadReg.type;
+    }
+    MOZ_ASSERT(kind_ == PayloadStack);
+    return data_.payloadStack.type;
+  }
+  Value constant() const {
+    MOZ_ASSERT(kind_ == Constant);
+    return data_.constant;
+  }
+  BaselineFrameSlot baselineFrameSlot() const {
+    MOZ_ASSERT(kind_ == BaselineFrame);
+    return data_.baselineFrameSlot;
+  }
+
+  void setPayloadReg(Register reg, JSValueType type) {
+    kind_ = PayloadReg;
+    data_.payloadReg.reg = reg;
+    data_.payloadReg.type = type;
+  }
+  void setDoubleReg(FloatRegister reg) {
+    kind_ = DoubleReg;
+    data_.doubleReg = reg;
+  }
+  void setValueReg(ValueOperand reg) {
+    kind_ = ValueReg;
+    data_.valueReg = reg;
+  }
+  void setPayloadStack(uint32_t stackPushed, JSValueType type) {
+    kind_ = PayloadStack;
+    data_.payloadStack.stackPushed = stackPushed;
+    data_.payloadStack.type = type;
+  }
+  void setValueStack(uint32_t stackPushed) {
+    kind_ = ValueStack;
+    data_.valueStackPushed = stackPushed;
+  }
+  void setConstant(const Value& v) {
+    kind_ = Constant;
+    data_.constant = v;
+  }
+  void setBaselineFrame(BaselineFrameSlot slot) {
+    kind_ = BaselineFrame;
+    data_.baselineFrameSlot = slot;
+  }
+
+  bool isUninitialized() const { return kind_ == Uninitialized; }
+  bool isInRegister() const { return kind_ == PayloadReg || kind_ == ValueReg; }
+  bool isOnStack() const {
+    return kind_ == PayloadStack || kind_ == ValueStack;
+  }
+
+  size_t stackPushed() const {
+    if (kind_ == PayloadStack) {
+      return data_.payloadStack.stackPushed;
+    }
+    MOZ_ASSERT(kind_ == ValueStack);
+    return data_.valueStackPushed;
+  }
+  size_t stackSizeInBytes() const {
+    if (kind_ == PayloadStack) {
+      return sizeof(uintptr_t);
+    }
+    MOZ_ASSERT(kind_ == ValueStack);
+    return sizeof(js::Value);
+  }
+  void adjustStackPushed(int32_t diff) {
+    if (kind_ == PayloadStack) {
+      data_.payloadStack.stackPushed += diff;
+      return;
+    }
+    MOZ_ASSERT(kind_ == ValueStack);
+    data_.valueStackPushed += diff;
+  }
+
+  bool aliasesReg(Register reg) const {
+    if (kind_ == PayloadReg) {
+      return payloadReg() == reg;
+    }
+    if (kind_ == ValueReg) {
+      return valueReg().aliases(reg);
+    }
+    return false;
+  }
+  bool aliasesReg(ValueOperand reg) const {
+#if defined(JS_NUNBOX32)
+    return aliasesReg(reg.typeReg()) || aliasesReg(reg.payloadReg());
+#else
+    return aliasesReg(reg.valueReg());
+#endif
+  }
+
+  bool aliasesReg(const OperandLocation& other) const;
+
+  bool operator==(const OperandLocation& other) const;
+  bool operator!=(const OperandLocation& other) const {
+    return !operator==(other);
+  }
+};
+
+struct SpilledRegister {
+  Register reg;
+  uint32_t stackPushed;
+
+  SpilledRegister(Register reg, uint32_t stackPushed)
+      : reg(reg), stackPushed(stackPushed) {}
+  bool operator==(const SpilledRegister& other) const {
+    return reg == other.reg && stackPushed == other.stackPushed;
+  }
+  bool operator!=(const SpilledRegister& other) const {
+    return !(*this == other);
+  }
+};
+
+using SpilledRegisterVector = Vector<SpilledRegister, 2, SystemAllocPolicy>;
+
+class MOZ_RAII CacheRegisterAllocator {
+  Vector<OperandLocation, 4, SystemAllocPolicy> origInputLocations_;
+
+  Vector<OperandLocation, 8, SystemAllocPolicy> operandLocations_;
+
+  Vector<uint32_t, 2, SystemAllocPolicy> freeValueSlots_;
+  Vector<uint32_t, 2, SystemAllocPolicy> freePayloadSlots_;
+
+  LiveGeneralRegisterSet currentOpRegs_;
+
+  AllocatableGeneralRegisterSet availableRegs_;
+
+  AllocatableGeneralRegisterSet availableRegsAfterSpill_;
+
+  SpilledRegisterVector spilledRegs_;
+
+  uint32_t stackPushed_;
+
+#ifdef DEBUG
+  bool addedFailurePath_;
+#endif
+
+  uint32_t currentInstruction_;
+
+  bool hasAutoScratchFloatRegisterSpill_ = false;
+
+  const CacheIRWriter& writer_;
+
+  void freeDeadOperandLocations(MacroAssembler& masm);
+
+  void spillOperandToStack(MacroAssembler& masm, OperandLocation* loc);
+  void spillOperandToStackOrRegister(MacroAssembler& masm,
+                                     OperandLocation* loc);
+
+  void popPayload(MacroAssembler& masm, OperandLocation* loc, Register dest);
+  void popValue(MacroAssembler& masm, OperandLocation* loc, ValueOperand dest);
+  Address payloadAddress(MacroAssembler& masm,
+                         const OperandLocation* loc) const;
+  Address valueAddress(MacroAssembler& masm, const OperandLocation* loc) const;
+
+#ifdef DEBUG
+  void assertValidState() const;
+#endif
+
+ public:
+  friend class AutoScratchRegister;
+  friend class AutoScratchRegisterExcluding;
+
+  explicit CacheRegisterAllocator(const CacheIRWriter& writer)
+      : stackPushed_(0),
+#ifdef DEBUG
+        addedFailurePath_(false),
+#endif
+        currentInstruction_(0),
+        writer_(writer) {
+  }
+
+  CacheRegisterAllocator(const CacheRegisterAllocator&) = delete;
+  CacheRegisterAllocator& operator=(const CacheRegisterAllocator&) = delete;
+
+  [[nodiscard]] bool init();
+
+  void initAvailableRegs(const AllocatableGeneralRegisterSet& available) {
+    availableRegs_ = available;
+  }
+  void initAvailableRegsAfterSpill();
+
+  void fixupAliasedInputs(MacroAssembler& masm);
+
+  OperandLocation operandLocation(size_t i) const {
+    return operandLocations_[i];
+  }
+  void setOperandLocation(size_t i, const OperandLocation& loc) {
+    operandLocations_[i] = loc;
+  }
+
+  OperandLocation origInputLocation(size_t i) const {
+    return origInputLocations_[i];
+  }
+  void initInputLocation(size_t i, ValueOperand reg) {
+    origInputLocations_[i].setValueReg(reg);
+    operandLocations_[i].setValueReg(reg);
+  }
+  void initInputLocation(size_t i, Register reg, JSValueType type) {
+    origInputLocations_[i].setPayloadReg(reg, type);
+    operandLocations_[i].setPayloadReg(reg, type);
+  }
+  void initInputLocation(size_t i, FloatRegister reg) {
+    origInputLocations_[i].setDoubleReg(reg);
+    operandLocations_[i].setDoubleReg(reg);
+  }
+  void initInputLocation(size_t i, const Value& v) {
+    origInputLocations_[i].setConstant(v);
+    operandLocations_[i].setConstant(v);
+  }
+  void initInputLocation(size_t i, BaselineFrameSlot slot) {
+    origInputLocations_[i].setBaselineFrame(slot);
+    operandLocations_[i].setBaselineFrame(slot);
+  }
+
+  void initInputLocation(size_t i, const TypedOrValueRegister& reg);
+  void initInputLocation(size_t i, const ConstantOrRegister& value);
+
+  const SpilledRegisterVector& spilledRegs() const { return spilledRegs_; }
+
+  [[nodiscard]] bool setSpilledRegs(const SpilledRegisterVector& regs) {
+    spilledRegs_.clear();
+    return spilledRegs_.appendAll(regs);
+  }
+
+  bool hasAutoScratchFloatRegisterSpill() const {
+    return hasAutoScratchFloatRegisterSpill_;
+  }
+  void setHasAutoScratchFloatRegisterSpill(bool b) {
+    MOZ_ASSERT(hasAutoScratchFloatRegisterSpill_ != b);
+    hasAutoScratchFloatRegisterSpill_ = b;
+  }
+
+  void nextOp() {
+#ifdef DEBUG
+    assertValidState();
+    addedFailurePath_ = false;
+#endif
+    currentOpRegs_.clear();
+    currentInstruction_++;
+  }
+
+#ifdef DEBUG
+  void setAddedFailurePath() {
+    MOZ_ASSERT(!addedFailurePath_, "multiple failure paths for instruction");
+    addedFailurePath_ = true;
+  }
+#endif
+
+  bool isDeadAfterInstruction(OperandId opId) const {
+    return writer_.operandIsDead(opId.id(), currentInstruction_ + 1);
+  }
+
+  uint32_t stackPushed() const { return stackPushed_; }
+  void setStackPushed(uint32_t pushed) { stackPushed_ = pushed; }
+
+  Register allocateRegister(MacroAssembler& masm);
+  ValueOperand allocateValueRegister(MacroAssembler& masm);
+
+  void allocateFixedRegister(MacroAssembler& masm, Register reg);
+  void allocateFixedValueRegister(MacroAssembler& masm, ValueOperand reg);
+
+  void releaseRegister(Register reg) {
+    MOZ_ASSERT(currentOpRegs_.has(reg));
+    availableRegs_.add(reg);
+    currentOpRegs_.take(reg);
+  }
+  void releaseValueRegister(ValueOperand reg) {
+#ifdef JS_NUNBOX32
+    releaseRegister(reg.payloadReg());
+    releaseRegister(reg.typeReg());
+#else
+    releaseRegister(reg.valueReg());
+#endif
+  }
+
+  void discardStack(MacroAssembler& masm);
+
+  Address addressOf(MacroAssembler& masm, BaselineFrameSlot slot) const;
+  BaseValueIndex addressOf(MacroAssembler& masm, Register argcReg,
+                           BaselineFrameSlot slot) const;
+
+  ValueOperand useValueRegister(MacroAssembler& masm, ValOperandId val);
+  Register useRegister(MacroAssembler& masm, TypedOperandId typedId);
+
+  ConstantOrRegister useConstantOrRegister(MacroAssembler& masm,
+                                           ValOperandId val);
+
+  Register defineRegister(MacroAssembler& masm, TypedOperandId typedId);
+  ValueOperand defineValueRegister(MacroAssembler& masm, ValOperandId val);
+
+  void ensureDoubleRegister(MacroAssembler& masm, NumberOperandId op,
+                            FloatRegister dest) const;
+
+  void copyToScratchRegister(MacroAssembler& masm, TypedOperandId typedId,
+                             Register dest) const;
+  void copyToScratchValueRegister(MacroAssembler& masm, ValOperandId valId,
+                                  ValueOperand dest) const;
+
+  JSValueType knownType(ValOperandId val) const;
+
+  void restoreInputState(MacroAssembler& masm, bool discardStack = true);
+
+  GeneralRegisterSet inputRegisterSet() const;
+
+  void saveIonLiveRegisters(MacroAssembler& masm, LiveRegisterSet liveRegs,
+                            Register scratch, IonScript* ionScript);
+  void restoreIonLiveRegisters(MacroAssembler& masm, LiveRegisterSet liveRegs);
+};
+
+class MOZ_RAII AutoScratchRegister {
+  CacheRegisterAllocator& alloc_;
+  Register reg_;
+
+ public:
+  AutoScratchRegister(CacheRegisterAllocator& alloc, MacroAssembler& masm,
+                      Register reg = InvalidReg)
+      : alloc_(alloc) {
+    if (reg != InvalidReg) {
+      alloc.allocateFixedRegister(masm, reg);
+      reg_ = reg;
+    } else {
+      reg_ = alloc.allocateRegister(masm);
+    }
+    MOZ_ASSERT(alloc_.currentOpRegs_.has(reg_));
+  }
+  ~AutoScratchRegister() { alloc_.releaseRegister(reg_); }
+  AutoScratchRegister(const AutoScratchRegister&) = delete;
+  void operator=(const AutoScratchRegister&) = delete;
+
+  Register get() const { return reg_; }
+  operator Register() const { return reg_; }
+};
+
+class MOZ_RAII AutoSpectreBoundsScratchRegister {
+  mozilla::Maybe<AutoScratchRegister> scratch_;
+  Register reg_ = InvalidReg;
+
+ public:
+  AutoSpectreBoundsScratchRegister(CacheRegisterAllocator& alloc,
+                                   MacroAssembler& masm) {
+#ifdef JS_CODEGEN_X86
+    if (JitOptions.spectreIndexMasking) {
+      scratch_.emplace(alloc, masm);
+      reg_ = scratch_->get();
+    }
+#endif
+  }
+  AutoSpectreBoundsScratchRegister(const AutoSpectreBoundsScratchRegister&) =
+      delete;
+  void operator=(const AutoSpectreBoundsScratchRegister&) = delete;
+
+  Register get() const { return reg_; }
+  operator Register() const { return reg_; }
+};
+
+class MOZ_RAII AutoScratchRegister64 {
+  AutoScratchRegister reg1_;
+#if JS_BITS_PER_WORD == 32
+  AutoScratchRegister reg2_;
+#endif
+
+ public:
+  AutoScratchRegister64(const AutoScratchRegister64&) = delete;
+  void operator=(const AutoScratchRegister64&) = delete;
+
+#if JS_BITS_PER_WORD == 32
+  AutoScratchRegister64(CacheRegisterAllocator& alloc, MacroAssembler& masm)
+      : reg1_(alloc, masm), reg2_(alloc, masm) {}
+
+  Register64 get() const { return Register64(reg1_, reg2_); }
+#else
+  AutoScratchRegister64(CacheRegisterAllocator& alloc, MacroAssembler& masm)
+      : reg1_(alloc, masm) {}
+
+  Register64 get() const { return Register64(reg1_); }
+#endif
+
+  operator Register64() const { return get(); }
+};
+
+class MOZ_RAII AutoScratchValueRegister {
+  AutoScratchRegister reg1_;
+#if JS_BITS_PER_WORD == 32
+  AutoScratchRegister reg2_;
+#endif
+
+ public:
+  AutoScratchValueRegister(const AutoScratchValueRegister&) = delete;
+  void operator=(const AutoScratchValueRegister&) = delete;
+
+#if JS_BITS_PER_WORD == 32
+  AutoScratchValueRegister(CacheRegisterAllocator& alloc, MacroAssembler& masm)
+      : reg1_(alloc, masm), reg2_(alloc, masm) {}
+
+  ValueOperand get() const { return ValueOperand(reg1_, reg2_); }
+#else
+  AutoScratchValueRegister(CacheRegisterAllocator& alloc, MacroAssembler& masm)
+      : reg1_(alloc, masm) {}
+
+  ValueOperand get() const { return ValueOperand(reg1_); }
+#endif
+
+  operator ValueOperand() const { return get(); }
+};
+
+class FailurePath {
+  Vector<OperandLocation, 4, SystemAllocPolicy> inputs_;
+  SpilledRegisterVector spilledRegs_;
+  NonAssertingLabel label_;
+  uint32_t stackPushed_ = 0;
+#ifdef DEBUG
+  bool hasAutoScratchFloatRegister_ = false;
+#endif
+
+ public:
+  FailurePath() = default;
+
+  FailurePath(FailurePath&& other)
+      : inputs_(std::move(other.inputs_)),
+        spilledRegs_(std::move(other.spilledRegs_)),
+        label_(other.label_),
+        stackPushed_(other.stackPushed_) {}
+
+  Label* labelUnchecked() { return &label_; }
+  Label* label() {
+    MOZ_ASSERT(!hasAutoScratchFloatRegister_);
+    return labelUnchecked();
+  }
+
+  void setStackPushed(uint32_t i) { stackPushed_ = i; }
+  uint32_t stackPushed() const { return stackPushed_; }
+
+  [[nodiscard]] bool appendInput(const OperandLocation& loc) {
+    return inputs_.append(loc);
+  }
+  OperandLocation input(size_t i) const { return inputs_[i]; }
+
+  const SpilledRegisterVector& spilledRegs() const { return spilledRegs_; }
+
+  [[nodiscard]] bool setSpilledRegs(const SpilledRegisterVector& regs) {
+    MOZ_ASSERT(spilledRegs_.empty());
+    return spilledRegs_.appendAll(regs);
+  }
+
+  bool canShareFailurePath(const FailurePath& other) const;
+
+  void setHasAutoScratchFloatRegister() {
+#ifdef DEBUG
+    MOZ_ASSERT(!hasAutoScratchFloatRegister_);
+    hasAutoScratchFloatRegister_ = true;
+#endif
+  }
+
+  void clearHasAutoScratchFloatRegister() {
+#ifdef DEBUG
+    MOZ_ASSERT(hasAutoScratchFloatRegister_);
+    hasAutoScratchFloatRegister_ = false;
+#endif
+  }
+};
+
+class StubFieldOffset {
+ private:
+  uint32_t offset_;
+  StubField::Type type_;
+
+ public:
+  StubFieldOffset(uint32_t offset, StubField::Type type)
+      : offset_(offset), type_(type) {}
+
+  uint32_t getOffset() { return offset_; }
+  StubField::Type getStubFieldType() { return type_; }
+};
+
+class AutoOutputRegister;
+
+class MOZ_RAII CacheIRCompiler {
+ protected:
+  friend class AutoOutputRegister;
+  friend class AutoStubFrame;
+  friend class AutoSaveLiveRegisters;
+  friend class AutoCallVM;
+  friend class AutoScratchFloatRegister;
+  friend class AutoAvailableFloatRegister;
+
+  enum class Mode { Baseline, Ion };
+
+  bool enteredStubFrame_;
+
+  bool isBaseline();
+  bool isIon();
+  BaselineCacheIRCompiler* asBaseline();
+  IonCacheIRCompiler* asIon();
+
+  JSContext* cx_;
+  const CacheIRWriter& writer_;
+  StackMacroAssembler masm;
+
+  CacheRegisterAllocator allocator;
+  Vector<FailurePath, 4, SystemAllocPolicy> failurePaths;
+
+  LiveFloatRegisterSet liveFloatRegs_;
+
+  mozilla::Maybe<TypedOrValueRegister> outputUnchecked_;
+  Mode mode_;
+
+  uint32_t stubDataOffset_;
+
+  enum class StubFieldPolicy { Address, Constant };
+
+  StubFieldPolicy stubFieldPolicy_;
+
+  CacheIRCompiler(JSContext* cx, TempAllocator& alloc,
+                  const CacheIRWriter& writer, uint32_t stubDataOffset,
+                  Mode mode, StubFieldPolicy policy)
+      : enteredStubFrame_(false),
+        cx_(cx),
+        writer_(writer),
+        masm(cx, alloc),
+        allocator(writer_),
+        liveFloatRegs_(FloatRegisterSet::All()),
+        mode_(mode),
+        stubDataOffset_(stubDataOffset),
+        stubFieldPolicy_(policy) {
+    MOZ_ASSERT(!writer.failed());
+  }
+
+  [[nodiscard]] bool addFailurePath(FailurePath** failure);
+  [[nodiscard]] bool emitFailurePath(size_t i);
+
+  FloatRegisterSet liveVolatileFloatRegs() const {
+    return FloatRegisterSet::Intersect(liveFloatRegs_.set(),
+                                       FloatRegisterSet::Volatile());
+  }
+
+  LiveRegisterSet liveVolatileRegs() const {
+    return {GeneralRegisterSet::Volatile(), liveVolatileFloatRegs()};
+  }
+
+  bool objectGuardNeedsSpectreMitigations(ObjOperandId objId) const {
+    return JitOptions.spectreObjectMitigations &&
+           !allocator.isDeadAfterInstruction(objId);
+  }
+
+ private:
+  void emitPostBarrierShared(Register obj, const ConstantOrRegister& val,
+                             Register scratch, Register maybeIndex);
+
+  void emitPostBarrierShared(Register obj, ValueOperand val, Register scratch,
+                             Register maybeIndex) {
+    emitPostBarrierShared(obj, ConstantOrRegister(val), scratch, maybeIndex);
+  }
+
+ protected:
+  template <typename T>
+  void emitPostBarrierSlot(Register obj, const T& val, Register scratch) {
+    emitPostBarrierShared(obj, val, scratch, InvalidReg);
+  }
+
+  template <typename T>
+  void emitPostBarrierElement(Register obj, const T& val, Register scratch,
+                              Register index) {
+    MOZ_ASSERT(index != InvalidReg);
+    emitPostBarrierShared(obj, val, scratch, index);
+  }
+
+  bool emitComparePointerResultShared(JSOp op, TypedOperandId lhsId,
+                                      TypedOperandId rhsId);
+
+  [[nodiscard]] bool emitMathFunctionNumberResultShared(
+      UnaryMathFunction fun, FloatRegister inputScratch, ValueOperand output);
+
+  template <typename Fn, Fn fn>
+  [[nodiscard]] bool emitBigIntBinaryOperationShared(BigIntOperandId lhsId,
+                                                     BigIntOperandId rhsId);
+
+  template <typename Fn, Fn fn>
+  [[nodiscard]] bool emitBigIntUnaryOperationShared(BigIntOperandId inputId);
+
+  bool emitDoubleIncDecResult(bool isInc, NumberOperandId inputId);
+
+  void emitTypedArrayBoundsCheck(ArrayBufferViewKind viewKind, Register obj,
+                                 Register index, Register scratch,
+                                 Register maybeScratch, Register spectreScratch,
+                                 Label* fail);
+
+  void emitTypedArrayBoundsCheck(ArrayBufferViewKind viewKind, Register obj,
+                                 Register index, Register scratch,
+                                 mozilla::Maybe<Register> maybeScratch,
+                                 mozilla::Maybe<Register> spectreScratch,
+                                 Label* fail);
+
+  void emitDataViewBoundsCheck(ArrayBufferViewKind viewKind, size_t byteSize,
+                               Register obj, Register offset, Register scratch,
+                               Register maybeScratch, Label* fail);
+
+  using AtomicsReadWriteModifyFn = int32_t (*)(TypedArrayObject*, size_t,
+                                               int32_t);
+
+  [[nodiscard]] bool emitAtomicsReadModifyWriteResult(
+      ObjOperandId objId, IntPtrOperandId indexId, uint32_t valueId,
+      Scalar::Type elementType, ArrayBufferViewKind viewKind,
+      AtomicsReadWriteModifyFn fn);
+
+  using AtomicsReadWriteModify64Fn = JS::BigInt* (*)(JSContext*,
+                                                     TypedArrayObject*, size_t,
+                                                     const JS::BigInt*);
+
+  template <AtomicsReadWriteModify64Fn fn>
+  [[nodiscard]] bool emitAtomicsReadModifyWriteResult64(
+      ObjOperandId objId, IntPtrOperandId indexId, uint32_t valueId,
+      ArrayBufferViewKind viewKind);
+
+  void emitActivateIterator(Register objBeingIterated, Register iterObject,
+                            Register nativeIter, Register scratch,
+                            Register scratch2, uint32_t enumeratorsAddrOffset);
+
+  CACHE_IR_COMPILER_SHARED_GENERATED
+
+  void emitLoadStubField(StubFieldOffset val, Register dest);
+  void emitLoadStubFieldConstant(StubFieldOffset val, Register dest);
+
+  void emitLoadValueStubField(StubFieldOffset val, ValueOperand dest);
+  void emitLoadDoubleValueStubField(StubFieldOffset val, ValueOperand dest,
+                                    FloatRegister scratch);
+
+  uintptr_t readStubWord(uint32_t offset, StubField::Type type) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    MOZ_ASSERT((offset % sizeof(uintptr_t)) == 0);
+    return writer_.readStubField(offset, type).asWord();
+  }
+  uint64_t readStubInt64(uint32_t offset, StubField::Type type) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    MOZ_ASSERT((offset % sizeof(uintptr_t)) == 0);
+    return writer_.readStubField(offset, type).asInt64();
+  }
+  int32_t int32StubField(uint32_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    return readStubWord(offset, StubField::Type::RawInt32);
+  }
+  uint32_t uint32StubField(uint32_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    return readStubWord(offset, StubField::Type::RawInt32);
+  }
+  Shape* shapeStubField(uint32_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    return (Shape*)readStubWord(offset, StubField::Type::Shape);
+  }
+  Shape* weakShapeStubField(uint32_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    Shape* shape = (Shape*)readStubWord(offset, StubField::Type::WeakShape);
+    gc::ReadBarrier(shape);
+    return shape;
+  }
+  JSObject* objectStubField(uint32_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    return (JSObject*)readStubWord(offset, StubField::Type::JSObject);
+  }
+  JSObject* weakObjectStubField(uint32_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    JSObject* obj =
+        (JSObject*)readStubWord(offset, StubField::Type::WeakObject);
+    gc::ReadBarrier(obj);
+    return obj;
+  }
+  Value valueStubField(uint32_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    uint64_t raw = readStubInt64(offset, StubField::Type::Value);
+    return Value::fromRawBits(raw);
+  }
+  Value weakValueStubField(uint32_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    uint64_t raw = readStubInt64(offset, StubField::Type::WeakValue);
+    Value v = Value::fromRawBits(raw);
+    gc::ValueReadBarrier(v);
+    return v;
+  }
+  double doubleStubField(uint32_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    uint64_t raw = readStubInt64(offset, StubField::Type::Double);
+    return mozilla::BitwiseCast<double>(raw);
+  }
+  JSString* stringStubField(uint32_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    return (JSString*)readStubWord(offset, StubField::Type::String);
+  }
+  JS::Symbol* symbolStubField(uint32_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    return (JS::Symbol*)readStubWord(offset, StubField::Type::Symbol);
+  }
+  JS::Compartment* compartmentStubField(uint32_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    return (JS::Compartment*)readStubWord(offset, StubField::Type::RawPointer);
+  }
+  BaseScript* weakBaseScriptStubField(uint32_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    BaseScript* script =
+        (BaseScript*)readStubWord(offset, StubField::Type::WeakBaseScript);
+    gc::ReadBarrier(script);
+    return script;
+  }
+  const JSClass* classStubField(uintptr_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    return (const JSClass*)readStubWord(offset, StubField::Type::RawPointer);
+  }
+  const void* proxyHandlerStubField(uintptr_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    return (const void*)readStubWord(offset, StubField::Type::RawPointer);
+  }
+  const void* pointerStubField(uintptr_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    return (const void*)readStubWord(offset, StubField::Type::RawPointer);
+  }
+  jsid idStubField(uint32_t offset) {
+    MOZ_ASSERT(stubFieldPolicy_ == StubFieldPolicy::Constant);
+    return jsid::fromRawBits(readStubWord(offset, StubField::Type::Id));
+  }
+
+#ifdef DEBUG
+  void assertFloatRegisterAvailable(FloatRegister reg);
+#endif
+
+  void callVMInternal(MacroAssembler& masm, VMFunctionId id);
+  template <typename Fn, Fn fn>
+  void callVM(MacroAssembler& masm);
+};
+
+class MOZ_RAII AutoOutputRegister {
+  TypedOrValueRegister output_;
+  CacheRegisterAllocator& alloc_;
+
+ public:
+  explicit AutoOutputRegister(CacheIRCompiler& compiler);
+  ~AutoOutputRegister();
+  AutoOutputRegister(const AutoOutputRegister&) = delete;
+  void operator=(const AutoOutputRegister&) = delete;
+
+  Register maybeReg() const {
+    if (output_.hasValue()) {
+      return output_.valueReg().scratchReg();
+    }
+    if (!output_.typedReg().isFloat()) {
+      return output_.typedReg().gpr();
+    }
+    return InvalidReg;
+  }
+
+  bool hasValue() const { return output_.hasValue(); }
+  ValueOperand valueReg() const { return output_.valueReg(); }
+  AnyRegister typedReg() const { return output_.typedReg(); }
+
+  JSValueType type() const {
+    MOZ_ASSERT(!hasValue());
+    return ValueTypeFromMIRType(output_.type());
+  }
+
+  operator TypedOrValueRegister() const { return output_; }
+};
+
+class MOZ_RAII AutoStubFrame {
+  BaselineCacheIRCompiler& compiler;
+#ifdef DEBUG
+  uint32_t framePushedAtEnterStubFrame_;
+#endif
+
+ public:
+  explicit AutoStubFrame(BaselineCacheIRCompiler& compiler);
+  AutoStubFrame(const AutoStubFrame&) = delete;
+  void operator=(const AutoStubFrame&) = delete;
+
+  void enter(MacroAssembler& masm, Register scratch);
+  void leave(MacroAssembler& masm);
+  void pushInlinedICScript(MacroAssembler& masm, Address icScriptAddr);
+  void storeTracedValue(MacroAssembler& masm, ValueOperand val);
+  void loadTracedValue(MacroAssembler& masm, uint8_t slotIndex,
+                       ValueOperand result);
+
+#ifdef DEBUG
+  ~AutoStubFrame();
+#endif
+};
+class MOZ_RAII AutoSaveLiveRegisters {
+  IonCacheIRCompiler& compiler_;
+
+ public:
+  explicit AutoSaveLiveRegisters(IonCacheIRCompiler& compiler);
+
+  AutoSaveLiveRegisters(const AutoSaveLiveRegisters&) = delete;
+  void operator=(const AutoSaveLiveRegisters&) = delete;
+
+  ~AutoSaveLiveRegisters();
+};
+class MOZ_RAII AutoScratchRegisterMaybeOutput {
+  mozilla::Maybe<AutoScratchRegister> scratch_;
+  Register scratchReg_;
+
+ public:
+  AutoScratchRegisterMaybeOutput(CacheRegisterAllocator& alloc,
+                                 MacroAssembler& masm,
+                                 const AutoOutputRegister& output) {
+    scratchReg_ = output.maybeReg();
+    if (scratchReg_ == InvalidReg) {
+      scratch_.emplace(alloc, masm);
+      scratchReg_ = scratch_.ref();
+    }
+  }
+  AutoScratchRegisterMaybeOutput(CacheRegisterAllocator& alloc,
+                                 MacroAssembler& masm) {
+    scratch_.emplace(alloc, masm);
+    scratchReg_ = scratch_.ref();
+  }
+  AutoScratchRegisterMaybeOutput(const AutoScratchRegisterMaybeOutput&) =
+      delete;
+  void operator=(const AutoScratchRegisterMaybeOutput&) = delete;
+
+  Register get() const { return scratchReg_; }
+  operator Register() const { return scratchReg_; }
+};
+
+class MOZ_RAII AutoScratchRegisterMaybeOutputType {
+  mozilla::Maybe<AutoScratchRegister> scratch_;
+  Register scratchReg_;
+
+ public:
+  AutoScratchRegisterMaybeOutputType(CacheRegisterAllocator& alloc,
+                                     MacroAssembler& masm,
+                                     const AutoOutputRegister& output) {
+#if defined(JS_NUNBOX32)
+    scratchReg_ = output.hasValue() ? output.valueReg().typeReg() : InvalidReg;
+#else
+    scratchReg_ = InvalidReg;
+#endif
+    if (scratchReg_ == InvalidReg) {
+      scratch_.emplace(alloc, masm);
+      scratchReg_ = scratch_.ref();
+    }
+  }
+
+  AutoScratchRegisterMaybeOutputType(
+      const AutoScratchRegisterMaybeOutputType&) = delete;
+
+  void operator=(const AutoScratchRegisterMaybeOutputType&) = delete;
+
+  Register get() const { return scratchReg_; }
+  operator Register() const { return scratchReg_; }
+};
+
+
+class MOZ_RAII AutoCallVM {
+  MacroAssembler& masm_;
+  CacheIRCompiler* compiler_;
+  CacheRegisterAllocator& allocator_;
+  mozilla::Maybe<AutoOutputRegister> output_;
+
+  mozilla::Maybe<AutoStubFrame> stubFrame_;
+  mozilla::Maybe<AutoScratchRegisterMaybeOutput> scratch_;
+
+  mozilla::Maybe<AutoSaveLiveRegisters> save_;
+
+  void storeResult(JSValueType returnType);
+
+  template <typename Fn>
+  void storeResult();
+
+  void leaveBaselineStubFrame();
+
+ public:
+  AutoCallVM(MacroAssembler& masm, CacheIRCompiler* compiler,
+             CacheRegisterAllocator& allocator);
+
+  void prepare();
+
+  template <typename Fn, Fn fn>
+  void call() {
+    compiler_->callVM<Fn, fn>(masm_);
+    storeResult<Fn>();
+    leaveBaselineStubFrame();
+  }
+
+  template <typename Fn, Fn fn>
+  void callNoResult() {
+    compiler_->callVM<Fn, fn>(masm_);
+    leaveBaselineStubFrame();
+  }
+
+  const AutoOutputRegister& output() const { return *output_; }
+  ValueOperand outputValueReg() const { return output_->valueReg(); }
+};
+
+class MOZ_RAII AutoScratchFloatRegister {
+  Label failurePopReg_{};
+  CacheIRCompiler* compiler_;
+  FailurePath* failure_;
+
+ public:
+  explicit AutoScratchFloatRegister(CacheIRCompiler* compiler)
+      : AutoScratchFloatRegister(compiler, nullptr) {}
+
+  AutoScratchFloatRegister(CacheIRCompiler* compiler, FailurePath* failure);
+
+  ~AutoScratchFloatRegister();
+
+  AutoScratchFloatRegister(const AutoScratchFloatRegister&) = delete;
+  void operator=(const AutoScratchFloatRegister&) = delete;
+
+  Label* failure();
+
+  FloatRegister get() const { return FloatReg0; }
+  operator FloatRegister() const { return FloatReg0; }
+};
+
+class MOZ_RAII AutoAvailableFloatRegister {
+  FloatRegister reg_;
+
+ public:
+  explicit AutoAvailableFloatRegister(CacheIRCompiler& compiler,
+                                      FloatRegister reg)
+      : reg_(reg) {
+#ifdef DEBUG
+    compiler.assertFloatRegisterAvailable(reg);
+#endif
+  }
+  AutoAvailableFloatRegister(const AutoAvailableFloatRegister&) = delete;
+  void operator=(const AutoAvailableFloatRegister&) = delete;
+
+  FloatRegister get() const { return reg_; }
+  operator FloatRegister() const { return reg_; }
+};
+
+template <StubField::Type type>
+struct MapStubFieldToType {};
+template <>
+struct MapStubFieldToType<StubField::Type::Shape> {
+  using RawType = Shape*;
+  using WrappedType = GCPtr<Shape*>;
+};
+template <>
+struct MapStubFieldToType<StubField::Type::WeakShape> {
+  using RawType = Shape*;
+  using WrappedType = WeakHeapPtr<Shape*>;
+};
+template <>
+struct MapStubFieldToType<StubField::Type::JSObject> {
+  using RawType = JSObject*;
+  using WrappedType = GCPtr<JSObject*>;
+};
+template <>
+struct MapStubFieldToType<StubField::Type::WeakObject> {
+  using RawType = JSObject*;
+  using WrappedType = WeakHeapPtr<JSObject*>;
+};
+template <>
+struct MapStubFieldToType<StubField::Type::Symbol> {
+  using RawType = JS::Symbol*;
+  using WrappedType = GCPtr<JS::Symbol*>;
+};
+template <>
+struct MapStubFieldToType<StubField::Type::String> {
+  using RawType = JSString*;
+  using WrappedType = GCPtr<JSString*>;
+};
+template <>
+struct MapStubFieldToType<StubField::Type::WeakBaseScript> {
+  using RawType = BaseScript*;
+  using WrappedType = WeakHeapPtr<BaseScript*>;
+};
+template <>
+struct MapStubFieldToType<StubField::Type::JitCode> {
+  using RawType = JitCode*;
+  using WrappedType = GCPtr<JitCode*>;
+};
+template <>
+struct MapStubFieldToType<StubField::Type::Id> {
+  using RawType = jsid;
+  using WrappedType = GCPtr<jsid>;
+};
+template <>
+struct MapStubFieldToType<StubField::Type::Value> {
+  using RawType = Value;
+  using WrappedType = GCPtr<Value>;
+};
+template <>
+struct MapStubFieldToType<StubField::Type::WeakValue> {
+  using RawType = Value;
+  using WrappedType = WeakHeapPtr<Value>;
+};
+
+class CacheIRStubInfo {
+  uint32_t codeLength_;
+  CacheKind kind_;
+  ICStubEngine engine_;
+  uint8_t stubDataOffset_;
+  bool makesGCCalls_;
+
+  CacheIRStubInfo(CacheKind kind, ICStubEngine engine, bool makesGCCalls,
+                  uint32_t stubDataOffset, uint32_t codeLength)
+      : codeLength_(codeLength),
+        kind_(kind),
+        engine_(engine),
+        stubDataOffset_(stubDataOffset),
+        makesGCCalls_(makesGCCalls) {
+    MOZ_ASSERT(kind_ == kind, "Kind must fit in bitfield");
+    MOZ_ASSERT(engine_ == engine, "Engine must fit in bitfield");
+    MOZ_ASSERT(stubDataOffset_ == stubDataOffset,
+               "stubDataOffset must fit in uint8_t");
+  }
+
+ public:
+  CacheKind kind() const { return kind_; }
+  ICStubEngine engine() const { return engine_; }
+  bool makesGCCalls() const { return makesGCCalls_; }
+
+  CacheIRStubInfo(const CacheIRStubInfo&) = delete;
+  CacheIRStubInfo& operator=(const CacheIRStubInfo&) = delete;
+
+  const uint8_t* code() const {
+    return reinterpret_cast<const uint8_t*>(this) + sizeof(CacheIRStubInfo);
+  }
+  uint32_t codeLength() const { return codeLength_; }
+  uint32_t stubDataOffset() const { return stubDataOffset_; }
+
+  size_t stubDataSize() const;
+
+  StubField::Type fieldType(uint32_t i) const {
+    static_assert(sizeof(StubField::Type) == sizeof(uint8_t));
+    const uint8_t* fieldTypes = code() + codeLength_;
+    return static_cast<StubField::Type>(fieldTypes[i]);
+  }
+
+  static CacheIRStubInfo* New(CacheKind kind, ICStubEngine engine,
+                              bool canMakeCalls, uint32_t stubDataOffset,
+                              const CacheIRWriter& writer);
+
+  template <class Stub, StubField::Type type>
+  typename MapStubFieldToType<type>::WrappedType& getStubField(
+      Stub* stub, uint32_t offset) const;
+
+  template <class Stub, class T>
+  T* getPtrStubField(Stub* stub, uint32_t offset) const;
+
+  template <StubField::Type type>
+  typename MapStubFieldToType<type>::WrappedType& getStubField(
+      ICCacheIRStub* stub, uint32_t offset) const {
+    return getStubField<ICCacheIRStub, type>(stub, offset);
+  }
+
+  uintptr_t getStubRawWord(const uint8_t* stubData, uint32_t offset) const {
+    MOZ_ASSERT(uintptr_t(stubData + offset) % sizeof(uintptr_t) == 0);
+    return *reinterpret_cast<const uintptr_t*>(stubData + offset);
+  }
+
+  uintptr_t getStubRawWord(ICCacheIRStub* stub, uint32_t offset) const {
+    uint8_t* stubData = (uint8_t*)stub + stubDataOffset_;
+    return getStubRawWord(stubData, offset);
+  }
+
+  int32_t getStubRawInt32(const uint8_t* stubData, uint32_t offset) const {
+    MOZ_ASSERT(uintptr_t(stubData + offset) % sizeof(int32_t) == 0);
+    return *reinterpret_cast<const int32_t*>(stubData + offset);
+  }
+
+  int32_t getStubRawInt32(ICCacheIRStub* stub, uint32_t offset) const {
+    uint8_t* stubData = (uint8_t*)stub + stubDataOffset_;
+    return getStubRawInt32(stubData, offset);
+  }
+
+  int64_t getStubRawInt64(const uint8_t* stubData, uint32_t offset) const {
+    MOZ_ASSERT(uintptr_t(stubData + offset) % sizeof(int64_t) == 0);
+    return *reinterpret_cast<const int64_t*>(stubData + offset);
+  }
+
+  int64_t getStubRawInt64(ICCacheIRStub* stub, uint32_t offset) const {
+    uint8_t* stubData = (uint8_t*)stub + stubDataOffset_;
+    return getStubRawInt64(stubData, offset);
+  }
+
+  void replaceStubRawWord(uint8_t* stubData, uint32_t offset, uintptr_t oldWord,
+                          uintptr_t newWord) const;
+
+  void replaceStubRawValueBits(uint8_t* stubData, uint32_t offset,
+                               uint64_t oldBits, uint64_t newBits) const;
+};
+
+template <typename T>
+void TraceCacheIRStub(JSTracer* trc, T* stub, const CacheIRStubInfo* stubInfo);
+
+template <typename T>
+bool TraceWeakCacheIRStub(JSTracer* trc, T* stub,
+                          const CacheIRStubInfo* stubInfo);
+
+}  
+}  
+
+#endif /* jit_CacheIRCompiler_h */

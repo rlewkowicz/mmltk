@@ -1,0 +1,80 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_HTMLDetailsElement_h
+#define mozilla_dom_HTMLDetailsElement_h
+
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/Attributes.h"
+#include "nsGenericHTMLElement.h"
+
+namespace mozilla::dom {
+
+class HTMLSummaryElement;
+
+class HTMLDetailsElement final : public nsGenericHTMLElement {
+ public:
+  using NodeInfo = mozilla::dom::NodeInfo;
+  using Element::Command;
+
+  explicit HTMLDetailsElement(already_AddRefed<NodeInfo> aNodeInfo);
+
+  NS_IMPL_FROMNODE_HTML_WITH_TAG(HTMLDetailsElement, details)
+
+  HTMLSummaryElement* GetFirstSummary() const;
+
+  nsresult Clone(NodeInfo* aNodeInfo, nsINode** aResult) const override;
+
+  void AfterSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                    const nsAttrValue* aValue, const nsAttrValue* aOldValue,
+                    nsIPrincipal* aMaybeScriptedPrincipal,
+                    bool aNotify) override;
+
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+
+  bool IsInteractiveHTMLContent() const override { return true; }
+
+
+  void SetName(const nsAString& aName, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::name, aName, aRv);
+  }
+
+  void GetName(nsAString& aName) { GetHTMLAttr(nsGkAtoms::name, aName); }
+
+  bool Open() const { return GetBoolAttr(nsGkAtoms::open); }
+
+  void SetOpen(bool aOpen, ErrorResult& aError) {
+    SetHTMLBoolAttr(nsGkAtoms::open, aOpen, aError);
+  }
+
+  void ToggleOpen() { SetOpen(!Open(), IgnoreErrors()); }
+
+  void AsyncEventRunning(AsyncEventDispatcher* aEvent) override;
+
+  bool IsValidCommandAction(Command aCommand) const override;
+  MOZ_CAN_RUN_SCRIPT bool HandleCommandInternal(Element* aSource,
+                                                Command aCommand,
+                                                ErrorResult& aRv) override;
+
+ protected:
+  virtual ~HTMLDetailsElement();
+  void SetupShadowTree();
+  void GetSlotNameFor(const ShadowRoot&, const nsIContent&,
+                      nsAString&) const override;
+  void OnChildBeforeSlotted(ShadowRoot&, nsIContent&) override;
+  void OnChildUnslotted(ShadowRoot&, nsIContent&) override;
+
+  void CloseElementIfNeeded();
+
+  void CloseOtherElementsIfNeeded();
+
+  JSObject* WrapNode(JSContext* aCx,
+                     JS::Handle<JSObject*> aGivenProto) override;
+
+  RefPtr<AsyncEventDispatcher> mToggleEventDispatcher;
+};
+
+}  
+
+#endif /* mozilla_dom_HTMLDetailsElement_h */

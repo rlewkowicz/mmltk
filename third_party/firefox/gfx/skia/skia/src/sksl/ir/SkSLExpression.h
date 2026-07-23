@@ -1,0 +1,106 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_EXPRESSION)
+#define SKSL_EXPRESSION
+
+#include "include/core/SkTypes.h"
+#include "src/sksl/SkSLPosition.h"
+#include "src/sksl/ir/SkSLIRNode.h"
+#include "src/sksl/ir/SkSLType.h"
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+
+namespace SkSL {
+
+class AnyConstructor;
+class Context;
+enum class OperatorPrecedence : uint8_t;
+
+class Expression : public IRNode {
+public:
+    using Kind = ExpressionKind;
+
+    Expression(Position pos, Kind kind, const Type* type)
+        : INHERITED(pos, (int) kind)
+        , fType(type) {
+        SkASSERT(kind >= Kind::kFirst && kind <= Kind::kLast);
+    }
+
+    Kind kind() const {
+        return (Kind)fKind;
+    }
+
+    const Type& type() const {
+        return *fType;
+    }
+
+    bool isAnyConstructor() const {
+        static_assert((int)Kind::kConstructorArray - 1 == (int)Kind::kChildCall);
+        static_assert((int)Kind::kConstructorStruct + 1 == (int)Kind::kEmpty);
+        return this->kind() >= Kind::kConstructorArray && this->kind() <= Kind::kConstructorStruct;
+    }
+
+    bool isIntLiteral() const {
+        return this->kind() == Kind::kLiteral && this->type().isInteger();
+    }
+
+    bool isFloatLiteral() const {
+        return this->kind() == Kind::kLiteral && this->type().isFloat();
+    }
+
+    bool isBoolLiteral() const {
+        return this->kind() == Kind::kLiteral && this->type().isBoolean();
+    }
+
+    AnyConstructor& asAnyConstructor();
+    const AnyConstructor& asAnyConstructor() const;
+
+    bool isIncomplete(const Context& context) const;
+
+    enum class ComparisonResult {
+        kUnknown = -1,
+        kNotEqual,
+        kEqual
+    };
+    virtual ComparisonResult compareConstant(const Expression& other) const {
+        return ComparisonResult::kUnknown;
+    }
+
+    CoercionCost coercionCost(const Type& target) const {
+        return this->type().coercionCost(target);
+    }
+
+    virtual bool supportsConstantValues() const {
+        return false;
+    }
+
+    virtual std::optional<double> getConstantValue(int n) const {
+        SkASSERT(!this->supportsConstantValues());
+        return std::nullopt;
+    }
+
+    virtual std::unique_ptr<Expression> clone(Position pos) const = 0;
+
+    std::unique_ptr<Expression> clone() const { return this->clone(fPosition); }
+
+    std::string description() const final;
+    virtual std::string description(OperatorPrecedence parentPrecedence) const = 0;
+
+
+private:
+    const Type* fType;
+
+    using INHERITED = IRNode;
+};
+
+}  
+
+#endif

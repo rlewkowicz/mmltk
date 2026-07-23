@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_AbortFollower_h
+#define mozilla_dom_AbortFollower_h
+
+#include "jsapi.h"
+#include "mozilla/WeakPtr.h"
+#include "nsISupportsImpl.h"
+#include "nsTObserverArray.h"
+
+namespace mozilla::dom {
+
+enum class SignalAborted { No, Yes };
+
+class AbortSignal;
+class AbortSignalImpl;
+
+class AbortFollower : public nsISupports {
+ public:
+  virtual void RunAbortAlgorithm() = 0;
+
+  void Follow(AbortSignalImpl* aSignal);
+
+  void Unfollow();
+
+  bool IsFollowing() const;
+
+  AbortSignalImpl* Signal() const { return mFollowingSignal; }
+
+ protected:
+  virtual ~AbortFollower();
+
+  friend class AbortSignalImpl;
+
+  WeakPtr<AbortSignalImpl> mFollowingSignal;
+};
+
+class AbortSignalImpl : public nsISupports, public SupportsWeakPtr {
+ public:
+  explicit AbortSignalImpl(SignalAborted aAborted,
+                           JS::Handle<JS::Value> aReason);
+
+  bool Aborted() const;
+
+  void GetReason(JSContext* aCx, JS::MutableHandle<JS::Value> aReason);
+  JS::Value RawReason() const;
+
+  void SignalAbort(JS::Handle<JS::Value> aReason);
+
+ protected:
+  static void Traverse(AbortSignalImpl* aSignal,
+                       nsCycleCollectionTraversalCallback& cb);
+
+  static void Unlink(AbortSignalImpl* aSignal);
+
+  virtual ~AbortSignalImpl() { UnlinkFollowers(); }
+
+  virtual void SignalAbortWithDependents();
+
+  virtual void RunAbortSteps();
+
+  void SetAborted(JS::Handle<JS::Value> aReason);
+
+  JS::Heap<JS::Value> mReason;
+
+ private:
+  friend class AbortFollower;
+
+  void MaybeAssignAbortError(JSContext* aCx);
+
+  void UnlinkFollowers();
+
+  nsTObserverArray<RefPtr<AbortFollower>> mFollowers;
+
+  SignalAborted mAborted;
+};
+
+}  
+
+#endif  // mozilla_dom_AbortFollower_h

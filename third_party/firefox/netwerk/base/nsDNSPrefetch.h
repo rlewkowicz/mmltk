@@ -1,0 +1,71 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsDNSPrefetch_h_
+#define nsDNSPrefetch_h_
+
+#include <functional>
+
+#include "nsIWeakReferenceUtils.h"
+#include "nsString.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/BasePrincipal.h"
+
+#include "nsIDNSListener.h"
+#include "nsIRequest.h"
+#include "nsIDNSService.h"
+
+class nsIURI;
+class nsIDNSHTTPSSVCRecord;
+
+class nsDNSPrefetch final : public nsIDNSListener {
+  ~nsDNSPrefetch() = default;
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIDNSLISTENER
+
+  nsDNSPrefetch(nsIURI* aURI, mozilla::OriginAttributes& aOriginAttributes,
+                nsIRequest::TRRMode aTRRMode, nsIDNSListener* aListener,
+                bool storeTiming);
+  nsDNSPrefetch(nsIURI* aURI, mozilla::OriginAttributes& aOriginAttributes,
+                nsIRequest::TRRMode aTRRMode);
+  bool TimingsValid() const {
+    return !mStartTimestamp.IsNull() && !mEndTimestamp.IsNull();
+  }
+  const mozilla::TimeStamp& StartTimestamp() const { return mStartTimestamp; }
+  const mozilla::TimeStamp& EndTimestamp() const { return mEndTimestamp; }
+
+  static nsresult Initialize(nsIDNSService* aDNSService);
+  static nsresult Shutdown();
+
+  nsresult PrefetchHigh(
+      nsIDNSService::DNSFlags = nsIDNSService::RESOLVE_DEFAULT_FLAGS);
+  nsresult PrefetchMedium(
+      nsIDNSService::DNSFlags = nsIDNSService::RESOLVE_DEFAULT_FLAGS);
+  nsresult PrefetchLow(
+      nsIDNSService::DNSFlags = nsIDNSService::RESOLVE_DEFAULT_FLAGS);
+
+  nsresult PrefetchHighPerFamily(nsIDNSService::DNSFlags aFlags, bool aSkipIPv4,
+                                 bool aSkipIPv6);
+
+  nsresult FetchHTTPSSVC(
+      bool aRefreshDNS, bool aPrefetch,
+      std::function<void(nsIDNSHTTPSSVCRecord*)>&& aCallback);
+
+ private:
+  nsCString mHostname;
+  int32_t mPort{-1};
+  mozilla::OriginAttributes mOriginAttributes;
+  bool mStoreTiming;
+  nsIRequest::TRRMode mTRRMode;
+  mozilla::TimeStamp mStartTimestamp;
+  mozilla::TimeStamp mEndTimestamp;
+  nsWeakPtr mListener;
+  bool mLookupCompleted{false};
+
+  nsresult Prefetch(nsIDNSService::DNSFlags flags);
+};
+
+#endif

@@ -1,0 +1,44 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_QUOTA_NORMALORIGINOPERATIONBASE_H_
+#define DOM_QUOTA_NORMALORIGINOPERATIONBASE_H_
+
+#include "OriginOperationBase.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/dom/quota/CheckedUnsafePtr.h"
+
+namespace mozilla::dom::quota {
+
+class NormalOriginOperationBase
+    : public OriginOperationBase,
+      public SupportsCheckedUnsafePtr<CheckIf<DiagnosticAssertEnabled>> {
+ public:
+  const Atomic<bool>& Canceled() const { return mCanceled; }
+
+  bool Cancel() { return mCanceled.exchange(true); }
+
+ protected:
+  NormalOriginOperationBase(MovingNotNull<RefPtr<QuotaManager>> aQuotaManager,
+                            const char* aName);
+
+  ~NormalOriginOperationBase();
+
+  virtual RefPtr<BoolPromise> OpenDirectory() = 0;
+
+  virtual void SendResults() = 0;
+
+  virtual void CloseDirectory() = 0;
+
+ private:
+  virtual RefPtr<BoolPromise> Open() override;
+
+  virtual void UnblockOpen() override;
+
+  mozilla::Atomic<bool> mCanceled;
+};
+
+}  
+
+#endif  // DOM_QUOTA_NORMALORIGINOPERATIONBASE_H_

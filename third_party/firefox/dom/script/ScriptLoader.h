@@ -1,0 +1,648 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ScriptLoader_h
+#define mozilla_dom_ScriptLoader_h
+
+#include "ModuleLoader.h"
+#include "SharedScriptCache.h"
+#include "js/TypeDecls.h"
+#include "js/Utility.h"                     // JS::FreePolicy
+#include "js/experimental/CompileScript.h"  // JS::FrontendContext
+#include "js/loader/LoadedScript.h"
+#include "js/loader/ModuleLoaderBase.h"
+#include "js/loader/ScriptKind.h"
+#include "js/loader/ScriptLoadRequest.h"
+#include "js/loader/ScriptLoadRequestList.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/MaybeOneOf.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/dom/ScriptLoadContext.h"
+#include "mozilla/dom/ScriptLoadRequestType.h"
+#include "nsCOMArray.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsILoadInfo.h"  // nsSecurityFlags
+#include "nsINode.h"
+#include "nsIObserver.h"
+#include "nsIScriptElement.h"
+#include "nsIScriptLoaderObserver.h"
+#include "nsRefPtrHashtable.h"
+#include "nsTArray.h"
+#include "nsURIHashKey.h"
+
+class nsCycleCollectionTraversalCallback;
+class nsIChannel;
+class nsIConsoleReportCollector;
+class nsIContent;
+class nsIIncrementalStreamLoader;
+class nsIPrincipal;
+class nsIScriptGlobalObject;
+class nsITimer;
+class nsIURI;
+
+namespace JS {
+
+class CompileOptions;
+
+template <typename UnitT>
+class SourceText;
+
+namespace loader {
+
+class LoadedScript;
+class ModuleLoadRequest;
+class ModuleScript;
+class ScriptLoadRequest;
+
+}  
+}  
+
+namespace mozilla {
+
+class LazyLogModule;
+union Utf8Unit;
+
+namespace dom {
+
+class AutoJSAPI;
+class DocGroup;
+class Document;
+class ModuleLoader;
+class SRICheckDataVerifier;
+class SRIMetadata;
+class ScriptLoadHandler;
+class ScriptLoadContext;
+class ScriptLoader;
+class ScriptRequestProcessor;
+
+enum class ReferrerPolicy : uint8_t;
+enum class RequestPriority : uint8_t;
+
+class ShutdownAndMemoryPressureObserver final : public nsIObserver {
+  ~ShutdownAndMemoryPressureObserver() { Unregister(); }
+
+ public:
+  explicit ShutdownAndMemoryPressureObserver(ScriptLoader* aLoader)
+      : mScriptLoader(aLoader) {}
+
+  void OnShutdown();
+  void OnMemoryPressure();
+  void Unregister();
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+ private:
+  ScriptLoader* mScriptLoader;
+};
+
+
+class ScriptLoader final : public JS::loader::ScriptLoaderInterface {
+  class MOZ_STACK_CLASS AutoCurrentScriptUpdater {
+   public:
+    AutoCurrentScriptUpdater(ScriptLoader* aScriptLoader,
+                             nsIScriptElement* aCurrentScript)
+        : mOldScript(aScriptLoader->mCurrentScript),
+          mScriptLoader(aScriptLoader) {
+      nsCOMPtr<nsINode> node = do_QueryInterface(aCurrentScript);
+      mScriptLoader->mCurrentScript =
+          node && !node->IsInShadowTree() ? aCurrentScript : nullptr;
+    }
+
+    ~AutoCurrentScriptUpdater() {
+      mScriptLoader->mCurrentScript.swap(mOldScript);
+    }
+
+   private:
+    nsCOMPtr<nsIScriptElement> mOldScript;
+    ScriptLoader* mScriptLoader;
+  };
+
+  friend class JS::loader::ModuleLoadRequest;
+  friend class ScriptRequestProcessor;
+  friend class ModuleLoader;
+  friend class ScriptLoadHandler;
+  friend class AutoCurrentScriptUpdater;
+
+ public:
+  using MaybeSourceText =
+      mozilla::MaybeOneOf<JS::SourceText<char16_t>, JS::SourceText<Utf8Unit>>;
+  using ScriptLoadRequest = JS::loader::ScriptLoadRequest;
+
+  explicit ScriptLoader(Document* aDocument);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(ScriptLoader)
+
+  void SetGlobalObject(nsIGlobalObject* aGlobalObject);
+
+  void DropDocumentReference();
+
+  void RegisterToCache();
+
+  void DeregisterFromCache();
+
+  nsIPrincipal* LoaderPrincipal() const;
+  nsIPrincipal* PartitionedPrincipal() const;
+
+  bool ShouldBypassCache() const;
+
+#ifdef NIGHTLY_BUILD
+  bool WAICTHandlesScripts() const;
+#endif
+
+  template <typename T>
+  bool HasLoaded(const T& aKey) {
+    return false;
+  }
+
+  nsresult AddObserver(nsIScriptLoaderObserver* aObserver) {
+    return mObservers.AppendObject(aObserver) ? NS_OK : NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  void RemoveObserver(nsIScriptLoaderObserver* aObserver) {
+    mObservers.RemoveObject(aObserver);
+  }
+
+  bool ProcessScriptElement(nsIScriptElement* aElement,
+                            const nsAString& aSourceText);
+
+  nsIScriptElement* GetCurrentScript() { return mCurrentScript; }
+
+  void ContinueParsingDocumentAfterCurrentScript() {
+    MOZ_ASSERT(mCurrentScript);
+    mContinueParsingDocumentAfterCurrentScript = true;
+  }
+
+  nsIScriptElement* GetCurrentParserInsertedScript() {
+    return mCurrentParserInsertedScript;
+  }
+
+  bool GetEnabled() { return mEnabled; }
+
+  void SetEnabled(bool aEnabled) {
+    if (!mEnabled && aEnabled) {
+      ProcessPendingRequestsAsync();
+    }
+    mEnabled = aEnabled;
+  }
+
+  ModuleLoader* GetModuleLoader() { return mModuleLoader; }
+
+  bool SpeculativeOMTParsingEnabled() const {
+    return mSpeculativeOMTParsingEnabled;
+  }
+
+  void AddParserBlockingScriptExecutionBlocker() {
+    ++mParserBlockingBlockerCount;
+  }
+
+  void RemoveParserBlockingScriptExecutionBlocker() {
+    if (!--mParserBlockingBlockerCount && ReadyToExecuteScripts()) {
+      ProcessPendingRequestsAsync();
+    }
+  }
+
+  void AddExecuteBlocker() { ++mBlockerCount; }
+
+  void RemoveExecuteBlocker() {
+    MOZ_ASSERT(mBlockerCount);
+    if (!--mBlockerCount) {
+      ProcessPendingRequestsAsync();
+    }
+  }
+
+  static nsresult ConvertToUTF16(nsIChannel* aChannel, const uint8_t* aData,
+                                 uint32_t aLength,
+                                 const nsAString& aHintCharset,
+                                 Document* aDocument,
+                                 UniquePtr<char16_t[], JS::FreePolicy>& aBufOut,
+                                 size_t& aLengthOut);
+
+  static nsresult ConvertToUTF8(nsIChannel* aChannel, const uint8_t* aData,
+                                uint32_t aLength, const nsAString& aHintCharset,
+                                Document* aDocument,
+                                UniquePtr<Utf8Unit[], JS::FreePolicy>& aBufOut,
+                                size_t& aLengthOut);
+
+  nsresult OnStreamComplete(nsIChannel* aChannel, ScriptLoadRequest* aRequest,
+                            nsresult aChannelStatus, nsresult aSRIStatus,
+                            SRICheckDataVerifier* aSRIDataVerifier);
+
+  bool HasPendingRequests() const;
+
+  bool HasPendingDynamicImports() const;
+
+  void ProcessPendingRequests(bool aAllowBypassingParserBlocking = false);
+
+  void BeginDeferringScripts();
+
+  void ParsingComplete(bool aTerminated);
+
+  void DeferCheckpointReached();
+
+  uint32_t HasPendingOrCurrentScripts() {
+    return mCurrentScript || mParserBlockingRequest;
+  }
+
+  void PreloadURI(nsIURI* aURI, const nsAString& aCharset,
+                  const nsAString& aType, const nsAString& aCrossOrigin,
+                  const nsAString& aNonce, const nsAString& aFetchPriority,
+                  const nsAString& aIntegrity, bool aScriptFromHead,
+                  bool aAsync, bool aDefer, bool aLinkPreload,
+                  const ReferrerPolicy aReferrerPolicy,
+                  uint64_t aEarlyHintPreloaderId);
+
+  nsresult ProcessOffThreadRequest(ScriptLoadRequest* aRequest);
+
+  bool AddPendingChildLoader(ScriptLoader* aChild) {
+    mPendingChildLoaders.AppendElement(aChild);
+    return true;
+  }
+
+  mozilla::dom::DocGroup* GetDocGroup() const;
+
+  void LoadEventFired();
+
+  void Destroy();
+
+  void OnMemoryPressure();
+
+  static JS::loader::ScriptFetchInfo* GetActiveScriptFetchInfo(JSContext* aCx);
+
+  Document* GetDocument() const { return mDocument; }
+
+  nsIURI* GetBaseURI() const override;
+
+ private:
+  ~ScriptLoader();
+
+  already_AddRefed<ScriptLoadRequest> CreateLoadRequest(
+      JS::loader::ScriptKind aKind, nsIURI* aURI, nsIScriptElement* aElement,
+      const nsAString& aScriptContent, nsIPrincipal* aTriggeringPrincipal,
+      mozilla::CORSMode aCORSMode, const nsAString& aNonce,
+      RequestPriority aRequestPriority, const SRIMetadata& aIntegrity,
+      ReferrerPolicy aReferrerPolicy,
+      JS::loader::ParserMetadata aParserMetadata,
+      ScriptLoadRequestType aRequestType);
+
+  void TryUseCache(
+      ReferrerPolicy aReferrerPolicy, ScriptFetchOptions* aFetchOptions,
+      nsIURI* aURI, ScriptLoadRequest* aRequest,
+      nsIScriptElement* aElement = nullptr, const nsAString& aNonce = u""_ns,
+      ScriptLoadRequestType aRequestType = ScriptLoadRequestType::External);
+
+  void EmulateNetworkEvents(ScriptLoadRequest* aRequest,
+                            const Maybe<nsAutoString>& aCharsetForPreload);
+
+  void NotifyObserversForCachedScript(
+      ScriptLoadRequest* aRequest,
+      const Maybe<nsAutoString>& aCharsetForPreload);
+
+  void UnblockParser(ScriptLoadRequest* aParserBlockingRequest);
+
+  void ContinueParserAsync(ScriptLoadRequest* aParserBlockingRequest);
+
+  bool ProcessExternalScript(nsIScriptElement* aElement,
+                             JS::loader::ScriptKind aScriptKind,
+                             nsIContent* aScriptContent);
+
+  bool ProcessInlineScript(nsIScriptElement* aElement,
+                           JS::loader::ScriptKind aScriptKind,
+                           const nsAString& aSourceText);
+
+  enum class CacheBehavior : uint8_t {
+    DoNothingDisabled,
+    DoNothingExisting,
+    Insert,
+    Evict,
+  };
+
+  CacheBehavior GetCacheBehavior(ScriptLoadRequest* aRequest);
+
+  void TryCacheRequest(ScriptLoadRequest* aRequest);
+
+  JS::loader::ScriptLoadRequest* LookupPreloadRequest(
+      nsIScriptElement* aElement, JS::loader::ScriptKind aScriptKind,
+      const SRIMetadata& aSRIMetadata);
+
+  void GetSRIMetadata(const nsAString& aIntegrityAttr,
+                      SRIMetadata* aMetadataOut);
+
+  ReferrerPolicy GetReferrerPolicy(nsIScriptElement* aElement);
+
+  nsresult CheckContentPolicy(nsIScriptElement* aElement,
+                              const nsAString& aNonce,
+                              ScriptLoadRequest* aRequest,
+                              ScriptFetchOptions* aFetchOptions, nsIURI* aURI);
+
+  static bool IsAboutPageLoadingChromeURI(ScriptLoadRequest* aRequest,
+                                          Document* aDocument);
+
+  nsresult StartLoad(ScriptLoadRequest* aRequest,
+                     const Maybe<nsAutoString>& aCharsetForPreload);
+  nsresult StartClassicLoad(ScriptLoadRequest* aRequest,
+                            const Maybe<nsAutoString>& aCharsetForPreload);
+
+  void OnDelayedReady(ScriptLoadRequest* aRequest,
+                      const Maybe<nsAutoString>& aCharsetForPreload);
+
+  static void PrepareCacheInfoChannel(nsIChannel* aChannel,
+                                      ScriptLoadRequest* aRequest);
+
+  static void PrepareRequestPriorityAndRequestDependencies(
+      nsIChannel* aChannel, ScriptLoadRequest* aRequest);
+
+  [[nodiscard]] static nsresult PrepareHttpRequestAndInitiatorType(
+      nsIChannel* aChannel, ScriptLoadRequest* aRequest,
+      const Maybe<nsAutoString>& aCharsetForPreload);
+
+  [[nodiscard]] nsresult PrepareIncrementalStreamLoader(
+      nsIIncrementalStreamLoader** aOutLoader, nsIChannel* aChannel,
+      ScriptLoadRequest* aRequest);
+
+  nsresult StartLoadInternal(ScriptLoadRequest* aRequest,
+                             nsSecurityFlags securityFlags,
+                             const Maybe<nsAutoString>& aCharsetForPreload);
+
+  nsresult RestartLoad(ScriptLoadRequest* aRequest);
+
+  void HandleLoadError(ScriptLoadRequest* aRequest, nsresult aResult);
+
+  void HandleLoadErrorAndProcessPendingRequests(ScriptLoadRequest* aRequest,
+                                                nsresult aResult);
+
+  void ProcessPendingRequestsAsync();
+
+  void ProcessPendingRequestsAsyncBypassParserBlocking();
+
+  bool ReadyToExecuteParserBlockingScripts();
+
+  bool SelfReadyToExecuteParserBlockingScripts() {
+    return ReadyToExecuteScripts() && !mParserBlockingBlockerCount;
+  }
+
+  bool ReadyToExecuteScripts() { return mEnabled && !mBlockerCount; }
+
+  nsresult VerifySRI(ScriptLoadRequest* aRequest, nsIChannel* aChannel,
+                     nsresult aSRIStatus,
+                     SRICheckDataVerifier* aSRIDataVerifier) const;
+
+  nsresult SaveSRIHash(ScriptLoadRequest* aRequest,
+                       SRICheckDataVerifier* aSRIDataVerifier) const;
+
+  void ReportErrorToConsole(ScriptLoadRequest* aRequest,
+                            nsresult aResult) const override;
+
+  void ReportWarningToConsole(
+      ScriptLoadRequest* aRequest, const char* aMessageName,
+      const nsTArray<nsString>& aParams = nsTArray<nsString>()) const override;
+
+  bool IsImportMapSupported() const override { return true; }
+
+  void ReportPreloadErrorsToConsole(ScriptLoadRequest* aRequest);
+
+  nsIConsoleReportCollector* GetConsoleReportCollector() const override {
+    return mReporter;
+  }
+
+  nsresult AttemptOffThreadScriptCompile(ScriptLoadRequest* aRequest,
+                                         bool* aCouldCompileOut);
+
+  nsresult CreateOffThreadTask(JSContext* aCx, ScriptLoadRequest* aRequest,
+                               JS::CompileOptions& aOptions,
+                               CompileOrDecodeTask** aCompileOrDecodeTask);
+
+  nsresult ProcessRequest(ScriptLoadRequest* aRequest);
+  nsresult CompileOffThreadOrProcessRequest(ScriptLoadRequest* aRequest);
+  void FireScriptAvailable(nsresult aResult, ScriptLoadRequest* aRequest);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void FireScriptEvaluated(
+      nsresult aResult, ScriptLoadRequest* aRequest);
+
+  nsresult EvaluateScriptElement(ScriptLoadRequest* aRequest);
+
+  bool StartCollectingDelazifications(JSContext* aCx,
+                                      JS::Handle<JSScript*> aScript,
+                                      JS::Stencil* aStencil);
+  bool StartCollectingDelazifications(JSContext* aCx,
+                                      JS::Handle<JSObject*> aModule,
+                                      JS::Stencil* aStencil);
+
+ private:
+  void AppendDelazificationCollection(JS::Handle<JSScript*> aScript);
+  void AppendDelazificationCollection(JS::Handle<JSObject*> aModule);
+
+  enum class CollectDelazifications : bool { No, Yes };
+
+  void InstantiateStencil(JSContext* aCx, JS::CompileOptions& aCompileOptions,
+                          JS::Stencil* aStencil,
+                          JS::MutableHandle<JSScript*> aScript,
+                          JS::Handle<JSScript*> aDebuggerIntroductionScript,
+                          ErrorResult& aRv,
+                          JS::InstantiationStorage* aStorage = nullptr,
+                          CollectDelazifications aCollectDelazifications =
+                              CollectDelazifications::No);
+
+ public:
+  void InstantiateClassicScriptFromAny(
+      JSContext* aCx, JS::CompileOptions& aCompileOptions,
+      ScriptLoadRequest* aRequest, JS::MutableHandle<JSScript*> aScript,
+      JS::Handle<JSScript*> aDebuggerIntroductionScript, ErrorResult& aRv);
+
+  void InstantiateClassicScriptFromMaybeEncodedSource(
+      JSContext* aCx, JS::CompileOptions& aCompileOptions,
+      ScriptLoadRequest* aRequest, JS::MutableHandle<JSScript*> aScript,
+      JS::Handle<JSScript*> aDebuggerIntroductionScript, ErrorResult& aRv);
+
+  void InstantiateClassicScriptFromCachedStencil(
+      JSContext* aCx, JS::CompileOptions& aCompileOptions,
+      ScriptLoadRequest* aRequest, JS::Stencil* aStencil,
+      JS::MutableHandle<JSScript*> aScript,
+      JS::Handle<JSScript*> aDebuggerIntroductionScript, ErrorResult& aRv);
+
+  static nsCString& BytecodeMimeTypeFor(const ScriptLoadRequest* aRequest);
+  static nsCString& BytecodeMimeTypeFor(
+      const JS::loader::LoadedScript* aLoadedScript);
+
+  nsresult MaybePrepareForDiskCacheAfterExecute(ScriptLoadRequest* aRequest,
+                                                nsresult aRv);
+
+  nsresult MaybePrepareModuleForDiskCacheAfterExecute(
+      ModuleLoadRequest* aRequest, nsresult aRv) override;
+
+  nsresult EvaluateScript(nsIGlobalObject* aGlobalObject,
+                          ScriptLoadRequest* aRequest);
+
+  void RegisterForDiskCache(ScriptLoadRequest* aRequest);
+
+  void MaybeUpdateDiskCache() override;
+
+  void UpdateDiskCache();
+
+  void StopCollectingDelazifications();
+
+ public:
+  static bool EncodeAndCompress(JS::FrontendContext* aFc,
+                                const JS::loader::LoadedScript* aLoadedScript,
+                                JS::Stencil* aStencil,
+                                const JS::TranscodeBuffer& aSRI,
+                                Vector<uint8_t>& aCompressed);
+
+  static bool SaveToDiskCache(const JS::loader::LoadedScript* aLoadedScript,
+                              const Vector<uint8_t>& aCompressed);
+
+ private:
+  void Decode(JSContext* aCx, JS::CompileOptions& aCompileOptions,
+              const JS::TranscodeRange& aRange, RefPtr<JS::Stencil>& aStencil,
+              ErrorResult& aRv);
+
+  void GiveUpDiskCaching();
+
+  already_AddRefed<nsIGlobalObject> GetGlobalForRequest(
+      ScriptLoadRequest* aRequest);
+
+  already_AddRefed<nsIScriptGlobalObject> GetScriptGlobalObject();
+
+  nsresult FillCompileOptionsForRequest(
+      JSContext* aCx, ScriptLoadRequest* aRequest, JS::CompileOptions* aOptions,
+      JS::MutableHandle<JSScript*> aIntroductionScript) override;
+
+  uint32_t NumberOfProcessors();
+  int32_t PhysicalSizeOfMemoryInGB();
+
+  nsresult PrepareLoadedRequest(ScriptLoadRequest* aRequest,
+                                nsIChannel* aChannel, nsresult aStatus);
+
+  void AddDeferRequest(ScriptLoadRequest* aRequest);
+  void AddAsyncRequest(ScriptLoadRequest* aRequest);
+  bool MaybeRemovedDeferRequests();
+
+  bool ShouldApplyDelazifyStrategy(ScriptLoadRequest* aRequest);
+  void ApplyDelazifyStrategy(JS::CompileOptions* aOptions);
+
+  bool ShouldCompileOffThread(ScriptLoadRequest* aRequest);
+
+  void MaybeMoveToLoadedList(ScriptLoadRequest* aRequest);
+
+  bool IsBeforeFCP();
+
+  bool UsesMemoryCache() const { return !!mCache; }
+
+ public:
+  struct DiskCacheStrategy {
+    bool mIsDisabled = false;
+    bool mHasSourceLengthMin = false;
+    bool mHasFetchCountMin = false;
+    uint8_t mFetchCountMin = 0;
+    size_t mSourceLengthMin = 0;
+  };
+
+  static DiskCacheStrategy GetDiskCacheStrategy();
+
+ private:
+  void CalculateCacheFlag(ScriptLoadRequest* aRequest);
+
+  void RunScriptWhenSafe(ScriptLoadRequest* aRequest);
+
+  void CancelAndClearScriptLoadRequests();
+
+  Document* mDocument;  
+  nsCOMArray<nsIScriptLoaderObserver> mObservers;
+
+  nsTArray<JS::Heap<JSScript*>> mDelazificationCollectingScripts;
+  nsTArray<JS::Heap<JSObject*>> mDelazificationCollectingModules;
+
+
+  JS::loader::ScriptLoadRequestList mNonAsyncExternalScriptInsertedRequests;
+
+  JS::loader::ScriptLoadRequestList mLoadingAsyncRequests;
+
+  JS::loader::ScriptLoadRequestList mLoadedAsyncRequests;
+
+  JS::loader::ScriptLoadRequestList mDeferRequests;
+
+  JS::loader::ScriptLoadRequestList mXSLTRequests;
+
+  RefPtr<ScriptLoadRequest> mParserBlockingRequest;
+
+  JS::loader::ScriptLoadRequestList mOffThreadCompilingRequests;
+
+  JS::loader::ScriptLoadRequestList mDiskCacheableDependencyModules;
+
+  nsTArray<RefPtr<JS::loader::LoadedScript>> mDiskCacheQueue;
+
+  struct PreloadInfo {
+    RefPtr<ScriptLoadRequest> mRequest;
+    nsString mCharset;
+  };
+
+  friend void ImplCycleCollectionUnlink(ScriptLoader::PreloadInfo& aField);
+  friend void ImplCycleCollectionTraverse(
+      nsCycleCollectionTraversalCallback& aCallback,
+      ScriptLoader::PreloadInfo& aField, const char* aName, uint32_t aFlags);
+
+  struct PreloadRequestComparator {
+    bool Equals(const PreloadInfo& aPi,
+                ScriptLoadRequest* const& aRequest) const {
+      return aRequest == aPi.mRequest;
+    }
+  };
+
+  struct PreloadURIComparator {
+    bool Equals(const PreloadInfo& aPi, nsIURI* const& aURI) const;
+  };
+
+  nsTArray<PreloadInfo> mPreloads;
+
+  nsCOMPtr<nsIScriptElement> mCurrentScript;
+  nsCOMPtr<nsIScriptElement> mCurrentParserInsertedScript;
+  nsTArray<RefPtr<ScriptLoader>> mPendingChildLoaders;
+  uint32_t mParserBlockingBlockerCount = 0;
+  uint32_t mBlockerCount = 0;
+  uint32_t mNumberOfProcessors = 0;
+  uint32_t mTotalFullParseSize = 0;
+  int32_t mPhysicalSizeOfMemory = -1;
+
+  bool mEnabled = true;
+  bool mDeferEnabled = false;
+  bool mSpeculativeOMTParsingEnabled = false;
+  bool mDeferCheckpointReached = false;
+  bool mBlockingDOMContentLoaded = false;
+  bool mLoadEventFired = false;
+  bool mGiveUpDiskCaching = false;
+  bool mContinueParsingDocumentAfterCurrentScript = false;
+  bool mHadFCPDoNotUseDirectly = false;
+
+  TimeDuration mMainThreadParseTime;
+
+  nsCOMPtr<nsIConsoleReportCollector> mReporter;
+
+  RefPtr<ShutdownAndMemoryPressureObserver> mObserver;
+
+  RefPtr<ModuleLoader> mModuleLoader;
+
+  RefPtr<SharedScriptCache> mCache;
+
+  nsCOMPtr<nsITimer> mProcessPendingRequestsAsyncBypassParserBlocking;
+
+ public:
+  static LazyLogModule gCspPRLog;
+  static LazyLogModule gScriptLoaderLog;
+};
+
+class nsAutoScriptLoaderDisabler {
+ public:
+  explicit nsAutoScriptLoaderDisabler(Document* aDoc);
+
+  ~nsAutoScriptLoaderDisabler();
+
+  bool mWasEnabled;
+  RefPtr<ScriptLoader> mLoader;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_ScriptLoader_h

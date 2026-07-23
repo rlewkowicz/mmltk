@@ -1,0 +1,63 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+#if !defined(SkCodecImageGenerator_DEFINED)
+#define SkCodecImageGenerator_DEFINED
+
+#include "include/codec/SkCodec.h"
+#include "include/core/SkData.h"
+#include "include/core/SkImageGenerator.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkSize.h"
+#include "include/core/SkYUVAPixmaps.h"
+
+#include <cstddef>
+#include <memory>
+#include <optional>
+
+enum SkAlphaType : int;
+struct SkImageInfo;
+
+class SkCodecImageGenerator : public SkImageGenerator {
+public:
+    static std::unique_ptr<SkImageGenerator> MakeFromEncodedCodec(
+            sk_sp<const SkData>, std::optional<SkAlphaType> = std::nullopt);
+
+    static std::unique_ptr<SkImageGenerator> MakeFromCodec(
+            std::unique_ptr<SkCodec>, std::optional<SkAlphaType> = std::nullopt);
+
+    SkISize getScaledDimensions(float desiredScale) const;
+
+    bool getPixels(const SkImageInfo& info, void* pixels, size_t rowBytes, const SkCodec::Options* options = nullptr);
+
+    int getFrameCount() { return fCodec->getFrameCount(); }
+
+    bool getFrameInfo(int index, SkCodec::FrameInfo* info) const {
+        return fCodec->getFrameInfo(index, info);
+    }
+
+    int getRepetitionCount() { return fCodec->getRepetitionCount(); }
+
+protected:
+    sk_sp<const SkData> onRefEncodedData() override;
+
+    bool onGetPixels(const SkImageInfo& info,
+                     void* pixels,
+                     size_t rowBytes,
+                     const Options& opts) override;
+
+    bool onQueryYUVAInfo(const SkYUVAPixmapInfo::SupportedDataTypes&,
+                         SkYUVAPixmapInfo*) const override;
+
+    bool onGetYUVAPlanes(const SkYUVAPixmaps& yuvaPixmaps) override;
+
+private:
+    SkCodecImageGenerator(std::unique_ptr<SkCodec>, std::optional<SkAlphaType>);
+
+    std::unique_ptr<SkCodec> fCodec;
+    sk_sp<const SkData> fCachedData = nullptr;
+};
+#endif

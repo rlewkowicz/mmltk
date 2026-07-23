@@ -1,0 +1,73 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_cache_CacheChild_h
+#define mozilla_dom_cache_CacheChild_h
+
+#include "mozilla/dom/cache/ActorChild.h"
+#include "mozilla/dom/cache/CacheOpChild.h"
+#include "mozilla/dom/cache/PCacheChild.h"
+
+class nsIAsyncInputStream;
+class nsIGlobalObject;
+
+namespace mozilla::dom::cache {
+class Cache;
+class CacheOpArgs;
+class Listener;
+
+class CacheChild final : public PCacheChild, public CacheActorChild {
+  friend class PCacheChild;
+
+ public:
+  friend class mozilla::detail::BaseAutoLock<CacheChild&>;
+  using AutoLock = mozilla::detail::BaseAutoLock<CacheChild&>;
+
+  explicit CacheChild(ActorChild* aParentActor = nullptr);
+
+  void SetListener(CacheChildListener* aListener);
+
+  void ClearListener();
+
+  template <typename PromiseType>
+  void ExecuteOp(nsIGlobalObject* aGlobal, PromiseType& aPromise,
+                 nsISupports* aParent, const CacheOpArgs& aArgs) {
+    MOZ_ALWAYS_TRUE(SendPCacheOpConstructor(
+        new CacheOpChild(GetWorkerRefPtr().clonePtr(), aGlobal, aParent,
+                         aPromise, this),
+        aArgs));
+  }
+
+  void StartDestroyFromListener();
+  void NoteDeletedActor() override;
+
+  NS_INLINE_DECL_REFCOUNTING(CacheChild, override);
+
+ private:
+  ~CacheChild();
+
+  void DestroyInternal();
+  virtual void StartDestroy() override;
+
+  virtual void ActorDestroy(ActorDestroyReason aReason) override;
+
+  already_AddRefed<PCacheOpChild> AllocPCacheOpChild(
+      const CacheOpArgs& aOpArgs);
+
+  inline uint32_t NumChildActors() { return ManagedPCacheOpChild().Count(); }
+
+  void Lock();
+
+  void Unlock();
+
+  ActorChild* mParentActor;
+  CacheChildListener* MOZ_NON_OWNING_REF mListener;
+
+  bool mLocked;
+  bool mDelayedDestroy;
+};
+
+}  
+
+#endif  // mozilla_dom_cache_CacheChild_h

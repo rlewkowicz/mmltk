@@ -1,0 +1,219 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef _mozilla_dom_FetchService_h
+#define _mozilla_dom_FetchService_h
+
+#include "mozilla/ErrorResult.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/FetchDriver.h"
+#include "mozilla/dom/FetchTypes.h"
+#include "mozilla/dom/PerformanceTimingTypes.h"
+#include "mozilla/dom/SafeRefPtr.h"
+#include "mozilla/ipc/PBackgroundSharedTypes.h"
+#include "mozilla/net/NeckoChannelParams.h"
+#include "nsIChannel.h"
+#include "nsIObserver.h"
+#include "nsTHashMap.h"
+
+class nsILoadGroup;
+class nsIPrincipal;
+class nsICookieJarSettings;
+class PerformanceStorage;
+
+namespace mozilla::dom {
+
+class InternalRequest;
+class InternalResponse;
+class ClientInfo;
+class ServiceWorkerDescriptor;
+
+using FetchServiceResponse = SafeRefPtr<InternalResponse>;
+using FetchServiceResponseAvailablePromise =
+    MozPromise<FetchServiceResponse, CopyableErrorResult, true>;
+using FetchServiceResponseTimingPromise =
+    MozPromise<ResponseTiming, CopyableErrorResult, true>;
+using FetchServiceResponseEndPromise =
+    MozPromise<ResponseEndArgs, CopyableErrorResult, true>;
+
+class FetchServicePromises final {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(FetchServicePromises);
+
+ public:
+  FetchServicePromises();
+
+  RefPtr<FetchServiceResponseAvailablePromise> GetResponseAvailablePromise();
+  RefPtr<FetchServiceResponseTimingPromise> GetResponseTimingPromise();
+  RefPtr<FetchServiceResponseEndPromise> GetResponseEndPromise();
+
+  bool IsResponseAvailablePromiseResolved() {
+    return mAvailablePromiseResolved;
+  }
+  bool IsResponseTimingPromiseResolved() { return mTimingPromiseResolved; }
+  bool IsResponseEndPromiseResolved() { return mEndPromiseResolved; }
+
+  void ResolveResponseAvailablePromise(FetchServiceResponse&& aResponse,
+                                       StaticString aMethodName);
+  void RejectResponseAvailablePromise(const CopyableErrorResult&& aError,
+                                      StaticString aMethodName);
+  void ResolveResponseTimingPromise(ResponseTiming&& aTiming,
+                                    StaticString aMethodName);
+  void RejectResponseTimingPromise(const CopyableErrorResult&& aError,
+                                   StaticString aMethodName);
+  void ResolveResponseEndPromise(ResponseEndArgs&& aArgs,
+                                 StaticString aMethodName);
+  void RejectResponseEndPromise(const CopyableErrorResult&& aError,
+                                StaticString aMethodName);
+
+ private:
+  ~FetchServicePromises() = default;
+
+  RefPtr<FetchServiceResponseAvailablePromise::Private> mAvailablePromise;
+  RefPtr<FetchServiceResponseTimingPromise::Private> mTimingPromise;
+  RefPtr<FetchServiceResponseEndPromise::Private> mEndPromise;
+
+  bool mAvailablePromiseResolved = false;
+  bool mTimingPromiseResolved = false;
+  bool mEndPromiseResolved = false;
+};
+
+class FetchService final : public nsIObserver {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  struct NavigationPreloadArgs {
+    SafeRefPtr<InternalRequest> mRequest;
+    nsCOMPtr<nsIChannel> mChannel;
+  };
+
+  struct WorkerFetchArgs {
+    SafeRefPtr<InternalRequest> mRequest;
+    mozilla::ipc::PrincipalInfo mPrincipalInfo;
+    nsCString mWorkerScript;
+    ClientInfo mClientInfo;
+    Maybe<ServiceWorkerDescriptor> mController;
+    Maybe<net::CookieJarSettingsArgs> mCookieJarSettings;
+    bool mNeedOnDataAvailable;
+    nsCOMPtr<nsICSPEventListener> mCSPEventListener;
+    uint64_t mAssociatedBrowsingContextID;
+    nsCOMPtr<nsISerialEventTarget> mEventTarget;
+    nsID mActorID;
+    bool mIsThirdPartyContext;
+    MozPromiseRequestHolder<FetchServiceResponseEndPromise>
+        mResponseEndPromiseHolder;
+    RefPtr<GenericPromise::Private> mFetchParentPromise;
+    bool mIsOn3PCBExceptionList;
+  };
+
+  struct MainThreadFetchArgs {
+    SafeRefPtr<InternalRequest> mRequest;
+    mozilla::ipc::PrincipalInfo mPrincipalInfo;
+    ClientInfo mClientInfo;
+    Maybe<net::CookieJarSettingsArgs> mCookieJarSettings;
+    bool mNeedOnDataAvailable;
+    nsCOMPtr<nsICSPEventListener> mCSPEventListener;
+    uint64_t mAssociatedBrowsingContextID;
+    nsCOMPtr<nsISerialEventTarget> mEventTarget;
+    nsID mActorID;
+    bool mIsThirdPartyContext{false};
+  };
+
+  struct UnknownArgs {};
+
+  using FetchArgs = Variant<NavigationPreloadArgs, WorkerFetchArgs,
+                            MainThreadFetchArgs, UnknownArgs>;
+
+  enum class FetchArgsType {
+    NavigationPreload,
+    WorkerFetch,
+    MainThreadFetch,
+    Unknown,
+  };
+  static already_AddRefed<FetchService> GetInstance();
+
+  static RefPtr<FetchServicePromises> NetworkErrorResponse(
+      nsresult aRv, const FetchArgs& aArgs = AsVariant(UnknownArgs{}));
+
+  FetchService();
+
+  RefPtr<FetchServicePromises> Fetch(FetchArgs&& aArgs);
+
+  void CancelFetch(const RefPtr<FetchServicePromises>&& aPromises,
+                   bool aForceAbort);
+
+  MozPromiseRequestHolder<FetchServiceResponseEndPromise>&
+  GetResponseEndPromiseHolder(const RefPtr<FetchServicePromises>& aPromises);
+
+ private:
+  class FetchInstance final : public FetchDriverObserver {
+   public:
+    FetchInstance() = default;
+
+    nsresult Initialize(FetchArgs&& aArgs);
+
+    const FetchArgs& Args() { return mArgs; }
+    MozPromiseRequestHolder<FetchServiceResponseEndPromise>&
+    GetResponseEndPromiseHolder() {
+      MOZ_ASSERT(mArgs.is<WorkerFetchArgs>());
+      return mArgs.as<WorkerFetchArgs>().mResponseEndPromiseHolder;
+    }
+
+    RefPtr<FetchServicePromises> Fetch();
+
+    void Cancel(bool aForceAbort);
+
+    bool IsLocalHostFetch() const;
+
+    void OnResponseEnd(FetchDriverObserver::EndReason aReason,
+                       JS::Handle<JS::Value> aReasonDetails) override;
+    void OnResponseAvailableInternal(
+        SafeRefPtr<InternalResponse> aResponse) override;
+    bool NeedOnDataAvailable() override;
+    void OnDataAvailable() override;
+    void FlushConsoleReport() override;
+    void OnReportPerformanceTiming() override;
+    void OnNotifyNetworkMonitorAlternateStack(uint64_t aChannelID) override;
+
+   private:
+    ~FetchInstance() = default;
+    nsCOMPtr<nsISerialEventTarget> GetBackgroundEventTarget();
+    nsID GetActorID();
+
+    SafeRefPtr<InternalRequest> mRequest;
+    nsCOMPtr<nsIPrincipal> mPrincipal;
+    nsCOMPtr<nsILoadGroup> mLoadGroup;
+    nsCOMPtr<nsICookieJarSettings> mCookieJarSettings;
+    RefPtr<PerformanceStorage> mPerformanceStorage;
+    FetchArgs mArgs{AsVariant(FetchService::UnknownArgs())};
+    RefPtr<FetchDriver> mFetchDriver;
+    SafeRefPtr<InternalResponse> mResponse;
+    RefPtr<FetchServicePromises> mPromises;
+    FetchArgsType mArgsType;
+    Atomic<bool> mActorDying{false};
+  };
+
+  ~FetchService();
+
+  nsresult RegisterNetworkObserver();
+  nsresult UnregisterNetworkObserver();
+
+  void IncrementKeepAliveRequestCount(const nsACString& aOrigin);
+  void DecrementKeepAliveRequestCount(const nsACString& aOrigin);
+
+  bool DoesExceedsKeepaliveResourceLimits(const nsACString& aOrigin);
+
+  nsTHashMap<nsRefPtrHashKey<FetchServicePromises>, RefPtr<FetchInstance> >
+      mFetchInstanceTable;
+  bool mObservingNetwork{false};
+  bool mOffline{false};
+
+  nsTHashMap<nsCStringHashKey, uint32_t> mPendingKeepAliveRequestsPerOrigin;
+
+  uint32_t mTotalKeepAliveRequests{0};
+};
+
+}  
+
+#endif  // _mozilla_dom_FetchService_h

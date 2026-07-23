@@ -1,0 +1,405 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HTMLEditorEventListener.h"
+
+#include "HTMLEditUtils.h"
+#include "mozilla/HTMLEditor.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/EventTarget.h"
+#include "mozilla/dom/MouseEvent.h"
+#include "mozilla/dom/Selection.h"
+#include "nsCOMPtr.h"
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsISupportsImpl.h"
+#include "nsLiteralString.h"
+#include "nsQueryObject.h"
+#include "nsRange.h"
+
+namespace mozilla {
+
+using namespace dom;
+
+nsresult HTMLEditorEventListener::Connect(EditorBase* aEditorBase) {
+  HTMLEditor* htmlEditor = HTMLEditor::GetFrom(aEditorBase);
+  if (NS_WARN_IF(!htmlEditor)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  nsresult rv = EditorEventListener::Connect(htmlEditor);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorEventListener::Connect() failed");
+  return rv;
+}
+
+void HTMLEditorEventListener::Disconnect() {
+  if (DetachedFromEditor()) {
+    EditorEventListener::Disconnect();
+  }
+
+  if (mListeningToMouseMoveEventForResizers) {
+    DebugOnly<nsresult> rvIgnored = ListenToMouseMoveEventForResizers(false);
+    NS_WARNING_ASSERTION(
+        NS_SUCCEEDED(rvIgnored),
+        "HTMLEditorEventListener::ListenToMouseMoveEventForResizers() failed, "
+        "but ignored");
+  }
+  if (mListeningToMouseMoveEventForGrabber) {
+    DebugOnly<nsresult> rvIgnored = ListenToMouseMoveEventForGrabber(false);
+    NS_WARNING_ASSERTION(
+        NS_SUCCEEDED(rvIgnored),
+        "HTMLEditorEventListener::ListenToMouseMoveEventForGrabber() failed, "
+        "but ignored");
+  }
+  if (mListeningToResizeEvent) {
+    DebugOnly<nsresult> rvIgnored = ListenToWindowResizeEvent(false);
+    NS_WARNING_ASSERTION(
+        NS_SUCCEEDED(rvIgnored),
+        "HTMLEditorEventListener::ListenToWindowResizeEvent() failed, "
+        "but ignored");
+  }
+
+  EditorEventListener::Disconnect();
+}
+
+NS_IMETHODIMP HTMLEditorEventListener::HandleEvent(Event* aEvent) {
+  switch (aEvent->WidgetEventPtr()->mMessage) {
+    case eMouseMove: {
+      if (DetachedFromEditor()) {
+        return NS_OK;
+      }
+
+      RefPtr<MouseEvent> mouseMoveEvent = aEvent->AsMouseEvent();
+      if (NS_WARN_IF(!aEvent->WidgetEventPtr())) {
+        return NS_ERROR_FAILURE;
+      }
+
+      RefPtr<HTMLEditor> htmlEditor = mEditorBase->AsHTMLEditor();
+      DebugOnly<nsresult> rvIgnored =
+          htmlEditor->UpdateResizerOrGrabberPositionTo(
+              RoundedToInt(mouseMoveEvent->ClientPoint()));
+      NS_WARNING_ASSERTION(
+          NS_SUCCEEDED(rvIgnored),
+          "HTMLEditor::UpdateResizerOrGrabberPositionTo() failed, but ignored");
+      return NS_OK;
+    }
+    case eResize: {
+      if (DetachedFromEditor()) {
+        return NS_OK;
+      }
+
+      RefPtr<HTMLEditor> htmlEditor = mEditorBase->AsHTMLEditor();
+      nsresult rv = htmlEditor->RefreshResizers();
+      NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                           "HTMLEditor::RefreshResizers() failed");
+      return rv;
+    }
+    default: {
+      nsresult rv = EditorEventListener::HandleEvent(aEvent);
+      NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                           "EditorEventListener::HandleEvent() failed");
+      return rv;
+    }
+  }
+}
+
+nsresult HTMLEditorEventListener::ListenToMouseMoveEventForResizersOrGrabber(
+    bool aListen, bool aForGrabber) {
+  MOZ_ASSERT(aForGrabber ? mListeningToMouseMoveEventForGrabber != aListen
+                         : mListeningToMouseMoveEventForResizers != aListen);
+
+  if (NS_WARN_IF(DetachedFromEditor())) {
+    return aListen ? NS_ERROR_FAILURE : NS_OK;
+  }
+
+  if (aListen) {
+    if (aForGrabber && mListeningToMouseMoveEventForResizers) {
+      mListeningToMouseMoveEventForGrabber = true;
+      return NS_OK;
+    }
+    if (!aForGrabber && mListeningToMouseMoveEventForGrabber) {
+      mListeningToMouseMoveEventForResizers = true;
+      return NS_OK;
+    }
+  } else {
+    if (aForGrabber && mListeningToMouseMoveEventForResizers) {
+      mListeningToMouseMoveEventForGrabber = false;
+      return NS_OK;
+    }
+    if (!aForGrabber && mListeningToMouseMoveEventForGrabber) {
+      mListeningToMouseMoveEventForResizers = false;
+      return NS_OK;
+    }
+  }
+
+  EventTarget* eventTarget = mEditorBase->AsHTMLEditor()->GetDOMEventTarget();
+  if (NS_WARN_IF(!eventTarget)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  EventListenerManager* eventListenerManager =
+      eventTarget->GetOrCreateListenerManager();
+  if (NS_WARN_IF(!eventListenerManager)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (aListen) {
+    eventListenerManager->AddEventListenerByType(
+        this, u"mousemove"_ns, TrustedEventsAtSystemGroupBubble());
+    if (aForGrabber) {
+      mListeningToMouseMoveEventForGrabber = true;
+    } else {
+      mListeningToMouseMoveEventForResizers = true;
+    }
+    return NS_OK;
+  }
+
+  eventListenerManager->RemoveEventListenerByType(
+      this, u"mousemove"_ns, TrustedEventsAtSystemGroupBubble());
+  if (aForGrabber) {
+    mListeningToMouseMoveEventForGrabber = false;
+  } else {
+    mListeningToMouseMoveEventForResizers = false;
+  }
+  return NS_OK;
+}
+
+nsresult HTMLEditorEventListener::ListenToWindowResizeEvent(bool aListen) {
+  if (mListeningToResizeEvent == aListen) {
+    return NS_OK;
+  }
+
+  if (DetachedFromEditor()) {
+    return aListen ? NS_ERROR_FAILURE : NS_OK;
+  }
+
+  Document* document = mEditorBase->AsHTMLEditor()->GetDocument();
+  if (NS_WARN_IF(!document)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsPIDOMWindowOuter* window = document->GetWindow();
+  if (!window) {
+    NS_WARNING_ASSERTION(!aListen,
+                         "There should be window when adding event listener");
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<EventTarget> eventTarget = do_QueryInterface(window);
+  if (NS_WARN_IF(!eventTarget)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  EventListenerManager* eventListenerManager =
+      eventTarget->GetOrCreateListenerManager();
+  if (NS_WARN_IF(!eventListenerManager)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (aListen) {
+    eventListenerManager->AddEventListenerByType(
+        this, u"resize"_ns, TrustedEventsAtSystemGroupBubble());
+    mListeningToResizeEvent = true;
+    return NS_OK;
+  }
+
+  eventListenerManager->RemoveEventListenerByType(
+      this, u"resize"_ns, TrustedEventsAtSystemGroupBubble());
+  mListeningToResizeEvent = false;
+  return NS_OK;
+}
+
+nsresult HTMLEditorEventListener::MouseUp(MouseEvent* aMouseEvent) {
+  MOZ_ASSERT(aMouseEvent);
+  MOZ_ASSERT(aMouseEvent->IsTrusted());
+
+  if (DetachedFromEditor()) {
+    return NS_OK;
+  }
+
+  RefPtr<HTMLEditor> htmlEditor = mEditorBase->AsHTMLEditor();
+  htmlEditor->PreHandleMouseUp(*aMouseEvent);
+
+  if (NS_WARN_IF(!aMouseEvent->GetTarget())) {
+    return NS_ERROR_FAILURE;
+  }
+
+  DebugOnly<nsresult> rvIgnored = htmlEditor->StopDraggingResizerOrGrabberAt(
+      RoundedToInt(aMouseEvent->ClientPoint()));
+  NS_WARNING_ASSERTION(
+      NS_SUCCEEDED(rvIgnored),
+      "HTMLEditor::StopDraggingResizerOrGrabberAt() failed, but ignored");
+
+  nsresult rv = EditorEventListener::MouseUp(aMouseEvent);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorEventListener::MouseUp() failed");
+  return rv;
+}
+
+static bool IsAcceptableMouseEvent(const HTMLEditor& aHTMLEditor,
+                                   MouseEvent* aMouseEvent) {
+  WidgetMouseEvent* mousedownEvent =
+      aMouseEvent->WidgetEventPtr()->AsMouseEvent();
+  MOZ_ASSERT(mousedownEvent);
+  return aHTMLEditor.IsAcceptableInputEvent(mousedownEvent);
+}
+
+nsresult HTMLEditorEventListener::HandlePrimaryMouseButtonDown(
+    HTMLEditor& aHTMLEditor, MouseEvent& aMouseEvent) {
+  RefPtr<EventTarget> eventTarget = aMouseEvent.GetExplicitOriginalTarget();
+  if (NS_WARN_IF(!eventTarget)) {
+    return NS_ERROR_FAILURE;
+  }
+  nsIContent* eventTargetContent = nsIContent::FromEventTarget(eventTarget);
+  if (!eventTargetContent) {
+    return NS_OK;
+  }
+
+  RefPtr<Element> toSelect;
+  bool isElement = eventTargetContent->IsElement();
+  int32_t clickCount = aMouseEvent.Detail();
+  switch (clickCount) {
+    case 1:
+      if (isElement) {
+        OwningNonNull<Element> element(*eventTargetContent->AsElement());
+        DebugOnly<nsresult> rvIgnored =
+            aHTMLEditor.StartToDragResizerOrHandleDragGestureOnGrabber(
+                aMouseEvent, element);
+        NS_WARNING_ASSERTION(
+            NS_SUCCEEDED(rvIgnored),
+            "HTMLEditor::StartToDragResizerOrHandleDragGestureOnGrabber() "
+            "failed, but ignored");
+      }
+      break;
+    case 2:
+      if (isElement) {
+        toSelect = eventTargetContent->AsElement();
+      }
+      break;
+    case 3:
+      if (!isElement) {
+        toSelect = aHTMLEditor.GetInclusiveAncestorByTagName(
+            *nsGkAtoms::href, *eventTargetContent);
+      }
+      break;
+  }
+  if (toSelect) {
+    DebugOnly<nsresult> rvIgnored = aHTMLEditor.SelectElement(toSelect);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                         "HTMLEditor::SelectElement() failed, but ignored");
+    aMouseEvent.PreventDefault();
+  }
+  return NS_OK;
+}
+
+nsresult HTMLEditorEventListener::HandleSecondaryMouseButtonDown(
+    HTMLEditor& aHTMLEditor, MouseEvent& aMouseEvent) {
+  RefPtr<Selection> selection = aHTMLEditor.GetSelection();
+  if (NS_WARN_IF(!selection)) {
+    return NS_OK;
+  }
+
+  int32_t offset = -1;
+  nsCOMPtr<nsIContent> parentContent =
+      aMouseEvent.GetRangeParentContentAndOffset(&offset);
+  if (NS_WARN_IF(!parentContent) || NS_WARN_IF(offset < 0)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (nsContentUtils::IsPointInSelection(*selection, *parentContent,
+                                         AssertedCast<uint32_t>(offset))) {
+    return NS_OK;
+  }
+
+  RefPtr<EventTarget> eventTarget = aMouseEvent.GetExplicitOriginalTarget();
+  if (NS_WARN_IF(!eventTarget)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  Element* eventTargetElement = Element::FromEventTarget(eventTarget);
+
+  if (eventTargetElement &&
+      HTMLEditUtils::IsImageElement(*eventTargetElement)) {
+    DebugOnly<nsresult> rvIgnored =
+        aHTMLEditor.SelectElement(MOZ_KnownLive(eventTargetElement));
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                         "HTMLEditor::SelectElement() failed, but ignored");
+  }
+
+  DebugOnly<nsresult> rvIgnored =
+      aHTMLEditor.CheckSelectionStateForAnonymousButtons();
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                       "HTMLEditor::CheckSelectionStateForAnonymousButtons() "
+                       "failed, but ignored");
+
+  return NS_OK;
+}
+
+nsresult HTMLEditorEventListener::MouseDown(MouseEvent* aMouseEvent) {
+  MOZ_ASSERT(aMouseEvent);
+  MOZ_ASSERT(aMouseEvent->IsTrusted());
+
+  if (NS_WARN_IF(!aMouseEvent) || DetachedFromEditor()) {
+    return NS_OK;
+  }
+
+  if (!EnsureCommitComposition()) {
+    return NS_OK;
+  }
+
+  RefPtr<HTMLEditor> htmlEditor = mEditorBase->AsHTMLEditor();
+  htmlEditor->PreHandleMouseDown(*aMouseEvent);
+
+  if (!IsAcceptableMouseEvent(*htmlEditor, aMouseEvent)) {
+    return EditorEventListener::MouseDown(aMouseEvent);
+  }
+
+  if (aMouseEvent->Button() == MouseButton::ePrimary) {
+    nsresult rv = HandlePrimaryMouseButtonDown(*htmlEditor, *aMouseEvent);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+  } else if (aMouseEvent->Button() == MouseButton::eSecondary) {
+    nsresult rv = HandleSecondaryMouseButtonDown(*htmlEditor, *aMouseEvent);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+  }
+
+  nsresult rv = EditorEventListener::MouseDown(aMouseEvent);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorEventListener::MouseDown() failed");
+  return rv;
+}
+
+nsresult HTMLEditorEventListener::PointerClick(
+    WidgetMouseEvent* aPointerClickEvent) {
+  if (NS_WARN_IF(DetachedFromEditor())) {
+    return NS_OK;
+  }
+
+  RefPtr<Element> element = Element::FromEventTargetOrNull(
+      aPointerClickEvent->GetOriginalDOMEventTarget());
+  if (NS_WARN_IF(!element)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<HTMLEditor> htmlEditor = mEditorBase->AsHTMLEditor();
+  DebugOnly<nsresult> rvIgnored =
+      htmlEditor->DoInlineTableEditingAction(*element);
+  NS_WARNING_ASSERTION(
+      NS_SUCCEEDED(rvIgnored),
+      "HTMLEditor::DoInlineTableEditingAction() failed, but ignored");
+  if (NS_WARN_IF(htmlEditor->Destroyed())) {
+    return NS_OK;
+  }
+
+  nsresult rv = EditorEventListener::PointerClick(aPointerClickEvent);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorEventListener::PointerClick() failed");
+  return rv;
+}
+
+}  

@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_capsule_parser_h
+#define mozilla_net_capsule_parser_h
+
+#include "Capsule.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Result.h"
+#include "mozilla/Span.h"
+
+namespace mozilla::net {
+
+class CapsuleDecoder;
+
+class CapsuleParser final {
+ public:
+  class Listener {
+   public:
+    NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+    virtual bool OnCapsule(Capsule&& aCapsule) = 0;
+    virtual void OnCapsuleParseFailure(nsresult aError) = 0;
+
+   protected:
+    virtual ~Listener() = default;
+  };
+
+  explicit CapsuleParser(Listener* aListener);
+  ~CapsuleParser() = default;
+  bool ProcessCapsuleData(const uint8_t* aData, uint32_t aCount);
+
+  bool IsBufferEmpty() const { return mBuffer.IsEmpty(); }
+
+ private:
+  bool mProcessing = false;
+
+  RefPtr<Listener> mListener;
+  nsTArray<uint8_t> mBuffer;
+  Result<size_t, nsresult> ParseCapsuleData(Span<const uint8_t> aData);
+  Result<Capsule, nsresult> ParseCapsulePayload(CapsuleDecoder& aDecoder,
+                                                CapsuleType aType,
+                                                size_t aPayloadLength);
+};
+
+class CapsuleParserListener : public CapsuleParser::Listener {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(CapsuleParserListener, override)
+
+  CapsuleParserListener() = default;
+  bool OnCapsule(Capsule&& aCapsule) override;
+  void OnCapsuleParseFailure(nsresult aError) override;
+
+  nsTArray<Capsule> GetParsedCapsules() { return std::move(mParsedCapsules); }
+
+  Maybe<nsresult> GetErrorResult() { return mError; }
+
+ private:
+  virtual ~CapsuleParserListener() = default;
+
+  nsTArray<Capsule> mParsedCapsules;
+  Maybe<nsresult> mError = Nothing();
+};
+
+}  
+
+#endif

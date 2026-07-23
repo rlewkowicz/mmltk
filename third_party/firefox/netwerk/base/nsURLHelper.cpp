@@ -1,0 +1,1143 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsURLHelper.h"
+
+#include "mozilla/AppShutdown.h"
+#include "mozilla/CompactPair.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/TextUtils.h"
+
+#include <algorithm>
+#include <iterator>
+
+#include "nsASCIIMask.h"
+#include "nsIFile.h"
+#include "nsIURLParser.h"
+#include "nsCOMPtr.h"
+#include "nsCRT.h"
+#include "nsNetCID.h"
+#include "mozilla/Preferences.h"
+#include "prnetdb.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/Tokenizer.h"
+#include "nsEscape.h"
+#include "nsDOMString.h"
+#include "mozilla/net/rust_helper.h"
+#include "mozilla/net/DNS.h"
+
+using namespace mozilla;
+
+
+static StaticMutex gInitLock MOZ_ANNOTATED;
+static Atomic<bool, MemoryOrdering::Relaxed> gInitialized(false);
+static StaticRefPtr<nsIURLParser> gNoAuthURLParser;
+static StaticRefPtr<nsIURLParser> gAuthURLParser;
+static StaticRefPtr<nsIURLParser> gStdURLParser;
+
+static void EnsureGlobalsAreInited() {
+  if (!gInitialized) {
+    StaticMutexAutoLock lock(gInitLock);
+    if (gInitialized) {
+      return;
+    }
+
+    nsCOMPtr<nsIURLParser> parser;
+
+    parser = do_GetService(NS_NOAUTHURLPARSER_CONTRACTID);
+    NS_ASSERTION(parser, "failed getting 'noauth' url parser");
+    if (parser) {
+      gNoAuthURLParser = parser.forget();
+    }
+
+    parser = do_GetService(NS_AUTHURLPARSER_CONTRACTID);
+    NS_ASSERTION(parser, "failed getting 'auth' url parser");
+    if (parser) {
+      gAuthURLParser = parser.forget();
+    }
+
+    parser = do_GetService(NS_STDURLPARSER_CONTRACTID);
+    NS_ASSERTION(parser, "failed getting 'std' url parser");
+    if (parser) {
+      gStdURLParser = parser.forget();
+    }
+
+    gInitialized = true;
+  }
+}
+
+void net_ShutdownURLHelper() {
+  if (gInitialized) {
+    MOZ_ASSERT(AppShutdown::IsInOrBeyond(ShutdownPhase::XPCOMShutdownFinal));
+    gNoAuthURLParser = nullptr;
+    gAuthURLParser = nullptr;
+    gStdURLParser = nullptr;
+  }
+}
+
+
+already_AddRefed<nsIURLParser> net_GetAuthURLParser() {
+  EnsureGlobalsAreInited();
+  RefPtr<nsIURLParser> keepMe = gAuthURLParser;
+  return keepMe.forget();
+}
+
+already_AddRefed<nsIURLParser> net_GetNoAuthURLParser() {
+  EnsureGlobalsAreInited();
+  RefPtr<nsIURLParser> keepMe = gNoAuthURLParser;
+  return keepMe.forget();
+}
+
+already_AddRefed<nsIURLParser> net_GetStdURLParser() {
+  EnsureGlobalsAreInited();
+  RefPtr<nsIURLParser> keepMe = gStdURLParser;
+  return keepMe.forget();
+}
+
+nsresult net_GetURLSpecFromDir(nsIFile* aFile, nsACString& result) {
+  nsAutoCString escPath;
+  nsresult rv = net_GetURLSpecFromActualFile(aFile, escPath);
+  if (NS_FAILED(rv)) return rv;
+
+  if (escPath.Last() != '/') {
+    escPath += '/';
+  }
+
+  result = escPath;
+  return NS_OK;
+}
+
+nsresult net_GetURLSpecFromFile(nsIFile* aFile, nsACString& result) {
+  nsAutoCString escPath;
+  nsresult rv = net_GetURLSpecFromActualFile(aFile, escPath);
+  if (NS_FAILED(rv)) return rv;
+
+  if (escPath.Last() != '/') {
+    bool dir;
+    rv = aFile->IsDirectory(&dir);
+    if (NS_SUCCEEDED(rv) && dir) escPath += '/';
+  }
+
+  result = escPath;
+  return NS_OK;
+}
+
+
+nsresult net_ParseFileURL(const nsACString& inURL, nsACString& outDirectory,
+                          nsACString& outFileBaseName,
+                          nsACString& outFileExtension) {
+  nsresult rv;
+
+  if (inURL.Length() >
+      (uint32_t)StaticPrefs::network_standard_url_max_length()) {
+    return NS_ERROR_MALFORMED_URI;
+  }
+
+  outDirectory.Truncate();
+  outFileBaseName.Truncate();
+  outFileExtension.Truncate();
+
+  const nsPromiseFlatCString& flatURL = PromiseFlatCString(inURL);
+  const char* url = flatURL.get();
+
+  nsAutoCString scheme;
+  rv = net_ExtractURLScheme(flatURL, scheme);
+  if (NS_FAILED(rv)) return rv;
+
+  if (!scheme.EqualsLiteral("file")) {
+    NS_ERROR("must be a file:// url");
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  nsCOMPtr<nsIURLParser> parser = net_GetNoAuthURLParser();
+  NS_ENSURE_TRUE(parser, NS_ERROR_UNEXPECTED);
+
+  uint32_t pathPos, filepathPos, directoryPos, basenamePos, extensionPos;
+  int32_t pathLen, filepathLen, directoryLen, basenameLen, extensionLen;
+
+  rv = parser->ParseURL(url, flatURL.Length(), nullptr,
+                        nullptr,           
+                        nullptr, nullptr,  
+                        &pathPos, &pathLen);
+  if (NS_FAILED(rv)) return rv;
+
+  rv = parser->ParsePath(url + pathPos, pathLen, &filepathPos, &filepathLen,
+                         nullptr, nullptr,   
+                         nullptr, nullptr);  
+  if (NS_FAILED(rv)) return rv;
+
+  filepathPos += pathPos;
+
+  rv = parser->ParseFilePath(url + filepathPos, filepathLen, &directoryPos,
+                             &directoryLen, &basenamePos, &basenameLen,
+                             &extensionPos, &extensionLen);
+  if (NS_FAILED(rv)) return rv;
+
+  if (directoryLen > 0) {
+    outDirectory = Substring(inURL, filepathPos + directoryPos, directoryLen);
+  }
+  if (basenameLen > 0) {
+    outFileBaseName = Substring(inURL, filepathPos + basenamePos, basenameLen);
+  }
+  if (extensionLen > 0) {
+    outFileExtension =
+        Substring(inURL, filepathPos + extensionPos, extensionLen);
+  }
+
+  return NS_OK;
+}
+
+
+mozilla::Maybe<mozilla::CompactPair<uint32_t, uint32_t>> net_CoalesceDirs(
+    char* path) {
+  char* fwdPtr = path;
+  char* urlPtr = path;
+
+  MOZ_ASSERT(*path == '/', "We expect the path to begin with /");
+  if (*path != '/') {
+    return Nothing();
+  }
+
+  auto isSegmentEnd = [](char aChar) {
+    return aChar == '/' || aChar == '?' || aChar == '#' || aChar == '\0';
+  };
+
+  constexpr int PERCENT_2E_LENGTH = sizeof("%2e") - 1;
+  constexpr uint32_t PERCENT_2E_WITH_PERIOD_LENGTH = PERCENT_2E_LENGTH + 1;
+
+  for (; (*fwdPtr != '\0') && (*fwdPtr != '?') && (*fwdPtr != '#'); ++fwdPtr) {
+    if (*fwdPtr == '/' &&
+        nsCRT::strncasecmp(fwdPtr + 1, "%2e", PERCENT_2E_LENGTH) == 0 &&
+        isSegmentEnd(*(fwdPtr + PERCENT_2E_LENGTH + 1))) {
+      *urlPtr++ = '/';
+      *urlPtr++ = '.';
+      fwdPtr += PERCENT_2E_LENGTH;
+    }
+    else if (*fwdPtr == '/' &&
+             nsCRT::strncasecmp(fwdPtr + 1, "%2e%2e", PERCENT_2E_LENGTH * 2) ==
+                 0 &&
+             isSegmentEnd(*(fwdPtr + PERCENT_2E_LENGTH * 2 + 1))) {
+      *urlPtr++ = '/';
+      *urlPtr++ = '.';
+      *urlPtr++ = '.';
+      fwdPtr += PERCENT_2E_LENGTH * 2;
+    }
+    else if (*fwdPtr == '/' &&
+             (nsCRT::strncasecmp(fwdPtr + 1, "%2e.",
+                                 PERCENT_2E_WITH_PERIOD_LENGTH) == 0 ||
+              nsCRT::strncasecmp(fwdPtr + 1, ".%2e",
+                                 PERCENT_2E_WITH_PERIOD_LENGTH) == 0) &&
+             isSegmentEnd(*(fwdPtr + PERCENT_2E_WITH_PERIOD_LENGTH + 1))) {
+      *urlPtr++ = '/';
+      *urlPtr++ = '.';
+      *urlPtr++ = '.';
+      fwdPtr += PERCENT_2E_WITH_PERIOD_LENGTH;
+    } else {
+      *urlPtr++ = *fwdPtr;
+    }
+  }
+  for (; *fwdPtr != '\0'; ++fwdPtr) {
+    *urlPtr++ = *fwdPtr;
+  }
+  *urlPtr = '\0';  
+
+  fwdPtr = path;
+  urlPtr = path;
+
+  for (; (*fwdPtr != '\0') && (*fwdPtr != '?') && (*fwdPtr != '#'); ++fwdPtr) {
+    if (*fwdPtr == '/' && *(fwdPtr + 1) == '.' && *(fwdPtr + 2) == '/') {
+      ++fwdPtr;
+    } else if (*fwdPtr == '/' && *(fwdPtr + 1) == '.' && *(fwdPtr + 2) == '.' &&
+               isSegmentEnd(*(fwdPtr + 3))) {
+      if (urlPtr != path) urlPtr--;  
+      for (; *urlPtr != '/' && urlPtr != path; urlPtr--) {
+        ;  
+      }
+      fwdPtr += 2;
+      if (*fwdPtr == '.' && (*(fwdPtr + 1) == '\0' || *(fwdPtr + 1) == '?' ||
+                             *(fwdPtr + 1) == '#')) {
+        ++urlPtr;
+      }
+    } else {
+      *urlPtr++ = *fwdPtr;
+    }
+  }
+
+
+  if ((urlPtr > (path + 1)) && (*(urlPtr - 1) == '.') &&
+      (*(urlPtr - 2) == '/')) {
+    urlPtr--;
+  }
+
+  if (urlPtr == path && fwdPtr != path) {
+    urlPtr++;
+  }
+
+  for (; *fwdPtr != '\0'; ++fwdPtr) {
+    *urlPtr++ = *fwdPtr;
+  }
+  *urlPtr = '\0';  
+
+  uint32_t lastSlash = 0;
+  uint32_t endOfBasename = 0;
+
+  for (; (*(path + endOfBasename) != '\0') &&
+         (*(path + endOfBasename) != '?') && (*(path + endOfBasename) != '#');
+       ++endOfBasename) {
+  }
+
+  lastSlash = endOfBasename;
+  if (lastSlash != 0 && *(path + lastSlash) == '\0') {
+    --lastSlash;
+  }
+  for (; lastSlash != 0 && *(path + lastSlash) != '/'; --lastSlash) {
+  }
+
+  return Some(mozilla::MakeCompactPair(lastSlash, endOfBasename));
+}
+
+
+static bool net_IsValidSchemeChar(const char aChar) {
+  return mozilla::net::rust_net_is_valid_scheme_char(aChar);
+}
+
+nsresult net_ExtractURLScheme(const nsACString& inURI, nsACString& scheme) {
+  nsACString::const_iterator start, end;
+  inURI.BeginReading(start);
+  inURI.EndReading(end);
+
+  while (start != end) {
+    if ((uint8_t)*start > 0x20) {
+      break;
+    }
+    start++;
+  }
+
+  Tokenizer p(Substring(start, end), "\r\n\t");
+  p.Record();
+  if (!p.CheckChar(IsAsciiAlpha)) {
+    return NS_ERROR_MALFORMED_URI;
+  }
+
+  while (p.CheckChar(net_IsValidSchemeChar) || p.CheckWhite()) {
+  }
+
+  if (!p.CheckChar(':')) {
+    return NS_ERROR_MALFORMED_URI;
+  }
+
+  p.Claim(scheme);
+  scheme.StripTaggedASCII(ASCIIMask::MaskCRLFTab());
+  ToLowerCase(scheme);
+  return NS_OK;
+}
+
+bool net_IsValidScheme(const nsACString& scheme) {
+  return mozilla::net::rust_net_is_valid_scheme(&scheme);
+}
+
+bool net_IsAbsoluteURL(const nsACString& uri) {
+  nsACString::const_iterator start, end;
+  uri.BeginReading(start);
+  uri.EndReading(end);
+
+  while (start != end) {
+    if ((uint8_t)*start > 0x20) {
+      break;
+    }
+    start++;
+  }
+
+  Tokenizer p(Substring(start, end), "\r\n\t");
+
+  if (!p.CheckChar(IsAsciiAlpha)) {
+    return false;
+  }
+
+  while (p.CheckChar(net_IsValidSchemeChar) || p.CheckWhite()) {
+  }
+  if (!p.CheckChar(':')) {
+    return false;
+  }
+  p.SkipWhites();
+
+  if (!p.CheckChar('/')) {
+    return false;
+  }
+  p.SkipWhites();
+
+  if (p.CheckChar('/')) {
+    return true;
+  }
+  return false;
+}
+
+void net_FilterURIString(const nsACString& input, nsACString& result) {
+  result.Truncate();
+
+  const auto* start = input.BeginReading();
+  const auto* end = input.EndReading();
+
+  auto charFilter = [](char c) { return static_cast<uint8_t>(c) > 0x20; };
+  const auto* newStart = std::find_if(start, end, charFilter);
+  const auto* newEnd =
+      std::find_if(std::reverse_iterator<decltype(end)>(end),
+                   std::reverse_iterator<decltype(newStart)>(newStart),
+                   charFilter)
+          .base();
+
+  bool needsStrip = false;
+  const ASCIIMaskArray& mask = ASCIIMask::MaskCRLFTab();
+  for (const auto* itr = start; itr != end; ++itr) {
+    if (ASCIIMask::IsMasked(mask, *itr)) {
+      needsStrip = true;
+      break;
+    }
+  }
+
+  if (newStart == start && newEnd == end && !needsStrip) {
+    result = input;
+    return;
+  }
+
+  result.Assign(Substring(newStart, newEnd));
+  if (needsStrip) {
+    result.StripTaggedASCII(mask);
+  }
+}
+
+nsresult net_FilterAndEscapeURI(const nsACString& aInput, uint32_t aFlags,
+                                const ASCIIMaskArray& aFilterMask,
+                                nsACString& aResult) {
+  aResult.Truncate();
+
+  const auto* start = aInput.BeginReading();
+  const auto* end = aInput.EndReading();
+
+  auto charFilter = [](char c) { return static_cast<uint8_t>(c) > 0x20; };
+  const auto* newStart = std::find_if(start, end, charFilter);
+  const auto* newEnd =
+      std::find_if(std::reverse_iterator<decltype(end)>(end),
+                   std::reverse_iterator<decltype(newStart)>(newStart),
+                   charFilter)
+          .base();
+
+  return NS_EscapeAndFilterURL(Substring(newStart, newEnd), aFlags,
+                               &aFilterMask, aResult, fallible);
+}
+
+
+
+static inline void ToLower(char& c) {
+  if ((unsigned)(c - 'A') <= (unsigned)('Z' - 'A')) c += 'a' - 'A';
+}
+
+void net_ToLowerCase(char* str, uint32_t length) {
+  for (char* end = str + length; str < end; ++str) ToLower(*str);
+}
+
+void net_ToLowerCase(char* str) {
+  for (; *str; ++str) ToLower(*str);
+}
+
+char* net_FindCharInSet(const char* iter, const char* stop, const char* set) {
+  for (; iter != stop && *iter; ++iter) {
+    for (const char* s = set; *s; ++s) {
+      if (*iter == *s) return (char*)iter;
+    }
+  }
+  return (char*)iter;
+}
+
+char* net_FindCharNotInSet(const char* iter, const char* stop,
+                           const char* set) {
+repeat:
+  for (const char* s = set; *s; ++s) {
+    if (*iter == *s) {
+      if (++iter == stop) break;
+      goto repeat;
+    }
+  }
+  return (char*)iter;
+}
+
+char* net_RFindCharNotInSet(const char* stop, const char* iter,
+                            const char* set) {
+  --iter;
+  --stop;
+
+  if (iter == stop) return (char*)iter;
+
+repeat:
+  for (const char* s = set; *s; ++s) {
+    if (*iter == *s) {
+      if (--iter == stop) break;
+      goto repeat;
+    }
+  }
+  return (char*)iter;
+}
+
+#define HTTP_LWS " \t"
+
+static uint32_t net_FindStringEnd(const nsCString& flatStr,
+                                  uint32_t stringStart, char stringDelim) {
+  NS_ASSERTION(stringStart < flatStr.Length() &&
+                   flatStr.CharAt(stringStart) == stringDelim &&
+                   (stringDelim == '"' || stringDelim == '\''),
+               "Invalid stringStart");
+
+  const char set[] = {stringDelim, '\\', '\0'};
+  do {
+
+    uint32_t stringEnd = flatStr.FindCharInSet(set, stringStart + 1);
+    if (stringEnd == uint32_t(kNotFound)) return flatStr.Length();
+
+    if (flatStr.CharAt(stringEnd) == '\\') {
+      stringStart = stringEnd + 1;
+      if (stringStart == flatStr.Length()) return stringStart;
+
+      continue;
+    }
+
+    return stringEnd;
+
+  } while (true);
+
+  MOZ_ASSERT_UNREACHABLE("How did we get here?");
+  return flatStr.Length();
+}
+
+static uint32_t net_FindMediaDelimiter(const nsCString& flatStr,
+                                       uint32_t searchStart, char delimiter) {
+  do {
+    const char delimStr[] = {delimiter, '"', '\0'};
+    uint32_t curDelimPos = flatStr.FindCharInSet(delimStr, searchStart);
+    if (curDelimPos == uint32_t(kNotFound)) return flatStr.Length();
+
+    char ch = flatStr.CharAt(curDelimPos);
+    if (ch == delimiter) {
+      return curDelimPos;
+    }
+
+    searchStart = net_FindStringEnd(flatStr, curDelimPos, ch);
+    if (searchStart == flatStr.Length()) return searchStart;
+
+    ++searchStart;
+
+  } while (true);
+
+  MOZ_ASSERT_UNREACHABLE("How did we get here?");
+  return flatStr.Length();
+}
+
+static void net_ParseMediaType(const nsACString& aMediaTypeStr,
+                               nsACString& aContentType,
+                               nsACString& aContentCharset, int32_t aOffset,
+                               bool* aHadCharset, int32_t* aCharsetStart,
+                               int32_t* aCharsetEnd, bool aStrict) {
+  const nsCString& flatStr = PromiseFlatCString(aMediaTypeStr);
+  const char* start = flatStr.get();
+  const char* end = start + flatStr.Length();
+
+  const char* type = net_FindCharNotInSet(start, end, HTTP_LWS);
+  const char* typeEnd = net_FindCharInSet(type, end, HTTP_LWS ";");
+
+  const char* charset = "";
+  const char* charsetEnd = charset;
+  int32_t charsetParamStart = 0;
+  int32_t charsetParamEnd = 0;
+
+  uint32_t consumed = typeEnd - type;
+
+  bool typeHasCharset = false;
+  uint32_t paramStart = flatStr.FindChar(';', typeEnd - start);
+  if (paramStart != uint32_t(kNotFound)) {
+    uint32_t curParamStart = paramStart + 1;
+    do {
+      uint32_t curParamEnd =
+          net_FindMediaDelimiter(flatStr, curParamStart, ';');
+
+      const char* paramName = net_FindCharNotInSet(
+          start + curParamStart, start + curParamEnd, HTTP_LWS);
+      static const char charsetStr[] = "charset=";
+      if (nsCRT::strncasecmp(paramName, charsetStr, sizeof(charsetStr) - 1) ==
+          0) {
+        charset = paramName + sizeof(charsetStr) - 1;
+        charsetEnd = start + curParamEnd;
+        typeHasCharset = true;
+        charsetParamStart = curParamStart - 1;
+        charsetParamEnd = curParamEnd;
+      }
+
+      consumed = curParamEnd;
+      curParamStart = curParamEnd + 1;
+    } while (curParamStart < flatStr.Length());
+  }
+
+  bool charsetNeedsQuotedStringUnescaping = false;
+  if (typeHasCharset) {
+    charset = net_FindCharNotInSet(charset, charsetEnd, HTTP_LWS);
+    if (*charset == '"') {
+      charsetNeedsQuotedStringUnescaping = true;
+      charsetEnd =
+          start + net_FindStringEnd(flatStr, charset - start, *charset);
+      charset++;
+      NS_ASSERTION(charsetEnd >= charset, "Bad charset parsing");
+    } else {
+      charsetEnd = net_FindCharInSet(charset, charsetEnd, HTTP_LWS ";");
+    }
+  }
+
+
+  if (type != typeEnd && memchr(type, '/', typeEnd - type) != nullptr &&
+      (aStrict ? (net_FindCharNotInSet(start + consumed, end, HTTP_LWS) == end)
+               : (strncmp(type, "*/*", typeEnd - type) != 0))) {
+    bool eq = !aContentType.IsEmpty() &&
+              aContentType.Equals(Substring(type, typeEnd),
+                                  nsCaseInsensitiveCStringComparator);
+    if (!eq) {
+      aContentType.Assign(type, typeEnd - type);
+      ToLowerCase(aContentType);
+    }
+
+    if ((!eq && *aHadCharset) || typeHasCharset) {
+      *aHadCharset = true;
+      if (charsetNeedsQuotedStringUnescaping) {
+        aContentCharset.Truncate();
+        for (const char* c = charset; c != charsetEnd; c++) {
+          if (*c == '\\' && c + 1 != charsetEnd) {
+            c++;
+          }
+          aContentCharset.Append(*c);
+        }
+      } else {
+        aContentCharset.Assign(charset, charsetEnd - charset);
+      }
+      if (typeHasCharset) {
+        *aCharsetStart = charsetParamStart + aOffset;
+        *aCharsetEnd = charsetParamEnd + aOffset;
+      }
+    }
+    if (!eq && !typeHasCharset) {
+      int32_t charsetStart = int32_t(paramStart);
+      if (charsetStart == kNotFound) charsetStart = flatStr.Length();
+
+      *aCharsetEnd = *aCharsetStart = charsetStart + aOffset;
+    }
+  }
+}
+
+#undef HTTP_LWS
+
+void net_ParseContentType(const nsACString& aHeaderStr,
+                          nsACString& aContentType, nsACString& aContentCharset,
+                          bool* aHadCharset) {
+  int32_t dummy1, dummy2;
+  net_ParseContentType(aHeaderStr, aContentType, aContentCharset, aHadCharset,
+                       &dummy1, &dummy2);
+}
+
+void net_ParseContentType(const nsACString& aHeaderStr,
+                          nsACString& aContentType, nsACString& aContentCharset,
+                          bool* aHadCharset, int32_t* aCharsetStart,
+                          int32_t* aCharsetEnd) {
+
+  *aHadCharset = false;
+  const nsCString& flatStr = PromiseFlatCString(aHeaderStr);
+
+  uint32_t curTypeStart = 0;
+  do {
+    uint32_t curTypeEnd = net_FindMediaDelimiter(flatStr, curTypeStart, ',');
+
+    net_ParseMediaType(
+        Substring(flatStr, curTypeStart, curTypeEnd - curTypeStart),
+        aContentType, aContentCharset, curTypeStart, aHadCharset, aCharsetStart,
+        aCharsetEnd, false);
+
+    curTypeStart = curTypeEnd + 1;
+  } while (curTypeStart < flatStr.Length());
+}
+
+void net_ParseRequestContentType(const nsACString& aHeaderStr,
+                                 nsACString& aContentType,
+                                 nsACString& aContentCharset,
+                                 bool* aHadCharset) {
+
+  aContentType.Truncate();
+  aContentCharset.Truncate();
+  *aHadCharset = false;
+  const nsCString& flatStr = PromiseFlatCString(aHeaderStr);
+
+  nsAutoCString contentType, contentCharset;
+  bool hadCharset = false;
+  int32_t dummy1, dummy2;
+  uint32_t typeEnd = net_FindMediaDelimiter(flatStr, 0, ',');
+  if (typeEnd != flatStr.Length()) {
+    return;
+  }
+  net_ParseMediaType(flatStr, contentType, contentCharset, 0, &hadCharset,
+                     &dummy1, &dummy2, true);
+
+  aContentType = contentType;
+  aContentCharset = contentCharset;
+  *aHadCharset = hadCharset;
+}
+
+bool net_IsValidDNSHost(const nsACString& host) {
+  if (host.Length() > 253) {
+    return false;
+  }
+
+  const char* end = host.EndReading();
+
+  if (net_FindCharNotInSet(host.BeginReading(), end,
+                           "abcdefghijklmnopqrstuvwxyz"
+                           ".-0123456789"
+                           "ABCDEFGHIJKLMNOPQRSTUVWXYZ$+_") == end) {
+    return true;
+  }
+
+  return mozilla::net::HostIsIPLiteral(host);
+}
+
+bool net_IsValidIPv4Addr(const nsACString& aAddr) {
+  return mozilla::net::rust_net_is_valid_ipv4_addr(&aAddr);
+}
+
+bool net_IsValidIPv6Addr(const nsACString& aAddr) {
+  return mozilla::net::rust_net_is_valid_ipv6_addr(&aAddr);
+}
+
+bool net_GetDefaultStatusTextForCode(uint16_t aCode, nsACString& aOutText) {
+  switch (aCode) {
+    case 200:
+      aOutText.AssignLiteral("OK");
+      break;
+    case 404:
+      aOutText.AssignLiteral("Not Found");
+      break;
+    case 301:
+      aOutText.AssignLiteral("Moved Permanently");
+      break;
+    case 304:
+      aOutText.AssignLiteral("Not Modified");
+      break;
+    case 307:
+      aOutText.AssignLiteral("Temporary Redirect");
+      break;
+    case 500:
+      aOutText.AssignLiteral("Internal Server Error");
+      break;
+
+    case 100:
+      aOutText.AssignLiteral("Continue");
+      break;
+    case 101:
+      aOutText.AssignLiteral("Switching Protocols");
+      break;
+    case 201:
+      aOutText.AssignLiteral("Created");
+      break;
+    case 202:
+      aOutText.AssignLiteral("Accepted");
+      break;
+    case 203:
+      aOutText.AssignLiteral("Non Authoritative");
+      break;
+    case 204:
+      aOutText.AssignLiteral("No Content");
+      break;
+    case 205:
+      aOutText.AssignLiteral("Reset Content");
+      break;
+    case 206:
+      aOutText.AssignLiteral("Partial Content");
+      break;
+    case 207:
+      aOutText.AssignLiteral("Multi-Status");
+      break;
+    case 208:
+      aOutText.AssignLiteral("Already Reported");
+      break;
+    case 300:
+      aOutText.AssignLiteral("Multiple Choices");
+      break;
+    case 302:
+      aOutText.AssignLiteral("Found");
+      break;
+    case 303:
+      aOutText.AssignLiteral("See Other");
+      break;
+    case 305:
+      aOutText.AssignLiteral("Use Proxy");
+      break;
+    case 308:
+      aOutText.AssignLiteral("Permanent Redirect");
+      break;
+    case 400:
+      aOutText.AssignLiteral("Bad Request");
+      break;
+    case 401:
+      aOutText.AssignLiteral("Unauthorized");
+      break;
+    case 402:
+      aOutText.AssignLiteral("Payment Required");
+      break;
+    case 403:
+      aOutText.AssignLiteral("Forbidden");
+      break;
+    case 405:
+      aOutText.AssignLiteral("Method Not Allowed");
+      break;
+    case 406:
+      aOutText.AssignLiteral("Not Acceptable");
+      break;
+    case 407:
+      aOutText.AssignLiteral("Proxy Authentication Required");
+      break;
+    case 408:
+      aOutText.AssignLiteral("Request Timeout");
+      break;
+    case 409:
+      aOutText.AssignLiteral("Conflict");
+      break;
+    case 410:
+      aOutText.AssignLiteral("Gone");
+      break;
+    case 411:
+      aOutText.AssignLiteral("Length Required");
+      break;
+    case 412:
+      aOutText.AssignLiteral("Precondition Failed");
+      break;
+    case 413:
+      aOutText.AssignLiteral("Request Entity Too Large");
+      break;
+    case 414:
+      aOutText.AssignLiteral("Request URI Too Long");
+      break;
+    case 415:
+      aOutText.AssignLiteral("Unsupported Media Type");
+      break;
+    case 416:
+      aOutText.AssignLiteral("Requested Range Not Satisfiable");
+      break;
+    case 417:
+      aOutText.AssignLiteral("Expectation Failed");
+      break;
+    case 418:
+      aOutText.AssignLiteral("I'm a teapot");
+      break;
+    case 421:
+      aOutText.AssignLiteral("Misdirected Request");
+      break;
+    case 422:
+      aOutText.AssignLiteral("Unprocessable Entity");
+      break;
+    case 423:
+      aOutText.AssignLiteral("Locked");
+      break;
+    case 424:
+      aOutText.AssignLiteral("Failed Dependency");
+      break;
+    case 425:
+      aOutText.AssignLiteral("Too Early");
+      break;
+    case 426:
+      aOutText.AssignLiteral("Upgrade Required");
+      break;
+    case 428:
+      aOutText.AssignLiteral("Precondition Required");
+      break;
+    case 429:
+      aOutText.AssignLiteral("Too Many Requests");
+      break;
+    case 431:
+      aOutText.AssignLiteral("Request Header Fields Too Large");
+      break;
+    case 451:
+      aOutText.AssignLiteral("Unavailable For Legal Reasons");
+      break;
+    case 501:
+      aOutText.AssignLiteral("Not Implemented");
+      break;
+    case 502:
+      aOutText.AssignLiteral("Bad Gateway");
+      break;
+    case 503:
+      aOutText.AssignLiteral("Service Unavailable");
+      break;
+    case 504:
+      aOutText.AssignLiteral("Gateway Timeout");
+      break;
+    case 505:
+      aOutText.AssignLiteral("HTTP Version Unsupported");
+      break;
+    case 506:
+      aOutText.AssignLiteral("Variant Also Negotiates");
+      break;
+    case 507:
+      aOutText.AssignLiteral("Insufficient Storage ");
+      break;
+    case 508:
+      aOutText.AssignLiteral("Loop Detected");
+      break;
+    case 510:
+      aOutText.AssignLiteral("Not Extended");
+      break;
+    case 511:
+      aOutText.AssignLiteral("Network Authentication Required");
+      break;
+    default:
+      aOutText.AssignLiteral("No Reason Phrase");
+      return false;
+  }
+  return true;
+}
+
+static auto MakeNameMatcher(const nsACString& aName) {
+  return [&aName](const auto& param) { return param.mKey.Equals(aName); };
+}
+
+static void AssignMaybeInvalidUTF8String(const nsACString& aSource,
+                                         nsACString& aDest) {
+  if (NS_FAILED(UTF_8_ENCODING->DecodeWithoutBOMHandling(aSource, aDest))) {
+    MOZ_CRASH("Out of memory when converting URL params.");
+  }
+}
+
+namespace mozilla {
+
+bool URLParams::Has(const nsACString& aName) {
+  return std::any_of(mParams.cbegin(), mParams.cend(), MakeNameMatcher(aName));
+}
+
+bool URLParams::Has(const nsACString& aName, const nsACString& aValue) {
+  return std::any_of(
+      mParams.cbegin(), mParams.cend(), [&aName, &aValue](const auto& param) {
+        return param.mKey.Equals(aName) && param.mValue.Equals(aValue);
+      });
+}
+
+void URLParams::Get(const nsACString& aName, nsACString& aRetval) {
+  aRetval.SetIsVoid(true);
+
+  const auto end = mParams.cend();
+  const auto it = std::find_if(mParams.cbegin(), end, MakeNameMatcher(aName));
+  if (it != end) {
+    aRetval.Assign(it->mValue);
+  }
+}
+
+void URLParams::GetAll(const nsACString& aName, nsTArray<nsCString>& aRetval) {
+  aRetval.Clear();
+
+  for (uint32_t i = 0, len = mParams.Length(); i < len; ++i) {
+    if (mParams[i].mKey.Equals(aName)) {
+      aRetval.AppendElement(mParams[i].mValue);
+    }
+  }
+}
+
+void URLParams::Append(const nsACString& aName, const nsACString& aValue) {
+  Param* param = mParams.AppendElement();
+  param->mKey = aName;
+  param->mValue = aValue;
+}
+
+void URLParams::Set(const nsACString& aName, const nsACString& aValue) {
+  Param* param = nullptr;
+  for (uint32_t i = 0, len = mParams.Length(); i < len;) {
+    if (!mParams[i].mKey.Equals(aName)) {
+      ++i;
+      continue;
+    }
+    if (!param) {
+      param = &mParams[i];
+      ++i;
+      continue;
+    }
+    mParams.RemoveElementAt(i);
+    --len;
+  }
+
+  if (!param) {
+    param = mParams.AppendElement();
+    param->mKey = aName;
+  }
+
+  param->mValue = aValue;
+}
+
+void URLParams::Delete(const nsACString& aName) {
+  mParams.RemoveElementsBy(
+      [&aName](const auto& param) { return param.mKey.Equals(aName); });
+}
+
+void URLParams::Delete(const nsACString& aName, const nsACString& aValue) {
+  mParams.RemoveElementsBy([&aName, &aValue](const auto& param) {
+    return param.mKey.Equals(aName) && param.mValue.Equals(aValue);
+  });
+}
+
+void URLParams::DecodeString(const nsACString& aInput, nsACString& aOutput) {
+  const char* const end = aInput.EndReading();
+  for (const char* iter = aInput.BeginReading(); iter != end;) {
+    if (*iter == '+') {
+      aOutput.Append(' ');
+      ++iter;
+      continue;
+    }
+
+    if (*iter == '%') {
+      const char* const first = iter + 1;
+      const char* const second = first + 1;
+
+      const auto asciiHexDigit = [](char x) {
+        return (x >= 0x41 && x <= 0x46) || (x >= 0x61 && x <= 0x66) ||
+               (x >= 0x30 && x <= 0x39);
+      };
+
+      const auto hexDigit = [](char x) {
+        return x >= 0x30 && x <= 0x39
+                   ? x - 0x30
+                   : (x >= 0x41 && x <= 0x46 ? x - 0x37 : x - 0x57);
+      };
+
+      if (first != end && second != end && asciiHexDigit(*first) &&
+          asciiHexDigit(*second)) {
+        aOutput.Append(hexDigit(*first) * 16 + hexDigit(*second));
+        iter = second + 1;
+      } else {
+        aOutput.Append('%');
+        ++iter;
+      }
+
+      continue;
+    }
+
+    aOutput.Append(*iter);
+    ++iter;
+  }
+  AssignMaybeInvalidUTF8String(aOutput, aOutput);
+}
+
+bool URLParams::ParseNextInternal(const char*& aStart, const char* const aEnd,
+                                  bool aShouldDecode, nsACString* aOutputName,
+                                  nsACString* aOutputValue) {
+  nsDependentCSubstring string;
+
+  const char* const iter = std::find(aStart, aEnd, '&');
+  if (iter != aEnd) {
+    string.Rebind(aStart, iter);
+    aStart = iter + 1;
+  } else {
+    string.Rebind(aStart, aEnd);
+    aStart = aEnd;
+  }
+
+  if (string.IsEmpty()) {
+    return false;
+  }
+
+  const auto* const eqStart = string.BeginReading();
+  const auto* const eqEnd = string.EndReading();
+  const auto* const eqIter = std::find(eqStart, eqEnd, '=');
+
+  nsDependentCSubstring name;
+  nsDependentCSubstring value;
+
+  if (eqIter != eqEnd) {
+    name.Rebind(eqStart, eqIter);
+    value.Rebind(eqIter + 1, eqEnd);
+  } else {
+    name.Rebind(string, 0);
+  }
+
+  if (aShouldDecode) {
+    DecodeString(name, *aOutputName);
+    DecodeString(value, *aOutputValue);
+    return true;
+  }
+
+  AssignMaybeInvalidUTF8String(name, *aOutputName);
+  AssignMaybeInvalidUTF8String(value, *aOutputValue);
+  return true;
+}
+
+bool URLParams::Extract(const nsACString& aInput, const nsACString& aName,
+                        nsACString& aValue) {
+  aValue.SetIsVoid(true);
+  return !URLParams::Parse(
+      aInput, true,
+      [&aName, &aValue](const nsACString& name, nsCString&& value) {
+        if (aName == name) {
+          aValue = std::move(value);
+          return false;
+        }
+        return true;
+      });
+}
+
+void URLParams::ParseInput(const nsACString& aInput) {
+  DeleteAll();
+
+  URLParams::Parse(aInput, true, [this](nsCString&& name, nsCString&& value) {
+    mParams.AppendElement(Param{std::move(name), std::move(value)});
+    return true;
+  });
+}
+
+void URLParams::SerializeString(const nsACString& aInput, nsACString& aValue) {
+  const unsigned char* p = (const unsigned char*)aInput.BeginReading();
+  const unsigned char* end = p + aInput.Length();
+
+  while (p != end) {
+    if (*p == 0x20) {
+      aValue.Append(0x2B);
+    } else if (*p == 0x2A || *p == 0x2D || *p == 0x2E ||
+               (*p >= 0x30 && *p <= 0x39) || (*p >= 0x41 && *p <= 0x5A) ||
+               *p == 0x5F || (*p >= 0x61 && *p <= 0x7A)) {
+      aValue.Append(*p);
+    } else {
+      aValue.AppendPrintf("%%%.2X", *p);
+    }
+
+    ++p;
+  }
+}
+
+void URLParams::Serialize(nsACString& aValue, bool aEncode) const {
+  aValue.Truncate();
+  bool first = true;
+
+  for (uint32_t i = 0, len = mParams.Length(); i < len; ++i) {
+    if (first) {
+      first = false;
+    } else {
+      aValue.Append('&');
+    }
+
+    if (aEncode) {
+      SerializeString(mParams[i].mKey, aValue);
+      aValue.Append('=');
+      SerializeString(mParams[i].mValue, aValue);
+    } else {
+      aValue.Append(mParams[i].mKey);
+      aValue.Append('=');
+      aValue.Append(mParams[i].mValue);
+    }
+  }
+}
+
+void URLParams::Sort() {
+  mParams.StableSort([](const Param& lhs, const Param& rhs) {
+    return Compare(NS_ConvertUTF8toUTF16(lhs.mKey),
+                   NS_ConvertUTF8toUTF16(rhs.mKey));
+  });
+}
+
+}  

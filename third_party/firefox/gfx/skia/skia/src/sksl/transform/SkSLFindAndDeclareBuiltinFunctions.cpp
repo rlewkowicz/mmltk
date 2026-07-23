@@ -1,0 +1,86 @@
+/*
+ * Copyright 2022 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/core/SkTypes.h"
+#include "src/core/SkTHash.h"
+#include "src/sksl/SkSLContext.h"
+#include "src/sksl/SkSLIntrinsicList.h"
+#include "src/sksl/SkSLProgramSettings.h"
+#include "src/sksl/analysis/SkSLProgramUsage.h"
+#include "src/sksl/ir/SkSLFunctionDeclaration.h"
+#include "src/sksl/ir/SkSLFunctionDefinition.h"
+#include "src/sksl/ir/SkSLProgram.h"
+#include "src/sksl/ir/SkSLSymbol.h"
+#include "src/sksl/transform/SkSLTransform.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace SkSL {
+
+class ProgramElement;
+
+void Transform::FindAndDeclareBuiltinFunctions(Program& program) {
+    ProgramUsage* usage = program.fUsage.get();
+    Context& context = *program.fContext;
+
+    std::vector<const FunctionDefinition*> addedBuiltins;
+    for (;;) {
+        size_t numBuiltinsAtStart = addedBuiltins.size();
+        for (const auto& [symbol, count] : usage->fCallCounts) {
+            const FunctionDeclaration& fn = symbol->as<FunctionDeclaration>();
+            if (!fn.isBuiltin() || count == 0) {
+                continue;
+            }
+            if (fn.intrinsicKind() == k_dFdy_IntrinsicKind) {
+                if (!context.fConfig->fSettings.fForceNoRTFlip) {
+                    program.fInterface.fRTFlipUniform |= Program::Interface::kRTFlip_Derivative;
+                }
+            }
+            if (const FunctionDefinition* builtinDef = fn.definition()) {
+                if (std::find(addedBuiltins.begin(), addedBuiltins.end(), builtinDef) ==
+                    addedBuiltins.end()) {
+                    addedBuiltins.push_back(builtinDef);
+                }
+            }
+        }
+
+        if (addedBuiltins.size() == numBuiltinsAtStart) {
+            break;
+        }
+
+        std::sort(addedBuiltins.begin() + numBuiltinsAtStart,
+                  addedBuiltins.end(),
+                  [](const FunctionDefinition* aDefinition, const FunctionDefinition* bDefinition) {
+                      const FunctionDeclaration& a = aDefinition->declaration();
+                      const FunctionDeclaration& b = bDefinition->declaration();
+                      if (a.name() != b.name()) {
+                          return a.name() > b.name();
+                      }
+                      return a.description() > b.description();
+                  });
+
+        int usageCallCounts = usage->fCallCounts.count();
+
+        for (size_t index = numBuiltinsAtStart; index < addedBuiltins.size(); ++index) {
+            usage->add(*addedBuiltins[index]);
+        }
+
+        if (usage->fCallCounts.count() == usageCallCounts) {
+            break;
+        }
+    }
+
+    program.fSharedElements.insert(program.fSharedElements.begin(),
+                                   addedBuiltins.rbegin(), addedBuiltins.rend());
+}
+
+}  

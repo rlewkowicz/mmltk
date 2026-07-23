@@ -1,0 +1,2149 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include <utility>
+
+#include "mozilla/Encoding.h"
+#include "mozilla/IntegerRange.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/RangeBoundary.h"
+#include "mozilla/Result.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/StringBuffer.h"
+#include "mozilla/TextControlElement.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/AbstractRange.h"
+#include "mozilla/dom/ChildIterator.h"
+#include "mozilla/dom/Comment.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentType.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/HTMLBRElement.h"
+#include "mozilla/dom/ProcessingInstruction.h"
+#include "mozilla/dom/Selection.h"
+#include "mozilla/dom/ShadowRoot.h"
+#include "mozilla/dom/Text.h"
+#include "nsCOMPtr.h"
+#include "nsCRT.h"
+#include "nsComponentManagerUtils.h"
+#include "nsContentUtils.h"
+#include "nsElementTable.h"
+#include "nsGkAtoms.h"
+#include "nsHTMLDocument.h"
+#include "nsIContent.h"
+#include "nsIContentInlines.h"
+#include "nsIContentSerializer.h"
+#include "nsIDocumentEncoder.h"
+#include "nsIFrame.h"
+#include "nsINode.h"
+#include "nsIOutputStream.h"
+#include "nsIScriptContext.h"
+#include "nsIScriptGlobalObject.h"
+#include "nsISupports.h"
+#include "nsITransferable.h"
+#include "nsLayoutUtils.h"
+#include "nsMimeTypes.h"
+#include "nsRange.h"
+#include "nsReadableUtils.h"
+#include "nsTArray.h"
+#include "nsUnicharUtils.h"
+#include "nscore.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+enum nsRangeIterationDirection { kDirectionOut = -1, kDirectionIn = 1 };
+
+class TextStreamer {
+ public:
+  TextStreamer(nsIOutputStream& aStream, UniquePtr<Encoder> aUnicodeEncoder,
+               bool aIsPlainText, nsAString& aOutputBuffer);
+
+  nsresult FlushIfStringLongEnough();
+
+  nsresult ForceFlush();
+
+ private:
+  const static uint32_t kMaxLengthBeforeFlush = 1024;
+
+  const static uint32_t kEncoderBufferSizeInBytes = 4096;
+
+  nsresult EncodeAndWrite();
+
+  nsresult EncodeAndWriteAndTruncate();
+
+  const nsCOMPtr<nsIOutputStream> mStream;
+  const UniquePtr<Encoder> mUnicodeEncoder;
+  const bool mIsPlainText;
+  nsAString& mOutputBuffer;
+};
+
+TextStreamer::TextStreamer(nsIOutputStream& aStream,
+                           UniquePtr<Encoder> aUnicodeEncoder,
+                           bool aIsPlainText, nsAString& aOutputBuffer)
+    : mStream{&aStream},
+      mUnicodeEncoder(std::move(aUnicodeEncoder)),
+      mIsPlainText(aIsPlainText),
+      mOutputBuffer(aOutputBuffer) {
+  MOZ_ASSERT(mUnicodeEncoder);
+}
+
+nsresult TextStreamer::FlushIfStringLongEnough() {
+  nsresult rv = NS_OK;
+
+  if (mOutputBuffer.Length() > kMaxLengthBeforeFlush) {
+    rv = EncodeAndWriteAndTruncate();
+  }
+
+  return rv;
+}
+
+nsresult TextStreamer::ForceFlush() { return EncodeAndWriteAndTruncate(); }
+
+nsresult TextStreamer::EncodeAndWrite() {
+  if (mOutputBuffer.IsEmpty()) {
+    return NS_OK;
+  }
+
+  uint8_t buffer[kEncoderBufferSizeInBytes];
+  auto src = Span(mOutputBuffer);
+  auto bufferSpan = Span(buffer);
+  auto dst = bufferSpan.To(bufferSpan.Length() - 1);
+  for (;;) {
+    uint32_t result;
+    size_t read;
+    size_t written;
+    if (mIsPlainText) {
+      std::tie(result, read, written) =
+          mUnicodeEncoder->EncodeFromUTF16WithoutReplacement(src, dst, false);
+      if (result != kInputEmpty && result != kOutputFull) {
+        dst[written++] = '?';
+      }
+    } else {
+      std::tie(result, read, written, std::ignore) =
+          mUnicodeEncoder->EncodeFromUTF16(src, dst, false);
+    }
+    src = src.From(read);
+    bufferSpan[written] = 0;
+    uint32_t streamWritten;
+    nsresult rv = mStream->Write(reinterpret_cast<char*>(dst.Elements()),
+                                 written, &streamWritten);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    if (result == kInputEmpty) {
+      return NS_OK;
+    }
+  }
+}
+
+nsresult TextStreamer::EncodeAndWriteAndTruncate() {
+  const nsresult rv = EncodeAndWrite();
+  mOutputBuffer.Truncate();
+  return rv;
+}
+
+class EncodingScope {
+ public:
+  bool IsLimited() const;
+
+  RefPtr<Selection> mSelection;
+  RefPtr<nsRange> mRange;
+  nsCOMPtr<nsINode> mNode;
+  bool mNodeIsContainer = false;
+};
+
+bool EncodingScope::IsLimited() const { return mSelection || mRange || mNode; }
+
+struct RangeBoundariesInclusiveAncestorsAndOffsets {
+  using InclusiveAncestors = AutoTArray<nsIContent*, 8>;
+
+  using InclusiveAncestorsOffsets = AutoTArray<Maybe<uint32_t>, 8>;
+
+  InclusiveAncestors mInclusiveAncestorsOfStart;
+  InclusiveAncestorsOffsets mInclusiveAncestorsOffsetsOfStart;
+
+  InclusiveAncestors mInclusiveAncestorsOfEnd;
+  InclusiveAncestorsOffsets mInclusiveAncestorsOffsetsOfEnd;
+};
+
+struct ContextInfoDepth {
+  uint32_t mStart = 0;
+  uint32_t mEnd = 0;
+};
+
+class nsDocumentEncoder : public nsIDocumentEncoder {
+ protected:
+  class RangeNodeContext {
+   public:
+    virtual ~RangeNodeContext() = default;
+
+    virtual bool IncludeInContext(nsINode& aNode) const;
+
+    virtual int32_t GetImmediateContextCount(
+        const nsTArray<nsINode*>& aAncestorArray) const {
+      return -1;
+    }
+  };
+
+ public:
+  nsDocumentEncoder();
+
+ protected:
+  explicit nsDocumentEncoder(UniquePtr<RangeNodeContext> aRangeNodeContext);
+
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS(nsDocumentEncoder)
+  NS_DECL_NSIDOCUMENTENCODER
+
+ protected:
+  virtual ~nsDocumentEncoder();
+
+  void Initialize(bool aClearCachedSerializer = true,
+                  AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+                      AllowRangeCrossShadowBoundary::No);
+
+  nsresult SerializeDependingOnScope(uint32_t aMaxLength);
+
+  nsresult SerializeSelection();
+
+  nsresult SerializeNode();
+
+  nsresult SerializeWholeDocument(uint32_t aMaxLength);
+
+  static bool IsInvisibleNodeAndShouldBeSkipped(const nsINode& aNode,
+                                                const uint32_t aFlags) {
+    if (aFlags & SkipInvisibleContent) {
+      const nsINode* node{&aNode};
+      if (const ShadowRoot* shadowRoot = ShadowRoot::FromNode(node)) {
+        node = shadowRoot->GetHost();
+      }
+
+      if (node->IsContent()) {
+        nsIFrame* frame = node->AsContent()->GetPrimaryFrame();
+        if (!frame) {
+          if (node->IsElement() && node->AsElement()->IsDisplayContents()) {
+            return false;
+          }
+          if (node->IsText()) {
+            return false;
+          }
+          if (node->IsHTMLElement(nsGkAtoms::rp)) {
+            return false;
+          }
+          return true;
+        }
+        if (node->IsText() &&
+            (!frame->StyleVisibility()->IsVisible() ||
+             frame->IsHiddenByContentVisibilityOnAnyAncestor())) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  void ReleaseDocumentReferenceAndInitialize(bool aClearCachedSerializer);
+
+  class MOZ_STACK_CLASS AutoReleaseDocumentIfNeeded final {
+   public:
+    explicit AutoReleaseDocumentIfNeeded(nsDocumentEncoder* aEncoder)
+        : mEncoder(aEncoder) {}
+
+    ~AutoReleaseDocumentIfNeeded() {
+      if (mEncoder->mFlags & RequiresReinitAfterOutput) {
+        const bool clearCachedSerializer = false;
+        mEncoder->ReleaseDocumentReferenceAndInitialize(clearCachedSerializer);
+      }
+    }
+
+   private:
+    nsDocumentEncoder* mEncoder;
+  };
+
+  nsCOMPtr<Document> mDocument;
+  EncodingScope mEncodingScope;
+  nsCOMPtr<nsIContentSerializer> mSerializer;
+
+  Maybe<TextStreamer> mTextStreamer;
+  nsCOMPtr<nsIDocumentEncoderNodeFixup> mNodeFixup;
+
+  nsString mMimeType;
+  const Encoding* mEncoding;
+  uint32_t mFlags;
+  uint32_t mWrapColumn;
+  bool mNeedsPreformatScanning;
+  bool mIsCopying;  
+  RefPtr<StringBuffer> mCachedBuffer;
+
+  class NodeSerializer {
+   public:
+    NodeSerializer(const bool& aNeedsPreformatScanning,
+                   const nsCOMPtr<nsIContentSerializer>& aSerializer,
+                   const uint32_t& aFlags,
+                   const nsCOMPtr<nsIDocumentEncoderNodeFixup>& aNodeFixup,
+                   Maybe<TextStreamer>& aTextStreamer)
+        : mNeedsPreformatScanning{aNeedsPreformatScanning},
+          mSerializer{aSerializer},
+          mFlags{aFlags},
+          mNodeFixup{aNodeFixup},
+          mTextStreamer{aTextStreamer} {}
+
+    nsresult SerializeNodeStart(nsINode& aOriginalNode, int32_t aStartOffset,
+                                int32_t aEndOffset,
+                                nsINode* aFixupNode = nullptr) const;
+
+    enum class SerializeRoot { eYes, eNo };
+
+    nsresult SerializeToStringRecursive(nsINode* aNode,
+                                        SerializeRoot aSerializeRoot,
+                                        uint32_t aMaxLength = 0) const;
+
+    nsresult SerializeNodeEnd(nsINode& aOriginalNode,
+                              nsINode* aFixupNode = nullptr) const;
+
+    [[nodiscard]] nsresult SerializeTextNode(nsINode& aNode,
+                                             int32_t aStartOffset,
+                                             int32_t aEndOffset) const;
+
+    nsresult SerializeToStringIterative(nsINode* aNode) const;
+
+   private:
+    const bool& mNeedsPreformatScanning;
+    const nsCOMPtr<nsIContentSerializer>& mSerializer;
+    const uint32_t& mFlags;
+    const nsCOMPtr<nsIDocumentEncoderNodeFixup>& mNodeFixup;
+    Maybe<TextStreamer>& mTextStreamer;
+  };
+
+  NodeSerializer mNodeSerializer;
+
+  const UniquePtr<RangeNodeContext> mRangeNodeContext;
+
+  struct RangeContextSerializer final {
+    RangeContextSerializer(const RangeNodeContext& aRangeNodeContext,
+                           const NodeSerializer& aNodeSerializer)
+        : mDisableContextSerialize{false},
+          mRangeNodeContext{aRangeNodeContext},
+          mNodeSerializer{aNodeSerializer} {}
+
+    nsresult SerializeRangeContextStart(
+        const nsTArray<nsINode*>& aAncestorArray);
+    nsresult SerializeRangeContextEnd();
+
+    bool mDisableContextSerialize;
+    AutoTArray<AutoTArray<nsINode*, 8>, 8> mRangeContexts;
+
+    const RangeNodeContext& mRangeNodeContext;
+
+   private:
+    const NodeSerializer& mNodeSerializer;
+  };
+
+  RangeContextSerializer mRangeContextSerializer;
+
+  struct RangeSerializer {
+    RangeSerializer(const uint32_t& aFlags,
+                    const NodeSerializer& aNodeSerializer,
+                    RangeContextSerializer& aRangeContextSerializer)
+        : mStartRootIndex{0},
+          mEndRootIndex{0},
+          mHaltRangeHint{false},
+          mFlags{aFlags},
+          mNodeSerializer{aNodeSerializer},
+          mRangeContextSerializer{aRangeContextSerializer} {}
+
+    void Initialize(AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary);
+
+    nsresult SerializeRangeNodes(const nsRange* aRange, nsINode* aNode,
+                                 int32_t aDepth);
+
+    [[nodiscard]] nsresult SerializeChildrenOfContent(nsIContent& aContent,
+                                                      uint32_t aStartOffset,
+                                                      uint32_t aEndOffset,
+                                                      const nsRange* aRange,
+                                                      int32_t aDepth);
+
+    nsresult SerializeRangeToString(const nsRange* aRange);
+
+    nsCOMPtr<nsINode> mClosestCommonInclusiveAncestorOfRange;
+
+    AutoTArray<nsINode*, 8> mCommonInclusiveAncestors;
+
+    ContextInfoDepth mContextInfoDepth;
+
+   private:
+    struct StartAndEndContent {
+      nsCOMPtr<nsIContent> mStart;
+      nsCOMPtr<nsIContent> mEnd;
+    };
+
+    StartAndEndContent GetStartAndEndContentForRecursionLevel(
+        int32_t aDepth) const;
+
+    bool HasInvisibleParentAndShouldBeSkipped(nsINode& aNode) const;
+
+    nsresult SerializeNodePartiallyContainedInRange(
+        nsIContent& aContent, const StartAndEndContent& aStartAndEndContent,
+        const nsRange& aRange, int32_t aDepth);
+
+    nsresult SerializeTextNode(nsIContent& aContent,
+                               const StartAndEndContent& aStartAndEndContent,
+                               const nsRange& aRange) const;
+
+    RangeBoundariesInclusiveAncestorsAndOffsets
+        mRangeBoundariesInclusiveAncestorsAndOffsets;
+    int32_t mStartRootIndex;
+    int32_t mEndRootIndex;
+    bool mHaltRangeHint;
+
+    const uint32_t& mFlags;
+
+    const NodeSerializer& mNodeSerializer;
+    RangeContextSerializer& mRangeContextSerializer;
+
+    AllowRangeCrossShadowBoundary mAllowCrossShadowBoundary =
+        AllowRangeCrossShadowBoundary::No;
+  };
+
+  RangeSerializer mRangeSerializer;
+};
+
+void nsDocumentEncoder::RangeSerializer::Initialize(
+    AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary) {
+  mContextInfoDepth = {};
+  mStartRootIndex = 0;
+  mEndRootIndex = 0;
+  mHaltRangeHint = false;
+  mClosestCommonInclusiveAncestorOfRange = nullptr;
+  mRangeBoundariesInclusiveAncestorsAndOffsets = {};
+  mAllowCrossShadowBoundary = aAllowCrossShadowBoundary;
+}
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(nsDocumentEncoder)
+NS_IMPL_CYCLE_COLLECTING_RELEASE_WITH_LAST_RELEASE(
+    nsDocumentEncoder, ReleaseDocumentReferenceAndInitialize(true))
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsDocumentEncoder)
+  NS_INTERFACE_MAP_ENTRY(nsIDocumentEncoder)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTION(
+    nsDocumentEncoder, mDocument, mEncodingScope.mSelection,
+    mEncodingScope.mRange, mEncodingScope.mNode, mSerializer,
+    mRangeSerializer.mClosestCommonInclusiveAncestorOfRange)
+
+nsDocumentEncoder::nsDocumentEncoder(
+    UniquePtr<RangeNodeContext> aRangeNodeContext)
+    : mEncoding(nullptr),
+      mIsCopying(false),
+      mCachedBuffer(nullptr),
+      mNodeSerializer(mNeedsPreformatScanning, mSerializer, mFlags, mNodeFixup,
+                      mTextStreamer),
+      mRangeNodeContext(std::move(aRangeNodeContext)),
+      mRangeContextSerializer(*mRangeNodeContext, mNodeSerializer),
+      mRangeSerializer(mFlags, mNodeSerializer, mRangeContextSerializer) {
+  MOZ_ASSERT(mRangeNodeContext);
+
+  Initialize();
+  mMimeType.AssignLiteral("text/plain");
+}
+
+nsDocumentEncoder::nsDocumentEncoder()
+    : nsDocumentEncoder(MakeUnique<RangeNodeContext>()) {}
+
+void nsDocumentEncoder::Initialize(
+    bool aClearCachedSerializer,
+    AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary) {
+  mFlags = 0;
+  mWrapColumn = 72;
+  mRangeSerializer.Initialize(aAllowCrossShadowBoundary);
+  mNeedsPreformatScanning = false;
+  mRangeContextSerializer.mDisableContextSerialize = false;
+  mEncodingScope = {};
+  mNodeFixup = nullptr;
+  if (aClearCachedSerializer) {
+    mSerializer = nullptr;
+  }
+}
+
+static bool ParentIsTR(nsIContent* aContent) {
+  mozilla::dom::Element* parent = aContent->GetParentElement();
+  if (!parent) {
+    return false;
+  }
+  return parent->IsHTMLElement(nsGkAtoms::tr);
+}
+
+static AllowRangeCrossShadowBoundary GetAllowRangeCrossShadowBoundary(
+    const uint32_t aFlags) {
+  return (aFlags & nsIDocumentEncoder::AllowCrossShadowBoundary)
+             ? AllowRangeCrossShadowBoundary::Yes
+             : AllowRangeCrossShadowBoundary::No;
+}
+
+nsresult nsDocumentEncoder::SerializeDependingOnScope(uint32_t aMaxLength) {
+  nsresult rv = NS_OK;
+  if (mEncodingScope.mSelection) {
+    rv = SerializeSelection();
+  } else if (nsRange* range = mEncodingScope.mRange) {
+    rv = mRangeSerializer.SerializeRangeToString(range);
+  } else if (mEncodingScope.mNode) {
+    rv = SerializeNode();
+  } else {
+    rv = SerializeWholeDocument(aMaxLength);
+  }
+
+  mEncodingScope = {};
+
+  return rv;
+}
+
+nsresult nsDocumentEncoder::SerializeSelection() {
+  NS_ENSURE_TRUE(mEncodingScope.mSelection, NS_ERROR_FAILURE);
+
+  nsresult rv = NS_OK;
+  const Selection* selection = mEncodingScope.mSelection;
+  nsCOMPtr<nsINode> node;
+  nsCOMPtr<nsINode> prevNode;
+  uint32_t firstRangeStartDepth = 0;
+  const uint32_t rangeCount = selection->RangeCount();
+  for (const uint32_t i : IntegerRange(rangeCount)) {
+    MOZ_ASSERT(selection->RangeCount() == rangeCount);
+    RefPtr<const nsRange> range = selection->GetRangeAt(i);
+
+    node = ShadowDOMSelectionHelpers::GetStartContainer(
+        range, GetAllowRangeCrossShadowBoundary(mFlags));
+    NS_ENSURE_TRUE(node, NS_ERROR_FAILURE);
+    if (node != prevNode) {
+      if (prevNode) {
+        rv = mNodeSerializer.SerializeNodeEnd(*prevNode);
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+      nsCOMPtr<nsIContent> content = nsIContent::FromNodeOrNull(node);
+      if (content && content->IsHTMLElement(nsGkAtoms::tr) &&
+          !ParentIsTR(content)) {
+        if (!prevNode) {
+          mRangeSerializer.mCommonInclusiveAncestors.Clear();
+          nsContentUtils::GetInclusiveAncestors(
+              node->GetParentNode(),
+              mRangeSerializer.mCommonInclusiveAncestors);
+          rv = mRangeContextSerializer.SerializeRangeContextStart(
+              mRangeSerializer.mCommonInclusiveAncestors);
+          NS_ENSURE_SUCCESS(rv, rv);
+          mRangeContextSerializer.mDisableContextSerialize = true;
+        }
+
+        rv = mNodeSerializer.SerializeNodeStart(*node, 0, -1);
+        NS_ENSURE_SUCCESS(rv, rv);
+        prevNode = node;
+      } else if (prevNode) {
+        mRangeContextSerializer.mDisableContextSerialize = false;
+
+        mRangeSerializer.mCommonInclusiveAncestors.Clear();
+        nsContentUtils::GetInclusiveAncestors(
+            prevNode->GetParentNode(),
+            mRangeSerializer.mCommonInclusiveAncestors);
+
+        rv = mRangeContextSerializer.SerializeRangeContextEnd();
+        NS_ENSURE_SUCCESS(rv, rv);
+        prevNode = nullptr;
+      }
+    }
+
+    rv = mRangeSerializer.SerializeRangeToString(range);
+    NS_ENSURE_SUCCESS(rv, rv);
+    if (i == 0) {
+      firstRangeStartDepth = mRangeSerializer.mContextInfoDepth.mStart;
+    }
+  }
+  mRangeSerializer.mContextInfoDepth.mStart = firstRangeStartDepth;
+
+  if (prevNode) {
+    rv = mNodeSerializer.SerializeNodeEnd(*prevNode);
+    NS_ENSURE_SUCCESS(rv, rv);
+    mRangeContextSerializer.mDisableContextSerialize = false;
+
+    mRangeSerializer.mCommonInclusiveAncestors.Clear();
+    nsContentUtils::GetInclusiveAncestors(
+        prevNode->GetParentNode(), mRangeSerializer.mCommonInclusiveAncestors);
+
+    rv = mRangeContextSerializer.SerializeRangeContextEnd();
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  mRangeContextSerializer.mDisableContextSerialize = false;
+
+  return rv;
+}
+
+nsresult nsDocumentEncoder::SerializeNode() {
+  NS_ENSURE_TRUE(mEncodingScope.mNode, NS_ERROR_FAILURE);
+
+  nsresult rv = NS_OK;
+  nsINode* node = mEncodingScope.mNode;
+  const bool nodeIsContainer = mEncodingScope.mNodeIsContainer;
+  if (!mNodeFixup && !(mFlags & SkipInvisibleContent) && !mTextStreamer &&
+      nodeIsContainer) {
+    rv = mNodeSerializer.SerializeToStringIterative(node);
+  } else {
+    rv = mNodeSerializer.SerializeToStringRecursive(
+        node, nodeIsContainer ? NodeSerializer::SerializeRoot::eNo
+                              : NodeSerializer::SerializeRoot::eYes);
+  }
+
+  return rv;
+}
+
+nsresult nsDocumentEncoder::SerializeWholeDocument(uint32_t aMaxLength) {
+  NS_ENSURE_FALSE(mEncodingScope.mSelection, NS_ERROR_FAILURE);
+  NS_ENSURE_FALSE(mEncodingScope.mRange, NS_ERROR_FAILURE);
+  NS_ENSURE_FALSE(mEncodingScope.mNode, NS_ERROR_FAILURE);
+
+  nsresult rv = mSerializer->AppendDocumentStart(mDocument);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = mNodeSerializer.SerializeToStringRecursive(
+      mDocument, NodeSerializer::SerializeRoot::eYes, aMaxLength);
+  return rv;
+}
+
+nsDocumentEncoder::~nsDocumentEncoder() = default;
+
+NS_IMETHODIMP
+nsDocumentEncoder::Init(Document* aDocument, const nsAString& aMimeType,
+                        uint32_t aFlags) {
+  if (!aDocument) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  Initialize(!mMimeType.Equals(aMimeType),
+             GetAllowRangeCrossShadowBoundary(aFlags));
+
+  mDocument = aDocument;
+
+  mMimeType = aMimeType;
+
+  mFlags = aFlags;
+  mIsCopying = false;
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsDocumentEncoder::SetWrapColumn(uint32_t aWC) {
+  mWrapColumn = aWC;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsDocumentEncoder::SetSelection(Selection* aSelection) {
+  mEncodingScope.mSelection = aSelection;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsDocumentEncoder::SetRange(nsRange* aRange) {
+  mEncodingScope.mRange = aRange;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsDocumentEncoder::SetNode(nsINode* aNode) {
+  mEncodingScope.mNodeIsContainer = false;
+  mEncodingScope.mNode = aNode;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsDocumentEncoder::SetContainerNode(nsINode* aContainer) {
+  mEncodingScope.mNodeIsContainer = true;
+  mEncodingScope.mNode = aContainer;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsDocumentEncoder::SetCharset(const nsACString& aCharset) {
+  const Encoding* encoding = Encoding::ForLabel(aCharset);
+  if (!encoding) {
+    return NS_ERROR_UCONV_NOCONV;
+  }
+  mEncoding = encoding->OutputEncoding();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsDocumentEncoder::GetMimeType(nsAString& aMimeType) {
+  aMimeType = mMimeType;
+  return NS_OK;
+}
+
+class FixupNodeDeterminer {
+ public:
+  FixupNodeDeterminer(nsIDocumentEncoderNodeFixup* aNodeFixup,
+                      nsINode* aFixupNode, nsINode& aOriginalNode)
+      : mIsSerializationOfFixupChildrenNeeded{false},
+        mNodeFixup(aNodeFixup),
+        mOriginalNode(aOriginalNode) {
+    if (mNodeFixup) {
+      if (aFixupNode) {
+        mFixupNode = aFixupNode;
+      } else {
+        mNodeFixup->FixupNode(&mOriginalNode,
+                              &mIsSerializationOfFixupChildrenNeeded,
+                              getter_AddRefs(mFixupNode));
+      }
+    }
+  }
+
+  bool IsSerializationOfFixupChildrenNeeded() const {
+    return mIsSerializationOfFixupChildrenNeeded;
+  }
+
+  nsINode& GetFixupNodeFallBackToOriginalNode() const {
+    return mFixupNode ? *mFixupNode : mOriginalNode;
+  }
+
+ private:
+  bool mIsSerializationOfFixupChildrenNeeded;
+  nsIDocumentEncoderNodeFixup* mNodeFixup;
+  nsCOMPtr<nsINode> mFixupNode;
+  nsINode& mOriginalNode;
+};
+
+nsresult nsDocumentEncoder::NodeSerializer::SerializeNodeStart(
+    nsINode& aOriginalNode, int32_t aStartOffset, int32_t aEndOffset,
+    nsINode* aFixupNode) const {
+  if (mNeedsPreformatScanning) {
+    if (aOriginalNode.IsElement()) {
+      mSerializer->ScanElementForPreformat(aOriginalNode.AsElement());
+    } else if (aOriginalNode.IsText()) {
+      const nsCOMPtr<nsINode> parent = aOriginalNode.GetParent();
+      if (parent && parent->IsElement()) {
+        mSerializer->ScanElementForPreformat(parent->AsElement());
+      }
+    }
+  }
+
+  if (IsInvisibleNodeAndShouldBeSkipped(aOriginalNode, mFlags)) {
+    return NS_OK;
+  }
+
+  FixupNodeDeterminer fixupNodeDeterminer{mNodeFixup, aFixupNode,
+                                          aOriginalNode};
+  nsINode* node = &fixupNodeDeterminer.GetFixupNodeFallBackToOriginalNode();
+
+  nsresult rv = NS_OK;
+
+  if (node->IsElement()) {
+    if ((mFlags & (nsIDocumentEncoder::OutputPreformatted |
+                   nsIDocumentEncoder::OutputDropInvisibleBreak)) &&
+        nsLayoutUtils::IsInvisibleBreak(node)) {
+      return rv;
+    }
+    rv = mSerializer->AppendElementStart(node->AsElement(),
+                                         aOriginalNode.AsElement());
+    return rv;
+  }
+
+  switch (node->NodeType()) {
+    case nsINode::TEXT_NODE: {
+      rv = mSerializer->AppendText(node->AsText(), aStartOffset, aEndOffset);
+      break;
+    }
+    case nsINode::CDATA_SECTION_NODE: {
+      rv = mSerializer->AppendCDATASection(node->AsText(), aStartOffset,
+                                           aEndOffset);
+      break;
+    }
+    case nsINode::PROCESSING_INSTRUCTION_NODE: {
+      rv = mSerializer->AppendProcessingInstruction(
+          static_cast<ProcessingInstruction*>(node), aStartOffset, aEndOffset);
+      break;
+    }
+    case nsINode::COMMENT_NODE: {
+      rv = mSerializer->AppendComment(static_cast<Comment*>(node), aStartOffset,
+                                      aEndOffset);
+      break;
+    }
+    case nsINode::DOCUMENT_TYPE_NODE: {
+      rv = mSerializer->AppendDoctype(static_cast<DocumentType*>(node));
+      break;
+    }
+  }
+
+  return rv;
+}
+
+nsresult nsDocumentEncoder::NodeSerializer::SerializeNodeEnd(
+    nsINode& aOriginalNode, nsINode* aFixupNode) const {
+  if (mNeedsPreformatScanning) {
+    if (aOriginalNode.IsElement()) {
+      mSerializer->ForgetElementForPreformat(aOriginalNode.AsElement());
+    } else if (aOriginalNode.IsText()) {
+      const nsCOMPtr<nsINode> parent = aOriginalNode.GetParent();
+      if (parent && parent->IsElement()) {
+        mSerializer->ForgetElementForPreformat(parent->AsElement());
+      }
+    }
+  }
+
+  if (IsInvisibleNodeAndShouldBeSkipped(aOriginalNode, mFlags)) {
+    return NS_OK;
+  }
+
+  nsresult rv = NS_OK;
+
+  FixupNodeDeterminer fixupNodeDeterminer{mNodeFixup, aFixupNode,
+                                          aOriginalNode};
+  nsINode* node = &fixupNodeDeterminer.GetFixupNodeFallBackToOriginalNode();
+
+  if (node->IsElement()) {
+    rv = mSerializer->AppendElementEnd(node->AsElement(),
+                                       aOriginalNode.AsElement());
+  }
+
+  return rv;
+}
+
+nsresult nsDocumentEncoder::NodeSerializer::SerializeToStringRecursive(
+    nsINode* aNode, SerializeRoot aSerializeRoot, uint32_t aMaxLength) const {
+  uint32_t outputLength{0};
+  nsresult rv = mSerializer->GetOutputLength(outputLength);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (aMaxLength > 0 && outputLength >= aMaxLength) {
+    return NS_OK;
+  }
+
+  NS_ENSURE_TRUE(aNode, NS_ERROR_NULL_POINTER);
+
+  if (IsInvisibleNodeAndShouldBeSkipped(*aNode, mFlags)) {
+    return NS_OK;
+  }
+
+  FixupNodeDeterminer fixupNodeDeterminer{mNodeFixup, nullptr, *aNode};
+  nsINode* maybeFixedNode =
+      &fixupNodeDeterminer.GetFixupNodeFallBackToOriginalNode();
+
+  if (mFlags & SkipInvisibleContent) {
+    if (aNode->IsContent()) {
+      if (nsIFrame* frame = aNode->AsContent()->GetPrimaryFrame()) {
+        if (!frame->IsSelectable()) {
+          aSerializeRoot = SerializeRoot::eNo;
+        }
+      }
+    }
+  }
+
+  if (aSerializeRoot == SerializeRoot::eYes) {
+    int32_t endOffset = -1;
+    if (aMaxLength > 0) {
+      MOZ_ASSERT(aMaxLength >= outputLength);
+      endOffset = aMaxLength - outputLength;
+    }
+    rv = SerializeNodeStart(*aNode, 0, endOffset, maybeFixedNode);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  ShadowRoot* shadowRoot = ShadowDOMSelectionHelpers::GetShadowRoot(
+      aNode, GetAllowRangeCrossShadowBoundary(mFlags));
+
+  if (shadowRoot) {
+    SerializeToStringRecursive(shadowRoot, aSerializeRoot, aMaxLength);
+  }
+
+  nsINode* node = fixupNodeDeterminer.IsSerializationOfFixupChildrenNeeded()
+                      ? maybeFixedNode
+                      : aNode;
+
+  int32_t counter = -1;
+
+  const bool allowCrossShadowBoundary =
+      GetAllowRangeCrossShadowBoundary(mFlags) ==
+      AllowRangeCrossShadowBoundary::Yes;
+  auto GetNextNode = [&counter, node, allowCrossShadowBoundary](
+                         nsINode* aCurrentNode) -> nsINode* {
+    ++counter;
+    if (allowCrossShadowBoundary) {
+      if (const auto* slot = HTMLSlotElement::FromNode(node)) {
+        auto assigned = slot->AssignedNodes();
+        if (size_t(counter) < assigned.Length()) {
+          return assigned[counter];
+        }
+        return nullptr;
+      }
+    }
+
+    if (counter == 0) {
+      return node->GetFirstChildOfTemplateOrNode();
+    }
+    return aCurrentNode->GetNextSibling();
+  };
+
+  if (!shadowRoot) {
+    for (nsINode* child = GetNextNode(nullptr); child;
+         child = GetNextNode(child)) {
+      rv = SerializeToStringRecursive(child, SerializeRoot::eYes, aMaxLength);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+  }
+
+  if (aSerializeRoot == SerializeRoot::eYes) {
+    rv = SerializeNodeEnd(*aNode, maybeFixedNode);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  if (mTextStreamer) {
+    rv = mTextStreamer->FlushIfStringLongEnough();
+  }
+
+  return rv;
+}
+
+nsresult nsDocumentEncoder::NodeSerializer::SerializeToStringIterative(
+    nsINode* aNode) const {
+  nsresult rv;
+
+  nsINode* node = aNode->GetFirstChildOfTemplateOrNode();
+  while (node) {
+    nsINode* current = node;
+    rv = SerializeNodeStart(*current, 0, -1, current);
+    NS_ENSURE_SUCCESS(rv, rv);
+    node = current->GetFirstChildOfTemplateOrNode();
+    while (!node && current && current != aNode) {
+      rv = SerializeNodeEnd(*current);
+      NS_ENSURE_SUCCESS(rv, rv);
+      node = current->GetNextSibling();
+      if (!node) {
+        current = current->GetParentNode();
+
+        if (current && current != aNode && current->IsDocumentFragment()) {
+          nsIContent* host = current->AsDocumentFragment()->GetHost();
+          if (host && host->IsHTMLElement(nsGkAtoms::_template)) {
+            current = host;
+          }
+        }
+      }
+    }
+  }
+
+  return NS_OK;
+}
+
+static bool IsTextNode(nsINode* aNode) { return aNode && aNode->IsText(); }
+
+nsresult nsDocumentEncoder::NodeSerializer::SerializeTextNode(
+    nsINode& aNode, int32_t aStartOffset, int32_t aEndOffset) const {
+  MOZ_ASSERT(IsTextNode(&aNode));
+
+  nsresult rv = SerializeNodeStart(aNode, aStartOffset, aEndOffset);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = SerializeNodeEnd(aNode);
+  NS_ENSURE_SUCCESS(rv, rv);
+  return rv;
+}
+
+nsDocumentEncoder::RangeSerializer::StartAndEndContent
+nsDocumentEncoder::RangeSerializer::GetStartAndEndContentForRecursionLevel(
+    const int32_t aDepth) const {
+  StartAndEndContent result;
+
+  const auto& inclusiveAncestorsOfStart =
+      mRangeBoundariesInclusiveAncestorsAndOffsets.mInclusiveAncestorsOfStart;
+  const auto& inclusiveAncestorsOfEnd =
+      mRangeBoundariesInclusiveAncestorsAndOffsets.mInclusiveAncestorsOfEnd;
+  int32_t start = mStartRootIndex - aDepth;
+  if (start >= 0 && (uint32_t)start <= inclusiveAncestorsOfStart.Length()) {
+    result.mStart = inclusiveAncestorsOfStart[start];
+  }
+
+  int32_t end = mEndRootIndex - aDepth;
+  if (end >= 0 && (uint32_t)end <= inclusiveAncestorsOfEnd.Length()) {
+    result.mEnd = inclusiveAncestorsOfEnd[end];
+  }
+
+  return result;
+}
+
+nsresult nsDocumentEncoder::RangeSerializer::SerializeTextNode(
+    nsIContent& aContent, const StartAndEndContent& aStartAndEndContent,
+    const nsRange& aRange) const {
+  const int32_t startOffset = (aStartAndEndContent.mStart == &aContent)
+                                  ? ShadowDOMSelectionHelpers::StartOffset(
+                                        &aRange, mAllowCrossShadowBoundary)
+                                  : 0;
+  const int32_t endOffset = (aStartAndEndContent.mEnd == &aContent)
+                                ? ShadowDOMSelectionHelpers::EndOffset(
+                                      &aRange, mAllowCrossShadowBoundary)
+                                : -1;
+  return mNodeSerializer.SerializeTextNode(aContent, startOffset, endOffset);
+}
+
+nsresult nsDocumentEncoder::RangeSerializer::SerializeRangeNodes(
+    const nsRange* const aRange, nsINode* const aNode, const int32_t aDepth) {
+  MOZ_ASSERT(aDepth >= 0);
+  MOZ_ASSERT(aRange);
+
+  nsCOMPtr<nsIContent> content = nsIContent::FromNodeOrNull(aNode);
+  NS_ENSURE_TRUE(content, NS_ERROR_FAILURE);
+
+  if (nsDocumentEncoder::IsInvisibleNodeAndShouldBeSkipped(*aNode, mFlags)) {
+    return NS_OK;
+  }
+
+  nsresult rv = NS_OK;
+
+  StartAndEndContent startAndEndContent =
+      GetStartAndEndContentForRecursionLevel(aDepth);
+
+  if (startAndEndContent.mStart != content &&
+      startAndEndContent.mEnd != content) {
+    rv = mNodeSerializer.SerializeToStringRecursive(
+        aNode, NodeSerializer::SerializeRoot::eYes);
+    NS_ENSURE_SUCCESS(rv, rv);
+  } else {
+    rv = SerializeNodePartiallyContainedInRange(*content, startAndEndContent,
+                                                *aRange, aDepth);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+  }
+  return NS_OK;
+}
+
+nsresult
+nsDocumentEncoder::RangeSerializer::SerializeNodePartiallyContainedInRange(
+    nsIContent& aContent, const StartAndEndContent& aStartAndEndContent,
+    const nsRange& aRange, const int32_t aDepth) {
+  if (IsTextNode(&aContent)) {
+    nsresult rv = SerializeTextNode(aContent, aStartAndEndContent, aRange);
+    NS_ENSURE_SUCCESS(rv, rv);
+  } else {
+    if (&aContent != mClosestCommonInclusiveAncestorOfRange) {
+      if (mRangeContextSerializer.mRangeNodeContext.IncludeInContext(
+              aContent)) {
+        mHaltRangeHint = true;
+      }
+      if ((aStartAndEndContent.mStart == &aContent) && !mHaltRangeHint) {
+        ++mContextInfoDepth.mStart;
+      }
+      if ((aStartAndEndContent.mEnd == &aContent) && !mHaltRangeHint) {
+        ++mContextInfoDepth.mEnd;
+      }
+
+      nsresult rv = mNodeSerializer.SerializeNodeStart(aContent, 0, -1);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+
+    const auto& inclusiveAncestorsOffsetsOfStart =
+        mRangeBoundariesInclusiveAncestorsAndOffsets
+            .mInclusiveAncestorsOffsetsOfStart;
+    const auto& inclusiveAncestorsOffsetsOfEnd =
+        mRangeBoundariesInclusiveAncestorsAndOffsets
+            .mInclusiveAncestorsOffsetsOfEnd;
+    Maybe<uint32_t> startOffset = Some(0);
+    Maybe<uint32_t> endOffset;
+    if (aStartAndEndContent.mStart == &aContent && mStartRootIndex >= aDepth) {
+      startOffset = inclusiveAncestorsOffsetsOfStart[mStartRootIndex - aDepth];
+    }
+    if (aStartAndEndContent.mEnd == &aContent && mEndRootIndex >= aDepth) {
+      endOffset = inclusiveAncestorsOffsetsOfEnd[mEndRootIndex - aDepth];
+    }
+    if (startOffset.isNothing()) {
+      startOffset = Some(0);
+    }
+    if (endOffset.isNothing()) {
+      endOffset = Some(aContent.GetChildCount());
+
+      if (mAllowCrossShadowBoundary == AllowRangeCrossShadowBoundary::Yes) {
+        if (const auto* slot = HTMLSlotElement::FromNode(aContent)) {
+          const auto& assignedNodes = slot->AssignedNodes();
+          if (!assignedNodes.IsEmpty()) {
+            endOffset = Some(assignedNodes.Length());
+          }
+        }
+      }
+    } else {
+      const nsINode* endContainer = ShadowDOMSelectionHelpers::GetEndContainer(
+          &aRange, mAllowCrossShadowBoundary);
+      if (&aContent != endContainer) {
+        MOZ_ASSERT(*endOffset != UINT32_MAX);
+        endOffset.ref()++;
+      }
+    }
+
+    MOZ_ASSERT(endOffset.isSome());
+    nsresult rv = SerializeChildrenOfContent(aContent, *startOffset, *endOffset,
+                                             &aRange, aDepth);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    if (&aContent != mClosestCommonInclusiveAncestorOfRange) {
+      nsresult rv = mNodeSerializer.SerializeNodeEnd(aContent);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult nsDocumentEncoder::RangeSerializer::SerializeChildrenOfContent(
+    nsIContent& aContent, uint32_t aStartOffset, uint32_t aEndOffset,
+    const nsRange* aRange, int32_t aDepth) {
+  ShadowRoot* shadowRoot = ShadowDOMSelectionHelpers::GetShadowRoot(
+      &aContent, mAllowCrossShadowBoundary);
+  if (shadowRoot) {
+    SerializeRangeNodes(aRange, shadowRoot, aDepth + 1);
+    return NS_OK;
+  }
+
+  if (!aEndOffset) {
+    return NS_OK;
+  }
+
+  nsIContent* child =
+      mAllowCrossShadowBoundary == AllowRangeCrossShadowBoundary::Yes
+          ? aContent.GetChildAtInFlatTreeForSelection(aStartOffset)
+          : aContent.GetChildAt_Deprecated(aStartOffset);
+
+  auto GetNextSibling = [this, &aContent](
+                            nsINode* aCurrentNode,
+                            uint32_t aCurrentIndex) -> nsIContent* {
+    if (mAllowCrossShadowBoundary == AllowRangeCrossShadowBoundary::Yes) {
+      if (const auto* slot = HTMLSlotElement::FromNode(&aContent)) {
+        auto assigned = slot->AssignedNodes();
+        if (++aCurrentIndex < assigned.Length()) {
+          return nsIContent::FromNode(assigned[aCurrentIndex]);
+        }
+        return nullptr;
+      }
+    }
+
+    return aCurrentNode->GetNextSibling();
+  };
+
+  for (size_t j = aStartOffset; child && j < aEndOffset; ++j) {
+    nsresult rv{NS_OK};
+    const bool isFirstOrLastNodeToSerialize =
+        j == aStartOffset || j == aEndOffset - 1;
+    if (isFirstOrLastNodeToSerialize) {
+      rv = SerializeRangeNodes(aRange, child, aDepth + 1);
+    } else {
+      rv = mNodeSerializer.SerializeToStringRecursive(
+          child, NodeSerializer::SerializeRoot::eYes);
+    }
+
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+
+    child = GetNextSibling(child, j);
+  }
+
+  return NS_OK;
+}
+
+bool nsDocumentEncoder::RangeNodeContext::IncludeInContext(
+    nsINode& aNode) const {
+  const nsIContent* const content = nsIContent::FromNodeOrNull(&aNode);
+  return content && content->IsHTMLElement(nsGkAtoms::span) &&
+         content->AsElement()->HasAttr(nsGkAtoms::mozquote);
+}
+
+nsresult nsDocumentEncoder::RangeContextSerializer::SerializeRangeContextStart(
+    const nsTArray<nsINode*>& aAncestorArray) {
+  if (mDisableContextSerialize) {
+    return NS_OK;
+  }
+
+  AutoTArray<nsINode*, 8>* serializedContext = mRangeContexts.AppendElement();
+
+  int32_t i = aAncestorArray.Length(), j;
+  nsresult rv = NS_OK;
+
+  j = mRangeNodeContext.GetImmediateContextCount(aAncestorArray);
+
+  while (i > 0) {
+    nsINode* node = aAncestorArray.ElementAt(--i);
+    if (!node) break;
+
+    if (mRangeNodeContext.IncludeInContext(*node) || i < j) {
+      rv = mNodeSerializer.SerializeNodeStart(*node, 0, -1);
+      serializedContext->AppendElement(node);
+      if (NS_FAILED(rv)) break;
+    }
+  }
+
+  return rv;
+}
+
+nsresult nsDocumentEncoder::RangeContextSerializer::SerializeRangeContextEnd() {
+  if (mDisableContextSerialize) {
+    return NS_OK;
+  }
+
+  MOZ_RELEASE_ASSERT(!mRangeContexts.IsEmpty(),
+                     "Tried to end context without starting one.");
+  AutoTArray<nsINode*, 8>& serializedContext = mRangeContexts.LastElement();
+
+  nsresult rv = NS_OK;
+  for (nsINode* node : Reversed(serializedContext)) {
+    rv = mNodeSerializer.SerializeNodeEnd(*node);
+
+    if (NS_FAILED(rv)) break;
+  }
+
+  mRangeContexts.RemoveLastElement();
+  return rv;
+}
+
+bool nsDocumentEncoder::RangeSerializer::HasInvisibleParentAndShouldBeSkipped(
+    nsINode& aNode) const {
+  if (!(mFlags & SkipInvisibleContent)) {
+    return false;
+  }
+
+  nsCOMPtr<nsIContent> content = nsIContent::FromNode(aNode);
+  if (content && !content->GetPrimaryFrame()) {
+    nsIContent* parent = content->GetParent();
+    return !parent || IsInvisibleNodeAndShouldBeSkipped(*parent, mFlags);
+  }
+
+  return false;
+}
+
+nsresult nsDocumentEncoder::RangeSerializer::SerializeRangeToString(
+    const nsRange* aRange) {
+  if (!aRange ||
+      (aRange->Collapsed() &&
+       (mAllowCrossShadowBoundary == AllowRangeCrossShadowBoundary::No ||
+        !aRange->MayCrossShadowBoundary()))) {
+    return NS_OK;
+  }
+
+  mClosestCommonInclusiveAncestorOfRange =
+      aRange->GetClosestCommonInclusiveAncestor(mAllowCrossShadowBoundary);
+
+  if (!mClosestCommonInclusiveAncestorOfRange) {
+    return NS_OK;
+  }
+
+  nsINode* startContainer = ShadowDOMSelectionHelpers::GetStartContainer(
+      aRange, mAllowCrossShadowBoundary);
+  NS_ENSURE_TRUE(startContainer, NS_ERROR_FAILURE);
+  const int32_t startOffset =
+      ShadowDOMSelectionHelpers::StartOffset(aRange, mAllowCrossShadowBoundary);
+
+  nsINode* endContainer = ShadowDOMSelectionHelpers::GetEndContainer(
+      aRange, mAllowCrossShadowBoundary);
+  NS_ENSURE_TRUE(endContainer, NS_ERROR_FAILURE);
+  const int32_t endOffset =
+      ShadowDOMSelectionHelpers::EndOffset(aRange, mAllowCrossShadowBoundary);
+
+  mContextInfoDepth = {};
+  mCommonInclusiveAncestors.Clear();
+
+  mRangeBoundariesInclusiveAncestorsAndOffsets = {};
+  auto& inclusiveAncestorsOfStart =
+      mRangeBoundariesInclusiveAncestorsAndOffsets.mInclusiveAncestorsOfStart;
+  auto& inclusiveAncestorsOffsetsOfStart =
+      mRangeBoundariesInclusiveAncestorsAndOffsets
+          .mInclusiveAncestorsOffsetsOfStart;
+  auto& inclusiveAncestorsOfEnd =
+      mRangeBoundariesInclusiveAncestorsAndOffsets.mInclusiveAncestorsOfEnd;
+  auto& inclusiveAncestorsOffsetsOfEnd =
+      mRangeBoundariesInclusiveAncestorsAndOffsets
+          .mInclusiveAncestorsOffsetsOfEnd;
+
+  nsContentUtils::GetInclusiveAncestors(mClosestCommonInclusiveAncestorOfRange,
+                                        mCommonInclusiveAncestors);
+  if (mAllowCrossShadowBoundary == AllowRangeCrossShadowBoundary::Yes) {
+    nsContentUtils::GetFlattenedTreeAncestorsAndOffsetsForSelection(
+        startContainer, startOffset, inclusiveAncestorsOfStart,
+        inclusiveAncestorsOffsetsOfStart);
+    nsContentUtils::GetFlattenedTreeAncestorsAndOffsetsForSelection(
+        endContainer, endOffset, inclusiveAncestorsOfEnd,
+        inclusiveAncestorsOffsetsOfEnd);
+  } else {
+    nsContentUtils::GetInclusiveAncestorsAndOffsets(
+        startContainer, startOffset, inclusiveAncestorsOfStart,
+        inclusiveAncestorsOffsetsOfStart);
+    nsContentUtils::GetInclusiveAncestorsAndOffsets(
+        endContainer, endOffset, inclusiveAncestorsOfEnd,
+        inclusiveAncestorsOffsetsOfEnd);
+  }
+
+  nsCOMPtr<nsIContent> commonContent =
+      nsIContent::FromNodeOrNull(mClosestCommonInclusiveAncestorOfRange);
+  mStartRootIndex = inclusiveAncestorsOfStart.IndexOf(commonContent);
+  mEndRootIndex = inclusiveAncestorsOfEnd.IndexOf(commonContent);
+
+  nsresult rv = NS_OK;
+
+  rv = mRangeContextSerializer.SerializeRangeContextStart(
+      mCommonInclusiveAncestors);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (startContainer == endContainer && IsTextNode(startContainer)) {
+    if (HasInvisibleParentAndShouldBeSkipped(*startContainer)) {
+      return NS_OK;
+    }
+    rv = mNodeSerializer.SerializeTextNode(*startContainer, startOffset,
+                                           endOffset);
+    NS_ENSURE_SUCCESS(rv, rv);
+  } else {
+    rv = SerializeRangeNodes(aRange, mClosestCommonInclusiveAncestorOfRange, 0);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  rv = mRangeContextSerializer.SerializeRangeContextEnd();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return rv;
+}
+
+void nsDocumentEncoder::ReleaseDocumentReferenceAndInitialize(
+    bool aClearCachedSerializer) {
+  mDocument = nullptr;
+
+  Initialize(aClearCachedSerializer);
+}
+
+NS_IMETHODIMP
+nsDocumentEncoder::EncodeToString(nsAString& aOutputString) {
+  return EncodeToStringWithMaxLength(0, aOutputString);
+}
+
+NS_IMETHODIMP
+nsDocumentEncoder::EncodeToStringWithMaxLength(uint32_t aMaxLength,
+                                               nsAString& aOutputString) {
+  MOZ_ASSERT(mRangeContextSerializer.mRangeContexts.IsEmpty(),
+             "Re-entrant call to nsDocumentEncoder.");
+  auto rangeContextGuard =
+      MakeScopeExit([&] { mRangeContextSerializer.mRangeContexts.Clear(); });
+
+  if (!mDocument) return NS_ERROR_NOT_INITIALIZED;
+
+  AutoReleaseDocumentIfNeeded autoReleaseDocument(this);
+
+  aOutputString.Truncate();
+
+  nsString output;
+  static const size_t kStringBufferSizeInBytes = 2048;
+  if (!mCachedBuffer) {
+    mCachedBuffer = StringBuffer::Alloc(kStringBufferSizeInBytes);
+    if (NS_WARN_IF(!mCachedBuffer)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+  }
+  NS_ASSERTION(
+      !mCachedBuffer->IsReadonly(),
+      "nsIDocumentEncoder shouldn't keep reference to non-readonly buffer!");
+  static_cast<char16_t*>(mCachedBuffer->Data())[0] = char16_t(0);
+  output.Assign(mCachedBuffer.forget(), 0);
+
+  if (!mSerializer) {
+    nsAutoCString progId(NS_CONTENTSERIALIZER_CONTRACTID_PREFIX);
+    AppendUTF16toUTF8(mMimeType, progId);
+
+    mSerializer = do_CreateInstance(progId.get());
+    NS_ENSURE_TRUE(mSerializer, NS_ERROR_NOT_IMPLEMENTED);
+  }
+
+  nsresult rv = NS_OK;
+
+  bool rewriteEncodingDeclaration =
+      !mEncodingScope.IsLimited() &&
+      !(mFlags & OutputDontRewriteEncodingDeclaration);
+  mSerializer->Init(mFlags, mWrapColumn, mEncoding, mIsCopying,
+                    rewriteEncodingDeclaration, &mNeedsPreformatScanning,
+                    output);
+
+  rv = SerializeDependingOnScope(aMaxLength);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = mSerializer->FlushAndFinish();
+
+  bool setOutput = false;
+  MOZ_ASSERT(!mCachedBuffer);
+  if (StringBuffer* outputBuffer = output.GetOwnedStringBuffer()) {
+    if (outputBuffer->StorageSize() == kStringBufferSizeInBytes &&
+        !outputBuffer->IsReadonly()) {
+      mCachedBuffer = outputBuffer;
+    } else if (NS_SUCCEEDED(rv)) {
+      aOutputString.Assign(outputBuffer, output.Length());
+      setOutput = true;
+    }
+  }
+
+  if (!setOutput && NS_SUCCEEDED(rv)) {
+    aOutputString.Append(output.get(), output.Length());
+  }
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsDocumentEncoder::EncodeToStream(nsIOutputStream* aStream) {
+  MOZ_ASSERT(mRangeContextSerializer.mRangeContexts.IsEmpty(),
+             "Re-entrant call to nsDocumentEncoder.");
+  auto rangeContextGuard =
+      MakeScopeExit([&] { mRangeContextSerializer.mRangeContexts.Clear(); });
+  NS_ENSURE_ARG_POINTER(aStream);
+
+  nsresult rv = NS_OK;
+
+  if (!mDocument) return NS_ERROR_NOT_INITIALIZED;
+
+  if (!mEncoding) {
+    return NS_ERROR_UCONV_NOCONV;
+  }
+
+  nsAutoString buf;
+  const bool isPlainText = mMimeType.LowerCaseEqualsLiteral(kTextMime);
+  mTextStreamer.emplace(*aStream, mEncoding->NewEncoder(), isPlainText, buf);
+
+  rv = EncodeToString(buf);
+
+  rv = mTextStreamer->ForceFlush();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mTextStreamer.reset();
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsDocumentEncoder::EncodeToStringWithContext(nsAString& aContextString,
+                                             nsAString& aInfoString,
+                                             nsAString& aEncodedString) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+nsDocumentEncoder::SetNodeFixup(nsIDocumentEncoderNodeFixup* aFixup) {
+  mNodeFixup = aFixup;
+  return NS_OK;
+}
+
+bool do_getDocumentTypeSupportedForEncoding(const char* aContentType) {
+  if (!nsCRT::strcmp(aContentType, TEXT_XML) ||
+      !nsCRT::strcmp(aContentType, APPLICATION_XML) ||
+      !nsCRT::strcmp(aContentType, APPLICATION_XHTML_XML) ||
+      !nsCRT::strcmp(aContentType, IMAGE_SVG_XML) ||
+      !nsCRT::strcmp(aContentType, TEXT_HTML) ||
+      !nsCRT::strcmp(aContentType, TEXT_PLAIN)) {
+    return true;
+  }
+  return false;
+}
+
+already_AddRefed<nsIDocumentEncoder> do_createDocumentEncoder(
+    const char* aContentType) {
+  if (do_getDocumentTypeSupportedForEncoding(aContentType)) {
+    return do_AddRef(new nsDocumentEncoder);
+  }
+  return nullptr;
+}
+
+class nsHTMLCopyEncoder final : public nsDocumentEncoder {
+ private:
+  class RangeNodeContext final : public nsDocumentEncoder::RangeNodeContext {
+    bool IncludeInContext(nsINode& aNode) const final;
+
+    int32_t GetImmediateContextCount(
+        const nsTArray<nsINode*>& aAncestorArray) const final;
+  };
+
+ public:
+  nsHTMLCopyEncoder();
+  ~nsHTMLCopyEncoder();
+
+  NS_IMETHOD Init(Document* aDocument, const nsAString& aMimeType,
+                  uint32_t aFlags) override;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  NS_IMETHOD SetSelection(Selection* aSelection) override;
+  NS_IMETHOD EncodeToStringWithContext(nsAString& aContextString,
+                                       nsAString& aInfoString,
+                                       nsAString& aEncodedString) override;
+  NS_IMETHOD EncodeToString(nsAString& aOutputString) override;
+
+ protected:
+  [[nodiscard]] TreeKind GetTreeKind() const {
+    return mFlags & nsIDocumentEncoder::AllowCrossShadowBoundary
+               ? TreeKind::FlatForSelection
+               : TreeKind::DOM;
+  }
+  nsresult PromoteRange(nsRange* inRange);
+
+  Result<RawRangeBoundary, nsresult> GetPromotedStartPoint(
+      const RawRangeBoundary& aPoint, const nsINode* const aCommon) const;
+
+  Result<RawRangeBoundary, nsresult> GetPromotedEndPoint(
+      const RawRangeBoundary& aPoint, const nsINode* const aCommon) const;
+
+  static Result<RawRangeBoundary, nsresult> GetParentPoint(
+      const RawRangeBoundary& aPoint);
+
+  static Result<RawRangeBoundary, nsresult> GetPointAfterContainer(
+      const RawRangeBoundary& aPoint);
+
+  [[nodiscard]] static Maybe<uint32_t> ComputeIndexOfContent(
+      const nsINode* aParent, const nsIContent* aChild, TreeKind aTreeKind);
+  static bool IsMozBR(Element* aNode);
+  bool IsRoot(nsINode* aNode, TreeKind aKind) const;
+
+  static bool ChildIsFirstNode(const RawRangeBoundary& aPoint);
+
+  static bool ChildIsLastNode(const RawRangeBoundary& aPoint);
+
+  bool mIsTextWidget{false};
+};
+
+nsHTMLCopyEncoder::nsHTMLCopyEncoder()
+    : nsDocumentEncoder{MakeUnique<nsHTMLCopyEncoder::RangeNodeContext>()} {}
+
+nsHTMLCopyEncoder::~nsHTMLCopyEncoder() = default;
+
+NS_IMETHODIMP
+nsHTMLCopyEncoder::Init(Document* aDocument, const nsAString& aMimeType,
+                        uint32_t aFlags) {
+  if (!aDocument) return NS_ERROR_INVALID_ARG;
+
+  mIsTextWidget = false;
+  Initialize(true, GetAllowRangeCrossShadowBoundary(aFlags));
+
+  mIsCopying = true;
+  mDocument = aDocument;
+
+  MOZ_ASSERT(aMimeType.EqualsLiteral(kTextMime) ||
+             aMimeType.EqualsLiteral(kHTMLMime));
+  if (aMimeType.EqualsLiteral(kTextMime)) {
+    mMimeType.AssignLiteral(kTextMime);
+  } else {
+    mMimeType.AssignLiteral(kHTMLMime);
+  }
+
+  mFlags = aFlags | OutputAbsoluteLinks;
+
+  if (!mDocument->IsScriptEnabled()) mFlags |= OutputNoScriptContent;
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsHTMLCopyEncoder::SetSelection(Selection* aSelection) {
+
+  if (!aSelection) return NS_ERROR_NULL_POINTER;
+
+  const uint32_t rangeCount = aSelection->RangeCount();
+
+  if (!rangeCount) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<nsRange> range = aSelection->GetRangeAt(0);
+  nsINode* commonParent = range->GetClosestCommonInclusiveAncestor();
+
+  mIsTextWidget =
+      commonParent &&
+      TextControlElement::FromNodeOrNull(
+          commonParent->GetClosestNativeAnonymousSubtreeRootParentOrHost());
+
+  if (mIsTextWidget) {
+    mEncodingScope.mSelection = aSelection;
+    mMimeType.AssignLiteral("text/plain");
+    return NS_OK;
+  }
+
+
+  if (!(mDocument && mDocument->IsHTMLDocument())) {
+    mIsTextWidget = true;
+    mEncodingScope.mSelection = aSelection;
+    return NS_OK;
+  }
+
+  mEncodingScope.mSelection = new Selection(SelectionType::eNormal, nullptr);
+
+  for (const uint32_t rangeIdx : IntegerRange(rangeCount)) {
+    MOZ_ASSERT(aSelection->RangeCount() == rangeCount);
+    range = aSelection->GetRangeAt(rangeIdx);
+    NS_ENSURE_TRUE(range, NS_ERROR_FAILURE);
+    RefPtr<nsRange> myRange = range->CloneRange();
+    MOZ_ASSERT(myRange);
+
+    nsresult rv = PromoteRange(myRange);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    ErrorResult result;
+    RefPtr<Selection> selection(mEncodingScope.mSelection);
+    RefPtr<Document> document(mDocument);
+    selection->AddRangeAndSelectFramesAndNotifyListenersInternal(
+        *myRange, document, result);
+    rv = result.StealNSResult();
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsHTMLCopyEncoder::EncodeToString(nsAString& aOutputString) {
+  if (mIsTextWidget) {
+    mMimeType.AssignLiteral("text/plain");
+  }
+  return nsDocumentEncoder::EncodeToString(aOutputString);
+}
+
+NS_IMETHODIMP
+nsHTMLCopyEncoder::EncodeToStringWithContext(nsAString& aContextString,
+                                             nsAString& aInfoString,
+                                             nsAString& aEncodedString) {
+  nsresult rv = EncodeToString(aEncodedString);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (mIsTextWidget) return NS_OK;
+
+
+  mSerializer->Init(mFlags, mWrapColumn, mEncoding, mIsCopying, false,
+                    &mNeedsPreformatScanning, aContextString);
+
+  int32_t count = mRangeSerializer.mCommonInclusiveAncestors.Length();
+  int32_t i;
+  nsCOMPtr<nsINode> node;
+  if (count > 0) {
+    node = mRangeSerializer.mCommonInclusiveAncestors.ElementAt(0);
+  }
+
+  if (node && IsTextNode(node)) {
+    mRangeSerializer.mCommonInclusiveAncestors.RemoveElementAt(0);
+    if (mRangeSerializer.mContextInfoDepth.mStart) {
+      --mRangeSerializer.mContextInfoDepth.mStart;
+    }
+    if (mRangeSerializer.mContextInfoDepth.mEnd) {
+      --mRangeSerializer.mContextInfoDepth.mEnd;
+    }
+    count--;
+  }
+
+  i = count;
+  while (i > 0) {
+    node = mRangeSerializer.mCommonInclusiveAncestors.ElementAt(--i);
+    rv = mNodeSerializer.SerializeNodeStart(*node, 0, -1);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  while (i < count) {
+    node = mRangeSerializer.mCommonInclusiveAncestors.ElementAt(i++);
+    rv = mNodeSerializer.SerializeNodeEnd(*node);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  mSerializer->Finish();
+
+  nsAutoString infoString;
+  infoString.AppendInt(mRangeSerializer.mContextInfoDepth.mStart);
+  infoString.Append(char16_t(','));
+  infoString.AppendInt(mRangeSerializer.mContextInfoDepth.mEnd);
+  aInfoString = infoString;
+
+  return rv;
+}
+
+bool nsHTMLCopyEncoder::RangeNodeContext::IncludeInContext(
+    nsINode& aNode) const {
+  const nsIContent* const content = nsIContent::FromNodeOrNull(&aNode);
+  if (!content) {
+    return false;
+  }
+
+  if (content->IsEditingHost()) {
+    return false;
+  }
+
+  return content->IsAnyOfHTMLElements(
+      nsGkAtoms::b, nsGkAtoms::i, nsGkAtoms::u, nsGkAtoms::a, nsGkAtoms::tt,
+      nsGkAtoms::s, nsGkAtoms::big, nsGkAtoms::small, nsGkAtoms::strike,
+      nsGkAtoms::em, nsGkAtoms::strong, nsGkAtoms::dfn, nsGkAtoms::code,
+      nsGkAtoms::cite, nsGkAtoms::var, nsGkAtoms::abbr, nsGkAtoms::font,
+      nsGkAtoms::script, nsGkAtoms::span, nsGkAtoms::pre, nsGkAtoms::h1,
+      nsGkAtoms::h2, nsGkAtoms::h3, nsGkAtoms::h4, nsGkAtoms::h5,
+      nsGkAtoms::h6);
+}
+
+nsresult nsHTMLCopyEncoder::PromoteRange(nsRange* inRange) {
+  if (!inRange->IsPositioned()) {
+    return NS_ERROR_UNEXPECTED;
+  }
+  const RawRangeBoundary startRef = [&]() -> RawRangeBoundary {
+    if (GetTreeKind() == TreeKind::DOM) {
+      return inRange->MayCrossShadowBoundaryStartRef().AsRaw();
+    }
+    MOZ_ASSERT(GetTreeKind() == TreeKind::FlatForSelection);
+    const RangeBoundaryFor startBoundaryIsFor =
+        inRange->Collapsed() ? RangeBoundaryFor::Collapsed
+                             : RangeBoundaryFor::Start;
+    return inRange->MayCrossShadowBoundaryStartRef()
+        .AsRaw()
+        .GetRangeBoundaryInFlatTree(startBoundaryIsFor);
+  }();
+  const RawRangeBoundary endRef = [&]() -> RawRangeBoundary {
+    if (GetTreeKind() == TreeKind::DOM) {
+      return inRange->MayCrossShadowBoundaryEndRef().AsRaw();
+    }
+    MOZ_ASSERT(GetTreeKind() == TreeKind::FlatForSelection);
+    const RangeBoundaryFor endBoundaryIsFor = inRange->Collapsed()
+                                                  ? RangeBoundaryFor::Collapsed
+                                                  : RangeBoundaryFor::End;
+    return inRange->MayCrossShadowBoundaryEndRef()
+        .AsRaw()
+        .GetRangeBoundaryInFlatTree(endBoundaryIsFor);
+  }();
+  MOZ_ASSERT(startRef.GetTreeKind() == endRef.GetTreeKind());
+  const nsINode* const commonAncestor =
+      inRange->GetClosestCommonInclusiveAncestor(
+          AllowRangeCrossShadowBoundary::Yes);
+  MOZ_ASSERT(commonAncestor);
+
+  Result<RawRangeBoundary, nsresult> promotedStartPointOrError =
+      GetPromotedStartPoint(startRef, commonAncestor);
+  if (NS_WARN_IF(promotedStartPointOrError.isErr())) {
+    return NS_ERROR_FAILURE;
+  }
+  Result<RawRangeBoundary, nsresult> promotedEndPointOrError =
+      GetPromotedEndPoint(endRef, commonAncestor);
+  if (NS_WARN_IF(promotedEndPointOrError.isErr())) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RawRangeBoundary promotedStartPoint = promotedStartPointOrError.unwrap();
+  MOZ_ASSERT(promotedStartPoint.IsSet());
+  RawRangeBoundary promotedEndPoint = promotedEndPointOrError.unwrap();
+  MOZ_ASSERT(promotedEndPoint.IsSet());
+
+  ErrorResult err;
+  inRange->SetStart(promotedStartPoint.AsRangeBoundaryInDOMTree(), err,
+                    GetAllowRangeCrossShadowBoundary(mFlags));
+  if (NS_WARN_IF(err.Failed())) {
+    return err.StealNSResult();
+  }
+  inRange->SetEnd(RawRangeBoundary(promotedEndPoint.AsRangeBoundaryInDOMTree()),
+                  err, GetAllowRangeCrossShadowBoundary(mFlags));
+  if (NS_WARN_IF(err.Failed())) {
+    return err.StealNSResult();
+  }
+  return NS_OK;
+}
+
+Result<RawRangeBoundary, nsresult> nsHTMLCopyEncoder::GetPromotedStartPoint(
+    const RawRangeBoundary& aPoint, const nsINode* const aCommon) const {
+  MOZ_ASSERT(aPoint.IsSet());
+
+  using OffsetFilter = RawRangeBoundary::OffsetFilter;
+
+  if (aCommon == aPoint.GetContainer() ||
+      IsRoot(aPoint.GetContainer(), aPoint.GetTreeKind())) {
+    return aPoint;
+  }
+
+  RawRangeBoundary point(aPoint.GetTreeKind());
+  bool resetPromotion = false;
+
+  if (auto* const nodeAsText = Text::FromNode(aPoint.GetContainer())) {
+    if (!aPoint.IsStartOfContainer()) {
+      if (!nodeAsText->TextStartsWithOnlyWhitespace(
+              *aPoint.Offset(OffsetFilter::kValidOrInvalidOffsets))) {
+        return aPoint;
+      }
+      resetPromotion = true;
+    }
+    Result<RawRangeBoundary, nsresult> parentPointOrError =
+        GetParentPoint(aPoint);
+    if (NS_WARN_IF(parentPointOrError.isErr())) {
+      return parentPointOrError.propagateErr();
+    }
+    point = parentPointOrError.unwrap();
+    if (MOZ_UNLIKELY(!point.IsSet())) {
+      NS_WARNING(fmt::format("aPoint={}", aPoint).c_str());
+      MOZ_ASSERT_UNREACHABLE(
+          "Selection shouldn't start/end in generated content nor content "
+          "being removed");
+      return aPoint;
+    }
+    if (point.GetContainer() == aCommon) {
+      return aPoint;
+    }
+  } else {
+    if (aPoint.GetContainer()->HasChildNodes() && !aPoint.IsEndOfContainer()) {
+      if (aPoint.GetContainer() == aCommon) {
+        return aPoint;
+      }
+      point = aPoint;
+    }
+    else {
+      Result<RawRangeBoundary, nsresult> parentPointOrError =
+          GetParentPoint(aPoint);
+      if (NS_WARN_IF(parentPointOrError.isErr())) {
+        return parentPointOrError.propagateErr();
+      }
+      point = parentPointOrError.unwrap();
+      if (MOZ_UNLIKELY(!point.IsSet())) {
+        NS_WARNING(fmt::format("aPoint={}", aPoint).c_str());
+        MOZ_ASSERT_UNREACHABLE(
+            "Selection shouldn't start/end in generated content nor content "
+            "being removed");
+        return aPoint;
+      }
+    }
+  }
+  NS_WARNING_ASSERTION(
+      point.GetChildAtOffset(),
+      nsFmtCString(
+          FMT_STRING("Not pointing a child node:\npoint={}\naPoint={}\n"),
+          point, aPoint)
+          .get());
+  MOZ_ASSERT(point.GetChildAtOffset());
+
+  if (aPoint.GetContainer() != point.GetChildAtOffset() &&
+      IsRoot(point.GetChildAtOffset(), point.GetTreeKind())) {
+    return aPoint;
+  }
+
+  while (point.GetContainer() != aCommon &&
+         !IsRoot(point.GetContainer(), point.GetTreeKind()) &&
+         ChildIsFirstNode(point)) {
+    if (resetPromotion) {
+      nsIContent* const parentContent =
+          nsIContent::FromNodeOrNull(point.GetContainer());
+      if (parentContent && parentContent->IsHTMLElement() &&
+          nsHTMLElement::IsBlock(
+              nsHTMLTags::AtomTagToId(parentContent->NodeInfo()->NameAtom()))) {
+        resetPromotion = false;
+      }
+    }
+    Result<RawRangeBoundary, nsresult> parentPointOrError =
+        GetParentPoint(point);
+    if (MOZ_UNLIKELY(parentPointOrError.isErr())) {
+      return parentPointOrError.propagateErr();
+    }
+    if (MOZ_UNLIKELY(!parentPointOrError.inspect().IsSet())) {
+      NS_WARNING(fmt::format("aPoint={}", aPoint).c_str());
+      MOZ_ASSERT_UNREACHABLE(
+          "Selection shouldn't start/end in generated content nor content "
+          "being removed");
+      return Err(NS_ERROR_FAILURE);
+    }
+    point = parentPointOrError.unwrap();
+  }
+
+  return resetPromotion ? aPoint : point;
+}
+
+Result<RawRangeBoundary, nsresult> nsHTMLCopyEncoder::GetPromotedEndPoint(
+    const RawRangeBoundary& aPoint, const nsINode* const aCommon) const {
+  MOZ_ASSERT(aPoint.IsSet());
+
+  using OffsetFilter = RawRangeBoundary::OffsetFilter;
+
+  if (aCommon == aPoint.GetContainer() ||
+      IsRoot(aPoint.GetContainer(), aPoint.GetTreeKind())) {
+    return aPoint;
+  }
+
+  RawRangeBoundary point(aPoint.GetTreeKind());
+  bool resetPromotion = false;
+
+  if (aPoint.GetContainer()->IsCharacterData()) {
+    if (auto* const nodeAsText = Text::FromNode(aPoint.GetContainer())) {
+      if (!aPoint.IsEndOfContainer()) {
+        if (!nodeAsText->TextEndsWithOnlyWhitespace(
+                *aPoint.Offset(OffsetFilter::kValidOrInvalidOffsets))) {
+          return aPoint;
+        }
+        resetPromotion = true;
+      }
+    }
+    Result<RawRangeBoundary, nsresult> parentPointOrError =
+        GetPointAfterContainer(aPoint);
+    if (NS_WARN_IF(parentPointOrError.isErr())) {
+      return parentPointOrError.propagateErr();
+    }
+    point = parentPointOrError.unwrap();
+    if (MOZ_UNLIKELY(!point.IsSet())) {
+      NS_WARNING(fmt::format("aPoint={}", aPoint).c_str());
+      MOZ_ASSERT_UNREACHABLE(
+          "Selection shouldn't start/end in generated content nor content "
+          "being removed");
+      return aPoint;
+    }
+    if (point.GetContainer() == aCommon ||
+        IsRoot(point.GetContainer(), point.GetTreeKind())) {
+      return aPoint;
+    }
+    NS_WARNING_ASSERTION(
+        point.GetPreviousSiblingOfChildAtOffset(),
+        nsFmtCString(
+            FMT_STRING("Not pointing a child node:\npoint={}\naPoint={}\n"),
+            point, aPoint)
+            .get());
+    MOZ_ASSERT(point.GetPreviousSiblingOfChildAtOffset());
+  } else {
+    point = aPoint;
+  }
+  MOZ_ASSERT(point.IsSet());
+  MOZ_ASSERT(!IsRoot(point.GetContainer(), point.GetTreeKind()));
+
+  while (point.GetContainer() != aCommon &&
+         !IsRoot(point.GetContainer(), point.GetTreeKind()) &&
+         ChildIsLastNode(point)) {
+    if (resetPromotion) {
+      nsIContent* const parentContent =
+          nsIContent::FromNodeOrNull(point.GetContainer());
+      if (parentContent && parentContent->IsHTMLElement() &&
+          nsHTMLElement::IsBlock(
+              nsHTMLTags::AtomTagToId(parentContent->NodeInfo()->NameAtom()))) {
+        resetPromotion = false;
+      }
+    }
+
+    Result<RawRangeBoundary, nsresult> parentPointOrError =
+        GetPointAfterContainer(point);
+    if (MOZ_UNLIKELY(parentPointOrError.isErr())) {
+      NS_WARNING(fmt::format("point={}", point).c_str());
+      return parentPointOrError.propagateErr();
+    }
+
+    if (MOZ_UNLIKELY(!parentPointOrError.inspect().IsSet())) {
+      NS_WARNING(fmt::format("point={}", point).c_str());
+      MOZ_ASSERT_UNREACHABLE(
+          "Selection shouldn't start/end in generated content nor content "
+          "being removed");
+      return Err(NS_ERROR_FAILURE);
+    }
+    point = parentPointOrError.unwrap();
+  }
+
+  return resetPromotion ? aPoint : point;
+}
+
+bool nsHTMLCopyEncoder::IsMozBR(Element* aElement) {
+  HTMLBRElement* brElement = HTMLBRElement::FromNodeOrNull(aElement);
+  return brElement && brElement->IsPaddingForEmptyLastLine();
+}
+
+Maybe<uint32_t> nsHTMLCopyEncoder::ComputeIndexOfContent(
+    const nsINode* aParent, const nsIContent* aChild, TreeKind aTreeKind) {
+  MOZ_ASSERT(aParent);
+  MOZ_ASSERT(aChild);
+
+  return aTreeKind == TreeKind::DOM
+             ? aParent->ComputeIndexOf(aChild)
+             : aParent->ComputeFlatTreeForSelectionIndexOf(aChild);
+}
+
+Result<RawRangeBoundary, nsresult> nsHTMLCopyEncoder::GetParentPoint(
+    const RawRangeBoundary& aPoint) {
+  MOZ_ASSERT(aPoint.IsSet());
+
+  nsIContent* const containerContent =
+      nsIContent::FromNodeOrNull(aPoint.GetContainer());
+  if (MOZ_UNLIKELY(!containerContent)) {
+    return Err(NS_ERROR_NULL_POINTER);
+  }
+
+  if (aPoint.GetTreeKind() == TreeKind::FlatForSelection) {
+    if (ShadowRoot* const shadowRoot = ShadowRoot::FromNode(containerContent)) {
+      Element* const host = shadowRoot->GetHost();
+      if (MOZ_UNLIKELY(!host)) {
+        return Err(NS_ERROR_NULL_POINTER);
+      }
+      RawRangeBoundary atHost =
+          RawRangeBoundary::FromChild(*host, aPoint.GetTreeKind());
+      if (MOZ_UNLIKELY(!atHost.IsSet())) {
+        return Err(NS_ERROR_NULL_POINTER);
+      }
+      return std::move(atHost);
+    }
+  }
+
+  nsINode* const containerParentNode =
+      aPoint.GetTreeKind() == TreeKind::FlatForSelection
+          ? containerContent->GetFlattenedTreeParentNodeForSelection()
+          : containerContent->GetParentNode();
+  if (MOZ_UNLIKELY(!containerParentNode)) {
+    return Err(NS_ERROR_NULL_POINTER);
+  }
+
+  const Maybe<uint32_t> indexOfContainer = ComputeIndexOfContent(
+      containerParentNode, containerContent, aPoint.GetTreeKind());
+  if (MOZ_UNLIKELY(indexOfContainer.isNothing())) {
+    return RawRangeBoundary(aPoint.GetTreeKind());
+  }
+  return RawRangeBoundary(
+      containerParentNode, *indexOfContainer,
+      RangeBoundarySetBy::Offset, aPoint.GetTreeKind());
+}
+
+Result<RawRangeBoundary, nsresult> nsHTMLCopyEncoder::GetPointAfterContainer(
+    const RawRangeBoundary& aPoint) {
+  MOZ_ASSERT(aPoint.IsSet());
+
+  nsIContent* const containerContent =
+      nsIContent::FromNodeOrNull(aPoint.GetContainer());
+  if (MOZ_UNLIKELY(!containerContent)) {
+    return Err(NS_ERROR_NULL_POINTER);
+  }
+
+  if (aPoint.GetTreeKind() == TreeKind::FlatForSelection) {
+    if (ShadowRoot* const shadowRoot = ShadowRoot::FromNode(containerContent)) {
+      Element* const host = shadowRoot->GetHost();
+      if (MOZ_UNLIKELY(!host)) {
+        return Err(NS_ERROR_NULL_POINTER);
+      }
+
+      RawRangeBoundary afterHost =
+          RawRangeBoundary::After(*host, aPoint.GetTreeKind());
+      if (MOZ_UNLIKELY(!afterHost.IsSet())) {
+        return Err(NS_ERROR_NULL_POINTER);
+      }
+      return std::move(afterHost);
+    }
+  }
+
+  return RawRangeBoundary::After(*containerContent, aPoint.GetTreeKind());
+}
+
+bool nsHTMLCopyEncoder::IsRoot(nsINode* aNode, TreeKind aKind) const {
+  nsCOMPtr<nsIContent> content = nsIContent::FromNodeOrNull(aNode);
+  if (!content) {
+    return false;
+  }
+
+  if (mIsTextWidget) {
+    return content->IsHTMLElement(nsGkAtoms::div);
+  }
+
+  if (aKind == TreeKind::FlatForSelection) {
+    if (const ShadowRoot* const shadowRoot = ShadowRoot::FromNode(*content)) {
+      if (MOZ_UNLIKELY(shadowRoot->IsUAWidget())) {
+        return true;
+      }
+      const Element* const host = shadowRoot->GetHost();
+      if (NS_WARN_IF(!host)) {
+        return true;
+      }
+      const nsINode* const flattenedTreeParentNode =
+          host->GetFlattenedTreeParentNodeForSelection();
+      if (MOZ_UNLIKELY(!flattenedTreeParentNode)) {
+        return true;
+      }
+    }
+  }
+
+
+  return content->IsAnyOfHTMLElements(nsGkAtoms::body, nsGkAtoms::td,
+                                      nsGkAtoms::th, nsGkAtoms::slot);
+}
+
+bool nsHTMLCopyEncoder::ChildIsFirstNode(const RawRangeBoundary& aPoint) {
+  MOZ_ASSERT(aPoint.GetChildAtOffset());
+
+
+  const auto ChildIsSignificant = [](nsIContent& aContent) {
+    return !aContent.TextIsOnlyWhitespace();
+  };
+  if (aPoint.GetTreeKind() == TreeKind::FlatForSelection) {
+    FlattenedChildIteratorForSelection iter(aPoint.GetContainer());
+    if (!iter.Seek(aPoint.GetChildAtOffset())) {
+      return false;
+    }
+    for (nsIContent* sibling = iter.GetPreviousChild(); sibling;
+         sibling = iter.GetPreviousChild()) {
+      if (ChildIsSignificant(*sibling)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  ChildIterator iter(aPoint.GetContainer());
+  if (!iter.Seek(aPoint.GetChildAtOffset())) {
+    return false;
+  }
+  for (nsIContent* sibling = iter.GetPreviousChild(); sibling;
+       sibling = iter.GetPreviousChild()) {
+    if (ChildIsSignificant(*sibling)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool nsHTMLCopyEncoder::ChildIsLastNode(const RawRangeBoundary& aPoint) {
+  MOZ_ASSERT(aPoint.IsSet());
+  MOZ_ASSERT(!aPoint.GetContainer()->IsCharacterData());
+
+  if (aPoint.IsEndOfContainer()) {
+    return true;
+  }
+
+  MOZ_ASSERT(aPoint.GetChildAtOffset());
+
+
+  const auto ChildIsSignificant = [](nsIContent& aContent) {
+    if (aContent.IsElement() && IsMozBR(aContent.AsElement())) {
+      return false;
+    }
+    return !aContent.TextIsOnlyWhitespace();
+  };
+  if (aPoint.GetTreeKind() == TreeKind::FlatForSelection) {
+    FlattenedChildIteratorForSelection iter(aPoint.GetContainer());
+    if (!iter.Seek(aPoint.GetChildAtOffset())) {
+      return false;
+    }
+    for (nsIContent* sibling = iter.Get(); sibling;
+         sibling = iter.GetNextChild()) {
+      if (ChildIsSignificant(*sibling)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  ChildIterator iter(aPoint.GetContainer());
+  if (!iter.Seek(aPoint.GetChildAtOffset())) {
+    return false;
+  }
+  for (nsIContent* sibling = iter.Get(); sibling;
+       sibling = iter.GetNextChild()) {
+    if (ChildIsSignificant(*sibling)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+already_AddRefed<nsIDocumentEncoder> do_createHTMLCopyEncoder() {
+  return do_AddRef(new nsHTMLCopyEncoder);
+}
+
+int32_t nsHTMLCopyEncoder::RangeNodeContext::GetImmediateContextCount(
+    const nsTArray<nsINode*>& aAncestorArray) const {
+  int32_t i = aAncestorArray.Length(), j = 0;
+  while (j < i) {
+    nsINode* node = aAncestorArray.ElementAt(j);
+    if (!node) {
+      break;
+    }
+    nsCOMPtr<nsIContent> content(nsIContent::FromNodeOrNull(node));
+    if (!content || !content->IsAnyOfHTMLElements(
+                        nsGkAtoms::tr, nsGkAtoms::thead, nsGkAtoms::tbody,
+                        nsGkAtoms::tfoot, nsGkAtoms::table)) {
+      break;
+    }
+    ++j;
+  }
+  return j;
+}

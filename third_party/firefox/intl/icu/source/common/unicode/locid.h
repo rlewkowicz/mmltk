@@ -1,0 +1,497 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+*
+*   Copyright (C) 1996-2015, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+******************************************************************************
+*
+* File locid.h
+*
+* Created by: Helena Shih
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   02/11/97    aliu        Changed gLocPath to fgLocPath and added methods to
+*                           get and set it.
+*   04/02/97    aliu        Made operator!= inline; fixed return value of getName().
+*   04/15/97    aliu        Cleanup for AIX/Win32.
+*   04/24/97    aliu        Numerous changes per code review.
+*   08/18/98    stephen     Added tokenizeString(),changed getDisplayName()
+*   09/08/98    stephen     Moved definition of kEmptyString for Mac Port
+*   11/09/99    weiv        Added const char * getName() const;
+*   04/12/00    srl         removing unicodestring api's and cached hash code
+*   08/10/01    grhoten     Change the static Locales to accessor functions
+******************************************************************************
+*/
+
+#if !defined(LOCID_H)
+#define LOCID_H
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include <cstdint>
+#include <string_view>
+
+#include "unicode/bytestream.h"
+#include "unicode/localpointer.h"
+#include "unicode/strenum.h"
+#include "unicode/stringpiece.h"
+#include "unicode/uobject.h"
+#include "unicode/putil.h"
+#include "unicode/uloc.h"
+
+
+U_NAMESPACE_BEGIN
+
+void U_CALLCONV locale_available_init(); 
+
+class StringEnumeration;
+class UnicodeString;
+
+class U_COMMON_API_CLASS Locale : public UObject {
+public:
+    U_COMMON_API static const Locale& U_EXPORT2 getRoot();
+    U_COMMON_API static const Locale& U_EXPORT2 getEnglish();
+    U_COMMON_API static const Locale& U_EXPORT2 getFrench();
+    U_COMMON_API static const Locale& U_EXPORT2 getGerman();
+    U_COMMON_API static const Locale& U_EXPORT2 getItalian();
+    U_COMMON_API static const Locale& U_EXPORT2 getJapanese();
+    U_COMMON_API static const Locale& U_EXPORT2 getKorean();
+    U_COMMON_API static const Locale& U_EXPORT2 getChinese();
+    U_COMMON_API static const Locale& U_EXPORT2 getSimplifiedChinese();
+    U_COMMON_API static const Locale& U_EXPORT2 getTraditionalChinese();
+
+    U_COMMON_API static const Locale& U_EXPORT2 getFrance();
+    U_COMMON_API static const Locale& U_EXPORT2 getGermany();
+    U_COMMON_API static const Locale& U_EXPORT2 getItaly();
+    U_COMMON_API static const Locale& U_EXPORT2 getJapan();
+    U_COMMON_API static const Locale& U_EXPORT2 getKorea();
+    U_COMMON_API static const Locale& U_EXPORT2 getChina();
+    U_COMMON_API static const Locale& U_EXPORT2 getPRC();
+    U_COMMON_API static const Locale& U_EXPORT2 getTaiwan();
+    U_COMMON_API static const Locale& U_EXPORT2 getUK();
+    U_COMMON_API static const Locale& U_EXPORT2 getUS();
+    U_COMMON_API static const Locale& U_EXPORT2 getCanada();
+    U_COMMON_API static const Locale& U_EXPORT2 getCanadaFrench();
+
+    U_COMMON_API Locale();
+
+    U_COMMON_API Locale(const char* language,
+                        const char* country = nullptr,
+                        const char* variant = nullptr,
+                        const char* keywordsAndValues = nullptr);
+
+    U_COMMON_API Locale(const Locale& other);
+
+    U_COMMON_API Locale(Locale&& other) noexcept;
+
+    U_COMMON_API virtual ~Locale();
+
+    U_COMMON_API Locale& operator=(const Locale& other);
+
+    U_COMMON_API Locale& operator=(Locale&& other) noexcept;
+
+    U_COMMON_API bool operator==(const Locale& other) const;
+
+    U_COMMON_API inline bool operator!=(const Locale& other) const;
+
+    U_COMMON_API Locale* clone() const;
+
+#if !defined(U_HIDE_SYSTEM_API)
+    U_COMMON_API static const Locale& U_EXPORT2 getDefault();
+
+    U_COMMON_API static void U_EXPORT2 setDefault(const Locale& newLocale, UErrorCode& success);
+#endif
+
+    U_COMMON_API static Locale U_EXPORT2 forLanguageTag(StringPiece tag, UErrorCode& status);
+
+    U_COMMON_API void toLanguageTag(ByteSink& sink, UErrorCode& status) const;
+
+    template<typename StringClass>
+    inline StringClass toLanguageTag(UErrorCode& status) const;
+
+    U_COMMON_API static Locale U_EXPORT2 createFromName(const char* name);
+
+#if !defined(U_HIDE_INTERNAL_API)
+    U_COMMON_API static Locale U_EXPORT2 createFromName(StringPiece name);
+#endif
+
+    U_COMMON_API static Locale U_EXPORT2 createCanonical(const char* name);
+
+    U_COMMON_API const char* getLanguage() const;
+
+    U_COMMON_API const char* getScript() const;
+
+    U_COMMON_API const char* getCountry() const;
+
+    U_COMMON_API const char* getVariant() const;
+
+    U_COMMON_API const char* getName() const;
+
+    U_COMMON_API const char* getBaseName() const;
+
+    U_COMMON_API void addLikelySubtags(UErrorCode& status);
+
+    U_COMMON_API void minimizeSubtags(UErrorCode& status);
+
+    U_COMMON_API void canonicalize(UErrorCode& status);
+
+    U_COMMON_API StringEnumeration* createKeywords(UErrorCode& status) const;
+
+    U_COMMON_API StringEnumeration* createUnicodeKeywords(UErrorCode& status) const;
+
+    template<typename StringClass, typename OutputIterator>
+    inline void getKeywords(OutputIterator iterator, UErrorCode& status) const;
+
+    template<typename StringClass, typename OutputIterator>
+    inline void getUnicodeKeywords(OutputIterator iterator, UErrorCode& status) const;
+
+    U_COMMON_API int32_t getKeywordValue(const char* keywordName,
+                                         char* buffer,
+                                         int32_t bufferCapacity,
+                                         UErrorCode& status) const;
+
+    U_COMMON_API void getKeywordValue(StringPiece keywordName, ByteSink& sink, UErrorCode& status) const;
+
+    template<typename StringClass>
+    inline StringClass getKeywordValue(StringPiece keywordName, UErrorCode& status) const;
+
+    U_COMMON_API void getUnicodeKeywordValue(StringPiece keywordName,
+                                             ByteSink& sink,
+                                             UErrorCode& status) const;
+
+    template<typename StringClass>
+    inline StringClass getUnicodeKeywordValue(StringPiece keywordName, UErrorCode& status) const;
+
+    U_COMMON_API void setKeywordValue(const char* keywordName,
+                                      const char* keywordValue,
+                                      UErrorCode& status) {
+        setKeywordValue(StringPiece{keywordName}, StringPiece{keywordValue}, status);
+    }
+
+    U_COMMON_API void setKeywordValue(StringPiece keywordName,
+                                      StringPiece keywordValue,
+                                      UErrorCode& status);
+
+    U_COMMON_API void setUnicodeKeywordValue(StringPiece keywordName,
+                                             StringPiece keywordValue,
+                                             UErrorCode& status);
+
+    U_COMMON_API const char* getISO3Language() const;
+
+    U_COMMON_API const char* getISO3Country() const;
+
+    U_COMMON_API uint32_t getLCID() const;
+
+    U_COMMON_API UBool isRightToLeft() const;
+
+    U_COMMON_API UnicodeString& getDisplayLanguage(UnicodeString& dispLang) const;
+
+    U_COMMON_API UnicodeString& getDisplayLanguage(const Locale& displayLocale,
+                                                   UnicodeString& dispLang) const;
+
+    U_COMMON_API UnicodeString& getDisplayScript(UnicodeString& dispScript) const;
+
+    U_COMMON_API UnicodeString& getDisplayScript(const Locale& displayLocale,
+                                                 UnicodeString& dispScript) const;
+
+    U_COMMON_API UnicodeString& getDisplayCountry(UnicodeString& dispCountry) const;
+
+    U_COMMON_API UnicodeString& getDisplayCountry(const Locale& displayLocale,
+                                                  UnicodeString& dispCountry) const;
+
+    U_COMMON_API UnicodeString& getDisplayVariant(UnicodeString& dispVar) const;
+
+    U_COMMON_API UnicodeString& getDisplayVariant(const Locale& displayLocale,
+                                                  UnicodeString& dispVar) const;
+
+    U_COMMON_API UnicodeString& getDisplayName(UnicodeString& name) const;
+
+    U_COMMON_API UnicodeString& getDisplayName(const Locale& displayLocale, UnicodeString& name) const;
+
+    U_COMMON_API int32_t hashCode() const;
+
+    U_COMMON_API void setToBogus();
+
+    U_COMMON_API inline UBool isBogus() const;
+
+    U_COMMON_API static const Locale* U_EXPORT2 getAvailableLocales(int32_t& count);
+
+    U_COMMON_API static const char* const* U_EXPORT2 getISOCountries();
+
+    U_COMMON_API static const char* const* U_EXPORT2 getISOLanguages();
+
+    U_COMMON_API static UClassID U_EXPORT2 getStaticClassID();
+
+    U_COMMON_API virtual UClassID getDynamicClassID() const override;
+
+    class U_COMMON_API Iterator  {
+    public:
+        virtual ~Iterator();
+
+        virtual UBool hasNext() const = 0;
+
+        virtual const Locale &next() = 0;
+    };
+
+    template<typename Iter>
+    class RangeIterator : public Iterator, public UMemory {
+    public:
+        RangeIterator(Iter begin, Iter end) : it_(begin), end_(end) {}
+
+        UBool hasNext() const override { return it_ != end_; }
+
+        const Locale &next() override { return *it_++; }
+
+    private:
+        Iter it_;
+        const Iter end_;
+    };
+
+    template<typename Iter, typename Conv>
+    class ConvertingIterator : public Iterator, public UMemory {
+    public:
+        ConvertingIterator(Iter begin, Iter end, Conv converter) :
+                it_(begin), end_(end), converter_(converter) {}
+
+        UBool hasNext() const override { return it_ != end_; }
+
+        const Locale &next() override { return converter_(*it_++); }
+
+    private:
+        Iter it_;
+        const Iter end_;
+        Conv converter_;
+    };
+
+protected: 
+#if !defined(U_HIDE_INTERNAL_API)
+    U_COMMON_API void setFromPOSIXID(const char* posixID);
+    U_COMMON_API void minimizeSubtags(bool favorScript, UErrorCode& status);
+#endif
+
+private:
+    Locale& init(const char* localeID, UBool canonicalize);
+    Locale& init(StringPiece localeID, UBool canonicalize);
+
+    enum ELocaleType : uint8_t {
+        eBOGUS,
+        eNEST,
+        eHEAP,
+    };
+    Locale(ELocaleType);
+
+    static Locale* getLocaleCache();
+
+    union Payload;
+    struct Nest;
+    struct Heap;
+
+    struct Nest {
+        static constexpr size_t SIZE = 32;
+
+        ELocaleType type = eNEST;
+        char language[4];
+        char script[5];
+        char region[4];
+        uint8_t variantBegin;
+        char baseName[SIZE -
+                      sizeof type -
+                      sizeof language -
+                      sizeof script -
+                      sizeof region -
+                      sizeof variantBegin];
+
+        const char* getLanguage() const { return language; }
+        const char* getScript() const { return script; }
+        const char* getRegion() const { return region; }
+        const char* getVariant() const { return variantBegin == 0 ? "" : getBaseName() + variantBegin; }
+        const char* getBaseName() const { return baseName; }
+
+        static void* U_EXPORT2 operator new(size_t) noexcept = delete;
+        static void* U_EXPORT2 operator new[](size_t) noexcept = delete;
+
+        Nest() : language{'\0'}, script{'\0'}, region{'\0'}, variantBegin{0}, baseName{'\0'} {}
+
+        void init(std::string_view language,
+                  std::string_view script,
+                  std::string_view region,
+                  uint8_t variantBegin);
+
+        static bool fits(int32_t length,
+                         std::string_view language,
+                         std::string_view script,
+                         std::string_view region) {
+            return length < static_cast<int32_t>(sizeof Nest::baseName) &&
+                   language.size() < sizeof Nest::language &&
+                   script.size() < sizeof Nest::script &&
+                   region.size() < sizeof Nest::region;
+        }
+
+      private:
+        friend union Payload;
+        Nest(Heap&& heap, uint8_t variantBegin);
+    };
+    static_assert(sizeof(Nest) == Nest::SIZE);
+
+    struct Heap {
+        struct Alloc;
+
+        ELocaleType type;
+        char language[ULOC_LANG_CAPACITY];
+        char script[ULOC_SCRIPT_CAPACITY];
+        char region[ULOC_COUNTRY_CAPACITY];
+        Alloc* ptr;
+
+        const char* getLanguage() const { return language; }
+        const char* getScript() const { return script; }
+        const char* getRegion() const { return region; }
+        const char* getVariant() const;
+        const char* getFullName() const;
+        const char* getBaseName() const;
+
+        static void* U_EXPORT2 operator new(size_t) noexcept = delete;
+        static void* U_EXPORT2 operator new[](size_t) noexcept = delete;
+
+        Heap(std::string_view language,
+             std::string_view script,
+             std::string_view region,
+             int32_t variantBegin);
+        ~Heap();
+
+        Heap& operator=(const Heap& other);
+        Heap& operator=(Heap&& other) noexcept;
+    };
+    static_assert(sizeof(Heap) <= sizeof(Nest));
+
+    union Payload {
+      private:
+        Nest nest;
+        Heap heap;
+        ELocaleType type;
+
+        void copy(const Payload& other);
+        void move(Payload&& other) noexcept;
+
+      public:
+        static void* U_EXPORT2 operator new(size_t) noexcept = delete;
+        static void* U_EXPORT2 operator new[](size_t) noexcept = delete;
+
+        Payload() : type{eBOGUS} {}
+        ~Payload();
+
+        Payload(const Payload& other);
+        Payload(Payload&& other) noexcept;
+
+        Payload& operator=(const Payload& other);
+        Payload& operator=(Payload&& other) noexcept;
+
+        void setToBogus();
+        bool isBogus() const { return type == eBOGUS; }
+
+        template <typename T, typename... Args> T& emplace(Args&&... args);
+
+        template <typename T> T* get();
+
+        template <typename BogusFn, typename NestFn, typename HeapFn, typename... Args>
+        auto visit(BogusFn bogusFn, NestFn nestFn, HeapFn heapFn, Args... args) const;
+    } payload;
+
+    template <const char* (Nest::*const NEST)() const,
+              const char* (Heap::*const HEAP)() const>
+    const char* getField() const;
+
+    static const Locale &getLocale(int locid);
+
+    friend Locale *locale_set_default_internal(const char *, UErrorCode& status);
+
+    friend void U_CALLCONV locale_available_init();
+};
+
+U_COMMON_API inline bool
+Locale::operator!=(const    Locale&     other) const
+{
+    return !operator==(other);
+}
+
+template<typename StringClass> inline StringClass
+Locale::toLanguageTag(UErrorCode& status) const
+{
+    if (U_FAILURE(status)) { return {}; }
+    StringClass result;
+    StringByteSink<StringClass> sink(&result);
+    toLanguageTag(sink, status);
+    return result;
+}
+
+template<typename StringClass, typename OutputIterator> inline void
+Locale::getKeywords(OutputIterator iterator, UErrorCode& status) const
+{
+    if (U_FAILURE(status)) { return; }
+    LocalPointer<StringEnumeration> keys(createKeywords(status));
+    if (U_FAILURE(status) || keys.isNull()) {
+        return;
+    }
+    for (;;) {
+        int32_t resultLength;
+        const char* buffer = keys->next(&resultLength, status);
+        if (U_FAILURE(status) || buffer == nullptr) {
+            return;
+        }
+        *iterator++ = StringClass(buffer, resultLength);
+    }
+}
+
+template<typename StringClass, typename OutputIterator> inline void
+Locale::getUnicodeKeywords(OutputIterator iterator, UErrorCode& status) const
+{
+    if (U_FAILURE(status)) { return; }
+    LocalPointer<StringEnumeration> keys(createUnicodeKeywords(status));
+    if (U_FAILURE(status) || keys.isNull()) {
+        return;
+    }
+    for (;;) {
+        int32_t resultLength;
+        const char* buffer = keys->next(&resultLength, status);
+        if (U_FAILURE(status) || buffer == nullptr) {
+            return;
+        }
+        *iterator++ = StringClass(buffer, resultLength);
+    }
+}
+
+template<typename StringClass> inline StringClass
+Locale::getKeywordValue(StringPiece keywordName, UErrorCode& status) const
+{
+    if (U_FAILURE(status)) { return {}; }
+    StringClass result;
+    StringByteSink<StringClass> sink(&result);
+    getKeywordValue(keywordName, sink, status);
+    return result;
+}
+
+template<typename StringClass> inline StringClass
+Locale::getUnicodeKeywordValue(StringPiece keywordName, UErrorCode& status) const
+{
+    if (U_FAILURE(status)) { return {}; }
+    StringClass result;
+    StringByteSink<StringClass> sink(&result);
+    getUnicodeKeywordValue(keywordName, sink, status);
+    return result;
+}
+
+U_COMMON_API inline UBool
+Locale::isBogus() const {
+    return payload.isBogus();
+}
+
+U_NAMESPACE_END
+
+#endif
+
+#endif

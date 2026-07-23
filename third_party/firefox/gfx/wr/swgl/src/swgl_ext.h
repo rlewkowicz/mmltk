@@ -1,0 +1,2168 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include <cstdint>
+
+template <typename P, typename C>
+static void commit_masked_solid_span(P* buf, C color, int len) {
+  override_clip_mask();
+  uint8_t* mask = get_clip_mask(buf);
+  for (P* end = &buf[len]; buf < end; buf += 4, mask += 4) {
+    commit_span(
+        buf,
+        blend_span(
+            buf,
+            applyColor(expand_mask(buf, unpack(unaligned_load<PackedR8>(mask))),
+                       color)));
+  }
+  restore_clip_mask();
+}
+
+template <typename P, typename R>
+static ALWAYS_INLINE void commit_aa_solid_span(P* buf, R r, int len) {
+  if (int start = min((get_aa_opaque_start(buf) + 3) & ~3, len)) {
+    commit_solid_span<true>(buf, r, start);
+    buf += start;
+    len -= start;
+  }
+  if (int opaque = min((get_aa_opaque_size(buf) + 3) & ~3, len)) {
+    override_aa();
+    commit_solid_span<true>(buf, r, opaque);
+    restore_aa();
+    buf += opaque;
+    len -= opaque;
+  }
+  if (len > 0) {
+    commit_solid_span<true>(buf, r, len);
+  }
+}
+
+template <typename T>
+static ALWAYS_INLINE auto swgl_forceScalar(T v) -> decltype(force_scalar(v)) {
+  return force_scalar(v);
+}
+
+#define swgl_stepInterp() step_interp_inputs()
+
+#define swgl_interpStep(v) (interp_step.v)
+
+#define swgl_commitSolid(format, v, n)                                   \
+  do {                                                                   \
+    int len = (n);                                                       \
+    if (blend_key) {                                                     \
+      if (swgl_ClipFlags & SWGL_CLIP_FLAG_MASK) {                        \
+        commit_masked_solid_span(swgl_Out##format,                       \
+                                 packColor(swgl_Out##format, (v)), len); \
+      } else if (swgl_ClipFlags & SWGL_CLIP_FLAG_AA) {                   \
+        commit_aa_solid_span(swgl_Out##format,                           \
+                             pack_span(swgl_Out##format, (v)), len);     \
+      } else {                                                           \
+        commit_solid_span<true>(swgl_Out##format,                        \
+                                pack_span(swgl_Out##format, (v)), len);  \
+      }                                                                  \
+    } else {                                                             \
+      commit_solid_span<false>(swgl_Out##format,                         \
+                               pack_span(swgl_Out##format, (v)), len);   \
+    }                                                                    \
+    swgl_Out##format += len;                                             \
+    swgl_SpanLength -= len;                                              \
+  } while (0)
+#define swgl_commitSolidRGBA8(v) swgl_commitSolid(RGBA8, v, swgl_SpanLength)
+#define swgl_commitSolidR8(v) swgl_commitSolid(R8, v, swgl_SpanLength)
+#define swgl_commitPartialSolidRGBA8(len, v) \
+  swgl_commitSolid(RGBA8, v, min(int(len), swgl_SpanLength))
+#define swgl_commitPartialSolidR8(len, v) \
+  swgl_commitSolid(R8, v, min(int(len), swgl_SpanLength))
+
+#define swgl_commitChunk(format, chunk)                 \
+  do {                                                  \
+    auto r = chunk;                                     \
+    if (blend_key) r = blend_span(swgl_Out##format, r); \
+    commit_span(swgl_Out##format, r);                   \
+    swgl_Out##format += swgl_StepSize;                  \
+    swgl_SpanLength -= swgl_StepSize;                   \
+  } while (0)
+
+#define swgl_commitColor(format, color) \
+  swgl_commitChunk(format, pack_pixels_##format(color))
+#define swgl_commitColorRGBA8(color) swgl_commitColor(RGBA8, color)
+#define swgl_commitColorR8(color) swgl_commitColor(R8, color)
+
+template <typename S>
+static ALWAYS_INLINE bool swgl_isTextureLinear(S s) {
+  return s->filter == TextureFilter::LINEAR;
+}
+
+template <typename S>
+static ALWAYS_INLINE bool swgl_isTextureRGBA8(S s) {
+  return s->format == TextureFormat::RGBA8;
+}
+
+template <typename S>
+static ALWAYS_INLINE bool swgl_isTextureR8(S s) {
+  return s->format == TextureFormat::R8;
+}
+
+const int swgl_LinearQuantizeScale = 128;
+
+template <typename S, typename T>
+static ALWAYS_INLINE T swgl_linearQuantize(S s, T p) {
+  return linearQuantize(p, swgl_LinearQuantizeScale, s);
+}
+
+template <typename S, typename T>
+static ALWAYS_INLINE T swgl_linearQuantizeStep(S s, T p) {
+  return samplerScale(s, p) * swgl_LinearQuantizeScale;
+}
+
+template <typename S>
+static ALWAYS_INLINE WideRGBA8 textureLinearUnpacked(UNUSED uint32_t* buf,
+                                                     S sampler, ivec2 i) {
+  return textureLinearUnpackedRGBA8(sampler, i);
+}
+
+template <typename S>
+static ALWAYS_INLINE WideR8 textureLinearUnpacked(UNUSED uint8_t* buf,
+                                                  S sampler, ivec2 i) {
+  return textureLinearUnpackedR8(sampler, i);
+}
+
+template <typename S>
+static ALWAYS_INLINE bool matchTextureFormat(S s, UNUSED uint32_t* buf) {
+  return swgl_isTextureRGBA8(s);
+}
+
+template <typename S>
+static ALWAYS_INLINE bool matchTextureFormat(S s, UNUSED uint8_t* buf) {
+  return swgl_isTextureR8(s);
+}
+
+#define LINEAR_QUANTIZE_UV(sampler, uv, uv_step, uv_rect, min_uv, max_uv)     \
+  uv = swgl_linearQuantize(sampler, uv);                                      \
+  vec2_scalar uv_step =                                                       \
+      float(swgl_StepSize) * vec2_scalar{uv.x.y - uv.x.x, uv.y.y - uv.y.x};   \
+  vec2_scalar min_uv = max(                                                   \
+      swgl_linearQuantize(sampler, vec2_scalar{uv_rect.x, uv_rect.y}), 0.0f); \
+  vec2_scalar max_uv =                                                        \
+      max(swgl_linearQuantize(sampler, vec2_scalar{uv_rect.z, uv_rect.w}),    \
+          min_uv);
+
+template <bool BLEND, typename S, typename C, typename P>
+static P* blendTextureLinearFallback(S sampler, vec2 uv, int span,
+                                     vec2_scalar uv_step, vec2_scalar min_uv,
+                                     vec2_scalar max_uv, C color, P* buf) {
+  for (P* end = buf + span; buf < end; buf += swgl_StepSize, uv += uv_step) {
+    commit_blend_span<BLEND>(
+        buf, applyColor(textureLinearUnpacked(buf, sampler,
+                                              ivec2(clamp(uv, min_uv, max_uv))),
+                        color));
+  }
+  return buf;
+}
+
+static ALWAYS_INLINE U64 castForShuffle(V16<int16_t> r) {
+  return bit_cast<U64>(r);
+}
+static ALWAYS_INLINE U16 castForShuffle(V4<int16_t> r) {
+  return bit_cast<U16>(r);
+}
+
+static ALWAYS_INLINE V16<int16_t> applyFracX(V16<int16_t> r, I16 fracx) {
+  return r * fracx.xxxxyyyyzzzzwwww;
+}
+static ALWAYS_INLINE V4<int16_t> applyFracX(V4<int16_t> r, I16 fracx) {
+  return r * fracx;
+}
+
+template <bool BLEND, typename S, typename C, typename P>
+static void blendTextureLinearUpscale(S sampler, vec2 uv, int span,
+                                      vec2_scalar uv_step, vec2_scalar min_uv,
+                                      vec2_scalar max_uv, C color, P* buf) {
+  typedef VectorType<uint8_t, 4 * sizeof(P)> packed_type;
+  typedef VectorType<uint16_t, 4 * sizeof(P)> unpacked_type;
+  typedef VectorType<int16_t, 4 * sizeof(P)> signed_unpacked_type;
+
+  ivec2 i(clamp(uv, min_uv, max_uv));
+  ivec2 frac = i;
+  i >>= 7;
+  P* row0 = (P*)sampler->buf + computeRow(sampler, ivec2_scalar(0, i.y.x));
+  P* row1 = row0 + computeNextRowOffset(sampler, ivec2_scalar(0, i.y.x));
+  I16 fracx = computeFracX(sampler, i, frac);
+  int16_t fracy = computeFracY(frac).x;
+  auto src0 =
+      CONVERT(unaligned_load<packed_type>(&row0[i.x.x]), signed_unpacked_type);
+  auto src1 =
+      CONVERT(unaligned_load<packed_type>(&row1[i.x.x]), signed_unpacked_type);
+  auto src = castForShuffle(src0 + (((src1 - src0) * fracy) >> 7));
+
+  for (P* end = buf + span; buf < end; buf += 4) {
+    uv.x += uv_step.x;
+    I32 ixn = cast(uv.x);
+    I16 fracn = computeFracNoClamp(ixn);
+    ixn >>= 7;
+    auto src0n = CONVERT(unaligned_load<packed_type>(&row0[ixn.x]),
+                         signed_unpacked_type);
+    auto src1n = CONVERT(unaligned_load<packed_type>(&row1[ixn.x]),
+                         signed_unpacked_type);
+    auto srcn = castForShuffle(src0n + (((src1n - src0n) * fracy) >> 7));
+
+    auto shuf = src;
+    auto shufn = SHUFFLE(src, ixn.x == i.x.w ? srcn.yyyy : srcn, 1, 2, 3, 4);
+    if (i.x.y == i.x.x) {
+      shuf = shuf.xxyz;
+      shufn = shufn.xxyz;
+    }
+    if (i.x.z == i.x.y) {
+      shuf = shuf.xyyz;
+      shufn = shufn.xyyz;
+    }
+    if (i.x.w == i.x.z) {
+      shuf = shuf.xyzz;
+      shufn = shufn.xyzz;
+    }
+
+    auto interp = bit_cast<signed_unpacked_type>(shuf);
+    auto interpn = bit_cast<signed_unpacked_type>(shufn);
+    interp += applyFracX(interpn - interp, fracx) >> 7;
+
+    commit_blend_span<BLEND>(
+        buf, applyColor(bit_cast<unpacked_type>(interp), color));
+
+    i.x = ixn;
+    fracx = fracn;
+    src = srcn;
+  }
+}
+
+template <bool BLEND, typename S, typename C, typename P>
+static void blendTextureLinearFast(S sampler, vec2 uv, int span,
+                                   vec2_scalar min_uv, vec2_scalar max_uv,
+                                   C color, P* buf) {
+  typedef VectorType<uint8_t, 4 * sizeof(P)> packed_type;
+  typedef VectorType<uint16_t, 4 * sizeof(P)> unpacked_type;
+  typedef VectorType<int16_t, 4 * sizeof(P)> signed_unpacked_type;
+
+  ivec2 i(clamp(uv, min_uv, max_uv));
+  ivec2 frac = i;
+  i >>= 7;
+  P* row0 = (P*)sampler->buf + computeRow(sampler, force_scalar(i));
+  P* row1 = row0 + computeNextRowOffset(sampler, force_scalar(i));
+  int16_t fracx = computeFracX(sampler, i, frac).x;
+  int16_t fracy = computeFracY(frac).x;
+  auto src0 = CONVERT(unaligned_load<packed_type>(row0), signed_unpacked_type);
+  auto src1 = CONVERT(unaligned_load<packed_type>(row1), signed_unpacked_type);
+  auto src = castForShuffle(src0 + (((src1 - src0) * fracy) >> 7));
+
+  for (P* end = buf + span; buf < end; buf += 4) {
+    row0 += 4;
+    row1 += 4;
+    auto src0n =
+        CONVERT(unaligned_load<packed_type>(row0), signed_unpacked_type);
+    auto src1n =
+        CONVERT(unaligned_load<packed_type>(row1), signed_unpacked_type);
+    auto srcn = castForShuffle(src0n + (((src1n - src0n) * fracy) >> 7));
+
+    auto interp = bit_cast<signed_unpacked_type>(src);
+    auto interpn =
+        bit_cast<signed_unpacked_type>(SHUFFLE(src, srcn, 1, 2, 3, 4));
+    interp += ((interpn - interp) * fracx) >> 7;
+
+    commit_blend_span<BLEND>(
+        buf, applyColor(bit_cast<unpacked_type>(interp), color));
+
+    src = srcn;
+  }
+}
+
+template <bool BLEND, typename S, typename C, typename P>
+static NO_INLINE void blendTextureLinearDownscale(S sampler, vec2 uv, int span,
+                                                  vec2_scalar min_uv,
+                                                  vec2_scalar max_uv, C color,
+                                                  P* buf) {
+  typedef VectorType<uint8_t, 4 * sizeof(P)> packed_type;
+  typedef VectorType<uint16_t, 4 * sizeof(P)> unpacked_type;
+  typedef VectorType<int16_t, 4 * sizeof(P)> signed_unpacked_type;
+
+  ivec2 i(clamp(uv, min_uv, max_uv));
+  ivec2 frac = i;
+  i >>= 7;
+  P* row0 = (P*)sampler->buf + computeRow(sampler, force_scalar(i));
+  P* row1 = row0 + computeNextRowOffset(sampler, force_scalar(i));
+  int16_t fracx = computeFracX(sampler, i, frac).x;
+  int16_t fracy = computeFracY(frac).x;
+
+  for (P* end = buf + span; buf < end; buf += 4) {
+    auto src0 =
+        CONVERT(unaligned_load<packed_type>(row0), signed_unpacked_type);
+    auto src1 =
+        CONVERT(unaligned_load<packed_type>(row1), signed_unpacked_type);
+    auto src = castForShuffle(src0 + (((src1 - src0) * fracy) >> 7));
+    row0 += 4;
+    row1 += 4;
+    auto src0n =
+        CONVERT(unaligned_load<packed_type>(row0), signed_unpacked_type);
+    auto src1n =
+        CONVERT(unaligned_load<packed_type>(row1), signed_unpacked_type);
+    auto srcn = castForShuffle(src0n + (((src1n - src0n) * fracy) >> 7));
+    row0 += 4;
+    row1 += 4;
+
+    auto interp =
+        bit_cast<signed_unpacked_type>(SHUFFLE(src, srcn, 0, 2, 4, 6));
+    auto interpn =
+        bit_cast<signed_unpacked_type>(SHUFFLE(src, srcn, 1, 3, 5, 7));
+    interp += ((interpn - interp) * fracx) >> 7;
+
+    commit_blend_span<BLEND>(
+        buf, applyColor(bit_cast<unpacked_type>(interp), color));
+  }
+}
+
+enum LinearFilter {
+  LINEAR_FILTER_NEAREST = 0,
+  LINEAR_FILTER_FALLBACK,
+  LINEAR_FILTER_UPSCALE,
+  LINEAR_FILTER_FAST,
+  LINEAR_FILTER_DOWNSCALE
+};
+
+template <bool BLEND, typename S, typename C, typename P>
+static P* blendTextureLinearDispatch(S sampler, vec2 uv, int span,
+                                     vec2_scalar uv_step, vec2_scalar min_uv,
+                                     vec2_scalar max_uv, C color, P* buf,
+                                     LinearFilter filter) {
+  P* end = buf + span;
+  if (filter != LINEAR_FILTER_FALLBACK) {
+    float beforeDist = max(0.0f, min_uv.x) - uv.x.x;
+    if (beforeDist > 0) {
+      int before = clamp(int(ceil(beforeDist / uv_step.x)) * swgl_StepSize, 0,
+                         int(end - buf));
+      buf = blendTextureLinearFallback<BLEND>(sampler, uv, before, uv_step,
+                                              min_uv, max_uv, color, buf);
+      uv.x += (before / swgl_StepSize) * uv_step.x;
+    }
+    float insideDist =
+        min(max_uv.x, float((int(sampler->width) - swgl_StepSize) *
+                            swgl_LinearQuantizeScale)) -
+        uv.x.x;
+    if (uv_step.x > 0.0f && insideDist >= uv_step.x) {
+      int32_t inside = int(end - buf);
+      if (filter == LINEAR_FILTER_DOWNSCALE) {
+        inside = min(int(insideDist * (0.5f / swgl_LinearQuantizeScale)) &
+                         ~(swgl_StepSize - 1),
+                     inside);
+        if (inside > 0) {
+          blendTextureLinearDownscale<BLEND>(sampler, uv, inside, min_uv,
+                                             max_uv, color, buf);
+          buf += inside;
+          uv.x += (inside / swgl_StepSize) * uv_step.x;
+        }
+      } else if (filter == LINEAR_FILTER_UPSCALE) {
+        inside = min(int(insideDist / uv_step.x) * swgl_StepSize, inside);
+        if (inside > 0) {
+          blendTextureLinearUpscale<BLEND>(sampler, uv, inside, uv_step, min_uv,
+                                           max_uv, color, buf);
+          buf += inside;
+          uv.x += (inside / swgl_StepSize) * uv_step.x;
+        }
+      } else {
+        inside = min(int(insideDist * (1.0f / swgl_LinearQuantizeScale)) &
+                         ~(swgl_StepSize - 1),
+                     inside);
+        if (inside > 0) {
+          blendTextureLinearFast<BLEND>(sampler, uv, inside, min_uv, max_uv,
+                                        color, buf);
+          buf += inside;
+          uv.x += (inside / swgl_StepSize) * uv_step.x;
+        }
+      }
+    }
+  }
+  if (buf < end) {
+    buf = blendTextureLinearFallback<BLEND>(
+        sampler, uv, int(end - buf), uv_step, min_uv, max_uv, color, buf);
+  }
+  return buf;
+}
+
+template <bool BLEND, typename S, typename C, typename P>
+static inline int blendTextureLinear(S sampler, vec2 uv, int span,
+                                     const vec4_scalar& uv_rect, C color,
+                                     P* buf, LinearFilter filter) {
+  if (!matchTextureFormat(sampler, buf)) {
+    return 0;
+  }
+  LINEAR_QUANTIZE_UV(sampler, uv, uv_step, uv_rect, min_uv, max_uv);
+  blendTextureLinearDispatch<BLEND>(sampler, uv, span, uv_step, min_uv, max_uv,
+                                    color, buf, filter);
+  return span;
+}
+
+template <bool BLEND, typename S, typename C, typename P>
+static int blendTextureNearestFast(S sampler, vec2 uv, int span,
+                                   const vec4_scalar& uv_rect, C color,
+                                   P* buf) {
+  if (!matchTextureFormat(sampler, buf)) {
+    return 0;
+  }
+
+  typedef VectorType<uint8_t, 4 * sizeof(P)> packed_type;
+
+  ivec2_scalar i = make_ivec2(samplerScale(sampler, force_scalar(uv)));
+  ivec2_scalar minUV =
+      make_ivec2(samplerScale(sampler, vec2_scalar{uv_rect.x, uv_rect.y}));
+  ivec2_scalar maxUV =
+      make_ivec2(samplerScale(sampler, vec2_scalar{uv_rect.z, uv_rect.w}));
+
+  P* row =
+      &((P*)sampler
+            ->buf)[clampCoord(clamp(i.y, minUV.y, maxUV.y), sampler->height) *
+                   sampler->stride];
+  int minX = clamp(minUV.x, 0, sampler->width - 1);
+  int maxX = clamp(maxUV.x, minX, sampler->width - 1);
+  int curX = i.x;
+  int endX = i.x + span;
+  if (curX < minX) {
+    int n = min(minX, endX) - curX;
+    auto src =
+        applyColor(unpack(bit_cast<packed_type>(V4<P>(row[minX]))), color);
+    commit_solid_span<BLEND>(buf, src, n);
+    buf += n;
+    curX += n;
+  }
+  int n = max(min(maxX + 1, endX) - curX, 0);
+  for (int end = curX + (n & ~3); curX < end; curX += 4, buf += 4) {
+    auto src = applyColor(unaligned_load<packed_type>(&row[curX]), color);
+    commit_blend_span<BLEND>(buf, src);
+  }
+  n &= 3;
+  if (n > 0) {
+    auto src = applyColor(partial_load_span<packed_type>(&row[curX], n), color);
+    commit_blend_span<BLEND>(buf, src, n);
+    buf += n;
+    curX += n;
+  }
+  if (curX < endX) {
+    auto src =
+        applyColor(unpack(bit_cast<packed_type>(V4<P>(row[maxX]))), color);
+    commit_solid_span<BLEND>(buf, src, endX - curX);
+  }
+  return span;
+}
+
+template <typename T>
+static ALWAYS_INLINE int spanNeedsScale(int span, T P) {
+  span &= ~(128 - 1);
+  span += 128;
+  int scaled = round((P.x.y - P.x.x) * span);
+  return scaled != span ? (scaled == span * 2 ? 2 : 1) : 0;
+}
+
+template <typename S, typename T>
+static inline LinearFilter needsTextureLinear(S sampler, T P, int span) {
+  if (sampler->width < 2) {
+    return LINEAR_FILTER_NEAREST;
+  }
+  if (P.y.x != P.y.y) {
+    return LINEAR_FILTER_FALLBACK;
+  }
+  P = samplerScale(sampler, P);
+  if (int scale = spanNeedsScale(span, P)) {
+    return P.x.x < P.x.y && P.x.y - P.x.x <= 1
+               ? LINEAR_FILTER_UPSCALE
+               : (scale == 2 ? LINEAR_FILTER_DOWNSCALE
+                             : LINEAR_FILTER_FALLBACK);
+  }
+  if ((int(P.x.x * 4.0f + 0.5f) & 3) != 2 ||
+      (int(P.y.x * 4.0f + 0.5f) & 3) != 2) {
+    return LINEAR_FILTER_FAST;
+  }
+  return LINEAR_FILTER_NEAREST;
+}
+
+#define swgl_commitTextureLinear(format, s, p, uv_rect, color, n)              \
+  do {                                                                         \
+    auto packed_color = packColor(swgl_Out##format, color);                    \
+    int len = (n);                                                             \
+    int drawn = 0;                                                             \
+    if (LinearFilter filter = needsTextureLinear(s, p, len)) {                 \
+      if (blend_key) {                                                         \
+        drawn = blendTextureLinear<true>(s, p, len, uv_rect, packed_color,     \
+                                         swgl_Out##format, filter);            \
+      } else {                                                                 \
+        drawn = blendTextureLinear<false>(s, p, len, uv_rect, packed_color,    \
+                                          swgl_Out##format, filter);           \
+      }                                                                        \
+    } else if (blend_key) {                                                    \
+      drawn = blendTextureNearestFast<true>(s, p, len, uv_rect, packed_color,  \
+                                            swgl_Out##format);                 \
+    } else {                                                                   \
+      drawn = blendTextureNearestFast<false>(s, p, len, uv_rect, packed_color, \
+                                             swgl_Out##format);                \
+    }                                                                          \
+    swgl_Out##format += drawn;                                                 \
+    swgl_SpanLength -= drawn;                                                  \
+  } while (0)
+#define swgl_commitTextureLinearRGBA8(s, p, uv_rect) \
+  swgl_commitTextureLinear(RGBA8, s, p, uv_rect, NoColor(), swgl_SpanLength)
+#define swgl_commitTextureLinearR8(s, p, uv_rect) \
+  swgl_commitTextureLinear(R8, s, p, uv_rect, NoColor(), swgl_SpanLength)
+
+#define swgl_commitPartialTextureLinearR8(len, s, p, uv_rect) \
+  swgl_commitTextureLinear(R8, s, p, uv_rect, NoColor(),      \
+                           min(int(len), swgl_SpanLength))
+#define swgl_commitPartialTextureLinearInvertR8(len, s, p, uv_rect) \
+  swgl_commitTextureLinear(R8, s, p, uv_rect, InvertColor(),        \
+                           min(int(len), swgl_SpanLength))
+
+#define swgl_commitTextureLinearColorRGBA8(s, p, uv_rect, color) \
+  swgl_commitTextureLinear(RGBA8, s, p, uv_rect, color, swgl_SpanLength)
+#define swgl_commitTextureLinearColorR8(s, p, uv_rect, color) \
+  swgl_commitTextureLinear(R8, s, p, uv_rect, color, swgl_SpanLength)
+
+template <bool BLEND, typename S, typename C, typename P>
+static inline int blendTextureLinearR8(S sampler, vec2 uv, int span,
+                                       const vec4_scalar& uv_rect, C color,
+                                       P* buf) {
+  if (!swgl_isTextureR8(sampler) || sampler->width < 2) {
+    return 0;
+  }
+  LINEAR_QUANTIZE_UV(sampler, uv, uv_step, uv_rect, min_uv, max_uv);
+  for (P* end = buf + span; buf < end; buf += swgl_StepSize, uv += uv_step) {
+    commit_blend_span<BLEND>(
+        buf, applyColor(expand_mask(buf, textureLinearUnpackedR8(
+                                             sampler,
+                                             ivec2(clamp(uv, min_uv, max_uv)))),
+                        color));
+  }
+  return span;
+}
+
+#define swgl_commitTextureLinearColorR8ToRGBA8(s, p, uv_rect, color)      \
+  do {                                                                    \
+    auto packed_color = packColor(swgl_OutRGBA8, color);                  \
+    int drawn = 0;                                                        \
+    if (blend_key) {                                                      \
+      drawn = blendTextureLinearR8<true>(s, p, swgl_SpanLength, uv_rect,  \
+                                         packed_color, swgl_OutRGBA8);    \
+    } else {                                                              \
+      drawn = blendTextureLinearR8<false>(s, p, swgl_SpanLength, uv_rect, \
+                                          packed_color, swgl_OutRGBA8);   \
+    }                                                                     \
+    swgl_OutRGBA8 += drawn;                                               \
+    swgl_SpanLength -= drawn;                                             \
+  } while (0)
+#define swgl_commitTextureLinearR8ToRGBA8(s, p, uv_rect) \
+  swgl_commitTextureLinearColorR8ToRGBA8(s, p, uv_rect, NoColor())
+
+static inline vec2 tileRepeatUV(vec2 uv, const vec2_scalar& tile_repeat) {
+  if (tile_repeat.x > 0.0f) {
+    uv = clamp(uv, vec2_scalar(0.0f), tile_repeat - 1.0e-6f);
+  }
+  return fract(uv);
+}
+
+static inline int computeNoRepeatSteps(Float uv, float uv_step,
+                                       float tile_repeat, int steps) {
+  if (uv.w < uv.x) {
+    uv = uv.wzyx;
+  }
+  float limit = floor(uv.x) + 1.0f;
+  if (tile_repeat > 0.0f) {
+    limit = min(limit, tile_repeat);
+  }
+  return uv.x >= 0.0f && uv.w < limit
+             ? (uv_step != 0.0f
+                    ? int(clamp((limit - uv.x) / uv_step, 0.0f, float(steps)))
+                    : steps)
+             : 0;
+}
+
+template <bool BLEND, typename S, typename C, typename P>
+static int blendTextureLinearRepeat(S sampler, vec2 uv, int span,
+                                    const vec2_scalar& tile_repeat,
+                                    const vec4_scalar& uv_repeat,
+                                    const vec4_scalar& uv_rect, C color,
+                                    P* buf) {
+  if (!matchTextureFormat(sampler, buf)) {
+    return 0;
+  }
+  vec2_scalar uv_scale = {uv_repeat.z - uv_repeat.x, uv_repeat.w - uv_repeat.y};
+  vec2_scalar uv_offset = {uv_repeat.x, uv_repeat.y};
+  LinearFilter filter =
+      needsTextureLinear(sampler, uv * uv_scale + uv_offset, span);
+  vec2_scalar uv_step =
+      float(swgl_StepSize) * vec2_scalar{uv.x.y - uv.x.x, uv.y.y - uv.y.x};
+  uv_scale = swgl_linearQuantizeStep(sampler, uv_scale);
+  uv_offset = swgl_linearQuantize(sampler, uv_offset);
+  vec2_scalar min_uv = max(
+      swgl_linearQuantize(sampler, vec2_scalar{uv_rect.x, uv_rect.y}), 0.0f);
+  vec2_scalar max_uv = max(
+      swgl_linearQuantize(sampler, vec2_scalar{uv_rect.z, uv_rect.w}), min_uv);
+  for (P* end = buf + span; buf < end; buf += swgl_StepSize, uv += uv_step) {
+    int steps = int(end - buf) / swgl_StepSize;
+    steps = computeNoRepeatSteps(uv.x, uv_step.x, tile_repeat.x, steps);
+    if (steps > 0) {
+      steps = computeNoRepeatSteps(uv.y, uv_step.y, tile_repeat.y, steps);
+      if (steps > 0) {
+        buf = blendTextureLinearDispatch<BLEND>(
+            sampler, fract(uv) * uv_scale + uv_offset, steps * swgl_StepSize,
+            uv_step * uv_scale, min_uv, max_uv, color, buf, filter);
+        if (buf >= end) {
+          break;
+        }
+        uv += steps * uv_step;
+      }
+    }
+    vec2 repeated_uv = clamp(
+        tileRepeatUV(uv, tile_repeat) * uv_scale + uv_offset, min_uv, max_uv);
+    commit_blend_span<BLEND>(
+        buf, applyColor(textureLinearUnpacked(buf, sampler, ivec2(repeated_uv)),
+                        color));
+  }
+  return span;
+}
+
+#define swgl_commitTextureLinearRepeat(format, s, p, tile_repeat, uv_repeat,   \
+                                       uv_rect, color)                         \
+  do {                                                                         \
+    auto packed_color = packColor(swgl_Out##format, color);                    \
+    int drawn = 0;                                                             \
+    if (blend_key) {                                                           \
+      drawn = blendTextureLinearRepeat<true>(s, p, swgl_SpanLength,            \
+                                             tile_repeat, uv_repeat, uv_rect,  \
+                                             packed_color, swgl_Out##format);  \
+    } else {                                                                   \
+      drawn = blendTextureLinearRepeat<false>(s, p, swgl_SpanLength,           \
+                                              tile_repeat, uv_repeat, uv_rect, \
+                                              packed_color, swgl_Out##format); \
+    }                                                                          \
+    swgl_Out##format += drawn;                                                 \
+    swgl_SpanLength -= drawn;                                                  \
+  } while (0)
+#define swgl_commitTextureLinearRepeatRGBA8(s, p, tile_repeat, uv_repeat,      \
+                                            uv_rect)                           \
+  swgl_commitTextureLinearRepeat(RGBA8, s, p, tile_repeat, uv_repeat, uv_rect, \
+                                 NoColor())
+#define swgl_commitTextureLinearRepeatColorRGBA8(s, p, tile_repeat, uv_repeat, \
+                                                 uv_rect, color)               \
+  swgl_commitTextureLinearRepeat(RGBA8, s, p, tile_repeat, uv_repeat, uv_rect, \
+                                 color)
+
+template <typename S>
+static ALWAYS_INLINE PackedRGBA8 textureNearestPacked(UNUSED uint32_t* buf,
+                                                      S sampler, ivec2 i) {
+  return textureNearestPackedRGBA8(sampler, i);
+}
+
+template <bool BLEND, bool REPEAT, typename S, typename C, typename P>
+static int blendTextureNearestRepeat(S sampler, vec2 uv, int span,
+                                     const vec2_scalar& tile_repeat,
+                                     const vec4_scalar& uv_rect, C color,
+                                     P* buf) {
+  if (!matchTextureFormat(sampler, buf)) {
+    return 0;
+  }
+  if (!REPEAT) {
+    uv = samplerScale(sampler, uv);
+  }
+  vec2_scalar uv_step =
+      float(swgl_StepSize) * vec2_scalar{uv.x.y - uv.x.x, uv.y.y - uv.y.x};
+  vec2_scalar min_uv = samplerScale(sampler, vec2_scalar{uv_rect.x, uv_rect.y});
+  vec2_scalar max_uv = samplerScale(sampler, vec2_scalar{uv_rect.z, uv_rect.w});
+  vec2_scalar uv_scale = max_uv - min_uv;
+  if ((int(min_uv.x) + (REPEAT ? 1 : 0) >= int(max_uv.x) ||
+       (abs(uv_step.x) * span * (REPEAT ? uv_scale.x : 1.0f) < 0.5f)) &&
+      (int(min_uv.y) + (REPEAT ? 1 : 0) >= int(max_uv.y) ||
+       (abs(uv_step.y) * span * (REPEAT ? uv_scale.y : 1.0f) < 0.5f))) {
+    vec2 repeated_uv = REPEAT
+                           ? tileRepeatUV(uv, tile_repeat) * uv_scale + min_uv
+                           : clamp(uv, min_uv, max_uv);
+    commit_solid_span<BLEND>(buf,
+                             applyColor(unpack(textureNearestPacked(
+                                            buf, sampler, ivec2(repeated_uv))),
+                                        color),
+                             span);
+  } else {
+    for (P* end = buf + span; buf < end; buf += swgl_StepSize, uv += uv_step) {
+      if (REPEAT) {
+        int steps = int(end - buf) / swgl_StepSize;
+        steps = computeNoRepeatSteps(uv.x, uv_step.x, tile_repeat.x, steps);
+        if (steps > 0) {
+          steps = computeNoRepeatSteps(uv.y, uv_step.y, tile_repeat.y, steps);
+          if (steps > 0) {
+            vec2 inside_uv = fract(uv) * uv_scale + min_uv;
+            vec2 inside_step = uv_step * uv_scale;
+            for (P* outside = &buf[steps * swgl_StepSize]; buf < outside;
+                 buf += swgl_StepSize, inside_uv += inside_step) {
+              commit_blend_span<BLEND>(
+                  buf, applyColor(
+                           textureNearestPacked(buf, sampler, ivec2(inside_uv)),
+                           color));
+            }
+            if (buf >= end) {
+              break;
+            }
+            uv += steps * uv_step;
+          }
+        }
+      }
+
+      vec2 repeated_uv = REPEAT
+                             ? tileRepeatUV(uv, tile_repeat) * uv_scale + min_uv
+                             : clamp(uv, min_uv, max_uv);
+      commit_blend_span<BLEND>(
+          buf,
+          applyColor(textureNearestPacked(buf, sampler, ivec2(repeated_uv)),
+                     color));
+    }
+  }
+  return span;
+}
+
+template <typename S, typename T>
+static ALWAYS_INLINE bool needsNearestFallback(S sampler, T P, int span) {
+  P = samplerScale(sampler, P);
+  return (P.y.y - P.y.x) * span >= 0.5f || spanNeedsScale(span, P);
+}
+
+#define swgl_commitTextureNearest(format, s, p, uv_rect, color)               \
+  do {                                                                        \
+    auto packed_color = packColor(swgl_Out##format, color);                   \
+    int drawn = 0;                                                            \
+    if (needsNearestFallback(s, p, swgl_SpanLength)) {                        \
+      if (blend_key) {                                                        \
+        drawn = blendTextureNearestRepeat<true, false>(                       \
+            s, p, swgl_SpanLength, 0.0f, uv_rect, packed_color,               \
+            swgl_Out##format);                                                \
+      } else {                                                                \
+        drawn = blendTextureNearestRepeat<false, false>(                      \
+            s, p, swgl_SpanLength, 0.0f, uv_rect, packed_color,               \
+            swgl_Out##format);                                                \
+      }                                                                       \
+    } else if (blend_key) {                                                   \
+      drawn = blendTextureNearestFast<true>(s, p, swgl_SpanLength, uv_rect,   \
+                                            packed_color, swgl_Out##format);  \
+    } else {                                                                  \
+      drawn = blendTextureNearestFast<false>(s, p, swgl_SpanLength, uv_rect,  \
+                                             packed_color, swgl_Out##format); \
+    }                                                                         \
+    swgl_Out##format += drawn;                                                \
+    swgl_SpanLength -= drawn;                                                 \
+  } while (0)
+#define swgl_commitTextureNearestRGBA8(s, p, uv_rect) \
+  swgl_commitTextureNearest(RGBA8, s, p, uv_rect, NoColor())
+#define swgl_commitTextureNearestColorRGBA8(s, p, uv_rect, color) \
+  swgl_commitTextureNearest(RGBA8, s, p, uv_rect, color)
+
+#define swgl_commitTextureNearestRepeat(format, s, p, tile_repeat, uv_rect, \
+                                        color)                              \
+  do {                                                                      \
+    auto packed_color = packColor(swgl_Out##format, color);                 \
+    int drawn = 0;                                                          \
+    if (blend_key) {                                                        \
+      drawn = blendTextureNearestRepeat<true, true>(                        \
+          s, p, swgl_SpanLength, tile_repeat, uv_rect, packed_color,        \
+          swgl_Out##format);                                                \
+    } else {                                                                \
+      drawn = blendTextureNearestRepeat<false, true>(                       \
+          s, p, swgl_SpanLength, tile_repeat, uv_rect, packed_color,        \
+          swgl_Out##format);                                                \
+    }                                                                       \
+    swgl_Out##format += drawn;                                              \
+    swgl_SpanLength -= drawn;                                               \
+  } while (0)
+#define swgl_commitTextureNearestRepeatRGBA8(s, p, tile_repeat, uv_repeat, \
+                                             uv_rect)                      \
+  swgl_commitTextureNearestRepeat(RGBA8, s, p, tile_repeat, uv_repeat,     \
+                                  NoColor())
+#define swgl_commitTextureNearestRepeatColorRGBA8(s, p, tile_repeat,         \
+                                                  uv_repeat, uv_rect, color) \
+  swgl_commitTextureNearestRepeat(RGBA8, s, p, tile_repeat, uv_repeat, color)
+
+#define swgl_commitTexture(format, s, ...)               \
+  do {                                                   \
+    if (s->filter == TextureFilter::LINEAR) {            \
+      swgl_commitTextureLinear##format(s, __VA_ARGS__);  \
+    } else {                                             \
+      swgl_commitTextureNearest##format(s, __VA_ARGS__); \
+    }                                                    \
+  } while (0)
+#define swgl_commitTextureRGBA8(...) swgl_commitTexture(RGBA8, __VA_ARGS__)
+#define swgl_commitTextureColorRGBA8(...) \
+  swgl_commitTexture(ColorRGBA8, __VA_ARGS__)
+#define swgl_commitTextureRepeatRGBA8(...) \
+  swgl_commitTexture(RepeatRGBA8, __VA_ARGS__)
+#define swgl_commitTextureRepeatColorRGBA8(...) \
+  swgl_commitTexture(RepeatColorRGBA8, __VA_ARGS__)
+
+template <bool BLEND, typename S, typename P>
+static int blendGaussianBlur(S sampler, vec2 uv, const vec4_scalar& uv_rect,
+                             P* buf, int span, bool hori, int radius,
+                             vec2_scalar coeffs) {
+  if (!matchTextureFormat(sampler, buf)) {
+    return 0;
+  }
+  vec2_scalar size = {float(sampler->width), float(sampler->height)};
+  ivec2_scalar curUV = make_ivec2(force_scalar(uv) * size);
+  ivec4_scalar bounds = make_ivec4(uv_rect * make_vec4(size, size));
+  int startX = curUV.x;
+  int endX = min(min(bounds.z, curUV.x + span), int(size.x));
+  if (hori) {
+    for (; curUV.x + swgl_StepSize <= endX;
+         buf += swgl_StepSize, curUV.x += swgl_StepSize) {
+      commit_blend_span<BLEND>(
+          buf, gaussianBlurHorizontal<P>(sampler, curUV, bounds.x, bounds.z,
+                                         radius, coeffs.x, coeffs.y));
+    }
+  } else {
+    for (; curUV.x + swgl_StepSize <= endX;
+         buf += swgl_StepSize, curUV.x += swgl_StepSize) {
+      commit_blend_span<BLEND>(
+          buf, gaussianBlurVertical<P>(sampler, curUV, bounds.y, bounds.w,
+                                       radius, coeffs.x, coeffs.y));
+    }
+  }
+  return curUV.x - startX;
+}
+
+#define swgl_commitGaussianBlur(format, s, p, uv_rect, hori, radius, coeffs)   \
+  do {                                                                         \
+    int drawn = 0;                                                             \
+    if (blend_key) {                                                           \
+      drawn = blendGaussianBlur<true>(s, p, uv_rect, swgl_Out##format,         \
+                                      swgl_SpanLength, hori, radius, coeffs);  \
+    } else {                                                                   \
+      drawn = blendGaussianBlur<false>(s, p, uv_rect, swgl_Out##format,        \
+                                       swgl_SpanLength, hori, radius, coeffs); \
+    }                                                                          \
+    swgl_Out##format += drawn;                                                 \
+    swgl_SpanLength -= drawn;                                                  \
+  } while (0)
+#define swgl_commitGaussianBlurRGBA8(s, p, uv_rect, hori, radius, coeffs) \
+  swgl_commitGaussianBlur(RGBA8, s, p, uv_rect, hori, radius, coeffs)
+#define swgl_commitGaussianBlurR8(s, p, uv_rect, hori, radius, coeffs) \
+  swgl_commitGaussianBlur(R8, s, p, uv_rect, hori, radius, coeffs)
+
+static ALWAYS_INLINE PackedRGBA8 convertYUV(const YUVMatrix& rgb_from_ycbcr,
+                                            U16 y, U16 u, U16 v) {
+  auto yy = V8<int16_t>(zip(y, y));
+  auto uv = V8<int16_t>(zip(u, v));
+  return rgb_from_ycbcr.convert(yy, uv);
+}
+
+template <typename S0>
+static ALWAYS_INLINE PackedRGBA8 sampleYUV(S0 sampler0, ivec2 uv0,
+                                           const YUVMatrix& rgb_from_ycbcr,
+                                           UNUSED int rescaleFactor) {
+  switch (sampler0->format) {
+    case TextureFormat::RGBA8: {
+      auto planar = textureLinearPlanarRGBA8(sampler0, uv0);
+      return convertYUV(rgb_from_ycbcr, highHalf(planar.rg), lowHalf(planar.rg),
+                        lowHalf(planar.ba));
+    }
+    case TextureFormat::YUY2: {
+      auto planar = textureLinearPlanarYUY2(sampler0, uv0);
+      return convertYUV(rgb_from_ycbcr, planar.y, planar.u, planar.v);
+    }
+    default:
+      assert(false);
+      return PackedRGBA8(0);
+  }
+}
+
+template <bool BLEND, typename S0, typename P, typename C = NoColor>
+static int blendYUV(P* buf, int span, S0 sampler0, vec2 uv0,
+                    const vec4_scalar& uv_rect0, const vec3_scalar& ycbcr_bias,
+                    const mat3_scalar& rgb_from_debiased_ycbcr,
+                    int rescaleFactor, C color = C()) {
+  if (!swgl_isTextureLinear(sampler0)) {
+    return 0;
+  }
+  LINEAR_QUANTIZE_UV(sampler0, uv0, uv_step0, uv_rect0, min_uv0, max_uv0);
+  const auto rgb_from_ycbcr =
+      YUVMatrix::From(ycbcr_bias, rgb_from_debiased_ycbcr, rescaleFactor);
+  auto c = packColor(buf, color);
+  auto* end = buf + span;
+  for (; buf < end; buf += swgl_StepSize, uv0 += uv_step0) {
+    commit_blend_span<BLEND>(
+        buf, applyColor(sampleYUV(sampler0, ivec2(clamp(uv0, min_uv0, max_uv0)),
+                                  rgb_from_ycbcr, rescaleFactor),
+                        c));
+  }
+  return span;
+}
+
+template <typename S0, typename S1>
+static ALWAYS_INLINE PackedRGBA8 sampleYUV(S0 sampler0, ivec2 uv0, S1 sampler1,
+                                           ivec2 uv1,
+                                           const YUVMatrix& rgb_from_ycbcr,
+                                           int rescaleFactor) {
+  switch (sampler1->format) {
+    case TextureFormat::RG8: {
+      assert(sampler0->format == TextureFormat::R8);
+      auto y = textureLinearUnpackedR8(sampler0, uv0);
+      auto planar = textureLinearPlanarRG8(sampler1, uv1);
+      return convertYUV(rgb_from_ycbcr, y, lowHalf(planar.rg),
+                        highHalf(planar.rg));
+    }
+    case TextureFormat::RGBA8: {
+      assert(sampler0->format == TextureFormat::R8);
+      auto y = textureLinearUnpackedR8(sampler0, uv0);
+      auto planar = textureLinearPlanarRGBA8(sampler1, uv1);
+      return convertYUV(rgb_from_ycbcr, y, lowHalf(planar.ba),
+                        highHalf(planar.rg));
+    }
+    case TextureFormat::RG16: {
+      assert(sampler0->format == TextureFormat::R16);
+      int colorDepth = 16 - rescaleFactor;
+      int rescaleBits = (colorDepth - 1) - 8;
+      auto y = textureLinearUnpackedR16(sampler0, uv0) >> rescaleBits;
+      auto uv = textureLinearUnpackedRG16(sampler1, uv1) >> rescaleBits;
+      return rgb_from_ycbcr.convert(zip(y, y), uv);
+    }
+    default:
+      assert(false);
+      return PackedRGBA8(0);
+  }
+}
+
+template <bool BLEND, typename S0, typename S1, typename P,
+          typename C = NoColor>
+static int blendYUV(P* buf, int span, S0 sampler0, vec2 uv0,
+                    const vec4_scalar& uv_rect0, S1 sampler1, vec2 uv1,
+                    const vec4_scalar& uv_rect1, const vec3_scalar& ycbcr_bias,
+                    const mat3_scalar& rgb_from_debiased_ycbcr,
+                    int rescaleFactor, C color = C()) {
+  if (!swgl_isTextureLinear(sampler0) || !swgl_isTextureLinear(sampler1)) {
+    return 0;
+  }
+  LINEAR_QUANTIZE_UV(sampler0, uv0, uv_step0, uv_rect0, min_uv0, max_uv0);
+  LINEAR_QUANTIZE_UV(sampler1, uv1, uv_step1, uv_rect1, min_uv1, max_uv1);
+  const auto rgb_from_ycbcr =
+      YUVMatrix::From(ycbcr_bias, rgb_from_debiased_ycbcr, rescaleFactor);
+  auto c = packColor(buf, color);
+  auto* end = buf + span;
+  for (; buf < end; buf += swgl_StepSize, uv0 += uv_step0, uv1 += uv_step1) {
+    commit_blend_span<BLEND>(
+        buf, applyColor(sampleYUV(sampler0, ivec2(clamp(uv0, min_uv0, max_uv0)),
+                                  sampler1, ivec2(clamp(uv1, min_uv1, max_uv1)),
+                                  rgb_from_ycbcr, rescaleFactor),
+                        c));
+  }
+  return span;
+}
+
+template <typename S0, typename S1, typename S2>
+static ALWAYS_INLINE PackedRGBA8 sampleYUV(S0 sampler0, ivec2 uv0, S1 sampler1,
+                                           ivec2 uv1, S2 sampler2, ivec2 uv2,
+                                           const YUVMatrix& rgb_from_ycbcr,
+                                           int rescaleFactor) {
+  assert(sampler0->format == sampler1->format &&
+         sampler0->format == sampler2->format);
+  switch (sampler0->format) {
+    case TextureFormat::R8: {
+      auto y = textureLinearUnpackedR8(sampler0, uv0);
+      auto u = textureLinearUnpackedR8(sampler1, uv1);
+      auto v = textureLinearUnpackedR8(sampler2, uv2);
+      return convertYUV(rgb_from_ycbcr, y, u, v);
+    }
+    case TextureFormat::R16: {
+      int colorDepth = 16 - rescaleFactor;
+      int rescaleBits = (colorDepth - 1) - 8;
+      auto y = textureLinearUnpackedR16(sampler0, uv0) >> rescaleBits;
+      auto u = textureLinearUnpackedR16(sampler1, uv1) >> rescaleBits;
+      auto v = textureLinearUnpackedR16(sampler2, uv2) >> rescaleBits;
+      return convertYUV(rgb_from_ycbcr, U16(y), U16(u), U16(v));
+    }
+    default:
+      assert(false);
+      return PackedRGBA8(0);
+  }
+}
+
+template <bool BLEND, typename S0, typename S1, typename S2, typename P,
+          typename C>
+static void blendYUVFallback(P* buf, int span, S0 sampler0, vec2 uv0,
+                             vec2_scalar uv_step0, vec2_scalar min_uv0,
+                             vec2_scalar max_uv0, S1 sampler1, vec2 uv1,
+                             vec2_scalar uv_step1, vec2_scalar min_uv1,
+                             vec2_scalar max_uv1, S2 sampler2, vec2 uv2,
+                             vec2_scalar uv_step2, vec2_scalar min_uv2,
+                             vec2_scalar max_uv2, const vec3_scalar& ycbcr_bias,
+                             const mat3_scalar& rgb_from_debiased_ycbcr,
+                             int rescaleFactor, C color) {
+  const auto rgb_from_ycbcr =
+      YUVMatrix::From(ycbcr_bias, rgb_from_debiased_ycbcr, rescaleFactor);
+  for (auto* end = buf + span; buf < end; buf += swgl_StepSize, uv0 += uv_step0,
+             uv1 += uv_step1, uv2 += uv_step2) {
+    commit_blend_span<BLEND>(
+        buf, applyColor(sampleYUV(sampler0, ivec2(clamp(uv0, min_uv0, max_uv0)),
+                                  sampler1, ivec2(clamp(uv1, min_uv1, max_uv1)),
+                                  sampler2, ivec2(clamp(uv2, min_uv2, max_uv2)),
+                                  rgb_from_ycbcr, rescaleFactor),
+                        color));
+  }
+}
+
+template <bool BLEND, typename S0, typename S1, typename S2, typename P,
+          typename C = NoColor>
+static int blendYUV(P* buf, int span, S0 sampler0, vec2 uv0,
+                    const vec4_scalar& uv_rect0, S1 sampler1, vec2 uv1,
+                    const vec4_scalar& uv_rect1, S2 sampler2, vec2 uv2,
+                    const vec4_scalar& uv_rect2, const vec3_scalar& ycbcr_bias,
+                    const mat3_scalar& rgb_from_debiased_ycbcr,
+                    int rescaleFactor, C color = C()) {
+  if (!swgl_isTextureLinear(sampler0) || !swgl_isTextureLinear(sampler1) ||
+      !swgl_isTextureLinear(sampler2)) {
+    return 0;
+  }
+  LINEAR_QUANTIZE_UV(sampler0, uv0, uv_step0, uv_rect0, min_uv0, max_uv0);
+  LINEAR_QUANTIZE_UV(sampler1, uv1, uv_step1, uv_rect1, min_uv1, max_uv1);
+  LINEAR_QUANTIZE_UV(sampler2, uv2, uv_step2, uv_rect2, min_uv2, max_uv2);
+  auto c = packColor(buf, color);
+  blendYUVFallback<BLEND>(buf, span, sampler0, uv0, uv_step0, min_uv0, max_uv0,
+                          sampler1, uv1, uv_step1, min_uv1, max_uv1, sampler2,
+                          uv2, uv_step2, min_uv2, max_uv2, ycbcr_bias,
+                          rgb_from_debiased_ycbcr, rescaleFactor, c);
+  return span;
+}
+
+template <bool BLEND>
+static int blendYUV(uint32_t* buf, int span, sampler2DRect sampler0, vec2 uv0,
+                    const vec4_scalar& uv_rect0, sampler2DRect sampler1,
+                    vec2 uv1, const vec4_scalar& uv_rect1,
+                    sampler2DRect sampler2, vec2 uv2,
+                    const vec4_scalar& uv_rect2, const vec3_scalar& ycbcr_bias,
+                    const mat3_scalar& rgb_from_debiased_ycbcr,
+                    int rescaleFactor, NoColor noColor = NoColor()) {
+  if (!swgl_isTextureLinear(sampler0) || !swgl_isTextureLinear(sampler1) ||
+      !swgl_isTextureLinear(sampler2)) {
+    return 0;
+  }
+  LINEAR_QUANTIZE_UV(sampler0, uv0, uv_step0, uv_rect0, min_uv0, max_uv0);
+  LINEAR_QUANTIZE_UV(sampler1, uv1, uv_step1, uv_rect1, min_uv1, max_uv1);
+  LINEAR_QUANTIZE_UV(sampler2, uv2, uv_step2, uv_rect2, min_uv2, max_uv2);
+  auto* end = buf + span;
+  if (sampler0->format == sampler1->format &&
+      sampler1->format == sampler2->format &&
+      sampler1->width == sampler2->width &&
+      sampler1->height == sampler2->height && uv_step0.y == 0 &&
+      uv_step0.x > 0 && uv_step1.y == 0 && uv_step1.x > 0 &&
+      uv_step1 == uv_step2 && uv1.x.x == uv2.x.x && uv1.y.x == uv2.y.x) {
+    int outside = min(int(ceil(max((min_uv0.x - uv0.x.x) / uv_step0.x,
+                                   (min_uv1.x - uv1.x.x) / uv_step1.x))),
+                      (end - buf) / swgl_StepSize);
+    if (outside > 0) {
+      blendYUVFallback<BLEND>(buf, outside * swgl_StepSize, sampler0, uv0,
+                              uv_step0, min_uv0, max_uv0, sampler1, uv1,
+                              uv_step1, min_uv1, max_uv1, sampler2, uv2,
+                              uv_step2, min_uv2, max_uv2, ycbcr_bias,
+                              rgb_from_debiased_ycbcr, rescaleFactor, noColor);
+      buf += outside * swgl_StepSize;
+      uv0.x += outside * uv_step0.x;
+      uv1.x += outside * uv_step1.x;
+      uv2.x += outside * uv_step2.x;
+    }
+    int inside = min(int(min((max_uv0.x - uv0.x.x) / uv_step0.x,
+                             (max_uv1.x - uv1.x.x) / uv_step1.x)),
+                     (end - buf) / swgl_StepSize);
+    if (inside > 0) {
+      int colorDepth =
+          (sampler0->format == TextureFormat::R16 ? 16 : 8) - rescaleFactor;
+      const auto rgb_from_ycbcr =
+          YUVMatrix::From(ycbcr_bias, rgb_from_debiased_ycbcr, rescaleFactor);
+      linear_row_yuv<BLEND>(
+          buf, inside * swgl_StepSize, sampler0, force_scalar(uv0),
+          uv_step0.x / swgl_StepSize, sampler1, sampler2, force_scalar(uv1),
+          uv_step1.x / swgl_StepSize, colorDepth, rgb_from_ycbcr);
+      buf += inside * swgl_StepSize;
+      uv0.x += inside * uv_step0.x;
+      uv1.x += inside * uv_step1.x;
+      uv2.x += inside * uv_step2.x;
+    }
+  }
+  blendYUVFallback<BLEND>(buf, end - buf, sampler0, uv0, uv_step0, min_uv0,
+                          max_uv0, sampler1, uv1, uv_step1, min_uv1, max_uv1,
+                          sampler2, uv2, uv_step2, min_uv2, max_uv2, ycbcr_bias,
+                          rgb_from_debiased_ycbcr, rescaleFactor, noColor);
+  return span;
+}
+
+#define swgl_commitTextureLinearYUV(...)                                    \
+  do {                                                                      \
+    int drawn = 0;                                                          \
+    if (blend_key) {                                                        \
+      drawn = blendYUV<true>(swgl_OutRGBA8, swgl_SpanLength, __VA_ARGS__);  \
+    } else {                                                                \
+      drawn = blendYUV<false>(swgl_OutRGBA8, swgl_SpanLength, __VA_ARGS__); \
+    }                                                                       \
+    swgl_OutRGBA8 += drawn;                                                 \
+    swgl_SpanLength -= drawn;                                               \
+  } while (0)
+
+#define swgl_commitTextureLinearColorYUV(...) \
+  swgl_commitTextureLinearYUV(__VA_ARGS__)
+
+struct GradientStops {
+  Float startColor;
+  union {
+    Float stepColor;
+    vec4_scalar stepData;
+  };
+
+  bool can_merge(const GradientStops& next) const {
+    return stepData == next.stepData;
+  }
+
+  Float interpolate(float offset) const {
+    return startColor + stepColor * offset;
+  }
+
+  Float end_color() const { return startColor + stepColor; }
+};
+
+static inline int swgl_validateGradient(sampler2D sampler, ivec2_scalar address,
+                                        int entries) {
+  return sampler->format == TextureFormat::RGBA32F && address.y >= 0 &&
+                 address.y < int(sampler->height) && address.x >= 0 &&
+                 address.x < int(sampler->width) && entries > 0 &&
+                 address.x +
+                         int(sizeof(GradientStops) / sizeof(Float)) * entries <=
+                     int(sampler->width)
+             ? address.y * sampler->stride + address.x * 4
+             : -1;
+}
+
+static inline int swgl_validateGradientFromStops(sampler2D sampler,
+                                                 ivec2_scalar address,
+                                                 int entries) {
+  int colors_size = entries;
+  int stops_size = ((entries + 3) & ~3) / 4;
+  return sampler->format == TextureFormat::RGBA32F && address.y >= 0 &&
+                 address.y < int(sampler->height) && address.x >= 0 &&
+                 address.x < int(sampler->width) && entries > 0 &&
+                 address.x + colors_size + stops_size <= int(sampler->width)
+             ? address.y * sampler->stride + address.x * 4
+             : -1;
+}
+
+static inline WideRGBA8 sampleGradient(sampler2D sampler, int address,
+                                       Float entry) {
+  assert(sampler->format == TextureFormat::RGBA32F);
+  assert(address >= 0 && address < int(sampler->height * sampler->stride));
+  I32 index = cast(entry);
+  Float offset = entry - cast(index);
+  assert(test_all(index >= 0 &&
+                  index * int(sizeof(GradientStops) / sizeof(Float)) <
+                      int(sampler->width)));
+  GradientStops* stops = (GradientStops*)&sampler->buf[address];
+  return combine(
+      packRGBA8(round_pixel(stops[index.x].interpolate(offset.x).zyxw),
+                round_pixel(stops[index.y].interpolate(offset.y).zyxw)),
+      packRGBA8(round_pixel(stops[index.z].interpolate(offset.z).zyxw),
+                round_pixel(stops[index.w].interpolate(offset.w).zyxw)));
+}
+
+#define swgl_commitGradientRGBA8(sampler, address, entry) \
+  swgl_commitChunk(RGBA8, sampleGradient(sampler, address, entry))
+
+#define swgl_commitGradientColorRGBA8(sampler, address, entry, color)         \
+  swgl_commitChunk(RGBA8, applyColor(sampleGradient(sampler, address, entry), \
+                                     packColor(swgl_OutRGBA, color)))
+
+static const WideRGBA8 ditherNoise[64] = {
+    {2, 2, 2, 128, 194, 194, 194, 128, 50, 50, 50, 128, 242, 242, 242, 128},
+    {194, 194, 194, 128, 50, 50, 50, 128, 242, 242, 242, 128, 14, 14, 14, 128},
+    {50, 50, 50, 128, 242, 242, 242, 128, 14, 14, 14, 128, 206, 206, 206, 128},
+    {242, 242, 242, 128, 14, 14, 14, 128, 206, 206, 206, 128, 62, 62, 62, 128},
+    {14, 14, 14, 128, 206, 206, 206, 128, 62, 62, 62, 128, 254, 254, 254, 128},
+    {206, 206, 206, 128, 62, 62, 62, 128, 254, 254, 254, 128, 130, 130, 130,
+     128},
+    {62, 62, 62, 128, 254, 254, 254, 128, 130, 130, 130, 128, 66, 66, 66, 128},
+    {254, 254, 254, 128, 130, 130, 130, 128, 66, 66, 66, 128, 178, 178, 178,
+     128},
+    {130, 130, 130, 128, 66, 66, 66, 128, 178, 178, 178, 128, 114, 114, 114,
+     128},
+    {66, 66, 66, 128, 178, 178, 178, 128, 114, 114, 114, 128, 142, 142, 142,
+     128},
+    {178, 178, 178, 128, 114, 114, 114, 128, 142, 142, 142, 128, 78, 78, 78,
+     128},
+    {114, 114, 114, 128, 142, 142, 142, 128, 78, 78, 78, 128, 190, 190, 190,
+     128},
+    {142, 142, 142, 128, 78, 78, 78, 128, 190, 190, 190, 128, 126, 126, 126,
+     128},
+    {78, 78, 78, 128, 190, 190, 190, 128, 126, 126, 126, 128, 34, 34, 34, 128},
+    {190, 190, 190, 128, 126, 126, 126, 128, 34, 34, 34, 128, 226, 226, 226,
+     128},
+    {126, 126, 126, 128, 34, 34, 34, 128, 226, 226, 226, 128, 18, 18, 18, 128},
+    {34, 34, 34, 128, 226, 226, 226, 128, 18, 18, 18, 128, 210, 210, 210, 128},
+    {226, 226, 226, 128, 18, 18, 18, 128, 210, 210, 210, 128, 46, 46, 46, 128},
+    {18, 18, 18, 128, 210, 210, 210, 128, 46, 46, 46, 128, 238, 238, 238, 128},
+    {210, 210, 210, 128, 46, 46, 46, 128, 238, 238, 238, 128, 30, 30, 30, 128},
+    {46, 46, 46, 128, 238, 238, 238, 128, 30, 30, 30, 128, 222, 222, 222, 128},
+    {238, 238, 238, 128, 30, 30, 30, 128, 222, 222, 222, 128, 162, 162, 162,
+     128},
+    {30, 30, 30, 128, 222, 222, 222, 128, 162, 162, 162, 128, 98, 98, 98, 128},
+    {222, 222, 222, 128, 162, 162, 162, 128, 98, 98, 98, 128, 146, 146, 146,
+     128},
+    {162, 162, 162, 128, 98, 98, 98, 128, 146, 146, 146, 128, 82, 82, 82, 128},
+    {98, 98, 98, 128, 146, 146, 146, 128, 82, 82, 82, 128, 174, 174, 174, 128},
+    {146, 146, 146, 128, 82, 82, 82, 128, 174, 174, 174, 128, 110, 110, 110,
+     128},
+    {82, 82, 82, 128, 174, 174, 174, 128, 110, 110, 110, 128, 158, 158, 158,
+     128},
+    {174, 174, 174, 128, 110, 110, 110, 128, 158, 158, 158, 128, 94, 94, 94,
+     128},
+    {110, 110, 110, 128, 158, 158, 158, 128, 94, 94, 94, 128, 10, 10, 10, 128},
+    {158, 158, 158, 128, 94, 94, 94, 128, 10, 10, 10, 128, 202, 202, 202, 128},
+    {94, 94, 94, 128, 10, 10, 10, 128, 202, 202, 202, 128, 58, 58, 58, 128},
+    {10, 10, 10, 128, 202, 202, 202, 128, 58, 58, 58, 128, 250, 250, 250, 128},
+    {202, 202, 202, 128, 58, 58, 58, 128, 250, 250, 250, 128, 6, 6, 6, 128},
+    {58, 58, 58, 128, 250, 250, 250, 128, 6, 6, 6, 128, 198, 198, 198, 128},
+    {250, 250, 250, 128, 6, 6, 6, 128, 198, 198, 198, 128, 54, 54, 54, 128},
+    {6, 6, 6, 128, 198, 198, 198, 128, 54, 54, 54, 128, 246, 246, 246, 128},
+    {198, 198, 198, 128, 54, 54, 54, 128, 246, 246, 246, 128, 138, 138, 138,
+     128},
+    {54, 54, 54, 128, 246, 246, 246, 128, 138, 138, 138, 128, 74, 74, 74, 128},
+    {246, 246, 246, 128, 138, 138, 138, 128, 74, 74, 74, 128, 186, 186, 186,
+     128},
+    {138, 138, 138, 128, 74, 74, 74, 128, 186, 186, 186, 128, 122, 122, 122,
+     128},
+    {74, 74, 74, 128, 186, 186, 186, 128, 122, 122, 122, 128, 134, 134, 134,
+     128},
+    {186, 186, 186, 128, 122, 122, 122, 128, 134, 134, 134, 128, 70, 70, 70,
+     128},
+    {122, 122, 122, 128, 134, 134, 134, 128, 70, 70, 70, 128, 182, 182, 182,
+     128},
+    {134, 134, 134, 128, 70, 70, 70, 128, 182, 182, 182, 128, 118, 118, 118,
+     128},
+    {70, 70, 70, 128, 182, 182, 182, 128, 118, 118, 118, 128, 42, 42, 42, 128},
+    {182, 182, 182, 128, 118, 118, 118, 128, 42, 42, 42, 128, 234, 234, 234,
+     128},
+    {118, 118, 118, 128, 42, 42, 42, 128, 234, 234, 234, 128, 26, 26, 26, 128},
+    {42, 42, 42, 128, 234, 234, 234, 128, 26, 26, 26, 128, 218, 218, 218, 128},
+    {234, 234, 234, 128, 26, 26, 26, 128, 218, 218, 218, 128, 38, 38, 38, 128},
+    {26, 26, 26, 128, 218, 218, 218, 128, 38, 38, 38, 128, 230, 230, 230, 128},
+    {218, 218, 218, 128, 38, 38, 38, 128, 230, 230, 230, 128, 22, 22, 22, 128},
+    {38, 38, 38, 128, 230, 230, 230, 128, 22, 22, 22, 128, 214, 214, 214, 128},
+    {230, 230, 230, 128, 22, 22, 22, 128, 214, 214, 214, 128, 170, 170, 170,
+     128},
+    {22, 22, 22, 128, 214, 214, 214, 128, 170, 170, 170, 128, 106, 106, 106,
+     128},
+    {214, 214, 214, 128, 170, 170, 170, 128, 106, 106, 106, 128, 154, 154, 154,
+     128},
+    {170, 170, 170, 128, 106, 106, 106, 128, 154, 154, 154, 128, 90, 90, 90,
+     128},
+    {106, 106, 106, 128, 154, 154, 154, 128, 90, 90, 90, 128, 166, 166, 166,
+     128},
+    {154, 154, 154, 128, 90, 90, 90, 128, 166, 166, 166, 128, 102, 102, 102,
+     128},
+    {90, 90, 90, 128, 166, 166, 166, 128, 102, 102, 102, 128, 150, 150, 150,
+     128},
+    {166, 166, 166, 128, 102, 102, 102, 128, 150, 150, 150, 128, 86, 86, 86,
+     128},
+    {102, 102, 102, 128, 150, 150, 150, 128, 86, 86, 86, 128, 2, 2, 2, 128},
+    {150, 150, 150, 128, 86, 86, 86, 128, 2, 2, 2, 128, 194, 194, 194, 128},
+    {86, 86, 86, 128, 2, 2, 2, 128, 194, 194, 194, 128, 50, 50, 50, 128}};
+
+static ALWAYS_INLINE const WideRGBA8* getDitherNoise(int32_t fragCoordY) {
+  return &ditherNoise[(fragCoordY & 7) * 8];
+}
+
+static ALWAYS_INLINE WideRGBA8 dither(WideRGBA8 color, int32_t fragCoordX,
+                                      const WideRGBA8* ditherNoiseYIndexed) {
+  return color + ditherNoiseYIndexed[fragCoordX & 7];
+}
+
+static int32_t findGradientStopPair(float offset, float* stops,
+                                    int32_t numStops,
+                                    float& prevOffset,
+                                    float& nextOffset) {
+    int32_t levelBaseAddr = 0;
+    int32_t levelStride = 1;
+    int32_t offsetInLevel = 0;
+    int32_t index = 0;
+
+    int32_t indexStride = 1;
+    while (indexStride * 5 <= numStops) {
+        indexStride *= 5;
+    }
+
+
+    prevOffset = 0.0;
+    nextOffset = 1.0;
+
+    if (!isfinite(offset)) {
+        offset = 0.0f;
+    }
+
+    while (true) {
+        int32_t addr = (levelBaseAddr + offsetInLevel) * 4;
+        float currentStops0 = stops[addr];
+        float currentStops1 = stops[addr + 1];
+        float currentStops2 = stops[addr + 2];
+        float currentStops3 = stops[addr + 3];
+
+        int32_t nextPartition = 4;
+        if (currentStops0 > offset) {
+            nextPartition = 0;
+            nextOffset = currentStops0;
+        } else if (currentStops1 > offset) {
+            nextPartition = 1;
+            prevOffset = currentStops0;
+            nextOffset = currentStops1;
+        } else if (currentStops2 > offset) {
+            nextPartition = 2;
+            prevOffset = currentStops1;
+            nextOffset = currentStops2;
+        } else if (currentStops3 > offset) {
+            nextPartition = 3;
+            prevOffset = currentStops2;
+            nextOffset = currentStops3;
+        } else {
+            prevOffset = currentStops3;
+        }
+
+        index += nextPartition * indexStride;
+
+        if (indexStride == 1) {
+            break;
+        }
+
+        indexStride /= 5;
+        levelBaseAddr += levelStride;
+        levelStride *= 5;
+        offsetInLevel = offsetInLevel * 5 + nextPartition;
+    }
+
+    if (index < 1) {
+        index = 1;
+    } else if (index > numStops - 1) {
+        index = numStops - 1;
+    }
+
+    return index - 1;
+}
+
+
+template <bool BLEND, bool DITHER>
+static bool commitLinearGradient(sampler2D sampler, int address, float size,
+                                 bool tileRepeat, bool gradientRepeat, vec2 pos,
+                                 const vec2_scalar& scaleDir, float startOffset,
+                                 uint32_t* buf, int span,
+                                 vec4 fragCoord = vec4()) {
+  assert(sampler->format == TextureFormat::RGBA32F);
+  assert(address >= 0 && address < int(sampler->height * sampler->stride));
+  GradientStops* stops = (GradientStops*)&sampler->buf[address];
+  vec2_scalar posStep = dFdx(pos) * 4.0f;
+  float delta = dot(posStep, scaleDir);
+  if (!isfinite(delta)) {
+    return false;
+  }
+
+  int32_t currentFragCoordX = int32_t(fragCoord.x.x);
+  const auto* ditherNoiseYIndexed =
+      DITHER ? getDitherNoise(int32_t(fragCoord.y.x)) : nullptr;
+
+  vec2_scalar distCoeffsX = {0.25f * span, 0.0f};
+  vec2_scalar distCoeffsY = distCoeffsX;
+  if (tileRepeat) {
+    if (posStep.x != 0.0f) {
+      distCoeffsX = vec2_scalar{step(0.0f, posStep.x), 1.0f} * recip(posStep.x);
+    }
+    if (posStep.y != 0.0f) {
+      distCoeffsY = vec2_scalar{step(0.0f, posStep.y), 1.0f} * recip(posStep.y);
+    }
+  }
+
+  for (; span > 0;) {
+    float chunks = 0.25f * span;
+    vec2 repeatPos = pos;
+    if (tileRepeat) {
+      repeatPos = fract(pos);
+      chunks = min(chunks, distCoeffsX.x - repeatPos.x.x * distCoeffsX.y);
+      chunks = min(chunks, distCoeffsY.x - repeatPos.y.x * distCoeffsY.y);
+    }
+    Float offset =
+        repeatPos.x * scaleDir.x + repeatPos.y * scaleDir.y - startOffset;
+    if (gradientRepeat) {
+      offset = fract(offset);
+    }
+    float startEntry;
+    int minIndex, maxIndex;
+    if (offset.x < 0) {
+      startEntry = 0;
+      minIndex = int(startEntry);
+      maxIndex = minIndex;
+      if (delta > 0) {
+        chunks = min(chunks, -offset.x / delta);
+      }
+    } else if (offset.x < 1) {
+      startEntry = 1.0f + offset.x * size;
+      if (delta < 0) {
+        chunks = min(chunks, -offset.x / delta);
+      } else if (delta > 0) {
+        chunks = min(chunks, (1 - offset.x) / delta);
+      }
+      float endEntry = clamp(1.0f + (offset.x + delta * int(chunks)) * size,
+                             0.0f, 1.0f + size);
+      minIndex = int(startEntry);
+      maxIndex = minIndex;
+      if (delta > 0) {
+        while (maxIndex + 1 < endEntry &&
+               stops[maxIndex].can_merge(stops[maxIndex + 1])) {
+          maxIndex++;
+        }
+        chunks = min(chunks, (maxIndex + 1 - startEntry) / (delta * size));
+      } else if (delta < 0) {
+        while (minIndex - 1 > endEntry &&
+               stops[minIndex - 1].can_merge(stops[minIndex])) {
+          minIndex--;
+        }
+        chunks = min(chunks, (minIndex - startEntry) / (delta * size));
+      }
+    } else {
+      startEntry = 1.0f + size;
+      minIndex = int(startEntry);
+      maxIndex = minIndex;
+      if (delta < 0) {
+        chunks = min(chunks, (1 - offset.x) / delta);
+      }
+    }
+    if (chunks >= 1.0f) {
+      int inside = int(chunks);
+      auto minColorF = stops[minIndex].startColor.zyxw * float(0xFF00);
+      auto maxColorF = stops[maxIndex].end_color().zyxw * float(0xFF00);
+      auto colorRangeF =
+          (maxColorF - minColorF) * (1.0f / (maxIndex + 1 - minIndex));
+      auto colorF =
+          minColorF + colorRangeF * (startEntry - minIndex) + float(0x80);
+      Float deltaColorF = colorRangeF * (delta * size);
+      auto deltaColor = repeat4(CONVERT(round_pixel(deltaColorF, 1), U16));
+      for (int remaining = inside;;) {
+        auto color =
+            combine(CONVERT(round_pixel(colorF, 1), U16),
+                    CONVERT(round_pixel(colorF + deltaColorF * 0.25f, 1), U16),
+                    CONVERT(round_pixel(colorF + deltaColorF * 0.5f, 1), U16),
+                    CONVERT(round_pixel(colorF + deltaColorF * 0.75f, 1), U16));
+        int segment = min(remaining, 256 / 4);
+        for (auto* end = buf + segment * 4; buf < end; buf += 4) {
+          if (DITHER) {
+            commit_blend_span<BLEND>(
+                buf,
+                dither(color, currentFragCoordX, ditherNoiseYIndexed) >> 8);
+            currentFragCoordX += 4;
+          } else {
+            commit_blend_span<BLEND>(buf, color >> 8);
+          }
+          color += deltaColor;
+        }
+        remaining -= segment;
+        if (remaining <= 0) {
+          break;
+        }
+        colorF += deltaColorF * segment;
+      }
+      span -= inside * 4;
+      if (span <= 0) {
+        break;
+      }
+      // will probably require per-sample table lookups, so fall through below.
+      pos += posStep * float(inside);
+      repeatPos = tileRepeat ? fract(pos) : pos;
+      offset =
+          repeatPos.x * scaleDir.x + repeatPos.y * scaleDir.y - startOffset;
+      if (gradientRepeat) {
+        offset = fract(offset);
+      }
+    }
+    Float entry = clamp(offset * size + 1.0f, 0.0f, 1.0f + size);
+    if (DITHER) {
+      auto gradientSample = sampleGradient(sampler, address, entry) << 8;
+      commit_blend_span<BLEND>(
+          buf,
+          dither(gradientSample, currentFragCoordX, ditherNoiseYIndexed) >> 8);
+      currentFragCoordX += 4;
+    } else {
+      commit_blend_span<BLEND>(buf, sampleGradient(sampler, address, entry));
+    }
+    span -= 4;
+    buf += 4;
+    pos += posStep;
+  }
+  return true;
+}
+
+template <bool BLEND, bool DITHER>
+static bool commitLinearGradientFromStops(sampler2D sampler, int offsetsAddress,
+                                          int colorsAddress, float stopCount,
+                                          bool gradientRepeat, vec2 pos,
+                                          const vec2_scalar& scaleDir,
+                                          float startOffset, uint32_t* buf,
+                                          int span, vec4 fragCoord = vec4()) {
+  assert(sampler->format == TextureFormat::RGBA32F);
+  assert(colorsAddress >= 0 && colorsAddress < offsetsAddress);
+  assert(offsetsAddress >= 0 && offsetsAddress + (stopCount + 3) / 4 <
+                                    int(sampler->height * sampler->stride));
+  float* stopOffsets = (float*)&sampler->buf[offsetsAddress];
+  Float* stopColors = (Float*)&sampler->buf[colorsAddress];
+
+  const float CHUNK_SIZE = 4.0f;
+
+  int32_t currentFragCoordX = int32_t(fragCoord.x.x);
+  const auto* ditherNoiseYIndexed =
+      DITHER ? getDitherNoise(int32_t(fragCoord.y.x)) : nullptr;
+
+  vec2_scalar posStep = dFdx(pos);
+  float delta = dot(posStep, scaleDir);
+  if (!isfinite(delta)) {
+    return false;
+  }
+
+  for (; span > 0;) {
+    float subSpan = span;
+
+    Float offset = pos.x * scaleDir.x + pos.y * scaleDir.y - startOffset;
+    if (gradientRepeat) {
+      offset = fract(offset);
+    }
+
+    int32_t stopIndex = 0;
+    float prevOffset = 0.0;
+    float nextOffset = 0.0;
+    if (offset.x < 0) {
+      if (delta > 0) {
+        subSpan = min(subSpan, -offset.x / delta);
+      }
+    } else if (offset.x >= 1) {
+      stopIndex = stopCount - 1;
+      if (delta < 0) {
+        subSpan = min(subSpan, (1.0f - offset.x) / delta);
+      }
+    } else {
+      stopIndex =
+          findGradientStopPair(offset.x, stopOffsets, stopCount,
+                               prevOffset, nextOffset);
+      float offsetRange =
+          delta > 0.0f ? nextOffset - offset.x : prevOffset - offset.x;
+      subSpan = min(subSpan, offsetRange / delta);
+    }
+
+    subSpan = max(ceil(subSpan), 1.0f);
+
+    auto colorScale = (DITHER ? float(0xFF00) : 255.0f) * 256.0f;
+    auto minColorF = stopColors[stopIndex].zyxw * colorScale;
+    auto maxColorF = stopColors[stopIndex + 1].zyxw * colorScale;
+    auto deltaOffset = nextOffset - prevOffset;
+    Float colorRangeF = deltaOffset == 0.0f
+                            ? Float(0.0f)
+                            : (maxColorF - minColorF) * (1.0 / deltaOffset);
+
+    auto colorF =
+        minColorF + colorRangeF * (offset.x - prevOffset) + float(0x80);
+
+    Float deltaColorF = colorRangeF * delta * CHUNK_SIZE;
+    auto deltaColor = repeat4(CONVERT(round_pixel(deltaColorF, 1), U16));
+    int chunks = int(subSpan) / 4;
+    if (chunks > 0) {
+      for (int remaining = chunks;;) {
+        auto color =
+            combine(CONVERT(round_pixel(colorF, 1), U16),
+                    CONVERT(round_pixel(colorF + deltaColorF * 0.25f, 1), U16),
+                    CONVERT(round_pixel(colorF + deltaColorF * 0.5f, 1), U16),
+                    CONVERT(round_pixel(colorF + deltaColorF * 0.75f, 1), U16));
+        int segment = min(remaining, 256 / 4);
+        for (auto* end = buf + segment * 4; buf < end; buf += 4) {
+          if (DITHER) {
+            commit_blend_span<BLEND>(
+                buf,
+                dither(color, currentFragCoordX, ditherNoiseYIndexed) >> 8);
+            currentFragCoordX += 4;
+          } else {
+            commit_blend_span<BLEND>(buf, bit_cast<WideRGBA8>(color >> 8));
+          }
+          color += deltaColor;
+        }
+        remaining -= segment;
+        colorF += deltaColorF * segment;
+        if (remaining <= 0) {
+          break;
+        }
+      }
+      span -= chunks * 4;
+      pos += posStep * float(chunks) * CHUNK_SIZE;
+    }
+
+    int remainder = int(subSpan - chunks * 4);
+    if (remainder > 0) {
+      assert(remainder < 4);
+      auto color =
+          combine(CONVERT(round_pixel(colorF, 1), U16),
+                  CONVERT(round_pixel(colorF + deltaColorF * 0.25f, 1), U16),
+                  CONVERT(round_pixel(colorF + deltaColorF * 0.5f, 1), U16),
+                  CONVERT(round_pixel(colorF + deltaColorF * 0.75f, 1), U16));
+      if (DITHER) {
+        color = dither(color, currentFragCoordX, ditherNoiseYIndexed),
+        currentFragCoordX += remainder;
+      }
+      commit_blend_span<BLEND>(buf, bit_cast<WideRGBA8>(color >> 8), remainder);
+
+      buf += remainder;
+      span -= remainder;
+      pos += posStep * float(remainder);
+    }
+  }
+  return true;
+}
+
+#define swgl_commitLinearGradientRGBA8(sampler, address, size, tileRepeat,   \
+                                       gradientRepeat, pos, scaleDir,        \
+                                       startOffset)                          \
+  do {                                                                       \
+    bool drawn = false;                                                      \
+    if (blend_key) {                                                         \
+      drawn = commitLinearGradient<true, false>(                             \
+          sampler, address, size, tileRepeat, gradientRepeat, pos, scaleDir, \
+          startOffset, swgl_OutRGBA8, swgl_SpanLength);                      \
+    } else {                                                                 \
+      drawn = commitLinearGradient<false, false>(                            \
+          sampler, address, size, tileRepeat, gradientRepeat, pos, scaleDir, \
+          startOffset, swgl_OutRGBA8, swgl_SpanLength);                      \
+    }                                                                        \
+    if (drawn) {                                                             \
+      swgl_OutRGBA8 += swgl_SpanLength;                                      \
+      swgl_SpanLength = 0;                                                   \
+    }                                                                        \
+  } while (0)
+
+#define swgl_commitDitheredLinearGradientRGBA8(sampler, address, size,       \
+                                               tileRepeat, gradientRepeat,   \
+                                               pos, scaleDir, startOffset)   \
+  do {                                                                       \
+    bool drawn = false;                                                      \
+    if (blend_key) {                                                         \
+      drawn = commitLinearGradient<true, true>(                              \
+          sampler, address, size, tileRepeat, gradientRepeat, pos, scaleDir, \
+          startOffset, swgl_OutRGBA8, swgl_SpanLength, gl_FragCoord);        \
+    } else {                                                                 \
+      drawn = commitLinearGradient<false, true>(                             \
+          sampler, address, size, tileRepeat, gradientRepeat, pos, scaleDir, \
+          startOffset, swgl_OutRGBA8, swgl_SpanLength, gl_FragCoord);        \
+    }                                                                        \
+    if (drawn) {                                                             \
+      swgl_OutRGBA8 += swgl_SpanLength;                                      \
+      swgl_SpanLength = 0;                                                   \
+    }                                                                        \
+  } while (0)
+
+#define swgl_commitLinearGradientFromStopsRGBA8(                             \
+    sampler, offsetsAddress, colorsAddress, size, gradientRepeat, pos,       \
+    scaleDir, startOffset)                                                   \
+  do {                                                                       \
+    bool drawn = false;                                                      \
+    if (blend_key) {                                                         \
+      drawn = commitLinearGradientFromStops<true, false>(                    \
+          sampler, offsetsAddress, colorsAddress, size, gradientRepeat, pos, \
+          scaleDir, startOffset, swgl_OutRGBA8, swgl_SpanLength);            \
+    } else {                                                                 \
+      drawn = commitLinearGradientFromStops<false, false>(                   \
+          sampler, offsetsAddress, colorsAddress, size, gradientRepeat, pos, \
+          scaleDir, startOffset, swgl_OutRGBA8, swgl_SpanLength);            \
+    }                                                                        \
+    if (drawn) {                                                             \
+      swgl_OutRGBA8 += swgl_SpanLength;                                      \
+      swgl_SpanLength = 0;                                                   \
+    }                                                                        \
+  } while (0)
+
+#define swgl_commitDitheredLinearGradientFromStopsRGBA8(                      \
+    sampler, offsetsAddress, colorsAddress, size, tileRepeat, gradientRepeat, \
+    pos, scaleDir, startOffset)                                               \
+  do {                                                                        \
+    bool drawn = false;                                                       \
+    if (blend_key) {                                                          \
+      drawn = commitLinearGradientFromStops<true, true>(                      \
+          sampler, offsetsAddress, colorsAddress, size, gradientRepeat, pos,  \
+          scaleDir, startOffset, swgl_OutRGBA8, swgl_SpanLength, fragCoord);  \
+    } else {                                                                  \
+      drawn = commitLinearGradientFromStops<false, true>(                     \
+          sampler, offsetsAddress, colorsAddress, size, gradientRepeat, pos,  \
+          scaleDir, startOffset, swgl_OutRGBA8, swgl_SpanLength, fragCoord);  \
+    }                                                                         \
+    if (drawn) {                                                              \
+      swgl_OutRGBA8 += swgl_SpanLength;                                       \
+      swgl_SpanLength = 0;                                                    \
+    }                                                                         \
+  } while (0)
+
+template <bool CLAMP, typename V>
+static ALWAYS_INLINE V fastSqrt(V v) {
+  if (CLAMP) {
+    v = max(v, V(1.0e-12f));
+  }
+#if USE_SSE2 || USE_NEON
+  return v * inversesqrt(v);
+#else
+  return sqrt(v);
+#endif
+}
+
+template <bool CLAMP, typename V>
+static ALWAYS_INLINE auto fastLength(V v) {
+  return fastSqrt<CLAMP>(dot(v, v));
+}
+
+template <bool BLEND, bool DITHER>
+static bool commitRadialGradient(sampler2D sampler, int address, float size,
+                                 bool repeat, vec2 pos, float radius,
+                                 uint32_t* buf, int span,
+                                 vec4 fragCoord = vec4()) {
+  assert(sampler->format == TextureFormat::RGBA32F);
+  assert(address >= 0 && address < int(sampler->height * sampler->stride));
+  GradientStops* stops = (GradientStops*)&sampler->buf[address];
+  // clang-format off
+  // clang-format on
+  vec2_scalar pos0 = {pos.x.x, pos.y.x};
+  vec2_scalar delta = {pos.x.y - pos.x.x, pos.y.y - pos.y.x};
+  float deltaDelta = dot(delta, delta);
+  if (!isfinite(deltaDelta) || !isfinite(radius)) {
+    return false;
+  }
+
+  int32_t currentFragCoordX = int32_t(fragCoord.x.x);
+  const auto* ditherNoiseYIndexed =
+      DITHER ? getDitherNoise(int32_t(fragCoord.y.x)) : nullptr;
+
+  float invDelta, middleT, middleB;
+  if (deltaDelta > 0) {
+    invDelta = 1.0f / deltaDelta;
+    middleT = -dot(delta, pos0) * invDelta;
+    middleB = middleT * middleT - dot(pos0, pos0) * invDelta;
+  } else {
+    invDelta = 0.0f;
+    middleT = float(span);
+    middleB = 0.0f;
+  }
+  Float middleEndRadius = fastLength<true>(
+      pos0 + delta * (Float){middleT, float(span), 0.0f, 0.0f});
+  float middleRadius = span < middleT ? middleEndRadius.y : middleEndRadius.x;
+  float endRadius = middleEndRadius.y;
+  delta *= 4;
+  deltaDelta *= 4 * 4;
+  // clang-format off
+  // clang-format on
+  Float dotPos = dot(pos, pos);
+  Float dotPosDelta = 2.0f * dot(pos, delta) + deltaDelta;
+  float deltaDelta2 = 2.0f * deltaDelta;
+  for (int t = 0; t < span;) {
+    Float offset = fastSqrt<true>(dotPos) - radius;
+    float startRadius = radius;
+    if (repeat) {
+      startRadius += offset.x;
+      offset = fract(offset);
+      startRadius -= offset.x;
+    }
+    float intercept = -1;
+    int minIndex = 0;
+    int maxIndex = int(1.0f + size);
+    if (offset.x < 0) {
+      maxIndex = minIndex;
+      if (t >= middleT) {
+        intercept = radius;
+      }
+    } else if (offset.x < 1) {
+      minIndex = int(1.0f + offset.x * size);
+      maxIndex = minIndex;
+      float searchOffset =
+          (t >= middleT ? endRadius : middleRadius) - startRadius;
+      int searchIndex = int(clamp(1.0f + size * searchOffset, 1.0f, size));
+      if (t >= middleT) {
+        while (maxIndex + 1 <= searchIndex &&
+               stops[maxIndex].can_merge(stops[maxIndex + 1])) {
+          maxIndex++;
+        }
+        intercept = maxIndex + 1;
+      } else {
+        while (minIndex - 1 >= searchIndex &&
+               stops[minIndex - 1].can_merge(stops[minIndex])) {
+          minIndex--;
+        }
+        intercept = minIndex;
+      }
+      intercept = clamp((intercept - 1.0f) / size, 0.0f, 1.0f) + startRadius;
+    } else {
+      minIndex = maxIndex;
+      if (t < middleT) {
+        intercept = radius + 1;
+      }
+    }
+    float endT = t >= middleT ? span : min(span, int(middleT));
+    if (intercept >= 0) {
+      float b = middleB + intercept * intercept * invDelta;
+      if (b > 0) {
+        b = fastSqrt<false>(b);
+        endT = min(endT, t >= middleT ? middleT + b : middleT - b);
+      } else {
+        endT = min(endT, middleT);
+      }
+    }
+    if (t + 4.0f <= endT) {
+      int inside = int(endT - t) & ~3;
+      auto minColorF =
+          stops[minIndex].startColor.zyxw * (DITHER ? float(0xFF00) : 255.0f);
+      auto maxColorF =
+          stops[maxIndex].end_color().zyxw * (DITHER ? float(0xFF00) : 255.0f);
+
+      auto deltaColorF =
+          (maxColorF - minColorF) * (size / (maxIndex + 1 - minIndex));
+      Float colorF =
+          minColorF - deltaColorF * (startRadius + (minIndex - 1) / size);
+      for (auto* end = buf + inside; buf < end; buf += 4) {
+        Float offsetG = fastSqrt<false>(dotPos);
+        if (DITHER) {
+          auto color = combine(
+              CONVERT(round_pixel(colorF + deltaColorF * offsetG.x, 1), U16),
+              CONVERT(round_pixel(colorF + deltaColorF * offsetG.y, 1), U16),
+              CONVERT(round_pixel(colorF + deltaColorF * offsetG.z, 1), U16),
+              CONVERT(round_pixel(colorF + deltaColorF * offsetG.w, 1), U16));
+          commit_blend_span<BLEND>(
+              buf, dither(color, currentFragCoordX, ditherNoiseYIndexed) >> 8);
+          currentFragCoordX += 4;
+        } else {
+          auto color = combine(
+              packRGBA8(round_pixel(colorF + deltaColorF * offsetG.x, 1),
+                        round_pixel(colorF + deltaColorF * offsetG.y, 1)),
+              packRGBA8(round_pixel(colorF + deltaColorF * offsetG.z, 1),
+                        round_pixel(colorF + deltaColorF * offsetG.w, 1)));
+          commit_blend_span<BLEND>(buf, color);
+        }
+
+        dotPos += dotPosDelta;
+        dotPosDelta += deltaDelta2;
+      }
+      t += inside;
+      if (t >= span) {
+        break;
+      }
+      // just assume that to be the case and fall through below to doing the
+      offset = fastSqrt<true>(dotPos) - radius;
+      if (repeat) {
+        offset = fract(offset);
+      }
+    }
+    Float entry = clamp(offset * size + 1.0f, 0.0f, 1.0f + size);
+    commit_blend_span<BLEND>(buf, sampleGradient(sampler, address, entry));
+    buf += 4;
+    t += 4;
+    dotPos += dotPosDelta;
+    dotPosDelta += deltaDelta2;
+  }
+  return true;
+}
+
+template <bool BLEND, bool DITHER>
+static bool commitRadialGradientFromStops(sampler2D sampler, int offsetsAddress,
+                                          int colorsAddress, float stopCount,
+                                          bool repeat, vec2 pos,
+                                          float startRadius, uint32_t* buf,
+                                          int span, vec4 fragCoord = vec4()) {
+  assert(sampler->format == TextureFormat::RGBA32F);
+  assert(colorsAddress >= 0 && colorsAddress < offsetsAddress);
+  assert(offsetsAddress >= 0 && offsetsAddress + (stopCount + 3) / 4 <
+                                    int(sampler->height * sampler->stride));
+  float* stopOffsets = (float*)&sampler->buf[offsetsAddress];
+  Float* stopColors = (Float*)&sampler->buf[colorsAddress];
+  // clang-format off
+  // clang-format on
+  vec2_scalar pos0 = {pos.x.x, pos.y.x};
+  vec2_scalar delta = {pos.x.y - pos.x.x, pos.y.y - pos.y.x};
+  float deltaDelta = dot(delta, delta);
+  if (!isfinite(deltaDelta) || !isfinite(startRadius)) {
+    return false;
+  }
+
+  int32_t currentFragCoordX = int32_t(fragCoord.x.x);
+  const auto* ditherNoiseYIndexed =
+      DITHER ? getDitherNoise(int32_t(fragCoord.y.x)) : nullptr;
+
+  float invDelta, middleT, middleB;
+  if (deltaDelta > 0) {
+    invDelta = 1.0f / deltaDelta;
+    middleT = -dot(delta, pos0) * invDelta;
+    middleB = middleT * middleT - dot(pos0, pos0) * invDelta;
+  } else {
+    invDelta = 0.0f;
+    middleT = float(span);
+    middleB = 0.0f;
+  }
+
+  delta *= 4;
+  deltaDelta *= 4 * 4;
+  // clang-format off
+  // clang-format on
+  Float dotPos = dot(pos, pos);
+  Float dotPosDelta = 2.0f * dot(pos, delta) + deltaDelta;
+  float deltaDelta2 = 2.0f * deltaDelta;
+
+  for (int t = 0; t < span;) {
+    Float offset = fastSqrt<true>(dotPos) - startRadius;
+    float adjustedStartRadius = startRadius;
+    if (repeat) {
+      adjustedStartRadius += offset.x;
+      offset = fract(offset);
+      adjustedStartRadius -= offset.x;
+    }
+
+    float intercept = -1;
+    int32_t stopIndex = 0;
+    float prevOffset = 0.0f;
+    float nextOffset = 0.0f;
+    if (offset.x < 0) {
+      if (t >= middleT) {
+        intercept = startRadius;
+      }
+    } else if (offset.x >= 1) {
+      stopIndex = stopCount - 1;
+      if (t < middleT) {
+        intercept = startRadius + 1;
+      }
+    } else {
+
+      stopIndex =
+          findGradientStopPair(offset.x, stopOffsets, stopCount,
+                                   prevOffset, nextOffset);
+      if (t >= middleT) {
+        intercept = adjustedStartRadius + nextOffset;
+      } else {
+        intercept = adjustedStartRadius + prevOffset;
+      }
+    }
+    float endT = t >= middleT ? span : min(span, int(middleT));
+    if (intercept >= 0) {
+      float b = middleB + intercept * intercept * invDelta;
+      if (b > 0) {
+        b = fastSqrt<false>(b);
+        endT = min(endT, t >= middleT ? middleT + b : middleT - b);
+      } else {
+        endT = min(endT, middleT);
+      }
+    }
+    endT = max(ceil(endT), t + 1.0f);
+
+    int inside = int(endT - t) & ~3;
+    auto minColorF =
+        stopColors[stopIndex].zyxw * (DITHER ? float(0xFF00) : 255.0f);
+    auto maxColorF =
+        stopColors[stopIndex + 1].zyxw * (DITHER ? float(0xFF00) : 255.0f);
+
+    auto deltaOffset = nextOffset - prevOffset;
+    Float deltaColorF =
+        deltaOffset == 0.0f
+            ?
+            Float(0.0f)
+            : (maxColorF - minColorF) / deltaOffset;
+    Float colorF = minColorF - deltaColorF * (adjustedStartRadius + prevOffset);
+    for (auto* end = buf + inside; buf < end; buf += 4) {
+      Float offsetG = fastSqrt<false>(dotPos);
+      if (DITHER) {
+        auto color = combine(
+            CONVERT(round_pixel(colorF + deltaColorF * offsetG.x, 1), U16),
+            CONVERT(round_pixel(colorF + deltaColorF * offsetG.y, 1), U16),
+            CONVERT(round_pixel(colorF + deltaColorF * offsetG.z, 1), U16),
+            CONVERT(round_pixel(colorF + deltaColorF * offsetG.w, 1), U16));
+        commit_blend_span<BLEND>(
+            buf, dither(color, currentFragCoordX, ditherNoiseYIndexed) >> 8);
+        currentFragCoordX += 4;
+      } else {
+        auto color = combine(
+            packRGBA8(round_pixel(colorF + deltaColorF * offsetG.x, 1),
+                      round_pixel(colorF + deltaColorF * offsetG.y, 1)),
+            packRGBA8(round_pixel(colorF + deltaColorF * offsetG.z, 1),
+                      round_pixel(colorF + deltaColorF * offsetG.w, 1)));
+        commit_blend_span<BLEND>(buf, color);
+      }
+      dotPos += dotPosDelta;
+      dotPosDelta += deltaDelta2;
+    }
+    t += inside;
+
+    if (t >= span) {
+      break;
+    }
+
+    int remainder = endT - t;
+    if (remainder > 0) {
+      assert(remainder < 4);
+      Float offsetG = fastSqrt<false>(dotPos);
+      if (DITHER) {
+        auto color = combine(
+            CONVERT(round_pixel(colorF + deltaColorF * offsetG.x, 1), U16),
+            CONVERT(round_pixel(colorF + deltaColorF * offsetG.y, 1), U16),
+            CONVERT(round_pixel(colorF + deltaColorF * offsetG.z, 1), U16),
+            CONVERT(round_pixel(colorF + deltaColorF * offsetG.w, 1), U16));
+        commit_blend_span<BLEND>(
+            buf, dither(color, currentFragCoordX, ditherNoiseYIndexed) >> 8,
+            remainder);
+        currentFragCoordX += 4;
+      } else {
+        auto color = combine(
+            packRGBA8(round_pixel(colorF + deltaColorF * offsetG.x, 1),
+                      round_pixel(colorF + deltaColorF * offsetG.y, 1)),
+            packRGBA8(round_pixel(colorF + deltaColorF * offsetG.z, 1),
+                      round_pixel(colorF + deltaColorF * offsetG.w, 1)));
+        commit_blend_span<BLEND>(buf, color, remainder);
+      }
+      buf += remainder;
+      t += remainder;
+
+      float partialDeltaDelta2 = deltaDelta2 * 0.25f * float(remainder);
+      dotPosDelta += partialDeltaDelta2;
+
+
+      float singlePxDeltaDelta2 = deltaDelta2 * 0.0625f;
+      float dotPosDeltaFirst = dotPos.y - dotPos.x;
+      Float pxOffsets = {0.0f, 1.0f, 2.0f, 3.0f};
+      Float partialDotPosDelta =
+          pxOffsets * singlePxDeltaDelta2 + dotPosDeltaFirst;
+
+      for (int i = 0; i < remainder; ++i) {
+        dotPos += partialDotPosDelta;
+        partialDotPosDelta += singlePxDeltaDelta2;
+      }
+    }
+  }
+  return true;
+}
+
+#define swgl_commitRadialGradientRGBA8(sampler, address, size, repeat, pos, \
+                                       radius)                              \
+  do {                                                                      \
+    bool drawn = false;                                                     \
+    if (blend_key) {                                                        \
+      drawn = commitRadialGradient<true, false>(                            \
+          sampler, address, size, repeat, pos, radius, swgl_OutRGBA8,       \
+          swgl_SpanLength);                                                 \
+    } else {                                                                \
+      drawn = commitRadialGradient<false, false>(                           \
+          sampler, address, size, repeat, pos, radius, swgl_OutRGBA8,       \
+          swgl_SpanLength);                                                 \
+    }                                                                       \
+    if (drawn) {                                                            \
+      swgl_OutRGBA8 += swgl_SpanLength;                                     \
+      swgl_SpanLength = 0;                                                  \
+    }                                                                       \
+  } while (0)
+
+#define swgl_commitDitheredRadialGradientRGBA8(sampler, address, size, repeat, \
+                                               pos, radius)                    \
+  do {                                                                         \
+    bool drawn = false;                                                        \
+    if (blend_key) {                                                           \
+      drawn = commitRadialGradient<true, true>(sampler, address, size, repeat, \
+                                               pos, radius, swgl_OutRGBA8,     \
+                                               swgl_SpanLength, gl_FragCoord); \
+    } else {                                                                   \
+      drawn = commitRadialGradient<false, true>(                               \
+          sampler, address, size, repeat, pos, radius, swgl_OutRGBA8,          \
+          swgl_SpanLength, gl_FragCoord);                                      \
+    }                                                                          \
+    if (drawn) {                                                               \
+      swgl_OutRGBA8 += swgl_SpanLength;                                        \
+      swgl_SpanLength = 0;                                                     \
+    }                                                                          \
+  } while (0)
+
+#define swgl_commitRadialGradientFromStopsRGBA8(                            \
+    sampler, offsetsAddress, colorsAddress, size, repeat, pos, startRadius) \
+  do {                                                                      \
+    bool drawn = false;                                                     \
+    if (blend_key) {                                                        \
+      drawn = commitRadialGradientFromStops<true, false>(                   \
+          sampler, offsetsAddress, colorsAddress, size, repeat, pos,        \
+          startRadius, swgl_OutRGBA8, swgl_SpanLength);                     \
+    } else {                                                                \
+      drawn = commitRadialGradientFromStops<false, false>(                  \
+          sampler, offsetsAddress, colorsAddress, size, repeat, pos,        \
+          startRadius, swgl_OutRGBA8, swgl_SpanLength);                     \
+    }                                                                       \
+    if (drawn) {                                                            \
+      swgl_OutRGBA8 += swgl_SpanLength;                                     \
+      swgl_SpanLength = 0;                                                  \
+    }                                                                       \
+  } while (0)
+
+#define swgl_commitDitheredRadialGradientFromStopsRGBA8(                    \
+    sampler, offsetsAddress, colorsAddress, size, repeat, pos, startRadius) \
+  do {                                                                      \
+    bool drawn = false;                                                     \
+    if (blend_key) {                                                        \
+      drawn = commitRadialGradientFromStops<true, true>(                    \
+          sampler, offsetsAddress, colorsAddress, size, repeat, pos,        \
+          startRadius, swgl_OutRGBA8, swgl_SpanLength, gl_FragCoord);       \
+    } else {                                                                \
+      drawn = commitRadialGradientFromStops<false, true>(                   \
+          sampler, offsetsAddress, colorsAddress, size, repeat, pos,        \
+          startRadius, swgl_OutRGBA8, swgl_SpanLength, gl_FragCoord);       \
+    }                                                                       \
+    if (drawn) {                                                            \
+      swgl_OutRGBA8 += swgl_SpanLength;                                     \
+      swgl_SpanLength = 0;                                                  \
+    }                                                                       \
+  } while (0)
+
+static sampler2D swgl_ClipMask = nullptr;
+static IntPoint swgl_ClipMaskOffset = {0, 0};
+static IntRect swgl_ClipMaskBounds = {0, 0, 0, 0};
+#define swgl_clipMask(mask, offset, bb_origin, bb_size)        \
+  do {                                                         \
+    if (bb_size != vec2_scalar(0.0f, 0.0f)) {                  \
+      swgl_ClipFlags |= SWGL_CLIP_FLAG_MASK;                   \
+      swgl_ClipMask = mask;                                    \
+      swgl_ClipMaskOffset = make_ivec2(offset);                \
+      swgl_ClipMaskBounds =                                    \
+          IntRect(make_ivec2(bb_origin), make_ivec2(bb_size)); \
+    }                                                          \
+  } while (0)
+
+static int swgl_AAEdgeMask = 0;
+
+static ALWAYS_INLINE int calcAAEdgeMask(bool on) { return on ? 0xF : 0; }
+static ALWAYS_INLINE int calcAAEdgeMask(int mask) { return mask; }
+static ALWAYS_INLINE int calcAAEdgeMask(bvec4_scalar mask) {
+  return (mask.x ? 1 : 0) | (mask.y ? 2 : 0) | (mask.z ? 4 : 0) |
+         (mask.w ? 8 : 0);
+}
+
+#define swgl_antiAlias(edges)                \
+  do {                                       \
+    swgl_AAEdgeMask = calcAAEdgeMask(edges); \
+    if (swgl_AAEdgeMask) {                   \
+      swgl_ClipFlags |= SWGL_CLIP_FLAG_AA;   \
+    }                                        \
+  } while (0)
+
+#define swgl_blendDropShadow(color)                         \
+  do {                                                      \
+    swgl_ClipFlags |= SWGL_CLIP_FLAG_BLEND_OVERRIDE;        \
+    swgl_BlendOverride = BLEND_KEY(SWGL_BLEND_DROP_SHADOW); \
+    swgl_BlendColorRGBA8 = packColor<uint32_t>(color);      \
+  } while (0)
+
+#define swgl_blendSubpixelText(color)                         \
+  do {                                                        \
+    swgl_ClipFlags |= SWGL_CLIP_FLAG_BLEND_OVERRIDE;          \
+    swgl_BlendOverride = BLEND_KEY(SWGL_BLEND_SUBPIXEL_TEXT); \
+    swgl_BlendColorRGBA8 = packColor<uint32_t>(color);        \
+    swgl_BlendAlphaRGBA8 = alphas(swgl_BlendColorRGBA8);      \
+  } while (0)
+
+#define DISPATCH_DRAW_SPAN(self, format)        \
+  do {                                          \
+    int total = self->swgl_SpanLength;          \
+    self->swgl_drawSpan##format();              \
+    int drawn = total - self->swgl_SpanLength;  \
+    if (drawn) self->step_interp_inputs(drawn); \
+    return drawn;                               \
+  } while (0)

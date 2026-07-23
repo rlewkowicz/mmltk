@@ -1,0 +1,92 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGANIMATEDPATHSEGLIST_H_
+#define DOM_SVG_SVGANIMATEDPATHSEGLIST_H_
+
+#include <memory>
+
+#include "SVGPathData.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/SMILAttr.h"
+
+namespace mozilla {
+
+class SMILValue;
+
+namespace dom {
+class SVGAnimationElement;
+class SVGElement;
+class SVGPathSegment;
+struct SVGPathSegmentInit;
+}  
+
+class SVGAnimatedPathSegList final {
+ public:
+  SVGAnimatedPathSegList() = default;
+
+  SVGAnimatedPathSegList& operator=(const SVGAnimatedPathSegList& aOther) {
+    mBaseVal = aOther.mBaseVal;
+    if (aOther.mAnimVal) {
+      mAnimVal = std::make_unique<SVGPathData>(*aOther.mAnimVal);
+    }
+    return *this;
+  }
+
+  const SVGPathData& GetBaseValue() const { return mBaseVal; }
+
+  nsresult SetBaseValueString(const nsAString& aValue);
+
+  void SetBaseValueFromPathSegments(
+      const dom::Sequence<dom::SVGPathSegmentInit>& aValues);
+
+  void ClearBaseValue();
+
+  const SVGPathData& GetAnimValue() const {
+    return mAnimVal ? *mAnimVal : mBaseVal;
+  }
+
+  nsresult SetAnimValue(const SVGPathData& aNewAnimValue,
+                        dom::SVGElement* aElement);
+
+  void ClearAnimValue(dom::SVGElement* aElement);
+
+  bool IsRendered() const;
+
+  void* GetBaseValKey() const { return (void*)&mBaseVal; }
+  void* GetAnimValKey() const { return (void*)&mAnimVal; }
+
+  bool IsAnimating() const { return !!mAnimVal; }
+
+  std::unique_ptr<SMILAttr> ToSMILAttr(dom::SVGElement* aElement);
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const;
+
+ private:
+
+  SVGPathData mBaseVal;
+  std::unique_ptr<SVGPathData> mAnimVal;
+
+  struct SMILAnimatedPathSegList : public SMILAttr {
+   public:
+    SMILAnimatedPathSegList(SVGAnimatedPathSegList* aVal,
+                            dom::SVGElement* aElement)
+        : mVal(aVal), mElement(aElement) {}
+
+    SVGAnimatedPathSegList* mVal;
+    dom::SVGElement* mElement;
+
+    nsresult ValueFromString(const nsAString& aStr,
+                             const dom::SVGAnimationElement* aSrcElement,
+                             SMILValue& aValue,
+                             bool& aPreventCachingOfSandwich) const override;
+    SMILValue GetBaseValue() const override;
+    void ClearAnimValue() override;
+    nsresult SetAnimValue(const SMILValue& aValue) override;
+  };
+};
+
+}  
+
+#endif  // DOM_SVG_SVGANIMATEDPATHSEGLIST_H_

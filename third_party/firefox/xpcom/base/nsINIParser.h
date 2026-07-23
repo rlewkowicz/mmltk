@@ -1,0 +1,81 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsINIParser_h_
+#define nsINIParser_h_
+
+#ifdef MOZILLA_INTERNAL_API
+#  define nsINIParser nsINIParser_internal
+#endif
+
+#include "nscore.h"
+#include "nsClassHashtable.h"
+#include "mozilla/UniquePtr.h"
+
+class nsIFile;
+
+class nsINIParser {
+ public:
+  nsINIParser() {}
+  ~nsINIParser() = default;
+
+  nsresult Init(nsIFile* aFile, bool* aContainedErrors = nullptr);
+
+  nsresult InitFromString(const nsCString& aStr,
+                          bool* aContainedErrors = nullptr);
+
+  nsresult GetSections(std::function<bool(const char*)>&& aCallback);
+
+  nsresult GetStrings(
+      const char* aSection,
+      std::function<bool(const char*, const char*)>&& aCallback);
+
+  nsresult GetString(const char* aSection, const char* aKey,
+                     nsACString& aResult);
+
+  nsresult GetString(const char* aSection, const char* aKey, char* aResult,
+                     uint32_t aResultLen);
+
+  nsresult SetString(const char* aSection, const char* aKey,
+                     const char* aValue);
+
+  nsresult DeleteString(const char* aSection, const char* aKey);
+
+  nsresult DeleteSection(const char* aSection);
+
+  nsresult RenameSection(const char* aSection, const char* aNewName);
+
+  nsresult WriteToFile(nsIFile* aFile);
+
+  void WriteToString(nsACString& aOutput);
+
+ private:
+  struct INIValue {
+    INIValue(const char* aKey, const char* aValue)
+        : key(strdup(aKey)), value(strdup(aValue)) {}
+
+    ~INIValue() {
+      delete key;
+      delete value;
+    }
+
+    void SetValue(const char* aValue) {
+      delete value;
+      value = strdup(aValue);
+    }
+
+    const char* key;
+    const char* value;
+    mozilla::UniquePtr<INIValue> next;
+  };
+
+  nsClassHashtable<nsCharPtrHashKey, INIValue> mSections;
+
+  bool IsValidSection(const char* aSection);
+  bool IsValidKey(const char* aKey);
+  bool IsValidValue(const char* aValue);
+};
+
+#endif /* nsINIParser_h_ */

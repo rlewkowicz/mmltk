@@ -1,0 +1,54 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MEMORY_BLOCK_CACHE_H_
+#define MEMORY_BLOCK_CACHE_H_
+
+#include "MediaBlockCacheBase.h"
+#include "mozilla/Mutex.h"
+
+namespace mozilla {
+
+class MemoryBlockCache : public MediaBlockCacheBase {
+ public:
+  explicit MemoryBlockCache(int64_t aContentLength);
+
+ protected:
+  virtual ~MemoryBlockCache();
+
+ public:
+  virtual nsresult Init() override;
+
+  void Flush() override;
+
+  size_t GetMaxBlocks(size_t) const override { return mMaxBlocks; }
+
+  virtual nsresult WriteBlock(uint32_t aBlockIndex, Span<const uint8_t> aData1,
+                              Span<const uint8_t> aData2) override;
+
+  nsresult Read(int64_t aOffset, uint8_t* aData, int32_t aLength) override;
+
+  virtual nsresult MoveBlock(int32_t aSourceBlockIndex,
+                             int32_t aDestBlockIndex) override;
+
+ private:
+  static size_t BlockIndexToOffset(uint32_t aBlockIndex) {
+    return static_cast<size_t>(aBlockIndex) * BLOCK_SIZE;
+  }
+
+  bool EnsureBufferCanContain(size_t aContentLength);
+
+  const size_t mInitialContentLength;
+
+  const size_t mMaxBlocks;
+
+  Mutex mMutex MOZ_UNANNOTATED;
+
+  nsTArray<uint8_t> mBuffer;
+  bool mHasGrown = false;
+};
+
+}  
+
+#endif /* MEMORY_BLOCK_CACHE_H_ */

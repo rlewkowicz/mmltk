@@ -1,0 +1,190 @@
+/*
+ * Basic SSL handshake functions.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nssrenam.h"
+#include "cert.h"
+#include "secitem.h"
+#include "sechash.h"
+#include "cryptohi.h" /* for SGN_ funcs */
+#include "keyhi.h"    /* for SECKEY_ high level functions. */
+#include "ssl.h"
+#include "sslimpl.h"
+#include "sslproto.h"
+#include "ssl3prot.h"
+#include "sslerr.h"
+#include "pk11func.h"
+#include "prinit.h"
+
+const char *ssl_version = "SECURITY_VERSION:"
+                          " +us"
+                          " +export"
+#if defined(TRACE)
+                          " +trace"
+#endif
+#if defined(DEBUG)
+                          " +debug"
+#endif
+    ;
+
+SECStatus
+ssl_GatherRecord1stHandshake(sslSocket *ss)
+{
+    int rv;
+
+    PORT_Assert(ss->opt.noLocks || ssl_Have1stHandshakeLock(ss));
+
+    ssl_GetRecvBufLock(ss);
+
+    rv = ssl3_GatherCompleteHandshake(ss, 0);
+    SSL_TRC(10, ("%d: SSL[%d]: handshake gathering, rv=%d",
+                 SSL_GETPID(), ss->fd, rv));
+
+    ssl_ReleaseRecvBufLock(ss);
+
+    if (rv <= 0) {
+        if (rv == 0) {
+            PORT_SetError(PR_END_OF_FILE_ERROR);
+        }
+        if (PORT_GetError() == PR_WOULD_BLOCK_ERROR) {
+            SSL_TRC(10, ("%d: SSL[%d]: handshake blocked (need %d)",
+                         SSL_GETPID(), ss->fd, ss->gs.remainder));
+        }
+        return SECFailure; 
+    }
+
+    ss->handshake = NULL;
+    return SECSuccess;
+}
+
+static SECStatus
+ssl_CheckConfigSanity(sslSocket *ss)
+{
+    if (SSL_ALL_VERSIONS_DISABLED(&ss->vrange)) {
+        SSL_DBG(("%d: SSL[%d]: Can't handshake! all versions disabled.",
+                 SSL_GETPID(), ss->fd));
+        PORT_SetError(SSL_ERROR_SSL_DISABLED);
+        return SECFailure;
+    }
+    return SECSuccess;
+}
+
+SECStatus
+ssl_BeginClientHandshake(sslSocket *ss)
+{
+    sslSessionID *sid = NULL;
+    SECStatus rv;
+
+    PORT_Assert(ss->opt.noLocks || ssl_Have1stHandshakeLock(ss));
+
+    ss->sec.isServer = PR_FALSE;
+
+    rv = ssl_CheckConfigSanity(ss);
+    if (rv != SECSuccess)
+        goto loser;
+
+    rv = ssl_GetPeerInfo(ss);
+    if (rv < 0) {
+#if defined(HPUX11)
+        if (PR_GetError() == PR_NOT_CONNECTED_ERROR) {
+            char dummy;
+            (void)PR_Write(ss->fd->lower, &dummy, 0);
+            rv = ssl_GetPeerInfo(ss);
+            if (rv < 0) {
+                goto loser;
+            }
+        }
+#else
+        goto loser;
+#endif
+    }
+
+    SSL_TRC(3, ("%d: SSL[%d]: sending client-hello", SSL_GETPID(), ss->fd));
+
+    if (ss->sec.ci.sid && ss->sec.ci.sid->cached == in_external_cache) {
+        sid = ss->sec.ci.sid;
+        SSL_TRC(3, ("%d: SSL[%d]: using external token", SSL_GETPID(), ss->fd));
+    } else if (!ss->opt.noCache) {
+        sid = ssl_LookupSID(ssl_Time(ss), &ss->sec.ci.peer,
+                            ss->sec.ci.port, ss->peerID, ss->url);
+    }
+
+    if (sid) {
+        if (sid->version >= ss->vrange.min && sid->version <= ss->vrange.max) {
+            PORT_Assert(!ss->sec.localCert);
+            ss->sec.localCert = CERT_DupCertificate(sid->localCert);
+        } else {
+            ssl_UncacheSessionID(ss);
+            if (ss->sec.ci.sid == sid) {
+                ss->sec.ci.sid = NULL;
+            }
+            ssl_FreeSID(sid);
+            sid = NULL;
+        }
+    }
+    if (!sid) {
+        sid = ssl3_NewSessionID(ss, PR_FALSE);
+        if (!sid) {
+            goto loser;
+        }
+        sid->u.ssl3.keys.resumable = PR_FALSE;
+    }
+    ss->sec.ci.sid = sid;
+
+    ss->gs.state = GS_INIT;
+    ss->handshake = ssl_GatherRecord1stHandshake;
+
+    ss->version = SSL_LIBRARY_VERSION_3_0;
+
+    ssl_GetSSL3HandshakeLock(ss);
+    ssl_GetXmitBufLock(ss);
+    rv = ssl3_SendClientHello(ss, client_hello_initial);
+    ssl_ReleaseXmitBufLock(ss);
+    ssl_ReleaseSSL3HandshakeLock(ss);
+
+    return rv;
+
+loser:
+    return SECFailure;
+}
+
+SECStatus
+ssl_BeginServerHandshake(sslSocket *ss)
+{
+    SECStatus rv;
+
+    ss->sec.isServer = PR_TRUE;
+    ss->ssl3.hs.ws = wait_client_hello;
+
+    rv = ssl_CheckConfigSanity(ss);
+    if (rv != SECSuccess)
+        goto loser;
+
+    ss->handshake = ssl_GatherRecord1stHandshake;
+    return SECSuccess;
+
+loser:
+    return SECFailure;
+}
+
+
+#include "nss.h"
+extern const char __nss_ssl_version[];
+
+PRBool
+NSSSSL_VersionCheck(const char *importedVersion)
+{
+#define NSS_VERSION_VARIABLE __nss_ssl_version
+#include "verref.h"
+
+    return NSS_VersionCheck(importedVersion);
+}
+
+const char *
+NSSSSL_GetVersion(void)
+{
+    return NSS_VERSION;
+}

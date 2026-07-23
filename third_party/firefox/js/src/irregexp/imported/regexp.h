@@ -1,0 +1,235 @@
+// Copyright 2012 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(V8_REGEXP_REGEXP_H_)
+#define V8_REGEXP_REGEXP_H_
+
+#include "irregexp/imported/regexp-error.h"
+#include "irregexp/RegExpShim.h"
+
+namespace v8 {
+namespace internal {
+
+class JSRegExp;
+class RegExpData;
+class IrRegExpData;
+class AtomRegExpData;
+class RegExpMatchInfo;
+class TrustedFixedArray;
+
+namespace regexp {
+
+class Capture;
+class Node;
+class Tree;
+
+enum class CompilationTarget : int { kBytecode, kNative };
+
+struct CompileData {
+  Tree* tree = nullptr;
+
+  Node* node = nullptr;
+
+  DirectHandle<Object> code;
+
+  bool simple = true;
+
+  bool contains_anchor = false;
+
+  ZoneVector<Capture*>* named_captures = nullptr;
+
+  Error error = Error::kNone;
+
+  int error_pos = 0;
+
+  int capture_count = 0;
+
+  int register_count = 0;
+
+  CompilationTarget compilation_target;
+};
+
+}  
+
+class RegExp final : public AllStatic {
+ public:
+  static bool CanGenerateBytecode();
+
+  V8_EXPORT_PRIVATE static bool VerifyFlags(regexp::Flags flags);
+
+  template <class CharT>
+  static bool VerifySyntax(Zone* zone, uintptr_t stack_limit,
+                           const CharT* input, int input_length,
+                           regexp::Flags flags, regexp::Error* regexp_error_out,
+                           const DisallowGarbageCollection& no_gc);
+
+  V8_WARN_UNUSED_RESULT static MaybeDirectHandle<Object> Compile(
+      Isolate* isolate, DirectHandle<JSRegExp> re,
+      DirectHandle<String> original_source, regexp::Flags flags,
+      uint32_t backtrack_limit);
+
+  V8_WARN_UNUSED_RESULT static bool EnsureFullyCompiled(
+      Isolate* isolate, DirectHandle<RegExpData> re_data,
+      DirectHandle<String> subject);
+
+  enum CallOrigin : int {
+    kFromRuntime = 0,
+    kFromJs = 1,
+  };
+
+#if defined(V8_ENABLE_REGEXP_DIAGNOSTICS)
+  static void TraceExecutionBegin(Address isolate_ptr);
+  static void TraceExecutionEnd(Address isolate_ptr, Address data_ptr,
+                                Address subject_ptr, int32_t last_index,
+                                int32_t result);
+#endif
+
+  V8_EXPORT_PRIVATE V8_WARN_UNUSED_RESULT static std::optional<int> Exec(
+      Isolate* isolate, DirectHandle<JSRegExp> regexp,
+      DirectHandle<String> subject, int index, int32_t* result_offsets_vector,
+      uint32_t result_offsets_vector_length);
+  V8_EXPORT_PRIVATE V8_WARN_UNUSED_RESULT static MaybeDirectHandle<Object>
+  Exec_Single(Isolate* isolate, DirectHandle<JSRegExp> regexp,
+              DirectHandle<String> subject, int index,
+              DirectHandle<RegExpMatchInfo> last_match_info);
+
+  V8_EXPORT_PRIVATE V8_WARN_UNUSED_RESULT static std::optional<int>
+  ExperimentalOneshotExec(Isolate* isolate, DirectHandle<JSRegExp> regexp,
+                          DirectHandle<String> subject, int index,
+                          int32_t* result_offsets_vector,
+                          uint32_t result_offsets_vector_length);
+
+  V8_EXPORT_PRIVATE static intptr_t AtomExecRaw(
+      Isolate* isolate, Address  data_address,
+      Address  subject_address, int32_t index,
+      int32_t* result_offsets_vector, int32_t result_offsets_vector_length);
+
+  static constexpr int kInternalRegExpFailure = 0;
+  static constexpr int kInternalRegExpSuccess = 1;
+  static constexpr int kInternalRegExpException = -1;
+  static constexpr int kInternalRegExpRetry = -2;
+  static constexpr int kInternalRegExpFallbackToExperimental = -3;
+  static constexpr int kInternalRegExpSmallestResult = -3;
+
+  enum IrregexpResult : int32_t {
+    RE_FAILURE = kInternalRegExpFailure,
+    RE_SUCCESS = kInternalRegExpSuccess,
+    RE_EXCEPTION = kInternalRegExpException,
+    RE_RETRY = kInternalRegExpRetry,
+    RE_FALLBACK_TO_EXPERIMENTAL = kInternalRegExpFallbackToExperimental,
+  };
+
+  static DirectHandle<RegExpMatchInfo> SetLastMatchInfo(
+      Isolate* isolate, DirectHandle<RegExpMatchInfo> last_match_info,
+      DirectHandle<String> subject, int capture_count, int32_t* match);
+
+  V8_EXPORT_PRIVATE static bool CompileForTesting(
+      Isolate* isolate, Zone* zone, regexp::CompileData* input,
+      regexp::Flags flags, DirectHandle<String> pattern,
+      DirectHandle<String> sample_subject, DirectHandle<IrRegExpData> re_data,
+      bool is_one_byte);
+
+  V8_EXPORT_PRIVATE static void DotPrintForTesting(const char* label,
+                                                   regexp::Node* node);
+
+  static const int kMaxOptimizedPatternLength = 20 * KB;
+
+  V8_WARN_UNUSED_RESULT
+  static MaybeDirectHandle<Object> ThrowRegExpException(
+      Isolate* isolate, regexp::Flags flags,
+      DirectHandle<String> original_source, regexp::Error error);
+  static void ThrowRegExpException(Isolate* isolate,
+                                   DirectHandle<RegExpData> re_data,
+                                   regexp::Error error_text);
+
+  static bool IsUnmodifiedRegExp(Isolate* isolate,
+                                 DirectHandle<JSRegExp> regexp);
+
+  static DirectHandle<TrustedFixedArray> CreateCaptureNameMap(
+      Isolate* isolate, ZoneVector<regexp::Capture*>* named_captures);
+};
+
+namespace regexp {
+
+class GlobalExecRunner final {
+ public:
+  GlobalExecRunner(DirectHandle<RegExpData> regexp_data,
+                   DirectHandle<String> subject, Isolate* isolate);
+
+  int32_t* FetchNext();
+
+  int32_t* LastSuccessfulMatch() const;
+
+  bool HasException() const { return num_matches_ < 0; }
+
+ private:
+  int AdvanceZeroLength(int last_index) const;
+
+  int max_matches() const {
+    DCHECK_NE(register_array_size_, 0);
+    return register_array_size_ / registers_per_match_;
+  }
+
+  ResultVectorScope result_vector_scope_;
+  int num_matches_ = 0;
+  int current_match_index_ = 0;
+  int registers_per_match_ = 0;
+  int32_t* register_array_ = nullptr;
+  int register_array_size_ = 0;
+  DirectHandle<RegExpData> regexp_data_;
+  DirectHandle<String> subject_;
+  Isolate* const isolate_;
+};
+
+class ResultsCache final : public AllStatic {
+ public:
+  enum ResultsCacheType { REGEXP_MULTIPLE_INDICES, STRING_SPLIT_SUBSTRINGS };
+
+  static Tagged<Object> Lookup(Heap* heap, Tagged<String> key_string,
+                               Tagged<Object> key_pattern,
+                               Tagged<FixedArray>* last_match_out,
+                               ResultsCacheType type);
+  static void Enter(Isolate* isolate, DirectHandle<String> key_string,
+                    DirectHandle<Object> key_pattern,
+                    DirectHandle<FixedArray> value_array,
+                    DirectHandle<FixedArray> last_match_cache,
+                    ResultsCacheType type);
+  static void Clear(Tagged<FixedArray> cache);
+
+  static constexpr int kRegExpResultsCacheSize = 0x100;
+
+ private:
+  static constexpr int kStringOffset = 0;
+  static constexpr int kPatternOffset = 1;
+  static constexpr int kArrayOffset = 2;
+  static constexpr int kLastMatchOffset = 3;
+  static constexpr int kArrayEntriesPerCacheEntry = 4;
+};
+
+class ResultsCache_MatchGlobalAtom final : public AllStatic {
+ public:
+  static void TryInsert(Isolate* isolate, Tagged<String> subject,
+                        Tagged<String> pattern, uint32_t number_of_matches,
+                        int last_match_index);
+  static bool TryGet(Isolate* isolate, Tagged<String> subject,
+                     Tagged<String> pattern, uint32_t* number_of_matches_out,
+                     int* last_match_index_out);
+  static void Clear(Heap* heap);
+
+ private:
+  static constexpr int kSubjectIndex = 0;          
+  static constexpr int kPatternIndex = 1;          
+  static constexpr int kNumberOfMatchesIndex = 2;  
+  static constexpr int kLastMatchIndexIndex = 3;   
+  static constexpr int kEntrySize = 4;
+
+ public:
+  static constexpr int kSize = kEntrySize;  
+};
+
+}  
+}  
+}  
+
+#endif

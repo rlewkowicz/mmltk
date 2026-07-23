@@ -1,0 +1,131 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+
+#if !defined(GOOGLE_PROTOBUF_IO_GZIP_STREAM_H__)
+#define GOOGLE_PROTOBUF_IO_GZIP_STREAM_H__
+
+#include "google/protobuf/io/zero_copy_stream.h"
+#include "google/protobuf/port.h"
+
+#include "google/protobuf/port_def.inc"
+
+namespace google {
+namespace protobuf {
+namespace internal {
+struct StreamContext;
+}  
+
+namespace io {
+
+class PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED PROTOBUF_EXPORT
+    GzipInputStream final : public ZeroCopyInputStream {
+ public:
+  enum Format {
+    AUTO = 0,
+
+    GZIP = 1,
+
+    ZLIB = 2,
+  };
+
+  explicit GzipInputStream(ZeroCopyInputStream* sub_stream,
+                           Format format = AUTO, int buffer_size = -1);
+  GzipInputStream(const GzipInputStream&) = delete;
+  GzipInputStream& operator=(const GzipInputStream&) = delete;
+  ~GzipInputStream() override;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD const char* ZlibErrorMessage() const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD inline int ZlibErrorCode() const {
+    return zerror_;
+  }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool Next(const void** data,
+                                                int* size) override;
+  void BackUp(int count) override;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool Skip(int count) override;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD int64_t ByteCount() const override;
+
+ private:
+  Format format_;
+
+  ZeroCopyInputStream* sub_stream_;
+
+  internal::StreamContext* zcontext_;
+  int zerror_;
+
+  void* output_buffer_;
+  void* output_position_;
+  size_t output_buffer_length_;
+  int64_t byte_count_;
+
+  int Inflate(int flush);
+  void DoNextOutput(const void** data, int* size);
+};
+
+class PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED PROTOBUF_EXPORT
+    GzipOutputStream final : public ZeroCopyOutputStream {
+ public:
+  enum Format {
+    GZIP = 1,
+
+    ZLIB = 2,
+  };
+
+  struct PROTOBUF_EXPORT Options {
+    Format format;
+
+    int buffer_size;
+
+    int compression_level;
+
+    int compression_strategy;
+
+    Options();  
+  };
+
+  explicit GzipOutputStream(ZeroCopyOutputStream* sub_stream);
+
+  GzipOutputStream(ZeroCopyOutputStream* sub_stream, const Options& options);
+  GzipOutputStream(const GzipOutputStream&) = delete;
+  GzipOutputStream& operator=(const GzipOutputStream&) = delete;
+
+  ~GzipOutputStream() override;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD const char* ZlibErrorMessage() const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD inline int ZlibErrorCode() const {
+    return zerror_;
+  }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool Flush();
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool Close();
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool Next(void** data,
+                                                int* size) override;
+  void BackUp(int count) override;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD int64_t ByteCount() const override;
+
+ private:
+  ZeroCopyOutputStream* sub_stream_;
+  void* sub_data_;
+  int sub_data_size_;
+
+  internal::StreamContext* zcontext_;
+  int zerror_;
+  void* input_buffer_;
+  size_t input_buffer_length_;
+
+  void Init(ZeroCopyOutputStream* sub_stream, const Options& options);
+
+  int Deflate(int flush);
+};
+
+}  
+}  
+}  
+
+#include "google/protobuf/port_undef.inc"
+
+#endif

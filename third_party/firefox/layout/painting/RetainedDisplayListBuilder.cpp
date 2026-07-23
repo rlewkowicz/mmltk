@@ -1,0 +1,1351 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#include "RetainedDisplayListBuilder.h"
+
+#include "mozilla/Attributes.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/DisplayPortUtils.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "nsCanvasFrame.h"
+#include "nsIFrame.h"
+#include "nsIFrameInlines.h"
+#include "nsPlaceholderFrame.h"
+#include "nsSubDocumentFrame.h"
+
+
+namespace mozilla {
+
+RetainedDisplayListData::RetainedDisplayListData()
+    : mModifiedFrameLimit(
+          StaticPrefs::layout_display_list_rebuild_frame_limit()) {}
+
+void RetainedDisplayListData::AddModifiedFrame(nsIFrame* aFrame) {
+  MOZ_ASSERT(!aFrame->IsFrameModified());
+  Flags(aFrame) += RetainedDisplayListData::FrameFlag::Modified;
+  aFrame->SetFrameIsModified(true);
+  mModifiedFrameCount++;
+}
+
+static void MarkFramesWithItemsAndImagesModified(nsDisplayList* aList) {
+  for (nsDisplayItem* i : *aList) {
+    if (!i->HasDeletedFrame() && i->CanBeReused() &&
+        !i->Frame()->IsFrameModified()) {
+      bool invalidate = false;
+      if (!(i->GetFlags() & TYPE_RENDERS_NO_IMAGES)) {
+        invalidate = true;
+      }
+
+      if (invalidate) {
+        DL_LOGV("RDL - Invalidating item %p (%s)", i, i->Name());
+        i->FrameForInvalidation()->MarkNeedsDisplayItemRebuild();
+        if (i->GetDependentFrame()) {
+          i->GetDependentFrame()->MarkNeedsDisplayItemRebuild();
+        }
+      }
+    }
+    if (i->GetChildren()) {
+      MarkFramesWithItemsAndImagesModified(i->GetChildren());
+    }
+  }
+}
+
+static nsIFrame* SelectAGRForFrame(nsIFrame* aFrame, nsIFrame* aParentAGR) {
+  if (!aFrame->IsStackingContext() || !aFrame->IsFixedPosContainingBlock()) {
+    return aParentAGR;
+  }
+
+  if (!aFrame->HasOverrideDirtyRegion()) {
+    return nullptr;
+  }
+
+  nsDisplayListBuilder::DisplayListBuildingData* data =
+      aFrame->GetProperty(nsDisplayListBuilder::DisplayListBuildingRect());
+
+  return data && data->mModifiedAGR ? data->mModifiedAGR : nullptr;
+}
+
+void RetainedDisplayListBuilder::AddSizeOfIncludingThis(
+    nsWindowSizes& aSizes) const {
+  aSizes.mLayoutRetainedDisplayListSize += aSizes.mState.mMallocSizeOf(this);
+  mBuilder.AddSizeOfExcludingThis(aSizes);
+  mList.AddSizeOfExcludingThis(aSizes);
+}
+
+bool AnyContentAncestorModified(nsIFrame* aFrame, nsIFrame* aStopAtFrame) {
+  nsIFrame* f = aFrame;
+  while (f) {
+    if (f->IsFrameModified()) {
+      return true;
+    }
+
+    if (aStopAtFrame && f == aStopAtFrame) {
+      break;
+    }
+
+    f = nsLayoutUtils::GetDisplayListParent(f);
+  }
+
+  return false;
+}
+
+bool RetainedDisplayListBuilder::PreProcessDisplayList(
+    RetainedDisplayList* aList, nsIFrame* aAGR, PartialUpdateResult& aUpdated,
+    nsIFrame* aAsyncAncestor, const ActiveScrolledRoot* aAsyncAncestorASR,
+    nsIFrame* aOuterFrame, uint32_t aCallerKey, uint32_t aNestingDepth,
+    bool aKeepLinked) {
+  static const uint32_t kMaxEdgeRatio = 5;
+  const bool initializeDAG = !aList->mDAG.Length();
+  if (!aKeepLinked && !initializeDAG &&
+      aList->mDAG.mDirectPredecessorList.Length() >
+          (aList->mDAG.mNodesInfo.Length() * kMaxEdgeRatio)) {
+    return false;
+  }
+
+  const bool initializeOldItems = aList->mOldItems.IsEmpty();
+  if (initializeOldItems) {
+    aList->mOldItems.SetCapacity(aList->Length());
+  } else {
+    MOZ_RELEASE_ASSERT(!initializeDAG);
+  }
+
+  MOZ_RELEASE_ASSERT(
+      initializeDAG ||
+      aList->mDAG.Length() ==
+          (initializeOldItems ? aList->Length() : aList->mOldItems.Length()));
+
+  nsDisplayList out(Builder());
+
+  size_t i = 0;
+  while (nsDisplayItem* item = aList->RemoveBottom()) {
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+    item->SetMergedPreProcessed(false, true);
+#endif
+
+    if (!initializeOldItems) {
+      while (!aList->mOldItems[i].mItem) {
+        i++;
+      }
+    }
+
+    if (initializeDAG) {
+      if (i == 0) {
+        aList->mDAG.AddNode(Span<const MergedListIndex>());
+      } else {
+        MergedListIndex previous(i - 1);
+        aList->mDAG.AddNode(Span<const MergedListIndex>(&previous, 1));
+      }
+    }
+
+    if (!item->CanBeReused() || item->HasDeletedFrame() ||
+        AnyContentAncestorModified(item->FrameForInvalidation(), aOuterFrame)) {
+      if (initializeOldItems) {
+        aList->mOldItems.AppendElement(OldItemInfo(nullptr));
+      } else {
+        MOZ_RELEASE_ASSERT(aList->mOldItems[i].mItem == item);
+        aList->mOldItems[i].mItem = nullptr;
+      }
+
+      item->Destroy(&mBuilder);
+      Metrics()->mRemovedItems++;
+
+      i++;
+      aUpdated = PartialUpdateResult::Updated;
+      continue;
+    }
+
+    if (initializeOldItems) {
+      aList->mOldItems.AppendElement(OldItemInfo(item));
+    }
+
+    aList->mOldItems[i].mOwnsItem = !aKeepLinked;
+
+    item->SetOldListIndex(aList, OldListIndex(i), aCallerKey, aNestingDepth);
+
+    nsIFrame* f = item->Frame();
+
+    if (item->GetChildren()) {
+      bool keepLinked = aKeepLinked;
+      nsIFrame* invalid = item->FrameForInvalidation();
+      if (!invalid->ForceDescendIntoIfVisible() &&
+          !invalid->HasAnyStateBits(NS_FRAME_FORCE_DISPLAY_LIST_DESCEND_INTO)) {
+        keepLinked = true;
+      }
+
+      nsIFrame* asyncAncestor = aAsyncAncestor;
+      const ActiveScrolledRoot* asyncAncestorASR = aAsyncAncestorASR;
+      if (item->CanMoveAsync()) {
+        asyncAncestor = item->Frame();
+        asyncAncestorASR = item->GetNearestScrollASR();
+      }
+
+      if (!PreProcessDisplayList(
+              item->GetChildren(), SelectAGRForFrame(f, aAGR), aUpdated,
+              asyncAncestor, asyncAncestorASR, item->Frame(),
+              item->GetPerFrameKey(), aNestingDepth + 1, keepLinked)) {
+        MOZ_RELEASE_ASSERT(
+            !aKeepLinked,
+            "Can't early return since we need to move the out list back");
+        return false;
+      }
+    }
+
+    nsIFrame* agrFrame = nullptr;
+    const ActiveScrolledRoot* asr = item->GetNearestScrollASR();
+    if (aAsyncAncestorASR == asr || !asr) {
+      agrFrame = aAsyncAncestor;
+    } else {
+      auto* scrollContainerFrame = asr->ScrollFrame();
+      if (MOZ_UNLIKELY(!scrollContainerFrame)) {
+        MOZ_DIAGNOSTIC_ASSERT(false);
+        gfxCriticalNoteOnce << "Found null mScrollContainerFrame in asr";
+        return false;
+      }
+      agrFrame = scrollContainerFrame->GetScrolledFrame();
+    }
+
+    if (aAGR && agrFrame != aAGR) {
+      mBuilder.MarkFrameForDisplayIfVisible(f, RootReferenceFrame());
+    }
+
+    if (aKeepLinked) {
+      if (item->GetChildren()) {
+        item->UpdateBounds(Builder());
+      }
+      if (item->GetType() == DisplayItemType::TYPE_SUBDOCUMENT) {
+        IncrementSubDocPresShellPaintCount(item);
+      }
+      out.AppendToTop(item);
+    }
+    i++;
+  }
+
+  MOZ_RELEASE_ASSERT(aList->mOldItems.Length() == aList->mDAG.Length());
+
+  if (aKeepLinked) {
+    aList->AppendToTop(&out);
+  }
+
+  return true;
+}
+
+void IncrementPresShellPaintCount(nsDisplayListBuilder* aBuilder,
+                                  nsDisplayItem* aItem) {
+  MOZ_ASSERT(aItem->GetType() == DisplayItemType::TYPE_SUBDOCUMENT);
+
+  nsSubDocumentFrame* subDocFrame =
+      static_cast<nsDisplaySubDocument*>(aItem)->SubDocumentFrame();
+  MOZ_ASSERT(subDocFrame);
+
+  PresShell* presShell = subDocFrame->GetSubdocumentPresShellForPainting(0);
+  MOZ_ASSERT(presShell);
+
+  aBuilder->IncrementPresShellPaintCount(presShell);
+}
+
+void RetainedDisplayListBuilder::IncrementSubDocPresShellPaintCount(
+    nsDisplayItem* aItem) {
+  IncrementPresShellPaintCount(&mBuilder, aItem);
+}
+
+static Maybe<const ActiveScrolledRoot*> SelectContainerASR(
+    const DisplayItemClipChain* aClipChain, const ActiveScrolledRoot* aItemASR,
+    Maybe<const ActiveScrolledRoot*>& aContainerASR) {
+  const ActiveScrolledRoot* itemClipASR =
+      aClipChain ? aClipChain->mASR : nullptr;
+
+  MOZ_DIAGNOSTIC_ASSERT(!aClipChain || aClipChain->mOnStack || !itemClipASR ||
+                        itemClipASR->mFrame);
+
+  const ActiveScrolledRoot* finiteBoundsASR =
+      ActiveScrolledRoot::PickDescendant(itemClipASR, aItemASR);
+
+  if (!aContainerASR) {
+    return Some(finiteBoundsASR);
+  }
+
+  return Some(
+      ActiveScrolledRoot::PickAncestor(*aContainerASR, finiteBoundsASR));
+}
+
+static void UpdateASR(nsDisplayItem* aItem,
+                      Maybe<const ActiveScrolledRoot*>& aContainerASR) {
+  const Maybe<const ActiveScrolledRoot*> frameASR =
+      aItem->GetBaseASRForAncestorOfContainedASR();
+  if (!frameASR) {
+    return;
+  }
+
+  if (!aContainerASR) {
+    aItem->SetActiveScrolledRoot(*frameASR);
+    return;
+  }
+
+  aItem->SetActiveScrolledRoot(
+      ActiveScrolledRoot::PickAncestor(*frameASR, *aContainerASR));
+}
+
+static void CopyASR(nsDisplayItem* aOld, nsDisplayItem* aNew) {
+  aNew->SetActiveScrolledRoot(aOld->GetActiveScrolledRoot());
+}
+
+OldItemInfo::OldItemInfo(nsDisplayItem* aItem)
+    : mItem(aItem), mUsed(false), mDiscarded(false), mOwnsItem(false) {
+  if (mItem) {
+    mItem->SetModifiedFrame(false);
+  }
+}
+
+void OldItemInfo::AddedMatchToMergedList(RetainedDisplayListBuilder* aBuilder,
+                                         MergedListIndex aIndex) {
+  AddedToMergedList(aIndex);
+}
+
+void OldItemInfo::Discard(RetainedDisplayListBuilder* aBuilder,
+                          nsTArray<MergedListIndex>&& aDirectPredecessors) {
+  MOZ_ASSERT(!IsUsed());
+  mUsed = mDiscarded = true;
+  mDirectPredecessors = std::move(aDirectPredecessors);
+  if (mItem) {
+    MOZ_ASSERT(mOwnsItem);
+    mItem->Destroy(aBuilder->Builder());
+    aBuilder->Metrics()->mRemovedItems++;
+  }
+  mItem = nullptr;
+}
+
+bool OldItemInfo::IsChanged() {
+  return !mItem || !mItem->CanBeReused() || mItem->HasDeletedFrame();
+}
+
+class MergeState {
+ public:
+  MergeState(RetainedDisplayListBuilder* aBuilder,
+             RetainedDisplayList& aOldList, nsDisplayItem* aOuterItem)
+      : mBuilder(aBuilder),
+        mOldList(&aOldList),
+        mOldItems(std::move(aOldList.mOldItems)),
+        mOldDAG(
+            std::move(*reinterpret_cast<DirectedAcyclicGraph<OldListUnits>*>(
+                &aOldList.mDAG))),
+        mMergedItems(aBuilder->Builder()),
+        mOuterItem(aOuterItem),
+        mResultIsModified(false) {
+    mMergedDAG.EnsureCapacityFor(mOldDAG);
+    MOZ_RELEASE_ASSERT(mOldItems.Length() == mOldDAG.Length());
+  }
+
+  Maybe<MergedListIndex> ProcessItemFromNewList(
+      nsDisplayItem* aNewItem, const Maybe<MergedListIndex>& aPreviousItem) {
+    OldListIndex oldIndex;
+    MOZ_DIAGNOSTIC_ASSERT(aNewItem->HasModifiedFrame() ==
+                          HasModifiedFrame(aNewItem));
+    if (!aNewItem->HasModifiedFrame() &&
+        HasMatchingItemInOldList(aNewItem, &oldIndex)) {
+      mBuilder->Metrics()->mRebuiltItems++;
+      nsDisplayItem* oldItem = mOldItems[oldIndex.val].mItem;
+      MOZ_DIAGNOSTIC_ASSERT(oldItem->GetPerFrameKey() ==
+                                aNewItem->GetPerFrameKey() &&
+                            oldItem->Frame() == aNewItem->Frame());
+      if (!mOldItems[oldIndex.val].IsChanged()) {
+        MOZ_DIAGNOSTIC_ASSERT(!mOldItems[oldIndex.val].IsUsed());
+        nsDisplayItem* destItem;
+        if (ShouldUseNewItem(aNewItem)) {
+          destItem = aNewItem;
+        } else {
+          destItem = oldItem;
+          oldItem->SetBuildingRect(aNewItem->GetBuildingRect());
+        }
+
+        MergeChildLists(aNewItem, oldItem, destItem);
+
+        AutoTArray<MergedListIndex, 2> directPredecessors =
+            ProcessPredecessorsOfOldNode(oldIndex);
+        MergedListIndex newIndex = AddNewNode(
+            destItem, Some(oldIndex), directPredecessors, aPreviousItem);
+        mOldItems[oldIndex.val].AddedMatchToMergedList(mBuilder, newIndex);
+        if (destItem == aNewItem) {
+          oldItem->Destroy(mBuilder->Builder());
+        } else {
+          aNewItem->Destroy(mBuilder->Builder());
+        }
+        return Some(newIndex);
+      }
+    }
+    mResultIsModified = true;
+    return Some(AddNewNode(aNewItem, Nothing(), Span<MergedListIndex>(),
+                           aPreviousItem));
+  }
+
+  void MergeChildLists(nsDisplayItem* aNewItem, nsDisplayItem* aOldItem,
+                       nsDisplayItem* aOutItem) {
+    if (!aOutItem->GetChildren()) {
+      return;
+    }
+
+    Maybe<const ActiveScrolledRoot*> containerASRForChildren;
+    nsDisplayList empty(mBuilder->Builder());
+    const bool modified = mBuilder->MergeDisplayLists(
+        aNewItem ? aNewItem->GetChildren() : &empty, aOldItem->GetChildren(),
+        aOutItem->GetChildren(), containerASRForChildren, aOutItem);
+    if (modified) {
+      aOutItem->InvalidateCachedChildInfo(mBuilder->Builder());
+      UpdateASR(aOutItem, containerASRForChildren);
+      mResultIsModified = true;
+    } else if (aOutItem == aNewItem) {
+      CopyASR(aOldItem, aNewItem);
+    }
+    aOutItem->UpdateBounds(mBuilder->Builder());
+
+    if (aOutItem->GetType() == DisplayItemType::TYPE_TRANSFORM) {
+      MOZ_ASSERT(!aNewItem ||
+                 aNewItem->GetType() == DisplayItemType::TYPE_TRANSFORM);
+      MOZ_ASSERT(aOldItem->GetType() == DisplayItemType::TYPE_TRANSFORM);
+      static_cast<nsDisplayTransform*>(aOutItem)->SetContainsASRs(
+          static_cast<nsDisplayTransform*>(aOldItem)->GetContainsASRs() ||
+          (aNewItem
+               ? static_cast<nsDisplayTransform*>(aNewItem)->GetContainsASRs()
+               : false));
+    }
+  }
+
+  bool ShouldUseNewItem(nsDisplayItem* aNewItem) {
+    DisplayItemType type = aNewItem->GetType();
+    if (type == DisplayItemType::TYPE_SOLID_COLOR) {
+      return true;
+    }
+
+    if (type == DisplayItemType::TYPE_TABLE_BORDER_COLLAPSE) {
+      return true;
+    }
+
+    if (type == DisplayItemType::TYPE_TEXT_OVERFLOW) {
+      return true;
+    }
+
+    if (type == DisplayItemType::TYPE_SUBDOCUMENT ||
+        type == DisplayItemType::TYPE_STICKY_POSITION) {
+      return true;
+    }
+
+    if (type == DisplayItemType::TYPE_CARET) {
+      return true;
+    }
+
+    if (type == DisplayItemType::TYPE_MASK ||
+        type == DisplayItemType::TYPE_FILTER ||
+        type == DisplayItemType::TYPE_SVG_WRAPPER) {
+      return true;
+    }
+
+    if (type == DisplayItemType::TYPE_TRANSFORM) {
+      return true;
+    }
+
+    return false;
+  }
+
+  RetainedDisplayList Finalize() {
+    for (size_t i = 0; i < mOldDAG.Length(); i++) {
+      if (mOldItems[i].IsUsed()) {
+        continue;
+      }
+
+      AutoTArray<MergedListIndex, 2> directPredecessors =
+          ResolveNodeIndexesOldToMerged(
+              mOldDAG.GetDirectPredecessors(OldListIndex(i)));
+      ProcessOldNode(OldListIndex(i), std::move(directPredecessors));
+    }
+
+    RetainedDisplayList result(mBuilder->Builder());
+    result.AppendToTop(&mMergedItems);
+    result.mDAG = std::move(mMergedDAG);
+    MOZ_RELEASE_ASSERT(result.mDAG.Length() == result.Length());
+    return result;
+  }
+
+  bool HasMatchingItemInOldList(nsDisplayItem* aItem, OldListIndex* aOutIndex) {
+    uint32_t outerKey = mOuterItem ? mOuterItem->GetPerFrameKey() : 0;
+    nsIFrame* frame = aItem->Frame();
+    for (nsDisplayItem* i : frame->DisplayItems()) {
+      if (i != aItem && i->Frame() == frame &&
+          i->GetPerFrameKey() == aItem->GetPerFrameKey()) {
+        if (i->GetOldListIndex(mOldList, outerKey, aOutIndex)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  bool HasModifiedFrame(nsDisplayItem* aItem) {
+    nsIFrame* stopFrame = mOuterItem ? mOuterItem->Frame() : nullptr;
+    return AnyContentAncestorModified(aItem->FrameForInvalidation(), stopFrame);
+  }
+#endif
+
+  void UpdateContainerASR(nsDisplayItem* aItem) {
+    mContainerASR = SelectContainerASR(
+        aItem->GetClipChain(), aItem->GetActiveScrolledRoot(), mContainerASR);
+  }
+
+  MergedListIndex AddNewNode(
+      nsDisplayItem* aItem, const Maybe<OldListIndex>& aOldIndex,
+      Span<const MergedListIndex> aDirectPredecessors,
+      const Maybe<MergedListIndex>& aExtraDirectPredecessor) {
+    if (aItem->GetType() != DisplayItemType::TYPE_VT_CAPTURE) {
+      UpdateContainerASR(aItem);
+    }
+    aItem->NotifyUsed(mBuilder->Builder());
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+    for (nsDisplayItem* i : aItem->Frame()->DisplayItems()) {
+      if (i->Frame() == aItem->Frame() &&
+          i->GetPerFrameKey() == aItem->GetPerFrameKey()) {
+        MOZ_DIAGNOSTIC_ASSERT(!i->IsMergedItem());
+      }
+    }
+
+    aItem->SetMergedPreProcessed(true, false);
+#endif
+
+    mMergedItems.AppendToTop(aItem);
+    mBuilder->Metrics()->mTotalItems++;
+
+    MergedListIndex newIndex =
+        mMergedDAG.AddNode(aDirectPredecessors, aExtraDirectPredecessor);
+    return newIndex;
+  }
+
+  void ProcessOldNode(OldListIndex aNode,
+                      nsTArray<MergedListIndex>&& aDirectPredecessors) {
+    nsDisplayItem* item = mOldItems[aNode.val].mItem;
+    if (mOldItems[aNode.val].IsChanged()) {
+      mOldItems[aNode.val].Discard(mBuilder, std::move(aDirectPredecessors));
+      mResultIsModified = true;
+    } else {
+      MergeChildLists(nullptr, item, item);
+
+      if (item->GetType() == DisplayItemType::TYPE_SUBDOCUMENT) {
+        mBuilder->IncrementSubDocPresShellPaintCount(item);
+      }
+      mBuilder->Metrics()->mReusedItems++;
+      mOldItems[aNode.val].AddedToMergedList(
+          AddNewNode(item, Some(aNode), aDirectPredecessors, Nothing()));
+    }
+  }
+
+  struct PredecessorStackItem {
+    PredecessorStackItem(OldListIndex aNode, Span<OldListIndex> aPredecessors)
+        : mNode(aNode),
+          mDirectPredecessors(aPredecessors),
+          mCurrentPredecessorIndex(0) {}
+
+    bool IsFinished() {
+      return mCurrentPredecessorIndex == mDirectPredecessors.Length();
+    }
+
+    OldListIndex GetAndIncrementCurrentPredecessor() {
+      return mDirectPredecessors[mCurrentPredecessorIndex++];
+    }
+
+    OldListIndex mNode;
+    Span<OldListIndex> mDirectPredecessors;
+    size_t mCurrentPredecessorIndex;
+  };
+
+  AutoTArray<MergedListIndex, 2> ProcessPredecessorsOfOldNode(
+      OldListIndex aNode) {
+    AutoTArray<PredecessorStackItem, 256> mStack;
+    mStack.AppendElement(
+        PredecessorStackItem(aNode, mOldDAG.GetDirectPredecessors(aNode)));
+
+    while (true) {
+      if (mStack.LastElement().IsFinished()) {
+        PredecessorStackItem item = mStack.PopLastElement();
+        AutoTArray<MergedListIndex, 2> result =
+            ResolveNodeIndexesOldToMerged(item.mDirectPredecessors);
+
+        if (mStack.IsEmpty()) {
+          return result;
+        }
+
+        ProcessOldNode(item.mNode, std::move(result));
+      } else {
+        OldListIndex currentIndex =
+            mStack.LastElement().GetAndIncrementCurrentPredecessor();
+        if (!mOldItems[currentIndex.val].IsUsed()) {
+          mStack.AppendElement(PredecessorStackItem(
+              currentIndex, mOldDAG.GetDirectPredecessors(currentIndex)));
+        }
+      }
+    }
+  }
+
+  AutoTArray<MergedListIndex, 2> ResolveNodeIndexesOldToMerged(
+      Span<OldListIndex> aDirectPredecessors) {
+    AutoTArray<MergedListIndex, 2> result;
+    result.SetCapacity(aDirectPredecessors.Length());
+    for (OldListIndex index : aDirectPredecessors) {
+      OldItemInfo& oldItem = mOldItems[index.val];
+      if (oldItem.IsDiscarded()) {
+        for (MergedListIndex inner : oldItem.mDirectPredecessors) {
+          if (!result.Contains(inner)) {
+            result.AppendElement(inner);
+          }
+        }
+      } else {
+        result.AppendElement(oldItem.mIndex);
+      }
+    }
+    return result;
+  }
+
+  RetainedDisplayListBuilder* mBuilder;
+  RetainedDisplayList* mOldList;
+  Maybe<const ActiveScrolledRoot*> mContainerASR;
+  nsTArray<OldItemInfo> mOldItems;
+  DirectedAcyclicGraph<OldListUnits> mOldDAG;
+  nsDisplayList mMergedItems;
+  DirectedAcyclicGraph<MergedListUnits> mMergedDAG;
+  nsDisplayItem* mOuterItem;
+  bool mResultIsModified;
+};
+
+#ifdef DEBUG
+void VerifyNotModified(nsDisplayList* aList) {
+  for (nsDisplayItem* item : *aList) {
+    MOZ_ASSERT(!AnyContentAncestorModified(item->FrameForInvalidation()));
+
+    if (item->GetChildren()) {
+      VerifyNotModified(item->GetChildren());
+    }
+  }
+}
+#endif
+
+bool RetainedDisplayListBuilder::MergeDisplayLists(
+    nsDisplayList* aNewList, RetainedDisplayList* aOldList,
+    RetainedDisplayList* aOutList,
+    mozilla::Maybe<const mozilla::ActiveScrolledRoot*>& aOutContainerASR,
+    nsDisplayItem* aOuterItem) {
+
+  if (!aOldList->IsEmpty()) {
+
+    aNewList->DeleteAll(&mBuilder);
+#ifdef DEBUG
+    VerifyNotModified(aOldList);
+#endif
+
+    if (aOldList != aOutList) {
+      *aOutList = std::move(*aOldList);
+    }
+
+    return false;
+  }
+
+  MergeState merge(this, *aOldList, aOuterItem);
+
+  Maybe<MergedListIndex> previousItemIndex;
+  for (nsDisplayItem* item : aNewList->TakeItems()) {
+    Metrics()->mNewItems++;
+    previousItemIndex = merge.ProcessItemFromNewList(item, previousItemIndex);
+  }
+
+  *aOutList = merge.Finalize();
+  aOutContainerASR = merge.mContainerASR;
+  return merge.mResultIsModified;
+}
+
+void RetainedDisplayListBuilder::GetModifiedAndFramesWithProps(
+    nsTArray<nsIFrame*>* aOutModifiedFrames,
+    nsTArray<nsIFrame*>* aOutFramesWithProps) {
+  for (auto it = Data()->ConstIterator(); !it.Done(); it.Next()) {
+    nsIFrame* frame = it.Key();
+    const RetainedDisplayListData::FrameFlags& flags = it.Data();
+
+    if (flags.contains(RetainedDisplayListData::FrameFlag::Modified)) {
+      aOutModifiedFrames->AppendElement(frame);
+    }
+
+    if (flags.contains(RetainedDisplayListData::FrameFlag::HasProps)) {
+      aOutFramesWithProps->AppendElement(frame);
+    }
+  }
+
+  Data()->Clear();
+}
+
+#if CRR_DEBUG
+#  define CRR_LOG(...) printf_stderr(__VA_ARGS__)
+#else
+#  define CRR_LOG(...)
+#endif
+
+static nsDisplayItem* GetFirstDisplayItemWithChildren(nsIFrame* aFrame) {
+  for (nsDisplayItem* i : aFrame->DisplayItems()) {
+    if (i->HasDeletedFrame() || i->Frame() != aFrame) {
+      continue;
+    }
+
+    if (i->HasChildren()) {
+      return static_cast<nsDisplayItem*>(i);
+    }
+  }
+  return nullptr;
+}
+
+static bool IsInPreserve3DContext(const nsIFrame* aFrame) {
+  return aFrame->Extend3DContext() ||
+         aFrame->Combines3DTransformWithAncestors();
+}
+
+static bool CanStoreDisplayListBuildingRect(nsDisplayListBuilder* aBuilder,
+                                            nsIFrame* aFrame) {
+  return aFrame != aBuilder->RootReferenceFrame() &&
+         aFrame->IsStackingContext() && aFrame->IsFixedPosContainingBlock() &&
+         !aFrame->GetPrevContinuation() && !aFrame->GetNextContinuation();
+}
+
+static bool ProcessFrameInternal(nsIFrame* aFrame,
+                                 nsDisplayListBuilder* aBuilder,
+                                 nsIFrame** aAGR, nsRect& aOverflow,
+                                 const nsIFrame* aStopAtFrame,
+                                 nsTArray<nsIFrame*>& aOutFramesWithProps,
+                                 const bool aStopAtStackingContext) {
+  nsIFrame* currentFrame = aFrame;
+
+  while (currentFrame != aStopAtFrame) {
+    CRR_LOG("currentFrame: %p (placeholder=%d), aOverflow: %d %d %d %d\n",
+            currentFrame, !aStopAtStackingContext, aOverflow.x, aOverflow.y,
+            aOverflow.width, aOverflow.height);
+
+    nsIFrame* placeholder = currentFrame->HasAnyStateBits(NS_FRAME_OUT_OF_FLOW)
+                                ? currentFrame->GetPlaceholderFrame()
+                                : nullptr;
+
+    if (placeholder) {
+      nsRect placeholderOverflow = aOverflow;
+      auto rv = nsLayoutUtils::TransformRect(currentFrame, placeholder,
+                                             placeholderOverflow);
+      if (rv != nsLayoutUtils::TRANSFORM_SUCCEEDED) {
+        placeholderOverflow = nsRect();
+      }
+
+      CRR_LOG("Processing placeholder %p for OOF frame %p\n", placeholder,
+              currentFrame);
+
+      CRR_LOG("OOF frame draw area: %d %d %d %d\n", placeholderOverflow.x,
+              placeholderOverflow.y, placeholderOverflow.width,
+              placeholderOverflow.height);
+
+      nsIFrame* dummyAGR = nullptr;
+
+      const nsIFrame* ancestor = nsLayoutUtils::FindNearestCommonAncestorFrame(
+          currentFrame->GetParent(), placeholder->GetParent());
+
+      if (!ProcessFrameInternal(placeholder, aBuilder, &dummyAGR,
+                                placeholderOverflow, ancestor,
+                                aOutFramesWithProps, false)) {
+        return false;
+      }
+    }
+
+    aOverflow = nsLayoutUtils::TransformFrameRectToAncestor(
+        currentFrame, aOverflow, aStopAtFrame, nullptr, nullptr,
+         true,
+        &currentFrame);
+    if (IsInPreserve3DContext(currentFrame)) {
+      return false;
+    }
+
+    MOZ_ASSERT(currentFrame);
+
+    nsRect displayPort;
+    ScrollContainerFrame* sf = do_QueryFrame(currentFrame);
+    nsIContent* content = sf ? currentFrame->GetContent() : nullptr;
+
+    if (content && DisplayPortUtils::GetDisplayPort(content, &displayPort)) {
+      CRR_LOG("Frame belongs to displayport frame %p\n", currentFrame);
+
+      nsRect r = aOverflow - sf->GetScrollPortRect().TopLeft();
+      r.IntersectRect(r, displayPort);
+      if (!r.IsEmpty()) {
+        nsRect* rect = currentFrame->GetProperty(
+            nsDisplayListBuilder::DisplayListBuildingDisplayPortRect());
+        if (!rect) {
+          rect = new nsRect();
+          currentFrame->SetProperty(
+              nsDisplayListBuilder::DisplayListBuildingDisplayPortRect(), rect);
+          currentFrame->SetHasOverrideDirtyRegion(true);
+          aOutFramesWithProps.AppendElement(currentFrame);
+        }
+        rect->UnionRect(*rect, r);
+        CRR_LOG("Adding area to displayport draw area: %d %d %d %d\n", r.x, r.y,
+                r.width, r.height);
+
+        aOverflow = sf->GetScrollPortRect();
+      } else {
+        aOverflow.SetEmpty();
+      }
+    } else {
+      aOverflow.IntersectRect(aOverflow,
+                              currentFrame->InkOverflowRectRelativeToSelf());
+    }
+
+    if (aOverflow.IsEmpty()) {
+      break;
+    }
+
+    if (CanStoreDisplayListBuildingRect(aBuilder, currentFrame)) {
+      CRR_LOG("Frame belongs to stacking context frame %p\n", currentFrame);
+      nsDisplayItem* wrapperItem =
+          GetFirstDisplayItemWithChildren(currentFrame);
+      if (!wrapperItem) {
+        continue;
+      }
+
+      nsDisplayListBuilder::DisplayListBuildingData* data =
+          currentFrame->GetProperty(
+              nsDisplayListBuilder::DisplayListBuildingRect());
+      if (!data) {
+        data = new nsDisplayListBuilder::DisplayListBuildingData();
+        currentFrame->SetProperty(
+            nsDisplayListBuilder::DisplayListBuildingRect(), data);
+        currentFrame->SetHasOverrideDirtyRegion(true);
+        aOutFramesWithProps.AppendElement(currentFrame);
+      }
+      CRR_LOG("Adding area to stacking context draw area: %d %d %d %d\n",
+              aOverflow.x, aOverflow.y, aOverflow.width, aOverflow.height);
+      data->mDirtyRect.UnionRect(data->mDirtyRect, aOverflow);
+
+      if (!aStopAtStackingContext) {
+        continue;
+      }
+
+      nsRect previousVisible = wrapperItem->GetBuildingRectForChildren();
+      if (wrapperItem->ReferenceFrameForChildren() != wrapperItem->Frame()) {
+        previousVisible -= wrapperItem->ToReferenceFrame();
+      }
+
+      if (!previousVisible.Contains(aOverflow)) {
+        continue;
+      }
+
+      if (!data->mModifiedAGR) {
+        data->mModifiedAGR = *aAGR;
+      } else if (data->mModifiedAGR != *aAGR) {
+        data->mDirtyRect = currentFrame->InkOverflowRectRelativeToSelf();
+        CRR_LOG(
+            "Found multiple modified AGRs within this stacking context, "
+            "giving up\n");
+      }
+
+      aOverflow.SetEmpty();
+      *aAGR = nullptr;
+
+      break;
+    }
+  }
+  return true;
+}
+
+bool RetainedDisplayListBuilder::ProcessFrame(
+    nsIFrame* aFrame, nsDisplayListBuilder* aBuilder, nsIFrame* aStopAtFrame,
+    nsTArray<nsIFrame*>& aOutFramesWithProps, const bool aStopAtStackingContext,
+    nsRect* aOutDirty, nsIFrame** aOutModifiedAGR) {
+  if (aFrame->HasOverrideDirtyRegion()) {
+    aOutFramesWithProps.AppendElement(aFrame);
+  }
+
+  if (aFrame->HasAnyStateBits(NS_FRAME_IN_POPUP)) {
+    return true;
+  }
+
+  nsIFrame* agrFrame = aBuilder->FindAnimatedGeometryRootFrameFor(aFrame);
+
+  CRR_LOG("Processing frame %p with agr %p\n", aFrame, agr->mFrame);
+
+  nsRect overflow = aFrame->InkOverflowRectRelativeToSelf();
+
+  if (aFrame == aBuilder->GetCaretFrame()) {
+    overflow.UnionRect(overflow, aBuilder->GetCaretRect());
+  }
+
+  if (!ProcessFrameInternal(aFrame, aBuilder, &agrFrame, overflow, aStopAtFrame,
+                            aOutFramesWithProps, aStopAtStackingContext)) {
+    return false;
+  }
+
+  if (!overflow.IsEmpty()) {
+    aOutDirty->UnionRect(*aOutDirty, overflow);
+    CRR_LOG("Adding area to root draw area: %d %d %d %d\n", overflow.x,
+            overflow.y, overflow.width, overflow.height);
+
+    if (!*aOutModifiedAGR) {
+      CRR_LOG("Setting %p as root stacking context AGR\n", agrFrame);
+      *aOutModifiedAGR = agrFrame;
+    } else if (agrFrame && *aOutModifiedAGR != agrFrame) {
+      CRR_LOG("Found multiple AGRs in root stacking context, giving up\n");
+      return false;
+    }
+  }
+  return true;
+}
+
+static void AddFramesForContainingBlock(nsIFrame* aBlock,
+                                        const nsFrameList& aFrames,
+                                        nsTArray<nsIFrame*>& aExtraFrames) {
+  for (nsIFrame* f : aFrames) {
+    if (!f->IsFrameModified() && AnyContentAncestorModified(f, aBlock)) {
+      CRR_LOG("Adding invalid OOF %p\n", f);
+      aExtraFrames.AppendElement(f);
+    }
+  }
+}
+
+static void FindContainingBlocks(nsIFrame* aFrame,
+                                 nsTArray<nsIFrame*>& aExtraFrames) {
+  for (nsIFrame* f = aFrame; f; f = nsLayoutUtils::GetDisplayListParent(f)) {
+    if (f->ForceDescendIntoIfVisible()) {
+      return;
+    }
+    f->SetForceDescendIntoIfVisible(true);
+    CRR_LOG("Considering OOFs for %p\n", f);
+
+    AddFramesForContainingBlock(f, f->GetChildList(FrameChildListID::Float),
+                                aExtraFrames);
+    AddFramesForContainingBlock(f, f->GetChildList(FrameChildListID::Absolute),
+                                aExtraFrames);
+
+    if (f->HasAnyStateBits(NS_FRAME_OUT_OF_FLOW) && !f->GetPrevInFlow()) {
+      nsIFrame* parent = f->GetParent();
+      if (parent && !parent->ForceDescendIntoIfVisible()) {
+        FindContainingBlocks(parent, aExtraFrames);
+      }
+    }
+  }
+}
+
+bool RetainedDisplayListBuilder::ComputeRebuildRegion(
+    nsTArray<nsIFrame*>& aModifiedFrames, nsRect* aOutDirty,
+    nsIFrame** aOutModifiedAGR, nsTArray<nsIFrame*>& aOutFramesWithProps) {
+  CRR_LOG("Computing rebuild regions for %zu frames:\n",
+          aModifiedFrames.Length());
+  nsTArray<nsIFrame*> extraFrames;
+  for (nsIFrame* f : aModifiedFrames) {
+    MOZ_ASSERT(f);
+
+    mBuilder.AddFrameMarkedForDisplayIfVisible(f);
+    FindContainingBlocks(f, extraFrames);
+
+    if (!ProcessFrame(f, &mBuilder, RootReferenceFrame(), aOutFramesWithProps,
+                      true, aOutDirty, aOutModifiedAGR)) {
+      return false;
+    }
+  }
+
+  aModifiedFrames.AppendElements(extraFrames);
+
+  for (nsIFrame* f : extraFrames) {
+    f->SetFrameIsModified(true);
+
+    if (!ProcessFrame(f, &mBuilder, RootReferenceFrame(), aOutFramesWithProps,
+                      true, aOutDirty, aOutModifiedAGR)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool RetainedDisplayListBuilder::ShouldBuildPartial(
+    nsTArray<nsIFrame*>& aModifiedFrames) {
+  if (mBuilder.DisablePartialUpdates()) {
+    mBuilder.SetDisablePartialUpdates(false);
+    Metrics()->mPartialUpdateFailReason = PartialUpdateFailReason::Disabled;
+    return false;
+  }
+
+  if (mList.IsEmpty()) {
+    Metrics()->mPartialUpdateFailReason = PartialUpdateFailReason::EmptyList;
+    return false;
+  }
+
+  if (aModifiedFrames.Length() >
+      StaticPrefs::layout_display_list_rebuild_frame_limit()) {
+    Metrics()->mPartialUpdateFailReason = PartialUpdateFailReason::RebuildLimit;
+    return false;
+  }
+
+  for (nsIFrame* f : aModifiedFrames) {
+    MOZ_ASSERT(f);
+
+    const LayoutFrameType type = f->Type();
+
+    if (type == LayoutFrameType::Viewport ||
+        type == LayoutFrameType::PageContent ||
+        type == LayoutFrameType::Canvas || type == LayoutFrameType::Scrollbar) {
+      Metrics()->mPartialUpdateFailReason = PartialUpdateFailReason::FrameType;
+      return false;
+    }
+
+    if (type == LayoutFrameType::ScrollContainer && f->GetParent() &&
+        !f->GetParent()->GetParent()) {
+      Metrics()->mPartialUpdateFailReason = PartialUpdateFailReason::FrameType;
+      return false;
+    }
+  }
+
+  return true;
+}
+
+class AutoClearFramePropsArray {
+ public:
+  explicit AutoClearFramePropsArray(size_t aCapacity) : mFrames(aCapacity) {}
+  AutoClearFramePropsArray() = default;
+  ~AutoClearFramePropsArray() {
+    size_t len = mFrames.Length();
+    nsIFrame** elements = mFrames.Elements();
+    for (size_t i = 0; i < len; ++i) {
+      nsIFrame* f = elements[i];
+      DL_LOGV("RDL - Clearing modified flags for frame %p", f);
+      if (f->HasOverrideDirtyRegion()) {
+        f->SetHasOverrideDirtyRegion(false);
+        f->RemoveProperty(nsDisplayListBuilder::DisplayListBuildingRect());
+        f->RemoveProperty(
+            nsDisplayListBuilder::DisplayListBuildingDisplayPortRect());
+      }
+      f->SetFrameIsModified(false);
+      f->SetHasModifiedDescendants(false);
+    }
+  }
+
+  nsTArray<nsIFrame*>& Frames() { return mFrames; }
+  bool IsEmpty() const { return mFrames.IsEmpty(); }
+
+ private:
+  nsTArray<nsIFrame*> mFrames;
+};
+
+void RetainedDisplayListBuilder::ClearFramesWithProps() {
+  AutoClearFramePropsArray modifiedFrames(Data()->GetModifiedFrameCount());
+  AutoClearFramePropsArray framesWithProps;
+  GetModifiedAndFramesWithProps(&modifiedFrames.Frames(),
+                                &framesWithProps.Frames());
+}
+
+void RetainedDisplayListBuilder::ClearRetainedData() {
+  DL_LOGI("(%p) RDL - Clearing retained display list builder data", this);
+  List()->DeleteAll(Builder());
+  ClearFramesWithProps();
+  ClearReuseableDisplayItems();
+}
+
+namespace RDLUtils {
+
+MOZ_NEVER_INLINE_DEBUG void AssertFrameSubtreeUnmodified(
+    const nsIFrame* aFrame) {
+  MOZ_ASSERT(!aFrame->IsFrameModified());
+  MOZ_ASSERT(!aFrame->HasModifiedDescendants());
+
+  for (const auto& childList : aFrame->ChildLists()) {
+    for (nsIFrame* child : childList.mList) {
+      AssertFrameSubtreeUnmodified(child);
+    }
+  }
+}
+
+MOZ_NEVER_INLINE_DEBUG void AssertDisplayListUnmodified(nsDisplayList* aList) {
+  for (nsDisplayItem* item : *aList) {
+    AssertDisplayItemUnmodified(item);
+  }
+}
+
+MOZ_NEVER_INLINE_DEBUG void AssertDisplayItemUnmodified(nsDisplayItem* aItem) {
+  MOZ_ASSERT(!aItem->HasDeletedFrame());
+  MOZ_ASSERT(!AnyContentAncestorModified(aItem->FrameForInvalidation()));
+
+  if (aItem->GetChildren()) {
+    AssertDisplayListUnmodified(aItem->GetChildren());
+  }
+}
+
+}  
+
+namespace RDL {
+
+void MarkAncestorFrames(nsIFrame* aFrame,
+                        nsTArray<nsIFrame*>& aOutFramesWithProps) {
+  nsIFrame* frame = nsLayoutUtils::GetDisplayListParent(aFrame);
+  while (frame && !frame->HasModifiedDescendants()) {
+    aOutFramesWithProps.AppendElement(frame);
+    frame->SetHasModifiedDescendants(true);
+    frame = nsLayoutUtils::GetDisplayListParent(frame);
+  }
+}
+
+void MarkAllAncestorFrames(const nsTArray<nsIFrame*>& aModifiedFrames,
+                           nsTArray<nsIFrame*>& aOutFramesWithProps) {
+  nsAutoString frameName;
+  DL_LOGI("RDL - Modified frames: %zu", aModifiedFrames.Length());
+  for (nsIFrame* frame : aModifiedFrames) {
+#ifdef DEBUG
+    frame->GetFrameName(frameName);
+#endif
+    DL_LOGV("RDL - Processing modified frame: %p (%s)", frame,
+            NS_ConvertUTF16toUTF8(frameName).get());
+
+    MarkAncestorFrames(frame, aOutFramesWithProps);
+  }
+}
+
+MOZ_NEVER_INLINE_DEBUG void ReuseStackingContextItem(
+    nsDisplayListBuilder* aBuilder, nsDisplayItem* aItem) {
+  aItem->SetPreProcessed();
+
+  if (aItem->HasChildren()) {
+    aItem->UpdateBounds(aBuilder);
+  }
+
+  aBuilder->AddReusableDisplayItem(aItem);
+  DL_LOGD("Reusing display item %p", aItem);
+}
+
+bool IsSupportedFrameType(const nsIFrame* aFrame) {
+  if (aFrame->IsTableColFrame()) {
+    return false;
+  }
+
+  if (aFrame->IsTableColGroupFrame()) {
+    return false;
+  }
+
+  if (aFrame->IsTableRowFrame()) {
+    return false;
+  }
+
+  if (aFrame->IsTableRowGroupFrame()) {
+    return false;
+  }
+
+  if (aFrame->IsTableCellFrame()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool IsReuseableStackingContextItem(nsDisplayItem* aItem) {
+  if (!IsSupportedFrameType(aItem->Frame())) {
+    return false;
+  }
+
+  if (!aItem->IsReusable()) {
+    return false;
+  }
+
+  const nsIFrame* frame = aItem->FrameForInvalidation();
+  return !frame->HasModifiedDescendants() && !frame->GetPrevContinuation() &&
+         !frame->GetNextContinuation();
+}
+
+void CollectStackingContextItems(nsDisplayListBuilder* aBuilder,
+                                 nsDisplayList* aList, nsIFrame* aOuterFrame,
+                                 int aDepth = 0, bool aParentReused = false) {
+  for (nsDisplayItem* item : aList->TakeItems()) {
+    if (DL_LOG_TEST(LogLevel::Debug)) {
+      DL_LOGD(
+          "%*s Preprocessing item %p (%s) (frame: %p) "
+          "(children: %zu) (depth: %d) (parentReused: %d)",
+          aDepth, "", item, item->Name(),
+          item->HasDeletedFrame() ? nullptr : item->Frame(),
+          item->GetChildren() ? item->GetChildren()->Length() : 0, aDepth,
+          aParentReused);
+    }
+
+    if (!item->CanBeReused() || item->HasDeletedFrame() ||
+        AnyContentAncestorModified(item->FrameForInvalidation(), aOuterFrame)) {
+      DL_LOGD("%*s Deleted modified or temporary item %p", aDepth, "", item);
+      item->Destroy(aBuilder);
+      continue;
+    }
+
+    MOZ_ASSERT(!AnyContentAncestorModified(item->FrameForInvalidation()));
+    MOZ_ASSERT(!item->IsPreProcessed());
+    item->InvalidateCachedChildInfo(aBuilder);
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+    item->SetMergedPreProcessed(false, true);
+#endif
+    const bool isStackingContextItem = IsReuseableStackingContextItem(item);
+
+    if (item->GetChildren()) {
+      CollectStackingContextItems(aBuilder, item->GetChildren(), item->Frame(),
+                                  aDepth + 1,
+                                  aParentReused || isStackingContextItem);
+    }
+
+    if (aParentReused) {
+#ifdef DEBUG
+      RDLUtils::AssertDisplayItemUnmodified(item);
+#endif
+      aList->AppendToTop(item);
+    } else if (isStackingContextItem) {
+      ReuseStackingContextItem(aBuilder, item);
+    } else {
+      DL_LOGD("%*s Deleted unused item %p", aDepth, "", item);
+      item->Destroy(aBuilder);
+      continue;
+    }
+
+    if (item->GetType() == DisplayItemType::TYPE_SUBDOCUMENT) {
+      IncrementPresShellPaintCount(aBuilder, item);
+    }
+  }
+}
+
+}  
+
+bool RetainedDisplayListBuilder::TrySimpleUpdate(
+    const nsTArray<nsIFrame*>& aModifiedFrames,
+    nsTArray<nsIFrame*>& aOutFramesWithProps) {
+  if (!mBuilder.IsReusingStackingContextItems()) {
+    return false;
+  }
+
+  RDL::MarkAllAncestorFrames(aModifiedFrames, aOutFramesWithProps);
+  RDL::CollectStackingContextItems(&mBuilder, &mList, RootReferenceFrame());
+
+  return true;
+}
+
+PartialUpdateResult RetainedDisplayListBuilder::AttemptPartialUpdate(
+    nscolor aBackstop) {
+  DL_LOGI("(%p) RDL - AttemptPartialUpdate, root frame: %p", this,
+          RootReferenceFrame());
+
+  mBuilder.RemoveModifiedWindowRegions();
+
+  if (mBuilder.ShouldSyncDecodeImages()) {
+    DL_LOGI("RDL - Sync decoding images");
+    MarkFramesWithItemsAndImagesModified(&mList);
+  }
+
+  mBuilder.InvalidateCaretFramesIfNeeded();
+
+  AutoClearFramePropsArray modifiedFrames(Data()->GetModifiedFrameCount());
+  AutoClearFramePropsArray framesWithProps(64);
+  GetModifiedAndFramesWithProps(&modifiedFrames.Frames(),
+                                &framesWithProps.Frames());
+
+  if (!ShouldBuildPartial(modifiedFrames.Frames())) {
+    mBuilder.SetPartialBuildFailed(true);
+    return PartialUpdateResult::Failed;
+  }
+
+  nsRect modifiedDirty;
+  nsDisplayList modifiedDL(&mBuilder);
+  nsIFrame* modifiedAGR = nullptr;
+  PartialUpdateResult result = PartialUpdateResult::NoChange;
+  const bool simpleUpdate =
+      TrySimpleUpdate(modifiedFrames.Frames(), framesWithProps.Frames());
+
+  mBuilder.EnterPresShell(RootReferenceFrame());
+
+  if (!simpleUpdate) {
+    if (!ComputeRebuildRegion(modifiedFrames.Frames(), &modifiedDirty,
+                              &modifiedAGR, framesWithProps.Frames()) ||
+        !PreProcessDisplayList(&mList, modifiedAGR, result,
+                               RootReferenceFrame(), nullptr)) {
+      DL_LOGI("RDL - Partial update aborted");
+      mBuilder.SetPartialBuildFailed(true);
+      mBuilder.LeavePresShell(RootReferenceFrame(), nullptr);
+      mList.DeleteAll(&mBuilder);
+      return PartialUpdateResult::Failed;
+    }
+  } else {
+    modifiedDirty = mBuilder.GetVisibleRect();
+  }
+
+  ScrollContainerFrame* sf =
+      RootReferenceFrame()->PresShell()->GetRootScrollContainerFrame();
+  if (sf) {
+    nsCanvasFrame* canvasFrame = do_QueryFrame(sf->GetScrolledFrame());
+    if (canvasFrame) {
+      mBuilder.MarkFrameForDisplayIfVisible(canvasFrame, RootReferenceFrame());
+    }
+  }
+
+  nsRect rootOverflow = RootOverflowRect();
+  modifiedDirty.IntersectRect(modifiedDirty, rootOverflow);
+
+  mBuilder.SetDirtyRect(modifiedDirty);
+  mBuilder.SetPartialUpdate(true);
+  mBuilder.SetPartialBuildFailed(false);
+
+  DL_LOGI("RDL - Starting display list build");
+  RootReferenceFrame()->BuildDisplayListForStackingContext(&mBuilder,
+                                                           &modifiedDL);
+  DL_LOGI("RDL - Finished display list build");
+
+  if (!modifiedDL.IsEmpty()) {
+    nsLayoutUtils::AddExtraBackgroundItems(
+        &mBuilder, &modifiedDL, RootReferenceFrame(),
+        nsRect(nsPoint(0, 0), rootOverflow.Size()), rootOverflow, aBackstop);
+  }
+  mBuilder.SetPartialUpdate(false);
+
+  if (mBuilder.PartialBuildFailed()) {
+    DL_LOGI("RDL - Partial update failed!");
+    mBuilder.LeavePresShell(RootReferenceFrame(), nullptr);
+    mBuilder.ClearReuseableDisplayItems();
+    mList.DeleteAll(&mBuilder);
+    modifiedDL.DeleteAll(&mBuilder);
+    Metrics()->mPartialUpdateFailReason = PartialUpdateFailReason::Content;
+    return PartialUpdateResult::Failed;
+  }
+
+
+  if (!simpleUpdate) {
+    Maybe<const ActiveScrolledRoot*> dummy;
+    if (MergeDisplayLists(&modifiedDL, &mList, &mList, dummy)) {
+      result = PartialUpdateResult::Updated;
+    }
+  } else {
+    MOZ_ASSERT(mList.IsEmpty());
+    mList = std::move(modifiedDL);
+    mBuilder.ClearReuseableDisplayItems();
+    result = PartialUpdateResult::Updated;
+  }
+
+#if 0
+  if (DL_LOG_TEST(LogLevel::Verbose)) {
+    printf_stderr("Painting --- Display list:\n");
+    nsIFrame::PrintDisplayList(&mBuilder, mList);
+  }
+#endif
+
+  mBuilder.LeavePresShell(RootReferenceFrame(), List());
+  return result;
+}
+
+nsRect RetainedDisplayListBuilder::RootOverflowRect() const {
+  const nsIFrame* rootReferenceFrame = RootReferenceFrame();
+  nsRect rootOverflowRect = rootReferenceFrame->InkOverflowRectRelativeToSelf();
+  const nsPresContext* presContext = rootReferenceFrame->PresContext();
+  if (!rootReferenceFrame->GetParent() &&
+      presContext->IsRootContentDocumentCrossProcess() &&
+      presContext->HasDynamicToolbar()) {
+    rootOverflowRect.SizeTo(nsLayoutUtils::ExpandHeightForDynamicToolbar(
+        presContext, rootOverflowRect.Size()));
+  }
+
+  return rootOverflowRect;
+}
+
+}  

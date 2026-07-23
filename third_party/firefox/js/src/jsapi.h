@@ -1,0 +1,566 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef jsapi_h
+#define jsapi_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/Variant.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "jspubtd.h"
+
+#include "js/AllocPolicy.h"
+#include "js/CallAndConstruct.h"  // JS::Call, JS_CallFunction, JS_CallFunctionName, JS_CallFunctionValue
+#include "js/CallArgs.h"
+#include "js/CharacterEncoding.h"
+#include "js/Class.h"
+#include "js/CompileOptions.h"
+#include "js/Context.h"
+#include "js/Debug.h"
+#include "js/ErrorInterceptor.h"
+#include "js/ErrorReport.h"
+#include "js/Exception.h"
+#include "js/GCAPI.h"
+#include "js/GCVector.h"
+#include "js/GlobalObject.h"
+#include "js/HashTable.h"
+#include "js/Id.h"
+#include "js/Interrupt.h"
+#include "js/MapAndSet.h"
+#include "js/MemoryCallbacks.h"
+#include "js/MemoryFunctions.h"
+#include "js/Principals.h"
+#include "js/PropertyAndElement.h"  // JS_Enumerate
+#include "js/PropertyDescriptor.h"
+#include "js/PropertySpec.h"
+#include "js/Realm.h"
+#include "js/RealmIterators.h"
+#include "js/RealmOptions.h"
+#include "js/RefCounted.h"
+#include "js/RootingAPI.h"
+#include "js/ScriptPrivate.h"
+#include "js/Stack.h"
+#include "js/StreamConsumer.h"
+#include "js/String.h"
+#include "js/ExecutionTimers.h"
+#include "js/TracingAPI.h"
+#include "js/Transcoding.h"
+#include "js/UniquePtr.h"
+#include "js/Utility.h"
+#include "js/Value.h"
+#include "js/ValueArray.h"
+#include "js/Vector.h"
+#include "js/WaitCallbacks.h"
+#include "js/WeakMap.h"
+#include "js/WrapperCallbacks.h"
+#include "js/Zone.h"
+
+
+struct JSFunctionSpec;
+struct JSPropertySpec;
+
+namespace JS {
+
+template <typename UnitT>
+class SourceText;
+
+class TwoByteChars;
+
+using ValueVector = JS::GCVector<JS::Value>;
+using IdVector = JS::GCVector<jsid>;
+using ScriptVector = JS::GCVector<JSScript*>;
+using StringVector = JS::GCVector<JSString*>;
+
+} 
+
+
+static MOZ_ALWAYS_INLINE JS::Value JS_NumberValue(double d) {
+  return JS::NumberValue(d);
+}
+
+
+JS_PUBLIC_API bool JS_StringHasBeenPinned(JSContext* cx, JSString* str);
+
+
+extern JS_PUBLIC_API int64_t JS_Now(void);
+
+extern JS_PUBLIC_API bool JS_ValueToObject(JSContext* cx, JS::HandleValue v,
+                                           JS::MutableHandleObject objp);
+
+extern JS_PUBLIC_API JSFunction* JS_ValueToFunction(JSContext* cx,
+                                                    JS::HandleValue v);
+
+extern JS_PUBLIC_API JSFunction* JS_ValueToConstructor(JSContext* cx,
+                                                       JS::HandleValue v);
+
+extern JS_PUBLIC_API JSString* JS_ValueToSource(JSContext* cx,
+                                                JS::Handle<JS::Value> v);
+
+extern JS_PUBLIC_API bool JS_DoubleIsInt32(double d, int32_t* ip);
+
+extern JS_PUBLIC_API JSType JS_TypeOfValue(JSContext* cx,
+                                           JS::Handle<JS::Value> v);
+
+namespace JS {
+
+extern JS_PUBLIC_API const char* InformalValueTypeName(const JS::Value& v);
+
+} 
+
+extern JS_PUBLIC_API bool JS_IsBuiltinEvalFunction(JSFunction* fun);
+
+extern JS_PUBLIC_API bool JS_IsBuiltinFunctionConstructor(JSFunction* fun);
+
+extern JS_PUBLIC_API const char* JS_GetImplementationVersion(void);
+
+extern JS_PUBLIC_API void JS_SetWrapObjectCallbacks(
+    JSContext* cx, const JSWrapObjectCallbacks* callbacks);
+
+extern JS_PUBLIC_API mozilla::Maybe<JSExnType> JS_GetErrorType(
+    const JS::Value& val);
+
+extern JS_PUBLIC_API bool JS_WrapObject(JSContext* cx,
+                                        JS::MutableHandleObject objp);
+
+extern JS_PUBLIC_API bool JS_WrapValue(JSContext* cx,
+                                       JS::MutableHandleValue vp);
+
+extern JS_PUBLIC_API JSObject* JS_TransplantObject(JSContext* cx,
+                                                   JS::HandleObject origobj,
+                                                   JS::HandleObject target);
+
+extern JS_PUBLIC_API bool JS_ResolveStandardClass(JSContext* cx,
+                                                  JS::HandleObject obj,
+                                                  JS::HandleId id,
+                                                  bool* resolved);
+
+extern JS_PUBLIC_API bool JS_MayResolveStandardClass(const JSAtomState& names,
+                                                     jsid id,
+                                                     JSObject* maybeObj);
+
+extern JS_PUBLIC_API bool JS_EnumerateStandardClasses(JSContext* cx,
+                                                      JS::HandleObject obj);
+
+extern JS_PUBLIC_API bool JS_NewEnumerateStandardClasses(
+    JSContext* cx, JS::HandleObject obj, JS::MutableHandleIdVector properties,
+    bool enumerableOnly);
+
+extern JS_PUBLIC_API bool JS_NewEnumerateStandardClassesIncludingResolved(
+    JSContext* cx, JS::HandleObject obj, JS::MutableHandleIdVector properties,
+    bool enumerableOnly);
+
+extern JS_PUBLIC_API bool JS_GetClassObject(JSContext* cx, JSProtoKey key,
+                                            JS::MutableHandle<JSObject*> objp);
+
+extern JS_PUBLIC_API bool JS_GetClassPrototype(
+    JSContext* cx, JSProtoKey key, JS::MutableHandle<JSObject*> objp);
+
+namespace JS {
+
+
+extern JS_PUBLIC_API JSProtoKey IdentifyStandardInstance(JSObject* obj);
+
+extern JS_PUBLIC_API JSProtoKey IdentifyStandardPrototype(JSObject* obj);
+
+extern JS_PUBLIC_API JSProtoKey
+IdentifyStandardInstanceOrPrototype(JSObject* obj);
+
+extern JS_PUBLIC_API JSProtoKey IdentifyStandardConstructor(JSObject* obj);
+
+extern JS_PUBLIC_API void ProtoKeyToId(JSContext* cx, JSProtoKey key,
+                                       JS::MutableHandleId idp);
+
+} 
+
+extern JS_PUBLIC_API JSProtoKey JS_IdToProtoKey(JSContext* cx, JS::HandleId id);
+
+extern JS_PUBLIC_API JSObject* JS_GlobalLexicalEnvironment(JSObject* obj);
+
+extern JS_PUBLIC_API bool JS_HasExtensibleLexicalEnvironment(JSObject* obj);
+
+extern JS_PUBLIC_API JSObject* JS_ExtensibleLexicalEnvironment(JSObject* obj);
+
+extern JS_PUBLIC_API bool JS_InitReflectParse(JSContext* cx,
+                                              JS::HandleObject global);
+
+
+extern JS_PUBLIC_API bool JS_ValueToId(JSContext* cx, JS::HandleValue v,
+                                       JS::MutableHandleId idp);
+
+extern JS_PUBLIC_API bool JS_StringToId(JSContext* cx, JS::HandleString s,
+                                        JS::MutableHandleId idp);
+
+extern JS_PUBLIC_API bool JS_IdToValue(JSContext* cx, jsid id,
+                                       JS::MutableHandle<JS::Value> vp);
+
+namespace JS {
+
+extern JS_PUBLIC_API bool ToPrimitive(JSContext* cx, JS::HandleObject obj,
+                                      JSType hint, JS::MutableHandleValue vp);
+
+extern JS_PUBLIC_API bool GetFirstArgumentAsTypeHint(JSContext* cx,
+                                                     const CallArgs& args,
+                                                     JSType* result);
+
+} 
+
+extern JS_PUBLIC_API JSObject* JS_InitClass(
+    JSContext* cx, JS::HandleObject obj, const JSClass* protoClass,
+    JS::HandleObject protoProto, const char* name, JSNative constructor,
+    unsigned nargs, const JSPropertySpec* ps, const JSFunctionSpec* fs,
+    const JSPropertySpec* static_ps, const JSFunctionSpec* static_fs);
+
+extern JS_PUBLIC_API bool JS_LinkConstructorAndPrototype(
+    JSContext* cx, JS::Handle<JSObject*> ctor, JS::Handle<JSObject*> proto);
+
+extern JS_PUBLIC_API bool JS_InstanceOf(JSContext* cx,
+                                        JS::Handle<JSObject*> obj,
+                                        const JSClass* clasp,
+                                        JS::CallArgs* args);
+
+extern JS_PUBLIC_API bool JS_HasInstance(JSContext* cx,
+                                         JS::Handle<JSObject*> obj,
+                                         JS::Handle<JS::Value> v, bool* bp);
+
+namespace JS {
+
+extern JS_PUBLIC_API bool OrdinaryHasInstance(JSContext* cx,
+                                              HandleObject objArg,
+                                              HandleValue v, bool* bp);
+
+}  
+
+extern JS_PUBLIC_API JSObject* JS_GetConstructor(JSContext* cx,
+                                                 JS::Handle<JSObject*> proto);
+
+extern JS_PUBLIC_API JSObject* JS_NewObject(JSContext* cx,
+                                            const JSClass* clasp);
+
+extern JS_PUBLIC_API bool JS_IsNative(JSObject* obj);
+
+extern JS_PUBLIC_API JSObject* JS_NewObjectWithGivenProto(
+    JSContext* cx, const JSClass* clasp, JS::Handle<JSObject*> proto);
+
+extern JS_PUBLIC_API JSObject* JS_NewPlainObject(JSContext* cx);
+
+extern JS_PUBLIC_API bool JS_DeepFreezeObject(JSContext* cx,
+                                              JS::Handle<JSObject*> obj);
+
+extern JS_PUBLIC_API bool JS_FreezeObject(JSContext* cx,
+                                          JS::Handle<JSObject*> obj);
+
+
+extern JS_PUBLIC_API bool JS_GetPrototype(JSContext* cx, JS::HandleObject obj,
+                                          JS::MutableHandleObject result);
+
+extern JS_PUBLIC_API bool JS_GetPrototypeIfOrdinary(
+    JSContext* cx, JS::HandleObject obj, bool* isOrdinary,
+    JS::MutableHandleObject result);
+
+extern JS_PUBLIC_API bool JS_SetPrototype(JSContext* cx, JS::HandleObject obj,
+                                          JS::HandleObject proto);
+
+extern JS_PUBLIC_API bool JS_IsExtensible(JSContext* cx, JS::HandleObject obj,
+                                          bool* extensible);
+
+extern JS_PUBLIC_API bool JS_PreventExtensions(JSContext* cx,
+                                               JS::HandleObject obj,
+                                               JS::ObjectOpResult& result);
+
+extern JS_PUBLIC_API bool JS_SetImmutablePrototype(JSContext* cx,
+                                                   JS::HandleObject obj,
+                                                   bool* succeeded);
+
+extern JS_PUBLIC_API bool JS_AssignObject(JSContext* cx,
+                                          JS::HandleObject target,
+                                          JS::HandleObject src);
+
+namespace JS {
+
+extern JS_PUBLIC_API bool IsMapObject(JSContext* cx, JS::HandleObject obj,
+                                      bool* isMap);
+
+extern JS_PUBLIC_API bool IsSetObject(JSContext* cx, JS::HandleObject obj,
+                                      bool* isSet);
+
+} 
+
+JS_PUBLIC_API void JS_SetAllNonReservedSlotsToUndefined(JS::HandleObject obj);
+
+extern JS_PUBLIC_API void JS_SetReservedSlot(JSObject* obj, uint32_t index,
+                                             const JS::Value& v);
+
+extern JS_PUBLIC_API void JS_InitReservedSlot(JSObject* obj, uint32_t index,
+                                              void* ptr, size_t nbytes,
+                                              JS::MemoryUse use);
+
+template <typename T>
+void JS_InitReservedSlot(JSObject* obj, uint32_t index, T* ptr,
+                         JS::MemoryUse use) {
+  JS_InitReservedSlot(obj, index, ptr, sizeof(T), use);
+}
+
+
+static constexpr unsigned JSFUN_CONSTRUCTOR = 0x400;
+
+static constexpr unsigned JSFUN_FLAGS_MASK = 0x400;
+
+static_assert((JSPROP_FLAGS_MASK & JSFUN_FLAGS_MASK) == 0,
+              "JSFUN_* flags do not overlap JSPROP_* flags, because bits from "
+              "the two flag-sets appear in the same flag in some APIs");
+
+extern JS_PUBLIC_API JSFunction* JS_NewFunction(JSContext* cx, JSNative call,
+                                                unsigned nargs, unsigned flags,
+                                                const char* name);
+
+namespace JS {
+
+extern JS_PUBLIC_API JSFunction* GetSelfHostedFunction(
+    JSContext* cx, const char* selfHostedName, HandleId id, unsigned nargs);
+
+extern JS_PUBLIC_API JSFunction* NewFunctionFromSpec(JSContext* cx,
+                                                     const JSFunctionSpec* fs,
+                                                     HandleId id);
+
+extern JS_PUBLIC_API JSFunction* NewFunctionFromSpec(JSContext* cx,
+                                                     const JSFunctionSpec* fs);
+
+} 
+
+extern JS_PUBLIC_API JSObject* JS_GetFunctionObject(JSFunction* fun);
+
+extern JS_PUBLIC_API bool JS_GetFunctionId(JSContext* cx,
+                                           JS::Handle<JSFunction*> fun,
+                                           JS::MutableHandle<JSString*> name);
+
+extern JS_PUBLIC_API JSString* JS_GetMaybePartialFunctionId(JSFunction* fun);
+
+extern JS_PUBLIC_API bool JS_GetFunctionDisplayId(
+    JSContext* cx, JS::Handle<JSFunction*> fun,
+    JS::MutableHandle<JSString*> name);
+
+extern JS_PUBLIC_API JSString* JS_GetMaybePartialFunctionDisplayId(JSFunction*);
+
+extern JS_PUBLIC_API uint16_t JS_GetFunctionArity(JSFunction* fun);
+
+JS_PUBLIC_API bool JS_GetFunctionLength(JSContext* cx, JS::HandleFunction fun,
+                                        uint16_t* length);
+
+extern JS_PUBLIC_API bool JS_ObjectIsFunction(JSObject* obj);
+
+extern JS_PUBLIC_API bool JS_IsNativeFunction(JSObject* funobj, JSNative call);
+
+extern JS_PUBLIC_API bool JS_IsConstructor(JSFunction* fun);
+
+extern JS_PUBLIC_API bool JS_ObjectIsBoundFunction(JSObject* obj);
+
+extern JS_PUBLIC_API JSObject* JS_GetBoundFunctionTarget(JSObject* obj);
+
+extern JS_PUBLIC_API JSObject* JS_GetGlobalFromScript(JSScript* script);
+
+extern JS_PUBLIC_API const char* JS_GetScriptFilename(JSScript* script);
+
+extern JS_PUBLIC_API unsigned JS_GetScriptBaseLineNumber(JSContext* cx,
+                                                         JSScript* script);
+
+extern JS_PUBLIC_API JSScript* JS_GetFunctionScript(JSContext* cx,
+                                                    JS::HandleFunction fun);
+
+extern JS_PUBLIC_API JSString* JS_DecompileScript(JSContext* cx,
+                                                  JS::Handle<JSScript*> script);
+
+extern JS_PUBLIC_API JSString* JS_DecompileFunction(
+    JSContext* cx, JS::Handle<JSFunction*> fun);
+
+namespace JS {
+
+class MOZ_STACK_CLASS JS_PUBLIC_API AutoSetAsyncStackForNewCalls {
+  JSContext* cx;
+  RootedObject oldAsyncStack;
+  const char* oldAsyncCause;
+  bool oldAsyncCallIsExplicit;
+
+ public:
+  enum class AsyncCallKind {
+    IMPLICIT,
+    EXPLICIT
+  };
+
+  AutoSetAsyncStackForNewCalls(JSContext* cx, JSObject* stack,
+                               const char* asyncCause,
+                               AsyncCallKind kind = AsyncCallKind::IMPLICIT);
+  ~AutoSetAsyncStackForNewCalls();
+};
+
+}  
+
+
+namespace JS {
+
+JS_PUBLIC_API bool PropertySpecNameEqualsId(JSPropertySpec::Name name,
+                                            HandleId id);
+
+JS_PUBLIC_API bool PropertySpecNameToPermanentId(JSContext* cx,
+                                                 JSPropertySpec::Name name,
+                                                 jsid* idp);
+
+} 
+
+
+
+extern JS_PUBLIC_API void JS_AbortIfWrongThread(JSContext* cx);
+
+
+extern JS_PUBLIC_API JSObject* JS_NewObjectForConstructor(
+    JSContext* cx, const JSClass* clasp, const JS::CallArgs& args);
+
+
+extern JS_PUBLIC_API void JS_SetOffthreadBaselineCompilationEnabled(
+    JSContext* cx, bool enabled);
+extern JS_PUBLIC_API void JS_SetOffthreadIonCompilationEnabled(JSContext* cx,
+                                                               bool enabled);
+
+// clang-format off
+#define JIT_COMPILER_OPTIONS(Register) \
+  Register(BASELINE_INTERPRETER_WARMUP_TRIGGER, "blinterp.warmup.trigger") \
+  Register(BASELINE_WARMUP_TRIGGER, "baseline.warmup.trigger") \
+  Register(IC_FORCE_MEGAMORPHIC, "ic.force-megamorphic") \
+  Register(ION_NORMAL_WARMUP_TRIGGER, "ion.warmup.trigger") \
+  Register(ION_GVN_ENABLE, "ion.gvn.enable") \
+  Register(ION_FORCE_IC, "ion.forceinlineCaches") \
+  Register(ION_ENABLE, "ion.enable") \
+  Register(JIT_TRUSTEDPRINCIPALS_ENABLE, "jit_trustedprincipals.enable") \
+  Register(ION_CHECK_RANGE_ANALYSIS, "ion.check-range-analysis") \
+  Register(ION_FREQUENT_BAILOUT_THRESHOLD, "ion.frequent-bailout-threshold") \
+  Register(BASE_REG_FOR_LOCALS, "base-reg-for-locals") \
+  Register(INLINING_BYTECODE_MAX_LENGTH, "inlining.bytecode-max-length") \
+  Register(BASELINE_INTERPRETER_ENABLE, "blinterp.enable") \
+  Register(BASELINE_ENABLE, "baseline.enable") \
+  Register(PORTABLE_BASELINE_ENABLE, "pbl.enable") \
+  Register(PORTABLE_BASELINE_WARMUP_THRESHOLD, "pbl.warmup.threshold") \
+  Register(OFFTHREAD_COMPILATION_ENABLE, "offthread-compilation.enable")  \
+  Register(FULL_DEBUG_CHECKS, "jit.full-debug-checks") \
+  Register(JUMP_THRESHOLD, "jump-threshold") \
+  Register(NATIVE_REGEXP_ENABLE, "native_regexp.enable") \
+  Register(JIT_HINTS_ENABLE, "jitHints.enable") \
+  Register(SIMULATOR_ALWAYS_INTERRUPT, "simulator.always-interrupt")      \
+  Register(SPECTRE_INDEX_MASKING, "spectre.index-masking") \
+  Register(SPECTRE_OBJECT_MITIGATIONS, "spectre.object-mitigations") \
+  Register(SPECTRE_STRING_MITIGATIONS, "spectre.string-mitigations") \
+  Register(SPECTRE_VALUE_MASKING, "spectre.value-masking") \
+  Register(SPECTRE_JIT_TO_CXX_CALLS, "spectre.jit-to-cxx-calls") \
+  Register(WRITE_PROTECT_CODE, "write-protect-code") \
+  Register(WASM_FOLD_OFFSETS, "wasm.fold-offsets") \
+  Register(WASM_DELAY_TIER2, "wasm.delay-tier2") \
+  Register(WASM_JIT_BASELINE, "wasm.baseline") \
+  Register(WASM_JIT_OPTIMIZING, "wasm.optimizing") \
+  Register(REGEXP_DUPLICATE_NAMED_GROUPS, "regexp.duplicate-named-groups") \
+  Register(REGEXP_MODIFIERS, "regexp.modifiers")  // clang-format on
+
+typedef enum JSJitCompilerOption {
+#define JIT_COMPILER_DECLARE(key, str) JSJITCOMPILER_##key,
+
+  JIT_COMPILER_OPTIONS(JIT_COMPILER_DECLARE)
+#undef JIT_COMPILER_DECLARE
+
+      JSJITCOMPILER_NOT_AN_OPTION
+} JSJitCompilerOption;
+
+extern JS_PUBLIC_API void JS_SetGlobalJitCompilerOption(JSContext* cx,
+                                                        JSJitCompilerOption opt,
+                                                        uint32_t value);
+extern JS_PUBLIC_API bool JS_GetGlobalJitCompilerOption(JSContext* cx,
+                                                        JSJitCompilerOption opt,
+                                                        uint32_t* valueOut);
+
+namespace JS {
+
+extern JS_PUBLIC_API void DisableSpectreMitigationsAfterInit();
+
+};  
+
+extern JS_PUBLIC_API bool JS_IndexToId(JSContext* cx, uint32_t index,
+                                       JS::MutableHandleId);
+
+extern JS_PUBLIC_API bool JS_CharsToId(JSContext* cx, JS::TwoByteChars chars,
+                                       JS::MutableHandleId);
+
+extern JS_PUBLIC_API bool JS_IsIdentifier(JSContext* cx, JS::HandleString str,
+                                          bool* isIdentifier);
+
+extern JS_PUBLIC_API bool JS_IsIdentifier(const char16_t* chars, size_t length);
+
+namespace js {
+class ScriptSource;
+}  
+
+namespace JS {
+
+class MOZ_RAII JS_PUBLIC_API AutoFilename {
+ private:
+  js::ScriptSource* ss_;
+  mozilla::Variant<const char*, UniqueChars> filename_;
+
+ public:
+  AutoFilename()
+      : ss_(nullptr), filename_(mozilla::AsVariant<const char*>(nullptr)) {}
+
+  ~AutoFilename() { reset(); }
+
+  AutoFilename(const AutoFilename&) = delete;
+  AutoFilename& operator=(const AutoFilename&) = delete;
+
+  void reset();
+
+  void setOwned(UniqueChars&& filename);
+  void setUnowned(const char* filename);
+  void setScriptSource(js::ScriptSource* ss);
+
+  const char* get() const;
+};
+
+extern JS_PUBLIC_API bool DescribeScriptedCaller(
+    AutoFilename* filename, JSContext* cx, uint32_t* lineno = nullptr,
+    JS::ColumnNumberOneOrigin* column = nullptr);
+
+extern JS_PUBLIC_API JSObject* GetScriptedCallerGlobal(JSContext* cx);
+
+extern JS_PUBLIC_API void HideScriptedCaller(JSContext* cx);
+
+extern JS_PUBLIC_API void UnhideScriptedCaller(JSContext* cx);
+
+class MOZ_RAII AutoHideScriptedCaller {
+ public:
+  explicit AutoHideScriptedCaller(JSContext* cx) : mContext(cx) {
+    HideScriptedCaller(mContext);
+  }
+  ~AutoHideScriptedCaller() { UnhideScriptedCaller(mContext); }
+
+ protected:
+  JSContext* mContext;
+};
+
+[[nodiscard]] extern JS_PUBLIC_API bool DisableWasmHugeMemory();
+
+extern JS_PUBLIC_API bool IsMaybeWrappedSavedFrame(JSObject* obj);
+
+extern JS_PUBLIC_API bool IsUnwrappedSavedFrame(JSObject* obj);
+
+} 
+
+namespace js {
+
+extern JS_PUBLIC_API void NoteIntentionalCrash();
+
+} 
+
+#ifdef DEBUG
+#endif /* DEBUG */
+
+#endif /* jsapi_h */

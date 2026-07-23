@@ -1,0 +1,61 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_SYNCHRONOUSTASK_H
+#define MOZILLA_GFX_SYNCHRONOUSTASK_H
+
+#include "mozilla/ReentrantMonitor.h"  // for ReentrantMonitor, etc
+
+namespace mozilla {
+namespace layers {
+
+class MOZ_STACK_CLASS SynchronousTask {
+  friend class AutoCompleteTask;
+
+ public:
+  explicit SynchronousTask(const char* name) : mMonitor(name), mDone(false) {}
+
+  nsresult Wait(PRIntervalTime aInterval = PR_INTERVAL_NO_TIMEOUT) {
+    ReentrantMonitorAutoEnter lock(mMonitor);
+
+    while (aInterval == PR_INTERVAL_NO_TIMEOUT && !mDone) {
+      mMonitor.Wait();
+    }
+
+    if (!mDone) {
+      mMonitor.Wait(aInterval);
+
+      if (!mDone) {
+        return NS_ERROR_ABORT;
+      }
+    }
+
+    return NS_OK;
+  }
+
+ private:
+  void Complete() {
+    ReentrantMonitorAutoEnter lock(mMonitor);
+    mDone = true;
+    mMonitor.NotifyAll();
+  }
+
+ private:
+  ReentrantMonitor mMonitor MOZ_UNANNOTATED;
+  bool mDone;
+};
+
+class MOZ_STACK_CLASS AutoCompleteTask final {
+ public:
+  explicit AutoCompleteTask(SynchronousTask* aTask) : mTask(aTask) {}
+  ~AutoCompleteTask() { mTask->Complete(); }
+
+ private:
+  SynchronousTask* mTask;
+};
+
+}  
+}  
+
+#endif

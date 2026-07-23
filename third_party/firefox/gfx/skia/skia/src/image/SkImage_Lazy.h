@@ -1,0 +1,111 @@
+/*
+ * Copyright 2018 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkImage_Lazy_DEFINED)
+#define SkImage_Lazy_DEFINED
+
+#include "include/core/SkColorSpace.h"
+#include "include/core/SkImage.h"
+#include "include/core/SkImageGenerator.h"
+#include "include/core/SkImageInfo.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkTypes.h"
+#include "include/core/SkYUVAPixmaps.h"
+#include "include/private/SkIDChangeListener.h"
+#include "include/private/base/SkMutex.h"
+#include "src/image/SkImage_Base.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
+class GrDirectContext;
+class SharedGenerator;
+class SkBitmap;
+class SkCachedData;
+class SkData;
+class SkPixmap;
+class SkRecorder;
+class SkSurface;
+enum SkColorType : int;
+struct SkIRect;
+
+class SkImage_Lazy : public SkImage_Base {
+public:
+    struct Validator {
+        Validator(sk_sp<SharedGenerator>, const SkColorType*, sk_sp<SkColorSpace>);
+
+        explicit operator bool() const { return fSharedGenerator.get(); }
+
+        sk_sp<SharedGenerator> fSharedGenerator;
+        SkImageInfo            fInfo;
+        sk_sp<SkColorSpace>    fColorSpace;
+        uint32_t               fUniqueID;
+    };
+
+    explicit SkImage_Lazy(Validator* validator);
+
+    bool isValid(SkRecorder*) const override;
+    sk_sp<SkImage> makeColorTypeAndColorSpace(SkRecorder*,
+                                              SkColorType targetColorType,
+                                              sk_sp<SkColorSpace> targetColorSpace,
+                                              RequiredProperties) const override;
+
+    bool onHasMipmaps() const override {
+        return false;
+    }
+    bool onIsProtected() const override;
+
+    bool onReadPixels(GrDirectContext*, const SkImageInfo&, void*, size_t, int srcX, int srcY,
+                      CachingHint) const override;
+    sk_sp<const SkData> onRefEncoded() const override;
+
+    sk_sp<SkImage> onMakeSubset(SkRecorder*, const SkIRect&, RequiredProperties) const override;
+
+    sk_sp<SkSurface> onMakeSurface(SkRecorder*, const SkImageInfo&) const override;
+
+    bool getROPixels(GrDirectContext*, SkBitmap*, CachingHint) const override;
+    SkImage_Base::Type type() const override { return SkImage_Base::Type::kLazy; }
+
+    sk_sp<SkImage> onReinterpretColorSpace(sk_sp<SkColorSpace>) const final;
+
+    void addUniqueIDListener(sk_sp<SkIDChangeListener>) const;
+    sk_sp<SkCachedData> getPlanes(const SkYUVAPixmapInfo::SupportedDataTypes& supportedDataTypes,
+                                  SkYUVAPixmaps* pixmaps) const;
+
+    sk_sp<SharedGenerator> generator() const;
+
+protected:
+    virtual bool readPixelsProxy(GrDirectContext*, const SkPixmap&) const { return false; }
+
+private:
+
+    class ScopedGenerator;
+
+    sk_sp<SharedGenerator> fSharedGenerator;
+
+    mutable SkMutex        fOnMakeColorTypeAndSpaceMutex;
+    mutable sk_sp<SkImage> fOnMakeColorTypeAndSpaceResult;
+    mutable SkIDChangeListener::List fUniqueIDListeners;
+};
+
+class SharedGenerator final : public SkNVRefCnt<SharedGenerator> {
+public:
+    static sk_sp<SharedGenerator> Make(std::unique_ptr<SkImageGenerator> gen);
+
+    const SkImageInfo& getInfo() const;
+
+    bool isTextureGenerator();
+
+    std::unique_ptr<SkImageGenerator> fGenerator;
+    SkMutex                           fMutex;
+
+private:
+    explicit SharedGenerator(std::unique_ptr<SkImageGenerator> gen);
+};
+
+#endif

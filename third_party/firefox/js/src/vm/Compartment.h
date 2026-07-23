@@ -1,0 +1,445 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_Compartment_h
+#define vm_Compartment_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+
+#include <stddef.h>
+#include <utility>
+
+#include "gc/NurseryAwareHashMap.h"
+#include "gc/ZoneAllocator.h"
+#include "js/friend/Wrapper.h"
+#include "vm/Iteration.h"
+#include "vm/JSObject.h"
+#include "vm/JSScript.h"
+
+namespace js {
+
+JSString* CopyStringPure(JSContext* cx, JSString* str);
+
+class ObjectWrapperMap {
+  static const size_t InitialInnerMapSize = 4;
+
+  using InnerMap = NurseryAwareHashMap<JSObject*, JSObject*, ZoneAllocPolicy>;
+  using OuterMap = GCHashMap<JS::Compartment*, InnerMap,
+                             DefaultHasher<JS::Compartment*>, ZoneAllocPolicy>;
+
+  OuterMap map;
+  Zone* zone;
+
+ public:
+  class ModIterator {
+    void goToNext() {
+      if (outer.isNothing()) {
+        return;
+      }
+      for (; !outer->done(); outer->next()) {
+        JS::Compartment* c = outer->get().key();
+        MOZ_ASSERT(c);
+        if (filter && !filter->match(c)) {
+          continue;
+        }
+        InnerMap& m = outer->get().value();
+        if (!m.empty()) {
+          if (inner.isSome()) {
+            inner.reset();
+          }
+          inner.emplace(m.modIter());
+          outer->next();
+          return;
+        }
+      }
+      inner.reset();
+    }
+
+    mozilla::Maybe<OuterMap::Iterator> outer;
+    mozilla::Maybe<InnerMap::ModIterator> inner;
+    const CompartmentFilter* filter;
+
+   public:
+    explicit ModIterator(ObjectWrapperMap& m) : filter(nullptr) {
+      outer.emplace(m.map.iter());
+      goToNext();
+    }
+
+    ModIterator(ObjectWrapperMap& m, const CompartmentFilter& f) : filter(&f) {
+      outer.emplace(m.map.iter());
+      goToNext();
+    }
+
+    ModIterator(ObjectWrapperMap& m, JS::Compartment* target) {
+      auto p = m.map.lookup(target);
+      if (p) {
+        inner.emplace(p->value().modIter());
+      }
+    }
+
+    ModIterator(const ModIterator&) = delete;
+    void operator=(const ModIterator&) = delete;
+
+    bool done() const {
+      return (outer.isNothing() || outer->done()) &&
+             (inner.isNothing() || inner->done());
+    }
+
+    InnerMap::Entry& get() const {
+      MOZ_ASSERT(inner.isSome() && !inner->done());
+      return inner->get();
+    }
+
+    void next() {
+      MOZ_ASSERT(!done());
+      inner->next();
+      if (!inner->done()) {
+        return;
+      }
+      goToNext();
+    }
+
+    void remove() {
+      MOZ_ASSERT(inner.isSome() && !inner->done());
+      inner->remove();
+    }
+  };
+
+  class Ptr : public InnerMap::Ptr {
+    friend class ObjectWrapperMap;
+
+    InnerMap* map;
+
+    Ptr() : map(nullptr) {}
+    Ptr(const InnerMap::Ptr& p, InnerMap& m) : InnerMap::Ptr(p), map(&m) {}
+  };
+
+  class WrappedCompartmentIterator {
+    OuterMap::Iterator iter;
+
+    void settle() {
+      while (!iter.done() && iter.get().value().empty()) {
+        iter.next();
+      }
+    }
+
+   public:
+    explicit WrappedCompartmentIterator(const ObjectWrapperMap& map)
+        : iter(map.map.iter()) {
+      settle();
+    }
+    bool done() const { return iter.done(); }
+    JS::Compartment* get() const { return iter.get().key(); }
+    void next() {
+      iter.next();
+      settle();
+    }
+    operator JS::Compartment*() const { return get(); }
+    JS::Compartment* operator->() const { return get(); }
+    JS::Compartment& operator*() const { return *get(); }
+  };
+
+  explicit ObjectWrapperMap(Zone* zone) : map(zone), zone(zone) {}
+  ObjectWrapperMap(Zone* zone, size_t aLen) : map(zone, aLen), zone(zone) {}
+
+  bool empty() {
+    if (map.empty()) {
+      return true;
+    }
+    for (auto iter = map.iter(); !iter.done(); iter.next()) {
+      if (!iter.get().value().empty()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  Ptr lookup(JSObject* obj) const {
+    auto op = map.lookup(obj->compartment());
+    if (op) {
+      auto ip = op->value().lookup(obj);
+      if (ip) {
+        return Ptr(ip, op->value());
+      }
+    }
+    return Ptr();
+  }
+
+  void remove(Ptr p) {
+    if (p) {
+      p.map->remove(p);
+    }
+  }
+
+  [[nodiscard]] bool put(JSObject* key, JSObject* value) {
+    JS::Compartment* comp = key->compartment();
+    auto ptr = map.lookupForAdd(comp);
+    if (!ptr) {
+      InnerMap m(zone, InitialInnerMapSize);
+      if (!map.add(ptr, comp, std::move(m))) {
+        return false;
+      }
+    }
+    return ptr->value().put(key, value);
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) {
+    size_t size = map.shallowSizeOfExcludingThis(mallocSizeOf);
+    for (auto iter = map.iter(); !iter.done(); iter.next()) {
+      size += iter.get().value().sizeOfExcludingThis(mallocSizeOf);
+    }
+    return size;
+  }
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) {
+    return mallocSizeOf(this) + sizeOfExcludingThis(mallocSizeOf);
+  }
+
+  bool hasNurseryAllocatedWrapperEntries(const CompartmentFilter& f) {
+    for (auto iter = map.iter(); !iter.done(); iter.next()) {
+      JS::Compartment* c = iter.get().key();
+      if (c && !f.match(c)) {
+        continue;
+      }
+      InnerMap& m = iter.get().value();
+      if (m.hasNurseryEntries()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void sweepAfterMinorGC(JSTracer* trc) {
+    for (auto iter = map.modIter(); !iter.done(); iter.next()) {
+      InnerMap& m = iter.get().value();
+      m.sweepAfterMinorGC(trc);
+      if (m.empty()) {
+        iter.remove();
+      }
+    }
+  }
+
+  void traceWeak(JSTracer* trc) {
+    for (auto iter = map.modIter(); !iter.done(); iter.next()) {
+      InnerMap& m = iter.get().value();
+      m.traceWeak(trc);
+      if (m.empty()) {
+        iter.remove();
+      }
+    }
+    map.compact();
+  }
+};
+
+using StringWrapperMap =
+    NurseryAwareHashMap<JSString*, JSString*, ZoneAllocPolicy,
+                        DuplicatesPossible>;
+
+}  
+
+class JS::Compartment {
+  JS::Zone* zone_;
+  JSRuntime* runtime_;
+  bool invisibleToDebugger_;
+
+  js::ObjectWrapperMap crossCompartmentObjectWrappers;
+
+  using RealmVector = js::Vector<JS::Realm*, 1, js::ZoneAllocPolicy>;
+  RealmVector realms_;
+
+ public:
+  JSObject* gcIncomingGrayPointers = nullptr;
+
+  void* data = nullptr;
+
+  struct {
+    bool scheduledForDestruction = false;
+    bool hasMarkedCells = false;
+    bool maybeAlive = true;
+
+    bool hasEnteredRealm = false;
+  } gcState;
+
+  bool nukedOutgoingWrappers = false;
+
+  JS::Zone* zone() { return zone_; }
+  const JS::Zone* zone() const { return zone_; }
+
+  JSRuntime* runtimeFromMainThread() const {
+    MOZ_ASSERT(js::CurrentThreadCanAccessRuntime(runtime_));
+    return runtime_;
+  }
+
+  JSRuntime* runtimeFromAnyThread() const { return runtime_; }
+
+  bool invisibleToDebugger() const { return invisibleToDebugger_; }
+
+  RealmVector& realms() { return realms_; }
+
+  js::GlobalObject& firstGlobal() const;
+  js::GlobalObject& globalForNewCCW() const { return firstGlobal(); }
+
+  void assertNoCrossCompartmentWrappers() {
+    MOZ_ASSERT(crossCompartmentObjectWrappers.empty());
+  }
+
+  void addSizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf,
+                              size_t* compartmentObjects,
+                              size_t* crossCompartmentWrappersTables,
+                              size_t* compartmentsPrivateData);
+
+#ifdef JSGC_HASH_TABLE_CHECKS
+  void checkObjectWrappersAfterMovingGC();
+#endif
+
+ private:
+  bool getNonWrapperObjectForCurrentCompartment(JSContext* cx,
+                                                js::HandleObject origObj,
+                                                js::MutableHandleObject obj);
+  bool getOrCreateWrapper(JSContext* cx, js::HandleObject existing,
+                          js::MutableHandleObject obj);
+
+ public:
+  explicit Compartment(JS::Zone* zone, bool invisibleToDebugger);
+
+  void destroy(JS::GCContext* gcx);
+
+  [[nodiscard]] inline bool wrap(JSContext* cx, JS::MutableHandleValue vp);
+
+  [[nodiscard]] inline bool wrap(JSContext* cx,
+                                 MutableHandle<mozilla::Maybe<Value>> vp);
+
+  [[nodiscard]] bool wrap(JSContext* cx, js::MutableHandleString strp);
+  [[nodiscard]] bool wrap(JSContext* cx, js::MutableHandle<JS::BigInt*> bi);
+  [[nodiscard]] bool wrap(JSContext* cx, JS::MutableHandleObject obj);
+  [[nodiscard]] bool wrap(JSContext* cx,
+                          JS::MutableHandle<JS::PropertyDescriptor> desc);
+  [[nodiscard]] bool wrap(
+      JSContext* cx,
+      JS::MutableHandle<mozilla::Maybe<JS::PropertyDescriptor>> desc);
+  [[nodiscard]] bool wrap(JSContext* cx,
+                          JS::MutableHandle<JS::GCVector<JS::Value>> vec);
+  [[nodiscard]] bool rewrap(JSContext* cx, JS::MutableHandleObject obj,
+                            JS::HandleObject existing);
+
+  [[nodiscard]] bool putWrapper(JSContext* cx, JSObject* wrapped,
+                                JSObject* wrapper);
+
+  [[nodiscard]] bool putWrapper(JSContext* cx, JSString* wrapped,
+                                JSString* wrapper);
+
+  js::ObjectWrapperMap::Ptr lookupWrapper(JSObject* obj) const {
+    return crossCompartmentObjectWrappers.lookup(obj);
+  }
+
+  inline js::StringWrapperMap::Ptr lookupWrapper(JSString* str) const;
+
+  void removeWrapper(js::ObjectWrapperMap::Ptr p);
+
+  bool hasNurseryAllocatedObjectWrapperEntries(const js::CompartmentFilter& f) {
+    return crossCompartmentObjectWrappers.hasNurseryAllocatedWrapperEntries(f);
+  }
+
+  using ObjectWrapperIter = js::ObjectWrapperMap::ModIterator;
+  ObjectWrapperIter objectWrapperMappings() {
+    return ObjectWrapperIter(crossCompartmentObjectWrappers);
+  }
+  ObjectWrapperIter objectWrapperMappings(const js::CompartmentFilter& f) {
+    return ObjectWrapperIter(crossCompartmentObjectWrappers, f);
+  }
+  ObjectWrapperIter objectWrapperMappingsTo(Compartment* target) {
+    return ObjectWrapperIter(crossCompartmentObjectWrappers, target);
+  }
+
+  using WrappedObjectCompartmentIterator =
+      js::ObjectWrapperMap::WrappedCompartmentIterator;
+  WrappedObjectCompartmentIterator wrappedObjectCompartments() const {
+    return WrappedObjectCompartmentIterator(crossCompartmentObjectWrappers);
+  }
+
+  enum EdgeSelector { AllEdges, NonGrayEdges, GrayEdges, BlackEdges };
+  void traceWrapperTargetsInCollectedZones(JSTracer* trc,
+                                           EdgeSelector whichEdges);
+  static void traceIncomingCrossCompartmentEdgesForZoneGC(
+      JSTracer* trc, EdgeSelector whichEdges);
+
+  void sweepRealms(JS::GCContext* gcx, bool keepAtleastOne,
+                   bool destroyingRuntime);
+  void sweepAfterMinorGC(JSTracer* trc);
+  void traceCrossCompartmentObjectWrapperEdges(JSTracer* trc);
+
+  void fixupCrossCompartmentObjectWrappersAfterMovingGC(JSTracer* trc);
+  void fixupAfterMovingGC(JSTracer* trc);
+
+  [[nodiscard]] bool findSweepGroupEdges();
+
+ private:
+  js::NativeIteratorListHead enumerators_;
+
+ public:
+  js::NativeIteratorListHead* enumeratorsAddr() { return &enumerators_; }
+  MOZ_ALWAYS_INLINE bool objectMaybeInIteration(JSObject* obj);
+
+  void traceWeakNativeIterators(JSTracer* trc);
+};
+
+namespace js {
+
+template <typename T>
+inline void SetCompartmentHasMarkedCells(T* thing) {}
+
+template <>
+inline void SetCompartmentHasMarkedCells(JSObject* thing) {
+  thing->compartment()->gcState.hasMarkedCells = true;
+}
+
+template <>
+inline void SetCompartmentHasMarkedCells(JSScript* thing) {
+  thing->compartment()->gcState.hasMarkedCells = true;
+}
+
+
+struct WrapperValue {
+  explicit WrapperValue(const ObjectWrapperMap::Ptr& ptr)
+      : value(ptr->value().unbarrieredGet()) {}
+
+  explicit WrapperValue(const ObjectWrapperMap::ModIterator& e)
+      : value(e.get().value().unbarrieredGet()) {}
+
+  JSObject*& get() { return value; }
+  JSObject* get() const { return value; }
+  operator JSObject*() const { return value; }
+
+ private:
+  JSObject* value;
+};
+
+class MOZ_RAII AutoWrapperVector : public JS::GCVector<WrapperValue, 8>,
+                                   public JS::AutoGCRooter {
+ public:
+  explicit AutoWrapperVector(JSContext* cx)
+      : JS::GCVector<WrapperValue, 8>(cx),
+        JS::AutoGCRooter(cx, JS::AutoGCRooter::Kind::WrapperVector) {}
+
+  void trace(JSTracer* trc);
+
+ private:
+};
+
+class MOZ_RAII AutoWrapperRooter : public JS::AutoGCRooter {
+ public:
+  AutoWrapperRooter(JSContext* cx, const WrapperValue& v)
+      : JS::AutoGCRooter(cx, JS::AutoGCRooter::Kind::Wrapper), value(v) {}
+
+  operator JSObject*() const { return value; }
+
+  void trace(JSTracer* trc);
+
+ private:
+  WrapperValue value;
+};
+
+} 
+
+#endif /* vm_Compartment_h */

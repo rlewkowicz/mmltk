@@ -1,0 +1,1569 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DataTransfer.h"
+
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/BasicEvents.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/ClipboardReadRequestChild.h"
+#include "mozilla/Span.h"
+#include "mozilla/SpinEventLoopUntil.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/AutoSuppressEventHandlingAndSuspend.h"
+#include "mozilla/dom/BindingUtils.h"
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/dom/DOMStringList.h"
+#include "mozilla/dom/DataTransferBinding.h"
+#include "mozilla/dom/DataTransferItemList.h"
+#include "mozilla/dom/Directory.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/FileList.h"
+#include "mozilla/dom/IPCBlobUtils.h"
+#include "mozilla/dom/OSFileSystem.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/WindowContext.h"
+#include "nsArray.h"
+#include "nsBaseClipboard.h"
+#include "nsCRT.h"
+#include "nsComponentManagerUtils.h"
+#include "nsContentUtils.h"
+#include "nsError.h"
+#include "nsIClipboard.h"
+#include "nsIContent.h"
+#include "nsIDragService.h"
+#include "nsIObjectInputStream.h"
+#include "nsIObjectOutputStream.h"
+#include "nsIScriptContext.h"
+#include "nsIScriptGlobalObject.h"
+#include "nsIScriptObjectPrincipal.h"
+#include "nsIScriptSecurityManager.h"
+#include "nsIStorageStream.h"
+#include "nsISupportsPrimitives.h"
+#include "nsIXPConnect.h"
+#include "nsNetUtil.h"
+#include "nsPIDOMWindowInlines.h"
+#include "nsPresContext.h"
+#include "nsQueryObject.h"
+#include "nsReadableUtils.h"
+#include "nsStringStream.h"
+#include "nsVariant.h"
+
+namespace mozilla::dom {
+
+static constexpr nsLiteralCString kNonPlainTextExternalFormats[] = {
+    nsLiteralCString(kCustomTypesMime), nsLiteralCString(kFileMime),
+    nsLiteralCString(kHTMLMime),        nsLiteralCString(kRTFMime),
+    nsLiteralCString(kURLMime),         nsLiteralCString(kURLDataMime),
+    nsLiteralCString(kTextMime),        nsLiteralCString(kPNGImageMime),
+    nsLiteralCString(kPDFJSMime)};
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(DataTransfer)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(DataTransfer)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mParent)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mItems)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDragTarget)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDragImage)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(DataTransfer)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mParent)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mItems)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDragTarget)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDragImage)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(DataTransfer)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(DataTransfer)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(DataTransfer)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(mozilla::dom::DataTransfer)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+const char DataTransfer::sEffects[8][9] = {
+    "none", "copy", "move", "copyMove", "link", "copyLink", "linkMove", "all"};
+
+enum CustomClipboardTypeId {
+  eCustomClipboardTypeId_None,
+  eCustomClipboardTypeId_String
+};
+
+static DataTransfer::Mode ModeForEvent(EventMessage aEventMessage) {
+  switch (aEventMessage) {
+    case eCut:
+    case eCopy:
+    case eDragStart:
+      return DataTransfer::Mode::ReadWrite;
+    case eDrop:
+    case ePaste:
+    case ePasteNoFormatting:
+    case eEditorInput:
+      return DataTransfer::Mode::ReadOnly;
+    default:
+      return StaticPrefs::dom_events_dataTransfer_protected_enabled()
+                 ? DataTransfer::Mode::Protected
+                 : DataTransfer::Mode::ReadOnly;
+  }
+}
+
+DataTransfer::DataTransfer(
+    nsISupports* aParent, EventMessage aEventMessage, bool aIsExternal,
+    mozilla::Maybe<nsIClipboard::ClipboardType> aClipboardType)
+    : mParent(aParent),
+      mEventMessage(aEventMessage),
+      mMode(ModeForEvent(aEventMessage)),
+      mIsExternal(aIsExternal),
+      mClipboardType(aClipboardType) {
+  mItems = new DataTransferItemList(this);
+
+  if (mIsExternal && mMode != Mode::ReadWrite) {
+    if (aEventMessage == ePasteNoFormatting) {
+      mEventMessage = ePaste;
+      CacheExternalClipboardFormats(true);
+    } else if (aEventMessage == ePaste) {
+      CacheExternalClipboardFormats(false);
+    } else if (aEventMessage >= eDragDropEventFirst &&
+               aEventMessage <= eDragDropEventLast) {
+      CacheExternalDragFormats();
+    }
+  }
+}
+
+DataTransfer::DataTransfer(nsISupports* aParent, EventMessage aEventMessage,
+                           nsITransferable* aTransferable)
+    : mParent(aParent),
+      mTransferable(aTransferable),
+      mEventMessage(aEventMessage),
+      mMode(ModeForEvent(aEventMessage)),
+      mIsExternal(true) {
+  mItems = new DataTransferItemList(this);
+
+  CacheTransferableFormats();
+  FillAllExternalData();
+  mIsExternal = false;
+  mTransferable = nullptr;
+}
+
+DataTransfer::DataTransfer(nsISupports* aParent, EventMessage aEventMessage,
+                           const nsAString& aString)
+    : mParent(aParent),
+      mEventMessage(aEventMessage),
+      mMode(ModeForEvent(aEventMessage)) {
+  mItems = new DataTransferItemList(this);
+
+  nsCOMPtr<nsIPrincipal> sysPrincipal = nsContentUtils::GetSystemPrincipal();
+
+  RefPtr<nsVariantCC> variant = new nsVariantCC();
+  variant->SetAsAString(aString);
+  DebugOnly<nsresult> rvIgnored =
+      SetDataWithPrincipal(u"text/plain"_ns, variant, 0, sysPrincipal, false);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                       "Failed to set given string to the DataTransfer object");
+}
+
+DataTransfer::DataTransfer(nsISupports* aParent,
+                           nsIClipboard::ClipboardType aClipboardType,
+                           nsIClipboardDataSnapshot* aClipboardDataSnapshot)
+    : mParent(aParent),
+      mEventMessage(ePaste),
+      mMode(ModeForEvent(ePaste)),
+      mClipboardType(Some(aClipboardType)) {
+  MOZ_ASSERT(aClipboardDataSnapshot);
+
+  mClipboardDataSnapshot = aClipboardDataSnapshot;
+  mItems = new DataTransferItemList(this);
+
+  AutoTArray<nsCString, std::size(kNonPlainTextExternalFormats)> flavors;
+  if (NS_FAILED(aClipboardDataSnapshot->GetFlavorList(flavors))) {
+    NS_WARNING("nsIClipboardDataSnapshot::GetFlavorList() failed");
+    return;
+  }
+
+  AutoTArray<nsCString, std::size(kNonPlainTextExternalFormats)> typesArray;
+  for (const auto& format : kNonPlainTextExternalFormats) {
+    if (flavors.Contains(format)) {
+      typesArray.AppendElement(format);
+    }
+  }
+
+  CacheExternalData(typesArray, nsContentUtils::GetSystemPrincipal());
+}
+
+DataTransfer::DataTransfer(
+    nsISupports* aParent, EventMessage aEventMessage,
+    const uint32_t aEffectAllowed, bool aCursorState, bool aIsExternal,
+    bool aUserCancelled, bool aIsCrossDomainSubFrameDrop,
+    mozilla::Maybe<nsIClipboard::ClipboardType> aClipboardType,
+    nsCOMPtr<nsIClipboardDataSnapshot> aClipboardDataSnapshot,
+    DataTransferItemList* aItems, Element* aDragImage, uint32_t aDragImageX,
+    uint32_t aDragImageY, bool aShowFailAnimation)
+    : mParent(aParent),
+      mEffectAllowed(aEffectAllowed),
+      mEventMessage(aEventMessage),
+      mCursorState(aCursorState),
+      mMode(ModeForEvent(aEventMessage)),
+      mIsExternal(aIsExternal),
+      mUserCancelled(aUserCancelled),
+      mIsCrossDomainSubFrameDrop(aIsCrossDomainSubFrameDrop),
+      mClipboardType(aClipboardType),
+      mClipboardDataSnapshot(std::move(aClipboardDataSnapshot)),
+      mDragImage(aDragImage),
+      mDragImageX(aDragImageX),
+      mDragImageY(aDragImageY),
+      mShowFailAnimation(aShowFailAnimation) {
+  MOZ_ASSERT(mParent);
+  MOZ_ASSERT(aItems);
+
+  mItems = aItems->Clone(this);
+  NS_ASSERTION(aEventMessage != eDragStart,
+               "invalid event type for DataTransfer constructor");
+}
+
+DataTransfer::~DataTransfer() = default;
+
+already_AddRefed<DataTransfer> DataTransfer::Constructor(
+    const GlobalObject& aGlobal) {
+  RefPtr<DataTransfer> transfer =
+      new DataTransfer(aGlobal.GetAsSupports(), eCopy,  false,
+                        Nothing());
+  transfer->mEffectAllowed = nsIDragService::DRAGDROP_ACTION_NONE;
+  return transfer.forget();
+}
+
+JSObject* DataTransfer::WrapObject(JSContext* aCx,
+                                   JS::Handle<JSObject*> aGivenProto) {
+  return DataTransfer_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+namespace {
+
+class ClipboardGetDataSnapshotCallback final
+    : public nsIClipboardGetDataSnapshotCallback {
+ public:
+  ClipboardGetDataSnapshotCallback(nsIGlobalObject* aGlobal,
+                                   nsIClipboard::ClipboardType aClipboardType)
+      : mGlobal(aGlobal), mClipboardType(aClipboardType) {}
+
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD OnSuccess(
+      nsIClipboardDataSnapshot* aClipboardDataSnapshot) override {
+    MOZ_ASSERT(aClipboardDataSnapshot);
+    mDataTransfer = MakeRefPtr<DataTransfer>(
+        ToSupports(mGlobal), mClipboardType, aClipboardDataSnapshot);
+    mComplete = true;
+    return NS_OK;
+  }
+
+  NS_IMETHOD OnError(nsresult aResult) override {
+    mComplete = true;
+    return NS_OK;
+  }
+
+  already_AddRefed<DataTransfer> TakeDataTransfer() {
+    MOZ_ASSERT(mComplete);
+    return mDataTransfer.forget();
+  }
+
+  bool IsComplete() const { return mComplete; }
+
+ protected:
+  ~ClipboardGetDataSnapshotCallback() {
+    MOZ_ASSERT(!mDataTransfer);
+    MOZ_ASSERT(mComplete);
+  };
+
+  nsCOMPtr<nsIGlobalObject> mGlobal;
+  RefPtr<DataTransfer> mDataTransfer;
+  nsIClipboard::ClipboardType mClipboardType;
+  bool mComplete = false;
+};
+
+NS_IMPL_ISUPPORTS(ClipboardGetDataSnapshotCallback,
+                  nsIClipboardGetDataSnapshotCallback)
+
+}  
+
+already_AddRefed<DataTransfer>
+DataTransfer::WaitForClipboardDataSnapshotAndCreate(
+    nsPIDOMWindowOuter* aWindow, nsIPrincipal* aSubjectPrincipal) {
+  MOZ_ASSERT(aWindow);
+  MOZ_ASSERT(aSubjectPrincipal);
+
+  nsCOMPtr<nsIClipboard> clipboardService =
+      do_GetService("@mozilla.org/widget/clipboard;1");
+  if (!clipboardService) {
+    return nullptr;
+  }
+
+  BrowsingContext* bc = aWindow->GetBrowsingContext();
+  if (!bc) {
+    return nullptr;
+  }
+
+  WindowContext* wc = bc->GetCurrentWindowContext();
+  if (!wc) {
+    return nullptr;
+  }
+
+  Document* doc = wc->GetExtantDoc();
+  if (!doc) {
+    return nullptr;
+  }
+
+  RefPtr<ClipboardGetDataSnapshotCallback> callback =
+      MakeRefPtr<ClipboardGetDataSnapshotCallback>(
+          doc->GetScopeObject(), nsIClipboard::kGlobalClipboard);
+
+  AutoTArray<nsCString, std::size(kNonPlainTextExternalFormats)> types;
+  types.AppendElements(
+      Span<const nsLiteralCString>(kNonPlainTextExternalFormats));
+
+  nsresult rv = clipboardService->GetDataSnapshot(
+      types, nsIClipboard::kGlobalClipboard, wc, aSubjectPrincipal, callback);
+  if (NS_FAILED(rv)) {
+    return nullptr;
+  }
+
+  AutoSuppressEventHandlingAndSuspend autoSuppress(bc->Group());
+  if (!SpinEventLoopUntil(
+          "DataTransfer::WaitForClipboardDataSnapshotAndCreate"_ns,
+          [&]() { return callback->IsComplete(); })) {
+    return nullptr;
+  }
+
+  return callback->TakeDataTransfer();
+}
+
+void DataTransfer::SetDropEffect(const nsAString& aDropEffect) {
+  for (uint32_t e = 0; e <= nsIDragService::DRAGDROP_ACTION_LINK; e++) {
+    if (aDropEffect.EqualsASCII(sEffects[e])) {
+      if (e != (nsIDragService::DRAGDROP_ACTION_COPY |
+                nsIDragService::DRAGDROP_ACTION_MOVE)) {
+        mDropEffect = e;
+      }
+      break;
+    }
+  }
+}
+
+void DataTransfer::SetEffectAllowed(const nsAString& aEffectAllowed) {
+  if (aEffectAllowed.EqualsLiteral("uninitialized")) {
+    mEffectAllowed = nsIDragService::DRAGDROP_ACTION_UNINITIALIZED;
+    return;
+  }
+
+  static_assert(nsIDragService::DRAGDROP_ACTION_NONE == 0,
+                "DRAGDROP_ACTION_NONE constant is wrong");
+  static_assert(nsIDragService::DRAGDROP_ACTION_COPY == 1,
+                "DRAGDROP_ACTION_COPY constant is wrong");
+  static_assert(nsIDragService::DRAGDROP_ACTION_MOVE == 2,
+                "DRAGDROP_ACTION_MOVE constant is wrong");
+  static_assert(nsIDragService::DRAGDROP_ACTION_LINK == 4,
+                "DRAGDROP_ACTION_LINK constant is wrong");
+
+  for (uint32_t e = 0; e < std::size(sEffects); e++) {
+    if (aEffectAllowed.EqualsASCII(sEffects[e])) {
+      mEffectAllowed = e;
+      break;
+    }
+  }
+}
+
+void DataTransfer::GetMozTriggeringPrincipalURISpec(
+    nsAString& aPrincipalURISpec) {
+  auto* dragSession = GetOwnerDragSession();
+  if (!dragSession) {
+    aPrincipalURISpec.Truncate(0);
+    return;
+  }
+
+  nsCOMPtr<nsIPrincipal> principal;
+  dragSession->GetTriggeringPrincipal(getter_AddRefs(principal));
+  if (!principal) {
+    aPrincipalURISpec.Truncate(0);
+    return;
+  }
+
+  nsAutoCString spec;
+  principal->GetAsciiSpec(spec);
+  CopyUTF8toUTF16(spec, aPrincipalURISpec);
+}
+
+nsIPolicyContainer* DataTransfer::GetPolicyContainer() {
+  auto* dragSession = GetOwnerDragSession();
+  if (!dragSession) {
+    return nullptr;
+  }
+  nsCOMPtr<nsIPolicyContainer> policyContainer;
+  dragSession->GetPolicyContainer(getter_AddRefs(policyContainer));
+  return policyContainer;
+}
+
+already_AddRefed<FileList> DataTransfer::GetFiles(
+    nsIPrincipal& aSubjectPrincipal) {
+  return mItems->Files(&aSubjectPrincipal);
+}
+
+void DataTransfer::GetTypes(nsTArray<nsString>& aTypes,
+                            CallerType aCallerType) const {
+  aTypes.Clear();
+
+  return mItems->GetTypes(aTypes, aCallerType);
+}
+
+bool DataTransfer::HasType(const nsAString& aType) const {
+  return mItems->HasType(aType);
+}
+
+bool DataTransfer::HasFile() const { return mItems->HasFile(); }
+
+void DataTransfer::GetData(const nsAString& aFormat, nsAString& aData,
+                           nsIPrincipal& aSubjectPrincipal,
+                           ErrorResult& aRv) const {
+  aData.Truncate();
+
+  nsCOMPtr<nsIVariant> data;
+  nsresult rv =
+      GetDataAtInternal(aFormat, 0, &aSubjectPrincipal, getter_AddRefs(data));
+  if (NS_FAILED(rv)) {
+    if (rv != NS_ERROR_DOM_INDEX_SIZE_ERR) {
+      aRv.Throw(rv);
+    }
+    return;
+  }
+
+  if (data) {
+    nsAutoString stringdata;
+    data->GetAsAString(stringdata);
+
+    nsAutoString lowercaseFormat;
+    nsContentUtils::ASCIIToLower(aFormat, lowercaseFormat);
+
+    if (lowercaseFormat.EqualsLiteral("url")) {
+      int32_t lastidx = 0, idx;
+      int32_t length = stringdata.Length();
+      while (lastidx < length) {
+        idx = stringdata.FindChar('\n', lastidx);
+        if (stringdata[lastidx] == '#') {
+          if (idx == -1) {
+            break;
+          }
+        } else {
+          if (idx == -1) {
+            aData.Assign(Substring(stringdata, lastidx));
+          } else {
+            aData.Assign(Substring(stringdata, lastidx, idx - lastidx));
+          }
+          aData =
+              nsContentUtils::TrimWhitespace<nsCRT::IsAsciiSpace>(aData, true);
+          return;
+        }
+        lastidx = idx + 1;
+      }
+    } else {
+      aData = stringdata;
+    }
+  }
+}
+
+void DataTransfer::SetData(const nsAString& aFormat, const nsAString& aData,
+                           nsIPrincipal& aSubjectPrincipal, ErrorResult& aRv) {
+  RefPtr<nsVariantCC> variant = new nsVariantCC();
+  variant->SetAsAString(aData);
+
+  aRv = SetDataAtInternal(aFormat, variant, 0, &aSubjectPrincipal);
+}
+
+void DataTransfer::ClearData(const Optional<nsAString>& aFormat,
+                             nsIPrincipal& aSubjectPrincipal,
+                             ErrorResult& aRv) {
+  if (IsReadOnly()) {
+    aRv.Throw(NS_ERROR_DOM_NO_MODIFICATION_ALLOWED_ERR);
+    return;
+  }
+
+  if (MozItemCount() == 0) {
+    return;
+  }
+
+  if (aFormat.WasPassed()) {
+    MozClearDataAtHelper(aFormat.Value(), 0, aSubjectPrincipal, aRv);
+  } else {
+    MozClearDataAtHelper(u""_ns, 0, aSubjectPrincipal, aRv);
+  }
+}
+
+void DataTransfer::SetMozCursor(const nsAString& aCursorState) {
+  mCursorState = aCursorState.EqualsLiteral("default");
+}
+
+already_AddRefed<nsINode> DataTransfer::GetMozSourceNode() {
+  auto* dragSession = GetOwnerDragSession();
+  if (!dragSession) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsINode> sourceNode;
+  dragSession->GetSourceNode(getter_AddRefs(sourceNode));
+  if (sourceNode && !nsContentUtils::LegacyIsCallerNativeCode() &&
+      !nsContentUtils::CanCallerAccess(sourceNode)) {
+    return nullptr;
+  }
+
+  return sourceNode.forget();
+}
+
+already_AddRefed<WindowContext> DataTransfer::GetSourceTopWindowContext() {
+  auto* dragSession = GetOwnerDragSession();
+  if (!dragSession) {
+    return nullptr;
+  }
+
+  RefPtr<WindowContext> sourceTopWindowContext;
+  dragSession->GetSourceTopWindowContext(
+      getter_AddRefs(sourceTopWindowContext));
+  return sourceTopWindowContext.forget();
+}
+
+already_AddRefed<DOMStringList> DataTransfer::MozTypesAt(
+    uint32_t aIndex, ErrorResult& aRv) const {
+  if (aIndex > 0 && (mEventMessage == eCut || mEventMessage == eCopy ||
+                     mEventMessage == ePaste)) {
+    aRv.Throw(NS_ERROR_DOM_INDEX_SIZE_ERR);
+    return nullptr;
+  }
+
+  RefPtr<DOMStringList> types = new DOMStringList();
+  if (aIndex < MozItemCount()) {
+    const nsTArray<RefPtr<DataTransferItem>>& items =
+        *mItems->MozItemsAt(aIndex);
+
+    bool addFile = false;
+    for (uint32_t i = 0; i < items.Length(); i++) {
+      nsAutoString type;
+      items[i]->GetInternalType(type);
+      if (NS_WARN_IF(!types->Add(type))) {
+        aRv.Throw(NS_ERROR_FAILURE);
+        return nullptr;
+      }
+
+      if (items[i]->Kind() == DataTransferItem::KIND_FILE) {
+        addFile = true;
+      }
+    }
+
+    if (addFile) {
+      types->Add(u"Files"_ns);
+    }
+  }
+
+  return types.forget();
+}
+
+nsresult DataTransfer::GetDataAtNoSecurityCheck(const nsAString& aFormat,
+                                                uint32_t aIndex,
+                                                nsIVariant** aData) const {
+  return GetDataAtInternal(aFormat, aIndex,
+                           nsContentUtils::GetSystemPrincipal(), aData);
+}
+
+nsresult DataTransfer::GetDataAtInternal(const nsAString& aFormat,
+                                         uint32_t aIndex,
+                                         nsIPrincipal* aSubjectPrincipal,
+                                         nsIVariant** aData) const {
+  *aData = nullptr;
+
+  if (aFormat.IsEmpty()) {
+    return NS_OK;
+  }
+
+  if (aIndex >= MozItemCount()) {
+    return NS_ERROR_DOM_INDEX_SIZE_ERR;
+  }
+
+  if (aIndex > 0 && (mEventMessage == eCut || mEventMessage == eCopy ||
+                     mEventMessage == ePaste)) {
+    return NS_ERROR_DOM_INDEX_SIZE_ERR;
+  }
+
+  nsAutoString format;
+  GetRealFormat(aFormat, format);
+
+  MOZ_ASSERT(aSubjectPrincipal);
+
+  RefPtr<DataTransferItem> item = mItems->MozItemByTypeAt(format, aIndex);
+  if (!item) {
+    return NS_OK;
+  }
+
+  if (!aSubjectPrincipal->IsSystemPrincipal() && item->ChromeOnly()) {
+    return NS_OK;
+  }
+
+  ErrorResult result;
+  nsCOMPtr<nsIVariant> data = item->Data(aSubjectPrincipal, result);
+  if (NS_WARN_IF(!data || result.Failed())) {
+    return result.StealNSResult();
+  }
+
+  data.forget(aData);
+  return NS_OK;
+}
+
+void DataTransfer::MozGetDataAt(JSContext* aCx, const nsAString& aFormat,
+                                uint32_t aIndex,
+                                JS::MutableHandle<JS::Value> aRetval,
+                                mozilla::ErrorResult& aRv) {
+  nsCOMPtr<nsIVariant> data;
+  aRv = GetDataAtInternal(aFormat, aIndex, nsContentUtils::GetSystemPrincipal(),
+                          getter_AddRefs(data));
+  if (aRv.Failed()) {
+    return;
+  }
+
+  if (!data) {
+    aRetval.setNull();
+    return;
+  }
+
+  JS::Rooted<JS::Value> result(aCx);
+  if (!VariantToJsval(aCx, data, aRetval)) {
+    aRv = NS_ERROR_FAILURE;
+    return;
+  }
+}
+
+bool DataTransfer::PrincipalMaySetData(const nsAString& aType,
+                                       nsIVariant* aData,
+                                       nsIPrincipal* aPrincipal) {
+  if (!aPrincipal->IsSystemPrincipal()) {
+    DataTransferItem::eKind kind = DataTransferItem::KindFromData(aData);
+    if (kind == DataTransferItem::KIND_OTHER) {
+      NS_WARNING("Disallowing adding non string/file types to DataTransfer");
+      return false;
+    }
+
+    if (FindInReadable(kInternal_Mimetype_Prefix, aType) &&
+        !StringBeginsWith(aType, u"text/x-moz-url"_ns)) {
+      NS_WARNING("Disallowing adding this type to DataTransfer");
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void DataTransfer::TypesListMayHaveChanged() {
+  DataTransfer_Binding::ClearCachedTypesValue(this);
+}
+
+already_AddRefed<DataTransfer> DataTransfer::MozCloneForEvent(
+    const nsAString& aEvent, ErrorResult& aRv) {
+  RefPtr<nsAtom> atomEvt = NS_Atomize(aEvent);
+  if (!atomEvt) {
+    aRv.Throw(NS_ERROR_OUT_OF_MEMORY);
+    return nullptr;
+  }
+  EventMessage eventMessage = nsContentUtils::GetEventMessage(atomEvt);
+
+  RefPtr<DataTransfer> dt;
+  nsresult rv = Clone(mParent, eventMessage, false, false, getter_AddRefs(dt));
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+    return nullptr;
+  }
+  return dt.forget();
+}
+
+void DataTransfer::GetExternalClipboardFormats(const bool& aPlainTextOnly,
+                                               nsTArray<nsCString>& aResult) {
+
+  MOZ_ASSERT(!mClipboardDataSnapshot);
+
+  if (mClipboardType.isNothing()) {
+    return;
+  }
+
+  RefPtr<WindowContext> wc = GetWindowContext();
+  if (NS_WARN_IF(!wc)) {
+    MOZ_ASSERT_UNREACHABLE(
+        "How could this DataTransfer be created with a non-window global?");
+    return;
+  }
+
+  nsCOMPtr<nsIClipboard> clipboard =
+      do_GetService("@mozilla.org/widget/clipboard;1");
+  if (!clipboard) {
+    return;
+  }
+
+  nsCOMPtr<nsIClipboardDataSnapshot> clipboardDataSnapshot;
+  nsresult rv = NS_ERROR_FAILURE;
+  if (aPlainTextOnly) {
+    AutoTArray<nsCString, 1> formats{nsLiteralCString(kTextMime)};
+    rv = clipboard->GetDataSnapshotSync(
+        formats, *mClipboardType, wc, getter_AddRefs(clipboardDataSnapshot));
+  } else {
+    AutoTArray<nsCString, std::size(kNonPlainTextExternalFormats) + 5> formats;
+    if (StaticPrefs::dom_clipboard_customFormatSupport_enabled()) {
+      formats.AppendElement(kWebCustomFormatMapType);
+    }
+    formats.AppendElements(
+        Span<const nsLiteralCString>(kNonPlainTextExternalFormats));
+    formats.AppendElement(kNativeHTMLMime);
+    formats.AppendElement(kJPEGImageMime);
+    formats.AppendElement(kGIFImageMime);
+    formats.AppendElement(kMozTextInternal);
+
+    rv = clipboard->GetDataSnapshotSync(
+        formats, *mClipboardType, wc, getter_AddRefs(clipboardDataSnapshot));
+  }
+
+  if (NS_FAILED(rv) || !clipboardDataSnapshot) {
+    return;
+  }
+
+  AutoTArray<nsCString, std::size(kNonPlainTextExternalFormats)> flavors;
+  clipboardDataSnapshot->GetFlavorList(flavors);
+
+  for (const auto& flavor : flavors) {
+    if (StringBeginsWith(flavor, nsLiteralCString(kWebCustomFormatPrefix))) {
+      aResult.AppendElement(flavor);
+    }
+  }
+  for (const auto& format : kNonPlainTextExternalFormats) {
+    if (flavors.Contains(format)) {
+      aResult.AppendElement(format);
+    }
+  }
+
+  mClipboardDataSnapshot = std::move(clipboardDataSnapshot);
+}
+
+void DataTransfer::GetExternalTransferableFormats(
+    nsITransferable* aTransferable, bool aPlainTextOnly,
+    nsTArray<nsCString>* aResult) {
+  MOZ_ASSERT(aTransferable);
+  MOZ_ASSERT(aResult);
+
+  aResult->Clear();
+
+
+  AutoTArray<nsCString, 10> flavors;
+  aTransferable->FlavorsTransferableCanExport(flavors);
+
+  if (aPlainTextOnly) {
+    auto index = flavors.IndexOf(nsLiteralCString(kTextMime));
+    if (index != flavors.NoIndex) {
+      aResult->AppendElement(nsLiteralCString(kTextMime));
+    }
+    return;
+  }
+
+  for (const auto& format : kNonPlainTextExternalFormats) {
+    auto index = flavors.IndexOf(format);
+    if (index != flavors.NoIndex) {
+      aResult->AppendElement(format);
+    }
+  }
+}
+
+nsresult DataTransfer::SetDataAtInternal(const nsAString& aFormat,
+                                         nsIVariant* aData, uint32_t aIndex,
+                                         nsIPrincipal* aSubjectPrincipal) {
+  if (aFormat.IsEmpty()) {
+    return NS_OK;
+  }
+
+  if (IsReadOnly()) {
+    return NS_ERROR_DOM_NO_MODIFICATION_ALLOWED_ERR;
+  }
+
+  if (aIndex > MozItemCount()) {
+    return NS_ERROR_DOM_INDEX_SIZE_ERR;
+  }
+
+  if (aIndex > 0 && (mEventMessage == eCut || mEventMessage == eCopy ||
+                     mEventMessage == ePaste)) {
+    return NS_ERROR_DOM_INDEX_SIZE_ERR;
+  }
+
+  if (aFormat.EqualsLiteral(kCustomTypesMime)) {
+    return NS_ERROR_DOM_NOT_SUPPORTED_ERR;
+  }
+
+  if (!PrincipalMaySetData(aFormat, aData, aSubjectPrincipal)) {
+    return NS_ERROR_DOM_SECURITY_ERR;
+  }
+
+  return SetDataWithPrincipal(aFormat, aData, aIndex, aSubjectPrincipal);
+}
+
+void DataTransfer::MozSetDataAt(JSContext* aCx, const nsAString& aFormat,
+                                JS::Handle<JS::Value> aData, uint32_t aIndex,
+                                ErrorResult& aRv) {
+  nsCOMPtr<nsIVariant> data;
+  aRv = nsContentUtils::XPConnect()->JSValToVariant(aCx, aData,
+                                                    getter_AddRefs(data));
+  if (!aRv.Failed()) {
+    aRv = SetDataAtInternal(aFormat, data, aIndex,
+                            nsContentUtils::GetSystemPrincipal());
+  }
+}
+
+void DataTransfer::MozClearDataAt(const nsAString& aFormat, uint32_t aIndex,
+                                  ErrorResult& aRv) {
+  if (IsReadOnly()) {
+    aRv.Throw(NS_ERROR_DOM_NO_MODIFICATION_ALLOWED_ERR);
+    return;
+  }
+
+  if (aIndex >= MozItemCount()) {
+    aRv.Throw(NS_ERROR_DOM_INDEX_SIZE_ERR);
+    return;
+  }
+
+  if (aIndex > 0 && (mEventMessage == eCut || mEventMessage == eCopy ||
+                     mEventMessage == ePaste)) {
+    aRv.Throw(NS_ERROR_DOM_INDEX_SIZE_ERR);
+    return;
+  }
+
+  MozClearDataAtHelper(aFormat, aIndex, *nsContentUtils::GetSystemPrincipal(),
+                       aRv);
+
+
+  if (aIndex == 0 && mItems->MozItemCount() > 1 &&
+      mItems->MozItemsAt(0)->Length() == 0) {
+    mItems->PopIndexZero();
+  }
+}
+
+void DataTransfer::MozClearDataAtHelper(const nsAString& aFormat,
+                                        uint32_t aIndex,
+                                        nsIPrincipal& aSubjectPrincipal,
+                                        ErrorResult& aRv) {
+  MOZ_ASSERT(!IsReadOnly());
+  MOZ_ASSERT(aIndex < MozItemCount());
+  MOZ_ASSERT(aIndex == 0 || (mEventMessage != eCut && mEventMessage != eCopy &&
+                             mEventMessage != ePaste));
+
+  nsAutoString format;
+  GetRealFormat(aFormat, format);
+
+  mItems->MozRemoveByTypeAt(format, aIndex, aSubjectPrincipal, aRv);
+}
+
+void DataTransfer::SetDragImage(Element& aImage, int32_t aX, int32_t aY) {
+  if (!IsReadOnly()) {
+    mDragImage = &aImage;
+    mDragImageX = aX;
+    mDragImageY = aY;
+  }
+}
+
+void DataTransfer::UpdateDragImage(Element& aImage, int32_t aX, int32_t aY) {
+  if (mEventMessage < eDragDropEventFirst ||
+      mEventMessage > eDragDropEventLast) {
+    return;
+  }
+
+  auto* dragSession = GetOwnerDragSession();
+  if (dragSession) {
+    dragSession->UpdateDragImage(&aImage, aX, aY);
+  }
+}
+
+void DataTransfer::AddElement(Element& aElement, ErrorResult& aRv) {
+  if (IsReadOnly()) {
+    aRv.Throw(NS_ERROR_DOM_NO_MODIFICATION_ALLOWED_ERR);
+    return;
+  }
+
+  mDragTarget = &aElement;
+}
+
+nsresult DataTransfer::Clone(nsISupports* aParent, EventMessage aEventMessage,
+                             bool aUserCancelled,
+                             bool aIsCrossDomainSubFrameDrop,
+                             DataTransfer** aNewDataTransfer) {
+  RefPtr<DataTransfer> newDataTransfer = new DataTransfer(
+      aParent, aEventMessage, mEffectAllowed, mCursorState, mIsExternal,
+      aUserCancelled, aIsCrossDomainSubFrameDrop, mClipboardType,
+      mClipboardDataSnapshot, mItems, mDragImage, mDragImageX, mDragImageY,
+      mShowFailAnimation);
+
+  newDataTransfer.forget(aNewDataTransfer);
+  return NS_OK;
+}
+
+already_AddRefed<nsIArray> DataTransfer::GetTransferables(
+    nsINode* aDragTarget) {
+  MOZ_ASSERT(aDragTarget);
+
+  Document* doc = aDragTarget->GetComposedDoc();
+  if (!doc) {
+    return nullptr;
+  }
+
+  return GetTransferables(doc->GetLoadContext());
+}
+
+already_AddRefed<nsIArray> DataTransfer::GetTransferables(
+    nsILoadContext* aLoadContext) {
+  nsCOMPtr<nsIMutableArray> transArray = nsArray::Create();
+  if (!transArray) {
+    return nullptr;
+  }
+
+  uint32_t count = MozItemCount();
+  for (uint32_t i = 0; i < count; i++) {
+    nsCOMPtr<nsITransferable> transferable = GetTransferable(i, aLoadContext);
+    if (transferable) {
+      transArray->AppendElement(transferable);
+    }
+  }
+
+  return transArray.forget();
+}
+
+already_AddRefed<nsITransferable> DataTransfer::GetTransferable(
+    uint32_t aIndex, nsILoadContext* aLoadContext) {
+  if (aIndex >= MozItemCount()) {
+    return nullptr;
+  }
+
+  const nsTArray<RefPtr<DataTransferItem>>& item = *mItems->MozItemsAt(aIndex);
+  uint32_t count = item.Length();
+  if (!count) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsITransferable> transferable =
+      do_CreateInstance("@mozilla.org/widget/transferable;1");
+  if (!transferable) {
+    return nullptr;
+  }
+  transferable->Init(aLoadContext);
+
+  if (mMode == Mode::ReadWrite) {
+    if (nsCOMPtr<nsIGlobalObject> global = GetGlobal()) {
+      transferable->SetDataPrincipal(global->PrincipalOrNull());
+    }
+  }
+
+  nsCOMPtr<nsIStorageStream> storageStream;
+  nsCOMPtr<nsIObjectOutputStream> stream;
+
+  bool added = false;
+  bool handlingCustomFormats = true;
+
+  const uint32_t baseLength = sizeof(uint32_t) + 1;
+  uint32_t totalCustomLength = baseLength;
+
+  do {
+    for (uint32_t f = 0; f < count; f++) {
+      RefPtr<DataTransferItem> formatitem = item[f];
+      nsCOMPtr<nsIVariant> variant = formatitem->DataNoSecurityCheck();
+      if (!variant) {  
+        continue;
+      }
+
+      nsAutoString type;
+      formatitem->GetInternalType(type);
+
+      bool isCustomFormat = true;
+      for (const char* format : kKnownFormats) {
+        if (type.EqualsASCII(format)) {
+          isCustomFormat = false;
+          break;
+        }
+      }
+
+      if (isCustomFormat &&
+          StringBeginsWith(
+              type, NS_LITERAL_STRING_FROM_CSTRING(kWebCustomFormatPrefix))) {
+        isCustomFormat = false;
+      }
+
+      uint32_t lengthInBytes;
+      nsCOMPtr<nsISupports> convertedData;
+
+      if (handlingCustomFormats) {
+        if (!ConvertFromVariant(variant, getter_AddRefs(convertedData),
+                                &lengthInBytes)) {
+          continue;
+        }
+
+        if (isCustomFormat && totalCustomLength > 0) {
+          nsCOMPtr<nsISupportsString> str(do_QueryInterface(convertedData));
+          if (str) {
+            nsAutoString data;
+            str->GetData(data);
+
+            if (!stream) {
+              NS_NewStorageStream(1024, UINT32_MAX,
+                                  getter_AddRefs(storageStream));
+
+              nsCOMPtr<nsIOutputStream> outputStream;
+              storageStream->GetOutputStream(0, getter_AddRefs(outputStream));
+
+              stream = NS_NewObjectOutputStream(outputStream);
+            }
+
+            CheckedInt<uint32_t> formatLength =
+                CheckedInt<uint32_t>(type.Length()) *
+                sizeof(nsString::char_type);
+
+            CheckedInt<uint32_t> newSize = formatLength + totalCustomLength +
+                                           lengthInBytes +
+                                           (sizeof(uint32_t) * 3);
+            if (newSize.isValid()) {
+              nsresult rv = stream->Write32(eCustomClipboardTypeId_String);
+              if (NS_WARN_IF(NS_FAILED(rv))) {
+                totalCustomLength = 0;
+                continue;
+              }
+              rv = stream->Write32(formatLength.value());
+              if (NS_WARN_IF(NS_FAILED(rv))) {
+                totalCustomLength = 0;
+                continue;
+              }
+              MOZ_ASSERT(formatLength.isValid() &&
+                             formatLength.value() ==
+                                 type.Length() * sizeof(nsString::char_type),
+                         "Why is formatLength off?");
+              rv = stream->WriteBytes(
+                  AsBytes(Span(type.BeginReading(), type.Length())));
+              if (NS_WARN_IF(NS_FAILED(rv))) {
+                totalCustomLength = 0;
+                continue;
+              }
+              rv = stream->Write32(lengthInBytes);
+              if (NS_WARN_IF(NS_FAILED(rv))) {
+                totalCustomLength = 0;
+                continue;
+              }
+              rv = stream->WriteBytes(
+                  Span(reinterpret_cast<const uint8_t*>(data.BeginReading()),
+                       lengthInBytes));
+              if (NS_WARN_IF(NS_FAILED(rv))) {
+                totalCustomLength = 0;
+                continue;
+              }
+
+              totalCustomLength = newSize.value();
+            }
+          }
+        }
+      } else if (isCustomFormat && stream) {
+        if (totalCustomLength > baseLength) {
+          nsresult rv = stream->Write32(eCustomClipboardTypeId_None);
+          if (NS_SUCCEEDED(rv)) {
+            nsCOMPtr<nsIInputStream> inputStream;
+            storageStream->NewInputStream(0, getter_AddRefs(inputStream));
+
+            RefPtr<StringBuffer> stringBuffer =
+                StringBuffer::Alloc(totalCustomLength);
+
+            totalCustomLength--;
+
+            uint32_t amountRead;
+            rv = inputStream->Read(static_cast<char*>(stringBuffer->Data()),
+                                   totalCustomLength, &amountRead);
+            if (NS_SUCCEEDED(rv)) {
+              static_cast<char*>(stringBuffer->Data())[amountRead] = 0;
+
+              nsCString str;
+              str.Assign(stringBuffer, totalCustomLength);
+              nsCOMPtr<nsISupportsCString> strSupports(
+                  do_CreateInstance(NS_SUPPORTS_CSTRING_CONTRACTID));
+              strSupports->SetData(str);
+
+              nsresult rv =
+                  transferable->SetTransferData(kCustomTypesMime, strSupports);
+              if (NS_FAILED(rv)) {
+                return nullptr;
+              }
+
+              added = true;
+            }
+          }
+        }
+
+        stream = nullptr;
+      } else {
+        if (!ConvertFromVariant(variant, getter_AddRefs(convertedData),
+                                &lengthInBytes)) {
+          continue;
+        }
+
+        NS_ConvertUTF16toUTF8 format(type);
+
+        nsCOMPtr<nsIFormatConverter> converter =
+            do_QueryInterface(convertedData);
+        if (converter) {
+          transferable->AddDataFlavor(format.get());
+          transferable->SetConverter(converter);
+          continue;
+        }
+
+        nsresult rv =
+            transferable->SetTransferData(format.get(), convertedData);
+        if (NS_FAILED(rv)) {
+          return nullptr;
+        }
+
+        added = true;
+      }
+    }
+
+    handlingCustomFormats = !handlingCustomFormats;
+  } while (!handlingCustomFormats);
+
+  if (added) {
+    return transferable.forget();
+  }
+
+  return nullptr;
+}
+
+bool DataTransfer::ConvertFromVariant(nsIVariant* aVariant,
+                                      nsISupports** aSupports,
+                                      uint32_t* aLength) const {
+  *aSupports = nullptr;
+  *aLength = 0;
+
+  uint16_t type = aVariant->GetDataType();
+  if (type == nsIDataType::VTYPE_INTERFACE ||
+      type == nsIDataType::VTYPE_INTERFACE_IS) {
+    nsCOMPtr<nsISupports> data;
+    if (NS_FAILED(aVariant->GetAsISupports(getter_AddRefs(data)))) {
+      return false;
+    }
+
+    if (nsCOMPtr<nsIFlavorDataProvider> fdp = do_QueryInterface(data)) {
+      fdp.forget(aSupports);
+      *aLength = 0;
+      return true;
+    }
+
+    if (RefPtr<Blob> blob = do_QueryObject(data)) {
+      RefPtr<BlobImpl> blobImpl = blob->Impl();
+      blobImpl.forget(aSupports);
+    } else {
+      data.forget(aSupports);
+    }
+
+    *aLength = sizeof(nsISupports*);
+    return true;
+  }
+
+  if (type == nsIDataType::VTYPE_CSTRING) {
+    nsAutoCString cStr;
+    if (NS_FAILED(aVariant->GetAsACString(cStr))) {
+      return false;
+    }
+    nsCOMPtr<nsISupportsCString> cStrSupports(
+        do_CreateInstance(NS_SUPPORTS_CSTRING_CONTRACTID));
+    if (!cStrSupports) {
+      return false;
+    }
+    cStrSupports->SetData(cStr);
+    cStrSupports.forget(aSupports);
+    *aLength = cStr.Length();
+
+    return true;
+  }
+
+  nsAutoString str;
+  nsresult rv = aVariant->GetAsAString(str);
+  if (NS_FAILED(rv)) {
+    return false;
+  }
+
+  nsCOMPtr<nsISupportsString> strSupports(
+      do_CreateInstance(NS_SUPPORTS_STRING_CONTRACTID));
+  if (!strSupports) {
+    return false;
+  }
+
+  strSupports->SetData(str);
+
+  strSupports.forget(aSupports);
+
+  *aLength = str.Length() * 2;
+
+  return true;
+}
+
+void DataTransfer::Disconnect() {
+  SetMode(Mode::Protected);
+  if (StaticPrefs::dom_events_dataTransfer_protected_enabled()) {
+    ClearAll();
+  }
+}
+
+void DataTransfer::ClearAll() {
+  mItems->ClearAllItems();
+  mClipboardDataSnapshot = nullptr;
+}
+
+uint32_t DataTransfer::MozItemCount() const { return mItems->MozItemCount(); }
+
+nsresult DataTransfer::SetDataWithPrincipal(const nsAString& aFormat,
+                                            nsIVariant* aData, uint32_t aIndex,
+                                            nsIPrincipal* aPrincipal,
+                                            bool aHidden) {
+  nsAutoString format;
+  GetRealFormat(aFormat, format);
+
+  ErrorResult rv;
+  RefPtr<DataTransferItem> item =
+      mItems->SetDataWithPrincipal(format, aData, aIndex, aPrincipal,
+                                    false, aHidden, rv);
+  return rv.StealNSResult();
+}
+
+void DataTransfer::SetDataWithPrincipalFromOtherProcess(
+    const nsAString& aFormat, nsIVariant* aData, uint32_t aIndex,
+    nsIPrincipal* aPrincipal, bool aHidden) {
+  if (aFormat.EqualsLiteral(kCustomTypesMime)) {
+    FillInExternalCustomTypes(aData, aIndex, aPrincipal);
+  } else {
+    nsAutoString format;
+    GetRealFormat(aFormat, format);
+
+    ErrorResult rv;
+    RefPtr<DataTransferItem> item =
+        mItems->SetDataWithPrincipal(format, aData, aIndex, aPrincipal,
+                                      false, aHidden, rv);
+    if (NS_WARN_IF(rv.Failed())) {
+      rv.SuppressException();
+    }
+  }
+}
+
+void DataTransfer::GetRealFormat(const nsAString& aInFormat,
+                                 nsAString& aOutFormat) const {
+  nsAutoString lowercaseFormat;
+  nsContentUtils::ASCIIToLower(aInFormat, lowercaseFormat);
+  if (lowercaseFormat.EqualsLiteral("text") ||
+      lowercaseFormat.EqualsLiteral("text/unicode")) {
+    aOutFormat.AssignLiteral("text/plain");
+    return;
+  }
+
+  if (lowercaseFormat.EqualsLiteral("url")) {
+    aOutFormat.AssignLiteral("text/uri-list");
+    return;
+  }
+
+  aOutFormat.Assign(lowercaseFormat);
+}
+
+already_AddRefed<nsIGlobalObject> DataTransfer::GetGlobal() const {
+  nsCOMPtr<nsIGlobalObject> global;
+  if (nsCOMPtr<EventTarget> target = do_QueryInterface(mParent)) {
+    global = target->GetRelevantGlobal();
+  } else if (RefPtr<Event> event = do_QueryObject(mParent)) {
+    global = event->GetParentObject();
+  }
+
+  return global.forget();
+}
+
+already_AddRefed<WindowContext> DataTransfer::GetWindowContext() const {
+  nsCOMPtr<nsIGlobalObject> global = GetGlobal();
+  if (!global) {
+    return nullptr;
+  }
+
+  const auto* innerWindow = global->GetAsInnerWindow();
+  if (!innerWindow) {
+    return nullptr;
+  }
+
+  return do_AddRef(innerWindow->GetWindowContext());
+}
+
+nsIClipboardDataSnapshot* DataTransfer::GetClipboardDataSnapshot() const {
+  return mClipboardDataSnapshot;
+}
+
+nsresult DataTransfer::CacheExternalData(const char* aFormat, uint32_t aIndex,
+                                         nsIPrincipal* aPrincipal,
+                                         bool aHidden) {
+  ErrorResult rv;
+  RefPtr<DataTransferItem> item;
+
+  if (strcmp(aFormat, kTextMime) == 0) {
+    item = mItems->SetDataWithPrincipal(u"text/plain"_ns, nullptr, aIndex,
+                                        aPrincipal, false, aHidden, rv);
+    if (NS_WARN_IF(rv.Failed())) {
+      return rv.StealNSResult();
+    }
+    return NS_OK;
+  }
+
+  if (strcmp(aFormat, kURLDataMime) == 0) {
+    item = mItems->SetDataWithPrincipal(u"text/uri-list"_ns, nullptr, aIndex,
+                                        aPrincipal, false, aHidden, rv);
+    if (NS_WARN_IF(rv.Failed())) {
+      return rv.StealNSResult();
+    }
+    return NS_OK;
+  }
+
+  nsAutoString format;
+  GetRealFormat(NS_ConvertUTF8toUTF16(aFormat), format);
+  item = mItems->SetDataWithPrincipal(format, nullptr, aIndex, aPrincipal,
+                                      false, aHidden, rv);
+  if (NS_WARN_IF(rv.Failed())) {
+    return rv.StealNSResult();
+  }
+  return NS_OK;
+}
+
+void DataTransfer::CacheExternalDragFormats() {
+  auto* dragSession = GetOwnerDragSession();
+  if (!dragSession) {
+    return;
+  }
+
+  nsIScriptSecurityManager* ssm = nsContentUtils::GetSecurityManager();
+  nsCOMPtr<nsIPrincipal> sysPrincipal;
+  ssm->GetSystemPrincipal(getter_AddRefs(sysPrincipal));
+
+  static const char* formats[] = {kFileMime,    kHTMLMime, kURLMime,
+                                  kURLDataMime, kTextMime, kPNGImageMime};
+
+  uint32_t count;
+  dragSession->GetNumDropItems(&count);
+  for (uint32_t c = 0; c < count; c++) {
+    bool hasFileData = false;
+    dragSession->IsDataFlavorSupported(kFileMime, &hasFileData);
+
+    bool supported;
+    dragSession->IsDataFlavorSupported(kCustomTypesMime, &supported);
+    if (supported) {
+      FillInExternalCustomTypes(c, sysPrincipal);
+    }
+
+    for (uint32_t f = 0; f < std::size(formats); f++) {
+      bool supported;
+      dragSession->IsDataFlavorSupported(formats[f], &supported);
+      if (supported) {
+        CacheExternalData(formats[f], c, sysPrincipal,
+                           f && hasFileData);
+      }
+    }
+  }
+}
+
+void DataTransfer::CacheExternalClipboardFormats(bool aPlainTextOnly) {
+  NS_ASSERTION(mEventMessage == ePaste,
+               "caching clipboard data for invalid event");
+
+  nsCOMPtr<nsIPrincipal> sysPrincipal = nsContentUtils::GetSystemPrincipal();
+  nsTArray<nsCString> typesArray;
+  GetExternalClipboardFormats(aPlainTextOnly, typesArray);
+  if (aPlainTextOnly) {
+    MOZ_ASSERT(typesArray.IsEmpty() || typesArray.Length() == 1);
+    if (typesArray.Length() == 1) {
+      MOZ_ASSERT(typesArray.Contains(kTextMime));
+      CacheExternalData(kTextMime, 0, sysPrincipal, false);
+    }
+    return;
+  }
+
+  CacheExternalData(typesArray, sysPrincipal);
+}
+
+void DataTransfer::CacheTransferableFormats() {
+  nsCOMPtr<nsIPrincipal> sysPrincipal = nsContentUtils::GetSystemPrincipal();
+
+  AutoTArray<nsCString, 10> typesArray;
+  GetExternalTransferableFormats(mTransferable, false, &typesArray);
+
+  CacheExternalData(typesArray, sysPrincipal);
+}
+
+void DataTransfer::CacheExternalData(const nsTArray<nsCString>& aTypes,
+                                     nsIPrincipal* aPrincipal) {
+  bool hasFileData = false;
+  for (const nsCString& type : aTypes) {
+    if (type.EqualsLiteral(kCustomTypesMime)) {
+      FillInExternalCustomTypes(0, aPrincipal);
+    } else if (type.EqualsLiteral(kFileMime) && XRE_IsContentProcess() &&
+               !StaticPrefs::dom_events_dataTransfer_mozFile_enabled()) {
+      hasFileData = false;
+      continue;
+    } else {
+      if (type.EqualsLiteral(kFileMime)) {
+        hasFileData = true;
+      }
+
+      CacheExternalData(
+          type.get(), 0, aPrincipal,
+           !type.EqualsLiteral(kFileMime) && hasFileData);
+    }
+  }
+}
+
+void DataTransfer::FillAllExternalData() {
+  if (mIsExternal) {
+    for (uint32_t i = 0; i < MozItemCount(); ++i) {
+      const nsTArray<RefPtr<DataTransferItem>>& items = *mItems->MozItemsAt(i);
+      for (uint32_t j = 0; j < items.Length(); ++j) {
+        MOZ_ASSERT(items[j]->Index() == i);
+
+        items[j]->FillInExternalData();
+      }
+    }
+  }
+}
+
+void DataTransfer::FillInExternalCustomTypes(uint32_t aIndex,
+                                             nsIPrincipal* aPrincipal) {
+  RefPtr<DataTransferItem> item = new DataTransferItem(
+      this, NS_LITERAL_STRING_FROM_CSTRING(kCustomTypesMime),
+      DataTransferItem::KIND_STRING);
+  item->SetIndex(aIndex);
+
+  nsCOMPtr<nsIVariant> variant = item->DataNoSecurityCheck();
+  if (!variant) {
+    return;
+  }
+
+  FillInExternalCustomTypes(variant, aIndex, aPrincipal);
+}
+
+ void DataTransfer::ParseExternalCustomTypesString(
+    mozilla::Span<const char> aString,
+    std::function<void(ParseExternalCustomTypesStringData&&)>&& aCallback) {
+  CheckedInt<int32_t> checkedLen(aString.Length());
+  if (!checkedLen.isValid()) {
+    return;
+  }
+
+  nsCOMPtr<nsIInputStream> stringStream;
+  NS_NewByteInputStream(getter_AddRefs(stringStream), aString,
+                        NS_ASSIGNMENT_DEPEND);
+
+  nsCOMPtr<nsIObjectInputStream> stream = NS_NewObjectInputStream(stringStream);
+
+  uint32_t type;
+  do {
+    nsresult rv = stream->Read32(&type);
+    NS_ENSURE_SUCCESS_VOID(rv);
+    if (type == eCustomClipboardTypeId_String) {
+      uint32_t formatLength;
+      rv = stream->Read32(&formatLength);
+      NS_ENSURE_SUCCESS_VOID(rv);
+      char* formatBytes;
+      rv = stream->ReadBytes(formatLength, &formatBytes);
+      NS_ENSURE_SUCCESS_VOID(rv);
+      nsAutoString format;
+      format.Adopt(reinterpret_cast<char16_t*>(formatBytes),
+                   formatLength / sizeof(char16_t));
+
+      uint32_t dataLength;
+      rv = stream->Read32(&dataLength);
+      NS_ENSURE_SUCCESS_VOID(rv);
+      char* dataBytes;
+      rv = stream->ReadBytes(dataLength, &dataBytes);
+      NS_ENSURE_SUCCESS_VOID(rv);
+      nsAutoString data;
+      data.Adopt(reinterpret_cast<char16_t*>(dataBytes),
+                 dataLength / sizeof(char16_t));
+
+      aCallback(ParseExternalCustomTypesStringData(std::move(format),
+                                                   std::move(data)));
+    }
+  } while (type != eCustomClipboardTypeId_None);
+}
+
+void DataTransfer::FillInExternalCustomTypes(nsIVariant* aData, uint32_t aIndex,
+                                             nsIPrincipal* aPrincipal) {
+  char* chrs;
+  uint32_t len = 0;
+  nsresult rv = aData->GetAsStringWithSize(&len, &chrs);
+  if (NS_FAILED(rv)) {
+    return;
+  }
+  auto freeChrs = MakeScopeExit([&]() { free(chrs); });
+
+  ParseExternalCustomTypesString(
+      mozilla::Span(chrs, len),
+      [&](ParseExternalCustomTypesStringData&& aData) {
+        auto [format, data] = std::move(aData);
+        RefPtr<nsVariantCC> variant = new nsVariantCC();
+        if (NS_FAILED(variant->SetAsAString(data))) {
+          return;
+        }
+
+        SetDataWithPrincipal(format, variant, aIndex, aPrincipal);
+      });
+}
+
+void DataTransfer::SetMode(DataTransfer::Mode aMode) {
+  if (!StaticPrefs::dom_events_dataTransfer_protected_enabled() &&
+      aMode == Mode::Protected) {
+    mMode = Mode::ReadOnly;
+  } else {
+    mMode = aMode;
+  }
+}
+
+nsIWidget* DataTransfer::GetOwnerWidget() {
+  RefPtr<WindowContext> wc = GetWindowContext();
+  NS_ENSURE_TRUE(wc, nullptr);
+  auto* doc = wc->GetDocument();
+  NS_ENSURE_TRUE(doc, nullptr);
+  auto* pc = doc->GetPresContext();
+  NS_ENSURE_TRUE(pc, nullptr);
+  return pc->GetRootWidget();
+}
+
+nsIDragSession* DataTransfer::GetOwnerDragSession() {
+  auto* widget = GetOwnerWidget();
+  nsCOMPtr<nsIDragSession> dragSession = nsContentUtils::GetDragSession(widget);
+  return dragSession;
+}
+
+void DataTransfer::ClearForPaste() {
+  MOZ_ASSERT(mEventMessage == ePaste,
+             "ClearForPaste() should only be called on ePaste messages");
+  Disconnect();
+
+  ClearAll();
+}
+
+bool DataTransfer::HasPrivateHTMLFlavor() const {
+  MOZ_ASSERT(mEventMessage == ePaste,
+             "Only works for ePaste messages, where the mClipboardDataSnapshot "
+             "is available.");
+  nsIClipboardDataSnapshot* snapshot = GetClipboardDataSnapshot();
+  if (!snapshot) {
+    NS_WARNING("DataTransfer::GetClipboardDataSnapshot() returned null");
+    return false;
+  }
+  nsTArray<nsCString> snapshotFlavors;
+  if (NS_FAILED(snapshot->GetFlavorList(snapshotFlavors))) {
+    NS_WARNING("nsIClipboardDataSnapshot::GetFlavorList() failed");
+    return false;
+  }
+  return snapshotFlavors.Contains(kHTMLContext);
+}
+
+}  

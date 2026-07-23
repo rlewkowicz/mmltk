@@ -1,0 +1,433 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_TRACKBUFFERSMANAGER_H_
+#define MOZILLA_TRACKBUFFERSMANAGER_H_
+
+#include "MediaContainerType.h"
+#include "MediaData.h"
+#include "MediaDataDemuxer.h"
+#include "MediaResult.h"
+#include "MediaSourceDecoder.h"
+#include "MediaSpan.h"
+#include "SourceBufferTask.h"
+#include "TimeUnits.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/EventTargetCapability.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/NotNull.h"
+#include "mozilla/TaskQueue.h"
+#include "mozilla/dom/MediaDebugInfoBinding.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+class AbstractThread;
+class ContainerParser;
+class MediaByteBuffer;
+class MediaRawData;
+class MediaSourceDemuxer;
+class SourceBufferResource;
+
+namespace dom {
+enum class MediaSourceEndOfStreamError : uint8_t;
+}  
+
+class SourceBufferTaskQueue {
+ public:
+  SourceBufferTaskQueue() = default;
+
+  ~SourceBufferTaskQueue() {
+    MOZ_ASSERT(mQueue.IsEmpty(), "All tasks must have been processed");
+  }
+
+  void Push(SourceBufferTask* aTask) { mQueue.AppendElement(aTask); }
+
+  already_AddRefed<SourceBufferTask> Pop() {
+    if (!mQueue.Length()) {
+      return nullptr;
+    }
+    RefPtr<SourceBufferTask> task = std::move(mQueue[0]);
+    mQueue.RemoveElementAt(0);
+    return task.forget();
+  }
+
+  nsTArray<RefPtr<SourceBufferTask>>::size_type Length() const {
+    return mQueue.Length();
+  }
+
+ private:
+  nsTArray<RefPtr<SourceBufferTask>> mQueue;
+};
+
+DDLoggedTypeDeclName(TrackBuffersManager);
+
+class TrackBuffersManager final
+    : public DecoderDoctorLifeLogger<TrackBuffersManager> {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(TrackBuffersManager);
+
+  enum class EvictDataResult : int8_t {
+    NO_DATA_EVICTED,
+    CANT_EVICT,
+    BUFFER_FULL,
+  };
+
+  using TrackType = TrackInfo::TrackType;
+  using MediaType = MediaData::Type;
+  using TrackBuffer = nsTArray<RefPtr<MediaRawData>>;
+  using AppendPromise = SourceBufferTask::AppendPromise;
+  using RangeRemovalPromise = SourceBufferTask::RangeRemovalPromise;
+
+  TrackBuffersManager(MediaSourceDecoder* aParentDecoder,
+                      const MediaContainerType& aType);
+
+  RefPtr<AppendPromise> AppendData(already_AddRefed<MediaByteBuffer> aData,
+                                   const SourceBufferAttributes& aAttributes);
+
+  void AbortAppendData();
+
+  void ResetParserState(SourceBufferAttributes& aAttributes);
+
+  RefPtr<RangeRemovalPromise> RangeRemoval(media::TimeUnit aStart,
+                                           media::TimeUnit aEnd);
+
+  EvictDataResult EvictData(const media::TimeUnit& aPlaybackTime, int64_t aSize,
+                            TrackType aType);
+
+  void EvictDataWithoutSize(TrackType aType, const media::TimeUnit& aTarget);
+
+  void ChangeType(const MediaContainerType& aType);
+
+  media::TimeIntervals Buffered() const;
+  media::TimeUnit HighestStartTime() const;
+  media::TimeUnit HighestEndTime() const;
+
+  int64_t GetSize() const;
+
+  void SetEnded(const dom::Optional<dom::MediaSourceEndOfStreamError>& aError);
+
+  void Detach();
+
+  int64_t EvictionThreshold(
+      TrackInfo::TrackType aType = TrackInfo::TrackType::kUndefinedTrack) const;
+
+  MediaInfo GetMetadata() const;
+  const TrackBuffer& GetTrackBuffer(TrackInfo::TrackType aTrack) const;
+  const media::TimeIntervals& Buffered(TrackInfo::TrackType) const;
+  const media::TimeUnit& HighestStartTime(TrackInfo::TrackType) const;
+  media::TimeIntervals SafeBuffered(TrackInfo::TrackType) const;
+  bool HaveAllData() const { return mHaveAllData; }
+  uint32_t Evictable(TrackInfo::TrackType aTrack) const;
+  media::TimeUnit Seek(TrackInfo::TrackType aTrack,
+                       const media::TimeUnit& aTime,
+                       const media::TimeUnit& aFuzz);
+  uint32_t SkipToNextRandomAccessPoint(TrackInfo::TrackType aTrack,
+                                       const media::TimeUnit& aTimeThreadshold,
+                                       const media::TimeUnit& aFuzz,
+                                       bool& aFound);
+
+  already_AddRefed<MediaRawData> GetSample(TrackInfo::TrackType aTrack,
+                                           const media::TimeUnit& aFuzz,
+                                           MediaResult& aResult);
+  int32_t FindCurrentPosition(TrackInfo::TrackType aTrack,
+                              const media::TimeUnit& aFuzz) const
+      MOZ_REQUIRES(mTaskQueueCapability);
+
+  nsresult SetNextGetSampleIndexIfNeeded(TrackInfo::TrackType aTrack,
+                                         const media::TimeUnit& aFuzz)
+      MOZ_REQUIRES(mTaskQueueCapability);
+
+  media::TimeUnit GetNextRandomAccessPoint(TrackInfo::TrackType aTrack,
+                                           const media::TimeUnit& aFuzz);
+
+  RefPtr<GenericPromise> RequestDebugInfo(
+      dom::TrackBuffersManagerDebugInfo& aInfo) const;
+  void AddSizeOfResources(MediaSourceDecoder::ResourceSizes* aSizes) const;
+
+ private:
+  using CodedFrameProcessingPromise = MozPromise<bool, MediaResult, true>;
+
+  ~TrackBuffersManager();
+  void Reopen();
+
+  RefPtr<AppendPromise> DoAppendData(already_AddRefed<MediaByteBuffer> aData,
+                                     const SourceBufferAttributes& aAttributes);
+  void ScheduleSegmentParserLoop() MOZ_REQUIRES(mTaskQueueCapability);
+  void SegmentParserLoop() MOZ_REQUIRES(mTaskQueueCapability);
+  void InitializationSegmentReceived() MOZ_REQUIRES(mTaskQueueCapability);
+  void ShutdownDemuxers() MOZ_REQUIRES(mTaskQueueCapability);
+  void CreateDemuxerforMIMEType() MOZ_REQUIRES(mTaskQueueCapability);
+  void ResetDemuxingState() MOZ_REQUIRES(mTaskQueueCapability);
+  void NeedMoreData() MOZ_REQUIRES(mTaskQueueCapability);
+  void RejectAppend(const MediaResult& aRejectValue, const char* aName)
+      MOZ_REQUIRES(mTaskQueueCapability);
+  RefPtr<CodedFrameProcessingPromise> CodedFrameProcessing()
+      MOZ_REQUIRES(mTaskQueueCapability);
+  void CompleteCodedFrameProcessing() MOZ_REQUIRES(mTaskQueueCapability);
+  void CompleteResetParserState() MOZ_REQUIRES(mTaskQueueCapability);
+  RefPtr<RangeRemovalPromise> CodedFrameRemovalWithPromise(
+      const media::TimeInterval& aInterval) MOZ_REQUIRES(mTaskQueueCapability);
+  bool CodedFrameRemoval(const media::TimeInterval& aInterval)
+      MOZ_REQUIRES(mTaskQueueCapability);
+  void RemoveAllCodedFrames() MOZ_REQUIRES(mTaskQueueCapability);
+  void SetAppendState(SourceBufferAttributes::AppendState aAppendState)
+      MOZ_REQUIRES(mTaskQueueCapability);
+
+  bool HasVideo() const { return mVideoTracks.mNumTracks > 0; }
+  bool HasAudio() const { return mAudioTracks.mNumTracks > 0; }
+
+  Maybe<MediaSpan> mInputBuffer MOZ_GUARDED_BY(mTaskQueueCapability);
+  Atomic<bool> mBufferFull;
+  bool mFirstInitializationSegmentReceived MOZ_GUARDED_BY(mTaskQueueCapability);
+  bool mChangeTypeReceived MOZ_GUARDED_BY(mTaskQueueCapability);
+  bool mNewMediaSegmentStarted MOZ_GUARDED_BY(mTaskQueueCapability);
+  bool mActiveTrack MOZ_GUARDED_BY(mTaskQueueCapability);
+  MediaContainerType mType MOZ_GUARDED_BY(mTaskQueueCapability);
+
+
+  void RecreateParser(bool aReuseInitData) MOZ_REQUIRES(mTaskQueueCapability);
+  UniquePtr<ContainerParser> mParser;
+
+  void AppendDataToCurrentInputBuffer(const MediaSpan& aData)
+      MOZ_REQUIRES(mTaskQueueCapability);
+
+  RefPtr<MediaByteBuffer> mInitData MOZ_GUARDED_BY(mTaskQueueCapability);
+
+  bool IsRepeatInitData(const MediaInfo& aNewMediaInfo) const
+      MOZ_REQUIRES(mTaskQueueCapability);
+
+  Maybe<MediaSpan> mPendingInputBuffer MOZ_GUARDED_BY(mTaskQueueCapability);
+  RefPtr<SourceBufferResource> mCurrentInputBuffer
+      MOZ_GUARDED_BY(mTaskQueueCapability);
+  RefPtr<MediaDataDemuxer> mInputDemuxer MOZ_GUARDED_BY(mTaskQueueCapability);
+  uint64_t mProcessedInput MOZ_GUARDED_BY(mTaskQueueCapability);
+  Maybe<media::TimeUnit> mLastParsedEndTime
+      MOZ_GUARDED_BY(mTaskQueueCapability);
+
+  void OnDemuxerInitDone(const MediaResult& aResult);
+  void OnDemuxerInitFailed(const MediaResult& aError);
+  void OnDemuxerResetDone(const MediaResult& aResult)
+      MOZ_REQUIRES(mTaskQueueCapability);
+  MozPromiseRequestHolder<MediaDataDemuxer::InitPromise> mDemuxerInitRequest;
+
+  void OnDemuxFailed(TrackType aTrack, const MediaResult& aError)
+      MOZ_REQUIRES(mTaskQueueCapability);
+  void DoDemuxVideo() MOZ_REQUIRES(mTaskQueueCapability);
+  void OnVideoDemuxCompleted(
+      const RefPtr<MediaTrackDemuxer::SamplesHolder>& aSamples);
+  void OnVideoDemuxFailed(const MediaResult& aError) {
+    mVideoTracks.mDemuxRequest.Complete();
+    mTaskQueueCapability->AssertOnCurrentThread();
+    OnDemuxFailed(TrackType::kVideoTrack, aError);
+  }
+  void DoDemuxAudio() MOZ_REQUIRES(mTaskQueueCapability);
+  void OnAudioDemuxCompleted(
+      const RefPtr<MediaTrackDemuxer::SamplesHolder>& aSamples);
+  void OnAudioDemuxFailed(const MediaResult& aError) {
+    mAudioTracks.mDemuxRequest.Complete();
+    mTaskQueueCapability->AssertOnCurrentThread();
+    OnDemuxFailed(TrackType::kAudioTrack, aError);
+  }
+
+  void DoEvictData(const media::TimeUnit& aPlaybackTime,
+                   Maybe<int64_t> aSizeToEvict)
+      MOZ_REQUIRES(mTaskQueueCapability);
+
+  void GetDebugInfo(dom::TrackBuffersManagerDebugInfo& aInfo) const
+      MOZ_REQUIRES(mTaskQueueCapability);
+
+  struct TrackData {
+    TrackData() : mNumTracks(0), mNeedRandomAccessPoint(true), mSizeBuffer(0) {}
+    Atomic<uint32_t> mNumTracks;
+    Maybe<media::TimeUnit> mLastDecodeTimestamp;
+    Maybe<media::TimeUnit> mLastFrameDuration;
+    Maybe<media::TimeUnit> mHighestEndTimestamp;
+    media::TimeUnit mHighestStartTimestamp;
+    media::TimeUnit mLongestFrameDuration;
+    bool mNeedRandomAccessPoint;
+    RefPtr<MediaTrackDemuxer> mDemuxer;
+    MozPromiseRequestHolder<MediaTrackDemuxer::SamplesPromise> mDemuxRequest;
+    media::TimeUnit mLastParsedEndTime;
+
+    Maybe<uint32_t> mNextInsertionIndex;
+    TrackBuffer mQueuedSamples;
+    const TrackBuffer& GetTrackBuffer() const {
+      MOZ_RELEASE_ASSERT(mBuffers.Length(),
+                         "TrackBuffer must have been created");
+      return mBuffers.LastElement();
+    }
+    TrackBuffer& GetTrackBuffer() {
+      MOZ_RELEASE_ASSERT(mBuffers.Length(),
+                         "TrackBuffer must have been created");
+      return mBuffers.LastElement();
+    }
+    nsTArray<TrackBuffer> mBuffers;
+    media::TimeIntervals mBufferedRanges;
+    media::TimeIntervals mSanitizedBufferedRanges;
+    uint32_t mSizeBuffer;
+    RefPtr<TrackInfoSharedPtr> mInfo;
+    RefPtr<TrackInfoSharedPtr> mLastInfo;
+
+    Maybe<uint32_t> mNextGetSampleIndex;
+    media::TimeUnit mNextSampleTimecode;
+    media::TimeUnit mNextSampleTime;
+
+    struct EvictionIndex {
+      EvictionIndex() { Reset(); }
+      void Reset() {
+        mEvictable = 0;
+        mLastIndex = 0;
+      }
+      uint32_t mEvictable = 0;
+      uint32_t mLastIndex = 0;
+    };
+    EvictionIndex mEvictionIndex;
+
+    void ResetAppendState() {
+      mLastDecodeTimestamp.reset();
+      mLastFrameDuration.reset();
+      mHighestEndTimestamp.reset();
+      mNeedRandomAccessPoint = true;
+      mNextInsertionIndex.reset();
+    }
+
+    void Reset() {
+      ResetAppendState();
+      mEvictionIndex.Reset();
+      for (auto& buffer : mBuffers) {
+        buffer.Clear();
+      }
+      mSizeBuffer = 0;
+      mNextGetSampleIndex.reset();
+      mBufferedRanges.Clear();
+      mSanitizedBufferedRanges.Clear();
+    }
+
+    void AddSizeOfResources(MediaSourceDecoder::ResourceSizes* aSizes) const;
+  };
+
+  void CheckSequenceDiscontinuity(const media::TimeUnit& aPresentationTime)
+      MOZ_REQUIRES(mTaskQueueCapability);
+  void ProcessFrames(TrackBuffer& aSamples, TrackData& aTrackData)
+      MOZ_REQUIRES(mTaskQueueCapability);
+  media::TimeInterval PresentationInterval(const TrackBuffer& aSamples) const
+      MOZ_REQUIRES(mTaskQueueCapability);
+  bool CheckNextInsertionIndex(TrackData& aTrackData,
+                               const media::TimeUnit& aSampleTime)
+      MOZ_REQUIRES(mTaskQueueCapability);
+  void InsertFrames(TrackBuffer& aSamples,
+                    const media::TimeIntervals& aIntervals,
+                    TrackData& aTrackData) MOZ_REQUIRES(mTaskQueueCapability);
+  void UpdateHighestTimestamp(TrackData& aTrackData,
+                              const media::TimeUnit& aHighestTime)
+      MOZ_REQUIRES(mTaskQueueCapability);
+  enum class RemovalMode {
+    kRemoveFrame,
+    kTruncateFrame,
+  };
+  uint32_t RemoveFrames(const media::TimeIntervals& aIntervals,
+                        TrackData& aTrackData, uint32_t aStartIndex,
+                        RemovalMode aMode);
+  void ResetEvictionIndex(TrackData& aTrackData);
+  void UpdateEvictionIndex(TrackData& aTrackData, uint32_t aCurrentIndex);
+  uint32_t FindSampleIndex(const TrackBuffer& aTrackBuffer,
+                           const media::TimeInterval& aInterval);
+  const MediaRawData* GetSample(TrackInfo::TrackType aTrack, uint32_t aIndex,
+                                const media::TimeUnit& aExpectedDts,
+                                const media::TimeUnit& aExpectedPts,
+                                const media::TimeUnit& aFuzz);
+  void UpdateBufferedRanges();
+  void RejectProcessing(const MediaResult& aRejectValue, const char* aName);
+  void ResolveProcessing(bool aResolveValue, const char* aName);
+  MozPromiseRequestHolder<CodedFrameProcessingPromise> mProcessingRequest;
+  MozPromiseHolder<CodedFrameProcessingPromise> mProcessingPromise;
+
+  nsTArray<const TrackData*> GetTracksList() const;
+  nsTArray<TrackData*> GetTracksList();
+  TrackData& GetTracksData(TrackType aTrack) {
+    switch (aTrack) {
+      case TrackType::kVideoTrack:
+        return mVideoTracks;
+      case TrackType::kAudioTrack:
+      default:
+        return mAudioTracks;
+    }
+  }
+  const TrackData& GetTracksData(TrackType aTrack) const {
+    switch (aTrack) {
+      case TrackType::kVideoTrack:
+        return mVideoTracks;
+      case TrackType::kAudioTrack:
+      default:
+        return mAudioTracks;
+    }
+  }
+  TrackData mVideoTracks;
+  TrackData mAudioTracks;
+
+  RefPtr<TaskQueue> GetTaskQueueSafe() const {
+    MutexAutoLock mut(mMutex);
+    return mTaskQueue;
+  }
+  NotNull<AbstractThread*> TaskQueueFromTaskQueue() const {
+#ifdef DEBUG
+    RefPtr<TaskQueue> taskQueue = GetTaskQueueSafe();
+    MOZ_ASSERT(taskQueue && taskQueue->IsCurrentThreadIn());
+#endif
+    return WrapNotNull(mTaskQueue.get());
+  }
+  bool OnTaskQueue() const {
+    auto taskQueue = TaskQueueFromTaskQueue();
+    return taskQueue->IsCurrentThreadIn();
+  }
+  void ResetTaskQueue() {
+    MutexAutoLock mut(mMutex);
+    mTaskQueue = nullptr;
+  }
+
+  SourceBufferTaskQueue mQueue;
+  void QueueTask(SourceBufferTask* aTask);
+  void ProcessTasks();
+  RefPtr<SourceBufferTask> mCurrentTask MOZ_GUARDED_BY(mTaskQueueCapability);
+  UniquePtr<SourceBufferAttributes> mSourceBufferAttributes
+      MOZ_GUARDED_BY(mTaskQueueCapability);
+  media::Interval<double> mAppendWindow MOZ_GUARDED_BY(mTaskQueueCapability);
+
+  nsMainThreadPtrHandle<MediaSourceDecoder> mParentDecoder;
+
+  const RefPtr<AbstractThread> mAbstractMainThread;
+
+  media::TimeUnit HighestEndTime(
+      nsTArray<const media::TimeIntervals*>& aTracks) const;
+
+  Atomic<bool> mHaveAllData{false};
+
+  Atomic<int64_t> mSizeSourceBuffer;
+  const int64_t mVideoEvictionThreshold;
+  const int64_t mAudioEvictionThreshold;
+  const double mEvictionBufferWatermarkRatio;
+  enum class EvictionState {
+    NO_EVICTION_NEEDED,
+    EVICTION_NEEDED,
+    EVICTION_COMPLETED,
+  };
+  Atomic<EvictionState> mEvictionState;
+
+  mutable Mutex mMutex MOZ_UNANNOTATED;
+  RefPtr<TaskQueue> mTaskQueue;
+  media::TimeIntervals mVideoBufferedRanges;
+  media::TimeIntervals mAudioBufferedRanges;
+  MediaInfo mInfo;
+  bool mEnded MOZ_GUARDED_BY(mMutex) = false;
+
+  Maybe<EventTargetCapability<TaskQueue>> mTaskQueueCapability;
+
+  Maybe<media::TimeUnit> mFrameEndTimeBeforeRecreateDemuxer;
+};
+
+}  
+
+#endif /* MOZILLA_TRACKBUFFERSMANAGER_H_ */

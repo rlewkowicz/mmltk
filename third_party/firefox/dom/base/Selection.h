@@ -1,0 +1,905 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_Selection_h_
+#define mozilla_Selection_h_
+
+#include "mozilla/AutoRestore.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/PresShellForwards.h"
+#include "mozilla/RangeBoundary.h"
+#include "mozilla/SelectionChangeEventDispatcher.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/dom/Highlight.h"
+#include "mozilla/dom/StyledRange.h"
+#include "mozilla/intl/BidiEmbeddingLevel.h"
+#include "nsDirection.h"
+#include "nsISelectionController.h"
+#include "nsISelectionListener.h"
+#include "nsRange.h"
+#include "nsTArrayForwardDeclare.h"
+#include "nsThreadUtils.h"
+#include "nsWeakReference.h"
+#include "nsWrapperCache.h"
+
+struct CachedOffsetForFrame;
+class AutoScroller;
+class nsIFrame;
+class nsFrameSelection;
+class nsPIDOMWindowOuter;
+struct SelectionDetails;
+struct SelectionCustomColors;
+class nsCopySupport;
+class nsHTMLCopyEncoder;
+class nsPresContext;
+struct nsPoint;
+struct nsRect;
+
+namespace mozilla {
+class AccessibleCaretEventHub;
+class ErrorResult;
+class HTMLEditor;
+enum class CaretAssociationHint;
+enum class TableSelectionMode : uint32_t;
+struct AutoPrepareFocusRange;
+struct PrimaryFrameData;
+namespace dom {
+class DocGroup;
+class ShadowRootOrGetComposedRangesOptions;
+}  
+}  
+
+namespace mozilla {
+
+enum class SelectionScrollMode : uint8_t {
+  Async,
+  SyncNoFlush,
+  SyncFlush,
+};
+
+namespace dom {
+
+class MOZ_RAII SelectionNodeCache final {
+ public:
+  ~SelectionNodeCache();
+  bool MaybeCollectNodesAndCheckIfFullySelectedInAnyOf(
+      const nsINode* aNode, const nsTArray<Selection*>& aSelections);
+
+  bool MaybeCollectNodesAndCheckIfFullySelected(const nsINode* aNode,
+                                                const Selection* aSelection) {
+    return MaybeCollect(aSelection).Contains(aNode);
+  }
+
+  AutoTArray<Selection*, 1>* LastCommonAncestorSelections(
+      const nsINode* aCommonAncestorForRangeInSelection) {
+    if (mLastCommonAncestorForRangeInSelection &&
+        mLastCommonAncestorForRangeInSelection ==
+            aCommonAncestorForRangeInSelection) {
+      return &mLastCommonAncestorSelections;
+    }
+    return nullptr;
+  }
+
+  void SetLastCommonAncestorSelections(
+      const nsINode* aCommonAncestorForRangeInSelection,
+      const AutoTArray<Selection*, 1>& aAncestorSelections) {
+    mLastCommonAncestorForRangeInSelection = aCommonAncestorForRangeInSelection;
+    mLastCommonAncestorSelections.Clear();
+    mLastCommonAncestorSelections.AppendElements(aAncestorSelections);
+  }
+
+ private:
+  friend PresShell;
+  explicit SelectionNodeCache(PresShell& aOwningPresShell);
+  const nsTHashSet<const nsINode*>& MaybeCollect(const Selection* aSelection);
+
+  const nsINode* mLastCommonAncestorForRangeInSelection = nullptr;
+
+  AutoTArray<Selection*, 1> mLastCommonAncestorSelections;
+
+  nsTHashMap<const Selection*, nsTHashSet<const nsINode*>> mSelectedNodes;
+
+  PresShell& mOwningPresShell;
+};
+
+class Selection final : public nsSupportsWeakReference,
+                        public nsWrapperCache,
+                        public SupportsWeakPtr {
+  using AllowRangeCrossShadowBoundary =
+      mozilla::dom::AllowRangeCrossShadowBoundary;
+  using IsUnlinking = AbstractRange::IsUnlinking;
+
+ protected:
+  ~Selection();
+
+ public:
+  explicit Selection(SelectionType aSelectionType,
+                     nsFrameSelection* aFrameSelection);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(Selection)
+
+  void StartBatchChanges(const char* aDetails);
+
+  MOZ_CAN_RUN_SCRIPT void EndBatchChanges(
+      const char* aDetails, int16_t aReason = nsISelectionListener::NO_REASON);
+
+  void NotifyAutoCopy() {
+    MOZ_ASSERT(mSelectionType == SelectionType::eNormal);
+
+    mNotifyAutoCopy = true;
+  }
+
+  void MaybeNotifyAccessibleCaretEventHub(PresShell* aPresShell);
+
+  void StopNotifyingAccessibleCaretEventHub();
+
+  void EnableSelectionChangeEvent() {
+    if (!mSelectionChangeEventDispatcher) {
+      mSelectionChangeEventDispatcher = new SelectionChangeEventDispatcher();
+    }
+  }
+
+  Document* GetParentObject() const;
+
+  DocGroup* GetDocGroup() const;
+
+  nsPresContext* GetPresContext() const;
+  PresShell* GetPresShell() const;
+  Document* GetDocument() const;
+  nsFrameSelection* GetFrameSelection() const { return mFrameSelection; }
+  nsIFrame* GetSelectionAnchorGeometry(SelectionRegion aRegion, nsRect* aRect);
+  nsIFrame* GetSelectionEndPointGeometry(SelectionRegion aRegion,
+                                         nsRect* aRect);
+
+  nsresult PostScrollSelectionIntoViewEvent(SelectionRegion aRegion,
+                                            ScrollFlags aFlags,
+                                            AxisScrollParams aVertical,
+                                            AxisScrollParams aHorizontal);
+
+  MOZ_CAN_RUN_SCRIPT nsresult ScrollIntoView(
+      SelectionRegion, AxisScrollParams aVertical = AxisScrollParams(),
+      AxisScrollParams aHorizontal = AxisScrollParams(),
+      ScrollFlags = ScrollFlags::None,
+      SelectionScrollMode = SelectionScrollMode::Async);
+
+ private:
+  static bool IsUserSelectionCollapsed(
+      const nsRange& aRange, nsTArray<RefPtr<nsRange>>& aTempRangesToAdd);
+  enum class DispatchSelectstartEvent {
+    No,
+    Maybe,
+  };
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult AddRangesForUserSelectableNodes(
+      nsRange* aRange, Maybe<size_t>* aOutIndex,
+      const DispatchSelectstartEvent aDispatchSelectstartEvent);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult AddRangesForSelectableNodes(
+      nsRange* aRange, Maybe<size_t>* aOutIndex,
+      DispatchSelectstartEvent aDispatchSelectstartEvent);
+
+  already_AddRefed<StaticRange> GetComposedRange(
+      const AbstractRange* aRange,
+      const Sequence<OwningNonNull<ShadowRoot>>& aShadowRoots) const;
+
+ public:
+  nsresult RemoveCollapsedRanges();
+  void Clear(nsPresContext* aPresContext,
+             IsUnlinking aIsUnlinking = IsUnlinking::No);
+  MOZ_CAN_RUN_SCRIPT nsresult CollapseInLimiter(nsINode* aContainer,
+                                                uint32_t aOffset) {
+    if (!aContainer) {
+      return NS_ERROR_INVALID_ARG;
+    }
+    return CollapseInLimiter(RawRangeBoundary(aContainer, aOffset));
+  }
+  MOZ_CAN_RUN_SCRIPT nsresult
+  CollapseInLimiter(const RawRangeBoundary& aPoint) {
+    ErrorResult result;
+    CollapseInLimiter(aPoint, result);
+    return result.StealNSResult();
+  }
+  MOZ_CAN_RUN_SCRIPT void CollapseInLimiter(const RawRangeBoundary& aPoint,
+                                            ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT nsresult Extend(nsINode* aContainer, uint32_t aOffset);
+
+  nsRange* GetRangeAt(uint32_t aIndex) const;
+  nsRange* GetFirstRange() const { return GetRangeAt(0); }
+  nsRange* GetLastRange() const {
+    return RangeCount() ? GetRangeAt(RangeCount() - 1u) : nullptr;
+  }
+
+  AbstractRange* GetAbstractRangeAt(uint32_t aIndex) const;
+  const nsRange* GetAnchorFocusRange() const { return mAnchorFocusRange; }
+
+  void SetAnchorFocusRange(size_t aIndex);
+
+  void GetDirection(nsAString& aDirection) const;
+
+  nsDirection GetDirection() const { return mDirection; }
+
+  void SetDirection(nsDirection aDir) { mDirection = aDir; }
+  MOZ_CAN_RUN_SCRIPT nsresult SetAnchorFocusToRange(nsRange* aRange);
+
+  MOZ_CAN_RUN_SCRIPT void ReplaceAnchorFocusRange(nsRange* aRange);
+
+  void AdjustAnchorFocusForMultiRange(nsDirection aDirection);
+
+  nsIFrame* GetPrimaryFrameForAnchorNode() const;
+
+  PrimaryFrameData GetPrimaryFrameForCaretAtFocusNode(bool aVisual) const;
+
+  UniquePtr<SelectionDetails> LookUpSelection(
+      nsIContent* aContent, uint32_t aContentOffset, uint32_t aContentLength,
+      UniquePtr<SelectionDetails> aDetailsHead, SelectionType aSelectionType);
+
+  NS_IMETHOD Repaint(nsPresContext* aPresContext);
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult StartAutoScrollTimer(nsIFrame* aFrame, const nsPoint& aPoint,
+                                uint32_t aDelayInMs);
+
+  nsresult StopAutoScrollTimer();
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  nsINode* GetAnchorNode(CallerType aCallerType = CallerType::System) const {
+    const RangeBoundary& anchor = AnchorRef();
+    nsINode* anchorNode = anchor.IsSet() ? anchor.GetContainer() : nullptr;
+    if (!anchorNode || aCallerType == CallerType::System ||
+        !anchorNode->ChromeOnlyAccess()) {
+      return anchorNode;
+    }
+    return anchorNode->AsContent()->FindFirstNonChromeOnlyAccessContent();
+  }
+  uint32_t AnchorOffset(CallerType aCallerType = CallerType::System) const {
+    const RangeBoundary& anchor = AnchorRef();
+    if (aCallerType != CallerType::System && anchor.IsSet() &&
+        anchor.GetContainer()->ChromeOnlyAccess()) {
+      return 0;
+    }
+    const Maybe<uint32_t> offset =
+        anchor.Offset(RangeBoundary::OffsetFilter::kValidOffsets);
+    return offset ? *offset : 0;
+  }
+  nsINode* GetFocusNode(CallerType aCallerType = CallerType::System) const {
+    const RangeBoundary& focus = FocusRef();
+    nsINode* focusNode = focus.IsSet() ? focus.GetContainer() : nullptr;
+    if (!focusNode || aCallerType == CallerType::System ||
+        !focusNode->ChromeOnlyAccess()) {
+      return focusNode;
+    }
+    return focusNode->AsContent()->FindFirstNonChromeOnlyAccessContent();
+  }
+  uint32_t FocusOffset(CallerType aCallerType = CallerType::System) const {
+    const RangeBoundary& focus = FocusRef();
+    if (aCallerType != CallerType::System && focus.IsSet() &&
+        focus.GetContainer()->ChromeOnlyAccess()) {
+      return 0;
+    }
+    const Maybe<uint32_t> offset =
+        focus.Offset(RangeBoundary::OffsetFilter::kValidOffsets);
+    return offset ? *offset : 0;
+  }
+
+  nsINode* GetMayCrossShadowBoundaryAnchorNode() const {
+    const RangeBoundary& anchor = AnchorRef(AllowRangeCrossShadowBoundary::Yes);
+    return anchor.IsSet() ? anchor.GetContainer() : nullptr;
+  }
+
+  uint32_t MayCrossShadowBoundaryAnchorOffset() const {
+    const RangeBoundary& anchor = AnchorRef(AllowRangeCrossShadowBoundary::Yes);
+    const Maybe<uint32_t> offset =
+        anchor.Offset(RangeBoundary::OffsetFilter::kValidOffsets);
+    return offset ? *offset : 0;
+  }
+
+  nsINode* GetMayCrossShadowBoundaryFocusNode() const {
+    const RangeBoundary& focus = FocusRef(AllowRangeCrossShadowBoundary::Yes);
+    return focus.IsSet() ? focus.GetContainer() : nullptr;
+  }
+
+  uint32_t MayCrossShadowBoundaryFocusOffset() const {
+    const RangeBoundary& focus = FocusRef(AllowRangeCrossShadowBoundary::Yes);
+    const Maybe<uint32_t> offset =
+        focus.Offset(RangeBoundary::OffsetFilter::kValidOffsets);
+    return offset ? *offset : 0;
+  }
+
+  nsIContent* GetChildAtAnchorOffset() {
+    const RangeBoundary& anchor = AnchorRef();
+    return anchor.IsSet() ? anchor.GetChildAtOffset() : nullptr;
+  }
+  nsIContent* GetChildAtFocusOffset() {
+    const RangeBoundary& focus = FocusRef();
+    return focus.IsSet() ? focus.GetChildAtOffset() : nullptr;
+  }
+
+  const RangeBoundary& AnchorRef(
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+          AllowRangeCrossShadowBoundary::No) const;
+  const RangeBoundary& FocusRef(
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+          AllowRangeCrossShadowBoundary::No) const;
+
+  bool IsCollapsed() const {
+    size_t cnt = mStyledRanges.Length();
+    if (cnt == 0) {
+      return true;
+    }
+
+    if (cnt != 1) {
+      return false;
+    }
+
+    return mStyledRanges.GetAbstractRangeAt(0)->Collapsed();
+  }
+
+  bool AreNormalAndCrossShadowBoundaryRangesCollapsed() const {
+    if (!IsCollapsed()) {
+      return false;
+    }
+
+    size_t cnt = mStyledRanges.Length();
+    if (cnt == 0) {
+      return true;
+    }
+
+    AbstractRange* range = mStyledRanges.GetAbstractRangeAt(0);
+    if (range->MayCrossShadowBoundary()) {
+      return range->AsDynamicRange()->CrossShadowBoundaryRangeCollapsed();
+    }
+
+    return true;
+  }
+
+  MOZ_CAN_RUN_SCRIPT void CollapseJS(nsINode* aContainer, uint32_t aOffset,
+                                     mozilla::ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void CollapseToStartJS(mozilla::ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void CollapseToEndJS(mozilla::ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void ExtendJS(nsINode& aContainer, uint32_t aOffset,
+                                   mozilla::ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void SelectAllChildrenJS(nsINode& aNode,
+                                              mozilla::ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void DeleteFromDocument(mozilla::ErrorResult& aRv);
+
+  uint32_t RangeCount() const { return mStyledRanges.Length(); }
+
+  void GetType(nsAString& aOutType) const;
+
+  nsRange* GetRangeAt(uint32_t aIndex, mozilla::ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void AddRangeJS(nsRange& aRange,
+                                     mozilla::ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void RemoveRangeAndUnselectFramesAndNotifyListeners(
+      AbstractRange& aRange, mozilla::ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void RemoveAllRanges(mozilla::ErrorResult& aRv);
+
+  void GetComposedRanges(
+      const ShadowRootOrGetComposedRangesOptions&
+          aShadowRootOrGetComposedRangesOptions,
+      const Sequence<OwningNonNull<ShadowRoot>>& aShadowRoots,
+      nsTArray<RefPtr<StaticRange>>& aComposedRanges);
+
+  enum class FlushFrames { No, Yes };
+  MOZ_CAN_RUN_SCRIPT
+  void Stringify(nsAString& aResult,
+                 CallerType aCallerType = CallerType::System,
+                 FlushFrames = FlushFrames::Yes);
+
+  bool ContainsNode(nsINode& aNode, bool aPartlyContained,
+                    mozilla::ErrorResult& aRv);
+
+  bool ContainsPoint(const nsPoint& aPoint);
+
+  MOZ_CAN_RUN_SCRIPT void Modify(const nsAString& aAlter,
+                                 const nsAString& aDirection,
+                                 const nsAString& aGranularity);
+
+  MOZ_CAN_RUN_SCRIPT
+  void SetBaseAndExtentJS(nsINode& aAnchorNode, uint32_t aAnchorOffset,
+                          nsINode& aFocusNode, uint32_t aFocusOffset,
+                          mozilla::ErrorResult& aRv);
+
+  bool GetInterlinePositionJS(mozilla::ErrorResult& aRv) const;
+  void SetInterlinePositionJS(bool aHintRight, mozilla::ErrorResult& aRv);
+
+  enum class InterlinePosition : uint8_t {
+    EndOfLine,
+    StartOfNextLine,
+    Undefined,
+  };
+  InterlinePosition GetInterlinePosition() const;
+  nsresult SetInterlinePosition(InterlinePosition aInterlinePosition);
+
+  Nullable<int16_t> GetCaretBidiLevel(mozilla::ErrorResult& aRv) const;
+  void SetCaretBidiLevel(const Nullable<int16_t>& aCaretBidiLevel,
+                         mozilla::ErrorResult& aRv);
+
+  void ToStringWithFormat(const nsAString& aFormatType, uint32_t aFlags,
+                          int32_t aWrapColumn, nsAString& aReturn,
+                          mozilla::ErrorResult& aRv);
+  void AddSelectionListener(nsISelectionListener* aListener);
+  void RemoveSelectionListener(nsISelectionListener* aListener);
+
+  RawSelectionType RawType() const {
+    return ToRawSelectionType(mSelectionType);
+  }
+  SelectionType Type() const { return mSelectionType; }
+
+  void SetHighlightSelectionData(
+      dom::HighlightSelectionData aHighlightSelectionData);
+
+  const dom::HighlightSelectionData& HighlightSelectionData() const {
+    return mHighlightData;
+  }
+
+  void GetRangesForInterval(nsINode& aBeginNode, uint32_t aBeginOffset,
+                            nsINode& aEndNode, uint32_t aEndOffset,
+                            bool aAllowAdjacent,
+                            nsTArray<RefPtr<nsRange>>& aReturn,
+                            ErrorResult& aRv);
+
+  void SetColors(const nsAString& aForeColor, const nsAString& aBackColor,
+                 const nsAString& aAltForeColor, const nsAString& aAltBackColor,
+                 ErrorResult& aRv);
+
+  void ResetColors();
+
+
+  MOZ_CAN_RUN_SCRIPT void CollapseInLimiter(nsINode& aContainer,
+                                            uint32_t aOffset,
+                                            ErrorResult& aRv) {
+    CollapseInLimiter(RawRangeBoundary(&aContainer, aOffset), aRv);
+  }
+
+ private:
+  enum class InLimiter {
+    eYes,
+    eNo,
+  };
+  MOZ_CAN_RUN_SCRIPT
+  void CollapseInternal(InLimiter aInLimiter, const RawRangeBoundary& aPoint,
+                        ErrorResult& aRv);
+
+ public:
+  MOZ_CAN_RUN_SCRIPT void CollapseToStart(mozilla::ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void CollapseToEnd(mozilla::ErrorResult& aRv);
+
+ private:
+  MOZ_CAN_RUN_SCRIPT void ExtendInternal(nsINode& aContainer, uint32_t aOffset,
+                                         ErrorResult& aRv);
+
+ public:
+  MOZ_CAN_RUN_SCRIPT void AddRangeAndSelectFramesAndNotifyListeners(
+      nsRange& aRange, mozilla::ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void AddHighlightRangeAndSelectFramesAndNotifyListeners(
+      AbstractRange& aRange);
+
+  MOZ_CAN_RUN_SCRIPT void SelectAllChildren(nsINode& aNode,
+                                            mozilla::ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT
+  void SetStartAndEnd(const RawRangeBoundary& aStartRef,
+                      const RawRangeBoundary& aEndRef, ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT
+  void SetStartAndEnd(nsINode& aStartContainer, uint32_t aStartOffset,
+                      nsINode& aEndContainer, uint32_t aEndOffset,
+                      ErrorResult& aRv) {
+    SetStartAndEnd(RawRangeBoundary(&aStartContainer, aStartOffset),
+                   RawRangeBoundary(&aEndContainer, aEndOffset), aRv);
+  }
+
+  MOZ_CAN_RUN_SCRIPT
+  void SetStartAndEndInLimiter(const RawRangeBoundary& aStartRef,
+                               const RawRangeBoundary& aEndRef,
+                               ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT
+  void SetStartAndEndInLimiter(nsINode& aStartContainer, uint32_t aStartOffset,
+                               nsINode& aEndContainer, uint32_t aEndOffset,
+                               ErrorResult& aRv) {
+    SetStartAndEndInLimiter(RawRangeBoundary(&aStartContainer, aStartOffset),
+                            RawRangeBoundary(&aEndContainer, aEndOffset), aRv);
+  }
+  MOZ_CAN_RUN_SCRIPT
+  Result<Ok, nsresult> SetStartAndEndInLimiter(
+      nsINode& aStartContainer, uint32_t aStartOffset, nsINode& aEndContainer,
+      uint32_t aEndOffset, nsDirection aDirection, int16_t aReason);
+
+  MOZ_CAN_RUN_SCRIPT
+  void SetBaseAndExtent(nsINode& aAnchorNode, uint32_t aAnchorOffset,
+                        nsINode& aFocusNode, uint32_t aFocusOffset,
+                        ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT
+  void SetBaseAndExtent(const RawRangeBoundary& aAnchorRef,
+                        const RawRangeBoundary& aFocusRef, ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT
+  void SetBaseAndExtentInLimiter(nsINode& aAnchorNode, uint32_t aAnchorOffset,
+                                 nsINode& aFocusNode, uint32_t aFocusOffset,
+                                 ErrorResult& aRv) {
+    SetBaseAndExtentInLimiter(RawRangeBoundary(&aAnchorNode, aAnchorOffset),
+                              RawRangeBoundary(&aFocusNode, aFocusOffset), aRv);
+  }
+  MOZ_CAN_RUN_SCRIPT
+  void SetBaseAndExtentInLimiter(const RawRangeBoundary& aAnchorRef,
+                                 const RawRangeBoundary& aFocusRef,
+                                 ErrorResult& aRv);
+
+  void AddSelectionChangeBlocker();
+  void RemoveSelectionChangeBlocker();
+  bool IsBlockingSelectionChangeEvents() const;
+
+  bool IsEditorSelection() const;
+
+  nsresult SetTextRangeStyle(nsRange* aRange,
+                             const TextRangeStyle& aTextRangeStyle);
+
+  [[nodiscard]] Element* GetAncestorLimiter() const;
+  MOZ_CAN_RUN_SCRIPT void SetAncestorLimiter(Element* aLimiter);
+
+  void SetCanCacheFrameOffset(bool aCanCacheFrameOffset);
+
+  nsresult GetAbstractRangesForIntervalArray(nsINode* aBeginNode,
+                                             uint32_t aBeginOffset,
+                                             nsINode* aEndNode,
+                                             uint32_t aEndOffset,
+                                             bool aAllowAdjacent,
+                                             nsTArray<AbstractRange*>* aRanges);
+
+  nsresult GetDynamicRangesForIntervalArray(
+      nsINode* aBeginNode, uint32_t aBeginOffset, nsINode* aEndNode,
+      uint32_t aEndOffset, bool aAllowAdjacent, nsTArray<nsRange*>* aRanges);
+
+  nsresult SelectionLanguageChange(bool aLangRTL);
+
+ private:
+  bool HasSameRootOrSameComposedDoc(const nsINode& aNode) const;
+
+  friend class ::nsCopySupport;
+  friend class ::nsHTMLCopyEncoder;
+  MOZ_CAN_RUN_SCRIPT
+  void AddRangeAndSelectFramesAndNotifyListenersInternal(nsRange& aRange,
+                                                         Document* aDocument,
+                                                         ErrorResult&);
+
+  nsresult GetCachedFrameOffset(nsIFrame* aFrame, int32_t inOffset,
+                                nsPoint& aPoint);
+
+  MOZ_CAN_RUN_SCRIPT
+  void SetStartAndEndInternal(InLimiter aInLimiter,
+                              const RawRangeBoundary& aStartRef,
+                              const RawRangeBoundary& aEndRef,
+                              nsDirection aDirection, ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT
+  void SetBaseAndExtentInternal(InLimiter aInLimiter,
+                                const RawRangeBoundary& aAnchorRef,
+                                const RawRangeBoundary& aFocusRef,
+                                ErrorResult& aRv);
+
+  static bool IsValidNodeAndOffsetForBoundary(const nsINode& aContainer,
+                                              uint32_t aOffset,
+                                              ErrorResult& aRv);
+
+ public:
+  SelectionType GetType() const { return mSelectionType; }
+
+  SelectionCustomColors* GetCustomColors() const { return mCustomColors.get(); }
+
+  enum class IsFromRangeMutationObserver { Yes, No };
+  MOZ_CAN_RUN_SCRIPT void NotifySelectionListeners(
+      bool aCalledByJS, IsFromRangeMutationObserver aIsFromRange =
+                            IsFromRangeMutationObserver::No);
+  MOZ_CAN_RUN_SCRIPT void NotifySelectionListeners();
+
+  bool ChangesDuringBatching() const { return mChangesDuringBatching; }
+
+  friend struct AutoUserInitiated;
+  struct MOZ_RAII AutoUserInitiated {
+    explicit AutoUserInitiated(Selection& aSelectionRef)
+        : AutoUserInitiated(&aSelectionRef) {}
+    explicit AutoUserInitiated(Selection* aSelection)
+        : mSavedValue(aSelection->mUserInitiated) {
+      aSelection->mUserInitiated = true;
+    }
+    AutoRestore<bool> mSavedValue;
+  };
+
+ private:
+  friend struct mozilla::AutoPrepareFocusRange;
+  class ScrollSelectionIntoViewEvent;
+  friend class ScrollSelectionIntoViewEvent;
+
+  class ScrollSelectionIntoViewEvent : public Runnable {
+   public:
+    MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_DECL_NSIRUNNABLE
+
+    ScrollSelectionIntoViewEvent(Selection* aSelection, SelectionRegion aRegion,
+                                 AxisScrollParams aVertical,
+                                 AxisScrollParams aHorizontal,
+                                 ScrollFlags aFlags)
+        : Runnable("dom::Selection::ScrollSelectionIntoViewEvent"),
+          mSelection(aSelection),
+          mRegion(aRegion),
+          mVerticalScroll(aVertical),
+          mHorizontalScroll(aHorizontal),
+          mFlags(aFlags) {
+      NS_ASSERTION(aSelection, "null parameter");
+    }
+    void Revoke() { mSelection = nullptr; }
+
+   private:
+    Selection* mSelection;
+    SelectionRegion mRegion;
+    AxisScrollParams mVerticalScroll;
+    AxisScrollParams mHorizontalScroll;
+    ScrollFlags mFlags;
+  };
+
+  void RemoveAnchorFocusRange() { mAnchorFocusRange = nullptr; }
+  void SelectFramesOf(nsIContent* aContent, bool aSelected) const;
+
+  void SelectFramesOfFlattenedTreeOfContent(nsIContent* aContent,
+                                            bool aSelected) const;
+
+  nsresult SelectFrames(nsPresContext* aPresContext, AbstractRange& aRange,
+                        bool aSelect) const;
+
+  void SelectFramesInAllRanges(nsPresContext* aPresContext);
+
+  MOZ_CAN_RUN_SCRIPT nsresult MaybeAddTableCellRange(nsRange& aRange,
+                                                     Maybe<size_t>* aOutIndex);
+
+  MOZ_CAN_RUN_SCRIPT void RemoveAllRangesInternal(
+      mozilla::ErrorResult& aRv, IsUnlinking aIsUnlinking = IsUnlinking::No);
+
+  void Disconnect();
+
+  struct StyledRanges {
+    explicit StyledRanges(Selection& aSelection) : mSelection(aSelection) {}
+    void Clear();
+
+    const TextRangeStyle* GetNonDefaultTextRangeStyle(
+        const AbstractRange* aRange);
+
+    size_t Length() const;
+
+    mozilla::Span<RefPtr<AbstractRange>> Ranges() { return mRanges.Ranges(); }
+    mozilla::Span<const RefPtr<AbstractRange>> Ranges() const {
+      return mRanges.Ranges();
+    }
+
+    AbstractRange* GetAbstractRangeAt(uint32_t aIndex) const {
+      return mRanges.GetAbstractRangeAt(aIndex);
+    }
+
+    StyledRange GetStyledRangeAt(uint32_t aIndex) {
+      return mRanges.GetStyledRangeAt(aIndex);
+    }
+
+    nsresult RemoveCollapsedRanges();
+
+    nsresult RemoveRangeAndUnregisterSelection(AbstractRange& aRange);
+
+    template <typename PT, typename RT, typename ArrayType>
+    static size_t FindInsertionPoint(
+        const ArrayType& aElementArray,
+        const RangeBoundaryBase<PT, RT>& aBoundary, RangeBoundaryFor aFor,
+        int32_t (*aComparator)(const RangeBoundaryBase<PT, RT>&,
+                               RangeBoundaryFor aFor, const AbstractRange&));
+
+    nsresult GetIndicesForInterval(const nsINode* aBeginNode,
+                                   uint32_t aBeginOffset,
+                                   const nsINode* aEndNode, uint32_t aEndOffset,
+                                   bool aAllowAdjacent,
+                                   Maybe<size_t>& aStartIndex,
+                                   Maybe<size_t>& aEndIndex);
+
+    bool HasEqualRangeBoundariesAt(const AbstractRange& aRange,
+                                   size_t aRangeIndex) const;
+
+    MOZ_CAN_RUN_SCRIPT nsresult
+    MaybeAddRangeAndTruncateOverlaps(nsRange* aRange, Maybe<size_t>* aOutIndex);
+
+    MOZ_CAN_RUN_SCRIPT nsresult
+    AddRangeAndIgnoreOverlaps(AbstractRange* aRange);
+
+    Element* GetCommonEditingHost() const;
+
+    MOZ_CAN_RUN_SCRIPT void MaybeFocusCommonEditingHost(
+        PresShell* aPresShell) const;
+
+    static nsresult SubtractRange(StyledRange& aRange, nsRange& aSubtract,
+                                  nsTArray<StyledRange>* aOutput);
+
+    void UnregisterSelection(IsUnlinking aIsUnlinking = IsUnlinking::No);
+
+    [[nodiscard]] nsresult ReorderRangesIfNecessary();
+
+    StyledRangeCollection mRanges;
+
+    nsTArray<StyledRange> mInvalidStaticRanges;
+
+    Selection& mSelection;
+
+    int32_t mDocumentGeneration{0};
+    bool mRangesMightHaveChanged{false};
+  };
+
+  StyledRanges mStyledRanges{*this};
+
+  RefPtr<nsRange> mAnchorFocusRange;
+  RefPtr<nsFrameSelection> mFrameSelection;
+  RefPtr<AccessibleCaretEventHub> mAccessibleCaretEventHub;
+  RefPtr<SelectionChangeEventDispatcher> mSelectionChangeEventDispatcher;
+  RefPtr<AutoScroller> mAutoScroller;
+  nsTArray<nsCOMPtr<nsISelectionListener>> mSelectionListeners;
+  nsRevocableEventPtr<ScrollSelectionIntoViewEvent> mScrollEvent;
+  CachedOffsetForFrame* mCachedOffsetForFrame;
+  nsDirection mDirection;
+  const SelectionType mSelectionType;
+  dom::HighlightSelectionData mHighlightData;
+  UniquePtr<SelectionCustomColors> mCustomColors;
+
+  uint32_t mSelectionChangeBlockerCount;
+
+  bool mUserInitiated;
+
+  bool mCalledByJS;
+
+  bool mNotifyAutoCopy;
+
+  bool mChangesDuringBatching = false;
+};
+
+class MOZ_STACK_CLASS SelectionBatcher final {
+ private:
+  const RefPtr<Selection> mSelection;
+  const int16_t mReasons;
+  const char* const mRequesterFuncName;
+
+ public:
+  MOZ_CAN_RUN_SCRIPT explicit SelectionBatcher(
+      Selection& aSelectionRef, const char* aRequesterFuncName,
+      int16_t aReasons = nsISelectionListener::NO_REASON)
+      : SelectionBatcher(&aSelectionRef, aRequesterFuncName, aReasons) {}
+  MOZ_CAN_RUN_SCRIPT explicit SelectionBatcher(
+      Selection* aSelection, const char* aRequesterFuncName,
+      int16_t aReasons = nsISelectionListener::NO_REASON)
+      : mSelection(aSelection),
+        mReasons(aReasons),
+        mRequesterFuncName(aRequesterFuncName) {
+    if (mSelection) {
+      mSelection->StartBatchChanges(mRequesterFuncName);
+    }
+  }
+
+  MOZ_CAN_RUN_SCRIPT ~SelectionBatcher() {
+    if (mSelection) {
+      MOZ_KnownLive(mSelection)->EndBatchChanges(mRequesterFuncName, mReasons);
+    }
+  }
+};
+
+class MOZ_RAII AutoHideSelectionChanges final {
+ public:
+  explicit AutoHideSelectionChanges(const nsFrameSelection* aFrame);
+
+  explicit AutoHideSelectionChanges(Selection& aSelectionRef)
+      : AutoHideSelectionChanges(&aSelectionRef) {}
+
+  ~AutoHideSelectionChanges() {
+    if (mSelection) {
+      mSelection->RemoveSelectionChangeBlocker();
+    }
+  }
+
+ private:
+  explicit AutoHideSelectionChanges(Selection* aSelection)
+      : mSelection(aSelection) {
+    if (mSelection) {
+      mSelection->AddSelectionChangeBlocker();
+    }
+  }
+
+  RefPtr<Selection> mSelection;
+};
+
+}  
+
+constexpr bool IsValidRawSelectionType(RawSelectionType aRawSelectionType) {
+  return aRawSelectionType >= nsISelectionController::SELECTION_NONE &&
+         aRawSelectionType <= nsISelectionController::SELECTION_TARGET_TEXT;
+}
+
+constexpr SelectionType ToSelectionType(RawSelectionType aRawSelectionType) {
+  if (!IsValidRawSelectionType(aRawSelectionType)) {
+    return SelectionType::eInvalid;
+  }
+  return static_cast<SelectionType>(aRawSelectionType);
+}
+
+constexpr RawSelectionType ToRawSelectionType(SelectionType aSelectionType) {
+  MOZ_ASSERT(aSelectionType != SelectionType::eInvalid);
+  return static_cast<RawSelectionType>(aSelectionType);
+}
+
+constexpr RawSelectionType ToRawSelectionType(TextRangeType aTextRangeType) {
+  return ToRawSelectionType(ToSelectionType(aTextRangeType));
+}
+
+constexpr SelectionTypeMask ToSelectionTypeMask(SelectionType aSelectionType) {
+  MOZ_ASSERT(aSelectionType != SelectionType::eInvalid);
+  return aSelectionType == SelectionType::eNone
+             ? 0
+             : static_cast<SelectionTypeMask>(
+                   1 << (static_cast<uint8_t>(aSelectionType) - 1));
+}
+
+inline std::ostream& operator<<(
+    std::ostream& aStream, const dom::Selection::InterlinePosition& aPosition) {
+  using InterlinePosition = dom::Selection::InterlinePosition;
+  switch (aPosition) {
+    case InterlinePosition::EndOfLine:
+      return aStream << "InterlinePosition::EndOfLine";
+    case InterlinePosition::StartOfNextLine:
+      return aStream << "InterlinePosition::StartOfNextLine";
+    case InterlinePosition::Undefined:
+      return aStream << "InterlinePosition::Undefined";
+    default:
+      MOZ_ASSERT_UNREACHABLE("Illegal value");
+      return aStream << "<Illegal value>";
+  }
+}
+
+class SelectionChangeGuard {
+ public:
+  SelectionChangeGuard() : mStartingGeneration(sGeneration) {}
+
+  [[nodiscard]] bool Changed(uint32_t aIgnoreCount) const {
+    return (sGeneration - mStartingGeneration) > aIgnoreCount;
+  }
+
+  static void DidChange() { sGeneration++; }
+
+ private:
+  uint64_t mStartingGeneration;
+  static uint64_t sGeneration;
+};
+
+}  
+
+inline nsresult nsISelectionController::ScrollSelectionIntoView(
+    mozilla::SelectionType aType, SelectionRegion aRegion,
+    const mozilla::AxisScrollParams& aVertical = mozilla::AxisScrollParams(),
+    const mozilla::AxisScrollParams& aHorizontal = mozilla::AxisScrollParams(),
+    mozilla::ScrollFlags aScrollFlags = mozilla::ScrollFlags::None,
+    mozilla::SelectionScrollMode aMode = mozilla::SelectionScrollMode::Async) {
+  RefPtr selection = GetSelection(mozilla::RawSelectionType(aType));
+  if (!selection) {
+    return NS_ERROR_FAILURE;
+  }
+  return selection->ScrollIntoView(aRegion, aVertical, aHorizontal,
+                                   aScrollFlags, aMode);
+}
+
+inline nsresult nsISelectionController::ScrollSelectionIntoView(
+    mozilla::SelectionType aType, SelectionRegion aRegion,
+    mozilla::SelectionScrollMode aMode) {
+  return ScrollSelectionIntoView(aType, aRegion, mozilla::AxisScrollParams(),
+                                 mozilla::AxisScrollParams(),
+                                 mozilla::ScrollFlags::None, aMode);
+}
+
+#endif  // mozilla_Selection_h_

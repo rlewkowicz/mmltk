@@ -1,0 +1,54 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+#if !defined(SkPathWriter_DEFINED)
+#define SkPathWriter_DEFINED
+
+#include "include/core/SkPath.h"
+#include "include/core/SkPathBuilder.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkScalar.h"
+#include "include/private/base/SkTArray.h"
+#include "include/private/base/SkTDArray.h"
+
+class SkOpPtT;
+
+
+class SkPathWriter {
+public:
+    SkPathWriter(SkPathFillType);
+    void assemble();
+    void conicTo(const SkPoint& pt1, const SkOpPtT* pt2, SkScalar weight);
+    void cubicTo(const SkPoint& pt1, const SkPoint& pt2, const SkOpPtT* pt3);
+    bool deferredLine(const SkOpPtT* pt);
+    void deferredMove(const SkOpPtT* pt);
+    void finishContour();
+    bool hasMove() const { return !fFirstPtT; }
+    void init();
+    bool isClosed() const;
+    SkPath nativePath() { return fBuilder.detach(); }
+    void quadTo(const SkPoint& pt1, const SkOpPtT* pt2);
+
+private:
+    bool changedSlopes(const SkOpPtT* pt) const;
+    void close();
+    const SkTDArray<const SkOpPtT*>& endPtTs() const { return fEndPtTs; }
+    void lineTo();
+    bool matchedLast(const SkOpPtT*) const;
+    void moveTo();
+    const skia_private::TArray<SkPathBuilder>& partials() const { return fPartials; }
+    bool someAssemblyRequired();
+    SkPoint update(const SkOpPtT* pt);
+
+    SkPathBuilder fBuilder;
+    SkPathBuilder fCurrent;  
+    skia_private::TArray<SkPathBuilder> fPartials;   
+    SkTDArray<const SkOpPtT*> fEndPtTs;  
+    const SkOpPtT* fDefer[2];  
+    const SkOpPtT* fFirstPtT;  
+};
+
+#endif

@@ -1,0 +1,166 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/ipc/MessageLink.h"
+#include "mojo/core/ports/event.h"
+#include "mojo/core/ports/node.h"
+#include "mozilla/ipc/MessageChannel.h"
+#include "mozilla/ipc/ProtocolUtils.h"
+#include "mozilla/ipc/NodeController.h"
+#include "chrome/common/ipc_channel.h"
+#include "base/task.h"
+
+#include "mozilla/Assertions.h"
+#include "nsDebug.h"
+#include "nsISupportsImpl.h"
+#include "nsPrintfCString.h"
+#include "nsXULAppAPI.h"
+
+using namespace mozilla;
+
+namespace mozilla {
+namespace ipc {
+
+const char* StringFromIPCSide(Side side) {
+  switch (side) {
+    case ChildSide:
+      return "Child";
+    case ParentSide:
+      return "Parent";
+    default:
+      return "Unknown";
+  }
+}
+
+MessageLink::MessageLink(MessageChannel* aChan) : mChan(aChan) {}
+
+MessageLink::~MessageLink() {
+#ifdef DEBUG
+  mChan = nullptr;
+#endif
+}
+
+class PortLink::PortObserverThunk : public NodeController::PortObserver {
+ public:
+  PortObserverThunk(RefCountedMonitor* aMonitor, PortLink* aLink)
+      : mMonitor(aMonitor), mLink(aLink) {}
+
+  void OnPortStatusChanged() override {
+    MonitorAutoLock lock(*mMonitor);
+    if (mLink) {
+      mLink->OnPortStatusChanged();
+    }
+  }
+
+ private:
+  friend class PortLink;
+
+  RefPtr<RefCountedMonitor> mMonitor;
+
+  PortLink* MOZ_NON_OWNING_REF mLink;
+};
+
+PortLink::PortLink(MessageChannel* aChan, ScopedPort aPort)
+    : MessageLink(aChan), mNode(aPort.Controller()), mPort(aPort.Release()) {
+  mChan->mMonitor->AssertCurrentThreadOwns();
+
+  mObserver = new PortObserverThunk(mChan->mMonitor, this);
+  mNode->SetPortObserver(mPort, mObserver);
+
+  nsCOMPtr<nsIRunnable> openRunnable = NewRunnableMethod(
+      "PortLink::Open", mObserver, &PortObserverThunk::OnPortStatusChanged);
+  if (aChan->mIsSameThreadChannel) {
+    aChan->mWorkerThread->Dispatch(openRunnable.forget());
+  } else {
+    XRE_GetAsyncIOEventTarget()->Dispatch(openRunnable.forget());
+  }
+}
+
+PortLink::~PortLink() {
+  MOZ_RELEASE_ASSERT(!mObserver, "PortLink destroyed without being closed!");
+}
+
+void PortLink::SendMessage(UniquePtr<Message> aMessage) {
+  mChan->mMonitor->AssertCurrentThreadOwns();
+
+  if (aMessage->size() > IPC::Channel::kMaximumMessageSize) {
+    MOZ_CRASH("IPC message size is too large");
+  }
+  aMessage->AssertAsLargeAsHeader();
+
+  RefPtr<PortObserverThunk> observer = mObserver;
+  if (!observer) {
+    NS_WARNING("Ignoring message to closed PortLink");
+    return;
+  }
+
+  RefPtr<RefCountedMonitor> monitor = mChan->mMonitor;
+  RefPtr<NodeController> node = mNode;
+  PortRef port = mPort;
+
+  bool ok = false;
+  monitor->AssertCurrentThreadOwns();
+  {
+    MonitorAutoUnlock guard(*monitor);
+    ok = node->SendUserMessage(port, std::move(aMessage));
+  }
+  if (!ok) {
+    if (observer->mLink) {
+      MOZ_CRASH("Invalid argument to SendUserMessage");
+    }
+    NS_WARNING("Message dropped as PortLink was closed");
+  }
+}
+
+void PortLink::Close() {
+  mChan->mMonitor->AssertCurrentThreadOwns();
+
+  if (!mObserver) {
+    return;
+  }
+
+  Clear();
+}
+
+void PortLink::Clear() {
+  mChan->mMonitor->AssertCurrentThreadOwns();
+
+  mNode->SetPortObserver(mPort, nullptr);
+  mObserver->mLink = nullptr;
+  mObserver = nullptr;
+  mNode->ClosePort(mPort);
+}
+
+void PortLink::OnPortStatusChanged() {
+  mChan->mMonitor->AssertCurrentThreadOwns();
+
+  if (Maybe<PortStatus> status = mNode->GetStatus(mPort);
+      status && status->peer_remote != mChan->IsCrossProcess()) {
+    mChan->SetIsCrossProcess(status->peer_remote);
+  }
+
+  while (mObserver) {
+    UniquePtr<IPC::Message> message;
+    if (!mNode->GetMessage(mPort, &message)) {
+      Clear();
+      mChan->OnChannelErrorFromLink();
+      return;
+    }
+    if (!message) {
+      return;
+    }
+
+    mChan->OnMessageReceivedFromLink(std::move(message));
+  }
+}
+
+bool PortLink::IsClosed() const {
+  if (Maybe<PortStatus> status = mNode->GetStatus(mPort)) {
+    return !(status->has_messages || status->receiving_messages);
+  }
+  return true;
+}
+
+}  
+}  

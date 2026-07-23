@@ -1,0 +1,38 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+var A11yUtils = {
+  async announce({ id = null, args = {}, raw = null } = {}) {
+    if ((!id && !raw) || (id && raw)) {
+      throw new Error("One of raw or id must be specified.");
+    }
+
+    if (this._cancelAnnounce) {
+      this._cancelAnnounce();
+      this._cancelAnnounce = null;
+    }
+
+    let message;
+    if (id) {
+      let cancel = false;
+      this._cancelAnnounce = () => (cancel = true);
+      message = await document.l10n.formatValue(id, args);
+      if (cancel) {
+        return;
+      }
+      this._cancelAnnounce = null;
+    } else {
+      message = raw;
+    }
+
+    let live = document.getElementById("a11y-announcement");
+    if (live.firstChild) {
+      live.firstChild.remove();
+    }
+    let label = document.createElement("label");
+    label.setAttribute("aria-label", message);
+    live.appendChild(label);
+  },
+};

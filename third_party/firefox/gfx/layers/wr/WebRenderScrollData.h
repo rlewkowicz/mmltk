@@ -1,0 +1,283 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_WEBRENDERSCROLLDATA_H
+#define GFX_WEBRENDERSCROLLDATA_H
+
+#include <iosfwd>
+
+#include "chrome/common/ipc_message_utils.h"
+#include "FrameMetrics.h"
+#include "ipc/IPCMessageUtils.h"
+#include "LayersTypes.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/GfxMessageUtils.h"
+#include "mozilla/layers/FocusTarget.h"
+#include "mozilla/layers/ScrollbarData.h"
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "mozilla/HashTable.h"
+#include "mozilla/Maybe.h"
+#include "nsTArrayForwardDeclare.h"
+
+namespace mozilla {
+
+class nsDisplayItem;
+class nsDisplayListBuilder;
+struct ActiveScrolledRoot;
+
+namespace layers {
+
+class APZTestAccess;
+class Layer;
+class WebRenderLayerManager;
+class WebRenderScrollData;
+
+class WebRenderLayerScrollData final {
+ public:
+  WebRenderLayerScrollData();  
+  WebRenderLayerScrollData(WebRenderLayerScrollData&& aOther) = default;
+  ~WebRenderLayerScrollData();
+
+  using ViewID = ScrollableLayerGuid::ViewID;
+
+  bool ValidateSubtree(const WebRenderScrollData& aParent,
+                       std::vector<size_t>& aVisitCounts,
+                       size_t aCurrentIndex) const;
+
+  void InitializeRoot(int32_t aDescendantCount);
+  void Initialize(WebRenderScrollData& aOwner, nsDisplayItem* aItem,
+                  int32_t aDescendantCount,
+                  const ActiveScrolledRoot* aStopAtAsr,
+                  const Maybe<gfx::Matrix4x4>& aAncestorTransform,
+                  const ViewID& aAncestorTransformId);
+
+  int32_t GetDescendantCount() const;
+  size_t GetScrollMetadataCount() const;
+
+  void AppendScrollMetadata(WebRenderScrollData& aOwner,
+                            const ScrollMetadata& aData);
+  const ScrollMetadata& GetScrollMetadata(const WebRenderScrollData& aOwner,
+                                          size_t aIndex) const;
+
+  gfx::Matrix4x4 GetAncestorTransform() const { return mAncestorTransform; }
+  ViewID GetAncestorTransformId() const { return mAncestorTransformId; }
+  void SetTransform(const gfx::Matrix4x4& aTransform) {
+    mTransform = aTransform;
+  }
+  gfx::Matrix4x4 GetTransform() const { return mTransform; }
+  CSSTransformMatrix GetTransformTyped() const;
+  void SetTransformIsPerspective(bool aTransformIsPerspective) {
+    mTransformIsPerspective = aTransformIsPerspective;
+  }
+  bool GetTransformIsPerspective() const { return mTransformIsPerspective; }
+
+  void SetEventRegionsOverride(const EventRegionsOverride& aOverride) {
+    mEventRegionsOverride = aOverride;
+  }
+  EventRegionsOverride GetEventRegionsOverride() const {
+    return mEventRegionsOverride;
+  }
+
+  void SetVisibleRect(const LayerIntRect& aRect) { mVisibleRect = aRect; }
+  const LayerIntRect& GetVisibleRect() const { return mVisibleRect; }
+  void SetRemoteDocumentSize(const LayerIntSize& aRemoteDocumentSize) {
+    mRemoteDocumentSize = aRemoteDocumentSize;
+  }
+  const LayerIntSize& GetRemoteDocumentSize() const {
+    return mRemoteDocumentSize;
+  }
+  void SetReferentId(LayersId aReferentId) { mReferentId = Some(aReferentId); }
+  Maybe<LayersId> GetReferentId() const { return mReferentId; }
+
+  void SetScrollbarData(const ScrollbarData& aData) { mScrollbarData = aData; }
+  const ScrollbarData& GetScrollbarData() const { return mScrollbarData; }
+  void SetScrollbarAnimationId(const uint64_t& aId) {
+    mScrollbarAnimationId = Some(aId);
+  }
+  Maybe<uint64_t> GetScrollbarAnimationId() const {
+    return mScrollbarAnimationId;
+  }
+
+  void SetFixedPositionAnimationId(const uint64_t& aId) {
+    mFixedPositionAnimationId = Some(aId);
+  }
+  Maybe<uint64_t> GetFixedPositionAnimationId() const {
+    return mFixedPositionAnimationId;
+  }
+
+  void SetFixedPositionSides(const SideBits& aSideBits) {
+    mFixedPositionSides = aSideBits;
+  }
+  SideBits GetFixedPositionSides() const { return mFixedPositionSides; }
+
+  void SetFixedPositionScrollContainerId(ViewID aId) {
+    mFixedPosScrollContainerId = aId;
+  }
+  ViewID GetFixedPositionScrollContainerId() const {
+    return mFixedPosScrollContainerId;
+  }
+
+  void SetStickyPositionScrollContainerId(ViewID aId) {
+    mStickyPosScrollContainerId = aId;
+  }
+  ViewID GetStickyPositionScrollContainerId() const {
+    return mStickyPosScrollContainerId;
+  }
+
+  void SetStickyScrollRangeOuter(const LayerRectAbsolute& scrollRange) {
+    mStickyScrollRangeOuter = scrollRange;
+  }
+  const LayerRectAbsolute& GetStickyScrollRangeOuter() const {
+    return mStickyScrollRangeOuter;
+  }
+
+  void SetStickyScrollRangeInner(const LayerRectAbsolute& scrollRange) {
+    mStickyScrollRangeInner = scrollRange;
+  }
+  const LayerRectAbsolute& GetStickyScrollRangeInner() const {
+    return mStickyScrollRangeInner;
+  }
+
+  void SetStickyPositionAnimationId(const uint64_t& aId) {
+    mStickyPositionAnimationId = Some(aId);
+  }
+  Maybe<uint64_t> GetStickyPositionAnimationId() const {
+    return mStickyPositionAnimationId;
+  }
+
+  void SetZoomAnimationId(const uint64_t& aId) { mZoomAnimationId = Some(aId); }
+  Maybe<uint64_t> GetZoomAnimationId() const { return mZoomAnimationId; }
+
+  void SetAsyncZoomContainerId(const ViewID& aId) {
+    mAsyncZoomContainerId = Some(aId);
+  }
+  Maybe<ViewID> GetAsyncZoomContainerId() const {
+    return mAsyncZoomContainerId;
+  }
+
+  void Dump(std::ostream& aOut, const WebRenderScrollData& aOwner) const;
+
+  friend struct IPC::ParamTraits<WebRenderLayerScrollData>;
+
+ private:
+  friend class APZTestAccess;
+
+  void InitializeForTest(int32_t aDescendantCount);
+
+  ScrollMetadata& GetScrollMetadataMut(WebRenderScrollData& aOwner,
+                                       size_t aIndex);
+
+ private:
+  int32_t mDescendantCount;
+
+  CopyableTArray<size_t> mScrollIds;
+
+
+  gfx::Matrix4x4 mAncestorTransform;
+  ViewID mAncestorTransformId;
+  gfx::Matrix4x4 mTransform;
+  bool mTransformIsPerspective;
+  LayerIntRect mVisibleRect;
+  LayerIntSize mRemoteDocumentSize;
+  Maybe<LayersId> mReferentId;
+  EventRegionsOverride mEventRegionsOverride;
+  ScrollbarData mScrollbarData;
+  Maybe<uint64_t> mScrollbarAnimationId;
+  Maybe<uint64_t> mFixedPositionAnimationId;
+  SideBits mFixedPositionSides;
+  ViewID mFixedPosScrollContainerId;
+  ViewID mStickyPosScrollContainerId;
+  LayerRectAbsolute mStickyScrollRangeOuter;
+  LayerRectAbsolute mStickyScrollRangeInner;
+  Maybe<uint64_t> mStickyPositionAnimationId;
+  Maybe<uint64_t> mZoomAnimationId;
+  Maybe<ViewID> mAsyncZoomContainerId;
+
+#if defined(DEBUG) || defined(MOZ_DUMP_PAINTING)
+  nsDisplayItem* mInitializedFrom = nullptr;
+#endif
+};
+
+class WebRenderScrollData {
+ public:
+  WebRenderScrollData();
+  explicit WebRenderScrollData(WebRenderLayerManager* aManager,
+                               nsDisplayListBuilder* aBuilder);
+  WebRenderScrollData(WebRenderScrollData&& aOther) = default;
+  WebRenderScrollData& operator=(WebRenderScrollData&& aOther) = default;
+  virtual ~WebRenderScrollData() = default;
+
+  bool Validate() const;
+
+  WebRenderLayerManager* GetManager() const;
+
+  nsDisplayListBuilder* GetBuilder() const;
+
+  size_t AddMetadata(const ScrollMetadata& aMetadata);
+  size_t AddLayerData(WebRenderLayerScrollData&& aData);
+
+  size_t GetLayerCount() const;
+
+  const WebRenderLayerScrollData* GetLayerData(size_t aIndex) const;
+  WebRenderLayerScrollData* GetLayerData(size_t aIndex);
+
+  const ScrollMetadata& GetScrollMetadata(size_t aIndex) const;
+  Maybe<size_t> HasMetadataFor(
+      const ScrollableLayerGuid::ViewID& aScrollId) const;
+
+  void SetIsFirstPaint(bool aValue);
+  bool IsFirstPaint() const;
+  void SetPaintSequenceNumber(uint32_t aPaintSequenceNumber);
+  uint32_t GetPaintSequenceNumber() const;
+
+  void ApplyUpdates(ScrollUpdatesMap&& aUpdates, uint32_t aPaintSequenceNumber);
+
+  void PrependUpdates(const WebRenderScrollData& aPreviousData);
+
+  void SetWasUpdateSkipped(bool aWasUpdateSkipped) {
+    mWasUpdateSkipped = aWasUpdateSkipped;
+  }
+  bool GetWasUpdateSkipped() const { return mWasUpdateSkipped; }
+
+  friend struct IPC::ParamTraits<WebRenderScrollData>;
+
+  friend std::ostream& operator<<(std::ostream& aOut,
+                                  const WebRenderScrollData& aData);
+
+ private:
+  friend class WebRenderLayerScrollData;
+  ScrollMetadata& GetScrollMetadataMut(size_t aIndex);
+
+ private:
+  bool RepopulateMap();
+
+  void DumpSubtree(std::ostream& aOut, size_t aIndex,
+                   const std::string& aIndent) const;
+
+ private:
+  WebRenderLayerManager* MOZ_NON_OWNING_REF mManager;
+
+  nsDisplayListBuilder* MOZ_NON_OWNING_REF mBuilder;
+
+  HashMap<ScrollableLayerGuid::ViewID, size_t> mScrollIdMap;
+
+  nsTArray<ScrollMetadata> mScrollMetadatas;
+
+  nsTArray<WebRenderLayerScrollData> mLayerScrollData;
+
+  bool mIsFirstPaint;
+  uint32_t mPaintSequenceNumber;
+
+  bool mWasUpdateSkipped = false;
+};
+
+}  
+}  
+
+namespace IPC {
+DECLARE_IPC_SERIALIZER(mozilla::layers::WebRenderLayerScrollData);
+DECLARE_IPC_SERIALIZER(mozilla::layers::WebRenderScrollData);
+}  
+
+#endif /* GFX_WEBRENDERSCROLLDATA_H */

@@ -1,0 +1,85 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef MOZILLA_GENERICREFCOUNTED_H_
+#define MOZILLA_GENERICREFCOUNTED_H_
+
+#include <type_traits>
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/RefCounted.h"
+
+namespace mozilla {
+
+class GenericRefCountedBase {
+ protected:
+  virtual ~GenericRefCountedBase() = default;
+
+ public:
+  virtual void AddRef() = 0;
+
+  virtual void Release() = 0;
+
+  void ref() { AddRef(); }
+  void deref() { Release(); }
+
+#ifdef MOZ_REFCOUNTED_LEAK_CHECKING
+  virtual const char* typeName() const = 0;
+  virtual size_t typeSize() const = 0;
+#endif
+};
+
+namespace detail {
+
+template <RefCountAtomicity Atomicity>
+class GenericRefCounted : public GenericRefCountedBase {
+ protected:
+  GenericRefCounted() : refCnt(0) {}
+
+  virtual ~GenericRefCounted() { MOZ_ASSERT(refCnt == detail::DEAD); }
+
+ public:
+  virtual void AddRef() override {
+    MOZ_ASSERT(int32_t(refCnt) >= 0);
+    MozRefCountType cnt = ++refCnt;
+    detail::RefCountLogger::logAddRef(this, cnt);
+  }
+
+  virtual void Release() override {
+    MOZ_ASSERT(int32_t(refCnt) > 0);
+    detail::RefCountLogger::ReleaseLogger logger{this};
+    MozRefCountType cnt = --refCnt;
+    logger.logRelease(cnt);
+    if (0 == cnt) {
+#ifdef DEBUG
+      refCnt = detail::DEAD;
+#endif
+      delete this;
+    }
+  }
+
+  MozRefCountType refCount() const { return refCnt; }
+  bool hasOneRef() const {
+    MOZ_ASSERT(refCnt > 0);
+    return refCnt == 1;
+  }
+
+ private:
+  std::conditional_t<Atomicity == AtomicRefCount, Atomic<MozRefCountType>,
+                     MozRefCountType>
+      refCnt;
+};
+
+}  
+
+class GenericRefCounted
+    : public detail::GenericRefCounted<detail::NonAtomicRefCount> {};
+
+class GenericAtomicRefCounted
+    : public detail::GenericRefCounted<detail::AtomicRefCount> {};
+
+}  
+
+#endif

@@ -1,0 +1,239 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_LAYERS_ISURFACEDEALLOCATOR
+#define GFX_LAYERS_ISURFACEDEALLOCATOR
+
+#include <stddef.h>  // for size_t
+#include <stdint.h>  // for uint32_t
+#include "gfxTypes.h"
+#include "mozilla/dom/ipc/IdType.h"
+#include "mozilla/ipc/Shmem.h"
+#include "mozilla/gfx/Point.h"  // for IntSize
+#include "nsIMemoryReporter.h"  // for nsIMemoryReporter
+#include "mozilla/Atomics.h"    // for Atomic
+#include "nsTArray.h"
+
+class MessageLoop;
+
+namespace mozilla {
+namespace ipc {
+class Shmem;
+class IShmemAllocator;
+}  
+namespace gfx {
+class DataSourceSurface;
+}  
+
+namespace layers {
+
+class PTextureParent;
+class AsyncParentMessageData;
+class CompositableForwarder;
+class CompositorBridgeParentBase;
+class TextureForwarder;
+class UntrustedShmemSection;
+
+class ShmemSectionAllocator;
+class LegacySurfaceDescriptorAllocator;
+class HostIPCAllocator;
+class LayersIPCChannel;
+
+enum BufferCapabilities {
+  DEFAULT_BUFFER_CAPS = 0,
+  MAP_AS_IMAGE_SURFACE = 1 << 0,
+  USING_GL_RENDERING_ONLY = 1 << 1
+};
+
+class SurfaceDescriptor;
+
+class ISurfaceAllocator {
+ public:
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  ISurfaceAllocator() = default;
+
+
+  virtual mozilla::ipc::IShmemAllocator* AsShmemAllocator() { return nullptr; }
+
+  virtual ShmemSectionAllocator* AsShmemSectionAllocator() { return nullptr; }
+
+  virtual CompositableForwarder* AsCompositableForwarder() { return nullptr; }
+
+  virtual RefPtr<TextureForwarder> GetTextureForwarder();
+
+  virtual HostIPCAllocator* AsHostIPCAllocator() { return nullptr; }
+
+  virtual LegacySurfaceDescriptorAllocator*
+  AsLegacySurfaceDescriptorAllocator() {
+    return nullptr;
+  }
+
+  virtual CompositorBridgeParentBase* AsCompositorBridgeParentBase() {
+    return nullptr;
+  }
+
+
+  virtual bool IPCOpen() const { return true; }
+
+  virtual bool IsSameProcess() const = 0;
+
+  virtual bool UsesImageBridge() const { return false; }
+
+  virtual bool UsesWebRenderBridge() const { return false; }
+
+  virtual dom::ContentParentId GetContentId() { return dom::ContentParentId(); }
+
+ protected:
+  void Finalize() {}
+
+  virtual ~ISurfaceAllocator() = default;
+};
+
+class HostIPCAllocator : public ISurfaceAllocator {
+ public:
+  HostIPCAllocator() = default;
+
+  HostIPCAllocator* AsHostIPCAllocator() override { return this; }
+
+  virtual base::ProcessId GetChildProcessId() = 0;
+
+  virtual void NotifyNotUsed(PTextureParent* aTexture,
+                             uint64_t aTransactionId) = 0;
+
+  virtual void SendAsyncMessage(Span<const AsyncParentMessageData>) = 0;
+  virtual void SendPendingAsyncMessages();
+
+  virtual void SetAboutToSendAsyncMessages() {
+    mAboutToSendAsyncMessages = true;
+  }
+
+  bool IsAboutToSendAsyncMessages() { return mAboutToSendAsyncMessages; }
+
+ protected:
+  nsTArray<AsyncParentMessageData> mPendingAsyncMessage;
+  bool mAboutToSendAsyncMessages = false;
+};
+
+class ShmemSection {
+ public:
+  static Maybe<ShmemSection> FromUntrusted(
+      const UntrustedShmemSection& aUntrusted, size_t aMinSize);
+  bool Init(const mozilla::ipc::Shmem& aShm, uint32_t offset, uint32_t size);
+
+  uint32_t size() const { return mSize; }
+  uint32_t offset() const { return mOffset; }
+  const mozilla::ipc::Shmem& shmem() { return mShmem; }
+
+ private:
+  mozilla::ipc::Shmem mShmem;
+  uint32_t mOffset;
+  uint32_t mSize;
+};
+
+class ShmemSectionAllocator {
+ public:
+  virtual bool AllocShmemSection(uint32_t aSize,
+                                 ShmemSection* aShmemSection) = 0;
+
+  virtual void DeallocShmemSection(ShmemSection& aShmemSection) = 0;
+
+  virtual void MemoryPressure() {}
+};
+
+class LegacySurfaceDescriptorAllocator {
+ public:
+  virtual bool AllocSurfaceDescriptor(const gfx::IntSize& aSize,
+                                      gfxContentType aContent,
+                                      SurfaceDescriptor* aBuffer) = 0;
+
+  virtual bool AllocSurfaceDescriptorWithCaps(const gfx::IntSize& aSize,
+                                              gfxContentType aContent,
+                                              uint32_t aCaps,
+                                              SurfaceDescriptor* aBuffer) = 0;
+
+  virtual void DestroySurfaceDescriptor(SurfaceDescriptor* aSurface) = 0;
+};
+
+bool IsSurfaceDescriptorValid(const SurfaceDescriptor& aSurface);
+
+class GfxMemoryImageReporter final : public nsIMemoryReporter {
+  ~GfxMemoryImageReporter() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  GfxMemoryImageReporter() {
+#ifdef DEBUG
+    static bool hasRun = false;
+    MOZ_ASSERT(!hasRun);
+    hasRun = true;
+#endif
+  }
+
+  MOZ_DEFINE_MALLOC_SIZE_OF_ON_ALLOC(MallocSizeOfOnAlloc)
+  MOZ_DEFINE_MALLOC_SIZE_OF_ON_FREE(MallocSizeOfOnFree)
+
+  static void DidAlloc(void* aPointer) {
+    sAmount += MallocSizeOfOnAlloc(aPointer);
+  }
+
+  static void WillFree(void* aPointer) {
+    sAmount -= MallocSizeOfOnFree(aPointer);
+  }
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    MOZ_COLLECT_REPORT(
+        "explicit/gfx/heap-textures", KIND_HEAP, UNITS_BYTES, sAmount,
+        "Heap memory shared between threads by texture clients and hosts.");
+
+    return NS_OK;
+  }
+
+ private:
+  static mozilla::Atomic<ptrdiff_t> sAmount;
+};
+
+class FixedSizeSmallShmemSectionAllocator final : public ShmemSectionAllocator {
+ public:
+  NS_DECL_OWNINGTHREAD
+
+  enum AllocationStatus { STATUS_ALLOCATED, STATUS_FREED };
+
+  struct ShmemSectionHeapHeader {
+    Atomic<uint32_t> mTotalBlocks;
+    Atomic<uint32_t> mAllocatedBlocks;
+  };
+
+  struct ShmemSectionHeapAllocation {
+    Atomic<uint32_t> mStatus;
+    uint32_t mSize;
+  };
+
+  explicit FixedSizeSmallShmemSectionAllocator(LayersIPCChannel* aShmProvider);
+
+  ~FixedSizeSmallShmemSectionAllocator();
+
+  bool AllocShmemSection(uint32_t aSize, ShmemSection* aShmemSection) override;
+
+  void DeallocShmemSection(ShmemSection& aShmemSection) override;
+
+  void MemoryPressure() override { ShrinkShmemSectionHeap(); }
+
+  static void FreeShmemSection(ShmemSection& aShmemSection);
+
+  void ShrinkShmemSectionHeap();
+
+  bool IPCOpen() const;
+
+ protected:
+  std::vector<mozilla::ipc::Shmem> mUsedShmems;
+  LayersIPCChannel* mShmProvider;
+};
+
+}  
+}  
+
+#endif

@@ -1,0 +1,389 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/PopupBlocker.h"
+
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/Components.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/UserActivation.h"
+#include "nsIPermissionManager.h"
+#include "nsXULPopupManager.h"
+
+namespace mozilla::dom {
+
+namespace {
+
+static char* sPopupAllowedEvents;
+
+static PopupBlocker::PopupControlState sPopupControlState =
+    PopupBlocker::openAbused;
+static uint32_t sPopupStatePusherCount = 0;
+
+static TimeStamp sLastAllowedExternalProtocolIFrameTimeStamp;
+
+static uint32_t sOpenPopupSpamCount = 0;
+
+void PopupAllowedEventsChanged() {
+  if (sPopupAllowedEvents) {
+    free(sPopupAllowedEvents);
+  }
+
+  nsAutoCString str;
+  Preferences::GetCString("dom.popup_allowed_events", str);
+
+  sPopupAllowedEvents = ToNewCString(str);
+}
+
+bool PopupAllowedForEvent(const char* eventName) {
+  if (!sPopupAllowedEvents) {
+    PopupAllowedEventsChanged();
+
+    if (!sPopupAllowedEvents) {
+      return false;
+    }
+  }
+
+  nsDependentCString events(sPopupAllowedEvents);
+
+  nsCString::const_iterator start, end;
+  nsCString::const_iterator startiter(events.BeginReading(start));
+  events.EndReading(end);
+
+  while (startiter != end) {
+    nsCString::const_iterator enditer(end);
+
+    if (!FindInReadable(nsDependentCString(eventName), startiter, enditer))
+      return false;
+
+    if ((startiter == start || *--startiter == ' ') &&
+        (enditer == end || *enditer == ' ')) {
+      return true;
+    }
+
+    startiter = enditer;
+  }
+
+  return false;
+}
+
+void OnPrefChange(const char* aPrefName, void*) {
+  nsDependentCString prefName(aPrefName);
+  if (prefName.EqualsLiteral("dom.popup_allowed_events")) {
+    PopupAllowedEventsChanged();
+  }
+}
+
+}  
+
+PopupBlocker::PopupControlState PopupBlocker::PushPopupControlState(
+    PopupBlocker::PopupControlState aState, bool aForce) {
+  MOZ_ASSERT(NS_IsMainThread());
+  PopupBlocker::PopupControlState old = sPopupControlState;
+  if (aState < old || aForce) {
+    sPopupControlState = aState;
+  }
+  return old;
+}
+
+void PopupBlocker::PopPopupControlState(
+    PopupBlocker::PopupControlState aState) {
+  MOZ_ASSERT(NS_IsMainThread());
+  sPopupControlState = aState;
+}
+
+ PopupBlocker::PopupControlState
+PopupBlocker::GetPopupControlState() {
+  return sPopupControlState;
+}
+
+uint32_t PopupBlocker::GetPopupPermission(nsIPrincipal* aPrincipal) {
+  uint32_t permit = nsIPermissionManager::UNKNOWN_ACTION;
+  nsCOMPtr<nsIPermissionManager> permissionManager =
+      components::PermissionManager::Service();
+
+  if (permissionManager) {
+    permissionManager->TestPermissionFromPrincipal(aPrincipal, "popup"_ns,
+                                                   &permit);
+  }
+
+  return permit;
+}
+
+void PopupBlocker::PopupStatePusherCreated() { ++sPopupStatePusherCount; }
+
+void PopupBlocker::PopupStatePusherDestroyed() {
+  MOZ_ASSERT(sPopupStatePusherCount);
+  --sPopupStatePusherCount;
+}
+
+PopupBlocker::PopupControlState PopupBlocker::GetEventPopupControlState(
+    WidgetEvent* aEvent, Event* aDOMEvent) {
+  PopupBlocker::PopupControlState abuse = PopupBlocker::openBlocked;
+
+  if (aDOMEvent && aDOMEvent->GetWantsPopupControlCheck()) {
+    nsAutoString type;
+    aDOMEvent->GetType(type);
+    if (PopupAllowedForEvent(NS_ConvertUTF16toUTF8(type).get())) {
+      return PopupBlocker::openAllowed;
+    }
+  }
+
+  switch (aEvent->mClass) {
+    case eBasicEventClass:
+      if (UserActivation::IsHandlingUserInput()) {
+        switch (aEvent->mMessage) {
+          case eFormSelect:
+            if (PopupAllowedForEvent("select")) {
+              abuse = PopupBlocker::openControlled;
+            }
+            break;
+          case eFormChange:
+            if (PopupAllowedForEvent("change")) {
+              abuse = PopupBlocker::openControlled;
+            }
+            break;
+          default:
+            break;
+        }
+      }
+      break;
+    case eEditorInputEventClass:
+      if (UserActivation::IsHandlingUserInput()) {
+        switch (aEvent->mMessage) {
+          case eEditorInput:
+            if (PopupAllowedForEvent("input")) {
+              abuse = PopupBlocker::openControlled;
+            }
+            break;
+          default:
+            break;
+        }
+      }
+      break;
+    case eInputEventClass:
+      if (UserActivation::IsHandlingUserInput()) {
+        switch (aEvent->mMessage) {
+          case eFormChange:
+            if (PopupAllowedForEvent("change")) {
+              abuse = PopupBlocker::openControlled;
+            }
+            break;
+          case eUnidentifiedEvent:
+            if (aEvent->mSpecifiedEventType == nsGkAtoms::oncommand) {
+              abuse = PopupBlocker::openControlled;
+            }
+            break;
+          default:
+            break;
+        }
+      }
+      break;
+    case eKeyboardEventClass:
+      if (aEvent->IsTrusted()) {
+        uint32_t key = aEvent->AsKeyboardEvent()->mKeyCode;
+        switch (aEvent->mMessage) {
+          case eKeyPress:
+            if (key == NS_VK_RETURN) {
+              abuse = PopupBlocker::openAllowed;
+            } else if (PopupAllowedForEvent("keypress")) {
+              abuse = PopupBlocker::openControlled;
+            }
+            break;
+          case eKeyUp:
+            if (key == NS_VK_SPACE) {
+              abuse = PopupBlocker::openAllowed;
+            } else if (PopupAllowedForEvent("keyup")) {
+              abuse = PopupBlocker::openControlled;
+            }
+            break;
+          case eKeyDown:
+            if (PopupAllowedForEvent("keydown")) {
+              abuse = PopupBlocker::openControlled;
+            }
+            break;
+          default:
+            break;
+        }
+      }
+      break;
+    case eTouchEventClass:
+      if (aEvent->IsTrusted()) {
+        switch (aEvent->mMessage) {
+          case eTouchStart:
+            if (PopupAllowedForEvent("touchstart")) {
+              abuse = PopupBlocker::openControlled;
+            }
+            break;
+          case eTouchEnd:
+            if (PopupAllowedForEvent("touchend")) {
+              abuse = PopupBlocker::openControlled;
+            }
+            break;
+          default:
+            break;
+        }
+      }
+      break;
+    case eMouseEventClass:
+      if (aEvent->IsTrusted()) {
+        if (aEvent->AsMouseEvent()->mButton == MouseButton::ePrimary ||
+            aEvent->AsMouseEvent()->mButton == MouseButton::eMiddle) {
+          switch (aEvent->mMessage) {
+            case eMouseUp:
+              if (PopupAllowedForEvent("mouseup")) {
+                abuse = PopupBlocker::openControlled;
+              }
+              break;
+            case eMouseDown:
+              if (PopupAllowedForEvent("mousedown")) {
+                abuse = PopupBlocker::openControlled;
+              }
+              break;
+            case eMouseDoubleClick:
+              if (PopupAllowedForEvent("dblclick")) {
+                abuse = PopupBlocker::openControlled;
+              }
+              break;
+            default:
+              break;
+          }
+        }
+      }
+      break;
+    case ePointerEventClass:
+      if (aEvent->IsTrusted()) {
+        if ((aEvent->AsPointerEvent()->mButton == MouseButton::ePrimary ||
+             aEvent->AsPointerEvent()->mButton == MouseButton::eMiddle)) {
+          switch (aEvent->mMessage) {
+            case ePointerClick:
+              if (PopupAllowedForEvent("click")) {
+                abuse = PopupBlocker::openAllowed;
+              }
+              break;
+            case ePointerUp:
+              if (PopupAllowedForEvent("pointerup")) {
+                abuse = PopupBlocker::openControlled;
+              }
+              break;
+            case ePointerDown:
+              if (PopupAllowedForEvent("pointerdown")) {
+                abuse = PopupBlocker::openControlled;
+              }
+              break;
+            default:
+              break;
+          }
+        }
+        else if (aEvent->mMessage == ePointerAuxClick) {
+          if (PopupAllowedForEvent("auxclick")) {
+            abuse = PopupBlocker::openControlled;
+          }
+        }
+
+        if (aEvent->mMessage == eContextMenu) {
+          if (PopupAllowedForEvent("contextmenu")) {
+            abuse = PopupBlocker::openControlled;
+          }
+        }
+      }
+      break;
+    case eFormEventClass:
+      if (UserActivation::IsHandlingUserInput()) {
+        switch (aEvent->mMessage) {
+          case eFormSubmit:
+            if (PopupAllowedForEvent("submit")) {
+              abuse = PopupBlocker::openControlled;
+            }
+            break;
+          case eFormReset:
+            if (PopupAllowedForEvent("reset")) {
+              abuse = PopupBlocker::openControlled;
+            }
+            break;
+          default:
+            break;
+        }
+      }
+      break;
+    default:
+      break;
+  }
+
+  return abuse;
+}
+
+void PopupBlocker::Initialize() {
+  DebugOnly<nsresult> rv =
+      Preferences::RegisterCallback(OnPrefChange, "dom.popup_allowed_events");
+  MOZ_ASSERT(NS_SUCCEEDED(rv),
+             "Failed to observe \"dom.popup_allowed_events\"");
+}
+
+void PopupBlocker::Shutdown() {
+  MOZ_ASSERT(sOpenPopupSpamCount == 0);
+
+  if (sPopupAllowedEvents) {
+    free(sPopupAllowedEvents);
+  }
+
+  Preferences::UnregisterCallback(OnPrefChange, "dom.popup_allowed_events");
+}
+
+bool PopupBlocker::ConsumeTimerTokenForExternalProtocolIframe() {
+  if (!StaticPrefs::dom_delay_block_external_protocol_in_iframes_enabled()) {
+    return false;
+  }
+
+  TimeStamp now = TimeStamp::Now();
+
+  if (sLastAllowedExternalProtocolIFrameTimeStamp.IsNull()) {
+    sLastAllowedExternalProtocolIFrameTimeStamp = now;
+    return true;
+  }
+
+  if ((now - sLastAllowedExternalProtocolIFrameTimeStamp).ToSeconds() <
+      StaticPrefs::dom_delay_block_external_protocol_in_iframes()) {
+    return false;
+  }
+
+  sLastAllowedExternalProtocolIFrameTimeStamp = now;
+  return true;
+}
+
+TimeStamp PopupBlocker::WhenLastExternalProtocolIframeAllowed() {
+  return sLastAllowedExternalProtocolIFrameTimeStamp;
+}
+
+void PopupBlocker::ResetLastExternalProtocolIframeAllowed() {
+  sLastAllowedExternalProtocolIFrameTimeStamp = TimeStamp();
+}
+
+void PopupBlocker::RegisterOpenPopupSpam() { sOpenPopupSpamCount++; }
+
+void PopupBlocker::UnregisterOpenPopupSpam() {
+  MOZ_ASSERT(sOpenPopupSpamCount);
+  sOpenPopupSpamCount--;
+}
+
+uint32_t PopupBlocker::GetOpenPopupSpamCount() { return sOpenPopupSpamCount; }
+
+}  
+
+AutoPopupStatePusherInternal::AutoPopupStatePusherInternal(
+    mozilla::dom::PopupBlocker::PopupControlState aState, bool aForce)
+    : mOldState(
+          mozilla::dom::PopupBlocker::PushPopupControlState(aState, aForce)) {
+  mozilla::dom::PopupBlocker::PopupStatePusherCreated();
+}
+
+AutoPopupStatePusherInternal::~AutoPopupStatePusherInternal() {
+  mozilla::dom::PopupBlocker::PopPopupControlState(mOldState);
+  mozilla::dom::PopupBlocker::PopupStatePusherDestroyed();
+}

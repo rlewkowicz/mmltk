@@ -1,0 +1,72 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsChildContentList_h_
+#define nsChildContentList_h_
+
+#include "js/TypeDecls.h"  // for Handle, Value, JSObject, JSContext
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/NodeList.h"  // base class
+#include "nsISupportsImpl.h"
+
+class nsIContent;
+class nsINode;
+
+class nsAttrChildContentList : public mozilla::dom::NodeList {
+ public:
+  explicit nsAttrChildContentList(nsINode* aNode) : mNode(aNode) {}
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_SKIPPABLE_WRAPPERCACHE_CLASS(nsAttrChildContentList)
+
+  JSObject* WrapObject(JSContext*, JS::Handle<JSObject*> aGivenProto) override;
+
+  int32_t IndexOf(nsIContent* aContent) override;
+  nsIContent* Item(uint32_t aIndex) override;
+  uint32_t Length() override;
+  nsINode* GetParentObject() final { return mNode; }
+
+  virtual void InvalidateCacheIfAvailable() {}
+
+ protected:
+  virtual ~nsAttrChildContentList() = default;
+
+  RefPtr<nsINode> mNode;
+};
+
+class nsParentNodeChildContentList final : public nsAttrChildContentList {
+ public:
+  explicit nsParentNodeChildContentList(nsINode* aNode)
+      : nsAttrChildContentList(aNode) {
+    ValidateCache();
+  }
+
+  int32_t IndexOf(nsIContent* aContent) override;
+  nsIContent* Item(uint32_t aIndex) override;
+  uint32_t Length() override;
+
+  void InvalidateCacheIfAvailable() final { InvalidateCache(); }
+
+  void InvalidateCache() {
+    mIsCacheValid = false;
+    mCachedChildArray.Clear();
+  }
+
+ private:
+  ~nsParentNodeChildContentList() = default;
+
+  void ValidateCache();
+  void EnsureCacheValid() {
+    if (!mIsCacheValid) {
+      ValidateCache();
+    }
+    MOZ_ASSERT(mIsCacheValid);
+  }
+
+  bool mIsCacheValid = false;
+
+  AutoTArray<nsIContent*, 8> mCachedChildArray;
+};
+
+#endif /* nsChildContentList_h_ */

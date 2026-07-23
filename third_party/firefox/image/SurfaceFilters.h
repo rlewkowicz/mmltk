@@ -1,0 +1,1122 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_image_SurfaceFilters_h
+#define mozilla_image_SurfaceFilters_h
+
+#include <stdint.h>
+#include <string.h>
+
+#include <algorithm>
+
+#include "DownscalingFilter.h"
+#include "SurfaceCache.h"
+#include "SurfacePipe.h"
+#include "mozilla/Likely.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/gfx/Swizzle.h"
+#include "skia/src/core/SkBlitRow.h"
+
+namespace mozilla {
+namespace image {
+
+
+template <typename Next>
+class SwizzleFilter;
+
+struct SwizzleConfig {
+  template <typename Next>
+  using Filter = SwizzleFilter<Next>;
+  gfx::SurfaceFormat mInFormat;
+  gfx::SurfaceFormat mOutFormat;
+  bool mPremultiplyAlpha;
+};
+
+template <typename Next>
+class SwizzleFilter final : public SurfaceFilter {
+ public:
+  SwizzleFilter() : mSwizzleFn(nullptr) {}
+
+  template <typename... Rest>
+  nsresult Configure(const SwizzleConfig& aConfig, const Rest&... aRest) {
+    nsresult rv = mNext.Configure(aRest...);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+
+    if (aConfig.mPremultiplyAlpha) {
+      mSwizzleFn = gfx::PremultiplyRow(aConfig.mInFormat, aConfig.mOutFormat);
+    } else {
+      mSwizzleFn = gfx::SwizzleRow(aConfig.mInFormat, aConfig.mOutFormat);
+    }
+
+    if (!mSwizzleFn) {
+      return NS_ERROR_INVALID_ARG;
+    }
+
+    ConfigureFilter(mNext.InputSize(), sizeof(uint32_t));
+    return NS_OK;
+  }
+
+  Maybe<SurfaceInvalidRect> TakeInvalidRect() override {
+    return mNext.TakeInvalidRect();
+  }
+
+ protected:
+  uint8_t* DoResetToFirstRow() override { return mNext.ResetToFirstRow(); }
+
+  uint8_t* DoAdvanceRowFromBuffer(const uint8_t* aInputRow) override {
+    uint8_t* rowPtr = mNext.CurrentRowPointer();
+    if (!rowPtr) {
+      return nullptr;  
+    }
+
+    mSwizzleFn(aInputRow, rowPtr, mNext.InputSize().width);
+    return mNext.AdvanceRow();
+  }
+
+  uint8_t* DoAdvanceRow() override {
+    return DoAdvanceRowFromBuffer(mNext.CurrentRowPointer());
+  }
+
+  Next mNext;  
+
+  gfx::SwizzleRowFn mSwizzleFn;
+};
+
+
+template <typename Next>
+class ColorManagementFilter;
+
+struct ColorManagementConfig {
+  template <typename Next>
+  using Filter = ColorManagementFilter<Next>;
+  qcms_transform* mTransform;
+};
+
+template <typename Next>
+class ColorManagementFilter final : public SurfaceFilter {
+ public:
+  ColorManagementFilter() : mTransform(nullptr) {}
+
+  template <typename... Rest>
+  nsresult Configure(const ColorManagementConfig& aConfig,
+                     const Rest&... aRest) {
+    nsresult rv = mNext.Configure(aRest...);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+
+    if (!aConfig.mTransform) {
+      return NS_ERROR_INVALID_ARG;
+    }
+
+    mTransform = aConfig.mTransform;
+    ConfigureFilter(mNext.InputSize(), sizeof(uint32_t));
+    return NS_OK;
+  }
+
+  Maybe<SurfaceInvalidRect> TakeInvalidRect() override {
+    return mNext.TakeInvalidRect();
+  }
+
+ protected:
+  uint8_t* DoResetToFirstRow() override { return mNext.ResetToFirstRow(); }
+
+  uint8_t* DoAdvanceRowFromBuffer(const uint8_t* aInputRow) override {
+    qcms_transform_data(mTransform, aInputRow, mNext.CurrentRowPointer(),
+                        mNext.InputSize().width);
+    return mNext.AdvanceRow();
+  }
+
+  uint8_t* DoAdvanceRow() override {
+    return DoAdvanceRowFromBuffer(mNext.CurrentRowPointer());
+  }
+
+  Next mNext;  
+
+  qcms_transform* mTransform;
+};
+
+
+template <typename PixelType, typename Next>
+class DeinterlacingFilter;
+
+template <typename PixelType>
+struct DeinterlacingConfig {
+  template <typename Next>
+  using Filter = DeinterlacingFilter<PixelType, Next>;
+  bool mProgressiveDisplay;  
+};
+
+template <typename PixelType, typename Next>
+class DeinterlacingFilter final : public SurfaceFilter {
+ public:
+  DeinterlacingFilter()
+      : mInputRow(0), mOutputRow(0), mPass(0), mProgressiveDisplay(true) {}
+
+  template <typename... Rest>
+  nsresult Configure(const DeinterlacingConfig<PixelType>& aConfig,
+                     const Rest&... aRest) {
+    nsresult rv = mNext.Configure(aRest...);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+
+    gfx::IntSize outputSize = mNext.InputSize();
+    mProgressiveDisplay = aConfig.mProgressiveDisplay;
+
+    const CheckedUint32 bufferSize = CheckedUint32(outputSize.width) *
+                                     CheckedUint32(outputSize.height) *
+                                     CheckedUint32(sizeof(PixelType));
+
+    if (!bufferSize.isValid() || !SurfaceCache::CanHold(bufferSize.value())) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    mBuffer.reset(new (fallible) uint8_t[bufferSize.value()]);
+    if (MOZ_UNLIKELY(!mBuffer)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    memset(mBuffer.get(), 0, bufferSize.value());
+
+    ConfigureFilter(outputSize, sizeof(PixelType));
+    return NS_OK;
+  }
+
+  Maybe<SurfaceInvalidRect> TakeInvalidRect() override {
+    return mNext.TakeInvalidRect();
+  }
+
+ protected:
+  uint8_t* DoResetToFirstRow() override {
+    mNext.ResetToFirstRow();
+    mPass = 0;
+    mInputRow = 0;
+    mOutputRow = InterlaceOffset(mPass);
+    return GetRowPointer(mOutputRow);
+  }
+
+  uint8_t* DoAdvanceRowFromBuffer(const uint8_t* aInputRow) override {
+    CopyInputRow(aInputRow);
+    return DoAdvanceRow();
+  }
+
+  uint8_t* DoAdvanceRow() override {
+    if (mPass >= 4) {
+      return nullptr;  
+    }
+    if (mInputRow >= InputSize().height) {
+      return nullptr;  
+    }
+
+    DuplicateRows(
+        HaeberliOutputStartRow(mPass, mProgressiveDisplay, mOutputRow),
+        HaeberliOutputUntilRow(mPass, mProgressiveDisplay, InputSize(),
+                               mOutputRow));
+
+    OutputRows(HaeberliOutputStartRow(mPass, mProgressiveDisplay, mOutputRow),
+               HaeberliOutputUntilRow(mPass, mProgressiveDisplay, InputSize(),
+                                      mOutputRow));
+
+    bool advancedPass = false;
+    uint32_t stride = InterlaceStride(mPass);
+    int32_t nextOutputRow = mOutputRow + stride;
+    while (nextOutputRow >= InputSize().height) {
+      if (!advancedPass) {
+        OutputRows(HaeberliOutputUntilRow(mPass, mProgressiveDisplay,
+                                          InputSize(), mOutputRow),
+                   InputSize().height);
+      }
+
+      mPass++;
+      if (mPass >= 4) {
+        return nullptr;  
+      }
+
+      mNext.ResetToFirstRow();
+
+      advancedPass = true;
+      stride = InterlaceStride(mPass);
+      nextOutputRow = InterlaceOffset(mPass);
+    }
+
+    MOZ_ASSERT(nextOutputRow >= 0);
+    MOZ_ASSERT(nextOutputRow < InputSize().height);
+
+    MOZ_ASSERT(
+        HaeberliOutputStartRow(mPass, mProgressiveDisplay, nextOutputRow) >= 0);
+    MOZ_ASSERT(HaeberliOutputStartRow(mPass, mProgressiveDisplay,
+                                      nextOutputRow) < InputSize().height);
+    MOZ_ASSERT(HaeberliOutputStartRow(mPass, mProgressiveDisplay,
+                                      nextOutputRow) <= nextOutputRow);
+
+    MOZ_ASSERT(HaeberliOutputUntilRow(mPass, mProgressiveDisplay, InputSize(),
+                                      nextOutputRow) >= 0);
+    MOZ_ASSERT(HaeberliOutputUntilRow(mPass, mProgressiveDisplay, InputSize(),
+                                      nextOutputRow) <= InputSize().height);
+    MOZ_ASSERT(HaeberliOutputUntilRow(mPass, mProgressiveDisplay, InputSize(),
+                                      nextOutputRow) > nextOutputRow);
+
+    int32_t nextHaeberliOutputRow =
+        HaeberliOutputStartRow(mPass, mProgressiveDisplay, nextOutputRow);
+
+    if (advancedPass) {
+      OutputRows(0, nextHaeberliOutputRow);
+    } else {
+      OutputRows(HaeberliOutputUntilRow(mPass, mProgressiveDisplay, InputSize(),
+                                        mOutputRow),
+                 nextHaeberliOutputRow);
+    }
+
+    mInputRow++;
+    mOutputRow = nextOutputRow;
+
+    return GetRowPointer(nextHaeberliOutputRow);
+  }
+
+ private:
+  static uint32_t InterlaceOffset(uint32_t aPass) {
+    MOZ_ASSERT(aPass < 4, "Invalid pass");
+    static const uint8_t offset[] = {0, 4, 2, 1};
+    return offset[aPass];
+  }
+
+  static uint32_t InterlaceStride(uint32_t aPass) {
+    MOZ_ASSERT(aPass < 4, "Invalid pass");
+    static const uint8_t stride[] = {8, 8, 4, 2};
+    return stride[aPass];
+  }
+
+  static int32_t HaeberliOutputStartRow(uint32_t aPass,
+                                        bool aProgressiveDisplay,
+                                        int32_t aOutputRow) {
+    MOZ_ASSERT(aPass < 4, "Invalid pass");
+    static const uint8_t firstRowOffset[] = {3, 1, 0, 0};
+
+    if (aProgressiveDisplay) {
+      return std::max(aOutputRow - firstRowOffset[aPass], 0);
+    } else {
+      return aOutputRow;
+    }
+  }
+
+  static int32_t HaeberliOutputUntilRow(uint32_t aPass,
+                                        bool aProgressiveDisplay,
+                                        const gfx::IntSize& aInputSize,
+                                        int32_t aOutputRow) {
+    MOZ_ASSERT(aPass < 4, "Invalid pass");
+    static const uint8_t lastRowOffset[] = {4, 2, 1, 0};
+
+    if (aProgressiveDisplay) {
+      return std::min(aOutputRow + lastRowOffset[aPass],
+                      aInputSize.height - 1) +
+             1;  
+    } else {
+      return aOutputRow + 1;
+    }
+  }
+
+  void DuplicateRows(int32_t aStart, int32_t aUntil) {
+    MOZ_ASSERT(aStart >= 0);
+    MOZ_ASSERT(aUntil >= 0);
+
+    if (aUntil <= aStart || aStart >= InputSize().height) {
+      return;
+    }
+
+    const uint8_t* sourceRowPointer = GetRowPointer(aStart);
+
+    for (int32_t destRow = aStart + 1; destRow < aUntil; ++destRow) {
+      uint8_t* destRowPointer = GetRowPointer(destRow);
+      memcpy(destRowPointer, sourceRowPointer,
+             InputSize().width * sizeof(PixelType));
+    }
+  }
+
+  void OutputRows(int32_t aStart, int32_t aUntil) {
+    MOZ_ASSERT(aStart >= 0);
+    MOZ_ASSERT(aUntil >= 0);
+
+    if (aUntil <= aStart || aStart >= InputSize().height) {
+      return;
+    }
+
+    for (int32_t rowToOutput = aStart; rowToOutput < aUntil; ++rowToOutput) {
+      mNext.WriteBuffer(
+          reinterpret_cast<PixelType*>(GetRowPointer(rowToOutput)));
+    }
+  }
+
+  uint8_t* GetRowPointer(uint32_t aRow) const {
+#ifdef DEBUG
+    uint64_t offset64 = uint64_t(aRow) * uint64_t(InputSize().width) *
+                        uint64_t(sizeof(PixelType));
+    uint64_t bufferLength = uint64_t(InputSize().width) *
+                            uint64_t(InputSize().height) *
+                            uint64_t(sizeof(PixelType));
+    MOZ_ASSERT(offset64 < bufferLength, "Start of row is outside of image");
+    MOZ_ASSERT(
+        offset64 + uint64_t(InputSize().width) * uint64_t(sizeof(PixelType)) <=
+            bufferLength,
+        "End of row is outside of image");
+#endif
+    uint32_t offset = aRow * InputSize().width * sizeof(PixelType);
+    return mBuffer.get() + offset;
+  }
+
+  Next mNext;  
+
+  UniquePtr<uint8_t[]> mBuffer;  
+  int32_t mInputRow;             
+  int32_t mOutputRow;            
+  uint8_t mPass;                 
+  bool mProgressiveDisplay;      
+};
+
+
+template <typename Next>
+class BlendAnimationFilter;
+
+struct BlendAnimationConfig {
+  template <typename Next>
+  using Filter = BlendAnimationFilter<Next>;
+  Decoder* mDecoder;  
+};
+
+template <typename Next>
+class BlendAnimationFilter final : public SurfaceFilter {
+ public:
+  BlendAnimationFilter()
+      : mRow(0),
+        mRowLength(0),
+        mRecycleRow(0),
+        mRecycleRowMost(0),
+        mRecycleRowOffset(0),
+        mRecycleRowLength(0),
+        mClearRow(0),
+        mClearRowMost(0),
+        mClearPrefixLength(0),
+        mClearInfixOffset(0),
+        mClearInfixLength(0),
+        mClearPostfixOffset(0),
+        mClearPostfixLength(0),
+        mOverProc(nullptr),
+        mBaseFrameStartPtr(nullptr),
+        mBaseFrameRowPtr(nullptr) {}
+
+  template <typename... Rest>
+  nsresult Configure(const BlendAnimationConfig& aConfig,
+                     const Rest&... aRest) {
+    nsresult rv = mNext.Configure(aRest...);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+
+    imgFrame* currentFrame = aConfig.mDecoder->GetCurrentFrame();
+    if (!currentFrame) {
+      MOZ_ASSERT_UNREACHABLE("Decoder must have current frame!");
+      return NS_ERROR_FAILURE;
+    }
+
+    mFrameRect = mUnclampedFrameRect = currentFrame->GetBlendRect();
+    gfx::IntSize outputSize = mNext.InputSize();
+    mRowLength = outputSize.width * sizeof(uint32_t);
+
+    if (mUnclampedFrameRect.width < 0 || mUnclampedFrameRect.height < 0) {
+      return NS_ERROR_FAILURE;
+    }
+
+    gfx::IntRect outputRect(0, 0, outputSize.width, outputSize.height);
+    mFrameRect = mFrameRect.Intersect(outputRect);
+    bool fullFrame = outputRect.IsEqualEdges(mFrameRect);
+
+    if (mFrameRect.IsEmpty()) {
+      mFrameRect.SetRect(0, 0, 0, 0);
+    }
+
+    BlendMethod blendMethod = currentFrame->GetBlendMethod();
+    switch (blendMethod) {
+      default:
+        blendMethod = BlendMethod::SOURCE;
+        MOZ_FALLTHROUGH_ASSERT("Unexpected blend method!");
+      case BlendMethod::SOURCE:
+        break;
+      case BlendMethod::OVER:
+        if (mFrameRect.IsEmpty()) {
+          blendMethod = BlendMethod::SOURCE;
+        }
+        break;
+    }
+
+    gfx::IntRect dirtyRect(outputRect);
+    gfx::IntRect clearRect;
+    if (!fullFrame || blendMethod != BlendMethod::SOURCE) {
+      const RawAccessFrameRef& restoreFrame =
+          aConfig.mDecoder->GetRestoreFrameRef();
+      if (restoreFrame) {
+        MOZ_ASSERT(restoreFrame->GetSize() == outputSize);
+        MOZ_ASSERT(restoreFrame->IsFinished());
+
+        mBaseFrameStartPtr = restoreFrame.Data();
+        MOZ_ASSERT(mBaseFrameStartPtr);
+
+        gfx::IntRect restoreBlendRect = restoreFrame->GetBoundedBlendRect();
+        gfx::IntRect restoreDirtyRect = aConfig.mDecoder->GetRestoreDirtyRect();
+        switch (restoreFrame->GetDisposalMethod()) {
+          default:
+          case DisposalMethod::RESTORE_PREVIOUS:
+            MOZ_FALLTHROUGH_ASSERT("Unexpected DisposalMethod");
+          case DisposalMethod::NOT_SPECIFIED:
+          case DisposalMethod::KEEP:
+            dirtyRect = mFrameRect.Union(restoreDirtyRect);
+            break;
+          case DisposalMethod::CLEAR:
+            if (!mFrameRect.Contains(restoreBlendRect) ||
+                blendMethod == BlendMethod::OVER) {
+              clearRect = restoreBlendRect;
+            }
+
+            if (outputRect.IsEqualEdges(clearRect)) {
+              mBaseFrameStartPtr = nullptr;
+            } else {
+              dirtyRect = mFrameRect.Union(restoreDirtyRect).Union(clearRect);
+            }
+            break;
+        }
+      } else if (!fullFrame) {
+        clearRect = outputRect;
+      }
+    }
+
+    const gfx::IntRect& recycleRect = aConfig.mDecoder->GetRecycleRect();
+    mRecycleRow = recycleRect.y;
+    mRecycleRowMost = recycleRect.YMost();
+    mRecycleRowOffset = recycleRect.x * sizeof(uint32_t);
+    mRecycleRowLength = recycleRect.width * sizeof(uint32_t);
+
+    if (!clearRect.IsEmpty()) {
+      mClearRow = clearRect.y;
+      mClearRowMost = clearRect.YMost();
+      mClearInfixOffset = clearRect.x * sizeof(uint32_t);
+      mClearInfixLength = clearRect.width * sizeof(uint32_t);
+
+      if (mClearInfixOffset > mRecycleRowOffset) {
+        mClearPrefixLength = mClearInfixOffset - mRecycleRowOffset;
+      }
+
+      mClearPostfixOffset = mClearInfixOffset + mClearInfixLength;
+      size_t recycleRowEndOffset = mRecycleRowOffset + mRecycleRowLength;
+      if (mClearPostfixOffset < recycleRowEndOffset) {
+        mClearPostfixLength = recycleRowEndOffset - mClearPostfixOffset;
+      }
+    }
+
+    currentFrame->SetDirtyRect(dirtyRect);
+
+    if (!mBaseFrameStartPtr) {
+      blendMethod = BlendMethod::SOURCE;
+    }
+
+    if (blendMethod == BlendMethod::OVER) {
+      mOverProc = SkBlitRow::Factory32(SkBlitRow::kSrcPixelAlpha_Flag32);
+      MOZ_ASSERT(mOverProc);
+    }
+
+    if (mFrameRect.width < mUnclampedFrameRect.width || mOverProc) {
+      mBuffer.reset(new (fallible)
+                        uint8_t[mUnclampedFrameRect.width * sizeof(uint32_t)]);
+      if (MOZ_UNLIKELY(!mBuffer)) {
+        return NS_ERROR_OUT_OF_MEMORY;
+      }
+
+      memset(mBuffer.get(), 0, mUnclampedFrameRect.width * sizeof(uint32_t));
+    }
+
+    ConfigureFilter(mUnclampedFrameRect.Size(), sizeof(uint32_t));
+    return NS_OK;
+  }
+
+  Maybe<SurfaceInvalidRect> TakeInvalidRect() override {
+    return mNext.TakeInvalidRect();
+  }
+
+ protected:
+  uint8_t* DoResetToFirstRow() override {
+    uint8_t* rowPtr = mNext.ResetToFirstRow();
+    if (rowPtr == nullptr) {
+      mRow = mFrameRect.YMost();
+      return nullptr;
+    }
+
+    mRow = 0;
+    mBaseFrameRowPtr = mBaseFrameStartPtr;
+
+    while (mRow < mFrameRect.y) {
+      WriteBaseFrameRow();
+      AdvanceRowOutsideFrameRect();
+    }
+
+    rowPtr = mBuffer ? mBuffer.get() : mNext.CurrentRowPointer();
+    if (!mFrameRect.IsEmpty() || rowPtr == nullptr) {
+      mRow = mUnclampedFrameRect.y;
+      WriteBaseFrameRow();
+      return AdjustRowPointer(rowPtr);
+    }
+
+    WriteBaseFrameRowsUntilComplete();
+
+    mRow = mFrameRect.YMost();
+    return nullptr;  
+  }
+
+  uint8_t* DoAdvanceRowFromBuffer(const uint8_t* aInputRow) override {
+    CopyInputRow(aInputRow);
+    return DoAdvanceRow();
+  }
+
+  uint8_t* DoAdvanceRow() override {
+    uint8_t* rowPtr = nullptr;
+
+    const int32_t currentRow = mRow;
+    mRow++;
+
+    if (currentRow >= 0 && mBaseFrameRowPtr) {
+      mBaseFrameRowPtr += mRowLength;
+    }
+
+    if (currentRow < mFrameRect.y) {
+      rowPtr = mBuffer ? mBuffer.get() : mNext.CurrentRowPointer();
+      return AdjustRowPointer(rowPtr);
+    } else if (NS_WARN_IF(currentRow >= mFrameRect.YMost())) {
+      return nullptr;
+    }
+
+    if (mBuffer) {
+      int32_t width = mFrameRect.width;
+      uint32_t* dst = reinterpret_cast<uint32_t*>(mNext.CurrentRowPointer());
+      uint32_t* src = reinterpret_cast<uint32_t*>(mBuffer.get()) -
+                      std::min(mUnclampedFrameRect.x, 0);
+      dst += mFrameRect.x;
+      if (mOverProc) {
+        mOverProc(dst, src, width, 0xFF);
+      } else {
+        memcpy(dst, src, width * sizeof(uint32_t));
+      }
+      rowPtr = mNext.AdvanceRow() ? mBuffer.get() : nullptr;
+    } else {
+      MOZ_ASSERT(!mOverProc);
+      rowPtr = mNext.AdvanceRow();
+    }
+
+    if (mRow < mFrameRect.YMost() || rowPtr == nullptr) {
+      WriteBaseFrameRow();
+      return AdjustRowPointer(rowPtr);
+    }
+
+    WriteBaseFrameRowsUntilComplete();
+
+    return nullptr;  
+  }
+
+ private:
+  void WriteBaseFrameRowsUntilComplete() {
+    do {
+      WriteBaseFrameRow();
+    } while (AdvanceRowOutsideFrameRect());
+  }
+
+  void WriteBaseFrameRow() {
+    uint8_t* dest = mNext.CurrentRowPointer();
+    if (!dest) {
+      return;
+    }
+
+    bool needBaseFrame = mRow >= mRecycleRow && mRow < mRecycleRowMost;
+
+    if (!mBaseFrameRowPtr) {
+      if (needBaseFrame) {
+        memset(dest + mRecycleRowOffset, 0, mRecycleRowLength);
+      }
+    } else if (mClearRow <= mRow && mClearRowMost > mRow) {
+      if (needBaseFrame) {
+        memcpy(dest + mRecycleRowOffset, mBaseFrameRowPtr + mRecycleRowOffset,
+               mClearPrefixLength);
+        memcpy(dest + mClearPostfixOffset,
+               mBaseFrameRowPtr + mClearPostfixOffset, mClearPostfixLength);
+      }
+      memset(dest + mClearInfixOffset, 0, mClearInfixLength);
+    } else if (needBaseFrame) {
+      memcpy(dest + mRecycleRowOffset, mBaseFrameRowPtr + mRecycleRowOffset,
+             mRecycleRowLength);
+    }
+  }
+
+  bool AdvanceRowOutsideFrameRect() {
+    MOZ_ASSERT(mRow >= 0);
+    MOZ_ASSERT(mRow < mFrameRect.y || mRow >= mFrameRect.YMost());
+
+    mRow++;
+    if (mBaseFrameRowPtr) {
+      mBaseFrameRowPtr += mRowLength;
+    }
+
+    return mNext.AdvanceRow() != nullptr;
+  }
+
+  uint8_t* AdjustRowPointer(uint8_t* aNextRowPointer) const {
+    if (mBuffer) {
+      MOZ_ASSERT(aNextRowPointer == mBuffer.get() ||
+                 aNextRowPointer == nullptr);
+      return aNextRowPointer;  
+    }
+
+    if (mFrameRect.IsEmpty() || mRow >= mFrameRect.YMost() ||
+        aNextRowPointer == nullptr) {
+      return nullptr;  
+    }
+
+    MOZ_ASSERT(!mOverProc);
+    return aNextRowPointer + mFrameRect.x * sizeof(uint32_t);
+  }
+
+  Next mNext;  
+
+  gfx::IntRect mFrameRect;  
+  gfx::IntRect mUnclampedFrameRect;  
+  UniquePtr<uint8_t[]> mBuffer;      
+  int32_t mRow;              
+  size_t mRowLength;         
+  int32_t mRecycleRow;       
+  int32_t mRecycleRowMost;   
+  size_t mRecycleRowOffset;  
+  size_t mRecycleRowLength;  
+
+  int32_t mClearRow;           
+  int32_t mClearRowMost;       
+  size_t mClearPrefixLength;   
+  size_t mClearInfixOffset;    
+  size_t mClearInfixLength;    
+  size_t mClearPostfixOffset;  
+  size_t mClearPostfixLength;  
+
+  SkBlitRow::Proc32 mOverProc;  
+  const uint8_t*
+      mBaseFrameStartPtr;           
+  const uint8_t* mBaseFrameRowPtr;  
+};
+
+
+template <typename Next>
+class RemoveFrameRectFilter;
+
+struct RemoveFrameRectConfig {
+  template <typename Next>
+  using Filter = RemoveFrameRectFilter<Next>;
+  gfx::IntRect mFrameRect;  
+};
+
+template <typename Next>
+class RemoveFrameRectFilter final : public SurfaceFilter {
+ public:
+  RemoveFrameRectFilter() : mRow(0) {}
+
+  template <typename... Rest>
+  nsresult Configure(const RemoveFrameRectConfig& aConfig,
+                     const Rest&... aRest) {
+    nsresult rv = mNext.Configure(aRest...);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+
+    mFrameRect = mUnclampedFrameRect = aConfig.mFrameRect;
+    gfx::IntSize outputSize = mNext.InputSize();
+
+    if (aConfig.mFrameRect.Width() < 0 || aConfig.mFrameRect.Height() < 0) {
+      return NS_ERROR_INVALID_ARG;
+    }
+
+    gfx::IntRect outputRect(0, 0, outputSize.width, outputSize.height);
+    mFrameRect = mFrameRect.Intersect(outputRect);
+
+    if (mFrameRect.IsEmpty()) {
+      mFrameRect.MoveTo(0, 0);
+    }
+
+    if (mFrameRect.Width() < mUnclampedFrameRect.Width()) {
+      mBuffer.reset(new (
+          fallible) uint8_t[mUnclampedFrameRect.Width() * sizeof(uint32_t)]);
+      if (MOZ_UNLIKELY(!mBuffer)) {
+        return NS_ERROR_OUT_OF_MEMORY;
+      }
+
+      memset(mBuffer.get(), 0, mUnclampedFrameRect.Width() * sizeof(uint32_t));
+    }
+
+    ConfigureFilter(mUnclampedFrameRect.Size(), sizeof(uint32_t));
+    return NS_OK;
+  }
+
+  Maybe<SurfaceInvalidRect> TakeInvalidRect() override {
+    return mNext.TakeInvalidRect();
+  }
+
+ protected:
+  uint8_t* DoResetToFirstRow() override {
+    uint8_t* rowPtr = mNext.ResetToFirstRow();
+    if (rowPtr == nullptr) {
+      mRow = mFrameRect.YMost();
+      return nullptr;
+    }
+
+    mRow = mUnclampedFrameRect.Y();
+
+    if (mFrameRect.Y() > 0) {
+      for (int32_t rowToOutput = 0; rowToOutput < mFrameRect.Y();
+           ++rowToOutput) {
+        mNext.WriteEmptyRow();
+      }
+    }
+
+    rowPtr = mBuffer ? mBuffer.get() : mNext.CurrentRowPointer();
+    if (!mFrameRect.IsEmpty() || rowPtr == nullptr) {
+      return AdjustRowPointer(rowPtr);
+    }
+
+    while (mNext.WriteEmptyRow() == WriteState::NEED_MORE_DATA) {
+    }
+
+    mRow = mFrameRect.YMost();
+    return nullptr;  
+  }
+
+  uint8_t* DoAdvanceRowFromBuffer(const uint8_t* aInputRow) override {
+    CopyInputRow(aInputRow);
+    return DoAdvanceRow();
+  }
+
+  uint8_t* DoAdvanceRow() override {
+    uint8_t* rowPtr = nullptr;
+
+    const int32_t currentRow = mRow;
+    mRow++;
+
+    if (currentRow < mFrameRect.Y()) {
+      rowPtr = mBuffer ? mBuffer.get() : mNext.CurrentRowPointer();
+      return AdjustRowPointer(rowPtr);
+    } else if (currentRow >= mFrameRect.YMost()) {
+      NS_WARNING("RemoveFrameRectFilter: Advancing past end of frame rect");
+      return nullptr;
+    }
+
+    if (mBuffer) {
+      uint32_t* source = reinterpret_cast<uint32_t*>(mBuffer.get()) -
+                         std::min(mUnclampedFrameRect.X(), 0);
+
+      WriteState state =
+          mNext.WriteBuffer(source, mFrameRect.X(), mFrameRect.Width());
+
+      rowPtr = state == WriteState::NEED_MORE_DATA ? mBuffer.get() : nullptr;
+    } else {
+      rowPtr = mNext.AdvanceRow();
+    }
+
+    if (mRow < mFrameRect.YMost() || rowPtr == nullptr) {
+      return AdjustRowPointer(rowPtr);
+    }
+
+    while (mNext.WriteEmptyRow() == WriteState::NEED_MORE_DATA) {
+    }
+
+    mRow = mFrameRect.YMost();
+    return nullptr;  
+  }
+
+ private:
+  uint8_t* AdjustRowPointer(uint8_t* aNextRowPointer) const {
+    if (mBuffer) {
+      MOZ_ASSERT(aNextRowPointer == mBuffer.get() ||
+                 aNextRowPointer == nullptr);
+      return aNextRowPointer;  
+    }
+
+    if (mFrameRect.IsEmpty() || mRow >= mFrameRect.YMost() ||
+        aNextRowPointer == nullptr) {
+      return nullptr;  
+    }
+
+    return aNextRowPointer + mFrameRect.X() * sizeof(uint32_t);
+  }
+
+  Next mNext;  
+
+  gfx::IntRect mFrameRect;  
+  gfx::IntRect mUnclampedFrameRect;  
+  UniquePtr<uint8_t[]> mBuffer;      
+  int32_t mRow;  
+};
+
+
+template <typename Next>
+class ADAM7InterpolatingFilter;
+
+struct ADAM7InterpolatingConfig {
+  template <typename Next>
+  using Filter = ADAM7InterpolatingFilter<Next>;
+};
+
+template <typename Next>
+class ADAM7InterpolatingFilter final : public SurfaceFilter {
+ public:
+  ADAM7InterpolatingFilter()
+      : mPass(0)  
+        ,
+        mRow(0) {}
+
+  template <typename... Rest>
+  nsresult Configure(const ADAM7InterpolatingConfig& aConfig,
+                     const Rest&... aRest) {
+    nsresult rv = mNext.Configure(aRest...);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+
+    size_t inputWidthInBytes = mNext.InputSize().width * sizeof(uint32_t);
+    mPreviousRow.reset(new (fallible) uint8_t[inputWidthInBytes]);
+    if (MOZ_UNLIKELY(!mPreviousRow)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    mCurrentRow.reset(new (fallible) uint8_t[inputWidthInBytes]);
+    if (MOZ_UNLIKELY(!mCurrentRow)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    memset(mPreviousRow.get(), 0, inputWidthInBytes);
+    memset(mCurrentRow.get(), 0, inputWidthInBytes);
+
+    ConfigureFilter(mNext.InputSize(), sizeof(uint32_t));
+    return NS_OK;
+  }
+
+  Maybe<SurfaceInvalidRect> TakeInvalidRect() override {
+    return mNext.TakeInvalidRect();
+  }
+
+ protected:
+  uint8_t* DoResetToFirstRow() override {
+    mRow = 0;
+    mPass = std::min(mPass + 1, 7);
+
+    uint8_t* rowPtr = mNext.ResetToFirstRow();
+    if (mPass == 7) {
+      return rowPtr;
+    }
+
+    return mCurrentRow.get();
+  }
+
+  uint8_t* DoAdvanceRowFromBuffer(const uint8_t* aInputRow) override {
+    CopyInputRow(aInputRow);
+    return DoAdvanceRow();
+  }
+
+  uint8_t* DoAdvanceRow() override {
+    MOZ_ASSERT(0 < mPass && mPass <= 7, "Invalid pass");
+
+    int32_t currentRow = mRow;
+    ++mRow;
+
+    if (mPass == 7) {
+      return mNext.AdvanceRow();
+    }
+
+    const int32_t lastImportantRow =
+        LastImportantRow(InputSize().height, mPass);
+    if (currentRow > lastImportantRow) {
+      return nullptr;  
+    }
+
+    if (!IsImportantRow(currentRow, mPass)) {
+      return mCurrentRow.get();
+    }
+
+    InterpolateHorizontally(mCurrentRow.get(), InputSize().width, mPass);
+
+    if (currentRow != 0) {
+      InterpolateVertically(mPreviousRow.get(), mCurrentRow.get(), mPass,
+                            mNext);
+    }
+
+    uint32_t* currentRowAsPixels =
+        reinterpret_cast<uint32_t*>(mCurrentRow.get());
+    mNext.WriteBuffer(currentRowAsPixels);
+
+    if (currentRow == lastImportantRow) {
+      while (mNext.WriteBuffer(currentRowAsPixels) ==
+             WriteState::NEED_MORE_DATA) {
+      }
+
+      return nullptr;
+    }
+
+    std::swap(mPreviousRow, mCurrentRow);
+
+    MOZ_ASSERT(mRow < InputSize().height,
+               "Reached the end of the surface without "
+               "hitting the last important row?");
+
+    return mCurrentRow.get();
+  }
+
+ private:
+  static void InterpolateVertically(uint8_t* aPreviousRow, uint8_t* aCurrentRow,
+                                    uint8_t aPass, SurfaceFilter& aNext) {
+    const float* weights = InterpolationWeights(ImportantRowStride(aPass));
+
+    for (int32_t outRow = 1; outRow < ImportantRowStride(aPass); ++outRow) {
+      const float weight = weights[outRow];
+
+      uint8_t* prevRowBytes = aPreviousRow;
+      uint8_t* currRowBytes = aCurrentRow;
+
+      aNext.template WritePixelsToRow<uint32_t>([&] {
+        uint32_t pixel = 0;
+        auto* component = reinterpret_cast<uint8_t*>(&pixel);
+        *component++ =
+            InterpolateByte(*prevRowBytes++, *currRowBytes++, weight);
+        *component++ =
+            InterpolateByte(*prevRowBytes++, *currRowBytes++, weight);
+        *component++ =
+            InterpolateByte(*prevRowBytes++, *currRowBytes++, weight);
+        *component++ =
+            InterpolateByte(*prevRowBytes++, *currRowBytes++, weight);
+        return AsVariant(pixel);
+      });
+    }
+  }
+
+  static void InterpolateHorizontally(uint8_t* aRow, int32_t aWidth,
+                                      uint8_t aPass) {
+    const size_t finalPixelStride = FinalPixelStride(aPass);
+    const size_t finalPixelStrideBytes = finalPixelStride * sizeof(uint32_t);
+    const size_t lastFinalPixel = LastFinalPixel(aWidth, aPass);
+    const size_t lastFinalPixelBytes = lastFinalPixel * sizeof(uint32_t);
+    const float* weights = InterpolationWeights(finalPixelStride);
+
+    for (size_t blockBytes = 0; blockBytes < lastFinalPixelBytes;
+         blockBytes += finalPixelStrideBytes) {
+      uint8_t* finalPixelA = aRow + blockBytes;
+      uint8_t* finalPixelB = aRow + blockBytes + finalPixelStrideBytes;
+
+      MOZ_ASSERT(finalPixelA < aRow + aWidth * sizeof(uint32_t),
+                 "Running off end of buffer");
+      MOZ_ASSERT(finalPixelB < aRow + aWidth * sizeof(uint32_t),
+                 "Running off end of buffer");
+
+      for (size_t pixelIndex = 1; pixelIndex < finalPixelStride; ++pixelIndex) {
+        const float weight = weights[pixelIndex];
+        uint8_t* pixel = aRow + blockBytes + pixelIndex * sizeof(uint32_t);
+
+        MOZ_ASSERT(pixel < aRow + aWidth * sizeof(uint32_t),
+                   "Running off end of buffer");
+
+        for (size_t component = 0; component < sizeof(uint32_t); ++component) {
+          pixel[component] = InterpolateByte(finalPixelA[component],
+                                             finalPixelB[component], weight);
+        }
+      }
+    }
+
+    uint32_t* rowPixels = reinterpret_cast<uint32_t*>(aRow);
+    uint32_t pixelToDuplicate = rowPixels[lastFinalPixel];
+    for (int32_t pixelIndex = lastFinalPixel + 1; pixelIndex < aWidth;
+         ++pixelIndex) {
+      MOZ_ASSERT(pixelIndex < aWidth, "Running off end of buffer");
+      rowPixels[pixelIndex] = pixelToDuplicate;
+    }
+  }
+
+  static uint8_t InterpolateByte(uint8_t aByteA, uint8_t aByteB,
+                                 float aWeight) {
+    return uint8_t(aByteA * aWeight + aByteB * (1.0f - aWeight));
+  }
+
+  static int32_t ImportantRowStride(uint8_t aPass) {
+    MOZ_ASSERT(0 < aPass && aPass <= 7, "Invalid pass");
+
+    static int32_t strides[] = {1, 8, 8, 4, 4, 2, 2, 1};
+
+    return strides[aPass];
+  }
+
+  static bool IsImportantRow(int32_t aRow, uint8_t aPass) {
+    MOZ_ASSERT(aRow >= 0);
+
+    int32_t mask = ImportantRowStride(aPass) - 1;
+    return (aRow & mask) == 0;
+  }
+
+  static int32_t LastImportantRow(int32_t aHeight, uint8_t aPass) {
+    MOZ_ASSERT(aHeight > 0);
+
+    int32_t lastRow = aHeight - 1;
+    int32_t mask = ImportantRowStride(aPass) - 1;
+    return lastRow - (lastRow & mask);
+  }
+
+  static size_t FinalPixelStride(uint8_t aPass) {
+    MOZ_ASSERT(0 < aPass && aPass <= 7, "Invalid pass");
+
+    static size_t strides[] = {1, 8, 4, 4, 2, 2, 1, 1};
+
+    return strides[aPass];
+  }
+
+  static size_t LastFinalPixel(int32_t aWidth, uint8_t aPass) {
+    MOZ_ASSERT(aWidth >= 0);
+
+    int32_t lastColumn = aWidth - 1;
+    size_t mask = FinalPixelStride(aPass) - 1;
+    return lastColumn - (lastColumn & mask);
+  }
+
+  static const float* InterpolationWeights(int32_t aStride) {
+    static float stride8Weights[] = {1.0f,     7 / 8.0f, 6 / 8.0f, 5 / 8.0f,
+                                     4 / 8.0f, 3 / 8.0f, 2 / 8.0f, 1 / 8.0f};
+    static float stride4Weights[] = {1.0f, 3 / 4.0f, 2 / 4.0f, 1 / 4.0f};
+    static float stride2Weights[] = {1.0f, 1 / 2.0f};
+    static float stride1Weights[] = {1.0f};
+
+    switch (aStride) {
+      case 8:
+        return stride8Weights;
+      case 4:
+        return stride4Weights;
+      case 2:
+        return stride2Weights;
+      case 1:
+        return stride1Weights;
+      default:
+        MOZ_CRASH();
+    }
+  }
+
+  Next mNext;  
+
+  UniquePtr<uint8_t[]>
+      mPreviousRow;  
+  UniquePtr<uint8_t[]> mCurrentRow;  
+  uint8_t mPass;                     
+  int32_t mRow;                      
+};
+
+}  
+}  
+
+#endif  // mozilla_image_SurfaceFilters_h

@@ -1,0 +1,159 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_AUDIONODETRACK_H_
+#define MOZILLA_AUDIONODETRACK_H_
+
+#include "AlignedTArray.h"
+#include "AudioBlock.h"
+#include "AudioSegment.h"
+#include "MediaTrackGraph.h"
+#include "mozilla/dom/AudioNodeBinding.h"
+
+namespace WebCore {
+class Reverb;
+}  
+
+namespace mozilla {
+
+namespace dom {
+struct ThreeDPoint;
+struct AudioParamEvent;
+class AudioContext;
+}  
+
+class AbstractThread;
+class ThreadSharedFloatArrayBufferList;
+class AudioNodeEngine;
+class AudioNodeExternalInputTrack;
+
+typedef AlignedAutoTArray<float, GUESS_AUDIO_CHANNELS * WEBAUDIO_BLOCK_SIZE, 16>
+    DownmixBufferType;
+
+class AudioNodeTrack : public ProcessedMediaTrack {
+  typedef dom::ChannelCountMode ChannelCountMode;
+  typedef dom::ChannelInterpretation ChannelInterpretation;
+
+ public:
+  typedef mozilla::dom::AudioContext AudioContext;
+
+  enum { AUDIO_TRACK = 1 };
+
+  typedef AutoTArray<AudioBlock, 1> OutputChunks;
+
+  typedef unsigned Flags;
+  enum : Flags {
+    NO_TRACK_FLAGS = 0U,
+    NEED_MAIN_THREAD_ENDED = 1U << 0,
+    NEED_MAIN_THREAD_CURRENT_TIME = 1U << 1,
+    EXTERNAL_OUTPUT = 1U << 2,
+  };
+  static already_AddRefed<AudioNodeTrack> Create(AudioContext* aCtx,
+                                                 AudioNodeEngine* aEngine,
+                                                 Flags aKind,
+                                                 MediaTrackGraph* aGraph);
+
+ protected:
+  AudioNodeTrack(AudioNodeEngine* aEngine, Flags aFlags, TrackRate aSampleRate);
+
+  ~AudioNodeTrack();
+
+ public:
+  void SetTrackTimeParameter(uint32_t aIndex, AudioContext* aContext,
+                             double aTrackTime);
+  void SetDoubleParameter(uint32_t aIndex, double aValue);
+  void SetInt32Parameter(uint32_t aIndex, int32_t aValue);
+  void SetThreeDPointParameter(uint32_t aIndex, const dom::ThreeDPoint& aValue);
+  void SetBuffer(AudioChunk&& aBuffer);
+  void SetReverb(WebCore::Reverb* aReverb, uint32_t aImpulseChannelCount);
+  void SendTimelineEvent(uint32_t aIndex, const dom::AudioParamEvent& aEvent);
+  void SetRawArrayData(nsTArray<float>&& aData);
+  void SetChannelMixingParameters(uint32_t aNumberOfChannels,
+                                  ChannelCountMode aChannelCountMoe,
+                                  ChannelInterpretation aChannelInterpretation);
+  void SetPassThrough(bool aPassThrough);
+  void SendRunnable(already_AddRefed<nsIRunnable> aRunnable);
+  ChannelInterpretation GetChannelInterpretation() {
+    return mChannelInterpretation;
+  }
+
+  void SetAudioParamHelperTrack() {
+    MOZ_ASSERT(!mAudioParamTrack, "Can only do this once");
+    mAudioParamTrack = true;
+  }
+  uint32_t NumberOfChannels() const override;
+
+  void AdvanceAndResume(TrackTime aAdvance);
+
+  AudioNodeTrack* AsAudioNodeTrack() override { return this; }
+  void AddInput(MediaInputPort* aPort) override;
+  void RemoveInput(MediaInputPort* aPort) override;
+
+  void SetTrackTimeParameterImpl(uint32_t aIndex, MediaTrack* aRelativeToTrack,
+                                 double aTrackTime);
+  void SetChannelMixingParametersImpl(
+      uint32_t aNumberOfChannels, ChannelCountMode aChannelCountMoe,
+      ChannelInterpretation aChannelInterpretation);
+  void ProcessInput(GraphTime aFrom, GraphTime aTo, uint32_t aFlags) override;
+  void ProduceOutputBeforeInput(GraphTime aFrom);
+  bool IsAudioParamTrack() const { return mAudioParamTrack; }
+
+  const OutputChunks& LastChunks() const { return mLastChunks; }
+  bool MainThreadNeedsUpdates() const override {
+    return ((mFlags & NEED_MAIN_THREAD_ENDED) && mEnded) ||
+           (mFlags & NEED_MAIN_THREAD_CURRENT_TIME);
+  }
+
+  AudioNodeEngine* Engine() { return mEngine.get(); }
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const override;
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const override;
+
+  void SizeOfAudioNodesIncludingThis(MallocSizeOf aMallocSizeOf,
+                                     AudioNodeSizes& aUsage) const;
+
+  void SetActive();
+  void ScheduleCheckForInactive();
+
+  virtual AudioNodeExternalInputTrack* AsAudioNodeExternalInputTrack() {
+    return nullptr;
+  }
+
+ protected:
+  void OnGraphThreadDone() override;
+  void DestroyImpl() override;
+
+  void CheckForInactive();
+
+  void AdvanceOutputSegment();
+  void FinishOutput();
+  void AccumulateInputChunk(uint32_t aInputIndex, const AudioBlock& aChunk,
+                            AudioBlock* aBlock,
+                            DownmixBufferType* aDownmixBuffer);
+  void UpMixDownMixChunk(const AudioBlock* aChunk, uint32_t aOutputChannelCount,
+                         nsTArray<const float*>& aOutputChannels,
+                         DownmixBufferType& aDownmixBuffer);
+
+  uint32_t ComputedNumberOfChannels(uint32_t aInputChannelCount);
+  void ObtainInputBlock(AudioBlock& aTmpChunk, uint32_t aPortIndex);
+  void IncrementActiveInputCount();
+  void DecrementActiveInputCount();
+
+  const UniquePtr<AudioNodeEngine> mEngine;
+  OutputChunks mInputChunks;
+  OutputChunks mLastChunks;
+  const Flags mFlags;
+  uint32_t mActiveInputCount = 0;
+  uint32_t mNumberOfInputChannels;
+  ChannelCountMode mChannelCountMode;
+  ChannelInterpretation mChannelInterpretation;
+  bool mIsActive;
+  bool mMarkAsEndedAfterThisBlock;
+  bool mAudioParamTrack;
+  bool mPassThrough;
+};
+
+}  
+
+#endif /* MOZILLA_AUDIONODETRACK_H_ */

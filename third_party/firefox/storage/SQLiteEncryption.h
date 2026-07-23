@@ -1,0 +1,47 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef STORAGE_SQLITEENCRYPTION_H_
+#define STORAGE_SQLITEENCRYPTION_H_
+
+#include <cstdint>
+
+#include "nsStringFwd.h"
+
+enum class nsresult : uint32_t;
+
+namespace mozilla {
+class LogModule;
+}
+
+namespace mozilla::storage {
+
+void InitEncryptionKeystore();
+
+enum class OpenIntent : uint8_t {
+  CreateIfNew,   
+  LoadExisting,  
+};
+
+enum class EncryptionStatus : uint8_t {
+  Unset,      
+  Encrypted,  
+  Plaintext,  
+};
+
+nsresult GetDatabaseEncryptionStatus(const nsACString& aDatabasePath,
+                                     EncryptionStatus& aStatus);
+
+bool IsBootstrapDatabasePath(const nsACString& aPath);
+
+nsresult GetEncryptionKey(const nsACString& aDatabasePath, OpenIntent aIntent,
+                          nsACString& aOutHexKey);
+
+void ShutdownEncryptionKeystore();
+
+mozilla::LogModule* GetSQLiteEncryptionLog();
+
+}  
+
+#endif  // STORAGE_SQLITEENCRYPTION_H_

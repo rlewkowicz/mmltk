@@ -1,0 +1,239 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Image.h"
+
+#include "WebRenderImageProvider.h"
+#include "imgRequest.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Services.h"
+#include "mozilla/SizeOfState.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/gfx/Point.h"
+#include "mozilla/gfx/Rect.h"
+#include "mozilla/gfx/SourceSurfaceRawData.h"
+#include "nsContentUtils.h"
+#include "nsIObserverService.h"
+#include "nsRefreshDriver.h"
+#include "mozilla/layers/SharedSurfacesChild.h"
+
+namespace mozilla {
+namespace image {
+
+WebRenderImageProvider::WebRenderImageProvider(const ImageResource* aImage)
+    : mProviderId(aImage->GetImageProviderId()) {}
+
+ ImageProviderId WebRenderImageProvider::AllocateProviderId() {
+  static Atomic<ImageProviderId> sProviderId(0u);
+  return ++sProviderId;
+}
+
+
+ImageMemoryCounter::ImageMemoryCounter(imgRequest* aRequest,
+                                       SizeOfState& aState, bool aIsUsed)
+    : mProgress(UINT32_MAX),
+      mType(UINT16_MAX),
+      mIsUsed(aIsUsed),
+      mHasError(false),
+      mValidating(false) {
+  MOZ_ASSERT(aRequest);
+
+  nsCOMPtr<nsIURI> imageURL;
+  nsresult rv = aRequest->GetURI(getter_AddRefs(imageURL));
+  if (NS_SUCCEEDED(rv) && imageURL) {
+    imageURL->GetSpec(mURI);
+  }
+
+  mType = imgIContainer::TYPE_REQUEST;
+  mHasError = NS_FAILED(aRequest->GetImageErrorCode());
+  mValidating = !!aRequest->GetValidator();
+
+  RefPtr<ProgressTracker> tracker = aRequest->GetProgressTracker();
+  if (tracker) {
+    mProgress = tracker->GetProgress();
+  }
+}
+
+ImageMemoryCounter::ImageMemoryCounter(imgRequest* aRequest, Image* aImage,
+                                       SizeOfState& aState, bool aIsUsed)
+    : mProgress(UINT32_MAX),
+      mType(UINT16_MAX),
+      mIsUsed(aIsUsed),
+      mHasError(false),
+      mValidating(false) {
+  MOZ_ASSERT(aRequest);
+  MOZ_ASSERT(aImage);
+
+  nsCOMPtr<nsIURI> imageURL(aImage->GetURI());
+  if (imageURL) {
+    imageURL->GetSpec(mURI);
+  }
+
+  ImageIntrinsicSize size;
+  if (NS_SUCCEEDED(aImage->GetIntrinsicSize(&size))) {
+    mIntrinsicSize.SizeTo(size.mWidth.valueOr(0), size.mHeight.valueOr(0));
+  }  
+
+  mType = aImage->GetType();
+  mHasError = aImage->HasError();
+  mValidating = !!aRequest->GetValidator();
+
+  RefPtr<ProgressTracker> tracker = aImage->GetProgressTracker();
+  if (tracker) {
+    mProgress = tracker->GetProgress();
+  }
+
+  mValues.SetSource(aImage->SizeOfSourceWithComputedFallback(aState));
+  aImage->CollectSizeOfSurfaces(mSurfaces, aState.mMallocSizeOf);
+
+  for (const SurfaceMemoryCounter& surfaceCounter : mSurfaces) {
+    mValues += surfaceCounter.Values();
+  }
+}
+
+
+bool ImageResource::GetSpecTruncatedTo1k(nsCString& aSpec) const {
+  static const size_t sMaxTruncatedLength = 1024;
+
+  mURI->GetSpec(aSpec);
+  if (sMaxTruncatedLength >= aSpec.Length()) {
+    return true;
+  }
+
+  aSpec.Truncate(sMaxTruncatedLength);
+  return false;
+}
+
+void ImageResource::CollectSizeOfSurfaces(
+    nsTArray<SurfaceMemoryCounter>& aCounters,
+    MallocSizeOf aMallocSizeOf) const {
+  SurfaceCache::CollectSizeOfSurfaces(ImageKey(this), aCounters, aMallocSizeOf);
+}
+
+ImageResource::ImageResource(nsIURI* aURI)
+    : mURI(aURI),
+      mInnerWindowId(0),
+      mAnimationConsumers(0),
+      mAnimationMode(kNormalAnimMode),
+      mInitialized(false),
+      mAnimating(false),
+      mError(false),
+      mProviderId(WebRenderImageProvider::AllocateProviderId()) {}
+
+ImageResource::~ImageResource() {
+  mProgressTracker->ResetImage();
+}
+
+void ImageResource::IncrementAnimationConsumers() {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "Main thread only to encourage serialization "
+             "with DecrementAnimationConsumers");
+  mAnimationConsumers++;
+}
+
+void ImageResource::DecrementAnimationConsumers() {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "Main thread only to encourage serialization "
+             "with IncrementAnimationConsumers");
+  MOZ_ASSERT(mAnimationConsumers >= 1, "Invalid no. of animation consumers!");
+  mAnimationConsumers--;
+}
+
+nsresult ImageResource::GetAnimationModeInternal(uint16_t* aAnimationMode) {
+  if (mError) {
+    return NS_ERROR_FAILURE;
+  }
+
+  NS_ENSURE_ARG_POINTER(aAnimationMode);
+
+  *aAnimationMode = mAnimationMode;
+  return NS_OK;
+}
+
+nsresult ImageResource::SetAnimationModeInternal(uint16_t aAnimationMode) {
+  if (mError) {
+    return NS_ERROR_FAILURE;
+  }
+
+  NS_ASSERTION(aAnimationMode == kNormalAnimMode ||
+                   aAnimationMode == kDontAnimMode ||
+                   aAnimationMode == kLoopOnceAnimMode,
+               "Wrong Animation Mode is being set!");
+
+  mAnimationMode = aAnimationMode;
+
+  return NS_OK;
+}
+
+bool ImageResource::HadRecentRefresh(const TimeStamp& aTime) {
+  static TimeDuration recentThreshold =
+      TimeDuration::FromMilliseconds(nsRefreshDriver::DefaultInterval() / 2.0);
+
+  if (!mLastRefreshTime.IsNull() &&
+      aTime - mLastRefreshTime < recentThreshold) {
+    return true;
+  }
+
+  mLastRefreshTime = aTime;
+  return false;
+}
+
+void ImageResource::EvaluateAnimation() {
+  if (!mAnimating && ShouldAnimate()) {
+    nsresult rv = StartAnimation();
+    mAnimating = NS_SUCCEEDED(rv);
+  } else if (mAnimating && !ShouldAnimate()) {
+    StopAnimation();
+  }
+}
+
+void ImageResource::SendOnUnlockedDraw(uint32_t aFlags) {
+  if (!mProgressTracker) {
+    return;
+  }
+
+  if (!(aFlags & FLAG_ASYNC_NOTIFY)) {
+    mProgressTracker->OnUnlockedDraw();
+  } else {
+    NotNull<RefPtr<ImageResource>> image = WrapNotNull(this);
+    nsCOMPtr<nsIEventTarget> eventTarget = GetMainThreadSerialEventTarget();
+    nsCOMPtr<nsIRunnable> ev = NS_NewRunnableFunction(
+        "image::ImageResource::SendOnUnlockedDraw", [=]() -> void {
+          RefPtr<ProgressTracker> tracker = image->GetProgressTracker();
+          if (tracker) {
+            tracker->OnUnlockedDraw();
+          }
+        });
+    eventTarget->Dispatch(CreateRenderBlockingRunnable(ev.forget()),
+                          NS_DISPATCH_NORMAL);
+  }
+}
+
+#ifdef DEBUG
+void ImageResource::NotifyDrawingObservers() {
+  if (!mURI || !NS_IsMainThread()) {
+    return;
+  }
+
+  if (!mURI->SchemeIs("resource") && !mURI->SchemeIs("chrome")) {
+    return;
+  }
+
+  nsCOMPtr<nsIURI> uri = mURI;
+  nsContentUtils::AddScriptRunner(NS_NewRunnableFunction(
+      "image::ImageResource::NotifyDrawingObservers", [uri]() {
+        nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+        NS_WARNING_ASSERTION(obs, "Can't get an observer service handle");
+        if (obs) {
+          nsAutoCString spec;
+          uri->GetSpec(spec);
+          obs->NotifyObservers(nullptr, "image-drawing",
+                               NS_ConvertUTF8toUTF16(spec).get());
+        }
+      }));
+}
+#endif
+
+}  
+}  

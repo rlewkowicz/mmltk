@@ -1,0 +1,88 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_serviceworkerjob_h
+#define mozilla_dom_serviceworkerjob_h
+
+#include "nsCOMPtr.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+class nsIPrincipal;
+
+namespace mozilla {
+
+class ErrorResult;
+
+namespace dom {
+
+class ServiceWorkerJob {
+ public:
+  class Callback {
+   public:
+    virtual void JobFinished(ServiceWorkerJob* aJob, ErrorResult& aStatus) = 0;
+
+    virtual void JobDiscarded(ErrorResult& aStatus) = 0;
+
+    NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+  };
+
+  enum class Type { Register, Update, Unregister };
+
+  enum class State { Initial, Started, Finished };
+
+  Type GetType() const;
+
+  State GetState() const;
+
+  bool Canceled() const;
+
+  bool ResultCallbacksInvoked() const;
+
+  bool IsEquivalentTo(ServiceWorkerJob* aJob) const;
+
+  void AppendResultCallback(Callback* aCallback);
+
+  void StealResultCallbacksFrom(ServiceWorkerJob* aJob);
+
+  void Start(Callback* aFinalCallback);
+
+  void Cancel();
+
+ protected:
+  ServiceWorkerJob(Type aType, nsIPrincipal* aPrincipal,
+                   const nsACString& aScope, nsCString aScriptSpec);
+
+  virtual ~ServiceWorkerJob();
+
+  void InvokeResultCallbacks(ErrorResult& aRv);
+
+  void InvokeResultCallbacks(nsresult aRv);
+
+  void Finish(ErrorResult& aRv);
+
+  void Finish(nsresult aRv);
+
+  virtual void AsyncExecute() = 0;
+
+  const Type mType;
+  nsCOMPtr<nsIPrincipal> mPrincipal;
+  const nsCString mScope;
+  const nsCString mScriptSpec;
+
+ private:
+  RefPtr<Callback> mFinalCallback;
+  nsTArray<RefPtr<Callback>> mResultCallbackList;
+  State mState;
+  bool mCanceled;
+  bool mResultCallbacksInvoked;
+
+ public:
+  NS_INLINE_DECL_REFCOUNTING(ServiceWorkerJob)
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_serviceworkerjob_h

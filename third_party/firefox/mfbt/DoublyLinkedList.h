@@ -1,0 +1,472 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_DoublyLinkedList_h
+#define mozilla_DoublyLinkedList_h
+
+#include <algorithm>
+#include <iterator>
+#include <type_traits>
+
+#include "mozilla/Assertions.h"
+
+
+namespace mozilla {
+
+template <typename T>
+class DoublyLinkedListElement {
+  template <typename U, typename E>
+  friend class DoublyLinkedList;
+  friend T;
+  T* mNext;
+  T* mPrev;
+
+ public:
+  DoublyLinkedListElement() : mNext(nullptr), mPrev(nullptr) {}
+};
+
+template <typename T>
+struct GetDoublyLinkedListElement {
+  static_assert(std::is_base_of<DoublyLinkedListElement<T>, T>::value,
+                "You need your own specialization of GetDoublyLinkedListElement"
+                " or use a separate Trait.");
+  static const DoublyLinkedListElement<T>& Get(const T* aThis) {
+    return *aThis;
+  }
+  static DoublyLinkedListElement<T>& Get(T* aThis) { return *aThis; }
+};
+
+template <typename T, typename ElementAccess = GetDoublyLinkedListElement<T>>
+class DoublyLinkedList final {
+  T* mHead;
+  T* mTail;
+
+  bool isStateValid() const { return (mHead != nullptr) == (mTail != nullptr); }
+
+  bool ElementNotInList(const T* aElm) const {
+    if (!ElementAccess::Get(aElm).mNext && !ElementAccess::Get(aElm).mPrev) {
+      return mHead != aElm;
+    }
+    return false;
+  }
+
+ public:
+  constexpr DoublyLinkedList() : mHead(nullptr), mTail(nullptr) {}
+
+  class Iterator final {
+    T* mCurrent;
+
+   public:
+    using iterator_category = std::forward_iterator_tag;
+    using value_type = T;
+    using difference_type = std::ptrdiff_t;
+    using pointer = T*;
+    using reference = T&;
+
+    Iterator() : mCurrent(nullptr) {}
+    explicit Iterator(T* aCurrent) : mCurrent(aCurrent) {}
+
+    T& operator*() const { return *mCurrent; }
+    T* operator->() const { return mCurrent; }
+
+    Iterator& operator++() {
+      mCurrent = mCurrent ? ElementAccess::Get(mCurrent).mNext : nullptr;
+      return *this;
+    }
+
+    Iterator operator++(int) {
+      Iterator result = *this;
+      ++(*this);
+      return result;
+    }
+
+    Iterator& operator--() {
+      mCurrent = ElementAccess::Get(mCurrent).mPrev;
+      return *this;
+    }
+
+    Iterator operator--(int) {
+      Iterator result = *this;
+      --(*this);
+      return result;
+    }
+
+    bool operator!=(const Iterator& aOther) const {
+      return mCurrent != aOther.mCurrent;
+    }
+
+    bool operator==(const Iterator& aOther) const {
+      return mCurrent == aOther.mCurrent;
+    }
+
+    explicit operator bool() const { return mCurrent; }
+  };
+
+  Iterator begin() { return Iterator(mHead); }
+  const Iterator begin() const { return Iterator(mHead); }
+  const Iterator cbegin() const { return Iterator(mHead); }
+
+  Iterator end() { return Iterator(); }
+  const Iterator end() const { return Iterator(); }
+  const Iterator cend() const { return Iterator(); }
+
+  bool isEmpty() const {
+    MOZ_ASSERT(isStateValid());
+    return mHead == nullptr;
+  }
+
+  void pushFront(T* aElm) {
+    MOZ_ASSERT(aElm);
+    MOZ_ASSERT(ElementNotInList(aElm));
+    MOZ_ASSERT(isStateValid());
+
+    ElementAccess::Get(aElm).mNext = mHead;
+    if (mHead) {
+      MOZ_ASSERT(!ElementAccess::Get(mHead).mPrev);
+      ElementAccess::Get(mHead).mPrev = aElm;
+    }
+
+    mHead = aElm;
+    if (!mTail) {
+      mTail = aElm;
+    }
+  }
+
+  T* popFront() {
+    MOZ_ASSERT(!isEmpty());
+    MOZ_ASSERT(isStateValid());
+
+    T* result = mHead;
+    mHead = result ? ElementAccess::Get(result).mNext : nullptr;
+    if (mHead) {
+      ElementAccess::Get(mHead).mPrev = nullptr;
+    }
+
+    if (mTail == result) {
+      mTail = nullptr;
+    }
+
+    if (result) {
+      ElementAccess::Get(result).mNext = nullptr;
+      ElementAccess::Get(result).mPrev = nullptr;
+    }
+
+    return result;
+  }
+
+  void pushBack(T* aElm) {
+    MOZ_ASSERT(aElm);
+    MOZ_ASSERT(ElementNotInList(aElm));
+    MOZ_ASSERT(isStateValid());
+
+    ElementAccess::Get(aElm).mNext = nullptr;
+    ElementAccess::Get(aElm).mPrev = mTail;
+    if (mTail) {
+      MOZ_ASSERT(!ElementAccess::Get(mTail).mNext);
+      ElementAccess::Get(mTail).mNext = aElm;
+    }
+
+    mTail = aElm;
+    if (!mHead) {
+      mHead = aElm;
+    }
+  }
+
+  T* popBack() {
+    MOZ_ASSERT(!isEmpty());
+    MOZ_ASSERT(isStateValid());
+
+    T* result = mTail;
+    mTail = result ? ElementAccess::Get(result).mPrev : nullptr;
+    if (mTail) {
+      ElementAccess::Get(mTail).mNext = nullptr;
+    }
+
+    if (mHead == result) {
+      mHead = nullptr;
+    }
+
+    if (result) {
+      ElementAccess::Get(result).mNext = nullptr;
+      ElementAccess::Get(result).mPrev = nullptr;
+    }
+
+    return result;
+  }
+
+  void insertBefore(const Iterator& aIter, T* aElm) {
+    MOZ_ASSERT(aElm);
+    MOZ_ASSERT(ElementNotInList(aElm));
+    MOZ_ASSERT(isStateValid());
+
+    if (!aIter) {
+      return pushBack(aElm);
+    } else if (aIter == begin()) {
+      return pushFront(aElm);
+    }
+
+    T* after = &(*aIter);
+    T* before = ElementAccess::Get(after).mPrev;
+    MOZ_ASSERT(before);
+
+    ElementAccess::Get(before).mNext = aElm;
+    ElementAccess::Get(aElm).mPrev = before;
+    ElementAccess::Get(aElm).mNext = after;
+    ElementAccess::Get(after).mPrev = aElm;
+  }
+
+  void remove(T* aElm) {
+    MOZ_ASSERT(aElm);
+    MOZ_ASSERT(ElementAccess::Get(aElm).mNext ||
+                   ElementAccess::Get(aElm).mPrev ||
+                   (aElm == mHead && aElm == mTail),
+               "Attempted to remove element not in this list");
+
+    if (T* prev = ElementAccess::Get(aElm).mPrev) {
+      ElementAccess::Get(prev).mNext = ElementAccess::Get(aElm).mNext;
+    } else {
+      MOZ_ASSERT(mHead == aElm);
+      mHead = ElementAccess::Get(aElm).mNext;
+    }
+
+    if (T* next = ElementAccess::Get(aElm).mNext) {
+      ElementAccess::Get(next).mPrev = ElementAccess::Get(aElm).mPrev;
+    } else {
+      MOZ_ASSERT(mTail == aElm);
+      mTail = ElementAccess::Get(aElm).mPrev;
+    }
+
+    ElementAccess::Get(aElm).mNext = nullptr;
+    ElementAccess::Get(aElm).mPrev = nullptr;
+  }
+
+  Iterator find(const T& aElm) const { return std::find(begin(), end(), aElm); }
+
+  Iterator find(const T* aNeedle) const {
+    return std::find_if(begin(), end(),
+                        [aNeedle](const T& elm) { return &elm == aNeedle; });
+  }
+
+  bool contains(const T& aElm) const { return find(aElm) != Iterator(); }
+
+  bool contains(const T* aElm) const { return find(aElm) != Iterator(); }
+
+  bool ElementProbablyInList(const T* aElm) const {
+    if (isEmpty()) {
+      return false;
+    }
+    return !ElementNotInList(aElm);
+  }
+
+  bool ElementIsLinkedWell(const T* aElm) const {
+    MOZ_ASSERT(aElm);
+    if (!ElementProbablyInList(aElm)) {
+      return false;
+    }
+    T* next = ElementAccess::Get(aElm).mNext;
+    if (next) {
+      if (ElementAccess::Get(next).mPrev != aElm || aElm == mTail) {
+        return false;
+      }
+    } else {
+      if (aElm != mTail) {
+        return false;
+      }
+    }
+    T* prev = ElementAccess::Get(aElm).mPrev;
+    if (prev) {
+      if (ElementAccess::Get(prev).mNext != aElm || aElm == mHead) {
+        return false;
+      }
+    } else {
+      if (aElm != mHead) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool ListIsWellFormed() const {
+    if ((mHead == nullptr) && (mTail == mHead)) {
+      return true;
+    } else if (mTail == nullptr) {
+      return false;
+    }
+
+    std::all_of(begin(), end(),
+                [this](const T& elem) { return ElementIsLinkedWell(&elem); });
+
+    return true;
+  }
+};
+
+template <typename T, typename ElementAccess = GetDoublyLinkedListElement<T>>
+class SafeDoublyLinkedList {
+ public:
+  class SafeIterator {
+    using BaseIterator = typename DoublyLinkedList<T, ElementAccess>::Iterator;
+    friend class SafeDoublyLinkedList<T, ElementAccess>;
+
+   public:
+    using iterator_category = std::forward_iterator_tag;
+    using value_type = T;
+    using difference_type = std::ptrdiff_t;
+    using pointer = T*;
+    using const_pointer = const T*;
+    using reference = T&;
+    using const_reference = const T&;
+
+    SafeIterator() = default;
+    SafeIterator(SafeIterator const& aOther)
+        : SafeIterator(aOther.mCurrent, aOther.mList) {}
+
+    SafeIterator(BaseIterator aBaseIter,
+                 SafeDoublyLinkedList<T, ElementAccess>* aList)
+        : mCurrent(aBaseIter),
+          mNext(aBaseIter ? ++aBaseIter : BaseIterator()),
+          mList(aList) {
+      if (mList) {
+        mNextIterator = mList->mIter;
+        mList->mIter = this;
+      }
+    }
+    ~SafeIterator() {
+      if (mList) {
+        MOZ_ASSERT(mList->mIter == this,
+                   "Iterators must currently be destroyed in opposite order "
+                   "from the construction order. It is suggested that you "
+                   "simply put them on the stack");
+        mList->mIter = mNextIterator;
+      }
+    }
+
+    SafeIterator& operator++() {
+      mCurrent = mNext;
+      if (mNext) {
+        ++mNext;
+      }
+      return *this;
+    }
+
+    pointer operator->() { return &*mCurrent; }
+    const_pointer operator->() const { return &*mCurrent; }
+    reference operator*() { return *mCurrent; }
+    const_reference operator*() const { return *mCurrent; }
+
+    pointer current() { return mCurrent ? &*mCurrent : nullptr; }
+    const_pointer current() const { return mCurrent ? &*mCurrent : nullptr; }
+
+    explicit operator bool() const { return bool(mCurrent); }
+    bool operator==(SafeIterator const& other) const {
+      return mCurrent == other.mCurrent;
+    }
+    bool operator!=(SafeIterator const& other) const {
+      return mCurrent != other.mCurrent;
+    }
+
+    BaseIterator& next() { return mNext; }  
+   private:
+    BaseIterator mCurrent{nullptr};
+    BaseIterator mNext{nullptr};
+
+    SafeIterator* mNextIterator{nullptr};
+    SafeDoublyLinkedList<T, ElementAccess>* mList{nullptr};
+
+    void setNext(T* aElm) { mNext = BaseIterator(aElm); }
+    void setCurrent(T* aElm) { mCurrent = BaseIterator(aElm); }
+  };
+
+ private:
+  using BaseListType = DoublyLinkedList<T, ElementAccess>;
+  friend class SafeIterator;
+
+ public:
+  SafeDoublyLinkedList() = default;
+
+  bool isEmpty() const { return mList.isEmpty(); }
+  bool contains(T* aElm) {
+    for (const T& el : *this) {
+      if (aElm == &el) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  SafeIterator begin() { return SafeIterator(mList.begin(), this); }
+  SafeIterator begin() const { return SafeIterator(mList.begin(), this); }
+  SafeIterator cbegin() const { return begin(); }
+
+  SafeIterator end() { return SafeIterator(); }
+  SafeIterator end() const { return SafeIterator(); }
+  SafeIterator cend() const { return SafeIterator(); }
+
+  void pushFront(T* aElm) { mList.pushFront(aElm); }
+
+  void pushBack(T* aElm) {
+    mList.pushBack(aElm);
+    auto* iter = mIter;
+    while (iter) {
+      if (!iter->mNext) {
+        iter->setNext(aElm);
+      }
+      iter = iter->mNextIterator;
+    }
+  }
+
+  T* popFront() {
+    T* firstElm = mList.popFront();
+    auto* iter = mIter;
+    while (iter) {
+      if (iter->current() == firstElm) {
+        iter->setCurrent(nullptr);
+      }
+      iter = iter->mNextIterator;
+    }
+
+    return firstElm;
+  }
+
+  T* popBack() {
+    T* lastElm = mList.popBack();
+    auto* iter = mIter;
+    while (iter) {
+      if (iter->current() == lastElm) {
+        iter->setCurrent(nullptr);
+      } else if (iter->mNext && &*(iter->mNext) == lastElm) {
+        iter->setNext(nullptr);
+      }
+      iter = iter->mNextIterator;
+    }
+
+    return lastElm;
+  }
+
+  void remove(T* aElm) {
+    if (!mList.ElementProbablyInList(aElm)) {
+      return;
+    }
+    auto* iter = mIter;
+    while (iter) {
+      if (iter->mNext && &*(iter->mNext) == aElm) {
+        ++(iter->mNext);
+      }
+      if (iter->current() == aElm) {
+        iter->setCurrent(nullptr);
+      }
+      iter = iter->mNextIterator;
+    }
+
+    mList.remove(aElm);
+  }
+
+ private:
+  BaseListType mList;
+  SafeIterator* mIter{nullptr};
+};
+
+}  
+
+#endif  // mozilla_DoublyLinkedList_h

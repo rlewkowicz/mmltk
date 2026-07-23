@@ -1,0 +1,58 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef CTLogVerifier_h
+#define CTLogVerifier_h
+
+#include "CTKnownLogs.h"
+#include "CTLog.h"
+#include "CTUtils.h"
+#include "SignedCertificateTimestamp.h"
+#include "mozpkix/Input.h"
+#include "mozpkix/Result.h"
+#include "mozpkix/pkix.h"
+#include "signature_cache_ffi.h"
+
+namespace mozilla {
+namespace ct {
+
+class CTLogVerifier {
+ public:
+  CTLogVerifier(CTLogOperatorId operatorId, CTLogState logState,
+                CTLogFormat logFormat, uint64_t timestamp);
+
+  pkix::Result Init(pkix::Input subjectPublicKeyInfo);
+
+  const Buffer& keyId() const { return mKeyId; }
+
+  CTLogOperatorId operatorId() const { return mOperatorId; }
+  CTLogState state() const { return mState; }
+  CTLogFormat format() const { return mFormat; }
+  uint64_t timestamp() const { return mTimestamp; }
+
+  pkix::Result Verify(const LogEntry& entry,
+                      const SignedCertificateTimestamp& sct,
+                      SignatureCache* signatureCache);
+
+  bool SignatureParametersMatch(const DigitallySigned& signature);
+
+ private:
+  pkix::Result VerifySignature(pkix::Input data, pkix::Input signature,
+                               SignatureCache* signatureCache);
+  pkix::Result VerifySignature(const Buffer& data, const Buffer& signature,
+                               SignatureCache* signatureCache);
+
+  Buffer mSubjectPublicKeyInfo;
+  Buffer mKeyId;
+  DigitallySigned::SignatureAlgorithm mSignatureAlgorithm;
+  CTLogOperatorId mOperatorId;
+  CTLogState mState;
+  CTLogFormat mFormat;
+  uint64_t mTimestamp;
+};
+
+}  
+}  
+
+#endif  // CTLogVerifier_h

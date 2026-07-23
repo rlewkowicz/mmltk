@@ -1,0 +1,259 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/PromiseDebugging.h"
+
+#include "js/Promise.h"
+#include "js/Value.h"
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/ThreadLocal.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/PromiseBinding.h"
+#include "mozilla/dom/PromiseDebuggingBinding.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla::dom {
+
+class FlushRejections : public DiscardableRunnable {
+ public:
+  FlushRejections() : DiscardableRunnable("dom::FlushRejections") {}
+
+  static void Init() {
+    if (!sDispatched.init()) {
+      MOZ_CRASH("Could not initialize FlushRejections::sDispatched");
+    }
+    sDispatched.set(false);
+  }
+
+  static void DispatchNeeded() {
+    if (sDispatched.get()) {
+      return;
+    }
+    sDispatched.set(true);
+
+    NS_DispatchToCurrentThread(new FlushRejections());
+  }
+
+  static void FlushSync(bool aDeferToEventPath = true) {
+    sDispatched.set(false);
+
+    PromiseDebugging::FlushUncaughtRejectionsInternal(aDeferToEventPath);
+  }
+
+  NS_IMETHOD Run() override {
+    FlushSync();
+    return NS_OK;
+  }
+
+ private:
+  static MOZ_THREAD_LOCAL(bool) sDispatched;
+};
+
+ MOZ_THREAD_LOCAL(bool) FlushRejections::sDispatched;
+
+void PromiseDebugging::GetState(GlobalObject& aGlobal,
+                                JS::Handle<JSObject*> aPromise,
+                                PromiseDebuggingStateHolder& aState,
+                                ErrorResult& aRv) {
+  JSContext* cx = aGlobal.Context();
+  JS::Rooted<JSObject*> obj(cx, js::CheckedUnwrapStatic(aPromise));
+  if (!obj || !JS::IsPromiseObject(obj)) {
+    aRv.ThrowTypeError<MSG_IS_NOT_PROMISE>();
+    return;
+  }
+  switch (JS::GetPromiseState(obj)) {
+    case JS::PromiseState::Pending:
+      aState.mState = PromiseDebuggingState::Pending;
+      break;
+    case JS::PromiseState::Fulfilled:
+      aState.mState = PromiseDebuggingState::Fulfilled;
+      aState.mValue = JS::GetPromiseResult(obj);
+      break;
+    case JS::PromiseState::Rejected:
+      aState.mState = PromiseDebuggingState::Rejected;
+      aState.mReason = JS::GetPromiseResult(obj);
+      break;
+  }
+}
+
+void PromiseDebugging::GetPromiseID(GlobalObject& aGlobal,
+                                    JS::Handle<JSObject*> aPromise,
+                                    nsString& aID, ErrorResult& aRv) {
+  JSContext* cx = aGlobal.Context();
+  JS::Rooted<JSObject*> obj(cx, js::CheckedUnwrapStatic(aPromise));
+  if (!obj || !JS::IsPromiseObject(obj)) {
+    aRv.ThrowTypeError<MSG_IS_NOT_PROMISE>();
+    return;
+  }
+  uint64_t promiseID = JS::GetPromiseID(obj);
+  aID = sIDPrefix;
+  aID.AppendInt(promiseID);
+}
+
+void PromiseDebugging::GetAllocationStack(GlobalObject& aGlobal,
+                                          JS::Handle<JSObject*> aPromise,
+                                          JS::MutableHandle<JSObject*> aStack,
+                                          ErrorResult& aRv) {
+  JSContext* cx = aGlobal.Context();
+  JS::Rooted<JSObject*> obj(cx, js::CheckedUnwrapStatic(aPromise));
+  if (!obj || !JS::IsPromiseObject(obj)) {
+    aRv.ThrowTypeError<MSG_IS_NOT_PROMISE>();
+    return;
+  }
+  aStack.set(JS::GetPromiseAllocationSite(obj));
+}
+
+void PromiseDebugging::GetRejectionStack(GlobalObject& aGlobal,
+                                         JS::Handle<JSObject*> aPromise,
+                                         JS::MutableHandle<JSObject*> aStack,
+                                         ErrorResult& aRv) {
+  JSContext* cx = aGlobal.Context();
+  JS::Rooted<JSObject*> obj(cx, js::CheckedUnwrapStatic(aPromise));
+  if (!obj || !JS::IsPromiseObject(obj)) {
+    aRv.ThrowTypeError<MSG_IS_NOT_PROMISE>();
+    return;
+  }
+  aStack.set(JS::GetPromiseResolutionSite(obj));
+}
+
+void PromiseDebugging::GetFullfillmentStack(GlobalObject& aGlobal,
+                                            JS::Handle<JSObject*> aPromise,
+                                            JS::MutableHandle<JSObject*> aStack,
+                                            ErrorResult& aRv) {
+  JSContext* cx = aGlobal.Context();
+  JS::Rooted<JSObject*> obj(cx, js::CheckedUnwrapStatic(aPromise));
+  if (!obj || !JS::IsPromiseObject(obj)) {
+    aRv.ThrowTypeError<MSG_IS_NOT_PROMISE>();
+    return;
+  }
+  aStack.set(JS::GetPromiseResolutionSite(obj));
+}
+
+constinit nsString PromiseDebugging::sIDPrefix;
+
+void PromiseDebugging::Init() {
+  FlushRejections::Init();
+
+  sIDPrefix = u"PromiseDebugging."_ns;
+  if (XRE_IsContentProcess()) {
+    sIDPrefix.AppendInt(ContentChild::GetSingleton()->GetID());
+    sIDPrefix.Append('.');
+  } else {
+    sIDPrefix.AppendLiteral("0.");
+  }
+}
+
+void PromiseDebugging::Shutdown() { sIDPrefix.SetIsVoid(true); }
+
+void PromiseDebugging::FlushUncaughtRejections() {
+  MOZ_ASSERT(!NS_IsMainThread());
+  FlushRejections::FlushSync( false);
+}
+
+void PromiseDebugging::AddUncaughtRejectionObserver(
+    GlobalObject&, UncaughtRejectionObserver& aObserver) {
+  CycleCollectedJSContext* storage = CycleCollectedJSContext::Get();
+  nsTArray<nsCOMPtr<nsISupports>>& observers =
+      storage->mUncaughtRejectionObservers;
+  observers.AppendElement(&aObserver);
+}
+
+bool PromiseDebugging::RemoveUncaughtRejectionObserver(
+    GlobalObject&, UncaughtRejectionObserver& aObserver) {
+  CycleCollectedJSContext* storage = CycleCollectedJSContext::Get();
+  nsTArray<nsCOMPtr<nsISupports>>& observers =
+      storage->mUncaughtRejectionObservers;
+  for (size_t i = 0; i < observers.Length(); ++i) {
+    UncaughtRejectionObserver* observer =
+        static_cast<UncaughtRejectionObserver*>(observers[i].get());
+    if (*observer == aObserver) {
+      observers.RemoveElementAt(i);
+      return true;
+    }
+  }
+  return false;
+}
+
+void PromiseDebugging::AddUncaughtRejection(JS::Handle<JSObject*> aPromise) {
+  if (CycleCollectedJSContext::Get()->mUncaughtRejections.append(aPromise)) {
+    FlushRejections::DispatchNeeded();
+  }
+}
+
+void PromiseDebugging::AddConsumedRejection(JS::Handle<JSObject*> aPromise) {
+  auto& uncaughtRejections =
+      CycleCollectedJSContext::Get()->mUncaughtRejections;
+  for (size_t i = 0; i < uncaughtRejections.length(); i++) {
+    if (uncaughtRejections[i] == aPromise) {
+      uncaughtRejections[i].set(nullptr);
+      return;
+    }
+  }
+  if (CycleCollectedJSContext::Get()->mConsumedRejections.append(aPromise)) {
+    FlushRejections::DispatchNeeded();
+  }
+}
+
+void PromiseDebugging::FlushUncaughtRejectionsInternal(bool aDeferToEventPath) {
+  CycleCollectedJSContext* storage = CycleCollectedJSContext::Get();
+
+  auto& uncaught = storage->mUncaughtRejections;
+  auto& consumed = storage->mConsumedRejections;
+
+  AutoJSAPI jsapi;
+  jsapi.Init();
+  JSContext* cx = jsapi.cx();
+
+  auto& observers = storage->mUncaughtRejectionObservers;
+
+  for (size_t i = 0; i < uncaught.length(); i++) {
+    JS::Rooted<JSObject*> promise(cx, uncaught[i]);
+    if (!promise) {
+      continue;
+    }
+
+    if (aDeferToEventPath) {
+      const uint64_t promiseID = JS::GetPromiseID(promise);
+      if (storage->HasPendingUnhandledRejection(promiseID)) {
+        continue;
+      }
+    }
+
+    bool suppressReporting = false;
+    for (size_t j = 0; j < observers.Length(); ++j) {
+      RefPtr<UncaughtRejectionObserver> obs =
+          static_cast<UncaughtRejectionObserver*>(observers[j].get());
+
+      if (obs->OnLeftUncaught(promise, IgnoreErrors())) {
+        suppressReporting = true;
+      }
+    }
+
+    if (!suppressReporting) {
+      JSAutoRealm ar(cx, promise);
+      Promise::ReportRejectedPromise(cx, promise);
+    }
+  }
+  storage->mUncaughtRejections.clear();
+
+
+  for (size_t i = 0; i < consumed.length(); i++) {
+    JS::Rooted<JSObject*> promise(cx, consumed[i]);
+
+    for (size_t j = 0; j < observers.Length(); ++j) {
+      RefPtr<UncaughtRejectionObserver> obs =
+          static_cast<UncaughtRejectionObserver*>(observers[j].get());
+
+      obs->OnConsumed(promise, IgnoreErrors());
+    }
+  }
+  storage->mConsumedRejections.clear();
+}
+
+}  

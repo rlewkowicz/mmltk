@@ -1,0 +1,44 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsNSSCertTrust_h
+#define nsNSSCertTrust_h
+
+#include "certt.h"
+
+class nsNSSCertTrust {
+ public:
+  nsNSSCertTrust();
+  nsNSSCertTrust(unsigned int ssl, unsigned int email);
+  explicit nsNSSCertTrust(CERTCertTrust* t);
+  virtual ~nsNSSCertTrust();
+
+  bool HasAnyCA();
+  bool HasAnyUser();
+  bool HasPeer(bool checkSSL = true, bool checkEmail = true);
+  bool HasTrustedCA(bool checkSSL = true, bool checkEmail = true);
+  bool HasTrustedPeer(bool checkSSL = true, bool checkEmail = true);
+
+  void SetValidCA();
+  void SetValidPeer();
+
+  void SetSSLTrust(bool peer, bool tPeer, bool ca, bool tCA, bool tClientCA,
+                   bool user, bool warn);
+
+  void SetEmailTrust(bool peer, bool tPeer, bool ca, bool tCA, bool tClientCA,
+                     bool user, bool warn);
+
+  void AddCATrust(bool ssl, bool email);
+  void AddPeerTrust(bool ssl, bool email);
+
+  CERTCertTrust& GetTrust() { return mTrust; }
+
+ private:
+  void addTrust(unsigned int* t, unsigned int v);
+  void removeTrust(unsigned int* t, unsigned int v);
+  bool hasTrust(unsigned int t, unsigned int v);
+  CERTCertTrust mTrust;
+};
+
+#endif  // nsNSSCertTrust_h

@@ -1,0 +1,213 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include "mozilla/JSEventHandler.h"
+
+#include "mozilla/ContentEvents.h"
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/HoldDropJSObjects.h"
+#include "mozilla/Likely.h"
+#include "mozilla/dom/BeforeUnloadEvent.h"
+#include "mozilla/dom/ErrorEvent.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "nsDOMJSUtils.h"
+#include "nsGkAtoms.h"
+#include "nsIScriptContext.h"
+#include "nsIScriptGlobalObject.h"
+#include "nsJSEnvironment.h"
+#include "nsJSUtils.h"
+#include "nsString.h"
+#include "nsVariant.h"
+#include "xpcpublic.h"
+
+namespace mozilla {
+
+using namespace dom;
+
+JSEventHandler::JSEventHandler(EventTarget* aTarget, nsAtom* aType,
+                               const TypedEventHandler& aTypedHandler)
+    : mTarget(aTarget), mEventName(aType), mTypedHandler(aTypedHandler) {
+  HoldJSObjects(this);
+}
+
+JSEventHandler::~JSEventHandler() {
+  NS_ASSERTION(!mTarget, "Should have called Disconnect()!");
+  DropJSObjects(this);
+}
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(JSEventHandler)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(JSEventHandler)
+  tmp->mTypedHandler.ForgetHandler();
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INTERNAL(JSEventHandler)
+  if (MOZ_UNLIKELY(cb.WantDebugInfo()) && tmp->mEventName) {
+    nsAutoCString name;
+    name.AppendLiteral("JSEventHandler handlerName=");
+    name.Append(
+        NS_ConvertUTF16toUTF8(nsDependentAtomString(tmp->mEventName)).get());
+    cb.DescribeRefCountedNode(tmp->mRefCnt.get(), name.get());
+  } else {
+    NS_IMPL_CYCLE_COLLECTION_DESCRIBE(JSEventHandler, tmp->mRefCnt.get())
+  }
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_RAWPTR(mTypedHandler.Ptr())
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_BEGIN(JSEventHandler)
+  if (tmp->IsBlackForCC()) {
+    return true;
+  }
+  if (tmp->mTarget) {
+    nsXPCOMCycleCollectionParticipant* cp = nullptr;
+    CallQueryInterface(tmp->mTarget, &cp);
+    nsISupports* canonical = nullptr;
+    tmp->mTarget->QueryInterface(NS_GET_IID(nsCycleCollectionISupports),
+                                 reinterpret_cast<void**>(&canonical));
+    if (cp && canonical && cp->CanSkip(canonical, true)) {
+      return tmp->IsBlackForCC();
+    }
+  }
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_BEGIN(JSEventHandler)
+  return tmp->IsBlackForCC();
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_BEGIN(JSEventHandler)
+  return tmp->IsBlackForCC();
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(JSEventHandler)
+  NS_INTERFACE_MAP_ENTRY(nsIDOMEventListener)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+  NS_INTERFACE_MAP_ENTRY(JSEventHandler)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(JSEventHandler)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(JSEventHandler)
+
+bool JSEventHandler::IsBlackForCC() {
+  return !mTypedHandler.HasEventHandler() ||
+         mTypedHandler.Ptr()->IsBlackForCC();
+}
+
+nsresult JSEventHandler::HandleEvent(Event* aEvent) {
+  nsCOMPtr<EventTarget> target = mTarget;
+  if (!target || !mTypedHandler.HasEventHandler() ||
+      !GetTypedEventHandler().Ptr()->CallbackPreserveColor()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  bool isMainThread = aEvent->IsMainThreadEvent();
+  bool isChromeHandler =
+      isMainThread
+          ? nsContentUtils::ObjectPrincipal(
+                GetTypedEventHandler().Ptr()->CallbackGlobalOrNull()) ==
+                nsContentUtils::GetSystemPrincipal()
+          : mozilla::dom::IsCurrentThreadRunningChromeWorker();
+
+  if (mTypedHandler.Type() == TypedEventHandler::eOnError) {
+    MOZ_ASSERT_IF(mEventName, mEventName == nsGkAtoms::onerror);
+
+    nsCString file;
+    EventOrString msgOrEvent;
+    Optional<nsACString> fileName;
+    Optional<uint32_t> lineNumber;
+    Optional<uint32_t> columnNumber;
+    Optional<JS::Handle<JS::Value>> error;
+
+    NS_ENSURE_TRUE(aEvent, NS_ERROR_UNEXPECTED);
+    ErrorEvent* scriptEvent = aEvent->AsErrorEvent();
+    if (scriptEvent) {
+      scriptEvent->GetMessage(msgOrEvent.SetAsString());
+      scriptEvent->GetFilename(file);
+      fileName = &file;
+
+      lineNumber.Construct();
+      lineNumber.Value() = scriptEvent->Lineno();
+
+      columnNumber.Construct();
+      columnNumber.Value() = scriptEvent->Colno();
+
+      error.Construct(RootingCx());
+      scriptEvent->GetError(&error.Value());
+    } else {
+      msgOrEvent.SetAsEvent() = aEvent;
+    }
+
+    RefPtr<OnErrorEventHandlerNonNull> handler =
+        mTypedHandler.OnErrorEventHandler();
+    ErrorResult rv;
+    JS::Rooted<JS::Value> retval(RootingCx());
+    handler->Call(target, msgOrEvent, fileName, lineNumber, columnNumber, error,
+                  &retval, rv);
+    if (rv.Failed()) {
+      return rv.StealNSResult();
+    }
+
+    if (retval.isBoolean() && retval.toBoolean() == bool(scriptEvent)) {
+      aEvent->PreventDefaultInternal(isChromeHandler);
+    }
+    return NS_OK;
+  }
+
+  if (mTypedHandler.Type() == TypedEventHandler::eOnBeforeUnload) {
+    MOZ_ASSERT(mEventName == nsGkAtoms::onbeforeunload);
+
+    RefPtr<OnBeforeUnloadEventHandlerNonNull> handler =
+        mTypedHandler.OnBeforeUnloadEventHandler();
+    ErrorResult rv;
+    nsString retval;
+    handler->Call(target, *aEvent, retval, rv);
+    if (rv.Failed()) {
+      return rv.StealNSResult();
+    }
+
+    BeforeUnloadEvent* beforeUnload = aEvent->AsBeforeUnloadEvent();
+    NS_ENSURE_STATE(beforeUnload);
+
+    if (!DOMStringIsNull(retval)) {
+      aEvent->PreventDefaultInternal(isChromeHandler);
+
+      nsAutoString text;
+      beforeUnload->GetReturnValue(text);
+
+      if (text.IsEmpty()) {
+        beforeUnload->SetReturnValue(retval);
+      }
+    }
+
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(mTypedHandler.Type() == TypedEventHandler::eNormal);
+  ErrorResult rv;
+  RefPtr<EventHandlerNonNull> handler = mTypedHandler.NormalEventHandler();
+  JS::Rooted<JS::Value> retval(RootingCx());
+  handler->Call(target, *aEvent, &retval, rv);
+  if (rv.Failed()) {
+    return rv.StealNSResult();
+  }
+
+  if (retval.isBoolean() && !retval.toBoolean()) {
+    aEvent->PreventDefaultInternal(isChromeHandler);
+  }
+
+  return NS_OK;
+}
+
+}  
+
+using namespace mozilla;
+
+
+nsresult NS_NewJSEventHandler(mozilla::dom::EventTarget* aTarget,
+                              nsAtom* aEventType,
+                              const TypedEventHandler& aTypedHandler,
+                              JSEventHandler** aReturn) {
+  NS_ENSURE_ARG(aEventType || !NS_IsMainThread());
+  JSEventHandler* it = new JSEventHandler(aTarget, aEventType, aTypedHandler);
+  NS_ADDREF(*aReturn = it);
+
+  return NS_OK;
+}

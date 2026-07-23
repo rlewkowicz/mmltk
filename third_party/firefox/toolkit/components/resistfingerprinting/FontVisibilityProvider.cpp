@@ -1,0 +1,87 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#include "FontVisibilityProvider.h"
+
+#include "gfxTypes.h"
+#include "gfxFontEntry.h"
+#include "gfxPlatformFontList.h"
+
+#include "SharedFontList.h"
+#include "nsPresContext.h"
+#include "nsRFPService.h"
+
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/ContentBlockingAllowList.h"
+
+#include "mozilla/dom/OffscreenCanvas.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/OffscreenCanvas.h"
+
+using namespace mozilla;
+
+void FontVisibilityProvider::ReportBlockedFontFamily(
+    const gfxFontFamily& aFamily) const {
+  nsCString msg;
+  FormatBlockedFontFamilyMessage(msg, aFamily.Name(), aFamily.Visibility());
+  ReportBlockedFontFamily(msg);
+}
+
+void FontVisibilityProvider::ReportBlockedFontFamily(
+    const fontlist::Family& aFamily) const {
+  auto* fontList = gfxPlatformFontList::PlatformFontList()->SharedFontList();
+  const nsCString& name = aFamily.DisplayName().AsString(fontList);
+  nsCString msg;
+  FormatBlockedFontFamilyMessage(msg, name, aFamily.Visibility());
+  ReportBlockedFontFamily(msg);
+}
+
+void FontVisibilityProvider::FormatBlockedFontFamilyMessage(
+    nsCString& aMsg, const nsCString& aFamily,
+    FontVisibility aVisibility) const {
+  aMsg.AppendPrintf(
+      "Request for font \"%s\" blocked at visibility level %d (requires "
+      "%d)\n",
+      aFamily.get(), int(GetFontVisibility()), int(aVisibility));
+}
+
+FontVisibility FontVisibilityProvider::ComputeFontVisibility() const {
+
+  if (Maybe<FontVisibility> maybeVis = MaybeInheritFontVisibility()) {
+    return *maybeVis;
+  }
+
+  if (IsChrome()) {
+    return FontVisibility::User;
+  }
+
+  bool isPrivate = IsPrivateBrowsing();
+
+  int32_t level;
+  if (ShouldResistFingerprinting(RFPTarget::FontVisibilityBaseSystem)) {
+    if (nsRFPService::IsRFPPrefEnabled(isPrivate)) {
+      return FontVisibility::Base;
+    }
+
+    level = int32_t(FontVisibility::Base);
+  }
+  else if (ShouldResistFingerprinting(RFPTarget::FontVisibilityLangPack)) {
+    level = int32_t(FontVisibility::LangPack);
+  }
+  else {
+    level = StaticPrefs::layout_css_font_visibility();
+  }
+
+  nsICookieJarSettings* cookieJarSettings = GetCookieJarSettings();
+
+  if (level != StaticPrefs::layout_css_font_visibility() &&
+      ContentBlockingAllowList::Check(cookieJarSettings)) {
+    level = StaticPrefs::layout_css_font_visibility();
+  }
+
+  level = std::clamp(level, int32_t(FontVisibility::Base),
+                     int32_t(FontVisibility::User));
+
+  return FontVisibility(level);
+}

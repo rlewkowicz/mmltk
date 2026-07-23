@@ -1,0 +1,71 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_timeoutexecutor_h
+#define mozilla_dom_timeoutexecutor_h
+
+#include "mozilla/TimeStamp.h"
+#include "nsCOMPtr.h"
+#include "nsINamed.h"
+#include "nsIRunnable.h"
+#include "nsITimer.h"
+
+namespace mozilla::dom {
+
+class TimeoutManager;
+
+class TimeoutExecutor final : public nsIRunnable,
+                              public nsITimerCallback,
+                              public nsINamed {
+  TimeoutManager* mOwner;
+  bool mIsIdleQueue;
+  nsCOMPtr<nsITimer> mTimer;
+  TimeStamp mDeadline;
+  uint32_t mMaxIdleDeferMS;
+
+  TimeDuration mAllowedEarlyFiringTime;
+
+  enum class Mode {
+    None,
+    Immediate,
+    Delayed,
+    Shutdown
+  };
+
+  Mode mMode;
+
+  ~TimeoutExecutor();
+
+  nsresult ScheduleImmediate(const TimeStamp& aDeadline, const TimeStamp& aNow);
+
+  nsresult ScheduleDelayed(const TimeStamp& aDeadline, const TimeStamp& aNow,
+                           const TimeDuration& aMinDelay);
+
+  nsresult Schedule(const TimeStamp& aDeadline, const TimeDuration& aMinDelay);
+
+  nsresult MaybeReschedule(const TimeStamp& aDeadline,
+                           const TimeDuration& aMinDelay);
+
+  MOZ_CAN_RUN_SCRIPT void MaybeExecute();
+
+ public:
+  TimeoutExecutor(TimeoutManager* aOwner, bool aIsIdleQueue,
+                  uint32_t aMaxIdleDeferMS);
+
+  void Shutdown();
+
+  nsresult MaybeSchedule(const TimeStamp& aDeadline,
+                         const TimeDuration& aMinDelay);
+
+  void Cancel();
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIRUNNABLE
+  NS_DECL_NSITIMERCALLBACK
+  NS_DECL_NSINAMED
+};
+
+}  
+
+#endif  // mozilla_dom_timeoutexecutor_h

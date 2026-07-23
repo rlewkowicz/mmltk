@@ -1,0 +1,221 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_decoders_nsAVIFDecoder_h
+#define mozilla_image_decoders_nsAVIFDecoder_h
+
+#include <aom/aom_decoder.h>
+
+#include "Decoder.h"
+#include "MP4Metadata.h"
+#include "SampleIterator.h"
+#include "SurfacePipe.h"
+#include "dav1d/dav1d.h"
+#include "mozilla/gfx/Types.h"
+#include "mp4parse.h"
+
+namespace mozilla {
+namespace image {
+class RasterImage;
+class AVIFDecoderStream;
+class AVIFParser;
+class AVIFDecoderInterface;
+
+class nsAVIFDecoder final : public Decoder {
+ public:
+  virtual ~nsAVIFDecoder();
+
+  DecoderType GetType() const override { return DecoderType::AVIF; }
+
+ protected:
+  LexerResult DoDecode(SourceBufferIterator& aIterator,
+                       IResumable* aOnResume) override;
+ private:
+  friend class DecoderFactory;
+  friend class AVIFDecoderInterface;
+  friend class AVIFParser;
+
+  explicit nsAVIFDecoder(RasterImage* aImage);
+
+  static intptr_t ReadSource(uint8_t* aDestBuf, uintptr_t aDestBufSize,
+                             void* aUserData);
+
+  typedef int Dav1dResult;
+  enum class NonAOMCodecError { NoFrame, SizeOverflow };
+  typedef Variant<aom_codec_err_t, NonAOMCodecError> AOMResult;
+  enum class NonDecoderResult {
+    NeedMoreData,
+    OutputAvailable,
+    Complete,
+    SizeOverflow,
+    OutOfMemory,
+    PipeInitError,
+    WriteBufferError,
+    AlphaYSizeMismatch,
+    AlphaYColorDepthMismatch,
+    MetadataImageSizeMismatch,
+    RenderSizeMismatch,
+    FrameSizeChanged,
+    InvalidCICP,
+    NoSamples,
+    ConvertYCbCrFailure,
+  };
+  using DecodeResult =
+      Variant<Mp4parseStatus, NonDecoderResult, Dav1dResult, AOMResult>;
+  Mp4parseStatus CreateParser();
+  DecodeResult CreateDecoder();
+  DecodeResult DoDecodeInternal(SourceBufferIterator& aIterator,
+                                IResumable* aOnResume);
+
+  static bool IsDecodeSuccess(const DecodeResult& aResult);
+
+  Vector<uint8_t> mBufferedData;
+  RefPtr<AVIFDecoderStream> mBufferStream;
+
+  const uint8_t* mReadCursor = nullptr;
+
+  UniquePtr<AVIFParser> mParser = nullptr;
+  UniquePtr<AVIFDecoderInterface> mDecoder = nullptr;
+
+  bool mIsAnimated = false;
+  bool mHasAlpha = false;
+  bool mUsePipeTransform = true;
+};
+
+class AVIFDecoderStream : public ByteStream {
+ public:
+  explicit AVIFDecoderStream(Vector<uint8_t>* aBuffer) { mBuffer = aBuffer; }
+
+  virtual nsresult ReadAt(int64_t offset, void* data, size_t size,
+                          size_t* bytes_read) override;
+  virtual nsresult CachedReadAt(int64_t offset, void* data, size_t size,
+                                size_t* bytes_read) override {
+    return ReadAt(offset, data, size, bytes_read);
+  };
+  virtual bool Length(int64_t* size) override;
+  virtual const uint8_t* GetContiguousAccess(int64_t aOffset,
+                                             size_t aSize) override;
+
+ private:
+  Vector<uint8_t>* mBuffer;
+};
+
+struct AVIFImage {
+  uint32_t mFrameNum = 0;
+  FrameTimeout mDuration = FrameTimeout::Zero();
+  RefPtr<MediaRawData> mColorImage = nullptr;
+  RefPtr<MediaRawData> mAlphaImage = nullptr;
+};
+
+class AVIFParser {
+ public:
+  static Mp4parseStatus Create(const Mp4parseIo* aIo, ByteStream* aBuffer,
+                               UniquePtr<AVIFParser>& aParserOut);
+
+  ~AVIFParser();
+
+  const Mp4parseAvifInfo& GetInfo() const { return mInfo; }
+
+  uint32_t GetFrameCount();
+
+  nsAVIFDecoder::DecodeResult GetImage(AVIFImage& aImage);
+
+  bool IsAnimated() const;
+
+ private:
+  explicit AVIFParser(const Mp4parseIo* aIo);
+
+  Mp4parseStatus Init(ByteStream* aBuffer);
+
+  struct FreeAvifParser {
+    void operator()(Mp4parseAvifParser* aPtr) { mp4parse_avif_free(aPtr); }
+  };
+
+  const Mp4parseIo* mIo;
+  UniquePtr<Mp4parseAvifParser, FreeAvifParser> mParser = nullptr;
+  Mp4parseAvifInfo mInfo = {};
+
+  UniquePtr<SampleIterator> mColorSampleIter = nullptr;
+  UniquePtr<SampleIterator> mAlphaSampleIter = nullptr;
+  uint32_t mFrameNum = 0;
+};
+
+struct Dav1dPictureUnref {
+  void operator()(Dav1dPicture* aPtr) {
+    dav1d_picture_unref(aPtr);
+    delete aPtr;
+  }
+};
+
+using OwnedDav1dPicture = UniquePtr<Dav1dPicture, Dav1dPictureUnref>;
+
+class OwnedAOMImage {
+ public:
+  ~OwnedAOMImage();
+
+  static OwnedAOMImage* CopyFrom(aom_image_t* aImage, bool aIsAlpha);
+
+  aom_image_t* GetImage() { return mImage.isSome() ? mImage.ptr() : nullptr; }
+
+ private:
+  OwnedAOMImage();
+
+  bool CloneFrom(aom_image_t* aImage, bool aIsAlpha);
+
+  Maybe<aom_image_t> mImage;
+  UniquePtr<uint8_t[]> mBuffer;
+};
+
+struct AVIFDecodedData : layers::PlanarYCbCrData {
+ public:
+  Maybe<OrientedIntSize> mRenderSize = Nothing();
+  gfx::CICP::ColourPrimaries mColourPrimaries = gfx::CICP::CP_UNSPECIFIED;
+  gfx::CICP::TransferCharacteristics mTransferCharacteristics =
+      gfx::CICP::TC_UNSPECIFIED;
+  gfx::CICP::MatrixCoefficients mMatrixCoefficients = gfx::CICP::MC_UNSPECIFIED;
+
+  OwnedDav1dPicture mColorDav1d;
+  OwnedDav1dPicture mAlphaDav1d;
+  UniquePtr<OwnedAOMImage> mColorAOM;
+  UniquePtr<OwnedAOMImage> mAlphaAOM;
+
+  void SetCicpValues(
+      const Mp4parseNclxColourInformation* aNclx,
+      const gfx::CICP::ColourPrimaries aAv1ColourPrimaries,
+      const gfx::CICP::TransferCharacteristics aAv1TransferCharacteristics,
+      const gfx::CICP::MatrixCoefficients aAv1MatrixCoefficients);
+};
+
+class AVIFDecoderInterface {
+ public:
+  using Dav1dResult = nsAVIFDecoder::Dav1dResult;
+  using NonAOMCodecError = nsAVIFDecoder::NonAOMCodecError;
+  using AOMResult = nsAVIFDecoder::AOMResult;
+  using NonDecoderResult = nsAVIFDecoder::NonDecoderResult;
+  using DecodeResult = nsAVIFDecoder::DecodeResult;
+
+  virtual ~AVIFDecoderInterface() = default;
+
+  virtual DecodeResult Decode(const Mp4parseAvifInfo& aAVIFInfo,
+                              const AVIFImage& aSamples) = 0;
+  UniquePtr<AVIFDecodedData> GetDecodedData() {
+    MOZ_ASSERT(mDecodedData);
+    return std::move(mDecodedData);
+  }
+
+ protected:
+  explicit AVIFDecoderInterface() = default;
+
+  inline static bool IsDecodeSuccess(const DecodeResult& aResult) {
+    return nsAVIFDecoder::IsDecodeSuccess(aResult);
+  }
+
+  UniquePtr<AVIFDecodedData> mDecodedData;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_decoders_nsAVIFDecoder_h

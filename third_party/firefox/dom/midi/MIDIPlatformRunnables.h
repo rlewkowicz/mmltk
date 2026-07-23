@@ -1,0 +1,93 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_MIDIPlatformRunnables_h
+#define mozilla_dom_MIDIPlatformRunnables_h
+
+#include "mozilla/dom/MIDITypes.h"
+
+namespace mozilla::dom {
+
+enum class MIDIPortConnectionState : uint8_t;
+enum class MIDIPortDeviceState : uint8_t;
+
+class MIDIPortParent;
+class MIDIMessage;
+class MIDIPortInfo;
+
+class MIDIBackgroundRunnable : public Runnable {
+ public:
+  MIDIBackgroundRunnable(const char* aName) : Runnable(aName) {}
+  virtual ~MIDIBackgroundRunnable() = default;
+  NS_IMETHOD Run() override;
+  virtual void RunInternal() = 0;
+};
+
+class ReceiveRunnable final : public MIDIBackgroundRunnable {
+ public:
+  ReceiveRunnable(const nsAString& aPortId, const nsTArray<MIDIMessage>& aMsgs)
+      : MIDIBackgroundRunnable("ReceiveRunnable"),
+        mMsgs(aMsgs.Clone()),
+        mPortId(aPortId) {}
+  ReceiveRunnable(const nsAString& aPortId, const MIDIMessage& aMsgs)
+      : MIDIBackgroundRunnable("ReceiveRunnable"), mPortId(aPortId) {
+    mMsgs.AppendElement(aMsgs);
+  }
+  ~ReceiveRunnable() = default;
+  void RunInternal() override;
+
+ private:
+  nsTArray<MIDIMessage> mMsgs;
+  nsString mPortId;
+};
+
+class AddPortRunnable final : public MIDIBackgroundRunnable {
+ public:
+  explicit AddPortRunnable(const MIDIPortInfo& aPortInfo)
+      : MIDIBackgroundRunnable("AddPortRunnable"), mPortInfo(aPortInfo) {}
+  ~AddPortRunnable() = default;
+  void RunInternal() override;
+
+ private:
+  MIDIPortInfo mPortInfo;
+};
+
+class RemovePortRunnable final : public MIDIBackgroundRunnable {
+ public:
+  explicit RemovePortRunnable(const MIDIPortInfo& aPortInfo)
+      : MIDIBackgroundRunnable("RemovePortRunnable"), mPortInfo(aPortInfo) {}
+  ~RemovePortRunnable() = default;
+  void RunInternal() override;
+
+ private:
+  MIDIPortInfo mPortInfo;
+};
+
+class SendPortListRunnable final : public MIDIBackgroundRunnable {
+ public:
+  SendPortListRunnable() : MIDIBackgroundRunnable("SendPortListRunnable") {}
+  ~SendPortListRunnable() = default;
+  void RunInternal() override;
+};
+
+class SetStatusRunnable final : public MIDIBackgroundRunnable {
+ public:
+  SetStatusRunnable(MIDIPortParent* aPort, MIDIPortDeviceState aState,
+                    MIDIPortConnectionState aConnection)
+      : MIDIBackgroundRunnable("SetStatusRunnable"),
+        mPort(aPort),
+        mState(aState),
+        mConnection(aConnection) {}
+  ~SetStatusRunnable() = default;
+  void RunInternal() override;
+
+ private:
+  RefPtr<MIDIPortParent> mPort;
+  MIDIPortDeviceState mState;
+  MIDIPortConnectionState mConnection;
+};
+
+}  
+
+#endif  // mozilla_dom_MIDIPlatformRunnables_h

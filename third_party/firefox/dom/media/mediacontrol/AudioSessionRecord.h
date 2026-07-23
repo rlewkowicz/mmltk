@@ -1,0 +1,72 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_MEDIACONTROL_AUDIOSESSIONRECORD_H_
+#define DOM_MEDIA_MEDIACONTROL_AUDIOSESSIONRECORD_H_
+
+#include <cstdint>
+
+#include "mozilla/Maybe.h"
+#include "mozilla/dom/AudioSessionBinding.h"
+
+namespace mozilla::dom {
+
+inline int AudioSessionTypePriorityRank(AudioSessionType aType) {
+  return static_cast<int>(aType);
+}
+
+inline constexpr AudioSessionType DefaultAudioSessionType() {
+  return AudioSessionType::Ambient;
+}
+
+inline constexpr AudioSessionType kExclusiveAudioSessionTypes[] = {
+    AudioSessionType::Play_and_record,
+    AudioSessionType::Playback,
+    AudioSessionType::Transient_solo,
+};
+
+inline constexpr AudioSessionType kNonExclusiveAudioSessionTypes[] = {
+    AudioSessionType::Transient,
+    AudioSessionType::Ambient,
+};
+
+inline bool IsExclusiveAudioSessionType(AudioSessionType aType) {
+  for (const AudioSessionType t : kExclusiveAudioSessionTypes) {
+    if (t == aType) {
+      return true;
+    }
+  }
+  return false;
+}
+
+class AudioSessionRecord {
+ public:
+  Maybe<AudioSessionType> GetTypeOverride() const { return mTypeOverride; }
+
+  Maybe<int64_t> GetAudibleAtMs() const { return mAudibleAtMs; }
+
+  AudioSessionState GetState() const { return mState; }
+
+  bool IsEmpty() const {
+    return mTypeOverride.isNothing() && mAudibleAtMs.isNothing() &&
+           mState == AudioSessionState::Inactive;
+  }
+
+  void SetTypeOverride(uint64_t aBcId, Maybe<AudioSessionType> aTypeOverride);
+  void SetAudibleAtMs(uint64_t aBcId, Maybe<int64_t> aAudibleAtMs);
+  void SetState(uint64_t aBcId, AudioSessionState aState);
+
+  void DispatchStateChange(uint64_t aBcId) const;
+
+ private:
+  void LogState(uint64_t aBcId) const;
+
+  Maybe<AudioSessionType> mTypeOverride;
+  Maybe<int64_t> mAudibleAtMs;
+  AudioSessionState mState = AudioSessionState::Inactive;
+};
+
+}  
+
+#endif  // DOM_MEDIA_MEDIACONTROL_AUDIOSESSIONRECORD_H_

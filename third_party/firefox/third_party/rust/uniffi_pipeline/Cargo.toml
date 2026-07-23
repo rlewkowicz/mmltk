@@ -1,0 +1,42 @@
+
+[package]
+edition = "2021"
+name = "uniffi_pipeline"
+version = "0.31.0"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "a multi-language bindings generator for rust (codegen and cli tooling)"
+homepage = "https://mozilla.github.io/uniffi-rs"
+documentation = "https://mozilla.github.io/uniffi-rs"
+keywords = [
+    "ffi",
+    "bindgen",
+]
+license = "MPL-2.0"
+repository = "https://github.com/mozilla/uniffi-rs"
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--generate-link-to-definition"]
+
+[lib]
+name = "uniffi_pipeline"
+path = "src/lib.rs"
+
+[dependencies.anyhow]
+version = "1"
+
+[dependencies.heck]
+version = "0.5"
+
+[dependencies.indexmap]
+version = "2.2"
+
+[dependencies.tempfile]
+version = "3"
+
+[dependencies.uniffi_internal_macros]
+version = "=0.31.0"

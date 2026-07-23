@@ -1,0 +1,256 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef ComputedStyle_h_
+#define ComputedStyle_h_
+
+#include "mozilla/Assertions.h"
+#include "mozilla/CachedInheritingStyles.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/PseudoStyleRequest.h"
+#include "mozilla/ServoComputedData.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "nsColor.h"
+#include "nsStyleStructFwd.h"
+
+enum nsChangeHint : uint32_t;
+class nsWindowSizes;
+
+#define FORWARD_STRUCT(name_) struct nsStyle##name_;
+FOR_EACH_STYLE_STRUCT(FORWARD_STRUCT, FORWARD_STRUCT)
+#undef FORWARD_STRUCT
+
+extern "C" {
+void Gecko_ComputedStyle_Destroy(mozilla::ComputedStyle*);
+}
+
+namespace mozilla {
+
+struct CSSPropertyId;
+enum class StylePointerEvents : uint8_t;
+enum class StyleUserSelect : uint8_t;
+
+namespace dom {
+class Document;
+}
+
+
+class ComputedStyle {
+  using Flag = StyleComputedValueFlags;
+
+  const StyleComputedValueFlags& Flags() const { return mSource.flags; }
+
+ public:
+  explicit ComputedStyle(ServoComputedDataForgotten aComputedValues);
+
+  void GetComputedPropertyValue(NonCustomCSSPropertyId aId,
+                                nsACString& aOut) const {
+    Servo_GetComputedValue(this, aId, &aOut);
+  }
+
+  bool GetPropertyTypedValueList(const CSSPropertyId& aId,
+                                 StylePropertyTypedValueList& aOut) const {
+    return Servo_ComputedValues_GetPropertyTypedValueList(this, &aId, &aOut);
+  }
+
+  const ComputedStyle* GetStyleIfVisited() const {
+    return mSource.visited_style;
+  }
+
+  bool IsLazilyCascadedPseudoElement() const {
+    return IsPseudoElement() &&
+           !PseudoStyle::IsEagerlyCascadedInServo(GetPseudoType());
+  }
+
+  PseudoStyleType GetPseudoType() const { return mSource.pseudo_type; }
+
+  bool IsPseudoElement() const {
+    return PseudoStyle::IsPseudoElement(GetPseudoType());
+  }
+
+  bool IsInheritingAnonBox() const {
+    return PseudoStyle::IsInheritingAnonBox(GetPseudoType());
+  }
+
+  bool IsNonInheritingAnonBox() const {
+    return PseudoStyle::IsNonInheritingAnonBox(GetPseudoType());
+  }
+
+  bool IsWrapperAnonBox() const {
+    return PseudoStyle::IsWrapperAnonBox(GetPseudoType());
+  }
+
+  bool IsAnonBox() const { return PseudoStyle::IsAnonBox(GetPseudoType()); }
+
+  bool IsPseudoOrAnonBox() const {
+    return GetPseudoType() != PseudoStyleType::NotPseudo;
+  }
+
+  bool HasAuthorSpecifiedBorderOrBackground() const {
+    return bool(Flags() & Flag::HAS_AUTHOR_SPECIFIED_BORDER_BACKGROUND);
+  }
+
+  bool HasAuthorSpecifiedTextColor() const {
+    return bool(Flags() & Flag::HAS_AUTHOR_SPECIFIED_TEXT_COLOR);
+  }
+
+  bool HasAuthorSpecifiedTextShadow() const {
+    return bool(Flags() & Flag::HAS_AUTHOR_SPECIFIED_TEXT_SHADOW);
+  }
+
+  bool HasTextDecorationLines() const {
+    return bool(Flags() & Flag::HAS_TEXT_DECORATION_LINES);
+  }
+
+  bool ShouldSuppressLineBreak() const {
+    return bool(Flags() & Flag::SHOULD_SUPPRESS_LINEBREAK);
+  }
+
+  bool IsTextCombined() const { return bool(Flags() & Flag::IS_TEXT_COMBINED); }
+
+  bool DependsOnSelfFontMetrics() const {
+    return bool(Flags() & Flag::DEPENDS_ON_SELF_FONT_METRICS);
+  }
+
+  bool DependsOnInheritedFontMetrics() const {
+    return bool(Flags() & Flag::DEPENDS_ON_INHERITED_FONT_METRICS);
+  }
+
+  bool IsInFirstLineSubtree() const {
+    return bool(Flags() & Flag::IS_IN_FIRST_LINE_SUBTREE);
+  }
+
+  bool SelfOrAncestorHasContainStyle() const {
+    return bool(Flags() & Flag::SELF_OR_ANCESTOR_HAS_CONTAIN_STYLE);
+  }
+
+  bool UsesContainerUnits() const {
+    return bool(Flags() & Flag::USES_CONTAINER_UNITS);
+  }
+
+  bool UsesViewportUnits() const {
+    return bool(Flags() & Flag::USES_VIEWPORT_UNITS);
+  }
+
+  void GetCachedLazyPseudoStyles(nsTArray<const ComputedStyle*>& aArray) const {
+    mCachedInheritingStyles.AppendTo(aArray);
+  }
+
+  template <typename Func>
+  void ForEachCachedLazyPseudoEntry(Func&& aFunc) const;
+
+  bool RelevantLinkVisited() const {
+    return bool(Flags() & Flag::IS_RELEVANT_LINK_VISITED);
+  }
+
+  bool IsRootElementStyle() const {
+    return bool(Flags() & Flag::IS_ROOT_ELEMENT_STYLE);
+  }
+
+  bool IsInOpacityZeroSubtree() const {
+    return bool(Flags() & Flag::IS_IN_OPACITY_ZERO_SUBTREE);
+  }
+
+  bool HasAuthorSpecifiedGridAutoFlow() const {
+    return bool(Flags() & Flag::HAS_AUTHOR_SPECIFIED_GRID_AUTO_FLOW);
+  }
+
+  bool HasAnchorPosReference() const;
+
+  bool HasAttrReferences() const {
+    return !!mSource.attribute_references.mUsedAttributes;
+  }
+
+  bool MaybeAnchorPosReferencesDiffer(const ComputedStyle* aOther) const;
+
+  ComputedStyle* GetCachedInheritingAnonBoxStyle(
+      PseudoStyleType aPseudoType) const {
+    MOZ_ASSERT(PseudoStyle::IsInheritingAnonBox(aPseudoType));
+    return mCachedInheritingStyles.Lookup(PseudoStyleRequest(aPseudoType));
+  }
+
+  void SetCachedInheritedAnonBoxStyle(ComputedStyle* aStyle) {
+    mCachedInheritingStyles.Insert(aStyle, aStyle->GetPseudoType());
+  }
+
+  ComputedStyle* GetCachedLazyPseudoStyle(const PseudoStyleRequest&) const;
+
+  void SetCachedLazyPseudoStyle(ComputedStyle* aStyle, PseudoStyleType aType,
+                                nsAtom* aFunctionalPseudoParameter) {
+    MOZ_ASSERT_IF(aStyle, aStyle->IsPseudoElement());
+    MOZ_ASSERT_IF(aStyle, aStyle->GetPseudoType() == aType);
+    if (!aStyle &&
+        mCachedInheritingStyles.HasEntry({aType, aFunctionalPseudoParameter})) {
+      return;
+    }
+    MOZ_ASSERT(!GetCachedLazyPseudoStyle({aType, aFunctionalPseudoParameter}));
+
+    if (PseudoStyle::SupportsUserActionState(aType)) {
+      return;
+    }
+
+    mCachedInheritingStyles.Insert(aStyle, aType, aFunctionalPseudoParameter);
+  }
+
+#define GENERATE_ACCESSOR(name_)                                         \
+  inline const nsStyle##name_* Style##name_() const MOZ_NONNULL_RETURN { \
+    return mSource.Style##name_();                                       \
+  }
+  FOR_EACH_STYLE_STRUCT(GENERATE_ACCESSOR, GENERATE_ACCESSOR)
+#undef GENERATE_ACCESSOR
+
+  inline mozilla::StylePointerEvents PointerEvents() const;
+  inline mozilla::StyleUserSelect UserSelect() const;
+
+  inline bool IsAbsPosContainingBlock(const nsIFrame*) const;
+
+  inline bool IsFixedPosContainingBlock(const nsIFrame*) const;
+
+  inline bool IsFixedPosContainingBlockForNonSVGTextFrames() const;
+
+  nsChangeHint CalcStyleDifference(const ComputedStyle& aNewContext,
+                                   uint32_t* aEqualStructs) const;
+
+#ifdef DEBUG
+  bool EqualForCachedAnonymousContentStyle(const ComputedStyle&) const;
+#endif
+
+#ifdef DEBUG
+  void DumpMatchedRules() const;
+#endif
+
+  template <typename T, typename S>
+  nscolor GetVisitedDependentColor(T S::* aField) const;
+
+  static nscolor CombineVisitedColors(nscolor* aColors, bool aLinkIsVisited);
+
+  inline void StartImageLoads(dom::Document&,
+                              const ComputedStyle* aOldStyle = nullptr);
+
+#ifdef DEBUG
+  void List(FILE* out, int32_t aIndent);
+  static const char* StructName(StyleStructID aSID);
+  static Maybe<StyleStructID> LookupStruct(const nsACString& aName);
+#endif
+
+  void AddSizeOfIncludingThis(nsWindowSizes& aSizes, size_t* aCVsSize) const;
+
+  StyleWritingMode WritingMode() const { return {mSource.WritingMode().mBits}; }
+
+  const StyleZoom& EffectiveZoom() const { return mSource.effective_zoom; }
+
+ protected:
+  friend void ::Gecko_ComputedStyle_Destroy(ComputedStyle*);
+
+  ~ComputedStyle() = default;
+
+  ServoComputedData mSource;
+
+  CachedInheritingStyles mCachedInheritingStyles;
+};
+
+}  
+
+#endif

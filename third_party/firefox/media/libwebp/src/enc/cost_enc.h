@@ -1,0 +1,65 @@
+// Copyright 2011 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#if !defined(WEBP_ENC_COST_ENC_H_)
+#define WEBP_ENC_COST_ENC_H_
+
+#include <assert.h>
+#include <stdlib.h>
+
+#include "src/dec/common_dec.h"
+#include "src/dsp/dsp.h"
+#include "src/enc/vp8i_enc.h"
+#include "src/webp/types.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+typedef struct VP8Residual VP8Residual;
+struct VP8Residual {
+  int first;
+  int last;
+  const int16_t* coeffs;
+
+  int coeff_type;
+  ProbaArray*   prob;
+  StatsArray*   stats;
+  CostArrayPtr  costs;
+};
+
+void VP8InitResidual(int first, int coeff_type,
+                     VP8Encoder* const enc, VP8Residual* const res);
+
+int VP8RecordCoeffs(int ctx, const VP8Residual* const res);
+
+static WEBP_INLINE int VP8RecordStats(int bit, proba_t* const stats) {
+  proba_t p = *stats;
+  if (p >= 0xfffe0000u) {
+    p = ((p + 1u) >> 1) & 0x7fff7fffu;  
+  }
+  p += 0x00010000u + bit;
+  *stats = p;
+  return bit;
+}
+
+static WEBP_INLINE int VP8BitCost(int bit, uint8_t proba) {
+  return !bit ? VP8EntropyCost[proba] : VP8EntropyCost[255 - proba];
+}
+
+void VP8CalculateLevelCosts(VP8EncProba* const proba);
+static WEBP_INLINE int VP8LevelCost(const uint16_t* const table, int level) {
+  return VP8LevelFixedCosts[level]
+       + table[(level > MAX_VARIABLE_LEVEL) ? MAX_VARIABLE_LEVEL : level];
+}
+
+extern const uint16_t VP8FixedCostsUV[4];
+extern const uint16_t VP8FixedCostsI16[4];
+extern const uint16_t VP8FixedCostsI4[NUM_BMODES][NUM_BMODES][NUM_BMODES];
+
+
+#if defined(__cplusplus)
+}    
+#endif
+
+#endif

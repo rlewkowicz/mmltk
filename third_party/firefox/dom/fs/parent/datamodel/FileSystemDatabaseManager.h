@@ -1,0 +1,120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_FS_PARENT_DATAMODEL_FILESYSTEMDATABASEMANAGER_H_
+#define DOM_FS_PARENT_DATAMODEL_FILESYSTEMDATABASEMANAGER_H_
+
+#include "ResultConnection.h"
+#include "mozilla/dom/FileSystemTypes.h"
+#include "mozilla/dom/quota/ForwardDecls.h"
+#include "mozilla/dom/quota/UsageInfo.h"
+#include "nsStringFwd.h"
+
+template <class T>
+class nsCOMPtr;
+
+class nsIFile;
+
+namespace mozilla {
+
+template <typename V, typename E>
+class Result;
+
+namespace dom {
+
+namespace quota {
+
+struct OriginMetadata;
+
+}  
+
+namespace fs {
+
+struct FileId;
+enum class FileMode;
+class FileSystemChildMetadata;
+class FileSystemEntryMetadata;
+class FileSystemDirectoryListing;
+class FileSystemEntryPair;
+
+namespace data {
+
+using FileSystemConnection = fs::ResultConnection;
+
+class FileSystemDatabaseManager {
+ public:
+  static nsresult RescanUsages(const ResultConnection& aConnection,
+                               const quota::OriginMetadata& aOriginMetadata);
+
+  static Result<quota::UsageInfo, QMResult> GetUsage(
+      const ResultConnection& aConnection,
+      const quota::OriginMetadata& aOriginMetadata);
+
+  virtual Result<quota::UsageInfo, QMResult> GetUsage() const = 0;
+
+  virtual nsresult UpdateUsage(const FileId& aFileId) = 0;
+
+  virtual Result<EntryId, QMResult> GetOrCreateDirectory(
+      const FileSystemChildMetadata& aHandle, bool aCreate) = 0;
+
+  virtual Result<EntryId, QMResult> GetOrCreateFile(
+      const FileSystemChildMetadata& aHandle, bool aCreate) = 0;
+
+  virtual nsresult GetFile(const EntryId& aEntryId, const FileId& aFileId,
+                           const FileMode& aMode, ContentType& aType,
+                           TimeStamp& lastModifiedMilliSeconds, Path& aPath,
+                           nsCOMPtr<nsIFile>& aFile) const = 0;
+
+  virtual Result<FileSystemDirectoryListing, QMResult> GetDirectoryEntries(
+      const EntryId& aParent, PageNumber aPage) const = 0;
+
+  virtual Result<bool, QMResult> RemoveDirectory(
+      const FileSystemChildMetadata& aHandle, bool aRecursive) = 0;
+
+  virtual Result<bool, QMResult> RemoveFile(
+      const FileSystemChildMetadata& aHandle) = 0;
+
+  virtual Result<EntryId, QMResult> RenameEntry(
+      const FileSystemEntryMetadata& aHandle, const Name& aNewName) = 0;
+
+  virtual Result<EntryId, QMResult> MoveEntry(
+      const FileSystemEntryMetadata& aHandle,
+      const FileSystemChildMetadata& aNewDesignation) = 0;
+
+  virtual Result<Path, QMResult> Resolve(
+      const FileSystemEntryPair& aEndpoints) const = 0;
+
+  virtual Result<bool, QMResult> DoesFileExist(
+      const EntryId& aEntryId) const = 0;
+
+  virtual Result<EntryId, QMResult> GetEntryId(
+      const FileSystemChildMetadata& aHandle) const = 0;
+
+  virtual Result<EntryId, QMResult> GetEntryId(const FileId& aFileId) const = 0;
+
+  virtual Result<FileId, QMResult> EnsureFileId(const EntryId& aEntryId) = 0;
+
+  virtual Result<FileId, QMResult> EnsureTemporaryFileId(
+      const EntryId& aEntryId) = 0;
+
+  virtual Result<FileId, QMResult> GetFileId(const EntryId& aEntryId) const = 0;
+
+  virtual nsresult MergeFileId(const EntryId& aEntryId, const FileId& aFileId,
+                               bool aAbort) = 0;
+
+  virtual void Close() = 0;
+
+  virtual nsresult BeginUsageTracking(const FileId& aFileId) = 0;
+
+  virtual nsresult EndUsageTracking(const FileId& aFileId) = 0;
+
+  virtual ~FileSystemDatabaseManager() = default;
+};
+
+}  
+}  
+}  
+}  
+
+#endif  // DOM_FS_PARENT_DATAMODEL_FILESYSTEMDATABASEMANAGER_H_

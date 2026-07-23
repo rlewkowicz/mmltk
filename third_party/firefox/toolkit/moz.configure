@@ -1,0 +1,2245 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+# App-specific project settings
+
+project_flag(
+    env="MOZ_APP_ID",
+    nargs=1,
+    help='Used for application.ini\'s "ID" field, and crash reporter server url',
+)
+
+
+@depends("MOZ_APP_ID", build_project)
+def check_moz_app_id(moz_app_id, build_project):
+    if not moz_app_id:
+        die(f"No value for MOZ_APP_ID in project '{build_project}'")
+
+
+project_flag(
+    env="MOZ_APP_VENDOR",
+    nargs=1,
+    help='Used for application.ini\'s "Vendor" field, which also impacts profile location and user-visible fields',
+)
+
+project_flag(
+    env="MOZ_APP_UA_NAME",
+    default="",
+    nargs=1,
+    help="Application name in the User Agent string",
+)
+
+project_flag(
+    "MOZ_APP_PROFILE",
+    nargs=1,
+    help='Used for application.ini\'s "Profile" field, which controls profile location',
+)
+
+option(
+    env="MOZ_STUB_INSTALLER",
+    help="Produce a stub installer",
+)
+set_config("MOZ_STUB_INSTALLER", True, when="MOZ_STUB_INSTALLER")
+
+set_config("MOZ_PROFILE_MIGRATOR", False)
+
+project_flag(
+    env="BROWSER_CHROME_URL",
+    default="",
+    nargs=1,
+    set_as_define=True,
+    help="Markup for a single browser window",
+)
+set_define(
+    "BROWSER_CHROME_URL_QUOTED",
+    depends("BROWSER_CHROME_URL")(lambda v: f'"{v[0]}"' if v else ""),
+)
+
+# External builds (specifically Ubuntu) may drop the hg repo information, so we allow to
+# explicitly set the repository and changeset information in.
+option(env="MOZ_SOURCE_REPO", nargs=1, help="Project source repository")
+set_config("MOZ_SOURCE_REPO", depends_if("MOZ_SOURCE_REPO")(lambda src: src[0]))
+option(env="MOZ_SOURCE_CHANGESET", nargs=1, help="Source changeset")
+set_config("MOZ_SOURCE_CHANGESET", depends_if("MOZ_SOURCE_CHANGESET")(lambda v: v[0]))
+
+option(
+    env="MOZ_INCLUDE_SOURCE_INFO",
+    # Build revisions should always be present in official builds
+    default=mozilla_official,
+    help="Include build repository informations",
+)
+set_config("MOZ_INCLUDE_SOURCE_INFO", True, when="MOZ_INCLUDE_SOURCE_INFO")
+
+option(
+    "--with-distribution-id",
+    nargs=1,
+    default="org.mozilla",
+    help="Set distribution-specific id",
+)
+set_config("MOZ_DISTRIBUTION_ID", depends("--with-distribution-id")(lambda v: v[0]))
+
+option(
+    "--built-by-mozilla",
+    help="Enable Mozilla official build designation",
+)
+set_config("BUILT_BY_MOZILLA", depends("--built-by-mozilla")(lambda v: bool(v) or None))
+set_define("BUILT_BY_MOZILLA", depends("--built-by-mozilla")(lambda v: bool(v) or None))
+
+
+@depends("MOZ_APP_VENDOR", build_project)
+def check_moz_app_vendor(moz_app_vendor, build_project):
+    if not moz_app_vendor:
+        die(f"No value for MOZ_APP_VENDOR in project '{build_project}'")
+
+
+# Set the MOZ_CONFIGURE_OPTIONS variable with all the options that
+# were passed somehow (environment, command line, mozconfig)
+@dependable
+@imports(_from="mozshellutil", _import="quote")
+@imports(_from="mozbuild.util", _import="ensure_unicode")
+@imports(_from="mozbuild.util", _import="system_encoding")
+@imports("__sandbox__")
+def all_configure_options():
+    result = []
+    previous = None
+    for option in __sandbox__._options.values():
+        # __sandbox__._options contains items for both option.name and
+        # option.env. But it's also an OrderedDict, meaning both are
+        # consecutive.
+        # Also ignore MOZCONFIG because they're not
+        # interesting.
+        if option == previous or option.env in ("MOZCONFIG",):
+            continue
+        previous = option
+        value = __sandbox__._value_for(option)
+        # We only want options that were explicitly given on the command
+        # line, the environment, or mozconfig, and that differ from the
+        # defaults.
+        if (
+            value is not None
+            and value.origin not in ("default", "implied", "confvars")
+            and value != option.default
+        ):
+            result.append(
+                ensure_unicode(__sandbox__._raw_options[option], system_encoding)
+            )
+        # We however always include options that are sent to old configure
+        # because we don't know their actual defaults. (Keep the conditions
+        # separate for ease of understanding and ease of removal)
+        elif (
+            option.help == "Help missing for old configure options"
+            and option in __sandbox__._raw_options
+        ):
+            result.append(
+                ensure_unicode(__sandbox__._raw_options[option], system_encoding)
+            )
+
+    # We shouldn't need this, but currently, quote will return a byte string
+    # if result is empty, and that's not wanted here.
+    if not result:
+        return ""
+
+    return quote(*result)
+
+
+set_config("MOZ_CONFIGURE_OPTIONS", all_configure_options)
+
+
+@depends(target)
+def fold_libs(target):
+    return False
+
+
+set_config("MOZ_FOLD_LIBS", fold_libs)
+
+set_config("MOZ_WEBMIDI_MIDIR_IMPL", False)
+
+
+# Enable various cubeb backends
+# ==============================================================
+option(
+    "--enable-audio-backends",
+    nargs="+",
+    choices=("alsa", "jack", "pulseaudio"),
+    default=("pulseaudio",),
+    help="{Enable|Disable} various cubeb backends",
+)
+
+
+@depends("--enable-audio-backends")
+def imply_alsa(values):
+    return any("alsa" in value for value in values) or None
+
+
+@depends("--enable-audio-backends")
+def imply_jack(values):
+    return any("jack" in value for value in values) or None
+
+
+@depends("--enable-audio-backends")
+def imply_pulseaudio(values):
+    return any("pulseaudio" in value for value in values) or None
+
+imply_option(
+    "--enable-alsa", imply_alsa, reason="--enable-audio-backends", when=use_pkg_config
+)
+
+imply_option(
+    "--enable-jack", imply_jack, reason="--enable-audio-backends", when=use_pkg_config
+)
+
+imply_option(
+    "--enable-pulseaudio",
+    imply_pulseaudio,
+    reason="--enable-audio-backends",
+    when=use_pkg_config,
+)
+
+# ALSA cubeb backend
+# ==============================================================
+option(
+    "--enable-alsa",
+    env="MOZ_ALSA",
+    help="Enable ALSA audio backend",
+    when=use_pkg_config,
+)
+
+
+@depends("--enable-alsa", when=use_pkg_config)
+def enable_alsa_option(enable_alsa):
+    return enable_alsa
+
+
+pkg_check_modules("MOZ_ALSA", "alsa", when=enable_alsa_option)
+
+set_config("MOZ_ALSA", True, when="--enable-alsa")
+set_define("MOZ_ALSA", True, when="--enable-alsa")
+
+# JACK cubeb backend
+# ==============================================================
+system_lib_option(
+    "--enable-jack",
+    env="MOZ_JACK",
+    help="Enable JACK audio backend",
+    when=use_pkg_config,
+)
+
+jack = pkg_check_modules("MOZ_JACK", "jack", when="--enable-jack")
+
+set_config("MOZ_JACK", depends_if(jack)(lambda _: True))
+
+# PulseAudio cubeb backend
+# ==============================================================
+option(
+    "--enable-pulseaudio",
+    env="MOZ_PULSEAUDIO",
+    help="{Enable|Disable} PulseAudio audio backend",
+    when=use_pkg_config,
+)
+
+pulseaudio = pkg_check_modules("MOZ_PULSEAUDIO", "libpulse", when="--enable-pulseaudio")
+
+set_config("MOZ_PULSEAUDIO", depends_if(pulseaudio)(lambda _: True))
+set_define("MOZ_PULSEAUDIO", depends_if(pulseaudio)(lambda _: True))
+
+# Javascript engine
+# ==============================================================
+include("../js/moz.configure")
+
+
+# NodeJS
+# ==============================================================
+include("../build/moz.configure/node.configure")
+
+# JsonCpp
+# ==============================================================
+set_define("JSON_USE_EXCEPTION", 0)
+
+# L10N
+# ==============================================================
+option("--with-l10n-base", nargs=1, env="L10NBASEDIR", help="Path to l10n repositories")
+
+
+@depends("--with-l10n-base", moz_automation, build_environment)
+@imports(_from="os.path", _import="isdir")
+@imports(_from="os.path", _import="expanduser")
+@imports(_from="os", _import="environ")
+def l10n_base(value, automation, build_env):
+    if value:
+        path = value[0]
+        if not isdir(path):
+            die("Invalid value --with-l10n-base, %s doesn't exist", path)
+    elif automation:
+        path = os.path.join(build_env.topsrcdir, "../l10n-central")
+    else:
+        path = os.path.join(
+            environ.get(
+                "MOZBUILD_STATE_PATH", expanduser(os.path.join("~", ".mozbuild"))
+            ),
+            "l10n-central",
+        )
+    return os.path.realpath(os.path.abspath(path))
+
+
+set_config("L10NBASEDIR", l10n_base)
+
+
+# Default toolkit
+# ==============================================================
+toolkit_choices = dependable(("cairo-gtk3-wayland-only",))
+
+
+@depends(toolkit_choices)
+def toolkit_default(choices):
+    return choices[0]
+
+
+option(
+    "--enable-default-toolkit",
+    nargs=1,
+    choices=toolkit_choices,
+    default=toolkit_default,
+    help="Select default toolkit",
+)
+
+
+@depends("--enable-default-toolkit")
+def full_toolkit(value):
+    if value:
+        return value[0]
+
+
+@depends(full_toolkit)
+def toolkit(toolkit):
+    if toolkit.startswith("cairo-gtk3"):
+        widget_toolkit = "gtk"
+    else:
+        widget_toolkit = toolkit.replace("cairo-", "")
+    return widget_toolkit
+
+
+set_config("MOZ_WIDGET_TOOLKIT", toolkit)
+
+
+set_define("MOZ_WIDGET_GTK", True)
+
+
+@depends(toolkit)
+def toolkit_gtk(toolkit):
+    return True
+
+
+@depends(toolkit_gtk)
+def toolkit_gtk_wayland(toolkit_gtk):
+    return toolkit_gtk
+
+
+# Wayland support
+# ==============================================================
+wayland_headers = pkg_check_modules(
+    "MOZ_WAYLAND",
+    "gtk+-wayland-3.0 >= 3.14 xkbcommon >= 0.4.1",
+    when=toolkit_gtk_wayland,
+)
+
+
+@depends(wayland_headers, toolkit_gtk, artifact_builds, toolkit_gtk_wayland)
+def wayland_headers(wayland, toolkit_gtk, artifacts, toolkit_gtk_wayland):
+    if not toolkit_gtk_wayland:
+        return False
+    if toolkit_gtk and artifacts:
+        return True
+    return wayland
+
+
+set_config("MOZ_WAYLAND", depends_if(wayland_headers)(lambda _: True))
+set_define("MOZ_WAYLAND", depends_if(wayland_headers)(lambda _: True))
+
+
+# Hardware-accelerated video decode (VAAPI, Vulkan, V4L2) on Linux
+# ================================================================
+@depends(toolkit_gtk, "--enable-minimal-browser")
+def gtk_hardware_video(toolkit_gtk, minimal_browser):
+    return bool(toolkit_gtk and not minimal_browser)
+
+
+set_config("MOZ_ENABLE_VAAPI", True, when=gtk_hardware_video)
+set_define("MOZ_ENABLE_VAAPI", True, when=gtk_hardware_video)
+
+set_config("MOZ_ENABLE_VULKAN_VIDEO", True, when=gtk_hardware_video)
+set_define("MOZ_ENABLE_VULKAN_VIDEO", True, when=gtk_hardware_video)
+
+@depends(target, toolkit_gtk)
+def v4l2(target, toolkit_gtk):
+    # V4L2 decode is only used in GTK/Linux and generally only appears on
+    # embedded SOCs.
+    if target.cpu in ("arm", "aarch64", "riscv64") and toolkit_gtk:
+        return True
+
+
+set_config("MOZ_ENABLE_V4L2", True, when=v4l2)
+set_define("MOZ_ENABLE_V4L2", True, when=v4l2)
+system_lib_option(
+    "--with-system-pipewire",
+    nargs="?",
+    help="Use system PipeWire",
+    when=use_pkg_config,
+)
+
+pipewire_headers = pkg_check_modules(
+    "MOZ_PIPEWIRE",
+    "libpipewire-0.3 libspa-0.2",
+    when="--with-system-pipewire",
+)
+
+set_config("MOZ_SYSTEM_PIPEWIRE", True, when="--with-system-pipewire")
+system_lib_option(
+    "--with-system-gbm",
+    nargs="?",
+    help="Use system gbm",
+    when=use_pkg_config,
+)
+
+pipewire_headers = pkg_check_modules(
+    "MOZ_GBM",
+    "gbm",
+    when="--with-system-gbm",
+)
+
+set_config("MOZ_SYSTEM_GBM", True, when="--with-system-gbm")
+system_lib_option(
+    "--with-system-libdrm",
+    nargs="?",
+    help="Use system libdrm",
+    when=use_pkg_config,
+)
+
+pipewire_headers = pkg_check_modules(
+    "MOZ_LIBDRM",
+    "libdrm",
+    when="--with-system-libdrm",
+)
+
+set_config("MOZ_SYSTEM_LIBDRM", True, when="--with-system-libdrm")
+
+# GL Provider
+# ==============================================================
+option("--with-gl-provider", nargs=1, help="Set GL provider backend type")
+
+
+@depends("--with-gl-provider")
+def gl_provider(value):
+    if value:
+        return value[0]
+
+
+@depends(gl_provider)
+def gl_provider_define(provider):
+    if provider:
+        return "GLContextProvider%s" % provider
+
+
+set_define("MOZ_GL_PROVIDER", gl_provider_define)
+set_config("MOZ_GL_PROVIDER", gl_provider)
+
+
+set_config("MOZ_PDF_PRINTING", False)
+
+# Fontconfig Freetype
+# ==============================================================
+option(env="USE_FC_FREETYPE", help="Force-enable the use of fontconfig freetype")
+
+
+@depends("USE_FC_FREETYPE", toolkit)
+def fc_freetype(value, toolkit):
+    if value or (value.origin == "default"):
+        return True
+
+
+set_define("USE_FC_FREETYPE", fc_freetype)
+
+# Pango
+# ==============================================================
+pkg_check_modules("MOZ_PANGO", "pango >= 1.22.0", when=toolkit_gtk)
+
+# Fontconfig
+# ==============================================================
+fontconfig_info = pkg_check_modules(
+    "_FONTCONFIG", "fontconfig >= 2.7.0", when=fc_freetype
+)
+
+
+@depends(fc_freetype)
+def check_for_freetype2(fc_freetype):
+    if fc_freetype:
+        return True
+
+
+# Check for freetype2. Flags are combined with fontconfig flags.
+freetype2_info = pkg_check_modules(
+    "_FT2", "freetype2 >= 9.10.3", when=check_for_freetype2
+)
+
+
+@depends(fontconfig_info, freetype2_info)
+def freetype2_combined_info(fontconfig_info, freetype2_info):
+    if not freetype2_info:
+        return
+    if not fontconfig_info:
+        return freetype2_info
+    return namespace(
+        cflags=freetype2_info.cflags + fontconfig_info.cflags,
+        libs=freetype2_info.libs + fontconfig_info.libs,
+    )
+
+
+set_define("MOZ_HAVE_FREETYPE2", depends_if(freetype2_info)(lambda _: True))
+
+
+# FFmpeg H264/AAC Decoding Support
+# ==============================================================
+option("--disable-ffmpeg", help="Disable FFmpeg for fragmented H264/AAC decoding")
+
+
+@depends("--disable-ffmpeg", target)
+def ffmpeg(value, target):
+    enabled = bool(value)
+    if value.origin == "default":
+        enabled = True
+    if enabled:
+        return True
+
+
+set_config("MOZ_FFMPEG", ffmpeg)
+set_define("MOZ_FFMPEG", ffmpeg)
+
+# AV1 Video Codec Support
+# ==============================================================
+option("--with-system-av1", help="Use system av1 (located with pkg-config)")
+
+pkg_check_modules("MOZ_SYSTEM_LIBAOM", "aom >= 3.0.0", when="--with-system-av1")
+pkg_check_modules("MOZ_SYSTEM_LIBDAV1D", "dav1d >= 1.2.1", when="--with-system-av1")
+
+
+@depends(target, "--with-system-av1", when=compile_environment)
+def dav1d_asm(target, system_av1):
+    if not system_av1 and target.cpu in ("arm", "aarch64", "x86", "x86_64"):
+        return True
+
+
+@depends(target, "--with-system-av1", when=compile_environment)
+def dav1d_nasm(target, system_av1):
+    if not system_av1 and target.cpu in ("x86", "x86_64"):
+        return namespace(version="2.14", what="AV1")
+
+
+set_config("MOZ_DAV1D_ASM", dav1d_asm)
+set_define("MOZ_DAV1D_ASM", dav1d_asm)
+set_config("MOZ_SYSTEM_AV1", True, when="--with-system-av1")
+
+# JXL Image Codec Support
+# ==============================================================
+option("--disable-jxl", help="Disable jxl image support")
+
+
+@depends("--disable-jxl")
+def jxl(value):
+    if value:
+        return True
+
+
+set_config("MOZ_JXL", jxl)
+set_define("MOZ_JXL", jxl)
+
+set_config("MOZ_SAMPLE_TYPE_FLOAT32", True)
+set_define("MOZ_SAMPLE_TYPE_FLOAT32", True)
+
+# OpenMAX IL Decoding Support
+# ==============================================================
+option("--enable-openmax", help="Enable OpenMAX IL for video/audio decoding")
+
+
+@depends("--enable-openmax")
+def openmax(value):
+    enabled = bool(value)
+    if enabled:
+        return True
+
+
+set_config("MOZ_OMX", openmax)
+set_define("MOZ_OMX", openmax)
+
+
+option(
+    name="--enable-chrome-format",
+    help="Select FORMAT of chrome files during packaging",
+    nargs=1,
+    choices=("omni", "jar", "flat"),
+    default="omni",
+)
+
+
+@depends("--enable-chrome-format")
+def packager_format(value):
+    return value[0]
+
+
+set_config("MOZ_PACKAGER_FORMAT", packager_format)
+
+option(
+    name="--enable-minify",
+    help="Select types of files to minify during packaging",
+    nargs="*",
+    choices=("properties", "js"),
+    default=("properties",),
+)
+
+
+@depends("--enable-minify")
+def enable_minify(value):
+    if "js" in value and "properties" not in value:
+        die("--enable-minify=js requires --enable-minify=properties.")
+    return namespace(
+        properties="properties" in value,
+        js="js" in value,
+    )
+
+
+set_config("MOZ_PACKAGER_MINIFY", True, when=enable_minify.properties)
+set_config("MOZ_PACKAGER_MINIFY_JS", True, when=enable_minify.js)
+
+
+set_config("MOZ_PACKAGER_MINIFY_PDFJS", False)
+
+
+@depends(host)
+def jar_maker_format(host):
+    return "symlink"
+
+
+set_config("MOZ_JAR_MAKER_FILE_FORMAT", jar_maker_format)
+
+
+@depends(toolkit)
+def omnijar_name(toolkit):
+    return "omni.ja"
+
+
+set_config("OMNIJAR_NAME", omnijar_name)
+
+project_flag("MOZ_PLACES", help="Build Places if required", set_as_define=True)
+
+set_config("MOZ_NORMANDY", False)
+
+project_flag(
+    "MOZ_GECKOVIEW_HISTORY",
+    help="Enable Geckoview History instead of Places",
+    set_as_define=True,
+)
+
+project_flag(
+    "MOZ_EXTRA_ERROR_DEFINITIONS",
+    help="Name of JSON file to add extra error definitions to ErrorList.py",
+    nargs=1,
+)
+
+set_config("MOZ_SELECTABLE_PROFILES", False)
+set_config("MOZ_DEDICATED_PROFILES", False)
+set_config("MOZ_BLOCK_PROFILE_DOWNGRADE", False)
+
+
+@depends("MOZ_PLACES", "MOZ_GECKOVIEW_HISTORY", "--enable-minimal-browser")
+def check_places_and_geckoview_history(
+    places, geckoview_history, minimal_browser
+):
+    if places and geckoview_history:
+        die("Cannot use MOZ_GECKOVIEW_HISTORY alongside MOZ_PLACES.")
+    if not places and not geckoview_history and not minimal_browser:
+        die("One of MOZ_GECKOVIEW_HISTORY or MOZ_PLACES must be set.")
+
+
+# Miscellaneous programs
+# ==============================================================
+
+check_prog("TAR", ("gnutar", "gtar", "tar"))
+check_prog("UNZIP", ("unzip",))
+
+# Key files
+# ==============================================================
+include("../build/moz.configure/keyfiles.configure")
+
+simple_keyfile("Mozilla API")
+simple_keyfile("Google Location Service API")
+
+id_and_secret_keyfile("Bing API")
+
+simple_keyfile("Adjust SDK")
+
+id_and_secret_keyfile("Leanplum SDK")
+
+simple_keyfile("Pocket API")
+
+
+# WebRender Debugger integration
+# ==============================================================
+
+option(
+    "--enable-webrender-debugger", help="Build the websocket debug server in WebRender"
+)
+
+
+@depends("--enable-webrender-debugger")
+def webrender_debugger(value):
+    if value:
+        return True
+
+
+set_config("MOZ_WEBRENDER_DEBUGGER", webrender_debugger)
+set_define("MOZ_WEBRENDER_DEBUGGER", webrender_debugger)
+
+# Additional system headers defined at the application level
+# ==============================================================
+
+option(
+    "--enable-app-system-headers",
+    env="MOZ_APP_SYSTEM_HEADERS",
+    help="Use additional system headers defined in $MOZ_BUILD_APP/app-system-headers.mozbuild",
+)
+
+
+@depends("--enable-app-system-headers")
+def app_system_headers(value):
+    if value:
+        return True
+
+
+set_config("MOZ_APP_SYSTEM_HEADERS", app_system_headers)
+
+
+set_config("NS_PRINTING", False)
+
+
+set_config("MOZ_SYNTH_SPEECHD", False)
+set_config("MOZ_WEBSPEECH", False)
+set_config("MOZ_WEBSPEECH_TEST_BACKEND", False)
+
+# Graphics
+# Graphics
+# ==============================================================
+set_config("MOZ_ENABLE_SKIA_PDF", False)
+
+set_config(
+    "SKIA_INCLUDES",
+    [
+        "/gfx/skia",
+        "/gfx/skia/skia",
+    ],
+)
+
+system_lib_option(
+    "--with-system-webp",
+    help="Use system libwebp (located with pkgconfig)",
+    when=use_pkg_config,
+)
+
+system_webp = pkg_check_modules(
+    "MOZ_WEBP", "libwebp >= 1.0.2 libwebpdemux >= 1.0.2", when="--with-system-webp"
+)
+
+set_config("MOZ_SYSTEM_WEBP", depends(when=system_webp)(lambda: True))
+
+
+# Build Freetype in the tree
+# ==============================================================
+@depends(target)
+def tree_freetype(target):
+    pass
+
+
+set_define("MOZ_TREE_FREETYPE", tree_freetype)
+set_config("MOZ_TREE_FREETYPE", tree_freetype)
+
+set_define("HAVE_FT_GLYPHSLOT_EMBOLDEN", tree_freetype)
+set_define("HAVE_FT_LOAD_SFNT_TABLE", tree_freetype)
+
+
+@depends(freetype2_combined_info, tree_freetype, build_environment)
+def ft2_info(freetype2_combined_info, tree_freetype, build_env):
+    if tree_freetype:
+        return namespace(
+            cflags=("-I%s/modules/freetype2/include" % build_env.topsrcdir,), libs=()
+        )
+    if freetype2_combined_info:
+        return freetype2_combined_info
+
+
+set_config("FT2_LIBS", ft2_info.libs)
+
+
+@depends(tree_freetype, freetype2_info)
+def enable_cairo_ft(tree_freetype, freetype2_info):
+    return freetype2_info or tree_freetype
+
+
+set_config("MOZ_ENABLE_CAIRO_FT", True, when=enable_cairo_ft)
+set_config("CAIRO_FT_CFLAGS", ft2_info.cflags, when=enable_cairo_ft)
+
+
+# RAW media
+# ==============================================================
+
+option(
+    "--enable-raw",
+    default=False,
+    help="{Enable|Disable} support for RAW media",
+)
+
+set_define("MOZ_RAW", depends_if("--enable-raw")(lambda _: True))
+set_define("HAVE_STAT64", check_symbol("stat64"))
+set_define("HAVE_LSTAT64", check_symbol("lstat64"))
+set_define("HAVE_TRUNCATE64", check_symbol("truncate64"))
+set_define("HAVE_STATVFS64", check_symbol("statvfs64"))
+set_define("HAVE_STATVFS", check_symbol("statvfs"))
+set_define("HAVE_STATFS64", check_symbol("statfs64"))
+set_define("HAVE_STATFS", check_symbol("statfs"))
+set_define("HAVE_LUTIMES", check_symbol("lutimes"))
+set_define("HAVE_POSIX_FADVISE", check_symbol("posix_fadvise"))
+set_define("HAVE_POSIX_FALLOCATE", check_symbol("posix_fallocate"))
+set_define("HAVE_EVENTFD", check_symbol("eventfd"))
+
+have_arc4random = check_symbol("arc4random")
+set_define("HAVE_ARC4RANDOM", have_arc4random)
+set_define("HAVE_ARC4RANDOM_BUF", check_symbol("arc4random_buf"))
+set_define("HAVE_MALLINFO", check_symbol("mallinfo"))
+set_define("HAVE_SYSIOCCOM_H", check_header("sys/ioccom.h"))
+
+set_config("HAVE_EXECINFO", check_header("execinfo.h"))
+
+set_config("HAVE_SINGLE_THREADED_H", check_header("sys/single_threaded.h"))
+
+# Elfhack
+# ==============================================================
+with only_when("--enable-compile-environment"):
+
+    @depends(host, target)
+    def has_elfhack(host, target):
+        return target.cpu in ("arm", "aarch64", "x86", "x86_64")
+
+    option(
+        "--disable-elf-hack",
+        nargs="?",
+        choices=("legacy", "relr"),
+        help="{Enable|Disable} elf hacks",
+        when=has_elfhack,
+    )
+
+    @depends("--enable-elf-hack", when=has_elfhack)
+    def may_enable_legacy_elfhack(enable):
+        if enable and enable != ("relr",):
+            return enable
+
+    @depends("--enable-elf-hack", when=has_elfhack)
+    def may_enable_relrhack(enable):
+        if enable and enable != ("legacy",):
+            return enable
+
+    option(
+        "--enable-packed-relative-relocs",
+        help="{Enable|Disable} packed relative relocations (RELR)",
+        when=target_has_linux_kernel,
+    )
+
+    @depends(
+        "--enable-packed-relative-relocs",
+        have_arc4random,
+        when=target_has_linux_kernel,
+    )
+    def may_use_pack_relative_relocs(enable, have_arc4random):
+        # Packed relative relocations are supported in glibc since version 2.36
+        # and in musl since version 1.2.4.
+        # glibc 2.36 also added the arc4random function, which is our proxy
+        # to detect this (or newer) version being used.
+        # When targetting those newer versions, we allow ourselves to use
+        # packed relative relocations rather than elfhack.
+        # However, on musl libc there's no such discovery option, so we add a
+        # separate flag to enable this feature regardless.
+        if enable:
+            return True
+        if not enable and enable.origin != "default":
+            return False
+        return have_arc4random
+
+    @depends(
+        c_compiler,
+        extra_toolchain_flags,
+        linker_ldflags,
+        readelf,
+        when=may_use_pack_relative_relocs | may_enable_relrhack,
+    )
+    @checking("for -z pack-relative-relocs option to ld", bool)
+    @imports(_from="__builtin__", _import="FileNotFoundError")
+    @imports("os")
+    @imports("textwrap")
+    def has_pack_relative_relocs(
+        c_compiler,
+        extra_toolchain_flags,
+        linker_ldflags,
+        readelf,
+    ):
+        with create_temporary_file(suffix=".out") as path:
+            pack_rel_relocs = ["-Wl,-z,pack-relative-relocs"]
+            if (
+                try_invoke_compiler(
+                    # No configure_cache because it would not create the
+                    # expected output file.
+                    None,
+                    [c_compiler.compiler] + c_compiler.flags,
+                    c_compiler.language,
+                    # The resulting binary is expected to have relative
+                    # relocations, the `ptr` variable attempts to ensure
+                    # there is at least one. This requires the executable
+                    # being built as position independent.
+                    "int main() { return 0; }\nint (*ptr)() = main;",
+                    pack_rel_relocs
+                    + ["-pie", "-o", path]
+                    + extra_toolchain_flags
+                    + linker_ldflags,
+                    wrapper=c_compiler.wrapper,
+                    onerror=lambda: None,
+                )
+                is not None
+            ):
+                # BFD ld ignores options it doesn't understand. So check
+                # that we did get packed relative relocations (DT_RELR).
+                env = os.environ.copy()
+                env["LANG"] = "C"
+                dyn = check_cmd_output(readelf, "-d", path, env=env).splitlines()
+                tags = [
+                    int(l.split()[0], 16) for l in dyn if l.strip().startswith("0x")
+                ]
+                # Older versions of readelf don't know about DT_RELR but will
+                # still display the tag number.
+                if 0x23 in tags:
+                    needed = [l for l in dyn if l.split()[1:2] == ["(NEEDED)"]]
+                    is_glibc = any(l.endswith("[libc.so.6]") for l in needed)
+                    # The mold linker doesn't add a GLIBC_ABI_DT_RELR version
+                    # dependency, which ld.so doesn't like.
+                    # https://github.com/rui314/mold/issues/653#issuecomment-1670274638
+                    if is_glibc:
+                        versions = check_cmd_output(readelf, "-V", path, env=env)
+                        if "GLIBC_ABI_DT_RELR" in versions.split():
+                            return pack_rel_relocs
+                    else:
+                        return pack_rel_relocs
+
+    @depends(
+        has_pack_relative_relocs,
+        may_enable_legacy_elfhack,
+        may_enable_relrhack,
+        may_use_pack_relative_relocs,
+        when=has_pack_relative_relocs,
+    )
+    def pack_relative_relocs_flags(
+        flags,
+        may_enable_legacy_elfhack,
+        may_enable_relrhack,
+        may_use_pack_relative_relocs,
+    ):
+        # When relrhack is enabled, we don't pass the flag to the linker because
+        # relrhack will take care of it.
+        if may_enable_relrhack and may_enable_relrhack.origin != "default":
+            return None
+        # if elfhack is explicitly enabled instead of relrhack, we prioritize it
+        # over packed relative relocs.
+        if may_enable_legacy_elfhack and may_enable_legacy_elfhack.origin != "default":
+            return None
+        if may_use_pack_relative_relocs:
+            return flags
+
+    @depends(
+        select_linker,
+        pack_relative_relocs_flags,
+        has_pack_relative_relocs,
+        may_enable_legacy_elfhack,
+        may_enable_relrhack,
+        when=has_elfhack,
+    )
+    def which_elf_hack(
+        linker,
+        pack_relative_relocs_flags,
+        has_pack_relative_relocs,
+        may_enable_legacy_elfhack,
+        may_enable_relrhack,
+    ):
+        if pack_relative_relocs_flags:
+            return
+        if may_enable_relrhack:
+            if has_pack_relative_relocs:
+                return "relr"
+            elif (
+                may_enable_relrhack.origin != "default"
+                and not may_enable_legacy_elfhack
+            ):
+                die(
+                    "Cannot enable relrhack without linker support for -z pack-relative-relocs"
+                )
+        if may_enable_legacy_elfhack:
+            if linker and linker.KIND in ("lld", "mold"):
+                if may_enable_legacy_elfhack.origin != "default":
+                    die(
+                        f"Cannot enable elfhack with {linker.KIND}."
+                        " Use --enable-linker=bfd, --enable-linker=gold, or --disable-elf-hack"
+                    )
+            else:
+                return "legacy"
+
+    set_config(
+        "USE_ELF_HACK", True, when=depends(which_elf_hack)(lambda x: x == "legacy")
+    )
+
+    use_relrhack = depends(which_elf_hack)(lambda x: x == "relr")
+    set_config("RELRHACK", True, when=use_relrhack)
+
+    @depends(linker_ldflags, when=use_relrhack)
+    def relrhack_linker(linker_ldflags):
+        ld = "ld"
+        for flag in linker_ldflags:
+            if flag.startswith("-fuse-ld="):
+                ld = "ld." + flag[len("-fuse-ld=") :]
+        return ld
+
+    set_config("RELRHACK_LINKER", relrhack_linker)
+
+    @depends(c_compiler, relrhack_linker, when=use_relrhack)
+    def relrhack_real_linker(c_compiler, ld):
+        ld = check_cmd_output(
+            c_compiler.compiler, f"--print-prog-name={ld}", *c_compiler.flags
+        )
+        return ld.rstrip()
+
+    std_filesystem = host_cxx_compiler.try_run(
+        header="#include <filesystem>",
+        body='auto foo = std::filesystem::absolute("");',
+        flags=host_linker_ldflags,
+        when=use_relrhack,
+        onerror=lambda: None,
+    )
+
+    stdcxxfs = host_cxx_compiler.try_run(
+        header="#include <filesystem>",
+        body='auto foo = std::filesystem::absolute("");',
+        flags=depends(host_linker_ldflags)(
+            lambda flags: (flags or []) + ["-lstdc++fs"]
+        ),
+        check_msg="whether std::filesystem requires -lstdc++fs",
+        when=use_relrhack & depends(std_filesystem)(lambda x: not x),
+        onerror=lambda: None,
+    )
+
+    set_config("RELRHACK_LIBS", ["stdc++fs"], when=stdcxxfs)
+
+    @depends(build_environment, relrhack_real_linker, when=use_relrhack)
+    def relrhack_ldflags(build_env, ld):
+        flags = [
+            "-B",
+            os.path.join(build_env.topobjdir, "build", "unix", "elfhack"),
+        ]
+        if os.path.basename(ld) != ld:
+            flags.append(f"-Wl,--real-linker,{ld}")
+        return flags
+
+    set_config("RELRHACK_LDFLAGS", relrhack_ldflags)
+
+
+@depends(build_environment)
+def idl_roots(build_env):
+    return namespace(
+        ipdl_root=os.path.join(build_env.topobjdir, "ipc", "ipdl"),
+        webidl_root=os.path.join(build_env.topobjdir, "dom", "bindings"),
+        xpcom_root=os.path.join(build_env.topobjdir, "xpcom", "components"),
+    )
+
+
+set_config("WEBIDL_ROOT", idl_roots.webidl_root)
+set_config("IPDL_ROOT", idl_roots.ipdl_root)
+set_config("XPCOM_ROOT", idl_roots.xpcom_root)
+
+# Proxy bypass protection
+# ==============================================================
+
+option(
+    "--enable-proxy-bypass-protection",
+    help="Prevent suspected or confirmed proxy bypasses",
+)
+
+
+@depends_if("--enable-proxy-bypass-protection")
+def proxy_bypass_protection(_):
+    return True
+
+
+set_config("MOZ_PROXY_BYPASS_PROTECTION", proxy_bypass_protection)
+set_define("MOZ_PROXY_BYPASS_PROTECTION", proxy_bypass_protection)
+
+# Proxy direct failover
+# ==============================================================
+
+option(
+    "--disable-proxy-direct-failover",
+    help="Disable direct failover for system requests",
+)
+
+
+@depends_if("--disable-proxy-direct-failover")
+def proxy_direct_failover(value):
+    if value:
+        return True
+
+
+set_config("MOZ_PROXY_DIRECT_FAILOVER", proxy_direct_failover)
+set_define("MOZ_PROXY_DIRECT_FAILOVER", proxy_direct_failover)
+
+accessibility = dependable(False)
+set_config("ACCESSIBILITY", False)
+set_config("A11Y_LOG", False)
+
+# Bundled fonts on desktop platform
+# ==============================================================
+
+
+@depends(target)
+def bundled_fonts_default(target):
+    return True
+
+
+@depends(build_project)
+def allow_bundled_fonts(project):
+    return project == "browser" or project == "comm/mail"
+
+
+option(
+    "--enable-bundled-fonts",
+    default=bundled_fonts_default,
+    when=allow_bundled_fonts,
+    help="{Enable|Disable} support for bundled fonts on desktop platforms",
+)
+
+set_define(
+    "MOZ_BUNDLED_FONTS",
+    depends_if("--enable-bundled-fonts", when=allow_bundled_fonts)(lambda _: True),
+)
+
+system_lib_option(
+    "--with-system-libvpx",
+    help="Use system libvpx (located with pkgconfig)",
+    when=use_pkg_config,
+)
+
+@depends("--with-system-libvpx", when=use_pkg_config)
+def with_system_libvpx_option(with_system_libvpx):
+    return with_system_libvpx
+
+with only_when("--with-system-libvpx"):
+    vpx = pkg_check_modules("MOZ_LIBVPX", "vpx >= 1.10.0")
+
+    check_header(
+        "vpx/vpx_decoder.h",
+        flags=vpx.cflags,
+        onerror=lambda: die(
+            "Couldn't find vpx/vpx_decoder.h, which is required to build "
+            "with system libvpx. Use --without-system-libvpx to build "
+            "with in-tree libvpx."
+        ),
+    )
+
+    check_symbol(
+        "vpx_codec_dec_init_ver",
+        flags=vpx.libs,
+        onerror=lambda: die(
+            "--with-system-libvpx requested but symbol vpx_codec_dec_init_ver "
+            "not found"
+        ),
+    )
+
+    set_config("MOZ_SYSTEM_LIBVPX", True)
+
+@depends(with_system_libvpx_option, target)
+def in_tree_vpx(system_libvpx, target):
+    if system_libvpx:
+        return
+
+    arm_asm = (target.cpu == "arm") or None
+    return namespace(arm_asm=arm_asm)
+
+@depends(target, when=in_tree_vpx)
+def vpx_nasm(target):
+    if target.cpu in ("x86", "x86_64"):
+        pass
+        return namespace(what="VPX")
+
+@depends(in_tree_vpx, vpx_nasm, target, neon_flags)
+def vpx_as_flags(vpx, vpx_nasm, target, neon_flags):
+    if vpx and vpx.arm_asm:
+        # These flags are a lie; they're just used to enable the requisite
+        # opcodes; actual arch detection is done at runtime.
+        return neon_flags
+    elif vpx and vpx_nasm and target.cpu != "x86_64":
+        return ("-DPIC",)
+
+set_config("VPX_USE_NASM", True, when=vpx_nasm)
+set_config("VPX_ASFLAGS", vpx_as_flags)
+system_lib_option(
+    "--with-system-jpeg",
+    nargs="?",
+    help="Use system libjpeg (installed at given prefix)",
+)
+
+@depends_if("--with-system-jpeg")
+def jpeg_flags(value):
+    if len(value):
+        return namespace(
+            cflags=("-I%s/include" % value[0],),
+            ldflags=("-L%s/lib" % value[0], "-ljpeg"),
+        )
+    return namespace(
+        ldflags=("-ljpeg",),
+    )
+
+with only_when("--with-system-jpeg"):
+    check_symbol(
+        "jpeg_destroy_compress",
+        flags=jpeg_flags.ldflags,
+        onerror=lambda: die(
+            "--with-system-jpeg requested but symbol "
+            "jpeg_destroy_compress not found."
+        ),
+    )
+
+    c_compiler.try_compile(
+        includes=[
+            "stdio.h",
+            "sys/types.h",
+            "jpeglib.h",
+        ],
+        body="""
+                #if JPEG_LIB_VERSION < 62
+                #error Insufficient JPEG library version
+                #endif
+            """,
+        flags=jpeg_flags.cflags,
+        check_msg="for sufficient jpeg library version",
+        onerror=lambda: die(
+            "Insufficient JPEG library version for --with-system-jpeg (62 required)"
+        ),
+    )
+
+    c_compiler.try_compile(
+        includes=[
+            "stdio.h",
+            "sys/types.h",
+            "jpeglib.h",
+        ],
+        body="""
+                #ifndef JCS_EXTENSIONS
+                #error libjpeg-turbo JCS_EXTENSIONS required
+                #endif
+            """,
+        flags=jpeg_flags.cflags,
+        check_msg="for sufficient libjpeg-turbo JCS_EXTENSIONS",
+        onerror=lambda: die(
+            "libjpeg-turbo JCS_EXTENSIONS required for --with-system-jpeg"
+        ),
+    )
+
+    set_config("MOZ_JPEG_CFLAGS", jpeg_flags.cflags)
+    set_config("MOZ_JPEG_LIBS", jpeg_flags.ldflags)
+
+@depends("--with-system-jpeg", target, neon_flags)
+def in_tree_jpeg_arm(system_jpeg, target, neon_flags):
+    if system_jpeg:
+        return
+
+    if target.cpu == "arm":
+        return neon_flags
+    elif target.cpu == "aarch64":
+        return ("-march=armv8-a",)
+
+@depends("--with-system-jpeg", target)
+def in_tree_jpeg_mips64(system_jpeg, target):
+    if system_jpeg:
+        return
+
+    if target.cpu == "mips64":
+        return ("-Wa,-mloongson-mmi", "-mloongson-ext")
+
+# Compiler check from https://github.com/libjpeg-turbo/libjpeg-turbo/blob/57ba02a408a9a55ccff25aae8b164632a3a4f177/simd/CMakeLists.txt#L419
+jpeg_mips64_mmi = c_compiler.try_compile(
+    body='int c = 0, a = 0, b = 0; asm("paddb %0, %1, %2" : "=f" (c) : "f" (a), "f" (b));',
+    check_msg="for loongson mmi support",
+    flags=in_tree_jpeg_mips64,
+    when=in_tree_jpeg_mips64,
+)
+
+@depends(
+    "--with-system-jpeg",
+    target,
+    in_tree_jpeg_arm,
+    in_tree_jpeg_mips64,
+    jpeg_mips64_mmi,
+)
+def in_tree_jpeg(
+    system_jpeg, target, in_tree_jpeg_arm, in_tree_jpeg_mips64, jpeg_mips64_mmi
+):
+    if system_jpeg:
+        return
+
+    if target.cpu in ("arm", "aarch64"):
+        return in_tree_jpeg_arm
+    elif target.cpu == "mips32":
+        return ("-mdspr2",)
+    elif target.cpu == "mips64" and jpeg_mips64_mmi:
+        return in_tree_jpeg_mips64
+    elif target.cpu == "x86":
+        return ("-DPIC", "-DELF")
+    elif target.cpu == "x86_64":
+        return ("-D__x86_64__", "-DPIC", "-DELF")
+
+@depends(target, when=depends("--with-system-jpeg")(lambda x: not x))
+def jpeg_nasm(target):
+    if target.cpu in ("x86", "x86_64"):
+        # libjpeg-turbo 2.0.6 requires nasm 2.10.
+        return namespace(version="2.10", what="JPEG")
+
+# Compiler checks from https://github.com/libjpeg-turbo/libjpeg-turbo/blob/57ba02a408a9a55ccff25aae8b164632a3a4f177/simd/CMakeLists.txt#L258
+jpeg_arm_neon_vld1_s16_x3 = c_compiler.try_compile(
+    includes=["arm_neon.h"],
+    body="int16_t input[12] = {}; int16x4x3_t output = vld1_s16_x3(input);",
+    check_msg="for vld1_s16_x3 in arm_neon.h",
+    flags=in_tree_jpeg_arm,
+    when=in_tree_jpeg_arm,
+)
+
+jpeg_arm_neon_vld1_u16_x2 = c_compiler.try_compile(
+    includes=["arm_neon.h"],
+    body="uint16_t input[8] = {}; uint16x4x2_t output = vld1_u16_x2(input);",
+    check_msg="for vld1_u16_x2 in arm_neon.h",
+    flags=in_tree_jpeg_arm,
+    when=in_tree_jpeg_arm,
+)
+
+jpeg_arm_neon_vld1q_u8_x4 = c_compiler.try_compile(
+    includes=["arm_neon.h"],
+    body="uint8_t input[64] = {}; uint8x16x4_t output = vld1q_u8_x4(input);",
+    check_msg="for vld1q_u8_x4 in arm_neon.h",
+    flags=in_tree_jpeg_arm,
+    when=in_tree_jpeg_arm,
+)
+
+set_config("LIBJPEG_TURBO_USE_NASM", True, when=jpeg_nasm)
+set_config("LIBJPEG_TURBO_SIMD_FLAGS", in_tree_jpeg)
+set_config("LIBJPEG_TURBO_HAVE_VLD1_S16_X3", jpeg_arm_neon_vld1_s16_x3)
+set_config("LIBJPEG_TURBO_HAVE_VLD1_U16_X2", jpeg_arm_neon_vld1_u16_x2)
+set_config("LIBJPEG_TURBO_HAVE_VLD1Q_U8_X4", jpeg_arm_neon_vld1q_u8_x4)
+set_config(
+    "LIBJPEG_TURBO_NEON_INTRINSICS",
+    jpeg_arm_neon_vld1_s16_x3
+    & jpeg_arm_neon_vld1_u16_x2
+    & jpeg_arm_neon_vld1q_u8_x4,
+)
+
+set_config("MOZ_SYSTEM_JPEG", True, when="--with-system-jpeg")
+system_lib_option(
+    "--with-system-png",
+    nargs="?",
+    help="Use system libpng",
+    when=use_pkg_config,
+)
+
+@depends("--with-system-png", when=use_pkg_config)
+def deprecated_system_png_path(value):
+    if len(value) == 1:
+        die(
+            "--with-system-png=PATH is not supported anymore. Please use "
+            "--with-system-png and set any necessary pkg-config environment variable."
+        )
+
+png = pkg_check_modules("MOZ_PNG", "libpng >= 1.6.45", when="--with-system-png")
+
+check_symbol(
+    "png_get_acTL",
+    flags=png.libs,
+    onerror=lambda: die(
+        "--with-system-png won't work because the system's libpng doesn't have APNG support"
+    ),
+    when="--with-system-png",
+)
+
+set_config("MOZ_SYSTEM_PNG", True, when="--with-system-png")
+
+
+# FFmpeg's ffvpx configuration
+# ==============================================================
+
+
+@depends(target)
+def ffvpx(target):
+    use_nasm = True
+    audio_only = False
+    flags = []
+    if target.cpu == "x86_64":
+        audio_only = True
+    else:
+        audio_only = True
+
+    if audio_only:
+        use_nasm = False
+
+    return namespace(
+        use_nasm=use_nasm,
+        audio_only=audio_only,
+        flags=flags,
+    )
+
+
+@depends(when=ffvpx.use_nasm)
+def ffvpx_nasm():
+    # nasm 2.10 for AVX-2 support.
+    return namespace(version="2.10", what="FFVPX")
+
+
+# ffvpx_nasm can't indirectly depend on vpx_as_flags, because it depends
+# on a compiler test, so we have to do a little bit of dance here.
+@depends(ffvpx, vpx_as_flags, target)
+def ffvpx(ffvpx, vpx_as_flags, target):
+    if ffvpx and vpx_as_flags and target.cpu in ("arm", "aarch64"):
+        ffvpx.flags.extend(vpx_as_flags)
+    return ffvpx
+
+
+set_config("MOZ_FFVPX_AUDIOONLY", True, when=ffvpx.audio_only)
+set_define("MOZ_FFVPX_AUDIOONLY", True, when=ffvpx.audio_only)
+set_config("FFVPX_ASFLAGS", ffvpx.flags)
+set_config("FFVPX_USE_NASM", True, when=ffvpx.use_nasm)
+
+
+# nasm detection
+# ==============================================================
+@depends(dav1d_nasm, vpx_nasm, jpeg_nasm, ffvpx_nasm, when=compile_environment)
+def need_nasm(*requirements):
+    requires = {
+        x.what: x.version if hasattr(x, "version") else True for x in requirements if x
+    }
+    if requires:
+        items = sorted(requires.keys())
+        if len(items) > 1:
+            what = " and ".join((", ".join(items[:-1]), items[-1]))
+        else:
+            what = items[0]
+        versioned = {k: v for (k, v) in requires.items() if v is not True}
+        return namespace(what=what, versioned=versioned)
+
+
+nasm = check_prog(
+    "NASM",
+    ["nasm"],
+    allow_missing=True,
+    bootstrap="nasm",
+    when=need_nasm,
+)
+
+
+@depends(nasm, need_nasm.what)
+def check_nasm(nasm, what):
+    if not nasm and what:
+        die("Nasm is required to build with %s, but it was not found." % what)
+    return nasm
+
+
+@depends_if(check_nasm)
+@checking("nasm version")
+def nasm_version(nasm):
+    version = (
+        check_cmd_output(nasm, "-v", onerror=lambda: die("Failed to get nasm version."))
+        .splitlines()[0]
+        .split()[2]
+    )
+    return Version(version)
+
+
+@depends(nasm_version, need_nasm.versioned, when=need_nasm.versioned)
+def check_nasm_version(nasm_version, versioned):
+    by_version = sorted(versioned.items(), key=lambda x: x[1])
+    what, version = by_version[-1]
+    if nasm_version < version:
+        die(
+            "Nasm version %s or greater is required to build with %s." % (version, what)
+        )
+    return nasm_version
+
+
+@depends(target, when=check_nasm_version)
+def nasm_asflags(target):
+    if target.cpu == "x86":
+        return ["-f", "elf32"]
+    if target.cpu == "x86_64":
+        return ["-f", "elf64"]
+
+
+set_config("NASM_ASFLAGS", nasm_asflags)
+
+
+# Remoting protocol support
+# ==============================================================
+
+
+@depends(toolkit)
+def has_remote(_toolkit):
+    return None
+
+
+set_config("MOZ_HAS_REMOTE", has_remote)
+set_define("MOZ_HAS_REMOTE", has_remote)
+
+# Auxiliary files persistence on application close
+# ==============================================================
+
+option(
+    "--enable-disk-remnant-avoidance",
+    help="Prevent persistence of auxiliary files on application close",
+)
+
+
+set_config(
+    "MOZ_AVOID_DISK_REMNANT_ON_CLOSE",
+    True,
+    when="--enable-disk-remnant-avoidance",
+)
+
+
+# dump_syms
+# ==============================================================
+
+check_prog(
+    "DUMP_SYMS",
+    ["dump_syms"],
+    allow_missing=True,
+    bootstrap="dump_syms",
+    when=compile_environment,
+)
+
+
+# Fork server
+@depends(target, build_project)
+def forkserver_default(target, build_project):
+    return False
+
+
+option(
+    "--enable-forkserver",
+    default=forkserver_default,
+    env="MOZ_ENABLE_FORKSERVER",
+    help="{Enable|Disable} fork server",
+)
+
+
+@depends("--enable-forkserver", target)
+def forkserver_flag(value, target):
+    pass
+    pass
+
+
+set_config("MOZ_ENABLE_FORKSERVER", forkserver_flag)
+set_define("MOZ_ENABLE_FORKSERVER", forkserver_flag, forkserver_flag)
+
+# Linux stack-context support
+# ==============================================================
+
+with only_when(target_has_linux_kernel):
+    # Check if we need to use the breakpad_getcontext fallback.
+    getcontext = check_symbol("getcontext")
+    set_config("HAVE_GETCONTEXT", getcontext)
+    set_define("HAVE_GETCONTEXT", getcontext)
+
+# NSS
+# ==============================================================
+include("../build/moz.configure/nss.configure")
+
+
+set_config("MOZ_BACKGROUNDTASKS", False)
+
+
+set_config("MOZ_PREF_EXTENSIONS", False)
+
+# Offer a way to disable the startup cache
+# ==============================================================
+option("--disable-startupcache", help="Disable startup cache")
+
+
+@depends("--enable-startupcache")
+def enable_startupcache(value):
+    if value:
+        return True
+
+
+set_define(
+    "MOZ_DISABLE_STARTUPCACHE", True, when=depends(enable_startupcache)(lambda x: not x)
+)
+
+
+# Branding
+# ==============================================================
+
+option(
+    "--enable-official-branding",
+    help="Enable Official mozilla.org Branding. "
+    "Do not distribute builds with --enable-official-branding unless "
+    "you have permission to use trademarks per "
+    "http://www.mozilla.org/foundation/trademarks/",
+)
+
+with only_when("--enable-official-branding"):
+    set_config("MOZ_OFFICIAL_BRANDING", True)
+    set_define("MOZ_OFFICIAL_BRANDING", True)
+
+
+confvar(
+    "MOZ_BRANDING_DIRECTORY",
+    nargs=1,
+    set_as_config=False,
+    help="Path to the directory used for branding resources",
+)
+
+confvar(
+    "MOZ_OFFICIAL_BRANDING_DIRECTORY",
+    set_as_config=False,
+    allow_implied=True,
+    nargs=1,
+    help="Path to the directory used for official branding resources",
+)
+
+
+option(
+    "--with-branding", metavar="DIR", nargs=1, help="Use branding from directory DIR"
+)
+
+
+@depends("MOZ_OFFICIAL_BRANDING_DIRECTORY", when="--enable-official-branding")
+def check_official_branding_directory(moz_official_branding_directory):
+    if not moz_official_branding_directory:
+        die(
+            "MOZ_OFFICIAL_BRANDING_DIRECTORY must be set in a confvars.sh to use --enable-official-branding."
+        )
+
+
+@depends(
+    "--with-branding",
+    "--enable-official-branding",
+    "MOZ_OFFICIAL_BRANDING_DIRECTORY",
+    "MOZ_BRANDING_DIRECTORY",
+)
+def moz_branding_directory(
+    with_branding_dir,
+    moz_official_branding,
+    moz_official_branding_directory,
+    moz_branding_directory,
+):
+    if moz_official_branding:
+        return moz_official_branding_directory[0]
+    if with_branding_dir:
+        return with_branding_dir[0]
+    if moz_branding_directory:
+        return moz_branding_directory[0]
+
+
+set_config("MOZ_BRANDING_DIRECTORY", moz_branding_directory)
+
+
+@depends(moz_branding_directory, build_project)
+def real_branding_directory(moz_branding_directory, build_project):
+    if moz_branding_directory:
+        return moz_branding_directory
+    return f"{build_project}/branding/nightly"
+
+
+confvar(
+    "MOZ_APP_DISPLAYNAME",
+    nargs=1,
+    set_as_config=False,
+    help="Branded application name",
+)
+mangled_username = dependable(None)
+
+
+@depends("MOZ_APP_DISPLAYNAME", mangled_username)
+def moz_app_displayname(value, username):
+    if not value:
+        return
+
+    if username:
+        return f"{value[0]} {username}"
+
+    return value[0]
+
+
+set_define("MOZ_APP_UA_VERSION", depends(milestone.app_version)(lambda v: f'"{v}"'))
+
+set_config("MOZ_APP_DISPLAYNAME", moz_app_displayname)
+
+
+confvar(
+    "MOZ_DEV_EDITION",
+    nargs=1,
+    set_as_define=True,
+    help="Whether this a dev edition build",
+)
+
+confvar(
+    "MOZ_MACBUNDLE_ID",
+    nargs=1,
+    set_as_config=False,
+    help="ID of the associated mac bundle",
+)
+
+option(
+    env="MOZ_APP_REMOTINGNAME",
+    nargs=1,
+    help="Used for the internal program name, which affects profile name "
+    "and remoting. If not set, defaults to MOZ_APP_NAME if the update channel "
+    "is release, and MOZ_APP_NAME-MOZ_UPDATE_CHANNEL otherwise",
+)
+
+
+@depends("MOZ_APP_REMOTINGNAME", moz_app_name, update_channel)
+def moz_app_remotingname(value, moz_app_name, update_channel):
+    if value:
+        return value[0]
+    if update_channel == "release":
+        return moz_app_name
+    return moz_app_name + "-" + update_channel
+
+
+set_config("MOZ_APP_REMOTINGNAME", moz_app_remotingname)
+
+
+# Child Process Name for IPC
+# ==============================================================
+@depends(toolkit, bin_suffix(target))
+def moz_child_process_name(toolkit, bin_suffix):
+    return f"plugin-container{bin_suffix}"
+
+
+set_config("MOZ_CHILD_PROCESS_NAME", moz_child_process_name)
+
+set_config(
+    "MOZ_CHILD_PROCESS_APPNAME",
+    depends_if(moz_app_displayname)(lambda v: f"{v}CP"),
+)
+pass
+
+
+# Miscellaneous options
+# ==============================================================
+option(env="MOZ_WINCONSOLE", nargs="?", help="Whether we can create a console window")
+set_define("MOZ_WINCONSOLE", True, when=depends("MOZ_WINCONSOLE")(lambda x: x))
+
+# Wine
+# ==============================================================
+@depends(target, host)
+def want_wine(target, host):
+    return False
+
+
+wine = check_prog(
+    "WINE",
+    ["wine64", "wine"],
+    when=want_wine,
+    bootstrap="wine/bin",
+)
+system_lib_option(
+    "--with-system-libevent",
+    nargs="?",
+    help="Use system libevent",
+    when=use_pkg_config,
+)
+
+@depends("--with-system-libevent", when=use_pkg_config)
+def deprecated_system_libevent_path(value):
+    if len(value) == 1:
+        die(
+            "--with-system-libevent=PATH is not supported anymore. Please use "
+            "--with-system-libevent and set any necessary pkg-config environment variable."
+        )
+
+pkg_check_modules("MOZ_LIBEVENT", "libevent", when="--with-system-libevent")
+
+set_config("MOZ_SYSTEM_LIBEVENT", True, when="--with-system-libevent")
+
+
+# Gtk+
+# ==============================================================
+with only_when(toolkit_gtk):
+    pkg_check_modules(
+        "MOZ_GTK3",
+        "gtk+-3.0 >= 3.14.0 gtk+-unix-print-3.0 glib-2.0 gobject-2.0 gio-unix-2.0",
+    )
+
+    set_define("GDK_VERSION_MIN_REQUIRED", "GDK_VERSION_3_14")
+    set_define("GDK_VERSION_MAX_ALLOWED", "GDK_VERSION_3_14")
+
+    pkg_check_modules("GLIB", "glib-2.0 >= 2.42 gobject-2.0")
+
+    set_define("GLIB_VERSION_MIN_REQUIRED", "GLIB_VERSION_2_42")
+    set_define("GLIB_VERSION_MAX_ALLOWED", "GLIB_VERSION_2_42")
+
+    set_define("MOZ_ACCESSIBILITY_ATK", True, when=accessibility)
+
+# DBus
+# ==============================================================
+with only_when(toolkit_gtk):
+    option("--disable-dbus", help="Disable dbus support", when=use_pkg_config)
+
+    @depends("--enable-dbus", when=use_pkg_config)
+    def enable_dbus_option(enable_dbus):
+        return enable_dbus
+
+    with only_when(enable_dbus_option):
+        pkg_check_modules("MOZ_DBUS", "dbus-1 >= 0.60")
+
+        set_config("MOZ_ENABLE_DBUS", True)
+        set_define("MOZ_ENABLE_DBUS", True)
+
+
+# Necko's Linux Wi-Fi scanner
+# ==============================================================
+option("--disable-necko-wifi", help="Disable necko wifi scanner")
+
+set_config("NECKO_WIFI", True, when="--enable-necko-wifi")
+set_define("NECKO_WIFI", True, when="--enable-necko-wifi")
+
+
+@depends("--enable-necko-wifi", enable_dbus_option)
+def necko_wifi_dbus(necko_wifi, dbus):
+    if necko_wifi and not dbus:
+        die(
+            "Necko WiFi scanning needs DBus, remove --disable-dbus or use "
+            "--disable-necko-wifi"
+        )
+    return necko_wifi and dbus
+
+
+set_config("NECKO_WIFI_DBUS", True, when=necko_wifi_dbus)
+set_define("NECKO_WIFI_DBUS", True, when=necko_wifi_dbus)
+
+
+# Frontend JS debug mode
+# ==============================================================
+option("--enable-debug-js-modules", help="Enable debug mode for frontend JS libraries")
+
+set_config("DEBUG_JS_MODULES", True, when="--enable-debug-js-modules")
+
+
+# moz_dump_painting
+# ==============================================================
+option("--enable-dump-painting", help="Enable paint debugging")
+
+set_define(
+    "MOZ_DUMP_PAINTING",
+    True,
+    when=depends("--enable-dump-painting", "--enable-debug")(
+        lambda painting, debug: painting or debug
+    ),
+)
+set_define("MOZ_LAYERS_HAVE_LOG", True, when="--enable-dump-painting")
+
+
+# libproxy support
+# ==============================================================
+with only_when(toolkit_gtk):
+    system_lib_option(
+        "--enable-libproxy",
+        help="Enable libproxy support",
+        when=use_pkg_config,
+    )
+
+    with only_when("--enable-libproxy"):
+        pkg_check_modules("MOZ_LIBPROXY", "libproxy-1.0")
+
+        set_config("MOZ_ENABLE_LIBPROXY", True)
+
+
+# Enable runtime logging
+# ==============================================================
+set_define("MOZ_LOGGING", True)
+set_define("FORCE_PR_LOG", True)
+
+# This will enable logging of addref, release, ctor, dtor.
+# ==============================================================
+option(
+    "--enable-logrefcnt",
+    default=moz_debug,
+    help="{Enable|Disable} logging of refcounts",
+)
+
+set_define("NS_BUILD_REFCNT_LOGGING", True, when="--enable-logrefcnt")
+
+
+# Package renaming
+# ==============================================================
+
+option(env="MOZ_SIMPLE_PACKAGE_NAME", nargs=1, help="Package name override")
+set_config(
+    "MOZ_SIMPLE_PACKAGE_NAME", depends_if("MOZ_SIMPLE_PACKAGE_NAME")(lambda x: x[0])
+)
+option(env="MOZ_PKG_SPECIAL", nargs=1, help="Name of special moz flavor")
+set_config("MOZ_PKG_SPECIAL", depends_if("MOZ_PKG_SPECIAL")(lambda x: x[0]))
+
+
+option(env="MOZ_PKG_PLATFORM", nargs=1, help="Override the package platform name")
+
+
+@depends(target, "MOZ_PKG_PLATFORM", "MOZ_PKG_SPECIAL")
+def moz_pkg_platform(target, override, special):
+    if override:
+        platform = override[0]
+    else:
+        # target.raw_os and target.raw_cpu can be unintuitive; hardcode
+        # the well-known platforms.
+        platform = f"{target.raw_os}-{target.raw_cpu}"
+        if target.raw_os == "linux-gnu":
+            platform = f"linux-{target.raw_cpu}"
+    if special:
+        platform = f"{platform}-{special[0]}"
+    return platform
+
+
+set_config("MOZ_PKG_PLATFORM", moz_pkg_platform)
+
+
+@depends(moz_pkg_platform, "MOZ_SIMPLE_PACKAGE_NAME")
+def pkg_langpack_path(platform, simple_name):
+    if simple_name:
+        return ""
+    return f"{platform}/xpi/"
+
+
+set_config("PKG_LANGPACK_PATH", pkg_langpack_path)
+
+
+option(
+    env="MOZ_PKG_APPNAME",
+    nargs=1,
+    help="Override the application name used in package file names",
+)
+
+
+@depends("MOZ_PKG_APPNAME", moz_app_name)
+def moz_pkg_appname(override, app_name):
+    if override:
+        return override[0]
+    return app_name
+
+
+set_config("MOZ_PKG_APPNAME", moz_pkg_appname)
+
+
+option(
+    env="MOZ_PKG_VERSION",
+    nargs=1,
+    help="Override the version used in package file names",
+)
+
+
+@depends("MOZ_PKG_VERSION", milestone.app_version)
+def moz_pkg_version(override, app_version):
+    if override:
+        return override[0]
+    return app_version
+
+
+set_config("MOZ_PKG_VERSION", moz_pkg_version)
+
+
+option(
+    env="MOZ_PKG_FORMAT",
+    nargs=1,
+    help="Override the package container format (TAR, TGZ, XZ, BZ2, ZIP, DMG, APK)",
+)
+
+
+@depends("MOZ_PKG_FORMAT", target, toolkit)
+def moz_pkg_format(override, target, toolkit):
+    if override:
+        return override[0]
+    pass
+    pass
+    pass
+    return "XZ"
+    pass
+    return "TGZ"
+
+
+set_config("MOZ_PKG_FORMAT", moz_pkg_format)
+
+
+@depends(moz_pkg_format)
+@imports(_from="mozbuild.action.package", _import="FORMAT_SUFFIX")
+def pkg_suffix(pkg_format):
+    return FORMAT_SUFFIX[pkg_format]
+
+
+set_config("PKG_SUFFIX", pkg_suffix)
+
+
+@depends("MOZ_DEV_EDITION")
+def moz_langpack_eid_host(dev_edition):
+    if dev_edition:
+        return "devedition.mozilla.org"
+    return "firefox.mozilla.org"
+
+
+set_config("MOZ_LANGPACK_EID_HOST", moz_langpack_eid_host)
+
+
+pkg_path = dependable("bin")
+set_config("MOZ_PKG_BINPATH", pkg_path, when=True)
+set_config("MOZ_PKG_RESPATH", pkg_path, when=True)
+
+
+# Smart card support
+# ==============================================================
+disable_smart_cards = dependable(True)
+set_config("MOZ_NO_SMART_CARDS", True, when=disable_smart_cards)
+set_define("MOZ_NO_SMART_CARDS", True, when=disable_smart_cards)
+
+
+# Update-related programs: updater, maintenance service, update agent,
+# default browser agent.
+# ==============================================================
+include("../build/moz.configure/update-programs.configure")
+
+
+# Per-format extra args passed to mozbuild.action.package
+# ==============================================================
+@depends(
+    moz_pkg_format,
+    enable_profile_use,
+)
+@imports("shlex")
+def moz_package_extra_args(
+    pkg_format,
+    profile_use,
+):
+    args = []
+    # For non-shippable builds, we would rather finish the build sooner
+    # than have optimal compression.
+    if pkg_format == "XZ" and profile_use:
+        args.append("--strong-compression")
+    return " ".join(shlex.quote(a) for a in args)
+
+
+set_config("MOZ_PACKAGE_EXTRA_ARGS", moz_package_extra_args)
+
+
+# JS Packaging
+# ==============================================================
+
+option(
+    env="MOZ_PACKAGE_JSSHELL",
+    help="Whether the installer bundles the JS shell",
+)
+set_config("MOZ_PACKAGE_JSSHELL", depends_if("MOZ_PACKAGE_JSSHELL")(lambda x: bool(x)))
+system_lib_option(
+    "--with-system-pixman",
+    help="Use system pixman (located with pkgconfig)",
+    when=use_pkg_config,
+)
+
+@depends("--with-system-pixman", when=use_pkg_config)
+def enable_system_pixman_option(enable_system_pixman):
+    return enable_system_pixman
+
+@depends(enable_system_pixman_option)
+def in_tree_pixman(pixman):
+    return not pixman
+
+set_config("MOZ_TREE_PIXMAN", True, when=in_tree_pixman)
+set_define("MOZ_TREE_PIXMAN", True, when=in_tree_pixman)
+
+pkg_check_modules("MOZ_PIXMAN", "pixman-1 >= 0.40.0", when="--with-system-pixman")
+# Set MOZ_PIXMAN_CFLAGS to an explicit empty value when --with-system-pixman is *not* used,
+# for layout/style/extra-bindgen-flags
+set_config("MOZ_PIXMAN_CFLAGS", [], when=in_tree_pixman)
+option("--disable-zipwriter", help="Disable zipwriter component")
+
+set_config("MOZ_ZIPWRITER", True, when="--enable-zipwriter")
+
+@depends(target)
+def default_user_appdir(target):
+    pass
+    return "mozilla"
+
+option(
+    "--with-user-appdir",
+    nargs=1,
+    default=default_user_appdir,
+    help="Set user-specific appdir",
+)
+
+@depends("--with-user-appdir")
+def user_appdir(appdir):
+    if not appdir:
+        die("--without-user-appdir is not a valid option.")
+    if "/" in appdir[0]:
+        die("--with-user-appdir must be a single relative path.")
+    return '"{}"'.format(appdir[0])
+
+@depends(depends("--with-user-appdir")(lambda x: x), when=toolkit_gtk)
+def forced_or_dotted_user_appdir(value):
+    return value.origin != "default" or value[0].startswith(".")
+
+set_define("MOZ_USER_DIR", user_appdir)
+set_define("MOZ_LEGACY_HOME", True, when=forced_or_dotted_user_appdir)
+have_sin_len = c_compiler.try_compile(
+    includes=["netinet/in.h"],
+    body="struct sockaddr_in x; void *foo = (void*) &x.sin_len;",
+    check_msg="for sin_len in struct sockaddr_in",
+)
+have_sin6_len = c_compiler.try_compile(
+    includes=["netinet/in.h"],
+    body="struct sockaddr_in6 x; void *foo = (void*) &x.sin6_len;",
+    check_msg="for sin_len6 in struct sockaddr_in6",
+)
+set_define("HAVE_SIN_LEN", have_sin_len)
+set_define("HAVE_SIN6_LEN", have_sin6_len)
+# HAVE_CONN_LEN must be the same as HAVE_SIN_LEN and HAVE_SIN6_LEN
+set_define("HAVE_SCONN_LEN", have_sin_len & have_sin6_len)
+set_define(
+    "HAVE_SA_LEN",
+    c_compiler.try_compile(
+        includes=["netinet/in.h"],
+        body="struct sockaddr x; void *foo = (void*) &x.sa_len;",
+        check_msg="for sa_len in struct sockaddr",
+    ),
+)
+set_define(
+    "HAVE_PTHREAD_COND_TIMEDWAIT_MONOTONIC",
+    c_compiler.try_compile(
+        includes=["pthread.h"],
+        body="pthread_cond_timedwait_monotonic_np(0, 0, 0);",
+        # -Werror to catch any "implicit declaration" warning that means the function
+        # is not supported.
+        flags=["-Werror=implicit-function-declaration"],
+        check_msg="for pthread_cond_timedwait_monotonic_np",
+    ),
+)
+
+
+# System policies
+# ==============================================================
+
+option(
+    "--disable-system-policies",
+    help="Disable reading policies from /etc/firefox",
+)
+
+set_config("MOZ_SYSTEM_POLICIES", True, when="--enable-system-policies")
+
+# System preferences
+# ==============================================================
+
+option(
+    "--disable-system-preferences",
+    help="Disable reading preferences from /etc/firefox",
+)
+
+set_config("MOZ_SYSTEM_PREFERENCES", True, when="--enable-system-preferences")
+set_define("MOZ_SYSTEM_PREFERENCES", True, when="--enable-system-preferences")
+
+# Allow disabling the creation a legacy profile
+# ==============================================================
+
+option(
+    "--disable-legacy-profile-creation",
+    help="Disable the creation a legacy profile, to be used by old versions "
+    "of Firefox, when no profiles exist",
+)
+
+set_config("MOZ_CREATE_LEGACY_PROFILE", True, when="--enable-legacy-profile-creation")
+
+
+# STL wrapping
+# ==============================================================
+set_config("WRAP_STL_INCLUDES", True)
+set_config(
+    "STL_FLAGS",
+    depends(build_environment.dist)(lambda dist: [f"-I{dist}/stl_wrappers"]),
+)
+
+
+# Perl detection
+# ==============================================================
+@depends(target)
+def need_perl(target):
+    # Ideally, we'd also depend on gnu_as here, but that adds complications.
+    return target.cpu == "arm"
+
+
+perl = check_prog("PERL", ("perl5", "perl"), when=need_perl)
+
+
+@template
+def perl_version_check(min_version):
+    @depends(perl)
+    @checking("for minimum required perl version >= %s" % min_version)
+    def get_perl_version(perl):
+        return Version(
+            check_cmd_output(
+                perl,
+                "-e",
+                "print $]",
+                onerror=lambda: die("Failed to get perl version."),
+            )
+        )
+
+    @depends(get_perl_version)
+    def check_perl_version(version):
+        if version < min_version:
+            die("Perl %s or higher is required.", min_version)
+
+    @depends(perl)
+    @checking("for full perl installation")
+    @imports("subprocess")
+    def has_full_perl_installation(perl):
+        ret = subprocess.call([perl, "-e", "use Config; exit(!-d $Config{archlib})"])
+        return ret == 0
+
+    @depends(has_full_perl_installation)
+    def require_full_perl_installation(has_full_perl_installation):
+        if not has_full_perl_installation:
+            die(
+                "Cannot find Config.pm or $Config{archlib}. "
+                "A full perl installation is required."
+            )
+
+
+with only_when(need_perl):
+    perl_version_check("5.006")
+
+
+set_config("ONNX_RUNTIME", False)
+
+
+option(
+    "--enable-appservices-in-tree",
+    help="Enables building from an in-tree app-services",
+)
+
+
+@depends("--enable-appservices-in-tree")
+def enable_appservices_in_tree(value):
+    if value:
+        return True
+
+
+set_config("MOZ_APPSERVICES_IN_TREE", enable_appservices_in_tree)

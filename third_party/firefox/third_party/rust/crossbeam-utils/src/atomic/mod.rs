@@ -1,0 +1,19 @@
+//! Atomic types.
+//!
+//! * [`AtomicCell`], a thread-safe mutable memory location.
+//! * [`AtomicConsume`], for reading from primitive atomic types with "consume" ordering.
+
+#[cfg(target_has_atomic = "ptr")]
+#[cfg(not(crossbeam_loom))]
+#[cfg_attr(any(target_pointer_width = "16", target_pointer_width = "32"), path = "seq_lock_wide.rs")]
+mod seq_lock;
+
+#[cfg(target_has_atomic = "ptr")]
+#[cfg(not(crossbeam_loom))]
+mod atomic_cell;
+#[cfg(target_has_atomic = "ptr")]
+#[cfg(not(crossbeam_loom))]
+pub use atomic_cell::AtomicCell;
+
+mod consume;
+pub use consume::AtomicConsume;

@@ -1,0 +1,995 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DNSPacket.h"
+
+#include "DNS.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "DNSLogging.h"
+
+#include "nsIInputStream.h"
+
+namespace mozilla {
+namespace net {
+
+static uint16_t get16bit(const unsigned char* aData, unsigned int index) {
+  return (static_cast<uint16_t>(aData[index]) << 8) |
+         static_cast<uint16_t>(aData[index + 1]);
+}
+
+static uint32_t get32bit(const unsigned char* aData, unsigned int index) {
+  return (static_cast<uint32_t>(aData[index]) << 24) |
+         (static_cast<uint32_t>(aData[index + 1]) << 16) |
+         (static_cast<uint32_t>(aData[index + 2]) << 8) |
+         static_cast<uint32_t>(aData[index + 3]);
+}
+
+bool hardFail(uint16_t code) {
+  const uint16_t noFallbackErrors[] = {
+      4,   
+      17,  
+  };
+
+  for (const auto& err : noFallbackErrors) {
+    if (code == err) {
+      return true;
+    }
+  }
+  return false;
+}
+
+nsresult DNSPacket::FillBuffer(
+    std::function<int(unsigned char response[MAX_SIZE])>&& aPredicate) {
+  int response_length = aPredicate(mResponse);
+  if (response_length < 0) {
+    LOG(("FillBuffer response len < 0"));
+    mBodySize = 0;
+    mStatus = NS_ERROR_UNEXPECTED;
+    return mStatus;
+  }
+
+  if (static_cast<uint32_t>(response_length) > MAX_SIZE) {
+    LOG(("FillBuffer response len %d > MAX_SIZE %u", response_length,
+         MAX_SIZE));
+    mBodySize = 0;
+    mStatus = NS_ERROR_UNEXPECTED;
+    return mStatus;
+  }
+
+  mBodySize = response_length;
+  return NS_OK;
+}
+nsresult DNSPacket::ParseSvcParam(unsigned int svcbIndex, uint16_t key,
+                                  SvcFieldValue& field, uint16_t length,
+                                  const unsigned char* aBuffer,
+                                  bool aAllowRFC1918) {
+  switch (key) {
+    case SvcParamKeyMandatory: {
+      if (length % 2 != 0) {
+        return NS_ERROR_UNEXPECTED;
+      }
+      while (length > 0) {
+        uint16_t mandatoryKey = get16bit(aBuffer, svcbIndex);
+        length -= 2;
+        svcbIndex += 2;
+
+        if (!IsValidSvcParamKey(mandatoryKey)) {
+          LOG(("The mandatory field includes a key we don't support %u",
+               mandatoryKey));
+          return NS_ERROR_UNEXPECTED;
+        }
+      }
+      break;
+    }
+    case SvcParamKeyAlpn: {
+      field.mValue = AsVariant(SvcParamAlpn());
+      auto& alpnArray = field.mValue.as<SvcParamAlpn>().mValue;
+      while (length > 0) {
+        uint8_t alpnIdLength = aBuffer[svcbIndex++];
+        length -= 1;
+        if (alpnIdLength > length) {
+          return NS_ERROR_UNEXPECTED;
+        }
+
+        alpnArray.AppendElement(
+            nsCString((const char*)&aBuffer[svcbIndex], alpnIdLength));
+        length -= alpnIdLength;
+        svcbIndex += alpnIdLength;
+      }
+      break;
+    }
+    case SvcParamKeyNoDefaultAlpn: {
+      if (length != 0) {
+        return NS_ERROR_UNEXPECTED;
+      }
+      field.mValue = AsVariant(SvcParamNoDefaultAlpn{});
+      break;
+    }
+    case SvcParamKeyPort: {
+      if (length != 2) {
+        return NS_ERROR_UNEXPECTED;
+      }
+      field.mValue =
+          AsVariant(SvcParamPort{.mValue = get16bit(aBuffer, svcbIndex)});
+      break;
+    }
+    case SvcParamKeyIpv4Hint: {
+      if (length % 4 != 0) {
+        return NS_ERROR_UNEXPECTED;
+      }
+
+      field.mValue = AsVariant(SvcParamIpv4Hint());
+      auto& ipv4array = field.mValue.as<SvcParamIpv4Hint>().mValue;
+      while (length > 0) {
+        NetAddr addr;
+        addr.inet.family = AF_INET;
+        addr.inet.port = 0;
+        addr.inet.ip = ntohl(get32bit(aBuffer, svcbIndex));
+        if (aAllowRFC1918 || !addr.IsIPAddrLocal()) {
+          ipv4array.AppendElement(addr);
+        }
+        length -= 4;
+        svcbIndex += 4;
+      }
+      break;
+    }
+    case SvcParamKeyEchConfig: {
+      field.mValue = AsVariant(SvcParamEchConfig{
+          .mValue = nsCString((const char*)(&aBuffer[svcbIndex]), length)});
+      break;
+    }
+    case SvcParamKeyIpv6Hint: {
+      if (length % 16 != 0) {
+        return NS_ERROR_UNEXPECTED;
+      }
+
+      field.mValue = AsVariant(SvcParamIpv6Hint());
+      auto& ipv6array = field.mValue.as<SvcParamIpv6Hint>().mValue;
+      while (length > 0) {
+        NetAddr addr;
+        addr.inet6.family = AF_INET6;
+        addr.inet6.port = 0;      
+        addr.inet6.flowinfo = 0;  
+        addr.inet6.scope_id = 0;  
+        for (int i = 0; i < 16; i++, svcbIndex++) {
+          addr.inet6.ip.u8[i] = aBuffer[svcbIndex];
+        }
+        if (aAllowRFC1918 || !addr.IsIPAddrLocal()) {
+          ipv6array.AppendElement(addr);
+        }
+        length -= 16;
+      }
+      break;
+    }
+    case SvcParamKeyODoHConfig: {
+      field.mValue = AsVariant(SvcParamODoHConfig{
+          .mValue = nsCString((const char*)(&aBuffer[svcbIndex]), length)});
+      break;
+    }
+    default: {
+      return NS_OK;
+      break;
+    }
+  }
+  return NS_OK;
+}
+
+nsresult DNSPacket::PassQName(unsigned int& index,
+                              const unsigned char* aBuffer) {
+  uint8_t length;
+  do {
+    if (mBodySize < (index + 1)) {
+      LOG(("TRR: PassQName:%d fail at index %d\n", __LINE__, index));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    length = static_cast<uint8_t>(aBuffer[index]);
+    if ((length & 0xc0) == 0xc0) {
+      if (mBodySize < (index + 2)) {
+        return NS_ERROR_ILLEGAL_VALUE;
+      }
+      index += 2;
+      break;
+    }
+    if (length & 0xc0) {
+      LOG(("TRR: illegal label length byte (%x) at index %d\n", length, index));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    if (mBodySize < (index + 1 + length)) {
+      LOG(("TRR: PassQName:%d fail at index %d\n", __LINE__, index));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    index += 1 + length;
+  } while (length);
+  return NS_OK;
+}
+
+nsresult DNSPacket::GetQname(nsACString& aQname, unsigned int& aIndex,
+                             const unsigned char* aBuffer,
+                             unsigned int aBodySize) {
+  uint8_t clength = 0;
+  unsigned int cindex = aIndex;
+  unsigned int loop = 128;    
+  unsigned int endindex = 0;  
+  do {
+    if (cindex >= aBodySize) {
+      LOG(("TRR: bad Qname packet\n"));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    clength = static_cast<uint8_t>(aBuffer[cindex]);
+    if ((clength & 0xc0) == 0xc0) {
+      if ((cindex + 1) >= aBodySize) {
+        return NS_ERROR_ILLEGAL_VALUE;
+      }
+      uint16_t newpos = (clength & 0x3f) << 8 | aBuffer[cindex + 1];
+      if (!endindex) {
+        endindex = cindex + 2;
+      }
+      cindex = newpos;
+      continue;
+    }
+    if (clength & 0xc0) {
+      LOG(("TRR: bad Qname packet\n"));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+
+    cindex++;
+
+    if (clength) {
+      if (!aQname.IsEmpty()) {
+        aQname.Append(".");
+      }
+      if ((cindex + clength) > aBodySize) {
+        return NS_ERROR_ILLEGAL_VALUE;
+      }
+      aQname.Append((const char*)(&aBuffer[cindex]), clength);
+      cindex += clength;  
+    }
+  } while (clength && --loop);
+
+  if (!loop) {
+    LOG(("DNSPacket::DohDecode pointer loop error\n"));
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
+  if (!endindex) {
+    endindex = cindex;
+  }
+  aIndex = endindex;
+  return NS_OK;
+}
+
+nsresult DOHresp::Add(uint32_t TTL, unsigned char const* dns,
+                      unsigned int index, uint16_t len, bool aLocalAllowed) {
+  NetAddr addr;
+  if (4 == len) {
+    addr.inet.family = AF_INET;
+    addr.inet.port = 0;  
+    addr.inet.ip = ntohl(get32bit(dns, index));
+  } else if (16 == len) {
+    addr.inet6.family = AF_INET6;
+    addr.inet6.port = 0;      
+    addr.inet6.flowinfo = 0;  
+    addr.inet6.scope_id = 0;  
+    for (int i = 0; i < 16; i++, index++) {
+      addr.inet6.ip.u8[i] = dns[index];
+    }
+  } else {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  if (addr.IsIPAddrLocal() && !aLocalAllowed) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (mAddresses.IsEmpty() || TTL < mTtl) {
+    mTtl = TTL;
+  }
+
+  if (LOG_ENABLED()) {
+    LOG(("DOHresp:Add %s\n", addr.ToString().get()));
+  }
+  mAddresses.AppendElement(addr);
+  return NS_OK;
+}
+
+nsresult DNSPacket::OnDataAvailable(nsIRequest* aRequest,
+                                    nsIInputStream* aInputStream,
+                                    uint64_t aOffset, const uint32_t aCount) {
+  if (aCount > MAX_SIZE - mBodySize) {
+    LOG(("DNSPacket::OnDataAvailable:%d fail\n", __LINE__));
+    return NS_ERROR_FAILURE;
+  }
+  uint32_t count;
+  nsresult rv =
+      aInputStream->Read((char*)mResponse + mBodySize, aCount, &count);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  mBodySize += count;
+  return NS_OK;
+}
+
+const uint8_t kDNS_CLASS_IN = 1;
+
+nsresult DNSPacket::EncodeHost(nsCString& aBody, const nsACString& aHost) {
+
+  int32_t index = 0;
+  int32_t offset = 0;
+  do {
+    bool dotFound = false;
+    int32_t labelLength;
+    index = aHost.FindChar('.', offset);
+    if (kNotFound != index) {
+      dotFound = true;
+      labelLength = index - offset;
+    } else {
+      labelLength = aHost.Length() - offset;
+    }
+    if (labelLength > 63) {
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    if (labelLength > 0) {
+      aBody += static_cast<unsigned char>(labelLength);
+      nsDependentCSubstring label = Substring(aHost, offset, labelLength);
+      aBody.Append(label);
+    }
+    if (!dotFound) {
+      aBody += '\0';  
+      break;
+    }
+    offset += labelLength + 1;  
+  } while (true);
+
+  return NS_OK;
+}
+
+nsresult DNSPacket::EncodeRequest(nsCString& aBody, const nsACString& aHost,
+                                  uint16_t aType, bool aDisableECS) {
+  aBody.Truncate();
+  aBody += '\0';
+  aBody += '\0';  
+  aBody += 0x01;  
+  aBody += '\0';  
+  aBody += '\0';
+  aBody += 1;  
+  aBody += '\0';
+  aBody += '\0';  
+  aBody += '\0';
+  aBody += '\0';  
+
+  char additionalRecords =
+      (aDisableECS || StaticPrefs::network_trr_padding()) ? 1 : 0;
+  aBody += '\0';               
+  aBody += additionalRecords;  
+
+
+  nsresult rv = EncodeHost(aBody, aHost);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  aBody += static_cast<uint8_t>(aType >> 8);  
+  aBody += static_cast<uint8_t>(aType);
+  aBody += '\0';           
+  aBody += kDNS_CLASS_IN;  
+
+  if (additionalRecords) {
+    aBody += '\0';  
+    aBody += '\0';
+    aBody += 41;  
+    aBody += 16;  
+    aBody +=
+        '\0';  
+    aBody += '\0';  
+    aBody += '\0';
+    aBody += '\0';
+    aBody += '\0';
+
+    unsigned int paddingLen = 0;
+    unsigned int rdlen = 0;
+    bool padding = StaticPrefs::network_trr_padding();
+    if (padding) {
+
+      unsigned int packetLen = aBody.Length() + 2 + 4;
+      if (aDisableECS) {
+        packetLen += 8;
+      }
+
+      uint32_t padTo = std::clamp<uint32_t>(
+          StaticPrefs::network_trr_padding_length(), 0, 1024);
+
+      if (padTo > 0) {
+        paddingLen = (padTo - (packetLen % padTo)) % padTo;
+      }
+      rdlen += 4 + paddingLen;
+    }
+    if (aDisableECS) {
+      rdlen += 8;
+    }
+
+    aBody += (char)((rdlen >> 8) & 0xff);  
+    aBody += (char)(rdlen & 0xff);
+
+
+    if (aDisableECS) {
+      aBody += '\0';  
+      aBody += 8;     
+
+      aBody += '\0';  
+      aBody += 4;     
+      aBody += '\0';  
+      aBody += 1;     
+
+      aBody += '\0';  
+      aBody += '\0';
+
+    }
+
+    if (padding) {
+      aBody += '\0';  
+      aBody += 12;    
+
+      aBody += (char)((paddingLen >> 8) & 0xff);
+      aBody += (char)(paddingLen & 0xff);
+      for (unsigned int i = 0; i < paddingLen; i++) {
+        aBody += '\0';
+      }
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult DNSPacket::ParseHTTPS(uint16_t aRDLen, struct SVCB& aParsed,
+                               unsigned int aIndex,
+                               const unsigned char* aBuffer,
+                               unsigned int aBodySize,
+                               const nsACString& aOriginHost,
+                               bool aAllowRFC1918) {
+  int32_t lastSvcParamKey = -1;
+  nsresult rv = NS_OK;
+  unsigned int svcbIndex = aIndex;
+  CheckedInt<uint16_t> available = aRDLen;
+
+  if (available.value() < 3) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  aParsed.mSvcFieldPriority = get16bit(aBuffer, svcbIndex);
+  svcbIndex += 2;
+
+  rv = GetQname(aParsed.mSvcDomainName, svcbIndex, aBuffer, aBodySize);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (aParsed.mSvcDomainName.IsEmpty()) {
+    if (aParsed.mSvcFieldPriority == 0) {
+      return NS_OK;
+    }
+
+    aParsed.mSvcDomainName = aOriginHost;
+  }
+
+  available -= (svcbIndex - aIndex);
+  if (!available.isValid()) {
+    return NS_ERROR_UNEXPECTED;
+  }
+  while (available.value() >= 4) {
+    struct SvcFieldValue value;
+    uint16_t key = get16bit(aBuffer, svcbIndex);
+    svcbIndex += 2;
+
+    if (key <= lastSvcParamKey) {
+      LOG(("SvcParamKeys not in increasing order"));
+      return NS_ERROR_UNEXPECTED;
+    }
+    lastSvcParamKey = key;
+
+    uint16_t len = get16bit(aBuffer, svcbIndex);
+    svcbIndex += 2;
+
+    available -= 4 + len;
+    if (!available.isValid()) {
+      return NS_ERROR_UNEXPECTED;
+    }
+
+    rv = ParseSvcParam(svcbIndex, key, value, len, aBuffer, aAllowRFC1918);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    svcbIndex += len;
+
+    if (key == SvcParamKeyMandatory || !IsValidSvcParamKey(key)) {
+      continue;
+    }
+
+    if (value.mValue.is<SvcParamIpv4Hint>() &&
+        !value.mValue.as<SvcParamIpv4Hint>().mValue.IsEmpty()) {
+      aParsed.mHasIPHints = true;
+    }
+    if (value.mValue.is<SvcParamIpv6Hint>() &&
+        !value.mValue.as<SvcParamIpv6Hint>().mValue.IsEmpty()) {
+      aParsed.mHasIPHints = true;
+    }
+    if (value.mValue.is<SvcParamEchConfig>()) {
+      aParsed.mHasEchConfig = true;
+      aParsed.mEchConfig = value.mValue.as<SvcParamEchConfig>().mValue;
+    }
+    if (value.mValue.is<SvcParamODoHConfig>()) {
+      aParsed.mODoHConfig = value.mValue.as<SvcParamODoHConfig>().mValue;
+    }
+    aParsed.mSvcFieldValue.AppendElement(value);
+  }
+
+  return NS_OK;
+}
+
+Result<uint8_t, nsresult> DNSPacket::GetRCode() const {
+  if (mBodySize < 12) {
+    LOG(("DNSPacket::GetRCode - packet too small"));
+    return Err(NS_ERROR_ILLEGAL_VALUE);
+  }
+
+  return mResponse[3] & 0x0F;
+}
+
+Result<bool, nsresult> DNSPacket::RecursionAvailable() const {
+  if (mBodySize < 12) {
+    LOG(("DNSPacket::GetRCode - packet too small"));
+    return Err(NS_ERROR_ILLEGAL_VALUE);
+  }
+
+  return mResponse[3] & 0x80;
+}
+
+nsresult DNSPacket::DecodeInternal(
+    nsCString& aHost, enum TrrType aType, nsCString& aCname, bool aAllowRFC1918,
+    DOHresp& aResp, TypeRecordResultType& aTypeResult,
+    nsClassHashtable<nsCStringHashKey, DOHresp>& aAdditionalRecords,
+    uint32_t& aTTL, const unsigned char* aBuffer, uint32_t aLen) {
+
+
+  unsigned int index = 12;
+  nsAutoCString host;
+  nsresult rv;
+  uint16_t extendedError = UINT16_MAX;
+
+  LOG(("doh decode %s %d bytes\n", aHost.get(), aLen));
+
+  aCname.Truncate();
+
+  aTypeResult = mozilla::AsVariant(Nothing());
+
+  if (aLen < 12) {
+    LOG(("TRR bad incoming DOH, eject!\n"));
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
+
+  if (!mNativePacket && (aBuffer[0] || aBuffer[1])) {
+    LOG(("Packet ID is unexpectedly non-zero"));
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
+
+  uint8_t rcode = mResponse[3] & 0x0F;
+  LOG(("TRR Decode %s RCODE %d\n", PromiseFlatCString(aHost).get(), rcode));
+
+  uint16_t questionRecords = get16bit(aBuffer, 4);  
+  while (questionRecords) {
+    nsAutoCString qname;
+    rv = GetQname(qname, index, aBuffer, mBodySize);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    if (host.IsEmpty()) {
+      host = qname;
+    } else if (!qname.IsEmpty()) {
+      host.Append(".");
+      host.Append(qname);
+    }
+    if (aLen < (index + 4)) {
+      LOG(("TRR Decode 3 index: %u size: %u", index, aLen));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    index += 4;  
+    questionRecords--;
+  }
+
+  uint16_t answerRecords = get16bit(aBuffer, 6);
+
+  LOG(("TRR Decode: %d answer records (%u bytes body) %s index=%u\n",
+       answerRecords, aLen, host.get(), index));
+
+  while (answerRecords) {
+    nsAutoCString qname;
+    rv = GetQname(qname, index, aBuffer, mBodySize);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    if (aLen < (index + 2)) {
+      LOG(("TRR: Dohdecode:%d fail at index %d\n", __LINE__, index + 2));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    uint16_t TYPE = get16bit(aBuffer, index);
+
+    index += 2;
+
+    if (aLen < (index + 2)) {
+      LOG(("TRR: Dohdecode:%d fail at index %d\n", __LINE__, index + 2));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    uint16_t CLASS = get16bit(aBuffer, index);
+    if (kDNS_CLASS_IN != CLASS) {
+      LOG(("TRR bad CLASS (%u) at index %d\n", CLASS, index));
+      return NS_ERROR_UNEXPECTED;
+    }
+    index += 2;
+
+    if (aLen < (index + 4)) {
+      LOG(("TRR: Dohdecode:%d fail at index %d\n", __LINE__, index));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    uint32_t TTL = get32bit(aBuffer, index);
+    index += 4;
+
+    if (aLen < (index + 2)) {
+      LOG(("TRR: Dohdecode:%d fail at index %d\n", __LINE__, index));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    uint16_t RDLENGTH = get16bit(aBuffer, index);
+    index += 2;
+
+    if (aLen < (index + RDLENGTH)) {
+      LOG(("TRR: Dohdecode:%d fail RDLENGTH=%d at index %d\n", __LINE__,
+           RDLENGTH, index));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+
+    if ((TYPE != TRRTYPE_CNAME) && (TYPE != TRRTYPE_HTTPSSVC) &&
+        (TYPE != static_cast<uint16_t>(aType))) {
+      LOG(("TRR: Dohdecode:%d asked for type %d got %d\n", __LINE__, aType,
+           TYPE));
+      index += RDLENGTH;
+      answerRecords--;
+      continue;
+    }
+
+    bool responseMatchesQuestion =
+        (qname.Length() == aHost.Length() ||
+         (aHost.Length() == qname.Length() + 1 && aHost.Last() == '.')) &&
+        StringBeginsWith(aHost, qname, nsCaseInsensitiveCStringComparator);
+
+    if (responseMatchesQuestion) {
+
+      switch (TYPE) {
+        case TRRTYPE_A:
+          if (RDLENGTH != 4) {
+            LOG(("TRR bad length for A (%u)\n", RDLENGTH));
+            return NS_ERROR_UNEXPECTED;
+          }
+          rv = aResp.Add(TTL, aBuffer, index, RDLENGTH, aAllowRFC1918);
+          if (NS_FAILED(rv)) {
+            LOG(
+                ("TRR:DohDecode failed: local IP addresses or unknown IP "
+                 "family\n"));
+            return rv;
+          }
+          break;
+        case TRRTYPE_AAAA:
+          if (RDLENGTH != 16) {
+            LOG(("TRR bad length for AAAA (%u)\n", RDLENGTH));
+            return NS_ERROR_UNEXPECTED;
+          }
+          rv = aResp.Add(TTL, aBuffer, index, RDLENGTH, aAllowRFC1918);
+          if (NS_FAILED(rv)) {
+            LOG(("TRR got unique/local IPv6 address!\n"));
+            return rv;
+          }
+          break;
+
+        case TRRTYPE_NS:
+          break;
+        case TRRTYPE_CNAME:
+          if (aCname.IsEmpty()) {
+            nsAutoCString qname;
+            unsigned int qnameindex = index;
+            rv = GetQname(qname, qnameindex, aBuffer, mBodySize);
+            if (NS_FAILED(rv)) {
+              return rv;
+            }
+            if (!qname.IsEmpty()) {
+              ToLowerCase(qname);
+              aCname = qname;
+              LOG(("DNSPacket::DohDecode CNAME host %s => %s\n", host.get(),
+                   aCname.get()));
+            } else {
+              LOG(("DNSPacket::DohDecode empty CNAME for host %s!\n",
+                   host.get()));
+            }
+          } else {
+            LOG(("DNSPacket::DohDecode CNAME - ignoring another entry\n"));
+          }
+          break;
+        case TRRTYPE_TXT: {
+          nsAutoCString txt;
+          unsigned int txtIndex = index;
+          uint16_t available = RDLENGTH;
+
+          while (available > 0) {
+            uint8_t characterStringLen = aBuffer[txtIndex++];
+            available--;
+            if (characterStringLen > available) {
+              LOG(("DNSPacket::DohDecode MALFORMED TXT RECORD\n"));
+              break;
+            }
+            txt.Append((const char*)(&aBuffer[txtIndex]), characterStringLen);
+            txtIndex += characterStringLen;
+            available -= characterStringLen;
+          }
+
+          if (!aTypeResult.is<TypeRecordTxt>()) {
+            aTypeResult = AsVariant(CopyableTArray<nsCString>());
+          }
+
+          {
+            auto& results = aTypeResult.as<TypeRecordTxt>();
+            results.AppendElement(txt);
+          }
+          if (aTTL > TTL) {
+            aTTL = TTL;
+          }
+          LOG(("DNSPacket::DohDecode TXT host %s => %s\n", host.get(),
+               txt.get()));
+
+          break;
+        }
+        case TRRTYPE_HTTPSSVC: {
+          struct SVCB parsed;
+
+          if (aType != TRRTYPE_HTTPSSVC) {
+            break;
+          }
+
+          rv = ParseHTTPS(RDLENGTH, parsed, index, aBuffer, mBodySize,
+                          mOriginHost ? *mOriginHost : qname, aAllowRFC1918);
+          if (NS_FAILED(rv)) {
+            return rv;
+          }
+
+          if (parsed.mSvcDomainName.IsEmpty() &&
+              parsed.mSvcFieldPriority == 0) {
+            continue;
+          }
+
+          if (aCname.IsEmpty() && parsed.mSvcFieldPriority == 0) {
+            if (parsed.mSvcDomainName.IsEmpty()) {
+              return NS_ERROR_UNEXPECTED;
+            }
+            aCname = parsed.mSvcDomainName;
+            aTypeResult = mozilla::AsVariant(Nothing());
+            ToLowerCase(aCname);
+            LOG(("DNSPacket::DohDecode HTTPSSVC AliasForm host %s => %s\n",
+                 host.get(), aCname.get()));
+            break;
+          }
+
+          aTTL = TTL;
+
+          if (!aTypeResult.is<TypeRecordHTTPSSVC>()) {
+            aTypeResult = mozilla::AsVariant(CopyableTArray<SVCB>());
+          }
+          {
+            auto& results = aTypeResult.as<TypeRecordHTTPSSVC>();
+            results.AppendElement(parsed);
+          }
+
+          break;
+        }
+        default:
+          LOG(("TRR unsupported TYPE (%u) RDLENGTH %u\n", TYPE, RDLENGTH));
+          break;
+      }
+    } else {
+      LOG(("TRR asked for %s data but got %s\n", aHost.get(), qname.get()));
+    }
+
+    index += RDLENGTH;
+    LOG(("done with record type %u len %u index now %u of %u\n", TYPE, RDLENGTH,
+         index, aLen));
+    answerRecords--;
+  }
+
+  uint16_t nsRecords = get16bit(aBuffer, 8);
+  LOG(("TRR Decode: %d ns records (%u bytes body)\n", nsRecords, aLen));
+  while (nsRecords) {
+    rv = PassQName(index, aBuffer);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+
+    if (aLen < (index + 8)) {
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    index += 2;  
+    index += 2;  
+    index += 4;  
+
+    if (aLen < (index + 2)) {
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    uint16_t RDLENGTH = get16bit(aBuffer, index);
+    index += 2;
+    if (aLen < (index + RDLENGTH)) {
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    index += RDLENGTH;
+    LOG(("done with nsRecord now %u of %u\n", index, aLen));
+    nsRecords--;
+  }
+
+  uint16_t arRecords = get16bit(aBuffer, 10);
+  LOG(("TRR Decode: %d additional resource records (%u bytes body)\n",
+       arRecords, aLen));
+
+  while (arRecords) {
+    nsAutoCString qname;
+    rv = GetQname(qname, index, aBuffer, mBodySize);
+    if (NS_FAILED(rv)) {
+      LOG(("Bad qname for additional record"));
+      return rv;
+    }
+
+    if (aLen < (index + 8)) {
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    uint16_t type = get16bit(aBuffer, index);
+    index += 2;
+    uint16_t cls = get16bit(aBuffer, index);
+    index += 2;
+    uint32_t ttl = get32bit(aBuffer, index);
+    index += 4;
+
+    if (aLen < (index + 2)) {
+      LOG(("Record too small"));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+
+    uint16_t rdlength = get16bit(aBuffer, index);
+    index += 2;
+    if (aLen < (index + rdlength)) {
+      LOG(("rdlength too big"));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+
+    auto parseRecord = [&]() {
+      LOG(("Parsing additional record type: %u", type));
+      auto* entry = aAdditionalRecords.GetOrInsertNew(qname);
+
+      switch (type) {
+        case TRRTYPE_A:
+          if (kDNS_CLASS_IN != cls) {
+            LOG(("NOT IN - returning"));
+            return;
+          }
+          if (rdlength != 4) {
+            LOG(("TRR bad length for A (%u)\n", rdlength));
+            return;
+          }
+          rv = entry->Add(ttl, aBuffer, index, rdlength, aAllowRFC1918);
+          if (NS_FAILED(rv)) {
+            LOG(
+                ("TRR:DohDecode failed: local IP addresses or unknown IP "
+                 "family\n"));
+            return;
+          }
+          break;
+        case TRRTYPE_AAAA:
+          if (kDNS_CLASS_IN != cls) {
+            LOG(("NOT IN - returning"));
+            return;
+          }
+          if (rdlength != 16) {
+            LOG(("TRR bad length for AAAA (%u)\n", rdlength));
+            return;
+          }
+          rv = entry->Add(ttl, aBuffer, index, rdlength, aAllowRFC1918);
+          if (NS_FAILED(rv)) {
+            LOG(("TRR got unique/local IPv6 address!\n"));
+            return;
+          }
+          break;
+        case TRRTYPE_OPT: {  
+          LOG(("Parsing opt rdlen: %u", rdlength));
+          unsigned int offset = 0;
+          while (offset + 2 <= rdlength) {
+            uint16_t optCode = get16bit(aBuffer, index + offset);
+            LOG(("optCode: %u", optCode));
+            offset += 2;
+            if (offset + 2 > rdlength) {
+              break;
+            }
+            uint16_t optLen = get16bit(aBuffer, index + offset);
+            LOG(("optLen: %u", optLen));
+            offset += 2;
+            if (offset + optLen > rdlength) {
+              LOG(("offset: %u, optLen: %u, rdlen: %u", offset, optLen,
+                   rdlength));
+              break;
+            }
+
+            LOG(("OPT: code: %u len:%u", optCode, optLen));
+
+            if (optCode != 15) {
+              offset += optLen;
+              continue;
+            }
+
+
+            if (offset + 2 > rdlength || optLen < 2) {
+              break;
+            }
+            extendedError = get16bit(aBuffer, index + offset);
+
+            LOG(("Extended error code: %u message: %s", extendedError,
+                 nsAutoCString((char*)aBuffer + index + offset + 2, optLen - 2)
+                     .get()));
+            offset += optLen;
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    };
+
+    parseRecord();
+
+    index += rdlength;
+    LOG(("done with additional rr now %u of %u\n", index, aLen));
+    arRecords--;
+  }
+
+  if (index != aLen) {
+    LOG(("DohDecode failed to parse entire response body, %u out of %u bytes\n",
+         index, aLen));
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
+
+  if (aType == TRRTYPE_NS && rcode != 0) {
+    return NS_ERROR_UNKNOWN_HOST;
+  }
+
+  if ((aType != TRRTYPE_NS) && aCname.IsEmpty() && aResp.mAddresses.IsEmpty() &&
+      aTypeResult.is<TypeRecordEmpty>()) {
+    LOG(("TRR: No entries were stored!\n"));
+
+    if (extendedError != UINT16_MAX &&
+        StaticPrefs::network_trr_hard_fail_on_extended_error() &&
+        hardFail(extendedError)) {
+      return NS_ERROR_DEFINITIVE_UNKNOWN_HOST;
+    }
+    return NS_ERROR_UNKNOWN_HOST;
+  }
+
+  if (aTypeResult.is<TypeRecordHTTPSSVC>()) {
+    auto& results = aTypeResult.as<TypeRecordHTTPSSVC>();
+    results.Sort();
+  }
+
+  return NS_OK;
+}
+
+nsresult DNSPacket::Decode(
+    nsCString& aHost, enum TrrType aType, nsCString& aCname, bool aAllowRFC1918,
+    DOHresp& aResp, TypeRecordResultType& aTypeResult,
+    nsClassHashtable<nsCStringHashKey, DOHresp>& aAdditionalRecords,
+    uint32_t& aTTL) {
+  nsresult rv =
+      DecodeInternal(aHost, aType, aCname, aAllowRFC1918, aResp, aTypeResult,
+                     aAdditionalRecords, aTTL, mResponse, mBodySize);
+  mStatus = rv;
+  return rv;
+}
+
+}  
+}  

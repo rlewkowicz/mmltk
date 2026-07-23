@@ -1,0 +1,173 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsDataChannel.h"
+
+#include "mozilla/Base64.h"
+#include "mozilla/dom/MimeType.h"
+#include "mozilla/net/NeckoChild.h"
+#include "mozilla/net/NeckoCommon.h"
+#include "nsDataHandler.h"
+#include "nsIInputStream.h"
+#include "nsEscape.h"
+#include "nsISupports.h"
+#include "nsStringStream.h"
+#include "nsIObserverService.h"
+#include "mozilla/dom/ContentChild.h"
+#include "../protocol/http/nsHttpHandler.h"
+
+using namespace mozilla;
+using namespace mozilla::net;
+
+NS_IMPL_ISUPPORTS_INHERITED(nsDataChannel, nsBaseChannel, nsIDataChannel,
+                            nsIIdentChannel, nsIChildChannel)
+
+const nsACString& Unescape(const nsACString& aStr, nsACString& aBuffer,
+                           nsresult* rv) {
+  MOZ_ASSERT(rv);
+
+  bool appended = false;
+  *rv = NS_UnescapeURL(aStr.Data(), aStr.Length(),  0, aBuffer,
+                       appended, mozilla::fallible);
+  if (NS_FAILED(*rv) || !appended) {
+    return aStr;
+  }
+
+  return aBuffer;
+}
+
+nsresult nsDataChannel::OpenContentStream(bool async, nsIInputStream** result,
+                                          nsIChannel** channel) {
+  NS_ENSURE_TRUE(URI(), NS_ERROR_NOT_INITIALIZED);
+
+  nsresult rv;
+
+
+  nsAutoCString spec;
+  rv = URI()->GetSpec(spec);
+  if (NS_FAILED(rv)) return rv;
+
+  nsCString contentType, contentCharset;
+  nsDependentCSubstring dataRange;
+  RefPtr<CMimeType> fullMimeType;
+  bool lBase64;
+  rv = nsDataHandler::ParseURI(spec, contentType, &contentCharset, lBase64,
+                               &dataRange, &fullMimeType);
+  if (NS_FAILED(rv)) return rv;
+
+  nsAutoCString unescapedBuffer;
+  const nsACString& data = Unescape(dataRange, unescapedBuffer, &rv);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (lBase64 && &data == &unescapedBuffer) {
+    unescapedBuffer.StripWhitespace();
+  }
+
+  nsCOMPtr<nsIInputStream> bufInStream;
+  uint32_t contentLen;
+  if (lBase64) {
+    nsAutoCString decodedData;
+    rv = Base64Decode(data, decodedData);
+    if (NS_FAILED(rv)) {
+      return NS_ERROR_MALFORMED_URI;
+    }
+
+    contentLen = decodedData.Length();
+    rv = NS_NewCStringInputStream(getter_AddRefs(bufInStream), decodedData);
+  } else {
+    contentLen = data.Length();
+    rv = NS_NewCStringInputStream(getter_AddRefs(bufInStream), data);
+  }
+
+  if (NS_FAILED(rv)) return rv;
+
+  SetContentType(contentType);
+  SetContentCharset(contentCharset);
+  SetFullMimeType(std::move(fullMimeType));
+  mContentLength = contentLen;
+
+  MaybeSendDataChannelOpenNotification();
+
+  bufInStream.forget(result);
+
+  return NS_OK;
+}
+
+nsresult nsDataChannel::Init() {
+  NS_ENSURE_STATE(mLoadInfo);
+
+  RefPtr<nsHttpHandler> handler = nsHttpHandler::GetInstance();
+  mChannelId = handler->NewChannelId();
+  return NS_OK;
+}
+
+nsresult nsDataChannel::MaybeSendDataChannelOpenNotification() {
+  nsCOMPtr<nsIObserverService> obsService = services::GetObserverService();
+  if (!obsService) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo;
+  nsresult rv = GetLoadInfo(getter_AddRefs(loadInfo));
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  bool isTopLevel;
+  rv = loadInfo->GetIsTopLevelLoad(&isTopLevel);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  uint64_t browsingContextID;
+  rv = loadInfo->GetBrowsingContextID(&browsingContextID);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if ((browsingContextID != 0 && isTopLevel) ||
+      !loadInfo->TriggeringPrincipal()->IsSystemPrincipal()) {
+    obsService->NotifyObservers(static_cast<nsIIdentChannel*>(this),
+                                "data-channel-opened", nullptr);
+  }
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+nsDataChannel::GetChannelId(uint64_t* aChannelId) {
+  *aChannelId = mChannelId;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsDataChannel::SetChannelId(uint64_t aChannelId) {
+  mChannelId = aChannelId;
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+nsDataChannel::ConnectParent(uint32_t aId) {
+  if (!IsNeckoChild()) {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  mozilla::dom::ContentChild* cc =
+      static_cast<mozilla::dom::ContentChild*>(gNeckoChild->Manager());
+  if (cc->IsShuttingDown()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  gNeckoChild->SendConnectBaseChannel(aId);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsDataChannel::CompleteRedirectSetup(nsIStreamListener* aListener) {
+  return AsyncOpen(aListener);
+}

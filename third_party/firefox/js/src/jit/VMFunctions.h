@@ -1,0 +1,641 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_VMFunctions_h
+#define jit_VMFunctions_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/HashFunctions.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "jstypes.h"
+#include "NamespaceImports.h"
+
+#include "gc/AllocKind.h"
+#include "js/ScalarType.h"
+#include "js/TypeDecls.h"
+#include "vm/TypeofEqOperand.h"
+#include "vm/UsingHint.h"
+
+class JSJitInfo;
+class JSLinearString;
+
+namespace js {
+
+class AbstractGeneratorObject;
+class ArrayObject;
+class DateObject;
+class FixedLengthTypedArrayObject;
+class GlobalObject;
+class InterpreterFrame;
+class LexicalScope;
+class ClassBodyScope;
+class MapObject;
+class NativeObject;
+class PlainObject;
+class PropertyName;
+class SetObject;
+class Shape;
+class TypedArrayObject;
+class WithScope;
+class MegamorphicCacheEntry;
+
+namespace gc {
+
+class AllocSite;
+class Cell;
+
+}  
+
+namespace wasm {
+
+class AnyRef;
+
+}  
+
+namespace jit {
+
+class BaselineFrame;
+class InterpreterStubExitFrameLayout;
+
+enum DataType : uint8_t {
+  Type_Void,
+  Type_Bool,
+  Type_Int32,
+  Type_Double,
+  Type_Pointer,
+  Type_Cell,
+  Type_Value,
+  Type_Handle
+};
+
+
+struct VMFunctionData {
+#if defined(DEBUG) || defined(JS_JITSPEW) || defined(JS_ION_PERF)
+  const char* name_;
+#endif
+
+  enum RootType : uint8_t {
+    RootNone = 0,
+    RootObject,
+    RootString,
+    RootId,
+    RootValue,
+    RootCell,
+    RootBigInt
+  };
+
+  uint64_t argumentRootTypes;
+
+  enum ArgProperties {
+    WordByValue = 0,
+    DoubleByValue = 1,
+    WordByRef = 2,
+    DoubleByRef = 3,
+    Word = 0,
+    Double = 1,
+    ByRef = 2
+  };
+
+  uint32_t argumentProperties;
+
+  uint32_t argumentPassedInFloatRegs;
+
+  uint8_t explicitArgs;
+
+  RootType outParamRootType;
+
+  DataType outParam;
+
+  DataType returnType;
+
+  uint8_t extraValuesToPop;
+
+  uint32_t argc() const {
+    return 1 + explicitArgc() + ((outParam == Type_Void) ? 0 : 1);
+  }
+
+  DataType failType() const { return returnType; }
+
+  bool returnsData() const {
+    return returnType == Type_Cell || outParam != Type_Void;
+  }
+
+  ArgProperties argProperties(uint32_t explicitArg) const {
+    return ArgProperties((argumentProperties >> (2 * explicitArg)) & 3);
+  }
+
+  RootType argRootType(uint32_t explicitArg) const {
+    return RootType((argumentRootTypes >> (3 * explicitArg)) & 7);
+  }
+
+  bool argPassedInFloatReg(uint32_t explicitArg) const {
+    return ((argumentPassedInFloatRegs >> explicitArg) & 1) == 1;
+  }
+
+#if defined(DEBUG) || defined(JS_JITSPEW) || defined(JS_ION_PERF)
+  const char* name() const { return name_; }
+#endif
+
+  size_t explicitStackSlots() const {
+    size_t stackSlots = explicitArgs;
+
+    uint32_t n = ((1 << (explicitArgs * 2)) - 1)  
+                 & 0x55555555                     
+                 & argumentProperties;
+
+    while (n) {
+      stackSlots++;
+      n &= n - 1;
+    }
+    return stackSlots;
+  }
+
+  size_t explicitArgc() const {
+    size_t stackSlots = explicitArgs;
+
+    uint32_t n = ((1 << (explicitArgs * 2)) - 1)  
+                 & argumentProperties;
+
+    n = (n & 0x55555555) & ~(n >> 1);
+
+    while (n) {
+      stackSlots++;
+      n &= n - 1;
+    }
+    return stackSlots;
+  }
+
+  size_t doubleByRefArgs() const {
+    size_t count = 0;
+
+    uint32_t n = ((1 << (explicitArgs * 2)) - 1)  
+                 & argumentProperties;
+
+    n = (n & 0x55555555) & (n >> 1);
+
+    while (n) {
+      count++;
+      n &= n - 1;
+    }
+    return count;
+  }
+
+  size_t sizeOfOutParamStackSlot() const;
+
+  constexpr VMFunctionData(const char* name, uint32_t explicitArgs,
+                           uint32_t argumentProperties,
+                           uint32_t argumentPassedInFloatRegs,
+                           uint64_t argRootTypes, DataType outParam,
+                           RootType outParamRootType, DataType returnType,
+                           uint8_t extraValuesToPop = 0)
+      :
+#if defined(DEBUG) || defined(JS_JITSPEW) || defined(JS_ION_PERF)
+        name_(name),
+#endif
+        argumentRootTypes(argRootTypes),
+        argumentProperties(argumentProperties),
+        argumentPassedInFloatRegs(argumentPassedInFloatRegs),
+        explicitArgs(explicitArgs),
+        outParamRootType(outParamRootType),
+        outParam(outParam),
+        returnType(returnType),
+        extraValuesToPop(extraValuesToPop) {
+    MOZ_ASSERT_IF(outParam != Type_Void,
+                  returnType == Type_Void || returnType == Type_Bool);
+    MOZ_ASSERT(returnType == Type_Void || returnType == Type_Bool ||
+               returnType == Type_Cell);
+  }
+
+  constexpr VMFunctionData(const VMFunctionData& o) = default;
+};
+
+template <typename... ArgTypes>
+struct LastArg;
+
+template <>
+struct LastArg<> {
+  using Type = void;
+};
+
+template <typename HeadType>
+struct LastArg<HeadType> {
+  using Type = HeadType;
+};
+
+template <typename HeadType, typename... TailTypes>
+struct LastArg<HeadType, TailTypes...> {
+  using Type = typename LastArg<TailTypes...>::Type;
+};
+
+[[nodiscard]] bool InvokeFunction(JSContext* cx, HandleObject obj0,
+                                  bool constructing, bool ignoresReturnValue,
+                                  uint32_t argc, Value* argv,
+                                  MutableHandleValue rval);
+
+bool InvokeFromInterpreterStub(JSContext* cx,
+                               InterpreterStubExitFrameLayout* frame);
+void* GetContextSensitiveInterpreterStub();
+
+bool CheckOverRecursed(JSContext* cx);
+bool CheckOverRecursedBaseline(JSContext* cx, BaselineFrame* frame);
+
+[[nodiscard]] bool MutatePrototype(JSContext* cx, Handle<PlainObject*> obj,
+                                   HandleValue value);
+
+enum class EqualityKind : bool { NotEqual, Equal };
+
+template <EqualityKind Kind>
+bool StringsEqual(JSContext* cx, HandleString lhs, HandleString rhs, bool* res);
+
+enum class ComparisonKind : bool { GreaterThanOrEqual, LessThan };
+
+template <ComparisonKind Kind>
+bool StringsCompare(JSContext* cx, HandleString lhs, HandleString rhs,
+                    bool* res);
+
+JSString* ArrayJoin(JSContext* cx, HandleObject array, HandleString sep);
+[[nodiscard]] bool SetArrayLength(JSContext* cx, HandleObject obj,
+                                  HandleValue value, bool strict);
+
+[[nodiscard]] bool CharCodeAt(JSContext* cx, HandleString str, int32_t index,
+                              uint32_t* code);
+[[nodiscard]] bool CodePointAt(JSContext* cx, HandleString str, int32_t index,
+                               uint32_t* code);
+JSLinearString* StringFromCharCodeNoGC(JSContext* cx, int32_t code);
+JSLinearString* LinearizeForCharAccessPure(JSString* str);
+JSLinearString* LinearizeForCharAccess(JSContext* cx, JSString* str);
+int32_t StringTrimStartIndex(const JSString* str);
+int32_t StringTrimEndIndex(const JSString* str, int32_t start);
+JSString* CharCodeToLowerCase(JSContext* cx, int32_t code);
+JSString* CharCodeToUpperCase(JSContext* cx, int32_t code);
+
+[[nodiscard]] bool SetProperty(JSContext* cx, HandleObject obj,
+                               Handle<PropertyName*> name, HandleValue value,
+                               bool strict, jsbytecode* pc);
+
+[[nodiscard]] bool InterruptCheck(JSContext* cx);
+
+JSObject* NewStringObject(JSContext* cx, HandleString str);
+
+bool OperatorIn(JSContext* cx, HandleValue key, HandleObject obj, bool* out);
+
+[[nodiscard]] bool GetIntrinsicValue(JSContext* cx, Handle<PropertyName*> name,
+                                     MutableHandleValue rval);
+
+[[nodiscard]] bool CreateThisFromIC(JSContext* cx, HandleObject callee,
+                                    HandleObject newTarget, Value* argv,
+                                    uint32_t argc, MutableHandleValue rval);
+[[nodiscard]] bool CreateThisFromICWithAllocSite(
+    JSContext* cx, HandleObject callee, HandleObject newTarget,
+    gc::AllocSite* site, Value* argv, uint32_t argc, MutableHandleValue rval);
+[[nodiscard]] bool CreateThisFromIon(JSContext* cx, HandleObject callee,
+                                     HandleObject newTarget,
+                                     MutableHandleValue rval);
+
+void PostWriteBarrier(JSRuntime* rt, js::gc::Cell* cell);
+void PostGlobalWriteBarrier(JSRuntime* rt, GlobalObject* obj);
+
+void PostWriteElementBarrier(JSRuntime* rt, JSObject* obj, int32_t index);
+
+bool GetInt32FromStringPure(JSContext* cx, JSString* str, int32_t* result);
+
+int32_t GetIndexFromString(JSString* str);
+
+JSObject* WrapObjectPure(JSContext* cx, JSObject* obj);
+
+[[nodiscard]] bool DebugPrologue(JSContext* cx, BaselineFrame* frame);
+[[nodiscard]] bool DebugEpilogue(JSContext* cx, BaselineFrame* frame,
+                                 const jsbytecode* pc, bool ok);
+[[nodiscard]] bool DebugEpilogueOnBaselineReturn(JSContext* cx,
+                                                 BaselineFrame* frame,
+                                                 const jsbytecode* pc);
+void FrameIsDebuggeeCheck(BaselineFrame* frame);
+
+JSObject* CreateGeneratorFromFrame(JSContext* cx, BaselineFrame* frame);
+JSObject* CreateGenerator(JSContext* cx, HandleFunction, HandleScript,
+                          HandleObject, HandleObject);
+
+[[nodiscard]] bool NormalSuspend(JSContext* cx, HandleObject obj,
+                                 BaselineFrame* frame, uint32_t frameSize,
+                                 const jsbytecode* pc);
+[[nodiscard]] bool FinalSuspend(JSContext* cx, HandleObject obj,
+                                const jsbytecode* pc);
+[[nodiscard]] bool InterpretResume(JSContext* cx, HandleObject obj,
+                                   Value* stackValues, MutableHandleValue rval);
+[[nodiscard]] bool DebugAfterYield(JSContext* cx, BaselineFrame* frame);
+[[nodiscard]] bool GeneratorThrowOrReturn(
+    JSContext* cx, BaselineFrame* frame,
+    Handle<AbstractGeneratorObject*> genObj, HandleValue arg,
+    int32_t resumeKindArg);
+
+[[nodiscard]] bool GlobalDeclInstantiationFromIon(JSContext* cx,
+                                                  HandleScript script,
+                                                  const jsbytecode* pc);
+[[nodiscard]] bool InitFunctionEnvironmentObjects(JSContext* cx,
+                                                  BaselineFrame* frame);
+
+[[nodiscard]] bool NewArgumentsObject(JSContext* cx, BaselineFrame* frame,
+                                      MutableHandleValue res);
+
+ArrayObject* NewArrayObjectEnsureDenseInitLength(JSContext* cx, int32_t count);
+
+ArrayObject* InitRestParameter(JSContext* cx, uint32_t length, Value* rest,
+                               Handle<ArrayObject*> arrRes);
+
+[[nodiscard]] bool HandleDebugTrap(JSContext* cx, BaselineFrame* frame,
+                                   const uint8_t* retAddr);
+[[nodiscard]] bool OnDebuggerStatement(JSContext* cx, BaselineFrame* frame);
+[[nodiscard]] bool GlobalHasLiveOnDebuggerStatement(JSContext* cx);
+
+[[nodiscard]] bool EnterWith(JSContext* cx, BaselineFrame* frame,
+                             HandleValue val, Handle<WithScope*> templ);
+[[nodiscard]] bool LeaveWith(JSContext* cx, BaselineFrame* frame);
+
+[[nodiscard]] bool PushLexicalEnv(JSContext* cx, BaselineFrame* frame,
+                                  Handle<LexicalScope*> scope);
+[[nodiscard]] bool PushClassBodyEnv(JSContext* cx, BaselineFrame* frame,
+                                    Handle<ClassBodyScope*> scope);
+[[nodiscard]] bool DebugLeaveThenPopLexicalEnv(JSContext* cx,
+                                               BaselineFrame* frame,
+                                               const jsbytecode* pc);
+[[nodiscard]] bool FreshenLexicalEnv(JSContext* cx, BaselineFrame* frame);
+[[nodiscard]] bool DebuggeeFreshenLexicalEnv(JSContext* cx,
+                                             BaselineFrame* frame,
+                                             const jsbytecode* pc);
+[[nodiscard]] bool RecreateLexicalEnv(JSContext* cx, BaselineFrame* frame);
+[[nodiscard]] bool DebuggeeRecreateLexicalEnv(JSContext* cx,
+                                              BaselineFrame* frame,
+                                              const jsbytecode* pc);
+[[nodiscard]] bool DebugLeaveLexicalEnv(JSContext* cx, BaselineFrame* frame,
+                                        const jsbytecode* pc);
+
+[[nodiscard]] bool PushVarEnv(JSContext* cx, BaselineFrame* frame,
+                              Handle<Scope*> scope);
+
+void InitBaselineFrameForOsr(BaselineFrame* frame,
+                             InterpreterFrame* interpFrame,
+                             uint32_t numStackValues);
+
+JSString* StringReplace(JSContext* cx, HandleString string,
+                        HandleString pattern, HandleString repl);
+
+void AssertValidBigIntPtr(JSContext* cx, JS::BigInt* bi);
+void AssertValidObjectPtr(JSContext* cx, JSObject* obj);
+void AssertValidStringPtr(JSContext* cx, JSString* str);
+void AssertValidSymbolPtr(JSContext* cx, JS::Symbol* sym);
+void AssertValidValue(JSContext* cx, Value* v);
+
+void JitValuePreWriteBarrier(JSRuntime* rt, Value* vp);
+void JitStringPreWriteBarrier(JSRuntime* rt, JSString** stringp);
+void JitObjectPreWriteBarrier(JSRuntime* rt, JSObject** objp);
+void JitShapePreWriteBarrier(JSRuntime* rt, Shape** shapep);
+void JitWasmAnyRefPreWriteBarrier(JSRuntime* rt, wasm::AnyRef* refp);
+
+bool ObjectIsCallable(JSObject* obj);
+bool ObjectIsConstructor(JSObject* obj);
+JSObject* ObjectKeys(JSContext* cx, HandleObject obj);
+JSObject* ObjectKeysFromIterator(JSContext* cx, HandleObject iterObj);
+
+[[nodiscard]] bool ThrowRuntimeLexicalError(JSContext* cx,
+                                            unsigned errorNumber);
+
+[[nodiscard]] bool ThrowBadDerivedReturnOrUninitializedThis(JSContext* cx,
+                                                            HandleValue v);
+
+[[nodiscard]] bool BaselineGetFunctionThis(JSContext* cx, BaselineFrame* frame,
+                                           MutableHandleValue res);
+
+[[nodiscard]] bool CallNativeGetter(JSContext* cx, HandleFunction callee,
+                                    HandleValue receiver,
+                                    MutableHandleValue result);
+
+bool CallDOMGetter(JSContext* cx, const JSJitInfo* jitInfo, HandleObject obj,
+                   MutableHandleValue result);
+
+bool CallDOMSetter(JSContext* cx, const JSJitInfo* jitInfo, HandleObject obj,
+                   HandleValue value);
+
+[[nodiscard]] bool CallNativeSetter(JSContext* cx, HandleFunction callee,
+                                    HandleObject obj, HandleValue rhs);
+
+[[nodiscard]] bool EqualStringsHelperPure(JSString* str1, JSString* str2);
+
+void HandleCodeCoverageAtPC(BaselineFrame* frame, jsbytecode* pc);
+void HandleCodeCoverageAtPrologue(BaselineFrame* frame);
+
+bool CheckProxyGetByValueResult(JSContext* cx, HandleObject obj, HandleValue id,
+                                HandleValue value, MutableHandleValue result);
+
+bool GetNativeDataPropertyPure(JSContext* cx, JSObject* obj, PropertyKey id,
+                               MegamorphicCacheEntry* entry, Value* vp);
+
+bool GetNativeDataPropertyPureWithCacheLookup(JSContext* cx, JSObject* obj,
+                                              PropertyKey id,
+                                              MegamorphicCacheEntry* entry,
+                                              Value* vp);
+
+bool GetNativeDataPropertyByValuePure(JSContext* cx, JSObject* obj,
+                                      MegamorphicCacheEntry* cacheEntry,
+                                      Value* vp);
+
+bool GetPropMaybeCached(JSContext* cx, HandleObject obj, HandleId id,
+                        MegamorphicCacheEntry* cacheEntry,
+                        MutableHandleValue result);
+
+bool GetElemMaybeCached(JSContext* cx, HandleObject obj, HandleValue id,
+                        MegamorphicCacheEntry* cacheEntry,
+                        MutableHandleValue result);
+
+template <bool HasOwn>
+bool HasNativeDataPropertyPure(JSContext* cx, JSObject* obj,
+                               MegamorphicCacheEntry* cacheEntry, Value* vp);
+
+bool HasNativeElementPure(JSContext* cx, NativeObject* obj, int32_t index,
+                          Value* vp);
+
+bool ObjectHasGetterSetterPure(JSContext* cx, JSObject* objArg, jsid id,
+                               GetterSetter* getterSetter);
+
+template <bool Cached>
+bool SetElementMegamorphic(JSContext* cx, HandleObject obj, HandleValue index,
+                           HandleValue value, bool strict);
+
+template <bool Cached>
+bool SetPropertyMegamorphic(JSContext* cx, HandleObject obj, HandleId id,
+                            HandleValue value, bool strict);
+
+JSString* TypeOfNameObject(JSObject* obj, JSRuntime* rt);
+
+bool TypeOfEqObject(JSObject* obj, TypeofEqOperand operand);
+
+bool GetPrototypeOf(JSContext* cx, HandleObject target,
+                    MutableHandleValue rval);
+
+bool DoConcatStringObject(JSContext* cx, HandleValue lhs, HandleValue rhs,
+                          MutableHandleValue res);
+
+bool IsPossiblyWrappedTypedArray(JSContext* cx, JSObject* obj, bool* result);
+
+void* AllocateDependentString(JSContext* cx);
+void* AllocateFatInlineString(JSContext* cx);
+void* AllocateBigIntNoGC(JSContext* cx, bool requestMinorGC);
+void AllocateAndInitTypedArrayBuffer(JSContext* cx,
+                                     FixedLengthTypedArrayObject* obj,
+                                     int32_t count, size_t inlineCapacity);
+
+#ifdef JS_GC_PROBES
+void TraceCreateObject(JSObject* obj);
+#endif
+
+bool PreserveWrapper(JSContext* cx, JSObject* obj);
+
+bool DoStringToInt64(JSContext* cx, HandleString str, uint64_t* res);
+
+BigInt* CreateBigIntFromInt32(JSContext* cx, int32_t i32);
+
+#if JS_BITS_PER_WORD == 32
+BigInt* CreateBigIntFromInt64(JSContext* cx, uint32_t low, uint32_t high);
+BigInt* CreateBigIntFromUint64(JSContext* cx, uint32_t low, uint32_t high);
+#else
+BigInt* CreateBigIntFromInt64(JSContext* cx, uint64_t i64);
+BigInt* CreateBigIntFromUint64(JSContext* cx, uint64_t i64);
+#endif
+
+template <EqualityKind Kind>
+bool BigIntEqual(BigInt* x, BigInt* y);
+
+template <ComparisonKind Kind>
+bool BigIntCompare(BigInt* x, BigInt* y);
+
+template <EqualityKind Kind>
+bool BigIntNumberEqual(BigInt* x, double y);
+
+template <ComparisonKind Kind>
+bool BigIntNumberCompare(BigInt* x, double y);
+
+template <ComparisonKind Kind>
+bool NumberBigIntCompare(double x, BigInt* y);
+
+template <EqualityKind Kind>
+bool BigIntStringEqual(JSContext* cx, HandleBigInt x, HandleString y,
+                       bool* res);
+
+template <ComparisonKind Kind>
+bool BigIntStringCompare(JSContext* cx, HandleBigInt x, HandleString y,
+                         bool* res);
+
+template <ComparisonKind Kind>
+bool StringBigIntCompare(JSContext* cx, HandleString x, HandleBigInt y,
+                         bool* res);
+
+BigInt* BigIntAsIntN(JSContext* cx, HandleBigInt x, int32_t bits);
+BigInt* BigIntAsUintN(JSContext* cx, HandleBigInt x, int32_t bits);
+
+using AtomicsCompareExchangeFn = int32_t (*)(TypedArrayObject*, size_t, int32_t,
+                                             int32_t);
+
+using AtomicsReadWriteModifyFn = int32_t (*)(TypedArrayObject*, size_t,
+                                             int32_t);
+
+AtomicsCompareExchangeFn AtomicsCompareExchange(Scalar::Type elementType);
+AtomicsReadWriteModifyFn AtomicsExchange(Scalar::Type elementType);
+AtomicsReadWriteModifyFn AtomicsAdd(Scalar::Type elementType);
+AtomicsReadWriteModifyFn AtomicsSub(Scalar::Type elementType);
+AtomicsReadWriteModifyFn AtomicsAnd(Scalar::Type elementType);
+AtomicsReadWriteModifyFn AtomicsOr(Scalar::Type elementType);
+AtomicsReadWriteModifyFn AtomicsXor(Scalar::Type elementType);
+
+BigInt* AtomicsLoad64(JSContext* cx, TypedArrayObject* typedArray,
+                      size_t index);
+
+void AtomicsStore64(TypedArrayObject* typedArray, size_t index,
+                    const BigInt* value);
+
+BigInt* AtomicsCompareExchange64(JSContext* cx, TypedArrayObject* typedArray,
+                                 size_t index, const BigInt* expected,
+                                 const BigInt* replacement);
+
+BigInt* AtomicsExchange64(JSContext* cx, TypedArrayObject* typedArray,
+                          size_t index, const BigInt* value);
+
+BigInt* AtomicsAdd64(JSContext* cx, TypedArrayObject* typedArray, size_t index,
+                     const BigInt* value);
+BigInt* AtomicsAnd64(JSContext* cx, TypedArrayObject* typedArray, size_t index,
+                     const BigInt* value);
+BigInt* AtomicsOr64(JSContext* cx, TypedArrayObject* typedArray, size_t index,
+                    const BigInt* value);
+BigInt* AtomicsSub64(JSContext* cx, TypedArrayObject* typedArray, size_t index,
+                     const BigInt* value);
+BigInt* AtomicsXor64(JSContext* cx, TypedArrayObject* typedArray, size_t index,
+                     const BigInt* value);
+
+float RoundFloat16ToFloat32(int32_t d);
+float RoundFloat16ToFloat32(float d);
+float RoundFloat16ToFloat32(double d);
+
+float Float16ToFloat32(int32_t value);
+int32_t Float32ToFloat16(float value);
+
+void DateFillLocalTimeSlots(DateObject* dateObj);
+double DateNow(JSContext* cx);
+double DateParse(JSContext* cx, const JSString* str);
+double DateLocalTimeToUTC(JSContext* cx, int64_t localTime);
+void DateYearFromTime(JSContext* cx, double utcTime, JS::Value* result);
+void DateMonthFromTime(JSContext* cx, double utcTime, JS::Value* result);
+void DateDateFromTime(JSContext* cx, double utcTime, JS::Value* result);
+JSObject* NewDateObject(JSContext* cx, double utcTime);
+
+JSAtom* AtomizeStringNoGC(JSContext* cx, JSString* str);
+
+bool SetObjectHas(JSContext* cx, Handle<SetObject*> obj, HandleValue key,
+                  bool* rval);
+bool SetObjectDelete(JSContext* cx, Handle<SetObject*> obj, HandleValue key,
+                     bool* rval);
+bool SetObjectAdd(JSContext* cx, Handle<SetObject*> obj, HandleValue key);
+bool SetObjectAddFromIC(JSContext* cx, Handle<SetObject*> obj, HandleValue key,
+                        MutableHandleValue rval);
+bool MapObjectHas(JSContext* cx, Handle<MapObject*> obj, HandleValue key,
+                  bool* rval);
+bool MapObjectGet(JSContext* cx, Handle<MapObject*> obj, HandleValue key,
+                  MutableHandleValue rval);
+bool MapObjectDelete(JSContext* cx, Handle<MapObject*> obj, HandleValue key,
+                     bool* rval);
+bool MapObjectSet(JSContext* cx, Handle<MapObject*> obj, HandleValue key,
+                  HandleValue val);
+bool MapObjectSetFromIC(JSContext* cx, Handle<MapObject*> obj, HandleValue key,
+                        HandleValue val, MutableHandleValue rval);
+
+void AssertSetObjectHash(JSContext* cx, SetObject* obj, const Value* value,
+                         mozilla::HashNumber actualHash);
+void AssertMapObjectHash(JSContext* cx, MapObject* obj, const Value* value,
+                         mozilla::HashNumber actualHash);
+
+void AssertPropertyLookup(NativeObject* obj, PropertyKey id, uint32_t slot);
+
+void WeakMapValueReadBarrier(gc::TenuredCell* cell, Zone* mapZone);
+
+void AssumeUnreachable(const char* output);
+void Printf0(const char* output);
+void Printf1(const char* output, uintptr_t value);
+
+enum class VMFunctionId;
+
+extern const VMFunctionData& GetVMFunction(VMFunctionId id);
+
+extern size_t NumVMFunctions();
+
+}  
+}  
+
+#if defined(JS_CODEGEN_ARM)
+extern "C" {
+extern MOZ_EXPORT int64_t __aeabi_idivmod(int, int);
+extern MOZ_EXPORT int64_t __aeabi_uidivmod(int, int);
+}
+#endif
+
+#endif /* jit_VMFunctions_h */

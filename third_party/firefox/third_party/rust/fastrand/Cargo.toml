@@ -1,0 +1,40 @@
+
+[package]
+edition = "2018"
+rust-version = "1.36"
+name = "fastrand"
+version = "2.1.1"
+authors = ["Stjepan Glavina <stjepang@gmail.com>"]
+build = false
+exclude = ["/.*"]
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "A simple and fast random number generator"
+keywords = [
+    "simple",
+    "fast",
+    "rand",
+    "random",
+    "wyrand",
+]
+categories = ["algorithms"]
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/smol-rs/fastrand"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
+
+[lib]
+name = "fastrand"
+path = "src/lib.rs"
+
+[features]
+alloc = []
+default = ["std"]
+std = ["alloc"]

@@ -1,0 +1,226 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkColor_DEFINED)
+#define SkColor_DEFINED
+
+#include "include/core/SkAlphaType.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkCPUTypes.h"
+#include "include/private/base/SkTPin.h"
+
+#include <array>
+#include <cstdint>
+
+
+typedef uint8_t SkAlpha;
+
+typedef uint32_t SkColor;
+
+static constexpr inline SkColor SkColorSetARGB(U8CPU a, U8CPU r, U8CPU g, U8CPU b) {
+    return SkASSERT(a <= 255 && r <= 255 && g <= 255 && b <= 255),
+           (a << 24) | (r << 16) | (g << 8) | (b << 0);
+}
+
+#define SkColorSetRGB(r, g, b)  SkColorSetARGB(0xFF, r, g, b)
+
+#define SkColorGetA(color)      (((color) >> 24) & 0xFF)
+
+#define SkColorGetR(color)      (((color) >> 16) & 0xFF)
+
+#define SkColorGetG(color)      (((color) >>  8) & 0xFF)
+
+#define SkColorGetB(color)      (((color) >>  0) & 0xFF)
+
+[[nodiscard]] static constexpr inline SkColor SkColorSetA(SkColor c, U8CPU a) {
+    return (c & 0x00FFFFFF) | (a << 24);
+}
+
+constexpr SkAlpha SK_AlphaTRANSPARENT = 0x00;
+
+constexpr SkAlpha SK_AlphaOPAQUE      = 0xFF;
+
+constexpr SkColor SK_ColorTRANSPARENT = SkColorSetARGB(0x00, 0x00, 0x00, 0x00);
+
+constexpr SkColor SK_ColorBLACK       = SkColorSetARGB(0xFF, 0x00, 0x00, 0x00);
+
+constexpr SkColor SK_ColorDKGRAY      = SkColorSetARGB(0xFF, 0x44, 0x44, 0x44);
+
+constexpr SkColor SK_ColorGRAY        = SkColorSetARGB(0xFF, 0x88, 0x88, 0x88);
+
+constexpr SkColor SK_ColorLTGRAY      = SkColorSetARGB(0xFF, 0xCC, 0xCC, 0xCC);
+
+constexpr SkColor SK_ColorWHITE       = SkColorSetARGB(0xFF, 0xFF, 0xFF, 0xFF);
+
+constexpr SkColor SK_ColorRED         = SkColorSetARGB(0xFF, 0xFF, 0x00, 0x00);
+
+constexpr SkColor SK_ColorGREEN       = SkColorSetARGB(0xFF, 0x00, 0xFF, 0x00);
+
+constexpr SkColor SK_ColorBLUE        = SkColorSetARGB(0xFF, 0x00, 0x00, 0xFF);
+
+constexpr SkColor SK_ColorYELLOW      = SkColorSetARGB(0xFF, 0xFF, 0xFF, 0x00);
+
+constexpr SkColor SK_ColorCYAN        = SkColorSetARGB(0xFF, 0x00, 0xFF, 0xFF);
+
+constexpr SkColor SK_ColorMAGENTA     = SkColorSetARGB(0xFF, 0xFF, 0x00, 0xFF);
+
+SK_API void SkRGBToHSV(U8CPU red, U8CPU green, U8CPU blue, SkScalar hsv[3]);
+
+static inline void SkColorToHSV(SkColor color, SkScalar hsv[3]) {
+    SkRGBToHSV(SkColorGetR(color), SkColorGetG(color), SkColorGetB(color), hsv);
+}
+
+SK_API SkColor SkHSVToColor(U8CPU alpha, const SkScalar hsv[3]);
+
+static inline SkColor SkHSVToColor(const SkScalar hsv[3]) {
+    return SkHSVToColor(0xFF, hsv);
+}
+
+typedef uint32_t SkPMColor;
+
+SK_API SkPMColor SkPreMultiplyARGB(U8CPU a, U8CPU r, U8CPU g, U8CPU b);
+
+SK_API SkPMColor SkPreMultiplyColor(SkColor c);
+
+enum class SkColorChannel {
+    kR,  
+    kG,  
+    kB,  
+    kA,  
+
+    kLastEnum = kA,
+};
+
+enum SkColorChannelFlag : uint32_t {
+    kRed_SkColorChannelFlag    = 1 << static_cast<uint32_t>(SkColorChannel::kR),
+    kGreen_SkColorChannelFlag  = 1 << static_cast<uint32_t>(SkColorChannel::kG),
+    kBlue_SkColorChannelFlag   = 1 << static_cast<uint32_t>(SkColorChannel::kB),
+    kAlpha_SkColorChannelFlag  = 1 << static_cast<uint32_t>(SkColorChannel::kA),
+    kGray_SkColorChannelFlag   = 0x10,
+    kGrayAlpha_SkColorChannelFlags = kGray_SkColorChannelFlag | kAlpha_SkColorChannelFlag,
+    kRG_SkColorChannelFlags        = kRed_SkColorChannelFlag | kGreen_SkColorChannelFlag,
+    kRGB_SkColorChannelFlags       = kRG_SkColorChannelFlags | kBlue_SkColorChannelFlag,
+    kRGBA_SkColorChannelFlags      = kRGB_SkColorChannelFlags | kAlpha_SkColorChannelFlag,
+};
+static_assert(0 == (kGray_SkColorChannelFlag & kRGBA_SkColorChannelFlags), "bitfield conflict");
+
+template <SkAlphaType kAT>
+struct SkRGBA4f {
+    float fR;  
+    float fG;  
+    float fB;  
+    float fA;  
+
+    bool operator==(const SkRGBA4f& other) const {
+        return fA == other.fA && fR == other.fR && fG == other.fG && fB == other.fB;
+    }
+
+    bool operator!=(const SkRGBA4f& other) const {
+        return !(*this == other);
+    }
+
+    SkRGBA4f operator*(float scale) const {
+        return { fR * scale, fG * scale, fB * scale, fA * scale };
+    }
+
+    SkRGBA4f operator*(const SkRGBA4f& scale) const {
+        return { fR * scale.fR, fG * scale.fG, fB * scale.fB, fA * scale.fA };
+    }
+
+    const float* vec() const { return &fR; }
+
+    float* vec() { return &fR; }
+
+    std::array<float, 4> array() const { return {fR, fG, fB, fA}; }
+
+    float operator[](int index) const {
+        SkASSERT(index >= 0 && index < 4);
+        return this->vec()[index];
+    }
+
+    float& operator[](int index) {
+        SkASSERT(index >= 0 && index < 4);
+        return this->vec()[index];
+    }
+
+    bool isOpaque() const {
+        SkASSERT(fA <= 1.0f && fA >= 0.0f);
+        return fA == 1.0f;
+    }
+
+    bool fitsInBytes() const {
+        SkASSERT(fA >= 0.0f && fA <= 1.0f);
+        return fR >= 0.0f && fR <= 1.0f &&
+               fG >= 0.0f && fG <= 1.0f &&
+               fB >= 0.0f && fB <= 1.0f;
+    }
+
+    static SkRGBA4f FromColor(SkColor color);  
+
+    SkColor toSkColor() const;  
+
+    static SkRGBA4f FromPMColor(SkPMColor);  
+
+    SkRGBA4f<kPremul_SkAlphaType> premul() const {
+        static_assert(kAT == kUnpremul_SkAlphaType, "");
+        return { fR * fA, fG * fA, fB * fA, fA };
+    }
+
+    SkRGBA4f<kUnpremul_SkAlphaType> unpremul() const {
+        static_assert(kAT == kPremul_SkAlphaType, "");
+
+        if (fA == 0.0f) {
+            return { 0, 0, 0, 0 };
+        } else {
+            float invAlpha = 1 / fA;
+            return { fR * invAlpha, fG * invAlpha, fB * invAlpha, fA };
+        }
+    }
+
+    uint32_t toBytes_RGBA() const;
+    static SkRGBA4f FromBytes_RGBA(uint32_t color);
+
+    SkRGBA4f makeOpaque() const {
+        return { fR, fG, fB, 1.0f };
+    }
+
+    SkRGBA4f pinAlpha() const {
+        return { fR, fG, fB, SkTPin(fA, 0.f, 1.f) };
+    }
+
+    SkRGBA4f withAlpha(float a) const {
+        return { fR, fG, fB, a };
+    }
+
+    SkRGBA4f withAlphaByte(uint8_t a) const {
+        return { fR, fG, fB, a/255.f };
+    }
+};
+
+using SkColor4f = SkRGBA4f<kUnpremul_SkAlphaType>;
+
+template <> SK_API SkColor4f SkColor4f::FromColor(SkColor);
+template <> SK_API SkColor   SkColor4f::toSkColor() const;
+template <> SK_API uint32_t  SkColor4f::toBytes_RGBA() const;
+template <> SK_API SkColor4f SkColor4f::FromBytes_RGBA(uint32_t color);
+
+namespace SkColors {
+constexpr SkColor4f kTransparent = {0, 0, 0, 0};
+constexpr SkColor4f kBlack       = {0, 0, 0, 1};
+constexpr SkColor4f kDkGray      = {0.25f, 0.25f, 0.25f, 1};
+constexpr SkColor4f kGray        = {0.50f, 0.50f, 0.50f, 1};
+constexpr SkColor4f kLtGray      = {0.75f, 0.75f, 0.75f, 1};
+constexpr SkColor4f kWhite       = {1, 1, 1, 1};
+constexpr SkColor4f kRed         = {1, 0, 0, 1};
+constexpr SkColor4f kGreen       = {0, 1, 0, 1};
+constexpr SkColor4f kBlue        = {0, 0, 1, 1};
+constexpr SkColor4f kYellow      = {1, 1, 0, 1};
+constexpr SkColor4f kCyan        = {0, 1, 1, 1};
+constexpr SkColor4f kMagenta     = {1, 0, 1, 1};
+}  
+#endif

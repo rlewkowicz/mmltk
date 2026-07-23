@@ -1,0 +1,300 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsNativeThemeGTK.h"
+#include "cairo.h"
+#include "nsDeviceContext.h"
+#include "gtk/gtk.h"
+#include "nsPresContext.h"
+#include "GtkWidgets.h"
+#include "nsIFrame.h"
+
+#include "gfxContext.h"
+#include "mozilla/gfx/HelpersCairo.h"
+#include "mozilla/WidgetUtilsGtk.h"
+#include "mozilla/StaticPrefs_widget.h"
+
+#include <dlfcn.h>
+
+using namespace mozilla;
+using namespace mozilla::gfx;
+using namespace mozilla::widget;
+
+nsNativeThemeGTK::nsNativeThemeGTK() : Theme(ScrollbarStyle()) {}
+
+nsNativeThemeGTK::~nsNativeThemeGTK() { GtkWidgets::Shutdown(); }
+
+static RefPtr<DataSourceSurface> GetWidgetFourPatch(
+    nsIFrame* aFrame, GtkWidgets::Type aWidget, CSSIntCoord aSectionSize,
+    CSSToLayoutDeviceScale aScale) {
+  static auto sCairoSurfaceSetDeviceScalePtr =
+      (void (*)(cairo_surface_t*, double, double))dlsym(
+          RTLD_DEFAULT, "cairo_surface_set_device_scale");
+
+  CSSIntRect rect(0, 0, aSectionSize * 2, aSectionSize * 2);
+  GtkWidgets::DrawingParams params{
+      .widget = aWidget,
+      .rect = {rect.x, rect.y, rect.width, rect.height},
+      .state = GTK_STATE_FLAG_NORMAL,
+      .image_scale = gint(std::ceil(aScale.scale)),
+  };
+
+  if (aFrame->PresContext()->Document()->State().HasState(
+          dom::DocumentState::WINDOW_INACTIVE)) {
+    params.state = GtkStateFlags(gint(params.state) | GTK_STATE_FLAG_BACKDROP);
+  }
+
+  auto surfaceRect = RoundedOut(rect * aScale);
+  RefPtr<DataSourceSurface> dataSurface = Factory::CreateDataSourceSurface(
+      surfaceRect.Size().ToUnknownSize(), SurfaceFormat::B8G8R8A8,
+       true);
+  if (NS_WARN_IF(!dataSurface)) {
+    return nullptr;
+  }
+  DataSourceSurface::ScopedMap map(dataSurface,
+                                   DataSourceSurface::MapType::WRITE);
+  if (NS_WARN_IF(!map.IsMapped())) {
+    return nullptr;
+  }
+  cairo_surface_t* surf = cairo_image_surface_create_for_data(
+      map.GetData(), GfxFormatToCairoFormat(dataSurface->GetFormat()),
+      surfaceRect.width, surfaceRect.height, map.GetStride());
+  if (NS_WARN_IF(!surf)) {
+    return nullptr;
+  }
+  if (cairo_t* cr = cairo_create(surf)) {
+    if (aScale.scale != 1.0) {
+      if (sCairoSurfaceSetDeviceScalePtr) {
+        sCairoSurfaceSetDeviceScalePtr(surf, aScale.scale, aScale.scale);
+      } else {
+        cairo_scale(cr, aScale.scale, aScale.scale);
+      }
+    }
+    GtkWidgets::Draw(cr, &params);
+    cairo_destroy(cr);
+  }
+  cairo_surface_destroy(surf);
+  return dataSurface;
+}
+
+static void DrawWindowDecorationsWithCairo(nsIFrame* aFrame,
+                                           gfxContext* aContext, bool aSnapped,
+                                           const Point& aDrawOrigin,
+                                           const nsIntSize& aDrawSize) {
+  DrawTarget* dt = aContext->GetDrawTarget();
+  const Point drawOffset = aSnapped ? aDrawOrigin -
+                                          dt->GetTransform().GetTranslation() -
+                                          aContext->GetDeviceOffset()
+                                    : aDrawOrigin;
+
+  const CSSIntCoord sectionSize =
+      LookAndFeel::GetInt(LookAndFeel::IntID::TitlebarRadius);
+  if (!sectionSize) {
+    return;
+  }
+
+  const CSSToLayoutDeviceScale scaleFactor{
+      float(AppUnitsPerCSSPixel()) /
+      float(aFrame->PresContext()
+                ->DeviceContext()
+                ->AppUnitsPerDevPixelAtUnitFullZoom())};
+  RefPtr dataSurface = GetWidgetFourPatch(
+      aFrame, GtkWidgets::Type::WindowDecoration, sectionSize, scaleFactor);
+  if (NS_WARN_IF(!dataSurface)) {
+    return;
+  }
+
+  LayoutDeviceSize scaledSize(CSSCoord(sectionSize) * scaleFactor,
+                              CSSCoord(sectionSize) * scaleFactor);
+
+  dt->DrawSurface(dataSurface, Rect(drawOffset, scaledSize.ToUnknownSize()),
+                  Rect(Point(), scaledSize.ToUnknownSize()));
+  dt->DrawSurface(dataSurface,
+                  Rect(Point(drawOffset.x + aDrawSize.width - scaledSize.width,
+                             drawOffset.y),
+                       scaledSize.ToUnknownSize()),
+                  Rect(Point(scaledSize.width, 0), scaledSize.ToUnknownSize()));
+  if (StaticPrefs::widget_gtk_rounded_bottom_corners_enabled()) {
+    dt->DrawSurface(
+        dataSurface,
+        Rect(Point(drawOffset.x,
+                   drawOffset.y + aDrawSize.height - scaledSize.height),
+             scaledSize.ToUnknownSize()),
+        Rect(Point(0, scaledSize.height), scaledSize.ToUnknownSize()));
+
+    dt->DrawSurface(
+        dataSurface,
+        Rect(Point(drawOffset.x + aDrawSize.width - scaledSize.width,
+                   drawOffset.y + aDrawSize.height - scaledSize.height),
+             scaledSize.ToUnknownSize()),
+        Rect(Point(scaledSize.width, scaledSize.height),
+             scaledSize.ToUnknownSize()));
+  }
+}
+
+void nsNativeThemeGTK::DrawWidgetBackground(
+    gfxContext* aContext, nsIFrame* aFrame, StyleAppearance aAppearance,
+    const nsRect& aRect, const nsRect& aDirtyRect, DrawOverflow aDrawOverflow) {
+  if (IsWidgetNonNative(aFrame, aAppearance) != NonNative::No) {
+    return Theme::DrawWidgetBackground(aContext, aFrame, aAppearance, aRect,
+                                       aDirtyRect, aDrawOverflow);
+  }
+
+  if (NS_WARN_IF(aAppearance != StyleAppearance::MozWindowDecorations)) {
+    return;
+  }
+
+  if (GdkIsWaylandDisplay()) {
+    return;
+  }
+
+  gfxContext* ctx = aContext;
+  nsPresContext* presContext = aFrame->PresContext();
+
+  gfxRect rect = presContext->AppUnitsToGfxUnits(aRect);
+  gfxRect dirtyRect = presContext->AppUnitsToGfxUnits(aDirtyRect);
+
+  bool snapped = ctx->UserToDevicePixelSnapped(
+      rect, gfxContext::SnapOption::PrioritizeSize);
+  if (snapped) {
+    dirtyRect = ctx->UserToDevice(dirtyRect);
+  }
+
+  dirtyRect.MoveBy(-rect.TopLeft());
+  dirtyRect.RoundOut();
+
+  LayoutDeviceIntRect widgetRect(0, 0, NS_lround(rect.Width()),
+                                 NS_lround(rect.Height()));
+
+  LayoutDeviceIntRect drawingRect(
+      int32_t(dirtyRect.X()), int32_t(dirtyRect.Y()),
+      int32_t(dirtyRect.Width()), int32_t(dirtyRect.Height()));
+  if (widgetRect.IsEmpty() ||
+      !drawingRect.IntersectRect(widgetRect, drawingRect)) {
+    return;
+  }
+
+  gfxPoint origin = rect.TopLeft() + drawingRect.TopLeft().ToUnknownPoint();
+  DrawWindowDecorationsWithCairo(aFrame, ctx, snapped, ToPoint(origin),
+                                 drawingRect.Size().ToUnknownSize());
+}
+
+bool nsNativeThemeGTK::CreateWebRenderCommandsForWidget(
+    mozilla::wr::DisplayListBuilder& aBuilder,
+    mozilla::wr::IpcResourceUpdateQueue& aResources,
+    const mozilla::layers::StackingContextHelper& aSc,
+    mozilla::layers::RenderRootStateManager* aManager, nsIFrame* aFrame,
+    StyleAppearance aAppearance, const nsRect& aRect) {
+  if (IsWidgetNonNative(aFrame, aAppearance) != NonNative::No) {
+    return Theme::CreateWebRenderCommandsForWidget(
+        aBuilder, aResources, aSc, aManager, aFrame, aAppearance, aRect);
+  }
+  if (aAppearance == StyleAppearance::MozWindowDecorations &&
+      GdkIsWaylandDisplay()) {
+    return true;
+  }
+  return false;
+}
+
+LayoutDeviceIntMargin nsNativeThemeGTK::GetWidgetBorder(
+    nsDeviceContext* aContext, nsIFrame* aFrame, StyleAppearance aAppearance) {
+  if (IsWidgetAlwaysNonNative(aFrame, aAppearance)) {
+    return Theme::GetWidgetBorder(aContext, aFrame, aAppearance);
+  }
+  return {};
+}
+
+bool nsNativeThemeGTK::GetWidgetPadding(nsDeviceContext* aContext,
+                                        nsIFrame* aFrame,
+                                        StyleAppearance aAppearance,
+                                        LayoutDeviceIntMargin* aResult) {
+  if (IsWidgetAlwaysNonNative(aFrame, aAppearance)) {
+    return Theme::GetWidgetPadding(aContext, aFrame, aAppearance, aResult);
+  }
+  return false;
+}
+
+bool nsNativeThemeGTK::GetWidgetOverflow(nsDeviceContext* aContext,
+                                         nsIFrame* aFrame,
+                                         StyleAppearance aAppearance,
+                                         nsRect* aOverflowRect) {
+  if (IsWidgetNonNative(aFrame, aAppearance) != NonNative::No) {
+    return Theme::GetWidgetOverflow(aContext, aFrame, aAppearance,
+                                    aOverflowRect);
+  }
+  return false;
+}
+
+auto nsNativeThemeGTK::IsWidgetNonNative(nsIFrame* aFrame,
+                                         StyleAppearance aAppearance)
+    -> NonNative {
+  if (IsWidgetAlwaysNonNative(aFrame, aAppearance)) {
+    return NonNative::Always;
+  }
+
+  if (LookAndFeel::ColorSchemeForFrame(aFrame) ==
+      PreferenceSheet::ColorSchemeForChrome()) {
+    return NonNative::No;
+  }
+
+  if (!Theme::ThemeSupportsWidget(aFrame->PresContext(), aFrame, aAppearance)) {
+    return NonNative::No;
+  }
+
+  return NonNative::BecauseColorMismatch;
+}
+
+bool nsNativeThemeGTK::IsWidgetAlwaysNonNative(nsIFrame* aFrame,
+                                               StyleAppearance aAppearance) {
+  return Theme::IsWidgetAlwaysNonNative(aFrame, aAppearance) ||
+         aAppearance == StyleAppearance::MozMenulistArrowButton ||
+         aAppearance == StyleAppearance::Textfield ||
+         aAppearance == StyleAppearance::NumberInput ||
+         aAppearance == StyleAppearance::PasswordInput ||
+         aAppearance == StyleAppearance::Textarea ||
+         aAppearance == StyleAppearance::Checkbox ||
+         aAppearance == StyleAppearance::Radio ||
+         aAppearance == StyleAppearance::Button ||
+         aAppearance == StyleAppearance::Listbox ||
+         aAppearance == StyleAppearance::Menulist;
+}
+
+LayoutDeviceIntSize nsNativeThemeGTK::GetMinimumWidgetSize(
+    nsPresContext* aPresContext, nsIFrame* aFrame,
+    StyleAppearance aAppearance) {
+  if (IsWidgetAlwaysNonNative(aFrame, aAppearance)) {
+    return Theme::GetMinimumWidgetSize(aPresContext, aFrame, aAppearance);
+  }
+  return {};
+}
+
+bool nsNativeThemeGTK::ThemeSupportsWidget(nsPresContext* aPresContext,
+                                           nsIFrame* aFrame,
+                                           StyleAppearance aAppearance) {
+  if (IsWidgetAlwaysNonNative(aFrame, aAppearance)) {
+    return Theme::ThemeSupportsWidget(aPresContext, aFrame, aAppearance);
+  }
+  return aAppearance == StyleAppearance::MozWindowDecorations;
+}
+
+bool nsNativeThemeGTK::ThemeDrawsFocusForWidget(nsIFrame* aFrame,
+                                                StyleAppearance aAppearance) {
+  if (IsWidgetNonNative(aFrame, aAppearance) != NonNative::No) {
+    return Theme::ThemeDrawsFocusForWidget(aFrame, aAppearance);
+  }
+  return false;
+}
+
+nsITheme::Transparency nsNativeThemeGTK::GetWidgetTransparency(
+    nsIFrame* aFrame, StyleAppearance aAppearance) {
+  if (IsWidgetNonNative(aFrame, aAppearance) != NonNative::No) {
+    return Theme::GetWidgetTransparency(aFrame, aAppearance);
+  }
+
+  return eUnknownTransparency;
+}
+
+already_AddRefed<Theme> do_CreateNativeThemeDoNotUseDirectly() {
+  return do_AddRef(new nsNativeThemeGTK());
+}

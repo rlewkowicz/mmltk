@@ -1,0 +1,35 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+include GraphicsMessages;
+include protocol PRemoteMediaManager;
+
+using mozilla::dom::ContentParentId from "mozilla/dom/ipc/IdType.h";
+using mozilla::media::MediaCodecsSupported from "MediaCodecsSupport.h";
+using mozilla::RemoteMediaIn from "mozilla/RemoteMediaManagerChild.h";
+
+namespace mozilla {
+
+namespace ipc {
+
+// This protocol allows to run media related services on top of the Utility
+// process.
+[ParentProc=Utility, ChildProc=Parent]
+protocol PUtilityMediaService
+{
+parent:
+  async NewContentRemoteMediaManager(
+            Endpoint<PRemoteMediaManagerParent> endpoint, ContentParentId parentId);
+
+  async UpdateVar(GfxVarUpdate[] var);
+
+child:
+  async UpdateMediaCodecsSupported(RemoteMediaIn aLocation,
+                                   MediaCodecsSupported aSupported);
+
+};
+
+} // namespace ipc
+
+} // namespace mozilla

@@ -1,0 +1,218 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2007-2016, International Business Machines Corporation and
+* others. All Rights Reserved.
+*******************************************************************************
+*
+* File DTPTNGEN.H
+*
+*******************************************************************************
+*/
+
+#ifndef __DTPTNGEN_H__
+#define __DTPTNGEN_H__
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/datefmt.h"
+#include "unicode/locid.h"
+#include "unicode/udat.h"
+#include "unicode/udatpg.h"
+#include "unicode/unistr.h"
+
+U_NAMESPACE_BEGIN
+
+
+
+class CharString;
+class Hashtable;
+class FormatParser;
+class DateTimeMatcher;
+class DistanceInfo;
+class PatternMap;
+class PtnSkeleton;
+class SharedDateTimePatternGenerator;
+
+class U_I18N_API_CLASS DateTimePatternGenerator : public UObject {
+public:
+    U_I18N_API static DateTimePatternGenerator* createInstance(UErrorCode& status);
+
+    U_I18N_API static DateTimePatternGenerator* createInstance(const Locale& uLocale, UErrorCode& status);
+
+#ifndef U_HIDE_INTERNAL_API
+
+    U_I18N_API static DateTimePatternGenerator* createInstanceNoStdPat(const Locale& uLocale,
+                                                                       UErrorCode& status);
+
+#endif /* U_HIDE_INTERNAL_API */
+
+    U_I18N_API static DateTimePatternGenerator* createEmptyInstance(UErrorCode& status);
+
+    U_I18N_API virtual ~DateTimePatternGenerator();
+
+    U_I18N_API DateTimePatternGenerator* clone() const;
+
+    U_I18N_API bool operator==(const DateTimePatternGenerator& other) const;
+
+    U_I18N_API bool operator!=(const DateTimePatternGenerator& other) const;
+
+    U_I18N_API static UnicodeString staticGetSkeleton(const UnicodeString& pattern, UErrorCode& status);
+
+    U_I18N_API UnicodeString getSkeleton(const UnicodeString& pattern, UErrorCode& status); 
+
+    U_I18N_API static UnicodeString staticGetBaseSkeleton(const UnicodeString& pattern,
+                                                          UErrorCode& status);
+
+    U_I18N_API UnicodeString getBaseSkeleton(const UnicodeString& pattern, UErrorCode& status); 
+
+    U_I18N_API UDateTimePatternConflict addPattern(const UnicodeString& pattern,
+                                                   UBool override,
+                                                   UnicodeString& conflictingPattern,
+                                                   UErrorCode& status);
+
+#ifndef U_HIDE_INTERNAL_API
+    U_I18N_API UDateTimePatternConflict addPatternWithSkeleton(const UnicodeString& pattern,
+                                                               const UnicodeString& skeletonToUse,
+                                                               UBool override,
+                                                               UnicodeString& conflictingPattern,
+                                                               UErrorCode& status);
+#endif  /* U_HIDE_INTERNAL_API */
+
+    U_I18N_API void setAppendItemFormat(UDateTimePatternField field, const UnicodeString& value);
+
+    U_I18N_API const UnicodeString& getAppendItemFormat(UDateTimePatternField field) const;
+
+    U_I18N_API void setAppendItemName(UDateTimePatternField field, const UnicodeString& value);
+
+    U_I18N_API const UnicodeString& getAppendItemName(UDateTimePatternField field) const;
+
+    U_I18N_API UnicodeString getFieldDisplayName(UDateTimePatternField field,
+                                                 UDateTimePGDisplayWidth width) const;
+
+    U_I18N_API void setDateTimeFormat(const UnicodeString& dateTimeFormat);
+
+    U_I18N_API const UnicodeString& getDateTimeFormat() const;
+
+#if !UCONFIG_NO_FORMATTING
+    U_I18N_API void setDateTimeFormat(UDateFormatStyle style,
+                                      const UnicodeString& dateTimeFormat,
+                                      UErrorCode& status);
+
+    U_I18N_API const UnicodeString& getDateTimeFormat(UDateFormatStyle style, UErrorCode& status) const;
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+    U_I18N_API UnicodeString getBestPattern(const UnicodeString& skeleton, UErrorCode& status);
+
+    U_I18N_API UnicodeString getBestPattern(const UnicodeString& skeleton,
+                                            UDateTimePatternMatchOptions options,
+                                            UErrorCode& status);
+
+    U_I18N_API UnicodeString replaceFieldTypes(const UnicodeString& pattern,
+                                               const UnicodeString& skeleton,
+                                               UErrorCode& status);
+
+    U_I18N_API UnicodeString replaceFieldTypes(const UnicodeString& pattern,
+                                               const UnicodeString& skeleton,
+                                               UDateTimePatternMatchOptions options,
+                                               UErrorCode& status);
+
+    U_I18N_API StringEnumeration* getSkeletons(UErrorCode& status) const;
+
+    U_I18N_API const UnicodeString& getPatternForSkeleton(const UnicodeString& skeleton) const;
+
+    U_I18N_API StringEnumeration* getBaseSkeletons(UErrorCode& status) const;
+
+#ifndef U_HIDE_INTERNAL_API
+    U_I18N_API StringEnumeration* getRedundants(UErrorCode& status);
+#endif  /* U_HIDE_INTERNAL_API */
+
+    U_I18N_API void setDecimal(const UnicodeString& decimal);
+
+    U_I18N_API const UnicodeString& getDecimal() const;
+
+#if !UCONFIG_NO_FORMATTING
+
+    U_I18N_API UDateFormatHourCycle getDefaultHourCycle(UErrorCode& status) const;
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+    
+    U_I18N_API virtual UClassID getDynamicClassID() const override;
+
+    U_I18N_API static UClassID getStaticClassID();
+
+private:
+    DateTimePatternGenerator(UErrorCode & status);
+
+    DateTimePatternGenerator(const Locale& locale, UErrorCode & status, UBool skipStdPatterns = false);
+
+    DateTimePatternGenerator(const DateTimePatternGenerator& other);
+
+    DateTimePatternGenerator& operator=(const DateTimePatternGenerator& other);
+
+    static const int32_t UDATPG_WIDTH_COUNT = UDATPG_NARROW + 1;
+
+    Locale pLocale;  
+    FormatParser *fp;
+    DateTimeMatcher* dtMatcher;
+    DistanceInfo *distanceInfo;
+    PatternMap *patternMap;
+    UnicodeString appendItemFormats[UDATPG_FIELD_COUNT];
+    UnicodeString fieldDisplayNames[UDATPG_FIELD_COUNT][UDATPG_WIDTH_COUNT];
+    UnicodeString dateTimeFormat[4];
+    UnicodeString decimal;
+    DateTimeMatcher *skipMatcher;
+    Hashtable *fAvailableFormatKeyHash;
+    UnicodeString emptyString;
+    char16_t fDefaultHourFormatChar;
+
+    int32_t fAllowedHourFormats[7];  
+
+    UErrorCode internalErrorCode;
+
+    enum {
+        kDTPGNoFlags = 0,
+        kDTPGFixFractionalSeconds = 1,
+        kDTPGSkeletonUsesCapJ = 2
+    };
+
+    void initData(const Locale &locale, UErrorCode &status, UBool skipStdPatterns = false);
+    void addCanonicalItems(UErrorCode &status);
+    void addICUPatterns(const Locale& locale, UErrorCode& status);
+    void hackTimes(const UnicodeString& hackPattern, UErrorCode& status);
+    void getCalendarTypeToUse(const Locale& locale, CharString& destination, UErrorCode& err);
+    void consumeShortTimePattern(const UnicodeString& shortTimePattern, UErrorCode& status);
+    void addCLDRData(const Locale& locale, UErrorCode& status);
+    UDateTimePatternConflict addPatternWithOptionalSkeleton(const UnicodeString& pattern, const UnicodeString * skeletonToUse, UBool override, UnicodeString& conflictingPattern, UErrorCode& status);
+    void initHashtable(UErrorCode& status);
+    void setDateTimeFromCalendar(const Locale& locale, UErrorCode& status);
+    void setDecimalSymbols(const Locale& locale, UErrorCode& status);
+    UDateTimePatternField getAppendFormatNumber(const char* field) const;
+    UDateTimePatternField getFieldAndWidthIndices(const char* key, UDateTimePGDisplayWidth* widthP) const;
+    void setFieldDisplayName(UDateTimePatternField field, UDateTimePGDisplayWidth width, const UnicodeString& value);
+    UnicodeString& getMutableFieldDisplayName(UDateTimePatternField field, UDateTimePGDisplayWidth width);
+    void getAppendName(UDateTimePatternField field, UnicodeString& value);
+    UnicodeString mapSkeletonMetacharacters(const UnicodeString& patternForm, int32_t* flags, UErrorCode& status);
+    const UnicodeString* getBestRaw(DateTimeMatcher& source, int32_t includeMask, DistanceInfo* missingFields, UErrorCode& status, const PtnSkeleton** specifiedSkeletonPtr = nullptr);
+    UnicodeString adjustFieldTypes(const UnicodeString& pattern, const PtnSkeleton* specifiedSkeleton, int32_t flags, UDateTimePatternMatchOptions options = UDATPG_MATCH_NO_OPTIONS);
+    UnicodeString getBestAppending(int32_t missingFields, int32_t flags, UErrorCode& status, UDateTimePatternMatchOptions options = UDATPG_MATCH_NO_OPTIONS);
+    int32_t getTopBitNumber(int32_t foundMask) const;
+    void setAvailableFormat(const UnicodeString &key, UErrorCode& status);
+    UBool isAvailableFormatSet(const UnicodeString &key) const;
+    void copyHashtable(Hashtable *other, UErrorCode &status);
+    UBool isCanonicalItem(const UnicodeString& item) const;
+    static void U_CALLCONV loadAllowedHourFormatsData(UErrorCode &status);
+    void getAllowedHourFormats(const Locale &locale, UErrorCode &status);
+
+    struct U_HIDDEN AppendItemFormatsSink;
+    struct U_HIDDEN AppendItemNamesSink;
+    struct U_HIDDEN AvailableFormatsSink;
+} ;
+
+U_NAMESPACE_END
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif

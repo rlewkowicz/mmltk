@@ -1,0 +1,189 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(TimerThread_h_)
+#define TimerThread_h_
+
+#include "nsIObserver.h"
+#include "nsIRunnable.h"
+#include "nsIThread.h"
+
+#include "nsTimerImpl.h"
+#include "nsThreadUtils.h"
+
+#include "nsTArray.h"
+
+#include "mozilla/Monitor.h"
+#include "mozilla/Span.h"
+
+
+#define TIMER_THREAD_STATISTICS 0
+
+class TimerThread final : public mozilla::Runnable, public nsIObserver {
+ private:
+  typedef mozilla::Monitor TimerThreadMonitor;
+
+  using TimerThreadMonitorAutoLock =
+      mozilla::MonitorAutoLockBase<TimerThreadMonitor>;
+  using TimerThreadMonitorAutoUnlock =
+      mozilla::MonitorAutoUnlockBase<TimerThreadMonitor>;
+
+ public:
+  typedef mozilla::MutexAutoLock MutexAutoLock;
+  typedef mozilla::TimeStamp TimeStamp;
+  typedef mozilla::TimeDuration TimeDuration;
+
+  TimerThread();
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIRUNNABLE
+  NS_DECL_NSIOBSERVER
+
+  nsresult Shutdown();
+
+  nsresult AddTimer(nsTimerImpl* aTimer, const MutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(aTimer->mMutex);
+  nsresult RemoveTimer(nsTimerImpl* aTimer, const MutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(aTimer->mMutex);
+  TimeStamp FindNextFireTimeForCurrentThread(TimeStamp aDefault,
+                                             uint32_t aSearchBound);
+
+  void DoBeforeSleep();
+  void DoAfterSleep();
+
+  bool IsOnTimerThread() const { return mThread->IsOnCurrentThread(); }
+
+  uint32_t AllowedEarlyFiringMicroseconds();
+  nsresult GetTimers(nsTArray<RefPtr<nsITimer>>& aRetVal);
+
+ private:
+  ~TimerThread();
+
+  bool mInitialized;
+
+  void AddTimerInternal(nsTimerImpl& aTimer) MOZ_REQUIRES(mMonitor);
+  bool RemoveTimerInternal(nsTimerImpl& aTimer)
+      MOZ_REQUIRES(mMonitor, aTimer.mMutex);
+  void RemoveLeadingCanceledTimersInternal() MOZ_REQUIRES(mMonitor);
+  nsresult Init() MOZ_REQUIRES(mMonitor);
+  void AssertTimersSortedAndUnique() MOZ_REQUIRES(mMonitor);
+
+  nsCOMPtr<nsIThread> mThread;
+  TimerThreadMonitor mMonitor;
+
+  bool mShutdown MOZ_GUARDED_BY(mMonitor);
+  bool mWaiting MOZ_GUARDED_BY(mMonitor);
+  bool mNotified MOZ_GUARDED_BY(mMonitor);
+  bool mSleeping MOZ_GUARDED_BY(mMonitor);
+
+  struct EntryKey {
+    explicit EntryKey(nsTimerImpl& aTimerImpl)
+        : mTimeout(aTimerImpl.mTimeout), mTimerSeq(aTimerImpl.mTimerSeq) {}
+
+
+    bool operator==(const EntryKey& aRhs) const {
+      return (mTimeout == aRhs.mTimeout && mTimerSeq == aRhs.mTimerSeq);
+    }
+
+    bool operator<(const EntryKey& aRhs) const {
+      if (mTimeout == aRhs.mTimeout) {
+        return mTimerSeq < aRhs.mTimerSeq;
+      }
+      return mTimeout < aRhs.mTimeout;
+    }
+
+    TimeStamp mTimeout;
+    uint64_t mTimerSeq;
+  };
+
+  struct Entry final : EntryKey {
+    explicit Entry(nsTimerImpl& aTimerImpl)
+        : EntryKey(aTimerImpl),
+          mDelay(aTimerImpl.mDelay),
+          mTimerImpl(&aTimerImpl) {}
+
+    Entry(const Entry&) = delete;
+    Entry& operator=(const Entry&) = delete;
+    Entry(Entry&&) = default;
+    Entry& operator=(Entry&&) = default;
+
+#if defined(DEBUG)
+    bool IsTimerInThreadAndUnchanged() MOZ_NO_THREAD_SAFETY_ANALYSIS {
+      return (mTimerImpl && mTimerImpl->IsInTimerThread() &&
+              mTimerImpl->mTimeout == mTimeout);
+    }
+#endif
+
+    TimeDuration mDelay;
+    RefPtr<nsTimerImpl> mTimerImpl;
+  };
+
+  void PostTimerEvent(Entry& aPostMe) MOZ_REQUIRES(mMonitor);
+
+  struct WakeupTime {
+    const TimeStamp mWakeupTime;
+    const TimeDuration mDelayTolerance;
+  };
+
+  WakeupTime ComputeWakeupTimeFromTimers() const MOZ_REQUIRES(mMonitor);
+
+  TimeDuration ComputeAcceptableFiringDelay(TimeDuration timerDuration,
+                                            TimeDuration minDelay,
+                                            TimeDuration maxDelay) const;
+
+  uint64_t FireDueTimers(TimeDuration aAllowedEarlyFiring)
+      MOZ_REQUIRES(mMonitor);
+
+  void Wait(TimeDuration aWaitFor, TimeDuration aTolerance)
+      MOZ_REQUIRES(mMonitor);
+
+  nsTArray<Entry> mTimers MOZ_GUARDED_BY(mMonitor);
+
+  uint32_t mAllowedEarlyFiringMicroseconds MOZ_GUARDED_BY(mMonitor);
+
+  TimeStamp mIntendedWakeupTime;
+
+#if TIMER_THREAD_STATISTICS
+  static constexpr size_t sTimersFiredPerWakeupBucketCount = 16;
+  static inline constexpr std::array<size_t, sTimersFiredPerWakeupBucketCount>
+      sTimersFiredPerWakeupThresholds = {
+          0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 20, 30, 40, 50, 70, (size_t)(-1)};
+
+  mutable AutoTArray<size_t, sTimersFiredPerWakeupBucketCount>
+      mTimersFiredPerWakeup MOZ_GUARDED_BY(mMonitor) = {0, 0, 0, 0, 0, 0, 0, 0,
+                                                        0, 0, 0, 0, 0, 0, 0, 0};
+  mutable AutoTArray<size_t, sTimersFiredPerWakeupBucketCount>
+      mTimersFiredPerUnnotifiedWakeup MOZ_GUARDED_BY(mMonitor) = {
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  mutable AutoTArray<size_t, sTimersFiredPerWakeupBucketCount>
+      mTimersFiredPerNotifiedWakeup MOZ_GUARDED_BY(mMonitor) = {
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+  mutable size_t mTotalTimersAdded MOZ_GUARDED_BY(mMonitor) = 0;
+  mutable size_t mTotalTimersRemoved MOZ_GUARDED_BY(mMonitor) = 0;
+  mutable size_t mTotalTimersFiredNotified MOZ_GUARDED_BY(mMonitor) = 0;
+  mutable size_t mTotalTimersFiredUnnotified MOZ_GUARDED_BY(mMonitor) = 0;
+
+  mutable size_t mTotalWakeupCount MOZ_GUARDED_BY(mMonitor) = 0;
+  mutable size_t mTotalUnnotifiedWakeupCount MOZ_GUARDED_BY(mMonitor) = 0;
+  mutable size_t mTotalNotifiedWakeupCount MOZ_GUARDED_BY(mMonitor) = 0;
+
+  mutable double mTotalActualTimerFiringDelayNotified MOZ_GUARDED_BY(mMonitor) =
+      0.0;
+  mutable double mTotalActualTimerFiringDelayUnnotified
+      MOZ_GUARDED_BY(mMonitor) = 0.0;
+
+  mutable TimeStamp mFirstTimerAdded MOZ_GUARDED_BY(mMonitor);
+
+  mutable size_t mEarlyWakeups MOZ_GUARDED_BY(mMonitor) = 0;
+  mutable double mTotalEarlyWakeupTime MOZ_GUARDED_BY(mMonitor) = 0.0;
+
+  void CollectTimersFiredStatistics(uint64_t timersFiredThisWakeup);
+
+  void CollectWakeupStatistics();
+
+  void PrintStatistics() const;
+#endif
+};
+#endif

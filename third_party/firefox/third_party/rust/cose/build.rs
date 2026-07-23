@@ -1,0 +1,17 @@
+use std::env;
+
+fn main() {
+#[cfg(any())]
+
+
+
+
+
+
+
+
+    let lib_dir = env::var("NSS_LIB_DIR");
+    if let Ok(lib_dir) = env::var("NSS_LIB_DIR") {
+        println!("cargo:rustc-link-search={}", lib_dir);
+    }
+}

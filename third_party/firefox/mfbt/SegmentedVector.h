@@ -1,0 +1,278 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_SegmentedVector_h
+#define mozilla_SegmentedVector_h
+
+#include <new>  // for placement new
+#include <utility>
+
+#include "mozilla/AllocPolicy.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/OperatorNewExtensions.h"
+
+#ifdef IMPL_LIBXUL
+#  include "mozilla/Likely.h"
+#  include "mozilla/mozalloc_oom.h"
+#endif  // IMPL_LIBXUL
+
+namespace mozilla {
+
+template <typename T, size_t IdealSegmentSize = 4096,
+          typename AllocPolicy = MallocAllocPolicy>
+class SegmentedVector : private AllocPolicy {
+  template <size_t SegmentCapacity>
+  struct SegmentImpl
+      : public mozilla::LinkedListElement<SegmentImpl<SegmentCapacity>> {
+   private:
+    uint32_t mLength;
+    alignas(T) MOZ_INIT_OUTSIDE_CTOR
+        unsigned char mData[sizeof(T) * SegmentCapacity];
+
+    void* RawData() { return mData; }
+
+   public:
+    SegmentImpl() : mLength(0) {}
+
+    ~SegmentImpl() {
+      for (uint32_t i = 0; i < mLength; i++) {
+        (*this)[i].~T();
+      }
+    }
+
+    uint32_t Length() const { return mLength; }
+
+    T* Elems() { return reinterpret_cast<T*>(RawData()); }
+
+    T& operator[](size_t aIndex) {
+      MOZ_ASSERT(aIndex < mLength);
+      return Elems()[aIndex];
+    }
+
+    const T& operator[](size_t aIndex) const {
+      MOZ_ASSERT(aIndex < mLength);
+      return Elems()[aIndex];
+    }
+
+    template <typename U>
+    void Append(U&& aU) {
+      MOZ_ASSERT(mLength < SegmentCapacity);
+      mLength++;
+      T* elem = &(*this)[mLength - 1];
+      new (KnownNotNull, elem) T(std::forward<U>(aU));
+    }
+
+    void PopLast() {
+      MOZ_ASSERT(mLength > 0);
+      (*this)[mLength - 1].~T();
+      mLength--;
+    }
+  };
+
+  static const size_t kSingleElementSegmentSize = sizeof(SegmentImpl<1>);
+  static const size_t kSegmentCapacity =
+      kSingleElementSegmentSize <= IdealSegmentSize
+          ? (IdealSegmentSize - kSingleElementSegmentSize) / sizeof(T) + 1
+          : 1;
+
+ public:
+  typedef SegmentImpl<kSegmentCapacity> Segment;
+
+  explicit SegmentedVector(size_t aIdealSegmentSize = 0) {
+    MOZ_ASSERT_IF(
+        aIdealSegmentSize != 0,
+        (sizeof(Segment) > aIdealSegmentSize && kSegmentCapacity == 1) ||
+            aIdealSegmentSize - sizeof(Segment) < sizeof(T));
+  }
+
+  SegmentedVector(SegmentedVector&& aOther)
+      : mSegments(std::move(aOther.mSegments)) {}
+  SegmentedVector& operator=(SegmentedVector&& aOther) {
+    if (&aOther != this) {
+      this->~SegmentedVector();
+      new (this) SegmentedVector(std::move(aOther));
+    }
+    return *this;
+  }
+
+  ~SegmentedVector() { Clear(); }
+
+  bool IsEmpty() const { return !mSegments.getFirst(); }
+
+  size_t Length() const {
+    size_t n = 0;
+    for (auto segment = mSegments.getFirst(); segment;
+         segment = segment->getNext()) {
+      n += segment->Length();
+    }
+    return n;
+  }
+
+  template <typename U>
+  [[nodiscard]] bool Append(U&& aU) {
+    Segment* last = mSegments.getLast();
+    if (!last || last->Length() == kSegmentCapacity) {
+      last = this->template pod_malloc<Segment>(1);
+      if (!last) {
+        return false;
+      }
+      new (KnownNotNull, last) Segment();
+      mSegments.insertBack(last);
+    }
+    last->Append(std::forward<U>(aU));
+    return true;
+  }
+
+  template <typename U>
+  void InfallibleAppend(U&& aU) {
+    bool ok = Append(std::forward<U>(aU));
+
+#ifdef IMPL_LIBXUL
+    if (MOZ_UNLIKELY(!ok)) {
+      mozalloc_handle_oom(sizeof(Segment));
+    }
+#else
+    MOZ_RELEASE_ASSERT(ok);
+#endif  // MOZ_INTERNAL_API
+  }
+
+  void Clear() {
+    Segment* segment;
+    while ((segment = mSegments.popFirst())) {
+      segment->~Segment();
+      this->free_(segment, 1);
+    }
+  }
+
+  T& GetLast() {
+    MOZ_ASSERT(!IsEmpty());
+    Segment* last = mSegments.getLast();
+    return (*last)[last->Length() - 1];
+  }
+
+  const T& GetLast() const {
+    MOZ_ASSERT(!IsEmpty());
+    Segment* last = mSegments.getLast();
+    return (*last)[last->Length() - 1];
+  }
+
+  void PopLast() {
+    MOZ_ASSERT(!IsEmpty());
+    Segment* last = mSegments.getLast();
+    last->PopLast();
+    if (!last->Length()) {
+      mSegments.popLast();
+      last->~Segment();
+      this->free_(last, 1);
+    }
+  }
+
+  void PopLastN(uint32_t aNumElements) {
+    Segment* last;
+
+    do {
+      last = mSegments.getLast();
+
+      if (!last) {
+        return;
+      }
+
+      uint32_t segmentLen = last->Length();
+      if (segmentLen > aNumElements) {
+        break;
+      }
+
+      mSegments.popLast();
+      last->~Segment();
+      this->free_(last, 1);
+
+      MOZ_ASSERT(aNumElements >= segmentLen);
+      aNumElements -= segmentLen;
+      if (aNumElements == 0) {
+        return;
+      }
+    } while (true);
+
+    MOZ_ASSERT(last);
+    MOZ_ASSERT(last == mSegments.getLast());
+    MOZ_ASSERT(aNumElements < last->Length());
+    for (uint32_t i = 0; i < aNumElements; ++i) {
+      last->PopLast();
+    }
+    MOZ_ASSERT(last->Length() != 0);
+  }
+
+  class IterImpl {
+    friend class SegmentedVector;
+
+    Segment* mSegment;
+    size_t mIndex;
+
+    explicit IterImpl(SegmentedVector* aVector, bool aFromFirst)
+        : mSegment(aFromFirst ? aVector->mSegments.getFirst()
+                              : aVector->mSegments.getLast()),
+          mIndex(aFromFirst ? 0 : (mSegment ? mSegment->Length() - 1 : 0)) {
+      MOZ_ASSERT_IF(mSegment, mSegment->Length() > 0);
+    }
+
+   public:
+    bool Done() const {
+      MOZ_ASSERT_IF(mSegment, mSegment->isInList());
+      MOZ_ASSERT_IF(mSegment, mIndex < mSegment->Length());
+      return !mSegment;
+    }
+
+    T& Get() {
+      MOZ_ASSERT(!Done());
+      return (*mSegment)[mIndex];
+    }
+
+    const T& Get() const {
+      MOZ_ASSERT(!Done());
+      return (*mSegment)[mIndex];
+    }
+
+    void Next() {
+      MOZ_ASSERT(!Done());
+      mIndex++;
+      if (mIndex == mSegment->Length()) {
+        mSegment = mSegment->getNext();
+        mIndex = 0;
+      }
+    }
+
+    void Prev() {
+      MOZ_ASSERT(!Done());
+      if (mIndex == 0) {
+        mSegment = mSegment->getPrevious();
+        if (mSegment) {
+          mIndex = mSegment->Length() - 1;
+        }
+      } else {
+        --mIndex;
+      }
+    }
+  };
+
+  IterImpl Iter() { return IterImpl(this, true); }
+  IterImpl IterFromLast() { return IterImpl(this, false); }
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return mSegments.sizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+ private:
+  mozilla::LinkedList<Segment> mSegments;
+};
+
+}  
+
+#endif /* mozilla_SegmentedVector_h */

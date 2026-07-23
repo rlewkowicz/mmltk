@@ -1,0 +1,52 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ArenaAllocatorExtensions_h
+#define mozilla_ArenaAllocatorExtensions_h
+
+#include "mozilla/ArenaAllocator.h"
+#include "mozilla/CheckedInt.h"
+#include "nsAString.h"
+
+namespace mozilla {
+
+namespace detail {
+
+template <typename T, size_t ArenaSize, size_t Alignment>
+T* DuplicateString(const T* aSrc, const CheckedInt<size_t>& aLen,
+                   ArenaAllocator<ArenaSize, Alignment>& aArena);
+
+}  
+
+template <typename T, size_t ArenaSize, size_t Alignment>
+T* ArenaStrdup(const T* aStr, ArenaAllocator<ArenaSize, Alignment>& aArena) {
+  return detail::DuplicateString(aStr, nsCharTraits<T>::length(aStr), aArena);
+}
+
+template <typename T, size_t ArenaSize, size_t Alignment>
+T* ArenaStrdup(const detail::nsTStringRepr<T>& aStr,
+               ArenaAllocator<ArenaSize, Alignment>& aArena) {
+  return detail::DuplicateString(aStr.BeginReading(), aStr.Length(), aArena);
+}
+
+template <typename T, size_t ArenaSize, size_t Alignment>
+T* detail::DuplicateString(const T* aSrc, const CheckedInt<size_t>& aLen,
+                           ArenaAllocator<ArenaSize, Alignment>& aArena) {
+  const auto byteLen = (aLen + 1) * sizeof(T);
+  if (!byteLen.isValid()) {
+    return nullptr;
+  }
+
+  T* p = static_cast<T*>(aArena.Allocate(byteLen.value(), mozilla::fallible));
+  if (p) {
+    memcpy(p, aSrc, byteLen.value() - sizeof(T));
+    p[aLen.value()] = T(0);
+  }
+
+  return p;
+}
+
+}  
+
+#endif  // mozilla_ArenaAllocatorExtensions_h

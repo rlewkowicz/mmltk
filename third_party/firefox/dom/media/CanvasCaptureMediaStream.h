@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_CanvasCaptureMediaStream_h_
+#define mozilla_dom_CanvasCaptureMediaStream_h_
+
+#include "DOMMediaStream.h"
+#include "PrincipalHandle.h"
+#include "mozilla/dom/HTMLCanvasElement.h"
+
+class nsIPrincipal;
+
+namespace mozilla {
+class DOMMediaStream;
+class SourceMediaTrack;
+
+namespace layers {
+class Image;
+}  
+
+namespace dom {
+class CanvasCaptureMediaStream;
+class HTMLCanvasElement;
+class OutputStreamFrameListener;
+
+
+class OutputStreamDriver : public FrameCaptureListener {
+ public:
+  OutputStreamDriver(SourceMediaTrack* aSourceStream,
+                     const PrincipalHandle& aPrincipalHandle);
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(OutputStreamDriver);
+
+  virtual void RequestFrameCapture() = 0;
+
+  void SetImage(RefPtr<layers::Image>&& aImage, const TimeStamp& aTime);
+
+  void EndTrack();
+
+  const RefPtr<SourceMediaTrack> mSourceStream;
+  const PrincipalHandle mPrincipalHandle;
+
+ protected:
+  virtual ~OutputStreamDriver();
+};
+
+class CanvasCaptureMediaStream : public DOMMediaStream {
+ public:
+  CanvasCaptureMediaStream(nsPIDOMWindowInner* aWindow,
+                           HTMLCanvasElement* aCanvas);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(CanvasCaptureMediaStream,
+                                           DOMMediaStream)
+
+  nsresult Init(const dom::Optional<double>& aFPS, nsIPrincipal* aPrincipal);
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  HTMLCanvasElement* Canvas() const { return mCanvas; }
+  void RequestFrame();
+
+  dom::FrameCaptureListener* FrameCaptureListener();
+
+  void StopCapture();
+
+  SourceMediaTrack* GetSourceStream() const;
+
+ protected:
+  ~CanvasCaptureMediaStream();
+
+ private:
+  RefPtr<HTMLCanvasElement> mCanvas;
+  RefPtr<OutputStreamDriver> mOutputStreamDriver;
+};
+
+}  
+}  
+
+#endif /* mozilla_dom_CanvasCaptureMediaStream_h_ */

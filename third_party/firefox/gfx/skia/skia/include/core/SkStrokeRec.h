@@ -1,0 +1,114 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkStrokeRec_DEFINED)
+#define SkStrokeRec_DEFINED
+
+#include "include/core/SkPaint.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkMacros.h"
+
+#include <cmath>
+#include <cstdint>
+
+class SkPath;
+class SkPathBuilder;
+
+SK_BEGIN_REQUIRE_DENSE
+class SK_API SkStrokeRec {
+public:
+    enum InitStyle {
+        kHairline_InitStyle,
+        kFill_InitStyle
+    };
+    explicit SkStrokeRec(InitStyle style);
+    SkStrokeRec(const SkPaint&, SkPaint::Style, SkScalar resScale = 1);
+    explicit SkStrokeRec(const SkPaint&, SkScalar resScale = 1);
+
+    enum Style {
+        kHairline_Style,
+        kFill_Style,
+        kStroke_Style,
+        kStrokeAndFill_Style
+    };
+
+    static constexpr int kStyleCount = kStrokeAndFill_Style + 1;
+
+    Style getStyle() const;
+    SkScalar getWidth() const { return fWidth; }
+    SkScalar getMiter() const { return fMiterLimit; }
+    SkPaint::Cap getCap() const { return (SkPaint::Cap)fCap; }
+    SkPaint::Join getJoin() const { return (SkPaint::Join)fJoin; }
+
+    bool isHairlineStyle() const {
+        return kHairline_Style == this->getStyle();
+    }
+
+    bool isFillStyle() const {
+        return kFill_Style == this->getStyle();
+    }
+
+    void setFillStyle();
+    void setHairlineStyle();
+    void setStrokeStyle(SkScalar width, bool strokeAndFill = false);
+
+    void setStrokeParams(SkPaint::Cap cap, SkPaint::Join join, SkScalar miterLimit) {
+        fCap = cap;
+        fJoin = join;
+        fMiterLimit = miterLimit;
+    }
+
+    SkScalar getResScale() const {
+        return fResScale;
+    }
+
+    void setResScale(SkScalar rs) {
+        SkASSERT(rs > 0 && std::isfinite(rs));
+        fResScale = rs;
+    }
+
+    bool needToApply() const {
+        Style style = this->getStyle();
+        return (kStroke_Style == style) || (kStrokeAndFill_Style == style);
+    }
+
+    bool applyToPath(SkPathBuilder* dst, const SkPath& src) const;
+
+    void applyToPaint(SkPaint* paint) const;
+
+    SkScalar getInflationRadius() const;
+
+    static SkScalar GetInflationRadius(const SkPaint&, SkPaint::Style);
+
+    static SkScalar GetInflationRadius(SkPaint::Join, SkScalar miterLimit, SkPaint::Cap,
+                                       SkScalar strokeWidth);
+
+    bool hasEqualEffect(const SkStrokeRec& other) const {
+        if (!this->needToApply()) {
+            return this->getStyle() == other.getStyle();
+        }
+        return fWidth == other.fWidth &&
+               (fJoin != SkPaint::kMiter_Join || fMiterLimit == other.fMiterLimit) &&
+               fCap == other.fCap &&
+               fJoin == other.fJoin &&
+               fStrokeAndFill == other.fStrokeAndFill;
+    }
+
+private:
+    void init(const SkPaint&, SkPaint::Style, SkScalar resScale);
+
+    SkScalar        fResScale;
+    SkScalar        fWidth;
+    SkScalar        fMiterLimit;
+    uint32_t        fCap : 16;             
+    uint32_t        fJoin : 15;            
+    uint32_t        fStrokeAndFill : 1;    
+};
+SK_END_REQUIRE_DENSE
+
+#endif

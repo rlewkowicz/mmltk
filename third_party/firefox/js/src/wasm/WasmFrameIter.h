@@ -1,0 +1,363 @@
+/*
+ * Copyright 2014 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_frame_iter_h
+#define wasm_frame_iter_h
+
+#include "js/ColumnNumber.h"  // JS::TaggedColumnNumberOneOrigin
+#include "js/ProfilingFrameIterator.h"
+#include "js/TypeDecls.h"
+
+#include "wasm/WasmCode.h"          // For CodeBlockKind
+#include "wasm/WasmCodegenTypes.h"  // for BytecodeOffsetSpan
+
+namespace js {
+
+namespace jit {
+class JitActivation;
+class MacroAssembler;
+struct Register;
+enum class FrameType;
+}  
+
+namespace wasm {
+
+class CallIndirectId;
+class Code;
+class CodeRange;
+class DebugFrame;
+class Instance;
+class Instance;
+
+struct CallableOffsets;
+struct ImportOffsets;
+struct FuncOffsets;
+struct Offsets;
+class Frame;
+class FrameWithInstances;
+struct Handlers;
+class ContStack;
+
+using RegisterState = JS::ProfilingFrameIterator::RegisterState;
+
+
+class WasmFrameIter {
+
+  JSContext* cx_ = nullptr;
+  jit::JitActivation* activation_ = nullptr;
+  bool isLeavingFrames_ = false;
+  bool enableInlinedFrames_ = false;
+
+
+  const Code* code_ = nullptr;
+  uint32_t funcIndex_ = UINT32_MAX;
+  uint32_t bytecodeOffset_ = UINT32_MAX;
+  BytecodeOffsetSpan inlinedCallerOffsets_;
+  Frame* fp_ = nullptr;
+  Instance* instance_ = nullptr;
+  uint8_t* resumePCinCurrentFrame_ = nullptr;
+  bool failedUnwindSignatureMismatch_ = false;
+  bool currentFrameStackSwitched_ = false;
+#ifdef ENABLE_WASM_JSPI
+  ContStack* contStack_ = nullptr;
+#endif
+
+
+  void** unwoundAddressOfReturnAddress_ = nullptr;
+  uint8_t* unwoundCallerFP_ = nullptr;
+  bool unwoundCallerFPIsJSJit_ = false;
+
+  void popFrame(bool isLeavingFrame);
+
+ public:
+  explicit WasmFrameIter(jit::JitActivation* activation, Frame* fp = nullptr);
+
+  WasmFrameIter(Instance* instance, Frame* fp, void* returnAddress);
+
+  void setIsLeavingFrames() {
+    MOZ_ASSERT(activation_);
+    MOZ_ASSERT(!isLeavingFrames_);
+    isLeavingFrames_ = true;
+  }
+
+  void enableInlinedFrames() { enableInlinedFrames_ = true; }
+
+  JSContext* cx() const { return cx_; }
+
+
+  void operator++();
+  bool done() const;
+
+
+  bool hasSourceInfo() const;
+  const char* filename() const;
+  JSAtom* functionDisplayAtom() const;
+  unsigned bytecodeOffset() const;
+  uint32_t funcIndex() const;
+  unsigned computeLine(JS::TaggedColumnNumberOneOrigin* column) const;
+
+
+  Instance* instance() const {
+    MOZ_ASSERT(!done());
+    return instance_;
+  }
+
+  Frame* frame() const {
+    MOZ_ASSERT(!done());
+    MOZ_ASSERT(!enableInlinedFrames_);
+    return fp_;
+  }
+
+  uint8_t* resumePCinCurrentFrame() const {
+    MOZ_ASSERT(!done());
+    MOZ_ASSERT(!enableInlinedFrames_);
+    return resumePCinCurrentFrame_;
+  }
+
+  bool currentFrameStackSwitched() const {
+    MOZ_ASSERT(!done());
+    return currentFrameStackSwitched_;
+  }
+
+#ifdef ENABLE_WASM_JSPI
+  ContStack* contStack() const {
+    MOZ_ASSERT(!done());
+    return contStack_;
+  }
+#endif
+
+
+  bool debugEnabled() const;
+
+  DebugFrame* debugFrame() const;
+
+
+  void** unwoundAddressOfReturnAddress() const {
+    MOZ_ASSERT(done());
+    MOZ_ASSERT(unwoundAddressOfReturnAddress_);
+    return unwoundAddressOfReturnAddress_;
+  }
+
+  uint8_t* unwoundCallerFP() const {
+    MOZ_ASSERT(done());
+    MOZ_ASSERT(unwoundCallerFP_);
+    return unwoundCallerFP_;
+  }
+
+  bool unwoundCallerFPIsJSJit() const {
+    MOZ_ASSERT(done());
+    MOZ_ASSERT_IF(unwoundCallerFPIsJSJit_, unwoundCallerFP_);
+    return unwoundCallerFPIsJSJit_;
+  }
+};
+
+enum class SymbolicAddress;
+
+class ExitReason {
+ public:
+  enum class Fixed : uint32_t {
+    None,           
+    ImportJit,      
+    ImportInterp,   
+    BuiltinNative,  
+    Trap,           
+    DebugStub,      
+    RequestTierUp   
+  };
+
+ private:
+  uint32_t payload_;
+
+  ExitReason() : ExitReason(Fixed::None) {}
+
+ public:
+  MOZ_IMPLICIT ExitReason(Fixed exitReason)
+      : payload_(0x0 | (uint32_t(exitReason) << 1)) {
+    MOZ_ASSERT(isFixed());
+    MOZ_ASSERT_IF(isNone(), payload_ == 0);
+  }
+
+  explicit ExitReason(SymbolicAddress sym)
+      : payload_(0x1 | (uint32_t(sym) << 1)) {
+    MOZ_ASSERT(uint32_t(sym) <= (UINT32_MAX << 1), "packing constraints");
+    MOZ_ASSERT(!isFixed());
+  }
+
+  static ExitReason Decode(uint32_t payload) {
+    ExitReason reason;
+    reason.payload_ = payload;
+    return reason;
+  }
+
+  static ExitReason None() { return ExitReason(ExitReason::Fixed::None); }
+
+  bool isFixed() const { return (payload_ & 0x1) == 0; }
+  bool isNone() const { return isFixed() && fixed() == Fixed::None; }
+  bool isNative() const {
+    return !isFixed() || fixed() == Fixed::BuiltinNative;
+  }
+
+  uint32_t encode() const { return payload_; }
+  Fixed fixed() const {
+    MOZ_ASSERT(isFixed());
+    return Fixed(payload_ >> 1);
+  }
+  SymbolicAddress symbolic() const {
+    MOZ_ASSERT(!isFixed());
+    return SymbolicAddress(payload_ >> 1);
+  }
+};
+
+class ProfilingFrameIterator {
+ public:
+  enum class Category {
+    Baseline,
+    Ion,
+    Other,
+  };
+
+ private:
+  const Code* code_;
+  const CodeRange* codeRange_;
+  Category category_;
+  uint8_t* callerFP_;
+  void* callerPC_;
+  void* stackAddress_;
+  void* endStackAddress_ = nullptr;
+  uint8_t* unwoundJitCallerFP_;
+  ExitReason exitReason_;
+
+  void initFromExitFP(const Frame* fp);
+
+ public:
+  ProfilingFrameIterator();
+
+  explicit ProfilingFrameIterator(const jit::JitActivation& activation);
+
+  explicit ProfilingFrameIterator(const Frame* fp);
+
+  ProfilingFrameIterator(const jit::JitActivation& activation,
+                         const RegisterState& state);
+
+  void operator++();
+
+  bool done() const {
+    MOZ_ASSERT_IF(!exitReason_.isNone(), codeRange_);
+    return !codeRange_;
+  }
+
+  void* stackAddress() const {
+    MOZ_ASSERT(!done());
+    return stackAddress_;
+  }
+  uint8_t* unwoundJitCallerFP() const {
+    MOZ_ASSERT(done());
+    return unwoundJitCallerFP_;
+  }
+  const char* label() const;
+
+  Category category() const;
+
+  void* endStackAddress() const { return endStackAddress_; }
+
+  static ProfilingFrameIterator::Category categoryFromCodeBlock(
+      CodeBlockKind kind) {
+    if (kind == CodeBlockKind::BaselineTier) {
+      return ProfilingFrameIterator::Category::Baseline;
+    }
+    if (kind == CodeBlockKind::OptimizedTier) {
+      return ProfilingFrameIterator::Category::Ion;
+    }
+    return ProfilingFrameIterator::Category::Other;
+  }
+};
+
+const char* ThunkedNativeToDescription(SymbolicAddress func);
+
+
+void LoadActivation(jit::MacroAssembler& masm, jit::Register instance,
+                    jit::Register dest);
+void SetExitFP(jit::MacroAssembler& masm, ExitReason reason,
+               jit::Register activation, jit::Register scratch);
+void ClearExitFP(jit::MacroAssembler& masm, jit::Register activation);
+
+#ifdef ENABLE_WASM_JSPI
+void GenerateExitPrologueMainStackSwitch(jit::MacroAssembler& masm,
+                                         jit::Address savedStackSlots,
+                                         jit::Register instance,
+                                         jit::Register scratch1,
+                                         jit::Register scratch2,
+                                         jit::Register scratch3);
+
+void GenerateExitEpilogueMainStackReturn(jit::MacroAssembler& masm,
+                                         jit::Address savedStackSlots,
+                                         jit::Register instance,
+                                         jit::Register scratch1,
+                                         jit::Register scratch2);
+#endif
+
+enum class ExitFrameAlignment {
+  Static,
+  Dynamic,
+};
+
+void GenerateExitPrologue(jit::MacroAssembler& masm, ExitReason reason,
+                          bool switchToMainStack, ExitFrameAlignment alignment,
+                          unsigned frameSize, CallableOffsets* offsets);
+void GenerateExitEpilogue(jit::MacroAssembler& masm, ExitReason reason,
+                          bool switchToMainStack, ExitFrameAlignment alignment,
+                          CallableOffsets* offsets);
+
+void GenerateMinimalPrologue(jit::MacroAssembler& masm, uint32_t* entry);
+void GenerateMinimalEpilogue(jit::MacroAssembler& masm, uint32_t* ret);
+
+void GenerateJitExitPrologue(jit::MacroAssembler& masm, uint32_t fallbackOffset,
+                             ImportOffsets* offsets);
+void GenerateJitExitEpilogue(jit::MacroAssembler& masm,
+                             CallableOffsets* offsets);
+
+void GenerateJitEntryPrologue(jit::MacroAssembler& masm,
+                              CallableOffsets* offsets);
+void GenerateJitEntryEpilogue(jit::MacroAssembler& masm,
+                              CallableOffsets* offsets);
+
+void GenerateFunctionPrologue(jit::MacroAssembler& masm,
+                              const CallIndirectId& callIndirectId,
+                              const mozilla::Maybe<uint32_t>& tier1FuncIndex,
+                              FuncOffsets* offsets);
+void GenerateFunctionEpilogue(jit::MacroAssembler& masm, unsigned framePushed,
+                              FuncOffsets* offsets);
+
+const Instance* GetNearestEffectiveInstance(const Frame* fp);
+Instance* GetNearestEffectiveInstance(Frame* fp);
+
+
+struct UnwindState {
+  uint8_t* fp;
+  void* pc;
+  const Code* code;
+  const CodeRange* codeRange;
+  UnwindState() : fp(nullptr), pc(nullptr), code(nullptr), codeRange(nullptr) {}
+};
+
+
+bool StartUnwinding(const RegisterState& registers, UnwindState* unwindState,
+                    bool* unwoundCaller);
+
+}  
+}  
+
+#endif  // wasm_frame_iter_h

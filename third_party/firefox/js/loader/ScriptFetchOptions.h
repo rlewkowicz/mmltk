@@ -1,0 +1,79 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_loader_ScriptFecthOptions_h
+#define js_loader_ScriptFecthOptions_h
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/dom/ReferrerPolicyBinding.h"
+#include "mozilla/dom/RequestBinding.h"  // RequestPriority
+#include "nsCOMPtr.h"
+#include "nsIPrincipal.h"
+
+namespace JS::loader {
+
+enum class ParserMetadata : uint8_t {
+  NotParserInserted,
+  ParserInserted,
+};
+
+
+class ScriptFetchOptions {
+  ~ScriptFetchOptions();
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ScriptFetchOptions)
+
+  ScriptFetchOptions(mozilla::CORSMode aCORSMode, const nsAString& aNonce,
+                     mozilla::dom::RequestPriority aFetchPriority,
+                     const ParserMetadata aParserMetadata,
+                     nsIPrincipal* aTriggeringPrincipal = nullptr);
+
+  static already_AddRefed<ScriptFetchOptions> CreateDefault();
+
+  void SetTriggeringPrincipal(nsIPrincipal* aTriggeringPrincipal);
+
+  inline bool IsCompatibleExcludingNonce(ScriptFetchOptions* other) {
+    if (this == other) {
+      return true;
+    }
+
+    if (mTriggeringPrincipal && other->mTriggeringPrincipal) {
+      bool equals;
+      (void)mTriggeringPrincipal->Equals(other->mTriggeringPrincipal, &equals);
+      if (!equals) {
+        return false;
+      }
+    } else if (mTriggeringPrincipal || other->mTriggeringPrincipal) {
+      return false;
+    }
+
+    return mCORSMode == other->mCORSMode;
+  }
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return mNonce.SizeOfExcludingThisIfUnshared(aMallocSizeOf);
+  }
+
+ public:
+
+  const mozilla::CORSMode mCORSMode;
+
+  const mozilla::dom::RequestPriority mFetchPriority;
+
+  const ParserMetadata mParserMetadata;
+
+  nsCOMPtr<nsIPrincipal> mTriggeringPrincipal;
+
+  const nsString mNonce;
+};
+
+}  
+
+#endif  // js_loader_ScriptFetchOptions_h

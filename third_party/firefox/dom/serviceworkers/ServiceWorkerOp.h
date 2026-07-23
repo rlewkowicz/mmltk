@@ -1,0 +1,166 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_serviceworkerop_h_
+#define mozilla_dom_serviceworkerop_h_
+
+#include <functional>
+
+#include "ServiceWorkerEvents.h"
+#include "ServiceWorkerOpPromise.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/PromiseNativeHandler.h"
+#include "mozilla/dom/RemoteWorkerChild.h"
+#include "mozilla/dom/RemoteWorkerOp.h"
+#include "mozilla/dom/ServiceWorkerOpArgs.h"
+#include "mozilla/dom/ServiceWorkerOpPromise.h"
+#include "mozilla/dom/WorkerRunnable.h"
+#include "nsISupportsImpl.h"
+
+namespace mozilla::dom {
+
+using remoteworker::RemoteWorkerState;
+
+class FetchEventOpProxyChild;
+
+class ServiceWorkerOp : public RemoteWorkerOp {
+ public:
+  static already_AddRefed<ServiceWorkerOp> Create(
+      ServiceWorkerOpArgs&& aArgs,
+      std::function<void(const ServiceWorkerOpResult&)>&& aCallback);
+
+  ServiceWorkerOp(
+      ServiceWorkerOpArgs&& aArgs,
+      std::function<void(const ServiceWorkerOpResult&)>&& aCallback);
+
+  ServiceWorkerOp(const ServiceWorkerOp&) = delete;
+
+  ServiceWorkerOp& operator=(const ServiceWorkerOp&) = delete;
+
+  ServiceWorkerOp(ServiceWorkerOp&&) = default;
+
+  ServiceWorkerOp& operator=(ServiceWorkerOp&&) = default;
+
+  bool MaybeStart(RemoteWorkerChild* aOwner, RemoteWorkerState& aState) final;
+
+  void StartOnMainThread(RefPtr<RemoteWorkerChild>& aOwner) final;
+
+  void Start(RemoteWorkerNonLifeCycleOpControllerChild* aOwner,
+             RemoteWorkerState& aState) final;
+
+  void Cancel() final;
+
+ protected:
+  ~ServiceWorkerOp();
+
+  bool Started() const;
+
+  bool IsTerminationOp() const;
+
+  virtual RefPtr<WorkerThreadRunnable> GetRunnable(
+      WorkerPrivate* aWorkerPrivate);
+
+  virtual bool Exec(JSContext* aCx, WorkerPrivate* aWorkerPrivate) = 0;
+
+  virtual void RejectAll(nsresult aStatus);
+
+  ServiceWorkerOpArgs mArgs;
+
+  MozPromiseHolder<ServiceWorkerOpPromise> mPromiseHolder;
+
+ private:
+  class ServiceWorkerOpRunnable;
+
+  bool mStarted = false;
+};
+
+class ExtendableEventOp : public ServiceWorkerOp,
+                          public ExtendableEventCallback {
+  using ServiceWorkerOp::ServiceWorkerOp;
+
+ protected:
+  ~ExtendableEventOp() = default;
+
+  void FinishedWithResult(ExtendableEventResult aResult) override;
+};
+
+class FetchEventOp final : public ExtendableEventOp,
+                           public PromiseNativeHandler {
+  using ExtendableEventOp::ExtendableEventOp;
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+  void SetActor(RefPtr<FetchEventOpProxyChild> aActor);
+
+  void RevokeActor(FetchEventOpProxyChild* aActor);
+
+  RefPtr<FetchEventRespondWithPromise> GetRespondWithPromise();
+
+  void RespondWithCalledAt(const nsCString& aRespondWithScriptSpec,
+                           uint32_t aRespondWithLineNumber,
+                           uint32_t aRespondWithColumnNumber);
+
+  void ReportCanceled(const nsCString& aPreventDefaultScriptSpec,
+                      uint32_t aPreventDefaultLineNumber,
+                      uint32_t aPreventDefaultColumnNumber);
+
+ private:
+  class AutoCancel;
+
+  ~FetchEventOp();
+
+  bool Exec(JSContext* aCx, WorkerPrivate* aWorkerPrivate) override;
+
+  void RejectAll(nsresult aStatus) override;
+
+  void FinishedWithResult(ExtendableEventResult aResult) override;
+
+  void ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                        ErrorResult& aRv) override;
+
+  void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                        ErrorResult& aRv) override;
+
+  void MaybeFinished();
+
+  void AsyncLog(const nsCString& aMessageName, nsTArray<nsString> aParams);
+
+  void AsyncLog(const nsCString& aScriptSpec, uint32_t aLineNumber,
+                uint32_t aColumnNumber, const nsCString& aMessageName,
+                nsTArray<nsString> aParams);
+
+  void GetRequestURL(nsAString& aOutRequestURL);
+
+  nsresult DispatchFetchEvent(JSContext* aCx, WorkerPrivate* aWorkerPrivate);
+
+  RefPtr<FetchEventOpProxyChild> mActor;
+
+  MozPromiseHolder<FetchEventRespondWithPromise> mRespondWithPromiseHolder;
+
+  Maybe<ExtendableEventResult> mResult;
+  bool mPostDispatchChecksDone = false;
+
+  Maybe<FetchEventRespondWithClosure> mRespondWithClosure;
+
+  RefPtr<Promise> mHandled;
+
+  RefPtr<Promise> mPreloadResponse;
+
+  MozPromiseRequestHolder<FetchEventPreloadResponseAvailablePromise>
+      mPreloadResponseAvailablePromiseRequestHolder;
+  MozPromiseRequestHolder<FetchEventPreloadResponseTimingPromise>
+      mPreloadResponseTimingPromiseRequestHolder;
+  MozPromiseRequestHolder<FetchEventPreloadResponseEndPromise>
+      mPreloadResponseEndPromiseRequestHolder;
+
+  TimeStamp mFetchHandlerStart;
+  TimeStamp mFetchHandlerFinish;
+};
+
+}  
+
+#endif  // mozilla_dom_serviceworkerop_h_

@@ -1,0 +1,297 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef FragmentOrElement_h_
+#define FragmentOrElement_h_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/RadioGroupContainer.h"
+#include "nsAtomHashKeys.h"
+#include "nsCycleCollectionParticipant.h"  // NS_DECL_CYCLE_*
+#include "nsIContent.h"                    // base class
+#include "nsIWeakReferenceUtils.h"
+#include "nsTHashSet.h"
+
+class ContentUnbinder;
+class nsDOMAttributeMap;
+class nsDOMTokenList;
+class nsIControllers;
+class nsDOMCSSAttributeDeclaration;
+class nsDOMCSSDeclaration;
+class nsDOMStringMap;
+class nsIURI;
+
+namespace mozilla {
+struct StyleLockedDeclarationBlock;
+enum class ContentRelevancyReason;
+using ContentRelevancy = EnumSet<ContentRelevancyReason, uint8_t>;
+class ElementAnimationData;
+namespace dom {
+class ContentList;
+class Element;
+class HTMLCollection;
+class LabelsNodeList;
+class PopoverData;
+class StylePropertyMap;
+class StylePropertyMapReadOnly;
+struct CustomElementData;
+}  
+}  
+
+class nsNodeSupportsWeakRefTearoff final : public nsISupportsWeakReference {
+ public:
+  explicit nsNodeSupportsWeakRefTearoff(nsINode* aNode) : mNode(aNode) {}
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+
+  NS_DECL_NSISUPPORTSWEAKREFERENCE
+
+  NS_DECL_CYCLE_COLLECTION_CLASS(nsNodeSupportsWeakRefTearoff)
+
+ private:
+  ~nsNodeSupportsWeakRefTearoff() = default;
+
+  nsCOMPtr<nsINode> mNode;
+};
+
+namespace mozilla::dom {
+
+class DOMIntersectionObserver;
+class ShadowRoot;
+
+class FragmentOrElement : public nsIContent {
+ public:
+  explicit FragmentOrElement(
+      already_AddRefed<mozilla::dom::NodeInfo>& aNodeInfo);
+  explicit FragmentOrElement(
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo);
+
+  NS_IMETHOD QueryInterface(REFNSIID aIID, void** aInstancePtr) override;
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(FragmentOrElement, nsIContent);
+
+  NS_DECL_ADDSIZEOFEXCLUDINGTHIS
+
+  virtual void GetTextContentInternal(nsAString& aTextContent,
+                                      mozilla::OOMReporter& aError) override;
+  virtual void SetTextContentInternal(
+      const nsAString& aTextContent, nsIPrincipal* aSubjectPrincipal,
+      mozilla::ErrorResult& aError,
+      MutationEffectOnScript aMutationEffectOnScript) override;
+
+  const CharacterDataBuffer* GetCharacterDataBuffer() const override;
+  uint32_t TextLength() const override;
+  bool TextIsOnlyWhitespace() override;
+  bool ThreadSafeTextIsOnlyWhitespace() const override;
+
+  void DestroyContent() override;
+  void SaveSubtreeState() override;
+
+  HTMLCollection* Children();
+  uint32_t ChildElementCount();
+
+  RadioGroupContainer& OwnedRadioGroupContainer() {
+    auto* slots = ExtendedDOMSlots();
+    if (!slots->mRadioGroupContainer) {
+      slots->mRadioGroupContainer = MakeUnique<RadioGroupContainer>();
+    }
+    return *slots->mRadioGroupContainer;
+  }
+
+ public:
+  NS_DECL_CYCLE_COLLECTION_SKIPPABLE_WRAPPERCACHE_CLASS_INHERITED(
+      FragmentOrElement, nsIContent)
+
+  static void ClearContentUnbinder();
+  static bool CanSkip(nsINode* aNode, bool aRemovingAllowed);
+  static bool CanSkipInCC(nsINode* aNode);
+  static bool CanSkipThis(nsINode* aNode);
+  static void RemoveBlackMarkedNode(nsINode* aNode);
+  static void MarkNodeChildren(nsINode* aNode);
+  static void InitCCCallbacks();
+
+  static bool IsHTMLVoid(const nsAtom* aLocalName);
+
+ protected:
+  virtual ~FragmentOrElement();
+
+  nsresult CopyInnerTo(FragmentOrElement* aDest) { return NS_OK; }
+
+ public:
+
+  class nsExtendedDOMSlots : public nsIContent::nsExtendedContentSlots {
+   public:
+    nsExtendedDOMSlots();
+    ~nsExtendedDOMSlots();
+
+    void TraverseExtendedSlots(nsCycleCollectionTraversalCallback&) final;
+    void UnlinkExtendedSlots(nsIContent&) final;
+
+    size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const final;
+
+    RefPtr<nsDOMCSSAttributeDeclaration> mSMILOverrideStyle;
+
+    RefPtr<mozilla::StyleLockedDeclarationBlock> mSMILOverrideStyleDeclaration;
+
+    nsCOMPtr<nsIControllers> mControllers;
+
+    RefPtr<mozilla::dom::LabelsNodeList> mLabelsList;
+
+    RefPtr<ShadowRoot> mShadowRoot;
+
+    UniquePtr<CustomElementData> mCustomElementData;
+
+    UniquePtr<ElementAnimationData> mAnimations;
+
+    UniquePtr<PopoverData> mPopoverData;
+
+    nsWeakPtr mAssociatedPopover;
+
+    nsTArray<RefPtr<nsAtom>> mCustomStates;
+
+    UniquePtr<RadioGroupContainer> mRadioGroupContainer;
+
+    Maybe<float> mLastRememberedBSize;
+    Maybe<float> mLastRememberedISize;
+
+    Maybe<ContentRelevancy> mContentRelevancy;
+
+    Maybe<bool> mVisibleForContentVisibility;
+
+    bool mTemporarilyVisibleForScrolledIntoViewDescendant = false;
+
+    nsDOMStringMap* MOZ_UNSAFE_REF("ClearDataSet clears it") mDataset = nullptr;
+
+    RefPtr<nsDOMTokenList> mPart;
+
+    nsTHashMap<RefPtr<nsAtom>, nsWeakPtr> mExplicitlySetAttrElementMap;
+
+    nsTHashMap<RefPtr<nsAtom>, std::pair<Maybe<nsTArray<nsWeakPtr>>,
+                                         Maybe<nsTArray<RefPtr<Element>>>>>
+        mAttrElementsMap;
+
+    typedef bool (*AttrTargetObserver)(Element* aOldElement,
+                                       Element* aNewelement,
+                                       Element* aThisElement);
+    struct AttrElementObserverCallbackData {
+      nsWeakPtr mElement;
+      RefPtr<nsAtom> mAttr;
+    };
+    struct AttrElementObserverData {
+      nsWeakPtr mLastKnownAttrElement;  
+
+      RefPtr<nsAtom> mLastKnownAttrValue;  
+      nsTHashSet<AttrTargetObserver> mObservers;
+
+      UniquePtr<AttrElementObserverCallbackData> mCallbackData;
+    };
+    nsTHashMap<RefPtr<nsAtom>, AttrElementObserverData> mAttrElementObserverMap;
+
+    typedef bool (*ReferenceTargetChangeObserver)(void* aData);
+
+    struct ReferenceTargetChangeCallback {
+      ReferenceTargetChangeObserver mObserver;
+      void* mData;
+    };
+
+    struct ReferenceTargetChangeCallbackEntry : public PLDHashEntryHdr {
+      typedef const ReferenceTargetChangeCallback KeyType;
+      typedef const ReferenceTargetChangeCallback* KeyTypePointer;
+
+      explicit ReferenceTargetChangeCallbackEntry(
+          const ReferenceTargetChangeCallback* aKey)
+          : mKey(*aKey) {}
+      ReferenceTargetChangeCallbackEntry(
+          ReferenceTargetChangeCallbackEntry&& aOther)
+          : PLDHashEntryHdr(std::move(aOther)), mKey(std::move(aOther.mKey)) {}
+
+      KeyType GetKey() const { return mKey; }
+      bool KeyEquals(KeyTypePointer aKey) const {
+        return aKey->mObserver == mKey.mObserver && aKey->mData == mKey.mData;
+      }
+
+      static KeyTypePointer KeyToPointer(KeyType& aKey) { return &aKey; }
+      static PLDHashNumber HashKey(KeyTypePointer aKey) {
+        return HashGeneric(aKey->mObserver, aKey->mData);
+      }
+      enum { ALLOW_MEMMOVE = true };
+
+      ReferenceTargetChangeCallback mKey;
+    };
+    nsTHashSet<ReferenceTargetChangeCallbackEntry> mReferenceTargetObservers;
+  };
+
+  class nsDOMSlots : public nsIContent::nsContentSlots {
+   public:
+    nsDOMSlots();
+    ~nsDOMSlots();
+
+    void Traverse(nsCycleCollectionTraversalCallback&) final;
+    void Unlink(nsINode&) final;
+
+    size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+    nsCOMPtr<nsDOMCSSDeclaration> mStyle;
+
+    RefPtr<nsDOMAttributeMap> mAttributeMap;
+
+    RefPtr<ContentList> mChildrenList;
+
+    RefPtr<nsDOMTokenList> mClassList;
+
+    RefPtr<StylePropertyMapReadOnly> mComputedStyleMap;
+
+    RefPtr<StylePropertyMap> mAttributeStyleMap;
+  };
+
+  class FatSlots final : public nsDOMSlots, public nsExtendedDOMSlots {
+   public:
+    FatSlots() : nsDOMSlots(), nsExtendedDOMSlots() {
+      MOZ_COUNT_CTOR(FatSlots);
+      SetExtendedContentSlots(this, false);
+    }
+
+    ~FatSlots() final { MOZ_COUNT_DTOR(FatSlots); }
+  };
+
+ protected:
+  void GetMarkup(bool aIncludeSelf, nsAString& aMarkup);
+  void SetInnerHTMLInternal(const nsAString& aInnerHTML, ErrorResult& aError);
+
+  nsIContent::nsContentSlots* CreateSlots() override;
+
+  nsIContent::nsExtendedContentSlots* CreateExtendedSlots() final;
+
+  nsDOMSlots* DOMSlots() { return static_cast<nsDOMSlots*>(Slots()); }
+
+  nsDOMSlots* GetExistingDOMSlots() const {
+    return static_cast<nsDOMSlots*>(GetExistingSlots());
+  }
+
+  nsExtendedDOMSlots* ExtendedDOMSlots();
+
+  const nsExtendedDOMSlots* GetExistingExtendedDOMSlots() const {
+    return static_cast<const nsExtendedDOMSlots*>(
+        GetExistingExtendedContentSlots());
+  }
+
+  nsExtendedDOMSlots* GetExistingExtendedDOMSlots() {
+    return static_cast<nsExtendedDOMSlots*>(GetExistingExtendedContentSlots());
+  }
+
+  friend class ::ContentUnbinder;
+};
+
+}  
+
+#define NS_ELEMENT_INTERFACE_TABLE_TO_MAP_SEGUE               \
+  if (NS_SUCCEEDED(rv)) return rv;                            \
+                                                              \
+  rv = FragmentOrElement::QueryInterface(aIID, aInstancePtr); \
+  NS_INTERFACE_TABLE_TO_MAP_SEGUE
+
+#endif /* FragmentOrElement_h_ */

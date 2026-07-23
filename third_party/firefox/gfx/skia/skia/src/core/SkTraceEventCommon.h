@@ -1,0 +1,547 @@
+// Copyright 2015 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+#if !defined(SkTraceEventCommon_DEFINED)
+#define SkTraceEventCommon_DEFINED
+
+#include "include/core/SkTypes.h"
+#include "include/utils/SkTraceEventPhase.h"
+
+
+#if defined(TRACE_EVENT0)
+    #error "Another copy of this file has already been included."
+#endif
+
+
+#if defined(SK_ANDROID_FRAMEWORK_USE_PERFETTO)
+
+#define PERFETTO_TRACK_EVENT_NAMESPACE skia
+#include <perfetto/tracing.h>
+
+#include <cutils/trace.h>
+#include <stdarg.h>
+#include <string_view>
+
+PERFETTO_DEFINE_CATEGORIES(
+    perfetto::Category("GM"),
+    perfetto::Category("skia"),
+    perfetto::Category("skia.android"),
+    perfetto::Category("skia.gpu"),
+    perfetto::Category("skia.gpu.cache"),
+    perfetto::Category("skia.objects"),
+    perfetto::Category("skia.shaders"),
+    perfetto::Category("skottie"),
+    perfetto::Category("test"),
+    perfetto::Category("test_cpu"),
+    perfetto::Category("test_ganesh"),
+    perfetto::Category("test_graphite"),
+    perfetto::Category("GM.always").SetTags("skia.always"),
+    perfetto::Category("skia.always").SetTags("skia.always"),
+    perfetto::Category("skia.android.always").SetTags("skia.always"),
+    perfetto::Category("skia.gpu.always").SetTags("skia.always"),
+    perfetto::Category("skia.gpu.cache.always").SetTags("skia.always"),
+    perfetto::Category("skia.objects.always").SetTags("skia.always"),
+    perfetto::Category("skia.shaders.always").SetTags("skia.always"),
+    perfetto::Category("skottie.always").SetTags("skia.always"),
+    perfetto::Category("test.always").SetTags("skia.always"),
+    perfetto::Category("test_cpu.always").SetTags("skia.always"),
+    perfetto::Category("test_ganesh.always").SetTags("skia.always"),
+    perfetto::Category("test_graphite.always").SetTags("skia.always"),
+);
+
+#endif
+
+#if defined(SK_BUILD_FOR_ANDROID_FRAMEWORK)
+
+#if defined(SK_DISABLE_TRACING)
+#error SK_DISABLE_TRACING and SK_BUILD_FOR_ANDROID_FRAMEWORK are mutually exclusive.
+#endif
+
+#define SK_ANDROID_FRAMEWORK_ATRACE_BUFFER_SIZE 512
+
+class SkAndroidFrameworkTraceUtil {
+public:
+    SkAndroidFrameworkTraceUtil() = delete;
+
+    static void setEnableTracing(bool enableAndroidTracing) {
+        gEnableAndroidTracing = enableAndroidTracing;
+    }
+
+    static bool setUsePerfettoTrackEvents(bool usePerfettoTrackEvents) {
+#if defined(SK_ANDROID_FRAMEWORK_USE_PERFETTO)
+        if (!gUsePerfettoTrackEvents && usePerfettoTrackEvents) {
+            initPerfetto();
+        }
+        gUsePerfettoTrackEvents = usePerfettoTrackEvents;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    static bool getEnableTracing() {
+        return gEnableAndroidTracing;
+    }
+
+    static bool getUsePerfettoTrackEvents() {
+        return gUsePerfettoTrackEvents;
+    }
+
+private:
+    static bool gEnableAndroidTracing;
+    static bool gUsePerfettoTrackEvents;
+
+#if defined(SK_ANDROID_FRAMEWORK_USE_PERFETTO)
+    static void initPerfetto() {
+        ::perfetto::TracingInitArgs perfettoArgs;
+        perfettoArgs.backends |= perfetto::kSystemBackend;
+        ::perfetto::Tracing::Initialize(perfettoArgs);
+        ::skia::TrackEvent::Register();
+    }
+#endif
+};
+#endif
+
+#if defined(SK_DEBUG)
+static void skprintf_like_noop(const char format[], ...) SK_PRINTF_LIKE(1, 2);
+static inline void skprintf_like_noop(const char format[], ...) {}
+template <typename... Args>
+static inline void sk_noop(Args...) {}
+#define TRACE_EMPTY(...) do { sk_noop(__VA_ARGS__); } while (0)
+#define TRACE_EMPTY_FMT(fmt, ...) do { skprintf_like_noop(fmt, ##__VA_ARGS__); } while (0)
+#else
+#define TRACE_EMPTY(...) do {} while (0)
+#define TRACE_EMPTY_FMT(fmt, ...) do {} while (0)
+#endif
+
+#if defined(SK_DISABLE_TRACING) || \
+        (defined(SK_BUILD_FOR_ANDROID_FRAMEWORK) && !defined(SK_ANDROID_FRAMEWORK_USE_PERFETTO))
+
+    #define ATRACE_ANDROID_FRAMEWORK(fmt, ...) TRACE_EMPTY_FMT(fmt, ##__VA_ARGS__)
+    #define ATRACE_ANDROID_FRAMEWORK_ALWAYS(fmt, ...) TRACE_EMPTY_FMT(fmt, ##__VA_ARGS__)
+    #define TRACE_EVENT0(cg, n) TRACE_EMPTY(cg, n)
+    #define TRACE_EVENT1(cg, n, a1n, a1v) TRACE_EMPTY(cg, n, a1n, a1v)
+    #define TRACE_EVENT2(cg, n, a1n, a1v, a2n, a2v) TRACE_EMPTY(cg, n, a1n, a1v, a2n, a2v)
+    #define TRACE_EVENT0_ALWAYS(cg, n) TRACE_EMPTY(cg, n)
+    #define TRACE_EVENT1_ALWAYS(cg, n, a1n, a1v) TRACE_EMPTY(cg, n, a1n, a1v)
+    #define TRACE_EVENT2_ALWAYS(cg, n, a1n, a1v, a2n, a2v) TRACE_EMPTY(cg, n, a1n, a1v, a2n, a2v)
+    #define TRACE_EVENT_INSTANT0(cg, n, scope) TRACE_EMPTY(cg, n, scope)
+    #define TRACE_EVENT_INSTANT1(cg, n, scope, a1n, a1v) TRACE_EMPTY(cg, n, scope, a1n, a1v)
+    #define TRACE_EVENT_INSTANT2(cg, n, scope, a1n, a1v, a2n, a2v)  \
+        TRACE_EMPTY(cg, n, scope, a1n, a1v, a2n, a2v)
+    #define TRACE_EVENT_INSTANT0_ALWAYS(cg, n, scope) TRACE_EMPTY(cg, n, scope)
+    #define TRACE_EVENT_INSTANT1_ALWAYS(cg, n, scope, a1n, a1v) TRACE_EMPTY(cg, n, scope, a1n, a1v)
+    #define TRACE_EVENT_INSTANT2_ALWAYS(cg, n, scope, a1n, a1v, a2n, a2v)  \
+        TRACE_EMPTY(cg, n, scope, a1n, a1v, a2n, a2v)
+    #define TRACE_EVENT_OBJECT_CREATED_WITH_ID(cg, n, id) TRACE_EMPTY(cg, n, id)
+    #define TRACE_EVENT_OBJECT_SNAPSHOT_WITH_ID(cg, n, id, ss) TRACE_EMPTY(cg, n, id, ss)
+    #define TRACE_EVENT_OBJECT_DELETED_WITH_ID(cg, n, id) TRACE_EMPTY(cg, n, id)
+    #define TRACE_COUNTER1(cg, n, value) TRACE_EMPTY(cg, n, value)
+    #define TRACE_COUNTER2(cg, n, v1n, v1v, v2n, v2v) TRACE_EMPTY(cg, n, v1n, v1v, v2n, v2v)
+
+#elif defined(SK_ANDROID_FRAMEWORK_USE_PERFETTO)
+
+namespace skia_private {
+    inline const char* UnboxPerfettoString(const ::perfetto::DynamicString& str) {
+        return str.value;
+    }
+    inline const char* UnboxPerfettoString(const ::perfetto::StaticString& str) {
+        return str.value;
+    }
+    inline const char* UnboxPerfettoString(const char* str) {
+        return str;
+    }
+
+    template<typename T>
+    inline std::string WrapTraceArgInStdString(const T numeric) {
+        return std::to_string(numeric);
+    }
+    inline std::string WrapTraceArgInStdString(const ::perfetto::DynamicString& str) {
+        return std::string(str.value);
+    }
+    inline std::string WrapTraceArgInStdString(const ::perfetto::StaticString& str) {
+        return std::string(str.value);
+    }
+    inline std::string WrapTraceArgInStdString(const char* str) {
+        return std::string(str);
+    }
+
+    constexpr bool StrEndsWithAndLongerThan(const char* str, const char* suffix) {
+        auto strView = std::basic_string_view(str);
+        auto suffixView = std::basic_string_view(suffix);
+        return strView.size() > suffixView.size() &&
+                strView.compare(strView.size() - suffixView.size(),
+                                std::string_view::npos, suffixView) == 0;
+    }
+}
+
+#define SK_PERFETTO_INTERNAL_CONCAT2(a, b) a##b
+#define SK_PERFETTO_INTERNAL_CONCAT(a, b) SK_PERFETTO_INTERNAL_CONCAT2(a, b)
+#define SK_PERFETTO_UID(prefix) SK_PERFETTO_INTERNAL_CONCAT(prefix, __LINE__)
+
+#define SK_INTERNAL_GET_ATRACE_ARGS_MACRO(_0, _1a, _1b, _2a, _2b, macro_name, ...) macro_name
+
+#define SK_INTERNAL_ATRACE_ARGS_BEGIN_DANGEROUS_0(name) \
+    atrace_begin_body(::skia_private::UnboxPerfettoString(name));
+
+#define SK_INTERNAL_ATRACE_ARGS_BEGIN_DANGEROUS_1(name, arg1_name, arg1_val)       \
+    char SK_PERFETTO_UID(skTraceStrBuf1)[SK_ANDROID_FRAMEWORK_ATRACE_BUFFER_SIZE]; \
+    snprintf(SK_PERFETTO_UID(skTraceStrBuf1),                                      \
+             SK_ANDROID_FRAMEWORK_ATRACE_BUFFER_SIZE,                              \
+             "^(%s: %s)",                                                          \
+             ::skia_private::UnboxPerfettoString(arg1_name),                       \
+             ::skia_private::WrapTraceArgInStdString(arg1_val).c_str());           \
+    atrace_begin_body(::skia_private::UnboxPerfettoString(name));                  \
+    atrace_begin_body(SK_PERFETTO_UID(skTraceStrBuf1));
+
+#define SK_INTERNAL_ATRACE_ARGS_BEGIN_DANGEROUS_2(                                 \
+        name, arg1_name, arg1_val, arg2_name, arg2_val, ...)                       \
+    char SK_PERFETTO_UID(skTraceStrBuf1)[SK_ANDROID_FRAMEWORK_ATRACE_BUFFER_SIZE]; \
+    char SK_PERFETTO_UID(skTraceStrBuf2)[SK_ANDROID_FRAMEWORK_ATRACE_BUFFER_SIZE]; \
+    snprintf(SK_PERFETTO_UID(skTraceStrBuf1),                                      \
+             SK_ANDROID_FRAMEWORK_ATRACE_BUFFER_SIZE,                              \
+             "^(%s: %s)",                                                          \
+             ::skia_private::UnboxPerfettoString(arg1_name),                       \
+             ::skia_private::WrapTraceArgInStdString(arg1_val).c_str());           \
+    snprintf(SK_PERFETTO_UID(skTraceStrBuf2),                                      \
+             SK_ANDROID_FRAMEWORK_ATRACE_BUFFER_SIZE,                              \
+            "^(%s: %s)",                                                           \
+             ::skia_private::UnboxPerfettoString(arg2_name),                       \
+             ::skia_private::WrapTraceArgInStdString(arg2_val).c_str());           \
+    atrace_begin_body(::skia_private::UnboxPerfettoString(name));                  \
+    atrace_begin_body(SK_PERFETTO_UID(skTraceStrBuf1));                            \
+    atrace_begin_body(SK_PERFETTO_UID(skTraceStrBuf2));
+
+#define SK_INTERNAL_ATRACE_ARGS_BEGIN(slice_name, ...)                              \
+    if (CC_UNLIKELY(ATRACE_ENABLED())) {                                            \
+        SK_INTERNAL_GET_ATRACE_ARGS_MACRO(0,                                        \
+                                        ##__VA_ARGS__,                              \
+                                        SK_INTERNAL_ATRACE_ARGS_BEGIN_DANGEROUS_2,  \
+                                        0,                                          \
+                                        SK_INTERNAL_ATRACE_ARGS_BEGIN_DANGEROUS_1,  \
+                                        0,                                          \
+                                        SK_INTERNAL_ATRACE_ARGS_BEGIN_DANGEROUS_0)  \
+        (slice_name, ##__VA_ARGS__);                                                \
+    }
+
+#define SK_INTERNAL_ATRACE_ARGS_END_DANGEROUS_2(arg1_name, arg1_val, arg2_name, arg2_val, ...)  \
+    atrace_end_body();                                                                          \
+    atrace_end_body();                                                                          \
+    atrace_end_body();
+
+#define SK_INTERNAL_ATRACE_ARGS_END_DANGEROUS_1(arg1_name, arg1_val)    \
+    atrace_end_body();                                                  \
+    atrace_end_body();
+
+#define SK_INTERNAL_ATRACE_ARGS_END_DANGEROUS_0() \
+    atrace_end_body();
+
+#define SK_INTERNAL_ATRACE_ARGS_END(...)                                            \
+    if (CC_UNLIKELY(ATRACE_ENABLED())) {                                            \
+        SK_INTERNAL_GET_ATRACE_ARGS_MACRO(0,                                        \
+                                        ##__VA_ARGS__,                              \
+                                        SK_INTERNAL_ATRACE_ARGS_END_DANGEROUS_2,    \
+                                        0,                                          \
+                                        SK_INTERNAL_ATRACE_ARGS_END_DANGEROUS_1,    \
+                                        0,                                          \
+                                        SK_INTERNAL_ATRACE_ARGS_END_DANGEROUS_0)    \
+        (__VA_ARGS__);                                                              \
+    }
+
+#define TRACE_EVENT_ATRACE_OR_PERFETTO_FORCEABLE(force_always_trace, category, name, ...)       \
+    struct SK_PERFETTO_UID(ScopedEvent) {                                                       \
+        struct EventFinalizer {                                                                 \
+                         \
+                         \
+                         \
+                         \
+                         \
+                         \
+                         \
+            EventFinalizer(...) {}                                                              \
+            ~EventFinalizer() {                                                                 \
+                if (force_always_trace ||                                                       \
+                        CC_UNLIKELY(SkAndroidFrameworkTraceUtil::getEnableTracing())) {         \
+                    if (SkAndroidFrameworkTraceUtil::getUsePerfettoTrackEvents()) {             \
+                        TRACE_EVENT_END(category);                                              \
+                    } else {                                                                    \
+                        SK_INTERNAL_ATRACE_ARGS_END(__VA_ARGS__);                               \
+                    }                                                                           \
+                }                                                                               \
+            }                                                                                   \
+                                                                                                \
+            EventFinalizer(const EventFinalizer&) = delete;                                     \
+            EventFinalizer& operator=(const EventFinalizer&) = delete;                          \
+                                                                                                \
+            EventFinalizer(EventFinalizer&&) = default;                                         \
+            EventFinalizer& operator=(EventFinalizer&&) = delete;                               \
+        } finalizer;                                                                            \
+    } SK_PERFETTO_UID(scoped_event) {                                                           \
+        [&]() {                                                                                 \
+            static_assert(!force_always_trace ||                                                \
+                        ::skia_private::StrEndsWithAndLongerThan(category, ".always"),          \
+                    "[force_always_trace == true] requires [category] to end in '.always'");    \
+            if (force_always_trace ||                                                           \
+                    CC_UNLIKELY(SkAndroidFrameworkTraceUtil::getEnableTracing())) {             \
+                if (SkAndroidFrameworkTraceUtil::getUsePerfettoTrackEvents()) {                 \
+                    TRACE_EVENT_BEGIN(category, name, ##__VA_ARGS__);                           \
+                } else {                                                                        \
+                    SK_INTERNAL_ATRACE_ARGS_BEGIN(name, ##__VA_ARGS__);                         \
+                }                                                                               \
+            }                                                                                   \
+            return 0;                                                                           \
+        }()                                                                                     \
+    }
+
+#define TRACE_EVENT_ATRACE_OR_PERFETTO(category, name, ...)                     \
+    TRACE_EVENT_ATRACE_OR_PERFETTO_FORCEABLE(                                   \
+             false, category, name, ##__VA_ARGS__)
+
+#define ATRACE_ANDROID_FRAMEWORK(fmt, ...)                                                  \
+    char SK_PERFETTO_UID(skTraceStrBuf)[SK_ANDROID_FRAMEWORK_ATRACE_BUFFER_SIZE];           \
+    if (SkAndroidFrameworkTraceUtil::getEnableTracing()) {                                  \
+        snprintf(SK_PERFETTO_UID(skTraceStrBuf), SK_ANDROID_FRAMEWORK_ATRACE_BUFFER_SIZE,   \
+                 fmt, ##__VA_ARGS__);                                                       \
+    }                                                                                       \
+    TRACE_EVENT0("skia.android", TRACE_STR_COPY(SK_PERFETTO_UID(skTraceStrBuf)))
+
+#define ATRACE_ANDROID_FRAMEWORK_ALWAYS(fmt, ...)                                           \
+    char SK_PERFETTO_UID(skTraceStrBuf)[SK_ANDROID_FRAMEWORK_ATRACE_BUFFER_SIZE];           \
+    snprintf(SK_PERFETTO_UID(skTraceStrBuf), SK_ANDROID_FRAMEWORK_ATRACE_BUFFER_SIZE,       \
+             fmt, ##__VA_ARGS__);                                                           \
+    TRACE_EVENT0_ALWAYS("skia.android", TRACE_STR_COPY(SK_PERFETTO_UID(skTraceStrBuf)))
+
+#define TRACE_EVENT0(category_group, name) \
+    TRACE_EVENT_ATRACE_OR_PERFETTO(category_group, name)
+#define TRACE_EVENT1(category_group, name, arg1_name, arg1_val) \
+    TRACE_EVENT_ATRACE_OR_PERFETTO(category_group, name, arg1_name, arg1_val)
+#define TRACE_EVENT2(category_group, name, arg1_name, arg1_val, arg2_name, arg2_val) \
+    TRACE_EVENT_ATRACE_OR_PERFETTO(category_group, name, arg1_name, arg1_val, arg2_name, arg2_val)
+
+#define TRACE_EVENT0_ALWAYS(category_group, name) \
+    TRACE_EVENT_ATRACE_OR_PERFETTO_FORCEABLE(     \
+             true, category_group ".always", name)
+#define TRACE_EVENT1_ALWAYS(category_group, name, arg1_name, arg1_val) \
+    TRACE_EVENT_ATRACE_OR_PERFETTO_FORCEABLE(                          \
+             true, category_group ".always", name, arg1_name, arg1_val)
+#define TRACE_EVENT2_ALWAYS(category_group, name, arg1_name, arg1_val, arg2_name, arg2_val) \
+    TRACE_EVENT_ATRACE_OR_PERFETTO_FORCEABLE( true,               \
+                                             category_group ".always",                      \
+                                             name,                                          \
+                                             arg1_name,                                     \
+                                             arg1_val,                                      \
+                                             arg2_name,                                     \
+                                             arg2_val)
+
+#define TRACE_EVENT_INSTANT0(category_group, name, scope) \
+    do { TRACE_EVENT_ATRACE_OR_PERFETTO(category_group, name); } while(0)
+
+#define TRACE_EVENT_INSTANT1(category_group, name, scope, arg1_name, arg1_val) \
+    do { TRACE_EVENT_ATRACE_OR_PERFETTO(category_group, name, arg1_name, arg1_val); } while(0)
+
+#define TRACE_EVENT_INSTANT2(category_group, name, scope, arg1_name, arg1_val,      \
+                             arg2_name, arg2_val)                                   \
+    do { TRACE_EVENT_ATRACE_OR_PERFETTO(category_group, name, arg1_name, arg1_val,  \
+                                        arg2_name, arg2_val); } while(0)
+
+#define TRACE_EVENT_INSTANT0_ALWAYS(category_group, name, scope) \
+    do { TRACE_EVENT_ATRACE_OR_PERFETTO_FORCEABLE(               \
+         true, category_group ".always", name); } while(0)
+
+#define TRACE_EVENT_INSTANT1_ALWAYS(category_group, name, scope, arg1_name, arg1_val)          \
+    do { TRACE_EVENT_ATRACE_OR_PERFETTO_FORCEABLE(                                             \
+         true, category_group ".always", name, arg1_name, arg1_val); \
+    } while(0)
+
+#define TRACE_EVENT_INSTANT2_ALWAYS(category_group, name, scope, arg1_name, arg1_val, \
+                                    arg2_name, arg2_val)                              \
+    do { TRACE_EVENT_ATRACE_OR_PERFETTO_FORCEABLE( true,    \
+                                                  category_group,                     \
+                                                  name,                               \
+                                                  arg1_name,                          \
+                                                  arg1_val,                           \
+                                                  arg2_name,                          \
+                                                  arg2_val);                          \
+    } while(0)
+
+#define TRACE_COUNTER1(category_group, name, value)                     \
+    if (CC_UNLIKELY(SkAndroidFrameworkTraceUtil::getEnableTracing())) { \
+        if (SkAndroidFrameworkTraceUtil::getUsePerfettoTrackEvents()) { \
+            TRACE_COUNTER(category_group, name, value);                 \
+        } else {                                                        \
+            ATRACE_INT(name, value);                                    \
+        }                                                               \
+    }
+
+#define TRACE_COUNTER2(category_group, name, value1_name, value1_val, value2_name, value2_val)  \
+    if (CC_UNLIKELY(SkAndroidFrameworkTraceUtil::getEnableTracing())) {                         \
+        if (SkAndroidFrameworkTraceUtil::getUsePerfettoTrackEvents()) {                         \
+            TRACE_COUNTER(category_group, name "-" value1_name, value1_val);                    \
+            TRACE_COUNTER(category_group, name "-" value2_name, value2_val);                    \
+        } else {                                                                                \
+            ATRACE_INT(name "-" value1_name, value1_val);                                       \
+            ATRACE_INT(name "-" value2_name, value2_val);                                       \
+        }                                                                                       \
+    }
+
+#define TRACE_EVENT_OBJECT_CREATED_WITH_ID(category_group, name, id) \
+    TRACE_EMPTY(category_group, name, id)
+#define TRACE_EVENT_OBJECT_SNAPSHOT_WITH_ID(category_group, name, id, snapshot) \
+    TRACE_EMPTY(category_group, name, id, snapshot)
+#define TRACE_EVENT_OBJECT_DELETED_WITH_ID(category_group, name, id) \
+    TRACE_EMPTY(category_group, name, id)
+
+#define TRACE_EVENT_CATEGORY_GROUP_ENABLED(category_group, ret)                     \
+    if (CC_UNLIKELY(SkAndroidFrameworkTraceUtil::getEnableTracing() &&              \
+                    SkAndroidFrameworkTraceUtil::getUsePerfettoTrackEvents)) {      \
+        *ret = TRACE_EVENT_CATEGORY_ENABLED(category_group);                        \
+    } else {                                                                        \
+        *ret = false;                                                               \
+    }
+
+#else
+
+#define ATRACE_ANDROID_FRAMEWORK(fmt, ...) TRACE_EMPTY_FMT(fmt, ##__VA_ARGS__)
+#define ATRACE_ANDROID_FRAMEWORK_ALWAYS(fmt, ...) TRACE_EMPTY_FMT(fmt, ##__VA_ARGS__)
+
+#define TRACE_EVENT0(category_group, name) \
+  INTERNAL_TRACE_EVENT_ADD_SCOPED(category_group, name)
+
+#define TRACE_EVENT1(category_group, name, arg1_name, arg1_val) \
+  INTERNAL_TRACE_EVENT_ADD_SCOPED(category_group, name, arg1_name, arg1_val)
+
+#define TRACE_EVENT2(category_group, name, arg1_name, arg1_val, arg2_name, arg2_val) \
+  INTERNAL_TRACE_EVENT_ADD_SCOPED(category_group, name, arg1_name, arg1_val, arg2_name, arg2_val)
+
+#define TRACE_EVENT0_ALWAYS(category_group, name) \
+  INTERNAL_TRACE_EVENT_ADD_SCOPED(category_group, name)
+
+#define TRACE_EVENT1_ALWAYS(category_group, name, arg1_name, arg1_val) \
+  INTERNAL_TRACE_EVENT_ADD_SCOPED(category_group, name, arg1_name, arg1_val)
+
+#define TRACE_EVENT2_ALWAYS(category_group, name, arg1_name, arg1_val, arg2_name, arg2_val) \
+  INTERNAL_TRACE_EVENT_ADD_SCOPED(category_group, name, arg1_name, arg1_val, arg2_name, arg2_val)
+
+#define TRACE_EVENT_INSTANT0(category_group, name, scope)                   \
+  INTERNAL_TRACE_EVENT_ADD(TRACE_EVENT_PHASE_INSTANT, category_group, name, \
+                           TRACE_EVENT_FLAG_NONE | scope)
+
+#define TRACE_EVENT_INSTANT1(category_group, name, scope, arg1_name, arg1_val) \
+  INTERNAL_TRACE_EVENT_ADD(TRACE_EVENT_PHASE_INSTANT, category_group, name,    \
+                           TRACE_EVENT_FLAG_NONE | scope, arg1_name, arg1_val)
+
+#define TRACE_EVENT_INSTANT2(category_group, name, scope, arg1_name, arg1_val, \
+                             arg2_name, arg2_val)                              \
+  INTERNAL_TRACE_EVENT_ADD(TRACE_EVENT_PHASE_INSTANT, category_group, name,    \
+                           TRACE_EVENT_FLAG_NONE | scope, arg1_name, arg1_val, \
+                           arg2_name, arg2_val)
+
+#define TRACE_EVENT_INSTANT0_ALWAYS(category_group, name, scope)            \
+  INTERNAL_TRACE_EVENT_ADD(TRACE_EVENT_PHASE_INSTANT, category_group, name, \
+                           TRACE_EVENT_FLAG_NONE | scope)
+
+#define TRACE_EVENT_INSTANT1_ALWAYS(category_group, name, scope, arg1_name, arg1_val) \
+  INTERNAL_TRACE_EVENT_ADD(TRACE_EVENT_PHASE_INSTANT, category_group, name,           \
+                           TRACE_EVENT_FLAG_NONE | scope, arg1_name, arg1_val)
+
+#define TRACE_EVENT_INSTANT2_ALWAYS(category_group, name, scope, arg1_name, arg1_val, \
+                             arg2_name, arg2_val)                                     \
+  INTERNAL_TRACE_EVENT_ADD(TRACE_EVENT_PHASE_INSTANT, category_group, name,           \
+                           TRACE_EVENT_FLAG_NONE | scope, arg1_name, arg1_val,        \
+                           arg2_name, arg2_val)
+
+#define TRACE_COUNTER1(category_group, name, value)                         \
+  INTERNAL_TRACE_EVENT_ADD(TRACE_EVENT_PHASE_COUNTER, category_group, name, \
+                           TRACE_EVENT_FLAG_NONE, "value",                  \
+                           static_cast<int>(value))
+
+#define TRACE_COUNTER2(category_group, name, value1_name, value1_val,       \
+                       value2_name, value2_val)                             \
+  INTERNAL_TRACE_EVENT_ADD(TRACE_EVENT_PHASE_COUNTER, category_group, name, \
+                           TRACE_EVENT_FLAG_NONE, value1_name,              \
+                           static_cast<int>(value1_val), value2_name,       \
+                           static_cast<int>(value2_val))
+
+#define TRACE_EVENT_ASYNC_BEGIN0(category, name, id)                                           \
+    INTERNAL_TRACE_EVENT_ADD_WITH_ID(                                                          \
+        TRACE_EVENT_PHASE_ASYNC_BEGIN, category, name, id, TRACE_EVENT_FLAG_NONE)
+#define TRACE_EVENT_ASYNC_BEGIN1(category, name, id, arg1_name, arg1_val)                      \
+    INTERNAL_TRACE_EVENT_ADD_WITH_ID(TRACE_EVENT_PHASE_ASYNC_BEGIN,                            \
+        category, name, id, TRACE_EVENT_FLAG_NONE, arg1_name, arg1_val)
+#define TRACE_EVENT_ASYNC_BEGIN2(category, name, id, arg1_name, arg1_val, arg2_name, arg2_val) \
+    INTERNAL_TRACE_EVENT_ADD_WITH_ID(TRACE_EVENT_PHASE_ASYNC_BEGIN,                            \
+        category, name, id, TRACE_EVENT_FLAG_NONE, arg1_name, arg1_val, arg2_name, arg2_val)
+
+#define TRACE_EVENT_ASYNC_END0(category, name, id)                                           \
+    INTERNAL_TRACE_EVENT_ADD_WITH_ID(TRACE_EVENT_PHASE_ASYNC_END,                            \
+        category, name, id, TRACE_EVENT_FLAG_NONE)
+#define TRACE_EVENT_ASYNC_END1(category, name, id, arg1_name, arg1_val)                      \
+    INTERNAL_TRACE_EVENT_ADD_WITH_ID(TRACE_EVENT_PHASE_ASYNC_END,                            \
+        category, name, id, TRACE_EVENT_FLAG_NONE, arg1_name, arg1_val)
+#define TRACE_EVENT_ASYNC_END2(category, name, id, arg1_name, arg1_val, arg2_name, arg2_val) \
+    INTERNAL_TRACE_EVENT_ADD_WITH_ID(TRACE_EVENT_PHASE_ASYNC_END,                            \
+        category, name, id, TRACE_EVENT_FLAG_NONE, arg1_name, arg1_val, arg2_name, arg2_val)
+
+#define TRACE_EVENT_OBJECT_CREATED_WITH_ID(category_group, name, id) \
+  INTERNAL_TRACE_EVENT_ADD_WITH_ID(                                  \
+      TRACE_EVENT_PHASE_CREATE_OBJECT, category_group, name, id,     \
+      TRACE_EVENT_FLAG_NONE)
+
+#define TRACE_EVENT_OBJECT_SNAPSHOT_WITH_ID(category_group, name, id, \
+                                            snapshot)                 \
+  INTERNAL_TRACE_EVENT_ADD_WITH_ID(                                   \
+      TRACE_EVENT_PHASE_SNAPSHOT_OBJECT, category_group, name,        \
+      id, TRACE_EVENT_FLAG_NONE, "snapshot", snapshot)
+
+#define TRACE_EVENT_OBJECT_DELETED_WITH_ID(category_group, name, id) \
+  INTERNAL_TRACE_EVENT_ADD_WITH_ID(                                  \
+      TRACE_EVENT_PHASE_DELETE_OBJECT, category_group, name, id,     \
+      TRACE_EVENT_FLAG_NONE)
+
+#define TRACE_EVENT_CATEGORY_GROUP_ENABLED(category_group, ret)             \
+  do {                                                                      \
+    INTERNAL_TRACE_EVENT_GET_CATEGORY_INFO(category_group);                 \
+    if (INTERNAL_TRACE_EVENT_CATEGORY_GROUP_ENABLED_FOR_RECORDING_MODE()) { \
+      *ret = true;                                                          \
+    } else {                                                                \
+      *ret = false;                                                         \
+    }                                                                       \
+  } while (0)
+
+#endif
+
+#define TRACE_EVENT_FLAG_NONE (static_cast<unsigned int>(0))
+#define TRACE_EVENT_FLAG_COPY (static_cast<unsigned int>(1 << 0))
+#define TRACE_EVENT_FLAG_HAS_ID (static_cast<unsigned int>(1 << 1))
+#define TRACE_EVENT_FLAG_MANGLE_ID (static_cast<unsigned int>(1 << 2))
+#define TRACE_EVENT_FLAG_SCOPE_OFFSET (static_cast<unsigned int>(1 << 3))
+#define TRACE_EVENT_FLAG_SCOPE_EXTRA (static_cast<unsigned int>(1 << 4))
+#define TRACE_EVENT_FLAG_EXPLICIT_TIMESTAMP (static_cast<unsigned int>(1 << 5))
+#define TRACE_EVENT_FLAG_ASYNC_TTS (static_cast<unsigned int>(1 << 6))
+#define TRACE_EVENT_FLAG_BIND_TO_ENCLOSING (static_cast<unsigned int>(1 << 7))
+#define TRACE_EVENT_FLAG_FLOW_IN (static_cast<unsigned int>(1 << 8))
+#define TRACE_EVENT_FLAG_FLOW_OUT (static_cast<unsigned int>(1 << 9))
+#define TRACE_EVENT_FLAG_HAS_CONTEXT_ID (static_cast<unsigned int>(1 << 10))
+
+#define TRACE_EVENT_FLAG_SCOPE_MASK                          \
+  (static_cast<unsigned int>(TRACE_EVENT_FLAG_SCOPE_OFFSET | \
+                             TRACE_EVENT_FLAG_SCOPE_EXTRA))
+
+#define TRACE_VALUE_TYPE_BOOL (static_cast<unsigned char>(1))
+#define TRACE_VALUE_TYPE_UINT (static_cast<unsigned char>(2))
+#define TRACE_VALUE_TYPE_INT (static_cast<unsigned char>(3))
+#define TRACE_VALUE_TYPE_DOUBLE (static_cast<unsigned char>(4))
+#define TRACE_VALUE_TYPE_POINTER (static_cast<unsigned char>(5))
+#define TRACE_VALUE_TYPE_STRING (static_cast<unsigned char>(6))
+#define TRACE_VALUE_TYPE_COPY_STRING (static_cast<unsigned char>(7))
+#define TRACE_VALUE_TYPE_CONVERTABLE (static_cast<unsigned char>(8))
+
+#define TRACE_EVENT_SCOPE_GLOBAL (static_cast<unsigned char>(0 << 3))
+#define TRACE_EVENT_SCOPE_PROCESS (static_cast<unsigned char>(1 << 3))
+#define TRACE_EVENT_SCOPE_THREAD (static_cast<unsigned char>(2 << 3))
+
+#define TRACE_EVENT_SCOPE_NAME_GLOBAL ('g')
+#define TRACE_EVENT_SCOPE_NAME_PROCESS ('p')
+#define TRACE_EVENT_SCOPE_NAME_THREAD ('t')
+
+#endif

@@ -1,0 +1,183 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+"use strict";
+
+{
+
+  class MozEditor extends XULFrameElement {
+    connectedCallback() {
+      this._editorContentListener = {
+        QueryInterface: ChromeUtils.generateQI([
+          "nsIURIContentListener",
+          "nsISupportsWeakReference",
+        ]),
+        doContent() {
+          return false;
+        },
+        isPreferred() {
+          return false;
+        },
+        canHandleContent() {
+          return false;
+        },
+        loadCookie: null,
+        parentContentListener: null,
+      };
+
+      this._finder = null;
+
+      this._fastFind = null;
+
+      this._lastSearchString = null;
+
+      if (this.editortype) {
+        this.makeEditable(this.editortype, true);
+      }
+    }
+
+    get finder() {
+      if (!this._finder) {
+        if (!this.docShell) {
+          return null;
+        }
+
+        let { Finder } = ChromeUtils.importESModule(
+          "resource://gre/modules/Finder.sys.mjs"
+        );
+        this._finder = new Finder(this.docShell);
+      }
+      return this._finder;
+    }
+
+    get fastFind() {
+      if (!this._fastFind) {
+        if (!("@mozilla.org/typeaheadfind;1" in Cc)) {
+          return null;
+        }
+
+        if (!this.docShell) {
+          return null;
+        }
+
+        this._fastFind = Cc["@mozilla.org/typeaheadfind;1"].createInstance(
+          Ci.nsITypeAheadFind
+        );
+        this._fastFind.init(this.docShell);
+      }
+      return this._fastFind;
+    }
+
+    set editortype(val) {
+      this.setAttribute("editortype", val);
+    }
+
+    get editortype() {
+      return this.getAttribute("editortype");
+    }
+
+    get currentURI() {
+      return this.webNavigation.currentURI;
+    }
+
+    get webBrowserFind() {
+      return this.docShell
+        .QueryInterface(Ci.nsIInterfaceRequestor)
+        .getInterface(Ci.nsIWebBrowserFind);
+    }
+
+    get editingSession() {
+      return this.docShell.editingSession;
+    }
+
+    get commandManager() {
+      return this.webNavigation
+        .QueryInterface(Ci.nsIInterfaceRequestor)
+        .getInterface(Ci.nsICommandManager);
+    }
+
+    set fullZoom(val) {
+      this.browsingContext.fullZoom = val;
+    }
+
+    get fullZoom() {
+      return this.browsingContext.fullZoom;
+    }
+
+    set textZoom(val) {
+      this.browsingContext.textZoom = val;
+    }
+
+    get textZoom() {
+      return this.browsingContext.textZoom;
+    }
+
+    get isSyntheticDocument() {
+      return this.contentDocument.isSyntheticDocument;
+    }
+
+    get messageManager() {
+      if (this.frameLoader) {
+        return this.frameLoader.messageManager;
+      }
+      return null;
+    }
+
+    sendMessageToActor(messageName, args, actorName, scope) {
+      if (!this.frameLoader) {
+        return;
+      }
+
+      function sendToChildren(browsingContext, childScope) {
+        let windowGlobal = browsingContext.currentWindowGlobal;
+        if (
+          windowGlobal &&
+          (childScope != "roots" || windowGlobal.isProcessRoot)
+        ) {
+          windowGlobal.getActor(actorName).sendAsyncMessage(messageName, args);
+        }
+
+        if (scope) {
+          for (let context of browsingContext.children) {
+            sendToChildren(context, scope);
+          }
+        }
+      }
+
+      sendToChildren(this.browsingContext);
+    }
+
+    get outerWindowID() {
+      return this.docShell.outerWindowID;
+    }
+
+    makeEditable(editortype, waitForUrlLoad) {
+      let win = this.contentWindow;
+      this.editingSession.makeWindowEditable(
+        win,
+        editortype,
+        waitForUrlLoad,
+        true,
+        false
+      );
+      this.setAttribute("editortype", editortype);
+
+      this.docShell
+        .QueryInterface(Ci.nsIInterfaceRequestor)
+        .getInterface(Ci.nsIURIContentListener).parentContentListener =
+        this._editorContentListener;
+    }
+
+    getEditor(containingWindow) {
+      return this.editingSession.getEditorForWindow(containingWindow);
+    }
+
+    getHTMLEditor(containingWindow) {
+      var editor = this.editingSession.getEditorForWindow(containingWindow);
+      return editor.QueryInterface(Ci.nsIHTMLEditor);
+    }
+  }
+
+  customElements.define("editor", MozEditor);
+}

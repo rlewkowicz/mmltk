@@ -1,0 +1,73 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(mozilla_AvailableMemoryWatcher_h)
+#define mozilla_AvailableMemoryWatcher_h
+
+#include "MemoryPressureLevelMac.h"
+#include "nsCOMPtr.h"
+#include "nsIAvailableMemoryWatcherBase.h"
+#include "nsIObserver.h"
+#include "nsIObserverService.h"
+
+namespace mozilla {
+
+#if defined(XP_LINUX) && !0
+struct PSIInfo {
+  unsigned long some_avg10 = 0;
+  unsigned long some_avg60 = 0;
+  unsigned long some_avg300 = 0;
+  unsigned long some_total = 0;
+  unsigned long full_avg10 = 0;
+  unsigned long full_avg60 = 0;
+  unsigned long full_avg300 = 0;
+  unsigned long full_total = 0;
+  bool psi_available = false;
+};
+
+nsresult GetLastPSISnapshot(PSIInfo& aResult);
+
+void StartNonOOMPSISampling();
+#endif
+
+class nsAvailableMemoryWatcherBase : public nsIAvailableMemoryWatcherBase,
+                                     public nsIObserver {
+  static StaticRefPtr<nsAvailableMemoryWatcherBase> sSingleton;
+  static const char* const kObserverTopics[];
+
+  TimeStamp mLowMemoryStart;
+
+ protected:
+  Mutex mMutex;
+
+  uint32_t mNumOfTabUnloading MOZ_GUARDED_BY(mMutex);
+  uint32_t mNumOfMemoryPressure MOZ_GUARDED_BY(mMutex);
+
+  nsCOMPtr<nsITabUnloader> mTabUnloader;
+  nsCOMPtr<nsIObserverService> mObserverSvc;
+  bool mInteracting;
+
+  virtual ~nsAvailableMemoryWatcherBase() = default;
+  virtual nsresult Init();
+  void Shutdown();
+  void UpdateLowMemoryTimeStamp();
+  void RecordTelemetryEventOnHighMemory(const MutexAutoLock&)
+      MOZ_REQUIRES(mMutex);
+
+ public:
+  static already_AddRefed<nsAvailableMemoryWatcherBase> GetSingleton();
+
+  nsAvailableMemoryWatcherBase();
+
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIAVAILABLEMEMORYWATCHERBASE
+  NS_DECL_NSIOBSERVER
+};
+
+already_AddRefed<nsAvailableMemoryWatcherBase> CreateAvailableMemoryWatcher();
+
+}  
+
+#endif

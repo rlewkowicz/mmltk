@@ -1,0 +1,99 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef MOZILLA_AUDIOBLOCK_H_
+#define MOZILLA_AUDIOBLOCK_H_
+
+#include "AudioSegment.h"
+
+namespace mozilla {
+
+class AudioBlock : private AudioChunk {
+ public:
+  AudioBlock() {
+    mDuration = WEBAUDIO_BLOCK_SIZE;
+    mBufferFormat = AUDIO_FORMAT_SILENCE;
+  }
+  AudioBlock(const AudioBlock& aBlock) : AudioChunk(aBlock.AsAudioChunk()) {}
+  explicit AudioBlock(const AudioChunk& aChunk) : AudioChunk(aChunk) {
+    MOZ_ASSERT(aChunk.mDuration == WEBAUDIO_BLOCK_SIZE);
+  }
+  ~AudioBlock();
+
+  using AudioChunk::ChannelCount;
+  using AudioChunk::ChannelData;
+  using AudioChunk::GetDuration;
+  using AudioChunk::IsNull;
+  using AudioChunk::SizeOfExcludingThis;
+  using AudioChunk::SizeOfExcludingThisIfUnshared;
+  using AudioChunk::mBufferFormat;
+  using AudioChunk::mChannelData;
+  using AudioChunk::mVolume;
+
+  const AudioChunk& AsAudioChunk() const { return *this; }
+  AudioChunk* AsMutableChunk() {
+    ClearDownstreamMark();
+    return this;
+  }
+
+  void AllocateChannels(uint32_t aChannelCount);
+
+  float* ChannelFloatsForWrite(size_t aChannel) {
+    MOZ_ASSERT(mBufferFormat == AUDIO_FORMAT_FLOAT32);
+    MOZ_ASSERT(CanWrite());
+    return static_cast<float*>(const_cast<void*>(mChannelData[aChannel]));
+  }
+
+  ThreadSharedObject* GetBuffer() const { return mBuffer; }
+  void SetBuffer(ThreadSharedObject* aNewBuffer);
+  void SetNull(TrackTime aDuration) {
+    MOZ_ASSERT(aDuration == WEBAUDIO_BLOCK_SIZE);
+    SetBuffer(nullptr);
+    mChannelData.Clear();
+    mVolume = 1.0f;
+    mBufferFormat = AUDIO_FORMAT_SILENCE;
+  }
+
+  AudioBlock& operator=(const AudioBlock& aBlock) {
+    return *this = aBlock.AsAudioChunk();
+  }
+  AudioBlock& operator=(const AudioChunk& aChunk) {
+    MOZ_ASSERT(aChunk.mDuration == WEBAUDIO_BLOCK_SIZE);
+    SetBuffer(aChunk.mBuffer);
+    mChannelData = aChunk.mChannelData;
+    mVolume = aChunk.mVolume;
+    mBufferFormat = aChunk.mBufferFormat;
+    return *this;
+  }
+
+  bool IsMuted() const { return mVolume == 0.0f; }
+
+  bool IsSilentOrSubnormal() const {
+    if (!mBuffer) {
+      return true;
+    }
+
+    for (uint32_t i = 0, length = mChannelData.Length(); i < length; ++i) {
+      const float* channel = static_cast<const float*>(mChannelData[i]);
+      for (TrackTime frame = 0; frame < mDuration; ++frame) {
+        if (fabs(channel[frame]) >= FLT_MIN) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+ private:
+  void ClearDownstreamMark();
+  bool CanWrite();
+
+  bool mBufferIsDownstreamRef = false;
+};
+
+}  
+
+MOZ_DECLARE_RELOCATE_USING_MOVE_CONSTRUCTOR(mozilla::AudioBlock)
+
+#endif  // MOZILLA_AUDIOBLOCK_H_

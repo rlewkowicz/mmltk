@@ -1,0 +1,142 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_DOMSVGLENGTHLIST_H_
+#define DOM_SVG_DOMSVGLENGTHLIST_H_
+
+#include "DOMSVGAnimatedLengthList.h"
+#include "SVGLengthList.h"
+#include "mozAutoDocUpdate.h"
+#include "mozilla/Attributes.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsDebug.h"
+#include "nsTArray.h"
+
+#define MOZILLA_DOMSVGLENGTHLIST_IID \
+  {0xcbecb7a4, 0xd6f3, 0xd6f3, {0xb5, 0xa3, 0x3e, 0x5b, 0xdb, 0xf5, 0xb2, 0xf9}}
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+class DOMSVGLength;
+class SVGElement;
+
+template <class T>
+class MOZ_RAII AutoChangeLengthListNotifier : public mozAutoDocUpdate {
+ public:
+  explicit AutoChangeLengthListNotifier(T* aValue)
+      : mozAutoDocUpdate(aValue->Element()->GetComposedDoc(), true),
+        mValue(aValue) {
+    MOZ_ASSERT(aValue, "Expecting non-null value");
+    mValue->Element()->WillChangeLengthList(mValue->AttrEnum(), *this);
+  }
+
+  ~AutoChangeLengthListNotifier() {
+    mValue->Element()->DidChangeLengthList(mValue->AttrEnum(), *this);
+    if (mValue->IsAnimating()) {
+      mValue->Element()->AnimationNeedsResample();
+    }
+  }
+
+ private:
+  T* const mValue;
+};
+
+class DOMSVGLengthList final : public nsISupports, public nsWrapperCache {
+  template <class T>
+  friend class AutoChangeLengthListNotifier;
+  friend class DOMSVGLength;
+
+  ~DOMSVGLengthList() {
+    if (mAList) {
+      (IsAnimValList() ? mAList->mAnimVal : mAList->mBaseVal) = nullptr;
+    }
+  }
+
+ public:
+  NS_INLINE_DECL_STATIC_IID(MOZILLA_DOMSVGLENGTHLIST_IID)
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(DOMSVGLengthList)
+
+  DOMSVGLengthList(DOMSVGAnimatedLengthList* aAList,
+                   const SVGLengthList& aInternalList)
+      : mAList(aAList) {
+
+    InternalListLengthWillChange(aInternalList.Length());  
+  }
+
+  JSObject* WrapObject(JSContext* cx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  nsISupports* GetParentObject() { return static_cast<nsIContent*>(Element()); }
+
+  uint32_t LengthNoFlush() const {
+    MOZ_ASSERT(
+        mItems.Length() == 0 || mItems.Length() == InternalList().Length(),
+        "DOM wrapper's list length is out of sync");
+    return mItems.Length();
+  }
+
+  void InternalListLengthWillChange(uint32_t aNewLength);
+
+  bool IsAnimating() const { return mAList->IsAnimating(); }
+  bool AnimListMirrorsBaseList() const {
+    return mAList->mAnimVal && !mAList->IsAnimating();
+  }
+
+  uint32_t NumberOfItems() const {
+    if (IsAnimValList()) {
+      Element()->FlushAnimations();
+    }
+    return LengthNoFlush();
+  }
+  void Clear(ErrorResult& aError);
+  already_AddRefed<DOMSVGLength> Initialize(DOMSVGLength& newItem,
+                                            ErrorResult& aRv);
+  already_AddRefed<DOMSVGLength> GetItem(uint32_t index, ErrorResult& aRv);
+  already_AddRefed<DOMSVGLength> IndexedGetter(uint32_t index, bool& found,
+                                               ErrorResult& aRv);
+  already_AddRefed<DOMSVGLength> InsertItemBefore(DOMSVGLength& newItem,
+                                                  uint32_t index,
+                                                  ErrorResult& aRv);
+  already_AddRefed<DOMSVGLength> ReplaceItem(DOMSVGLength& newItem,
+                                             uint32_t index, ErrorResult& aRv);
+  already_AddRefed<DOMSVGLength> RemoveItem(uint32_t index, ErrorResult& aRv);
+  already_AddRefed<DOMSVGLength> AppendItem(DOMSVGLength& newItem,
+                                            ErrorResult& aRv) {
+    return InsertItemBefore(newItem, LengthNoFlush(), aRv);
+  }
+  void IndexedSetter(uint32_t index, DOMSVGLength& newValue, ErrorResult& aRv);
+  uint32_t Length() const { return NumberOfItems(); }
+
+ private:
+  dom::SVGElement* Element() const { return mAList->mElement; }
+
+  uint8_t AttrEnum() const { return mAList->mAttrEnum; }
+
+  SVGLength::Axis Axis() const { return mAList->mAxis; }
+
+  bool IsAnimValList() const {
+    MOZ_ASSERT(this == mAList->mBaseVal || this == mAList->mAnimVal,
+               "Calling IsAnimValList() too early?!");
+    return this == mAList->mAnimVal;
+  }
+
+  SVGLengthList& InternalList() const;
+
+  already_AddRefed<DOMSVGLength> GetItemAt(uint32_t aIndex);
+
+  void MaybeInsertNullInAnimValListAt(uint32_t aIndex);
+  void MaybeRemoveItemFromAnimValListAt(uint32_t aIndex);
+
+  FallibleTArray<DOMSVGLength*> mItems;
+
+  RefPtr<DOMSVGAnimatedLengthList> mAList;
+};
+
+}  
+}  
+
+#endif  // DOM_SVG_DOMSVGLENGTHLIST_H_

@@ -1,0 +1,175 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_MEMORY_MEMORY_H_
+#define ABSL_MEMORY_MEMORY_H_
+
+#include <cstddef>
+#include <limits>
+#include <memory>
+#include <new>
+#include <type_traits>
+#include <utility>
+
+#include "absl/base/macros.h"
+#include "absl/meta/type_traits.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+template <typename T>
+std::unique_ptr<T> WrapUnique(T* ptr) {
+  static_assert(!std::is_array_v<T>, "array types are unsupported");
+  static_assert(std::is_object_v<T>, "non-object types are unsupported");
+  return std::unique_ptr<T>(ptr);
+}
+
+using std::make_unique ABSL_REFACTOR_INLINE;
+
+#if defined(__cpp_lib_smart_ptr_for_overwrite) && \
+    __cpp_lib_smart_ptr_for_overwrite >= 202002L
+using std::make_unique_for_overwrite;
+#else
+
+namespace memory_internal {
+
+template <typename T>
+struct MakeUniqueResult {
+  using scalar = std::unique_ptr<T>;
+};
+template <typename T>
+struct MakeUniqueResult<T[]> {
+  using array = std::unique_ptr<T[]>;
+};
+template <typename T, size_t N>
+struct MakeUniqueResult<T[N]> {
+  using invalid = void;
+};
+
+}  
+
+template <typename T>
+typename memory_internal::MakeUniqueResult<T>::scalar
+make_unique_for_overwrite() {
+  return std::unique_ptr<T>(new T);
+}
+
+template <typename T>
+typename memory_internal::MakeUniqueResult<T>::array make_unique_for_overwrite(
+    size_t n) {
+  return std::unique_ptr<T>(new typename std::remove_extent_t<T>[n]);
+}
+
+template <typename T, typename... Args>
+typename memory_internal::MakeUniqueResult<T>::invalid
+make_unique_for_overwrite(Args&&... ) = delete;
+
+#endif  // __cpp_lib_smart_ptr_for_overwrite
+
+template <typename T>
+auto RawPtr(T&& ptr) -> decltype(std::addressof(*ptr)) {
+  return (ptr != nullptr) ? std::addressof(*ptr) : nullptr;
+}
+inline std::nullptr_t RawPtr(std::nullptr_t) { return nullptr; }
+
+template <typename T, typename D>
+std::shared_ptr<T> ShareUniquePtr(std::unique_ptr<T, D>&& ptr) {
+  return ptr ? std::shared_ptr<T>(std::move(ptr)) : std::shared_ptr<T>();
+}
+
+template <typename T>
+std::weak_ptr<T> WeakenPtr(const std::shared_ptr<T>& ptr) {
+  return std::weak_ptr<T>(ptr);
+}
+
+template <typename Ptr>
+using pointer_traits ABSL_DEPRECATE_AND_INLINE() = std::pointer_traits<Ptr>;
+
+template <typename Alloc>
+using allocator_traits ABSL_DEPRECATE_AND_INLINE() =
+    std::allocator_traits<Alloc>;
+
+namespace memory_internal {
+
+template <template <typename> class Extract, typename Obj, typename Default,
+          typename>
+struct ExtractOr {
+  using type = Default;
+};
+
+template <template <typename> class Extract, typename Obj, typename Default>
+struct ExtractOr<Extract, Obj, Default, std::void_t<Extract<Obj>>> {
+  using type = Extract<Obj>;
+};
+
+template <template <typename> class Extract, typename Obj, typename Default>
+using ExtractOrT = typename ExtractOr<Extract, Obj, Default, void>::type;
+
+template <typename Alloc>
+using GetIsNothrow = typename Alloc::is_nothrow;
+
+}  
+
+template <typename Alloc>
+struct allocator_is_nothrow
+    : memory_internal::ExtractOrT<memory_internal::GetIsNothrow, Alloc,
+                                  std::false_type> {};
+
+#if defined(ABSL_ALLOCATOR_NOTHROW) && ABSL_ALLOCATOR_NOTHROW
+template <typename T>
+struct allocator_is_nothrow<std::allocator<T>> : std::true_type {};
+struct default_allocator_is_nothrow : std::true_type {};
+#else
+struct default_allocator_is_nothrow : std::false_type {};
+#endif
+
+namespace memory_internal {
+template <typename Allocator, typename Iterator, typename... Args>
+void ConstructRange(Allocator& alloc, Iterator first, Iterator last,
+                    const Args&... args) {
+  for (Iterator cur = first; cur != last; ++cur) {
+    ABSL_INTERNAL_TRY {
+      std::allocator_traits<Allocator>::construct(alloc, std::addressof(*cur),
+                                                  args...);
+    }
+    ABSL_INTERNAL_CATCH_ANY {
+      while (cur != first) {
+        --cur;
+        std::allocator_traits<Allocator>::destroy(alloc, std::addressof(*cur));
+      }
+      ABSL_INTERNAL_RETHROW;
+    }
+  }
+}
+
+template <typename Allocator, typename Iterator, typename InputIterator>
+void CopyRange(Allocator& alloc, Iterator destination, InputIterator first,
+               InputIterator last) {
+  for (Iterator cur = destination; first != last;
+       static_cast<void>(++cur), static_cast<void>(++first)) {
+    ABSL_INTERNAL_TRY {
+      std::allocator_traits<Allocator>::construct(alloc, std::addressof(*cur),
+                                                  *first);
+    }
+    ABSL_INTERNAL_CATCH_ANY {
+      while (cur != destination) {
+        --cur;
+        std::allocator_traits<Allocator>::destroy(alloc, std::addressof(*cur));
+      }
+      ABSL_INTERNAL_RETHROW;
+    }
+  }
+}
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_MEMORY_MEMORY_H_

@@ -1,0 +1,268 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsNavHistory_h_
+#define nsNavHistory_h_
+
+#include "nsINavHistoryService.h"
+
+#include "nsIStringBundle.h"
+#include "nsITimer.h"
+#include "nsMaybeWeakPtr.h"
+#include "nsCategoryCache.h"
+#include "nsNetCID.h"
+#include "nsToolkitCompsCID.h"
+#include "nsURIHashKey.h"
+#include "nsTHashtable.h"
+
+#include "nsNavHistoryResult.h"
+#include "nsNavHistoryQuery.h"
+#include "Database.h"
+#include "mozilla/Atomics.h"
+#include "mozIStorageVacuumParticipant.h"
+
+#define QUERYUPDATE_TIME 0
+#define QUERYUPDATE_SIMPLE 1
+#define QUERYUPDATE_COMPLEX 2
+#define QUERYUPDATE_COMPLEX_WITH_BOOKMARKS 3
+#define QUERYUPDATE_HOST 4
+#define QUERYUPDATE_MOBILEPREF 5
+#define QUERYUPDATE_NONE 6
+
+#define URI_LENGTH_MAX 65536
+#define TITLE_LENGTH_MAX 4096
+
+#define RECENT_EVENT_THRESHOLD PRTime((int64_t)15 * 60 * PR_USEC_PER_SEC)
+
+#define MOBILE_BOOKMARKS_PREF "browser.bookmarks.showMobileBookmarks"
+
+#define MOBILE_BOOKMARKS_VIRTUAL_GUID "mobile_____v"
+
+#define ROOT_GUID "root________"
+#define MENU_ROOT_GUID "menu________"
+#define TOOLBAR_ROOT_GUID "toolbar_____"
+#define UNFILED_ROOT_GUID "unfiled_____"
+#define TAGS_ROOT_GUID "tags________"
+#define MOBILE_ROOT_GUID "mobile______"
+
+#define SQL_QUOTE(text) "'" text "'"
+
+class mozIStorageValueArray;
+class nsIAutoCompleteController;
+class nsIEffectiveTLDService;
+class nsIIDNService;
+class nsNavHistory;
+class PlacesSQLQueryBuilder;
+
+
+class nsNavHistory final : public nsSupportsWeakReference,
+                           public nsINavHistoryService,
+                           public nsIObserver,
+                           public mozIStorageVacuumParticipant {
+  friend class PlacesSQLQueryBuilder;
+
+ public:
+  nsNavHistory();
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSINAVHISTORYSERVICE
+  NS_DECL_NSIOBSERVER
+  NS_DECL_MOZISTORAGEVACUUMPARTICIPANT
+
+  static already_AddRefed<nsNavHistory> GetSingleton();
+
+  nsresult Init();
+
+  static nsNavHistory* GetHistoryService() {
+    if (!gHistoryService) {
+      nsCOMPtr<nsINavHistoryService> serv =
+          do_GetService(NS_NAVHISTORYSERVICE_CONTRACTID);
+      NS_ENSURE_TRUE(serv, nullptr);
+      NS_ASSERTION(gHistoryService, "Should have static instance pointer now");
+    }
+    return gHistoryService;
+  }
+
+  static const nsNavHistory* GetConstHistoryService() {
+    const nsNavHistory* const history = gHistoryService;
+    return history;
+  }
+
+  nsresult GetIdForPage(nsIURI* aURI, int64_t* _pageId, nsCString& _GUID);
+
+  nsresult GetOrCreateIdForPage(nsIURI* aURI, int64_t* _pageId,
+                                nsCString& _GUID);
+
+  nsIStringBundle* GetBundle();
+  void GetStringFromName(const char* aName, nsACString& aResult);
+  void GetAgeInDaysString(int32_t aInt, const char* aName, nsACString& aResult);
+  static void GetMonthName(const PRExplodedTime& aTime, nsACString& aResult);
+  static void GetMonthYear(const PRExplodedTime& aTime, nsACString& aResult);
+
+  bool IsHistoryDisabled() { return !mHistoryEnabled; }
+
+  bool MatchDiacritics() const { return mMatchDiacritics; }
+
+  static const int32_t kGetInfoIndex_PageID;
+  static const int32_t kGetInfoIndex_URL;
+  static const int32_t kGetInfoIndex_Title;
+  static const int32_t kGetInfoIndex_RevHost;
+  static const int32_t kGetInfoIndex_VisitCount;
+  static const int32_t kGetInfoIndex_VisitDate;
+  static const int32_t kGetInfoIndex_FaviconURL;
+  static const int32_t kGetInfoIndex_ItemId;
+  static const int32_t kGetInfoIndex_ItemDateAdded;
+  static const int32_t kGetInfoIndex_ItemLastModified;
+  static const int32_t kGetInfoIndex_ItemParentId;
+  static const int32_t kGetInfoIndex_ItemTags;
+  static const int32_t kGetInfoIndex_Frecency;
+  static const int32_t kGetInfoIndex_Hidden;
+  static const int32_t kGetInfoIndex_Guid;
+  static const int32_t kGetInfoIndex_VisitId;
+  static const int32_t kGetInfoIndex_FromVisitId;
+  static const int32_t kGetInfoIndex_VisitType;
+  static const int32_t kGetTargetFolder_Guid;
+  static const int32_t kGetTargetFolder_ItemId;
+  static const int32_t kGetTargetFolder_Title;
+
+  int64_t GetTagsFolder();
+
+  nsresult GetQueryResults(nsNavHistoryQueryResultNode* aResultNode,
+                           const RefPtr<nsNavHistoryQuery>& aQuery,
+                           const RefPtr<nsNavHistoryQueryOptions>& aOptions,
+                           nsCOMArray<nsNavHistoryResultNode>* aResults);
+
+  nsresult RowToResult(mozIStorageValueArray* aRow,
+                       nsNavHistoryQueryOptions* aOptions,
+                       nsNavHistoryResultNode** aResult);
+
+  nsresult QueryUriToResult(const nsACString& aQueryURI, int64_t aItemId,
+                            const nsACString& aBookmarkGuid,
+                            const nsACString& aTitle,
+                            int64_t aTargetFolderItemId,
+                            const nsACString& aTargetFolderGuid,
+                            const nsACString& aTargetFolderTitle,
+                            uint32_t aAccessCount, PRTime aTime,
+                            nsNavHistoryResultNode** aNode);
+
+  int32_t GetDaysOfHistory();
+
+  void DomainNameFromURI(nsIURI* aURI, nsACString& aDomainName);
+  static PRTime NormalizeTime(uint32_t aRelative, PRTime aOffset);
+
+  typedef nsTHashMap<nsCStringHashKey, nsCString> StringHash;
+
+  enum RecentEventFlags {
+    RECENT_TYPED = 1 << 0,      
+    RECENT_ACTIVATED = 1 << 1,  
+    RECENT_BOOKMARKED = 1 << 2  
+  };
+
+  uint32_t GetRecentFlags(nsIURI* aURI);
+
+  bool hasHistoryEntries();
+
+  bool hasEmbedVisit(nsIURI* aURI);
+
+  int64_t CalculateFrecency(int32_t aVisitAgeInDays, int32_t aNumVisits,
+                            bool aBookmarked) const;
+
+  void UpdateDaysOfHistory(PRTime visitTime);
+
+  static nsLiteralCString GetTagsSqlFragment(const uint16_t aQueryType,
+                                             bool aExcludeItems);
+
+  static mozilla::Maybe<nsCString> GetTargetFolderGuid(
+      const nsACString& aQueryURI);
+
+  static mozilla::Atomic<int64_t> sLastInsertedPlaceId;
+  static mozilla::Atomic<int64_t> sLastInsertedVisitId;
+
+  static mozilla::Atomic<bool> sShouldStartFrecencyRecalculation;
+
+  static void StoreLastInsertedId(const nsACString& aTable,
+                                  const int64_t aLastInsertedId);
+
+  static nsresult FilterResultSet(
+      nsNavHistoryQueryResultNode* aParentNode,
+      const nsCOMArray<nsNavHistoryResultNode>& aSet,
+      nsCOMArray<nsNavHistoryResultNode>* aFiltered,
+      const RefPtr<nsNavHistoryQuery>& aQuery,
+      nsNavHistoryQueryOptions* aOptions);
+
+  static void InvalidateDaysOfHistory();
+
+  static nsresult TokensToQuery(
+      const nsTArray<mozilla::places::QueryKeyValuePair>& aTokens,
+      nsNavHistoryQuery* aQuery, nsNavHistoryQueryOptions* aOptions);
+
+  PRTime GetNow();
+
+ private:
+  ~nsNavHistory();
+
+  static nsNavHistory* gHistoryService;
+
+  static mozilla::Atomic<int32_t> sDaysOfHistory;
+
+ protected:
+  RefPtr<mozilla::places::Database> mDB;
+
+  void LoadPrefs();
+
+  PRTime mCachedNow;
+  nsCOMPtr<nsITimer> mExpireNowTimer;
+  static void expireNowTimerCallback(nsITimer* aTimer, void* aClosure);
+
+  nsresult ConstructQueryString(
+      const RefPtr<nsNavHistoryQuery>& aQuery,
+      const RefPtr<nsNavHistoryQueryOptions>& aOptions, nsCString& queryString,
+      bool& aParamsPresent, StringHash& aAddParams);
+
+  nsresult QueryToSelectClause(const RefPtr<nsNavHistoryQuery>& aQuery,
+                               const RefPtr<nsNavHistoryQueryOptions>& aOptions,
+                               nsCString* aClause);
+  nsresult BindQueryClauseParameters(
+      mozIStorageBaseStatement* statement,
+      const RefPtr<nsNavHistoryQuery>& aQuery,
+      const RefPtr<nsNavHistoryQueryOptions>& aOptions);
+
+  nsresult ResultsAsList(mozIStorageStatement* statement,
+                         nsNavHistoryQueryOptions* aOptions,
+                         nsCOMArray<nsNavHistoryResultNode>* aResults);
+
+  nsCOMPtr<nsIEffectiveTLDService> mTLDService;
+  nsCOMPtr<nsIIDNService> mIDNService;
+
+  nsCOMPtr<nsIStringBundle> mBundle;
+
+  typedef nsTHashMap<nsCStringHashKey, int64_t> RecentEventHash;
+  RecentEventHash mRecentTyped;
+  RecentEventHash mRecentLink;
+  RecentEventHash mRecentBookmark;
+
+  bool CheckIsRecentEvent(RecentEventHash* hashTable, const nsACString& url);
+  void ExpireNonrecentEvents(RecentEventHash* hashTable);
+
+  bool mHistoryEnabled;
+
+  bool mMatchDiacritics;
+
+  int64_t mTagsFolder;
+  int64_t mLastCachedStartOfDay;
+  int64_t mLastCachedEndOfDay;
+};
+
+#define PLACES_URI_PREFIX "place:"
+
+inline static bool IsQueryURI(const nsACString& uri) {
+  return StringBeginsWith(uri, nsLiteralCString(PLACES_URI_PREFIX));
+}
+
+inline const nsDependentCSubstring QueryURIToQuery(const nsCString& uri) {
+  NS_ASSERTION(IsQueryURI(uri), "should only be called for query URIs");
+  return Substring(uri, nsLiteralCString(PLACES_URI_PREFIX).Length());
+}
+
+#endif  // nsNavHistory_h_

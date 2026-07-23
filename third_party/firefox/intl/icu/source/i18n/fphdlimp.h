@@ -1,0 +1,90 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2009-2015, International Business Machines Corporation and    *
+* others. All Rights Reserved.                                                *
+*******************************************************************************
+*/
+
+#ifndef FPHDLIMP_H
+#define FPHDLIMP_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/fieldpos.h"
+#include "unicode/fpositer.h"
+#include "unicode/formattedvalue.h"
+
+U_NAMESPACE_BEGIN
+
+
+class U_I18N_API FieldPositionHandler: public UMemory {
+ protected:
+  int32_t fShift = 0;
+
+ public:
+  virtual ~FieldPositionHandler();
+  virtual void addAttribute(int32_t id, int32_t start, int32_t limit) = 0;
+  virtual void shiftLast(int32_t delta) = 0;
+  virtual UBool isRecording() const = 0;
+
+  void setShift(int32_t delta);
+};
+
+
+
+class FieldPositionOnlyHandler : public FieldPositionHandler {
+  FieldPosition& pos;
+  UBool acceptFirstOnly = false;
+  UBool seenFirst = false;
+
+ public:
+  FieldPositionOnlyHandler(FieldPosition& pos);
+  virtual ~FieldPositionOnlyHandler();
+
+  void addAttribute(int32_t id, int32_t start, int32_t limit) override;
+  void shiftLast(int32_t delta) override;
+  UBool isRecording() const override;
+
+  void setAcceptFirstOnly(UBool acceptFirstOnly);
+};
+
+
+
+class U_I18N_API FieldPositionIteratorHandler : public FieldPositionHandler {
+  FieldPositionIterator* iter; 
+  UVector32* vec;
+  UErrorCode status;
+  UFieldCategory fCategory;
+
+  static void* U_EXPORT2 operator new(size_t) noexcept = delete;
+  static void* U_EXPORT2 operator new[](size_t) noexcept = delete;
+  static void* U_EXPORT2 operator new(size_t, void*) noexcept = delete;
+
+ public:
+  FieldPositionIteratorHandler(FieldPositionIterator* posIter, UErrorCode& status);
+  FieldPositionIteratorHandler(UVector32* vec, UErrorCode& status);
+  ~FieldPositionIteratorHandler();
+
+  void addAttribute(int32_t id, int32_t start, int32_t limit) override;
+  void shiftLast(int32_t delta) override;
+  UBool isRecording() const override;
+
+  inline void getError(UErrorCode& _status) {
+    if (U_SUCCESS(_status) && U_FAILURE(status)) {
+      _status = status;
+    }
+  }
+
+  inline void setCategory(UFieldCategory category) {
+    fCategory = category;
+  }
+};
+
+U_NAMESPACE_END
+
+#endif /* !UCONFIG_NO_FORMATTING */
+
+#endif /* FPHDLIMP_H */

@@ -1,0 +1,2174 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+*   Copyright (C) 1997-2016, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+**********************************************************************
+*
+* File ULOC.CPP
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   04/01/97    aliu        Creation.
+*   08/21/98    stephen     JDK 1.2 sync
+*   12/08/98    rtg         New Locale implementation and C API
+*   03/15/99    damiba      overhaul.
+*   04/06/99    stephen     changed setDefault() to realloc and copy
+*   06/14/99    stephen     Changed calls to ures_open for new params
+*   07/21/99    stephen     Modified setDefault() to propagate to C++
+*   05/14/04    alan        7 years later: refactored, cleaned up, fixed bugs,
+*                           brought canonicalization code into line with spec
+*****************************************************************************/
+
+
+#include <algorithm>
+#include <optional>
+#include <string_view>
+
+#include "unicode/bytestream.h"
+#include "unicode/errorcode.h"
+#include "unicode/stringpiece.h"
+#include "unicode/utypes.h"
+#include "unicode/ustring.h"
+#include "unicode/uloc.h"
+
+#include "bytesinkutil.h"
+#include "putilimp.h"
+#include "ustr_imp.h"
+#include "ulocimp.h"
+#include "umutex.h"
+#include "cstring.h"
+#include "cmemory.h"
+#include "locmap.h"
+#include "uarrsort.h"
+#include "uenumimp.h"
+#include "uassert.h"
+#include "charstr.h"
+
+U_NAMESPACE_USE
+
+
+U_CFUNC void locale_set_default(const char *id);
+U_CFUNC const char *locale_get_default();
+
+namespace {
+
+
+constexpr const char* LANGUAGES[] = {
+    "aa",  "ab",  "ace", "ach", "ada", "ady", "ae",  "aeb",
+    "af",  "afh", "agq", "ain", "ak",  "akk", "akz", "ale",
+    "aln", "alt", "am",  "an",  "ang", "anp", "ar",  "arc",
+    "arn", "aro", "arp", "arq", "ars", "arw", "ary", "arz", "as",
+    "asa", "ase", "ast", "av",  "avk", "awa", "ay",  "az",
+    "ba",  "bal", "ban", "bar", "bas", "bax", "bbc", "bbj",
+    "be",  "bej", "bem", "bew", "bez", "bfd", "bfq", "bg",
+    "bgc", "bgn", "bho", "bi",  "bik", "bin", "bjn", "bkm", "bla",
+    "blo", "bm",  "bn",  "bo",  "bpy", "bqi", "br",  "bra", "brh",
+    "brx", "bs",  "bss", "bua", "bug", "bum", "byn", "byv",
+    "ca",  "cad", "car", "cay", "cch", "ccp", "ce",  "ceb", "cgg",
+    "ch",  "chb", "chg", "chk", "chm", "chn", "cho", "chp",
+    "chr", "chy", "ckb", "co",  "cop", "cps", "cr",  "crh",
+    "cs",  "csb", "csw", "cu",  "cv",  "cy",
+    "da",  "dak", "dar", "dav", "de",  "del", "den", "dgr",
+    "din", "dje", "doi", "dsb", "dtp", "dua", "dum", "dv",
+    "dyo", "dyu", "dz",  "dzg",
+    "ebu", "ee",  "efi", "egl", "egy", "eka", "el",  "elx",
+    "en",  "enm", "eo",  "es",  "esu", "et",  "eu",  "ewo",
+    "ext",
+    "fa",  "fan", "fat", "ff",  "fi",  "fil", "fit", "fj",
+    "fo",  "fon", "fr",  "frc", "frm", "fro", "frp", "frr",
+    "frs", "fur", "fy",
+    "ga",  "gaa", "gag", "gan", "gay", "gba", "gbz", "gd",
+    "gez", "gil", "gl",  "glk", "gmh", "gn",  "goh", "gom",
+    "gon", "gor", "got", "grb", "grc", "gsw", "gu",  "guc",
+    "gur", "guz", "gv",  "gwi",
+    "ha",  "hai", "hak", "haw", "he",  "hi",  "hif", "hil",
+    "hit", "hmn", "ho",  "hr",  "hsb", "hsn", "ht",  "hu",
+    "hup", "hy",  "hz",
+    "ia",  "iba", "ibb", "id",  "ie",  "ig",  "ii",  "ik",
+    "ilo", "inh", "io",  "is",  "it",  "iu",  "izh",
+    "ja",  "jam", "jbo", "jgo", "jmc", "jpr", "jrb", "jut",
+    "jv",
+    "ka",  "kaa", "kab", "kac", "kaj", "kam", "kaw", "kbd",
+    "kbl", "kcg", "kde", "kea", "ken", "kfo", "kg",  "kgp",
+    "kha", "kho", "khq", "khw", "ki",  "kiu", "kj",  "kk",
+    "kkj", "kl",  "kln", "km",  "kmb", "kn",  "ko",  "koi",
+    "kok", "kos", "kpe", "kr",  "krc", "kri", "krj", "krl",
+    "kru", "ks",  "ksb", "ksf", "ksh", "ku",  "kum", "kut",
+    "kv",  "kw",  "kxv", "ky",
+    "la",  "lad", "lag", "lah", "lam", "lb",  "lez", "lfn",
+    "lg",  "li",  "lij", "liv", "lkt", "lmo", "ln",  "lo",
+    "lol", "loz", "lrc", "lt",  "ltg", "lu",  "lua", "lui",
+    "lun", "luo", "lus", "luy", "lv",  "lzh", "lzz",
+    "mad", "maf", "mag", "mai", "mak", "man", "mas", "mde",
+    "mdf", "mdh", "mdr", "men", "mer", "mfe", "mg",  "mga",
+    "mgh", "mgo", "mh",  "mi",  "mic", "min", "mis", "mk",
+    "ml",  "mn",  "mnc", "mni",
+    "moh", "mos", "mr",  "mrj",
+    "ms",  "mt",  "mua", "mul", "mus", "mwl", "mwr", "mwv",
+    "my",  "mye", "myv", "mzn",
+    "na",  "nan", "nap", "naq", "nb",  "nd",  "nds", "ne",
+    "new", "ng",  "nia", "niu", "njo", "nl",  "nmg", "nn",
+    "nnh", "no",  "nog", "non", "nov", "nqo", "nr",  "nso",
+    "nus", "nv",  "nwc", "ny",  "nym", "nyn", "nyo", "nzi",
+    "oc",  "oj",  "om",  "or",  "os",  "osa", "ota",
+    "pa",  "pag", "pal", "pam", "pap", "pau", "pcd", "pcm", "pdc",
+    "pdt", "peo", "pfl", "phn", "pi",  "pl",  "pms", "pnt",
+    "pon", "prg", "pro", "ps",  "pt",
+    "qu",  "quc", "qug",
+    "raj", "rap", "rar", "rgn", "rif", "rm",  "rn",  "ro",
+    "rof", "rom", "rtm", "ru",  "rue", "rug", "rup",
+    "rw",  "rwk",
+    "sa",  "sad", "sah", "sam", "saq", "sas", "sat", "saz",
+    "sba", "sbp", "sc",  "scn", "sco", "sd",  "sdc", "sdh",
+    "se",  "see", "seh", "sei", "sel", "ses", "sg",  "sga",
+    "sgs", "shi", "shn", "shu", "si",  "sid", "sk",
+    "sl",  "sli", "sly", "sm",  "sma", "smj", "smn", "sms",
+    "sn",  "snk", "so",  "sog", "sq",  "sr",  "srn", "srr",
+    "ss",  "ssy", "st",  "stq", "su",  "suk", "sus", "sux",
+    "sv",  "sw",  "swb", "syc", "syr", "szl",
+    "ta",  "tcy", "te",  "tem", "teo", "ter", "tet", "tg",
+    "th",  "ti",  "tig", "tiv", "tk",  "tkl", "tkr",
+    "tlh", "tli", "tly", "tmh", "tn",  "to",  "tog", "tok", "tpi",
+    "tr",  "tru", "trv", "ts",  "tsd", "tsi", "tt",  "ttt",
+    "tum", "tvl", "tw",  "twq", "ty",  "tyv", "tzm",
+    "udm", "ug",  "uga", "uk",  "umb", "und", "ur",  "uz",
+    "vai", "ve",  "vec", "vep", "vi",  "vls", "vmf", "vmw",
+    "vo", "vot", "vro", "vun",
+    "wa",  "wae", "wal", "war", "was", "wbp", "wo",  "wuu",
+    "xal", "xh",  "xmf", "xnr", "xog",
+    "yao", "yap", "yav", "ybb", "yi",  "yo",  "yrl", "yue",
+    "za",  "zap", "zbl", "zea", "zen", "zgh", "zh",  "zu",
+    "zun", "zxx", "zza",
+nullptr,
+    "in",  "iw",  "ji",  "jw",  "mo",  "sh",  "swc", "tl",  
+nullptr
+};
+
+constexpr const char* DEPRECATED_LANGUAGES[]={
+    "in", "iw", "ji", "jw", "mo", nullptr, nullptr
+};
+constexpr const char* REPLACEMENT_LANGUAGES[]={
+    "id", "he", "yi", "jv", "ro", nullptr, nullptr
+};
+
+constexpr const char* LANGUAGES_3[] = {
+    "aar", "abk", "ace", "ach", "ada", "ady", "ave", "aeb",
+    "afr", "afh", "agq", "ain", "aka", "akk", "akz", "ale",
+    "aln", "alt", "amh", "arg", "ang", "anp", "ara", "arc",
+    "arn", "aro", "arp", "arq", "ars", "arw", "ary", "arz", "asm",
+    "asa", "ase", "ast", "ava", "avk", "awa", "aym", "aze",
+    "bak", "bal", "ban", "bar", "bas", "bax", "bbc", "bbj",
+    "bel", "bej", "bem", "bew", "bez", "bfd", "bfq", "bul",
+    "bgc", "bgn", "bho", "bis", "bik", "bin", "bjn", "bkm", "bla",
+    "blo", "bam", "ben", "bod", "bpy", "bqi", "bre", "bra", "brh",
+    "brx", "bos", "bss", "bua", "bug", "bum", "byn", "byv",
+    "cat", "cad", "car", "cay", "cch", "ccp", "che", "ceb", "cgg",
+    "cha", "chb", "chg", "chk", "chm", "chn", "cho", "chp",
+    "chr", "chy", "ckb", "cos", "cop", "cps", "cre", "crh",
+    "ces", "csb", "csw", "chu", "chv", "cym",
+    "dan", "dak", "dar", "dav", "deu", "del", "den", "dgr",
+    "din", "dje", "doi", "dsb", "dtp", "dua", "dum", "div",
+    "dyo", "dyu", "dzo", "dzg",
+    "ebu", "ewe", "efi", "egl", "egy", "eka", "ell", "elx",
+    "eng", "enm", "epo", "spa", "esu", "est", "eus", "ewo",
+    "ext",
+    "fas", "fan", "fat", "ful", "fin", "fil", "fit", "fij",
+    "fao", "fon", "fra", "frc", "frm", "fro", "frp", "frr",
+    "frs", "fur", "fry",
+    "gle", "gaa", "gag", "gan", "gay", "gba", "gbz", "gla",
+    "gez", "gil", "glg", "glk", "gmh", "grn", "goh", "gom",
+    "gon", "gor", "got", "grb", "grc", "gsw", "guj", "guc",
+    "gur", "guz", "glv", "gwi",
+    "hau", "hai", "hak", "haw", "heb", "hin", "hif", "hil",
+    "hit", "hmn", "hmo", "hrv", "hsb", "hsn", "hat", "hun",
+    "hup", "hye", "her",
+    "ina", "iba", "ibb", "ind", "ile", "ibo", "iii", "ipk",
+    "ilo", "inh", "ido", "isl", "ita", "iku", "izh",
+    "jpn", "jam", "jbo", "jgo", "jmc", "jpr", "jrb", "jut",
+    "jav",
+    "kat", "kaa", "kab", "kac", "kaj", "kam", "kaw", "kbd",
+    "kbl", "kcg", "kde", "kea", "ken", "kfo", "kon", "kgp",
+    "kha", "kho", "khq", "khw", "kik", "kiu", "kua", "kaz",
+    "kkj", "kal", "kln", "khm", "kmb", "kan", "kor", "koi",
+    "kok", "kos", "kpe", "kau", "krc", "kri", "krj", "krl",
+    "kru", "kas", "ksb", "ksf", "ksh", "kur", "kum", "kut",
+    "kom", "cor", "kxv", "kir",
+    "lat", "lad", "lag", "lah", "lam", "ltz", "lez", "lfn",
+    "lug", "lim", "lij", "liv", "lkt", "lmo", "lin", "lao",
+    "lol", "loz", "lrc", "lit", "ltg", "lub", "lua", "lui",
+    "lun", "luo", "lus", "luy", "lav", "lzh", "lzz",
+    "mad", "maf", "mag", "mai", "mak", "man", "mas", "mde",
+    "mdf", "mdh", "mdr", "men", "mer", "mfe", "mlg", "mga",
+    "mgh", "mgo", "mah", "mri", "mic", "min", "mis", "mkd",
+    "mal", "mon", "mnc", "mni",
+    "moh", "mos", "mar", "mrj",
+    "msa", "mlt", "mua", "mul", "mus", "mwl", "mwr", "mwv",
+    "mya", "mye", "myv", "mzn",
+    "nau", "nan", "nap", "naq", "nob", "nde", "nds", "nep",
+    "new", "ndo", "nia", "niu", "njo", "nld", "nmg", "nno",
+    "nnh", "nor", "nog", "non", "nov", "nqo", "nbl", "nso",
+    "nus", "nav", "nwc", "nya", "nym", "nyn", "nyo", "nzi",
+    "oci", "oji", "orm", "ori", "oss", "osa", "ota",
+    "pan", "pag", "pal", "pam", "pap", "pau", "pcd", "pcm", "pdc",
+    "pdt", "peo", "pfl", "phn", "pli", "pol", "pms", "pnt",
+    "pon", "prg", "pro", "pus", "por",
+    "que", "quc", "qug",
+    "raj", "rap", "rar", "rgn", "rif", "roh", "run", "ron",
+    "rof", "rom", "rtm", "rus", "rue", "rug", "rup",
+    "kin", "rwk",
+    "san", "sad", "sah", "sam", "saq", "sas", "sat", "saz",
+    "sba", "sbp", "srd", "scn", "sco", "snd", "sdc", "sdh",
+    "sme", "see", "seh", "sei", "sel", "ses", "sag", "sga",
+    "sgs", "shi", "shn", "shu", "sin", "sid", "slk",
+    "slv", "sli", "sly", "smo", "sma", "smj", "smn", "sms",
+    "sna", "snk", "som", "sog", "sqi", "srp", "srn", "srr",
+    "ssw", "ssy", "sot", "stq", "sun", "suk", "sus", "sux",
+    "swe", "swa", "swb", "syc", "syr", "szl",
+    "tam", "tcy", "tel", "tem", "teo", "ter", "tet", "tgk",
+    "tha", "tir", "tig", "tiv", "tuk", "tkl", "tkr",
+    "tlh", "tli", "tly", "tmh", "tsn", "ton", "tog", "tok", "tpi",
+    "tur", "tru", "trv", "tso", "tsd", "tsi", "tat", "ttt",
+    "tum", "tvl", "twi", "twq", "tah", "tyv", "tzm",
+    "udm", "uig", "uga", "ukr", "umb", "und", "urd", "uzb",
+    "vai", "ven", "vec", "vep", "vie", "vls", "vmf", "vmw",
+    "vol", "vot", "vro", "vun",
+    "wln", "wae", "wal", "war", "was", "wbp", "wol", "wuu",
+    "xal", "xho", "xmf", "xnr", "xog",
+    "yao", "yap", "yav", "ybb", "yid", "yor", "yrl", "yue",
+    "zha", "zap", "zbl", "zea", "zen", "zgh", "zho", "zul",
+    "zun", "zxx", "zza",
+nullptr,
+    "ind", "heb", "yid", "jaw", "mol", "srp", "swc", "tgl",
+nullptr
+};
+
+constexpr const char* COUNTRIES[] = {
+    "AD",  "AE",  "AF",  "AG",  "AI",  "AL",  "AM",
+    "AO",  "AQ",  "AR",  "AS",  "AT",  "AU",  "AW",  "AX",  "AZ",
+    "BA",  "BB",  "BD",  "BE",  "BF",  "BG",  "BH",  "BI",
+    "BJ",  "BL",  "BM",  "BN",  "BO",  "BQ",  "BR",  "BS",  "BT",  "BV",
+    "BW",  "BY",  "BZ",  "CA",  "CC",  "CD",  "CF",  "CG",
+    "CH",  "CI",  "CK",  "CL",  "CM",  "CN",  "CO",  "CQ",  "CR",
+    "CU",  "CV",  "CW",  "CX",  "CY",  "CZ",  "DE",  "DG",  "DJ",  "DK",
+    "DM",  "DO",  "DZ",  "EA",  "EC",  "EE",  "EG",  "EH",  "ER",
+    "ES",  "ET",  "FI",  "FJ",  "FK",  "FM",  "FO",  "FR",
+    "GA",  "GB",  "GD",  "GE",  "GF",  "GG",  "GH",  "GI",  "GL",
+    "GM",  "GN",  "GP",  "GQ",  "GR",  "GS",  "GT",  "GU",
+    "GW",  "GY",  "HK",  "HM",  "HN",  "HR",  "HT",  "HU",
+    "IC",  "ID",  "IE",  "IL",  "IM",  "IN",  "IO",  "IQ",  "IR",  "IS",
+    "IT",  "JE",  "JM",  "JO",  "JP",  "KE",  "KG",  "KH",  "KI",
+    "KM",  "KN",  "KP",  "KR",  "KW",  "KY",  "KZ",  "LA",
+    "LB",  "LC",  "LI",  "LK",  "LR",  "LS",  "LT",  "LU",
+    "LV",  "LY",  "MA",  "MC",  "MD",  "ME",  "MF",  "MG",  "MH",  "MK",
+    "ML",  "MM",  "MN",  "MO",  "MP",  "MQ",  "MR",  "MS",
+    "MT",  "MU",  "MV",  "MW",  "MX",  "MY",  "MZ",  "NA",
+    "NC",  "NE",  "NF",  "NG",  "NI",  "NL",  "NO",  "NP",
+    "NR",  "NU",  "NZ",  "OM",  "PA",  "PE",  "PF",  "PG",
+    "PH",  "PK",  "PL",  "PM",  "PN",  "PR",  "PS",  "PT",
+    "PW",  "PY",  "QA",  "RE",  "RO",  "RS",  "RU",  "RW",  "SA",
+    "SB",  "SC",  "SD",  "SE",  "SG",  "SH",  "SI",  "SJ",
+    "SK",  "SL",  "SM",  "SN",  "SO",  "SR",  "SS",  "ST",  "SV",
+    "SX",  "SY",  "SZ",  "TC",  "TD",  "TF",  "TG",  "TH",  "TJ",
+    "TK",  "TL",  "TM",  "TN",  "TO",  "TR",  "TT",  "TV",
+    "TW",  "TZ",  "UA",  "UG",  "UM",  "US",  "UY",  "UZ",
+    "VA",  "VC",  "VE",  "VG",  "VI",  "VN",  "VU",  "WF",
+    "WS",  "XK",  "YE",  "YT",  "ZA",  "ZM",  "ZW",
+nullptr,
+    "AN",  "BU", "CS", "FX", "RO", "SU", "TP", "YD", "YU", "ZR",   
+nullptr
+};
+
+constexpr const char* DEPRECATED_COUNTRIES[] = {
+    "AN", "BU", "CS", "DD", "DY", "FX", "HV", "NH", "RH", "SU", "TP", "UK", "VD", "YD", "YU", "ZR", nullptr, nullptr 
+};
+constexpr const char* REPLACEMENT_COUNTRIES[] = {
+    "CW", "MM", "RS", "DE", "BJ", "FR", "BF", "VU", "ZW", "RU", "TL", "GB", "VN", "YE", "RS", "CD", nullptr, nullptr  
+};
+
+constexpr const char* COUNTRIES_3[] = {
+    "AND", "ARE", "AFG", "ATG", "AIA", "ALB", "ARM",
+    "AGO", "ATA", "ARG", "ASM", "AUT", "AUS", "ABW", "ALA", "AZE",
+    "BIH", "BRB", "BGD", "BEL", "BFA", "BGR", "BHR", "BDI",
+    "BEN", "BLM", "BMU", "BRN", "BOL", "BES", "BRA", "BHS", "BTN", "BVT",
+    "BWA", "BLR", "BLZ", "CAN", "CCK", "COD", "CAF", "COG",
+    "CHE", "CIV", "COK", "CHL", "CMR", "CHN", "COL", "CRQ", "CRI",
+    "CUB", "CPV", "CUW", "CXR", "CYP", "CZE", "DEU", "DGA", "DJI", "DNK",
+    "DMA", "DOM", "DZA", "XEA", "ECU", "EST", "EGY", "ESH", "ERI",
+    "ESP", "ETH", "FIN", "FJI", "FLK", "FSM", "FRO", "FRA",
+    "GAB", "GBR", "GRD", "GEO", "GUF", "GGY", "GHA", "GIB", "GRL",
+    "GMB", "GIN", "GLP", "GNQ", "GRC", "SGS", "GTM", "GUM",
+    "GNB", "GUY", "HKG", "HMD", "HND", "HRV", "HTI", "HUN",
+    "XIC", "IDN", "IRL", "ISR", "IMN", "IND", "IOT", "IRQ", "IRN", "ISL",
+    "ITA", "JEY", "JAM", "JOR", "JPN", "KEN", "KGZ", "KHM", "KIR",
+    "COM", "KNA", "PRK", "KOR", "KWT", "CYM", "KAZ", "LAO",
+    "LBN", "LCA", "LIE", "LKA", "LBR", "LSO", "LTU", "LUX",
+    "LVA", "LBY", "MAR", "MCO", "MDA", "MNE", "MAF", "MDG", "MHL", "MKD",
+    "MLI", "MMR", "MNG", "MAC", "MNP", "MTQ", "MRT", "MSR",
+    "MLT", "MUS", "MDV", "MWI", "MEX", "MYS", "MOZ", "NAM",
+    "NCL", "NER", "NFK", "NGA", "NIC", "NLD", "NOR", "NPL",
+    "NRU", "NIU", "NZL", "OMN", "PAN", "PER", "PYF", "PNG",
+    "PHL", "PAK", "POL", "SPM", "PCN", "PRI", "PSE", "PRT",
+    "PLW", "PRY", "QAT", "REU", "ROU", "SRB", "RUS", "RWA", "SAU",
+    "SLB", "SYC", "SDN", "SWE", "SGP", "SHN", "SVN", "SJM",
+    "SVK", "SLE", "SMR", "SEN", "SOM", "SUR", "SSD", "STP", "SLV",
+    "SXM", "SYR", "SWZ", "TCA", "TCD", "ATF", "TGO", "THA", "TJK",
+    "TKL", "TLS", "TKM", "TUN", "TON", "TUR", "TTO", "TUV",
+    "TWN", "TZA", "UKR", "UGA", "UMI", "USA", "URY", "UZB",
+    "VAT", "VCT", "VEN", "VGB", "VIR", "VNM", "VUT", "WLF",
+    "WSM", "XKK", "YEM", "MYT", "ZAF", "ZMB", "ZWE",
+nullptr,
+    "ANT", "BUR", "SCG", "FXX", "ROM", "SUN", "TMP", "YMD", "YUG", "ZAR",
+nullptr
+};
+
+typedef struct CanonicalizationMap {
+    const char *id;          
+    const char *canonicalID; 
+} CanonicalizationMap;
+
+constexpr CanonicalizationMap CANONICALIZE_MAP[] = {
+    { "art__LOJBAN",    "jbo" }, 
+    { "hy__AREVELA",    "hy" }, 
+    { "hy__AREVMDA",    "hyw" }, 
+    { "zh__GUOYU",      "zh" }, 
+    { "zh__HAKKA",      "hak" }, 
+    { "zh__XIANG",      "hsn" }, 
+    { "zh_GAN",         "gan" }, 
+    { "zh_MIN_NAN",     "nan" }, 
+    { "zh_WUU",         "wuu" }, 
+    { "zh_YUE",         "yue" }, 
+};
+
+int32_t getShortestSubtagLength(std::string_view localeID) {
+    int32_t localeIDLength = static_cast<int32_t>(localeID.length());
+    int32_t length = localeIDLength;
+    int32_t tmpLength = 0;
+    int32_t i;
+    bool reset = true;
+
+    for (i = 0; i < localeIDLength; i++) {
+        if (localeID[i] != '_' && localeID[i] != '-') {
+            if (reset) {
+                tmpLength = 0;
+                reset = false;
+            }
+            tmpLength++;
+        } else {
+            if (tmpLength != 0 && tmpLength < length) {
+                length = tmpLength;
+            }
+            reset = true;
+        }
+    }
+
+    return length;
+}
+inline bool _hasBCP47Extension(std::string_view id) {
+    return id.find('@') == std::string_view::npos && getShortestSubtagLength(id) == 1;
+}
+
+inline bool UPRV_ISDIGIT(char c) { return c >= '0' && c <= '9'; }
+inline bool UPRV_ISALPHANUM(char c) { return uprv_isASCIILetter(c) || UPRV_ISDIGIT(c); }
+inline bool UPRV_OK_VALUE_PUNCTUATION(char c) { return c == '_' || c == '-' || c == '+' || c == '/'; }
+
+}  
+
+#define ULOC_KEYWORD_BUFFER_LEN 25
+#define ULOC_MAX_NO_KEYWORDS 25
+
+U_CAPI const char * U_EXPORT2
+locale_getKeywordsStart(std::string_view localeID) {
+    if (size_t pos = localeID.find('@'); pos != std::string_view::npos) {
+        return localeID.data() + pos;
+    }
+#if (U_CHARSET_FAMILY == U_EBCDIC_FAMILY)
+    else {
+        static const uint8_t ebcdicSigns[] = { 0x7C, 0x44, 0x66, 0x80, 0xAC, 0xAE, 0xAF, 0xB5, 0xEC, 0xEF, 0x00 };
+        const uint8_t *charToFind = ebcdicSigns;
+        while(*charToFind) {
+            if (size_t pos = localeID.find(*charToFind); pos != std::string_view::npos) {
+                return localeID.data() + pos;
+            }
+            charToFind++;
+        }
+    }
+#endif
+    return nullptr;
+}
+
+namespace {
+
+CharString locale_canonKeywordName(std::string_view keywordName, UErrorCode& status)
+{
+  if (U_FAILURE(status)) { return {}; }
+  CharString result;
+
+  for (char c : keywordName) {
+    if (!UPRV_ISALPHANUM(c)) {
+      status = U_ILLEGAL_ARGUMENT_ERROR; 
+      return {};
+    }
+    result.append(uprv_tolower(c), status);
+  }
+  if (result.isEmpty()) {
+    status = U_ILLEGAL_ARGUMENT_ERROR; 
+    return {};
+  }
+
+  return result;
+}
+
+typedef struct {
+    char keyword[ULOC_KEYWORD_BUFFER_LEN];
+    int32_t keywordLen;
+    const char *valueStart;
+    int32_t valueLen;
+} KeywordStruct;
+
+int32_t U_CALLCONV
+compareKeywordStructs(const void * , const void *left, const void *right) {
+    const char* leftString = static_cast<const KeywordStruct*>(left)->keyword;
+    const char* rightString = static_cast<const KeywordStruct*>(right)->keyword;
+    return uprv_strcmp(leftString, rightString);
+}
+
+}  
+
+U_EXPORT CharString
+ulocimp_getKeywords(std::string_view localeID,
+                    char prev,
+                    bool valuesToo,
+                    UErrorCode& status)
+{
+    return ByteSinkUtil::viaByteSinkToCharString(
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getKeywords(localeID,
+                                prev,
+                                sink,
+                                valuesToo,
+                                status);
+        },
+        status);
+}
+
+U_EXPORT void
+ulocimp_getKeywords(std::string_view localeID,
+                    char prev,
+                    ByteSink& sink,
+                    bool valuesToo,
+                    UErrorCode& status)
+{
+    if (U_FAILURE(status)) { return; }
+
+    KeywordStruct keywordList[ULOC_MAX_NO_KEYWORDS];
+
+    int32_t maxKeywords = ULOC_MAX_NO_KEYWORDS;
+    int32_t numKeywords = 0;
+    size_t equalSign = std::string_view::npos;
+    size_t semicolon = std::string_view::npos;
+    int32_t i = 0, j, n;
+
+    if(prev == '@') { 
+        do {
+            bool duplicate = false;
+            while (!localeID.empty() && localeID.front() == ' ') {
+                localeID.remove_prefix(1);
+            }
+            if (localeID.empty()) { 
+                break;
+            }
+            if(numKeywords == maxKeywords) {
+                status = U_INTERNAL_PROGRAM_ERROR;
+                return;
+            }
+            equalSign = localeID.find('=');
+            semicolon = localeID.find(';');
+            if (equalSign == std::string_view::npos ||
+                (semicolon != std::string_view::npos && semicolon < equalSign)) {
+                status = U_INVALID_FORMAT_ERROR;
+                return;
+            }
+            if (equalSign == 0) {
+                status = U_INVALID_FORMAT_ERROR;
+                return;
+            }
+            if (equalSign >= ULOC_KEYWORD_BUFFER_LEN) {
+                status = U_INTERNAL_PROGRAM_ERROR;
+                return;
+            }
+            for (i = 0, n = 0; static_cast<size_t>(i) < equalSign; ++i) {
+                if (localeID[i] != ' ') {
+                    keywordList[numKeywords].keyword[n++] = uprv_tolower(localeID[i]);
+                }
+            }
+
+            keywordList[numKeywords].keyword[n] = 0;
+            keywordList[numKeywords].keywordLen = n;
+            equalSign++;
+            while (equalSign < localeID.length() && localeID[equalSign] == ' ') {
+                equalSign++;
+            }
+
+            if (equalSign == localeID.length() || equalSign == semicolon) {
+                status = U_INVALID_FORMAT_ERROR;
+                return;
+            }
+
+            keywordList[numKeywords].valueStart = localeID.data() + equalSign;
+
+            std::string_view value = localeID;
+            if (semicolon != std::string_view::npos) {
+                value.remove_suffix(value.length() - semicolon);
+                localeID.remove_prefix(semicolon + 1);
+            } else {
+                localeID = {};
+            }
+            value.remove_prefix(equalSign);
+            if (size_t last = value.find_last_not_of(' '); last != std::string_view::npos) {
+                value.remove_suffix(value.length() - last - 1);
+            }
+            keywordList[numKeywords].valueLen = static_cast<int32_t>(value.length());
+
+            for (j=0; j<numKeywords; ++j) {
+                if (uprv_strcmp(keywordList[j].keyword, keywordList[numKeywords].keyword) == 0) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                ++numKeywords;
+            }
+        } while (!localeID.empty());
+
+        uprv_sortArray(keywordList, numKeywords, sizeof(KeywordStruct), compareKeywordStructs, nullptr, false, &status);
+
+        for(i = 0; i < numKeywords; i++) {
+            sink.Append(keywordList[i].keyword, keywordList[i].keywordLen);
+            if(valuesToo) {
+                sink.Append("=", 1);
+                sink.Append(keywordList[i].valueStart, keywordList[i].valueLen);
+                if(i < numKeywords - 1) {
+                    sink.Append(";", 1);
+                }
+            } else {
+                sink.Append("\0", 1);
+            }
+        }
+    }
+}
+
+U_CAPI int32_t U_EXPORT2
+uloc_getKeywordValue(const char* localeID,
+                     const char* keywordName,
+                     char* buffer, int32_t bufferCapacity,
+                     UErrorCode* status)
+{
+    if (U_FAILURE(*status)) { return 0; }
+    if (keywordName == nullptr || *keywordName == '\0') {
+        *status = U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+    return ByteSinkUtil::viaByteSinkToTerminatedChars(
+        buffer, bufferCapacity,
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getKeywordValue(localeID, keywordName, sink, status);
+        },
+        *status);
+}
+
+U_EXPORT CharString
+ulocimp_getKeywordValue(const char* localeID,
+                        std::string_view keywordName,
+                        UErrorCode& status)
+{
+    return ByteSinkUtil::viaByteSinkToCharString(
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getKeywordValue(localeID, keywordName, sink, status);
+        },
+        status);
+}
+
+U_EXPORT void
+ulocimp_getKeywordValue(const char* localeID,
+                        std::string_view keywordName,
+                        icu::ByteSink& sink,
+                        UErrorCode& status)
+{
+    if (U_FAILURE(status)) { return; }
+
+    if (localeID == nullptr || keywordName.empty()) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+
+    const char* startSearchHere = nullptr;
+    const char* nextSeparator = nullptr;
+
+    CharString tempBuffer;
+    const char* tmpLocaleID;
+
+    CharString canonKeywordName = locale_canonKeywordName(keywordName, status);
+    if (U_FAILURE(status)) {
+      return;
+    }
+
+    if (localeID != nullptr && _hasBCP47Extension(localeID)) {
+        tempBuffer = ulocimp_forLanguageTag(localeID, -1, nullptr, status);
+        tmpLocaleID = U_SUCCESS(status) && !tempBuffer.isEmpty() ? tempBuffer.data() : localeID;
+    } else {
+        tmpLocaleID=localeID;
+    }
+
+    startSearchHere = locale_getKeywordsStart(tmpLocaleID);
+    if(startSearchHere == nullptr) {
+        return;
+    }
+
+    while(startSearchHere) {
+        const char* keyValueTail;
+
+        startSearchHere++; 
+        nextSeparator = uprv_strchr(startSearchHere, '=');
+        if(!nextSeparator) {
+            status = U_ILLEGAL_ARGUMENT_ERROR; 
+            return;
+        }
+        while(*startSearchHere == ' ') {
+            startSearchHere++;
+        }
+        keyValueTail = nextSeparator;
+        while (keyValueTail > startSearchHere && *(keyValueTail-1) == ' ') {
+            keyValueTail--;
+        }
+        if (startSearchHere == keyValueTail) {
+            status = U_ILLEGAL_ARGUMENT_ERROR; 
+            return;
+        }
+        CharString localeKeywordName;
+        while (startSearchHere < keyValueTail) {
+          if (!UPRV_ISALPHANUM(*startSearchHere)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR; 
+            return;
+          }
+          localeKeywordName.append(uprv_tolower(*startSearchHere++), status);
+        }
+        if (U_FAILURE(status)) {
+            return;
+        }
+
+        startSearchHere = uprv_strchr(nextSeparator, ';');
+
+        if (canonKeywordName == localeKeywordName) {
+           nextSeparator++; 
+            while(*nextSeparator == ' ') {
+              nextSeparator++;
+            }
+            keyValueTail = (startSearchHere)? startSearchHere: nextSeparator + uprv_strlen(nextSeparator);
+            while(keyValueTail > nextSeparator && *(keyValueTail-1) == ' ') {
+              keyValueTail--;
+            }
+            if (nextSeparator == keyValueTail) {
+              status = U_ILLEGAL_ARGUMENT_ERROR; 
+              return;
+            }
+            while (nextSeparator < keyValueTail) {
+              if (!UPRV_ISALPHANUM(*nextSeparator) && !UPRV_OK_VALUE_PUNCTUATION(*nextSeparator)) {
+                status = U_ILLEGAL_ARGUMENT_ERROR; 
+                return;
+              }
+              sink.Append(nextSeparator++, 1);
+            }
+            return;
+        }
+    }
+}
+
+U_CAPI int32_t U_EXPORT2
+uloc_setKeywordValue(const char* keywordName,
+                     const char* keywordValue,
+                     char* buffer, int32_t bufferCapacity,
+                     UErrorCode* status)
+{
+    if (U_FAILURE(*status)) { return 0; }
+
+    if (keywordName == nullptr || *keywordName == 0) {
+        *status = U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+
+    if (bufferCapacity <= 1) {
+        *status = U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+
+    int32_t bufLen = (int32_t)uprv_strlen(buffer);
+    if(bufferCapacity<bufLen) {
+        *status = U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+
+    char* keywords = const_cast<char*>(
+        locale_getKeywordsStart({buffer, static_cast<std::string_view::size_type>(bufLen)}));
+    int32_t baseLen = keywords == nullptr ? bufLen : keywords - buffer;
+    CheckedArrayByteSink sink(keywords == nullptr ? buffer + bufLen : keywords,
+                              bufferCapacity - baseLen - 1);
+    int32_t reslen = ulocimp_setKeywordValue(
+        keywords == nullptr ? std::string_view() : keywords,
+        keywordName,
+        keywordValue == nullptr ? std::string_view() : keywordValue,
+        sink,
+        *status);
+
+    if (U_FAILURE(*status)) {
+        return *status == U_BUFFER_OVERFLOW_ERROR ? reslen + baseLen : 0;
+    }
+
+    U_ASSERT(!sink.Overflowed());
+    U_ASSERT(reslen >= 0);
+    return u_terminateChars(buffer, bufferCapacity, reslen + baseLen, status);
+}
+
+U_EXPORT void
+ulocimp_setKeywordValue(std::string_view keywordName,
+                        std::string_view keywordValue,
+                        CharString& localeID,
+                        UErrorCode& status)
+{
+    if (U_FAILURE(status)) { return; }
+    std::string_view keywords;
+    if (const char* start = locale_getKeywordsStart(localeID.toStringPiece()); start != nullptr) {
+        int32_t size = start - localeID.data();
+        keywords = localeID.toStringPiece();
+        keywords.remove_prefix(size);
+        localeID.truncate(size);
+    }
+    CharStringByteSink sink(&localeID);
+    ulocimp_setKeywordValue(keywords, keywordName, keywordValue, sink, status);
+}
+
+U_EXPORT int32_t
+ulocimp_setKeywordValue(std::string_view keywords,
+                        std::string_view keywordName,
+                        std::string_view keywordValue,
+                        ByteSink& sink,
+                        UErrorCode& status)
+{
+    if (U_FAILURE(status)) { return 0; }
+
+    int32_t needLen = 0;
+    int32_t rc;
+    CharString updatedKeysAndValues;
+    bool handledInputKeyAndValue = false;
+    char keyValuePrefix = '@';
+
+    if (status == U_STRING_NOT_TERMINATED_WARNING) {
+        status = U_ZERO_ERROR;
+    }
+    if (keywordName.empty()) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+    CharString canonKeywordName = locale_canonKeywordName(keywordName, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    CharString canonKeywordValue;
+    for (char c : keywordValue) {
+        if (!UPRV_ISALPHANUM(c) && !UPRV_OK_VALUE_PUNCTUATION(c)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR; 
+            return 0;
+        }
+        canonKeywordValue.append(c, status);
+    }
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    if (keywords.size() <= 1) {
+        if (canonKeywordValue.isEmpty()) { 
+            U_ASSERT(status != U_STRING_NOT_TERMINATED_WARNING);
+            return 0;
+        }
+
+        needLen = 1 + canonKeywordName.length() + 1 + canonKeywordValue.length();
+        int32_t capacity = 0;
+        char* buffer = sink.GetAppendBuffer(
+                needLen, needLen, nullptr, needLen, &capacity);
+        if (capacity < needLen || buffer == nullptr) {
+            status = U_BUFFER_OVERFLOW_ERROR;
+            return needLen; 
+        }
+        char* it = buffer;
+
+        *it++ = '@';
+        uprv_memcpy(it, canonKeywordName.data(), canonKeywordName.length());
+        it += canonKeywordName.length();
+        *it++ = '=';
+        uprv_memcpy(it, canonKeywordValue.data(), canonKeywordValue.length());
+        sink.Append(buffer, needLen);
+        U_ASSERT(status != U_STRING_NOT_TERMINATED_WARNING);
+        return needLen;
+    } 
+
+    for (size_t keywordStart = 0; keywordStart != std::string_view::npos;) {
+        keywordStart++; 
+        size_t nextEqualsign = keywords.find('=', keywordStart);
+        if (nextEqualsign == std::string_view::npos) {
+            status = U_ILLEGAL_ARGUMENT_ERROR; 
+            return 0;
+        }
+        while (keywordStart < keywords.size() && keywords[keywordStart] == ' ') {
+            keywordStart++;
+        }
+        size_t keyValueTail = nextEqualsign;
+        while (keyValueTail > keywordStart && keywords[keyValueTail - 1] == ' ') {
+            keyValueTail--;
+        }
+        if (keywordStart == keyValueTail) {
+            status = U_ILLEGAL_ARGUMENT_ERROR; 
+            return 0;
+        }
+        CharString localeKeywordName;
+        while (keywordStart < keyValueTail) {
+            if (!UPRV_ISALPHANUM(keywords[keywordStart])) {
+                status = U_ILLEGAL_ARGUMENT_ERROR; 
+                return 0;
+            }
+            localeKeywordName.append(uprv_tolower(keywords[keywordStart++]), status);
+        }
+        if (U_FAILURE(status)) {
+            return 0;
+        }
+
+        size_t nextSeparator = keywords.find(';', nextEqualsign);
+
+        nextEqualsign++; 
+        while (nextEqualsign < keywords.size() && keywords[nextEqualsign] == ' ') {
+            nextEqualsign++;
+        }
+        keyValueTail = nextSeparator == std::string_view::npos ? keywords.size() : nextSeparator;
+        while (keyValueTail > nextEqualsign && keywords[keyValueTail - 1] == ' ') {
+            keyValueTail--;
+        }
+        if (nextEqualsign == keyValueTail) {
+            status = U_ILLEGAL_ARGUMENT_ERROR; 
+            return 0;
+        }
+
+        rc = uprv_strcmp(canonKeywordName.data(), localeKeywordName.data());
+        if(rc == 0) {
+            if (!canonKeywordValue.isEmpty()) { 
+                updatedKeysAndValues.append(keyValuePrefix, status);
+                keyValuePrefix = ';'; 
+                updatedKeysAndValues.append(canonKeywordName, status);
+                updatedKeysAndValues.append('=', status);
+                updatedKeysAndValues.append(canonKeywordValue, status);
+            } 
+            handledInputKeyAndValue = true;
+        } else {
+            if (rc < 0 && !canonKeywordValue.isEmpty() && !handledInputKeyAndValue) {
+                updatedKeysAndValues.append(keyValuePrefix, status);
+                keyValuePrefix = ';'; 
+                updatedKeysAndValues.append(canonKeywordName, status);
+                updatedKeysAndValues.append('=', status);
+                updatedKeysAndValues.append(canonKeywordValue, status);
+                handledInputKeyAndValue = true;
+            }
+            updatedKeysAndValues.append(keyValuePrefix, status);
+            keyValuePrefix = ';'; 
+            updatedKeysAndValues.append(localeKeywordName, status);
+            updatedKeysAndValues.append('=', status);
+            updatedKeysAndValues.append(keywords.data() + nextEqualsign,
+                                        static_cast<int32_t>(keyValueTail - nextEqualsign), status);
+        }
+        if (nextSeparator == std::string_view::npos && !canonKeywordValue.isEmpty() && !handledInputKeyAndValue) {
+            updatedKeysAndValues.append(keyValuePrefix, status);
+            updatedKeysAndValues.append(canonKeywordName, status);
+            updatedKeysAndValues.append('=', status);
+            updatedKeysAndValues.append(canonKeywordValue, status);
+            handledInputKeyAndValue = true;
+        }
+        keywordStart = nextSeparator;
+    } 
+
+    if (!handledInputKeyAndValue || U_FAILURE(status)) {
+        U_ASSERT(status != U_STRING_NOT_TERMINATED_WARNING);
+        needLen = static_cast<int32_t>(keywords.size());
+        int32_t capacity = 0;
+        char* buffer = sink.GetAppendBuffer(
+                needLen, needLen, nullptr, needLen, &capacity);
+        if (capacity < needLen || buffer == nullptr) {
+            status = U_BUFFER_OVERFLOW_ERROR;
+        } else {
+            *buffer = '@';
+            sink.Append(buffer, needLen);
+        }
+        return needLen;
+    }
+
+    needLen = updatedKeysAndValues.length();
+    if (needLen > 0) {
+        int32_t capacity = 0;
+        char* buffer = sink.GetAppendBuffer(
+                needLen, needLen, nullptr, needLen, &capacity);
+        if (capacity < needLen || buffer == nullptr) {
+            status = U_BUFFER_OVERFLOW_ERROR;
+            return needLen;
+        }
+        uprv_memcpy(buffer, updatedKeysAndValues.data(), needLen);
+        sink.Append(buffer, needLen);
+    }
+    U_ASSERT(status != U_STRING_NOT_TERMINATED_WARNING);
+    return needLen;
+}
+
+
+namespace {
+
+inline bool _isPrefixLetter(char a) { return a == 'x' || a == 'X' || a == 'i' || a == 'I'; }
+
+inline bool _isIDPrefix(std::string_view s) {
+    return s.size() >= 2 && _isPrefixLetter(s[0]) && _isIDSeparator(s[1]);
+}
+
+inline bool _isTerminator(char a) { return a == '.' || a == '@'; }
+
+inline bool _isBCP47Extension(std::string_view p) {
+    return p.size() >= 3 &&
+           p[0] == '-' &&
+           (p[1] == 't' || p[1] == 'T' ||
+            p[1] == 'u' || p[1] == 'U' ||
+            p[1] == 'x' || p[1] == 'X') &&
+           p[2] == '-';
+}
+
+std::optional<int16_t> _findIndex(const char* const* list, const char* key)
+{
+    const char* const* anchor = list;
+    int32_t pass = 0;
+
+    while (pass++ < 2) {
+        while (*list) {
+            if (uprv_strcmp(key, *list) == 0) {
+                return static_cast<int16_t>(list - anchor);
+            }
+            list++;
+        }
+        ++list;     
+    }
+    return std::nullopt;
+}
+
+}  
+
+U_CFUNC const char*
+uloc_getCurrentCountryID(const char* oldID){
+    std::optional<int16_t> offset = _findIndex(DEPRECATED_COUNTRIES, oldID);
+    return offset.has_value() ? REPLACEMENT_COUNTRIES[*offset] : oldID;
+}
+U_CFUNC const char*
+uloc_getCurrentLanguageID(const char* oldID){
+    std::optional<int16_t> offset = _findIndex(DEPRECATED_LANGUAGES, oldID);
+    return offset.has_value() ? REPLACEMENT_LANGUAGES[*offset] : oldID;
+}
+
+namespace {
+
+
+size_t _getLanguage(std::string_view localeID, ByteSink* sink, UErrorCode& status) {
+    size_t skip = 0;
+    if (localeID.size() == 4 && uprv_strnicmp(localeID.data(), "root", 4) == 0) {
+        skip = 4;
+        localeID.remove_prefix(skip);
+    } else if (localeID.size() >= 3 && uprv_strnicmp(localeID.data(), "und", 3) == 0 &&
+               (localeID.size() == 3 ||
+                localeID[3] == '-' ||
+                localeID[3] == '_' ||
+                localeID[3] == '@')) {
+        skip = 3;
+        localeID.remove_prefix(skip);
+    }
+
+    constexpr int32_t MAXLEN = ULOC_LANG_CAPACITY - 1;  
+
+    size_t len = _isIDPrefix(localeID) ? 2 : 0;
+    while (len < localeID.size() && !_isTerminator(localeID[len]) && !_isIDSeparator(localeID[len])) {
+        if (len == MAXLEN) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return 0;
+        }
+        len++;
+    }
+
+    if (sink == nullptr || len == 0) { return skip + len; }
+
+    int32_t minCapacity = uprv_max(static_cast<int32_t>(len), 4);  
+    char scratch[MAXLEN];
+    int32_t capacity = 0;
+    char* buffer = sink->GetAppendBuffer(
+            minCapacity, minCapacity, scratch, UPRV_LENGTHOF(scratch), &capacity);
+
+    for (size_t i = 0; i < len; ++i) {
+        buffer[i] = uprv_tolower(localeID[i]);
+    }
+    if (localeID.size() >= 2 && _isIDSeparator(localeID[1])) {
+        buffer[1] = '-';
+    }
+
+    if (len == 3) {
+        U_ASSERT(capacity >= 4);
+        buffer[3] = '\0';
+        std::optional<int16_t> offset = _findIndex(LANGUAGES_3, buffer);
+        if (offset.has_value()) {
+            const char* const alias = LANGUAGES[*offset];
+            sink->Append(alias, static_cast<int32_t>(uprv_strlen(alias)));
+            return skip + len;
+        }
+    }
+
+    sink->Append(buffer, static_cast<int32_t>(len));
+    return skip + len;
+}
+
+size_t _getScript(std::string_view localeID, ByteSink* sink) {
+    constexpr int32_t LENGTH = 4;
+
+    size_t len = 0;
+    while (len < localeID.size() && !_isTerminator(localeID[len]) && !_isIDSeparator(localeID[len]) &&
+            uprv_isASCIILetter(localeID[len])) {
+        if (len == LENGTH) { return 0; }
+        len++;
+    }
+    if (len != LENGTH) { return 0; }
+
+    if (sink == nullptr) { return len; }
+
+    char scratch[LENGTH];
+    int32_t capacity = 0;
+    char* buffer = sink->GetAppendBuffer(
+            LENGTH, LENGTH, scratch, UPRV_LENGTHOF(scratch), &capacity);
+
+    buffer[0] = uprv_toupper(localeID[0]);
+    for (int32_t i = 1; i < LENGTH; ++i) {
+        buffer[i] = uprv_tolower(localeID[i]);
+    }
+
+    sink->Append(buffer, LENGTH);
+    return len;
+}
+
+size_t _getRegion(std::string_view localeID, ByteSink* sink) {
+    constexpr int32_t MINLEN = 2;
+    constexpr int32_t MAXLEN = ULOC_COUNTRY_CAPACITY - 1;  
+
+    size_t len = 0;
+    while (len < localeID.size() && !_isTerminator(localeID[len]) && !_isIDSeparator(localeID[len])) {
+        if (len == MAXLEN) { return 0; }
+        len++;
+    }
+    if (len < MINLEN) { return 0; }
+
+    if (sink == nullptr) { return len; }
+
+    char scratch[ULOC_COUNTRY_CAPACITY];
+    int32_t capacity = 0;
+    char* buffer = sink->GetAppendBuffer(
+            ULOC_COUNTRY_CAPACITY,
+            ULOC_COUNTRY_CAPACITY,
+            scratch,
+            UPRV_LENGTHOF(scratch),
+            &capacity);
+
+    for (size_t i = 0; i < len; ++i) {
+        buffer[i] = uprv_toupper(localeID[i]);
+    }
+
+    if (len == 3) {
+        U_ASSERT(capacity >= 4);
+        buffer[3] = '\0';
+        std::optional<int16_t> offset = _findIndex(COUNTRIES_3, buffer);
+        if (offset.has_value()) {
+            const char* const alias = COUNTRIES[*offset];
+            sink->Append(alias, static_cast<int32_t>(uprv_strlen(alias)));
+            return len;
+        }
+    }
+
+    sink->Append(buffer, static_cast<int32_t>(len));
+    return len;
+}
+
+size_t
+_getVariant(std::string_view localeID,
+            char prev,
+            ByteSink* sink,
+            bool needSeparator,
+            UErrorCode& status) {
+    if (U_FAILURE(status) || localeID.empty()) return 0;
+
+    constexpr int32_t MAX_VARIANTS_LENGTH = 179;
+
+    size_t index = 0;
+    if (_isIDSeparator(prev)) {
+        for (std::string_view sub = localeID;;) {
+            size_t next = sub.find_first_of(".@_-");
+            bool finished = next == std::string_view::npos || next + 1 == sub.length();
+            size_t limit = finished ? sub.length() : next;
+            index += limit;
+            if (index > MAX_VARIANTS_LENGTH) {
+                status = U_ILLEGAL_ARGUMENT_ERROR;
+                return 0;
+            }
+
+            if (sink != nullptr) {
+                if (needSeparator) {
+                    sink->Append("_", 1);
+                } else {
+                    needSeparator = true;
+                }
+
+                int32_t length = static_cast<int32_t>(limit);
+                int32_t minCapacity = uprv_min(length, MAX_VARIANTS_LENGTH);
+                char scratch[MAX_VARIANTS_LENGTH];
+                int32_t capacity = 0;
+                char* buffer = sink->GetAppendBuffer(
+                        minCapacity, minCapacity, scratch, UPRV_LENGTHOF(scratch), &capacity);
+
+                for (size_t i = 0; i < limit; ++i) {
+                    buffer[i] = uprv_toupper(sub[i]);
+                }
+                sink->Append(buffer, length);
+            }
+
+            if (finished) { return index; }
+            sub.remove_prefix(next);
+            if (_isTerminator(sub.front()) || _isBCP47Extension(sub)) { return index; }
+            sub.remove_prefix(1);
+            index++;
+        }
+    }
+
+    size_t skip = 0;
+    if (prev == '@') {
+    } else if (const char* p = locale_getKeywordsStart(localeID); p != nullptr) {
+        skip = 1 + p - localeID.data(); 
+        localeID.remove_prefix(skip);
+    } else {
+        return 0;
+    }
+    for (; index < localeID.size() && !_isTerminator(localeID[index]); index++) {
+        if (index >= MAX_VARIANTS_LENGTH) { 
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return 0;
+        }
+        if (needSeparator) {
+            if (sink != nullptr) {
+                sink->Append("_", 1);
+            }
+            needSeparator = false;
+        }
+        if (sink != nullptr) {
+            char c = uprv_toupper(localeID[index]);
+            if (c == '-' || c == ',') c = '_';
+            sink->Append(&c, 1);
+        }
+    }
+    return skip + index;
+}
+
+}  
+
+U_EXPORT CharString
+ulocimp_getLanguage(std::string_view localeID, UErrorCode& status) {
+    return ByteSinkUtil::viaByteSinkToCharString(
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getSubtags(
+                    localeID,
+                    &sink,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    status);
+        },
+        status);
+}
+
+U_EXPORT CharString
+ulocimp_getScript(std::string_view localeID, UErrorCode& status) {
+    return ByteSinkUtil::viaByteSinkToCharString(
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getSubtags(
+                    localeID,
+                    nullptr,
+                    &sink,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    status);
+        },
+        status);
+}
+
+U_EXPORT CharString
+ulocimp_getRegion(std::string_view localeID, UErrorCode& status) {
+    return ByteSinkUtil::viaByteSinkToCharString(
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getSubtags(
+                    localeID,
+                    nullptr,
+                    nullptr,
+                    &sink,
+                    nullptr,
+                    nullptr,
+                    status);
+        },
+        status);
+}
+
+U_EXPORT CharString
+ulocimp_getVariant(std::string_view localeID, UErrorCode& status) {
+    return ByteSinkUtil::viaByteSinkToCharString(
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getSubtags(
+                    localeID,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    &sink,
+                    nullptr,
+                    status);
+        },
+        status);
+}
+
+U_EXPORT void
+ulocimp_getSubtags(
+        std::string_view localeID,
+        CharString* language,
+        CharString* script,
+        CharString* region,
+        CharString* variant,
+        const char** pEnd,
+        UErrorCode& status) {
+    if (U_FAILURE(status)) { return; }
+
+    std::optional<CharStringByteSink> languageSink;
+    std::optional<CharStringByteSink> scriptSink;
+    std::optional<CharStringByteSink> regionSink;
+    std::optional<CharStringByteSink> variantSink;
+
+    if (language != nullptr) { languageSink.emplace(language); }
+    if (script != nullptr) { scriptSink.emplace(script); }
+    if (region != nullptr) { regionSink.emplace(region); }
+    if (variant != nullptr) { variantSink.emplace(variant); }
+
+    ulocimp_getSubtags(
+            localeID,
+            languageSink.has_value() ? &*languageSink : nullptr,
+            scriptSink.has_value() ? &*scriptSink : nullptr,
+            regionSink.has_value() ? &*regionSink : nullptr,
+            variantSink.has_value() ? &*variantSink : nullptr,
+            pEnd,
+            status);
+}
+
+U_EXPORT void
+ulocimp_getSubtags(
+        std::string_view localeID,
+        ByteSink* language,
+        ByteSink* script,
+        ByteSink* region,
+        ByteSink* variant,
+        const char** pEnd,
+        UErrorCode& status) {
+    if (U_FAILURE(status)) { return; }
+
+    if (pEnd != nullptr) {
+        *pEnd = localeID.data();
+    } else if (language == nullptr &&
+               script == nullptr &&
+               region == nullptr &&
+               variant == nullptr) {
+        return;
+    }
+
+    if (localeID.empty()) { return; }
+
+    bool hasRegion = false;
+
+    {
+        size_t len = _getLanguage(localeID, language, status);
+        if (U_FAILURE(status)) { return; }
+        if (len > 0) {
+            localeID.remove_prefix(len);
+        }
+    }
+
+    if (pEnd != nullptr) {
+        *pEnd = localeID.data();
+    } else if (script == nullptr &&
+               region == nullptr &&
+               variant == nullptr) {
+        return;
+    }
+
+    if (localeID.empty()) { return; }
+
+    if (_isIDSeparator(localeID.front())) {
+        std::string_view sub = localeID;
+        sub.remove_prefix(1);
+        size_t len = _getScript(sub, script);
+        if (len > 0) {
+            localeID.remove_prefix(len + 1);
+            if (pEnd != nullptr) { *pEnd = localeID.data(); }
+        }
+    }
+
+    if ((region == nullptr && variant == nullptr && pEnd == nullptr) || localeID.empty()) { return; }
+
+    if (_isIDSeparator(localeID.front())) {
+        std::string_view sub = localeID;
+        sub.remove_prefix(1);
+        size_t len = _getRegion(sub, region);
+        if (len > 0) {
+            hasRegion = true;
+            localeID.remove_prefix(len + 1);
+            if (pEnd != nullptr) { *pEnd = localeID.data(); }
+        }
+    }
+
+    if ((variant == nullptr && pEnd == nullptr) || localeID.empty()) { return; }
+
+    bool hasVariant = false;
+
+    if (_isIDSeparator(localeID.front()) && !_isBCP47Extension(localeID)) {
+        std::string_view sub = localeID;
+        size_t skip = !hasRegion && localeID.size() > 1 && _isIDSeparator(localeID[1]) ? 2 : 1;
+        sub.remove_prefix(skip);
+        size_t len = _getVariant(sub, localeID[0], variant, false, status);
+        if (U_FAILURE(status)) { return; }
+        if (len > 0) {
+            hasVariant = true;
+            localeID.remove_prefix(skip + len);
+            if (pEnd != nullptr) { *pEnd = localeID.data(); }
+        }
+    }
+
+    if ((variant == nullptr && pEnd == nullptr) || localeID.empty()) { return; }
+
+    if (_isBCP47Extension(localeID)) {
+        localeID.remove_prefix(2);
+        constexpr char vaposix[] = "-va-posix";
+        constexpr size_t length = sizeof vaposix - 1;
+        for (size_t next;; localeID.remove_prefix(next)) {
+            next = localeID.find('-', 1);
+            if (next == std::string_view::npos) { break; }
+            next = localeID.find('-', next + 1);
+            bool finished = next == std::string_view::npos;
+            std::string_view sub = localeID;
+            if (!finished) { sub.remove_suffix(sub.length() - next); }
+
+            if (sub.length() == length && uprv_strnicmp(sub.data(), vaposix, length) == 0) {
+                if (variant != nullptr) {
+                    if (hasVariant) { variant->Append("_", 1); }
+                    constexpr char posix[] = "POSIX";
+                    variant->Append(posix, sizeof posix - 1);
+                }
+                if (pEnd != nullptr) { *pEnd = localeID.data() + length; }
+            }
+
+            if (finished) { break; }
+        }
+    }
+}
+
+
+typedef struct UKeywordsContext {
+    char* keywords;
+    char* current;
+} UKeywordsContext;
+
+U_CDECL_BEGIN
+
+static void U_CALLCONV
+uloc_kw_closeKeywords(UEnumeration *enumerator) {
+    uprv_free(((UKeywordsContext *)enumerator->context)->keywords);
+    uprv_free(enumerator->context);
+    uprv_free(enumerator);
+}
+
+static int32_t U_CALLCONV
+uloc_kw_countKeywords(UEnumeration *en, UErrorCode * ) {
+    char *kw = ((UKeywordsContext *)en->context)->keywords;
+    int32_t result = 0;
+    while(*kw) {
+        result++;
+        kw += uprv_strlen(kw)+1;
+    }
+    return result;
+}
+
+static const char * U_CALLCONV
+uloc_kw_nextKeyword(UEnumeration* en,
+                    int32_t* resultLength,
+                    UErrorCode* ) {
+    const char* result = ((UKeywordsContext *)en->context)->current;
+    int32_t len = 0;
+    if(*result) {
+        len = (int32_t)uprv_strlen(((UKeywordsContext *)en->context)->current);
+        ((UKeywordsContext *)en->context)->current += len+1;
+    } else {
+        result = nullptr;
+    }
+    if (resultLength) {
+        *resultLength = len;
+    }
+    return result;
+}
+
+static void U_CALLCONV
+uloc_kw_resetKeywords(UEnumeration* en,
+                      UErrorCode* ) {
+    ((UKeywordsContext *)en->context)->current = ((UKeywordsContext *)en->context)->keywords;
+}
+
+U_CDECL_END
+
+
+static const UEnumeration gKeywordsEnum = {
+    nullptr,
+    nullptr,
+    uloc_kw_closeKeywords,
+    uloc_kw_countKeywords,
+    uenum_unextDefault,
+    uloc_kw_nextKeyword,
+    uloc_kw_resetKeywords
+};
+
+U_CAPI UEnumeration* U_EXPORT2
+uloc_openKeywordList(const char *keywordList, int32_t keywordListSize, UErrorCode* status)
+{
+    if (U_FAILURE(*status)) { return nullptr; }
+
+    LocalMemory<UKeywordsContext> myContext;
+    LocalMemory<UEnumeration> result;
+
+    myContext.adoptInstead(static_cast<UKeywordsContext *>(uprv_malloc(sizeof(UKeywordsContext))));
+    result.adoptInstead(static_cast<UEnumeration *>(uprv_malloc(sizeof(UEnumeration))));
+    if (myContext.isNull() || result.isNull()) {
+        *status = U_MEMORY_ALLOCATION_ERROR;
+        return nullptr;
+    }
+    uprv_memcpy(result.getAlias(), &gKeywordsEnum, sizeof(UEnumeration));
+    myContext->keywords = static_cast<char *>(uprv_malloc(keywordListSize+1));
+    if (myContext->keywords == nullptr) {
+        *status = U_MEMORY_ALLOCATION_ERROR;
+        return nullptr;
+    }
+    uprv_memcpy(myContext->keywords, keywordList, keywordListSize);
+    myContext->keywords[keywordListSize] = 0;
+    myContext->current = myContext->keywords;
+    result->context = myContext.orphan();
+    return result.orphan();
+}
+
+U_CAPI UEnumeration* U_EXPORT2
+uloc_openKeywords(const char* localeID,
+                        UErrorCode* status)
+{
+    if(status==nullptr || U_FAILURE(*status)) {
+        return nullptr;
+    }
+
+    CharString tempBuffer;
+    const char* tmpLocaleID;
+
+    if (localeID != nullptr && _hasBCP47Extension(localeID)) {
+        tempBuffer = ulocimp_forLanguageTag(localeID, -1, nullptr, *status);
+        tmpLocaleID = U_SUCCESS(*status) && !tempBuffer.isEmpty() ? tempBuffer.data() : localeID;
+    } else {
+        if (localeID==nullptr) {
+            localeID=uloc_getDefault();
+        }
+        tmpLocaleID=localeID;
+    }
+
+    ulocimp_getSubtags(
+            tmpLocaleID,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            &tmpLocaleID,
+            *status);
+    if (U_FAILURE(*status)) {
+        return nullptr;
+    }
+
+    if((tmpLocaleID = locale_getKeywordsStart(tmpLocaleID)) != nullptr) {
+        CharString keywords = ulocimp_getKeywords(tmpLocaleID + 1, '@', false, *status);
+        if (U_FAILURE(*status)) {
+            return nullptr;
+        }
+        return uloc_openKeywordList(keywords.data(), keywords.length(), status);
+    }
+    return nullptr;
+}
+
+
+#define _ULOC_STRIP_KEYWORDS 0x2
+#define _ULOC_CANONICALIZE   0x1
+
+namespace {
+
+inline bool OPTION_SET(uint32_t options, uint32_t mask) { return (options & mask) != 0; }
+
+constexpr char i_default[] = {'i', '-', 'd', 'e', 'f', 'a', 'u', 'l', 't'};
+constexpr int32_t I_DEFAULT_LENGTH = UPRV_LENGTHOF(i_default);
+
+void
+_canonicalize(std::string_view localeID,
+              ByteSink& sink,
+              uint32_t options,
+              UErrorCode& err) {
+    if (U_FAILURE(err)) {
+        return;
+    }
+
+    int32_t j, fieldCount=0;
+    CharString tempBuffer;  
+    CharString localeIDWithHyphens;  
+    std::string_view origLocaleID;
+    std::string_view tmpLocaleID;
+    size_t keywordAssign = std::string_view::npos;
+    size_t separatorIndicator = std::string_view::npos;
+
+    if (_hasBCP47Extension(localeID)) {
+        std::string_view localeIDPtr = localeID;
+
+        if (localeID.size() >= 2 && localeID.find('_') != std::string_view::npos && localeID[1] != '-' && localeID[1] != '_') {
+            localeIDWithHyphens.append(localeID, err);
+            if (U_SUCCESS(err)) {
+                for (char* p = localeIDWithHyphens.data(); *p != '\0'; ++p) {
+                    if (*p == '_') {
+                        *p = '-';
+                    }
+                }
+                localeIDPtr = localeIDWithHyphens.toStringPiece();
+            }
+        }
+
+        tempBuffer = ulocimp_forLanguageTag(localeIDPtr.data(), static_cast<int32_t>(localeIDPtr.size()), nullptr, err);
+        tmpLocaleID = U_SUCCESS(err) && !tempBuffer.isEmpty() ? static_cast<std::string_view>(tempBuffer.toStringPiece()) : localeIDPtr;
+    } else {
+        tmpLocaleID=localeID;
+    }
+
+    origLocaleID=tmpLocaleID;
+
+    CharString tag;
+    CharString script;
+    CharString country;
+    CharString variant;
+    const char* end = nullptr;
+    ulocimp_getSubtags(
+            tmpLocaleID,
+            &tag,
+            &script,
+            &country,
+            &variant,
+            &end,
+            err);
+    if (U_FAILURE(err)) {
+        return;
+    }
+    U_ASSERT(end != nullptr);
+    if (end > tmpLocaleID.data()) {
+        tmpLocaleID.remove_prefix(end - tmpLocaleID.data());
+    }
+
+    if (tag.length() == I_DEFAULT_LENGTH && origLocaleID.length() >= I_DEFAULT_LENGTH &&
+            uprv_strncmp(origLocaleID.data(), i_default, I_DEFAULT_LENGTH) == 0) {
+        tag.clear();
+        tag.append(uloc_getDefault(), err);
+    } else {
+        if (!script.isEmpty()) {
+            ++fieldCount;
+            tag.append('_', err);
+            tag.append(script, err);
+        }
+        if (!country.isEmpty()) {
+            ++fieldCount;
+            tag.append('_', err);
+            tag.append(country, err);
+        }
+        if (!variant.isEmpty()) {
+            ++fieldCount;
+            if (country.isEmpty()) {
+                tag.append('_', err);
+            }
+            tag.append('_', err);
+            tag.append(variant, err);
+        }
+    }
+
+    if (!OPTION_SET(options, _ULOC_CANONICALIZE) && !tmpLocaleID.empty() && tmpLocaleID.front() == '.') {
+        tag.append('.', err);
+        tmpLocaleID.remove_prefix(1);
+        size_t length;
+        if (size_t atPos = tmpLocaleID.find('@'); atPos != std::string_view::npos) {
+            length = atPos;
+        } else {
+            length = tmpLocaleID.length();
+        }
+        constexpr size_t kMaxCharsetLength = 64;
+        if (length > kMaxCharsetLength) {
+           err = U_ILLEGAL_ARGUMENT_ERROR; 
+           return;
+        }
+        if (length > 0) {
+            tag.append(tmpLocaleID.data(), static_cast<int32_t>(length), err);
+            tmpLocaleID.remove_prefix(length);
+        }
+    }
+
+    if (const char* start = locale_getKeywordsStart(tmpLocaleID); start != nullptr) {
+        if (start > tmpLocaleID.data()) {
+            tmpLocaleID.remove_prefix(start - tmpLocaleID.data());
+        }
+        keywordAssign = tmpLocaleID.find('=');
+        separatorIndicator = tmpLocaleID.find(';');
+    } else {
+        tmpLocaleID = {};
+    }
+
+    if (!OPTION_SET(options, _ULOC_CANONICALIZE) &&
+        !tmpLocaleID.empty() && keywordAssign == std::string_view::npos) {
+        tag.append(tmpLocaleID, err);
+        tmpLocaleID = {};
+    }
+
+    if (OPTION_SET(options, _ULOC_CANONICALIZE)) {
+        if (!tmpLocaleID.empty() && keywordAssign == std::string_view::npos) {
+            if (fieldCount < 2 || (fieldCount < 3 && !script.isEmpty())) {
+                do {
+                    tag.append('_', err);
+                    ++fieldCount;
+                } while(fieldCount<2);
+            }
+
+            CharStringByteSink s(&tag);
+            std::string_view sub = tmpLocaleID;
+            sub.remove_prefix(1);
+            _getVariant(sub, '@', &s, !variant.isEmpty(), err);
+            if (U_FAILURE(err)) { return; }
+        }
+
+        for (j=0; j<UPRV_LENGTHOF(CANONICALIZE_MAP); j++) {
+            StringPiece id(CANONICALIZE_MAP[j].id);
+            if (tag == id) {
+                if (id.empty() && !tmpLocaleID.empty()) {
+                    break; 
+                }
+                tag.clear();
+                tag.append(CANONICALIZE_MAP[j].canonicalID, err);
+                break;
+            }
+        }
+    }
+
+    sink.Append(tag.data(), tag.length());
+
+    if (!OPTION_SET(options, _ULOC_STRIP_KEYWORDS)) {
+        if (!tmpLocaleID.empty() && keywordAssign != std::string_view::npos &&
+            (separatorIndicator == std::string_view::npos || separatorIndicator > keywordAssign)) {
+            sink.Append("@", 1);
+            ++fieldCount;
+            tmpLocaleID.remove_prefix(1);
+            ulocimp_getKeywords(tmpLocaleID, '@', sink, true, err);
+        }
+    }
+}
+
+}  
+
+
+U_CAPI int32_t  U_EXPORT2
+uloc_getParent(const char*    localeID,
+               char* parent,
+               int32_t parentCapacity,
+               UErrorCode* err)
+{
+    return ByteSinkUtil::viaByteSinkToTerminatedChars(
+        parent, parentCapacity,
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getParent(localeID, sink, status);
+        },
+        *err);
+}
+
+U_EXPORT CharString
+ulocimp_getParent(const char* localeID,
+                  UErrorCode& err)
+{
+    return ByteSinkUtil::viaByteSinkToCharString(
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getParent(localeID, sink, status);
+        },
+        err);
+}
+
+U_EXPORT void
+ulocimp_getParent(const char* localeID,
+                  icu::ByteSink& sink,
+                  UErrorCode& err)
+{
+    if (U_FAILURE(err)) { return; }
+
+    const char *lastUnderscore;
+    int32_t i;
+
+    if (localeID == nullptr)
+        localeID = uloc_getDefault();
+
+    lastUnderscore=uprv_strrchr(localeID, '_');
+    if(lastUnderscore!=nullptr) {
+        i = static_cast<int32_t>(lastUnderscore - localeID);
+    } else {
+        i=0;
+    }
+
+    if (i > 0) {
+        if (uprv_strnicmp(localeID, "und_", 4) == 0) {
+            localeID += 3;
+            i -= 3;
+        }
+        sink.Append(localeID, i);
+    }
+}
+
+U_CAPI int32_t U_EXPORT2
+uloc_getLanguage(const char*    localeID,
+         char* language,
+         int32_t languageCapacity,
+         UErrorCode* err)
+{
+    if (localeID == nullptr) {
+        localeID = uloc_getDefault();
+    }
+
+    return ByteSinkUtil::viaByteSinkToTerminatedChars(
+        language, languageCapacity,
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getSubtags(
+                    localeID,
+                    &sink,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    status);
+        },
+        *err);
+}
+
+U_CAPI int32_t U_EXPORT2
+uloc_getScript(const char*    localeID,
+         char* script,
+         int32_t scriptCapacity,
+         UErrorCode* err)
+{
+    if (localeID == nullptr) {
+        localeID = uloc_getDefault();
+    }
+
+    return ByteSinkUtil::viaByteSinkToTerminatedChars(
+        script, scriptCapacity,
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getSubtags(
+                    localeID,
+                    nullptr,
+                    &sink,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    status);
+        },
+        *err);
+}
+
+U_CAPI int32_t  U_EXPORT2
+uloc_getCountry(const char* localeID,
+            char* country,
+            int32_t countryCapacity,
+            UErrorCode* err)
+{
+    if (localeID == nullptr) {
+        localeID = uloc_getDefault();
+    }
+
+    return ByteSinkUtil::viaByteSinkToTerminatedChars(
+        country, countryCapacity,
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getSubtags(
+                    localeID,
+                    nullptr,
+                    nullptr,
+                    &sink,
+                    nullptr,
+                    nullptr,
+                    status);
+        },
+        *err);
+}
+
+U_CAPI int32_t  U_EXPORT2
+uloc_getVariant(const char* localeID,
+                char* variant,
+                int32_t variantCapacity,
+                UErrorCode* err)
+{
+    if (localeID == nullptr) {
+        localeID = uloc_getDefault();
+    }
+
+    return ByteSinkUtil::viaByteSinkToTerminatedChars(
+        variant, variantCapacity,
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getSubtags(
+                    localeID,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    &sink,
+                    nullptr,
+                    status);
+        },
+        *err);
+}
+
+U_CAPI int32_t  U_EXPORT2
+uloc_getName(const char* localeID,
+             char* name,
+             int32_t nameCapacity,
+             UErrorCode* err)
+{
+    if (localeID == nullptr) {
+        localeID = uloc_getDefault();
+    }
+    return ByteSinkUtil::viaByteSinkToTerminatedChars(
+        name, nameCapacity,
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getName(localeID, sink, status);
+        },
+        *err);
+}
+
+U_EXPORT CharString
+ulocimp_getName(std::string_view localeID,
+                UErrorCode& err)
+{
+    return ByteSinkUtil::viaByteSinkToCharString(
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getName(localeID, sink, status);
+        },
+        err);
+}
+
+U_EXPORT void
+ulocimp_getName(std::string_view localeID,
+                ByteSink& sink,
+                UErrorCode& err)
+{
+    _canonicalize(localeID, sink, 0, err);
+}
+
+U_CAPI int32_t  U_EXPORT2
+uloc_getBaseName(const char* localeID,
+                 char* name,
+                 int32_t nameCapacity,
+                 UErrorCode* err)
+{
+    if (localeID == nullptr) {
+        localeID = uloc_getDefault();
+    }
+    return ByteSinkUtil::viaByteSinkToTerminatedChars(
+        name, nameCapacity,
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getBaseName(localeID, sink, status);
+        },
+        *err);
+}
+
+U_EXPORT CharString
+ulocimp_getBaseName(std::string_view localeID,
+                    UErrorCode& err)
+{
+    return ByteSinkUtil::viaByteSinkToCharString(
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_getBaseName(localeID, sink, status);
+        },
+        err);
+}
+
+U_EXPORT void
+ulocimp_getBaseName(std::string_view localeID,
+                    ByteSink& sink,
+                    UErrorCode& err)
+{
+    _canonicalize(localeID, sink, _ULOC_STRIP_KEYWORDS, err);
+}
+
+U_CAPI int32_t  U_EXPORT2
+uloc_canonicalize(const char* localeID,
+                  char* name,
+                  int32_t nameCapacity,
+                  UErrorCode* err)
+{
+    if (localeID == nullptr) {
+        localeID = uloc_getDefault();
+    }
+    return ByteSinkUtil::viaByteSinkToTerminatedChars(
+        name, nameCapacity,
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_canonicalize(localeID, sink, status);
+        },
+        *err);
+}
+
+U_EXPORT CharString
+ulocimp_canonicalize(std::string_view localeID,
+                     UErrorCode& err)
+{
+    return ByteSinkUtil::viaByteSinkToCharString(
+        [&](ByteSink& sink, UErrorCode& status) {
+            ulocimp_canonicalize(localeID, sink, status);
+        },
+        err);
+}
+
+U_EXPORT void
+ulocimp_canonicalize(std::string_view localeID,
+                     ByteSink& sink,
+                     UErrorCode& err)
+{
+    _canonicalize(localeID, sink, _ULOC_CANONICALIZE, err);
+}
+
+U_CAPI const char*  U_EXPORT2
+uloc_getISO3Language(const char* localeID)
+{
+    UErrorCode err = U_ZERO_ERROR;
+
+    if (localeID == nullptr)
+    {
+        localeID = uloc_getDefault();
+    }
+    CharString lang = ulocimp_getLanguage(localeID, err);
+    if (U_FAILURE(err))
+        return "";
+    std::optional<int16_t> offset = _findIndex(LANGUAGES, lang.data());
+    return offset.has_value() ? LANGUAGES_3[*offset] : "";
+}
+
+U_CAPI const char*  U_EXPORT2
+uloc_getISO3Country(const char* localeID)
+{
+    UErrorCode err = U_ZERO_ERROR;
+
+    if (localeID == nullptr)
+    {
+        localeID = uloc_getDefault();
+    }
+    CharString cntry = ulocimp_getRegion(localeID, err);
+    if (U_FAILURE(err))
+        return "";
+    std::optional<int16_t> offset = _findIndex(COUNTRIES, cntry.data());
+    return offset.has_value() ? COUNTRIES_3[*offset] : "";
+}
+
+U_CAPI uint32_t  U_EXPORT2
+uloc_getLCID(const char* localeID)
+{
+    UErrorCode status = U_ZERO_ERROR;
+    uint32_t   lcid = 0;
+
+    if (!localeID || uprv_strlen(localeID) < 2) {
+        return 0;
+    }
+
+    lcid = uprv_convertToLCIDPlatform(localeID, &status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    if (lcid > 0) {
+        return lcid;
+    }
+
+    CharString langID = ulocimp_getLanguage(localeID, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    if (uprv_strchr(localeID, '@')) {
+        CharString collVal = ulocimp_getKeywordValue(localeID, "collation", status);
+        if (U_SUCCESS(status) && !collVal.isEmpty()) {
+            CharString tmpLocaleID = ulocimp_getBaseName(localeID, status);
+            ulocimp_setKeywordValue("collation", collVal.toStringPiece(), tmpLocaleID, status);
+            if (U_SUCCESS(status)) {
+                return uprv_convertToLCID(langID.data(), tmpLocaleID.data(), &status);
+            }
+        }
+
+        // fall through - all keywords are simply ignored
+        status = U_ZERO_ERROR;
+    }
+
+    return uprv_convertToLCID(langID.data(), localeID, &status);
+}
+
+U_CAPI int32_t U_EXPORT2
+uloc_getLocaleForLCID(uint32_t hostid, char *locale, int32_t localeCapacity,
+                UErrorCode *status)
+{
+    return uprv_convertToPosix(hostid, locale, localeCapacity, status);
+}
+
+
+U_CAPI const char*  U_EXPORT2
+uloc_getDefault()
+{
+    return locale_get_default();
+}
+
+U_CAPI void  U_EXPORT2
+uloc_setDefault(const char*   newDefaultLocale,
+             UErrorCode* err)
+{
+    if (U_FAILURE(*err))
+        return;
+
+    locale_set_default(newDefaultLocale);
+}
+
+U_CAPI const char* const*  U_EXPORT2
+uloc_getISOLanguages()
+{
+    return LANGUAGES;
+}
+
+U_CAPI const char* const*  U_EXPORT2
+uloc_getISOCountries()
+{
+    return COUNTRIES;
+}
+
+U_CAPI const char* U_EXPORT2
+uloc_toUnicodeLocaleKey(const char* keyword)
+{
+    if (keyword == nullptr || *keyword == '\0') { return nullptr; }
+    std::optional<std::string_view> result = ulocimp_toBcpKeyWithFallback(keyword);
+    return result.has_value() ? result->data() : nullptr;  
+}
+
+U_EXPORT std::optional<std::string_view>
+ulocimp_toBcpKeyWithFallback(std::string_view keyword)
+{
+    std::optional<std::string_view> bcpKey = ulocimp_toBcpKey(keyword);
+    if (!bcpKey.has_value() &&
+        ultag_isUnicodeLocaleKey(keyword.data(), static_cast<int32_t>(keyword.size()))) {
+        return keyword;
+    }
+    return bcpKey;
+}
+
+U_CAPI const char* U_EXPORT2
+uloc_toUnicodeLocaleType(const char* keyword, const char* value)
+{
+    if (keyword == nullptr || *keyword == '\0' ||
+        value == nullptr || *value == '\0') { return nullptr; }
+    std::optional<std::string_view> result = ulocimp_toBcpTypeWithFallback(keyword, value);
+    return result.has_value() ? result->data() : nullptr;  
+}
+
+U_EXPORT std::optional<std::string_view>
+ulocimp_toBcpTypeWithFallback(std::string_view keyword, std::string_view value)
+{
+    std::optional<std::string_view> bcpType = ulocimp_toBcpType(keyword, value);
+    if (!bcpType.has_value() &&
+        ultag_isUnicodeLocaleType(value.data(), static_cast<int32_t>(value.size()))) {
+        return value;
+    }
+    return bcpType;
+}
+
+namespace {
+
+bool
+isWellFormedLegacyKey(std::string_view key)
+{
+    return std::all_of(key.begin(), key.end(), UPRV_ISALPHANUM);
+}
+
+bool
+isWellFormedLegacyType(std::string_view legacyType)
+{
+    int32_t alphaNumLen = 0;
+    for (char c : legacyType) {
+        if (c == '_' || c == '/' || c == '-') {
+            if (alphaNumLen == 0) {
+                return false;
+            }
+            alphaNumLen = 0;
+        } else if (UPRV_ISALPHANUM(c)) {
+            alphaNumLen++;
+        } else {
+            return false;
+        }
+    }
+    return alphaNumLen != 0;
+}
+
+}  
+
+U_CAPI const char* U_EXPORT2
+uloc_toLegacyKey(const char* keyword)
+{
+    if (keyword == nullptr || *keyword == '\0') { return nullptr; }
+    std::optional<std::string_view> result = ulocimp_toLegacyKeyWithFallback(keyword);
+    return result.has_value() ? result->data() : nullptr;  
+}
+
+U_EXPORT std::optional<std::string_view>
+ulocimp_toLegacyKeyWithFallback(std::string_view keyword)
+{
+    std::optional<std::string_view> legacyKey = ulocimp_toLegacyKey(keyword);
+    if (!legacyKey.has_value() && isWellFormedLegacyKey(keyword)) {
+        return keyword;
+    }
+    return legacyKey;
+}
+
+U_CAPI const char* U_EXPORT2
+uloc_toLegacyType(const char* keyword, const char* value)
+{
+    if (keyword == nullptr || *keyword == '\0' ||
+        value == nullptr || *value == '\0') { return nullptr; }
+    std::optional<std::string_view> result = ulocimp_toLegacyTypeWithFallback(keyword, value);
+    return result.has_value() ? result->data() : nullptr;  
+}
+
+U_EXPORT std::optional<std::string_view>
+ulocimp_toLegacyTypeWithFallback(std::string_view keyword, std::string_view value)
+{
+    std::optional<std::string_view> legacyType = ulocimp_toLegacyType(keyword, value);
+    if (!legacyType.has_value() && isWellFormedLegacyType(value)) {
+        return value;
+    }
+    return legacyType;
+}
+

@@ -1,0 +1,1109 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "imgRequest.h"
+
+#include "DecodePool.h"
+#include "Image.h"
+#include "ImageFactory.h"
+#include "ImageLogging.h"
+#include "MultipartImage.h"
+#include "ProgressTracker.h"
+#include "RasterImage.h"
+#include "imgIRequest.h"
+#include "imgLoader.h"
+#include "imgRequestProxy.h"
+#include "mozilla/IntegerPrintfMacros.h"
+#include "mozilla/SizeOfState.h"
+#include "mozilla/dom/Document.h"
+#include "nsComponentManagerUtils.h"
+#include "nsContentUtils.h"
+#include "nsEscape.h"
+#include "nsICacheInfoChannel.h"
+#include "nsIChannel.h"
+#include "nsIClassOfService.h"
+#include "nsIHttpChannel.h"
+#include "nsIInputStream.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsIMultiPartChannel.h"
+#include "nsIProtocolHandler.h"
+#include "nsIScriptSecurityManager.h"
+#include "nsISupportsPrimitives.h"
+#include "nsIThreadRetargetableRequest.h"
+#include "nsIURL.h"
+#include "nsMimeTypes.h"
+#include "nsNetUtil.h"
+#include "nsProperties.h"
+#include "prtime.h"  // for PR_Now
+
+using namespace mozilla;
+using namespace mozilla::image;
+
+#define LOG_TEST(level) (MOZ_LOG_TEST(gImgLog, (level)))
+
+NS_IMPL_ISUPPORTS(imgRequest, nsIStreamListener, nsIRequestObserver,
+                  nsIThreadRetargetableStreamListener, nsIChannelEventSink,
+                  nsIInterfaceRequestor, nsIAsyncVerifyRedirectCallback)
+
+imgRequest::imgRequest(imgLoader* aLoader, const ImageCacheKey& aCacheKey)
+    : mLoader(aLoader),
+      mCacheKey(aCacheKey),
+      mLoadId(nullptr),
+      mFirstProxy(nullptr),
+      mValidator(nullptr),
+      mImageErrorCode(NS_OK),
+      mCORSMode(CORS_NONE),
+      mImageAvailable(false),
+      mIsDeniedCrossSiteCORSRequest(false),
+      mIsCrossSiteNoCORSRequest(false),
+      mShouldReportRenderTimeForLCP(false),
+      mMutex("imgRequest"),
+      mProgressTracker(new ProgressTracker()),
+      mIsMultiPartChannel(false),
+      mIsInCache(false),
+      mDecodeRequested(false),
+      mNewPartPending(false),
+      mHadInsecureRedirect(false),
+      mInnerWindowId(0) {
+  LOG_FUNC(gImgLog, "imgRequest::imgRequest()");
+}
+
+imgRequest::~imgRequest() {
+  if (mLoader) {
+    mLoader->RemoveFromUncachedImages(this);
+  }
+  if (mURI) {
+    LOG_FUNC_WITH_PARAM(gImgLog, "imgRequest::~imgRequest()", "keyuri", mURI);
+  } else
+    LOG_FUNC(gImgLog, "imgRequest::~imgRequest()");
+}
+
+nsresult imgRequest::Init(
+    nsIURI* aURI, nsIURI* aFinalURI, bool aHadInsecureRedirect,
+    nsIRequest* aRequest, nsIChannel* aChannel, imgCacheEntry* aCacheEntry,
+    mozilla::dom::Document* aLoadingDocument,
+    nsIPrincipal* aTriggeringPrincipal, mozilla::CORSMode aCORSMode,
+    nsIReferrerInfo* aReferrerInfo) MOZ_NO_THREAD_SAFETY_ANALYSIS {
+  MOZ_ASSERT(NS_IsMainThread(), "Cannot use nsIURI off main thread!");
+
+  LOG_FUNC(gImgLog, "imgRequest::Init");
+
+  MOZ_ASSERT(!mImage, "Multiple calls to init");
+  MOZ_ASSERT(aURI, "No uri");
+  MOZ_ASSERT(aFinalURI, "No final uri");
+  MOZ_ASSERT(aRequest, "No request");
+  MOZ_ASSERT(aChannel, "No channel");
+
+  mProperties = new nsProperties();
+  mURI = aURI;
+  mFinalURI = aFinalURI;
+  mRequest = aRequest;
+  mChannel = aChannel;
+  mTimedChannel = do_QueryInterface(mChannel);
+  mTriggeringPrincipal = aTriggeringPrincipal;
+  mReferrerInfo = aReferrerInfo;
+  mCORSMode = aCORSMode;
+
+  if (aURI != aFinalURI) {
+    bool schemeLocal = false;
+    if (NS_FAILED(NS_URIChainHasFlags(
+            aURI, nsIProtocolHandler::URI_IS_LOCAL_RESOURCE, &schemeLocal)) ||
+        (!aURI->SchemeIs("https") && !aURI->SchemeIs("chrome") &&
+         !schemeLocal)) {
+      mHadInsecureRedirect = true;
+    }
+  }
+
+  mHadInsecureRedirect = mHadInsecureRedirect || aHadInsecureRedirect;
+
+  mChannel->GetNotificationCallbacks(getter_AddRefs(mPrevChannelSink));
+
+  NS_ASSERTION(mPrevChannelSink != this,
+               "Initializing with a channel that already calls back to us!");
+
+  mChannel->SetNotificationCallbacks(this);
+
+  mCacheEntry = aCacheEntry;
+  mCacheEntry->UpdateLoadTime();
+
+  SetLoadId(aLoadingDocument);
+
+  if (aLoadingDocument) {
+    mInnerWindowId = aLoadingDocument->InnerWindowID();
+  }
+
+  return NS_OK;
+}
+
+bool imgRequest::CanReuseWithoutValidation(dom::Document* aDoc) const {
+  void* key = (void*)aDoc;
+  uint64_t innerWindowID = aDoc ? aDoc->InnerWindowID() : 0;
+  if (LoadId() == key && InnerWindowID() == innerWindowID) {
+    return true;
+  }
+
+  if (dom::Document* original = aDoc ? aDoc->GetOriginalDocument() : nullptr) {
+    return CanReuseWithoutValidation(original);
+  }
+
+  return false;
+}
+
+void imgRequest::ClearLoader() { mLoader = nullptr; }
+
+already_AddRefed<nsIPrincipal> imgRequest::GetTriggeringPrincipal() const {
+  nsCOMPtr<nsIPrincipal> principal = mTriggeringPrincipal;
+  return principal.forget();
+}
+
+already_AddRefed<ProgressTracker> imgRequest::GetProgressTracker() const {
+  MutexAutoLock lock(mMutex);
+
+  if (mImage) {
+    MOZ_ASSERT(!mProgressTracker,
+               "Should have given mProgressTracker to mImage");
+    return mImage->GetProgressTracker();
+  }
+  MOZ_ASSERT(mProgressTracker,
+             "Should have mProgressTracker until we create mImage");
+  RefPtr<ProgressTracker> progressTracker = mProgressTracker;
+  MOZ_ASSERT(progressTracker);
+  return progressTracker.forget();
+}
+
+void imgRequest::SetCacheEntry(imgCacheEntry* entry) { mCacheEntry = entry; }
+
+bool imgRequest::HasCacheEntry() const { return mCacheEntry != nullptr; }
+
+void imgRequest::ResetCacheEntry() {
+  if (HasCacheEntry()) {
+    mCacheEntry->SetDataSize(0);
+  }
+}
+
+void imgRequest::AddProxy(imgRequestProxy* proxy) {
+  MOZ_ASSERT(proxy, "null imgRequestProxy passed in");
+  LOG_SCOPE_WITH_PARAM(gImgLog, "imgRequest::AddProxy", "proxy", proxy);
+
+  if (!mFirstProxy) {
+    mFirstProxy = proxy;
+  }
+
+  RefPtr<ProgressTracker> progressTracker = GetProgressTracker();
+  if (progressTracker->ObserverCount() == 0) {
+    MOZ_ASSERT(mURI, "Trying to SetHasProxies without key uri.");
+    if (mLoader) {
+      mLoader->SetHasProxies(this);
+    }
+  }
+
+  progressTracker->AddObserver(proxy);
+}
+
+nsresult imgRequest::RemoveProxy(imgRequestProxy* proxy, nsresult aStatus) {
+  LOG_SCOPE_WITH_PARAM(gImgLog, "imgRequest::RemoveProxy", "proxy", proxy);
+
+  proxy->ClearAnimationConsumers();
+
+  RefPtr<ProgressTracker> progressTracker = GetProgressTracker();
+  if (!progressTracker->RemoveObserver(proxy)) {
+    return NS_OK;
+  }
+
+  if (progressTracker->ObserverCount() == 0) {
+    if (mCacheEntry) {
+      MOZ_ASSERT(mURI, "Removing last observer without key uri.");
+
+      if (mLoader) {
+        mLoader->SetHasNoProxies(this, mCacheEntry);
+      }
+    } else {
+      LOG_MSG_WITH_PARAM(gImgLog, "imgRequest::RemoveProxy no cache entry",
+                         "uri", mURI);
+    }
+
+    if (!(progressTracker->GetProgress() & FLAG_LAST_PART_COMPLETE) &&
+        NS_FAILED(aStatus)) {
+      LOG_MSG(gImgLog, "imgRequest::RemoveProxy",
+              "load in progress.  canceling");
+
+      this->Cancel(NS_BINDING_ABORTED);
+    }
+
+    mCacheEntry = nullptr;
+  }
+
+  return NS_OK;
+}
+
+uint64_t imgRequest::InnerWindowID() const {
+  MutexAutoLock lock(mMutex);
+  return mInnerWindowId;
+}
+
+void imgRequest::SetInnerWindowID(uint64_t aInnerWindowId) {
+  MutexAutoLock lock(mMutex);
+  mInnerWindowId = aInnerWindowId;
+}
+
+void imgRequest::CancelAndAbort(nsresult aStatus) {
+  LOG_SCOPE(gImgLog, "imgRequest::CancelAndAbort");
+
+  Cancel(aStatus);
+
+  if (mChannel) {
+    mChannel->SetNotificationCallbacks(mPrevChannelSink);
+    mPrevChannelSink = nullptr;
+  }
+}
+
+class imgRequestMainThreadCancel : public Runnable {
+ public:
+  imgRequestMainThreadCancel(imgRequest* aImgRequest, nsresult aStatus)
+      : Runnable("imgRequestMainThreadCancel"),
+        mImgRequest(aImgRequest),
+        mStatus(aStatus) {
+    MOZ_ASSERT(!NS_IsMainThread(), "Create me off main thread only!");
+    MOZ_ASSERT(aImgRequest);
+  }
+
+  NS_IMETHOD Run() override {
+    MOZ_ASSERT(NS_IsMainThread(), "I should be running on the main thread!");
+    mImgRequest->ContinueCancel(mStatus);
+    return NS_OK;
+  }
+
+ private:
+  RefPtr<imgRequest> mImgRequest;
+  nsresult mStatus;
+};
+
+void imgRequest::Cancel(nsresult aStatus) {
+  LOG_SCOPE(gImgLog, "imgRequest::Cancel");
+
+  if (NS_IsMainThread()) {
+    ContinueCancel(aStatus);
+  } else {
+    nsCOMPtr<nsIEventTarget> eventTarget = GetMainThreadSerialEventTarget();
+    nsCOMPtr<nsIRunnable> ev = new imgRequestMainThreadCancel(this, aStatus);
+    eventTarget->Dispatch(ev.forget(), NS_DISPATCH_NORMAL);
+  }
+}
+
+void imgRequest::ContinueCancel(nsresult aStatus) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  RefPtr<ProgressTracker> progressTracker = GetProgressTracker();
+  progressTracker->SyncNotifyProgress(FLAG_HAS_ERROR);
+
+  RemoveFromCache();
+
+  if (mRequest && !(progressTracker->GetProgress() & FLAG_LAST_PART_COMPLETE)) {
+    mRequest->CancelWithReason(aStatus, "imgRequest::ContinueCancel"_ns);
+  }
+}
+
+class imgRequestMainThreadEvict : public Runnable {
+ public:
+  explicit imgRequestMainThreadEvict(imgRequest* aImgRequest)
+      : Runnable("imgRequestMainThreadEvict"), mImgRequest(aImgRequest) {
+    MOZ_ASSERT(!NS_IsMainThread(), "Create me off main thread only!");
+    MOZ_ASSERT(aImgRequest);
+  }
+
+  NS_IMETHOD Run() override {
+    MOZ_ASSERT(NS_IsMainThread(), "I should be running on the main thread!");
+    mImgRequest->ContinueEvict();
+    return NS_OK;
+  }
+
+ private:
+  RefPtr<imgRequest> mImgRequest;
+};
+
+void imgRequest::EvictFromCache() {
+  LOG_SCOPE(gImgLog, "imgRequest::EvictFromCache");
+
+  if (NS_IsMainThread()) {
+    ContinueEvict();
+  } else {
+    NS_DispatchToMainThread(new imgRequestMainThreadEvict(this));
+  }
+}
+
+void imgRequest::ContinueEvict() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  RemoveFromCache();
+}
+
+void imgRequest::StartDecoding() {
+  MutexAutoLock lock(mMutex);
+  mDecodeRequested = true;
+}
+
+bool imgRequest::IsDecodeRequested() const {
+  MutexAutoLock lock(mMutex);
+  return mDecodeRequested;
+}
+
+nsresult imgRequest::GetURI(nsIURI** aURI) {
+  MOZ_ASSERT(aURI);
+
+  LOG_FUNC(gImgLog, "imgRequest::GetURI");
+
+  if (mURI) {
+    *aURI = mURI;
+    NS_ADDREF(*aURI);
+    return NS_OK;
+  }
+
+  return NS_ERROR_FAILURE;
+}
+
+nsresult imgRequest::GetFinalURI(nsIURI** aURI) {
+  MOZ_ASSERT(aURI);
+
+  LOG_FUNC(gImgLog, "imgRequest::GetFinalURI");
+
+  if (mFinalURI) {
+    *aURI = mFinalURI;
+    NS_ADDREF(*aURI);
+    return NS_OK;
+  }
+
+  return NS_ERROR_FAILURE;
+}
+
+bool imgRequest::IsChrome() const { return mURI->SchemeIs("chrome"); }
+
+bool imgRequest::IsData() const { return mURI->SchemeIs("data"); }
+
+nsresult imgRequest::GetImageErrorCode() { return mImageErrorCode; }
+
+void imgRequest::RemoveFromCache() {
+  LOG_SCOPE(gImgLog, "imgRequest::RemoveFromCache");
+
+  bool isInCache = false;
+
+  {
+    MutexAutoLock lock(mMutex);
+    isInCache = mIsInCache;
+  }
+
+  if (isInCache && mLoader) {
+    if (mCacheEntry) {
+      mLoader->RemoveFromCache(mCacheEntry);
+    } else {
+      mLoader->RemoveFromCache(mCacheKey);
+    }
+  }
+
+  mCacheEntry = nullptr;
+}
+
+bool imgRequest::HasConsumers() const {
+  RefPtr<ProgressTracker> progressTracker = GetProgressTracker();
+  return progressTracker && progressTracker->ObserverCount() > 0;
+}
+
+already_AddRefed<image::Image> imgRequest::GetImage() const {
+  MutexAutoLock lock(mMutex);
+  RefPtr<image::Image> image = mImage;
+  return image.forget();
+}
+
+void imgRequest::GetFileName(nsACString& aFileName) {
+  nsAutoString fileName;
+
+  nsCOMPtr<nsISupportsCString> supportscstr;
+  if (NS_SUCCEEDED(mProperties->Get("content-disposition",
+                                    NS_GET_IID(nsISupportsCString),
+                                    getter_AddRefs(supportscstr))) &&
+      supportscstr) {
+    nsAutoCString cdHeader;
+    supportscstr->GetData(cdHeader);
+    NS_GetFilenameFromDisposition(fileName, cdHeader);
+  }
+
+  if (fileName.IsEmpty()) {
+    nsCOMPtr<nsIURL> imgUrl(do_QueryInterface(mURI));
+    if (imgUrl) {
+      imgUrl->GetFileName(aFileName);
+      NS_UnescapeURL(aFileName);
+    }
+  } else {
+    aFileName = NS_ConvertUTF16toUTF8(fileName);
+  }
+}
+
+int32_t imgRequest::Priority() const {
+  int32_t priority = nsISupportsPriority::PRIORITY_NORMAL;
+  nsCOMPtr<nsISupportsPriority> p = do_QueryInterface(mRequest);
+  if (p) {
+    p->GetPriority(&priority);
+  }
+  return priority;
+}
+
+void imgRequest::AdjustPriority(imgRequestProxy* proxy, int32_t delta) {
+  if (!mFirstProxy || proxy != mFirstProxy) {
+    return;
+  }
+
+  AdjustPriorityInternal(delta);
+}
+
+void imgRequest::AdjustPriorityInternal(int32_t aDelta) {
+  nsCOMPtr<nsISupportsPriority> p = do_QueryInterface(mChannel);
+  if (p) {
+    p->AdjustPriority(aDelta);
+  }
+}
+
+void imgRequest::BoostPriority(uint32_t aCategory) {
+  if (!StaticPrefs::image_layout_network_priority()) {
+    return;
+  }
+
+  uint32_t newRequestedCategory =
+      (mBoostCategoriesRequested & aCategory) ^ aCategory;
+  if (!newRequestedCategory) {
+    return;
+  }
+
+  MOZ_LOG(gImgLog, LogLevel::Debug,
+          ("[this=%p] imgRequest::BoostPriority for category %x", this,
+           newRequestedCategory));
+
+  int32_t delta = 0;
+
+  if (newRequestedCategory & imgIRequest::CATEGORY_FRAME_INIT) {
+    --delta;
+  }
+
+  if (newRequestedCategory & imgIRequest::CATEGORY_FRAME_STYLE) {
+    --delta;
+  }
+
+  if (newRequestedCategory & imgIRequest::CATEGORY_SIZE_QUERY) {
+    --delta;
+  }
+
+  if (newRequestedCategory & imgIRequest::CATEGORY_DISPLAY) {
+    delta += nsISupportsPriority::PRIORITY_HIGH;
+  }
+
+  AdjustPriorityInternal(delta);
+  mBoostCategoriesRequested |= newRequestedCategory;
+}
+
+void imgRequest::SetIsInCache(bool aInCache) {
+  LOG_FUNC_WITH_PARAM(gImgLog, "imgRequest::SetIsCacheable", "aInCache",
+                      aInCache);
+  MutexAutoLock lock(mMutex);
+  mIsInCache = aInCache;
+}
+
+void imgRequest::UpdateCacheEntrySize() {
+  if (!mCacheEntry) {
+    return;
+  }
+
+  RefPtr<Image> image = GetImage();
+  SizeOfState state(moz_malloc_size_of);
+  size_t size = image->SizeOfSourceWithComputedFallback(state);
+  mCacheEntry->SetDataSize(size);
+}
+
+void imgRequest::SetCacheValidation(imgCacheEntry* aCacheEntry,
+                                    nsIRequest* aRequest,
+                                    bool aForceTouch ) {
+  if (!aCacheEntry) {
+    return;
+  }
+
+  RefPtr<imgRequest> req = aCacheEntry->GetRequest();
+  MOZ_ASSERT(req);
+  RefPtr<nsIURI> uri;
+  req->GetURI(getter_AddRefs(uri));
+  auto info = nsContentUtils::GetSubresourceCacheValidationInfo(aRequest, uri);
+
+  if (!info.mExpirationTime) {
+    info.mExpirationTime.emplace(CacheExpirationTime::AlreadyExpired());
+  }
+  aCacheEntry->AccumulateExpiryTime(*info.mExpirationTime, aForceTouch);
+  if (info.mMustRevalidate) {
+    aCacheEntry->SetMustValidate(info.mMustRevalidate);
+  }
+}
+
+bool imgRequest::GetMultipart() const {
+  MutexAutoLock lock(mMutex);
+  return mIsMultiPartChannel;
+}
+
+bool imgRequest::HadInsecureRedirect() const {
+  MutexAutoLock lock(mMutex);
+  return mHadInsecureRedirect;
+}
+
+bool imgRequest::HadCrossOriginRedirects() const {
+  if (mTimedChannel) {
+    bool allRedirectsSameOrigin = false;
+    return NS_SUCCEEDED(
+               mTimedChannel->GetAllRedirectsSameOriginIgnoringInternal(
+                   &allRedirectsSameOrigin)) &&
+           !allRedirectsSameOrigin;
+  }
+  return mHadCrossOriginRedirects;
+}
+
+
+NS_IMETHODIMP
+imgRequest::OnStartRequest(nsIRequest* aRequest) {
+  LOG_SCOPE(gImgLog, "imgRequest::OnStartRequest");
+
+  RefPtr<Image> image;
+
+  if (nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(aRequest)) {
+    nsresult rv;
+    nsCOMPtr<nsILoadInfo> loadInfo = httpChannel->LoadInfo();
+    mIsDeniedCrossSiteCORSRequest =
+        loadInfo->GetTainting() == LoadTainting::CORS &&
+        (NS_FAILED(httpChannel->GetStatus(&rv)) || NS_FAILED(rv));
+    mIsCrossSiteNoCORSRequest = loadInfo->GetTainting() == LoadTainting::Opaque;
+  }
+
+  UpdateShouldReportRenderTimeForLCP();
+  nsCOMPtr<nsIMultiPartChannel> multiPartChannel = do_QueryInterface(aRequest);
+  {
+    MutexAutoLock lock(mMutex);
+
+    MOZ_ASSERT(multiPartChannel || !mIsMultiPartChannel,
+               "Stopped being multipart?");
+
+    mNewPartPending = true;
+    image = mImage;
+    mIsMultiPartChannel = bool(multiPartChannel);
+  }
+
+  if (image && !multiPartChannel) {
+    MOZ_ASSERT_UNREACHABLE("Already have an image for a non-multipart request");
+    Cancel(NS_IMAGELIB_ERROR_FAILURE);
+    return NS_ERROR_FAILURE;
+  }
+
+  if (!mRequest) {
+    MOZ_ASSERT(multiPartChannel, "Should have mRequest unless we're multipart");
+    nsCOMPtr<nsIChannel> baseChannel;
+    multiPartChannel->GetBaseChannel(getter_AddRefs(baseChannel));
+    mRequest = baseChannel;
+  }
+
+  nsCOMPtr<nsIChannel> channel(do_QueryInterface(aRequest));
+  if (channel) {
+    nsCOMPtr<nsIScriptSecurityManager> secMan =
+        nsContentUtils::GetSecurityManager();
+    if (secMan) {
+      nsresult rv = secMan->GetChannelResultPrincipal(
+          channel, getter_AddRefs(mPrincipal));
+      if (NS_FAILED(rv)) {
+        return rv;
+      }
+    }
+  }
+
+  SetCacheValidation(mCacheEntry, aRequest,  true);
+
+  RefPtr<ProgressTracker> progressTracker = GetProgressTracker();
+  if (progressTracker->ObserverCount() == 0) {
+    this->Cancel(NS_IMAGELIB_ERROR_FAILURE);
+  }
+
+  if (!channel || IsData()) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIThreadRetargetableRequest> retargetable =
+      do_QueryInterface(aRequest);
+  if (retargetable) {
+    nsAutoCString mimeType;
+    nsresult rv = channel->GetContentType(mimeType);
+    if (NS_SUCCEEDED(rv) && !mimeType.EqualsLiteral(IMAGE_SVG_XML)) {
+      mOffMainThreadData = true;
+      nsCOMPtr<nsISerialEventTarget> target =
+          DecodePool::Singleton()->GetIOEventTarget();
+      rv = retargetable->RetargetDeliveryTo(target);
+      MOZ_LOG(gImgLog, LogLevel::Warning,
+              ("[this=%p] imgRequest::OnStartRequest -- "
+               "RetargetDeliveryTo rv %" PRIu32 "=%s\n",
+               this, static_cast<uint32_t>(rv),
+               NS_SUCCEEDED(rv) ? "succeeded" : "failed"));
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequest::OnStopRequest(nsIRequest* aRequest, nsresult status) {
+  LOG_FUNC(gImgLog, "imgRequest::OnStopRequest");
+  MOZ_ASSERT(NS_IsMainThread(), "Can't send notifications off-main-thread");
+
+  RefPtr<imgRequest> strongThis = this;
+
+  bool isMultipart = false;
+  bool newPartPending = false;
+  {
+    MutexAutoLock lock(mMutex);
+    isMultipart = mIsMultiPartChannel;
+    newPartPending = mNewPartPending;
+  }
+  if (isMultipart && newPartPending) {
+    OnDataAvailable(aRequest, nullptr, 0, 0);
+  }
+
+  RefPtr<Image> image = GetImage();
+
+  if (mRequest) {
+    mRequest = nullptr;  
+  }
+
+  if (mChannel) {
+    mChannel->SetNotificationCallbacks(mPrevChannelSink);
+    mPrevChannelSink = nullptr;
+    mChannel = nullptr;
+  }
+
+  bool lastPart = true;
+  nsCOMPtr<nsIMultiPartChannel> mpchan(do_QueryInterface(aRequest));
+  if (mpchan) {
+    mpchan->GetIsLastPart(&lastPart);
+  }
+
+  bool isPartial = false;
+  if (image && (status == NS_ERROR_NET_PARTIAL_TRANSFER)) {
+    isPartial = true;
+    status = NS_OK;  
+  }
+
+  if (image) {
+    nsresult rv = image->OnImageDataComplete(aRequest, status, lastPart);
+
+    if (NS_FAILED(rv) && NS_SUCCEEDED(status)) {
+      status = rv;
+    }
+  }
+
+  if (image && NS_SUCCEEDED(status) && !isPartial) {
+    UpdateCacheEntrySize();
+
+  } else if (isPartial) {
+    this->EvictFromCache();
+
+  } else {
+    mImageErrorCode = status;
+
+    this->Cancel(status);
+  }
+
+  if (!image) {
+    Progress progress =
+        LoadCompleteProgress(lastPart,  false, status);
+
+    RefPtr<ProgressTracker> progressTracker = GetProgressTracker();
+    progressTracker->SyncNotifyProgress(progress);
+  }
+
+  if (mTimedChannel) {
+    bool allRedirectsSameOrigin = false;
+    mHadCrossOriginRedirects =
+        NS_SUCCEEDED(mTimedChannel->GetAllRedirectsSameOriginIgnoringInternal(
+            &allRedirectsSameOrigin)) &&
+        !allRedirectsSameOrigin;
+  }
+
+  mTimedChannel = nullptr;
+  return NS_OK;
+}
+
+struct mimetype_closure {
+  nsACString* newType;
+};
+
+static nsresult sniff_mimetype_callback(nsIInputStream* in, void* closure,
+                                        const char* fromRawSegment,
+                                        uint32_t toOffset, uint32_t count,
+                                        uint32_t* writeCount);
+
+NS_IMETHODIMP
+imgRequest::CheckListenerChain() {
+  return mOffMainThreadData ? NS_OK : NS_ERROR_NO_INTERFACE;
+}
+
+NS_IMETHODIMP
+imgRequest::OnDataFinished(nsresult) { return NS_OK; }
+
+
+struct NewPartResult final {
+  explicit NewPartResult(image::Image* aExistingImage)
+      : mImage(aExistingImage),
+        mIsFirstPart(!aExistingImage),
+        mSucceeded(false),
+        mShouldResetCacheEntry(false) {}
+
+  nsAutoCString mContentType;
+  int64_t mContentLength = 0;
+  nsAutoCString mContentDisposition;
+  RefPtr<image::Image> mImage;
+  const bool mIsFirstPart;
+  bool mSucceeded;
+  bool mShouldResetCacheEntry;
+};
+
+static NewPartResult PrepareForNewPart(nsIRequest* aRequest,
+                                       nsIInputStream* aInStr, uint32_t aCount,
+                                       nsIURI* aURI, bool aIsMultipart,
+                                       image::Image* aExistingImage,
+                                       ProgressTracker* aProgressTracker,
+                                       uint64_t aInnerWindowId) {
+  NewPartResult result(aExistingImage);
+
+  if (aInStr) {
+    mimetype_closure closure;
+    closure.newType = &result.mContentType;
+
+    uint32_t out;
+    aInStr->ReadSegments(sniff_mimetype_callback, &closure, aCount, &out);
+  }
+
+  nsCOMPtr<nsIChannel> chan(do_QueryInterface(aRequest));
+  if (result.mContentType.IsEmpty()) {
+    nsresult rv =
+        chan ? chan->GetContentType(result.mContentType) : NS_ERROR_FAILURE;
+    if (NS_FAILED(rv)) {
+      MOZ_LOG(gImgLog, LogLevel::Error,
+              ("imgRequest::PrepareForNewPart -- "
+               "Content type unavailable from the channel\n"));
+      if (!aIsMultipart) {
+        return result;
+      }
+    }
+  }
+
+  if (chan) {
+    chan->GetContentDispositionHeader(result.mContentDisposition);
+    chan->GetContentLength(&result.mContentLength);
+  }
+
+  MOZ_LOG(gImgLog, LogLevel::Debug,
+          ("imgRequest::PrepareForNewPart -- Got content type %s\n",
+           result.mContentType.get()));
+
+
+  if (aIsMultipart) {
+    auto progressTracker = MakeRefPtr<ProgressTracker>();
+    RefPtr<image::Image> partImage = image::ImageFactory::CreateImage(
+        aRequest, progressTracker, result.mContentType, aURI,
+         true, aInnerWindowId);
+
+    if (result.mIsFirstPart) {
+      MOZ_ASSERT(aProgressTracker, "Shouldn't have given away tracker yet");
+      aProgressTracker->SetIsMultipart();
+      result.mImage = image::ImageFactory::CreateMultipartImage(
+          partImage, aProgressTracker);
+    } else {
+      auto multipartImage = static_cast<MultipartImage*>(aExistingImage);
+      multipartImage->BeginTransitionToPart(partImage);
+
+      result.mShouldResetCacheEntry = true;
+    }
+  } else {
+    MOZ_ASSERT(!aExistingImage, "New part for non-multipart channel?");
+    MOZ_ASSERT(aProgressTracker, "Shouldn't have given away tracker yet");
+
+    result.mImage = image::ImageFactory::CreateImage(
+        aRequest, aProgressTracker, result.mContentType, aURI,
+         false, aInnerWindowId);
+  }
+
+  MOZ_ASSERT(result.mImage);
+  if (!result.mImage->HasError() || aIsMultipart) {
+    result.mSucceeded = true;
+  }
+
+  return result;
+}
+
+class FinishPreparingForNewPartRunnable final : public Runnable {
+ public:
+  FinishPreparingForNewPartRunnable(imgRequest* aImgRequest,
+                                    NewPartResult&& aResult)
+      : Runnable("FinishPreparingForNewPartRunnable"),
+        mImgRequest(aImgRequest),
+        mResult(std::move(aResult)) {
+    MOZ_ASSERT(aImgRequest);
+  }
+
+  NS_IMETHOD Run() override {
+    mImgRequest->FinishPreparingForNewPart(mResult);
+    return NS_OK;
+  }
+
+ private:
+  RefPtr<imgRequest> mImgRequest;
+  NewPartResult mResult;
+};
+
+void imgRequest::FinishPreparingForNewPart(const NewPartResult& aResult) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  mContentType = aResult.mContentType;
+  mContentLength = aResult.mContentLength;
+
+  SetProperties(aResult.mContentType, aResult.mContentDisposition);
+
+  if (aResult.mIsFirstPart) {
+    mImageAvailable = true;
+    RefPtr<ProgressTracker> progressTracker = GetProgressTracker();
+    progressTracker->OnImageAvailable();
+    MOZ_ASSERT(progressTracker->HasImage());
+  }
+
+  if (aResult.mShouldResetCacheEntry) {
+    ResetCacheEntry();
+  }
+
+  if (IsDecodeRequested()) {
+    aResult.mImage->StartDecoding(imgIContainer::FLAG_NONE);
+  }
+}
+
+bool imgRequest::ImageAvailable() const { return mImageAvailable; }
+
+NS_IMETHODIMP
+imgRequest::OnDataAvailable(nsIRequest* aRequest, nsIInputStream* aInStr,
+                            uint64_t aOffset, uint32_t aCount) {
+  LOG_SCOPE_WITH_PARAM(gImgLog, "imgRequest::OnDataAvailable", "count", aCount);
+
+  NS_ASSERTION(aRequest, "imgRequest::OnDataAvailable -- no request!");
+
+  RefPtr<Image> image;
+  RefPtr<ProgressTracker> progressTracker;
+  bool isMultipart = false;
+  bool newPartPending = false;
+  uint64_t innerWindowId = 0;
+
+  {
+    MutexAutoLock lock(mMutex);
+    image = mImage;
+    progressTracker = mProgressTracker;
+    isMultipart = mIsMultiPartChannel;
+    newPartPending = mNewPartPending;
+    mNewPartPending = false;
+    innerWindowId = mInnerWindowId;
+  }
+
+  if (newPartPending) {
+    NewPartResult result =
+        PrepareForNewPart(aRequest, aInStr, aCount, mURI, isMultipart, image,
+                          progressTracker, innerWindowId);
+    bool succeeded = result.mSucceeded;
+
+    if (result.mImage) {
+      image = result.mImage;
+
+      {
+        MutexAutoLock lock(mMutex);
+        mImage = image;
+
+        mProgressTracker = nullptr;
+      }
+
+      nsCOMPtr<nsIEventTarget> eventTarget;
+      if (!NS_IsMainThread()) {
+        eventTarget = GetMainThreadSerialEventTarget();
+        MOZ_ASSERT(eventTarget);
+      }
+
+      if (!eventTarget) {
+        MOZ_ASSERT(NS_IsMainThread());
+        FinishPreparingForNewPart(result);
+      } else {
+        nsCOMPtr<nsIRunnable> runnable =
+            new FinishPreparingForNewPartRunnable(this, std::move(result));
+        eventTarget->Dispatch(CreateRenderBlockingRunnable(runnable.forget()),
+                              NS_DISPATCH_NORMAL);
+      }
+    }
+
+    if (!succeeded) {
+      Cancel(NS_IMAGELIB_ERROR_FAILURE);
+      return NS_BINDING_ABORTED;
+    }
+  }
+
+  if (aInStr) {
+    nsresult rv =
+        image->OnImageDataAvailable(aRequest, aInStr, aOffset, aCount);
+
+    if (NS_FAILED(rv)) {
+      MOZ_LOG(gImgLog, LogLevel::Warning,
+              ("[this=%p] imgRequest::OnDataAvailable -- "
+               "copy to RasterImage failed\n",
+               this));
+      Cancel(NS_IMAGELIB_ERROR_FAILURE);
+      return NS_BINDING_ABORTED;
+    }
+  }
+
+  return NS_OK;
+}
+
+void imgRequest::SetProperties(const nsACString& aContentType,
+                               const nsACString& aContentDisposition) {
+  nsCOMPtr<nsISupportsCString> contentType =
+      do_CreateInstance("@mozilla.org/supports-cstring;1");
+  if (contentType) {
+    contentType->SetData(aContentType);
+    mProperties->Set("type", contentType);
+  }
+
+  if (!aContentDisposition.IsEmpty()) {
+    nsCOMPtr<nsISupportsCString> contentDisposition =
+        do_CreateInstance("@mozilla.org/supports-cstring;1");
+    if (contentDisposition) {
+      contentDisposition->SetData(aContentDisposition);
+      mProperties->Set("content-disposition", contentDisposition);
+    }
+  }
+}
+
+static nsresult sniff_mimetype_callback(nsIInputStream* in, void* data,
+                                        const char* fromRawSegment,
+                                        uint32_t toOffset, uint32_t count,
+                                        uint32_t* writeCount) {
+  mimetype_closure* closure = static_cast<mimetype_closure*>(data);
+
+  NS_ASSERTION(closure, "closure is null!");
+
+  if (count > 0) {
+    imgLoader::GetMimeTypeFromContent(fromRawSegment, count, *closure->newType);
+  }
+
+  *writeCount = 0;
+  return NS_ERROR_FAILURE;
+}
+
+
+NS_IMETHODIMP
+imgRequest::GetInterface(const nsIID& aIID, void** aResult) {
+  if (!mPrevChannelSink || aIID.Equals(NS_GET_IID(nsIChannelEventSink))) {
+    return QueryInterface(aIID, aResult);
+  }
+
+  NS_ASSERTION(
+      mPrevChannelSink != this,
+      "Infinite recursion - don't keep track of channel sinks that are us!");
+  return mPrevChannelSink->GetInterface(aIID, aResult);
+}
+
+NS_IMETHODIMP
+imgRequest::AsyncOnChannelRedirect(nsIChannel* oldChannel,
+                                   nsIChannel* newChannel, uint32_t flags,
+                                   nsIAsyncVerifyRedirectCallback* callback) {
+  NS_ASSERTION(mRequest && mChannel,
+               "Got a channel redirect after we nulled out mRequest!");
+  NS_ASSERTION(mChannel == oldChannel,
+               "Got a channel redirect for an unknown channel!");
+  NS_ASSERTION(newChannel, "Got a redirect to a NULL channel!");
+
+  SetCacheValidation(mCacheEntry, oldChannel);
+
+  mRedirectCallback = callback;
+  mNewRedirectChannel = newChannel;
+
+  nsCOMPtr<nsIChannelEventSink> sink(do_GetInterface(mPrevChannelSink));
+  if (sink) {
+    nsresult rv =
+        sink->AsyncOnChannelRedirect(oldChannel, newChannel, flags, this);
+    if (NS_FAILED(rv)) {
+      mRedirectCallback = nullptr;
+      mNewRedirectChannel = nullptr;
+    }
+    return rv;
+  }
+
+  (void)OnRedirectVerifyCallback(NS_OK);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequest::OnRedirectVerifyCallback(nsresult result) {
+  NS_ASSERTION(mRedirectCallback, "mRedirectCallback not set in callback");
+  NS_ASSERTION(mNewRedirectChannel, "mNewRedirectChannel not set in callback");
+
+  if (NS_FAILED(result)) {
+    mRedirectCallback->OnRedirectVerifyCallback(result);
+    mRedirectCallback = nullptr;
+    mNewRedirectChannel = nullptr;
+    return NS_OK;
+  }
+
+  mChannel = mNewRedirectChannel;
+  mTimedChannel = do_QueryInterface(mChannel);
+  mNewRedirectChannel = nullptr;
+
+  if (LOG_TEST(LogLevel::Debug)) {
+    LOG_MSG_WITH_PARAM(gImgLog, "imgRequest::OnChannelRedirect", "old",
+                       mFinalURI ? mFinalURI->GetSpecOrDefault().get() : "");
+  }
+
+  bool schemeLocal = false;
+  if (NS_FAILED(NS_URIChainHasFlags(mFinalURI,
+                                    nsIProtocolHandler::URI_IS_LOCAL_RESOURCE,
+                                    &schemeLocal)) ||
+      (!mFinalURI->SchemeIs("https") && !mFinalURI->SchemeIs("chrome") &&
+       !schemeLocal)) {
+    MutexAutoLock lock(mMutex);
+
+    nsCOMPtr<nsILoadInfo> loadInfo = mChannel->LoadInfo();
+    bool upgradeInsecureRequests =
+        loadInfo ? loadInfo->GetUpgradeInsecureRequests() ||
+                       loadInfo->GetBrowserUpgradeInsecureRequests()
+                 : false;
+    if (!upgradeInsecureRequests) {
+      mHadInsecureRedirect = true;
+    }
+  }
+
+  mChannel->GetURI(getter_AddRefs(mFinalURI));
+
+  if (LOG_TEST(LogLevel::Debug)) {
+    LOG_MSG_WITH_PARAM(gImgLog, "imgRequest::OnChannelRedirect", "new",
+                       mFinalURI ? mFinalURI->GetSpecOrDefault().get() : "");
+  }
+
+  if (nsContentUtils::IsExternalProtocol(mFinalURI)) {
+    mRedirectCallback->OnRedirectVerifyCallback(NS_ERROR_ABORT);
+    mRedirectCallback = nullptr;
+    return NS_OK;
+  }
+
+  mRedirectCallback->OnRedirectVerifyCallback(NS_OK);
+  mRedirectCallback = nullptr;
+  return NS_OK;
+}
+
+void imgRequest::UpdateShouldReportRenderTimeForLCP() {
+  if (mTimedChannel) {
+    bool allRedirectPassTAO = false;
+    mTimedChannel->GetAllRedirectsPassTimingAllowCheck(&allRedirectPassTAO);
+    mShouldReportRenderTimeForLCP =
+        mTimedChannel->TimingAllowCheck(mTriggeringPrincipal) &&
+        allRedirectPassTAO;
+  }
+}

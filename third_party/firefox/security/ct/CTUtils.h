@@ -1,0 +1,100 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef CTUtils_h
+#define CTUtils_h
+
+#include <memory>
+
+#include "cryptohi.h"
+#include "keyhi.h"
+#include "keythi.h"
+#include "pk11pub.h"
+#include "mozpkix/Input.h"
+#include "mozpkix/Result.h"
+
+#define MOZILLA_CT_ARRAY_LENGTH(x) (sizeof(x) / sizeof((x)[0]))
+
+struct DeleteHelper {
+  void operator()(CERTSubjectPublicKeyInfo* value) {
+    SECKEY_DestroySubjectPublicKeyInfo(value);
+  }
+  void operator()(PK11Context* value) { PK11_DestroyContext(value, true); }
+  void operator()(PK11SlotInfo* value) { PK11_FreeSlot(value); }
+  void operator()(SECKEYPublicKey* value) { SECKEY_DestroyPublicKey(value); }
+  void operator()(SECItem* value) { SECITEM_FreeItem(value, true); }
+};
+
+template <class T>
+struct MaybeDeleteHelper {
+  void operator()(T* ptr) {
+    if (ptr) {
+      DeleteHelper del;
+      del(ptr);
+    }
+  }
+};
+
+typedef std::unique_ptr<CERTSubjectPublicKeyInfo,
+                        MaybeDeleteHelper<CERTSubjectPublicKeyInfo>>
+    UniqueCERTSubjectPublicKeyInfo;
+typedef std::unique_ptr<PK11Context, MaybeDeleteHelper<PK11Context>>
+    UniquePK11Context;
+typedef std::unique_ptr<PK11SlotInfo, MaybeDeleteHelper<PK11SlotInfo>>
+    UniquePK11SlotInfo;
+typedef std::unique_ptr<SECKEYPublicKey, MaybeDeleteHelper<SECKEYPublicKey>>
+    UniqueSECKEYPublicKey;
+typedef std::unique_ptr<SECItem, MaybeDeleteHelper<SECItem>> UniqueSECItem;
+
+namespace mozilla {
+namespace ct {
+
+inline static pkix::Result UncheckedReadUint(size_t length, pkix::Reader& in,
+                                             uint64_t& out) {
+  uint64_t result = 0;
+  for (size_t i = 0; i < length; ++i) {
+    uint8_t value;
+    pkix::Result rv = in.Read(value);
+    if (rv != pkix::Success) {
+      return rv;
+    }
+    result = (result << 8) | value;
+  }
+  out = result;
+  return pkix::Success;
+}
+
+template <size_t length, typename T>
+pkix::Result ReadUint(pkix::Reader& in, T& out) {
+  uint64_t value;
+  static_assert(std::is_unsigned<T>::value, "T must be unsigned");
+  static_assert(length <= 8, "At most 8 byte integers can be read");
+  static_assert(sizeof(T) >= length, "T must be able to hold <length> bytes");
+  pkix::Result rv = UncheckedReadUint(length, in, value);
+  if (rv != pkix::Success) {
+    return rv;
+  }
+  out = static_cast<T>(value);
+  return pkix::Success;
+}
+
+static inline pkix::Result ReadFixedBytes(size_t length, pkix::Reader& in,
+                                          pkix::Input& out) {
+  return in.Skip(length, out);
+}
+
+template <size_t prefixLength>
+pkix::Result ReadVariableBytes(pkix::Reader& in, pkix::Input& out) {
+  size_t length;
+  pkix::Result rv = ReadUint<prefixLength>(in, length);
+  if (rv != pkix::Success) {
+    return rv;
+  }
+  return ReadFixedBytes(length, in, out);
+}
+
+}  
+}  
+
+#endif  // CTUtils_h

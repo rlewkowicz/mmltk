@@ -1,0 +1,47 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkTFitsIn_DEFINED)
+#define SkTFitsIn_DEFINED
+
+#include "include/private/base/SkDebug.h"
+
+#include <limits>
+#include <type_traits>
+
+template <typename T, class Enable = void>
+struct sk_strip_enum {
+    typedef T type;
+};
+
+template <typename T>
+struct sk_strip_enum<T, typename std::enable_if<std::is_enum<T>::value>::type> {
+    typedef typename std::underlying_type<T>::type type;
+};
+
+
+
+template <typename D, typename S>
+static constexpr inline
+typename std::enable_if<(std::is_integral<S>::value || std::is_enum<S>::value) &&
+                        (std::is_integral<D>::value || std::is_enum<D>::value), bool>::type
+ SkTFitsIn(S src) {
+    using Sa = typename sk_strip_enum<S>::type;
+    using Da = typename sk_strip_enum<D>::type;
+
+    return
+
+    (std::is_signed<Sa>::value && std::is_unsigned<Da>::value && sizeof(Sa) <= sizeof(Da)) ?
+        (S)0 <= src :
+
+    (std::is_signed<Da>::value && std::is_unsigned<Sa>::value && sizeof(Da) <= sizeof(Sa)) ?
+        src <= (S)std::numeric_limits<Da>::max() :
+
+    (S)(D)src == src;
+}
+
+#endif

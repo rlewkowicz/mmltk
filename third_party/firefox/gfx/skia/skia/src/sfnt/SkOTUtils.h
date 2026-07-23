@@ -1,0 +1,77 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkOTUtils_DEFINED)
+#define SkOTUtils_DEFINED
+
+#include "include/core/SkTypeface.h"
+#include "src/sfnt/SkOTTableTypes.h"
+#include "src/sfnt/SkOTTable_OS_2_V4.h"
+#include "src/sfnt/SkOTTable_name.h"
+
+class SkData;
+class SkStream;
+struct SkAdvancedTypefaceMetrics;
+
+struct SkOTUtils {
+    static uint32_t CalcTableChecksum(SK_OT_ULONG *data, size_t length);
+
+    static SkData* RenameFont(SkStreamAsset* fontData, const char* fontName, int fontNameLen);
+
+    class LocalizedStrings_NameTable : public SkTypeface::LocalizedStrings {
+    public:
+        LocalizedStrings_NameTable(std::unique_ptr<uint8_t[]> nameTableData, size_t size,
+                                   SK_OT_USHORT types[],
+                                   int typesCount)
+            : fTypes(types), fTypesCount(typesCount), fTypesIndex(0)
+            , fNameTableData(std::move(nameTableData))
+            , fFamilyNameIter(fNameTableData.get(), size, fTypes[fTypesIndex])
+        { }
+
+        static sk_sp<LocalizedStrings_NameTable> Make(
+            const SkTypeface& typeface,
+            SK_OT_USHORT types[],
+            int typesCount);
+
+        static sk_sp<LocalizedStrings_NameTable> MakeForFamilyNames(const SkTypeface& typeface);
+
+        bool next(SkTypeface::LocalizedString* localizedString) override;
+    private:
+        static SK_OT_USHORT familyNameTypes[3];
+
+        SK_OT_USHORT* fTypes;
+        int fTypesCount;
+        int fTypesIndex;
+        std::unique_ptr<uint8_t[]> fNameTableData;
+        SkOTTableName::Iterator fFamilyNameIter;
+    };
+
+    class LocalizedStrings_SingleName : public SkTypeface::LocalizedStrings {
+    public:
+        LocalizedStrings_SingleName(SkString name, SkString language)
+                : fName(std::move(name)), fLanguage(std::move(language)), fHasNext(true) {}
+
+        bool next(SkTypeface::LocalizedString* localizedString) override {
+            localizedString->fString = fName;
+            localizedString->fLanguage = fLanguage;
+
+            bool hadNext = fHasNext;
+            fHasNext = false;
+            return hadNext;
+        }
+
+    private:
+        SkString fName;
+        SkString fLanguage;
+        bool fHasNext;
+    };
+
+    static void SetAdvancedTypefaceFlags(SkOTTableOS2_V4::Type fsType,
+                                         SkAdvancedTypefaceMetrics* info);
+};
+
+#endif

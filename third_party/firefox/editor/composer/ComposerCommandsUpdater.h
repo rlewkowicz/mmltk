@@ -1,0 +1,104 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ComposerCommandsUpdater_h
+#define mozilla_ComposerCommandsUpdater_h
+
+#include "nsCOMPtr.h"  // for already_AddRefed, nsCOMPtr
+#include "nsCycleCollectionParticipant.h"
+#include "nsINamed.h"
+#include "nsISupportsImpl.h"  // for NS_DECL_ISUPPORTS
+#include "nsITimer.h"         // for NS_DECL_NSITIMERCALLBACK, etc
+#include "nscore.h"           // for NS_IMETHOD, nsresult, etc
+
+class nsCommandManager;
+class nsIDocShell;
+class nsITransaction;
+class nsITransactionManager;
+class nsPIDOMWindowOuter;
+
+namespace mozilla {
+
+class TransactionManager;
+
+class ComposerCommandsUpdater final : public nsITimerCallback, public nsINamed {
+ public:
+  ComposerCommandsUpdater();
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(ComposerCommandsUpdater,
+                                           nsITimerCallback)
+
+  NS_DECL_NSITIMERCALLBACK
+
+  NS_DECL_NSINAMED
+
+  void Init(nsPIDOMWindowOuter& aDOMWindow);
+
+  void OnSelectionChange() { PrimeUpdateTimer(); }
+
+  MOZ_CAN_RUN_SCRIPT void OnHTMLEditorCreated() {
+    UpdateOneCommand("obs_documentCreated");
+  }
+
+  MOZ_CAN_RUN_SCRIPT void OnBeforeHTMLEditorDestroyed() {
+    if (mUpdateTimer) {
+      mUpdateTimer->Cancel();
+      mUpdateTimer = nullptr;
+    }
+
+  }
+
+  MOZ_CAN_RUN_SCRIPT void OnHTMLEditorDirtyStateChanged(bool aNowDirty) {
+    if (mDirtyState == static_cast<int8_t>(aNowDirty)) {
+      return;
+    }
+    UpdateCommandGroup(CommandGroup::Save);
+    UpdateCommandGroup(CommandGroup::Undo);
+    mDirtyState = aNowDirty;
+  }
+
+  MOZ_CAN_RUN_SCRIPT void DidDoTransaction(
+      TransactionManager& aTransactionManager);
+  MOZ_CAN_RUN_SCRIPT void DidUndoTransaction(
+      TransactionManager& aTransactionManager);
+  MOZ_CAN_RUN_SCRIPT void DidRedoTransaction(
+      TransactionManager& aTransactionManager);
+
+ protected:
+  virtual ~ComposerCommandsUpdater();
+
+  enum {
+    eStateUninitialized = -1,
+    eStateOff = 0,
+    eStateOn = 1,
+  };
+
+  bool SelectionIsCollapsed();
+  MOZ_CAN_RUN_SCRIPT nsresult UpdateOneCommand(const char* aCommand);
+  enum class CommandGroup {
+    Save,
+    Style,
+    Undo,
+  };
+  MOZ_CAN_RUN_SCRIPT void UpdateCommandGroup(CommandGroup aCommandGroup);
+
+  nsCommandManager* GetCommandManager();
+
+  nsresult PrimeUpdateTimer();
+  void TimerCallback();
+
+  nsCOMPtr<nsITimer> mUpdateTimer;
+  nsCOMPtr<nsPIDOMWindowOuter> mDOMWindow;
+  nsCOMPtr<nsIDocShell> mDocShell;
+
+  int8_t mDirtyState;
+  int8_t mSelectionCollapsed;
+  bool mFirstDoOfFirstUndo;
+};
+
+}  
+
+#endif  // #ifndef mozilla_ComposerCommandsUpdater_h

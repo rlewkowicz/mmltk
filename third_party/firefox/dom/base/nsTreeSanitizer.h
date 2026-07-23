@@ -1,0 +1,116 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsTreeSanitizer_h_
+#define nsTreeSanitizer_h_
+
+#include "mozilla/StaticPtr.h"
+#include "mozilla/dom/NameSpaceConstants.h"
+#include "mozilla/dom/StaticAtomSet.h"
+#include "nsAtom.h"
+#include "nsHashKeys.h"
+#include "nsHashtablesFwd.h"
+#include "nsIPrincipal.h"
+#include "nsTArray.h"
+
+class nsIContent;
+class nsIGlobalObject;
+class nsINode;
+
+namespace mozilla {
+class DeclarationBlock;
+class ErrorResult;
+enum class StyleSanitizationKind : uint8_t;
+}  
+
+namespace mozilla::dom {
+class DocumentFragment;
+class Element;
+}  
+
+class nsTreeSanitizer {
+ public:
+  explicit nsTreeSanitizer(uint32_t aFlags = 0);
+
+  static void InitializeStatics();
+  static void ReleaseStatics();
+
+  void Sanitize(mozilla::dom::DocumentFragment* aFragment);
+
+  void Sanitize(mozilla::dom::Document* aDocument);
+
+  static void RemoveConditionalCSSFromSubtree(nsINode* aRoot);
+
+ private:
+  bool mAllowStyles;
+
+  bool mAllowComments;
+
+  bool mDropNonCSSPresentation;
+
+  bool mDropForms;
+
+  bool mCidEmbedsOnly;
+
+  bool mDropMedia;
+
+  bool mFullDocument;
+
+  bool mLogRemovals;
+
+  void SanitizeChildren(nsINode* aRoot);
+
+  bool MustFlatten(int32_t aNamespace, nsAtom* aLocal);
+
+  bool MustPrune(int32_t aNamespace, nsAtom* aLocal,
+                 mozilla::dom::Element* aElement);
+
+  bool IsURL(const nsStaticAtom* const* aURLs, nsAtom* aLocalName);
+
+  struct AllowedAttributes {
+    mozilla::dom::StaticAtomSet* mNames = nullptr;
+    const nsStaticAtom* const* mURLs = nullptr;
+    bool mXLink = false;
+    bool mStyle = false;
+    bool mDangerousSrc = false;
+  };
+
+  void SanitizeAttributes(mozilla::dom::Element* aElement,
+                          AllowedAttributes aAllowed);
+
+  bool SanitizeURL(mozilla::dom::Element* aElement, int32_t aNamespace,
+                   nsAtom* aLocalName, bool aFragmentsOnly = false);
+
+  bool SanitizeStyleDeclaration(mozilla::DeclarationBlock* aDeclaration);
+
+  static bool SanitizeInlineStyle(mozilla::dom::Element*,
+                                  mozilla::StyleSanitizationKind);
+
+  static void RemoveAllAttributes(mozilla::dom::Element* aElement);
+
+  static void RemoveAllAttributesFromDescendants(mozilla::dom::Element*);
+
+  void LogMessage(const char* aMessage, mozilla::dom::Document* aDoc,
+                  mozilla::dom::Element* aElement = nullptr,
+                  nsAtom* aAttr = nullptr);
+
+  static mozilla::StaticAutoPtr<mozilla::dom::StaticAtomSet> sElementsHTML;
+
+  static mozilla::StaticAutoPtr<mozilla::dom::StaticAtomSet> sAttributesHTML;
+
+  static mozilla::StaticAutoPtr<mozilla::dom::StaticAtomSet>
+      sPresAttributesHTML;
+
+  static mozilla::StaticAutoPtr<mozilla::dom::StaticAtomSet> sElementsSVG;
+
+  static mozilla::StaticAutoPtr<mozilla::dom::StaticAtomSet> sAttributesSVG;
+
+  static mozilla::StaticAutoPtr<mozilla::dom::StaticAtomSet> sElementsMathML;
+
+  static mozilla::StaticAutoPtr<mozilla::dom::StaticAtomSet> sAttributesMathML;
+
+  static mozilla::StaticRefPtr<nsIPrincipal> sNullPrincipal;
+};
+
+#endif  // nsTreeSanitizer_h_

@@ -1,0 +1,412 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_CheckedInt_h
+#define mozilla_CheckedInt_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/CheckedArithmetic.h"
+
+#include <cstdint>
+#include <limits>
+#include <type_traits>
+#include <utility>
+
+namespace mozilla {
+
+template <typename T>
+class CheckedInt;
+
+namespace detail {
+
+
+template <typename IntegerType>
+struct IsSupportedPass2 {
+  static const bool value = false;
+};
+
+template <typename IntegerType>
+struct IsSupported {
+  static const bool value = IsSupportedPass2<IntegerType>::value;
+};
+
+template <>
+struct IsSupported<int8_t> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupported<uint8_t> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupported<int16_t> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupported<uint16_t> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupported<int32_t> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupported<uint32_t> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupported<int64_t> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupported<uint64_t> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupportedPass2<signed char> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupportedPass2<unsigned char> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupportedPass2<short> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupportedPass2<unsigned short> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupportedPass2<int> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupportedPass2<unsigned int> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupportedPass2<long> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupportedPass2<unsigned long> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupportedPass2<long long> {
+  static const bool value = true;
+};
+
+template <>
+struct IsSupportedPass2<unsigned long long> {
+  static const bool value = true;
+};
+
+
+template <typename T>
+constexpr bool IsDivValid(T aX, T aY) {
+  return aY != 0 && !(std::is_signed_v<T> &&
+                      aX == std::numeric_limits<T>::min() && aY == T(-1));
+}
+
+template <typename T>
+constexpr bool IsModValid(T aX, T aY) {
+  return IsDivValid(aX, aY);
+}
+
+template <typename T, bool IsSigned = std::is_signed_v<T>>
+struct NegateImpl;
+
+template <typename T>
+struct NegateImpl<T, false> {
+  static constexpr CheckedInt<T> negate(const CheckedInt<T>& aVal) {
+    static_assert(std::in_range<T>(0), "Integer type can't represent 0");
+    return CheckedInt<T>(T(0), aVal.isValid() && aVal.mValue == 0);
+  }
+};
+
+template <typename T>
+struct NegateImpl<T, true> {
+  static constexpr CheckedInt<T> negate(const CheckedInt<T>& aVal) {
+    if (!aVal.isValid() || aVal.mValue == std::numeric_limits<T>::min()) {
+      return CheckedInt<T>(aVal.mValue, false);
+    }
+    return CheckedInt<T>(T(-aVal.mValue), true);
+  }
+};
+
+}  
+
+
+template <typename T>
+class CheckedInt {
+ protected:
+  T mValue;
+  bool mIsValid;
+
+  template <typename U>
+  constexpr CheckedInt(U aValue, bool aIsValid)
+      : mValue(aValue), mIsValid(aIsValid) {
+    static_assert(std::is_same_v<T, U>,
+                  "this constructor must accept only T values");
+    static_assert(detail::IsSupported<T>::value,
+                  "This type is not supported by CheckedInt");
+  }
+
+  friend struct detail::NegateImpl<T>;
+
+ public:
+  template <
+      typename U,
+      std::enable_if_t<!std::is_enum_v<U> && !std::is_same_v<U, bool>, int> = 0>
+  MOZ_IMPLICIT MOZ_NO_ARITHMETIC_EXPR_IN_ARGUMENT constexpr CheckedInt(U aValue)
+      : mValue(T(aValue)), mIsValid(std::in_range<T>(aValue)) {
+    static_assert(
+        detail::IsSupported<T>::value && detail::IsSupported<U>::value,
+        "This type is not supported by CheckedInt");
+  }
+
+  template <typename U, std::enable_if_t<std::is_enum_v<U>, int> = 0>
+  MOZ_IMPLICIT constexpr CheckedInt(U aValue)
+      : CheckedInt(static_cast<std::underlying_type_t<U>>(aValue)) {}
+
+  template <typename U, std::enable_if_t<std::is_same_v<U, bool>, int> = 0>
+  MOZ_IMPLICIT constexpr CheckedInt(U aValue)
+      : CheckedInt(static_cast<uint8_t>(aValue)) {}
+
+  template <typename U>
+  friend class CheckedInt;
+
+  template <typename U>
+  constexpr CheckedInt<U> toChecked() const {
+    CheckedInt<U> ret(mValue);
+    ret.mIsValid = ret.mIsValid && mIsValid;
+    return ret;
+  }
+
+  constexpr CheckedInt() : mValue(T(0)), mIsValid(true) {
+    static_assert(detail::IsSupported<T>::value,
+                  "This type is not supported by CheckedInt");
+    static_assert(std::in_range<T>(0), "Integer type can't represent 0");
+  }
+
+  constexpr T value() const {
+    MOZ_RELEASE_ASSERT(
+        mIsValid,
+        "Invalid checked integer (division by zero or integer overflow)");
+    return mValue;
+  }
+
+  constexpr bool isValid() const { return mIsValid; }
+
+  template <typename U>
+  friend constexpr CheckedInt<U> operator+(const CheckedInt<U>& aLhs,
+                                           const CheckedInt<U>& aRhs);
+  template <typename U>
+  constexpr CheckedInt& operator+=(U aRhs);
+  constexpr CheckedInt& operator+=(const CheckedInt<T>& aRhs);
+
+  template <typename U>
+  friend constexpr CheckedInt<U> operator-(const CheckedInt<U>& aLhs,
+                                           const CheckedInt<U>& aRhs);
+  template <typename U>
+  constexpr CheckedInt& operator-=(U aRhs);
+  constexpr CheckedInt& operator-=(const CheckedInt<T>& aRhs);
+
+  template <typename U>
+  friend constexpr CheckedInt<U> operator*(const CheckedInt<U>& aLhs,
+                                           const CheckedInt<U>& aRhs);
+  template <typename U>
+  constexpr CheckedInt& operator*=(U aRhs);
+  constexpr CheckedInt& operator*=(const CheckedInt<T>& aRhs);
+
+  template <typename U>
+  friend constexpr CheckedInt<U> operator/(const CheckedInt<U>& aLhs,
+                                           const CheckedInt<U>& aRhs);
+  template <typename U>
+  constexpr CheckedInt& operator/=(U aRhs);
+  constexpr CheckedInt& operator/=(const CheckedInt<T>& aRhs);
+
+  template <typename U>
+  friend constexpr CheckedInt<U> operator%(const CheckedInt<U>& aLhs,
+                                           const CheckedInt<U>& aRhs);
+  template <typename U>
+  constexpr CheckedInt& operator%=(U aRhs);
+  constexpr CheckedInt& operator%=(const CheckedInt<T>& aRhs);
+
+  constexpr CheckedInt operator-() const {
+    return detail::NegateImpl<T>::negate(*this);
+  }
+
+  constexpr bool operator==(const CheckedInt& aOther) const {
+    return mIsValid && aOther.mIsValid && mValue == aOther.mValue;
+  }
+
+  constexpr CheckedInt& operator++() {
+    *this += 1;
+    return *this;
+  }
+
+  constexpr CheckedInt operator++(int) {
+    CheckedInt tmp = *this;
+    *this += 1;
+    return tmp;
+  }
+
+  constexpr CheckedInt& operator--() {
+    *this -= 1;
+    return *this;
+  }
+
+  constexpr CheckedInt operator--(int) {
+    CheckedInt tmp = *this;
+    *this -= 1;
+    return tmp;
+  }
+
+ private:
+  template <typename U>
+  bool operator!=(U aOther) const = delete;
+  template <typename U>
+  bool operator<(U aOther) const = delete;
+  template <typename U>
+  bool operator<=(U aOther) const = delete;
+  template <typename U>
+  bool operator>(U aOther) const = delete;
+  template <typename U>
+  bool operator>=(U aOther) const = delete;
+};
+
+#define MOZ_CHECKEDINT_BASIC_BINARY_OPERATOR(NAME, OP)                      \
+  template <typename T>                                                     \
+  constexpr CheckedInt<T> operator OP(const CheckedInt<T>& aLhs,            \
+                                      const CheckedInt<T>& aRhs) {          \
+    if (!detail::Is##NAME##Valid(aLhs.mValue, aRhs.mValue)) {               \
+      static_assert(std::in_range<T>(0), "Integer type can't represent 0"); \
+      return CheckedInt<T>(T(0), false);                                    \
+    }                                                                       \
+                     \
+    return CheckedInt<T>(T(aLhs.mValue OP aRhs.mValue),                     \
+                         aLhs.mIsValid && aRhs.mIsValid);                   \
+  }
+
+#define MOZ_CHECKEDINT_BASIC_BINARY_OPERATOR2(NAME, OP, FUN)                \
+  template <typename T>                                                     \
+  constexpr CheckedInt<T> operator OP(const CheckedInt<T>& aLhs,            \
+                                      const CheckedInt<T>& aRhs) {          \
+    auto result = T{};                                                      \
+    if (MOZ_UNLIKELY(!FUN(aLhs.mValue, aRhs.mValue, &result))) {            \
+      static_assert(std::in_range<T>(0), "Integer type can't represent 0"); \
+      return CheckedInt<T>(T(0), false);                                    \
+    }                                                                       \
+    return CheckedInt<T>(result, aLhs.mIsValid && aRhs.mIsValid);           \
+  }
+MOZ_CHECKEDINT_BASIC_BINARY_OPERATOR2(Add, +, SafeAdd)
+MOZ_CHECKEDINT_BASIC_BINARY_OPERATOR2(Sub, -, SafeSub)
+MOZ_CHECKEDINT_BASIC_BINARY_OPERATOR2(Mul, *, SafeMul)
+#undef MOZ_CHECKEDINT_BASIC_BINARY_OPERATOR2
+
+MOZ_CHECKEDINT_BASIC_BINARY_OPERATOR(Div, /)
+MOZ_CHECKEDINT_BASIC_BINARY_OPERATOR(Mod, %)
+#undef MOZ_CHECKEDINT_BASIC_BINARY_OPERATOR
+
+
+namespace detail {
+
+template <typename T, typename U>
+struct CastToCheckedIntImpl {
+  typedef CheckedInt<T> ReturnType;
+  static constexpr CheckedInt<T> run(U aU) { return aU; }
+};
+
+template <typename T>
+struct CastToCheckedIntImpl<T, CheckedInt<T>> {
+  typedef const CheckedInt<T>& ReturnType;
+  static constexpr const CheckedInt<T>& run(const CheckedInt<T>& aU) {
+    return aU;
+  }
+};
+
+}  
+
+template <typename T, typename U>
+constexpr typename detail::CastToCheckedIntImpl<T, U>::ReturnType
+castToCheckedInt(U aU) {
+  static_assert(detail::IsSupported<T>::value && detail::IsSupported<U>::value,
+                "This type is not supported by CheckedInt");
+  return detail::CastToCheckedIntImpl<T, U>::run(aU);
+}
+
+#define MOZ_CHECKEDINT_CONVENIENCE_BINARY_OPERATORS(OP, COMPOUND_OP)       \
+  template <typename T>                                                    \
+  template <typename U>                                                    \
+  constexpr CheckedInt<T>& CheckedInt<T>::operator COMPOUND_OP(U aRhs) {   \
+    *this = *this OP castToCheckedInt<T>(aRhs);                            \
+    return *this;                                                          \
+  }                                                                        \
+  template <typename T>                                                    \
+  constexpr CheckedInt<T>& CheckedInt<T>::operator COMPOUND_OP(            \
+      const CheckedInt<T>& aRhs) {                                         \
+    *this = *this OP aRhs;                                                 \
+    return *this;                                                          \
+  }                                                                        \
+  template <typename T, typename U>                                        \
+  constexpr CheckedInt<T> operator OP(const CheckedInt<T>& aLhs, U aRhs) { \
+    return aLhs OP castToCheckedInt<T>(aRhs);                              \
+  }                                                                        \
+  template <typename T, typename U>                                        \
+  constexpr CheckedInt<T> operator OP(U aLhs, const CheckedInt<T>& aRhs) { \
+    return castToCheckedInt<T>(aLhs) OP aRhs;                              \
+  }
+
+MOZ_CHECKEDINT_CONVENIENCE_BINARY_OPERATORS(+, +=)
+MOZ_CHECKEDINT_CONVENIENCE_BINARY_OPERATORS(*, *=)
+MOZ_CHECKEDINT_CONVENIENCE_BINARY_OPERATORS(-, -=)
+MOZ_CHECKEDINT_CONVENIENCE_BINARY_OPERATORS(/, /=)
+MOZ_CHECKEDINT_CONVENIENCE_BINARY_OPERATORS(%, %=)
+
+#undef MOZ_CHECKEDINT_CONVENIENCE_BINARY_OPERATORS
+
+template <typename T, typename U>
+constexpr bool operator==(const CheckedInt<T>& aLhs, U aRhs) {
+  return aLhs == castToCheckedInt<T>(aRhs);
+}
+
+template <typename T, typename U>
+constexpr bool operator==(U aLhs, const CheckedInt<T>& aRhs) {
+  return castToCheckedInt<T>(aLhs) == aRhs;
+}
+
+typedef CheckedInt<int8_t> CheckedInt8;
+typedef CheckedInt<uint8_t> CheckedUint8;
+typedef CheckedInt<int16_t> CheckedInt16;
+typedef CheckedInt<uint16_t> CheckedUint16;
+typedef CheckedInt<int32_t> CheckedInt32;
+typedef CheckedInt<uint32_t> CheckedUint32;
+typedef CheckedInt<int64_t> CheckedInt64;
+typedef CheckedInt<uint64_t> CheckedUint64;
+
+}  
+
+#endif /* mozilla_CheckedInt_h */

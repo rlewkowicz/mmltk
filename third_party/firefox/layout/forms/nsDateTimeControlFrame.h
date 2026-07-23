@@ -1,0 +1,53 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsDateTimeControlFrame_h_
+#define nsDateTimeControlFrame_h_
+
+#include "nsCOMPtr.h"
+#include "nsContainerFrame.h"
+#include "nsIAnonymousContentCreator.h"
+
+namespace mozilla {
+class PresShell;
+namespace dom {
+struct DateTimeValue;
+}  
+}  
+
+class nsDateTimeControlFrame final : public nsContainerFrame {
+  typedef mozilla::dom::DateTimeValue DateTimeValue;
+
+  explicit nsDateTimeControlFrame(ComputedStyle* aStyle,
+                                  nsPresContext* aPresContext);
+
+ public:
+  friend nsIFrame* NS_NewDateTimeControlFrame(mozilla::PresShell* aPresShell,
+                                              ComputedStyle* aStyle);
+
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsDateTimeControlFrame)
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override {
+    return MakeFrameName(u"DateTimeControl"_ns, aResult);
+  }
+#endif
+
+  nscoord IntrinsicISize(const mozilla::IntrinsicSizeInput& aInput,
+                         mozilla::IntrinsicISizeType aType) override;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  Maybe<nscoord> GetNaturalBaselineBOffset(
+      mozilla::WritingMode aWM, BaselineSharingGroup aBaselineGroup,
+      BaselineExportContext) const override;
+
+  nscoord mFirstBaseline = NS_INTRINSIC_ISIZE_UNKNOWN;
+};
+
+#endif  // nsDateTimeControlFrame_h_

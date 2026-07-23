@@ -1,0 +1,1761 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "FilterInstance.h"
+
+#include <memory>
+
+#include "CSSFilterInstance.h"
+#include "FilterSupport.h"
+#include "ImgDrawResult.h"
+#include "SVGIntegrationUtils.h"
+#include "gfx2DGlue.h"
+#include "gfxContext.h"
+#include "gfxPlatform.h"
+#include "gfxUtils.h"
+#include "mozilla/ISVGDisplayableFrame.h"
+#include "mozilla/SVGFilterInstance.h"
+#include "mozilla/SVGObserverUtils.h"
+#include "mozilla/SVGUtils.h"
+#include "mozilla/StaticPrefs_gfx.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/gfx/Filters.h"
+#include "mozilla/gfx/Helpers.h"
+#include "mozilla/gfx/Logging.h"
+#include "mozilla/gfx/PatternHelpers.h"
+#include "nsLayoutUtils.h"
+
+using namespace mozilla::dom;
+using namespace mozilla::gfx;
+using namespace mozilla::image;
+
+namespace mozilla {
+
+FilterDescription FilterInstance::GetFilterDescription(
+    nsIContent* aFilteredElement, Span<const StyleFilter> aFilterChain,
+    ISVGFilterObserverList* aFiltersObserverList, bool aFilterInputIsTainted,
+    const UserSpaceMetrics& aMetrics, const gfxRect& aBBox,
+    nsTArray<RefPtr<SourceSurface>>& aOutAdditionalImages) {
+  gfxMatrix identity;
+
+  nsTArray<SVGFilterFrame*> filterFrames;
+  if (SVGObserverUtils::GetAndObserveFilters(aFiltersObserverList,
+                                             &filterFrames) ==
+      SVGObserverUtils::ReferenceState::HasRefsSomeInvalid) {
+    return FilterDescription();
+  }
+
+  FilterInstance instance(nullptr, aFilteredElement, aMetrics, aFilterChain,
+                          filterFrames, aFilterInputIsTainted, nullptr,
+                          identity, nullptr, nullptr, nullptr, &aBBox);
+  if (!instance.IsInitialized()) {
+    return FilterDescription();
+  }
+  return instance.ExtractDescriptionAndAdditionalImages(aOutAdditionalImages);
+}
+
+static std::unique_ptr<UserSpaceMetrics> UserSpaceMetricsForFrame(
+    nsIFrame* aFrame) {
+  if (auto* element = SVGElement::FromNodeOrNull(aFrame->GetContent())) {
+    return std::make_unique<SVGElementMetrics>(element);
+  }
+  return std::make_unique<NonSVGFrameUserSpaceMetrics>(aFrame);
+}
+
+void FilterInstance::PaintFilteredFrame(
+    nsIFrame* aFilteredFrame, Span<const StyleFilter> aFilterChain,
+    const nsTArray<SVGFilterFrame*>& aFilterFrames, gfxContext* aCtx,
+    const SVGFilterPaintCallback& aPaintCallback, const nsRegion* aDirtyArea,
+    imgDrawingParams& aImgParams, float aOpacity,
+    const gfxRect* aOverrideBBox) {
+  std::unique_ptr<UserSpaceMetrics> metrics =
+      UserSpaceMetricsForFrame(aFilteredFrame);
+
+  gfxContextMatrixAutoSaveRestore autoSR(aCtx);
+  auto scaleFactors = aCtx->CurrentMatrixDouble().ScaleFactors();
+  if (scaleFactors.xScale == 0 || scaleFactors.yScale == 0) {
+    return;
+  }
+
+  auto cssDevPixelScale =
+      aFilteredFrame->PresContext()->CSSToDevPixelScale().scale;
+
+  gfxMatrix scaleMatrixInDevUnits(scaleFactors.xScale * cssDevPixelScale, 0.0f,
+                                  0.0f, scaleFactors.yScale * cssDevPixelScale,
+                                  0.0f, 0.0f);
+
+  FilterInstance instance(aFilteredFrame, aFilteredFrame->GetContent(),
+                          *metrics, aFilterChain, aFilterFrames,
+                           true, aPaintCallback,
+                          scaleMatrixInDevUnits, aDirtyArea, nullptr, nullptr,
+                          aOverrideBBox);
+  if (instance.IsInitialized()) {
+    gfxMatrix reverseScaleMatrix(1.0 / scaleFactors.xScale, 0.0f, 0.0f,
+                                 1.0 / scaleFactors.yScale, 0.0f, 0.0f);
+
+    aCtx->SetMatrixDouble(reverseScaleMatrix * aCtx->CurrentMatrixDouble());
+
+    instance.Render(aCtx, aImgParams, aOpacity);
+  } else {
+    aPaintCallback(*aCtx, aImgParams, nullptr, nullptr);
+  }
+}
+
+static mozilla::wr::ComponentTransferFuncType FuncTypeToWr(
+    SVGFEComponentTransferType aFuncType) {
+  MOZ_ASSERT(aFuncType != SVGFEComponentTransferType::SameAsR);
+  switch (aFuncType) {
+    case SVGFEComponentTransferType::Table:
+      return mozilla::wr::ComponentTransferFuncType::Table;
+    case SVGFEComponentTransferType::Discrete:
+      return mozilla::wr::ComponentTransferFuncType::Discrete;
+    case SVGFEComponentTransferType::Linear:
+      return mozilla::wr::ComponentTransferFuncType::Linear;
+    case SVGFEComponentTransferType::Gamma:
+      return mozilla::wr::ComponentTransferFuncType::Gamma;
+    case SVGFEComponentTransferType::Identity:
+    default:
+      return mozilla::wr::ComponentTransferFuncType::Identity;
+  }
+  MOZ_ASSERT_UNREACHABLE("all func types not handled?");
+  return mozilla::wr::ComponentTransferFuncType::Identity;
+}
+
+WrFiltersStatus FilterInstance::BuildWebRenderFilters(
+    nsIFrame* aFilteredFrame, Span<const StyleFilter> aFilters,
+    StyleFilterType aStyleFilterType, WrFiltersHolder& aWrFilters,
+    const nsPoint& aOffsetForSVGFilters) {
+  WrFiltersStatus status = WrFiltersStatus::BLOB_FALLBACK;
+  if (StaticPrefs::gfx_webrender_svg_filter_effects()) {
+    status =
+        BuildWebRenderSVGFiltersImpl(aFilteredFrame, aFilters, aStyleFilterType,
+                                     aWrFilters, aOffsetForSVGFilters);
+  }
+  if (status == WrFiltersStatus::BLOB_FALLBACK) {
+    status = BuildWebRenderFiltersImpl(aFilteredFrame, aFilters,
+                                       aStyleFilterType, aWrFilters);
+  }
+  return status;
+}
+
+WrFiltersStatus FilterInstance::BuildWebRenderFiltersImpl(
+    nsIFrame* aFilteredFrame, Span<const StyleFilter> aFilters,
+    StyleFilterType aStyleFilterType, WrFiltersHolder& aWrFilters) {
+  aWrFilters.filters.Clear();
+  aWrFilters.filter_datas.Clear();
+  aWrFilters.values.Clear();
+  aWrFilters.post_filters_clip = Nothing();
+
+  nsIFrame* firstFrame =
+      nsLayoutUtils::FirstContinuationOrIBSplitSibling(aFilteredFrame);
+
+  nsTArray<SVGFilterFrame*> filterFrames;
+  if (SVGObserverUtils::GetAndObserveFilters(firstFrame, &filterFrames,
+                                             aStyleFilterType) ==
+      SVGObserverUtils::ReferenceState::HasRefsSomeInvalid) {
+    return WrFiltersStatus::UNSUPPORTED;
+  }
+
+  std::unique_ptr<UserSpaceMetrics> metrics =
+      UserSpaceMetricsForFrame(firstFrame);
+
+  gfxMatrix scaleMatrix;
+  gfxMatrix scaleMatrixInDevUnits =
+      scaleMatrix * SVGUtils::GetCSSPxToDevPxMatrix(firstFrame);
+
+  FilterInstance instance(firstFrame, firstFrame->GetContent(), *metrics,
+                          aFilters, filterFrames,  true,
+                          nullptr, scaleMatrixInDevUnits, nullptr, nullptr,
+                          nullptr, nullptr);
+
+  if (!instance.IsInitialized()) {
+    return WrFiltersStatus::UNSUPPORTED;
+  }
+
+  if (instance.mFilterDescription.mPrimitives.Length() >
+      StaticPrefs::gfx_webrender_max_filter_ops_per_chain()) {
+    return WrFiltersStatus::DISABLED_FOR_PERFORMANCE;
+  }
+
+  size_t primitiveCount = instance.mFilterDescription.mPrimitives.Length();
+
+  aWrFilters.filters.SetCapacity(primitiveCount * 2 + 1);
+  aWrFilters.filter_datas.SetCapacity(primitiveCount);
+  aWrFilters.values.SetCapacity(primitiveCount);
+
+  Maybe<IntRect> finalClip;
+  bool srgb = true;
+  for (uint32_t i = 0; i < instance.mFilterDescription.mPrimitives.Length();
+       i++) {
+    const auto& primitive = instance.mFilterDescription.mPrimitives[i];
+
+    if (primitive.NumberOfInputs() != 1) {
+      return WrFiltersStatus::BLOB_FALLBACK;
+    }
+    if (i == 0) {
+      if (primitive.InputPrimitiveIndex(0) !=
+          FilterPrimitiveDescription::kPrimitiveIndexSourceGraphic) {
+        return WrFiltersStatus::BLOB_FALLBACK;
+      }
+    } else if (primitive.InputPrimitiveIndex(0) != int32_t(i - 1)) {
+      return WrFiltersStatus::BLOB_FALLBACK;
+    }
+
+    bool previousSrgb = srgb;
+    bool primNeedsSrgb = primitive.InputColorSpace(0) == gfx::ColorSpace::SRGB;
+    if (srgb && !primNeedsSrgb) {
+      aWrFilters.filters.AppendElement(wr::FilterOp::SrgbToLinear());
+    } else if (!srgb && primNeedsSrgb) {
+      aWrFilters.filters.AppendElement(wr::FilterOp::LinearToSrgb());
+    }
+    srgb = primitive.OutputColorSpace() == gfx::ColorSpace::SRGB;
+
+    const PrimitiveAttributes& attr = primitive.Attributes();
+
+    bool filterIsNoop = false;
+
+    if (attr.is<OpacityAttributes>()) {
+      float opacity = attr.as<OpacityAttributes>().mOpacity;
+      aWrFilters.filters.AppendElement(wr::FilterOp::Opacity(
+          wr::PropertyBinding<float>::Value(opacity), opacity));
+    } else if (attr.is<ColorMatrixAttributes>()) {
+      const ColorMatrixAttributes& attributes =
+          attr.as<ColorMatrixAttributes>();
+
+      float transposed[20];
+      if (gfx::ComputeColorMatrix(attributes, transposed)) {
+        float matrix[20] = {
+            transposed[0], transposed[5], transposed[10], transposed[15],
+            transposed[1], transposed[6], transposed[11], transposed[16],
+            transposed[2], transposed[7], transposed[12], transposed[17],
+            transposed[3], transposed[8], transposed[13], transposed[18],
+            transposed[4], transposed[9], transposed[14], transposed[19]};
+
+        aWrFilters.filters.AppendElement(wr::FilterOp::ColorMatrix(matrix));
+      } else {
+        filterIsNoop = true;
+      }
+    } else if (attr.is<GaussianBlurAttributes>()) {
+      if (finalClip) {
+        return WrFiltersStatus::BLOB_FALLBACK;
+      }
+
+      const GaussianBlurAttributes& blur = attr.as<GaussianBlurAttributes>();
+
+      const Size& stdDev = blur.mStdDeviation;
+      if (stdDev.width != 0.0 || stdDev.height != 0.0) {
+        aWrFilters.filters.AppendElement(
+            wr::FilterOp::Blur(stdDev.width, stdDev.height));
+      } else {
+        filterIsNoop = true;
+      }
+    } else if (attr.is<DropShadowAttributes>()) {
+      if (finalClip) {
+        return WrFiltersStatus::BLOB_FALLBACK;
+      }
+
+      const DropShadowAttributes& shadow = attr.as<DropShadowAttributes>();
+
+      const Size& stdDev = shadow.mStdDeviation;
+      if (stdDev.width != stdDev.height) {
+        return WrFiltersStatus::BLOB_FALLBACK;
+      }
+
+      sRGBColor color = shadow.mColor;
+      if (!primNeedsSrgb) {
+        color = FilterWrappers::SRGBToLinearRGB(color);
+      }
+      wr::Shadow wrShadow;
+      wrShadow.offset = {shadow.mOffset.x, shadow.mOffset.y};
+      wrShadow.color = wr::ToColorF(ToDeviceColor(color));
+      wrShadow.blur_radius = stdDev.width;
+      wr::FilterOp filterOp = wr::FilterOp::DropShadow(wrShadow);
+
+      aWrFilters.filters.AppendElement(filterOp);
+    } else if (attr.is<ComponentTransferAttributes>()) {
+      const ComponentTransferAttributes& attributes =
+          attr.as<ComponentTransferAttributes>();
+
+      size_t numValues =
+          attributes.mValues[0].Length() + attributes.mValues[1].Length() +
+          attributes.mValues[2].Length() + attributes.mValues[3].Length();
+      if (numValues > 1024) {
+        return WrFiltersStatus::BLOB_FALLBACK;
+      }
+
+      wr::FilterOp filterOp = {wr::FilterOp::Tag::ComponentTransfer};
+      wr::WrFilterData filterData;
+      aWrFilters.values.AppendElement(nsTArray<float>());
+      nsTArray<float>* values = &aWrFilters.values.LastElement();
+      values->SetCapacity(numValues);
+
+      filterData.funcR_type = FuncTypeToWr(attributes.mTypes[0]);
+      size_t R_startindex = values->Length();
+      values->AppendElements(attributes.mValues[0]);
+      filterData.R_values_count = attributes.mValues[0].Length();
+
+      size_t indexToUse =
+          attributes.mTypes[1] == SVGFEComponentTransferType::SameAsR ? 0 : 1;
+      filterData.funcG_type = FuncTypeToWr(attributes.mTypes[indexToUse]);
+      size_t G_startindex = values->Length();
+      values->AppendElements(attributes.mValues[indexToUse]);
+      filterData.G_values_count = attributes.mValues[indexToUse].Length();
+
+      indexToUse =
+          attributes.mTypes[2] == SVGFEComponentTransferType::SameAsR ? 0 : 2;
+      filterData.funcB_type = FuncTypeToWr(attributes.mTypes[indexToUse]);
+      size_t B_startindex = values->Length();
+      values->AppendElements(attributes.mValues[indexToUse]);
+      filterData.B_values_count = attributes.mValues[indexToUse].Length();
+
+      filterData.funcA_type = FuncTypeToWr(attributes.mTypes[3]);
+      size_t A_startindex = values->Length();
+      values->AppendElements(attributes.mValues[3]);
+      filterData.A_values_count = attributes.mValues[3].Length();
+
+      filterData.R_values =
+          filterData.R_values_count > 0 ? &((*values)[R_startindex]) : nullptr;
+      filterData.G_values =
+          filterData.G_values_count > 0 ? &((*values)[G_startindex]) : nullptr;
+      filterData.B_values =
+          filterData.B_values_count > 0 ? &((*values)[B_startindex]) : nullptr;
+      filterData.A_values =
+          filterData.A_values_count > 0 ? &((*values)[A_startindex]) : nullptr;
+
+      aWrFilters.filters.AppendElement(filterOp);
+      aWrFilters.filter_datas.AppendElement(filterData);
+    } else {
+      return WrFiltersStatus::BLOB_FALLBACK;
+    }
+
+    if (filterIsNoop && !aWrFilters.filters.IsEmpty() &&
+        (aWrFilters.filters.LastElement().tag ==
+             wr::FilterOp::Tag::SrgbToLinear ||
+         aWrFilters.filters.LastElement().tag ==
+             wr::FilterOp::Tag::LinearToSrgb)) {
+      (void)aWrFilters.filters.PopLastElement();
+      srgb = previousSrgb;
+    }
+
+    if (!filterIsNoop) {
+      if (finalClip.isNothing()) {
+        finalClip = Some(primitive.PrimitiveSubregion());
+      } else {
+        finalClip =
+            Some(primitive.PrimitiveSubregion().Intersect(finalClip.value()));
+      }
+    }
+  }
+
+  if (!srgb) {
+    aWrFilters.filters.AppendElement(wr::FilterOp::LinearToSrgb());
+  }
+
+  if (finalClip) {
+    aWrFilters.post_filters_clip =
+        Some(instance.FilterSpaceToFrameSpace(finalClip.value()));
+  }
+  return WrFiltersStatus::CHAIN;
+}
+
+static WrFiltersStatus WrSVGFEInputBuild(wr::FilterOpGraphPictureReference& pic,
+                                         int32_t aSource, int16_t aNodeOutput,
+                                         int16_t aSourceGraphic,
+                                         int16_t aSourceAlpha,
+                                         const int16_t aBufferIdMapping[]) {
+  switch (aSource) {
+    case FilterPrimitiveDescription::kPrimitiveIndexSourceGraphic:
+      pic.buffer_id =
+          wr::FilterOpGraphPictureBufferId::BufferId(aSourceGraphic);
+      break;
+    case FilterPrimitiveDescription::kPrimitiveIndexSourceAlpha:
+      pic.buffer_id = wr::FilterOpGraphPictureBufferId::BufferId(aSourceAlpha);
+      break;
+    case FilterPrimitiveDescription::kPrimitiveIndexFillPaint:
+    case FilterPrimitiveDescription::kPrimitiveIndexStrokePaint:
+      return WrFiltersStatus::BLOB_FALLBACK;
+    default:
+      MOZ_RELEASE_ASSERT(
+          aSource >= 0,
+          "Unrecognized SVG filter primitive enum value - added another?");
+      MOZ_RELEASE_ASSERT(aSource < aNodeOutput,
+                         "Invalid DAG - nodes can only refer to earlier nodes");
+      if (aSource < 0 || aSource >= aNodeOutput) {
+        return WrFiltersStatus::UNSUPPORTED;
+      }
+      pic.buffer_id =
+          wr::FilterOpGraphPictureBufferId::BufferId(aBufferIdMapping[aSource]);
+      break;
+  }
+  return WrFiltersStatus::SVGFE;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEOpacity(
+    WrFiltersHolder& aWrFilters, const wr::FilterOpGraphNode& aGraphNode,
+    const OpacityAttributes& aAttributes) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_opacity()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  float opacity = aAttributes.mOpacity;
+  if (opacity != 1.0f) {
+    aWrFilters.filters.AppendElement(wr::FilterOp::SVGFEOpacity(
+        aGraphNode, wr::PropertyBinding<float>::Value(opacity), opacity));
+  } else {
+    aWrFilters.filters.AppendElement(wr::FilterOp::SVGFEIdentity(aGraphNode));
+  }
+  return WrFiltersStatus::SVGFE;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEToAlpha(
+    WrFiltersHolder& aWrFilters, const wr::FilterOpGraphNode& aGraphNode,
+    const ToAlphaAttributes& aAttributes) {
+  // Convert a color image to an alpha channel - internal use; generated by
+  if (!StaticPrefs::GetPrefName_gfx_webrender_svg_filter_effects_toalpha()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  aWrFilters.filters.AppendElement(wr::FilterOp::SVGFEToAlpha(aGraphNode));
+  return WrFiltersStatus::SVGFE;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEBlend(
+    WrFiltersHolder& aWrFilters, const wr::FilterOpGraphNode& aGraphNode,
+    const BlendAttributes& aAttributes) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_feblend()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  switch (aAttributes.mBlendMode) {
+    case SVGFEBlendMode::Color:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEBlendColor(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFEBlendMode::ColorBurn:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEBlendColorBurn(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFEBlendMode::ColorDodge:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEBlendColorDodge(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFEBlendMode::Darken:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEBlendDarken(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFEBlendMode::Difference:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEBlendDifference(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFEBlendMode::Exclusion:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEBlendExclusion(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFEBlendMode::HardLight:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEBlendHardLight(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFEBlendMode::Hue:
+      aWrFilters.filters.AppendElement(wr::FilterOp::SVGFEBlendHue(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFEBlendMode::Lighten:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEBlendLighten(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFEBlendMode::Luminosity:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEBlendLuminosity(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFEBlendMode::Multiply:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEBlendMultiply(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFEBlendMode::Normal:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEBlendNormal(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFEBlendMode::Overlay:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEBlendOverlay(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFEBlendMode::Saturation:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEBlendSaturation(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFEBlendMode::Screen:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEBlendScreen(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFEBlendMode::SoftLight:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEBlendSoftLight(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    default:
+      break;
+  }
+  MOZ_CRASH("Unrecognized SVG_FEBLEND_MODE");
+  return WrFiltersStatus::BLOB_FALLBACK;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEComposite(
+    WrFiltersHolder& aWrFilters, const wr::FilterOpGraphNode& aGraphNode,
+    const CompositeAttributes& aAttributes) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_fecomposite()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  switch (aAttributes.mOperator) {
+    case SVGFECompositeOperator::Arithmetic:
+      aWrFilters.filters.AppendElement(wr::FilterOp::SVGFECompositeArithmetic(
+          aGraphNode, aAttributes.mCoefficients[0],
+          aAttributes.mCoefficients[1], aAttributes.mCoefficients[2],
+          aAttributes.mCoefficients[3]));
+      return WrFiltersStatus::SVGFE;
+    case SVGFECompositeOperator::Atop:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFECompositeATop(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFECompositeOperator::In:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFECompositeIn(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFECompositeOperator::Lighter:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFECompositeLighter(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFECompositeOperator::Out:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFECompositeOut(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFECompositeOperator::Over:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFECompositeOver(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    case SVGFECompositeOperator::Xor:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFECompositeXOR(aGraphNode));
+      return WrFiltersStatus::SVGFE;
+    default:
+      break;
+  }
+  MOZ_CRASH("Unrecognized SVG_FECOMPOSITE_OPERATOR");
+  return WrFiltersStatus::BLOB_FALLBACK;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEColorMatrix(
+    WrFiltersHolder& aWrFilters, wr::FilterOpGraphNode& aGraphNode,
+    const ColorMatrixAttributes& aAttributes) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_fecolormatrix()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  float transposed[20];
+  if (gfx::ComputeColorMatrix(aAttributes, transposed)) {
+    float matrix[20] = {
+        transposed[0], transposed[5], transposed[10], transposed[15],
+        transposed[1], transposed[6], transposed[11], transposed[16],
+        transposed[2], transposed[7], transposed[12], transposed[17],
+        transposed[3], transposed[8], transposed[13], transposed[18],
+        transposed[4], transposed[9], transposed[14], transposed[19]};
+    aWrFilters.filters.AppendElement(
+        wr::FilterOp::SVGFEColorMatrix(aGraphNode, matrix));
+  } else {
+    aWrFilters.filters.AppendElement(wr::FilterOp::SVGFEIdentity(aGraphNode));
+  }
+  return WrFiltersStatus::SVGFE;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEComponentTransfer(
+    WrFiltersHolder& aWrFilters, wr::FilterOpGraphNode& aGraphNode,
+    const ComponentTransferAttributes& aAttributes) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_fecomponenttransfer()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  static constexpr size_t kStops = 256;
+
+  aWrFilters.values.AppendElement(nsTArray<float>());
+  nsTArray<float>& values = aWrFilters.values.LastElement();
+  values.SetCapacity(kStops * 4);
+
+  wr::WrFilterData filterData{};
+  filterData.funcR_type =
+      aAttributes.mTypes[0] != SVGFEComponentTransferType::Discrete
+          ? mozilla::wr::ComponentTransferFuncType::Table
+          : mozilla::wr::ComponentTransferFuncType::Discrete;
+  filterData.funcG_type =
+      aAttributes.mTypes[1] != SVGFEComponentTransferType::Discrete
+          ? mozilla::wr::ComponentTransferFuncType::Table
+          : mozilla::wr::ComponentTransferFuncType::Discrete;
+  filterData.funcB_type =
+      aAttributes.mTypes[2] != SVGFEComponentTransferType::Discrete
+          ? mozilla::wr::ComponentTransferFuncType::Table
+          : mozilla::wr::ComponentTransferFuncType::Discrete;
+  filterData.funcA_type =
+      aAttributes.mTypes[3] != SVGFEComponentTransferType::Discrete
+          ? mozilla::wr::ComponentTransferFuncType::Table
+          : mozilla::wr::ComponentTransferFuncType::Discrete;
+
+  values.SetLength(kStops * 4);
+  filterData.R_values = &(values[0]);
+  filterData.R_values_count = kStops;
+  filterData.G_values = &(values[kStops]);
+  filterData.G_values_count = kStops;
+  filterData.B_values = &(values[kStops * 2]);
+  filterData.B_values_count = kStops;
+  filterData.A_values = &(values[kStops * 3]);
+  filterData.A_values_count = kStops;
+
+  for (size_t c = 0; c < 4; c++) {
+    auto f = aAttributes.mTypes[c];
+    if (aAttributes.mValues[c].IsEmpty() &&
+        f != SVGFEComponentTransferType::SameAsR) {
+      f = SVGFEComponentTransferType::Identity;
+    }
+    if (c == 0 && f == SVGFEComponentTransferType::SameAsR) {
+      f = SVGFEComponentTransferType::Identity;
+    }
+    switch (f) {
+      case SVGFEComponentTransferType::Discrete: {
+        size_t length = (size_t)aAttributes.mValues[c].Length();
+        size_t length1 = length - 1;
+        float step = (float)length / (float)kStops;
+        for (size_t i = 0; i < kStops; i++) {
+          float kf = (float)i * step;
+          float floorkf = std::floor(kf);
+          size_t k = std::min((size_t)floorkf, length1);
+          float v = aAttributes.mValues[c][k];
+          values[i * 4 + c] = std::clamp(v, 0.0f, 1.0f);
+        }
+        break;
+      }
+      case SVGFEComponentTransferType::Gamma: {
+        float step = 1.0f / (float)(kStops - 1);
+        float amplitude = aAttributes.mValues[c][0];
+        float exponent = aAttributes.mValues[c][1];
+        float offset = aAttributes.mValues[c][2];
+        for (size_t i = 0; i < kStops; i++) {
+          float v = amplitude * pow((float)i * step, exponent) + offset;
+          values[i * 4 + c] = std::clamp(v, 0.0f, 1.0f);
+        }
+        break;
+      }
+      case SVGFEComponentTransferType::Identity: {
+        float step = 1.0f / (float)(kStops - 1);
+        for (size_t i = 0; i < kStops; i++) {
+          float v = (float)i * step;
+          values[i * 4 + c] = std::clamp(v, 0.0f, 1.0f);
+        }
+        break;
+      }
+      case SVGFEComponentTransferType::Linear: {
+        float step = aAttributes.mValues[c][0] / (float)(kStops - 1);
+        float intercept = aAttributes.mValues[c][1];
+        for (size_t i = 0; i < kStops; i++) {
+          float v = (float)i * step + intercept;
+          values[i * 4 + c] = std::clamp(v, 0.0f, 1.0f);
+        }
+        break;
+      }
+      case SVGFEComponentTransferType::Table: {
+        size_t length1 = (size_t)aAttributes.mValues[c].Length() - 1;
+        float step = (float)length1 / (float)(kStops - 1);
+        for (size_t i = 0; i < kStops; i++) {
+          float kf = (float)i * step;
+          float floorkf = floor(kf);
+          size_t k = std::min((size_t)floorkf, length1);
+          float v1 = aAttributes.mValues[c][k];
+          float v2 = aAttributes.mValues[c][(k + 1 <= length1) ? k + 1 : k];
+          float v = v1 + (v2 - v1) * (kf - floorkf);
+          values[i * 4 + c] = std::clamp(v, 0.0f, 1.0f);
+        }
+        break;
+      }
+      case SVGFEComponentTransferType::SameAsR: {
+        for (size_t i = 0; i < kStops; i++) {
+          values[i * 4 + c] = values[i * 4];
+        }
+        break;
+      }
+      default: {
+        MOZ_CRASH("Unrecognized feComponentTransfer type");
+        return WrFiltersStatus::BLOB_FALLBACK;
+      }
+    }
+  }
+  aWrFilters.filters.AppendElement(
+      wr::FilterOp::SVGFEComponentTransfer(aGraphNode));
+  aWrFilters.filter_datas.AppendElement(filterData);
+  return WrFiltersStatus::SVGFE;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEConvolveMatrix(
+    WrFiltersHolder& aWrFilters, wr::FilterOpGraphNode& aGraphNode,
+    const ConvolveMatrixAttributes& aAttributes) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_feconvolvematrix()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  static constexpr int32_t width = 5;
+  static constexpr int32_t height = 5;
+  if (aAttributes.mKernelSize.Width() < 1 ||
+      aAttributes.mKernelSize.Width() > width ||
+      aAttributes.mKernelSize.Height() < 1 ||
+      aAttributes.mKernelSize.Height() > height ||
+      (size_t)aAttributes.mKernelSize.Width() *
+              (size_t)aAttributes.mKernelSize.Height() >
+          width * height) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  if (aAttributes.mKernelMatrix.Length() <
+      (size_t)aAttributes.mKernelSize.Width() *
+          (size_t)aAttributes.mKernelSize.Height()) {
+    return WrFiltersStatus::UNSUPPORTED;
+  }
+  float matrix[width * height];
+  for (size_t y = 0; y < height; y++) {
+    for (size_t x = 0; x < width; x++) {
+      if (x < (size_t)aAttributes.mKernelSize.Width() &&
+          y < (size_t)aAttributes.mKernelSize.Height()) {
+        matrix[y * width + x] =
+            aAttributes.mKernelMatrix[y * aAttributes.mKernelSize.Width() + x];
+      } else {
+        matrix[y * width + x] = 0.0f;
+      }
+    }
+  }
+  switch (aAttributes.mEdgeMode) {
+    case SVGEdgeMode::Unknown:
+    case SVGEdgeMode::Duplicate:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEConvolveMatrixEdgeModeDuplicate(
+              aGraphNode, aAttributes.mKernelSize.Width(),
+              aAttributes.mKernelSize.Height(), matrix, aAttributes.mDivisor,
+              aAttributes.mBias, aAttributes.mTarget.x.value,
+              aAttributes.mTarget.y.value,
+              aAttributes.mKernelUnitLength.Width(),
+              aAttributes.mKernelUnitLength.Height(),
+              aAttributes.mPreserveAlpha));
+      return WrFiltersStatus::SVGFE;
+    case SVGEdgeMode::None:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEConvolveMatrixEdgeModeNone(
+              aGraphNode, aAttributes.mKernelSize.Width(),
+              aAttributes.mKernelSize.Height(), matrix, aAttributes.mDivisor,
+              aAttributes.mBias, aAttributes.mTarget.x.value,
+              aAttributes.mTarget.y.value,
+              aAttributes.mKernelUnitLength.Width(),
+              aAttributes.mKernelUnitLength.Height(),
+              aAttributes.mPreserveAlpha));
+      return WrFiltersStatus::SVGFE;
+    case SVGEdgeMode::Wrap:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEConvolveMatrixEdgeModeWrap(
+              aGraphNode, aAttributes.mKernelSize.Width(),
+              aAttributes.mKernelSize.Height(), matrix, aAttributes.mDivisor,
+              aAttributes.mBias, aAttributes.mTarget.x.value,
+              aAttributes.mTarget.y.value,
+              aAttributes.mKernelUnitLength.Width(),
+              aAttributes.mKernelUnitLength.Height(),
+              aAttributes.mPreserveAlpha));
+      return WrFiltersStatus::SVGFE;
+    default:
+      break;
+  }
+  MOZ_CRASH("Unrecognized SVG_EDGEMODE");
+  return WrFiltersStatus::BLOB_FALLBACK;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEDiffuseLighting(
+    WrFiltersHolder& aWrFilters, wr::FilterOpGraphNode& aGraphNode,
+    const DiffuseLightingAttributes& aAttributes,
+    const LayoutDevicePoint& aUserspaceOffset) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_fediffuselighting()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  switch (aAttributes.mLightType) {
+    case LightType::Distant:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFEDiffuseLightingDistant(
+              aGraphNode, aAttributes.mSurfaceScale,
+              aAttributes.mLightingConstant,
+              aAttributes.mKernelUnitLength.width,
+              aAttributes.mKernelUnitLength.height, aAttributes.mLightValues[0],
+              aAttributes.mLightValues[1]));
+      return WrFiltersStatus::SVGFE;
+    case LightType::Point:
+      aWrFilters.filters.AppendElement(wr::FilterOp::SVGFEDiffuseLightingPoint(
+          aGraphNode, aAttributes.mSurfaceScale, aAttributes.mLightingConstant,
+          aAttributes.mKernelUnitLength.width,
+          aAttributes.mKernelUnitLength.height,
+          aAttributes.mLightValues[0] + aUserspaceOffset.x.value,
+          aAttributes.mLightValues[1] + aUserspaceOffset.y.value,
+          aAttributes.mLightValues[2]));
+      return WrFiltersStatus::SVGFE;
+    case LightType::Spot:
+      aWrFilters.filters.AppendElement(wr::FilterOp::SVGFEDiffuseLightingSpot(
+          aGraphNode, aAttributes.mSurfaceScale, aAttributes.mLightingConstant,
+          aAttributes.mKernelUnitLength.width,
+          aAttributes.mKernelUnitLength.height,
+          aAttributes.mLightValues[0] + aUserspaceOffset.x.value,
+          aAttributes.mLightValues[1] + aUserspaceOffset.y.value,
+          aAttributes.mLightValues[2],
+          aAttributes.mLightValues[3] + aUserspaceOffset.x.value,
+          aAttributes.mLightValues[4] + aUserspaceOffset.y.value,
+          aAttributes.mLightValues[5], aAttributes.mLightValues[6],
+          aAttributes.mLightValues[7]));
+      return WrFiltersStatus::SVGFE;
+    case LightType::None:
+    case LightType::Max:
+      break;
+  }
+  MOZ_CRASH("Unrecognized LightType");
+  return WrFiltersStatus::BLOB_FALLBACK;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEDisplacementMap(
+    WrFiltersHolder& aWrFilters, wr::FilterOpGraphNode& aGraphNode,
+    const DisplacementMapAttributes& aAttributes) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_fedisplacementmap()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  aWrFilters.filters.AppendElement(wr::FilterOp::SVGFEDisplacementMap(
+      aGraphNode, aAttributes.mScale,
+      static_cast<uint32_t>(aAttributes.mXChannel),
+      static_cast<uint32_t>(aAttributes.mYChannel)));
+  return WrFiltersStatus::SVGFE;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEDropShadow(
+    WrFiltersHolder& aWrFilters, wr::FilterOpGraphNode& aGraphNode,
+    const DropShadowAttributes& aAttributes) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_fedropshadow()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  aWrFilters.filters.AppendElement(wr::FilterOp::SVGFEDropShadow(
+      aGraphNode, wr::ToColorF(ToDeviceColor(aAttributes.mColor)),
+      aAttributes.mOffset.x, aAttributes.mOffset.y,
+      aAttributes.mStdDeviation.width, aAttributes.mStdDeviation.height));
+  return WrFiltersStatus::SVGFE;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEFlood(
+    WrFiltersHolder& aWrFilters, wr::FilterOpGraphNode& aGraphNode,
+    const FloodAttributes& aAttributes) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_feflood()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  aWrFilters.filters.AppendElement(wr::FilterOp::SVGFEFlood(
+      aGraphNode, wr::ToColorF(ToDeviceColor(aAttributes.mColor))));
+  return WrFiltersStatus::SVGFE;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEGaussianBlur(
+    WrFiltersHolder& aWrFilters, wr::FilterOpGraphNode& aGraphNode,
+    const GaussianBlurAttributes& aAttributes) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_fegaussianblur()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  aWrFilters.filters.AppendElement(wr::FilterOp::SVGFEGaussianBlur(
+      aGraphNode, aAttributes.mStdDeviation.width,
+      aAttributes.mStdDeviation.height));
+  return WrFiltersStatus::SVGFE;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEImage(
+    WrFiltersHolder& aWrFilters, wr::FilterOpGraphNode& aGraphNode,
+    const ImageAttributes& aAttributes,
+    const LayoutDevicePoint& aUserspaceOffset) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_feimage()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  float matrix[6];
+  matrix[0] = aAttributes.mTransform.components[0];
+  matrix[1] = aAttributes.mTransform.components[1];
+  matrix[2] = aAttributes.mTransform.components[2];
+  matrix[3] = aAttributes.mTransform.components[3];
+  matrix[4] = aAttributes.mTransform.components[4] + aUserspaceOffset.x.value;
+  matrix[5] = aAttributes.mTransform.components[5] + aUserspaceOffset.y.value;
+  aWrFilters.filters.AppendElement(
+      wr::FilterOp::SVGFEImage(aGraphNode, aAttributes.mFilter, matrix));
+  return WrFiltersStatus::SVGFE;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEMerge(
+    WrFiltersHolder& aWrFilters, wr::FilterOpGraphNode& aGraphNode,
+    const MergeAttributes& aAttributes, FilterPrimitiveDescription& aPrimitive,
+    int16_t aNodeOutput, int16_t aSourceGraphic, int16_t aSourceAlpha,
+    const int16_t aBufferIdMapping[], size_t aMaxFilters) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_femerge()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  if (aPrimitive.NumberOfInputs() >= 2) {
+    wr::FilterOpGraphPictureReference previous{};
+    for (size_t index = 0; index < aPrimitive.NumberOfInputs(); index++) {
+      wr::FilterOpGraphPictureReference current{};
+      WrFiltersStatus status = WrSVGFEInputBuild(
+          current, aPrimitive.InputPrimitiveIndex(index), aNodeOutput,
+          aSourceGraphic, aSourceAlpha, aBufferIdMapping);
+      if (status != WrFiltersStatus::SVGFE) {
+        return status;
+      }
+      aGraphNode.input = current;
+      aGraphNode.input2 = previous;
+      if (aWrFilters.filters.Length() >= aMaxFilters) {
+        return WrFiltersStatus::DISABLED_FOR_PERFORMANCE;
+      }
+      if (index >= 1) {
+        aWrFilters.filters.AppendElement(
+            wr::FilterOp::SVGFECompositeOver(aGraphNode));
+        previous.buffer_id = wr::FilterOpGraphPictureBufferId::BufferId(
+            (int16_t)(aWrFilters.filters.Length() - 1));
+      } else {
+        previous.buffer_id = current.buffer_id;
+      }
+    }
+  } else if (aPrimitive.NumberOfInputs() == 1) {
+    aWrFilters.filters.AppendElement(wr::FilterOp::SVGFEIdentity(aGraphNode));
+  } else {
+    wr::ColorF blank = {0.0f, 0.0f, 0.0f, 0.0f};
+    aWrFilters.filters.AppendElement(
+        wr::FilterOp::SVGFEFlood(aGraphNode, blank));
+  }
+  return WrFiltersStatus::SVGFE;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEMorphology(
+    WrFiltersHolder& aWrFilters, wr::FilterOpGraphNode& aGraphNode,
+    const MorphologyAttributes& aAttributes) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_femorphology()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  switch (aAttributes.mOperator) {
+    case SVGMorphologyOperator::Dilate:
+      aWrFilters.filters.AppendElement(wr::FilterOp::SVGFEMorphologyDilate(
+          aGraphNode, aAttributes.mRadii.width, aAttributes.mRadii.height));
+      return WrFiltersStatus::SVGFE;
+    case SVGMorphologyOperator::Erode:
+      aWrFilters.filters.AppendElement(wr::FilterOp::SVGFEMorphologyErode(
+          aGraphNode, aAttributes.mRadii.width, aAttributes.mRadii.height));
+      return WrFiltersStatus::SVGFE;
+    default:
+      break;
+  }
+  MOZ_CRASH("Unrecognized SVG_OPERATOR");
+  return WrFiltersStatus::BLOB_FALLBACK;
+}
+
+static WrFiltersStatus WrFilterOpSVGFEOffset(
+    WrFiltersHolder& aWrFilters, wr::FilterOpGraphNode& aGraphNode,
+    const OffsetAttributes& aAttributes) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_feoffset()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  aWrFilters.filters.AppendElement(wr::FilterOp::SVGFEOffset(
+      aGraphNode, (float)aAttributes.mValue.x, (float)aAttributes.mValue.y));
+  return WrFiltersStatus::SVGFE;
+}
+
+static WrFiltersStatus WrFilterOpSVGFETile(WrFiltersHolder& aWrFilters,
+                                           wr::FilterOpGraphNode& aGraphNode,
+                                           const TileAttributes& aAttributes) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_fetile()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  aWrFilters.filters.AppendElement(wr::FilterOp::SVGFETile(aGraphNode));
+  return WrFiltersStatus::SVGFE;
+}
+
+static WrFiltersStatus WrFilterOpSVGFESpecularLighting(
+    WrFiltersHolder& aWrFilters, wr::FilterOpGraphNode& aGraphNode,
+    const SpecularLightingAttributes& aAttributes,
+    const LayoutDevicePoint& aUserspaceOffset) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_fespecularlighting()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  switch (aAttributes.mLightType) {
+    case LightType::Distant:
+      aWrFilters.filters.AppendElement(
+          wr::FilterOp::SVGFESpecularLightingDistant(
+              aGraphNode, aAttributes.mSurfaceScale,
+              aAttributes.mLightingConstant, aAttributes.mSpecularExponent,
+              aAttributes.mKernelUnitLength.width,
+              aAttributes.mKernelUnitLength.height, aAttributes.mLightValues[0],
+              aAttributes.mLightValues[1]));
+      return WrFiltersStatus::SVGFE;
+    case LightType::Point:
+      aWrFilters.filters.AppendElement(wr::FilterOp::SVGFESpecularLightingPoint(
+          aGraphNode, aAttributes.mSurfaceScale, aAttributes.mLightingConstant,
+          aAttributes.mSpecularExponent, aAttributes.mKernelUnitLength.width,
+          aAttributes.mKernelUnitLength.height,
+          aAttributes.mLightValues[0] + aUserspaceOffset.x.value,
+          aAttributes.mLightValues[1] + aUserspaceOffset.y.value,
+          aAttributes.mLightValues[2]));
+      return WrFiltersStatus::SVGFE;
+    case LightType::Spot:
+      aWrFilters.filters.AppendElement(wr::FilterOp::SVGFESpecularLightingSpot(
+          aGraphNode, aAttributes.mSurfaceScale, aAttributes.mLightingConstant,
+          aAttributes.mSpecularExponent, aAttributes.mKernelUnitLength.width,
+          aAttributes.mKernelUnitLength.height,
+          aAttributes.mLightValues[0] + aUserspaceOffset.x.value,
+          aAttributes.mLightValues[1] + aUserspaceOffset.y.value,
+          aAttributes.mLightValues[2],
+          aAttributes.mLightValues[3] + aUserspaceOffset.x.value,
+          aAttributes.mLightValues[4] + aUserspaceOffset.y.value,
+          aAttributes.mLightValues[5], aAttributes.mLightValues[6],
+          aAttributes.mLightValues[7]));
+      return WrFiltersStatus::SVGFE;
+    case LightType::None:
+    case LightType::Max:
+      break;
+  }
+  MOZ_CRASH("Unrecognized LightType");
+  return WrFiltersStatus::BLOB_FALLBACK;
+}
+
+static WrFiltersStatus WrFilterOpSVGFETurbulence(
+    WrFiltersHolder& aWrFilters, wr::FilterOpGraphNode& aGraphNode,
+    const TurbulenceAttributes& aAttributes,
+    const LayoutDevicePoint& aUserspaceOffset) {
+  if (!StaticPrefs::gfx_webrender_svg_filter_effects_feturbulence()) {
+    return WrFiltersStatus::BLOB_FALLBACK;
+  }
+  int32_t m1 = 2147483647 - 1;
+  int32_t seed = (int32_t)((uint32_t)aAttributes.mSeed);
+  if (seed <= 0) {
+    seed = -(seed % m1) + 1;
+  }
+  if (seed > m1) {
+    seed = m1;
+  }
+  switch (aAttributes.mType) {
+    case SVGTurbulenceType::FractalNoise:
+      if (aAttributes.mStitchable) {
+        aWrFilters.filters.AppendElement(
+            wr::FilterOp::SVGFETurbulenceWithFractalNoiseWithStitching(
+                aGraphNode, aAttributes.mBaseFrequency.width,
+                aAttributes.mBaseFrequency.height, aAttributes.mOctaves, seed));
+      } else {
+        aWrFilters.filters.AppendElement(
+            wr::FilterOp::SVGFETurbulenceWithFractalNoiseWithNoStitching(
+                aGraphNode, aAttributes.mBaseFrequency.width,
+                aAttributes.mBaseFrequency.height, aAttributes.mOctaves, seed));
+      }
+      return WrFiltersStatus::SVGFE;
+    case SVGTurbulenceType::Turbulence:
+      if (aAttributes.mStitchable) {
+        aWrFilters.filters.AppendElement(
+            wr::FilterOp::SVGFETurbulenceWithTurbulenceNoiseWithStitching(
+                aGraphNode, aAttributes.mBaseFrequency.width,
+                aAttributes.mBaseFrequency.height, aAttributes.mOctaves, seed));
+      } else {
+        aWrFilters.filters.AppendElement(
+            wr::FilterOp::SVGFETurbulenceWithTurbulenceNoiseWithNoStitching(
+                aGraphNode, aAttributes.mBaseFrequency.width,
+                aAttributes.mBaseFrequency.height, aAttributes.mOctaves, seed));
+      }
+      return WrFiltersStatus::SVGFE;
+    default:
+      break;
+  }
+  MOZ_CRASH("Unrecognized SVG_TURBULENCE_TYPE");
+  return WrFiltersStatus::BLOB_FALLBACK;
+}
+
+WrFiltersStatus FilterInstance::BuildWebRenderSVGFiltersImpl(
+    nsIFrame* aFilteredFrame, Span<const StyleFilter> aFilters,
+    StyleFilterType aStyleFilterType, WrFiltersHolder& aWrFilters,
+    const nsPoint& aOffsetForSVGFilters) {
+  aWrFilters.filters.Clear();
+  aWrFilters.filter_datas.Clear();
+  aWrFilters.values.Clear();
+  aWrFilters.post_filters_clip = Nothing();
+
+  nsIFrame* firstFrame =
+      nsLayoutUtils::FirstContinuationOrIBSplitSibling(aFilteredFrame);
+
+  nsTArray<SVGFilterFrame*> filterFrames;
+  if (SVGObserverUtils::GetAndObserveFilters(firstFrame, &filterFrames,
+                                             aStyleFilterType) ==
+      SVGObserverUtils::ReferenceState::HasRefsSomeInvalid) {
+    return WrFiltersStatus::UNSUPPORTED;
+  }
+
+  std::unique_ptr<UserSpaceMetrics> metrics =
+      UserSpaceMetricsForFrame(firstFrame);
+
+  gfxRect filterSpaceBoundsNotSnapped;
+
+  gfxMatrix scaleMatrix;
+  gfxMatrix scaleMatrixInDevUnits =
+      scaleMatrix * SVGUtils::GetCSSPxToDevPxMatrix(firstFrame);
+
+  FilterInstance instance(firstFrame, firstFrame->GetContent(), *metrics,
+                          aFilters, filterFrames,  true,
+                          nullptr, scaleMatrixInDevUnits, nullptr, nullptr,
+                          nullptr, nullptr, &filterSpaceBoundsNotSnapped);
+
+  if (!instance.IsInitialized()) {
+    return WrFiltersStatus::UNSUPPORTED;
+  }
+
+  if (instance.mFilterDescription.mPrimitives.Length() >
+      StaticPrefs::gfx_webrender_max_filter_ops_per_chain()) {
+    return WrFiltersStatus::DISABLED_FOR_PERFORMANCE;
+  }
+
+  static constexpr size_t maxFilters = wr::SVGFE_GRAPH_MAX;
+  int16_t bufferIdMapping[maxFilters];
+  if (instance.mFilterDescription.mPrimitives.Length() > maxFilters) {
+    return WrFiltersStatus::DISABLED_FOR_PERFORMANCE;
+  }
+
+  LayoutDevicePoint userspaceOffset = LayoutDevicePoint::FromAppUnits(
+      aOffsetForSVGFilters,
+      aFilteredFrame->PresContext()->AppUnitsPerDevPixel());
+
+  wr::LayoutRect filterRegion = {
+      {(float)(filterSpaceBoundsNotSnapped.TopLeft().x +
+               userspaceOffset.x.value),
+       (float)(filterSpaceBoundsNotSnapped.TopLeft().y +
+               userspaceOffset.y.value)},
+      {(float)(filterSpaceBoundsNotSnapped.BottomRight().x +
+               userspaceOffset.x.value),
+       (float)(filterSpaceBoundsNotSnapped.BottomRight().y +
+               userspaceOffset.y.value)}};
+
+  auto sourceGraphicNode = (int16_t)aWrFilters.filters.Length();
+  auto sourceNode = wr::FilterOpGraphNode{};
+  sourceNode.subregion = filterRegion;
+  aWrFilters.filters.AppendElement(
+      wr::FilterOp::SVGFESourceGraphic(sourceNode));
+  auto sourceAlphaNode = (int16_t)aWrFilters.filters.Length();
+  aWrFilters.filters.AppendElement(wr::FilterOp::SVGFESourceAlpha(sourceNode));
+
+  WrFiltersStatus status = WrFiltersStatus::SVGFE;
+
+  for (uint32_t i = 0; i < instance.mFilterDescription.mPrimitives.Length();
+       i++) {
+    const auto& primitive = instance.mFilterDescription.mPrimitives[i];
+    const PrimitiveAttributes& attr = primitive.Attributes();
+    const bool linear = primitive.OutputColorSpace() == ColorSpace::LinearRGB;
+    const size_t inputs = primitive.NumberOfInputs();
+    wr::FilterOpGraphNode graphNode = wr::FilterOpGraphNode{};
+    graphNode.linear = linear;
+    graphNode.subregion =
+        wr::ToLayoutRect(Rect(primitive.PrimitiveSubregion()) +
+                         userspaceOffset.ToUnknownPoint());
+    if (i == instance.mFilterDescription.mPrimitives.Length() - 1) {
+      if (graphNode.subregion.min.x < filterRegion.min.x) {
+        graphNode.subregion.min.x = filterRegion.min.x;
+      }
+      if (graphNode.subregion.min.y < filterRegion.min.y) {
+        graphNode.subregion.min.y = filterRegion.min.y;
+      }
+      if (graphNode.subregion.max.x > filterRegion.max.x) {
+        graphNode.subregion.max.x = filterRegion.max.x;
+      }
+      if (graphNode.subregion.max.y > filterRegion.max.y) {
+        graphNode.subregion.max.y = filterRegion.max.y;
+      }
+    }
+
+    graphNode.input.buffer_id = wr::FilterOpGraphPictureBufferId::None();
+    graphNode.input2.buffer_id = wr::FilterOpGraphPictureBufferId::None();
+    if (inputs >= 1) {
+      status = WrSVGFEInputBuild(
+          graphNode.input, primitive.InputPrimitiveIndex(0), (int16_t)i,
+          sourceGraphicNode, sourceAlphaNode, bufferIdMapping);
+      if (status != WrFiltersStatus::SVGFE) {
+        break;
+      }
+      if (inputs >= 2) {
+        status = WrSVGFEInputBuild(
+            graphNode.input2, primitive.InputPrimitiveIndex(1), (int16_t)i,
+            sourceGraphicNode, sourceAlphaNode, bufferIdMapping);
+        if (status != WrFiltersStatus::SVGFE) {
+          break;
+        }
+      }
+    }
+
+    if (aWrFilters.filters.Length() >= maxFilters) {
+      status = WrFiltersStatus::DISABLED_FOR_PERFORMANCE;
+      break;
+    }
+
+    if (attr.is<OpacityAttributes>()) {
+      status = WrFilterOpSVGFEOpacity(aWrFilters, graphNode,
+                                      attr.as<OpacityAttributes>());
+    } else if (attr.is<ToAlphaAttributes>()) {
+      status = WrFilterOpSVGFEToAlpha(aWrFilters, graphNode,
+                                      attr.as<ToAlphaAttributes>());
+    } else if (attr.is<BlendAttributes>()) {
+      status = WrFilterOpSVGFEBlend(aWrFilters, graphNode,
+                                    attr.as<BlendAttributes>());
+    } else if (attr.is<ColorMatrixAttributes>()) {
+      status = WrFilterOpSVGFEColorMatrix(aWrFilters, graphNode,
+                                          attr.as<ColorMatrixAttributes>());
+    } else if (attr.is<ComponentTransferAttributes>()) {
+      status = WrFilterOpSVGFEComponentTransfer(
+          aWrFilters, graphNode, attr.as<ComponentTransferAttributes>());
+    } else if (attr.is<CompositeAttributes>()) {
+      status = WrFilterOpSVGFEComposite(aWrFilters, graphNode,
+                                        attr.as<CompositeAttributes>());
+    } else if (attr.is<ConvolveMatrixAttributes>()) {
+      status = WrFilterOpSVGFEConvolveMatrix(
+          aWrFilters, graphNode, attr.as<ConvolveMatrixAttributes>());
+    } else if (attr.is<DiffuseLightingAttributes>()) {
+      status = WrFilterOpSVGFEDiffuseLighting(
+          aWrFilters, graphNode, attr.as<DiffuseLightingAttributes>(),
+          userspaceOffset);
+    } else if (attr.is<DisplacementMapAttributes>()) {
+      status = WrFilterOpSVGFEDisplacementMap(
+          aWrFilters, graphNode, attr.as<DisplacementMapAttributes>());
+    } else if (attr.is<DropShadowAttributes>()) {
+      status = WrFilterOpSVGFEDropShadow(aWrFilters, graphNode,
+                                         attr.as<DropShadowAttributes>());
+    } else if (attr.is<FloodAttributes>()) {
+      status = WrFilterOpSVGFEFlood(aWrFilters, graphNode,
+                                    attr.as<FloodAttributes>());
+    } else if (attr.is<GaussianBlurAttributes>()) {
+      status = WrFilterOpSVGFEGaussianBlur(aWrFilters, graphNode,
+                                           attr.as<GaussianBlurAttributes>());
+    } else if (attr.is<ImageAttributes>()) {
+      status = WrFilterOpSVGFEImage(
+          aWrFilters, graphNode, attr.as<ImageAttributes>(), userspaceOffset);
+    } else if (attr.is<MergeAttributes>()) {
+      status = WrFilterOpSVGFEMerge(
+          aWrFilters, graphNode, attr.as<MergeAttributes>(),
+          instance.mFilterDescription.mPrimitives[i], (int16_t)i,
+          sourceGraphicNode, sourceAlphaNode, bufferIdMapping, maxFilters);
+    } else if (attr.is<MorphologyAttributes>()) {
+      status = WrFilterOpSVGFEMorphology(aWrFilters, graphNode,
+                                         attr.as<MorphologyAttributes>());
+    } else if (attr.is<OffsetAttributes>()) {
+      status = WrFilterOpSVGFEOffset(aWrFilters, graphNode,
+                                     attr.as<OffsetAttributes>());
+    } else if (attr.is<SpecularLightingAttributes>()) {
+      status = WrFilterOpSVGFESpecularLighting(
+          aWrFilters, graphNode, attr.as<SpecularLightingAttributes>(),
+          userspaceOffset);
+    } else if (attr.is<TileAttributes>()) {
+      status =
+          WrFilterOpSVGFETile(aWrFilters, graphNode, attr.as<TileAttributes>());
+    } else if (attr.is<TurbulenceAttributes>()) {
+      status = WrFilterOpSVGFETurbulence(aWrFilters, graphNode,
+                                         attr.as<TurbulenceAttributes>(),
+                                         userspaceOffset);
+    } else {
+      status = WrFiltersStatus::BLOB_FALLBACK;
+    }
+    if (status != WrFiltersStatus::SVGFE) {
+      break;
+    }
+    bufferIdMapping[i] = (int16_t)(aWrFilters.filters.Length() - 1);
+  }
+  if (status != WrFiltersStatus::SVGFE) {
+    aWrFilters.filters.Clear();
+    aWrFilters.filter_datas.Clear();
+    aWrFilters.values.Clear();
+    aWrFilters.post_filters_clip = Nothing();
+  }
+  return status;
+}
+
+nsRegion FilterInstance::GetPreFilterNeededArea(
+    nsIFrame* aFilteredFrame, const nsTArray<SVGFilterFrame*>& aFilterFrames,
+    const nsRegion& aPostFilterDirtyRegion) {
+  gfxMatrix tm = SVGUtils::GetCanvasTM(aFilteredFrame);
+  auto filterChain = aFilteredFrame->StyleEffects()->mFilters.AsSpan();
+  std::unique_ptr<UserSpaceMetrics> metrics =
+      UserSpaceMetricsForFrame(aFilteredFrame);
+  FilterInstance instance(aFilteredFrame, aFilteredFrame->GetContent(),
+                          *metrics, filterChain, aFilterFrames,
+                           true, nullptr, tm,
+                          &aPostFilterDirtyRegion);
+  if (!instance.IsInitialized()) {
+    return nsRect();
+  }
+
+  return instance.ComputeSourceNeededRect();
+}
+
+Maybe<nsRect> FilterInstance::GetPostFilterBounds(
+    nsIFrame* aFilteredFrame, const nsTArray<SVGFilterFrame*>& aFilterFrames,
+    const gfxRect* aOverrideBBox, const nsRect* aPreFilterBounds) {
+  MOZ_ASSERT(!aFilteredFrame->HasAnyStateBits(NS_FRAME_SVG_LAYOUT) ||
+                 !aFilteredFrame->HasAnyStateBits(NS_FRAME_IS_NONDISPLAY),
+             "Non-display SVG do not maintain ink overflow rects");
+
+  nsRegion preFilterRegion;
+  nsRegion* preFilterRegionPtr = nullptr;
+  if (aPreFilterBounds) {
+    preFilterRegion = *aPreFilterBounds;
+    preFilterRegionPtr = &preFilterRegion;
+  }
+
+  gfxMatrix tm = SVGUtils::GetCanvasTM(aFilteredFrame);
+  auto filterChain = aFilteredFrame->StyleEffects()->mFilters.AsSpan();
+  std::unique_ptr<UserSpaceMetrics> metrics =
+      UserSpaceMetricsForFrame(aFilteredFrame);
+  FilterInstance instance(aFilteredFrame, aFilteredFrame->GetContent(),
+                          *metrics, filterChain, aFilterFrames,
+                           true, nullptr, tm, nullptr,
+                          preFilterRegionPtr, aPreFilterBounds, aOverrideBBox);
+  if (!instance.IsInitialized()) {
+    return Nothing();
+  }
+
+  return Some(instance.ComputePostFilterExtents());
+}
+
+FilterInstance::FilterInstance(
+    nsIFrame* aTargetFrame, nsIContent* aTargetContent,
+    const UserSpaceMetrics& aMetrics, Span<const StyleFilter> aFilterChain,
+    const nsTArray<SVGFilterFrame*>& aFilterFrames, bool aFilterInputIsTainted,
+    const SVGFilterPaintCallback& aPaintCallback,
+    const gfxMatrix& aPaintTransform, const nsRegion* aPostFilterDirtyRegion,
+    const nsRegion* aPreFilterDirtyRegion,
+    const nsRect* aPreFilterInkOverflowRectOverride,
+    const gfxRect* aOverrideBBox, gfxRect* aFilterSpaceBoundsNotSnapped)
+    : mTargetFrame(aTargetFrame),
+      mTargetContent(aTargetContent),
+      mMetrics(aMetrics),
+      mPaintCallback(aPaintCallback),
+      mPaintTransform(aPaintTransform),
+      mInitialized(false) {
+  if (aOverrideBBox) {
+    mTargetBBox = *aOverrideBBox;
+  } else {
+    MOZ_ASSERT(mTargetFrame,
+               "Need to supply a frame when there's no aOverrideBBox");
+    mTargetBBox =
+        SVGUtils::GetBBox(mTargetFrame, {SVGBBoxFlag::UseFrameBoundsForOuterSVG,
+                                         SVGBBoxFlag::IncludeFillGeometry});
+  }
+
+  if (!ComputeUserSpaceToFilterSpaceScale()) {
+    return;
+  }
+
+  if (!ComputeTargetBBoxInFilterSpace()) {
+    return;
+  }
+
+  gfxMatrix filterToUserSpace(mFilterSpaceToUserSpaceScale.xScale, 0.0f, 0.0f,
+                              mFilterSpaceToUserSpaceScale.yScale, 0.0f, 0.0f);
+
+  mFilterSpaceToFrameSpaceInCSSPxTransform =
+      filterToUserSpace * GetUserSpaceToFrameSpaceInCSSPxTransform();
+  mFrameSpaceInCSSPxToFilterSpaceTransform =
+      mFilterSpaceToFrameSpaceInCSSPxTransform;
+  mFrameSpaceInCSSPxToFilterSpaceTransform.Invert();
+
+  nsIntRect targetBounds;
+  if (aPreFilterInkOverflowRectOverride) {
+    targetBounds = FrameSpaceToFilterSpace(aPreFilterInkOverflowRectOverride);
+  } else if (mTargetFrame) {
+    nsRect preFilterVOR = mTargetFrame->PreEffectsInkOverflowRect();
+    targetBounds = FrameSpaceToFilterSpace(&preFilterVOR);
+  }
+  mTargetBounds.UnionRect(mTargetBBoxInFilterSpace, targetBounds);
+
+  if (NS_FAILED(BuildPrimitives(aFilterChain, aFilterFrames,
+                                aFilterInputIsTainted))) {
+    return;
+  }
+
+  mPostFilterDirtyRegion = FrameSpaceToFilterSpace(aPostFilterDirtyRegion);
+  mPreFilterDirtyRegion = FrameSpaceToFilterSpace(aPreFilterDirtyRegion);
+
+  if (aFilterSpaceBoundsNotSnapped) {
+    *aFilterSpaceBoundsNotSnapped = mFilterSpaceBoundsNotSnapped;
+  }
+
+  mInitialized = true;
+}
+
+bool FilterInstance::ComputeTargetBBoxInFilterSpace() {
+  gfxRect targetBBoxInFilterSpace = UserSpaceToFilterSpace(mTargetBBox);
+  targetBBoxInFilterSpace.RoundOut();
+
+  return gfxUtils::GfxRectToIntRect(targetBBoxInFilterSpace,
+                                    &mTargetBBoxInFilterSpace);
+}
+
+bool FilterInstance::ComputeUserSpaceToFilterSpaceScale() {
+  if (mTargetFrame) {
+    mUserSpaceToFilterSpaceScale = mPaintTransform.ScaleFactors();
+    if (mUserSpaceToFilterSpaceScale.xScale <= 0.0f ||
+        mUserSpaceToFilterSpaceScale.yScale <= 0.0f) {
+      return false;
+    }
+  } else {
+    mUserSpaceToFilterSpaceScale = MatrixScalesDouble();
+  }
+
+  mFilterSpaceToUserSpaceScale =
+      MatrixScalesDouble(1.0f / mUserSpaceToFilterSpaceScale.xScale,
+                         1.0f / mUserSpaceToFilterSpaceScale.yScale);
+
+  return true;
+}
+
+gfxRect FilterInstance::UserSpaceToFilterSpace(
+    const gfxRect& aUserSpaceRect) const {
+  gfxRect filterSpaceRect = aUserSpaceRect;
+  filterSpaceRect.Scale(mUserSpaceToFilterSpaceScale);
+  return filterSpaceRect;
+}
+
+gfxRect FilterInstance::FilterSpaceToUserSpace(
+    const gfxRect& aFilterSpaceRect) const {
+  gfxRect userSpaceRect = aFilterSpaceRect;
+  userSpaceRect.Scale(mFilterSpaceToUserSpaceScale);
+  return userSpaceRect;
+}
+
+nsresult FilterInstance::BuildPrimitives(
+    Span<const StyleFilter> aFilterChain,
+    const nsTArray<SVGFilterFrame*>& aFilterFrames,
+    bool aFilterInputIsTainted) {
+  AutoTArray<FilterPrimitiveDescription, 8> primitiveDescriptions;
+
+  uint32_t filterIndex = 0;
+
+  for (const auto& filter : aFilterChain) {
+    if (filter.IsUrl() && aFilterFrames.IsEmpty()) {
+      return NS_ERROR_FAILURE;
+    }
+    auto* filterFrame = filter.IsUrl() ? aFilterFrames[filterIndex++] : nullptr;
+    bool inputIsTainted = primitiveDescriptions.IsEmpty()
+                              ? aFilterInputIsTainted
+                              : primitiveDescriptions.LastElement().IsTainted();
+    nsresult rv = BuildPrimitivesForFilter(filter, filterFrame, inputIsTainted,
+                                           primitiveDescriptions);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+  }
+
+  mFilterDescription = FilterDescription(std::move(primitiveDescriptions));
+
+  return NS_OK;
+}
+
+nsresult FilterInstance::BuildPrimitivesForFilter(
+    const StyleFilter& aFilter, SVGFilterFrame* aFilterFrame,
+    bool aInputIsTainted,
+    nsTArray<FilterPrimitiveDescription>& aPrimitiveDescriptions) {
+  NS_ASSERTION(mUserSpaceToFilterSpaceScale.xScale > 0.0f &&
+                   mFilterSpaceToUserSpaceScale.yScale > 0.0f,
+               "scale factors between spaces should be positive values");
+
+  if (aFilter.IsUrl()) {
+    SVGFilterInstance svgFilterInstance(
+        aFilter, aFilterFrame, mTargetContent, mMetrics, mTargetBBox,
+        mUserSpaceToFilterSpaceScale, mFilterSpaceBoundsNotSnapped);
+    if (!svgFilterInstance.IsInitialized()) {
+      return NS_ERROR_FAILURE;
+    }
+
+    return svgFilterInstance.BuildPrimitives(aPrimitiveDescriptions,
+                                             mInputImages, aInputIsTainted);
+  }
+
+
+  nscolor shadowFallbackColor =
+      mTargetFrame ? mTargetFrame->StyleText()->mColor.ToColor()
+                   : NS_RGB(0, 0, 0);
+
+  CSSFilterInstance cssFilterInstance(aFilter, shadowFallbackColor,
+                                      mTargetBounds,
+                                      mFrameSpaceInCSSPxToFilterSpaceTransform);
+  return cssFilterInstance.BuildPrimitives(aPrimitiveDescriptions,
+                                           aInputIsTainted);
+}
+
+static void UpdateNeededBounds(const nsIntRegion& aRegion, nsIntRect& aBounds) {
+  aBounds = aRegion.GetBounds();
+
+  if (aBounds.IsEmpty()) {
+    return;
+  }
+
+  bool overflow;
+  IntSize surfaceSize =
+      SVGUtils::ConvertToSurfaceSize(SizeDouble(aBounds.Size()), &overflow);
+  if (overflow) {
+    aBounds.SizeTo(surfaceSize);
+  }
+}
+
+void FilterInstance::ComputeNeededBoxes() {
+  if (mFilterDescription.mPrimitives.IsEmpty()) {
+    return;
+  }
+
+  nsIntRegion sourceGraphicNeededRegion;
+  nsIntRegion fillPaintNeededRegion;
+  nsIntRegion strokePaintNeededRegion;
+
+  FilterSupport::ComputeSourceNeededRegions(
+      mFilterDescription, mPostFilterDirtyRegion, sourceGraphicNeededRegion,
+      fillPaintNeededRegion, strokePaintNeededRegion);
+
+  sourceGraphicNeededRegion.AndWith(mTargetBounds);
+
+  UpdateNeededBounds(sourceGraphicNeededRegion, mSourceGraphic.mNeededBounds);
+  UpdateNeededBounds(fillPaintNeededRegion, mFillPaint.mNeededBounds);
+  UpdateNeededBounds(strokePaintNeededRegion, mStrokePaint.mNeededBounds);
+}
+
+void FilterInstance::BuildSourcePaint(SourceInfo* aSource,
+                                      imgDrawingParams& aImgParams) {
+  MOZ_ASSERT(mTargetFrame);
+  nsIntRect neededRect = aSource->mNeededBounds;
+  if (neededRect.IsEmpty()) {
+    return;
+  }
+
+  RefPtr<DrawTarget> offscreenDT =
+      gfxPlatform::GetPlatform()->CreateOffscreenContentDrawTarget(
+          neededRect.Size(), SurfaceFormat::B8G8R8A8);
+  if (!offscreenDT || !offscreenDT->IsValid()) {
+    return;
+  }
+
+  gfxContext ctx(offscreenDT);
+  gfxContextAutoSaveRestore saver(&ctx);
+
+  ctx.SetMatrixDouble(mPaintTransform *
+                      gfxMatrix::Translation(-neededRect.TopLeft()));
+  GeneralPattern pattern;
+  if (aSource == &mFillPaint) {
+    SVGUtils::MakeFillPatternFor(mTargetFrame, &ctx, &pattern, aImgParams);
+  } else if (aSource == &mStrokePaint) {
+    SVGUtils::MakeStrokePatternFor(mTargetFrame, &ctx, &pattern, aImgParams);
+  }
+
+  if (pattern.GetPattern()) {
+    offscreenDT->FillRect(
+        ToRect(FilterSpaceToUserSpace(ThebesRect(neededRect))), pattern);
+  }
+
+  aSource->mSourceSurface = offscreenDT->Snapshot();
+  aSource->mSurfaceRect = neededRect;
+}
+
+void FilterInstance::BuildSourcePaints(imgDrawingParams& aImgParams) {
+  if (!mFillPaint.mNeededBounds.IsEmpty()) {
+    BuildSourcePaint(&mFillPaint, aImgParams);
+  }
+
+  if (!mStrokePaint.mNeededBounds.IsEmpty()) {
+    BuildSourcePaint(&mStrokePaint, aImgParams);
+  }
+}
+
+void FilterInstance::BuildSourceImage(DrawTarget* aDest,
+                                      imgDrawingParams& aImgParams,
+                                      FilterNode* aFilter, FilterNode* aSource,
+                                      const Rect& aSourceRect) {
+  MOZ_ASSERT(mTargetFrame);
+
+  nsIntRect neededRect = mSourceGraphic.mNeededBounds;
+  if (neededRect.IsEmpty()) {
+    return;
+  }
+
+  RefPtr<DrawTarget> offscreenDT;
+  SurfaceFormat format = SurfaceFormat::B8G8R8A8;
+  if (aDest->CanCreateSimilarDrawTarget(neededRect.Size(), format)) {
+    offscreenDT = aDest->CreateSimilarDrawTargetForFilter(
+        neededRect.Size(), format, aFilter, aSource, aSourceRect, Point(0, 0));
+  }
+  if (!offscreenDT || !offscreenDT->IsValid()) {
+    return;
+  }
+
+  gfxRect r = FilterSpaceToUserSpace(ThebesRect(neededRect));
+  r.RoundOut();
+  nsIntRect dirty;
+  if (!gfxUtils::GfxRectToIntRect(r, &dirty)) {
+    return;
+  }
+
+  gfxContext ctx(offscreenDT);
+  gfxMatrix devPxToCssPxTM = SVGUtils::GetCSSPxToDevPxMatrix(mTargetFrame);
+  DebugOnly<bool> invertible = devPxToCssPxTM.Invert();
+  MOZ_ASSERT(invertible);
+  ctx.SetMatrixDouble(devPxToCssPxTM * mPaintTransform *
+                      gfxMatrix::Translation(-neededRect.TopLeft()));
+
+  auto imageFlags = aImgParams.imageFlags;
+  if (mTargetFrame->HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+    imageFlags &= ~imgIContainer::FLAG_HIGH_QUALITY_SCALING;
+  }
+  imgDrawingParams imgParams(imageFlags);
+  mPaintCallback(ctx, imgParams, &mPaintTransform, &dirty);
+  aImgParams.result = imgParams.result;
+
+  mSourceGraphic.mSourceSurface = offscreenDT->Snapshot();
+  mSourceGraphic.mSurfaceRect = neededRect;
+}
+
+void FilterInstance::Render(gfxContext* aCtx, imgDrawingParams& aImgParams,
+                            float aOpacity) {
+  MOZ_ASSERT(mTargetFrame, "Need a frame for rendering");
+
+  if (mFilterDescription.mPrimitives.IsEmpty()) {
+    return;
+  }
+
+  nsIntRect filterRect =
+      mPostFilterDirtyRegion.GetBounds().Intersect(OutputFilterSpaceBounds());
+  if (filterRect.IsEmpty() || mPaintTransform.IsSingular()) {
+    return;
+  }
+
+  gfxContextMatrixAutoSaveRestore autoSR(aCtx);
+  aCtx->SetMatrix(
+      aCtx->CurrentMatrix().PreTranslate(filterRect.x, filterRect.y));
+
+  ComputeNeededBoxes();
+
+  Rect renderRect = IntRectToRect(filterRect);
+  RefPtr<DrawTarget> dt = aCtx->GetDrawTarget();
+
+  MOZ_ASSERT(dt);
+  if (!dt->IsValid()) {
+    return;
+  }
+
+  BuildSourcePaints(aImgParams);
+  RefPtr<FilterNode> sourceGraphic, fillPaint, strokePaint;
+  if (mFillPaint.mSourceSurface) {
+    fillPaint = FilterWrappers::ForSurface(dt, mFillPaint.mSourceSurface,
+                                           mFillPaint.mSurfaceRect.TopLeft());
+  }
+  if (mStrokePaint.mSourceSurface) {
+    strokePaint = FilterWrappers::ForSurface(
+        dt, mStrokePaint.mSourceSurface, mStrokePaint.mSurfaceRect.TopLeft());
+  }
+
+  sourceGraphic = dt->CreateFilter(FilterType::TRANSFORM);
+  if (sourceGraphic) {
+    IntPoint offset = mSourceGraphic.mNeededBounds.TopLeft();
+    sourceGraphic->SetAttribute(ATT_TRANSFORM_MATRIX,
+                                Matrix::Translation(offset.x, offset.y));
+  }
+
+  RefPtr<FilterNode> resultFilter = FilterNodeGraphFromDescription(
+      dt, mFilterDescription, renderRect, sourceGraphic,
+      mSourceGraphic.mSurfaceRect, fillPaint, strokePaint, mInputImages);
+
+  if (!resultFilter) {
+    gfxWarning() << "Filter is NULL.";
+    return;
+  }
+
+  BuildSourceImage(dt, aImgParams, resultFilter, sourceGraphic, renderRect);
+  if (sourceGraphic) {
+    if (mSourceGraphic.mSourceSurface) {
+      sourceGraphic->SetInput(IN_TRANSFORM_IN, mSourceGraphic.mSourceSurface);
+    } else {
+      RefPtr<FilterNode> clear = FilterWrappers::Clear(aCtx->GetDrawTarget());
+      sourceGraphic->SetInput(IN_TRANSFORM_IN, clear);
+    }
+  }
+
+  dt->DrawFilter(resultFilter, renderRect, Point(0, 0), DrawOptions(aOpacity));
+}
+
+nsRegion FilterInstance::ComputePostFilterDirtyRegion() {
+  if (mPreFilterDirtyRegion.IsEmpty() ||
+      mFilterDescription.mPrimitives.IsEmpty()) {
+    return nsRegion();
+  }
+
+  nsIntRegion resultChangeRegion = FilterSupport::ComputeResultChangeRegion(
+      mFilterDescription, mPreFilterDirtyRegion, nsIntRegion(), nsIntRegion());
+  return FilterSpaceToFrameSpace(resultChangeRegion);
+}
+
+nsRect FilterInstance::ComputePostFilterExtents() {
+  if (mFilterDescription.mPrimitives.IsEmpty()) {
+    return nsRect();
+  }
+
+  nsIntRegion postFilterExtents = FilterSupport::ComputePostFilterExtents(
+      mFilterDescription, mTargetBounds);
+  return FilterSpaceToFrameSpace(postFilterExtents.GetBounds());
+}
+
+nsRect FilterInstance::ComputeSourceNeededRect() {
+  ComputeNeededBoxes();
+  return FilterSpaceToFrameSpace(mSourceGraphic.mNeededBounds);
+}
+
+nsIntRect FilterInstance::OutputFilterSpaceBounds() const {
+  if (mFilterDescription.mPrimitives.IsEmpty()) {
+    return nsIntRect();
+  }
+
+  return mFilterDescription.mPrimitives.LastElement().PrimitiveSubregion();
+}
+
+nsIntRect FilterInstance::FrameSpaceToFilterSpace(const nsRect* aRect) const {
+  nsIntRect rect = OutputFilterSpaceBounds();
+  if (aRect) {
+    if (aRect->IsEmpty()) {
+      return nsIntRect();
+    }
+    gfxRect rectInCSSPx =
+        nsLayoutUtils::RectToGfxRect(*aRect, AppUnitsPerCSSPixel());
+    gfxRect rectInFilterSpace =
+        mFrameSpaceInCSSPxToFilterSpaceTransform.TransformBounds(rectInCSSPx);
+    rectInFilterSpace.RoundOut();
+    nsIntRect intRect;
+    if (gfxUtils::GfxRectToIntRect(rectInFilterSpace, &intRect)) {
+      rect = intRect;
+    }
+  }
+  return rect;
+}
+
+nsRect FilterInstance::FilterSpaceToFrameSpace(const nsIntRect& aRect) const {
+  if (aRect.IsEmpty()) {
+    return nsRect();
+  }
+  gfxRect r(aRect.x, aRect.y, aRect.width, aRect.height);
+  r = mFilterSpaceToFrameSpaceInCSSPxTransform.TransformBounds(r);
+  return nsLayoutUtils::RoundGfxRectToAppRect(r, AppUnitsPerCSSPixel());
+}
+
+nsIntRegion FilterInstance::FrameSpaceToFilterSpace(
+    const nsRegion* aRegion) const {
+  if (!aRegion) {
+    return OutputFilterSpaceBounds();
+  }
+  nsIntRegion result;
+  for (auto iter = aRegion->RectIter(); !iter.Done(); iter.Next()) {
+    nsRect rect = iter.Get();
+    result.OrWith(FrameSpaceToFilterSpace(&rect));
+  }
+  return result;
+}
+
+nsRegion FilterInstance::FilterSpaceToFrameSpace(
+    const nsIntRegion& aRegion) const {
+  nsRegion result;
+  for (auto iter = aRegion.RectIter(); !iter.Done(); iter.Next()) {
+    result.OrWith(FilterSpaceToFrameSpace(iter.Get()));
+  }
+  return result;
+}
+
+gfxMatrix FilterInstance::GetUserSpaceToFrameSpaceInCSSPxTransform() const {
+  if (!mTargetFrame) {
+    return gfxMatrix();
+  }
+  return gfxMatrix::Translation(
+      -SVGUtils::FrameSpaceInCSSPxToUserSpaceOffset(mTargetFrame));
+}
+
+}  

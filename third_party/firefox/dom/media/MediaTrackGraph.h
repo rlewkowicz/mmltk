@@ -1,0 +1,752 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_MEDIATRACKGRAPH_H_
+#define MOZILLA_MEDIATRACKGRAPH_H_
+
+#include <speex/speex_resampler.h>
+
+#include "AudioSampleFormat.h"
+#include "CubebUtils.h"
+#include "MainThreadUtils.h"
+#include "MediaSegment.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/StateWatching.h"
+#include "mozilla/TaskQueue.h"
+#include "nsAutoRef.h"
+#include "nsIRunnable.h"
+#include "nsTArray.h"
+
+class nsIRunnable;
+class nsIGlobalObject;
+class nsPIDOMWindowInner;
+
+namespace mozilla {
+class AudioCaptureTrack;
+class CrossGraphTransmitter;
+class CrossGraphReceiver;
+class NativeInputTrack;
+};  
+
+template <>
+class nsAutoRefTraits<SpeexResamplerState>
+    : public nsPointerRefTraits<SpeexResamplerState> {
+ public:
+  static void Release(SpeexResamplerState* aState) {
+    speex_resampler_destroy(aState);
+  }
+};
+
+namespace mozilla {
+
+extern LazyLogModule gMediaTrackGraphLog;
+
+namespace dom {
+enum class AudioContextOperation : uint8_t;
+enum class AudioContextOperationFlags;
+enum class AudioContextState : uint8_t;
+}  
+
+
+class AudioProcessingTrack;
+class AudioNodeEngine;
+class AudioNodeExternalInputTrack;
+class AudioNodeTrack;
+class DirectMediaTrackListener;
+class ForwardedInputTrack;
+class MediaInputPort;
+class MediaTrack;
+class MediaTrackGraph;
+class MediaTrackGraphImpl;
+class MediaTrackListener;
+class DeviceInputConsumerTrack;
+class DeviceInputTrack;
+class ProcessedMediaTrack;
+class SourceMediaTrack;
+
+class AudioDataListenerInterface {
+ protected:
+  virtual ~AudioDataListenerInterface() = default;
+
+ public:
+  virtual uint32_t RequestedInputChannelCount(
+      MediaTrackGraph* aGraph) const = 0;
+
+  virtual cubeb_input_processing_params RequestedInputProcessingParams(
+      MediaTrackGraph* aGraph) const = 0;
+
+  virtual bool IsVoiceInput(MediaTrackGraph* aGraph) const = 0;
+
+  virtual void DeviceChanged(MediaTrackGraph* aGraph) = 0;
+
+  virtual void Disconnect(MediaTrackGraph* aGraph) = 0;
+
+  virtual void NotifySetRequestedInputProcessingParams(
+      MediaTrackGraph* aGraph, int aGeneration,
+      cubeb_input_processing_params aRequestedParams) = 0;
+
+  virtual void NotifySetRequestedInputProcessingParamsResult(
+      MediaTrackGraph* aGraph, int aGeneration,
+      const Result<cubeb_input_processing_params, int>& aResult) = 0;
+};
+
+class AudioDataListener : public AudioDataListenerInterface {
+ protected:
+  virtual ~AudioDataListener() = default;
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(AudioDataListener)
+};
+
+class MainThreadMediaTrackListener {
+ public:
+  virtual void NotifyMainThreadTrackEnded() = 0;
+};
+
+struct AudioNodeSizes {
+  AudioNodeSizes() : mTrack(0), mEngine(0), mNodeType() {}
+  size_t mTrack;
+  size_t mEngine;
+  const char* mNodeType;
+};
+
+enum class DisabledTrackMode { ENABLED, SILENCE_BLACK, SILENCE_FREEZE };
+
+class MediaTrack : public mozilla::LinkedListElement<MediaTrack> {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaTrack)
+
+  MediaTrack(TrackRate aSampleRate, MediaSegment::Type aType,
+             MediaSegment* aSegment);
+
+  const TrackRate mSampleRate;
+  const MediaSegment::Type mType;
+
+ protected:
+  virtual ~MediaTrack();
+
+ public:
+  MediaTrackGraphImpl* GraphImpl();
+  const MediaTrackGraphImpl* GraphImpl() const;
+  MediaTrackGraph* Graph() { return mGraph; }
+  const MediaTrackGraph* Graph() const { return mGraph; }
+  void SetGraphImpl(MediaTrackGraphImpl* aGraph);
+  void SetGraphImpl(MediaTrackGraph* aGraph);
+
+  void AddAudioOutput(void* aKey, const AudioDeviceInfo* aSink);
+  void AddAudioOutput(void* aKey, CubebUtils::AudioDeviceID aDeviceID,
+                      TrackRate aPreferredSampleRate);
+  void SetAudioOutputVolume(void* aKey, float aVolume);
+  void RemoveAudioOutput(void* aKey);
+  void Suspend();
+  void Resume();
+  virtual void AddListener(MediaTrackListener* aListener);
+  virtual RefPtr<GenericPromise> RemoveListener(MediaTrackListener* aListener);
+
+  void AddDirectListener(DirectMediaTrackListener* aListener);
+
+  void RemoveDirectListener(DirectMediaTrackListener* aListener);
+
+  void SetDisabledTrackMode(DisabledTrackMode aMode);
+
+  void AddMainThreadListener(MainThreadMediaTrackListener* aListener);
+  void RemoveMainThreadListener(MainThreadMediaTrackListener* aListener) {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT(aListener);
+    mMainThreadListeners.RemoveElement(aListener);
+  }
+
+  template <typename Function>
+  void QueueControlMessageWithNoShutdown(Function&& aFunction) {
+    QueueMessage(WrapUnique(
+        new ControlMessageWithNoShutdown(std::forward<Function>(aFunction))));
+  }
+
+  enum class IsInShutdown { No, Yes };
+  template <typename Function>
+  void QueueControlOrShutdownMessage(Function&& aFunction) {
+    QueueMessage(WrapUnique(
+        new ControlOrShutdownMessage(std::forward<Function>(aFunction))));
+  }
+
+  void RunAfterPendingUpdates(already_AddRefed<nsIRunnable> aRunnable);
+
+  virtual void Destroy();
+
+  TrackTime GetCurrentTime() const {
+    NS_ASSERTION(NS_IsMainThread(), "Call only on main thread");
+    return mMainThreadCurrentTime;
+  }
+  bool IsEnded() const {
+    NS_ASSERTION(NS_IsMainThread(), "Call only on main thread");
+    return mMainThreadEnded;
+  }
+
+  bool IsDestroyed() const {
+    NS_ASSERTION(NS_IsMainThread(), "Call only on main thread");
+    return mMainThreadDestroyed;
+  }
+
+  uint64_t GetWindowId() const;
+
+  friend class MediaTrackGraphImpl;
+  friend class MediaInputPort;
+  friend class AudioNodeExternalInputTrack;
+
+  virtual AudioProcessingTrack* AsAudioProcessingTrack() { return nullptr; }
+  virtual SourceMediaTrack* AsSourceTrack() { return nullptr; }
+  virtual ProcessedMediaTrack* AsProcessedTrack() { return nullptr; }
+  virtual AudioNodeTrack* AsAudioNodeTrack() { return nullptr; }
+  virtual ForwardedInputTrack* AsForwardedInputTrack() { return nullptr; }
+  virtual CrossGraphTransmitter* AsCrossGraphTransmitter() { return nullptr; }
+  virtual CrossGraphReceiver* AsCrossGraphReceiver() { return nullptr; }
+  virtual DeviceInputTrack* AsDeviceInputTrack() { return nullptr; }
+  virtual DeviceInputConsumerTrack* AsDeviceInputConsumerTrack() {
+    return nullptr;
+  }
+
+  virtual void DestroyImpl();
+  TrackTime GetEnd() const;
+
+  virtual void RemoveAllDirectListenersImpl() {}
+  void RemoveAllResourcesAndListenersImpl();
+
+  virtual void AddListenerImpl(already_AddRefed<MediaTrackListener> aListener);
+  virtual void RemoveListenerImpl(MediaTrackListener* aListener);
+  virtual void AddDirectListenerImpl(
+      already_AddRefed<DirectMediaTrackListener> aListener);
+  virtual void RemoveDirectListenerImpl(DirectMediaTrackListener* aListener);
+  virtual void SetDisabledTrackModeImpl(DisabledTrackMode aMode);
+
+  void AddConsumer(MediaInputPort* aPort) { mConsumers.AppendElement(aPort); }
+  void RemoveConsumer(MediaInputPort* aPort) {
+    mConsumers.RemoveElement(aPort);
+  }
+  GraphTime StartTime() const { return mStartTime; }
+  bool Ended() const { return mEnded; }
+
+  virtual uint32_t NumberOfChannels() const = 0;
+
+  virtual DisabledTrackMode CombinedDisabledMode() const {
+    return mDisabledMode;
+  }
+
+  template <class SegmentType>
+  SegmentType* GetData() const {
+    if (!mSegment) {
+      return nullptr;
+    }
+    if (mSegment->GetType() != SegmentType::StaticType()) {
+      return nullptr;
+    }
+    return static_cast<SegmentType*>(mSegment.get());
+  }
+  MediaSegment* GetData() const { return mSegment.get(); }
+
+  double TrackTimeToSeconds(TrackTime aTime) const {
+    NS_ASSERTION(0 <= aTime && aTime <= TRACK_TIME_MAX, "Bad time");
+    return static_cast<double>(aTime) / mSampleRate;
+  }
+  int64_t TrackTimeToMicroseconds(TrackTime aTime) const {
+    NS_ASSERTION(0 <= aTime && aTime <= TRACK_TIME_MAX, "Bad time");
+    return (aTime * 1000000) / mSampleRate;
+  }
+  TrackTime SecondsToNearestTrackTime(double aSeconds) const {
+    NS_ASSERTION(0 <= aSeconds && aSeconds <= TRACK_TICKS_MAX / TRACK_RATE_MAX,
+                 "Bad seconds");
+    return mSampleRate * aSeconds + 0.5;
+  }
+  TrackTime MicrosecondsToTrackTimeRoundDown(int64_t aMicroseconds) const {
+    return (aMicroseconds * mSampleRate) / 1000000;
+  }
+
+  TrackTicks TimeToTicksRoundUp(TrackRate aRate, TrackTime aTime) const {
+    return RateConvertTicksRoundUp(aRate, mSampleRate, aTime);
+  }
+  TrackTime TicksToTimeRoundDown(TrackRate aRate, TrackTicks aTicks) const {
+    return RateConvertTicksRoundDown(mSampleRate, aRate, aTicks);
+  }
+  TrackTime GraphTimeToTrackTimeWithBlocking(GraphTime aTime) const;
+  TrackTime GraphTimeToTrackTime(GraphTime aTime) const;
+  GraphTime TrackTimeToGraphTime(TrackTime aTime) const;
+
+  virtual void ApplyTrackDisabling(MediaSegment* aSegment,
+                                   MediaSegment* aRawSegment = nullptr);
+
+  virtual bool MainThreadNeedsUpdates() const { return true; }
+
+  virtual size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const;
+  virtual size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const;
+
+  bool IsSuspended() const { return mSuspendedCount > 0; }
+  void IncrementSuspendCount();
+  virtual void DecrementSuspendCount();
+
+  void AssertOnGraphThread() const;
+  void AssertOnGraphThreadOrNotRunning() const;
+
+  template <typename Function>
+  void RunAfterProcessing(Function&& aFunction) {
+    RunMessageAfterProcessing(WrapUnique(
+        new ControlMessageWithNoShutdown(std::forward<Function>(aFunction))));
+  }
+
+  class ControlMessageInterface;
+
+ protected:
+  virtual void OnGraphThreadDone() {}
+
+  virtual void AdvanceTimeVaryingValuesToCurrentTime(GraphTime aCurrentTime,
+                                                     GraphTime aBlockedTime);
+
+ private:
+  template <typename Function>
+  class ControlMessageWithNoShutdown;
+  template <typename Function>
+  class ControlOrShutdownMessage;
+
+  void QueueMessage(UniquePtr<ControlMessageInterface> aMessage);
+  void RunMessageAfterProcessing(UniquePtr<ControlMessageInterface> aMessage);
+
+  void NotifyMainThreadListeners() {
+    NS_ASSERTION(NS_IsMainThread(), "Call only on main thread");
+
+    for (int32_t i = mMainThreadListeners.Length() - 1; i >= 0; --i) {
+      mMainThreadListeners[i]->NotifyMainThreadTrackEnded();
+    }
+    mMainThreadListeners.Clear();
+  }
+
+  bool ShouldNotifyTrackEnded() {
+    NS_ASSERTION(NS_IsMainThread(), "Call only on main thread");
+    if (!mMainThreadEnded || mEndedNotificationSent) {
+      return false;
+    }
+
+    mEndedNotificationSent = true;
+    return true;
+  }
+
+ protected:
+  void NotifyIfDisabledModeChangedFrom(DisabledTrackMode aOldMode);
+
+
+  const UniquePtr<MediaSegment> mSegment;
+
+  GraphTime mStartTime;
+
+  TrackTime mForgottenTime;
+
+  bool mEnded;
+
+  bool mNotifiedEnded;
+
+  nsTArray<RefPtr<MediaTrackListener>> mTrackListeners;
+  nsTArray<MainThreadMediaTrackListener*> mMainThreadListeners;
+  DisabledTrackMode mDisabledMode;
+
+  GraphTime mStartBlocking;
+
+  nsTArray<MediaInputPort*> mConsumers;
+
+  int32_t mSuspendedCount;
+
+  TrackTime mMainThreadCurrentTime;
+  bool mMainThreadEnded;
+  bool mEndedNotificationSent;
+  bool mMainThreadDestroyed;
+
+  MediaTrackGraph* mGraph;
+};
+
+class SourceMediaTrack : public MediaTrack {
+ public:
+  SourceMediaTrack(MediaSegment::Type aType, TrackRate aSampleRate);
+
+  SourceMediaTrack* AsSourceTrack() override { return this; }
+
+
+  void SetPullingEnabled(bool aEnabled);
+
+  void DestroyImpl() override;
+
+  bool PullNewData(GraphTime aDesiredUpToTime);
+
+  void ExtractPendingInput(GraphTime aCurrentTime, GraphTime aDesiredUpToTime);
+
+  void SetAppendDataSourceRate(TrackRate aRate);
+
+  TrackTime AppendData(MediaSegment* aSegment,
+                       MediaSegment* aRawSegment = nullptr);
+
+  TrackTime ClearFutureData();
+
+  void End();
+
+  void SetDisabledTrackModeImpl(DisabledTrackMode aMode) override;
+
+  uint32_t NumberOfChannels() const override;
+
+  void RemoveAllDirectListenersImpl() override;
+
+  void SetVolume(float aVolume);
+  float GetVolumeLocked() MOZ_REQUIRES(mMutex);
+
+  Mutex& GetMutex() MOZ_RETURN_CAPABILITY(mMutex) { return mMutex; }
+
+  friend class MediaTrackGraphImpl;
+
+ protected:
+  enum TrackCommands : uint32_t;
+
+  virtual ~SourceMediaTrack();
+
+  struct TrackData {
+    TrackRate mInputRate;
+    nsAutoRef<SpeexResamplerState> mResampler;
+    uint32_t mResamplerChannelCount;
+    UniquePtr<MediaSegment> mData;
+    bool mEnded;
+    bool mPullingEnabled;
+    bool mGraphThreadDone;
+  };
+
+  bool NeedsMixing();
+
+  void ResampleAudioToGraphSampleRate(MediaSegment* aSegment)
+      MOZ_REQUIRES(mMutex);
+
+  void AddDirectListenerImpl(
+      already_AddRefed<DirectMediaTrackListener> aListener) override;
+  void RemoveDirectListenerImpl(DirectMediaTrackListener* aListener) override;
+
+  void NotifyDirectConsumers(MediaSegment* aSegment) MOZ_REQUIRES(mMutex);
+
+  void OnGraphThreadDone() override {
+    MutexAutoLock lock(mMutex);
+    if (!mUpdateTrack) {
+      return;
+    }
+    mUpdateTrack->mGraphThreadDone = true;
+    if (!mUpdateTrack->mData) {
+      return;
+    }
+    mUpdateTrack->mData->Clear();
+  }
+
+  virtual void AdvanceTimeVaryingValuesToCurrentTime(
+      GraphTime aCurrentTime, GraphTime aBlockedTime) override;
+
+  Mutex mMutex;
+  float mVolume MOZ_GUARDED_BY(mMutex) = 1.0;
+  UniquePtr<TrackData> mUpdateTrack MOZ_GUARDED_BY(mMutex);
+  DisabledTrackMode mDirectDisabledMode MOZ_GUARDED_BY(mMutex) =
+      DisabledTrackMode::ENABLED;
+  nsTArray<RefPtr<DirectMediaTrackListener>> mDirectTrackListeners
+      MOZ_GUARDED_BY(mMutex);
+};
+
+struct SharedDummyTrack {
+  NS_INLINE_DECL_REFCOUNTING(SharedDummyTrack)
+  explicit SharedDummyTrack(MediaTrack* aTrack) : mTrack(aTrack) {
+    mTrack->Suspend();
+  }
+  const RefPtr<MediaTrack> mTrack;
+
+ private:
+  ~SharedDummyTrack() { mTrack->Destroy(); }
+};
+
+class MediaInputPort final {
+ private:
+  MediaInputPort(MediaTrackGraphImpl* aGraph, MediaTrack* aSource,
+                 ProcessedMediaTrack* aDest, uint16_t aInputNumber,
+                 uint16_t aOutputNumber)
+      : mSource(aSource),
+        mDest(aDest),
+        mInputNumber(aInputNumber),
+        mOutputNumber(aOutputNumber),
+        mGraph(aGraph) {
+    MOZ_COUNT_CTOR(MediaInputPort);
+  }
+
+  MOZ_COUNTED_DTOR(MediaInputPort)
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaInputPort)
+
+  void Destroy();
+
+
+  void Init();
+  void Disconnect();
+
+  MediaTrack* GetSource() const;
+  ProcessedMediaTrack* GetDestination() const;
+
+  uint16_t InputNumber() const { return mInputNumber; }
+  uint16_t OutputNumber() const { return mOutputNumber; }
+
+  struct InputInterval {
+    GraphTime mStart;
+    GraphTime mEnd;
+    bool mInputIsBlocked;
+  };
+  static InputInterval GetNextInputInterval(MediaInputPort const* aPort,
+                                            GraphTime aTime);
+
+  MediaTrackGraphImpl* GraphImpl() const;
+  MediaTrackGraph* Graph() const;
+
+  void SetGraphImpl(MediaTrackGraphImpl* aGraph);
+
+  void Suspended();
+
+  void Resumed();
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+    size_t amount = 0;
+
+    return amount;
+  }
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+ private:
+  friend class ProcessedMediaTrack;
+  MediaTrack* mSource;
+  ProcessedMediaTrack* mDest;
+  const uint16_t mInputNumber;
+  const uint16_t mOutputNumber;
+
+  MediaTrackGraphImpl* mGraph;
+};
+
+class ProcessedMediaTrack : public MediaTrack {
+ public:
+  ProcessedMediaTrack(TrackRate aSampleRate, MediaSegment::Type aType,
+                      MediaSegment* aSegment)
+      : MediaTrack(aSampleRate, aType, aSegment),
+        mAutoend(true),
+        mCycleMarker(0) {}
+
+  already_AddRefed<MediaInputPort> AllocateInputPort(
+      MediaTrack* aTrack, uint16_t aInputNumber = 0,
+      uint16_t aOutputNumber = 0);
+  virtual void QueueSetAutoend(bool aAutoend);
+
+  ProcessedMediaTrack* AsProcessedTrack() override { return this; }
+
+  friend class MediaTrackGraphImpl;
+
+  virtual void AddInput(MediaInputPort* aPort);
+  virtual void RemoveInput(MediaInputPort* aPort) {
+    mInputs.RemoveElement(aPort) || mSuspendedInputs.RemoveElement(aPort);
+  }
+  bool HasInputPort(MediaInputPort* aPort) const {
+    return mInputs.Contains(aPort) || mSuspendedInputs.Contains(aPort);
+  }
+  uint32_t InputPortCount() const {
+    return mInputs.Length() + mSuspendedInputs.Length();
+  }
+  void InputSuspended(MediaInputPort* aPort);
+  void InputResumed(MediaInputPort* aPort);
+  void DestroyImpl() override;
+  void DecrementSuspendCount() override;
+  enum { ALLOW_END = 0x01 };
+  virtual void ProcessInput(GraphTime aFrom, GraphTime aTo,
+                            uint32_t aFlags) = 0;
+  void SetAutoendImpl(bool aAutoend) { mAutoend = aAutoend; }
+
+  bool InMutedCycle() const { return mCycleMarker; }
+
+  virtual void OnInputDisabledModeChanged(DisabledTrackMode aMode) {}
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const override {
+    size_t amount = MediaTrack::SizeOfExcludingThis(aMallocSizeOf);
+    amount += mInputs.ShallowSizeOfExcludingThis(aMallocSizeOf);
+    amount += mSuspendedInputs.ShallowSizeOfExcludingThis(aMallocSizeOf);
+    return amount;
+  }
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const override {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+ protected:
+
+  nsTArray<MediaInputPort*> mInputs;
+  nsTArray<MediaInputPort*> mSuspendedInputs;
+  bool mAutoend;
+  uint32_t mCycleMarker;
+};
+
+class MediaTrackGraph {
+ public:
+
+  enum GraphDriverType {
+    AUDIO_THREAD_DRIVER,
+    SYSTEM_THREAD_DRIVER,
+    OFFLINE_THREAD_DRIVER
+  };
+  enum GraphRunType {
+    DIRECT_DRIVER,
+    SINGLE_THREAD,
+  };
+  static const uint32_t AUDIO_CALLBACK_DRIVER_SHUTDOWN_TIMEOUT = 20 * 1000;
+  static const TrackRate REQUEST_DEFAULT_SAMPLE_RATE = 0;
+  constexpr static const CubebUtils::AudioDeviceID DEFAULT_OUTPUT_DEVICE =
+      nullptr;
+
+  static MediaTrackGraph* GetInstanceIfExists(
+      nsPIDOMWindowInner* aWindow, TrackRate aSampleRate,
+      CubebUtils::AudioDeviceID aPrimaryOutputDeviceID);
+  static MediaTrackGraph* GetInstance(
+      GraphDriverType aGraphDriverRequested, nsPIDOMWindowInner* aWindow,
+      TrackRate aSampleRate, CubebUtils::AudioDeviceID aPrimaryOutputDeviceID);
+  static MediaTrackGraph* CreateNonRealtimeInstance(TrackRate aSampleRate);
+
+  void ForceShutDown();
+
+  virtual void OpenAudioInput(DeviceInputTrack* aTrack) = 0;
+  virtual void CloseAudioInput(DeviceInputTrack* aTrack) = 0;
+
+  SourceMediaTrack* CreateSourceTrack(MediaSegment::Type aType);
+  ProcessedMediaTrack* CreateForwardedInputTrack(MediaSegment::Type aType);
+  AudioCaptureTrack* CreateAudioCaptureTrack();
+
+  CrossGraphTransmitter* CreateCrossGraphTransmitter(
+      CrossGraphReceiver* aReceiver);
+  CrossGraphReceiver* CreateCrossGraphReceiver(TrackRate aTransmitterRate);
+
+  void AddTrack(MediaTrack* aTrack);
+
+  using GraphStartedPromise = GenericPromise;
+  virtual RefPtr<GraphStartedPromise> NotifyWhenDeviceStarted(
+      CubebUtils::AudioDeviceID aDeviceID) = 0;
+
+  using AudioContextOperationPromise =
+      MozPromise<dom::AudioContextState, bool, true>;
+  RefPtr<AudioContextOperationPromise> ApplyAudioContextOperation(
+      MediaTrack* aDestinationTrack, nsTArray<RefPtr<MediaTrack>> aTracks,
+      dom::AudioContextOperation aOperation);
+
+  bool IsNonRealtime() const;
+  void StartNonRealtimeProcessing(uint32_t aTicksToProcess);
+
+  void NotifyJSContext(JSContext* aCx);
+
+  void DispatchToMainThreadStableState(already_AddRefed<nsIRunnable> aRunnable);
+  void ReevaluateInputDevice(CubebUtils::AudioDeviceID aID);
+
+  TrackRate GraphRate() const { return mSampleRate; }
+  CubebUtils::AudioDeviceID PrimaryOutputDeviceID() const {
+    return mPrimaryOutputDeviceID;
+  }
+
+  double AudioOutputLatency();
+  bool OutputForAECMightDrift();
+  bool OutputForAECIsPrimary();
+
+  void RegisterCaptureTrackForWindow(uint64_t aWindowId,
+                                     ProcessedMediaTrack* aCaptureTrack);
+  void UnregisterCaptureTrackForWindow(uint64_t aWindowId);
+  already_AddRefed<MediaInputPort> ConnectToCaptureTrack(
+      uint64_t aWindowId, MediaTrack* aMediaTrack);
+
+  void AssertOnGraphThread() const { MOZ_ASSERT(OnGraphThread()); }
+  void AssertOnGraphThreadOrNotRunning() const {
+    MOZ_ASSERT(OnGraphThreadOrNotRunning());
+  }
+
+  virtual Watchable<GraphTime>& CurrentTime() = 0;
+
+  GraphTime ProcessedTime() const;
+  void* CurrentDriver() const;
+
+  DeviceInputTrack* GetDeviceInputTrackMainThread(
+      CubebUtils::AudioDeviceID aID);
+
+  NativeInputTrack* GetNativeInputTrackMainThread();
+
+  int ProcessingParamsGeneration() { return ++mProcessingParamsGeneration; }
+
+ protected:
+  explicit MediaTrackGraph(TrackRate aSampleRate,
+                           CubebUtils::AudioDeviceID aPrimaryOutputDeviceID)
+      : mSampleRate(aSampleRate),
+        mPrimaryOutputDeviceID(aPrimaryOutputDeviceID) {
+    MOZ_COUNT_CTOR(MediaTrackGraph);
+  }
+  MOZ_COUNTED_DTOR_VIRTUAL(MediaTrackGraph)
+
+  virtual bool OnGraphThreadOrNotRunning() const = 0;
+  virtual bool OnGraphThread() const = 0;
+
+  virtual bool Destroyed() const = 0;
+
+  const TrackRate mSampleRate;
+  const CubebUtils::AudioDeviceID mPrimaryOutputDeviceID;
+
+  int mProcessingParamsGeneration = 0;
+};
+
+inline void MediaTrack::AssertOnGraphThread() const {
+  Graph()->AssertOnGraphThread();
+}
+inline void MediaTrack::AssertOnGraphThreadOrNotRunning() const {
+  Graph()->AssertOnGraphThreadOrNotRunning();
+}
+
+class MediaTrack::ControlMessageInterface {
+ public:
+  MOZ_COUNTED_DEFAULT_CTOR(ControlMessageInterface)
+  MOZ_COUNTED_DTOR_VIRTUAL(ControlMessageInterface)
+  virtual void Run() = 0;
+  virtual void RunDuringShutdown() {}
+};
+
+template <typename Function>
+class MediaTrack::ControlMessageWithNoShutdown
+    : public ControlMessageInterface {
+ public:
+  explicit ControlMessageWithNoShutdown(Function&& aFunction)
+      : mFunction(std::forward<Function>(aFunction)) {}
+
+  void Run() override {
+    static_assert(std::is_void_v<decltype(mFunction())>,
+                  "The lambda must return void!");
+    mFunction();
+  }
+
+ private:
+  using StoredFunction = std::decay_t<Function>;
+  StoredFunction mFunction;
+};
+
+template <typename Function>
+class MediaTrack::ControlOrShutdownMessage : public ControlMessageInterface {
+ public:
+  explicit ControlOrShutdownMessage(Function&& aFunction)
+      : mFunction(std::forward<Function>(aFunction)) {}
+
+  void Run() override {
+    static_assert(std::is_void_v<decltype(mFunction(IsInShutdown()))>,
+                  "The lambda must return void!");
+    mFunction(IsInShutdown::No);
+  }
+  void RunDuringShutdown() override { mFunction(IsInShutdown::Yes); }
+
+ private:
+  using StoredFunction = std::decay_t<Function>;
+  StoredFunction mFunction;
+};
+
+}  
+
+#endif /* MOZILLA_MEDIATRACKGRAPH_H_ */

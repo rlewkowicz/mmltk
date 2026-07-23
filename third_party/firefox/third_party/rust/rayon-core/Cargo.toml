@@ -1,0 +1,37 @@
+
+[package]
+edition = "2021"
+rust-version = "1.63"
+name = "rayon-core"
+version = "1.12.1"
+authors = [
+    "Niko Matsakis <niko@alum.mit.edu>",
+    "Josh Stone <cuviper@gmail.com>",
+]
+build = "build.rs"
+links = "rayon-core"
+description = "Core APIs for Rayon"
+documentation = "https://docs.rs/rayon/"
+keywords = [
+    "parallel",
+    "thread",
+    "concurrency",
+    "join",
+    "performance",
+]
+categories = ["concurrency"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rayon-rs/rayon"
+
+[dependencies.crossbeam-deque]
+version = "0.8.1"
+
+[dependencies.crossbeam-utils]
+version = "0.8.0"
+
+[dependencies.wasm_sync]
+version = "0.1.0"
+optional = true
+
+[features]
+web_spin_lock = ["dep:wasm_sync"]

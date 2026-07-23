@@ -1,0 +1,318 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_Tracer_h
+#define js_Tracer_h
+
+#include "gc/Allocator.h"
+#include "gc/Barrier.h"
+#include "gc/TraceKind.h"
+#include "js/HashTable.h"
+#include "js/TracingAPI.h"
+
+namespace JS {
+
+using CompartmentSet =
+    js::HashSet<Compartment*, js::DefaultHasher<Compartment*>,
+                js::SystemAllocPolicy>;
+
+class Zone;
+
+}  
+
+namespace js {
+
+class TaggedProto;
+namespace wasm {
+class AnyRef;
+}  
+
+
+class GCMarker;
+
+#ifdef DEBUG
+template <typename T>
+void CheckTracedThing(JSTracer* trc, T* thing);
+template <typename T>
+void CheckTracedThing(JSTracer* trc, const T& thing);
+#else
+template <typename T>
+inline void CheckTracedThing(JSTracer* trc, T* thing) {}
+template <typename T>
+inline void CheckTracedThing(JSTracer* trc, const T& thing) {}
+#endif
+
+namespace gc {
+
+template <typename T>
+struct PtrBaseGCType {
+  using type = T;
+};
+template <typename T>
+struct PtrBaseGCType<T*> {
+  using type = typename BaseGCType<T>::type*;
+};
+
+template <typename T>
+typename PtrBaseGCType<T>::type* ConvertToBase(T* thingp) {
+  return reinterpret_cast<typename PtrBaseGCType<T>::type*>(thingp);
+}
+
+
+#define DEFINE_TRACE_FUNCTION(name, type, _1, _2)                        \
+  MOZ_ALWAYS_INLINE bool TraceEdgeInternal(JSTracer* trc, type** thingp, \
+                                           const char* name) {           \
+    CheckTracedThing(trc, *thingp);                                      \
+    return trc->on##name##Edge(thingp, name);                            \
+  }
+JS_FOR_EACH_TRACEKIND(DEFINE_TRACE_FUNCTION)
+#undef DEFINE_TRACE_FUNCTION
+
+bool TraceEdgeInternal(JSTracer* trc, Value* thingp, const char* name);
+bool TraceEdgeInternal(JSTracer* trc, jsid* thingp, const char* name);
+bool TraceEdgeInternal(JSTracer* trc, TaggedProto* thingp, const char* name);
+bool TraceEdgeInternal(JSTracer* trc, wasm::AnyRef* thingp, const char* name);
+
+template <typename T>
+void TraceRangeInternal(JSTracer* trc, size_t len, T* vec, const char* name);
+
+#ifdef DEBUG
+void AssertRootMarkingPhase(JSTracer* trc);
+template <typename T>
+void AssertShouldMarkInZone(GCMarker* marker, T* thing);
+#else
+inline void AssertRootMarkingPhase(JSTracer* trc) {}
+template <typename T>
+void AssertShouldMarkInZone(GCMarker* marker, T* thing) {}
+#endif
+
+}  
+
+
+template <typename T>
+inline void TraceEdge(JSTracer* trc, const BarrieredBase<T>* thingp,
+                      const char* name) {
+  auto* basep = gc::ConvertToBase(thingp->unbarrieredAddress());
+  MOZ_ALWAYS_TRUE(gc::TraceEdgeInternal(trc, basep, name));
+}
+
+template <typename T>
+inline void TraceEdge(JSTracer* trc, WeakHeapPtr<T>* thingp, const char* name) {
+  auto* basep = gc::ConvertToBase(thingp->unbarrieredAddress());
+  JS::AutoTracingWeakEdge weak(trc);
+  MOZ_ALWAYS_TRUE(gc::TraceEdgeInternal(trc, basep, name));
+}
+
+template <class BC, class T>
+inline void TraceCellHeaderEdge(JSTracer* trc,
+                                gc::CellWithTenuredGCPointer<BC, T>* thingp,
+                                const char* name) {
+  T* thing = thingp->headerPtr();
+  auto* basep = gc::ConvertToBase(&thing);
+  MOZ_ALWAYS_TRUE(gc::TraceEdgeInternal(trc, basep, name));
+  if (thing != thingp->headerPtr()) {
+    thingp->unbarrieredSetHeaderPtr(thing);
+  }
+}
+
+template <class T>
+inline void TraceCellHeaderEdge(JSTracer* trc, gc::CellWithGCPointer<T>* thingp,
+                                const char* name) {
+  T* thing = thingp->headerPtr();
+  auto* basep = gc::ConvertToBase(&thing);
+  MOZ_ALWAYS_TRUE(gc::TraceEdgeInternal(trc, basep, name));
+  if (thing != thingp->headerPtr()) {
+    thingp->unbarrieredSetHeaderPtr(thing);
+  }
+}
+
+
+template <typename T>
+inline void TraceRoot(JSTracer* trc, T* thingp, const char* name) {
+  gc::AssertRootMarkingPhase(trc);
+  auto* basep = gc::ConvertToBase(thingp);
+  MOZ_ALWAYS_TRUE(gc::TraceEdgeInternal(trc, basep, name));
+}
+
+template <typename T>
+inline void TraceRoot(JSTracer* trc, const HeapPtr<T>* thingp,
+                      const char* name) {
+  TraceRoot(trc, thingp->unbarrieredAddress(), name);
+}
+
+template <typename T>
+void TraceBufferRoot(JSTracer* trc, JS::Zone* zone, T** bufferp,
+                     const char* name) {
+  void** ptrp = reinterpret_cast<void**>(bufferp);
+  gc::TraceBufferEdgeInternal(trc, ptrp, name);
+}
+
+template <typename T>
+void BufferHolder<T>::trace(JSTracer* trc) {
+  if (buffer) {
+    TraceBufferRoot(trc, zone, &buffer, "BufferHolder buffer");
+    JS::GCPolicy<T>::trace(trc, buffer, "BufferHolder data");
+  }
+}
+
+
+template <typename T>
+inline void TraceManuallyBarrieredEdge(JSTracer* trc, T* thingp,
+                                       const char* name) {
+  auto* basep = gc::ConvertToBase(thingp);
+  MOZ_ALWAYS_TRUE(gc::TraceEdgeInternal(trc, basep, name));
+}
+
+template <typename T>
+struct TraceWeakResult {
+  const bool live_;
+  const T initial_;
+  const T final_;
+
+  bool isLive() const { return live_; }
+  bool isDead() const { return !live_; }
+  bool wasMoved() const { return final_ != initial_; }
+
+  MOZ_IMPLICIT operator bool() const { return isLive(); }
+
+  T initialTarget() const { return initial_; }
+
+  T finalTarget() const {
+    MOZ_ASSERT(isLive());
+    return final_;
+  }
+};
+
+template <typename T>
+inline TraceWeakResult<T> TraceWeakEdge(JSTracer* trc,
+                                        const BarrieredBase<T>* thingp,
+                                        const char* name) {
+  T* addr = thingp->unbarrieredAddress();
+  T initial = *addr;
+  JS::AutoTracingWeakEdge weak(trc);
+  bool live = !InternalBarrierMethods<T>::isMarkable(initial) ||
+              gc::TraceEdgeInternal(trc, gc::ConvertToBase(addr), name);
+  return TraceWeakResult<T>{live, initial, *addr};
+}
+template <typename T>
+inline TraceWeakResult<T> TraceManuallyBarrieredWeakEdge(JSTracer* trc,
+                                                         T* thingp,
+                                                         const char* name) {
+  T initial = *thingp;
+  JS::AutoTracingWeakEdge weak(trc);
+  bool live = !InternalBarrierMethods<T>::isMarkable(initial) ||
+              gc::TraceEdgeInternal(trc, gc::ConvertToBase(thingp), name);
+  return TraceWeakResult<T>{live, initial, *thingp};
+}
+
+template <typename T>
+inline bool TraceOrClearWeakEdge(JSTracer* trc, BarrieredBase<T>* thingp,
+                                 const char* name) {
+  T* addr = thingp->unbarrieredAddress();
+  T initial = *addr;
+  if (!InternalBarrierMethods<T>::isMarkable(initial) ||
+      gc::TraceEdgeInternal(trc, gc::ConvertToBase(addr), name)) {
+    return true;
+  }
+
+  *addr = JS::SafelyInitialized<T>::create();
+  return false;
+}
+
+
+template <typename T>
+void TraceRange(JSTracer* trc, size_t len, BarrieredBase<T>* vec,
+                const char* name) {
+  if (len == 0) {
+    return;
+  }
+  gc::TraceRangeInternal(trc, len,
+                         gc::ConvertToBase(vec[0].unbarrieredAddress()), name);
+}
+
+
+template <typename T>
+void TraceRootRange(JSTracer* trc, size_t len, T* vec, const char* name) {
+  gc::AssertRootMarkingPhase(trc);
+  gc::TraceRangeInternal(trc, len, gc::ConvertToBase(vec), name);
+}
+
+template <typename T>
+T* TraceBufferEdge(JSTracer* trc, T** bufferp, const char* name) {
+  void** ptrp = reinterpret_cast<void**>(bufferp);
+  void* ptr = gc::TraceBufferEdgeInternal(trc, ptrp, name);
+  return static_cast<T*>(ptr);
+}
+template <typename T>
+void TraceEdgeAndBuffer(JSTracer* trc, GCBuffer<T>* bufferp, const char* name) {
+  static_assert(std::is_pointer_v<T>);
+  T ptr = TraceBufferEdge(trc, bufferp->unbarrieredAddress(), name);
+  if (ptr) {
+    ptr->trace(trc);
+  }
+}
+
+template <typename T>
+void TraceManuallyBarrieredCrossCompartmentEdge(JSTracer* trc, JSObject* src,
+                                                T* dst, const char* name);
+
+template <typename T>
+void TraceCrossCompartmentEdge(JSTracer* trc, JSObject* src,
+                               const BarrieredBase<T>* dst, const char* name) {
+  TraceManuallyBarrieredCrossCompartmentEdge(
+      trc, src, gc::ConvertToBase(dst->unbarrieredAddress()), name);
+}
+
+template <typename T>
+void TraceSameZoneCrossCompartmentEdge(JSTracer* trc,
+                                       const BarrieredBase<T>* dst,
+                                       const char* name);
+
+template <typename T>
+void TraceWeakMapKeyEdgeInternal(JSTracer* trc, Zone* weakMapZone, T** thingp,
+                                 const char* name);
+
+template <typename T>
+void TraceWeakMapKeyEdgeInternal(JSTracer* trc, Zone* weakMapZone, T* thingp,
+                                 const char* name);
+
+template <typename T>
+inline void TraceWeakMapKeyEdge(JSTracer* trc, Zone* weakMapZone,
+                                const T* thingp, const char* name) {
+  TraceWeakMapKeyEdgeInternal(trc, weakMapZone,
+                              gc::ConvertToBase(const_cast<T*>(thingp)), name);
+}
+
+void TraceGenericPointerRoot(JSTracer* trc, gc::Cell** thingp,
+                             const char* name);
+
+void TraceManuallyBarrieredGenericPointerEdge(JSTracer* trc, gc::Cell** thingp,
+                                              const char* name);
+
+void TraceGCCellPtrRoot(JSTracer* trc, JS::GCCellPtr* thingp, const char* name);
+
+void TraceManuallyBarrieredGCCellPtr(JSTracer* trc, JS::GCCellPtr* thingp,
+                                     const char* name);
+
+namespace gc {
+
+void TraceCycleCollectorChildren(JSTracer* trc, Shape* shape);
+
+void TraceIncomingCCWs(JSTracer* trc, const JS::CompartmentSet& compartments);
+
+void GetTraceThingInfo(char* buf, size_t bufsize, void* thing,
+                       JS::TraceKind kind, bool includeDetails);
+
+#define DEFINE_DISPATCH_FUNCTION(name, type, _1, _2)         \
+  inline void DispatchToOnEdge(JSTracer* trc, type** thingp, \
+                               const char* name) {           \
+    trc->on##name##Edge(thingp, name);                       \
+  }
+JS_FOR_EACH_TRACEKIND(DEFINE_DISPATCH_FUNCTION)
+#undef DEFINE_DISPATCH_FUNCTION
+
+}  
+}  
+
+#endif /* js_Tracer_h */

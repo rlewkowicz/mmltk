@@ -1,0 +1,28 @@
+
+[package]
+edition = "2018"
+name = "fluent-langneg"
+version = "0.13.0"
+authors = ["Zibi Braniecki <gandalf@mozilla.com>"]
+include = ["src/**/*", "benches/*.rs", "Cargo.toml", "README.md"]
+description = "A library for language and locale negotiation.\n"
+homepage = "http://projectfluent.org/"
+categories = ["internationalization", "localization"]
+license = "Apache-2.0"
+repository = "https://github.com/projectfluent/fluent-langneg-rs"
+
+[dependencies.unic-langid]
+version = "0.9"
+[features]
+cldr = ["unic-langid/likelysubtags"]
+default = []
+[badges.coveralls]
+branch = "master"
+repository = "projectfluent/fluent-langneg-rs"
+service = "github"
+
+[badges.maintenance]
+status = "actively-developed"
+
+[badges.travis-ci]
+repository = "projectfluent/fluent-langneg-rs"

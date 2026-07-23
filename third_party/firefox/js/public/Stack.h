@@ -1,0 +1,100 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_Stack_h
+#define js_Stack_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+#include "mozilla/Maybe.h"       // mozilla::Maybe
+#include "mozilla/Variant.h"     // mozilla::Variant
+
+#include <stddef.h>  // size_t
+#include <stdint.h>  // uint32_t, uintptr_t, UINTPTR_MAX
+#include <utility>   // std::move
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "js/NativeStackLimits.h"
+#include "js/Principals.h"  // JSPrincipals, JS_HoldPrincipals, JS_DropPrincipals
+#include "js/RootingAPI.h"
+
+extern JS_PUBLIC_API void JS_SetNativeStackQuota(
+    JSContext* cx, JS::NativeStackSize systemCodeStackSize,
+    JS::NativeStackSize trustedScriptStackSize = 0,
+    JS::NativeStackSize untrustedScriptStackSize = 0);
+
+namespace js {
+
+enum class StackFormat { SpiderMonkey, V8, Default };
+
+extern JS_PUBLIC_API void SetStackFormat(JSContext* cx, StackFormat format);
+
+extern JS_PUBLIC_API StackFormat GetStackFormat(JSContext* cx);
+
+}  
+
+namespace JS {
+
+struct AllFrames {};
+
+struct MaxFrames {
+  uint32_t maxFrames;
+
+  explicit MaxFrames(uint32_t max) : maxFrames(max) { MOZ_ASSERT(max > 0); }
+};
+
+struct JS_PUBLIC_API FirstSubsumedFrame {
+  JSContext* cx;
+  JSPrincipals* principals;
+  bool ignoreSelfHosted;
+
+  explicit FirstSubsumedFrame(JSContext* cx,
+                              bool ignoreSelfHostedFrames = true);
+
+  explicit FirstSubsumedFrame(JSContext* ctx, JSPrincipals* p,
+                              bool ignoreSelfHostedFrames = true)
+      : cx(ctx), principals(p), ignoreSelfHosted(ignoreSelfHostedFrames) {
+    if (principals) {
+      JS_HoldPrincipals(principals);
+    }
+  }
+
+  FirstSubsumedFrame(const FirstSubsumedFrame&) = delete;
+  FirstSubsumedFrame& operator=(const FirstSubsumedFrame&) = delete;
+  FirstSubsumedFrame& operator=(FirstSubsumedFrame&&) = delete;
+
+  FirstSubsumedFrame(FirstSubsumedFrame&& rhs)
+      : principals(rhs.principals), ignoreSelfHosted(rhs.ignoreSelfHosted) {
+    MOZ_ASSERT(this != &rhs, "self move disallowed");
+    rhs.principals = nullptr;
+  }
+
+  ~FirstSubsumedFrame() {
+    if (principals) {
+      JS_DropPrincipals(cx, principals);
+    }
+  }
+};
+
+using StackCapture = mozilla::Variant<AllFrames, MaxFrames, FirstSubsumedFrame>;
+
+extern JS_PUBLIC_API bool CaptureCurrentStack(
+    JSContext* cx, MutableHandleObject stackp,
+    StackCapture&& capture = StackCapture(AllFrames()),
+    HandleObject startAfter = nullptr);
+
+extern JS_PUBLIC_API bool IsAsyncStackCaptureEnabledForRealm(JSContext* cx);
+
+extern JS_PUBLIC_API bool CopyAsyncStack(
+    JSContext* cx, HandleObject asyncStack, HandleString asyncCause,
+    MutableHandleObject stackp, const mozilla::Maybe<size_t>& maxFrameCount);
+
+extern JS_PUBLIC_API bool BuildStackString(
+    JSContext* cx, JSPrincipals* principals, HandleObject stack,
+    MutableHandleString stringp, size_t indent = 0,
+    js::StackFormat stackFormat = js::StackFormat::Default);
+
+}  
+
+#endif  // js_Stack_h

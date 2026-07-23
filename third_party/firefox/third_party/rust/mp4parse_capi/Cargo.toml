@@ -1,0 +1,53 @@
+
+[package]
+edition = "2018"
+name = "mp4parse_capi"
+version = "0.17.0"
+authors = [
+    "Ralph Giles <giles@mozilla.com>",
+    "Matthew Gregan <kinetik@flim.org>",
+    "Alfredo Yang <ayang@mozilla.com>",
+    "Jon Bauman <jbauman@mozilla.com>",
+    "Bryce Seager van Dyk <bvandyk@mozilla.com>",
+]
+build = false
+exclude = [
+    "*.mp4",
+    "*.avif",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Parser for ISO base media file format (mp4)"
+documentation = "https://docs.rs/mp4parse_capi/"
+license = "MPL-2.0"
+repository = "https://github.com/mozilla/mp4parse-rust"
+
+[badges.travis-ci]
+repository = "https://github.com/mozilla/mp4parse-rust"
+
+[features]
+3gpp = ["mp4parse/3gpp"]
+meta-xml = ["mp4parse/meta-xml"]
+missing-pixi-permitted = ["mp4parse/missing-pixi-permitted"]
+mp4v = ["mp4parse/mp4v"]
+
+[lib]
+name = "mp4parse_capi"
+path = "src/lib.rs"
+
+[dependencies]
+byteorder = "1.2.1"
+log = "0.4"
+num-traits = "0.2.14"
+
+[dependencies.fallible_collections]
+version = "0.5"
+features = ["std_io"]
+
+[dependencies.mp4parse]
+version = "0.17.0"
+path = "../mp4parse"
+features = ["unstable-api"]

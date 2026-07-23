@@ -1,0 +1,173 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_image_CopyOnWrite_h
+#define mozilla_image_CopyOnWrite_h
+
+#include "MainThreadUtils.h"
+#include "mozilla/RefPtr.h"
+#include "nsISupportsImpl.h"
+
+namespace mozilla {
+namespace image {
+
+
+namespace detail {
+
+template <typename T>
+class CopyOnWriteValue final {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(CopyOnWriteValue)
+
+  explicit CopyOnWriteValue(T* aValue)
+      : mValue(aValue), mReaders(0), mWriter(false) {}
+  explicit CopyOnWriteValue(already_AddRefed<T>& aValue)
+      : mValue(aValue), mReaders(0), mWriter(false) {}
+  explicit CopyOnWriteValue(already_AddRefed<T> aValue)
+      : mValue(aValue), mReaders(0), mWriter(false) {}
+  explicit CopyOnWriteValue(const RefPtr<T>& aValue)
+      : mValue(aValue), mReaders(0), mWriter(false) {}
+  explicit CopyOnWriteValue(RefPtr<T>&& aValue)
+      : mValue(std::move(aValue)), mReaders(0), mWriter(false) {}
+
+  T* get() { return mValue.get(); }
+  const T* get() const { return mValue.get(); }
+
+  bool HasReaders() const { return mReaders > 0; }
+  bool HasWriter() const { return mWriter; }
+  bool HasUsers() const { return HasReaders() || HasWriter(); }
+
+  void LockForReading() {
+    MOZ_ASSERT(!HasWriter());
+    mReaders++;
+  }
+  void UnlockForReading() {
+    MOZ_ASSERT(HasReaders());
+    mReaders--;
+  }
+
+  struct MOZ_STACK_CLASS AutoReadLock {
+    explicit AutoReadLock(CopyOnWriteValue* aValue) : mValue(aValue) {
+      mValue->LockForReading();
+    }
+    ~AutoReadLock() { mValue->UnlockForReading(); }
+    CopyOnWriteValue<T>* mValue;
+  };
+
+  void LockForWriting() {
+    MOZ_ASSERT(!HasUsers());
+    mWriter = true;
+  }
+  void UnlockForWriting() {
+    MOZ_ASSERT(HasWriter());
+    mWriter = false;
+  }
+
+  struct MOZ_STACK_CLASS AutoWriteLock {
+    explicit AutoWriteLock(CopyOnWriteValue* aValue) : mValue(aValue) {
+      mValue->LockForWriting();
+    }
+    ~AutoWriteLock() { mValue->UnlockForWriting(); }
+    CopyOnWriteValue<T>* mValue;
+  };
+
+ private:
+  CopyOnWriteValue(const CopyOnWriteValue&) = delete;
+  CopyOnWriteValue(CopyOnWriteValue&&) = delete;
+
+  ~CopyOnWriteValue() {}
+
+  RefPtr<T> mValue;
+  uint64_t mReaders = 0;
+  bool mWriter = false;
+};
+
+}  
+
+
+template <typename T>
+class CopyOnWrite final {
+  typedef detail::CopyOnWriteValue<T> CopyOnWriteValue;
+
+ public:
+  explicit CopyOnWrite(T* aValue)
+      : mValue(MakeRefPtr<CopyOnWriteValue>(aValue)) {}
+
+  explicit CopyOnWrite(already_AddRefed<T>& aValue)
+      : mValue(MakeRefPtr<CopyOnWriteValue>(aValue)) {}
+
+  explicit CopyOnWrite(already_AddRefed<T> aValue)
+      : mValue(MakeRefPtr<CopyOnWriteValue>(aValue)) {}
+
+  explicit CopyOnWrite(const RefPtr<T>& aValue)
+      : mValue(MakeRefPtr<CopyOnWriteValue>(aValue)) {}
+
+  explicit CopyOnWrite(RefPtr<T>&& aValue)
+      : mValue(MakeRefPtr<CopyOnWriteValue>(std::move(aValue))) {}
+
+  bool CanRead() const { return !mValue->HasWriter(); }
+
+  template <typename ReadFunc>
+  auto Read(ReadFunc aReader) const
+      -> decltype(aReader(static_cast<const T*>(nullptr))) {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT(CanRead());
+
+    RefPtr<CopyOnWriteValue> cowValue = mValue;
+    typename CopyOnWriteValue::AutoReadLock lock(cowValue);
+    return aReader(cowValue->get());
+  }
+
+  template <typename ReadFunc, typename ErrorFunc>
+  auto Read(ReadFunc aReader, ErrorFunc aOnError) const
+      -> decltype(aReader(static_cast<const T*>(nullptr))) {
+    MOZ_ASSERT(NS_IsMainThread());
+
+    if (!CanRead()) {
+      return aOnError();
+    }
+
+    return Read(aReader);
+  }
+
+  bool CanWrite() const { return !mValue->HasWriter(); }
+
+  template <typename WriteFunc>
+  auto Write(WriteFunc aWriter) -> decltype(aWriter(static_cast<T*>(nullptr))) {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT(CanWrite());
+
+    if (mValue->HasReaders()) {
+      mValue = MakeRefPtr<CopyOnWriteValue>(MakeRefPtr<T>(*mValue->get()));
+    }
+
+    RefPtr<CopyOnWriteValue> cowValue = mValue;
+    typename CopyOnWriteValue::AutoWriteLock lock(cowValue);
+    return aWriter(cowValue->get());
+  }
+
+  template <typename WriteFunc, typename ErrorFunc>
+  auto Write(WriteFunc aWriter, ErrorFunc aOnError)
+      -> decltype(aWriter(static_cast<T*>(nullptr))) {
+    MOZ_ASSERT(NS_IsMainThread());
+
+    if (!CanWrite()) {
+      return aOnError();
+    }
+
+    return Write(aWriter);
+  }
+
+ private:
+  CopyOnWrite(const CopyOnWrite&) = delete;
+  CopyOnWrite(CopyOnWrite&&) = delete;
+
+  RefPtr<CopyOnWriteValue> mValue;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_CopyOnWrite_h

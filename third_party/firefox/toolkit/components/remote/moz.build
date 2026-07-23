@@ -1,0 +1,46 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+SOURCES += [
+    "nsRemoteService.cpp",
+]
+
+XPCOM_MANIFESTS += [
+    "components.conf",
+]
+
+XPIDL_SOURCES += [
+    "nsIRemoteService.idl",
+]
+
+XPIDL_MODULE = "toolkitremote"
+
+SOURCES += [
+    "nsUnixRemoteServer.cpp",
+    "RemoteUtils.cpp",
+]
+if CONFIG["MOZ_ENABLE_DBUS"]:
+    SOURCES += [
+        "nsDBusRemoteClient.cpp",
+        "nsDBusRemoteServer.cpp",
+    ]
+    EXPORTS += [
+        "nsUnixRemoteServer.h",
+        "RemoteUtils.h",
+    ]
+    CXXFLAGS += CONFIG["MOZ_DBUS_CFLAGS"]
+else:
+    SOURCES += [
+        "nsGTKRemoteServer.cpp",
+        "nsXRemoteClient.cpp",
+        "nsXRemoteServer.cpp",
+    ]
+CXXFLAGS += CONFIG["MOZ_GTK3_CFLAGS"]
+
+
+LOCAL_INCLUDES += [
+    "../../profile",
+    "../../xre",
+]
+FINAL_LIBRARY = "xul"

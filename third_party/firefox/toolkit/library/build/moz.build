@@ -1,0 +1,7 @@
+USE_LIBS += ['static:xul']
+USE_LIBS += ['gkrust']
+Libxul('xul-real')
+if CONFIG['COMPILE_ENVIRONMENT']:
+    full_libname = '%s%s%s' % (CONFIG['DLL_PREFIX'], SHARED_LIBRARY_NAME, CONFIG['DLL_SUFFIX'])
+    GeneratedFile('dependentlibs.list', script='dependentlibs.py', entry_point='gen_list', inputs=['!/dist/bin/%s' % full_libname])
+    FINAL_TARGET_FILES += ['!dependentlibs.list']

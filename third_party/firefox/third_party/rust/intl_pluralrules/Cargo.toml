@@ -1,0 +1,44 @@
+
+[package]
+edition = "2018"
+name = "intl_pluralrules"
+version = "7.0.2"
+authors = [
+    "Kekoa Riggin <kekoariggin@gmail.com>",
+    "Zibi Braniecki <zbraniecki@mozilla.com>",
+]
+include = [
+    "src/**/*",
+    "benches/*.rs",
+    "Cargo.toml",
+    "README.md",
+]
+description = "Unicode Plural Rules categorizer for numeric input."
+keywords = [
+    "localization",
+    "l10n",
+    "i18n",
+    "intl",
+    "internationalization",
+]
+categories = [
+    "localization",
+    "internationalization",
+]
+license = "Apache-2.0/MIT"
+repository = "https://github.com/zbraniecki/pluralrules"
+
+[dependencies.unic-langid]
+version = "0.9"
+
+[badges.coveralls]
+branch = "master"
+repository = "zbraniecki/pluralrules"
+service = "github"
+
+[badges.maintenance]
+status = "actively-developed"
+
+[badges.travis-ci]
+branch = "master"
+repository = "zbraniecki/pluralrules"

@@ -1,0 +1,108 @@
+// Copyright 2017 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "compiler/translator/tree_util/RunAtTheEndOfShader.h"
+
+#include "compiler/translator/Compiler.h"
+#include "compiler/translator/IntermNode.h"
+#include "compiler/translator/StaticType.h"
+#include "compiler/translator/SymbolTable.h"
+#include "compiler/translator/tree_util/FindMain.h"
+#include "compiler/translator/tree_util/IntermNode_util.h"
+#include "compiler/translator/tree_util/IntermTraverse.h"
+
+namespace sh
+{
+
+namespace
+{
+
+constexpr const ImmutableString kMainString("main");
+
+class ContainsReturnOrDiscardTraverser : public TIntermTraverser
+{
+  public:
+    ContainsReturnOrDiscardTraverser()
+        : TIntermTraverser(true, false, false), mContainsReturnOrDiscard(false)
+    {}
+
+    bool visitBranch(Visit visit, TIntermBranch *node) override
+    {
+        if (node->getFlowOp() == EOpReturn || node->getFlowOp() == EOpKill)
+        {
+            mContainsReturnOrDiscard = true;
+        }
+        return false;
+    }
+
+    bool containsReturnOrDiscard() { return mContainsReturnOrDiscard; }
+
+  private:
+    bool mContainsReturnOrDiscard;
+};
+
+bool ContainsReturnOrDiscard(TIntermNode *node)
+{
+    ContainsReturnOrDiscardTraverser traverser;
+    node->traverse(&traverser);
+    return traverser.containsReturnOrDiscard();
+}
+
+void WrapMainAndAppend(TIntermBlock *root,
+                       TIntermFunctionDefinition *main,
+                       TIntermNode *codeToRun,
+                       TSymbolTable *symbolTable)
+{
+    TFunction *oldMain =
+        new TFunction(symbolTable, kEmptyImmutableString, SymbolType::AngleInternal,
+                      StaticType::GetBasic<EbtVoid, EbpUndefined>(), false);
+    TIntermFunctionDefinition *oldMainDefinition =
+        CreateInternalFunctionDefinitionNode(*oldMain, main->getBody());
+
+    bool replaced = root->replaceChildNode(main, oldMainDefinition);
+    ASSERT(replaced);
+
+    TFunction *newMain = new TFunction(symbolTable, kMainString, SymbolType::UserDefined,
+                                       StaticType::GetBasic<EbtVoid, EbpUndefined>(), false);
+    TIntermFunctionPrototype *newMainProto = new TIntermFunctionPrototype(newMain);
+
+    TIntermBlock *newMainBody = new TIntermBlock();
+    TIntermSequence emptySequence;
+    TIntermAggregate *oldMainCall = TIntermAggregate::CreateFunctionCall(*oldMain, &emptySequence);
+    newMainBody->appendStatement(oldMainCall);
+    newMainBody->appendStatement(codeToRun);
+
+    TIntermFunctionDefinition *newMainDefinition =
+        new TIntermFunctionDefinition(newMainProto, newMainBody);
+    root->appendStatement(newMainDefinition);
+
+    TIntermFunctionPrototype *oldMainProto = FindMainPrototype(root);
+    if (oldMainProto)
+    {
+        newMainProto = new TIntermFunctionPrototype(newMain);
+        replaced     = root->replaceChildNode(oldMainProto, newMainProto);
+    }
+}
+
+}  
+
+bool RunAtTheEndOfShader(TCompiler *compiler,
+                         TIntermBlock *root,
+                         TIntermNode *codeToRun,
+                         TSymbolTable *symbolTable)
+{
+    TIntermFunctionDefinition *main = FindMain(root);
+    if (ContainsReturnOrDiscard(main))
+    {
+        WrapMainAndAppend(root, main, codeToRun, symbolTable);
+    }
+    else
+    {
+        main->getBody()->appendStatement(codeToRun);
+    }
+
+    return compiler->validateAST(root);
+}
+
+}  

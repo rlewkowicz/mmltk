@@ -1,0 +1,570 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(MediaDecoder_h_)
+#  define MediaDecoder_h_
+
+#  include "BackgroundVideoDecodingPermissionObserver.h"
+#  include "DecoderDoctorDiagnostics.h"
+#  include "MediaContainerType.h"
+#  include "MediaDecoderOwner.h"
+#  include "MediaEventSource.h"
+#  include "MediaMetadataManager.h"
+#  include "MediaPromiseDefs.h"
+#  include "MediaResource.h"
+#  include "SeekTarget.h"
+#  include "TimeUnits.h"
+#  include "mozilla/Atomics.h"
+#  include "mozilla/DefineEnum.h"
+#  include "mozilla/MozPromise.h"
+#  include "mozilla/ReentrantMonitor.h"
+#  include "mozilla/StateMirroring.h"
+#  include "mozilla/StateWatching.h"
+#  include "mozilla/dom/MediaDebugInfoBinding.h"
+#  include "nsCOMPtr.h"
+#  include "nsIObserver.h"
+#  include "nsISupports.h"
+#  include "nsITimer.h"
+
+class AudioDeviceInfo;
+class nsIPrincipal;
+
+namespace mozilla {
+
+class AbstractThread;
+class DOMMediaStream;
+class ProcessedMediaTrack;
+class FrameStatistics;
+class VideoFrameContainer;
+class MediaFormatReader;
+class MediaDecoderStateMachineBase;
+struct MediaPlaybackEvent;
+struct SharedDummyTrack;
+
+template <typename T>
+struct DurationToType {
+  double operator()(double aDouble);
+  double operator()(const media::TimeUnit& aTimeUnit);
+};
+
+template <>
+struct DurationToType<double> {
+  double operator()(double aDouble) { return aDouble; }
+  double operator()(const media::TimeUnit& aTimeUnit) {
+    if (aTimeUnit.IsValid()) {
+      if (aTimeUnit.IsPosInf()) {
+        return std::numeric_limits<double>::infinity();
+      }
+      if (aTimeUnit.IsNegInf()) {
+        return -std::numeric_limits<double>::infinity();
+      }
+      return aTimeUnit.ToSeconds();
+    }
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+};
+
+using DurationToDouble = DurationToType<double>;
+
+template <>
+struct DurationToType<media::TimeUnit> {
+  media::TimeUnit operator()(double aDouble) {
+    return media::TimeUnit::FromSeconds(aDouble);
+  }
+  media::TimeUnit operator()(const media::TimeUnit& aTimeUnit) {
+    return aTimeUnit;
+  }
+};
+
+using DurationToTimeUnit = DurationToType<media::TimeUnit>;
+
+struct MOZ_STACK_CLASS MediaDecoderInit {
+  MediaDecoderOwner* const mOwner;
+  const double mVolume;
+  const bool mPreservesPitch;
+  const double mPlaybackRate;
+  const bool mMinimizePreroll;
+  const bool mHasSuspendTaint;
+  const bool mLooping;
+  const MediaContainerType mContainerType;
+  const nsAutoString mStreamName;
+
+  MediaDecoderInit(MediaDecoderOwner* aOwner, double aVolume,
+                   bool aPreservesPitch, double aPlaybackRate,
+                   bool aMinimizePreroll, bool aHasSuspendTaint, bool aLooping,
+                   const MediaContainerType& aContainerType)
+      : mOwner(aOwner),
+        mVolume(aVolume),
+        mPreservesPitch(aPreservesPitch),
+        mPlaybackRate(aPlaybackRate),
+        mMinimizePreroll(aMinimizePreroll),
+        mHasSuspendTaint(aHasSuspendTaint),
+        mLooping(aLooping),
+        mContainerType(aContainerType) {}
+};
+
+DDLoggedTypeDeclName(MediaDecoder);
+
+class MediaDecoder : public DecoderDoctorLifeLogger<MediaDecoder> {
+ public:
+  typedef MozPromise<bool , bool ,
+                      true>
+      SeekPromise;
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaDecoder)
+
+  MOZ_DEFINE_ENUM_WITH_TOSTRING_AT_CLASS_SCOPE(
+      PlayState, (PLAY_STATE_LOADING, PLAY_STATE_PAUSED, PLAY_STATE_PLAYING,
+                  PLAY_STATE_ENDED, PLAY_STATE_SHUTDOWN));
+
+  static void InitStatics();
+
+  explicit MediaDecoder(MediaDecoderInit& aInit);
+
+  const MediaContainerType& ContainerType() const { return mContainerType; }
+
+  virtual void Shutdown();
+
+  void NotifyXPCOMShutdown();
+
+  void NetworkError(const MediaResult& aError);
+
+  virtual already_AddRefed<nsIPrincipal> GetCurrentPrincipal() = 0;
+
+  virtual bool HadCrossOriginRedirects() = 0;
+
+  virtual double GetCurrentTime();
+
+  void Seek(double aTime, SeekTarget::Type aSeekType);
+
+  virtual void Play();
+
+  void NotifyOwnerActivityChanged(bool aIsOwnerInvisible,
+                                  bool aIsOwnerConnected,
+                                  bool aIsOwnerInBackground,
+                                  bool aHasOwnerPendingCallbacks);
+
+  virtual void Pause();
+  void SetVolume(double aVolume);
+
+  void SetPlaybackRate(double aPlaybackRate);
+  void SetPreservesPitch(bool aPreservesPitch);
+  void SetLooping(bool aLooping);
+  void SetStreamName(const nsAutoString& aStreamName);
+
+  RefPtr<GenericPromise> SetSink(AudioDeviceInfo* aSinkDevice);
+
+  bool GetMinimizePreroll() const { return mMinimizePreroll; }
+
+  void SetDelaySeekMode(bool aShouldDelaySeek);
+
+
+  MOZ_DEFINE_ENUM_CLASS_WITH_TOSTRING_AT_CLASS_SCOPE(OutputCaptureState,
+                                                     (Capture, Halt, None));
+
+  struct OutputCaptureInfo {
+    explicit OutputCaptureInfo(OutputCaptureState aState);
+
+    OutputCaptureInfo(OutputCaptureState aState, SharedDummyTrack* aDummyTrack,
+                      bool aShouldConfigAudioOutput, AudioDeviceInfo* aDevice);
+
+    OutputCaptureInfo(const OutputCaptureInfo& aOther);
+    OutputCaptureInfo& operator=(const OutputCaptureInfo& aOther);
+
+    OutputCaptureInfo(OutputCaptureInfo&& aOther) noexcept;
+    OutputCaptureInfo& operator=(OutputCaptureInfo&& aOther) noexcept;
+
+    bool operator==(const OutputCaptureInfo& aOther) const;
+    bool operator!=(const OutputCaptureInfo& aOther) const {
+      return !(*this == aOther);
+    }
+
+    ~OutputCaptureInfo();
+
+    OutputCaptureState mState;
+    nsMainThreadPtrHandle<SharedDummyTrack> mDummyTrack;
+    bool mShouldConfigAudioOutput;
+    RefPtr<AudioDeviceInfo> mDevice;
+  };
+
+  void SetOutputCaptureState(OutputCaptureInfo aInfo);
+
+  void AddOutputTrack(RefPtr<ProcessedMediaTrack> aTrack);
+  void RemoveOutputTrack(const RefPtr<ProcessedMediaTrack>& aTrack);
+  void SetOutputTracksPrincipal(const RefPtr<nsIPrincipal>& aPrincipal);
+
+  virtual double GetDuration();
+
+  bool IsInfinite() const;
+
+  bool IsSeeking() const;
+
+  bool IsEnded() const;
+
+  virtual bool IsMSE() const { return false; }
+
+  bool OwnerHasError() const;
+
+  bool IsMediaSeekable();
+  virtual bool IsTransportSeekable() = 0;
+
+  virtual media::TimeIntervals GetSeekable();
+  virtual media::TimeRanges GetSeekableTimeRanges();
+
+  template <typename T>
+  T GetSeekableImpl();
+
+  virtual void SetFragmentEndTime(double aTime);
+
+  void Invalidate();
+  void InvalidateWithFlags(uint32_t aFlags);
+
+  virtual void Suspend();
+
+  virtual void Resume();
+
+  virtual void SetLoadInBackground(bool aLoadInBackground) {}
+
+  MediaDecoderStateMachineBase* GetStateMachine() const;
+  void SetStateMachine(
+      already_AddRefed<MediaDecoderStateMachineBase> aStateMachine);
+
+  virtual media::TimeIntervals GetBuffered();
+
+  size_t SizeOfVideoQueue();
+  size_t SizeOfAudioQueue();
+
+  struct ResourceSizes {
+    typedef MozPromise<size_t, size_t, true> SizeOfPromise;
+    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ResourceSizes)
+    explicit ResourceSizes(MallocSizeOf aMallocSizeOf)
+        : mMallocSizeOf(aMallocSizeOf), mByteSize(0), mCallback() {}
+
+    mozilla::MallocSizeOf mMallocSizeOf;
+    mozilla::Atomic<size_t> mByteSize;
+
+    RefPtr<SizeOfPromise> Promise() { return mCallback.Ensure(__func__); }
+
+   private:
+    ~ResourceSizes() { mCallback.ResolveIfExists(mByteSize, __func__); }
+
+    MozPromiseHolder<SizeOfPromise> mCallback;
+  };
+
+  virtual void AddSizeOfResources(ResourceSizes* aSizes) = 0;
+
+  VideoFrameContainer* GetVideoFrameContainer() { return mVideoFrameContainer; }
+
+  layers::ImageContainer* GetImageContainer();
+
+  bool CanPlayThrough();
+
+  void SetElementVisibility(bool aIsOwnerInvisible, bool aIsOwnerConnected,
+                            bool aIsOwnerInBackground,
+                            bool aHasOwnerPendingCallbacks);
+
+  void SetForcedHidden(bool aForcedHidden);
+
+  void SetSuspendTaint(bool aTaint);
+
+  bool HasSuspendTaint() const;
+
+  void UpdateVideoDecodeMode();
+
+  void SetSecondaryVideoContainer(
+      const RefPtr<VideoFrameContainer>& aSecondaryVideoContainer);
+
+  void SetIsBackgroundVideoDecodingAllowed(bool aAllowed);
+
+  bool IsVideoDecodingSuspended() const;
+
+  bool ShouldResistFingerprinting() const {
+    return mShouldResistFingerprinting;
+  }
+
+
+  virtual void ChangeState(PlayState aState);
+
+  void PlaybackEnded();
+
+  void OnSeekRejected();
+  void OnSeekResolved();
+
+  void SeekingStarted();
+
+  void UpdateLogicalPositionInternal();
+  void UpdateLogicalPosition() {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_DIAGNOSTIC_ASSERT(!IsShutdown());
+    if (mPlayState == PLAY_STATE_PAUSED || IsSeeking()) {
+      return;
+    }
+    UpdateLogicalPositionInternal();
+  }
+
+  int64_t GetDownloadPosition();
+
+  void DecodeError(const MediaResult& aError);
+
+  void UpdateSameOriginStatus(bool aSameOrigin);
+
+  MediaDecoderOwner* GetOwner() const;
+
+  AbstractThread* AbstractMainThread() const { return mAbstractMainThread; }
+
+  static bool IsOggEnabled();
+  static bool IsOpusEnabled();
+  static bool IsWaveEnabled();
+  static bool IsWebMEnabled();
+
+  FrameStatistics& GetFrameStatistics() { return *mFrameStats; }
+
+  void UpdateReadyState() {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_DIAGNOSTIC_ASSERT(!IsShutdown());
+    GetOwner()->UpdateReadyState();
+  }
+
+  MediaDecoderOwner::NextFrameStatus NextFrameStatus() const {
+    return mNextFrameStatus;
+  }
+
+  virtual MediaDecoderOwner::NextFrameStatus NextFrameBufferedStatus();
+
+  RefPtr<GenericPromise> RequestDebugInfo(dom::MediaDecoderDebugInfo& aInfo);
+
+  void GetDebugInfo(dom::MediaDecoderDebugInfo& aInfo);
+
+  virtual bool IsHLSDecoder() const { return false; }
+
+ protected:
+  virtual ~MediaDecoder();
+
+  virtual void FirstFrameLoaded(UniquePtr<MediaInfo> aInfo,
+                                MediaDecoderEventVisibility aEventVisibility);
+
+  nsresult CreateAndInitStateMachine(bool aIsLiveStream);
+
+  virtual already_AddRefed<MediaDecoderStateMachineBase> CreateStateMachine() =
+      0;
+
+  void SetStateMachineParameters();
+
+  void DisconnectEvents();
+  RefPtr<ShutdownPromise> ShutdownStateMachine();
+
+  virtual void ShutdownInternal();
+
+  bool IsShutdown() const;
+
+  virtual void DurationChanged();
+
+  WatchManager<MediaDecoder> mWatchManager;
+
+  double ExplicitDuration() { return mExplicitDuration.ref(); }
+
+  void SetExplicitDuration(double aValue) {
+    MOZ_DIAGNOSTIC_ASSERT(!IsShutdown());
+    mExplicitDuration = Some(aValue);
+
+    DurationChanged();
+  }
+
+  virtual void OnPlaybackEvent(const MediaPlaybackEvent& aEvent);
+
+  virtual void MetadataLoaded(UniquePtr<MediaInfo> aInfo,
+                              UniquePtr<MetadataTags> aTags,
+                              MediaDecoderEventVisibility aEventVisibility);
+
+  void SetLogicalPosition(const media::TimeUnit& aNewPosition);
+
+
+  double mLogicalPosition;
+
+  virtual media::TimeUnit CurrentPosition() { return mCurrentPosition.Ref(); }
+
+  already_AddRefed<layers::KnowsCompositor> GetCompositor();
+
+  Variant<media::TimeUnit, double> mDuration;
+
+
+  RefPtr<MediaFormatReader> mReader;
+
+  static constexpr auto DEFAULT_NEXT_FRAME_AVAILABLE_BUFFERED =
+      media::TimeUnit::FromMicroseconds(250000);
+
+ private:
+  void NotifyCompositor();
+
+  void OnPlaybackErrorEvent(const MediaResult& aError);
+
+  void OnDecoderDoctorEvent(DecoderDoctorEvent aEvent);
+
+  void OnMediaNotSeekable() { mMediaSeekable = false; }
+
+  void OnNextFrameStatus(MediaDecoderOwner::NextFrameStatus);
+
+  void OnTrackInfoUpdated(const VideoInfo& aVideoInfo,
+                          const AudioInfo& aAudioInfo);
+
+  void OnSecondaryVideoContainerInstalled(
+      const RefPtr<VideoFrameContainer>& aSecondaryVideoContainer);
+
+  void FinishShutdown();
+
+  void ConnectMirrors();
+  void DisconnectMirrors();
+  virtual bool CanPlayThroughImpl() = 0;
+
+  RefPtr<MediaDecoderStateMachineBase> mDecoderStateMachine;
+
+ protected:
+  void NotifyReaderDataArrived();
+  void DiscardOngoingSeekIfExists();
+  void CallSeek(const SeekTarget& aTarget);
+
+  virtual void NotifyPrincipalChanged();
+
+  MozPromiseRequestHolder<SeekPromise> mSeekRequest;
+
+  void OnMetadataUpdate(TimedMetadata&& aMetadata);
+
+  MediaDecoderOwner* mOwner;
+
+  const RefPtr<AbstractThread> mAbstractMainThread;
+
+  const RefPtr<FrameStatistics> mFrameStats;
+
+  RefPtr<VideoFrameContainer> mVideoFrameContainer;
+
+  const bool mMinimizePreroll;
+
+  bool mFiredMetadataLoaded;
+
+  bool mMediaSeekable = true;
+
+  bool mMediaSeekableOnlyInBufferedRanges = false;
+
+  UniquePtr<MediaInfo> mInfo;
+
+  bool mIsOwnerInvisible;
+
+  bool mIsOwnerConnected;
+
+  bool mIsOwnerInBackground;
+
+  bool mHasOwnerPendingCallbacks;
+
+  bool mForcedHidden;
+
+  bool mHasSuspendTaint;
+
+  const bool mShouldResistFingerprinting;
+
+  MediaDecoderOwner::NextFrameStatus mNextFrameStatus =
+      MediaDecoderOwner::NEXT_FRAME_UNAVAILABLE;
+
+  MediaEventListener mTimedMetadataListener;
+
+  MediaEventListener mMetadataLoadedListener;
+  MediaEventListener mFirstFrameLoadedListener;
+
+  MediaEventListener mOnPlaybackEvent;
+  MediaEventListener mOnPlaybackErrorEvent;
+  MediaEventListener mOnDecoderDoctorEvent;
+  MediaEventListener mOnMediaNotSeekable;
+  MediaEventListener mOnDecodeWarning;
+  MediaEventListener mOnNextFrameStatus;
+  MediaEventListener mOnTrackInfoUpdated;
+  MediaEventListener mOnSecondaryVideoContainerInstalled;
+
+  bool mIsVideoDecodingSuspended = false;
+
+ protected:
+  double mPlaybackRate;
+
+  Watchable<bool> mLogicallySeeking;
+
+  Mirror<media::TimeIntervals> mBuffered;
+
+  Mirror<media::TimeUnit> mCurrentPosition;
+
+  Mirror<media::NullableTimeUnit> mStateMachineDuration;
+
+  Mirror<bool> mIsAudioDataAudible;
+
+  Canonical<double> mVolume;
+
+  Canonical<bool> mPreservesPitch;
+
+  Canonical<bool> mLooping;
+
+  Canonical<nsAutoString> mStreamName;
+
+  Canonical<RefPtr<AudioDeviceInfo>> mSinkDevice;
+
+  Canonical<RefPtr<VideoFrameContainer>> mSecondaryVideoContainer;
+
+  Canonical<OutputCaptureInfo> mOutputCaptureInfo;
+
+  Canonical<CopyableTArray<RefPtr<ProcessedMediaTrack>>> mOutputTracks;
+
+  Canonical<PrincipalHandle> mOutputPrincipal;
+
+  Maybe<double> mExplicitDuration;
+
+  Canonical<PlayState> mPlayState;
+
+  PlayState mNextState = PLAY_STATE_PAUSED;
+
+  bool mSameOriginMedia;
+
+  RefPtr<BackgroundVideoDecodingPermissionObserver> mVideoDecodingOberver;
+
+  bool mIsBackgroundVideoDecodingAllowed;
+
+  bool mShouldDelaySeek = false;
+  Maybe<SeekTarget> mDelayedSeekTarget;
+
+ public:
+  Canonical<double>& CanonicalVolume() { return mVolume; }
+  Canonical<bool>& CanonicalPreservesPitch() { return mPreservesPitch; }
+  Canonical<bool>& CanonicalLooping() { return mLooping; }
+  Canonical<nsAutoString>& CanonicalStreamName() { return mStreamName; }
+  Canonical<RefPtr<AudioDeviceInfo>>& CanonicalSinkDevice() {
+    return mSinkDevice;
+  }
+  Canonical<RefPtr<VideoFrameContainer>>& CanonicalSecondaryVideoContainer() {
+    return mSecondaryVideoContainer;
+  }
+  Canonical<OutputCaptureInfo>& CanonicalOutputCaptureInfo() {
+    return mOutputCaptureInfo;
+  }
+  Canonical<CopyableTArray<RefPtr<ProcessedMediaTrack>>>&
+  CanonicalOutputTracks() {
+    return mOutputTracks;
+  }
+  Canonical<PrincipalHandle>& CanonicalOutputPrincipal() {
+    return mOutputPrincipal;
+  }
+  Canonical<PlayState>& CanonicalPlayState() { return mPlayState; }
+
+ private:
+  enum class PositionUpdate {
+    ePeriodicUpdate,
+    eSeamlessLoopingSeeking,
+    eOther,
+  };
+  PositionUpdate GetPositionUpdateReason(double aPrevPos,
+                                         const media::TimeUnit& aCurPos) const;
+
+  void NotifyAudibleStateChanged();
+
+  const MediaContainerType mContainerType;
+  bool mCanPlayThrough = false;
+};
+
+}  
+
+#endif

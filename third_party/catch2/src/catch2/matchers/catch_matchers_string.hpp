@@ -1,0 +1,74 @@
+
+
+#ifndef CATCH_MATCHERS_STRING_HPP_INCLUDED
+#define CATCH_MATCHERS_STRING_HPP_INCLUDED
+
+#include <catch2/internal/catch_stringref.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
+#include <catch2/catch_case_sensitive.hpp>
+
+#include <string>
+
+namespace Catch {
+namespace Matchers {
+
+struct CasedString {
+    CasedString(std::string const& str, CaseSensitive caseSensitivity);
+    std::string adjustString(std::string const& str) const;
+    StringRef caseSensitivitySuffix() const;
+
+    CaseSensitive m_caseSensitivity;
+    std::string m_str;
+};
+
+class StringMatcherBase : public MatcherBase<std::string> {
+   protected:
+    CasedString m_comparator;
+    StringRef m_operation;
+
+   public:
+    StringMatcherBase(StringRef operation, CasedString const& comparator);
+    std::string describe() const override;
+};
+
+class StringEqualsMatcher final : public StringMatcherBase {
+   public:
+    StringEqualsMatcher(CasedString const& comparator);
+    bool match(std::string const& source) const override;
+};
+class StringContainsMatcher final : public StringMatcherBase {
+   public:
+    StringContainsMatcher(CasedString const& comparator);
+    bool match(std::string const& source) const override;
+};
+class StartsWithMatcher final : public StringMatcherBase {
+   public:
+    StartsWithMatcher(CasedString const& comparator);
+    bool match(std::string const& source) const override;
+};
+class EndsWithMatcher final : public StringMatcherBase {
+   public:
+    EndsWithMatcher(CasedString const& comparator);
+    bool match(std::string const& source) const override;
+};
+
+class RegexMatcher final : public MatcherBase<std::string> {
+    std::string m_regex;
+    CaseSensitive m_caseSensitivity;
+
+   public:
+    RegexMatcher(std::string regex, CaseSensitive caseSensitivity);
+    bool match(std::string const& matchee) const override;
+    std::string describe() const override;
+};
+
+StringEqualsMatcher Equals(std::string const& str, CaseSensitive caseSensitivity = CaseSensitive::Yes);
+StringContainsMatcher ContainsSubstring(std::string const& str, CaseSensitive caseSensitivity = CaseSensitive::Yes);
+EndsWithMatcher EndsWith(std::string const& str, CaseSensitive caseSensitivity = CaseSensitive::Yes);
+StartsWithMatcher StartsWith(std::string const& str, CaseSensitive caseSensitivity = CaseSensitive::Yes);
+RegexMatcher Matches(std::string const& regex, CaseSensitive caseSensitivity = CaseSensitive::Yes);
+
+}  
+}  
+
+#endif  // CATCH_MATCHERS_STRING_HPP_INCLUDED

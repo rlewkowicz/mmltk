@@ -1,0 +1,276 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/LICM.h"
+
+#include "jit/IonAnalysis.h"
+#include "jit/JitSpewer.h"
+#include "jit/MIRGenerator.h"
+#include "jit/MIRGraph.h"
+
+using namespace js;
+using namespace js::jit;
+
+static constexpr size_t LargestAllowedLoop = 100;
+
+static constexpr size_t LargestAllowedTableSwitch = 25;
+
+static bool LoopContainsPossibleCall(MIRGraph& graph, MBasicBlock* header,
+                                     MBasicBlock* backedge) {
+  for (auto i(graph.rpoBegin(header));; ++i) {
+    MOZ_ASSERT(i != graph.rpoEnd(),
+               "Reached end of graph searching for blocks in loop");
+    MBasicBlock* block = *i;
+    if (!block->isMarked()) {
+      continue;
+    }
+
+    for (auto ins : *block) {
+      if (ins->possiblyCalls()) {
+#ifdef JS_JITSPEW
+        JitSpew(JitSpew_LICM, "    Possible call found at %s%u", ins->opName(),
+                ins->id());
+#endif
+        return true;
+      }
+    }
+
+    if (block == backedge) {
+      break;
+    }
+  }
+  return false;
+}
+
+static bool LoopContainsBigTableSwitch(MIRGraph& graph, MBasicBlock* header,
+                                        size_t* numSuccessors) {
+  MBasicBlock* backedge = header->backedge();
+
+  for (auto i(graph.rpoBegin(header));; ++i) {
+    MOZ_ASSERT(i != graph.rpoEnd(),
+               "Reached end of graph searching for blocks in loop");
+    MBasicBlock* block = *i;
+    if (!block->isMarked()) {
+      continue;
+    }
+
+    for (auto ins : *block) {
+      if (ins->isTableSwitch() &&
+          ins->toTableSwitch()->numSuccessors() > LargestAllowedTableSwitch) {
+        *numSuccessors = ins->toTableSwitch()->numSuccessors();
+        return true;
+      }
+    }
+
+    if (block == backedge) {
+      break;
+    }
+  }
+  return false;
+}
+
+static bool IsBeforeLoop(MDefinition* ins, MBasicBlock* header) {
+  return ins->block()->id() < header->id();
+}
+
+static bool IsInLoop(MDefinition* ins) { return ins->block()->isMarked(); }
+
+static bool RequiresHoistedUse(const MDefinition* ins, bool hasCalls) {
+  if (ins->isBox()) {
+    MOZ_ASSERT(!ins->toBox()->input()->isBox(),
+               "Box of a box could lead to unbounded recursion");
+    return true;
+  }
+
+  if (ins->isConstant() && (!IsFloatingPointType(ins->type()) || hasCalls)) {
+    return true;
+  }
+
+  return false;
+}
+
+static bool HasOperandInLoop(MInstruction* ins, bool hasCalls) {
+  for (size_t i = 0, e = ins->numOperands(); i != e; ++i) {
+    MDefinition* op = ins->getOperand(i);
+
+    if (!IsInLoop(op)) {
+      continue;
+    }
+
+    if (RequiresHoistedUse(op, hasCalls)) {
+      if (!HasOperandInLoop(op->toInstruction(), hasCalls)) {
+        continue;
+      }
+    }
+
+    return true;
+  }
+  return false;
+}
+
+static bool IsHoistableIgnoringDependency(MInstruction* ins, bool hasCalls) {
+  return ins->isMovable() && !ins->isEffectful() &&
+         !HasOperandInLoop(ins, hasCalls);
+}
+
+static bool HasDependencyInLoop(MInstruction* ins, MBasicBlock* header) {
+  if (MDefinition* dep = ins->dependency()) {
+    return !IsBeforeLoop(dep, header);
+  }
+  return false;
+}
+
+static bool IsHoistable(MInstruction* ins, MBasicBlock* header, bool hasCalls) {
+  return IsHoistableIgnoringDependency(ins, hasCalls) &&
+         !HasDependencyInLoop(ins, header);
+}
+
+static void MoveDeferredOperands(MInstruction* ins, MInstruction* hoistPoint,
+                                 bool hasCalls) {
+  for (size_t i = 0, e = ins->numOperands(); i != e; ++i) {
+    MDefinition* op = ins->getOperand(i);
+    if (!IsInLoop(op)) {
+      continue;
+    }
+    MOZ_ASSERT(RequiresHoistedUse(op, hasCalls),
+               "Deferred loop-invariant operand is not cheap");
+    MInstruction* opIns = op->toInstruction();
+
+    MoveDeferredOperands(opIns, hoistPoint, hasCalls);
+
+#ifdef JS_JITSPEW
+    JitSpew(JitSpew_LICM,
+            "      Hoisting %s%u (now that a user will be hoisted)",
+            opIns->opName(), opIns->id());
+#endif
+
+    opIns->block()->moveBefore(hoistPoint, opIns);
+    opIns->setBailoutKind(BailoutKind::LICM);
+  }
+}
+
+static void VisitLoopBlock(MBasicBlock* block, MBasicBlock* header,
+                           MInstruction* hoistPoint, bool hasCalls) {
+  for (auto insIter(block->begin()), insEnd(block->end()); insIter != insEnd;) {
+    MInstruction* ins = *insIter++;
+
+    if (!IsHoistable(ins, header, hasCalls)) {
+#ifdef JS_JITSPEW
+      if (IsHoistableIgnoringDependency(ins, hasCalls)) {
+        JitSpew(JitSpew_LICM,
+                "      %s%u isn't hoistable due to dependency on %s%u",
+                ins->opName(), ins->id(), ins->dependency()->opName(),
+                ins->dependency()->id());
+      }
+#endif
+      continue;
+    }
+
+    if (RequiresHoistedUse(ins, hasCalls)) {
+#ifdef JS_JITSPEW
+      JitSpew(JitSpew_LICM, "      %s%u will be hoisted only if its users are",
+              ins->opName(), ins->id());
+#endif
+      continue;
+    }
+
+    MoveDeferredOperands(ins, hoistPoint, hasCalls);
+
+#ifdef JS_JITSPEW
+    JitSpew(JitSpew_LICM, "      Hoisting %s%u", ins->opName(), ins->id());
+#endif
+
+    block->moveBefore(hoistPoint, ins);
+    ins->setBailoutKind(BailoutKind::LICM);
+  }
+}
+
+static void VisitLoop(MIRGraph& graph, MBasicBlock* header) {
+  MInstruction* hoistPoint = header->loopPredecessor()->lastIns();
+
+#ifdef JS_JITSPEW
+  JitSpew(JitSpew_LICM, "  Visiting loop with header block%u, hoisting to %s%u",
+          header->id(), hoistPoint->opName(), hoistPoint->id());
+#endif
+
+  MBasicBlock* backedge = header->backedge();
+
+  bool hasCalls = LoopContainsPossibleCall(graph, header, backedge);
+
+  for (auto i(graph.rpoBegin(header));; ++i) {
+    MOZ_ASSERT(i != graph.rpoEnd(),
+               "Reached end of graph searching for blocks in loop");
+    MBasicBlock* block = *i;
+    if (!block->isMarked()) {
+      continue;
+    }
+
+#ifdef JS_JITSPEW
+    JitSpew(JitSpew_LICM, "    Visiting block%u", block->id());
+#endif
+
+    VisitLoopBlock(block, header, hoistPoint, hasCalls);
+
+    if (block == backedge) {
+      break;
+    }
+  }
+}
+
+bool jit::LICM(const MIRGenerator* mir, MIRGraph& graph) {
+  JitSpew(JitSpew_LICM, "Beginning LICM pass");
+
+  for (auto i(graph.rpoBegin()), e(graph.rpoEnd()); i != e; ++i) {
+    MBasicBlock* header = *i;
+    if (!header->isLoopHeader()) {
+      continue;
+    }
+
+    bool canOsr;
+    size_t numBlocks = MarkLoopBlocks(graph, header, &canOsr);
+
+    if (numBlocks == 0) {
+      JitSpew(JitSpew_LICM,
+              "  Skipping loop with header block%u -- contains zero blocks",
+              header->id());
+      continue;
+    }
+
+
+    bool doVisit = true;
+    if (canOsr) {
+      JitSpew(JitSpew_LICM, "  Skipping loop with header block%u due to OSR",
+              header->id());
+      doVisit = false;
+    } else if (numBlocks > LargestAllowedLoop) {
+      JitSpew(JitSpew_LICM,
+              "  Skipping loop with header block%u "
+              "due to too many blocks (%u > thresh %u)",
+              header->id(), (uint32_t)numBlocks, (uint32_t)LargestAllowedLoop);
+      doVisit = false;
+    } else {
+      size_t switchSize = 0;
+      if (LoopContainsBigTableSwitch(graph, header, &switchSize)) {
+        JitSpew(JitSpew_LICM,
+                "  Skipping loop with header block%u "
+                "due to oversize tableswitch (%u > thresh %u)",
+                header->id(), (uint32_t)switchSize,
+                (uint32_t)LargestAllowedTableSwitch);
+        doVisit = false;
+      }
+    }
+
+    if (doVisit) {
+      VisitLoop(graph, header);
+    }
+
+    UnmarkLoopBlocks(graph, header);
+
+    if (mir->shouldCancel("LICM (main loop)")) {
+      return false;
+    }
+  }
+
+  return true;
+}

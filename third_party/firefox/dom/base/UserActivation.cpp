@@ -1,0 +1,129 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/UserActivation.h"
+
+#include "mozilla/TextEvents.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/UserActivationBinding.h"
+#include "mozilla/dom/WindowGlobalChild.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(UserActivation, mWindow)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(UserActivation)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(UserActivation)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(UserActivation)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+UserActivation::UserActivation(nsPIDOMWindowInner* aWindow)
+    : mWindow(aWindow) {}
+
+JSObject* UserActivation::WrapObject(JSContext* aCx,
+                                     JS::Handle<JSObject*> aGivenProto) {
+  return UserActivation_Binding::Wrap(aCx, this, aGivenProto);
+};
+
+bool UserActivation::HasBeenActive() const {
+
+  WindowContext* wc = mWindow->GetWindowContext();
+  return wc && wc->HasBeenUserGestureActivated();
+}
+
+bool UserActivation::IsActive() const {
+
+  WindowContext* wc = mWindow->GetWindowContext();
+  return wc && wc->HasValidTransientUserGestureActivation();
+}
+
+namespace {
+
+static int32_t sUserInputEventDepth = 0;
+static int32_t sUserKeyboardEventDepth = 0;
+
+static TimeStamp sHandlingInputStart;
+
+static TimeStamp sLatestUserInputStart;
+
+}  
+
+bool UserActivation::IsHandlingUserInput() { return sUserInputEventDepth > 0; }
+
+bool UserActivation::IsHandlingKeyboardInput() {
+  return sUserKeyboardEventDepth > 0;
+}
+
+bool UserActivation::IsUserInteractionEvent(const WidgetEvent* aEvent) {
+  if (!aEvent->IsTrusted()) {
+    return false;
+  }
+
+  switch (aEvent->mMessage) {
+    case eKeyPress:
+    case eKeyDown:
+    case eKeyUp:
+      return aEvent->AsKeyboardEvent()->CanTreatAsUserInput();
+    case eMouseDown:
+    case eMouseUp:
+    case ePointerClick:
+    case ePointerDown:
+    case ePointerUp:
+    case eTouchStart:
+    case eTouchEnd:
+      return true;
+    default:
+      return false;
+  }
+}
+
+void UserActivation::StartHandlingUserInput(EventMessage aMessage) {
+  ++sUserInputEventDepth;
+  if (sUserInputEventDepth == 1) {
+    sLatestUserInputStart = sHandlingInputStart = TimeStamp::Now();
+  }
+  if (WidgetEvent::IsKeyEventMessage(aMessage)) {
+    ++sUserKeyboardEventDepth;
+  }
+}
+
+void UserActivation::StopHandlingUserInput(EventMessage aMessage) {
+  --sUserInputEventDepth;
+  if (sUserInputEventDepth == 0) {
+    sHandlingInputStart = TimeStamp();
+  }
+  if (WidgetEvent::IsKeyEventMessage(aMessage)) {
+    --sUserKeyboardEventDepth;
+  }
+}
+
+TimeStamp UserActivation::GetHandlingInputStart() {
+  return sHandlingInputStart;
+}
+
+TimeStamp UserActivation::LatestUserInputStart() {
+  return sLatestUserInputStart;
+}
+
+
+AutoHandlingUserInputStatePusher::AutoHandlingUserInputStatePusher(
+    bool aIsHandlingUserInput, WidgetEvent* aEvent)
+    : mMessage(aEvent ? aEvent->mMessage : eVoidEvent),
+      mIsHandlingUserInput(aIsHandlingUserInput) {
+  if (!aIsHandlingUserInput) {
+    return;
+  }
+  UserActivation::StartHandlingUserInput(mMessage);
+}
+
+AutoHandlingUserInputStatePusher::~AutoHandlingUserInputStatePusher() {
+  if (!mIsHandlingUserInput) {
+    return;
+  }
+  UserActivation::StopHandlingUserInput(mMessage);
+}
+
+}  

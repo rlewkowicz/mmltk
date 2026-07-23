@@ -1,0 +1,45 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ipc_SharedMemoryPlatform_h
+#define mozilla_ipc_SharedMemoryPlatform_h
+
+#include "mozilla/ipc/SharedMemoryHandle.h"
+#include "mozilla/ipc/SharedMemoryMapping.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Maybe.h"
+
+namespace mozilla::ipc::shared_memory {
+
+extern LazyLogModule gSharedMemoryLog;
+
+class Platform {
+ public:
+  static bool Create(MutableHandle& aHandle, size_t aSize);
+
+  static bool CreateFreezable(FreezableHandle& aHandle, size_t aSize);
+
+  static bool IsSafeToMap(const PlatformHandle& aHandle);
+
+  static PlatformHandle CloneHandle(const PlatformHandle& aHandle);
+
+  static bool Freeze(FreezableHandle& aHandle);
+
+  static Maybe<void*> Map(const HandleBase& aHandle, uint64_t aOffset,
+                          size_t aSize, void* aFixedAddress, bool aReadOnly);
+
+  static void Unmap(void* aMemory, size_t aSize);
+
+  static bool Protect(char* aAddr, size_t aSize, Access aAccess);
+
+  static void* FindFreeAddressSpace(size_t aSize);
+
+  static size_t PageSize();
+
+  static size_t AllocationGranularity();
+};
+
+}  
+
+#endif

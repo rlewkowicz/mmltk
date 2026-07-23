@@ -1,0 +1,79 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_RemoteWorkerManager_h
+#define mozilla_dom_RemoteWorkerManager_h
+
+#include "base/process.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/RemoteWorkerTypes.h"
+#include "mozilla/dom/WorkerPrivate.h"  // WorkerKind enum
+#include "nsISupportsImpl.h"
+#include "nsTArray.h"
+
+namespace mozilla::dom {
+
+class RemoteWorkerController;
+class RemoteWorkerServiceParent;
+class RemoteWorkerNonLifeCycleOpControllerParent;
+
+class RemoteWorkerManager final {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(RemoteWorkerManager)
+
+  static already_AddRefed<RemoteWorkerManager> GetOrCreate();
+
+  void RegisterActor(RemoteWorkerServiceParent* aActor);
+
+  void UnregisterActor(RemoteWorkerServiceParent* aActor);
+
+  void Launch(RemoteWorkerController* aController,
+              const RemoteWorkerData& aData, base::ProcessId aProcessId);
+
+  static bool MatchRemoteType(const nsACString& processRemoteType,
+                              const nsACString& workerRemoteType);
+
+  static Result<nsCString, nsresult> GetRemoteType(
+      const nsCOMPtr<nsIPrincipal>& aPrincipal, WorkerKind aWorkerKind,
+      const nsACString& aCurrentRemoteType);
+
+ private:
+  RemoteWorkerManager();
+  ~RemoteWorkerManager();
+
+  struct TargetActorAndKeepAlive {
+    RefPtr<RemoteWorkerServiceParent> mActor;
+    UniqueThreadsafeContentParentKeepAlive mKeepAlive;
+  };
+
+  TargetActorAndKeepAlive SelectTargetActor(const RemoteWorkerData& aData,
+                                            base::ProcessId aProcessId);
+
+  TargetActorAndKeepAlive SelectTargetActorInternal(
+      const RemoteWorkerData& aData, base::ProcessId aProcessId) const;
+
+  void LaunchInternal(RemoteWorkerController* aController,
+                      RemoteWorkerServiceParent* aTargetActor,
+                      UniqueThreadsafeContentParentKeepAlive&& aKeepAlive,
+                      const RemoteWorkerData& aData);
+
+  using LaunchProcessPromise =
+      MozPromise<TargetActorAndKeepAlive, nsresult, true>;
+  RefPtr<LaunchProcessPromise> LaunchNewContentProcess(
+      const RemoteWorkerData& aData);
+
+  void AsyncCreationFailed(RemoteWorkerController* aController);
+
+  template <typename Callback>
+  void ForEachActor(Callback&& aCallback, const nsACString& aRemoteType,
+                    Maybe<base::ProcessId> aProcessId = Nothing()) const;
+
+  nsTArray<RemoteWorkerServiceParent*> mChildActors;
+  RemoteWorkerServiceParent* mParentActor;
+};
+
+}  
+
+#endif  // mozilla_dom_RemoteWorkerManager_h

@@ -1,0 +1,155 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_CompositorAnimationStorage_h
+#define mozilla_layers_CompositorAnimationStorage_h
+
+#include "mozilla/layers/AnimationStorageData.h"
+#include "mozilla/layers/LayersMessages.h"  // for TransformData, etc
+#include "mozilla/webrender/webrender_ffi.h"
+#include "mozilla/Variant.h"
+#include "nsClassHashtable.h"
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace mozilla {
+namespace layers {
+class APZSampler;
+class Animation;
+class CompositorBridgeParent;
+class OMTAController;
+
+using AnimationArray = nsTArray<layers::Animation>;
+using SampledAnimationArray = AutoTArray<RefPtr<StyleAnimationValue>, 1>;
+
+struct AnimationTransform {
+  gfx::Matrix4x4 mFrameTransform;
+  TransformData mData;
+
+  SampledAnimationArray mAnimationValues;
+};
+
+struct AnimatedValue final {
+  typedef Variant<AnimationTransform, float, nscolor> AnimatedValueType;
+
+  const AnimatedValueType& Value() const { return mValue; }
+  const AnimationTransform& Transform() const {
+    return mValue.as<AnimationTransform>();
+  }
+  const float& Opacity() const { return mValue.as<float>(); }
+  const nscolor& Color() const { return mValue.as<nscolor>(); }
+  template <typename T>
+  bool Is() const {
+    return mValue.is<T>();
+  }
+
+  AnimatedValue(const gfx::Matrix4x4& aFrameTransform,
+                const TransformData& aData, SampledAnimationArray&& aValue)
+      : mValue(AsVariant(
+            AnimationTransform{aFrameTransform, aData, std::move(aValue)})) {}
+
+  explicit AnimatedValue(const float& aValue) : mValue(AsVariant(aValue)) {}
+
+  explicit AnimatedValue(nscolor aValue) : mValue(AsVariant(aValue)) {}
+
+  void SetTransform(const gfx::Matrix4x4& aFrameTransform,
+                    const TransformData& aData,
+                    SampledAnimationArray&& aValue) {
+    MOZ_ASSERT(mValue.is<AnimationTransform>());
+    AnimationTransform& previous = mValue.as<AnimationTransform>();
+    previous.mFrameTransform = aFrameTransform;
+    if (previous.mData != aData) {
+      previous.mData = aData;
+    }
+    previous.mAnimationValues = std::move(aValue);
+  }
+  void SetOpacity(float aOpacity) {
+    MOZ_ASSERT(mValue.is<float>());
+    mValue.as<float>() = aOpacity;
+  }
+  void SetColor(nscolor aColor) {
+    MOZ_ASSERT(mValue.is<nscolor>());
+    mValue.as<nscolor>() = aColor;
+  }
+
+  already_AddRefed<StyleAnimationValue> AsAnimationValue(
+      NonCustomCSSPropertyId) const;
+
+ private:
+  AnimatedValueType mValue;
+};
+
+struct WrAnimations {
+  nsTArray<wr::WrOpacityProperty> mOpacityArrays;
+  nsTArray<wr::WrTransformProperty> mTransformArrays;
+  nsTArray<wr::WrColorProperty> mColorArrays;
+};
+
+class CompositorAnimationStorage final {
+  typedef nsClassHashtable<nsUint64HashKey, AnimatedValue> AnimatedValueTable;
+  typedef std::unordered_map<uint64_t, std::unique_ptr<AnimationStorageData>>
+      AnimationsTable;
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(CompositorAnimationStorage)
+ public:
+  explicit CompositorAnimationStorage(CompositorBridgeParent* aCompositorBridge)
+      : mLock("CompositorAnimationStorage::mLock"),
+        mCompositorBridge(aCompositorBridge) {}
+
+  OMTAValue GetOMTAValue(const uint64_t& aId) const;
+
+  WrAnimations CollectWebRenderAnimations() const;
+
+  void SetAnimations(uint64_t aId, const LayersId& aLayersId,
+                     const AnimationArray& aAnimations,
+                     const TimeStamp& aPreviousSampleTime);
+
+  bool SampleAnimations(const OMTAController* aOMTAController,
+                        TimeStamp aPreviousFrameTime,
+                        TimeStamp aCurrentFrameTime);
+
+  bool HasAnimations() const;
+
+  void ClearById(const uint64_t& aId);
+
+  AnimatedValue* GetAnimatedValue(const uint64_t& aId) const;
+
+ private:
+  ~CompositorAnimationStorage() = default;
+
+  void SetAnimatedValue(uint64_t aId, AnimatedValue* aPreviousValue,
+                        const gfx::Matrix4x4& aFrameTransform,
+                        const TransformData& aData,
+                        SampledAnimationArray&& aValue);
+
+  void SetAnimatedValue(uint64_t aId, AnimatedValue* aPreviousValue,
+                        float aOpacity);
+
+  void SetAnimatedValue(uint64_t aId, AnimatedValue* aPreviousValue,
+                        nscolor aColor);
+
+  using JankedAnimationMap =
+      std::unordered_map<LayersId, nsTArray<uint64_t>, LayersId::HashFn>;
+
+  void StoreAnimatedValue(
+      NonCustomCSSPropertyId aProperty, uint64_t aId,
+      const std::unique_ptr<AnimationStorageData>& aAnimationStorageData,
+      SampledAnimationArray&& aAnimationValues,
+      const MutexAutoLock& aProofOfMapLock,
+      const RefPtr<APZSampler>& aApzSampler, AnimatedValue* aAnimatedValueEntry,
+      JankedAnimationMap& aJankedAnimationMap);
+
+ private:
+  AnimatedValueTable mAnimatedValues;
+  AnimationsTable mAnimations;
+  std::unordered_set<uint64_t> mNewAnimations;
+  mutable Mutex mLock MOZ_UNANNOTATED;
+  CompositorBridgeParent* MOZ_NON_OWNING_REF mCompositorBridge;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_CompositorAnimationStorage_h

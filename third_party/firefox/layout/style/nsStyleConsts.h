@@ -1,0 +1,431 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsStyleConsts_h_
+#define nsStyleConsts_h_
+
+#include "gfxFontConstants.h"
+#include "mozilla/ServoStyleConsts.h"
+
+
+namespace mozilla {
+
+enum class StyleBoxAlign : uint8_t {
+  Stretch,
+  Start,
+  Center,
+  Baseline,
+  End,
+};
+
+enum class StyleBoxDecorationBreak : uint8_t {
+  Slice,
+  Clone,
+};
+
+enum class StyleBoxDirection : uint8_t {
+  Normal,
+  Reverse,
+};
+
+enum class StyleBoxOrient : uint8_t {
+  Horizontal,
+  Vertical,
+};
+
+enum class StyleBoxPack : uint8_t {
+  Start,
+  Center,
+  End,
+  Justify,
+};
+
+enum class StyleBoxSizing : uint8_t { ContentBox, BorderBox };
+
+enum class StyleBoxShadowType : uint8_t {
+  Inset,
+};
+
+enum class StyleColumnFill : uint8_t {
+  Balance,
+  Auto,
+};
+
+enum class StyleColumnSpan : uint8_t {
+  None,
+  All,
+};
+
+enum class StyleGeometryBox : uint8_t {
+  ContentBox,  
+  PaddingBox,  
+  BorderBox,
+  MarginBox,   
+  FillBox,     
+  StrokeBox,   
+  ViewBox,     
+  NoClip,      
+  Text,        
+  BorderArea,  
+  NoBox,  
+  MozAlmostPadding = 127  
+};
+
+enum class StyleFloatEdge : uint8_t {
+  ContentBox,
+  MarginBox,
+};
+
+enum class StyleHyphens : uint8_t {
+  None,
+  Manual,
+  Auto,
+};
+
+enum class StyleImageOrientation : uint8_t {
+  None,
+  FromImage,
+};
+
+enum class StyleScrollbarWidth : uint8_t {
+  Auto,
+  Thin,
+  None,
+};
+
+enum class StyleFieldSizing : bool {
+  Fixed,
+  Content,
+};
+
+enum class StyleShapeSourceType : uint8_t {
+  None,
+  Image,  
+  Shape,
+  Box,
+  Path,  
+};
+
+enum class StyleWindowDragging : uint8_t {
+  Default,
+  Drag,
+  NoDrag,
+};
+
+enum class StyleOrient : uint8_t {
+  Inline,
+  Block,
+  Horizontal,
+  Vertical,
+};
+
+enum class StyleImageLayerAttachment : uint8_t { Scroll, Fixed, Local };
+
+enum class StyleImageLayerRepeat : uint8_t {
+  NoRepeat = 0x00,
+  RepeatX,
+  RepeatY,
+  Repeat,
+  Space,
+  Round
+};
+
+enum class StyleMaskMode : uint8_t { Alpha = 0, Luminance, MatchSource };
+
+enum class StyleBorderCollapse : uint8_t { Collapse, Separate };
+
+enum class StyleDirection : uint8_t { Ltr, Rtl };
+
+
+static constexpr uint8_t kWritingModeSidewaysMask = 4;
+
+enum class StyleFlexDirection : uint8_t {
+  Row,
+  RowReverse,
+  Column,
+  ColumnReverse,
+};
+
+enum class StyleFlexWrap : uint8_t {
+  Nowrap,
+  Wrap,
+  WrapReverse,
+};
+
+enum class StyleGridTrackBreadth : uint8_t {
+  MaxContent = 1,
+  MinContent = 2,
+};
+
+static constexpr float kMathMLDefaultScriptSizeMultiplier{0.71f};
+static constexpr float kMathMLDefaultScriptMinSizePt{8.f};
+
+enum class StyleMathVariant : uint8_t {
+  None = 0,
+  Normal = 1,
+  Bold = 2,
+  Italic = 3,
+  BoldItalic = 4,
+  Script = 5,
+  BoldScript = 6,
+  Fraktur = 7,
+  DoubleStruck = 8,
+  BoldFraktur = 9,
+  SansSerif = 10,
+  BoldSansSerif = 11,
+  SansSerifItalic = 12,
+  SansSerifBoldItalic = 13,
+  Monospace = 14,
+  Initial = 15,
+  Tailed = 16,
+  Looped = 17,
+  Stretched = 18,
+};
+
+enum class StyleMathStyle : uint8_t { Compact = 0, Normal = 1 };
+
+enum class StyleMathShift : uint8_t { Compact = 0, Normal = 1 };
+
+enum class FrameBorderProperty : uint8_t { Yes, No, One, Zero };
+
+enum class ScrollingAttribute : uint8_t {
+  Yes,
+  No,
+  On,
+  Off,
+  Scroll,
+  Noscroll,
+  Auto
+};
+
+enum class ListStyle : uint8_t {
+  Custom = 255,  
+  None = 0,
+  Decimal,
+  Disc,
+  Circle,
+  Square,
+  DisclosureClosed,
+  DisclosureOpen,
+  Hebrew,
+  JapaneseInformal,
+  JapaneseFormal,
+  KoreanHangulFormal,
+  KoreanHanjaInformal,
+  KoreanHanjaFormal,
+  SimpChineseInformal,
+  SimpChineseFormal,
+  TradChineseInformal,
+  TradChineseFormal,
+  EthiopicNumeric,
+  LowerRoman = 100,
+  UpperRoman,
+  LowerAlpha,
+  UpperAlpha
+};
+
+enum class StyleListStylePosition : uint8_t { Inside, Outside };
+
+enum class StyleIsolation : uint8_t {
+  Auto,
+  Isolate,
+};
+
+enum class StyleObjectFit : uint8_t {
+  Fill,
+  Contain,
+  Cover,
+  None,
+  ScaleDown,
+};
+
+enum class StyleTextDecorationStyle : uint8_t {
+  None,  
+  Dotted,
+  Dashed,
+  Solid,
+  Double,
+  Wavy,
+  Sentinel = Wavy
+};
+
+enum class StyleTextSecurity : uint8_t {
+  None,
+  Circle,
+  Disc,
+  Square,
+};
+
+enum class StyleTopLayer : uint8_t {
+  None,
+  Auto,
+};
+
+enum class StyleVisibility : uint8_t {
+  Hidden,
+  Visible,
+  Collapse,
+};
+
+enum class StyleWhiteSpaceCollapse : uint8_t {
+  Collapse = 0,
+  Preserve,
+  PreserveBreaks,
+  PreserveSpaces,
+  BreakSpaces,
+};
+
+enum class StyleTextWrapMode : uint8_t {
+  Wrap = 0,
+  Nowrap,
+};
+
+enum class StyleTextWrapStyle : uint8_t {
+  Auto = 0,
+  Stable,
+  Balance,
+};
+
+enum class StyleRubyAlign : uint8_t {
+  Start,
+  Center,
+  SpaceBetween,
+  SpaceAround,
+};
+
+enum class StyleTextSizeAdjust : uint8_t {
+  None,
+  Auto,
+};
+
+enum class StyleTextOrientation : uint8_t {
+  Mixed,
+  Upright,
+  Sideways,
+};
+
+enum class StyleBoxCollapse : uint8_t {
+  Flex,
+  Legacy,
+};
+
+enum class StyleTextCombineUpright : uint8_t {
+  None,
+  All,
+};
+
+enum class StyleUnicodeBidi : uint8_t {
+  Normal,
+  Embed,
+  Isolate,
+  BidiOverride,
+  IsolateOverride,
+  Plaintext
+};
+
+enum class StyleTableLayout : uint8_t {
+  Auto,
+  Fixed,
+};
+
+enum class StyleEmptyCells : uint8_t {
+  Hide,
+  Show,
+};
+
+enum class StyleImeMode : uint8_t {
+  Auto,
+  Normal,
+  Active,
+  Disabled,
+  Inactive,
+};
+
+
+enum class StyleWindowShadow : uint8_t {
+  Auto,
+  None,
+};
+
+enum class StyleMaskType : uint8_t {
+  Luminance,
+  Alpha,
+};
+
+enum class StyleShapeRendering : uint8_t {
+  Auto,
+  Optimizespeed,
+  Crispedges,
+  Geometricprecision,
+};
+
+enum class StyleStrokeLinecap : uint8_t {
+  Butt,
+  Round,
+  Square,
+};
+
+enum class StyleStrokeLinejoin : uint8_t {
+  Miter,
+  Round,
+  Bevel,
+};
+
+enum class StyleTextAnchor : uint8_t {
+  Start,
+  Middle,
+  End,
+};
+
+enum class StyleTextRendering : uint8_t {
+  Auto,
+  Optimizespeed,
+  Optimizelegibility,
+  Geometricprecision,
+};
+
+enum class StyleColorInterpolation : uint8_t {
+  Auto = 0,
+  Srgb = 1,
+  Linearrgb = 2,
+};
+
+enum class StyleBackfaceVisibility : uint8_t { Hidden = 0, Visible = 1 };
+
+enum class StyleBlend : uint8_t {
+  Normal = 0,
+  Multiply,
+  Screen,
+  Overlay,
+  Darken,
+  Lighten,
+  ColorDodge,
+  ColorBurn,
+  HardLight,
+  SoftLight,
+  Difference,
+  Exclusion,
+  Hue,
+  Saturation,
+  Color,
+  Luminosity,
+  PlusLighter,
+};
+
+enum class StyleMaskComposite : uint8_t {
+  Add = 0,
+  Subtract,
+  Intersect,
+  Exclude
+};
+
+enum class StyleScrollBehavior : uint8_t {
+  Auto,
+  Smooth,
+};
+
+}  
+
+#endif /* nsStyleConsts_h_ */

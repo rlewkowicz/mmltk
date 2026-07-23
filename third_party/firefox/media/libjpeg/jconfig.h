@@ -1,0 +1,20 @@
+#define JPEG_LIB_VERSION  62
+
+#define LIBJPEG_TURBO_VERSION  3.1.4.1
+
+#define LIBJPEG_TURBO_VERSION_NUMBER  3001004
+
+
+
+#define MEM_SRCDST_SUPPORTED 1
+
+#ifdef MOZ_WITH_SIMD
+#define WITH_SIMD 1
+#else
+#undef  WITH_SIMD
+#endif
+
+#ifndef BITS_IN_JSAMPLE
+#define BITS_IN_JSAMPLE  8
+#endif
+

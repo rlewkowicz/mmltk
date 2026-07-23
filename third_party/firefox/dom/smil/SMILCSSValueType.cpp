@@ -1,0 +1,487 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "SMILCSSValueType.h"
+
+#include "mozilla/PresShell.h"
+#include "mozilla/PresShellInlines.h"
+#include "mozilla/SMILParserUtils.h"
+#include "mozilla/SMILValue.h"
+#include "mozilla/ServoBindings.h"
+#include "mozilla/ServoCSSParser.h"
+#include "mozilla/ServoStyleSet.h"
+#include "mozilla/StyleAnimationValue.h"
+#include "mozilla/dom/BaseKeyframeTypesBinding.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Element.h"
+#include "nsCSSProps.h"
+#include "nsCSSValue.h"
+#include "nsColor.h"
+#include "nsComputedDOMStyle.h"
+#include "nsDebug.h"
+#include "nsPresContext.h"
+#include "nsPresContextInlines.h"
+#include "nsString.h"
+#include "nsStyleUtil.h"
+
+using namespace mozilla::dom;
+
+namespace mozilla {
+
+using ServoAnimationValues = CopyableAutoTArray<RefPtr<StyleAnimationValue>, 1>;
+
+SMILCSSValueType SMILCSSValueType::sSingleton;
+
+struct ValueWrapper {
+  ValueWrapper(NonCustomCSSPropertyId aPropId, const AnimationValue& aValue)
+      : mPropId(aPropId) {
+    MOZ_ASSERT(!aValue.IsNull());
+    mServoValues.AppendElement(aValue.mServo);
+  }
+  ValueWrapper(NonCustomCSSPropertyId aPropId,
+               const RefPtr<StyleAnimationValue>& aValue)
+      : mPropId(aPropId), mServoValues{(aValue)} {}
+  ValueWrapper(NonCustomCSSPropertyId aPropId, ServoAnimationValues&& aValues)
+      : mPropId(aPropId), mServoValues{std::move(aValues)} {}
+
+  bool operator==(const ValueWrapper& aOther) const {
+    if (mPropId != aOther.mPropId) {
+      return false;
+    }
+
+    MOZ_ASSERT(!mServoValues.IsEmpty());
+    size_t len = mServoValues.Length();
+    if (len != aOther.mServoValues.Length()) {
+      return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+      if (!Servo_AnimationValue_DeepEqual(mServoValues[i],
+                                          aOther.mServoValues[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool operator!=(const ValueWrapper& aOther) const {
+    return !(*this == aOther);
+  }
+
+  NonCustomCSSPropertyId mPropId;
+  ServoAnimationValues mServoValues;
+};
+
+
+static bool FinalizeServoAnimationValues(
+    const RefPtr<StyleAnimationValue>*& aValue1,
+    const RefPtr<StyleAnimationValue>*& aValue2,
+    RefPtr<StyleAnimationValue>& aZeroValueStorage) {
+  if (!aValue1 && !aValue2) {
+    return false;
+  }
+
+
+  if (!aValue1) {
+    aZeroValueStorage = Servo_AnimationValues_GetZeroValue(*aValue2).Consume();
+    aValue1 = &aZeroValueStorage;
+  } else if (!aValue2) {
+    aZeroValueStorage = Servo_AnimationValues_GetZeroValue(*aValue1).Consume();
+    aValue2 = &aZeroValueStorage;
+  }
+  return *aValue1 && *aValue2;
+}
+
+static ValueWrapper* ExtractValueWrapper(SMILValue& aValue) {
+  return static_cast<ValueWrapper*>(aValue.mU.mPtr);
+}
+
+static const ValueWrapper* ExtractValueWrapper(const SMILValue& aValue) {
+  return static_cast<const ValueWrapper*>(aValue.mU.mPtr);
+}
+
+void SMILCSSValueType::InitValue(SMILValue& aValue) const {
+  MOZ_ASSERT(aValue.IsNull(), "Unexpected SMIL value type");
+
+  aValue.mU.mPtr = nullptr;
+  aValue.mType = this;
+}
+
+void SMILCSSValueType::DestroyValue(SMILValue& aValue) const {
+  MOZ_ASSERT(aValue.mType == this, "Unexpected SMIL value type");
+  delete static_cast<ValueWrapper*>(aValue.mU.mPtr);
+  aValue.mType = SMILNullType::Singleton();
+}
+
+nsresult SMILCSSValueType::Assign(SMILValue& aDest,
+                                  const SMILValue& aSrc) const {
+  MOZ_ASSERT(aDest.mType == aSrc.mType, "Incompatible SMIL types");
+  MOZ_ASSERT(aDest.mType == this, "Unexpected SMIL value type");
+  const ValueWrapper* srcWrapper = ExtractValueWrapper(aSrc);
+  ValueWrapper* destWrapper = ExtractValueWrapper(aDest);
+
+  if (srcWrapper) {
+    if (!destWrapper) {
+      aDest.mU.mPtr = new ValueWrapper(*srcWrapper);
+    } else {
+      *destWrapper = *srcWrapper;
+    }
+  } else if (destWrapper) {
+    delete destWrapper;
+    aDest.mU.mPtr = destWrapper = nullptr;
+  }  
+
+  return NS_OK;
+}
+
+bool SMILCSSValueType::IsEqual(const SMILValue& aLeft,
+                               const SMILValue& aRight) const {
+  MOZ_ASSERT(aLeft.mType == aRight.mType, "Incompatible SMIL types");
+  MOZ_ASSERT(aLeft.mType == this, "Unexpected SMIL value");
+  const ValueWrapper* leftWrapper = ExtractValueWrapper(aLeft);
+  const ValueWrapper* rightWrapper = ExtractValueWrapper(aRight);
+
+  if (leftWrapper) {
+    if (rightWrapper) {
+      NS_WARNING_ASSERTION(leftWrapper != rightWrapper,
+                           "Two SMILValues with matching ValueWrapper ptr");
+      return *leftWrapper == *rightWrapper;
+    }
+    return false;
+  }
+  if (rightWrapper) {
+    return false;
+  }
+  return true;
+}
+
+static bool AddOrAccumulate(SMILValue& aDest, const SMILValue& aValueToAdd,
+                            CompositeOperation aCompositeOp, uint64_t aCount) {
+  MOZ_ASSERT(aValueToAdd.mType == aDest.mType,
+             "Trying to add mismatching types");
+  MOZ_ASSERT(aValueToAdd.mType == &SMILCSSValueType::sSingleton,
+             "Unexpected SMIL value type");
+  MOZ_ASSERT(aCompositeOp == CompositeOperation::Add ||
+                 aCompositeOp == CompositeOperation::Accumulate,
+             "Composite operation should be add or accumulate");
+  MOZ_ASSERT(aCompositeOp != CompositeOperation::Add || aCount == 1,
+             "Count should be 1 if composite operation is add");
+
+  ValueWrapper* destWrapper = ExtractValueWrapper(aDest);
+  const ValueWrapper* valueToAddWrapper = ExtractValueWrapper(aValueToAdd);
+
+  if (!destWrapper && !valueToAddWrapper) {
+    return false;
+  }
+
+  NonCustomCSSPropertyId property =
+      valueToAddWrapper ? valueToAddWrapper->mPropId : destWrapper->mPropId;
+  if (property == eCSSProperty_font_size_adjust ||
+      property == eCSSProperty_stroke_dasharray) {
+    return false;
+  }
+  if (property == eCSSProperty_font) {
+    return false;
+  }
+
+  size_t len = valueToAddWrapper ? valueToAddWrapper->mServoValues.Length()
+                                 : destWrapper->mServoValues.Length();
+
+  MOZ_ASSERT(!valueToAddWrapper || !destWrapper ||
+                 valueToAddWrapper->mServoValues.Length() ==
+                     destWrapper->mServoValues.Length(),
+             "Both of values' length in the wrappers should be the same if "
+             "both of them exist");
+
+  for (size_t i = 0; i < len; i++) {
+    const RefPtr<StyleAnimationValue>* valueToAdd =
+        valueToAddWrapper ? &valueToAddWrapper->mServoValues[i] : nullptr;
+    const RefPtr<StyleAnimationValue>* destValue =
+        destWrapper ? &destWrapper->mServoValues[i] : nullptr;
+    RefPtr<StyleAnimationValue> zeroValueStorage;
+    if (!FinalizeServoAnimationValues(valueToAdd, destValue,
+                                      zeroValueStorage)) {
+      return false;
+    }
+
+    if (destWrapper) {
+      destWrapper->mServoValues[i] = *destValue;
+    } else {
+      aDest.mU.mPtr = destWrapper = new ValueWrapper(property, *destValue);
+      destWrapper->mServoValues.SetLength(len);
+    }
+
+    RefPtr<StyleAnimationValue> result;
+    if (aCompositeOp == CompositeOperation::Add) {
+      result = Servo_AnimationValues_Add(*destValue, *valueToAdd).Consume();
+    } else {
+      result = Servo_AnimationValues_Accumulate(*destValue, *valueToAdd, aCount)
+                   .Consume();
+    }
+
+    if (!result) {
+      return false;
+    }
+    destWrapper->mServoValues[i] = result;
+  }
+
+  return true;
+}
+
+nsresult SMILCSSValueType::SandwichAdd(SMILValue& aDest,
+                                       const SMILValue& aValueToAdd) const {
+  return AddOrAccumulate(aDest, aValueToAdd, CompositeOperation::Add, 1)
+             ? NS_OK
+             : NS_ERROR_FAILURE;
+}
+
+nsresult SMILCSSValueType::Add(SMILValue& aDest, const SMILValue& aValueToAdd,
+                               uint32_t aCount) const {
+  return AddOrAccumulate(aDest, aValueToAdd, CompositeOperation::Accumulate,
+                         aCount)
+             ? NS_OK
+             : NS_ERROR_FAILURE;
+}
+
+nsresult SMILCSSValueType::ComputeDistance(const SMILValue& aFrom,
+                                           const SMILValue& aTo,
+                                           double& aDistance) const {
+  MOZ_ASSERT(aFrom.mType == aTo.mType, "Trying to compare different types");
+  MOZ_ASSERT(aFrom.mType == this, "Unexpected source type");
+
+  const ValueWrapper* fromWrapper = ExtractValueWrapper(aFrom);
+  const ValueWrapper* toWrapper = ExtractValueWrapper(aTo);
+  MOZ_ASSERT(toWrapper, "expecting non-null endpoint");
+
+  size_t len = toWrapper->mServoValues.Length();
+  MOZ_ASSERT(!fromWrapper || fromWrapper->mServoValues.Length() == len,
+             "From and to values length should be the same if "
+             "The start value exists");
+
+  double squareDistance = 0;
+
+  for (size_t i = 0; i < len; i++) {
+    const RefPtr<StyleAnimationValue>* fromValue =
+        fromWrapper ? &fromWrapper->mServoValues[i] : nullptr;
+    const RefPtr<StyleAnimationValue>* toValue = &toWrapper->mServoValues[i];
+    RefPtr<StyleAnimationValue> zeroValueStorage;
+    if (!FinalizeServoAnimationValues(fromValue, toValue, zeroValueStorage)) {
+      return NS_ERROR_FAILURE;
+    }
+
+    double distance =
+        Servo_AnimationValues_ComputeDistance(*fromValue, *toValue);
+    if (distance < 0.0) {
+      return NS_ERROR_FAILURE;
+    }
+
+    if (len == 1) {
+      aDistance = distance;
+      return NS_OK;
+    }
+    squareDistance += distance * distance;
+  }
+
+  aDistance = sqrt(squareDistance);
+
+  return NS_OK;
+}
+
+nsresult SMILCSSValueType::Interpolate(const SMILValue& aStartVal,
+                                       const SMILValue& aEndVal,
+                                       double aUnitDistance,
+                                       SMILValue& aResult) const {
+  MOZ_ASSERT(aStartVal.mType == aEndVal.mType,
+             "Trying to interpolate different types");
+  MOZ_ASSERT(aStartVal.mType == this, "Unexpected types for interpolation");
+  MOZ_ASSERT(aResult.mType == this, "Unexpected result type");
+  MOZ_ASSERT(aUnitDistance >= 0.0 && aUnitDistance <= 1.0,
+             "unit distance value out of bounds");
+  MOZ_ASSERT(!aResult.mU.mPtr, "expecting barely-initialized outparam");
+
+  const ValueWrapper* startWrapper = ExtractValueWrapper(aStartVal);
+  const ValueWrapper* endWrapper = ExtractValueWrapper(aEndVal);
+  MOZ_ASSERT(endWrapper, "expecting non-null endpoint");
+
+  if (Servo_Property_IsDiscreteAnimatable(endWrapper->mPropId)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  ServoAnimationValues results;
+  size_t len = endWrapper->mServoValues.Length();
+  results.SetCapacity(len);
+  MOZ_ASSERT(!startWrapper || startWrapper->mServoValues.Length() == len,
+             "Start and end values length should be the same if "
+             "the start value exists");
+  for (size_t i = 0; i < len; i++) {
+    const RefPtr<StyleAnimationValue>* startValue =
+        startWrapper ? &startWrapper->mServoValues[i] : nullptr;
+    const RefPtr<StyleAnimationValue>* endValue = &endWrapper->mServoValues[i];
+    RefPtr<StyleAnimationValue> zeroValueStorage;
+    if (!FinalizeServoAnimationValues(startValue, endValue, zeroValueStorage)) {
+      return NS_ERROR_FAILURE;
+    }
+
+    RefPtr<StyleAnimationValue> result =
+        Servo_AnimationValues_Interpolate(*startValue, *endValue, aUnitDistance)
+            .Consume();
+    if (!result) {
+      return NS_ERROR_FAILURE;
+    }
+    results.AppendElement(result);
+  }
+  aResult.mU.mPtr = new ValueWrapper(endWrapper->mPropId, std::move(results));
+
+  return NS_OK;
+}
+
+static ServoAnimationValues ValueFromStringHelper(
+    NonCustomCSSPropertyId aPropId, Element* aTargetElement,
+    nsPresContext* aPresContext, const ComputedStyle* aComputedStyle,
+    const nsAString& aString) {
+  ServoAnimationValues result;
+
+  Document* doc = aTargetElement->GetComposedDoc();
+  if (!doc) {
+    return result;
+  }
+
+  ServoCSSParser::ParsingEnvironment env =
+      ServoCSSParser::GetParsingEnvironment(doc);
+  RefPtr<StyleLockedDeclarationBlock> servoDeclarationBlock =
+      ServoCSSParser::ParseProperty(
+          aPropId, NS_ConvertUTF16toUTF8(aString), env,
+          StyleParsingMode::ALLOW_UNITLESS_LENGTH |
+              StyleParsingMode::ALLOW_ALL_NUMERIC_VALUES);
+  if (!servoDeclarationBlock) {
+    return result;
+  }
+
+  aPresContext->StyleSet()->GetAnimationValues(
+      servoDeclarationBlock, aTargetElement, aComputedStyle, result);
+
+  return result;
+}
+
+void SMILCSSValueType::ValueFromString(NonCustomCSSPropertyId aPropId,
+                                       Element* aTargetElement,
+                                       const nsAString& aString,
+                                       SMILValue& aValue,
+                                       bool* aIsContextSensitive) {
+  MOZ_ASSERT(aValue.IsNull(), "Outparam should be null-typed");
+  nsPresContext* presContext =
+      nsContentUtils::GetContextForContent(aTargetElement);
+  if (!presContext) {
+    NS_WARNING("Not parsing animation value; unable to get PresContext");
+    return;
+  }
+
+  Document* doc = aTargetElement->GetComposedDoc();
+  if (doc && !nsStyleUtil::CSPAllowsInlineStyle(nullptr, doc, nullptr, 0, 1,
+                                                aString, nullptr)) {
+    return;
+  }
+
+  RefPtr<const ComputedStyle> computedStyle =
+      nsComputedDOMStyle::GetComputedStyleNoFlush(aTargetElement);
+  if (!computedStyle) {
+    return;
+  }
+
+  ServoAnimationValues parsedValues = ValueFromStringHelper(
+      aPropId, aTargetElement, presContext, computedStyle, aString);
+  if (aIsContextSensitive) {
+    *aIsContextSensitive = false;
+  }
+
+  if (!parsedValues.IsEmpty()) {
+    sSingleton.InitValue(aValue);
+    aValue.mU.mPtr = new ValueWrapper(aPropId, std::move(parsedValues));
+  }
+}
+
+SMILValue SMILCSSValueType::ValueFromAnimationValue(
+    NonCustomCSSPropertyId aPropId, Element* aTargetElement,
+    const AnimationValue& aValue) {
+  SMILValue result;
+
+  Document* doc = aTargetElement->GetComposedDoc();
+  static const nsLiteralString kPlaceholderText = u"[SVG animation of CSS]"_ns;
+  if (doc && !nsStyleUtil::CSPAllowsInlineStyle(nullptr, doc, nullptr, 0, 1,
+                                                kPlaceholderText, nullptr)) {
+    return result;
+  }
+
+  sSingleton.InitValue(result);
+  result.mU.mPtr = new ValueWrapper(aPropId, aValue);
+
+  return result;
+}
+
+bool SMILCSSValueType::SetPropertyValues(NonCustomCSSPropertyId aPropertyId,
+                                         const SMILValue& aValue,
+                                         StyleLockedDeclarationBlock& aDecl) {
+  MOZ_ASSERT(aValue.mType == &SMILCSSValueType::sSingleton,
+             "Unexpected SMIL value type");
+  const ValueWrapper* wrapper = ExtractValueWrapper(aValue);
+  if (!wrapper) {
+    return Servo_DeclarationBlock_RemovePropertyById(&aDecl, aPropertyId, {});
+  }
+
+  bool changed = false;
+  for (const auto& value : wrapper->mServoValues) {
+    changed |=
+        Servo_DeclarationBlock_SetPropertyToAnimationValue(&aDecl, value, {});
+  }
+
+  return changed;
+}
+
+NonCustomCSSPropertyId SMILCSSValueType::PropertyFromValue(
+    const SMILValue& aValue) {
+  if (aValue.mType != &SMILCSSValueType::sSingleton) {
+    return eCSSProperty_UNKNOWN;
+  }
+
+  const ValueWrapper* wrapper = ExtractValueWrapper(aValue);
+  if (!wrapper) {
+    return eCSSProperty_UNKNOWN;
+  }
+
+  return wrapper->mPropId;
+}
+
+void SMILCSSValueType::FinalizeValue(SMILValue& aValue,
+                                     const SMILValue& aValueToMatch) {
+  MOZ_ASSERT(aValue.mType == aValueToMatch.mType, "Incompatible SMIL types");
+  MOZ_ASSERT(aValue.mType == &SMILCSSValueType::sSingleton,
+             "Unexpected SMIL value type");
+
+  ValueWrapper* valueWrapper = ExtractValueWrapper(aValue);
+  if (valueWrapper) {
+    return;
+  }
+
+  const ValueWrapper* valueToMatchWrapper = ExtractValueWrapper(aValueToMatch);
+  if (!valueToMatchWrapper) {
+    MOZ_ASSERT_UNREACHABLE("Value to match is empty");
+    return;
+  }
+
+  ServoAnimationValues zeroValues;
+  zeroValues.SetCapacity(valueToMatchWrapper->mServoValues.Length());
+
+  for (const auto& valueToMatch : valueToMatchWrapper->mServoValues) {
+    RefPtr<StyleAnimationValue> zeroValue =
+        Servo_AnimationValues_GetZeroValue(valueToMatch).Consume();
+    if (!zeroValue) {
+      return;
+    }
+    zeroValues.AppendElement(std::move(zeroValue));
+  }
+  aValue.mU.mPtr =
+      new ValueWrapper(valueToMatchWrapper->mPropId, std::move(zeroValues));
+}
+
+}  

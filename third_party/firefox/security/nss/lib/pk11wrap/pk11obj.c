@@ -1,0 +1,2214 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include <limits.h>
+#include <stddef.h>
+
+#include "seccomon.h"
+#include "secder.h"
+#include "secmod.h"
+#include "secmodi.h"
+#include "secmodti.h"
+#include "pkcs11.h"
+#include "pkcs11t.h"
+#include "pk11func.h"
+#include "keyhi.h"
+#include "keyi.h"
+#include "secitem.h"
+#include "secerr.h"
+#include "sslerr.h"
+
+#define PK11_SEARCH_CHUNKSIZE 10
+
+SECItem *
+PK11_BlockData(SECItem *data, unsigned long size)
+{
+    SECItem *newData;
+
+    if (size == 0u)
+        return NULL;
+
+    newData = (SECItem *)PORT_Alloc(sizeof(SECItem));
+    if (newData == NULL)
+        return NULL;
+
+    newData->len = (data->len + (size - 1)) / size;
+    newData->len *= size;
+
+    newData->data = (unsigned char *)PORT_ZAlloc(newData->len);
+    if (newData->data == NULL) {
+        PORT_Free(newData);
+        return NULL;
+    }
+    PORT_Memset(newData->data, newData->len - data->len, newData->len);
+    PORT_Memcpy(newData->data, data->data, data->len);
+    return newData;
+}
+
+SECStatus
+PK11_DestroyObject(PK11SlotInfo *slot, CK_OBJECT_HANDLE object)
+{
+    CK_RV crv;
+
+    PK11_EnterSlotMonitor(slot);
+    crv = PK11_GETTAB(slot)->C_DestroyObject(slot->session, object);
+    PK11_ExitSlotMonitor(slot);
+    if (crv != CKR_OK) {
+        return SECFailure;
+    }
+    return SECSuccess;
+}
+
+SECStatus
+PK11_DestroyTokenObject(PK11SlotInfo *slot, CK_OBJECT_HANDLE object)
+{
+    CK_RV crv;
+    SECStatus rv = SECSuccess;
+    CK_SESSION_HANDLE rwsession;
+
+    rwsession = PK11_GetRWSession(slot);
+    if (rwsession == CK_INVALID_HANDLE) {
+        PORT_SetError(SEC_ERROR_BAD_DATA);
+        return SECFailure;
+    }
+
+    crv = PK11_GETTAB(slot)->C_DestroyObject(rwsession, object);
+    if (crv != CKR_OK) {
+        rv = SECFailure;
+        PORT_SetError(PK11_MapError(crv));
+    }
+    PK11_RestoreROSession(slot, rwsession);
+    return rv;
+}
+
+SECStatus
+PK11_ReadAttribute(PK11SlotInfo *slot, CK_OBJECT_HANDLE id,
+                   CK_ATTRIBUTE_TYPE type, PLArenaPool *arena, SECItem *result)
+{
+    CK_ATTRIBUTE attr = { 0, NULL, 0 };
+    CK_RV crv;
+
+    attr.type = type;
+
+    PK11_EnterSlotMonitor(slot);
+    crv = PK11_GETTAB(slot)->C_GetAttributeValue(slot->session, id, &attr, 1);
+    if (crv != CKR_OK) {
+        PK11_ExitSlotMonitor(slot);
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+    if (arena) {
+        attr.pValue = PORT_ArenaAlloc(arena, attr.ulValueLen);
+    } else {
+        attr.pValue = PORT_Alloc(attr.ulValueLen);
+    }
+    if (attr.pValue == NULL) {
+        PK11_ExitSlotMonitor(slot);
+        return SECFailure;
+    }
+    crv = PK11_GETTAB(slot)->C_GetAttributeValue(slot->session, id, &attr, 1);
+    PK11_ExitSlotMonitor(slot);
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        if (!arena)
+            PORT_Free(attr.pValue);
+        return SECFailure;
+    }
+
+    result->data = (unsigned char *)attr.pValue;
+    result->len = attr.ulValueLen;
+
+    return SECSuccess;
+}
+
+CK_ULONG
+PK11_ReadULongAttribute(PK11SlotInfo *slot, CK_OBJECT_HANDLE id,
+                        CK_ATTRIBUTE_TYPE type)
+{
+    CK_ATTRIBUTE attr;
+    CK_ULONG value = CK_UNAVAILABLE_INFORMATION;
+    CK_RV crv;
+
+    PK11_SETATTRS(&attr, type, &value, sizeof(value));
+
+    PK11_EnterSlotMonitor(slot);
+    crv = PK11_GETTAB(slot)->C_GetAttributeValue(slot->session, id, &attr, 1);
+    PK11_ExitSlotMonitor(slot);
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+    }
+    return value;
+}
+
+CK_BBOOL
+pk11_HasAttributeSet_Lock(PK11SlotInfo *slot, CK_OBJECT_HANDLE id,
+                          CK_ATTRIBUTE_TYPE type, PRBool haslock)
+{
+    CK_BBOOL ckvalue = CK_FALSE;
+    CK_ATTRIBUTE theTemplate;
+    CK_RV crv;
+
+    PK11_SETATTRS(&theTemplate, type, &ckvalue, sizeof(CK_BBOOL));
+
+    if (!haslock)
+        PK11_EnterSlotMonitor(slot);
+    crv = PK11_GETTAB(slot)->C_GetAttributeValue(slot->session, id,
+                                                 &theTemplate, 1);
+    if (!haslock)
+        PK11_ExitSlotMonitor(slot);
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        return CK_FALSE;
+    }
+
+    return ckvalue;
+}
+
+CK_BBOOL
+PK11_HasAttributeSet(PK11SlotInfo *slot, CK_OBJECT_HANDLE id,
+                     CK_ATTRIBUTE_TYPE type, PRBool haslock)
+{
+    PR_ASSERT(haslock == PR_FALSE);
+    return pk11_HasAttributeSet_Lock(slot, id, type, PR_FALSE);
+}
+
+CK_RV
+PK11_GetAttributes(PLArenaPool *arena, PK11SlotInfo *slot,
+                   CK_OBJECT_HANDLE obj, CK_ATTRIBUTE *attr, int count)
+{
+    int i;
+    void *mark = NULL;
+    CK_RV crv;
+    if (slot->session == CK_INVALID_HANDLE)
+        return CKR_SESSION_HANDLE_INVALID;
+
+    PK11_EnterSlotMonitor(slot);
+    crv = PK11_GETTAB(slot)->C_GetAttributeValue(slot->session, obj, attr, count);
+    if (crv != CKR_OK) {
+        PK11_ExitSlotMonitor(slot);
+        return crv;
+    }
+
+    if (arena) {
+        mark = PORT_ArenaMark(arena);
+        if (mark == NULL)
+            return CKR_HOST_MEMORY;
+    }
+
+    for (i = 0; i < count; i++) {
+        if (attr[i].ulValueLen == 0)
+            continue;
+        if (arena) {
+            attr[i].pValue = PORT_ArenaAlloc(arena, attr[i].ulValueLen);
+            if (attr[i].pValue == NULL) {
+                PORT_ArenaRelease(arena, mark);
+                PK11_ExitSlotMonitor(slot);
+                return CKR_HOST_MEMORY;
+            }
+        } else {
+            attr[i].pValue = PORT_Alloc(attr[i].ulValueLen);
+            if (attr[i].pValue == NULL) {
+                int j;
+                for (j = 0; j < i; j++) {
+                    PORT_Free(attr[j].pValue);
+                    attr[j].pValue = NULL;
+                }
+                PK11_ExitSlotMonitor(slot);
+                return CKR_HOST_MEMORY;
+            }
+        }
+    }
+
+    crv = PK11_GETTAB(slot)->C_GetAttributeValue(slot->session, obj, attr, count);
+    PK11_ExitSlotMonitor(slot);
+    if (crv != CKR_OK) {
+        if (arena) {
+            PORT_ArenaRelease(arena, mark);
+        } else {
+            for (i = 0; i < count; i++) {
+                PORT_Free(attr[i].pValue);
+                attr[i].pValue = NULL;
+            }
+        }
+    } else if (arena && mark) {
+        PORT_ArenaUnmark(arena, mark);
+    }
+    return crv;
+}
+
+PRBool
+PK11_IsPermObject(PK11SlotInfo *slot, CK_OBJECT_HANDLE handle)
+{
+    return (PRBool)PK11_HasAttributeSet(slot, handle, CKA_TOKEN, PR_FALSE);
+}
+
+char *
+PK11_GetObjectNickname(PK11SlotInfo *slot, CK_OBJECT_HANDLE id)
+{
+    char *nickname = NULL;
+    SECItem result;
+    SECStatus rv;
+
+    rv = PK11_ReadAttribute(slot, id, CKA_LABEL, NULL, &result);
+    if (rv != SECSuccess) {
+        return NULL;
+    }
+
+    nickname = PORT_ZAlloc(result.len + 1);
+    if (nickname == NULL) {
+        PORT_Free(result.data);
+        return NULL;
+    }
+    PORT_Memcpy(nickname, result.data, result.len);
+    PORT_Free(result.data);
+    return nickname;
+}
+
+SECStatus
+PK11_SetObjectNickname(PK11SlotInfo *slot, CK_OBJECT_HANDLE id,
+                       const char *nickname)
+{
+    int len = PORT_Strlen(nickname);
+    CK_ATTRIBUTE setTemplate;
+    CK_RV crv;
+    CK_SESSION_HANDLE rwsession;
+
+    if (len < 0) {
+        return SECFailure;
+    }
+
+    PK11_SETATTRS(&setTemplate, CKA_LABEL, (CK_CHAR *)nickname, len);
+    rwsession = PK11_GetRWSession(slot);
+    if (rwsession == CK_INVALID_HANDLE) {
+        PORT_SetError(SEC_ERROR_BAD_DATA);
+        return SECFailure;
+    }
+    crv = PK11_GETTAB(slot)->C_SetAttributeValue(rwsession, id,
+                                                 &setTemplate, 1);
+    PK11_RestoreROSession(slot, rwsession);
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+    return SECSuccess;
+}
+
+void
+pk11_SignedToUnsigned(CK_ATTRIBUTE *attrib)
+{
+    char *ptr = (char *)attrib->pValue;
+    unsigned long len = attrib->ulValueLen;
+
+    while ((len > 1) && (*ptr == 0)) {
+        len--;
+        ptr++;
+    }
+    attrib->pValue = ptr;
+    attrib->ulValueLen = len;
+}
+
+CK_SESSION_HANDLE
+pk11_GetNewSession(PK11SlotInfo *slot, PRBool *owner)
+{
+    CK_SESSION_HANDLE session;
+    *owner = PR_TRUE;
+    if (!slot->isThreadSafe)
+        PK11_EnterSlotMonitor(slot);
+    if (PK11_GETTAB(slot)->C_OpenSession(slot->slotID, CKF_SERIAL_SESSION,
+                                         slot, pk11_notify, &session) != CKR_OK) {
+        *owner = PR_FALSE;
+        session = slot->session;
+    }
+    if (!slot->isThreadSafe)
+        PK11_ExitSlotMonitor(slot);
+
+    return session;
+}
+
+void
+pk11_CloseSession(PK11SlotInfo *slot, CK_SESSION_HANDLE session, PRBool owner)
+{
+    if (!owner)
+        return;
+    if (!slot->isThreadSafe)
+        PK11_EnterSlotMonitor(slot);
+    (void)PK11_GETTAB(slot)->C_CloseSession(session);
+    if (!slot->isThreadSafe)
+        PK11_ExitSlotMonitor(slot);
+}
+
+SECStatus
+PK11_CreateNewObject(PK11SlotInfo *slot, CK_SESSION_HANDLE session,
+                     const CK_ATTRIBUTE *theTemplate, int count,
+                     PRBool token, CK_OBJECT_HANDLE *objectID)
+{
+    CK_SESSION_HANDLE rwsession;
+    CK_RV crv;
+    SECStatus rv = SECSuccess;
+
+    rwsession = session;
+    if (token) {
+        rwsession = PK11_GetRWSession(slot);
+    } else if (rwsession == CK_INVALID_HANDLE) {
+        rwsession = slot->session;
+        if (rwsession != CK_INVALID_HANDLE)
+            PK11_EnterSlotMonitor(slot);
+    }
+    if (rwsession == CK_INVALID_HANDLE) {
+        PORT_SetError(SEC_ERROR_BAD_DATA);
+        return SECFailure;
+    }
+    crv = PK11_GETTAB(slot)->C_CreateObject(rwsession,
+                                             (CK_ATTRIBUTE_PTR)theTemplate,
+                                            count, objectID);
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        rv = SECFailure;
+    }
+    if (token) {
+        PK11_RestoreROSession(slot, rwsession);
+    } else if (session == CK_INVALID_HANDLE) {
+        PK11_ExitSlotMonitor(slot);
+    }
+
+    return rv;
+}
+
+unsigned int
+pk11_OpFlagsToAttributes(CK_FLAGS flags, CK_ATTRIBUTE *attrs, CK_BBOOL *ckTrue)
+{
+
+    const static CK_ATTRIBUTE_TYPE attrTypes[12] = {
+        CKA_ENCRYPT, CKA_DECRYPT, 0 , CKA_SIGN,
+        CKA_SIGN_RECOVER, CKA_VERIFY, CKA_VERIFY_RECOVER, 0 ,
+        0 , CKA_WRAP, CKA_UNWRAP, CKA_DERIVE
+    };
+
+    const CK_ATTRIBUTE_TYPE *pType = attrTypes;
+    CK_ATTRIBUTE *attr = attrs;
+    CK_FLAGS test = CKF_ENCRYPT;
+
+    PR_ASSERT(!(flags & ~CKF_KEY_OPERATION_FLAGS));
+    flags &= CKF_KEY_OPERATION_FLAGS;
+
+    for (; flags && test <= CKF_DERIVE; test <<= 1, ++pType) {
+        if (test & flags) {
+            flags ^= test;
+            PR_ASSERT(*pType);
+            PK11_SETATTRS(attr, *pType, ckTrue, sizeof *ckTrue);
+            ++attr;
+        }
+    }
+    return (attr - attrs);
+}
+
+PRBool
+pk11_BadAttrFlags(PK11AttrFlags attrFlags)
+{
+    PK11AttrFlags trueFlags = attrFlags & 0x55555555;
+    PK11AttrFlags falseFlags = (attrFlags >> 1) & 0x55555555;
+    return ((trueFlags & falseFlags) != 0);
+}
+
+unsigned int
+pk11_AttrFlagsToAttributes(PK11AttrFlags attrFlags, CK_ATTRIBUTE *attrs,
+                           CK_BBOOL *ckTrue, CK_BBOOL *ckFalse)
+{
+    const static CK_ATTRIBUTE_TYPE attrTypes[5] = {
+        CKA_TOKEN, CKA_PRIVATE, CKA_MODIFIABLE, CKA_SENSITIVE,
+        CKA_EXTRACTABLE
+    };
+
+    const CK_ATTRIBUTE_TYPE *pType = attrTypes;
+    CK_ATTRIBUTE *attr = attrs;
+    PK11AttrFlags test = PK11_ATTR_TOKEN;
+
+    PR_ASSERT(!pk11_BadAttrFlags(attrFlags));
+
+    for (; attrFlags && test <= PK11_ATTR_EXTRACTABLE; test <<= 2, ++pType) {
+        if (test & attrFlags) {
+            attrFlags ^= test;
+            PK11_SETATTRS(attr, *pType, ckTrue, sizeof *ckTrue);
+            ++attr;
+        } else if ((test << 1) & attrFlags) {
+            attrFlags ^= (test << 1);
+            PK11_SETATTRS(attr, *pType, ckFalse, sizeof *ckFalse);
+            ++attr;
+        }
+    }
+    return (attr - attrs);
+}
+
+static int
+pk11_backupGetSignLength(SECKEYPrivateKey *key)
+{
+    PK11SlotInfo *slot = key->pkcs11Slot;
+    CK_MECHANISM mech = { 0, NULL, 0 };
+    PRBool owner = PR_TRUE;
+    CK_SESSION_HANDLE session;
+    CK_ULONG len;
+    CK_RV crv;
+    unsigned char h_data[20] = { 0 };
+    unsigned char buf[20]; 
+    CK_ULONG smallLen = sizeof(buf);
+
+    mech.mechanism = PK11_MapSignKeyType(key->keyType);
+
+    session = pk11_GetNewSession(slot, &owner);
+    if (!owner || !(slot->isThreadSafe))
+        PK11_EnterSlotMonitor(slot);
+    crv = PK11_GETTAB(slot)->C_SignInit(session, &mech, key->pkcs11ID);
+    if (crv != CKR_OK) {
+        if (!owner || !(slot->isThreadSafe))
+            PK11_ExitSlotMonitor(slot);
+        pk11_CloseSession(slot, session, owner);
+        PORT_SetError(PK11_MapError(crv));
+        return -1;
+    }
+    len = 0;
+    crv = PK11_GETTAB(slot)->C_Sign(session, h_data, sizeof(h_data),
+                                    NULL, &len);
+    (void)PK11_GETTAB(slot)->C_Sign(session, h_data, sizeof(h_data), buf, &smallLen);
+
+    if (!owner || !(slot->isThreadSafe))
+        PK11_ExitSlotMonitor(slot);
+    pk11_CloseSession(slot, session, owner);
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        return -1;
+    }
+    return len;
+}
+
+int
+PK11_SignatureLen(SECKEYPrivateKey *key)
+{
+    int val;
+    SECItem attributeItem = { siBuffer, NULL, 0 };
+    SECStatus rv;
+    int length;
+    SECOidTag paramSet;
+
+    switch (key->keyType) {
+        case rsaKey:
+        case rsaPssKey:
+            val = PK11_GetPrivateModulusLen(key);
+            if (val == -1) {
+                return pk11_backupGetSignLength(key);
+            }
+            return (unsigned long)val;
+
+        case fortezzaKey:
+            return 40;
+
+        case dsaKey:
+            rv = PK11_ReadAttribute(key->pkcs11Slot, key->pkcs11ID, CKA_SUBPRIME,
+                                    NULL, &attributeItem);
+            if (rv == SECSuccess) {
+                length = attributeItem.len;
+                if ((length > 0) && attributeItem.data[0] == 0) {
+                    length--;
+                }
+                PORT_Free(attributeItem.data);
+                return length * 2;
+            }
+            return pk11_backupGetSignLength(key);
+        case ecKey:
+        case edKey:
+            rv = PK11_ReadAttribute(key->pkcs11Slot, key->pkcs11ID, CKA_EC_PARAMS,
+                                    NULL, &attributeItem);
+            if (rv == SECSuccess) {
+                length = SECKEY_ECParamsToBasePointOrderLen(&attributeItem);
+                PORT_Free(attributeItem.data);
+                if (length != 0) {
+                    length = ((length + 7) / 8) * 2;
+                    return length;
+                }
+            }
+            return pk11_backupGetSignLength(key);
+        case mldsaKey:
+            paramSet = seckey_GetParameterSet(key);
+            if (paramSet == SEC_OID_UNKNOWN) {
+                break;
+            }
+
+            return SECKEY_MLDSAOidParamsToLen(paramSet, SECKEYSignatureType);
+        default:
+            break;
+    }
+    PORT_SetError(SEC_ERROR_INVALID_KEY);
+    return 0;
+}
+
+CK_OBJECT_HANDLE
+PK11_CopyKey(PK11SlotInfo *slot, CK_OBJECT_HANDLE srcObject)
+{
+    CK_OBJECT_HANDLE destObject;
+    CK_RV crv;
+
+    PK11_EnterSlotMonitor(slot);
+    crv = PK11_GETTAB(slot)->C_CopyObject(slot->session, srcObject, NULL, 0,
+                                          &destObject);
+    PK11_ExitSlotMonitor(slot);
+    if (crv == CKR_OK)
+        return destObject;
+    PORT_SetError(PK11_MapError(crv));
+    return CK_INVALID_HANDLE;
+}
+
+PRBool
+pk11_FindAttrInTemplate(CK_ATTRIBUTE *attr, unsigned int numAttrs,
+                        CK_ATTRIBUTE_TYPE target)
+{
+    for (; numAttrs > 0; ++attr, --numAttrs) {
+        if (attr->type == target)
+            return PR_TRUE;
+    }
+    return PR_FALSE;
+}
+
+SECStatus
+PK11_VerifyRecover(SECKEYPublicKey *key, const SECItem *sig,
+                   SECItem *dsig, void *wincx)
+{
+    PK11SlotInfo *slot = key->pkcs11Slot;
+    CK_OBJECT_HANDLE id = key->pkcs11ID;
+    CK_MECHANISM mech = { 0, NULL, 0 };
+    PRBool owner = PR_TRUE;
+    CK_SESSION_HANDLE session;
+    CK_ULONG len;
+    CK_RV crv;
+
+    mech.mechanism = PK11_MapSignKeyType(key->keyType);
+
+    if (slot == NULL) {
+        slot = PK11_GetBestSlotWithAttributes(mech.mechanism,
+                                              CKF_VERIFY_RECOVER, 0, wincx);
+        if (slot == NULL) {
+            PORT_SetError(SEC_ERROR_NO_MODULE);
+            return SECFailure;
+        }
+        id = PK11_ImportPublicKey(slot, key, PR_FALSE);
+    } else {
+        PK11_ReferenceSlot(slot);
+    }
+
+    if (id == CK_INVALID_HANDLE) {
+        PK11_FreeSlot(slot);
+        PORT_SetError(SEC_ERROR_BAD_KEY);
+        return SECFailure;
+    }
+
+    session = pk11_GetNewSession(slot, &owner);
+    if (!owner || !(slot->isThreadSafe))
+        PK11_EnterSlotMonitor(slot);
+    crv = PK11_GETTAB(slot)->C_VerifyRecoverInit(session, &mech, id);
+    if (crv != CKR_OK) {
+        if (!owner || !(slot->isThreadSafe))
+            PK11_ExitSlotMonitor(slot);
+        pk11_CloseSession(slot, session, owner);
+        PORT_SetError(PK11_MapError(crv));
+        PK11_FreeSlot(slot);
+        return SECFailure;
+    }
+    len = dsig->len;
+    crv = PK11_GETTAB(slot)->C_VerifyRecover(session, sig->data,
+                                             sig->len, dsig->data, &len);
+    if (!owner || !(slot->isThreadSafe))
+        PK11_ExitSlotMonitor(slot);
+    pk11_CloseSession(slot, session, owner);
+    dsig->len = len;
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        PK11_FreeSlot(slot);
+        return SECFailure;
+    }
+    PK11_FreeSlot(slot);
+    return SECSuccess;
+}
+
+SECStatus
+PK11_Verify(SECKEYPublicKey *key, const SECItem *sig, const SECItem *hash,
+            void *wincx)
+{
+    CK_MECHANISM_TYPE mech = PK11_MapSignKeyType(key->keyType);
+    return PK11_VerifyWithMechanism(key, mech, NULL, sig, hash, wincx);
+}
+
+SECStatus
+PK11_VerifyWithMechanism(SECKEYPublicKey *key, CK_MECHANISM_TYPE mechanism,
+                         const SECItem *param, const SECItem *sig,
+                         const SECItem *hash, void *wincx)
+{
+    PK11SlotInfo *slot = key->pkcs11Slot;
+    CK_OBJECT_HANDLE id = key->pkcs11ID;
+    CK_MECHANISM mech = { 0, NULL, 0 };
+    PRBool owner = PR_TRUE;
+    CK_SESSION_HANDLE session;
+    CK_RV crv;
+
+    mech.mechanism = mechanism;
+    if (param) {
+        mech.pParameter = param->data;
+        mech.ulParameterLen = param->len;
+    }
+
+    if (slot == NULL) {
+        unsigned int length = 0;
+        if ((mech.mechanism == CKM_DSA) &&
+            (key->u.dsa.params.prime.len > 129)) {
+            length = key->u.dsa.params.prime.len;
+            if (key->u.dsa.params.prime.data[0] == 0) {
+                length--;
+            }
+            length *= 8;
+        }
+        slot = PK11_GetBestSlotWithAttributes(mech.mechanism,
+                                              CKF_VERIFY, length, wincx);
+        if (slot == NULL) {
+            PORT_SetError(SEC_ERROR_NO_MODULE);
+            return SECFailure;
+        }
+        id = PK11_ImportPublicKey(slot, key, PR_FALSE);
+
+    } else {
+        PK11_ReferenceSlot(slot);
+    }
+
+    if (id == CK_INVALID_HANDLE) {
+        PK11_FreeSlot(slot);
+        PORT_SetError(SEC_ERROR_BAD_KEY);
+        return SECFailure;
+    }
+
+    session = pk11_GetNewSession(slot, &owner);
+    if (!owner || !(slot->isThreadSafe))
+        PK11_EnterSlotMonitor(slot);
+    if (PK11_CheckPKCS11Version(slot, 3, 2, PR_TRUE) >= 0) {
+        crv = PK11_GETTAB(slot)->C_VerifySignatureInit(session, &mech, id,
+                                                       sig->data, sig->len);
+        if (crv != CKR_OK) {
+            if (!owner || !(slot->isThreadSafe))
+                PK11_ExitSlotMonitor(slot);
+            pk11_CloseSession(slot, session, owner);
+            PK11_FreeSlot(slot);
+            PORT_SetError(PK11_MapError(crv));
+            return SECFailure;
+        }
+        crv = PK11_GETTAB(slot)->C_VerifySignature(session, hash->data,
+                                                   hash->len);
+    } else {
+        crv = PK11_GETTAB(slot)->C_VerifyInit(session, &mech, id);
+        if (crv != CKR_OK) {
+            if (!owner || !(slot->isThreadSafe))
+                PK11_ExitSlotMonitor(slot);
+            pk11_CloseSession(slot, session, owner);
+            PK11_FreeSlot(slot);
+            PORT_SetError(PK11_MapError(crv));
+            return SECFailure;
+        }
+        crv = PK11_GETTAB(slot)->C_Verify(session, hash->data,
+                                          hash->len, sig->data, sig->len);
+    }
+    if (!owner || !(slot->isThreadSafe))
+        PK11_ExitSlotMonitor(slot);
+
+    pk11_CloseSession(slot, session, owner);
+    PK11_FreeSlot(slot);
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+    return SECSuccess;
+}
+
+SECStatus
+PK11_Sign(SECKEYPrivateKey *key, SECItem *sig, const SECItem *hash)
+{
+    CK_MECHANISM_TYPE mech = PK11_MapSignKeyType(key->keyType);
+    return PK11_SignWithMechanism(key, mech, NULL, sig, hash);
+}
+
+SECStatus
+PK11_SignWithMechanism(SECKEYPrivateKey *key, CK_MECHANISM_TYPE mechanism,
+                       const SECItem *param, SECItem *sig, const SECItem *hash)
+{
+    PK11SlotInfo *slot = key->pkcs11Slot;
+    CK_MECHANISM mech = { 0, NULL, 0 };
+    PRBool owner = PR_TRUE;
+    CK_SESSION_HANDLE session;
+    PRBool haslock = PR_FALSE;
+    CK_ULONG len;
+    CK_RV crv;
+
+    mech.mechanism = mechanism;
+    if (param) {
+        mech.pParameter = param->data;
+        mech.ulParameterLen = param->len;
+    }
+
+    if (SECKEY_HAS_ATTRIBUTE_SET(key, CKA_PRIVATE)) {
+        PK11_HandlePasswordCheck(slot, key->wincx);
+    }
+
+    session = pk11_GetNewSession(slot, &owner);
+    haslock = (!owner || !(slot->isThreadSafe));
+    if (haslock)
+        PK11_EnterSlotMonitor(slot);
+    crv = PK11_GETTAB(slot)->C_SignInit(session, &mech, key->pkcs11ID);
+    if (crv != CKR_OK) {
+        if (haslock)
+            PK11_ExitSlotMonitor(slot);
+        pk11_CloseSession(slot, session, owner);
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+
+    if (SECKEY_HAS_ATTRIBUTE_SET_LOCK(key, CKA_ALWAYS_AUTHENTICATE, haslock)) {
+        PK11_DoPassword(slot, session, PR_FALSE, key->wincx, haslock, PR_TRUE);
+    }
+
+    len = sig->len;
+    crv = PK11_GETTAB(slot)->C_Sign(session, hash->data,
+                                    hash->len, sig->data, &len);
+    if (haslock)
+        PK11_ExitSlotMonitor(slot);
+    pk11_CloseSession(slot, session, owner);
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+    sig->len = len;
+    return SECSuccess;
+}
+
+SECStatus
+PK11_SignWithSymKey(PK11SymKey *symKey, CK_MECHANISM_TYPE mechanism,
+                    SECItem *param, SECItem *sig, const SECItem *data)
+{
+    PK11SlotInfo *slot = symKey->slot;
+    CK_MECHANISM mech = { 0, NULL, 0 };
+    PRBool owner = PR_TRUE;
+    CK_SESSION_HANDLE session;
+    PRBool haslock = PR_FALSE;
+    CK_ULONG len;
+    CK_RV crv;
+
+    mech.mechanism = mechanism;
+    if (param) {
+        mech.pParameter = param->data;
+        mech.ulParameterLen = param->len;
+    }
+
+    session = pk11_GetNewSession(slot, &owner);
+    haslock = (!owner || !(slot->isThreadSafe));
+    if (haslock)
+        PK11_EnterSlotMonitor(slot);
+    crv = PK11_GETTAB(slot)->C_SignInit(session, &mech, symKey->objectID);
+    if (crv != CKR_OK) {
+        if (haslock)
+            PK11_ExitSlotMonitor(slot);
+        pk11_CloseSession(slot, session, owner);
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+
+    len = sig->len;
+    crv = PK11_GETTAB(slot)->C_Sign(session, data->data,
+                                    data->len, sig->data, &len);
+    if (haslock)
+        PK11_ExitSlotMonitor(slot);
+    pk11_CloseSession(slot, session, owner);
+    sig->len = len;
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+    return SECSuccess;
+}
+
+SECStatus
+PK11_Decrypt(PK11SymKey *symKey,
+             CK_MECHANISM_TYPE mechanism, SECItem *param,
+             unsigned char *out, unsigned int *outLen,
+             unsigned int maxLen,
+             const unsigned char *enc, unsigned encLen)
+{
+    PK11SlotInfo *slot = symKey->slot;
+    CK_MECHANISM mech = { 0, NULL, 0 };
+    CK_ULONG len = maxLen;
+    PRBool owner = PR_TRUE;
+    CK_SESSION_HANDLE session;
+    PRBool haslock = PR_FALSE;
+    CK_RV crv;
+
+    mech.mechanism = mechanism;
+    if (param) {
+        mech.pParameter = param->data;
+        mech.ulParameterLen = param->len;
+    }
+
+    session = pk11_GetNewSession(slot, &owner);
+    haslock = (!owner || !slot->isThreadSafe);
+    if (haslock)
+        PK11_EnterSlotMonitor(slot);
+    crv = PK11_GETTAB(slot)->C_DecryptInit(session, &mech, symKey->objectID);
+    if (crv != CKR_OK) {
+        if (haslock)
+            PK11_ExitSlotMonitor(slot);
+        pk11_CloseSession(slot, session, owner);
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+
+    crv = PK11_GETTAB(slot)->C_Decrypt(session, (unsigned char *)enc, encLen,
+                                       out, &len);
+    if (haslock)
+        PK11_ExitSlotMonitor(slot);
+    pk11_CloseSession(slot, session, owner);
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+    *outLen = len;
+    return SECSuccess;
+}
+
+SECStatus
+PK11_Encrypt(PK11SymKey *symKey,
+             CK_MECHANISM_TYPE mechanism, SECItem *param,
+             unsigned char *out, unsigned int *outLen,
+             unsigned int maxLen,
+             const unsigned char *data, unsigned int dataLen)
+{
+    PK11SlotInfo *slot = symKey->slot;
+    CK_MECHANISM mech = { 0, NULL, 0 };
+    CK_ULONG len = maxLen;
+    PRBool owner = PR_TRUE;
+    CK_SESSION_HANDLE session;
+    PRBool haslock = PR_FALSE;
+    CK_RV crv;
+
+    mech.mechanism = mechanism;
+    if (param) {
+        mech.pParameter = param->data;
+        mech.ulParameterLen = param->len;
+    }
+
+    session = pk11_GetNewSession(slot, &owner);
+    haslock = (!owner || !slot->isThreadSafe);
+    if (haslock)
+        PK11_EnterSlotMonitor(slot);
+    crv = PK11_GETTAB(slot)->C_EncryptInit(session, &mech, symKey->objectID);
+    if (crv != CKR_OK) {
+        if (haslock)
+            PK11_ExitSlotMonitor(slot);
+        pk11_CloseSession(slot, session, owner);
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+    crv = PK11_GETTAB(slot)->C_Encrypt(session, (unsigned char *)data,
+                                       dataLen, out, &len);
+    if (haslock)
+        PK11_ExitSlotMonitor(slot);
+    pk11_CloseSession(slot, session, owner);
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+    *outLen = len;
+    return SECSuccess;
+}
+
+static SECStatus
+pk11_PrivDecryptRaw(SECKEYPrivateKey *key,
+                    unsigned char *data, unsigned *outLen, unsigned int maxLen,
+                    const unsigned char *enc, unsigned encLen,
+                    CK_MECHANISM_PTR mech)
+{
+    PK11SlotInfo *slot = key->pkcs11Slot;
+    CK_ULONG out = maxLen;
+    PRBool owner = PR_TRUE;
+    CK_SESSION_HANDLE session;
+    PRBool haslock = PR_FALSE;
+    CK_RV crv;
+
+    if (key->keyType != rsaKey) {
+        PORT_SetError(SEC_ERROR_INVALID_KEY);
+        return SECFailure;
+    }
+
+    if (SECKEY_HAS_ATTRIBUTE_SET(key, CKA_PRIVATE)) {
+        PK11_HandlePasswordCheck(slot, key->wincx);
+    }
+    session = pk11_GetNewSession(slot, &owner);
+    haslock = (!owner || !(slot->isThreadSafe));
+    if (haslock)
+        PK11_EnterSlotMonitor(slot);
+    crv = PK11_GETTAB(slot)->C_DecryptInit(session, mech, key->pkcs11ID);
+    if (crv != CKR_OK) {
+        if (haslock)
+            PK11_ExitSlotMonitor(slot);
+        pk11_CloseSession(slot, session, owner);
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+
+    if (SECKEY_HAS_ATTRIBUTE_SET_LOCK(key, CKA_ALWAYS_AUTHENTICATE, haslock)) {
+        PK11_DoPassword(slot, session, PR_FALSE, key->wincx, haslock, PR_TRUE);
+    }
+
+    crv = PK11_GETTAB(slot)->C_Decrypt(session, (unsigned char *)enc, encLen,
+                                       data, &out);
+    if (haslock)
+        PK11_ExitSlotMonitor(slot);
+    pk11_CloseSession(slot, session, owner);
+    *outLen = out;
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+    return SECSuccess;
+}
+
+SECStatus
+PK11_PubDecryptRaw(SECKEYPrivateKey *key,
+                   unsigned char *data, unsigned *outLen, unsigned int maxLen,
+                   const unsigned char *enc, unsigned encLen)
+{
+    CK_MECHANISM mech = { CKM_RSA_X_509, NULL, 0 };
+    return pk11_PrivDecryptRaw(key, data, outLen, maxLen, enc, encLen, &mech);
+}
+
+SECStatus
+PK11_PrivDecryptPKCS1(SECKEYPrivateKey *key,
+                      unsigned char *data, unsigned *outLen, unsigned int maxLen,
+                      const unsigned char *enc, unsigned encLen)
+{
+    CK_MECHANISM mech = { CKM_RSA_PKCS, NULL, 0 };
+    return pk11_PrivDecryptRaw(key, data, outLen, maxLen, enc, encLen, &mech);
+}
+
+static SECStatus
+pk11_PubEncryptRaw(SECKEYPublicKey *key,
+                   unsigned char *out, unsigned int *outLen,
+                   unsigned int maxLen,
+                   const unsigned char *data, unsigned dataLen,
+                   CK_MECHANISM_PTR mech, void *wincx)
+{
+    PK11SlotInfo *slot;
+    CK_OBJECT_HANDLE id;
+    CK_ULONG len = maxLen;
+    PRBool owner = PR_TRUE;
+    CK_SESSION_HANDLE session;
+    CK_RV crv;
+
+    slot = PK11_GetBestSlotWithAttributes(mech->mechanism, CKF_ENCRYPT, 0, wincx);
+    if (slot == NULL) {
+        PORT_SetError(SEC_ERROR_NO_MODULE);
+        return SECFailure;
+    }
+
+    id = PK11_ImportPublicKey(slot, key, PR_FALSE);
+
+    if (id == CK_INVALID_HANDLE) {
+        PK11_FreeSlot(slot);
+        PORT_SetError(SEC_ERROR_BAD_KEY);
+        return SECFailure;
+    }
+
+    session = pk11_GetNewSession(slot, &owner);
+    if (!owner || !(slot->isThreadSafe))
+        PK11_EnterSlotMonitor(slot);
+    crv = PK11_GETTAB(slot)->C_EncryptInit(session, mech, id);
+    if (crv != CKR_OK) {
+        if (!owner || !(slot->isThreadSafe))
+            PK11_ExitSlotMonitor(slot);
+        pk11_CloseSession(slot, session, owner);
+        PK11_FreeSlot(slot);
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+    crv = PK11_GETTAB(slot)->C_Encrypt(session, (unsigned char *)data, dataLen,
+                                       out, &len);
+    if (!owner || !(slot->isThreadSafe))
+        PK11_ExitSlotMonitor(slot);
+    pk11_CloseSession(slot, session, owner);
+    PK11_FreeSlot(slot);
+    *outLen = len;
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+    return SECSuccess;
+}
+
+SECStatus
+PK11_PubEncryptRaw(SECKEYPublicKey *key,
+                   unsigned char *enc,
+                   const unsigned char *data, unsigned dataLen,
+                   void *wincx)
+{
+    CK_MECHANISM mech = { CKM_RSA_X_509, NULL, 0 };
+    unsigned int outLen;
+    if (!key || key->keyType != rsaKey) {
+        PORT_SetError(SEC_ERROR_BAD_KEY);
+        return SECFailure;
+    }
+    outLen = SECKEY_PublicKeyStrength(key);
+    return pk11_PubEncryptRaw(key, enc, &outLen, outLen, data, dataLen, &mech,
+                              wincx);
+}
+
+SECStatus
+PK11_PubEncryptPKCS1(SECKEYPublicKey *key,
+                     unsigned char *enc,
+                     const unsigned char *data, unsigned dataLen,
+                     void *wincx)
+{
+    CK_MECHANISM mech = { CKM_RSA_PKCS, NULL, 0 };
+    unsigned int outLen;
+    if (!key || key->keyType != rsaKey) {
+        PORT_SetError(SEC_ERROR_BAD_KEY);
+        return SECFailure;
+    }
+    outLen = SECKEY_PublicKeyStrength(key);
+    return pk11_PubEncryptRaw(key, enc, &outLen, outLen, data, dataLen, &mech,
+                              wincx);
+}
+
+SECStatus
+PK11_PrivDecrypt(SECKEYPrivateKey *key,
+                 CK_MECHANISM_TYPE mechanism, SECItem *param,
+                 unsigned char *out, unsigned int *outLen,
+                 unsigned int maxLen,
+                 const unsigned char *enc, unsigned encLen)
+{
+    CK_MECHANISM mech = { mechanism, NULL, 0 };
+    if (param) {
+        mech.pParameter = param->data;
+        mech.ulParameterLen = param->len;
+    }
+    return pk11_PrivDecryptRaw(key, out, outLen, maxLen, enc, encLen, &mech);
+}
+
+SECStatus
+PK11_PubEncrypt(SECKEYPublicKey *key,
+                CK_MECHANISM_TYPE mechanism, SECItem *param,
+                unsigned char *out, unsigned int *outLen,
+                unsigned int maxLen,
+                const unsigned char *data, unsigned dataLen,
+                void *wincx)
+{
+    CK_MECHANISM mech = { mechanism, NULL, 0 };
+    if (param) {
+        mech.pParameter = param->data;
+        mech.ulParameterLen = param->len;
+    }
+    return pk11_PubEncryptRaw(key, out, outLen, maxLen, data, dataLen, &mech,
+                              wincx);
+}
+
+SECKEYPrivateKey *
+PK11_UnwrapPrivKey(PK11SlotInfo *slot, PK11SymKey *wrappingKey,
+                   CK_MECHANISM_TYPE wrapType, SECItem *param,
+                   SECItem *wrappedKey, SECItem *label,
+                   const SECItem *idValue, PRBool perm, PRBool sensitive,
+                   CK_KEY_TYPE keyType, CK_ATTRIBUTE_TYPE *usage,
+                   int usageCount, void *wincx)
+{
+    CK_BBOOL cktrue = CK_TRUE;
+    CK_BBOOL ckfalse = CK_FALSE;
+    CK_OBJECT_CLASS keyClass = CKO_PRIVATE_KEY;
+    CK_ATTRIBUTE keyTemplate[15];
+    int templateCount = 0;
+    CK_OBJECT_HANDLE privKeyID;
+    CK_MECHANISM mechanism;
+    CK_ATTRIBUTE *attrs = keyTemplate;
+    SECItem *param_free = NULL, *ck_id = NULL;
+    CK_RV crv;
+    CK_SESSION_HANDLE rwsession;
+    PK11SymKey *newKey = NULL;
+    SECKEYPrivateKey *privKey = NULL;
+    SECKEYPublicKey *pubKey = NULL;
+    int i;
+
+    if (!slot || !wrappedKey) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return NULL;
+    }
+
+    if (usageCount < 0 ||
+        usageCount > (int)(PR_ARRAY_SIZE(keyTemplate) - 8)) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return NULL;
+    }
+
+    if (idValue) {
+        ck_id = PK11_MakeIDFromPubKey(idValue);
+        if (!ck_id) {
+            return NULL;
+        }
+    }
+
+    PK11_SETATTRS(attrs, CKA_TOKEN, perm ? &cktrue : &ckfalse,
+                  sizeof(cktrue));
+    attrs++;
+    PK11_SETATTRS(attrs, CKA_CLASS, &keyClass, sizeof(keyClass));
+    attrs++;
+    PK11_SETATTRS(attrs, CKA_KEY_TYPE, &keyType, sizeof(keyType));
+    attrs++;
+    PK11_SETATTRS(attrs, CKA_PRIVATE, sensitive ? &cktrue : &ckfalse,
+                  sizeof(cktrue));
+    attrs++;
+    PK11_SETATTRS(attrs, CKA_SENSITIVE, sensitive ? &cktrue : &ckfalse,
+                  sizeof(cktrue));
+    attrs++;
+    if (label && label->data) {
+        PK11_SETATTRS(attrs, CKA_LABEL, label->data, label->len);
+        attrs++;
+    }
+    if (ck_id) {
+        PK11_SETATTRS(attrs, CKA_ID, ck_id->data, ck_id->len);
+        attrs++;
+    }
+    for (i = 0; i < usageCount; i++) {
+        PK11_SETATTRS(attrs, usage[i], &cktrue, sizeof(cktrue));
+        attrs++;
+    }
+
+    if (idValue && PK11_IsInternal(slot)) {
+        PK11_SETATTRS(attrs, CKA_NSS_DB, idValue->data,
+                      idValue->len);
+        attrs++;
+    }
+
+    templateCount = attrs - keyTemplate;
+    PR_ASSERT(templateCount <= (sizeof(keyTemplate) / sizeof(CK_ATTRIBUTE)));
+
+    mechanism.mechanism = wrapType;
+    if (!param)
+        param = param_free = PK11_ParamFromIV(wrapType, NULL);
+    if (param) {
+        mechanism.pParameter = param->data;
+        mechanism.ulParameterLen = param->len;
+    } else {
+        mechanism.pParameter = NULL;
+        mechanism.ulParameterLen = 0;
+    }
+
+    if (wrappingKey->slot != slot) {
+        newKey = pk11_CopyToSlot(slot, wrapType, CKA_UNWRAP, wrappingKey);
+    } else {
+        newKey = PK11_ReferenceSymKey(wrappingKey);
+    }
+
+    if (newKey) {
+        if (perm) {
+            rwsession = PK11_GetRWSession(slot);
+        } else {
+            rwsession = slot->session;
+            if (rwsession != CK_INVALID_HANDLE)
+                PK11_EnterSlotMonitor(slot);
+        }
+        if (rwsession == CK_INVALID_HANDLE) {
+            PORT_SetError(SEC_ERROR_BAD_DATA);
+            goto loser;
+        }
+        crv = PK11_GETTAB(slot)->C_UnwrapKey(rwsession, &mechanism,
+                                             newKey->objectID,
+                                             wrappedKey->data,
+                                             wrappedKey->len, keyTemplate,
+                                             templateCount, &privKeyID);
+
+        if (perm) {
+            PK11_RestoreROSession(slot, rwsession);
+        } else {
+            PK11_ExitSlotMonitor(slot);
+        }
+        PK11_FreeSymKey(newKey);
+        newKey = NULL;
+    } else {
+        crv = CKR_FUNCTION_NOT_SUPPORTED;
+    }
+
+    SECITEM_FreeItem(ck_id, PR_TRUE);
+    ck_id = NULL;
+
+    if (crv != CKR_OK) {
+        PK11SlotInfo *int_slot = PK11_GetInternalSlot();
+
+        if (int_slot && (slot != int_slot)) {
+            privKey = PK11_UnwrapPrivKey(int_slot, wrappingKey, wrapType,
+                                         param, wrappedKey, label,
+                                         idValue, PR_FALSE, PR_FALSE,
+                                         keyType, usage, usageCount, wincx);
+            if (privKey) {
+                SECKEYPrivateKey *newPrivKey = PK11_LoadPrivKey(slot, privKey,
+                                                                NULL, perm, sensitive);
+                SECKEY_DestroyPrivateKey(privKey);
+                PK11_FreeSlot(int_slot);
+                SECITEM_FreeItem(param_free, PR_TRUE);
+                return newPrivKey;
+            }
+        }
+        if (int_slot)
+            PK11_FreeSlot(int_slot);
+        PORT_SetError(PK11_MapError(crv));
+        SECITEM_FreeItem(param_free, PR_TRUE);
+        return NULL;
+    }
+    SECITEM_FreeItem(param_free, PR_TRUE);
+    privKey = pk11_MakePrivKey(slot, nullKey, !perm , privKeyID, wincx);
+    if (!privKey) {
+        goto loser;
+    }
+    if (idValue == NULL) {
+        SECStatus rv;
+        pubKey = SECKEY_ConvertToPublicKey(privKey);
+        if (pubKey == NULL) {
+            goto loser;
+        }
+        idValue = PK11_GetPublicValueFromPublicKey(pubKey);
+        if (idValue == NULL) {
+            goto loser;
+        }
+        ck_id = PK11_MakeIDFromPubKey(idValue);
+        if (ck_id == NULL) {
+            goto loser;
+        }
+        rv = PK11_WriteRawAttribute(PK11_TypePrivKey, privKey, CKA_ID, ck_id);
+        if (rv != SECSuccess) {
+            goto loser;
+        }
+        if (pubKey->pkcs11Slot) {
+            rv = PK11_WriteRawAttribute(PK11_TypePubKey, pubKey, CKA_ID, ck_id);
+            if (rv != SECSuccess) {
+                goto loser;
+            }
+        }
+        if (!pubKey->pkcs11Slot ||
+            !PK11_IsPermObject(pubKey->pkcs11Slot, pubKey->pkcs11ID)) {
+            (void)PK11_ImportPublicKey(privKey->pkcs11Slot, pubKey, PR_TRUE);
+        }
+        SECKEY_DestroyPublicKey(pubKey);
+        SECITEM_FreeItem(ck_id, PR_TRUE);
+    }
+    return privKey;
+
+loser:
+    if (newKey) {
+        PK11_FreeSymKey(newKey);
+    }
+    if (privKey)
+        SECKEY_DestroyPrivateKey(privKey);
+    if (pubKey)
+        SECKEY_DestroyPublicKey(pubKey);
+    SECITEM_FreeItem(ck_id, PR_TRUE);
+    SECITEM_FreeItem(param_free, PR_TRUE);
+    return NULL;
+}
+
+#define _MAX_USAGE 6
+SECKEYPrivateKey *
+PK11_UnwrapPrivKeyByKeyType(PK11SlotInfo *slot, PK11SymKey *wrappingKey,
+                            CK_MECHANISM_TYPE wrapType, SECItem *param,
+                            SECItem *wrappedKey, SECItem *label,
+                            const SECItem *idValue, PRBool perm, PRBool sensitive,
+                            KeyType keyType, unsigned int keyUsage, void *wincx)
+{
+    CK_KEY_TYPE pk11KeyType = pk11_getPKCS11KeyTypeFromKeyType(keyType);
+    CK_ATTRIBUTE_TYPE usage[_MAX_USAGE];
+    int usageCount = 0;
+    PRBool needKeyUsage = PR_FALSE;
+
+    if ((keyType == rsaKey) || (keyType == ecKey)) {
+        needKeyUsage = PR_TRUE;
+    }
+
+    if ((pk11_mapWrapKeyType(keyType) != CKM_INVALID_MECHANISM) &&
+        (!needKeyUsage || keyUsage & KU_KEY_ENCIPHERMENT)) {
+        usage[usageCount++] = CKA_UNWRAP;
+        usage[usageCount++] = CKA_DECRYPT;
+    }
+    if ((pk11_mapKemKeyType(keyType) != CKM_INVALID_MECHANISM) &&
+        (!needKeyUsage || keyUsage & KU_KEY_AGREEMENT)) {
+        usage[usageCount++] = CKA_DECAPSULATE;
+    }
+    if ((PK11_MapSignKeyType(keyType) != CKM_INVALID_MECHANISM) &&
+        (!needKeyUsage || keyUsage & KU_DIGITAL_SIGNATURE)) {
+        usage[usageCount++] = CKA_SIGN;
+        if (keyType == rsaKey) {
+            usage[usageCount++] = CKA_SIGN_RECOVER;
+        }
+    }
+    if ((pk11_mapDeriveKeyType(keyType) != CKM_INVALID_MECHANISM) &&
+        (!needKeyUsage || keyUsage & KU_KEY_AGREEMENT)) {
+        usage[usageCount++] = CKA_DERIVE;
+    }
+
+    PORT_Assert(usageCount <= _MAX_USAGE);
+
+    if (usageCount == 0) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+    }
+    return PK11_UnwrapPrivKey(slot, wrappingKey, wrapType, param, wrappedKey,
+                              label, idValue, perm, sensitive, pk11KeyType,
+                              usage, usageCount, wincx);
+}
+
+SECStatus
+PK11_WrapPrivKey(PK11SlotInfo *slot, PK11SymKey *wrappingKey,
+                 SECKEYPrivateKey *privKey, CK_MECHANISM_TYPE wrapType,
+                 SECItem *param, SECItem *wrappedKey, void *wincx)
+{
+    PK11SlotInfo *privSlot = privKey->pkcs11Slot; 
+    PK11SymKey *newSymKey = NULL;
+    SECKEYPrivateKey *newPrivKey = NULL;
+    SECItem *param_free = NULL;
+    CK_ULONG len = wrappedKey->len;
+    CK_MECHANISM mech;
+    CK_RV crv;
+
+    if (!privSlot || !PK11_DoesMechanism(privSlot, wrapType)) {
+        PK11SlotInfo *int_slot = PK11_GetInternalSlot();
+
+        privSlot = int_slot; 
+        newPrivKey = PK11_LoadPrivKey(privSlot, privKey, NULL, PR_FALSE, PR_FALSE);
+        PK11_FreeSlot(int_slot);
+        if (newPrivKey == NULL) {
+            return SECFailure;
+        }
+        privKey = newPrivKey;
+    }
+
+    if (privSlot != wrappingKey->slot) {
+        newSymKey = pk11_CopyToSlot(privSlot, wrapType, CKA_WRAP,
+                                    wrappingKey);
+        wrappingKey = newSymKey;
+    }
+
+    if (wrappingKey == NULL) {
+        if (newPrivKey) {
+            SECKEY_DestroyPrivateKey(newPrivKey);
+        }
+        return SECFailure;
+    }
+    mech.mechanism = wrapType;
+    if (!param) {
+        param = param_free = PK11_ParamFromIV(wrapType, NULL);
+    }
+    if (param) {
+        mech.pParameter = param->data;
+        mech.ulParameterLen = param->len;
+    } else {
+        mech.pParameter = NULL;
+        mech.ulParameterLen = 0;
+    }
+
+    PK11_EnterSlotMonitor(privSlot);
+    crv = PK11_GETTAB(privSlot)->C_WrapKey(privSlot->session, &mech,
+                                           wrappingKey->objectID,
+                                           privKey->pkcs11ID,
+                                           wrappedKey->data, &len);
+    PK11_ExitSlotMonitor(privSlot);
+
+    if (newSymKey) {
+        PK11_FreeSymKey(newSymKey);
+    }
+    if (newPrivKey) {
+        SECKEY_DestroyPrivateKey(newPrivKey);
+    }
+    if (param_free) {
+        SECITEM_FreeItem(param_free, PR_TRUE);
+    }
+
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+
+    wrappedKey->len = len;
+    return SECSuccess;
+}
+
+#if 0
+
+    firstObj = PK11_FindGenericObjects(slot, objClass);
+    for (thisObj=firstObj;
+         thisObj;
+         thisObj=PK11_GetNextGenericObject(thisObj)) {
+    }
+    firstObj = PK11_FindGenericObjects(slot, objClass);
+    for (thisObj=firstObj;
+         thisObj;
+         thisObj=PK11_GetNextGenericObject(thisObj)) {
+      if (isMyObj(thisObj)) {
+       if ( thisObj == firstObj) {
+      firstObj = PK11_GetNextGenericObject(thsObj);
+       }
+       PK11_UnlinkGenericObject(thisObj);
+            myObj = thisObj;
+            break;
+        }
+    }
+
+    PK11_DestroyGenericObjects(firstObj);
+
+
+    PK11_DestroyGenericObject(myObj);
+#endif /* sample code */
+
+PK11GenericObject *
+PK11_FindGenericObjects(PK11SlotInfo *slot, CK_OBJECT_CLASS objClass)
+{
+    CK_ATTRIBUTE template[1];
+    CK_ATTRIBUTE *attrs = template;
+    CK_OBJECT_HANDLE *objectIDs = NULL;
+    PK11GenericObject *lastObj = NULL, *obj;
+    PK11GenericObject *firstObj = NULL;
+    int i, count = 0;
+
+    PK11_SETATTRS(attrs, CKA_CLASS, &objClass, sizeof(objClass));
+    attrs++;
+
+    objectIDs = pk11_FindObjectsByTemplate(slot, template, 1, &count);
+    if (objectIDs == NULL) {
+        return NULL;
+    }
+
+    for (i = 0; i < count; i++) {
+        obj = PORT_New(PK11GenericObject);
+        if (!obj) {
+            if (firstObj) {
+                PK11_DestroyGenericObjects(firstObj);
+            }
+            PORT_Free(objectIDs);
+            return NULL;
+        }
+        obj->slot = PK11_ReferenceSlot(slot);
+        obj->objectID = objectIDs[i];
+        obj->owner = PR_FALSE;
+        obj->next = NULL;
+        obj->prev = NULL;
+
+        if (firstObj == NULL) {
+            firstObj = obj;
+        } else {
+            PK11_LinkGenericObject(lastObj, obj);
+        }
+        lastObj = obj;
+    }
+    PORT_Free(objectIDs);
+    return firstObj;
+}
+
+PK11GenericObject *
+PK11_GetNextGenericObject(PK11GenericObject *object)
+{
+    return object->next;
+}
+
+PK11GenericObject *
+PK11_GetPrevGenericObject(PK11GenericObject *object)
+{
+    return object->prev;
+}
+
+SECStatus
+PK11_LinkGenericObject(PK11GenericObject *list, PK11GenericObject *object)
+{
+    PK11_UnlinkGenericObject(object);
+    object->prev = list;
+    object->next = list->next;
+    list->next = object;
+    if (object->next != NULL) {
+        object->next->prev = object;
+    }
+    return SECSuccess;
+}
+
+SECStatus
+PK11_UnlinkGenericObject(PK11GenericObject *object)
+{
+    if (object->prev != NULL) {
+        object->prev->next = object->next;
+    }
+    if (object->next != NULL) {
+        object->next->prev = object->prev;
+    }
+
+    object->next = NULL;
+    object->prev = NULL;
+    return SECSuccess;
+}
+
+SECStatus
+PK11_DestroyGenericObject(PK11GenericObject *object)
+{
+    if (object == NULL) {
+        return SECSuccess;
+    }
+
+    PK11_UnlinkGenericObject(object);
+    if (object->slot) {
+        if (object->owner) {
+            PK11_DestroyObject(object->slot, object->objectID);
+        }
+        PK11_FreeSlot(object->slot);
+    }
+    PORT_Free(object);
+    return SECSuccess;
+}
+
+SECStatus
+PK11_DestroyGenericObjects(PK11GenericObject *objects)
+{
+    PK11GenericObject *nextObject;
+    PK11GenericObject *prevObject;
+
+    if (objects == NULL) {
+        return SECSuccess;
+    }
+
+    nextObject = objects->next;
+    prevObject = objects->prev;
+
+    for (; objects; objects = nextObject) {
+        nextObject = objects->next;
+        PK11_DestroyGenericObject(objects);
+    }
+    for (objects = prevObject; objects; objects = prevObject) {
+        prevObject = objects->prev;
+        PK11_DestroyGenericObject(objects);
+    }
+    return SECSuccess;
+}
+
+PK11GenericObject *
+pk11_CreateGenericObjectHelper(PK11SlotInfo *slot,
+                               const CK_ATTRIBUTE *pTemplate,
+                               int count, PRBool token, PRBool owner)
+{
+    CK_OBJECT_HANDLE objectID;
+    PK11GenericObject *obj;
+    CK_RV crv;
+
+    PK11_EnterSlotMonitor(slot);
+    crv = PK11_CreateNewObject(slot, slot->session, pTemplate, count,
+                               token, &objectID);
+    PK11_ExitSlotMonitor(slot);
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        return NULL;
+    }
+
+    obj = PORT_New(PK11GenericObject);
+    if (!obj) {
+        return NULL;
+    }
+
+    obj->slot = PK11_ReferenceSlot(slot);
+    obj->objectID = objectID;
+    obj->owner = owner;
+    obj->next = NULL;
+    obj->prev = NULL;
+    return obj;
+}
+
+PK11GenericObject *
+PK11_CreateGenericObject(PK11SlotInfo *slot, const CK_ATTRIBUTE *pTemplate,
+                         int count, PRBool token)
+{
+    return pk11_CreateGenericObjectHelper(slot, pTemplate, count, token,
+                                          PR_FALSE);
+}
+
+PK11GenericObject *
+PK11_CreateManagedGenericObject(PK11SlotInfo *slot,
+                                const CK_ATTRIBUTE *pTemplate, int count, PRBool token)
+{
+    return pk11_CreateGenericObjectHelper(slot, pTemplate, count, token,
+                                          !token);
+}
+
+CK_OBJECT_HANDLE
+PK11_GetObjectHandle(PK11ObjectType objType, void *objSpec,
+                     PK11SlotInfo **slotp)
+{
+    CK_OBJECT_HANDLE handle = CK_INVALID_HANDLE;
+    PK11SlotInfo *slot = NULL;
+
+    switch (objType) {
+        case PK11_TypeGeneric:
+            slot = ((PK11GenericObject *)objSpec)->slot;
+            handle = ((PK11GenericObject *)objSpec)->objectID;
+            break;
+        case PK11_TypePrivKey:
+            slot = ((SECKEYPrivateKey *)objSpec)->pkcs11Slot;
+            handle = ((SECKEYPrivateKey *)objSpec)->pkcs11ID;
+            break;
+        case PK11_TypePubKey:
+            slot = ((SECKEYPublicKey *)objSpec)->pkcs11Slot;
+            handle = ((SECKEYPublicKey *)objSpec)->pkcs11ID;
+            break;
+        case PK11_TypeSymKey:
+            slot = ((PK11SymKey *)objSpec)->slot;
+            handle = ((PK11SymKey *)objSpec)->objectID;
+            break;
+        case PK11_TypeCert:
+            handle = PK11_FindObjectForCert((CERTCertificate *)objSpec, NULL,
+                                            &slot);
+            break;
+        default:
+            PORT_SetError(SEC_ERROR_UNKNOWN_OBJECT_TYPE);
+            break;
+    }
+    if (slotp) {
+        *slotp = slot;
+    }
+    if (slot == NULL) {
+        handle = CK_INVALID_HANDLE;
+    }
+    return handle;
+}
+
+SECStatus
+PK11_WriteRawAttribute(PK11ObjectType objType, void *objSpec,
+                       CK_ATTRIBUTE_TYPE attrType, SECItem *item)
+{
+    PK11SlotInfo *slot = NULL;
+    CK_OBJECT_HANDLE handle = 0;
+    CK_ATTRIBUTE setTemplate;
+    CK_RV crv;
+    CK_SESSION_HANDLE rwsession;
+
+    handle = PK11_GetObjectHandle(objType, objSpec, &slot);
+    if (handle == CK_INVALID_HANDLE) {
+        PORT_SetError(SEC_ERROR_UNKNOWN_OBJECT_TYPE);
+        return SECFailure;
+    }
+
+    PK11_SETATTRS(&setTemplate, attrType, (CK_CHAR *)item->data, item->len);
+    rwsession = PK11_GetRWSession(slot);
+    if (rwsession == CK_INVALID_HANDLE) {
+        PORT_SetError(SEC_ERROR_BAD_DATA);
+        return SECFailure;
+    }
+    crv = PK11_GETTAB(slot)->C_SetAttributeValue(rwsession, handle,
+                                                 &setTemplate, 1);
+    PK11_RestoreROSession(slot, rwsession);
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+    return SECSuccess;
+}
+
+SECStatus
+PK11_ReadRawAttribute(PK11ObjectType objType, void *objSpec,
+                      CK_ATTRIBUTE_TYPE attrType, SECItem *item)
+{
+    PK11SlotInfo *slot = NULL;
+    CK_OBJECT_HANDLE handle = 0;
+
+    handle = PK11_GetObjectHandle(objType, objSpec, &slot);
+    if (handle == CK_INVALID_HANDLE) {
+        PORT_SetError(SEC_ERROR_UNKNOWN_OBJECT_TYPE);
+        return SECFailure;
+    }
+
+    return PK11_ReadAttribute(slot, handle, attrType, NULL, item);
+}
+
+SECStatus
+PK11_ReadRawAttributes(PLArenaPool *arena, PK11ObjectType objType, void *objSpec,
+                       CK_ATTRIBUTE *pTemplate, unsigned int count)
+{
+    PK11SlotInfo *slot = NULL;
+    CK_OBJECT_HANDLE handle = 0;
+
+    handle = PK11_GetObjectHandle(objType, objSpec, &slot);
+    if (handle == CK_INVALID_HANDLE) {
+        PORT_SetError(SEC_ERROR_UNKNOWN_OBJECT_TYPE);
+        return SECFailure;
+    }
+    CK_RV crv = PK11_GetAttributes(arena, slot, handle, pTemplate, count);
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+    return SECSuccess;
+}
+
+SECStatus
+PK11_ReadDistrustAfterAttribute(PK11SlotInfo *slot,
+                                CK_OBJECT_HANDLE object,
+                                CK_ATTRIBUTE_TYPE type,
+                                 PRBool *distrusted,
+                                 PRTime *time)
+{
+    if (!slot || !distrusted || !time) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return SECFailure;
+    }
+
+    if (type != CKA_NSS_SERVER_DISTRUST_AFTER && type != CKA_NSS_EMAIL_DISTRUST_AFTER) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return SECFailure;
+    }
+
+    unsigned char buf[13] = { 0 };
+    CK_ATTRIBUTE attr = { .type = type, .pValue = buf, .ulValueLen = sizeof buf };
+    CK_RV crv;
+
+    PK11_EnterSlotMonitor(slot);
+    crv = PK11_GETTAB(slot)->C_GetAttributeValue(slot->session, object, &attr, 1);
+    PK11_ExitSlotMonitor(slot);
+    if (crv != CKR_OK) {
+        PORT_SetError(PK11_MapError(crv));
+        return SECFailure;
+    }
+
+    if (attr.ulValueLen == 1 && buf[0] == 0) {
+        *distrusted = PR_FALSE;
+        return SECSuccess;
+    }
+
+    if (attr.ulValueLen != sizeof buf) {
+        PORT_SetError(SEC_ERROR_INVALID_TIME);
+        return SECFailure;
+    }
+
+    *distrusted = PR_TRUE;
+    SECItem item = { siUTCTime, buf, sizeof buf };
+    return DER_UTCTimeToTime(time, &item);
+}
+
+CK_OBJECT_HANDLE
+pk11_FindObjectByTemplate(PK11SlotInfo *slot, CK_ATTRIBUTE *theTemplate, size_t tsize)
+{
+    CK_OBJECT_HANDLE object;
+    CK_RV crv = CKR_SESSION_HANDLE_INVALID;
+    CK_ULONG objectCount;
+
+    PK11_EnterSlotMonitor(slot);
+    if (slot->session != CK_INVALID_HANDLE) {
+        crv = PK11_GETTAB(slot)->C_FindObjectsInit(slot->session,
+                                                   theTemplate, tsize);
+    }
+    if (crv != CKR_OK) {
+        PK11_ExitSlotMonitor(slot);
+        PORT_SetError(PK11_MapError(crv));
+        return CK_INVALID_HANDLE;
+    }
+
+    crv = PK11_GETTAB(slot)->C_FindObjects(slot->session, &object, 1, &objectCount);
+    PK11_GETTAB(slot)->C_FindObjectsFinal(slot->session);
+    PK11_ExitSlotMonitor(slot);
+    if ((crv != CKR_OK) || (objectCount < 1)) {
+        PORT_SetError(crv != CKR_OK ? PK11_MapError(crv) : SSL_ERROR_NO_CERTIFICATE);
+        return CK_INVALID_HANDLE;
+    }
+
+    PORT_Assert(object != CK_INVALID_HANDLE);
+    return object;
+}
+
+CK_OBJECT_HANDLE *
+pk11_FindObjectsByTemplate(PK11SlotInfo *slot, CK_ATTRIBUTE *findTemplate,
+                           size_t templCount, int *object_count)
+{
+    CK_OBJECT_HANDLE *objID = NULL;
+    CK_ULONG returned_count = 0;
+    PRBool owner = PR_TRUE;
+    CK_SESSION_HANDLE session;
+    PRBool haslock = PR_FALSE;
+    CK_RV crv = CKR_SESSION_HANDLE_INVALID;
+
+    session = pk11_GetNewSession(slot, &owner);
+    haslock = (!owner || !(slot->isThreadSafe));
+    if (haslock) {
+        PK11_EnterSlotMonitor(slot);
+    }
+    if (session != CK_INVALID_HANDLE) {
+        crv = PK11_GETTAB(slot)->C_FindObjectsInit(session,
+                                                   findTemplate, templCount);
+    }
+    if (crv != CKR_OK) {
+        if (haslock)
+            PK11_ExitSlotMonitor(slot);
+        pk11_CloseSession(slot, session, owner);
+        PORT_SetError(PK11_MapError(crv));
+        *object_count = -1;
+        return NULL;
+    }
+
+    do {
+        CK_OBJECT_HANDLE *oldObjID = objID;
+
+        if (objID == NULL) {
+            objID = (CK_OBJECT_HANDLE *)PORT_Alloc(sizeof(CK_OBJECT_HANDLE) *
+                                                   (*object_count + PK11_SEARCH_CHUNKSIZE));
+        } else {
+            objID = (CK_OBJECT_HANDLE *)PORT_Realloc(objID,
+                                                     sizeof(CK_OBJECT_HANDLE) * (*object_count + PK11_SEARCH_CHUNKSIZE));
+        }
+
+        if (objID == NULL) {
+            if (oldObjID)
+                PORT_Free(oldObjID);
+            break;
+        }
+        crv = PK11_GETTAB(slot)->C_FindObjects(session,
+                                               &objID[*object_count], PK11_SEARCH_CHUNKSIZE, &returned_count);
+        if (crv != CKR_OK) {
+            PORT_SetError(PK11_MapError(crv));
+            PORT_Free(objID);
+            objID = NULL;
+            break;
+        }
+        *object_count += returned_count;
+    } while (returned_count == PK11_SEARCH_CHUNKSIZE);
+
+    PK11_GETTAB(slot)->C_FindObjectsFinal(session);
+    if (haslock) {
+        PK11_ExitSlotMonitor(slot);
+    }
+    pk11_CloseSession(slot, session, owner);
+
+    if (objID && (*object_count == 0)) {
+        PORT_Free(objID);
+        return NULL;
+    }
+    if (objID == NULL)
+        *object_count = -1;
+    return objID;
+}
+
+SECStatus
+PK11_FindRawCertsWithSubject(PK11SlotInfo *slot, SECItem *derSubject,
+                             CERTCertificateList **results)
+{
+    if (!slot || !derSubject || !results) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return SECFailure;
+    }
+    *results = NULL;
+
+    if (!derSubject->data && derSubject->len != 0) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return SECFailure;
+    }
+
+    CK_CERTIFICATE_TYPE ckc_x_509 = CKC_X_509;
+    CK_OBJECT_CLASS cko_certificate = CKO_CERTIFICATE;
+    CK_ATTRIBUTE subjectTemplate[] = {
+        { CKA_CERTIFICATE_TYPE, &ckc_x_509, sizeof(ckc_x_509) },
+        { CKA_CLASS, &cko_certificate, sizeof(cko_certificate) },
+        { CKA_SUBJECT, derSubject->data, derSubject->len },
+    };
+    const size_t templateCount = sizeof(subjectTemplate) / sizeof(subjectTemplate[0]);
+    int handleCount = 0;
+    CK_OBJECT_HANDLE *handles =
+        pk11_FindObjectsByTemplate(slot, subjectTemplate, templateCount,
+                                   &handleCount);
+    if (!handles) {
+        if (handleCount == -1) {
+            return SECFailure;
+        }
+        return SECSuccess;
+    }
+    PORT_Assert(handleCount > 0);
+    if (handleCount <= 0) {
+        PORT_Free(handles);
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    if (handleCount > INT_MAX / sizeof(SECItem)) {
+        PORT_Free(handles);
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    PLArenaPool *arena = PORT_NewArena(DER_DEFAULT_CHUNKSIZE);
+    if (!arena) {
+        PORT_Free(handles);
+        return SECFailure;
+    }
+    CERTCertificateList *rawCertificates =
+        PORT_ArenaNew(arena, CERTCertificateList);
+    if (!rawCertificates) {
+        PORT_Free(handles);
+        PORT_FreeArena(arena, PR_FALSE);
+        return SECFailure;
+    }
+    rawCertificates->arena = arena;
+    rawCertificates->certs = PORT_ArenaNewArray(arena, SECItem, handleCount);
+    if (!rawCertificates->certs) {
+        PORT_Free(handles);
+        PORT_FreeArena(arena, PR_FALSE);
+        return SECFailure;
+    }
+    rawCertificates->len = handleCount;
+    int handleIndex;
+    for (handleIndex = 0; handleIndex < handleCount; handleIndex++) {
+        SECStatus rv =
+            PK11_ReadAttribute(slot, handles[handleIndex], CKA_VALUE, arena,
+                               &rawCertificates->certs[handleIndex]);
+        if (rv != SECSuccess) {
+            PORT_Free(handles);
+            PORT_FreeArena(arena, PR_FALSE);
+            return SECFailure;
+        }
+        if (!rawCertificates->certs[handleIndex].data) {
+            PORT_Free(handles);
+            PORT_FreeArena(arena, PR_FALSE);
+            PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+            return SECFailure;
+        }
+    }
+    PORT_Free(handles);
+    *results = rawCertificates;
+    return SECSuccess;
+}
+
+CK_OBJECT_HANDLE
+PK11_MatchItem(PK11SlotInfo *slot, CK_OBJECT_HANDLE searchID,
+               CK_OBJECT_CLASS matchclass)
+{
+    CK_ATTRIBUTE theTemplate[] = {
+        { CKA_ID, NULL, 0 },
+        { CKA_CLASS, NULL, 0 }
+    };
+    CK_ATTRIBUTE *keyclass = &theTemplate[1];
+    const size_t tsize = sizeof(theTemplate) / sizeof(theTemplate[0]);
+    CK_OBJECT_HANDLE peerID;
+    PORTCheapArenaPool tmpArena;
+    CK_RV crv;
+
+    PORT_InitCheapArena(&tmpArena, DER_DEFAULT_CHUNKSIZE);
+
+    crv = PK11_GetAttributes(&tmpArena.arena, slot, searchID, theTemplate, tsize);
+    if (crv != CKR_OK) {
+        PORT_DestroyCheapArena(&tmpArena);
+        PORT_SetError(PK11_MapError(crv));
+        return CK_INVALID_HANDLE;
+    }
+
+    if ((theTemplate[0].ulValueLen == 0) || (theTemplate[0].ulValueLen == -1)) {
+        PORT_DestroyCheapArena(&tmpArena);
+        if (matchclass == CKO_CERTIFICATE) {
+            PORT_SetError(SEC_ERROR_BAD_KEY);
+        } else {
+            PORT_SetError(SEC_ERROR_NO_KEY);
+        }
+        return CK_INVALID_HANDLE;
+    }
+
+    *(CK_OBJECT_CLASS *)(keyclass->pValue) = matchclass;
+
+    peerID = pk11_FindObjectByTemplate(slot, theTemplate, tsize);
+    PORT_DestroyCheapArena(&tmpArena);
+
+    return peerID;
+}
+
+int
+PK11_NumberObjectsFor(PK11SlotInfo *slot, CK_ATTRIBUTE *findTemplate,
+                      int templCount)
+{
+    CK_OBJECT_HANDLE objID[PK11_SEARCH_CHUNKSIZE];
+    int object_count = 0;
+    CK_ULONG returned_count = 0;
+    CK_RV crv = CKR_SESSION_HANDLE_INVALID;
+
+    PK11_EnterSlotMonitor(slot);
+    if (slot->session != CK_INVALID_HANDLE) {
+        crv = PK11_GETTAB(slot)->C_FindObjectsInit(slot->session,
+                                                   findTemplate, templCount);
+    }
+    if (crv != CKR_OK) {
+        PK11_ExitSlotMonitor(slot);
+        PORT_SetError(PK11_MapError(crv));
+        return object_count;
+    }
+
+    do {
+        crv = PK11_GETTAB(slot)->C_FindObjects(slot->session, objID,
+                                               PK11_SEARCH_CHUNKSIZE,
+                                               &returned_count);
+        if (crv != CKR_OK) {
+            PORT_SetError(PK11_MapError(crv));
+            break;
+        }
+        object_count += returned_count;
+    } while (returned_count == PK11_SEARCH_CHUNKSIZE);
+
+    PK11_GETTAB(slot)->C_FindObjectsFinal(slot->session);
+    PK11_ExitSlotMonitor(slot);
+    return object_count;
+}
+
+SECStatus
+PK11_TraverseSlot(PK11SlotInfo *slot, void *arg)
+{
+    int i;
+    CK_OBJECT_HANDLE *objID = NULL;
+    int object_count = 0;
+    pk11TraverseSlot *slotcb = (pk11TraverseSlot *)arg;
+
+    objID = pk11_FindObjectsByTemplate(slot, slotcb->findTemplate,
+                                       slotcb->templateCount, &object_count);
+
+    if (object_count == 0) {
+        return SECSuccess;
+    }
+
+    if (objID == NULL) {
+        return SECFailure;
+    }
+
+    for (i = 0; i < object_count; i++) {
+        (*slotcb->callback)(slot, objID[i], slotcb->callbackArg);
+    }
+    PORT_Free(objID);
+    return SECSuccess;
+}
+
+SECStatus
+pk11_TraverseAllSlots(SECStatus (*callback)(PK11SlotInfo *, void *),
+                      void *arg, PRBool forceLogin, void *wincx)
+{
+    PK11SlotList *list;
+    PK11SlotListElement *le;
+    SECStatus rv;
+
+    list = PK11_GetAllTokens(CKM_INVALID_MECHANISM, PR_FALSE, PR_FALSE, wincx);
+    if (list == NULL)
+        return SECFailure;
+
+    for (le = list->head; le; le = le->next) {
+        if (forceLogin) {
+            rv = pk11_AuthenticateUnfriendly(le->slot, PR_FALSE, wincx);
+            if (rv != SECSuccess) {
+                continue;
+            }
+        }
+        if (callback) {
+            (*callback)(le->slot, arg);
+        }
+    }
+
+    PK11_FreeSlotList(list);
+
+    return SECSuccess;
+}
+
+CK_OBJECT_HANDLE *
+PK11_FindObjectsFromNickname(char *nickname, PK11SlotInfo **slotptr,
+                             CK_OBJECT_CLASS objclass, int *returnCount, void *wincx)
+{
+    char *tokenName;
+    char *delimit;
+    PK11SlotInfo *slot;
+    CK_OBJECT_HANDLE *objID;
+    CK_ATTRIBUTE findTemplate[] = {
+        { CKA_LABEL, NULL, 0 },
+        { CKA_CLASS, NULL, 0 },
+    };
+    const size_t findCount = sizeof(findTemplate) / sizeof(findTemplate[0]);
+    SECStatus rv;
+    PK11_SETATTRS(&findTemplate[1], CKA_CLASS, &objclass, sizeof(objclass));
+
+    *slotptr = slot = NULL;
+    *returnCount = 0;
+    if ((delimit = PORT_Strchr(nickname, ':')) != NULL) {
+        int len = delimit - nickname;
+        tokenName = (char *)PORT_Alloc(len + 1);
+        if (!tokenName) {
+            return CK_INVALID_HANDLE;
+        }
+        PORT_Memcpy(tokenName, nickname, len);
+        tokenName[len] = 0;
+
+        slot = *slotptr = PK11_FindSlotByName(tokenName);
+        PORT_Free(tokenName);
+        if (slot == NULL) {
+            slot = *slotptr = PK11_GetInternalKeySlot();
+        } else {
+            nickname = delimit + 1;
+        }
+    } else {
+        *slotptr = slot = PK11_GetInternalKeySlot();
+    }
+    if (slot == NULL) {
+        return CK_INVALID_HANDLE;
+    }
+
+    rv = pk11_AuthenticateUnfriendly(slot, PR_TRUE, wincx);
+    if (rv != SECSuccess) {
+        PK11_FreeSlot(slot);
+        *slotptr = NULL;
+        return CK_INVALID_HANDLE;
+    }
+
+    findTemplate[0].pValue = nickname;
+    findTemplate[0].ulValueLen = PORT_Strlen(nickname);
+    objID = pk11_FindObjectsByTemplate(slot, findTemplate, findCount, returnCount);
+    if (objID == NULL) {
+        findTemplate[0].ulValueLen += 1;
+        objID = pk11_FindObjectsByTemplate(slot, findTemplate, findCount,
+                                           returnCount);
+        if (objID == NULL) {
+            PK11_FreeSlot(slot);
+            *slotptr = NULL;
+            *returnCount = 0;
+        }
+    }
+
+    return objID;
+}
+
+SECItem *
+pk11_GetLowLevelKeyFromHandle(PK11SlotInfo *slot, CK_OBJECT_HANDLE handle)
+{
+    CK_ATTRIBUTE theTemplate[] = {
+        { CKA_ID, NULL, 0 },
+    };
+    int tsize = sizeof(theTemplate) / sizeof(theTemplate[0]);
+    CK_RV crv;
+    SECItem *item;
+
+    item = SECITEM_AllocItem(NULL, NULL, 0);
+
+    if (item == NULL) {
+        return NULL;
+    }
+
+    crv = PK11_GetAttributes(NULL, slot, handle, theTemplate, tsize);
+    if (crv != CKR_OK) {
+        SECITEM_FreeItem(item, PR_TRUE);
+        PORT_SetError(PK11_MapError(crv));
+        return NULL;
+    }
+
+    item->data = (unsigned char *)theTemplate[0].pValue;
+    item->len = theTemplate[0].ulValueLen;
+
+    return item;
+}
+
+PRBool
+PK11_ObjectGetFIPSStatus(PK11ObjectType objType, void *objSpec)
+{
+    PK11SlotInfo *slot = NULL;
+    CK_OBJECT_HANDLE handle = 0;
+
+    handle = PK11_GetObjectHandle(objType, objSpec, &slot);
+    if (handle == CK_INVALID_HANDLE) {
+        PORT_SetError(SEC_ERROR_UNKNOWN_OBJECT_TYPE);
+        return PR_FALSE;
+    }
+    return pk11slot_GetFIPSStatus(slot, slot->session, handle,
+                                  CKT_NSS_OBJECT_CHECK);
+}

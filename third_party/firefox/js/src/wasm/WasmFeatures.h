@@ -1,0 +1,60 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_wasm_WasmFeatures_h
+#define js_wasm_WasmFeatures_h
+
+#include "js/WasmFeatures.h"
+#include "js/TypeDecls.h"
+
+namespace js {
+
+class JSStringBuilder;
+
+namespace wasm {
+
+
+bool HasPlatformSupport();
+
+
+bool HasSupport(JSContext* cx);
+
+
+bool BaselineAvailable(JSContext* cx);
+bool IonAvailable(JSContext* cx);
+
+
+bool AnyCompilerAvailable(JSContext* cx);
+
+
+bool BaselineDisabledByFeatures(JSContext* cx, bool* isDisabled,
+                                JSStringBuilder* reason = nullptr);
+bool IonDisabledByFeatures(JSContext* cx, bool* isDisabled,
+                           JSStringBuilder* reason = nullptr);
+
+
+bool StreamingCompilationAvailable(JSContext* cx);
+
+bool CodeCachingAvailable(JSContext* cx);
+
+bool ThreadsAvailable(JSContext* cx);
+
+#define WASM_FEATURE(NAME, ...) bool NAME##Available(JSContext* cx);
+JS_FOR_WASM_FEATURES(WASM_FEATURE)
+#undef WASM_FEATURE
+
+bool SimdAvailable(JSContext* cx);
+
+bool IsPrivilegedContext(JSContext* cx);
+
+#if defined(ENABLE_WASM_SIMD) && defined(DEBUG)
+void ReportSimdAnalysis(const char* data);
+#endif
+
+bool ExceptionsAvailable(JSContext* cx);
+
+}  
+}  
+
+#endif  // js_wasm_WasmFeatures_h

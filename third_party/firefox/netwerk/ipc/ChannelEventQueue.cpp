@@ -1,0 +1,184 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ChannelEventQueue.h"
+
+#include "mozilla/Assertions.h"
+#include "nsIChannel.h"
+#include "mozilla/dom/Document.h"
+#include "nsThreadUtils.h"
+namespace mozilla {
+namespace net {
+
+ChannelEvent* ChannelEventQueue::TakeEvent() {
+  mMutex.AssertCurrentThreadOwns();
+  MOZ_ASSERT(mFlushing);
+
+  if (mSuspended || mEventQueue.IsEmpty()) {
+    return nullptr;
+  }
+
+  UniquePtr<ChannelEvent> event(std::move(mEventQueue[0]));
+  mEventQueue.RemoveElementAt(0);
+
+  return event.release();
+}
+
+void ChannelEventQueue::FlushQueue() {
+  mMutex.AssertCurrentThreadOwns();
+  nsCOMPtr<nsISupports> kungFuDeathGrip;
+  kungFuDeathGrip = mOwner;
+  (void)kungFuDeathGrip;  
+
+  MOZ_ASSERT(mFlushing);
+
+  bool needResumeOnOtherThread = false;
+
+  while (true) {
+    UniquePtr<ChannelEvent> event;
+    event.reset(TakeEvent());
+    if (!event) {
+      MOZ_ASSERT(mFlushing);
+      mFlushing = false;
+      MOZ_ASSERT(mEventQueue.IsEmpty() || (mSuspended || !!mForcedCount));
+      break;
+    }
+
+    nsCOMPtr<nsIEventTarget> target = event->GetEventTarget();
+    MOZ_ASSERT(target);
+
+    bool isCurrentThread = false;
+    nsresult rv = target->IsOnCurrentThread(&isCurrentThread);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      MOZ_DIAGNOSTIC_CRASH("IsOnCurrentThread failed");
+      isCurrentThread = true;
+    }
+
+    if (!isCurrentThread) {
+      SuspendInternal();
+      PrependEventInternal(std::move(event));
+
+      needResumeOnOtherThread = true;
+      MOZ_ASSERT(mFlushing);
+      mFlushing = false;
+      MOZ_ASSERT(!mEventQueue.IsEmpty());
+      break;
+    }
+    {
+      MutexAutoUnlock unlock(mMutex);
+      event->Run();
+    }
+  }  
+
+  if (needResumeOnOtherThread) {
+    ResumeInternal();
+  }
+}
+
+void ChannelEventQueue::Suspend() {
+  MutexAutoLock lock(mMutex);
+  SuspendInternal();
+}
+
+void ChannelEventQueue::SuspendInternal() {
+  mMutex.AssertCurrentThreadOwns();
+
+  mSuspended = true;
+  mSuspendCount++;
+}
+
+void ChannelEventQueue::Resume() {
+  MutexAutoLock lock(mMutex);
+  ResumeInternal();
+}
+
+void ChannelEventQueue::ResumeInternal() {
+  mMutex.AssertCurrentThreadOwns();
+
+  MOZ_ASSERT(mSuspendCount > 0);
+  if (mSuspendCount <= 0) {
+    return;
+  }
+
+  if (!--mSuspendCount) {
+    if (mEventQueue.IsEmpty() || !!mForcedCount) {
+      mSuspended = false;
+      return;
+    }
+
+    class CompleteResumeRunnable : public Runnable {
+     public:
+      explicit CompleteResumeRunnable(ChannelEventQueue* aQueue,
+                                      nsISupports* aOwner)
+          : Runnable("CompleteResumeRunnable"),
+            mQueue(aQueue),
+            mOwner(aOwner) {}
+
+      NS_IMETHOD Run() override {
+        mQueue->CompleteResume();
+        return NS_OK;
+      }
+
+     private:
+      virtual ~CompleteResumeRunnable() = default;
+
+      RefPtr<ChannelEventQueue> mQueue;
+      nsCOMPtr<nsISupports> mOwner;
+    };
+
+    if (!mOwner) {
+      return;
+    }
+
+    RefPtr<Runnable> event = new CompleteResumeRunnable(this, mOwner);
+
+    nsCOMPtr<nsIEventTarget> target;
+    target = mEventQueue[0]->GetEventTarget();
+    MOZ_ASSERT(target);
+
+    (void)NS_WARN_IF(
+        NS_FAILED(target->Dispatch(event.forget(), NS_DISPATCH_NORMAL)));
+  }
+}
+
+bool ChannelEventQueue::MaybeSuspendIfEventsAreSuppressed() {
+  if (!NS_IsMainThread()) {
+    return false;
+  }
+
+  if (mHasCheckedForAsyncXMLHttpRequest && !mForAsyncXMLHttpRequest) {
+    return false;
+  }
+
+  mMutex.AssertCurrentThreadOwns();
+  nsCOMPtr<nsIChannel> channel(do_QueryInterface(mOwner));
+  if (!channel) {
+    return false;
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+  if (!mHasCheckedForAsyncXMLHttpRequest) {
+    nsContentPolicyType contentType = loadInfo->InternalContentPolicyType();
+    mForAsyncXMLHttpRequest =
+        contentType == nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST_ASYNC;
+    mHasCheckedForAsyncXMLHttpRequest = true;
+
+    if (!mForAsyncXMLHttpRequest) {
+      return false;
+    }
+  }
+
+  RefPtr<dom::Document> document;
+  loadInfo->GetLoadingDocument(getter_AddRefs(document));
+  if (document && document->EventHandlingSuppressed()) {
+    document->AddSuspendedChannelEventQueue(this);
+    SuspendInternal();
+    return true;
+  }
+
+  return false;
+}
+
+}  
+}  

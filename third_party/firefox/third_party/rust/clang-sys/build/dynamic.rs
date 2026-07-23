@@ -1,0 +1,210 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use std::env;
+use std::fs::File;
+use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
+use super::common;
+
+
+/// Extracts the ELF class from the ELF header in a shared library.
+fn parse_elf_header(path: &Path) -> io::Result<u8> {
+    let mut file = File::open(path)?;
+    let mut buffer = [0; 5];
+    file.read_exact(&mut buffer)?;
+    if buffer[..4] == [127, 69, 76, 70] {
+        Ok(buffer[4])
+    } else {
+        Err(Error::new(ErrorKind::InvalidData, "invalid ELF header"))
+    }
+}
+
+/// Extracts the magic number from the PE header in a shared library.
+fn parse_pe_header(path: &Path) -> io::Result<u16> {
+    let mut file = File::open(path)?;
+
+    let mut buffer = [0; 4];
+    let start = SeekFrom::Start(0x3C);
+    file.seek(start)?;
+    file.read_exact(&mut buffer)?;
+    let offset = i32::from_le_bytes(buffer);
+
+    file.seek(SeekFrom::Start(offset as u64))?;
+    file.read_exact(&mut buffer)?;
+    if buffer != [80, 69, 0, 0] {
+        return Err(Error::new(ErrorKind::InvalidData, "invalid PE header"));
+    }
+
+    let mut buffer = [0; 2];
+    file.seek(SeekFrom::Current(20))?;
+    file.read_exact(&mut buffer)?;
+    Ok(u16::from_le_bytes(buffer))
+}
+
+/// Checks that a `libclang` shared library matches the target platform.
+fn validate_library(path: &Path) -> Result<(), String> {
+    if target_os!("linux") || target_os!("freebsd") {
+        let class = parse_elf_header(path).map_err(|e| e.to_string())?;
+
+        if target_pointer_width!("32") && class != 1 {
+            return Err("invalid ELF class (64-bit)".into());
+        }
+
+        if target_pointer_width!("64") && class != 2 {
+            return Err("invalid ELF class (32-bit)".into());
+        }
+
+        Ok(())
+    } else if target_os!("windows") {
+        let magic = parse_pe_header(path).map_err(|e| e.to_string())?;
+
+        if target_pointer_width!("32") && magic != 267 {
+            return Err("invalid DLL (64-bit)".into());
+        }
+
+        if target_pointer_width!("64") && magic != 523 {
+            return Err("invalid DLL (32-bit)".into());
+        }
+
+        Ok(())
+    } else {
+        Ok(())
+    }
+}
+
+
+/// Extracts the version components in a `libclang` shared library filename.
+fn parse_version(filename: &str) -> Vec<u32> {
+    let version = if let Some(version) = filename.strip_prefix("libclang.so.") {
+        version
+    } else if filename.starts_with("libclang-") {
+        &filename[9..filename.len() - 3]
+    } else {
+        return vec![];
+    };
+
+    version.split('.').map(|s| s.parse().unwrap_or(0)).collect()
+}
+
+/// Finds `libclang` shared libraries and returns the paths to, filenames of,
+/// and versions of those shared libraries.
+fn search_libclang_directories(runtime: bool) -> Result<Vec<(PathBuf, String, Vec<u32>)>, String> {
+    let mut files = vec![format!(
+        "{}clang{}",
+        env::consts::DLL_PREFIX,
+        env::consts::DLL_SUFFIX
+    )];
+
+    if target_os!("linux") {
+        files.push("libclang-*.so".into());
+
+        if runtime {
+            files.push("libclang.so.*".into());
+            files.push("libclang-*.so.*".into());
+        }
+    }
+
+    if target_os!("freebsd") || target_os!("haiku") || target_os!("netbsd") || target_os!("openbsd") {
+        files.push("libclang.so.*".into());
+    }
+
+    if target_os!("windows") {
+        files.push("libclang.dll".into());
+    }
+
+    let mut valid = vec![];
+    let mut invalid = vec![];
+    for (directory, filename) in common::search_libclang_directories(&files, "LIBCLANG_PATH") {
+        let path = directory.join(&filename);
+        match validate_library(&path) {
+            Ok(()) => {
+                let version = parse_version(&filename);
+                valid.push((directory, filename, version))
+            }
+            Err(message) => invalid.push(format!("({}: {})", path.display(), message)),
+        }
+    }
+
+    if !valid.is_empty() {
+        return Ok(valid);
+    }
+
+    let message = format!(
+        "couldn't find any valid shared libraries matching: [{}], set the \
+         `LIBCLANG_PATH` environment variable to a path where one of these files \
+         can be found (invalid: [{}])",
+        files
+            .iter()
+            .map(|f| format!("'{}'", f))
+            .collect::<Vec<_>>()
+            .join(", "),
+        invalid.join(", "),
+    );
+
+    Err(message)
+}
+
+/// Finds the "best" `libclang` shared library and returns the directory and
+/// filename of that library.
+pub fn find(runtime: bool) -> Result<(PathBuf, String), String> {
+    search_libclang_directories(runtime)?
+        .iter()
+        .rev()
+        .max_by_key(|f| &f.2)
+        .cloned()
+        .map(|(path, filename, _)| (path, filename))
+        .ok_or_else(|| "unreachable".into())
+}
+
+
+/// Finds and links to a `libclang` shared library.
+#[cfg(not(feature = "runtime"))]
+pub fn link() {
+    let cep = common::CommandErrorPrinter::default();
+
+    use std::fs;
+
+    let (directory, filename) = find(false).unwrap();
+    println!("cargo:rustc-link-search={}", directory.display());
+
+    if cfg!(all(target_os = "windows", target_env = "msvc")) {
+        let lib = if !directory.ends_with("bin") {
+            directory
+        } else {
+            directory.parent().unwrap().join("lib")
+        };
+
+        if lib.join("libclang.lib").exists() {
+            println!("cargo:rustc-link-search={}", lib.display());
+        } else if lib.join("libclang.dll.a").exists() {
+            let out = env::var("OUT_DIR").unwrap();
+            fs::copy(
+                lib.join("libclang.dll.a"),
+                Path::new(&out).join("libclang.lib"),
+            )
+            .unwrap();
+            println!("cargo:rustc-link-search=native={}", out);
+        } else {
+            panic!(
+                "using '{}', so 'libclang.lib' or 'libclang.dll.a' must be \
+                 available in {}",
+                filename,
+                lib.display(),
+            );
+        }
+
+        println!("cargo:rustc-link-lib=dylib=libclang");
+    } else {
+        let name = filename.trim_start_matches("lib");
+
+        let name = match name.find(".dylib").or_else(|| name.find(".so")) {
+            Some(index) => &name[0..index],
+            None => name,
+        };
+
+        println!("cargo:rustc-link-lib=dylib={}", name);
+    }
+
+    cep.discard();
+}

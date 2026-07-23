@@ -1,0 +1,2038 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+*   Copyright (C) 2001-2015 IBM and others. All rights reserved.
+**********************************************************************
+*   Date        Name        Description
+*  07/02/2001   synwee      Creation.
+**********************************************************************
+*/
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_COLLATION && !UCONFIG_NO_BREAK_ITERATION
+
+#include "unicode/usearch.h"
+#include "unicode/ustring.h"
+#include "unicode/uchar.h"
+#include "unicode/utf16.h"
+#include "normalizer2impl.h"
+#include "usrchimp.h"
+#include "cmemory.h"
+#include "ucln_in.h"
+#include "uassert.h"
+#include "ustr_imp.h"
+
+U_NAMESPACE_USE
+
+
+#define LAST_BYTE_MASK_          0xFF
+#define SECOND_LAST_BYTE_SHIFT_  8
+#define SUPPLEMENTARY_MIN_VALUE_ 0x10000
+
+static const Normalizer2Impl *g_nfcImpl = nullptr;
+
+
+static
+inline void setColEIterOffset(UCollationElements *elems,
+                              int32_t offset,
+                              UErrorCode &status)
+{
+    ucol_setOffset(elems, offset, &status);
+}
+
+static
+inline uint32_t getMask(UCollationStrength strength)
+{
+    switch (strength)
+    {
+    case UCOL_PRIMARY:
+        return UCOL_PRIMARYORDERMASK;
+    case UCOL_SECONDARY:
+        return UCOL_SECONDARYORDERMASK | UCOL_PRIMARYORDERMASK;
+    default:
+        return UCOL_TERTIARYORDERMASK | UCOL_SECONDARYORDERMASK |
+               UCOL_PRIMARYORDERMASK;
+    }
+}
+
+U_CDECL_BEGIN
+static UBool U_CALLCONV
+usearch_cleanup() {
+    g_nfcImpl = nullptr;
+    return true;
+}
+U_CDECL_END
+
+static
+inline void initializeFCD(UErrorCode *status)
+{
+    if (g_nfcImpl == nullptr) {
+        g_nfcImpl = Normalizer2Factory::getNFCImpl(*status);
+        ucln_i18n_registerCleanup(UCLN_I18N_USEARCH, usearch_cleanup);
+    }
+}
+
+static
+uint16_t getFCD(const char16_t   *str, int32_t *offset,
+                             int32_t  strlength)
+{
+    const char16_t *temp = str + *offset;
+    uint16_t    result = g_nfcImpl->nextFCD16(temp, str + strlength);
+    *offset = static_cast<int32_t>(temp - str);
+    return result;
+}
+
+static
+inline int32_t getCE(const UStringSearch *strsrch, uint32_t sourcece)
+{
+    sourcece &= strsrch->ceMask;
+
+    if (strsrch->toShift) {
+        if (strsrch->variableTop > sourcece) {
+            if (strsrch->strength >= UCOL_QUATERNARY) {
+                sourcece &= UCOL_PRIMARYORDERMASK;
+            }
+            else {
+                sourcece = UCOL_IGNORABLE;
+            }
+        }
+    } else if (strsrch->strength >= UCOL_QUATERNARY && sourcece == UCOL_IGNORABLE) {
+        sourcece = 0xFFFF;
+    }
+
+    return sourcece;
+}
+
+static
+inline int32_t * addTouint32_tArray(int32_t    *destination,
+                                    uint32_t   *destinationCapacity,
+                                    bool        destOnHeap,
+                                    uint32_t    offset,
+                                    uint32_t    value,
+                                    uint32_t    increments,
+                                    UErrorCode *status)
+{
+    if (U_FAILURE(*status)) {
+        return destination;
+    }
+    if (offset >= *destinationCapacity) {
+        uint32_t newlength = offset + increments;
+        int32_t* temp = static_cast<int32_t*>(uprv_malloc(sizeof(int32_t) * newlength));
+        if (temp == nullptr) {
+            *status = U_MEMORY_ALLOCATION_ERROR;
+            return destination;
+        }
+        uprv_memcpy(temp, destination, sizeof(int32_t) * (size_t)offset);
+        if (destOnHeap) {
+            uprv_free(destination);
+        }
+        *destinationCapacity = newlength;
+        destination        = temp;
+    }
+    destination[offset] = value;
+    return destination;
+}
+
+static
+inline int64_t * addTouint64_tArray(int64_t    *destination,
+                                    uint32_t   *destinationCapacity,
+                                    bool        destOnHeap,
+                                    uint32_t    offset,
+                                    uint64_t    value,
+                                    uint32_t    increments,
+                                    UErrorCode *status)
+{
+    if (U_FAILURE(*status)) {
+        return destination;
+    }
+    if (offset >= *destinationCapacity) {
+        uint32_t newlength = offset + increments;
+        int64_t* temp = static_cast<int64_t*>(uprv_malloc(sizeof(int64_t) * newlength));
+        if (temp == nullptr) {
+            *status = U_MEMORY_ALLOCATION_ERROR;
+            return destination;
+        }
+        uprv_memcpy(temp, destination, sizeof(int64_t) * (size_t)offset);
+        if (destOnHeap) {
+            uprv_free(destination);
+        }
+        *destinationCapacity = newlength;
+        destination        = temp;
+    }
+    destination[offset] = value;
+    return destination;
+}
+
+static
+inline void initializePatternCETable(UStringSearch *strsrch, UErrorCode *status)
+{
+    UPattern *pattern            = &(strsrch->pattern);
+    uint32_t  cetablesize        = INITIAL_ARRAY_SIZE_;
+    int32_t  *cetable            = pattern->cesBuffer;
+    uint32_t  patternlength      = pattern->textLength;
+    UCollationElements *coleiter = strsrch->utilIter;
+
+    if (coleiter == nullptr) {
+        coleiter = ucol_openElements(strsrch->collator, pattern->text,
+                                     patternlength, status);
+        strsrch->utilIter = coleiter;
+    }
+    else {
+        ucol_setText(coleiter, pattern->text, pattern->textLength, status);
+    }
+    if(U_FAILURE(*status)) {
+        return;
+    }
+
+    if (pattern->ces != cetable && pattern->ces) {
+        uprv_free(pattern->ces);
+    }
+
+    uint32_t  offset      = 0;
+    int32_t   ce;
+
+    while ((ce = ucol_next(coleiter, status)) != UCOL_NULLORDER &&
+           U_SUCCESS(*status)) {
+        uint32_t newce = getCE(strsrch, ce);
+        if (newce) {
+            cetable = addTouint32_tArray(
+                cetable, &cetablesize,  cetable != pattern->cesBuffer,
+                offset, newce, patternlength - ucol_getOffset(coleiter) + 1, status);
+            offset ++;
+        }
+    }
+
+    cetable = addTouint32_tArray(
+        cetable, &cetablesize,  cetable != pattern->cesBuffer,
+        offset, 0, 1, status);
+    if (U_FAILURE(*status)) {
+        if (cetable != pattern->cesBuffer) {
+            uprv_free(cetable);
+        }
+        return;
+    }
+    pattern->ces       = cetable;
+    pattern->cesLength = offset;
+}
+
+static
+inline void initializePatternPCETable(UStringSearch *strsrch,
+                                      UErrorCode    *status)
+{
+    UPattern *pattern            = &(strsrch->pattern);
+    uint32_t  pcetablesize       = INITIAL_ARRAY_SIZE_;
+    int64_t  *pcetable           = pattern->pcesBuffer;
+    uint32_t  patternlength      = pattern->textLength;
+    UCollationElements *coleiter = strsrch->utilIter;
+
+    if (coleiter == nullptr) {
+        coleiter = ucol_openElements(strsrch->collator, pattern->text,
+                                     patternlength, status);
+        strsrch->utilIter = coleiter;
+    } else {
+        ucol_setText(coleiter, pattern->text, pattern->textLength, status);
+    }
+    if(U_FAILURE(*status)) {
+        return;
+    }
+
+    if (pattern->pces != pcetable && pattern->pces != nullptr) {
+        uprv_free(pattern->pces);
+    }
+
+    uint32_t  offset = 0;
+    int64_t   pce;
+
+    icu::UCollationPCE iter(coleiter);
+
+    while ((pce = iter.nextProcessed(nullptr, nullptr, status)) != UCOL_PROCESSED_NULLORDER &&
+           U_SUCCESS(*status)) {
+        pcetable = addTouint64_tArray(
+            pcetable, &pcetablesize,  pcetable != pattern->pcesBuffer,
+            offset, pce, patternlength - ucol_getOffset(coleiter) + 1, status);
+        offset += 1;
+    }
+
+    pcetable = addTouint64_tArray(
+        pcetable, &pcetablesize,  pcetable != pattern->pcesBuffer,
+        offset, 0, 1, status);
+    if (U_FAILURE(*status)) {
+        if (pcetable != pattern->pcesBuffer) {
+            uprv_free(pcetable);
+        }
+        return;
+    }
+    pattern->pces       = pcetable;
+    pattern->pcesLength = offset;
+}
+
+static
+inline void initializePattern(UStringSearch *strsrch, UErrorCode *status)
+{
+    if (U_FAILURE(*status)) { return; }
+
+          UPattern   *pattern     = &(strsrch->pattern);
+    const char16_t   *patterntext = pattern->text;
+          int32_t     length      = pattern->textLength;
+          int32_t index       = 0;
+
+    if (strsrch->strength == UCOL_PRIMARY) {
+        pattern->hasPrefixAccents = 0;
+        pattern->hasSuffixAccents = 0;
+    } else {
+        pattern->hasPrefixAccents = getFCD(patterntext, &index, length) >>
+                                                         SECOND_LAST_BYTE_SHIFT_;
+        index = length;
+        U16_BACK_1(patterntext, 0, index);
+        pattern->hasSuffixAccents = getFCD(patterntext, &index, length) &
+                                                                 LAST_BYTE_MASK_;
+    }
+
+    if (strsrch->pattern.pces != nullptr) {
+        if (strsrch->pattern.pces != strsrch->pattern.pcesBuffer) {
+            uprv_free(strsrch->pattern.pces);
+        }
+
+        strsrch->pattern.pces = nullptr;
+    }
+
+    initializePatternCETable(strsrch, status);
+}
+
+static
+inline void initialize(UStringSearch *strsrch, UErrorCode *status)
+{
+    initializePattern(strsrch, status);
+}
+
+#if !UCONFIG_NO_BREAK_ITERATION
+static UBreakIterator* getBreakIterator(UStringSearch *strsrch, UErrorCode &status)
+{
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+    if (strsrch->search->breakIter != nullptr) {
+        return strsrch->search->breakIter;
+    }
+
+    if (strsrch->search->internalBreakIter != nullptr) {
+        return strsrch->search->internalBreakIter;
+    }
+
+    strsrch->search->internalBreakIter = ubrk_open(UBRK_CHARACTER,
+        ucol_getLocaleByType(strsrch->collator, ULOC_VALID_LOCALE, &status),
+        strsrch->search->text, strsrch->search->textLength, &status);
+
+    return strsrch->search->internalBreakIter;
+}
+#endif
+
+static
+inline void setMatchNotFound(UStringSearch *strsrch, UErrorCode &status)
+{
+    UErrorCode localStatus = U_ZERO_ERROR;
+
+    strsrch->search->matchedIndex = USEARCH_DONE;
+    strsrch->search->matchedLength = 0;
+    if (strsrch->search->isForwardSearching) {
+        setColEIterOffset(strsrch->textIter, strsrch->search->textLength, localStatus);
+    }
+    else {
+        setColEIterOffset(strsrch->textIter, 0, localStatus);
+    }
+
+    if (U_SUCCESS(status) && U_FAILURE(localStatus)) {
+        status = localStatus;
+    }
+}
+
+static
+inline UBool isOutOfBounds(int32_t textlength, int32_t offset)
+{
+    return offset < 0 || offset > textlength;
+}
+
+static
+inline UBool checkIdentical(const UStringSearch *strsrch, int32_t start, int32_t end)
+{
+    if (strsrch->strength != UCOL_IDENTICAL) {
+        return true;
+    }
+
+    UErrorCode status = U_ZERO_ERROR;
+    UnicodeString t2, p2;
+    strsrch->nfd->normalize(
+        UnicodeString(false, strsrch->search->text + start, end - start), t2, status);
+    strsrch->nfd->normalize(
+        UnicodeString(false, strsrch->pattern.text, strsrch->pattern.textLength), p2, status);
+    return U_SUCCESS(status) && t2 == p2;
+}
+
+
+U_CAPI UStringSearch * U_EXPORT2 usearch_open(const char16_t *pattern,
+                                          int32_t         patternlength,
+                                    const char16_t       *text,
+                                          int32_t         textlength,
+                                    const char           *locale,
+                                          UBreakIterator *breakiter,
+                                          UErrorCode     *status)
+{
+    if (U_FAILURE(*status)) {
+        return nullptr;
+    }
+#if UCONFIG_NO_BREAK_ITERATION
+    if (breakiter != nullptr) {
+        *status = U_UNSUPPORTED_ERROR;
+        return nullptr;
+    }
+#endif
+    if (locale) {
+        UCollator     *collator = ucol_open(locale, status);
+        UStringSearch *result   = usearch_openFromCollator(pattern,
+                                              patternlength, text, textlength,
+                                              collator, breakiter, status);
+
+        if (result == nullptr || U_FAILURE(*status)) {
+            if (collator) {
+                ucol_close(collator);
+            }
+            return nullptr;
+        }
+        else {
+            result->ownCollator = true;
+        }
+        return result;
+    }
+    *status = U_ILLEGAL_ARGUMENT_ERROR;
+    return nullptr;
+}
+
+U_CAPI UStringSearch * U_EXPORT2 usearch_openFromCollator(
+                                  const char16_t       *pattern,
+                                        int32_t         patternlength,
+                                  const char16_t       *text,
+                                        int32_t         textlength,
+                                  const UCollator      *collator,
+                                        UBreakIterator *breakiter,
+                                        UErrorCode     *status)
+{
+    if (U_FAILURE(*status)) {
+        return nullptr;
+    }
+#if UCONFIG_NO_BREAK_ITERATION
+    if (breakiter != nullptr) {
+        *status = U_UNSUPPORTED_ERROR;
+        return nullptr;
+    }
+#endif
+    if (pattern == nullptr || text == nullptr || collator == nullptr) {
+        *status = U_ILLEGAL_ARGUMENT_ERROR;
+        return nullptr;
+    }
+
+    if(ucol_getAttribute(collator, UCOL_NUMERIC_COLLATION, status) == UCOL_ON) {
+        *status = U_UNSUPPORTED_ERROR;
+        return nullptr;
+    }
+
+    if (U_SUCCESS(*status)) {
+        initializeFCD(status);
+        if (U_FAILURE(*status)) {
+            return nullptr;
+        }
+
+        UStringSearch *result;
+        if (textlength == -1) {
+            textlength = u_strlen(text);
+        }
+        if (patternlength == -1) {
+            patternlength = u_strlen(pattern);
+        }
+        if (textlength <= 0 || patternlength <= 0) {
+            *status = U_ILLEGAL_ARGUMENT_ERROR;
+            return nullptr;
+        }
+
+        result = (UStringSearch *)uprv_malloc(sizeof(UStringSearch));
+        if (result == nullptr) {
+            *status = U_MEMORY_ALLOCATION_ERROR;
+            return nullptr;
+        }
+
+        result->collator    = collator;
+        result->strength    = ucol_getStrength(collator);
+        result->ceMask      = getMask(result->strength);
+        result->toShift     =
+             ucol_getAttribute(collator, UCOL_ALTERNATE_HANDLING, status) ==
+                                                            UCOL_SHIFTED;
+        result->variableTop = ucol_getVariableTop(collator, status);
+
+        result->nfd         = Normalizer2::getNFDInstance(*status);
+
+        if (U_FAILURE(*status)) {
+            uprv_free(result);
+            return nullptr;
+        }
+
+        result->search             = (USearch *)uprv_malloc(sizeof(USearch));
+        if (result->search == nullptr) {
+            *status = U_MEMORY_ALLOCATION_ERROR;
+            uprv_free(result);
+            return nullptr;
+        }
+
+        result->search->text       = text;
+        result->search->textLength = textlength;
+
+        result->pattern.text       = pattern;
+        result->pattern.textLength = patternlength;
+        result->pattern.ces         = nullptr;
+        result->pattern.pces        = nullptr;
+
+        result->search->breakIter  = breakiter;
+#if !UCONFIG_NO_BREAK_ITERATION
+        result->search->internalBreakIter = nullptr; 
+        if (breakiter) {
+            ubrk_setText(breakiter, text, textlength, status);
+        }
+#endif
+
+        result->ownCollator           = false;
+        result->search->matchedLength = 0;
+        result->search->matchedIndex  = USEARCH_DONE;
+        result->utilIter              = nullptr;
+        result->textIter              = ucol_openElements(collator, text,
+                                                          textlength, status);
+        result->textProcessedIter     = nullptr;
+        if (U_FAILURE(*status)) {
+            usearch_close(result);
+            return nullptr;
+        }
+
+        result->search->isOverlap          = false;
+        result->search->isCanonicalMatch   = false;
+        result->search->elementComparisonType = 0;
+        result->search->isForwardSearching = true;
+        result->search->reset              = true;
+
+        initialize(result, status);
+
+        if (U_FAILURE(*status)) {
+            usearch_close(result);
+            return nullptr;
+        }
+
+        return result;
+    }
+    return nullptr;
+}
+
+U_CAPI void U_EXPORT2 usearch_close(UStringSearch *strsrch)
+{
+    if (strsrch) {
+        if (strsrch->pattern.ces != strsrch->pattern.cesBuffer &&
+            strsrch->pattern.ces) {
+            uprv_free(strsrch->pattern.ces);
+        }
+
+        if (strsrch->pattern.pces != nullptr &&
+            strsrch->pattern.pces != strsrch->pattern.pcesBuffer) {
+            uprv_free(strsrch->pattern.pces);
+        }
+
+        delete strsrch->textProcessedIter;
+        ucol_closeElements(strsrch->textIter);
+        ucol_closeElements(strsrch->utilIter);
+
+        if (strsrch->ownCollator && strsrch->collator) {
+            ucol_close((UCollator *)strsrch->collator);
+        }
+
+#if !UCONFIG_NO_BREAK_ITERATION
+        if (strsrch->search->internalBreakIter != nullptr) {
+            ubrk_close(strsrch->search->internalBreakIter);
+        }
+#endif
+
+        uprv_free(strsrch->search);
+        uprv_free(strsrch);
+    }
+}
+
+namespace {
+
+UBool initTextProcessedIter(UStringSearch *strsrch, UErrorCode *status) {
+    if (U_FAILURE(*status)) { return false; }
+    if (strsrch->textProcessedIter == nullptr) {
+        strsrch->textProcessedIter = new icu::UCollationPCE(strsrch->textIter);
+        if (strsrch->textProcessedIter == nullptr) {
+            *status = U_MEMORY_ALLOCATION_ERROR;
+            return false;
+        }
+    } else {
+        strsrch->textProcessedIter->init(strsrch->textIter);
+    }
+    return true;
+}
+
+}
+
+
+U_CAPI void U_EXPORT2 usearch_setOffset(UStringSearch *strsrch,
+                                        int32_t        position,
+                                        UErrorCode    *status)
+{
+    if (U_SUCCESS(*status) && strsrch) {
+        if (isOutOfBounds(strsrch->search->textLength, position)) {
+            *status = U_INDEX_OUTOFBOUNDS_ERROR;
+        }
+        else {
+            setColEIterOffset(strsrch->textIter, position, *status);
+        }
+        strsrch->search->matchedIndex  = USEARCH_DONE;
+        strsrch->search->matchedLength = 0;
+        strsrch->search->reset         = false;
+    }
+}
+
+U_CAPI int32_t U_EXPORT2 usearch_getOffset(const UStringSearch *strsrch)
+{
+    if (strsrch) {
+        int32_t result = ucol_getOffset(strsrch->textIter);
+        if (isOutOfBounds(strsrch->search->textLength, result)) {
+            return USEARCH_DONE;
+        }
+        return result;
+    }
+    return USEARCH_DONE;
+}
+
+U_CAPI void U_EXPORT2 usearch_setAttribute(UStringSearch        *strsrch,
+                                           USearchAttribute      attribute,
+                                           USearchAttributeValue value,
+                                           UErrorCode           *status)
+{
+    if (U_SUCCESS(*status) && strsrch) {
+        switch (attribute)
+        {
+        case USEARCH_OVERLAP :
+            strsrch->search->isOverlap = (value == USEARCH_ON ? true : false);
+            break;
+        case USEARCH_CANONICAL_MATCH :
+            strsrch->search->isCanonicalMatch = (value == USEARCH_ON ? true :
+                                                                      false);
+            break;
+        case USEARCH_ELEMENT_COMPARISON :
+            if (value == USEARCH_PATTERN_BASE_WEIGHT_IS_WILDCARD || value == USEARCH_ANY_BASE_WEIGHT_IS_WILDCARD) {
+                strsrch->search->elementComparisonType = (int16_t)value;
+            } else {
+                strsrch->search->elementComparisonType = 0;
+            }
+            break;
+        case USEARCH_ATTRIBUTE_COUNT :
+        default:
+            *status = U_ILLEGAL_ARGUMENT_ERROR;
+        }
+    }
+    if (value == USEARCH_ATTRIBUTE_VALUE_COUNT) {
+        *status = U_ILLEGAL_ARGUMENT_ERROR;
+    }
+}
+
+U_CAPI USearchAttributeValue U_EXPORT2 usearch_getAttribute(
+                                                const UStringSearch *strsrch,
+                                                USearchAttribute attribute)
+{
+    if (strsrch) {
+        switch (attribute) {
+        case USEARCH_OVERLAP :
+            return (strsrch->search->isOverlap ? USEARCH_ON : USEARCH_OFF);
+        case USEARCH_CANONICAL_MATCH :
+            return (strsrch->search->isCanonicalMatch ? USEARCH_ON : USEARCH_OFF);
+        case USEARCH_ELEMENT_COMPARISON :
+            {
+                int16_t value = strsrch->search->elementComparisonType;
+                if (value == USEARCH_PATTERN_BASE_WEIGHT_IS_WILDCARD || value == USEARCH_ANY_BASE_WEIGHT_IS_WILDCARD) {
+                    return (USearchAttributeValue)value;
+                } else {
+                    return USEARCH_STANDARD_ELEMENT_COMPARISON;
+                }
+            }
+        case USEARCH_ATTRIBUTE_COUNT :
+            return USEARCH_DEFAULT;
+        }
+    }
+    return USEARCH_DEFAULT;
+}
+
+U_CAPI int32_t U_EXPORT2 usearch_getMatchedStart(
+                                                const UStringSearch *strsrch)
+{
+    if (strsrch == nullptr) {
+        return USEARCH_DONE;
+    }
+    return strsrch->search->matchedIndex;
+}
+
+
+U_CAPI int32_t U_EXPORT2 usearch_getMatchedText(const UStringSearch *strsrch,
+                                            char16_t      *result,
+                                            int32_t        resultCapacity,
+                                            UErrorCode    *status)
+{
+    if (U_FAILURE(*status)) {
+        return USEARCH_DONE;
+    }
+    if (strsrch == nullptr || resultCapacity < 0 || (resultCapacity > 0 &&
+        result == nullptr)) {
+        *status = U_ILLEGAL_ARGUMENT_ERROR;
+        return USEARCH_DONE;
+    }
+
+    int32_t     copylength = strsrch->search->matchedLength;
+    int32_t copyindex  = strsrch->search->matchedIndex;
+    if (copyindex == USEARCH_DONE) {
+        u_terminateUChars(result, resultCapacity, 0, status);
+        return USEARCH_DONE;
+    }
+
+    if (resultCapacity < copylength) {
+        copylength = resultCapacity;
+    }
+    if (copylength > 0) {
+        uprv_memcpy(result, strsrch->search->text + copyindex,
+                    copylength * sizeof(char16_t));
+    }
+    return u_terminateUChars(result, resultCapacity,
+                             strsrch->search->matchedLength, status);
+}
+
+U_CAPI int32_t U_EXPORT2 usearch_getMatchedLength(
+                                              const UStringSearch *strsrch)
+{
+    if (strsrch) {
+        return strsrch->search->matchedLength;
+    }
+    return USEARCH_DONE;
+}
+
+#if !UCONFIG_NO_BREAK_ITERATION
+
+U_CAPI void U_EXPORT2 usearch_setBreakIterator(UStringSearch  *strsrch,
+                                               UBreakIterator *breakiter,
+                                               UErrorCode     *status)
+{
+    if (U_SUCCESS(*status) && strsrch) {
+        strsrch->search->breakIter = breakiter;
+        if (breakiter) {
+            ubrk_setText(breakiter, strsrch->search->text,
+                         strsrch->search->textLength, status);
+        }
+    }
+}
+
+U_CAPI const UBreakIterator* U_EXPORT2
+usearch_getBreakIterator(const UStringSearch *strsrch)
+{
+    if (strsrch) {
+        return strsrch->search->breakIter;
+    }
+    return nullptr;
+}
+
+#endif
+
+U_CAPI void U_EXPORT2 usearch_setText(      UStringSearch *strsrch,
+                                      const char16_t      *text,
+                                            int32_t        textlength,
+                                            UErrorCode    *status)
+{
+    if (U_SUCCESS(*status)) {
+        if (strsrch == nullptr || text == nullptr || textlength < -1 ||
+            textlength == 0) {
+            *status = U_ILLEGAL_ARGUMENT_ERROR;
+        }
+        else {
+            if (textlength == -1) {
+                textlength = u_strlen(text);
+            }
+            strsrch->search->text       = text;
+            strsrch->search->textLength = textlength;
+            ucol_setText(strsrch->textIter, text, textlength, status);
+            strsrch->search->matchedIndex  = USEARCH_DONE;
+            strsrch->search->matchedLength = 0;
+            strsrch->search->reset         = true;
+#if !UCONFIG_NO_BREAK_ITERATION
+            if (strsrch->search->breakIter != nullptr) {
+                ubrk_setText(strsrch->search->breakIter, text,
+                             textlength, status);
+            }
+            if (strsrch->search->internalBreakIter != nullptr) {
+                ubrk_setText(strsrch->search->internalBreakIter, text, textlength, status);
+            }
+#endif
+        }
+    }
+}
+
+U_CAPI const char16_t * U_EXPORT2 usearch_getText(const UStringSearch *strsrch,
+                                                     int32_t       *length)
+{
+    if (strsrch) {
+        *length = strsrch->search->textLength;
+        return strsrch->search->text;
+    }
+    return nullptr;
+}
+
+U_CAPI void U_EXPORT2 usearch_setCollator(      UStringSearch *strsrch,
+                                          const UCollator     *collator,
+                                                UErrorCode    *status)
+{
+    if (U_SUCCESS(*status)) {
+        if (collator == nullptr) {
+            *status = U_ILLEGAL_ARGUMENT_ERROR;
+            return;
+        }
+
+        if (strsrch) {
+            delete strsrch->textProcessedIter;
+            strsrch->textProcessedIter = nullptr;
+            ucol_closeElements(strsrch->textIter);
+            ucol_closeElements(strsrch->utilIter);
+            strsrch->textIter = strsrch->utilIter = nullptr;
+            if (strsrch->ownCollator && (strsrch->collator != collator)) {
+                ucol_close((UCollator *)strsrch->collator);
+                strsrch->ownCollator = false;
+            }
+            strsrch->collator    = collator;
+            strsrch->strength    = ucol_getStrength(collator);
+            strsrch->ceMask      = getMask(strsrch->strength);
+#if !UCONFIG_NO_BREAK_ITERATION
+            if (strsrch->search->internalBreakIter != nullptr) {
+                ubrk_close(strsrch->search->internalBreakIter);
+                strsrch->search->internalBreakIter = nullptr;   
+            }
+#endif
+            strsrch->toShift     =
+               ucol_getAttribute(collator, UCOL_ALTERNATE_HANDLING, status) ==
+                                                                UCOL_SHIFTED;
+            strsrch->variableTop = ucol_getVariableTop(collator, status);
+            strsrch->textIter = ucol_openElements(collator,
+                                      strsrch->search->text,
+                                      strsrch->search->textLength,
+                                      status);
+            strsrch->utilIter = ucol_openElements(
+                    collator, strsrch->pattern.text, strsrch->pattern.textLength, status);
+            initialize(strsrch, status);
+        }
+
+#if 0
+        uprv_init_pce(strsrch->textIter);
+        uprv_init_pce(strsrch->utilIter);
+#endif
+    }
+}
+
+U_CAPI UCollator * U_EXPORT2 usearch_getCollator(const UStringSearch *strsrch)
+{
+    if (strsrch) {
+        return (UCollator *)strsrch->collator;
+    }
+    return nullptr;
+}
+
+U_CAPI void U_EXPORT2 usearch_setPattern(      UStringSearch *strsrch,
+                                         const char16_t      *pattern,
+                                               int32_t        patternlength,
+                                               UErrorCode    *status)
+{
+    if (U_SUCCESS(*status)) {
+        if (strsrch == nullptr || pattern == nullptr) {
+            *status = U_ILLEGAL_ARGUMENT_ERROR;
+        }
+        else {
+            if (patternlength == -1) {
+                patternlength = u_strlen(pattern);
+            }
+            if (patternlength == 0) {
+                *status = U_ILLEGAL_ARGUMENT_ERROR;
+                return;
+            }
+            strsrch->pattern.text       = pattern;
+            strsrch->pattern.textLength = patternlength;
+            initialize(strsrch, status);
+        }
+    }
+}
+
+U_CAPI const char16_t* U_EXPORT2
+usearch_getPattern(const UStringSearch *strsrch,
+                   int32_t             *length)
+{
+    if (strsrch) {
+        *length = strsrch->pattern.textLength;
+        return strsrch->pattern.text;
+    }
+    return nullptr;
+}
+
+
+U_CAPI int32_t U_EXPORT2 usearch_first(UStringSearch *strsrch,
+                                       UErrorCode    *status)
+{
+    if (strsrch && U_SUCCESS(*status)) {
+        strsrch->search->isForwardSearching = true;
+        usearch_setOffset(strsrch, 0, status);
+        if (U_SUCCESS(*status)) {
+            return usearch_next(strsrch, status);
+        }
+    }
+    return USEARCH_DONE;
+}
+
+U_CAPI int32_t U_EXPORT2 usearch_following(UStringSearch *strsrch,
+                                           int32_t        position,
+                                           UErrorCode    *status)
+{
+    if (strsrch && U_SUCCESS(*status)) {
+        strsrch->search->isForwardSearching = true;
+        usearch_setOffset(strsrch, position, status);
+        if (U_SUCCESS(*status)) {
+            return usearch_next(strsrch, status);
+        }
+    }
+    return USEARCH_DONE;
+}
+
+U_CAPI int32_t U_EXPORT2 usearch_last(UStringSearch *strsrch,
+                                      UErrorCode    *status)
+{
+    if (strsrch && U_SUCCESS(*status)) {
+        strsrch->search->isForwardSearching = false;
+        usearch_setOffset(strsrch, strsrch->search->textLength, status);
+        if (U_SUCCESS(*status)) {
+            return usearch_previous(strsrch, status);
+        }
+    }
+    return USEARCH_DONE;
+}
+
+U_CAPI int32_t U_EXPORT2 usearch_preceding(UStringSearch *strsrch,
+                                           int32_t        position,
+                                           UErrorCode    *status)
+{
+    if (strsrch && U_SUCCESS(*status)) {
+        strsrch->search->isForwardSearching = false;
+        usearch_setOffset(strsrch, position, status);
+        if (U_SUCCESS(*status)) {
+            return usearch_previous(strsrch, status);
+        }
+    }
+    return USEARCH_DONE;
+}
+
+U_CAPI int32_t U_EXPORT2 usearch_next(UStringSearch *strsrch,
+                                      UErrorCode    *status)
+{
+    if (U_SUCCESS(*status) && strsrch) {
+        int32_t      offset       = usearch_getOffset(strsrch);
+        USearch     *search       = strsrch->search;
+        search->reset             = false;
+        int32_t      textlength   = search->textLength;
+        if (search->isForwardSearching) {
+            if (offset == textlength ||
+                (! search->isOverlap &&
+                (search->matchedIndex != USEARCH_DONE &&
+                offset + search->matchedLength > textlength))) {
+                    setMatchNotFound(strsrch, *status);
+                    return USEARCH_DONE;
+            }
+        }
+        else {
+            search->isForwardSearching = true;
+            if (search->matchedIndex != USEARCH_DONE) {
+                return search->matchedIndex;
+            }
+        }
+
+        if (U_SUCCESS(*status)) {
+            if (strsrch->pattern.cesLength == 0) {
+                if (search->matchedIndex == USEARCH_DONE) {
+                    search->matchedIndex = offset;
+                }
+                else { 
+                    U16_FWD_1(search->text, search->matchedIndex, textlength);
+                }
+
+                search->matchedLength = 0;
+                setColEIterOffset(strsrch->textIter, search->matchedIndex, *status);
+                if (search->matchedIndex == textlength) {
+                    search->matchedIndex = USEARCH_DONE;
+                }
+            }
+            else {
+                if (search->matchedLength > 0) {
+                    if (search->isOverlap) {
+                        ucol_setOffset(strsrch->textIter, offset + 1, status);
+                    }
+                    else {
+                        ucol_setOffset(strsrch->textIter,
+                                       offset + search->matchedLength, status);
+                    }
+                }
+                else {
+                    search->matchedIndex = offset - 1;
+                }
+
+                if (search->isCanonicalMatch) {
+                    usearch_handleNextCanonical(strsrch, status);
+                }
+                else {
+                    usearch_handleNextExact(strsrch, status);
+                }
+            }
+
+            if (U_FAILURE(*status)) {
+                return USEARCH_DONE;
+            }
+
+            if (search->matchedIndex == USEARCH_DONE) {
+                ucol_setOffset(strsrch->textIter, search->textLength, status);
+            } else {
+                ucol_setOffset(strsrch->textIter, search->matchedIndex, status);
+            }
+
+            return search->matchedIndex;
+        }
+    }
+    return USEARCH_DONE;
+}
+
+U_CAPI int32_t U_EXPORT2 usearch_previous(UStringSearch *strsrch,
+                                          UErrorCode    *status)
+{
+    if (U_SUCCESS(*status) && strsrch) {
+        int32_t offset;
+        USearch *search = strsrch->search;
+        if (search->reset) {
+            offset                     = search->textLength;
+            search->isForwardSearching = false;
+            search->reset              = false;
+            setColEIterOffset(strsrch->textIter, offset, *status);
+        }
+        else {
+            offset = usearch_getOffset(strsrch);
+        }
+
+        int32_t matchedindex = search->matchedIndex;
+        if (search->isForwardSearching) {
+            search->isForwardSearching = false;
+            if (matchedindex != USEARCH_DONE) {
+                return matchedindex;
+            }
+        }
+        else {
+
+            if (offset == 0 || matchedindex == 0) {
+                setMatchNotFound(strsrch, *status);
+                return USEARCH_DONE;
+            }
+        }
+
+        if (U_SUCCESS(*status)) {
+            if (strsrch->pattern.cesLength == 0) {
+                search->matchedIndex =
+                      (matchedindex == USEARCH_DONE ? offset : matchedindex);
+                if (search->matchedIndex == 0) {
+                    setMatchNotFound(strsrch, *status);
+                }
+                else { 
+                    U16_BACK_1(search->text, 0, search->matchedIndex);
+                    setColEIterOffset(strsrch->textIter, search->matchedIndex, *status);
+                    search->matchedLength = 0;
+                }
+            }
+            else {
+                if (strsrch->search->isCanonicalMatch) {
+                    usearch_handlePreviousCanonical(strsrch, status);
+                }
+                else {
+                    usearch_handlePreviousExact(strsrch, status);
+                }
+            }
+
+            if (U_FAILURE(*status)) {
+                return USEARCH_DONE;
+            }
+
+            return search->matchedIndex;
+        }
+    }
+    return USEARCH_DONE;
+}
+
+
+
+U_CAPI void U_EXPORT2 usearch_reset(UStringSearch *strsrch)
+{
+    if (strsrch) {
+        UErrorCode status            = U_ZERO_ERROR;
+        UBool      sameCollAttribute = true;
+        uint32_t   ceMask;
+        UBool      shift;
+        uint32_t   varTop;
+
+        UCollationStrength newStrength = ucol_getStrength(strsrch->collator);
+        if ((strsrch->strength < UCOL_QUATERNARY && newStrength >= UCOL_QUATERNARY) ||
+            (strsrch->strength >= UCOL_QUATERNARY && newStrength < UCOL_QUATERNARY)) {
+                sameCollAttribute = false;
+        }
+
+        strsrch->strength    = ucol_getStrength(strsrch->collator);
+        ceMask = getMask(strsrch->strength);
+        if (strsrch->ceMask != ceMask) {
+            strsrch->ceMask = ceMask;
+            sameCollAttribute = false;
+        }
+
+        shift = ucol_getAttribute(strsrch->collator, UCOL_ALTERNATE_HANDLING,
+                                  &status) == UCOL_SHIFTED;
+        if (strsrch->toShift != shift) {
+            strsrch->toShift  = shift;
+            sameCollAttribute = false;
+        }
+
+        varTop = ucol_getVariableTop(strsrch->collator, &status);
+        if (strsrch->variableTop != varTop) {
+            strsrch->variableTop = varTop;
+            sameCollAttribute    = false;
+        }
+        if (!sameCollAttribute) {
+            initialize(strsrch, &status);
+        }
+        ucol_setText(strsrch->textIter, strsrch->search->text,
+                              strsrch->search->textLength,
+                              &status);
+        strsrch->search->matchedLength      = 0;
+        strsrch->search->matchedIndex       = USEARCH_DONE;
+        strsrch->search->isOverlap          = false;
+        strsrch->search->isCanonicalMatch   = false;
+        strsrch->search->elementComparisonType = 0;
+        strsrch->search->isForwardSearching = true;
+        strsrch->search->reset              = true;
+    }
+}
+
+struct  CEI {
+    int64_t ce;
+    int32_t lowIndex;
+    int32_t highIndex;
+};
+
+U_NAMESPACE_BEGIN
+
+namespace {
+#define   DEFAULT_CEBUFFER_SIZE 96
+#define   CEBUFFER_EXTRA 32
+#define   MAX_TARGET_IGNORABLES_PER_PAT_JAMO_L 8
+#define   MAX_TARGET_IGNORABLES_PER_PAT_OTHER 3
+#define   MIGHT_BE_JAMO_L(c) ((c >= 0x1100 && c <= 0x115E) || (c >= 0x3131 && c <= 0x314E) || (c >= 0x3165 && c <= 0x3186))
+struct CEIBuffer {
+    CEI                  defBuf[DEFAULT_CEBUFFER_SIZE];
+    CEI                 *buf;
+    int32_t              bufSize;
+    int32_t              firstIx;
+    int32_t              limitIx;
+    UCollationElements  *ceIter;
+    UStringSearch       *strSearch;
+
+
+
+               CEIBuffer(UStringSearch *ss, UErrorCode *status);
+               ~CEIBuffer();
+   const CEI   *get(int32_t index);
+   const CEI   *getPrevious(int32_t index);
+};
+
+
+CEIBuffer::CEIBuffer(UStringSearch *ss, UErrorCode *status) {
+    buf = defBuf;
+    strSearch = ss;
+    bufSize = ss->pattern.pcesLength + CEBUFFER_EXTRA;
+    if (ss->search->elementComparisonType != 0) {
+        const char16_t * patText = ss->pattern.text;
+        if (patText) {
+            const char16_t * patTextLimit = patText + ss->pattern.textLength;
+            while ( patText < patTextLimit ) {
+                char16_t c = *patText++;
+                if (MIGHT_BE_JAMO_L(c)) {
+                    bufSize += MAX_TARGET_IGNORABLES_PER_PAT_JAMO_L;
+                } else {
+                    bufSize += MAX_TARGET_IGNORABLES_PER_PAT_OTHER;
+                }
+            }
+        }
+    }
+    ceIter    = ss->textIter;
+    firstIx = 0;
+    limitIx = 0;
+
+    if (!initTextProcessedIter(ss, status)) { return; }
+
+    if (bufSize>DEFAULT_CEBUFFER_SIZE) {
+        buf = static_cast<CEI*>(uprv_malloc(bufSize * sizeof(CEI)));
+        if (buf == nullptr) {
+            *status = U_MEMORY_ALLOCATION_ERROR;
+        }
+    }
+}
+
+
+CEIBuffer::~CEIBuffer() {
+    if (buf != defBuf) {
+        uprv_free(buf);
+    }
+}
+
+
+const CEI *CEIBuffer::get(int32_t index) {
+    int i = index % bufSize;
+
+    if (index>=firstIx && index<limitIx) {
+        return &buf[i];
+    }
+
+    if (index != limitIx) {
+        UPRV_UNREACHABLE_ASSERT;
+        return nullptr;
+    }
+
+    limitIx++;
+
+    if (limitIx - firstIx >= bufSize) {
+        firstIx++;
+    }
+
+    UErrorCode status = U_ZERO_ERROR;
+
+    buf[i].ce = strSearch->textProcessedIter->nextProcessed(&buf[i].lowIndex, &buf[i].highIndex, &status);
+
+    return &buf[i];
+}
+
+const CEI *CEIBuffer::getPrevious(int32_t index) {
+    int i = index % bufSize;
+
+    if (index>=firstIx && index<limitIx) {
+        return &buf[i];
+    }
+
+    if (index != limitIx) {
+        UPRV_UNREACHABLE_ASSERT;
+        return nullptr;
+    }
+
+    limitIx++;
+
+    if (limitIx - firstIx >= bufSize) {
+        firstIx++;
+    }
+
+    UErrorCode status = U_ZERO_ERROR;
+
+    buf[i].ce = strSearch->textProcessedIter->previousProcessed(&buf[i].lowIndex, &buf[i].highIndex, &status);
+
+    return &buf[i];
+}
+
+}
+
+U_NAMESPACE_END
+
+
+
+#ifdef USEARCH_DEBUG
+#include <stdio.h>
+#include <stdlib.h>
+#endif
+
+static int32_t nextBoundaryAfter(UStringSearch *strsrch, int32_t startIndex, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return startIndex;
+    }
+#if 0
+    const char16_t *text = strsrch->search->text;
+    int32_t textLen   = strsrch->search->textLength;
+
+    U_ASSERT(startIndex>=0);
+    U_ASSERT(startIndex<=textLen);
+
+    if (startIndex >= textLen) {
+        return startIndex;
+    }
+
+    UChar32  c;
+    int32_t  i = startIndex;
+    U16_NEXT(text, i, textLen, c);
+
+    int32_t gcProperty = u_getIntPropertyValue(c, UCHAR_GRAPHEME_CLUSTER_BREAK);
+    if (gcProperty==U_GCB_CONTROL || gcProperty==U_GCB_LF || gcProperty==U_GCB_CR) {
+        return i;
+    }
+
+    int32_t  indexOfLastCharChecked;
+    for (;;) {
+        indexOfLastCharChecked = i;
+        if (i>=textLen) {
+            break;
+        }
+        U16_NEXT(text, i, textLen, c);
+        gcProperty = u_getIntPropertyValue(c, UCHAR_GRAPHEME_CLUSTER_BREAK);
+        if (gcProperty != U_GCB_EXTEND && gcProperty != U_GCB_SPACING_MARK) {
+            break;
+        }
+    }
+    return indexOfLastCharChecked;
+#elif !UCONFIG_NO_BREAK_ITERATION
+    UBreakIterator *breakiterator = getBreakIterator(strsrch, status);
+    if (U_FAILURE(status)) {
+        return startIndex;
+    }
+
+    return ubrk_following(breakiterator, startIndex);
+#else
+    return startIndex;
+#endif
+
+}
+
+static UBool isBreakBoundary(UStringSearch *strsrch, int32_t index, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return true;
+    }
+#if 0
+    const char16_t *text = strsrch->search->text;
+    int32_t textLen   = strsrch->search->textLength;
+
+    U_ASSERT(index>=0);
+    U_ASSERT(index<=textLen);
+
+    if (index>=textLen || index<=0) {
+        return true;
+    }
+
+    UChar32  c;
+    U16_GET(text, 0, index, textLen, c);
+    int32_t gcProperty = u_getIntPropertyValue(c, UCHAR_GRAPHEME_CLUSTER_BREAK);
+    if (gcProperty != U_GCB_EXTEND && gcProperty != U_GCB_SPACING_MARK) {
+        return true;
+    }
+
+    U16_PREV(text, 0, index, c);
+    gcProperty = u_getIntPropertyValue(c, UCHAR_GRAPHEME_CLUSTER_BREAK);
+    UBool combining =  !(gcProperty==U_GCB_CONTROL || gcProperty==U_GCB_LF || gcProperty==U_GCB_CR);
+    return !combining;
+#elif !UCONFIG_NO_BREAK_ITERATION
+    UBreakIterator *breakiterator = getBreakIterator(strsrch, status);
+    if (U_FAILURE(status)) {
+        return true;
+    }
+
+    return ubrk_isBoundary(breakiterator, index);
+#else
+    return true;
+#endif
+}
+
+#if 0
+static UBool onBreakBoundaries(const UStringSearch *strsrch, int32_t start, int32_t end, UErrorCode &status)
+{
+    if (U_FAILURE(status)) {
+        return true;
+    }
+
+#if !UCONFIG_NO_BREAK_ITERATION
+    UBreakIterator *breakiterator = getBreakIterator(strsrch, status);
+    if (U_SUCCESS(status)) {
+        int32_t startindex = ubrk_first(breakiterator);
+        int32_t endindex   = ubrk_last(breakiterator);
+
+        if (start < startindex || start > endindex ||
+            end < startindex || end > endindex) {
+            return false;
+        }
+
+        return ubrk_isBoundary(breakiterator, start) &&
+               ubrk_isBoundary(breakiterator, end);
+    }
+#endif
+
+    return true;
+}
+#endif
+
+typedef enum {
+    U_CE_MATCH = -1,
+    U_CE_NO_MATCH = 0,
+    U_CE_SKIP_TARG,
+    U_CE_SKIP_PATN
+} UCompareCEsResult;
+#define U_CE_LEVEL2_BASE 0x00000005
+#define U_CE_LEVEL3_BASE 0x00050000
+
+static UCompareCEsResult compareCE64s(int64_t targCE, int64_t patCE, int16_t compareType) {
+    if (targCE == patCE) {
+        return U_CE_MATCH;
+    }
+    if (compareType == 0) {
+        return U_CE_NO_MATCH;
+    }
+    
+    int64_t targCEshifted = targCE >> 32;
+    int64_t patCEshifted = patCE >> 32;
+    int64_t mask;
+
+    mask = 0xFFFF0000;
+    int32_t targLev1 = static_cast<int32_t>(targCEshifted & mask);
+    int32_t patLev1 = static_cast<int32_t>(patCEshifted & mask);
+    if ( targLev1 != patLev1 ) {
+        if ( targLev1 == 0 ) {
+            return U_CE_SKIP_TARG;
+        }
+        if ( patLev1 == 0 && compareType == USEARCH_ANY_BASE_WEIGHT_IS_WILDCARD ) {
+            return U_CE_SKIP_PATN;
+        }
+        return U_CE_NO_MATCH;
+    }
+
+    mask = 0x0000FFFF;
+    int32_t targLev2 = static_cast<int32_t>(targCEshifted & mask);
+    int32_t patLev2 = static_cast<int32_t>(patCEshifted & mask);
+    if ( targLev2 != patLev2 ) {
+        if ( targLev2 == 0 ) {
+            return U_CE_SKIP_TARG;
+        }
+        if ( patLev2 == 0 && compareType == USEARCH_ANY_BASE_WEIGHT_IS_WILDCARD ) {
+            return U_CE_SKIP_PATN;
+        }
+        return (patLev2 == U_CE_LEVEL2_BASE || (compareType == USEARCH_ANY_BASE_WEIGHT_IS_WILDCARD && targLev2 == U_CE_LEVEL2_BASE) )?
+            U_CE_MATCH: U_CE_NO_MATCH;
+    }
+    
+    mask = 0xFFFF0000;
+    int32_t targLev3 = static_cast<int32_t>(targCE & mask);
+    int32_t patLev3 = static_cast<int32_t>(patCE & mask);
+    if ( targLev3 != patLev3 ) {
+        return (patLev3 == U_CE_LEVEL3_BASE || (compareType == USEARCH_ANY_BASE_WEIGHT_IS_WILDCARD && targLev3 == U_CE_LEVEL3_BASE) )?
+            U_CE_MATCH: U_CE_NO_MATCH;
+   }
+
+    return U_CE_MATCH;
+}
+
+namespace {
+
+UChar32 codePointAt(const USearch &search, int32_t index) {
+    if (index < search.textLength) {
+        UChar32 c;
+        U16_NEXT(search.text, index, search.textLength, c);
+        return c;
+    }
+    return U_SENTINEL;
+}
+
+UChar32 codePointBefore(const USearch &search, int32_t index) {
+    if (0 < index) {
+        UChar32 c;
+        U16_PREV(search.text, 0, index, c);
+        return c;
+    }
+    return U_SENTINEL;
+}
+
+}  
+
+U_CAPI UBool U_EXPORT2 usearch_search(UStringSearch  *strsrch,
+                                       int32_t        startIdx,
+                                       int32_t        *matchStart,
+                                       int32_t        *matchLimit,
+                                       UErrorCode     *status)
+{
+    if (U_FAILURE(*status)) {
+        return false;
+    }
+
+
+#ifdef USEARCH_DEBUG
+    if (getenv("USEARCH_DEBUG") != nullptr) {
+        printf("Pattern CEs\n");
+        for (int ii=0; ii<strsrch->pattern.cesLength; ii++) {
+            printf(" %8x", strsrch->pattern.ces[ii]);
+        }
+        printf("\n");
+    }
+
+#endif
+    if(strsrch->pattern.cesLength == 0         ||
+       startIdx < 0                           ||
+       startIdx > strsrch->search->textLength ||
+       strsrch->pattern.ces == nullptr) {
+           *status = U_ILLEGAL_ARGUMENT_ERROR;
+           return false;
+    }
+
+    if (strsrch->pattern.pces == nullptr) {
+        initializePatternPCETable(strsrch, status);
+    }
+
+    ucol_setOffset(strsrch->textIter, startIdx, status);
+    CEIBuffer ceb(strsrch, status);
+
+    if (U_FAILURE(*status)) {
+        return false;
+    }
+
+    int32_t    targetIx = 0;
+    const CEI *targetCEI = nullptr;
+    int32_t    patIx;
+    UBool      found;
+
+    int32_t  mStart = -1;
+    int32_t  mLimit = -1;
+    int32_t  minLimit;
+    int32_t  maxLimit;
+
+
+
+    for(targetIx=0; ; targetIx++)
+    {
+        found = true;
+        int32_t targetIxOffset = 0;
+        int64_t patCE = 0;
+        const CEI *firstCEI = ceb.get(targetIx);
+        if (firstCEI == nullptr) {
+            *status = U_INTERNAL_PROGRAM_ERROR;
+            found = false;
+            break;
+        }
+        
+        for (patIx=0; patIx<strsrch->pattern.pcesLength; patIx++) {
+            patCE = strsrch->pattern.pces[patIx];
+            targetCEI = ceb.get(targetIx+patIx+targetIxOffset);
+            UCompareCEsResult ceMatch = compareCE64s(targetCEI->ce, patCE, strsrch->search->elementComparisonType);
+            if ( ceMatch == U_CE_NO_MATCH ) {
+                found = false;
+                break;
+            } else if ( ceMatch > U_CE_NO_MATCH ) {
+                if ( ceMatch == U_CE_SKIP_TARG ) {
+                    patIx--;
+                    targetIxOffset++;
+                } else { 
+                    targetIxOffset--;
+                }
+            }
+        }
+        targetIxOffset += strsrch->pattern.pcesLength; 
+
+        if (!found && ((targetCEI == nullptr) || (targetCEI->ce != UCOL_PROCESSED_NULLORDER))) {
+            continue;
+        }
+
+        if (!found) {
+            break;
+        }
+
+
+        const CEI *lastCEI  = ceb.get(targetIx + targetIxOffset - 1);
+
+        mStart   = firstCEI->lowIndex;
+        minLimit = lastCEI->lowIndex;
+
+
+        const CEI* nextCEI = nullptr;
+        if (strsrch->search->elementComparisonType == 0) {
+            nextCEI  = ceb.get(targetIx + targetIxOffset);
+            maxLimit = nextCEI->lowIndex;
+            if (nextCEI->lowIndex == nextCEI->highIndex && nextCEI->ce != UCOL_PROCESSED_NULLORDER) {
+                found = false;
+            }
+        } else {
+            for ( ; ; ++targetIxOffset ) {
+                nextCEI = ceb.get(targetIx + targetIxOffset);
+                maxLimit = nextCEI->lowIndex;
+                if (  nextCEI->ce == UCOL_PROCESSED_NULLORDER ) {
+                    break;
+                }
+                if ( (((nextCEI->ce) >> 32) & 0xFFFF0000UL) == 0 ) {
+                    UCompareCEsResult ceMatch = compareCE64s(nextCEI->ce, patCE, strsrch->search->elementComparisonType);
+                    if ( ceMatch == U_CE_NO_MATCH || ceMatch == U_CE_SKIP_PATN ) {
+                        found = false;
+                        break;
+                    }
+                } else if ( nextCEI->lowIndex == nextCEI->highIndex ) {
+                    found = false;
+                    break;
+                } else {
+                    break;
+                }
+            }
+        }
+
+
+        if (!isBreakBoundary(strsrch, mStart, *status)) {
+            found = false;
+        }
+        if (U_FAILURE(*status)) {
+            break;
+        }
+
+        int32_t secondIx = firstCEI->highIndex;
+        if (mStart == secondIx) {
+            found = false;
+        }
+
+        UBool allowMidclusterMatch = false;
+        if (strsrch->search->text != nullptr && strsrch->search->textLength > maxLimit) {
+            allowMidclusterMatch =
+                    strsrch->search->breakIter == nullptr &&
+                    nextCEI != nullptr && (((nextCEI->ce) >> 32) & 0xFFFF0000UL) != 0 &&
+                    maxLimit >= lastCEI->highIndex && nextCEI->highIndex > maxLimit &&
+                    (strsrch->nfd->hasBoundaryBefore(codePointAt(*strsrch->search, maxLimit)) ||
+                        strsrch->nfd->hasBoundaryAfter(codePointBefore(*strsrch->search, maxLimit)));
+        }
+
+        mLimit = maxLimit;
+        if (minLimit < maxLimit) {
+            if (minLimit == lastCEI->highIndex && isBreakBoundary(strsrch, minLimit, *status)) {
+                mLimit = minLimit;
+            } else {
+                int32_t nba = nextBoundaryAfter(strsrch, minLimit, *status);
+                if (nba >= lastCEI->highIndex && (!allowMidclusterMatch || nba < maxLimit)) {
+                    mLimit = nba;
+                }
+            }
+        }
+
+        if (U_FAILURE(*status)) {
+            break;
+        }
+
+    #ifdef USEARCH_DEBUG
+        if (getenv("USEARCH_DEBUG") != nullptr) {
+            printf("minLimit, maxLimit, mLimit = %d, %d, %d\n", minLimit, maxLimit, mLimit);
+        }
+    #endif
+
+        if (!allowMidclusterMatch) {
+            if (mLimit > maxLimit) {
+                found = false;
+            }
+
+            if (!isBreakBoundary(strsrch, mLimit, *status)) {
+                found = false;
+            }
+            if (U_FAILURE(*status)) {
+                break;
+            }
+        }
+
+        if (! checkIdentical(strsrch, mStart, mLimit)) {
+            found = false;
+        }
+
+        if (found) {
+            break;
+        }
+    }
+
+    #ifdef USEARCH_DEBUG
+    if (getenv("USEARCH_DEBUG") != nullptr) {
+        printf("Target CEs [%d .. %d]\n", ceb.firstIx, ceb.limitIx);
+        int32_t  lastToPrint = ceb.limitIx+2;
+        for (int ii=ceb.firstIx; ii<lastToPrint; ii++) {
+            printf("%8x@%d ", ceb.get(ii)->ce, ceb.get(ii)->srcIndex);
+        }
+        printf("\n%s\n", found? "match found" : "no match");
+    }
+    #endif
+
+
+    if (U_FAILURE(*status)) {
+        found = false; 
+    }
+
+    if (found==false) {
+        mLimit = -1;
+        mStart = -1;
+    }
+
+    if (matchStart != nullptr) {
+        *matchStart= mStart;
+    }
+
+    if (matchLimit != nullptr) {
+        *matchLimit = mLimit;
+    }
+
+    return found;
+}
+
+U_CAPI UBool U_EXPORT2 usearch_searchBackwards(UStringSearch  *strsrch,
+                                                int32_t        startIdx,
+                                                int32_t        *matchStart,
+                                                int32_t        *matchLimit,
+                                                UErrorCode     *status)
+{
+    if (U_FAILURE(*status)) {
+        return false;
+    }
+
+
+#ifdef USEARCH_DEBUG
+    if (getenv("USEARCH_DEBUG") != nullptr) {
+        printf("Pattern CEs\n");
+        for (int ii=0; ii<strsrch->pattern.cesLength; ii++) {
+            printf(" %8x", strsrch->pattern.ces[ii]);
+        }
+        printf("\n");
+    }
+
+#endif
+    if(strsrch->pattern.cesLength == 0        ||
+       startIdx < 0                           ||
+       startIdx > strsrch->search->textLength ||
+       strsrch->pattern.ces == nullptr) {
+           *status = U_ILLEGAL_ARGUMENT_ERROR;
+           return false;
+    }
+
+    if (strsrch->pattern.pces == nullptr) {
+        initializePatternPCETable(strsrch, status);
+    }
+
+    CEIBuffer ceb(strsrch, status);
+    int32_t    targetIx = 0;
+
+    if (startIdx < strsrch->search->textLength) {
+        UBreakIterator *breakiterator = getBreakIterator(strsrch, *status);
+        if (U_FAILURE(*status)) {
+            return false;
+        }
+        int32_t next = ubrk_following(breakiterator, startIdx);
+
+        ucol_setOffset(strsrch->textIter, next, status);
+
+        for (targetIx = 0; ; targetIx += 1) {
+            if (ceb.getPrevious(targetIx)->lowIndex < startIdx) {
+                break;
+            }
+        }
+    } else {
+        ucol_setOffset(strsrch->textIter, startIdx, status);
+    }
+
+    if (U_FAILURE(*status)) {
+        return false;
+    }
+
+    const CEI *targetCEI = nullptr;
+    int32_t    patIx;
+    UBool      found;
+
+    int32_t  limitIx = targetIx;
+    int32_t  mStart = -1;
+    int32_t  mLimit = -1;
+    int32_t  minLimit;
+    int32_t  maxLimit;
+
+
+
+    for(targetIx = limitIx; ; targetIx += 1)
+    {
+        found = true;
+        const CEI *lastCEI  = ceb.getPrevious(targetIx);
+        if (lastCEI == nullptr) {
+            *status = U_INTERNAL_PROGRAM_ERROR;
+            found = false;
+             break;
+        }
+        int32_t targetIxOffset = 0;
+        for (patIx = strsrch->pattern.pcesLength - 1; patIx >= 0; patIx -= 1) {
+            int64_t patCE = strsrch->pattern.pces[patIx];
+
+            targetCEI = ceb.getPrevious(targetIx + strsrch->pattern.pcesLength - 1 - patIx + targetIxOffset);
+            UCompareCEsResult ceMatch = compareCE64s(targetCEI->ce, patCE, strsrch->search->elementComparisonType);
+            if ( ceMatch == U_CE_NO_MATCH ) {
+                found = false;
+                break;
+            } else if ( ceMatch > U_CE_NO_MATCH ) {
+                if ( ceMatch == U_CE_SKIP_TARG ) {
+                    patIx++;
+                    targetIxOffset++;
+                } else { 
+                    targetIxOffset--;
+                }
+            }
+        }
+
+        if (!found && ((targetCEI == nullptr) || (targetCEI->ce != UCOL_PROCESSED_NULLORDER))) {
+            continue;
+        }
+
+        if (!found) {
+            break;
+        }
+
+
+        const CEI *firstCEI = ceb.getPrevious(targetIx + strsrch->pattern.pcesLength - 1 + targetIxOffset);
+        mStart   = firstCEI->lowIndex;
+
+        if (!isBreakBoundary(strsrch, mStart, *status)) {
+            found = false;
+        }
+        if (U_FAILURE(*status)) {
+            break;
+        }
+
+        if (mStart == firstCEI->highIndex) {
+            found = false;
+        }
+
+
+        minLimit = lastCEI->lowIndex;
+
+        if (targetIx > 0) {
+
+            const CEI *nextCEI  = ceb.getPrevious(targetIx - 1);
+
+            if (nextCEI->lowIndex == nextCEI->highIndex && nextCEI->ce != UCOL_PROCESSED_NULLORDER) {
+                found = false;
+            }
+
+            mLimit = maxLimit = nextCEI->lowIndex;
+
+            UBool allowMidclusterMatch = false;
+            if (strsrch->search->text != nullptr && strsrch->search->textLength > maxLimit) {
+                allowMidclusterMatch =
+                        strsrch->search->breakIter == nullptr &&
+                        nextCEI != nullptr && (((nextCEI->ce) >> 32) & 0xFFFF0000UL) != 0 &&
+                        maxLimit >= lastCEI->highIndex && nextCEI->highIndex > maxLimit &&
+                        (strsrch->nfd->hasBoundaryBefore(codePointAt(*strsrch->search, maxLimit)) ||
+                            strsrch->nfd->hasBoundaryAfter(codePointBefore(*strsrch->search, maxLimit)));
+            }
+
+            if (minLimit < maxLimit) {
+                int32_t nba = nextBoundaryAfter(strsrch, minLimit, *status);
+                if (nba >= lastCEI->highIndex && (!allowMidclusterMatch || nba < maxLimit)) {
+                    mLimit = nba;
+                }
+            }
+
+            if (!allowMidclusterMatch) {
+                if (mLimit > maxLimit) {
+                    found = false;
+                }
+
+                if (!isBreakBoundary(strsrch, mLimit, *status)) {
+                    found = false;
+                }
+                if (U_FAILURE(*status)) {
+                    break;
+                }
+            }
+
+        } else {
+            int32_t nba = nextBoundaryAfter(strsrch, minLimit, *status);
+            mLimit = maxLimit = (nba > 0) && (startIdx > nba) ? nba : startIdx;
+        }
+
+    #ifdef USEARCH_DEBUG
+        if (getenv("USEARCH_DEBUG") != nullptr) {
+            printf("minLimit, maxLimit, mLimit = %d, %d, %d\n", minLimit, maxLimit, mLimit);
+        }
+    #endif
+
+
+        if (! checkIdentical(strsrch, mStart, mLimit)) {
+            found = false;
+        }
+
+        if (found) {
+            break;
+        }
+    }
+
+    #ifdef USEARCH_DEBUG
+    if (getenv("USEARCH_DEBUG") != nullptr) {
+        printf("Target CEs [%d .. %d]\n", ceb.firstIx, ceb.limitIx);
+        int32_t  lastToPrint = ceb.limitIx+2;
+        for (int ii=ceb.firstIx; ii<lastToPrint; ii++) {
+            printf("%8x@%d ", ceb.get(ii)->ce, ceb.get(ii)->srcIndex);
+        }
+        printf("\n%s\n", found? "match found" : "no match");
+    }
+    #endif
+
+
+    if (U_FAILURE(*status)) {
+        found = false; 
+    }
+
+    if (found==false) {
+        mLimit = -1;
+        mStart = -1;
+    }
+
+    if (matchStart != nullptr) {
+        *matchStart= mStart;
+    }
+
+    if (matchLimit != nullptr) {
+        *matchLimit = mLimit;
+    }
+
+    return found;
+}
+
+
+UBool usearch_handleNextExact(UStringSearch *strsrch, UErrorCode *status)
+{
+    if (U_FAILURE(*status)) {
+        setMatchNotFound(strsrch, *status);
+        return false;
+    }
+
+    int32_t textOffset = ucol_getOffset(strsrch->textIter);
+    int32_t start = -1;
+    int32_t end = -1;
+
+    if (usearch_search(strsrch, textOffset, &start, &end, status)) {
+        strsrch->search->matchedIndex  = start;
+        strsrch->search->matchedLength = end - start;
+        return true;
+    } else {
+        setMatchNotFound(strsrch, *status);
+        return false;
+    }
+}
+
+UBool usearch_handleNextCanonical(UStringSearch *strsrch, UErrorCode *status)
+{
+    if (U_FAILURE(*status)) {
+        setMatchNotFound(strsrch, *status);
+        return false;
+    }
+
+    int32_t textOffset = ucol_getOffset(strsrch->textIter);
+    int32_t start = -1;
+    int32_t end = -1;
+
+    if (usearch_search(strsrch, textOffset, &start, &end, status)) {
+        strsrch->search->matchedIndex  = start;
+        strsrch->search->matchedLength = end - start;
+        return true;
+    } else {
+        setMatchNotFound(strsrch, *status);
+        return false;
+    }
+}
+
+UBool usearch_handlePreviousExact(UStringSearch *strsrch, UErrorCode *status)
+{
+    if (U_FAILURE(*status)) {
+        setMatchNotFound(strsrch, *status);
+        return false;
+    }
+
+    int32_t textOffset;
+
+    if (strsrch->search->isOverlap) {
+        if (strsrch->search->matchedIndex != USEARCH_DONE) {
+            textOffset = strsrch->search->matchedIndex + strsrch->search->matchedLength - 1;
+        } else {
+            initializePatternPCETable(strsrch, status);
+            if (!initTextProcessedIter(strsrch, status)) {
+                setMatchNotFound(strsrch, *status);
+                return false;
+            }
+            for (int32_t nPCEs = 0; nPCEs < strsrch->pattern.pcesLength - 1; nPCEs++) {
+                int64_t pce = strsrch->textProcessedIter->nextProcessed(nullptr, nullptr, status);
+                if (pce == UCOL_PROCESSED_NULLORDER) {
+                    break;
+                }
+            }
+            if (U_FAILURE(*status)) {
+                setMatchNotFound(strsrch, *status);
+                return false;
+            }
+            textOffset = ucol_getOffset(strsrch->textIter);
+        }
+    } else {
+        textOffset = ucol_getOffset(strsrch->textIter);
+    }
+
+    int32_t start = -1;
+    int32_t end = -1;
+
+    if (usearch_searchBackwards(strsrch, textOffset, &start, &end, status)) {
+        strsrch->search->matchedIndex = start;
+        strsrch->search->matchedLength = end - start;
+        return true;
+    } else {
+        setMatchNotFound(strsrch, *status);
+        return false;
+    }
+}
+
+UBool usearch_handlePreviousCanonical(UStringSearch *strsrch,
+                                      UErrorCode    *status)
+{
+    if (U_FAILURE(*status)) {
+        setMatchNotFound(strsrch, *status);
+        return false;
+    }
+
+    int32_t textOffset;
+
+    if (strsrch->search->isOverlap) {
+        if (strsrch->search->matchedIndex != USEARCH_DONE) {
+            textOffset = strsrch->search->matchedIndex + strsrch->search->matchedLength - 1;
+        } else {
+            initializePatternPCETable(strsrch, status);
+            if (!initTextProcessedIter(strsrch, status)) {
+                setMatchNotFound(strsrch, *status);
+                return false;
+            }
+            for (int32_t nPCEs = 0; nPCEs < strsrch->pattern.pcesLength - 1; nPCEs++) {
+                int64_t pce = strsrch->textProcessedIter->nextProcessed(nullptr, nullptr, status);
+                if (pce == UCOL_PROCESSED_NULLORDER) {
+                    break;
+                }
+            }
+            if (U_FAILURE(*status)) {
+                setMatchNotFound(strsrch, *status);
+                return false;
+            }
+            textOffset = ucol_getOffset(strsrch->textIter);
+        }
+    } else {
+        textOffset = ucol_getOffset(strsrch->textIter);
+    }
+
+    int32_t start = -1;
+    int32_t end = -1;
+
+    if (usearch_searchBackwards(strsrch, textOffset, &start, &end, status)) {
+        strsrch->search->matchedIndex = start;
+        strsrch->search->matchedLength = end - start;
+        return true;
+    } else {
+        setMatchNotFound(strsrch, *status);
+        return false;
+    }
+}
+
+#endif /* #if !UCONFIG_NO_COLLATION */

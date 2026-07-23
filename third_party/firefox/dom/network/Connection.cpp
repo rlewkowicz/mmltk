@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Connection.h"
+
+#include "ConnectionMainThread.h"
+#include "ConnectionWorker.h"
+#include "Constants.h"
+#include "mozilla/dom/WorkerPrivate.h"
+
+#define CHANGE_EVENT_NAME u"typechange"_ns
+
+namespace mozilla::dom::network {
+
+NS_IMPL_ISUPPORTS_INHERITED0(dom::network::Connection, DOMEventTargetHelper)
+
+Connection::Connection(nsPIDOMWindowInner* aWindow,
+                       bool aShouldResistFingerprinting)
+    : DOMEventTargetHelper(aWindow),
+      mShouldResistFingerprinting(aShouldResistFingerprinting),
+      mType(static_cast<ConnectionType>(kDefaultType)),
+      mIsWifi(kDefaultIsWifi),
+      mDHCPGateway(kDefaultDHCPGateway),
+      mBeenShutDown(false) {}
+
+Connection::~Connection() {
+  NS_ASSERT_OWNINGTHREAD(Connection);
+  MOZ_ASSERT(mBeenShutDown);
+}
+
+void Connection::Shutdown() {
+  NS_ASSERT_OWNINGTHREAD(Connection);
+
+  if (mBeenShutDown) {
+    return;
+  }
+
+  mBeenShutDown = true;
+  ShutdownInternal();
+}
+
+JSObject* Connection::WrapObject(JSContext* aCx,
+                                 JS::Handle<JSObject*> aGivenProto) {
+  return NetworkInformation_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void Connection::Update(ConnectionType aType, bool aIsWifi,
+                        uint32_t aDHCPGateway, bool aNotify) {
+  NS_ASSERT_OWNINGTHREAD(Connection);
+
+  ConnectionType previousType = mType;
+
+  mType = aType;
+  mIsWifi = aIsWifi;
+  mDHCPGateway = aDHCPGateway;
+
+  if (aNotify && previousType != aType && !mShouldResistFingerprinting) {
+    DispatchTrustedEvent(CHANGE_EVENT_NAME);
+  }
+}
+
+already_AddRefed<Connection> Connection::CreateForWindow(
+    nsPIDOMWindowInner* aWindow, bool aShouldResistFingerprinting) {
+  MOZ_ASSERT(aWindow);
+  return MakeAndAddRef<ConnectionMainThread>(aWindow,
+                                             aShouldResistFingerprinting);
+}
+
+already_AddRefed<Connection> Connection::CreateForWorker(
+    WorkerPrivate* aWorkerPrivate, ErrorResult& aRv) {
+  MOZ_ASSERT(aWorkerPrivate);
+  aWorkerPrivate->AssertIsOnWorkerThread();
+  return ConnectionWorker::Create(aWorkerPrivate, aRv);
+}
+
+}  

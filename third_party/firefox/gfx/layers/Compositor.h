@@ -1,0 +1,199 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_COMPOSITOR_H
+#define MOZILLA_GFX_COMPOSITOR_H
+
+#include "Units.h"                           // for ScreenPoint
+#include "mozilla/Assertions.h"              // for MOZ_ASSERT, etc
+#include "mozilla/gfx/2D.h"                  // for DrawTarget
+#include "mozilla/gfx/MatrixFwd.h"           // for Matrix, Matrix4x4
+#include "mozilla/gfx/Point.h"               // for IntSize, Point
+#include "mozilla/gfx/Polygon.h"             // for Polygon
+#include "mozilla/gfx/Rect.h"                // for Rect, IntRect
+#include "mozilla/gfx/Types.h"               // for Float
+#include "mozilla/gfx/Triangle.h"            // for Triangle, TexturedTriangle
+#include "mozilla/layers/CompositorTypes.h"  // for DiagnosticTypes, etc
+#include "mozilla/layers/LayersTypes.h"      // for LayersBackend
+#include "mozilla/layers/SurfacePool.h"      // for SurfacePoolHandle
+#include "mozilla/layers/TextureSourceProvider.h"
+#include "mozilla/widget/CompositorWidget.h"
+#include "nsISupportsImpl.h"  // for MOZ_COUNT_CTOR, etc
+#include "nsRegion.h"
+#include "mozilla/WidgetUtils.h"
+
+
+class nsIWidget;
+
+namespace mozilla {
+namespace gfx {
+class DrawTarget;
+class DataSourceSurface;
+}  
+
+namespace layers {
+
+struct Effect;
+struct EffectChain;
+class Image;
+class Layer;
+class TextureSource;
+class DataTextureSource;
+class CompositingRenderTarget;
+class CompositorBridgeParent;
+class NativeLayer;
+class CompositorOGL;
+class CompositorD3D11;
+class TextureReadLock;
+struct GPUStats;
+class AsyncReadbackBuffer;
+class RecordedFrame;
+
+enum SurfaceInitMode { INIT_MODE_NONE, INIT_MODE_CLEAR };
+
+class Compositor : public TextureSourceProvider {
+ protected:
+  virtual ~Compositor();
+
+ public:
+  explicit Compositor(widget::CompositorWidget* aWidget);
+
+  bool IsValid() const override { return true; }
+
+  virtual bool Initialize(nsCString* const out_failureReason) = 0;
+  void Destroy() override;
+  bool IsDestroyed() const { return mIsDestroyed; }
+
+  virtual already_AddRefed<CompositingRenderTarget> CreateRenderTarget(
+      const gfx::IntRect& aRect, SurfaceInitMode aInit) = 0;
+
+  virtual bool ReadbackRenderTarget(CompositingRenderTarget* aSource,
+                                    AsyncReadbackBuffer* aDest) = 0;
+
+  virtual already_AddRefed<AsyncReadbackBuffer> CreateAsyncReadbackBuffer(
+      const gfx::IntSize& aSize) = 0;
+
+  virtual bool BlitRenderTarget(CompositingRenderTarget* aSource,
+                                const gfx::IntSize& aSourceSize,
+                                const gfx::IntSize& aDestSize) = 0;
+
+  virtual void SetRenderTarget(CompositingRenderTarget* aSurface) = 0;
+
+  virtual already_AddRefed<CompositingRenderTarget> GetCurrentRenderTarget()
+      const = 0;
+
+  virtual already_AddRefed<CompositingRenderTarget> GetWindowRenderTarget()
+      const = 0;
+
+  virtual void SetDestinationSurfaceSize(const gfx::IntSize& aSize) = 0;
+
+  virtual void DrawQuad(const gfx::Rect& aRect, const gfx::IntRect& aClipRect,
+                        const EffectChain& aEffectChain, gfx::Float aOpacity,
+                        const gfx::Matrix4x4& aTransform,
+                        const gfx::Rect& aVisibleRect) = 0;
+
+  void SetClearColor(const gfx::DeviceColor& aColor) { mClearColor = aColor; }
+
+  virtual Maybe<gfx::IntRect> BeginFrameForWindow(
+      const nsIntRegion& aInvalidRegion, const Maybe<gfx::IntRect>& aClipRect,
+      const gfx::IntRect& aRenderBounds, const nsIntRegion& aOpaqueRegion) = 0;
+
+  virtual void EndFrame();
+
+  virtual void CancelFrame(bool aNeedFlush = true) {}
+
+#ifdef MOZ_DUMP_PAINTING
+  virtual const char* Name() const = 0;
+#endif  // MOZ_DUMP_PAINTING
+
+  virtual CompositorD3D11* AsCompositorD3D11() { return nullptr; }
+
+  Compositor* AsCompositor() override { return this; }
+
+  TimeStamp GetLastCompositionEndTime() const override {
+    return mLastCompositionEndTime;
+  }
+
+  virtual void Pause() {}
+  virtual bool Resume() { return true; }
+
+  widget::CompositorWidget* GetWidget() const { return mWidget; }
+
+  virtual void RequestAllowFrameRecording(bool aWillRecord) {
+    mRecordFrames = aWillRecord;
+  }
+
+ protected:
+  bool ShouldRecordFrames() const;
+
+  TimeStamp mLastCompositionEndTime;
+
+  widget::CompositorWidget* mWidget;
+
+  bool mIsDestroyed;
+
+  gfx::DeviceColor mClearColor;
+
+  bool mRecordFrames = false;
+
+ private:
+  static LayersBackend sBackend;
+};
+
+typedef gfx::Rect decomposedRectArrayT[4];
+size_t DecomposeIntoNoRepeatRects(const gfx::Rect& aRect,
+                                  const gfx::Rect& aTexCoordRect,
+                                  decomposedRectArrayT* aLayerRects,
+                                  decomposedRectArrayT* aTextureRects);
+
+static inline bool BlendOpIsMixBlendMode(gfx::CompositionOp aOp) {
+  switch (aOp) {
+    case gfx::CompositionOp::OP_MULTIPLY:
+    case gfx::CompositionOp::OP_SCREEN:
+    case gfx::CompositionOp::OP_OVERLAY:
+    case gfx::CompositionOp::OP_DARKEN:
+    case gfx::CompositionOp::OP_LIGHTEN:
+    case gfx::CompositionOp::OP_COLOR_DODGE:
+    case gfx::CompositionOp::OP_COLOR_BURN:
+    case gfx::CompositionOp::OP_HARD_LIGHT:
+    case gfx::CompositionOp::OP_SOFT_LIGHT:
+    case gfx::CompositionOp::OP_DIFFERENCE:
+    case gfx::CompositionOp::OP_EXCLUSION:
+    case gfx::CompositionOp::OP_HUE:
+    case gfx::CompositionOp::OP_SATURATION:
+    case gfx::CompositionOp::OP_COLOR:
+    case gfx::CompositionOp::OP_LUMINOSITY:
+      return true;
+    default:
+      return false;
+  }
+}
+
+class AsyncReadbackBuffer {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(AsyncReadbackBuffer)
+
+  gfx::IntSize GetSize() const { return mSize; }
+  virtual bool MapAndCopyInto(gfx::DataSourceSurface* aSurface,
+                              const gfx::IntSize& aReadSize) const = 0;
+
+ protected:
+  explicit AsyncReadbackBuffer(const gfx::IntSize& aSize) : mSize(aSize) {}
+  virtual ~AsyncReadbackBuffer() = default;
+
+  gfx::IntSize mSize;
+};
+
+struct TexturedVertex {
+  float position[2];
+  float texCoords[2];
+};
+
+nsTArray<TexturedVertex> TexturedTrianglesToVertexArray(
+    const nsTArray<gfx::TexturedTriangle>& aTriangles);
+
+}  
+}  
+
+#endif /* MOZILLA_GFX_COMPOSITOR_H */

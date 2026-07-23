@@ -1,0 +1,137 @@
+/*
+ * Copyright © 2010  Red Hat, Inc.
+ * Copyright © 2012  Google, Inc.
+ *
+ *  This is part of HarfBuzz, a text shaping library.
+ *
+ * Permission is hereby granted, without written agreement and without
+ * license or royalty fees, to use, copy, modify, and distribute this
+ * software and its documentation for any purpose, provided that the
+ * above copyright notice and the following two paragraphs appear in
+ * all copies of this software.
+ *
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE TO ANY PARTY FOR
+ * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES
+ * ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN
+ * IF THE COPYRIGHT HOLDER HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ *
+ * THE COPYRIGHT HOLDER SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING,
+ * BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+ * FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ * ON AN "AS IS" BASIS, AND THE COPYRIGHT HOLDER HAS NO OBLIGATION TO
+ * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ *
+ * Red Hat Author(s): Behdad Esfahbod
+ * Google Author(s): Behdad Esfahbod
+ */
+
+#ifndef HB_OT_HEAD_TABLE_HH
+#define HB_OT_HEAD_TABLE_HH
+
+#include "hb-open-type.hh"
+
+#define HB_OT_TAG_head HB_TAG('h','e','a','d')
+
+
+namespace OT {
+
+
+struct head
+{
+  friend struct OpenTypeOffsetTable;
+
+  static constexpr hb_tag_t tableTag = HB_OT_TAG_head;
+
+  unsigned int get_upem () const
+  {
+    unsigned int upem = unitsPerEm;
+    return 16 <= upem && upem <= 16384 ? upem : 1000;
+  }
+
+  bool serialize (hb_serialize_context_t *c) const
+  {
+    TRACE_SERIALIZE (this);
+    return_trace ((bool) c->embed (this));
+  }
+
+  bool subset (hb_subset_context_t *c) const
+  {
+    TRACE_SUBSET (this);
+    head *out = c->serializer->embed (this);
+    if (unlikely (!out)) return_trace (false);
+
+    if (c->plan->normalized_coords)
+    {
+      if (unlikely (!c->serializer->check_assign (out->xMin, c->plan->head_maxp_info.xMin,
+                                                  HB_SERIALIZE_ERROR_INT_OVERFLOW)))
+        return_trace (false);
+      if (unlikely (!c->serializer->check_assign (out->xMax, c->plan->head_maxp_info.xMax,
+                                                  HB_SERIALIZE_ERROR_INT_OVERFLOW)))
+        return_trace (false);
+      if (unlikely (!c->serializer->check_assign (out->yMin, c->plan->head_maxp_info.yMin,
+                                                  HB_SERIALIZE_ERROR_INT_OVERFLOW)))
+        return_trace (false);
+      if (unlikely (!c->serializer->check_assign (out->yMax, c->plan->head_maxp_info.yMax,
+                                                  HB_SERIALIZE_ERROR_INT_OVERFLOW)))
+        return_trace (false);
+    }
+    return_trace (true);
+  }
+
+  enum mac_style_flag_t {
+    BOLD	= 1u<<0,
+    ITALIC	= 1u<<1,
+    UNDERLINE	= 1u<<2,
+    OUTLINE	= 1u<<3,
+    SHADOW	= 1u<<4,
+    CONDENSED	= 1u<<5,
+    EXPANDED	= 1u<<6,
+  };
+
+  bool is_bold () const      { return macStyle & BOLD; }
+  bool is_italic () const    { return macStyle & ITALIC; }
+  bool is_condensed () const { return macStyle & CONDENSED; }
+  bool is_expanded () const  { return macStyle & EXPANDED; }
+
+  bool sanitize (hb_sanitize_context_t *c) const
+  {
+    TRACE_SANITIZE (this);
+    return_trace (c->check_struct (this) &&
+		  hb_barrier () &&
+		  version.major == 1 &&
+		  magicNumber == 0x5F0F3CF5u);
+  }
+
+  protected:
+  FixedVersion<>version;		
+  FixedVersion<>fontRevision;		
+  HBUINT32	checkSumAdjustment;	
+  HBUINT32	magicNumber;		
+  public:
+  HBUINT16	flags;			
+  protected:
+  HBUINT16	unitsPerEm;		
+  LONGDATETIME	created;		
+  LONGDATETIME	modified;		
+  public:
+  HBINT16	xMin;			
+  HBINT16	yMin;			
+  HBINT16	xMax;			
+  HBINT16	yMax;			
+  protected:
+  HBUINT16	macStyle;		
+  HBUINT16	lowestRecPPEM;		
+  HBINT16	fontDirectionHint;	
+  public:
+  HBUINT16	indexToLocFormat;	
+  HBUINT16	glyphDataFormat;	
+
+  DEFINE_SIZE_STATIC (54);
+};
+
+
+} 
+
+
+#endif /* HB_OT_HEAD_TABLE_HH */

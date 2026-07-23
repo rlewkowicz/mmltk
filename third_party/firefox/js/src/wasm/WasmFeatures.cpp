@@ -1,0 +1,199 @@
+/*
+ * Copyright 2016 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "wasm/WasmFeatures.h"
+
+#include <bit>
+
+#include "jit/AtomicOperations.h"
+#include "jit/JitContext.h"
+#include "jit/JitOptions.h"
+#include "js/Prefs.h"
+#include "util/StringBuilder.h"
+#include "vm/JSContext.h"
+#include "vm/Realm.h"
+#include "vm/StringType.h"
+#include "wasm/WasmBaselineCompile.h"
+#include "wasm/WasmIonCompile.h"
+#include "wasm/WasmSignalHandlers.h"
+
+using namespace js;
+using namespace js::wasm;
+using namespace js::jit;
+
+static inline bool WasmThreadsFlag(JSContext* cx) {
+  return cx->realm() &&
+         cx->realm()->creationOptions().getSharedMemoryAndAtomicsEnabled();
+}
+
+#define WASM_FEATURE(NAME, ...) \
+  static inline bool Wasm##NAME##Flag(JSContext* cx);
+JS_FOR_WASM_FEATURES(WASM_FEATURE);
+#undef WASM_FEATURE
+
+#define WASM_FEATURE(NAME, LOWER_NAME, COMPILE_PRED, COMPILER_PRED, FLAG_PRED, \
+                     FLAG_FORCE_ON, PREF)                                      \
+  static inline bool Wasm##NAME##Flag(JSContext* cx) {                         \
+    if (!(COMPILE_PRED)) {                                                     \
+      return false;                                                            \
+    }                                                                          \
+    return ((FLAG_PRED) && JS::Prefs::wasm_##PREF()) || (FLAG_FORCE_ON);       \
+  }
+JS_FOR_WASM_FEATURES(WASM_FEATURE);
+#undef WASM_FEATURE
+
+static inline bool WasmDebuggerActive(JSContext* cx) {
+  return cx->realm() && cx->realm()->debuggerObservesWasm();
+}
+
+
+
+bool wasm::BaselineAvailable(JSContext* cx) {
+  if (!cx->options().wasmBaseline() || !BaselinePlatformSupport()) {
+    return false;
+  }
+  bool isDisabled = false;
+  MOZ_ALWAYS_TRUE(BaselineDisabledByFeatures(cx, &isDisabled));
+  return !isDisabled;
+}
+
+bool wasm::IonAvailable(JSContext* cx) {
+  if (!cx->options().wasmIon() || !IonPlatformSupport()) {
+    return false;
+  }
+  bool isDisabled = false;
+  MOZ_ALWAYS_TRUE(IonDisabledByFeatures(cx, &isDisabled));
+  return !isDisabled;
+}
+
+template <size_t ArrayLength>
+static inline bool Append(JSStringBuilder* reason, const char (&s)[ArrayLength],
+                          char* sep) {
+  if ((*sep && !reason->append(*sep)) || !reason->append(s)) {
+    return false;
+  }
+  *sep = ',';
+  return true;
+}
+
+bool wasm::BaselineDisabledByFeatures(JSContext* cx, bool* isDisabled,
+                                      JSStringBuilder* reason) {
+  bool testSerialization = WasmTestSerializationFlag(cx);
+  if (reason) {
+    char sep = 0;
+    if (testSerialization && !Append(reason, "testSerialization", &sep)) {
+      return false;
+    }
+  }
+  *isDisabled = testSerialization;
+  return true;
+}
+
+bool wasm::IonDisabledByFeatures(JSContext* cx, bool* isDisabled,
+                                 JSStringBuilder* reason) {
+  bool debug = WasmDebuggerActive(cx);
+  bool customPageSizes = WasmCustomPageSizesFlag(cx);
+  if (reason) {
+    char sep = 0;
+    if (debug && !Append(reason, "debug", &sep)) {
+      return false;
+    }
+    if (customPageSizes && !Append(reason, "custom-page-sizes", &sep)) {
+      return false;
+    }
+  }
+  *isDisabled = debug || customPageSizes;
+  return true;
+}
+
+bool wasm::AnyCompilerAvailable(JSContext* cx) {
+  return wasm::BaselineAvailable(cx) || wasm::IonAvailable(cx);
+}
+
+
+#define WASM_FEATURE(NAME, LOWER_NAME, COMPILE_PRED, COMPILER_PRED, ...) \
+  bool wasm::NAME##Available(JSContext* cx) {                            \
+    return Wasm##NAME##Flag(cx) && (COMPILER_PRED);                      \
+  }
+JS_FOR_WASM_FEATURES(WASM_FEATURE)
+#undef WASM_FEATURE
+
+bool wasm::IsPrivilegedContext(JSContext* cx) {
+  return cx->realm() && cx->realm()->principals() &&
+         cx->realm()->principals()->isSystemPrincipal();
+}
+
+bool wasm::SimdAvailable(JSContext* cx) {
+  return js::jit::JitSupportsWasmSimd();
+}
+
+bool wasm::ThreadsAvailable(JSContext* cx) {
+  return WasmThreadsFlag(cx) && AnyCompilerAvailable(cx);
+}
+
+bool wasm::HasPlatformSupport() {
+  if constexpr (std::endian::native != std::endian::little) {
+    return false;
+  }
+
+  if (!HasJitBackend()) {
+    return false;
+  }
+
+  if (gc::SystemPageSize() > wasm::StandardPageSizeBytes) {
+    return false;
+  }
+
+  if (!JitOptions.supportsUnalignedAccesses) {
+    return false;
+  }
+
+  if (!jit::JitSupportsAtomics()) {
+    return false;
+  }
+
+  if (!jit::AtomicOperations::isLockfree8()) {
+    return false;
+  }
+
+  return BaselinePlatformSupport() || IonPlatformSupport();
+}
+
+bool wasm::HasSupport(JSContext* cx) {
+  bool prefEnabled = cx->options().wasm();
+  if (MOZ_UNLIKELY(!prefEnabled)) {
+    prefEnabled = cx->options().wasmForTrustedPrinciples() && cx->realm() &&
+                  cx->realm()->principals() &&
+                  cx->realm()->principals()->isSystemPrincipal();
+  }
+  return prefEnabled && HasPlatformSupport() && EnsureFullSignalHandlers(cx);
+}
+
+bool wasm::StreamingCompilationAvailable(JSContext* cx) {
+  return HasSupport(cx) && AnyCompilerAvailable(cx) &&
+         cx->runtime()->offThreadPromiseState.ref().initialized() &&
+         CanUseExtraThreads() && cx->runtime()->consumeStreamCallback &&
+         cx->runtime()->reportStreamErrorCallback;
+}
+
+bool wasm::CodeCachingAvailable(JSContext* cx) {
+
+  if (JS::Prefs::wasm_lazy_tiering()) {
+    return false;
+  }
+
+  return StreamingCompilationAvailable(cx) && IonAvailable(cx);
+}

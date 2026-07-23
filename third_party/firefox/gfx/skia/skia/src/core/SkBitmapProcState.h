@@ -1,0 +1,175 @@
+/*
+ * Copyright 2007 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkBitmapProcState_DEFINED)
+#define SkBitmapProcState_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPixmap.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkSamplingOptions.h"
+#include "include/core/SkScalar.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkCPUTypes.h"
+#include "include/private/base/SkDebug.h"
+#include "include/private/base/SkFixed.h"
+#include "src/base/SkArenaAlloc.h"
+
+#include <cstddef>
+#include <cstdint>
+
+class SkImage_Base;
+enum class SkTileMode;
+
+struct SkBitmapProcState {
+    SkBitmapProcState(const SkImage_Base* image, SkTileMode tmx, SkTileMode tmy);
+
+    bool setup(const SkMatrix& inv, SkColor color, const SkSamplingOptions& sampling) {
+        return this->init(inv, color, sampling)
+            && this->chooseProcs();
+    }
+
+    using ShaderProc32 = void (*)(const void* ctx, int x, int y, SkPMColor[], int count);
+
+    using MatrixProc = void (*)(const SkBitmapProcState&,
+                                uint32_t bitmapXY[],
+                                int count,
+                                int x, int y);
+
+    using SampleProc32 = void (*)(const SkBitmapProcState&,
+                                  const uint32_t[],
+                                  int count,
+                                  SkPMColor colors[]);
+
+    const SkImage_Base*     fImage;
+
+    SkPixmap                fPixmap;
+    SkMatrix                fInvMatrix;         
+    SkAlpha                 fPaintAlpha;
+    SkTileMode              fTileModeX;
+    SkTileMode              fTileModeY;
+    bool                    fBilerp;
+
+    SkFixed3232             fInvSx;
+    SkFixed3232             fInvKy;
+
+    SkFixed                 fFilterOneX;
+    SkFixed                 fFilterOneY;
+
+    uint16_t                fAlphaScale;        
+
+    int maxCountForBufferSize(size_t bufferSize) const;
+
+    ShaderProc32 getShaderProc32() const { return fShaderProc32; }
+
+#if defined(SK_DEBUG)
+    MatrixProc getMatrixProc() const;
+#else
+    MatrixProc getMatrixProc() const { return fMatrixProc; }
+#endif
+    SampleProc32 getSampleProc32() const { return fSampleProc32; }
+
+private:
+    static constexpr size_t kBMStateSize = 136;
+    SkSTArenaAlloc<kBMStateSize> fAlloc;
+
+    ShaderProc32        fShaderProc32;      
+    MatrixProc          fMatrixProc;        
+    SampleProc32        fSampleProc32;      
+
+    bool init(const SkMatrix& inverse, SkAlpha, const SkSamplingOptions&);
+    bool chooseProcs();
+    MatrixProc chooseMatrixProc(bool trivial_matrix);
+    ShaderProc32 chooseShaderProc32();
+
+    bool setupForTranslate();
+
+#if defined(SK_DEBUG)
+    static void DebugMatrixProc(const SkBitmapProcState&,
+                                uint32_t[], int count, int x, int y);
+#endif
+};
+
+#if defined(SK_CPU_BENDIAN)
+    #define PACK_TWO_SHORTS(pri, sec) ((pri) << 16 | (sec))
+    #define UNPACK_PRIMARY_SHORT(packed)    ((uint32_t)(packed) >> 16)
+    #define UNPACK_SECONDARY_SHORT(packed)  ((packed) & 0xFFFF)
+#else
+    #define PACK_TWO_SHORTS(pri, sec) ((pri) | ((sec) << 16))
+    #define UNPACK_PRIMARY_SHORT(packed)    ((packed) & 0xFFFF)
+    #define UNPACK_SECONDARY_SHORT(packed)  ((uint32_t)(packed) >> 16)
+#endif
+
+#if defined(SK_DEBUG)
+    static inline uint32_t pack_two_shorts(U16CPU pri, U16CPU sec) {
+        SkASSERT((uint16_t)pri == pri);
+        SkASSERT((uint16_t)sec == sec);
+        return PACK_TWO_SHORTS(pri, sec);
+    }
+#else
+    #define pack_two_shorts(pri, sec)   PACK_TWO_SHORTS(pri, sec)
+#endif
+
+class SkBitmapProcStateAutoMapper {
+public:
+    SkBitmapProcStateAutoMapper(const SkBitmapProcState& s, int x, int y,
+                                SkPoint* scalarPoint = nullptr) {
+        SkPoint pt = s.fInvMatrix.mapPoint({
+            SkIntToScalar(x) + SK_ScalarHalf,
+            SkIntToScalar(y) + SK_ScalarHalf,
+        });
+
+        SkFixed biasX = 0, biasY = 0;
+        if (s.fBilerp) {
+            biasX = s.fFilterOneX >> 1;
+            biasY = s.fFilterOneY >> 1;
+        } else {
+            biasX = 1;
+            biasY = 1;
+        }
+
+        fX = (SkFixed3232)((uint64_t)SkScalarToFixed3232(pt.x()) -
+                           (uint64_t)SkFixedToFixed3232(biasX));
+        fY = (SkFixed3232)((uint64_t)SkScalarToFixed3232(pt.y()) -
+                           (uint64_t)SkFixedToFixed3232(biasY));
+
+        if (scalarPoint) {
+            scalarPoint->set(pt.x() - SkFixedToScalar(biasX),
+                             pt.y() - SkFixedToScalar(biasY));
+        }
+    }
+
+    SkFixed3232 fixed3232X() const { return fX; }
+    SkFixed3232 fixed3232Y() const { return fY; }
+
+    SkFixed fixedX() const { return SkFixed3232ToFixed(fX); }
+    SkFixed fixedY() const { return SkFixed3232ToFixed(fY); }
+
+    int intX() const { return SkFixed3232ToInt(fX); }
+    int intY() const { return SkFixed3232ToInt(fY); }
+
+private:
+    SkFixed3232 fX, fY;
+};
+
+namespace sktests {
+    uint32_t pack_clamp(SkFixed f, unsigned max);
+    uint32_t pack_repeat(SkFixed f, unsigned max, size_t width);
+    uint32_t pack_mirror(SkFixed f, unsigned max, size_t width);
+}
+
+namespace SkOpts {
+    extern void (*S32_alpha_D32_filter_DX)(const SkBitmapProcState&,
+                                           const uint32_t* xy, int count, SkPMColor*);
+    extern void (*S32_alpha_D32_filter_DXDY)(const SkBitmapProcState&,
+                                             const uint32_t* xy, int count, SkPMColor*);
+
+    void Init_BitmapProcState();
+}  
+
+#endif

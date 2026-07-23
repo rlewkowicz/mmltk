@@ -1,0 +1,399 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkStream_DEFINED)
+#define SkStream_DEFINED
+
+#include "include/core/SkData.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkCPUTypes.h"
+#include "include/private/base/SkTo.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <utility>
+#include <vector>
+
+class SkStreamAsset;
+
+class SK_API SkStream {
+public:
+    virtual ~SkStream() {}
+    SkStream() {}
+
+    static std::unique_ptr<SkStreamAsset> MakeFromFile(const char path[]);
+
+    virtual size_t read(void* buffer, size_t size) = 0;
+
+    size_t skip(size_t size) {
+        return this->read(nullptr, size);
+    }
+
+    virtual size_t peek(void* , size_t ) const { return 0; }
+
+    virtual bool isAtEnd() const = 0;
+
+    [[nodiscard]] bool readS8(int8_t*);
+    [[nodiscard]] bool readS16(int16_t*);
+    [[nodiscard]] bool readS32(int32_t*);
+    [[nodiscard]] bool readS64(int64_t*);
+
+    [[nodiscard]] bool readU8(uint8_t* i)   { return this->readS8((int8_t*)i); }
+    [[nodiscard]] bool readU16(uint16_t* i) { return this->readS16((int16_t*)i); }
+    [[nodiscard]] bool readU32(uint32_t* i) { return this->readS32((int32_t*)i); }
+    [[nodiscard]] bool readU64(uint64_t* i) { return this->readS64((int64_t*)i); }
+
+    [[nodiscard]] bool readBool(bool* b) {
+        uint8_t i;
+        if (!this->readU8(&i)) { return false; }
+        *b = (i != 0);
+        return true;
+    }
+    [[nodiscard]] bool readScalar(SkScalar*);
+    [[nodiscard]] bool readPackedUInt(size_t*);
+
+    virtual bool rewind() { return false; }
+
+    std::unique_ptr<SkStream> duplicate() const {
+        return std::unique_ptr<SkStream>(this->onDuplicate());
+    }
+    std::unique_ptr<SkStream> fork() const {
+        return std::unique_ptr<SkStream>(this->onFork());
+    }
+
+    virtual bool hasPosition() const { return false; }
+    virtual size_t getPosition() const { return 0; }
+
+    virtual bool seek(size_t ) { return false; }
+
+    virtual bool move(long ) { return false; }
+
+    virtual bool hasLength() const { return false; }
+    virtual size_t getLength() const { return 0; }
+
+    virtual const void* getMemoryBase() { return nullptr; }
+    virtual sk_sp<const SkData> getData() const { return nullptr; }
+
+private:
+    virtual SkStream* onDuplicate() const { return nullptr; }
+    virtual SkStream* onFork() const { return nullptr; }
+
+    SkStream(SkStream&&) = delete;
+    SkStream(const SkStream&) = delete;
+    SkStream& operator=(SkStream&&) = delete;
+    SkStream& operator=(const SkStream&) = delete;
+};
+
+class SK_API SkStreamRewindable : public SkStream {
+public:
+    bool rewind() override = 0;
+    std::unique_ptr<SkStreamRewindable> duplicate() const {
+        return std::unique_ptr<SkStreamRewindable>(this->onDuplicate());
+    }
+private:
+    SkStreamRewindable* onDuplicate() const override = 0;
+};
+
+class SK_API SkStreamSeekable : public SkStreamRewindable {
+public:
+    std::unique_ptr<SkStreamSeekable> duplicate() const {
+        return std::unique_ptr<SkStreamSeekable>(this->onDuplicate());
+    }
+
+    bool hasPosition() const override { return true; }
+    size_t getPosition() const override = 0;
+    bool seek(size_t position) override = 0;
+    bool move(long offset) override = 0;
+
+    std::unique_ptr<SkStreamSeekable> fork() const {
+        return std::unique_ptr<SkStreamSeekable>(this->onFork());
+    }
+private:
+    SkStreamSeekable* onDuplicate() const override = 0;
+    SkStreamSeekable* onFork() const override = 0;
+};
+
+class SK_API SkStreamAsset : public SkStreamSeekable {
+public:
+    bool hasLength() const override { return true; }
+    size_t getLength() const override = 0;
+
+    std::unique_ptr<SkStreamAsset> duplicate() const {
+        return std::unique_ptr<SkStreamAsset>(this->onDuplicate());
+    }
+    std::unique_ptr<SkStreamAsset> fork() const {
+        return std::unique_ptr<SkStreamAsset>(this->onFork());
+    }
+private:
+    SkStreamAsset* onDuplicate() const override = 0;
+    SkStreamAsset* onFork() const override = 0;
+};
+
+class SK_API SkStreamMemory : public SkStreamAsset {
+public:
+    const void* getMemoryBase() override = 0;
+
+    std::unique_ptr<SkStreamMemory> duplicate() const {
+        return std::unique_ptr<SkStreamMemory>(this->onDuplicate());
+    }
+    std::unique_ptr<SkStreamMemory> fork() const {
+        return std::unique_ptr<SkStreamMemory>(this->onFork());
+    }
+private:
+    SkStreamMemory* onDuplicate() const override = 0;
+    SkStreamMemory* onFork() const override = 0;
+};
+
+class SK_API SkWStream {
+public:
+    virtual ~SkWStream();
+    SkWStream() {}
+
+    virtual bool write(const void* buffer, size_t size) = 0;
+    virtual void flush();
+
+    virtual size_t bytesWritten() const = 0;
+
+
+    bool write8(U8CPU value)   {
+        uint8_t v = SkToU8(value);
+        return this->write(&v, 1);
+    }
+    bool write16(U16CPU value) {
+        uint16_t v = SkToU16(value);
+        return this->write(&v, 2);
+    }
+    bool write32(uint32_t value) {
+        return this->write(&value, 4);
+    }
+    bool write64(uint64_t value) {
+        return this->write(&value, 8);
+    }
+
+    bool writeText(const char text[]) {
+        SkASSERT(text);
+        return this->write(text, std::strlen(text));
+    }
+
+    bool newline() { return this->write("\n", std::strlen("\n")); }
+
+    bool writeDecAsText(int32_t);
+    bool writeBigDecAsText(int64_t, int minDigits = 0);
+    bool writeHexAsText(uint32_t, int minDigits = 0);
+    bool writeScalarAsText(SkScalar);
+
+    bool writeBool(bool v) { return this->write8(v); }
+    bool writeScalar(SkScalar);
+    bool writePackedUInt(size_t);
+
+    bool writeStream(SkStream* input, size_t length);
+
+    static int SizeOfPackedUInt(size_t value);
+
+private:
+    SkWStream(const SkWStream&) = delete;
+    SkWStream& operator=(const SkWStream&) = delete;
+};
+
+class SK_API SkNullWStream : public SkWStream {
+public:
+    SkNullWStream() : fBytesWritten(0) {}
+
+    bool write(const void* , size_t n) override { fBytesWritten += n; return true; }
+    void flush() override {}
+    size_t bytesWritten() const override { return fBytesWritten; }
+
+private:
+    size_t fBytesWritten;
+};
+
+
+class SK_API SkFILEStream : public SkStreamAsset {
+public:
+    explicit SkFILEStream(const char path[] = nullptr);
+
+    explicit SkFILEStream(FILE* file);
+
+    explicit SkFILEStream(FILE* file, size_t size);
+
+    ~SkFILEStream() override;
+
+    static std::unique_ptr<SkFILEStream> Make(const char path[]) {
+        std::unique_ptr<SkFILEStream> stream(new SkFILEStream(path));
+        return stream->isValid() ? std::move(stream) : nullptr;
+    }
+
+    bool isValid() const { return fFILE != nullptr; }
+
+    void close();
+
+    size_t read(void* buffer, size_t size) override;
+    bool isAtEnd() const override;
+
+    bool rewind() override;
+    std::unique_ptr<SkStreamAsset> duplicate() const {
+        return std::unique_ptr<SkStreamAsset>(this->onDuplicate());
+    }
+
+    size_t getPosition() const override;
+    bool seek(size_t position) override;
+    bool move(long offset) override;
+
+    std::unique_ptr<SkStreamAsset> fork() const {
+        return std::unique_ptr<SkStreamAsset>(this->onFork());
+    }
+
+    size_t getLength() const override;
+
+private:
+    explicit SkFILEStream(FILE*, size_t size, size_t start);
+    explicit SkFILEStream(std::shared_ptr<FILE>, size_t end, size_t start);
+    explicit SkFILEStream(std::shared_ptr<FILE>, size_t end, size_t start, size_t current);
+
+    SkStreamAsset* onDuplicate() const override;
+    SkStreamAsset* onFork() const override;
+
+    std::shared_ptr<FILE> fFILE;
+    size_t fEnd;
+    size_t fStart;
+    size_t fCurrent;
+
+    using INHERITED = SkStreamAsset;
+};
+
+class SK_API SkMemoryStream : public SkStreamMemory {
+public:
+    SkMemoryStream();
+
+    explicit SkMemoryStream(size_t length);
+
+    SkMemoryStream(const void* data, size_t length, bool copyData = false);
+
+    explicit SkMemoryStream(sk_sp<const SkData> data);
+
+    static std::unique_ptr<SkMemoryStream> MakeCopy(const void* data, size_t length);
+
+    static std::unique_ptr<SkMemoryStream> MakeDirect(const void* data, size_t length);
+
+    static std::unique_ptr<SkMemoryStream> Make(sk_sp<const SkData> data);
+
+    virtual void setMemory(const void* data, size_t length,
+                           bool copyData = false);
+    void setMemoryOwned(const void* data, size_t length);
+
+    sk_sp<const SkData> getData() const override { return fData; }
+
+    void setData(sk_sp<const SkData> data);
+
+    const void* getAtPos();
+
+    size_t read(void* buffer, size_t size) override;
+    bool isAtEnd() const override;
+
+    size_t peek(void* buffer, size_t size) const override;
+
+    bool rewind() override;
+
+    std::unique_ptr<SkMemoryStream> duplicate() const {
+        return std::unique_ptr<SkMemoryStream>(this->onDuplicate());
+    }
+
+    size_t getPosition() const override;
+    bool seek(size_t position) override;
+    bool move(long offset) override;
+
+    std::unique_ptr<SkMemoryStream> fork() const {
+        return std::unique_ptr<SkMemoryStream>(this->onFork());
+    }
+
+    size_t getLength() const override;
+
+    const void* getMemoryBase() override;
+
+private:
+    SkMemoryStream* onDuplicate() const override;
+    SkMemoryStream* onFork() const override;
+
+    sk_sp<const SkData> fData;
+    size_t fOffset;
+
+    using INHERITED = SkStreamMemory;
+};
+
+
+class SK_API SkFILEWStream : public SkWStream {
+public:
+    explicit SkFILEWStream(const char path[]);
+    ~SkFILEWStream() override;
+
+    bool isValid() const { return fFILE != nullptr; }
+
+    bool write(const void* buffer, size_t size) override;
+    void flush() override;
+    void fsync();
+    size_t bytesWritten() const override;
+
+private:
+    FILE* fFILE;
+
+    using INHERITED = SkWStream;
+};
+
+class SK_API SkDynamicMemoryWStream : public SkWStream {
+public:
+    SkDynamicMemoryWStream() = default;
+    SkDynamicMemoryWStream(SkDynamicMemoryWStream&&);
+    SkDynamicMemoryWStream& operator=(SkDynamicMemoryWStream&&);
+    ~SkDynamicMemoryWStream() override;
+
+    bool write(const void* buffer, size_t size) override;
+    size_t bytesWritten() const override;
+
+    bool read(void* buffer, size_t offset, size_t size);
+
+    void copyTo(void* dst) const;
+    bool writeToStream(SkWStream* dst) const;
+
+    void copyToAndReset(void* dst);
+
+    bool writeToAndReset(SkWStream* dst);
+
+    bool writeToAndReset(SkDynamicMemoryWStream* dst);
+
+    void prependToAndReset(SkDynamicMemoryWStream* dst);
+
+    sk_sp<SkData> detachAsData();
+
+    std::vector<uint8_t> detachAsVector();
+
+    std::unique_ptr<SkStreamAsset> detachAsStream();
+
+    void reset();
+    void padToAlign4();
+private:
+    struct Block;
+    Block*  fHead = nullptr;
+    Block*  fTail = nullptr;
+    size_t  fBytesWrittenBeforeTail = 0;
+
+#if defined(SK_DEBUG)
+    void validate() const;
+#else
+    void validate() const {}
+#endif
+
+    friend class SkBlockMemoryStream;
+    friend class SkBlockMemoryRefCnt;
+
+    using INHERITED = SkWStream;
+};
+
+#endif

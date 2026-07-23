@@ -1,0 +1,97 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*****************************************************************************************
+* Copyright (C) 2010-2013, International Business Machines
+* Corporation and others. All Rights Reserved.
+*****************************************************************************************
+*/
+
+#ifndef UPLURALRULES_H
+#define UPLURALRULES_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/uenum.h"
+
+#if U_SHOW_CPLUSPLUS_API
+#include "unicode/localpointer.h"
+#endif   // U_SHOW_CPLUSPLUS_API
+
+#ifndef U_HIDE_INTERNAL_API
+#include "unicode/unum.h"
+#endif  /* U_HIDE_INTERNAL_API */
+
+struct UFormattedNumber;
+struct UFormattedNumberRange;
+
+
+enum UPluralType {
+    UPLURAL_TYPE_CARDINAL,
+    UPLURAL_TYPE_ORDINAL,
+#ifndef U_HIDE_DEPRECATED_API
+    UPLURAL_TYPE_COUNT
+#endif  /* U_HIDE_DEPRECATED_API */
+};
+typedef enum UPluralType UPluralType;
+
+struct UPluralRules;
+typedef struct UPluralRules UPluralRules;  
+
+U_CAPI UPluralRules* U_EXPORT2
+uplrules_open(const char *locale, UErrorCode *status);
+
+U_CAPI UPluralRules* U_EXPORT2
+uplrules_openForType(const char *locale, UPluralType type, UErrorCode *status);
+
+U_CAPI void U_EXPORT2
+uplrules_close(UPluralRules *uplrules);
+
+
+#if U_SHOW_CPLUSPLUS_API
+
+U_NAMESPACE_BEGIN
+
+U_DEFINE_LOCAL_OPEN_POINTER(LocalUPluralRulesPointer, UPluralRules, uplrules_close);
+
+U_NAMESPACE_END
+
+#endif
+
+
+U_CAPI int32_t U_EXPORT2
+uplrules_select(const UPluralRules *uplrules,
+               double number,
+               UChar *keyword, int32_t capacity,
+               UErrorCode *status);
+
+U_CAPI int32_t U_EXPORT2
+uplrules_selectFormatted(const UPluralRules *uplrules,
+               const struct UFormattedNumber* number,
+               UChar *keyword, int32_t capacity,
+               UErrorCode *status);
+
+U_CAPI int32_t U_EXPORT2
+uplrules_selectForRange(const UPluralRules *uplrules,
+               const struct UFormattedNumberRange* urange,
+               UChar *keyword, int32_t capacity,
+               UErrorCode *status);
+
+#ifndef U_HIDE_INTERNAL_API
+U_CAPI int32_t U_EXPORT2
+uplrules_selectWithFormat(const UPluralRules *uplrules,
+                          double number,
+                          const UNumberFormat *fmt,
+                          UChar *keyword, int32_t capacity,
+                          UErrorCode *status);
+
+#endif  /* U_HIDE_INTERNAL_API */
+
+U_CAPI UEnumeration* U_EXPORT2
+uplrules_getKeywords(const UPluralRules *uplrules,
+                     UErrorCode *status);
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif

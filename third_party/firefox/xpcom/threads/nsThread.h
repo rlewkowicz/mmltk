@@ -1,0 +1,274 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(nsThread_h_)
+#define nsThread_h_
+
+#include "MainThreadUtils.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/DataMutex.h"
+#include "mozilla/EventQueue.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/NotNull.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/TaskDispatcher.h"
+#include "mozilla/TimeStamp.h"
+#include "nsIDirectTaskDispatcher.h"
+#include "nsIEventTarget.h"
+#include "nsISerialEventTarget.h"
+#include "nsISupportsPriority.h"
+#include "nsIThread.h"
+#include "nsIThreadInternal.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+class CycleCollectedJSContext;
+class DelayedRunnable;
+class SynchronizedEventQueue;
+class ThreadEventQueue;
+class ThreadEventTarget;
+
+template <typename T, size_t Length>
+class Array;
+}  
+
+using mozilla::NotNull;
+
+class nsIRunnable;
+class nsThreadShutdownContext;
+
+#define W3_LONGTASK_BUSY_WINDOW_MS 50
+
+namespace mozilla {
+class PerformanceCounterState {
+ public:
+  explicit PerformanceCounterState(
+      const uint32_t& aNestedEventLoopDepthRef, bool aIsMainThread = false,
+      const Maybe<uint32_t>& aLongTaskLength = Nothing())
+      : mNestedEventLoopDepth(aNestedEventLoopDepthRef),
+        mIsMainThread(aIsMainThread),
+        mLongTaskLength(aLongTaskLength),
+        mLastLongTaskEnd(TimeStamp::Now()),
+        mLastLongNonIdleTaskEnd(mLastLongTaskEnd) {}
+
+  class Snapshot {
+   public:
+    Snapshot(uint32_t aOldEventLoopDepth, bool aOldIsIdleRunnable)
+        : mOldEventLoopDepth(aOldEventLoopDepth),
+          mOldIsIdleRunnable(aOldIsIdleRunnable) {}
+
+    Snapshot(const Snapshot&) = default;
+    Snapshot(Snapshot&&) = default;
+
+   private:
+    friend class PerformanceCounterState;
+
+    const uint32_t mOldEventLoopDepth;
+    const bool mOldIsIdleRunnable;
+  };
+
+  Snapshot RunnableWillRun(TimeStamp aNow, bool aIsIdleRunnable);
+
+  void RunnableDidRun(const nsCString& aName, Snapshot&& aSnapshot);
+
+  const TimeStamp& LastLongTaskEnd() const { return mLastLongTaskEnd; }
+  const TimeStamp& LastLongNonIdleTaskEnd() const {
+    return mLastLongNonIdleTaskEnd;
+  }
+
+ private:
+  void MaybeReportAccumulatedTime(const nsCString& aName, TimeStamp aNow);
+
+  bool IsNestedRunnable() const {
+    return mNestedEventLoopDepth > mCurrentEventLoopDepth;
+  }
+
+  uint32_t mCurrentEventLoopDepth = std::numeric_limits<uint32_t>::max();
+
+  const uint32_t& mNestedEventLoopDepth;
+
+  bool mCurrentRunnableIsIdleRunnable = false;
+
+  const bool mIsMainThread;
+
+  const Maybe<uint32_t> mLongTaskLength;
+
+  TimeStamp mCurrentTimeSliceStart;
+
+  TimeStamp mLastLongTaskEnd;
+  TimeStamp mLastLongNonIdleTaskEnd;
+};
+}  
+
+class nsThread : public nsIThreadInternal,
+                 public nsISupportsPriority,
+                 public nsIDirectTaskDispatcher,
+                 private mozilla::LinkedListElement<nsThread> {
+  friend mozilla::LinkedList<nsThread>;
+  friend mozilla::LinkedListElement<nsThread>;
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIEVENTTARGET_FULL
+  NS_DECL_NSITHREAD
+  NS_DECL_NSITHREADINTERNAL
+  NS_DECL_NSISUPPORTSPRIORITY
+  NS_DECL_NSIDIRECTTASKDISPATCHER
+
+  enum MainThreadFlag { MAIN_THREAD, NOT_MAIN_THREAD };
+
+  nsThread(NotNull<mozilla::SynchronizedEventQueue*> aQueue,
+           MainThreadFlag aMainThread,
+           nsIThreadManager::ThreadCreationOptions aOptions);
+
+ private:
+  nsThread();
+
+ public:
+  nsresult Init(const nsACString& aName);
+
+  nsresult InitCurrentThread();
+
+  void GetThreadName(nsACString& aNameBuffer);
+
+  void SetThreadNameInternal(const nsACString& aName);
+
+ private:
+  void InitCommon();
+
+ public:
+  PRThread* GetPRThread() const { return mThread; }
+
+  const void* StackBase() const { return mStackBase; }
+  size_t StackSize() const { return mStackSize; }
+
+  uint32_t ThreadId() const { return mThreadId; }
+
+  bool ShutdownRequired() { return mShutdownRequired; }
+
+  void SetPoolThreadFreePtr(mozilla::Atomic<bool, mozilla::Relaxed>* aPtr) {
+    mIsAPoolThreadFreePtr = aPtr;
+  }
+
+  void SetScriptObserver(mozilla::CycleCollectedJSContext* aScriptObserver);
+
+  uint32_t RecursionDepth() const;
+
+  void ShutdownComplete(NotNull<nsThreadShutdownContext*> aContext);
+
+  void WaitForAllAsynchronousShutdowns();
+
+  static const uint32_t kRunnableNameBufSize = 1000;
+  static mozilla::Array<char, kRunnableNameBufSize> sMainThreadRunnableName;
+
+  mozilla::SynchronizedEventQueue* EventQueue() { return mEvents.get(); }
+
+  bool ShuttingDown() const { return mShutdownContext != nullptr; }
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+  size_t ShallowSizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+  size_t SizeOfEventQueues(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+ private:
+  void DoMainThreadSpecificProcessing() const;
+
+ protected:
+  friend class nsThreadShutdownEvent;
+
+  virtual ~nsThread();
+
+  static void ThreadFunc(void* aArg);
+
+  already_AddRefed<nsIThreadObserver> GetObserver() {
+    nsIThreadObserver* obs;
+    nsThread::GetObserver(&obs);
+    return already_AddRefed<nsIThreadObserver>(obs);
+  }
+
+  already_AddRefed<nsThreadShutdownContext> ShutdownInternal(bool aSync);
+
+  friend class nsThreadManager;
+  friend class nsThreadPool;
+
+  void MaybeRemoveFromThreadList();
+
+  RefPtr<mozilla::SynchronizedEventQueue> mEvents;
+  RefPtr<mozilla::ThreadEventTarget> mEventTarget;
+
+  uint32_t mOutstandingShutdownContexts;
+  RefPtr<nsThreadShutdownContext> mShutdownContext;
+
+  mozilla::CycleCollectedJSContext* mScriptObserver;
+
+  mozilla::DataMutex<nsCString> mThreadName;
+
+  void* mStackBase = nullptr;
+  uint32_t mStackSize;
+  uint32_t mThreadId;
+
+  uint32_t mNestedEventLoopDepth;
+
+  mozilla::Atomic<bool> mShutdownRequired;
+
+  int8_t mPriority;
+
+  const bool mIsMainThread;
+  const bool mIsUiThread;
+  mozilla::Atomic<bool, mozilla::Relaxed>* mIsAPoolThreadFreePtr = nullptr;
+
+  bool mCanInvokeJS;
+
+  mozilla::TimeDuration mLastEventDelay;
+  mozilla::TimeStamp mLastEventStart;
+
+  mozilla::PerformanceCounterState mPerformanceCounterState;
+
+  mozilla::SimpleTaskQueue mDirectTasks;
+};
+
+class nsThreadShutdownContext final : public nsIThreadShutdown {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSITHREADSHUTDOWN
+
+ private:
+  friend class nsThread;
+  friend class nsThreadShutdownEvent;
+  friend class nsThreadShutdownAckEvent;
+
+  nsThreadShutdownContext(NotNull<nsThread*> aTerminatingThread,
+                          nsThread* aJoiningThread)
+      : mTerminatingThread(aTerminatingThread),
+        mTerminatingPRThread(aTerminatingThread->GetPRThread()),
+        mJoiningThreadMutex("nsThreadShutdownContext::mJoiningThreadMutex"),
+        mJoiningThread(aJoiningThread) {}
+
+  ~nsThreadShutdownContext() = default;
+
+  void MarkCompleted();
+
+  NotNull<RefPtr<nsThread>> const mTerminatingThread;
+  PRThread* const mTerminatingPRThread;
+
+  bool mCompleted = false;
+  nsTArray<nsCOMPtr<nsIRunnable>> mCompletionCallbacks;
+
+  mozilla::Mutex mJoiningThreadMutex;
+  RefPtr<nsThread> mJoiningThread MOZ_GUARDED_BY(mJoiningThreadMutex);
+  bool mThreadLeaked MOZ_GUARDED_BY(mJoiningThreadMutex) = false;
+};
+
+#if defined(XP_UNIX) && !0 && !defined(DEBUG) && HAVE_UALARM && \
+    defined(_GNU_SOURCE)
+#  define MOZ_CANARY
+
+extern int sCanaryOutputFD;
+#endif
+
+#endif

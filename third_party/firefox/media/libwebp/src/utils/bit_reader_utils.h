@@ -1,0 +1,138 @@
+// Copyright 2010 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#if !defined(WEBP_UTILS_BIT_READER_UTILS_H_)
+#define WEBP_UTILS_BIT_READER_UTILS_H_
+
+#include <assert.h>
+#include <stddef.h>
+
+#if defined(_MSC_VER)
+#include <stdlib.h>  // _byteswap_ulong
+#endif
+#include "src/dsp/cpu.h"
+#include "src/webp/types.h"
+
+#if !defined(BITTRACE)
+#define BITTRACE 0    // 0 = off, 1 = print bits, 2 = print bytes
+#endif
+
+#if (BITTRACE > 0)
+struct VP8BitReader;
+extern void BitTrace(const struct VP8BitReader* const br, const char label[]);
+#define BT_TRACK(br) BitTrace(br, label)
+#define VP8Get(BR, L) VP8GetValue(BR, 1, L)
+#else
+#define BT_TRACK(br)
+#define VP8GetValue(BR, N, L) VP8GetValue(BR, N)
+#define VP8Get(BR, L) VP8GetValue(BR, 1, L)
+#define VP8GetSignedValue(BR, N, L) VP8GetSignedValue(BR, N)
+#define VP8GetBit(BR, P, L) VP8GetBit(BR, P)
+#define VP8GetBitAlt(BR, P, L) VP8GetBitAlt(BR, P)
+#define VP8GetSigned(BR, V, L) VP8GetSigned(BR, V)
+#endif
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+
+#if defined(__i386__) || defined(_M_IX86)      // x86 32bit
+#define BITS 24
+#elif defined(__x86_64__) || defined(_M_X64)   // x86 64bit
+#define BITS 56
+#elif defined(__arm__) || defined(_M_ARM)      // ARM
+#define BITS 24
+#elif WEBP_AARCH64                             // ARM 64bit
+#define BITS 56
+#elif defined(__mips__)                        // MIPS
+#define BITS 24
+#elif defined(__wasm__)                        // WASM
+#define BITS 56
+#else
+#define BITS 24
+#endif
+
+
+#if (BITS > 24)
+typedef uint64_t bit_t;
+#else
+typedef uint32_t bit_t;
+#endif
+
+typedef uint32_t range_t;
+
+
+typedef struct VP8BitReader VP8BitReader;
+struct VP8BitReader {
+  bit_t value;               
+  range_t range;             
+  int bits;                  
+  const uint8_t* buf;        
+  const uint8_t* buf_end;    
+  const uint8_t* buf_max;    
+  int eof;                   
+};
+
+void VP8InitBitReader(VP8BitReader* const br,
+                      const uint8_t* const start, size_t size);
+void VP8BitReaderSetBuffer(VP8BitReader* const br,
+                           const uint8_t* const start, size_t size);
+
+void VP8RemapBitReader(VP8BitReader* const br, ptrdiff_t offset);
+
+uint32_t VP8GetValue(VP8BitReader* const br, int num_bits, const char label[]);
+
+int32_t VP8GetSignedValue(VP8BitReader* const br, int num_bits,
+                          const char label[]);
+
+
+
+#define VP8L_MAX_NUM_BIT_READ 24
+
+#define VP8L_LBITS 64  // Number of bits prefetched (= bit-size of vp8l_val_t).
+#define VP8L_WBITS 32  // Minimum number of bytes ready after VP8LFillBitWindow.
+
+typedef uint64_t vp8l_val_t;  
+
+typedef struct {
+  vp8l_val_t     val;        
+  const uint8_t* buf;        
+  size_t         len;        
+  size_t         pos;        
+  int            bit_pos;    
+  int            eos;        
+} VP8LBitReader;
+
+void VP8LInitBitReader(VP8LBitReader* const br,
+                       const uint8_t* const start,
+                       size_t length);
+
+void VP8LBitReaderSetBuffer(VP8LBitReader* const br,
+                            const uint8_t* const buffer, size_t length);
+
+uint32_t VP8LReadBits(VP8LBitReader* const br, int n_bits);
+
+static WEBP_INLINE uint32_t VP8LPrefetchBits(VP8LBitReader* const br) {
+  return (uint32_t)(br->val >> (br->bit_pos & (VP8L_LBITS - 1)));
+}
+
+static WEBP_INLINE int VP8LIsEndOfStream(const VP8LBitReader* const br) {
+  assert(br->pos <= br->len);
+  return br->eos || ((br->pos == br->len) && (br->bit_pos > VP8L_LBITS));
+}
+
+static WEBP_INLINE void VP8LSetBitPos(VP8LBitReader* const br, int val) {
+  br->bit_pos = val;
+}
+
+extern void VP8LDoFillBitWindow(VP8LBitReader* const br);
+static WEBP_INLINE void VP8LFillBitWindow(VP8LBitReader* const br) {
+  if (br->bit_pos >= VP8L_WBITS) VP8LDoFillBitWindow(br);
+}
+
+#if defined(__cplusplus)
+}    
+#endif
+
+#endif

@@ -1,0 +1,205 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ScriptLoadContext_h
+#define mozilla_dom_ScriptLoadContext_h
+
+#include "js/AllocPolicy.h"
+#include "js/ColumnNumber.h"    // JS::ColumnNumberOneOrigin
+#include "js/CompileOptions.h"  // JS::OwningCompileOptions
+#include "js/RootingAPI.h"
+#include "js/SourceText.h"
+#include "js/Transcoding.h"  // JS::TranscodeResult
+#include "js/TypeDecls.h"
+#include "js/experimental/JSStencil.h"  // JS::FrontendContext, JS::Stencil, JS::InstantiationStorage
+#include "js/loader/LoadContextBase.h"
+#include "js/loader/ScriptKind.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/PreloaderBase.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/TaskController.h"  // mozilla::Task
+#include "mozilla/Utf8.h"            // mozilla::Utf8Unit
+#include "mozilla/dom/SRIMetadata.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIScriptElement.h"
+
+class nsICacheInfoChannel;
+struct JSContext;
+
+namespace mozilla::dom {
+
+class Element;
+
+
+class CompileOrDecodeTask : public mozilla::Task {
+ protected:
+  CompileOrDecodeTask();
+  virtual ~CompileOrDecodeTask();
+
+  nsresult InitFrontendContext();
+
+  void DidRunTask(const MutexAutoLock& aProofOfLock,
+                  RefPtr<JS::Stencil>&& aStencil);
+
+  bool IsCancelled(const MutexAutoLock& aProofOfLock) const {
+    return mIsCancelled;
+  }
+
+ public:
+  already_AddRefed<JS::Stencil> StealResult(
+      JSContext* aCx, JS::InstantiationStorage* aInstantiationStorage);
+
+  void Cancel();
+
+ protected:
+  mozilla::Mutex mMutex;
+
+  JS::TranscodeResult mResult = JS::TranscodeResult::Ok;
+
+  JS::OwningCompileOptions mOptions;
+
+  JS::FrontendContext* mFrontendContext = nullptr;
+
+  bool mIsCancelled = false;
+
+ private:
+  RefPtr<JS::Stencil> mStencil;
+
+  JS::InstantiationStorage mInstantiationStorage;
+};
+
+class ScriptLoadContext : public JS::loader::LoadContextBase,
+                          public PreloaderBase {
+ protected:
+  virtual ~ScriptLoadContext();
+
+ public:
+  explicit ScriptLoadContext(nsIScriptElement* aScriptElement = nullptr,
+                             const nsAString& aSourceText = VoidString());
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(ScriptLoadContext,
+                                           JS::loader::LoadContextBase)
+
+  static void PrioritizeAsPreload(nsIChannel* aChannel);
+
+  bool IsPreload() const override;
+
+  bool CompileStarted() const;
+
+  void BlockOnload(Document* aDocument);
+
+  void MaybeUnblockOnload();
+
+  enum class ScriptMode : uint8_t {
+    eBlocking,
+    eDeferred,
+    eAsync,
+    eLinkPreload  
+  };
+
+  void SetScriptMode(bool aDeferAttr, bool aAsyncAttr, bool aLinkPreload);
+
+  bool IsLinkPreloadScript() const {
+    return mScriptMode == ScriptMode::eLinkPreload;
+  }
+
+  bool IsBlockingScript() const { return mScriptMode == ScriptMode::eBlocking; }
+
+  bool IsDeferredScript() const { return mScriptMode == ScriptMode::eDeferred; }
+
+  bool IsAsyncScript() const { return mScriptMode == ScriptMode::eAsync; }
+
+
+  inline nsIScriptElement* GetScriptElementForLoadingNode() const {
+    MOZ_ASSERT(mScriptElement);
+    return mScriptElement;
+  }
+
+  inline nsIScriptElement* GetScriptElementForCurrentParserInsertedScript()
+      const {
+    MOZ_ASSERT(mScriptElement);
+    return mScriptElement;
+  }
+
+  inline nsIScriptElement* GetScriptElementForObserver() const {
+    MOZ_ASSERT(mScriptElement);
+    return mScriptElement;
+  }
+
+  inline nsIScriptElement* GetScriptElementForCurrentScript() const {
+    MOZ_ASSERT(mScriptElement);
+    return mScriptElement;
+  }
+
+  bool HasScriptElement() const;
+
+  void GetInlineScriptText(nsAString& aText) const;
+
+  void GetHintCharset(nsAString& aCharset) const;
+
+  uint32_t GetScriptLineNumber() const;
+  JS::ColumnNumberOneOrigin GetScriptColumnNumber() const;
+
+  void BeginEvaluatingTopLevel() const;
+  void EndEvaluatingTopLevel() const;
+
+  void UnblockParser() const;
+  void ContinueParserAsync() const;
+
+  Document* GetScriptOwnerDocument() const;
+
+  void SetIsPreloadRequest() {
+    MOZ_ASSERT(!HasScriptElement());
+    MOZ_ASSERT(!IsPreload());
+    mIsPreload = true;
+  }
+
+  void SetIsLoadRequest(nsIScriptElement* aElement);
+
+  FromParser GetParserCreated() const {
+    if (!mScriptElement) {
+      return NOT_FROM_PARSER;
+    }
+    return mScriptElement->GetParserCreated();
+  }
+
+  void MaybeCancelOffThreadScript();
+
+  already_AddRefed<JS::Stencil> StealOffThreadResult(
+      JSContext* aCx, JS::InstantiationStorage* aInstantiationStorage);
+
+  ScriptMode mScriptMode;  
+  bool mScriptFromHead;    
+  bool mIsInline;          
+  bool mInDeferList;       
+  bool mInAsyncList;       
+  bool mIsNonAsyncScriptInserted;  
+  bool mIsXSLT;                    
+  bool mInCompilingList;  
+  bool mWasCompiledOMT;   
+  bool mIsPreload;
+
+  nsresult mUnreportedPreloadError;
+
+  uint32_t mLineNo;
+  JS::ColumnNumberOneOrigin mColumnNo;
+
+  RefPtr<CompileOrDecodeTask> mCompileOrDecodeTask;
+
+  RefPtr<Document> mLoadBlockedDocument;
+
+  nsCOMPtr<nsIScriptElement> mScriptElement;
+
+  nsString mSourceText;
+};
+
+}  
+
+#endif  // mozilla_dom_ScriptLoadContext_h

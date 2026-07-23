@@ -1,0 +1,92 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ClonedErrorHolder_h
+#define mozilla_dom_ClonedErrorHolder_h
+
+#include "js/ColumnNumber.h"  // JS::ColumnNumberOneOrigin
+#include "js/ErrorReport.h"
+#include "js/TypeDecls.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/NonRefcountedDOMObject.h"
+#include "mozilla/dom/StructuredCloneHolder.h"
+#include "nsISupportsImpl.h"
+
+class nsIGlobalObject;
+class nsQueryActorChild;
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+class ClonedErrorHolder final : public NonRefcountedDOMObject {
+ public:
+  static UniquePtr<ClonedErrorHolder> Constructor(const GlobalObject& aGlobal,
+                                                  JS::Handle<JSObject*> aError,
+                                                  ErrorResult& aRv);
+
+  static UniquePtr<ClonedErrorHolder> Create(JSContext* aCx,
+                                             JS::Handle<JSObject*> aError,
+                                             ErrorResult& aRv);
+
+  enum class Type : uint8_t {
+    Uninitialized,
+    JSError,
+    Exception,
+    DOMException,
+    Max_,
+  };
+
+  bool WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto,
+                  JS::MutableHandle<JSObject*> aReflector);
+
+  bool WriteStructuredClone(JSContext* aCx, JSStructuredCloneWriter* aWriter,
+                            StructuredCloneHolder* aHolder);
+
+  static JSObject* ReadStructuredClone(JSContext* aCx,
+                                       JSStructuredCloneReader* aReader,
+                                       StructuredCloneHolder* aHolder);
+
+ private:
+  ClonedErrorHolder();
+
+  void Init(JSContext* aCx, JS::Handle<JSObject*> aError, ErrorResult& aRv);
+
+  bool Init(JSContext* aCx, JSStructuredCloneReader* aReader);
+
+  bool ToErrorValue(JSContext* aCx, JS::MutableHandle<JS::Value> aResult);
+
+  class Holder final : public StructuredCloneHolder {
+   public:
+    using StructuredCloneHolder::StructuredCloneHolder;
+
+    bool ReadStructuredCloneInternal(JSContext* aCx,
+                                     JSStructuredCloneReader* aReader);
+  };
+
+  nsCString mName;        
+  nsCString mMessage;     
+  nsCString mFilename;    
+  nsCString mSourceLine;  
+
+  uint32_t mLineNumber = 0;           
+  JS::ColumnNumberOneOrigin mColumn;  
+  uint32_t mTokenOffset = 0;          
+  uint32_t mErrorNumber = 0;          
+
+  Type mType = Type::Uninitialized;
+
+  uint16_t mCode = 0;                 
+  JSExnType mExnType = JSExnType(0);  
+  nsresult mResult = NS_OK;           
+
+  Holder mStack{Holder::CloningSupported, Holder::TransferringNotSupported,
+                Holder::StructuredCloneScope::DifferentProcess};
+};
+
+}  
+}  
+
+#endif  // !defined(mozilla_dom_ClonedErrorHolder_h)

@@ -1,0 +1,1439 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#define UNISTR_FROM_STRING_EXPLICIT
+
+#include "charstr.h"
+#include "cmemory.h"
+#include "cstring.h"
+#ifdef JS_HAS_INTL_API
+#include "double-conversion/string-to-double.h"
+#else
+#include "double-conversion-string-to-double.h"
+#endif
+#include "measunit_impl.h"
+#include "resource.h"
+#include "uarrsort.h"
+#include "uassert.h"
+#include "ucln_in.h"
+#include "umutex.h"
+#include "unicode/bytestrie.h"
+#include "unicode/bytestriebuilder.h"
+#include "unicode/localpointer.h"
+#include "unicode/stringpiece.h"
+#include "unicode/stringtriebuilder.h"
+#include "unicode/ures.h"
+#include "unicode/ustringtrie.h"
+#include "uresimp.h"
+#include "util.h"
+#include <limits.h>
+#include <cstdlib>
+U_NAMESPACE_BEGIN
+
+
+namespace {
+
+#ifdef JS_HAS_INTL_API
+using double_conversion::StringToDoubleConverter;
+#else
+using icu::double_conversion::StringToDoubleConverter;
+#endif
+
+constexpr UErrorCode kUnitIdentifierSyntaxError = U_ILLEGAL_ARGUMENT_ERROR;
+
+constexpr int32_t kPrefixOffset = 64;
+static_assert(kPrefixOffset + UMEASURE_PREFIX_INTERNAL_MIN_BIN > 0,
+              "kPrefixOffset is too small for minimum UMeasurePrefix value");
+static_assert(kPrefixOffset + UMEASURE_PREFIX_INTERNAL_MIN_SI > 0,
+              "kPrefixOffset is too small for minimum UMeasurePrefix value");
+
+constexpr int32_t kCompoundPartOffset = 128;
+static_assert(kCompoundPartOffset > kPrefixOffset + UMEASURE_PREFIX_INTERNAL_MAX_BIN,
+              "Ambiguous token values: prefix tokens are overlapping with CompoundPart tokens");
+static_assert(kCompoundPartOffset > kPrefixOffset + UMEASURE_PREFIX_INTERNAL_MAX_SI,
+              "Ambiguous token values: prefix tokens are overlapping with CompoundPart tokens");
+
+enum CompoundPart {
+    COMPOUND_PART_PER = kCompoundPartOffset,
+    COMPOUND_PART_TIMES,
+    COMPOUND_PART_AND,
+};
+
+constexpr int32_t kInitialCompoundPartOffset = 192;
+
+enum InitialCompoundPart {
+    INITIAL_COMPOUND_PART_PER = kInitialCompoundPartOffset,
+};
+
+constexpr int32_t kPowerPartOffset = 256;
+
+enum PowerPart {
+    POWER_PART_P2 = kPowerPartOffset + 2,
+    POWER_PART_P3,
+    POWER_PART_P4,
+    POWER_PART_P5,
+    POWER_PART_P6,
+    POWER_PART_P7,
+    POWER_PART_P8,
+    POWER_PART_P9,
+    POWER_PART_P10,
+    POWER_PART_P11,
+    POWER_PART_P12,
+    POWER_PART_P13,
+    POWER_PART_P14,
+    POWER_PART_P15,
+};
+
+constexpr int32_t kSimpleUnitOffset = 512;
+
+constexpr int32_t kAliasOffset = 51200; 
+
+const struct UnitPrefixStrings {
+    const char* const string;
+    UMeasurePrefix value;
+} gUnitPrefixStrings[] = {
+    { "quetta", UMEASURE_PREFIX_QUETTA },
+    { "ronna", UMEASURE_PREFIX_RONNA },
+    { "yotta", UMEASURE_PREFIX_YOTTA },
+    { "zetta", UMEASURE_PREFIX_ZETTA },
+    { "exa", UMEASURE_PREFIX_EXA },
+    { "peta", UMEASURE_PREFIX_PETA },
+    { "tera", UMEASURE_PREFIX_TERA },
+    { "giga", UMEASURE_PREFIX_GIGA },
+    { "mega", UMEASURE_PREFIX_MEGA },
+    { "kilo", UMEASURE_PREFIX_KILO },
+    { "hecto", UMEASURE_PREFIX_HECTO },
+    { "deka", UMEASURE_PREFIX_DEKA },
+    { "deci", UMEASURE_PREFIX_DECI },
+    { "centi", UMEASURE_PREFIX_CENTI },
+    { "milli", UMEASURE_PREFIX_MILLI },
+    { "micro", UMEASURE_PREFIX_MICRO },
+    { "nano", UMEASURE_PREFIX_NANO },
+    { "pico", UMEASURE_PREFIX_PICO },
+    { "femto", UMEASURE_PREFIX_FEMTO },
+    { "atto", UMEASURE_PREFIX_ATTO },
+    { "zepto", UMEASURE_PREFIX_ZEPTO },
+    { "yocto", UMEASURE_PREFIX_YOCTO },
+    { "ronto", UMEASURE_PREFIX_RONTO },
+    { "quecto", UMEASURE_PREFIX_QUECTO },
+    { "yobi", UMEASURE_PREFIX_YOBI },
+    { "zebi", UMEASURE_PREFIX_ZEBI },
+    { "exbi", UMEASURE_PREFIX_EXBI },
+    { "pebi", UMEASURE_PREFIX_PEBI },
+    { "tebi", UMEASURE_PREFIX_TEBI },
+    { "gibi", UMEASURE_PREFIX_GIBI },
+    { "mebi", UMEASURE_PREFIX_MEBI },
+    { "kibi", UMEASURE_PREFIX_KIBI },
+};
+
+class SimpleUnitIdentifiersSink : public icu::ResourceSink {
+  public:
+    explicit SimpleUnitIdentifiersSink(StringPiece quantitiesTrieData, const char **out,
+                                       int32_t *outCategories, int32_t outSize,
+                                       BytesTrieBuilder &trieBuilder, int32_t trieValueOffset)
+        : outArray(out), outCategories(outCategories), outSize(outSize), trieBuilder(trieBuilder),
+          trieValueOffset(trieValueOffset), quantitiesTrieData(quantitiesTrieData), outIndex(0) {}
+
+    void put(const char * , ResourceValue &value, UBool , UErrorCode &status) override {
+        ResourceTable table = value.getTable(status);
+        if (U_FAILURE(status)) return;
+
+        if (outIndex + table.getSize() > outSize) {
+            status = U_INDEX_OUTOFBOUNDS_ERROR;
+            return;
+        }
+
+        BytesTrie quantitiesTrie(quantitiesTrieData.data());
+
+        const char *simpleUnitID;
+        for (int32_t i = 0; table.getKeyAndValue(i, simpleUnitID, value); ++i) {
+            U_ASSERT(i < table.getSize());
+            U_ASSERT(outIndex < outSize);
+            if (uprv_strcmp(simpleUnitID, "kilogram") == 0) {
+                continue;
+            }
+            outArray[outIndex] = simpleUnitID;
+            trieBuilder.add(simpleUnitID, trieValueOffset + outIndex, status);
+
+            ResourceTable table = value.getTable(status);
+            if (U_FAILURE(status)) { return; }
+            if (!table.findValue("target", value)) {
+                status = U_INVALID_FORMAT_ERROR;
+                break;
+            }
+            int32_t len;
+            const char16_t* uTarget = value.getString(len, status);
+            CharString target;
+            target.appendInvariantChars(uTarget, len, status);
+            if (U_FAILURE(status)) { return; }
+            quantitiesTrie.reset();
+            UStringTrieResult result = quantitiesTrie.next(target.data(), target.length());
+            if (!USTRINGTRIE_HAS_VALUE(result)) {
+                status = U_INVALID_FORMAT_ERROR;
+                break;
+            }
+            outCategories[outIndex] = quantitiesTrie.getValue();
+
+            outIndex++;
+        }
+    }
+
+  private:
+    const char **outArray;
+    int32_t *outCategories;
+    int32_t outSize;
+    BytesTrieBuilder &trieBuilder;
+    int32_t trieValueOffset;
+
+    StringPiece quantitiesTrieData;
+
+    int32_t outIndex;
+};
+
+class UnitAliasesSink : public icu::ResourceSink {
+  public:
+    explicit UnitAliasesSink(MaybeStackVector<CharString> &unitAliases,
+                             MaybeStackVector<CharString> &unitReplacements)
+        : unitAliases(unitAliases), unitReplacements(unitReplacements) {}
+
+    void put(const char *key, ResourceValue &value, UBool ,
+             UErrorCode &status) override {
+        if (U_FAILURE(status)) return;
+
+        int32_t keyLen = static_cast<int32_t>(uprv_strlen(key));
+        unitAliases.emplaceBackAndCheckErrorCode(status)->append(key, keyLen, status);
+        if (U_FAILURE(status)) {
+            return;
+        }
+
+        ResourceTable aliasTable = value.getTable(status);
+        if (U_FAILURE(status)) {
+            return;
+        }
+
+        if (!aliasTable.findValue("replacement", value)) {
+            status = U_MISSING_RESOURCE_ERROR;
+            return;
+        }
+
+        int32_t len;
+        const char16_t *uReplacement = value.getString(len, status);
+        unitReplacements.emplaceBackAndCheckErrorCode(status)->appendInvariantChars(uReplacement,
+                                                                                    len, status);
+    }
+
+  private:
+    MaybeStackVector<CharString> &unitAliases;
+    MaybeStackVector<CharString> &unitReplacements;
+};
+
+class CategoriesSink : public icu::ResourceSink {
+  public:
+    explicit CategoriesSink(const char16_t **out, int32_t &outSize, BytesTrieBuilder &trieBuilder)
+        : outQuantitiesArray(out), outSize(outSize), trieBuilder(trieBuilder), outIndex(0) {}
+
+    void put(const char * , ResourceValue &value, UBool , UErrorCode &status) override {
+        ResourceArray array = value.getArray(status);
+        if (U_FAILURE(status)) {
+            return;
+        }
+
+        if (outIndex + array.getSize() > outSize) {
+            status = U_INDEX_OUTOFBOUNDS_ERROR;
+            return;
+        }
+
+        for (int32_t i = 0; array.getValue(i, value); ++i) {
+            U_ASSERT(outIndex < outSize);
+            ResourceTable table = value.getTable(status);
+            if (U_FAILURE(status)) {
+                return;
+            }
+            if (table.getSize() != 1) {
+                status = U_INVALID_FORMAT_ERROR;
+                return;
+            }
+            const char *key;
+            table.getKeyAndValue(0, key, value);
+            int32_t uTmpLen;
+            outQuantitiesArray[outIndex] = value.getString(uTmpLen, status);
+            trieBuilder.add(key, outIndex, status);
+            outIndex++;
+        }
+    }
+
+  private:
+    const char16_t **outQuantitiesArray;
+    int32_t &outSize;
+    BytesTrieBuilder &trieBuilder;
+
+    int32_t outIndex;
+};
+
+icu::UInitOnce gUnitExtrasInitOnce {};
+
+const char** gUnitReplacements;
+const char* gUnitReplacementStrings;
+int32_t gNumUnitReplacements;
+
+const char **gSimpleUnits = nullptr;
+
+int32_t *gSimpleUnitCategories = nullptr;
+
+char *gSerializedUnitExtrasStemTrie = nullptr;
+
+const char16_t **gCategories = nullptr;
+int32_t gCategoriesCount = 0;
+char *gSerializedUnitCategoriesTrie = nullptr;
+
+UBool U_CALLCONV cleanupUnitExtras() {
+    uprv_free(gSerializedUnitCategoriesTrie);
+    gSerializedUnitCategoriesTrie = nullptr;
+    uprv_free(gCategories);
+    gCategories = nullptr;
+    uprv_free(gSerializedUnitExtrasStemTrie);
+    gSerializedUnitExtrasStemTrie = nullptr;
+    uprv_free(gSimpleUnitCategories);
+    gSimpleUnitCategories = nullptr;
+    uprv_free(gSimpleUnits);
+    gSimpleUnits = nullptr;
+    uprv_free((void*)gUnitReplacementStrings);
+    gUnitReplacementStrings = nullptr;
+    uprv_free(gUnitReplacements);
+    gUnitReplacements = nullptr;
+    gNumUnitReplacements = 0;
+    gUnitExtrasInitOnce.reset();
+    return true;
+}
+
+void U_CALLCONV initUnitExtras(UErrorCode& status) {
+    ucln_i18n_registerCleanup(UCLN_I18N_UNIT_EXTRAS, cleanupUnitExtras);
+    LocalUResourceBundlePointer unitsBundle(ures_openDirect(nullptr, "units", &status));
+
+    const char *CATEGORY_TABLE_NAME = "unitQuantities";
+    LocalUResourceBundlePointer unitQuantities(
+        ures_getByKey(unitsBundle.getAlias(), CATEGORY_TABLE_NAME, nullptr, &status));
+    if (U_FAILURE(status)) { return; }
+    gCategoriesCount = unitQuantities.getAlias()->fSize;
+    size_t quantitiesMallocSize = sizeof(char16_t *) * gCategoriesCount;
+    gCategories = static_cast<const char16_t **>(uprv_malloc(quantitiesMallocSize));
+    if (gCategories == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    uprv_memset(gCategories, 0, quantitiesMallocSize);
+    BytesTrieBuilder quantitiesBuilder(status);
+    CategoriesSink categoriesSink(gCategories, gCategoriesCount, quantitiesBuilder);
+    ures_getAllItemsWithFallback(unitsBundle.getAlias(), CATEGORY_TABLE_NAME, categoriesSink, status);
+    StringPiece resultQuantities = quantitiesBuilder.buildStringPiece(USTRINGTRIE_BUILD_FAST, status);
+    if (U_FAILURE(status)) { return; }
+    size_t numBytesQuantities = resultQuantities.length();
+    gSerializedUnitCategoriesTrie = static_cast<char *>(uprv_malloc(numBytesQuantities));
+    if (gSerializedUnitCategoriesTrie == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    uprv_memcpy(gSerializedUnitCategoriesTrie, resultQuantities.data(), numBytesQuantities);
+
+
+    BytesTrieBuilder b(status);
+    if (U_FAILURE(status)) { return; }
+
+    for (const auto& unitPrefixInfo : gUnitPrefixStrings) {
+        b.add(unitPrefixInfo.string, unitPrefixInfo.value + kPrefixOffset, status);
+    }
+    if (U_FAILURE(status)) { return; }
+
+    b.add("-per-", COMPOUND_PART_PER, status);
+    b.add("-", COMPOUND_PART_TIMES, status);
+    b.add("-and-", COMPOUND_PART_AND, status);
+    b.add("per-", INITIAL_COMPOUND_PART_PER, status);
+    b.add("square-", POWER_PART_P2, status);
+    b.add("cubic-", POWER_PART_P3, status);
+    b.add("pow2-", POWER_PART_P2, status);
+    b.add("pow3-", POWER_PART_P3, status);
+    b.add("pow4-", POWER_PART_P4, status);
+    b.add("pow5-", POWER_PART_P5, status);
+    b.add("pow6-", POWER_PART_P6, status);
+    b.add("pow7-", POWER_PART_P7, status);
+    b.add("pow8-", POWER_PART_P8, status);
+    b.add("pow9-", POWER_PART_P9, status);
+    b.add("pow10-", POWER_PART_P10, status);
+    b.add("pow11-", POWER_PART_P11, status);
+    b.add("pow12-", POWER_PART_P12, status);
+    b.add("pow13-", POWER_PART_P13, status);
+    b.add("pow14-", POWER_PART_P14, status);
+    b.add("pow15-", POWER_PART_P15, status);
+    if (U_FAILURE(status)) { return; }
+
+    LocalUResourceBundlePointer convertUnits(
+        ures_getByKey(unitsBundle.getAlias(), "convertUnits", nullptr, &status));
+    if (U_FAILURE(status)) { return; }
+
+    int32_t simpleUnitsCount = convertUnits.getAlias()->fSize;
+    int32_t arrayMallocSize = sizeof(char *) * simpleUnitsCount;
+    gSimpleUnits = static_cast<const char **>(uprv_malloc(arrayMallocSize));
+    if (gSimpleUnits == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    uprv_memset(gSimpleUnits, 0, arrayMallocSize);
+    arrayMallocSize = sizeof(int32_t) * simpleUnitsCount;
+    gSimpleUnitCategories = static_cast<int32_t *>(uprv_malloc(arrayMallocSize));
+    if (gSimpleUnitCategories == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    uprv_memset(gSimpleUnitCategories, 0, arrayMallocSize);
+
+    SimpleUnitIdentifiersSink identifierSink(resultQuantities, gSimpleUnits, gSimpleUnitCategories,
+                                             simpleUnitsCount, b, kSimpleUnitOffset);
+    ures_getAllItemsWithFallback(unitsBundle.getAlias(), "convertUnits", identifierSink, status);
+
+    LocalUResourceBundlePointer aliasBundle(ures_open(U_ICUDATA_ALIAS, "metadata", &status));
+    if (U_FAILURE(status)) {
+        return;
+    }
+    MaybeStackVector<CharString> unitAliases;
+    MaybeStackVector<CharString> unitReplacements;
+    
+    UnitAliasesSink aliasSink(unitAliases, unitReplacements);
+    ures_getAllChildrenWithFallback(aliasBundle.getAlias(), "alias/unit", aliasSink, status);
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    for (int32_t i = 0; i < unitAliases.length(); i++) {
+        b.add(unitAliases[i]->data(), i + kAliasOffset, status);
+        if (U_FAILURE(status)) {
+            return;
+        }
+    }
+    
+    int32_t unitReplacementStringLength = 0;
+    for (int32_t i = 0; i < unitReplacements.length(); i++) {
+        unitReplacementStringLength += unitReplacements[i]->length() + 1;
+    }
+    gUnitReplacementStrings = (const char*)uprv_malloc(unitReplacementStringLength * sizeof(char));
+    gUnitReplacements = (const char**)uprv_malloc(unitReplacements.length() * sizeof(const char**));
+    if (gUnitReplacementStrings == nullptr || gUnitReplacements == nullptr) {
+		status = U_MEMORY_ALLOCATION_ERROR;
+		return;
+    }
+    gNumUnitReplacements = unitReplacements.length();
+    char* p = const_cast<char*>(gUnitReplacementStrings);
+    for (int32_t i = 0; i < unitReplacements.length(); i++) {
+        gUnitReplacements[i] = p;
+        uprv_strcpy(p, unitReplacements[i]->data());
+        p += unitReplacements[i]->length() + 1;
+    }
+    
+    StringPiece result = b.buildStringPiece(USTRINGTRIE_BUILD_FAST, status);
+    if (U_FAILURE(status)) { return; }
+
+    size_t numBytes = result.length();
+    gSerializedUnitExtrasStemTrie = static_cast<char *>(uprv_malloc(numBytes));
+    if (gSerializedUnitExtrasStemTrie == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    uprv_memcpy(gSerializedUnitExtrasStemTrie, result.data(), numBytes);
+}
+
+class Token {
+public:
+  Token(int64_t match) : fMatch(match) {
+      if (fMatch < kCompoundPartOffset) {
+          this->fType = TYPE_PREFIX;
+      } else if (fMatch < kInitialCompoundPartOffset) {
+          this->fType = TYPE_COMPOUND_PART;
+      } else if (fMatch < kPowerPartOffset) {
+          this->fType = TYPE_INITIAL_COMPOUND_PART;
+      } else if (fMatch < kSimpleUnitOffset) {
+          this->fType = TYPE_POWER_PART;
+      } else if (fMatch < kAliasOffset) {
+          this->fType = TYPE_SIMPLE_UNIT;
+      } else {
+          this->fType = TYPE_ALIAS;
+      }
+  }
+
+  static Token constantToken(StringPiece str, UErrorCode &status) {
+      Token result;
+      auto value = Token::parseStringToLong(str, status);
+      if (U_FAILURE(status)) {
+          return result;
+      }
+      result.fMatch = value;
+      result.fType = TYPE_CONSTANT_DENOMINATOR;
+      return result;
+  }
+
+  enum Type {
+      TYPE_UNDEFINED,
+      TYPE_PREFIX,
+      TYPE_COMPOUND_PART,
+      TYPE_INITIAL_COMPOUND_PART,
+      TYPE_POWER_PART,
+      TYPE_SIMPLE_UNIT,
+      TYPE_CONSTANT_DENOMINATOR,
+      TYPE_ALIAS,
+  };
+
+  Type getType() const {
+      U_ASSERT(fMatch >= 0);
+      return this->fType;
+  }
+
+  uint64_t getConstantDenominator() const {
+      U_ASSERT(getType() == TYPE_CONSTANT_DENOMINATOR);
+      return static_cast<uint64_t>(fMatch);
+  }
+
+    UMeasurePrefix getUnitPrefix() const {
+        U_ASSERT(getType() == TYPE_PREFIX);
+        return static_cast<UMeasurePrefix>(fMatch - kPrefixOffset);
+    }
+
+    int32_t getMatch() const {
+        U_ASSERT(getType() == TYPE_COMPOUND_PART);
+        return fMatch;
+    }
+
+    int32_t getInitialCompoundPart() const {
+        U_ASSERT(getType() == TYPE_INITIAL_COMPOUND_PART);
+        U_ASSERT(fMatch == INITIAL_COMPOUND_PART_PER);
+        return fMatch;
+    }
+
+    int8_t getPower() const {
+        U_ASSERT(getType() == TYPE_POWER_PART);
+        return static_cast<int8_t>(fMatch - kPowerPartOffset);
+    }
+
+    int32_t getSimpleUnitIndex() const {
+        U_ASSERT(getType() == TYPE_SIMPLE_UNIT);
+        return fMatch - kSimpleUnitOffset;
+    }
+
+    int32_t getAliasIndex() const {
+        U_ASSERT(getType() == TYPE_ALIAS);
+        return static_cast<int32_t>(fMatch - kAliasOffset);
+    }
+
+    static uint64_t parseStringToLong(const StringPiece strNum, UErrorCode &status) {
+        StringToDoubleConverter converter(0, 0, 0, "", "");
+        int32_t count;
+        double double_result = converter.StringToDouble(strNum.data(), strNum.length(), &count);
+        if (count != strNum.length()) {
+            status = kUnitIdentifierSyntaxError;
+            return 0;
+        }
+
+        if (U_FAILURE(status) || double_result < 1.0 || double_result > static_cast<double>(INT64_MAX)) {
+            status = kUnitIdentifierSyntaxError;
+            return 0;
+        }
+
+        uint64_t int_result = static_cast<uint64_t>(double_result);
+        const double kTolerance = 1e-9;
+        if (abs(double_result - int_result) > kTolerance) {
+            status = kUnitIdentifierSyntaxError;
+            return 0;
+        }
+
+        return int_result;
+    }
+
+private:
+  Token() = default;
+  int64_t fMatch;
+  Type fType = TYPE_UNDEFINED;
+};
+
+class Parser {
+public:
+    static Parser from(StringPiece source, UErrorCode& status) {
+        if (U_FAILURE(status)) {
+            return {};
+        }
+        umtx_initOnce(gUnitExtrasInitOnce, &initUnitExtras, status);
+        if (U_FAILURE(status)) {
+            return {};
+        }
+        return {source};
+    }
+
+    struct SingleUnitOrConstant {
+        enum ValueType {
+            kSingleUnit,
+            kConstantDenominator,
+        };
+
+        ValueType type = kSingleUnit;
+        SingleUnitImpl singleUnit;
+        uint64_t constantDenominator;
+
+        static SingleUnitOrConstant singleUnitValue(SingleUnitImpl singleUnit) {
+            SingleUnitOrConstant result;
+            result.type = kSingleUnit;
+            result.singleUnit = singleUnit;
+            result.constantDenominator = 0;
+            return result;
+        }
+
+        static SingleUnitOrConstant constantDenominatorValue(uint64_t constant) {
+            SingleUnitOrConstant result;
+            result.type = kConstantDenominator;
+            result.singleUnit = {};
+            result.constantDenominator = constant;
+            return result;
+        }
+
+        uint64_t getConstantDenominator() const {
+            U_ASSERT(type == kConstantDenominator);
+            return constantDenominator;
+        }
+
+        SingleUnitImpl getSingleUnit() const {
+            U_ASSERT(type == kSingleUnit);
+            return singleUnit;
+        }
+
+        bool isSingleUnit() const { return type == kSingleUnit; }
+
+        bool isConstantDenominator() const { return type == kConstantDenominator; }
+    };
+
+    MeasureUnitImpl parse(UErrorCode& status) {
+        MeasureUnitImpl result;
+
+        if (U_FAILURE(status)) {
+            return result;
+        }
+        if (fSource.empty()) {
+            return result;
+        }
+
+        while (hasNext()) {
+            bool sawAnd = false;
+
+            auto singleUnitOrConstant = nextSingleUnitOrConstant(sawAnd, status);
+            if (U_FAILURE(status)) {
+                return result;
+            }
+
+            if (singleUnitOrConstant.isConstantDenominator()) {
+                if (result.constantDenominator > 0) {
+                    status = kUnitIdentifierSyntaxError;
+                    return result;
+                }
+                result.constantDenominator = singleUnitOrConstant.getConstantDenominator();
+                result.complexity = UMEASURE_UNIT_COMPOUND;
+                continue;
+            }
+
+            U_ASSERT(singleUnitOrConstant.isSingleUnit());
+            bool added = result.appendSingleUnit(singleUnitOrConstant.getSingleUnit(), status);
+            if (U_FAILURE(status)) {
+                return result;
+            }
+
+            if (sawAnd && !added) {
+                status = kUnitIdentifierSyntaxError;
+                return result;
+            }
+
+            if (result.singleUnits.length() >= 2) {
+                UMeasureUnitComplexity complexity =
+                    sawAnd ? UMEASURE_UNIT_MIXED : UMEASURE_UNIT_COMPOUND;
+                if (result.singleUnits.length() == 2) {
+                    U_ASSERT(result.complexity == UMEASURE_UNIT_COMPOUND);
+                    result.complexity = complexity;
+                } else if (result.complexity != complexity) {
+                    status = kUnitIdentifierSyntaxError;
+                    return result;
+                }
+            }
+        }
+
+        if (result.singleUnits.length() == 0) {
+            status = kUnitIdentifierSyntaxError;
+            return result; 
+        }
+
+        return result;
+    }
+
+private:
+    int32_t fIndex = 0;
+
+    StringPiece fSource;
+    BytesTrie fTrie;
+
+    CharString fModifiedSource;
+
+    bool fAfterPer = false;
+
+    bool fJustSawPer = false;
+
+    Parser() : fSource(""), fTrie(u"") {}
+
+    Parser(StringPiece source)
+        : fSource(source), fTrie(gSerializedUnitExtrasStemTrie) {}
+
+    inline bool hasNext() const {
+        return fIndex < fSource.length();
+    }
+
+    Token nextToken(UErrorCode& status) {
+        fTrie.reset();
+        int32_t match = -1;
+        int32_t previ = -1;
+
+        int32_t currentFIndex = fIndex;
+
+        while (fIndex < fSource.length()) {
+            auto result = fTrie.next(fSource.data()[fIndex++]);
+            if (result == USTRINGTRIE_NO_MATCH) {
+                break;
+            } else if (result == USTRINGTRIE_NO_VALUE) {
+                continue;
+            }
+            U_ASSERT(USTRINGTRIE_HAS_VALUE(result));
+            match = fTrie.getValue();
+            previ = fIndex;
+            if (result == USTRINGTRIE_FINAL_VALUE) {
+                break;
+            }
+            U_ASSERT(result == USTRINGTRIE_INTERMEDIATE_VALUE);
+        }
+
+        if (match >= 0) {
+            fIndex = previ;
+            return {match};
+        }
+
+        int32_t endOfConstantIndex = fSource.find("-", currentFIndex);
+        endOfConstantIndex = (endOfConstantIndex == -1) ? fSource.length() : endOfConstantIndex;
+        if (endOfConstantIndex <= currentFIndex) {
+            status = kUnitIdentifierSyntaxError;
+            return {match};
+        }
+
+        StringPiece constantDenominatorStr =
+            fSource.substr(currentFIndex, endOfConstantIndex - currentFIndex);
+        fIndex = endOfConstantIndex;
+        return Token::constantToken(constantDenominatorStr, status);
+    }
+
+    SingleUnitOrConstant nextSingleUnitOrConstant(bool &sawAnd, UErrorCode &status) {
+        SingleUnitImpl singleUnitResult;
+        if (U_FAILURE(status)) {
+            return {};
+        }
+
+        int32_t state = 0;
+
+        bool atStart = fIndex == 0;
+        Token token = nextToken(status);
+        if (U_FAILURE(status)) {
+            return {};
+        }
+
+        if (token.getType() == Token::TYPE_ALIAS) {
+            processAlias(token, status);
+            token = nextToken(status);
+            if (U_FAILURE(status)) {
+                return {};
+            }
+        }
+
+        fJustSawPer = false;
+
+        if (atStart) {
+            if (token.getType() == Token::TYPE_INITIAL_COMPOUND_PART) {
+                U_ASSERT(token.getInitialCompoundPart() == INITIAL_COMPOUND_PART_PER);
+                fAfterPer = true;
+                fJustSawPer = true;
+                singleUnitResult.dimensionality = -1;
+
+                token = nextToken(status);
+                if (U_FAILURE(status)) {
+                    return {};
+                }
+            }
+        } else {
+            if (token.getType() != Token::TYPE_COMPOUND_PART) {
+                status = kUnitIdentifierSyntaxError;
+                return {};
+            }
+
+            switch (token.getMatch()) {
+            case COMPOUND_PART_PER:
+                if (sawAnd) {
+                    status = kUnitIdentifierSyntaxError;
+                    return {};
+                }
+                fAfterPer = true;
+                fJustSawPer = true;
+                singleUnitResult.dimensionality = -1;
+                break;
+
+            case COMPOUND_PART_TIMES:
+                if (fAfterPer) {
+                    singleUnitResult.dimensionality = -1;
+                }
+                break;
+
+            case COMPOUND_PART_AND:
+                if (fAfterPer) {
+                    status = kUnitIdentifierSyntaxError;
+                    return {};
+                }
+                sawAnd = true;
+                break;
+            }
+
+            token = nextToken(status);
+            if (U_FAILURE(status)) {
+                return {};
+            }
+        }
+
+        if (token.getType() == Token::TYPE_CONSTANT_DENOMINATOR) {
+            if (!fJustSawPer) {
+                status = kUnitIdentifierSyntaxError;
+                return {};
+            }
+
+            return SingleUnitOrConstant::constantDenominatorValue(token.getConstantDenominator());
+        }
+
+        while (true) {
+            switch (token.getType()) {
+            case Token::TYPE_POWER_PART:
+                if (state > 0) {
+                    status = kUnitIdentifierSyntaxError;
+                    return {};
+                }
+                singleUnitResult.dimensionality *= token.getPower();
+                state = 1;
+                break;
+
+            case Token::TYPE_PREFIX:
+                if (state > 1) {
+                    status = kUnitIdentifierSyntaxError;
+                    return {};
+                }
+                singleUnitResult.unitPrefix = token.getUnitPrefix();
+                state = 2;
+                break;
+
+            case Token::TYPE_SIMPLE_UNIT:
+                singleUnitResult.index = token.getSimpleUnitIndex();
+                break;
+
+            case Token::TYPE_ALIAS:
+                processAlias(token, status);
+                break;
+
+            default:
+                status = kUnitIdentifierSyntaxError;
+                return {};
+            }
+
+            if (token.getType() == Token::TYPE_SIMPLE_UNIT) {
+                break;
+            }
+
+            if (!hasNext()) {
+                status = kUnitIdentifierSyntaxError;
+                return {};
+            }
+            token = nextToken(status);
+            if (U_FAILURE(status)) {
+                return {};
+            }
+        }
+
+        return SingleUnitOrConstant::singleUnitValue(singleUnitResult);
+    }
+
+  private:
+    void processAlias(const Token &token, UErrorCode &status) {
+        if (U_FAILURE(status)) {
+            return;
+        }
+
+        auto aliasIndex = token.getAliasIndex();
+        if (aliasIndex < 0 || aliasIndex >= gNumUnitReplacements) {
+            status = kUnitIdentifierSyntaxError;
+            return;
+        }
+        const char* replacement = gUnitReplacements[aliasIndex];
+        
+        fModifiedSource.clear();
+        fModifiedSource.append(StringPiece(replacement), status);
+        
+        if (fIndex < fSource.length()) {
+            StringPiece remaining = fSource.substr(fIndex);
+            fModifiedSource.append(remaining.data(), remaining.length(), status);
+        }
+
+        if (U_FAILURE(status)) {
+            return;
+        }
+
+        fSource = StringPiece(fModifiedSource.data(), fModifiedSource.length());
+        fIndex = 0;
+
+        return;
+    }
+};
+
+int32_t U_CALLCONV
+compareSingleUnits(const void* , const void* left, const void* right) {
+    const auto* realLeft = static_cast<const SingleUnitImpl* const*>(left);
+    const auto* realRight = static_cast<const SingleUnitImpl* const*>(right);
+    return (*realLeft)->compareTo(**realRight);
+}
+
+int32_t getUnitCategoryIndex(BytesTrie &trie, StringPiece baseUnitIdentifier, UErrorCode &status) {
+    UStringTrieResult result = trie.reset().next(baseUnitIdentifier.data(), baseUnitIdentifier.length());
+    if (!USTRINGTRIE_HAS_VALUE(result)) {
+        status = U_UNSUPPORTED_ERROR;
+        return -1;
+    }
+
+    return trie.getValue();
+}
+
+} 
+
+U_CAPI int32_t U_EXPORT2
+umeas_getPrefixPower(UMeasurePrefix unitPrefix) {
+    if (unitPrefix >= UMEASURE_PREFIX_INTERNAL_MIN_BIN &&
+        unitPrefix <= UMEASURE_PREFIX_INTERNAL_MAX_BIN) {
+        return unitPrefix - UMEASURE_PREFIX_INTERNAL_ONE_BIN;
+    }
+    U_ASSERT(unitPrefix >= UMEASURE_PREFIX_INTERNAL_MIN_SI &&
+             unitPrefix <= UMEASURE_PREFIX_INTERNAL_MAX_SI);
+    return unitPrefix - UMEASURE_PREFIX_ONE;
+}
+
+U_CAPI int32_t U_EXPORT2
+umeas_getPrefixBase(UMeasurePrefix unitPrefix) {
+    if (unitPrefix >= UMEASURE_PREFIX_INTERNAL_MIN_BIN &&
+        unitPrefix <= UMEASURE_PREFIX_INTERNAL_MAX_BIN) {
+        return 1024;
+    }
+    U_ASSERT(unitPrefix >= UMEASURE_PREFIX_INTERNAL_MIN_SI &&
+             unitPrefix <= UMEASURE_PREFIX_INTERNAL_MAX_SI);
+    return 10;
+}
+
+CharString U_I18N_API getUnitQuantity(const MeasureUnitImpl &baseMeasureUnitImpl, UErrorCode &status) {
+    CharString result;
+    MeasureUnitImpl baseUnitImpl = baseMeasureUnitImpl.copy(status);
+    UErrorCode localStatus = U_ZERO_ERROR;
+    umtx_initOnce(gUnitExtrasInitOnce, &initUnitExtras, status);
+    if (U_FAILURE(status)) {
+        return result;
+    }
+    BytesTrie trie(gSerializedUnitCategoriesTrie);
+
+    baseUnitImpl.serialize(status);
+    StringPiece identifier = baseUnitImpl.identifier.data();
+    int32_t idx = getUnitCategoryIndex(trie, identifier, localStatus);
+    if (U_FAILURE(status)) {
+        return result;
+    }
+
+    if (U_FAILURE(localStatus)) {
+        localStatus = U_ZERO_ERROR;
+        baseUnitImpl.takeReciprocal(status);
+        baseUnitImpl.serialize(status);
+        identifier.set(baseUnitImpl.identifier.data());
+        idx = getUnitCategoryIndex(trie, identifier, localStatus);
+
+        if (U_FAILURE(status)) {
+            return result;
+        }
+    }
+
+    MeasureUnitImpl simplifiedUnit = baseMeasureUnitImpl.copyAndSimplify(status);
+    if (U_FAILURE(status)) {
+        return result;
+    }
+    if (U_FAILURE(localStatus)) {
+        localStatus = U_ZERO_ERROR;
+        simplifiedUnit.serialize(status);
+        identifier.set(simplifiedUnit.identifier.data());
+        idx = getUnitCategoryIndex(trie, identifier, localStatus);
+
+        if (U_FAILURE(status)) {
+            return result;
+        }
+    }
+
+    if (U_FAILURE(localStatus)) {
+        localStatus = U_ZERO_ERROR;
+        simplifiedUnit.takeReciprocal(status);
+        simplifiedUnit.serialize(status);
+        identifier.set(simplifiedUnit.identifier.data());
+        idx = getUnitCategoryIndex(trie, identifier, localStatus);
+
+        if (U_FAILURE(status)) {
+            return result;
+        }
+    }
+
+    if (U_FAILURE(localStatus)) {
+        status = U_INVALID_FORMAT_ERROR;
+        return result;
+    }
+
+    if (idx < 0 || idx >= gCategoriesCount) {
+        status = U_INVALID_FORMAT_ERROR;
+        return result;
+    }
+
+    result.appendInvariantChars(gCategories[idx], u_strlen(gCategories[idx]), status);
+    return result;
+}
+
+SingleUnitImpl SingleUnitImpl::forMeasureUnit(const MeasureUnit& measureUnit, UErrorCode& status) {
+    MeasureUnitImpl temp;
+    const MeasureUnitImpl& impl = MeasureUnitImpl::forMeasureUnit(measureUnit, temp, status);
+    if (U_FAILURE(status)) {
+        return {};
+    }
+    if (impl.singleUnits.length() == 0) {
+        return {};
+    }
+    if (impl.singleUnits.length() == 1) {
+        return *impl.singleUnits[0];
+    }
+    status = U_ILLEGAL_ARGUMENT_ERROR;
+    return {};
+}
+
+MeasureUnit SingleUnitImpl::build(UErrorCode& status) const {
+    MeasureUnitImpl temp;
+    temp.appendSingleUnit(*this, status);
+    return std::move(temp).build(status);
+}
+
+const char *SingleUnitImpl::getSimpleUnitID() const {
+    return gSimpleUnits[index];
+}
+
+void SingleUnitImpl::appendNeutralIdentifier(CharString &result, UErrorCode &status) const UPRV_NO_SANITIZE_UNDEFINED {
+    int32_t absPower = std::abs(this->dimensionality);
+
+    U_ASSERT(absPower > 0); 
+    
+    if (absPower == 1) {
+    } else if (absPower == 2) {
+        result.append(StringPiece("square-"), status);
+    } else if (absPower == 3) {
+        result.append(StringPiece("cubic-"), status);
+    } else if (absPower <= 15) {
+        result.append(StringPiece("pow"), status);
+        result.appendNumber(absPower, status);
+        result.append(StringPiece("-"), status);
+    } else {
+        status = U_ILLEGAL_ARGUMENT_ERROR; 
+        return;
+    }
+
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    if (this->unitPrefix != UMEASURE_PREFIX_ONE) {
+        bool found = false;
+        for (const auto &unitPrefixInfo : gUnitPrefixStrings) {
+            if (unitPrefixInfo.value == this->unitPrefix) {
+                result.append(unitPrefixInfo.string, status);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            status = U_UNSUPPORTED_ERROR;
+            return;
+        }
+    }
+
+    result.append(StringPiece(this->getSimpleUnitID()), status);
+}
+
+int32_t SingleUnitImpl::getUnitCategoryIndex() const {
+    return gSimpleUnitCategories[index];
+}
+
+MeasureUnitImpl::MeasureUnitImpl(const SingleUnitImpl &singleUnit, UErrorCode &status) {
+    this->appendSingleUnit(singleUnit, status);
+}
+
+MeasureUnitImpl MeasureUnitImpl::forIdentifier(StringPiece identifier, UErrorCode& status) {
+    return Parser::from(identifier, status).parse(status);
+}
+
+const MeasureUnitImpl& MeasureUnitImpl::forMeasureUnit(
+        const MeasureUnit& measureUnit, MeasureUnitImpl& memory, UErrorCode& status) {
+    if (measureUnit.fImpl) {
+        return *measureUnit.fImpl;
+    } else {
+        memory = Parser::from(measureUnit.getIdentifier(), status).parse(status);
+        return memory;
+    }
+}
+
+MeasureUnitImpl MeasureUnitImpl::forMeasureUnitMaybeCopy(
+        const MeasureUnit& measureUnit, UErrorCode& status) {
+    if (measureUnit.fImpl) {
+        return measureUnit.fImpl->copy(status);
+    } else {
+        return Parser::from(measureUnit.getIdentifier(), status).parse(status);
+    }
+}
+
+void MeasureUnitImpl::takeReciprocal(UErrorCode& ) {
+    identifier.clear();
+    for (int32_t i = 0; i < singleUnits.length(); i++) {
+        singleUnits[i]->dimensionality *= -1;
+    }
+}
+
+MeasureUnitImpl MeasureUnitImpl::copyAndSimplify(UErrorCode &status) const {
+    MeasureUnitImpl result;
+    for (int32_t i = 0; i < singleUnits.length(); i++) {
+        const SingleUnitImpl &singleUnit = *this->singleUnits[i];
+        
+        bool unitExist = false;
+        for (int32_t j = 0; j < result.singleUnits.length(); j++) {
+            if (uprv_strcmp(result.singleUnits[j]->getSimpleUnitID(), singleUnit.getSimpleUnitID()) ==
+                    0 &&
+                result.singleUnits[j]->unitPrefix == singleUnit.unitPrefix) {
+                unitExist = true;
+                result.singleUnits[j]->dimensionality =
+                    result.singleUnits[j]->dimensionality + singleUnit.dimensionality;
+                break;
+            }
+        }
+
+        if (!unitExist) {
+            result.appendSingleUnit(singleUnit, status);
+        }
+    }
+
+    return result;
+}
+
+bool MeasureUnitImpl::appendSingleUnit(const SingleUnitImpl &singleUnit, UErrorCode &status) {
+    identifier.clear();
+
+    if (singleUnit.isDimensionless()) {
+        return false;
+    }
+
+    SingleUnitImpl *oldUnit = nullptr;
+    for (int32_t i = 0; i < this->singleUnits.length(); i++) {
+        auto *candidate = this->singleUnits[i];
+        if (candidate->isCompatibleWith(singleUnit)) {
+            oldUnit = candidate;
+        }
+    }
+
+    if (oldUnit) {
+        oldUnit->dimensionality += singleUnit.dimensionality;
+
+        return false;
+    }
+
+    this->singleUnits.emplaceBackAndCheckErrorCode(status, singleUnit);
+    if (U_FAILURE(status)) {
+        return false;
+    }
+
+    if (this->singleUnits.length() > 1 &&
+        this->complexity == UMeasureUnitComplexity::UMEASURE_UNIT_SINGLE) {
+        this->complexity = UMeasureUnitComplexity::UMEASURE_UNIT_COMPOUND;
+    }
+
+    return true;
+}
+
+MaybeStackVector<MeasureUnitImplWithIndex>
+MeasureUnitImpl::extractIndividualUnitsWithIndices(UErrorCode &status) const {
+    MaybeStackVector<MeasureUnitImplWithIndex> result;
+
+    if (this->complexity != UMeasureUnitComplexity::UMEASURE_UNIT_MIXED) {
+        result.emplaceBackAndCheckErrorCode(status, 0, *this, status);
+        return result;
+    }
+
+    for (int32_t i = 0; i < singleUnits.length(); ++i) {
+        result.emplaceBackAndCheckErrorCode(status, i, *singleUnits[i], status);
+        if (U_FAILURE(status)) {
+            return result;
+        }
+    }
+
+    return result;
+}
+
+int32_t countCharacter(const CharString &str, char c) {
+    int32_t count = 0;
+    for (int32_t i = 0, n = str.length(); i < n; i++) {
+        if (str[i] == c) {
+            count++;
+        }
+    }
+    return count;
+}
+
+CharString getConstantsString(uint64_t constantDenominator, UErrorCode &status) {
+    U_ASSERT(constantDenominator > 0 && constantDenominator <= LLONG_MAX);
+
+    CharString result;
+    result.appendNumber(constantDenominator, status);
+    if (U_FAILURE(status)) {
+        return result;
+    }
+
+    if (constantDenominator <= 1000) {
+        return result;
+    }
+
+    int32_t zeros = countCharacter(result, '0');
+    if (zeros == result.length() - 1 && result[0] == '1') {
+        result.clear();
+        result.append(StringPiece("1e"), status);
+        result.appendNumber(zeros, status);
+    }
+
+    return result;
+}
+
+void MeasureUnitImpl::serialize(UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    if (this->singleUnits.length() == 0 && this->constantDenominator == 0) {
+        return;
+    }
+
+    if (this->complexity == UMEASURE_UNIT_COMPOUND) {
+        uprv_sortArray(this->singleUnits.getAlias(), this->singleUnits.length(),
+                       sizeof(this->singleUnits[0]), compareSingleUnits, nullptr, false, &status);
+        if (U_FAILURE(status)) {
+            return;
+        }
+    }
+
+    CharString result;
+    bool beforePer = true;
+    bool firstTimeNegativeDimension = false;
+    bool constantDenominatorAppended = false;
+    for (int32_t i = 0; i < this->singleUnits.length(); i++) {
+        if (beforePer && (*this->singleUnits[i]).dimensionality < 0) {
+            beforePer = false;
+            firstTimeNegativeDimension = true;
+        } else if ((*this->singleUnits[i]).dimensionality < 0) {
+            firstTimeNegativeDimension = false;
+        }
+
+        if (U_FAILURE(status)) {
+            return;
+        }
+
+        if (this->complexity == UMeasureUnitComplexity::UMEASURE_UNIT_MIXED) {
+            if (result.length() != 0) {
+                result.append(StringPiece("-and-"), status);
+            }
+        } else {
+            if (firstTimeNegativeDimension) {
+                if (result.length() == 0) {
+                    result.append(StringPiece("per-"), status);
+                } else {
+                    result.append(StringPiece("-per-"), status);
+                }
+
+                if (this->constantDenominator > 0) {
+                    result.append(getConstantsString(this->constantDenominator, status), status);
+                    result.append(StringPiece("-"), status);
+                    constantDenominatorAppended = true;
+                }
+
+            } else if (result.length() != 0) {
+                result.append(StringPiece("-"), status);
+            }
+        }
+
+        this->singleUnits[i]->appendNeutralIdentifier(result, status);
+    }
+
+    if (!constantDenominatorAppended && this->constantDenominator > 0) {
+        result.append(StringPiece("-per-"), status);
+        result.append(getConstantsString(this->constantDenominator, status), status);
+    }
+
+    if (U_FAILURE(status)) {
+        return;
+    }
+    this->identifier = result.toStringPiece();
+    if (this->identifier.isEmpty() != result.isEmpty()) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+    }
+}
+
+MeasureUnit MeasureUnitImpl::build(UErrorCode &status) && {
+    this->serialize(status);
+    return MeasureUnit(std::move(*this));
+}
+
+MeasureUnit MeasureUnit::forIdentifier(StringPiece identifier, UErrorCode &status) {
+    return Parser::from(identifier, status).parse(status).build(status);
+}
+
+UMeasureUnitComplexity MeasureUnit::getComplexity(UErrorCode &status) const {
+    MeasureUnitImpl temp;
+    return MeasureUnitImpl::forMeasureUnit(*this, temp, status).complexity;
+}
+
+UMeasurePrefix MeasureUnit::getPrefix(UErrorCode &status) const {
+    return SingleUnitImpl::forMeasureUnit(*this, status).unitPrefix;
+}
+
+MeasureUnit MeasureUnit::withPrefix(UMeasurePrefix prefix,
+                                    UErrorCode &status) const UPRV_NO_SANITIZE_UNDEFINED {
+    SingleUnitImpl singleUnit = SingleUnitImpl::forMeasureUnit(*this, status);
+    singleUnit.unitPrefix = prefix;
+    return singleUnit.build(status);
+}
+
+uint64_t MeasureUnit::getConstantDenominator(UErrorCode &status) const {
+    auto measureUnitImpl = MeasureUnitImpl::forMeasureUnitMaybeCopy(*this, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    auto complexity = measureUnitImpl.complexity;
+
+    if (complexity != UMEASURE_UNIT_SINGLE && complexity != UMEASURE_UNIT_COMPOUND) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+
+
+    return measureUnitImpl.constantDenominator;
+}
+
+MeasureUnit MeasureUnit::withConstantDenominator(uint64_t denominator, UErrorCode &status) const {
+    if (denominator > LONG_MAX) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return {};
+    }
+
+    auto complexity = this->getComplexity(status);
+    if (U_FAILURE(status)) {
+        return {};
+    }
+    if (complexity != UMEASURE_UNIT_SINGLE && complexity != UMEASURE_UNIT_COMPOUND) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return {};
+    }
+
+    MeasureUnitImpl impl = MeasureUnitImpl::forMeasureUnitMaybeCopy(*this, status);
+    if (U_FAILURE(status)) {
+        return {};
+    }
+
+    impl.constantDenominator = denominator;
+    impl.complexity = (impl.singleUnits.length() < 2 && denominator == 0) ? UMEASURE_UNIT_SINGLE
+                                                                          : UMEASURE_UNIT_COMPOUND;
+    return std::move(impl).build(status);
+}
+
+int32_t MeasureUnit::getDimensionality(UErrorCode& status) const {
+    SingleUnitImpl singleUnit = SingleUnitImpl::forMeasureUnit(*this, status);
+    if (U_FAILURE(status)) { return 0; }
+    if (singleUnit.isDimensionless()) {
+        return 0;
+    }
+    return singleUnit.dimensionality;
+}
+
+MeasureUnit MeasureUnit::withDimensionality(int32_t dimensionality, UErrorCode& status) const {
+    SingleUnitImpl singleUnit = SingleUnitImpl::forMeasureUnit(*this, status);
+    singleUnit.dimensionality = dimensionality;
+    return singleUnit.build(status);
+}
+
+MeasureUnit MeasureUnit::reciprocal(UErrorCode& status) const {
+    MeasureUnitImpl impl = MeasureUnitImpl::forMeasureUnitMaybeCopy(*this, status);
+    if (impl.constantDenominator != 0) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return {};
+    }
+    impl.takeReciprocal(status);
+    return std::move(impl).build(status);
+}
+
+MeasureUnit MeasureUnit::product(const MeasureUnit& other, UErrorCode& status) const {
+    MeasureUnitImpl impl = MeasureUnitImpl::forMeasureUnitMaybeCopy(*this, status);
+    MeasureUnitImpl temp;
+    const MeasureUnitImpl& otherImpl = MeasureUnitImpl::forMeasureUnit(other, temp, status);
+    if (impl.complexity == UMEASURE_UNIT_MIXED || otherImpl.complexity == UMEASURE_UNIT_MIXED) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return {};
+    }
+    for (int32_t i = 0; i < otherImpl.singleUnits.length(); i++) {
+        impl.appendSingleUnit(*otherImpl.singleUnits[i], status);
+    }
+
+    uint64_t currentConstatDenominator = impl.constantDenominator;
+    uint64_t otherConstantDenominator = otherImpl.constantDenominator;
+
+    if (currentConstatDenominator != 0 && otherConstantDenominator != 0) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return {};
+    }
+
+    impl.constantDenominator = uprv_max(currentConstatDenominator, otherConstantDenominator);
+
+    if (impl.singleUnits.length() > 1 || impl.constantDenominator > 0) {
+        impl.complexity = UMEASURE_UNIT_COMPOUND;
+    }
+
+    return std::move(impl).build(status);
+}
+
+LocalArray<MeasureUnit> MeasureUnit::splitToSingleUnitsImpl(int32_t& outCount, UErrorCode& status) const {
+    MeasureUnitImpl temp;
+    const MeasureUnitImpl& impl = MeasureUnitImpl::forMeasureUnit(*this, temp, status);
+    outCount = impl.singleUnits.length();
+    MeasureUnit* arr = new MeasureUnit[outCount];
+    if (arr == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return LocalArray<MeasureUnit>();
+    }
+    for (int32_t i = 0; i < outCount; i++) {
+        arr[i] = impl.singleUnits[i]->build(status);
+    }
+    return LocalArray<MeasureUnit>(arr, status);
+}
+
+
+U_NAMESPACE_END
+
+#endif /* !UNCONFIG_NO_FORMATTING */

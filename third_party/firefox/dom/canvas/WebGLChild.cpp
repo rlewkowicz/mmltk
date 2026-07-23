@@ -1,0 +1,150 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WebGLChild.h"
+
+#include "ClientWebGLContext.h"
+#include "WebGLMethodDispatcher.h"
+#include "mozilla/StaticPrefs_webgl.h"
+
+namespace mozilla::dom {
+
+WebGLChild::WebGLChild(ClientWebGLContext& context)
+    : mContext(&context),
+      mDefaultCmdsShmemSize(StaticPrefs::webgl_out_of_process_shmem_size()) {}
+
+WebGLChild::~WebGLChild() { Destroy(); }
+
+void WebGLChild::Destroy() {
+  if (!CanSend()) {
+    return;
+  }
+  if (mContext) {
+    mContext->OnDestroyChild(this);
+  }
+  (void)Send__delete__(this);
+}
+
+void WebGLChild::ActorDestroy(ActorDestroyReason why) {
+  mPendingCmdsShmem = {};
+}
+
+
+Maybe<Range<uint8_t>> WebGLChild::AllocPendingCmdBytes(
+    const size_t size, const size_t fyiAlignmentOverhead) {
+  if (!mPendingCmdsShmem.Size()) {
+    size_t capacity = mDefaultCmdsShmemSize;
+    if (capacity < size) {
+      capacity = size;
+    }
+
+    mPendingCmdsShmem = mozilla::ipc::BigBuffer::TryAlloc(capacity);
+    if (!mPendingCmdsShmem.Size()) {
+      NS_WARNING("Failed to alloc shmem for AllocPendingCmdBytes.");
+      return {};
+    }
+    mPendingCmdsPos = 0;
+    mPendingCmdsAlignmentOverhead = 0;
+
+    if (kIsDebug) {
+      const auto ptr = mPendingCmdsShmem.Data();
+      const auto initialOffset = AlignmentOffset(kUniversalAlignment, ptr);
+      MOZ_ALWAYS_TRUE(!initialOffset);
+    }
+  }
+
+  const auto range = Range<uint8_t>{mPendingCmdsShmem.AsSpan()};
+
+  auto itr = range.begin() + mPendingCmdsPos;
+  const auto offset = AlignmentOffset(kUniversalAlignment, itr.get());
+  mPendingCmdsPos += offset;
+  mPendingCmdsAlignmentOverhead += offset;
+  const auto required = mPendingCmdsPos + size;
+  if (required > range.length()) {
+    FlushPendingCmds();
+    return AllocPendingCmdBytes(size, fyiAlignmentOverhead);
+  }
+  itr = range.begin() + mPendingCmdsPos;
+  const auto remaining = Range<uint8_t>{itr, range.end()};
+  mPendingCmdsPos += size;
+  mPendingCmdsAlignmentOverhead += fyiAlignmentOverhead;
+  return Some(Range<uint8_t>{remaining.begin(), remaining.begin() + size});
+}
+
+void WebGLChild::FlushPendingCmds() {
+  if (!mPendingCmdsShmem.Size()) return;
+
+  const auto byteSize = mPendingCmdsPos;
+  SendDispatchCommands(std::move(mPendingCmdsShmem), byteSize);
+  mPendingCmdsShmem = {};
+
+  mFlushedCmdInfo.flushes += 1;
+  mFlushedCmdInfo.flushedCmdBytes += byteSize;
+  mFlushedCmdInfo.overhead += mPendingCmdsAlignmentOverhead;
+
+  mFlushedCmdInfo.flushesSinceLastCongestionCheck += 1;
+  constexpr auto START_CONGESTION_CHECK_THRESHOLD = 20;
+  constexpr auto ASSUME_IPC_CONGESTION_THRESHOLD = 70;
+  RefPtr<WebGLChild> self = this;
+  size_t generation = self->mFlushedCmdInfo.congestionCheckGeneration;
+
+  if (mFlushedCmdInfo.flushesSinceLastCongestionCheck ==
+      START_CONGESTION_CHECK_THRESHOLD) {
+    const auto eventTarget = RefPtr{GetCurrentSerialEventTarget()};
+    MOZ_ASSERT(eventTarget);
+    if (!eventTarget) {
+      NS_WARNING("GetCurrentSerialEventTarget()->nullptr in FlushPendingCmds.");
+    } else {
+      SendPing()->Then(eventTarget, __func__, [self, generation]() {
+        if (generation == self->mFlushedCmdInfo.congestionCheckGeneration) {
+          self->mFlushedCmdInfo.flushesSinceLastCongestionCheck = 0;
+          self->mFlushedCmdInfo.congestionCheckGeneration++;
+        }
+      });
+    }
+  } else if (mFlushedCmdInfo.flushesSinceLastCongestionCheck >
+             ASSUME_IPC_CONGESTION_THRESHOLD) {
+    SendSyncPing();
+    mFlushedCmdInfo.flushesSinceLastCongestionCheck = 0;
+    mFlushedCmdInfo.congestionCheckGeneration++;
+  }
+
+  if (gl::GLContext::ShouldSpew()) {
+    const auto overheadRatio = float(mPendingCmdsAlignmentOverhead) /
+                               (byteSize - mPendingCmdsAlignmentOverhead);
+    const auto totalOverheadRatio =
+        float(mFlushedCmdInfo.overhead) /
+        (mFlushedCmdInfo.flushedCmdBytes - mFlushedCmdInfo.overhead);
+    printf_stderr(
+        "[WebGLChild] Flushed %zu (%zu=%.2f%% overhead) bytes."
+        " (%zu (%.2f%% overhead) over %zu flushes)\n",
+        byteSize, mPendingCmdsAlignmentOverhead, 100 * overheadRatio,
+        mFlushedCmdInfo.flushedCmdBytes, 100 * totalOverheadRatio,
+        mFlushedCmdInfo.flushes);
+  }
+}
+
+
+mozilla::ipc::IPCResult WebGLChild::RecvJsWarning(
+    const std::string& text) const {
+  if (!mContext) return IPC_OK();
+  mContext->JsWarning(text);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WebGLChild::RecvOnContextLoss(
+    const webgl::ContextLossReason reason) const {
+  if (!mContext) return IPC_OK();
+  mContext->OnContextLoss(reason);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WebGLChild::RecvOnSyncComplete(
+    const webgl::ObjectId id) const {
+  if (!mContext) return IPC_OK();
+  mContext->OnSyncComplete(id);
+  return IPC_OK();
+}
+
+}  

@@ -1,0 +1,405 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsTObserverArray_h_
+#define nsTObserverArray_h_
+
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/ReverseIterator.h"
+#include "nsTArray.h"
+#include "nsCycleCollectionNoteChild.h"
+
+
+class nsTObserverArray_base {
+ public:
+  typedef size_t index_type;
+  typedef size_t size_type;
+  typedef ptrdiff_t diff_type;
+
+ protected:
+  class Iterator_base {
+   public:
+    Iterator_base(const Iterator_base&) = delete;
+
+   protected:
+    friend class nsTObserverArray_base;
+
+    Iterator_base(index_type aPosition, Iterator_base* aNext)
+        : mPosition(aPosition), mNext(aNext) {}
+
+    index_type mPosition;
+
+    Iterator_base* mNext;
+  };
+
+  nsTObserverArray_base() : mIterators(nullptr) {}
+
+  ~nsTObserverArray_base() {
+    NS_ASSERTION(mIterators == nullptr, "iterators outlasting array");
+  }
+
+  void AdjustIterators(index_type aModPos, diff_type aAdjustment);
+
+  void ClearIterators();
+
+  mutable Iterator_base* mIterators;
+};
+
+template <class T, size_t N>
+class nsAutoTObserverArray : protected nsTObserverArray_base {
+ public:
+  typedef T value_type;
+  typedef nsTArray<T> array_type;
+
+  nsAutoTObserverArray() = default;
+
+
+  size_type Length() const { return mArray.Length(); }
+
+  bool IsEmpty() const { return mArray.IsEmpty(); }
+
+  const value_type* Elements() const { return mArray.Elements(); }
+  value_type* Elements() { return mArray.Elements(); }
+
+  value_type& ElementAt(index_type aIndex) { return mArray.ElementAt(aIndex); }
+
+  const value_type& ElementAt(index_type aIndex) const {
+    return mArray.ElementAt(aIndex);
+  }
+
+  value_type& SafeElementAt(index_type aIndex, value_type& aDef) {
+    return mArray.SafeElementAt(aIndex, aDef);
+  }
+
+  const value_type& SafeElementAt(index_type aIndex,
+                                  const value_type& aDef) const {
+    return mArray.SafeElementAt(aIndex, aDef);
+  }
+
+
+
+  template <class Item>
+  bool Contains(const Item& aItem) const {
+    return IndexOf(aItem) != array_type::NoIndex;
+  }
+
+  template <class Item>
+  index_type IndexOf(const Item& aItem, index_type aStart = 0) const {
+    return mArray.IndexOf(aItem, aStart);
+  }
+
+
+  template <class Item>
+  void InsertElementAt(index_type aIndex, const Item& aItem) {
+    mArray.InsertElementAt(aIndex, aItem);
+    AdjustIterators(aIndex, 1);
+  }
+
+  value_type* InsertElementAt(index_type aIndex) {
+    value_type* item = mArray.InsertElementAt(aIndex);
+    AdjustIterators(aIndex, 1);
+    return item;
+  }
+
+  template <class Item>
+  void PrependElementUnlessExists(const Item& aItem) {
+    if (!Contains(aItem)) {
+      mArray.InsertElementAt(0, aItem);
+      AdjustIterators(0, 1);
+    }
+  }
+
+  template <class Item>
+  void AppendElement(Item&& aItem) {
+    mArray.AppendElement(std::forward<Item>(aItem));
+  }
+
+  value_type* AppendElement() { return mArray.AppendElement(); }
+
+  template <class Item>
+  void AppendElementUnlessExists(const Item& aItem) {
+    if (!Contains(aItem)) {
+      mArray.AppendElement(aItem);
+    }
+  }
+
+  void RemoveElementAt(index_type aIndex) {
+    NS_ASSERTION(aIndex < mArray.Length(), "invalid index");
+    mArray.RemoveElementAt(aIndex);
+    AdjustIterators(aIndex, -1);
+  }
+
+  template <class Item>
+  bool RemoveElement(const Item& aItem) {
+    index_type index = mArray.IndexOf(aItem, 0);
+    if (index == array_type::NoIndex) {
+      return false;
+    }
+
+    mArray.RemoveElementAt(index);
+    AdjustIterators(index, -1);
+    return true;
+  }
+
+  template <typename Predicate>
+  void NonObservingRemoveElementsBy(Predicate aPredicate) {
+    index_type i = 0;
+    mArray.RemoveElementsBy([&](const value_type& aItem) {
+      if (aPredicate(aItem)) {
+        AdjustIterators(i, -1);
+        return true;
+      }
+      ++i;
+      return false;
+    });
+  }
+
+  void Clear() {
+    mArray.Clear();
+    ClearIterators();
+  }
+
+  void Compact() { mArray.Compact(); }
+
+  size_t ShallowSizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return mArray.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+
+
+  class Iterator : public Iterator_base {
+   protected:
+    friend class nsAutoTObserverArray;
+    typedef nsAutoTObserverArray<T, N> array_type;
+
+    Iterator(const Iterator& aOther)
+        : Iterator(aOther.mPosition, aOther.mArray) {}
+
+    Iterator(index_type aPosition, const array_type& aArray)
+        : Iterator_base(aPosition, aArray.mIterators),
+          mArray(const_cast<array_type&>(aArray)) {
+      aArray.mIterators = this;
+    }
+
+    ~Iterator() {
+      NS_ASSERTION(mArray.mIterators == this,
+                   "Iterators must currently be destroyed in opposite order "
+                   "from the construction order. It is suggested that you "
+                   "simply put them on the stack");
+      mArray.mIterators = mNext;
+    }
+
+    array_type& mArray;
+  };
+
+  class ForwardIterator : protected Iterator {
+   public:
+    typedef nsAutoTObserverArray<T, N> array_type;
+    typedef Iterator base_type;
+
+    explicit ForwardIterator(const array_type& aArray) : Iterator(0, aArray) {}
+
+    ForwardIterator(const array_type& aArray, index_type aPos)
+        : Iterator(aPos, aArray) {}
+
+    bool operator<(const ForwardIterator& aOther) const {
+      NS_ASSERTION(&this->mArray == &aOther.mArray,
+                   "not iterating the same array");
+      return base_type::mPosition < aOther.mPosition;
+    }
+
+    bool HasMore() const {
+      return base_type::mPosition < base_type::mArray.Length();
+    }
+
+    value_type& GetNext() {
+      NS_ASSERTION(HasMore(), "iterating beyond end of array");
+      return base_type::mArray.Elements()[base_type::mPosition++];
+    }
+
+    void Remove() {
+      return base_type::mArray.RemoveElementAt(base_type::mPosition - 1);
+    }
+  };
+
+  class EndLimitedIterator : protected ForwardIterator {
+   public:
+    typedef nsAutoTObserverArray<T, N> array_type;
+    typedef Iterator base_type;
+
+    explicit EndLimitedIterator(const array_type& aArray)
+        : ForwardIterator(aArray), mEnd(aArray, aArray.Length()) {}
+
+    bool HasMore() const { return *this < mEnd; }
+
+    value_type& GetNext() {
+      NS_ASSERTION(HasMore(), "iterating beyond end of array");
+      return base_type::mArray.Elements()[base_type::mPosition++];
+    }
+
+    void Remove() {
+      return base_type::mArray.RemoveElementAt(base_type::mPosition - 1);
+    }
+
+   private:
+    ForwardIterator mEnd;
+  };
+
+  class BackwardIterator : protected Iterator {
+   public:
+    typedef nsAutoTObserverArray<T, N> array_type;
+    typedef Iterator base_type;
+
+    explicit BackwardIterator(const array_type& aArray)
+        : Iterator(aArray.Length(), aArray) {}
+
+    bool HasMore() const { return base_type::mPosition > 0; }
+
+    value_type& GetNext() {
+      NS_ASSERTION(HasMore(), "iterating beyond start of array");
+      return base_type::mArray.Elements()[--base_type::mPosition];
+    }
+
+    void Remove() {
+      return base_type::mArray.RemoveElementAt(base_type::mPosition);
+    }
+  };
+
+  struct EndSentinel {};
+
+  template <typename Iterator, typename U>
+  struct STLIterator {
+    using value_type = std::remove_reference_t<U>;
+
+    explicit STLIterator(const nsAutoTObserverArray<T, N>& aArray)
+        : mIterator{aArray} {
+      operator++();
+    }
+
+    bool operator!=(const EndSentinel&) const {
+      return mCurrent;
+    }
+
+    STLIterator& operator++() {
+      mCurrent = mIterator.HasMore() ? &mIterator.GetNext() : nullptr;
+      return *this;
+    }
+
+    value_type* operator->() { return mCurrent; }
+    U& operator*() { return *mCurrent; }
+
+   private:
+    Iterator mIterator;
+    value_type* mCurrent;
+  };
+
+  template <typename Iterator, typename U>
+  class STLIteratorRange {
+   public:
+    using iterator = STLIterator<Iterator, U>;
+
+    explicit STLIteratorRange(const nsAutoTObserverArray<T, N>& aArray)
+        : mArray{aArray} {}
+
+    STLIteratorRange(const STLIteratorRange& aOther) = delete;
+
+    iterator begin() const { return iterator{mArray}; }
+    EndSentinel end() const { return {}; }
+
+   private:
+    const nsAutoTObserverArray<T, N>& mArray;
+  };
+
+  template <typename U>
+  using STLForwardIteratorRange = STLIteratorRange<ForwardIterator, U>;
+
+  template <typename U>
+  using STLEndLimitedIteratorRange = STLIteratorRange<EndLimitedIterator, U>;
+
+  template <typename U>
+  using STLBackwardIteratorRange = STLIteratorRange<BackwardIterator, U>;
+
+  auto ForwardRange() { return STLForwardIteratorRange<T>{*this}; }
+
+  auto ForwardRange() const { return STLForwardIteratorRange<const T>{*this}; }
+
+  auto EndLimitedRange() { return STLEndLimitedIteratorRange<T>{*this}; }
+
+  auto EndLimitedRange() const {
+    return STLEndLimitedIteratorRange<const T>{*this};
+  }
+
+  auto BackwardRange() { return STLBackwardIteratorRange<T>{*this}; }
+
+  auto BackwardRange() const {
+    return STLBackwardIteratorRange<const T>{*this};
+  }
+
+  auto NonObservingRange() const {
+    return mozilla::detail::IteratorRange<
+        typename AutoTArray<T, N>::const_iterator,
+        typename AutoTArray<T, N>::const_reverse_iterator>{mArray.cbegin(),
+                                                           mArray.cend()};
+  }
+
+ protected:
+  AutoTArray<T, N> mArray;
+};
+
+template <class T>
+class nsTObserverArray : public nsAutoTObserverArray<T, 0> {
+ public:
+  typedef nsAutoTObserverArray<T, 0> base_type;
+  typedef nsTObserverArray_base::size_type size_type;
+
+
+  nsTObserverArray() = default;
+
+  explicit nsTObserverArray(size_type aCapacity) {
+    base_type::mArray.SetCapacity(aCapacity);
+  }
+
+  nsTObserverArray Clone() const {
+    auto result = nsTObserverArray{};
+    result.mArray.Assign(this->mArray);
+    return result;
+  }
+};
+
+template <typename T, size_t N>
+auto MakeBackInserter(nsAutoTObserverArray<T, N>& aArray) {
+  return mozilla::nsTArrayBackInserter<T, nsAutoTObserverArray<T, N>>{aArray};
+}
+
+template <typename T, size_t N>
+inline void ImplCycleCollectionUnlink(nsAutoTObserverArray<T, N>& aField) {
+  aField.Clear();
+}
+
+template <typename T, size_t N>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    nsAutoTObserverArray<T, N>& aField, const char* aName,
+    uint32_t aFlags = 0) {
+  aFlags |= CycleCollectionEdgeNameArrayFlag;
+  size_t length = aField.Length();
+  for (size_t i = 0; i < length; ++i) {
+    ImplCycleCollectionTraverse(aCallback, aField.ElementAt(i), aName, aFlags);
+  }
+}
+
+#define NS_OBSERVER_ARRAY_NOTIFY_XPCOM_OBSERVERS(array_, func_, params_) \
+  do {                                                                   \
+    for (RefPtr obs_ : (array_).ForwardRange()) {                        \
+      obs_->func_ params_;                                               \
+    }                                                                    \
+  } while (0)
+
+#define NS_OBSERVER_ARRAY_NOTIFY_OBSERVERS(array_, func_, params_) \
+  do {                                                             \
+    for (auto* obs_ : (array_).ForwardRange()) {                   \
+      obs_->func_ params_;                                         \
+    }                                                              \
+  } while (0)
+
+#endif  // nsTObserverArray_h_

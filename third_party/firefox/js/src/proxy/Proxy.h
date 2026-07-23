@@ -1,0 +1,99 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef proxy_Proxy_h
+#define proxy_Proxy_h
+
+#include "NamespaceImports.h"
+
+#include "js/Array.h"  // JS::IsArrayAnswer
+#include "js/Class.h"
+
+namespace js {
+
+class Proxy {
+ public:
+  static bool getOwnPropertyDescriptor(
+      JSContext* cx, HandleObject proxy, HandleId id,
+      MutableHandle<mozilla::Maybe<JS::PropertyDescriptor>> desc);
+  static bool defineProperty(JSContext* cx, HandleObject proxy, HandleId id,
+                             Handle<JS::PropertyDescriptor> desc,
+                             ObjectOpResult& result);
+  static bool ownPropertyKeys(JSContext* cx, HandleObject proxy,
+                              MutableHandleIdVector props);
+  static bool delete_(JSContext* cx, HandleObject proxy, HandleId id,
+                      ObjectOpResult& result);
+  static bool enumerate(JSContext* cx, HandleObject proxy,
+                        MutableHandleIdVector props);
+  static bool isExtensible(JSContext* cx, HandleObject proxy, bool* extensible);
+  static bool preventExtensions(JSContext* cx, HandleObject proxy,
+                                ObjectOpResult& result);
+  static bool getPrototype(JSContext* cx, HandleObject proxy,
+                           MutableHandleObject protop);
+  static bool setPrototype(JSContext* cx, HandleObject proxy,
+                           HandleObject proto, ObjectOpResult& result);
+  static bool getPrototypeIfOrdinary(JSContext* cx, HandleObject proxy,
+                                     bool* isOrdinary,
+                                     MutableHandleObject protop);
+  static bool setImmutablePrototype(JSContext* cx, HandleObject proxy,
+                                    bool* succeeded);
+  static bool has(JSContext* cx, HandleObject proxy, HandleId id, bool* bp);
+  static bool get(JSContext* cx, HandleObject proxy, HandleValue receiver,
+                  HandleId id, MutableHandleValue vp);
+  static bool getInternal(JSContext* cx, HandleObject proxy,
+                          HandleValue receiver, HandleId id,
+                          MutableHandleValue vp);
+  static bool set(JSContext* cx, HandleObject proxy, HandleId id, HandleValue v,
+                  HandleValue receiver, ObjectOpResult& result);
+  static bool setInternal(JSContext* cx, HandleObject proxy, HandleId id,
+                          HandleValue v, HandleValue receiver,
+                          ObjectOpResult& result);
+  static bool call(JSContext* cx, HandleObject proxy, const CallArgs& args);
+  static bool construct(JSContext* cx, HandleObject proxy,
+                        const CallArgs& args);
+
+  static bool hasOwn(JSContext* cx, HandleObject proxy, HandleId id, bool* bp);
+  static bool getOwnEnumerablePropertyKeys(JSContext* cx, HandleObject proxy,
+                                           MutableHandleIdVector props);
+  static bool nativeCall(JSContext* cx, IsAcceptableThis test, NativeImpl impl,
+                         const CallArgs& args);
+  static bool getBuiltinClass(JSContext* cx, HandleObject proxy, ESClass* cls);
+  static bool isArray(JSContext* cx, HandleObject proxy,
+                      JS::IsArrayAnswer* answer);
+  static const char* className(JSContext* cx, HandleObject proxy);
+  static JSString* fun_toString(JSContext* cx, HandleObject proxy,
+                                bool isToSource);
+  static RegExpShared* regexp_toShared(JSContext* cx, HandleObject proxy);
+  static bool boxedValue_unbox(JSContext* cx, HandleObject proxy,
+                               MutableHandleValue vp);
+
+  static bool getElements(JSContext* cx, HandleObject obj, uint32_t begin,
+                          uint32_t end, ElementAdder* adder);
+
+  static void trace(JSTracer* trc, JSObject* obj);
+};
+
+size_t proxy_ObjectMoved(JSObject* obj, JSObject* old);
+
+
+bool ProxyHas(JSContext* cx, HandleObject proxy, HandleValue idVal,
+              bool* result);
+
+bool ProxyHasOwn(JSContext* cx, HandleObject proxy, HandleValue idVal,
+                 bool* result);
+
+bool ProxyGetProperty(JSContext* cx, HandleObject proxy, HandleId id,
+                      MutableHandleValue vp);
+
+bool ProxyGetPropertyByValue(JSContext* cx, HandleObject proxy,
+                             HandleValue idVal, MutableHandleValue vp);
+
+bool ProxySetProperty(JSContext* cx, HandleObject proxy, HandleId id,
+                      HandleValue val, bool strict);
+
+bool ProxySetPropertyByValue(JSContext* cx, HandleObject proxy,
+                             HandleValue idVal, HandleValue val, bool strict);
+} 
+
+#endif /* proxy_Proxy_h */

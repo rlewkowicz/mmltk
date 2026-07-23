@@ -1,0 +1,75 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_TextInputListener_h
+#define mozilla_TextInputListener_h
+
+#include "mozilla/WeakPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIDOMEventListener.h"
+#include "nsStringFwd.h"
+#include "nsWeakReference.h"
+
+class nsIFrame;
+class nsTextControlFrame;
+
+namespace mozilla {
+class TextControlElement;
+class TextControlState;
+class TextEditor;
+
+namespace dom {
+class Selection;
+}  
+
+class TextInputListener final : public nsIDOMEventListener,
+                                public nsSupportsWeakReference {
+ public:
+  explicit TextInputListener(TextControlElement*);
+
+  void SettingValue(bool aValue) { mSettingValue = aValue; }
+  void SetValueChanged(bool aSetValueChanged) {
+    mSetValueChanged = aSetValueChanged;
+  }
+
+  void HandleValueChanged(TextEditor&);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult OnEditActionHandled(TextEditor&);
+
+  MOZ_CAN_RUN_SCRIPT
+  void OnSelectionChange(dom::Selection& aSelection, int16_t aReason);
+
+  void StartToListenToSelectionChange() { mListeningToSelectionChange = true; }
+  void EndListeningToSelectionChange() { mListeningToSelectionChange = false; }
+
+  void StartToHandleShortcutKeys();
+  void EndHandlingShortcutKeys();
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(TextInputListener,
+                                           nsIDOMEventListener)
+  NS_DECL_NSIDOMEVENTLISTENER
+
+ protected:
+  virtual ~TextInputListener() = default;
+
+  nsresult UpdateTextInputCommands(const nsAString& aCommandsToUpdate);
+
+ protected:
+  TextControlElement* const mTxtCtrlElement;
+  WeakPtr<TextControlState> const mTextControlState;
+
+  bool mSelectionWasCollapsed : 1 = true;
+
+  bool mHadUndoItems : 1 = false;
+  bool mHadRedoItems : 1 = false;
+  bool mSettingValue : 1 = false;
+  bool mSetValueChanged : 1 = true;
+  bool mListeningToSelectionChange : 1 = false;
+  bool mListeningToKeyboardEvents : 1 = false;
+};
+
+}  
+
+#endif  // #ifndef mozilla_TextInputListener_h

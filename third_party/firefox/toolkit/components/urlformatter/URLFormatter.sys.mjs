@@ -1,0 +1,173 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+
+const PREF_APP_DISTRIBUTION = "distribution.id";
+const PREF_APP_DISTRIBUTION_VERSION = "distribution.version";
+
+const lazy = {};
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  Region: "resource://gre/modules/Region.sys.mjs",
+  UpdateUtils: "resource://gre/modules/UpdateUtils.sys.mjs",
+});
+
+export function nsURLFormatterService() {
+  ChromeUtils.defineLazyGetter(this, "ABI", function UFS_ABI() {
+    let ABI = "default";
+    try {
+      ABI = Services.appinfo.XPCOMABI;
+    } catch (e) {}
+
+    return ABI;
+  });
+
+  ChromeUtils.defineLazyGetter(this, "OSVersion", function UFS_OSVersion() {
+    let OSVersion = "default";
+    let { sysinfo } = Services;
+    try {
+      OSVersion =
+        sysinfo.getProperty("name") + " " + sysinfo.getProperty("version");
+      OSVersion += ` (${sysinfo.getProperty("secondaryLibrary")})`;
+    } catch (e) {}
+
+    return encodeURIComponent(OSVersion);
+  });
+
+  ChromeUtils.defineLazyGetter(
+    this,
+    "distribution",
+    function UFS_distribution() {
+      let defaults = Services.prefs.getDefaultBranch(null);
+      let id = defaults.getCharPref(PREF_APP_DISTRIBUTION, "default");
+      let version = defaults.getCharPref(
+        PREF_APP_DISTRIBUTION_VERSION,
+        "default"
+      );
+
+      return { id, version };
+    }
+  );
+}
+
+nsURLFormatterService.prototype = {
+  classID: Components.ID("{e6156350-2be8-11db-a98b-0800200c9a66}"),
+  QueryInterface: ChromeUtils.generateQI(["nsIURLFormatter"]),
+
+  _defaults: {
+    LOCALE: () => Services.locale.appLocaleAsBCP47,
+    REGION() {
+      try {
+        return lazy.Region.home || "ZZ";
+      } catch (e) {
+        return "ZZ";
+      }
+    },
+    VENDOR() {
+      return Services.appinfo.vendor;
+    },
+    NAME() {
+      return Services.appinfo.name;
+    },
+    ID() {
+      return Services.appinfo.ID;
+    },
+    VERSION() {
+      return Services.appinfo.version;
+    },
+    MAJOR_VERSION() {
+      return Services.appinfo.version.replace(
+        /^([^\.]+\.[0-9]+[a-z]*).*/gi,
+        "$1"
+      );
+    },
+    APPBUILDID() {
+      return Services.appinfo.appBuildID;
+    },
+    PLATFORMVERSION() {
+      return Services.appinfo.platformVersion;
+    },
+    PLATFORMBUILDID() {
+      return Services.appinfo.platformBuildID;
+    },
+    APP() {
+      return Services.appinfo.name.toLowerCase().replace(/ /, "");
+    },
+    OS() {
+      return Services.appinfo.OS;
+    },
+    XPCOMABI() {
+      return this.ABI;
+    },
+    BUILD_TARGET() {
+      return Services.appinfo.OS + "_" + this.ABI;
+    },
+    OS_VERSION() {
+      return this.OSVersion;
+    },
+    CHANNEL: () => lazy.UpdateUtils.UpdateChannel,
+    MOZILLA_API_KEY: () => AppConstants.MOZ_MOZILLA_API_KEY,
+    GOOGLE_LOCATION_SERVICE_API_KEY: () =>
+      AppConstants.MOZ_GOOGLE_LOCATION_SERVICE_API_KEY,
+    BING_API_CLIENTID: () => AppConstants.MOZ_BING_API_CLIENTID,
+    BING_API_KEY: () => AppConstants.MOZ_BING_API_KEY,
+    DISTRIBUTION() {
+      return this.distribution.id;
+    },
+    DISTRIBUTION_VERSION() {
+      return this.distribution.version;
+    },
+  },
+
+  formatURL: function uf_formatURL(aFormat) {
+    var _this = this;
+    var replacementCallback = function (aMatch, aKey) {
+      if (aKey in _this._defaults) {
+        return _this._defaults[aKey].call(_this);
+      }
+      console.error("formatURL: Couldn't find value for key: ", aKey);
+      return aMatch;
+    };
+    return aFormat.replace(/%([A-Z_]+)%/g, replacementCallback);
+  },
+
+  formatURLPref: function uf_formatURLPref(aPref) {
+    var format = null;
+
+    try {
+      format = Services.prefs.getStringPref(aPref);
+    } catch (ex) {
+      console.error("formatURLPref: Couldn't get pref: ", aPref);
+      return "about:blank";
+    }
+
+    if (
+      !Services.prefs.prefHasUserValue(aPref) &&
+      /^(data:text\/plain,.+=.+|chrome:\/\/.+\/locale\/.+\.properties)$/.test(
+        format
+      )
+    ) {
+      try {
+        format = Services.prefs.getComplexValue(
+          aPref,
+          Ci.nsIPrefLocalizedString
+        ).data;
+      } catch (ex) {}
+    }
+
+    return this.formatURL(format);
+  },
+
+  trimSensitiveURLs: function uf_trimSensitiveURLs(aMsg) {
+    aMsg = AppConstants.MOZ_GOOGLE_LOCATION_SERVICE_API_KEY
+      ? aMsg.replace(
+          RegExp(AppConstants.MOZ_GOOGLE_LOCATION_SERVICE_API_KEY, "g"),
+          "[trimmed-google-api-key]"
+        )
+      : aMsg;
+    return aMsg;
+  },
+};

@@ -1,0 +1,281 @@
+/* zutil.h -- internal interface and configuration of the compression library
+ * Copyright (C) 1995-2026 Jean-loup Gailly, Mark Adler
+ * For conditions of distribution and use, see copyright notice in zlib.h
+ */
+
+
+
+#if !defined(ZUTIL_H)
+#define ZUTIL_H
+
+#if defined(HAVE_HIDDEN)
+#  define ZLIB_INTERNAL __attribute__((visibility ("hidden")))
+#else
+#  define ZLIB_INTERNAL
+#endif
+
+#include "zlib.h"
+
+#if defined(STDC) && !defined(Z_SOLO)
+#    include <stddef.h>
+#  include <string.h>
+#  include <stdlib.h>
+#endif
+
+#if !defined(local)
+#  define local static
+#endif
+
+extern const char deflate_copyright[];
+extern const char inflate_copyright[];
+extern const char inflate9_copyright[];
+
+typedef unsigned char  uch;
+typedef uch FAR uchf;
+typedef unsigned short ush;
+typedef ush FAR ushf;
+typedef unsigned long  ulg;
+
+#if !defined(Z_U8) && !defined(Z_SOLO) && defined(STDC)
+#  include <limits.h>
+#if (ULONG_MAX == 0xffffffffffffffff)
+#    define Z_U8 unsigned long
+#elif (ULLONG_MAX == 0xffffffffffffffff)
+#    define Z_U8 unsigned long long
+#elif (ULONG_LONG_MAX == 0xffffffffffffffff)
+#    define Z_U8 unsigned long long
+#elif (UINT_MAX == 0xffffffffffffffff)
+#    define Z_U8 unsigned
+#endif
+#endif
+
+extern z_const char * const z_errmsg[10]; 
+
+#define ERR_MSG(err) z_errmsg[(err) < -6 || (err) > 2 ? 9 : 2 - (err)]
+
+#define ERR_RETURN(strm,err) \
+  return (strm->msg = ERR_MSG(err), (err))
+
+#if MAX_WBITS < 9 || MAX_WBITS > 15
+#  error MAX_WBITS must be in 9..15
+#endif
+#if !defined(DEF_WBITS)
+#  define DEF_WBITS MAX_WBITS
+#endif
+
+#if MAX_MEM_LEVEL >= 8
+#  define DEF_MEM_LEVEL 8
+#else
+#  define DEF_MEM_LEVEL  MAX_MEM_LEVEL
+#endif
+
+#define STORED_BLOCK 0
+#define STATIC_TREES 1
+#define DYN_TREES    2
+
+#define MIN_MATCH  3
+#define MAX_MATCH  258
+
+#define PRESET_DICT 0x20 /* preset dictionary flag in zlib header */
+
+
+#if defined(MSDOS) || (defined(WINDOWS) && !0)
+#  define OS_CODE  0x00
+#if !defined(Z_SOLO)
+#if defined(__TURBOC__) || defined(__BORLANDC__)
+#if (__STDC__ == 1) && (defined(__LARGE__) || defined(__COMPACT__))
+         void _Cdecl farfree( void *block );
+         void *_Cdecl farmalloc( unsigned long nbytes );
+#else
+#        include <alloc.h>
+#endif
+#else
+#      include <malloc.h>
+#endif
+#endif
+#endif
+
+#if defined(AMIGA)
+#  define OS_CODE  1
+#endif
+
+#if defined(VAXC) || defined(VMS)
+#  define OS_CODE  2
+#  define F_OPEN(name, mode) \
+     fopen((name), (mode), "mbc=60", "ctx=stm", "rfm=fix", "mrs=512")
+#endif
+
+#if defined(__370__)
+#if __TARGET_LIB__ < 0x20000000
+#    define OS_CODE 4
+#elif __TARGET_LIB__ < 0x40000000
+#    define OS_CODE 11
+#else
+#    define OS_CODE 8
+#endif
+#endif
+
+#if defined(ATARI) || defined(atarist)
+#  define OS_CODE  5
+#endif
+
+#if defined(OS2)
+#  define OS_CODE  6
+#if defined(M_I86) && !defined(Z_SOLO)
+#    include <malloc.h>
+#endif
+#endif
+
+#if defined(__acorn) || defined(__riscos)
+#  define OS_CODE 13
+#endif
+
+
+#if defined(_BEOS_)
+#  define OS_CODE  16
+#endif
+
+#if defined(__TOS_OS400__)
+#  define OS_CODE 18
+#endif
+
+
+#if defined(__BORLANDC__) && !defined(MSDOS)
+  #pragma warn -8004
+  #pragma warn -8008
+  #pragma warn -8066
+#endif
+
+#if !defined(Z_LARGE64)
+   ZEXTERN uLong ZEXPORT adler32_combine64(uLong, uLong, z_off64_t);
+   ZEXTERN uLong ZEXPORT crc32_combine64(uLong, uLong, z_off64_t);
+   ZEXTERN uLong ZEXPORT crc32_combine_gen64(z_off64_t);
+#endif
+
+
+#if !defined(OS_CODE)
+#  define OS_CODE  3     /* assume Unix */
+#endif
+
+#if !defined(F_OPEN)
+#  define F_OPEN(name, mode) fopen((name), (mode))
+#endif
+
+
+#if defined(pyr) || defined(Z_SOLO)
+#  define NO_MEMCPY
+#endif
+#if defined(SMALL_MEDIUM) && !defined(_MSC_VER) && !defined(__SC__)
+#  define NO_MEMCPY
+#endif
+#if defined(STDC) && !defined(HAVE_MEMCPY) && !defined(NO_MEMCPY)
+#  define HAVE_MEMCPY
+#endif
+#if defined(HAVE_MEMCPY)
+#if defined(SMALL_MEDIUM)
+#    define zmemcpy _fmemcpy
+#    define zmemcmp _fmemcmp
+#    define zmemzero(dest, len) _fmemset(dest, 0, len)
+#else
+#    define zmemcpy memcpy
+#    define zmemcmp memcmp
+#    define zmemzero(dest, len) memset(dest, 0, len)
+#endif
+#else
+   void ZLIB_INTERNAL zmemcpy(void FAR *, const void FAR *, z_size_t);
+   int ZLIB_INTERNAL zmemcmp(const void FAR *, const void FAR *, z_size_t);
+   void ZLIB_INTERNAL zmemzero(void FAR *, z_size_t);
+#endif
+
+#if defined(ZLIB_DEBUG)
+#  include <stdio.h>
+   extern int ZLIB_INTERNAL z_verbose;
+   extern void ZLIB_INTERNAL z_error(char *m);
+#  define Assert(cond,msg) {if(!(cond)) z_error(msg);}
+#  define Trace(x) {if (z_verbose>=0) fprintf x ;}
+#  define Tracev(x) {if (z_verbose>0) fprintf x ;}
+#  define Tracevv(x) {if (z_verbose>1) fprintf x ;}
+#  define Tracec(c,x) {if (z_verbose>0 && (c)) fprintf x ;}
+#  define Tracecv(c,x) {if (z_verbose>1 && (c)) fprintf x ;}
+#else
+#  define Assert(cond,msg)
+#  define Trace(x)
+#  define Tracev(x)
+#  define Tracevv(x)
+#  define Tracec(c,x)
+#  define Tracecv(c,x)
+#endif
+
+#if !defined(Z_SOLO)
+   voidpf ZLIB_INTERNAL zcalloc(voidpf opaque, unsigned items,
+                                unsigned size);
+   void ZLIB_INTERNAL zcfree(voidpf opaque, voidpf ptr);
+#endif
+
+#define ZALLOC(strm, items, size) \
+           (*((strm)->zalloc))((strm)->opaque, (items), (size))
+#define ZFREE(strm, addr)  (*((strm)->zfree))((strm)->opaque, (voidpf)(addr))
+#define TRY_FREE(s, p) {if (p) ZFREE(s, p);}
+
+#define ZSWAP32(q) ((((q) >> 24) & 0xff) + (((q) >> 8) & 0xff00) + \
+                    (((q) & 0xff00) << 8) + (((q) & 0xff) << 24))
+
+#if defined(Z_ONCE)
+
+#if defined(__STDC__) && __STDC_VERSION__ >= 201112L && \
+    !defined(__STDC_NO_ATOMICS__)
+
+#include <stdatomic.h>
+typedef struct {
+    atomic_flag begun;
+    atomic_int done;
+} z_once_t;
+#define Z_ONCE_INIT {ATOMIC_FLAG_INIT, 0}
+
+local void z_once(z_once_t *state, void (*init)(void)) {
+    if (!atomic_load(&state->done)) {
+        if (atomic_flag_test_and_set(&state->begun))
+            while (!atomic_load(&state->done))
+                ;
+        else {
+            init();
+            atomic_store(&state->done, 1);
+        }
+    }
+}
+
+#else
+
+#warning zlib not thread-safe
+
+typedef struct z_once_s {
+    volatile int begun;
+    volatile int done;
+} z_once_t;
+#define Z_ONCE_INIT {0, 0}
+
+local int test_and_set(int volatile *flag) {
+    int was;
+
+    was = *flag;
+    *flag = 1;
+    return was;
+}
+
+local void z_once(z_once_t *state, void (*init)(void)) {
+    if (!state->done) {
+        if (test_and_set(&state->begun))
+            while (!state->done)
+                ;
+        else {
+            init();
+            state->done = 1;
+        }
+    }
+}
+
+#endif
+
+#endif
+
+#endif

@@ -1,0 +1,45 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "frontend/ExpressionStatementEmitter.h"
+
+#include "frontend/BytecodeEmitter.h"
+#include "vm/Opcodes.h"
+
+using namespace js;
+using namespace js::frontend;
+
+ExpressionStatementEmitter::ExpressionStatementEmitter(BytecodeEmitter* bce,
+                                                       ValueUsage valueUsage)
+    : bce_(bce), valueUsage_(valueUsage) {}
+
+bool ExpressionStatementEmitter::prepareForExpr(uint32_t beginPos) {
+  MOZ_ASSERT(state_ == State::Start);
+
+  if (!bce_->updateSourceCoordNotes(beginPos)) {
+    return false;
+  }
+
+#ifdef DEBUG
+  depth_ = bce_->bytecodeSection().stackDepth();
+  state_ = State::Expr;
+#endif
+  return true;
+}
+
+bool ExpressionStatementEmitter::emitEnd() {
+  MOZ_ASSERT(state_ == State::Expr);
+  MOZ_ASSERT(bce_->bytecodeSection().stackDepth() == depth_ + 1);
+
+
+  JSOp op = valueUsage_ == ValueUsage::WantValue ? JSOp::SetRval : JSOp::Pop;
+  if (!bce_->emit1(op)) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::End;
+#endif
+  return true;
+}

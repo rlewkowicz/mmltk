@@ -1,0 +1,129 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_TYPES_H
+#define GFX_TYPES_H
+
+#include <stdint.h>
+#include "mozilla/Attributes.h"
+#include "mozilla/TypedEnumBits.h"
+
+namespace mozilla {
+enum class StyleGenericFontFamily : uint32_t;
+}
+
+typedef struct _cairo_surface cairo_surface_t;
+typedef struct _cairo_user_data_key cairo_user_data_key_t;
+
+typedef void (*thebes_destroy_func_t)(void* data);
+
+typedef double gfxFloat;
+
+enum class gfxBreakPriority { eNoBreak = 0, eWordWrapBreak, eNormalBreak };
+
+enum class gfxSurfaceType {
+  Image,
+  PDF,
+  PS,
+  Xlib,
+  Xcb,
+  Glitz,  
+  Quartz,
+  Win32,
+  BeOS,
+  DirectFB,  
+  SVG,
+  OS2,
+  Win32Printing,
+  QuartzImage,
+  Script,
+  QPainter,
+  Recording,
+  VG,
+  GL,
+  DRM,
+  Tee,
+  XML,
+  Skia,
+  Subsurface,
+  Max
+};
+
+enum class gfxContentType {
+  COLOR = 0x1000,
+  ALPHA = 0x2000,
+  COLOR_ALPHA = 0x3000,
+  SENTINEL = 0xffff
+};
+
+enum class gfxAlphaType {
+  Opaque,
+  Premult,
+  NonPremult,
+};
+
+struct FontMatchType {
+  enum class Kind : uint8_t {
+    kUnspecified = 0,
+    kFontGroup = 1,
+    kPrefsFallback = 1 << 1,
+    kSystemFallback = 1 << 2,
+  };
+
+  inline FontMatchType& operator|=(const FontMatchType& aOther);
+
+  bool operator==(const FontMatchType& aOther) const {
+    return kind == aOther.kind && generic == aOther.generic;
+  }
+
+  bool operator!=(const FontMatchType& aOther) const {
+    return !(*this == aOther);
+  }
+
+  MOZ_IMPLICIT FontMatchType() = default;
+  MOZ_IMPLICIT FontMatchType(Kind aKind) : kind(aKind) {}
+  FontMatchType(Kind aKind, mozilla::StyleGenericFontFamily aGeneric)
+      : kind(aKind), generic(aGeneric) {}
+
+  Kind kind = static_cast<Kind>(0);
+  mozilla::StyleGenericFontFamily generic = mozilla::StyleGenericFontFamily(0);
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(FontMatchType::Kind)
+
+FontMatchType& FontMatchType::operator|=(const FontMatchType& aOther) {
+  kind |= aOther.kind;
+  if (generic != aOther.generic) {
+    generic = mozilla::StyleGenericFontFamily(0);
+  }
+  return *this;
+}
+
+enum class FontVisibility : uint8_t {
+  Unknown = 0,   
+  Base = 1,      
+  LangPack = 2,  
+  User = 3,      
+  Hidden = 4,    
+  Webfont = 5,   
+  Count = 6,     
+};
+
+struct HwStretchingSupport {
+  uint32_t mBoth;
+  uint32_t mWindowOnly;
+  uint32_t mFullScreenOnly;
+  uint32_t mNone;
+  uint32_t mError;
+
+  HwStretchingSupport()
+      : mBoth(0), mWindowOnly(0), mFullScreenOnly(0), mNone(0), mError(0) {}
+
+  bool IsFullySupported() const {
+    return mBoth > 0 && mWindowOnly == 0 && mFullScreenOnly == 0 &&
+           mNone == 0 && mError == 0;
+  }
+};
+
+#endif /* GFX_TYPES_H */

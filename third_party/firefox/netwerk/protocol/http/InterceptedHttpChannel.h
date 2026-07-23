@@ -1,0 +1,259 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_InterceptedHttpChannel_h
+#define mozilla_net_InterceptedHttpChannel_h
+
+#include "HttpBaseChannel.h"
+#include "nsIAsyncVerifyRedirectCallback.h"
+#include "nsINetworkInterceptController.h"
+#include "nsIInputStream.h"
+#include "nsICacheInfoChannel.h"
+#include "nsInputStreamPump.h"
+#include "nsIThreadRetargetableRequest.h"
+#include "nsIThreadRetargetableStreamListener.h"
+
+namespace mozilla::net {
+
+class InterceptedHttpChannel final
+    : public HttpBaseChannel,
+      public HttpAsyncAborter<InterceptedHttpChannel>,
+      public nsIInterceptedChannel,
+      public nsICacheInfoChannel,
+      public nsIAsyncVerifyRedirectCallback,
+      public nsIThreadRetargetableRequest,
+      public nsIThreadRetargetableStreamListener {
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIINTERCEPTEDCHANNEL
+  NS_DECL_NSICACHEINFOCHANNEL
+  NS_DECL_NSIASYNCVERIFYREDIRECTCALLBACK
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSITHREADRETARGETABLEREQUEST
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+
+ private:
+  friend class HttpAsyncAborter<InterceptedHttpChannel>;
+
+  UniquePtr<nsHttpResponseHead> mSynthesizedResponseHead;
+  nsCOMPtr<nsIChannel> mRedirectChannel;
+  nsCOMPtr<nsIInputStream> mBodyReader;
+  nsCOMPtr<nsISupports> mReleaseHandle;
+  nsCOMPtr<nsIProgressEventSink> mProgressSink;
+  nsCOMPtr<nsIInterceptedBodyCallback> mBodyCallback;
+  nsCOMPtr<nsICacheInfoChannel> mSynthesizedCacheInfo;
+  RefPtr<nsInputStreamPump> mPump;
+  TimeStamp mInterceptedChannelCreationTimestamp;
+
+  TimeStamp mLastStatusReported;
+
+  Atomic<int64_t> mProgress;
+  int64_t mProgressReported;
+  int64_t mSynthesizedStreamLength;
+  uint64_t mResumeStartPos;
+  nsCString mResumeEntityId;
+  nsString mStatusHost;
+  Atomic<bool> mCallingStatusAndProgress;
+  bool mInterceptionReset{false};
+
+  class InterceptionTimeStamps final {
+   public:
+    enum Status {
+      Created,
+      Initialized,
+      Synthesized,
+      Reset,
+      Redirected,
+      Canceled,
+      CanceledAfterSynthesized,
+      CanceledAfterReset,
+      CanceledAfterRedirected
+    };
+
+    InterceptionTimeStamps();
+    ~InterceptionTimeStamps() = default;
+
+    void Init(nsIChannel* aChannel);
+
+    void RecordTime(TimeStamp&& aTimeStamp = TimeStamp::Now());
+
+    void RecordTime(Status&& aStatus,
+                    TimeStamp&& aTimeStamp = TimeStamp::Now());
+
+    TimeStamp mInterceptionStart;
+
+    TimeStamp mInterceptionFinish;
+
+    TimeStamp mFetchHandlerStart;
+
+    TimeStamp mFetchHandlerFinish;
+
+   private:
+    enum Stage {
+      InterceptionStart,
+      FetchHandlerStart,
+      FetchHandlerFinish,
+      InterceptionFinish
+    } mStage;
+
+    Status mStatus;
+
+    bool mIsNonSubresourceRequest = false;
+    nsCString mKey;
+    nsCString mSubresourceKey;
+
+    void RecordTimeInternal(TimeStamp&& aTimeStamp);
+
+    void GenKeysWithStatus(nsCString& aKey, nsCString& aSubresourceKey);
+
+    void SaveTimeStamps();
+  };
+
+  InterceptionTimeStamps mTimeStamps;
+
+  InterceptedHttpChannel(PRTime aCreationTime,
+                         const TimeStamp& aCreationTimestamp,
+                         const TimeStamp& aAsyncOpenTimestamp);
+  ~InterceptedHttpChannel() = default;
+
+  virtual void ReleaseListeners() override;
+
+  [[nodiscard]] virtual nsresult SetupReplacementChannel(
+      nsIURI* aURI, nsIChannel* aChannel, bool aPreserveMethod,
+      uint32_t aRedirectFlags) override;
+
+  void AsyncOpenInternal();
+
+  bool ShouldRedirect() const;
+
+  nsresult FollowSyntheticRedirect();
+
+  nsresult RedirectForResponseURL(nsIURI* aResponseURI,
+                                  bool aResponseRedirected);
+
+  nsresult StartPump();
+
+  nsresult OpenRedirectChannel();
+
+  void MaybeCallStatusAndProgress();
+
+  void MaybeCallBodyCallback();
+
+  TimeStamp mServiceWorkerLaunchStart;
+  TimeStamp mServiceWorkerLaunchEnd;
+
+ public:
+  static already_AddRefed<InterceptedHttpChannel> CreateForInterception(
+      PRTime aCreationTime, const TimeStamp& aCreationTimestamp,
+      const TimeStamp& aAsyncOpenTimestamp);
+
+  static already_AddRefed<InterceptedHttpChannel> CreateForSynthesis(
+      const nsHttpResponseHead* aHead, nsIInputStream* aBody,
+      nsIInterceptedBodyCallback* aBodyCallback, PRTime aCreationTime,
+      const TimeStamp& aCreationTimestamp,
+      const TimeStamp& aAsyncOpenTimestamp);
+
+  NS_IMETHOD SetCanceledReason(const nsACString& aReason) override;
+  NS_IMETHOD GetCanceledReason(nsACString& aReason) override;
+  NS_IMETHOD CancelWithReason(nsresult status,
+                              const nsACString& reason) override;
+
+  NS_IMETHOD
+  Cancel(nsresult aStatus) override;
+
+  NS_IMETHOD
+  Suspend(void) override;
+
+  NS_IMETHOD
+  Resume(void) override;
+
+  NS_IMETHOD
+  GetSecurityInfo(nsITransportSecurityInfo** aSecurityInfo) override;
+
+  NS_IMETHOD
+  AsyncOpen(nsIStreamListener* aListener) override;
+
+  NS_IMETHOD
+  LogBlockedCORSRequest(const nsAString& aMessage, const nsACString& aCategory,
+                        bool aIsWarning) override;
+
+  NS_IMETHOD
+  LogMimeTypeMismatch(const nsACString& aMessageName, bool aWarning,
+                      const nsAString& aURL,
+                      const nsAString& aContentType) override;
+
+  NS_IMETHOD
+  GetIsAuthChannel(bool* aIsAuthChannel) override;
+
+  NS_IMETHOD
+  SetPriority(int32_t aPriority) override;
+
+  NS_IMETHOD
+  SetClassFlags(uint32_t aClassFlags) override;
+
+  NS_IMETHOD
+  ClearClassFlags(uint32_t flags) override;
+
+  NS_IMETHOD
+  AddClassFlags(uint32_t flags) override;
+
+  NS_IMETHOD
+  SetClassOfService(ClassOfService cos) override;
+
+  NS_IMETHOD
+  SetIncremental(bool incremental) override;
+
+  NS_IMETHOD
+  ResumeAt(uint64_t startPos, const nsACString& entityID) override;
+
+  NS_IMETHOD
+  SetEarlyHintObserver(nsIEarlyHintObserver* aObserver) override {
+    return NS_OK;
+  }
+
+  NS_IMETHOD SetWebTransportSessionEventListener(
+      WebTransportSessionEventListener* aListener) override {
+    return NS_OK;
+  }
+
+  NS_IMETHOD SetResponseOverride(
+      nsIReplacedHttpResponse* aReplacedHttpResponse) override {
+    return NS_OK;
+  }
+
+  NS_IMETHOD SetResponseStatus(uint32_t aStatus,
+                               const nsACString& aStatusText) override {
+    return NS_OK;
+  }
+
+  NS_IMETHOD SetLaunchServiceWorkerStart(TimeStamp aTimeStamp) override;
+  NS_IMETHOD GetLaunchServiceWorkerStart(TimeStamp* aRetVal) override;
+
+  NS_IMETHOD SetLaunchServiceWorkerEnd(TimeStamp aTimeStamp) override;
+  NS_IMETHOD GetLaunchServiceWorkerEnd(TimeStamp* aRetVal) override;
+
+  NS_IMETHOD GetDispatchFetchEventStart(TimeStamp* aRetVal) override;
+  NS_IMETHOD GetDispatchFetchEventEnd(TimeStamp* aRetVal) override;
+
+  NS_IMETHOD GetHandleFetchEventStart(TimeStamp* aRetVal) override;
+  NS_IMETHOD GetHandleFetchEventEnd(TimeStamp* aRetVal) override;
+
+  void DoNotifyListenerCleanup() override;
+
+  void DoAsyncAbort(nsresult aStatus) override;
+
+  NS_IMETHOD GetDecompressDictionary(
+      DictionaryCacheEntry** aDictionary) override {
+    *aDictionary = nullptr;
+    return NS_OK;
+  }
+  NS_IMETHOD SetDecompressDictionary(
+      DictionaryCacheEntry* aDictionary) override {
+    return NS_OK;
+  }
+};
+
+}  
+
+#endif  // mozilla_net_InterceptedHttpChannel_h

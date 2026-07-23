@@ -1,0 +1,643 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsTableWrapperFrame.h"
+
+#include <algorithm>
+
+#include "LayoutConstants.h"
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ReflowInput.h"
+#include "nsCSSRendering.h"
+#include "nsDisplayList.h"
+#include "nsFrameManager.h"
+#include "nsGridContainerFrame.h"
+#include "nsHTMLParts.h"
+#include "nsIContent.h"
+#include "nsIFrameInlines.h"
+#include "nsLayoutUtils.h"
+#include "nsPresContext.h"
+#include "nsStyleConsts.h"
+#include "nsTableCellFrame.h"
+#include "nsTableFrame.h"
+#include "prinrval.h"
+
+using namespace mozilla;
+using namespace mozilla::layout;
+
+Maybe<nscoord> nsTableWrapperFrame::GetNaturalBaselineBOffset(
+    WritingMode aWM, BaselineSharingGroup aBaselineGroup,
+    BaselineExportContext aExportContext) const {
+  if (StyleDisplay()->IsContainLayout() ||
+      GetWritingMode().IsOrthogonalTo(aWM)) {
+    return Nothing{};
+  }
+  auto* innerTable = InnerTableFrame();
+  return innerTable
+      ->GetNaturalBaselineBOffset(aWM, aBaselineGroup, aExportContext)
+      .map([this, aWM, aBaselineGroup, innerTable](nscoord aBaseline) {
+        auto bStart = innerTable->BStart(aWM, mRect.Size());
+        if (aBaselineGroup == BaselineSharingGroup::First) {
+          return aBaseline + bStart;
+        }
+        auto bEnd = bStart + innerTable->BSize(aWM);
+        return BSize(aWM) - (bEnd - aBaseline);
+      });
+}
+
+nsTableWrapperFrame::nsTableWrapperFrame(ComputedStyle* aStyle,
+                                         nsPresContext* aPresContext,
+                                         ClassID aID)
+    : nsContainerFrame(aStyle, aPresContext, aID) {}
+
+nsTableWrapperFrame::~nsTableWrapperFrame() = default;
+
+NS_QUERYFRAME_HEAD(nsTableWrapperFrame)
+  NS_QUERYFRAME_ENTRY(nsTableWrapperFrame)
+NS_QUERYFRAME_TAIL_INHERITING(nsContainerFrame)
+
+#ifdef ACCESSIBILITY
+a11y::AccType nsTableWrapperFrame::AccessibleType() {
+  return a11y::eHTMLTableType;
+}
+#endif
+
+void nsTableWrapperFrame::Destroy(DestroyContext& aContext) {
+  DestroyAbsoluteFrames(aContext);
+  nsContainerFrame::Destroy(aContext);
+}
+
+void nsTableWrapperFrame::AppendFrames(ChildListID aListID,
+                                       nsFrameList&& aFrameList) {
+  MOZ_ASSERT(FrameChildListID::Principal == aListID, "unexpected child list");
+  MOZ_ASSERT(aFrameList.IsEmpty() || aFrameList.FirstChild()->IsTableCaption(),
+             "Why are we appending non-caption frames?");
+  nsContainerFrame::AppendFrames(aListID, std::move(aFrameList));
+  MarkNeedsDisplayItemRebuild();
+}
+
+void nsTableWrapperFrame::InsertFrames(
+    ChildListID aListID, nsIFrame* aPrevFrame,
+    const nsLineList::iterator* aPrevFrameLine, nsFrameList&& aFrameList) {
+  MOZ_ASSERT(FrameChildListID::Principal == aListID, "unexpected child list");
+  MOZ_ASSERT(aFrameList.IsEmpty() || aFrameList.FirstChild()->IsTableCaption(),
+             "Why are we inserting non-caption frames?");
+  MOZ_ASSERT(!aPrevFrame || aPrevFrame->GetParent() == this,
+             "inserting after sibling frame with different parent");
+  nsContainerFrame::InsertFrames(aListID, aPrevFrame, aPrevFrameLine,
+                                 std::move(aFrameList));
+  MarkNeedsDisplayItemRebuild();
+}
+
+void nsTableWrapperFrame::RemoveFrame(DestroyContext& aContext,
+                                      ChildListID aListID,
+                                      nsIFrame* aOldFrame) {
+  MOZ_ASSERT(aOldFrame->IsTableCaption(), "can't remove inner frame");
+  nsContainerFrame::RemoveFrame(aContext, aListID, aOldFrame);
+  MarkNeedsDisplayItemRebuild();
+}
+
+void nsTableWrapperFrame::BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                                           const nsDisplayListSet& aLists) {
+
+  if (nsIFrame* inner = mFrames.OnlyChild()) {
+    BuildDisplayListForChild(aBuilder, inner, aLists);
+    DisplayOutline(aBuilder, aLists);
+    return;
+  }
+
+  MOZ_ASSERT(mFrames.FirstChild());
+  MOZ_ASSERT(mFrames.FirstChild()->IsTableFrame());
+
+  nsDisplayListCollection set(aBuilder);
+  nsDisplayListSet captionSet(set, set.BlockBorderBackgrounds());
+  for (auto* frame : mFrames) {
+    const bool isTable = frame->IsTableFrame();
+    auto& setForFrame = isTable ? set : captionSet;
+    BuildDisplayListForChild(aBuilder, frame, setForFrame);
+    if (!isTable) {
+      break;
+    }
+  }
+
+  set.Floats()->SortByContentOrder(GetContent());
+  set.Content()->SortByContentOrder(GetContent());
+  set.PositionedDescendants()->SortByContentOrder(GetContent());
+  set.Outlines()->SortByContentOrder(GetContent());
+  set.MoveTo(aLists);
+
+  DisplayOutline(aBuilder, aLists);
+}
+
+ComputedStyle* nsTableWrapperFrame::GetParentComputedStyle(
+    nsIFrame** aProviderFrame) const {
+
+  return (*aProviderFrame = InnerTableFrame())->Style();
+}
+
+nscoord nsTableWrapperFrame::IntrinsicISize(const IntrinsicSizeInput& aInput,
+                                            IntrinsicISizeType aType) {
+  nscoord iSize = nsLayoutUtils::IntrinsicForContainer(
+      aInput.mContext, InnerTableFrame(), aType);
+
+  {
+    AutoMaybeDisableFontInflation an(this);
+
+    const IntrinsicSizeInput input(aInput.mContext, Nothing(), Nothing());
+
+    const IntrinsicSizeOffsetData offset =
+        InnerTableFrame()->IntrinsicISizeOffsets();
+    const nscoord innerTableMinISize =
+        InnerTableFrame()->GetMinISize(input) + offset.MarginBorderPadding();
+    iSize = std::max(iSize, innerTableMinISize);
+  }
+
+  if (nsIFrame* caption = GetCaption()) {
+    const nscoord capMinISize = nsLayoutUtils::IntrinsicForContainer(
+        aInput.mContext, caption, IntrinsicISizeType::MinISize);
+    iSize = std::max(iSize, capMinISize);
+  }
+  return iSize;
+}
+
+LogicalSize nsTableWrapperFrame::InnerTableShrinkWrapSize(
+    const SizeComputationInput& aSizingInput, nsTableFrame* aTableFrame,
+    WritingMode aWM, const LogicalSize& aCBSize, nscoord aAvailableISize,
+    const StyleSizeOverrides& aSizeOverrides, ComputeSizeFlags aFlags) const {
+  MOZ_ASSERT(InnerTableFrame() == aTableFrame);
+
+  AutoMaybeDisableFontInflation an(aTableFrame);
+
+  Maybe<LogicalMargin> collapseBorder;
+  Maybe<LogicalMargin> collapsePadding;
+  aTableFrame->GetCollapsedBorderPadding(collapseBorder, collapsePadding);
+
+  SizeComputationInput input(aTableFrame, aSizingInput.mRenderingContext, aWM,
+                             aCBSize.ISize(aWM), collapseBorder,
+                             collapsePadding);
+  LogicalSize marginSize(aWM);  
+  LogicalSize bpSize = input.ComputedLogicalBorderPadding(aWM).Size(aWM);
+
+  StyleSizeOverrides innerOverrides = ComputeSizeOverridesForInnerTable(
+      aTableFrame, aSizeOverrides, bpSize,  0);
+  auto size = aTableFrame
+                  ->ComputeSize(input, aWM, aCBSize, aAvailableISize,
+                                marginSize, bpSize, innerOverrides, aFlags)
+                  .mLogicalSize;
+  size.ISize(aWM) += bpSize.ISize(aWM);
+  if (size.BSize(aWM) != NS_UNCONSTRAINEDSIZE) {
+    size.BSize(aWM) += bpSize.BSize(aWM);
+  }
+  return size;
+}
+
+LogicalSize nsTableWrapperFrame::CaptionShrinkWrapSize(
+    const SizeComputationInput& aSizingInput, nsIFrame* aCaptionFrame,
+    WritingMode aWM, const LogicalSize& aCBSize, nscoord aAvailableISize,
+    ComputeSizeFlags aFlags) const {
+  MOZ_ASSERT(aCaptionFrame != mFrames.FirstChild());
+
+  AutoMaybeDisableFontInflation an(aCaptionFrame);
+
+  SizeComputationInput input(aCaptionFrame, aSizingInput.mRenderingContext, aWM,
+                             aCBSize.ISize(aWM));
+  LogicalSize marginSize = input.ComputedLogicalMargin(aWM).Size(aWM);
+  LogicalSize bpSize = input.ComputedLogicalBorderPadding(aWM).Size(aWM);
+
+  auto size = aCaptionFrame
+                  ->ComputeSize(input, aWM, aCBSize, aAvailableISize,
+                                marginSize, bpSize, {}, aFlags)
+                  .mLogicalSize;
+  size.ISize(aWM) += (marginSize.ISize(aWM) + bpSize.ISize(aWM));
+  if (size.BSize(aWM) != NS_UNCONSTRAINEDSIZE) {
+    size.BSize(aWM) += (marginSize.BSize(aWM) + bpSize.BSize(aWM));
+  }
+  return size;
+}
+
+StyleSize nsTableWrapperFrame::ReduceStyleSizeBy(
+    const StyleSize& aStyleSize, const nscoord aAmountToReduce) const {
+  MOZ_ASSERT(aStyleSize.ConvertsToLength(), "Only handles 'Length' StyleSize!");
+  const nscoord size = std::max(0, aStyleSize.ToLength() - aAmountToReduce);
+  return StyleSize::FromAppUnits(size);
+}
+
+StyleSizeOverrides nsTableWrapperFrame::ComputeSizeOverridesForInnerTable(
+    const nsTableFrame* aTableFrame,
+    const StyleSizeOverrides& aWrapperSizeOverrides,
+    const LogicalSize& aBorderPadding, nscoord aBSizeOccupiedByCaption) const {
+  if (aWrapperSizeOverrides.mApplyOverridesVerbatim ||
+      !aWrapperSizeOverrides.HasAnyLengthOverrides()) {
+    return aWrapperSizeOverrides;
+  }
+
+  const auto wm = aTableFrame->GetWritingMode();
+  LogicalSize areaOccupied(wm, 0, aBSizeOccupiedByCaption);
+  if (aTableFrame->StylePosition()->mBoxSizing == StyleBoxSizing::ContentBox) {
+    areaOccupied += aBorderPadding;
+  }
+
+  StyleSizeOverrides innerSizeOverrides;
+  const auto& wrapperISize = aWrapperSizeOverrides.mStyleISize;
+  if (wrapperISize) {
+    MOZ_ASSERT(!wrapperISize->HasPercent(),
+               "Table doesn't support size overrides containing percentages!");
+    innerSizeOverrides.mStyleISize.emplace(
+        wrapperISize->ConvertsToLength()
+            ? ReduceStyleSizeBy(*wrapperISize, areaOccupied.ISize(wm))
+            : *wrapperISize);
+  }
+
+  const auto& wrapperBSize = aWrapperSizeOverrides.mStyleBSize;
+  if (wrapperBSize) {
+    MOZ_ASSERT(!wrapperBSize->HasPercent(),
+               "Table doesn't support size overrides containing percentages!");
+    innerSizeOverrides.mStyleBSize.emplace(
+        wrapperBSize->ConvertsToLength()
+            ? ReduceStyleSizeBy(*wrapperBSize, areaOccupied.BSize(wm))
+            : *wrapperBSize);
+  }
+
+  return innerSizeOverrides;
+}
+
+nsIFrame::SizeComputationResult nsTableWrapperFrame::ComputeSize(
+    const SizeComputationInput& aSizingInput, WritingMode aWM,
+    const LogicalSize& aCBSize, nscoord aAvailableISize,
+    const LogicalSize& aMargin, const LogicalSize& aBorderPadding,
+    const StyleSizeOverrides& aSizeOverrides, ComputeSizeFlags aFlags) {
+  auto result = nsContainerFrame::ComputeSize(
+      aSizingInput, aWM, aCBSize, aAvailableISize, aMargin, aBorderPadding,
+      aSizeOverrides, aFlags);
+
+  if (aSizeOverrides.mApplyOverridesVerbatim &&
+      aSizeOverrides.HasAnyOverrides()) {
+    auto size =
+        ComputeAutoSize(aSizingInput, aWM, aCBSize, aAvailableISize, aMargin,
+                        aBorderPadding, aSizeOverrides, aFlags);
+    result.mLogicalSize = size;
+  }
+
+  return result;
+}
+
+LogicalSize nsTableWrapperFrame::ComputeAutoSize(
+    const SizeComputationInput& aSizingInput, WritingMode aWM,
+    const LogicalSize& aCBSize, nscoord aAvailableISize,
+    const LogicalSize& aMargin, const LogicalSize& aBorderPadding,
+    const StyleSizeOverrides& aSizeOverrides, ComputeSizeFlags aFlags) {
+  nscoord kidAvailableISize = aAvailableISize - aMargin.ISize(aWM);
+  NS_ASSERTION(aBorderPadding.IsAllZero(),
+               "Table wrapper frames cannot have borders or paddings");
+
+  const ComputeSizeFlags flags = CreateComputeSizeFlagsForChild();
+
+  Maybe<StyleCaptionSide> captionSide = GetCaptionSide();
+
+  const LogicalSize innerTableSize =
+      InnerTableShrinkWrapSize(aSizingInput, InnerTableFrame(), aWM, aCBSize,
+                               kidAvailableISize, aSizeOverrides, flags);
+  if (!captionSide) {
+    return innerTableSize;
+  }
+  const LogicalSize captionSize =
+      CaptionShrinkWrapSize(aSizingInput, GetCaption(), aWM, aCBSize,
+                            innerTableSize.ISize(aWM), flags);
+  const nscoord iSize =
+      std::max(innerTableSize.ISize(aWM), captionSize.ISize(aWM));
+  nscoord bSize = NS_UNCONSTRAINEDSIZE;
+  if (innerTableSize.BSize(aWM) != NS_UNCONSTRAINEDSIZE &&
+      captionSize.BSize(aWM) != NS_UNCONSTRAINEDSIZE) {
+    bSize = innerTableSize.BSize(aWM) + captionSize.BSize(aWM);
+  }
+  return LogicalSize(aWM, iSize, bSize);
+}
+
+Maybe<StyleCaptionSide> nsTableWrapperFrame::GetCaptionSide() const {
+  if (!HasCaption()) {
+    return Nothing();
+  }
+  return Some(GetCaption()->StyleTableBorder()->mCaptionSide);
+}
+
+nscoord nsTableWrapperFrame::ComputeFinalBSize(
+    const LogicalSize& aInnerSize, const LogicalSize& aCaptionSize,
+    const LogicalMargin& aCaptionMargin, const WritingMode aWM) const {
+  return std::max(0, aInnerSize.BSize(aWM) +
+                         std::max(0, aCaptionSize.BSize(aWM) +
+                                         aCaptionMargin.BStartEnd(aWM)));
+}
+
+void nsTableWrapperFrame::GetCaptionOrigin(StyleCaptionSide aCaptionSide,
+                                           const LogicalSize& aInnerSize,
+                                           const LogicalSize& aCaptionSize,
+                                           LogicalMargin& aCaptionMargin,
+                                           LogicalPoint& aOrigin,
+                                           WritingMode aWM) const {
+  aOrigin.I(aWM) = aOrigin.B(aWM) = 0;
+  if ((NS_UNCONSTRAINEDSIZE == aInnerSize.ISize(aWM)) ||
+      (NS_UNCONSTRAINEDSIZE == aInnerSize.BSize(aWM)) ||
+      (NS_UNCONSTRAINEDSIZE == aCaptionSize.ISize(aWM)) ||
+      (NS_UNCONSTRAINEDSIZE == aCaptionSize.BSize(aWM))) {
+    return;
+  }
+  if (!HasCaption()) {
+    return;
+  }
+
+  NS_ASSERTION(NS_AUTOMARGIN != aCaptionMargin.IStart(aWM) &&
+                   NS_AUTOMARGIN != aCaptionMargin.BStart(aWM) &&
+                   NS_AUTOMARGIN != aCaptionMargin.BEnd(aWM),
+               "The computed caption margin is auto?");
+
+  aOrigin.I(aWM) = aCaptionMargin.IStart(aWM);
+
+  switch (aCaptionSide) {
+    case StyleCaptionSide::Bottom:
+      aOrigin.B(aWM) = aInnerSize.BSize(aWM) + aCaptionMargin.BStart(aWM);
+      break;
+    case StyleCaptionSide::Top:
+      aOrigin.B(aWM) = aCaptionMargin.BStart(aWM);
+      break;
+  }
+}
+
+void nsTableWrapperFrame::GetInnerOrigin(const MaybeCaptionSide& aCaptionSide,
+                                         const LogicalSize& aCaptionSize,
+                                         const LogicalMargin& aCaptionMargin,
+                                         const LogicalSize& aInnerSize,
+                                         LogicalPoint& aOrigin,
+                                         WritingMode aWM) const {
+  NS_ASSERTION(NS_AUTOMARGIN != aCaptionMargin.IStart(aWM) &&
+                   NS_AUTOMARGIN != aCaptionMargin.IEnd(aWM),
+               "The computed caption margin is auto?");
+
+  aOrigin.I(aWM) = aOrigin.B(aWM) = 0;
+  if ((NS_UNCONSTRAINEDSIZE == aInnerSize.ISize(aWM)) ||
+      (NS_UNCONSTRAINEDSIZE == aInnerSize.BSize(aWM)) ||
+      (NS_UNCONSTRAINEDSIZE == aCaptionSize.ISize(aWM)) ||
+      (NS_UNCONSTRAINEDSIZE == aCaptionSize.BSize(aWM))) {
+    return;
+  }
+
+  if (aCaptionSide) {
+    switch (*aCaptionSide) {
+      case StyleCaptionSide::Bottom:
+        break;
+      case StyleCaptionSide::Top:
+        aOrigin.B(aWM) =
+            aCaptionSize.BSize(aWM) + aCaptionMargin.BStartEnd(aWM);
+        break;
+    }
+  }
+}
+
+ComputeSizeFlags nsTableWrapperFrame::CreateComputeSizeFlagsForChild() const {
+  if (MOZ_UNLIKELY(IsGridItem())) {
+    auto* gridContainer = static_cast<nsGridContainerFrame*>(GetParent());
+    if (gridContainer->GridItemShouldStretch(this, LogicalAxis::Inline)) {
+      return {};
+    }
+  }
+  return {ComputeSizeFlag::ShrinkWrap};
+}
+
+void nsTableWrapperFrame::CreateReflowInputForInnerTable(
+    nsPresContext* aPresContext, nsTableFrame* aTableFrame,
+    const ReflowInput& aOuterRI, Maybe<ReflowInput>& aChildRI,
+    const nscoord aAvailISize, nscoord aBSizeOccupiedByCaption) const {
+  MOZ_ASSERT(InnerTableFrame() == aTableFrame);
+
+  const WritingMode wm = aTableFrame->GetWritingMode();
+  nscoord availBSize = aOuterRI.AvailableBSize();
+  if (availBSize != NS_UNCONSTRAINEDSIZE) {
+    availBSize = std::max(0, availBSize - aBSizeOccupiedByCaption);
+  }
+  const LogicalSize availSize(wm, aAvailISize, availBSize);
+
+  Maybe<LogicalSize> cbSize = Some(aOuterRI.mContainingBlockSize);
+
+  if (IsGridItem()) {
+    const LogicalMargin margin = aOuterRI.ComputedLogicalMargin(wm);
+    cbSize->ISize(wm) = std::max(0, cbSize->ISize(wm) - margin.IStartEnd(wm));
+    if (cbSize->BSize(wm) != NS_UNCONSTRAINEDSIZE) {
+      cbSize->BSize(wm) = std::max(0, cbSize->BSize(wm) - margin.BStartEnd(wm) -
+                                          aBSizeOccupiedByCaption);
+    }
+  }
+
+  ComputeSizeFlags csFlags = CreateComputeSizeFlagsForChild();
+  if (!aTableFrame->IsBorderCollapse() &&
+      !aOuterRI.mStyleSizeOverrides.HasAnyOverrides()) {
+    aChildRI.emplace(aPresContext, aOuterRI, aTableFrame, availSize, cbSize,
+                     ReflowInput::InitFlags{}, StyleSizeOverrides{}, csFlags);
+    return;
+  }
+
+  Maybe<LogicalMargin> borderPadding;
+  Maybe<LogicalMargin> padding;
+  {
+    Maybe<LogicalMargin> collapseBorder;
+    Maybe<LogicalMargin> collapsePadding;
+    aTableFrame->GetCollapsedBorderPadding(collapseBorder, collapsePadding);
+    SizeComputationInput input(aTableFrame, aOuterRI.mRenderingContext, wm,
+                               cbSize->ISize(wm), collapseBorder,
+                               collapsePadding);
+    borderPadding.emplace(input.ComputedLogicalBorderPadding(wm));
+    padding.emplace(input.ComputedLogicalPadding(wm));
+  }
+
+  StyleSizeOverrides innerOverrides = ComputeSizeOverridesForInnerTable(
+      aTableFrame, aOuterRI.mStyleSizeOverrides, borderPadding->Size(wm),
+      aBSizeOccupiedByCaption);
+
+  aChildRI.emplace(aPresContext, aOuterRI, aTableFrame, availSize, Nothing(),
+                   ReflowInput::InitFlag::CallerWillInit, innerOverrides,
+                   csFlags);
+  aChildRI->Init(aPresContext, cbSize, Some(*borderPadding - *padding),
+                 padding);
+}
+
+void nsTableWrapperFrame::CreateReflowInputForCaption(
+    nsPresContext* aPresContext, nsIFrame* aCaptionFrame,
+    const ReflowInput& aOuterRI, Maybe<ReflowInput>& aChildRI,
+    const nscoord aAvailISize) const {
+  MOZ_ASSERT(aCaptionFrame == GetCaption());
+
+  const WritingMode wm = aCaptionFrame->GetWritingMode();
+
+  const LogicalSize availSize(wm, aAvailISize, NS_UNCONSTRAINEDSIZE);
+  aChildRI.emplace(aPresContext, aOuterRI, aCaptionFrame, availSize);
+
+  if (aChildRI->mFlags.mIsTopOfPage) {
+    if (auto captionSide = GetCaptionSide()) {
+      if (*captionSide == StyleCaptionSide::Bottom) {
+        aChildRI->mFlags.mIsTopOfPage = false;
+      }
+    }
+  }
+}
+
+void nsTableWrapperFrame::ReflowChild(nsPresContext* aPresContext,
+                                      nsIFrame* aChildFrame,
+                                      const ReflowInput& aChildRI,
+                                      ReflowOutput& aMetrics,
+                                      nsReflowStatus& aStatus) {
+  const nsSize zeroCSize;
+  WritingMode wm = aChildRI.GetWritingMode();
+
+  LogicalPoint childPt = aChildFrame->GetLogicalPosition(wm, zeroCSize);
+  ReflowChildFlags flags = ReflowChildFlags::NoMoveFrame;
+
+  if (aChildFrame == InnerTableFrame()) {
+    flags |= ReflowChildFlags::NoDeleteNextInFlowChild;
+  }
+
+  nsContainerFrame::ReflowChild(aChildFrame, aPresContext, aMetrics, aChildRI,
+                                wm, childPt, zeroCSize, flags, aStatus);
+}
+
+void nsTableWrapperFrame::UpdateOverflowAreas(ReflowOutput& aMet) {
+  aMet.SetOverflowAreasToDesiredBounds();
+  for (auto* frame : mFrames) {
+    ConsiderChildOverflow(aMet.mOverflowAreas, frame);
+  }
+}
+
+void nsTableWrapperFrame::Reflow(nsPresContext* aPresContext,
+                                 ReflowOutput& aDesiredSize,
+                                 const ReflowInput& aOuterRI,
+                                 nsReflowStatus& aStatus) {
+  MarkInReflow();
+  DO_GLOBAL_REFLOW_COUNT("nsTableWrapperFrame");
+  MOZ_ASSERT(aStatus.IsEmpty(), "Caller should pass a fresh reflow status!");
+
+  aDesiredSize.ClearSize();
+
+  if (!HasAnyStateBits(NS_FRAME_FIRST_REFLOW)) {
+    MoveOverflowToChildList();
+  }
+
+  Maybe<ReflowInput> captionRI;
+  Maybe<ReflowInput> innerRI;
+
+  nsRect origCaptionRect;
+  nsRect origCaptionInkOverflow;
+  bool captionFirstReflow = false;
+  if (nsIFrame* caption = GetCaption()) {
+    origCaptionRect = caption->GetRect();
+    origCaptionInkOverflow = caption->InkOverflowRect();
+    captionFirstReflow = caption->HasAnyStateBits(NS_FRAME_FIRST_REFLOW);
+  }
+
+  WritingMode wm = aOuterRI.GetWritingMode();
+  Maybe<StyleCaptionSide> captionSide = GetCaptionSide();
+  const nscoord contentBoxISize = aOuterRI.ComputedSize(wm).ISize(wm);
+
+  MOZ_ASSERT(HasCaption() == captionSide.isSome());
+
+  CreateReflowInputForInnerTable(aPresContext, InnerTableFrame(), aOuterRI,
+                                 innerRI, contentBoxISize);
+
+  ReflowOutput captionMet(wm);
+  LogicalSize captionSize(wm);
+  LogicalMargin captionMargin(wm);
+  if (captionSide) {
+    nscoord innerBorderISize =
+        innerRI->ComputedSizeWithBorderPadding(wm).ISize(wm);
+    CreateReflowInputForCaption(aPresContext, GetCaption(), aOuterRI, captionRI,
+                                innerBorderISize);
+
+    nsReflowStatus capStatus;
+    ReflowChild(aPresContext, GetCaption(), *captionRI, captionMet, capStatus);
+    captionSize = captionMet.Size(wm);
+    captionMargin = captionRI->ComputedLogicalMargin(wm);
+    nscoord bSizeOccupiedByCaption =
+        captionSize.BSize(wm) + captionMargin.BStartEnd(wm);
+    if (bSizeOccupiedByCaption) {
+      innerRI.reset();
+      CreateReflowInputForInnerTable(aPresContext, InnerTableFrame(), aOuterRI,
+                                     innerRI, contentBoxISize,
+                                     bSizeOccupiedByCaption);
+    }
+  }
+
+  ReflowOutput innerMet(innerRI->GetWritingMode());
+  ReflowChild(aPresContext, InnerTableFrame(), *innerRI, innerMet, aStatus);
+  LogicalSize innerSize(wm, innerMet.ISize(wm), innerMet.BSize(wm));
+
+  LogicalSize desiredSize(wm);
+
+  desiredSize.ISize(wm) = contentBoxISize;
+  desiredSize.BSize(wm) =
+      ComputeFinalBSize(innerSize, captionSize, captionMargin, wm);
+
+  aDesiredSize.SetSize(wm, desiredSize);
+  nsSize containerSize = aDesiredSize.PhysicalSize();
+
+  MOZ_ASSERT(HasCaption() == captionSide.isSome());
+  if (nsIFrame* caption = GetCaption()) {
+    LogicalPoint captionOrigin(wm);
+    GetCaptionOrigin(*captionSide, innerSize, captionSize, captionMargin,
+                     captionOrigin, wm);
+    FinishReflowChild(caption, aPresContext, captionMet, captionRI.ptr(), wm,
+                      captionOrigin, containerSize,
+                      ReflowChildFlags::ApplyRelativePositioning);
+    captionRI.reset();
+  }
+
+  LogicalPoint innerOrigin(wm);
+  GetInnerOrigin(captionSide, captionSize, captionMargin, innerSize,
+                 innerOrigin, wm);
+  FinishReflowChild(InnerTableFrame(), aPresContext, innerMet, innerRI.ptr(),
+                    wm, innerOrigin, containerSize, ReflowChildFlags::Default);
+  innerRI.reset();
+
+  if (HasCaption()) {
+    nsTableFrame::InvalidateTableFrame(GetCaption(), origCaptionRect,
+                                       origCaptionInkOverflow,
+                                       captionFirstReflow);
+  }
+
+  UpdateOverflowAreas(aDesiredSize);
+
+  if (GetPrevInFlow()) {
+    ReflowOverflowContainerChildren(aPresContext, aOuterRI,
+                                    aDesiredSize.mOverflowAreas,
+                                    ReflowChildFlags::Default, aStatus);
+  }
+
+  FinishReflowWithAbsoluteFrames(aPresContext, aDesiredSize, aOuterRI, aStatus);
+}
+
+
+nsIContent* nsTableWrapperFrame::GetCellAt(uint32_t aRowIdx,
+                                           uint32_t aColIdx) const {
+  nsTableCellMap* cellMap = InnerTableFrame()->GetCellMap();
+  if (!cellMap) {
+    return nullptr;
+  }
+
+  nsTableCellFrame* cell = cellMap->GetCellInfoAt(aRowIdx, aColIdx);
+  if (!cell) {
+    return nullptr;
+  }
+
+  return cell->GetContent();
+}
+
+nsTableWrapperFrame* NS_NewTableWrapperFrame(PresShell* aPresShell,
+                                             ComputedStyle* aStyle) {
+  return new (aPresShell)
+      nsTableWrapperFrame(aStyle, aPresShell->GetPresContext());
+}
+
+NS_IMPL_FRAMEARENA_HELPERS(nsTableWrapperFrame)
+
+#ifdef DEBUG_FRAME_DUMP
+nsresult nsTableWrapperFrame::GetFrameName(nsAString& aResult) const {
+  return MakeFrameName(u"TableWrapper"_ns, aResult);
+}
+#endif

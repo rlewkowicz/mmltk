@@ -1,0 +1,593 @@
+/*
+ * Copyright 2022 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_RASTERPIPELINEBUILDER)
+#define SKSL_RASTERPIPELINEBUILDER
+
+#include "include/core/SkTypes.h"
+
+#include "include/core/SkSpan.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkTArray.h"
+#include "src/base/SkUtils.h"
+#include "src/core/SkRasterPipelineOpList.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+
+class SkArenaAlloc;
+class SkRasterPipeline;
+class SkWStream;
+using SkRPOffset = uint32_t;
+
+namespace SkSL {
+
+class DebugTracePriv;
+class TraceHook;
+
+namespace RP {
+
+using Slot = int;
+constexpr Slot NA = -1;
+
+struct SlotRange {
+    Slot index = 0;
+    int count = 0;
+};
+
+#define SKRP_EXTENDED_OPS(M)     \
+             \
+    M(label)                     \
+                                 \
+             \
+    M(invoke_shader)             \
+    M(invoke_color_filter)       \
+    M(invoke_blender)            \
+                                 \
+     \
+    M(invoke_to_linear_srgb)     \
+    M(invoke_from_linear_srgb)
+
+enum class ProgramOp {
+    #define M(stage) stage,
+        SK_RASTER_PIPELINE_OPS_ALL(M)
+
+        SKRP_EXTENDED_OPS(M)
+    #undef M
+};
+
+enum class BuilderOp {
+    #define M(stage) stage,
+        SK_RASTER_PIPELINE_OPS_ALL(M)
+
+        SKRP_EXTENDED_OPS(M)
+    #undef M
+
+    push_clone,
+    push_clone_from_stack,
+    push_clone_indirect_from_stack,
+    push_constant,
+    push_immutable,
+    push_immutable_indirect,
+    push_slots,
+    push_slots_indirect,
+    push_uniform,
+    push_uniform_indirect,
+    copy_stack_to_slots,
+    copy_stack_to_slots_unmasked,
+    copy_stack_to_slots_indirect,
+    copy_uniform_to_slots_unmasked,
+    store_immutable_value,
+    swizzle_copy_stack_to_slots,
+    swizzle_copy_stack_to_slots_indirect,
+    discard_stack,
+    pad_stack,
+    select,
+    push_condition_mask,
+    pop_condition_mask,
+    push_loop_mask,
+    pop_loop_mask,
+    pop_and_reenable_loop_mask,
+    push_return_mask,
+    pop_return_mask,
+    push_src_rgba,
+    push_dst_rgba,
+    push_device_xy01,
+    pop_src_rgba,
+    pop_dst_rgba,
+    trace_var_indirect,
+    branch_if_no_active_lanes_on_stack_top_equal,
+    unsupported
+};
+
+static_assert((int)ProgramOp::label == (int)BuilderOp::label);
+
+struct Instruction {
+    BuilderOp fOp;
+    Slot      fSlotA = NA;
+    Slot      fSlotB = NA;
+    int       fImmA = 0;
+    int       fImmB = 0;
+    int       fImmC = 0;
+    int       fImmD = 0;
+    int       fStackID = 0;
+};
+
+class Callbacks {
+public:
+    virtual ~Callbacks() = default;
+
+    virtual bool appendShader(int index) = 0;
+    virtual bool appendColorFilter(int index) = 0;
+    virtual bool appendBlender(int index) = 0;
+
+    virtual void toLinearSrgb(const void* color) = 0;
+    virtual void fromLinearSrgb(const void* color) = 0;
+};
+
+class Program {
+public:
+    Program(skia_private::TArray<Instruction> instrs,
+            int numValueSlots,
+            int numUniformSlots,
+            int numImmutableSlots,
+            int numLabels,
+            DebugTracePriv* debugTrace);
+    ~Program();
+
+    bool appendStages(SkRasterPipeline* pipeline,
+                      SkArenaAlloc* alloc,
+                      Callbacks* callbacks,
+                      SkSpan<const float> uniforms) const;
+
+    void dump(SkWStream* out, bool writeInstructionCount = false) const;
+
+    int numUniforms() const { return fNumUniformSlots; }
+
+private:
+    using StackDepths = skia_private::TArray<int>; 
+
+    struct SlotData {
+        SkSpan<float> values;
+        SkSpan<float> stack;
+        SkSpan<float> immutable;
+    };
+    std::optional<SlotData> allocateSlotData(SkArenaAlloc* alloc) const;
+
+    struct Stage {
+        ProgramOp op;
+        void*     ctx;
+    };
+    void makeStages(skia_private::TArray<Stage>* pipeline,
+                    SkArenaAlloc* alloc,
+                    SkSpan<const float> uniforms,
+                    const SlotData& slots) const;
+    StackDepths tempStackMaxDepths() const;
+
+    void appendCopy(skia_private::TArray<Stage>* pipeline,
+                    SkArenaAlloc* alloc,
+                    std::byte* basePtr,
+                    ProgramOp baseStage,
+                    SkRPOffset dst, int dstStride,
+                    SkRPOffset src, int srcStride,
+                    int numSlots) const;
+    void appendCopyImmutableUnmasked(skia_private::TArray<Stage>* pipeline,
+                                     SkArenaAlloc* alloc,
+                                     std::byte* basePtr,
+                                     SkRPOffset dst,
+                                     SkRPOffset src,
+                                     int numSlots) const;
+    void appendCopySlotsUnmasked(skia_private::TArray<Stage>* pipeline,
+                                 SkArenaAlloc* alloc,
+                                 SkRPOffset dst,
+                                 SkRPOffset src,
+                                 int numSlots) const;
+    void appendCopySlotsMasked(skia_private::TArray<Stage>* pipeline,
+                               SkArenaAlloc* alloc,
+                               SkRPOffset dst,
+                               SkRPOffset src,
+                               int numSlots) const;
+
+    void appendSingleSlotUnaryOp(skia_private::TArray<Stage>* pipeline, ProgramOp stage,
+                                 float* dst, int numSlots) const;
+
+    void appendMultiSlotUnaryOp(skia_private::TArray<Stage>* pipeline, ProgramOp baseStage,
+                                float* dst, int numSlots) const;
+
+    void appendImmediateBinaryOp(skia_private::TArray<Stage>* pipeline, SkArenaAlloc* alloc,
+                                 ProgramOp baseStage,
+                                 SkRPOffset dst, int32_t value, int numSlots) const;
+
+    void appendAdjacentNWayBinaryOp(skia_private::TArray<Stage>* pipeline, SkArenaAlloc* alloc,
+                                    ProgramOp stage,
+                                    SkRPOffset dst, SkRPOffset src, int numSlots) const;
+
+    void appendAdjacentMultiSlotBinaryOp(skia_private::TArray<Stage>* pipeline, SkArenaAlloc* alloc,
+                                         ProgramOp baseStage, std::byte* basePtr,
+                                         SkRPOffset dst, SkRPOffset src, int numSlots) const;
+
+    void appendAdjacentMultiSlotTernaryOp(skia_private::TArray<Stage>* pipeline,
+                                          SkArenaAlloc* alloc, ProgramOp baseStage,
+                                          std::byte* basePtr, SkRPOffset dst, SkRPOffset src0,
+                                          SkRPOffset src1, int numSlots) const;
+
+    void appendAdjacentNWayTernaryOp(skia_private::TArray<Stage>* pipeline, SkArenaAlloc* alloc,
+                                     ProgramOp stage, std::byte* basePtr, SkRPOffset dst,
+                                     SkRPOffset src0, SkRPOffset src1, int numSlots) const;
+
+    void appendStackRewindForNonTailcallers(skia_private::TArray<Stage>* pipeline) const;
+
+    void appendStackRewind(skia_private::TArray<Stage>* pipeline) const;
+
+    class Dumper;
+    friend class Dumper;
+
+    skia_private::TArray<Instruction> fInstructions;
+    int fNumValueSlots = 0;
+    int fNumUniformSlots = 0;
+    int fNumImmutableSlots = 0;
+    int fNumTempStackSlots = 0;
+    int fNumLabels = 0;
+    StackDepths fTempStackMaxDepths;
+    DebugTracePriv* fDebugTrace = nullptr;
+    std::unique_ptr<SkSL::TraceHook> fTraceHook;
+};
+
+class Builder {
+public:
+    std::unique_ptr<Program> finish(int numValueSlots,
+                                    int numUniformSlots,
+                                    int numImmutableSlots,
+                                    DebugTracePriv* debugTrace = nullptr);
+    int nextLabelID() {
+        return fNumLabels++;
+    }
+
+    void enableExecutionMaskWrites() {
+        ++fExecutionMaskWritesEnabled;
+    }
+
+    void disableExecutionMaskWrites() {
+        SkASSERT(this->executionMaskWritesAreEnabled());
+        --fExecutionMaskWritesEnabled;
+    }
+
+    bool executionMaskWritesAreEnabled() {
+        return fExecutionMaskWritesEnabled > 0;
+    }
+
+    void init_lane_masks() {
+        this->appendInstruction(BuilderOp::init_lane_masks, {});
+    }
+
+    void store_src_rg(SlotRange slots) {
+        SkASSERT(slots.count == 2);
+        this->appendInstruction(BuilderOp::store_src_rg, {slots.index});
+    }
+
+    void store_src(SlotRange slots) {
+        SkASSERT(slots.count == 4);
+        this->appendInstruction(BuilderOp::store_src, {slots.index});
+    }
+
+    void store_dst(SlotRange slots) {
+        SkASSERT(slots.count == 4);
+        this->appendInstruction(BuilderOp::store_dst, {slots.index});
+    }
+
+    void store_device_xy01(SlotRange slots) {
+        SkASSERT(slots.count == 4);
+        this->appendInstruction(BuilderOp::store_device_xy01, {slots.index});
+    }
+
+    void load_src(SlotRange slots) {
+        SkASSERT(slots.count == 4);
+        this->appendInstruction(BuilderOp::load_src, {slots.index});
+    }
+
+    void load_dst(SlotRange slots) {
+        SkASSERT(slots.count == 4);
+        this->appendInstruction(BuilderOp::load_dst, {slots.index});
+    }
+
+    void set_current_stack(int stackID) {
+        fCurrentStackID = stackID;
+    }
+
+    void label(int labelID);
+
+    void jump(int labelID);
+
+    void branch_if_all_lanes_active(int labelID);
+
+    void branch_if_any_lanes_active(int labelID);
+
+    void branch_if_no_lanes_active(int labelID);
+
+    void branch_if_no_active_lanes_on_stack_top_equal(int value, int labelID);
+
+    void push_constant_i(int32_t val, int count = 1);
+
+    void push_zeros(int count) {
+        this->push_constant_i(0, count);
+    }
+
+    void push_constant_f(float val) {
+        this->push_constant_i(sk_bit_cast<int32_t>(val), 1);
+    }
+
+    void push_constant_u(uint32_t val, int count = 1) {
+        this->push_constant_i(sk_bit_cast<int32_t>(val), count);
+    }
+
+    void push_uniform(SlotRange src);
+
+    void store_immutable_value_i(Slot slot, int32_t val) {
+        this->appendInstruction(BuilderOp::store_immutable_value, {slot}, val);
+    }
+
+    void copy_uniform_to_slots_unmasked(SlotRange dst, SlotRange src);
+
+    void push_uniform_indirect(SlotRange fixedRange, int dynamicStack, SlotRange limitRange);
+
+
+    void push_slots(SlotRange src) {
+        this->push_slots_or_immutable(src, BuilderOp::push_slots);
+    }
+
+    void push_immutable(SlotRange src) {
+        this->push_slots_or_immutable(src, BuilderOp::push_immutable);
+    }
+
+    void push_slots_or_immutable(SlotRange src, BuilderOp op);
+
+    void push_slots_indirect(SlotRange fixedRange, int dynamicStack, SlotRange limitRange) {
+        this->push_slots_or_immutable_indirect(fixedRange, dynamicStack, limitRange,
+                                               BuilderOp::push_slots_indirect);
+    }
+
+    void push_immutable_indirect(SlotRange fixedRange, int dynamicStack, SlotRange limitRange) {
+        this->push_slots_or_immutable_indirect(fixedRange, dynamicStack, limitRange,
+                                               BuilderOp::push_immutable_indirect);
+    }
+
+    void push_slots_or_immutable_indirect(SlotRange fixedRange, int dynamicStack,
+                                          SlotRange limitRange, BuilderOp op);
+
+    void copy_stack_to_slots(SlotRange dst) {
+        this->copy_stack_to_slots(dst, dst.count);
+    }
+
+    void copy_stack_to_slots(SlotRange dst, int offsetFromStackTop);
+
+    void swizzle_copy_stack_to_slots(SlotRange dst,
+                                     SkSpan<const int8_t> components,
+                                     int offsetFromStackTop);
+
+    void swizzle_copy_stack_to_slots_indirect(SlotRange fixedRange,
+                                              int dynamicStackID,
+                                              SlotRange limitRange,
+                                              SkSpan<const int8_t> components,
+                                              int offsetFromStackTop);
+
+    void copy_stack_to_slots_unmasked(SlotRange dst) {
+        this->copy_stack_to_slots_unmasked(dst, dst.count);
+    }
+
+    void copy_stack_to_slots_unmasked(SlotRange dst, int offsetFromStackTop);
+
+    void copy_stack_to_slots_indirect(SlotRange fixedRange,
+                                      int dynamicStackID,
+                                      SlotRange limitRange);
+
+    void pop_slots_indirect(SlotRange fixedRange, int dynamicStackID, SlotRange limitRange) {
+        this->copy_stack_to_slots_indirect(fixedRange, dynamicStackID, limitRange);
+        this->discard_stack(fixedRange.count);
+    }
+
+    void unary_op(BuilderOp op, int32_t slots);
+
+    void binary_op(BuilderOp op, int32_t slots);
+
+    void ternary_op(BuilderOp op, int32_t slots);
+
+    void dot_floats(int32_t slots);
+
+    void refract_floats();
+
+    void inverse_matrix(int32_t n);
+
+    void discard_stack(int32_t count, int stackID);
+
+    void discard_stack(int32_t count) {
+        this->discard_stack(count, fCurrentStackID);
+    }
+
+    void pad_stack(int32_t count);
+
+    void pop_slots(SlotRange dst);
+
+    void push_duplicates(int count);
+
+    void push_clone(int numSlots, int offsetFromStackTop = 0);
+
+    void push_clone_from_stack(SlotRange range, int otherStackID, int offsetFromStackTop);
+
+    void push_clone_indirect_from_stack(SlotRange fixedOffset,
+                                        int dynamicStackID,
+                                        int otherStackID,
+                                        int offsetFromStackTop);
+
+    void case_op(int value) {
+        this->appendInstruction(BuilderOp::case_op, {}, value);
+    }
+
+    void continue_op(int continueMaskStackID) {
+        this->appendInstruction(BuilderOp::continue_op, {}, continueMaskStackID);
+    }
+
+    void select(int slots) {
+        SkASSERT(slots > 0);
+        this->appendInstruction(BuilderOp::select, {}, slots);
+    }
+
+    void pop_slots_unmasked(SlotRange dst);
+
+    void copy_slots_masked(SlotRange dst, SlotRange src) {
+        SkASSERT(dst.count == src.count);
+        this->appendInstruction(BuilderOp::copy_slot_masked, {dst.index, src.index}, dst.count);
+    }
+
+    void copy_slots_unmasked(SlotRange dst, SlotRange src);
+
+    void copy_immutable_unmasked(SlotRange dst, SlotRange src);
+
+    void copy_constant(Slot slot, int constantValue);
+
+    void zero_slots_unmasked(SlotRange dst);
+
+    void swizzle(int consumedSlots, SkSpan<const int8_t> components);
+
+    void transpose(int columns, int rows);
+
+    void diagonal_matrix(int columns, int rows);
+
+    void matrix_resize(int origColumns, int origRows, int newColumns, int newRows);
+
+    void matrix_multiply(int leftColumns, int leftRows, int rightColumns, int rightRows);
+
+    void push_condition_mask();
+
+    void pop_condition_mask() {
+        SkASSERT(this->executionMaskWritesAreEnabled());
+        this->appendInstruction(BuilderOp::pop_condition_mask, {});
+    }
+
+    void merge_condition_mask();
+
+    void merge_inv_condition_mask() {
+        SkASSERT(this->executionMaskWritesAreEnabled());
+        this->appendInstruction(BuilderOp::merge_inv_condition_mask, {});
+    }
+
+    void push_loop_mask() {
+        SkASSERT(this->executionMaskWritesAreEnabled());
+        this->appendInstruction(BuilderOp::push_loop_mask, {});
+    }
+
+    void pop_loop_mask() {
+        SkASSERT(this->executionMaskWritesAreEnabled());
+        this->appendInstruction(BuilderOp::pop_loop_mask, {});
+    }
+
+    void exchange_src();
+
+    void push_src_rgba() {
+        this->appendInstruction(BuilderOp::push_src_rgba, {});
+    }
+
+    void push_dst_rgba() {
+        this->appendInstruction(BuilderOp::push_dst_rgba, {});
+    }
+
+    void push_device_xy01() {
+        this->appendInstruction(BuilderOp::push_device_xy01, {});
+    }
+
+    void pop_src_rgba();
+
+    void pop_dst_rgba() {
+        this->appendInstruction(BuilderOp::pop_dst_rgba, {});
+    }
+
+    void mask_off_loop_mask() {
+        SkASSERT(this->executionMaskWritesAreEnabled());
+        this->appendInstruction(BuilderOp::mask_off_loop_mask, {});
+    }
+
+    void reenable_loop_mask(SlotRange src) {
+        SkASSERT(this->executionMaskWritesAreEnabled());
+        SkASSERT(src.count == 1);
+        this->appendInstruction(BuilderOp::reenable_loop_mask, {src.index});
+    }
+
+    void pop_and_reenable_loop_mask() {
+        SkASSERT(this->executionMaskWritesAreEnabled());
+        this->appendInstruction(BuilderOp::pop_and_reenable_loop_mask, {});
+    }
+
+    void merge_loop_mask() {
+        SkASSERT(this->executionMaskWritesAreEnabled());
+        this->appendInstruction(BuilderOp::merge_loop_mask, {});
+    }
+
+    void push_return_mask() {
+        SkASSERT(this->executionMaskWritesAreEnabled());
+        this->appendInstruction(BuilderOp::push_return_mask, {});
+    }
+
+    void pop_return_mask();
+
+    void mask_off_return_mask() {
+        SkASSERT(this->executionMaskWritesAreEnabled());
+        this->appendInstruction(BuilderOp::mask_off_return_mask, {});
+    }
+
+    void invoke_shader(int childIdx);
+    void invoke_color_filter(int childIdx);
+    void invoke_blender(int childIdx);
+    void invoke_to_linear_srgb();
+    void invoke_from_linear_srgb();
+
+    void trace_line(int traceMaskStackID, int line) {
+        this->appendInstruction(BuilderOp::trace_line, {}, traceMaskStackID, line);
+    }
+
+    void trace_var(int traceMaskStackID, SlotRange r) {
+        this->appendInstruction(BuilderOp::trace_var, {r.index}, traceMaskStackID, r.count);
+    }
+
+    void trace_var_indirect(int traceMaskStackID, SlotRange fixedRange,
+                            int dynamicStackID, SlotRange limitRange);
+
+    void trace_enter(int traceMaskStackID, int funcID) {
+        this->appendInstruction(BuilderOp::trace_enter, {}, traceMaskStackID, funcID);
+    }
+
+    void trace_exit(int traceMaskStackID, int funcID) {
+        this->appendInstruction(BuilderOp::trace_exit, {}, traceMaskStackID, funcID);
+    }
+
+    void trace_scope(int traceMaskStackID, int delta) {
+        this->appendInstruction(BuilderOp::trace_scope, {}, traceMaskStackID, delta);
+    }
+
+private:
+    struct SlotList {
+        SlotList(Slot a = NA, Slot b = NA) : fSlotA(a), fSlotB(b) {}
+        Slot fSlotA = NA;
+        Slot fSlotB = NA;
+    };
+    void appendInstruction(BuilderOp op, SlotList slots,
+                           int a = 0, int b = 0, int c = 0, int d = 0);
+    Instruction* lastInstruction(int fromBack = 0);
+    Instruction* lastInstructionOnAnyStack(int fromBack = 0);
+    void simplifyPopSlotsUnmasked(SlotRange* dst);
+    bool simplifyImmediateUnmaskedOp();
+
+    skia_private::TArray<Instruction> fInstructions;
+    int fNumLabels = 0;
+    int fExecutionMaskWritesEnabled = 0;
+    int fCurrentStackID = 0;
+};
+
+}  
+}  
+
+#endif

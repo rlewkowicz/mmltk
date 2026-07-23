@@ -1,0 +1,55 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+#if !defined(GOOGLE_PROTOBUF_EXPLICITLY_CONSTRUCTED_H__)
+#define GOOGLE_PROTOBUF_EXPLICITLY_CONSTRUCTED_H__
+
+#include <stdint.h>
+
+#include <string>
+#include <utility>
+
+// clang-format off
+#include "google/protobuf/port_def.inc"
+// clang-format on
+
+namespace google {
+namespace protobuf {
+namespace internal {
+
+template <typename T, size_t min_align = 1>
+class PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED ExplicitlyConstructed {
+ public:
+  void DefaultConstruct() { new (&union_) T(); }
+
+  template <typename... Args>
+  void Construct(Args&&... args) {
+    new (&union_) T(std::forward<Args>(args)...);
+  }
+
+  void Destruct() { get_mutable()->~T(); }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD constexpr const T& get() const {
+    return reinterpret_cast<const T&>(union_);
+  }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD T* get_mutable() {
+    return reinterpret_cast<T*>(&union_);
+  }
+
+ private:
+  union AlignedUnion {
+    alignas(min_align > alignof(T) ? min_align
+                                   : alignof(T)) char space[sizeof(T)];
+    int64_t align_to_int64;
+    void* align_to_ptr;
+  } union_;
+};
+
+}  
+}  
+}  
+
+#include "google/protobuf/port_undef.inc"
+
+#endif

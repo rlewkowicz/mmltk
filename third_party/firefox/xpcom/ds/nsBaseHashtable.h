@@ -1,0 +1,773 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsBaseHashtable_h_
+#define nsBaseHashtable_h_
+
+#include <functional>
+#include <utility>
+
+#include "mozilla/dom/SafeRefPtr.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Result.h"
+#include "mozilla/UniquePtr.h"
+#include "nsCOMPtr.h"
+#include "nsDebug.h"
+#include "nsHashtablesFwd.h"
+#include "nsTHashtable.h"
+
+namespace mozilla::detail {
+
+template <typename SmartPtr>
+struct SmartPtrTraits {
+  static constexpr bool IsSmartPointer = false;
+  static constexpr bool IsRefCounted = false;
+};
+
+template <typename Pointee>
+struct SmartPtrTraits<UniquePtr<Pointee>> {
+  static constexpr bool IsSmartPointer = true;
+  static constexpr bool IsRefCounted = false;
+  using SmartPointerType = UniquePtr<Pointee>;
+  using PointeeType = Pointee;
+  using RawPointerType = Pointee*;
+  template <typename U>
+  using OtherSmartPtrType = UniquePtr<U>;
+
+  template <typename U, typename... Args>
+  static SmartPointerType NewObject(Args&&... aConstructionArgs) {
+    return mozilla::MakeUnique<U>(std::forward<Args>(aConstructionArgs)...);
+  }
+};
+
+template <typename Pointee>
+struct SmartPtrTraits<RefPtr<Pointee>> {
+  static constexpr bool IsSmartPointer = true;
+  static constexpr bool IsRefCounted = true;
+  using SmartPointerType = RefPtr<Pointee>;
+  using PointeeType = Pointee;
+  using RawPointerType = Pointee*;
+  template <typename U>
+  using OtherSmartPtrType = RefPtr<U>;
+
+  template <typename U, typename... Args>
+  static SmartPointerType NewObject(Args&&... aConstructionArgs) {
+    return MakeRefPtr<U>(std::forward<Args>(aConstructionArgs)...);
+  }
+};
+
+template <typename Pointee>
+struct SmartPtrTraits<SafeRefPtr<Pointee>> {
+  static constexpr bool IsSmartPointer = true;
+  static constexpr bool IsRefCounted = true;
+  using SmartPointerType = SafeRefPtr<Pointee>;
+  using PointeeType = Pointee;
+  using RawPointerType = Pointee*;
+  template <typename U>
+  using OtherSmartPtrType = SafeRefPtr<U>;
+
+  template <typename U, typename... Args>
+  static SmartPointerType NewObject(Args&&... aConstructionArgs) {
+    return MakeSafeRefPtr<U>(std::forward<Args>(aConstructionArgs)...);
+  }
+};
+
+template <typename Pointee>
+struct SmartPtrTraits<nsCOMPtr<Pointee>> {
+  static constexpr bool IsSmartPointer = true;
+  static constexpr bool IsRefCounted = true;
+  using SmartPointerType = nsCOMPtr<Pointee>;
+  using PointeeType = Pointee;
+  using RawPointerType = Pointee*;
+  template <typename U>
+  using OtherSmartPtrType = nsCOMPtr<U>;
+
+  template <typename U, typename... Args>
+  static SmartPointerType NewObject(Args&&... aConstructionArgs) {
+    return MakeRefPtr<U>(std::forward<Args>(aConstructionArgs)...);
+  }
+};
+
+template <class T>
+T* PtrGetWeak(T* aPtr) {
+  return aPtr;
+}
+
+template <class T>
+T* PtrGetWeak(const RefPtr<T>& aPtr) {
+  return aPtr.get();
+}
+
+template <class T>
+T* PtrGetWeak(const SafeRefPtr<T>& aPtr) {
+  return aPtr.unsafeGetRawPtr();
+}
+
+template <class T>
+T* PtrGetWeak(const nsCOMPtr<T>& aPtr) {
+  return aPtr.get();
+}
+
+template <class T>
+T* PtrGetWeak(const UniquePtr<T>& aPtr) {
+  return aPtr.get();
+}
+
+template <typename EntryType>
+class nsBaseHashtableValueIterator : public ::detail::nsTHashtableIteratorBase {
+
+ public:
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = const std::decay_t<typename EntryType::DataType>;
+  using difference_type = int32_t;
+  using pointer = value_type*;
+  using reference = value_type&;
+
+  using iterator_type = nsBaseHashtableValueIterator;
+  using const_iterator_type = nsBaseHashtableValueIterator;
+
+  using nsTHashtableIteratorBase::nsTHashtableIteratorBase;
+
+  value_type* operator->() const {
+    return &static_cast<const EntryType*>(mIterator.Get())->GetData();
+  }
+  decltype(auto) operator*() const {
+    return static_cast<const EntryType*>(mIterator.Get())->GetData();
+  }
+
+  iterator_type& operator++() {
+    mIterator.Next();
+    return *this;
+  }
+  iterator_type operator++(int) {
+    iterator_type it = *this;
+    ++*this;
+    return it;
+  }
+};
+
+template <typename EntryType>
+class nsBaseHashtableValueRange {
+ public:
+  using IteratorType = nsBaseHashtableValueIterator<EntryType>;
+  using iterator = IteratorType;
+
+  explicit nsBaseHashtableValueRange(const PLDHashTable& aHashtable)
+      : mHashtable{aHashtable} {}
+
+  auto begin() const { return IteratorType{mHashtable}; }
+  auto end() const {
+    return IteratorType{mHashtable, typename IteratorType::EndIteratorTag{}};
+  }
+  auto cbegin() const { return begin(); }
+  auto cend() const { return end(); }
+
+  uint32_t Count() const { return mHashtable.EntryCount(); }
+
+ private:
+  const PLDHashTable& mHashtable;
+};
+
+template <typename EntryType>
+size_t RangeSizeEstimate(
+    const detail::nsBaseHashtableValueRange<EntryType>& aRange) {
+  return aRange.Count();
+}
+
+}  
+
+template <class DataType, class UserDataType>
+class nsDefaultConverter {
+ public:
+  static UserDataType Unwrap(DataType& src) { return UserDataType(src); }
+  static UserDataType Unwrap(const DataType& src) { return UserDataType(src); }
+
+  static DataType Wrap(const UserDataType& src) { return DataType(src); }
+
+  template <typename U>
+  static DataType Wrap(U&& src) {
+    return std::forward<U>(src);
+  }
+
+  template <typename U>
+  static UserDataType Unwrap(U&& src) {
+    return std::forward<U>(src);
+  }
+};
+
+template <class KeyClass, class TDataType>
+class nsBaseHashtableET : public KeyClass {
+ public:
+  using DataType = TDataType;
+
+  const DataType& GetData() const { return mData; }
+  DataType* GetModifiableData() { return &mData; }
+  template <typename U>
+  void SetData(U&& aData) {
+    mData = std::forward<U>(aData);
+  }
+
+  decltype(auto) GetWeak() const {
+    return mozilla::detail::PtrGetWeak(GetData());
+  }
+
+  ~nsBaseHashtableET() = default;
+
+ private:
+  DataType mData;
+  friend class nsTHashtable<nsBaseHashtableET<KeyClass, DataType>>;
+  template <typename KeyClassX, typename DataTypeX, typename UserDataTypeX,
+            typename ConverterX>
+  friend class nsBaseHashtable;
+  friend class ::detail::nsTHashtableKeyIterator<
+      nsBaseHashtableET<KeyClass, DataType>>;
+
+  typedef typename KeyClass::KeyType KeyType;
+  typedef typename KeyClass::KeyTypePointer KeyTypePointer;
+
+  template <typename... Args>
+  explicit nsBaseHashtableET(KeyTypePointer aKey, Args&&... aArgs);
+  nsBaseHashtableET(nsBaseHashtableET<KeyClass, DataType>&& aToMove) = default;
+};
+
+template <class KeyClass, class DataType, class UserDataType, class Converter>
+class nsBaseHashtable
+    : protected nsTHashtable<nsBaseHashtableET<KeyClass, DataType>> {
+  using Base = nsTHashtable<nsBaseHashtableET<KeyClass, DataType>>;
+  typedef mozilla::fallible_t fallible_t;
+  template <typename KC, typename DT, typename UDT, typename C>
+  friend inline void ::ImplCycleCollectionTraverse(
+      nsCycleCollectionTraversalCallback&,
+      const nsBaseHashtable<KC, DT, UDT, C>&, const char* aName,
+      uint32_t aFlags);
+
+  template <typename KC, typename DT, typename UDT, typename C>
+  friend inline void ImplCycleCollectionTrace(const TraceCallbacks& aCallbacks,
+                                              nsBaseHashtable<KC, DT, UDT, C>&,
+                                              const char* aName,
+                                              void* aClosure);
+
+ public:
+  typedef typename KeyClass::KeyType KeyType;
+  typedef nsBaseHashtableET<KeyClass, DataType> EntryType;
+
+  static_assert(!(std::is_trivially_destructible_v<KeyClass> &&
+                  std::is_trivially_destructible_v<DataType>) ||
+                    std::is_trivially_destructible_v<EntryType>,
+                "trivially-destructible key and data must yield a "
+                "trivially-destructible entry");
+
+  using nsTHashtable<EntryType>::Contains;
+  using nsTHashtable<EntryType>::GetGeneration;
+  using nsTHashtable<EntryType>::SizeOfExcludingThis;
+  using nsTHashtable<EntryType>::SizeOfIncludingThis;
+
+  nsBaseHashtable() = default;
+  explicit nsBaseHashtable(uint32_t aInitLength)
+      : nsTHashtable<EntryType>(aInitLength) {}
+
+  [[nodiscard]] uint32_t Count() const {
+    return nsTHashtable<EntryType>::Count();
+  }
+
+  [[nodiscard]] bool IsEmpty() const {
+    return nsTHashtable<EntryType>::IsEmpty();
+  }
+
+  [[nodiscard]] bool Get(KeyType aKey, UserDataType* aData) const {
+    EntryType* ent = this->GetEntry(aKey);
+    if (!ent) {
+      return false;
+    }
+
+    if (aData) {
+      *aData = Converter::Unwrap(ent->mData);
+    }
+
+    return true;
+  }
+
+  [[nodiscard]] UserDataType Get(KeyType aKey) const {
+    EntryType* ent = this->GetEntry(aKey);
+    if (!ent) {
+      return UserDataType{};
+    }
+
+    return Converter::Unwrap(ent->mData);
+  }
+
+  [[nodiscard]] mozilla::Maybe<UserDataType> MaybeGet(KeyType aKey) const {
+    EntryType* ent = this->GetEntry(aKey);
+    if (!ent) {
+      return mozilla::Nothing();
+    }
+
+    return mozilla::Some(Converter::Unwrap(ent->mData));
+  }
+
+  using SmartPtrTraits = mozilla::detail::SmartPtrTraits<DataType>;
+
+  template <typename... Args>
+  auto GetOrInsertNew(KeyType aKey, Args&&... aConstructionArgs) {
+    static_assert(
+        SmartPtrTraits::IsSmartPointer,
+        "GetOrInsertNew can only be used with smart pointer data types");
+    return mozilla::detail::PtrGetWeak(LookupOrInsertWith(std::move(aKey), [&] {
+      return SmartPtrTraits::template NewObject<
+          typename SmartPtrTraits::PointeeType>(
+          std::forward<Args>(aConstructionArgs)...);
+    }));
+  }
+
+  template <typename... Args>
+  DataType& LookupOrInsert(const KeyType& aKey, Args&&... aArgs) {
+    return WithEntryHandle(aKey, [&](auto entryHandle) -> DataType& {
+      return entryHandle.OrInsert(std::forward<Args>(aArgs)...);
+    });
+  }
+
+  template <typename F>
+  DataType& LookupOrInsertWith(const KeyType& aKey, F&& aFunc) {
+    return WithEntryHandle(aKey, [&aFunc](auto entryHandle) -> DataType& {
+      return entryHandle.OrInsertWith(std::forward<F>(aFunc));
+    });
+  }
+
+  template <typename F>
+  [[nodiscard]] auto TryLookupOrInsertWith(const KeyType& aKey, F&& aFunc) {
+    return WithEntryHandle(
+        aKey,
+        [&aFunc](auto entryHandle)
+            -> mozilla::Result<std::reference_wrapper<DataType>,
+                               typename std::invoke_result_t<F>::err_type> {
+          if (entryHandle) {
+            return std::ref(entryHandle.Data());
+          }
+
+          auto res = std::forward<F>(aFunc)();
+          if (res.isErr()) {
+            return res.propagateErr();
+          }
+          return std::ref(entryHandle.Insert(res.unwrap()));
+        });
+  }
+
+  template <typename U>
+  DataType& InsertOrUpdate(KeyType aKey, U&& aData) {
+    return WithEntryHandle(aKey, [&aData](auto entryHandle) -> DataType& {
+      return entryHandle.InsertOrUpdate(std::forward<U>(aData));
+    });
+  }
+
+  template <typename U>
+  [[nodiscard]] bool InsertOrUpdate(KeyType aKey, U&& aData,
+                                    const fallible_t& aFallible) {
+    return WithEntryHandle(aKey, aFallible, [&aData](auto maybeEntryHandle) {
+      if (!maybeEntryHandle) {
+        return false;
+      }
+      maybeEntryHandle->InsertOrUpdate(std::forward<U>(aData));
+      return true;
+    });
+  }
+
+  bool Remove(KeyType aKey, DataType* aData) {
+    if (auto* ent = this->GetEntry(aKey)) {
+      if (aData) {
+        *aData = std::move(ent->mData);
+      }
+      this->RemoveEntry(ent);
+      return true;
+    }
+    if (aData) {
+      *aData = std::move(DataType());
+    }
+    return false;
+  }
+
+  bool Remove(KeyType aKey) {
+    if (auto* ent = this->GetEntry(aKey)) {
+      this->RemoveEntry(ent);
+      return true;
+    }
+
+    return false;
+  }
+
+  [[nodiscard]] mozilla::Maybe<DataType> Extract(KeyType aKey) {
+    mozilla::Maybe<DataType> value;
+    if (EntryType* ent = this->GetEntry(aKey)) {
+      value.emplace(std::move(ent->mData));
+      this->RemoveEntry(ent);
+    }
+    return value;
+  }
+
+  template <typename HashtableRef>
+  struct LookupResult {
+   private:
+    EntryType* mEntry;
+    HashtableRef mTable;
+#ifdef DEBUG
+    uint32_t mTableGeneration;
+#endif
+
+   public:
+    LookupResult(EntryType* aEntry, HashtableRef aTable)
+        : mEntry(aEntry),
+          mTable(aTable)
+#ifdef DEBUG
+          ,
+          mTableGeneration(aTable.GetGeneration())
+#endif
+    {
+    }
+
+    explicit operator bool() const {
+      MOZ_ASSERT(mTableGeneration == mTable.GetGeneration());
+      return mEntry;
+    }
+
+    void Remove() {
+      if (!*this) {
+        return;
+      }
+      mTable.RemoveEntry(mEntry);
+      mEntry = nullptr;
+    }
+
+    [[nodiscard]] DataType& Data() {
+      MOZ_ASSERT(!!*this, "must have an entry to access its value");
+      return mEntry->mData;
+    }
+
+    [[nodiscard]] const DataType& Data() const {
+      MOZ_ASSERT(!!*this, "must have an entry to access its value");
+      return mEntry->mData;
+    }
+
+    [[nodiscard]] DataType* DataPtrOrNull() {
+      return static_cast<bool>(*this) ? &mEntry->mData : nullptr;
+    }
+
+    [[nodiscard]] const DataType* DataPtrOrNull() const {
+      return static_cast<bool>(*this) ? &mEntry->mData : nullptr;
+    }
+
+    [[nodiscard]] DataType* operator->() { return &Data(); }
+    [[nodiscard]] const DataType* operator->() const { return &Data(); }
+
+    [[nodiscard]] DataType& operator*() { return Data(); }
+    [[nodiscard]] const DataType& operator*() const { return Data(); }
+  };
+
+  template <typename Pred>
+  void RemoveIf(Pred&& aPred) {
+    for (auto iter = Iter(); !iter.Done(); iter.Next()) {
+      if (aPred(const_cast<std::add_const_t<decltype(iter)>&>(iter))) {
+        iter.Remove();
+      }
+    }
+  }
+
+  [[nodiscard]] auto Lookup(KeyType aKey) {
+    return LookupResult<nsBaseHashtable&>(this->GetEntry(aKey), *this);
+  }
+
+  [[nodiscard]] auto Lookup(KeyType aKey) const {
+    return LookupResult<const nsBaseHashtable&>(this->GetEntry(aKey), *this);
+  }
+
+  class EntryHandle : protected nsTHashtable<EntryType>::EntryHandle {
+   public:
+    using Base = typename nsTHashtable<EntryType>::EntryHandle;
+
+    EntryHandle(EntryHandle&& aOther) = default;
+    ~EntryHandle() = default;
+
+    EntryHandle(const EntryHandle&) = delete;
+    EntryHandle& operator=(const EntryHandle&) = delete;
+    EntryHandle& operator=(const EntryHandle&&) = delete;
+
+    using Base::Key;
+
+    using Base::HasEntry;
+
+    using Base::operator bool;
+
+    using Base::Entry;
+
+    template <typename... Args>
+    DataType& Insert(Args&&... aArgs) {
+      Base::InsertInternal(std::forward<Args>(aArgs)...);
+      return Data();
+    }
+
+    template <typename... Args>
+    DataType& OrInsert(Args&&... aArgs) {
+      if (!HasEntry()) {
+        return Insert(std::forward<Args>(aArgs)...);
+      }
+      return Data();
+    }
+
+    template <typename F>
+    DataType& OrInsertWith(F&& aFunc) {
+      if (!HasEntry()) {
+        return Insert(std::forward<F>(aFunc)());
+      }
+      return Data();
+    }
+
+    template <typename U>
+    DataType& Update(U&& aData) {
+      MOZ_RELEASE_ASSERT(HasEntry());
+      Data() = std::forward<U>(aData);
+      return Data();
+    }
+
+    template <typename U>
+    void OrUpdate(U&& aData) {
+      if (HasEntry()) {
+        Update(std::forward<U>(aData));
+      }
+    }
+
+    template <typename F>
+    void OrUpdateWith(F&& aFunc) {
+      if (HasEntry()) {
+        Update(std::forward<F>(aFunc)());
+      }
+    }
+
+    template <typename U>
+    DataType& InsertOrUpdate(U&& aData) {
+      if (!HasEntry()) {
+        Insert(std::forward<U>(aData));
+      } else {
+        Update(std::forward<U>(aData));
+      }
+      return Data();
+    }
+
+    using Base::Remove;
+
+    using Base::OrRemove;
+
+    [[nodiscard]] DataType& Data() { return Entry()->mData; }
+
+    [[nodiscard]] DataType* DataPtrOrNull() {
+      return static_cast<bool>(*this) ? &Data() : nullptr;
+    }
+
+    [[nodiscard]] DataType* operator->() { return &Data(); }
+
+    [[nodiscard]] DataType& operator*() { return Data(); }
+
+   private:
+    friend class nsBaseHashtable;
+
+    explicit EntryHandle(Base&& aBase) : Base(std::move(aBase)) {}
+  };
+
+  template <class F>
+  [[nodiscard]] auto WithEntryHandle(KeyType aKey, F&& aFunc)
+      -> std::invoke_result_t<F, EntryHandle&&> {
+    return Base::WithEntryHandle(
+        aKey, [&aFunc](auto entryHandle) -> decltype(auto) {
+          return std::forward<F>(aFunc)(EntryHandle{std::move(entryHandle)});
+        });
+  }
+
+  template <class F>
+  [[nodiscard]] auto WithEntryHandle(KeyType aKey, const fallible_t& aFallible,
+                                     F&& aFunc)
+      -> std::invoke_result_t<F, mozilla::Maybe<EntryHandle>&&> {
+    return Base::WithEntryHandle(
+        aKey, aFallible, [&aFunc](auto maybeEntryHandle) {
+          return std::forward<F>(aFunc)(
+              maybeEntryHandle
+                  ? mozilla::Some(EntryHandle{maybeEntryHandle.extract()})
+                  : mozilla::Nothing());
+        });
+  }
+
+ public:
+  class ConstIterator {
+   public:
+    explicit ConstIterator(nsBaseHashtable* aTable)
+        : mBaseIterator(&aTable->mTable) {}
+    ~ConstIterator() = default;
+
+    const EntryType* Entry() const {
+      return static_cast<EntryType*>(mBaseIterator.Get());
+    }
+    KeyType Key() const { return Entry()->GetKey(); }
+    UserDataType UserData() const { return Converter::Unwrap(Entry()->mData); }
+    const DataType& Data() const { return Entry()->mData; }
+
+    bool Done() const { return mBaseIterator.Done(); }
+    void Next() { mBaseIterator.Next(); }
+
+    ConstIterator() = delete;
+    ConstIterator(const ConstIterator&) = delete;
+    ConstIterator(ConstIterator&& aOther) = delete;
+    ConstIterator& operator=(const ConstIterator&) = delete;
+    ConstIterator& operator=(ConstIterator&&) = delete;
+
+   protected:
+    PLDHashTable::Iterator mBaseIterator;
+  };
+
+  class Iterator final : public ConstIterator {
+   public:
+    using ConstIterator::ConstIterator;
+
+    using ConstIterator::Data;
+    DataType& Data() {
+      return static_cast<EntryType*>(this->mBaseIterator.Get())->mData;
+    }
+
+    void Remove() { this->mBaseIterator.Remove(); }
+  };
+
+  Iterator Iter() { return Iterator(this); }
+
+  ConstIterator ConstIter() const {
+    return ConstIterator(const_cast<nsBaseHashtable*>(this));
+  }
+
+  using nsTHashtable<EntryType>::Remove;
+
+  void Remove(ConstIterator& aIter) { aIter.mBaseIterator.Remove(); }
+
+  using typename nsTHashtable<EntryType>::iterator;
+  using typename nsTHashtable<EntryType>::const_iterator;
+
+  using nsTHashtable<EntryType>::begin;
+  using nsTHashtable<EntryType>::end;
+  using nsTHashtable<EntryType>::cbegin;
+  using nsTHashtable<EntryType>::cend;
+
+  using nsTHashtable<EntryType>::Keys;
+
+  auto Values() const {
+    return mozilla::detail::nsBaseHashtableValueRange<EntryType>{this->mTable};
+  }
+
+  void Remove(mozilla::detail::nsBaseHashtableValueIterator<EntryType>& aIter) {
+    aIter.mIterator.Remove();
+  }
+
+  void Clear() { nsTHashtable<EntryType>::Clear(); }
+
+  void ClearAndRetainStorage() {
+    nsTHashtable<EntryType>::ClearAndRetainStorage();
+  }
+
+  size_t ShallowSizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return this->mTable.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  size_t ShallowSizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + ShallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  void SwapElements(nsBaseHashtable& aOther) {
+    nsTHashtable<EntryType>::SwapElements(aOther);
+  }
+
+  using nsTHashtable<EntryType>::MarkImmutable;
+
+  nsBaseHashtable Clone() const { return CloneAs<nsBaseHashtable>(); }
+
+ protected:
+  template <typename T>
+  T CloneAs() const {
+    static_assert(std::is_base_of_v<nsBaseHashtable, T>);
+    T result(Count());
+    for (const auto& srcEntry : *this) {
+      result.WithEntryHandle(srcEntry.GetKey(), [&](auto&& dstEntry) {
+        dstEntry.Insert(srcEntry.GetData());
+      });
+    }
+    return result;
+  }
+};
+
+
+template <class KeyClass, class DataType>
+template <typename... Args>
+nsBaseHashtableET<KeyClass, DataType>::nsBaseHashtableET(KeyTypePointer aKey,
+                                                         Args&&... aArgs)
+    : KeyClass(aKey), mData(std::forward<Args>(aArgs)...) {}
+
+template <class KeyClass, class DataType, class UserDataType, class Converter>
+inline void ImplCycleCollectionUnlink(
+    nsBaseHashtable<KeyClass, DataType, UserDataType, Converter>& aField) {
+  aField.Clear();
+}
+
+template <class KeyClass, class DataType, class UserDataType, class Converter>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    const nsBaseHashtable<KeyClass, DataType, UserDataType, Converter>& aField,
+    const char* aName, uint32_t aFlags = 0) {
+  ImplCycleCollectionTraverse(
+      aCallback,
+      static_cast<const nsTHashtable<nsBaseHashtableET<KeyClass, DataType>>&>(
+          aField),
+      aName, aFlags);
+}
+
+template <typename KeyClass, typename DataType>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    const nsBaseHashtableET<KeyClass, DataType>& aField, const char* aName,
+    uint32_t aFlags = 0) {
+  ImplCycleCollectionTraverse(aCallback, static_cast<const KeyClass&>(aField),
+                              aName, aFlags);
+  ImplCycleCollectionTraverse(aCallback, aField.GetData(), aName, aFlags);
+}
+
+template <class KeyClass, class DataType, class UserDataType, class Converter>
+inline void ImplCycleCollectionTrace(
+    const TraceCallbacks& aCallbacks,
+    nsBaseHashtable<KeyClass, DataType, UserDataType, Converter>& aField,
+    const char* aName, void* aClosure) {
+  ImplCycleCollectionTrace(
+      aCallbacks,
+      static_cast<nsTHashtable<nsBaseHashtableET<KeyClass, DataType>>&>(aField),
+      aName, aClosure);
+}
+
+namespace mozilla::detail {
+template <typename T, typename = void>
+constexpr bool kCanTrace = false;
+
+template <typename T>
+constexpr bool
+    kCanTrace<T, std::void_t<decltype(ImplCycleCollectionTrace(
+                     std::declval<TraceCallbacks>(), std::declval<T&>(),
+                     std::declval<const char*>(), std::declval<void*>()))>> =
+        true;
+}  
+
+template <typename KeyClass, typename DataType>
+inline void ImplCycleCollectionTrace(
+    const TraceCallbacks& aCallbacks,
+    nsBaseHashtableET<KeyClass, DataType>& aField, const char* aName,
+    void* aClosure) {
+  static_assert(!mozilla::detail::kCanTrace<KeyClass&>,
+                "Don't use traceable values as KeyClass");
+  static_assert(mozilla::detail::kCanTrace<DataType&>,
+                "Can't trace values of type DataType");
+
+  ImplCycleCollectionTrace(aCallbacks, *aField.GetModifiableData(), aName,
+                           aClosure);
+}
+
+#endif  // nsBaseHashtable_h_

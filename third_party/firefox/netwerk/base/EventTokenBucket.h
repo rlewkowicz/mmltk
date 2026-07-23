@@ -1,0 +1,87 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(NetEventTokenBucket_h_)
+#define NetEventTokenBucket_h_
+
+#include "ARefBase.h"
+#include "nsCOMPtr.h"
+#include "nsDeque.h"
+#include "nsINamed.h"
+#include "nsITimer.h"
+
+#include "mozilla/TimeStamp.h"
+
+class nsICancelable;
+
+namespace mozilla {
+namespace net {
+
+
+class EventTokenBucket;
+
+class ATokenBucketEvent {
+ public:
+  virtual void OnTokenBucketAdmitted() = 0;
+};
+
+class TokenBucketCancelable;
+
+class EventTokenBucket : public nsITimerCallback,
+                         public nsINamed,
+                         public ARefBase {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSITIMERCALLBACK
+  NS_DECL_NSINAMED
+
+  EventTokenBucket(uint32_t eventsPerSecond, uint32_t burstSize);
+
+  void ClearCredits();
+  uint32_t BurstEventsAvailable();
+  uint32_t QueuedEvents();
+
+  void Pause();
+  void UnPause();
+  void Stop();
+
+  nsresult SubmitEvent(ATokenBucketEvent* event, nsICancelable** cancelable);
+
+ private:
+  virtual ~EventTokenBucket();
+  void CleanupTimers();
+
+  friend class RunNotifyEvent;
+  friend class SetTimerEvent;
+
+  bool TryImmediateDispatch(TokenBucketCancelable* cancelable);
+  void SetRate(uint32_t eventsPerSecond, uint32_t burstSize);
+
+  void DispatchEvents();
+  void UpdateTimer();
+  void UpdateCredits();
+
+  const static uint64_t kUsecPerSec = 1000000;
+  const static uint64_t kUsecPerMsec = 1000;
+  const static uint64_t kMaxHz = 10000;
+
+  uint64_t
+      mUnitCost;  
+  uint64_t mMaxCredit;  
+  uint64_t mCredit;     
+
+  bool mPaused;
+  bool mStopped;
+  nsRefPtrDeque<TokenBucketCancelable> mEvents;
+  bool mTimerArmed;
+  TimeStamp mLastUpdate;
+
+  nsCOMPtr<nsITimer> mTimer;
+
+};
+
+}  
+}  
+
+#endif

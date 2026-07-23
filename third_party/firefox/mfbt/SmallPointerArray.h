@@ -1,0 +1,222 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_SmallPointerArray_h
+#define mozilla_SmallPointerArray_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/PodOperations.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <new>
+#include <vector>
+
+namespace mozilla {
+
+template <typename T>
+class SmallPointerArray {
+  static_assert(!std::is_same_v<T, bool>,
+                "SmallPointerArray<bool> is not supported");
+
+ public:
+  SmallPointerArray() {
+    mArray[0].mValue = nullptr;
+    mArray[1].mVector = nullptr;
+  }
+
+  ~SmallPointerArray() {
+    if (!first()) {
+      delete maybeVector();
+    }
+  }
+
+  SmallPointerArray(SmallPointerArray&& aOther) {
+    PodCopy(mArray, aOther.mArray, 2);
+    aOther.mArray[0].mValue = nullptr;
+    aOther.mArray[1].mVector = nullptr;
+  }
+
+  SmallPointerArray& operator=(SmallPointerArray&& aOther) {
+    std::swap(mArray, aOther.mArray);
+    return *this;
+  }
+
+  void Clear() {
+    if (first()) {
+      first() = nullptr;
+      new (&mArray[1].mVector) std::vector<T*>*(nullptr);
+      return;
+    }
+
+    delete maybeVector();
+    mArray[1].mVector = nullptr;
+  }
+
+  void AppendElement(T* aElement) {
+
+    MOZ_ASSERT(aElement != nullptr);
+    if (aElement == nullptr) {
+      return;
+    }
+
+    if (!first()) {
+      auto* vec = maybeVector();
+      if (!vec) {
+        first() = aElement;
+        new (&mArray[1].mValue) T*(nullptr);
+        return;
+      }
+
+      vec->push_back(aElement);
+      return;
+    }
+
+    if (!second()) {
+      second() = aElement;
+      return;
+    }
+
+    auto* vec = new std::vector<T*>({first(), second(), aElement});
+    first() = nullptr;
+    new (&mArray[1].mVector) std::vector<T*>*(vec);
+  }
+
+  bool RemoveElement(T* aElement) {
+    MOZ_ASSERT(aElement != nullptr);
+    if (aElement == nullptr) {
+      return false;
+    }
+
+    if (first() == aElement) {
+      T* maybeSecond = second();
+      first() = maybeSecond;
+      if (maybeSecond) {
+        second() = nullptr;
+      } else {
+        new (&mArray[1].mVector) std::vector<T*>*(nullptr);
+      }
+
+      return true;
+    }
+
+    if (first()) {
+      if (second() == aElement) {
+        second() = nullptr;
+        return true;
+      }
+      return false;
+    }
+
+    if (auto* vec = maybeVector()) {
+      for (auto iter = vec->begin(); iter != vec->end(); iter++) {
+        if (*iter == aElement) {
+          vec->erase(iter);
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  bool Contains(T* aElement) const {
+    MOZ_ASSERT(aElement != nullptr);
+    if (aElement == nullptr) {
+      return false;
+    }
+
+    if (T* v = first()) {
+      return v == aElement || second() == aElement;
+    }
+
+    if (auto* vec = maybeVector()) {
+      return std::find(vec->begin(), vec->end(), aElement) != vec->end();
+    }
+
+    return false;
+  }
+
+  size_t Length() const {
+    if (first()) {
+      return second() ? 2 : 1;
+    }
+
+    if (auto* vec = maybeVector()) {
+      return vec->size();
+    }
+
+    return 0;
+  }
+
+  bool IsEmpty() const { return Length() == 0; }
+
+  T* ElementAt(size_t aIndex) const {
+    MOZ_ASSERT(aIndex < Length());
+    if (first()) {
+      return mArray[aIndex].mValue;
+    }
+
+    auto* vec = maybeVector();
+    MOZ_ASSERT(vec, "must have backing vector if accessing an element");
+    return (*vec)[aIndex];
+  }
+
+  T* operator[](size_t aIndex) const { return ElementAt(aIndex); }
+
+  using iterator = T**;
+  using const_iterator = const T**;
+
+  iterator begin() { return beginInternal(); }
+  const_iterator begin() const { return beginInternal(); }
+  const_iterator cbegin() const { return begin(); }
+  iterator end() { return beginInternal() + Length(); }
+  const_iterator end() const { return beginInternal() + Length(); }
+  const_iterator cend() const { return end(); }
+
+ private:
+  T** beginInternal() const {
+    if (first()) {
+      static_assert(sizeof(T*) == sizeof(Element),
+                    "pointer ops on &first() must produce adjacent "
+                    "Element::mValue arms");
+      return &first();
+    }
+
+    auto* vec = maybeVector();
+    if (!vec) {
+      return &first();
+    }
+
+    if (vec->empty()) {
+      return nullptr;
+    }
+
+    return &(*vec)[0];
+  }
+
+
+  T*& first() const { return const_cast<T*&>(mArray[0].mValue); }
+
+  T*& second() const {
+    MOZ_ASSERT(first(), "first() must be non-null to have a T* second pointer");
+    return const_cast<T*&>(mArray[1].mValue);
+  }
+
+  std::vector<T*>* maybeVector() const {
+    MOZ_ASSERT(!first(),
+               "function must only be called when this is either empty or has "
+               "std::vector-backed elements");
+    return mArray[1].mVector;
+  }
+
+  union Element {
+    T* mValue;
+    std::vector<T*>* mVector;
+  } mArray[2];
+};
+
+}  
+
+#endif  // mozilla_SmallPointerArray_h

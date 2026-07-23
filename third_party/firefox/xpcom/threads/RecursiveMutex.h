@@ -1,0 +1,101 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#if !defined(mozilla_RecursiveMutex_h)
+#define mozilla_RecursiveMutex_h
+
+#include "mozilla/ThreadSafety.h"
+#include "mozilla/BlockingResourceBase.h"
+
+#  include <pthread.h>
+
+namespace mozilla {
+
+class MOZ_CAPABILITY("recursive mutex") RecursiveMutex
+    : public BlockingResourceBase {
+ public:
+  explicit RecursiveMutex(const char* aName);
+  ~RecursiveMutex();
+
+#if defined(DEBUG)
+  void Lock() MOZ_CAPABILITY_ACQUIRE();
+  void Unlock() MOZ_CAPABILITY_RELEASE();
+#else
+  void Lock() MOZ_CAPABILITY_ACQUIRE() { LockInternal(); }
+  void Unlock() MOZ_CAPABILITY_RELEASE() { UnlockInternal(); }
+#endif
+
+#if defined(DEBUG)
+  void AssertCurrentThreadIn() const MOZ_ASSERT_CAPABILITY(this);
+  void AssertNotCurrentThreadIn() const MOZ_EXCLUDES(this) {
+  }
+#else
+  void AssertCurrentThreadIn() const MOZ_ASSERT_CAPABILITY(this) {}
+  void AssertNotCurrentThreadIn() const MOZ_EXCLUDES(this) {}
+#endif
+
+ private:
+  RecursiveMutex() = delete;
+  RecursiveMutex(const RecursiveMutex&) = delete;
+  RecursiveMutex& operator=(const RecursiveMutex&) = delete;
+
+  void LockInternal();
+  void UnlockInternal();
+
+#if defined(DEBUG)
+  PRThread* mOwningThread;
+  size_t mEntryCount;
+#endif
+
+  pthread_mutex_t mMutex;
+};
+
+class MOZ_RAII MOZ_SCOPED_CAPABILITY RecursiveMutexAutoLock {
+ public:
+  explicit RecursiveMutexAutoLock(RecursiveMutex& aRecursiveMutex)
+      MOZ_CAPABILITY_ACQUIRE(aRecursiveMutex)
+      : mRecursiveMutex(&aRecursiveMutex) {
+    NS_ASSERTION(mRecursiveMutex, "null mutex");
+    mRecursiveMutex->Lock();
+  }
+
+  ~RecursiveMutexAutoLock(void) MOZ_CAPABILITY_RELEASE() {
+    mRecursiveMutex->Unlock();
+  }
+
+ private:
+  RecursiveMutexAutoLock() = delete;
+  RecursiveMutexAutoLock(const RecursiveMutexAutoLock&) = delete;
+  RecursiveMutexAutoLock& operator=(const RecursiveMutexAutoLock&) = delete;
+  static void* operator new(size_t) noexcept(true);
+
+  mozilla::RecursiveMutex* mRecursiveMutex;
+};
+
+class MOZ_RAII MOZ_SCOPED_CAPABILITY RecursiveMutexAutoUnlock {
+ public:
+  explicit RecursiveMutexAutoUnlock(RecursiveMutex& aRecursiveMutex)
+      MOZ_SCOPED_UNLOCK_RELEASE(aRecursiveMutex)
+      : mRecursiveMutex(&aRecursiveMutex) {
+    NS_ASSERTION(mRecursiveMutex, "null mutex");
+    mRecursiveMutex->Unlock();
+  }
+
+  ~RecursiveMutexAutoUnlock(void) MOZ_SCOPED_UNLOCK_REACQUIRE() {
+    mRecursiveMutex->Lock();
+  }
+
+ private:
+  RecursiveMutexAutoUnlock() = delete;
+  RecursiveMutexAutoUnlock(const RecursiveMutexAutoUnlock&) = delete;
+  RecursiveMutexAutoUnlock& operator=(const RecursiveMutexAutoUnlock&) = delete;
+  static void* operator new(size_t) noexcept(true);
+
+  mozilla::RecursiveMutex* mRecursiveMutex;
+};
+
+}  
+
+#endif

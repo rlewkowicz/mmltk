@@ -1,0 +1,225 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_OffThreadPromiseRuntimeState_h
+#define vm_OffThreadPromiseRuntimeState_h
+
+#include <stddef.h>  // size_t
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "ds/Fifo.h"           // js::Fifo
+#include "ds/PriorityQueue.h"  // js::PriorityQueue
+#include "js/AllocPolicy.h"    // js::SystemAllocPolicy
+#include "js/HashTable.h"      // js::DefaultHasher, js::HashSet
+#include "js/Promise.h"  // JS::Dispatchable, JS::Dispatchable::MaybeShuttingDown,
+#include "js/RootingAPI.h"                // JS::Handle, JS::PersistentRooted
+#include "threading/ConditionVariable.h"  // js::ConditionVariable
+#include "vm/PromiseObject.h"             // js::PromiseObject
+
+struct JS_PUBLIC_API JSContext;
+struct JS_PUBLIC_API JSRuntime;
+
+namespace js {
+
+class AutoLockHelperThreadState;
+class OffThreadPromiseRuntimeState;
+
+
+class OffThreadPromiseTask : public JS::Dispatchable {
+  friend class OffThreadPromiseRuntimeState;
+
+  JSRuntime* runtime_;
+  JS::PersistentRooted<PromiseObject*> promise_;
+
+  bool cancellable_;
+
+  void unregister(OffThreadPromiseRuntimeState& state);
+  void unregister(OffThreadPromiseRuntimeState& state,
+                  const AutoLockHelperThreadState& lock);
+
+ protected:
+  OffThreadPromiseTask(JSContext* cx, JS::Handle<PromiseObject*> promise);
+
+  virtual bool resolve(JSContext* cx, JS::Handle<PromiseObject*> promise) {
+    MOZ_CRASH("Tasks should override resolve");
+  };
+
+  void run(JSContext* cx, MaybeShuttingDown maybeShuttingDown) final;
+
+  void transferToRuntime() final;
+
+  virtual void prepareForCancel() {
+    MOZ_CRASH("Undispatched tasks should override prepareForCancel");
+  }
+
+ public:
+  ~OffThreadPromiseTask() override;
+
+  void operator=(const OffThreadPromiseTask&) = delete;
+  OffThreadPromiseTask(const OffThreadPromiseTask&) = delete;
+
+  static void DestroyUndispatchedTask(OffThreadPromiseTask* task,
+                                      OffThreadPromiseRuntimeState& state,
+                                      const AutoLockHelperThreadState& lock);
+
+  JSRuntime* runtime() { return runtime_; }
+
+  bool init(JSContext* cx);
+  bool init(JSContext* cx, const AutoLockHelperThreadState& lock);
+
+  static bool InitCancellable(JSContext* cx,
+                              js::UniquePtr<OffThreadPromiseTask>&& task);
+  static bool InitCancellable(JSContext* cx,
+                              const AutoLockHelperThreadState& lock,
+                              js::UniquePtr<OffThreadPromiseTask>&& task);
+
+  void removeFromCancellableListAndDispatch();
+  void removeFromCancellableListAndDispatch(
+      const AutoLockHelperThreadState& lock);
+
+  void dispatchResolveAndDestroy();
+  void dispatchResolveAndDestroy(const AutoLockHelperThreadState& lock);
+
+  static void DispatchResolveAndDestroy(
+      js::UniquePtr<OffThreadPromiseTask>&& task);
+  static void DispatchResolveAndDestroy(
+      js::UniquePtr<OffThreadPromiseTask>&& task,
+      const AutoLockHelperThreadState& lock);
+
+  static PromiseObject* ExtractAndForget(OffThreadPromiseTask* task,
+                                         const AutoLockHelperThreadState& lock);
+};
+
+using OffThreadPromiseTaskSet =
+    HashSet<OffThreadPromiseTask*, DefaultHasher<OffThreadPromiseTask*>,
+            SystemAllocPolicy>;
+
+using DispatchableFifo =
+    Fifo<js::UniquePtr<JS::Dispatchable>, 0, SystemAllocPolicy>;
+
+class DelayedDispatchable {
+  js::UniquePtr<JS::Dispatchable> dispatchable_;
+  mozilla::TimeStamp endTime_;
+
+ public:
+  DelayedDispatchable(DelayedDispatchable&& other)
+      : dispatchable_(other.dispatchable()), endTime_(other.endTime()) {}
+
+  DelayedDispatchable(js::UniquePtr<JS::Dispatchable>&& dispatchable,
+                      mozilla::TimeStamp endTime)
+      : dispatchable_(std::move(dispatchable)), endTime_(endTime) {}
+
+  void operator=(DelayedDispatchable&& other) {
+    dispatchable_ = other.dispatchable();
+    endTime_ = other.endTime();
+  }
+  js::UniquePtr<JS::Dispatchable> dispatchable() {
+    return std::move(dispatchable_);
+  }
+  mozilla::TimeStamp endTime() const { return endTime_; }
+
+  static bool higherPriority(const DelayedDispatchable& a,
+                             const DelayedDispatchable& b) {
+    return a.endTime_ < b.endTime_;
+  }
+};
+
+using DelayedDispatchablePriorityQueue =
+    PriorityQueue<DelayedDispatchable, DelayedDispatchable, 0,
+                  SystemAllocPolicy>;
+
+class OffThreadPromiseRuntimeState {
+  friend class OffThreadPromiseTask;
+
+  JS::DispatchToEventLoopCallback dispatchToEventLoopCallback_;
+  JS::DelayedDispatchToEventLoopCallback delayedDispatchToEventLoopCallback_;
+  JS::AsyncTaskStartedCallback asyncTaskStartedCallback_;
+  JS::AsyncTaskFinishedCallback asyncTaskFinishedCallback_;
+  void* dispatchToEventLoopClosure_;
+
+#ifdef DEBUG
+  HelperThreadLockData<bool> forceQuitting_;
+#endif
+
+  HelperThreadLockData<size_t> numRegistered_;
+
+  HelperThreadLockData<size_t> numDelayed_;
+
+  HelperThreadLockData<OffThreadPromiseTaskSet> cancellable_;
+
+  HelperThreadLockData<DispatchableFifo> failed_;
+
+  HelperThreadLockData<ConditionVariable> allFailed_;
+
+  HelperThreadLockData<DispatchableFifo> internalDispatchQueue_;
+  HelperThreadLockData<ConditionVariable> internalDispatchQueueAppended_;
+  HelperThreadLockData<bool> internalDispatchQueueClosed_;
+  HelperThreadLockData<DelayedDispatchablePriorityQueue>
+      internalDelayedDispatchPriorityQueue_;
+
+  ConditionVariable& allFailed() { return allFailed_.ref(); }
+
+  DispatchableFifo& failed() { return failed_.ref(); }
+  OffThreadPromiseTaskSet& cancellable() { return cancellable_.ref(); }
+
+  DispatchableFifo& internalDispatchQueue() {
+    return internalDispatchQueue_.ref();
+  }
+  ConditionVariable& internalDispatchQueueAppended() {
+    return internalDispatchQueueAppended_.ref();
+  }
+  DelayedDispatchablePriorityQueue& internalDelayedDispatchPriorityQueue() {
+    return internalDelayedDispatchPriorityQueue_.ref();
+  }
+
+  void dispatchDelayedTasks();
+
+  static bool internalDispatchToEventLoop(void*,
+                                          js::UniquePtr<JS::Dispatchable>&&);
+  static bool internalDelayedDispatchToEventLoop(
+      void*, js::UniquePtr<JS::Dispatchable>&&, uint32_t);
+  bool usingInternalDispatchQueue() const;
+
+  void registerTask(JSContext* cx, OffThreadPromiseTask* task);
+  void unregisterTask(OffThreadPromiseTask* task);
+
+ public:
+  OffThreadPromiseRuntimeState();
+  ~OffThreadPromiseRuntimeState();
+
+  void operator=(const OffThreadPromiseRuntimeState&) = delete;
+  OffThreadPromiseRuntimeState(const OffThreadPromiseRuntimeState&) = delete;
+
+  void init(JS::DispatchToEventLoopCallback dispatchCallback,
+            JS::DelayedDispatchToEventLoopCallback delayedDispatchCallback,
+            JS::AsyncTaskStartedCallback asyncTaskStartedCallback,
+            JS::AsyncTaskFinishedCallback asyncTaskFinishedCallback,
+            void* closure);
+  void initInternalDispatchQueue();
+  bool initialized() const;
+
+  void internalDrain(JSContext* cx);
+  bool internalHasPending();
+  bool internalHasPending(AutoLockHelperThreadState& lock);
+
+  void stealFailedTask(JS::Dispatchable* dispatchable);
+
+  bool dispatchToEventLoop(js::UniquePtr<JS::Dispatchable>&& dispatchable);
+  bool delayedDispatchToEventLoop(
+      js::UniquePtr<JS::Dispatchable>&& dispatchable, uint32_t delay);
+
+  void cancelTasks(JSContext* cx);
+  void cancelTasks(AutoLockHelperThreadState& lock, JSContext* cx);
+
+  void shutdown(JSContext* cx);
+
+#ifdef DEBUG
+  void setForceQuitting() { forceQuitting_ = true; }
+#endif
+};
+
+}  
+
+#endif  // vm_OffThreadPromiseRuntimeState_h

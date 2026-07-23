@@ -1,0 +1,1740 @@
+/*
+ * Copyright 2019 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/core/SkImageFilterTypes.h"
+
+#include "include/core/SkAlphaType.h"
+#include "include/core/SkBlendMode.h"
+#include "include/core/SkBlender.h"
+#include "include/core/SkCanvas.h"
+#include "include/core/SkClipOp.h"
+#include "include/core/SkColor.h"
+#include "include/core/SkImage.h"
+#include "include/core/SkImageInfo.h"
+#include "include/core/SkM44.h"
+#include "include/core/SkPaint.h"
+#include "include/core/SkPicture.h"  // IWYU pragma: keep
+#include "include/core/SkShader.h"
+#include "include/effects/SkRuntimeEffect.h"
+#include "include/private/base/SkDebug.h"
+#include "include/private/base/SkFloatingPoint.h"
+#include "src/base/SkMathPriv.h"
+#include "src/base/SkVx.h"
+#include "src/core/SkBitmapDevice.h"
+#include "src/core/SkBlenderBase.h"
+#include "src/core/SkBlurEngine.h"
+#include "src/core/SkCanvasPriv.h"
+#include "src/core/SkColorSpacePriv.h"
+#include "src/core/SkDevice.h"
+#include "src/core/SkImageFilterCache.h"
+#include "src/core/SkImageFilter_Base.h"
+#include "src/core/SkKnownRuntimeEffects.h"
+#include "src/core/SkMatrixPriv.h"
+#include "src/core/SkRectPriv.h"
+#include "src/core/SkTraceEvent.h"
+#include "src/effects/colorfilters/SkColorFilterBase.h"
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+
+namespace skif {
+
+namespace {
+
+static constexpr float kRoundEpsilon = 1e-3f;
+
+std::pair<bool, bool> are_axes_nearly_integer_aligned(const LayerSpace<SkMatrix>& m,
+                                                      LayerSpace<SkIPoint>* out=nullptr) {
+    float invW  = sk_ieee_float_divide(1.f, m.rc(2,2));
+    float tx = SkScalarRoundToScalar(m.rc(0,2)*invW);
+    float ty = SkScalarRoundToScalar(m.rc(1,2)*invW);
+    bool affine = SkScalarNearlyEqual(m.rc(2,0)*invW, 0.f, kRoundEpsilon) &&
+                  SkScalarNearlyEqual(m.rc(2,1)*invW, 0.f, kRoundEpsilon);
+    if (!affine) {
+        return {false, false};
+    }
+
+    bool xAxis = SkScalarNearlyEqual(1.f, m.rc(0,0)*invW, kRoundEpsilon) &&
+                 SkScalarNearlyEqual(0.f, m.rc(0,1)*invW, kRoundEpsilon) &&
+                 SkScalarNearlyEqual(tx,  m.rc(0,2)*invW, kRoundEpsilon);
+    bool yAxis = SkScalarNearlyEqual(0.f, m.rc(1,0)*invW, kRoundEpsilon) &&
+                 SkScalarNearlyEqual(1.f, m.rc(1,1)*invW, kRoundEpsilon) &&
+                 SkScalarNearlyEqual(ty,  m.rc(1,2)*invW, kRoundEpsilon);
+    if (out && xAxis && yAxis) {
+        *out = LayerSpace<SkIPoint>({(int) tx, (int) ty});
+    }
+    return {xAxis, yAxis};
+}
+
+bool is_nearly_integer_translation(const LayerSpace<SkMatrix>& m,
+                                   LayerSpace<SkIPoint>* out=nullptr) {
+    auto [axisX, axisY] = are_axes_nearly_integer_aligned(m, out);
+    return axisX && axisY;
+}
+
+void decompose_transform(const SkMatrix& transform, SkPoint representativePoint,
+                         SkMatrix* postScaling, SkMatrix* scaling) {
+    SkSize scale;
+    if (transform.decomposeScale(&scale, postScaling)) {
+        *scaling = SkMatrix::Scale(scale.fWidth, scale.fHeight);
+    } else {
+        float approxScale = SkMatrixPriv::DifferentialAreaScale(transform, representativePoint);
+        if (SkIsFinite(approxScale) && !SkScalarNearlyZero(approxScale)) {
+            approxScale = SkScalarSqrt(approxScale);
+        } else {
+            approxScale = 1.f;
+        }
+        if (postScaling) {
+            *postScaling = transform;
+            float invScale = SkScalarInvert(approxScale);
+            postScaling->preScale(invScale, invScale);
+        }
+        *scaling = SkMatrix::Scale(approxScale, approxScale);
+    }
+}
+
+std::optional<LayerSpace<SkMatrix>> periodic_axis_transform(
+        SkTileMode tileMode,
+        const LayerSpace<SkIRect>& crop,
+        const LayerSpace<SkIRect>& output) {
+    if (tileMode == SkTileMode::kClamp || tileMode == SkTileMode::kDecal) {
+        return {};
+    }
+
+    double cropL = (double) crop.left();
+    double cropT = (double) crop.top();
+    double cropWidth = crop.right() - cropL;
+    double cropHeight = crop.bottom() - cropT;
+
+    double periodL = std::floor((output.left() - cropL) / cropWidth);
+    double periodT = std::floor((output.top() - cropT) / cropHeight);
+    double periodR = std::ceil((output.right() - cropL) / cropWidth);
+    double periodB = std::ceil((output.bottom() - cropT) / cropHeight);
+
+    if (periodR - periodL <= 1.0 && periodB - periodT <= 1.0) {
+        float sx = 1.f;
+        float sy = 1.f;
+        double tx = -cropL;
+        double ty = -cropT;
+
+        if (tileMode == SkTileMode::kMirror) {
+            if (std::fmod(periodL, 2.f) > SK_ScalarNearlyZero) {
+                sx = -1.f;
+                tx = cropWidth - tx;
+            }
+            if (std::fmod(periodT, 2.f) > SK_ScalarNearlyZero) {
+                sy = -1.f;
+                ty = cropHeight - ty;
+            }
+        }
+        tx += periodL * cropWidth + cropL;
+        ty += periodT * cropHeight + cropT;
+
+        if (sk_double_saturate2int(tx) != (float) tx ||
+            sk_double_saturate2int(ty) != (float) ty) {
+            return {};
+        }
+
+        SkMatrix periodicTransform;
+        periodicTransform.setScaleTranslate(sx, sy, (float) tx, (float) ty);
+        return LayerSpace<SkMatrix>(periodicTransform);
+    } else {
+        return {};
+    }
+}
+
+class RasterBackend : public Backend {
+public:
+
+    RasterBackend(const SkSurfaceProps& surfaceProps, SkColorType colorType)
+            : Backend(SkImageFilterCache::Get(), surfaceProps, colorType) {}
+
+    sk_sp<SkDevice> makeDevice(SkISize size,
+                               sk_sp<SkColorSpace> colorSpace,
+                               const SkSurfaceProps* props) const override {
+        SkImageInfo imageInfo = SkImageInfo::Make(size,
+                                                  this->colorType(),
+                                                  kPremul_SkAlphaType,
+                                                  std::move(colorSpace));
+        return SkBitmapDevice::Create(imageInfo, props ? *props : this->surfaceProps());
+    }
+
+    sk_sp<SkSpecialImage> makeImage(const SkIRect& subset, sk_sp<SkImage> image) const override {
+        return SkSpecialImages::MakeFromRaster(subset, image, this->surfaceProps());
+    }
+
+    sk_sp<SkImage> getCachedBitmap(const SkBitmap& data) const override {
+        return SkImages::RasterFromBitmap(data);
+    }
+
+    const SkBlurEngine* getBlurEngine() const override {
+        return SkBlurEngine::GetRasterBlurEngine();
+    }
+};
+
+} 
+
+
+Backend::Backend(sk_sp<SkImageFilterCache> cache,
+                 const SkSurfaceProps& surfaceProps,
+                 const SkColorType colorType)
+        : fCache(std::move(cache))
+        , fSurfaceProps(surfaceProps)
+        , fColorType(colorType) {}
+
+Backend::~Backend() = default;
+
+sk_sp<Backend> MakeRasterBackend(const SkSurfaceProps& surfaceProps, SkColorType colorType) {
+    return sk_make_sp<RasterBackend>(surfaceProps, colorType);
+}
+
+void Stats::dumpStats() const {
+    SkDebugf("ImageFilter Stats:\n"
+             "      # visited filters: %d\n"
+             "           # cache hits: %d\n"
+             "   # offscreen surfaces: %d\n"
+             " # shader-clamped draws: %d\n"
+             "   # shader-tiled draws: %d\n",
+             fNumVisitedImageFilters,
+             fNumCacheHits,
+             fNumOffscreenSurfaces,
+             fNumShaderClampedDraws,
+             fNumShaderBasedTilingDraws);
+}
+
+void Stats::reportStats() const {
+    TRACE_EVENT_INSTANT2("skia", "ImageFilter Graph Size", TRACE_EVENT_SCOPE_THREAD,
+                         "count", fNumVisitedImageFilters, "cache hits", fNumCacheHits);
+    TRACE_EVENT_INSTANT1("skia", "ImageFilter Surfaces", TRACE_EVENT_SCOPE_THREAD,
+                         "count", fNumOffscreenSurfaces);
+    TRACE_EVENT_INSTANT2("skia", "ImageFilter Shader Tiling", TRACE_EVENT_SCOPE_THREAD,
+                         "clamp", fNumShaderClampedDraws, "other", fNumShaderBasedTilingDraws);
+}
+
+
+SkIRect RoundOut(SkRect r) { return r.makeInset(kRoundEpsilon, kRoundEpsilon).roundOut(); }
+
+SkIRect RoundIn(SkRect r) { return r.makeOutset(kRoundEpsilon, kRoundEpsilon).roundIn(); }
+
+bool Mapping::decomposeCTM(const SkM44& ctm, MatrixCapability capability,
+                           const skif::ParameterSpace<SkPoint>& representativePt) {
+    SkM44 remainder{SkM44::kUninitialized_Constructor};
+    SkM44 layer{SkM44::kUninitialized_Constructor};
+    if (capability == MatrixCapability::kTranslate) {
+        remainder = ctm;
+        layer = SkM44();
+    } else if (SkMatrixPriv::IsScaleTranslateAsM33(ctm) ||
+               capability == MatrixCapability::kComplex) {
+        remainder = SkM44();
+        layer = ctm;
+    } else {
+        SkMatrix layer33;
+        decompose_transform(ctm.asM33(), SkPoint(representativePt),
+                            nullptr, &layer33);
+        layer = SkM44(layer33);
+        remainder = ctm;
+        remainder.preScale(1.f / layer.rc(0,0), 1.f / layer.rc(1,1));
+    }
+
+    SkM44 invRemainder;
+    if (!remainder.invert(&invRemainder)) {
+        return false;
+    } else {
+        fParamToLayerMatrix = layer;
+        fLayerToDevMatrix = remainder;
+        fDevToLayerMatrix = invRemainder;
+        return true;
+    }
+}
+
+bool Mapping::decomposeCTM(const SkM44& ctm,
+                           const SkImageFilter* filter,
+                           const skif::ParameterSpace<SkPoint>& representativePt) {
+    return this->decomposeCTM(
+            ctm,
+            filter ? as_IFB(filter)->getCTMCapability() : MatrixCapability::kComplex,
+            representativePt);
+}
+
+bool Mapping::adjustLayerSpace(const SkM44& layer) {
+    SkM44 invLayer;
+    if (!layer.invert(&invLayer)) {
+        return false;
+    }
+    fParamToLayerMatrix.postConcat(layer);
+    fDevToLayerMatrix.postConcat(layer);
+    fLayerToDevMatrix.preConcat(invLayer);
+    return true;
+}
+
+template<>
+SkRect Mapping::map<SkRect>(const SkRect& geom, const SkMatrix& matrix) {
+    return geom.isEmpty() ? SkRect::MakeEmpty() : matrix.mapRect(geom);
+}
+
+template<>
+SkIRect Mapping::map<SkIRect>(const SkIRect& geom, const SkMatrix& matrix) {
+    if (geom.isEmpty()) {
+        return SkIRect::MakeEmpty();
+    }
+    if (matrix.isScaleTranslate()) {
+        double l = (double)matrix.getScaleX()*geom.fLeft   + (double)matrix.getTranslateX();
+        double r = (double)matrix.getScaleX()*geom.fRight  + (double)matrix.getTranslateX();
+        double t = (double)matrix.getScaleY()*geom.fTop    + (double)matrix.getTranslateY();
+        double b = (double)matrix.getScaleY()*geom.fBottom + (double)matrix.getTranslateY();
+        return {sk_double_saturate2int(std::floor(std::min(l, r) + kRoundEpsilon)),
+                sk_double_saturate2int(std::floor(std::min(t, b) + kRoundEpsilon)),
+                sk_double_saturate2int(std::ceil(std::max(l, r)  - kRoundEpsilon)),
+                sk_double_saturate2int(std::ceil(std::max(t, b)  - kRoundEpsilon))};
+    } else {
+        return RoundOut(matrix.mapRect(SkRect::Make(geom)));
+    }
+}
+
+template<>
+SkIPoint Mapping::map<SkIPoint>(const SkIPoint& geom, const SkMatrix& matrix) {
+    SkPoint p = matrix.mapPoint({SkIntToScalar(geom.fX), SkIntToScalar(geom.fY)});
+    return SkIPoint::Make(SkScalarRoundToInt(p.fX), SkScalarRoundToInt(p.fY));
+}
+
+template<>
+SkPoint Mapping::map<SkPoint>(const SkPoint& geom, const SkMatrix& matrix) {
+    return matrix.mapPoint(geom);
+}
+
+template<>
+Vector Mapping::map<Vector>(const Vector& geom, const SkMatrix& matrix) {
+    return Vector(matrix.mapVector({geom.fX, geom.fY}));
+}
+
+template<>
+IVector Mapping::map<IVector>(const IVector& geom, const SkMatrix& matrix) {
+    const SkVector v = matrix.mapVector({SkIntToScalar(geom.fX), SkIntToScalar(geom.fY)});
+    return IVector(SkScalarRoundToInt(v.fX), SkScalarRoundToInt(v.fY));
+}
+
+template<>
+SkSize Mapping::map<SkSize>(const SkSize& geom, const SkMatrix& matrix) {
+    if (matrix.isScaleTranslate()) {
+        SkVector sizes = matrix.mapVector(geom.fWidth, geom.fHeight);
+        return {SkScalarAbs(sizes.fX), SkScalarAbs(sizes.fY)};
+    }
+
+    SkVector xAxis = matrix.mapVector(geom.fWidth, 0.f);
+    SkVector yAxis = matrix.mapVector(0.f, geom.fHeight);
+    return {xAxis.length(), yAxis.length()};
+}
+
+template<>
+SkISize Mapping::map<SkISize>(const SkISize& geom, const SkMatrix& matrix) {
+    SkSize size = map(SkSize::Make(geom), matrix);
+    return SkISize::Make(SkScalarCeilToInt(size.fWidth - kRoundEpsilon),
+                         SkScalarCeilToInt(size.fHeight - kRoundEpsilon));
+}
+
+template<>
+SkMatrix Mapping::map<SkMatrix>(const SkMatrix& m, const SkMatrix& matrix) {
+    SkMatrix inv = matrix.invert().value_or(SkMatrix());
+    inv.postConcat(m);
+    inv.postConcat(matrix);
+    return inv;
+}
+
+
+LayerSpace<SkIRect> LayerSpace<SkIRect>::relevantSubset(const LayerSpace<SkIRect> dstRect,
+                                                        SkTileMode tileMode) const {
+    LayerSpace<SkIRect> fittedSrc = *this;
+    if (tileMode == SkTileMode::kDecal || tileMode == SkTileMode::kClamp) {
+        if (!fittedSrc.intersect(dstRect)) {
+            if (tileMode == SkTileMode::kDecal) {
+                fittedSrc = LayerSpace<SkIRect>::Empty();
+            } else {
+                auto edge = SkRectPriv::ClosestDisjointEdge(SkIRect(fittedSrc),  SkIRect(dstRect));
+                fittedSrc = LayerSpace<SkIRect>(edge);
+            }
+        }
+    } 
+
+    return fittedSrc;
+}
+
+LayerSpace<SkISize> LayerSpace<SkSize>::round() const {
+    return LayerSpace<SkISize>(fData.toRound());
+}
+LayerSpace<SkISize> LayerSpace<SkSize>::ceil() const {
+    return LayerSpace<SkISize>({SkScalarCeilToInt(fData.fWidth - kRoundEpsilon),
+                                SkScalarCeilToInt(fData.fHeight - kRoundEpsilon)});
+}
+LayerSpace<SkISize> LayerSpace<SkSize>::floor() const {
+    return LayerSpace<SkISize>({SkScalarFloorToInt(fData.fWidth + kRoundEpsilon),
+                                SkScalarFloorToInt(fData.fHeight + kRoundEpsilon)});
+}
+
+LayerSpace<SkRect> LayerSpace<SkMatrix>::mapRect(const LayerSpace<SkRect>& r) const {
+    return LayerSpace<SkRect>(Mapping::map(SkRect(r), fData));
+}
+
+LayerSpace<SkIRect> LayerSpace<SkMatrix>::mapRect(const LayerSpace<SkIRect>& r) const {
+    return LayerSpace<SkIRect>(Mapping::map(SkIRect(r), fData));
+}
+
+LayerSpace<SkPoint> LayerSpace<SkMatrix>::mapPoint(const LayerSpace<SkPoint>& p) const {
+    return LayerSpace<SkPoint>(Mapping::map(SkPoint(p), fData));
+}
+
+LayerSpace<Vector> LayerSpace<SkMatrix>::mapVector(const LayerSpace<Vector>& v) const {
+    return LayerSpace<Vector>(Mapping::map(Vector(v), fData));
+}
+
+LayerSpace<SkSize> LayerSpace<SkMatrix>::mapSize(const LayerSpace<SkSize>& s) const {
+    return LayerSpace<SkSize>(Mapping::map(SkSize(s), fData));
+}
+
+bool LayerSpace<SkMatrix>::inverseMapRect(const LayerSpace<SkRect>& r,
+                                          LayerSpace<SkRect>* out) const {
+    SkRect mapped;
+    if (r.isEmpty()) {
+        *out = LayerSpace<SkRect>::Empty();
+        return true;
+    } else if (SkMatrixPriv::InverseMapRect(fData, &mapped, SkRect(r))) {
+        *out = LayerSpace<SkRect>(mapped);
+        return true;
+    } else {
+        return false;
+    }
+}
+
+bool LayerSpace<SkMatrix>::inverseMapRect(const LayerSpace<SkIRect>& rect,
+                                          LayerSpace<SkIRect>* out) const {
+    if (rect.isEmpty()) {
+        *out = LayerSpace<SkIRect>::Empty();
+        return true;
+    } else if (fData.isScaleTranslate()) { 
+        if (fData.getScaleX() == 0.f || fData.getScaleY() == 0.f) {
+            return false;
+        }
+        double l = (rect.left()   - (double)fData.getTranslateX()) / (double)fData.getScaleX();
+        double r = (rect.right()  - (double)fData.getTranslateX()) / (double)fData.getScaleX();
+        double t = (rect.top()    - (double)fData.getTranslateY()) / (double)fData.getScaleY();
+        double b = (rect.bottom() - (double)fData.getTranslateY()) / (double)fData.getScaleY();
+
+        SkIRect mapped{sk_double_saturate2int(std::floor(std::min(l, r) + kRoundEpsilon)),
+                       sk_double_saturate2int(std::floor(std::min(t, b) + kRoundEpsilon)),
+                       sk_double_saturate2int(std::ceil(std::max(l, r)  - kRoundEpsilon)),
+                       sk_double_saturate2int(std::ceil(std::max(t, b)  - kRoundEpsilon))};
+        *out = LayerSpace<SkIRect>(mapped);
+        return true;
+    } else {
+        SkRect mapped;
+        if (SkMatrixPriv::InverseMapRect(fData, &mapped, SkRect::Make(SkIRect(rect)))) {
+            *out = LayerSpace<SkRect>(mapped).roundOut();
+            return true;
+        }
+    }
+
+    return false;
+}
+
+class FilterResult::AutoSurface {
+public:
+    AutoSurface(const Context& ctx,
+                const LayerSpace<SkIRect>& dstBounds,
+                PixelBoundary boundary,
+                bool renderInParameterSpace,
+                const SkSurfaceProps* props = nullptr)
+            : fDstBounds(dstBounds)
+            , fBoundary(boundary) {
+        sk_sp<SkDevice> device = nullptr;
+        if (!dstBounds.isEmpty()) {
+            int padding = this->padding();
+            if (padding) {
+                fDstBounds.outset(LayerSpace<SkISize>({padding, padding}));
+                if (fDstBounds.left() >= dstBounds.left() ||
+                    fDstBounds.right() <= dstBounds.right() ||
+                    fDstBounds.top() >= dstBounds.top() ||
+                    fDstBounds.bottom() <= dstBounds.bottom()) {
+                    return;
+                }
+            }
+            device = ctx.backend()->makeDevice(SkISize(fDstBounds.size()),
+                                               ctx.refColorSpace(),
+                                               props);
+        }
+
+        if (!device) {
+            return;
+        }
+
+        ctx.markNewSurface();
+        fCanvas.emplace(std::move(device));
+        fCanvas->translate(-fDstBounds.left(), -fDstBounds.top());
+        fCanvas->clear(SkColors::kTransparent);
+        if (fBoundary == PixelBoundary::kTransparent) {
+            fCanvas->clipIRect(SkIRect(dstBounds));
+        } else {
+            fCanvas->clipIRect(SkIRect(fDstBounds));
+        }
+
+        if (renderInParameterSpace) {
+            fCanvas->concat(ctx.mapping().layerMatrix());
+        }
+    }
+
+    explicit operator bool() const { return fCanvas.has_value(); }
+
+    SkCanvas* canvas() { SkASSERT(fCanvas.has_value()); return &*fCanvas; }
+    SkDevice* device() { return SkCanvasPriv::TopDevice(this->canvas()); }
+    SkCanvas* operator->() { return this->canvas(); }
+
+    FilterResult snap() {
+        if (fCanvas.has_value()) {
+            fCanvas->restoreToCount(0);
+            this->device()->setImmutable();
+
+            SkIRect subset = SkIRect::MakeWH(fDstBounds.width(), fDstBounds.height());
+            sk_sp<SkSpecialImage> image = this->device()->snapSpecial(subset);
+            fCanvas.reset(); 
+
+            if (image && fBoundary != PixelBoundary::kUnknown) {
+                const int padding = this->padding();
+                subset = SkIRect::MakeSize(image->dimensions()).makeInset(padding, padding);
+                LayerSpace<SkIPoint> origin{{fDstBounds.left() + padding,
+                                             fDstBounds.top() + padding}};
+                return {image->makeSubset(subset), origin, fBoundary};
+            } else {
+                return {image, fDstBounds.topLeft(), PixelBoundary::kUnknown};
+            }
+        } else {
+            return {};
+        }
+    }
+
+private:
+    int padding() const { return fBoundary == PixelBoundary::kUnknown ? 0 : 1; }
+
+    std::optional<SkCanvas> fCanvas;
+    LayerSpace<SkIRect> fDstBounds; 
+    PixelBoundary fBoundary;
+};
+
+
+sk_sp<SkSpecialImage> FilterResult::imageAndOffset(const Context& ctx, SkIPoint* offset) const {
+    auto [image, origin] = this->imageAndOffset(ctx);
+    *offset = SkIPoint(origin);
+    return image;
+}
+
+std::pair<sk_sp<SkSpecialImage>, LayerSpace<SkIPoint>>FilterResult::imageAndOffset(
+        const Context& ctx) const {
+    FilterResult resolved = this->resolve(ctx, ctx.desiredOutput());
+    return {resolved.fImage, resolved.layerBounds().topLeft()};
+}
+
+FilterResult FilterResult::insetForSaveLayer() const {
+    if (!fImage) {
+        return {};
+    }
+
+    SkASSERT(fTileMode == SkTileMode::kDecal);
+
+    FilterResult inset = this->insetByPixel();
+    SkASSERT(inset.fBoundary == PixelBoundary::kInitialized &&
+             inset.fTileMode == SkTileMode::kDecal);
+    inset.fBoundary = PixelBoundary::kTransparent;
+    return inset;
+}
+
+FilterResult FilterResult::insetByPixel() const {
+    auto insetBounds = fLayerBounds;
+    insetBounds.inset(LayerSpace<SkISize>({1, 1}));
+    SkASSERT(!insetBounds.isEmpty());
+    return this->subset(fLayerBounds.topLeft(), insetBounds);
+}
+
+SkEnumBitMask<FilterResult::BoundsAnalysis> FilterResult::analyzeBounds(
+        const SkMatrix& xtraTransform,
+        const SkIRect& dstBounds,
+        BoundsScope scope) const {
+    static constexpr SkSamplingOptions kNearestNeighbor = {};
+    static constexpr float kHalfPixel = 0.5f;
+    static constexpr float kCubicRadius = 1.5f;
+
+    SkEnumBitMask<BoundsAnalysis> analysis = BoundsAnalysis::kSimple;
+    const bool fillsLayerBounds = fTileMode != SkTileMode::kDecal ||
+                                  (fColorFilter && as_CFB(fColorFilter)->affectsTransparentBlack());
+
+    SkRect pixelCenterBounds = SkRect::Make(dstBounds);
+    if (!SkRectPriv::QuadContainsRect(xtraTransform,
+                                      SkIRect(fLayerBounds),
+                                      dstBounds,
+                                      kRoundEpsilon)) {
+        bool requireLayerCrop = fillsLayerBounds;
+        if (!fillsLayerBounds) {
+            LayerSpace<SkIRect> imageBounds =
+                    fTransform.mapRect(LayerSpace<SkIRect>{fImage->dimensions()});
+            requireLayerCrop = !fLayerBounds.contains(imageBounds);
+        }
+
+        if (requireLayerCrop) {
+            analysis |= BoundsAnalysis::kRequiresLayerCrop;
+            SkIRect layerBoundsInDst = Mapping::map(SkIRect(fLayerBounds), xtraTransform);
+            (void) pixelCenterBounds.intersect(SkRect::Make(layerBoundsInDst));
+        }
+    }
+
+    SkRect imageBounds = SkRect::Make(fImage->dimensions());
+    LayerSpace<SkMatrix> netTransform = fTransform;
+    netTransform.postConcat(LayerSpace<SkMatrix>(xtraTransform));
+    SkM44 netM44{SkMatrix(netTransform)};
+
+    const auto [xAxisAligned, yAxisAligned] = are_axes_nearly_integer_aligned(netTransform);
+    const bool isPixelAligned = xAxisAligned && yAxisAligned;
+    const bool decalLeaks = scope != BoundsScope::kRescale &&
+                            fTileMode == SkTileMode::kDecal &&
+                            fSamplingOptions != kNearestNeighbor &&
+                            !isPixelAligned;
+
+    const float sampleRadius = fSamplingOptions.useCubic ? kCubicRadius : kHalfPixel;
+    SkRect safeImageBounds = imageBounds.makeInset(sampleRadius, sampleRadius);
+    if (fSamplingOptions == kDefaultSampling && !isPixelAligned) {
+        safeImageBounds.inset(xAxisAligned ? 0.f : kRoundEpsilon,
+                              yAxisAligned ? 0.f : kRoundEpsilon);
+    }
+    bool hasPixelPadding = fBoundary != PixelBoundary::kUnknown;
+
+    if (!SkRectPriv::QuadContainsRect(netM44,
+                                      decalLeaks ? safeImageBounds : imageBounds,
+                                      pixelCenterBounds,
+                                      kRoundEpsilon)) {
+        analysis |= BoundsAnalysis::kDstBoundsNotCovered;
+        if (fillsLayerBounds) {
+            analysis |= BoundsAnalysis::kHasLayerFillingEffect;
+        }
+        if (decalLeaks) {
+            float scaleFactors[2];
+            if (!(SkMatrix(netTransform).getMinMaxScales(scaleFactors) &&
+                    SkScalarNearlyEqual(scaleFactors[0], 1.f, 0.2f) &&
+                    SkScalarNearlyEqual(scaleFactors[1], 1.f, 0.2f))) {
+                analysis |= BoundsAnalysis::kRequiresDecalInLayerSpace;
+                if (fBoundary == PixelBoundary::kTransparent) {
+                    hasPixelPadding = false;
+                }
+            }
+        }
+    }
+
+    if (scope == BoundsScope::kDeferred) {
+        return analysis; 
+    } else if (scope == BoundsScope::kCanDrawDirectly &&
+               !(analysis & BoundsAnalysis::kHasLayerFillingEffect)) {
+        const bool nnOrBilerp = fSamplingOptions == kDefaultSampling ||
+                                fSamplingOptions == kNearestNeighbor;
+        if (nnOrBilerp && (hasPixelPadding || isPixelAligned)) {
+            return analysis;
+        }
+    }
+
+
+    if (hasPixelPadding) {
+        safeImageBounds.outset(1.f, 1.f);
+    }
+    pixelCenterBounds.inset(kHalfPixel, kHalfPixel);
+
+    skvx::int4 edgeMask = SkRectPriv::QuadContainsRectMask(netM44,
+                                                           safeImageBounds,
+                                                           pixelCenterBounds,
+                                                           kRoundEpsilon);
+    if (!all(edgeMask)) {
+        skvx::int4 hwEdge{fImage->subset().fTop == 0,
+                          fImage->subset().fRight == fImage->backingStoreDimensions().fWidth,
+                          fImage->subset().fBottom == fImage->backingStoreDimensions().fHeight,
+                          fImage->subset().fLeft == 0};
+        if (fTileMode == SkTileMode::kRepeat || fTileMode == SkTileMode::kMirror) {
+            hwEdge = hwEdge & skvx::shuffle<2,3,0,1>(hwEdge); 
+        }
+        if (!all(edgeMask | hwEdge)) {
+            analysis |= BoundsAnalysis::kRequiresShaderTiling;
+        }
+    }
+
+    return analysis;
+}
+
+void FilterResult::updateTileMode(const Context& ctx, SkTileMode tileMode) {
+    if (fImage) {
+        fTileMode = tileMode;
+        if (tileMode != SkTileMode::kDecal) {
+            fLayerBounds = ctx.desiredOutput();
+        }
+    }
+}
+
+FilterResult FilterResult::applyCrop(const Context& ctx,
+                                     const LayerSpace<SkIRect>& crop,
+                                     SkTileMode tileMode) const {
+    static const LayerSpace<SkMatrix> kIdentity{SkMatrix::I()};
+
+    if (crop.isEmpty() || ctx.desiredOutput().isEmpty()) {
+        return {};
+    }
+
+    LayerSpace<SkIRect> cropContent = crop;
+    if (!fImage ||
+        !cropContent.intersect(fLayerBounds)) {
+        return {};
+    }
+
+    LayerSpace<SkIRect> fittedCrop = crop.relevantSubset(ctx.desiredOutput(), tileMode);
+
+    if (!cropContent.intersect(fittedCrop)) {
+        return {};
+    }
+
+    auto periodicTransform = periodic_axis_transform(tileMode, fittedCrop, ctx.desiredOutput());
+    if (periodicTransform) {
+        return this->applyTransform(ctx, *periodicTransform, FilterResult::kDefaultSampling);
+    }
+
+    bool preserveTransparencyInCrop = false;
+    if (tileMode == SkTileMode::kDecal) {
+        fittedCrop = cropContent;
+    } else if (fittedCrop.contains(ctx.desiredOutput())) {
+        tileMode = SkTileMode::kDecal;
+        fittedCrop = ctx.desiredOutput();
+    } else if (!cropContent.contains(fittedCrop)) {
+        preserveTransparencyInCrop = true;
+        if (fTileMode == SkTileMode::kDecal && tileMode == SkTileMode::kClamp) {
+            cropContent.outset(skif::LayerSpace<SkISize>({1, 1}));
+            SkAssertResult(fittedCrop.intersect(cropContent));
+        }
+    } 
+
+    const bool doubleClamp = fTileMode == SkTileMode::kClamp && tileMode == SkTileMode::kClamp;
+    LayerSpace<SkIPoint> origin;
+    if (!preserveTransparencyInCrop &&
+        is_nearly_integer_translation(fTransform, &origin) &&
+        (doubleClamp ||
+         !(this->analyzeBounds(fittedCrop) & BoundsAnalysis::kHasLayerFillingEffect))) {
+        FilterResult restrictedOutput = this->subset(origin, fittedCrop, doubleClamp);
+        restrictedOutput.updateTileMode(ctx, tileMode);
+        if (restrictedOutput.fBoundary == PixelBoundary::kInitialized ||
+            tileMode != SkTileMode::kDecal) {
+            restrictedOutput.fBoundary = PixelBoundary::kUnknown;
+        }
+        return restrictedOutput;
+    } else if (tileMode == SkTileMode::kDecal) {
+        SkASSERT(!preserveTransparencyInCrop);
+        FilterResult restrictedOutput = *this;
+        restrictedOutput.fLayerBounds = fittedCrop;
+        return restrictedOutput;
+    } else {
+        FilterResult tiled = this->resolve(ctx, fittedCrop, true);
+        tiled.updateTileMode(ctx, tileMode);
+        return tiled;
+    }
+}
+
+FilterResult FilterResult::applyColorFilter(const Context& ctx,
+                                            sk_sp<SkColorFilter> colorFilter) const {
+    SkASSERT(colorFilter);
+
+    if (ctx.desiredOutput().isEmpty()) {
+        return {};
+    }
+
+    LayerSpace<SkIRect> newLayerBounds = fLayerBounds;
+    if (as_CFB(colorFilter)->affectsTransparentBlack()) {
+        if (!fImage || !newLayerBounds.intersect(ctx.desiredOutput())) {
+            AutoSurface surface{ctx,
+                                LayerSpace<SkIRect>{SkIRect::MakeXYWH(ctx.desiredOutput().left(),
+                                                                      ctx.desiredOutput().top(),
+                                                                      1, 1)},
+                                PixelBoundary::kInitialized,
+                                false};
+            if (surface) {
+                SkPaint paint;
+                paint.setColor4f(SkColors::kTransparent, nullptr);
+                paint.setColorFilter(std::move(colorFilter));
+#if !defined(SK_USE_SRCOVER_FOR_FILTERS)
+                paint.setBlendMode(SkBlendMode::kSrc);
+#endif
+                surface->drawPaint(paint);
+            }
+            FilterResult solidColor = surface.snap();
+            solidColor.updateTileMode(ctx, SkTileMode::kClamp);
+            return solidColor;
+        }
+
+        if (this->analyzeBounds(ctx.desiredOutput()) & BoundsAnalysis::kRequiresLayerCrop) {
+            newLayerBounds.outset(LayerSpace<SkISize>({1, 1}));
+            SkAssertResult(newLayerBounds.intersect(ctx.desiredOutput()));
+            FilterResult filtered = this->resolve(ctx, newLayerBounds, true);
+            filtered.fColorFilter = std::move(colorFilter);
+            filtered.updateTileMode(ctx, SkTileMode::kClamp);
+            return filtered;
+        }
+
+        newLayerBounds = ctx.desiredOutput();
+    } else {
+        if (!fImage || !LayerSpace<SkIRect>::Intersects(newLayerBounds, ctx.desiredOutput())) {
+            return {};
+        }
+    }
+
+    FilterResult filtered = *this;
+    filtered.fLayerBounds = newLayerBounds;
+    filtered.fColorFilter = SkColorFilters::Compose(std::move(colorFilter), fColorFilter);
+    return filtered;
+}
+
+static bool compatible_sampling(const SkSamplingOptions& currentSampling,
+                                bool currentXformWontAffectNearest,
+                                SkSamplingOptions* nextSampling,
+                                bool nextXformWontAffectNearest) {
+    if (currentSampling.isAniso() && nextSampling->isAniso()) {
+        *nextSampling =  SkSamplingOptions::Aniso(std::max(currentSampling.maxAniso,
+                                                           nextSampling->maxAniso));
+        return true;
+    } else if (currentSampling.isAniso() && nextSampling->filter == SkFilterMode::kLinear) {
+        *nextSampling = currentSampling;
+        return true;
+    } else if (nextSampling->isAniso() && currentSampling.filter == SkFilterMode::kLinear) {
+        return true;
+    } else if (currentSampling.useCubic && (nextSampling->filter == SkFilterMode::kLinear ||
+                                            (nextSampling->useCubic &&
+                                             currentSampling.cubic.B == nextSampling->cubic.B &&
+                                             currentSampling.cubic.C == nextSampling->cubic.C))) {
+        *nextSampling = currentSampling;
+        return true;
+    } else if (nextSampling->useCubic && currentSampling.filter == SkFilterMode::kLinear) {
+        return true;
+    } else if (currentSampling.filter == SkFilterMode::kLinear &&
+               nextSampling->filter == SkFilterMode::kLinear) {
+        return true;
+    } else if (nextSampling->filter == SkFilterMode::kNearest && currentXformWontAffectNearest) {
+        SkASSERT(currentSampling.filter == SkFilterMode::kLinear);
+        return true;
+    } else if (currentSampling.filter == SkFilterMode::kNearest && nextXformWontAffectNearest) {
+        SkASSERT(nextSampling->filter == SkFilterMode::kLinear);
+        *nextSampling = currentSampling;
+        return true;
+    } else {
+        return false;
+    }
+}
+
+FilterResult FilterResult::applyTransform(const Context& ctx,
+                                          const LayerSpace<SkMatrix>& transform,
+                                          const SkSamplingOptions &sampling) const {
+    if (!fImage || ctx.desiredOutput().isEmpty()) {
+        SkASSERT(!fColorFilter);
+        return {};
+    }
+
+    if (!transform.invert(nullptr)) {
+        return {};
+    }
+
+    const bool currentXformIsInteger = is_nearly_integer_translation(fTransform);
+    const bool nextXformIsInteger = is_nearly_integer_translation(transform);
+
+    SkASSERT(!currentXformIsInteger || fSamplingOptions == kDefaultSampling);
+    SkSamplingOptions nextSampling = nextXformIsInteger ? kDefaultSampling : sampling;
+
+    bool isCropped = !nextXformIsInteger &&
+                     (this->analyzeBounds(SkMatrix(transform), SkIRect(ctx.desiredOutput()))
+                            & BoundsAnalysis::kRequiresLayerCrop);
+
+    FilterResult transformed;
+    if (!isCropped && compatible_sampling(fSamplingOptions, currentXformIsInteger,
+                                          &nextSampling, nextXformIsInteger)) {
+        transformed = *this;
+    } else {
+        LayerSpace<SkIRect> tightBounds;
+        if (transform.inverseMapRect(ctx.desiredOutput(), &tightBounds)) {
+            transformed = this->resolve(ctx, tightBounds);
+        }
+
+        if (!transformed.fImage) {
+            return {};
+        }
+    }
+
+    transformed.fSamplingOptions = nextSampling;
+    transformed.fTransform.postConcat(transform);
+    transformed.fLayerBounds = transform.mapRect(transformed.fLayerBounds);
+    if (!LayerSpace<SkIRect>::Intersects(transformed.fLayerBounds, ctx.desiredOutput())) {
+        return {};
+    }
+
+    return transformed;
+}
+
+FilterResult FilterResult::resolve(const Context& ctx,
+                                   LayerSpace<SkIRect> dstBounds,
+                                   bool preserveDstBounds) const {
+    if (!fImage || (!preserveDstBounds && !dstBounds.intersect(fLayerBounds))) {
+        return {nullptr, {}};
+    }
+
+    const bool subsetCompatible = !fColorFilter &&
+                                  fTileMode == SkTileMode::kDecal &&
+                                  !preserveDstBounds;
+
+    LayerSpace<SkIPoint> origin;
+    if (subsetCompatible && is_nearly_integer_translation(fTransform, &origin)) {
+        return this->subset(origin, dstBounds);
+    } // else fall through and attempt a draw
+
+    SkSurfaceProps props = {};
+    PixelBoundary boundary = preserveDstBounds ? PixelBoundary::kUnknown
+                                               : PixelBoundary::kTransparent;
+    AutoSurface surface{ctx, dstBounds, boundary, false, &props};
+    if (surface) {
+        this->draw(ctx, surface.device(), false);
+    }
+    return surface.snap();
+}
+
+FilterResult FilterResult::subset(const LayerSpace<SkIPoint>& knownOrigin,
+                                  const LayerSpace<SkIRect>& subsetBounds,
+                                  bool clampSrcIfDisjoint) const {
+    SkDEBUGCODE(LayerSpace<SkIPoint> actualOrigin;)
+    SkASSERT(is_nearly_integer_translation(fTransform, &actualOrigin) &&
+             SkIPoint(actualOrigin) == SkIPoint(knownOrigin));
+
+
+    LayerSpace<SkIRect> imageBounds(SkIRect::MakeXYWH(knownOrigin.x(), knownOrigin.y(),
+                                                      fImage->width(), fImage->height()));
+    imageBounds = imageBounds.relevantSubset(subsetBounds, clampSrcIfDisjoint ? SkTileMode::kClamp
+                                                                              : SkTileMode::kDecal);
+    if (imageBounds.isEmpty()) {
+        return {};
+    }
+
+    SkIRect subset = { imageBounds.left() - knownOrigin.x(),
+                       imageBounds.top() - knownOrigin.y(),
+                       imageBounds.right() - knownOrigin.x(),
+                       imageBounds.bottom() - knownOrigin.y() };
+    SkASSERT(subset.fLeft >= 0 && subset.fTop >= 0 &&
+             subset.fRight <= fImage->width() && subset.fBottom <= fImage->height());
+
+    FilterResult result{fImage->makeSubset(subset), imageBounds.topLeft()};
+    result.fColorFilter = fColorFilter;
+
+    SkASSERT(result.fBoundary == PixelBoundary::kUnknown);
+    if (fImage->subset() == result.fImage->subset()) {
+        result.fBoundary = fBoundary;
+    } else {
+        SkIRect safeSubset = fImage->subset();
+        if (fBoundary == PixelBoundary::kUnknown) {
+            safeSubset.inset(1, 1);
+        }
+        if (safeSubset.contains(result.fImage->subset())) {
+            result.fBoundary = PixelBoundary::kInitialized;
+        }
+    }
+    return result;
+}
+
+void FilterResult::draw(const Context& ctx, SkDevice* target, const SkBlender* blender) const {
+    SkAutoDeviceTransformRestore adtr{target, ctx.mapping().layerToDevice()};
+    this->draw(ctx, target, true, blender);
+}
+
+void FilterResult::draw(const Context& ctx,
+                        SkDevice* device,
+                        bool preserveDeviceState,
+                        const SkBlender* blender) const {
+    const bool blendAffectsTransparentBlack = blender && as_BB(blender)->affectsTransparentBlack();
+    if (!fImage) {
+        if (blendAffectsTransparentBlack) {
+            SkPaint clear;
+            clear.setColor4f(SkColors::kTransparent);
+            clear.setBlender(sk_ref_sp(blender));
+            device->drawPaint(clear);
+        }
+        return;
+    }
+
+    BoundsScope scope = blendAffectsTransparentBlack ? BoundsScope::kShaderOnly
+                                                     : BoundsScope::kCanDrawDirectly;
+    SkEnumBitMask<BoundsAnalysis> analysis = this->analyzeBounds(device->localToDevice(),
+                                                                 device->devClipBounds(),
+                                                                 scope);
+
+    if (analysis & BoundsAnalysis::kRequiresLayerCrop) {
+        if (blendAffectsTransparentBlack) {
+            LayerSpace<SkIRect> dstBounds;
+            if (!LayerSpace<SkMatrix>(device->localToDevice()).inverseMapRect(
+                        LayerSpace<SkIRect>(device->devClipBounds()), &dstBounds)) {
+                return;
+            }
+            FilterResult clipped = this->resolve(ctx, dstBounds);
+            clipped.draw(ctx, device, preserveDeviceState, blender);
+            return;
+        }
+        if (preserveDeviceState) {
+            device->pushClipStack();
+        }
+        device->clipRect(SkRect::Make(SkIRect(fLayerBounds)), SkClipOp::kIntersect, true);
+    }
+
+    const bool pixelAligned =
+            is_nearly_integer_translation(fTransform) &&
+            is_nearly_integer_translation(skif::LayerSpace<SkMatrix>(device->localToDevice()));
+    SkSamplingOptions sampling = fSamplingOptions;
+    if (sampling == kDefaultSampling && pixelAligned) {
+        sampling = {};
+    }
+
+    if (analysis & BoundsAnalysis::kHasLayerFillingEffect ||
+        (blendAffectsTransparentBlack && (analysis & BoundsAnalysis::kDstBoundsNotCovered))) {
+        SkPaint paint;
+        if (!preserveDeviceState && !blender) {
+#if !defined(SK_USE_SRCOVER_FOR_FILTERS)
+            paint.setBlendMode(SkBlendMode::kSrc);
+#endif
+        } else {
+            paint.setBlender(sk_ref_sp(blender));
+        }
+        paint.setShader(this->getAnalyzedShaderView(ctx, sampling, analysis));
+        device->drawPaint(paint);
+    } else {
+        SkPaint paint;
+        paint.setBlender(sk_ref_sp(blender));
+        paint.setColorFilter(fColorFilter);
+
+        SkMatrix netTransform = SkMatrix::Concat(device->localToDevice(), SkMatrix(fTransform));
+
+        if (this->canClampToTransparentBoundary(analysis) && fSamplingOptions == kDefaultSampling) {
+            SkASSERT(!(analysis & BoundsAnalysis::kRequiresShaderTiling));
+            if (!preserveDeviceState && !blender) {
+#if !defined(SK_USE_SRCOVER_FOR_FILTERS)
+                paint.setBlendMode(SkBlendMode::kSrc);
+#endif
+            }
+            netTransform.preTranslate(-1.f, -1.f);
+            device->drawSpecial(fImage->makePixelOutset().get(), netTransform, sampling, paint,
+                                SkCanvas::kFast_SrcRectConstraint);
+        } else {
+            paint.setAntiAlias(true);
+            SkCanvas::SrcRectConstraint constraint = SkCanvas::kFast_SrcRectConstraint;
+            if (analysis & BoundsAnalysis::kRequiresShaderTiling) {
+                constraint = SkCanvas::kStrict_SrcRectConstraint;
+                ctx.markShaderBasedTilingRequired(SkTileMode::kClamp);
+            }
+            device->drawSpecial(fImage.get(), netTransform, sampling, paint, constraint);
+        }
+    }
+
+    if (preserveDeviceState && (analysis & BoundsAnalysis::kRequiresLayerCrop)) {
+        device->popClipStack();
+    }
+}
+
+sk_sp<SkShader> FilterResult::asShader(const Context& ctx,
+                                       const SkSamplingOptions& xtraSampling,
+                                       SkEnumBitMask<ShaderFlags> flags,
+                                       const LayerSpace<SkIRect>& sampleBounds) const {
+    if (!fImage) {
+        return nullptr;
+    }
+    const bool currentXformIsInteger = is_nearly_integer_translation(fTransform);
+    const bool nextXformIsInteger = !(flags & ShaderFlags::kNonTrivialSampling);
+
+    SkBlendMode colorFilterMode;
+    SkEnumBitMask<BoundsAnalysis> analysis = this->analyzeBounds(sampleBounds,
+                                                                 BoundsScope::kShaderOnly);
+
+    SkSamplingOptions sampling = xtraSampling;
+    const bool needsResolve =
+            (flags & ShaderFlags::kSampledRepeatedly &&
+                    ((fColorFilter && (!fColorFilter->asAColorMode(nullptr, &colorFilterMode) ||
+                                       colorFilterMode > SkBlendMode::kLastCoeffMode)) ||
+                     !SkColorSpace::Equals(fImage->getColorSpace(), ctx.colorSpace()))) ||
+            !compatible_sampling(fSamplingOptions, currentXformIsInteger,
+                                 &sampling, nextXformIsInteger) ||
+            (analysis & BoundsAnalysis::kRequiresLayerCrop);
+
+    if (sampling == kDefaultSampling && nextXformIsInteger &&
+        (needsResolve || currentXformIsInteger)) {
+        sampling = {};
+    }
+
+    sk_sp<SkShader> shader;
+    if (needsResolve) {
+        FilterResult resolved = this->resolve(ctx, sampleBounds);
+        if (resolved) {
+            [[maybe_unused]] static constexpr SkEnumBitMask<BoundsAnalysis> kExpectedAnalysis =
+                    BoundsAnalysis::kDstBoundsNotCovered | BoundsAnalysis::kRequiresShaderTiling;
+            analysis = resolved.analyzeBounds(sampleBounds, BoundsScope::kShaderOnly);
+            SkASSERT(!(analysis & ~kExpectedAnalysis));
+            return resolved.getAnalyzedShaderView(ctx, sampling, analysis);
+        }
+    } else {
+        shader = this->getAnalyzedShaderView(ctx, sampling, analysis);
+    }
+
+    return shader;
+}
+
+sk_sp<SkShader> FilterResult::getAnalyzedShaderView(
+        const Context& ctx,
+        const SkSamplingOptions& finalSampling,
+        SkEnumBitMask<BoundsAnalysis> analysis) const {
+    const SkMatrix& localMatrix(fTransform);
+    const SkRect imageBounds = SkRect::Make(fImage->dimensions());
+    SkMatrix postDecal, preDecal;
+    if (localMatrix.rectStaysRect() ||
+        !(analysis & BoundsAnalysis::kRequiresDecalInLayerSpace)) {
+        postDecal = SkMatrix::I();
+        preDecal = localMatrix;
+    } else {
+        decompose_transform(localMatrix, imageBounds.center(), &postDecal, &preDecal);
+    }
+
+    SkTileMode effectiveTileMode = fTileMode;
+    const bool decalClampToTransparent = this->canClampToTransparentBoundary(analysis);
+    const bool strict = SkToBool(analysis & BoundsAnalysis::kRequiresShaderTiling);
+
+    sk_sp<SkShader> imageShader;
+    if (strict && decalClampToTransparent) {
+        preDecal.preTranslate(-1.f, -1.f);
+        imageShader = fImage->makePixelOutset()->asShader(SkTileMode::kClamp, finalSampling,
+                                                          preDecal, strict);
+        effectiveTileMode = SkTileMode::kClamp;
+    } else {
+        if (!(analysis & BoundsAnalysis::kDstBoundsNotCovered) ||
+            (analysis & BoundsAnalysis::kRequiresDecalInLayerSpace)) {
+            effectiveTileMode = SkTileMode::kClamp;
+        }
+        imageShader = fImage->asShader(effectiveTileMode, finalSampling, preDecal, strict);
+    }
+    if (strict) {
+        ctx.markShaderBasedTilingRequired(effectiveTileMode);
+    }
+
+    if (analysis & BoundsAnalysis::kRequiresDecalInLayerSpace) {
+        SkASSERT(fTileMode == SkTileMode::kDecal);
+        const SkRuntimeEffect* decalEffect =
+                GetKnownRuntimeEffect(SkKnownRuntimeEffects::StableKey::kDecal);
+
+        SkRuntimeShaderBuilder builder(sk_ref_sp(decalEffect));
+        builder.child("image") = std::move(imageShader);
+        builder.uniform("decalBounds") = preDecal.mapRect(imageBounds);
+
+        imageShader = builder.makeShader();
+    }
+
+    if (imageShader && (analysis & BoundsAnalysis::kRequiresDecalInLayerSpace)) {
+        imageShader = imageShader->makeWithLocalMatrix(postDecal);
+    }
+
+    if (imageShader && fColorFilter) {
+        imageShader = imageShader->makeWithColorFilter(fColorFilter);
+    }
+
+    return imageShader;
+}
+
+
+namespace {
+
+template <typename T>
+using PixelSpace = LayerSpace<T>;
+
+int downscale_step_count(float netScaleFactor) {
+    int steps = SkNextLog2(sk_float_ceil2int(1.f / netScaleFactor));
+    if (steps > 0) {
+        static constexpr float kMultiPassLimit = 0.9f;
+        static constexpr float kNearIdentityLimit = 1.f - kRoundEpsilon; 
+
+        float finalStepScale = netScaleFactor * (1 << (steps - 1));
+        float limit = steps == 1 ? kNearIdentityLimit : kMultiPassLimit;
+        if (finalStepScale >= limit) {
+            steps--;
+        }
+    }
+
+    return steps;
+}
+
+PixelSpace<SkRect> scale_about_center(const PixelSpace<SkRect> src, float sx, float sy) {
+    float cx = sx == 1.f ? 0.f : (0.5f * src.left() + 0.5f * src.right());
+    float cy = sy == 1.f ? 0.f : (0.5f * src.top()  + 0.5f * src.bottom());
+    return LayerSpace<SkRect>({(src.left()  - cx) * sx, (src.top()    - cy) * sy,
+                               (src.right() - cx) * sx, (src.bottom() - cy) * sy});
+}
+
+void draw_color_filtered_border(SkCanvas* canvas,
+                                PixelSpace<SkIRect> border,
+                                sk_sp<SkColorFilter> colorFilter) {
+    SkPaint cfOnly;
+    cfOnly.setColor4f(SkColors::kTransparent);
+    cfOnly.setColorFilter(std::move(colorFilter));
+#if !defined(SK_USE_SRCOVER_FOR_FILTERS)
+    cfOnly.setBlendMode(SkBlendMode::kSrc);
+#endif
+
+    canvas->drawIRect({border.left(),      border.top(),
+                       border.right(),     border.top() + 1},
+                       cfOnly); 
+    canvas->drawIRect({border.left(),      border.bottom() - 1,
+                       border.right(),     border.bottom()},
+                       cfOnly); 
+    canvas->drawIRect({border.left(),      border.top() + 1,
+                       border.left() + 1,  border.bottom() - 1},
+                       cfOnly); 
+    canvas->drawIRect({border.right() - 1, border.top() + 1,
+                       border.right(),     border.bottom() - 1},
+                       cfOnly); 
+}
+
+void draw_tiled_border(SkCanvas* canvas,
+                       SkTileMode tileMode,
+                       const SkPaint& paint,
+                       const PixelSpace<SkMatrix>& srcToDst,
+                       PixelSpace<SkRect> srcBorder,
+                       PixelSpace<SkRect> dstBorder) {
+    SkASSERT(tileMode != SkTileMode::kDecal); 
+
+    auto drawEdge = [&](const SkRect& src, const SkRect& dst) {
+        canvas->save();
+        canvas->concat(SkMatrix::RectToRectOrIdentity(src, dst));
+        canvas->drawRect(src, paint);
+        canvas->restore();
+    };
+    auto drawCorner = [&](const SkPoint& src, const SkPoint& dst) {
+        drawEdge(SkRect::MakeXYWH(src.fX, src.fY, 1.f, 1.f),
+                 SkRect::MakeXYWH(dst.fX, dst.fY, 1.f, 1.f));
+    };
+
+    PixelSpace<SkRect> dstSampleBounds{dstBorder};
+    dstSampleBounds.inset(PixelSpace<SkSize>({1.f, 1.f}));
+
+    PixelSpace<SkRect> srcSampleBounds;
+    SkAssertResult(srcToDst.inverseMapRect(dstSampleBounds, &srcSampleBounds));
+
+    if (tileMode == SkTileMode::kMirror || tileMode == SkTileMode::kRepeat) {
+        srcBorder = dstSampleBounds;
+        srcBorder.inset(PixelSpace<SkSize>({0.5f, 0.5f}));
+        SkAssertResult(srcToDst.inverseMapRect(srcBorder, &srcBorder));
+        srcBorder.outset(PixelSpace<SkSize>({0.5f, 0.5f}));
+    }
+
+    if (tileMode == SkTileMode::kRepeat) {
+        dstBorder = PixelSpace<SkRect>({dstBorder.right() - 1.f, dstBorder.bottom() - 1.f,
+                                        dstBorder.left()  + 1.f, dstBorder.top()    + 1.f});
+    }
+
+    drawEdge({srcBorder.left(),        srcSampleBounds.top(),
+              srcBorder.left() + 1.f,  srcSampleBounds.bottom()},
+             {dstBorder.left(),        dstSampleBounds.top(),
+              dstBorder.left() + 1.f,  dstSampleBounds.bottom()}); 
+
+    drawEdge({srcBorder.right() - 1.f, srcSampleBounds.top(),
+              srcBorder.right(),       srcSampleBounds.bottom()},
+             {dstBorder.right() - 1.f, dstSampleBounds.top(),
+              dstBorder.right(),       dstSampleBounds.bottom()}); 
+
+    drawEdge({srcSampleBounds.left(),  srcBorder.top(),
+              srcSampleBounds.right(), srcBorder.top() + 1.f},
+             {dstSampleBounds.left(),  dstBorder.top(),
+              dstSampleBounds.right(), dstBorder.top() + 1.f});    
+
+    drawEdge({srcSampleBounds.left(),  srcBorder.bottom() - 1.f,
+              srcSampleBounds.right(), srcBorder.bottom()},
+             {dstSampleBounds.left(),  dstBorder.bottom() - 1.f,
+              dstSampleBounds.right(), dstBorder.bottom()});       
+
+    drawCorner({srcBorder.left(),        srcBorder.top()},
+               {dstBorder.left(),        dstBorder.top()});          
+    drawCorner({srcBorder.right() - 1.f, srcBorder.top()},
+               {dstBorder.right() - 1.f, dstBorder.top()});          
+    drawCorner({srcBorder.right() - 1.f, srcBorder.bottom() - 1.f},
+               {dstBorder.right() - 1.f, dstBorder.bottom() - 1.f}); 
+    drawCorner({srcBorder.left(),        srcBorder.bottom() - 1.f},
+               {dstBorder.left(),        dstBorder.bottom() - 1.f}); 
+}
+
+} 
+
+FilterResult FilterResult::rescale(const Context& ctx,
+                                   const LayerSpace<SkSize>& scale,
+                                   bool enforceDecal,
+                                   bool allowOverscaling) const {
+    LayerSpace<SkIRect> visibleLayerBounds = fLayerBounds;
+    if (!fImage || !visibleLayerBounds.intersect(ctx.desiredOutput()) ||
+        scale.width() <= 0.f || scale.height() <= 0.f) {
+        return {};
+    }
+
+    PixelSpace<SkIPoint> origin;
+    const bool pixelAligned = is_nearly_integer_translation(fTransform, &origin);
+    SkEnumBitMask<BoundsAnalysis> analysis = this->analyzeBounds(ctx.desiredOutput(),
+                                                                 BoundsScope::kRescale);
+
+    // then just extract the necessary subset. Otherwise fall through and apply the effects with
+    const bool canDeferTiling =
+            pixelAligned &&
+            !(analysis & BoundsAnalysis::kRequiresLayerCrop) &&
+            !(enforceDecal && (analysis & BoundsAnalysis::kHasLayerFillingEffect));
+
+    const SkColorSpace* srcCS = fImage->getColorSpace() ? fImage->getColorSpace()
+                                                        : sk_srgb_singleton();
+    const SkColorSpace* dstCS = ctx.colorSpace() ? ctx.colorSpace() : srcCS;
+    const bool hasEffectsToApply =
+            !canDeferTiling ||
+            SkToBool(fColorFilter) ||
+            fImage->colorType() != ctx.backend()->colorType() ||
+            !SkColorSpace::Equals(srcCS, dstCS);
+
+    int xSteps = downscale_step_count(scale.width());
+    int ySteps = downscale_step_count(scale.height());
+    if (xSteps == 0 && ySteps == 0 && !hasEffectsToApply) {
+        if (analysis & BoundsAnalysis::kHasLayerFillingEffect) {
+            FilterResult noop = *this;
+            noop.fLayerBounds = visibleLayerBounds;
+            return noop;
+        } else {
+            return this->subset(origin, visibleLayerBounds);
+        }
+    }
+
+    PixelSpace<SkIRect> srcRect;
+    SkTileMode tileMode;
+    bool cfBorder = false;
+    bool deferPeriodicTiling = false;
+    if (canDeferTiling && (analysis & BoundsAnalysis::kHasLayerFillingEffect)) {
+        srcRect = LayerSpace<SkIRect>(SkIRect::MakeXYWH(origin.x(), origin.y(),
+                                                        fImage->width(), fImage->height()));
+        if (fTileMode == SkTileMode::kDecal &&
+            (analysis & BoundsAnalysis::kHasLayerFillingEffect)) {
+            tileMode = SkTileMode::kClamp;
+            cfBorder = true;
+        } else {
+            tileMode = fTileMode;
+            deferPeriodicTiling = tileMode == SkTileMode::kRepeat ||
+                                  tileMode == SkTileMode::kMirror;
+        }
+    } else {
+        srcRect = visibleLayerBounds;
+        tileMode = SkTileMode::kDecal;
+    }
+
+    srcRect = srcRect.relevantSubset(ctx.desiredOutput(), tileMode);
+    PixelSpace<SkRect> stepBoundsF{srcRect};
+    if (stepBoundsF.isEmpty()) {
+        return {};
+    }
+    PixelSpace<SkRect> stepPixelBounds{srcRect};
+
+    FilterResult image = *this;
+    if (!pixelAligned && (xSteps > 0 || ySteps > 0)) {
+        LayerSpace<SkSize> netScale = image.fTransform.mapSize(scale);
+        int nextXSteps = std::isfinite(netScale.width()) ? downscale_step_count(netScale.width())
+                                                         : std::numeric_limits<int>::max();
+        int nextYSteps = std::isfinite(netScale.height()) ? downscale_step_count(netScale.height())
+                                                          : std::numeric_limits<int>::max();
+        if ((xSteps > 0 && nextXSteps > xSteps) || (ySteps > 0 && nextYSteps > ySteps)) {
+            image = image.resolve(ctx, srcRect);
+            if (!image) {
+                return {};
+            }
+            if (!cfBorder) {
+                image.fTileMode = tileMode;
+            } 
+        }
+    }
+
+    if (deferPeriodicTiling) {
+        image.fTileMode = SkTileMode::kClamp;
+    } else {
+        allowOverscaling = false;
+    }
+
+    float finalScaleX = xSteps > 0 ? (allowOverscaling ? (1.f / (1 << xSteps))
+                                                       : scale.width())
+                                   : 1.f;
+    float finalScaleY = ySteps > 0 ? (allowOverscaling ? (1.f / (1 << ySteps))
+                                                       : scale.height())
+                                   : 1.f;
+
+    do {
+        float sx = 1.f;
+        if (xSteps > 0) {
+            sx = xSteps > 1 ? 0.5f : srcRect.width()*finalScaleX / stepBoundsF.width();
+            xSteps--;
+        }
+
+        float sy = 1.f;
+        if (ySteps > 0) {
+            sy = ySteps > 1 ? 0.5f : srcRect.height()*finalScaleY / stepBoundsF.height();
+            ySteps--;
+        }
+
+        PixelSpace<SkRect> dstBoundsF = scale_about_center(stepBoundsF, sx, sy);
+        const bool finalXStep = xSteps == 0 && sx != 1.f;
+        const bool finalYStep = ySteps == 0 && sy != 1.f;
+        if (deferPeriodicTiling && (finalXStep || finalYStep)) {
+            PixelSpace<SkIRect> dstPixels = dstBoundsF.roundOut();
+            dstBoundsF = PixelSpace<SkRect>({
+                finalXStep ? (float) dstPixels.left()   : dstBoundsF.left(),
+                finalYStep ? (float) dstPixels.top()    : dstBoundsF.top(),
+                finalXStep ? (float) dstPixels.right()  : dstBoundsF.right(),
+                finalYStep ? (float) dstPixels.bottom() : dstBoundsF.bottom()});
+        }
+
+        PixelSpace<SkIRect> dstPixelBounds = dstBoundsF.roundOut();
+
+        PixelBoundary boundary = PixelBoundary::kUnknown;
+        PixelSpace<SkIRect> sampleBounds = dstPixelBounds;
+        if (tileMode == SkTileMode::kDecal) {
+            boundary = PixelBoundary::kTransparent;
+        } else {
+            dstPixelBounds.outset(LayerSpace<SkISize>({1,1}));
+        }
+
+        AutoSurface surface{ctx, dstPixelBounds, boundary, false};
+        if (surface) {
+            const auto scaleXform = PixelSpace<SkMatrix>::RectToRect(stepBoundsF, dstBoundsF);
+
+            analysis = image.analyzeBounds(SkMatrix(scaleXform),
+                                           SkIRect(sampleBounds),
+                                           BoundsScope::kRescale);
+
+            SkPaint paint;
+            paint.setShader(image.getAnalyzedShaderView(ctx, image.sampling(), analysis));
+#if !defined(SK_USE_SRCOVER_FOR_FILTERS)
+            paint.setBlendMode(SkBlendMode::kSrc);
+#endif
+
+            PixelSpace<SkRect> srcSampled;
+            SkAssertResult(scaleXform.inverseMapRect(PixelSpace<SkRect>(sampleBounds),
+                                                     &srcSampled));
+
+            surface->save();
+                surface->concat(SkMatrix(scaleXform));
+                surface->drawRect(SkRect(srcSampled), paint);
+            surface->restore();
+
+            if (cfBorder) {
+                SkASSERT(fColorFilter && as_CFB(fColorFilter)->affectsTransparentBlack());
+                SkASSERT(tileMode == SkTileMode::kClamp);
+
+                draw_color_filtered_border(surface.canvas(), dstPixelBounds, fColorFilter);
+                cfBorder = false;
+            } else if (tileMode != SkTileMode::kDecal) {
+                draw_tiled_border(surface.canvas(), tileMode, paint, scaleXform,
+                                  stepPixelBounds, PixelSpace<SkRect>(dstPixelBounds));
+            }
+        } else {
+            return {};
+        }
+
+        image = surface.snap();
+        image.fTileMode = deferPeriodicTiling ? SkTileMode::kClamp : tileMode;
+
+        stepBoundsF = dstBoundsF;
+        stepPixelBounds = PixelSpace<SkRect>(dstPixelBounds);
+    } while(xSteps > 0 || ySteps > 0);
+
+
+    if (deferPeriodicTiling) {
+        image = image.insetByPixel();
+    } else {
+        SkASSERT(tileMode == SkTileMode::kDecal || tileMode == SkTileMode::kClamp);
+    }
+    image.fTileMode = tileMode;
+    image.fTransform.postConcat(
+            LayerSpace<SkMatrix>::RectToRect(stepBoundsF, LayerSpace<SkRect>{srcRect}));
+    image.fLayerBounds = visibleLayerBounds;
+
+    SkASSERT(!enforceDecal || image.fTileMode == SkTileMode::kDecal);
+    SkASSERT(image.fTileMode != SkTileMode::kDecal ||
+             image.fBoundary == PixelBoundary::kTransparent);
+    SkASSERT(!deferPeriodicTiling || image.fBoundary == PixelBoundary::kInitialized);
+    return image;
+}
+
+FilterResult FilterResult::MakeFromPicture(const Context& ctx,
+                                           sk_sp<SkPicture> pic,
+                                           ParameterSpace<SkRect> cullRect) {
+    SkASSERT(pic);
+    LayerSpace<SkIRect> dstBounds = ctx.mapping().paramToLayer(cullRect).roundOut();
+    if (!dstBounds.intersect(ctx.desiredOutput())) {
+        return {};
+    }
+
+    SkSurfaceProps props = ctx.backend()->surfaceProps()
+                                         .cloneWithPixelGeometry(kUnknown_SkPixelGeometry);
+    AutoSurface surface{ctx, dstBounds, PixelBoundary::kUnknown,
+                        true, &props};
+    if (surface) {
+        surface->clipRect(SkRect(cullRect));
+        surface->drawPicture(std::move(pic));
+    }
+    return surface.snap();
+}
+
+FilterResult FilterResult::MakeFromShader(const Context& ctx,
+                                          sk_sp<SkShader> shader,
+                                          bool dither) {
+    SkASSERT(shader);
+
+    PixelBoundary boundary = dither ? PixelBoundary::kUnknown : PixelBoundary::kTransparent;
+    AutoSurface surface{ctx, ctx.desiredOutput(), boundary, true};
+    if (surface) {
+        SkPaint paint;
+        paint.setShader(shader);
+        paint.setDither(dither);
+#if !defined(SK_USE_SRCOVER_FOR_FILTERS)
+        paint.setBlendMode(SkBlendMode::kSrc);
+#endif
+        surface->drawPaint(paint);
+    }
+    return surface.snap();
+}
+
+FilterResult FilterResult::MakeFromImage(const Context& ctx,
+                                         sk_sp<SkImage> image,
+                                         SkRect srcRect,
+                                         ParameterSpace<SkRect> dstRect,
+                                         const SkSamplingOptions& sampling) {
+    SkASSERT(image);
+
+    SkRect imageBounds = SkRect::Make(image->dimensions());
+    if (!imageBounds.contains(srcRect)) {
+        SkMatrix srcToDst = SkMatrix::RectToRectOrIdentity(srcRect, SkRect(dstRect));
+        if (!srcRect.intersect(imageBounds)) {
+            return {}; 
+        }
+        dstRect = ParameterSpace<SkRect>{srcToDst.mapRect(srcRect)};
+    }
+
+    if (SkRect(dstRect).isEmpty()) {
+        return {}; 
+    }
+
+    SkIRect srcSubset = RoundOut(srcRect);
+    if (SkRect::Make(srcSubset) == srcRect) {
+        sk_sp<SkSpecialImage> specialImage = ctx.backend()->makeImage(srcSubset, std::move(image));
+
+        skif::FilterResult subset{std::move(specialImage),
+                                  skif::LayerSpace<SkIPoint>(srcSubset.topLeft())};
+        SkM44 transform = ctx.mapping().layerMatrix() * SkM44::RectToRect(srcRect, SkRect(dstRect));
+        return subset.applyTransform(ctx, skif::LayerSpace<SkMatrix>(transform.asM33()), sampling);
+    }
+
+    LayerSpace<SkIRect> dstBounds = ctx.mapping().paramToLayer(dstRect).roundOut();
+    if (!dstBounds.intersect(ctx.desiredOutput())) {
+        return {};
+    }
+
+    AutoSurface surface{ctx, dstBounds, PixelBoundary::kTransparent,
+                        true};
+    if (surface) {
+        SkPaint paint;
+        paint.setAntiAlias(true);
+        surface->drawImageRect(std::move(image), srcRect, SkRect(dstRect), sampling, &paint,
+                               SkCanvas::kStrict_SrcRectConstraint);
+    }
+    return surface.snap();
+}
+
+
+FilterResult::Builder::Builder(const Context& context) : fContext(context) {}
+FilterResult::Builder::~Builder() = default;
+
+SkSpan<sk_sp<SkShader>> FilterResult::Builder::createInputShaders(
+        const LayerSpace<SkIRect>& outputBounds,
+        bool evaluateInParameterSpace) {
+    SkEnumBitMask<ShaderFlags> xtraFlags = ShaderFlags::kNone;
+    SkMatrix layerToParam;
+    if (evaluateInParameterSpace) {
+        layerToParam = fContext.mapping().layerMatrix().asM33().invert().value_or(SkMatrix());
+        if (!is_nearly_integer_translation(LayerSpace<SkMatrix>(layerToParam))) {
+            xtraFlags |= ShaderFlags::kNonTrivialSampling;
+        }
+    }
+
+    fInputShaders.reserve(fInputs.size());
+    for (const SampledFilterResult& input : fInputs) {
+        auto sampleBounds = input.fSampleBounds ? *input.fSampleBounds : outputBounds;
+        auto shader = input.fImage.asShader(fContext,
+                                            input.fSampling,
+                                            input.fFlags | xtraFlags,
+                                            sampleBounds);
+        if (evaluateInParameterSpace && shader) {
+            shader = shader->makeWithLocalMatrix(layerToParam);
+        }
+        fInputShaders.push_back(std::move(shader));
+    }
+    return SkSpan<sk_sp<SkShader>>(fInputShaders);
+}
+
+LayerSpace<SkIRect> FilterResult::Builder::outputBounds(
+        std::optional<LayerSpace<SkIRect>> explicitOutput) const {
+    LayerSpace<SkIRect> output = fContext.desiredOutput();
+    if (explicitOutput.has_value()) {
+        if (!output.intersect(*explicitOutput)) {
+            return LayerSpace<SkIRect>::Empty();
+        }
+    }
+    return output;
+}
+
+FilterResult FilterResult::Builder::drawShader(sk_sp<SkShader> shader,
+                                               const LayerSpace<SkIRect>& outputBounds,
+                                               bool evaluateInParameterSpace) const {
+    SkASSERT(!outputBounds.isEmpty()); 
+    if (!shader) {
+        return {};
+    }
+
+    AutoSurface surface{fContext, outputBounds, PixelBoundary::kTransparent,
+                        evaluateInParameterSpace};
+    if (surface) {
+        SkPaint paint;
+        paint.setShader(std::move(shader));
+#if !defined(SK_USE_SRCOVER_FOR_FILTERS)
+        paint.setBlendMode(SkBlendMode::kSrc);
+#endif
+        surface->drawPaint(paint);
+    }
+    return surface.snap();
+}
+
+FilterResult FilterResult::Builder::merge() {
+    SkASSERT(!fInputs.empty());
+    if (fInputs.size() == 1) {
+        SkASSERT(!fInputs[0].fSampleBounds.has_value() &&
+                 fInputs[0].fSampling == kDefaultSampling &&
+                 fInputs[0].fFlags == ShaderFlags::kNone);
+        return fInputs[0].fImage;
+    }
+
+    const auto mergedBounds = LayerSpace<SkIRect>::Union(
+            (int) fInputs.size(),
+            [this](int i) { return fInputs[i].fImage.layerBounds(); });
+    const auto outputBounds = this->outputBounds(mergedBounds);
+
+    AutoSurface surface{fContext, outputBounds, PixelBoundary::kTransparent,
+                        false};
+    if (surface) {
+        for (const SampledFilterResult& input : fInputs) {
+            SkASSERT(!input.fSampleBounds.has_value() &&
+                     input.fSampling == kDefaultSampling &&
+                     input.fFlags == ShaderFlags::kNone);
+            input.fImage.draw(fContext, surface.device(), true);
+        }
+    }
+    return surface.snap();
+}
+
+FilterResult FilterResult::Builder::blur(const LayerSpace<SkSize>& sigma) {
+    SkASSERT(fInputs.size() == 1);
+
+    const SkBlurEngine* blurEngine = fContext.backend()->getBlurEngine();
+    SkASSERT(blurEngine);
+
+    const SkBlurEngine::Algorithm* algorithm = blurEngine->findAlgorithm(
+            SkSize(sigma), fContext.backend()->colorType());
+    if (!algorithm) {
+        return {};
+    }
+
+    LayerSpace<SkISize> radii =
+            LayerSpace<SkSize>({3.f*sigma.width(), 3.f*sigma.height()}).ceil();
+    auto maxOutput = fInputs[0].fImage.layerBounds();
+    maxOutput.outset(radii);
+
+    auto outputBounds = this->outputBounds(maxOutput);
+    if (outputBounds.isEmpty()) {
+        return {};
+    }
+
+    auto sampleBounds = outputBounds;
+    sampleBounds.outset(radii);
+
+    float sx = sigma.width()  > algorithm->maxSigma() ? algorithm->maxSigma()/sigma.width()  : 1.f;
+    float sy = sigma.height() > algorithm->maxSigma() ? algorithm->maxSigma()/sigma.height() : 1.f;
+    FilterResult lowResImage = fInputs[0].fImage.rescale(
+            fContext.withNewDesiredOutput(sampleBounds),
+            LayerSpace<SkSize>({sx, sy}),
+            algorithm->supportsOnlyDecalTiling(),
+            true);
+    if (!lowResImage) {
+        return {};
+    }
+    SkASSERT(lowResImage.tileMode() == SkTileMode::kDecal ||
+             !algorithm->supportsOnlyDecalTiling());
+
+    const float invScaleX = sk_ieee_float_divide(1.f, lowResImage.fTransform.rc(0,0));
+    const float invScaleY = sk_ieee_float_divide(1.f, lowResImage.fTransform.rc(1,1));
+    PixelSpace<SkSize> lowResSigma{{std::min(sigma.width() * invScaleX, algorithm->maxSigma()),
+                                    std::min(sigma.height()* invScaleY, algorithm->maxSigma())}};
+    PixelSpace<SkIRect> lowResMaxOutput{SkISize{lowResImage.fImage->width(),
+                                                lowResImage.fImage->height()}};
+
+    PixelSpace<SkIRect> srcRelativeOutput;
+    if (lowResImage.tileMode() == SkTileMode::kRepeat ||
+        lowResImage.tileMode() == SkTileMode::kMirror) {
+        srcRelativeOutput = lowResMaxOutput;
+    } else {
+        SkAssertResult(lowResImage.fTransform.inverseMapRect(outputBounds, &srcRelativeOutput));
+
+        lowResMaxOutput.outset(PixelSpace<SkSize>({3.f * lowResSigma.width(),
+                                                   3.f * lowResSigma.height()}).ceil());
+        srcRelativeOutput = lowResMaxOutput.relevantSubset(srcRelativeOutput,
+                                                           lowResImage.tileMode());
+
+        if (srcRelativeOutput.isEmpty()) {
+            return {};
+        }
+
+        srcRelativeOutput.outset(PixelSpace<SkISize>({1, 1}));
+    }
+
+    sk_sp<SkSpecialImage> lowResBlur = lowResImage.refImage();
+    SkIRect blurOutputBounds = SkIRect(srcRelativeOutput);
+    SkTileMode tileMode = lowResImage.tileMode();
+    if (!algorithm->supportsOnlyDecalTiling() &&
+        lowResImage.canClampToTransparentBoundary(BoundsAnalysis::kSimple)) {
+        lowResBlur = lowResBlur->makePixelOutset();
+        blurOutputBounds.offset(1, 1);
+        tileMode = SkTileMode::kClamp;
+    }
+
+    lowResBlur = algorithm->blur(SkSize(lowResSigma),
+                                 lowResBlur,
+                                 SkIRect::MakeSize(lowResBlur->dimensions()),
+                                 tileMode,
+                                 blurOutputBounds);
+    if (!lowResBlur) {
+        return {};
+    }
+
+    FilterResult result{std::move(lowResBlur), srcRelativeOutput.topLeft()};
+    if (lowResImage.tileMode() == SkTileMode::kClamp ||
+        lowResImage.tileMode() == SkTileMode::kDecal) {
+        result = result.insetByPixel();
+    }
+
+    result.fTransform.postConcat(lowResImage.fTransform);
+    if (lowResImage.tileMode() == SkTileMode::kDecal) {
+        outputBounds = this->outputBounds(
+                result.fTransform.mapRect(LayerSpace<SkIRect>(result.fImage->dimensions())));
+    }
+    result.fLayerBounds = outputBounds;
+    result.fTileMode = lowResImage.tileMode();
+    return result;
+}
+
+} 

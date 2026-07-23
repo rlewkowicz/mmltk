@@ -1,0 +1,106 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_MEDIACONTROL_MEDIACONTROLSERVICE_H_
+#define DOM_MEDIA_MEDIACONTROL_MEDIACONTROLSERVICE_H_
+
+#include "AudioFocusManager.h"
+#include "MediaControlKeyManager.h"
+#include "MediaController.h"
+#include "mozilla/dom/MediaControllerBinding.h"
+#include "nsIObserver.h"
+#include "nsTArray.h"
+
+namespace mozilla::dom {
+
+class MediaControlService final : public nsIObserver {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  static RefPtr<MediaControlService> GetService();
+
+  AudioFocusManager& GetAudioFocusManager() { return mAudioFocusManager; }
+  MediaControlKeySource* GetMediaControlKeySource() {
+    return mMediaControlKeyManager;
+  }
+
+  bool RegisterActiveMediaController(MediaController* aController);
+  bool UnregisterActiveMediaController(MediaController* aController);
+  uint64_t GetActiveControllersNum() const;
+
+  void NotifyControllerPlaybackStateChanged(MediaController* aController);
+
+  void RequestUpdateMainController(MediaController* aController);
+
+  MediaController* GetMainController() const;
+
+  nsString GetFallbackTitle() const;
+
+ private:
+  MediaControlService();
+  ~MediaControlService();
+
+  class ControllerManager final {
+   public:
+    explicit ControllerManager(MediaControlService* aService);
+    ~ControllerManager() = default;
+
+    using MediaKeysArray = nsTArray<MediaControlKey>;
+    using LinkedListControllerPtr = LinkedListElement<RefPtr<MediaController>>*;
+    using ConstLinkedListControllerPtr =
+        const LinkedListElement<RefPtr<MediaController>>*;
+
+    bool AddController(MediaController* aController);
+    bool RemoveController(MediaController* aController);
+    void UpdateMainControllerIfNeeded(MediaController* aController);
+
+    void Shutdown();
+
+    MediaController* GetMainController() const;
+    bool Contains(MediaController* aController) const;
+    uint64_t GetControllersNum() const;
+
+    void MainControllerPlaybackStateChanged(MediaSessionPlaybackState aState);
+    void MainControllerMetadataChanged(const MediaMetadataBase& aMetadata);
+
+   private:
+    enum class InsertOptions {
+      eInsertAsMainController,
+      eInsertAsNormalController,
+    };
+
+    void ReorderGivenController(MediaController* aController,
+                                InsertOptions aOption);
+
+    void UpdateMainControllerInternal(MediaController* aController);
+    void ConnectMainControllerEvents();
+    void DisconnectMainControllerEvents();
+
+    LinkedList<RefPtr<MediaController>> mControllers;
+    RefPtr<MediaController> mMainController;
+
+    RefPtr<MediaControlKeySource> mSource;
+    MediaEventListener mMetadataChangedListener;
+    MediaEventListener mSupportedKeysChangedListener;
+    MediaEventListener mFullScreenChangedListener;
+    MediaEventListener mPositionChangedListener;
+  };
+
+  void Init();
+  void Shutdown();
+
+  AudioFocusManager mAudioFocusManager;
+  RefPtr<MediaControlKeyManager> mMediaControlKeyManager;
+  RefPtr<MediaControlKeyListener> mMediaKeysHandler;
+  MediaEventProducer<uint64_t> mMediaControllerAmountChangedEvent;
+  UniquePtr<ControllerManager> mControllerManager;
+  nsString mFallbackTitle;
+
+  void UpdateTelemetryUsageProbe();
+};
+
+}  
+
+#endif

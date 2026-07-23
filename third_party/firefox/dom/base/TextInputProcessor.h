@@ -1,0 +1,181 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_textinputprocessor_h_
+#define mozilla_dom_textinputprocessor_h_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/BasicEvents.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/TextEventDispatcher.h"
+#include "mozilla/TextEventDispatcherListener.h"
+#include "nsITextInputProcessor.h"
+#include "nsITextInputProcessorCallback.h"
+#include "nsTArray.h"
+
+class nsPIDOMWindowInner;
+
+namespace mozilla {
+
+namespace dom {
+class KeyboardEvent;
+}  
+
+class TextInputProcessor final : public nsITextInputProcessor,
+                                 public widget::TextEventDispatcherListener {
+  using IMENotification = mozilla::widget::IMENotification;
+  using IMENotificationRequest = mozilla::widget::IMENotificationRequest;
+  using IMENotificationRequests = mozilla::widget::IMENotificationRequests;
+  using TextEventDispatcher = mozilla::widget::TextEventDispatcher;
+
+ public:
+  TextInputProcessor();
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSITEXTINPUTPROCESSOR
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHOD
+  NotifyIME(TextEventDispatcher* aTextEventDispatcher,
+            const IMENotification& aNotification) override;
+
+  NS_IMETHOD_(IMENotificationRequests) GetIMENotificationRequests() override;
+
+  NS_IMETHOD_(void)
+  OnRemovedFrom(TextEventDispatcher* aTextEventDispatcher) override;
+
+  NS_IMETHOD_(void)
+  WillDispatchKeyboardEvent(TextEventDispatcher* aTextEventDispatcher,
+                            WidgetKeyboardEvent& aKeyboardEvent,
+                            uint32_t aIndexOfKeypress, void* aData) override;
+
+  Modifiers GetActiveModifiers() const {
+    return mModifierKeyDataArray ? mModifierKeyDataArray->GetActiveModifiers()
+                                 : MODIFIER_NONE;
+  }
+
+  MOZ_CAN_RUN_SCRIPT nsresult Keydown(const WidgetKeyboardEvent& aKeyboardEvent,
+                                      uint32_t aKeyFlags,
+                                      uint32_t* aConsumedFlags = nullptr);
+  nsresult Keyup(const WidgetKeyboardEvent& aKeyboardEvent, uint32_t aKeyFlags,
+                 bool* aDoDefault = nullptr);
+
+  static CodeNameIndex GuessCodeNameIndexOfPrintableKeyInUSEnglishLayout(
+      const nsAString& aKeyValue, const Maybe<uint32_t>& aLocation);
+
+  static uint32_t GuessKeyCodeOfPrintableKeyInUSEnglishLayout(
+      const nsAString& aKeyValue, const Maybe<uint32_t>& aLocation);
+
+ protected:
+  virtual ~TextInputProcessor();
+
+ private:
+  bool IsComposing() const;
+  MOZ_CAN_RUN_SCRIPT nsresult BeginInputTransactionInternal(
+      mozIDOMWindow* aWindow, nsITextInputProcessorCallback* aCallback,
+      bool aForTests, bool& aSucceeded);
+  MOZ_CAN_RUN_SCRIPT nsresult CommitCompositionInternal(
+      const WidgetKeyboardEvent* aKeyboardEvent = nullptr,
+      uint32_t aKeyFlags = 0, const nsAString* aCommitString = nullptr,
+      bool* aSucceeded = nullptr);
+  MOZ_CAN_RUN_SCRIPT nsresult
+  CancelCompositionInternal(const WidgetKeyboardEvent* aKeyboardEvent = nullptr,
+                            uint32_t aKeyFlags = 0);
+  MOZ_CAN_RUN_SCRIPT nsresult
+  KeydownInternal(const WidgetKeyboardEvent& aKeyboardEvent, uint32_t aKeyFlags,
+                  bool aAllowToDispatchKeypress, uint32_t& aConsumedFlags);
+  nsresult KeyupInternal(const WidgetKeyboardEvent& aKeyboardEvent,
+                         uint32_t aKeyFlags, bool& aDoDefault);
+  nsresult IsValidStateForComposition();
+  void UnlinkFromTextEventDispatcher();
+  nsresult PrepareKeyboardEventToDispatch(WidgetKeyboardEvent& aKeyboardEvent,
+                                          uint32_t aKeyFlags);
+  MOZ_CAN_RUN_SCRIPT nsresult
+  InitEditCommands(WidgetKeyboardEvent& aKeyboardEvent) const;
+
+  bool IsValidEventTypeForComposition(
+      const WidgetKeyboardEvent& aKeyboardEvent) const;
+  nsresult PrepareKeyboardEventForComposition(
+      dom::KeyboardEvent* aDOMKeyEvent, uint32_t& aKeyFlags,
+      uint8_t aOptionalArgc, WidgetKeyboardEvent*& aKeyboardEvent);
+
+  struct EventDispatcherResult {
+    nsresult mResult;
+    bool mDoDefault;
+    bool mCanContinue;
+
+    EventDispatcherResult()
+        : mResult(NS_OK), mDoDefault(true), mCanContinue(true) {}
+  };
+  MOZ_CAN_RUN_SCRIPT EventDispatcherResult MaybeDispatchKeydownForComposition(
+      const WidgetKeyboardEvent* aKeyboardEvent, uint32_t aKeyFlags);
+  EventDispatcherResult MaybeDispatchKeyupForComposition(
+      const WidgetKeyboardEvent* aKeyboardEvent, uint32_t aKeyFlags);
+
+  class MOZ_STACK_CLASS AutoPendingCompositionResetter {
+   public:
+    explicit AutoPendingCompositionResetter(TextInputProcessor* aTIP);
+    ~AutoPendingCompositionResetter();
+
+   private:
+    RefPtr<TextInputProcessor> mTIP;
+  };
+
+  struct ModifierKeyData {
+    KeyNameIndex mKeyNameIndex;
+    CodeNameIndex mCodeNameIndex;
+    Modifiers mModifier;
+
+    explicit ModifierKeyData(const WidgetKeyboardEvent& aKeyboardEvent);
+
+    bool operator==(const ModifierKeyData& aOther) const {
+      return mKeyNameIndex == aOther.mKeyNameIndex &&
+             mCodeNameIndex == aOther.mCodeNameIndex;
+    }
+  };
+
+  class ModifierKeyDataArray : public nsTArray<ModifierKeyData> {
+    NS_INLINE_DECL_REFCOUNTING(ModifierKeyDataArray)
+
+   public:
+    Modifiers GetActiveModifiers() const;
+    void ActivateModifierKey(const ModifierKeyData& aModifierKeyData);
+    void InactivateModifierKey(const ModifierKeyData& aModifierKeyData);
+    void ToggleModifierKey(const ModifierKeyData& aModifierKeyData);
+
+   private:
+    virtual ~ModifierKeyDataArray() = default;
+  };
+
+  void EnsureModifierKeyDataArray() {
+    if (mModifierKeyDataArray) {
+      return;
+    }
+    mModifierKeyDataArray = new ModifierKeyDataArray();
+  }
+  void ActivateModifierKey(const ModifierKeyData& aModifierKeyData) {
+    EnsureModifierKeyDataArray();
+    mModifierKeyDataArray->ActivateModifierKey(aModifierKeyData);
+  }
+  void InactivateModifierKey(const ModifierKeyData& aModifierKeyData) {
+    if (!mModifierKeyDataArray) {
+      return;
+    }
+    mModifierKeyDataArray->InactivateModifierKey(aModifierKeyData);
+  }
+  void ToggleModifierKey(const ModifierKeyData& aModifierKeyData) {
+    EnsureModifierKeyDataArray();
+    mModifierKeyDataArray->ToggleModifierKey(aModifierKeyData);
+  }
+
+  TextEventDispatcher* mDispatcher;  
+  nsCOMPtr<nsITextInputProcessorCallback> mCallback;
+  RefPtr<ModifierKeyDataArray> mModifierKeyDataArray;
+
+  bool mForTests;
+};
+
+}  
+
+#endif  // #ifndef mozilla_dom_textinputprocessor_h_

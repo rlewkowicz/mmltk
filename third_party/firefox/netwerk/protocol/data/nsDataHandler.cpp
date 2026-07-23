@@ -1,0 +1,221 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsDataChannel.h"
+#include "nsDataHandler.h"
+#include "nsNetCID.h"
+#include "nsError.h"
+#include "nsIOService.h"
+#include "nsNetUtil.h"
+#include "nsSimpleURI.h"
+#include "nsUnicharUtils.h"
+#include "mozilla/dom/MimeType.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/Try.h"
+#include "DefaultURI.h"
+
+using namespace mozilla;
+
+
+NS_IMPL_ISUPPORTS(nsDataHandler, nsIProtocolHandler, nsISupportsWeakReference)
+
+nsresult nsDataHandler::Create(const nsIID& aIID, void** aResult) {
+  RefPtr<nsDataHandler> ph = new nsDataHandler();
+  return ph->QueryInterface(aIID, aResult);
+}
+
+
+NS_IMETHODIMP
+nsDataHandler::GetScheme(nsACString& result) {
+  result.AssignLiteral("data");
+  return NS_OK;
+}
+
+ nsresult nsDataHandler::CreateNewURI(const nsACString& aSpec,
+                                                  const char* aCharset,
+                                                  nsIURI* aBaseURI,
+                                                  nsIURI** result) {
+  nsCOMPtr<nsIURI> uri;
+  nsAutoCString contentType;
+  bool base64;
+  MOZ_TRY(ParseURI(aSpec, contentType,  nullptr, base64,
+                    nullptr));
+
+  nsresult rv;
+  if (base64) {
+    rv = NS_MutateURI(new mozilla::net::nsSimpleURI::Mutator())
+             .Apply(&nsISimpleURIMutator::SetSpecAndFilterWhitespace, aSpec,
+                    nullptr)
+             .Finalize(uri);
+  } else {
+    rv = NS_MutateURI(new mozilla::net::nsSimpleURI::Mutator())
+             .SetSpec(aSpec)
+             .Finalize(uri);
+  }
+
+  if (NS_FAILED(rv)) return rv;
+
+  auto pos = aSpec.Find("data:");
+  if (pos != kNotFound) {
+    nsDependentCSubstring rest(aSpec, pos + sizeof("data:") - 1, -1);
+    if (StringBeginsWith(rest, "//"_ns)) {
+      nsCOMPtr<nsIURI> uriWithHost;
+      rv = NS_MutateURI(new mozilla::net::DefaultURI::Mutator())
+               .SetSpec(aSpec)
+               .Finalize(uriWithHost);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+  }
+
+  uri.forget(result);
+  return rv;
+}
+
+NS_IMETHODIMP
+nsDataHandler::NewChannel(nsIURI* uri, nsILoadInfo* aLoadInfo,
+                          nsIChannel** result) {
+  NS_ENSURE_ARG_POINTER(uri);
+  RefPtr<nsDataChannel> channel = new nsDataChannel(uri);
+
+  nsresult rv = channel->SetLoadInfo(aLoadInfo);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = channel->Init();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  *result = channel.forget().downcast<nsBaseChannel>().take();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsDataHandler::AllowPort(int32_t port, const char* scheme, bool* _retval) {
+  *_retval = false;
+  return NS_OK;
+}
+
+namespace {
+
+bool TrimSpacesAndBase64(nsACString& aMimeType) {
+  const char* beg = aMimeType.BeginReading();
+  const char* end = aMimeType.EndReading();
+
+  while (beg < end && NS_IsHTTPWhitespace(*beg)) {
+    ++beg;
+  }
+  if (beg == end) {
+    aMimeType.Truncate();
+    return false;
+  }
+  while (end > beg && NS_IsHTTPWhitespace(*(end - 1))) {
+    --end;
+  }
+  if (beg == end) {
+    aMimeType.Truncate();
+    return false;
+  }
+
+  const char* pos = end - 1;
+  bool foundBase64 = false;
+  if (pos > beg && *pos == '4' && --pos > beg && *pos == '6' && --pos > beg &&
+      ToLowerCaseASCII(*pos) == 'e' && --pos > beg &&
+      ToLowerCaseASCII(*pos) == 's' && --pos > beg &&
+      ToLowerCaseASCII(*pos) == 'a' && --pos > beg &&
+      ToLowerCaseASCII(*pos) == 'b') {
+    while (--pos > beg && NS_IsHTTPWhitespace(*pos)) {
+    }
+    if (pos >= beg && *pos == ';') {
+      end = pos;
+      foundBase64 = true;
+    }
+  }
+
+  const char* s = aMimeType.BeginReading();
+  aMimeType.Assign(Substring(aMimeType, beg - s, end - s));
+  return foundBase64;
+}
+
+}  
+
+static nsresult ParsePathWithoutRef(const nsACString& aPath,
+                                    nsCString& aContentType,
+                                    nsCString* aContentCharset, bool& aIsBase64,
+                                    nsDependentCSubstring* aDataBuffer,
+                                    RefPtr<CMimeType>* aMimeType) {
+  static constexpr auto kCharset = "charset"_ns;
+
+
+  aIsBase64 = false;
+
+  int32_t commaIdx = aPath.FindChar(',');
+
+  if (aContentCharset && commaIdx == kNotFound) {
+    return NS_ERROR_MALFORMED_URI;
+  }
+
+  nsCString mimeType(Substring(aPath, 0, commaIdx));
+
+  aIsBase64 = TrimSpacesAndBase64(mimeType);
+
+  if (mimeType.Length() > 0 && mimeType.CharAt(0) == ';') {
+    mimeType = "text/plain"_ns + mimeType;
+  }
+
+  if (RefPtr<CMimeType> parsed = CMimeType::Parse(mimeType)) {
+    parsed->GetEssence(aContentType);
+    if (aContentCharset) {
+      parsed->GetParameterValue(kCharset, *aContentCharset);
+    }
+    if (aMimeType) {
+      *aMimeType = std::move(parsed);
+    }
+  } else {
+    aContentType.AssignLiteral("text/plain");
+    if (aContentCharset) {
+      aContentCharset->AssignLiteral("US-ASCII");
+    }
+    if (aMimeType) {
+      *aMimeType = new CMimeType("text"_ns, "plain"_ns);
+      (*aMimeType)->SetParameterValue("charset"_ns, "US-ASCII"_ns);
+    }
+  }
+
+  if (aDataBuffer) {
+    aDataBuffer->Rebind(aPath, commaIdx + 1);
+  }
+
+  return NS_OK;
+}
+
+static inline char ToLower(const char c) {
+  if (c >= 'A' && c <= 'Z') {
+    return char(c + ('a' - 'A'));
+  }
+  return c;
+}
+
+nsresult nsDataHandler::ParseURI(const nsACString& aSpec,
+                                 nsCString& aContentType,
+                                 nsCString* aContentCharset, bool& aIsBase64,
+                                 nsDependentCSubstring* aDataBuffer,
+                                 RefPtr<CMimeType>* aMimeType) {
+  static constexpr auto kDataScheme = "data:"_ns;
+
+  const char* pos = std::search(
+      aSpec.BeginReading(), aSpec.EndReading(), kDataScheme.BeginReading(),
+      kDataScheme.EndReading(),
+      [](const char a, const char b) { return ToLower(a) == ToLower(b); });
+  if (pos == aSpec.EndReading()) {
+    return NS_ERROR_MALFORMED_URI;
+  }
+
+  uint32_t scheme = pos - aSpec.BeginReading();
+  scheme += kDataScheme.Length();
+
+  int32_t hash = aSpec.FindChar('#', scheme);
+
+  auto pathWithoutRef =
+      Substring(aSpec, scheme, hash != kNotFound ? hash - scheme : -1);
+  return ParsePathWithoutRef(pathWithoutRef, aContentType, aContentCharset,
+                             aIsBase64, aDataBuffer, aMimeType);
+}

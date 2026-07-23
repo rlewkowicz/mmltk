@@ -1,0 +1,689 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsHtml5Parser.h"
+
+#include "ErrorList.h"
+#include "encoding_rs_statics.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/UniquePtr.h"
+#include "nsCRT.h"
+#include "nsContentUtils.h"  // for kLoadAsData
+#include "nsHtml5AtomTable.h"
+#include "nsHtml5DependentUTF16Buffer.h"
+#include "nsHtml5Tokenizer.h"
+#include "nsHtml5TreeBuilder.h"
+#include "nsNetUtil.h"
+
+using namespace mozilla;
+
+NS_INTERFACE_TABLE_HEAD(nsHtml5Parser)
+  NS_INTERFACE_TABLE(nsHtml5Parser, nsIParser, nsISupportsWeakReference,
+                     nsIStreamListener)
+  NS_INTERFACE_TABLE_TO_MAP_SEGUE_CYCLE_COLLECTION(nsHtml5Parser)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(nsHtml5Parser)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(nsHtml5Parser)
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(nsHtml5Parser)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsHtml5Parser)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mExecutor)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_RAWPTR(GetStreamParser())
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsHtml5Parser)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mExecutor)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_REFERENCE
+  tmp->DropStreamParser();
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+nsHtml5Parser::nsHtml5Parser()
+    : mAboutBlankMode(false),
+      mLastWasCR(false),
+      mDocWriteSpeculativeLastWasCR(false),
+      mBlocked(0),
+      mDocWriteSpeculatorActive(false),
+      mScriptNestingLevel(0),
+      mTerminationStarted(false),
+      mDocumentClosed(false),
+      mInDocumentWrite(false),
+      mInsertionPointPermanentlyUndefined(false),
+      mFirstBuffer(new nsHtml5OwningUTF16Buffer((void*)nullptr)),
+      mLastBuffer(mFirstBuffer),
+      mExecutor(new nsHtml5TreeOpExecutor()),
+      mTreeBuilder(new nsHtml5TreeBuilder(mExecutor, nullptr, false)),
+      mTokenizer(new nsHtml5Tokenizer(mTreeBuilder.get(), false)),
+      mRootContextLineNumber(1),
+      mReturnToStreamParserPermitted(false) {
+  mTokenizer->setInterner(&mAtomTable);
+}
+
+nsHtml5Parser::~nsHtml5Parser() {
+  mTokenizer->end();
+  if (mDocWriteSpeculativeTokenizer) {
+    mDocWriteSpeculativeTokenizer->end();
+  }
+}
+
+NS_IMETHODIMP_(void)
+nsHtml5Parser::SetContentSink(nsIContentSink* aSink) {
+  NS_ASSERTION(aSink == static_cast<nsIContentSink*>(mExecutor),
+               "Attempt to set a foreign sink.");
+}
+
+NS_IMETHODIMP_(nsIContentSink*)
+nsHtml5Parser::GetContentSink() {
+  return static_cast<nsIContentSink*>(mExecutor);
+}
+
+NS_IMETHODIMP_(void)
+nsHtml5Parser::GetCommand(nsCString& aCommand) {
+  aCommand.AssignLiteral("view");
+}
+
+NS_IMETHODIMP_(void)
+nsHtml5Parser::SetCommand(const char* aCommand) {
+  NS_ASSERTION(!strcmp(aCommand, "view") || !strcmp(aCommand, "view-source") ||
+                   !strcmp(aCommand, "external-resource") ||
+                   !strcmp(aCommand, "import") ||
+                   !strcmp(aCommand, kLoadAsData),
+               "Unsupported parser command");
+}
+
+NS_IMETHODIMP_(void)
+nsHtml5Parser::SetCommand(eParserCommands aParserCommand) {
+  NS_ASSERTION(aParserCommand == eViewNormal,
+               "Parser command was not eViewNormal.");
+}
+
+void nsHtml5Parser::SetDocumentCharset(NotNull<const Encoding*> aEncoding,
+                                       int32_t aCharsetSource,
+                                       bool aForceAutoDetection) {
+  MOZ_ASSERT(!mExecutor->HasStarted(), "Document charset set too late.");
+  if (mAboutBlankMode) {
+    MOZ_ASSERT(aEncoding == UTF_8_ENCODING);
+  } else {
+    MOZ_ASSERT(GetStreamParser(), "Setting charset on a script-only parser.");
+    GetStreamParser()->SetDocumentCharset(
+        aEncoding, (nsCharsetSource)aCharsetSource, aForceAutoDetection);
+  }
+  mExecutor->SetDocumentCharsetAndSource(aEncoding,
+                                         (nsCharsetSource)aCharsetSource);
+}
+
+nsresult nsHtml5Parser::GetChannel(nsIChannel** aChannel) {
+  if (GetStreamParser()) {
+    return GetStreamParser()->GetChannel(aChannel);
+  }
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+nsIStreamListener* nsHtml5Parser::GetStreamListener() {
+  if (mAboutBlankMode) {
+    return this;
+  }
+  return mStreamListener;
+}
+
+NS_IMETHODIMP
+nsHtml5Parser::ContinueInterruptedParsing() {
+  MOZ_ASSERT_UNREACHABLE("Don't call. For interface compat only.");
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP_(void)
+nsHtml5Parser::BlockParser() {
+  MOZ_ASSERT(!mAboutBlankMode, "Must not block about:blank");
+  mBlocked++;
+}
+
+NS_IMETHODIMP_(void)
+nsHtml5Parser::UnblockParser() {
+  MOZ_ASSERT(!mAboutBlankMode, "Must not unblock about:blank");
+  MOZ_DIAGNOSTIC_ASSERT(mBlocked > 0);
+  if (MOZ_LIKELY(mBlocked > 0)) {
+    mBlocked--;
+  }
+  if (MOZ_LIKELY(mBlocked == 0) && mExecutor) {
+    mExecutor->ContinueInterruptedParsingAsync();
+  }
+}
+
+NS_IMETHODIMP_(void)
+nsHtml5Parser::ContinueInterruptedParsingAsync() {
+  if (mExecutor) {
+    mExecutor->ContinueInterruptedParsingAsync();
+  }
+}
+
+NS_IMETHODIMP_(bool)
+nsHtml5Parser::IsParserEnabled() { return !mBlocked; }
+
+NS_IMETHODIMP_(bool)
+nsHtml5Parser::IsParserClosed() { return mDocumentClosed; }
+
+NS_IMETHODIMP_(bool)
+nsHtml5Parser::IsComplete() { return mExecutor->IsComplete(); }
+
+NS_IMETHODIMP
+nsHtml5Parser::Parse(nsIURI* aURL) {
+  MOZ_ASSERT(!mExecutor->HasStarted(),
+             "Tried to start parse without initializing the parser.");
+  if (!mAboutBlankMode) {
+    MOZ_ASSERT(GetStreamParser(),
+               "Can't call this Parse() variant on script-created parser");
+
+    GetStreamParser()->SetViewSourceTitle(
+        aURL);  
+    mExecutor->SetStreamParser(GetStreamParser());
+  }
+  mExecutor->SetParser(this);
+  return NS_OK;
+}
+
+nsresult nsHtml5Parser::Parse(const nsAString& aSourceBuffer, void* aKey,
+                              bool aLastCall) {
+  nsresult rv;
+  if (NS_FAILED(rv = mExecutor->IsBroken())) {
+    return rv;
+  }
+  if (aSourceBuffer.Length() > INT32_MAX) {
+    return mExecutor->MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+  }
+
+  nsCOMPtr<nsIParser> kungFuDeathGrip(this);
+
+  RefPtr<nsHtml5StreamParser> streamKungFuDeathGrip(GetStreamParser());
+  (void)streamKungFuDeathGrip;  
+  RefPtr<nsHtml5TreeOpExecutor> executor(mExecutor);
+
+  MOZ_RELEASE_ASSERT(executor->HasStarted());
+
+  if (executor->IsComplete()) {
+    return NS_OK;
+  }
+
+  if (aLastCall && aSourceBuffer.IsEmpty() && !aKey) {
+    NS_ASSERTION(!GetStreamParser(),
+                 "Had stream parser but got document.close().");
+    if (mDocumentClosed) {
+      return NS_OK;
+    }
+    mDocumentClosed = true;
+    if (!mBlocked && !mInDocumentWrite && !executor->IsFlushing()) {
+      return ParseUntilBlocked();
+    }
+    return NS_OK;
+  }
+
+
+  MOZ_RELEASE_ASSERT(
+      IsInsertionPointDefined(),
+      "Doc.write reached parser with undefined insertion point.");
+
+  MOZ_RELEASE_ASSERT(!(GetStreamParser() && !aKey),
+                     "Got a null key in a non-script-created parser");
+
+  if (aSourceBuffer.IsEmpty()) {
+    return NS_OK;
+  }
+
+  mozilla::AutoRestore<bool> guard(mInDocumentWrite);
+  mInDocumentWrite = true;
+
+
+  RefPtr<nsHtml5OwningUTF16Buffer> prevSearchBuf;
+  RefPtr<nsHtml5OwningUTF16Buffer> firstLevelMarker;
+
+  if (aKey) {
+    if (mFirstBuffer == mLastBuffer) {
+      nsHtml5OwningUTF16Buffer* keyHolder = new nsHtml5OwningUTF16Buffer(aKey);
+      keyHolder->next = mLastBuffer;
+      mFirstBuffer = keyHolder;
+    } else if (mFirstBuffer->key != aKey) {
+      prevSearchBuf = mFirstBuffer;
+      for (;;) {
+        if (prevSearchBuf->next == mLastBuffer) {
+          nsHtml5OwningUTF16Buffer* keyHolder =
+              new nsHtml5OwningUTF16Buffer(aKey);
+          keyHolder->next = mFirstBuffer;
+          mFirstBuffer = keyHolder;
+          prevSearchBuf = nullptr;
+          break;
+        }
+        if (prevSearchBuf->next->key == aKey) {
+          break;
+        }
+        prevSearchBuf = prevSearchBuf->next;
+      }
+    }  
+
+  } else {
+    mLastBuffer->next = new nsHtml5OwningUTF16Buffer((void*)nullptr);
+    firstLevelMarker = mLastBuffer;
+    mLastBuffer = mLastBuffer->next;
+  }
+
+  nsHtml5DependentUTF16Buffer stackBuffer(aSourceBuffer);
+
+  while (!mBlocked && stackBuffer.hasMore()) {
+    stackBuffer.adjust(mLastWasCR);
+    mLastWasCR = false;
+    if (stackBuffer.hasMore()) {
+      int32_t lineNumberSave;
+      bool inRootContext = (!GetStreamParser() && !aKey);
+      if (inRootContext) {
+        mTokenizer->setLineNumber(mRootContextLineNumber);
+      } else {
+        lineNumberSave = mTokenizer->getLineNumber();
+      }
+
+      if (!mTokenizer->EnsureBufferSpace(stackBuffer.getLength())) {
+        return executor->MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+      }
+      mLastWasCR = mTokenizer->tokenizeBuffer(&stackBuffer);
+      if (NS_FAILED((rv = mTreeBuilder->IsBroken()))) {
+        return executor->MarkAsBroken(rv);
+      }
+
+      if (inRootContext) {
+        mRootContextLineNumber = mTokenizer->getLineNumber();
+      } else {
+        mTokenizer->setLineNumber(lineNumberSave);
+      }
+
+      if (mTreeBuilder->HasScriptThatMayDocumentWriteOrBlock()) {
+        auto r = mTreeBuilder->Flush();  
+        if (r.isErr()) {
+          return executor->MarkAsBroken(r.unwrapErr());
+        }
+        rv = executor->FlushDocumentWrite();  
+        NS_ENSURE_SUCCESS(rv, rv);
+        if (executor->IsComplete()) {
+          return NS_OK;
+        }
+      }
+    }
+  }
+
+  RefPtr<nsHtml5OwningUTF16Buffer> heapBuffer;
+  if (stackBuffer.hasMore()) {
+    heapBuffer = stackBuffer.FalliblyCopyAsOwningBuffer();
+    if (!heapBuffer) {
+      return executor->MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+    }
+  }
+
+  if (heapBuffer) {
+    if (aKey) {
+      NS_ASSERTION(mFirstBuffer != mLastBuffer, "Where's the keyholder?");
+      if (mFirstBuffer->key == aKey) {
+        NS_ASSERTION(
+            !prevSearchBuf,
+            "Non-null prevSearchBuf when mFirstBuffer is the key holder?");
+        heapBuffer->next = mFirstBuffer;
+        mFirstBuffer = heapBuffer;
+      } else {
+        if (!prevSearchBuf) {
+          prevSearchBuf = mFirstBuffer;
+        }
+        while (prevSearchBuf->next->key != aKey) {
+          prevSearchBuf = prevSearchBuf->next;
+        }
+        heapBuffer->next = prevSearchBuf->next;
+        prevSearchBuf->next = heapBuffer;
+      }
+    } else {
+      NS_ASSERTION(firstLevelMarker, "How come we don't have a marker.");
+      firstLevelMarker->Swap(heapBuffer);
+    }
+  }
+
+  if (!mBlocked) {  
+    NS_ASSERTION(!stackBuffer.hasMore(),
+                 "Buffer wasn't tokenized to completion?");
+    auto r = mTreeBuilder->Flush();  
+    if (r.isErr()) {
+      return executor->MarkAsBroken(r.unwrapErr());
+    }
+    rv = executor->FlushDocumentWrite();  
+    NS_ENSURE_SUCCESS(rv, rv);
+  } else if (stackBuffer.hasMore()) {
+    if (!mDocWriteSpeculatorActive) {
+      mDocWriteSpeculatorActive = true;
+      if (!mDocWriteSpeculativeTreeBuilder) {
+        mDocWriteSpeculativeTreeBuilder =
+            mozilla::MakeUnique<nsHtml5TreeBuilder>(nullptr,
+                                                    executor->GetStage(), true);
+        mDocWriteSpeculativeTreeBuilder->setScriptingEnabled(
+            mTreeBuilder->isScriptingEnabled());
+        mDocWriteSpeculativeTreeBuilder->setAllowDeclarativeShadowRoots(
+            mTreeBuilder->isAllowDeclarativeShadowRoots());
+        mDocWriteSpeculativeTokenizer = mozilla::MakeUnique<nsHtml5Tokenizer>(
+            mDocWriteSpeculativeTreeBuilder.get(), false);
+        mDocWriteSpeculativeTokenizer->setInterner(&mAtomTable);
+        mDocWriteSpeculativeTokenizer->start();
+      }
+      mDocWriteSpeculativeTokenizer->resetToDataState();
+      mDocWriteSpeculativeTreeBuilder->loadState(mTreeBuilder.get());
+      mDocWriteSpeculativeLastWasCR = false;
+    }
+
+
+    while (stackBuffer.hasMore()) {
+      stackBuffer.adjust(mDocWriteSpeculativeLastWasCR);
+      if (stackBuffer.hasMore()) {
+        if (!mDocWriteSpeculativeTokenizer->EnsureBufferSpace(
+                stackBuffer.getLength())) {
+          return executor->MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+        }
+        mDocWriteSpeculativeLastWasCR =
+            mDocWriteSpeculativeTokenizer->tokenizeBuffer(&stackBuffer);
+        nsresult rv;
+        if (NS_FAILED((rv = mDocWriteSpeculativeTreeBuilder->IsBroken()))) {
+          return executor->MarkAsBroken(rv);
+        }
+      }
+    }
+
+    auto r = mDocWriteSpeculativeTreeBuilder->Flush();
+    if (r.isErr()) {
+      return executor->MarkAsBroken(r.unwrapErr());
+    }
+    mDocWriteSpeculativeTreeBuilder->DropHandles();
+    executor->FlushSpeculativeLoads();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsHtml5Parser::Terminate() {
+  if (mTerminationStarted) {
+    return NS_OK;
+  }
+  mTerminationStarted = true;
+  if (mExecutor->IsComplete()) {
+    return NS_OK;
+  }
+  nsCOMPtr<nsIParser> kungFuDeathGrip(this);
+  RefPtr<nsHtml5StreamParser> streamParser(GetStreamParser());
+  RefPtr<nsHtml5TreeOpExecutor> executor(mExecutor);
+  if (streamParser) {
+    streamParser->Terminate();
+  }
+  return executor->DidBuildModel(true);
+}
+
+bool nsHtml5Parser::IsInsertionPointDefined() {
+  return !mExecutor->IsFlushing() && !mInsertionPointPermanentlyUndefined &&
+         (!GetStreamParser() || mScriptNestingLevel != 0);
+}
+
+void nsHtml5Parser::IncrementScriptNestingLevel() { ++mScriptNestingLevel; }
+
+void nsHtml5Parser::DecrementScriptNestingLevel() { --mScriptNestingLevel; }
+
+bool nsHtml5Parser::HasNonzeroScriptNestingLevel() const {
+  return mScriptNestingLevel != 0;
+}
+
+void nsHtml5Parser::MarkAsNotScriptCreated(const char* aCommand) {
+  MOZ_ASSERT(!mStreamListener, "Must not call this twice.");
+  eParserMode mode = NORMAL;
+  if (!nsCRT::strcmp(aCommand, "view-source")) {
+    mode = VIEW_SOURCE_HTML;
+  } else if (!nsCRT::strcmp(aCommand, "view-source-xml")) {
+    mode = VIEW_SOURCE_XML;
+  } else if (!nsCRT::strcmp(aCommand, "view-source-plain")) {
+    mode = VIEW_SOURCE_PLAIN;
+  } else if (!nsCRT::strcmp(aCommand, "plain-text")) {
+    mode = PLAIN_TEXT;
+  } else if (!nsCRT::strcmp(aCommand, kLoadAsData)) {
+    mode = LOAD_AS_DATA;
+  } else if (!nsCRT::strcmp(aCommand, "about-blank")) {
+    mode = ABOUT_BLANK;
+  }
+#ifdef DEBUG
+  else {
+    NS_ASSERTION(!nsCRT::strcmp(aCommand, "view") ||
+                     !nsCRT::strcmp(aCommand, "external-resource") ||
+                     !nsCRT::strcmp(aCommand, "import"),
+                 "Unsupported parser command!");
+  }
+#endif
+  if (mode == ABOUT_BLANK) {
+    mAboutBlankMode = true;
+  } else {
+    mStreamListener = new nsHtml5StreamListener(
+        new nsHtml5StreamParser(mExecutor, this, mode));
+  }
+}
+
+bool nsHtml5Parser::IsScriptCreated() { return !GetStreamParser(); }
+
+bool nsHtml5Parser::IsAboutBlankMode() { return mAboutBlankMode; }
+
+
+nsresult nsHtml5Parser::ParseUntilBlocked() {
+  nsresult rv = mExecutor->IsBroken();
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (mBlocked || mInsertionPointPermanentlyUndefined || mTerminationStarted ||
+      mExecutor->IsComplete()) {
+    return NS_OK;
+  }
+  NS_ASSERTION(mExecutor->HasStarted(), "Bad life cycle.");
+  NS_ASSERTION(!mInDocumentWrite,
+               "ParseUntilBlocked entered while in doc.write!");
+
+  mDocWriteSpeculatorActive = false;
+
+  for (;;) {
+    if (!mFirstBuffer->hasMore()) {
+      if (mFirstBuffer == mLastBuffer) {
+        if (mExecutor->IsComplete()) {
+          return NS_OK;
+        }
+        if (mDocumentClosed) {
+          PermanentlyUndefineInsertionPoint();
+          nsresult rv;
+          MOZ_RELEASE_ASSERT(
+              !GetStreamParser(),
+              "This should only happen with script-created parser.");
+          if (NS_SUCCEEDED((rv = mExecutor->IsBroken()))) {
+            mTokenizer->eof();
+            if (NS_FAILED((rv = mTreeBuilder->IsBroken()))) {
+              mExecutor->MarkAsBroken(rv);
+            } else {
+              mTreeBuilder->StreamEnded();
+            }
+          }
+          auto r = mTreeBuilder->Flush();
+          if (r.isErr()) {
+            return mExecutor->MarkAsBroken(r.unwrapErr());
+          }
+          mExecutor->FlushDocumentWrite();
+          mTokenizer->end();
+          return rv;
+        }
+        NS_ASSERTION(!mLastBuffer->getStart() && !mLastBuffer->getEnd(),
+                     "Sentinel buffer had its indeces changed.");
+        if (GetStreamParser()) {
+          if (mReturnToStreamParserPermitted &&
+              !mExecutor->IsScriptExecuting()) {
+            auto r = mTreeBuilder->Flush();
+            if (r.isErr()) {
+              return mExecutor->MarkAsBroken(r.unwrapErr());
+            }
+            mReturnToStreamParserPermitted = false;
+            GetStreamParser()->ContinueAfterScriptsOrEncodingCommitment(
+                mTokenizer.get(), mTreeBuilder.get(), mLastWasCR);
+          }
+        } else {
+          auto r = mTreeBuilder->Flush();
+          if (r.isErr()) {
+            return mExecutor->MarkAsBroken(r.unwrapErr());
+          }
+          NS_ASSERTION(mExecutor->IsInFlushLoop(),
+                       "How did we come here without being in the flush loop?");
+        }
+        return NS_OK;  
+      }
+      mFirstBuffer = mFirstBuffer->next;
+      continue;
+    }
+
+    if (mBlocked || mExecutor->IsComplete()) {
+      return NS_OK;
+    }
+
+    mFirstBuffer->adjust(mLastWasCR);
+    mLastWasCR = false;
+    if (mFirstBuffer->hasMore()) {
+      bool inRootContext = (!GetStreamParser() && !mFirstBuffer->key);
+      if (inRootContext) {
+        mTokenizer->setLineNumber(mRootContextLineNumber);
+      }
+      if (!mTokenizer->EnsureBufferSpace(mFirstBuffer->getLength())) {
+        return mExecutor->MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+      }
+      mLastWasCR = mTokenizer->tokenizeBuffer(mFirstBuffer);
+      nsresult rv;
+      if (NS_FAILED((rv = mTreeBuilder->IsBroken()))) {
+        return mExecutor->MarkAsBroken(rv);
+      }
+      if (inRootContext) {
+        mRootContextLineNumber = mTokenizer->getLineNumber();
+      }
+      if (mTreeBuilder->HasScriptThatMayDocumentWriteOrBlock()) {
+        auto r = mTreeBuilder->Flush();
+        if (r.isErr()) {
+          return mExecutor->MarkAsBroken(r.unwrapErr());
+        }
+        rv = mExecutor->FlushDocumentWrite();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+      if (mBlocked) {
+        return NS_OK;
+      }
+    }
+  }
+}
+
+nsresult nsHtml5Parser::StartExecutor() {
+  MOZ_ASSERT(!GetStreamParser(),
+             "Had stream parser but document.write started life cycle.");
+  RefPtr<nsHtml5TreeOpExecutor> executor(mExecutor);
+  executor->SetParser(this);
+  mTreeBuilder->setScriptingEnabled(executor->IsScriptEnabled());
+  mTreeBuilder->setAllowDeclarativeShadowRoots(
+      executor->GetDocument()->AllowsDeclarativeShadowRoots());
+
+  mTreeBuilder->setIsSrcdocDocument(false);
+
+  mTokenizer->start();
+  executor->Start();
+
+  return executor->WillBuildModel();
+}
+
+nsresult nsHtml5Parser::Initialize(mozilla::dom::Document* aDoc, nsIURI* aURI,
+                                   nsISupports* aContainer,
+                                   nsIChannel* aChannel) {
+  mTreeBuilder->setAllowDeclarativeShadowRoots(
+      aDoc->AllowsDeclarativeShadowRoots());
+  return mExecutor->Init(aDoc, aURI, aContainer, aChannel);
+}
+
+void nsHtml5Parser::StartTokenizer(bool aScriptingEnabled) {
+  bool isSrcdoc = false;
+  nsCOMPtr<nsIChannel> channel;
+  nsresult rv = GetChannel(getter_AddRefs(channel));
+  if (NS_SUCCEEDED(rv)) {
+    isSrcdoc = NS_IsSrcdocChannel(channel);
+  }
+  mTreeBuilder->setIsSrcdocDocument(isSrcdoc);
+
+  mTreeBuilder->SetPreventScriptExecution(!aScriptingEnabled);
+  mTreeBuilder->setScriptingEnabled(aScriptingEnabled);
+  mTreeBuilder->setAllowDeclarativeShadowRoots(
+      mExecutor->GetDocument()->AllowsDeclarativeShadowRoots());
+  mTokenizer->start();
+}
+
+void nsHtml5Parser::InitializeDocWriteParserState(
+    nsAHtml5TreeBuilderState* aState, int32_t aLine) {
+  mTokenizer->resetToDataState();
+  mTokenizer->setLineNumber(aLine);
+  mTreeBuilder->loadState(aState);
+  mLastWasCR = false;
+  mReturnToStreamParserPermitted = true;
+}
+
+void nsHtml5Parser::ContinueAfterFailedCharsetSwitch() {
+  MOZ_ASSERT(
+      GetStreamParser(),
+      "Tried to continue after failed charset switch without a stream parser");
+  GetStreamParser()->ContinueAfterFailedCharsetSwitch();
+}
+
+NS_IMETHODIMP nsHtml5Parser::OnStartRequest(nsIRequest* aRequest) {
+  if (!mAboutBlankMode) {
+    MOZ_ASSERT(false,
+               "Attempted to use nsHtml5Parser as stream listener in "
+               "non-about:blank mode.");
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  MOZ_RELEASE_ASSERT(!GetStreamParser(),
+                     "Should not have stream parser in about:blank mode.");
+  mTokenizer->start();
+  mExecutor->Start();
+  nsresult rv = mExecutor->WillBuildModel();
+  NS_ENSURE_SUCCESS(rv, rv);
+  PermanentlyUndefineInsertionPoint();
+  mTokenizer->eof();
+  if (NS_FAILED((rv = mTreeBuilder->IsBroken()))) {
+    mExecutor->MarkAsBroken(rv);
+  } else {
+    mTreeBuilder->StreamEnded();
+  }
+  auto r = mTreeBuilder->Flush();
+  if (r.isErr()) {
+    return mExecutor->MarkAsBroken(r.unwrapErr());
+  }
+  mExecutor->FlushDocumentWrite();
+  mTokenizer->end();
+  return rv;
+}
+
+NS_IMETHODIMP nsHtml5Parser::OnDataAvailable(nsIRequest* aRequest,
+                                             nsIInputStream* aInStream,
+                                             uint64_t aSourceOffset,
+                                             uint32_t aLength) {
+  if (!mAboutBlankMode) {
+    MOZ_ASSERT(false,
+               "Attempted to use nsHtml5Parser as stream listener in "
+               "non-about:blank mode.");
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  if (aLength) {
+    MOZ_ASSERT(false, "Non-zero-length stream in about:blank mode.");
+    return NS_ERROR_ILLEGAL_INPUT;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsHtml5Parser::OnStopRequest(nsIRequest* aRequest,
+                                           nsresult aStatus) {
+  if (!mAboutBlankMode) {
+    MOZ_ASSERT(false,
+               "Attempted to use nsHtml5Parser as stream listener in "
+               "non-about:blank mode.");
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  return NS_OK;
+}

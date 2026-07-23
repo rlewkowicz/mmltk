@@ -1,0 +1,96 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+import { Log } from "resource://gre/modules/Log.sys.mjs";
+
+import { CryptoUtils } from "moz-src:///services/crypto/modules/utils.sys.mjs";
+
+import { CommonUtils } from "resource://services-common/utils.sys.mjs";
+
+const PROTOCOL_VERSION = "identity.mozilla.com/picl/v1/";
+const PBKDF2_ROUNDS = 1000;
+const STRETCHED_PW_LENGTH_BYTES = 32;
+const HKDF_SALT = CommonUtils.hexToBytes("00");
+const HKDF_LENGTH = 32;
+
+const PREF_LOG_LEVEL = "identity.fxaccounts.loglevel";
+let LOG_LEVEL = Log.Level.Error;
+try {
+  LOG_LEVEL =
+    Services.prefs.getPrefType(PREF_LOG_LEVEL) ==
+      Ci.nsIPrefBranch.PREF_STRING &&
+    Services.prefs.getStringPref(PREF_LOG_LEVEL);
+} catch (e) {}
+
+var log = Log.repository.getLogger("Identity.FxAccounts");
+log.level = LOG_LEVEL;
+log.addAppender(new Log.ConsoleAppender(new Log.BasicFormatter()));
+
+export var Credentials = Object.freeze({
+  constants: {
+    PROTOCOL_VERSION,
+    PBKDF2_ROUNDS,
+    STRETCHED_PW_LENGTH_BYTES,
+    HKDF_SALT,
+    HKDF_LENGTH,
+  },
+
+  keyWord(context) {
+    return CommonUtils.stringToBytes(PROTOCOL_VERSION + context);
+  },
+
+  keyWordExtended(name, email) {
+    return CommonUtils.stringToBytes(PROTOCOL_VERSION + name + ":" + email);
+  },
+
+  setup(emailInput, passwordInput, options = {}) {
+    return new Promise(resolve => {
+      log.debug("setup credentials for " + emailInput);
+
+      let hkdfSalt = options.hkdfSalt || HKDF_SALT;
+      let hkdfLength = options.hkdfLength || HKDF_LENGTH;
+      let stretchedPWLength =
+        options.stretchedPassLength || STRETCHED_PW_LENGTH_BYTES;
+      let pbkdf2Rounds = options.pbkdf2Rounds || PBKDF2_ROUNDS;
+
+      let result = {};
+
+      let password = CommonUtils.encodeUTF8(passwordInput);
+      let salt = this.keyWordExtended("quickStretch", emailInput);
+
+      let runnable = async () => {
+        let start = Date.now();
+        let quickStretchedPW = await CryptoUtils.pbkdf2Generate(
+          password,
+          salt,
+          pbkdf2Rounds,
+          stretchedPWLength
+        );
+
+        result.quickStretchedPW = quickStretchedPW;
+
+        result.authPW = await CryptoUtils.hkdfLegacy(
+          quickStretchedPW,
+          hkdfSalt,
+          this.keyWord("authPW"),
+          hkdfLength
+        );
+
+        result.unwrapBKey = await CryptoUtils.hkdfLegacy(
+          quickStretchedPW,
+          hkdfSalt,
+          this.keyWord("unwrapBkey"),
+          hkdfLength
+        );
+
+        log.debug("Credentials set up after " + (Date.now() - start) + " ms");
+        resolve(result);
+      };
+
+      Services.tm.dispatchToMainThread(runnable);
+      log.debug("Dispatched thread for credentials setup crypto work");
+    });
+  },
+});

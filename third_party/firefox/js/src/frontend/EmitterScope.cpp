@@ -1,0 +1,1026 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "frontend/EmitterScope.h"
+
+#include "frontend/AbstractScopePtr.h"
+#include "frontend/BytecodeControlStructures.h"
+#include "frontend/BytecodeEmitter.h"
+#include "frontend/ModuleSharedContext.h"
+#include "frontend/TDZCheckCache.h"
+#include "frontend/UsingEmitter.h"
+#include "js/friend/ErrorMessages.h"  // JSMSG_*
+#include "vm/EnvironmentObject.h"     // ClassBodyLexicalEnvironmentObject
+
+using namespace js;
+using namespace js::frontend;
+
+using mozilla::DebugOnly;
+using mozilla::Maybe;
+using mozilla::Nothing;
+using mozilla::Some;
+
+EmitterScope::EmitterScope(BytecodeEmitter* bce)
+    : Nestable<EmitterScope>(&bce->innermostEmitterScope_),
+      nameCache_(bce->fc->nameCollectionPool()),
+      hasEnvironment_(false),
+      environmentChainLength_(0),
+      nextFrameSlot_(0),
+      scopeIndex_(ScopeNote::NoScopeIndex),
+      noteIndex_(ScopeNote::NoScopeNoteIndex) {}
+
+bool EmitterScope::ensureCache(BytecodeEmitter* bce) {
+  return nameCache_.acquire(bce->fc);
+}
+
+bool EmitterScope::checkSlotLimits(BytecodeEmitter* bce,
+                                   const ParserBindingIter& bi) {
+  if (bi.nextFrameSlot() >= LOCALNO_LIMIT ||
+      bi.nextEnvironmentSlot() >= ENVCOORD_SLOT_LIMIT) {
+    bce->reportError(nullptr, JSMSG_TOO_MANY_LOCALS);
+    return false;
+  }
+  return true;
+}
+
+bool EmitterScope::checkEnvironmentChainLength(BytecodeEmitter* bce) {
+  uint32_t hops;
+  if (EmitterScope* emitterScope = enclosing(&bce)) {
+    hops = emitterScope->environmentChainLength_;
+  } else if (!bce->compilationState.input.enclosingScope.isNull()) {
+    hops =
+        bce->compilationState.scopeContext.enclosingScopeEnvironmentChainLength;
+  } else {
+    MOZ_ASSERT(bce->sc->isModule());
+    hops = ModuleScope::EnclosingEnvironmentChainLength;
+  }
+
+  if (hops >= ENVCOORD_HOPS_LIMIT - 1) {
+    bce->reportError(nullptr, JSMSG_TOO_DEEP, "function");
+    return false;
+  }
+
+  environmentChainLength_ = mozilla::AssertedCast<uint16_t>(hops + 1);
+  return true;
+}
+
+void EmitterScope::updateFrameFixedSlots(BytecodeEmitter* bce,
+                                         const ParserBindingIter& bi) {
+  nextFrameSlot_ = bi.nextFrameSlot();
+  if (nextFrameSlot_ > bce->maxFixedSlots) {
+    bce->maxFixedSlots = nextFrameSlot_;
+  }
+}
+
+bool EmitterScope::putNameInCache(BytecodeEmitter* bce,
+                                  TaggedParserAtomIndex name,
+                                  NameLocation loc) {
+  NameLocationMap& cache = *nameCache_;
+  NameLocationMap::AddPtr p = cache.lookupForAdd(name);
+  MOZ_ASSERT(!p);
+  if (!cache.add(p, name, loc)) {
+    ReportOutOfMemory(bce->fc);
+    return false;
+  }
+  return true;
+}
+
+Maybe<NameLocation> EmitterScope::lookupInCache(BytecodeEmitter* bce,
+                                                TaggedParserAtomIndex name) {
+  if (NameLocationMap::Ptr p = nameCache_->lookup(name)) {
+    return Some(p->value().wrapped);
+  }
+  if (fallbackFreeNameLocation_ && nameCanBeFree(bce, name)) {
+    return fallbackFreeNameLocation_;
+  }
+  return Nothing();
+}
+
+EmitterScope* EmitterScope::enclosing(BytecodeEmitter** bce) const {
+  if (EmitterScope* inFrame = enclosingInFrame()) {
+    return inFrame;
+  }
+
+  if ((*bce)->parent) {
+    *bce = (*bce)->parent;
+    return (*bce)->innermostEmitterScopeNoCheck();
+  }
+
+  return nullptr;
+}
+
+mozilla::Maybe<ScopeIndex> EmitterScope::enclosingScopeIndex(
+    BytecodeEmitter* bce) const {
+  if (EmitterScope* es = enclosing(&bce)) {
+    MOZ_ASSERT_IF(es->scopeIndex(bce).isNothing(),
+                  bce->emitterMode == BytecodeEmitter::SelfHosting);
+    return es->scopeIndex(bce);
+  }
+
+  return mozilla::Nothing();
+}
+
+bool EmitterScope::nameCanBeFree(BytecodeEmitter* bce,
+                                 TaggedParserAtomIndex name) {
+  return name != TaggedParserAtomIndex::WellKnown::dot_generator_();
+}
+
+NameLocation EmitterScope::searchAndCache(BytecodeEmitter* bce,
+                                          TaggedParserAtomIndex name) {
+  Maybe<NameLocation> loc;
+  uint16_t hops = hasEnvironment() ? 1 : 0;
+  DebugOnly<bool> inCurrentScript = enclosingInFrame();
+
+  for (EmitterScope* es = enclosing(&bce); es; es = es->enclosing(&bce)) {
+    loc = es->lookupInCache(bce, name);
+    if (loc) {
+      if (loc->kind() == NameLocation::Kind::EnvironmentCoordinate) {
+        *loc = loc->addHops(hops);
+      }
+      break;
+    }
+
+    if (es->hasEnvironment()) {
+      hops++;
+    }
+
+#ifdef DEBUG
+    if (!es->enclosingInFrame()) {
+      inCurrentScript = false;
+    }
+#endif
+  }
+
+  if (!loc) {
+    MOZ_ASSERT(bce->compilationState.input.target ==
+                   CompilationInput::CompilationTarget::Delazification ||
+               bce->compilationState.input.target ==
+                   CompilationInput::CompilationTarget::Eval);
+    inCurrentScript = false;
+    loc = Some(bce->compilationState.scopeContext.searchInEnclosingScope(
+        bce->fc, bce->compilationState.input, bce->parserAtoms(), name));
+    if (loc->kind() == NameLocation::Kind::EnvironmentCoordinate) {
+      *loc = loc->addHops(hops);
+    }
+  }
+
+  MOZ_ASSERT_IF(!inCurrentScript, loc->kind() != NameLocation::Kind::FrameSlot);
+
+  if (!putNameInCache(bce, name, *loc)) {
+    bce->fc->recoverFromOutOfMemory();
+  }
+
+  return *loc;
+}
+
+bool EmitterScope::internEmptyGlobalScopeAsBody(BytecodeEmitter* bce) {
+  MOZ_ASSERT(bce->emitterMode == BytecodeEmitter::SelfHosting);
+
+  hasEnvironment_ = Scope::hasEnvironment(ScopeKind::Global);
+
+  bce->bodyScopeIndex =
+      GCThingIndex(bce->perScriptData().gcThingList().length());
+  return bce->perScriptData().gcThingList().appendEmptyGlobalScope(
+      &scopeIndex_);
+}
+
+bool EmitterScope::internScopeStencil(BytecodeEmitter* bce,
+                                      ScopeIndex scopeIndex) {
+  ScopeStencil& scope = bce->compilationState.scopeData[scopeIndex.index];
+  hasEnvironment_ = scope.hasEnvironment();
+  return bce->perScriptData().gcThingList().append(scopeIndex, &scopeIndex_);
+}
+
+bool EmitterScope::internBodyScopeStencil(BytecodeEmitter* bce,
+                                          ScopeIndex scopeIndex) {
+  MOZ_ASSERT(bce->bodyScopeIndex == ScopeNote::NoScopeIndex,
+             "There can be only one body scope");
+  bce->bodyScopeIndex =
+      GCThingIndex(bce->perScriptData().gcThingList().length());
+  return internScopeStencil(bce, scopeIndex);
+}
+
+bool EmitterScope::appendScopeNote(BytecodeEmitter* bce) {
+  MOZ_ASSERT(ScopeKindIsInBody(scope(bce).kind()) && enclosingInFrame(),
+             "Scope notes are not needed for body-level scopes.");
+  noteIndex_ = bce->bytecodeSection().scopeNoteList().length();
+  return bce->bytecodeSection().scopeNoteList().append(
+      index(), bce->bytecodeSection().offset(),
+      enclosingInFrame() ? enclosingInFrame()->noteIndex()
+                         : ScopeNote::NoScopeNoteIndex);
+}
+
+bool EmitterScope::clearFrameSlotRange(BytecodeEmitter* bce, JSOp opcode,
+                                       uint32_t slotStart,
+                                       uint32_t slotEnd) const {
+  MOZ_ASSERT(opcode == JSOp::Uninitialized || opcode == JSOp::Undefined);
+
+  if (slotStart != slotEnd) {
+    if (!bce->emit1(opcode)) {
+      return false;
+    }
+    for (uint32_t slot = slotStart; slot < slotEnd; slot++) {
+      if (!bce->emitLocalOp(JSOp::InitLexical, slot)) {
+        return false;
+      }
+    }
+    if (!bce->emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void EmitterScope::dump(BytecodeEmitter* bce) {
+  fprintf(stdout, "EmitterScope [%s] %p\n", ScopeKindString(scope(bce).kind()),
+          this);
+
+  for (auto iter = nameCache_->iter(); !iter.done(); iter.next()) {
+    const NameLocation& l = iter.get().value();
+
+    auto atom = iter.get().key();
+    UniqueChars bytes = bce->parserAtoms().toPrintableString(atom);
+    if (!bytes) {
+      ReportOutOfMemory(bce->fc);
+      return;
+    }
+    if (l.kind() != NameLocation::Kind::Dynamic) {
+      fprintf(stdout, "  %s %s ", BindingKindString(l.bindingKind()),
+              bytes.get());
+    } else {
+      fprintf(stdout, "  %s ", bytes.get());
+    }
+
+    switch (l.kind()) {
+      case NameLocation::Kind::Dynamic:
+        fprintf(stdout, "dynamic\n");
+        break;
+      case NameLocation::Kind::Global:
+        fprintf(stdout, "global\n");
+        break;
+      case NameLocation::Kind::Intrinsic:
+        fprintf(stdout, "intrinsic\n");
+        break;
+      case NameLocation::Kind::NamedLambdaCallee:
+        fprintf(stdout, "named lambda callee\n");
+        break;
+      case NameLocation::Kind::Import:
+        fprintf(stdout, "import\n");
+        break;
+      case NameLocation::Kind::ArgumentSlot:
+        fprintf(stdout, "arg slot=%u\n", l.argumentSlot());
+        break;
+      case NameLocation::Kind::FrameSlot:
+        fprintf(stdout, "frame slot=%u\n", l.frameSlot());
+        break;
+      case NameLocation::Kind::EnvironmentCoordinate:
+        fprintf(stdout, "environment hops=%u slot=%u\n",
+                l.environmentCoordinate().hops(),
+                l.environmentCoordinate().slot());
+        break;
+      case NameLocation::Kind::DebugEnvironmentCoordinate:
+        fprintf(stdout, "debugEnvironment hops=%u slot=%u\n",
+                l.environmentCoordinate().hops(),
+                l.environmentCoordinate().slot());
+        break;
+      case NameLocation::Kind::DynamicAnnexBVar:
+        fprintf(stdout, "dynamic annex b var\n");
+        break;
+    }
+  }
+
+  fprintf(stdout, "\n");
+}
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+bool EmitterScope::prepareForDisposableScopeBody(BytecodeEmitter* bce) {
+  if (hasDisposables()) {
+    if (!usingEmitter_->prepareForDisposableScopeBody(blockKind_)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool EmitterScope::prepareForModuleDisposableScopeBody(BytecodeEmitter* bce) {
+  return prepareForDisposableScopeBody(bce);
+}
+
+bool EmitterScope::prepareForDisposableAssignment(UsingHint hint) {
+  MOZ_ASSERT(hasDisposables());
+  return usingEmitter_->prepareForAssignment(hint);
+}
+
+bool EmitterScope::emitDisposableScopeBodyEnd(BytecodeEmitter* bce) {
+  if (hasDisposables() && (blockKind_ != BlockKind::ForOf)) {
+    if (!usingEmitter_->emitEnd()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool EmitterScope::emitModuleDisposableScopeBodyEnd(BytecodeEmitter* bce) {
+  return emitDisposableScopeBodyEnd(bce);
+}
+#endif
+
+bool EmitterScope::enterLexical(BytecodeEmitter* bce, ScopeKind kind,
+                                LexicalScope::ParserData* bindings
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+                                ,
+                                BlockKind blockKind
+#endif
+) {
+  MOZ_ASSERT(kind != ScopeKind::NamedLambda &&
+             kind != ScopeKind::StrictNamedLambda);
+  MOZ_ASSERT(this == bce->innermostEmitterScopeNoCheck());
+
+  if (!ensureCache(bce)) {
+    return false;
+  }
+
+  TDZCheckCache* tdzCache = bce->innermostTDZCheckCache;
+  uint32_t firstFrameSlot = frameSlotStart();
+  ParserBindingIter bi(*bindings, firstFrameSlot,  false);
+  for (; bi; bi++) {
+    if (!checkSlotLimits(bce, bi)) {
+      return false;
+    }
+
+    NameLocation loc = bi.nameLocation();
+    if (!putNameInCache(bce, bi.name(), loc)) {
+      return false;
+    }
+
+    if (!tdzCache->noteTDZCheck(bce, bi.name(), CheckTDZ)) {
+      return false;
+    }
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+    if (bi.kind() == BindingKind::Using) {
+      setHasDisposables(bce);
+    }
+#endif
+  }
+
+  updateFrameFixedSlots(bce, bi);
+
+  ScopeIndex scopeIndex;
+  if (!ScopeStencil::createForLexicalScope(
+          bce->fc, bce->compilationState, kind, bindings, firstFrameSlot,
+          enclosingScopeIndex(bce), &scopeIndex)) {
+    return false;
+  }
+  if (!internScopeStencil(bce, scopeIndex)) {
+    return false;
+  }
+
+  if (ScopeKindIsInBody(kind) && hasEnvironment()) {
+    if (!bce->emitInternedScopeOp(index(), JSOp::PushLexicalEnv)) {
+      return false;
+    }
+  }
+
+  if (!appendScopeNote(bce)) {
+    return false;
+  }
+
+  if (!deadZoneFrameSlotRange(bce, firstFrameSlot, frameSlotEnd())) {
+    return false;
+  }
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  MOZ_ASSERT_IF(blockKind_ != BlockKind::Other, kind == ScopeKind::Lexical);
+  MOZ_ASSERT_IF(kind != ScopeKind::Lexical, blockKind_ == BlockKind::Other);
+
+  blockKind_ = blockKind;
+
+  if (!prepareForDisposableScopeBody(bce)) {
+    return false;
+  }
+#endif
+
+  return checkEnvironmentChainLength(bce);
+}
+
+bool EmitterScope::enterClassBody(BytecodeEmitter* bce, ScopeKind kind,
+                                  ClassBodyScope::ParserData* bindings) {
+  MOZ_ASSERT(kind == ScopeKind::ClassBody);
+  MOZ_ASSERT(this == bce->innermostEmitterScopeNoCheck());
+
+  if (!ensureCache(bce)) {
+    return false;
+  }
+
+  TDZCheckCache* tdzCache = bce->innermostTDZCheckCache;
+  uint32_t firstFrameSlot = frameSlotStart();
+  ParserBindingIter bi(*bindings, firstFrameSlot);
+  for (; bi; bi++) {
+    if (!checkSlotLimits(bce, bi)) {
+      return false;
+    }
+
+    NameLocation loc = bi.nameLocation();
+    if (!putNameInCache(bce, bi.name(), loc)) {
+      return false;
+    }
+
+    if (!tdzCache->noteTDZCheck(bce, bi.name(), CheckTDZ)) {
+      return false;
+    }
+  }
+
+  updateFrameFixedSlots(bce, bi);
+
+  ScopeIndex scopeIndex;
+  if (!ScopeStencil::createForClassBodyScope(
+          bce->fc, bce->compilationState, kind, bindings, firstFrameSlot,
+          enclosingScopeIndex(bce), &scopeIndex)) {
+    return false;
+  }
+  if (!internScopeStencil(bce, scopeIndex)) {
+    return false;
+  }
+
+  if (ScopeKindIsInBody(kind) && hasEnvironment()) {
+    if (!bce->emitInternedScopeOp(index(), JSOp::PushClassBodyEnv)) {
+      return false;
+    }
+  }
+
+  if (!appendScopeNote(bce)) {
+    return false;
+  }
+
+  return checkEnvironmentChainLength(bce);
+}
+
+bool EmitterScope::enterNamedLambda(BytecodeEmitter* bce, FunctionBox* funbox) {
+  MOZ_ASSERT(this == bce->innermostEmitterScopeNoCheck());
+  MOZ_ASSERT(funbox->namedLambdaBindings());
+
+  if (!ensureCache(bce)) {
+    return false;
+  }
+
+  ParserBindingIter bi(*funbox->namedLambdaBindings(), LOCALNO_LIMIT,
+                        true);
+  MOZ_ASSERT(bi.kind() == BindingKind::NamedLambdaCallee);
+
+  NameLocation loc = bi.nameLocation();
+  if (!putNameInCache(bce, bi.name(), loc)) {
+    return false;
+  }
+
+  bi++;
+  MOZ_ASSERT(!bi, "There should be exactly one binding in a NamedLambda scope");
+
+  ScopeKind scopeKind =
+      funbox->strict() ? ScopeKind::StrictNamedLambda : ScopeKind::NamedLambda;
+
+  ScopeIndex scopeIndex;
+  if (!ScopeStencil::createForLexicalScope(
+          bce->fc, bce->compilationState, scopeKind,
+          funbox->namedLambdaBindings(), LOCALNO_LIMIT,
+          enclosingScopeIndex(bce), &scopeIndex)) {
+    return false;
+  }
+  if (!internScopeStencil(bce, scopeIndex)) {
+    return false;
+  }
+
+  return checkEnvironmentChainLength(bce);
+}
+
+bool EmitterScope::enterFunction(BytecodeEmitter* bce, FunctionBox* funbox) {
+  MOZ_ASSERT(this == bce->innermostEmitterScopeNoCheck());
+
+  if (!funbox->functionHasExtraBodyVarScope()) {
+    bce->setVarEmitterScope(this);
+  }
+
+  if (!ensureCache(bce)) {
+    return false;
+  }
+
+  auto bindings = funbox->functionScopeBindings();
+  if (bindings) {
+    NameLocationMap& cache = *nameCache_;
+
+    ParserBindingIter bi(*bindings, funbox->hasParameterExprs);
+    for (; bi; bi++) {
+      if (!checkSlotLimits(bce, bi)) {
+        return false;
+      }
+
+      NameLocation loc = bi.nameLocation();
+      NameLocationMap::AddPtr p = cache.lookupForAdd(bi.name());
+
+      if (p) {
+        MOZ_ASSERT(bi.kind() == BindingKind::FormalParameter);
+        MOZ_ASSERT(!funbox->hasDestructuringArgs);
+        MOZ_ASSERT(!funbox->hasRest());
+        p->value() = loc;
+        continue;
+      }
+
+      if (!cache.add(p, bi.name(), loc)) {
+        ReportOutOfMemory(bce->fc);
+        return false;
+      }
+    }
+
+    updateFrameFixedSlots(bce, bi);
+  } else {
+    nextFrameSlot_ = 0;
+  }
+
+  if (funbox->funHasExtensibleScope()) {
+    fallbackFreeNameLocation_ = Some(NameLocation::Dynamic());
+  } else if (funbox->isStandalone) {
+    if (bce->compilationState.input.target ==
+        CompilationInput::CompilationTarget::
+            StandaloneFunctionInNonSyntacticScope) {
+      fallbackFreeNameLocation_ = Some(NameLocation::Dynamic());
+    } else {
+      fallbackFreeNameLocation_ = Some(NameLocation::Global(BindingKind::Var));
+    }
+  }
+
+  if (funbox->hasParameterExprs && nextFrameSlot_) {
+    uint32_t paramFrameSlotEnd = 0;
+    for (ParserBindingIter bi(*bindings, true); bi; bi++) {
+      if (!BindingKindIsLexical(bi.kind())) {
+        break;
+      }
+
+      NameLocation loc = bi.nameLocation();
+      if (loc.kind() == NameLocation::Kind::FrameSlot) {
+        MOZ_ASSERT(paramFrameSlotEnd <= loc.frameSlot());
+        paramFrameSlotEnd = loc.frameSlot() + 1;
+      }
+    }
+
+    if (!deadZoneFrameSlotRange(bce, 0, paramFrameSlotEnd)) {
+      return false;
+    }
+  }
+
+  ScopeIndex scopeIndex;
+  if (!ScopeStencil::createForFunctionScope(
+          bce->fc, bce->compilationState, funbox->functionScopeBindings(),
+          funbox->hasParameterExprs,
+          funbox->needsCallObjectRegardlessOfBindings(), funbox->index(),
+          funbox->isArrow(), enclosingScopeIndex(bce), &scopeIndex)) {
+    return false;
+  }
+  if (!internBodyScopeStencil(bce, scopeIndex)) {
+    return false;
+  }
+
+  return checkEnvironmentChainLength(bce);
+}
+
+bool EmitterScope::enterFunctionExtraBodyVar(BytecodeEmitter* bce,
+                                             FunctionBox* funbox) {
+  MOZ_ASSERT(funbox->hasParameterExprs);
+  MOZ_ASSERT(funbox->extraVarScopeBindings() ||
+             funbox->needsExtraBodyVarEnvironmentRegardlessOfBindings());
+  MOZ_ASSERT(this == bce->innermostEmitterScopeNoCheck());
+
+  bce->setVarEmitterScope(this);
+
+  if (!ensureCache(bce)) {
+    return false;
+  }
+
+  uint32_t firstFrameSlot = frameSlotStart();
+  if (auto bindings = funbox->extraVarScopeBindings()) {
+    ParserBindingIter bi(*bindings, firstFrameSlot);
+    for (; bi; bi++) {
+      if (!checkSlotLimits(bce, bi)) {
+        return false;
+      }
+
+      NameLocation loc = bi.nameLocation();
+      MOZ_ASSERT(bi.kind() == BindingKind::Var);
+      if (!putNameInCache(bce, bi.name(), loc)) {
+        return false;
+      }
+    }
+
+    uint32_t priorEnd = bce->maxFixedSlots;
+    updateFrameFixedSlots(bce, bi);
+
+    uint32_t end = std::min(priorEnd, nextFrameSlot_);
+    if (firstFrameSlot < end) {
+      if (!clearFrameSlotRange(bce, JSOp::Undefined, firstFrameSlot, end)) {
+        return false;
+      }
+    }
+  } else {
+    nextFrameSlot_ = firstFrameSlot;
+  }
+
+  if (funbox->funHasExtensibleScope()) {
+    fallbackFreeNameLocation_ = Some(NameLocation::Dynamic());
+  }
+
+  ScopeIndex scopeIndex;
+  if (!ScopeStencil::createForVarScope(
+          bce->fc, bce->compilationState, ScopeKind::FunctionBodyVar,
+          funbox->extraVarScopeBindings(), firstFrameSlot,
+          funbox->needsExtraBodyVarEnvironmentRegardlessOfBindings(),
+          enclosingScopeIndex(bce), &scopeIndex)) {
+    return false;
+  }
+  if (!internScopeStencil(bce, scopeIndex)) {
+    return false;
+  }
+
+  if (hasEnvironment()) {
+    if (!bce->emitInternedScopeOp(index(), JSOp::PushVarEnv)) {
+      return false;
+    }
+  }
+
+  if (!appendScopeNote(bce)) {
+    return false;
+  }
+
+  return checkEnvironmentChainLength(bce);
+}
+
+bool EmitterScope::enterGlobal(BytecodeEmitter* bce,
+                               GlobalSharedContext* globalsc) {
+  MOZ_ASSERT(this == bce->innermostEmitterScopeNoCheck());
+
+
+  bce->setVarEmitterScope(this);
+
+  if (!ensureCache(bce)) {
+    return false;
+  }
+
+  if (bce->emitterMode == BytecodeEmitter::SelfHosting) {
+    fallbackFreeNameLocation_ = Some(NameLocation::Intrinsic());
+
+    return internEmptyGlobalScopeAsBody(bce);
+  }
+
+  ScopeIndex scopeIndex;
+  if (!ScopeStencil::createForGlobalScope(bce->fc, bce->compilationState,
+                                          globalsc->scopeKind(),
+                                          globalsc->bindings, &scopeIndex)) {
+    return false;
+  }
+  if (!internBodyScopeStencil(bce, scopeIndex)) {
+    return false;
+  }
+
+  MOZ_ASSERT(bce->bodyScopeIndex == GCThingIndex::outermostScopeIndex(),
+             "Global scope must be index 0");
+
+  if (globalsc->bindings) {
+    for (ParserBindingIter bi(*globalsc->bindings); bi; bi++) {
+      NameLocation loc = bi.nameLocation();
+      if (!putNameInCache(bce, bi.name(), loc)) {
+        return false;
+      }
+    }
+  }
+
+  if (globalsc->scopeKind() == ScopeKind::Global) {
+    fallbackFreeNameLocation_ = Some(NameLocation::Global(BindingKind::Var));
+  } else {
+    fallbackFreeNameLocation_ = Some(NameLocation::Dynamic());
+  }
+
+  return true;
+}
+
+bool EmitterScope::enterEval(BytecodeEmitter* bce, EvalSharedContext* evalsc) {
+  MOZ_ASSERT(this == bce->innermostEmitterScopeNoCheck());
+
+  bce->setVarEmitterScope(this);
+
+  if (!ensureCache(bce)) {
+    return false;
+  }
+
+  ScopeKind scopeKind =
+      evalsc->strict() ? ScopeKind::StrictEval : ScopeKind::Eval;
+
+  ScopeIndex scopeIndex;
+  if (!ScopeStencil::createForEvalScope(
+          bce->fc, bce->compilationState, scopeKind, evalsc->bindings,
+          enclosingScopeIndex(bce), &scopeIndex)) {
+    return false;
+  }
+  if (!internBodyScopeStencil(bce, scopeIndex)) {
+    return false;
+  }
+
+  if (evalsc->strict()) {
+    if (evalsc->bindings) {
+      ParserBindingIter bi(*evalsc->bindings, true);
+      for (; bi; bi++) {
+        if (!checkSlotLimits(bce, bi)) {
+          return false;
+        }
+
+        NameLocation loc = bi.nameLocation();
+        if (!putNameInCache(bce, bi.name(), loc)) {
+          return false;
+        }
+      }
+
+      updateFrameFixedSlots(bce, bi);
+    }
+  } else {
+    fallbackFreeNameLocation_ = Some(NameLocation::Dynamic());
+  }
+
+  if (hasEnvironment()) {
+    if (!bce->emitInternedScopeOp(index(), JSOp::PushVarEnv)) {
+      return false;
+    }
+  } else {
+
+    if (scope(bce).enclosing().is<GlobalScope>()) {
+      fallbackFreeNameLocation_ = Some(NameLocation::Global(BindingKind::Var));
+    }
+  }
+
+  return checkEnvironmentChainLength(bce);
+}
+
+bool EmitterScope::enterModule(BytecodeEmitter* bce,
+                               ModuleSharedContext* modulesc) {
+  MOZ_ASSERT(this == bce->innermostEmitterScopeNoCheck());
+
+  bce->setVarEmitterScope(this);
+
+  if (!ensureCache(bce)) {
+    return false;
+  }
+
+  TDZCheckCache* tdzCache = bce->innermostTDZCheckCache;
+  Maybe<uint32_t> firstLexicalFrameSlot;
+  if (ModuleScope::ParserData* bindings = modulesc->bindings) {
+    ParserBindingIter bi(*bindings);
+    for (; bi; bi++) {
+      if (!checkSlotLimits(bce, bi)) {
+        return false;
+      }
+
+      NameLocation loc = bi.nameLocation();
+      if (!putNameInCache(bce, bi.name(), loc)) {
+        return false;
+      }
+
+      if (BindingKindIsLexical(bi.kind())) {
+        if (loc.kind() == NameLocation::Kind::FrameSlot &&
+            !firstLexicalFrameSlot) {
+          firstLexicalFrameSlot = Some(loc.frameSlot());
+        }
+
+        if (!tdzCache->noteTDZCheck(bce, bi.name(), CheckTDZ)) {
+          return false;
+        }
+      }
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+      if (bi.kind() == BindingKind::Using) {
+        setHasDisposables(bce);
+      }
+#endif
+    }
+
+    updateFrameFixedSlots(bce, bi);
+  } else {
+    nextFrameSlot_ = 0;
+  }
+
+  fallbackFreeNameLocation_ = Some(NameLocation::Global(BindingKind::Var));
+
+  if (firstLexicalFrameSlot) {
+    if (!deadZoneFrameSlotRange(bce, *firstLexicalFrameSlot, frameSlotEnd())) {
+      return false;
+    }
+  }
+
+  ScopeIndex scopeIndex;
+  if (!ScopeStencil::createForModuleScope(
+          bce->fc, bce->compilationState, modulesc->bindings,
+          enclosingScopeIndex(bce), &scopeIndex)) {
+    return false;
+  }
+  if (!internBodyScopeStencil(bce, scopeIndex)) {
+    return false;
+  }
+
+  return checkEnvironmentChainLength(bce);
+}
+
+bool EmitterScope::enterWith(BytecodeEmitter* bce) {
+  MOZ_ASSERT(this == bce->innermostEmitterScopeNoCheck());
+
+  if (!ensureCache(bce)) {
+    return false;
+  }
+
+  fallbackFreeNameLocation_ = Some(NameLocation::Dynamic());
+
+  ScopeIndex scopeIndex;
+  if (!ScopeStencil::createForWithScope(bce->fc, bce->compilationState,
+                                        enclosingScopeIndex(bce),
+                                        &scopeIndex)) {
+    return false;
+  }
+
+  if (!internScopeStencil(bce, scopeIndex)) {
+    return false;
+  }
+
+  if (!bce->emitInternedScopeOp(index(), JSOp::EnterWith)) {
+    return false;
+  }
+
+  if (!appendScopeNote(bce)) {
+    return false;
+  }
+
+  return checkEnvironmentChainLength(bce);
+}
+
+bool EmitterScope::deadZoneFrameSlots(BytecodeEmitter* bce) const {
+  return deadZoneFrameSlotRange(bce, frameSlotStart(), frameSlotEnd());
+}
+
+bool EmitterScope::leave(BytecodeEmitter* bce, bool nonLocal) {
+  MOZ_ASSERT_IF(!nonLocal, this == bce->innermostEmitterScopeNoCheck());
+
+  ScopeKind kind = scope(bce).kind();
+  switch (kind) {
+    case ScopeKind::Lexical:
+    case ScopeKind::SimpleCatch:
+    case ScopeKind::Catch:
+    case ScopeKind::FunctionLexical:
+    case ScopeKind::ClassBody:
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+      if (!nonLocal) {
+        if (!emitDisposableScopeBodyEnd(bce)) {
+          return false;
+        }
+      }
+#endif
+
+      if (bce->sc->isFunctionBox() &&
+          bce->sc->asFunctionBox()->needsClearSlotsOnExit()) {
+        if (!deadZoneFrameSlots(bce)) {
+          return false;
+        }
+      }
+
+      if (!bce->emit1(hasEnvironment() ? JSOp::PopLexicalEnv
+                                       : JSOp::DebugLeaveLexicalEnv)) {
+        return false;
+      }
+      break;
+
+    case ScopeKind::With:
+      if (!bce->emit1(JSOp::LeaveWith)) {
+        return false;
+      }
+      break;
+
+    case ScopeKind::Function:
+    case ScopeKind::FunctionBodyVar:
+    case ScopeKind::NamedLambda:
+    case ScopeKind::StrictNamedLambda:
+    case ScopeKind::Eval:
+    case ScopeKind::StrictEval:
+    case ScopeKind::Global:
+    case ScopeKind::NonSyntactic:
+    case ScopeKind::Module:
+      break;
+
+    case ScopeKind::WasmInstance:
+    case ScopeKind::WasmFunction:
+      MOZ_CRASH("No wasm function scopes in JS");
+  }
+
+  if (!nonLocal) {
+    if (ScopeKindIsInBody(kind)) {
+      if (kind == ScopeKind::FunctionBodyVar) {
+        bce->bytecodeSection().scopeNoteList().recordEndFunctionBodyVar(
+            noteIndex_);
+      } else {
+        bce->bytecodeSection().scopeNoteList().recordEnd(
+            noteIndex_, bce->bytecodeSection().offset());
+      }
+    }
+  }
+
+  return true;
+}
+
+AbstractScopePtr EmitterScope::scope(const BytecodeEmitter* bce) const {
+  return bce->perScriptData().gcThingList().getScope(index());
+}
+
+mozilla::Maybe<ScopeIndex> EmitterScope::scopeIndex(
+    const BytecodeEmitter* bce) const {
+  return bce->perScriptData().gcThingList().getScopeIndex(index());
+}
+
+NameLocation EmitterScope::lookup(BytecodeEmitter* bce,
+                                  TaggedParserAtomIndex name) {
+  if (Maybe<NameLocation> loc = lookupInCache(bce, name)) {
+    return *loc;
+  }
+  return searchAndCache(bce, name);
+}
+
+uint32_t EmitterScope::CountEnclosingCompilationEnvironments(
+    BytecodeEmitter* bce, EmitterScope* emitterScope) {
+  uint32_t environments = emitterScope->hasEnvironment() ? 1 : 0;
+  while ((emitterScope = emitterScope->enclosing(&bce))) {
+    if (emitterScope->hasEnvironment()) {
+      environments++;
+    }
+  }
+  return environments;
+}
+
+void EmitterScope::lookupPrivate(BytecodeEmitter* bce,
+                                 TaggedParserAtomIndex name, NameLocation& loc,
+                                 mozilla::Maybe<NameLocation>& brandLoc) {
+  loc = lookup(bce, name);
+
+  if (loc.kind() != NameLocation::Kind::EnvironmentCoordinate &&
+      loc.kind() != NameLocation::Kind::FrameSlot) {
+    MOZ_ASSERT(loc.kind() == NameLocation::Kind::Dynamic ||
+               loc.kind() == NameLocation::Kind::Global);
+    mozilla::Maybe<NameLocation> cacheEntry =
+        bce->compilationState.scopeContext.getPrivateFieldLocation(name);
+    MOZ_ASSERT(cacheEntry);
+
+    if (cacheEntry->bindingKind() == BindingKind::PrivateMethod) {
+      MOZ_ASSERT(cacheEntry->kind() ==
+                 NameLocation::Kind::DebugEnvironmentCoordinate);
+
+      uint32_t compilation_hops =
+          CountEnclosingCompilationEnvironments(bce, this);
+
+      uint32_t external_hops = cacheEntry->environmentCoordinate().hops();
+
+      brandLoc = Some(NameLocation::DebugEnvironmentCoordinate(
+          BindingKind::Synthetic, compilation_hops + external_hops,
+          ClassBodyLexicalEnvironmentObject::privateBrandSlot()));
+    } else {
+      brandLoc = Nothing();
+    }
+    return;
+  }
+
+  if (loc.bindingKind() == BindingKind::PrivateMethod) {
+    uint32_t hops = 0;
+    if (loc.kind() == NameLocation::Kind::EnvironmentCoordinate) {
+      hops = loc.environmentCoordinate().hops();
+    } else {
+      MOZ_ASSERT(bce->innermostScope().is<ClassBodyScope>());
+    }
+
+    brandLoc = Some(NameLocation::EnvironmentCoordinate(
+        BindingKind::Synthetic, hops,
+        ClassBodyLexicalEnvironmentObject::privateBrandSlot()));
+  } else {
+    brandLoc = Nothing();
+  }
+}
+
+Maybe<NameLocation> EmitterScope::locationBoundInScope(
+    TaggedParserAtomIndex name, EmitterScope* target) {
+  uint16_t extraHops = 0;
+  for (EmitterScope* es = this; es != target; es = es->enclosingInFrame()) {
+    if (es->hasEnvironment()) {
+      extraHops++;
+    }
+  }
+
+  Maybe<NameLocation> loc;
+  if (NameLocationMap::Ptr p = target->nameCache_->lookup(name)) {
+    NameLocation l = p->value().wrapped;
+    if (l.kind() == NameLocation::Kind::EnvironmentCoordinate) {
+      loc = Some(l.addHops(extraHops));
+    } else {
+      loc = Some(l);
+    }
+  }
+  return loc;
+}

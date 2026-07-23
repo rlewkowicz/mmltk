@@ -1,0 +1,211 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_localstorage_ActorsChild_h
+#define mozilla_dom_localstorage_ActorsChild_h
+
+#include <cstdint>
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/PBackgroundLSDatabaseChild.h"
+#include "mozilla/dom/PBackgroundLSObserverChild.h"
+#include "mozilla/dom/PBackgroundLSRequest.h"
+#include "mozilla/dom/PBackgroundLSRequestChild.h"
+#include "mozilla/dom/PBackgroundLSSimpleRequest.h"
+#include "mozilla/dom/PBackgroundLSSimpleRequestChild.h"
+#include "mozilla/dom/PBackgroundLSSnapshotChild.h"
+#include "mozilla/ipc/ProtocolUtils.h"
+#include "nsISupports.h"
+#include "nsStringFwd.h"
+#include "nscore.h"
+
+namespace mozilla {
+
+namespace ipc {
+
+class BackgroundChildImpl;
+
+}  
+
+namespace dom {
+
+class LocalStorageManager2;
+class LSDatabase;
+class LSObject;
+class LSObserver;
+class LSRequestChildCallback;
+class LSSimpleRequestChildCallback;
+class LSSnapshot;
+
+class LSDatabaseChild final : public PBackgroundLSDatabaseChild {
+  friend class mozilla::ipc::BackgroundChildImpl;
+  friend class LSDatabase;
+  friend class LSObject;
+
+  LSDatabase* mDatabase;
+
+  NS_INLINE_DECL_REFCOUNTING(LSDatabaseChild, override)
+
+ public:
+  void AssertIsOnOwningThread() const {
+    NS_ASSERT_OWNINGTHREAD(LSDatabaseChild);
+  }
+
+ private:
+  explicit LSDatabaseChild(LSDatabase* aDatabase);
+
+  ~LSDatabaseChild();
+
+  void Shutdown();
+
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  mozilla::ipc::IPCResult RecvRequestAllowToClose() override;
+
+  PBackgroundLSSnapshotChild* AllocPBackgroundLSSnapshotChild(
+      const nsAString& aDocumentURI, const nsAString& aKey,
+      const bool& aIncreasePeakUsage, const int64_t& aMinSize,
+      LSSnapshotInitInfo* aInitInfo) override;
+
+  bool DeallocPBackgroundLSSnapshotChild(
+      PBackgroundLSSnapshotChild* aActor) override;
+};
+
+class LSObserverChild final : public PBackgroundLSObserverChild {
+  friend class mozilla::ipc::BackgroundChildImpl;
+  friend class LSObserver;
+  friend class LSObject;
+
+  LSObserver* mObserver;
+
+  NS_DECL_OWNINGTHREAD
+
+ public:
+  void AssertIsOnOwningThread() const {
+    NS_ASSERT_OWNINGTHREAD(LSObserverChild);
+  }
+
+ private:
+  explicit LSObserverChild(LSObserver* aObserver);
+
+  ~LSObserverChild();
+
+  void SendDeleteMeInternal();
+
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  mozilla::ipc::IPCResult RecvObserve(const PrincipalInfo& aPrinciplaInfo,
+                                      const uint32_t& aPrivateBrowsingId,
+                                      const nsAString& aDocumentURI,
+                                      const nsAString& aKey,
+                                      const LSValue& aOldValue,
+                                      const LSValue& aNewValue) override;
+};
+
+class LSRequestChild final : public PBackgroundLSRequestChild {
+  friend class LSObject;
+  friend class LocalStorageManager2;
+
+  RefPtr<LSRequestChildCallback> mCallback;
+
+  bool mFinishing;
+
+  NS_DECL_OWNINGTHREAD
+
+ public:
+  void AssertIsOnOwningThread() const {
+    NS_ASSERT_OWNINGTHREAD(LSRequestChild);
+  }
+
+  bool Finishing() const;
+
+ private:
+  LSRequestChild();
+
+  ~LSRequestChild();
+
+  void SetCallback(LSRequestChildCallback* aCallback);
+
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  mozilla::ipc::IPCResult Recv__delete__(
+      LSRequestResponse&& aResponse) override;
+
+  mozilla::ipc::IPCResult RecvReady() override;
+};
+
+class NS_NO_VTABLE LSRequestChildCallback {
+ public:
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  virtual void OnResponse(LSRequestResponse&& aResponse) = 0;
+
+ protected:
+  virtual ~LSRequestChildCallback() = default;
+};
+
+class LSSimpleRequestChild final : public PBackgroundLSSimpleRequestChild {
+  friend class LocalStorageManager2;
+
+  RefPtr<LSSimpleRequestChildCallback> mCallback;
+
+  NS_DECL_OWNINGTHREAD
+
+ public:
+  void AssertIsOnOwningThread() const {
+    NS_ASSERT_OWNINGTHREAD(LSSimpleRequestChild);
+  }
+
+ private:
+  LSSimpleRequestChild();
+
+  void SetCallback(LSSimpleRequestChildCallback* aCallback);
+
+  ~LSSimpleRequestChild();
+
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  mozilla::ipc::IPCResult Recv__delete__(
+      const LSSimpleRequestResponse& aResponse) override;
+};
+
+class NS_NO_VTABLE LSSimpleRequestChildCallback {
+ public:
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  virtual void OnResponse(const LSSimpleRequestResponse& aResponse) = 0;
+
+ protected:
+  virtual ~LSSimpleRequestChildCallback() = default;
+};
+
+class LSSnapshotChild final : public PBackgroundLSSnapshotChild {
+  friend class LSDatabase;
+  friend class LSSnapshot;
+
+  LSSnapshot* mSnapshot;
+
+  NS_DECL_OWNINGTHREAD
+
+ public:
+  void AssertIsOnOwningThread() const {
+    NS_ASSERT_OWNINGTHREAD(LSSnapshotChild);
+  }
+
+ private:
+  explicit LSSnapshotChild(LSSnapshot* aSnapshot);
+
+  ~LSSnapshotChild();
+
+  void SendDeleteMeInternal();
+
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  mozilla::ipc::IPCResult RecvMarkDirty() override;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_localstorage_ActorsChild_h

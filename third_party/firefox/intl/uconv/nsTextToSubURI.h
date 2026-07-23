@@ -1,0 +1,29 @@
+// This Source Code is subject to the terms of the Mozilla Public License
+// version 2.0 (the "License"). You can obtain a copy of the License at
+#ifndef nsTextToSubURI_h_
+#define nsTextToSubURI_h_
+
+#include "nsITextToSubURI.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "mozilla/net/IDNBlocklistUtils.h"
+
+class nsTextToSubURI : public nsITextToSubURI {
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSITEXTTOSUBURI
+
+  static nsresult UnEscapeNonAsciiURI(const nsACString& aCharset,
+                                      const nsACString& aURIFragment,
+                                      nsAString& _retval);
+
+ private:
+  virtual ~nsTextToSubURI();
+
+  static nsresult convertURItoUnicode(const nsCString& aCharset,
+                                      const nsCString& aURI,
+                                      nsAString& _retval);
+
+  nsTArray<mozilla::net::BlocklistRange> mIDNBlocklist;
+};
+
+#endif  // nsTextToSubURI_h_

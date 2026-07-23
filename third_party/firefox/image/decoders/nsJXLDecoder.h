@@ -1,0 +1,137 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_decoders_nsJXLDecoder_h
+#define mozilla_image_decoders_nsJXLDecoder_h
+
+#include "Decoder.h"
+#include "SurfacePipe.h"
+#include "mozilla/Vector.h"
+#include "mozilla/image/jxl_decoder_ffi.h"
+
+namespace mozilla::image {
+
+struct JxlDecoderDeleter {
+  void operator()(JxlApiDecoder* ptr) { jxl_decoder_destroy(ptr); }
+};
+
+class nsJXLDecoder final : public Decoder {
+ public:
+  ~nsJXLDecoder() override;
+
+  DecoderType GetType() const override { return DecoderType::JXL; }
+
+#ifdef DEBUG
+  uint32_t GetWritePixelRowsCount() const { return mWritePixelRowsCount; }
+#endif
+
+ protected:
+  nsresult InitInternal() override;
+  LexerResult DoDecode(SourceBufferIterator& aIterator,
+                       IResumable* aOnResume) override;
+
+ private:
+  friend class DecoderFactory;
+
+  explicit nsJXLDecoder(RasterImage* aImage);
+
+  enum class DecoderState { Initial, HaveBasicInfo };
+
+  enum class PixelFormat {
+    Rgba8,       
+    Gray8,       
+    GrayAlpha8,  
+    Cmyk8,       
+    Rgba16f,     
+  };
+
+  enum class FrameOutputResult {
+    BufferAllocated,
+    FrameAdvanced,
+    DecodeComplete,
+    NoOutput,
+    Error
+  };
+
+  enum class ProcessResult { NeedMoreData, YieldOutput, Complete, Error };
+
+  JxlDecoderStatus ProcessInput(const uint8_t** aData, size_t* aLength);
+  FrameOutputResult HandleFrameOutput();
+  ProcessResult ProcessAvailableData(const uint8_t** aData, size_t* aLength);
+
+  LexerResult ScanForFrameCount(SourceBufferIterator& aIterator,
+                                IResumable* aOnResume);
+
+  static PixelFormat DetectPixelFormat(JxlApiDecoder* aDecoder,
+                                       const JxlBasicInfo& aBasicInfo);
+  nsresult AllocateFrameBuffers();
+  nsresult EnsureSurfacePipe();
+  void BuildCMSTransform();
+  nsresult FinishFrame();
+  void FlushPartialFrame();
+  bool WritePixelRowsToPipe();
+
+  LexerResult DrainFrames();
+
+  size_t BytesPerPixel() const {
+    switch (mPixelFormat.value()) {
+      case PixelFormat::Rgba8:
+        return 4;
+      case PixelFormat::Gray8:
+        return 1;
+      case PixelFormat::GrayAlpha8:
+        return 2;
+      case PixelFormat::Cmyk8:
+        return 4;
+      case PixelFormat::Rgba16f:
+        return 8;
+    }
+    MOZ_ASSERT_UNREACHABLE("unhandled PixelFormat");
+    return 4;
+  }
+
+  std::unique_ptr<JxlApiDecoder, JxlDecoderDeleter> mDecoder;
+  std::unique_ptr<JxlApiDecoder, JxlDecoderDeleter> mScanner;
+
+  DecoderState mDecoderState = DecoderState::Initial;
+
+  uint32_t mFrameIndex = 0;
+
+  template <typename T>
+  class WriteOnce {
+   public:
+    T value() const {
+      MOZ_ASSERT(mIsSet);
+      return mValue;
+    }
+    void set(T aVal) {
+      MOZ_ASSERT(!mIsSet);
+      mIsSet = true;
+      mValue = aVal;
+    }
+
+   private:
+    bool mIsSet = false;
+    T mValue{};
+  };
+
+  WriteOnce<PixelFormat> mPixelFormat;
+
+  Vector<uint8_t> mU8RowBuf;
+
+  Vector<uint8_t> mPixelBuffer;
+  Vector<uint8_t> mKBuffer;  
+  Maybe<SurfacePipe> mCurrentPipe;
+
+  bool mIteratorComplete = false;
+
+#ifdef DEBUG
+  uint32_t mWritePixelRowsCount = 0;
+#endif
+};
+
+}  
+
+#endif  // mozilla_image_decoders_nsJXLDecoder_h

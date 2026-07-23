@@ -1,0 +1,188 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+*
+*   Copyright (C) 1997-2012, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+*******************************************************************************
+*   file name:  loclikely.cpp
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+*   created on: 2010feb25
+*   created by: Markus W. Scherer
+*
+*   Code for miscellaneous locale-related resource bundle data access,
+*   separated out from other .cpp files
+*   that then do not depend on resource bundle code and this data.
+*/
+
+#include "unicode/utypes.h"
+#include "unicode/putil.h"
+#include "unicode/uloc.h"
+#include "unicode/ures.h"
+#include "charstr.h"
+#include "cstring.h"
+#include "ulocimp.h"
+#include "uresimp.h"
+
+U_CAPI const char16_t * U_EXPORT2
+uloc_getTableStringWithFallback(const char *path, const char *locale,
+                              const char *tableKey, const char *subTableKey,
+                              const char *itemKey,
+                              int32_t *pLength,
+                              UErrorCode *pErrorCode)
+{
+    if (U_FAILURE(*pErrorCode)) { return nullptr; }
+    const char16_t *item=nullptr;
+    UErrorCode errorCode;
+
+    errorCode=U_ZERO_ERROR;
+    icu::LocalUResourceBundlePointer rb(ures_open(path, locale, &errorCode));
+
+    if(U_FAILURE(errorCode)) {
+        *pErrorCode=errorCode;
+        return nullptr;
+    } else if(errorCode==U_USING_DEFAULT_WARNING ||
+                (errorCode==U_USING_FALLBACK_WARNING && *pErrorCode!=U_USING_DEFAULT_WARNING)
+    ) {
+        *pErrorCode=errorCode;
+    }
+
+    for(;;){
+        icu::StackUResourceBundle table;
+        icu::StackUResourceBundle subTable;
+        ures_getByKeyWithFallback(rb.getAlias(), tableKey, table.getAlias(), &errorCode);
+
+        if (subTableKey != nullptr) {
+            
+            ures_getByKeyWithFallback(table.getAlias(), subTableKey, table.getAlias(), &errorCode);
+        }
+        if(U_SUCCESS(errorCode)){
+            item = ures_getStringByKeyWithFallback(table.getAlias(), itemKey, pLength, &errorCode);
+            if(U_FAILURE(errorCode)){
+                const char* replacement = nullptr;
+                *pErrorCode = errorCode; 
+                errorCode = U_ZERO_ERROR;
+                if(uprv_strcmp(tableKey, "Countries")==0){
+                    replacement =  uloc_getCurrentCountryID(itemKey);
+                }else if(uprv_strcmp(tableKey, "Languages")==0){
+                    replacement =  uloc_getCurrentLanguageID(itemKey);
+                }
+                if(replacement!=nullptr && itemKey != replacement){
+                    item = ures_getStringByKeyWithFallback(table.getAlias(), replacement, pLength, &errorCode);
+                    if(U_SUCCESS(errorCode)){
+                        *pErrorCode = errorCode;
+                        break;
+                    }
+                }
+            }else{
+                break;
+            }
+        }
+        
+        if(U_FAILURE(errorCode)){    
+
+            int32_t len = 0;
+            const char16_t* fallbackLocale =  nullptr;
+            *pErrorCode = errorCode;
+            errorCode = U_ZERO_ERROR;
+
+            fallbackLocale = ures_getStringByKeyWithFallback(table.getAlias(), "Fallback", &len, &errorCode);
+            if(U_FAILURE(errorCode)){
+               *pErrorCode = errorCode;
+                break;
+            }
+
+            icu::CharString explicitFallbackName;
+            explicitFallbackName.appendInvariantChars(fallbackLocale, len, errorCode);
+
+            if (explicitFallbackName == locale) {
+                *pErrorCode = U_INTERNAL_PROGRAM_ERROR;
+                break;
+            }
+            rb.adoptInstead(ures_open(path, explicitFallbackName.data(), &errorCode));
+            if(U_FAILURE(errorCode)){
+                *pErrorCode = errorCode;
+                break;
+            }
+        }else{
+            break;
+        }
+    }
+
+    return item;
+}
+
+namespace {
+
+ULayoutType
+_uloc_getOrientationHelper(const char* localeId,
+                           const char* key,
+                           UErrorCode& status)
+{
+    ULayoutType result = ULOC_LAYOUT_UNKNOWN;
+
+    if (U_FAILURE(status)) { return result; }
+
+    if (localeId == nullptr) {
+        localeId = uloc_getDefault();
+    }
+    icu::CharString localeBuffer = ulocimp_canonicalize(localeId, status);
+
+    if (U_FAILURE(status)) { return result; }
+
+    int32_t length = 0;
+    const char16_t* const value =
+        uloc_getTableStringWithFallback(
+            nullptr,
+            localeBuffer.data(),
+            "layout",
+            nullptr,
+            key,
+            &length,
+            &status);
+
+    if (U_FAILURE(status)) { return result; }
+
+    if (length != 0) {
+        switch(value[0])
+        {
+        case 0x0062: 
+            result = ULOC_LAYOUT_BTT;
+            break;
+        case 0x006C: 
+            result = ULOC_LAYOUT_LTR;
+            break;
+        case 0x0072: 
+            result = ULOC_LAYOUT_RTL;
+            break;
+        case 0x0074: 
+            result = ULOC_LAYOUT_TTB;
+            break;
+        default:
+            status = U_INTERNAL_PROGRAM_ERROR;
+            break;
+        }
+    }
+
+    return result;
+}
+
+}  
+
+U_CAPI ULayoutType U_EXPORT2
+uloc_getCharacterOrientation(const char* localeId,
+                             UErrorCode *status)
+{
+    return _uloc_getOrientationHelper(localeId, "characters", *status);
+}
+
+U_CAPI ULayoutType U_EXPORT2
+uloc_getLineOrientation(const char* localeId,
+                        UErrorCode *status)
+{
+    return _uloc_getOrientationHelper(localeId, "lines", *status);
+}

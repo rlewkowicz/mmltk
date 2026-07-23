@@ -1,0 +1,4 @@
+#filter dumbComments emptyLines
+
+
+#include init/all.js

@@ -1,0 +1,73 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_l10n_L10nMutations_h
+#define mozilla_dom_l10n_L10nMutations_h
+
+#include "nsCycleCollectionParticipant.h"
+#include "nsHashKeys.h"
+#include "nsRefreshObservers.h"
+#include "nsStubMutationObserver.h"
+#include "nsTHashSet.h"
+
+class nsRefreshDriver;
+
+namespace mozilla::dom {
+class Document;
+class DOMLocalization;
+class L10nMutations final : public nsStubMultiMutationObserver,
+                            public nsARefreshObserver {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(L10nMutations, nsIMutationObserver)
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTAPPENDED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTINSERTED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTREMOVED
+  NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTECHANGED
+
+  explicit L10nMutations(DOMLocalization* aDOMLocalization);
+
+  void PauseObserving();
+
+  void ResumeObserving();
+
+  void Disconnect();
+
+  void OnCreatePresShell();
+
+  bool HasPendingMutations() const {
+    return !mPendingElements.IsEmpty() || mPendingPromises;
+  }
+
+  MOZ_CAN_RUN_SCRIPT void PendingPromiseSettled();
+
+ private:
+  bool mObserving = false;
+  bool mBlockingLoad = false;
+  bool mPendingBlockingLoadFlush = false;
+  uint32_t mPendingPromises = 0;
+  RefPtr<nsRefreshDriver> mRefreshDriver;
+  DOMLocalization* mDOMLocalization;
+
+  nsTHashSet<RefPtr<Element>> mPendingElementsHash;
+  nsTArray<RefPtr<Element>> mPendingElements;
+
+  Document* GetDocument() const;
+
+  MOZ_CAN_RUN_SCRIPT void WillRefresh(mozilla::TimeStamp aTime) override;
+
+  void StartRefreshObserver();
+  void StopRefreshObserver();
+  void L10nElementChanged(Element* aElement);
+  MOZ_CAN_RUN_SCRIPT void FlushPendingTranslations();
+  MOZ_CAN_RUN_SCRIPT void FlushPendingTranslationsBeforeLoad();
+  MOZ_CAN_RUN_SCRIPT void MaybeFirePendingTranslationsFinished();
+
+  ~L10nMutations();
+  bool IsInRoots(nsINode* aNode);
+};
+
+}  
+
+#endif  // mozilla_dom_l10n_L10nMutations_h__

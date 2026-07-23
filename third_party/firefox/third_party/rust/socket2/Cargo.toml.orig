@@ -1,0 +1,53 @@
+[package]
+name          = "socket2"
+version       = "0.6.3"
+authors       = [
+  "Alex Crichton <alex@alexcrichton.com>",
+  "Thomas de Zeeuw <thomasdezeeuw@gmail.com>"
+]
+license       = "MIT OR Apache-2.0"
+repository    = "https://github.com/rust-lang/socket2"
+homepage      = "https://github.com/rust-lang/socket2"
+documentation = "https://docs.rs/socket2"
+description = """
+Utilities for handling networking sockets with a maximal amount of configuration
+possible intended.
+"""
+keywords      = ["io", "socket", "network"]
+categories    = ["api-bindings", "network-programming"]
+edition       = "2021"
+rust-version  = "1.70"
+include       = [
+  "Cargo.toml",
+  "LICENSE-APACHE",
+  "LICENSE-MIT",
+  "README.md",
+  "src/**/*.rs",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "x86_64-unknown-linux-gnu"
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[package.metadata.playground]
+features = ["all"]
+
+[features]
+# Enable all API, even ones not available on all OSs.
+all = []
+
+[dependencies]
+libc = "0.2"
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+  # Referenced via a type alias.
+  "libc::socklen_t",
+  "libc::*::socklen_t", # libc::socklen_t isn't always detected.
+  "libc::sa_family_t",
+  "libc::*::sa_family_t", # libc::sa_family_t is always detected.
+]

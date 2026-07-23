@@ -1,0 +1,69 @@
+#define BUILD  "20260327"
+
+#define HIDDEN __attribute__((visibility("hidden")))
+
+#include "mozilla/Attributes.h"
+#define INLINE MOZ_ALWAYS_INLINE
+
+#if defined(_MSC_VER)
+#define THREAD_LOCAL __declspec(thread)
+#else
+#define THREAD_LOCAL __thread
+#endif
+
+#define PACKAGE_NAME  "libjpeg-turbo"
+
+#define VERSION  "3.1.4.1"
+
+#ifdef HAVE_64BIT_BUILD
+#define SIZEOF_SIZE_T 8
+#else
+#define SIZEOF_SIZE_T 4
+#endif
+
+#ifndef _MSC_VER
+#define HAVE_BUILTIN_CTZL 1
+#endif
+
+#ifdef _MSC_VER
+#define HAVE_INTRIN_H 1
+#endif
+
+#if defined(_MSC_VER) && defined(HAVE_INTRIN_H)
+#if (SIZEOF_SIZE_T == 8)
+#define HAVE_BITSCANFORWARD64
+#elif (SIZEOF_SIZE_T == 4)
+#define HAVE_BITSCANFORWARD
+#endif
+#endif
+
+#if defined(__has_attribute)
+#if __has_attribute(fallthrough)
+#define FALLTHROUGH  __attribute__((fallthrough));
+#else
+#define FALLTHROUGH
+#endif
+#else
+#define FALLTHROUGH
+#endif
+
+
+#ifndef BITS_IN_JSAMPLE
+#define BITS_IN_JSAMPLE  8      /* use 8 or 12 */
+#endif
+
+#undef C_ARITH_CODING_SUPPORTED
+#undef D_ARITH_CODING_SUPPORTED
+#undef WITH_SIMD
+
+#if BITS_IN_JSAMPLE == 8
+
+
+
+#ifdef MOZ_WITH_SIMD
+#define WITH_SIMD 1
+#else
+#undef  WITH_SIMD
+#endif
+
+#endif

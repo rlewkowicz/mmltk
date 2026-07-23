@@ -1,0 +1,27 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+[equalsize="always"] > * {
+  flex: 1;
+  contain: inline-size;
+}
+
+treecol {
+  flex: 1 auto;
+  width: 0; 
+}
+
+#certmanager {
+  padding: 0;
+}
+
+richlistbox {
+  min-height: 15em;
+  contain: size;
+}
+
+richlistbox,
+richlistitem {
+  min-height: 30px;
+}

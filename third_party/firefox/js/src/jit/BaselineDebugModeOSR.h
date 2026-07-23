@@ -1,0 +1,28 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_BaselineDebugModeOSR_h
+#define jit_BaselineDebugModeOSR_h
+
+#include "jstypes.h"
+
+#include "debugger/DebugAPI.h"
+
+struct JS_PUBLIC_API JSContext;
+
+namespace js {
+namespace jit {
+
+
+[[nodiscard]] bool RecompileOnStackBaselineScriptsForDebugMode(
+    JSContext* cx, const DebugAPI::ExecutionObservableSet& obs,
+    DebugAPI::IsObserving observing);
+
+[[nodiscard]] bool RecompileBaselineScriptForDebugMode(
+    JSContext* cx, JSScript* script, DebugAPI::IsObserving observing);
+
+}  
+}  
+
+#endif  // jit_BaselineDebugModeOSR_h

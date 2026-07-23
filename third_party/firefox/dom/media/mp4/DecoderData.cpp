@@ -1,0 +1,328 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DecoderData.h"
+
+#include "Adts.h"
+#include "AnnexB.h"
+#include "BufferReader.h"
+#include "MP4Metadata.h"
+#include "VideoUtils.h"
+#include "gfxUtils.h"
+#include "mozilla/EndianUtils.h"
+#include "mozilla/Logging.h"
+#include "mp4parse.h"
+
+#define LOG(...) \
+  MOZ_LOG_FMT(gMP4MetadataLog, mozilla::LogLevel::Debug, __VA_ARGS__)
+
+using mozilla::media::TimeUnit;
+
+namespace mozilla {
+
+mozilla::Result<mozilla::Ok, nsresult> CryptoFile::DoUpdate(
+    const uint8_t* aData, size_t aLength) {
+  BufferReader reader(aData, aLength);
+  while (reader.Remaining()) {
+    PsshInfo psshInfo;
+    if (!reader.ReadArray(psshInfo.uuid, 16)) {
+      return mozilla::Err(NS_ERROR_FAILURE);
+    }
+
+    if (!reader.CanReadType<uint32_t>()) {
+      return mozilla::Err(NS_ERROR_FAILURE);
+    }
+    auto length = reader.ReadType<uint32_t>();
+
+    if (!reader.ReadArray(psshInfo.data, length)) {
+      return mozilla::Err(NS_ERROR_FAILURE);
+    }
+    pssh.AppendElement(std::move(psshInfo));
+  }
+  return mozilla::Ok();
+}
+
+static MediaResult UpdateTrackProtectedInfo(mozilla::TrackInfo& aConfig,
+                                            const Mp4parseSinfInfo& aSinf) {
+  if (aSinf.is_encrypted != 0) {
+    if (aSinf.scheme_type == MP4_PARSE_ENCRYPTION_SCHEME_TYPE_CENC) {
+      aConfig.mCrypto.mCryptoScheme = CryptoScheme::Cenc;
+    } else if (aSinf.scheme_type == MP4_PARSE_ENCRYPTION_SCHEME_TYPE_CBCS) {
+      aConfig.mCrypto.mCryptoScheme = CryptoScheme::Cbcs;
+    } else {
+      return MediaResult(
+          NS_ERROR_DOM_MEDIA_METADATA_ERR,
+          RESULT_DETAIL(
+              "Unsupported encryption scheme encountered aSinf.scheme_type=%d",
+              static_cast<int>(aSinf.scheme_type)));
+    }
+    aConfig.mCrypto.mIVSize = aSinf.iv_size;
+    aConfig.mCrypto.mKeyId.AppendElements(aSinf.kid.data, aSinf.kid.length);
+    aConfig.mCrypto.mCryptByteBlock = aSinf.crypt_byte_block;
+    aConfig.mCrypto.mSkipByteBlock = aSinf.skip_byte_block;
+    aConfig.mCrypto.mConstantIV.AppendElements(aSinf.constant_iv.data,
+                                               aSinf.constant_iv.length);
+  }
+  return NS_OK;
+}
+
+template <typename Mp4ParseTrackAudioOrVideoInfo>
+static MediaResult VerifyAudioOrVideoInfoAndRecordTelemetry(
+    Mp4ParseTrackAudioOrVideoInfo* audioOrVideoInfo) {
+
+
+  if (audioOrVideoInfo->sample_info_count == 0) {
+    return MediaResult(
+        NS_ERROR_DOM_MEDIA_METADATA_ERR,
+        RESULT_DETAIL("Got 0 sample info while verifying track."));
+  }
+
+  bool hasMultipleCodecs = false;
+  Mp4parseCodec codecType = audioOrVideoInfo->sample_info[0].codec_type;
+  for (uint32_t i = 0; i < audioOrVideoInfo->sample_info_count; i++) {
+    if (audioOrVideoInfo->sample_info[i].codec_type != codecType) {
+      hasMultipleCodecs = true;
+    }
+  }
+
+
+
+  if (hasMultipleCodecs) {
+    return MediaResult(
+        NS_ERROR_DOM_MEDIA_METADATA_ERR,
+        RESULT_DETAIL("Multiple codecs encountered while verifying track."));
+  }
+
+  return NS_OK;
+}
+
+MediaResult MP4AudioInfo::Update(const Mp4parseTrackInfo* aTrack,
+                                 const Mp4parseTrackAudioInfo* aAudio,
+                                 const IndiceWrapper* aIndices) {
+  auto rv = VerifyAudioOrVideoInfoAndRecordTelemetry(aAudio);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  Mp4parseCodec codecType = aAudio->sample_info[0].codec_type;
+  for (uint32_t i = 0; i < aAudio->sample_info_count; i++) {
+    if (aAudio->sample_info[i].protected_data.is_encrypted) {
+      auto rv = UpdateTrackProtectedInfo(*this,
+                                         aAudio->sample_info[i].protected_data);
+      NS_ENSURE_SUCCESS(rv, rv);
+      break;
+    }
+  }
+
+  Mp4parseByteData mp4ParseSampleCodecSpecific =
+      aAudio->sample_info[0].codec_specific_config;
+  Mp4parseByteData extraData = aAudio->sample_info[0].extra_data;
+  MOZ_ASSERT(mCodecSpecificConfig.is<NoCodecSpecificData>(),
+             "Should have no codec specific data yet");
+  if (codecType == MP4PARSE_CODEC_OPUS) {
+    mMimeType = "audio/opus"_ns;
+    OpusCodecSpecificData opusCodecSpecificData{};
+    if (mp4ParseSampleCodecSpecific.data &&
+        mp4ParseSampleCodecSpecific.length >= 12) {
+      uint16_t preskip = mozilla::LittleEndian::readUint16(
+          mp4ParseSampleCodecSpecific.data + 10);
+      opusCodecSpecificData.mContainerCodecDelayFrames = preskip;
+      LOG("Opus stream in MP4 container, {} microseconds of encoder delay "
+          "({}).",
+          opusCodecSpecificData.mContainerCodecDelayFrames, preskip);
+    } else {
+      opusCodecSpecificData.mContainerCodecDelayFrames = 0;
+    }
+    opusCodecSpecificData.mHeadersBinaryBlob->AppendElements(
+        mp4ParseSampleCodecSpecific.data, mp4ParseSampleCodecSpecific.length);
+    mCodecSpecificConfig =
+        AudioCodecSpecificVariant{std::move(opusCodecSpecificData)};
+  } else if (codecType == MP4PARSE_CODEC_AAC ||
+             codecType == MP4PARSE_CODEC_XHEAAC) {
+    mMimeType = "audio/mp4a-latm"_ns;
+    int64_t codecDelayTicks = aTrack->media_time;
+    uint32_t encoderDelayFrameCount = 0;
+    if (codecDelayTicks > 0) {
+      encoderDelayFrameCount = static_cast<uint32_t>(
+          std::lround(static_cast<double>(codecDelayTicks) *
+                      aAudio->sample_info->sample_rate / aTrack->time_scale));
+      LOG("AAC stream in MP4 container, {} frames of encoder delay.",
+          encoderDelayFrameCount);
+    }
+
+    uint64_t mediaFrameCount = 0;
+    if (aIndices) {
+      MP4SampleIndex::Indice firstIndice = {0};
+      MP4SampleIndex::Indice lastIndice = {0};
+      bool rv = aIndices->GetIndice(0, firstIndice);
+      rv |= aIndices->GetIndice(aIndices->Length() - 1, lastIndice);
+      if (rv) {
+        if (firstIndice.start_composition > lastIndice.end_composition) {
+          return MediaResult(
+              NS_ERROR_DOM_MEDIA_METADATA_ERR,
+              RESULT_DETAIL("Inconsistent start and end time in index"));
+        }
+        mediaFrameCount =
+            lastIndice.end_composition - firstIndice.start_composition;
+        LOG("AAC stream in MP4 container, total media duration is {} frames",
+            mediaFrameCount);
+      } else {
+        LOG("AAC stream in MP4 container, couldn't determine total media time");
+      }
+    }
+
+    AacCodecSpecificData aacCodecSpecificData{};
+
+    aacCodecSpecificData.mEncoderDelayFrames = encoderDelayFrameCount;
+    aacCodecSpecificData.mMediaFrameCount = mediaFrameCount;
+
+    aacCodecSpecificData.mDecoderConfigDescriptorBinaryBlob->AppendElements(
+        mp4ParseSampleCodecSpecific.data, mp4ParseSampleCodecSpecific.length);
+    aacCodecSpecificData.mEsDescriptorBinaryBlob->AppendElements(
+        extraData.data, extraData.length);
+    mCodecSpecificConfig =
+        AudioCodecSpecificVariant{std::move(aacCodecSpecificData)};
+  } else if (codecType == MP4PARSE_CODEC_FLAC) {
+    MOZ_ASSERT(extraData.length == 0,
+               "FLAC doesn't expect extra data so doesn't handle it!");
+    mMimeType = "audio/flac"_ns;
+    FlacCodecSpecificData flacCodecSpecificData{};
+    flacCodecSpecificData.mStreamInfoBinaryBlob->AppendElements(
+        mp4ParseSampleCodecSpecific.data, mp4ParseSampleCodecSpecific.length);
+    mCodecSpecificConfig =
+        AudioCodecSpecificVariant{std::move(flacCodecSpecificData)};
+  } else if (codecType == MP4PARSE_CODEC_MP3) {
+    mMimeType = "audio/mpeg"_ns;
+    mCodecSpecificConfig = AudioCodecSpecificVariant{Mp3CodecSpecificData{}};
+  }
+
+  mRate = aAudio->sample_info[0].sample_rate;
+  mChannels = aAudio->sample_info[0].channels;
+  mBitDepth = aAudio->sample_info[0].bit_depth;
+  if (aAudio->sample_info[0].extended_profile <= INT8_MAX) {
+    mExtendedProfile =
+        AssertedCast<int8_t>(aAudio->sample_info[0].extended_profile);
+  }
+  if (aTrack->duration > TimeUnit::MaxTicks()) {
+    mDuration = TimeUnit::FromInfinity();
+  } else {
+    mDuration =
+        TimeUnit(AssertedCast<int64_t>(aTrack->duration), aTrack->time_scale);
+  }
+  mMediaTime = TimeUnit(aTrack->media_time, aTrack->time_scale);
+  mTrackId = aTrack->track_id;
+
+  if (aAudio->sample_info[0].profile <= 4) {
+    mProfile = AssertedCast<int8_t>(aAudio->sample_info[0].profile);
+  }
+
+  if (mCodecSpecificConfig.is<NoCodecSpecificData>()) {
+    MOZ_ASSERT(
+        extraData.length == 0,
+        "Codecs that use extra data should be explicitly handled already");
+    AudioCodecSpecificBinaryBlob codecSpecificBinaryBlob;
+    codecSpecificBinaryBlob.mBinaryBlob->AppendElements(
+        mp4ParseSampleCodecSpecific.data, mp4ParseSampleCodecSpecific.length);
+    mCodecSpecificConfig =
+        AudioCodecSpecificVariant{std::move(codecSpecificBinaryBlob)};
+  }
+
+  return NS_OK;
+}
+
+bool MP4AudioInfo::IsValid() const {
+  return mChannels > 0 && mRate > 0 &&
+         (!mMimeType.EqualsLiteral("audio/mp4a-latm") || mProfile > 0 ||
+          mExtendedProfile > 0);
+}
+
+MediaResult MP4VideoInfo::Update(const Mp4parseTrackInfo* track,
+                                 const Mp4parseTrackVideoInfo* video) {
+  auto rv = VerifyAudioOrVideoInfoAndRecordTelemetry(video);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  Mp4parseCodec codecType = video->sample_info[0].codec_type;
+  for (uint32_t i = 0; i < video->sample_info_count; i++) {
+    if (video->sample_info[i].protected_data.is_encrypted) {
+      auto rv =
+          UpdateTrackProtectedInfo(*this, video->sample_info[i].protected_data);
+      NS_ENSURE_SUCCESS(rv, rv);
+      break;
+    }
+  }
+
+  if (codecType == MP4PARSE_CODEC_AVC) {
+    mMimeType = "video/avc"_ns;
+  } else if (codecType == MP4PARSE_CODEC_VP9) {
+    mMimeType = "video/vp9"_ns;
+  } else if (codecType == MP4PARSE_CODEC_AV1) {
+    mMimeType = "video/av1"_ns;
+  } else if (codecType == MP4PARSE_CODEC_MP4V) {
+    mMimeType = "video/mp4v-es"_ns;
+  } else if (codecType == MP4PARSE_CODEC_HEVC) {
+    mMimeType = "video/hevc"_ns;
+  }
+  mTrackId = track->track_id;
+  if (track->duration > TimeUnit::MaxTicks()) {
+    mDuration = TimeUnit::FromInfinity();
+  } else {
+    mDuration =
+        TimeUnit(AssertedCast<int64_t>(track->duration), track->time_scale);
+  }
+  mMediaTime = TimeUnit(track->media_time, track->time_scale);
+  mDisplay.width = AssertedCast<int32_t>(video->display_width);
+  mDisplay.height = AssertedCast<int32_t>(video->display_height);
+  mImage.width = video->sample_info[0].image_width;
+  mImage.height = video->sample_info[0].image_height;
+  mRotation = ToSupportedRotation(video->rotation);
+  Mp4parseByteData extraData = video->sample_info[0].extra_data;
+  mExtraData->AppendElements(extraData.data, extraData.length);
+  const auto& si = video->sample_info[0];
+  if (si.has_colour_info) {
+    mTransferFunction = gfxUtils::CicpToTransferFunction(
+        static_cast<gfx::CICP::TransferCharacteristics>(
+            si.transfer_characteristics));
+    mColorPrimaries = gfxUtils::CicpToColorPrimaries(
+        static_cast<gfx::CICP::ColourPrimaries>(si.colour_primaries),
+        gMP4MetadataLog);
+    mColorSpace = gfxUtils::CicpToColorSpace(
+        static_cast<gfx::CICP::MatrixCoefficients>(si.matrix_coefficients),
+        static_cast<gfx::CICP::ColourPrimaries>(si.colour_primaries),
+        gMP4MetadataLog);
+    mColorRange =
+        si.full_range_flag ? gfx::ColorRange::FULL : gfx::ColorRange::LIMITED;
+  }
+  if (si.has_mastering_display || si.has_content_light_level) {
+    gfx::HDRMetadata hdr;
+    if (si.has_mastering_display) {
+      const auto& md = si.mastering_display;
+      gfx::Smpte2086Metadata smpte;
+      smpte.displayPrimaryRed = {md.display_primaries_x[0] / 50000.0f,
+                                 md.display_primaries_y[0] / 50000.0f};
+      smpte.displayPrimaryGreen = {md.display_primaries_x[1] / 50000.0f,
+                                   md.display_primaries_y[1] / 50000.0f};
+      smpte.displayPrimaryBlue = {md.display_primaries_x[2] / 50000.0f,
+                                  md.display_primaries_y[2] / 50000.0f};
+      smpte.whitePoint = {md.white_point_x / 50000.0f,
+                          md.white_point_y / 50000.0f};
+      smpte.maxLuminance = md.max_display_mastering_luminance / 10000.0f;
+      smpte.minLuminance = md.min_display_mastering_luminance / 10000.0f;
+      hdr.mSmpte2086 = Some(smpte);
+    }
+    if (si.has_content_light_level) {
+      const auto& cll = si.content_light_level;
+      hdr.mContentLightLevel = Some(gfx::ContentLightLevel{
+          cll.max_content_light_level, cll.max_pic_average_light_level});
+    }
+    mHDRMetadata = Some(hdr);
+  }
+  return NS_OK;
+}
+
+bool MP4VideoInfo::IsValid() const {
+  return (mDisplay.width > 0 && mDisplay.height > 0) ||
+         (mImage.width > 0 && mImage.height > 0);
+}
+
+}  
+
+#undef LOG

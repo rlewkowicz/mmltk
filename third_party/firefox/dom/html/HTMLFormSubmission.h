@@ -1,0 +1,183 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_HTMLFormSubmission_h
+#define mozilla_dom_HTMLFormSubmission_h
+
+#include "mozilla/Encoding.h"
+#include "mozilla/dom/HTMLDialogElement.h"
+#include "mozilla/dom/UserActivation.h"
+#include "nsCOMPtr.h"
+#include "nsString.h"
+
+class nsIURI;
+class nsIInputStream;
+class nsGenericHTMLElement;
+class nsIMultiplexInputStream;
+
+namespace mozilla::dom {
+
+class Blob;
+class DialogFormSubmission;
+class Directory;
+class Element;
+class HTMLFormElement;
+
+class HTMLFormSubmission {
+ public:
+  static nsresult GetFromForm(HTMLFormElement* aForm,
+                              nsGenericHTMLElement* aSubmitter,
+                              NotNull<const Encoding*>& aEncoding,
+                              FormData* aFormData,
+                              HTMLFormSubmission** aFormSubmission);
+
+  MOZ_COUNTED_DTOR_VIRTUAL(HTMLFormSubmission)
+
+  virtual nsresult AddNameValuePair(const nsAString& aName,
+                                    const nsAString& aValue) = 0;
+
+  virtual nsresult AddNameBlobPair(const nsAString& aName, Blob* aBlob) = 0;
+
+  virtual nsresult AddNameDirectoryPair(const nsAString& aName,
+                                        Directory* aDirectory) = 0;
+
+  virtual nsresult GetEncodedSubmission(nsIURI* aURI,
+                                        nsIInputStream** aPostDataStream,
+                                        nsCOMPtr<nsIURI>& aOutURI) = 0;
+
+  void GetCharset(nsACString& aCharset) { mEncoding->Name(aCharset); }
+
+  nsIURI* GetActionURL() const { return mActionURL; }
+
+  void GetTarget(nsAString& aTarget) { aTarget = mTarget; }
+
+  bool IsInitiatedFromUserInput() const { return mInitiatedFromUserInput; }
+
+  virtual DialogFormSubmission* GetAsDialogSubmission() { return nullptr; }
+
+  FormData* GetFormData() const { return mFormData; }
+
+  virtual Element* GetSubmitterElement() const;
+
+ protected:
+  HTMLFormSubmission(nsIURI* aActionURL, const nsAString& aTarget,
+                     mozilla::NotNull<const mozilla::Encoding*> aEncoding);
+
+  nsCOMPtr<nsIURI> mActionURL;
+
+  nsString mTarget;
+
+  mozilla::NotNull<const mozilla::Encoding*> mEncoding;
+
+  RefPtr<FormData> mFormData;
+
+  bool mInitiatedFromUserInput;
+};
+
+class EncodingFormSubmission : public HTMLFormSubmission {
+ public:
+  EncodingFormSubmission(nsIURI* aActionURL, const nsAString& aTarget,
+                         mozilla::NotNull<const mozilla::Encoding*> aEncoding,
+                         Element* aSubmitter);
+
+  virtual ~EncodingFormSubmission();
+
+  enum EncodeType {
+    eNameEncode,
+    eFilenameEncode,
+    eValueEncode,
+  };
+
+  nsresult EncodeVal(const nsAString& aStr, nsCString& aOut,
+                     EncodeType aEncodeType);
+};
+
+class DialogFormSubmission final : public HTMLFormSubmission {
+ public:
+  DialogFormSubmission(nsAString& aResult, NotNull<const Encoding*> aEncoding,
+                       HTMLDialogElement* aDialogElement)
+      : HTMLFormSubmission(nullptr, u""_ns, aEncoding),
+        mDialogElement(aDialogElement),
+        mReturnValue(aResult) {}
+  nsresult AddNameValuePair(const nsAString& aName,
+                            const nsAString& aValue) override {
+    MOZ_CRASH("This method should not be called");
+    return NS_OK;
+  }
+
+  nsresult AddNameBlobPair(const nsAString& aName, Blob* aBlob) override {
+    MOZ_CRASH("This method should not be called");
+    return NS_OK;
+  }
+
+  nsresult AddNameDirectoryPair(const nsAString& aName,
+                                Directory* aDirectory) override {
+    MOZ_CRASH("This method should not be called");
+    return NS_OK;
+  }
+
+  nsresult GetEncodedSubmission(nsIURI* aURI, nsIInputStream** aPostDataStream,
+                                nsCOMPtr<nsIURI>& aOutURI) override {
+    MOZ_CRASH("This method should not be called");
+    return NS_OK;
+  }
+
+  DialogFormSubmission* GetAsDialogSubmission() override { return this; }
+
+  HTMLDialogElement* DialogElement() { return mDialogElement; }
+
+  nsString& ReturnValue() { return mReturnValue; }
+
+ private:
+  const RefPtr<HTMLDialogElement> mDialogElement;
+  nsString mReturnValue;
+};
+
+class FSMultipartFormData : public EncodingFormSubmission {
+ public:
+  FSMultipartFormData(nsIURI* aActionURL, const nsAString& aTarget,
+                      mozilla::NotNull<const mozilla::Encoding*> aEncoding,
+                      Element* aSubmitter);
+  ~FSMultipartFormData();
+
+  virtual nsresult AddNameValuePair(const nsAString& aName,
+                                    const nsAString& aValue) override;
+
+  virtual nsresult AddNameBlobPair(const nsAString& aName,
+                                   Blob* aBlob) override;
+
+  virtual nsresult AddNameDirectoryPair(const nsAString& aName,
+                                        Directory* aDirectory) override;
+
+  virtual nsresult GetEncodedSubmission(nsIURI* aURI,
+                                        nsIInputStream** aPostDataStream,
+                                        nsCOMPtr<nsIURI>& aOutURI) override;
+
+  void GetContentType(nsACString& aContentType) {
+    aContentType = "multipart/form-data; boundary="_ns + mBoundary;
+  }
+
+  nsIInputStream* GetSubmissionBody(uint64_t* aContentLength);
+
+ protected:
+  nsresult AddPostDataStream();
+
+ private:
+  void AddDataChunk(const nsACString& aName, const nsACString& aFilename,
+                    const nsACString& aContentType,
+                    nsIInputStream* aInputStream, uint64_t aInputStreamSize);
+  nsCOMPtr<nsIMultiplexInputStream> mPostData;
+
+  nsIInputStream* mPostDataStream;
+
+  nsCString mPostDataChunk;
+
+  nsCString mBoundary;
+
+  uint64_t mTotalLength;
+};
+
+}  
+
+#endif /* mozilla_dom_HTMLFormSubmission_h */

@@ -1,0 +1,756 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_TEXTUREHOST_H
+#define MOZILLA_GFX_TEXTUREHOST_H
+
+#include <stddef.h>              // for size_t
+#include <stdint.h>              // for uint64_t, uint32_t, uint8_t
+#include "mozilla/Assertions.h"  // for MOZ_ASSERT, etc
+#include "mozilla/Attributes.h"  // for override
+#include "mozilla/RefPtr.h"      // for RefPtr, already_AddRefed, etc
+#include "mozilla/dom/ipc/IdType.h"
+#include "mozilla/gfx/Logging.h"
+#include "mozilla/gfx/Matrix.h"
+#include "mozilla/gfx/Point.h"  // for IntSize, IntPoint
+#include "mozilla/gfx/Rect.h"
+#include "mozilla/gfx/Types.h"               // for SurfaceFormat, etc
+#include "mozilla/layers/CompositorTypes.h"  // for TextureFlags, etc
+#include "mozilla/layers/LayersTypes.h"      // for LayerRenderState, etc
+#include "mozilla/layers/LayersMessages.h"
+#include "mozilla/layers/LayersSurfaces.h"
+#include "mozilla/layers/TextureSourceProvider.h"
+#include "mozilla/mozalloc.h"  // for operator delete
+#include "mozilla/Range.h"
+#include "mozilla/UniquePtr.h"            // for UniquePtr
+#include "mozilla/UniquePtrExtensions.h"  // for UniqueFileHandle
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "nsCOMPtr.h"         // for already_AddRefed
+#include "nsDebug.h"          // for NS_WARNING
+#include "nsISupportsImpl.h"  // for MOZ_COUNT_CTOR, etc
+#include "nsRect.h"
+#include "nsRegion.h"       // for nsIntRegion
+#include "nsTraceRefcnt.h"  // for MOZ_COUNT_CTOR, etc
+#include "nscore.h"         // for nsACString
+#include "mozilla/layers/AtomicRefCountedWithFinalize.h"
+
+class MacIOSurface;
+namespace mozilla {
+namespace gfx {
+class DataSourceSurface;
+}
+
+namespace ipc {
+class Shmem;
+}  
+
+namespace wr {
+class DisplayListBuilder;
+class TransactionBuilder;
+class RenderTextureHost;
+}  
+
+namespace layers {
+
+class AndroidHardwareBuffer;
+class AndroidHardwareBufferTextureHost;
+class BufferDescriptor;
+class BufferTextureHost;
+class Compositor;
+class CompositableParentManager;
+class ReadLockDescriptor;
+class CompositorBridgeParent;
+class DXGITextureHostD3D11;
+class DXGIYCbCrTextureHostD3D11;
+class Fence;
+class SurfaceDescriptor;
+class HostIPCAllocator;
+class ISurfaceAllocator;
+class MacIOSurfaceTextureHostOGL;
+class ShmemTextureHost;
+class SurfaceTextureHost;
+class TextureHostOGL;
+class TextureReadLock;
+class TextureSourceOGL;
+class TextureSourceD3D11;
+class DataTextureSource;
+class PTextureParent;
+class RemoteTextureHostWrapper;
+class TextureParent;
+class WebRenderTextureHost;
+class WrappingTextureSourceYCbCrBasic;
+class TextureHostWrapperD3D11;
+
+class BigImageIterator {
+ public:
+  virtual void BeginBigImageIteration() = 0;
+  virtual void EndBigImageIteration() {};
+  virtual gfx::IntRect GetTileRect() = 0;
+  virtual size_t GetTileCount() = 0;
+  virtual bool NextTile() = 0;
+};
+
+class TextureSource : public RefCounted<TextureSource> {
+ public:
+  MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(TextureSource)
+
+  TextureSource();
+
+  virtual ~TextureSource();
+
+  virtual const char* Name() const = 0;
+
+  virtual void DeallocateDeviceData() {}
+
+  virtual gfx::IntSize GetSize() const = 0;
+
+  virtual gfx::SurfaceFormat GetFormat() const {
+    return gfx::SurfaceFormat::UNKNOWN;
+  }
+
+  virtual TextureSourceOGL* AsSourceOGL() {
+    gfxCriticalNote << "Failed to cast " << Name()
+                    << " into a TextureSourceOGL";
+    return nullptr;
+  }
+  virtual TextureSourceD3D11* AsSourceD3D11() { return nullptr; }
+  virtual DataTextureSource* AsDataTextureSource() { return nullptr; }
+
+  virtual BigImageIterator* AsBigImageIterator() { return nullptr; }
+
+  virtual void Unbind() {}
+
+  void SetNextSibling(TextureSource* aTexture) { mNextSibling = aTexture; }
+
+  TextureSource* GetNextSibling() const { return mNextSibling; }
+
+  TextureSource* GetSubSource(int index) {
+    switch (index) {
+      case 0:
+        return this;
+      case 1:
+        return GetNextSibling();
+      case 2:
+        return GetNextSibling() ? GetNextSibling()->GetNextSibling() : nullptr;
+    }
+    return nullptr;
+  }
+
+  void AddCompositableRef() { ++mCompositableCount; }
+
+  void ReleaseCompositableRef() {
+    --mCompositableCount;
+    MOZ_ASSERT(mCompositableCount >= 0);
+  }
+
+  virtual RefPtr<TextureSource> ExtractCurrentTile() {
+    NS_WARNING("Implementation does not expose tile sources");
+    return nullptr;
+  }
+
+  int NumCompositableRefs() const { return mCompositableCount; }
+
+  virtual bool Sync(bool aBlocking) { return true; }
+
+ protected:
+  RefPtr<TextureSource> mNextSibling;
+  int mCompositableCount;
+};
+
+template <typename T>
+class CompositableTextureRef {
+ public:
+  CompositableTextureRef() = default;
+
+  explicit CompositableTextureRef(const CompositableTextureRef& aOther) {
+    *this = aOther;
+  }
+
+  explicit CompositableTextureRef(T* aOther) { *this = aOther; }
+
+  ~CompositableTextureRef() {
+    if (mRef) {
+      mRef->ReleaseCompositableRef();
+    }
+  }
+
+  CompositableTextureRef& operator=(const CompositableTextureRef& aOther) {
+    if (aOther.get()) {
+      aOther->AddCompositableRef();
+    }
+    if (mRef) {
+      mRef->ReleaseCompositableRef();
+    }
+    mRef = aOther.get();
+    return *this;
+  }
+
+  CompositableTextureRef& operator=(T* aOther) {
+    if (aOther) {
+      aOther->AddCompositableRef();
+    }
+    if (mRef) {
+      mRef->ReleaseCompositableRef();
+    }
+    mRef = aOther;
+    return *this;
+  }
+
+  T* get() const { return mRef; }
+  operator T*() const { return mRef; }
+  T* operator->() const { return mRef; }
+  T& operator*() const { return *mRef; }
+
+ private:
+  RefPtr<T> mRef;
+};
+
+typedef CompositableTextureRef<TextureSource> CompositableTextureSourceRef;
+typedef CompositableTextureRef<TextureHost> CompositableTextureHostRef;
+
+class DataTextureSource : public TextureSource {
+ public:
+  DataTextureSource() : mOwner(0), mUpdateSerial(0) {}
+
+  const char* Name() const override { return "DataTextureSource"; }
+
+  DataTextureSource* AsDataTextureSource() override { return this; }
+
+  virtual bool Update(gfx::DataSourceSurface* aSurface,
+                      nsIntRegion* aDestRegion = nullptr,
+                      gfx::IntPoint* aSrcOffset = nullptr,
+                      gfx::IntPoint* aDstOffset = nullptr) = 0;
+
+  uint32_t GetUpdateSerial() const { return mUpdateSerial; }
+  void SetUpdateSerial(uint32_t aValue) { mUpdateSerial = aValue; }
+
+  void DeallocateDeviceData() override { SetUpdateSerial(0); }
+
+#ifdef DEBUG
+  virtual already_AddRefed<gfx::DataSourceSurface> ReadBack() {
+    return nullptr;
+  };
+#endif
+
+  void SetOwner(TextureHost* aOwner) {
+    auto newOwner = (uintptr_t)aOwner;
+    if (newOwner != mOwner) {
+      mOwner = newOwner;
+      SetUpdateSerial(0);
+    }
+  }
+
+  bool IsOwnedBy(TextureHost* aOwner) const {
+    return mOwner == (uintptr_t)aOwner;
+  }
+
+  bool HasOwner() const { return !IsOwnedBy(nullptr); }
+
+ private:
+  uintptr_t mOwner;
+  uint32_t mUpdateSerial;
+};
+
+enum class TextureHostType : int8_t {
+  Unknown = 0,
+  Buffer,
+  DXGI,
+  DXGIYCbCr,
+  DcompSurface,
+  DMABUF,
+  MacIOSurface,
+  AndroidSurfaceTexture,
+  AndroidHardwareBuffer,
+  EGLImage,
+  GLTexture,
+  Last
+};
+
+class TextureHost : public AtomicRefCountedWithFinalize<TextureHost> {
+  void Finalize();
+
+  friend class AtomicRefCountedWithFinalize<TextureHost>;
+
+ public:
+  TextureHost(TextureHostType aType, TextureFlags aFlags);
+
+ protected:
+  virtual ~TextureHost();
+
+ public:
+  static already_AddRefed<TextureHost> Create(
+      const SurfaceDescriptor& aDesc, ReadLockDescriptor&& aReadLock,
+      HostIPCAllocator* aDeallocator, LayersBackend aBackend,
+      TextureFlags aFlags, wr::MaybeExternalImageId& aExternalImageId);
+
+  virtual bool LockWithoutCompositor() { return true; }
+  virtual void UnlockWithoutCompositor() {}
+
+  virtual gfx::SurfaceFormat GetFormat() const = 0;
+  virtual gfx::SurfaceFormat GetReadFormat() const { return GetFormat(); }
+
+  virtual gfx::TransferFunction GetTransferFunction() const {
+    return gfx::TransferFunction::SRGB;
+  }
+
+  virtual gfx::YUVColorSpace GetYUVColorSpace() const {
+    return gfx::YUVColorSpace::Identity;
+  }
+
+  virtual gfx::ColorDepth GetColorDepth() const {
+    return gfx::ColorDepth::COLOR_8;
+  }
+
+  virtual gfx::ColorRange GetColorRange() const {
+    return gfx::ColorRange::LIMITED;
+  }
+
+  virtual void UnbindTextureSource();
+
+  virtual bool IsValid() { return true; }
+
+  virtual void DeallocateDeviceData() {}
+
+  virtual void DeallocateSharedData() {}
+
+  virtual void ForgetSharedData() {}
+
+  virtual gfx::IntSize GetSize() const = 0;
+
+  virtual void SetCropRect(nsIntRect aCropRect) {}
+
+  virtual already_AddRefed<gfx::DataSourceSurface> GetAsSurface(
+      gfx::DataSourceSurface* aSurface = nullptr) = 0;
+
+  void SetFlags(TextureFlags aFlags) { mFlags = aFlags; }
+
+  void AddFlag(TextureFlags aFlag) { mFlags |= aFlag; }
+
+  TextureFlags GetFlags() { return mFlags; }
+
+  wr::MaybeExternalImageId GetMaybeExternalImageId() const {
+    return mExternalImageId;
+  }
+
+  static already_AddRefed<PTextureParent> CreateIPDLActor(
+      HostIPCAllocator* aAllocator, const SurfaceDescriptor& aSharedData,
+      ReadLockDescriptor&& aDescriptor, LayersBackend aLayersBackend,
+      TextureFlags aFlags, const dom::ContentParentId& aContentId,
+      uint64_t aSerial, const wr::MaybeExternalImageId& aExternalImageId);
+  static bool DestroyIPDLActor(PTextureParent* actor);
+
+  static void ReceivedDestroy(PTextureParent* actor);
+
+  static TextureHost* AsTextureHost(PTextureParent* actor);
+
+  static uint64_t GetTextureSerial(PTextureParent* actor);
+
+  static dom::ContentParentId GetTextureContentId(PTextureParent* actor);
+
+  PTextureParent* GetIPDLActor();
+
+  virtual void OnShutdown() {}
+
+  virtual void ForgetBufferActor() {}
+
+  virtual const char* Name() { return "TextureHost"; }
+
+  virtual bool NeedsDeferredDeletion() const { return true; }
+
+  void AddCompositableRef() {
+    ++mCompositableCount;
+    if (mCompositableCount == 1) {
+      PrepareForUse();
+    }
+  }
+
+  void ReleaseCompositableRef() {
+    --mCompositableCount;
+    MOZ_ASSERT(mCompositableCount >= 0);
+    if (mCompositableCount == 0) {
+      UnbindTextureSource();
+      NotifyNotUsed();
+    }
+  }
+
+  int NumCompositableRefs() const { return mCompositableCount; }
+
+  void SetLastFwdTransactionId(uint64_t aTransactionId);
+
+  void DeserializeReadLock(ReadLockDescriptor&& aDesc,
+                           ISurfaceAllocator* aAllocator);
+  void SetReadLocked();
+
+  TextureReadLock* GetReadLock() { return mReadLock; }
+
+  virtual BufferTextureHost* AsBufferTextureHost() { return nullptr; }
+  virtual ShmemTextureHost* AsShmemTextureHost() { return nullptr; }
+  virtual MacIOSurfaceTextureHostOGL* AsMacIOSurfaceTextureHost() {
+    return nullptr;
+  }
+  virtual WebRenderTextureHost* AsWebRenderTextureHost() { return nullptr; }
+  virtual SurfaceTextureHost* AsSurfaceTextureHost() { return nullptr; }
+  virtual AndroidHardwareBufferTextureHost*
+  AsAndroidHardwareBufferTextureHost() {
+    return nullptr;
+  }
+  virtual RemoteTextureHostWrapper* AsRemoteTextureHostWrapper() {
+    return nullptr;
+  }
+
+  virtual TextureHostWrapperD3D11* AsTextureHostWrapperD3D11() {
+    return nullptr;
+  }
+
+  virtual DXGITextureHostD3D11* AsDXGITextureHostD3D11() { return nullptr; }
+
+  virtual DXGIYCbCrTextureHostD3D11* AsDXGIYCbCrTextureHostD3D11() {
+    return nullptr;
+  }
+
+  virtual bool IsWrappingSurfaceTextureHost() { return false; }
+
+  virtual void CreateRenderTexture(
+      const wr::ExternalImageId& aExternalImageId) {
+    MOZ_RELEASE_ASSERT(
+        false,
+        "No CreateRenderTexture() implementation for this TextureHost type.");
+  }
+
+  void EnsureRenderTexture(const wr::MaybeExternalImageId& aExternalImageId);
+
+  virtual void MaybeDestroyRenderTexture();
+
+  static void DestroyRenderTexture(const wr::ExternalImageId& aExternalImageId);
+
+  virtual uint32_t NumSubTextures() { return 1; }
+
+  enum ResourceUpdateOp {
+    ADD_IMAGE,
+    UPDATE_IMAGE,
+  };
+
+  virtual void PushResourceUpdates(wr::TransactionBuilder& aResources,
+                                   ResourceUpdateOp aOp,
+                                   const Range<wr::ImageKey>& aImageKeys,
+                                   const wr::ExternalImageId& aExtID) {
+    MOZ_ASSERT_UNREACHABLE("Unimplemented");
+  }
+
+  enum class PushDisplayItemFlag {
+    PREFER_COMPOSITOR_SURFACE,
+
+    SUPPORTS_EXTERNAL_BUFFER_TEXTURES,
+
+    EXTERNAL_COMPOSITING_DISABLED,
+  };
+  using PushDisplayItemFlagSet = EnumSet<PushDisplayItemFlag>;
+
+  virtual void PushDisplayItems(wr::DisplayListBuilder& aBuilder,
+                                const wr::LayoutRect& aBounds,
+                                const wr::LayoutRect& aClip,
+                                wr::ImageRendering aFilter,
+                                const Range<wr::ImageKey>& aKeys,
+                                PushDisplayItemFlagSet aFlags) {
+    MOZ_ASSERT_UNREACHABLE(
+        "No PushDisplayItems() implementation for this TextureHost type.");
+  }
+
+  virtual MacIOSurface* GetMacIOSurface() { return nullptr; }
+
+  virtual bool NeedsYFlip() const;
+
+  virtual AndroidHardwareBuffer* GetAndroidHardwareBuffer() const {
+    return nullptr;
+  }
+
+  virtual bool SupportsExternalCompositing(WebRenderBackend aBackend) {
+    return false;
+  }
+
+  virtual TextureHostType GetTextureHostType() { return mTextureHostType; }
+
+  virtual void SetReadFence(Fence* aReadFence) {}
+
+  enum NativeTexturePolicy {
+    REQUIRE,
+    FORBID,
+    DONT_CARE,
+  };
+
+  static NativeTexturePolicy BackendNativeTexturePolicy(
+      layers::WebRenderBackend, gfx::IntSize) {
+    return DONT_CARE;
+  }
+
+  void SetDestroyedCallback(std::function<void()>&& aDestroyedCallback) {
+    MOZ_ASSERT(!mDestroyedCallback);
+    mDestroyedCallback = std::move(aDestroyedCallback);
+  }
+
+ protected:
+  virtual void ReadUnlock();
+
+  void RecycleTexture(TextureFlags aFlags);
+
+  virtual void PrepareForUse();
+
+  virtual void NotifyNotUsed();
+
+  void CallNotifyNotUsed();
+
+  TextureHostType mTextureHostType;
+  RefPtr<TextureParent> mActor;
+  RefPtr<TextureReadLock> mReadLock;
+  TextureFlags mFlags;
+  int mCompositableCount;
+  uint64_t mFwdTransactionId;
+  bool mReadLocked;
+  wr::MaybeExternalImageId mExternalImageId;
+
+  std::function<void()> mDestroyedCallback;
+
+  friend class Compositor;
+  friend class RemoteTextureHostWrapper;
+  friend class TextureParent;
+  friend class TextureSourceProvider;
+  friend class GPUVideoTextureHost;
+  friend class WebRenderTextureHost;
+  friend class TextureHostWrapperD3D11;
+};
+
+class BufferTextureHost : public TextureHost {
+ public:
+  BufferTextureHost(const BufferDescriptor& aDescriptor, TextureFlags aFlags);
+
+  virtual ~BufferTextureHost();
+
+  virtual uint8_t* GetBuffer() const = 0;
+  virtual uint16_t* GetBuffer16() const = 0;
+
+  virtual size_t GetBufferSize() const = 0;
+
+  void UnbindTextureSource() override;
+
+  void DeallocateDeviceData() override;
+
+  gfx::SurfaceFormat GetFormat() const override;
+
+  gfx::YUVColorSpace GetYUVColorSpace() const override;
+
+  gfx::TransferFunction GetTransferFunction() const override;
+
+  gfx::ColorDepth GetColorDepth() const override;
+
+  gfx::ColorRange GetColorRange() const override;
+
+  gfx::ChromaSubsampling GetChromaSubsampling() const;
+
+  gfx::IntSize GetSize() const override { return mSize; }
+
+  already_AddRefed<gfx::DataSourceSurface> GetAsSurface(
+      gfx::DataSourceSurface* aSurface) override;
+
+  bool NeedsDeferredDeletion() const override {
+    return TextureHost::NeedsDeferredDeletion() || UseExternalTextures();
+  }
+
+  BufferTextureHost* AsBufferTextureHost() override { return this; }
+
+  const BufferDescriptor& GetBufferDescriptor() const { return mDescriptor; }
+
+  void CreateRenderTexture(
+      const wr::ExternalImageId& aExternalImageId) override;
+
+  uint32_t NumSubTextures() override;
+
+  void PushResourceUpdates(wr::TransactionBuilder& aResources,
+                           ResourceUpdateOp aOp,
+                           const Range<wr::ImageKey>& aImageKeys,
+                           const wr::ExternalImageId& aExtID) override;
+
+  void PushDisplayItems(wr::DisplayListBuilder& aBuilder,
+                        const wr::LayoutRect& aBounds,
+                        const wr::LayoutRect& aClip, wr::ImageRendering aFilter,
+                        const Range<wr::ImageKey>& aImageKeys,
+                        PushDisplayItemFlagSet aFlags) override;
+
+  bool IsYCbCr() const;
+
+  uint8_t* GetYChannel();
+  uint8_t* GetCbChannel();
+  uint8_t* GetCrChannel();
+  uint16_t* GetYChannel16();
+  uint16_t* GetCbChannel16();
+  uint16_t* GetCrChannel16();
+  int32_t GetYStride() const;
+  int32_t GetCbCrStride() const;
+
+ protected:
+  bool UseExternalTextures() const { return mUseExternalTextures; }
+
+  BufferDescriptor mDescriptor;
+  RefPtr<Compositor> mCompositor;
+  gfx::IntSize mSize;
+  gfx::SurfaceFormat mFormat;
+  bool mLocked;
+  bool mUseExternalTextures;
+
+  class DataTextureSourceYCbCrBasic;
+};
+
+class ShmemTextureHost : public BufferTextureHost {
+ public:
+  ShmemTextureHost(const mozilla::ipc::Shmem& aShmem,
+                   const BufferDescriptor& aDesc,
+                   ISurfaceAllocator* aDeallocator, TextureFlags aFlags);
+
+ protected:
+  ~ShmemTextureHost();
+
+ public:
+  void DeallocateSharedData() override;
+
+  void ForgetSharedData() override;
+
+  uint8_t* GetBuffer() const override;
+  uint16_t* GetBuffer16() const override;
+
+  size_t GetBufferSize() const override;
+
+  const char* Name() override { return "ShmemTextureHost"; }
+
+  void OnShutdown() override;
+
+  ShmemTextureHost* AsShmemTextureHost() override { return this; }
+
+  void OnRenderTextureCreated(wr::RenderTextureHost* aRenderTexture);
+
+ protected:
+  class ShmemDeallocRunnable final : public Runnable {
+   public:
+    ShmemDeallocRunnable(ISurfaceAllocator* aDeallocator,
+                         UniquePtr<mozilla::ipc::Shmem>&& aShmem);
+    NS_IMETHOD Run() override;
+    mozilla::ipc::Shmem* GetShmem() { return mShmem.get(); }
+
+   protected:
+    virtual ~ShmemDeallocRunnable();
+
+    RefPtr<ISurfaceAllocator> mDeallocator;
+    UniquePtr<mozilla::ipc::Shmem> mShmem;
+  };
+
+  RefPtr<ISurfaceAllocator> mDeallocator;
+  RefPtr<ShmemDeallocRunnable> mShmemDeallocRunnable;
+};
+
+class MemoryTextureHost : public BufferTextureHost {
+ public:
+  MemoryTextureHost(uint8_t* aBuffer, const BufferDescriptor& aDesc,
+                    TextureFlags aFlags);
+
+ protected:
+  ~MemoryTextureHost();
+
+ public:
+  void DeallocateSharedData() override;
+
+  void ForgetSharedData() override;
+
+  uint8_t* GetBuffer() const override;
+  uint16_t* GetBuffer16() const override;
+
+  size_t GetBufferSize() const override;
+
+  const char* Name() override { return "MemoryTextureHost"; }
+
+ protected:
+  uint8_t* mBuffer;
+};
+
+class MOZ_STACK_CLASS AutoLockTextureHostWithoutCompositor {
+ public:
+  explicit AutoLockTextureHostWithoutCompositor(TextureHost* aTexture)
+      : mTexture(aTexture) {
+    mLocked = mTexture ? mTexture->LockWithoutCompositor() : false;
+  }
+
+  ~AutoLockTextureHostWithoutCompositor() {
+    if (mTexture && mLocked) {
+      mTexture->UnlockWithoutCompositor();
+    }
+  }
+
+  bool Failed() { return mTexture && !mLocked; }
+
+ private:
+  RefPtr<TextureHost> mTexture;
+  bool mLocked;
+};
+
+class CompositingRenderTarget : public TextureSource {
+ public:
+  explicit CompositingRenderTarget(const gfx::IntPoint& aOrigin)
+      : mClearOnBind(false),
+        mOrigin(aOrigin),
+        mZNear(0),
+        mZFar(0),
+        mHasComplexProjection(false),
+        mEnableDepthBuffer(false) {}
+  virtual ~CompositingRenderTarget() = default;
+
+  const char* Name() const override { return "CompositingRenderTarget"; }
+
+#ifdef MOZ_DUMP_PAINTING
+  virtual already_AddRefed<gfx::DataSourceSurface> Dump(
+      Compositor* aCompositor) {
+    return nullptr;
+  }
+#endif
+
+  void ClearOnBind() { mClearOnBind = true; }
+
+  const gfx::IntPoint& GetOrigin() const { return mOrigin; }
+  gfx::IntRect GetRect() { return gfx::IntRect(GetOrigin(), GetSize()); }
+
+  bool HasComplexProjection() const { return mHasComplexProjection; }
+  void ClearProjection() { mHasComplexProjection = false; }
+  void SetProjection(const gfx::Matrix4x4& aNewMatrix, bool aEnableDepthBuffer,
+                     float aZNear, float aZFar) {
+    mProjectionMatrix = aNewMatrix;
+    mEnableDepthBuffer = aEnableDepthBuffer;
+    mZNear = aZNear;
+    mZFar = aZFar;
+    mHasComplexProjection = true;
+  }
+  void GetProjection(gfx::Matrix4x4& aMatrix, bool& aEnableDepth, float& aZNear,
+                     float& aZFar) {
+    MOZ_ASSERT(mHasComplexProjection);
+    aMatrix = mProjectionMatrix;
+    aEnableDepth = mEnableDepthBuffer;
+    aZNear = mZNear;
+    aZFar = mZFar;
+  }
+
+ protected:
+  bool mClearOnBind;
+
+ private:
+  gfx::IntPoint mOrigin;
+
+  gfx::Matrix4x4 mProjectionMatrix;
+  float mZNear, mZFar;
+  bool mHasComplexProjection;
+  bool mEnableDepthBuffer;
+};
+
+already_AddRefed<TextureHost> CreateBackendIndependentTextureHost(
+    const SurfaceDescriptor& aDesc, ISurfaceAllocator* aDeallocator,
+    LayersBackend aBackend, TextureFlags aFlags);
+
+}  
+}  
+
+#endif

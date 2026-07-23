@@ -1,0 +1,153 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_FS_PARENT_RESULTSTATEMENT_H_
+#define DOM_FS_PARENT_RESULTSTATEMENT_H_
+
+#include "FileSystemParentTypes.h"
+#include "mozIStorageStatement.h"
+#include "mozilla/dom/FileSystemTypes.h"
+#include "mozilla/dom/quota/QuotaCommon.h"
+#include "mozilla/dom/quota/ResultExtensions.h"
+#include "nsCOMPtr.h"
+#include "nsString.h"
+
+class mozIStorageConnection;
+
+namespace mozilla::dom::fs {
+
+using Column = uint32_t;
+
+using ResultConnection = nsCOMPtr<mozIStorageConnection>;
+
+class ResultStatement {
+ public:
+  using underlying_t = nsCOMPtr<mozIStorageStatement>;
+
+  explicit ResultStatement(underlying_t aStmt) : mStmt(std::move(aStmt)) {}
+
+  ResultStatement(const ResultStatement& aOther)
+      : ResultStatement(aOther.mStmt) {}
+
+  ResultStatement(ResultStatement&& aOther) noexcept
+      : ResultStatement(std::move(aOther.mStmt)) {}
+
+  ResultStatement& operator=(const ResultStatement& aOther) = default;
+
+  ResultStatement& operator=(ResultStatement&& aOther) noexcept {
+    mStmt = std::move(aOther.mStmt);
+    return *this;
+  }
+
+  static Result<ResultStatement, QMResult> Create(
+      const ResultConnection& aConnection, const nsACString& aSQLStatement);
+
+
+  inline nsresult BindEntryIdByName(const nsACString& aField,
+                                    const EntryId& aValue) {
+    return mStmt->BindUTF8StringAsBlobByName(aField, aValue);
+  }
+
+  inline nsresult BindFileIdByName(const nsACString& aField,
+                                   const FileId& aValue) {
+    return mStmt->BindUTF8StringAsBlobByName(aField, aValue.Value());
+  }
+
+  inline nsresult BindContentTypeByName(const nsACString& aField,
+                                        const ContentType& aValue) {
+    if (aValue.IsVoid()) {
+      return mStmt->BindNullByName(aField);
+    }
+
+    return mStmt->BindUTF8StringByName(aField, aValue);
+  }
+
+  inline nsresult BindNameByName(const nsACString& aField, const Name& aValue) {
+    return mStmt->BindStringAsBlobByName(aField, aValue);
+  }
+
+  inline nsresult BindPageNumberByName(const nsACString& aField,
+                                       PageNumber aValue) {
+    return mStmt->BindInt32ByName(aField, aValue);
+  }
+
+  inline nsresult BindUsageByName(const nsACString& aField, Usage aValue) {
+    return mStmt->BindInt64ByName(aField, aValue);
+  }
+
+  inline nsresult BindBooleanByName(const nsACString& aField, bool aValue) {
+    return mStmt->BindInt32ByName(aField, aValue ? 1 : 0);
+  }
+
+  inline Result<bool, QMResult> GetBooleanByColumn(Column aColumn) {
+    int32_t value = 0;
+    QM_TRY(QM_TO_RESULT(mStmt->GetInt32(aColumn, &value)));
+
+    return 0 != value;
+  }
+
+  inline Result<ContentType, QMResult> GetContentTypeByColumn(Column aColumn) {
+    ContentType value;
+    QM_TRY(QM_TO_RESULT(mStmt->GetUTF8String(aColumn, value)));
+
+    return value;
+  }
+
+  inline Result<EntryId, QMResult> GetEntryIdByColumn(Column aColumn) {
+    EntryId value;
+    QM_TRY(QM_TO_RESULT(mStmt->GetBlobAsUTF8String(aColumn, value)));
+
+    return value;
+  }
+
+  inline Result<FileId, QMResult> GetFileIdByColumn(Column aColumn) {
+    nsCString value;
+    QM_TRY(QM_TO_RESULT(mStmt->GetBlobAsUTF8String(aColumn, value)));
+
+    return FileId(std::move(value));
+  }
+
+  inline Result<Name, QMResult> GetNameByColumn(Column aColumn) {
+    Name value;
+    QM_TRY(QM_TO_RESULT(mStmt->GetBlobAsString(aColumn, value)));
+
+    return value;
+  }
+
+  inline Result<Usage, QMResult> GetUsageByColumn(Column aColumn) {
+    Usage value = 0;
+    QM_TRY(QM_TO_RESULT(mStmt->GetInt64(aColumn, &value)));
+
+    return value;
+  }
+
+  inline bool IsNullByColumn(Column aColumn) const {
+    bool value = mStmt->IsNull(aColumn);
+
+    return value;
+  }
+
+  inline nsresult Execute() { return mStmt->Execute(); }
+
+  inline Result<bool, QMResult> ExecuteStep() {
+    bool hasEntries = false;
+    QM_TRY(QM_TO_RESULT(mStmt->ExecuteStep(&hasEntries)));
+
+    return hasEntries;
+  }
+
+  inline Result<bool, QMResult> YesOrNoQuery() {
+    bool hasEntries = false;
+    QM_TRY(QM_TO_RESULT(mStmt->ExecuteStep(&hasEntries)));
+    MOZ_ALWAYS_TRUE(hasEntries);
+    return GetBooleanByColumn(0u);
+  }
+
+ private:
+  underlying_t mStmt;
+};
+
+}  
+
+#endif  // DOM_FS_PARENT_RESULTSTATEMENT_H_

@@ -1,0 +1,18 @@
+
+
+#include <catch2/catch_tag_alias_autoregistrar.hpp>
+#include <catch2/internal/catch_compiler_capabilities.hpp>
+#include <catch2/interfaces/catch_interfaces_registry_hub.hpp>
+
+namespace Catch {
+
+RegistrarForTagAliases::RegistrarForTagAliases(char const* alias, char const* tag, SourceLineInfo const& lineInfo) {
+    CATCH_TRY {
+        getMutableRegistryHub().registerTagAlias(alias, tag, lineInfo);
+    }
+    CATCH_CATCH_ALL {
+        getMutableRegistryHub().registerStartupException();
+    }
+}
+
+}  

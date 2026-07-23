@@ -1,0 +1,96 @@
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
+
+#ifndef SPA_BUFFER_H
+#define SPA_BUFFER_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <spa/utils/defs.h>
+#include <spa/buffer/meta.h>
+
+#ifndef SPA_API_BUFFER
+ #ifdef SPA_API_IMPL
+  #define SPA_API_BUFFER SPA_API_IMPL
+ #else
+  #define SPA_API_BUFFER static inline
+ #endif
+#endif
+
+
+
+enum spa_data_type {
+	SPA_DATA_Invalid,
+	SPA_DATA_MemPtr,		
+	SPA_DATA_MemFd,			
+	SPA_DATA_DmaBuf,		
+	SPA_DATA_MemId,			
+	SPA_DATA_SyncObj,		
+
+	_SPA_DATA_LAST,			
+};
+
+struct spa_chunk {
+	uint32_t offset;		
+	uint32_t size;			
+	int32_t stride;			
+#define SPA_CHUNK_FLAG_NONE		0
+#define SPA_CHUNK_FLAG_CORRUPTED	(1u<<0)	/**< chunk data is corrupted in some way */
+#define SPA_CHUNK_FLAG_EMPTY		(1u<<1)	/**< chunk data is empty with media specific
+						  *  neutral data such as silence or black. This
+						  *  could be used to optimize processing. */
+	int32_t flags;			
+};
+
+struct spa_data {
+	uint32_t type;			
+#define SPA_DATA_FLAG_NONE	 0
+#define SPA_DATA_FLAG_READABLE	(1u<<0)	/**< data is readable */
+#define SPA_DATA_FLAG_WRITABLE	(1u<<1)	/**< data is writable */
+#define SPA_DATA_FLAG_DYNAMIC	(1u<<2)	/**< data pointer can be changed */
+#define SPA_DATA_FLAG_READWRITE	(SPA_DATA_FLAG_READABLE|SPA_DATA_FLAG_WRITABLE)
+#define SPA_DATA_FLAG_MAPPABLE	(1u<<3)	/**< data is mappable with simple mmap/munmap. Some memory
+					  *  types are not simply mappable (DmaBuf) unless explicitly
+					  *  specified with this flag. */
+	uint32_t flags;			
+	int64_t fd;			
+	uint32_t mapoffset;		
+	uint32_t maxsize;		
+	void *data;			
+	struct spa_chunk *chunk;	
+};
+
+struct spa_buffer {
+	uint32_t n_metas;		
+	uint32_t n_datas;		
+	struct spa_meta *metas;		
+	struct spa_data *datas;		
+};
+
+SPA_API_BUFFER struct spa_meta *spa_buffer_find_meta(const struct spa_buffer *b, uint32_t type)
+{
+	uint32_t i;
+
+	for (i = 0; i < b->n_metas; i++)
+		if (b->metas[i].type == type)
+			return &b->metas[i];
+
+	return NULL;
+}
+
+SPA_API_BUFFER void *spa_buffer_find_meta_data(const struct spa_buffer *b, uint32_t type, size_t size)
+{
+	struct spa_meta *m;
+	if ((m = spa_buffer_find_meta(b, type)) && m->size >= size)
+		return m->data;
+	return NULL;
+}
+
+
+#ifdef __cplusplus
+}  
+#endif
+
+#endif /* SPA_BUFFER_H */

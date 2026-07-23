@@ -1,0 +1,73 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkUserConfig_DEFINED)
+#define SkUserConfig_DEFINED
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#define MOZ_SKIA
+
+#define SK_A32_SHIFT 24
+#define SK_R32_SHIFT 16
+#define SK_G32_SHIFT 8
+#define SK_B32_SHIFT 0
+
+#define SK_ALLOW_STATIC_GLOBAL_INITIALIZERS 0
+
+#define SK_RASTERIZE_EVEN_ROUNDING
+
+#define I_ACKNOWLEDGE_SKIA_DOES_NOT_SUPPORT_BIG_ENDIAN
+
+#define SK_SUPPORT_GPU 0
+
+#define SK_ENABLE_LEGACY_SHADERCONTEXT
+
+#define SK_DISABLE_LEGACY_PNG_WRITEBUFFER
+
+#define SK_DISABLE_SLOW_DEBUG_VALIDATION 1
+
+#define SK_DISABLE_TYPEFACE_CACHE
+
+#define SK_USE_FREETYPE_EMBOLDEN
+
+#define SK_DISABLE_DIRECTWRITE_COLRv1 1
+
+#if !defined(MOZ_IMPLICIT)
+#if defined(MOZ_CLANG_PLUGIN)
+#    define MOZ_IMPLICIT __attribute__((annotate("moz_implicit")))
+#else
+#    define MOZ_IMPLICIT
+#endif
+#endif
+
+#define SK_DISABLE_LEGACY_IMAGE_READBUFFER
+
+#define SK_GAMMA_EXPONENT 1.0
+#define SK_GAMMA_CONTRAST 0.0
+
+#if defined(SK_BUILD_FOR_UNIX) || defined(SK_BUILD_FOR_ANDROID)
+#  define SK_GAMMA_APPLY_TO_A8
+#endif
+
+#endif

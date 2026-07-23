@@ -1,0 +1,472 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsFocusManager_h_
+#define nsFocusManager_h_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/dom/Document.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIContent.h"
+#include "nsIFocusManager.h"
+#include "nsIObserver.h"
+#include "nsPIDOMWindowInlines.h"  // FIXME: Stop including inline definitions!
+#include "nsWeakReference.h"
+
+#define FOCUSMANAGER_CONTRACTID "@mozilla.org/focus-manager;1"
+
+class nsIContent;
+class nsPIDOMWindowOuter;
+
+namespace mozilla {
+class PresShell;
+namespace dom {
+class Element;
+class HTMLAreaElement;
+struct FocusOptions;
+class BrowserParent;
+class ContentChild;
+class ContentParent;
+}  
+}  
+
+struct nsDelayedBlurOrFocusEvent;
+
+
+class nsFocusManager final : public nsIFocusManager,
+                             public nsIObserver,
+                             public nsSupportsWeakReference {
+  using InputContextAction = mozilla::widget::InputContextAction;
+  using Document = mozilla::dom::Document;
+  friend class mozilla::dom::ContentChild;
+  friend class mozilla::dom::ContentParent;
+
+ public:
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsFocusManager, nsIFocusManager)
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSIFOCUSMANAGER
+
+  static nsresult Init();
+  static void Shutdown();
+
+  MOZ_CAN_RUN_SCRIPT static void FocusWindow(
+      nsPIDOMWindowOuter* aWindow, mozilla::dom::CallerType aCallerType);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY static void PrefChanged(const char* aPref,
+                                                      void* aSelf);
+  MOZ_CAN_RUN_SCRIPT void PrefChanged(const char* aPref);
+
+  static nsFocusManager* GetFocusManager() { return sInstance; }
+
+  mozilla::dom::Element* GetFocusedElement() { return mFocusedElement; }
+  static mozilla::dom::Element* GetFocusedElementStatic() {
+    return sInstance ? sInstance->GetFocusedElement() : nullptr;
+  }
+
+  bool IsFocused(nsIContent* aContent);
+
+  bool IsTestMode();
+
+  nsPIDOMWindowOuter* GetFocusedWindow() const { return mFocusedWindow; }
+  static nsPIDOMWindowOuter* GetFocusedWindowStatic() {
+    return sInstance ? sInstance->GetFocusedWindow() : nullptr;
+  }
+
+  mozilla::dom::BrowsingContext* GetFocusedBrowsingContext() const {
+    if (XRE_IsParentProcess()) {
+      if (mFocusedWindow) {
+        return mFocusedWindow->GetBrowsingContext();
+      }
+      return nullptr;
+    }
+    return mFocusedBrowsingContextInContent;
+  }
+
+  bool IsInActiveWindow(mozilla::dom::BrowsingContext*) const;
+
+  nsPIDOMWindowOuter* GetActiveWindow() const { return mActiveWindow; }
+
+  mozilla::dom::BrowsingContext* GetActiveBrowsingContext() const {
+    if (XRE_IsParentProcess()) {
+      if (mActiveWindow) {
+        return mActiveWindow->GetBrowsingContext();
+      }
+      return nullptr;
+    }
+    return mActiveBrowsingContextInContent;
+  }
+
+  void ContentInserted(nsIContent* aChild, const ContentInsertInfo& aInfo);
+
+  void ContentAppended(nsIContent* aFirstNewContent,
+                       const ContentAppendInfo& aInfo);
+
+  MOZ_CAN_RUN_SCRIPT nsresult ContentRemoved(Document* aDocument,
+                                             nsIContent* aContent,
+                                             const ContentRemoveInfo& aInfo);
+
+  void NeedsFlushBeforeEventHandling(mozilla::dom::Element* aElement) {
+    if (mFocusedElement == aElement) {
+      mEventHandlingNeedsFlush = true;
+    }
+  }
+
+  bool CanSkipFocus(nsIContent* aContent);
+
+  MOZ_CAN_RUN_SCRIPT void FlushBeforeEventHandlingIfNeeded(
+      nsIContent* aContent) {
+    if (mEventHandlingNeedsFlush) {
+      nsCOMPtr<Document> doc = aContent->GetComposedDoc();
+      if (doc) {
+        mEventHandlingNeedsFlush = false;
+        doc->FlushPendingNotifications(mozilla::FlushType::Layout);
+      }
+    }
+  }
+
+  MOZ_CAN_RUN_SCRIPT void UpdateCaretForCaretBrowsingMode();
+
+  uint32_t GetLastFocusMethod(nsPIDOMWindowOuter*) const;
+
+  enum SearchRange {
+    eOnlyCurrentWindow,
+    eIncludeAllDescendants,
+    eIncludeVisibleDescendants,
+  };
+  static mozilla::dom::Element* GetFocusedDescendant(
+      nsPIDOMWindowOuter* aWindow, SearchRange aSearchRange,
+      nsPIDOMWindowOuter** aFocusedWindow);
+
+  MOZ_CAN_RUN_SCRIPT nsresult DetermineElementToMoveFocus(
+      nsPIDOMWindowOuter* aWindow, nsIContent* aStart, int32_t aType,
+      bool aNoParentTraversal, bool aNavigateByKey, nsIContent** aNextContent);
+
+  MOZ_CAN_RUN_SCRIPT nsresult SetFocusedWindowWithCallerType(
+      mozIDOMWindowProxy* aWindowToFocus, mozilla::dom::CallerType aCallerType);
+
+  MOZ_CAN_RUN_SCRIPT void FixUpFocusAfterFrameLoaderChange(
+      mozilla::dom::Element&);
+  void FixUpFocusBeforeFrameLoaderChange(mozilla::dom::Element&,
+                                         mozilla::dom::BrowsingContext* aBc);
+
+  MOZ_CAN_RUN_SCRIPT void RaiseWindow(nsPIDOMWindowOuter* aWindow,
+                                      mozilla::dom::CallerType aCallerType,
+                                      uint64_t aActionId);
+
+  MOZ_CAN_RUN_SCRIPT void WindowRaised(mozIDOMWindowProxy* aWindow,
+                                       uint64_t aActionId);
+
+  MOZ_CAN_RUN_SCRIPT void WindowLowered(mozIDOMWindowProxy* aWindow,
+                                        uint64_t aActionId);
+
+  MOZ_CAN_RUN_SCRIPT void WindowShown(mozIDOMWindowProxy* aWindow,
+                                      bool aNeedsFocus);
+
+  MOZ_CAN_RUN_SCRIPT void WindowHidden(mozIDOMWindowProxy* aWindow,
+                                       uint64_t aActionId,
+                                       bool aIsEnteringBFCache);
+
+  MOZ_CAN_RUN_SCRIPT void FireDelayedEvents(Document* aDocument);
+
+  void WasNuked(nsPIDOMWindowOuter* aWindow);
+
+  static uint32_t ProgrammaticFocusFlags(
+      const mozilla::dom::FocusOptions& aOptions);
+
+  static InputContextAction::Cause GetFocusMoveActionCause(uint32_t aFlags);
+
+  MOZ_CAN_RUN_SCRIPT void NotifyOfReFocus(mozilla::dom::Element& aElement);
+
+  static void MarkUncollectableForCCGeneration(uint32_t aGeneration);
+
+  struct BlurredElementInfo {
+    const mozilla::OwningNonNull<mozilla::dom::Element> mElement;
+
+    explicit BlurredElementInfo(mozilla::dom::Element&);
+    ~BlurredElementInfo();
+  };
+
+ protected:
+  nsFocusManager();
+  ~nsFocusManager();
+
+  void EnsureCurrentWidgetFocused(mozilla::dom::CallerType aCallerType);
+
+  MOZ_CAN_RUN_SCRIPT void MoveFocusToWindowAfterRaise(nsPIDOMWindowOuter*,
+                                                      uint64_t aActionId);
+
+  void ActivateOrDeactivate(nsPIDOMWindowOuter* aWindow, bool aActive);
+
+  MOZ_CAN_RUN_SCRIPT mozilla::Maybe<uint64_t> SetFocusInner(
+      mozilla::dom::Element* aNewContent, int32_t aFlags, bool aFocusChanged,
+      bool aAdjustWidget);
+
+  bool IsSameOrAncestor(nsPIDOMWindowOuter* aPossibleAncestor,
+                        nsPIDOMWindowOuter* aWindow) const;
+  bool IsSameOrAncestor(nsPIDOMWindowOuter* aPossibleAncestor,
+                        mozilla::dom::BrowsingContext* aContext) const;
+  bool IsSameOrAncestor(mozilla::dom::BrowsingContext* aPossibleAncestor,
+                        nsPIDOMWindowOuter* aWindow) const;
+
+ public:
+  bool IsSameOrAncestor(mozilla::dom::BrowsingContext* aPossibleAncestor,
+                        mozilla::dom::BrowsingContext* aContext) const;
+
+ protected:
+  mozilla::dom::BrowsingContext* GetCommonAncestor(
+      nsPIDOMWindowOuter* aWindow, mozilla::dom::BrowsingContext* aContext);
+
+  MOZ_CAN_RUN_SCRIPT bool AdjustInProcessWindowFocus(
+      mozilla::dom::BrowsingContext* aBrowsingContext, bool aCheckPermission,
+      bool aIsVisible, uint64_t aActionId, bool aShouldClearAncestorFocus,
+      mozilla::dom::BrowsingContext* aAncestorBrowsingContextToFocus);
+
+  MOZ_CAN_RUN_SCRIPT void AdjustWindowFocus(
+      mozilla::dom::BrowsingContext* aBrowsingContext, bool aCheckPermission,
+      bool aIsVisible, uint64_t aActionId, bool aShouldClearAncestorFocus,
+      mozilla::dom::BrowsingContext* aAncestorBrowsingContextToFocus);
+
+  bool IsWindowVisible(nsPIDOMWindowOuter* aWindow);
+
+  bool IsNonFocusableRoot(nsIContent* aContent);
+
+  MOZ_CAN_RUN_SCRIPT mozilla::dom::Element* FlushAndCheckIfFocusable(
+      mozilla::dom::Element* aElement, uint32_t aFlags);
+
+  MOZ_CAN_RUN_SCRIPT bool Blur(
+      mozilla::dom::BrowsingContext* aBrowsingContextToClear,
+      mozilla::dom::BrowsingContext* aAncestorBrowsingContextToFocus,
+      bool aIsLeavingDocument, bool aAdjustWidget, bool aRemainActive,
+      uint64_t aActionId, mozilla::dom::Element* aElementToFocus = nullptr);
+  MOZ_CAN_RUN_SCRIPT void BlurFromOtherProcess(
+      mozilla::dom::BrowsingContext* aFocusedBrowsingContext,
+      mozilla::dom::BrowsingContext* aBrowsingContextToClear,
+      mozilla::dom::BrowsingContext* aAncestorBrowsingContextToFocus,
+      bool aIsLeavingDocument, bool aAdjustWidget, uint64_t aActionId);
+  MOZ_CAN_RUN_SCRIPT bool BlurImpl(
+      mozilla::dom::BrowsingContext* aBrowsingContextToClear,
+      mozilla::dom::BrowsingContext* aAncestorBrowsingContextToFocus,
+      bool aIsLeavingDocument, bool aAdjustWidget, bool aRemainActive,
+      mozilla::dom::Element* aElementToFocus, uint64_t aActionId);
+
+  MOZ_CAN_RUN_SCRIPT void Focus(
+      nsPIDOMWindowOuter* aWindow, mozilla::dom::Element* aContent,
+      uint32_t aFlags, bool aIsNewDocument, bool aFocusChanged,
+      bool aWindowRaised, bool aAdjustWidget, uint64_t aActionId,
+      const mozilla::Maybe<BlurredElementInfo>& = mozilla::Nothing());
+
+  MOZ_CAN_RUN_SCRIPT void SendFocusOrBlurEvent(
+      mozilla::EventMessage aEventMessage, mozilla::PresShell* aPresShell,
+      Document* aDocument, mozilla::dom::EventTarget* aTarget,
+      bool aWindowRaised, bool aIsRefocus = false,
+      mozilla::dom::EventTarget* aRelatedTarget = nullptr);
+  MOZ_CAN_RUN_SCRIPT void FireFocusOrBlurEvent(
+      mozilla::EventMessage aEventMessage, mozilla::PresShell* aPresShell,
+      mozilla::dom::EventTarget* aTarget, bool aWindowRaised,
+      bool aIsRefocus = false,
+      mozilla::dom::EventTarget* aRelatedTarget = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT void FireFocusInOrOutEvent(
+      mozilla::EventMessage aEventMessage, mozilla::PresShell* aPresShell,
+      mozilla::dom::EventTarget* aTarget,
+      nsPIDOMWindowOuter* aCurrentFocusedWindow,
+      nsIContent* aCurrentFocusedContent,
+      mozilla::dom::EventTarget* aRelatedTarget = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT
+  void ScrollIntoView(mozilla::PresShell* aPresShell, nsIContent* aContent,
+                      uint32_t aFlags);
+
+  MOZ_CAN_RUN_SCRIPT void UpdateCaret(bool aMoveCaretToFocus,
+                                      bool aUpdateVisibility,
+                                      nsIContent* aContent);
+
+  MOZ_CAN_RUN_SCRIPT void MoveCaretToFocus(mozilla::PresShell* aPresShell,
+                                           nsIContent* aContent);
+
+  nsresult SetCaretVisible(mozilla::PresShell* aPresShell, bool aVisible,
+                           nsIContent* aContent);
+
+
+  void GetSelectionLocation(Document* aDocument, mozilla::PresShell* aPresShell,
+                            nsIContent** aStartContent,
+                            nsIContent** aEndContent);
+
+  void GetSequentialFocusNavigationStartingPoint(Document* aDocument,
+                                                 nsIContent* aFocusedContent,
+                                                 bool aForward,
+                                                 nsIContent** aStartContent,
+                                                 bool* aConsiderStartContent);
+
+  MOZ_CAN_RUN_SCRIPT nsIContent* GetNextTabbableContentInScope(
+      nsIContent* aOwner, nsIContent* aStartContent,
+      nsIContent* aOriginalStartContent, bool aForward,
+      int32_t aCurrentTabIndex, bool aIgnoreTabIndex,
+      bool aForDocumentNavigation, bool aNavigateByKey, bool aSkipOwner,
+      bool aReachedToEndForDocumentNavigation);
+
+  MOZ_CAN_RUN_SCRIPT nsIContent* GetNextTabbableContentInAncestorScopes(
+      nsIContent* aStartOwner, nsCOMPtr<nsIContent>& aStartContent ,
+      nsIContent* aOriginalStartContent, bool aForward,
+      int32_t* aCurrentTabIndex, bool* aIgnoreTabIndex,
+      bool aForDocumentNavigation, bool aNavigateByKey,
+      bool aReachedToEndForDocumentNavigation);
+
+  MOZ_CAN_RUN_SCRIPT nsresult GetNextTabbableContent(
+      mozilla::PresShell* aPresShell, nsIContent* aRootContent,
+      nsIContent* aOriginalStartContent, nsIContent* aStartContent,
+      bool aForward, int32_t aCurrentTabIndex, bool aIgnoreTabIndex,
+      bool aForDocumentNavigation, bool aNavigateByKey,
+      bool aReachedToEndForDocumentNavigation, nsIContent** aResultContent);
+
+  nsIContent* GetNextTabbableMapArea(bool aForward, int32_t aCurrentTabIndex,
+                                     mozilla::dom::Element* aImageContent,
+                                     nsIContent* aStartContent);
+
+  int32_t GetNextTabIndex(nsIContent* aParent, int32_t aCurrentTabIndex,
+                          bool aForward);
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  FocusFirst(mozilla::dom::Element* aRootContent, nsIContent** aNextContent,
+             bool aReachedToEndForDocumentNavigation);
+
+  mozilla::dom::Element* GetRootForFocus(nsPIDOMWindowOuter* aWindow,
+                                         Document* aDocument,
+                                         bool aForDocumentNavigation,
+                                         bool aCheckVisibility);
+
+  mozilla::dom::Element* GetRootForChildDocument(nsIContent* aContent);
+
+  void GetFocusInSelection(nsPIDOMWindowOuter* aWindow,
+                           nsIContent* aStartSelection,
+                           nsIContent* aEndSelection,
+                           nsIContent** aFocusedContent);
+
+ private:
+  void ActivateRemoteFrameIfNeeded(mozilla::dom::Element&, uint64_t aActionId);
+
+  static void NotifyFocusStateChange(mozilla::dom::Element* aElement,
+                                     mozilla::dom::Element* aElementToFocus,
+                                     int32_t aFlags, bool aGettingFocus,
+                                     bool aShouldShowFocusRing);
+
+  void SetFocusedWindowInternal(nsPIDOMWindowOuter* aWindow, uint64_t aActionId,
+                                bool aSyncBrowsingContext = true);
+
+  MOZ_CAN_RUN_SCRIPT bool TryDocumentNavigation(nsIContent* aCurrentContent,
+                                                bool* aCheckSubDocument,
+                                                nsIContent** aResultContent);
+
+  MOZ_CAN_RUN_SCRIPT bool TryToMoveFocusToSubDocument(
+      nsIContent* aCurrentContent, nsIContent* aOriginalStartContent,
+      bool aForward, bool aForDocumentNavigation, bool aNavigateByKey,
+      bool aReachedToEndForDocumentNavigation, nsIContent** aResultContent);
+
+  void SetFocusedBrowsingContext(mozilla::dom::BrowsingContext* aContext,
+                                 uint64_t aActionId);
+
+  void SetFocusedBrowsingContextFromOtherProcess(
+      mozilla::dom::BrowsingContext* aContext, uint64_t aActionId);
+
+  bool SetFocusedBrowsingContextInChrome(
+      mozilla::dom::BrowsingContext* aContext, uint64_t aActionId);
+
+  void InsertNewFocusActionId(uint64_t aActionId);
+
+  bool ProcessPendingActiveBrowsingContextActionId(uint64_t aActionId,
+                                                   bool aSettingToNonNull);
+
+  bool ProcessPendingFocusedBrowsingContextActionId(uint64_t aActionId);
+
+ public:
+  mozilla::dom::BrowsingContext* GetFocusedBrowsingContextInChrome();
+
+  void BrowsingContextDetached(mozilla::dom::BrowsingContext* aContext);
+
+ private:
+  void SetActiveBrowsingContextInContent(
+      mozilla::dom::BrowsingContext* aContext, uint64_t aActionId,
+      bool aIsEnteringBFCache);
+
+  void SetActiveBrowsingContextFromOtherProcess(
+      mozilla::dom::BrowsingContext* aContext, uint64_t aActionId);
+
+  void UnsetActiveBrowsingContextFromOtherProcess(
+      mozilla::dom::BrowsingContext* aContext, uint64_t aActionId);
+
+  void ReviseActiveBrowsingContext(uint64_t aOldActionId,
+                                   mozilla::dom::BrowsingContext* aContext,
+                                   uint64_t aNewActionId);
+
+  void ReviseFocusedBrowsingContext(uint64_t aOldActionId,
+                                    mozilla::dom::BrowsingContext* aContext,
+                                    uint64_t aNewActionId);
+
+  bool SetActiveBrowsingContextInChrome(mozilla::dom::BrowsingContext* aContext,
+                                        uint64_t aActionId);
+
+  void FocusedElementMayHaveMoved(nsIContent* aContent, nsINode* aOldParent);
+
+ public:
+  mozilla::dom::BrowsingContext* GetActiveBrowsingContextInChrome();
+
+  uint64_t GetActionIdForActiveBrowsingContextInChrome() const;
+
+  uint64_t GetActionIdForFocusedBrowsingContextInChrome() const;
+
+  static uint64_t GenerateFocusActionId();
+
+  static mozilla::dom::Element* GetTheFocusableArea(
+      mozilla::dom::Element* aTarget, uint32_t aFlags);
+
+  static bool IsAreaElementFocusable(mozilla::dom::HTMLAreaElement& aArea);
+
+ private:
+  nsCOMPtr<nsPIDOMWindowOuter> mActiveWindow;
+
+  RefPtr<mozilla::dom::BrowsingContext> mActiveBrowsingContextInContent;
+
+  uint64_t mActionIdForActiveBrowsingContextInContent;
+
+  uint64_t mActionIdForActiveBrowsingContextInChrome;
+
+  uint64_t mActionIdForFocusedBrowsingContextInContent;
+
+  uint64_t mActionIdForFocusedBrowsingContextInChrome;
+
+  bool mActiveBrowsingContextInContentSetFromOtherProcess;
+
+  RefPtr<mozilla::dom::BrowsingContext> mActiveBrowsingContextInChrome;
+
+  nsCOMPtr<nsPIDOMWindowOuter> mFocusedWindow;
+
+  RefPtr<mozilla::dom::BrowsingContext> mFocusedBrowsingContextInContent;
+
+  RefPtr<mozilla::dom::BrowsingContext> mFocusedBrowsingContextInChrome;
+
+  RefPtr<mozilla::dom::Element> mFocusedElement;
+
+  nsCOMPtr<nsPIDOMWindowOuter> mWindowBeingLowered;
+
+  nsTArray<nsDelayedBlurOrFocusEvent> mDelayedBlurFocusEvents;
+
+  nsTArray<uint64_t> mPendingActiveBrowsingContextActions;
+
+  nsTArray<uint64_t> mPendingFocusedBrowsingContextActions;
+
+  bool mEventHandlingNeedsFlush;
+
+  static bool sTestMode;
+
+  static uint64_t sFocusActionCounter;
+
+  static mozilla::StaticRefPtr<nsFocusManager> sInstance;
+};
+
+nsresult NS_NewFocusManager(nsIFocusManager** aResult);
+
+#endif

@@ -1,0 +1,70 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ChangeAttributeTransaction_h
+#define ChangeAttributeTransaction_h
+
+#include "EditTransactionBase.h"  // base class
+
+#include "EditorForwards.h"
+
+#include "mozilla/Attributes.h"            // override
+#include "nsCOMPtr.h"                      // nsCOMPtr members
+#include "nsCycleCollectionParticipant.h"  // NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED
+#include "nsISupportsImpl.h"               // NS_DECL_ISUPPORTS_INHERITED
+#include "nsString.h"                      // nsString members
+
+class nsAtom;
+
+namespace mozilla {
+namespace dom {
+class Element;
+}  
+
+class ChangeAttributeTransaction final : public EditTransactionBase {
+ protected:
+  ChangeAttributeTransaction(EditorBase& aEditorBase, dom::Element& aElement,
+                             nsAtom& aAttribute, const nsAString* aValue);
+
+ public:
+  static already_AddRefed<ChangeAttributeTransaction> Create(
+      EditorBase& aEditorBase, dom::Element& aElement, nsAtom& aAttribute,
+      const nsAString& aValue);
+
+  static already_AddRefed<ChangeAttributeTransaction> CreateToRemove(
+      EditorBase& aEditorBase, dom::Element& aElement, nsAtom& aAttribute);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(ChangeAttributeTransaction,
+                                           EditTransactionBase)
+
+  NS_DECL_EDITTRANSACTIONBASE
+  NS_DECL_EDITTRANSACTIONBASE_GETASMETHODS_OVERRIDE(ChangeAttributeTransaction)
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD RedoTransaction() override;
+
+  friend std::ostream& operator<<(
+      std::ostream& aStream, const ChangeAttributeTransaction& aTransaction);
+
+ private:
+  virtual ~ChangeAttributeTransaction() = default;
+
+  RefPtr<EditorBase> mEditorBase;
+
+  nsCOMPtr<dom::Element> mElement;
+
+  RefPtr<nsAtom> mAttribute;
+
+  nsString mValue;
+
+  nsString mUndoValue;
+
+  bool mRemoveAttribute;
+
+  bool mAttributeWasSet;
+};
+
+}  
+
+#endif  // #ifndef ChangeAttributeTransaction_h

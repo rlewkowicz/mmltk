@@ -1,0 +1,254 @@
+// Copyright 2012 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "src/utils/huffman_utils.h"
+#include "src/utils/utils.h"
+#include "src/webp/format_constants.h"
+#include "src/webp/types.h"
+
+#define MAX_HTREE_GROUPS    0x10000
+
+HTreeGroup* VP8LHtreeGroupsNew(int num_htree_groups) {
+  HTreeGroup* const htree_groups =
+      (HTreeGroup*)WebPSafeMalloc(num_htree_groups, sizeof(*htree_groups));
+  if (htree_groups == NULL) {
+    return NULL;
+  }
+  assert(num_htree_groups <= MAX_HTREE_GROUPS);
+  return htree_groups;
+}
+
+void VP8LHtreeGroupsFree(HTreeGroup* const htree_groups) {
+  if (htree_groups != NULL) {
+    WebPSafeFree(htree_groups);
+  }
+}
+
+static WEBP_INLINE uint32_t GetNextKey(uint32_t key, int len) {
+  uint32_t step = 1 << (len - 1);
+  while (key & step) {
+    step >>= 1;
+  }
+  return step ? (key & (step - 1)) + step : key;
+}
+
+static WEBP_INLINE void ReplicateValue(HuffmanCode* table,
+                                       int step, int end,
+                                       HuffmanCode code) {
+  assert(end % step == 0);
+  do {
+    end -= step;
+    table[end] = code;
+  } while (end > 0);
+}
+
+static WEBP_INLINE int NextTableBitSize(const int* const count,
+                                        int len, int root_bits) {
+  int left = 1 << (len - root_bits);
+  while (len < MAX_ALLOWED_CODE_LENGTH) {
+    left -= count[len];
+    if (left <= 0) break;
+    ++len;
+    left <<= 1;
+  }
+  return len - root_bits;
+}
+
+static int BuildHuffmanTable(HuffmanCode* const root_table, int root_bits,
+                             const int code_lengths[], int code_lengths_size,
+                             uint16_t sorted[]) {
+  HuffmanCode* table = root_table;  
+  int total_size = 1 << root_bits;  
+  int len;                          
+  int symbol;                       
+  int count[MAX_ALLOWED_CODE_LENGTH + 1] = { 0 };
+  int offset[MAX_ALLOWED_CODE_LENGTH + 1];
+
+  assert(code_lengths_size != 0);
+  assert(code_lengths != NULL);
+  assert((root_table != NULL && sorted != NULL) ||
+         (root_table == NULL && sorted == NULL));
+  assert(root_bits > 0);
+
+  for (symbol = 0; symbol < code_lengths_size; ++symbol) {
+    if (code_lengths[symbol] > MAX_ALLOWED_CODE_LENGTH) {
+      return 0;
+    }
+    ++count[code_lengths[symbol]];
+  }
+
+  if (count[0] == code_lengths_size) {
+    return 0;
+  }
+
+  offset[1] = 0;
+  for (len = 1; len < MAX_ALLOWED_CODE_LENGTH; ++len) {
+    if (count[len] > (1 << len)) {
+      return 0;
+    }
+    offset[len + 1] = offset[len] + count[len];
+  }
+
+  for (symbol = 0; symbol < code_lengths_size; ++symbol) {
+    const int symbol_code_length = code_lengths[symbol];
+    if (code_lengths[symbol] > 0) {
+      if (sorted != NULL) {
+        if(offset[symbol_code_length] >= code_lengths_size) {
+            return 0;
+        }
+        sorted[offset[symbol_code_length]++] = symbol;
+      } else {
+        offset[symbol_code_length]++;
+      }
+    }
+  }
+
+  if (offset[MAX_ALLOWED_CODE_LENGTH] == 1) {
+    if (sorted != NULL) {
+      HuffmanCode code;
+      code.bits = 0;
+      code.value = (uint16_t)sorted[0];
+      ReplicateValue(table, 1, total_size, code);
+    }
+    return total_size;
+  }
+
+  {
+    int step;              
+    uint32_t low = 0xffffffffu;        
+    uint32_t mask = total_size - 1;    
+    uint32_t key = 0;      
+    int num_nodes = 1;     
+    int num_open = 1;      
+    int table_bits = root_bits;        
+    int table_size = 1 << table_bits;  
+    symbol = 0;
+    for (len = 1, step = 2; len <= root_bits; ++len, step <<= 1) {
+      num_open <<= 1;
+      num_nodes += num_open;
+      num_open -= count[len];
+      if (num_open < 0) {
+        return 0;
+      }
+      if (root_table == NULL) continue;
+      for (; count[len] > 0; --count[len]) {
+        HuffmanCode code;
+        code.bits = (uint8_t)len;
+        code.value = (uint16_t)sorted[symbol++];
+        ReplicateValue(&table[key], step, table_size, code);
+        key = GetNextKey(key, len);
+      }
+    }
+
+    for (len = root_bits + 1, step = 2; len <= MAX_ALLOWED_CODE_LENGTH;
+         ++len, step <<= 1) {
+      num_open <<= 1;
+      num_nodes += num_open;
+      num_open -= count[len];
+      if (num_open < 0) {
+        return 0;
+      }
+      for (; count[len] > 0; --count[len]) {
+        HuffmanCode code;
+        if ((key & mask) != low) {
+          if (root_table != NULL) table += table_size;
+          table_bits = NextTableBitSize(count, len, root_bits);
+          table_size = 1 << table_bits;
+          total_size += table_size;
+          low = key & mask;
+          if (root_table != NULL) {
+            root_table[low].bits = (uint8_t)(table_bits + root_bits);
+            root_table[low].value = (uint16_t)((table - root_table) - low);
+          }
+        }
+        if (root_table != NULL) {
+          code.bits = (uint8_t)(len - root_bits);
+          code.value = (uint16_t)sorted[symbol++];
+          ReplicateValue(&table[key >> root_bits], step, table_size, code);
+        }
+        key = GetNextKey(key, len);
+      }
+    }
+
+    if (num_nodes != 2 * offset[MAX_ALLOWED_CODE_LENGTH] - 1) {
+      return 0;
+    }
+  }
+
+  return total_size;
+}
+
+#define MAX_CODE_LENGTHS_SIZE \
+  ((1 << MAX_CACHE_BITS) + NUM_LITERAL_CODES + NUM_LENGTH_CODES)
+#define SORTED_SIZE_CUTOFF 512
+int VP8LBuildHuffmanTable(HuffmanTables* const root_table, int root_bits,
+                          const int code_lengths[], int code_lengths_size) {
+  const int total_size =
+      BuildHuffmanTable(NULL, root_bits, code_lengths, code_lengths_size, NULL);
+  assert(code_lengths_size <= MAX_CODE_LENGTHS_SIZE);
+  if (total_size == 0 || root_table == NULL) return total_size;
+
+  if (root_table->curr_segment->curr_table + total_size >=
+      root_table->curr_segment->start + root_table->curr_segment->size) {
+    const int segment_size = root_table->curr_segment->size;
+    struct HuffmanTablesSegment* next =
+        (HuffmanTablesSegment*)WebPSafeMalloc(1, sizeof(*next));
+    if (next == NULL) return 0;
+    next->size = total_size > segment_size ? total_size : segment_size;
+    next->start =
+        (HuffmanCode*)WebPSafeMalloc(next->size, sizeof(*next->start));
+    if (next->start == NULL) {
+      WebPSafeFree(next);
+      return 0;
+    }
+    next->curr_table = next->start;
+    next->next = NULL;
+    root_table->curr_segment->next = next;
+    root_table->curr_segment = next;
+  }
+  if (code_lengths_size <= SORTED_SIZE_CUTOFF) {
+    uint16_t sorted[SORTED_SIZE_CUTOFF];
+    BuildHuffmanTable(root_table->curr_segment->curr_table, root_bits,
+                      code_lengths, code_lengths_size, sorted);
+  } else {  
+    uint16_t* const sorted =
+        (uint16_t*)WebPSafeMalloc(code_lengths_size, sizeof(*sorted));
+    if (sorted == NULL) return 0;
+    BuildHuffmanTable(root_table->curr_segment->curr_table, root_bits,
+                      code_lengths, code_lengths_size, sorted);
+    WebPSafeFree(sorted);
+  }
+  return total_size;
+}
+
+int VP8LHuffmanTablesAllocate(int size, HuffmanTables* huffman_tables) {
+  HuffmanTablesSegment* const root = &huffman_tables->root;
+  huffman_tables->curr_segment = root;
+  root->next = NULL;
+  root->start = (HuffmanCode*)WebPSafeMalloc(size, sizeof(*root->start));
+  if (root->start == NULL) return 0;
+  root->curr_table = root->start;
+  root->size = size;
+  return 1;
+}
+
+void VP8LHuffmanTablesDeallocate(HuffmanTables* const huffman_tables) {
+  HuffmanTablesSegment *current, *next;
+  if (huffman_tables == NULL) return;
+  current = &huffman_tables->root;
+  next = current->next;
+  WebPSafeFree(current->start);
+  current->start = NULL;
+  current->next = NULL;
+  current = next;
+  while (current != NULL) {
+    next = current->next;
+    WebPSafeFree(current->start);
+    WebPSafeFree(current);
+    current = next;
+  }
+}

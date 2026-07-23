@@ -1,0 +1,69 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_BaseHistory_h
+#define mozilla_BaseHistory_h
+
+#include "IHistory.h"
+#include "mozilla/dom/ContentParent.h"
+#include "nsTHashSet.h"
+
+
+namespace mozilla {
+
+class BaseHistory : public IHistory {
+ public:
+  void RegisterVisitedCallback(nsIURI*, dom::Link*) final;
+  void ScheduleVisitedQuery(nsIURI*, dom::ContentParent*) final;
+  void UnregisterVisitedCallback(nsIURI*, dom::Link*) final;
+  void NotifyVisited(nsIURI*, VisitedStatus,
+                     const ContentParentSet* = nullptr) final;
+
+  static bool CanStore(nsIURI*);
+
+ protected:
+  void NotifyVisitedInThisProcess(nsIURI*, VisitedStatus);
+  void NotifyVisitedFromParent(nsIURI*, VisitedStatus, const ContentParentSet*);
+  static constexpr const size_t kTrackedUrisInitialSize = 64;
+
+  BaseHistory();
+  ~BaseHistory();
+
+  using ObserverArray = nsTObserverArray<dom::Link*>;
+  struct ObservingLinks {
+    ObserverArray mLinks;
+    VisitedStatus mStatus = VisitedStatus::Unknown;
+
+    size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+      return mLinks.ShallowSizeOfExcludingThis(aMallocSizeOf);
+    }
+  };
+
+  using PendingVisitedQueries = nsTHashMap<nsURIHashKey, ContentParentSet>;
+  struct PendingVisitedResult {
+    dom::VisitedQueryResult mResult;
+    ContentParentSet mProcessesToNotify;
+  };
+  using PendingVisitedResults = nsTArray<PendingVisitedResult>;
+
+  virtual void StartPendingVisitedQueries(PendingVisitedQueries&&) = 0;
+
+ private:
+  void CancelVisitedQueryIfPossible(nsIURI*);
+
+  void SendPendingVisitedResultsToChildProcesses();
+
+ protected:
+  nsTHashMap<nsURIHashKey, ObservingLinks> mTrackedURIs;
+
+ private:
+  PendingVisitedQueries mPendingQueries;
+  PendingVisitedResults mPendingResults;
+  bool mStartPendingVisitedQueriesScheduled = false;
+  bool mStartPendingResultsScheduled = false;
+};
+
+}  
+
+#endif

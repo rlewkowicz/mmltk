@@ -1,0 +1,218 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+
+#ifndef GCPolicyAPI_h
+#define GCPolicyAPI_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/UniquePtr.h"
+
+#include <type_traits>
+
+#include "js/GCTypeMacros.h"  // JS_FOR_EACH_PUBLIC_GC_POINTER_TYPE
+#include "js/TraceKind.h"
+#include "js/TracingAPI.h"
+#include "js/TypeDecls.h"
+
+namespace JS {
+
+template <typename T>
+struct GCPolicyBase {
+  static bool isValid(const T& tp) { return true;  }
+  static constexpr bool mightBeInNursery() { return true;  }
+};
+
+template <typename T>
+struct StructGCPolicy : public GCPolicyBase<T> {
+  static_assert(
+      !std::is_pointer_v<T>,
+      "Pointer types must have a GCPolicy<> specialization.\n"
+      "  - Public GC pointer types (eg JSObject*, JSString*) use "
+      "GCPointerPolicy.\n"
+      "  - Internal GC pointer types are handled by InternalGCPointerPolicy "
+      "from gc/Policy.h; make sure you are including that file.\n"
+      "  - Other pointer types (eg Realm*) must define their own "
+      "specialization.\n"
+      "The most likely cause of this error is attempting to root a non-GC "
+      "pointer that should not be rooted. Only pointers on the stack that "
+      "point to GC pointers should be or need to be rooted.");
+
+  static void trace(JSTracer* trc, T* tp, const char* name) { tp->trace(trc); }
+
+  static bool traceWeak(JSTracer* trc, T* tp) { return tp->traceWeak(trc); }
+};
+
+template <typename T>
+struct GCPolicy : public StructGCPolicy<T> {};
+
+template <typename T>
+struct IgnoreGCPolicy : public GCPolicyBase<T> {
+  static void trace(JSTracer* trc, T* t, const char* name) {}
+  static bool traceWeak(JSTracer*, T* v) { return true; }
+};
+template <>
+struct GCPolicy<uint8_t> : public IgnoreGCPolicy<uint8_t> {};
+template <>
+struct GCPolicy<uint32_t> : public IgnoreGCPolicy<uint32_t> {};
+template <>
+struct GCPolicy<uint64_t> : public IgnoreGCPolicy<uint64_t> {};
+template <>
+struct GCPolicy<bool> : public IgnoreGCPolicy<bool> {};
+
+template <typename T>
+struct GCPointerPolicy : public GCPolicyBase<T> {
+  static_assert(std::is_pointer_v<T>,
+                "Non-pointer type not allowed for GCPointerPolicy");
+
+  static void trace(JSTracer* trc, T* vp, const char* name) {
+    TraceRoot(trc, vp, name);
+  }
+  static bool isTenured(T v) { return !v || !js::gc::IsInsideNursery(v); }
+  static bool isValid(T v) { return js::gc::IsCellPointerValidOrNull(v); }
+};
+#define EXPAND_SPECIALIZE_GCPOLICY(Type)                   \
+  template <>                                              \
+  struct GCPolicy<Type> : public GCPointerPolicy<Type> {}; \
+  template <>                                              \
+  struct GCPolicy<Type const> : public GCPointerPolicy<Type const> {};
+JS_FOR_EACH_PUBLIC_GC_POINTER_TYPE(EXPAND_SPECIALIZE_GCPOLICY)
+#undef EXPAND_SPECIALIZE_GCPOLICY
+
+template <typename T>
+struct NonGCPointerPolicy : public GCPolicyBase<T> {
+  static void trace(JSTracer* trc, T* vp, const char* name) {
+    if (*vp) {
+      (*vp)->trace(trc);
+    }
+  }
+  static bool traceWeak(JSTracer* trc, T* vp) {
+    return !*vp || (*vp)->traceWeak(trc);
+  }
+};
+
+template <typename T>
+struct GCPolicy<JS::Heap<T>> : public GCPolicyBase<JS::Heap<T>> {
+  static void trace(JSTracer* trc, JS::Heap<T>* thingp, const char* name) {
+    TraceEdge(trc, thingp, name);
+  }
+  static bool traceWeak(JSTracer* trc, JS::Heap<T>* thingp) {
+    return !*thingp || js::gc::TraceWeakEdge(trc, thingp);
+  }
+};
+
+template <typename T, typename D>
+struct GCPolicy<mozilla::UniquePtr<T, D>>
+    : public GCPolicyBase<mozilla::UniquePtr<T, D>> {
+  static void trace(JSTracer* trc, mozilla::UniquePtr<T, D>* tp,
+                    const char* name) {
+    if (tp->get()) {
+      GCPolicy<T>::trace(trc, tp->get(), name);
+    }
+  }
+  static bool traceWeak(JSTracer* trc, mozilla::UniquePtr<T, D>* tp) {
+    return !tp->get() || GCPolicy<T>::traceWeak(trc, tp->get());
+  }
+  static bool isValid(const mozilla::UniquePtr<T, D>& t) {
+    return !t.get() || GCPolicy<T>::isValid(*t.get());
+  }
+};
+
+template <>
+struct GCPolicy<UniqueChars> : public IgnoreGCPolicy<UniqueChars> {};
+
+template <>
+struct GCPolicy<mozilla::Nothing> : public IgnoreGCPolicy<mozilla::Nothing> {};
+
+template <typename T>
+struct GCPolicy<mozilla::Maybe<T>> : public GCPolicyBase<mozilla::Maybe<T>> {
+  static void trace(JSTracer* trc, mozilla::Maybe<T>* tp, const char* name) {
+    if (tp->isSome()) {
+      GCPolicy<T>::trace(trc, tp->ptr(), name);
+    }
+  }
+  static bool traceWeak(JSTracer* trc, mozilla::Maybe<T>* tp) {
+    return tp->isNothing() || GCPolicy<T>::traceWeak(trc, tp->ptr());
+  }
+  static bool isValid(const mozilla::Maybe<T>& t) {
+    return t.isNothing() || GCPolicy<T>::isValid(t.ref());
+  }
+};
+
+template <typename T1, typename T2>
+struct GCPolicy<std::pair<T1, T2>> : public GCPolicyBase<std::pair<T1, T2>> {
+  static void trace(JSTracer* trc, std::pair<T1, T2>* tp, const char* name) {
+    GCPolicy<T1>::trace(trc, &tp->first, name);
+    GCPolicy<T2>::trace(trc, &tp->second, name);
+  }
+  static bool traceWeak(JSTracer* trc, std::pair<T1, T2>* tp) {
+    return GCPolicy<T1>::traceWeak(trc, &tp->first) &&
+           GCPolicy<T2>::traceWeak(trc, &tp->second);
+  }
+  static bool isValid(const std::pair<T1, T2>& t) {
+    return GCPolicy<T1>::isValid(t.first) && GCPolicy<T2>::isValid(t.second);
+  }
+};
+
+template <>
+struct GCPolicy<JS::Realm*>;  
+
+template <>
+struct GCPolicy<mozilla::Ok> : public IgnoreGCPolicy<mozilla::Ok> {};
+
+template <typename V, typename E>
+struct GCPolicy<mozilla::Result<V, E>>
+    : public GCPolicyBase<mozilla::Result<V, E>> {
+  static void trace(JSTracer* trc, mozilla::Result<V, E>* tp,
+                    const char* name) {
+    if (tp->isOk()) {
+      V tmp = tp->unwrap();
+      JS::GCPolicy<V>::trace(trc, &tmp, "Result value");
+      tp->updateAfterTracing(std::move(tmp));
+    }
+
+    if (tp->isErr()) {
+      E tmp = tp->unwrapErr();
+      JS::GCPolicy<E>::trace(trc, &tmp, "Result error");
+      tp->updateErrorAfterTracing(std::move(tmp));
+    }
+  }
+
+  static bool isValid(const mozilla::Result<V, E>& t) { return true; }
+};
+
+template <typename... Fs>
+struct GCPolicy<std::tuple<Fs...>> : public GCPolicyBase<std::tuple<Fs...>> {
+  using T = std::tuple<Fs...>;
+  static void trace(JSTracer* trc, T* tp, const char* name) {
+    traceFieldsFrom<0>(trc, *tp, name);
+  }
+  static bool isValid(const T& t) { return areFieldsValidFrom<0>(t); }
+
+ private:
+  template <size_t N>
+  static void traceFieldsFrom(JSTracer* trc, T& tuple, const char* name) {
+    if constexpr (N != std::tuple_size_v<T>) {
+      using F = std::tuple_element_t<N, T>;
+      GCPolicy<F>::trace(trc, &std::get<N>(tuple), name);
+      traceFieldsFrom<N + 1>(trc, tuple, name);
+    }
+  }
+
+  template <size_t N>
+  static bool areFieldsValidFrom(const T& tuple) {
+    if constexpr (N != std::tuple_size_v<T>) {
+      using F = std::tuple_element_t<N, T>;
+      return GCPolicy<F>::isValid(std::get<N>(tuple)) &&
+             areFieldsValidFrom<N + 1>(tuple);
+    }
+
+    return true;
+  }
+};
+
+}  
+
+#endif  // GCPolicyAPI_h

@@ -1,0 +1,112 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef AudioDestinationNode_h_
+#define AudioDestinationNode_h_
+
+#include "AudioChannelAgent.h"
+#include "AudioChannelService.h"
+#include "AudioNode.h"
+#include "mozilla/TimeStamp.h"
+
+namespace mozilla::dom {
+
+class AudioContext;
+class WakeLock;
+
+class AudioDestinationNode final : public AudioNode,
+                                   public nsIAudioChannelAgentCallback,
+                                   public MainThreadMediaTrackListener {
+ public:
+  AudioDestinationNode(AudioContext* aContext, bool aIsOffline,
+                       uint32_t aNumberOfChannels, uint32_t aLength);
+
+  void DestroyMediaTrack() override;
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(AudioDestinationNode, AudioNode)
+  NS_DECL_NSIAUDIOCHANNELAGENTCALLBACK
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  uint16_t NumberOfOutputs() const final { return 0; }
+
+  uint32_t MaxChannelCount() const;
+  void SetChannelCount(uint32_t aChannelCount, ErrorResult& aRv) override;
+
+  void Init();
+  void Close();
+
+  AudioNodeTrack* Track();
+
+  void Mute();
+  void Unmute();
+
+  void Suspend();
+  void Resume();
+
+  void StartRendering(Promise* aPromise);
+
+  void OfflineShutdown();
+
+  void NotifyMainThreadTrackEnded() override;
+  void FireOfflineCompletionEvent();
+
+  const char* NodeType() const override { return "AudioDestinationNode"; }
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const override;
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const override;
+
+  void NotifyDataAudibleStateChanged(bool aAudible);
+  void ResolvePromise(AudioBuffer* aRenderedBuffer);
+
+  unsigned long Length() {
+    MOZ_ASSERT(mIsOffline);
+    return mFramesToProduce;
+  }
+
+  void NotifyAudioContextStateChanged();
+
+ protected:
+  virtual ~AudioDestinationNode();
+
+ private:
+  void CreateAndStartAudioChannelAgent();
+  void DestroyAudioChannelAgentIfExists();
+  RefPtr<AudioChannelAgent> mAudioChannelAgent;
+
+  class MediaSharedKeysListener;
+  RefPtr<MediaSharedKeysListener> mSharedKeysListener;
+
+  bool IsCapturingAudio() const;
+  void StartAudioCapturingTrack();
+  void StopAudioCapturingTrack();
+  RefPtr<MediaInputPort> mCaptureTrackPort;
+
+  using AudibleChangedReasons = AudioChannelService::AudibleChangedReasons;
+  using AudibleState = AudioChannelService::AudibleState;
+  void UpdateFinalAudibleStateIfNeeded(AudibleChangedReasons aReason);
+  bool IsAudible() const;
+  bool mFinalAudibleState = false;
+  bool mIsDataAudible = false;
+  float mAudioChannelVolume = 1.0;
+
+  bool mAudioChannelDisabled = false;
+
+  void CreateAudioWakeLockIfNeeded();
+  void ReleaseAudioWakeLockIfExists();
+  RefPtr<WakeLock> mWakeLock;
+
+  SelfReference<AudioDestinationNode> mOfflineRenderingRef;
+  uint32_t mFramesToProduce;
+
+  RefPtr<Promise> mOfflineRenderingPromise;
+
+  bool mIsOffline;
+};
+
+}  
+
+#endif

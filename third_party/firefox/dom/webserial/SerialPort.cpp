@@ -1,0 +1,965 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/SerialPort.h"
+
+#include "SerialLogging.h"
+#include "SerialPortPumps.h"
+#include "SerialPortStreamAlgorithms.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/EventListenerManager.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/dom/DOMException.h"
+#include "mozilla/dom/DOMExceptionBinding.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/Promise-inl.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/ReadableStream.h"
+#include "mozilla/dom/Serial.h"
+#include "mozilla/dom/SerialPortBinding.h"
+#include "mozilla/dom/SerialPortChild.h"
+#include "mozilla/dom/SerialPortIPCTypes.h"
+#include "mozilla/dom/ToJSValue.h"
+#include "mozilla/dom/UnderlyingSourceCallbackHelpers.h"
+#include "mozilla/dom/WorkerCommon.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "mozilla/dom/WritableStream.h"
+#include "mozilla/ipc/DataPipe.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(SerialPort)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(SerialPort,
+                                                  DOMEventTargetHelper)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mSerial)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mReadable)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mWritable)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mChild)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mOpenPromise)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mClosePromise)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(SerialPort,
+                                                DOMEventTargetHelper)
+  tmp->Shutdown();
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mSerial)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mReadable)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mWritable)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mChild)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mOpenPromise)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mClosePromise)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_ADDREF_INHERITED(SerialPort, DOMEventTargetHelper)
+NS_IMPL_RELEASE_INHERITED(SerialPort, DOMEventTargetHelper)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(SerialPort)
+NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
+
+SerialPort::SerialPort(const IPCSerialPortInfo& aInfo, Serial* aSerial)
+    : DOMEventTargetHelper(aSerial->GetRelevantGlobal()),
+      mSerial(aSerial),
+      mInfo(aInfo) {
+  nsPIDOMWindowInner* window = aSerial->GetOwnerWindow();
+  if (window) {
+    if (Document* doc = window->GetExtantDoc()) {
+      doc->DisallowBFCaching();
+    }
+  }
+  MOZ_LOG(
+      gWebSerialLog, LogLevel::Info,
+      ("SerialPort[%p] created for port '%s' (%s)", this,
+       NS_ConvertUTF16toUTF8(mInfo.id()).get(), window ? "window" : "worker"));
+}
+
+void SerialPort::UpdateWorkerRef() {
+  if (NS_IsMainThread()) {
+    return;
+  }
+
+  bool needsRef = false;
+  if (!mHasShutdown && mState != State::Forgetting &&
+      mState != State::Forgotten) {
+    EventListenerManager* elm = GetExistingListenerManager();
+    bool hasListeners = elm && (elm->HasListenersFor(u"connect"_ns) ||
+                                elm->HasListenersFor(u"disconnect"_ns));
+    bool isActive = (mState == State::Opened) || (mState == State::Closing);
+    needsRef = isActive || hasListeners;
+  }
+
+  if (needsRef && !mWorkerRef) {
+    WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
+    if (workerPrivate) {
+      RefPtr<SerialPort> self = this;
+      mWorkerRef = StrongWorkerRef::Create(workerPrivate, "SerialPort",
+                                           [self]() { self->Shutdown(); });
+    }
+  } else if (!needsRef && mWorkerRef) {
+    mWorkerRef = nullptr;
+  }
+}
+
+void SerialPort::EventListenerAdded(nsAtom* aType) {
+  DOMEventTargetHelper::EventListenerAdded(aType);
+  UpdateWorkerRef();
+}
+
+void SerialPort::EventListenerRemoved(nsAtom* aType) {
+  DOMEventTargetHelper::EventListenerRemoved(aType);
+  UpdateWorkerRef();
+}
+
+SerialPort::~SerialPort() {
+  MOZ_LOG(gWebSerialLog, LogLevel::Debug,
+          ("SerialPort[%p] destroyed for port '%s'", this,
+           NS_ConvertUTF16toUTF8(mInfo.id()).get()));
+  MOZ_ASSERT(mHasShutdown);
+}
+
+void SerialPort::Shutdown() {
+  if (mHasShutdown) {
+    return;
+  }
+  MOZ_LOG(gWebSerialLog, LogLevel::Debug,
+          ("SerialPort[%p] shutting down port '%s'", this,
+           NS_ConvertUTF16toUTF8(mInfo.id()).get()));
+  mHasShutdown = true;
+
+  if (mState == State::Opened || mState == State::Closing) {
+    mState = State::Closed;
+    RefPtr<Promise> ignoredPromise = CloseStreams(StreamCloseMode::Forced);
+  }
+
+  if (mOpenPromise) {
+    mOpenPromise->MaybeRejectWithAbortError("Port was shut down");
+    mOpenPromise = nullptr;
+  }
+  if (mClosePromise) {
+    mClosePromise->MaybeRejectWithNetworkError("Port was shut down");
+    mClosePromise = nullptr;
+  }
+
+  if (mChild) {
+    mChild->Shutdown();
+    mChild = nullptr;
+  }
+
+  mWorkerRef = nullptr;
+}
+
+void SerialPort::DisconnectFromOwner() {
+  Shutdown();
+  DOMEventTargetHelper::DisconnectFromOwner();
+}
+
+JSObject* SerialPort::WrapObject(JSContext* aCx,
+                                 JS::Handle<JSObject*> aGivenProto) {
+  return SerialPort_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void SerialPort::GetEventTargetParent(EventChainPreVisitor& aVisitor) {
+  aVisitor.mCanHandle = true;
+  aVisitor.SetParentTarget(mSerial, false);
+}
+
+already_AddRefed<Promise> SerialPort::Open(const SerialOptions& aOptions,
+                                           ErrorResult& aRv) {
+  nsIGlobalObject* global = GetRelevantGlobal();
+  if (!global) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(global, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  MOZ_LOG(gWebSerialLog, LogLevel::Info,
+          ("SerialPort[%p]::Open called for port '%s' with baudRate=%u, "
+           "dataBits=%u, stopBits=%u, parity=%u, bufferSize=%u, flowControl=%u",
+           this, NS_ConvertUTF16toUTF8(mInfo.id()).get(), aOptions.mBaudRate,
+           aOptions.mDataBits, aOptions.mStopBits,
+           static_cast<uint8_t>(aOptions.mParity), aOptions.mBufferSize,
+           static_cast<uint8_t>(aOptions.mFlowControl)));
+
+  switch (mState) {
+    case State::Closed:
+      break;
+    case State::Opening:
+      promise->MaybeRejectWithInvalidStateError("Port is being opened");
+      return promise.forget();
+    case State::Opened:
+      promise->MaybeRejectWithInvalidStateError("Port is already open");
+      return promise.forget();
+    case State::Closing:
+      promise->MaybeRejectWithInvalidStateError("Port is being closed");
+      return promise.forget();
+    case State::Forgetting:
+    case State::Forgotten:
+      promise->MaybeRejectWithInvalidStateError("Port has been forgotten");
+      return promise.forget();
+  }
+  MOZ_ASSERT(mState == State::Closed);
+
+  if (aOptions.mBaudRate == 0) {
+    promise->MaybeRejectWithTypeError("Invalid baud rate");
+    return promise.forget();
+  }
+
+  if (aOptions.mDataBits != 7 && aOptions.mDataBits != 8) {
+    promise->MaybeRejectWithTypeError("Data bits must be 7 or 8");
+    return promise.forget();
+  }
+
+  if (aOptions.mStopBits != 1 && aOptions.mStopBits != 2) {
+    promise->MaybeRejectWithTypeError("Stop bits must be 1 or 2");
+    return promise.forget();
+  }
+
+  if (aOptions.mBufferSize == 0) {
+    promise->MaybeRejectWithTypeError("Invalid buffer size");
+    return promise.forget();
+  }
+
+  if (aOptions.mBufferSize > kMaxSerialBufferSize) {
+    promise->MaybeRejectWithTypeError(
+        "Requested buffer size exceeds the maximum supported size");
+    return promise.forget();
+  }
+
+  if (!mChild) {
+    promise->MaybeRejectWithNotSupportedError("Port actor not available");
+    return promise.forget();
+  }
+
+  mState = State::Opening;
+  mOpenPromise = promise;
+
+  IPCSerialOptions options{aOptions.mBaudRate,   aOptions.mDataBits,
+                           aOptions.mStopBits,   aOptions.mParity,
+                           aOptions.mBufferSize, aOptions.mFlowControl};
+
+  RefPtr<SerialPortChild> child = mChild;
+  RefPtr<SerialPort> self = this;
+
+  child->SendOpen(options)->Then(
+      GetCurrentSerialEventTarget(), __func__,
+      [self, bufferSize = options.bufferSize()](nsresult aResult) {
+        if (self->mHasShutdown) {
+          return;
+        }
+        if (NS_SUCCEEDED(aResult)) {
+          MOZ_LOG(gWebSerialLog, LogLevel::Info,
+                  ("SerialPort[%p] opened successfully for port '%s'",
+                   self.get(), NS_ConvertUTF16toUTF8(self->mInfo.id()).get()));
+          if (self->mState == State::Opening) {
+            self->mState = State::Opened;
+            self->UpdateWorkerRef();
+            self->NotifySharingStateChanged(true);
+            self->mBufferSize = bufferSize;
+            self->mPipeCapacity = std::max(bufferSize, kMinSerialPortPumpSize);
+            if (self->mOpenPromise) {
+              self->mOpenPromise->MaybeResolveWithUndefined();
+            }
+          } else if (self->mOpenPromise) {
+            self->mOpenPromise->MaybeRejectWithAbortError(
+                "Port was forgotten while opening");
+          }
+          self->mOpenPromise = nullptr;
+        } else {
+          MOZ_LOG(gWebSerialLog, LogLevel::Error,
+                  ("SerialPort[%p] failed to open port '%s': error 0x%08x",
+                   self.get(), NS_ConvertUTF16toUTF8(self->mInfo.id()).get(),
+                   static_cast<uint32_t>(aResult)));
+          if (self->mState == State::Opening) {
+            self->mState = State::Closed;
+          }
+          if (self->mOpenPromise) {
+            self->mOpenPromise->MaybeRejectWithNetworkError(
+                "Failed to open port");
+            self->mOpenPromise = nullptr;
+          }
+        }
+      },
+      [self](mozilla::ipc::ResponseRejectReason aReason) {
+        if (self->mHasShutdown) {
+          return;
+        }
+        MOZ_LOG(gWebSerialLog, LogLevel::Error,
+                ("SerialPort[%p] failed to open port '%s': IPC error "
+                 "(reason: %d)",
+                 self.get(), NS_ConvertUTF16toUTF8(self->mInfo.id()).get(),
+                 static_cast<int>(aReason)));
+        if (self->mState == State::Opening) {
+          self->mState = State::Closed;
+        }
+        if (self->mOpenPromise) {
+          self->mOpenPromise->MaybeRejectWithNetworkError(
+              "Failed to open port: IPC communication error");
+          self->mOpenPromise = nullptr;
+        }
+      });
+
+  return promise.forget();
+}
+
+already_AddRefed<Promise> SerialPort::SetSignals(
+    const SerialOutputSignals& aSignals, ErrorResult& aRv) {
+  nsIGlobalObject* global = GetRelevantGlobal();
+  if (!global) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(global, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  MOZ_LOG(gWebSerialLog, LogLevel::Debug,
+          ("SerialPort[%p]::SetSignals called for port '%s'", this,
+           NS_ConvertUTF16toUTF8(mInfo.id()).get()));
+
+  if (mState == State::Forgetting || mState == State::Forgotten) {
+    promise->MaybeRejectWithInvalidStateError("Port has been forgotten");
+    return promise.forget();
+  }
+
+  if (mState != State::Opened) {
+    promise->MaybeRejectWithInvalidStateError("Port is not open");
+    return promise.forget();
+  }
+
+  if (!aSignals.mDataTerminalReady.WasPassed() &&
+      !aSignals.mRequestToSend.WasPassed() && !aSignals.mBreak.WasPassed()) {
+    promise->MaybeRejectWithTypeError(
+        "At least one signal must be specified in setSignals()");
+    return promise.forget();
+  }
+
+  if (!mChild) {
+    promise->MaybeRejectWithInvalidStateError("Port not initialized");
+    return promise.forget();
+  }
+
+  IPCSerialOutputSignals signals{
+      aSignals.mDataTerminalReady.WasPassed()
+          ? Some(aSignals.mDataTerminalReady.Value())
+          : Nothing(),
+      aSignals.mRequestToSend.WasPassed()
+          ? Some(aSignals.mRequestToSend.Value())
+          : Nothing(),
+      aSignals.mBreak.WasPassed() ? Some(aSignals.mBreak.Value()) : Nothing()};
+
+  RefPtr<SerialPortChild> child = mChild;
+  nsISerialEventTarget* actorTarget = child->GetActorEventTarget();
+
+  if (!actorTarget) {
+    promise->MaybeRejectWithNetworkError("Actor not available");
+    return promise.forget();
+  }
+
+  InvokeAsync(actorTarget, "SerialPort::SendSetSignals",
+              [child = std::move(child), signals = std::move(signals)]() {
+                return child->SendSetSignals(signals);
+              })
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [promise](nsresult aResult) {
+            if (NS_SUCCEEDED(aResult)) {
+              promise->MaybeResolveWithUndefined();
+            } else {
+              promise->MaybeRejectWithNetworkError(
+                  nsPrintfCString("Failed to set signals: 0x%08x",
+                                  static_cast<uint32_t>(aResult)));
+            }
+          },
+          [promise](mozilla::ipc::ResponseRejectReason) {
+            promise->MaybeRejectWithNetworkError(
+                "Failed to set signals: IPC communication error");
+          });
+
+  return promise.forget();
+}
+
+already_AddRefed<Promise> SerialPort::GetSignals(ErrorResult& aRv) {
+  nsIGlobalObject* global = GetRelevantGlobal();
+  if (!global) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(global, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  MOZ_LOG(gWebSerialLog, LogLevel::Debug,
+          ("SerialPort[%p]::GetSignals called for port '%s'", this,
+           NS_ConvertUTF16toUTF8(mInfo.id()).get()));
+
+  if (mState == State::Forgetting || mState == State::Forgotten) {
+    promise->MaybeRejectWithInvalidStateError("Port has been forgotten");
+    return promise.forget();
+  }
+
+  if (mState != State::Opened) {
+    promise->MaybeRejectWithInvalidStateError("Port is not open");
+    return promise.forget();
+  }
+
+  if (!mChild) {
+    promise->MaybeRejectWithInvalidStateError("Port not initialized");
+    return promise.forget();
+  }
+
+  RefPtr<SerialPortChild> child = mChild;
+  nsISerialEventTarget* actorTarget = child->GetActorEventTarget();
+
+  if (!actorTarget) {
+    promise->MaybeRejectWithNetworkError("Actor not available");
+    return promise.forget();
+  }
+
+  InvokeAsync(actorTarget, "SerialPort::SendGetSignals",
+              [child]() { return child->SendGetSignals(); })
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [promise](
+              const std::tuple<nsresult, IPCSerialInputSignals>& aResult) {
+            nsresult rv = std::get<0>(aResult);
+            if (NS_SUCCEEDED(rv)) {
+              const IPCSerialInputSignals& ipcSignals = std::get<1>(aResult);
+              SerialInputSignals result;
+              result.mDataCarrierDetect = ipcSignals.dataCarrierDetect();
+              result.mClearToSend = ipcSignals.clearToSend();
+              result.mRingIndicator = ipcSignals.ringIndicator();
+              result.mDataSetReady = ipcSignals.dataSetReady();
+              promise->MaybeResolve(result);
+            } else {
+              promise->MaybeRejectWithNetworkError(nsPrintfCString(
+                  "Failed to get signals: 0x%08x", static_cast<uint32_t>(rv)));
+            }
+          },
+          [promise](mozilla::ipc::ResponseRejectReason) {
+            promise->MaybeRejectWithNetworkError(
+                "Failed to get signals: IPC communication error");
+          });
+
+  return promise.forget();
+}
+
+already_AddRefed<Promise> SerialPort::Close(ErrorResult& aRv) {
+  nsIGlobalObject* global = GetRelevantGlobal();
+  if (!global) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(global, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  MOZ_LOG(gWebSerialLog, LogLevel::Info,
+          ("SerialPort[%p]::Close called for port '%s'", this,
+           NS_ConvertUTF16toUTF8(mInfo.id()).get()));
+
+  switch (mState) {
+    case State::Opened:
+      break;
+    case State::Closing:
+      promise->MaybeRejectWithInvalidStateError("Port is being closed");
+      return promise.forget();
+    case State::Forgetting:
+    case State::Forgotten:
+      promise->MaybeRejectWithInvalidStateError("Port has been forgotten");
+      return promise.forget();
+    case State::Closed:
+    case State::Opening:
+      promise->MaybeRejectWithInvalidStateError("Port is not open");
+      return promise.forget();
+  }
+  MOZ_ASSERT(mState == State::Opened);
+
+  RefPtr<Promise> combinedPromise = CloseStreams(StreamCloseMode::Graceful);
+  if (!combinedPromise) {
+    combinedPromise = Promise::CreateResolvedWithUndefined(global, aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return nullptr;
+    }
+  }
+
+  mState = State::Closing;
+  mClosePromise = promise;
+
+  combinedPromise->AddCallbacksWithCycleCollectedArgs(
+      [](JSContext*, JS::Handle<JS::Value>, ErrorResult&, SerialPort* aSelf) {
+        aSelf->CloseAfterStreamsClosed();
+      },
+      [](JSContext*, JS::Handle<JS::Value> aReason, ErrorResult&,
+         SerialPort* aSelf) {
+        if (aSelf->mHasShutdown) {
+          return;
+        }
+        if (aSelf->mState == State::Closing) {
+          aSelf->mState = State::Closed;
+        }
+        aSelf->UpdateWorkerRef();
+        aSelf->NotifySharingStateChanged(false);
+        if (RefPtr<Promise> closePromise = aSelf->mClosePromise.forget()) {
+          closePromise->MaybeReject(aReason);
+        }
+      },
+      RefPtr(this));
+
+  return promise.forget();
+}
+
+already_AddRefed<Promise> SerialPort::Forget(ErrorResult& aRv) {
+  nsIGlobalObject* global = GetRelevantGlobal();
+  if (!global) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(global, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  MOZ_LOG(gWebSerialLog, LogLevel::Info,
+          ("SerialPort[%p]::Forget called for port '%s'", this,
+           NS_ConvertUTF16toUTF8(mInfo.id()).get()));
+
+  const bool wasActive =
+      (mState == State::Opened) || (mState == State::Closing);
+  mState = State::Forgetting;
+
+  if (mSerial) {
+    RefPtr<Serial> serial = mSerial;
+    serial->ForgetPort(mInfo.id());
+  }
+
+  if (wasActive) {
+    RefPtr<Promise> ignoredPromise = CloseStreams(StreamCloseMode::Graceful);
+  }
+
+  UpdateWorkerRef();
+  NotifySharingStateChanged(false);
+
+  if (mChild) {
+    RefPtr<SerialPortChild> child = mChild;
+    nsISerialEventTarget* actorTarget = child->GetActorEventTarget();
+
+    if (!actorTarget) {
+      mState = State::Forgotten;
+      promise->MaybeResolveWithUndefined();
+      return promise.forget();
+    }
+
+    RefPtr<SerialPort> self = this;
+    InvokeAsync(actorTarget, "SerialPort::SendForget",
+                [child = std::move(child)]() { return child->SendClose(); })
+        ->Then(
+            GetCurrentSerialEventTarget(), __func__,
+            [promise, self](nsresult aResult) {
+              self->mState = State::Forgotten;
+              promise->MaybeResolveWithUndefined();
+            },
+            [promise, self](mozilla::ipc::ResponseRejectReason aReason) {
+              self->mState = State::Forgotten;
+              promise->MaybeResolveWithUndefined();
+            });
+  } else {
+    mState = State::Forgotten;
+    promise->MaybeResolveWithUndefined();
+  }
+
+  return promise.forget();
+}
+
+void SerialPort::MarkForgotten() {
+  if (mState == State::Forgetting || mState == State::Forgotten) {
+    return;
+  }
+
+  MOZ_LOG(gWebSerialLog, LogLevel::Info,
+          ("SerialPort[%p]::MarkForgotten for port '%s'", this,
+           NS_ConvertUTF16toUTF8(mInfo.id()).get()));
+
+  const bool wasActive =
+      (mState == State::Opened) || (mState == State::Closing);
+  mState = State::Forgotten;
+
+  if (wasActive) {
+    RefPtr<Promise> ignoredPromise = CloseStreams(StreamCloseMode::Graceful);
+  }
+
+  UpdateWorkerRef();
+  NotifySharingStateChanged(false);
+}
+
+void SerialPort::GetInfo(SerialPortInfo& aRetVal, ErrorResult& aRv) {
+  if (mInfo.usbVendorId().isSome()) {
+    aRetVal.mUsbVendorId.Construct(mInfo.usbVendorId().value());
+  }
+
+  if (mInfo.usbProductId().isSome()) {
+    aRetVal.mUsbProductId.Construct(mInfo.usbProductId().value());
+  }
+
+  if (mInfo.bluetoothServiceClassId().isSome()) {
+    OwningStringOrUnsignedLong uuid;
+    uuid.SetAsString() = mInfo.bluetoothServiceClassId().value();
+    aRetVal.mBluetoothServiceClassId.Construct(uuid);
+  }
+}
+
+ReadableStream* SerialPort::GetReadable() {
+  if (mState != State::Opened) {
+    return nullptr;
+  }
+  if (mReadable && mReadable->State() == ReadableStream::ReaderState::Closed) {
+    mReadable = nullptr;
+  }
+  if (!mReadable) {
+    return CreateReadableStream();
+  }
+  return mReadable;
+}
+
+WritableStream* SerialPort::GetWritable() {
+  if (mState != State::Opened) {
+    return nullptr;
+  }
+  if (mWritable &&
+      mWritable->State() != WritableStream::WriterState::Writable) {
+    mWritable = nullptr;
+  }
+  if (!mWritable) {
+    return CreateWritableStream();
+  }
+  return mWritable;
+}
+
+void SerialPort::NotifySharingStateChanged(bool aConnected) {
+  if (!mChild) {
+    return;
+  }
+
+  RefPtr<SerialPortChild> child = mChild;
+  nsISerialEventTarget* actorTarget = child->GetActorEventTarget();
+  if (actorTarget) {
+    actorTarget->Dispatch(NS_NewRunnableFunction(
+        "SerialPort::SendUpdateSharingState",
+        [child, aConnected]() { child->SendUpdateSharingState(aConnected); }));
+  }
+}
+
+void SerialPort::OnActorDestroyed() {
+  if (mHasShutdown) {
+    return;
+  }
+
+  MOZ_LOG(gWebSerialLog, LogLevel::Info,
+          ("SerialPort[%p]::OnActorDestroyed for port '%s'", this,
+           NS_ConvertUTF16toUTF8(mInfo.id()).get()));
+
+  mChild = nullptr;
+
+  MarkForgotten();
+
+  if (mSerial) {
+    RefPtr<Serial> serial = mSerial;
+    serial->ForgetPort(mInfo.id());
+  }
+}
+
+void SerialPort::NotifyConnected() {
+  MOZ_LOG(gWebSerialLog, LogLevel::Info,
+          ("SerialPort[%p] connected for port '%s'", this,
+           NS_ConvertUTF16toUTF8(mInfo.id()).get()));
+
+  mPhysicallyPresent = true;
+
+  auto event = MakeRefPtr<Event>(this, nullptr, nullptr);
+  event->InitEvent(u"connect"_ns, true, false);
+  event->SetTrusted(true);
+  DispatchTrustedEvent(event);
+}
+
+void SerialPort::NotifyDisconnected() {
+  MOZ_LOG(gWebSerialLog, LogLevel::Info,
+          ("SerialPort[%p] disconnected for port '%s'", this,
+           NS_ConvertUTF16toUTF8(mInfo.id()).get()));
+  if (mState == State::Opened || mState == State::Closing) {
+    mState = State::Closed;
+  }
+  mPhysicallyPresent = false;
+  RefPtr<Promise> ignoredPromise = CloseStreams(StreamCloseMode::Graceful);
+  UpdateWorkerRef();
+  NotifySharingStateChanged(false);
+
+  auto event = MakeRefPtr<Event>(this, nullptr, nullptr);
+  event->InitEvent(u"disconnect"_ns, true, false);
+  event->SetTrusted(true);
+  DispatchTrustedEvent(event);
+}
+
+class SerialByteReadableStream final : public ReadableStream {
+ public:
+  explicit SerialByteReadableStream(nsIGlobalObject* aGlobal)
+      : ReadableStream(aGlobal, HoldDropJSObjectsCaller::Implicit) {}
+
+  void SetUp(JSContext* aCx, UnderlyingSourceAlgorithmsWrapper& aAlgorithms,
+             Maybe<double> aHighWaterMark, ErrorResult& aRv) {
+    SetUpByteNative(aCx, aAlgorithms, aHighWaterMark, aRv);
+  }
+};
+
+ReadableStream* SerialPort::CreateReadableStream() {
+  MOZ_ASSERT(mState == State::Opened);
+  MOZ_ASSERT(!mReadable);
+
+  RefPtr<mozilla::ipc::DataPipeSender> sender;
+  RefPtr<mozilla::ipc::DataPipeReceiver> receiver;
+  nsresult rv = mozilla::ipc::NewDataPipe(mPipeCapacity, getter_AddRefs(sender),
+                                          getter_AddRefs(receiver));
+  if (NS_FAILED(rv)) {
+    return nullptr;
+  }
+
+  if (mChild) {
+    RefPtr<SerialPortChild> child = mChild;
+    nsISerialEventTarget* actorTarget = child->GetActorEventTarget();
+    if (actorTarget) {
+      actorTarget->Dispatch(NS_NewRunnableFunction(
+          "SerialPort::AttachReadPipe", [child, sender = std::move(sender)]() {
+            child->SendAttachReadPipe(sender);
+          }));
+    }
+  }
+
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(GetRelevantGlobal())) {
+    return nullptr;
+  }
+
+  JSContext* cx = jsapi.cx();
+  ErrorResult erv;
+
+  nsCOMPtr<nsIAsyncInputStream> readInput = receiver.get();
+  auto readableStream =
+      MakeRefPtr<SerialByteReadableStream>(GetRelevantGlobal());
+  RefPtr readAlgorithms =
+      MakeRefPtr<SerialPortReadAlgorithms>(cx, readInput, readableStream, this);
+  readableStream->SetUp(cx, *readAlgorithms, Some(0.0), erv);
+  if (erv.Failed()) {
+    return nullptr;
+  }
+  mReadable = readableStream;
+
+  MOZ_LOG(gWebSerialLog, LogLevel::Info,
+          ("SerialPort[%p]::CreateReadableStream created readable=%p", this,
+           mReadable.get()));
+  return mReadable;
+}
+
+WritableStream* SerialPort::CreateWritableStream() {
+  MOZ_ASSERT(mState == State::Opened);
+  MOZ_ASSERT(!mWritable);
+
+  RefPtr<mozilla::ipc::DataPipeSender> sender;
+  RefPtr<mozilla::ipc::DataPipeReceiver> receiver;
+  nsresult rv = mozilla::ipc::NewDataPipe(mPipeCapacity, getter_AddRefs(sender),
+                                          getter_AddRefs(receiver));
+  if (NS_FAILED(rv)) {
+    return nullptr;
+  }
+
+  if (mChild) {
+    RefPtr<SerialPortChild> child = mChild;
+    nsISerialEventTarget* actorTarget = child->GetActorEventTarget();
+    if (actorTarget) {
+      actorTarget->Dispatch(
+          NS_NewRunnableFunction("SerialPort::AttachWritePipe",
+                                 [child, receiver = std::move(receiver)]() {
+                                   child->SendAttachWritePipe(receiver);
+                                 }));
+    }
+  }
+
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(GetRelevantGlobal())) {
+    return nullptr;
+  }
+
+  JSContext* cx = jsapi.cx();
+  ErrorResult erv;
+
+  nsCOMPtr<nsIAsyncOutputStream> writeOutput = sender.get();
+  RefPtr writeAlgorithms = MakeRefPtr<SerialPortWriteAlgorithms>(
+      GetRelevantGlobal(), writeOutput, this);
+  mWritable = WritableStream::CreateNative(
+      cx, *GetRelevantGlobal(), *writeAlgorithms,
+      Some(static_cast<double>(mBufferSize)), nullptr, erv);
+  if (erv.Failed()) {
+    return nullptr;
+  }
+
+  MOZ_LOG(gWebSerialLog, LogLevel::Info,
+          ("SerialPort[%p]::CreateWritableStream created writable=%p", this,
+           mWritable.get()));
+  return mWritable;
+}
+
+void SerialPort::CloseAfterStreamsClosed() {
+  if (mHasShutdown) {
+    return;
+  }
+
+  nsresult rv = NS_OK;
+  auto markClosed = MakeScopeExit([&]() { SettleClosePromise(rv); });
+
+  RefPtr<SerialPortChild> child = mChild;
+  if (!child) {
+    return;
+  }
+
+  nsISerialEventTarget* actorTarget = child->GetActorEventTarget();
+  if (!actorTarget) {
+    rv = NS_ERROR_FAILURE;
+    return;
+  }
+
+  markClosed.release();
+
+  RefPtr<SerialPort> self = this;
+  nsCOMPtr<nsISerialEventTarget> owningThread = GetCurrentSerialEventTarget();
+  InvokeAsync(actorTarget, "SerialPort::SendClose",
+              [child]() { return child->SendClose(); })
+      ->Then(
+          owningThread, "SerialPort::Close::SendClose",
+          [self](nsresult aResult) { self->SettleClosePromise(aResult); },
+          [self](mozilla::ipc::ResponseRejectReason aReason) {
+            self->SettleClosePromise(NS_ERROR_DOM_NETWORK_ERR);
+          });
+}
+
+void SerialPort::SettleClosePromise(nsresult aResult) {
+  if (mHasShutdown) {
+    return;
+  }
+  if (mState == State::Closing) {
+    mState = State::Closed;
+  }
+  UpdateWorkerRef();
+  NotifySharingStateChanged(false);
+  if (RefPtr<Promise> closePromise = mClosePromise.forget()) {
+    if (NS_SUCCEEDED(aResult)) {
+      closePromise->MaybeResolveWithUndefined();
+    } else {
+      closePromise->MaybeRejectWithNetworkError(
+          "Failed to close port: IPC communication error");
+    }
+  }
+}
+
+already_AddRefed<Promise> SerialPort::CloseStreams(StreamCloseMode aMode) {
+  nsIGlobalObject* global = GetRelevantGlobal();
+  if (!global) {
+    return nullptr;
+  }
+
+  if (!mReadable && !mWritable) {
+    return nullptr;
+  }
+
+  MOZ_LOG(gWebSerialLog, LogLevel::Info,
+          ("SerialPort[%p]::CloseStreams closing streams "
+           "(readable=%p, writable=%p, mode=%s)",
+           this, mReadable.get(), mWritable.get(),
+           aMode == StreamCloseMode::Forced ? "forced" : "graceful"));
+
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(global)) {
+    return nullptr;
+  }
+
+  JSContext* cx = jsapi.cx();
+
+  RefPtr<DOMException> exception =
+      DOMException::Create(NS_ERROR_DOM_NETWORK_ERR, "Port has been closed"_ns);
+  JS::Rooted<JS::Value> errorVal(cx);
+  bool hasError = ToJSValue(cx, exception, &errorVal);
+
+  if (aMode == StreamCloseMode::Forced) {
+    if (mReadable && hasError) {
+      IgnoredErrorResult rv;
+      RefPtr readable = mReadable;
+      readable->ErrorNative(cx, errorVal, rv);
+    }
+    if (mWritable && hasError) {
+      IgnoredErrorResult rv;
+      RefPtr writable = mWritable;
+      writable->ErrorNative(cx, errorVal, rv);
+    }
+    mReadable = nullptr;
+    mWritable = nullptr;
+    return nullptr;
+  }
+
+  nsTArray<RefPtr<Promise>> streamPromises;
+
+  if (mReadable && hasError) {
+    IgnoredErrorResult rv;
+    RefPtr readable = mReadable;
+    if (RefPtr<Promise> cancelPromise =
+            readable->CancelNative(cx, errorVal, rv)) {
+      streamPromises.AppendElement(std::move(cancelPromise));
+    }
+  }
+
+  if (mWritable && hasError) {
+    IgnoredErrorResult rv;
+    RefPtr writable = mWritable;
+    if (RefPtr<Promise> abortPromise =
+            writable->AbortNative(cx, errorVal, rv)) {
+      streamPromises.AppendElement(std::move(abortPromise));
+    }
+  }
+
+  if (streamPromises.IsEmpty()) {
+    mReadable = nullptr;
+    mWritable = nullptr;
+    return nullptr;
+  }
+
+  IgnoredErrorResult rv;
+  RefPtr<Promise> combined = Promise::All(cx, streamPromises, rv);
+  if (!combined) {
+    mReadable = nullptr;
+    mWritable = nullptr;
+    return nullptr;
+  }
+
+  combined->AddCallbacksWithCycleCollectedArgs(
+      [](JSContext*, JS::Handle<JS::Value>, ErrorResult&, SerialPort* aSelf) {
+        aSelf->mReadable = nullptr;
+        aSelf->mWritable = nullptr;
+      },
+      [](JSContext*, JS::Handle<JS::Value>, ErrorResult&, SerialPort* aSelf) {
+        aSelf->mReadable = nullptr;
+        aSelf->mWritable = nullptr;
+      },
+      RefPtr(this));
+
+  return combined.forget();
+}
+
+}  

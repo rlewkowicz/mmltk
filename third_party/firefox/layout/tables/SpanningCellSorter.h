@@ -1,0 +1,52 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef SpanningCellSorter_h
+#define SpanningCellSorter_h
+
+
+#include "StackArena.h"
+#include "nsDebug.h"
+#include "nsTArray.h"
+#include "nsTHashMap.h"
+
+class MOZ_STACK_CLASS SpanningCellSorter {
+ public:
+  SpanningCellSorter();
+  ~SpanningCellSorter();
+
+  struct Item {
+    int32_t row, col;
+    Item* next;
+  };
+
+  bool AddCell(int32_t aColSpan, int32_t aRow, int32_t aCol);
+
+  Item* GetNext(int32_t* aColSpan);
+
+ private:
+  enum State { ADDING, ENUMERATING_ARRAY, ENUMERATING_HASH, DONE };
+  State mState = ADDING;
+
+
+  enum { ARRAY_BASE = 2 };
+  enum { ARRAY_SIZE = 8 };
+  Item* mArray[ARRAY_SIZE] = {};
+  int32_t SpanToIndex(int32_t aSpan) { return aSpan - ARRAY_BASE; }
+  int32_t IndexToSpan(int32_t aIndex) { return aIndex + ARRAY_BASE; }
+  bool UseArrayForSpan(int32_t aSpan) {
+    NS_ASSERTION(SpanToIndex(aSpan) >= 0, "cell without colspan");
+    return SpanToIndex(aSpan) < ARRAY_SIZE;
+  }
+
+  using HashTableType = nsTHashMap<int32_t, Item*>;
+  using HashTableEntry = typename HashTableType::EntryType;
+
+  HashTableType mHashTable;
+
+  uint32_t mEnumerationIndex = 0;  
+  nsTArray<HashTableEntry*> mSortedHashTable;
+};
+
+#endif

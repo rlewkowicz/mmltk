@@ -1,0 +1,558 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_CacheIR_h
+#define jit_CacheIR_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "jstypes.h"
+
+#include "jit/CacheIROpsGenerated.h"
+#include "js/GCAnnotations.h"
+#include "js/Value.h"
+
+struct JS_PUBLIC_API JSContext;
+
+namespace js {
+namespace jit {
+
+
+class OperandId {
+ protected:
+  static const uint16_t InvalidId = UINT16_MAX;
+  uint16_t id_;
+
+  explicit OperandId(uint16_t id) : id_(id) {}
+
+ public:
+  OperandId() : id_(InvalidId) {}
+  uint16_t id() const { return id_; }
+  bool valid() const { return id_ != InvalidId; }
+};
+
+class ValOperandId : public OperandId {
+ public:
+  ValOperandId() = default;
+  explicit ValOperandId(uint16_t id) : OperandId(id) {}
+
+  bool operator==(const ValOperandId& other) const { return id_ == other.id_; }
+};
+
+class ValueTagOperandId : public OperandId {
+ public:
+  ValueTagOperandId() = default;
+  explicit ValueTagOperandId(uint16_t id) : OperandId(id) {}
+};
+
+class IntPtrOperandId : public OperandId {
+ public:
+  IntPtrOperandId() = default;
+  explicit IntPtrOperandId(uint16_t id) : OperandId(id) {}
+};
+
+class ObjOperandId : public OperandId {
+ public:
+  ObjOperandId() = default;
+  explicit ObjOperandId(uint16_t id) : OperandId(id) {}
+
+  bool operator==(const ObjOperandId& other) const { return id_ == other.id_; }
+  bool operator!=(const ObjOperandId& other) const { return id_ != other.id_; }
+};
+
+class NumberOperandId : public ValOperandId {
+ public:
+  NumberOperandId() = default;
+  explicit NumberOperandId(uint16_t id) : ValOperandId(id) {}
+};
+
+class StringOperandId : public OperandId {
+ public:
+  StringOperandId() = default;
+  explicit StringOperandId(uint16_t id) : OperandId(id) {}
+};
+
+class SymbolOperandId : public OperandId {
+ public:
+  SymbolOperandId() = default;
+  explicit SymbolOperandId(uint16_t id) : OperandId(id) {}
+};
+
+class BigIntOperandId : public OperandId {
+ public:
+  BigIntOperandId() = default;
+  explicit BigIntOperandId(uint16_t id) : OperandId(id) {}
+};
+
+class BooleanOperandId : public OperandId {
+ public:
+  BooleanOperandId() = default;
+  explicit BooleanOperandId(uint16_t id) : OperandId(id) {}
+};
+
+class Int32OperandId : public OperandId {
+ public:
+  Int32OperandId() = default;
+  explicit Int32OperandId(uint16_t id) : OperandId(id) {}
+};
+
+class TypedOperandId : public OperandId {
+  JSValueType type_;
+
+ public:
+  MOZ_IMPLICIT TypedOperandId(ObjOperandId id)
+      : OperandId(id.id()), type_(JSVAL_TYPE_OBJECT) {}
+  MOZ_IMPLICIT TypedOperandId(StringOperandId id)
+      : OperandId(id.id()), type_(JSVAL_TYPE_STRING) {}
+  MOZ_IMPLICIT TypedOperandId(SymbolOperandId id)
+      : OperandId(id.id()), type_(JSVAL_TYPE_SYMBOL) {}
+  MOZ_IMPLICIT TypedOperandId(BigIntOperandId id)
+      : OperandId(id.id()), type_(JSVAL_TYPE_BIGINT) {}
+  MOZ_IMPLICIT TypedOperandId(BooleanOperandId id)
+      : OperandId(id.id()), type_(JSVAL_TYPE_BOOLEAN) {}
+  MOZ_IMPLICIT TypedOperandId(Int32OperandId id)
+      : OperandId(id.id()), type_(JSVAL_TYPE_INT32) {}
+
+  MOZ_IMPLICIT TypedOperandId(ValueTagOperandId val)
+      : OperandId(val.id()), type_(JSVAL_TYPE_UNKNOWN) {}
+  MOZ_IMPLICIT TypedOperandId(IntPtrOperandId id)
+      : OperandId(id.id()), type_(JSVAL_TYPE_UNKNOWN) {}
+
+  TypedOperandId(ValOperandId val, JSValueType type)
+      : OperandId(val.id()), type_(type) {}
+
+  JSValueType type() const { return type_; }
+};
+
+#define CACHE_IR_KINDS(_) \
+  _(GetProp)              \
+  _(GetElem)              \
+  _(GetName)              \
+  _(GetPropSuper)         \
+  _(GetElemSuper)         \
+  _(GetImport)            \
+  _(LazyConstant)         \
+  _(SetProp)              \
+  _(SetElem)              \
+  _(BindName)             \
+  _(In)                   \
+  _(HasOwn)               \
+  _(CheckPrivateField)    \
+  _(TypeOf)               \
+  _(TypeOfEq)             \
+  _(ToPropertyKey)        \
+  _(InstanceOf)           \
+  _(GetIterator)          \
+  _(CloseIter)            \
+  _(OptimizeGetIterator)  \
+  _(OptimizeSpreadCall)   \
+  _(Compare)              \
+  _(ToBool)               \
+  _(Call)                 \
+  _(UnaryArith)           \
+  _(BinaryArith)          \
+  _(NewObject)            \
+  _(NewArray)             \
+  _(Lambda)
+
+enum class CacheKind : uint8_t {
+#define DEFINE_KIND(kind) kind,
+  CACHE_IR_KINDS(DEFINE_KIND)
+#undef DEFINE_KIND
+};
+
+extern const char* const CacheKindNames[];
+
+extern size_t NumInputsForCacheKind(CacheKind kind);
+
+enum class CacheOp : uint16_t {
+#define DEFINE_OP(op, ...) op,
+  CACHE_IR_OPS(DEFINE_OP)
+#undef DEFINE_OP
+      NumOpcodes,
+};
+
+struct CacheIROpInfo {
+  uint8_t argLength : 7;
+  bool transpile : 1;
+};
+static_assert(sizeof(CacheIROpInfo) == 1);
+extern const CacheIROpInfo CacheIROpInfos[];
+
+extern const char* const CacheIROpNames[];
+
+inline const char* CacheIRCodeName(CacheOp op) {
+  return CacheIROpNames[static_cast<size_t>(op)];
+}
+
+extern const uint32_t CacheIROpHealth[];
+
+class StubField {
+ public:
+  enum class Type : uint8_t {
+    RawInt32,
+    RawPointer,
+    ICScript,
+    Shape,
+    WeakShape,
+    JSObject,
+    WeakObject,
+    Symbol,
+    String,
+    WeakBaseScript,
+    JitCode,
+
+    Id,
+    AllocSite,
+
+    RawInt64,
+    First64BitType = RawInt64,
+    Value,
+    WeakValue,
+    Double,
+
+    Limit
+  };
+
+  static bool sizeIsWord(Type type) {
+    MOZ_ASSERT(type != Type::Limit);
+    return type < Type::First64BitType;
+  }
+
+  static bool sizeIsInt64(Type type) {
+    MOZ_ASSERT(type != Type::Limit);
+    return type >= Type::First64BitType;
+  }
+
+  static size_t sizeInBytes(Type type) {
+    if (sizeIsWord(type)) {
+      return sizeof(uintptr_t);
+    }
+    MOZ_ASSERT(sizeIsInt64(type));
+    return sizeof(int64_t);
+  }
+
+ private:
+  uint64_t data_;
+  Type type_;
+
+ public:
+  StubField(uint64_t data, Type type) : data_(data), type_(type) {
+    MOZ_ASSERT_IF(sizeIsWord(), data <= UINTPTR_MAX);
+  }
+
+  Type type() const { return type_; }
+
+  bool sizeIsWord() const { return sizeIsWord(type_); }
+  bool sizeIsInt64() const { return sizeIsInt64(type_); }
+
+  size_t sizeInBytes() const { return sizeInBytes(type_); }
+
+  uintptr_t asWord() const {
+    MOZ_ASSERT(sizeIsWord());
+    return uintptr_t(data_);
+  }
+  uint64_t asInt64() const {
+    MOZ_ASSERT(sizeIsInt64());
+    return data_;
+  }
+  uint64_t rawData() const { return data_; }
+} JS_HAZ_GC_POINTER;
+
+inline const char* StubFieldTypeName(StubField::Type ty) {
+  switch (ty) {
+    case StubField::Type::RawInt32:
+      return "RawInt32";
+    case StubField::Type::RawPointer:
+      return "RawPointer";
+    case StubField::Type::ICScript:
+      return "ICScript";
+    case StubField::Type::Shape:
+      return "Shape";
+    case StubField::Type::WeakShape:
+      return "WeakShape";
+    case StubField::Type::JSObject:
+      return "JSObject";
+    case StubField::Type::WeakObject:
+      return "WeakObject";
+    case StubField::Type::Symbol:
+      return "Symbol";
+    case StubField::Type::String:
+      return "String";
+    case StubField::Type::WeakBaseScript:
+      return "WeakBaseScript";
+    case StubField::Type::JitCode:
+      return "JitCode";
+    case StubField::Type::Id:
+      return "Id";
+    case StubField::Type::AllocSite:
+      return "AllocSite";
+    case StubField::Type::RawInt64:
+      return "RawInt64";
+    case StubField::Type::Value:
+      return "Value";
+    case StubField::Type::WeakValue:
+      return "WeakValue";
+    case StubField::Type::Double:
+      return "Double";
+    case StubField::Type::Limit:
+      return "Limit";
+  }
+  MOZ_CRASH("Unknown StubField::Type");
+}
+
+class CallFlags {
+ public:
+  enum ArgFormat : uint8_t {
+    Unknown,
+    Standard,
+    Spread,
+    FunCall,
+    FunApplyArgsObj,
+    FunApplyArray,
+    FunApplyNullUndefined,
+    LastArgFormat = FunApplyNullUndefined
+  };
+
+  CallFlags() = default;
+  explicit CallFlags(ArgFormat format) : argFormat_(format) {}
+  CallFlags(ArgFormat format, bool isConstructing, bool isSameRealm,
+            bool needsUninitializedThis)
+      : argFormat_(format),
+        isConstructing_(isConstructing),
+        isSameRealm_(isSameRealm),
+        needsUninitializedThis_(needsUninitializedThis) {}
+  CallFlags(bool isConstructing, bool isSpread, bool isSameRealm = false,
+            bool needsUninitializedThis = false)
+      : argFormat_(isSpread ? Spread : Standard),
+        isConstructing_(isConstructing),
+        isSameRealm_(isSameRealm),
+        needsUninitializedThis_(needsUninitializedThis) {}
+
+  ArgFormat getArgFormat() const { return argFormat_; }
+  bool isConstructing() const {
+    MOZ_ASSERT_IF(isConstructing_,
+                  argFormat_ == Standard || argFormat_ == Spread);
+    return isConstructing_;
+  }
+  bool isSameRealm() const { return isSameRealm_; }
+  void setIsSameRealm() { isSameRealm_ = true; }
+
+  bool needsUninitializedThis() const { return needsUninitializedThis_; }
+  void setNeedsUninitializedThis() { needsUninitializedThis_ = true; }
+
+  uint8_t toByte() const {
+    MOZ_ASSERT(argFormat_ != ArgFormat::Unknown);
+    uint8_t value = getArgFormat();
+    if (isConstructing()) {
+      value |= CallFlags::IsConstructing;
+    }
+    if (isSameRealm()) {
+      value |= CallFlags::IsSameRealm;
+    }
+    if (needsUninitializedThis()) {
+      value |= CallFlags::NeedsUninitializedThis;
+    }
+    return value;
+  }
+
+ private:
+  ArgFormat argFormat_ = ArgFormat::Unknown;
+  bool isConstructing_ = false;
+  bool isSameRealm_ = false;
+  bool needsUninitializedThis_ = false;
+
+  static const uint8_t ArgFormatBits = 4;
+  static const uint8_t ArgFormatMask = (1 << ArgFormatBits) - 1;
+  static_assert(LastArgFormat <= ArgFormatMask, "Not enough arg format bits");
+  static const uint8_t IsConstructing = 1 << 5;
+  static const uint8_t IsSameRealm = 1 << 6;
+  static const uint8_t NeedsUninitializedThis = 1 << 7;
+
+  friend class CacheIRReader;
+  friend class CacheIRWriter;
+};
+
+const uint32_t MaxUnrolledArgCopy = 5;
+inline uint32_t ClampFixedArgc(uint32_t argc) {
+  return std::min(argc, MaxUnrolledArgCopy);
+}
+
+enum class AttachDecision {
+  NoAction,
+
+  Attach,
+
+  TemporarilyUnoptimizable,
+
+  Deferred
+};
+
+#define TRY_ATTACH(expr)                                    \
+  do {                                                      \
+    AttachDecision tryAttachTempResult_ = expr;             \
+    if (tryAttachTempResult_ != AttachDecision::NoAction) { \
+      return tryAttachTempResult_;                          \
+    }                                                       \
+  } while (0)
+
+enum class ArgumentKind : uint8_t {
+  Callee,
+  This,
+  NewTarget,
+  Arg0,
+  Arg1,
+  Arg2,
+  Arg3,
+  Arg4,
+  Arg5,
+  Arg6,
+  Arg7,
+  NumKinds
+};
+
+const uint8_t ArgumentKindArgIndexLimit =
+    uint8_t(ArgumentKind::NumKinds) - uint8_t(ArgumentKind::Arg0);
+
+inline ArgumentKind ArgumentKindForArgIndex(uint32_t idx) {
+  MOZ_ASSERT(idx < ArgumentKindArgIndexLimit);
+  return ArgumentKind(uint32_t(ArgumentKind::Arg0) + idx);
+}
+
+inline int32_t GetIndexOfArgument(ArgumentKind kind, CallFlags flags,
+                                  bool* addArgc) {
+
+  switch (flags.getArgFormat()) {
+    case CallFlags::Standard:
+      *addArgc = true;
+      break;
+    case CallFlags::Spread:
+      MOZ_ASSERT(kind <= ArgumentKind::Arg0);
+      *addArgc = false;
+      break;
+    case CallFlags::Unknown:
+    case CallFlags::FunCall:
+    case CallFlags::FunApplyArgsObj:
+    case CallFlags::FunApplyArray:
+    case CallFlags::FunApplyNullUndefined:
+      MOZ_CRASH("Currently unreachable");
+      break;
+  }
+
+  bool hasArgumentArray = !*addArgc;
+  switch (kind) {
+    case ArgumentKind::Callee:
+      return flags.isConstructing() + hasArgumentArray + 1;
+    case ArgumentKind::This:
+      return flags.isConstructing() + hasArgumentArray;
+    case ArgumentKind::Arg0:
+      return flags.isConstructing() + hasArgumentArray - 1;
+    case ArgumentKind::Arg1:
+      return flags.isConstructing() + hasArgumentArray - 2;
+    case ArgumentKind::Arg2:
+      return flags.isConstructing() + hasArgumentArray - 3;
+    case ArgumentKind::Arg3:
+      return flags.isConstructing() + hasArgumentArray - 4;
+    case ArgumentKind::Arg4:
+      return flags.isConstructing() + hasArgumentArray - 5;
+    case ArgumentKind::Arg5:
+      return flags.isConstructing() + hasArgumentArray - 6;
+    case ArgumentKind::Arg6:
+      return flags.isConstructing() + hasArgumentArray - 7;
+    case ArgumentKind::Arg7:
+      return flags.isConstructing() + hasArgumentArray - 8;
+    case ArgumentKind::NewTarget:
+      MOZ_ASSERT(flags.isConstructing());
+      *addArgc = false;
+      return 0;
+    default:
+      MOZ_CRASH("Invalid argument kind");
+  }
+}
+
+enum class GuardClassKind : uint8_t {
+  Array,
+  PlainObject,
+  FixedLengthArrayBuffer,
+  ImmutableArrayBuffer,
+  ResizableArrayBuffer,
+  FixedLengthSharedArrayBuffer,
+  GrowableSharedArrayBuffer,
+  FixedLengthDataView,
+  ImmutableDataView,
+  ResizableDataView,
+  MappedArguments,
+  UnmappedArguments,
+  WindowProxy,
+  JSFunction,
+  BoundFunction,
+  Set,
+  Map,
+  Date,
+  WeakMap,
+  WeakSet,
+};
+
+const JSClass* ClassFor(GuardClassKind kind);
+
+enum class ArrayBufferViewKind : uint8_t {
+  FixedLength,
+  Immutable,
+  Resizable,
+};
+
+inline const char* GuardClassKindEnumName(GuardClassKind kind) {
+  switch (kind) {
+    case GuardClassKind::Array:
+      return "Array";
+    case GuardClassKind::PlainObject:
+      return "PlainObject";
+    case GuardClassKind::FixedLengthArrayBuffer:
+      return "FixedLengthArrayBuffer";
+    case GuardClassKind::ImmutableArrayBuffer:
+      return "ImmutableArrayBuffer";
+    case GuardClassKind::ResizableArrayBuffer:
+      return "ResizableArrayBuffer";
+    case GuardClassKind::FixedLengthSharedArrayBuffer:
+      return "FixedLengthSharedArrayBuffer";
+    case GuardClassKind::GrowableSharedArrayBuffer:
+      return "GrowableSharedArrayBuffer";
+    case GuardClassKind::FixedLengthDataView:
+      return "FixedLengthDataView";
+    case GuardClassKind::ImmutableDataView:
+      return "ImmutableDataView";
+    case GuardClassKind::ResizableDataView:
+      return "ResizableDataView";
+    case GuardClassKind::MappedArguments:
+      return "MappedArguments";
+    case GuardClassKind::UnmappedArguments:
+      return "UnmappedArguments";
+    case GuardClassKind::WindowProxy:
+      return "WindowProxy";
+    case GuardClassKind::JSFunction:
+      return "JSFunction";
+    case GuardClassKind::BoundFunction:
+      return "BoundFunction";
+    case GuardClassKind::Set:
+      return "Set";
+    case GuardClassKind::Map:
+      return "Map";
+    case GuardClassKind::Date:
+      return "Date";
+    case GuardClassKind::WeakMap:
+      return "WeakMap";
+    case GuardClassKind::WeakSet:
+      return "WeakSet";
+  }
+  MOZ_CRASH("Unknown GuardClassKind");
+}
+
+}  
+}  
+
+#endif /* jit_CacheIR_h */

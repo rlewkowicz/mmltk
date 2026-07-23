@@ -1,0 +1,81 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "KungFuDeathGripChecker.h"
+#include "CustomMatchers.h"
+
+void KungFuDeathGripChecker::registerMatchers(MatchFinder *AstMatcher) {
+  AstMatcher->addMatcher(varDecl(hasType(isRefPtr()), hasLocalStorage(),
+                                       hasInitializer(anything()),
+                                 unless(anyOf(isReferenced(), isParameter())))
+                             .bind("decl"),
+                         this);
+}
+
+void KungFuDeathGripChecker::check(const MatchFinder::MatchResult &Result) {
+  const char *Error = "Unused \"kungFuDeathGrip\" %0 objects constructed from "
+                      "%1 are prohibited";
+  const char *Note = "Please switch all accesses to this %0 to go through "
+                     "'%1', or explicitly cast '%1' to `(void)`";
+
+  const VarDecl *D = Result.Nodes.getNodeAs<VarDecl>("decl");
+
+  const Expr *E = IgnoreTrivials(D->getInit());
+  const CXXConstructExpr *CE = dyn_cast<CXXConstructExpr>(E);
+  if (CE && CE->getNumArgs() == 0) {
+    return;
+  }
+
+  while ((CE = dyn_cast<CXXConstructExpr>(E)) && CE->getNumArgs() == 1) {
+    E = IgnoreTrivials(CE->getArg(0));
+  }
+
+  if (E->isXValue()) {
+    return;
+  }
+
+  if (E->getType().isNull()) {
+    return;
+  }
+
+  if (isa<CXXThisExpr>(E) || isa<DeclRefExpr>(E) || isa<CXXNewExpr>(E)) {
+    return;
+  }
+
+  const TagDecl *TD = E->getType()->getAsTagDecl();
+  if (TD && TD->getIdentifier()) {
+    static const char *IgnoreTypes[] = {
+        "already_AddRefed",
+        "nsGetServiceByCID",
+        "nsGetServiceByCIDWithError",
+        "nsGetServiceByContractID",
+        "nsGetServiceByContractIDWithError",
+        "nsCreateInstanceByCID",
+        "nsCreateInstanceByContractID",
+        "nsCreateInstanceFromFactory",
+    };
+
+    for (uint32_t i = 0; i < sizeof(IgnoreTypes) / sizeof(IgnoreTypes[0]);
+         ++i) {
+      if (TD->getName() == IgnoreTypes[i]) {
+        return;
+      }
+    }
+  }
+
+  const char *ErrThing;
+  const char *NoteThing;
+  if (isa<MemberExpr>(E)) {
+    ErrThing = "members";
+    NoteThing = "member";
+  } else {
+    ErrThing = "temporary values";
+    NoteThing = "value";
+  }
+
+  diag(D->getBeginLoc(), Error, DiagnosticIDs::Error)
+      << D->getType() << ErrThing;
+  diag(E->getBeginLoc(), Note, DiagnosticIDs::Note)
+      << NoteThing << getNameChecked(D);
+}

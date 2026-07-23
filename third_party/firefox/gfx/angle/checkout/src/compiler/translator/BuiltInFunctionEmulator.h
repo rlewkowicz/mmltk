@@ -1,0 +1,60 @@
+// Copyright 2011 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(COMPILER_TRANSLATOR_BUILTINFUNCTIONEMULATOR_H_)
+#define COMPILER_TRANSLATOR_BUILTINFUNCTIONEMULATOR_H_
+
+#include "compiler/translator/InfoSink.h"
+
+namespace sh
+{
+
+class TIntermNode;
+class TFunction;
+class TSymbolUniqueId;
+
+using BuiltinQueryFunc = const char *(int);
+
+class BuiltInFunctionEmulator
+{
+  public:
+    BuiltInFunctionEmulator();
+
+    void markBuiltInFunctionsForEmulation(TIntermNode *root);
+
+    static void WriteEmulatedFunctionName(TInfoSinkBase &out, const char *name);
+
+    bool isOutputEmpty() const;
+
+    void outputEmulatedFunctions(TInfoSinkBase &out) const;
+
+    void addEmulatedFunction(const TSymbolUniqueId &uniqueId,
+                             const char *emulatedFunctionDefinition);
+
+    void addEmulatedFunctionWithDependency(const TSymbolUniqueId &dependency,
+                                           const TSymbolUniqueId &uniqueId,
+                                           const char *emulatedFunctionDefinition);
+
+    void addFunctionMap(BuiltinQueryFunc queryFunc);
+
+  private:
+    class BuiltInFunctionEmulationMarker;
+
+    bool setFunctionCalled(const TFunction *function);
+    bool setFunctionCalled(int uniqueId);
+
+    const char *findEmulatedFunction(int uniqueId) const;
+
+    std::map<int, std::string> mEmulatedFunctions;
+
+    std::map<int, int> mFunctionDependencies;
+
+    std::vector<int> mFunctions;
+
+    std::vector<BuiltinQueryFunc *> mQueryFunctions;
+};
+
+}  
+
+#endif

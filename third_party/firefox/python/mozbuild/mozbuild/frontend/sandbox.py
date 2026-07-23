@@ -1,0 +1,280 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+r"""Python sandbox implementation for build files.
+
+This module contains classes for Python sandboxes that execute in a
+highly-controlled environment.
+
+The main class is `Sandbox`. This provides an execution environment for Python
+code and is used to fill a Context instance for the takeaway information from
+the execution.
+
+Code in this module takes a different approach to exception handling compared
+to what you'd see elsewhere in Python. Arguments to built-in exceptions like
+KeyError are machine parseable. This machine-friendly data is used to present
+user-friendly error messages in the case of errors.
+"""
+
+import os
+import sys
+import weakref
+
+from mozpack.files import FileFinder
+
+from mozbuild.util import ReadOnlyDict
+
+from .context import Context
+
+default_finder = FileFinder("/")
+
+
+def alphabetical_sorted(iterable, key=lambda x: x.lower(), reverse=False):
+    """sorted() replacement for the sandbox, ordering alphabetically by
+    default.
+    """
+    return sorted(iterable, key=key, reverse=reverse)
+
+
+class SandboxError(Exception):
+    def __init__(self, file_stack):
+        self.file_stack = file_stack
+
+
+class SandboxExecutionError(SandboxError):
+    """Represents errors encountered during execution of a Sandbox.
+
+    This is a simple container exception. It's purpose is to capture state
+    so something else can report on it.
+    """
+
+    def __init__(self, file_stack, exc_type, exc_value, trace):
+        SandboxError.__init__(self, file_stack)
+
+        self.exc_type = exc_type
+        self.exc_value = exc_value
+        self.trace = trace
+
+
+class SandboxLoadError(SandboxError):
+    """Represents errors encountered when loading a file for execution.
+
+    This exception represents errors in a Sandbox that occurred as part of
+    loading a file. The error could have occurred in the course of executing
+    a file. If so, the file_stack will be non-empty and the file that caused
+    the load will be on top of the stack.
+    """
+
+    def __init__(self, file_stack, trace, illegal_path=None, read_error=None):
+        SandboxError.__init__(self, file_stack)
+
+        self.trace = trace
+        self.illegal_path = illegal_path
+        self.read_error = read_error
+
+
+class Sandbox(dict):
+    """Represents a sandbox for executing Python code.
+
+    This class provides a sandbox for execution of a single mozbuild frontend
+    file. The results of that execution is stored in the Context instance given
+    as the ``context`` argument.
+
+    Sandbox is effectively a glorified wrapper around compile() + exec(). You
+    point it at some Python code and it executes it. The main difference from
+    executing Python code like normal is that the executed code is very limited
+    in what it can do: the sandbox only exposes a very limited set of Python
+    functionality. Only specific types and functions are available. This
+    prevents executed code from doing things like import modules, open files,
+    etc.
+
+    Sandbox instances act as global namespace for the sandboxed execution
+    itself. They shall not be used to access the results of the execution.
+    Those results are available in the given Context instance after execution.
+
+    The Sandbox itself is responsible for enforcing rules such as forbidding
+    reassignment of variables.
+
+    Implementation note: Sandbox derives from dict because exec() insists that
+    what it is given for namespaces is a dict.
+    """
+
+    __hash__ = object.__hash__
+
+    BUILTINS = ReadOnlyDict({
+        "None": None,
+        "False": False,
+        "True": True,
+        "sorted": alphabetical_sorted,
+        "int": int,
+        "len": len,
+        "range": range,
+        "set": set,
+        "tuple": tuple,
+    })
+
+    def __init__(self, context, finder=default_finder):
+        """Initialize a Sandbox ready for execution."""
+        self._builtins = self.BUILTINS
+        dict.__setitem__(self, "__builtins__", self._builtins)
+
+        assert isinstance(self._builtins, ReadOnlyDict)
+        assert isinstance(context, Context)
+
+        self._active_contexts = [context]
+
+        self.subcontexts = []
+
+        self._last_name_error = None
+
+        self._current_source = None
+
+        self._finder = finder
+
+    @property
+    def _context(self):
+        return self._active_contexts[-1]
+
+    def exec_file(self, path, becomes_current_path=True):
+        """Execute code at a path in the sandbox.
+
+        The path must be absolute.
+        """
+        assert os.path.isabs(path)
+
+        try:
+            source = self._finder.get(path).read().decode()
+        except Exception:
+            raise SandboxLoadError(
+                self._context.source_stack, sys.exc_info()[2], read_error=path
+            )
+
+        self.exec_source(source, path, becomes_current_path)
+
+    def exec_source(self, source, path="", becomes_current_path=True):
+        """Execute Python code within a string.
+
+        The passed string should contain Python code to be executed. The string
+        will be compiled and executed.
+
+        You should almost always go through exec_file() because exec_source()
+        does not perform extra path normalization. This can cause relative
+        paths to behave weirdly.
+        """
+
+        def execute():
+            code = compile(source, path, "exec")
+            old_source = self._current_source
+            self._current_source = source
+            try:
+                exec(code, self)
+            finally:
+                self._current_source = old_source
+
+        self.exec_function(
+            execute, path=path, becomes_current_path=becomes_current_path
+        )
+
+    def exec_function(
+        self, func, args=(), kwargs={}, path="", becomes_current_path=True
+    ):
+        """Execute function with the given arguments in the sandbox."""
+        if path and becomes_current_path:
+            self._context.push_source(path)
+
+        old_sandbox = self._context._sandbox
+        self._context._sandbox = weakref.ref(self)
+
+
+        old_source = self._current_source
+        self._current_source = None
+        try:
+            func(*args, **kwargs)
+        except SandboxError as e:
+            raise e
+        except NameError as e:
+
+            actual = e
+
+            if self._last_name_error is not None:
+                actual = self._last_name_error
+            source_stack = self._context.source_stack
+            if not becomes_current_path:
+                source_stack.append(path)
+            raise SandboxExecutionError(
+                source_stack, type(actual), actual, sys.exc_info()[2]
+            )
+
+        except Exception:
+            exc = sys.exc_info()
+            source_stack = self._context.source_stack
+            if not becomes_current_path:
+                source_stack.append(path)
+            raise SandboxExecutionError(source_stack, exc[0], exc[1], exc[2])
+        finally:
+            self._current_source = old_source
+            self._context._sandbox = old_sandbox
+            if path and becomes_current_path:
+                self._context.pop_source()
+
+    def push_subcontext(self, context):
+        """Push a SubContext onto the execution stack.
+
+        When called, the active context will be set to the specified context,
+        meaning all variable accesses will go through it. We also record this
+        SubContext as having been executed as part of this sandbox.
+        """
+        self._active_contexts.append(context)
+        if context not in self.subcontexts:
+            self.subcontexts.append(context)
+
+    def pop_subcontext(self, context):
+        """Pop a SubContext off the execution stack.
+
+        SubContexts must be pushed and popped in opposite order. This is
+        validated as part of the function call to ensure proper consumer API
+        use.
+        """
+        popped = self._active_contexts.pop()
+        assert popped == context
+
+    def __getitem__(self, key):
+        if key.isupper():
+            try:
+                return self._context[key]
+            except Exception as e:
+                self._last_name_error = e
+                raise
+
+        return dict.__getitem__(self, key)
+
+    def __setitem__(self, key, value):
+        if key in self._builtins or key == "__builtins__":
+            raise KeyError("Cannot reassign builtins")
+
+        if key.isupper():
+            if key in self._context and self._context[key] is not value:
+                raise KeyError("global_ns", "reassign", key)
+
+            if (
+                key not in self._context
+                and isinstance(value, (list, dict))
+                and not value
+            ):
+                raise KeyError("Variable %s assigned an empty value." % key)
+
+            self._context[key] = value
+        else:
+            dict.__setitem__(self, key, value)
+
+    def get(self, key, default=None):
+        raise NotImplementedError("Not supported")
+
+    def __iter__(self):
+        raise NotImplementedError("Not supported")
+
+    def __contains__(self, key):
+        if key.isupper():
+            return key in self._context
+        return dict.__contains__(self, key)

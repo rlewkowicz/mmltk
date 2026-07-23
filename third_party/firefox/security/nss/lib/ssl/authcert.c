@@ -1,0 +1,208 @@
+/*
+ * NSS utility functions
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include <stdio.h>
+#include <string.h>
+#include "prerror.h"
+#include "secitem.h"
+#include "prnetdb.h"
+#include "cert.h"
+#include "nspr.h"
+#include "secder.h"
+#include "keyhi.h"
+#include "nss.h"
+#include "ssl.h"
+#include "pk11func.h" /* for PK11_ function calls */
+#include "sslimpl.h"
+
+static char **
+ssl_DistNamesToStrings(struct CERTDistNamesStr *caNames, int *n)
+{
+    char **names;
+    int i;
+    SECStatus rv;
+    PLArenaPool *arena;
+
+    *n = 0;
+    names = PORT_ZNewArray(char *, caNames->nnames);
+    if (names == NULL) {
+        return NULL;
+    }
+    arena = PORT_NewArena(2048);
+    if (arena == NULL) {
+        PORT_Free(names);
+        return NULL;
+    }
+    for (i = 0; i < caNames->nnames; ++i) {
+        CERTName dn;
+        rv = SEC_QuickDERDecodeItem(arena, &dn, SEC_ASN1_GET(CERT_NameTemplate),
+                                    caNames->names + i);
+        if (rv != SECSuccess) {
+            continue;
+        }
+        names[*n] = CERT_NameToAscii(&dn);
+        if (names[*n])
+            (*n)++;
+    }
+    PORT_FreeArena(arena, PR_FALSE);
+    return names;
+}
+
+static void
+ssl_FreeDistNamesStrings(char **strings, int n)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        PORT_Free(strings[i]);
+    }
+    PORT_Free(strings);
+}
+
+PRBool
+ssl_CertIsUsable(sslSocket *ss, CERTCertificate *cert)
+{
+    SECStatus rv;
+    SSLSignatureScheme scheme;
+
+    if ((ss == NULL) || (cert == NULL)) {
+        return PR_FALSE;
+    }
+    if (ss->ssl3.hs.clientAuthSignatureSchemesLen == 0) {
+        return PR_TRUE;
+    }
+    if (ss->ssl3.hs.clientAuthSignatureSchemes == NULL) {
+        return PR_FALSE; 
+    }
+    rv = ssl_PickClientSignatureScheme(ss, cert, NULL,
+                                       ss->ssl3.hs.clientAuthSignatureSchemes,
+                                       ss->ssl3.hs.clientAuthSignatureSchemesLen,
+                                       &scheme);
+    if (rv != SECSuccess) {
+        return PR_FALSE;
+    }
+    return PR_TRUE;
+}
+
+SECStatus
+ssl_FilterClientCertListBySSLSocket(sslSocket *ss, CERTCertList *certList)
+{
+    CERTCertListNode *node;
+    CERTCertificate *cert;
+
+    if (!certList) {
+        return SECFailure;
+    }
+
+    node = CERT_LIST_HEAD(certList);
+
+    while (!CERT_LIST_END(node, certList)) {
+        cert = node->cert;
+        if (PR_TRUE != ssl_CertIsUsable(ss, cert)) {
+            CERTCertListNode *freenode = node;
+            node = CERT_LIST_NEXT(node);
+            CERT_RemoveCertListNode(freenode);
+        } else {
+            node = CERT_LIST_NEXT(node);
+        }
+    }
+
+    return (SECSuccess);
+}
+
+SECStatus
+SSL_FilterClientCertListBySocket(PRFileDesc *fd, CERTCertList *certList)
+{
+    sslSocket *ss = ssl_FindSocket(fd);
+    if (ss == NULL) {
+        return SECFailure;
+    }
+    return ssl_FilterClientCertListBySSLSocket(ss, certList);
+}
+
+PRBool
+SSL_CertIsUsable(PRFileDesc *fd, CERTCertificate *cert)
+{
+    sslSocket *ss = ssl_FindSocket(fd);
+    if (ss == NULL) {
+        return PR_FALSE;
+    }
+    return ssl_CertIsUsable(ss, cert);
+}
+
+SECStatus
+NSS_GetClientAuthData(void *arg,
+                      PRFileDesc *fd,
+                      struct CERTDistNamesStr *caNames,
+                      struct CERTCertificateStr **pRetCert,
+                      struct SECKEYPrivateKeyStr **pRetKey)
+{
+    CERTCertificate *cert = NULL;
+    CERTCertList *certList = NULL;
+    SECKEYPrivateKey *privkey = NULL;
+    char *chosenNickName = (char *)arg; 
+    SECStatus rv = SECFailure;
+
+    sslSocket *ss = ssl_FindSocket(fd);
+    if (!ss) {
+        return SECFailure;
+    }
+    void *pw_arg = SSL_RevealPinArg(fd);
+
+    if (chosenNickName && pw_arg) {
+        certList = PK11_FindCertsFromNickname(chosenNickName, pw_arg);
+        if (certList) {
+            CERT_FilterCertListForUserCerts(certList);
+            rv = CERT_FilterCertListByUsage(certList, certUsageSSLClient,
+                                            PR_FALSE);
+            if ((rv != SECSuccess) || CERT_LIST_EMPTY(certList)) {
+                CERT_DestroyCertList(certList);
+                certList = NULL;
+            }
+        }
+    }
+
+    if (certList == NULL) {
+        certList = CERT_FindUserCertsByUsage(CERT_GetDefaultCertDB(),
+                                             certUsageSSLClient,
+                                             PR_FALSE, chosenNickName == NULL,
+                                             pw_arg);
+        if (certList == NULL) {
+            return SECFailure;
+        }
+        if (chosenNickName) {
+            rv = CERT_FilterCertListByNickname(certList, chosenNickName,
+                                               pw_arg);
+        } else {
+            int nnames = 0;
+            char **names = ssl_DistNamesToStrings(caNames, &nnames);
+            rv = CERT_FilterCertListByCANames(certList, nnames, names,
+                                              certUsageSSLClient);
+            ssl_FreeDistNamesStrings(names, nnames);
+        }
+        if ((rv != SECSuccess) || CERT_LIST_EMPTY(certList)) {
+            CERT_DestroyCertList(certList);
+            return SECFailure;
+        }
+    }
+
+    rv = ssl_FilterClientCertListBySSLSocket(ss, certList);
+    if ((rv != SECSuccess) || CERT_LIST_EMPTY(certList)) {
+        CERT_DestroyCertList(certList);
+        return SECFailure;
+    }
+
+    cert = CERT_DupCertificate(CERT_LIST_HEAD(certList)->cert);
+    CERT_DestroyCertList(certList);
+    privkey = PK11_FindKeyByAnyCert(cert, pw_arg);
+    if (privkey == NULL) {
+        CERT_DestroyCertificate(cert);
+        return SECFailure;
+    }
+    *pRetCert = cert;
+    *pRetKey = privkey;
+    return SECSuccess;
+}

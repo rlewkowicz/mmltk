@@ -1,0 +1,144 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_IfEmitter_h
+#define frontend_IfEmitter_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+
+#include <stdint.h>
+
+#include "frontend/JumpList.h"
+#include "frontend/TDZCheckCache.h"
+
+namespace js {
+namespace frontend {
+
+struct BytecodeEmitter;
+
+class MOZ_STACK_CLASS BranchEmitterBase {
+ public:
+  enum class LexicalKind {
+    MayContainLexicalAccessInBranch,
+
+    NoLexicalAccessInBranch
+  };
+
+ protected:
+  BytecodeEmitter* bce_;
+
+  JumpList jumpAroundThen_;
+
+  JumpList jumpsAroundElse_;
+
+  int32_t thenDepth_ = 0;
+
+  enum class ConditionKind { Positive, Negative };
+  LexicalKind lexicalKind_;
+
+  mozilla::Maybe<TDZCheckCache> tdzCache_;
+
+#ifdef DEBUG
+  int32_t pushed_ = 0;
+  bool calculatedPushed_ = false;
+#endif
+
+ protected:
+  BranchEmitterBase(BytecodeEmitter* bce, LexicalKind lexicalKind);
+
+  [[nodiscard]] bool emitThenInternal(ConditionKind conditionKind);
+  void calculateOrCheckPushed();
+  [[nodiscard]] bool emitElseInternal();
+  [[nodiscard]] bool emitEndInternal();
+
+ public:
+#ifdef DEBUG
+  int32_t pushed() const { return pushed_; }
+
+  int32_t popped() const { return -pushed_; }
+#endif
+};
+
+class MOZ_STACK_CLASS IfEmitter : public BranchEmitterBase {
+ public:
+  using ConditionKind = BranchEmitterBase::ConditionKind;
+
+ protected:
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    If,
+
+    Then,
+
+    ThenElse,
+
+    Else,
+
+    ElseIf,
+
+    End
+  };
+  State state_ = State::Start;
+#endif
+
+ protected:
+  IfEmitter(BytecodeEmitter* bce, LexicalKind lexicalKind);
+
+ public:
+  explicit IfEmitter(BytecodeEmitter* bce);
+
+  [[nodiscard]] bool emitIf(const mozilla::Maybe<uint32_t>& ifPos);
+
+  [[nodiscard]] bool emitThen(
+      ConditionKind conditionKind = ConditionKind::Positive);
+  [[nodiscard]] bool emitThenElse(
+      ConditionKind conditionKind = ConditionKind::Positive);
+
+  [[nodiscard]] bool emitElseIf(const mozilla::Maybe<uint32_t>& ifPos);
+  [[nodiscard]] bool emitElse();
+
+  [[nodiscard]] bool emitEnd();
+};
+
+class MOZ_STACK_CLASS InternalIfEmitter : public IfEmitter {
+ public:
+  explicit InternalIfEmitter(
+      BytecodeEmitter* bce,
+      LexicalKind lexicalKind =
+          BranchEmitterBase::LexicalKind::NoLexicalAccessInBranch);
+};
+
+class MOZ_STACK_CLASS CondEmitter : public BranchEmitterBase {
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    Cond,
+
+    ThenElse,
+
+    Else,
+
+    End
+  };
+  State state_ = State::Start;
+#endif
+
+ public:
+  explicit CondEmitter(BytecodeEmitter* bce);
+
+  [[nodiscard]] bool emitCond();
+  [[nodiscard]] bool emitThenElse(
+      ConditionKind conditionKind = ConditionKind::Positive);
+  [[nodiscard]] bool emitElse();
+  [[nodiscard]] bool emitEnd();
+};
+
+} 
+} 
+
+#endif /* frontend_IfEmitter_h */

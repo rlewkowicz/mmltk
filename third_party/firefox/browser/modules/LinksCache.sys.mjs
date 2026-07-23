@@ -1,0 +1,88 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const EXPIRATION_TIME = 4.5 * 60 * 1000; 
+
+export class LinksCache {
+  constructor(
+    linkObject,
+    linkProperty,
+    properties = [],
+    shouldRefresh = () => {}
+  ) {
+    this.clear();
+
+    this.linkGetter = options => {
+      const ret = linkObject[linkProperty];
+      return typeof ret === "function" ? ret.call(linkObject, options) : ret;
+    };
+
+    this.migrateProperties = ["__sharedCache", ...properties];
+    this.shouldRefresh = shouldRefresh;
+  }
+
+  clear() {
+    this.cache = Promise.resolve([]);
+    this.lastOptions = {};
+    this.expire();
+  }
+
+  expire() {
+    delete this.lastUpdate;
+  }
+
+  async request(options = {}) {
+    const now = Date.now();
+    if (
+      this.lastUpdate === undefined ||
+      now > this.lastUpdate + EXPIRATION_TIME ||
+      this.shouldRefresh(this.lastOptions, options)
+    ) {
+      this.lastOptions = options;
+      this.lastUpdate = now;
+
+      // eslint-disable-next-line no-async-promise-executor
+      this.cache = new Promise(async (resolve, reject) => {
+        try {
+          const toMigrate = new Map();
+          for (const oldLink of await this.cache) {
+            if (oldLink) {
+              toMigrate.set(oldLink.url, oldLink);
+            }
+          }
+
+          resolve(
+            (await this.linkGetter(options)).map(link => {
+              if (!link) {
+                return link;
+              }
+
+              const newLink = Object.assign({}, link);
+              const oldLink = toMigrate.get(newLink.url);
+              if (oldLink) {
+                for (const property of this.migrateProperties) {
+                  const oldValue = oldLink[property];
+                  if (oldValue !== undefined) {
+                    newLink[property] = oldValue;
+                  }
+                }
+              } else {
+                newLink.__sharedCache = {};
+              }
+              newLink.__sharedCache.updateLink = (property, value) => {
+                newLink[property] = value;
+              };
+
+              return newLink;
+            })
+          );
+        } catch (error) {
+          reject(error);
+        }
+      });
+    }
+
+    return (await this.cache).map(link => link && Object.assign({}, link));
+  }
+}

@@ -1,0 +1,83 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_RepaintRequestRunnable_h
+#define mozilla_layers_RepaintRequestRunnable_h
+
+#include <deque>
+#include <unordered_set>
+
+#include "mozilla/layers/GeckoContentController.h"
+#include "mozilla/layers/GeckoContentControllerTypes.h"
+#include "mozilla/layers/RepaintRequest.h"
+#include "mozilla/layers/ScrollableLayerGuid.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla {
+namespace layers {
+
+class GeckoContentController;
+
+class APZTaskRunnable final : public Runnable {
+  using APZStateChange = GeckoContentController_APZStateChange;
+
+ public:
+  explicit APZTaskRunnable(GeckoContentController* aController)
+      : Runnable("RepaintRequestRunnable"),
+        mController(aController),
+        mRegisteredPresShellId(0),
+        mNeedsFlushCompleteNotification(false) {}
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_DECL_NSIRUNNABLE
+
+      void
+      QueueRequest(const RepaintRequest& aRequest);
+  void QueueAPZStateChange(const ScrollableLayerGuid& aGuid,
+                           const APZStateChange& aChange, const int& aArg,
+                           Maybe<uint64_t> aInputBlockId);
+  void QueueFlushCompleteNotification();
+  void Revoke() {
+    mController = nullptr;
+    mRegisteredPresShellId = 0;
+  }
+
+ private:
+  void EnsureRegisterAsEarlyRunner();
+  bool IsRegisteredWithCurrentPresShell() const;
+  bool IsTestControllingRefreshesEnabled() const;
+
+  GeckoContentController* mController;
+
+  struct RepaintRequestKey {
+    ScrollableLayerGuid::ViewID mScrollId;
+    RepaintRequest::ScrollOffsetUpdateType mScrollUpdateType;
+    bool operator==(const RepaintRequestKey& aOther) const {
+      return mScrollId == aOther.mScrollId &&
+             mScrollUpdateType == aOther.mScrollUpdateType;
+    }
+    struct HashFn {
+      std::size_t operator()(const RepaintRequestKey& aKey) const {
+        return HashGeneric(aKey.mScrollId, aKey.mScrollUpdateType);
+      }
+    };
+  };
+  struct APZStateChangeRequest {
+    ScrollableLayerGuid mGuid;
+    APZStateChange mChange;
+    int mArg;
+    Maybe<uint64_t> mInputBlockId;
+  };
+  using Request = mozilla::Variant<RepaintRequest, APZStateChangeRequest>;
+  using RepaintRequests =
+      std::unordered_set<RepaintRequestKey, RepaintRequestKey::HashFn>;
+  RepaintRequests mPendingRepaintRequestMap;
+  std::deque<Request> mPendingRequestQueue;
+  uint32_t mRegisteredPresShellId;
+  bool mNeedsFlushCompleteNotification;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_RepaintRequestRunnable_h

@@ -1,0 +1,253 @@
+/*
+ * Copyright 2005 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkRegion_DEFINED)
+#define SkRegion_DEFINED
+
+#include "include/core/SkPath.h"
+#include "include/core/SkRect.h"
+#include "include/private/base/SkAPI.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkDebug.h"
+#include "include/private/base/SkTypeTraits.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+
+class SkPathBuilder;
+
+class SK_API SkRegion {
+    typedef int32_t RunType;
+public:
+
+    SkRegion();
+
+    SkRegion(const SkRegion& region);
+
+    explicit SkRegion(const SkIRect& rect);
+
+    ~SkRegion();
+
+    SkRegion& operator=(const SkRegion& region);
+
+    bool operator==(const SkRegion& other) const;
+
+    bool operator!=(const SkRegion& other) const {
+        return !(*this == other);
+    }
+
+    bool set(const SkRegion& src) {
+        *this = src;
+        return !this->isEmpty();
+    }
+
+    void swap(SkRegion& other);
+
+    bool isEmpty() const { return fRunHead == emptyRunHeadPtr(); }
+
+    bool isRect() const { return fRunHead == kRectRunHeadPtr; }
+
+    bool isComplex() const { return !this->isEmpty() && !this->isRect(); }
+
+    const SkIRect& getBounds() const { return fBounds; }
+
+    int computeRegionComplexity() const;
+
+    bool addBoundaryPath(SkPathBuilder*) const;
+
+    SkPath getBoundaryPath() const;
+
+    bool setEmpty();
+
+    bool setRect(const SkIRect& rect);
+
+    bool setRects(const SkIRect rects[], int count);
+
+    bool setRegion(const SkRegion& region);
+
+    bool setPath(const SkPath& path, const SkRegion& clip);
+
+    bool intersects(const SkIRect& rect) const;
+
+    bool intersects(const SkRegion& other) const;
+
+    bool contains(int32_t x, int32_t y) const;
+
+    bool contains(const SkIRect& other) const;
+
+    bool contains(const SkRegion& other) const;
+
+    bool quickContains(const SkIRect& r) const {
+        SkASSERT(this->isEmpty() == fBounds.isEmpty()); 
+
+        return  r.fLeft < r.fRight && r.fTop < r.fBottom &&
+                fRunHead == kRectRunHeadPtr &&  
+                fBounds.fLeft <= r.fLeft   && fBounds.fTop <= r.fTop &&
+                fBounds.fRight >= r.fRight && fBounds.fBottom >= r.fBottom;
+    }
+
+    bool quickReject(const SkIRect& rect) const {
+        return this->isEmpty() || rect.isEmpty() ||
+                !SkIRect::Intersects(fBounds, rect);
+    }
+
+    bool quickReject(const SkRegion& rgn) const {
+        return this->isEmpty() || rgn.isEmpty() ||
+               !SkIRect::Intersects(fBounds, rgn.fBounds);
+    }
+
+    void translate(int dx, int dy) { this->translate(dx, dy, this); }
+
+    void translate(int dx, int dy, SkRegion* dst) const;
+
+    enum Op {
+        kDifference_Op,                      
+        kIntersect_Op,                       
+        kUnion_Op,                           
+        kXOR_Op,                             
+        kReverseDifference_Op,               
+        kReplace_Op,                         
+        kLastOp               = kReplace_Op, 
+    };
+
+    static const int kOpCnt = kLastOp + 1;
+
+    bool op(const SkIRect& rect, Op op) {
+        if (this->isRect() && kIntersect_Op == op) {
+            if (!fBounds.intersect(rect)) {
+                return this->setEmpty();
+            }
+            return true;
+        }
+        return this->op(*this, rect, op);
+    }
+
+    bool op(const SkRegion& rgn, Op op) { return this->op(*this, rgn, op); }
+
+    bool op(const SkIRect& rect, const SkRegion& rgn, Op op);
+
+    bool op(const SkRegion& rgn, const SkIRect& rect, Op op);
+
+    bool op(const SkRegion& rgna, const SkRegion& rgnb, Op op);
+
+#if defined(SK_BUILD_FOR_ANDROID_FRAMEWORK)
+    char* toString();
+#endif
+
+    class SK_API Iterator {
+    public:
+
+        Iterator() : fRgn(nullptr), fDone(true) {}
+
+        Iterator(const SkRegion& region);
+
+        bool rewind();
+
+        void reset(const SkRegion& region);
+
+        bool done() const { return fDone; }
+
+        void next();
+
+        const SkIRect& rect() const { return fRect; }
+
+        const SkRegion* rgn() const { return fRgn; }
+
+    private:
+        const SkRegion* fRgn;
+        const SkRegion::RunType*  fRuns;
+        SkIRect         fRect = {0, 0, 0, 0};
+        bool            fDone;
+    };
+
+    class SK_API Cliperator {
+    public:
+
+        Cliperator(const SkRegion& region, const SkIRect& clip);
+
+        bool done() { return fDone; }
+
+        void  next();
+
+        const SkIRect& rect() const { return fRect; }
+
+    private:
+        Iterator    fIter;
+        SkIRect     fClip;
+        SkIRect     fRect = {0, 0, 0, 0};
+        bool        fDone;
+    };
+
+    class SK_API Spanerator {
+    public:
+
+        Spanerator(const SkRegion& region, int y, int left, int right);
+
+        bool next(int* left, int* right);
+
+    private:
+        const SkRegion::RunType* fRuns;
+        int     fLeft, fRight;
+        bool    fDone;
+    };
+
+    size_t writeToMemory(void* buffer) const;
+
+    size_t readFromMemory(const void* buffer, size_t length);
+
+    using sk_is_trivially_relocatable = std::true_type;
+
+private:
+    static constexpr int kOpCount = kReplace_Op + 1;
+
+    static constexpr int kRectRegionRuns = 7;
+
+    struct RunHead;
+
+    static RunHead* emptyRunHeadPtr() { return (SkRegion::RunHead*) -1; }
+    static constexpr const RunHead* const kRectRunHeadPtr = nullptr;
+
+    void allocateRuns(int count);
+    void allocateRuns(int count, int ySpanCount, int intervalCount);
+    void allocateRuns(const RunHead& src);
+
+    SkDEBUGCODE(void dump() const;)
+
+    SkIRect     fBounds;
+    RunHead*    fRunHead;
+
+    static_assert(::sk_is_trivially_relocatable<decltype(fBounds)>::value);
+    static_assert(::sk_is_trivially_relocatable<decltype(fRunHead)>::value);
+
+    void freeRuns();
+
+    const RunType*  getRuns(RunType tmpStorage[], int* intervals) const;
+
+    bool setRuns(RunType runs[], int count);
+
+    int count_runtype_values(int* itop, int* ibot) const;
+
+    bool isValid() const;
+
+    static void BuildRectRuns(const SkIRect& bounds,
+                              RunType runs[kRectRegionRuns]);
+
+    static bool RunsAreARect(const SkRegion::RunType runs[], int count,
+                             SkIRect* bounds);
+
+    static bool Oper(const SkRegion&, const SkRegion&, SkRegion::Op, SkRegion*);
+
+    friend struct RunHead;
+    friend class Iterator;
+    friend class Spanerator;
+    friend class SkRegionPriv;
+    friend class SkRgnBuilder;
+    friend class SkFlatRegion;
+};
+
+#endif

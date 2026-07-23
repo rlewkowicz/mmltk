@@ -1,0 +1,28 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_XrayExpandoClass_h
+#define mozilla_dom_XrayExpandoClass_h
+
+#include "js/Class.h"
+
+#define DEFINE_XRAY_EXPANDO_CLASS_WITH_OPS(maybeStatic_, name_, extraSlots_,  \
+                                           ops_)                              \
+  maybeStatic_ const JSClass name_ = {                                        \
+      "XrayExpandoObject",                                                    \
+      JSCLASS_HAS_RESERVED_SLOTS(xpc::JSSLOT_EXPANDO_COUNT + (extraSlots_)) | \
+          JSCLASS_FOREGROUND_FINALIZE,                                        \
+      ops_}
+
+#define DEFINE_XRAY_EXPANDO_CLASS(maybeStatic_, name_, extraSlots_)    \
+  DEFINE_XRAY_EXPANDO_CLASS_WITH_OPS(maybeStatic_, name_, extraSlots_, \
+                                     &xpc::XrayExpandoObjectClassOps)
+
+namespace mozilla::dom {
+
+extern const JSClass DefaultXrayExpandoObjectClass;
+
+}  
+
+#endif /* mozilla_dom_XrayExpandoClass_h */

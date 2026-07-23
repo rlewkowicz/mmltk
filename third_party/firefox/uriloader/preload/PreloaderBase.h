@@ -1,0 +1,131 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef PreloaderBase_h_
+#define PreloaderBase_h_
+
+#include "mozilla/Maybe.h"
+#include "mozilla/PreloadHashKey.h"
+#include "mozilla/WeakPtr.h"
+#include "nsCOMPtr.h"
+#include "nsISupports.h"
+#include "nsITimer.h"
+#include "nsIURI.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsTArray.h"
+
+class nsIChannel;
+class nsINode;
+class nsIRequest;
+class nsIStreamListener;
+
+namespace mozilla {
+
+namespace dom {
+
+class Document;
+
+}  
+
+class PreloaderBase : public SupportsWeakPtr, public nsISupports {
+ public:
+  PreloaderBase() = default;
+
+  void NotifyOpen(const PreloadHashKey& aKey, dom::Document* aDocument,
+                  bool aIsPreload, bool aIsModule = false);
+  void NotifyOpen(const PreloadHashKey& aKey, nsIChannel* aChannel,
+                  dom::Document* aDocument, bool aIsPreload,
+                  bool aIsModule = false);
+
+  void NotifyRestart(dom::Document* aDocument,
+                     PreloaderBase* aNewPreloader = nullptr);
+
+  void NotifyStart(nsIRequest* aRequest);
+  void NotifyStop(nsIRequest* aRequest, nsresult aStatus);
+  void NotifyStop(nsresult aStatus);
+
+  enum class LoadBackground { Keep, Drop };
+  void NotifyUsage(dom::Document* aDocument,
+                   LoadBackground aLoadBackground = LoadBackground::Drop);
+  bool IsUsed() const { return mIsUsed; }
+
+  void RemoveSelf(dom::Document* aDocument);
+
+  virtual nsresult AsyncConsume(nsIStreamListener* aListener);
+
+  nsIChannel* Channel() const { return mChannel; }
+
+  static void AddLoadBackgroundFlag(nsIChannel* aChannel);
+
+  void AddLinkPreloadNode(nsINode* aNode);
+  void RemoveLinkPreloadNode(nsINode* aNode);
+
+  class RedirectRecord {
+   public:
+    RedirectRecord(uint32_t aFlags, already_AddRefed<nsIURI> aURI)
+        : mFlags(aFlags), mURI(aURI) {}
+
+    uint32_t Flags() const { return mFlags; }
+    already_AddRefed<nsIURI> URINoFragment() const;
+    nsCString Fragment() const;
+
+   private:
+    uint32_t mFlags;
+    nsCOMPtr<nsIURI> mURI;
+  };
+
+  const nsTArray<RedirectRecord>& Redirects() { return mRedirectRecords; }
+
+  void SetForEarlyHints() { mIsEarlyHintsPreload = true; }
+
+ protected:
+  virtual ~PreloaderBase();
+
+  nsCOMPtr<nsIChannel> mChannel;
+
+ private:
+  void NotifyNodeEvent(nsINode* aNode);
+  void CancelUsageTimer();
+
+  void ReportUsageTelemetry();
+
+  class RedirectSink;
+
+  class UsageTimer final : public nsITimerCallback, public nsINamed {
+    NS_DECL_ISUPPORTS
+    NS_DECL_NSITIMERCALLBACK
+    NS_DECL_NSINAMED
+
+    UsageTimer(PreloaderBase* aPreload, dom::Document* aDocument);
+
+   private:
+    ~UsageTimer() = default;
+
+    WeakPtr<dom::Document> mDocument;
+    WeakPtr<PreloaderBase> mPreload;
+  };
+
+ private:
+  nsTArray<nsWeakPtr> mNodes;
+
+  nsTArray<RedirectRecord> mRedirectRecords;
+
+  nsCOMPtr<nsITimer> mUsageTimer;
+
+  PreloadHashKey mKey;
+
+  bool mShouldFireLoadEvent = false;
+
+  bool mIsUsed = false;
+
+  bool mUsageTelementryReported = false;
+
+  bool mIsEarlyHintsPreload = false;
+
+  Maybe<nsresult> mOnStopStatus;
+};
+
+}  
+
+#endif  // !PreloaderBase_h_

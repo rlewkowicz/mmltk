@@ -1,0 +1,108 @@
+/*
+ * This file is PRIVATE to SSL.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef __tls13ech_h_
+#define __tls13ech_h_
+
+#include "pk11hpke.h"
+
+#define TLS13_ECH_VERSION 0xfe0d
+#define TLS13_ECH_SIGNAL_LEN 8
+#define TLS13_ECH_AEAD_TAG_LEN 16
+
+static const char kHpkeInfoEch[] = "tls ech";
+static const char hHkdfInfoEchConfigID[] = "tls ech config id";
+static const char kHkdfInfoEchConfirm[] = "ech accept confirmation";
+static const char kHkdfInfoEchHrrConfirm[] = "hrr ech accept confirmation";
+
+typedef enum {
+    ech_xtn_type_outer = 0,
+    ech_xtn_type_inner = 1,
+} EchXtnType;
+
+struct sslEchConfigContentsStr {
+    PRUint8 configId;
+    HpkeKemId kemId;
+    SECItem publicKey; 
+    HpkeKdfId kdfId;
+    HpkeAeadId aeadId;
+    SECItem suites; 
+    PRUint8 maxNameLen;
+    char *publicName;
+};
+
+struct sslEchCookieDataStr {
+    PRBool previouslyOffered;
+    PRUint8 configId;
+    HpkeKdfId kdfId;
+    HpkeAeadId aeadId;
+    HpkeContext *hpkeCtx;
+    PRUint8 signal[TLS13_ECH_SIGNAL_LEN];
+};
+
+struct sslEchConfigStr {
+    PRCList link;
+    SECItem raw;
+    PRUint16 version;
+    sslEchConfigContents contents;
+};
+
+struct sslEchXtnStateStr {
+    SECItem innerCh;          
+    SECItem senderPubKey;     
+    PRUint8 configId;         
+    HpkeKdfId kdfId;          
+    HpkeAeadId aeadId;        
+    SECItem retryConfigs;     
+    PRBool retryConfigsValid; 
+    PRUint8 *hrrConfirmation; 
+    PRBool receivedInnerXtn;  
+    PRUint8 *payloadStart;    
+};
+
+SEC_BEGIN_PROTOS
+
+SECStatus SSLExp_EncodeEchConfigId(PRUint8 configId, const char *publicName, unsigned int maxNameLen,
+                                   HpkeKemId kemId, const SECKEYPublicKey *pubKey,
+                                   const HpkeSymmetricSuite *hpkeSuites, unsigned int hpkeSuiteCount,
+                                   PRUint8 *out, unsigned int *outlen, unsigned int maxlen);
+SECStatus SSLExp_GetEchRetryConfigs(PRFileDesc *fd, SECItem *retryConfigs);
+SECStatus SSLExp_SetClientEchConfigs(PRFileDesc *fd, const PRUint8 *echConfigs,
+                                     unsigned int echConfigsLen);
+SECStatus SSLExp_SetServerEchConfigs(PRFileDesc *fd,
+                                     const SECKEYPublicKey *pubKey, const SECKEYPrivateKey *privKey,
+                                     const PRUint8 *echConfigs, unsigned int numEchConfigs);
+SECStatus SSLExp_RemoveEchConfigs(PRFileDesc *fd);
+
+SEC_END_PROTOS
+
+SECStatus tls13_ClientSetupEch(sslSocket *ss, sslClientHelloType type);
+SECStatus tls13_ConstructClientHelloWithEch(sslSocket *ss, const sslSessionID *sid,
+                                            PRBool freshSid, sslBuffer *chOuterBuf,
+                                            sslBuffer *chInnerXtnsBuf);
+SECStatus tls13_CopyEchConfigs(PRCList *oconfigs, PRCList *configs);
+SECStatus tls13_DecodeEchConfigs(const SECItem *data, PRCList *configs);
+void tls13_DestroyEchConfigs(PRCList *list);
+void tls13_DestroyEchXtnState(sslEchXtnState *state);
+SECStatus tls13_GetMatchingEchConfig(const sslSocket *ss, HpkeKdfId kdf, HpkeAeadId aead,
+                                     const SECItem *configId, sslEchConfig **cfg);
+void tls13_EchKeyLog(sslSocket *ss);
+SECStatus tls13_MaybeHandleEch(sslSocket *ss, const PRUint8 *msg, PRUint32 msgLen, SECItem *sidBytes,
+                               SECItem *comps, SECItem *cookieBytes, SECItem *suites, SECItem **echInner);
+SECStatus tls13_MaybeHandleEchSignal(sslSocket *ss, const PRUint8 *savedMsg, PRUint32 savedLength, PRBool isHrr);
+SECStatus tls13_MaybeAcceptEch(sslSocket *ss, const SECItem *sidBytes, const PRUint8 *chOuter,
+                               unsigned int chOuterLen, SECItem **chInner);
+SECStatus tls13_MaybeGreaseEch(sslSocket *ss, const sslBuffer *preamble, sslBuffer *buf);
+SECStatus tls13_WriteServerEchSignal(sslSocket *ss, PRUint8 *sh, unsigned int shLen);
+SECStatus tls13_WriteServerEchHrrSignal(sslSocket *ss, PRUint8 *sh, unsigned int shLen);
+SECStatus tls13_DeriveEchSecret(const sslSocket *ss, PK11SymKey **output);
+SECStatus tls13_ComputeEchSignal(sslSocket *ss, PRBool isHrr, const PRUint8 *sh, unsigned int shLen, PRUint8 *out);
+
+PRBool tls13_IsIp(const PRUint8 *str, unsigned int len);
+PRBool tls13_IsLDH(const PRUint8 *str, unsigned int len);
+
+#endif

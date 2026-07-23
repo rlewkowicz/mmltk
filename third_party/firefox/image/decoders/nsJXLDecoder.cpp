@@ -1,0 +1,650 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsJXLDecoder.h"
+
+#include "AnimationParams.h"
+#include "ImageLogging.h"  // Must appear first
+#include "RasterImage.h"
+#include "SurfacePipeFactory.h"
+#include "gfxPlatform.h"
+#include "mozilla/CheckedInt.h"
+
+using namespace mozilla::gfx;
+
+namespace mozilla::image {
+
+static LazyLogModule sJXLLog("JXLDecoder");
+
+nsJXLDecoder::nsJXLDecoder(RasterImage* aImage) : Decoder(aImage) {
+  MOZ_LOG(sJXLLog, LogLevel::Debug,
+          ("[this=%p] nsJXLDecoder::nsJXLDecoder", this));
+}
+
+nsresult nsJXLDecoder::InitInternal() {
+  bool hasCMS = GetCMSOutputProfile() && mCMSMode != CMSMode::Off;
+  mDecoder.reset(jxl_decoder_new(IsMetadataDecode(), hasCMS));
+  if (WantsFrameCount()) {
+    mScanner.reset(jxl_scanner_new());
+  }
+  return NS_OK;
+}
+
+nsJXLDecoder::~nsJXLDecoder() {
+  MOZ_LOG(sJXLLog, LogLevel::Debug,
+          ("[this=%p] nsJXLDecoder::~nsJXLDecoder", this));
+}
+
+LexerResult nsJXLDecoder::DoDecode(SourceBufferIterator& aIterator,
+                                   IResumable* aOnResume) {
+  MOZ_ASSERT(!HasError(), "Shouldn't call DoDecode after error!");
+
+  if (WantsFrameCount()) {
+    return ScanForFrameCount(aIterator, aOnResume);
+  }
+
+  while (true) {
+    if (mIteratorComplete) {
+      return DrainFrames();
+    }
+
+    if (!aIterator.IsReady() || aIterator.Length() == 0) {
+      SourceBufferIterator::State state =
+          aIterator.AdvanceOrScheduleResume(SIZE_MAX, aOnResume);
+
+      if (state == SourceBufferIterator::WAITING ||
+          state == SourceBufferIterator::COMPLETE) {
+        if (!HasAnimation() && !mPixelBuffer.empty()) {
+          FlushPartialFrame();
+        }
+      }
+
+      if (state == SourceBufferIterator::WAITING) {
+        return LexerResult(Yield::NEED_MORE_DATA);
+      }
+      if (state == SourceBufferIterator::COMPLETE) {
+        mIteratorComplete = true;
+        continue;
+      }
+    }
+
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(aIterator.Data());
+    size_t length = aIterator.Length();
+    MOZ_ASSERT(length > 0);
+    const uint8_t* const chunkStart = data;
+
+    ProcessResult result = ProcessAvailableData(&data, &length);
+
+    aIterator.MarkConsumed(static_cast<size_t>(data - chunkStart));
+
+    switch (result) {
+      case ProcessResult::Error:
+        return LexerResult(TerminalState::FAILURE);
+      case ProcessResult::Complete:
+        return LexerResult(TerminalState::SUCCESS);
+      case ProcessResult::NeedMoreData:
+        break;
+      case ProcessResult::YieldOutput:
+        return LexerResult(Yield::OUTPUT_AVAILABLE);
+    }
+  }
+}
+
+LexerResult nsJXLDecoder::ScanForFrameCount(SourceBufferIterator& aIterator,
+                                            IResumable* aOnResume) {
+  MOZ_ASSERT(mScanner);
+
+  const uint8_t* currentData = nullptr;
+  size_t currentLength = 0;
+  bool iteratorComplete = false;
+
+  while (true) {
+    if (currentLength == 0 && !iteratorComplete) {
+      SourceBufferIterator::State state =
+          aIterator.AdvanceOrScheduleResume(SIZE_MAX, aOnResume);
+
+      if (state == SourceBufferIterator::WAITING) {
+        return LexerResult(Yield::NEED_MORE_DATA);
+      }
+
+      if (state == SourceBufferIterator::READY) {
+        currentData = reinterpret_cast<const uint8_t*>(aIterator.Data());
+        currentLength = aIterator.Length();
+      }
+
+      if (state == SourceBufferIterator::COMPLETE) {
+        iteratorComplete = true;
+      }
+    }
+
+    JxlDecoderStatus scanStatus = jxl_decoder_process_data(
+        mScanner.get(), &currentData, &currentLength,
+        nullptr, 0, nullptr, 0);
+    if (scanStatus == JxlDecoderStatus::Error) {
+      return LexerResult(TerminalState::FAILURE);
+    }
+
+    if (!HasSize()) {
+      JxlBasicInfo info = jxl_decoder_get_basic_info(mScanner.get());
+      if (info.valid) {
+        if (info.width > INT32_MAX || info.height > INT32_MAX) {
+          return LexerResult(TerminalState::FAILURE);
+        }
+        PostSize(info.width, info.height);
+        if (info.has_alpha) {
+          PostHasTransparency();
+        }
+        if (!info.is_animated) {
+          PostFrameCount(1);
+          return LexerResult(TerminalState::SUCCESS);
+        }
+      }
+    }
+
+    if (HasSize() && !HasAnimation()) {
+      uint32_t scannedCount =
+          jxl_decoder_get_scanned_frame_count(mScanner.get());
+      if (scannedCount > 0) {
+        JxlBasicInfo info = jxl_decoder_get_basic_info(mScanner.get());
+        JxlFrameInfo frameInfo =
+            jxl_decoder_get_scanned_frame_info(mScanner.get(), 0);
+        PostIsAnimated(
+            FrameTimeout::FromRawMilliseconds(frameInfo.duration_ms));
+        PostLoopCount((info.num_loops == 0 || info.num_loops > INT32_MAX)
+                          ? -1
+                          : static_cast<int32_t>(info.num_loops - 1));
+      }
+    }
+
+    if (HasSize()) {
+      uint32_t count = jxl_decoder_get_scanned_frame_count(mScanner.get());
+      if (count >= 1) {
+        PostFrameCount(count);
+      }
+    }
+
+    if (HasSize() && !jxl_decoder_has_more_frames(mScanner.get())) {
+      return LexerResult(TerminalState::SUCCESS);
+    }
+
+    if (scanStatus == JxlDecoderStatus::NeedMoreData && currentLength == 0 &&
+        iteratorComplete) {
+      if (!HasSize()) {
+        return LexerResult(TerminalState::FAILURE);
+      }
+      uint32_t count = jxl_decoder_get_scanned_frame_count(mScanner.get());
+      PostFrameCount(count > 0 ? count : 1);
+      return LexerResult(TerminalState::SUCCESS);
+    }
+  }
+}
+
+nsJXLDecoder::ProcessResult nsJXLDecoder::ProcessAvailableData(
+    const uint8_t** aData, size_t* aLength) {
+  while (true) {
+    JxlDecoderStatus status = ProcessInput(aData, aLength);
+
+    if (status == JxlDecoderStatus::Error) {
+      return ProcessResult::Error;
+    }
+
+    if (mDecoderState == DecoderState::Initial) {
+      JxlBasicInfo basicInfo = jxl_decoder_get_basic_info(mDecoder.get());
+      if (basicInfo.valid) {
+        if (basicInfo.width > INT32_MAX || basicInfo.height > INT32_MAX) {
+          return ProcessResult::Error;
+        }
+
+        PostSize(basicInfo.width, basicInfo.height);
+        if (basicInfo.has_alpha) {
+          PostHasTransparency();
+        }
+
+        if (!basicInfo.is_animated) {
+          PostFrameCount(1);
+          if (IsMetadataDecode()) {
+            return ProcessResult::Complete;
+          }
+        }
+
+        mDecoderState = DecoderState::HaveBasicInfo;
+
+        if (!basicInfo.is_animated) {
+          if (NS_FAILED(AllocateFrameBuffers())) {
+            return ProcessResult::Error;
+          }
+        }
+      } else if (status == JxlDecoderStatus::Ok) {
+        if (*aLength == 0) {
+          return ProcessResult::NeedMoreData;
+        }
+        continue;
+      }
+    }
+
+    if (status == JxlDecoderStatus::NeedMoreData) {
+      return ProcessResult::NeedMoreData;
+    }
+
+    MOZ_ASSERT(status == JxlDecoderStatus::Ok);
+    if (mDecoderState == DecoderState::HaveBasicInfo) {
+      if (jxl_decoder_is_frame_ready(mDecoder.get()) && !HasAnimation()) {
+        JxlBasicInfo basicInfo = jxl_decoder_get_basic_info(mDecoder.get());
+        if (basicInfo.is_animated) {
+          JxlFrameInfo frameInfo = jxl_decoder_get_frame_info(mDecoder.get());
+          PostIsAnimated(
+              FrameTimeout::FromRawMilliseconds(frameInfo.duration_ms));
+          PostLoopCount(
+              (basicInfo.num_loops == 0 || basicInfo.num_loops > INT32_MAX)
+                  ? -1
+                  : static_cast<int32_t>(basicInfo.num_loops - 1));
+          if (IsMetadataDecode()) {
+            return ProcessResult::Complete;
+          }
+        }
+      }
+    }
+
+    switch (HandleFrameOutput()) {
+      case FrameOutputResult::BufferAllocated:
+      case FrameOutputResult::NoOutput:
+        continue;
+      case FrameOutputResult::FrameAdvanced:
+        return ProcessResult::YieldOutput;
+      case FrameOutputResult::DecodeComplete:
+        return ProcessResult::Complete;
+      case FrameOutputResult::Error:
+        return ProcessResult::Error;
+    }
+    MOZ_CRASH("Unhandled FrameOutputResult");
+  }
+}
+
+LexerResult nsJXLDecoder::DrainFrames() {
+  while (true) {
+    const uint8_t* noData = nullptr;
+    size_t noLength = 0;
+    JxlDecoderStatus status = ProcessInput(&noData, &noLength);
+
+    switch (status) {
+      case JxlDecoderStatus::Ok: {
+        if (!HasSize()) {
+          return LexerResult(TerminalState::FAILURE);
+        }
+
+        switch (HandleFrameOutput()) {
+          case FrameOutputResult::BufferAllocated:
+            break;
+          case FrameOutputResult::FrameAdvanced:
+            return LexerResult(Yield::OUTPUT_AVAILABLE);
+          case FrameOutputResult::DecodeComplete:
+          case FrameOutputResult::NoOutput:
+            return LexerResult(TerminalState::SUCCESS);
+          case FrameOutputResult::Error:
+            return LexerResult(TerminalState::FAILURE);
+        }
+        break;
+      }
+
+      case JxlDecoderStatus::NeedMoreData:
+        if (!HasSize()) {
+          return LexerResult(TerminalState::FAILURE);
+        }
+        return LexerResult(TerminalState::SUCCESS);
+
+      case JxlDecoderStatus::Error:
+        return LexerResult(TerminalState::FAILURE);
+    }
+  }
+}
+
+JxlDecoderStatus nsJXLDecoder::ProcessInput(const uint8_t** aData,
+                                            size_t* aLength) {
+  uint8_t* bufferPtr = mPixelBuffer.empty() ? nullptr : mPixelBuffer.begin();
+  size_t bufferLen = mPixelBuffer.length();
+  uint8_t* kPtr = mKBuffer.empty() ? nullptr : mKBuffer.begin();
+  size_t kLen = mKBuffer.length();
+  return jxl_decoder_process_data(mDecoder.get(), aData, aLength, bufferPtr,
+                                  bufferLen, kPtr, kLen);
+}
+
+nsJXLDecoder::FrameOutputResult nsJXLDecoder::HandleFrameOutput() {
+  bool frameNeedsBuffer = jxl_decoder_is_frame_ready(mDecoder.get());
+
+  if (frameNeedsBuffer && mPixelBuffer.empty()) {
+    if (NS_FAILED(AllocateFrameBuffers())) {
+      return FrameOutputResult::Error;
+    }
+    return FrameOutputResult::BufferAllocated;
+  }
+
+  if (!frameNeedsBuffer && !mPixelBuffer.empty()) {
+    nsresult rv = FinishFrame();
+    if (NS_FAILED(rv)) {
+      return FrameOutputResult::Error;
+    }
+
+    bool hasMoreFrames = jxl_decoder_has_more_frames(mDecoder.get());
+    if (IsFirstFrameDecode() || !HasAnimation() || !hasMoreFrames) {
+      PostFrameCount(mFrameIndex + 1);
+      PostDecodeDone();
+      return FrameOutputResult::DecodeComplete;
+    }
+    mFrameIndex++;
+    mPixelBuffer.clear();
+    mKBuffer.clear();
+    return FrameOutputResult::FrameAdvanced;
+  }
+
+  return FrameOutputResult::NoOutput;
+}
+
+nsJXLDecoder::PixelFormat nsJXLDecoder::DetectPixelFormat(
+    JxlApiDecoder* aDecoder, const JxlBasicInfo& aBasicInfo) {
+  if (jxl_decoder_use_f16(aDecoder)) {
+    return PixelFormat::Rgba16f;
+  }
+  if (jxl_decoder_is_gray(aDecoder)) {
+    return aBasicInfo.has_alpha ? PixelFormat::GrayAlpha8 : PixelFormat::Gray8;
+  }
+  return jxl_decoder_has_black_channel(aDecoder) ? PixelFormat::Cmyk8
+                                                 : PixelFormat::Rgba8;
+}
+
+nsresult nsJXLDecoder::AllocateFrameBuffers() {
+  MOZ_ASSERT(HasSize());
+  OrientedIntSize size = Size();
+  JxlBasicInfo basicInfo = jxl_decoder_get_basic_info(mDecoder.get());
+  MOZ_ASSERT(basicInfo.valid);
+
+  if (mFrameIndex == 0) {
+    mPixelFormat.set(DetectPixelFormat(mDecoder.get(), basicInfo));
+  }
+
+  CheckedInt<size_t> bufferSize =
+      CheckedInt<size_t>(size.width) * size.height * BytesPerPixel();
+  if (!bufferSize.isValid() || !mPixelBuffer.resize(bufferSize.value())) {
+    MOZ_LOG(sJXLLog, LogLevel::Error,
+            ("[this=%p] nsJXLDecoder::AllocateFrameBuffers -- "
+             "failed to allocate pixel buffer\n",
+             this));
+    return NS_ERROR_FAILURE;
+  }
+
+  if (mPixelFormat.value() == PixelFormat::Cmyk8 &&
+      !mKBuffer.resize(size_t(size.width) * size.height)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (mPixelFormat.value() != PixelFormat::Rgba8) {
+    CheckedInt<size_t> rowBufSize = CheckedInt<size_t>(size.width) * 4;
+    if (!rowBufSize.isValid() || !mU8RowBuf.resize(rowBufSize.value())) {
+      return NS_ERROR_FAILURE;
+    }
+  }
+
+  if (mFrameIndex == 0 && GetCMSOutputProfile() && mCMSMode != CMSMode::Off) {
+    BuildCMSTransform();
+  }
+
+  return NS_OK;
+}
+
+nsresult nsJXLDecoder::EnsureSurfacePipe() {
+  if (mCurrentPipe) {
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(HasSize());
+  OrientedIntSize size = Size();
+  JxlBasicInfo basicInfo = jxl_decoder_get_basic_info(mDecoder.get());
+  MOZ_ASSERT(basicInfo.valid);
+
+  Maybe<AnimationParams> animParams;
+  if (HasAnimation()) {
+    JxlFrameInfo frameInfo = jxl_decoder_get_frame_info(mDecoder.get());
+    MOZ_ASSERT(frameInfo.frame_duration_valid);
+    if (!frameInfo.frame_duration_valid) {
+      return NS_ERROR_FAILURE;
+    }
+    animParams.emplace(FullFrame().ToUnknownRect(),
+                       FrameTimeout::FromRawMilliseconds(frameInfo.duration_ms),
+                       mFrameIndex, BlendMethod::SOURCE, DisposalMethod::KEEP);
+  }
+
+  SurfaceFormat inFormat;
+  SurfaceFormat outFormat;
+  if (mPixelFormat.value() == PixelFormat::Cmyk8 && mTransform) {
+    inFormat = SurfaceFormat::R8G8B8;
+    outFormat = SurfaceFormat::OS_RGBX;
+  } else {
+    inFormat = SurfaceFormat::R8G8B8A8;
+    outFormat =
+        basicInfo.has_alpha && mPixelFormat.value() != PixelFormat::Cmyk8
+            ? SurfaceFormat::OS_RGBA
+            : SurfaceFormat::OS_RGBX;
+  }
+
+  bool usePipeTransform = mPixelFormat.value() == PixelFormat::Rgba8;
+  qcms_transform* pipeTransform = usePipeTransform ? mTransform : nullptr;
+
+  const bool wantPremultiply =
+      !(GetSurfaceFlags() & SurfaceFlags::NO_PREMULTIPLY_ALPHA);
+  SurfacePipeFlags pipeFlags = SurfacePipeFlags();
+  if (wantPremultiply && mPixelFormat.value() != PixelFormat::Cmyk8) {
+    pipeFlags |= SurfacePipeFlags::PREMULTIPLY_ALPHA;
+  }
+
+  mCurrentPipe = SurfacePipeFactory::CreateSurfacePipe(
+      this, size, OutputSize(), FullFrame(), inFormat, outFormat, animParams,
+      pipeTransform, pipeFlags);
+  if (!mCurrentPipe) {
+    return NS_ERROR_FAILURE;
+  }
+
+  return NS_OK;
+}
+
+void nsJXLDecoder::BuildCMSTransform() {
+  size_t iccLen = 0;
+  const uint8_t* iccData = jxl_decoder_get_icc_profile(mDecoder.get(), &iccLen);
+  if (iccData && iccLen) {
+    mInProfile = qcms_profile_from_memory(
+        reinterpret_cast<const char*>(iccData), iccLen);
+    if (mInProfile) {
+      auto intent = static_cast<qcms_intent>(gfxPlatform::GetRenderingIntent());
+      if (intent < QCMS_INTENT_MIN || intent > QCMS_INTENT_MAX) {
+        intent = qcms_profile_get_rendering_intent(mInProfile);
+      }
+
+      uint32_t profileSpace = qcms_profile_get_color_space(mInProfile);
+      qcms_data_type inType;
+      qcms_data_type outType;
+      bool compatible = true;
+
+      if (profileSpace == icSigGrayData) {
+        if (mPixelFormat.value() != PixelFormat::Gray8 &&
+            mPixelFormat.value() != PixelFormat::GrayAlpha8) {
+          compatible = false;
+        }
+        inType = mPixelFormat.value() == PixelFormat::GrayAlpha8
+                     ? QCMS_DATA_GRAYA_8
+                     : QCMS_DATA_GRAY_8;
+        outType = QCMS_DATA_RGBA_8;
+      } else if (profileSpace == icSigCmykData) {
+        if (mPixelFormat.value() != PixelFormat::Cmyk8) {
+          compatible = false;
+        }
+        inType = QCMS_DATA_CMYK;
+        outType = QCMS_DATA_RGB_8;
+      } else {
+        if (mPixelFormat.value() != PixelFormat::Rgba8 &&
+            mPixelFormat.value() != PixelFormat::Rgba16f) {
+          compatible = false;
+        }
+        inType = QCMS_DATA_RGBA_8;
+        outType = QCMS_DATA_RGBA_8;
+      }
+
+      if (compatible) {
+        mTransform = qcms_transform_create(
+            mInProfile, inType, GetCMSOutputProfile(), outType, intent);
+      }
+    }
+  }
+}
+
+static float F16ToF32(uint16_t h) {
+  uint32_t sign = (h >> 15) & 1u;
+  uint32_t exp = (h >> 10) & 0x1fu;
+  uint32_t mantissa = h & 0x3ffu;
+  uint32_t f;
+  if (exp == 0) {
+    f = sign << 31;  
+  } else if (exp == 31) {
+    f = (sign << 31) | (0xffu << 23) | (mantissa << 13);  
+  } else {
+    f = (sign << 31) | ((exp + 127u - 15u) << 23) | (mantissa << 13);
+  }
+  float result;
+  memcpy(&result, &f, sizeof(result));
+  return result;
+}
+
+bool nsJXLDecoder::WritePixelRowsToPipe() {
+  MOZ_ASSERT(mCurrentPipe);
+#ifdef DEBUG
+  ++mWritePixelRowsCount;
+#endif
+  OrientedIntSize size = Size();
+
+  uint8_t* currentRow = mPixelBuffer.begin();
+  for (int32_t y = 0; y < size.height; ++y) {
+    uint8_t* pipeInput;
+    if (mPixelFormat.value() == PixelFormat::Rgba16f) {
+      if (mTransform) {
+        qcms_transform_data_rgba_f16_to_rgba_u8(
+            mTransform, reinterpret_cast<const uint16_t*>(currentRow),
+            mU8RowBuf.begin(), size.width);
+      } else {
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(currentRow);
+        for (int32_t i = 0; i < size.width * 4; ++i) {
+          float v = F16ToF32(src[i]);
+          mU8RowBuf[i] =
+              v <= 0.0f ? 0 : (v >= 1.0f ? 255 : uint8_t(v * 255.0f + 0.5f));
+        }
+      }
+      pipeInput = mU8RowBuf.begin();
+    } else if (mPixelFormat.value() == PixelFormat::Gray8 ||
+               mPixelFormat.value() == PixelFormat::GrayAlpha8) {
+      if (mTransform) {
+        qcms_transform_data(mTransform, currentRow, mU8RowBuf.begin(),
+                            size.width);
+      } else {
+        uint8_t* out = mU8RowBuf.begin();
+        for (int32_t x = 0; x < size.width; ++x) {
+          uint8_t g = currentRow[x * BytesPerPixel()];
+          uint8_t a = mPixelFormat.value() == PixelFormat::GrayAlpha8
+                          ? currentRow[x * BytesPerPixel() + 1]
+                          : 255;
+          out[x * 4] = g;
+          out[x * 4 + 1] = g;
+          out[x * 4 + 2] = g;
+          out[x * 4 + 3] = a;
+        }
+      }
+      pipeInput = mU8RowBuf.begin();
+    } else if (mPixelFormat.value() == PixelFormat::Cmyk8) {
+      uint8_t* out = mU8RowBuf.begin();
+      const uint8_t* kRow =
+          mKBuffer.empty() ? nullptr : mKBuffer.begin() + y * size.width;
+      if (mTransform) {
+        for (int32_t x = 0; x < size.width; ++x) {
+          out[x * 4] = 255 - currentRow[x * 4];
+          out[x * 4 + 1] = 255 - currentRow[x * 4 + 1];
+          out[x * 4 + 2] = 255 - currentRow[x * 4 + 2];
+          out[x * 4 + 3] = kRow ? (255 - kRow[x]) : 0;
+        }
+        qcms_transform_data(mTransform, out, out, size.width);
+      } else {
+        for (int32_t x = 0; x < size.width; ++x) {
+          uint8_t k = kRow ? kRow[x] : 255;
+          out[x * 4] = (uint16_t)currentRow[x * 4] * k / 255;
+          out[x * 4 + 1] = (uint16_t)currentRow[x * 4 + 1] * k / 255;
+          out[x * 4 + 2] = (uint16_t)currentRow[x * 4 + 2] * k / 255;
+          out[x * 4 + 3] = 255;
+        }
+      }
+      pipeInput = out;
+    } else {
+      pipeInput = currentRow;
+    }
+    if (mCurrentPipe->WriteBuffer(reinterpret_cast<uint32_t*>(pipeInput)) ==
+        WriteState::FAILURE) {
+      return false;
+    }
+    currentRow += size.width * BytesPerPixel();
+  }
+  return true;
+}
+
+nsresult nsJXLDecoder::FinishFrame() {
+  MOZ_ASSERT(HasSize());
+  MOZ_ASSERT(mDecoder);
+
+  nsresult rv = EnsureSurfacePipe();
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  JxlBasicInfo basicInfo = jxl_decoder_get_basic_info(mDecoder.get());
+
+  mCurrentPipe->ResetToFirstRow();
+  if (!WritePixelRowsToPipe()) {
+    mCurrentPipe.reset();
+    return NS_ERROR_FAILURE;
+  }
+
+  if (Maybe<SurfaceInvalidRect> invalidRect = mCurrentPipe->TakeInvalidRect()) {
+    PostInvalidation(invalidRect->mInputSpaceRect,
+                     Some(invalidRect->mOutputSpaceRect));
+  }
+
+  bool hasTransparency =
+      basicInfo.has_alpha && mPixelFormat.value() != PixelFormat::Cmyk8;
+  PostFrameStop(hasTransparency ? Opacity::SOME_TRANSPARENCY
+                                : Opacity::FULLY_OPAQUE);
+  mCurrentPipe.reset();
+  return NS_OK;
+}
+
+void nsJXLDecoder::FlushPartialFrame() {
+  MOZ_ASSERT(!mPixelBuffer.empty());
+
+  JxlDecoderStatus status = jxl_decoder_flush_pixels(
+      mDecoder.get(), mPixelBuffer.begin(), mPixelBuffer.length(),
+      mKBuffer.empty() ? nullptr : mKBuffer.begin(), mKBuffer.length());
+  if (status != JxlDecoderStatus::Ok) {
+    return;
+  }
+
+  if (NS_FAILED(EnsureSurfacePipe())) {
+    MOZ_LOG(sJXLLog, LogLevel::Error,
+            ("[this=%p] nsJXLDecoder::FlushPartialFrame -- "
+             "EnsureSurfacePipe failed\n",
+             this));
+    return;
+  }
+
+  mCurrentPipe->ResetToFirstRow();
+  WritePixelRowsToPipe();
+
+  if (Maybe<SurfaceInvalidRect> invalidRect = mCurrentPipe->TakeInvalidRect()) {
+    PostInvalidation(invalidRect->mInputSpaceRect,
+                     Some(invalidRect->mOutputSpaceRect));
+  }
+}
+
+}  

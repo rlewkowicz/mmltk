@@ -1,0 +1,21 @@
+[package]
+name = "hashbrown"
+version = "0.14.999"
+edition = "2021"
+
+[lib]
+path = "lib.rs"
+
+[features]
+default = ["hashbrown/default"]
+allocator-api2 = ["hashbrown/allocator-api2"]
+ahash = [
+    "hashbrown/default-hasher"
+]
+inline-more = ["hashbrown/inline-more"]
+raw = ["hashbrown/raw-entry"]
+serde = ["hashbrown/serde"]
+
+[dependencies.hashbrown]
+version = "0.15.2"
+default-features = false

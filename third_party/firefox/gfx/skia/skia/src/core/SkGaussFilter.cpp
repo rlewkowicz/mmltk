@@ -1,0 +1,84 @@
+/*
+ * Copyright 2017 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/core/SkGaussFilter.h"
+
+#include "include/private/base/SkAssert.h"
+
+#include <cmath>
+
+static constexpr double kGoodEnough = 1.0 / 100.0;
+
+static void normalize(int n, double* gauss) {
+    double sum = 0;
+    for (int i = n-1; i >= 1; i--) {
+        sum += 2 * gauss[i];
+    }
+    sum += gauss[0];
+
+    for (int i = 0; i < n; i++) {
+        gauss[i] /= sum;
+    }
+
+    sum = 0;
+    for (int i = n - 1; i >= 1; i--) {
+        sum += 2 * gauss[i];
+    }
+
+    gauss[0] = 1 - sum;
+}
+
+static int calculate_bessel_factors(double sigma, double *gauss) {
+    auto var = sigma * sigma;
+
+    auto besselI_0 = [](double t) -> double {
+        auto tSquaredOver4 = t * t / 4.0;
+        auto sum = 1.0;
+        auto factor = 1.0;
+        auto k = 1;
+        while(factor > 1.0/1000000.0) {
+            factor *= tSquaredOver4 / (k * k);
+            sum += factor;
+            k += 1;
+        }
+        return sum;
+    };
+    auto besselI_1 = [](double t) -> double {
+        auto tSquaredOver4 = t * t / 4.0;
+        auto sum = t / 2.0;
+        auto factor = sum;
+        auto k = 1;
+        while (factor > 1.0/1000000.0) {
+            factor *= tSquaredOver4 / (k * (k + 1));
+            sum += factor;
+            k += 1;
+        }
+        return sum;
+    };
+
+    auto d = std::exp(var);
+    double b[SkGaussFilter::kGaussArrayMax] = {besselI_0(var), besselI_1(var)};
+    gauss[0] = b[0]/d;
+    gauss[1] = b[1]/d;
+
+    int n = 1;
+    while (gauss[n] > kGoodEnough) {
+        b[n+1] = -(2*n/var) * b[n] + b[n-1];
+        gauss[n+1] = b[n+1] / d;
+        n += 1;
+    }
+
+    normalize(n, gauss);
+
+    return n;
+}
+
+SkGaussFilter::SkGaussFilter(double sigma) {
+    SkASSERT(0 <= sigma && sigma < 2);
+
+    fN = calculate_bessel_factors(sigma, fBasis);
+}

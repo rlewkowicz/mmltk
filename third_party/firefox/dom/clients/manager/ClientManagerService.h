@@ -1,0 +1,140 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef _mozilla_dom_ClientManagerService_h
+#define _mozilla_dom_ClientManagerService_h
+
+#include "ClientHandleParent.h"
+#include "ClientOpPromise.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Variant.h"
+#include "mozilla/dom/ClientIPCTypes.h"
+#include "mozilla/dom/ipc/IdType.h"
+#include "nsHashKeys.h"
+#include "nsISupports.h"
+#include "nsTArray.h"
+#include "nsTHashMap.h"
+
+struct nsID;
+
+namespace mozilla {
+
+namespace ipc {
+
+class PrincipalInfo;
+
+}  
+
+namespace dom {
+
+class ClientManagerParent;
+class ClientSourceParent;
+class ClientHandleParent;
+class ThreadsafeContentParentHandle;
+
+class ClientManagerService final {
+  class FutureClientSourceParent {
+   public:
+    explicit FutureClientSourceParent(const IPCClientInfo& aClientInfo);
+
+    const mozilla::ipc::PrincipalInfo& PrincipalInfo() const {
+      return mPrincipalInfo;
+    }
+
+    already_AddRefed<SourcePromise> Promise() {
+      return mPromiseHolder.Ensure(__func__);
+    }
+
+    void ResolvePromiseIfExists() {
+      mPromiseHolder.ResolveIfExists(true, __func__);
+    }
+
+    void RejectPromiseIfExists(const CopyableErrorResult& aRv) {
+      MOZ_ASSERT(aRv.Failed());
+      mPromiseHolder.RejectIfExists(aRv, __func__);
+    }
+
+    void SetAsAssociated() { mAssociated = true; }
+
+    bool IsAssociated() const { return mAssociated; }
+
+   private:
+    const mozilla::ipc::PrincipalInfo mPrincipalInfo;
+    MozPromiseHolder<SourcePromise> mPromiseHolder;
+    RefPtr<ClientManagerService> mService = ClientManagerService::GetInstance();
+    bool mAssociated;
+  };
+
+  using SourceTableEntry =
+      Variant<FutureClientSourceParent, ClientSourceParent*>;
+
+  nsTHashMap<nsIDHashKey, SourceTableEntry> mSourceTable;
+
+  nsTArray<ClientManagerParent*> mManagerList;
+
+  bool mShutdown;
+
+  ClientManagerService();
+  ~ClientManagerService();
+
+  void Shutdown();
+
+  ClientSourceParent* MaybeUnwrapAsExistingSource(
+      const SourceTableEntry& aEntry) const;
+
+ public:
+  static already_AddRefed<ClientManagerService> GetOrCreateInstance();
+
+  static already_AddRefed<ClientManagerService> GetInstance();
+
+  bool AddSource(ClientSourceParent* aSource);
+
+  bool RemoveSource(ClientSourceParent* aSource);
+
+  bool ExpectFutureSource(const IPCClientInfo& aClientInfo);
+
+  void ForgetFutureSource(const IPCClientInfo& aClientInfo);
+
+  RefPtr<SourcePromise> FindSource(
+      const nsID& aID, const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+
+  ClientSourceParent* FindExistingSource(
+      const nsID& aID, const mozilla::ipc::PrincipalInfo& aPrincipalInfo) const;
+
+  void AddManager(ClientManagerParent* aManager);
+
+  void RemoveManager(ClientManagerParent* aManager);
+
+  RefPtr<ClientOpPromise> Navigate(
+      ThreadsafeContentParentHandle* aOriginContent,
+      const ClientNavigateArgs& aArgs);
+
+  RefPtr<ClientOpPromise> MatchAll(
+      ThreadsafeContentParentHandle* aOriginContent,
+      const ClientMatchAllArgs& aArgs);
+
+  RefPtr<ClientOpPromise> Claim(ThreadsafeContentParentHandle* aOriginContent,
+                                const ClientClaimArgs& aArgs);
+
+  RefPtr<ClientOpPromise> GetInfoAndState(
+      ThreadsafeContentParentHandle* aOriginContent,
+      const ClientGetInfoAndStateArgs& aArgs);
+
+  RefPtr<ClientOpPromise> OpenWindow(
+      ThreadsafeContentParentHandle* aOriginContent,
+      const ClientOpenWindowArgs& aArgs);
+
+  bool HasWindow(ThreadsafeContentParentHandle* aContentParentHandle,
+                 const mozilla::ipc::PrincipalInfo& aPrincipalInfo,
+                 const nsID& aClientId);
+
+  NS_INLINE_DECL_REFCOUNTING(mozilla::dom::ClientManagerService)
+};
+
+}  
+}  
+
+#endif  // _mozilla_dom_ClientManagerService_h

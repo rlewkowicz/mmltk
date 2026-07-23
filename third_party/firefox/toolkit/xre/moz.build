@@ -1,0 +1,44 @@
+XPIDL_SOURCES += ['nsINativeAppSupport.idl', 'nsIXREDirProvider.idl']
+XPIDL_MODULE = 'xulapp'
+EXPORTS += ['nsAppRunner.h']
+EXPORTS.mozilla += ['AutoSQLiteLifetime.h', 'Bootstrap.h', 'CmdLineAndEnvUtils.h', 'GeckoArgs.h', 'MultiInstanceLock.h', 'SafeMode.h']
+UNIFIED_SOURCES += ['nsNativeAppSupportUnix.cpp']
+UNIFIED_SOURCES += ['nsGDKErrorHandler.cpp']
+LOCAL_INCLUDES += ['/widget', '/widget/gtk']
+UNIFIED_SOURCES += ['MultiInstanceLock.cpp']
+UNIFIED_SOURCES += ['/toolkit/mozapps/update/common/commonupdatedir.cpp', 'AutoSQLiteLifetime.cpp', 'Bootstrap.cpp', 'CmdLineAndEnvUtils.cpp', 'CreateAppData.cpp', 'GeckoArgs.cpp', 'nsConsoleWriter.cpp', 'nsNativeAppSupportBase.cpp', 'nsSigHandlers.cpp', 'nsXREDirProvider.cpp']
+SOURCES += ['../../other-licenses/nsis/Contrib/CityHash/cityhash/city.cpp', 'nsAppRunner.cpp', 'nsEmbedFunctions.cpp', 'ProfileReset.cpp']
+if CONFIG['MOZ_UPDATER']:
+    UNIFIED_SOURCES += ['nsUpdateDriver.cpp', 'nsUpdateMutex.cpp', 'nsUpdateSyncManager.cpp']
+if CONFIG['MOZ_PDF_PRINTING']:
+    DEFINES['PROXY_PRINTING'] = 1
+    LOCAL_INCLUDES += ['../components/printingui']
+XPCOM_MANIFESTS += ['components.conf']
+include('/ipc/chromium/chromium-config.mozbuild')
+FINAL_LIBRARY = 'xul'
+DEFINES['USE_GLX_TEST'] = True
+DIRS += ['glxtest']
+for var in ('MOZ_APP_NAME', 'MOZ_APP_BASENAME', 'MOZ_APP_DISPLAYNAME', 'MOZ_APP_VENDOR', 'MOZ_APP_VERSION', 'OS_TARGET', 'MOZ_WIDGET_TOOLKIT'):
+    DEFINES[var] = '"%s"' % CONFIG[var]
+if CONFIG['MOZ_UPDATER']:
+    DEFINES['MOZ_UPDATER'] = True
+DEFINES['MOZ_DISTRIBUTION_ID'] = '"%s"' % CONFIG['MOZ_DISTRIBUTION_ID']
+if CONFIG['TARGET_XPCOM_ABI']:
+    DEFINES['TARGET_OS_ABI'] = '"%s_%s"' % (CONFIG['OS_TARGET'], CONFIG['TARGET_XPCOM_ABI'])
+if CONFIG['OS_ARCH'] == 'Linux' and 'lib64' in CONFIG['libdir']:
+    DEFINES['HAVE_USR_LIB64_DIR'] = True
+DEFINES['GRE_MILESTONE'] = CONFIG['GRE_MILESTONE']
+DEFINES['MOZ_APP_VERSION_DISPLAY'] = CONFIG['MOZ_APP_VERSION_DISPLAY']
+for var in ('APP_VERSION', 'APP_ID'):
+    DEFINES[var] = CONFIG['MOZ_%s' % var]
+if CONFIG['MOZ_BUILD_APP'] == 'browser':
+    DEFINES['MOZ_BUILD_APP_IS_BROWSER'] = True
+if CONFIG['MOZ_USE_NSS_FOR_MAR']:
+    DEFINES['MAR_NSS'] = True
+LOCAL_INCLUDES += ['../../other-licenses/nsis/Contrib/CityHash/cityhash', '../components/find', '../components/printingui/ipc', '../components/windowwatcher', '../mozapps/update/common', '../profile', '/config', '/dom/base', '/dom/commandhandler', '/dom/ipc', '/dom/webbrowserpersist', '/js/xpconnect/loader', '/third_party/sqlite3/ext/', '/xpcom/build']
+CXXFLAGS += CONFIG['MOZ_DBUS_CFLAGS']
+CXXFLAGS += CONFIG['MOZ_GTK3_CFLAGS']
+CXXFLAGS += CONFIG['MOZ_PANGO_CFLAGS']
+DEFINES['TOPOBJDIR'] = TOPOBJDIR
+FINAL_TARGET_PP_FILES += ['platform.ini']
+PP_FILES_EXTRA_DEPS += ['!/buildid.h', '!/source-repo.h']

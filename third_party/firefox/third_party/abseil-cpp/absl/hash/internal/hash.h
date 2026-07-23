@@ -1,0 +1,1096 @@
+// Copyright 2018 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#if !defined(ABSL_HASH_INTERNAL_HASH_H_)
+#define ABSL_HASH_INTERNAL_HASH_H_
+
+
+#include "absl/base/config.h"
+
+#if defined(__has_include)
+#if __has_include(<version>)
+#define ABSL_INTERNAL_VERSION_HEADER_AVAILABLE 1
+#endif
+#endif
+
+#if ABSL_INTERNAL_CPLUSPLUS_LANG >= 202002L || \
+    defined(ABSL_INTERNAL_VERSION_HEADER_AVAILABLE)
+#include <version>
+#else
+#include <ciso646>
+#endif
+
+#undef ABSL_INTERNAL_VERSION_HEADER_AVAILABLE
+
+#include <algorithm>
+#include <array>
+#include <bitset>
+#include <cassert>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <forward_list>
+#include <functional>
+#include <iterator>
+#include <limits>
+#include <list>
+#include <map>
+#include <memory>
+#include <optional>
+#include <set>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "absl/base/attributes.h"
+#include "absl/base/internal/endian.h"
+#include "absl/base/internal/unaligned_access.h"
+#include "absl/base/optimization.h"
+#include "absl/base/options.h"
+#include "absl/base/port.h"
+#include "absl/container/fixed_array.h"
+#include "absl/hash/internal/city.h"
+#include "absl/hash/internal/weakly_mixed_integer.h"
+#include "absl/meta/type_traits.h"
+#include "absl/numeric/bits.h"
+#include "absl/numeric/int128.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/optional.h"
+#include "absl/types/variant.h"
+#include "absl/utility/utility.h"
+
+#if defined(__cpp_lib_filesystem) && __cpp_lib_filesystem >= 201703L && \
+    !defined(__XTENSA__)
+#include <filesystem>  // NOLINT
+#endif
+
+#if ABSL_OPTION_INLINE_HW_ACCEL_STRATEGY != 0
+
+#if defined(__SSE4_2__) && defined(__x86_64__)
+
+#include <x86intrin.h>
+#define ABSL_HASH_INTERNAL_HAS_CRC32
+#define ABSL_HASH_INTERNAL_CRC32_U64 _mm_crc32_u64
+#define ABSL_HASH_INTERNAL_CRC32_U32 _mm_crc32_u32
+#define ABSL_HASH_INTERNAL_CRC32_U8 _mm_crc32_u8
+
+#elif defined(_MSC_VER) && !defined(__clang__) && defined(__AVX__) && \
+    defined(_M_X64)
+
+#include <intrin.h>
+#define ABSL_HASH_INTERNAL_HAS_CRC32
+#define ABSL_HASH_INTERNAL_CRC32_U64 _mm_crc32_u64
+#define ABSL_HASH_INTERNAL_CRC32_U32 _mm_crc32_u32
+#define ABSL_HASH_INTERNAL_CRC32_U8 _mm_crc32_u8
+
+#elif defined(__ARM_FEATURE_CRC32)
+
+#include <arm_acle.h>
+#define ABSL_HASH_INTERNAL_HAS_CRC32
+#define ABSL_HASH_INTERNAL_CRC32_U64(crc, data) \
+  __crc32cd(static_cast<uint32_t>(crc), data)
+#define ABSL_HASH_INTERNAL_CRC32_U32 __crc32cw
+#define ABSL_HASH_INTERNAL_CRC32_U8 __crc32cb
+
+#endif
+
+#endif
+
+
+#if ABSL_OPTION_INLINE_HW_ACCEL_STRATEGY == 1
+#if !defined(ABSL_HASH_INTERNAL_HAS_CRC32)
+#error "Hardware acceleration is required by ABSL_OPTION_INLINE_HW_ACCEL_STRATEGY but not supported on this platform; see absl/base/options.h"
+#endif
+#endif
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+class HashState;
+
+namespace hash_internal {
+
+constexpr size_t PiecewiseChunkSize() { return 1024; }
+
+class PiecewiseCombiner {
+ public:
+  PiecewiseCombiner() = default;
+  PiecewiseCombiner(const PiecewiseCombiner&) = delete;
+  PiecewiseCombiner& operator=(const PiecewiseCombiner&) = delete;
+
+  template <typename H>
+  H add_buffer(H state, const unsigned char* data, size_t size);
+  template <typename H>
+  H add_buffer(H state, const char* data, size_t size) {
+    return add_buffer(std::move(state),
+                      reinterpret_cast<const unsigned char*>(data), size);
+  }
+
+  template <typename H>
+  H finalize(H state);
+
+ private:
+  unsigned char buf_[PiecewiseChunkSize()];
+  size_t position_ = 0;
+  bool added_something_ = false;
+};
+
+template <typename T>
+struct is_hashable;
+
+template <typename H>
+class HashStateBase {
+ public:
+  template <typename T, typename... Ts>
+  static H combine(H state, const T& value, const Ts&... values);
+  static H combine(H state) { return state; }
+
+  template <typename T>
+  static H combine_contiguous(H state, const T* data, size_t size);
+
+  template <typename I>
+  static H combine_unordered(H state, I begin, I end);
+
+  using AbslInternalPiecewiseCombiner = PiecewiseCombiner;
+
+  template <typename T>
+  using is_hashable = absl::hash_internal::is_hashable<T>;
+
+ private:
+  template <typename I>
+  struct CombineUnorderedCallback {
+    I begin;
+    I end;
+
+    template <typename InnerH, typename ElementStateConsumer>
+    void operator()(InnerH inner_state, ElementStateConsumer cb) {
+      for (; begin != end; ++begin) {
+        inner_state = H::combine(std::move(inner_state), *begin);
+        cb(inner_state);
+      }
+    }
+  };
+};
+
+template <typename T, typename Enable = void>
+struct is_uniquely_represented : std::false_type {};
+
+template <>
+struct is_uniquely_represented<unsigned char> : std::true_type {};
+
+template <typename Integral>
+struct is_uniquely_represented<Integral,
+                               std::enable_if_t<std::is_integral_v<Integral>>>
+    : std::true_type {};
+
+template <>
+struct is_uniquely_represented<bool> : std::false_type {};
+
+#if defined(ABSL_HAVE_INTRINSIC_INT128)
+template <>
+struct is_uniquely_represented<__int128> : std::true_type {};
+template <>
+struct is_uniquely_represented<unsigned __int128> : std::true_type {};
+#endif
+
+template <typename T>
+struct FitsIn64Bits : std::integral_constant<bool, sizeof(T) <= 8> {};
+
+struct CombineRaw {
+  template <typename H>
+  H operator()(H state, uint64_t value) const {
+    return H::combine_raw(std::move(state), value);
+  }
+};
+
+struct HashWithSeed {
+  template <typename Hasher, typename T>
+  size_t hash(const Hasher& hasher, const T& value, size_t seed) const {
+    // NOLINTNEXTLINE(clang-diagnostic-sign-conversion)
+    return hasher.hash_with_seed(value, seed);
+  }
+};
+
+template <typename H, typename T,
+          std::enable_if_t<FitsIn64Bits<T>::value, int> = 0>
+H hash_bytes(H hash_state, const T& value) {
+  const unsigned char* start = reinterpret_cast<const unsigned char*>(&value);
+  uint64_t v;
+  if constexpr (sizeof(T) == 1) {
+    v = *start;
+  } else if constexpr (sizeof(T) == 2) {
+    v = absl::base_internal::UnalignedLoad16(start);
+  } else if constexpr (sizeof(T) == 4) {
+    v = absl::base_internal::UnalignedLoad32(start);
+  } else {
+    static_assert(sizeof(T) == 8);
+    v = absl::base_internal::UnalignedLoad64(start);
+  }
+  return CombineRaw()(std::move(hash_state), v);
+}
+template <typename H, typename T,
+          std::enable_if_t<!FitsIn64Bits<T>::value, int> = 0>
+H hash_bytes(H hash_state, const T& value) {
+  const unsigned char* start = reinterpret_cast<const unsigned char*>(&value);
+  return H::combine_contiguous(std::move(hash_state), start, sizeof(value));
+}
+
+template <typename H>
+H hash_weakly_mixed_integer(H hash_state, WeaklyMixedInteger value) {
+  return H::combine_weakly_mixed_integer(std::move(hash_state), value);
+}
+
+
+
+template <typename H, typename B>
+std::enable_if_t<std::is_same_v<B, bool>, H> AbslHashValue(H hash_state,
+                                                           B value) {
+  return H::combine(std::move(hash_state),
+                    static_cast<size_t>(value ? ~size_t{} : 0));
+}
+
+template <typename H, typename Enum>
+std::enable_if_t<std::is_enum_v<Enum>, H> AbslHashValue(H hash_state, Enum e) {
+  return H::combine(std::move(hash_state),
+                    static_cast<std::underlying_type_t<Enum>>(e));
+}
+template <typename H, typename Float>
+std::enable_if_t<std::is_same_v<Float, float> || std::is_same_v<Float, double>,
+                 H>
+AbslHashValue(H hash_state, Float value) {
+  return hash_internal::hash_bytes(std::move(hash_state),
+                                   value == 0 ? 0 : value);
+}
+
+template <typename H, typename LongDouble>
+std::enable_if_t<std::is_same_v<LongDouble, long double>, H> AbslHashValue(
+    H hash_state, LongDouble value) {
+  const int category = std::fpclassify(value);
+  switch (category) {
+    case FP_INFINITE:
+      hash_state = H::combine(std::move(hash_state), std::signbit(value));
+      break;
+
+    case FP_NAN:
+    case FP_ZERO:
+    default:
+      break;
+
+    case FP_NORMAL:
+    case FP_SUBNORMAL:
+      int exp;
+      auto mantissa = static_cast<double>(std::frexp(value, &exp));
+      hash_state = H::combine(std::move(hash_state), mantissa, exp);
+  }
+
+  return H::combine(std::move(hash_state), category);
+}
+
+template <typename H, typename T, size_t N>
+H AbslHashValue(H hash_state, T (&)[N]) {
+  static_assert(
+      sizeof(T) == -1,
+      "Hashing C arrays is not allowed. For string literals, wrap the literal "
+      "in absl::string_view(). To hash the array contents, use "
+      "absl::MakeSpan() or make the array an std::array. To hash the array "
+      "address, use &array[0].");
+  return hash_state;
+}
+
+template <typename H, typename T>
+std::enable_if_t<std::is_pointer_v<T>, H> AbslHashValue(H hash_state, T ptr) {
+  auto v = reinterpret_cast<uintptr_t>(ptr);
+  return H::combine(std::move(hash_state), v);
+}
+
+template <typename H>
+H AbslHashValue(H hash_state, std::nullptr_t) {
+  return H::combine(std::move(hash_state), static_cast<void*>(nullptr));
+}
+
+template <typename H, typename T, typename C>
+H AbslHashValue(H hash_state, T C::*ptr) {
+  auto salient_ptm_size = [](std::size_t n) -> std::size_t {
+#if defined(_MSC_VER)
+    if constexpr (alignof(T C::*) == alignof(int)) {
+      return n;
+    } else {
+      return n == 24 ? 20 : n == 16 ? 12 : n;
+    }
+#else
+#if defined(__cpp_lib_has_unique_object_representations)
+    static_assert(std::has_unique_object_representations_v<T C::*>);
+#endif
+    return n;
+#endif
+  };
+  return H::combine_contiguous(std::move(hash_state),
+                               reinterpret_cast<unsigned char*>(&ptr),
+                               salient_ptm_size(sizeof ptr));
+}
+
+
+template <typename H, typename T1, typename T2>
+std::enable_if_t<is_hashable<T1>::value && is_hashable<T2>::value, H>
+AbslHashValue(H hash_state, const std::pair<T1, T2>& p) {
+  return H::combine(std::move(hash_state), p.first, p.second);
+}
+
+template <typename H, typename Tuple, size_t... Is>
+H hash_tuple(H hash_state, const Tuple& t, std::index_sequence<Is...>) {
+  return H::combine(std::move(hash_state), std::get<Is>(t)...);
+}
+
+template <typename H, typename... Ts>
+#if defined(_MSC_VER)
+H
+#else
+std::enable_if_t<std::conjunction_v<is_hashable<Ts>...>, H>
+#endif
+AbslHashValue(H hash_state, const std::tuple<Ts...>& t) {
+  return hash_internal::hash_tuple(std::move(hash_state), t,
+                                   std::make_index_sequence<sizeof...(Ts)>());
+}
+
+
+template <typename H, typename T, typename D>
+H AbslHashValue(H hash_state, const std::unique_ptr<T, D>& ptr) {
+  return H::combine(std::move(hash_state), ptr.get());
+}
+
+template <typename H, typename T>
+H AbslHashValue(H hash_state, const std::shared_ptr<T>& ptr) {
+  return H::combine(std::move(hash_state), ptr.get());
+}
+
+
+template <typename H>
+H AbslHashValue(H hash_state, absl::string_view str) {
+  return H::combine_contiguous(std::move(hash_state), str.data(), str.size());
+}
+
+template <typename Char, typename Alloc, typename H,
+          typename = std::enable_if_t<std::is_same_v<Char, wchar_t> ||
+                                      std::is_same_v<Char, char16_t> ||
+                                      std::is_same_v<Char, char32_t>>>
+H AbslHashValue(
+    H hash_state,
+    const std::basic_string<Char, std::char_traits<Char>, Alloc>& str) {
+  return H::combine_contiguous(std::move(hash_state), str.data(), str.size());
+}
+
+template <typename Char, typename H,
+          typename = std::enable_if_t<std::is_same_v<Char, wchar_t> ||
+                                      std::is_same_v<Char, char16_t> ||
+                                      std::is_same_v<Char, char32_t>>>
+H AbslHashValue(H hash_state, std::basic_string_view<Char> str) {
+  return H::combine_contiguous(std::move(hash_state), str.data(), str.size());
+}
+
+#if defined(__cpp_lib_filesystem) && __cpp_lib_filesystem >= 201703L && \
+    (!defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__) ||        \
+     __ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__ >= 130000) &&       \
+    (!defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) ||         \
+     __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ >= 101500) &&        \
+    (!defined(__XTENSA__))
+
+#define ABSL_INTERNAL_STD_FILESYSTEM_PATH_HASH_AVAILABLE 1
+
+template <typename Path, typename H,
+          typename = std::enable_if_t<
+              std::is_same_v<Path, std::filesystem::path>>>
+H AbslHashValue(H hash_state, const Path& path) {
+  return H::combine(std::move(hash_state), std::filesystem::hash_value(path));
+}
+
+#endif
+
+
+template <typename H, typename T, size_t N>
+std::enable_if_t<is_hashable<T>::value, H> AbslHashValue(
+    H hash_state, const std::array<T, N>& array) {
+  return H::combine_contiguous(std::move(hash_state), array.data(),
+                               array.size());
+}
+
+template <typename H, typename T, typename Allocator>
+std::enable_if_t<is_hashable<T>::value, H> AbslHashValue(
+    H hash_state, const std::deque<T, Allocator>& deque) {
+  for (const auto& t : deque) {
+    hash_state = H::combine(std::move(hash_state), t);
+  }
+  return H::combine(std::move(hash_state), WeaklyMixedInteger{deque.size()});
+}
+
+template <typename H, typename T, typename Allocator>
+std::enable_if_t<is_hashable<T>::value, H> AbslHashValue(
+    H hash_state, const std::forward_list<T, Allocator>& list) {
+  size_t size = 0;
+  for (const T& t : list) {
+    hash_state = H::combine(std::move(hash_state), t);
+    ++size;
+  }
+  return H::combine(std::move(hash_state), WeaklyMixedInteger{size});
+}
+
+template <typename H, typename T, typename Allocator>
+std::enable_if_t<is_hashable<T>::value, H> AbslHashValue(
+    H hash_state, const std::list<T, Allocator>& list) {
+  for (const auto& t : list) {
+    hash_state = H::combine(std::move(hash_state), t);
+  }
+  return H::combine(std::move(hash_state), WeaklyMixedInteger{list.size()});
+}
+
+template <typename H, typename T, typename Allocator>
+std::enable_if_t<is_hashable<T>::value && !std::is_same_v<T, bool>, H>
+AbslHashValue(H hash_state, const std::vector<T, Allocator>& vector) {
+  return H::combine_contiguous(std::move(hash_state), vector.data(),
+                               vector.size());
+}
+
+
+#if defined(ABSL_IS_BIG_ENDIAN) && \
+    (defined(__GLIBCXX__) || defined(__GLIBCPP__))
+
+template <typename H, typename T, typename Allocator>
+std::enable_if_t<is_hashable<T>::value && std::is_same_v<T, bool>, H>
+AbslHashValue(H hash_state, const std::vector<T, Allocator>& vector) {
+  typename H::AbslInternalPiecewiseCombiner combiner;
+  for (const auto& i : vector) {
+    unsigned char c = static_cast<unsigned char>(i);
+    hash_state = combiner.add_buffer(std::move(hash_state), &c, sizeof(c));
+  }
+  return H::combine(combiner.finalize(std::move(hash_state)),
+                    WeaklyMixedInteger{vector.size()});
+}
+#else
+template <typename H, typename T, typename Allocator>
+std::enable_if_t<is_hashable<T>::value && std::is_same_v<T, bool>, H>
+AbslHashValue(H hash_state, const std::vector<T, Allocator>& vector) {
+  return H::combine(std::move(hash_state),
+                    std::hash<std::vector<T, Allocator>>{}(vector),
+                    WeaklyMixedInteger{vector.size()});
+}
+#endif
+
+
+template <typename H, typename Key, typename T, typename Compare,
+          typename Allocator>
+std::enable_if_t<is_hashable<Key>::value && is_hashable<T>::value, H>
+AbslHashValue(H hash_state, const std::map<Key, T, Compare, Allocator>& map) {
+  for (const auto& t : map) {
+    hash_state = H::combine(std::move(hash_state), t);
+  }
+  return H::combine(std::move(hash_state), WeaklyMixedInteger{map.size()});
+}
+
+template <typename H, typename Key, typename T, typename Compare,
+          typename Allocator>
+std::enable_if_t<is_hashable<Key>::value && is_hashable<T>::value, H>
+AbslHashValue(H hash_state,
+              const std::multimap<Key, T, Compare, Allocator>& map) {
+  for (const auto& t : map) {
+    hash_state = H::combine(std::move(hash_state), t);
+  }
+  return H::combine(std::move(hash_state), WeaklyMixedInteger{map.size()});
+}
+
+template <typename H, typename Key, typename Compare, typename Allocator>
+std::enable_if_t<is_hashable<Key>::value, H> AbslHashValue(
+    H hash_state, const std::set<Key, Compare, Allocator>& set) {
+  for (const auto& t : set) {
+    hash_state = H::combine(std::move(hash_state), t);
+  }
+  return H::combine(std::move(hash_state), WeaklyMixedInteger{set.size()});
+}
+
+template <typename H, typename Key, typename Compare, typename Allocator>
+std::enable_if_t<is_hashable<Key>::value, H> AbslHashValue(
+    H hash_state, const std::multiset<Key, Compare, Allocator>& set) {
+  for (const auto& t : set) {
+    hash_state = H::combine(std::move(hash_state), t);
+  }
+  return H::combine(std::move(hash_state), WeaklyMixedInteger{set.size()});
+}
+
+
+template <typename H, typename Key, typename Hash, typename KeyEqual,
+          typename Alloc>
+std::enable_if_t<is_hashable<Key>::value, H> AbslHashValue(
+    H hash_state, const std::unordered_set<Key, Hash, KeyEqual, Alloc>& s) {
+  return H::combine(
+      H::combine_unordered(std::move(hash_state), s.begin(), s.end()),
+      WeaklyMixedInteger{s.size()});
+}
+
+template <typename H, typename Key, typename Hash, typename KeyEqual,
+          typename Alloc>
+std::enable_if_t<is_hashable<Key>::value, H> AbslHashValue(
+    H hash_state,
+    const std::unordered_multiset<Key, Hash, KeyEqual, Alloc>& s) {
+  return H::combine(
+      H::combine_unordered(std::move(hash_state), s.begin(), s.end()),
+      WeaklyMixedInteger{s.size()});
+}
+
+template <typename H, typename Key, typename T, typename Hash,
+          typename KeyEqual, typename Alloc>
+std::enable_if_t<is_hashable<Key>::value && is_hashable<T>::value, H>
+AbslHashValue(H hash_state,
+              const std::unordered_map<Key, T, Hash, KeyEqual, Alloc>& s) {
+  return H::combine(
+      H::combine_unordered(std::move(hash_state), s.begin(), s.end()),
+      WeaklyMixedInteger{s.size()});
+}
+
+template <typename H, typename Key, typename T, typename Hash,
+          typename KeyEqual, typename Alloc>
+std::enable_if_t<is_hashable<Key>::value && is_hashable<T>::value, H>
+AbslHashValue(H hash_state,
+              const std::unordered_multimap<Key, T, Hash, KeyEqual, Alloc>& s) {
+  return H::combine(
+      H::combine_unordered(std::move(hash_state), s.begin(), s.end()),
+      WeaklyMixedInteger{s.size()});
+}
+
+
+template <typename H, typename T>
+std::enable_if_t<is_hashable<T>::value, H> AbslHashValue(
+    H hash_state, std::reference_wrapper<T> opt) {
+  return H::combine(std::move(hash_state), opt.get());
+}
+
+template <typename H, typename T>
+std::enable_if_t<is_hashable<T>::value, H> AbslHashValue(
+    H hash_state, const std::optional<T>& opt) {
+  if (opt) hash_state = H::combine(std::move(hash_state), *opt);
+  return H::combine(std::move(hash_state), opt.has_value());
+}
+
+template <typename H>
+struct VariantVisitor {
+  H&& hash_state;
+  template <typename T>
+  H operator()(const T& t) const {
+    return H::combine(std::move(hash_state), t);
+  }
+};
+
+template <typename H, typename... T>
+std::enable_if_t<std::conjunction_v<is_hashable<T>...>, H> AbslHashValue(
+    H hash_state, const std::variant<T...>& v) {
+  if (!v.valueless_by_exception()) {
+    hash_state = std::visit(VariantVisitor<H>{std::move(hash_state)}, v);
+  }
+  return H::combine(std::move(hash_state), v.index());
+}
+
+
+
+#if defined(ABSL_IS_BIG_ENDIAN) && \
+    (defined(__GLIBCXX__) || defined(__GLIBCPP__))
+template <typename H, size_t N>
+H AbslHashValue(H hash_state, const std::bitset<N>& set) {
+  typename H::AbslInternalPiecewiseCombiner combiner;
+  for (size_t i = 0; i < N; i++) {
+    unsigned char c = static_cast<unsigned char>(set[i]);
+    hash_state = combiner.add_buffer(std::move(hash_state), &c, sizeof(c));
+  }
+  return H::combine(combiner.finalize(std::move(hash_state)), N);
+}
+#endif
+
+
+template <typename H, typename T>
+std::enable_if_t<is_uniquely_represented<T>::value, H> hash_range_or_bytes(
+    H hash_state, const T* data, size_t size) {
+  const auto* bytes = reinterpret_cast<const unsigned char*>(data);
+  return H::combine_contiguous(std::move(hash_state), bytes, sizeof(T) * size);
+}
+
+template <typename H, typename T>
+std::enable_if_t<!is_uniquely_represented<T>::value, H> hash_range_or_bytes(
+    H hash_state, const T* data, size_t size) {
+  for (const auto end = data + size; data < end; ++data) {
+    hash_state = H::combine(std::move(hash_state), *data);
+  }
+  return H::combine(std::move(hash_state),
+                    hash_internal::WeaklyMixedInteger{size});
+}
+
+inline constexpr uint64_t kMul = uint64_t{0x79d5f9e0de1e8cf5};
+
+ABSL_CACHELINE_ALIGNED inline constexpr uint64_t kStaticRandomData[] = {
+    0x243f'6a88'85a3'08d3, 0x1319'8a2e'0370'7344, 0xa409'3822'299f'31d0,
+    0x082e'fa98'ec4e'6c89, 0x4528'21e6'38d0'1377,
+};
+
+inline uint64_t PrecombineLengthMix(uint64_t state, size_t len) {
+  ABSL_ASSUME(len + sizeof(uint64_t) <= sizeof(kStaticRandomData));
+  uint64_t data = absl::base_internal::UnalignedLoad64(
+      reinterpret_cast<const unsigned char*>(&kStaticRandomData[0]) + len);
+  return state ^ data;
+}
+
+ABSL_ATTRIBUTE_ALWAYS_INLINE inline uint64_t Mix(uint64_t lhs, uint64_t rhs) {
+  absl::uint128 m = lhs;
+  m *= rhs;
+  return Uint128High64(m) ^ Uint128Low64(m);
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+#endif
+inline uint32_t Read4(const unsigned char* p) {
+  return absl::base_internal::UnalignedLoad32(p);
+}
+inline uint64_t Read8(const unsigned char* p) {
+  return absl::base_internal::UnalignedLoad64(p);
+}
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
+inline std::pair<uint64_t, uint64_t> Read9To16(const unsigned char* p,
+                                               size_t len) {
+  return {Read8(p), Read8(p + len - 8)};
+}
+
+inline uint64_t Read4To8(const unsigned char* p, size_t len) {
+  uint64_t most_significant =
+      static_cast<uint64_t>(absl::base_internal::UnalignedLoad32(p)) << 32;
+  uint64_t least_significant =
+      absl::base_internal::UnalignedLoad32(p + len - 4);
+  return most_significant | least_significant;
+}
+
+inline uint32_t Read1To3(const unsigned char* p, size_t len) {
+  uint32_t mem0 = (static_cast<uint32_t>(p[0]) << 16) | p[len - 1];
+  uint32_t mem1 = static_cast<uint32_t>(p[len / 2]) << 8;
+  return mem0 | mem1;
+}
+
+#if defined(ABSL_HASH_INTERNAL_HAS_CRC32)
+
+ABSL_ATTRIBUTE_ALWAYS_INLINE inline uint64_t CombineRawImpl(uint64_t state,
+                                                            uint64_t value) {
+  union {
+    uint64_t u64;
+    struct {
+#if defined(ABSL_IS_LITTLE_ENDIAN)
+      uint32_t low, high;
+#else
+      uint32_t high, low;
+#endif
+    } u32s;
+  } s;
+  s.u64 = state;
+  s.u32s.high =
+      static_cast<uint32_t>(ABSL_HASH_INTERNAL_CRC32_U64(s.u32s.high, value));
+  s.u32s.low = static_cast<uint32_t>(
+      ABSL_HASH_INTERNAL_CRC32_U64(s.u32s.low, 3 * value));
+  return s.u64;
+}
+#else
+ABSL_ATTRIBUTE_ALWAYS_INLINE inline uint64_t CombineRawImpl(uint64_t state,
+                                                            uint64_t value) {
+  return Mix(state ^ value, kMul);
+}
+#endif
+
+uint64_t CombineLargeContiguousImplOn32BitLengthGt8(uint64_t state,
+                                                    const unsigned char* first,
+                                                    size_t len);
+uint64_t CombineLargeContiguousImplOn64BitLengthGt32(uint64_t state,
+                                                     const unsigned char* first,
+                                                     size_t len);
+
+ABSL_ATTRIBUTE_ALWAYS_INLINE inline uint64_t CombineSmallContiguousImpl(
+    uint64_t state, const unsigned char* first, size_t len) {
+  ABSL_ASSUME(len <= 8);
+  uint64_t v;
+  if (len >= 4) {
+    v = Read4To8(first, len);
+  } else if (len > 0) {
+    v = Read1To3(first, len);
+  } else {
+    v = 0x57;
+  }
+  return CombineRawImpl(state, v);
+}
+
+ABSL_ATTRIBUTE_ALWAYS_INLINE inline uint64_t CombineContiguousImpl9to16(
+    uint64_t state, const unsigned char* first, size_t len) {
+  ABSL_ASSUME(len >= 9);
+  ABSL_ASSUME(len <= 16);
+  auto p = Read9To16(first, len);
+  return Mix(state ^ p.first, kMul ^ p.second);
+}
+
+ABSL_ATTRIBUTE_ALWAYS_INLINE inline uint64_t CombineContiguousImpl17to32(
+    uint64_t state, const unsigned char* first, size_t len) {
+  ABSL_ASSUME(len >= 17);
+  ABSL_ASSUME(len <= 32);
+  const uint64_t m0 =
+      Mix(Read8(first) ^ kStaticRandomData[1], Read8(first + 8) ^ state);
+
+  const unsigned char* tail_16b_ptr = first + (len - 16);
+  const uint64_t m1 = Mix(Read8(tail_16b_ptr) ^ kStaticRandomData[3],
+                          Read8(tail_16b_ptr + 8) ^ state);
+  return m0 ^ m1;
+}
+
+inline uint64_t CombineContiguousImpl(
+    uint64_t state, const unsigned char* first, size_t len,
+    std::integral_constant<int, 4> ) {
+  if (len <= 8) {
+    return CombineSmallContiguousImpl(PrecombineLengthMix(state, len), first,
+                                      len);
+  }
+  return CombineLargeContiguousImplOn32BitLengthGt8(state, first, len);
+}
+
+#if defined(ABSL_HASH_INTERNAL_HAS_CRC32)
+inline uint64_t CombineContiguousImpl(
+    uint64_t state, const unsigned char* first, size_t len,
+    std::integral_constant<int, 8> ) {
+  if (ABSL_PREDICT_FALSE(len > 32)) {
+    return CombineLargeContiguousImplOn64BitLengthGt32(state, first, len);
+  }
+  uint64_t mul = absl::rotr(kMul, static_cast<int>(len));
+  std::pair<uint64_t, uint64_t> crcs = {state + 8 * len,
+                                        absl::gbswap_64(state)};
+
+  if (len > 8) {
+    crcs = {ABSL_HASH_INTERNAL_CRC32_U64(crcs.first, Read8(first)),
+            ABSL_HASH_INTERNAL_CRC32_U64(crcs.second, Read8(first + len - 8))};
+    if (len > 16) {
+      crcs = {ABSL_HASH_INTERNAL_CRC32_U64(crcs.first, Read8(first + len - 16)),
+              ABSL_HASH_INTERNAL_CRC32_U64(crcs.second, Read8(first + 8))};
+    }
+  } else {
+    if (len >= 4) {
+      crcs = {ABSL_HASH_INTERNAL_CRC32_U32(static_cast<uint32_t>(crcs.first),
+                                           Read4(first)),
+              ABSL_HASH_INTERNAL_CRC32_U32(static_cast<uint32_t>(crcs.second),
+                                           Read4(first + len - 4))};
+    } else if (len >= 1) {
+      crcs = {ABSL_HASH_INTERNAL_CRC32_U8(static_cast<uint32_t>(crcs.first),
+                                          first[0]),
+              ABSL_HASH_INTERNAL_CRC32_U8(static_cast<uint32_t>(crcs.second),
+                                          first[len - 1])};
+      mul += first[len / 2];
+    }
+  }
+  return Mix(mul - crcs.first, crcs.second - mul);
+}
+#else
+inline uint64_t CombineContiguousImpl(
+    uint64_t state, const unsigned char* first, size_t len,
+    std::integral_constant<int, 8> ) {
+  if (len <= 8) {
+    return CombineSmallContiguousImpl(PrecombineLengthMix(state, len), first,
+                                      len);
+  }
+  if (len <= 16) {
+    return CombineContiguousImpl9to16(PrecombineLengthMix(state, len), first,
+                                      len);
+  }
+  if (len <= 32) {
+    return CombineContiguousImpl17to32(PrecombineLengthMix(state, len), first,
+                                       len);
+  }
+  return CombineLargeContiguousImplOn64BitLengthGt32(state, first, len);
+}
+#endif
+
+#if defined(ABSL_INTERNAL_LEGACY_HASH_NAMESPACE)
+#define ABSL_HASH_INTERNAL_SUPPORT_LEGACY_HASH_ 1
+#else
+#define ABSL_HASH_INTERNAL_SUPPORT_LEGACY_HASH_ 0
+#endif
+
+struct HashSelect {
+ private:
+  struct WeaklyMixedIntegerProbe {
+    template <typename H>
+    static H Invoke(H state, WeaklyMixedInteger value) {
+      return hash_internal::hash_weakly_mixed_integer(std::move(state), value);
+    }
+  };
+
+  struct State : HashStateBase<State> {
+    static State combine_contiguous(State hash_state, const unsigned char*,
+                                    size_t);
+    using State::HashStateBase::combine_contiguous;
+    static State combine_raw(State state, uint64_t value);
+    static State combine_weakly_mixed_integer(State hash_state,
+                                              WeaklyMixedInteger value);
+  };
+
+  struct UniquelyRepresentedProbe {
+    template <typename H, typename T>
+    static auto Invoke(H state, const T& value)
+        -> std::enable_if_t<is_uniquely_represented<T>::value, H> {
+      return hash_internal::hash_bytes(std::move(state), value);
+    }
+  };
+
+  struct HashValueProbe {
+    template <typename H, typename T>
+    static auto Invoke(H state, const T& value) -> std::enable_if_t<
+        std::is_same_v<H, decltype(AbslHashValue(std::move(state), value))>,
+        H> {
+      return AbslHashValue(std::move(state), value);
+    }
+  };
+
+  struct LegacyHashProbe {
+#if ABSL_HASH_INTERNAL_SUPPORT_LEGACY_HASH_
+    template <typename H, typename T>
+    static auto Invoke(H state, const T& value) -> std::enable_if_t<
+        std::is_convertible_v<
+            decltype(ABSL_INTERNAL_LEGACY_HASH_NAMESPACE::hash<T>()(value)),
+            size_t>,
+        H> {
+      return hash_internal::hash_bytes(
+          std::move(state),
+          ABSL_INTERNAL_LEGACY_HASH_NAMESPACE::hash<T>{}(value));
+    }
+#endif
+  };
+
+  struct StdHashProbe {
+    template <typename H, typename T>
+    static auto Invoke(H state, const T& value)
+        -> std::enable_if_t<type_traits_internal::IsHashable<T>::value, H> {
+      return hash_internal::hash_bytes(std::move(state), std::hash<T>{}(value));
+    }
+  };
+
+  template <typename Hash, typename T>
+  struct Probe : Hash {
+   private:
+    template <typename H, typename = decltype(H::Invoke(
+                              std::declval<State>(), std::declval<const T&>()))>
+    static std::true_type Test(int);
+    template <typename U>
+    static std::false_type Test(char);
+
+   public:
+    static constexpr bool value = decltype(Test<Hash>(0))::value;
+  };
+
+ public:
+  template <typename T>
+  using Apply = std::disjunction<         
+      Probe<WeaklyMixedIntegerProbe, T>,   
+      Probe<UniquelyRepresentedProbe, T>,  
+      Probe<HashValueProbe, T>,            
+      Probe<LegacyHashProbe, T>,           
+      Probe<StdHashProbe, T>,              
+      std::false_type>;
+};
+
+template <typename T>
+struct is_hashable
+    : std::integral_constant<bool, HashSelect::template Apply<T>::value> {};
+
+class ABSL_DLL MixingHashState : public HashStateBase<MixingHashState> {
+  template <typename T>
+  using IntegralFastPath =
+      std::conjunction<std::is_integral<T>, is_uniquely_represented<T>,
+                       FitsIn64Bits<T>>;
+
+ public:
+  MixingHashState(MixingHashState&&) = default;
+  MixingHashState& operator=(MixingHashState&&) = default;
+
+  static MixingHashState combine_contiguous(MixingHashState hash_state,
+                                            const unsigned char* first,
+                                            size_t size) {
+    return MixingHashState(
+        CombineContiguousImpl(hash_state.state_, first, size,
+                              std::integral_constant<int, sizeof(size_t)>{}));
+  }
+  using MixingHashState::HashStateBase::combine_contiguous;
+
+  template <typename T>
+  static size_t hash(const T& value) {
+    return hash_with_seed(value, Seed());
+  }
+
+  template <typename T, std::enable_if_t<IntegralFastPath<T>::value, int> = 0>
+  static size_t hash_with_seed(T value, size_t seed) {
+    return static_cast<size_t>(
+        CombineRawImpl(seed, static_cast<std::make_unsigned_t<T>>(value)));
+  }
+
+  template <typename T, std::enable_if_t<!IntegralFastPath<T>::value, int> = 0>
+  static size_t hash_with_seed(const T& value, size_t seed) {
+    return static_cast<size_t>(combine(MixingHashState{seed}, value).state_);
+  }
+
+ private:
+  friend class MixingHashState::HashStateBase;
+  template <typename H>
+  friend H absl::hash_internal::hash_weakly_mixed_integer(H,
+                                                          WeaklyMixedInteger);
+  friend class absl::HashState;
+  friend struct CombineRaw;
+
+  static const void* const kSeed;
+
+  MixingHashState() : state_(Seed()) {}
+
+  MixingHashState(const MixingHashState&) = default;
+
+  explicit MixingHashState(uint64_t state) : state_(state) {}
+
+  static MixingHashState combine_raw(MixingHashState hash_state,
+                                     uint64_t value) {
+    return MixingHashState(CombineRawImpl(hash_state.state_, value));
+  }
+
+  static MixingHashState combine_weakly_mixed_integer(
+      MixingHashState hash_state, WeaklyMixedInteger value) {
+    return MixingHashState{hash_state.state_ + (0x57 + value.value)};
+  }
+
+  template <typename CombinerT>
+  static MixingHashState RunCombineUnordered(MixingHashState state,
+                                             CombinerT combiner) {
+    uint64_t unordered_state = 0;
+    combiner(MixingHashState{}, [&](MixingHashState& inner_state) {
+      auto element_state = inner_state.state_;
+      unordered_state += element_state;
+      if (unordered_state < element_state) {
+        ++unordered_state;
+      }
+      inner_state = MixingHashState{};
+    });
+    return MixingHashState::combine(std::move(state), unordered_state);
+  }
+
+  ABSL_ATTRIBUTE_ALWAYS_INLINE static size_t Seed() {
+#if (!defined(__clang__) || __clang_major__ > 11) && \
+    (!defined(__apple_build_version__) ||            \
+     __apple_build_version__ >= 19558921)  
+    return static_cast<size_t>(reinterpret_cast<uintptr_t>(&kSeed));
+#else
+    return static_cast<size_t>(reinterpret_cast<uintptr_t>(kSeed));
+#endif
+  }
+
+  uint64_t state_;
+};
+
+struct AggregateBarrier {};
+
+struct PoisonedHash : private AggregateBarrier {
+  PoisonedHash() = delete;
+  PoisonedHash(const PoisonedHash&) = delete;
+  PoisonedHash& operator=(const PoisonedHash&) = delete;
+};
+
+template <typename T>
+struct HashImpl {
+  size_t operator()(const T& value) const {
+    return MixingHashState::hash(value);
+  }
+
+ private:
+  friend struct HashWithSeed;
+
+  size_t hash_with_seed(const T& value, size_t seed) const {
+    return MixingHashState::hash_with_seed(value, seed);
+  }
+};
+
+template <typename T>
+struct Hash
+    : std::conditional_t<is_hashable<T>::value, HashImpl<T>, PoisonedHash> {};
+
+template <typename H>
+template <typename T, typename... Ts>
+H HashStateBase<H>::combine(H state, const T& value, const Ts&... values) {
+  return H::combine(hash_internal::HashSelect::template Apply<T>::Invoke(
+                        std::move(state), value),
+                    values...);
+}
+
+template <typename H>
+template <typename T>
+H HashStateBase<H>::combine_contiguous(H state, const T* data, size_t size) {
+  return hash_internal::hash_range_or_bytes(std::move(state), data, size);
+}
+
+template <typename H>
+template <typename I>
+H HashStateBase<H>::combine_unordered(H state, I begin, I end) {
+  return H::RunCombineUnordered(std::move(state),
+                                CombineUnorderedCallback<I>{begin, end});
+}
+
+template <typename H>
+H PiecewiseCombiner::add_buffer(H state, const unsigned char* data,
+                                size_t size) {
+  if (position_ + size < PiecewiseChunkSize()) {
+    memcpy(buf_ + position_, data, size);
+    position_ += size;
+    return state;
+  }
+  added_something_ = true;
+  if (position_ != 0) {
+    const size_t bytes_needed = PiecewiseChunkSize() - position_;
+    memcpy(buf_ + position_, data, bytes_needed);
+    state = H::combine_contiguous(std::move(state), buf_, PiecewiseChunkSize());
+    data += bytes_needed;
+    size -= bytes_needed;
+  }
+
+  while (size >= PiecewiseChunkSize()) {
+    state = H::combine_contiguous(std::move(state), data, PiecewiseChunkSize());
+    data += PiecewiseChunkSize();
+    size -= PiecewiseChunkSize();
+  }
+  memcpy(buf_, data, size);
+  position_ = size;
+  return state;
+}
+
+template <typename H>
+H PiecewiseCombiner::finalize(H state) {
+  if (added_something_ && position_ == 0) {
+    return state;
+  }
+  return H::combine_contiguous(std::move(state), buf_, position_);
+}
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#undef ABSL_HASH_INTERNAL_HAS_CRC32
+#undef ABSL_HASH_INTERNAL_CRC32_U64
+#undef ABSL_HASH_INTERNAL_CRC32_U32
+#undef ABSL_HASH_INTERNAL_CRC32_U8
+
+#endif

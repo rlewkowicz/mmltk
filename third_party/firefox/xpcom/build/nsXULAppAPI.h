@@ -1,0 +1,134 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(_nsXULAppAPI_h_)
+#define _nsXULAppAPI_h_
+
+#include "js/TypeDecls.h"
+#include "mozilla/ProcessType.h"
+#include "mozilla/TimeStamp.h"
+#include "nscore.h"
+
+
+class JSString;
+class MessageLoop;
+class nsIDirectoryServiceProvider;
+class nsIFile;
+class nsISerialEventTarget;
+class nsISupports;
+struct JSContext;
+struct XREChildData;
+
+namespace mozilla {
+class XREAppData;
+struct BootstrapConfig;
+}  
+
+#define XRE_USER_APP_DATA_DIR "UAppData"
+
+#define XRE_EXECUTABLE_FILE "XREExeF"
+
+#define NS_APP_PROFILE_DIR_STARTUP "ProfDS"
+
+#define NS_APP_PROFILE_LOCAL_DIR_STARTUP "ProfLDS"
+
+#define XRE_SYS_LOCAL_EXTENSION_PARENT_DIR "XRESysLExtPD"
+
+#define XRE_SYS_SHARE_EXTENSION_PARENT_DIR "XRESysSExtPD"
+
+#if defined(XP_UNIX) || 0
+#  define XRE_SYS_NATIVE_MANIFESTS "XRESysNativeManifests"
+#  define XRE_USER_NATIVE_MANIFESTS "XREUserNativeManifests"
+#endif
+
+#define XRE_USER_SYS_EXTENSION_DIR "XREUSysExt"
+
+#define XRE_APP_DISTRIBUTION_DIR "XREAppDist"
+
+#define XRE_APP_FEATURES_DIR "XREAppFeat"
+
+#define XRE_ADDON_APP_DIR "XREAddonAppDir"
+
+#define XRE_USER_RUNTIME_DIR "XREUserRunTimeDir"
+
+#define XRE_UPDATE_ROOT_DIR "UpdRootD"
+
+#define XRE_OLD_UPDATE_ROOT_DIR "OldUpdRootD"
+
+int XRE_main(int argc, char* argv[], const mozilla::BootstrapConfig& aConfig);
+
+nsresult XRE_GetFileFromPath(const char* aPath, nsIFile** aResult);
+
+nsresult XRE_GetBinaryPath(nsIFile** aResult);
+
+enum NSLocationType {
+  NS_APP_LOCATION,
+  NS_EXTENSION_LOCATION,
+};
+
+nsresult XRE_AddManifestLocation(NSLocationType aType, nsIFile* aLocation);
+
+nsresult XRE_ParseAppData(nsIFile* aINIFile, mozilla::XREAppData& aAppData);
+
+const char* XRE_GeckoProcessTypeToString(GeckoProcessType aProcessType);
+const char* XRE_ChildProcessTypeToAnnotation(GeckoProcessType aProcessType);
+
+
+nsresult XRE_InitChildProcess(int aArgc, char* aArgv[],
+                              const XREChildData* aChildData);
+
+GeckoProcessType XRE_GetProcessType();
+
+const char* XRE_GetProcessTypeString();
+
+GeckoChildID XRE_GetChildID();
+
+bool XRE_IsE10sParentProcess();
+
+#define GECKO_PROCESS_TYPE(enum_value, enum_name, string_name, proc_typename, \
+                           process_bin_type, procinfo_typename,               \
+                           webidl_typename, allcaps_name)                     \
+  bool XRE_Is##proc_typename##Process();
+#include "mozilla/GeckoProcessTypes.h"
+#undef GECKO_PROCESS_TYPE
+
+bool XRE_IsSocketProcess();
+
+bool XRE_UseNativeEventProcessing();
+
+typedef void (*MainFunction)(void* aData);
+
+int XRE_RunIPDLTest(int aArgc, char* aArgv[]);
+
+nsresult XRE_RunAppShell();
+
+nsresult XRE_InitCommandLine(int aArgc, char* aArgv[]);
+
+nsresult XRE_DeinitCommandLine();
+
+void XRE_ShutdownChildProcess();
+
+nsISerialEventTarget* XRE_GetAsyncIOEventTarget();
+
+void XRE_InstallX11ErrorHandler();
+void XRE_CleanupX11ErrorHandler();
+
+void XRE_StartupTimelineRecord(int aEvent, mozilla::TimeStamp aWhen);
+
+void XRE_InitOmnijar(nsIFile* aGreOmni, nsIFile* aAppOmni);
+
+void XRE_EnableSameExecutableForContentProc();
+
+namespace mozilla {
+enum class BinPathType { Self, PluginContainer };
+}
+mozilla::BinPathType XRE_GetChildProcBinPathType(GeckoProcessType aProcessType);
+
+#if defined(MOZ_ENABLE_FORKSERVER)
+
+int XRE_ForkServer(int* aArgc, char*** aArgv);
+
+#endif
+
+#endif

@@ -1,0 +1,239 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsAttrValueInlines_h_
+#define nsAttrValueInlines_h_
+
+#include <stdint.h>
+
+#include "mozilla/Atomics.h"
+#include "mozilla/ServoUtils.h"
+#include "mozilla/dom/DOMString.h"
+#include "nsAttrValue.h"
+
+namespace mozilla {
+class ShadowParts;
+}
+
+struct MiscContainer final {
+  using ValueType = nsAttrValue::ValueType;
+
+  ValueType mType;
+  mozilla::Atomic<uintptr_t, mozilla::ReleaseAcquire> mStringBits;
+  union {
+    struct {
+      union {
+        int32_t mInteger;
+        nscolor mColor;
+        uint32_t mEnumValue;
+        mozilla::DeclarationBlock* mCSSDeclaration;
+        nsIURI* mURL;
+        const mozilla::AttrAtomArray* mAtomArray;
+        const mozilla::ShadowParts* mShadowParts;
+        const mozilla::SVGAnimatedIntegerPair* mSVGAnimatedIntegerPair;
+        const mozilla::SVGAnimatedLength* mSVGLength;
+        const mozilla::SVGAnimatedNumberPair* mSVGAnimatedNumberPair;
+        const mozilla::SVGAnimatedOrient* mSVGAnimatedOrient;
+        const mozilla::SVGAnimatedPreserveAspectRatio*
+            mSVGAnimatedPreserveAspectRatio;
+        const mozilla::SVGAnimatedViewBox* mSVGAnimatedViewBox;
+        const mozilla::SVGLengthList* mSVGLengthList;
+        const mozilla::SVGNumberList* mSVGNumberList;
+        const mozilla::SVGPathData* mSVGPathData;
+        const mozilla::SVGPointList* mSVGPointList;
+        const mozilla::SVGStringList* mSVGStringList;
+        const mozilla::SVGTransformList* mSVGTransformList;
+      };
+      uint32_t mRefCount : 31;
+      uint32_t mCached : 1;
+    } mValue;
+    double mDoubleValue;
+  };
+
+  MiscContainer() : mType(nsAttrValue::eColor), mStringBits(0) {
+    MOZ_COUNT_CTOR(MiscContainer);
+    mValue.mColor = 0;
+    mValue.mRefCount = 0;
+    mValue.mCached = 0;
+  }
+
+ protected:
+  friend class nsAttrValue;
+
+  ~MiscContainer() {
+    if (IsRefCounted()) {
+      MOZ_ASSERT(mValue.mRefCount == 0);
+      MOZ_ASSERT(!mValue.mCached);
+    }
+    MOZ_COUNT_DTOR(MiscContainer);
+  }
+
+ public:
+  bool GetString(nsAString& aString) const;
+
+  void* GetStringOrAtomPtr(bool& aIsString) const {
+    uintptr_t bits = mStringBits;
+    aIsString =
+        nsAttrValue::ValueBaseType(mStringBits & NS_ATTRVALUE_BASETYPE_MASK) ==
+        nsAttrValue::eStringBase;
+    return reinterpret_cast<void*>(bits & NS_ATTRVALUE_POINTERVALUE_MASK);
+  }
+
+  nsAtom* GetStoredAtom() const {
+    bool isString = false;
+    void* ptr = GetStringOrAtomPtr(isString);
+    return isString ? nullptr : static_cast<nsAtom*>(ptr);
+  }
+
+  mozilla::StringBuffer* GetStoredStringBuffer() const {
+    bool isString = false;
+    void* ptr = GetStringOrAtomPtr(isString);
+    return isString ? static_cast<mozilla::StringBuffer*>(ptr) : nullptr;
+  }
+
+  void SetStringBitsMainThread(uintptr_t aBits) {
+    MOZ_ASSERT(!mozilla::IsInServoTraversal());
+    MOZ_ASSERT(NS_IsMainThread());
+    mStringBits = aBits;
+  }
+
+  inline bool IsRefCounted() const {
+    return mType == nsAttrValue::eAtomArray ||
+           mType == nsAttrValue::eCSSDeclaration ||
+           mType == nsAttrValue::eShadowParts;
+  }
+
+  inline int32_t AddRef() {
+    MOZ_ASSERT(IsRefCounted());
+    return ++mValue.mRefCount;
+  }
+
+  inline int32_t Release() {
+    MOZ_ASSERT(IsRefCounted());
+    return --mValue.mRefCount;
+  }
+
+  void Cache();
+  void Evict();
+};
+
+
+inline int32_t nsAttrValue::GetIntegerValue() const {
+  MOZ_ASSERT(Type() == eInteger, "wrong type");
+  return (BaseType() == eIntegerBase) ? GetIntInternal()
+                                      : GetMiscContainer()->mValue.mInteger;
+}
+
+inline int16_t nsAttrValue::GetEnumValue() const {
+  MOZ_ASSERT(Type() == eEnum, "wrong type");
+  return static_cast<int16_t>(((BaseType() == eIntegerBase)
+                                   ? static_cast<uint32_t>(GetIntInternal())
+                                   : GetMiscContainer()->mValue.mEnumValue) >>
+                              NS_ATTRVALUE_ENUMTABLEINDEX_BITS);
+}
+
+inline double nsAttrValue::GetPercentValue() const {
+  MOZ_ASSERT(Type() == ePercent, "wrong type");
+  if (BaseType() == eIntegerBase) {
+    return GetIntInternal() / 100.0f;
+  }
+  return GetMiscContainer()->mDoubleValue / 100.0f;
+}
+
+inline const mozilla::AttrAtomArray* nsAttrValue::GetAtomArrayValue() const {
+  MOZ_ASSERT(Type() == eAtomArray, "wrong type");
+  return GetMiscContainer()->mValue.mAtomArray;
+}
+
+inline mozilla::DeclarationBlock* nsAttrValue::GetCSSDeclarationValue() const {
+  MOZ_ASSERT(Type() == eCSSDeclaration, "wrong type");
+  return GetMiscContainer()->mValue.mCSSDeclaration;
+}
+
+inline nsIURI* nsAttrValue::GetURLValue() const {
+  MOZ_ASSERT(Type() == eURL, "wrong type");
+  return GetMiscContainer()->mValue.mURL;
+}
+
+inline double nsAttrValue::GetDoubleValue() const {
+  MOZ_ASSERT(Type() == eDoubleValue, "wrong type");
+  return GetMiscContainer()->mDoubleValue;
+}
+
+inline bool nsAttrValue::IsSVGType(ValueType aType) const {
+  return aType >= eSVGTypesBegin && aType <= eSVGTypesEnd;
+}
+
+inline bool nsAttrValue::StoresOwnData() const {
+  return BaseType() != eOtherBase || !IsSVGType(Type());
+}
+
+inline void nsAttrValue::SetPtrValueAndType(void* aValue, ValueBaseType aType) {
+  NS_ASSERTION(!(NS_PTR_TO_INT32(aValue) & ~NS_ATTRVALUE_POINTERVALUE_MASK),
+               "pointer not properly aligned, this will crash");
+  mBits = reinterpret_cast<intptr_t>(aValue) | aType;
+}
+
+inline void nsAttrValue::ResetIfSet() {
+  if (mBits) {
+    Reset();
+  }
+}
+
+inline MiscContainer* nsAttrValue::GetMiscContainer() const {
+  NS_ASSERTION(BaseType() == eOtherBase, "wrong type");
+  return static_cast<MiscContainer*>(GetPtr());
+}
+
+inline int32_t nsAttrValue::GetIntInternal() const {
+  NS_ASSERTION(BaseType() == eIntegerBase, "getting integer from non-integer");
+  return static_cast<int32_t>(mBits & ~NS_ATTRVALUE_INTEGERTYPE_MASK) /
+         NS_ATTRVALUE_INTEGERTYPE_MULTIPLIER;
+}
+
+inline nsAttrValue::ValueType nsAttrValue::Type() const {
+  switch (BaseType()) {
+    case eIntegerBase: {
+      return static_cast<ValueType>(mBits & NS_ATTRVALUE_INTEGERTYPE_MASK);
+    }
+    case eOtherBase: {
+      return GetMiscContainer()->mType;
+    }
+    default: {
+      return static_cast<ValueType>(static_cast<uint16_t>(BaseType()));
+    }
+  }
+}
+
+inline nsAtom* nsAttrValue::GetAtomValue() const {
+  MOZ_ASSERT(Type() == eAtom, "wrong type");
+  return reinterpret_cast<nsAtom*>(GetPtr());
+}
+
+inline void nsAttrValue::ToString(mozilla::dom::DOMString& aResult) const {
+  switch (Type()) {
+    case eString: {
+      if (auto* str = static_cast<mozilla::StringBuffer*>(GetPtr())) {
+        aResult.SetKnownLiveStringBuffer(
+            str, str->StorageSize() / sizeof(char16_t) - 1);
+      }
+      return;
+    }
+    case eAtom: {
+      nsAtom* atom = static_cast<nsAtom*>(GetPtr());
+      aResult.SetKnownLiveAtom(atom, mozilla::dom::DOMString::eNullNotExpected);
+      break;
+    }
+    default: {
+      ToString(static_cast<nsAString&>(aResult));
+    }
+  }
+}
+
+inline const mozilla::ShadowParts& nsAttrValue::GetShadowPartsValue() const {
+  MOZ_ASSERT(Type() == eShadowParts);
+  return *GetMiscContainer()->mValue.mShadowParts;
+}
+
+#endif

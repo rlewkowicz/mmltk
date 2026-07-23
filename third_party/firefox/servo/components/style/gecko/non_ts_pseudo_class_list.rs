@@ -1,0 +1,88 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+
+macro_rules! apply_non_ts_list {
+    ($apply_macro:ident) => {
+        $apply_macro! {
+            [
+                ("-moz-table-border-nonzero", MozTableBorderNonzero, _, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS),
+                ("-moz-select-list-box", MozSelectListBox, _, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS_AND_CHROME),
+                ("link", Link, UNVISITED, _),
+                ("any-link", AnyLink, VISITED_OR_UNVISITED, _),
+                ("visited", Visited, VISITED, _),
+                ("active", Active, ACTIVE, _),
+                ("autofill", Autofill, AUTOFILL, _),
+                ("checked", Checked, CHECKED, _),
+                ("defined", Defined, DEFINED, _),
+                ("disabled", Disabled, DISABLED, _),
+                ("enabled", Enabled, ENABLED, _),
+                ("focus", Focus, FOCUS, _),
+                ("focus-within", FocusWithin, FOCUS_WITHIN, _),
+                ("focus-visible", FocusVisible, FOCUSRING, _),
+                ("has-slotted", HasSlotted, HAS_SLOTTED, _),
+                ("hover", Hover, HOVER, _),
+                ("active-view-transition", ActiveViewTransition, ACTIVE_VIEW_TRANSITION, _),
+                ("-moz-drag-over", MozDragOver, DRAGOVER, _),
+                ("target", Target, URLTARGET, _),
+                ("indeterminate", Indeterminate, INDETERMINATE, _),
+                ("-moz-inert", MozInert, INERT, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS),
+                ("-moz-devtools-highlighted", MozDevtoolsHighlighted, DEVTOOLS_HIGHLIGHTED, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS),
+                ("-moz-styleeditor-transitioning", MozStyleeditorTransitioning, STYLEEDITOR_TRANSITIONING, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS),
+                ("fullscreen", Fullscreen, FULLSCREEN, _),
+                ("modal", Modal, MODAL, _),
+                ("open", Open, OPEN, _),
+                ("-moz-topmost-modal", MozTopmostModal, TOPMOST_MODAL, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS),
+                ("-moz-broken", MozBroken, BROKEN, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS_AND_CHROME),
+                ("-moz-has-dir-attr", MozHasDirAttr, HAS_DIR_ATTR, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS),
+                ("-moz-dir-attr-ltr", MozDirAttrLTR, HAS_DIR_ATTR_LTR, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS),
+                ("-moz-dir-attr-rtl", MozDirAttrRTL, HAS_DIR_ATTR_RTL, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS),
+                ("-moz-dir-attr-like-auto", MozDirAttrLikeAuto, HAS_DIR_ATTR_LIKE_AUTO, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS),
+
+                ("-moz-autofill-preview", MozAutofillPreview, AUTOFILL_PREVIEW, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS_AND_CHROME),
+                ("-moz-value-empty", MozValueEmpty, VALUE_EMPTY, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS),
+                ("-moz-revealed", MozRevealed, REVEALED, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS),
+                ("-moz-suppress-for-print-selection", MozSuppressForPrintSelection, SUPPRESS_FOR_PRINT_SELECTION, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS),
+
+                ("-moz-math-increment-script-level", MozMathIncrementScriptLevel, INCREMENT_SCRIPT_LEVEL, _),
+
+                ("required", Required, REQUIRED, _),
+                ("popover-open", PopoverOpen, POPOVER_OPEN, _),
+                ("optional", Optional, OPTIONAL_, _),
+                ("valid", Valid, VALID, _),
+                ("invalid", Invalid, INVALID, _),
+                ("in-range", InRange, INRANGE, _),
+                ("out-of-range", OutOfRange, OUTOFRANGE, _),
+                ("default", Default, DEFAULT, _),
+                ("placeholder-shown", PlaceholderShown, PLACEHOLDER_SHOWN, _),
+                ("read-only", ReadOnly, READONLY, _),
+                ("read-write", ReadWrite, READWRITE, _),
+                ("user-valid", UserValid, USER_VALID, _),
+                ("user-invalid", UserInvalid, USER_INVALID, _),
+                ("-moz-meter-optimum", MozMeterOptimum, OPTIMUM, _),
+                ("-moz-meter-sub-optimum", MozMeterSubOptimum, SUB_OPTIMUM, _),
+                ("-moz-meter-sub-sub-optimum", MozMeterSubSubOptimum, SUB_SUB_OPTIMUM, _),
+
+                ("-moz-first-node", MozFirstNode, _, _),
+                ("-moz-last-node", MozLastNode, _, _),
+                ("-moz-only-whitespace", MozOnlyWhitespace, _, _),
+                ("-moz-native-anonymous", MozNativeAnonymous, _, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS),
+                ("-moz-placeholder", MozPlaceholder, _, _),
+
+                ("paused", Paused, PAUSED, _),
+                ("playing", Playing, PAUSED, _),
+                ("seeking", Seeking, SEEKING, _),
+                ("buffering", Buffering, BUFFERING, _),
+                ("stalled", Stalled, STALLED, _),
+                ("muted", Muted, MUTED, _),
+                ("volume-locked", VolumeLocked, _, _),
+                ("picture-in-picture", PictureInPicture, PICTURE_IN_PICTURE, _),
+
+
+                ("-moz-is-html", MozIsHTML, _, PSEUDO_CLASS_ENABLED_IN_UA_SHEETS),
+                ("-moz-window-inactive", MozWindowInactive, _, _),
+            ]
+        }
+    }
+}

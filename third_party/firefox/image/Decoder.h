@@ -1,0 +1,335 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_Decoder_h
+#define mozilla_image_Decoder_h
+
+#include "AnimationParams.h"
+#include "DecoderFlags.h"
+#include "FrameAnimator.h"
+#include "ImageMetadata.h"
+#include "Orientation.h"
+#include "RasterImage.h"
+#include "Resolution.h"
+#include "SourceBuffer.h"
+#include "StreamingLexer.h"
+#include "SurfaceFlags.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/NotNull.h"
+#include "mozilla/RefPtr.h"
+#include "qcms.h"
+
+enum class CMSMode : int32_t;
+
+namespace mozilla {
+
+namespace image {
+
+class imgFrame;
+
+struct DecoderFinalStatus final {
+  DecoderFinalStatus(bool aWasMetadataDecode, bool aFinished, bool aHadError,
+                     bool aShouldReportError)
+      : mWasMetadataDecode(aWasMetadataDecode),
+        mFinished(aFinished),
+        mHadError(aHadError),
+        mShouldReportError(aShouldReportError) {}
+
+  const bool mWasMetadataDecode : 1;
+
+  const bool mFinished : 1;
+
+  const bool mHadError : 1;
+
+  const bool mShouldReportError : 1;
+};
+
+class IDecoderFrameRecycler {
+ public:
+  virtual RawAccessFrameRef RecycleFrame(gfx::IntRect& aRecycleRect) = 0;
+};
+
+class Decoder {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(Decoder)
+
+  explicit Decoder(RasterImage* aImage);
+
+  nsresult Init();
+
+  LexerResult Decode(IResumable* aOnResume = nullptr);
+
+  LexerResult TerminateFailure();
+
+  bool ShouldSyncDecode(size_t aByteLimit);
+
+  OrientedIntRect TakeInvalidRect() {
+    OrientedIntRect invalidRect = mInvalidRect;
+    mInvalidRect.SetEmpty();
+    return invalidRect;
+  }
+
+  Progress TakeProgress() {
+    Progress progress = mProgress;
+    mProgress = NoProgress;
+    return progress;
+  }
+
+  bool HasProgress() const {
+    return mProgress != NoProgress || !mInvalidRect.IsEmpty() ||
+           mFinishedNewFrame;
+  }
+
+
+  void SetMetadataDecode(bool aMetadataDecode) {
+    MOZ_ASSERT(!mInitialized, "Shouldn't be initialized yet");
+    mMetadataDecode = aMetadataDecode;
+  }
+  bool IsMetadataDecode() const { return mMetadataDecode; }
+
+  bool WantsFrameCount() const {
+    return bool(mDecoderFlags & DecoderFlags::COUNT_FRAMES);
+  }
+
+  void SetOutputSize(const OrientedIntSize& aSize);
+
+  OrientedIntSize OutputSize() const {
+    MOZ_ASSERT(HasSize());
+    return *mOutputSize;
+  }
+
+  Maybe<OrientedIntSize> ExplicitOutputSize() const;
+
+  void SetExpectedSize(const OrientedIntSize& aSize) {
+    mExpectedSize.emplace(aSize);
+  }
+
+  bool IsExpectedSize() const {
+    return mExpectedSize.isNothing() || *mExpectedSize == Size();
+  }
+
+  void SetIterator(SourceBufferIterator&& aIterator) {
+    MOZ_ASSERT(!mInitialized, "Shouldn't be initialized yet");
+    mIterator.emplace(std::move(aIterator));
+  }
+
+  SourceBuffer* GetSourceBuffer() const { return mIterator->Owner(); }
+
+  bool ShouldSendPartialInvalidations() const {
+    return !(mDecoderFlags & DecoderFlags::IS_REDECODE);
+  }
+
+  bool IsFirstFrameDecode() const {
+    return bool(mDecoderFlags & DecoderFlags::FIRST_FRAME_ONLY);
+  }
+
+  Maybe<uint32_t> TakeCompleteFrameCount();
+
+  uint32_t GetFrameCount() { return mFrameCount; }
+
+  bool HasAnimation() const { return mImageMetadata.HasAnimation(); }
+
+  bool HasError() const { return mError; }
+  bool ShouldReportError() const { return mShouldReportError; }
+
+  void SetFinalizeFrames(bool aFinalize) { mFinalizeFrames = aFinalize; }
+  bool GetFinalizeFrames() const { return mFinalizeFrames; }
+
+  bool GetDecodeDone() const {
+    return mReachedTerminalState || mDecodeDone ||
+           (mMetadataDecode && HasSize() && !WantsFrameCount()) || HasError();
+  }
+
+  bool InFrame() const { return mInFrame; }
+
+  virtual bool IsValidICOResource() const { return false; }
+
+  virtual DecoderType GetType() const { return DecoderType::UNKNOWN; }
+
+  enum DecodeStyle {
+    PROGRESSIVE,  
+    SEQUENTIAL    
+  };
+
+  void SetDecoderFlags(DecoderFlags aDecoderFlags) {
+    MOZ_ASSERT(!mInitialized);
+    mDecoderFlags = aDecoderFlags;
+  }
+  DecoderFlags GetDecoderFlags() const { return mDecoderFlags; }
+
+  void SetSurfaceFlags(SurfaceFlags aSurfaceFlags);
+  SurfaceFlags GetSurfaceFlags() const { return mSurfaceFlags; }
+
+  bool HasSize() const { return mImageMetadata.HasSize(); }
+
+  OrientedIntSize Size() const {
+    MOZ_ASSERT(HasSize());
+    return mImageMetadata.GetSize();
+  }
+
+  OrientedIntRect FullFrame() const {
+    return OrientedIntRect(OrientedIntPoint(), Size());
+  }
+
+  OrientedIntRect FullOutputFrame() const {
+    return OrientedIntRect(OrientedIntPoint(), OutputSize());
+  }
+
+  Orientation GetOrientation() const {
+    MOZ_ASSERT(HasSize());
+    return mImageMetadata.GetOrientation();
+  }
+
+  DecoderFinalStatus FinalStatus() const;
+
+  const ImageMetadata& GetImageMetadata() { return mImageMetadata; }
+
+  NotNull<RasterImage*> GetImage() const { return WrapNotNull(mImage.get()); }
+
+  RasterImage* GetImageMaybeNull() const { return mImage.get(); }
+
+  RawAccessFrameRef GetCurrentFrameRef() {
+    return mCurrentFrame ? mCurrentFrame->RawAccessRef() : RawAccessFrameRef();
+  }
+
+  imgFrame* GetCurrentFrame() { return mCurrentFrame.get(); }
+
+  const RawAccessFrameRef& GetRestoreFrameRef() const { return mRestoreFrame; }
+
+  const gfx::IntRect& GetRestoreDirtyRect() const { return mRestoreDirtyRect; }
+
+  const gfx::IntRect& GetRecycleRect() const { return mRecycleRect; }
+
+  const gfx::IntRect& GetFirstFrameRefreshArea() const {
+    return mFirstFrameRefreshArea;
+  }
+
+  bool HasFrameToTake() const { return mHasFrameToTake; }
+  void ClearHasFrameToTake() {
+    MOZ_ASSERT(mHasFrameToTake);
+    mHasFrameToTake = false;
+  }
+
+  IDecoderFrameRecycler* GetFrameRecycler() const { return mFrameRecycler; }
+  void SetFrameRecycler(IDecoderFrameRecycler* aFrameRecycler) {
+    mFrameRecycler = aFrameRecycler;
+  }
+
+ protected:
+  friend class DecoderTestHelper;
+  friend class nsBMPDecoder;
+  friend class nsICODecoder;
+  friend class ReorientSurfaceSink;
+  friend class SurfaceSink;
+
+  virtual ~Decoder();
+
+  virtual nsresult InitInternal();
+  virtual LexerResult DoDecode(SourceBufferIterator& aIterator,
+                               IResumable* aOnResume) = 0;
+  virtual nsresult BeforeFinishInternal();
+  virtual nsresult FinishInternal();
+  virtual nsresult FinishWithErrorInternal();
+
+  qcms_profile* GetCMSOutputProfile() const;
+  qcms_transform* GetCMSsRGBTransform(gfx::SurfaceFormat aFormat) const;
+
+
+  void PostSize(int32_t aWidth, int32_t aHeight, Orientation = Orientation(),
+                Resolution = Resolution());
+
+  void PostHasTransparency();
+
+  void PostIsAnimated(FrameTimeout aFirstFrameTimeout);
+
+  void PostFrameCount(uint32_t aFrameCount);
+
+  void PostFrameStop(Opacity aFrameOpacity = Opacity::SOME_TRANSPARENCY);
+
+  void PostInvalidation(
+      const OrientedIntRect& aRect,
+      const Maybe<OrientedIntRect>& aRectAtOutputSize = Nothing());
+
+  void PostLoopCount(int32_t aLoopCount);
+
+  void PostDecodeDone();
+
+  nsresult AllocateFrame(const gfx::IntSize& aOutputSize,
+                         gfx::SurfaceFormat aFormat,
+                         const Maybe<AnimationParams>& aAnimParams = Nothing());
+
+ private:
+  void PostError();
+
+  void CompleteDecode();
+
+  uint32_t GetCompleteFrameCount() {
+    if (mFrameCount == 0) {
+      return 0;
+    }
+
+    return mInFrame ? mFrameCount - 1 : mFrameCount;
+  }
+
+  RawAccessFrameRef AllocateFrameInternal(
+      const gfx::IntSize& aOutputSize, gfx::SurfaceFormat aFormat,
+      const Maybe<AnimationParams>& aAnimParams,
+      RawAccessFrameRef&& aPreviousFrame);
+
+ protected:
+  static uint8_t ChooseTransferCharacteristics(uint8_t aTC);
+
+  qcms_profile* mInProfile;
+
+  qcms_transform* mTransform;
+
+  uint8_t* mImageData;  
+  uint32_t mImageDataLength;
+
+  CMSMode mCMSMode;
+
+ private:
+  RefPtr<RasterImage> mImage;
+  Maybe<SourceBufferIterator> mIterator;
+  IDecoderFrameRecycler* mFrameRecycler;
+
+  RawAccessFrameRef mCurrentFrame;
+
+  RawAccessFrameRef mRestoreFrame;
+
+  ImageMetadata mImageMetadata;
+
+  OrientedIntRect
+      mInvalidRect;  
+  gfx::IntRect mRestoreDirtyRect;  
+  gfx::IntRect mRecycleRect;       
+  Maybe<OrientedIntSize> mOutputSize;    
+  Maybe<OrientedIntSize> mExpectedSize;  
+  Progress mProgress;
+
+  uint32_t mFrameCount;      
+  FrameTimeout mLoopLength;  
+  gfx::IntRect
+      mFirstFrameRefreshArea;  
+
+  DecoderFlags mDecoderFlags;
+  SurfaceFlags mSurfaceFlags;
+
+  bool mInitialized : 1;
+  bool mMetadataDecode : 1;
+  bool mHaveExplicitOutputSize : 1;
+  bool mInFrame : 1;
+  bool mFinishedNewFrame : 1;  
+  bool mHasFrameToTake : 1;
+  bool mReachedTerminalState : 1;
+  bool mDecodeDone : 1;
+  bool mError : 1;
+  bool mShouldReportError : 1;
+  bool mFinalizeFrames : 1;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_Decoder_h

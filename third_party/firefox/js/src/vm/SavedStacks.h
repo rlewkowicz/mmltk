@@ -1,0 +1,195 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_SavedStacks_h
+#define vm_SavedStacks_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/FastBernoulliTrial.h"
+#include "mozilla/Maybe.h"
+
+#include "js/ColumnNumber.h"  // JS::TaggedColumnNumberOneOrigin
+#include "js/HashTable.h"
+#include "js/Stack.h"
+#include "vm/SavedFrame.h"
+
+namespace JS {
+enum class SavedFrameSelfHosted;
+}
+
+namespace js {
+
+class FrameIter;
+
+
+class SavedStacks {
+  friend class SavedFrame;
+  friend bool JS::ubi::ConstructSavedFrameStackSlow(
+      JSContext* cx, JS::ubi::StackFrame& ubiFrame,
+      MutableHandleObject outSavedFrameStack);
+
+ public:
+  SavedStacks()
+      : bernoulliSeeded(false),
+        bernoulli(1.0, 0x59fdad7f6b4cc573, 0x91adf38db96a9354),
+        creatingSavedFrame(false) {}
+
+  [[nodiscard]] bool saveCurrentStack(
+      JSContext* cx, MutableHandle<SavedFrame*> frame,
+      JS::StackCapture&& capture = JS::StackCapture(JS::AllFrames()),
+      HandleObject startAt = nullptr);
+  [[nodiscard]] bool copyAsyncStack(
+      JSContext* cx, HandleObject asyncStack, HandleString asyncCause,
+      MutableHandle<SavedFrame*> adoptedStack,
+      const mozilla::Maybe<size_t>& maxFrameCount);
+  void traceWeak(JSTracer* trc);
+  void trace(JSTracer* trc);
+  uint32_t count();
+  void clear();
+  void chooseSamplingProbability(JS::Realm* realm);
+
+  void setRNGState(uint64_t state0, uint64_t state1) {
+    bernoulli.setRandomState(state0, state1);
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf);
+
+  struct MetadataBuilder : public AllocationMetadataBuilder {
+    MetadataBuilder() = default;
+    virtual JSObject* build(JSContext* cx, HandleObject obj,
+                            AutoEnterOOMUnsafeRegion& oomUnsafe) const override;
+  };
+
+  static const MetadataBuilder metadataBuilder;
+
+ private:
+  SavedFrame::Set frames;
+  bool bernoulliSeeded;
+  mozilla::FastBernoulliTrial bernoulli;
+  bool creatingSavedFrame;
+
+  struct MOZ_RAII AutoReentrancyGuard {
+    SavedStacks& stacks;
+
+    explicit AutoReentrancyGuard(SavedStacks& stacks) : stacks(stacks) {
+      stacks.creatingSavedFrame = true;
+    }
+
+    ~AutoReentrancyGuard() { stacks.creatingSavedFrame = false; }
+  };
+
+  [[nodiscard]] bool insertFrames(JSContext* cx,
+                                  MutableHandle<SavedFrame*> frame,
+                                  JS::StackCapture&& capture,
+                                  HandleObject startAt);
+  [[nodiscard]] bool adoptAsyncStack(
+      JSContext* cx, MutableHandle<SavedFrame*> asyncStack,
+      Handle<JSAtom*> asyncCause, const mozilla::Maybe<size_t>& maxFrameCount);
+  [[nodiscard]] bool checkForEvalInFramePrev(
+      JSContext* cx, MutableHandle<SavedFrame::Lookup> lookup);
+  SavedFrame* getOrCreateSavedFrame(JSContext* cx,
+                                    Handle<SavedFrame::Lookup> lookup);
+  SavedFrame* createFrameFromLookup(JSContext* cx,
+                                    Handle<SavedFrame::Lookup> lookup);
+  void setSamplingProbability(double probability);
+
+
+  struct PCKey {
+    PCKey(JSScript* script, jsbytecode* pc) : script(script), pc(pc) {}
+
+    WeakHeapPtr<JSScript*> script;
+    jsbytecode* pc;
+
+    void trace(JSTracer* trc) {  }
+    bool traceWeak(JSTracer* trc) {
+      return TraceWeakEdge(trc, &script, "traceWeak");
+    }
+  };
+
+ public:
+  struct LocationValue {
+    LocationValue() : source(nullptr), sourceId(0), line(0) {}
+    LocationValue(JSAtom* source, uint32_t sourceId, size_t line,
+                  JS::TaggedColumnNumberOneOrigin column)
+        : source(source), sourceId(sourceId), line(line), column(column) {}
+
+    void trace(JSTracer* trc) {
+      TraceEdge(trc, &source, "SavedStacks::LocationValue::source");
+    }
+
+    bool traceWeak(JSTracer* trc) {
+      MOZ_ASSERT(source);
+      return TraceWeakEdge(trc, &source, "traceWeak");
+    }
+
+    WeakHeapPtr<JSAtom*> source;
+    uint32_t sourceId;
+
+    size_t line;
+
+    JS::TaggedColumnNumberOneOrigin column;
+  };
+
+ private:
+  struct PCLocationHasher : public DefaultHasher<PCKey> {
+    using ScriptPtrHasher = DefaultHasher<JSScript*>;
+    using BytecodePtrHasher = DefaultHasher<jsbytecode*>;
+
+    static HashNumber hash(const PCKey& key) {
+      return mozilla::AddToHash(ScriptPtrHasher::hash(key.script),
+                                BytecodePtrHasher::hash(key.pc));
+    }
+
+    static bool match(const PCKey& l, const PCKey& k) {
+      return ScriptPtrHasher::match(l.script, k.script) &&
+             BytecodePtrHasher::match(l.pc, k.pc);
+    }
+  };
+
+  using PCLocationMap =
+      GCHashMap<PCKey, LocationValue, PCLocationHasher, SystemAllocPolicy>;
+  PCLocationMap pcLocationMap;
+
+  [[nodiscard]] bool getLocation(JSContext* cx, const FrameIter& iter,
+                                 MutableHandle<LocationValue> locationp);
+};
+
+template <typename Wrapper>
+struct WrappedPtrOperations<SavedStacks::LocationValue, Wrapper> {
+  JSAtom* source() const { return loc().source; }
+  uint32_t sourceId() const { return loc().sourceId; }
+  size_t line() const { return loc().line; }
+  JS::TaggedColumnNumberOneOrigin column() const { return loc().column; }
+
+ private:
+  const SavedStacks::LocationValue& loc() const {
+    return static_cast<const Wrapper*>(this)->get();
+  }
+};
+
+template <typename Wrapper>
+struct MutableWrappedPtrOperations<SavedStacks::LocationValue, Wrapper>
+    : public WrappedPtrOperations<SavedStacks::LocationValue, Wrapper> {
+  void setSource(JSAtom* v) { loc().source = v; }
+  void setSourceId(uint32_t v) { loc().sourceId = v; }
+  void setLine(size_t v) { loc().line = v; }
+  void setColumn(JS::TaggedColumnNumberOneOrigin v) { loc().column = v; }
+
+ private:
+  SavedStacks::LocationValue& loc() {
+    return static_cast<Wrapper*>(this)->get();
+  }
+};
+
+JS::UniqueChars BuildUTF8StackString(JSContext* cx, JSPrincipals* principals,
+                                     HandleObject stack);
+
+js::SavedFrame* UnwrapSavedFrame(JSContext* cx, JSPrincipals* principals,
+                                 HandleObject obj,
+                                 JS::SavedFrameSelfHosted selfHosted,
+                                 bool& skippedAsync);
+
+} 
+
+#endif /* vm_SavedStacks_h */

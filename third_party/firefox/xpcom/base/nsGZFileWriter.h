@@ -1,0 +1,41 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsGZFileWriter_h
+#define nsGZFileWriter_h
+
+#include "nsISupportsImpl.h"
+#include "zlib.h"
+#include "nsDependentString.h"
+#include <stdio.h>
+
+class nsGZFileWriter final {
+  virtual ~nsGZFileWriter();
+
+ public:
+  explicit nsGZFileWriter();
+
+  NS_INLINE_DECL_REFCOUNTING(nsGZFileWriter)
+
+  [[nodiscard]] nsresult Init(nsIFile* aFile);
+
+  [[nodiscard]] nsresult InitANSIFileDesc(FILE* aFile);
+
+  [[nodiscard]] nsresult Write(const nsACString& aStr);
+
+  [[nodiscard]] nsresult Write(const char* aStr, uint32_t aLen) {
+    return Write(nsDependentCSubstring(aStr, aLen));
+  }
+
+  nsresult Finish();
+
+ private:
+  bool mInitialized;
+  bool mFinished;
+  FILE* mGZFile;
+  z_stream mZStream = {};
+  Bytef mBuffer[8192];
+};
+
+#endif

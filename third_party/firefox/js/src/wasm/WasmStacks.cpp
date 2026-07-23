@@ -1,0 +1,1153 @@
+/*
+ *
+ * Copyright 2025 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "wasm/WasmStacks.h"
+
+#include "mozilla/BinarySearch.h"
+
+#include <algorithm>
+
+#include "builtin/Promise.h"
+#include "debugger/DebugAPI.h"
+#include "gc/Memory.h"
+#include "jit/Assembler.h"
+#include "jit/MacroAssembler.h"
+#include "js/Prefs.h"
+#include "util/Poison.h"
+#include "vm/JSContext.h"
+#include "vm/JSObject.h"
+#include "vm/MutexIDs.h"
+#include "vm/NativeObject.h"
+#include "wasm/WasmConstants.h"
+#include "wasm/WasmContext.h"
+#include "wasm/WasmFrameIter.h"
+#include "wasm/WasmJS.h"
+#include "wasm/WasmStubs.h"
+
+#include "jit/MacroAssembler-inl.h"
+#include "vm/JSObject-inl.h"
+
+
+using namespace js;
+using namespace js::jit;
+
+#if defined(ENABLE_WASM_JSPI)
+
+namespace js::wasm {
+
+/* clang-format off */
+
+
+/* clang-format on */
+
+static_assert(JS_STACK_GROWTH_DIRECTION < 0,
+              "Stack switching is implemented only for native stacks that "
+              "grows down");
+
+void ContStackDeleter::operator()(ContStack* cont) { ContStack::free(cont); }
+
+void SwitchTarget::trace(JSTracer* trc) const {
+  if (instance) {
+    TraceInstanceEdge(trc, instance, "switch target instance");
+  }
+}
+
+void Handlers::trace(JSTracer* trc) const {
+  returnTarget.trace(trc);
+  for (uint32_t i = 0; i < numHandlers; i++) {
+    TraceManuallyBarrieredEdge(trc, &((Handler*)handler(i))->tag,
+                               "handler tag");
+  }
+}
+
+static constexpr size_t ContStackMinJitStackSize = 16 * 1024;
+static constexpr size_t ContStackMaxJitStackSize = 10 * 1024 * 1024;
+
+static constexpr size_t ContStackRedZoneSize = 0x8000;
+
+static constexpr size_t ContStackTopGuardPages = 1;
+static constexpr size_t ContStackBottomGuardPages = 1;
+
+static constexpr size_t ContStackAlignment = 16;
+
+void ContStackSize::compute() {
+  size_t pageSize = gc::SystemPageSize();
+  size_t topGuardSize = ContStackTopGuardPages * pageSize;
+  size_t bottomGuardSize = ContStackBottomGuardPages * pageSize;
+
+  jitStackSize =
+      RoundUp(std::clamp(size_t(JS::Prefs::wasm_cont_stack_size()),
+                         ContStackMinJitStackSize, ContStackMaxJitStackSize),
+              pageSize);
+  headerSize = RoundUp(sizeof(ContStack), pageSize);
+  totalSize = topGuardSize + ContStackRedZoneSize + jitStackSize +
+              bottomGuardSize + headerSize;
+
+  MOZ_RELEASE_ASSERT(totalSize <= MAX_UINT32 / ContStackArena::MaxCapacity);
+}
+
+void ContStack::init(ContStackArena* arena, uintptr_t allocationBase,
+                     const ContStackSize& size) {
+  size_t pageSize = gc::SystemPageSize();
+  size_t jitStackSize = size.jitStackSize;
+  size_t topGuardPageSize = ContStackTopGuardPages * pageSize;
+  size_t bottomGuardPageSize = ContStackBottomGuardPages * pageSize;
+
+  uintptr_t topGuardPagePhysicalStart = allocationBase;
+  uintptr_t topGuardPagePhysicalEnd = allocationBase + topGuardPageSize;
+  uintptr_t redZonePhysicalStart = topGuardPagePhysicalEnd;
+  uintptr_t jitStackPhysicalStart = redZonePhysicalStart + ContStackRedZoneSize;
+  uintptr_t jitStackPhysicalEnd = jitStackPhysicalStart + jitStackSize;
+  uintptr_t bottomGuardPagePhysicalStart = jitStackPhysicalEnd;
+  uintptr_t headerPhysicalStart =
+      bottomGuardPagePhysicalStart + bottomGuardPageSize;
+  uintptr_t headerPhysicalEnd = headerPhysicalStart + size.headerSize;
+
+  MOZ_RELEASE_ASSERT(headerPhysicalEnd - allocationBase == size.totalSize);
+
+  MOZ_ASSERT(headerPhysicalStart % alignof(wasm::ContStack) == 0);
+  MOZ_ASSERT(jitStackPhysicalEnd % jit::WasmStackAlignment == 0);
+
+  gc::ProtectPages(reinterpret_cast<void*>(topGuardPagePhysicalStart),
+                   topGuardPageSize);
+  gc::ProtectPages(reinterpret_cast<void*>(bottomGuardPagePhysicalStart),
+                   bottomGuardPageSize);
+
+  ContStack* stack =
+      new (reinterpret_cast<void*>(headerPhysicalStart)) ContStack();
+
+  stack->arena_ = arena;
+  stack->allocationBase_ = allocationBase;
+
+  stack->stackBase_ = jitStackPhysicalEnd;
+  stack->stackLimitForSystem_ = redZonePhysicalStart;
+  stack->stackLimitForJit_ = jitStackPhysicalStart;
+
+  stack->target_.stack = stack;
+  stack->target_.jitLimit = stack->stackLimitForJit_;
+
+  MOZ_ASSERT(
+      (reinterpret_cast<uintptr_t>(stack->baseFrame()) + sizeof(wasm::Frame)) %
+          jit::WasmStackAlignment ==
+      0);
+
+}
+
+void ContStack::prepare(Handle<ContObject*> continuation,
+                        Handle<JSFunction*> target, void* contBaseFrameStub,
+                        const Code* creatorCode) {
+  MOZ_RELEASE_ASSERT(isDead());
+  MOZ_RELEASE_ASSERT(target->isWasm());
+
+  initialResumeTarget_.framePointer = baseFrame();
+  initialResumeTarget_.stackPointer = baseFrame();
+  initialResumeTarget_.resumePC = contBaseFrameStub;
+  initialResumeTarget_.instance = &target->wasmInstance();
+  initialResumeTarget_.stack = &target_;
+
+  initialResumeCallee_ = target;
+  initialResumeCode_ = creatorCode;
+  handlers_ = nullptr;
+  resumeTarget_ = &initialResumeTarget_;
+
+  void* base = reinterpret_cast<void*>(stackLimitForSystem_);
+  size_t length = stackBase_ - stackLimitForSystem_;
+  switch (pageState_) {
+    case PageState::Ready:
+      break;
+    case PageState::Decommitted:
+      (void)gc::MarkPagesInUseSoft(base, length);
+      break;
+    case PageState::Poisoned:
+      MOZ_MAKE_MEM_UNDEFINED(base, length);
+      break;
+  }
+  pageState_ = PageState::Ready;
+
+  memset(baseFrame(), 0, sizeof(wasm::FrameWithInstances));
+}
+
+void ContStack::reset() {
+  MOZ_RELEASE_ASSERT(isDead() || canResume());
+
+  initialResumeTarget_.framePointer = nullptr;
+  initialResumeTarget_.stackPointer = nullptr;
+  initialResumeTarget_.resumePC = nullptr;
+  initialResumeTarget_.instance = nullptr;
+  initialResumeTarget_.stack = nullptr;
+
+  initialResumeCallee_ = nullptr;
+  initialResumeCode_ = nullptr;
+  handlers_ = nullptr;
+  resumeTarget_ = nullptr;
+}
+
+void ContStack::poison() {
+  MOZ_RELEASE_ASSERT(isDead());
+  MOZ_RELEASE_ASSERT(pageState_ == PageState::Ready);
+
+  void* base = reinterpret_cast<void*>(stackLimitForSystem_);
+  size_t length = stackBase_ - stackLimitForSystem_;
+  js::AlwaysPoison(base, JS_SWEPT_CONT_STACK_PATTERN, length,
+                   MemCheckKind::MakeNoAccess);
+  pageState_ = PageState::Poisoned;
+}
+
+void ContStack::decommit() {
+  MOZ_RELEASE_ASSERT(isDead());
+  MOZ_ASSERT(gc::DecommitEnabled());
+
+  if (pageState_ != PageState::Ready) {
+    return;
+  }
+
+  void* base = reinterpret_cast<void*>(stackLimitForSystem_);
+  size_t length = stackBase_ - stackLimitForSystem_;
+  (void)gc::MarkPagesUnusedSoft(base, length);
+  pageState_ = PageState::Decommitted;
+}
+
+void ContStack::free(ContStack* stack) {
+  MOZ_ASSERT(stack->arena_);
+  stack->arena_->free(stack);
+}
+
+void ContStack::unwind(wasm::Handlers* handlers) {
+  MOZ_RELEASE_ASSERT(handlers->child);
+  MOZ_RELEASE_ASSERT(!handlers->child->canResume());
+
+  handlers->child->handlers_ = nullptr;
+  handlers->child = nullptr;
+}
+
+void ContStack::freeSuspended(UniqueContStack resumeBase) {
+  MOZ_RELEASE_ASSERT(!resumeBase->handlers());
+  MOZ_RELEASE_ASSERT(resumeBase->canResume());
+
+  for (wasm::Handlers* handlers = resumeBase->resumeTargetStack()->handlers();
+       handlers != nullptr; handlers = handlers->self->handlers()) {
+    MOZ_RELEASE_ASSERT(handlers->child && handlers->child != resumeBase);
+    ContStack::unwind(handlers);
+    MOZ_ASSERT(!handlers->child);
+  }
+
+  resumeBase = nullptr;
+}
+
+void ContStack::traceFields(JSTracer* trc) {
+  TraceEdge(trc, &initialResumeCallee_, "base frame callee");
+  initialResumeTarget_.trace(trc);
+
+  if (handlers_) {
+    handlers_->trace(trc);
+  }
+}
+
+void ContStack::traceSuspended(JSTracer* trc, JSObject* src) {
+  MOZ_RELEASE_ASSERT(canResume());
+
+  WasmFrameIter iter = WasmFrameIter(
+      resumeTarget_->instance,
+      static_cast<FrameWithInstances*>(resumeTarget_->framePointer),
+      resumeTarget_->resumePC);
+
+#if defined(ENABLE_WASM_JSPI)
+  MOZ_ASSERT_IF(trc->isMarkingTracer(), src);
+  const bool traceDebugFrames = src && trc->isMarkingTracer();
+#endif
+
+  if (iter.done()) {
+    MOZ_RELEASE_ASSERT(isInitial());
+    traceFields(trc);
+    return;
+  }
+
+  MOZ_RELEASE_ASSERT(iter.currentFrameStackSwitched());
+  MOZ_RELEASE_ASSERT(iter.contStack() &&
+                     iter.contStack() == resumeTarget_->stack->stack);
+
+  uintptr_t highestByteVisitedInPrevWasmFrame = 0;
+  while (true) {
+    MOZ_RELEASE_ASSERT(!iter.done());
+
+    if (iter.currentFrameStackSwitched()) {
+      iter.contStack()->traceFields(trc);
+      highestByteVisitedInPrevWasmFrame = 0;
+    }
+
+    uint8_t* nextPC = iter.resumePCinCurrentFrame();
+    Instance* instance = iter.instance();
+    TraceInstanceEdge(trc, instance, "WasmFrameIter instance");
+    highestByteVisitedInPrevWasmFrame = instance->traceFrame(
+        trc, iter, nextPC, highestByteVisitedInPrevWasmFrame);
+
+#if defined(ENABLE_WASM_JSPI)
+    if (traceDebugFrames && iter.debugEnabled()) {
+      DebugAPI::traceWasmContFrame(trc, src, iter.debugFrame(), instance);
+    }
+#endif
+
+    if (iter.frame()->wasmCaller() == baseFrame()) {
+      break;
+    }
+    ++iter;
+  }
+}
+
+void ContStack::updateSuspendedForMovingGC(Nursery& nursery) {
+  MOZ_RELEASE_ASSERT(canResume());
+
+  WasmFrameIter iter = WasmFrameIter(
+      resumeTarget_->instance,
+      static_cast<FrameWithInstances*>(resumeTarget_->framePointer),
+      resumeTarget_->resumePC);
+
+  if (iter.done()) {
+    MOZ_RELEASE_ASSERT(isInitial());
+    return;
+  }
+
+  MOZ_RELEASE_ASSERT(iter.currentFrameStackSwitched());
+  MOZ_RELEASE_ASSERT(iter.contStack() &&
+                     iter.contStack() == resumeTarget_->stack->stack);
+
+  while (true) {
+    MOZ_RELEASE_ASSERT(!iter.done());
+    iter.instance()->updateFrameForMovingGC(iter, iter.resumePCinCurrentFrame(),
+                                            nursery);
+
+    if (iter.frame()->wasmCaller() == baseFrame()) {
+      break;
+    }
+    ++iter;
+  }
+}
+
+int32_t ContStack::offsetOfBaseFrame() {
+  size_t bottomGuardPageSize = ContStackBottomGuardPages * gc::SystemPageSize();
+  size_t preFrameFields =
+      AlignBytes(wasm::FrameWithInstances::sizeOfInstanceFieldsAndShadowStack(),
+                 jit::WasmStackAlignment);
+  size_t sizeOfBaseFrame = sizeof(wasm::Frame);
+  return -static_cast<int32_t>(bottomGuardPageSize + preFrameFields +
+                               sizeOfBaseFrame);
+}
+
+int32_t ContStack::offsetOfBaseFrameFP() {
+  return offsetOfBaseFrame() +
+         static_cast<int32_t>(FrameWithInstances::callerFPOffset());
+}
+
+static bool ShouldPoisonOnFree() {
+#if defined(JS_GC_ALLOW_EXTRA_POISONING)
+  return JS::Prefs::extra_gc_poisoning();
+#else
+  return false;
+#endif
+}
+
+void ContStackArena::free(ContStack* stack) {
+  uint32_t index = stackIndex(stack);
+  MOZ_RELEASE_ASSERT(isAllocated(index));
+  stack->reset();
+  if (ShouldPoisonOnFree()) {
+    stack->poison();
+  }
+  currentFreeMask_ |= (uint64_t(1) << index);
+  dirtySinceLastPurge_ = true;
+}
+
+void ContStackArena::purge() {
+  if (!dirtySinceLastPurge_) {
+    return;
+  }
+  dirtySinceLastPurge_ = false;
+  if (!gc::DecommitEnabled() || ShouldPoisonOnFree()) {
+    return;
+  }
+  forEachFreedStack([](ContStack* stack) { stack->decommit(); });
+}
+
+uintptr_t ContStackArena::stackAllocation(uint32_t index) const {
+  return base() + size_t(index) * owner_->stackSize().totalSize;
+}
+
+ContStack* ContStackArena::stack(uint32_t index) const {
+  return ContStack::fromAllocation(stackAllocation(index), owner_->stackSize());
+}
+
+uint32_t ContStackArena::stackIndex(const ContStack* stack) const {
+  uintptr_t allocationBase = stack->allocationBase();
+  MOZ_RELEASE_ASSERT(allocationBase >= base() &&
+                     allocationBase < base() + owner_->arenaSize());
+  size_t relativeAllocationBase = allocationBase - base();
+  return relativeAllocationBase / owner_->stackSize().totalSize;
+}
+
+static constexpr uint64_t AllFreeMask(uint32_t capacity) {
+  MOZ_ASSERT(capacity <= 64);
+  return capacity == 64 ? ~uint64_t(0) : (uint64_t(1) << capacity) - 1;
+}
+
+ContStackArena::ContStackArena(ContStackAllocator* owner, void* base)
+    : owner_(owner),
+      base_(base),
+      capacity_(owner->arenaCapacity()),
+      allFreeMask_(AllFreeMask(capacity_)),
+      currentFreeMask_(allFreeMask_) {}
+
+ContStackArena::~ContStackArena() {
+  MOZ_RELEASE_ASSERT(isEmpty());
+  if (base_) {
+    gc::UnmapPages(base_, owner_->arenaSize());
+  }
+}
+
+UniqueContStackArena ContStackArena::create(ContStackAllocator* owner) {
+  size_t arenaSize = owner->arenaSize();
+  void* arenaBase = gc::MapAlignedPages(arenaSize, ContStackAlignment);
+  if (!arenaBase) {
+    return nullptr;
+  }
+
+  UniqueContStackArena arena(js_new<ContStackArena>(owner, arenaBase));
+  if (!arena) {
+    gc::UnmapPages(arenaBase, arenaSize);
+    return nullptr;
+  }
+
+  for (uint32_t i = 0; i < arena->capacity(); i++) {
+    ContStack::init(arena.get(), arena->stackAllocation(i), owner->stackSize());
+  }
+
+  return arena;
+}
+
+bool ContStackArena::contains(uintptr_t address) const {
+  uintptr_t low = base();
+  uintptr_t high = low + owner_->arenaSize();
+  return address >= low && address < high;
+}
+
+UniqueContStack ContStackArena::allocate(Handle<ContObject*> continuation,
+                                         Handle<JSFunction*> target,
+                                         void* contBaseFrameStub,
+                                         const Code* creatorCode) {
+  if (isFull()) {
+    return nullptr;
+  }
+  uint32_t freeIndex = uint32_t(std::countr_zero(currentFreeMask_));
+  currentFreeMask_ &= ~(uint64_t(1) << freeIndex);
+  UniqueContStack result(stack(freeIndex));
+  result->prepare(continuation, target, contBaseFrameStub, creatorCode);
+  return result;
+}
+
+ContStack* ContStackArena::findForAddress(uintptr_t address) const {
+  if (address < base()) {
+    return nullptr;
+  }
+  uintptr_t relativeAddress = address - base();
+  uintptr_t index = relativeAddress / owner_->stackSize().totalSize;
+  if (index >= capacity_ || !isAllocated(index)) {
+    return nullptr;
+  }
+  return stack(index);
+}
+
+void ContStackAllocator::ensureInitialized() {
+  if (initialized_) {
+    return;
+  }
+
+  stackSize_.compute();
+
+  arenaCapacity_ =
+      uint32_t(std::clamp(size_t(JS::Prefs::wasm_cont_stack_arena_capacity()),
+                          size_t(1), size_t(ContStackArena::MaxCapacity)));
+
+  initialized_ = true;
+}
+
+ContStackArena* ContStackAllocator::addArena(JSContext* cx) {
+  UniqueContStackArena arena = ContStackArena::create(this);
+  if (!arena) {
+    return nullptr;
+  }
+
+  MOZ_RELEASE_ASSERT(!cx->stackContainsAddress(
+      arena->base(), JS::StackKind::StackForSystemCode));
+  MOZ_RELEASE_ASSERT(!cx->stackContainsAddress(
+      arena->base() + arenaSize() - 1, JS::StackKind::StackForSystemCode));
+
+  ContStackArena* rawArena = arena.get();
+
+  if (!arenas_.reserve(arenas_.length() + 1)) {
+    return nullptr;
+  }
+
+  uintptr_t newBase = rawArena->base();
+  size_t insertPos = mozilla::LowerBound(
+      arenas_, 0, arenas_.length(),
+      [newBase](const UniqueContStackArena& c) -> int32_t {
+        return c->base() < newBase ? 1 : (c->base() > newBase ? -1 : 0);
+      });
+
+  UniqueContStackArena* inserted =
+      arenas_.insert(arenas_.begin() + insertPos, std::move(arena));
+  MOZ_RELEASE_ASSERT(inserted);
+
+  return rawArena;
+}
+
+ContStackArena* ContStackAllocator::findOrAddArenaForAllocate(JSContext* cx) {
+  for (auto& arena : arenas_) {
+    if (!arena->isFull()) {
+      return arena.get();
+    }
+  }
+
+  return addArena(cx);
+}
+
+ContStackArena* ContStackAllocator::findArenaForAddress(
+    uintptr_t address) const {
+  size_t pos = mozilla::UpperBound(
+      arenas_, 0, arenas_.length(),
+      [address](const UniqueContStackArena& c) -> int32_t {
+        return address < c->base() ? -1 : (address == c->base() ? 0 : 1);
+      });
+  if (pos == 0) {
+    return nullptr;
+  }
+  ContStackArena* arena = arenas_[pos - 1].get();
+  return address < arena->base() + arenaSize() ? arena : nullptr;
+}
+
+UniqueContStack ContStackAllocator::allocate(JSContext* cx,
+                                             Handle<ContObject*> continuation,
+                                             Handle<JSFunction*> target,
+                                             void* contBaseFrameStub,
+                                             const Code* creatorCode) {
+  ensureInitialized();
+
+  ContStackArena* arena = findOrAddArenaForAllocate(cx);
+
+  if (!arena) {
+    ReportOutOfMemory(cx);
+    return nullptr;
+  }
+
+  UniqueContStack stack =
+      arena->allocate(continuation, target, contBaseFrameStub, creatorCode);
+
+  MOZ_ASSERT(stack);
+
+  return stack;
+}
+
+ContStack* ContStackAllocator::findForAddress(uintptr_t address) const {
+  if (!initialized_) {
+    return nullptr;
+  }
+
+  ContStackArena* arena = findArenaForAddress(address);
+  if (!arena) {
+    return nullptr;
+  }
+  return arena->findForAddress(address);
+}
+
+void ContStackAllocator::purge(bool shrinking) {
+  if (!initialized_) {
+    return;
+  }
+
+  size_t keptEmpty = 0;
+  size_t maxEmptyToKeep = shrinking ? 0 : 1;
+
+  arenas_.eraseIf([&](const UniqueContStackArena& arena) {
+    if (arena->isEmpty()) {
+      if (keptEmpty < maxEmptyToKeep) {
+        keptEmpty++;
+        return false;
+      }
+      return true;
+    }
+    return false;
+  });
+
+  for (auto& arena : arenas_) {
+    arena->purge();
+  }
+}
+
+size_t ContStackAllocator::sizeOfNonHeap() const {
+  if (!initialized_) {
+    return 0;
+  }
+  return arenas_.length() * arenaSize();
+}
+
+ContObject* ContObject::create(JSContext* cx, Handle<JSFunction*> target,
+                               void* contBaseFrameStub,
+                               const Code* creatorCode) {
+  Rooted<ContObject*> cont(cx, NewBuiltinClassInstance<ContObject>(cx));
+  if (!cont) {
+    ReportOutOfMemory(cx);
+    return nullptr;
+  }
+
+  UniqueContStack stack(cx->wasm().contStacks().allocate(
+      cx, cont, target, contBaseFrameStub, creatorCode));
+  if (!stack) {
+    return nullptr;
+  }
+  MOZ_ASSERT(stack->canResume());
+  cont->initFixedSlot(ResumeBaseSlot, JS::PrivateValue(stack.release()));
+
+  return cont;
+}
+
+ContObject* ContObject::createEmpty(JSContext* cx) {
+  Rooted<ContObject*> cont(cx, NewBuiltinClassInstance<ContObject>(cx));
+  if (!cont) {
+    ReportOutOfMemory(cx);
+    return nullptr;
+  }
+  MOZ_ASSERT(!cont->resumeBase());
+  return cont;
+}
+
+const JSClass ContObject::class_ = {
+    "ContObject",
+    JSCLASS_HAS_RESERVED_SLOTS(SlotCount) | JSCLASS_FOREGROUND_FINALIZE,
+    &ContObject::classOps_,
+    nullptr,
+    &ContObject::classExt_,
+};
+
+const JSClassOps ContObject::classOps_ = {
+    .finalize = finalize,
+    .trace = trace,
+};
+
+const ClassExtension ContObject::classExt_ = {};
+
+void ContObject::finalize(JS::GCContext* gcx, JSObject* obj) {
+  JSContext* cx = gcx->runtimeFromAnyThread()->mainContextFromAnyThread();
+  ContObject& cont = obj->as<ContObject>();
+
+  if (UniqueContStack resumeBase = cont.takeResumeBase()) {
+    DebugAPI::onLeaveWasmCont(cx, resumeBase.get());
+    ContStack::freeSuspended(std::move(resumeBase));
+  }
+}
+
+void ContObject::trace(JSTracer* trc, JSObject* obj) {
+  if (trc->isTenuringTracer()) {
+    return;
+  }
+
+  ContObject& cont = obj->as<ContObject>();
+  ContStack* resumeBase = cont.resumeBase();
+  if (resumeBase) {
+    MOZ_RELEASE_ASSERT(resumeBase->canResume());
+    resumeBase->traceSuspended(trc, obj);
+  }
+}
+
+void EmitEnterStackTarget(MacroAssembler& masm, Register cx,
+                          Register stackTarget, Register scratch) {
+  masm.loadPtr(Address(stackTarget, offsetof(wasm::StackTarget, stack)),
+               scratch);
+  masm.storePtr(scratch,
+                Address(cx, JSContext::offsetOfWasm() +
+                                wasm::Context::offsetOfCurrentStack()));
+
+  Label enteringContStack;
+  masm.branchTestPtr(Assembler::NonZero, scratch, scratch, &enteringContStack);
+  masm.storePtr(ImmWord(0),
+                Address(cx, JSContext::offsetOfWasm() +
+                                wasm::Context::offsetOfBaseHandlers()));
+  masm.bind(&enteringContStack);
+
+  masm.loadPtr(Address(stackTarget, offsetof(wasm::StackTarget, jitLimit)),
+               scratch);
+  masm.storePtr(scratch, Address(cx, JSContext::offsetOfWasm() +
+                                         wasm::Context::offsetOfStackLimit()));
+
+}
+
+void EmitSwitchStack(MacroAssembler& masm, Register switchTarget,
+                     Register scratch1, Register scratch2, Register scratch3) {
+  masm.loadPtr(Address(switchTarget, offsetof(wasm::SwitchTarget, instance)),
+               InstanceReg);
+  masm.loadWasmPinnedRegsFromInstance(mozilla::Nothing());
+#if defined(WASM_HAS_HEAPREG)
+  MOZ_ASSERT(HeapReg != scratch1 && HeapReg != scratch2 && HeapReg != scratch3);
+#endif
+  masm.switchToWasmInstanceRealm(scratch1, scratch2);
+
+  masm.loadPtr(Address(InstanceReg, wasm::Instance::offsetOfCx()), scratch1);
+  masm.loadPtr(Address(switchTarget, offsetof(wasm::SwitchTarget, stack)),
+               scratch2);
+  EmitEnterStackTarget(masm, scratch1, scratch2, scratch3);
+
+  masm.loadStackPtr(
+      Address(switchTarget, offsetof(wasm::SwitchTarget, stackPointer)));
+#if defined(JS_CODEGEN_ARM64)
+  if (sp.Is(masm.GetStackPointer64())) {
+    masm.Mov(PseudoStackPointer64, vixl::sp);
+  } else {
+    masm.Mov(vixl::sp, PseudoStackPointer64);
+  }
+#endif
+  masm.loadPtr(
+      Address(switchTarget, offsetof(wasm::SwitchTarget, framePointer)),
+      FramePointer);
+  masm.loadPtr(Address(switchTarget, offsetof(wasm::SwitchTarget, resumePC)),
+               scratch1);
+
+  ClobberWasmRegsForLongJmp(masm, scratch1);
+
+  masm.jump(scratch1);
+}
+
+void EmitClearSwitchTarget(MacroAssembler& masm, Register switchTarget) {
+  masm.storePtr(ImmWord(0), Address(switchTarget, offsetof(wasm::SwitchTarget,
+                                                           framePointer)));
+  masm.storePtr(ImmWord(0), Address(switchTarget, offsetof(wasm::SwitchTarget,
+                                                           stackPointer)));
+  masm.storePtr(ImmWord(0),
+                Address(switchTarget, offsetof(wasm::SwitchTarget, resumePC)));
+  masm.storePtr(ImmWord(0), Address(switchTarget,
+                                    offsetof(wasm::SwitchTarget, paramsArea)));
+  masm.storePtr(ImmWord(0),
+                Address(switchTarget, offsetof(wasm::SwitchTarget, instance)));
+  masm.storePtr(ImmWord(0),
+                Address(switchTarget, offsetof(wasm::SwitchTarget, stack)));
+}
+
+void EmitFindHandler(MacroAssembler& masm, Register instance, Register tag,
+                     Register output, Register scratch1, Register scratch2,
+                     Register scratch3, Register scratch4, Label* fail) {
+  masm.loadPtr(Address(instance, wasm::Instance::offsetOfCx()), scratch1);
+  masm.loadPtr(Address(scratch1, JSContext::offsetOfWasm() +
+                                     wasm::Context::offsetOfCurrentStack()),
+               scratch1);
+
+  masm.branchTestPtr(Assembler::Zero, scratch1, scratch1, fail);
+
+  masm.loadPtr(Address(scratch1, wasm::ContStack::offsetOfHandlers()),
+               scratch1);
+
+  Label isNotNull1;
+  masm.branchTestPtr(Assembler::NonZero, scratch1, scratch1, &isNotNull1);
+  masm.breakpoint();
+  masm.bind(&isNotNull1);
+
+
+  Label outerHandlersLoop;
+  Label innerHandlerLoop;
+  Label exitInnerHandlerLoop;
+  Label done;
+
+  masm.nopAlign(CodeAlignment);
+  masm.bind(&outerHandlersLoop);
+
+  masm.load32(Address(scratch1, offsetof(wasm::Handlers, numHandlers)),
+              scratch2);
+  masm.branchTest32(Assembler::Zero, scratch2, scratch2, &exitInnerHandlerLoop);
+  masm.assert32Compare(Assembler::LessThanOrEqual, scratch2,
+                       Imm32(wasm::MaxHandlers));
+
+  masm.computeEffectiveAddress(
+      Address(scratch1, wasm::Handlers::offsetOfHandler(0)), scratch3);
+
+  masm.nopAlign(CodeAlignment);
+  masm.bind(&innerHandlerLoop);
+
+  masm.loadPtr(Address(scratch3, offsetof(wasm::Handler, tag)), scratch4);
+  masm.branchPtr(Assembler::Equal, tag, scratch4, &done);
+
+  masm.addPtr(Imm32(sizeof(wasm::Handler)), scratch3);
+  masm.decBranchPtr(Assembler::NonZero, scratch2, Imm32(1), &innerHandlerLoop);
+
+  masm.bind(&exitInnerHandlerLoop);
+
+  masm.loadPtr(Address(scratch1, offsetof(wasm::Handlers, self)), scratch1);
+  masm.branchTestPtr(Assembler::Zero, scratch1, scratch1, fail);
+  masm.loadPtr(Address(scratch1, wasm::ContStack::offsetOfHandlers()),
+               scratch1);
+  masm.branchTestPtr(Assembler::Zero, scratch1, scratch1, fail);
+  masm.jump(&outerHandlersLoop);
+
+  masm.bind(&done);
+  masm.movePtr(scratch3, output);
+}
+
+static void EmitBuildSwitchTarget(MacroAssembler& masm,
+                                  uint32_t switchTargetFramePushed,
+                                  uint32_t returnFramePushed, Register instance,
+                                  Register stackTarget, Register resumePC,
+                                  Register scratch) {
+  masm.storePtr(
+      FramePointer,
+      Address(FramePointer, -static_cast<int32_t>(switchTargetFramePushed) +
+                                static_cast<int32_t>(offsetof(
+                                    wasm::SwitchTarget, framePointer))));
+  masm.computeEffectiveAddress(
+      Address(FramePointer, -static_cast<int32_t>(returnFramePushed)), scratch);
+  masm.storePtr(
+      scratch,
+      Address(FramePointer, -static_cast<int32_t>(switchTargetFramePushed) +
+                                static_cast<int32_t>(offsetof(
+                                    wasm::SwitchTarget, stackPointer))));
+  masm.storePtr(
+      resumePC,
+      Address(FramePointer, -static_cast<int32_t>(switchTargetFramePushed) +
+                                static_cast<int32_t>(
+                                    offsetof(wasm::SwitchTarget, resumePC))));
+  masm.storePtr(
+      ImmWord(0),
+      Address(FramePointer, -static_cast<int32_t>(switchTargetFramePushed) +
+                                static_cast<int32_t>(
+                                    offsetof(wasm::SwitchTarget, paramsArea))));
+  masm.storePtr(
+      instance,
+      Address(FramePointer, -static_cast<int32_t>(switchTargetFramePushed) +
+                                static_cast<int32_t>(
+                                    offsetof(wasm::SwitchTarget, instance))));
+  masm.storePtr(
+      stackTarget,
+      Address(FramePointer,
+              -static_cast<int32_t>(switchTargetFramePushed) +
+                  static_cast<int32_t>(offsetof(wasm::SwitchTarget, stack))));
+}
+
+void EmitSuspend(jit::MacroAssembler& masm, jit::Register instance,
+                 jit::Register suspendedCont, jit::Register handler,
+                 jit::Register scratch1, jit::Register scratch2,
+                 jit::Register scratch3, const CallSiteDesc& callSiteDesc,
+                 jit::CodeOffset* suspendCodeOffset,
+                 uint32_t* suspendFramePushed) {
+  masm.loadPtr(Address(instance, wasm::Instance::offsetOfCx()), scratch1);
+  masm.loadPtr(Address(scratch1, JSContext::offsetOfWasm() +
+                                     wasm::Context::offsetOfCurrentStack()),
+               scratch1);
+
+  masm.loadPtr(Address(handler, offsetof(wasm::Handler, handlers)), scratch2);
+
+  masm.loadPtr(Address(scratch2, offsetof(wasm::Handlers, child)), scratch3);
+
+  masm.storePrivateValue(
+      scratch3, Address(suspendedCont, wasm::ContObject::offsetOfResumeBase()));
+  Register scratch4 = suspendedCont;
+
+  masm.storePtr(ImmWord(0), Address(scratch2, offsetof(wasm::Handlers, child)));
+  masm.storePtr(
+      ImmWord(0),
+      Address(scratch3, wasm::ContStack::offsetOfBaseFrame() +
+                            static_cast<int32_t>(
+                                wasm::FrameWithInstances::callerFPOffset())));
+  masm.storePtr(
+      ImmWord(0),
+      Address(scratch3,
+              wasm::ContStack::offsetOfBaseFrame() +
+                  static_cast<int32_t>(
+                      wasm::FrameWithInstances::returnAddressOffset())));
+  masm.storePtr(
+      ImmWord(0),
+      Address(scratch3,
+              wasm::ContStack::offsetOfBaseFrame() +
+                  static_cast<int32_t>(
+                      wasm::FrameWithInstances::callerInstanceOffset())));
+  masm.storePtr(ImmWord(0),
+                Address(scratch3, wasm::ContStack::offsetOfHandlers()));
+
+
+  CodeLabel resumeLabel;
+  masm.reserveStack(sizeof(wasm::SwitchTarget));
+  masm.assertStackAlignment(WasmStackAlignment);
+  uint32_t switchTargetFramePushed = masm.framePushed();
+  *suspendFramePushed = masm.framePushed();
+
+  masm.storeStackPtr(
+      Address(scratch3, wasm::ContStack::offsetOfResumeTarget()));
+
+  masm.computeEffectiveAddress(
+      Address(scratch1, wasm::ContStack::offsetOfStackTarget()), scratch4);
+  masm.mov(&resumeLabel, scratch3);
+  EmitBuildSwitchTarget(masm, switchTargetFramePushed, *suspendFramePushed,
+                        instance, scratch4, scratch3, scratch1);
+
+  masm.computeEffectiveAddress(
+      Address(handler, offsetof(wasm::Handler, target)), scratch4);
+  EmitSwitchStack(masm, scratch4, scratch1, scratch2, scratch3);
+  MOZ_ASSERT(*suspendFramePushed == masm.framePushed());
+
+  masm.wasmTrapInstruction();
+  masm.bind(&resumeLabel);
+  *suspendCodeOffset = *resumeLabel.target();
+  masm.addCodeLabel(resumeLabel);
+  masm.append(callSiteDesc, *resumeLabel.target());
+
+  masm.freeStack(sizeof(wasm::SwitchTarget));
+}
+
+static void EmitCheckContIsResumable(MacroAssembler& masm, Register cont,
+                                     Register scratch1, Label* fail) {
+  masm.branchWasmAnyRefIsNull(true, cont, fail);
+
+  masm.branchTestUndefined(
+      Assembler::Equal, Address(cont, wasm::ContObject::offsetOfResumeBase()),
+      fail);
+
+  masm.loadPrivate(Address(cont, wasm::ContObject::offsetOfResumeBase()),
+                   scratch1);
+
+  masm.assertPtrNonZero(scratch1);
+
+  masm.assertPtrNonZero(
+      Address(scratch1, wasm::ContStack::offsetOfResumeTarget()));
+
+  masm.assertPtrZero(Address(scratch1, wasm::ContStack::offsetOfHandlers()));
+}
+
+static void EmitPushHandlers(MacroAssembler& masm, size_t sizeOfHandlers,
+                             Register instance, Register scratch1,
+                             Register scratch2, Register scratch3,
+                             uint32_t* handlersFramePushed) {
+  masm.loadPtr(Address(instance, wasm::Instance::offsetOfCx()), scratch3);
+  masm.loadPtr(Address(scratch3, JSContext::offsetOfWasm() +
+                                     wasm::Context::offsetOfCurrentStack()),
+               scratch1);
+
+  masm.reserveStack(sizeOfHandlers);
+  *handlersFramePushed = masm.framePushed();
+  MOZ_RELEASE_ASSERT((sizeOfHandlers) % WasmStackAlignment == 0);
+  masm.assertStackAlignment(WasmStackAlignment);
+
+  Label onMainStack;
+  Label rejoin;
+  masm.branchTestPtr(Assembler::Zero, scratch1, scratch1, &onMainStack);
+
+  masm.assertPtrNonZero(Address(
+      scratch3,
+      JSContext::offsetOfWasm() + wasm::Context::offsetOfBaseHandlers()));
+
+  masm.storePtr(scratch1, Address(masm.getStackPointer(),
+                                  offsetof(wasm::Handlers, self)));
+
+  masm.computeEffectiveAddress(
+      Address(scratch1, wasm::ContStack::offsetOfStackTarget()), scratch1);
+
+  masm.jump(&rejoin);
+  masm.bind(&onMainStack);
+
+
+  masm.assertPtrZero(Address(
+      scratch3,
+      JSContext::offsetOfWasm() + wasm::Context::offsetOfBaseHandlers()));
+
+  masm.storeStackPtr(Address(
+      scratch3,
+      JSContext::offsetOfWasm() + wasm::Context::offsetOfBaseHandlers()));
+
+  masm.storePtr(ImmWord(0), Address(masm.getStackPointer(),
+                                    offsetof(wasm::Handlers, self)));
+
+  masm.computeEffectiveAddress(
+      Address(scratch3, JSContext::offsetOfWasm() +
+                            wasm::Context::offsetOfMainStackTarget()),
+      scratch1);
+
+  masm.bind(&rejoin);
+}
+
+static void EmitInitializeHandler(
+    MacroAssembler& masm, uint32_t handlersFramePushed,
+    uint32_t handlerFramePushed, uint32_t returnFramePushed,
+    HandlerJitOffsets& handler, CodeLabel* handlerLabel, Register instance,
+    Register handlersParamsArea, Register stackTarget, Register scratch2,
+    Register scratch3) {
+  size_t tagObjectOffset = wasm::Instance::offsetInData(
+      handler.tagInstanceDataOffset + offsetof(wasm::TagInstanceData, object));
+  masm.loadPtr(Address(instance, tagObjectOffset), scratch3);
+  masm.storePtr(
+      scratch3,
+      Address(FramePointer,
+              -static_cast<int32_t>(handlerFramePushed) +
+                  static_cast<int32_t>(offsetof(wasm::Handler, tag))));
+
+  masm.computeEffectiveAddress(
+      Address(FramePointer, -static_cast<int32_t>(handlersFramePushed)),
+      scratch3);
+  masm.storePtr(
+      scratch3,
+      Address(FramePointer,
+              -static_cast<int32_t>(handlerFramePushed) +
+                  static_cast<int32_t>(offsetof(wasm::Handler, handlers))));
+
+  masm.mov(handlerLabel, scratch2);
+
+  EmitBuildSwitchTarget(
+      masm, handlerFramePushed - offsetof(wasm::Handler, target),
+      returnFramePushed, instance, stackTarget, scratch2, scratch3);
+
+  if (handlersParamsArea != Register::Invalid()) {
+    masm.movePtr(handlersParamsArea, scratch2);
+    masm.addPtr(Imm32(handler.resultsAreaOffset), scratch2);
+    masm.storePtr(
+        scratch2,
+        Address(FramePointer,
+                -static_cast<int32_t>(handlerFramePushed) +
+                    static_cast<int32_t>(offsetof(wasm::Handler, target)) +
+                    static_cast<int32_t>(
+                        offsetof(wasm::SwitchTarget, paramsArea))));
+  }
+}
+
+static void EmitActivateResumeBase(MacroAssembler& masm, Register instance,
+                                   Register cont, Register resumeBase,
+                                   Register resumeTarget, Register scratch3) {
+  masm.loadPrivate(Address(cont, wasm::ContObject::offsetOfResumeBase()),
+                   resumeBase);
+  masm.storeValue(UndefinedValue(),
+                  Address(cont, wasm::ContObject::offsetOfResumeBase()));
+
+  masm.storePtr(resumeBase, Address(masm.getStackPointer(),
+                                    offsetof(wasm::Handlers, child)));
+  masm.storeStackPtr(Address(resumeBase, wasm::ContStack::offsetOfHandlers()));
+
+  masm.storePtr(
+      FramePointer,
+      Address(resumeBase, wasm::ContStack::offsetOfBaseFrame() +
+                              static_cast<int32_t>(
+                                  wasm::FrameWithInstances::callerFPOffset())));
+  masm.loadPtr(Address(masm.getStackPointer(),
+                       offsetof(wasm::Handlers, returnTarget) +
+                           offsetof(wasm::SwitchTarget, resumePC)),
+               scratch3);
+  masm.storePtr(
+      scratch3,
+      Address(resumeBase,
+              wasm::ContStack::offsetOfBaseFrame() +
+                  static_cast<int32_t>(
+                      wasm::FrameWithInstances::returnAddressOffset())));
+  masm.storePtr(
+      instance,
+      Address(resumeBase,
+              wasm::ContStack::offsetOfBaseFrame() +
+                  static_cast<int32_t>(
+                      wasm::FrameWithInstances::callerInstanceOffset())));
+
+  masm.loadPtr(Address(resumeBase, wasm::ContStack::offsetOfResumeTarget()),
+               resumeTarget);
+  masm.storePtr(ImmWord(0),
+                Address(resumeBase, wasm::ContStack::offsetOfResumeTarget()));
+}
+
+static void EmitCallContUnwind(MacroAssembler& masm, Register instance,
+                               Register handlers) {
+  MOZ_ASSERT(instance == InstanceReg);
+  masm.Push(instance);
+  int32_t framePushedAfterInstance = masm.framePushed();
+
+  masm.setupWasmABICall(wasm::SymbolicAddress::ContUnwind);
+  masm.passABIArg(instance);
+  masm.passABIArg(handlers);
+  int32_t instanceOffset = masm.framePushed() - framePushedAfterInstance;
+  masm.callWithABI(wasm::BytecodeOffset(0), wasm::SymbolicAddress::ContUnwind,
+                   mozilla::Some(instanceOffset), ABIType::General);
+
+  masm.Pop(instance);
+#if JS_CODEGEN_ARM64
+  masm.syncStackPtr();
+#endif
+}
+
+void EmitResume(MacroAssembler& masm, Register instance, Register cont,
+                Register handlersParamsArea, Register scratch1,
+                Register scratch2, Register scratch3, Label* fail,
+                mozilla::Span<HandlerJitOffsets> handlerOffsets,
+                mozilla::Span<jit::Label*> handlerLabels,
+                const wasm::CallSiteDesc& callSiteDesc,
+                jit::CodeOffset* resumeCodeOffset,
+                uint32_t* resumeFramePushed) {
+  MOZ_ASSERT(handlerOffsets.size() == handlerLabels.size());
+  size_t numHandlers = handlerOffsets.size();
+  size_t sizeOfHandlers = wasm::Handlers::sizeOf(numHandlers);
+  uint32_t handlersFramePushed = 0;
+  CodeLabel returnLabel;
+  Vector<CodeLabel, 2, SystemAllocPolicy> handlerCodeLabels;
+  if (!handlerCodeLabels.resize(numHandlers)) {
+    masm.propagateOOM(false);
+    return;
+  }
+
+  EmitCheckContIsResumable(masm, cont, scratch1, fail);
+  EmitPushHandlers(masm, sizeOfHandlers, instance, scratch1, scratch2, scratch3,
+                   &handlersFramePushed);
+
+  masm.mov(&returnLabel, scratch2);
+  EmitBuildSwitchTarget(
+      masm, handlersFramePushed - offsetof(wasm::Handlers, returnTarget),
+      handlersFramePushed, instance, scratch1, scratch2, scratch3);
+
+  masm.store32(
+      Imm32(numHandlers),
+      Address(masm.getStackPointer(), offsetof(wasm::Handlers, numHandlers)));
+  for (uint32_t i = 0; i < numHandlers; i++) {
+    uint32_t handlerFramePushed =
+        handlersFramePushed - wasm::Handlers::offsetOfHandler(i);
+    uint32_t returnFramePushed = handlersFramePushed - sizeOfHandlers;
+    EmitInitializeHandler(masm, handlersFramePushed, handlerFramePushed,
+                          returnFramePushed, handlerOffsets[i],
+                          &handlerCodeLabels[i], instance, handlersParamsArea,
+                          scratch1, scratch2, scratch3);
+  }
+
+  EmitActivateResumeBase(masm, instance, cont, scratch1, scratch2, scratch3);
+
+  EmitSwitchStack(masm, scratch2, scratch1, scratch3, cont);
+  *resumeFramePushed = masm.framePushed();
+  MOZ_ASSERT(*resumeFramePushed == handlersFramePushed);
+
+  for (uint32_t i = 0; i < numHandlers; i++) {
+    masm.bind(&handlerCodeLabels[i]);
+    masm.addCodeLabel(handlerCodeLabels[i]);
+    masm.jump(handlerLabels[i]);
+  }
+
+  masm.wasmTrapInstruction();
+  masm.bind(&returnLabel);
+  masm.addCodeLabel(returnLabel);
+
+  *resumeCodeOffset = *returnLabel.target();
+  masm.append(callSiteDesc, *returnLabel.target());
+
+
+  masm.moveStackPtrTo(scratch1);
+  EmitCallContUnwind(masm, InstanceReg, scratch1);
+  masm.freeStack(sizeOfHandlers);
+}
+
+}  
+
+#endif

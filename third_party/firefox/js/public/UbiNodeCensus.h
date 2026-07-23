@@ -1,0 +1,135 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_UbiNodeCensus_h
+#define js_UbiNodeCensus_h
+
+#include "js/GCVector.h"
+#include "js/UbiNode.h"
+#include "js/UbiNodeBreadthFirst.h"
+
+
+namespace JS {
+namespace ubi {
+
+struct Census;
+
+class CountBase;
+
+struct CountDeleter {
+  JS_PUBLIC_API void operator()(CountBase*);
+};
+
+using CountBasePtr = js::UniquePtr<CountBase, CountDeleter>;
+
+struct CountType {
+  explicit CountType() = default;
+  virtual ~CountType() = default;
+
+  virtual void destructCount(CountBase& count) = 0;
+
+  virtual CountBasePtr makeCount() = 0;
+
+  virtual void traceCount(CountBase& count, JSTracer* trc) = 0;
+
+  [[nodiscard]] virtual bool count(CountBase& count,
+                                   mozilla::MallocSizeOf mallocSizeOf,
+                                   const Node& node) = 0;
+
+  [[nodiscard]] virtual bool report(JSContext* cx, CountBase& count,
+                                    MutableHandleValue report) = 0;
+};
+
+using CountTypePtr = js::UniquePtr<CountType>;
+
+class CountBase {
+  CountType& type;
+
+ protected:
+  ~CountBase() = default;
+
+ public:
+  explicit CountBase(CountType& type)
+      : type(type), total_(0), smallestNodeIdCounted_(SIZE_MAX) {}
+
+  [[nodiscard]] bool count(mozilla::MallocSizeOf mallocSizeOf,
+                           const Node& node) {
+    total_++;
+
+    auto id = node.identifier();
+    if (id < smallestNodeIdCounted_) {
+      smallestNodeIdCounted_ = id;
+    }
+
+#ifdef DEBUG
+    size_t oldTotal = total_;
+#endif
+
+    bool ret = type.count(*this, mallocSizeOf, node);
+
+    MOZ_ASSERT(total_ == oldTotal,
+               "CountType::count should not increment total_, CountBase::count "
+               "handles that");
+
+    return ret;
+  }
+
+  [[nodiscard]] bool report(JSContext* cx, MutableHandleValue report) {
+    return type.report(cx, *this, report);
+  }
+
+  void destruct() { return type.destructCount(*this); }
+
+  void trace(JSTracer* trc) { type.traceCount(*this, trc); }
+
+  size_t total_;
+
+  Node::Id smallestNodeIdCounted_;
+};
+
+using RootedCount = JS::Rooted<CountBasePtr>;
+
+struct Census {
+  JSContext* const cx;
+  JS::ZoneSet targetZones;
+
+  explicit Census(JSContext* cx) : cx(cx) {}
+};
+
+class CensusHandler {
+  Census& census;
+  JS::Handle<CountBasePtr> rootCount;
+  mozilla::MallocSizeOf mallocSizeOf;
+
+ public:
+  CensusHandler(Census& census, JS::Handle<CountBasePtr> rootCount,
+                mozilla::MallocSizeOf mallocSizeOf)
+      : census(census), rootCount(rootCount), mallocSizeOf(mallocSizeOf) {}
+
+  [[nodiscard]] bool report(JSContext* cx, MutableHandleValue report) {
+    return rootCount->report(cx, report);
+  }
+
+  class NodeData {};
+
+  [[nodiscard]] JS_PUBLIC_API bool operator()(
+      BreadthFirst<CensusHandler>& traversal, Node origin, const Edge& edge,
+      NodeData* referentData, bool first);
+};
+
+using CensusTraversal = BreadthFirst<CensusHandler>;
+
+[[nodiscard]] JS_PUBLIC_API bool ParseCensusOptions(JSContext* cx,
+                                                    Census& census,
+                                                    HandleObject options,
+                                                    CountTypePtr& outResult);
+
+JS_PUBLIC_API CountTypePtr
+ParseBreakdown(JSContext* cx, HandleValue breakdownValue,
+               MutableHandle<JS::GCVector<JSLinearString*>> seen);
+
+}  
+}  
+
+#endif  // js_UbiNodeCensus_h

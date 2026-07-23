@@ -1,0 +1,1151 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+
+const lazy = {};
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  lazy,
+  "gTabWarmingEnabled",
+  "browser.tabs.remote.warmup.enabled"
+);
+XPCOMUtils.defineLazyPreferenceGetter(
+  lazy,
+  "gTabWarmingMax",
+  "browser.tabs.remote.warmup.maxTabs"
+);
+XPCOMUtils.defineLazyPreferenceGetter(
+  lazy,
+  "gTabWarmingUnloadDelayMs",
+  "browser.tabs.remote.warmup.unloadDelayMs"
+);
+XPCOMUtils.defineLazyPreferenceGetter(
+  lazy,
+  "gTabCacheSize",
+  "browser.tabs.remote.tabCacheSize"
+);
+XPCOMUtils.defineLazyPreferenceGetter(
+  lazy,
+  "gTabUnloadDelay",
+  "browser.tabs.remote.unloadDelayMs",
+  300
+);
+
+export class AsyncTabSwitcher {
+  constructor(tabbrowser) {
+    this.log("START");
+
+    this.TAB_SWITCH_TIMEOUT = 400; 
+
+    this.UNLOAD_DELAY = lazy.gTabUnloadDelay; 
+
+
+    this.requestedTab = tabbrowser.selectedTab;
+
+    this.loadingTab = null;
+
+    this.lastVisibleTab = tabbrowser.selectedTab;
+
+
+    this.visibleTab = tabbrowser.selectedTab; 
+    this.spinnerTab = null; 
+    this.blankTab = null; 
+    this.lastPrimaryTab = tabbrowser.selectedTab; 
+
+    this.tabbrowser = tabbrowser;
+    this.window = tabbrowser.documentGlobal;
+    this.loadTimer = null; 
+    this.unloadTimer = null; 
+
+    this.tabState = new Map();
+
+    this.switchInProgress = false;
+
+    this.switchPaintId = -1;
+
+    this.maybeVisibleTabs = new Set([tabbrowser.selectedTab]);
+
+    this.warmingTabs = new WeakSet();
+
+    this.STATE_UNLOADED = 0;
+    this.STATE_LOADING = 1;
+    this.STATE_LOADED = 2;
+    this.STATE_UNLOADING = 3;
+
+    this._processing = false;
+
+    this._loadTimerClearedBy = "none";
+
+    this._useDumpForLogging = false;
+    this._logInit = false;
+    this._logFlags = [];
+
+    this.window.addEventListener("MozAfterPaint", this);
+    this.window.addEventListener("MozLayerTreeReady", this);
+    this.window.addEventListener("MozLayerTreeCleared", this);
+    this.window.addEventListener("TabRemotenessChange", this);
+    this.window.addEventListener("SwapDocShells", this, true);
+    this.window.addEventListener("EndSwapDocShells", this, true);
+    this.window.document.addEventListener("visibilitychange", this);
+
+    let initialTab = this.requestedTab;
+    let initialBrowser = initialTab.linkedBrowser;
+
+    let tabIsLoaded =
+      !initialBrowser.isRemoteBrowser ||
+      initialBrowser.frameLoader.remoteTab?.hasLayers;
+
+    initialBrowser.preserveLayers(false);
+
+    if (!this.windowHidden) {
+      this.log("Initial tab is loaded?: " + tabIsLoaded);
+      this.setTabState(
+        initialTab,
+        tabIsLoaded ? this.STATE_LOADED : this.STATE_LOADING
+      );
+    }
+
+  }
+
+  destroy() {
+    if (this.unloadTimer) {
+      this.clearTimer(this.unloadTimer);
+      this.unloadTimer = null;
+    }
+    if (this.loadTimer) {
+      this.clearTimer(this.loadTimer);
+      this.loadTimer = null;
+    }
+
+    this.window.removeEventListener("MozAfterPaint", this);
+    this.window.removeEventListener("MozLayerTreeReady", this);
+    this.window.removeEventListener("MozLayerTreeCleared", this);
+    this.window.removeEventListener("TabRemotenessChange", this);
+    this.window.removeEventListener("SwapDocShells", this, true);
+    this.window.removeEventListener("EndSwapDocShells", this, true);
+    this.window.document.removeEventListener("visibilitychange", this);
+
+    this.tabbrowser._switcher = null;
+  }
+
+  setTimer(callback, timeout) {
+    let event = {
+      notify: callback,
+    };
+
+    var timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+    timer.initWithCallback(event, timeout, Ci.nsITimer.TYPE_ONE_SHOT);
+    return timer;
+  }
+
+  clearTimer(timer) {
+    timer.cancel();
+  }
+
+  getTabState(tab) {
+    let state = this.tabState.get(tab);
+
+    if (state === undefined) {
+      state = this.STATE_UNLOADED;
+
+      if (tab && tab.linkedPanel) {
+        let b = tab.linkedBrowser;
+        if (b.renderLayers && b.hasLayers) {
+          state = this.STATE_LOADED;
+        } else if (b.renderLayers && !b.hasLayers) {
+          state = this.STATE_LOADING;
+        } else if (!b.renderLayers && b.hasLayers) {
+          state = this.STATE_UNLOADING;
+        }
+      }
+
+      this.setTabStateNoAction(tab, state);
+    }
+
+    return state;
+  }
+
+  setTabStateNoAction(tab, state) {
+    if (state == this.STATE_UNLOADED) {
+      this.tabState.delete(tab);
+    } else {
+      this.tabState.set(tab, state);
+    }
+  }
+
+  setTabState(tab, state) {
+    if (state == this.getTabState(tab)) {
+      return;
+    }
+
+    this.setTabStateNoAction(tab, state);
+
+    let browser = tab.linkedBrowser;
+    let remoteTab = browser.frameLoader?.remoteTab;
+    if (state == this.STATE_LOADING) {
+      this.assert(!this.windowHidden);
+
+      if (!this.warmingTabs.has(tab)) {
+        browser.docShellIsActive = true;
+      }
+
+      if (remoteTab) {
+        browser.renderLayers = true;
+        remoteTab.priorityHint = true;
+      }
+      if (browser.hasLayers) {
+        this.onLayersReady(browser);
+      }
+    } else if (state == this.STATE_UNLOADING) {
+      this.unwarmTab(tab);
+      browser.docShellIsActive = false;
+      if (remoteTab) {
+        remoteTab.priorityHint = false;
+      }
+      if (!browser.hasLayers) {
+        this.onLayersCleared(browser);
+      }
+    } else if (state == this.STATE_LOADED) {
+      this.maybeActivateDocShell(tab);
+    }
+
+    if (!tab.linkedBrowser.isRemoteBrowser) {
+      let nonRemoteState = this.getTabState(tab);
+      this.assert(
+        nonRemoteState == this.STATE_UNLOADED ||
+          nonRemoteState == this.STATE_LOADED
+      );
+    }
+  }
+
+  get windowHidden() {
+    return this.window.document.hidden;
+  }
+
+  get tabLayerCache() {
+    return this.tabbrowser._tabLayerCache;
+  }
+
+  finish() {
+    this.log("FINISH");
+
+    this.assert(this.tabbrowser._switcher);
+    this.assert(this.tabbrowser._switcher === this);
+    this.assert(!this.spinnerTab);
+    this.assert(!this.blankTab);
+    this.assert(!this.loadTimer);
+    this.assert(!this.loadingTab);
+    this.assert(this.lastVisibleTab === this.requestedTab);
+    this.assert(
+      this.windowHidden ||
+        this.getTabState(this.requestedTab) == this.STATE_LOADED
+    );
+
+    this.destroy();
+
+    this.window.document.commandDispatcher.unlock();
+
+    let event = new this.window.CustomEvent("TabSwitchDone", {
+      bubbles: true,
+      cancelable: true,
+    });
+    this.tabbrowser.dispatchEvent(event);
+  }
+
+  updateDisplay() {
+    let requestedTabState = this.getTabState(this.requestedTab);
+    let requestedBrowser = this.requestedTab.linkedBrowser;
+
+    let shouldBeBlank = false;
+    if (requestedBrowser.isRemoteBrowser) {
+      let isBusy = this.requestedTab.hasAttribute("busy");
+      let isLocalAbout = requestedBrowser.currentURI.schemeIs("about");
+      let hasSufficientlyLoaded = !isBusy && !isLocalAbout;
+
+      let fl = requestedBrowser.frameLoader;
+      shouldBeBlank =
+        !this.windowHidden &&
+        (!fl.remoteTab ||
+          (!hasSufficientlyLoaded && !fl.remoteTab.hasPresented));
+
+      if (this.logging()) {
+        let flag = shouldBeBlank ? "blank" : "nonblank";
+        this.addLogFlag(
+          flag,
+          this.windowHidden,
+          fl.remoteTab,
+          isBusy,
+          isLocalAbout,
+          fl.remoteTab ? fl.remoteTab.hasPresented : 0
+        );
+      }
+    }
+
+    if (requestedBrowser.isRemoteBrowser) {
+      this.addLogFlag("isRemote");
+    }
+
+    let showTab = null;
+    if (
+      requestedTabState != this.STATE_LOADED &&
+      this.lastVisibleTab &&
+      this.loadTimer &&
+      !shouldBeBlank
+    ) {
+      showTab = this.lastVisibleTab;
+    } else {
+      showTab = this.requestedTab;
+    }
+
+    if (!shouldBeBlank && this.blankTab) {
+      this.blankTab.linkedBrowser.removeAttribute("blank");
+      this.blankTab = null;
+    } else if (shouldBeBlank && this.blankTab !== showTab) {
+      if (this.blankTab) {
+        this.blankTab.linkedBrowser.removeAttribute("blank");
+      }
+      this.blankTab = showTab;
+      this.blankTab.linkedBrowser.setAttribute("blank", "true");
+    }
+
+    let needSpinner =
+      this.getTabState(showTab) != this.STATE_LOADED &&
+      !this.windowHidden &&
+      !shouldBeBlank &&
+      !this.loadTimer;
+
+    if (!needSpinner && this.spinnerTab) {
+      this.noteSpinnerHidden();
+      this.tabbrowser.tabpanels.removeAttribute("pendingpaint");
+      this.spinnerTab.linkedBrowser.removeAttribute("pendingpaint");
+      this.spinnerTab = null;
+    } else if (needSpinner && this.spinnerTab !== showTab) {
+      if (this.spinnerTab) {
+        this.spinnerTab.linkedBrowser.removeAttribute("pendingpaint");
+      } else {
+        this.noteSpinnerDisplayed();
+      }
+      this.spinnerTab = showTab;
+      this.tabbrowser.tabpanels.toggleAttribute("pendingpaint", true);
+      this.spinnerTab.linkedBrowser.toggleAttribute("pendingpaint", true);
+    }
+
+    if (this.visibleTab !== showTab) {
+      this.tabbrowser._adjustFocusBeforeTabSwitch(this.visibleTab, showTab);
+      this.visibleTab = showTab;
+
+      this.maybeVisibleTabs.add(showTab);
+
+      let tabpanels = this.tabbrowser.tabpanels;
+      let showPanel = this.tabbrowser.tabContainer.getRelatedElement(showTab);
+      let index = Array.prototype.indexOf.call(tabpanels.children, showPanel);
+      if (index != -1) {
+        this.log(`Switch to tab ${index} - ${this.tinfo(showTab)}`);
+        tabpanels.updateSelectedIndex(index);
+        if (showTab === this.requestedTab) {
+          if (requestedTabState == this.STATE_LOADED) {
+            this.switchPaintId = this.window.windowUtils.lastTransactionId + 1;
+          }
+
+          this.tabbrowser._adjustFocusAfterTabSwitch(showTab);
+          this.window.gURLBar.afterTabSwitchFocusChange();
+          this.maybeActivateDocShell(this.requestedTab);
+        }
+      }
+
+      if (this.lastVisibleTab) {
+        this.lastVisibleTab._visuallySelected = false;
+      }
+
+      this.visibleTab._visuallySelected = true;
+    }
+
+    this.lastVisibleTab = this.visibleTab;
+  }
+
+  assert(cond) {
+    if (!cond) {
+      dump("Assertion failure\n" + Error().stack);
+
+      if (AppConstants.DEBUG) {
+        throw new Error("Assertion failure");
+      }
+    }
+  }
+
+  maybeClearLoadTimer(caller) {
+    if (this.loadingTab) {
+      this._loadTimerClearedBy = caller;
+      this.loadingTab = null;
+      if (this.loadTimer) {
+        this.clearTimer(this.loadTimer);
+        this.loadTimer = null;
+      }
+    }
+  }
+
+  loadRequestedTab() {
+    this.assert(!this.loadTimer);
+    this.assert(!this.windowHidden);
+
+    this.loadingTab = this.requestedTab;
+    this.log("Loading tab " + this.tinfo(this.loadingTab));
+
+    this.loadTimer = this.setTimer(
+      () => this.handleEvent({ type: "loadTimeout" }),
+      this.TAB_SWITCH_TIMEOUT
+    );
+    this.setTabState(this.requestedTab, this.STATE_LOADING);
+  }
+
+  maybeActivateDocShell(tab) {
+    let browser = tab.linkedBrowser;
+    let state = this.getTabState(tab);
+    let canCheckDocShellState =
+      !browser.mDestroyed &&
+      (browser.docShell || browser.frameLoader.remoteTab);
+    if (
+      tab == this.requestedTab &&
+      canCheckDocShellState &&
+      state == this.STATE_LOADED &&
+      !browser.docShellIsActive &&
+      !this.windowHidden
+    ) {
+      browser.docShellIsActive = true;
+      this.logState(
+        "Set requested tab docshell to active and preserveLayers to false"
+      );
+      browser.preserveLayers(false);
+    }
+  }
+
+  preActions() {
+    this.assert(this.tabbrowser._switcher);
+    this.assert(this.tabbrowser._switcher === this);
+
+    for (let i = 0; i < this.tabLayerCache.length; i++) {
+      let tab = this.tabLayerCache[i];
+      if (!tab.linkedBrowser) {
+        this.tabState.delete(tab);
+        this.tabLayerCache.splice(i, 1);
+        i--;
+      }
+    }
+
+    for (let [tab] of this.tabState) {
+      if (!tab.linkedBrowser) {
+        this.tabState.delete(tab);
+        this.unwarmTab(tab);
+      }
+    }
+
+    if (this.lastVisibleTab && !this.lastVisibleTab.linkedBrowser) {
+      this.lastVisibleTab = null;
+    }
+    if (this.lastPrimaryTab && !this.lastPrimaryTab.linkedBrowser) {
+      this.lastPrimaryTab = null;
+    }
+    if (this.blankTab && !this.blankTab.linkedBrowser) {
+      this.blankTab = null;
+    }
+    if (this.spinnerTab && !this.spinnerTab.linkedBrowser) {
+      this.noteSpinnerHidden();
+      this.spinnerTab = null;
+    }
+    if (this.loadingTab && !this.loadingTab.linkedBrowser) {
+      this.maybeClearLoadTimer("preActions");
+    }
+  }
+
+  postActions(eventString) {
+    this.assert(
+      !this.loadingTab ||
+        this.getTabState(this.loadingTab) == this.STATE_LOADING
+    );
+
+    this.assert(!this.loadTimer || this.loadingTab);
+    this.assert(!this.loadingTab || this.loadTimer);
+
+    if (!this.requestedTab.linkedBrowser.isRemoteBrowser) {
+      this.maybeClearLoadTimer("postActions");
+    }
+
+    let stateOfRequestedTab = this.getTabState(this.requestedTab);
+    if (
+      !this.loadTimer &&
+      !this.windowHidden &&
+      (stateOfRequestedTab == this.STATE_UNLOADED ||
+        stateOfRequestedTab == this.STATE_UNLOADING ||
+        this.warmingTabs.has(this.requestedTab))
+    ) {
+      this.assert(stateOfRequestedTab != this.STATE_LOADED);
+      this.loadRequestedTab();
+    }
+
+    let numBackgroundCached = 0;
+    for (let tab of this.tabLayerCache) {
+      if (tab !== this.requestedTab) {
+        numBackgroundCached++;
+      }
+    }
+
+    let numPending = 0;
+    let numWarming = 0;
+    for (let [tab, state] of this.tabState) {
+      if (
+        state == this.STATE_LOADED &&
+        !this.shouldDeactivateDocShell(tab.linkedBrowser)
+      ) {
+        continue;
+      }
+
+      if (
+        state == this.STATE_LOADED &&
+        tab !== this.requestedTab &&
+        !this.tabLayerCache.includes(tab)
+      ) {
+        numPending++;
+
+        if (tab !== this.visibleTab) {
+          numWarming++;
+        }
+      }
+      if (state == this.STATE_LOADING || state == this.STATE_UNLOADING) {
+        numPending++;
+      }
+    }
+
+    this.updateDisplay();
+
+    if (!this.tabbrowser._switcher) {
+      return;
+    }
+
+    this.maybeFinishTabSwitch();
+
+    if (numBackgroundCached > 0) {
+      this.deactivateCachedBackgroundTabs();
+    }
+
+    if (numWarming > lazy.gTabWarmingMax) {
+      this.logState("Hit tabWarmingMax");
+      if (this.unloadTimer) {
+        this.clearTimer(this.unloadTimer);
+      }
+      this.unloadNonRequiredTabs();
+    }
+
+    if (numPending == 0) {
+      this.finish();
+    }
+
+    this.logState("/" + eventString);
+  }
+
+  onUnloadTimeout() {
+    this.unloadTimer = null;
+    this.unloadNonRequiredTabs();
+  }
+
+  deactivateCachedBackgroundTabs() {
+    for (let tab of this.tabLayerCache) {
+      if (tab !== this.requestedTab) {
+        let browser = tab.linkedBrowser;
+        browser.preserveLayers(true);
+        browser.docShellIsActive = false;
+      }
+    }
+  }
+
+  unloadNonRequiredTabs() {
+    this.warmingTabs = new WeakSet();
+    let numPending = 0;
+
+    for (let [tab, state] of this.tabState) {
+      if (!this.shouldDeactivateDocShell(tab.linkedBrowser)) {
+        continue;
+      }
+
+      let isInLayerCache = this.tabLayerCache.includes(tab);
+
+      if (
+        state == this.STATE_LOADED &&
+        !this.maybeVisibleTabs.has(tab) &&
+        tab !== this.lastVisibleTab &&
+        tab !== this.loadingTab &&
+        tab !== this.requestedTab &&
+        !isInLayerCache
+      ) {
+        this.setTabState(tab, this.STATE_UNLOADING);
+      }
+
+      if (
+        state != this.STATE_UNLOADED &&
+        tab !== this.requestedTab &&
+        !isInLayerCache
+      ) {
+        numPending++;
+      }
+    }
+
+    if (numPending) {
+      this.unloadTimer = this.setTimer(
+        () => this.handleEvent({ type: "unloadTimeout" }),
+        this.UNLOAD_DELAY
+      );
+    }
+  }
+
+  onLoadTimeout() {
+    this.maybeClearLoadTimer("onLoadTimeout");
+  }
+
+  onLayersReady(browser) {
+    let tab = this.tabbrowser.getTabForBrowser(browser);
+    if (!tab) {
+      return;
+    }
+
+    this.logState(`onLayersReady(${tab._tPos}, ${browser.isRemoteBrowser})`);
+    this.assert(
+      this.getTabState(tab) == this.STATE_LOADING ||
+        this.getTabState(tab) == this.STATE_LOADED
+    );
+    this.setTabState(tab, this.STATE_LOADED);
+    this.unwarmTab(tab);
+
+    if (this.loadingTab === tab) {
+      this.maybeClearLoadTimer("onLayersReady");
+    }
+  }
+
+  onPaint(event) {
+    this.addLogFlag(
+      "onPaint",
+      this.switchPaintId != -1,
+      event.transactionId >= this.switchPaintId
+    );
+    this.notePaint(event);
+    this.maybeVisibleTabs.clear();
+  }
+
+  onLayersCleared(browser) {
+    let tab = this.tabbrowser.getTabForBrowser(browser);
+    if (!tab) {
+      return;
+    }
+    this.logState(`onLayersCleared(${tab._tPos})`);
+    this.assert(
+      this.getTabState(tab) == this.STATE_UNLOADING ||
+        this.getTabState(tab) == this.STATE_UNLOADED
+    );
+    this.setTabState(tab, this.STATE_UNLOADED);
+  }
+
+  onRemotenessChange(tab) {
+    this.logState(
+      `onRemotenessChange(${tab._tPos}, ${tab.linkedBrowser.isRemoteBrowser})`
+    );
+    if (!tab.linkedBrowser.isRemoteBrowser) {
+      if (this.getTabState(tab) == this.STATE_LOADING) {
+        this.onLayersReady(tab.linkedBrowser);
+      } else if (this.getTabState(tab) == this.STATE_UNLOADING) {
+        this.onLayersCleared(tab.linkedBrowser);
+      }
+    } else if (this.getTabState(tab) == this.STATE_LOADED) {
+      this.setTabState(tab, this.STATE_LOADING);
+    }
+  }
+
+  onTabRemoved(tab) {
+    if (this.lastVisibleTab == tab) {
+      this.handleEvent({ type: "tabRemoved", tab });
+    }
+  }
+
+  onTabRemovedImpl() {
+    this.lastVisibleTab = null;
+  }
+
+  onVisibilityChange() {
+    if (this.windowHidden) {
+      for (let [tab, state] of this.tabState) {
+        if (!this.shouldDeactivateDocShell(tab.linkedBrowser)) {
+          continue;
+        }
+
+        if (state == this.STATE_LOADING || state == this.STATE_LOADED) {
+          this.setTabState(tab, this.STATE_UNLOADING);
+        }
+      }
+      this.maybeClearLoadTimer("onSizeModeOrOcc");
+    } else {
+      this.maybeActivateDocShell(this.tabbrowser.selectedTab);
+    }
+  }
+
+  onSwapDocShells(ourBrowser, otherBrowser) {
+
+    let otherTabbrowser = otherBrowser.documentGlobal.gBrowser;
+    let otherState;
+    if (otherTabbrowser && otherTabbrowser._switcher) {
+      let otherTab = otherTabbrowser.getTabForBrowser(otherBrowser);
+      let otherSwitcher = otherTabbrowser._switcher;
+      otherState = otherSwitcher.getTabState(otherTab);
+    } else {
+      otherState = otherBrowser.docShellIsActive
+        ? this.STATE_LOADED
+        : this.STATE_UNLOADED;
+    }
+    if (!this.swapMap) {
+      this.swapMap = new WeakMap();
+    }
+    this.swapMap.set(otherBrowser, {
+      state: otherState,
+    });
+  }
+
+  onEndSwapDocShells(ourBrowser, otherBrowser) {
+
+    this.maybeClearLoadTimer("onEndSwapDocShells");
+
+    let { state: otherState } = this.swapMap.get(otherBrowser);
+
+    this.swapMap.delete(otherBrowser);
+
+    let ourTab = this.tabbrowser.getTabForBrowser(ourBrowser);
+    if (ourTab) {
+      this.setTabStateNoAction(ourTab, otherState);
+    }
+  }
+
+  shouldDeactivateDocShell(browser) {
+    return !this.tabbrowser.splitViewBrowsers.includes(browser);
+  }
+
+  shouldActivateDocShell(browser) {
+    let tab = this.tabbrowser.getTabForBrowser(browser);
+    let state = this.getTabState(tab);
+    return state == this.STATE_LOADING || state == this.STATE_LOADED;
+  }
+
+  canWarmTab(tab) {
+    if (!lazy.gTabWarmingEnabled) {
+      return false;
+    }
+
+    if (!tab) {
+      return false;
+    }
+
+    if (
+      this.windowHidden ||
+      !tab.linkedPanel ||
+      tab.closing ||
+      !tab.linkedBrowser.isRemoteBrowser ||
+      !tab.linkedBrowser.frameLoader.remoteTab
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
+  shouldWarmTab(tab) {
+    if (this.canWarmTab(tab)) {
+      let state = this.getTabState(tab);
+      if (state === this.STATE_UNLOADING || state === this.STATE_UNLOADED) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  unwarmTab(tab) {
+    this.warmingTabs.delete(tab);
+  }
+
+  warmupTab(tab) {
+    if (!this.shouldWarmTab(tab)) {
+      return;
+    }
+
+    this.logState("warmupTab " + this.tinfo(tab));
+
+    this.warmingTabs.add(tab);
+    this.setTabState(tab, this.STATE_LOADING);
+    this.queueUnload(lazy.gTabWarmingUnloadDelayMs);
+  }
+
+  cleanUpTabAfterEviction(tab) {
+    this.assert(tab !== this.requestedTab);
+    let browser = tab.linkedBrowser;
+    if (browser) {
+      browser.preserveLayers(false);
+    }
+    this.setTabState(tab, this.STATE_UNLOADING);
+  }
+
+  evictOldestTabFromCache() {
+    let tab = this.tabLayerCache.shift();
+    this.cleanUpTabAfterEviction(tab);
+  }
+
+  maybePromoteTabInLayerCache(tab) {
+    if (
+      lazy.gTabCacheSize > 1 &&
+      tab.linkedBrowser.isRemoteBrowser &&
+      tab.linkedBrowser.currentURI.spec != "about:blank"
+    ) {
+      let tabIndex = this.tabLayerCache.indexOf(tab);
+
+      if (tabIndex != -1) {
+        this.tabLayerCache.splice(tabIndex, 1);
+      }
+
+      this.tabLayerCache.push(tab);
+
+      if (this.tabLayerCache.length > lazy.gTabCacheSize) {
+        this.evictOldestTabFromCache();
+      }
+    }
+  }
+
+  requestTab(tab) {
+    if (tab === this.requestedTab) {
+      return;
+    }
+
+    let tabState = this.getTabState(tab);
+
+    this.logState("requestTab " + this.tinfo(tab));
+    this.startTabSwitch();
+
+    let oldBrowser = this.requestedTab.linkedBrowser;
+    oldBrowser.deprioritize();
+    this.requestedTab = tab;
+    if (tabState == this.STATE_LOADED) {
+      this.maybeVisibleTabs.clear();
+      let browser = tab.linkedBrowser;
+      let remoteTab = browser.frameLoader?.remoteTab;
+      if (remoteTab) {
+        remoteTab.priorityHint = true;
+      }
+    }
+
+    tab.linkedBrowser.setAttribute("primary", "true");
+    if (this.lastPrimaryTab && this.lastPrimaryTab != tab) {
+      this.lastPrimaryTab.linkedBrowser.removeAttribute("primary");
+    }
+    this.lastPrimaryTab = tab;
+
+    this.queueUnload(this.UNLOAD_DELAY);
+  }
+
+  queueUnload(unloadTimeout) {
+    this.handleEvent({ type: "queueUnload", unloadTimeout });
+  }
+
+  onQueueUnload(unloadTimeout) {
+    if (this.unloadTimer) {
+      this.clearTimer(this.unloadTimer);
+    }
+    this.unloadTimer = this.setTimer(
+      () => this.handleEvent({ type: "unloadTimeout" }),
+      unloadTimeout
+    );
+  }
+
+  handleEvent(event, delayed = false) {
+    if (this._processing) {
+      this.setTimer(() => this.handleEvent(event, true), 0);
+      return;
+    }
+    if (delayed && this.tabbrowser._switcher != this) {
+      return;
+    }
+    this._processing = true;
+    try {
+      this.preActions();
+
+      switch (event.type) {
+        case "queueUnload":
+          this.onQueueUnload(event.unloadTimeout);
+          break;
+        case "unloadTimeout":
+          this.onUnloadTimeout();
+          break;
+        case "loadTimeout":
+          this.onLoadTimeout();
+          break;
+        case "tabRemoved":
+          this.onTabRemovedImpl(event.tab);
+          break;
+        case "MozLayerTreeReady": {
+          let browser = event.originalTarget;
+          if (!browser.renderLayers) {
+            return;
+          }
+          this.onLayersReady(browser);
+          break;
+        }
+        case "MozAfterPaint":
+          this.onPaint(event);
+          break;
+        case "MozLayerTreeCleared": {
+          let browser = event.originalTarget;
+          if (browser.renderLayers) {
+            return;
+          }
+          this.onLayersCleared(browser);
+          break;
+        }
+        case "TabRemotenessChange":
+          this.onRemotenessChange(event.target);
+          break;
+        case "visibilitychange":
+          this.onVisibilityChange();
+          break;
+        case "SwapDocShells":
+          this.onSwapDocShells(event.originalTarget, event.detail);
+          break;
+        case "EndSwapDocShells":
+          this.onEndSwapDocShells(event.originalTarget, event.detail);
+          break;
+      }
+
+      this.postActions(event.type);
+    } finally {
+      this._processing = false;
+    }
+  }
+
+
+  startTabSwitch() {
+    this.noteStartTabSwitch();
+    this.switchInProgress = true;
+  }
+
+  maybeFinishTabSwitch() {
+    if (
+      this.switchInProgress &&
+      this.requestedTab &&
+      (this.getTabState(this.requestedTab) == this.STATE_LOADED ||
+        this.requestedTab === this.blankTab)
+    ) {
+      if (this.requestedTab !== this.blankTab) {
+        this.maybePromoteTabInLayerCache(this.requestedTab);
+      }
+
+      this.noteFinishTabSwitch();
+      this.switchInProgress = false;
+
+      let event = new this.window.CustomEvent("TabSwitched", {
+        bubbles: true,
+        detail: {
+          tab: this.requestedTab,
+        },
+      });
+      this.tabbrowser.dispatchEvent(event);
+    }
+  }
+
+  logging() {
+    if (this._useDumpForLogging) {
+      return true;
+    }
+    if (this._logInit) {
+      return this._shouldLog;
+    }
+    let result = Services.prefs.getBoolPref(
+      "browser.tabs.remote.logSwitchTiming",
+      false
+    );
+    this._shouldLog = result;
+    this._logInit = true;
+    return this._shouldLog;
+  }
+
+  tinfo(tab) {
+    if (tab) {
+      return tab._tPos + "(" + tab.linkedBrowser.currentURI.spec + ")";
+    }
+    return "null";
+  }
+
+  log(s) {
+    if (!this.logging()) {
+      return;
+    }
+    if (this._useDumpForLogging) {
+      dump(s + "\n");
+    } else {
+      Services.console.logStringMessage(s);
+    }
+  }
+
+  addLogFlag(flag, ...subFlags) {
+    if (this.logging()) {
+      if (subFlags.length) {
+        flag += `(${subFlags.map(f => (f ? 1 : 0)).join("")})`;
+      }
+      this._logFlags.push(flag);
+    }
+  }
+
+  logState(suffix) {
+    if (!this.logging()) {
+      return;
+    }
+
+    let getTabString = tab => {
+      let tabString = "";
+
+      let state = this.getTabState(tab);
+      let isWarming = this.warmingTabs.has(tab);
+      let isCached = this.tabLayerCache.includes(tab);
+      let isClosing = tab.closing;
+      let linkedBrowser = tab.linkedBrowser;
+      let isActive = linkedBrowser && linkedBrowser.docShellIsActive;
+      let isRendered = linkedBrowser && linkedBrowser.renderLayers;
+      if (tab === this.lastVisibleTab) {
+        tabString += "V";
+      }
+      if (tab === this.loadingTab) {
+        tabString += "L";
+      }
+      if (tab === this.requestedTab) {
+        tabString += "R";
+      }
+      if (tab === this.blankTab) {
+        tabString += "B";
+      }
+      if (this.maybeVisibleTabs.has(tab)) {
+        tabString += "M";
+      }
+
+      let extraStates = "";
+      if (isWarming) {
+        extraStates += "W";
+      }
+      if (isCached) {
+        extraStates += "C";
+      }
+      if (isClosing) {
+        extraStates += "X";
+      }
+      if (isActive) {
+        extraStates += "A";
+      }
+      if (isRendered) {
+        extraStates += "R";
+      }
+      if (extraStates != "") {
+        tabString += `(${extraStates})`;
+      }
+
+      switch (state) {
+        case this.STATE_LOADED: {
+          tabString += "(loaded)";
+          break;
+        }
+        case this.STATE_LOADING: {
+          tabString += "(loading)";
+          break;
+        }
+        case this.STATE_UNLOADING: {
+          tabString += "(unloading)";
+          break;
+        }
+        case this.STATE_UNLOADED: {
+          tabString += "(unloaded)";
+          break;
+        }
+      }
+
+      return tabString;
+    };
+
+    let accum = "";
+
+    let tabStrings = this.tabbrowser.tabs.map(t => getTabString(t));
+    let lastMatch = -1;
+    let unloadedTabsStrings = [];
+    for (let i = 0; i <= tabStrings.length; i++) {
+      if (i > 0) {
+        if (i < tabStrings.length && tabStrings[i] == tabStrings[lastMatch]) {
+          continue;
+        }
+
+        if (tabStrings[lastMatch] == "(unloaded)") {
+          if (lastMatch == i - 1) {
+            unloadedTabsStrings.push(lastMatch.toString());
+          } else {
+            unloadedTabsStrings.push(`${lastMatch}...${i - 1}`);
+          }
+        } else if (lastMatch == i - 1) {
+          accum += `${lastMatch}:${tabStrings[lastMatch]} `;
+        } else {
+          accum += `${lastMatch}...${i - 1}:${tabStrings[lastMatch]} `;
+        }
+      }
+
+      lastMatch = i;
+    }
+
+    if (unloadedTabsStrings.length) {
+      accum += `${unloadedTabsStrings.join(",")}:(unloaded) `;
+    }
+
+    accum += "cached: " + this.tabLayerCache.length + " ";
+
+    if (this._logFlags.length) {
+      accum += `[${this._logFlags.join(",")}] `;
+      this._logFlags = [];
+    }
+
+    let logString;
+    if (this._lastLogString == accum) {
+      accum = "unchanged";
+    } else {
+      this._lastLogString = accum;
+    }
+    logString = `ATS: ${accum}{${suffix}}`;
+
+    if (this._useDumpForLogging) {
+      dump(logString + "\n");
+    } else {
+      Services.console.logStringMessage(logString);
+    }
+  }
+
+  notePaint(event) {
+    if (this.switchPaintId != -1 && event.transactionId >= this.switchPaintId) {
+      this.switchPaintId = -1;
+    }
+  }
+
+  noteStartTabSwitch() {}
+
+  noteFinishTabSwitch() {
+  }
+
+  noteSpinnerDisplayed() {
+    this.assert(!this.spinnerTab);
+    let browser = this.requestedTab.linkedBrowser;
+    this.assert(browser.isRemoteBrowser);
+    if (AppConstants.NIGHTLY_BUILD) {
+      Services.obs.notifyObservers(null, "tabswitch-spinner");
+    }
+  }
+
+  noteSpinnerHidden() {
+    this.assert(this.spinnerTab);
+    this.log("DEBUG: spinner hidden");
+    this._loadTimerClearedBy = "none";
+  }
+}

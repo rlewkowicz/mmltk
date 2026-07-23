@@ -1,0 +1,267 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+* Copyright (C) 2015, International Business Machines Corporation and
+* others. All Rights Reserved.
+******************************************************************************
+*
+* File UNIFIEDCACHE.H - The ICU Unified cache.
+******************************************************************************
+*/
+
+#ifndef __UNIFIED_CACHE_H__
+#define __UNIFIED_CACHE_H__
+
+#include "utypeinfo.h"  // for 'typeid' to work
+
+#include "unicode/uobject.h"
+#include "unicode/locid.h"
+#include "sharedobject.h"
+#include "unicode/unistr.h"
+#include "cstring.h"
+#include "ustr_imp.h"
+
+struct UHashtable;
+struct UHashElement;
+
+U_NAMESPACE_BEGIN
+
+class UnifiedCache;
+
+class U_COMMON_API CacheKeyBase : public UObject {
+ public:
+   CacheKeyBase() : fCreationStatus(U_ZERO_ERROR), fIsPrimary(false) {}
+
+   CacheKeyBase(const CacheKeyBase &other) 
+           : UObject(other), fCreationStatus(other.fCreationStatus), fIsPrimary(false) { }
+   virtual ~CacheKeyBase();
+
+   virtual int32_t hashCode() const = 0;
+
+   virtual CacheKeyBase *clone() const = 0;
+
+   virtual const SharedObject *createObject(
+           const void *creationContext, UErrorCode &status) const = 0;
+
+   virtual char *writeDescription(char *buffer, int32_t bufSize) const = 0;
+
+   friend inline bool operator==(const CacheKeyBase& lhs,
+                                 const CacheKeyBase& rhs) {
+       return lhs.equals(rhs);
+   }
+
+   friend inline bool operator!=(const CacheKeyBase& lhs,
+                                 const CacheKeyBase& rhs) {
+       return !lhs.equals(rhs);
+   }
+
+ protected:
+   virtual bool equals(const CacheKeyBase& other) const = 0;
+
+ private:
+   mutable UErrorCode fCreationStatus;
+   mutable UBool fIsPrimary;
+   friend class UnifiedCache;
+};
+
+
+
+template<typename T>
+class CacheKey : public CacheKeyBase {
+ public:
+   virtual ~CacheKey() { }
+   virtual int32_t hashCode() const override {
+       const char *s = typeid(T).name();
+       return ustr_hashCharsN(s, static_cast<int32_t>(uprv_strlen(s)));
+   }
+
+   virtual char *writeDescription(char *buffer, int32_t bufLen) const override {
+       const char *s = typeid(T).name();
+       uprv_strncpy(buffer, s, bufLen);
+       buffer[bufLen - 1] = 0;
+       return buffer;
+   }
+
+ protected:
+   virtual bool equals(const CacheKeyBase &other) const override {
+       return this == &other || typeid(*this) == typeid(other);
+   }
+};
+
+template<typename T>
+class LocaleCacheKey : public CacheKey<T> {
+ protected:
+   Locale   fLoc;
+   virtual bool equals(const CacheKeyBase &other) const override {
+       if (!CacheKey<T>::equals(other)) {
+           return false;
+       }
+       return operator==(static_cast<const LocaleCacheKey<T> &>(other));
+   }
+ public:
+   LocaleCacheKey(const Locale &loc) : fLoc(loc) {}
+   LocaleCacheKey(const LocaleCacheKey<T> &other)
+           : CacheKey<T>(other), fLoc(other.fLoc) { }
+   virtual ~LocaleCacheKey() { }
+   virtual int32_t hashCode() const override {
+       return (int32_t)(37u * (uint32_t)CacheKey<T>::hashCode() + (uint32_t)fLoc.hashCode());
+   }
+   inline bool operator == (const LocaleCacheKey<T> &other) const {
+       return fLoc == other.fLoc;
+   }
+   virtual CacheKeyBase *clone() const override {
+       return new LocaleCacheKey<T>(*this);
+   }
+   virtual const T *createObject(
+           const void *creationContext, UErrorCode &status) const override;
+   virtual char *writeDescription(char *buffer, int32_t bufLen) const override {
+       const char *s = fLoc.getName();
+       uprv_strncpy(buffer, s, bufLen);
+       buffer[bufLen - 1] = 0;
+       return buffer;
+   }
+
+};
+
+class U_COMMON_API UnifiedCache : public UnifiedCacheBase {
+ public:
+   UnifiedCache(UErrorCode &status);
+
+   static UnifiedCache *getInstance(UErrorCode &status);
+
+   template<typename T>
+   void get(
+           const CacheKey<T>& key,
+           const T *&ptr,
+           UErrorCode &status) const {
+       get(key, nullptr, ptr, status);
+   }
+
+   template<typename T>
+   void get(
+           const CacheKey<T>& key,
+           const void *creationContext,
+           const T *&ptr,
+           UErrorCode &status) const {
+       if (U_FAILURE(status)) {
+           return;
+       }
+       UErrorCode creationStatus = U_ZERO_ERROR;
+       const SharedObject *value = nullptr;
+       _get(key, value, creationContext, creationStatus);
+       const T *tvalue = (const T *) value;
+       if (U_SUCCESS(creationStatus)) {
+           SharedObject::copyPtr(tvalue, ptr);
+       }
+       SharedObject::clearPtr(tvalue);
+       if (status == U_ZERO_ERROR || U_FAILURE(creationStatus)) {
+           status = creationStatus;
+       }
+   }
+
+#ifdef UNIFIED_CACHE_DEBUG
+   void dumpContents() const;
+#endif
+
+   template<typename T>
+   static void getByLocale(
+           const Locale &loc, const T *&ptr, UErrorCode &status) {
+       const UnifiedCache *cache = getInstance(status);
+       if (U_FAILURE(status)) {
+           return;
+       }
+       cache->get(LocaleCacheKey<T>(loc), ptr, status);
+   }
+
+#ifdef UNIFIED_CACHE_DEBUG
+   static void dump();
+#endif
+
+   int32_t keyCount() const;
+
+   void flush() const;
+
+   void setEvictionPolicy(
+           int32_t count, int32_t percentageOfInUseItems, UErrorCode &status);
+
+
+   int64_t autoEvictedCount() const;
+
+   int32_t unusedCount() const;
+
+   virtual void handleUnreferencedObject() const override;
+   virtual ~UnifiedCache();
+   
+ private:
+   UHashtable *fHashtable;
+   mutable int32_t fEvictPos;
+   mutable int32_t fNumValuesTotal;
+   mutable int32_t fNumValuesInUse;
+   int32_t fMaxUnused;
+   int32_t fMaxPercentageOfInUse;
+   mutable int64_t fAutoEvictedCount;
+   SharedObject *fNoValue;
+   
+   UnifiedCache(const UnifiedCache &other) = delete;
+   UnifiedCache &operator=(const UnifiedCache &other) = delete;
+   
+   UBool _flush(UBool all) const;
+   
+   void _get(
+           const CacheKeyBase &key,
+           const SharedObject *&value,
+           const void *creationContext,
+           UErrorCode &status) const;
+
+    UBool _poll(
+            const CacheKeyBase &key,
+            const SharedObject *&value,
+            UErrorCode &status) const;
+    
+    void _putNew(
+        const CacheKeyBase &key,
+        const SharedObject *value,
+        const UErrorCode creationStatus,
+        UErrorCode &status) const;
+           
+   void _putIfAbsentAndGet(
+           const CacheKeyBase &key,
+           const SharedObject *&value,
+           UErrorCode &status) const;
+
+    const UHashElement *_nextElement() const;
+   
+   int32_t _computeCountOfItemsToEvict() const;
+   
+   void _runEvictionSlice() const;
+ 
+   void _registerPrimary(const CacheKeyBase *theKey, const SharedObject *value) const;
+        
+   void _put(
+           const UHashElement *element,
+           const SharedObject *value,
+           const UErrorCode status) const;
+   void removeSoftRef(const SharedObject *value) const;
+   
+   int32_t addHardRef(const SharedObject *value) const;
+   
+   int32_t removeHardRef(const SharedObject *value) const;
+
+   
+#ifdef UNIFIED_CACHE_DEBUG
+   void _dumpContents() const;
+#endif
+   
+   void _fetch(const UHashElement *element, const SharedObject *&value,
+                       UErrorCode &status) const;
+                       
+   UBool _inProgress(const UHashElement *element) const;
+   
+   UBool _inProgress(const SharedObject *theValue, UErrorCode creationStatus) const;
+   
+   UBool _isEvictable(const UHashElement *element) const;
+};
+
+U_NAMESPACE_END
+
+#endif

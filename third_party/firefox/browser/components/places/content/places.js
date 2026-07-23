@@ -1,0 +1,1268 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+var { XPCOMUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/XPCOMUtils.sys.mjs"
+);
+ChromeUtils.defineESModuleGetters(this, {
+  BookmarkJSONUtils: "resource://gre/modules/BookmarkJSONUtils.sys.mjs",
+  MigrationUtils: "resource:///modules/MigrationUtils.sys.mjs",
+  PlacesBackups: "resource://gre/modules/PlacesBackups.sys.mjs",
+  PrivateBrowsingUtils: "resource://gre/modules/PrivateBrowsingUtils.sys.mjs",
+  DownloadUtils: "resource://gre/modules/DownloadUtils.sys.mjs",
+});
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "PlacesTreeView",
+  "chrome://browser/content/places/treeView.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  ["PlacesInsertionPoint", "PlacesController", "PlacesControllerDragHelper"],
+  "chrome://browser/content/places/controller.js"
+);
+
+var { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+
+const RESTORE_FILEPICKER_FILTER_EXT = "*.json;*.jsonlz4";
+
+const SORTBY_L10N_IDS = new Map([
+  ["title", "places-view-sortby-name"],
+  ["url", "places-view-sortby-url"],
+  ["date", "places-view-sortby-date"],
+  ["visitCount", "places-view-sortby-visit-count"],
+  ["dateAdded", "places-view-sortby-date-added"],
+  ["lastModified", "places-view-sortby-last-modified"],
+  ["tags", "places-view-sortby-tags"],
+]);
+
+var PlacesOrganizer = {
+  _places: null,
+
+  _initFolderTree() {
+    this._places.place = `place:type=${Ci.nsINavHistoryQueryOptions.RESULTS_AS_LEFT_PANE_QUERY}&excludeItems=1&expandQueries=0`;
+  },
+
+  selectLeftPaneBuiltIn(item) {
+    switch (item) {
+      case "AllBookmarks":
+        this._places.selectItems([PlacesUtils.virtualAllBookmarksGuid]);
+        PlacesUtils.asContainer(this._places.selectedNode).containerOpen = true;
+        break;
+      case "History":
+        this._places.selectItems([PlacesUtils.virtualHistoryGuid]);
+        PlacesUtils.asContainer(this._places.selectedNode).containerOpen = true;
+        break;
+      case "Downloads":
+        this._places.selectItems([PlacesUtils.virtualDownloadsGuid]);
+        break;
+      case "Tags":
+        this._places.selectItems([PlacesUtils.virtualTagsGuid]);
+        break;
+      case "BookmarksMenu":
+        this.selectLeftPaneContainerByHierarchy([
+          PlacesUtils.virtualAllBookmarksGuid,
+          PlacesUtils.bookmarks.virtualMenuGuid,
+        ]);
+        break;
+      case "BookmarksToolbar":
+        this.selectLeftPaneContainerByHierarchy([
+          PlacesUtils.virtualAllBookmarksGuid,
+          PlacesUtils.bookmarks.virtualToolbarGuid,
+        ]);
+        break;
+      case "UnfiledBookmarks":
+        this.selectLeftPaneContainerByHierarchy([
+          PlacesUtils.virtualAllBookmarksGuid,
+          PlacesUtils.bookmarks.virtualUnfiledGuid,
+        ]);
+        break;
+      default:
+        throw new Error(
+          `Unrecognized item ${item} passed to selectLeftPaneRootItem`
+        );
+    }
+  },
+
+  selectLeftPaneContainerByHierarchy(aHierarchy) {
+    if (!aHierarchy) {
+      throw new Error("Containers hierarchy not specified");
+    }
+    let hierarchy = [].concat(aHierarchy);
+    let selectWasSuppressed =
+      this._places.view.selection.selectEventsSuppressed;
+    if (!selectWasSuppressed) {
+      this._places.view.selection.selectEventsSuppressed = true;
+    }
+    try {
+      for (let container of hierarchy) {
+        if (typeof container != "string") {
+          throw new Error("Invalid container type found: " + container);
+        }
+
+        try {
+          this.selectLeftPaneBuiltIn(container);
+        } catch (ex) {
+          if (container.substr(0, 6) == "place:") {
+            this._places.selectPlaceURI(container);
+          } else {
+            this._places.selectItems([container], false);
+          }
+        }
+        PlacesUtils.asContainer(this._places.selectedNode).containerOpen = true;
+      }
+    } finally {
+      if (!selectWasSuppressed) {
+        this._places.view.selection.selectEventsSuppressed = false;
+      }
+    }
+  },
+
+  init: function PO_init() {
+    const DOWNLOADS_QUERY =
+      "place:transition=" +
+      Ci.nsINavHistoryService.TRANSITION_DOWNLOAD +
+      "&sort=" +
+      Ci.nsINavHistoryQueryOptions.SORT_BY_DATE_DESCENDING;
+
+    ContentArea.setContentViewForQueryString(
+      DOWNLOADS_QUERY,
+      () =>
+        new DownloadsPlacesView(
+          document.getElementById("downloadsListBox"),
+          false
+        ),
+      {
+        showDetailsPane: false,
+        toolbarSet:
+          "back-button, forward-button, organizeButton, clearDownloadsButton, libraryToolbarSpacer, searchFilter",
+      }
+    );
+
+    ContentArea.init();
+
+    this._places = document.getElementById("placesList");
+    this._places.addEventListener("select", () => this.onPlaceSelected(true));
+    this._places.addEventListener("click", event =>
+      this.onPlacesListClick(event)
+    );
+    this._places.addEventListener("focus", event =>
+      this.updateDetailsPane(event)
+    );
+
+    this._initFolderTree();
+
+    var leftPaneSelection = "AllBookmarks"; 
+    if (window.arguments && window.arguments[0]) {
+      leftPaneSelection = window.arguments[0];
+    }
+
+    this.selectLeftPaneContainerByHierarchy(leftPaneSelection);
+    if (leftPaneSelection === "History") {
+      let historyNode = this._places.selectedNode;
+      if (historyNode.childCount > 0) {
+        this._places.selectNode(historyNode.getChild(0));
+      }
+    } else {
+    }
+
+    this._backHistory.splice(0, this._backHistory.length);
+    document
+      .getElementById("OrganizerCommand:Back")
+      .setAttribute("disabled", true);
+
+    PlacesSearchBox.init();
+    ViewMenu.init();
+
+    window.addEventListener("AppCommand", this, true);
+    document.addEventListener("command", this);
+
+    let placeContentElement = document.getElementById("placeContent");
+    placeContentElement.addEventListener("onOpenFlatContainer", event =>
+      this.openFlatContainer(event.detail)
+    );
+    placeContentElement.addEventListener("focus", event =>
+      this.updateDetailsPane(event)
+    );
+    placeContentElement.addEventListener("select", event =>
+      this.updateDetailsPane(event)
+    );
+
+    if (AppConstants.platform === "macosx") {
+      let findMenuItem = document.getElementById("menu_find");
+      findMenuItem.setAttribute("command", "OrganizerCommand_find:all");
+      let findKey = document.getElementById("key_find");
+      findKey.setAttribute("command", "OrganizerCommand_find:all");
+
+      let elements = ["cmd_handleBackspace", "cmd_handleShiftBackspace"];
+      for (let i = 0; i < elements.length; i++) {
+        document.getElementById(elements[i]).setAttribute("disabled", "true");
+      }
+
+      document
+        .getElementById("organizeButton")
+        .addEventListener("popupshowing", () => {
+          document.getElementById("placeContent").focus();
+        });
+    }
+
+    let contextMenu = document.getElementById("placesContext");
+    contextMenu.removeChild(document.getElementById("placesContext_show:info"));
+    contextMenu.removeChild(
+      document.getElementById("placesContext_show_bookmark:info")
+    );
+    contextMenu.removeChild(
+      document.getElementById("placesContext_show_folder:info")
+    );
+    let columnsContextPopup = document.getElementById("placesColumnsContext");
+    columnsContextPopup.addEventListener("command", event => {
+      ViewMenu.showHideColumn(event.target);
+      event.stopPropagation();
+    });
+    columnsContextPopup.addEventListener("popupshowing", event =>
+      ViewMenu.fillWithColumns(event, null, null, "checkbox", false)
+    );
+
+    document
+      .getElementById("fileRestorePopup")
+      .addEventListener("popupshowing", () => this.populateRestoreMenu());
+
+    ContentArea.focus();
+  },
+
+  QueryInterface: ChromeUtils.generateQI([]),
+
+  handleEvent: function PO_handleEvent(event) {
+    switch (event.type) {
+      case "load":
+        this.init();
+        break;
+      case "unload":
+        this.destroy();
+        break;
+      case "command":
+        switch (event.target.id) {
+          case "OrganizerCommand_find:all":
+            PlacesSearchBox.findAll();
+            break;
+          case "OrganizerCommand_export":
+            this.exportBookmarks();
+            break;
+          case "OrganizerCommand_import":
+            this.importFromFile();
+            break;
+          case "OrganizerCommand_browserImport":
+            this.importFromBrowser();
+            break;
+          case "OrganizerCommand_backup":
+            this.backupBookmarks();
+            break;
+          case "OrganizerCommand_restoreFromFile":
+            this.onRestoreBookmarksFromFile();
+            break;
+          case "OrganizerCommand_search:save":
+            this.saveSearch();
+            break;
+          case "OrganizerCommand_search:moreCriteria":
+            PlacesQueryBuilder.addRow();
+            break;
+          case "OrganizerCommand:Back":
+            this.back();
+            break;
+          case "OrganizerCommand:Forward":
+            this.forward();
+            break;
+          case "OrganizerCommand:CloseWindow":
+            window.close();
+            break;
+        }
+        break;
+      case "AppCommand":
+        event.stopPropagation();
+        switch (event.command) {
+          case "Back":
+            if (this._backHistory.length) {
+              this.back();
+            }
+            break;
+          case "Forward":
+            if (this._forwardHistory.length) {
+              this.forward();
+            }
+            break;
+          case "Search":
+            PlacesSearchBox.findAll();
+            break;
+        }
+        break;
+    }
+  },
+
+  destroy: function PO_destroy() {},
+
+  _location: null,
+  get location() {
+    return this._location;
+  },
+
+  set location(aLocation) {
+    if (!aLocation || this._location == aLocation) {
+      return;
+    }
+
+    if (this.location) {
+      this._backHistory.unshift(this.location);
+      this._forwardHistory.splice(0, this._forwardHistory.length);
+    }
+
+    this._location = aLocation;
+    this._places.selectPlaceURI(aLocation);
+
+    if (!this._places.hasSelection) {
+      ContentArea.currentPlace = aLocation;
+    }
+    this.updateDetailsPane();
+
+    if (!this._backHistory.length) {
+      document
+        .getElementById("OrganizerCommand:Back")
+        .setAttribute("disabled", true);
+    } else {
+      document
+        .getElementById("OrganizerCommand:Back")
+        .removeAttribute("disabled");
+    }
+    if (!this._forwardHistory.length) {
+      document
+        .getElementById("OrganizerCommand:Forward")
+        .setAttribute("disabled", true);
+    } else {
+      document
+        .getElementById("OrganizerCommand:Forward")
+        .removeAttribute("disabled");
+    }
+  },
+
+  _backHistory: [],
+  _forwardHistory: [],
+
+  back: function PO_back() {
+    this._forwardHistory.unshift(this.location);
+    var historyEntry = this._backHistory.shift();
+    this._location = null;
+    this.location = historyEntry;
+  },
+  forward: function PO_forward() {
+    this._backHistory.unshift(this.location);
+    var historyEntry = this._forwardHistory.shift();
+    this._location = null;
+    this.location = historyEntry;
+  },
+
+  _cachedLeftPaneSelectedURI: null,
+  onPlaceSelected: function PO_onPlaceSelected(resetSearchBox) {
+    if (!this._places.hasSelection) {
+      return;
+    }
+
+    let node = this._places.selectedNode;
+    let placeURI = node.uri;
+
+    if (ContentArea.currentPlace != placeURI || !resetSearchBox) {
+      ContentArea.currentPlace = placeURI;
+      this.location = placeURI;
+    }
+
+    if (placeURI == this._cachedLeftPaneSelectedURI) {
+      return;
+    }
+    this._cachedLeftPaneSelectedURI = placeURI;
+
+
+    let input = PlacesSearchBox.searchFilter;
+    input.clear();
+    input.editor?.clearUndoRedo();
+    this._setSearchScopeForNode(node);
+    this.updateDetailsPane();
+  },
+
+  _setSearchScopeForNode: function PO__setScopeForNode(aNode) {
+    let itemGuid = aNode.bookmarkGuid;
+
+    if (
+      PlacesUtils.nodeIsHistoryContainer(aNode) ||
+      itemGuid == PlacesUtils.virtualHistoryGuid
+    ) {
+      PlacesQueryBuilder.setScope("history");
+    } else if (itemGuid == PlacesUtils.virtualDownloadsGuid) {
+      PlacesQueryBuilder.setScope("downloads");
+    } else {
+      PlacesQueryBuilder.setScope("bookmarks");
+    }
+  },
+
+  onPlacesListClick: function PO_onPlacesListClick(aEvent) {
+    if (aEvent.target.localName != "treechildren") {
+      return;
+    }
+
+    let node = this._places.selectedNode;
+    if (node) {
+      let middleClick = aEvent.button == 1 && aEvent.detail == 1;
+      if (middleClick && PlacesUtils.nodeIsContainer(node)) {
+        PlacesUIUtils.openMultipleLinksInTabs(node, aEvent, this._places);
+      }
+    }
+  },
+
+  updateDetailsPane: function PO_updateDetailsPane() {
+    if (!ContentArea.currentViewOptions.showDetailsPane) {
+      return;
+    }
+    let view = PlacesUIUtils.getViewForNode(document.activeElement);
+    if (view) {
+      let selectedNodes = view.selectedNode
+        ? [view.selectedNode]
+        : view.selectedNodes;
+      this._fillDetailsPane(selectedNodes);
+    }
+  },
+
+  openFlatContainer(aContainer) {
+    if (aContainer.bookmarkGuid) {
+      PlacesUtils.asContainer(this._places.selectedNode).containerOpen = true;
+      this._places.selectItems([aContainer.bookmarkGuid], false);
+    } else if (PlacesUtils.nodeIsQuery(aContainer)) {
+      this._places.selectPlaceURI(aContainer.uri);
+    }
+  },
+
+  getCurrentOptions: function PO_getCurrentOptions() {
+    return PlacesUtils.asQuery(ContentArea.currentView.result.root)
+      .queryOptions;
+  },
+
+  importFromBrowser: function PO_importFromBrowser() {
+    MigrationUtils.showMigrationWizard(window, {
+      entrypoint: MigrationUtils.MIGRATION_ENTRYPOINTS.PLACES,
+    });
+  },
+
+  importFromFile: function PO_importFromFile() {
+    let fp = Cc["@mozilla.org/filepicker;1"].createInstance(Ci.nsIFilePicker);
+    let fpCallback = function fpCallback_done(aResult) {
+      if (aResult != Ci.nsIFilePicker.returnCancel && fp.fileURL) {
+        var { BookmarkHTMLUtils } = ChromeUtils.importESModule(
+          "resource://gre/modules/BookmarkHTMLUtils.sys.mjs"
+        );
+        BookmarkHTMLUtils.importFromURL(fp.fileURL.spec).catch(console.error);
+      }
+    };
+
+    fp.init(
+      window.browsingContext,
+      PlacesUIUtils.promptLocalization.formatValueSync(
+        "places-bookmarks-import"
+      ),
+      Ci.nsIFilePicker.modeOpen
+    );
+    fp.appendFilters(Ci.nsIFilePicker.filterHTML);
+    fp.open(fpCallback);
+  },
+
+  exportBookmarks: function PO_exportBookmarks() {
+    let fp = Cc["@mozilla.org/filepicker;1"].createInstance(Ci.nsIFilePicker);
+    let fpCallback = function fpCallback_done(aResult) {
+      if (aResult != Ci.nsIFilePicker.returnCancel) {
+        var { BookmarkHTMLUtils } = ChromeUtils.importESModule(
+          "resource://gre/modules/BookmarkHTMLUtils.sys.mjs"
+        );
+        BookmarkHTMLUtils.exportToFile(fp.file.path).catch(console.error);
+      }
+    };
+
+    fp.init(
+      window.browsingContext,
+      PlacesUIUtils.promptLocalization.formatValueSync(
+        "places-bookmarks-export"
+      ),
+      Ci.nsIFilePicker.modeSave
+    );
+    fp.appendFilters(Ci.nsIFilePicker.filterHTML);
+    fp.defaultString = "bookmarks.html";
+    fp.open(fpCallback);
+  },
+
+  populateRestoreMenu: function PO_populateRestoreMenu() {
+    let restorePopup = document.getElementById("fileRestorePopup");
+
+    const dtOptions = {
+      dateStyle: "long",
+    };
+    let dateFormatter = new Services.intl.DateTimeFormat(undefined, dtOptions);
+
+    while (restorePopup.childNodes.length > 1) {
+      restorePopup.firstChild.remove();
+    }
+
+    (async () => {
+      let backupFiles = await PlacesBackups.getBackupFiles();
+      if (!backupFiles.length) {
+        return;
+      }
+
+      for (let file of backupFiles) {
+        let fileSize = (await IOUtils.stat(file)).size;
+        let [size, unit] = DownloadUtils.convertByteUnits(fileSize);
+        let sizeString = PlacesUtils.getFormattedString("backupFileSizeText", [
+          size,
+          unit,
+        ]);
+
+        let countString;
+        let count = PlacesBackups.getBookmarkCountForFile(file);
+        if (count != null) {
+          const [msg] = await document.l10n.formatMessages([
+            { id: "places-details-pane-items-count", args: { count } },
+          ]);
+          countString = msg.attributes.find(
+            attr => attr.name === "value"
+          )?.value;
+        }
+
+        const backupDate = PlacesBackups.getDateForFile(file);
+        let label = dateFormatter.format(backupDate);
+        label += countString
+          ? ` (${sizeString} - ${countString})`
+          : ` (${sizeString})`;
+
+        let m = restorePopup.insertBefore(
+          document.createXULElement("menuitem"),
+          document.getElementById("restoreFromFile")
+        );
+        m.setAttribute("label", label);
+        m.setAttribute("value", PathUtils.filename(file));
+        m.addEventListener("command", () => this.onRestoreMenuItemClick(m));
+      }
+
+      restorePopup.insertBefore(
+        document.createXULElement("menuseparator"),
+        document.getElementById("restoreFromFile")
+      );
+    })();
+  },
+
+  async onRestoreMenuItemClick(aMenuItem) {
+    let backupName = aMenuItem.getAttribute("value");
+    let backupFilePaths = await PlacesBackups.getBackupFiles();
+    for (let backupFilePath of backupFilePaths) {
+      if (PathUtils.filename(backupFilePath) == backupName) {
+        PlacesOrganizer.restoreBookmarksFromFile(backupFilePath);
+        break;
+      }
+    }
+  },
+
+  onRestoreBookmarksFromFile: function PO_onRestoreBookmarksFromFile() {
+    let backupsDir = Services.dirsvc.get("Desk", Ci.nsIFile);
+    let fp = Cc["@mozilla.org/filepicker;1"].createInstance(Ci.nsIFilePicker);
+    let fpCallback = aResult => {
+      if (aResult != Ci.nsIFilePicker.returnCancel) {
+        this.restoreBookmarksFromFile(fp.file.path);
+      }
+    };
+
+    const [title, filterName] =
+      PlacesUIUtils.promptLocalization.formatValuesSync([
+        "places-bookmarks-restore-title",
+        "places-bookmarks-restore-filter-name",
+      ]);
+    fp.init(window.browsingContext, title, Ci.nsIFilePicker.modeOpen);
+    fp.appendFilter(filterName, RESTORE_FILEPICKER_FILTER_EXT);
+    fp.appendFilters(Ci.nsIFilePicker.filterAll);
+    fp.displayDirectory = backupsDir;
+    fp.open(fpCallback);
+  },
+
+  restoreBookmarksFromFile: function PO_restoreBookmarksFromFile(aFilePath) {
+    if (
+      !aFilePath.toLowerCase().endsWith("json") &&
+      !aFilePath.toLowerCase().endsWith("jsonlz4")
+    ) {
+      this._showErrorAlert("places-bookmarks-restore-format-error");
+      return;
+    }
+
+    const [title, body] = PlacesUIUtils.promptLocalization.formatValuesSync([
+      "places-bookmarks-restore-alert-title",
+      "places-bookmarks-restore-alert",
+    ]);
+    if (!Services.prompt.confirm(null, title, body)) {
+      return;
+    }
+
+    (async function () {
+      try {
+        await BookmarkJSONUtils.importFromFile(aFilePath, {
+          replace: true,
+        });
+      } catch (ex) {
+        PlacesOrganizer._showErrorAlert("places-bookmarks-restore-parse-error");
+      }
+    })();
+  },
+
+  _showErrorAlert: function PO__showErrorAlert(l10nId) {
+    const [title, msg] = PlacesUIUtils.promptLocalization.formatValuesSync([
+      "places-error-title",
+      l10nId,
+    ]);
+    Services.prompt.alert(window, title, msg);
+  },
+
+  backupBookmarks: function PO_backupBookmarks() {
+    let backupsDir = Services.dirsvc.get("Desk", Ci.nsIFile);
+    let fp = Cc["@mozilla.org/filepicker;1"].createInstance(Ci.nsIFilePicker);
+    let fpCallback = function fpCallback_done(aResult) {
+      if (aResult != Ci.nsIFilePicker.returnCancel) {
+        PlacesBackups.saveBookmarksToJSONFile(fp.file.path).catch(
+          console.error
+        );
+      }
+    };
+
+    const [title, filterName] =
+      PlacesUIUtils.promptLocalization.formatValuesSync([
+        "places-bookmarks-backup-title",
+        "places-bookmarks-restore-filter-name",
+      ]);
+    fp.init(window.browsingContext, title, Ci.nsIFilePicker.modeSave);
+    fp.appendFilter(filterName, RESTORE_FILEPICKER_FILTER_EXT);
+    fp.defaultString = PlacesBackups.getFilenameForDate();
+    fp.defaultExtension = "json";
+    fp.displayDirectory = backupsDir;
+    fp.open(fpCallback);
+  },
+
+  _fillDetailsPane: function PO__fillDetailsPane(aNodeList) {
+    var infoBox = document.getElementById("infoBox");
+    var itemsCountBox = document.getElementById("itemsCountBox");
+
+    infoBox.hidden = false;
+    itemsCountBox.hidden = true;
+
+    let selectedNode = aNodeList.length == 1 ? aNodeList[0] : null;
+
+    if (
+      selectedNode &&
+      !gEditItemOverlay.multiEdit &&
+      ((gEditItemOverlay.concreteGuid &&
+        gEditItemOverlay.concreteGuid ==
+          PlacesUtils.getConcreteItemGuid(selectedNode)) ||
+        (!selectedNode.bookmarkGuid &&
+          gEditItemOverlay.uri &&
+          gEditItemOverlay.uri == selectedNode.uri))
+    ) {
+      return;
+    }
+
+    gEditItemOverlay.uninitPanel(false);
+
+    if (selectedNode && !PlacesUtils.nodeIsSeparator(selectedNode)) {
+      gEditItemOverlay
+        .initPanel({
+          node: selectedNode,
+          hiddenRows: ["folderPicker"],
+        })
+        .catch(ex => console.error(ex));
+    } else if (!selectedNode && aNodeList[0]) {
+      if (aNodeList.every(PlacesUtils.nodeIsURI)) {
+        let uris = aNodeList.map(node => Services.io.newURI(node.uri));
+        gEditItemOverlay
+          .initPanel({
+            uris,
+            hiddenRows: ["folderPicker", "location", "keyword", "name"],
+          })
+          .catch(ex => console.error(ex));
+      } else {
+        let selectItemDesc = document.getElementById("selectItemDescription");
+        let itemsCountLabel = document.getElementById("itemsCountText");
+        selectItemDesc.hidden = false;
+        document.l10n.setAttributes(
+          itemsCountLabel,
+          "places-details-pane-items-count",
+          { count: aNodeList.length }
+        );
+        infoBox.hidden = true;
+      }
+    } else {
+      infoBox.hidden = true;
+      let selectItemDesc = document.getElementById("selectItemDescription");
+      let itemsCountLabel = document.getElementById("itemsCountText");
+      let itemsCount = 0;
+      if (ContentArea.currentView.result) {
+        let rootNode = ContentArea.currentView.result.root;
+        if (rootNode.containerOpen) {
+          itemsCount = rootNode.childCount;
+        }
+      }
+      if (itemsCount == 0) {
+        selectItemDesc.hidden = true;
+        document.l10n.setAttributes(
+          itemsCountLabel,
+          "places-details-pane-no-items"
+        );
+      } else {
+        selectItemDesc.hidden = false;
+        document.l10n.setAttributes(
+          itemsCountLabel,
+          "places-details-pane-items-count",
+          { count: itemsCount }
+        );
+      }
+    }
+    itemsCountBox.hidden = !infoBox.hidden;
+  },
+};
+
+window.addEventListener("load", PlacesOrganizer);
+window.addEventListener("unload", PlacesOrganizer);
+
+var PlacesSearchBox = {
+  get searchFilter() {
+    return document.getElementById("searchFilter");
+  },
+
+
+  _folders: [],
+  get folders() {
+    if (!this._folders.length) {
+      this._folders = PlacesUtils.bookmarks.userContentRoots;
+    }
+    return this._folders;
+  },
+  set folders(aFolders) {
+    this._folders = aFolders;
+  },
+
+  search(filterString) {
+    var PO = PlacesOrganizer;
+    if (filterString == "") {
+      PO.onPlaceSelected(false);
+      return;
+    }
+
+    let currentView = ContentArea.currentView;
+
+    switch (PlacesSearchBox.filterCollection) {
+      case "bookmarks":
+        currentView.applyFilter(filterString, this.folders);
+        break;
+      case "history": {
+        let currentOptions = PO.getCurrentOptions();
+        if (
+          currentOptions.queryType !=
+          Ci.nsINavHistoryQueryOptions.QUERY_TYPE_HISTORY
+        ) {
+          let query = PlacesUtils.history.getNewQuery();
+          query.searchTerms = filterString;
+          let options = currentOptions.clone();
+          options.resultType = currentOptions.RESULTS_AS_URI;
+          options.queryType = Ci.nsINavHistoryQueryOptions.QUERY_TYPE_HISTORY;
+          options.includeHidden = true;
+          currentView.load([query], options);
+        } else {
+          currentView.applyFilter(filterString, null, true);
+        }
+        break;
+      }
+      case "downloads": {
+        currentView.searchTerm = filterString;
+        break;
+      }
+      default:
+        throw new Error("Invalid filterCollection on search");
+    }
+
+    PlacesOrganizer.updateDetailsPane();
+  },
+
+  findAll() {
+    switch (this.filterCollection) {
+      case "history":
+        PlacesQueryBuilder.setScope("history");
+        break;
+      case "downloads":
+        PlacesQueryBuilder.setScope("downloads");
+        break;
+      default:
+        PlacesQueryBuilder.setScope("bookmarks");
+        break;
+    }
+    this.focus();
+  },
+
+  updatePlaceholder() {
+    let l10nId = "";
+    switch (this.filterCollection) {
+      case "history":
+        l10nId = "places-search-history";
+        break;
+      case "downloads":
+        l10nId = "places-search-downloads";
+        break;
+      default:
+        l10nId = "places-search-bookmarks";
+    }
+    document.l10n.setAttributes(this.searchFilter, l10nId);
+  },
+
+  get filterCollection() {
+    return this.searchFilter.getAttribute("collection");
+  },
+  set filterCollection(collectionName) {
+    if (collectionName == this.filterCollection) {
+      return;
+    }
+
+    this.searchFilter.setAttribute("collection", collectionName);
+    this.updatePlaceholder();
+  },
+
+  focus() {
+    this.searchFilter.focus();
+  },
+
+  init() {
+    this.searchFilter.addEventListener("MozInputSearch:search", e => {
+      this.search(e.target.value);
+    });
+    this.updatePlaceholder();
+  },
+
+  get value() {
+    return this.searchFilter.value;
+  },
+  set value(value) {
+    this.searchFilter.value = value;
+  },
+};
+
+var PlacesQueryBuilder = {
+  queries: [],
+  queryOptions: null,
+
+  setScope(aScope) {
+    var filterCollection;
+    var folders = [];
+    switch (aScope) {
+      case "history":
+        filterCollection = "history";
+        break;
+      case "bookmarks":
+        filterCollection = "bookmarks";
+        folders = PlacesUtils.bookmarks.userContentRoots;
+        break;
+      case "downloads":
+        filterCollection = "downloads";
+        break;
+      default:
+        throw new Error("Invalid search scope");
+    }
+
+    PlacesSearchBox.filterCollection = filterCollection;
+    PlacesSearchBox.folders = folders;
+    var searchStr = PlacesSearchBox.searchFilter.value;
+    if (searchStr) {
+      PlacesSearchBox.search(searchStr);
+    }
+  },
+};
+
+var ViewMenu = {
+  init() {
+    let columnsPopup = document.querySelector("#viewColumns > menupopup");
+    columnsPopup.addEventListener("command", event => {
+      event.stopPropagation();
+      this.showHideColumn(event.target);
+    });
+    columnsPopup.addEventListener("popupshowing", event =>
+      this.fillWithColumns(event, null, null, "checkbox", false)
+    );
+
+    let sortPopup = document.querySelector("#viewSort > menupopup");
+    sortPopup.addEventListener("command", event => {
+      event.stopPropagation();
+
+      switch (event.target.id) {
+        case "viewUnsorted":
+          this.setSortColumn(null, null);
+          break;
+        case "viewSortAscending":
+          this.setSortColumn(null, "ascending");
+          break;
+        case "viewSortDescending":
+          this.setSortColumn(null, "descending");
+          break;
+        default:
+          this.setSortColumn(event.target.column, null);
+          break;
+      }
+    });
+    sortPopup.addEventListener("popupshowing", event =>
+      this.populateSortMenu(event)
+    );
+  },
+
+  _clean: function VM__clean(popup, startID, endID) {
+    if (endID && !startID) {
+      throw new Error("meaningless to have valid endID and null startID");
+    }
+    if (startID) {
+      var startElement = document.getElementById(startID);
+      if (startElement.parentNode != popup) {
+        throw new Error("startElement is not in popup");
+      }
+      if (!startElement) {
+        throw new Error("startID does not correspond to an existing element");
+      }
+      var endElement = null;
+      if (endID) {
+        endElement = document.getElementById(endID);
+        if (endElement.parentNode != popup) {
+          throw new Error("endElement is not in popup");
+        }
+        if (!endElement) {
+          throw new Error("endID does not correspond to an existing element");
+        }
+      }
+      while (startElement.nextSibling != endElement) {
+        popup.removeChild(startElement.nextSibling);
+      }
+      return endElement;
+    }
+    while (popup.hasChildNodes()) {
+      popup.firstChild.remove();
+    }
+    return null;
+  },
+
+  fillWithColumns: function VM_fillWithColumns(
+    event,
+    startID,
+    endID,
+    type,
+    localize
+  ) {
+    var popup = event.target;
+    var pivot = this._clean(popup, startID, endID);
+
+    var content = document.getElementById("placeContent");
+    var columns = content.columns;
+    for (var i = 0; i < columns.count; ++i) {
+      var column = columns.getColumnAt(i).element;
+      var menuitem = document.createXULElement("menuitem");
+      menuitem.id = "menucol_" + column.id;
+      menuitem.column = column;
+      if (localize) {
+        const l10nId = SORTBY_L10N_IDS.get(column.getAttribute("anonid"));
+        document.l10n.setAttributes(menuitem, l10nId);
+      } else {
+        const label = column.getAttribute("label");
+        menuitem.setAttribute("label", label);
+      }
+      if (type == "radio") {
+        menuitem.setAttribute("type", "radio");
+        menuitem.setAttribute("name", "columns");
+        if (column.hasAttribute("sortDirection")) {
+          menuitem.setAttribute("checked", "true");
+        }
+      } else if (type == "checkbox") {
+        menuitem.setAttribute("type", "checkbox");
+        if (column.getAttribute("primary") == "true") {
+          menuitem.setAttribute("disabled", "true");
+        }
+        if (!column.hidden) {
+          menuitem.setAttribute("checked", "true");
+        }
+      }
+      if (pivot) {
+        popup.insertBefore(menuitem, pivot);
+      } else {
+        popup.appendChild(menuitem);
+      }
+    }
+    event.stopPropagation();
+  },
+
+  populateSortMenu: function VM_populateSortMenu(event) {
+    this.fillWithColumns(
+      event,
+      "viewUnsorted",
+      "directionSeparator",
+      "radio",
+      true
+    );
+
+    var sortColumn = this._getSortColumn();
+    var viewSortAscending = document.getElementById("viewSortAscending");
+    var viewSortDescending = document.getElementById("viewSortDescending");
+    var viewUnsorted = document.getElementById("viewUnsorted");
+    if (!sortColumn) {
+      viewSortAscending.removeAttribute("checked");
+      viewSortDescending.removeAttribute("checked");
+      viewUnsorted.setAttribute("checked", "true");
+    } else if (sortColumn.getAttribute("sortDirection") == "ascending") {
+      viewSortAscending.setAttribute("checked", "true");
+      viewSortDescending.removeAttribute("checked");
+      viewUnsorted.removeAttribute("checked");
+    } else if (sortColumn.getAttribute("sortDirection") == "descending") {
+      viewSortDescending.setAttribute("checked", "true");
+      viewSortAscending.removeAttribute("checked");
+      viewUnsorted.removeAttribute("checked");
+    }
+  },
+
+  showHideColumn: function VM_showHideColumn(element) {
+    var column = element.column;
+
+    var splitter = column.nextSibling;
+    if (splitter && splitter.localName != "splitter") {
+      splitter = null;
+    }
+
+    const isChecked = element.hasAttribute("checked");
+    column.hidden = !isChecked;
+    if (splitter) {
+      splitter.hidden = !isChecked;
+    }
+  },
+
+  _getSortColumn: function VM__getSortColumn() {
+    var content = document.getElementById("placeContent");
+    var cols = content.columns;
+    for (var i = 0; i < cols.count; ++i) {
+      var column = cols.getColumnAt(i).element;
+      var sortDirection = column.getAttribute("sortDirection");
+      if (sortDirection == "ascending" || sortDirection == "descending") {
+        return column;
+      }
+    }
+    return null;
+  },
+
+  setSortColumn: function VM_setSortColumn(aColumn, aDirection) {
+    var result = document.getElementById("placeContent").result;
+    if (!aColumn && !aDirection) {
+      result.sortingMode = Ci.nsINavHistoryQueryOptions.SORT_BY_NONE;
+      return;
+    }
+
+    var columnId;
+    if (aColumn) {
+      columnId = aColumn.getAttribute("anonid");
+      if (!aDirection) {
+        let sortColumn = this._getSortColumn();
+        if (sortColumn) {
+          aDirection = sortColumn.getAttribute("sortDirection");
+        }
+      }
+    } else {
+      let sortColumn = this._getSortColumn();
+      columnId = sortColumn ? sortColumn.getAttribute("anonid") : "title";
+    }
+
+    const colLookupTable = {
+      title: { key: "TITLE", dir: "ascending" },
+      tags: { key: "TAGS", dir: "ascending" },
+      url: { key: "URI", dir: "ascending" },
+      date: { key: "DATE", dir: "descending" },
+      visitCount: { key: "VISITCOUNT", dir: "descending" },
+      dateAdded: { key: "DATEADDED", dir: "descending" },
+      lastModified: { key: "LASTMODIFIED", dir: "descending" },
+    };
+
+    if (!colLookupTable.hasOwnProperty(columnId)) {
+      throw new Error("Invalid column");
+    }
+
+    aDirection = (aDirection || colLookupTable[columnId].dir).toUpperCase();
+
+    var sortConst =
+      "SORT_BY_" + colLookupTable[columnId].key + "_" + aDirection;
+    result.sortingMode = Ci.nsINavHistoryQueryOptions[sortConst];
+  },
+};
+
+var ContentArea = {
+  _specialViews: new Map(),
+
+  init: function CA_init() {
+    this._box = document.getElementById("placesViewsBox");
+    this._toolbar = document.getElementById("placesToolbar");
+    ContentTree.init();
+    this._setupView();
+  },
+
+  getContentViewForQueryString: function CA_getContentViewForQueryString(
+    aQueryString
+  ) {
+    try {
+      if (this._specialViews.has(aQueryString)) {
+        let { view, options } = this._specialViews.get(aQueryString);
+        if (typeof view == "function") {
+          view = view();
+          this._specialViews.set(aQueryString, { view, options });
+        }
+        return view;
+      }
+    } catch (ex) {
+      console.error(ex);
+    }
+    return ContentTree.view;
+  },
+
+  setContentViewForQueryString: function CA_setContentViewForQueryString(
+    aQueryString,
+    aView,
+    aOptions
+  ) {
+    if (
+      !aQueryString ||
+      (typeof aView != "object" && typeof aView != "function")
+    ) {
+      throw new Error("Invalid arguments");
+    }
+
+    this._specialViews.set(aQueryString, {
+      view: aView,
+      options: aOptions || {},
+    });
+  },
+
+  get currentView() {
+    let selectedPane = [...this._box.children].filter(
+      child => !child.hidden
+    )[0];
+    return PlacesUIUtils.getViewForNode(selectedPane);
+  },
+  set currentView(aNewView) {
+    let oldView = this.currentView;
+    if (oldView != aNewView) {
+      oldView.associatedElement.hidden = true;
+      aNewView.associatedElement.hidden = false;
+
+      if (document.activeElement == oldView.associatedElement) {
+        aNewView.associatedElement.focus();
+      }
+    }
+  },
+
+  get currentPlace() {
+    return this.currentView.place;
+  },
+  set currentPlace(aQueryString) {
+    let oldView = this.currentView;
+    let newView = this.getContentViewForQueryString(aQueryString);
+    newView.place = aQueryString;
+    if (oldView != newView) {
+      oldView.active = false;
+      this.currentView = newView;
+      this._setupView();
+      newView.active = true;
+    }
+  },
+
+  _setupView: function CA__setupView() {
+    let options = this.currentViewOptions;
+
+    let detailsPane = document.getElementById("detailsPane");
+    detailsPane.hidden = !options.showDetailsPane;
+
+    for (let elt of this._toolbar.childNodes) {
+      if (elt.id == "placesMenu") {
+        for (let menuElt of elt.childNodes) {
+          menuElt.hidden = !options.toolbarSet.includes(menuElt.id);
+        }
+      } else {
+        elt.hidden = !options.toolbarSet.includes(elt.id);
+      }
+    }
+  },
+
+  get currentViewOptions() {
+    let viewOptions = ContentTree.viewOptions;
+    if (this._specialViews.has(this.currentPlace)) {
+      let { options } = this._specialViews.get(this.currentPlace);
+      for (let option in options) {
+        viewOptions[option] = options[option];
+      }
+    }
+    return viewOptions;
+  },
+
+  focus() {
+    this.currentView.associatedElement.focus();
+  },
+};
+
+var ContentTree = {
+  init: function CT_init() {
+    this._view = document.getElementById("placeContent");
+    this.view.addEventListener("keypress", this);
+    document
+      .querySelector("#placeContent > treechildren")
+      .addEventListener("click", this);
+  },
+
+  get view() {
+    return this._view;
+  },
+
+  get viewOptions() {
+    return Object.seal({
+      showDetailsPane: true,
+      toolbarSet:
+        "back-button, forward-button, organizeButton, viewMenu, maintenanceButton, libraryToolbarSpacer, searchFilter",
+    });
+  },
+
+  openSelectedNode: function CT_openSelectedNode(aEvent) {
+    let view = this.view;
+    PlacesUIUtils.openNodeWithEvent(view.selectedNode, aEvent);
+  },
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "click":
+        this.onClick(event);
+        break;
+      case "keypress":
+        this.onKeyPress(event);
+        break;
+    }
+  },
+
+  onClick: function CT_onClick(aEvent) {
+    let node = this.view.selectedNode;
+    if (node) {
+      let doubleClick = aEvent.button == 0 && aEvent.detail == 2;
+      let middleClick = aEvent.button == 1 && aEvent.detail == 1;
+      if (PlacesUtils.nodeIsURI(node) && (doubleClick || middleClick)) {
+        this.openSelectedNode(aEvent);
+      } else if (middleClick && PlacesUtils.nodeIsContainer(node)) {
+        PlacesUIUtils.openMultipleLinksInTabs(node, aEvent, this.view);
+      }
+    }
+  },
+
+  onKeyPress: function CT_onKeyPress(aEvent) {
+    if (aEvent.keyCode == KeyEvent.DOM_VK_RETURN) {
+      this.openSelectedNode(aEvent);
+    }
+  },
+};

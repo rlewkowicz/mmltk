@@ -1,0 +1,190 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#if !defined(WebMBufferedParser_h_)
+#  define WebMBufferedParser_h_
+
+#  include "MediaResource.h"
+#  include "MediaResult.h"
+#  include "mozilla/Mutex.h"
+#  include "nsISupportsImpl.h"
+#  include "nsTArray.h"
+
+namespace mozilla {
+
+struct WebMTimeDataOffset {
+  WebMTimeDataOffset(int64_t aEndOffset, uint64_t aTimecode,
+                     int64_t aInitOffset, int64_t aSyncOffset,
+                     int64_t aClusterEndOffset)
+      : mEndOffset(aEndOffset),
+        mInitOffset(aInitOffset),
+        mSyncOffset(aSyncOffset),
+        mClusterEndOffset(aClusterEndOffset),
+        mTimecode(aTimecode) {}
+
+  bool operator==(int64_t aEndOffset) const { return mEndOffset == aEndOffset; }
+
+  bool operator!=(int64_t aEndOffset) const { return mEndOffset != aEndOffset; }
+
+  bool operator<(int64_t aEndOffset) const { return mEndOffset < aEndOffset; }
+
+  int64_t mEndOffset;
+  int64_t mInitOffset;
+  int64_t mSyncOffset;
+  int64_t mClusterEndOffset;
+  uint64_t mTimecode;
+};
+
+struct WebMBufferedParser {
+  explicit WebMBufferedParser(int64_t aOffset);
+
+  uint32_t GetTimecodeScale() {
+    MOZ_ASSERT(mGotTimecodeScale);
+    return mTimecodeScale;
+  }
+
+  void AppendMediaSegmentOnly() { mGotTimecodeScale = true; }
+
+  void SetTimecodeScale(uint32_t aTimecodeScale);
+
+  MediaResult Append(const unsigned char* aBuffer, uint32_t aLength,
+                     nsTArray<WebMTimeDataOffset>& aMapping);
+
+  bool operator==(int64_t aOffset) const { return mCurrentOffset == aOffset; }
+
+  bool operator<(int64_t aOffset) const { return mCurrentOffset < aOffset; }
+
+  int64_t EndSegmentOffset(int64_t aOffset);
+
+  int64_t GetClusterOffset() const;
+
+  int64_t mStartOffset;
+
+  int64_t mCurrentOffset;
+
+  int64_t mInitEndOffset;
+
+  int64_t mBlockEndOffset;
+
+ private:
+  enum State {
+    READ_ELEMENT_ID,
+
+    READ_ELEMENT_SIZE,
+
+    FIND_CLUSTER_SYNC,
+
+    PARSE_ELEMENT,
+
+    READ_VINT,
+
+    READ_VINT_REST,
+
+    READ_TIMECODESCALE,
+
+    READ_CLUSTER_TIMECODE,
+
+    READ_BLOCK_TIMECODE,
+
+    READ_EBML_MAX_ID_LENGTH,
+
+    READ_EBML_MAX_SIZE_LENGTH,
+
+    CHECK_INIT_FOUND,
+
+    SKIP_DATA,
+  };
+
+  State mState;
+
+  State mNextState;
+
+  struct VInt {
+    VInt() : mValue(0), mLength(0) {}
+    uint64_t mValue;
+    uint64_t mLength;
+  };
+
+  struct EBMLElement {
+    uint64_t Length() { return mID.mLength + mSize.mLength; }
+    VInt mID;
+    VInt mSize;
+  };
+
+  EBMLElement mElement;
+
+  VInt mVInt;
+
+  bool mVIntRaw;
+
+  int64_t mLastInitStartOffset;
+
+  uint32_t mLastInitSize;
+
+  uint8_t mEBMLMaxIdLength;
+
+  uint8_t mEBMLMaxSizeLength;
+
+  uint32_t mClusterSyncPos;
+
+  uint32_t mVIntLeft;
+
+  uint64_t mBlockSize;
+
+  uint64_t mClusterTimecode;
+
+  int64_t mClusterOffset;
+
+  int64_t mClusterEndOffset;
+
+  int64_t mBlockOffset;
+
+  int16_t mBlockTimecode;
+
+  uint32_t mBlockTimecodeLength;
+
+  uint32_t mSkipBytes;
+
+  uint32_t mTimecodeScale;
+
+  bool mGotTimecodeScale;
+
+  bool mGotClusterTimecode;
+};
+
+class WebMBufferedState final {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(WebMBufferedState)
+
+ public:
+  WebMBufferedState() : mMutex("WebMBufferedState") {
+    MOZ_COUNT_CTOR(WebMBufferedState);
+  }
+
+  void NotifyDataArrived(const unsigned char* aBuffer, uint32_t aLength,
+                         int64_t aOffset);
+  void Reset();
+  void UpdateIndex(const MediaByteRangeSet& aRanges, MediaResource* aResource);
+  bool CalculateBufferedForRange(int64_t aStartOffset, int64_t aEndOffset,
+                                 uint64_t* aStartTime, uint64_t* aEndTime);
+
+  bool GetOffsetForTime(uint64_t aTime, int64_t* aOffset);
+
+  int64_t GetInitEndOffset();
+
+  bool GetStartTime(uint64_t* aTime);
+
+  bool GetNextKeyframeTime(uint64_t aTime, uint64_t* aKeyframeTime);
+
+ private:
+  MOZ_COUNTED_DTOR(WebMBufferedState)
+
+  Mutex mMutex;
+
+  nsTArray<WebMTimeDataOffset> mTimeMapping MOZ_GUARDED_BY(mMutex);
+
+  nsTArray<WebMBufferedParser> mRangeParsers;
+};
+
+}  
+
+#endif

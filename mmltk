@@ -1,0 +1,1871 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+image_name="${MMLTK_IMAGE:-mmltk}"
+build_image_name="${MMLTK_BUILD_IMAGE:-mmltk-build:latest}"
+runtime_base_image_name="${MMLTK_RUNTIME_BASE_IMAGE:-mmltk-runtime-base:latest}"
+pytorch_devel_image="${MMLTK_PYTORCH_DEVEL_IMAGE:-pytorch/pytorch:2.10.0-cuda13.0-cudnn9-devel}"
+pytorch_runtime_image="${MMLTK_PYTORCH_RUNTIME_IMAGE:-pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime}"
+analysis_image_name="${MMLTK_ANALYSIS_IMAGE:-${image_name}-analysis}"
+settings_host_path="${MMLTK_GUI_SETTINGS_PATH:-${repo_root}/gui.json}"
+host_workdir="${PWD}"
+requested_cache_root="${MMLTK_CACHE_ROOT:-${repo_root}/.cache}"
+if [[ "${requested_cache_root}" != /* ]]; then
+    requested_cache_root="${repo_root}/${requested_cache_root}"
+fi
+cache_root="$(realpath -m -- "${requested_cache_root}")"
+repository_cache_root="${repo_root}/.cache"
+buildkit_cache_root="${cache_root}/buildkit"
+cmake_cache_root="${cache_root}/cmake"
+cargo_cache_root="${cache_root}/cargo"
+ccache_root="${cache_root}/ccache"
+firefox_cache_root="${cache_root}/firefox"
+firefox_build_input_file="${firefox_cache_root}/build-input.sha256"
+firefox_built_input_file="${firefox_cache_root}/obj-minimal-opt/.mmltk-build-input.sha256"
+browser_app_cache_root="${cache_root}/browser-app"
+image_fingerprint_root="${cache_root}/image-fingerprints"
+lock_root="${cache_root}/locks"
+requested_release_stage_root="${MMLTK_RELEASE_STAGE_ROOT:-${repo_root}/build/release}"
+if [[ "${requested_release_stage_root}" != /* ]]; then
+    requested_release_stage_root="${repo_root}/${requested_release_stage_root}"
+fi
+release_stage_root="$(realpath -m -- "${requested_release_stage_root}")"
+requested_browser_stage_root="${MMLTK_BROWSER_STAGE_ROOT:-${repo_root}/build/browser-app}"
+if [[ "${requested_browser_stage_root}" != /* ]]; then
+    requested_browser_stage_root="${repo_root}/${requested_browser_stage_root}"
+fi
+gui_build_root="$(realpath -m -- "${requested_browser_stage_root}")"
+gui_build_dist_dir="${gui_build_root}/dist"
+uid="$(id -u)"
+gid="$(id -g)"
+
+log() {
+    printf 'mmltk: %s\n' "$*" >&2
+}
+
+die() {
+    log "$*"
+    exit 1
+}
+
+online_cpu_file="/sys/devices/system/cpu/online"
+[[ -r "${online_cpu_file}" ]] || die "Linux online CPU list is unavailable"
+build_cpu_list="$(<"${online_cpu_file}")"
+[[ "${build_cpu_list}" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || die \
+    "invalid Linux online CPU list: ${build_cpu_list}"
+build_jobs="$(getconf _NPROCESSORS_ONLN)"
+[[ "${build_jobs}" =~ ^[1-9][0-9]*$ ]] || die \
+    "invalid online CPU count: ${build_jobs}"
+
+case "${cache_root}" in
+    "${repository_cache_root}"|"${repository_cache_root}/"*)
+        ;;
+    *)
+        die "MMLTK_CACHE_ROOT must stay under ${repository_cache_root}"
+        ;;
+esac
+case "${release_stage_root}" in
+    "${repo_root}/build/"*)
+        ;;
+    *)
+        die "MMLTK_RELEASE_STAGE_ROOT must stay under ${repo_root}/build"
+        ;;
+esac
+case "${gui_build_root}" in
+    "${repo_root}/build/"*)
+        ;;
+    *)
+        die "MMLTK_BROWSER_STAGE_ROOT must stay under ${repo_root}/build"
+        ;;
+esac
+
+container_cache_root="/workspace${cache_root#"${repo_root}"}"
+container_release_stage_root="/workspace${release_stage_root#"${repo_root}"}"
+container_browser_stage_root="/workspace${gui_build_root#"${repo_root}"}"
+container_firefox_sccache_basedirs="${container_cache_root}/firefox/obj-minimal-opt"
+container_firefox_sccache_basedirs+=":/workspace/third_party/firefox"
+container_firefox_sccache_basedirs+=":${container_cache_root}/firefox/mozbuild/sysroot-x86_64-linux-gnu"
+build_trace_file="${MMLTK_BUILD_TRACE_FILE:-}"
+ccache_stats_file="${MMLTK_CCACHE_STATS_FILE:-}"
+firefox_sccache_stats_file="${MMLTK_FIREFOX_SCCACHE_STATS_FILE:-}"
+container_ccache_stats_file=""
+container_firefox_sccache_stats_file=""
+container_build_trace_file=""
+firefox_stage_trace_file=""
+container_firefox_stage_trace_file=""
+build_trace_enabled=0
+
+prepare_trace_report_file() {
+    local requested_path="$1"
+    local variable_name="$2"
+    if [[ "${requested_path}" != /* ]]; then
+        requested_path="${host_workdir}/${requested_path}"
+    fi
+    requested_path="$(realpath -m -- "${requested_path}")"
+    case "${requested_path}" in
+        "${repo_root}/build/"*)
+            ;;
+        *)
+            die "${variable_name} must stay under ${repo_root}/build"
+            ;;
+    esac
+    prepare_owned_dirs "$(dirname "${requested_path}")"
+    : >"${requested_path}"
+    chown "${uid}:${gid}" "${requested_path}" 2>/dev/null || true
+    printf '%s\n' "${requested_path}"
+}
+
+initialize_build_trace() {
+    [[ -n "${build_trace_file}" ]] || return 0
+    if [[ "${build_trace_file}" != /* ]]; then
+        build_trace_file="${host_workdir}/${build_trace_file}"
+    fi
+    build_trace_file="$(realpath -m -- "${build_trace_file}")"
+    case "${build_trace_file}" in
+        "${repo_root}/"*)
+            ;;
+        *)
+            die "MMLTK_BUILD_TRACE_FILE must stay under ${repo_root}"
+            ;;
+    esac
+    prepare_owned_dirs "$(dirname "${build_trace_file}")"
+    touch "${build_trace_file}"
+    chown "${uid}:${gid}" "${build_trace_file}" 2>/dev/null || true
+    container_build_trace_file="/workspace${build_trace_file#"${repo_root}"}"
+    firefox_stage_trace_file="${build_trace_file%.jsonl}-firefox-stage.jsonl"
+    : >"${firefox_stage_trace_file}"
+    chown "${uid}:${gid}" "${firefox_stage_trace_file}" 2>/dev/null || true
+    container_firefox_stage_trace_file="/workspace${firefox_stage_trace_file#"${repo_root}"}"
+    if [[ -n "${ccache_stats_file}" ]]; then
+        ccache_stats_file="$(prepare_trace_report_file \
+            "${ccache_stats_file}" MMLTK_CCACHE_STATS_FILE)"
+        container_ccache_stats_file="/workspace${ccache_stats_file#"${repo_root}"}"
+    fi
+    if [[ -n "${firefox_sccache_stats_file}" ]]; then
+        firefox_sccache_stats_file="$(prepare_trace_report_file \
+            "${firefox_sccache_stats_file}" MMLTK_FIREFOX_SCCACHE_STATS_FILE)"
+        container_firefox_sccache_stats_file="/workspace${firefox_sccache_stats_file#"${repo_root}"}"
+    fi
+    build_trace_enabled=1
+}
+
+trace_build_event() {
+    (( build_trace_enabled )) || return 0
+    local phase="$1"
+    local event="$2"
+    local result="${3:-}"
+    printf '{"timestamp_ns":%s,"pid":%d,"phase":"%s","event":"%s","result":"%s"}\n' \
+        "$(date +%s%N)" "${BASHPID}" "${phase}" "${event}" "${result}" \
+        >>"${build_trace_file}"
+}
+
+trace_build_job_assignment() {
+    (( build_trace_enabled )) || return 0
+    printf '{"timestamp_ns":%s,"pid":%d,"phase":"jobs","event":"assigned","cpus":"%s","ninja":%d,"cargo":%d,"firefox":%d}\n' \
+        "$(date +%s%N)" "${BASHPID}" \
+        "${build_cpu_list}" "${build_jobs}" "${build_jobs}" "${build_jobs}" \
+        >>"${build_trace_file}"
+}
+
+run_traced_build_phase() (
+    local phase="$1"
+    shift
+    trace_build_event "${phase}" start
+    finish_traced_build_phase() {
+        local exit_status=$?
+        trap - EXIT
+        if (( exit_status == 0 )); then
+            trace_build_event "${phase}" finish success
+        else
+            trace_build_event "${phase}" finish "failure:${exit_status}"
+        fi
+        exit "${exit_status}"
+    }
+    trap finish_traced_build_phase EXIT
+    "$@"
+)
+
+# When running as root, resolve the first real (login-capable) user on the box
+# so the container uses that uid/gid for mounts and device access.
+resolve_real_user() {
+    if (( uid != 0 )); then
+        return 0
+    fi
+
+    local target_user="${MMLTK_USER:-}"
+    if [[ -z "${target_user}" ]]; then
+        # First UID >= 1000 with a real login shell
+        local entry
+        while IFS=: read -r entry; do
+            local u_name u_uid u_gid u_shell
+            u_name="$(echo "${entry}" | cut -d: -f1)"
+            u_uid="$(echo "${entry}" | cut -d: -f3)"
+            u_gid="$(echo "${entry}" | cut -d: -f4)"
+            u_shell="$(echo "${entry}" | cut -d: -f7)"
+            if (( u_uid >= 1000 )) && [[ "${u_shell}" != */nologin && "${u_shell}" != */false ]]; then
+                target_user="${u_name}"
+                uid="${u_uid}"
+                gid="${u_gid}"
+                break
+            fi
+        done < /etc/passwd
+    else
+        uid="$(id -u "${target_user}")"
+        gid="$(id -g "${target_user}")"
+    fi
+
+    if [[ -z "${target_user}" ]]; then
+        log "warning: running as root, no real user found (set MMLTK_USER to override)"
+        return 0
+    fi
+    log "running as root, resolved container user to ${target_user} (${uid}:${gid})"
+}
+resolve_real_user
+
+container_hash="$(printf '%s' "${repo_root}" | sha256sum | cut -c1-12)"
+container_name="${MMLTK_CONTAINER_NAME:-mmltk-${container_hash}}"
+release_build_container_name="${container_name}-build-release"
+buildx_builder_name="${MMLTK_BUILDX_BUILDER:-mmltk-${container_hash}-buildx}"
+buildx_builder_ready=0
+container_cleanup_armed=0
+mutation_locks_acquired=0
+active_docker_pid=0
+active_build_pids=()
+active_build_container_names=()
+
+terminate_active_builds() {
+    local container
+    for container in "${active_build_container_names[@]}"; do
+        docker rm -f "${container}" >/dev/null 2>&1 || true
+    done
+    active_build_container_names=()
+
+    local pid
+    for pid in "${active_build_pids[@]}"; do
+        if kill -0 "${pid}" >/dev/null 2>&1; then
+            kill -TERM "${pid}" >/dev/null 2>&1 || true
+        fi
+    done
+    for pid in "${active_build_pids[@]}"; do
+        wait "${pid}" >/dev/null 2>&1 || true
+    done
+    active_build_pids=()
+}
+
+cleanup_owned_container() {
+    local exit_status="$1"
+    trap - EXIT
+    trap '' HUP INT QUIT ABRT PIPE TERM USR1 USR2
+    terminate_active_builds
+    if (( container_cleanup_armed )); then
+        container_cleanup_armed=0
+        docker rm -f "${container_name}" >/dev/null 2>&1 || true
+    fi
+    exit "${exit_status}"
+}
+
+exit_from_signal() {
+    local signal_name="$1"
+    local exit_status="$2"
+    trap '' HUP INT QUIT ABRT PIPE TERM USR1 USR2
+    if (( active_docker_pid > 0 )); then
+        kill -s "${signal_name}" "${active_docker_pid}" >/dev/null 2>&1 || true
+    fi
+    terminate_active_builds
+    exit "${exit_status}"
+}
+
+trap 'cleanup_owned_container "$?"' EXIT
+trap 'exit_from_signal HUP 129' HUP
+trap 'exit_from_signal INT 130' INT
+trap 'exit_from_signal QUIT 131' QUIT
+trap 'exit_from_signal ABRT 134' ABRT
+trap 'exit_from_signal PIPE 141' PIPE
+trap 'exit_from_signal TERM 143' TERM
+trap 'exit_from_signal USR1 138' USR1
+trap 'exit_from_signal USR2 140' USR2
+
+docker_server_ready() {
+    docker version --format '{{.Server.Version}}' >/dev/null 2>&1
+}
+
+best_effort_start_docker() {
+    local -a attempts=(
+        "systemctl --user start docker"
+        "systemctl start docker"
+        "service docker start"
+        "sudo -n systemctl --user start docker"
+        "sudo -n systemctl start docker"
+        "sudo -n service docker start"
+    )
+    local attempt
+    for attempt in "${attempts[@]}"; do
+        if ${attempt} >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+ensure_docker() {
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    if docker_server_ready; then
+        return 0
+    fi
+
+    log "docker daemon is unavailable; attempting a best-effort start"
+    best_effort_start_docker || true
+    docker_server_ready && return 0
+
+    die "docker is still unavailable. Start dockerd, then rerun this command."
+}
+
+ensure_image() {
+    docker image inspect "${image_name}" >/dev/null 2>&1 || die \
+        "image '${image_name}' is missing. Build it first with: ./mmltk --build"
+}
+
+prepare_owned_dirs() {
+    local path
+    for path in "$@"; do
+        install -d -m 0755 "${path}"
+        chown "${uid}:${gid}" "${path}" 2>/dev/null || true
+    done
+}
+
+prepare_cache_layout() {
+    prepare_owned_dirs \
+        "${cache_root}" \
+        "${cmake_cache_root}/release" \
+        "${cargo_cache_root}/home" \
+        "${cargo_cache_root}/target/browser-app" \
+        "${ccache_root}" \
+        "${firefox_cache_root}/obj-minimal-opt" \
+        "${firefox_cache_root}/mozbuild" \
+        "${firefox_cache_root}/sccache" \
+        "${browser_app_cache_root}" \
+        "${buildkit_cache_root}" \
+        "${image_fingerprint_root}" \
+        "${lock_root}"
+}
+
+acquire_mutation_locks() {
+    (( mutation_locks_acquired == 0 )) || return 0
+    command -v flock >/dev/null 2>&1 || die "flock is required"
+    prepare_owned_dirs "${repository_cache_root}/locks" "${lock_root}"
+    exec 8>"${repository_cache_root}/locks/checkout.lock"
+    flock 8
+    exec 9>"${lock_root}/cache-root.lock"
+    flock 9
+    mutation_locks_acquired=1
+}
+
+release_mutation_locks() {
+    (( mutation_locks_acquired == 1 )) || return 0
+    flock -u 9
+    exec 9>&-
+    flock -u 8
+    exec 8>&-
+    mutation_locks_acquired=0
+}
+
+ensure_buildx_builder() {
+    (( buildx_builder_ready == 0 )) || return 0
+    docker buildx version >/dev/null 2>&1 || die "docker buildx is required"
+
+    local inspect_output=""
+    if ! inspect_output="$(docker buildx inspect "${buildx_builder_name}" 2>/dev/null)"; then
+        log "creating checkout-scoped Buildx builder '${buildx_builder_name}'"
+        local create_output=""
+        if ! create_output="$(docker buildx create \
+            --name "${buildx_builder_name}" \
+            --driver docker-container 2>&1)"; then
+            inspect_output="$(docker buildx inspect "${buildx_builder_name}" 2>/dev/null)" || die \
+                "failed to create Buildx builder '${buildx_builder_name}': ${create_output}"
+        fi
+    fi
+
+    inspect_output="$(docker buildx inspect "${buildx_builder_name}")"
+    local builder_driver
+    builder_driver="$(awk '/^Driver:/ { print $2; exit }' <<<"${inspect_output}")"
+    [[ "${builder_driver}" == "docker-container" ]] || die \
+        "Buildx builder '${buildx_builder_name}' uses '${builder_driver:-unknown}', expected docker-container"
+    docker buildx inspect "${buildx_builder_name}" --bootstrap >/dev/null || die \
+        "failed to bootstrap Buildx builder '${buildx_builder_name}'"
+    buildx_builder_ready=1
+}
+
+cached_buildx_image() {
+    local target="$1"
+    local tag="$2"
+    local dockerfile="$3"
+    local cache_name="$4"
+    local fingerprint="$5"
+    shift 5
+
+    local fingerprint_dir="${image_fingerprint_root}"
+    local fingerprint_file="${fingerprint_dir}/${cache_name}.sha256"
+    local image_fingerprint=""
+    if docker image inspect "${tag}" >/dev/null 2>&1; then
+        image_fingerprint="$(docker image inspect "${tag}" \
+            --format '{{ index .Config.Labels "com.mmltk.input-fingerprint" }}' 2>/dev/null || true)"
+    fi
+    if docker image inspect "${tag}" >/dev/null 2>&1 \
+        && [[ -f "${fingerprint_file}" ]] \
+        && [[ "$(<"${fingerprint_file}")" == "${fingerprint}" ]] \
+        && [[ "${image_fingerprint}" == "${fingerprint}" ]]; then
+        trace_build_event "image:${cache_name}" cache_hit
+        return 0
+    fi
+
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    ensure_buildx_builder
+    local build_cache="${buildkit_cache_root}/${cache_name}"
+    prepare_owned_dirs "${fingerprint_dir}" "${build_cache}"
+    local -a cache_args=(--cache-to "type=local,dest=${build_cache},mode=max")
+    if [[ -f "${build_cache}/index.json" ]]; then
+        cache_args+=(--cache-from "type=local,src=${build_cache}")
+    fi
+
+    local -a target_args=()
+    if [[ "${target}" != "-" ]]; then
+        target_args+=(--target "${target}")
+        log "building cached image '${tag}' from target '${target}'"
+    else
+        log "building cached image '${tag}'"
+    fi
+    trace_build_event "image:${cache_name}" cache_miss
+    local build_status=0
+    if docker buildx build \
+            --builder "${buildx_builder_name}" \
+            --progress=plain \
+            --load \
+            "${target_args[@]}" \
+            --tag "${tag}" \
+            --file "${dockerfile}" \
+            --build-arg "MMLTK_IMAGE_FINGERPRINT=${fingerprint}" \
+            "${cache_args[@]}" \
+            "$@" \
+            "${repo_root}"; then
+        :
+    else
+        build_status=$?
+        log "failed to build cached image '${tag}' (exit ${build_status})"
+        return "${build_status}"
+    fi
+    docker image inspect "${tag}" >/dev/null 2>&1 || die "image '${tag}' was not loaded"
+    image_fingerprint="$(docker image inspect "${tag}" \
+        --format '{{ index .Config.Labels "com.mmltk.input-fingerprint" }}')"
+    [[ "${image_fingerprint}" == "${fingerprint}" ]] || die \
+        "image '${tag}' has fingerprint label '${image_fingerprint:-missing}', expected '${fingerprint}'"
+    printf '%s\n' "${fingerprint}" >"${fingerprint_file}"
+}
+
+toolchain_image_fingerprint() {
+    {
+        printf '%s\n' toolchain "${pytorch_devel_image}"
+        sha256sum "${repo_root}/docker/Dockerfile.core" \
+            "${repo_root}/utilities/wasm-opt-wrapper"
+    } | sha256sum | cut -d' ' -f1
+}
+
+runtime_base_image_fingerprint() {
+    {
+        printf '%s\n' runtime-base "${pytorch_runtime_image}"
+        sha256sum "${repo_root}/docker/Dockerfile.runtime-base"
+    } | sha256sum | cut -d' ' -f1
+}
+
+ensure_build_image() {
+    local fingerprint
+    fingerprint="$(toolchain_image_fingerprint)"
+    cached_buildx_image toolchain "${build_image_name}" \
+        "${repo_root}/docker/Dockerfile.core" core-toolchain \
+        "${fingerprint}" \
+        --build-arg "MMLTK_PYTORCH_DEVEL_IMAGE=${pytorch_devel_image}"
+}
+
+ensure_runtime_base_image() {
+    local fingerprint
+    fingerprint="$(runtime_base_image_fingerprint)"
+    cached_buildx_image runtime-base "${runtime_base_image_name}" \
+        "${repo_root}/docker/Dockerfile.runtime-base" runtime-base \
+        "${fingerprint}" \
+        --build-arg "MMLTK_PYTORCH_RUNTIME_IMAGE=${pytorch_runtime_image}"
+}
+
+ensure_analysis_image() {
+    ensure_build_image
+    local build_image_id analysis_image_id=""
+    build_image_id="$(docker image inspect "${build_image_name}" --format '{{.Id}}')"
+    if docker image inspect "${analysis_image_name}" >/dev/null 2>&1; then
+        analysis_image_id="$(docker image inspect "${analysis_image_name}" --format '{{.Id}}')"
+    fi
+    if [[ "${analysis_image_id}" != "${build_image_id}" ]]; then
+        log "tagging source-free toolchain as analysis image '${analysis_image_name}'"
+        docker tag "${build_image_name}" "${analysis_image_name}"
+    fi
+}
+
+prepare_tidy_logging() {
+    local tidy_log_file="${MMLTK_TIDY_LOG_FILE:-}"
+    if [[ -z "${tidy_log_file}" ]]; then
+        tidy_log_file="${repo_root}/build/logs/mmltk-tidy-$(date +%Y%m%d-%H%M%S).log"
+    elif [[ "${tidy_log_file}" != /* ]]; then
+        tidy_log_file="${host_workdir}/${tidy_log_file}"
+    fi
+
+    mkdir -p "$(dirname "${tidy_log_file}")"
+    touch "${tidy_log_file}"
+    chown "${uid}:${gid}" "$(dirname "${tidy_log_file}")" "${tidy_log_file}" 2>/dev/null || true
+    export MMLTK_TIDY_LOG_FILE="${tidy_log_file}"
+    export MMLTK_TIDY_TEE_STARTED=1
+    exec > >(tee -a "${tidy_log_file}") 2>&1
+    log "writing tidy log to ${tidy_log_file}"
+    log "tail with: tail -f ${tidy_log_file}"
+}
+
+container_exists() {
+    docker container inspect "${container_name}" >/dev/null 2>&1
+}
+
+container_running() {
+    [[ "$(docker inspect --format '{{.State.Running}}' "${container_name}" 2>/dev/null || true)" == "true" ]]
+}
+
+image_id() {
+    docker image inspect --format '{{.Id}}' "${image_name}"
+}
+
+container_runtime_label() {
+    docker inspect --format '{{ index .Config.Labels "com.mmltk.runtime" }}' "${container_name}" 2>/dev/null || true
+}
+
+bind_mount_specs=()
+desired_runtime_label=""
+gui_platform=""
+gui_runtime_dir_container="/tmp/mmltk-gui-runtime"
+gui_wayland_socket_host_path=""
+gui_wayland_socket_container_path=""
+gui_dbus_socket_host_path=""
+gui_dbus_socket_container_path=""
+
+gui_runtime_tmpfs_spec() {
+    printf '%s' "${gui_runtime_dir_container}:rw,mode=700,uid=${uid},gid=${gid}"
+}
+
+path_is_covered_by_bind_mount() {
+    local source_path="$1"
+    local existing_spec
+    local existing_source
+    for existing_spec in "${bind_mount_specs[@]}"; do
+        existing_source="${existing_spec%%:*}"
+        if [[ "${source_path}" == "${existing_source}" || "${source_path}" == "${existing_source}"/* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+append_bind_mount() {
+    local source_path="$1"
+    local target_path="${2:-$1}"
+    local mode="${3:-rw}"
+    [[ -e "${source_path}" ]] || return 0
+    path_is_covered_by_bind_mount "${source_path}" && return 0
+    bind_mount_specs+=("${source_path}:${target_path}:${mode}")
+}
+
+extract_dbus_session_bus_path() {
+    local address="$1"
+    if [[ "${address}" =~ ^unix:path=([^,]+) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    fi
+}
+
+default_xdg_runtime_dir() {
+    local candidate="/run/user/${uid}"
+    [[ -d "${candidate}" ]] || return 1
+    printf '%s' "${candidate}"
+}
+
+env_value_from_text() {
+    local text="$1"
+    local name="$2"
+    printf '%s\n' "${text}" | sed -n "s/^${name}=//p" | head -n 1
+}
+
+infer_gui_environment_from_target_processes() {
+    local proc_env proc_dir owner env_text value
+    for proc_env in /proc/[0-9]*/environ; do
+        proc_dir="${proc_env%/environ}"
+        [[ -r "${proc_env}" ]] || continue
+        owner="$(stat -c %u "${proc_dir}" 2>/dev/null || true)"
+        [[ "${owner}" == "${uid}" ]] || continue
+        env_text="$(tr '\0' '\n' < "${proc_env}" 2>/dev/null)" || continue
+
+        if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+            value="$(env_value_from_text "${env_text}" XDG_RUNTIME_DIR)"
+            if [[ -n "${value}" ]]; then
+                XDG_RUNTIME_DIR="${value}"
+                log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+            fi
+        fi
+        if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+            value="$(env_value_from_text "${env_text}" WAYLAND_DISPLAY)"
+            if [[ -n "${value}" ]]; then
+                WAYLAND_DISPLAY="${value}"
+                log "assuming WAYLAND_DISPLAY=${WAYLAND_DISPLAY}"
+            fi
+        fi
+        if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+            value="$(env_value_from_text "${env_text}" DBUS_SESSION_BUS_ADDRESS)"
+            if [[ -n "${value}" ]]; then
+                DBUS_SESSION_BUS_ADDRESS="${value}"
+                log "assuming DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}"
+            fi
+        fi
+
+        if [[ -n "${XDG_RUNTIME_DIR:-}" && -n "${WAYLAND_DISPLAY:-}" && \
+              -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+            return 0
+        fi
+    done
+}
+
+infer_gui_common_environment() {
+    infer_gui_environment_from_target_processes
+
+    if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+        local runtime_dir=""
+        runtime_dir="$(default_xdg_runtime_dir)" || true
+        if [[ -n "${runtime_dir}" ]]; then
+            XDG_RUNTIME_DIR="${runtime_dir}"
+            log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+        fi
+    fi
+
+    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -n "${XDG_RUNTIME_DIR:-}" ]]; then
+        local dbus_socket_path="${XDG_RUNTIME_DIR}/bus"
+        if [[ -S "${dbus_socket_path}" || -e "${dbus_socket_path}" ]]; then
+            DBUS_SESSION_BUS_ADDRESS="unix:path=${dbus_socket_path}"
+            log "assuming DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}"
+        fi
+    fi
+}
+
+find_wayland_display_in_runtime_dir() {
+    local runtime_dir="$1"
+    local candidate="${runtime_dir}/wayland-0"
+    if [[ -S "${candidate}" || -e "${candidate}" ]]; then
+        printf 'wayland-0'
+        return 0
+    fi
+
+    for candidate in "${runtime_dir}"/wayland-*; do
+        [[ "${candidate}" == *.lock ]] && continue
+        [[ -S "${candidate}" || -e "${candidate}" ]] || continue
+        basename "${candidate}"
+        return 0
+    done
+
+    return 1
+}
+
+infer_gui_wayland_environment() {
+    infer_gui_common_environment
+
+    if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+        local runtime_dir=""
+        runtime_dir="$(default_xdg_runtime_dir)" || true
+        if [[ -n "${runtime_dir}" ]]; then
+            XDG_RUNTIME_DIR="${runtime_dir}"
+            log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+        elif [[ "${WAYLAND_DISPLAY:-}" == /* ]]; then
+            XDG_RUNTIME_DIR="${WAYLAND_DISPLAY%/*}"
+            log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+        fi
+    fi
+
+    if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+        local display_name=""
+        if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+            display_name="$(find_wayland_display_in_runtime_dir "${XDG_RUNTIME_DIR}")" || true
+        fi
+
+        if [[ -n "${display_name}" ]]; then
+            WAYLAND_DISPLAY="${display_name}"
+            log "assuming WAYLAND_DISPLAY=${WAYLAND_DISPLAY} from ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}"
+        else
+            WAYLAND_DISPLAY="wayland-0"
+            log "assuming WAYLAND_DISPLAY=${WAYLAND_DISPLAY}"
+        fi
+    fi
+}
+
+resolve_wayland_socket_host_path() {
+    [[ -n "${WAYLAND_DISPLAY:-}" ]] || return 1
+    [[ -n "${XDG_RUNTIME_DIR:-}" ]] || return 1
+
+    local candidate=""
+    if [[ "${WAYLAND_DISPLAY}" == /* ]]; then
+        candidate="${WAYLAND_DISPLAY}"
+    elif [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+        candidate="${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}"
+    else
+        return 1
+    fi
+
+    [[ -S "${candidate}" || -e "${candidate}" ]] || return 1
+    printf '%s' "${candidate}"
+}
+
+resolve_gui_dbus_forwarding() {
+    gui_dbus_socket_host_path=""
+    gui_dbus_socket_container_path=""
+    local dbus_socket_path=""
+    dbus_socket_path="$(extract_dbus_session_bus_path "${DBUS_SESSION_BUS_ADDRESS:-}")"
+    if [[ -n "${dbus_socket_path}" ]]; then
+        if [[ -S "${dbus_socket_path}" || -e "${dbus_socket_path}" ]]; then
+            gui_dbus_socket_host_path="${dbus_socket_path}"
+            gui_dbus_socket_container_path="${gui_runtime_dir_container}/$(basename "${dbus_socket_path}")"
+        else
+            log "warning: DBUS session bus socket '${dbus_socket_path}' is unavailable; skipping DBUS session bus forwarding"
+        fi
+    fi
+}
+
+resolve_wayland_gui_session() {
+    infer_gui_wayland_environment
+
+    [[ -n "${WAYLAND_DISPLAY:-}" ]] \
+        || die "--gui requires WAYLAND_DISPLAY to be set on the host"
+    [[ -n "${XDG_RUNTIME_DIR:-}" ]] \
+        || die "--gui requires XDG_RUNTIME_DIR to be set on the host"
+
+    local wayland_socket_host_path=""
+    wayland_socket_host_path="$(resolve_wayland_socket_host_path)" \
+        || die "--gui requires the Wayland socket '${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}' to exist on the host"
+
+    gui_platform="wayland"
+
+    gui_wayland_socket_host_path="${wayland_socket_host_path}"
+    gui_wayland_socket_container_path="${gui_runtime_dir_container}/$(basename "${wayland_socket_host_path}")"
+    resolve_gui_dbus_forwarding
+}
+
+resolve_gui_session() {
+    if (( ! gui_mode )); then
+        return 0
+    fi
+
+    if [[ -n "${gui_platform}" ]]; then
+        return 0
+    fi
+
+    resolve_wayland_gui_session
+}
+
+prepare_bind_mounts() {
+    bind_mount_specs=()
+    append_bind_mount /dev /dev rw
+    if (( ! gui_mode )); then
+        return 0
+    fi
+
+    resolve_gui_session
+
+    if [[ -n "${gui_wayland_socket_host_path}" ]]; then
+        append_bind_mount "${gui_wayland_socket_host_path}" "${gui_wayland_socket_container_path}" rw
+    fi
+
+    if [[ -n "${gui_dbus_socket_host_path}" ]]; then
+        append_bind_mount "${gui_dbus_socket_host_path}" "${gui_dbus_socket_container_path}" rw
+    fi
+
+    if [[ -d /run/dbus ]]; then
+        append_bind_mount /run/dbus /run/dbus rw
+    fi
+}
+
+desired_container_runtime_label() {
+    local -a spec_parts=(
+        "image=$(image_id)"
+        "privileged=1"
+        "user=${uid}:${gid}"
+        "home=/tmp/mmltk-home"
+    )
+    if (( gui_mode )); then
+        resolve_gui_session
+        spec_parts+=("gui=1")
+        spec_parts+=("gui_platform=${gui_platform}")
+        spec_parts+=("tmpfs=$(gui_runtime_tmpfs_spec)")
+    else
+        spec_parts+=("gui=0")
+    fi
+
+    local mount_spec
+    for mount_spec in "${bind_mount_specs[@]}"; do
+        spec_parts+=("mount=${mount_spec}")
+    done
+
+    local joined_spec
+    printf -v joined_spec '%s|' "${spec_parts[@]}"
+    printf '%s' "${joined_spec%|}"
+}
+
+rewrite_host_path() {
+    local value="$1"
+    if [[ "${value}" == /host/* ]]; then
+        printf '%s' "${value}"
+        return 0
+    fi
+    if [[ "${value}" == /* ]]; then
+        printf '/host%s' "${value}"
+        return 0
+    fi
+    printf '%s' "${value}"
+}
+
+is_path_option() {
+    case "$1" in
+        --source-dir|--output-dir|--compiled|--weights|--resume|--onnx|--tensorrt|--output|--input|--save-engine|--report-json|--source|--train-compiled|--val-compiled|--test-compiled|--dist-store-file|--file|source_dir|output_dir|compiled)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+rewrite_passthrough_args() {
+    rewritten_args=()
+    local expect_path_value=0
+    local arg
+    for arg in "${passthrough_args[@]}"; do
+        if (( expect_path_value )); then
+            rewritten_args+=("$(rewrite_host_path "${arg}")")
+            expect_path_value=0
+            continue
+        fi
+
+        if [[ "${arg}" == --*=* ]]; then
+            local option_name="${arg%%=*}"
+            local option_value="${arg#*=}"
+            if is_path_option "${option_name}"; then
+                rewritten_args+=("${option_name}=$(rewrite_host_path "${option_value}")")
+            else
+                rewritten_args+=("${arg}")
+            fi
+            continue
+        fi
+
+        if is_path_option "${arg}"; then
+            rewritten_args+=("${arg}")
+            expect_path_value=1
+            continue
+        fi
+
+        if [[ "${arg}" == /* ]]; then
+            rewritten_args+=("$(rewrite_host_path "${arg}")")
+            continue
+        fi
+
+        rewritten_args+=("${arg}")
+    done
+}
+
+build_run_args() {
+    run_args=(
+        run
+        -d
+        --init
+        --privileged
+        --name "${container_name}"
+        --entrypoint /bin/sh
+        --gpus all
+        --network host
+        --ipc host
+        --user "${uid}:${gid}"
+        --env HOME=/tmp/mmltk-home
+        --env NVIDIA_DRIVER_CAPABILITIES=all
+        --label com.mmltk.wrapper=1
+        --label "com.mmltk.repo=${repo_root}"
+        --label "com.mmltk.runtime=${desired_runtime_label}"
+        --volume /:/host:rw
+        --workdir "/host${repo_root}"
+    )
+
+    if (( gui_mode )); then
+        run_args+=(--tmpfs "$(gui_runtime_tmpfs_spec)")
+    fi
+
+    build_common_group_args
+    run_args+=("${common_group_args[@]}")
+
+    local bind_mount_spec
+    for bind_mount_spec in "${bind_mount_specs[@]}"; do
+        run_args+=(--volume "${bind_mount_spec}")
+    done
+
+    run_args+=(
+        "${image_name}"
+        -lc
+        'mkdir -p "${HOME}" && trap "exit 0" TERM INT; while :; do sleep 3600; done'
+    )
+}
+
+build_common_group_args() {
+    common_group_args=()
+
+    local -a host_groups=()
+    local group_lookup_user
+    group_lookup_user="${MMLTK_USER:-}"
+    if [[ -z "${group_lookup_user}" && ${uid} -ne $(id -u) ]]; then
+        group_lookup_user="$(getent passwd "${uid}" | cut -d: -f1)"
+    fi
+    if [[ -n "${group_lookup_user}" ]]; then
+        mapfile -t host_groups < <(id -G "${group_lookup_user}" | tr ' ' '\n' | sort -u)
+    else
+        mapfile -t host_groups < <(id -G | tr ' ' '\n' | sort -u)
+    fi
+    local group_id
+    for group_id in "${host_groups[@]}"; do
+        [[ -n "${group_id}" ]] || continue
+        common_group_args+=(--group-add "${group_id}")
+    done
+
+    # Add the video group for V4L2 capture device access inside the container.
+    # The host user may not be in the video group (ACLs grant access on the host
+    # but are not carried through to the container).
+    local video_gid
+    video_gid="$(getent group video 2>/dev/null | cut -d: -f3)"
+    if [[ -n "${video_gid}" ]]; then
+        common_group_args+=(--group-add "${video_gid}")
+    fi
+}
+
+ensure_gui_runtime_dir_access() {
+    if (( ! gui_mode )); then
+        return 0
+    fi
+
+    docker exec -u 0 "${container_name}" /bin/sh -lc "
+        mkdir -p '${gui_runtime_dir_container}' &&
+        chown '${uid}:${gid}' '${gui_runtime_dir_container}' &&
+        chmod 700 '${gui_runtime_dir_container}'
+    " >/dev/null
+}
+
+ensure_container() {
+    ensure_docker
+    ensure_image
+    prepare_bind_mounts
+
+    desired_runtime_label="$(desired_container_runtime_label)"
+    if container_exists && [[ "$(container_runtime_label)" != "${desired_runtime_label}" ]]; then
+        log "recreating ${container_name} for updated runtime configuration"
+        docker rm -f "${container_name}" >/dev/null 2>&1 || true
+    fi
+
+    if ! container_exists; then
+        local -a run_args=()
+        build_run_args
+        docker "${run_args[@]}" >/dev/null
+        return 0
+    fi
+
+    if ! container_running; then
+        docker start "${container_name}" >/dev/null || true
+    fi
+
+    if ! container_running; then
+        log "recreating ${container_name} because it did not stay running"
+        docker rm -f "${container_name}" >/dev/null 2>&1 || true
+        local -a run_args=()
+        build_run_args
+        docker "${run_args[@]}" >/dev/null
+    fi
+
+    ensure_gui_runtime_dir_access
+}
+
+terminate_existing_gui_instances() {
+    if (( ! gui_mode )); then
+        return 0
+    fi
+
+    if docker exec -u 0 "${container_name}" /bin/sh -lc '
+        pgrep -f "[m]mltk-browser-host" >/dev/null 2>&1
+    ' >/dev/null 2>&1; then
+        log "terminating existing GUI runtime before starting a new one"
+    fi
+
+    docker exec -u 0 "${container_name}" /bin/sh -lc '
+        pkill -TERM -f "[m]mltk-browser-host" 2>/dev/null || true
+        for _ in $(seq 1 50); do
+            if ! pgrep -f "[m]mltk-browser-host" >/dev/null 2>&1; then
+                exit 0
+            fi
+            sleep 0.1
+        done
+        pkill -KILL -f "[m]mltk-browser-host" 2>/dev/null || true
+    ' >/dev/null 2>&1 || true
+}
+
+build_exec_env_args() {
+    exec_env_args=()
+    exec_env_args+=(-e "MMLTK_RFDETR_TEST_CACHE_DIR=/host${cache_root}/tests/rfdetr")
+    if [[ -n "${MMLTK_LOG_LEVEL:-}" ]]; then
+        exec_env_args+=(-e "MMLTK_LOG_LEVEL=${MMLTK_LOG_LEVEL}")
+    fi
+    if [[ -n "${MMLTK_LOG_FILE:-}" ]]; then
+        exec_env_args+=(-e "MMLTK_LOG_FILE=$(rewrite_host_path "${MMLTK_LOG_FILE}")")
+    elif [[ -z "${MMLTK_LOG_DIR:-}" ]]; then
+        exec_env_args+=(-e "MMLTK_LOG_DIR=/host${repo_root}/.mmltk-data/logs")
+    fi
+    if [[ -n "${MMLTK_LOG_DIR:-}" ]]; then
+        exec_env_args+=(-e "MMLTK_LOG_DIR=$(rewrite_host_path "${MMLTK_LOG_DIR}")")
+    fi
+    if (( gui_mode )); then
+        resolve_gui_session
+
+        exec_env_args+=(
+            -e "XDG_SESSION_TYPE=${gui_platform}"
+            -e "XDG_RUNTIME_DIR=${gui_runtime_dir_container}"
+            -e "GDK_BACKEND=wayland"
+            -e "MMLTK_BROWSER_APP_ASSET_ROOT=/host${gui_build_dist_dir}"
+            # Force libglvnd to use NVIDIA's EGL ICD only; Mesa's ICD still
+            # runs probes on NVIDIA PCI IDs and emits noise ("pci id ...
+            # driver (null)") but more importantly can win the selection
+            # race on some loaders.
+            -e "__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+            -e "GBM_BACKEND=nvidia-drm"
+        )
+
+        exec_env_args+=(
+            -e "WAYLAND_DISPLAY=$(basename "${gui_wayland_socket_container_path}")"
+        )
+
+        if [[ -n "${gui_dbus_socket_container_path}" && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+            exec_env_args+=(
+                -e "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS/unix:path=${gui_dbus_socket_host_path}/unix:path=${gui_dbus_socket_container_path}}"
+            )
+        fi
+
+        if [[ -n "${__NV_PRIME_RENDER_OFFLOAD:-}" ]]; then
+            exec_env_args+=(-e "__NV_PRIME_RENDER_OFFLOAD=${__NV_PRIME_RENDER_OFFLOAD}")
+        fi
+
+        if [[ -n "${MMLTK_GUI_TRACE_FILE:-}" ]]; then
+            exec_env_args+=(-e "MMLTK_GUI_TRACE_FILE=$(rewrite_host_path "${MMLTK_GUI_TRACE_FILE}")")
+        fi
+        if [[ -n "${MMLTK_FIREFOX_LOG_FILE:-}" ]]; then
+            exec_env_args+=(-e "MMLTK_FIREFOX_LOG_FILE=$(rewrite_host_path "${MMLTK_FIREFOX_LOG_FILE}")")
+        fi
+        if [[ -n "${MMLTK_FIREFOX_BINARY:-}" ]]; then
+            exec_env_args+=(-e "MMLTK_FIREFOX_BINARY=$(rewrite_host_path "${MMLTK_FIREFOX_BINARY}")")
+        fi
+
+    fi
+}
+
+run_tidy() {
+    acquire_mutation_locks
+    prepare_tidy_logging
+    ensure_docker
+    ensure_analysis_image
+    prepare_compiler_cache_dirs
+    build_common_group_args
+
+    local -a docker_args=(run --rm --init -i)
+    if [[ -t 0 && -t 1 ]]; then
+        docker_args+=(-t)
+    fi
+    docker_args+=(
+        --user "${uid}:${gid}"
+        --env "HOME=/host${cache_root}/container-home"
+        --env "CCACHE_BASEDIR=/host${repo_root}"
+        --env "CCACHE_DIR=/host${ccache_root}"
+        --env "CCACHE_TEMPDIR=/host${ccache_root}/tmp"
+        --env CCACHE_NOHASHDIR=1
+        --env CCACHE_MAXSIZE=50G
+        --env CCACHE_SLOPPINESS=pch_defines,time_macros
+        --env "MMLTK_REPO_ROOT=/host${repo_root}"
+        --env "MMLTK_TIDY_BUILD_DIR=/host${cmake_cache_root}/analysis"
+        --env "MMLTK_TIDY_LOG_FILE=/host${MMLTK_TIDY_LOG_FILE}"
+        --env "MMLTK_TIDY_TEE_STARTED=${MMLTK_TIDY_TEE_STARTED}"
+        --volume /:/host:rw
+        --workdir "/host${host_workdir}"
+    )
+    docker_args+=("${common_group_args[@]}")
+    docker_args+=(
+        "${analysis_image_name}"
+        /bin/bash
+        "/host${repo_root}/utilities/run_static_analysis.sh"
+    )
+    docker_args+=("${rewritten_args[@]}")
+
+    docker "${docker_args[@]}"
+    release_mutation_locks
+}
+
+prepare_compiler_cache_dirs() {
+    prepare_owned_dirs \
+        "${cache_root}/container-home" \
+        "${cmake_cache_root}" \
+        "${cargo_cache_root}/home" \
+        "${cargo_cache_root}/target/browser-app" \
+        "${ccache_root}" \
+        "${ccache_root}/tmp" \
+        "${firefox_cache_root}/obj-minimal-opt" \
+        "${firefox_cache_root}/mozbuild" \
+        "${firefox_cache_root}/sccache" \
+        "${browser_app_cache_root}" \
+        "$(dirname "${release_stage_root}")" \
+        "${gui_build_root}" \
+        "${repo_root}/build"
+}
+
+run_toolchain_command() {
+    local command="$1"
+    local owned_container_name="${2:-}"
+    prepare_compiler_cache_dirs
+    local toolchain_identity
+    toolchain_identity="$(docker image inspect "${build_image_name}" --format '{{.Id}}')"
+    local -a docker_args=(
+        run --rm --init
+        --cpuset-cpus "${build_cpu_list}"
+        --user "${uid}:${gid}"
+        --env "HOME=${container_cache_root}/container-home"
+        --env "CARGO_HOME=${container_cache_root}/cargo/home"
+        --env "CARGO_TARGET_DIR=${container_cache_root}/cargo/target/browser-app"
+        --env CARGO_BUILD_JOBS="${build_jobs}"
+        --env CMAKE_BUILD_PARALLEL_LEVEL="${build_jobs}"
+        --env CCACHE_BASEDIR=/workspace
+        --env "CCACHE_DIR=${container_cache_root}/ccache"
+        --env "CCACHE_TEMPDIR=${container_cache_root}/ccache/tmp"
+        --env CCACHE_NOHASHDIR=1
+        --env CCACHE_MAXSIZE=50G
+        --env CCACHE_SLOPPINESS=pch_defines,time_macros
+        --env "MMLTK_BROWSER_APP_STATE_DIR=${container_cache_root}/browser-app"
+        --env "MMLTK_CONTAINER_BROWSER_STAGE_ROOT=${container_browser_stage_root}"
+        --env "MMLTK_CONTAINER_CACHE_ROOT=${container_cache_root}"
+        --env "MMLTK_CONTAINER_RELEASE_STAGE_ROOT=${container_release_stage_root}"
+        --env "MMLTK_FIREFOX_CACHE_ROOT=${container_cache_root}/firefox"
+        --env "MMLTK_JOBS=${build_jobs}"
+        --env "MMLTK_TOOLCHAIN_ID=${toolchain_identity}"
+        --env "MOZBUILD_STATE_PATH=${container_cache_root}/firefox/mozbuild"
+        --env "SCCACHE_BASEDIRS=${container_firefox_sccache_basedirs}"
+        --env "SCCACHE_DIR=${container_cache_root}/firefox/sccache"
+        --env SCCACHE_CACHE_SIZE=20G
+        --volume "${repo_root}:/workspace:rw"
+        --workdir /workspace
+        --entrypoint /bin/bash
+    )
+    if [[ -n "${owned_container_name}" ]]; then
+        docker_args+=(--name "${owned_container_name}")
+    fi
+    if [[ -n "${MMLTK_PACKAGE_FINGERPRINT:-}" ]]; then
+        docker_args+=(--env "MMLTK_PACKAGE_FINGERPRINT=${MMLTK_PACKAGE_FINGERPRINT}")
+    fi
+    if [[ -n "${container_ccache_stats_file}" ]]; then
+        docker_args+=(--env "MMLTK_CCACHE_STATS_FILE=${container_ccache_stats_file}")
+    fi
+    if [[ -n "${container_firefox_sccache_stats_file}" ]]; then
+        docker_args+=(--env \
+            "MMLTK_FIREFOX_SCCACHE_STATS_FILE=${container_firefox_sccache_stats_file}")
+    fi
+    if [[ -n "${container_build_trace_file}" ]]; then
+        docker_args+=(--env "MMLTK_BUILD_TRACE_FILE=${container_build_trace_file}")
+    fi
+    if [[ -n "${container_firefox_stage_trace_file}" ]]; then
+        docker_args+=(--env \
+            "MMLTK_FIREFOX_STAGE_LOG_FILE=${container_firefox_stage_trace_file}")
+    fi
+    docker_args+=("${build_image_name}" -lc "${command}")
+    docker "${docker_args[@]}"
+}
+
+firefox_source_state_fingerprint() {
+    local toolchain_identity="$1"
+    {
+        printf 'mmltk-firefox-build-input-v1\0%s\0' "${toolchain_identity}"
+        sha256sum -- "${repo_root}/cmake/mmltk_firefox.cmake"
+        git -C "${repo_root}" rev-parse HEAD:third_party/firefox
+        git -C "${repo_root}" diff --no-ext-diff --binary \
+            HEAD -- third_party/firefox
+        local untracked_path
+        while IFS= read -r -d '' untracked_path; do
+            printf 'untracked\0%s\0%s\0' "${untracked_path}" \
+                "$(fingerprint_path "${repo_root}/${untracked_path}")"
+        done < <(git -C "${repo_root}" ls-files --others \
+            --exclude-standard -z -- third_party/firefox)
+    } | sha256sum | cut -d' ' -f1
+}
+
+firefox_runtime_cache_complete() {
+    local runtime_root="${firefox_cache_root}/obj-minimal-opt/dist/firefox"
+    local required_path
+    for required_path in \
+        firefox \
+        firefox-bin \
+        libxul.so \
+        libmozgtk.so \
+        libmozwayland.so \
+        application.ini \
+        platform.ini \
+        omni.ja \
+        browser/omni.ja; do
+        [[ -e "${runtime_root}/${required_path}" ]] || return 1
+    done
+}
+
+prepare_firefox_build_input() {
+    local toolchain_identity
+    toolchain_identity="$(docker image inspect "${build_image_name}" --format '{{.Id}}')"
+    local fingerprint
+    fingerprint="$(firefox_source_state_fingerprint "${toolchain_identity}")"
+    local next_fingerprint="${firefox_build_input_file}.next.$$"
+    printf '%s\n' "${fingerprint}" >"${next_fingerprint}"
+    if [[ -f "${firefox_build_input_file}" ]] \
+        && cmp -s -- "${next_fingerprint}" "${firefox_build_input_file}"; then
+        rm -f -- "${next_fingerprint}"
+    else
+        mv -f -- "${next_fingerprint}" "${firefox_build_input_file}"
+        chown "${uid}:${gid}" "${firefox_build_input_file}" 2>/dev/null || true
+        log "Firefox build inputs changed"
+    fi
+
+    local legacy_runtime_stamp=
+    legacy_runtime_stamp="${firefox_cache_root}/obj-minimal-opt/dist/.mmltk-runtime-stage.sha256"
+    if [[ ! -f "${firefox_built_input_file}" \
+        && -f "${legacy_runtime_stamp}" ]] \
+        && firefox_runtime_cache_complete; then
+        local newer_source
+        newer_source="$(find "${repo_root}/third_party/firefox" -type f \
+            -newer "${legacy_runtime_stamp}" -print -quit)"
+        if [[ -z "${newer_source}" ]]; then
+            cp -- "${firefox_build_input_file}" "${firefox_built_input_file}"
+            chown "${uid}:${gid}" "${firefox_built_input_file}" 2>/dev/null || true
+            log "adopted the completed Firefox runtime into fingerprinted build state"
+        fi
+    fi
+}
+
+run_release_ninja() {
+    log "building the unified Release Ninja graph with ${build_jobs} workers on CPUs ${build_cpu_list}"
+    run_toolchain_command \
+        'set -euo pipefail
+         capture_compiler_cache_stats() {
+             if [[ -n "${MMLTK_CCACHE_STATS_FILE:-}" ]]; then
+                 ccache --show-stats >"${MMLTK_CCACHE_STATS_FILE}" 2>&1 || true
+             fi
+             if [[ -n "${MMLTK_FIREFOX_SCCACHE_STATS_FILE:-}" ]]; then
+                 sccache_bin="${MOZBUILD_STATE_PATH}/sccache/sccache"
+                 if [[ -x "${sccache_bin}" ]]; then
+                     "${sccache_bin}" --show-stats \
+                         >"${MMLTK_FIREFOX_SCCACHE_STATS_FILE}" 2>&1 || true
+                 fi
+             fi
+         }
+         trap capture_compiler_cache_stats EXIT
+         if [[ -n "${MMLTK_CCACHE_STATS_FILE:-}" ]]; then
+             ccache --zero-stats
+         fi
+         sccache_bin="${MOZBUILD_STATE_PATH}/sccache/sccache"
+         if [[ -x "${sccache_bin}" && -n "${MMLTK_FIREFOX_SCCACHE_STATS_FILE:-}" ]]; then
+             "${sccache_bin}" --zero-stats || true
+         fi
+         /workspace/utilities/run_traced_command.sh cargo_fetch \
+             cargo fetch --locked \
+             --manifest-path /workspace/src/browser/app/Cargo.toml \
+             --target wasm32-unknown-unknown
+         /workspace/utilities/configure_cmake_graph.sh \
+             release "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release" \
+             -DMMLTK_BROWSER_APP_STAGE_DIR="${MMLTK_CONTAINER_BROWSER_STAGE_ROOT}" \
+             -DMMLTK_BROWSER_APP_STATE_DIR="${MMLTK_BROWSER_APP_STATE_DIR}" \
+             -DMMLTK_BUILD_JOBS="${MMLTK_JOBS}" \
+             -DMMLTK_FIREFOX_CACHE_ROOT="${MMLTK_FIREFOX_CACHE_ROOT}"
+         /workspace/utilities/run_traced_command.sh ninja_build \
+             cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release" \
+             --parallel "${MMLTK_JOBS}"' \
+        "${release_build_container_name}"
+}
+
+run_release_branch() {
+    ensure_build_image
+    prepare_firefox_build_input
+    run_release_ninja
+}
+
+fingerprint_path() {
+    local root="$1"
+    if [[ -d "${root}" ]]; then
+        (
+            cd "${root}"
+            printf 'directory\0'
+            local relative_path
+            while IFS= read -r -d '' relative_path; do
+                printf '%s\0%s\0' "$(stat -c '%a' -- "${relative_path}")" "${relative_path}"
+                if [[ -L "${relative_path}" ]]; then
+                    printf 'link\0%s\0' "$(readlink -- "${relative_path}")"
+                else
+                    sha256sum -- "${relative_path}" | cut -d' ' -f1
+                fi
+            done < <(find . \( -type f -o -type l \) -print0 | sort -z)
+        ) | sha256sum | cut -d' ' -f1
+    elif [[ -f "${root}" || -L "${root}" ]]; then
+        {
+            printf 'file\0%s\0' "$(stat -c '%a' -- "${root}")"
+            if [[ -L "${root}" ]]; then
+                printf 'link\0%s\0' "$(readlink -- "${root}")"
+            else
+                sha256sum -- "${root}" | cut -d' ' -f1
+            fi
+        } | sha256sum | cut -d' ' -f1
+    else
+        printf 'missing\n' | sha256sum | cut -d' ' -f1
+    fi
+}
+
+release_package_fingerprint() {
+    local release_root="${cmake_cache_root}/release"
+    local toolchain_identity
+    toolchain_identity="$(docker image inspect "${build_image_name}" --format '{{.Id}}')"
+    {
+        printf 'mmltk-release-package-v2\n%s\n' "${toolchain_identity}"
+        local output_path
+        for output_path in \
+            mmltk \
+            mmltk-browser-host \
+            mmltk-rfdetr-onnx-info \
+            mmltk-rfdetr-onnx-simplify \
+            libmmltk_core.so \
+            libmmltk_logging.so \
+            libmmltk_rfdetr_native.so; do
+            printf '%s %s\n' "${output_path}" \
+                "$(fingerprint_path "${release_root}/${output_path}")"
+        done
+        while IFS= read -r -d '' output_path; do
+            printf '%s %s\n' "${output_path#"${release_root}/"}" \
+                "$(fingerprint_path "${output_path}")"
+        done < <(find "${release_root}" -type f -name cmake_install.cmake -print0 | sort -z)
+        printf 'browser %s\n' "$(fingerprint_path "${gui_build_dist_dir}")"
+        printf 'firefox %s\n' \
+            "$(fingerprint_path "${firefox_cache_root}/obj-minimal-opt/dist/firefox")"
+        printf 'python-checkpoint %s\n' \
+            "$(fingerprint_path "${repo_root}/utilities/rfdetr_checkpoint_bridge.py")"
+        printf 'python-vast %s\n' \
+            "$(fingerprint_path "${repo_root}/utilities/vast_bridge.py")"
+    } | sha256sum | cut -d' ' -f1
+}
+
+release_stage_complete() {
+    local stage_root="$1"
+    local required_path
+    for required_path in \
+        bin/mmltk \
+        bin/mmltk-browser-host \
+        lib/mmltk/firefox/firefox \
+        lib/mmltk/firefox/firefox-bin \
+        lib/mmltk/firefox/libxul.so \
+        lib/mmltk/firefox/libmozgtk.so \
+        lib/mmltk/firefox/libmozwayland.so \
+        lib/mmltk/firefox/application.ini \
+        lib/mmltk/firefox/platform.ini \
+        lib/mmltk/firefox/omni.ja \
+        lib/mmltk/firefox/browser/omni.ja \
+        share/mmltk/browser-app/index.html; do
+        [[ -e "${stage_root}/${required_path}" ]] || return 1
+    done
+    return 0
+}
+
+native_stage_fingerprint() {
+    local stage_root="$1"
+    {
+        printf 'bin %s\n' "$(fingerprint_path "${stage_root}/bin")"
+        printf 'python %s\n' "$(fingerprint_path "${stage_root}/share/mmltk/python")"
+        local library_path
+        while IFS= read -r -d '' library_path; do
+            printf '%s %s\n' "${library_path#"${stage_root}/lib/"}" \
+                "$(fingerprint_path "${library_path}")"
+        done < <(find "${stage_root}/lib" -maxdepth 1 \
+            \( -type f -o -type l \) -print0 | sort -z)
+    } | sha256sum | cut -d' ' -f1
+}
+
+runtime_image_fingerprint() {
+    local stage_root="$1"
+    local runtime_base_identity="$2"
+    {
+        printf 'mmltk-runtime-image-v2\n%s\n' "${runtime_base_identity}"
+        sha256sum "${repo_root}/docker/Dockerfile.runtime"
+        printf 'native %s\n' "$(native_stage_fingerprint "${stage_root}")"
+        printf 'firefox %s\n' \
+            "$(fingerprint_path "${stage_root}/lib/mmltk/firefox")"
+        printf 'browser %s\n' \
+            "$(fingerprint_path "${stage_root}/share/mmltk/browser-app")"
+    } | sha256sum | cut -d' ' -f1
+}
+
+build_runtime_image() {
+    local stage_root="$1"
+    local runtime_base_identity
+    runtime_base_identity="$(docker image inspect "${runtime_base_image_name}" --format '{{.Id}}')"
+    local release_fingerprint
+    release_fingerprint="$(runtime_image_fingerprint \
+        "${stage_root}" "${runtime_base_identity}")"
+    local current_release_fingerprint=""
+    local current_runtime_base_identity=""
+    if docker image inspect "${image_name}" >/dev/null 2>&1; then
+        current_release_fingerprint="$(docker image inspect "${image_name}" \
+            --format '{{ index .Config.Labels "com.mmltk.release-fingerprint" }}' \
+            2>/dev/null || true)"
+        current_runtime_base_identity="$(docker image inspect "${image_name}" \
+            --format '{{ index .Config.Labels "com.mmltk.runtime-base-identity" }}' \
+            2>/dev/null || true)"
+    fi
+    if [[ "${current_release_fingerprint}" == "${release_fingerprint}" \
+        && "${current_runtime_base_identity}" == "${runtime_base_identity}" ]]; then
+        log "runtime image is current"
+        trace_build_event runtime_image cache_hit
+        return 0
+    fi
+
+    trace_build_event runtime_image cache_miss
+    docker buildx inspect default >/dev/null || die \
+        "Docker's default Engine-backed Buildx builder is unavailable"
+    docker buildx build \
+        --builder default \
+        --progress=plain \
+        --load \
+        --file "${repo_root}/docker/Dockerfile.runtime" \
+        --build-arg "MMLTK_RUNTIME_BASE_IMAGE=${runtime_base_image_name}" \
+        --build-arg "MMLTK_RELEASE_FINGERPRINT=${release_fingerprint}" \
+        --build-arg "MMLTK_RUNTIME_BASE_IDENTITY=${runtime_base_identity}" \
+        --tag "${image_name}" \
+        "${stage_root}"
+    current_release_fingerprint="$(docker image inspect "${image_name}" \
+        --format '{{ index .Config.Labels "com.mmltk.release-fingerprint" }}')"
+    current_runtime_base_identity="$(docker image inspect "${image_name}" \
+        --format '{{ index .Config.Labels "com.mmltk.runtime-base-identity" }}')"
+    [[ "${current_release_fingerprint}" == "${release_fingerprint}" ]] || die \
+        "runtime image release fingerprint label does not match staged outputs"
+    [[ "${current_runtime_base_identity}" == "${runtime_base_identity}" ]] || die \
+        "runtime image base identity label does not match ${runtime_base_image_name}"
+}
+
+stage_release_and_runtime() {
+    local package_fingerprint
+    package_fingerprint="$(release_package_fingerprint)"
+    if release_stage_complete "${release_stage_root}" \
+        && [[ -f "${release_stage_root}/.mmltk-package-fingerprint" ]] \
+        && [[ "$(<"${release_stage_root}/.mmltk-package-fingerprint")" == "${package_fingerprint}" ]]; then
+        log "staged release is current"
+        trace_build_event package cache_hit
+        build_runtime_image "${release_stage_root}"
+        return
+    fi
+
+    trace_build_event package cache_miss
+    local next_stage="${release_stage_root}.next"
+    export MMLTK_PACKAGE_FINGERPRINT="${package_fingerprint}"
+    log "installing release into ${next_stage}"
+    run_toolchain_command \
+        'set -euo pipefail
+         next_stage="${MMLTK_CONTAINER_RELEASE_STAGE_ROOT}.next"
+         rm -rf -- "${next_stage}"
+         cmake --install "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release" \
+             --prefix "${next_stage}"
+         printf "%s\n" "${MMLTK_PACKAGE_FINGERPRINT}" >"${next_stage}/.mmltk-package-fingerprint"'
+    unset MMLTK_PACKAGE_FINGERPRINT
+    release_stage_complete "${next_stage}" || die "staged release is incomplete"
+    [[ -f "${next_stage}/.mmltk-package-fingerprint" \
+        && "$(<"${next_stage}/.mmltk-package-fingerprint")" == "${package_fingerprint}" ]] \
+        || die "staged release fingerprint is incomplete"
+
+    build_runtime_image "${next_stage}"
+    local previous_stage="${release_stage_root}.previous"
+    rm -rf -- "${previous_stage}"
+    if [[ -e "${release_stage_root}" ]]; then
+        mv "${release_stage_root}" "${previous_stage}"
+    fi
+    mv "${next_stage}" "${release_stage_root}"
+    rm -rf -- "${previous_stage}"
+}
+
+wait_for_parallel_builds() {
+    local remaining="${#active_build_pids[@]}"
+    local exit_status=0
+    while (( remaining > 0 )); do
+        if wait -n; then
+            remaining=$((remaining - 1))
+        else
+            exit_status=$?
+            log "parallel build job failed with exit status ${exit_status}; stopping its peer"
+            terminate_active_builds
+            return "${exit_status}"
+        fi
+    done
+    active_build_pids=()
+    active_build_container_names=()
+}
+
+run_gui_build() {
+    acquire_mutation_locks
+    ensure_docker
+    prepare_cache_layout
+    ensure_build_image
+    log "building iced Release bundle into ${gui_build_dist_dir}"
+    run_toolchain_command \
+        'set -euo pipefail
+         cargo fetch --locked \
+             --manifest-path /workspace/src/browser/app/Cargo.toml \
+             --target wasm32-unknown-unknown
+         /workspace/utilities/configure_cmake_graph.sh \
+             gui "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" \
+             -DMMLTK_BROWSER_APP_STAGE_DIR="${MMLTK_CONTAINER_BROWSER_STAGE_ROOT}" \
+             -DMMLTK_BROWSER_APP_STATE_DIR="${MMLTK_BROWSER_APP_STATE_DIR}"
+         cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" \
+             --parallel "${MMLTK_JOBS}" --target mmltk_browser_app'
+    release_mutation_locks
+}
+
+print_test_suites() {
+    printf '%s\n' \
+        'Test suites' \
+        '  core    Core dataset/runtime/compiler Catch2 suite' \
+        '  gui     GUI state/options/runtime Catch2 suite plus browser checks' \
+        '  rfdetr  RF-DETR native/model Catch2 suite' \
+        '  all     Build and run every suite' \
+        '' \
+        'Use: ./mmltk --test <core|gui|rfdetr|all> [-- <Catch2 args...>]'
+}
+
+run_test_executable() {
+    local executable="$1"
+    shift
+
+    prepare_owned_dirs \
+        "${cache_root}/tests/rfdetr" \
+        "${repo_root}/.mmltk-data/logs"
+    build_common_group_args
+    local -a docker_args=(
+        run --rm --init -i
+        --gpus all
+        --ipc host
+        --network host
+        --user "${uid}:${gid}"
+        --env "HOME=${container_cache_root}/container-home"
+        --env NVIDIA_DRIVER_CAPABILITIES=all
+        --env MMLTK_REPO_ROOT=/workspace
+        --env "MMLTK_RFDETR_TEST_CACHE_DIR=${container_cache_root}/tests/rfdetr"
+        --volume "${repo_root}:/workspace:rw"
+        --volume /:/host:rw
+        --workdir /workspace
+    )
+    if [[ -t 0 && -t 1 ]]; then
+        docker_args+=(-t)
+    fi
+    if [[ -n "${MMLTK_LOG_LEVEL:-}" ]]; then
+        docker_args+=(--env "MMLTK_LOG_LEVEL=${MMLTK_LOG_LEVEL}")
+    fi
+    if [[ -n "${MMLTK_LOG_FILE:-}" ]]; then
+        docker_args+=(--env "MMLTK_LOG_FILE=$(rewrite_host_path "${MMLTK_LOG_FILE}")")
+    elif [[ -z "${MMLTK_LOG_DIR:-}" ]]; then
+        docker_args+=(--env MMLTK_LOG_DIR=/workspace/.mmltk-data/logs)
+    fi
+    if [[ -n "${MMLTK_LOG_DIR:-}" ]]; then
+        docker_args+=(--env "MMLTK_LOG_DIR=$(rewrite_host_path "${MMLTK_LOG_DIR}")")
+    fi
+    docker_args+=("${common_group_args[@]}")
+    docker_args+=(--entrypoint "${executable}" "${build_image_name}")
+    docker_args+=("$@")
+    docker "${docker_args[@]}"
+}
+
+run_tests() {
+    local suite="$1"
+    shift
+
+    if [[ "${suite}" == "list" || "${suite}" == "help" || "${suite}" == "-h" || "${suite}" == "--help" ]]; then
+        (($# == 0)) || die "--test ${suite} does not accept additional arguments"
+        print_test_suites
+        return 0
+    fi
+
+    local -a targets=()
+    local -a executables=()
+    case "${suite}" in
+        core)
+            targets=(mmltk_tests_core)
+            executables=(mmltk_tests_core)
+            ;;
+        gui)
+            targets=(mmltk_tests_gui mmltk_browser_app_check)
+            executables=(mmltk_tests_gui)
+            ;;
+        rfdetr)
+            targets=(mmltk_tests_model_rfdetr)
+            executables=(mmltk_tests_model_rfdetr)
+            ;;
+        all)
+            targets=(
+                mmltk_tests_core
+                mmltk_tests_gui
+                mmltk_tests_model_rfdetr
+                mmltk_browser_app_check
+            )
+            executables=(mmltk_tests_core mmltk_tests_gui mmltk_tests_model_rfdetr)
+            ;;
+        *)
+            print_test_suites >&2
+            die "unknown test suite '${suite}'"
+            ;;
+    esac
+
+    acquire_mutation_locks
+    ensure_docker
+    prepare_cache_layout
+    ensure_build_image
+    local target_list="${targets[*]}"
+    log "building cached ${suite} test graph with ${build_jobs} workers"
+    run_toolchain_command \
+        "set -euo pipefail
+         cargo fetch --locked \
+             --manifest-path /workspace/src/browser/app/Cargo.toml \
+             --target wasm32-unknown-unknown
+         /workspace/utilities/configure_cmake_graph.sh \
+             release \"\${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release\" \
+             -DMMLTK_BROWSER_APP_STAGE_DIR=\"\${MMLTK_CONTAINER_BROWSER_STAGE_ROOT}\" \
+             -DMMLTK_BROWSER_APP_STATE_DIR=\"\${MMLTK_BROWSER_APP_STATE_DIR}\" \
+             -DMMLTK_BUILD_JOBS=\"\${MMLTK_JOBS}\" \
+             -DMMLTK_FIREFOX_CACHE_ROOT=\"\${MMLTK_FIREFOX_CACHE_ROOT}\"
+         cmake --build \"\${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release\" \
+             --parallel \"\${MMLTK_JOBS}\" --target ${target_list}"
+
+    local first_failure=0
+    local executable
+    for executable in "${executables[@]}"; do
+        log "running ${executable}"
+        local exit_status=0
+        if run_test_executable "${container_cache_root}/cmake/release/${executable}" "$@"; then
+            continue
+        else
+            exit_status=$?
+        fi
+        if (( first_failure == 0 )); then
+            first_failure="${exit_status}"
+        fi
+        if [[ "${suite}" != "all" ]]; then
+            release_mutation_locks
+            return "${exit_status}"
+        fi
+    done
+    release_mutation_locks
+    return "${first_failure}"
+}
+
+prepare_release_build_environment() {
+    acquire_mutation_locks
+    ensure_docker
+    prepare_cache_layout
+}
+
+run_build() {
+    acquire_mutation_locks
+    initialize_build_trace
+    trace_build_event build start
+    trace_build_job_assignment
+    trace_failed_build() {
+        local exit_status=$?
+        trap - ERR
+        trace_build_event build finish "failure:${exit_status}"
+        return "${exit_status}"
+    }
+    trap trace_failed_build ERR
+    run_traced_build_phase bootstrap prepare_release_build_environment
+    run_traced_build_phase buildx ensure_buildx_builder
+    buildx_builder_ready=1
+    docker rm -f "${release_build_container_name}" >/dev/null 2>&1 || true
+    active_build_container_names=("${release_build_container_name}")
+    run_traced_build_phase release_ninja run_release_branch &
+    active_build_pids+=("$!")
+    run_traced_build_phase runtime_base ensure_runtime_base_image &
+    active_build_pids+=("$!")
+    if wait_for_parallel_builds; then
+        :
+    else
+        local exit_status=$?
+        trap - ERR
+        trace_build_event build finish "failure:${exit_status}"
+        return "${exit_status}"
+    fi
+    run_traced_build_phase package stage_release_and_runtime
+    release_mutation_locks
+    trace_build_event build finish success
+    trap - ERR
+}
+
+reset_gui_session_resolution() {
+    gui_platform=""
+    gui_wayland_socket_host_path=""
+    gui_wayland_socket_container_path=""
+    gui_dbus_socket_host_path=""
+    gui_dbus_socket_container_path=""
+    bind_mount_specs=()
+    desired_runtime_label=""
+    exec_env_args=()
+}
+
+prepare_container_invocation() {
+    if (( gui_mode && !prepare_gui_container_mode )) && [[ ! -f "${gui_build_dist_dir}/index.html" ]]; then
+        die "GUI bundle is missing. Build it with ./mmltk --build or ./mmltk --build-gui"
+    fi
+
+    container_cleanup_armed=1
+    ensure_container
+    terminate_existing_gui_instances
+    build_exec_env_args
+
+    container_workdir="/host${host_workdir}"
+    settings_container_path="$(rewrite_host_path "${settings_host_path}")"
+
+    exec_args=(exec -i)
+    interactive_tty=0
+    if [[ -t 0 && -t 1 ]]; then
+        exec_args+=(-t)
+        interactive_tty=1
+    fi
+    exec_args+=("${exec_env_args[@]}" -w "${container_workdir}" "${container_name}")
+
+    if (( gui_mode )); then
+        container_command=(/opt/mmltk/bin/mmltk-browser-host --settings-path "${settings_container_path}")
+        log "using packaged GUI bundle from ${gui_build_dist_dir}"
+        if ((${#rewritten_args[@]} > 0)); then
+            container_command+=(--seed-from-cli -- "${rewritten_args[@]}")
+        fi
+    else
+        container_command=(/opt/mmltk/bin/mmltk "${rewritten_args[@]}")
+    fi
+
+    # When the caller redirects stdout/stderr (e.g. `./mmltk --gui 2>&1 | tee
+    # log`), docker attaches the child process to pipes instead of a pty. glibc
+    # then block-buffers stderr — on a crash the last diagnostics may disappear.
+    # Line-buffer with stdbuf so
+    # every newline flushes. Skip when already on a TTY since a terminal is
+    # line-buffered natively and stdbuf would be a no-op wrapper.
+    if (( ! interactive_tty )); then
+        container_command=(stdbuf -oL -eL "${container_command[@]}")
+    fi
+}
+
+run_prepared_container_invocation() {
+    docker "${exec_args[@]}" "${container_command[@]}" <&0 &
+    active_docker_pid=$!
+    local exit_status=0
+    if wait "${active_docker_pid}"; then
+        exit_status=0
+    else
+        exit_status=$?
+    fi
+    active_docker_pid=0
+    return "${exit_status}"
+}
+
+gui_mode=0
+build_mode=0
+build_gui_mode=0
+tidy_mode=0
+prepare_gui_container_mode=0
+test_mode=0
+test_suite=""
+test_args=()
+passthrough_args=()
+for arg in "$@"; do
+    if [[ "${arg}" == "--gui" ]]; then
+        gui_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--build" ]]; then
+        build_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--build-gui" ]]; then
+        build_gui_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--prepare-gui-container" ]]; then
+        gui_mode=1
+        prepare_gui_container_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--tidy" ]]; then
+        tidy_mode=1
+        continue
+    fi
+    passthrough_args+=("${arg}")
+done
+
+if ((${#passthrough_args[@]} > 0)); then
+    if [[ "${passthrough_args[0]}" == "--test" ]]; then
+        test_mode=1
+        ((${#passthrough_args[@]} >= 2)) || die "--test requires a suite name; use './mmltk --test list'"
+        test_suite="${passthrough_args[1]}"
+        test_args=("${passthrough_args[@]:2}")
+    elif [[ "${passthrough_args[0]}" == --test=* ]]; then
+        test_mode=1
+        test_suite="${passthrough_args[0]#--test=}"
+        [[ -n "${test_suite}" ]] || die "--test requires a suite name; use './mmltk --test list'"
+        test_args=("${passthrough_args[@]:1}")
+    fi
+fi
+if ((${#test_args[@]} > 0)) && [[ "${test_args[0]}" == "--" ]]; then
+    test_args=("${test_args[@]:1}")
+fi
+
+if (( build_mode + build_gui_mode + tidy_mode + test_mode > 1 ||
+      (build_mode || tidy_mode || test_mode) && gui_mode )); then
+    die "--build, --test, and --tidy are standalone; --build-gui cannot be combined with them"
+fi
+
+if (( test_mode )); then
+    run_tests "${test_suite}" "${test_args[@]}"
+    exit $?
+fi
+
+rewrite_passthrough_args
+
+if (( tidy_mode )); then
+    run_tidy
+    exit $?
+fi
+
+if (( build_mode )); then
+    if ((${#passthrough_args[@]} > 0)); then
+        die "--build does not accept application arguments"
+    fi
+    run_build
+    exit $?
+fi
+
+if (( build_gui_mode )); then
+    if (( ! gui_mode && ${#passthrough_args[@]} > 0 )); then
+        die "--build-gui without --gui does not accept application arguments"
+    fi
+    run_gui_build
+    if (( ! gui_mode )); then
+        exit 0
+    fi
+fi
+
+prepare_container_invocation
+
+if (( prepare_gui_container_mode )); then
+    exit 0
+fi
+
+run_prepared_container_invocation

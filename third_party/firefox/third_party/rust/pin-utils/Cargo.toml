@@ -1,0 +1,10 @@
+
+[package]
+edition = "2018"
+name = "pin-utils"
+version = "0.1.0"
+authors = ["Josef Brandl <mail@josefbrandl.de>"]
+description = "Utilities for pinning\n"
+documentation = "https://docs.rs/pin-utils"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-lang-nursery/pin-utils"

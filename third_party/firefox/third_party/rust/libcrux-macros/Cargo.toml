@@ -1,0 +1,28 @@
+
+[package]
+edition = "2021"
+name = "libcrux-macros"
+version = "0.0.3"
+authors = ["Cryspen"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Macros needed in libcrux"
+homepage = "https://github.com/cryspen/libcrux"
+license = "Apache-2.0"
+repository = "https://github.com/cryspen/libcrux"
+
+[lib]
+name = "libcrux_macros"
+path = "src/lib.rs"
+proc-macro = true
+
+[dependencies.quote]
+version = "1.0.37"
+
+[dependencies.syn]
+version = "2.0.89"
+features = ["full"]

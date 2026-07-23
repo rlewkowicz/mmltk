@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(netwerk_dns_GetAddrInfo_h)
+#define netwerk_dns_GetAddrInfo_h
+
+#include "nsError.h"
+#include "nscore.h"
+#include "nsINativeDNSResolverOverride.h"
+#include "nsHashKeys.h"
+#include "nsTHashMap.h"
+#include "mozilla/RWLock.h"
+#include "nsTArray.h"
+#include "prio.h"
+#include "mozilla/net/DNS.h"
+#include "nsIDNSByTypeRecord.h"
+#include "mozilla/Logging.h"
+#include "nsIDNSService.h"
+
+#  undef DNSQUERY_AVAILABLE
+
+namespace mozilla {
+namespace net {
+
+extern LazyLogModule gGetAddrInfoLog;
+class AddrInfo;
+class DNSPacket;
+
+nsresult GetAddrInfo(const nsACString& aHost, uint16_t aAddressFamily,
+                     nsIDNSService::DNSFlags aFlags, AddrInfo** aAddrInfo,
+                     bool aGetTtl);
+
+nsresult GetAddrInfoInit();
+
+nsresult GetAddrInfoShutdown();
+
+void DNSThreadShutdown();
+
+nsresult ResolveHTTPSRecord(const nsACString& aHost,
+                            nsIDNSService::DNSFlags aFlags,
+                            TypeRecordResultType& aResult, uint32_t& aTTL);
+
+nsresult ResolveHTTPSRecordImpl(const nsACString& aHost,
+                                nsIDNSService::DNSFlags aFlags,
+                                TypeRecordResultType& aResult, uint32_t& aTTL);
+
+nsresult ParseHTTPSRecord(nsCString& aHost, DNSPacket& aDNSPacket,
+                          TypeRecordResultType& aResult, uint32_t& aTTL);
+
+nsresult CreateAndResolveMockHTTPSRecord(const nsACString& aHost,
+                                         nsIDNSService::DNSFlags aFlags,
+                                         TypeRecordResultType& aResult,
+                                         uint32_t& aTTL);
+
+class NativeDNSResolverOverride : public nsINativeDNSResolverOverride {
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSINATIVEDNSRESOLVEROVERRIDE
+ public:
+  NativeDNSResolverOverride() = default;
+
+  static already_AddRefed<nsINativeDNSResolverOverride> GetSingleton();
+
+ private:
+  virtual ~NativeDNSResolverOverride() = default;
+  mozilla::RWLock mLock{"NativeDNSResolverOverride"};
+
+  nsTHashMap<nsCStringHashKey, nsTArray<NetAddr>> mOverrides
+      MOZ_GUARDED_BY(mLock);
+  nsTHashMap<nsCStringHashKey, nsCString> mCnames MOZ_GUARDED_BY(mLock);
+  nsTHashMap<nsCStringHashKey, nsTArray<uint8_t>> mHTTPSRecordOverrides
+      MOZ_GUARDED_BY(mLock);
+
+  friend bool FindAddrOverride(const nsACString& aHost, uint16_t aAddressFamily,
+                               nsIDNSService::DNSFlags aFlags,
+                               AddrInfo** aAddrInfo);
+  friend bool FindHTTPSRecordOverride(const nsACString& aHost,
+                                      TypeRecordResultType& aResult);
+};
+
+}  
+}  
+
+#endif

@@ -1,0 +1,1560 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "vm/JSContext-inl.h"
+
+#include "mozilla/CheckedInt.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Sprintf.h"
+#include "mozilla/Utf8.h"  // mozilla::ConvertUtf16ToUtf8
+
+#include <string.h>
+
+#include "jsapi.h"  // JS_SetNativeStackQuota
+#include "jstypes.h"
+
+#include "builtin/RegExp.h"  // js::RegExpSearcherLastLimitSentinel
+#if defined(MOZ_EXECUTION_TRACING)
+#  include "debugger/ExecutionTracer.h"
+#endif
+#include "frontend/FrontendContext.h"
+#include "gc/GC.h"
+#include "gc/PublicIterators.h"  // js::RealmsIter
+#include "irregexp/RegExpAPI.h"
+#include "jit/Simulator.h"
+#include "js/CallAndConstruct.h"  // JS::Call
+#include "js/CharacterEncoding.h"
+#include "js/ContextOptions.h"        // JS::ContextOptions
+#include "js/ErrorInterceptor.h"      // JSErrorInterceptor
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#include "js/friend/MicroTask.h"
+#include "js/friend/StackLimits.h"  // js::ReportOverRecursed
+#include "js/MemoryCallbacks.h"
+#include "js/Prefs.h"
+#include "js/Printf.h"
+#include "js/PropertyAndElement.h"  // JS_GetProperty
+#include "js/Stack.h"  // JS::NativeStackSize, JS::NativeStackLimit, JS::NativeStackLimitMin
+#include "util/DiagnosticAssertions.h"
+#include "util/DoubleToString.h"
+#include "util/NativeStack.h"
+#include "util/Text.h"
+#include "js/friend/DumpFunctions.h"  // for stack trace utilities
+#include "js/Printer.h"               // for FixedBufferPrinter
+#include "vm/BytecodeUtil.h"          // JSDVG_IGNORE_STACK
+#include "vm/ErrorObject.h"
+#include "vm/ErrorReporting.h"
+#include "vm/FrameIter.h"
+#include "vm/JSFunction.h"
+#include "vm/JSObject.h"
+#include "vm/PlainObject.h"  // js::PlainObject
+#include "vm/Realm.h"
+#include "vm/StringType.h"  // StringToNewUTF8CharsZ
+#include "vm/ToSource.h"    // js::ValueToSource
+
+#include "vm/Compartment-inl.h"
+#include "vm/JSObject-inl.h"
+#include "vm/Stack-inl.h"
+
+using namespace js;
+
+#if defined(DEBUG)
+JSContext* js::MaybeGetJSContext() {
+  if (!TlsContext.init()) {
+    return nullptr;
+  }
+  return TlsContext.get();
+}
+#endif
+
+bool js::AutoCycleDetector::init() {
+  MOZ_ASSERT(cyclic);
+
+  AutoCycleDetector::Vector& vector = cx->cycleDetectorVector();
+
+  for (JSObject* obj2 : vector) {
+    if (MOZ_UNLIKELY(obj == obj2)) {
+      return true;
+    }
+  }
+
+  if (!vector.append(obj)) {
+    return false;
+  }
+
+  cyclic = false;
+  return true;
+}
+
+js::AutoCycleDetector::~AutoCycleDetector() {
+  if (MOZ_LIKELY(!cyclic)) {
+    AutoCycleDetector::Vector& vec = cx->cycleDetectorVector();
+    MOZ_ASSERT(vec.back() == obj);
+    if (vec.length() > 1) {
+      vec.popBack();
+    } else {
+      vec.clearAndFree();
+    }
+  }
+}
+
+bool JSContext::init() {
+  TlsContext.set(this);
+  nativeStackBase_.emplace(GetNativeStackBase());
+
+  if (!fx.initInstance()) {
+    return false;
+  }
+
+#if defined(JS_SIMULATOR)
+  simulator_ = jit::Simulator::Create();
+  if (!simulator_) {
+    return false;
+  }
+#endif
+
+  isolate = irregexp::CreateIsolate(this);
+  if (!isolate) {
+    return false;
+  }
+
+  this->microTaskQueues = js::MakeUnique<js::MicroTaskQueueSet>(this);
+  if (!this->microTaskQueues) {
+    return false;
+  }
+
+#if defined(DEBUG)
+  initialized_ = true;
+#endif
+
+  return true;
+}
+
+static void InitDefaultStackQuota(JSContext* cx) {
+
+#if defined(MOZ_ASAN) || (defined(DEBUG) && !0)
+  static constexpr JS::NativeStackSize MaxStackSize =
+      2 * 128 * sizeof(size_t) * 1024;
+#else
+  static constexpr JS::NativeStackSize MaxStackSize =
+      128 * sizeof(size_t) * 1024;
+#endif
+  JS_SetNativeStackQuota(cx, MaxStackSize);
+}
+
+JSContext* js::NewContext(uint32_t maxBytes, JSRuntime* parentRuntime) {
+  AutoNoteSingleThreadedRegion anstr;
+
+  MOZ_RELEASE_ASSERT(!TlsContext.get());
+
+#if defined(DEBUG) || defined(JS_OOM_BREAKPOINT)
+  js::oom::SetThreadType(!parentRuntime ? js::THREAD_TYPE_MAIN
+                                        : js::THREAD_TYPE_WORKER);
+#endif
+
+  JSRuntime* runtime = js_new<JSRuntime>(parentRuntime);
+  if (!runtime) {
+    return nullptr;
+  }
+
+  JSContext* cx = js_new<JSContext>(runtime, JS::ContextOptions());
+  if (!cx) {
+    js_delete(runtime);
+    return nullptr;
+  }
+
+  if (!cx->init()) {
+    js_delete(cx);
+    js_delete(runtime);
+    return nullptr;
+  }
+
+  if (!runtime->init(cx, maxBytes)) {
+    runtime->destroyRuntime();
+    js_delete(cx);
+    js_delete(runtime);
+    return nullptr;
+  }
+
+  InitDefaultStackQuota(cx);
+
+  return cx;
+}
+
+void js::DestroyContext(JSContext* cx) {
+  JS_AbortIfWrongThread(cx);
+
+  MOZ_ASSERT(!cx->realm(), "Shouldn't destroy context with active realm");
+  MOZ_ASSERT(!cx->activation(), "Shouldn't destroy context with activations");
+
+  cx->checkNoGCRooters();
+
+  CancelOffThreadCompile(cx->runtime());
+
+  cx->jobQueue = nullptr;
+  cx->internalJobQueue = nullptr;
+  cx->microTaskQueues = nullptr;
+  SetContextProfilingStack(cx, nullptr);
+
+  JSRuntime* rt = cx->runtime();
+
+  rt->offThreadPromiseState.ref().shutdown(cx);
+
+  js::AutoNoteSingleThreadedRegion nochecks;
+  rt->destroyRuntime();
+  js_delete_poison(cx);
+  js_delete_poison(rt);
+}
+
+void JS::RootingContext::checkNoGCRooters() {
+#if defined(DEBUG)
+  for (auto const& stackRootPtr : stackRoots_) {
+    MOZ_ASSERT(stackRootPtr == nullptr);
+  }
+#endif
+}
+
+bool AutoResolving::alreadyStartedSlow() const {
+  MOZ_ASSERT(link);
+  AutoResolving* cursor = link;
+  do {
+    MOZ_ASSERT(this != cursor);
+    if (object.get() == cursor->object && id.get() == cursor->id) {
+      return true;
+    }
+  } while (!!(cursor = cursor->link));
+  return false;
+}
+
+void JSContext::onOutOfMemory() {
+  runtime()->hadOutOfMemory = true;
+  gc::AutoSuppressGC suppressGC(this);
+
+  requestInterrupt(js::InterruptReason::OOMStackTrace);
+
+  if (JS::OutOfMemoryCallback oomCallback = runtime()->oomCallback) {
+    oomCallback(this, runtime()->oomCallbackData);
+  }
+
+  if (MOZ_UNLIKELY(!runtime()->hasInitializedSelfHosting())) {
+    return;
+  }
+
+  RootedValue oomMessage(this, StringValue(names().out_of_memory_));
+  setPendingException(oomMessage, nullptr);
+  MOZ_ASSERT(status == JS::ExceptionStatus::Throwing);
+  status = JS::ExceptionStatus::OutOfMemory;
+
+  reportResourceExhaustion();
+}
+
+JS_PUBLIC_API void js::ReportOutOfMemory(JSContext* cx) {
+  cx->onOutOfMemory();
+}
+
+JS_PUBLIC_API void js::ReportLargeOutOfMemory(JSContext* cx) {
+  js::ReportOutOfMemory(cx);
+}
+
+JS_PUBLIC_API void js::ReportOutOfMemory(FrontendContext* fc) {
+  fc->onOutOfMemory();
+}
+
+void JSContext::onOverRecursed() {
+  AutoSuppressAllocationMetadataBuilder suppressMetadata(this);
+
+  JS_ReportErrorNumberASCII(this, GetErrorMessage, nullptr,
+                            JSMSG_OVER_RECURSED);
+  if (isExceptionPending() && !isThrowingOutOfMemory()) {
+    MOZ_ASSERT(unwrappedException().isObject());
+    MOZ_ASSERT(status == JS::ExceptionStatus::Throwing);
+    status = JS::ExceptionStatus::OverRecursed;
+  }
+
+  reportResourceExhaustion();
+}
+
+JS_PUBLIC_API void js::ReportOverRecursed(JSContext* maybecx) {
+  if (!maybecx) {
+    return;
+  }
+
+  maybecx->onOverRecursed();
+}
+
+JS_PUBLIC_API void js::ReportOverRecursed(FrontendContext* fc) {
+  fc->onOverRecursed();
+}
+
+void js::ReportOversizedAllocation(JSContext* cx, const unsigned errorNumber) {
+  gc::AutoSuppressGC suppressGC(cx);
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, errorNumber);
+
+  cx->reportResourceExhaustion();
+}
+
+void js::ReportAllocationOverflow(JSContext* cx) {
+
+  if (!cx) {
+    return;
+  }
+
+  cx->reportAllocOverflow();
+}
+
+void js::ReportAllocationOverflow(FrontendContext* fc) {
+  fc->onAllocationOverflow();
+}
+
+void js::ReportUsageErrorASCII(JSContext* cx, HandleObject callee,
+                               const char* msg) {
+  RootedValue usage(cx);
+  if (!JS_GetProperty(cx, callee, "usage", &usage)) {
+    return;
+  }
+
+  if (!usage.isString()) {
+    JS_ReportErrorASCII(cx, "%s", msg);
+  } else {
+    RootedString usageStr(cx, usage.toString());
+    UniqueChars str = JS_EncodeStringToUTF8(cx, usageStr);
+    if (!str) {
+      return;
+    }
+    JS_ReportErrorUTF8(cx, "%s. Usage: %s", msg, str.get());
+  }
+}
+
+enum class PrintErrorKind { Error, Warning, Note };
+
+static void PrintErrorLine(FILE* file, const char* prefix,
+                           JSErrorReport* report) {
+  if (const char16_t* linebuf = report->linebuf()) {
+    UniqueChars line;
+    size_t n;
+    {
+      size_t linebufLen = report->linebufLength();
+
+      mozilla::CheckedInt<size_t> utf8Len(linebufLen);
+      utf8Len *= 3;
+      if (utf8Len.isValid()) {
+        line = UniqueChars(js_pod_malloc<char>(utf8Len.value()));
+        if (line) {
+          n = mozilla::ConvertUtf16toUtf8({linebuf, linebufLen},
+                                          {line.get(), utf8Len.value()});
+        }
+      }
+    }
+
+    const char* utf8buf;
+    if (line) {
+      utf8buf = line.get();
+    } else {
+      static const char unavailableStr[] = "<context unavailable>";
+      utf8buf = unavailableStr;
+      n = js_strlen(unavailableStr);
+    }
+
+    fputs(":\n", file);
+    if (prefix) {
+      fputs(prefix, file);
+    }
+
+    for (size_t i = 0; i < n; i++) {
+      fputc(utf8buf[i], file);
+    }
+
+    if (n == 0 || utf8buf[n - 1] != '\n') {
+      fputc('\n', file);
+    }
+
+    if (prefix) {
+      fputs(prefix, file);
+    }
+
+    n = report->tokenOffset();
+    for (size_t i = 0, j = 0; i < n; i++) {
+      if (utf8buf[i] == '\t') {
+        for (size_t k = (j + 8) & ~7; j < k; j++) {
+          fputc('.', file);
+        }
+        continue;
+      }
+      fputc('.', file);
+      j++;
+    }
+    fputc('^', file);
+  }
+}
+
+static void PrintErrorLine(FILE* file, const char* prefix,
+                           JSErrorNotes::Note* note) {}
+
+template <typename T>
+static void PrintSingleError(FILE* file, JS::ConstUTF8CharsZ toStringResult,
+                             T* report, PrintErrorKind kind) {
+  UniqueChars prefix;
+  if (report->filename) {
+    prefix = JS_smprintf("%s:", report->filename.c_str());
+  }
+
+  if (report->lineno) {
+    prefix = JS_smprintf("%s%u:%u ", prefix ? prefix.get() : "", report->lineno,
+                         report->column.oneOriginValue());
+  }
+
+  if (kind != PrintErrorKind::Error) {
+    const char* kindPrefix = nullptr;
+    switch (kind) {
+      case PrintErrorKind::Error:
+        MOZ_CRASH("unreachable");
+      case PrintErrorKind::Warning:
+        kindPrefix = "warning";
+        break;
+      case PrintErrorKind::Note:
+        kindPrefix = "note";
+        break;
+    }
+
+    prefix = JS_smprintf("%s%s: ", prefix ? prefix.get() : "", kindPrefix);
+  }
+
+  const char* message =
+      toStringResult ? toStringResult.c_str() : report->message().c_str();
+
+  const char* ctmp;
+  while ((ctmp = strchr(message, '\n')) != nullptr) {
+    ctmp++;
+    if (prefix) {
+      fputs(prefix.get(), file);
+    }
+    (void)fwrite(message, 1, ctmp - message, file);
+    message = ctmp;
+  }
+
+  if (prefix) {
+    fputs(prefix.get(), file);
+  }
+  fputs(message, file);
+
+  PrintErrorLine(file, prefix.get(), report);
+  fputc('\n', file);
+
+  fflush(file);
+}
+
+static void PrintErrorImpl(FILE* file, JS::ConstUTF8CharsZ toStringResult,
+                           JSErrorReport* report, bool reportWarnings) {
+  MOZ_ASSERT(report);
+
+  if (report->isWarning() && !reportWarnings) {
+    return;
+  }
+
+  PrintErrorKind kind = PrintErrorKind::Error;
+  if (report->isWarning()) {
+    kind = PrintErrorKind::Warning;
+  }
+  PrintSingleError(file, toStringResult, report, kind);
+
+  if (report->notes) {
+    for (auto&& note : *report->notes) {
+      PrintSingleError(file, JS::ConstUTF8CharsZ(), note.get(),
+                       PrintErrorKind::Note);
+    }
+  }
+}
+
+JS_PUBLIC_API void JS::PrintError(FILE* file, JSErrorReport* report,
+                                  bool reportWarnings) {
+  PrintErrorImpl(file, JS::ConstUTF8CharsZ(), report, reportWarnings);
+}
+
+JS_PUBLIC_API void JS::PrintError(FILE* file,
+                                  const JS::ErrorReportBuilder& builder,
+                                  bool reportWarnings) {
+  PrintErrorImpl(file, builder.toStringResult(), builder.report(),
+                 reportWarnings);
+}
+
+void js::ReportIsNotDefined(JSContext* cx, HandleId id) {
+  if (UniqueChars printable =
+          IdToPrintableUTF8(cx, id, IdToPrintableBehavior::IdIsIdentifier)) {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr, JSMSG_NOT_DEFINED,
+                             printable.get());
+  }
+}
+
+void js::ReportIsNotDefined(JSContext* cx, Handle<PropertyName*> name) {
+  RootedId id(cx, NameToId(name));
+  ReportIsNotDefined(cx, id);
+}
+
+const char* NullOrUndefinedToCharZ(HandleValue v) {
+  MOZ_ASSERT(v.isNullOrUndefined());
+  return v.isNull() ? "null" : "undefined";
+}
+
+void js::ReportIsNullOrUndefinedForPropertyAccess(JSContext* cx, HandleValue v,
+                                                  int vIndex) {
+  MOZ_ASSERT(v.isNullOrUndefined());
+
+  if (vIndex == JSDVG_IGNORE_STACK) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_CANT_CONVERT_TO, NullOrUndefinedToCharZ(v),
+                              "object");
+    return;
+  }
+
+  UniqueChars bytes = DecompileValueGenerator(cx, vIndex, v, nullptr);
+  if (!bytes) {
+    return;
+  }
+
+  if (strcmp(bytes.get(), "undefined") == 0 ||
+      strcmp(bytes.get(), "null") == 0) {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr, JSMSG_NO_PROPERTIES,
+                             bytes.get());
+  } else {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                             JSMSG_UNEXPECTED_TYPE, bytes.get(),
+                             NullOrUndefinedToCharZ(v));
+  }
+}
+
+void js::ReportIsNullOrUndefinedForPropertyAccess(JSContext* cx, HandleValue v,
+                                                  int vIndex, HandleId key) {
+  MOZ_ASSERT(v.isNullOrUndefined());
+
+  if (!JS::Prefs::property_error_message_fix()) {
+    ReportIsNullOrUndefinedForPropertyAccess(cx, v, vIndex);
+    return;
+  }
+
+  RootedValue idVal(cx, IdToValue(key));
+  RootedString idStr(cx, ValueToSource(cx, idVal));
+  if (!idStr) {
+    return;
+  }
+
+  UniqueChars keyStr = StringToNewUTF8CharsZ(cx, *idStr);
+  if (!keyStr) {
+    return;
+  }
+
+  if (vIndex == JSDVG_IGNORE_STACK) {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr, JSMSG_PROPERTY_FAIL,
+                             keyStr.get(), NullOrUndefinedToCharZ(v));
+    return;
+  }
+
+  UniqueChars bytes = DecompileValueGenerator(cx, vIndex, v, nullptr);
+  if (!bytes) {
+    return;
+  }
+
+  if (strcmp(bytes.get(), "undefined") == 0 ||
+      strcmp(bytes.get(), "null") == 0) {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr, JSMSG_PROPERTY_FAIL,
+                             keyStr.get(), bytes.get());
+    return;
+  }
+
+  JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                           JSMSG_PROPERTY_FAIL_EXPR, keyStr.get(), bytes.get(),
+                           NullOrUndefinedToCharZ(v));
+}
+
+bool js::ReportValueError(JSContext* cx, const unsigned errorNumber,
+                          int spindex, HandleValue v, HandleString fallback,
+                          const char* arg1, const char* arg2) {
+  MOZ_ASSERT(js_ErrorFormatString[errorNumber].argCount >= 1);
+  MOZ_ASSERT(js_ErrorFormatString[errorNumber].argCount <= 3);
+  UniqueChars bytes = DecompileValueGenerator(cx, spindex, v, fallback);
+  if (!bytes) {
+    return false;
+  }
+
+  JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr, errorNumber,
+                           bytes.get(), arg1, arg2);
+  return false;
+}
+
+JSObject* js::CreateErrorNotesArray(JSContext* cx, JSErrorReport* report) {
+  Rooted<ArrayObject*> notesArray(cx, NewDenseEmptyArray(cx));
+  if (!notesArray) {
+    return nullptr;
+  }
+
+  if (!report->notes) {
+    return notesArray;
+  }
+
+  for (auto&& note : *report->notes) {
+    Rooted<PlainObject*> noteObj(cx, NewPlainObject(cx));
+    if (!noteObj) {
+      return nullptr;
+    }
+
+    RootedString messageStr(cx, note->newMessageString(cx));
+    if (!messageStr) {
+      return nullptr;
+    }
+    RootedValue messageVal(cx, StringValue(messageStr));
+    if (!DefineDataProperty(cx, noteObj, cx->names().message, messageVal)) {
+      return nullptr;
+    }
+
+    RootedValue filenameVal(cx);
+    if (const char* filename = note->filename.c_str()) {
+      JS::UTF8Chars utf8chars(filename, strlen(filename));
+      Rooted<JSString*> filenameStr(cx, NewStringCopyUTF8N(cx, utf8chars));
+      if (!filenameStr) {
+        return nullptr;
+      }
+      filenameVal = StringValue(filenameStr);
+    }
+    if (!DefineDataProperty(cx, noteObj, cx->names().fileName, filenameVal)) {
+      return nullptr;
+    }
+
+    RootedValue linenoVal(cx, Int32Value(note->lineno));
+    if (!DefineDataProperty(cx, noteObj, cx->names().lineNumber, linenoVal)) {
+      return nullptr;
+    }
+    RootedValue columnVal(cx, Int32Value(note->column.oneOriginValue()));
+    if (!DefineDataProperty(cx, noteObj, cx->names().columnNumber, columnVal)) {
+      return nullptr;
+    }
+
+    if (!NewbornArrayPush(cx, notesArray, ObjectValue(*noteObj))) {
+      return nullptr;
+    }
+  }
+
+  return notesArray;
+}
+
+void JSContext::recoverFromOutOfMemory() {
+  if (isExceptionPending()) {
+    MOZ_ASSERT(isThrowingOutOfMemory());
+    clearPendingException();
+  }
+}
+
+void JSContext::reportAllocOverflow() {
+  gc::AutoSuppressGC suppressGC(this);
+  JS_ReportErrorNumberASCII(this, GetErrorMessage, nullptr,
+                            JSMSG_ALLOC_OVERFLOW);
+}
+
+JS::StackKind JSContext::stackKindForCurrentPrincipal() {
+  return runningWithTrustedPrincipals() ? JS::StackForTrustedScript
+                                        : JS::StackForUntrustedScript;
+}
+
+JS::NativeStackLimit JSContext::stackLimitForCurrentPrincipal() {
+  return stackLimit(stackKindForCurrentPrincipal());
+}
+
+JS_PUBLIC_API bool js::UseInternalJobQueues(JSContext* cx) {
+  MOZ_RELEASE_ASSERT(
+      !cx->runtime()->hasInitializedSelfHosting(),
+      "js::UseInternalJobQueues must be called early during runtime startup.");
+  MOZ_ASSERT(!cx->jobQueue);
+  auto queue = MakeUnique<InternalJobQueue>(cx);
+  if (!queue) {
+    return false;
+  }
+
+  cx->internalJobQueue = std::move(queue);
+  cx->jobQueue = cx->internalJobQueue.ref().get();
+
+  cx->runtime()->offThreadPromiseState.ref().initInternalDispatchQueue();
+  MOZ_ASSERT(cx->runtime()->offThreadPromiseState.ref().initialized());
+
+  return true;
+}
+
+#if defined(DEBUG)
+JSObject* InternalJobQueue::copyJobs(JSContext* cx) {
+  Rooted<ArrayObject*> jobs(cx, NewDenseEmptyArray(cx));
+  if (!jobs) {
+    return nullptr;
+  }
+
+  auto& queues = cx->microTaskQueues;
+  auto addToArray = [&](auto& queue) -> bool {
+    for (const auto& e : queue) {
+      JS::JSMicroTask* task = JS::ToUnwrappedJSMicroTask(e);
+      if (task) {
+        RootedObject global(cx, JS::GetExecutionGlobalFromJSMicroTask(task));
+        if (!global) {
+          JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                    JSMSG_DEAD_OBJECT);
+          return false;
+        }
+        if (!cx->compartment()->wrap(cx, &global)) {
+          return false;
+        }
+        if (!NewbornArrayPush(cx, jobs, ObjectValue(*global))) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  };
+
+  if (!addToArray(queues->debugMicroTaskQueue)) {
+    return nullptr;
+  }
+  if (!addToArray(queues->microTaskQueue)) {
+    return nullptr;
+  }
+
+  return jobs;
+}
+
+JS_PUBLIC_API JSObject* js::GetJobsInInternalJobQueue(JSContext* cx) {
+  MOZ_ASSERT(cx->internalJobQueue.ref());
+  return cx->internalJobQueue->copyJobs(cx);
+}
+#endif
+
+JS_PUBLIC_API void js::StopDrainingJobQueue(JSContext* cx) {
+  MOZ_ASSERT(cx->internalJobQueue.ref());
+  cx->internalJobQueue->interrupt();
+}
+
+JS_PUBLIC_API void js::RestartDrainingJobQueue(JSContext* cx) {
+  MOZ_ASSERT(cx->internalJobQueue.ref());
+  cx->internalJobQueue->uninterrupt();
+}
+
+JS_PUBLIC_API void js::RunJobs(JSContext* cx) {
+  MOZ_ASSERT(cx->jobQueue);
+  MOZ_ASSERT(cx->isEvaluatingModule == 0);
+  cx->jobQueue->runJobs(cx);
+  JS::ClearKeptObjects(cx);
+}
+
+bool InternalJobQueue::getHostDefinedGlobal(
+    JSContext* cx, MutableHandle<JSObject*> out) const {
+  return true;
+}
+
+bool InternalJobQueue::getHostDefinedData(
+    JSContext* cx, JS::MutableHandle<JSObject*> incumbentGlobal,
+    JS::MutableHandle<JSObject*> optionalHostDefinedData) const {
+  incumbentGlobal.set(nullptr);
+  optionalHostDefinedData.set(nullptr);
+  return true;
+}
+
+void InternalJobQueue::runJobs(JSContext* cx) {
+  if (draining_ || interrupted_) {
+    return;
+  }
+
+  while (true) {
+    cx->runtime()->offThreadPromiseState.ref().internalDrain(cx);
+
+    draining_ = true;
+
+    JS::Rooted<JS::JSMicroTask*> job(cx);
+    JS::Rooted<JS::GenericMicroTask> dequeueJob(cx);
+    while (JS::HasAnyMicroTasks(cx)) {
+      if (interrupted_) {
+        break;
+      }
+
+      cx->runtime()->offThreadPromiseState.ref().internalDrain(cx);
+
+      dequeueJob = JS::DequeueNextMicroTask(cx);
+      MOZ_ASSERT(!dequeueJob.isNull());
+      job = JS::ToMaybeWrappedJSMicroTask(dequeueJob);
+      MOZ_ASSERT(job);
+
+      if (!JS::HasAnyMicroTasks(cx)) {
+        JS::JobQueueIsEmpty(cx);
+      }
+
+      if (!JS::GetExecutionGlobalFromJSMicroTask(job)) {
+        continue;
+      }
+      AutoRealm ar(cx, JS::GetExecutionGlobalFromJSMicroTask(job));
+      {
+        if (!JS::RunJSMicroTask(cx, job)) {
+          if (!cx->isExceptionPending()) {
+            continue;
+          }
+
+          RootedValue exn(cx);
+          bool success = cx->getPendingException(&exn);
+          cx->clearPendingException();
+          if (success) {
+            js::ReportExceptionClosure reportExn(exn);
+            PrepareScriptEnvironmentAndInvoke(cx, cx->global(), reportExn);
+          }
+        }
+      }
+    }
+
+    draining_ = false;
+
+    if (interrupted_) {
+      break;
+    }
+
+    cx->microTaskQueues->clear();
+
+    if (!cx->runtime()->offThreadPromiseState.ref().internalHasPending()) {
+      break;
+    }
+  }
+}
+
+class js::InternalJobQueue::SavedQueue : public JobQueue::SavedJobQueue {
+ public:
+  SavedQueue(JSContext* cx, MicroTaskQueueSet&& queueSet, bool draining)
+      : cx(cx), savedQueues(cx, std::move(queueSet)), draining_(draining) {
+    MOZ_ASSERT(cx->internalJobQueue.ref());
+  }
+
+  ~SavedQueue() {
+    MOZ_ASSERT(cx->internalJobQueue.ref());
+    cx->internalJobQueue->draining_ = draining_;
+    *cx->microTaskQueues.get() = std::move(savedQueues.get());
+  }
+
+ private:
+  JSContext* cx;
+  PersistentRooted<MicroTaskQueueSet> savedQueues;
+  bool draining_;
+};
+
+js::UniquePtr<JS::JobQueue::SavedJobQueue> InternalJobQueue::saveJobQueue(
+    JSContext* cx) {
+  auto saved = js::MakeUnique<SavedQueue>(cx, std::move(*cx->microTaskQueues),
+                                          draining_);
+  if (!saved) {
+    ReportOutOfMemory(cx);
+    return nullptr;
+  }
+
+  draining_ = false;
+  return saved;
+}
+
+void js::MicroTaskQueueElement::trace(JSTracer* trc) {
+  JSContext* cx = trc->runtime()->mainContextFromOwnThread();
+  MOZ_ASSERT(cx);
+  auto* queue = cx->jobQueue.ref();
+
+  if (!queue || value.isGCThing()) {
+    TraceRoot(trc, &value, "microtask-queue-entry");
+  } else {
+    queue->traceNonGCThingMicroTask(trc, &value);
+  }
+}
+
+JS::GenericMicroTask js::MicroTaskQueueSet::popDebugFront() {
+  JS_LOG(mtq, Info, "JS Drain Queue: popDebugFront");
+  if (!debugMicroTaskQueue.empty()) {
+    JS::Value p = debugMicroTaskQueue.front();
+    debugMicroTaskQueue.popFront();
+    return p;
+  }
+  return JS::NullValue();
+}
+
+JS::GenericMicroTask js::MicroTaskQueueSet::popFront() {
+  JS_LOG(mtq, Info, "JS Drain Queue");
+  if (!debugMicroTaskQueue.empty()) {
+    JS::Value p = debugMicroTaskQueue.front();
+    debugMicroTaskQueue.popFront();
+    return p;
+  }
+  if (!microTaskQueue.empty()) {
+    JS::Value p = microTaskQueue.front();
+    microTaskQueue.popFront();
+    return p;
+  }
+
+  return JS::NullValue();
+}
+
+JS::GenericMicroTask js::MicroTaskQueueSet::peekFront() {
+  JS_LOG(mtq, Info, "JS Peek Queue");
+  if (!debugMicroTaskQueue.empty()) {
+    return debugMicroTaskQueue.front();
+  }
+  if (!microTaskQueue.empty()) {
+    return microTaskQueue.front();
+  }
+
+  return JS::NullValue();
+}
+
+bool js::MicroTaskQueueSet::enqueueRegularMicroTask(
+    JSContext* cx, const JS::GenericMicroTask& entry) {
+  JS_LOG(mtq, Verbose, "JS: Enqueue Regular MT");
+  JS::JobQueueMayNotBeEmpty(cx);
+  return microTaskQueue.pushBack(entry);
+}
+
+bool js::MicroTaskQueueSet::prependRegularMicroTask(
+    JSContext* cx, const JS::GenericMicroTask& entry) {
+  JS_LOG(mtq, Verbose, "JS: Prepend Regular MT");
+  JS::JobQueueMayNotBeEmpty(cx);
+  return microTaskQueue.emplaceFront(entry);
+}
+
+bool js::MicroTaskQueueSet::enqueueDebugMicroTask(
+    JSContext* cx, const JS::GenericMicroTask& entry) {
+  JS_LOG(mtq, Verbose, "JS: Enqueue Debug MT");
+  return debugMicroTaskQueue.pushBack(entry);
+}
+
+JS_PUBLIC_API bool JS::EnqueueMicroTask(JSContext* cx,
+                                        const JS::GenericMicroTask& entry) {
+  JS_LOG(mtq, Info, "Enqueue of non JS MT");
+
+  return cx->microTaskQueues->enqueueRegularMicroTask(cx, entry);
+}
+
+JS_PUBLIC_API bool JS::EnqueueDebugMicroTask(
+    JSContext* cx, const JS::GenericMicroTask& entry) {
+  JS_LOG(mtq, Info, "Enqueue of non JS MT");
+
+  return cx->microTaskQueues->enqueueDebugMicroTask(cx, entry);
+}
+
+JS_PUBLIC_API bool JS::PrependMicroTask(JSContext* cx,
+                                        const JS::GenericMicroTask& entry) {
+  JS_LOG(mtq, Info, "Prepend job to MTQ");
+
+  return cx->microTaskQueues->prependRegularMicroTask(cx, entry);
+}
+
+JS_PUBLIC_API JS::GenericMicroTask JS::DequeueNextMicroTask(JSContext* cx) {
+  return cx->microTaskQueues->popFront();
+}
+
+JS_PUBLIC_API JS::GenericMicroTask JS::DequeueNextDebuggerMicroTask(
+    JSContext* cx) {
+  return cx->microTaskQueues->popDebugFront();
+}
+
+JS_PUBLIC_API JS::GenericMicroTask JS::PeekNextMicroTask(JSContext* cx) {
+  return cx->microTaskQueues->peekFront();
+}
+
+JS_PUBLIC_API bool JS::HasAnyMicroTasks(JSContext* cx) {
+  return !cx->microTaskQueues->empty();
+}
+
+JS_PUBLIC_API bool JS::HasDebuggerMicroTasks(JSContext* cx) {
+  return !cx->microTaskQueues->debugMicroTaskQueue.empty();
+}
+
+struct SavedMicroTaskQueueImpl : public JS::SavedMicroTaskQueue {
+  explicit SavedMicroTaskQueueImpl(JSContext* cx) : savedQueues(cx) {
+    savedQueues = js::MakeUnique<js::MicroTaskQueueSet>(cx);
+    std::swap(cx->microTaskQueues.get(), savedQueues.get());
+  }
+  ~SavedMicroTaskQueueImpl() override = default;
+  JS::PersistentRooted<js::UniquePtr<js::MicroTaskQueueSet>> savedQueues;
+};
+
+JS_PUBLIC_API js::UniquePtr<JS::SavedMicroTaskQueue> JS::SaveMicroTaskQueue(
+    JSContext* cx) {
+  auto saved = js::MakeUnique<SavedMicroTaskQueueImpl>(cx);
+  if (!saved) {
+    ReportOutOfMemory(cx);
+    return nullptr;
+  }
+  return saved;
+}
+
+JS_PUBLIC_API void JS::RestoreMicroTaskQueue(
+    JSContext* cx, js::UniquePtr<JS::SavedMicroTaskQueue> savedQueue) {
+  MOZ_ASSERT(cx->microTaskQueues->empty(), "Don't drop jobs on the floor");
+
+  SavedMicroTaskQueueImpl* savedQueueImpl =
+      static_cast<SavedMicroTaskQueueImpl*>(savedQueue.get());
+  std::swap(savedQueueImpl->savedQueues.get(), cx->microTaskQueues.get());
+}
+
+JS_PUBLIC_API size_t JS::GetRegularMicroTaskCount(JSContext* cx) {
+  return cx->microTaskQueues->microTaskQueue.length();
+}
+
+JS_PUBLIC_API bool JS::HasRegularMicroTasks(JSContext* cx) {
+  return !cx->microTaskQueues->microTaskQueue.empty();
+}
+
+JS_PUBLIC_API JS::GenericMicroTask JS::DequeueNextRegularMicroTask(
+    JSContext* cx) {
+  auto& queue = cx->microTaskQueues->microTaskQueue;
+  if (!queue.empty()) {
+    JS::GenericMicroTask p = queue.front();
+    queue.popFront();
+    return p;
+  }
+  return JS::NullValue();
+}
+
+mozilla::GenericErrorResult<OOM> JSContext::alreadyReportedOOM() {
+  MOZ_ASSERT(isThrowingOutOfMemory());
+  return mozilla::Err(JS::OOM());
+}
+
+mozilla::GenericErrorResult<JS::Error> JSContext::alreadyReportedError() {
+  return mozilla::Err(JS::Error());
+}
+
+JSContext::JSContext(JSRuntime* runtime, const JS::ContextOptions& options)
+    : RootingContext(runtime ? &runtime->gc.nursery() : nullptr),
+      runtime_(runtime),
+      options_(this, options),
+      measuringExecutionTimeEnabled_(this, false),
+      jitActivation(this, nullptr),
+      isolate(this, nullptr),
+      activation_(this, nullptr),
+      profilingActivation_(nullptr),
+      noExecuteDebuggerTop(this, nullptr),
+#if defined(JS_CHECK_UNSAFE_CALL_WITH_ABI)
+      inUnsafeCallWithABI(this, false),
+      hasAutoUnsafeCallWithABI(this, false),
+#endif
+#if defined(DEBUG)
+      liveArraySortDataInstances(this, 0),
+#endif
+#if defined(JS_SIMULATOR)
+      simulator_(this, nullptr),
+#endif
+      dtoaState(this, nullptr),
+      suppressGC(this, 0),
+#if defined(DEBUG)
+      noNurseryAllocationCheck(this, 0),
+      disableStrictProxyCheckingCount(this, 0),
+#endif
+#if defined(DEBUG) || defined(JS_OOM_BREAKPOINT)
+      runningOOMTest(this, false),
+#endif
+      inUnsafeRegion(this, 0),
+      generationalDisabled(this, 0),
+      compactingDisabledCount(this, 0),
+#if defined(DEBUG)
+      regExpSearcherLastLimit(this, RegExpSearcherLastLimitSentinel),
+#else
+      regExpSearcherLastLimit(this, 0),
+#endif
+      isEvaluatingModule(this, 0),
+      frontendCollectionPool_(this),
+      suppressProfilerSampling(false),
+      tempLifoAlloc_(this, (size_t)TEMP_LIFO_ALLOC_PRIMARY_CHUNK_SIZE,
+                     js::MallocArena),
+      debuggerMutations(this, 0),
+      status(this, JS::ExceptionStatus::None),
+      unwrappedException_(this),
+      unwrappedExceptionStack_(this),
+#if defined(DEBUG)
+      hadResourceExhaustion_(this, false),
+      hadUncatchableException_(this, false),
+#endif
+      reportGranularity(this, JS_DEFAULT_JITREPORT_GRANULARITY),
+      resolvingList(this, nullptr),
+#if defined(DEBUG)
+      enteredPolicy(this, nullptr),
+#endif
+      generatingError(this, false),
+      cycleDetectorVector_(this, this),
+      data(nullptr),
+      asyncStackForNewActivations_(this),
+      asyncCauseForNewActivations(this, nullptr),
+      asyncCallIsExplicit(this, false),
+      interruptCallbacks_(this),
+      interruptCallbackDisabled(this, false),
+      shouldWarnAboutInterruptTermination_(this, true),
+      interruptBits_(0),
+      jitStackLimit(JS::NativeStackLimitMin),
+      jitStackLimitNoInterrupt(this, JS::NativeStackLimitMin),
+      jobQueue(this, nullptr),
+      internalJobQueue(this),
+      canSkipEnqueuingJobs(this, false),
+      asyncResumeDepth(this, 0),
+      promiseRejectionTrackerCallback(this, nullptr),
+      promiseRejectionTrackerCallbackData(this, nullptr),
+      oomStackTraceBuffer_(this, nullptr),
+      oomStackTraceBufferValid_(this, false),
+      bypassCSPForDebugger(this, false),
+      hasDebuggerForcedLexicalInit(this, false),
+      insideExclusiveDebuggerOnEval(this, nullptr),
+      microTaskQueues(this) {
+  MOZ_ASSERT(static_cast<JS::RootingContext*>(this) ==
+             JS::RootingContext::get(this));
+
+  if (JS::Prefs::experimental_capture_oom_stack_trace()) {
+    oomStackTraceBuffer_ =
+        static_cast<char*>(js_calloc(OOMStackTraceBufferSize));
+  }
+}
+
+JSContext::~JSContext() {
+#if defined(DEBUG)
+  initialized_ = false;
+#endif
+
+  MOZ_ASSERT(!resolvingList);
+
+  MOZ_ASSERT(liveArraySortDataInstances == 0);
+
+  if (dtoaState) {
+    DestroyDtoaState(dtoaState);
+  }
+
+  fx.destroyInstance();
+
+#if defined(JS_SIMULATOR)
+  js::jit::Simulator::Destroy(simulator_);
+#endif
+
+  if (isolate) {
+    irregexp::DestroyIsolate(isolate.ref());
+  }
+
+  if (oomStackTraceBuffer_) {
+    js_free(oomStackTraceBuffer_);
+  }
+
+  TlsContext.set(nullptr);
+}
+
+void JSContext::unsetOOMStackTrace() { oomStackTraceBufferValid_ = false; }
+
+const char* JSContext::getOOMStackTrace() const {
+  if (!oomStackTraceBufferValid_ || !oomStackTraceBuffer_) {
+    return nullptr;
+  }
+  return oomStackTraceBuffer_;
+}
+
+bool JSContext::hasOOMStackTrace() const { return oomStackTraceBufferValid_; }
+
+void JSContext::captureOOMStackTrace() {
+  oomStackTraceBufferValid_ = false;
+
+  if (!oomStackTraceBuffer_) {
+    return;  
+  }
+
+  FixedBufferPrinter fbp(oomStackTraceBuffer_, OOMStackTraceBufferSize);
+  js::DumpBacktrace(this, fbp);
+  MOZ_ASSERT(strlen(oomStackTraceBuffer_) < OOMStackTraceBufferSize);
+
+  oomStackTraceBufferValid_ = true;
+}
+
+void JSContext::setRuntime(JSRuntime* rt) {
+  MOZ_ASSERT(!resolvingList);
+  MOZ_ASSERT(!compartment());
+  MOZ_ASSERT(!activation());
+  MOZ_ASSERT(!unwrappedException_.ref().initialized());
+  MOZ_ASSERT(!unwrappedExceptionStack_.ref().initialized());
+  MOZ_ASSERT(!asyncStackForNewActivations_.ref().initialized());
+
+  runtime_ = rt;
+}
+
+#if defined(NIGHTLY_BUILD)
+static bool IsOutOfMemoryException(JSContext* cx, const Value& v) {
+  return v == StringValue(cx->names().out_of_memory_);
+}
+#endif
+
+void JSContext::setPendingException(HandleValue v, Handle<SavedFrame*> stack) {
+#if defined(NIGHTLY_BUILD)
+  do {
+    if (this->runtime()->errorInterception.isExecuting) {
+      break;
+    }
+
+    if (!this->runtime()->errorInterception.interceptor) {
+      break;
+    }
+
+    if (IsOutOfMemoryException(this, v)) {
+      break;
+    }
+
+    this->runtime()->errorInterception.isExecuting = true;
+
+    const mozilla::DebugOnly<bool> wasExceptionPending =
+        this->isExceptionPending();
+    this->runtime()->errorInterception.interceptor->interceptError(this, v);
+    MOZ_ASSERT(wasExceptionPending == this->isExceptionPending());
+
+    this->runtime()->errorInterception.isExecuting = false;
+  } while (false);
+#endif
+
+  this->status = JS::ExceptionStatus::Throwing;
+  this->unwrappedException() = v;
+  this->unwrappedExceptionStack() = stack;
+}
+
+void JSContext::setPendingException(HandleValue value,
+                                    ShouldCaptureStack captureStack) {
+  Rooted<SavedFrame*> nstack(this);
+  if (captureStack == ShouldCaptureStack::Always ||
+      realm()->shouldCaptureStackForThrow()) {
+    RootedObject stack(this);
+    if (!CaptureStack(this, &stack, js::MAX_REPORTED_STACK_DEPTH)) {
+      clearPendingException();
+    }
+    if (stack) {
+      nstack = &stack->as<SavedFrame>();
+    }
+  }
+  setPendingException(value, nstack);
+}
+
+bool JSContext::getPendingException(MutableHandleValue rval) {
+  MOZ_ASSERT(isExceptionPending());
+
+  RootedValue exception(this, unwrappedException());
+  if (zone()->isAtomsZone()) {
+    rval.set(exception);
+    return true;
+  }
+
+  Rooted<SavedFrame*> stack(this, unwrappedExceptionStack());
+  JS::ExceptionStatus prevStatus = status;
+  clearPendingException();
+  if (!compartment()->wrap(this, &exception)) {
+    return false;
+  }
+  this->check(exception);
+  setPendingException(exception, stack);
+  status = prevStatus;
+
+  rval.set(exception);
+  return true;
+}
+
+bool JSContext::getPendingExceptionStack(MutableHandleValue rval) {
+  MOZ_ASSERT(isExceptionPending());
+
+  Rooted<SavedFrame*> exceptionStack(this, unwrappedExceptionStack());
+  if (!exceptionStack) {
+    rval.setNull();
+    return true;
+  }
+  if (zone()->isAtomsZone()) {
+    rval.setObject(*exceptionStack);
+    return true;
+  }
+
+  RootedValue stack(this, ObjectValue(*exceptionStack));
+  RootedValue exception(this, unwrappedException());
+  JS::ExceptionStatus prevStatus = status;
+  clearPendingException();
+  if (!compartment()->wrap(this, &exception) ||
+      !compartment()->wrap(this, &stack)) {
+    return false;
+  }
+  this->check(stack);
+  setPendingException(exception, exceptionStack);
+  status = prevStatus;
+
+  rval.set(stack);
+  return true;
+}
+
+SavedFrame* JSContext::getPendingExceptionStack() {
+  return unwrappedExceptionStack();
+}
+
+#if defined(DEBUG)
+const JS::Value& JSContext::getPendingExceptionUnwrapped() {
+  MOZ_ASSERT(isExceptionPending());
+  return unwrappedException();
+}
+#endif
+
+bool JSContext::isClosingGenerator() {
+  return isExceptionPending() &&
+         unwrappedException().isMagic(JS_GENERATOR_CLOSING);
+}
+
+bool JSContext::isThrowingDebuggeeWouldRun() {
+  return isExceptionPending() && unwrappedException().isObject() &&
+         unwrappedException().toObject().is<ErrorObject>() &&
+         unwrappedException().toObject().as<ErrorObject>().type() ==
+             JSEXN_DEBUGGEEWOULDRUN;
+}
+
+bool JSContext::isRuntimeCodeGenEnabled(
+    JS::RuntimeCode kind, JS::Handle<JSString*> codeString,
+    JS::CompilationType compilationType,
+    JS::Handle<JS::StackGCVector<JSString*>> parameterStrings,
+    JS::Handle<JSString*> bodyString,
+    JS::Handle<JS::StackGCVector<JS::Value>> parameterArgs,
+    JS::Handle<JS::Value> bodyArg, bool* outCanCompileStrings) {
+  if (JSCSPEvalChecker allows =
+          runtime()->securityCallbacks->contentSecurityPolicyAllows) {
+    return allows(this, kind, codeString, compilationType, parameterStrings,
+                  bodyString, parameterArgs, bodyArg, outCanCompileStrings);
+  }
+
+  *outCanCompileStrings = true;
+  return true;
+}
+
+bool JSContext::getCodeForEval(HandleObject code,
+                               JS::MutableHandle<JSString*> outCode) {
+  if (JSCodeForEvalOp gets = runtime()->securityCallbacks->codeForEvalGets) {
+    return gets(this, code, outCode);
+  }
+  outCode.set(nullptr);
+  return true;
+}
+
+size_t JSContext::sizeOfExcludingThis(
+    mozilla::MallocSizeOf mallocSizeOf) const {
+  return cycleDetectorVector().sizeOfExcludingThis(mallocSizeOf) +
+         irregexp::IsolateSizeOfIncludingThis(isolate, mallocSizeOf);
+}
+
+size_t JSContext::sizeOfIncludingThis(
+    mozilla::MallocSizeOf mallocSizeOf) const {
+  return mallocSizeOf(this) + sizeOfExcludingThis(mallocSizeOf);
+}
+
+#if defined(DEBUG)
+bool JSContext::inAtomsZone() const { return zone_->isAtomsZone(); }
+#endif
+
+void JSContext::trace(JSTracer* trc) {
+  cycleDetectorVector().trace(trc);
+  geckoProfiler().trace(trc);
+  if (isolate) {
+    irregexp::TraceIsolate(trc, isolate.ref());
+  }
+}
+
+JS::NativeStackLimit JSContext::stackLimitForJitCode(JS::StackKind kind) {
+#if defined(JS_SIMULATOR)
+  return simulator()->stackLimit();
+#else
+  return stackLimit(kind);
+#endif
+}
+
+bool JSContext::stackContainsAddress(uintptr_t address, JS::StackKind kind) {
+  return address <= nativeStackBase() && address > stackLimit(kind);
+}
+
+void JSContext::resetJitStackLimit() {
+#if defined(JS_SIMULATOR)
+  jitStackLimit = jit::Simulator::StackLimit();
+#else
+  jitStackLimit = nativeStackLimit[JS::StackForUntrustedScript];
+#endif
+  jitStackLimitNoInterrupt = jitStackLimit;
+}
+
+void JSContext::initJitStackLimit() {
+  resetJitStackLimit();
+  wasm_.initStackLimit(this);
+}
+
+JSScript* JSContext::currentScript(jsbytecode** ppc,
+                                   AllowCrossRealm allowCrossRealm) {
+  if (ppc) {
+    *ppc = nullptr;
+  }
+
+  if (!activation()) {
+    return nullptr;
+  }
+
+  FrameIter iter(this);
+  if (iter.done() || !iter.hasScript()) {
+    return nullptr;
+  }
+
+  JSScript* script = iter.script();
+  if (allowCrossRealm == AllowCrossRealm::DontAllow &&
+      script->realm() != realm()) {
+    return nullptr;
+  }
+
+  if (ppc) {
+    *ppc = iter.pc();
+  }
+  return script;
+}
+
+#if defined(JS_CRASH_DIAGNOSTICS)
+void ContextChecks::check(AbstractFramePtr frame, int argIndex) {
+  if (frame) {
+    check(frame.realm(), argIndex);
+  }
+}
+#endif
+
+void AutoEnterOOMUnsafeRegion::crash_impl(const char* reason) {
+  char msgbuf[1024];
+  js::NoteIntentionalCrash();
+  SprintfLiteral(msgbuf, "[unhandlable oom] %s", reason);
+#if !defined(DEBUG)
+  fprintf(stderr, "Hit MOZ_CRASH(%s) at %s:%d\n", msgbuf, __FILE__, __LINE__);
+#endif
+  MOZ_CRASH_UNSAFE(msgbuf);
+}
+
+mozilla::Atomic<AutoEnterOOMUnsafeRegion::AnnotateOOMAllocationSizeCallback,
+                mozilla::Relaxed>
+    AutoEnterOOMUnsafeRegion::annotateOOMSizeCallback(nullptr);
+
+void AutoEnterOOMUnsafeRegion::crash_impl(size_t size, const char* reason) {
+  {
+    JS::AutoSuppressGCAnalysis suppress;
+    if (annotateOOMSizeCallback) {
+      annotateOOMSizeCallback(size);
+    }
+  }
+  crash_impl(reason);
+}
+
+void ExternalValueArray::trace(JSTracer* trc) {
+  if (Value* vp = begin()) {
+    TraceRootRange(trc, length(), vp, "js::ExternalValueArray");
+  }
+}
+
+#if defined(MOZ_EXECUTION_TRACING)
+
+bool JSContext::enableExecutionTracing() {
+  if (!executionTracer_) {
+    for (RealmsIter realm(runtime()); !realm.done(); realm.next()) {
+      if (realm->debuggerObservesCoverage()) {
+        JS_ReportErrorNumberASCII(
+            this, GetErrorMessage, nullptr,
+            JSMSG_DEBUG_EXCLUSIVE_EXECUTION_TRACE_COVERAGE);
+        return false;
+      }
+    }
+
+    executionTracer_ = js::MakeUnique<ExecutionTracer>();
+
+    if (!executionTracer_) {
+      return false;
+    }
+
+    if (!executionTracer_->init()) {
+      executionTracer_ = nullptr;
+      return false;
+    }
+
+    for (RealmsIter realm(runtime()); !realm.done(); realm.next()) {
+      if (realm->isSystem()) {
+        continue;
+      }
+      realm->enableExecutionTracing();
+    }
+  }
+
+  executionTracerSuspended_ = false;
+  return true;
+}
+
+void JSContext::cleanUpExecutionTracingState() {
+  MOZ_ASSERT(executionTracer_);
+
+  for (RealmsIter realm(runtime()); !realm.done(); realm.next()) {
+    if (realm->isSystem()) {
+      continue;
+    }
+    realm->disableExecutionTracing();
+  }
+
+  caches().tracingCaches.clearAll();
+}
+
+void JSContext::disableExecutionTracing() {
+  if (executionTracer_) {
+    cleanUpExecutionTracingState();
+    executionTracer_ = nullptr;
+  }
+}
+
+void JSContext::suspendExecutionTracing() {
+  if (executionTracer_) {
+    cleanUpExecutionTracingState();
+    executionTracerSuspended_ = true;
+  }
+}
+
+#endif
+
+#if defined(JS_CHECK_UNSAFE_CALL_WITH_ABI)
+
+AutoUnsafeCallWithABI::AutoUnsafeCallWithABI(UnsafeABIStrictness strictness)
+    : cx_(TlsContext.get()),
+      nested_(cx_ ? cx_->hasAutoUnsafeCallWithABI : false),
+      nogc(cx_) {
+  if (!cx_) {
+    return;
+  }
+  switch (strictness) {
+    case UnsafeABIStrictness::NoExceptions:
+      MOZ_ASSERT(!JS_IsExceptionPending(cx_));
+      checkForPendingException_ = true;
+      break;
+    case UnsafeABIStrictness::AllowPendingExceptions:
+      checkForPendingException_ = !JS_IsExceptionPending(cx_);
+      break;
+  }
+
+  cx_->hasAutoUnsafeCallWithABI = true;
+}
+
+AutoUnsafeCallWithABI::~AutoUnsafeCallWithABI() {
+  if (!cx_) {
+    return;
+  }
+  MOZ_ASSERT(cx_->hasAutoUnsafeCallWithABI);
+  if (!nested_) {
+    cx_->hasAutoUnsafeCallWithABI = false;
+    cx_->inUnsafeCallWithABI = false;
+  }
+  MOZ_ASSERT_IF(checkForPendingException_, !JS_IsExceptionPending(cx_));
+}
+
+#endif
+
+#if defined(__wasi__)
+JS_PUBLIC_API void js::IncWasiRecursionDepth(JSContext* cx) {
+  ++JS::RootingContext::get(cx)->wasiRecursionDepth;
+}
+
+JS_PUBLIC_API void js::DecWasiRecursionDepth(JSContext* cx) {
+  MOZ_ASSERT(JS::RootingContext::get(cx)->wasiRecursionDepth > 0);
+  --JS::RootingContext::get(cx)->wasiRecursionDepth;
+}
+
+JS_PUBLIC_API bool js::CheckWasiRecursionLimit(JSContext* cx) {
+  if (JS::RootingContext::get(cx)->wasiRecursionDepth >=
+      JS::RootingContext::wasiRecursionDepthLimit) {
+    return false;
+  }
+  return true;
+}
+#endif

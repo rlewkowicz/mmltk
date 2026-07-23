@@ -1,0 +1,115 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ *****************************************************************************
+ * Copyright (C) 2007-2013, International Business Machines Corporation
+ * and others. All Rights Reserved.
+ *****************************************************************************
+ *
+ * File CHNSECAL.H
+ *
+ * Modification History:
+ *
+ *   Date        Name        Description
+ *   9/18/2007  ajmacher         ported from java ChineseCalendar
+ *****************************************************************************
+ */
+
+#ifndef CHNSECAL_H
+#define CHNSECAL_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/calendar.h"
+#include "unicode/timezone.h"
+
+U_NAMESPACE_BEGIN
+
+class CalendarCache;
+class U_I18N_API ChineseCalendar : public Calendar {
+ public:
+
+  ChineseCalendar(const Locale& aLocale, UErrorCode &success);
+
+  virtual bool inTemporalLeapYear(UErrorCode &status) const override;
+
+  virtual const char* getTemporalMonthCode(UErrorCode &status) const override;
+
+  virtual void setTemporalMonthCode(const char* code, UErrorCode& status) override;
+
+ public:
+  ChineseCalendar(const ChineseCalendar& other);
+
+  virtual ~ChineseCalendar();
+
+  virtual ChineseCalendar* clone() const override;
+
+ private:
+
+    
+  UBool hasLeapMonthBetweenWinterSolstices;
+
+
+ protected:
+  virtual int32_t handleGetLimit(UCalendarDateFields field, ELimitType limitType) const override;
+  virtual int32_t handleGetMonthLength(int32_t extendedYear, int32_t month, UErrorCode& status) const override;
+  virtual int64_t handleComputeMonthStart(int32_t eyear, int32_t month, UBool useMonth, UErrorCode& status) const override;
+  virtual int32_t handleGetExtendedYear(UErrorCode& status) override;
+  virtual void handleComputeFields(int32_t julianDay, UErrorCode &status) override;
+  virtual const UFieldResolutionTable* getFieldResolutionTable() const override;
+
+ private:
+  int32_t handleGetMonthLengthWithLeap(int32_t extendedYear, int32_t month, bool isLeap, UErrorCode& status) const;
+  int64_t handleComputeMonthStartWithLeap(int32_t eyear, int32_t month, bool isLeap, UErrorCode& status) const;
+
+ public:
+  virtual void add(UCalendarDateFields field, int32_t amount, UErrorCode &status) override;
+  virtual void add(EDateFields field, int32_t amount, UErrorCode &status) override;
+  virtual void roll(UCalendarDateFields field, int32_t amount, UErrorCode &status) override;
+  virtual void roll(EDateFields field, int32_t amount, UErrorCode &status) override;
+
+
+ private:
+
+  static const UFieldResolutionTable CHINESE_DATE_PRECEDENCE[];
+
+  virtual void offsetMonth(int32_t newMoon, int32_t dom, int32_t delta, UErrorCode& status);
+
+ public: 
+  virtual UClassID getDynamicClassID() const override;
+
+  static UClassID U_EXPORT2 getStaticClassID();
+
+  virtual const char * getType() const override;
+
+  virtual int32_t getActualMaximum(UCalendarDateFields field, UErrorCode& status) const override;
+
+  struct Setting {
+      const TimeZone* zoneAstroCalc;
+      CalendarCache** winterSolsticeCache;
+      CalendarCache** newYearCache;
+  };
+ protected:
+  virtual Setting getSetting(UErrorCode& status) const;
+  virtual int32_t internalGetMonth(int32_t defaultValue, UErrorCode& status) const override;
+
+  virtual int32_t internalGetMonth(UErrorCode& status) const override;
+
+ protected:
+
+  DECLARE_OVERRIDE_SYSTEM_DEFAULT_CENTURY
+
+ private: 
+
+  ChineseCalendar() = delete; 
+
+#ifdef __CalendarTest__
+  friend void CalendarTest::TestChineseCalendarComputeMonthStart();
+#endif
+};
+
+U_NAMESPACE_END
+
+#endif
+#endif

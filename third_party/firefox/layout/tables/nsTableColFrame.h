@@ -1,0 +1,210 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsTableColFrame_h_
+#define nsTableColFrame_h_
+
+#include "celldata.h"
+#include "mozilla/WritingModes.h"
+#include "nsContainerFrame.h"
+#include "nsTArray.h"
+#include "nsTableColGroupFrame.h"
+#include "nscore.h"
+
+namespace mozilla {
+class PresShell;
+}  
+
+class nsTableColFrame final : public nsSplittableFrame {
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(nsTableColFrame)
+
+  enum {
+    eWIDTH_SOURCE_NONE = 0,  
+    eWIDTH_SOURCE_CELL = 1,  
+    eWIDTH_SOURCE_CELL_WITH_SPAN = 2  
+  };
+
+  nsTableColType GetColType() const;
+  void SetColType(nsTableColType aType);
+
+  friend nsTableColFrame* NS_NewTableColFrame(mozilla::PresShell* aPresShell,
+                                              ComputedStyle* aContext);
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override {
+    nsSplittableFrame::Init(aContent, aParent, aPrevInFlow);
+    if (!aPrevInFlow) {
+      mWritingMode = GetTableFrame()->GetWritingMode();
+    }
+  }
+
+  void DidSetComputedStyle(ComputedStyle* aOldComputedStyle) override;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+  nsTableColGroupFrame* GetTableColGroupFrame() const {
+    nsIFrame* parent = GetParent();
+    MOZ_ASSERT(parent && parent->IsTableColGroupFrame());
+    return static_cast<nsTableColGroupFrame*>(parent);
+  }
+
+  nsTableFrame* GetTableFrame() const {
+    return GetTableColGroupFrame()->GetTableFrame();
+  }
+
+  int32_t GetColIndex() const;
+
+  void SetColIndex(int32_t aColIndex);
+
+  nsTableColFrame* GetNextCol() const;
+
+  int32_t GetSpan();
+
+  int32_t Count() const;
+
+  nscoord GetIStartBorderWidth() const { return mIStartBorderWidth; }
+  nscoord GetIEndBorderWidth() const { return mIEndBorderWidth; }
+  void SetIStartBorderWidth(nscoord aWidth) { mIStartBorderWidth = aWidth; }
+  void SetIEndBorderWidth(nscoord aWidth) { mIEndBorderWidth = aWidth; }
+
+#ifdef DEBUG
+  void Dump(int32_t aIndent);
+#endif
+
+  void ResetIntrinsics() {
+    mMinCoord = 0;
+    mPrefCoord = 0;
+    mPrefPercent = 0.0f;
+    mHasSpecifiedCoord = false;
+  }
+
+  void ResetPrefPercent() { mPrefPercent = 0.0f; }
+
+  void ResetSpanIntrinsics() {
+    mSpanMinCoord = 0;
+    mSpanPrefCoord = 0;
+    mSpanPrefPercent = 0.0f;
+  }
+
+  void AddCoords(nscoord aMinCoord, nscoord aPrefCoord,
+                 bool aHasSpecifiedCoord) {
+    NS_ASSERTION(aMinCoord <= aPrefCoord, "intrinsic widths out of order");
+
+    if (aHasSpecifiedCoord && !mHasSpecifiedCoord) {
+      mPrefCoord = mMinCoord;
+      mHasSpecifiedCoord = true;
+    }
+    if (!aHasSpecifiedCoord && mHasSpecifiedCoord) {
+      aPrefCoord = aMinCoord;  
+    }
+
+    if (aMinCoord > mMinCoord) {
+      mMinCoord = aMinCoord;
+    }
+    if (aPrefCoord > mPrefCoord) {
+      mPrefCoord = aPrefCoord;
+    }
+
+    NS_ASSERTION(mMinCoord <= mPrefCoord, "min larger than pref");
+  }
+
+  void AddPrefPercent(float aPrefPercent) {
+    if (aPrefPercent > mPrefPercent) {
+      mPrefPercent = aPrefPercent;
+    }
+  }
+
+  nscoord GetMinCoord() const { return mMinCoord; }
+  nscoord GetPrefCoord() const { return mPrefCoord; }
+  bool GetHasSpecifiedCoord() const { return mHasSpecifiedCoord; }
+
+  float GetPrefPercent() const { return mPrefPercent; }
+
+  void AddSpanCoords(nscoord aSpanMinCoord, nscoord aSpanPrefCoord,
+                     bool aSpanHasSpecifiedCoord) {
+    NS_ASSERTION(aSpanMinCoord <= aSpanPrefCoord,
+                 "intrinsic widths out of order");
+
+    if (!aSpanHasSpecifiedCoord && mHasSpecifiedCoord) {
+      aSpanPrefCoord = aSpanMinCoord;  
+    }
+
+    if (aSpanMinCoord > mSpanMinCoord) {
+      mSpanMinCoord = aSpanMinCoord;
+    }
+    if (aSpanPrefCoord > mSpanPrefCoord) {
+      mSpanPrefCoord = aSpanPrefCoord;
+    }
+
+    NS_ASSERTION(mSpanMinCoord <= mSpanPrefCoord, "min larger than pref");
+  }
+
+  void AddSpanPrefPercent(float aSpanPrefPercent) {
+    if (aSpanPrefPercent > mSpanPrefPercent) {
+      mSpanPrefPercent = aSpanPrefPercent;
+    }
+  }
+
+  void AccumulateSpanIntrinsics() {
+    AddCoords(mSpanMinCoord, mSpanPrefCoord, mHasSpecifiedCoord);
+    AddPrefPercent(mSpanPrefPercent);
+  }
+
+  void AdjustPrefPercent(float* aTableTotalPercent) {
+    float allowed = 1.0f - *aTableTotalPercent;
+    if (mPrefPercent > allowed) {
+      mPrefPercent = allowed;
+    }
+    *aTableTotalPercent += mPrefPercent;
+  }
+
+  void ResetFinalISize() {
+    mFinalISize = nscoord_MIN;  
+  }
+  void SetFinalISize(nscoord aFinalISize) { mFinalISize = aFinalISize; }
+  nscoord GetFinalISize() { return mFinalISize; }
+
+  void InvalidateFrame(uint32_t aDisplayItemKey = 0,
+                       bool aRebuildDisplayItems = true) override;
+  void InvalidateFrameWithRect(const nsRect& aRect,
+                               uint32_t aDisplayItemKey = 0,
+                               bool aRebuildDisplayItems = true) override;
+  void InvalidateFrameForRemoval() override { InvalidateFrameSubtree(); }
+
+ protected:
+  explicit nsTableColFrame(ComputedStyle* aStyle, nsPresContext* aPresContext);
+  ~nsTableColFrame();
+
+  nscoord mMinCoord;
+  nscoord mPrefCoord;
+  nscoord mSpanMinCoord;   
+  nscoord mSpanPrefCoord;  
+  float mPrefPercent;
+  float mSpanPrefPercent;  
+  nscoord mFinalISize;
+
+  uint32_t mColIndex;
+
+  nscoord mIStartBorderWidth;
+  nscoord mIEndBorderWidth;
+
+  bool mHasSpecifiedCoord;
+};
+
+inline int32_t nsTableColFrame::GetColIndex() const { return mColIndex; }
+
+inline void nsTableColFrame::SetColIndex(int32_t aColIndex) {
+  mColIndex = aColIndex;
+}
+
+#endif

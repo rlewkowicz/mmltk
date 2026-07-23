@@ -1,0 +1,50 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef AUDIO_THREAD_PRIORITY_H
+#define AUDIO_THREAD_PRIORITY_H
+
+#include <stdint.h>
+#include <stdlib.h>
+
+struct atp_handle;
+struct atp_thread_info;
+extern size_t ATP_THREAD_INFO_SIZE;
+
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
+
+atp_handle *atp_promote_current_thread_to_real_time(uint32_t audio_buffer_frames,
+                                                    uint32_t audio_samplerate_hz);
+
+
+int32_t atp_demote_current_thread_from_real_time(atp_handle *handle);
+
+int32_t atp_free_handle(atp_handle *handle);
+
+
+#ifdef __linux__
+atp_handle *atp_promote_thread_to_real_time(atp_thread_info *thread_info);
+
+int32_t atp_demote_thread_from_real_time(atp_thread_info* thread_info);
+
+atp_thread_info *atp_get_current_thread_info();
+
+int32_t atp_free_thread_info(atp_thread_info *thread_info);
+
+void atp_serialize_thread_info(atp_thread_info *thread_info, uint8_t *bytes);
+
+atp_thread_info* atp_deserialize_thread_info(uint8_t *bytes);
+
+int32_t atp_set_real_time_limit(uint32_t audio_buffer_frames,
+                                uint32_t audio_samplerate_hz);
+
+#endif // __linux__
+
+#ifdef __cplusplus
+} 
+#endif // __cplusplus
+
+#endif // AUDIO_THREAD_PRIORITY_H

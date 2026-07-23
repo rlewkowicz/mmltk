@@ -1,0 +1,139 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_shared_Disassembler_shared_h
+#define jit_shared_Disassembler_shared_h
+
+#include "mozilla/Atomics.h"
+#include "mozilla/Attributes.h"
+
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#if defined(JS_DISASM_ARM) || defined(JS_DISASM_ARM64) || \
+    defined(JS_DISASM_RISCV64)
+#  define JS_DISASM_SUPPORTED
+#endif
+
+namespace js {
+
+class JS_PUBLIC_API Sprinter;
+
+namespace jit {
+
+class Label;
+
+
+class DisassemblerSpew {
+#ifdef JS_DISASM_SUPPORTED
+  struct Node {
+    const Label* key;  
+    uint32_t value;    
+    bool bound;        
+    Node* next;
+  };
+
+  Node* lookup(const Label* key);
+  Node* add(const Label* key, uint32_t value);
+  bool remove(const Label* key);
+
+  uint32_t probe(const Label* l);
+  uint32_t define(const Label* l);
+  uint32_t internalResolve(const Label* l);
+#endif
+
+  void spewVA(const char* fmt, va_list va) MOZ_FORMAT_PRINTF(2, 0);
+
+ public:
+  DisassemblerSpew();
+  ~DisassemblerSpew();
+
+#ifdef JS_DISASM_SUPPORTED
+  void setLabelIndent(const char* s);
+  void setTargetIndent(const char* s);
+#endif
+
+  void setPrinter(Sprinter* sp);
+
+  bool isDisabled();
+
+  void spew(const char* fmt, ...) MOZ_FORMAT_PRINTF(2, 3);
+
+  struct LabelDoc {
+#ifdef JS_DISASM_SUPPORTED
+    LabelDoc() : doc(0), bound(false), valid(false) {}
+    LabelDoc(uint32_t doc, bool bound) : doc(doc), bound(bound), valid(true) {}
+    const uint32_t doc;
+    const bool bound;
+    const bool valid;
+#else
+    LabelDoc() = default;
+    LabelDoc(uint32_t, bool) {}
+#endif
+  };
+
+  struct LiteralDoc {
+#ifdef JS_DISASM_SUPPORTED
+    enum class Type { Patchable, I32, U32, I64, U64, F32, F64 };
+    const Type type;
+    union {
+      int32_t i32;
+      uint32_t u32;
+      int64_t i64;
+      uint64_t u64;
+      float f32;
+      double f64;
+    } value;
+    LiteralDoc() : type(Type::Patchable) {}
+    explicit LiteralDoc(int32_t v) : type(Type::I32) { value.i32 = v; }
+    explicit LiteralDoc(uint32_t v) : type(Type::U32) { value.u32 = v; }
+    explicit LiteralDoc(int64_t v) : type(Type::I64) { value.i64 = v; }
+    explicit LiteralDoc(uint64_t v) : type(Type::U64) { value.u64 = v; }
+    explicit LiteralDoc(float v) : type(Type::F32) { value.f32 = v; }
+    explicit LiteralDoc(double v) : type(Type::F64) { value.f64 = v; }
+#else
+    LiteralDoc() = default;
+    explicit LiteralDoc(int32_t) {}
+    explicit LiteralDoc(uint32_t) {}
+    explicit LiteralDoc(int64_t) {}
+    explicit LiteralDoc(uint64_t) {}
+    explicit LiteralDoc(float) {}
+    explicit LiteralDoc(double) {}
+#endif
+  };
+
+  LabelDoc refLabel(const Label* l);
+
+#ifdef JS_DISASM_SUPPORTED
+  void spewRef(const LabelDoc& target);
+
+  void spewBind(const Label* label);
+
+  void spewRetarget(const Label* label, const Label* target);
+
+  void formatLiteral(const LiteralDoc& doc, char* buffer, size_t bufsize);
+
+  void spewOrphans();
+#endif
+
+ private:
+  Sprinter* printer_;
+#ifdef JS_DISASM_SUPPORTED
+  const char* labelIndent_;
+  const char* targetIndent_;
+  uint32_t spewNext_;
+  Node* nodes_;
+  uint32_t tag_;
+
+  static mozilla::Atomic<uint32_t> counter_;
+#endif
+};
+
+}  
+}  
+
+#endif  // jit_shared_Disassembler_shared_h

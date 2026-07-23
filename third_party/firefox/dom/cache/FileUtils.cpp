@@ -1,0 +1,693 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "CacheCipherKeyManager.h"
+#include "DBSchema.h"
+#include "FileUtilsImpl.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/SnappyCompressOutputStream.h"
+#include "mozilla/dom/InternalResponse.h"
+#include "mozilla/dom/quota/DecryptingInputStream.h"
+#include "mozilla/dom/quota/DecryptingInputStream_impl.h"
+#include "mozilla/dom/quota/EncryptingOutputStream.h"
+#include "mozilla/dom/quota/EncryptingOutputStream_impl.h"
+#include "mozilla/dom/quota/FileStreams.h"
+#include "mozilla/dom/quota/PersistenceType.h"
+#include "mozilla/dom/quota/QuotaManager.h"
+#include "mozilla/dom/quota/QuotaObject.h"
+#include "mozilla/dom/quota/ResultExtensions.h"
+#include "nsIFile.h"
+#include "nsIObjectInputStream.h"
+#include "nsIObjectOutputStream.h"
+#include "nsIUUIDGenerator.h"
+#include "nsNetCID.h"
+#include "nsNetUtil.h"
+#include "nsServiceManagerUtils.h"
+#include "nsString.h"
+#include "nsThreadUtils.h"
+#include "snappy/snappy.h"
+
+namespace mozilla::dom::cache {
+
+static_assert(SNAPPY_VERSION == 0x010202);
+
+using mozilla::dom::quota::Client;
+using mozilla::dom::quota::CloneFileAndAppend;
+using mozilla::dom::quota::GetDirEntryKind;
+using mozilla::dom::quota::nsIFileKind;
+using mozilla::dom::quota::QuotaManager;
+using mozilla::dom::quota::QuotaObject;
+
+namespace {
+
+const int64_t kRoundUpNumber = 20480;
+
+constexpr uint32_t kEncryptedStreamBlockSize = 4096;
+
+enum BodyFileType { BODY_FILE_FINAL, BODY_FILE_TMP };
+
+Result<NotNull<nsCOMPtr<nsIFile>>, nsresult> BodyIdToFile(
+    nsIFile& aBaseDir, const nsID& aId, BodyFileType aType,
+    bool aCreateDirIfNotExists = false);
+
+int64_t RoundUp(int64_t aX, int64_t aY);
+
+int64_t BodyGeneratePadding(int64_t aBodyFileSize, uint32_t aPaddingInfo);
+
+nsresult DirectoryPaddingWrite(nsIFile& aBaseDir,
+                               DirPaddingFile aPaddingFileType,
+                               int64_t aPaddingSize);
+
+const auto kMorgueDirectory = u"morgue"_ns;
+
+bool IsFileNotFoundError(const nsresult aRv) {
+  return aRv == NS_ERROR_FILE_NOT_FOUND;
+}
+
+Result<NotNull<nsCOMPtr<nsIFile>>, nsresult> BodyGetCacheDir(
+    nsIFile& aBaseDir, const nsID& aId, bool aCreateDirIfNotExists = true) {
+  QM_TRY_UNWRAP(auto cacheDir, CloneFileAndAppend(aBaseDir, kMorgueDirectory));
+
+  QM_TRY(MOZ_TO_RESULT(cacheDir->Append(IntToString(aId.m3[7]))));
+
+  if (aCreateDirIfNotExists) {
+    bool exists;
+    QM_TRY(MOZ_TO_RESULT(cacheDir->Exists(&exists)));
+    if (!exists) {
+      QM_TRY(QM_OR_ELSE_LOG_VERBOSE_IF(
+          MOZ_TO_RESULT(cacheDir->Create(nsIFile::DIRECTORY_TYPE, 0755)),
+          IsSpecificError<NS_ERROR_FILE_ALREADY_EXISTS>,
+          ErrToDefaultOk<>));
+    }
+  }
+
+  return WrapNotNullUnchecked(std::move(cacheDir));
+}
+
+}  
+
+nsresult BodyCreateDir(nsIFile& aBaseDir) {
+  QM_TRY_INSPECT(const auto& bodyDir,
+                 CloneFileAndAppend(aBaseDir, kMorgueDirectory));
+
+  QM_TRY(QM_OR_ELSE_LOG_VERBOSE_IF(
+      MOZ_TO_RESULT(bodyDir->Create(nsIFile::DIRECTORY_TYPE, 0755)),
+      IsSpecificError<NS_ERROR_FILE_ALREADY_EXISTS>,
+      ErrToDefaultOk<>));
+
+  return NS_OK;
+}
+
+nsresult BodyDeleteDir(const CacheDirectoryMetadata& aDirectoryMetadata,
+                       nsIFile& aBaseDir) {
+  QM_TRY_INSPECT(const auto& bodyDir,
+                 CloneFileAndAppend(aBaseDir, kMorgueDirectory));
+
+  QM_TRY(MOZ_TO_RESULT(RemoveNsIFileRecursively(aDirectoryMetadata, *bodyDir)));
+
+  return NS_OK;
+}
+
+Result<nsCOMPtr<nsISupports>, nsresult> BodyStartWriteStream(
+    const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile& aBaseDir,
+    const nsID& aBodyId, Maybe<CipherKey> aMaybeCipherKey,
+    nsIInputStream& aSource, void* aClosure, nsAsyncCopyCallbackFun aCallback) {
+  MOZ_DIAGNOSTIC_ASSERT(aClosure);
+  MOZ_DIAGNOSTIC_ASSERT(aCallback);
+
+  {
+    QM_TRY_INSPECT(const auto& finalFile,
+                   BodyIdToFile(aBaseDir, aBodyId, BODY_FILE_FINAL,
+                                 false));
+
+    QM_TRY_INSPECT(const bool& exists,
+                   MOZ_TO_RESULT_INVOKE_MEMBER(*finalFile, Exists));
+
+    QM_TRY(OkIf(!exists), Err(NS_ERROR_FILE_ALREADY_EXISTS));
+  }
+
+  QM_TRY_INSPECT(const auto& tmpFile,
+                 BodyIdToFile(aBaseDir, aBodyId, BODY_FILE_TMP,
+                               true));
+
+  QM_TRY_UNWRAP(nsCOMPtr<nsIOutputStream> fileStream,
+                CreateFileOutputStream(aDirectoryMetadata.mPersistenceType,
+                                       aDirectoryMetadata, Client::DOMCACHE,
+                                       tmpFile.get()));
+
+  const auto privateBody = aDirectoryMetadata.mIsPrivate;
+  if (privateBody) {
+    MOZ_DIAGNOSTIC_ASSERT(aMaybeCipherKey);
+
+    fileStream = MakeRefPtr<quota::EncryptingOutputStream<CipherStrategy>>(
+        std::move(fileStream), kEncryptedStreamBlockSize, *aMaybeCipherKey);
+  }
+
+  const auto compressed = MakeRefPtr<SnappyCompressOutputStream>(fileStream);
+
+  const nsCOMPtr<nsIEventTarget> target =
+      do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID);
+
+  nsCOMPtr<nsISupports> copyContext;
+  QM_TRY(MOZ_TO_RESULT(
+      NS_AsyncCopy(&aSource, compressed, target, NS_ASYNCCOPY_VIA_WRITESEGMENTS,
+                   compressed->BlockSize(), aCallback, aClosure, true,
+                   true,  
+                   getter_AddRefs(copyContext))));
+
+  return std::move(copyContext);
+}
+
+void BodyCancelWrite(nsISupports& aCopyContext) {
+  QM_WARNONLY_TRY(
+      QM_TO_RESULT(NS_CancelAsyncCopy(&aCopyContext, NS_ERROR_ABORT)));
+
+}
+
+Result<int64_t, nsresult> BodyFinalizeWrite(nsIFile& aBaseDir,
+                                            const nsID& aId) {
+  QM_TRY_INSPECT(const auto& tmpFile,
+                 BodyIdToFile(aBaseDir, aId, BODY_FILE_TMP));
+
+  QM_TRY_INSPECT(const auto& finalFile,
+                 BodyIdToFile(aBaseDir, aId, BODY_FILE_FINAL));
+
+  nsAutoString finalFileName;
+  QM_TRY(MOZ_TO_RESULT(finalFile->GetLeafName(finalFileName)));
+
+  QM_TRY(MOZ_TO_RESULT(tmpFile->RenameTo(nullptr, finalFileName)));
+
+  QM_TRY_INSPECT(const int64_t& fileSize,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(*finalFile, GetFileSize));
+
+  return fileSize;
+}
+
+Result<int64_t, nsresult> GetBodyDiskSize(nsIFile& aBaseDir, const nsID& aId) {
+  QM_TRY_INSPECT(const auto& finalFile,
+                 BodyIdToFile(aBaseDir, aId, BODY_FILE_FINAL));
+
+  QM_TRY_INSPECT(const int64_t& fileSize,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(*finalFile, GetFileSize));
+
+  return fileSize;
+}
+
+Result<MovingNotNull<nsCOMPtr<nsIInputStream>>, nsresult> BodyOpen(
+    const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile& aBaseDir,
+    const nsID& aId, Maybe<CipherKey> aMaybeCipherKey) {
+  QM_TRY_INSPECT(const auto& finalFile,
+                 BodyIdToFile(aBaseDir, aId, BODY_FILE_FINAL));
+
+  QM_TRY_UNWRAP(nsCOMPtr<nsIInputStream> fileInputStream,
+                CreateFileInputStream(aDirectoryMetadata.mPersistenceType,
+                                      aDirectoryMetadata, Client::DOMCACHE,
+                                      finalFile.get()));
+
+  auto privateBody = aDirectoryMetadata.mIsPrivate;
+  if (privateBody) {
+    MOZ_DIAGNOSTIC_ASSERT(aMaybeCipherKey);
+
+    fileInputStream = new quota::DecryptingInputStream<CipherStrategy>(
+        WrapNotNull(std::move(fileInputStream)), kEncryptedStreamBlockSize,
+        *aMaybeCipherKey);
+  }
+  return WrapMovingNotNull(std::move(fileInputStream));
+}
+
+nsresult BodyMaybeUpdatePaddingSize(
+    const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile& aBaseDir,
+    const nsID& aId, const uint32_t aPaddingInfo, int64_t* aPaddingSizeInOut) {
+  MOZ_DIAGNOSTIC_ASSERT(aPaddingSizeInOut);
+
+  QM_TRY_INSPECT(const auto& bodyFile,
+                 BodyIdToFile(aBaseDir, aId, BODY_FILE_TMP));
+
+  QuotaManager* quotaManager = QuotaManager::Get();
+  MOZ_DIAGNOSTIC_ASSERT(quotaManager);
+
+  int64_t fileSize = 0;
+  RefPtr<QuotaObject> quotaObject = quotaManager->GetQuotaObject(
+      aDirectoryMetadata.mPersistenceType, aDirectoryMetadata, Client::DOMCACHE,
+      bodyFile.get(), -1, &fileSize);
+  MOZ_DIAGNOSTIC_ASSERT(quotaObject);
+  MOZ_DIAGNOSTIC_ASSERT(fileSize >= 0);
+  if (!quotaObject) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  if (*aPaddingSizeInOut == InternalResponse::UNKNOWN_PADDING_SIZE) {
+    *aPaddingSizeInOut = BodyGeneratePadding(fileSize, aPaddingInfo);
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(*aPaddingSizeInOut >= 0);
+
+  if (!quotaObject->IncreaseSize(*aPaddingSizeInOut)) {
+    return NS_ERROR_FILE_NO_DEVICE_SPACE;
+  }
+
+  return NS_OK;
+}
+
+nsresult BodyDeleteFiles(const CacheDirectoryMetadata& aDirectoryMetadata,
+                         nsIFile& aBaseDir, const nsTArray<nsID>& aIdList) {
+  for (const auto id : aIdList) {
+    bool exists;
+
+    QM_TRY_INSPECT(const auto& finalFile,
+                   BodyIdToFile(aBaseDir, id, BODY_FILE_FINAL));
+    QM_TRY(MOZ_TO_RESULT(finalFile->Exists(&exists)));
+    if (exists) {
+      QM_TRY(MOZ_TO_RESULT(RemoveNsIFile(aDirectoryMetadata, *finalFile,
+                                          true)));
+    }
+
+    QM_TRY_INSPECT(const auto& tempFile,
+                   BodyIdToFile(aBaseDir, id, BODY_FILE_TMP));
+    QM_TRY(MOZ_TO_RESULT(tempFile->Exists(&exists)));
+    if (exists) {
+      QM_TRY(MOZ_TO_RESULT(RemoveNsIFile(aDirectoryMetadata, *tempFile,
+                                          true)));
+    }
+  }
+
+  return NS_OK;
+}
+
+namespace {
+
+Result<NotNull<nsCOMPtr<nsIFile>>, nsresult> BodyIdToFile(
+    nsIFile& aBaseDir, const nsID& aId, const BodyFileType aType,
+    bool aCreateDirIfNotExists) {
+  QM_TRY_UNWRAP(auto bodyFile,
+                BodyGetCacheDir(aBaseDir, aId, aCreateDirIfNotExists));
+
+  char idString[NSID_LENGTH];
+  aId.ToProvidedString(idString);
+
+  NS_ConvertASCIItoUTF16 fileName(idString);
+
+  if (aType == BODY_FILE_FINAL) {
+    fileName.AppendLiteral(".final");
+  } else {
+    fileName.AppendLiteral(".tmp");
+  }
+
+  QM_TRY(MOZ_TO_RESULT(bodyFile->Append(fileName)));
+
+  return bodyFile;
+}
+
+int64_t RoundUp(const int64_t aX, const int64_t aY) {
+  MOZ_DIAGNOSTIC_ASSERT(aX >= 0);
+  MOZ_DIAGNOSTIC_ASSERT(aY > 0);
+
+  MOZ_DIAGNOSTIC_ASSERT(INT64_MAX - ((aX - 1) / aY) * aY >= aY);
+  return aY + ((aX - 1) / aY) * aY;
+}
+
+int64_t BodyGeneratePadding(const int64_t aBodyFileSize,
+                            const uint32_t aPaddingInfo) {
+  int64_t randomSize = static_cast<int64_t>(aPaddingInfo);
+  MOZ_DIAGNOSTIC_ASSERT(INT64_MAX - aBodyFileSize >= randomSize);
+  randomSize += aBodyFileSize;
+
+  return RoundUp(randomSize, kRoundUpNumber) - aBodyFileSize;
+}
+
+nsresult DirectoryPaddingWrite(nsIFile& aBaseDir,
+                               DirPaddingFile aPaddingFileType,
+                               int64_t aPaddingSize) {
+  MOZ_DIAGNOSTIC_ASSERT(aPaddingSize >= 0);
+
+  QM_TRY_INSPECT(
+      const auto& file,
+      CloneFileAndAppend(aBaseDir, aPaddingFileType == DirPaddingFile::TMP_FILE
+                                       ? nsLiteralString(PADDING_TMP_FILE_NAME)
+                                       : nsLiteralString(PADDING_FILE_NAME)));
+
+  QM_TRY_INSPECT(const auto& outputStream, NS_NewLocalFileOutputStream(file));
+
+  nsCOMPtr<nsIObjectOutputStream> objectStream =
+      NS_NewObjectOutputStream(outputStream);
+
+  QM_TRY(MOZ_TO_RESULT(objectStream->Write64(aPaddingSize)));
+
+  return NS_OK;
+}
+
+}  
+
+nsresult BodyDeleteOrphanedFiles(
+    const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile& aBaseDir,
+    nsTHashSet<nsID>& aKnownBodyIds) {
+
+  Maybe<CacheDirectoryMetadata> dirMetaData = Some(aDirectoryMetadata);
+
+  QM_TRY_INSPECT(const auto& dir,
+                 CloneFileAndAppend(aBaseDir, kMorgueDirectory));
+
+  QM_TRY(quota::CollectEachFile(
+      *dir,
+      [&dirMetaData, &aKnownBodyIds](
+          const nsCOMPtr<nsIFile>& subdir) -> Result<Ok, nsresult> {
+        QM_TRY_INSPECT(const auto& dirEntryKind, GetDirEntryKind(*subdir));
+
+        switch (dirEntryKind) {
+          case nsIFileKind::ExistsAsDirectory: {
+            const auto removeOrphanedFiles =
+                [&dirMetaData, &aKnownBodyIds](
+                    nsIFile& bodyFile,
+                    const nsACString& leafName) -> Result<bool, nsresult> {
+              auto cleanup = MakeScopeExit([&dirMetaData, &bodyFile] {
+                DebugOnly<nsresult> result =
+                    RemoveNsIFile(dirMetaData, bodyFile);
+                MOZ_ASSERT(NS_SUCCEEDED(result));
+              });
+
+              nsID id;
+              QM_TRY(OkIf(id.Parse(PromiseFlatCString(leafName).get())), true);
+
+              if (!aKnownBodyIds.Contains(id)) {
+                return true;
+              }
+
+              cleanup.release();
+
+              return false;
+            };
+
+            QM_TRY(QM_OR_ELSE_LOG_VERBOSE_IF(
+                MOZ_TO_RESULT(BodyTraverseFilesForCleanup(dirMetaData, *subdir,
+                                                          removeOrphanedFiles)),
+                IsSpecificError<NS_ERROR_FILE_FS_CORRUPTED>,
+                ErrToDefaultOk<>));
+            break;
+          }
+
+          case nsIFileKind::ExistsAsFile: {
+            DebugOnly<nsresult> result = RemoveNsIFile(dirMetaData, *subdir,
+                                                        false);
+            MOZ_ASSERT(NS_SUCCEEDED(result));
+            break;
+          }
+
+          case nsIFileKind::DoesNotExist:
+            break;
+        }
+
+        return Ok{};
+      }));
+
+  return NS_OK;
+}
+
+namespace {
+
+Result<nsCOMPtr<nsIFile>, nsresult> GetMarkerFileHandle(
+    const CacheDirectoryMetadata& aDirectoryMetadata) {
+  QM_TRY_UNWRAP(auto marker,
+                CloneFileAndAppend(*aDirectoryMetadata.mDir, u"cache"_ns));
+
+  QM_TRY(MOZ_TO_RESULT(marker->Append(u"context_open.marker"_ns)));
+
+  return marker;
+}
+
+}  
+
+nsresult CreateMarkerFile(const CacheDirectoryMetadata& aDirectoryMetadata) {
+  QM_TRY_INSPECT(const auto& marker, GetMarkerFileHandle(aDirectoryMetadata));
+
+  QM_TRY(QM_OR_ELSE_LOG_VERBOSE_IF(
+      MOZ_TO_RESULT(marker->Create(nsIFile::NORMAL_FILE_TYPE, 0644)),
+      IsSpecificError<NS_ERROR_FILE_ALREADY_EXISTS>,
+      ErrToDefaultOk<>));
+
+
+  return NS_OK;
+}
+
+nsresult DeleteMarkerFile(const CacheDirectoryMetadata& aDirectoryMetadata) {
+  QM_TRY_INSPECT(const auto& marker, GetMarkerFileHandle(aDirectoryMetadata));
+
+  DebugOnly<nsresult> result =
+      RemoveNsIFile(aDirectoryMetadata, *marker,  false);
+  MOZ_ASSERT(NS_SUCCEEDED(result));
+
+
+  return NS_OK;
+}
+
+bool MarkerFileExists(const CacheDirectoryMetadata& aDirectoryMetadata) {
+  QM_TRY_INSPECT(const auto& marker, GetMarkerFileHandle(aDirectoryMetadata),
+                 false);
+
+  QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER(marker, Exists), false);
+}
+
+nsresult RemoveNsIFileRecursively(
+    const Maybe<CacheDirectoryMetadata>& aDirectoryMetadata, nsIFile& aFile,
+    const bool aTrackQuota) {
+  MOZ_DIAGNOSTIC_ASSERT_IF(aTrackQuota, aDirectoryMetadata);
+
+  QM_TRY_INSPECT(const auto& dirEntryKind, GetDirEntryKind(aFile));
+
+  switch (dirEntryKind) {
+    case nsIFileKind::ExistsAsDirectory:
+      QM_TRY(quota::CollectEachFile(
+          aFile,
+          [&aDirectoryMetadata, &aTrackQuota](
+              const nsCOMPtr<nsIFile>& file) -> Result<Ok, nsresult> {
+            QM_TRY(MOZ_TO_RESULT(RemoveNsIFileRecursively(aDirectoryMetadata,
+                                                          *file, aTrackQuota)));
+
+            return Ok{};
+          }));
+
+      QM_TRY(MOZ_TO_RESULT(aFile.Remove( false)));
+
+      break;
+
+    case nsIFileKind::ExistsAsFile:
+      return RemoveNsIFile(aDirectoryMetadata, aFile, aTrackQuota);
+
+    case nsIFileKind::DoesNotExist:
+      break;
+  }
+
+  return NS_OK;
+}
+
+nsresult RemoveNsIFile(const Maybe<CacheDirectoryMetadata>& aDirectoryMetadata,
+                       nsIFile& aFile, const bool aTrackQuota) {
+  MOZ_DIAGNOSTIC_ASSERT_IF(aTrackQuota, aDirectoryMetadata);
+
+  int64_t fileSize = 0;
+  if (aTrackQuota) {
+    QM_TRY_INSPECT(
+        const auto& maybeFileSize,
+        QM_OR_ELSE_WARN_IF(
+            MOZ_TO_RESULT_INVOKE_MEMBER(aFile, GetFileSize).map(Some<int64_t>),
+            IsFileNotFoundError,
+            ErrToDefaultOk<Maybe<int64_t>>));
+
+    if (!maybeFileSize) {
+      return NS_OK;
+    }
+
+    fileSize = *maybeFileSize;
+  }
+
+  QM_TRY(QM_OR_ELSE_WARN_IF(
+      MOZ_TO_RESULT(aFile.Remove( false)),
+      IsFileNotFoundError,
+      ErrToDefaultOk<>));
+
+  if (fileSize > 0) {
+    MOZ_ASSERT(aTrackQuota);
+    DecreaseUsageForDirectoryMetadata(*aDirectoryMetadata, fileSize);
+  }
+
+  return NS_OK;
+}
+
+void DecreaseUsageForDirectoryMetadata(
+    const CacheDirectoryMetadata& aDirectoryMetadata,
+    const int64_t aUpdatingSize) {
+  MOZ_DIAGNOSTIC_ASSERT(aUpdatingSize > 0);
+
+  QuotaManager* quotaManager = QuotaManager::Get();
+  MOZ_DIAGNOSTIC_ASSERT(quotaManager);
+
+  quotaManager->DecreaseUsageForClient(
+      quota::ClientMetadata{aDirectoryMetadata, Client::DOMCACHE},
+      aUpdatingSize);
+}
+
+bool DirectoryPaddingFileExists(nsIFile& aBaseDir,
+                                DirPaddingFile aPaddingFileType) {
+  QM_TRY_INSPECT(
+      const auto& file,
+      CloneFileAndAppend(aBaseDir, aPaddingFileType == DirPaddingFile::TMP_FILE
+                                       ? nsLiteralString(PADDING_TMP_FILE_NAME)
+                                       : nsLiteralString(PADDING_FILE_NAME)),
+      false);
+
+  QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER(file, Exists), false);
+}
+
+Result<int64_t, nsresult> DirectoryPaddingGet(nsIFile& aBaseDir) {
+  MOZ_DIAGNOSTIC_ASSERT(
+      !DirectoryPaddingFileExists(aBaseDir, DirPaddingFile::TMP_FILE));
+
+  QM_TRY_INSPECT(
+      const auto& file,
+      CloneFileAndAppend(aBaseDir, nsLiteralString(PADDING_FILE_NAME)));
+
+  QM_TRY_UNWRAP(auto stream, NS_NewLocalFileInputStream(file));
+
+  QM_TRY_INSPECT(const auto& bufferedStream,
+                 NS_NewBufferedInputStream(stream.forget(), 512));
+
+  const nsCOMPtr<nsIObjectInputStream> objectStream =
+      NS_NewObjectInputStream(bufferedStream);
+
+  QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER(objectStream, Read64)
+                    .map([](const uint64_t val) { return int64_t(val); }));
+}
+
+nsresult DirectoryPaddingInit(nsIFile& aBaseDir) {
+  QM_TRY(
+      MOZ_TO_RESULT(DirectoryPaddingWrite(aBaseDir, DirPaddingFile::FILE, 0)));
+
+  return NS_OK;
+}
+
+nsresult UpdateDirectoryPaddingFile(nsIFile& aBaseDir,
+                                    mozIStorageConnection& aConn,
+                                    const int64_t aIncreaseSize,
+                                    const int64_t aDecreaseSize,
+                                    const bool aTemporaryFileExist) {
+  MOZ_DIAGNOSTIC_ASSERT(aIncreaseSize >= 0);
+  MOZ_DIAGNOSTIC_ASSERT(aDecreaseSize >= 0);
+
+  const auto directoryPaddingGetResult =
+      aTemporaryFileExist ? Maybe<int64_t>{} : [&aBaseDir] {
+        QM_TRY_RETURN(QM_OR_ELSE_WARN_IF(
+                          DirectoryPaddingGet(aBaseDir).map(Some<int64_t>),
+                          IsFileNotFoundError,
+                          ErrToDefaultOk<Maybe<int64_t>>),
+                      Maybe<int64_t>{});
+      }();
+
+  QM_TRY_INSPECT(
+      const int64_t& currentPaddingSize,
+      ([directoryPaddingGetResult, &aBaseDir, &aConn, aIncreaseSize,
+        aDecreaseSize]() -> Result<int64_t, nsresult> {
+        if (!directoryPaddingGetResult) {
+
+          QM_TRY(MOZ_TO_RESULT(
+              DirectoryPaddingDeleteFile(aBaseDir, DirPaddingFile::FILE)));
+
+          QM_TRY_RETURN(db::FindOverallPaddingSize(aConn));
+        }
+
+        int64_t currentPaddingSize = directoryPaddingGetResult.value();
+        bool shouldRevise = false;
+
+        if (aIncreaseSize > 0) {
+          if (INT64_MAX - currentPaddingSize < aDecreaseSize) {
+            shouldRevise = true;
+          } else {
+            currentPaddingSize += aIncreaseSize;
+          }
+        }
+
+        if (aDecreaseSize > 0) {
+          if (currentPaddingSize < aDecreaseSize) {
+            shouldRevise = true;
+          } else if (!shouldRevise) {
+            currentPaddingSize -= aDecreaseSize;
+          }
+        }
+
+        if (shouldRevise) {
+          QM_TRY(MOZ_TO_RESULT(
+              DirectoryPaddingDeleteFile(aBaseDir, DirPaddingFile::FILE)));
+
+          QM_TRY_UNWRAP(currentPaddingSize, db::FindOverallPaddingSize(aConn));
+
+          MOZ_ASSERT(false, "The padding size is unsync with QM");
+        }
+
+#ifdef DEBUG
+        const int64_t lastPaddingSize = currentPaddingSize;
+        QM_TRY_UNWRAP(currentPaddingSize, db::FindOverallPaddingSize(aConn));
+
+        MOZ_DIAGNOSTIC_ASSERT(currentPaddingSize == lastPaddingSize);
+#endif  // DEBUG
+
+        return currentPaddingSize;
+      }()));
+
+  MOZ_DIAGNOSTIC_ASSERT(currentPaddingSize >= 0);
+
+  QM_TRY(MOZ_TO_RESULT(DirectoryPaddingWrite(aBaseDir, DirPaddingFile::TMP_FILE,
+                                             currentPaddingSize)));
+
+  return NS_OK;
+}
+
+nsresult DirectoryPaddingFinalizeWrite(nsIFile& aBaseDir) {
+  MOZ_DIAGNOSTIC_ASSERT(
+      DirectoryPaddingFileExists(aBaseDir, DirPaddingFile::TMP_FILE));
+
+  QM_TRY_INSPECT(
+      const auto& file,
+      CloneFileAndAppend(aBaseDir, nsLiteralString(PADDING_TMP_FILE_NAME)));
+
+  QM_TRY(MOZ_TO_RESULT(
+      file->RenameTo(nullptr, nsLiteralString(PADDING_FILE_NAME))));
+
+  return NS_OK;
+}
+
+Result<int64_t, nsresult> DirectoryPaddingRestore(nsIFile& aBaseDir,
+                                                  mozIStorageConnection& aConn,
+                                                  const bool aMustRestore) {
+  QM_TRY(MOZ_TO_RESULT(
+      DirectoryPaddingDeleteFile(aBaseDir, DirPaddingFile::FILE)));
+
+  QM_TRY_INSPECT(const int64_t& paddingSize, db::FindOverallPaddingSize(aConn));
+  MOZ_DIAGNOSTIC_ASSERT(paddingSize >= 0);
+
+  QM_TRY(MOZ_TO_RESULT(DirectoryPaddingWrite(aBaseDir, DirPaddingFile::FILE,
+                                             paddingSize)),
+         (aMustRestore ? Err(tryTempError)
+                       : Result<int64_t, nsresult>{paddingSize}));
+
+  QM_TRY(MOZ_TO_RESULT(
+      DirectoryPaddingDeleteFile(aBaseDir, DirPaddingFile::TMP_FILE)));
+
+  return paddingSize;
+}
+
+nsresult DirectoryPaddingDeleteFile(nsIFile& aBaseDir,
+                                    DirPaddingFile aPaddingFileType) {
+  QM_TRY_INSPECT(
+      const auto& file,
+      CloneFileAndAppend(aBaseDir, aPaddingFileType == DirPaddingFile::TMP_FILE
+                                       ? nsLiteralString(PADDING_TMP_FILE_NAME)
+                                       : nsLiteralString(PADDING_FILE_NAME)));
+
+  QM_TRY(QM_OR_ELSE_WARN_IF(
+      MOZ_TO_RESULT(file->Remove( false)),
+      IsFileNotFoundError,
+      ErrToDefaultOk<>));
+
+  return NS_OK;
+}
+
+}  

@@ -1,0 +1,112 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_gfx_layers_ScrollbarData_h
+#define mozilla_gfx_layers_ScrollbarData_h
+
+#include "FrameMetrics.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/gfx/Types.h"
+#include "mozilla/layers/LayersTypes.h"
+#include "mozilla/layers/ScrollableLayerGuid.h"
+
+namespace IPC {
+template <typename T>
+struct ParamTraits;
+}  
+
+namespace mozilla {
+namespace layers {
+
+// clang-format off
+MOZ_DEFINE_ENUM_CLASS_WITH_BASE(ScrollbarLayerType, uint8_t, (
+  None,
+  Thumb,
+  Container
+));
+// clang-format on
+
+struct ScrollbarData {
+ private:
+  ScrollbarData(ScrollDirection aDirection, float aThumbRatio,
+                OuterCSSCoord aThumbStart, OuterCSSCoord aThumbLength,
+                OuterCSSCoord aThumbMinLength, bool aThumbIsAsyncDraggable,
+                OuterCSSCoord aScrollTrackStart,
+                OuterCSSCoord aScrollTrackLength, uint64_t aTargetViewId)
+      : mDirection(Some(aDirection)),
+        mScrollbarLayerType(ScrollbarLayerType::Thumb),
+        mThumbRatio(aThumbRatio),
+        mThumbStart(aThumbStart),
+        mThumbLength(aThumbLength),
+        mThumbMinLength(aThumbMinLength),
+        mThumbIsAsyncDraggable(aThumbIsAsyncDraggable),
+        mScrollTrackStart(aScrollTrackStart),
+        mScrollTrackLength(aScrollTrackLength),
+        mTargetViewId(aTargetViewId) {}
+
+  ScrollbarData(const Maybe<ScrollDirection>& aDirection,
+                uint64_t aTargetViewId)
+      : mDirection(aDirection),
+        mScrollbarLayerType(ScrollbarLayerType::Container),
+        mTargetViewId(aTargetViewId) {}
+
+ public:
+  ScrollbarData() = default;
+
+  static ScrollbarData CreateForThumb(
+      ScrollDirection aDirection, float aThumbRatio, OuterCSSCoord aThumbStart,
+      OuterCSSCoord aThumbLength, OuterCSSCoord aThumbMinLength,
+      bool aThumbIsAsyncDraggable, OuterCSSCoord aScrollTrackStart,
+      OuterCSSCoord aScrollTrackLength, uint64_t aTargetViewId) {
+    return ScrollbarData(aDirection, aThumbRatio, aThumbStart, aThumbLength,
+                         aThumbMinLength, aThumbIsAsyncDraggable,
+                         aScrollTrackStart, aScrollTrackLength, aTargetViewId);
+  }
+
+  static ScrollbarData CreateForScrollbarContainer(
+      const Maybe<ScrollDirection>& aDirection, uint64_t aTargetViewId) {
+    return ScrollbarData(aDirection, aTargetViewId);
+  }
+
+  Maybe<ScrollDirection> mDirection;
+
+  ScrollbarLayerType mScrollbarLayerType = ScrollbarLayerType::None;
+
+  float mThumbRatio = 0.0f;
+
+  OuterCSSCoord mThumbStart;
+  OuterCSSCoord mThumbLength;
+  OuterCSSCoord mThumbMinLength;
+
+  bool mThumbIsAsyncDraggable = false;
+
+  OuterCSSCoord mScrollTrackStart;
+  OuterCSSCoord mScrollTrackLength;
+  uint64_t mTargetViewId = ScrollableLayerGuid::NULL_SCROLL_ID;
+
+  bool operator==(const ScrollbarData& aOther) const {
+    return mDirection == aOther.mDirection &&
+           mScrollbarLayerType == aOther.mScrollbarLayerType &&
+           mThumbRatio == aOther.mThumbRatio &&
+           mThumbStart == aOther.mThumbStart &&
+           mThumbLength == aOther.mThumbLength &&
+           mThumbMinLength == aOther.mThumbMinLength &&
+           mThumbIsAsyncDraggable == aOther.mThumbIsAsyncDraggable &&
+           mScrollTrackStart == aOther.mScrollTrackStart &&
+           mScrollTrackLength == aOther.mScrollTrackLength &&
+           mTargetViewId == aOther.mTargetViewId;
+  }
+  bool operator!=(const ScrollbarData& aOther) const {
+    return !(*this == aOther);
+  }
+
+  bool IsThumb() const {
+    return mScrollbarLayerType == ScrollbarLayerType::Thumb;
+  }
+};
+
+}  
+}  
+
+#endif  // mozilla_gfx_layers_ScrollbarData_h

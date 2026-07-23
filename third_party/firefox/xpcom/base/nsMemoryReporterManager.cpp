@@ -1,0 +1,1779 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsMemoryReporterManager.h"
+
+#include "nsAtomTable.h"
+#include "nsCOMPtr.h"
+#include "nsCOMArray.h"
+#include "nsPrintfCString.h"
+#include "nsProxyRelease.h"
+#include "nsServiceManagerUtils.h"
+#include "nsITimer.h"
+#include "nsThreadManager.h"
+#include "nsThreadUtils.h"
+#include "nsPIDOMWindow.h"
+#include "nsIObserverService.h"
+#include "nsIOService.h"
+#include "nsIGlobalObject.h"
+#include "nsIXPConnect.h"
+#if defined(XP_UNIX) || defined(MOZ_DMD)
+#  include "nsMemoryInfoDumper.h"
+#endif
+#include "nsNetCID.h"
+#include "nsThread.h"
+#include "mozilla/MemoryReportingProcess.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_memory.h"
+#include "mozilla/RDDProcessManager.h"
+#include "mozilla/Services.h"
+#include "mozilla/UniquePtrExtensions.h"
+#include "mozilla/dom/MemoryReportTypes.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/gfx/GPUProcessManager.h"
+#include "mozilla/ipc/UtilityProcessManager.h"
+#include "mozilla/ipc/FileDescriptorUtils.h"
+
+
+#  include <unistd.h>
+
+using namespace mozilla;
+using namespace mozilla::ipc;
+using namespace dom;
+
+
+#  include "mozilla/MemoryMapping.h"
+
+#  include <malloc.h>
+#  include <string.h>
+#  include <stdlib.h>
+
+[[nodiscard]] static nsresult GetProcSelfStatmField(int aField, int64_t* aN) {
+  static const int MAX_FIELD = 2;
+  size_t fields[MAX_FIELD];
+  MOZ_ASSERT(aField < MAX_FIELD, "bad field number");
+  FILE* f = fopen("/proc/self/statm", "r");
+  if (f) {
+    int nread = fscanf(f, "%zu %zu", &fields[0], &fields[1]);
+    fclose(f);
+    if (nread == MAX_FIELD) {
+      *aN = fields[aField] * getpagesize();
+      return NS_OK;
+    }
+  }
+  return NS_ERROR_FAILURE;
+}
+
+[[nodiscard]] static nsresult GetProcSelfSmapsPrivate(int64_t* aN, pid_t aPid) {
+
+  nsTArray<MemoryMapping> mappings(1024);
+  MOZ_TRY(GetMemoryMappings(mappings, aPid));
+
+  int64_t amount = 0;
+  for (auto& mapping : mappings) {
+    amount += mapping.Private_Clean();
+    amount += mapping.Private_Dirty();
+  }
+  *aN = amount;
+  return NS_OK;
+}
+
+#  define HAVE_VSIZE_AND_RESIDENT_REPORTERS 1
+[[nodiscard]] static nsresult VsizeDistinguishedAmount(int64_t* aN) {
+  return GetProcSelfStatmField(0, aN);
+}
+
+[[nodiscard]] static nsresult ResidentDistinguishedAmount(int64_t* aN) {
+  return GetProcSelfStatmField(1, aN);
+}
+
+[[nodiscard]] static nsresult ResidentFastDistinguishedAmount(int64_t* aN) {
+  return ResidentDistinguishedAmount(aN);
+}
+
+#  define HAVE_RESIDENT_UNIQUE_REPORTER 1
+[[nodiscard]] static nsresult ResidentUniqueDistinguishedAmount(
+    int64_t* aN, pid_t aPid = 0) {
+  return GetProcSelfSmapsPrivate(aN, aPid);
+}
+
+#if defined(HAVE_MALLINFO)
+#    define HAVE_SYSTEM_HEAP_REPORTER 1
+[[nodiscard]] static nsresult SystemHeapSize(int64_t* aSizeOut) {
+  struct mallinfo info = mallinfo();
+
+  *aSizeOut = size_t(info.hblkhd) + size_t(info.uordblks);
+  return NS_OK;
+}
+#endif
+
+
+#if defined(HAVE_VSIZE_MAX_CONTIGUOUS_REPORTER)
+class VsizeMaxContiguousReporter final : public nsIMemoryReporter {
+  ~VsizeMaxContiguousReporter() {}
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    int64_t amount;
+    if (NS_SUCCEEDED(VsizeMaxContiguousDistinguishedAmount(&amount))) {
+      MOZ_COLLECT_REPORT(
+          "vsize-max-contiguous", KIND_OTHER, UNITS_BYTES, amount,
+          "Size of the maximum contiguous block of available virtual memory.");
+    }
+    return NS_OK;
+  }
+};
+NS_IMPL_ISUPPORTS(VsizeMaxContiguousReporter, nsIMemoryReporter)
+#endif
+
+#if defined(HAVE_PRIVATE_REPORTER)
+class PrivateReporter final : public nsIMemoryReporter {
+  ~PrivateReporter() {}
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    int64_t amount;
+    if (NS_SUCCEEDED(PrivateDistinguishedAmount(&amount))) {
+      // clang-format off
+      MOZ_COLLECT_REPORT(
+        "private", KIND_OTHER, UNITS_BYTES, amount,
+"Memory that cannot be shared with other processes, including memory that is "
+"committed and marked MEM_PRIVATE, data that is not mapped, and executable "
+"pages that have been written to.");
+      // clang-format on
+    }
+    return NS_OK;
+  }
+};
+NS_IMPL_ISUPPORTS(PrivateReporter, nsIMemoryReporter)
+#endif
+
+#if defined(HAVE_VSIZE_AND_RESIDENT_REPORTERS)
+class VsizeReporter final : public nsIMemoryReporter {
+  ~VsizeReporter() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    int64_t amount;
+    if (NS_SUCCEEDED(VsizeDistinguishedAmount(&amount))) {
+      // clang-format off
+      MOZ_COLLECT_REPORT(
+        "vsize", KIND_OTHER, UNITS_BYTES, amount,
+"Memory mapped by the process, including code and data segments, the heap, "
+"thread stacks, memory explicitly mapped by the process via mmap and similar "
+"operations, and memory shared with other processes. This is the vsize figure "
+"as reported by 'top' and 'ps'.  This figure is of limited use on Mac, where "
+"processes share huge amounts of memory with one another.  But even on other "
+"operating systems, 'resident' is a much better measure of the memory "
+"resources used by the process.");
+      // clang-format on
+    }
+    return NS_OK;
+  }
+};
+NS_IMPL_ISUPPORTS(VsizeReporter, nsIMemoryReporter)
+
+class ResidentReporter final : public nsIMemoryReporter {
+  ~ResidentReporter() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    int64_t amount;
+    if (NS_SUCCEEDED(ResidentDistinguishedAmount(&amount))) {
+      // clang-format off
+      MOZ_COLLECT_REPORT(
+        "resident", KIND_OTHER, UNITS_BYTES, amount,
+"Memory mapped by the process that is present in physical memory, also known "
+"as the resident set size (RSS).  This is the best single figure to use when "
+"considering the memory resources used by the process, but it depends both on "
+"other processes being run and details of the OS kernel and so is best used "
+"for comparing the memory usage of a single process at different points in "
+"time.");
+      // clang-format on
+    }
+    return NS_OK;
+  }
+};
+NS_IMPL_ISUPPORTS(ResidentReporter, nsIMemoryReporter)
+
+#endif
+
+#if defined(HAVE_RESIDENT_UNIQUE_REPORTER)
+class ResidentUniqueReporter final : public nsIMemoryReporter {
+  ~ResidentUniqueReporter() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    int64_t amount = 0;
+    // clang-format off
+    if (NS_SUCCEEDED(ResidentUniqueDistinguishedAmount(&amount))) {
+      MOZ_COLLECT_REPORT(
+        "resident-unique", KIND_OTHER, UNITS_BYTES, amount,
+"Memory mapped by the process that is present in physical memory and not "
+"shared with any other processes.  This is also known as the process's unique "
+"set size (USS).  This is the amount of RAM we'd expect to be freed if we "
+"closed this process.");
+    }
+    // clang-format on
+    return NS_OK;
+  }
+};
+NS_IMPL_ISUPPORTS(ResidentUniqueReporter, nsIMemoryReporter)
+
+#endif
+
+#if defined(HAVE_SYSTEM_HEAP_REPORTER)
+
+class SystemHeapReporter final : public nsIMemoryReporter {
+  ~SystemHeapReporter() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    int64_t amount;
+    if (NS_SUCCEEDED(SystemHeapSize(&amount))) {
+      // clang-format off
+      MOZ_COLLECT_REPORT(
+        "system-heap-allocated", KIND_OTHER, UNITS_BYTES, amount,
+"Memory used by the system allocator that is currently allocated to the "
+"application. This is distinct from the jemalloc heap that Firefox uses for "
+"most or all of its heap allocations. Ideally this number is zero, but "
+"on some platforms we cannot force every heap allocation through jemalloc.");
+      // clang-format on
+    }
+    return NS_OK;
+  }
+};
+NS_IMPL_ISUPPORTS(SystemHeapReporter, nsIMemoryReporter)
+#endif
+
+#if defined(XP_UNIX)
+
+#  include <sys/resource.h>
+
+#  define HAVE_RESIDENT_PEAK_REPORTER 1
+
+[[nodiscard]] static nsresult ResidentPeakDistinguishedAmount(int64_t* aN) {
+  struct rusage usage;
+  if (0 == getrusage(RUSAGE_SELF, &usage)) {
+    *aN = usage.ru_maxrss * 1024;
+    if (*aN > 0) {
+      return NS_OK;
+    }
+  }
+  return NS_ERROR_FAILURE;
+}
+
+class ResidentPeakReporter final : public nsIMemoryReporter {
+  ~ResidentPeakReporter() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    int64_t amount = 0;
+    if (NS_SUCCEEDED(ResidentPeakDistinguishedAmount(&amount))) {
+      MOZ_COLLECT_REPORT(
+          "resident-peak", KIND_OTHER, UNITS_BYTES, amount,
+          "The peak 'resident' value for the lifetime of the process.");
+    }
+    return NS_OK;
+  }
+};
+NS_IMPL_ISUPPORTS(ResidentPeakReporter, nsIMemoryReporter)
+
+#  define HAVE_PAGE_FAULT_REPORTERS 1
+
+class PageFaultsSoftReporter final : public nsIMemoryReporter {
+  ~PageFaultsSoftReporter() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    struct rusage usage;
+    int err = getrusage(RUSAGE_SELF, &usage);
+    if (err == 0) {
+      int64_t amount = usage.ru_minflt;
+      // clang-format off
+      MOZ_COLLECT_REPORT(
+        "page-faults-soft", KIND_OTHER, UNITS_COUNT_CUMULATIVE, amount,
+"The number of soft page faults (also known as 'minor page faults') that "
+"have occurred since the process started.  A soft page fault occurs when the "
+"process tries to access a page which is present in physical memory but is "
+"not mapped into the process's address space.  For instance, a process might "
+"observe soft page faults when it loads a shared library which is already "
+"present in physical memory. A process may experience many thousands of soft "
+"page faults even when the machine has plenty of available physical memory, "
+"and because the OS services a soft page fault without accessing the disk, "
+"they impact performance much less than hard page faults.");
+      // clang-format on
+    }
+    return NS_OK;
+  }
+};
+NS_IMPL_ISUPPORTS(PageFaultsSoftReporter, nsIMemoryReporter)
+
+[[nodiscard]] static nsresult PageFaultsHardDistinguishedAmount(
+    int64_t* aAmount) {
+  struct rusage usage;
+  int err = getrusage(RUSAGE_SELF, &usage);
+  if (err != 0) {
+    return NS_ERROR_FAILURE;
+  }
+  *aAmount = usage.ru_majflt;
+  return NS_OK;
+}
+
+class PageFaultsHardReporter final : public nsIMemoryReporter {
+  ~PageFaultsHardReporter() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    int64_t amount = 0;
+    if (NS_SUCCEEDED(PageFaultsHardDistinguishedAmount(&amount))) {
+      // clang-format off
+      MOZ_COLLECT_REPORT(
+        "page-faults-hard", KIND_OTHER, UNITS_COUNT_CUMULATIVE, amount,
+"The number of hard page faults (also known as 'major page faults') that have "
+"occurred since the process started.  A hard page fault occurs when a process "
+"tries to access a page which is not present in physical memory. The "
+"operating system must access the disk in order to fulfill a hard page fault. "
+"When memory is plentiful, you should see very few hard page faults. But if "
+"the process tries to use more memory than your machine has available, you "
+"may see many thousands of hard page faults. Because accessing the disk is up "
+"to a million times slower than accessing RAM, the program may run very "
+"slowly when it is experiencing more than 100 or so hard page faults a "
+"second.");
+      // clang-format on
+    }
+    return NS_OK;
+  }
+};
+NS_IMPL_ISUPPORTS(PageFaultsHardReporter, nsIMemoryReporter)
+
+#endif
+
+
+#if defined(HAVE_JEMALLOC_STATS)
+
+static size_t HeapOverhead(const jemalloc_stats_t& aStats) {
+  return aStats.waste + aStats.bookkeeping + aStats.pages_dirty +
+         aStats.bin_unused;
+}
+
+
+int64_t nsMemoryReporterManager::HeapOverheadFraction(
+    const jemalloc_stats_t& aStats) {
+  size_t heapOverhead = HeapOverhead(aStats);
+  size_t heapCommitted = aStats.allocated + heapOverhead;
+  return int64_t(10000 * (heapOverhead / (double)heapCommitted));
+}
+
+class JemallocHeapReporter final : public nsIMemoryReporter {
+  ~JemallocHeapReporter() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    jemalloc_stats_t stats;
+    const size_t num_bins = jemalloc_stats_num_bins();
+    nsTArray<jemalloc_bin_stats_t> bin_stats(num_bins);
+    bin_stats.SetLength(num_bins);
+    jemalloc_stats(&stats, bin_stats.Elements());
+
+    // clang-format off
+    MOZ_COLLECT_REPORT(
+      "heap/committed/allocated", KIND_OTHER, UNITS_BYTES, stats.allocated,
+"Memory mapped by the heap allocator that is currently allocated to the "
+"application.  This may exceed the amount of memory requested by the "
+"application because the allocator regularly rounds up request sizes. (The "
+"exact amount requested is not recorded.)");
+
+    MOZ_COLLECT_REPORT(
+      "heap-allocated", KIND_OTHER, UNITS_BYTES, stats.allocated,
+"The same as 'heap/committed/allocated'.");
+
+    for (auto& bin : bin_stats) {
+      MOZ_ASSERT(bin.size);
+      nsPrintfCString path("heap/committed/bin-unused/bin-%zu",
+          bin.size);
+      aHandleReport->Callback(EmptyCString(), path, KIND_NONHEAP, UNITS_BYTES,
+        bin.bytes_unused,
+        nsLiteralCString(
+          "Unused bytes in all runs of all bins for this size class"),
+        aData);
+    }
+
+    if (stats.waste > 0) {
+      MOZ_COLLECT_REPORT(
+        "heap/committed/waste", KIND_NONHEAP, UNITS_BYTES,
+        stats.waste,
+"Committed bytes which do not correspond to an active allocation and which the "
+"allocator is not intentionally keeping alive (i.e., not "
+"'heap/{bookkeeping,unused-pages,bin-unused}').");
+    }
+
+    MOZ_COLLECT_REPORT(
+      "heap/committed/bookkeeping", KIND_NONHEAP, UNITS_BYTES,
+      stats.bookkeeping,
+"Committed bytes which the heap allocator uses for internal data structures.");
+
+    MOZ_COLLECT_REPORT(
+      "heap/committed/unused-pages/dirty", KIND_NONHEAP, UNITS_BYTES,
+      stats.pages_dirty,
+"Memory which the allocator could return to the operating system, but hasn't. "
+"The allocator keeps this memory around as an optimization, so it doesn't "
+"have to ask the OS the next time it needs to fulfill a request. This value "
+"is typically not larger than a few megabytes.");
+
+    MOZ_COLLECT_REPORT(
+      "heap/decommitted/unused-pages/fresh", KIND_OTHER, UNITS_BYTES, stats.pages_fresh,
+"Amount of memory currently mapped but has never been used.");
+    MOZ_COLLECT_REPORT(
+      "decommitted/heap/unused-pages/fresh", KIND_OTHER, UNITS_BYTES, stats.pages_fresh,
+"Amount of memory currently mapped but has never been used.");
+
+#define MADVISED_GROUP "decommitted"
+    MOZ_COLLECT_REPORT(
+      "heap/" MADVISED_GROUP "/unused-pages/madvised", KIND_OTHER, UNITS_BYTES,
+      stats.pages_madvised,
+"Amount of memory currently mapped, not used and that the OS should remove "
+"from the application's resident set.");
+    MOZ_COLLECT_REPORT(
+      "decommitted/heap/unused-pages/madvised", KIND_OTHER, UNITS_BYTES, stats.pages_madvised,
+"Amount of memory currently mapped, not used and that the OS should remove "
+"from the application's resident set.");
+
+    {
+      size_t decommitted = stats.mapped - stats.allocated - stats.waste - stats.pages_dirty - stats.pages_fresh - stats.bookkeeping - stats.bin_unused;
+      MOZ_COLLECT_REPORT(
+        "heap/decommitted/unmapped", KIND_OTHER, UNITS_BYTES, decommitted,
+  "Amount of memory currently mapped but not committed, "
+  "neither in physical memory nor paged to disk.");
+      MOZ_COLLECT_REPORT(
+        "decommitted/heap/decommitted", KIND_OTHER, UNITS_BYTES, decommitted,
+  "Amount of memory currently mapped but not committed, "
+  "neither in physical memory nor paged to disk.");
+    }
+    MOZ_COLLECT_REPORT(
+      "heap-chunksize", KIND_OTHER, UNITS_BYTES, stats.chunksize,
+      "Size of chunks.");
+
+
+    // clang-format on
+
+    return NS_OK;
+  }
+};
+NS_IMPL_ISUPPORTS(JemallocHeapReporter, nsIMemoryReporter)
+
+#endif
+
+class AtomTablesReporter final : public nsIMemoryReporter {
+  MOZ_DEFINE_MALLOC_SIZE_OF(MallocSizeOf)
+
+  ~AtomTablesReporter() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    AtomsSizes sizes;
+    NS_AddSizeOfAtoms(MallocSizeOf, sizes);
+
+    MOZ_COLLECT_REPORT("explicit/atoms/table", KIND_HEAP, UNITS_BYTES,
+                       sizes.mTable, "Memory used by the atom table.");
+
+    MOZ_COLLECT_REPORT(
+        "explicit/atoms/dynamic-objects-and-chars", KIND_HEAP, UNITS_BYTES,
+        sizes.mDynamicAtoms,
+        "Memory used by dynamic atom objects and chars (which are stored "
+        "at the end of each atom object).");
+
+    return NS_OK;
+  }
+};
+NS_IMPL_ISUPPORTS(AtomTablesReporter, nsIMemoryReporter)
+
+class ThreadsReporter final : public nsIMemoryReporter {
+  MOZ_DEFINE_MALLOC_SIZE_OF(MallocSizeOf)
+  ~ThreadsReporter() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    nsTArray<MemoryMapping> mappings(1024);
+    MOZ_TRY(GetMemoryMappings(mappings));
+
+    struct ThreadData {
+      nsCString mName;
+      uint32_t mThreadId;
+      size_t mPrivateSize;
+    };
+    AutoTArray<ThreadData, 32> threads;
+
+    size_t eventQueueSizes = 0;
+    size_t wrapperSizes = 0;
+    size_t threadCount = 0;
+
+    {
+      nsThreadManager& tm = nsThreadManager::get();
+      OffTheBooksMutexAutoLock lock(tm.ThreadListMutex());
+      for (auto* thread : tm.ThreadList()) {
+        threadCount++;
+        eventQueueSizes += thread->SizeOfEventQueues(MallocSizeOf);
+        wrapperSizes += thread->ShallowSizeOfIncludingThis(MallocSizeOf);
+
+        if (!thread->StackBase()) {
+          continue;
+        }
+
+        int idx = mappings.BinaryIndexOf(thread->StackBase());
+        if (idx < 0) {
+          continue;
+        }
+        size_t privateSize = mappings[idx].Referenced();
+
+        MOZ_ASSERT(mappings[idx].Size() == thread->StackSize(),
+                   "Mapping region size doesn't match stack allocation size");
+
+        nsCString threadName;
+        thread->GetThreadName(threadName);
+        threads.AppendElement(ThreadData{
+            std::move(threadName),
+            thread->ThreadId(),
+            std::min(privateSize, thread->StackSize()),
+        });
+      }
+    }
+
+    for (auto& thread : threads) {
+      nsPrintfCString path("explicit/threads/stacks/%s (tid=%u)",
+                           thread.mName.get(), thread.mThreadId);
+
+      aHandleReport->Callback(
+          ""_ns, path, KIND_NONHEAP, UNITS_BYTES, thread.mPrivateSize,
+          nsLiteralCString("The sizes of thread stacks which have been "
+                           "committed to memory."),
+          aData);
+    }
+
+    MOZ_COLLECT_REPORT("explicit/threads/overhead/event-queues", KIND_HEAP,
+                       UNITS_BYTES, eventQueueSizes,
+                       "The sizes of nsThread event queues and observers.");
+
+    MOZ_COLLECT_REPORT("explicit/threads/overhead/wrappers", KIND_HEAP,
+                       UNITS_BYTES, wrapperSizes,
+                       "The sizes of nsThread/PRThread wrappers.");
+
+#if defined(__x86_64__) || defined(__i386__)
+    constexpr size_t kKernelSize = 4 * 1024;
+#else
+    constexpr size_t kKernelSize = 8 * 1024;
+#endif
+
+    MOZ_COLLECT_REPORT("explicit/threads/overhead/kernel", KIND_NONHEAP,
+                       UNITS_BYTES, threadCount * kKernelSize,
+                       "The total kernel overhead for all active threads.");
+
+    return NS_OK;
+  }
+};
+NS_IMPL_ISUPPORTS(ThreadsReporter, nsIMemoryReporter)
+
+#if defined(DEBUG)
+
+class DeadlockDetectorReporter final : public nsIMemoryReporter {
+  MOZ_DEFINE_MALLOC_SIZE_OF(MallocSizeOf)
+
+  ~DeadlockDetectorReporter() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    MOZ_COLLECT_REPORT(
+        "explicit/deadlock-detector", KIND_HEAP, UNITS_BYTES,
+        BlockingResourceBase::SizeOfDeadlockDetector(MallocSizeOf),
+        "Memory used by the deadlock detector.");
+
+    return NS_OK;
+  }
+};
+NS_IMPL_ISUPPORTS(DeadlockDetectorReporter, nsIMemoryReporter)
+
+#endif
+
+#if defined(MOZ_DMD)
+
+namespace mozilla {
+namespace dmd {
+
+class DMDReporter final : public nsIMemoryReporter {
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    dmd::Sizes sizes;
+    dmd::SizeOf(&sizes);
+
+    MOZ_COLLECT_REPORT(
+        "explicit/dmd/stack-traces/used", KIND_HEAP, UNITS_BYTES,
+        sizes.mStackTracesUsed,
+        "Memory used by stack traces which correspond to at least "
+        "one heap block DMD is tracking.");
+
+    MOZ_COLLECT_REPORT(
+        "explicit/dmd/stack-traces/unused", KIND_HEAP, UNITS_BYTES,
+        sizes.mStackTracesUnused,
+        "Memory used by stack traces which don't correspond to any heap "
+        "blocks DMD is currently tracking.");
+
+    MOZ_COLLECT_REPORT("explicit/dmd/stack-traces/table", KIND_HEAP,
+                       UNITS_BYTES, sizes.mStackTraceTable,
+                       "Memory used by DMD's stack trace table.");
+
+    MOZ_COLLECT_REPORT("explicit/dmd/live-block-table", KIND_HEAP, UNITS_BYTES,
+                       sizes.mLiveBlockTable,
+                       "Memory used by DMD's live block table.");
+
+    MOZ_COLLECT_REPORT("explicit/dmd/dead-block-list", KIND_HEAP, UNITS_BYTES,
+                       sizes.mDeadBlockTable,
+                       "Memory used by DMD's dead block list.");
+
+    return NS_OK;
+  }
+
+ private:
+  ~DMDReporter() = default;
+};
+NS_IMPL_ISUPPORTS(DMDReporter, nsIMemoryReporter)
+
+}  
+}  
+
+#endif
+
+
+
+NS_IMPL_ISUPPORTS(nsMemoryReporterManager, nsIMemoryReporterManager,
+                  nsIMemoryReporter)
+
+NS_IMETHODIMP
+nsMemoryReporterManager::Init() {
+  if (!NS_IsMainThread()) {
+    MOZ_CRASH();
+  }
+
+  static bool isInited = false;
+  if (isInited) {
+    NS_WARNING("nsMemoryReporterManager::Init() has already been called!");
+    return NS_OK;
+  }
+  isInited = true;
+
+  {
+
+    mozilla::MutexAutoLock autoLock(mMutex);
+
+#if defined(HAVE_JEMALLOC_STATS)
+    mStrongEternalReporters->AppendElement(new JemallocHeapReporter());
+#endif
+
+#if defined(HAVE_VSIZE_AND_RESIDENT_REPORTERS)
+    mStrongEternalReporters->AppendElement(new VsizeReporter());
+    mStrongEternalReporters->AppendElement(new ResidentReporter());
+#endif
+
+#if defined(HAVE_VSIZE_MAX_CONTIGUOUS_REPORTER)
+    mStrongEternalReporters->AppendElement(new VsizeMaxContiguousReporter());
+#endif
+
+#if defined(HAVE_RESIDENT_PEAK_REPORTER)
+    mStrongEternalReporters->AppendElement(new ResidentPeakReporter());
+#endif
+
+#if defined(HAVE_RESIDENT_UNIQUE_REPORTER)
+    mStrongEternalReporters->AppendElement(new ResidentUniqueReporter());
+#endif
+
+#if defined(HAVE_PAGE_FAULT_REPORTERS)
+    mStrongEternalReporters->AppendElement(new PageFaultsSoftReporter());
+    mStrongEternalReporters->AppendElement(new PageFaultsHardReporter());
+#endif
+
+#if defined(HAVE_PRIVATE_REPORTER)
+    mStrongEternalReporters->AppendElement(new PrivateReporter());
+#endif
+
+#if defined(HAVE_SYSTEM_HEAP_REPORTER)
+    mStrongEternalReporters->AppendElement(new SystemHeapReporter());
+#endif
+
+    mStrongEternalReporters->AppendElement(new AtomTablesReporter());
+
+    mStrongEternalReporters->AppendElement(new ThreadsReporter());
+
+#if defined(DEBUG)
+    mStrongEternalReporters->AppendElement(new DeadlockDetectorReporter());
+#endif
+
+#if defined(MOZ_DMD)
+    mStrongEternalReporters->AppendElement(new mozilla::dmd::DMDReporter());
+#endif
+
+
+  }  
+
+#if defined(XP_UNIX)
+  nsMemoryInfoDumper::Initialize();
+#endif
+
+  return NS_OK;
+}
+
+nsMemoryReporterManager::nsMemoryReporterManager()
+    : mMutex("nsMemoryReporterManager::mMutex"),
+      mIsRegistrationBlocked(false),
+      mStrongEternalReporters(new StrongReportersArray()),
+      mStrongReporters(new StrongReportersTable()),
+      mWeakReporters(new WeakReportersTable()),
+      mSavedStrongEternalReporters(nullptr),
+      mSavedStrongReporters(nullptr),
+      mSavedWeakReporters(nullptr),
+      mNextGeneration(1),
+      mPendingProcessesState(nullptr),
+      mPendingReportersState(nullptr)
+#if defined(HAVE_JEMALLOC_STATS)
+      ,
+      mThreadPool(do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID))
+#endif
+{
+}
+
+nsMemoryReporterManager::~nsMemoryReporterManager() {
+  NS_ASSERTION(!mSavedStrongEternalReporters,
+               "failed to restore eternal reporters");
+  NS_ASSERTION(!mSavedStrongReporters, "failed to restore strong reporters");
+  NS_ASSERTION(!mSavedWeakReporters, "failed to restore weak reporters");
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::CollectReports(nsIHandleReportCallback* aHandleReport,
+                                        nsISupports* aData, bool aAnonymize) {
+  size_t n = MallocSizeOf(this);
+  {
+    mozilla::MutexAutoLock autoLock(mMutex);
+    n += mStrongEternalReporters->ShallowSizeOfIncludingThis(MallocSizeOf);
+    n += mStrongReporters->ShallowSizeOfIncludingThis(MallocSizeOf);
+    n += mWeakReporters->ShallowSizeOfIncludingThis(MallocSizeOf);
+  }
+
+  MOZ_COLLECT_REPORT("explicit/memory-reporter-manager", KIND_HEAP, UNITS_BYTES,
+                     n, "Memory used by the memory reporter infrastructure.");
+
+  return NS_OK;
+}
+
+#if defined(DEBUG_CHILD_PROCESS_MEMORY_REPORTING)
+#  define MEMORY_REPORTING_LOG(format, ...) \
+    printf_stderr("++++ MEMORY REPORTING: " format, ##__VA_ARGS__);
+#else
+#  define MEMORY_REPORTING_LOG(...)
+#endif
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetReports(
+    nsIHandleReportCallback* aHandleReport, nsISupports* aHandleReportData,
+    nsIFinishReportingCallback* aFinishReporting,
+    nsISupports* aFinishReportingData, bool aAnonymize) {
+  return GetReportsExtended(aHandleReport, aHandleReportData, aFinishReporting,
+                            aFinishReportingData, aAnonymize,
+                             false,
+                             u""_ns);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetReportsExtended(
+    nsIHandleReportCallback* aHandleReport, nsISupports* aHandleReportData,
+    nsIFinishReportingCallback* aFinishReporting,
+    nsISupports* aFinishReportingData, bool aAnonymize, bool aMinimize,
+    const nsAString& aDMDDumpIdent) {
+  nsresult rv;
+
+  if (!NS_IsMainThread()) {
+    MOZ_CRASH();
+  }
+
+  uint32_t generation = mNextGeneration++;
+
+  if (mPendingProcessesState) {
+    MEMORY_REPORTING_LOG("GetReports (gen=%u, s->gen=%u): abort\n", generation,
+                         mPendingProcessesState->mGeneration);
+    return NS_OK;
+  }
+
+  MEMORY_REPORTING_LOG("GetReports (gen=%u)\n", generation);
+
+  uint32_t concurrency = Preferences::GetUint("memory.report_concurrency", 1);
+  MOZ_ASSERT(concurrency >= 1);
+  if (concurrency < 1) {
+    concurrency = 1;
+  }
+  mPendingProcessesState = new PendingProcessesState(
+      generation, aAnonymize, aMinimize, concurrency, aHandleReport,
+      aHandleReportData, aFinishReporting, aFinishReportingData, aDMDDumpIdent);
+
+  if (aMinimize) {
+    nsCOMPtr<nsIRunnable> callback =
+        NewRunnableMethod("nsMemoryReporterManager::StartGettingReports", this,
+                          &nsMemoryReporterManager::StartGettingReports);
+    rv = MinimizeMemoryUsage(callback);
+  } else {
+    rv = StartGettingReports();
+  }
+  return rv;
+}
+
+nsresult nsMemoryReporterManager::StartGettingReports() {
+  PendingProcessesState* s = mPendingProcessesState;
+  nsresult rv;
+
+  FILE* parentDMDFile = nullptr;
+#if defined(MOZ_DMD)
+  if (!s->mDMDDumpIdent.IsEmpty()) {
+    rv = nsMemoryInfoDumper::OpenDMDFile(s->mDMDDumpIdent, getpid(),
+                                         &parentDMDFile);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      parentDMDFile = nullptr;
+    }
+  }
+#endif
+
+  GetReportsForThisProcessExtended(
+      s->mHandleReport, s->mHandleReportData, s->mAnonymize, parentDMDFile,
+      s->mFinishReporting, s->mFinishReportingData);
+
+  nsTArray<dom::ContentParent*> childWeakRefs;
+  dom::ContentParent::GetAll(childWeakRefs);
+  if (!childWeakRefs.IsEmpty()) {
+
+    for (size_t i = 0; i < childWeakRefs.Length(); ++i) {
+      s->mChildrenPending.AppendElement(childWeakRefs[i]);
+    }
+  }
+
+  if (gfx::GPUProcessManager* gpu = gfx::GPUProcessManager::Get()) {
+    if (RefPtr<MemoryReportingProcess> proc = gpu->GetProcessMemoryReporter()) {
+      s->mChildrenPending.AppendElement(proc.forget());
+    }
+  }
+
+  if (RDDProcessManager* rdd = RDDProcessManager::Get()) {
+    if (RefPtr<MemoryReportingProcess> proc = rdd->GetProcessMemoryReporter()) {
+      s->mChildrenPending.AppendElement(proc.forget());
+    }
+  }
+
+  if (!IsRegistrationBlocked() && net::gIOService) {
+    if (RefPtr<MemoryReportingProcess> proc =
+            net::gIOService->GetSocketProcessMemoryReporter()) {
+      s->mChildrenPending.AppendElement(proc.forget());
+    }
+  }
+
+  if (!IsRegistrationBlocked()) {
+    if (RefPtr<UtilityProcessManager> utility =
+            UtilityProcessManager::GetIfExists()) {
+      for (RefPtr<UtilityProcessParent>& parent :
+           utility->GetAllProcessesProcessParent()) {
+        if (RefPtr<MemoryReportingProcess> proc =
+                utility->GetProcessMemoryReporter(parent)) {
+          s->mChildrenPending.AppendElement(proc.forget());
+        }
+      }
+    }
+  }
+
+  if (!s->mChildrenPending.IsEmpty()) {
+    nsCOMPtr<nsITimer> timer;
+    rv = NS_NewTimerWithFuncCallback(
+        getter_AddRefs(timer), TimeoutCallback, this,
+        StaticPrefs::memory_reporter_timeout(), nsITimer::TYPE_ONE_SHOT,
+        "nsMemoryReporterManager::StartGettingReports"_ns);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      FinishReporting();
+      return rv;
+    }
+
+    MOZ_ASSERT(!s->mTimer);
+    s->mTimer.swap(timer);
+  }
+
+  return NS_OK;
+}
+
+void nsMemoryReporterManager::DispatchReporter(
+    nsIMemoryReporter* aReporter, bool aIsAsync,
+    nsIHandleReportCallback* aHandleReport, nsISupports* aHandleReportData,
+    bool aAnonymize) {
+  MOZ_ASSERT(mPendingReportersState);
+
+  RefPtr<nsMemoryReporterManager> self = this;
+  nsCOMPtr<nsIMemoryReporter> reporter = aReporter;
+  nsCOMPtr<nsIHandleReportCallback> handleReport = aHandleReport;
+  nsCOMPtr<nsISupports> handleReportData = aHandleReportData;
+
+  nsCOMPtr<nsIRunnable> event = NS_NewRunnableFunction(
+      "nsMemoryReporterManager::DispatchReporter",
+      [self, reporter, aIsAsync, handleReport, handleReportData, aAnonymize]() {
+        reporter->CollectReports(handleReport, handleReportData, aAnonymize);
+        if (!aIsAsync) {
+          self->EndReport();
+        }
+      });
+
+  NS_DispatchToMainThread(event);
+  mPendingReportersState->mReportsPending++;
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetReportsForThisProcessExtended(
+    nsIHandleReportCallback* aHandleReport, nsISupports* aHandleReportData,
+    bool aAnonymize, FILE* aDMDFile,
+    nsIFinishReportingCallback* aFinishReporting,
+    nsISupports* aFinishReportingData) {
+  if (!NS_IsMainThread()) {
+    MOZ_CRASH();
+  }
+
+  if (NS_WARN_IF(mPendingReportersState)) {
+    return NS_ERROR_IN_PROGRESS;
+  }
+
+#if defined(MOZ_DMD)
+  if (aDMDFile) {
+    dmd::ClearReports();
+  }
+#else
+  MOZ_ASSERT(!aDMDFile);
+#endif
+
+  mPendingReportersState = new PendingReportersState(
+      aFinishReporting, aFinishReportingData, aDMDFile);
+
+  {
+    mozilla::MutexAutoLock autoLock(mMutex);
+
+    for (const auto& entry : *mStrongEternalReporters) {
+      DispatchReporter(entry, false, aHandleReport, aHandleReportData,
+                       aAnonymize);
+    }
+    if (!mIsRegistrationBlocked) {
+      DispatchReporter(this, false, aHandleReport, aHandleReportData,
+                       aAnonymize);
+    }
+
+    for (const auto& entry : *mStrongReporters) {
+      DispatchReporter(entry.GetKey(), entry.GetData(), aHandleReport,
+                       aHandleReportData, aAnonymize);
+    }
+    for (const auto& entry : *mWeakReporters) {
+      nsCOMPtr<nsIMemoryReporter> reporter = entry.GetKey();
+      DispatchReporter(reporter, entry.GetData(), aHandleReport,
+                       aHandleReportData, aAnonymize);
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::EndReport() {
+  if (--mPendingReportersState->mReportsPending == 0) {
+#if defined(MOZ_DMD)
+    if (mPendingReportersState->mDMDFile) {
+      nsMemoryInfoDumper::DumpDMDToFile(mPendingReportersState->mDMDFile);
+    }
+#endif
+    if (mPendingProcessesState) {
+      EndProcessReport(mPendingProcessesState->mGeneration, true);
+    } else {
+      mPendingReportersState->mFinishReporting->Callback(
+          mPendingReportersState->mFinishReportingData);
+    }
+
+    delete mPendingReportersState;
+    mPendingReportersState = nullptr;
+  }
+
+  return NS_OK;
+}
+
+nsMemoryReporterManager::PendingProcessesState*
+nsMemoryReporterManager::GetStateForGeneration(uint32_t aGeneration) {
+  MOZ_RELEASE_ASSERT(NS_IsMainThread());
+
+  PendingProcessesState* s = mPendingProcessesState;
+
+  if (!s) {
+    MEMORY_REPORTING_LOG("HandleChildReports: no request in flight (aGen=%u)\n",
+                         aGeneration);
+    return nullptr;
+  }
+
+  if (aGeneration != s->mGeneration) {
+    MOZ_ASSERT(aGeneration < s->mGeneration);
+    MEMORY_REPORTING_LOG(
+        "HandleChildReports: gen mismatch (aGen=%u, s->gen=%u)\n", aGeneration,
+        s->mGeneration);
+    return nullptr;
+  }
+
+  return s;
+}
+
+void nsMemoryReporterManager::HandleChildReport(
+    uint32_t aGeneration, const dom::MemoryReport& aChildReport) {
+  PendingProcessesState* s = GetStateForGeneration(aGeneration);
+  if (!s) {
+    return;
+  }
+
+  MOZ_ASSERT(!aChildReport.process().IsEmpty());
+
+  s->mHandleReport->Callback(aChildReport.process(), aChildReport.path(),
+                             aChildReport.kind(), aChildReport.units(),
+                             aChildReport.amount(), aChildReport.desc(),
+                             s->mHandleReportData);
+}
+
+bool nsMemoryReporterManager::StartChildReport(
+    mozilla::MemoryReportingProcess* aChild,
+    const PendingProcessesState* aState) {
+  if (!aChild->IsAlive()) {
+    MEMORY_REPORTING_LOG(
+        "StartChildReports (gen=%u): child exited before"
+        " its report was started\n",
+        aState->mGeneration);
+    return false;
+  }
+
+  Maybe<mozilla::ipc::FileDescriptor> dmdFileDesc;
+#if defined(MOZ_DMD)
+  if (!aState->mDMDDumpIdent.IsEmpty()) {
+    FILE* dmdFile = nullptr;
+    nsresult rv = nsMemoryInfoDumper::OpenDMDFile(aState->mDMDDumpIdent,
+                                                  aChild->Pid(), &dmdFile);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      dmdFile = nullptr;
+    }
+    if (dmdFile) {
+      dmdFileDesc = Some(mozilla::ipc::FILEToFileDescriptor(dmdFile));
+      fclose(dmdFile);
+    }
+  }
+#endif
+  return aChild->SendRequestMemoryReport(
+      aState->mGeneration, aState->mAnonymize, aState->mMinimize, dmdFileDesc);
+}
+
+void nsMemoryReporterManager::EndProcessReport(uint32_t aGeneration,
+                                               bool aSuccess) {
+  PendingProcessesState* s = GetStateForGeneration(aGeneration);
+  if (!s) {
+    return;
+  }
+
+  MOZ_ASSERT(s->mNumProcessesRunning > 0);
+  s->mNumProcessesRunning--;
+  s->mNumProcessesCompleted++;
+  MEMORY_REPORTING_LOG(
+      "HandleChildReports (aGen=%u): process %u %s"
+      " (%u running, %u pending)\n",
+      aGeneration, s->mNumProcessesCompleted,
+      aSuccess ? "completed" : "exited during report", s->mNumProcessesRunning,
+      static_cast<unsigned>(s->mChildrenPending.Length()));
+
+  while (s->mNumProcessesRunning < s->mConcurrencyLimit &&
+         !s->mChildrenPending.IsEmpty()) {
+    const RefPtr<MemoryReportingProcess> nextChild =
+        s->mChildrenPending.PopLastElement();
+    if (StartChildReport(nextChild, s)) {
+      ++s->mNumProcessesRunning;
+      MEMORY_REPORTING_LOG(
+          "HandleChildReports (aGen=%u): started child report"
+          " (%u running, %u pending)\n",
+          aGeneration, s->mNumProcessesRunning,
+          static_cast<unsigned>(s->mChildrenPending.Length()));
+    }
+  }
+
+  if (s->mNumProcessesRunning == 0) {
+    MOZ_ASSERT(s->mChildrenPending.IsEmpty());
+    if (s->mTimer) {
+      s->mTimer->Cancel();
+    }
+    FinishReporting();
+  }
+}
+
+void nsMemoryReporterManager::TimeoutCallback(nsITimer* aTimer, void* aData) {
+  nsMemoryReporterManager* mgr = static_cast<nsMemoryReporterManager*>(aData);
+  PendingProcessesState* s = mgr->mPendingProcessesState;
+
+  MOZ_RELEASE_ASSERT(s, "mgr->mPendingProcessesState");
+  MEMORY_REPORTING_LOG("TimeoutCallback (s->gen=%u; %u running, %u pending)\n",
+                       s->mGeneration, s->mNumProcessesRunning,
+                       static_cast<unsigned>(s->mChildrenPending.Length()));
+
+  mgr->FinishReporting();
+}
+
+nsresult nsMemoryReporterManager::FinishReporting() {
+  if (!NS_IsMainThread()) {
+    MOZ_CRASH();
+  }
+
+  MOZ_ASSERT(mPendingProcessesState);
+  MEMORY_REPORTING_LOG("FinishReporting (s->gen=%u; %u processes reported)\n",
+                       mPendingProcessesState->mGeneration,
+                       mPendingProcessesState->mNumProcessesCompleted);
+
+  nsresult rv = mPendingProcessesState->mFinishReporting->Callback(
+      mPendingProcessesState->mFinishReportingData);
+
+  delete mPendingProcessesState;
+  mPendingProcessesState = nullptr;
+  return rv;
+}
+
+nsMemoryReporterManager::PendingProcessesState::PendingProcessesState(
+    uint32_t aGeneration, bool aAnonymize, bool aMinimize,
+    uint32_t aConcurrencyLimit, nsIHandleReportCallback* aHandleReport,
+    nsISupports* aHandleReportData,
+    nsIFinishReportingCallback* aFinishReporting,
+    nsISupports* aFinishReportingData, const nsAString& aDMDDumpIdent)
+    : mGeneration(aGeneration),
+      mAnonymize(aAnonymize),
+      mMinimize(aMinimize),
+      mNumProcessesRunning(1),  
+      mNumProcessesCompleted(0),
+      mConcurrencyLimit(aConcurrencyLimit),
+      mHandleReport(aHandleReport),
+      mHandleReportData(aHandleReportData),
+      mFinishReporting(aFinishReporting),
+      mFinishReportingData(aFinishReportingData),
+      mDMDDumpIdent(aDMDDumpIdent) {}
+
+static void CrashIfRefcountIsZero(nsISupports* aObj) {
+  uint32_t refcnt = NS_ADDREF(aObj);
+  if (refcnt <= 1) {
+    MOZ_CRASH("CrashIfRefcountIsZero: refcount is zero");
+  }
+  NS_RELEASE(aObj);
+}
+
+nsresult nsMemoryReporterManager::RegisterReporterHelper(
+    nsIMemoryReporter* aReporter, bool aForce, bool aStrong, bool aIsAsync) {
+  mozilla::MutexAutoLock autoLock(mMutex);
+
+  if (mIsRegistrationBlocked && !aForce) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (mStrongReporters->Contains(aReporter) ||
+      mWeakReporters->Contains(aReporter)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (aStrong) {
+    nsCOMPtr<nsIMemoryReporter> kungFuDeathGrip = aReporter;
+    mStrongReporters->InsertOrUpdate(aReporter, aIsAsync);
+    CrashIfRefcountIsZero(aReporter);
+  } else {
+    CrashIfRefcountIsZero(aReporter);
+    nsCOMPtr<nsIXPConnectWrappedJS> jsComponent = do_QueryInterface(aReporter);
+    if (jsComponent) {
+      return NS_ERROR_XPC_BAD_CONVERT_JS;
+    }
+    mWeakReporters->InsertOrUpdate(aReporter, aIsAsync);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::RegisterStrongReporter(nsIMemoryReporter* aReporter) {
+  return RegisterReporterHelper(aReporter,  false,
+                                 true,
+                                 false);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::RegisterStrongAsyncReporter(
+    nsIMemoryReporter* aReporter) {
+  return RegisterReporterHelper(aReporter,  false,
+                                 true,
+                                 true);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::RegisterWeakReporter(nsIMemoryReporter* aReporter) {
+  return RegisterReporterHelper(aReporter,  false,
+                                 false,
+                                 false);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::RegisterWeakAsyncReporter(
+    nsIMemoryReporter* aReporter) {
+  return RegisterReporterHelper(aReporter,  false,
+                                 false,
+                                 true);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::RegisterStrongReporterEvenIfBlocked(
+    nsIMemoryReporter* aReporter) {
+  return RegisterReporterHelper(aReporter,  true,
+                                 true,
+                                 false);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::UnregisterStrongReporter(
+    nsIMemoryReporter* aReporter) {
+  mozilla::MutexAutoLock autoLock(mMutex);
+
+  MOZ_ASSERT(!mWeakReporters->Contains(aReporter));
+
+  if (mStrongReporters->Contains(aReporter)) {
+    mStrongReporters->Remove(aReporter);
+    return NS_OK;
+  }
+
+  if (mSavedStrongReporters && mSavedStrongReporters->Contains(aReporter)) {
+    mSavedStrongReporters->Remove(aReporter);
+    return NS_OK;
+  }
+
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::UnregisterWeakReporter(nsIMemoryReporter* aReporter) {
+  mozilla::MutexAutoLock autoLock(mMutex);
+
+  MOZ_ASSERT(!mStrongReporters->Contains(aReporter));
+
+  if (mWeakReporters->Contains(aReporter)) {
+    mWeakReporters->Remove(aReporter);
+    return NS_OK;
+  }
+
+  if (mSavedWeakReporters && mSavedWeakReporters->Contains(aReporter)) {
+    mSavedWeakReporters->Remove(aReporter);
+    return NS_OK;
+  }
+
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::BlockRegistrationAndHideExistingReporters() {
+  mozilla::MutexAutoLock autoLock(mMutex);
+  if (mIsRegistrationBlocked) {
+    return NS_ERROR_FAILURE;
+  }
+  mIsRegistrationBlocked = true;
+
+  MOZ_ASSERT(!mSavedStrongEternalReporters);
+  MOZ_ASSERT(!mSavedStrongReporters);
+  MOZ_ASSERT(!mSavedWeakReporters);
+  mSavedStrongEternalReporters.swap(mStrongEternalReporters);
+  mSavedStrongReporters.swap(mStrongReporters);
+  mSavedWeakReporters.swap(mWeakReporters);
+  mStrongEternalReporters.reset(new StrongReportersArray());
+  mStrongReporters.reset(new StrongReportersTable());
+  mWeakReporters.reset(new WeakReportersTable());
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::UnblockRegistrationAndRestoreOriginalReporters() {
+  mozilla::MutexAutoLock autoLock(mMutex);
+  if (!mIsRegistrationBlocked) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mStrongEternalReporters = std::move(mSavedStrongEternalReporters);
+  mStrongReporters = std::move(mSavedStrongReporters);
+  mWeakReporters = std::move(mSavedWeakReporters);
+
+  mIsRegistrationBlocked = false;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetVsize(int64_t* aVsize) {
+#if defined(HAVE_VSIZE_AND_RESIDENT_REPORTERS)
+  return VsizeDistinguishedAmount(aVsize);
+#else
+  *aVsize = 0;
+  return NS_ERROR_NOT_AVAILABLE;
+#endif
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetVsizeMaxContiguous(int64_t* aAmount) {
+#if defined(HAVE_VSIZE_MAX_CONTIGUOUS_REPORTER)
+  return VsizeMaxContiguousDistinguishedAmount(aAmount);
+#else
+  *aAmount = 0;
+  return NS_ERROR_NOT_AVAILABLE;
+#endif
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetResident(int64_t* aAmount) {
+#if defined(HAVE_VSIZE_AND_RESIDENT_REPORTERS)
+  return ResidentDistinguishedAmount(aAmount);
+#else
+  *aAmount = 0;
+  return NS_ERROR_NOT_AVAILABLE;
+#endif
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetResidentFast(int64_t* aAmount) {
+#if defined(HAVE_VSIZE_AND_RESIDENT_REPORTERS)
+  return ResidentFastDistinguishedAmount(aAmount);
+#else
+  *aAmount = 0;
+  return NS_ERROR_NOT_AVAILABLE;
+#endif
+}
+
+int64_t nsMemoryReporterManager::ResidentFast() {
+#if defined(HAVE_VSIZE_AND_RESIDENT_REPORTERS)
+  int64_t amount;
+  nsresult rv = ResidentFastDistinguishedAmount(&amount);
+  NS_ENSURE_SUCCESS(rv, 0);
+  return amount;
+#else
+  return 0;
+#endif
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetResidentPeak(int64_t* aAmount) {
+#if defined(HAVE_RESIDENT_PEAK_REPORTER)
+  return ResidentPeakDistinguishedAmount(aAmount);
+#else
+  *aAmount = 0;
+  return NS_ERROR_NOT_AVAILABLE;
+#endif
+}
+
+int64_t nsMemoryReporterManager::ResidentPeak() {
+#if defined(HAVE_RESIDENT_PEAK_REPORTER)
+  int64_t amount = 0;
+  nsresult rv = ResidentPeakDistinguishedAmount(&amount);
+  NS_ENSURE_SUCCESS(rv, 0);
+  return amount;
+#else
+  return 0;
+#endif
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetResidentUnique(int64_t* aAmount) {
+#if defined(HAVE_RESIDENT_UNIQUE_REPORTER)
+  return ResidentUniqueDistinguishedAmount(aAmount);
+#else
+  *aAmount = 0;
+  return NS_ERROR_NOT_AVAILABLE;
+#endif
+}
+
+
+typedef
+    pid_t
+        ResidentUniqueArg;
+
+
+int64_t nsMemoryReporterManager::ResidentUnique(ResidentUniqueArg aProcess) {
+  int64_t amount = 0;
+  nsresult rv = ResidentUniqueDistinguishedAmount(&amount, aProcess);
+  NS_ENSURE_SUCCESS(rv, 0);
+  return amount;
+}
+
+
+#if defined(HAVE_JEMALLOC_STATS)
+size_t nsMemoryReporterManager::HeapAllocated(const jemalloc_stats_t& aStats) {
+  return aStats.allocated;
+}
+#endif
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetHeapAllocated(int64_t* aAmount) {
+#if defined(HAVE_JEMALLOC_STATS)
+  jemalloc_stats_t stats;
+  jemalloc_stats(&stats);
+  *aAmount = HeapAllocated(stats);
+  return NS_OK;
+#else
+  *aAmount = 0;
+  return NS_ERROR_NOT_AVAILABLE;
+#endif
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetHeapOverheadFraction(int64_t* aAmount) {
+#if defined(HAVE_JEMALLOC_STATS)
+  jemalloc_stats_t stats;
+  jemalloc_stats(&stats);
+  *aAmount = HeapOverheadFraction(stats);
+  return NS_OK;
+#else
+  *aAmount = 0;
+  return NS_ERROR_NOT_AVAILABLE;
+#endif
+}
+
+[[nodiscard]] static nsresult GetInfallibleAmount(InfallibleAmountFn aAmountFn,
+                                                  int64_t* aAmount) {
+  if (aAmountFn) {
+    *aAmount = aAmountFn();
+    return NS_OK;
+  }
+  *aAmount = 0;
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetJSMainRuntimeGCHeap(int64_t* aAmount) {
+  return GetInfallibleAmount(mAmountFns.mJSMainRuntimeGCHeap, aAmount);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetJSMainRuntimeTemporaryPeak(int64_t* aAmount) {
+  return GetInfallibleAmount(mAmountFns.mJSMainRuntimeTemporaryPeak, aAmount);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetJSMainRuntimeCompartmentsSystem(int64_t* aAmount) {
+  return GetInfallibleAmount(mAmountFns.mJSMainRuntimeCompartmentsSystem,
+                             aAmount);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetJSMainRuntimeCompartmentsUser(int64_t* aAmount) {
+  return GetInfallibleAmount(mAmountFns.mJSMainRuntimeCompartmentsUser,
+                             aAmount);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetJSMainRuntimeRealmsSystem(int64_t* aAmount) {
+  return GetInfallibleAmount(mAmountFns.mJSMainRuntimeRealmsSystem, aAmount);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetJSMainRuntimeRealmsUser(int64_t* aAmount) {
+  return GetInfallibleAmount(mAmountFns.mJSMainRuntimeRealmsUser, aAmount);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetImagesContentUsedUncompressed(int64_t* aAmount) {
+  return GetInfallibleAmount(mAmountFns.mImagesContentUsedUncompressed,
+                             aAmount);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetStorageSQLite(int64_t* aAmount) {
+  return GetInfallibleAmount(mAmountFns.mStorageSQLite, aAmount);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetLowMemoryEventsPhysical(int64_t* aAmount) {
+  return GetInfallibleAmount(mAmountFns.mLowMemoryEventsPhysical, aAmount);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetGhostWindows(int64_t* aAmount) {
+  return GetInfallibleAmount(mAmountFns.mGhostWindows, aAmount);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetPageFaultsHard(int64_t* aAmount) {
+#if defined(HAVE_PAGE_FAULT_REPORTERS)
+  return PageFaultsHardDistinguishedAmount(aAmount);
+#else
+  *aAmount = 0;
+  return NS_ERROR_NOT_AVAILABLE;
+#endif
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetHasMozMallocUsableSize(bool* aHas) {
+  void* p = malloc(16);
+  if (!p) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  size_t usable = moz_malloc_usable_size(p);
+  free(p);
+  *aHas = !!(usable > 0);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetIsDMDEnabled(bool* aIsEnabled) {
+#if defined(MOZ_DMD)
+  *aIsEnabled = true;
+#else
+  *aIsEnabled = false;
+#endif
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::GetIsDMDRunning(bool* aIsRunning) {
+#if defined(MOZ_DMD)
+  *aIsRunning = dmd::IsRunning();
+#else
+  *aIsRunning = false;
+#endif
+  return NS_OK;
+}
+
+namespace {
+
+class MinimizeMemoryUsageRunnable : public Runnable {
+ public:
+  explicit MinimizeMemoryUsageRunnable(nsIRunnable* aCallback)
+      : mozilla::Runnable("MinimizeMemoryUsageRunnable"),
+        mCallback(aCallback),
+        mRemainingIters(sNumIters) {}
+
+  NS_IMETHOD Run() override {
+    nsCOMPtr<nsIObserverService> os = services::GetObserverService();
+    if (!os) {
+      return NS_ERROR_FAILURE;
+    }
+
+    if (mRemainingIters == 0) {
+#if defined(MOZ_MEMORY)
+      jemalloc_free_dirty_pages();
+#endif
+
+      os->NotifyObservers(nullptr, "after-minimize-memory-usage",
+                          u"MinimizeMemoryUsageRunnable");
+      if (mCallback) {
+        mCallback->Run();
+      }
+      return NS_OK;
+    }
+
+    os->NotifyObservers(nullptr, "memory-pressure", u"heap-minimize");
+    mRemainingIters--;
+    NS_DispatchToMainThread(this);
+
+    return NS_OK;
+  }
+
+ private:
+  static const uint32_t sNumIters = 3;
+
+  nsCOMPtr<nsIRunnable> mCallback;
+  uint32_t mRemainingIters;
+};
+
+}  
+
+NS_IMETHODIMP
+nsMemoryReporterManager::MinimizeMemoryUsage(nsIRunnable* aCallback) {
+  RefPtr runnable = MakeRefPtr<MinimizeMemoryUsageRunnable>(aCallback);
+
+  return NS_DispatchToMainThread(runnable);
+}
+
+NS_IMETHODIMP
+nsMemoryReporterManager::SizeOfTab(mozIDOMWindowProxy* aTopWindow,
+                                   int64_t* aJSObjectsSize,
+                                   int64_t* aJSStringsSize,
+                                   int64_t* aJSOtherSize, int64_t* aDomSize,
+                                   int64_t* aStyleSize, int64_t* aOtherSize,
+                                   int64_t* aTotalSize, double* aJSMilliseconds,
+                                   double* aNonJSMilliseconds) {
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aTopWindow);
+  auto* piWindow = nsPIDOMWindowOuter::From(aTopWindow);
+  if (NS_WARN_IF(!global) || NS_WARN_IF(!piWindow)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  TimeStamp t1 = TimeStamp::Now();
+
+  size_t jsObjectsSize, jsStringsSize, jsPrivateSize, jsOtherSize;
+  nsresult rv = mSizeOfTabFns.mJS(global->GetGlobalJSObject(), &jsObjectsSize,
+                                  &jsStringsSize, &jsPrivateSize, &jsOtherSize);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  TimeStamp t2 = TimeStamp::Now();
+
+  size_t domSize, styleSize, otherSize;
+  rv = mSizeOfTabFns.mNonJS(piWindow, &domSize, &styleSize, &otherSize);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  TimeStamp t3 = TimeStamp::Now();
+
+  *aTotalSize = 0;
+#define DO(aN, n)       \
+  {                     \
+    *aN = (n);          \
+    *aTotalSize += (n); \
+  }
+  DO(aJSObjectsSize, jsObjectsSize);
+  DO(aJSStringsSize, jsStringsSize);
+  DO(aJSOtherSize, jsOtherSize);
+  DO(aDomSize, jsPrivateSize + domSize);
+  DO(aStyleSize, styleSize);
+  DO(aOtherSize, otherSize);
+#undef DO
+
+  *aJSMilliseconds = (t2 - t1).ToMilliseconds();
+  *aNonJSMilliseconds = (t3 - t2).ToMilliseconds();
+
+  return NS_OK;
+}
+
+namespace mozilla {
+
+#define GET_MEMORY_REPORTER_MANAGER(mgr)      \
+  RefPtr<nsMemoryReporterManager> mgr =       \
+      nsMemoryReporterManager::GetOrCreate(); \
+  if (!mgr) {                                 \
+    return NS_ERROR_FAILURE;                  \
+  }
+
+nsresult RegisterStrongMemoryReporter(
+    already_AddRefed<nsIMemoryReporter> aReporter) {
+  nsCOMPtr<nsIMemoryReporter> reporter = aReporter;
+  GET_MEMORY_REPORTER_MANAGER(mgr)
+  return mgr->RegisterStrongReporter(reporter);
+}
+
+nsresult RegisterStrongAsyncMemoryReporter(
+    already_AddRefed<nsIMemoryReporter> aReporter) {
+  nsCOMPtr<nsIMemoryReporter> reporter = aReporter;
+  GET_MEMORY_REPORTER_MANAGER(mgr)
+  return mgr->RegisterStrongAsyncReporter(reporter);
+}
+
+nsresult RegisterWeakMemoryReporter(nsIMemoryReporter* aReporter) {
+  GET_MEMORY_REPORTER_MANAGER(mgr)
+  return mgr->RegisterWeakReporter(aReporter);
+}
+
+nsresult RegisterWeakAsyncMemoryReporter(nsIMemoryReporter* aReporter) {
+  GET_MEMORY_REPORTER_MANAGER(mgr)
+  return mgr->RegisterWeakAsyncReporter(aReporter);
+}
+
+nsresult UnregisterStrongMemoryReporter(nsIMemoryReporter* aReporter) {
+  GET_MEMORY_REPORTER_MANAGER(mgr)
+  return mgr->UnregisterStrongReporter(aReporter);
+}
+
+nsresult UnregisterWeakMemoryReporter(nsIMemoryReporter* aReporter) {
+  GET_MEMORY_REPORTER_MANAGER(mgr)
+  return mgr->UnregisterWeakReporter(aReporter);
+}
+
+#define DEFINE_REGISTER_DISTINGUISHED_AMOUNT(kind, name)                   \
+  nsresult Register##name##DistinguishedAmount(kind##AmountFn aAmountFn) { \
+    GET_MEMORY_REPORTER_MANAGER(mgr)                                       \
+    mgr->mAmountFns.m##name = aAmountFn;                                   \
+    return NS_OK;                                                          \
+  }
+
+#define DEFINE_UNREGISTER_DISTINGUISHED_AMOUNT(name) \
+  nsresult Unregister##name##DistinguishedAmount() { \
+    GET_MEMORY_REPORTER_MANAGER(mgr)                 \
+    mgr->mAmountFns.m##name = nullptr;               \
+    return NS_OK;                                    \
+  }
+
+DEFINE_REGISTER_DISTINGUISHED_AMOUNT(Infallible, JSMainRuntimeGCHeap)
+DEFINE_REGISTER_DISTINGUISHED_AMOUNT(Infallible, JSMainRuntimeTemporaryPeak)
+DEFINE_REGISTER_DISTINGUISHED_AMOUNT(Infallible,
+                                     JSMainRuntimeCompartmentsSystem)
+DEFINE_REGISTER_DISTINGUISHED_AMOUNT(Infallible, JSMainRuntimeCompartmentsUser)
+DEFINE_REGISTER_DISTINGUISHED_AMOUNT(Infallible, JSMainRuntimeRealmsSystem)
+DEFINE_REGISTER_DISTINGUISHED_AMOUNT(Infallible, JSMainRuntimeRealmsUser)
+
+DEFINE_REGISTER_DISTINGUISHED_AMOUNT(Infallible, ImagesContentUsedUncompressed)
+DEFINE_UNREGISTER_DISTINGUISHED_AMOUNT(ImagesContentUsedUncompressed)
+
+DEFINE_REGISTER_DISTINGUISHED_AMOUNT(Infallible, StorageSQLite)
+DEFINE_UNREGISTER_DISTINGUISHED_AMOUNT(StorageSQLite)
+
+DEFINE_REGISTER_DISTINGUISHED_AMOUNT(Infallible, LowMemoryEventsPhysical)
+
+DEFINE_REGISTER_DISTINGUISHED_AMOUNT(Infallible, GhostWindows)
+
+#undef DEFINE_REGISTER_DISTINGUISHED_AMOUNT
+#undef DEFINE_UNREGISTER_DISTINGUISHED_AMOUNT
+
+#define DEFINE_REGISTER_SIZE_OF_TAB(name)                              \
+  nsresult Register##name##SizeOfTab(name##SizeOfTabFn aSizeOfTabFn) { \
+    GET_MEMORY_REPORTER_MANAGER(mgr)                                   \
+    mgr->mSizeOfTabFns.m##name = aSizeOfTabFn;                         \
+    return NS_OK;                                                      \
+  }
+
+DEFINE_REGISTER_SIZE_OF_TAB(JS);
+DEFINE_REGISTER_SIZE_OF_TAB(NonJS);
+
+#undef DEFINE_REGISTER_SIZE_OF_TAB
+
+#undef GET_MEMORY_REPORTER_MANAGER
+
+}  

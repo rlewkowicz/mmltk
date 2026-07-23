@@ -1,0 +1,99 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsFrameLoaderOwner_h_
+#define nsFrameLoaderOwner_h_
+
+#include <functional>
+
+#include "nsFrameLoader.h"
+#include "nsISupports.h"
+
+namespace mozilla {
+class ErrorResult;
+namespace dom {
+class BrowsingContext;
+class BrowsingContextGroup;
+class BrowserBridgeChild;
+class ContentParent;
+class Element;
+struct RemotenessOptions;
+struct NavigationIsolationOptions;
+}  
+}  
+
+#define NS_FRAMELOADEROWNER_IID \
+  {0x1b4fd25c, 0x2e57, 0x11e9, {0x9e, 0x5a, 0x5b, 0x86, 0xe9, 0x89, 0xa5, 0xc0}}
+
+class nsFrameLoaderOwner : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_FRAMELOADEROWNER_IID)
+
+  nsFrameLoaderOwner() = default;
+  already_AddRefed<nsFrameLoader> GetFrameLoader();
+  void SetFrameLoader(nsFrameLoader* aNewFrameLoader);
+
+  mozilla::dom::BrowsingContext* GetBrowsingContext();
+  mozilla::dom::BrowsingContext* GetExtantBrowsingContext();
+
+  MOZ_CAN_RUN_SCRIPT
+  void ChangeRemoteness(const mozilla::dom::RemotenessOptions& aOptions,
+                        mozilla::ErrorResult& rv);
+
+  MOZ_CAN_RUN_SCRIPT
+  void ChangeRemotenessWithBridge(mozilla::dom::BrowserBridgeChild* aBridge,
+                                  mozilla::ErrorResult& rv);
+
+  MOZ_CAN_RUN_SCRIPT
+  void ChangeRemotenessToProcess(
+      mozilla::dom::ContentParent* aContentParent,
+      const mozilla::dom::NavigationIsolationOptions& aOptions,
+      mozilla::dom::BrowsingContextGroup* aGroup, mozilla::ErrorResult& rv);
+
+  MOZ_CAN_RUN_SCRIPT
+  void SubframeCrashed();
+
+  void RestoreFrameLoaderFromBFCache(nsFrameLoader* aNewFrameLoader);
+
+  MOZ_CAN_RUN_SCRIPT
+  void UpdateFocusAndMouseEnterStateAfterFrameLoaderChange();
+
+  void AttachFrameLoader(nsFrameLoader* aFrameLoader);
+  void DetachFrameLoader(nsFrameLoader* aFrameLoader);
+  void FrameLoaderDestroying(nsFrameLoader* aFrameLoader,
+                             bool aDestroyBFCached);
+
+ private:
+  bool UseRemoteSubframes();
+
+  enum class ChangeRemotenessContextType {
+    DONT_PRESERVE = 0,
+    PRESERVE = 1,
+  };
+  ChangeRemotenessContextType ShouldPreserveBrowsingContext(
+      bool aIsRemote, bool aReplaceBrowsingContext);
+
+  MOZ_CAN_RUN_SCRIPT
+  void ChangeRemotenessCommon(
+      const ChangeRemotenessContextType& aContextType,
+      const mozilla::dom::NavigationIsolationOptions& aOptions,
+      bool aSwitchingInProgressLoad, bool aIsRemote,
+      mozilla::dom::BrowsingContextGroup* aGroup,
+      std::function<void()>& aFrameLoaderInit, mozilla::ErrorResult& aRv);
+
+  void ChangeFrameLoaderCommon(mozilla::dom::Element* aOwner,
+                               bool aRetainPaint);
+
+  MOZ_CAN_RUN_SCRIPT
+  void UpdateFocusAndMouseEnterStateAfterFrameLoaderChange(
+      mozilla::dom::Element* aOwner);
+
+ protected:
+  virtual ~nsFrameLoaderOwner() = default;
+  RefPtr<nsFrameLoader> mFrameLoader;
+
+  mozilla::LinkedList<nsFrameLoader> mFrameLoaderList;
+};
+
+#endif  // nsFrameLoaderOwner_h_

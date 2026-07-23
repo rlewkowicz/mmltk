@@ -1,0 +1,495 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef gc_BufferAllocator_h
+#define gc_BufferAllocator_h
+
+#include "mozilla/Array.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/BitSet.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/TimeStamp.h"
+
+#include <cstdint>
+#include <stddef.h>
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "ds/SlimLinkedList.h"
+#include "js/HeapAPI.h"
+#include "threading/LockGuard.h"
+#include "threading/Mutex.h"
+#include "threading/ProtectedData.h"
+
+class JS_PUBLIC_API JSTracer;
+
+namespace JS {
+class JS_PUBLIC_API Zone;
+}  
+
+namespace js {
+
+class GCMarker;
+class Nursery;
+
+namespace gc {
+
+class BufferAllocator;
+class BufferAllocatorRuntime;  
+struct BufferChunk;
+class Cell;
+class GCRuntime;
+struct LargeBuffer;
+struct SmallBufferRegion;
+
+class AutoLockBufferAllocator : public LockGuard<Mutex> {
+ public:
+  explicit AutoLockBufferAllocator(BufferAllocatorRuntime* runtime);
+  friend class UnlockGuard<AutoLockBufferAllocator>;
+};
+
+class MaybeLockBufferAllocator
+    : public mozilla::Maybe<AutoLockBufferAllocator> {
+ public:
+  using Base = mozilla::Maybe<AutoLockBufferAllocator>;
+  using Base::Base;
+};
+
+
+class BufferAllocator : public SlimLinkedListElement<BufferAllocator> {
+ public:
+  static constexpr size_t MinSmallAllocShift = 4;    
+  static constexpr size_t MinMediumAllocShift = 12;  
+  static constexpr size_t MinLargeAllocShift = 20;   
+
+  static constexpr size_t MinSizeClassShift = 5;  
+  static_assert(MinSizeClassShift >= MinSmallAllocShift);
+
+  static constexpr size_t SmallSizeClasses =
+      MinMediumAllocShift - MinSizeClassShift + 1;
+  static constexpr size_t MediumSizeClasses =
+      MinLargeAllocShift - MinMediumAllocShift + 1;
+  static constexpr size_t AllocSizeClasses =
+      SmallSizeClasses + MediumSizeClasses;
+
+  static constexpr size_t FullChunkSizeClass = AllocSizeClasses;
+
+  struct Stats;
+
+  using AutoLock = AutoLockBufferAllocator;
+  using MaybeLock = MaybeLockBufferAllocator;
+
+ private:
+  template <typename Derived, size_t SizeBytes, size_t GranularityBytes>
+  friend struct AllocSpace;
+
+  using BufferChunkList = SlimLinkedList<BufferChunk>;
+
+  struct FreeRegion;
+  using FreeList = SlimLinkedList<FreeRegion>;
+
+  using SizeClassBitSet = mozilla::BitSet<AllocSizeClasses, uint32_t>;
+
+  class FreeLists {
+    using FreeListArray = mozilla::Array<FreeList, AllocSizeClasses>;
+
+    FreeListArray lists;
+    SizeClassBitSet available;
+
+   public:
+    class FreeListIter;
+    class FreeRegionIter;
+
+    FreeLists() = default;
+
+    FreeLists(FreeLists&& other);
+    FreeLists& operator=(FreeLists&& other);
+
+    FreeListIter freeListIter();
+    FreeRegionIter freeRegionIter();
+
+    bool isEmpty() const { return available.IsEmpty(); }
+
+    bool hasSizeClass(size_t sizeClass) const;
+    const auto& availableSizeClasses() const { return available; }
+
+    size_t getFirstAvailableSizeClass(size_t minSizeClass,
+                                      size_t maxSizeClass) const;
+    size_t getLastAvailableSizeClass(size_t minSizeClass,
+                                     size_t maxSizeClass) const;
+
+    FreeRegion* getFirstRegion(size_t sizeClass);
+
+    void pushFront(size_t sizeClass, FreeRegion* region);
+    void pushBack(size_t sizeClass, FreeRegion* region);
+
+    void append(FreeLists&& other);
+
+    void remove(size_t sizeClass, FreeRegion* region);
+
+    void clear();
+
+    template <typename Func>
+    void forEachRegion(Func&& func);
+
+    void assertEmpty() const;
+    void assertContains(size_t sizeClass, FreeRegion* region) const;
+    void checkAvailable() const;
+
+    void getStats(Stats& stats);
+  };
+
+  class ChunkLists {
+    using ChunkListArray =
+        mozilla::Array<BufferChunkList, AllocSizeClasses + 1>;
+    using AvailableBitSet = mozilla::BitSet<AllocSizeClasses + 1, uint32_t>;
+
+    ChunkListArray lists;
+    AvailableBitSet available;
+
+   public:
+    class ChunkListIter;
+    class ChunkIter;
+
+    ChunkLists() = default;
+
+    ChunkLists(const ChunkLists& other) = delete;
+    ChunkLists& operator=(const ChunkLists& other) = delete;
+
+    ChunkListIter chunkListIter();
+    ChunkIter chunkIter();
+    const auto& availableSizeClasses() const { return available; }
+
+    void pushFront(size_t sizeClass, BufferChunk* chunk);
+    void pushBack(BufferChunk* chunk);
+    void pushBack(size_t sizeClass, BufferChunk* chunk);
+
+    size_t getFirstAvailableSizeClass(size_t minSizeClass,
+                                      size_t maxSizeClass) const;
+
+    BufferChunk* popFirstChunk(size_t sizeClass);
+
+    void remove(size_t sizeClass, BufferChunk* chunk);
+
+    BufferChunkList extractAllChunks();
+
+    bool isEmpty() const;
+    void checkAvailable() const;
+  };
+
+  using LargeAllocList = SlimLinkedList<LargeBuffer>;
+
+  enum class State : uint8_t { NotCollecting, Marking, Sweeping };
+
+  enum class SizeKind : uint8_t { Small, Medium };
+
+  enum class SweepKind : uint8_t { Tenured = 0, Nursery };
+
+  MainThreadOrGCTaskData<GCRuntime*> gc;
+
+  MainThreadOrGCTaskData<JS::Zone*> zone;
+
+  MainThreadOrGCTaskData<BufferChunkList> mixedChunks;
+
+  MainThreadOrGCTaskData<BufferChunkList> tenuredChunks;
+
+  MainThreadOrGCTaskData<FreeLists> freeLists;
+
+  MainThreadOrGCTaskData<BufferChunkList> mixedChunksToSweep;
+
+  MainThreadOrGCTaskData<BufferChunkList> tenuredChunksToSweep;
+
+  MutexData<BufferChunkList> sweptMixedChunks;
+  MutexData<BufferChunkList> sweptTenuredChunks;
+
+  MainThreadOrGCTaskData<ChunkLists> availableMixedChunks;
+  MainThreadOrGCTaskData<ChunkLists> availableTenuredChunks;
+
+  MainThreadOrGCTaskData<LargeAllocList> largeNurseryAllocs;
+
+  MainThreadOrGCTaskData<LargeAllocList> largeTenuredAllocs;
+
+  MainThreadOrGCTaskData<LargeAllocList> largeNurseryAllocsToSweep;
+  MainThreadOrGCTaskData<LargeAllocList> largeTenuredAllocsToSweep;
+
+  MutexData<LargeAllocList> sweptLargeTenuredAllocs;
+
+  mozilla::Atomic<bool, mozilla::Relaxed> hasSweepDataToMerge;
+
+  MainThreadOrGCTaskData<State> minorState;
+  MainThreadOrGCTaskData<State> majorState;
+
+  MutexData<bool> minorSweepingFinished;
+  MutexData<bool> majorSweepingFinished;
+
+  MainThreadOrGCTaskData<bool> majorStartedWhileMinorSweeping;
+  MainThreadOrGCTaskData<bool> majorSweepingStartedWhileMinorSweeping;
+
+  MainThreadOrGCTaskData<bool> majorFinishedWhileMinorSweeping;
+
+  Mutex* multiThreadedMutex = nullptr;
+
+ public:
+  explicit BufferAllocator(GCRuntime* gc, JS::Zone* zone);
+  ~BufferAllocator();
+
+  static inline size_t GetGoodAllocSize(size_t requiredBytes);
+  static inline size_t GetGoodElementCount(size_t requiredElements,
+                                           size_t elementSize);
+  static inline size_t GetGoodPower2AllocSize(size_t requiredBytes);
+  static inline size_t GetGoodPower2ElementCount(size_t requiredElements,
+                                                 size_t elementSize);
+  static bool IsBufferAlloc(void* alloc);
+
+  void* alloc(size_t bytes, bool nurseryOwned);
+  void* allocInGC(size_t bytes, bool nurseryOwned);
+  void* realloc(void* alloc, size_t bytes, bool nurseryOwned);
+  void free(void* alloc);
+  size_t getAllocSize(void* alloc);
+  bool isNurseryOwned(void* alloc);
+
+  void startMinorCollection(MaybeLock& lock);
+  bool startMinorSweeping();
+  void sweepForMinorCollection();
+
+  void startMajorCollection(MaybeLock& lock);
+  void startMajorSweeping(MaybeLock& lock);
+  void sweepForMajorCollection(bool shouldDecommit);
+  void finishMajorCollection(const AutoLock& lock);
+  void clearMarkStateAfterBarrierVerification();
+  void clearChunkMarkBits(BufferChunk* chunk);
+  void clearMarkBitsInStolenChunks();
+
+  bool isEmpty() const;
+
+  static void* TraceEdge(JSTracer* trc, void** bufferp, const char* name);
+
+  bool markTenuredAlloc(void* alloc);
+  bool isMarkedBlack(void* alloc);
+
+  void setMultiThreadedUse(Mutex* mutex);
+  void clearMultiThreadedUse();
+
+  bool isPointerWithinBuffer(void* ptr);
+
+  size_t getSizeOfNurseryBuffers();
+
+  void addBufferSizesAndCounts(size_t* usedBytesOut, size_t* freeBytesOut,
+                               size_t* adminBytesOut, size_t* totalChunksOut,
+                               size_t* freeRegionsOut, size_t* largeAllocsOut);
+
+  static void printStatsHeader(FILE* file);
+  static void printStats(GCRuntime* gc, mozilla::TimeStamp creationTime,
+                         bool isMajorGC, FILE* file);
+
+  struct Stats {
+    size_t usedBytes = 0;
+    size_t freeBytes = 0;
+    size_t adminBytes = 0;
+    size_t mixedSmallRegions = 0;
+    size_t tenuredSmallRegions = 0;
+    size_t mixedChunks = 0;
+    size_t tenuredChunks = 0;
+    size_t availableMixedChunks = 0;
+    size_t availableTenuredChunks = 0;
+    size_t freeRegions = 0;
+    size_t largeNurseryAllocs = 0;
+    size_t largeTenuredAllocs = 0;
+  };
+  void getStats(Stats& stats);
+
+#ifdef DEBUG
+  bool hasAlloc(void* alloc);
+  void checkGCStateNotInUse();
+  void checkGCStateNotInUse(MaybeLock& lock);
+  void checkGCStateNotInUse(const AutoLock& lock);
+#endif
+
+ private:
+  void checkAccess() const;
+  void checkMainThread() const;
+  bool isUsedByMainThread() const;
+
+  BufferAllocatorRuntime* runtime() const;
+  friend class AutoLockBufferAllocator;
+
+  void markNurseryOwnedAlloc(void* alloc, bool nurseryOwned);
+  friend class js::Nursery;
+
+  void maybeMergeSweptData();
+  void maybeMergeSweptData(MaybeLock& lock);
+  void mergeSweptData();
+  void mergeSweptData(const AutoLock& lock);
+  void abortMajorSweeping(const AutoLock& lock);
+  void clearAllocatedDuringCollectionState(const AutoLock& lock);
+
+
+  static inline bool IsSmallAllocSize(size_t bytes);
+  static bool IsSmallAlloc(void* alloc);
+
+  void* allocSmall(size_t bytes, bool nurseryOwned, bool inGC);
+  void* retrySmallAlloc(size_t requestedBytes, size_t sizeClass, bool inGC);
+  bool allocNewSmallRegion(bool inGC);
+  void traceSmallAlloc(JSTracer* trc, void** allocp, const char* name);
+  void markSmallNurseryOwnedBuffer(void* alloc, bool nurseryOwned);
+  bool markSmallTenuredAlloc(void* alloc);
+
+
+  static bool IsMediumAlloc(void* alloc);
+  static bool CanSweepAlloc(bool nurseryOwned,
+                            BufferAllocator::SweepKind sweepKind);
+
+  void* allocMedium(size_t bytes, bool nurseryOwned, bool inGC);
+  void* retryMediumAlloc(size_t requestedBytes, size_t sizeClass, bool inGC);
+  template <typename Alloc, typename GrowHeap>
+  void* refillFreeListsAndRetryAlloc(size_t sizeClass, size_t maxSizeClass,
+                                     Alloc&& alloc, GrowHeap&& growHeap);
+  enum class RefillResult { Fail = 0, Success, Retry };
+  template <typename GrowHeap>
+  RefillResult refillFreeLists(size_t sizeClass, size_t maxSizeClass,
+                               GrowHeap&& growHeap);
+  bool useAvailableChunk(size_t sizeClass, size_t maxSizeClass);
+  bool useAvailableChunk(size_t sizeClass, size_t maxSizeClass, ChunkLists& src,
+                         BufferChunkList& dst);
+  SizeClassBitSet getChunkSizeClassesToMove(size_t maxSizeClass,
+                                            ChunkLists& src) const;
+  void* bumpAlloc(size_t bytes, size_t sizeClass, size_t maxSizeClass);
+  void* allocFromRegion(FreeRegion* region, size_t bytes, size_t sizeClass);
+  void* allocMediumAligned(size_t bytes, bool inGC);
+  void* retryAlignedAlloc(size_t sizeClass, bool inGC);
+  void* alignedAlloc(size_t sizeClass);
+  void* alignedAllocFromRegion(FreeRegion* region, size_t sizeClass);
+  void updateFreeListsAfterAlloc(FreeLists* freeLists, FreeRegion* region,
+                                 size_t sizeClass);
+  void setAllocated(void* alloc, size_t bytes, bool nurseryOwned, bool inGC);
+  void setChunkHasNurseryAllocs(BufferChunk* chunk);
+  void recommitRegion(FreeRegion* region);
+  bool stealOrAllocNewChunk(size_t sizeClass, bool inGC);
+  bool allocNewChunk(bool inGC);
+  bool sweepChunk(BufferChunk* chunk, SweepKind sweepKind, bool shouldDecommit);
+  void addSweptRegion(BufferChunk* chunk, uintptr_t freeStart,
+                      uintptr_t freeEnd, bool shouldDecommit,
+                      bool expectUnchanged, FreeLists& freeLists);
+  bool sweepSmallBufferRegion(BufferChunk* chunk, SmallBufferRegion* region,
+                              SweepKind sweepKind);
+  void addSweptRegion(SmallBufferRegion* region, uintptr_t freeStart,
+                      uintptr_t freeEnd, bool shouldDecommit,
+                      bool expectUnchanged, FreeLists& freeLists);
+  void freeMedium(void* alloc);
+  bool growMedium(void* alloc, size_t newBytes);
+  bool shrinkMedium(void* alloc, size_t newBytes);
+  FreeRegion* makeFreeRegion(uintptr_t start, uintptr_t bytes,
+                             bool anyDecommitted, bool expectUnchanged = false);
+  void pushFreeRegionBack(FreeLists* freeLists, FreeRegion* region,
+                          SizeKind kind);
+  void pushFreeRegionFront(FreeLists* freeLists, FreeRegion* region,
+                           SizeKind kind);
+  void updateFreeRegionStart(FreeLists* freeLists, FreeRegion* region,
+                             uintptr_t newStart, SizeKind kind);
+  FreeLists* getChunkFreeLists(BufferChunk* chunk);
+  ChunkLists* getChunkAvailableLists(BufferChunk* chunk);
+  void maybeUpdateAvailableLists(ChunkLists* availableChunks,
+                                 BufferChunk* chunk, size_t oldChunkSizeClass);
+  bool canModifyAllocations(BufferChunk* chunk);
+  bool isConcurrentMarking() const;
+  bool isSweepingChunk(BufferChunk* chunk);
+  void traceMediumAlloc(JSTracer* trc, void** allocp, const char* name);
+  bool isMediumBufferNurseryOwned(void* alloc) const;
+  void markMediumNurseryOwnedBuffer(void* alloc, bool nurseryOwned);
+  bool markMediumTenuredAlloc(void* alloc);
+
+  static SizeKind SizeClassKind(size_t sizeClass);
+
+  static size_t SizeClassForSmallAlloc(size_t bytes);
+  static size_t SizeClassForMediumAlloc(size_t bytes);
+
+  static size_t SizeClassForFreeRegion(size_t bytes, SizeKind kind);
+
+  static void CheckFreeRegionClass(FreeRegion* region, size_t sizeClass);
+
+  static size_t SizeClassBytes(size_t sizeClass);
+  friend struct BufferChunk;
+
+  static void ClearAllocatedDuringCollection(ChunkLists& chunks);
+  static void ClearAllocatedDuringCollection(BufferChunkList& list);
+  static void ClearAllocatedDuringCollection(LargeAllocList& list);
+
+
+  static inline bool IsLargeAllocSize(size_t bytes);
+  static bool IsLargeAlloc(void* alloc);
+  static void TraceLargeAlloc(JSTracer* trc, void** allocp, const char* name);
+
+  void* allocLarge(size_t bytes, bool nurseryOwned, bool inGC);
+  bool isLargeTenuredMarked(LargeBuffer* buffer);
+  void freeLarge(void* alloc);
+  bool shrinkLarge(LargeBuffer* buffer, size_t newBytes);
+  void unmapLarge(LargeBuffer* buffer, bool isSweeping, MaybeLock& lock);
+  void unregisterLarge(LargeBuffer* buffer, bool isSweeping, MaybeLock& lock);
+  void traceLargeBuffer(JSTracer* trc, LargeBuffer* buffer, const char* name);
+  void markLargeNurseryOwnedBuffer(LargeBuffer* buffer, bool nurseryOwned);
+  bool markLargeTenuredBuffer(LargeBuffer* buffer);
+
+  LargeBuffer* lookupLargeBuffer(void* alloc);
+  LargeBuffer* lookupLargeBuffer(void* alloc, MaybeLock& lock);
+  bool needLockToAccessBufferMap() const;
+
+  void increaseHeapSize(size_t bytes, bool nurseryOwned, bool checkThresholds,
+                        bool updateRetainedSize);
+  void decreaseHeapSize(size_t bytes, bool nurseryOwned,
+                        bool updateRetainedSize);
+
+  friend void* TestAllocAligned(JS::Zone* zone, size_t bytes);
+  friend size_t TestGetAllocSizeKind(void* alloc);
+
+#ifdef DEBUG
+  void checkChunkListsGCStateNotInUse(ChunkLists& chunkLists,
+                                      bool hasNurseryOwnedAllocs,
+                                      bool allowAllocatedDuringCollection);
+  void checkChunkListGCStateNotInUse(BufferChunkList& chunks,
+                                     bool hasNurseryOwnedAllocs,
+                                     bool allowAllocatedDuringCollection,
+                                     bool allowFreeLists);
+  void checkChunkGCStateNotInUse(BufferChunk* chunk,
+                                 bool allowAllocatedDuringCollection,
+                                 bool allowFreeLists);
+  void checkAllocListGCStateNotInUse(LargeAllocList& list, bool isNurseryOwned);
+  void verifyChunk(BufferChunk* chunk, bool hasNurseryOwnedAllocs);
+  void verifyFreeRegion(BufferChunk* chunk, uintptr_t endOffset,
+                        size_t expectedSize, size_t& freeRegionCount);
+  void verifySmallBufferRegion(SmallBufferRegion* region,
+                               size_t& freeRegionCount);
+  void verifyFreeRegion(SmallBufferRegion* chunk, uintptr_t endOffset,
+                        size_t expectedSize, size_t& freeRegionCount);
+#endif
+};
+
+static constexpr size_t SmallAllocGranularityShift =
+    BufferAllocator::MinSmallAllocShift;
+static constexpr size_t MediumAllocGranularityShift =
+    BufferAllocator::MinMediumAllocShift;
+
+static constexpr size_t SmallAllocGranularity = 1 << SmallAllocGranularityShift;
+static constexpr size_t MediumAllocGranularity = 1
+                                                 << MediumAllocGranularityShift;
+
+static constexpr size_t MinSmallAllocSize =
+    1 << BufferAllocator::MinSmallAllocShift;
+static constexpr size_t MinMediumAllocSize =
+    1 << BufferAllocator::MinMediumAllocShift;
+static constexpr size_t MinLargeAllocSize =
+    1 << BufferAllocator::MinLargeAllocShift;
+
+static constexpr size_t MinAllocSize = MinSmallAllocSize;
+
+static constexpr size_t MaxSmallAllocSize =
+    MinMediumAllocSize - SmallAllocGranularity;
+static constexpr size_t MaxMediumAllocSize =
+    MinLargeAllocSize - MediumAllocGranularity;
+static constexpr size_t MaxAlignedAllocSize = MinLargeAllocSize / 4;
+
+}  
+}  
+
+#endif  // gc_BufferAllocator_h

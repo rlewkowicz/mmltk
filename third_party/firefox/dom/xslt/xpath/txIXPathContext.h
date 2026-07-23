@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef TX_I_XPATH_CONTEXT
+#define TX_I_XPATH_CONTEXT
+
+#include "nsISupportsImpl.h"
+#include "nsStringFwd.h"
+#include "nscore.h"
+
+class FunctionCall;
+class nsAtom;
+class txAExprResult;
+class txResultRecycler;
+class txXPathNode;
+
+
+class txIParseContext {
+ public:
+  virtual ~txIParseContext() = default;
+
+  virtual int32_t resolveNamespacePrefix(nsAtom* aPrefix) = 0;
+
+  virtual nsresult resolveFunctionCall(nsAtom* aName, int32_t aID,
+                                       FunctionCall** aFunction) = 0;
+
+  virtual bool caseInsensitiveNameTests() = 0;
+
+  virtual void SetErrorOffset(uint32_t aOffset) = 0;
+
+  enum Allowed { KEY_FUNCTION = 1 << 0 };
+  virtual bool allowed(Allowed aAllowed) { return true; }
+};
+
+class txIMatchContext {
+ public:
+  virtual ~txIMatchContext() = default;
+
+  virtual nsresult getVariable(int32_t aNamespace, nsAtom* aLName,
+                               txAExprResult*& aResult) = 0;
+
+  virtual nsresult isStripSpaceAllowed(const txXPathNode& aNode,
+                                       bool& aAllowed) = 0;
+
+  virtual void* getPrivateContext() = 0;
+
+  virtual txResultRecycler* recycler() = 0;
+
+  virtual void receiveError(const nsAString& aMsg, nsresult aRes) = 0;
+};
+
+#define TX_DECL_MATCH_CONTEXT                                            \
+  nsresult getVariable(int32_t aNamespace, nsAtom* aLName,               \
+                       txAExprResult*& aResult) override;                \
+  nsresult isStripSpaceAllowed(const txXPathNode& aNode, bool& aAllowed) \
+      override;                                                          \
+  void* getPrivateContext() override;                                    \
+  txResultRecycler* recycler() override;                                 \
+  void receiveError(const nsAString& aMsg, nsresult aRes) override
+
+class txIEvalContext : public txIMatchContext {
+ public:
+  virtual const txXPathNode& getContextNode() = 0;
+
+  virtual uint32_t size() = 0;
+
+  virtual uint32_t position() = 0;
+};
+
+#define TX_DECL_EVAL_CONTEXT                    \
+  TX_DECL_MATCH_CONTEXT;                        \
+  const txXPathNode& getContextNode() override; \
+  uint32_t size() override;                     \
+  uint32_t position() override
+
+#endif  // TX_I_XPATH_CONTEXT

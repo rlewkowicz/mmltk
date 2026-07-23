@@ -1,0 +1,183 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef gc_Allocator_h
+#define gc_Allocator_h
+
+#include "gc/AllocKind.h"
+#include "gc/GCEnum.h"
+#include "js/HeapAPI.h"
+#include "js/TypeDecls.h"
+
+namespace js {
+namespace gc {
+
+class AllocSite;
+class Cell;
+class BufferAllocator;
+class TenuredCell;
+class TenuringTracer;
+
+class CellAllocator {
+ public:
+  template <typename T, AllowGC allowGC = CanGC, typename... Args>
+  static inline T* NewCell(JSContext* cx, Args&&... args);
+  friend class BufferAllocator;
+
+ private:
+  template <typename T, AllowGC allowGC, typename... Args>
+  static T* NewString(JSContext* cx, Heap heap, Args&&... args);
+
+  template <typename T, AllowGC allowGC>
+  static T* NewBigInt(JSContext* cx, Heap heap);
+
+  template <typename T, AllowGC allowGC, typename... Args>
+  static T* NewGetterSetter(JSContext* cx, Heap heap, Args&&... args);
+
+  template <typename T, AllowGC allowGC>
+  static T* NewObject(JSContext* cx, AllocKind kind, Heap heap,
+                      const JSClass* clasp, AllocSite* site = nullptr);
+
+  template <typename T, AllowGC allowGC, typename... Args>
+  static T* NewTenuredCell(JSContext* cx, Args&&... args);
+
+  template <JS::TraceKind traceKind, AllowGC allowGC>
+  static void* AllocNurseryOrTenuredCell(JSContext* cx, AllocKind allocKind,
+                                         size_t thingSize, Heap heap,
+                                         AllocSite* site);
+  friend class TenuringTracer;
+
+  template <AllowGC allowGC>
+  static void* RetryNurseryAlloc(JSContext* cx, JS::TraceKind traceKind,
+                                 AllocKind allocKind, size_t thingSize,
+                                 AllocSite* site);
+  template <AllowGC allowGC>
+  static void* AllocTenuredCellForNurseryAlloc(JSContext* cx, AllocKind kind);
+
+  template <AllowGC allowGC>
+  static void* AllocTenuredCell(JSContext* cx, AllocKind kind);
+
+  template <AllowGC allowGC>
+  static void* AllocTenuredCellUnchecked(JS::Zone* zone, AllocKind kind);
+
+  static void* RetryTenuredAlloc(JS::Zone* zone, AllocKind kind);
+
+#ifdef JS_GC_ZEAL
+  static AllocSite* MaybeGenerateMissingAllocSite(JSContext* cx,
+                                                  JS::TraceKind traceKind,
+                                                  AllocSite* site);
+#endif
+
+#ifdef DEBUG
+  static void CheckIncrementalZoneState(JS::Zone* zone, void* ptr);
+#endif
+
+  static inline Heap CheckedHeap(Heap heap);
+};
+
+
+size_t GetGoodAllocSize(size_t requiredBytes);
+size_t GetGoodPower2AllocSize(size_t requiredBytes);
+size_t GetGoodElementCount(size_t requiredCount, size_t elementSize);
+size_t GetGoodPower2ElementCount(size_t requiredCount, size_t elementSize);
+void* AllocBuffer(JS::Zone* zone, size_t bytes, bool nurseryOwned);
+void* ReallocBuffer(JS::Zone* zone, void* alloc, size_t bytes,
+                    bool nurseryOwned);
+void FreeBuffer(JS::Zone* zone, void* alloc);
+
+bool IsBufferAlloc(void* alloc);
+
+#ifdef DEBUG
+bool IsBufferAllocInZone(void* alloc, JS::Zone* zone);
+#endif
+
+bool IsNurseryOwned(JS::Zone* zone, void* alloc);
+
+size_t GetAllocSize(JS::Zone* zone, const void* alloc);
+
+
+void* AllocBufferInGC(JS::Zone* zone, size_t bytes, bool nurseryOwned);
+bool IsBufferAllocMarkedBlack(JS::Zone* zone, void* alloc);
+void* TraceBufferEdgeInternal(JSTracer* trc, void** bufferp, const char* name);
+void MarkTenuredBuffer(JS::Zone* zone, void* alloc);
+
+}  
+
+
+template <typename T>
+class MutableHandleBuffer;
+
+template <typename T>
+class BufferHolder {
+  JS::Zone* zone;
+  T* buffer;
+
+  friend class MutableHandleBuffer<T>;
+
+ public:
+  BufferHolder(JS::Zone* zone, T* buffer) : zone(zone), buffer(buffer) {
+    MOZ_ASSERT_IF(buffer, IsBufferAllocInZone(buffer, zone));
+  }
+  inline BufferHolder(JSContext* cx, T* buffer);
+
+  inline void trace(JSTracer* trc);
+
+  T* get() const { return buffer; }
+  operator T*() const { return get(); }
+  T* operator->() const { return get(); }
+  T& operator*() const { return *get(); }
+};
+
+template <typename T>
+class RootedBuffer : public JS::Rooted<BufferHolder<T>> {
+  using Base = JS::Rooted<BufferHolder<T>>;
+
+ public:
+  explicit RootedBuffer(JSContext* cx, T* buffer = nullptr)
+      : Base(cx, BufferHolder<T>(cx, buffer)) {}
+  T* get() const { return Base::get().get(); }
+  operator T*() const { return get(); }
+  T* operator->() const { return get(); }
+  T& operator*() const { return *get(); }
+};
+
+template <typename T>
+class HandleBuffer : public JS::Handle<BufferHolder<T>> {
+  using Base = JS::Handle<BufferHolder<T>>;
+
+ public:
+  HandleBuffer(const HandleBuffer& other) : Base(other) {}
+  MOZ_IMPLICIT HandleBuffer(const RootedBuffer<T>& root) : Base(root) {}
+  MOZ_IMPLICIT HandleBuffer(JS::MutableHandle<BufferHolder<T>>& handle)
+      : Base(handle) {}
+
+  T* get() const { return Base::get().get(); }
+  operator T*() const { return get(); }
+  T* operator->() const { return get(); }
+  T& operator*() const { return *get(); }
+};
+
+template <typename T>
+class MutableHandleBuffer : public JS::MutableHandle<BufferHolder<T>> {
+  using Base = JS::MutableHandle<BufferHolder<T>>;
+
+ public:
+  MutableHandleBuffer(const MutableHandleBuffer& other) : Base(other) {}
+  MOZ_IMPLICIT MutableHandleBuffer(RootedBuffer<T>* root) : Base(root) {}
+
+  void set(T* buffer) {
+    BufferHolder<T>& holder = Base::get();
+    MOZ_ASSERT_IF(buffer, IsBufferAllocInZone(buffer, holder.zone));
+    holder.buffer = buffer;
+  }
+  T* get() const { return Base::get().get(); }
+  operator T*() const { return get(); }
+  T* operator->() const { return get(); }
+  T& operator*() const { return *get(); }
+};
+
+}  
+
+#endif  // gc_Allocator_h

@@ -1,0 +1,79 @@
+
+[package]
+edition = "2021"
+rust-version = "1.71"
+name = "gpu-allocator"
+version = "0.28.0"
+authors = ["Traverse Research <opensource@traverseresearch.nl>"]
+build = false
+include = [
+    "/LICENSE-*",
+    "/src",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Memory allocator for Vulkan GPU memory"
+homepage = "https://github.com/Traverse-Research/gpu-allocator"
+documentation = "https://docs.rs/gpu-allocator/"
+keywords = [
+    "vulkan",
+    "memory",
+    "allocator",
+]
+categories = [
+    "rendering",
+    "rendering::graphics-api",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Traverse-Research/gpu-allocator"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+hashbrown = ["dep:hashbrown"]
+std = ["presser/std"]
+visualizer = [
+    "dep:egui",
+    "dep:egui_extras",
+]
+vulkan = ["dep:ash"]
+
+[lib]
+name = "gpu_allocator"
+path = "src/lib.rs"
+
+[dependencies.ash]
+version = "0.38"
+features = ["debug"]
+optional = true
+default-features = false
+
+[dependencies.egui]
+version = ">=0.24, <=0.27"
+optional = true
+default-features = false
+
+[dependencies.egui_extras]
+version = ">=0.24, <=0.27"
+optional = true
+default-features = false
+
+[dependencies.hashbrown]
+version = "0.16.0"
+optional = true
+
+[dependencies.log]
+version = "0.4"
+default-features = false
+
+[dependencies.presser]
+version = "0.3"
+default-features = false
+
+[dependencies.thiserror]
+version = "2.0"
+default-features = false

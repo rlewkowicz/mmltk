@@ -1,0 +1,222 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+*   Copyright (C) 1997-2015, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+**********************************************************************
+*
+* File UMUTEX.H
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   04/02/97  aliu        Creation.
+*   04/07/99  srl         rewrite - C interface, multiple mutices
+*   05/13/99  stephen     Changed to umutex (from cmutex)
+******************************************************************************
+*/
+
+#ifndef UMUTEX_H
+#define UMUTEX_H
+
+#ifndef __wasi__
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#endif
+
+#include <type_traits>
+
+#include "unicode/utypes.h"
+#include "unicode/uclean.h"
+#include "unicode/uobject.h"
+
+#include "putilimp.h"
+
+#if defined(U_USER_ATOMICS_H) || defined(U_USER_MUTEX_H)
+#error U_USER_ATOMICS and U_USER_MUTEX_H are not supported
+#endif
+
+U_NAMESPACE_BEGIN
+
+
+#ifndef __wasi__
+
+typedef std::atomic<int32_t> u_atomic_int32_t;
+
+inline int32_t umtx_loadAcquire(u_atomic_int32_t &var) {
+    return var.load(std::memory_order_acquire);
+}
+
+inline void umtx_storeRelease(u_atomic_int32_t &var, int32_t val) {
+    var.store(val, std::memory_order_release);
+}
+
+inline int32_t umtx_atomic_inc(u_atomic_int32_t *var) {
+    return var->fetch_add(1) + 1;
+}
+
+inline int32_t umtx_atomic_dec(u_atomic_int32_t *var) {
+    return var->fetch_sub(1) - 1;
+}
+
+#else
+
+typedef int32_t u_atomic_int32_t;
+
+inline int32_t umtx_loadAcquire(u_atomic_int32_t &var) {
+    return var;
+}
+
+inline void umtx_storeRelease(u_atomic_int32_t &var, int32_t val) {
+    var = val;
+}
+
+inline int32_t umtx_atomic_inc(u_atomic_int32_t *var) {
+    return ++(*var);
+}
+
+inline int32_t umtx_atomic_dec(u_atomic_int32_t *var) {
+    return --(*var);
+}
+
+#endif
+
+
+struct U_COMMON_API_CLASS UInitOnce {
+private:
+    friend U_COMMON_API UBool U_EXPORT2 umtx_initImplPreInit(UInitOnce&);
+    friend U_COMMON_API void U_EXPORT2 umtx_initImplPostInit(UInitOnce&);
+    template <typename T> friend void umtx_initOnce(UInitOnce&, T*, void (T::*)());
+    friend void umtx_initOnce(UInitOnce&, void (*)());
+    friend void umtx_initOnce(UInitOnce&, void (*)(UErrorCode&), UErrorCode&);
+    template <typename T> friend void umtx_initOnce(UInitOnce&, void (*)(T), T);
+    template <typename T> friend void umtx_initOnce(UInitOnce&, void (*)(T, UErrorCode&), T, UErrorCode&);
+
+    u_atomic_int32_t fState{0};
+    UErrorCode fErrCode{U_ZERO_ERROR};
+
+public:
+    U_COMMON_API void reset() { fState = 0; }
+    U_COMMON_API UBool isReset() { return umtx_loadAcquire(fState) == 0; }
+};
+
+U_COMMON_API UBool U_EXPORT2 umtx_initImplPreInit(UInitOnce &);
+U_COMMON_API void  U_EXPORT2 umtx_initImplPostInit(UInitOnce &);
+
+template<class T> void umtx_initOnce(UInitOnce &uio, T *obj, void (U_CALLCONV T::*fp)()) {
+    if (umtx_loadAcquire(uio.fState) == 2) {
+        return;
+    }
+    if (umtx_initImplPreInit(uio)) {
+        (obj->*fp)();
+        umtx_initImplPostInit(uio);
+    }
+}
+
+
+inline void umtx_initOnce(UInitOnce &uio, void (U_CALLCONV *fp)()) {
+    if (umtx_loadAcquire(uio.fState) == 2) {
+        return;
+    }
+    if (umtx_initImplPreInit(uio)) {
+        (*fp)();
+        umtx_initImplPostInit(uio);
+    }
+}
+
+inline void umtx_initOnce(UInitOnce &uio, void (U_CALLCONV *fp)(UErrorCode &), UErrorCode &errCode) {
+    if (U_FAILURE(errCode)) {
+        return;
+    }
+    if (umtx_loadAcquire(uio.fState) != 2 && umtx_initImplPreInit(uio)) {
+        (*fp)(errCode);
+        uio.fErrCode = errCode;
+        umtx_initImplPostInit(uio);
+    } else {
+        if (U_FAILURE(uio.fErrCode)) {
+            errCode = uio.fErrCode;
+        }
+    }
+}
+
+template<class T> void umtx_initOnce(UInitOnce &uio, void (U_CALLCONV *fp)(T), T context) {
+    if (umtx_loadAcquire(uio.fState) == 2) {
+        return;
+    }
+    if (umtx_initImplPreInit(uio)) {
+        (*fp)(context);
+        umtx_initImplPostInit(uio);
+    }
+}
+
+template<class T> void umtx_initOnce(UInitOnce &uio, void (U_CALLCONV *fp)(T, UErrorCode &), T context, UErrorCode &errCode) {
+    if (U_FAILURE(errCode)) {
+        return;
+    }
+    if (umtx_loadAcquire(uio.fState) != 2 && umtx_initImplPreInit(uio)) {
+        (*fp)(context, errCode);
+        uio.fErrCode = errCode;
+        umtx_initImplPostInit(uio);
+    } else {
+        if (U_FAILURE(uio.fErrCode)) {
+            errCode = uio.fErrCode;
+        }
+    }
+}
+
+#if (defined(_CPPLIB_VER) && !defined(_MSVC_STL_VERSION)) || \
+    (defined(_MSVC_STL_VERSION) && _MSVC_STL_VERSION < 142)
+#   define UMUTEX_CONSTEXPR
+#else
+#   define UMUTEX_CONSTEXPR constexpr
+#endif
+
+
+class U_COMMON_API_CLASS UMutex {
+public:
+    U_COMMON_API UMUTEX_CONSTEXPR UMutex() {}
+    U_COMMON_API ~UMutex() = default;
+
+    UMutex(const UMutex& other) = delete;
+    UMutex& operator=(const UMutex& other) = delete;
+    void* operator new(size_t) = delete;
+
+    U_COMMON_API void lock() {
+#ifndef __wasi__
+        std::mutex *m = fMutex.load(std::memory_order_acquire);
+        if (m == nullptr) { m = getMutex(); }
+        m->lock();
+#endif
+    }
+    U_COMMON_API void unlock() {
+#ifndef __wasi__
+        fMutex.load(std::memory_order_relaxed)->unlock();
+#endif
+    }
+
+    U_COMMON_API static void cleanup();
+
+private:
+#ifndef __wasi__
+    alignas(std::mutex) char fStorage[sizeof(std::mutex)] {};
+    std::atomic<std::mutex *> fMutex { nullptr };
+#endif
+
+    UMutex *fListLink { nullptr };
+    static UMutex *gListHead;
+
+#ifndef __wasi__
+    std::mutex *getMutex();
+#endif
+};
+
+
+U_CAPI void U_EXPORT2 umtx_lock(UMutex* mutex);
+
+U_CAPI void U_EXPORT2 umtx_unlock (UMutex* mutex);
+
+
+U_NAMESPACE_END
+
+#endif /* UMUTEX_H */

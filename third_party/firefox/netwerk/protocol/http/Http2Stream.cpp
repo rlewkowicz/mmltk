@@ -1,0 +1,122 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HttpLog.h"
+
+#include "Http2Stream.h"
+#include "nsHttp.h"
+#include "nsHttpConnectionInfo.h"
+#include "nsHttpRequestHead.h"
+#include "nsISocketTransport.h"
+#include "Http2Session.h"
+#include "nsIRequestContext.h"
+#include "nsHttpTransaction.h"
+#include "nsSocketTransportService2.h"
+
+namespace mozilla::net {
+
+Http2Stream::Http2Stream(nsAHttpTransaction* httpTransaction,
+                         Http2Session* session, int32_t priority, uint64_t bcId)
+    : Http2StreamBase((httpTransaction->QueryHttpTransaction())
+                          ? httpTransaction->QueryHttpTransaction()->BrowserId()
+                          : 0,
+                      session, priority, bcId),
+      mTransaction(httpTransaction) {
+  LOG1(("Http2Stream::Http2Stream %p trans=%p", this, httpTransaction));
+}
+
+Http2Stream::~Http2Stream() = default;
+
+void Http2Stream::CloseStream(nsresult reason) {
+  if (reason == NS_ERROR_NET_RESET &&
+      mTransaction->ConnectionInfo()->IsHttp3ProxyConnection()) {
+    mTransaction->DoNotRemoveAltSvc();
+  }
+  mTransaction->Close(reason);
+  mSession = nullptr;
+  mClosed = true;
+}
+
+uint32_t Http2Stream::GetWireStreamId() {
+  if (!mStreamID) {
+    return 0;
+  }
+
+  if (mState == RESERVED_BY_REMOTE) {
+    return 0;
+  }
+  return mStreamID;
+}
+
+nsresult Http2Stream::OnWriteSegment(char* buf, uint32_t count,
+                                     uint32_t* countWritten) {
+  LOG3(("Http2Stream::OnWriteSegment %p count=%d state=%x 0x%X\n", this, count,
+        mUpstreamState, mStreamID));
+
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+  MOZ_ASSERT(mSegmentWriter);
+
+  return Http2StreamBase::OnWriteSegment(buf, count, countWritten);
+}
+
+nsresult Http2Stream::CallToReadData(uint32_t count, uint32_t* countRead) {
+  return mTransaction->ReadSegments(this, count, countRead);
+}
+
+nsresult Http2Stream::CallToWriteData(uint32_t count, uint32_t* countWritten) {
+  return mTransaction->WriteSegments(this, count, countWritten);
+}
+
+nsresult Http2Stream::GenerateHeaders(nsCString& aCompressedData,
+                                      uint8_t& firstFrameFlags) {
+  const nsHttpRequestHead* head = mTransaction->RequestHead();
+  nsAutoCString requestURI;
+  head->RequestURI(requestURI);
+  RefPtr<Http2Session> session = Session();
+  LOG3(("Http2Stream %p Stream ID 0x%X [session=%p] for URI %s\n", this,
+        mStreamID, session.get(), requestURI.get()));
+
+  nsAutoCString authorityHeader;
+  nsresult rv = head->GetHeader(nsHttp::Host, authorityHeader);
+  if (NS_FAILED(rv)) {
+    MOZ_ASSERT(false);
+    return rv;
+  }
+
+  nsDependentCString scheme(head->IsHTTPS() ? "https" : "http");
+
+  nsAutoCString method;
+  nsAutoCString path;
+  head->Method(method);
+  head->Path(path);
+
+  bool mayAddTEHeader = true;
+  nsAutoCString teHeader;
+  rv = head->GetHeader(nsHttp::TE, teHeader);
+  if (NS_SUCCEEDED(rv) && teHeader.Equals("moz_no_te_trailers"_ns)) {
+    mayAddTEHeader = false;
+  }
+
+  rv = session->Compressor()->EncodeHeaderBlock(
+      mFlatHttpRequestHeaders, method, path, authorityHeader, scheme,
+      EmptyCString(), false, aCompressedData, mayAddTEHeader);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  int64_t clVal = session->Compressor()->GetParsedContentLength();
+  if (clVal != -1) {
+    mRequestBodyLenRemaining = clVal;
+  }
+
+
+  if (head->IsGet() || head->IsHead()) {
+    firstFrameFlags |= Http2Session::kFlag_END_STREAM;
+  } else if (head->IsPost() || head->IsPut() || head->IsConnect()) {
+  } else if (!mRequestBodyLenRemaining) {
+    firstFrameFlags |= Http2Session::kFlag_END_STREAM;
+  }
+
+  return NS_OK;
+}
+
+}  

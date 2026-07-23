@@ -1,0 +1,290 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MultipartImage.h"
+
+#include "imgINotificationObserver.h"
+
+namespace mozilla {
+
+using gfx::IntSize;
+using gfx::SourceSurface;
+
+namespace image {
+
+
+static void FinishPotentialVectorImage(Image* aImage) {
+  if (!aImage || aImage->GetType() != imgIContainer::TYPE_VECTOR) {
+    return;
+  }
+
+  RefPtr<ProgressTracker> tracker = aImage->GetProgressTracker();
+  if (tracker && !(tracker->GetProgress() & FLAG_LOAD_COMPLETE)) {
+    Progress loadProgress =
+        LoadCompleteProgress( false,  false,
+                              NS_OK);
+    tracker->SyncNotifyProgress(loadProgress | FLAG_SIZE_AVAILABLE);
+  }
+}
+
+class NextPartObserver : public IProgressObserver {
+ public:
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(NextPartObserver)
+  NS_INLINE_DECL_REFCOUNTING(NextPartObserver, override)
+
+  explicit NextPartObserver(MultipartImage* aOwner) : mOwner(aOwner) {
+    MOZ_ASSERT(mOwner);
+  }
+
+  void BeginObserving(Image* aImage) {
+    MOZ_ASSERT(aImage);
+    mImage = aImage;
+
+    RefPtr<ProgressTracker> tracker = mImage->GetProgressTracker();
+    tracker->AddObserver(this);
+  }
+
+  void BlockUntilDecodedAndFinishObserving() {
+    mImage->RequestDecodeForSize(gfx::IntSize(0, 0),
+                                 imgIContainer::FLAG_SYNC_DECODE);
+
+    FinishPotentialVectorImage(mImage);
+
+    if (mImage) {
+      FinishObserving();
+    }
+  }
+
+  virtual void Notify(int32_t aType,
+                      const nsIntRect* aRect = nullptr) override {
+    if (!mImage) {
+      return;
+    }
+
+    if (aType != imgINotificationObserver::FRAME_COMPLETE) {
+      return;
+    }
+
+    if (mImage && mImage->GetType() == imgIContainer::TYPE_VECTOR) {
+      RefPtr<ProgressTracker> tracker = mImage->GetProgressTracker();
+      if (tracker && !(tracker->GetProgress() & FLAG_LOAD_COMPLETE)) {
+        return;
+      }
+    }
+
+    FinishObserving();
+  }
+
+  virtual void OnLoadComplete(bool aLastPart) override {
+    if (!mImage) {
+      return;
+    }
+
+    int32_t width = 0;
+    int32_t height = 0;
+    mImage->GetWidth(&width);
+    mImage->GetHeight(&height);
+
+    mImage->RequestDecodeForSize(IntSize(width, height),
+                                 imgIContainer::DECODE_FLAGS_DEFAULT |
+                                     imgIContainer::FLAG_HIGH_QUALITY_SCALING);
+
+    RefPtr<ProgressTracker> tracker = mImage->GetProgressTracker();
+    if (tracker->GetProgress() & FLAG_HAS_ERROR) {
+      FinishObserving();
+      return;
+    }
+
+    if (mImage && mImage->GetType() == imgIContainer::TYPE_VECTOR &&
+        (tracker->GetProgress() & FLAG_FRAME_COMPLETE)) {
+      FinishObserving();
+    }
+  }
+
+  virtual void SetHasImage() override {}
+  virtual bool NotificationsDeferred() const override { return false; }
+  virtual void MarkPendingNotify() override {}
+  virtual void ClearPendingNotify() override {}
+
+ private:
+  virtual ~NextPartObserver() = default;
+
+  void FinishObserving() {
+    MOZ_ASSERT(mImage);
+
+    RefPtr<ProgressTracker> tracker = mImage->GetProgressTracker();
+    tracker->RemoveObserver(this);
+    mImage = nullptr;
+
+    mOwner->FinishTransition();
+  }
+
+  MultipartImage* mOwner;
+  RefPtr<Image> mImage;
+};
+
+
+MultipartImage::MultipartImage(Image* aFirstPart)
+    : ImageWrapper(aFirstPart), mPendingNotify(false) {
+  mNextPartObserver = new NextPartObserver(this);
+}
+
+void MultipartImage::Init() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mTracker, "Should've called SetProgressTracker() by now");
+
+  RefPtr<ProgressTracker> firstPartTracker = InnerImage()->GetProgressTracker();
+  firstPartTracker->AddObserver(this);
+  InnerImage()->IncrementAnimationConsumers();
+}
+
+MultipartImage::~MultipartImage() {
+  mTracker->ResetImage();
+}
+
+NS_IMPL_ISUPPORTS_INHERITED0(MultipartImage, ImageWrapper)
+
+void MultipartImage::BeginTransitionToPart(Image* aNextPart) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aNextPart);
+
+  if (mNextPart) {
+    mNextPartObserver->BlockUntilDecodedAndFinishObserving();
+    MOZ_ASSERT(!mNextPart);
+  }
+
+  mNextPart = aNextPart;
+
+  mNextPartObserver->BeginObserving(mNextPart);
+  mNextPart->IncrementAnimationConsumers();
+}
+
+static Progress FilterProgress(Progress aProgress) {
+  return aProgress & ~FLAG_HAS_ERROR;
+}
+
+void MultipartImage::FinishTransition() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mNextPart, "Should have a next part here");
+
+  RefPtr<ProgressTracker> newCurrentPartTracker =
+      mNextPart->GetProgressTracker();
+  if (newCurrentPartTracker->GetProgress() & FLAG_HAS_ERROR) {
+    mNextPart = nullptr;
+
+    mTracker->ResetForNewRequest();
+    RefPtr<ProgressTracker> currentPartTracker =
+        InnerImage()->GetProgressTracker();
+    mTracker->SyncNotifyProgress(
+        FilterProgress(currentPartTracker->GetProgress()));
+
+    return;
+  }
+
+  FinishPotentialVectorImage(InnerImage());
+
+  {
+    RefPtr<ProgressTracker> currentPartTracker =
+        InnerImage()->GetProgressTracker();
+    currentPartTracker->RemoveObserver(this);
+  }
+
+  mTracker->ResetForNewRequest();
+  SetInnerImage(mNextPart);
+  mNextPart = nullptr;
+  newCurrentPartTracker->AddObserver(this);
+
+  mTracker->SyncNotifyProgress(
+      FilterProgress(newCurrentPartTracker->GetProgress()),
+      GetMaxSizedIntRect());
+}
+
+already_AddRefed<imgIContainer> MultipartImage::Unwrap() {
+  nsCOMPtr<imgIContainer> image = this;
+  return image.forget();
+}
+
+already_AddRefed<ProgressTracker> MultipartImage::GetProgressTracker() {
+  MOZ_ASSERT(mTracker);
+  RefPtr<ProgressTracker> tracker = mTracker;
+  return tracker.forget();
+}
+
+void MultipartImage::SetProgressTracker(ProgressTracker* aTracker) {
+  MOZ_ASSERT(aTracker);
+  MOZ_ASSERT(!mTracker);
+  mTracker = aTracker;
+}
+
+nsresult MultipartImage::OnImageDataAvailable(nsIRequest* aRequest,
+                                              nsIInputStream* aInStr,
+                                              uint64_t aSourceOffset,
+                                              uint32_t aCount) {
+
+  RefPtr<Image> nextPart = mNextPart;
+  if (nextPart) {
+    nextPart->OnImageDataAvailable(aRequest, aInStr, aSourceOffset, aCount);
+  } else {
+    InnerImage()->OnImageDataAvailable(aRequest, aInStr, aSourceOffset, aCount);
+  }
+
+  return NS_OK;
+}
+
+nsresult MultipartImage::OnImageDataComplete(nsIRequest* aRequest,
+                                             nsresult aStatus, bool aLastPart) {
+
+  RefPtr<Image> nextPart = mNextPart;
+  if (nextPart) {
+    nextPart->OnImageDataComplete(aRequest, aStatus, aLastPart);
+  } else {
+    InnerImage()->OnImageDataComplete(aRequest, aStatus, aLastPart);
+  }
+
+  return NS_OK;
+}
+
+void MultipartImage::Notify(int32_t aType,
+                            const nsIntRect* aRect ) {
+  if (aType == imgINotificationObserver::SIZE_AVAILABLE) {
+    mTracker->SyncNotifyProgress(FLAG_SIZE_AVAILABLE);
+  } else if (aType == imgINotificationObserver::FRAME_UPDATE) {
+    mTracker->SyncNotifyProgress(NoProgress, *aRect);
+  } else if (aType == imgINotificationObserver::FRAME_COMPLETE) {
+    mTracker->SyncNotifyProgress(FLAG_FRAME_COMPLETE);
+  } else if (aType == imgINotificationObserver::LOAD_COMPLETE) {
+    mTracker->SyncNotifyProgress(FLAG_LOAD_COMPLETE);
+  } else if (aType == imgINotificationObserver::DECODE_COMPLETE) {
+    mTracker->SyncNotifyProgress(FLAG_DECODE_COMPLETE);
+  } else if (aType == imgINotificationObserver::DISCARD) {
+    mTracker->OnDiscard();
+  } else if (aType == imgINotificationObserver::UNLOCKED_DRAW) {
+    mTracker->OnUnlockedDraw();
+  } else if (aType == imgINotificationObserver::IS_ANIMATED) {
+    mTracker->SyncNotifyProgress(FLAG_IS_ANIMATED);
+  } else if (aType == imgINotificationObserver::HAS_TRANSPARENCY) {
+    mTracker->SyncNotifyProgress(FLAG_HAS_TRANSPARENCY);
+  } else {
+    MOZ_ASSERT_UNREACHABLE("Notification list should be exhaustive");
+  }
+}
+
+void MultipartImage::OnLoadComplete(bool aLastPart) {
+  Progress progress = FLAG_LOAD_COMPLETE;
+  if (aLastPart) {
+    progress |= FLAG_LAST_PART_COMPLETE;
+  }
+  mTracker->SyncNotifyProgress(progress);
+}
+
+void MultipartImage::SetHasImage() { mTracker->OnImageAvailable(); }
+
+bool MultipartImage::NotificationsDeferred() const { return mPendingNotify; }
+
+void MultipartImage::MarkPendingNotify() { mPendingNotify = true; }
+
+void MultipartImage::ClearPendingNotify() { mPendingNotify = false; }
+
+}  
+}  

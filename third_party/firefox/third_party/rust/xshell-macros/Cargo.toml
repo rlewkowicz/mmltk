@@ -1,0 +1,20 @@
+
+[package]
+edition = "2021"
+rust-version = "1.59"
+name = "xshell-macros"
+version = "0.2.7"
+authors = ["Aleksey Kladov <aleksey.kladov@gmail.com>"]
+build = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Private implementation detail of xshell crate"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/matklad/xshell"
+
+[lib]
+name = "xshell_macros"
+path = "src/lib.rs"
+proc-macro = true

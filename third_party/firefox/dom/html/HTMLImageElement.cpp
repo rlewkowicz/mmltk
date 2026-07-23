@@ -1,0 +1,1064 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/HTMLImageElement.h"
+
+#include "imgLoader.h"
+#include "mozilla/FocusModel.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/dom/BindContext.h"
+#include "mozilla/dom/BindingUtils.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/HTMLFormElement.h"
+#include "mozilla/dom/HTMLImageElementBinding.h"
+#include "mozilla/dom/NameSpaceConstants.h"
+#include "mozilla/dom/UnbindContext.h"
+#include "mozilla/dom/UserActivation.h"
+#include "nsAttrValueOrString.h"
+#include "nsContainerFrame.h"
+#include "nsContentUtils.h"
+#include "nsFocusManager.h"
+#include "nsGenericHTMLElement.h"
+#include "nsGkAtoms.h"
+#include "nsIMutationObserver.h"
+#include "nsIURIWithSizeOf.h"
+#include "nsImageFrame.h"
+#include "nsNodeInfoManager.h"
+#include "nsPresContext.h"
+#include "nsSize.h"
+
+#include "imgINotificationObserver.h"
+#include "imgRequestProxy.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/MappedDeclarationsBuilder.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/RestyleManager.h"
+#include "mozilla/dom/HTMLSourceElement.h"
+#include "mozilla/dom/ResponsiveImageSelector.h"
+#include "nsLayoutUtils.h"
+
+using namespace mozilla::net;
+using mozilla::Maybe;
+
+NS_IMPL_NS_NEW_HTML_ELEMENT(Image)
+
+#ifdef DEBUG
+static bool IsPreviousSibling(const nsINode* aSubject, const nsINode* aNode) {
+  if (aSubject == aNode) {
+    return false;
+  }
+
+  nsINode* parent = aSubject->GetParentNode();
+  if (parent && parent == aNode->GetParentNode()) {
+    const Maybe<uint32_t> indexOfSubject = parent->ComputeIndexOf(aSubject);
+    const Maybe<uint32_t> indexOfNode = parent->ComputeIndexOf(aNode);
+    if (MOZ_LIKELY(indexOfSubject.isSome() && indexOfNode.isSome())) {
+      return *indexOfSubject < *indexOfNode;
+    }
+    return indexOfSubject.isNothing() && indexOfNode.isSome();
+  }
+
+  return false;
+}
+#endif
+
+namespace mozilla::dom {
+
+HTMLImageElement::HTMLImageElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+    : nsGenericHTMLElement(std::move(aNodeInfo)) {
+  AddStatesSilently(ElementState::BROKEN);
+}
+
+HTMLImageElement::~HTMLImageElement() {
+  nsImageLoadingContent::Destroy();
+  if (mInDocResponsiveContent) {
+    OwnerDoc()->RemoveResponsiveContent(this);
+    mInDocResponsiveContent = false;
+  }
+}
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(HTMLImageElement, nsGenericHTMLElement,
+                                   mResponsiveSelector)
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED(HTMLImageElement,
+                                             nsGenericHTMLElement,
+                                             nsIImageLoadingContent,
+                                             imgINotificationObserver)
+
+NS_IMPL_ELEMENT_CLONE(HTMLImageElement)
+
+bool HTMLImageElement::IsInteractiveHTMLContent() const {
+  return HasAttr(nsGkAtoms::usemap) ||
+         nsGenericHTMLElement::IsInteractiveHTMLContent();
+}
+
+void HTMLImageElement::AsyncEventRunning(AsyncEventDispatcher* aEvent) {
+  nsImageLoadingContent::AsyncEventRunning(aEvent);
+}
+
+void HTMLImageElement::GetCurrentSrc(nsAString& aValue) {
+  nsCOMPtr<nsIURI> currentURI;
+  GetCurrentURI(getter_AddRefs(currentURI));
+  if (currentURI) {
+    nsAutoCString spec;
+    currentURI->GetSpec(spec);
+    CopyUTF8toUTF16(spec, aValue);
+  } else {
+    SetDOMStringToNull(aValue);
+  }
+}
+
+bool HTMLImageElement::Draggable() const {
+  return !AttrValueIs(kNameSpaceID_None, nsGkAtoms::draggable,
+                      nsGkAtoms::_false, eIgnoreCase);
+}
+
+bool HTMLImageElement::Complete() {
+  if (!HasAttr(nsGkAtoms::srcset) && !HasNonEmptyAttr(nsGkAtoms::src)) {
+    return true;
+  }
+
+  if (mPendingRequest || mPendingImageLoadTask) {
+    return false;
+  }
+
+  if (!mCurrentRequest) {
+    return !mLazyLoading;
+  }
+
+  uint32_t status;
+  mCurrentRequest->GetImageStatus(&status);
+  return (status &
+          (imgIRequest::STATUS_LOAD_COMPLETE | imgIRequest::STATUS_ERROR)) != 0;
+}
+
+CSSIntPoint HTMLImageElement::GetXY() {
+  nsIFrame* frame = GetPrimaryFrame(FlushType::Layout);
+  if (!frame) {
+    return CSSIntPoint(0, 0);
+  }
+  return CSSIntPoint::FromAppUnitsRounded(
+      frame->GetOffsetTo(frame->PresShell()->GetRootFrame()));
+}
+
+int32_t HTMLImageElement::X() { return GetXY().x; }
+
+int32_t HTMLImageElement::Y() { return GetXY().y; }
+
+void HTMLImageElement::GetDecoding(nsAString& aValue) {
+  GetEnumAttr(nsGkAtoms::decoding, kDecodingTableDefault->tag, aValue);
+}
+
+already_AddRefed<Promise> HTMLImageElement::Decode(ErrorResult& aRv) {
+  return nsImageLoadingContent::QueueDecodeAsync(aRv);
+}
+
+bool HTMLImageElement::ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                                      const nsAString& aValue,
+                                      nsIPrincipal* aMaybeScriptedPrincipal,
+                                      nsAttrValue& aResult) {
+  if (aNamespaceID == kNameSpaceID_None) {
+    if (aAttribute == nsGkAtoms::align) {
+      return ParseAlignValue(aValue, aResult);
+    }
+    if (aAttribute == nsGkAtoms::crossorigin) {
+      ParseCORSValue(aValue, aResult);
+      return true;
+    }
+    if (aAttribute == nsGkAtoms::decoding) {
+      return aResult.ParseEnumValue(aValue, kDecodingTable,
+                                     false,
+                                    kDecodingTableDefault);
+    }
+    if (aAttribute == nsGkAtoms::loading) {
+      return ParseLoadingAttribute(aValue, aResult);
+    }
+    if (aAttribute == nsGkAtoms::fetchpriority) {
+      ParseFetchPriority(aValue, aResult);
+      return true;
+    }
+    if (ParseImageAttribute(aAttribute, aValue, aResult)) {
+      return true;
+    }
+  }
+
+  return nsGenericHTMLElement::ParseAttribute(aNamespaceID, aAttribute, aValue,
+                                              aMaybeScriptedPrincipal, aResult);
+}
+
+void HTMLImageElement::MapAttributesIntoRule(
+    MappedDeclarationsBuilder& aBuilder) {
+  MapImageAlignAttributeInto(aBuilder);
+  MapImageBorderAttributeInto(aBuilder);
+  MapImageMarginAttributeInto(aBuilder);
+  MapImageSizeAttributesInto(aBuilder, MapAspectRatio::Yes);
+  MapCommonAttributesInto(aBuilder);
+}
+
+nsChangeHint HTMLImageElement::GetAttributeChangeHint(
+    const nsAtom* aAttribute, AttrModType aModType) const {
+  nsChangeHint retval =
+      nsGenericHTMLElement::GetAttributeChangeHint(aAttribute, aModType);
+  if (aAttribute == nsGkAtoms::usemap || aAttribute == nsGkAtoms::ismap) {
+    retval |= nsChangeHint_ReconstructFrame;
+  } else if (aAttribute == nsGkAtoms::alt) {
+    if (IsAdditionOrRemoval(aModType)) {
+      retval |= nsChangeHint_ReconstructFrame;
+    }
+  }
+  return retval;
+}
+
+NS_IMETHODIMP_(bool)
+HTMLImageElement::IsAttributeMapped(const nsAtom* aAttribute) const {
+  static const MappedAttributeEntry* const map[] = {
+      sCommonAttributeMap, sImageMarginSizeAttributeMap,
+      sImageBorderAttributeMap, sImageAlignAttributeMap};
+
+  return FindAttributeDependence(aAttribute, map);
+}
+
+nsMapRuleToAttributesFunc HTMLImageElement::GetAttributeMappingFunction()
+    const {
+  return &MapAttributesIntoRule;
+}
+
+void HTMLImageElement::BeforeSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                                     const nsAttrValue* aValue, bool aNotify) {
+  if (aNameSpaceID == kNameSpaceID_None && mForm &&
+      (aName == nsGkAtoms::name || aName == nsGkAtoms::id)) {
+    if (const auto* old = GetParsedAttr(aName); old && !old->IsEmptyString()) {
+      mForm->RemoveImageElementFromTable(
+          this, nsDependentAtomString(old->GetAtomValue()));
+    }
+  }
+
+  return nsGenericHTMLElement::BeforeSetAttr(aNameSpaceID, aName, aValue,
+                                             aNotify);
+}
+
+void HTMLImageElement::AfterSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                                    const nsAttrValue* aValue,
+                                    const nsAttrValue* aOldValue,
+                                    nsIPrincipal* aMaybeScriptedPrincipal,
+                                    bool aNotify) {
+  if (aNameSpaceID != kNameSpaceID_None) {
+    return nsGenericHTMLElement::AfterSetAttr(aNameSpaceID, aName, aValue,
+                                              aOldValue,
+                                              aMaybeScriptedPrincipal, aNotify);
+  }
+
+  nsAttrValueOrString attrVal(aValue);
+  if (aName == nsGkAtoms::src) {
+    mSrcURI = nullptr;
+    if (aValue && !aValue->IsEmptyString()) {
+      StringToURI(attrVal.String(), OwnerDoc(), getter_AddRefs(mSrcURI));
+    }
+  }
+
+  if (aValue) {
+    AfterMaybeChangeAttr(aNameSpaceID, aName, attrVal, aOldValue,
+                         aMaybeScriptedPrincipal, aNotify);
+  }
+
+  if (mForm && (aName == nsGkAtoms::name || aName == nsGkAtoms::id) && aValue &&
+      !aValue->IsEmptyString()) {
+    MOZ_ASSERT(aValue->Type() == nsAttrValue::eAtom,
+               "Expected atom value for name/id");
+    mForm->AddImageElementToTable(
+        this, nsDependentAtomString(aValue->GetAtomValue()));
+  }
+
+  bool forceReload = false;
+  if (aName == nsGkAtoms::loading) {
+    if (aValue && Loading(aValue->GetEnumValue()) == Loading::Lazy) {
+      SetLazyLoading();
+    } else if (aOldValue &&
+               Loading(aOldValue->GetEnumValue()) == Loading::Lazy) {
+      StopLazyLoading(StartLoad(aNotify));
+    }
+    UpdateAutoSizeObserver();
+  } else if (aName == nsGkAtoms::src && !aValue) {
+    if (mResponsiveSelector && mResponsiveSelector->Content() == this) {
+      mResponsiveSelector->SetDefaultSource(VoidString());
+    }
+    forceReload = true;
+  } else if (aName == nsGkAtoms::srcset) {
+    mUseUrgentStartForChannel = UserActivation::IsHandlingUserInput();
+
+    mSrcsetTriggeringPrincipal = aMaybeScriptedPrincipal;
+
+    if (aValue) {
+      if (!mInDocResponsiveContent) {
+        OwnerDoc()->AddResponsiveContent(this);
+        mInDocResponsiveContent = true;
+      }
+    } else if (mInDocResponsiveContent && !IsInPicture()) {
+      OwnerDoc()->RemoveResponsiveContent(this);
+      mInDocResponsiveContent = false;
+    }
+
+    PictureSourceSrcsetChanged(this, attrVal.String(), aNotify);
+  } else if (aName == nsGkAtoms::sizes) {
+    mUseUrgentStartForChannel = UserActivation::IsHandlingUserInput();
+
+    UpdateAutoSizeObserver();
+    PictureSourceSizesChanged(this, attrVal.String(), aNotify);
+  } else if (aName == nsGkAtoms::decoding) {
+    SetSyncDecodingHint(
+        aValue && static_cast<ImageDecodingType>(aValue->GetEnumValue()) ==
+                      ImageDecodingType::Sync);
+  } else if (aName == nsGkAtoms::referrerpolicy) {
+    ReferrerPolicy referrerPolicy = GetReferrerPolicyAsEnum();
+    forceReload = referrerPolicy != ReferrerPolicy::_empty &&
+                  referrerPolicy != ReferrerPolicyFromAttr(aOldValue);
+  } else if (aName == nsGkAtoms::crossorigin) {
+    forceReload = GetCORSMode() != AttrValueToCORSMode(aOldValue);
+  }
+
+  if (forceReload) {
+    mUseUrgentStartForChannel = UserActivation::IsHandlingUserInput();
+    UpdateSourceSyncAndQueueImageTask(true, aNotify);
+  }
+
+  return nsGenericHTMLElement::AfterSetAttr(
+      aNameSpaceID, aName, aValue, aOldValue, aMaybeScriptedPrincipal, aNotify);
+}
+
+void HTMLImageElement::OnAttrSetButNotChanged(int32_t aNamespaceID,
+                                              nsAtom* aName,
+                                              const nsAttrValueOrString& aValue,
+                                              bool aNotify) {
+  AfterMaybeChangeAttr(aNamespaceID, aName, aValue, nullptr, nullptr, aNotify);
+  return nsGenericHTMLElement::OnAttrSetButNotChanged(aNamespaceID, aName,
+                                                      aValue, aNotify);
+}
+
+void HTMLImageElement::AfterMaybeChangeAttr(
+    int32_t aNamespaceID, nsAtom* aName, const nsAttrValueOrString& aValue,
+    const nsAttrValue* aOldValue, nsIPrincipal* aMaybeScriptedPrincipal,
+    bool aNotify) {
+  if (aNamespaceID != kNameSpaceID_None || aName != nsGkAtoms::src) {
+    return;
+  }
+
+  mSrcTriggeringPrincipal = nsContentUtils::GetAttrTriggeringPrincipal(
+      this, aValue.String(), aMaybeScriptedPrincipal);
+
+  if (mResponsiveSelector && mResponsiveSelector->Content() == this) {
+    mResponsiveSelector->SetDefaultSource(mSrcURI, mSrcTriggeringPrincipal);
+  }
+  mUseUrgentStartForChannel = UserActivation::IsHandlingUserInput();
+  UpdateSourceSyncAndQueueImageTask(true, aNotify);
+}
+
+void HTMLImageElement::GetEventTargetParent(EventChainPreVisitor& aVisitor) {
+  WidgetMouseEvent* mouseEvent = aVisitor.mEvent->AsMouseEvent();
+  if (mouseEvent && mouseEvent->IsLeftClickEvent() && IsMap()) {
+    mouseEvent->mFlags.mMultipleActionsPrevented = true;
+  }
+  nsGenericHTMLElement::GetEventTargetParent(aVisitor);
+}
+
+nsINode* HTMLImageElement::GetScopeChainParent() const {
+  if (mForm) {
+    return mForm;
+  }
+  return nsGenericHTMLElement::GetScopeChainParent();
+}
+
+bool HTMLImageElement::IsHTMLFocusable(IsFocusableFlags aFlags,
+                                       bool* aIsFocusable, int32_t* aTabIndex) {
+  int32_t tabIndex = TabIndex();
+
+  if (IsInComposedDoc() && FindImageMap()) {
+    *aTabIndex = FocusModel::IsTabFocusable(TabFocusableType::Links) ? 0 : -1;
+    *aIsFocusable = false;
+    return false;
+  }
+
+  *aTabIndex = FocusModel::IsTabFocusable(TabFocusableType::FormElements)
+                   ? tabIndex
+                   : -1;
+  *aIsFocusable = IsFormControlDefaultFocusable(aFlags) &&
+                  (tabIndex >= 0 || GetTabIndexAttrValue().isSome());
+
+  return false;
+}
+
+nsresult HTMLImageElement::BindToTree(BindContext& aContext, nsINode& aParent) {
+  MOZ_TRY(nsGenericHTMLElement::BindToTree(aContext, aParent));
+
+  nsImageLoadingContent::BindToTree(aContext, aParent);
+
+  UpdateFormOwner();
+
+  UpdateAutoSizeObserver();
+  if (IsInPicture()) {
+    if (!mInDocResponsiveContent) {
+      aContext.OwnerDoc().AddResponsiveContent(this);
+      mInDocResponsiveContent = true;
+    }
+    mUseUrgentStartForChannel = UserActivation::IsHandlingUserInput();
+    UpdateSourceSyncAndQueueImageTask(false,  false);
+  }
+  if (mLazyLoading) {
+    LazyLoadingElementBindToTree(aContext);
+  }
+  return NS_OK;
+}
+
+void HTMLImageElement::UnbindFromTree(UnbindContext& aContext) {
+  if (mForm) {
+    if (aContext.IsUnbindRoot(this) || !FindAncestorForm(mForm)) {
+      ClearForm(true);
+    } else {
+      UnsetFlags(MAYBE_ORPHAN_FORM_ELEMENT);
+    }
+  }
+
+  if (mLazyLoading) {
+    LazyLoadingElementUnbindFromTree(aContext);
+  }
+
+  const bool wasInPicture = IsInPicture();
+
+  nsImageLoadingContent::UnbindFromTree();
+  nsGenericHTMLElement::UnbindFromTree(aContext);
+
+  UpdateAutoSizeObserver();
+
+  if (wasInPicture != IsInPicture()) {
+    MOZ_ASSERT(wasInPicture);
+    MOZ_ASSERT(aContext.IsUnbindRoot(this));
+    MOZ_ASSERT(mInDocResponsiveContent);
+    if (!HasAttr(nsGkAtoms::srcset)) {
+      aContext.OwnerDoc().RemoveResponsiveContent(this);
+      mInDocResponsiveContent = false;
+    }
+    UpdateSourceSyncAndQueueImageTask(false,  false);
+  }
+}
+
+void HTMLImageElement::UpdateFormOwner() {
+  if (!mForm) {
+    mForm = FindAncestorForm();
+  }
+
+  if (mForm && !HasFlag(ADDED_TO_FORM)) {
+    nsAutoString nameVal, idVal;
+    GetAttr(nsGkAtoms::name, nameVal);
+    GetAttr(nsGkAtoms::id, idVal);
+
+    SetFlags(ADDED_TO_FORM);
+
+    mForm->AddImageElement(this);
+
+    if (!nameVal.IsEmpty()) {
+      mForm->AddImageElementToTable(this, nameVal);
+    }
+
+    if (!idVal.IsEmpty()) {
+      mForm->AddImageElementToTable(this, idVal);
+    }
+  }
+}
+
+void HTMLImageElement::NodeInfoChanged(Document* aOldDoc) {
+  nsGenericHTMLElement::NodeInfoChanged(aOldDoc);
+
+  if (mInDocResponsiveContent) {
+    aOldDoc->RemoveResponsiveContent(this);
+    OwnerDoc()->AddResponsiveContent(this);
+  }
+
+  StopLazyLoading(StartLoad::No);
+  if (LoadingState() == Loading::Lazy) {
+    SetLazyLoading();
+  }
+
+  mSrcURI = nullptr;
+  nsAutoString src;
+  if (GetAttr(nsGkAtoms::src, src) && !src.IsEmpty()) {
+    StringToURI(src, OwnerDoc(), getter_AddRefs(mSrcURI));
+  }
+
+  UpdateSourceSyncAndQueueImageTask(true,  false);
+}
+
+already_AddRefed<HTMLImageElement> HTMLImageElement::Image(
+    const GlobalObject& aGlobal, const Optional<uint32_t>& aWidth,
+    const Optional<uint32_t>& aHeight, ErrorResult& aError) {
+  nsCOMPtr<nsPIDOMWindowInner> win = do_QueryInterface(aGlobal.GetAsSupports());
+  Document* doc;
+  if (!win || !(doc = win->GetExtantDoc())) {
+    aError.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+
+  RefPtr<mozilla::dom::NodeInfo> nodeInfo = doc->NodeInfoManager()->GetNodeInfo(
+      nsGkAtoms::img, nullptr, kNameSpaceID_XHTML, ELEMENT_NODE);
+
+  auto* nim = nodeInfo->NodeInfoManager();
+  RefPtr<HTMLImageElement> img = new (nim) HTMLImageElement(nodeInfo.forget());
+
+  if (aWidth.WasPassed()) {
+    img->SetWidth(aWidth.Value(), aError);
+    if (aError.Failed()) {
+      return nullptr;
+    }
+
+    if (aHeight.WasPassed()) {
+      img->SetHeight(aHeight.Value(), aError);
+      if (aError.Failed()) {
+        return nullptr;
+      }
+    }
+  }
+
+  return img.forget();
+}
+
+uint32_t HTMLImageElement::Height() { return GetWidthHeightForImage().height; }
+
+uint32_t HTMLImageElement::Width() { return GetWidthHeightForImage().width; }
+
+nsresult HTMLImageElement::CopyInnerTo(HTMLImageElement* aDest) {
+  MOZ_TRY(nsGenericHTMLElement::CopyInnerTo(aDest));
+
+  aDest->UpdateSourceSyncAndQueueImageTask(false,  false);
+  return NS_OK;
+}
+
+CORSMode HTMLImageElement::GetCORSMode() {
+  return AttrValueToCORSMode(GetParsedAttr(nsGkAtoms::crossorigin));
+}
+
+JSObject* HTMLImageElement::WrapNode(JSContext* aCx,
+                                     JS::Handle<JSObject*> aGivenProto) {
+  return HTMLImageElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void HTMLImageElement::SetForm(HTMLFormElement* aForm) {
+  MOZ_ASSERT(aForm, "Don't pass null here");
+  MOZ_ASSERT(!mForm && !HasFlag(ADDED_TO_FORM),
+             "We don't support switching from one non-null form to another.");
+
+  mForm = aForm;
+}
+
+void HTMLImageElement::ClearForm(bool aRemoveFromForm) {
+  NS_ASSERTION((mForm != nullptr) == HasFlag(ADDED_TO_FORM),
+               "Form control should have had flag set correctly");
+
+  if (!mForm) {
+    return;
+  }
+
+  if (aRemoveFromForm) {
+    nsAutoString nameVal, idVal;
+    GetAttr(nsGkAtoms::name, nameVal);
+    GetAttr(nsGkAtoms::id, idVal);
+
+    mForm->RemoveImageElement(this);
+
+    if (!nameVal.IsEmpty()) {
+      mForm->RemoveImageElementFromTable(this, nameVal);
+    }
+
+    if (!idVal.IsEmpty()) {
+      mForm->RemoveImageElementFromTable(this, idVal);
+    }
+  }
+
+  UnsetFlags(ADDED_TO_FORM);
+  mForm = nullptr;
+}
+
+void HTMLImageElement::UpdateSourceSyncAndQueueImageTask(
+    bool aAlwaysLoad, bool aNotify, const HTMLSourceElement* aSkippedSource) {
+  UpdateResponsiveSource(aSkippedSource);
+
+  nsImageLoadingContent::QueueImageTask(mSrcURI, mSrcTriggeringPrincipal,
+                                        HaveSrcsetOrInPicture(), aAlwaysLoad,
+                                        aNotify);
+}
+
+bool HTMLImageElement::HaveSrcsetOrInPicture() const {
+  return HasAttr(nsGkAtoms::srcset) || IsInPicture();
+}
+
+bool HTMLImageElement::SelectedSourceMatchesLast(nsIURI* aSelectedSource) {
+  if (!mLastSelectedSource || !aSelectedSource) {
+    return false;
+  }
+  bool equal = false;
+  return NS_SUCCEEDED(mLastSelectedSource->Equals(aSelectedSource, &equal)) &&
+         equal;
+}
+
+bool HTMLImageElement::AllowsAutoSizes() const {
+  if (!OwnerDoc()->AutoSizesEnabled()) {
+    return false;
+  }
+  const nsAttrValue* val = GetParsedAttr(nsGkAtoms::loading);
+  if (!val || Element::Loading(val->GetEnumValue()) != Element::Loading::Lazy) {
+    return false;
+  }
+
+  nsAutoString sizes;
+  GetAttr(nsGkAtoms::sizes, sizes);
+  ToLowerCase(sizes);
+  return StringBeginsWith(sizes, u"auto"_ns) &&
+         (sizes.Length() == 4 || sizes[4] == ',');
+}
+
+void HTMLImageElement::MaybeRecomputeAutoSizes(bool aQueueImageTask) {
+  MOZ_ASSERT(AllowsAutoSizes(), "Should only be called if allows auto sizing");
+  nsImageFrame* frame = do_QueryFrame(GetPrimaryFrame());
+  if (!frame || !mResponsiveSelector) {
+    return;
+  }
+  bool widthChanged =
+      mResponsiveSelector->SetAutoWidth(Some(frame->GetComputedSize().width));
+  if (widthChanged && aQueueImageTask) {
+    UpdateSourceSyncAndQueueImageTask(true, true);
+  }
+}
+
+void HTMLImageElement::UpdateAutoSizeObserver() {
+  bool shouldObserve = IsInComposedDoc() && AllowsAutoSizes();
+  if (shouldObserve == mObservingResize) {
+    return;
+  }
+  if (shouldObserve) {
+    OwnerDoc()->ObserveAutoSizesImage(*this);
+    mObservingResize = true;
+    MaybeRecomputeAutoSizes(false);
+  } else {
+    OwnerDoc()->UnobserveAutoSizesImage(*this);
+    if (mResponsiveSelector) {
+      mResponsiveSelector->SetAutoWidth(Nothing());
+    }
+    mObservingResize = false;
+  }
+}
+
+void HTMLImageElement::LoadSelectedImage(bool aAlwaysLoad,
+                                         bool aStopLazyLoading) {
+  MOZ_ASSERT(!UpdateResponsiveSource(),
+             "The image source should be the same because we update the "
+             "responsive source synchronously");
+
+  if (aStopLazyLoading) {
+    StopLazyLoading(StartLoad::No);
+  }
+
+  double currentDensity = mResponsiveSelector
+                              ? mResponsiveSelector->GetSelectedImageDensity()
+                              : 1.0;
+
+  nsCOMPtr<nsIURI> selectedSource;
+  nsCOMPtr<nsIPrincipal> triggeringPrincipal;
+  ImageLoadType type = eImageLoadType_Normal;
+  bool hasSrc = false;
+  if (mResponsiveSelector) {
+    selectedSource = mResponsiveSelector->GetSelectedImageURL();
+    triggeringPrincipal =
+        mResponsiveSelector->GetSelectedImageTriggeringPrincipal();
+    type = eImageLoadType_Imageset;
+  } else if (mSrcURI || HasAttr(nsGkAtoms::src)) {
+    hasSrc = true;
+    if (mSrcURI) {
+      selectedSource = mSrcURI;
+      if (HaveSrcsetOrInPicture()) {
+        type = eImageLoadType_Imageset;
+      }
+      triggeringPrincipal = mSrcTriggeringPrincipal;
+    }
+  }
+
+  if (!aAlwaysLoad && SelectedSourceMatchesLast(selectedSource)) {
+    SetDensity(currentDensity);
+    UpdateImageState(true);
+    return;
+  }
+
+  if (mLazyLoading) {
+    return;
+  }
+
+  nsresult rv = NS_ERROR_FAILURE;
+
+  const bool kNotify = true;
+  if (selectedSource || hasSrc) {
+    rv = LoadImage(selectedSource,  true, kNotify, type,
+                   triggeringPrincipal);
+  }
+
+  mLastSelectedSource = std::move(selectedSource);
+  mCurrentDensity = currentDensity;
+
+  if (NS_FAILED(rv)) {
+    CancelImageRequests(kNotify);
+  }
+}
+
+void HTMLImageElement::PictureSourceSrcsetChanged(nsIContent* aSourceNode,
+                                                  const nsAString& aNewValue,
+                                                  bool aNotify) {
+  MOZ_ASSERT(aSourceNode == this || IsPreviousSibling(aSourceNode, this),
+             "Should not be getting notifications for non-previous-siblings");
+
+  nsIContent* currentSrc =
+      mResponsiveSelector ? mResponsiveSelector->Content() : nullptr;
+
+  if (aSourceNode == currentSrc) {
+    nsCOMPtr<nsIPrincipal> principal;
+    if (aSourceNode == this) {
+      principal = mSrcsetTriggeringPrincipal;
+    } else if (auto* source = HTMLSourceElement::FromNode(aSourceNode)) {
+      principal = source->GetSrcsetTriggeringPrincipal();
+    }
+    mResponsiveSelector->SetCandidatesFromSourceSet(aNewValue, principal);
+  }
+
+  UpdateSourceSyncAndQueueImageTask(true, aNotify);
+}
+
+void HTMLImageElement::PictureSourceSizesChanged(nsIContent* aSourceNode,
+                                                 const nsAString& aNewValue,
+                                                 bool aNotify) {
+  MOZ_ASSERT(aSourceNode == this || IsPreviousSibling(aSourceNode, this),
+             "Should not be getting notifications for non-previous-siblings");
+
+  nsIContent* currentSrc =
+      mResponsiveSelector ? mResponsiveSelector->Content() : nullptr;
+
+  if (aSourceNode == currentSrc) {
+    mResponsiveSelector->SetSizesFromDescriptor(aNewValue);
+  }
+
+  UpdateSourceSyncAndQueueImageTask(true, aNotify);
+}
+
+void HTMLImageElement::PictureSourceMediaOrTypeChanged(nsIContent* aSourceNode,
+                                                       bool aNotify) {
+  MOZ_ASSERT(IsPreviousSibling(aSourceNode, this),
+             "Should not be getting notifications for non-previous-siblings");
+
+  UpdateSourceSyncAndQueueImageTask(true, aNotify);
+}
+
+void HTMLImageElement::PictureSourceDimensionChanged(
+    HTMLSourceElement* aSourceNode, bool aNotify) {
+  MOZ_ASSERT(IsPreviousSibling(aSourceNode, this),
+             "Should not be getting notifications for non-previous-siblings");
+
+  if (mResponsiveSelector && mResponsiveSelector->Content() == aSourceNode) {
+    InvalidateAttributeMapping();
+  }
+}
+
+void HTMLImageElement::PictureSourceAdded(bool aNotify,
+                                          HTMLSourceElement* aSourceNode) {
+  MOZ_ASSERT(!aSourceNode || IsPreviousSibling(aSourceNode, this),
+             "Should not be getting notifications for non-previous-siblings");
+
+  UpdateSourceSyncAndQueueImageTask(true, aNotify);
+}
+
+void HTMLImageElement::PictureSourceRemoved(bool aNotify,
+                                            HTMLSourceElement* aSourceNode) {
+  MOZ_ASSERT(!aSourceNode || IsPreviousSibling(aSourceNode, this),
+             "Should not be getting notifications for non-previous-siblings");
+  UpdateSourceSyncAndQueueImageTask(true, aNotify, aSourceNode);
+}
+
+bool HTMLImageElement::UpdateResponsiveSource(
+    const HTMLSourceElement* aSkippedSource) {
+  bool hadSelector = !!mResponsiveSelector;
+
+  nsIContent* currentSource =
+      mResponsiveSelector ? mResponsiveSelector->Content() : nullptr;
+
+  nsINode* candidateSource =
+      IsInPicture() ? GetParentElement()->GetFirstChild() : this;
+
+  RefPtr<ResponsiveImageSelector> newResponsiveSelector = nullptr;
+
+  for (; candidateSource; candidateSource = candidateSource->GetNextSibling()) {
+    if (aSkippedSource == candidateSource) {
+      continue;
+    }
+
+    if (candidateSource == currentSource) {
+      bool changed = mResponsiveSelector->SelectImage(true);
+      if (mResponsiveSelector->NumCandidates()) {
+        bool isUsableCandidate = true;
+
+        if (candidateSource->IsHTMLElement(nsGkAtoms::source) &&
+            !SourceElementMatches(candidateSource->AsElement())) {
+          isUsableCandidate = false;
+        }
+
+        if (isUsableCandidate) {
+          SetDensity(mResponsiveSelector->GetSelectedImageDensity());
+          return changed;
+        }
+      }
+
+      newResponsiveSelector = nullptr;
+      if (candidateSource == this) {
+        break;
+      }
+    } else if (candidateSource == this) {
+      newResponsiveSelector =
+          TryCreateResponsiveSelector(candidateSource->AsElement());
+      break;
+    } else if (auto* source = HTMLSourceElement::FromNode(candidateSource)) {
+      if (RefPtr<ResponsiveImageSelector> selector =
+              TryCreateResponsiveSelector(source)) {
+        newResponsiveSelector = selector.forget();
+        break;
+      }
+    }
+  }
+
+  SetResponsiveSelector(std::move(newResponsiveSelector));
+  return hadSelector || mResponsiveSelector;
+}
+
+bool HTMLImageElement::SupportedPictureSourceType(const nsAString& aType) {
+  nsAutoString type;
+  nsAutoString params;
+
+  nsContentUtils::SplitMimeType(aType, type, params);
+  if (type.IsEmpty()) {
+    return true;
+  }
+
+  return imgLoader::SupportImageWithMimeType(
+      NS_ConvertUTF16toUTF8(type), AcceptedMimeTypes::IMAGES_AND_DOCUMENTS);
+}
+
+bool HTMLImageElement::SourceElementMatches(Element* aSourceElement) {
+  MOZ_ASSERT(aSourceElement->IsHTMLElement(nsGkAtoms::source));
+
+  MOZ_ASSERT(IsInPicture());
+  MOZ_ASSERT(IsPreviousSibling(aSourceElement, this));
+
+  auto* src = static_cast<HTMLSourceElement*>(aSourceElement);
+  if (!src->MatchesCurrentMedia()) {
+    return false;
+  }
+
+  nsAutoString type;
+  return !src->GetAttr(nsGkAtoms::type, type) ||
+         SupportedPictureSourceType(type);
+}
+
+already_AddRefed<ResponsiveImageSelector>
+HTMLImageElement::TryCreateResponsiveSelector(Element* aSourceElement) {
+  nsCOMPtr<nsIPrincipal> principal;
+
+  bool isSourceTag = aSourceElement->IsHTMLElement(nsGkAtoms::source);
+  if (isSourceTag) {
+    if (!SourceElementMatches(aSourceElement)) {
+      return nullptr;
+    }
+    auto* source = HTMLSourceElement::FromNode(aSourceElement);
+    principal = source->GetSrcsetTriggeringPrincipal();
+  } else if (aSourceElement->IsHTMLElement(nsGkAtoms::img)) {
+    MOZ_ASSERT(aSourceElement == this);
+    principal = mSrcsetTriggeringPrincipal;
+  }
+
+  nsString srcset;
+  if (!aSourceElement->GetAttr(nsGkAtoms::srcset, srcset)) {
+    return nullptr;
+  }
+
+  if (srcset.IsEmpty()) {
+    return nullptr;
+  }
+
+  RefPtr<ResponsiveImageSelector> sel =
+      new ResponsiveImageSelector(aSourceElement);
+  if (!sel->SetCandidatesFromSourceSet(srcset, principal)) {
+    return nullptr;
+  }
+
+  nsAutoString sizes;
+  aSourceElement->GetAttr(nsGkAtoms::sizes, sizes);
+  sel->SetSizesFromDescriptor(sizes);
+
+  if (!isSourceTag) {
+    MOZ_ASSERT(aSourceElement == this);
+    if (mSrcURI) {
+      sel->SetDefaultSource(mSrcURI, mSrcTriggeringPrincipal);
+    }
+  }
+
+  return sel.forget();
+}
+
+bool HTMLImageElement::SelectSourceForTagWithAttrs(
+    Document* aDocument, bool aIsSourceTag, const nsAString& aSrcAttr,
+    const nsAString& aSrcsetAttr, const nsAString& aSizesAttr,
+    const nsAString& aTypeAttr, const nsAString& aMediaAttr,
+    nsAString& aResult) {
+  MOZ_ASSERT(aIsSourceTag || (aTypeAttr.IsEmpty() && aMediaAttr.IsEmpty()),
+             "Passing type or media attrs makes no sense without aIsSourceTag");
+  MOZ_ASSERT(!aIsSourceTag || aSrcAttr.IsEmpty(),
+             "Passing aSrcAttr makes no sense with aIsSourceTag set");
+
+  if (aSrcsetAttr.IsEmpty()) {
+    if (!aIsSourceTag) {
+      aResult.Assign(aSrcAttr);
+      return true;
+    }
+    return false;
+  }
+
+  if (aIsSourceTag &&
+      ((!aMediaAttr.IsVoid() && !HTMLSourceElement::WouldMatchMediaForDocument(
+                                    aMediaAttr, aDocument)) ||
+       (!aTypeAttr.IsVoid() && !SupportedPictureSourceType(aTypeAttr)))) {
+    return false;
+  }
+
+  RefPtr<ResponsiveImageSelector> sel = new ResponsiveImageSelector(aDocument);
+
+  sel->SetCandidatesFromSourceSet(aSrcsetAttr);
+  if (!aSizesAttr.IsEmpty()) {
+    sel->SetSizesFromDescriptor(aSizesAttr);
+  }
+  if (!aIsSourceTag) {
+    sel->SetDefaultSource(aSrcAttr);
+  }
+
+  if (sel->GetSelectedImageURLSpec(aResult)) {
+    return true;
+  }
+
+  if (!aIsSourceTag) {
+    aResult.Truncate();
+    return true;
+  }
+
+  return false;
+}
+
+void HTMLImageElement::DestroyContent() {
+  ClearImageLoadTask();
+
+  mResponsiveSelector = nullptr;
+
+  nsImageLoadingContent::Destroy();
+  nsGenericHTMLElement::DestroyContent();
+}
+
+void HTMLImageElement::MediaFeatureValuesChanged() {
+  UpdateSourceSyncAndQueueImageTask(false,  true);
+}
+
+void HTMLImageElement::SetLazyLoading() {
+  if (mLazyLoading || !MaybeStartLazyLoading()) {
+    return;
+  }
+  mLazyLoading = true;
+  UpdateImageState(true);
+}
+
+void HTMLImageElement::StopLazyLoading(StartLoad aStartLoad) {
+  if (!mLazyLoading) {
+    return;
+  }
+  Element::StopLazyLoading();
+  mLazyLoading = false;
+  if (aStartLoad == StartLoad::Yes) {
+    UpdateSourceSyncAndQueueImageTask(true,  true);
+  }
+}
+
+const StyleLockedDeclarationBlock*
+HTMLImageElement::GetMappedAttributesFromSource() const {
+  if (!IsInPicture() || !mResponsiveSelector) {
+    return nullptr;
+  }
+
+  const auto* source =
+      HTMLSourceElement::FromNodeOrNull(mResponsiveSelector->Content());
+  if (!source) {
+    return nullptr;
+  }
+
+  MOZ_ASSERT(IsPreviousSibling(source, this),
+             "Incorrect or out-of-date source");
+  return source->GetAttributesMappedForImage();
+}
+
+void HTMLImageElement::InvalidateAttributeMapping() {
+  if (!IsInPicture()) {
+    return;
+  }
+
+  nsPresContext* presContext = nsContentUtils::GetContextForContent(this);
+  if (!presContext) {
+    return;
+  }
+
+  presContext->RestyleManager()->PostRestyleEvent(
+      this, RestyleHint::RESTYLE_SELF, nsChangeHint(0));
+}
+
+void HTMLImageElement::SetResponsiveSelector(
+    RefPtr<ResponsiveImageSelector>&& aSource) {
+  if (mResponsiveSelector == aSource) {
+    return;
+  }
+
+  mResponsiveSelector = std::move(aSource);
+
+  if (mObservingResize) {
+    MaybeRecomputeAutoSizes(false);
+  }
+
+  InvalidateAttributeMapping();
+
+  SetDensity(mResponsiveSelector
+                 ? mResponsiveSelector->GetSelectedImageDensity()
+                 : 1.0);
+}
+
+void HTMLImageElement::SetDensity(double aDensity) {
+  if (mCurrentDensity == aDensity) {
+    return;
+  }
+
+  mCurrentDensity = aDensity;
+
+  if (nsImageFrame* f = do_QueryFrame(GetPrimaryFrame())) {
+    f->ResponsiveContentDensityChanged();
+  }
+}
+
+FetchPriority HTMLImageElement::GetFetchPriorityForImage() const {
+  return Element::GetFetchPriority();
+}
+
+void HTMLImageElement::AddSizeOfExcludingThis(nsWindowSizes& aSizes,
+                                              size_t* aNodeSize) const {
+  nsGenericHTMLElement::AddSizeOfExcludingThis(aSizes, aNodeSize);
+
+  if (mSrcURI) {
+    *aNodeSize += SizeOfIncludingThisIfURIWithSizeOf(
+        mSrcURI, aSizes.mState.mMallocSizeOf);
+  }
+}
+
+}  

@@ -1,0 +1,137 @@
+/*
+ * Copyright 2011 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/core/SkPixelRef.h"
+
+#include "include/private/SkPixelStorage.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkDebug.h"
+#include "src/core/SkBitmapCache.h"
+#include "src/core/SkNextID.h"
+#include "src/core/SkPixelRefPriv.h"
+
+#include <atomic>
+#include <utility>
+
+uint32_t SkNextID::ImageID() {
+    static std::atomic<uint32_t> nextID{2};
+
+    uint32_t id;
+    do {
+        id = nextID.fetch_add(2, std::memory_order_relaxed);
+    } while (id == 0);
+    return id;
+}
+
+
+SkPixelRef::SkPixelRef(int width, int height, void* pixels, size_t rowBytes)
+    : fWidth(width)
+    , fHeight(height)
+    , fPixels(pixels)
+    , fRowBytes(rowBytes)
+    , fAddedToCache(false)
+{
+    this->needsNewGenID();
+    fMutability = kMutable;
+}
+
+SkPixelRef::~SkPixelRef() {
+    this->callGenIDChangeListeners();
+}
+
+SkPixelStorage::Type SkPixelRef::type() const {
+    return SkPixelStorage::Type::kPixelRef;
+}
+
+void SkPixelRef::android_only_reset(int width, int height, size_t rowBytes) {
+    fWidth = width;
+    fHeight = height;
+    fRowBytes = rowBytes;
+
+    this->notifyPixelsChanged();
+}
+
+void SkPixelRef::needsNewGenID() {
+    fTaggedGenID.store(0);
+    SkASSERT(!this->genIDIsUnique()); 
+}
+
+uint32_t SkPixelRef::getGenerationID() const {
+    uint32_t id = fTaggedGenID.load();
+    if (0 == id) {
+        uint32_t next = SkNextID::ImageID() | 1u;
+        if (fTaggedGenID.compare_exchange_strong(id, next)) {
+            id = next;  
+        } else {
+        }
+    }
+    return id & ~1u;  
+}
+
+void SkPixelRef::addGenIDChangeListener(sk_sp<SkIDChangeListener> listener) {
+    if (!listener || !this->genIDIsUnique()) {
+        return;
+    }
+    SkASSERT(!listener->shouldDeregister());
+    fGenIDChangeListeners.add(std::move(listener));
+}
+
+void SkPixelRef::callGenIDChangeListeners() {
+    if (this->genIDIsUnique()) {
+        fGenIDChangeListeners.changed();
+        if (fAddedToCache.exchange(false)) {
+            SkNotifyBitmapGenIDIsStale(this->getGenerationID());
+        }
+    } else {
+        fGenIDChangeListeners.reset();
+    }
+}
+
+void SkPixelRef::notifyPixelsChanged() {
+#if defined(SK_DEBUG)
+    if (this->isImmutable()) {
+        SkDebugf("========== notifyPixelsChanged called on immutable pixelref");
+    }
+#endif
+    this->callGenIDChangeListeners();
+    this->needsNewGenID();
+}
+
+void SkPixelRef::setImmutable() {
+    fMutability = kImmutable;
+}
+
+void SkPixelRef::setImmutableWithID(uint32_t genID) {
+    fMutability = kImmutable;
+    fTaggedGenID.store(genID);
+}
+
+void SkPixelRef::setTemporarilyImmutable() {
+    SkASSERT(fMutability != kImmutable);
+    fMutability = kTemporarilyImmutable;
+}
+
+void SkPixelRef::restoreMutability() {
+    SkASSERT(fMutability != kImmutable);
+    fMutability = kMutable;
+}
+
+sk_sp<SkPixelRef> SkMakePixelRefWithProc(int width, int height, size_t rowBytes, void* addr,
+                                         void (*releaseProc)(void* addr, void* ctx), void* ctx) {
+    SkASSERT(width >= 0 && height >= 0);
+    if (nullptr == releaseProc) {
+        return sk_make_sp<SkPixelRef>(width, height, addr, rowBytes);
+    }
+    struct PixelRef final : public SkPixelRef {
+        void (*fReleaseProc)(void*, void*);
+        void* fReleaseProcContext;
+        PixelRef(int w, int h, void* s, size_t r, void (*proc)(void*, void*), void* ctx)
+            : SkPixelRef(w, h, s, r), fReleaseProc(proc), fReleaseProcContext(ctx) {}
+        ~PixelRef() override { fReleaseProc(this->pixels(), fReleaseProcContext); }
+    };
+    return sk_sp<SkPixelRef>(new PixelRef(width, height, addr, rowBytes, releaseProc, ctx));
+}

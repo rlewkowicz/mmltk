@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef TRRServiceBase_h_
+#define TRRServiceBase_h_
+
+#include "mozilla/Atomics.h"
+#include "mozilla/DataMutex.h"
+#include "mozilla/net/rust_helper.h"
+#include "nsString.h"
+#include "nsIDNSService.h"
+#include "nsIProtocolProxyService2.h"
+#include "nsTHashMap.h"
+
+class nsICancelable;
+class nsIProxyInfo;
+
+namespace mozilla {
+namespace net {
+
+class nsHttpConnectionInfo;
+
+static const char kRolloutURIPref[] = "doh-rollout.uri";
+static const char kRolloutModePref[] = "doh-rollout.mode";
+
+class TRRServiceBase : public nsIProxyConfigChangedCallback {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+  TRRServiceBase();
+  nsIDNSService::ResolverMode Mode() { return mMode; }
+  virtual void GetURI(nsACString& result) = 0;
+  already_AddRefed<nsHttpConnectionInfo> TRRConnectionInfo();
+  virtual void InitTRRConnectionInfo(bool aForceReinit = false);
+  bool TRRConnectionInfoInited() const { return mTRRConnectionInfoInited; }
+
+  void SetHttp3FirstForServer(const nsACString& aServer, bool aEnabled);
+  bool GetHttp3FirstForServer(const nsACString& aServer);
+
+ protected:
+  virtual ~TRRServiceBase();
+
+  virtual bool MaybeSetPrivateURI(const nsACString& aURI) = 0;
+  void ProcessURITemplate(nsACString& aURI);
+  void CheckURIPrefs();
+
+  void OnTRRModeChange();
+  void OnTRRURIChange();
+
+  virtual void ReadEtcHostsFile() = 0;
+  void AsyncCreateTRRConnectionInfo(const nsACString& aURI);
+  void AsyncCreateTRRConnectionInfoInternal(const nsACString& aURI);
+  virtual void SetDefaultTRRConnectionInfo(nsHttpConnectionInfo* aConnInfo);
+  void RegisterProxyChangeListener();
+  void UnregisterProxyChangeListener();
+
+  already_AddRefed<nsHttpConnectionInfo> CreateConnInfoHelper(
+      nsIURI* aURI, nsIProxyInfo* aProxyInfo);
+
+  nsCString mPrivateURI;  
+  nsCString mURIPref;
+  nsCString mRolloutURIPref;
+  nsCString mDefaultURIPref;
+  nsCString mOHTTPURIPref;
+
+  Atomic<nsIDNSService::ResolverMode, Relaxed> mMode{
+      nsIDNSService::MODE_NATIVEONLY};
+  Atomic<bool, Relaxed> mURISetByDetection{false};
+  Atomic<bool, Relaxed> mTRRConnectionInfoInited{false};
+  Atomic<uint32_t, Relaxed> mTRRConnectionInfoGeneration{0};
+  DataMutex<RefPtr<nsHttpConnectionInfo>> mDefaultTRRConnectionInfo;
+  bool mNativeHTTPSQueryEnabled{false};
+
+  Mutex mLock{"TRRService"};
+  nsTHashMap<nsCString, bool> mHttp3FirstServers MOZ_GUARDED_BY(mLock);
+};
+
+}  
+}  
+
+#endif  // TRRServiceBase_h_

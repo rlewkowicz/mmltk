@@ -1,0 +1,164 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozURL_h_
+#define mozURL_h_
+
+#include "nsIMemoryReporter.h"
+#include "mozilla/net/MozURL_ffi.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Result.h"
+
+MOZ_DEFINE_MALLOC_SIZE_OF(MozURLMallocSizeOf)
+
+namespace mozilla {
+namespace net {
+
+class MozURL final {
+ public:
+  MozURL() = delete;
+  ~MozURL() = delete;
+  MozURL(const MozURL&) = delete;
+  MozURL& operator=(const MozURL&) = delete;
+
+  static nsresult Init(MozURL** aURL, const nsACString& aSpec,
+                       const MozURL* aBaseURL = nullptr) {
+    return mozurl_new(aURL, &aSpec, aBaseURL);
+  }
+
+  nsDependentCSubstring Spec() const { return mozurl_spec(this); }
+  nsDependentCSubstring Scheme() const { return mozurl_scheme(this); }
+  nsDependentCSubstring Username() const { return mozurl_username(this); }
+  nsDependentCSubstring Password() const { return mozurl_password(this); }
+  nsDependentCSubstring Host() const { return mozurl_host(this); }
+  int32_t Port() const { return mozurl_port(this); }
+  int32_t RealPort() const { return mozurl_real_port(this); }
+  nsDependentCSubstring HostPort() const { return mozurl_host_port(this); }
+  nsDependentCSubstring FilePath() const { return mozurl_filepath(this); }
+  nsDependentCSubstring Path() const { return mozurl_path(this); }
+  nsDependentCSubstring Query() const { return mozurl_query(this); }
+  bool HasQuery() const { return mozurl_has_query(this); }
+  nsDependentCSubstring Ref() const { return mozurl_fragment(this); }
+  bool HasFragment() const { return mozurl_has_fragment(this); }
+  nsDependentCSubstring Directory() const { return mozurl_directory(this); }
+  nsDependentCSubstring PrePath() const { return mozurl_prepath(this); }
+  nsDependentCSubstring SpecNoRef() const { return mozurl_spec_no_ref(this); }
+
+  void Origin(nsACString& aOrigin) const { mozurl_origin(this, &aOrigin); }
+  bool CannotBeABase() { return mozurl_cannot_be_a_base(this); }
+
+  nsresult GetCommonBase(const MozURL* aOther, MozURL** aCommon) const {
+    return mozurl_common_base(this, aOther, aCommon);
+  }
+  nsresult GetRelative(const MozURL* aOther, nsACString* aRelative) const {
+    return mozurl_relative(this, aOther, aRelative);
+  }
+
+  size_t SizeOf() { return mozurl_sizeof(this, MozURLMallocSizeOf); }
+
+  class Mutator {
+   public:
+    nsresult Finalize(MozURL** aURL) {
+      nsresult rv = GetStatus();
+      if (NS_SUCCEEDED(rv)) {
+        mURL.forget(aURL);
+      } else {
+        *aURL = nullptr;
+      }
+      return rv;
+    }
+
+    Mutator& SetScheme(const nsACString& aScheme) {
+      if (NS_SUCCEEDED(GetStatus())) {
+        mStatus = mozurl_set_scheme(mURL, &aScheme);
+      }
+      return *this;
+    }
+    Mutator& SetUsername(const nsACString& aUser) {
+      if (NS_SUCCEEDED(GetStatus())) {
+        mStatus = mozurl_set_username(mURL, &aUser);
+      }
+      return *this;
+    }
+    Mutator& SetPassword(const nsACString& aPassword) {
+      if (NS_SUCCEEDED(GetStatus())) {
+        mStatus = mozurl_set_password(mURL, &aPassword);
+      }
+      return *this;
+    }
+    Mutator& SetHostname(const nsACString& aHost) {
+      if (NS_SUCCEEDED(GetStatus())) {
+        mStatus = mozurl_set_hostname(mURL, &aHost);
+      }
+      return *this;
+    }
+    Mutator& SetHostPort(const nsACString& aHostPort) {
+      if (NS_SUCCEEDED(GetStatus())) {
+        mStatus = mozurl_set_host_port(mURL, &aHostPort);
+      }
+      return *this;
+    }
+    Mutator& SetFilePath(const nsACString& aPath) {
+      if (NS_SUCCEEDED(GetStatus())) {
+        mStatus = mozurl_set_pathname(mURL, &aPath);
+      }
+      return *this;
+    }
+    Mutator& SetQuery(const nsACString& aQuery) {
+      if (NS_SUCCEEDED(GetStatus())) {
+        mStatus = mozurl_set_query(mURL, &aQuery);
+      }
+      return *this;
+    }
+    Mutator& SetRef(const nsACString& aRef) {
+      if (NS_SUCCEEDED(GetStatus())) {
+        mStatus = mozurl_set_fragment(mURL, &aRef);
+      }
+      return *this;
+    }
+    Mutator& SetPort(int32_t aPort) {
+      if (NS_SUCCEEDED(GetStatus())) {
+        mStatus = mozurl_set_port_no(mURL, aPort);
+      }
+      return *this;
+    }
+
+    nsresult GetStatus() { return mURL ? mStatus : NS_ERROR_NOT_AVAILABLE; }
+
+    static Result<Mutator, nsresult> FromSpec(
+        const nsACString& aSpec, const MozURL* aBaseURL = nullptr) {
+      Mutator m = Mutator(aSpec, aBaseURL);
+      if (m.mURL) {
+        MOZ_ASSERT(NS_SUCCEEDED(m.mStatus));
+        return m;
+      }
+
+      MOZ_ASSERT(NS_FAILED(m.mStatus));
+      return Err(m.mStatus);
+    }
+
+   private:
+    explicit Mutator(MozURL* aUrl) : mStatus(NS_OK) {
+      mozurl_clone(aUrl, getter_AddRefs(mURL));
+    }
+
+    explicit Mutator(const nsACString& aSpec,
+                     const MozURL* aBaseURL = nullptr) {
+      mStatus = mozurl_new(getter_AddRefs(mURL), &aSpec, aBaseURL);
+    }
+    RefPtr<MozURL> mURL;
+    nsresult mStatus;
+    friend class MozURL;
+  };
+
+  Mutator Mutate() { return Mutator(this); }
+
+  void AddRef() { mozurl_addref(this); }
+  void Release() { mozurl_release(this); }
+};
+
+}  
+}  
+
+#endif  // mozURL_h_

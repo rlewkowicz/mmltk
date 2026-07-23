@@ -1,0 +1,634 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/Mutex.h"
+#include "mozilla/ScopeExit.h"
+#include "nsAlgorithm.h"
+#include "nsStorageStream.h"
+#include "nsSegmentedBuffer.h"
+#include "nsStreamUtils.h"
+#include "nsCOMPtr.h"
+#include "nsICloneableInputStream.h"
+#include "nsIInputStream.h"
+#include "nsIIPCSerializableInputStream.h"
+#include "nsISeekableStream.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Likely.h"
+#include "mozilla/MathAlgorithms.h"
+#include "mozilla/ipc/InputStreamUtils.h"
+
+using mozilla::MutexAutoLock;
+using mozilla::ipc::InputStreamParams;
+using mozilla::ipc::StringInputStreamParams;
+
+static mozilla::LazyLogModule sStorageStreamLog("nsStorageStream");
+#ifdef LOG
+#  undef LOG
+#endif
+#define LOG(args) MOZ_LOG(sStorageStreamLog, mozilla::LogLevel::Debug, args)
+
+nsStorageStream::nsStorageStream() {
+  LOG(("Creating nsStorageStream [%p].\n", this));
+}
+
+nsStorageStream::~nsStorageStream() { delete mSegmentedBuffer; }
+
+NS_IMPL_ISUPPORTS(nsStorageStream, nsIStorageStream, nsIOutputStream)
+
+NS_IMETHODIMP
+nsStorageStream::Init(uint32_t aSegmentSize, uint32_t aMaxSize) {
+  MutexAutoLock lock(mMutex);
+  mSegmentedBuffer = new nsSegmentedBuffer();
+  mSegmentSize = aSegmentSize;
+  mSegmentSizeLog2 = mozilla::FloorLog2(aSegmentSize);
+  mMaxLogicalLength = aMaxSize;
+
+  if (mSegmentSize != ((uint32_t)1 << mSegmentSizeLog2)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  return mSegmentedBuffer->Init(aSegmentSize);
+}
+
+NS_IMETHODIMP
+nsStorageStream::GetOutputStream(int32_t aStartingOffset,
+                                 nsIOutputStream** aOutputStream) {
+  if (NS_WARN_IF(!aOutputStream)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  MutexAutoLock lock(mMutex);
+  if (NS_WARN_IF(!mSegmentedBuffer)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  if (mWriteInProgress) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  if (mActiveSegmentBorrows > 0) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  nsresult rv = Seek(aStartingOffset);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (mLastSegmentNum >= 0)
+    if (mSegmentedBuffer->ReallocLastSegment(mSegmentSize)) {
+      rv = Seek(aStartingOffset);
+      if (NS_FAILED(rv)) {
+        return rv;
+      }
+    }
+
+  NS_ADDREF(this);
+  *aOutputStream = static_cast<nsIOutputStream*>(this);
+  mWriteInProgress = true;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsStorageStream::Close() {
+  MutexAutoLock lock(mMutex);
+  if (NS_WARN_IF(!mSegmentedBuffer)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  mWriteInProgress = false;
+
+  int32_t segmentOffset = SegOffset(mLogicalLength);
+
+  if (segmentOffset && !mActiveSegmentBorrows) {
+    mSegmentedBuffer->ReallocLastSegment(segmentOffset);
+  }
+
+  mWriteCursor = nullptr;
+  mSegmentEnd = nullptr;
+
+  LOG(("nsStorageStream [%p] Close mWriteCursor=%p mSegmentEnd=%p\n", this,
+       mWriteCursor, mSegmentEnd));
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsStorageStream::Flush() { return NS_OK; }
+
+NS_IMETHODIMP
+nsStorageStream::StreamStatus() {
+  MutexAutoLock lock(mMutex);
+  if (!mSegmentedBuffer) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsStorageStream::Write(const char* aBuffer, uint32_t aCount,
+                       uint32_t* aNumWritten) {
+  if (NS_WARN_IF(!aNumWritten) || NS_WARN_IF(!aBuffer)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  MutexAutoLock lock(mMutex);
+  if (NS_WARN_IF(!mSegmentedBuffer)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  if (NS_WARN_IF(mLogicalLength >= mMaxLogicalLength)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  LOG(("nsStorageStream [%p] Write mWriteCursor=%p mSegmentEnd=%p aCount=%d\n",
+       this, mWriteCursor, mSegmentEnd, aCount));
+
+  uint32_t remaining = aCount;
+  const char* readCursor = aBuffer;
+
+  remaining = std::min(remaining, mMaxLogicalLength - mLogicalLength);
+
+  auto onExit = mozilla::MakeScopeExit([&] {
+    mMutex.AssertCurrentThreadOwns();
+    *aNumWritten = aCount - remaining;
+    mLogicalLength += *aNumWritten;
+
+    LOG(
+        ("nsStorageStream [%p] Wrote mWriteCursor=%p mSegmentEnd=%p "
+         "numWritten=%d\n",
+         this, mWriteCursor, mSegmentEnd, *aNumWritten));
+  });
+
+  bool firstTime = mSegmentedBuffer->GetSegmentCount() == 0;
+  while (remaining || MOZ_UNLIKELY(firstTime)) {
+    firstTime = false;
+    uint32_t availableInSegment = mSegmentEnd - mWriteCursor;
+    if (!availableInSegment) {
+      mWriteCursor = mSegmentedBuffer->AppendNewSegment();
+      if (!mWriteCursor) {
+        mSegmentEnd = nullptr;
+        return NS_ERROR_OUT_OF_MEMORY;
+      }
+      mLastSegmentNum++;
+      mSegmentEnd = mWriteCursor + mSegmentSize;
+      availableInSegment = mSegmentEnd - mWriteCursor;
+      LOG(
+          ("nsStorageStream [%p] Write (new seg) mWriteCursor=%p "
+           "mSegmentEnd=%p\n",
+           this, mWriteCursor, mSegmentEnd));
+    }
+
+    uint32_t count = XPCOM_MIN(availableInSegment, remaining);
+    memcpy(mWriteCursor, readCursor, count);
+    remaining -= count;
+    readCursor += count;
+    mWriteCursor += count;
+    LOG(
+        ("nsStorageStream [%p] Writing mWriteCursor=%p mSegmentEnd=%p "
+         "count=%d\n",
+         this, mWriteCursor, mSegmentEnd, count));
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsStorageStream::WriteFrom(nsIInputStream* aInStr, uint32_t aCount,
+                           uint32_t* aResult) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+nsStorageStream::WriteSegments(nsReadSegmentFun aReader, void* aClosure,
+                               uint32_t aCount, uint32_t* aResult) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+nsStorageStream::IsNonBlocking(bool* aNonBlocking) {
+  *aNonBlocking = false;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsStorageStream::GetLength(uint32_t* aLength) {
+  MutexAutoLock lock(mMutex);
+  *aLength = mLogicalLength;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsStorageStream::SetLength(uint32_t aLength) {
+  MutexAutoLock lock(mMutex);
+  return SetLengthLocked(aLength);
+}
+
+nsresult nsStorageStream::SetLengthLocked(uint32_t aLength) {
+  if (NS_WARN_IF(!mSegmentedBuffer)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  if (mWriteInProgress) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  if (mActiveSegmentBorrows) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  if (aLength > mLogicalLength) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  int32_t newLastSegmentNum = SegNum(aLength);
+  int32_t segmentOffset = SegOffset(aLength);
+  if (segmentOffset == 0) {
+    newLastSegmentNum--;
+  }
+
+  AutoTArray<mozilla::UniqueFreePtr<char>, 16> toFree;
+
+  while (newLastSegmentNum < mLastSegmentNum) {
+    toFree.AppendElement(mSegmentedBuffer->PopLastSegment());
+    mLastSegmentNum--;
+  }
+
+  if (toFree.Length() > 128) {
+    NS_DispatchBackgroundTask(NS_NewRunnableFunction(
+        "nsStorageStream::SetLengthLocked",
+        [toFree = std::move(toFree)]() mutable { toFree.Clear(); }));
+  }
+
+  mLogicalLength = aLength;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsStorageStream::GetWriteInProgress(bool* aWriteInProgress) {
+  MutexAutoLock lock(mMutex);
+  *aWriteInProgress = mWriteInProgress;
+  return NS_OK;
+}
+
+nsresult nsStorageStream::Seek(int32_t aPosition) {
+  if (NS_WARN_IF(!mSegmentedBuffer)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  if (aPosition == -1) {
+    aPosition = mLogicalLength;
+  }
+
+  if ((uint32_t)aPosition > mLogicalLength) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  SetLengthLocked(aPosition);
+
+  if (aPosition == 0) {
+    mWriteCursor = nullptr;
+    mSegmentEnd = nullptr;
+    LOG(("nsStorageStream [%p] Seek mWriteCursor=%p mSegmentEnd=%p\n", this,
+         mWriteCursor, mSegmentEnd));
+    return NS_OK;
+  }
+
+  mWriteCursor = mSegmentedBuffer->GetSegment(mLastSegmentNum);
+  NS_ASSERTION(mWriteCursor, "null mWriteCursor");
+  mSegmentEnd = mWriteCursor + mSegmentSize;
+
+  int32_t segmentOffset = SegOffset(aPosition);
+  if (segmentOffset == 0 && (SegNum(aPosition) > (uint32_t)mLastSegmentNum)) {
+    mWriteCursor = mSegmentEnd;
+  } else {
+    mWriteCursor += segmentOffset;
+  }
+
+  LOG(("nsStorageStream [%p] Seek mWriteCursor=%p mSegmentEnd=%p\n", this,
+       mWriteCursor, mSegmentEnd));
+  return NS_OK;
+}
+
+
+class nsStorageInputStream final : public nsIInputStream,
+                                   public nsISeekableStream,
+                                   public nsIIPCSerializableInputStream,
+                                   public nsICloneableInputStream {
+ public:
+  nsStorageInputStream(nsStorageStream* aStorageStream, uint32_t aSegmentSize)
+      : mStorageStream(aStorageStream),
+        mReadCursor(0),
+        mSegmentEnd(0),
+        mSegmentNum(0),
+        mSegmentSize(aSegmentSize),
+        mLogicalCursor(0),
+        mStatus(NS_OK) {}
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIINPUTSTREAM
+  NS_DECL_NSISEEKABLESTREAM
+  NS_DECL_NSITELLABLESTREAM
+  NS_DECL_NSIIPCSERIALIZABLEINPUTSTREAM
+  NS_DECL_NSICLONEABLEINPUTSTREAM
+
+ private:
+  ~nsStorageInputStream() = default;
+
+ protected:
+  nsresult Seek(uint32_t aPosition) MOZ_REQUIRES(mStorageStream->mMutex);
+
+  friend class nsStorageStream;
+
+ private:
+  RefPtr<nsStorageStream> mStorageStream;
+  uint32_t mReadCursor;     
+  uint32_t mSegmentEnd;     
+  uint32_t mSegmentNum;     
+  uint32_t mSegmentSize;    
+  uint32_t mLogicalCursor;  
+  nsresult mStatus;
+
+  uint32_t SegNum(uint32_t aPosition) MOZ_REQUIRES(mStorageStream->mMutex) {
+    return aPosition >> mStorageStream->mSegmentSizeLog2;
+  }
+  uint32_t SegOffset(uint32_t aPosition) {
+    return aPosition & (mSegmentSize - 1);
+  }
+};
+
+NS_IMPL_ISUPPORTS(nsStorageInputStream, nsIInputStream, nsISeekableStream,
+                  nsITellableStream, nsIIPCSerializableInputStream,
+                  nsICloneableInputStream)
+
+NS_IMETHODIMP
+nsStorageStream::NewInputStream(int32_t aStartingOffset,
+                                nsIInputStream** aInputStream) {
+  MutexAutoLock lock(mMutex);
+  if (NS_WARN_IF(!mSegmentedBuffer)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  RefPtr inputStream =
+      mozilla::MakeRefPtr<nsStorageInputStream>(this, mSegmentSize);
+
+  inputStream->mStorageStream->mMutex.AssertCurrentThreadOwns();
+  nsresult rv = inputStream->Seek(aStartingOffset);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  inputStream.forget(aInputStream);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsStorageInputStream::Close() {
+  mStatus = NS_BASE_STREAM_CLOSED;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsStorageInputStream::Available(uint64_t* aAvailable) {
+  if (NS_FAILED(mStatus)) {
+    return mStatus;
+  }
+
+  MutexAutoLock lock(mStorageStream->mMutex);
+  *aAvailable = mStorageStream->mLogicalLength - mLogicalCursor;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsStorageInputStream::StreamStatus() { return mStatus; }
+
+NS_IMETHODIMP
+nsStorageInputStream::Read(char* aBuffer, uint32_t aCount, uint32_t* aNumRead) {
+  return ReadSegments(NS_CopySegmentToBuffer, aBuffer, aCount, aNumRead);
+}
+
+NS_IMETHODIMP
+nsStorageInputStream::ReadSegments(nsWriteSegmentFun aWriter, void* aClosure,
+                                   uint32_t aCount, uint32_t* aNumRead) {
+  *aNumRead = 0;
+  if (mStatus == NS_BASE_STREAM_CLOSED) {
+    return NS_OK;
+  }
+  if (NS_FAILED(mStatus)) {
+    return mStatus;
+  }
+
+  uint32_t count, availableInSegment, remainingCapacity, bytesConsumed;
+  nsresult rv;
+
+  remainingCapacity = aCount;
+  while (remainingCapacity) {
+    const char* cur = nullptr;
+    {
+      MutexAutoLock lock(mStorageStream->mMutex);
+      availableInSegment = mSegmentEnd - mReadCursor;
+      if (!availableInSegment) {
+        uint32_t available = mStorageStream->mLogicalLength - mLogicalCursor;
+        if (!available) {
+          break;
+        }
+
+        if (mSegmentEnd > 0) {
+          mSegmentNum++;
+        }
+        mReadCursor = 0;
+        mSegmentEnd = XPCOM_MIN(mSegmentSize, available);
+        availableInSegment = mSegmentEnd;
+      }
+      cur = mStorageStream->mSegmentedBuffer->GetSegment(mSegmentNum);
+      mStorageStream->mActiveSegmentBorrows++;
+    }
+    auto dropBorrow = mozilla::MakeScopeExit([&] {
+      MutexAutoLock lock(mStorageStream->mMutex);
+      mStorageStream->mActiveSegmentBorrows--;
+    });
+
+    count = XPCOM_MIN(availableInSegment, remainingCapacity);
+    rv = aWriter(this, aClosure, cur + mReadCursor, aCount - remainingCapacity,
+                 count, &bytesConsumed);
+    if (NS_FAILED(rv) || (bytesConsumed == 0)) {
+      break;
+    }
+    remainingCapacity -= bytesConsumed;
+    mReadCursor += bytesConsumed;
+    mLogicalCursor += bytesConsumed;
+  }
+
+  *aNumRead = aCount - remainingCapacity;
+
+  bool isWriteInProgress = false;
+  if (NS_FAILED(mStorageStream->GetWriteInProgress(&isWriteInProgress))) {
+    isWriteInProgress = false;
+  }
+
+  if (*aNumRead == 0 && isWriteInProgress) {
+    return NS_BASE_STREAM_WOULD_BLOCK;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsStorageInputStream::IsNonBlocking(bool* aNonBlocking) {
+
+  *aNonBlocking = true;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsStorageInputStream::Seek(int32_t aWhence, int64_t aOffset) {
+  if (NS_FAILED(mStatus)) {
+    return mStatus;
+  }
+
+  MutexAutoLock lock(mStorageStream->mMutex);
+  int64_t pos = aOffset;
+
+  switch (aWhence) {
+    case NS_SEEK_SET:
+      break;
+    case NS_SEEK_CUR:
+      pos += mLogicalCursor;
+      break;
+    case NS_SEEK_END:
+      pos += mStorageStream->mLogicalLength;
+      break;
+    default:
+      MOZ_ASSERT_UNREACHABLE("unexpected whence value");
+      return NS_ERROR_UNEXPECTED;
+  }
+  if (pos == int64_t(mLogicalCursor)) {
+    return NS_OK;
+  }
+
+  return Seek(pos);
+}
+
+NS_IMETHODIMP
+nsStorageInputStream::Tell(int64_t* aResult) {
+  if (NS_FAILED(mStatus)) {
+    return mStatus;
+  }
+
+  *aResult = mLogicalCursor;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsStorageInputStream::SetEOF() {
+  MOZ_ASSERT_UNREACHABLE("nsStorageInputStream::SetEOF");
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+nsresult nsStorageInputStream::Seek(uint32_t aPosition) {
+  uint32_t length = mStorageStream->mLogicalLength;
+  if (aPosition > length) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (length == 0) {
+    return NS_OK;
+  }
+
+  mSegmentNum = SegNum(aPosition);
+  mReadCursor = SegOffset(aPosition);
+  uint32_t available = length - aPosition;
+  mSegmentEnd = mReadCursor + XPCOM_MIN(mSegmentSize - mReadCursor, available);
+  mLogicalCursor = aPosition;
+  return NS_OK;
+}
+
+void nsStorageInputStream::SerializedComplexity(uint32_t aMaxSize,
+                                                uint32_t* aSizeUsed,
+                                                uint32_t* aPipes,
+                                                uint32_t* aTransferables) {
+  uint64_t remaining = 0;
+  mozilla::DebugOnly<nsresult> rv = Available(&remaining);
+  MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+  if (remaining >= aMaxSize) {
+    *aPipes = 1;
+  } else {
+    *aSizeUsed = remaining;
+  }
+}
+
+void nsStorageInputStream::Serialize(InputStreamParams& aParams,
+                                     uint32_t aMaxSize, uint32_t* aSizeUsed) {
+  MOZ_ASSERT(aSizeUsed);
+  *aSizeUsed = 0;
+
+  uint64_t remaining = 0;
+  mozilla::DebugOnly<nsresult> rv = Available(&remaining);
+  MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+  if (remaining >= aMaxSize) {
+    mozilla::ipc::InputStreamHelper::SerializeInputStreamAsPipe(this, aParams);
+    return;
+  }
+
+  *aSizeUsed = remaining;
+
+  nsCString combined;
+  int64_t offset;
+  rv = Tell(&offset);
+  MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+  auto handleOrErr = combined.BulkWrite(remaining, 0, false);
+  MOZ_ASSERT(!handleOrErr.isErr());
+
+  auto handle = handleOrErr.unwrap();
+
+  uint32_t numRead = 0;
+
+  rv = Read(handle.Elements(), remaining, &numRead);
+  MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+  MOZ_ASSERT(numRead == remaining);
+  handle.Finish(numRead, false);
+
+  rv = Seek(NS_SEEK_SET, offset);
+  MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+  StringInputStreamParams params;
+  params.data() = std::move(combined);
+  aParams = std::move(params);
+}
+
+bool nsStorageInputStream::Deserialize(const InputStreamParams& aParams) {
+  MOZ_ASSERT_UNREACHABLE(
+      "We should never attempt to deserialize a storage "
+      "input stream.");
+  return false;
+}
+
+NS_IMETHODIMP
+nsStorageInputStream::GetCloneable(bool* aCloneableOut) {
+  *aCloneableOut = true;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsStorageInputStream::Clone(nsIInputStream** aCloneOut) {
+  return mStorageStream->NewInputStream(mLogicalCursor, aCloneOut);
+}
+
+nsresult NS_NewStorageStream(uint32_t aSegmentSize, uint32_t aMaxSize,
+                             nsIStorageStream** aResult) {
+  RefPtr storageStream = mozilla::MakeRefPtr<nsStorageStream>();
+  nsresult rv = storageStream->Init(aSegmentSize, aMaxSize);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  storageStream.forget(aResult);
+  return NS_OK;
+}
+
+#undef LOG

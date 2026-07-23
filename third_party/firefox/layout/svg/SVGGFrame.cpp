@@ -1,0 +1,46 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SVGGFrame.h"
+
+#include "mozilla/PresShell.h"
+#include "mozilla/dom/SVGElement.h"
+#include "nsGkAtoms.h"
+#include "nsIFrame.h"
+
+using namespace mozilla::dom;
+
+
+nsIFrame* NS_NewSVGGFrame(mozilla::PresShell* aPresShell,
+                          mozilla::ComputedStyle* aStyle) {
+  return new (aPresShell)
+      mozilla::SVGGFrame(aStyle, aPresShell->GetPresContext());
+}
+
+namespace mozilla {
+
+NS_IMPL_FRAMEARENA_HELPERS(SVGGFrame)
+
+#ifdef DEBUG
+void SVGGFrame::Init(nsIContent* aContent, nsContainerFrame* aParent,
+                     nsIFrame* aPrevInFlow) {
+  NS_ASSERTION(aContent->IsSVGElement() &&
+                   static_cast<SVGElement*>(aContent)->IsTransformable(),
+               "The element is not transformable");
+
+  SVGDisplayContainerFrame::Init(aContent, aParent, aPrevInFlow);
+}
+#endif /* DEBUG */
+
+
+nsresult SVGGFrame::AttributeChanged(int32_t aNameSpaceID, nsAtom* aAttribute,
+                                     AttrModType aModType) {
+  if (aNameSpaceID == kNameSpaceID_None && aAttribute == nsGkAtoms::transform) {
+    NotifySVGChanged(ChangeFlag::TransformChanged);
+  }
+
+  return NS_OK;
+}
+
+}  

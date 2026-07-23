@@ -1,0 +1,897 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsFind.h"
+#include "mozilla/Likely.h"
+#include "nsIContent.h"
+#include "nsIContentInlines.h"  // Is required by TreeIterator.h
+#include "nsINode.h"
+#include "nsIFrame.h"
+#include "nsIFormControl.h"
+#include "nsString.h"
+#include "nsAtom.h"
+#include "nsServiceManagerUtils.h"
+#include "nsUnicharUtils.h"
+#include "nsUnicodeProperties.h"
+#include "nsCRT.h"
+#include "nsRange.h"
+#include "nsReadableUtils.h"
+#include "nsContentUtils.h"
+#include "mozilla/TextEditor.h"
+#include "mozilla/dom/CharacterDataBuffer.h"
+#include "mozilla/dom/ChildIterator.h"
+#include "mozilla/dom/TreeIterator.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/HTMLOptionElement.h"
+#include "mozilla/dom/HTMLSelectElement.h"
+#include "mozilla/dom/Text.h"
+#include "mozilla/intl/Segmenter.h"
+#include "mozilla/intl/UnicodeProperties.h"
+#include "mozilla/StaticPrefs_browser.h"
+#include "mozilla/Utf16.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using namespace mozilla::unicode;
+
+#define CHAR_TO_UNICHAR(c) ((char16_t)(unsigned char)c)
+
+#define CH_SHY ((char16_t)0xAD)
+
+static_assert(CH_SHY <= 255, "CH_SHY is not an ascii character");
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsFind)
+  NS_INTERFACE_MAP_ENTRY(nsIFind)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(nsFind)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(nsFind)
+
+NS_IMPL_CYCLE_COLLECTION(nsFind)
+
+#ifdef DEBUG_FIND
+#  define DEBUG_FIND_PRINTF(...) printf(__VA_ARGS__)
+#else
+#  define DEBUG_FIND_PRINTF(...) /* nothing */
+#endif
+
+static nsIContent& AnonymousSubtreeRootParentOrHost(const nsINode& aNode) {
+  MOZ_ASSERT(aNode.IsInNativeAnonymousSubtree());
+  return *aNode.GetClosestNativeAnonymousSubtreeRootParentOrHost();
+}
+
+static void DumpNode(const nsINode* aNode) {
+#ifdef DEBUG_FIND
+  if (!aNode) {
+    printf(">>>> Node: NULL\n");
+    return;
+  }
+  nsString nodeName = aNode->NodeName();
+  if (aNode->IsText()) {
+    nsAutoString newText;
+    aNode->AsText()->AppendTextTo(newText);
+    printf(">>>> Text node (node name %s): '%s'\n",
+           NS_LossyConvertUTF16toASCII(nodeName).get(),
+           NS_LossyConvertUTF16toASCII(newText).get());
+  } else {
+    printf(">>>> Node: %s\n", NS_LossyConvertUTF16toASCII(nodeName).get());
+  }
+#endif
+}
+
+static bool IsBlockNode(const nsIContent* aContent) {
+  if (aContent->IsElement() && aContent->AsElement()->IsDisplayContents()) {
+    return false;
+  }
+
+  if (aContent->IsAnyOfHTMLElements(nsGkAtoms::img, nsGkAtoms::hr,
+                                    nsGkAtoms::th, nsGkAtoms::td)) {
+    return true;
+  }
+
+  nsIFrame* frame = aContent->GetPrimaryFrame();
+  if (!frame) {
+    return false;
+  }
+
+  const auto& disp = *frame->StyleDisplay();
+  return disp.IsBlockOutsideStyle() || disp.IsInternalTableStyleExceptCell();
+}
+
+static bool IsDisplayedNode(const nsINode* aNode) {
+  if (!aNode->IsContent()) {
+    return false;
+  }
+
+  if (aNode->AsContent()->GetPrimaryFrame()) {
+    return true;
+  }
+
+  return aNode->IsElement() && aNode->AsElement()->IsDisplayContents();
+}
+
+static bool IsRubyAnnotationNode(const nsINode* aNode) {
+  if (!aNode->IsContent()) {
+    return false;
+  }
+
+  nsIFrame* frame = aNode->AsContent()->GetPrimaryFrame();
+  if (!frame) {
+    return false;
+  }
+
+  StyleDisplay display = frame->StyleDisplay()->mDisplay;
+  return StyleDisplay::RubyText == display ||
+         StyleDisplay::RubyTextContainer == display;
+}
+
+static bool IsFindableNode(const nsINode* aNode) {
+  if (!IsDisplayedNode(aNode)) {
+    return false;
+  }
+
+  nsIFrame* frame = aNode->AsContent()->GetPrimaryFrame();
+  if (!frame) {
+    return true;
+  }
+  if (frame->StyleUI()->IsInert()) {
+    return false;
+  }
+  if (!frame->StyleVisibility()->IsVisible()) {
+    return false;
+  }
+
+  const bool isContentVisibilityHidden =
+      frame->HidesContent(nsIFrame::IncludeContentVisibility::Hidden) ||
+      frame->IsHiddenByContentVisibilityOnAnyAncestor(
+          nsIFrame::IncludeContentVisibility::Hidden);
+  if (isContentVisibilityHidden) {
+    return frame->IsHiddenUntilFoundOrClosedDetails();
+  }
+
+  return true;
+}
+
+static bool ShouldFindAnonymousContent(const nsIContent& aContent) {
+  MOZ_ASSERT(aContent.IsInNativeAnonymousSubtree());
+
+  nsIContent& host = AnonymousSubtreeRootParentOrHost(aContent);
+  if (const auto* formControl = nsIFormControl::FromNode(&host)) {
+    if (formControl->IsTextControl( true)) {
+      return aContent.IsEditable();
+    }
+
+    if (formControl->ControlType() == FormControlType::InputPassword) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool SkipNode(const nsIContent* aContent) {
+  const nsIContent* content = aContent;
+  while (content) {
+    if (!IsDisplayedNode(content) || content->IsComment() ||
+        content->IsAnyOfHTMLElements(nsGkAtoms::select)) {
+      DEBUG_FIND_PRINTF("Skipping node: ");
+      DumpNode(content);
+      return true;
+    }
+
+    if (const auto* option = HTMLOptionElement::FromNode(content)) {
+      const auto* select = option->GetSelect();
+      if (!select || select->IsCombobox()) {
+        DEBUG_FIND_PRINTF("Skipping node: ");
+        DumpNode(content);
+        return true;
+      }
+    }
+
+    if (StaticPrefs::browser_find_ignore_ruby_annotations() &&
+        IsRubyAnnotationNode(content)) {
+      DEBUG_FIND_PRINTF("Skipping node: ");
+      DumpNode(content);
+      return true;
+    }
+
+    if (content->IsInNativeAnonymousSubtree() &&
+        !ShouldFindAnonymousContent(*content)) {
+      DEBUG_FIND_PRINTF("Skipping node: ");
+      DumpNode(content);
+      return true;
+    }
+
+    if (IsBlockNode(content)) {
+      return false;
+    }
+
+    content = content->GetFlattenedTreeParent();
+  }
+
+  return false;
+}
+
+static const nsIContent* GetBlockParent(const Text& aNode) {
+  for (const nsIContent* current = aNode.GetFlattenedTreeParent(); current;
+       current = current->GetFlattenedTreeParent()) {
+    if (IsBlockNode(current)) {
+      return current;
+    }
+  }
+  return nullptr;
+}
+
+static bool NonTextNodeForcesBreak(const nsINode& aNode) {
+  nsIFrame* frame =
+      aNode.IsContent() ? aNode.AsContent()->GetPrimaryFrame() : nullptr;
+  return frame && frame->IsBrFrame();
+}
+
+static bool ForceBreakBetweenText(const Text& aPrevious, const Text& aNext) {
+  return GetBlockParent(aPrevious) != GetBlockParent(aNext);
+}
+
+struct nsFind::State final {
+  State(bool aFindBackward, nsIContent& aRoot, const RangeBoundary& aStartPoint)
+      : mFindBackward(aFindBackward),
+        mInitialized(false),
+        mFoundBreak(false),
+        mIterOffset(-1),
+        mIterator(aRoot),
+        mStartPoint(aStartPoint) {}
+
+  void PositionAt(Text& aNode) { mIterator.Seek(aNode); }
+
+  bool ForcedBreak() const { return mFoundBreak; }
+
+  Text* GetCurrentNode() const {
+    if (MOZ_UNLIKELY(!mInitialized)) {
+      return nullptr;
+    }
+    nsINode* node = mIterator.GetCurrent();
+    MOZ_ASSERT(!node || node->IsText());
+    return node ? node->GetAsText() : nullptr;
+  }
+
+  Text* GetNextNode(bool aAlreadyMatching) {
+    if (MOZ_UNLIKELY(!mInitialized)) {
+      MOZ_ASSERT(!aAlreadyMatching);
+      Initialize();
+    } else {
+      Advance(Initializing::No, aAlreadyMatching);
+      mIterOffset = -1;  
+    }
+    return GetCurrentNode();
+  }
+
+ private:
+  enum class Initializing { No, Yes };
+
+  void Advance(Initializing, bool aAlreadyMatching);
+  void Initialize();
+
+  static bool AnalyzeNode(const nsINode& aNode, const Text* aPrev,
+                          bool aAlreadyMatching, bool* aForcedBreak) {
+    if (!aNode.IsText()) {
+      *aForcedBreak = *aForcedBreak || NonTextNodeForcesBreak(aNode);
+      return false;
+    }
+    if (SkipNode(aNode.AsText())) {
+      return false;
+    }
+    *aForcedBreak = *aForcedBreak ||
+                    (aPrev && ForceBreakBetweenText(*aPrev, *aNode.AsText()));
+    if (*aForcedBreak) {
+      return true;
+    }
+
+    if (aAlreadyMatching && aPrev &&
+        !nsContentUtils::IsInSameAnonymousTree(&aNode, aPrev)) {
+      if (aPrev->IsInNativeAnonymousSubtree()) {
+        *aForcedBreak = true;
+        return true;
+      }
+      return false;
+    }
+
+    return true;
+  }
+
+  const bool mFindBackward;
+
+  bool mInitialized;
+
+ public:
+  bool mFoundBreak;
+  int mIterOffset;
+  TreeIterator<StyleChildrenIterator> mIterator;
+
+  const RangeBoundary& mStartPoint;
+};
+
+void nsFind::State::Advance(Initializing aInitializing, bool aAlreadyMatching) {
+  MOZ_ASSERT(mInitialized);
+
+  const Text* prev =
+      aInitializing == Initializing::Yes ? nullptr : GetCurrentNode();
+  mFoundBreak = false;
+
+  while (true) {
+    nsIContent* current =
+        mFindBackward ? mIterator.GetPrev() : mIterator.GetNext();
+    if (!current) {
+      return;
+    }
+    if (AnalyzeNode(*current, prev, aAlreadyMatching, &mFoundBreak)) {
+      break;
+    }
+  }
+}
+
+void nsFind::State::Initialize() {
+  MOZ_ASSERT(!mInitialized);
+  mInitialized = true;
+  mIterOffset = mFindBackward ? -1 : 0;
+
+  nsINode* container = mStartPoint.GetContainer();
+
+  nsIContent* beginning = mStartPoint.GetChildAtOffset();
+  if (beginning) {
+    mIterator.Seek(*beginning);
+    if (mFindBackward) {
+      mIterator.GetPrevSkippingChildren();
+    }
+  } else if (container && container->IsContent()) {
+    mIterator.Seek(*container->AsContent());
+  }
+
+  nsINode* current = mIterator.GetCurrent();
+  if (!current) {
+    return;
+  }
+
+  const bool kAlreadyMatching = false;
+  if (!AnalyzeNode(*current, nullptr, kAlreadyMatching, &mFoundBreak)) {
+    Advance(Initializing::Yes, kAlreadyMatching);
+    current = mIterator.GetCurrent();
+    if (!current) {
+      return;
+    }
+  }
+
+  if (current != container) {
+    return;
+  }
+
+  mIterOffset = int(
+      *mStartPoint.Offset(RangeBoundary::OffsetFilter::kValidOrInvalidOffsets));
+}
+
+class MOZ_STACK_CLASS nsFind::StateRestorer final {
+ public:
+  explicit StateRestorer(State& aState)
+      : mState(aState),
+        mIterOffset(aState.mIterOffset),
+        mFoundBreak(aState.mFoundBreak),
+        mCurrNode(aState.GetCurrentNode()) {}
+
+  ~StateRestorer() {
+    mState.mFoundBreak = mFoundBreak;
+    mState.mIterOffset = mIterOffset;
+    if (mCurrNode) {
+      mState.PositionAt(*mCurrNode);
+    }
+  }
+
+ private:
+  State& mState;
+
+  int32_t mIterOffset;
+  bool mFoundBreak;
+  Text* mCurrNode;
+};
+
+NS_IMETHODIMP
+nsFind::GetFindBackwards(bool* aFindBackward) {
+  if (!aFindBackward) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  *aFindBackward = mFindBackward;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsFind::SetFindBackwards(bool aFindBackward) {
+  mFindBackward = aFindBackward;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsFind::GetCaseSensitive(bool* aCaseSensitive) {
+  if (!aCaseSensitive) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  *aCaseSensitive = mCaseSensitive;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsFind::SetCaseSensitive(bool aCaseSensitive) {
+  mCaseSensitive = aCaseSensitive;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsFind::GetEntireWord(bool* aEntireWord) {
+  if (!aEntireWord) return NS_ERROR_NULL_POINTER;
+
+  *aEntireWord = mWordStartBounded && mWordEndBounded;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsFind::SetEntireWord(bool aEntireWord) {
+  mWordStartBounded = mWordEndBounded = aEntireWord;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsFind::GetMatchDiacritics(bool* aMatchDiacritics) {
+  if (!aMatchDiacritics) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  *aMatchDiacritics = mMatchDiacritics;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsFind::SetMatchDiacritics(bool aMatchDiacritics) {
+  mMatchDiacritics = aMatchDiacritics;
+  return NS_OK;
+}
+
+
+char32_t nsFind::DecodeChar(const char16_t* t2b, int32_t* index) const {
+  char32_t c = t2b[*index];
+  if (mFindBackward) {
+    if (*index >= 1 && mozilla::IsSurrogatePair(t2b[*index - 1], t2b[*index])) {
+      c = mozilla::SurrogateToUCS4(t2b[*index - 1], t2b[*index]);
+      (*index)--;
+    }
+  } else {
+    if (mozilla::IsSurrogatePair(t2b[*index], t2b[*index + 1])) {
+      c = mozilla::SurrogateToUCS4(t2b[*index], t2b[*index + 1]);
+      (*index)++;
+    }
+  }
+  return c;
+}
+
+bool nsFind::BreakInBetween(char32_t x, char32_t y) {
+  nsAutoStringN<4> text;
+  AppendUCS4ToUTF16(x, text);
+  const uint32_t x16Len = text.Length();
+  AppendUCS4ToUTF16(y, text);
+  mWordBreakIter.Reset(text);
+
+  return *mWordBreakIter.Seek(x16Len - 1) == x16Len;
+}
+
+char32_t nsFind::PeekNextChar(State& aState, bool aAlreadyMatching) const {
+  StateRestorer restorer(aState);
+
+  while (true) {
+    const Text* text = aState.GetNextNode(aAlreadyMatching);
+    if (!text || aState.ForcedBreak()) {
+      return L'\0';
+    }
+
+    const CharacterDataBuffer& characterDataBuffer = text->DataBuffer();
+    uint32_t len = characterDataBuffer.GetLength();
+    if (!len) {
+      continue;
+    }
+
+    const char16_t* t2b = nullptr;
+    const char* t1b = nullptr;
+
+    if (characterDataBuffer.Is2b()) {
+      t2b = characterDataBuffer.Get2b();
+    } else {
+      t1b = characterDataBuffer.Get1b();
+    }
+
+    int32_t index = mFindBackward ? len - 1 : 0;
+    return t1b ? CHAR_TO_UNICHAR(t1b[index]) : DecodeChar(t2b, &index);
+  }
+}
+
+#define NBSP_CHARCODE (CHAR_TO_UNICHAR(160))
+
+static bool IsSpace(char16_t aChar) {
+  return nsCRT::IsAsciiSpace(aChar) || aChar == NBSP_CHARCODE;
+}
+static bool IsSpace(char32_t aChar) {
+  return aChar <= 0xffff && IsSpace(char16_t(aChar));
+}
+
+#define OVERFLOW_PINDEX (mFindBackward ? pindex < 0 : pindex > patLen)
+#define DONE_WITH_PINDEX (mFindBackward ? pindex <= 0 : pindex >= patLen)
+
+NS_IMETHODIMP
+nsFind::Find(const nsAString& aPatText, nsRange* aSearchRange,
+             nsRange* aStartPoint, nsRange* aEndPoint, nsRange** aRangeRet) {
+  DEBUG_FIND_PRINTF("============== nsFind::Find('%s'%s, %p, %p, %p)\n",
+                    NS_LossyConvertUTF16toASCII(aPatText).get(),
+                    mFindBackward ? " (backward)" : " (forward)",
+                    (void*)aSearchRange, (void*)aStartPoint, (void*)aEndPoint);
+
+  NS_ENSURE_ARG(aSearchRange);
+  NS_ENSURE_ARG(aStartPoint);
+  NS_ENSURE_ARG(aEndPoint);
+  NS_ENSURE_ARG_POINTER(aRangeRet);
+
+  *aRangeRet = nullptr;
+
+  if (RefPtr findResult = FindFromRangeBoundaries(
+          aPatText, aStartPoint->StartRef(), aEndPoint->EndRef())) {
+    findResult.forget(aRangeRet);
+  }
+  return NS_OK;
+}
+already_AddRefed<nsRange> nsFind::FindFromRangeBoundaries(
+    const nsAString& aPatText, const mozilla::RangeBoundary& aStartPoint,
+    const mozilla::RangeBoundary& aEndPoint) {
+  if (!aStartPoint.IsSetAndInComposedDoc() ||
+      !aEndPoint.IsSetAndInComposedDoc()) {
+    return nullptr;
+  }
+  MOZ_ASSERT(aStartPoint.IsSetAndValid());
+  MOZ_ASSERT(aEndPoint.IsSetAndValid());
+  nsContentUtils::NodeIndexCache localCache;
+  AutoRestore<nsContentUtils::NodeIndexCache*> restoreCache(mNodeIndexCache);
+  if (!mNodeIndexCache) {
+    mNodeIndexCache = &localCache;
+  }
+#if MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  auto cmp = nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+      aStartPoint, aEndPoint, mNodeIndexCache);
+  MOZ_DIAGNOSTIC_ASSERT(cmp, "Start and end points in different trees?");
+  MOZ_DIAGNOSTIC_ASSERT(*cmp != 1, "Start point must not be after end point");
+#endif
+  if (MOZ_UNLIKELY(aStartPoint == aEndPoint)) {
+    return nullptr;
+  }
+
+  const Document* document = aStartPoint.GetContainer()->GetComposedDoc();
+  if (!document) {
+    return nullptr;
+  }
+
+  Element* root = document->GetRootElement();
+  if (!root) {
+    return nullptr;
+  }
+
+  nsAutoString patAutoStr(aPatText);
+  if (!mCaseSensitive) {
+    ToFoldedCase(patAutoStr);
+  }
+  if (!mMatchDiacritics) {
+    ToNaked(patAutoStr);
+  }
+
+  static const char16_t kShy[] = {CH_SHY, 0};
+  patAutoStr.StripChars(kShy);
+
+  const char16_t* patStr = patAutoStr.get();
+  const int32_t patLen = int(patAutoStr.Length()) - 1;
+
+  if (patLen < 0) {
+    return nullptr;
+  }
+
+  const int32_t patternStart = mFindBackward ? patLen : 0;
+
+  int32_t pindex = patternStart;
+
+  int32_t findex = 0;
+
+  const int incr = mFindBackward ? -1 : 1;
+
+  const CharacterDataBuffer* characterDataBuffer = nullptr;
+  int32_t fragLen = 0;
+
+  const char16_t* t2b = nullptr;
+  const char* t1b = nullptr;
+
+  bool inWhitespace = false;
+
+  Text* matchAnchorNode = nullptr;
+  int32_t matchAnchorOffset = 0;
+  char32_t matchAnchorChar = 0;
+
+  const RangeBoundary& endPoint = mFindBackward ? aStartPoint : aEndPoint;
+
+  char32_t c = 0;
+  char32_t patc = 0;
+  char32_t prevCharInMatch = 0;
+
+  State state(mFindBackward, *root, mFindBackward ? aEndPoint : aStartPoint);
+  Text* current = nullptr;
+
+  auto EndPartialMatch = [&]() -> bool {
+    const bool restart = !!matchAnchorNode && pindex != patternStart;
+    if (restart) {  
+      findex = matchAnchorOffset;
+      state.mIterOffset = matchAnchorOffset;
+      c = matchAnchorChar;
+
+      if (matchAnchorNode != state.GetCurrentNode()) {
+        characterDataBuffer = nullptr;
+        state.PositionAt(*matchAnchorNode);
+        DEBUG_FIND_PRINTF("Repositioned anchor node\n");
+      }
+      DEBUG_FIND_PRINTF(
+          "Ending a partial match; findex -> %d, mIterOffset -> %d\n", findex,
+          state.mIterOffset);
+    }
+    matchAnchorNode = nullptr;
+    matchAnchorOffset = 0;
+    matchAnchorChar = 0;
+    inWhitespace = false;
+    prevCharInMatch = 0;
+    pindex = patternStart;
+    DEBUG_FIND_PRINTF("Setting findex back to %d, pindex to %d\n", findex,
+                      pindex);
+    return restart;
+  };
+
+  while (true) {
+    DEBUG_FIND_PRINTF("Loop (pindex = %d)...\n", pindex);
+
+    if (!characterDataBuffer) {
+      current = state.GetNextNode(!!matchAnchorNode);
+      if (!current) {
+        DEBUG_FIND_PRINTF("Reached the end, matching: %d\n", !!matchAnchorNode);
+        if (EndPartialMatch()) {
+          continue;
+        }
+        return nullptr;
+      }
+
+      if (state.ForcedBreak()) {
+        DEBUG_FIND_PRINTF("Forced break!\n");
+        if (EndPartialMatch()) {
+          continue;
+        }
+        c = 0;
+      }
+
+      characterDataBuffer = &current->DataBuffer();
+      fragLen = int32_t(characterDataBuffer->GetLength());
+
+      if (current == matchAnchorNode) {
+        findex = matchAnchorOffset + (mFindBackward ? 1 : 0);
+      } else if (state.mIterOffset >= 0) {
+        findex = state.mIterOffset - (mFindBackward ? 1 : 0);
+      } else {
+        findex = mFindBackward ? (fragLen - 1) : 0;
+      }
+
+      state.mIterOffset = -1;
+
+      DEBUG_FIND_PRINTF("Starting from offset %d of %d\n", findex, fragLen);
+
+      if (findex < 0 || findex > fragLen - 1) {
+        DEBUG_FIND_PRINTF(
+            "At the end of a text node -- skipping to the next\n");
+        characterDataBuffer = nullptr;
+        continue;
+      }
+
+      if (characterDataBuffer->Is2b()) {
+        t2b = characterDataBuffer->Get2b();
+        t1b = nullptr;
+#ifdef DEBUG_FIND
+        nsAutoString str2(t2b, fragLen);
+        DEBUG_FIND_PRINTF("2 byte, '%s'\n",
+                          NS_LossyConvertUTF16toASCII(str2).get());
+#endif
+      } else {
+        t1b = characterDataBuffer->Get1b();
+        t2b = nullptr;
+#ifdef DEBUG_FIND
+        nsAutoCString str1(t1b, fragLen);
+        DEBUG_FIND_PRINTF("1 byte, '%s'\n", str1.get());
+#endif
+      }
+    } else {
+      findex += incr;
+      DEBUG_FIND_PRINTF("Same node -- (%d, %d)\n", pindex, findex);
+      if (mFindBackward ? (findex < 0) : (findex >= fragLen)) {
+        DEBUG_FIND_PRINTF(
+            "Will need to pull a new node: mAO = %d, frag len=%d\n",
+            matchAnchorOffset, fragLen);
+        characterDataBuffer = nullptr;
+        continue;
+      }
+    }
+
+    if (auto cmp = nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+            RawRangeBoundary(state.GetCurrentNode(), findex), endPoint,
+            mNodeIndexCache)) {
+      if ((mFindBackward && *cmp < 0) || (!mFindBackward && *cmp > 0)) {
+        DEBUG_FIND_PRINTF("Reached the end and not in the middle of a match\n");
+        return nullptr;
+      }
+    }
+
+    char32_t prevChar = c;
+    c = (t2b ? DecodeChar(t2b, &findex) : CHAR_TO_UNICHAR(t1b[findex]));
+    if (!mMatchDiacritics && IsCombiningDiacritic(c) &&
+        !intl::UnicodeProperties::IsMathOrMusicSymbol(prevChar)) {
+      continue;
+    }
+    patc = DecodeChar(patStr, &pindex);
+
+    DEBUG_FIND_PRINTF(
+        "Comparing '%c'=%#x to '%c'=%#x (%d of %d), findex=%d%s\n", (char)c,
+        (int)c, (char)patc, (int)patc, pindex, patLen, findex,
+        inWhitespace ? " (inWhitespace)" : "");
+
+    if (inWhitespace && !IsSpace(c)) {
+      inWhitespace = false;
+      pindex += incr;
+#ifdef DEBUG
+      if (OVERFLOW_PINDEX) {
+        NS_ASSERTION(false, "Missed a whitespace match");
+      }
+#endif
+      patc = DecodeChar(patStr, &pindex);
+    }
+    if (!inWhitespace && IsSpace(patc)) {
+      inWhitespace = true;
+    } else if (!inWhitespace) {
+      if (!mCaseSensitive) {
+        c = ToFoldedCase(c);
+      }
+      if (!mMatchDiacritics) {
+        c = ToNaked(c);
+      }
+    }
+
+    if (c == CH_SHY) {
+      continue;
+    }
+
+    if (pindex != patternStart && c != patc && !inWhitespace) {
+      if (c == '\n' && t2b && IS_CJ_CHAR(prevCharInMatch)) {
+        int32_t nindex = findex + incr;
+        if (mFindBackward ? (nindex >= 0) : (nindex < fragLen)) {
+          if (IS_CJ_CHAR(t2b[nindex])) {
+            continue;
+          }
+        }
+      }
+
+      if (IsDefaultIgnorable(c)) {
+        continue;
+      }
+    }
+
+    bool wordBreakPrev = true;
+    if (mWordStartBounded && prevChar) {
+      if (prevChar == NBSP_CHARCODE) {
+        prevChar = CHAR_TO_UNICHAR(' ');
+      }
+      wordBreakPrev = BreakInBetween(prevChar, c);
+    }
+
+    if ((c == patc && (!(mWordStartBounded || mWordEndBounded) ||
+                       matchAnchorNode || wordBreakPrev)) ||
+        (inWhitespace && IsSpace(c))) {
+      prevCharInMatch = c;
+      if (inWhitespace) {
+        DEBUG_FIND_PRINTF("YES (whitespace)(%d of %d)\n", pindex, patLen);
+      } else {
+        DEBUG_FIND_PRINTF("YES! '%c' == '%c' (%d of %d)\n", c, patc, pindex,
+                          patLen);
+      }
+
+      if (!matchAnchorNode) {
+        matchAnchorNode = state.GetCurrentNode();
+        matchAnchorOffset = findex;
+        if (!mozilla::IsInBMP(c)) {
+          matchAnchorOffset -= incr;
+        }
+        matchAnchorChar = c;
+      }
+
+      if (DONE_WITH_PINDEX) {
+        DEBUG_FIND_PRINTF("Found a match!\n");
+
+        if (mWordEndBounded || inWhitespace) {
+          int32_t nextfindex = findex + incr;
+
+          char32_t nextChar;
+          if (mFindBackward ? (nextfindex >= 0) : (nextfindex < fragLen)) {
+            if (t2b) {
+              nextChar = DecodeChar(t2b, &nextfindex);
+            } else {
+              nextChar = CHAR_TO_UNICHAR(t1b[nextfindex]);
+            }
+          } else {
+            nextChar = PeekNextChar(state, !!matchAnchorNode);
+          }
+
+          if (nextChar == NBSP_CHARCODE) {
+            nextChar = CHAR_TO_UNICHAR(' ');
+          }
+
+          if (mWordEndBounded && nextChar && !BreakInBetween(c, nextChar)) {
+            matchAnchorNode = nullptr;
+            continue;
+          }
+
+          if (inWhitespace && IsSpace(nextChar)) {
+            continue;
+          }
+        }
+
+        int32_t matchStartOffset;
+        int32_t matchEndOffset;
+        int32_t mao = matchAnchorOffset + (mFindBackward ? 1 : 0);
+        Text* startParent;
+        Text* endParent;
+        if (mFindBackward) {
+          startParent = current;
+          endParent = matchAnchorNode;
+          matchStartOffset = findex;
+          matchEndOffset = mao;
+        } else {
+          startParent = matchAnchorNode;
+          endParent = current;
+          matchStartOffset = mao;
+          matchEndOffset = findex + 1;
+        }
+
+        RefPtr<nsRange> range = nsRange::Create(current);
+        if (startParent && endParent && IsFindableNode(startParent) &&
+            IsFindableNode(endParent)) {
+          IgnoredErrorResult rv;
+          range->SetStart(*startParent, matchStartOffset, rv);
+          if (!rv.Failed()) {
+            range->SetEnd(*endParent, matchEndOffset, rv);
+          }
+          if (!rv.Failed()) {
+            return range.forget();
+          }
+        }
+
+        matchAnchorNode = nullptr;
+      }
+
+      if (matchAnchorNode) {
+        if (!inWhitespace || DONE_WITH_PINDEX ||
+            IsSpace(patStr[pindex + incr])) {
+          pindex += incr;
+          inWhitespace = false;
+          DEBUG_FIND_PRINTF("Advancing pindex to %d\n", pindex);
+        }
+
+        continue;
+      }
+    }
+
+    DEBUG_FIND_PRINTF("NOT: %c == %c\n", c, patc);
+    EndPartialMatch();
+  }
+}

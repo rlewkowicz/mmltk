@@ -1,0 +1,237 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_CallArgs_h
+#define js_CallArgs_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+
+#include <type_traits>
+
+#include "jstypes.h"
+
+#include "js/RootingAPI.h"
+#include "js/Value.h"
+
+using JSNative = bool (*)(JSContext* cx, unsigned argc, JS::Value* vp);
+
+namespace JS {
+
+extern JS_PUBLIC_DATA const HandleValue UndefinedHandleValue;
+
+namespace detail {
+
+extern JS_PUBLIC_API bool ComputeThis(JSContext* cx, JS::Value* vp,
+                                      MutableHandleObject thisObject);
+
+#ifdef JS_DEBUG
+extern JS_PUBLIC_API void CheckIsValidConstructible(const Value& v);
+#endif
+
+class MOZ_STACK_CLASS IncludeUsedRval {
+  mutable bool usedRval_ = false;
+
+ public:
+  bool usedRval() const { return usedRval_; }
+  void setUsedRval() const { usedRval_ = true; }
+  void clearUsedRval() const { usedRval_ = false; }
+  void assertUnusedRval() const { MOZ_ASSERT(!usedRval_); }
+};
+
+class MOZ_STACK_CLASS NoUsedRval {
+ public:
+  bool usedRval() const { return false; }
+  void setUsedRval() const {}
+  void clearUsedRval() const {}
+  void assertUnusedRval() const {}
+};
+
+template <class WantUsedRval>
+class MOZ_STACK_CLASS MOZ_NON_PARAM CallArgsBase {
+  static_assert(std::is_same_v<WantUsedRval, IncludeUsedRval> ||
+                    std::is_same_v<WantUsedRval, NoUsedRval>,
+                "WantUsedRval can only be IncludeUsedRval or NoUsedRval");
+
+ protected:
+  Value* argv_ = nullptr;
+  unsigned argc_ = 0;
+  bool constructing_ : 1;
+
+  bool ignoresReturnValue_ : 1;
+
+#ifdef JS_DEBUG
+  WantUsedRval wantUsedRval_;
+  bool usedRval() const { return wantUsedRval_.usedRval(); }
+  void setUsedRval() const { wantUsedRval_.setUsedRval(); }
+  void clearUsedRval() const { wantUsedRval_.clearUsedRval(); }
+  void assertUnusedRval() const { wantUsedRval_.assertUnusedRval(); }
+#else
+  bool usedRval() const { return false; }
+  void setUsedRval() const {}
+  void clearUsedRval() const {}
+  void assertUnusedRval() const {}
+#endif
+
+  CallArgsBase() : constructing_(false), ignoresReturnValue_(false) {}
+
+ public:
+
+  HandleValue calleev() const {
+    this->assertUnusedRval();
+    return HandleValue::fromMarkedLocation(&argv_[-2]);
+  }
+
+  JSObject& callee() const { return calleev().toObject(); }
+
+
+  bool isConstructing() const {
+#ifdef JS_DEBUG
+    if (constructing_ && !this->usedRval()) {
+      CheckIsValidConstructible(calleev());
+    }
+#endif
+    return constructing_;
+  }
+
+  bool ignoresReturnValue() const { return ignoresReturnValue_; }
+
+  MutableHandleValue newTarget() const {
+    MOZ_ASSERT(constructing_);
+    return MutableHandleValue::fromMarkedLocation(&this->argv_[argc_]);
+  }
+
+  HandleValue thisv() const {
+    return HandleValue::fromMarkedLocation(&argv_[-1]);
+  }
+
+  bool computeThis(JSContext* cx, MutableHandleObject thisObject) const {
+    if (thisv().isObject()) {
+      thisObject.set(&thisv().toObject());
+      return true;
+    }
+
+    return ComputeThis(cx, base(), thisObject);
+  }
+
+
+  unsigned length() const { return argc_; }
+
+  MutableHandleValue operator[](unsigned i) const {
+    MOZ_RELEASE_ASSERT(i < argc_);
+    return MutableHandleValue::fromMarkedLocation(&this->argv_[i]);
+  }
+
+  HandleValue get(unsigned i) const {
+    return i < length() ? HandleValue::fromMarkedLocation(&this->argv_[i])
+                        : UndefinedHandleValue;
+  }
+
+  bool hasDefined(unsigned i) const {
+    return i < argc_ && !this->argv_[i].isUndefined();
+  }
+
+
+  MutableHandleValue rval() const {
+    this->setUsedRval();
+    return MutableHandleValue::fromMarkedLocation(&argv_[-2]);
+  }
+
+  JS_PUBLIC_API inline bool requireAtLeast(JSContext* cx, const char* fnname,
+                                           unsigned required) const;
+
+ public:
+
+  void setCallee(const Value& aCalleev) const {
+    this->clearUsedRval();
+    argv_[-2] = aCalleev;
+  }
+
+  void setThis(const Value& aThisv) const { argv_[-1] = aThisv; }
+
+  MutableHandleValue mutableThisv() const {
+    return MutableHandleValue::fromMarkedLocation(&argv_[-1]);
+  }
+
+ public:
+
+  Value* array() const { return argv_; }
+  Value* end() const { return argv_ + argc_ + constructing_; }
+
+ public:
+
+  Value* base() const { return argv_ - 2; }
+
+  Value* spAfterCall() const {
+    this->setUsedRval();
+    return argv_ - 1;
+  }
+};
+
+}  
+
+class MOZ_STACK_CLASS MOZ_NON_PARAM CallArgs
+    : public detail::CallArgsBase<detail::IncludeUsedRval> {
+ private:
+  friend CallArgs CallArgsFromVp(unsigned argc, Value* vp);
+  friend CallArgs CallArgsFromSp(unsigned stackSlots, Value* sp,
+                                 bool constructing, bool ignoresReturnValue);
+
+  static CallArgs create(unsigned argc, Value* argv, bool constructing,
+                         bool ignoresReturnValue = false) {
+    CallArgs args;
+    args.clearUsedRval();
+    args.argv_ = argv;
+    args.argc_ = argc;
+    args.constructing_ = constructing;
+    args.ignoresReturnValue_ = ignoresReturnValue;
+#ifdef DEBUG
+    AssertValueIsNotGray(args.thisv());
+    AssertValueIsNotGray(args.calleev());
+    for (unsigned i = 0; i < argc; ++i) {
+      AssertValueIsNotGray(argv[i]);
+    }
+    if (constructing) {
+      AssertValueIsNotGray(args.newTarget());
+    }
+#endif
+    return args;
+  }
+
+ public:
+  static JS_PUBLIC_API void reportMoreArgsNeeded(JSContext* cx,
+                                                 const char* fnname,
+                                                 unsigned required,
+                                                 unsigned actual);
+};
+
+namespace detail {
+template <class WantUsedRval>
+JS_PUBLIC_API inline bool CallArgsBase<WantUsedRval>::requireAtLeast(
+    JSContext* cx, const char* fnname, unsigned required) const {
+  if (MOZ_LIKELY(required <= length())) {
+    return true;
+  }
+
+  CallArgs::reportMoreArgsNeeded(cx, fnname, required, length());
+  return false;
+}
+}  
+
+MOZ_ALWAYS_INLINE CallArgs CallArgsFromVp(unsigned argc, Value* vp) {
+  return CallArgs::create(argc, vp + 2,
+                          vp[1].isMagicNoReleaseCheck(JS_IS_CONSTRUCTING));
+}
+
+MOZ_ALWAYS_INLINE CallArgs CallArgsFromSp(unsigned stackSlots, Value* sp,
+                                          bool constructing = false,
+                                          bool ignoresReturnValue = false) {
+  return CallArgs::create(stackSlots - constructing, sp - stackSlots,
+                          constructing, ignoresReturnValue);
+}
+
+}  
+
+#endif /* js_CallArgs_h */

@@ -1,0 +1,43 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsXULPopupListener_h_
+#define nsXULPopupListener_h_
+
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIDOMEventListener.h"
+
+class nsIContent;
+
+namespace mozilla::dom {
+class Element;
+class MouseEvent;
+}  
+
+class nsXULPopupListener : public nsIDOMEventListener {
+ public:
+  nsXULPopupListener(mozilla::dom::Element* aElement, bool aIsContext);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_SKIPPABLE_CLASS(nsXULPopupListener)
+  NS_DECL_NSIDOMEVENTLISTENER
+
+ protected:
+  virtual ~nsXULPopupListener(void);
+
+  virtual nsresult LaunchPopup(mozilla::dom::MouseEvent* aEvent);
+
+  virtual void ClosePopup();
+
+ private:
+  RefPtr<mozilla::dom::Element> mElement;
+
+  RefPtr<mozilla::dom::Element> mPopupContent;
+
+  bool mIsContext;
+};
+
+#endif  // nsXULPopupListener_h_

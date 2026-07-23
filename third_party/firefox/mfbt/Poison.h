@@ -1,0 +1,73 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_Poison_h
+#define mozilla_Poison_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Types.h"
+
+#include <stdint.h>
+#include <string.h>
+
+MOZ_BEGIN_EXTERN_C
+
+extern MFBT_DATA uintptr_t gMozillaPoisonValue;
+
+inline uintptr_t mozPoisonValue() { return gMozillaPoisonValue; }
+
+inline void mozWritePoison(void* aPtr, size_t aSize) {
+  const uintptr_t POISON = mozPoisonValue();
+  char* p = (char*)aPtr;
+  char* limit = p + (aSize & ~(sizeof(uintptr_t) - 1));
+  MOZ_ASSERT(aSize >= sizeof(uintptr_t), "poisoning this object has no effect");
+  for (; p < limit; p += sizeof(uintptr_t)) {
+    memcpy(p, &POISON, sizeof(POISON));
+  }
+}
+
+extern MFBT_DATA uintptr_t gMozillaPoisonBase;
+extern MFBT_DATA uintptr_t gMozillaPoisonSize;
+
+MOZ_END_EXTERN_C
+
+#if defined(__cplusplus)
+
+namespace mozilla {
+
+class CorruptionCanaryForStatics {
+ public:
+  constexpr CorruptionCanaryForStatics() : mValue(kCanarySet) {}
+
+  ~CorruptionCanaryForStatics() = default;
+
+  void Check() const {
+    if (mValue != kCanarySet) {
+      MOZ_CRASH("Canary check failed, check lifetime");
+    }
+  }
+
+ protected:
+  uintptr_t mValue;
+
+ private:
+  static const uintptr_t kCanarySet = 0x0f0b0f0b;
+};
+
+class CorruptionCanary : public CorruptionCanaryForStatics {
+ public:
+  constexpr CorruptionCanary() = default;
+
+  ~CorruptionCanary() {
+    Check();
+    mValue = mozPoisonValue();
+  }
+};
+
+}  
+
+#endif
+
+#endif /* mozilla_Poison_h */

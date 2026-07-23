@@ -1,0 +1,825 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsURILoader.h"
+#include "nsComponentManagerUtils.h"
+#include "nsContentSecurityUtils.h"
+#include "nsIURIContentListener.h"
+#include "nsIContentHandler.h"
+#include "nsILoadGroup.h"
+#include "nsIDocumentLoader.h"
+#include "nsIStreamListener.h"
+#include "nsIURL.h"
+#include "nsIChannel.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsIInputStream.h"
+#include "nsIJARChannel.h"
+#include "nsIStreamConverterService.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsIHttpChannel.h"
+#include "netCore.h"
+#include "nsCRT.h"
+#include "nsIDocShell.h"
+#include "nsIThreadRetargetableStreamListener.h"
+#include "nsIChildChannel.h"
+#include "nsExternalHelperAppService.h"
+
+#include "nsString.h"
+#include "nsThreadUtils.h"
+#include "nsReadableUtils.h"
+#include "nsError.h"
+
+#include "nsICategoryManager.h"
+#include "nsCExternalHandlerService.h"
+
+#include "nsNetCID.h"
+
+#include "nsMimeTypes.h"
+
+#include "nsDocLoader.h"
+#include "mozilla/dom/LoadURIOptionsBinding.h"
+#include "mozilla/IntegerPrintfMacros.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/Result.h"
+#include "mozilla/StaticPrefs_browser.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_general.h"
+#include "nsContentUtils.h"
+#include "imgLoader.h"
+
+mozilla::LazyLogModule nsURILoader::mLog("URILoader");
+
+#define LOG(args) MOZ_LOG(nsURILoader::mLog, mozilla::LogLevel::Debug, args)
+#define LOG_ERROR(args) \
+  MOZ_LOG(nsURILoader::mLog, mozilla::LogLevel::Error, args)
+#define LOG_ENABLED() MOZ_LOG_TEST(nsURILoader::mLog, mozilla::LogLevel::Debug)
+
+NS_IMPL_ADDREF(nsDocumentOpenInfo)
+NS_IMPL_RELEASE(nsDocumentOpenInfo)
+
+NS_INTERFACE_MAP_BEGIN(nsDocumentOpenInfo)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIRequestObserver)
+  NS_INTERFACE_MAP_ENTRY(nsIRequestObserver)
+  NS_INTERFACE_MAP_ENTRY(nsIStreamListener)
+  NS_INTERFACE_MAP_ENTRY(nsIThreadRetargetableStreamListener)
+NS_INTERFACE_MAP_END
+
+nsDocumentOpenInfo::nsDocumentOpenInfo(nsIInterfaceRequestor* aWindowContext,
+                                       uint32_t aFlags, nsURILoader* aURILoader)
+    : m_originalContext(aWindowContext),
+      mFlags(aFlags),
+      mURILoader(aURILoader),
+      mDataConversionDepthLimit(
+          mozilla::StaticPrefs::
+              general_document_open_conversion_depth_limit()) {}
+
+nsDocumentOpenInfo::nsDocumentOpenInfo(uint32_t aFlags,
+                                       bool aAllowListenerConversions)
+    : m_originalContext(nullptr),
+      mFlags(aFlags),
+      mURILoader(nullptr),
+      mDataConversionDepthLimit(
+          mozilla::StaticPrefs::general_document_open_conversion_depth_limit()),
+      mAllowListenerConversions(aAllowListenerConversions) {}
+
+nsDocumentOpenInfo::~nsDocumentOpenInfo() = default;
+
+nsresult nsDocumentOpenInfo::Prepare() {
+  LOG(("[0x%p] nsDocumentOpenInfo::Prepare", this));
+
+  nsresult rv;
+
+  m_contentListener = do_GetInterface(m_originalContext, &rv);
+  return rv;
+}
+
+NS_IMETHODIMP nsDocumentOpenInfo::OnStartRequest(nsIRequest* request) {
+  LOG(("[0x%p] nsDocumentOpenInfo::OnStartRequest", this));
+  MOZ_ASSERT(request);
+  if (!request) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  nsresult rv = NS_OK;
+
+  nsCOMPtr<nsIHttpChannel> httpChannel(do_QueryInterface(request, &rv));
+
+  if (NS_SUCCEEDED(rv)) {
+    uint32_t responseCode = 0;
+
+    rv = httpChannel->GetResponseStatus(&responseCode);
+
+    if (NS_FAILED(rv)) {
+      LOG_ERROR(("  Failed to get HTTP response status"));
+
+      return NS_OK;
+    }
+
+    LOG(("  HTTP response status: %d", responseCode));
+
+    if (204 == responseCode || 205 == responseCode) {
+      return NS_BINDING_ABORTED;
+    }
+
+    if (!mozilla::StaticPrefs::
+            browser_http_blank_page_with_error_response_enabled()) {
+      int64_t contentLength = 0;
+      rv = httpChannel->GetContentLength(&contentLength);
+
+      if (NS_SUCCEEDED(rv) && contentLength == 0) {
+        nsCOMPtr<nsIURI> uri;
+        rv = httpChannel->GetURI(getter_AddRefs(uri));
+        if (NS_FAILED(rv) || !uri->SchemeIs("view-source")) {
+          if (responseCode >= 500) {
+            return NS_ERROR_NET_ERROR_RESPONSE;
+          }
+          if (responseCode >= 400) {
+            return NS_ERROR_NET_EMPTY_RESPONSE;
+          }
+        }
+      }
+    }
+  }
+
+  nsresult status;
+
+  rv = request->GetStatus(&status);
+
+  NS_ASSERTION(NS_SUCCEEDED(rv), "Unable to get request status!");
+  if (NS_FAILED(rv)) return rv;
+
+  if (NS_FAILED(status)) {
+    LOG_ERROR(("  Request failed, status: 0x%08" PRIX32,
+               static_cast<uint32_t>(status)));
+
+    return NS_OK;
+  }
+
+  rv = DispatchContent(request);
+
+  LOG(("  After dispatch, m_targetStreamListener: 0x%p, rv: 0x%08" PRIX32,
+       m_targetStreamListener.get(), static_cast<uint32_t>(rv)));
+
+  NS_ASSERTION(
+      NS_SUCCEEDED(rv) || !m_targetStreamListener,
+      "Must not have an m_targetStreamListener with a failure return!");
+
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (nsCOMPtr<nsIStreamListener> targetStreamListener =
+          m_targetStreamListener) {
+    rv = targetStreamListener->OnStartRequest(request);
+  }
+
+  LOG(("  OnStartRequest returning: 0x%08" PRIX32, static_cast<uint32_t>(rv)));
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsDocumentOpenInfo::CheckListenerChain() {
+  NS_ASSERTION(NS_IsMainThread(), "Should be on the main thread!");
+  nsresult rv = NS_OK;
+  nsCOMPtr<nsIThreadRetargetableStreamListener> retargetableListener =
+      do_QueryInterface(m_targetStreamListener, &rv);
+  if (retargetableListener) {
+    rv = retargetableListener->CheckListenerChain();
+  }
+  LOG(
+      ("[0x%p] nsDocumentOpenInfo::CheckListenerChain %s listener %p rv "
+       "%" PRIx32,
+       this, (NS_SUCCEEDED(rv) ? "success" : "failure"),
+       (nsIStreamListener*)m_targetStreamListener, static_cast<uint32_t>(rv)));
+  return rv;
+}
+
+NS_IMETHODIMP
+nsDocumentOpenInfo::OnDataAvailable(nsIRequest* request, nsIInputStream* inStr,
+                                    uint64_t sourceOffset, uint32_t count) {
+
+  mReceivedData = true;
+  nsresult rv = NS_OK;
+
+  if (nsCOMPtr<nsIStreamListener> targetStreamListener =
+          m_targetStreamListener) {
+    rv = targetStreamListener->OnDataAvailable(request, inStr, sourceOffset,
+                                               count);
+  }
+  return rv;
+}
+
+NS_IMETHODIMP
+nsDocumentOpenInfo::OnDataFinished(nsresult aStatus) {
+  if (!m_targetStreamListener) {
+    return NS_ERROR_FAILURE;
+  }
+  nsCOMPtr<nsIThreadRetargetableStreamListener> retargetableListener =
+      do_QueryInterface(m_targetStreamListener);
+  if (retargetableListener) {
+    return retargetableListener->OnDataFinished(aStatus);
+  }
+
+  return NS_OK;
+}
+
+nsresult nsDocumentOpenInfo::CheckContentLengthDiscrepancy(
+    nsIRequest* request) {
+  if (mReceivedData ||
+      mozilla::StaticPrefs::
+          browser_http_blank_page_with_error_response_enabled()) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChannel(do_QueryInterface(request));
+  if (!httpChannel) {
+    return NS_OK;
+  }
+
+  uint64_t decodedBodySize;
+  if (NS_FAILED(httpChannel->GetDecodedBodySize(&decodedBodySize)) ||
+      decodedBodySize != 0) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  if (NS_SUCCEEDED(httpChannel->GetURI(getter_AddRefs(uri))) &&
+      uri->SchemeIs("view-source")) {
+    return NS_OK;
+  }
+
+  uint32_t responseCode = 0;
+  if (NS_SUCCEEDED(httpChannel->GetResponseStatus(&responseCode))) {
+    if (responseCode >= 500) {
+      LOG(
+          ("  Returning NS_ERROR_NET_ERROR_RESPONSE from "
+           "nsDocumentOpenInfo::CheckContentLengthDiscrepancy due to 5xx "
+           "responses with no content"));
+      return NS_ERROR_NET_ERROR_RESPONSE;
+    }
+    if (responseCode >= 400) {
+      LOG(
+          ("  Returning NS_ERROR_NET_EMPTY_RESPONSE from "
+           "nsDocumentOpenInfo::CheckContentLengthDiscrepancy due to 4xx "
+           "responses with no content"));
+      return NS_ERROR_NET_EMPTY_RESPONSE;
+    }
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsDocumentOpenInfo::OnStopRequest(nsIRequest* request,
+                                                nsresult aStatus) {
+  LOG(("[0x%p] nsDocumentOpenInfo::OnStopRequest", this));
+
+  nsresult rv = CheckContentLengthDiscrepancy(request);
+  if (NS_FAILED(rv)) {
+    aStatus = rv;
+  }
+
+  if (m_targetStreamListener) {
+    nsCOMPtr<nsIStreamListener> listener(m_targetStreamListener);
+
+    m_targetStreamListener = nullptr;
+    mContentType.Truncate();
+    listener->OnStopRequest(request, aStatus);
+  }
+  mUsedContentHandler = false;
+
+  return NS_OK;
+}
+
+static bool IsContentPDF(nsIChannel* aChannel, const nsACString& aContentType) {
+  bool isPDF = aContentType.LowerCaseEqualsASCII(APPLICATION_PDF);
+  if (!isPDF && (aContentType.LowerCaseEqualsASCII(APPLICATION_OCTET_STREAM) ||
+                 aContentType.IsEmpty())) {
+    nsAutoString flname;
+    aChannel->GetContentDispositionFilename(flname);
+    isPDF = StringEndsWith(flname, u".pdf"_ns);
+    if (!isPDF) {
+      nsCOMPtr<nsIURI> uri;
+      aChannel->GetURI(getter_AddRefs(uri));
+      nsCOMPtr<nsIURL> url(do_QueryInterface(uri));
+      if (url) {
+        nsAutoCString ext;
+        url->GetFileExtension(ext);
+        isPDF = ext.EqualsLiteral("pdf");
+      }
+    }
+  }
+
+  return isPDF;
+}
+
+static mozilla::Result<bool, nsresult> ShouldHandleExternally(
+    const nsACString& aMimeType) {
+  nsCOMPtr<nsIMIMEInfo> mimeInfo;
+
+  nsCOMPtr<nsIMIMEService> mimeSvc(do_GetService(NS_MIMESERVICE_CONTRACTID));
+  if (!mimeSvc) {
+    return mozilla::Err(NS_ERROR_FAILURE);
+  }
+
+  mimeSvc->GetFromTypeAndExtension(aMimeType, EmptyCString(),
+                                   getter_AddRefs(mimeInfo));
+
+  if (mimeInfo) {
+    int32_t action = nsIMIMEInfo::saveToDisk;
+    mimeInfo->GetPreferredAction(&action);
+
+    bool alwaysAsk = true;
+    mimeInfo->GetAlwaysAskBeforeHandling(&alwaysAsk);
+    return alwaysAsk || action != nsIMIMEInfo::handleInternally;
+  }
+
+  return false;
+}
+
+static bool IsSandboxed(nsIChannel* aChannel) {
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  return loadInfo->GetSandboxFlags();
+}
+
+nsresult nsDocumentOpenInfo::DispatchContent(nsIRequest* request) {
+  LOG(("[0x%p] nsDocumentOpenInfo::DispatchContent for type '%s'", this,
+       mContentType.get()));
+
+  MOZ_ASSERT(!m_targetStreamListener,
+             "Why do we already have a target stream listener?");
+
+  nsresult rv;
+  nsCOMPtr<nsIChannel> aChannel = do_QueryInterface(request);
+  if (!aChannel) {
+    LOG_ERROR(("  Request is not a channel.  Bailing."));
+    return NS_ERROR_FAILURE;
+  }
+
+  constexpr auto anyType = "*/*"_ns;
+  if (mContentType.IsEmpty() || mContentType == anyType) {
+    rv = aChannel->GetContentType(mContentType);
+    if (NS_FAILED(rv)) return rv;
+    LOG(("  Got type from channel: '%s'", mContentType.get()));
+  }
+
+  bool isGuessFromExt =
+      mContentType.LowerCaseEqualsASCII(APPLICATION_GUESS_FROM_EXT);
+  if (isGuessFromExt) {
+    mContentType = APPLICATION_OCTET_STREAM;
+    aChannel->SetContentType(nsLiteralCString(APPLICATION_OCTET_STREAM));
+  }
+
+  uint32_t disposition;
+  rv = aChannel->GetContentDisposition(&disposition);
+
+  bool forceExternalHandling =
+      NS_SUCCEEDED(rv) && disposition == nsIChannel::DISPOSITION_ATTACHMENT;
+
+  LOG(("  forceExternalHandling: %s", forceExternalHandling ? "yes" : "no"));
+  LOG(("  IsSandboxed: %s", IsSandboxed(aChannel) ? "yes" : "no"));
+  LOG(("  IsContentPDF: %s",
+       IsContentPDF(aChannel, mContentType) ? "yes" : "no"));
+
+  if (forceExternalHandling && (mFlags & nsIURILoader::IS_OBJECT_EMBED) &&
+      (imgLoader::SupportImageWithMimeType(mContentType) ||
+       IsContentPDF(aChannel, mContentType))) {
+    LOG(("Handling pdf/image MIME internally for object/embed element"));
+    forceExternalHandling = false;
+  }
+
+  bool maybeForceInternalHandling =
+      forceExternalHandling &&
+      mozilla::StaticPrefs::browser_download_open_pdf_attachments_inline();
+
+  if (maybeForceInternalHandling && IsContentPDF(aChannel, mContentType)) {
+    auto result = ShouldHandleExternally(nsLiteralCString(APPLICATION_PDF));
+    if (result.isErr()) {
+      return result.unwrapErr();
+    }
+    forceExternalHandling = result.unwrap();
+
+    if (IsSandboxed(aChannel) && !forceExternalHandling) {
+      LOG(("Blocked sandboxed PDF"));
+      nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(aChannel);
+      if (httpChannel) {
+        nsContentSecurityUtils::LogMessageToConsole(
+            httpChannel, "IframeSandboxBlockedDownload");
+      }
+      return NS_ERROR_CONTENT_BLOCKED;
+    }
+  }
+
+  if (!forceExternalHandling) {
+    if (TryDefaultContentListener(aChannel)) {
+      LOG(("  Success!  Our default listener likes this type"));
+      return NS_OK;
+    }
+
+    if (!(mFlags & nsIURILoader::DONT_RETARGET)) {
+      int32_t count = mURILoader ? mURILoader->m_listeners.Count() : 0;
+      nsCOMPtr<nsIURIContentListener> listener;
+      for (int32_t i = 0; i < count; i++) {
+        listener = do_QueryReferent(mURILoader->m_listeners[i]);
+        if (listener) {
+          if (TryContentListener(listener, aChannel)) {
+            LOG(("  Found listener registered on the URILoader"));
+            return NS_OK;
+          }
+        } else {
+          mURILoader->m_listeners.RemoveObjectAt(i--);
+          --count;
+        }
+      }
+
+      nsAutoCString handlerContractID(NS_CONTENT_HANDLER_CONTRACTID_PREFIX);
+      handlerContractID += mContentType;
+
+      nsCOMPtr<nsIContentHandler> contentHandler =
+          do_CreateInstance(handlerContractID.get());
+      if (contentHandler) {
+        LOG(("  Content handler found"));
+        rv = contentHandler->HandleContent(mContentType.get(),
+                                           m_originalContext, request);
+        if (rv != NS_ERROR_WONT_HANDLE_CONTENT) {
+          if (NS_FAILED(rv)) {
+            LOG(("  Content handler failed.  Aborting load"));
+            request->Cancel(rv);
+          } else {
+            LOG(("  Content handler taking over load"));
+            mUsedContentHandler = true;
+          }
+
+          return rv;
+        }
+      }
+    } else {
+      LOG(
+          ("  DONT_RETARGET flag set, so skipped over random other content "
+           "listeners and content handlers"));
+    }
+
+    if (mContentType != anyType) {
+      rv = TryStreamConversion(aChannel);
+      if (NS_SUCCEEDED(rv)) {
+        return NS_OK;
+      }
+    }
+  }
+
+  NS_ASSERTION(!m_targetStreamListener,
+               "If we found a listener, why are we not using it?");
+
+  nsCOMPtr<nsIHttpChannel> httpChannel(do_QueryInterface(request));
+  if (httpChannel) {
+    bool requestSucceeded;
+    rv = httpChannel->GetRequestSucceeded(&requestSucceeded);
+    if (NS_FAILED(rv) || !requestSucceeded) {
+      LOG(
+          ("  Returning NS_ERROR_NET_ERROR_RESPONSE from "
+           "nsDocumentOpenInfo::DispatchContent due to failed HTTP response"));
+      return NS_ERROR_NET_ERROR_RESPONSE;
+    }
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  if (mFlags & nsIURILoader::DONT_RETARGET ||
+      loadInfo->GetForceMediaDocument() !=
+          mozilla::dom::ForceMediaDocument::None) {
+    LOG(
+        ("  External handling forced or (listener not interested and no "
+         "stream converter exists), and retargeting disallowed -> aborting"));
+    return NS_ERROR_WONT_HANDLE_CONTENT;
+  }
+
+
+  nsCOMPtr<nsIExternalHelperAppService> helperAppService =
+      do_GetService(NS_EXTERNALHELPERAPPSERVICE_CONTRACTID, &rv);
+  if (helperAppService) {
+    LOG(("  Passing load off to helper app service"));
+
+    nsLoadFlags loadFlags = 0;
+    request->GetLoadFlags(&loadFlags);
+    request->SetLoadFlags(loadFlags | nsIChannel::LOAD_RETARGETED_DOCUMENT_URI |
+                          nsIChannel::LOAD_TARGETED);
+
+    if (isGuessFromExt || mContentType.IsEmpty()) {
+      mContentType = APPLICATION_GUESS_FROM_EXT;
+      aChannel->SetContentType(nsLiteralCString(APPLICATION_GUESS_FROM_EXT));
+    }
+
+    rv = TryExternalHelperApp(helperAppService, aChannel);
+    if (NS_FAILED(rv)) {
+      request->SetLoadFlags(loadFlags);
+      m_targetStreamListener = nullptr;
+    }
+  }
+
+  NS_ASSERTION(m_targetStreamListener || NS_FAILED(rv),
+               "There is no way we should be successful at this point without "
+               "a m_targetStreamListener");
+  return rv;
+}
+
+nsresult nsDocumentOpenInfo::TryExternalHelperApp(
+    nsIExternalHelperAppService* aHelperAppService, nsIChannel* aChannel) {
+  return aHelperAppService->DoContent(mContentType, aChannel, m_originalContext,
+                                      false, nullptr,
+                                      getter_AddRefs(m_targetStreamListener));
+}
+
+nsresult nsDocumentOpenInfo::ConvertData(nsIRequest* request,
+                                         nsIURIContentListener* aListener,
+                                         const nsACString& aSrcContentType,
+                                         const nsACString& aOutContentType) {
+  LOG(("[0x%p] nsDocumentOpenInfo::ConvertData from '%s' to '%s'", this,
+       PromiseFlatCString(aSrcContentType).get(),
+       PromiseFlatCString(aOutContentType).get()));
+
+  if (mDataConversionDepthLimit == 0) {
+    LOG(
+        ("[0x%p] nsDocumentOpenInfo::ConvertData - reached the recursion "
+         "limit!",
+         this));
+    return NS_ERROR_ABORT;
+  }
+
+  MOZ_ASSERT(aSrcContentType != aOutContentType,
+             "ConvertData called when the two types are the same!");
+
+  nsresult rv = NS_OK;
+
+  nsCOMPtr<nsIStreamConverterService> StreamConvService =
+      do_GetService(NS_STREAMCONVERTERSERVICE_CONTRACTID, &rv);
+  if (NS_FAILED(rv)) return rv;
+
+  LOG(("  Got converter service"));
+
+  RefPtr<nsDocumentOpenInfo> nextLink = Clone();
+
+  LOG(("  Downstream DocumentOpenInfo would be: 0x%p", nextLink.get()));
+
+  nextLink->mDataConversionDepthLimit = mDataConversionDepthLimit - 1;
+
+  nextLink->m_contentListener = aListener;
+  nextLink->m_targetStreamListener = nullptr;
+
+  nextLink->mContentType = aOutContentType;
+
+  return StreamConvService->AsyncConvertData(
+      PromiseFlatCString(aSrcContentType).get(),
+      PromiseFlatCString(aOutContentType).get(), nextLink, request,
+      getter_AddRefs(m_targetStreamListener));
+}
+
+nsresult nsDocumentOpenInfo::TryStreamConversion(nsIChannel* aChannel) {
+  constexpr auto anyType = "*/*"_ns;
+
+  nsCString srcContentType(mContentType);
+  if (srcContentType.IsEmpty()) {
+    srcContentType.AssignLiteral(UNKNOWN_CONTENT_TYPE);
+  }
+
+  if (srcContentType.EqualsLiteral(UNKNOWN_CONTENT_TYPE)) {
+    if (nsCOMPtr<nsIJARChannel> jar = do_QueryInterface(aChannel)) {
+      m_targetStreamListener = nullptr;
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+  }
+
+  nsresult rv =
+      ConvertData(aChannel, m_contentListener, srcContentType, anyType);
+  if (NS_FAILED(rv)) {
+    m_targetStreamListener = nullptr;
+  } else if (m_targetStreamListener) {
+    LOG(("  Converter taking over now"));
+  }
+  return rv;
+}
+
+bool nsDocumentOpenInfo::TryContentListener(nsIURIContentListener* aListener,
+                                            nsIChannel* aChannel) {
+  LOG(("[0x%p] nsDocumentOpenInfo::TryContentListener; mFlags = 0x%x", this,
+       mFlags));
+
+  MOZ_ASSERT(aListener, "Must have a non-null listener");
+  MOZ_ASSERT(aChannel, "Must have a channel");
+
+  bool listenerWantsContent = false;
+  nsCString typeToUse;
+
+  if (mFlags & nsIURILoader::IS_CONTENT_PREFERRED) {
+    aListener->IsPreferred(mContentType.get(), getter_Copies(typeToUse),
+                           &listenerWantsContent);
+  } else {
+    aListener->CanHandleContent(mContentType.get(), false,
+                                getter_Copies(typeToUse),
+                                &listenerWantsContent);
+  }
+  if (!listenerWantsContent) {
+    LOG(("  Listener is not interested"));
+    return false;
+  }
+
+  if (!typeToUse.IsEmpty() && typeToUse != mContentType) {
+
+    nsresult rv = NS_ERROR_NOT_AVAILABLE;
+    if (mAllowListenerConversions) {
+      rv = ConvertData(aChannel, aListener, mContentType, typeToUse);
+    }
+
+    if (NS_FAILED(rv)) {
+      m_targetStreamListener = nullptr;
+    }
+
+    LOG(("  Found conversion: %s", m_targetStreamListener ? "yes" : "no"));
+
+    return m_targetStreamListener != nullptr;
+  }
+
+  nsLoadFlags loadFlags = 0;
+  aChannel->GetLoadFlags(&loadFlags);
+
+  nsLoadFlags newLoadFlags = nsIChannel::LOAD_TARGETED;
+
+  nsCOMPtr<nsIURIContentListener> originalListener =
+      do_GetInterface(m_originalContext);
+  if (originalListener != aListener) {
+    newLoadFlags |= nsIChannel::LOAD_RETARGETED_DOCUMENT_URI;
+  }
+  aChannel->SetLoadFlags(loadFlags | newLoadFlags);
+
+  bool abort = false;
+  bool isPreferred = (mFlags & nsIURILoader::IS_CONTENT_PREFERRED) != 0;
+  nsresult rv =
+      aListener->DoContent(mContentType, isPreferred, aChannel,
+                           getter_AddRefs(m_targetStreamListener), &abort);
+
+  if (NS_FAILED(rv)) {
+    LOG_ERROR(("  DoContent failed"));
+
+    aChannel->SetLoadFlags(loadFlags);
+    m_targetStreamListener = nullptr;
+    return false;
+  }
+
+  if (abort) {
+    LOG(("  Listener has aborted the load"));
+    m_targetStreamListener = nullptr;
+  }
+
+  NS_ASSERTION(abort || m_targetStreamListener,
+               "DoContent returned no listener?");
+
+  return true;
+}
+
+bool nsDocumentOpenInfo::TryDefaultContentListener(nsIChannel* aChannel) {
+  if (m_contentListener) {
+    return TryContentListener(m_contentListener, aChannel);
+  }
+  return false;
+}
+
+
+nsURILoader::nsURILoader() = default;
+
+nsURILoader::~nsURILoader() = default;
+
+NS_IMPL_ADDREF(nsURILoader)
+NS_IMPL_RELEASE(nsURILoader)
+
+NS_INTERFACE_MAP_BEGIN(nsURILoader)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIURILoader)
+  NS_INTERFACE_MAP_ENTRY(nsIURILoader)
+NS_INTERFACE_MAP_END
+
+NS_IMETHODIMP nsURILoader::RegisterContentListener(
+    nsIURIContentListener* aContentListener) {
+  nsresult rv = NS_OK;
+
+  nsWeakPtr weakListener = do_GetWeakReference(aContentListener);
+  NS_ASSERTION(weakListener,
+               "your URIContentListener must support weak refs!\n");
+
+  if (weakListener) m_listeners.AppendObject(weakListener);
+
+  return rv;
+}
+
+NS_IMETHODIMP nsURILoader::UnRegisterContentListener(
+    nsIURIContentListener* aContentListener) {
+  nsWeakPtr weakListener = do_GetWeakReference(aContentListener);
+  if (weakListener) m_listeners.RemoveObject(weakListener);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsURILoader::OpenURI(nsIChannel* channel, uint32_t aFlags,
+                                   nsIInterfaceRequestor* aWindowContext) {
+  NS_ENSURE_ARG_POINTER(channel);
+
+  if (LOG_ENABLED()) {
+    nsCOMPtr<nsIURI> uri;
+    channel->GetURI(getter_AddRefs(uri));
+    nsAutoCString spec;
+    uri->GetAsciiSpec(spec);
+    LOG(("nsURILoader::OpenURI for %s", spec.get()));
+  }
+
+  nsCOMPtr<nsIStreamListener> loader;
+  nsresult rv = OpenChannel(channel, aFlags, aWindowContext, false,
+                            getter_AddRefs(loader));
+  if (NS_FAILED(rv)) {
+    if (rv == NS_ERROR_WONT_HANDLE_CONTENT) {
+      return NS_OK;
+    }
+  }
+
+
+  rv = channel->AsyncOpen(loader);
+
+  if (rv == NS_ERROR_NO_CONTENT) {
+    LOG(("  rv is NS_ERROR_NO_CONTENT -- doing nothing"));
+    return NS_OK;
+  }
+  return rv;
+}
+
+nsresult nsURILoader::OpenChannel(nsIChannel* channel, uint32_t aFlags,
+                                  nsIInterfaceRequestor* aWindowContext,
+                                  bool aChannelIsOpen,
+                                  nsIStreamListener** aListener) {
+  NS_ASSERTION(channel, "Trying to open a null channel!");
+  NS_ASSERTION(aWindowContext, "Window context must not be null");
+
+  if (LOG_ENABLED()) {
+    nsCOMPtr<nsIURI> uri;
+    channel->GetURI(getter_AddRefs(uri));
+    nsAutoCString spec;
+    uri->GetAsciiSpec(spec);
+    LOG(("nsURILoader::OpenChannel for %s", spec.get()));
+  }
+
+  RefPtr loader =
+      mozilla::MakeRefPtr<nsDocumentOpenInfo>(aWindowContext, aFlags, this);
+
+  nsCOMPtr<nsILoadGroup> loadGroup(do_GetInterface(aWindowContext));
+
+  if (!loadGroup) {
+    nsCOMPtr<nsIURIContentListener> listener(do_GetInterface(aWindowContext));
+    if (listener) {
+      nsCOMPtr<nsISupports> cookie;
+      listener->GetLoadCookie(getter_AddRefs(cookie));
+      if (!cookie) {
+        RefPtr newDocLoader = mozilla::MakeRefPtr<nsDocLoader>();
+        nsresult rv = newDocLoader->Init();
+        if (NS_FAILED(rv)) return rv;
+        rv = nsDocLoader::AddDocLoaderAsChildOfRoot(newDocLoader);
+        if (NS_FAILED(rv)) return rv;
+        cookie = nsDocLoader::GetAsSupports(newDocLoader);
+        listener->SetLoadCookie(cookie);
+      }
+      loadGroup = do_GetInterface(cookie);
+    }
+  }
+
+  nsCOMPtr<nsILoadGroup> oldGroup;
+  channel->GetLoadGroup(getter_AddRefs(oldGroup));
+  if (aChannelIsOpen && !SameCOMIdentity(oldGroup, loadGroup)) {
+    loadGroup->AddRequest(channel, nullptr);
+
+    if (oldGroup) {
+      oldGroup->RemoveRequest(channel, nullptr, NS_BINDING_RETARGETED);
+    }
+  }
+
+  channel->SetLoadGroup(loadGroup);
+
+  nsresult rv = loader->Prepare();
+  if (NS_SUCCEEDED(rv)) NS_ADDREF(*aListener = loader);
+  return rv;
+}
+
+NS_IMETHODIMP nsURILoader::OpenChannel(nsIChannel* channel, uint32_t aFlags,
+                                       nsIInterfaceRequestor* aWindowContext,
+                                       nsIStreamListener** aListener) {
+  bool pending;
+  if (NS_FAILED(channel->IsPending(&pending))) {
+    pending = false;
+  }
+
+  return OpenChannel(channel, aFlags, aWindowContext, pending, aListener);
+}
+
+NS_IMETHODIMP nsURILoader::Stop(nsISupports* aLoadCookie) {
+  nsresult rv;
+  nsCOMPtr<nsIDocumentLoader> docLoader;
+
+  NS_ENSURE_ARG_POINTER(aLoadCookie);
+
+  docLoader = do_GetInterface(aLoadCookie, &rv);
+  if (docLoader) {
+    rv = docLoader->Stop();
+  }
+  return rv;
+}

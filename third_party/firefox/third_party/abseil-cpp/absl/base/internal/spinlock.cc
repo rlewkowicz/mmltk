@@ -1,0 +1,146 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "absl/base/internal/spinlock.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <limits>
+
+#include "absl/base/attributes.h"
+#include "absl/base/call_once.h"
+#include "absl/base/config.h"
+#include "absl/base/internal/atomic_hook.h"
+#include "absl/base/internal/cycleclock.h"
+#include "absl/base/internal/scheduling_mode.h"
+#include "absl/base/internal/spinlock_wait.h"
+#include "absl/base/internal/sysinfo.h" /* For NumCPUs() */
+#include "absl/base/internal/tsan_mutex_interface.h"
+
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace base_internal {
+
+ABSL_INTERNAL_ATOMIC_HOOK_ATTRIBUTES static AtomicHook<void (*)(
+    const void *lock, int64_t wait_cycles)>
+    submit_profile_data;
+
+void RegisterSpinLockProfiler(void (*fn)(const void *contendedlock,
+                                         int64_t wait_cycles)) {
+  submit_profile_data.Store(fn);
+}
+
+ABSL_CONST_INIT std::atomic<int> SpinLock::adaptive_spin_count_{0};
+uint32_t SpinLock::SpinLoop() {
+  if (adaptive_spin_count_.load(std::memory_order_relaxed) == 0) {
+    int current_spin_count = 0;
+    int new_spin_count = NumCPUs() > 1 ? 1000 : 1;
+    adaptive_spin_count_.compare_exchange_weak(
+        current_spin_count, new_spin_count, std::memory_order_relaxed,
+        std::memory_order_relaxed);
+  }
+  int c = adaptive_spin_count_.load(std::memory_order_relaxed);
+  uint32_t lock_value;
+  do {
+    lock_value = lockword_.load(std::memory_order_relaxed);
+  } while ((lock_value & kSpinLockHeld) != 0 && --c > 0);
+  return lock_value;
+}
+
+void SpinLock::SlowLock() {
+  uint32_t lock_value = SpinLoop();
+  lock_value = TryLockInternal(lock_value, 0);
+  if ((lock_value & kSpinLockHeld) == 0) {
+    return;
+  }
+
+  SchedulingMode scheduling_mode;
+  if ((lock_value & kSpinLockCooperative) != 0) {
+    scheduling_mode = SCHEDULE_COOPERATIVE_AND_KERNEL;
+  } else {
+    scheduling_mode = SCHEDULE_KERNEL_ONLY;
+  }
+
+  int64_t wait_start_time = CycleClock::Now();
+  uint32_t wait_cycles = 0;
+  int lock_wait_call_count = 0;
+  while ((lock_value & kSpinLockHeld) != 0) {
+    if ((lock_value & kWaitTimeMask) == 0) {
+      if (lockword_.compare_exchange_strong(
+              lock_value, lock_value | kSpinLockSleeper,
+              std::memory_order_relaxed, std::memory_order_relaxed)) {
+        lock_value |= kSpinLockSleeper;
+      } else if ((lock_value & kSpinLockHeld) == 0) {
+        lock_value = TryLockInternal(lock_value, wait_cycles);
+        continue;  
+      } else if ((lock_value & kWaitTimeMask) == 0) {
+        continue;
+      }
+    }
+
+    ABSL_TSAN_MUTEX_PRE_DIVERT(this, 0);
+    SpinLockDelay(&lockword_, lock_value, ++lock_wait_call_count,
+                  scheduling_mode);
+    ABSL_TSAN_MUTEX_POST_DIVERT(this, 0);
+    lock_value = SpinLoop();
+    wait_cycles = EncodeWaitCycles(wait_start_time, CycleClock::Now());
+    lock_value = TryLockInternal(lock_value, wait_cycles);
+  }
+}
+
+void SpinLock::SlowUnlock(uint32_t lock_value) {
+  SpinLockWake(&lockword_,
+               false);  
+
+  if ((lock_value & kWaitTimeMask) != kSpinLockSleeper) {
+    const int64_t wait_cycles = DecodeWaitCycles(lock_value);
+    ABSL_TSAN_MUTEX_PRE_DIVERT(this, 0);
+    submit_profile_data(this, wait_cycles);
+    ABSL_TSAN_MUTEX_POST_DIVERT(this, 0);
+  }
+}
+
+static constexpr int kProfileTimestampShift = 7;
+
+static constexpr int kLockwordReservedShift = 3;
+
+uint32_t SpinLock::EncodeWaitCycles(int64_t wait_start_time,
+                                    int64_t wait_end_time) {
+  static const int64_t kMaxWaitTime =
+      std::numeric_limits<uint32_t>::max() >> kLockwordReservedShift;
+  int64_t scaled_wait_time =
+      (wait_end_time - wait_start_time) >> kProfileTimestampShift;
+
+  uint32_t clamped = static_cast<uint32_t>(
+      std::min(scaled_wait_time, kMaxWaitTime) << kLockwordReservedShift);
+
+  if (clamped == 0) {
+    return kSpinLockSleeper;  
+  }
+  const uint32_t kMinWaitTime =
+      kSpinLockSleeper + (1 << kLockwordReservedShift);
+  if (clamped == kSpinLockSleeper) {
+    return kMinWaitTime;
+  }
+  return clamped;
+}
+
+int64_t SpinLock::DecodeWaitCycles(uint32_t lock_value) {
+  const int64_t scaled_wait_time =
+      static_cast<uint32_t>(lock_value & kWaitTimeMask);
+  return scaled_wait_time << (kProfileTimestampShift - kLockwordReservedShift);
+}
+
+}  
+ABSL_NAMESPACE_END
+}  

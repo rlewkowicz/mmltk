@@ -1,0 +1,106 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_QUOTA_ENCRYPTEDRANDOMACCESSBLOCK_H_
+#define DOM_QUOTA_ENCRYPTEDRANDOMACCESSBLOCK_H_
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+
+#include "mozilla/Span.h"
+#include "nsTArray.h"
+
+namespace mozilla::dom::quota {
+
+class EncryptedRandomAccessBlock {
+ public:
+  static constexpr size_t BlockSize = 4096;
+
+  using VersionType = uint16_t;
+  static constexpr VersionType kEncryptedRandomAccessBlockLatestVersion = 1;
+
+  template <size_t N>
+  using ConstSpan = Span<const uint8_t, N>;
+  template <size_t N>
+  using MutableSpan = Span<uint8_t, N>;
+
+  explicit EncryptedRandomAccessBlock(
+      VersionType aVersion = kEncryptedRandomAccessBlockLatestVersion) {
+    mData.SetLength(BlockSize);
+
+    std::fill(mData.begin(), mData.end(), 0);
+
+    SetVersion(aVersion);
+  }
+
+  static constexpr size_t CipherMetadataSize = 32;
+
+  static constexpr size_t HeaderSize = 32;
+
+ private:
+  static constexpr size_t VersionSize = sizeof(VersionType);
+  static_assert(VersionSize == 2, "Version should take 2 bytes on disk.");
+
+ public:
+  ConstSpan<HeaderSize> Header() const {
+    return WholeBlock().Subspan<0, HeaderSize>();
+  }
+
+  VersionType Version() const {
+    VersionType version = std::numeric_limits<VersionType>::max();
+    memcpy(&version, mData.Elements(), VersionSize);
+    return version;
+  }
+
+  void SetVersion(VersionType aVersion) {
+    memcpy(mData.Elements(), &aVersion, VersionSize);
+  }
+
+  ConstSpan<HeaderSize - VersionSize> ReservedBytes() const {
+    return WholeBlock().Subspan<VersionSize, HeaderSize - VersionSize>();
+  }
+  static_assert(HeaderSize - VersionSize == 30,
+                "Reserved region should take 30 bytes on disk.");
+
+  ConstSpan<CipherMetadataSize> CipherMetadata() const {
+    return WholeBlock().Subspan<HeaderSize, CipherMetadataSize>();
+  }
+
+  MutableSpan<CipherMetadataSize> MutableCipherMetadata() {
+    return MutableWholeBlock().Subspan<HeaderSize, CipherMetadataSize>();
+  }
+
+  static constexpr size_t CipherPayloadSize =
+      BlockSize - HeaderSize - CipherMetadataSize;
+  static_assert(CipherPayloadSize == 4032,
+                "CipherPayload should take 4032 bytes on disk.");
+
+  ConstSpan<CipherPayloadSize> CipherPayload() const {
+    return WholeBlock()
+        .Subspan<HeaderSize + CipherMetadataSize, CipherPayloadSize>();
+  }
+
+  MutableSpan<CipherPayloadSize> MutableCipherPayload() {
+    return MutableWholeBlock()
+        .Subspan<HeaderSize + CipherMetadataSize, CipherPayloadSize>();
+  }
+
+  void AssignFromBytes(ConstSpan<BlockSize> aData) {
+    memcpy(mData.Elements(), aData.data(), BlockSize);
+  }
+
+  ConstSpan<BlockSize> WholeBlock() const { return mData; }
+
+  MutableSpan<BlockSize> MutableWholeBlock() { return mData; }
+
+ private:
+  nsTArray<uint8_t> mData;
+};
+
+}  
+
+#endif  // DOM_QUOTA_ENCRYPTEDRANDOMACCESSBLOCK_H_

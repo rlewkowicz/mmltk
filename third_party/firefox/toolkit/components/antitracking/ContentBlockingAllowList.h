@@ -1,0 +1,70 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_contentblockingallowlist_h
+#define mozilla_contentblockingallowlist_h
+
+#include "mozilla/dom/BrowsingContext.h"
+#include "nsIContentBlockingAllowList.h"
+#include "nsIPermission.h"
+#include "nsTHashSet.h"
+
+class nsICookieJarSettings;
+class nsIHttpChannel;
+class nsIPrincipal;
+class nsIURI;
+class nsPIDOMWindowInner;
+
+namespace mozilla {
+
+class OriginAttributes;
+
+class ContentBlockingAllowListCache {
+ public:
+  nsresult CheckForBaseDomain(const nsACString& aBaseDomain,
+                              const OriginAttributes& aOriginAttributes,
+                              bool& aIsAllowListed);
+
+ protected:
+
+  virtual nsTArray<nsCString> GetAllowListPermissionTypes();
+
+  virtual nsresult IsAllowListPermission(nsIPermission* aPermission,
+                                         bool* aResult);
+
+ private:
+  bool mIsInitialized = false;
+
+  nsTHashSet<nsCString> mEntries;
+  nsTHashSet<nsCString> mEntriesPrivateBrowsing;
+
+  nsresult EnsureInit();
+};
+
+class ContentBlockingAllowList final : public nsIContentBlockingAllowList {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSICONTENTBLOCKINGALLOWLIST
+  static nsresult Check(nsIPrincipal* aContentBlockingAllowListPrincipal,
+                        bool aIsPrivateBrowsing, bool& aIsAllowListed);
+
+  static bool Check(nsIHttpChannel* aChannel);
+  static bool Check(nsPIDOMWindowInner* aWindow);
+  static bool Check(nsIPrincipal* aTopWinPrincipal, bool aIsPrivateBrowsing);
+  static bool Check(nsICookieJarSettings* aCookieJarSettings);
+
+  static void ComputePrincipal(nsIPrincipal* aDocumentPrincipal,
+                               nsIPrincipal** aPrincipal);
+
+  static void RecomputePrincipal(nsIURI* aURIBeingLoaded,
+                                 const OriginAttributes& aAttrs,
+                                 nsIPrincipal** aPrincipal);
+
+ private:
+  ~ContentBlockingAllowList() = default;
+};
+
+}  
+
+#endif  // mozilla_contentblockingallowlist_h

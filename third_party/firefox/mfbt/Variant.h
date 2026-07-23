@@ -1,0 +1,609 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_Variant_h
+#define mozilla_Variant_h
+
+#include <algorithm>
+#include <new>
+#include <stdint.h>
+
+#include "mozilla/Assertions.h"
+#include "mozilla/HashFunctions.h"
+#include "mozilla/OperatorNewExtensions.h"
+
+#include <type_traits>
+#include <utility>
+
+namespace IPC {
+template <typename T>
+struct ParamTraits;
+}  
+
+namespace mozilla {
+
+template <typename... Ts>
+class Variant;
+
+namespace detail {
+
+#if defined(__has_builtin)
+#  if __has_builtin(__type_pack_element)
+#    define MOZ_HAS_TYPE_PACK_ELEMENT
+#  endif
+#endif
+
+#ifdef MOZ_HAS_TYPE_PACK_ELEMENT
+
+template <size_t N, typename... Ts>
+struct type_pack_element {
+  using type = __type_pack_element<N, Ts...>;
+};
+
+template <size_t N, typename... Ts>
+using Nth = typename type_pack_element<N, Ts...>::type;
+
+#else
+
+template <size_t N, typename... Ts>
+struct NthImpl;
+
+template <typename T, typename... Ts>
+struct NthImpl<0, T, Ts...> {
+  using Type = T;
+};
+
+template <size_t N, typename T, typename... Ts>
+struct NthImpl<N, T, Ts...> {
+  using Type = typename NthImpl<N - 1, Ts...>::Type;
+};
+
+template <size_t N, typename... Ts>
+using Nth = typename NthImpl<N, Ts...>::Type;
+#endif
+
+template <typename T, typename... Variants>
+struct SelectVariantTypeHelper;
+
+template <typename T>
+struct SelectVariantTypeHelper<T> {
+  static constexpr size_t count = 0;
+};
+
+template <typename T, typename... Variants>
+struct SelectVariantTypeHelper<T, T, Variants...> {
+  typedef T Type;
+  static constexpr size_t count =
+      1 + SelectVariantTypeHelper<T, Variants...>::count;
+};
+
+template <typename T, typename... Variants>
+struct SelectVariantTypeHelper<T, const T, Variants...> {
+  typedef const T Type;
+  static constexpr size_t count =
+      1 + SelectVariantTypeHelper<T, Variants...>::count;
+};
+
+template <typename T, typename... Variants>
+struct SelectVariantTypeHelper<T, const T&, Variants...> {
+  typedef const T& Type;
+  static constexpr size_t count =
+      1 + SelectVariantTypeHelper<T, Variants...>::count;
+};
+
+template <typename T, typename... Variants>
+struct SelectVariantTypeHelper<T, T&&, Variants...> {
+  typedef T&& Type;
+  static constexpr size_t count =
+      1 + SelectVariantTypeHelper<T, Variants...>::count;
+};
+
+template <typename T, typename Head, typename... Variants>
+struct SelectVariantTypeHelper<T, Head, Variants...>
+    : public SelectVariantTypeHelper<T, Variants...> {};
+
+template <typename T, typename... Variants>
+struct SelectVariantType
+    : public SelectVariantTypeHelper<
+          std::remove_const_t<std::remove_reference_t<T>>, Variants...> {};
+
+template <typename... Ts>
+struct VariantTag {
+ private:
+  static const size_t TypeCount = sizeof...(Ts);
+
+ public:
+  using Type = std::conditional_t<
+      (TypeCount <= 2), bool,
+      std::conditional_t<(TypeCount <= size_t(UINT_FAST8_MAX)), uint_fast8_t,
+                         size_t  
+                         >>;
+};
+
+
+template <typename Tag, size_t N, typename T, typename U, typename Next,
+          bool isMatch>
+struct TagHelper;
+
+template <typename Tag, size_t N, typename T, typename U, typename Next>
+struct TagHelper<Tag, N, T, U, Next, false> {
+  static Tag tag() { return Next::template tag<U>(); }
+};
+
+template <typename Tag, size_t N, typename T, typename U, typename Next>
+struct TagHelper<Tag, N, T, U, Next, true> {
+  static Tag tag() { return Tag(N); }
+};
+
+
+template <typename Tag, size_t N, typename... Ts>
+struct VariantImplementation;
+
+template <typename Tag, size_t N, typename T>
+struct VariantImplementation<Tag, N, T> {
+  template <typename U>
+  static Tag tag() {
+    static_assert(std::is_same_v<T, U>, "mozilla::Variant: tag: bad type!");
+    return Tag(N);
+  }
+
+  template <typename Variant>
+  static void copyConstruct(void* aLhs, const Variant& aRhs) {
+    ::new (KnownNotNull, aLhs) T(aRhs.template as<N>());
+  }
+
+  template <typename Variant>
+  static void moveConstruct(void* aLhs, Variant&& aRhs) {
+    ::new (KnownNotNull, aLhs) T(aRhs.template extract<N>());
+  }
+
+  template <typename Variant>
+  static void destroy(Variant& aV) {
+    aV.template as<N>().~T();
+  }
+
+  template <typename Variant>
+  static bool equal(const Variant& aLhs, const Variant& aRhs) {
+    return aLhs.template as<N>() == aRhs.template as<N>();
+  }
+
+  template <typename Matcher, typename ConcreteVariant>
+  static decltype(auto) match(Matcher&& aMatcher, ConcreteVariant&& aV) {
+    if constexpr (std::is_invocable_v<Matcher, Tag,
+                                      decltype(std::forward<ConcreteVariant>(aV)
+                                                   .template as<N>())>) {
+      return std::forward<Matcher>(aMatcher)(
+          Tag(N), std::forward<ConcreteVariant>(aV).template as<N>());
+    } else {
+      return std::forward<Matcher>(aMatcher)(
+          std::forward<ConcreteVariant>(aV).template as<N>());
+    }
+  }
+
+  template <typename ConcreteVariant, typename Matcher>
+  static decltype(auto) matchN(ConcreteVariant&& aV, Matcher&& aMatcher) {
+    if constexpr (std::is_invocable_v<Matcher, Tag,
+                                      decltype(std::forward<ConcreteVariant>(aV)
+                                                   .template as<N>())>) {
+      return std::forward<Matcher>(aMatcher)(
+          Tag(N), std::forward<ConcreteVariant>(aV).template as<N>());
+    } else {
+      return std::forward<Matcher>(aMatcher)(
+          std::forward<ConcreteVariant>(aV).template as<N>());
+    }
+  }
+};
+
+template <typename Tag, size_t N, typename T, typename... Ts>
+struct VariantImplementation<Tag, N, T, Ts...> {
+  using Next = VariantImplementation<Tag, N + 1, Ts...>;
+
+  template <typename U>
+  static Tag tag() {
+    return TagHelper<Tag, N, T, U, Next, std::is_same_v<T, U>>::tag();
+  }
+
+  template <typename Variant>
+  static void copyConstruct(void* aLhs, const Variant& aRhs) {
+    if (aRhs.template is<N>()) {
+      ::new (KnownNotNull, aLhs) T(aRhs.template as<N>());
+    } else {
+      Next::copyConstruct(aLhs, aRhs);
+    }
+  }
+
+  template <typename Variant>
+  static void moveConstruct(void* aLhs, Variant&& aRhs) {
+    if (aRhs.template is<N>()) {
+      ::new (KnownNotNull, aLhs) T(aRhs.template extract<N>());
+    } else {
+      Next::moveConstruct(aLhs, std::move(aRhs));
+    }
+  }
+
+  template <typename Variant>
+  static void destroy(Variant& aV) {
+    if (aV.template is<N>()) {
+      aV.template as<N>().~T();
+    } else {
+      Next::destroy(aV);
+    }
+  }
+
+  template <typename Variant>
+  static bool equal(const Variant& aLhs, const Variant& aRhs) {
+    if (aLhs.template is<N>()) {
+      MOZ_ASSERT(aRhs.template is<N>());
+      return aLhs.template as<N>() == aRhs.template as<N>();
+    } else {
+      return Next::equal(aLhs, aRhs);
+    }
+  }
+
+  template <typename Matcher, typename ConcreteVariant>
+  static decltype(auto) match(Matcher&& aMatcher, ConcreteVariant&& aV) {
+    if (aV.template is<N>()) {
+      if constexpr (std::is_invocable_v<Matcher, Tag,
+                                        decltype(std::forward<ConcreteVariant>(
+                                                     aV)
+                                                     .template as<N>())>) {
+        return std::forward<Matcher>(aMatcher)(
+            Tag(N), std::forward<ConcreteVariant>(aV).template as<N>());
+      } else {
+        return std::forward<Matcher>(aMatcher)(
+            std::forward<ConcreteVariant>(aV).template as<N>());
+      }
+    } else {
+      return Next::match(std::forward<Matcher>(aMatcher),
+                         std::forward<ConcreteVariant>(aV));
+    }
+  }
+
+  template <typename ConcreteVariant, typename Mi, typename... Ms>
+  static decltype(auto) matchN(ConcreteVariant&& aV, Mi&& aMi, Ms&&... aMs) {
+    if (aV.template is<N>()) {
+      if constexpr (std::is_invocable_v<Mi, Tag,
+                                        decltype(std::forward<ConcreteVariant>(
+                                                     aV)
+                                                     .template as<N>())>) {
+        static_assert(
+            std::is_same_v<
+                decltype(std::forward<Mi>(aMi)(
+                    Tag(N),
+                    std::forward<ConcreteVariant>(aV).template as<N>())),
+                decltype(Next::matchN(std::forward<ConcreteVariant>(aV),
+                                      std::forward<Ms>(aMs)...))>,
+            "all matchers must have the same return type");
+        return std::forward<Mi>(aMi)(
+            Tag(N), std::forward<ConcreteVariant>(aV).template as<N>());
+      } else {
+        static_assert(
+            std::is_same_v<
+                decltype(std::forward<Mi>(aMi)(
+                    std::forward<ConcreteVariant>(aV).template as<N>())),
+                decltype(Next::matchN(std::forward<ConcreteVariant>(aV),
+                                      std::forward<Ms>(aMs)...))>,
+            "all matchers must have the same return type");
+        return std::forward<Mi>(aMi)(
+            std::forward<ConcreteVariant>(aV).template as<N>());
+      }
+    } else {
+      return Next::matchN(std::forward<ConcreteVariant>(aV),
+                          std::forward<Ms>(aMs)...);
+    }
+  }
+};
+
+template <typename T>
+struct AsVariantTemporary {
+  explicit AsVariantTemporary(const T& aValue) : mValue(aValue) {}
+
+  template <typename U>
+  explicit AsVariantTemporary(U&& aValue) : mValue(std::forward<U>(aValue)) {}
+
+  AsVariantTemporary(const AsVariantTemporary& aOther)
+      : mValue(aOther.mValue) {}
+
+  AsVariantTemporary(AsVariantTemporary&& aOther)
+      : mValue(std::move(aOther.mValue)) {}
+
+  AsVariantTemporary() = delete;
+  void operator=(const AsVariantTemporary&) = delete;
+  void operator=(AsVariantTemporary&&) = delete;
+
+  std::remove_const_t<std::remove_reference_t<T>> mValue;
+};
+
+}  
+
+template <typename T>
+struct VariantType {
+  using Type = T;
+};
+
+template <size_t N>
+struct VariantIndex {
+  static constexpr size_t index = N;
+};
+
+template <typename... Ts>
+class MOZ_INHERIT_TYPE_ANNOTATIONS_FROM_TEMPLATE_ARGS
+MOZ_NON_PARAM MOZ_GSL_OWNER Variant {
+  friend struct IPC::ParamTraits<mozilla::Variant<Ts...>>;
+
+  using Tag = typename detail::VariantTag<Ts...>::Type;
+  using Impl = detail::VariantImplementation<Tag, 0, Ts...>;
+
+  static constexpr size_t RawDataAlignment = std::max({alignof(Ts)...});
+  static constexpr size_t RawDataSize = std::max({sizeof(Ts)...});
+
+  alignas(RawDataAlignment) unsigned char rawData[RawDataSize];
+
+  Tag tag;
+
+  void* ptr() { return rawData; }
+
+  const void* ptr() const { return rawData; }
+
+ public:
+  template <typename RefT,
+            typename T = typename detail::SelectVariantType<RefT, Ts...>::Type>
+  explicit Variant(RefT&& aT) : tag(Impl::template tag<T>()) {
+    static_assert(
+        detail::SelectVariantType<RefT, Ts...>::count == 1,
+        "Variant can only be selected by type if that type is unique");
+    ::new (KnownNotNull, ptr()) T(std::forward<RefT>(aT));
+  }
+
+  template <typename T, typename... Args>
+  MOZ_IMPLICIT Variant(const VariantType<T>&, Args&&... aTs)
+      : tag(Impl::template tag<T>()) {
+    ::new (KnownNotNull, ptr()) T(std::forward<Args>(aTs)...);
+  }
+
+  template <size_t N, typename... Args>
+  MOZ_IMPLICIT Variant(const VariantIndex<N>&, Args&&... aTs) : tag(N) {
+    using T = detail::Nth<N, Ts...>;
+    ::new (KnownNotNull, ptr()) T(std::forward<Args>(aTs)...);
+  }
+
+  template <typename RefT>
+  MOZ_IMPLICIT Variant(detail::AsVariantTemporary<RefT>&& aValue)
+      : tag(Impl::template tag<
+            typename detail::SelectVariantType<RefT, Ts...>::Type>()) {
+    using T = typename detail::SelectVariantType<RefT, Ts...>::Type;
+    static_assert(
+        detail::SelectVariantType<RefT, Ts...>::count == 1,
+        "Variant can only be selected by type if that type is unique");
+    ::new (KnownNotNull, ptr()) T(std::move(aValue.mValue));
+  }
+
+  Variant(const Variant& aRhs) : tag(aRhs.tag) {
+    Impl::copyConstruct(ptr(), aRhs);
+  }
+
+  Variant(Variant&& aRhs) : tag(aRhs.tag) {
+    Impl::moveConstruct(ptr(), std::move(aRhs));
+  }
+
+  Variant& operator=(const Variant& aRhs) {
+    MOZ_ASSERT(&aRhs != this, "self-assign disallowed");
+    this->~Variant();
+    ::new (KnownNotNull, this) Variant(aRhs);
+    return *this;
+  }
+
+  Variant& operator=(Variant&& aRhs) {
+    MOZ_ASSERT(&aRhs != this, "self-assign disallowed");
+    this->~Variant();
+    ::new (KnownNotNull, this) Variant(std::move(aRhs));
+    return *this;
+  }
+
+  template <typename T>
+  Variant& operator=(detail::AsVariantTemporary<T>&& aValue) {
+    static_assert(
+        detail::SelectVariantType<T, Ts...>::count == 1,
+        "Variant can only be selected by type if that type is unique");
+    this->~Variant();
+    ::new (KnownNotNull, this) Variant(std::move(aValue));
+    return *this;
+  }
+
+  ~Variant() { Impl::destroy(*this); }
+
+  template <typename T, typename... Args>
+  T& emplace(Args&&... aTs) {
+    Impl::destroy(*this);
+    tag = Impl::template tag<T>();
+    ::new (KnownNotNull, ptr()) T(std::forward<Args>(aTs)...);
+    return as<T>();
+  }
+
+  template <size_t N, typename... Args>
+  detail::Nth<N, Ts...>& emplace(Args&&... aTs) {
+    using T = detail::Nth<N, Ts...>;
+    Impl::destroy(*this);
+    tag = N;
+    ::new (KnownNotNull, ptr()) T(std::forward<Args>(aTs)...);
+    return as<N>();
+  }
+
+  template <typename T>
+  bool is() const {
+    static_assert(
+        detail::SelectVariantType<T, Ts...>::count == 1,
+        "provided a type not uniquely found in this Variant's type list");
+    return Impl::template tag<T>() == tag;
+  }
+
+  template <size_t N>
+  bool is() const {
+    static_assert(N < sizeof...(Ts),
+                  "provided an index outside of this Variant's type list");
+    return N == size_t(tag);
+  }
+
+  bool operator==(const Variant& aRhs) const {
+    return tag == aRhs.tag && Impl::equal(*this, aRhs);
+  }
+
+  bool operator!=(const Variant& aRhs) const { return !(*this == aRhs); }
+
+
+  template <typename T>
+      T& as() & MOZ_LIFETIME_BOUND {
+    static_assert(
+        detail::SelectVariantType<T, Ts...>::count == 1,
+        "provided a type not uniquely found in this Variant's type list");
+    MOZ_RELEASE_ASSERT(is<T>());
+    return *static_cast<T*>(ptr());
+  }
+
+  template <size_t N>
+      detail::Nth<N, Ts...>& as() & MOZ_LIFETIME_BOUND {
+    static_assert(N < sizeof...(Ts),
+                  "provided an index outside of this Variant's type list");
+    MOZ_RELEASE_ASSERT(is<N>());
+    return *static_cast<detail::Nth<N, Ts...>*>(ptr());
+  }
+
+  template <typename T>
+  const T& as() const& MOZ_LIFETIME_BOUND {
+    static_assert(detail::SelectVariantType<T, Ts...>::count == 1,
+                  "provided a type not found in this Variant's type list");
+    MOZ_RELEASE_ASSERT(is<T>());
+    return *static_cast<const T*>(ptr());
+  }
+
+  template <size_t N>
+  const detail::Nth<N, Ts...>& as() const& MOZ_LIFETIME_BOUND {
+    static_assert(N < sizeof...(Ts),
+                  "provided an index outside of this Variant's type list");
+    MOZ_RELEASE_ASSERT(is<N>());
+    return *static_cast<const detail::Nth<N, Ts...>*>(ptr());
+  }
+
+  template <typename T>
+      T&& as() && MOZ_LIFETIME_BOUND {
+    static_assert(
+        detail::SelectVariantType<T, Ts...>::count == 1,
+        "provided a type not uniquely found in this Variant's type list");
+    MOZ_RELEASE_ASSERT(is<T>());
+    return std::move(*static_cast<T*>(ptr()));
+  }
+
+  template <size_t N>
+      detail::Nth<N, Ts...>&& as() && MOZ_LIFETIME_BOUND {
+    static_assert(N < sizeof...(Ts),
+                  "provided an index outside of this Variant's type list");
+    MOZ_RELEASE_ASSERT(is<N>());
+    return std::move(*static_cast<detail::Nth<N, Ts...>*>(ptr()));
+  }
+
+  template <typename T>
+  const T&& as() const&& MOZ_LIFETIME_BOUND {
+    static_assert(detail::SelectVariantType<T, Ts...>::count == 1,
+                  "provided a type not found in this Variant's type list");
+    MOZ_RELEASE_ASSERT(is<T>());
+    return std::move(*static_cast<const T*>(ptr()));
+  }
+
+  template <size_t N>
+  const detail::Nth<N, Ts...>&& as() const&& MOZ_LIFETIME_BOUND {
+    static_assert(N < sizeof...(Ts),
+                  "provided an index outside of this Variant's type list");
+    MOZ_RELEASE_ASSERT(is<N>());
+    return std::move(*static_cast<const detail::Nth<N, Ts...>*>(ptr()));
+  }
+
+  template <typename T>
+  T extract() {
+    static_assert(
+        detail::SelectVariantType<T, Ts...>::count == 1,
+        "provided a type not uniquely found in this Variant's type list");
+    MOZ_ASSERT(is<T>());
+    return T(std::move(as<T>()));
+  }
+
+  template <size_t N>
+  detail::Nth<N, Ts...> extract() {
+    static_assert(N < sizeof...(Ts),
+                  "provided an index outside of this Variant's type list");
+    MOZ_RELEASE_ASSERT(is<N>());
+    return detail::Nth<N, Ts...>(std::move(as<N>()));
+  }
+
+
+  template <typename Matcher>
+  decltype(auto) match(Matcher&& aMatcher) const& {
+    return Impl::match(std::forward<Matcher>(aMatcher), *this);
+  }
+
+  template <typename M0, typename M1, typename... Ms>
+  decltype(auto) match(M0&& aM0, M1&& aM1, Ms&&... aMs) const& {
+    return matchN(*this, std::forward<M0>(aM0), std::forward<M1>(aM1),
+                  std::forward<Ms>(aMs)...);
+  }
+
+  template <typename Matcher>
+  decltype(auto) match(Matcher&& aMatcher) & {
+    return Impl::match(std::forward<Matcher>(aMatcher), *this);
+  }
+
+  template <typename M0, typename M1, typename... Ms>
+  decltype(auto) match(M0&& aM0, M1&& aM1, Ms&&... aMs) & {
+    return matchN(*this, std::forward<M0>(aM0), std::forward<M1>(aM1),
+                  std::forward<Ms>(aMs)...);
+  }
+
+  template <typename Matcher>
+  decltype(auto) match(Matcher&& aMatcher) const&& {
+    return Impl::match(std::forward<Matcher>(aMatcher), std::move(*this));
+  }
+
+  template <typename M0, typename M1, typename... Ms>
+  decltype(auto) match(M0&& aM0, M1&& aM1, Ms&&... aMs) const&& {
+    return matchN(std::move(*this), std::forward<M0>(aM0),
+                  std::forward<M1>(aM1), std::forward<Ms>(aMs)...);
+  }
+
+  template <typename Matcher>
+  decltype(auto) match(Matcher&& aMatcher) && {
+    return Impl::match(std::forward<Matcher>(aMatcher), std::move(*this));
+  }
+
+  template <typename M0, typename M1, typename... Ms>
+  decltype(auto) match(M0&& aM0, M1&& aM1, Ms&&... aMs) && {
+    return matchN(std::move(*this), std::forward<M0>(aM0),
+                  std::forward<M1>(aM1), std::forward<Ms>(aMs)...);
+  }
+
+  mozilla::HashNumber addTagToHash(mozilla::HashNumber hashValue) const {
+    return mozilla::AddToHash(hashValue, tag);
+  }
+
+ private:
+  template <typename ConcreteVariant, typename M0, typename M1, typename... Ms>
+  static decltype(auto) matchN(ConcreteVariant&& aVariant, M0&& aM0, M1&& aM1,
+                               Ms&&... aMs) {
+    static_assert(
+        2 + sizeof...(Ms) == sizeof...(Ts),
+        "Variant<T...>::match() takes either one callable argument that "
+        "accepts every type T; or one for each type T, in order");
+    return Impl::matchN(std::forward<ConcreteVariant>(aVariant),
+                        std::forward<M0>(aM0), std::forward<M1>(aM1),
+                        std::forward<Ms>(aMs)...);
+  }
+};
+
+template <typename T>
+detail::AsVariantTemporary<T> AsVariant(T&& aValue) {
+  return detail::AsVariantTemporary<T>(std::forward<T>(aValue));
+}
+
+}  
+
+#endif /* mozilla_Variant_h */

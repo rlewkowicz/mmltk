@@ -1,0 +1,108 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef pprthred_h___
+#define pprthred_h___
+
+#include "nspr.h"
+
+PR_BEGIN_EXTERN_C
+
+
+NSPR_API(PRThread*) PR_AttachThread(PRThreadType type,
+                                    PRThreadPriority priority,
+                                    PRThreadStack *stack);
+
+NSPR_API(void) PR_DetachThread(void);
+
+NSPR_API(PRUint32) PR_GetThreadID(PRThread *thread);
+
+typedef void (*PRThreadDumpProc)(PRFileDesc *fd, PRThread *t, void *arg);
+NSPR_API(void) PR_SetThreadDumpProc(
+    PRThread* thread, PRThreadDumpProc dump, void *arg);
+
+NSPR_API(PRInt32) PR_GetThreadAffinityMask(PRThread *thread, PRUint32 *mask);
+
+NSPR_API(PRInt32) PR_SetThreadAffinityMask(PRThread *thread, PRUint32 mask );
+
+NSPR_API(PRInt32) PR_SetCPUAffinityMask(PRUint32 mask);
+
+NSPR_API(void) PR_ShowStatus(void);
+
+NSPR_API(void) PR_SetThreadRecycleMode(PRUint32 flag);
+
+
+
+
+NSPR_API(PRThread*) PR_CreateThreadGCAble(PRThreadType type,
+        void (*start)(void *arg),
+        void *arg,
+        PRThreadPriority priority,
+        PRThreadScope scope,
+        PRThreadState state,
+        PRUint32 stackSize);
+
+NSPR_API(PRThread*) PR_AttachThreadGCAble(PRThreadType type,
+        PRThreadPriority priority,
+        PRThreadStack *stack);
+
+NSPR_API(void) PR_SetThreadGCAble(void);
+
+NSPR_API(void) PR_ClearThreadGCAble(void);
+
+NSPR_API(void) PR_SuspendAll(void);
+
+NSPR_API(void) PR_ResumeAll(void);
+
+NSPR_API(void *) PR_GetSP(PRThread *thread);
+
+NSPR_API(PRWord *) PR_GetGCRegisters(PRThread *t, int isCurrent, int *np);
+
+NSPR_API(void*) GetExecutionEnvironment(PRThread *thread);
+NSPR_API(void) SetExecutionEnvironment(PRThread* thread, void *environment);
+
+typedef PRStatus (PR_CALLBACK *PREnumerator)(PRThread *t, int i, void *arg);
+NSPR_API(PRStatus) PR_EnumerateThreads(PREnumerator func, void *arg);
+
+typedef PRStatus
+(PR_CALLBACK *PRScanStackFun)(PRThread* t,
+                              void** baseAddr, PRUword count, void* closure);
+
+NSPR_API(PRStatus)
+PR_ThreadScanStackPointers(PRThread* t,
+                           PRScanStackFun scanFun, void* scanClosure);
+
+NSPR_API(PRStatus)
+PR_ScanStackPointers(PRScanStackFun scanFun, void* scanClosure);
+
+NSPR_API(PRUword)
+PR_GetStackSpaceLeft(PRThread* t);
+
+
+NSPR_API(struct _PRCPU *) _PR_GetPrimordialCPU(void);
+
+
+NSPR_API(PRMonitor*) PR_NewNamedMonitor(const char* name);
+
+NSPR_API(PRBool) PR_TestAndLock(PRLock *lock);
+
+NSPR_API(PRBool) PR_TestAndEnterMonitor(PRMonitor *mon);
+
+NSPR_API(PRIntn) PR_GetMonitorEntryCount(PRMonitor *mon);
+
+NSPR_API(PRMonitor*) PR_CTestAndEnterMonitor(void *address);
+
+
+#define PR_InMonitor(m)     (PR_GetMonitorEntryCount(m) > 0)
+
+
+#ifdef XP_UNIX
+extern void _PR_XLock(void);
+extern void _PR_XUnlock(void);
+extern PRBool _PR_XIsLocked(void);
+#endif /* XP_UNIX */
+
+PR_END_EXTERN_C
+
+#endif /* pprthred_h___ */

@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_JSActorManager_h
+#define mozilla_dom_JSActorManager_h
+
+#include "js/TypeDecls.h"
+#include "mozilla/dom/JSActor.h"
+#include "mozilla/dom/JSIPCValue.h"
+#include "nsRefPtrHashtable.h"
+#include "nsString.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace ipc {
+class IProtocol;
+}
+
+namespace dom {
+
+class JSActorProtocol;
+class JSActorService;
+
+class JSActorManager : public nsISupports {
+ public:
+  already_AddRefed<JSActor> GetActor(JSContext* aCx, const nsACString& aName,
+                                     ErrorResult& aRv);
+
+  already_AddRefed<JSActor> GetExistingActor(const nsACString& aName);
+
+  void ReceiveRawMessage(const JSActorMessageMeta& aMetadata,
+                         JSIPCValue&& aData, ipc::StructuredCloneData* aStack);
+
+  virtual const nsACString& GetRemoteType() const = 0;
+
+ protected:
+  void JSActorWillDestroy();
+
+  void JSActorDidDestroy();
+
+  virtual already_AddRefed<JSActorProtocol> MatchingJSActorProtocol(
+      JSActorService* aActorSvc, const nsACString& aName, ErrorResult& aRv) = 0;
+
+  virtual already_AddRefed<JSActor> InitJSActor(
+      JS::Handle<JSObject*> aMaybeActor, const nsACString& aName,
+      ErrorResult& aRv) = 0;
+
+  virtual mozilla::ipc::IProtocol* AsNativeActor() = 0;
+
+ private:
+  friend class JSActorService;
+
+  void JSActorUnregister(const nsACString& aName);
+
+  nsRefPtrHashtable<nsCStringHashKey, JSActor> mJSActors;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_JSActorManager_h

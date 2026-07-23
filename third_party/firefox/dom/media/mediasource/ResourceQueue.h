@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_RESOURCEQUEUE_H_
+#define MOZILLA_RESOURCEQUEUE_H_
+
+#include "MediaSpan.h"
+#include "nsDeque.h"
+
+namespace mozilla {
+
+class ErrorResult;
+
+
+
+struct ResourceItem {
+  ResourceItem(const MediaSpan& aData, uint64_t aOffset);
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const;
+  MediaSpan mData;
+  uint64_t mOffset;
+};
+
+class ResourceQueue : private nsDeque<ResourceItem> {
+ public:
+  ResourceQueue();
+
+  uint64_t GetOffset();
+
+  uint64_t GetLength();
+
+  void CopyData(uint64_t aOffset, uint32_t aCount, char* aDest);
+
+  void AppendItem(const MediaSpan& aData);
+
+  uint32_t Evict(uint64_t aOffset, uint32_t aSizeToEvict);
+
+  uint32_t EvictBefore(uint64_t aOffset);
+
+  uint32_t EvictAll();
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const;
+
+#if defined(DEBUG)
+  void Dump(const char* aPath);
+#endif
+
+  const uint8_t* GetContiguousAccess(int64_t aOffset, size_t aSize);
+
+ private:
+  ResourceItem* ResourceAt(uint32_t aIndex) const;
+
+  uint32_t GetAtOffset(uint64_t aOffset, uint32_t* aResourceOffset) const;
+
+  ResourceItem* PopFront();
+
+  uint64_t mLogicalLength;
+
+  uint64_t mOffset;
+};
+
+}  
+
+#endif /* MOZILLA_RESOURCEQUEUE_H_ */

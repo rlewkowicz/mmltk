@@ -1,0 +1,97 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+var { XPCOMUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/XPCOMUtils.sys.mjs"
+);
+
+ChromeUtils.defineESModuleGetters(this, {
+  PlacesTransactions: "resource://gre/modules/PlacesTransactions.sys.mjs",
+  PlacesUIUtils: "moz-src:///browser/components/places/PlacesUIUtils.sys.mjs",
+  PlacesUtils: "resource://gre/modules/PlacesUtils.sys.mjs",
+  PrivateBrowsingUtils: "resource://gre/modules/PrivateBrowsingUtils.sys.mjs",
+});
+
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "PlacesTreeView",
+  "chrome://browser/content/places/treeView.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  ["PlacesInsertionPoint", "PlacesController", "PlacesControllerDragHelper"],
+  "chrome://browser/content/places/controller.js"
+);
+
+var SelectBookmarkDialog = {
+  init: function SBD_init() {
+    let bookmarks = document.getElementById("bookmarks");
+    bookmarks.place =
+      "place:type=" + Ci.nsINavHistoryQueryOptions.RESULTS_AS_ROOTS_QUERY;
+    bookmarks.addEventListener("dblclick", () => this.onItemDblClick());
+    bookmarks.addEventListener("select", () => this.selectionChanged());
+
+    this.selectionChanged();
+    document.addEventListener("dialogaccept", function () {
+      SelectBookmarkDialog.accept();
+    });
+  },
+
+  selectionChanged: function SBD_selectionChanged() {
+    var accept = document
+      .getElementById("selectBookmarkDialog")
+      .getButton("accept");
+    var bookmarks = document.getElementById("bookmarks");
+    var disableAcceptButton = true;
+    if (bookmarks.hasSelection) {
+      if (!PlacesUtils.nodeIsSeparator(bookmarks.selectedNode)) {
+        disableAcceptButton = false;
+      }
+    }
+    accept.disabled = disableAcceptButton;
+  },
+
+  onItemDblClick: function SBD_onItemDblClick() {
+    var bookmarks = document.getElementById("bookmarks");
+    var selectedNode = bookmarks.selectedNode;
+    if (selectedNode && PlacesUtils.nodeIsURI(selectedNode)) {
+      document
+        .getElementById("selectBookmarkDialog")
+        .getButton("accept")
+        .click();
+    }
+  },
+
+  accept: function SBD_accept() {
+    var bookmarks = document.getElementById("bookmarks");
+    if (!bookmarks.hasSelection) {
+      throw new Error(
+        "Should not be able to accept dialog if there is no selected URL!"
+      );
+    }
+    var urls = [];
+    var names = [];
+    var selectedNode = bookmarks.selectedNode;
+    if (PlacesUtils.nodeIsFolderOrShortcut(selectedNode)) {
+      let concreteGuid = PlacesUtils.getConcreteItemGuid(selectedNode);
+      var contents = PlacesUtils.getFolderContents(concreteGuid).root;
+      var cc = contents.childCount;
+      for (var i = 0; i < cc; ++i) {
+        var node = contents.getChild(i);
+        if (PlacesUtils.nodeIsURI(node)) {
+          urls.push(node.uri);
+          names.push(node.title);
+        }
+      }
+      contents.containerOpen = false;
+    } else {
+      urls.push(selectedNode.uri);
+      names.push(selectedNode.title);
+    }
+    window.arguments[0].urls = urls;
+    window.arguments[0].names = names;
+  },
+};
+
+window.addEventListener("load", () => SelectBookmarkDialog.init());

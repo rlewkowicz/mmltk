@@ -1,0 +1,2341 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "TextControlState.h"
+
+#include "mozilla/Attributes.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/CaretAssociationHint.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/EventListenerManager.h"
+#include "mozilla/EventStateManager.h"
+#include "mozilla/IMEStateManager.h"
+#include "mozilla/InputEventOptions.h"
+#include "mozilla/KeyEventHandler.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/NativeKeyBindingsType.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/ScrollTypes.h"
+#include "mozilla/ShortcutKeys.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_ui.h"
+#include "mozilla/TextComposition.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/TextInputListener.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/HTMLInputElement.h"
+#include "mozilla/dom/HTMLTextAreaElement.h"
+#include "mozilla/dom/KeyboardEvent.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/Selection.h"
+#include "mozilla/dom/Text.h"
+#include "nsAttrValue.h"
+#include "nsAttrValueInlines.h"
+#include "nsBaseCommandController.h"
+#include "nsCOMPtr.h"
+#include "nsCaret.h"
+#include "nsContentCreatorFunctions.h"
+#include "nsContentUtils.h"
+#include "nsFocusManager.h"
+#include "nsFrameSelection.h"
+#include "nsGenericHTMLElement.h"
+#include "nsIController.h"
+#include "nsIControllers.h"
+#include "nsIDOMEventListener.h"
+#include "nsIDocumentEncoder.h"
+#include "nsIWidget.h"
+#include "nsPIDOMWindow.h"
+#include "nsServiceManagerUtils.h"
+#include "nsTextControlFrame.h"
+#include "nsTextNode.h"
+
+namespace mozilla {
+
+using namespace dom;
+using ValueSetterOption = TextControlState::ValueSetterOption;
+using ValueSetterOptions = TextControlState::ValueSetterOptions;
+
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(TextControlElement)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(
+    TextControlElement, nsGenericHTMLFormControlElementWithState)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(
+    TextControlElement, nsGenericHTMLFormControlElementWithState)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED_0(
+    TextControlElement, nsGenericHTMLFormControlElementWithState)
+
+already_AddRefed<TextControlElement>
+TextControlElement::GetTextControlElementFromEditingHost(nsIContent* aHost) {
+  if (!aHost || !aHost->IsInNativeAnonymousSubtree()) {
+    return nullptr;
+  }
+
+  auto* parent = TextControlElement::FromNodeOrNull(
+      aHost->GetClosestNativeAnonymousSubtreeRootParentOrHost());
+  return do_AddRef(parent);
+}
+
+TextControlElement::FocusTristate TextControlElement::FocusState() {
+  Document* doc = GetComposedDoc();
+  if (!doc) {
+    return FocusTristate::eUnfocusable;
+  }
+
+  if (IsDisabled()) {
+    return FocusTristate::eUnfocusable;
+  }
+
+  return IsInActiveTab(doc) ? FocusTristate::eActiveWindow
+                            : FocusTristate::eInactiveWindow;
+}
+
+using ValueChangeKind = TextControlElement::ValueChangeKind;
+
+MOZ_CAN_RUN_SCRIPT inline nsresult SetEditorFlagsIfNecessary(
+    EditorBase& aEditorBase, uint32_t aFlags) {
+  if (aEditorBase.Flags() == aFlags) {
+    return NS_OK;
+  }
+  return aEditorBase.SetFlags(aFlags);
+}
+
+
+class MOZ_STACK_CLASS AutoInputEventSuppresser final {
+ public:
+  explicit AutoInputEventSuppresser(TextEditor* aTextEditor)
+      : mTextEditor(aTextEditor),
+        mOuterTransaction(aTextEditor->IsSuppressingDispatchingInputEvent()) {
+    MOZ_ASSERT(mTextEditor);
+    mTextEditor->SuppressDispatchingInputEvent(true);
+  }
+  ~AutoInputEventSuppresser() {
+    mTextEditor->SuppressDispatchingInputEvent(mOuterTransaction);
+  }
+
+ private:
+  RefPtr<TextEditor> mTextEditor;
+  bool mOuterTransaction;
+};
+
+
+class MOZ_RAII AutoRestoreEditorState final {
+ public:
+  MOZ_CAN_RUN_SCRIPT explicit AutoRestoreEditorState(TextEditor* aTextEditor)
+      : mTextEditor(aTextEditor),
+        mSavedFlags(mTextEditor->Flags()),
+        mSavedMaxLength(mTextEditor->MaxTextLength()),
+        mSavedEchoingPasswordPrevented(
+            mTextEditor->EchoingPasswordPrevented()) {
+    MOZ_ASSERT(mTextEditor);
+
+    uint32_t flags = mSavedFlags;
+    flags &= ~nsIEditor::eEditorReadonlyMask;
+    if (mSavedFlags != flags) {
+      MOZ_KnownLive(mTextEditor)->SetFlags(flags);
+    }
+    mTextEditor->PreventToEchoPassword();
+    mTextEditor->SetMaxTextLength(-1);
+  }
+
+  MOZ_CAN_RUN_SCRIPT ~AutoRestoreEditorState() {
+    if (!mSavedEchoingPasswordPrevented) {
+      mTextEditor->AllowToEchoPassword();
+    }
+    mTextEditor->SetMaxTextLength(mSavedMaxLength);
+    SetEditorFlagsIfNecessary(MOZ_KnownLive(*mTextEditor), mSavedFlags);
+  }
+
+ private:
+  TextEditor* mTextEditor;
+  uint32_t mSavedFlags;
+  int32_t mSavedMaxLength;
+  bool mSavedEchoingPasswordPrevented;
+};
+
+
+class MOZ_RAII AutoDisableUndo final {
+ public:
+  explicit AutoDisableUndo(TextEditor* aTextEditor)
+      : mTextEditor(aTextEditor), mNumberOfMaximumTransactions(0) {
+    MOZ_ASSERT(mTextEditor);
+
+    mNumberOfMaximumTransactions =
+        mTextEditor ? mTextEditor->NumberOfMaximumTransactions() : 0;
+    DebugOnly<bool> disabledUndoRedo = mTextEditor->DisableUndoRedo();
+    NS_WARNING_ASSERTION(disabledUndoRedo,
+                         "Failed to disable undo/redo transactions");
+  }
+
+  ~AutoDisableUndo() {
+    if (mTextEditor->IsUndoRedoEnabled()) {
+      return;
+    }
+    if (mNumberOfMaximumTransactions) {
+      DebugOnly<bool> enabledUndoRedo =
+          mTextEditor->EnableUndoRedo(mNumberOfMaximumTransactions);
+      NS_WARNING_ASSERTION(enabledUndoRedo,
+                           "Failed to enable undo/redo transactions");
+    } else {
+      DebugOnly<bool> disabledUndoRedo = mTextEditor->DisableUndoRedo();
+      NS_WARNING_ASSERTION(disabledUndoRedo,
+                           "Failed to disable undo/redo transactions");
+    }
+  }
+
+ private:
+  TextEditor* mTextEditor;
+  int32_t mNumberOfMaximumTransactions;
+};
+
+static bool SuppressEventHandlers(Element* aElement) {
+  return aElement->OwnerDoc()->IsStaticDocument();
+}
+
+
+class TextInputSelectionController final : public nsSupportsWeakReference,
+                                           public nsISelectionController {
+  ~TextInputSelectionController() = default;
+
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(TextInputSelectionController,
+                                           nsISelectionController)
+
+  TextInputSelectionController(PresShell* aPresShell,
+                               Element& aEditorRootAnonymousDiv);
+
+  void DisconnectFromPresShell();
+  nsFrameSelection* GetIndependentFrameSelection() const {
+    return mFrameSelection;
+  }
+  Selection* GetSelection(SelectionType aSelectionType);
+
+  NS_IMETHOD SetDisplaySelection(int16_t toggle) override;
+  NS_IMETHOD GetDisplaySelection(int16_t* _retval) override;
+  NS_IMETHOD SetSelectionFlags(int16_t aInEnable) override;
+  NS_IMETHOD GetSelectionFlags(int16_t* aOutEnable) override;
+  NS_IMETHOD GetSelectionFromScript(RawSelectionType aRawSelectionType,
+                                    Selection** aSelection) override;
+  Selection* GetSelection(RawSelectionType aRawSelectionType) override;
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD ScrollSelectionIntoView(
+      RawSelectionType aRawSelectionType, SelectionRegion aRegion,
+      ControllerScrollFlags aFlags) override;
+  NS_IMETHOD RepaintSelection(RawSelectionType aRawSelectionType) override;
+  nsresult RepaintSelection(nsPresContext* aPresContext,
+                            SelectionType aSelectionType);
+  NS_IMETHOD SetCaretEnabled(bool enabled) override;
+  NS_IMETHOD SetCaretReadOnly(bool aReadOnly) override;
+  NS_IMETHOD GetCaretEnabled(bool* _retval) override;
+  NS_IMETHOD GetCaretVisible(bool* _retval) override;
+  NS_IMETHOD SetCaretVisibilityDuringSelection(bool aVisibility) override;
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD PhysicalMove(int16_t aDirection,
+                                             int16_t aAmount,
+                                             bool aExtend) override;
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD CharacterMove(bool aForward,
+                                              bool aExtend) override;
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD WordMove(bool aForward, bool aExtend) override;
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD LineMove(bool aForward, bool aExtend) override;
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD IntraLineMove(bool aForward,
+                                              bool aExtend) override;
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD ParagraphMove(bool aForward,
+                                              bool aExtend) override;
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD PageMove(bool aForward, bool aExtend) override;
+  NS_IMETHOD CompleteScroll(bool aForward) override;
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD CompleteMove(bool aForward,
+                                             bool aExtend) override;
+  NS_IMETHOD ScrollPage(bool aForward) override;
+  NS_IMETHOD ScrollLine(bool aForward) override;
+  NS_IMETHOD ScrollCharacter(bool aRight) override;
+  void SelectionWillTakeFocus() override;
+  void SelectionWillLoseFocus() override;
+  using nsISelectionController::ScrollSelectionIntoView;
+
+  ScrollContainerFrame* GetScrollFrame() const {
+    if (!mFrameSelection) {
+      return nullptr;
+    }
+    auto* limiter = mFrameSelection->GetIndependentSelectionRootElement();
+    if (!limiter) {
+      return nullptr;
+    }
+    auto* textControl = limiter->GetContainingShadowHost();
+    if (!textControl) {
+      return nullptr;
+    }
+    return do_QueryFrame(textControl->GetPrimaryFrame());
+  }
+
+ private:
+  RefPtr<nsFrameSelection> mFrameSelection;
+  nsWeakPtr mPresShellWeak;
+};
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(TextInputSelectionController)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(TextInputSelectionController)
+NS_INTERFACE_TABLE_HEAD(TextInputSelectionController)
+  NS_INTERFACE_TABLE(TextInputSelectionController, nsISelectionController,
+                     nsISelectionDisplay, nsISupportsWeakReference)
+  NS_INTERFACE_TABLE_TO_MAP_SEGUE_CYCLE_COLLECTION(TextInputSelectionController)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTION_WEAK(TextInputSelectionController, mFrameSelection)
+
+TextInputSelectionController::TextInputSelectionController(
+    PresShell* aPresShell, Element& aEditorRootAnonymousDiv) {
+  if (aPresShell) {
+    const bool accessibleCaretEnabled = PresShell::AccessibleCaretEnabled(
+        aEditorRootAnonymousDiv.OwnerDoc()->GetDocShell());
+    mFrameSelection = new nsFrameSelection(aPresShell, accessibleCaretEnabled,
+                                           &aEditorRootAnonymousDiv);
+    mPresShellWeak = do_GetWeakReference(aPresShell);
+
+    auto* draggingNode = aPresShell->GetPresContext()
+                             ->EventStateManager()
+                             ->GetTrackingDragGestureContent();
+    if (draggingNode && draggingNode->GetAsElementOrParentElement() ==
+                            &aEditorRootAnonymousDiv) {
+      mFrameSelection->RestoreDragState();
+    }
+  }
+}
+
+void TextInputSelectionController::DisconnectFromPresShell() {
+  if (mFrameSelection) {
+    mFrameSelection->DisconnectFromPresShell();
+    mFrameSelection = nullptr;
+  }
+}
+
+Selection* TextInputSelectionController::GetSelection(
+    SelectionType aSelectionType) {
+  if (!mFrameSelection) {
+    return nullptr;
+  }
+
+  return mFrameSelection->GetSelection(aSelectionType);
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::SetDisplaySelection(int16_t aToggle) {
+  if (!mFrameSelection) {
+    return NS_ERROR_NULL_POINTER;
+  }
+  mFrameSelection->SetDisplaySelection(aToggle);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::GetDisplaySelection(int16_t* aToggle) {
+  if (!mFrameSelection) {
+    return NS_ERROR_NULL_POINTER;
+  }
+  *aToggle = mFrameSelection->GetDisplaySelection();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::SetSelectionFlags(int16_t aToggle) {
+  return NS_OK;  
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::GetSelectionFlags(int16_t* aOutEnable) {
+  *aOutEnable = nsISelectionDisplay::DISPLAY_TEXT;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::GetSelectionFromScript(
+    RawSelectionType aRawSelectionType, Selection** aSelection) {
+  if (!mFrameSelection) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  *aSelection =
+      mFrameSelection->GetSelection(ToSelectionType(aRawSelectionType));
+
+  if (!(*aSelection)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  NS_ADDREF(*aSelection);
+  return NS_OK;
+}
+
+Selection* TextInputSelectionController::GetSelection(
+    RawSelectionType aRawSelectionType) {
+  return GetSelection(ToSelectionType(aRawSelectionType));
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::ScrollSelectionIntoView(
+    RawSelectionType aRawSelectionType, SelectionRegion aRegion,
+    ControllerScrollFlags aFlags) {
+  if (!mFrameSelection) {
+    return NS_ERROR_NULL_POINTER;
+  }
+  RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+  return frameSelection->ScrollSelectionIntoView(
+      ToSelectionType(aRawSelectionType), aRegion, aFlags);
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::RepaintSelection(
+    RawSelectionType aRawSelectionType) {
+  if (!mFrameSelection) {
+    return NS_ERROR_NULL_POINTER;
+  }
+  RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+  return frameSelection->RepaintSelection(ToSelectionType(aRawSelectionType));
+}
+
+nsresult TextInputSelectionController::RepaintSelection(
+    nsPresContext* aPresContext, SelectionType aSelectionType) {
+  if (!mFrameSelection) {
+    return NS_ERROR_NULL_POINTER;
+  }
+  RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+  return frameSelection->RepaintSelection(aSelectionType);
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::SetCaretEnabled(bool enabled) {
+  if (!mPresShellWeak) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+  RefPtr<PresShell> presShell = do_QueryReferent(mPresShellWeak);
+  if (!presShell) {
+    return NS_ERROR_FAILURE;
+  }
+
+  presShell->SetCaretEnabled(enabled);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::SetCaretReadOnly(bool aReadOnly) {
+  if (!mPresShellWeak) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+  nsresult rv;
+  RefPtr<PresShell> presShell = do_QueryReferent(mPresShellWeak, &rv);
+  if (!presShell) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (!mFrameSelection) {
+    return NS_ERROR_FAILURE;
+  }
+
+  presShell->SetCaretReadOnly(aReadOnly);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::GetCaretEnabled(bool* _retval) {
+  return GetCaretVisible(_retval);
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::GetCaretVisible(bool* _retval) {
+  if (!mPresShellWeak) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+  nsresult rv;
+  RefPtr<PresShell> presShell = do_QueryReferent(mPresShellWeak, &rv);
+  if (!presShell) {
+    return NS_ERROR_FAILURE;
+  }
+  RefPtr<nsCaret> caret = presShell->GetOriginalCaret();
+  if (!caret) {
+    return NS_ERROR_FAILURE;
+  }
+  Selection* selection = caret->GetSelection();
+  if (!selection || selection->GetFrameSelection() != mFrameSelection) {
+    *_retval = false;
+    return NS_OK;
+  }
+  *_retval = caret->IsVisible();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::SetCaretVisibilityDuringSelection(
+    bool aVisibility) {
+  if (!mPresShellWeak) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+  nsresult rv;
+  RefPtr<PresShell> presShell = do_QueryReferent(mPresShellWeak, &rv);
+  if (!presShell) {
+    return NS_ERROR_FAILURE;
+  }
+  presShell->SetCaretVisibilityDuringSelection(aVisibility);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::PhysicalMove(int16_t aDirection, int16_t aAmount,
+                                           bool aExtend) {
+  if (!mFrameSelection) {
+    return NS_ERROR_NULL_POINTER;
+  }
+  RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+  return frameSelection->PhysicalMove(aDirection, aAmount, aExtend);
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::CharacterMove(bool aForward, bool aExtend) {
+  if (!mFrameSelection) {
+    return NS_ERROR_NULL_POINTER;
+  }
+  RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+  return frameSelection->CharacterMove(aForward, aExtend);
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::WordMove(bool aForward, bool aExtend) {
+  if (!mFrameSelection) {
+    return NS_ERROR_NULL_POINTER;
+  }
+  RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+  return frameSelection->WordMove(aForward, aExtend);
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::LineMove(bool aForward, bool aExtend) {
+  if (!mFrameSelection) {
+    return NS_ERROR_NULL_POINTER;
+  }
+  RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+  nsresult result = frameSelection->LineMove(aForward, aExtend);
+  if (NS_FAILED(result)) {
+    result = CompleteMove(aForward, aExtend);
+  }
+  return result;
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::IntraLineMove(bool aForward, bool aExtend) {
+  if (!mFrameSelection) {
+    return NS_ERROR_NULL_POINTER;
+  }
+  RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+  return frameSelection->IntraLineMove(aForward, aExtend);
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::ParagraphMove(bool aForward, bool aExtend) {
+  if (!mFrameSelection) {
+    return NS_ERROR_NULL_POINTER;
+  }
+  RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+  return frameSelection->ParagraphMove(aForward, aExtend);
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::PageMove(bool aForward, bool aExtend) {
+  if (auto* frame = GetScrollFrame()) {
+    RefPtr fs = mFrameSelection;
+    return fs->PageMove(aForward, aExtend, frame,
+                        nsFrameSelection::SelectionIntoView::Yes);
+  }
+  return ScrollSelectionIntoView(SelectionType::eNormal,
+                                 nsISelectionController::SELECTION_FOCUS_REGION,
+                                 SelectionScrollMode::SyncFlush);
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::CompleteScroll(bool aForward) {
+  if (auto* sf = GetScrollFrame()) {
+    sf->ScrollBy(nsIntPoint(0, aForward ? 1 : -1), ScrollUnit::WHOLE,
+                 ScrollMode::Instant);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::CompleteMove(bool aForward, bool aExtend) {
+  if (NS_WARN_IF(!mFrameSelection)) {
+    return NS_ERROR_NULL_POINTER;
+  }
+  RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+
+  Element* const parentDIV =
+      frameSelection->GetIndependentSelectionRootElement();
+  if (!parentDIV) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  uint32_t offset = 0;
+  CaretAssociationHint hint = CaretAssociationHint::Before;
+  if (aForward) {
+    offset = parentDIV->GetChildCount();
+
+
+    if (offset) {
+      nsIContent* child = parentDIV->GetLastChild();
+
+      if (child->IsHTMLElement(nsGkAtoms::br)) {
+        --offset;
+        hint = CaretAssociationHint::After;  
+      }
+    }
+  }
+
+  const OwningNonNull<Element> pinnedParentDIV(*parentDIV);
+  const nsFrameSelection::FocusMode focusMode =
+      aExtend ? nsFrameSelection::FocusMode::kExtendSelection
+              : nsFrameSelection::FocusMode::kCollapseToNewPoint;
+  frameSelection->HandleClick(pinnedParentDIV, offset, offset, focusMode, hint);
+
+  return CompleteScroll(aForward);
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::ScrollPage(bool aForward) {
+  if (auto* sf = GetScrollFrame()) {
+    sf->ScrollBy(nsIntPoint(0, aForward ? 1 : -1), ScrollUnit::PAGES,
+                 ScrollMode::Smooth);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::ScrollLine(bool aForward) {
+  if (auto* sf = GetScrollFrame()) {
+    sf->ScrollBy(nsIntPoint(0, aForward ? 1 : -1), ScrollUnit::LINES,
+                 ScrollMode::Smooth);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+TextInputSelectionController::ScrollCharacter(bool aRight) {
+  if (auto* sf = GetScrollFrame()) {
+    sf->ScrollBy(nsIntPoint(aRight ? 1 : -1, 0), ScrollUnit::LINES,
+                 ScrollMode::Smooth);
+  }
+  return NS_OK;
+}
+
+void TextInputSelectionController::SelectionWillTakeFocus() {
+  if (mFrameSelection) {
+    if (PresShell* shell = mFrameSelection->GetPresShell()) {
+      shell->FrameSelectionWillTakeFocus(
+          *mFrameSelection,
+          StaticPrefs::dom_selection_mimic_chrome_tostring_enabled()
+              ? PresShell::CanMoveLastSelectionForToString::Yes
+              : PresShell::CanMoveLastSelectionForToString::No);
+    }
+  }
+}
+
+void TextInputSelectionController::SelectionWillLoseFocus() {
+  if (mFrameSelection) {
+    if (PresShell* shell = mFrameSelection->GetPresShell()) {
+      shell->FrameSelectionWillLoseFocus(*mFrameSelection);
+    }
+  }
+}
+
+
+TextInputListener::TextInputListener(TextControlElement* aTxtCtrlElement)
+    : mTxtCtrlElement(aTxtCtrlElement),
+      mTextControlState(aTxtCtrlElement ? aTxtCtrlElement->GetTextControlState()
+                                        : nullptr) {}
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(TextInputListener)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(TextInputListener)
+
+NS_INTERFACE_MAP_BEGIN(TextInputListener)
+  NS_INTERFACE_MAP_ENTRY(nsISupportsWeakReference)
+  NS_INTERFACE_MAP_ENTRY(nsIDOMEventListener)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIDOMEventListener)
+  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(TextInputListener)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(TextInputListener)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(TextInputListener)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_REFERENCE
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(TextInputListener)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+void TextInputListener::OnSelectionChange(Selection& aSelection,
+                                          int16_t aReason) {
+  if (!mListeningToSelectionChange) {
+    return;
+  }
+
+  bool collapsed = aSelection.IsCollapsed();
+  if (!collapsed && (aReason & (nsISelectionListener::MOUSEUP_REASON |
+                                nsISelectionListener::KEYPRESS_REASON |
+                                nsISelectionListener::SELECTALL_REASON))) {
+    if (nsCOMPtr<nsIContent> content = mTxtCtrlElement) {
+      if (auto* frame = content->GetPrimaryFrame()) {
+        RefPtr<PresShell> presShell = frame->PresShell();
+        nsEventStatus status = nsEventStatus_eIgnore;
+        WidgetEvent event(true, eFormSelect);
+        presShell->HandleEventWithTarget(&event, frame, content, &status);
+      }
+    }
+  }
+
+  if (collapsed == mSelectionWasCollapsed) {
+    return;
+  }
+
+  mSelectionWasCollapsed = collapsed;
+
+  if (nsFocusManager::GetFocusedElementStatic() != mTxtCtrlElement) {
+    return;
+  }
+
+  UpdateTextInputCommands(u"select"_ns);
+}
+
+MOZ_CAN_RUN_SCRIPT
+static void DoCommandCallback(Command aCommand, void* aData) {
+  RefPtr el = static_cast<TextControlElement*>(aData);
+  nsCOMPtr<nsIControllers> controllers;
+  if (auto* input = HTMLInputElement::FromNode(el)) {
+    input->GetControllers(getter_AddRefs(controllers));
+  } else if (auto* textArea = HTMLTextAreaElement::FromNode(el)) {
+    textArea->GetControllers(getter_AddRefs(controllers));
+  }
+
+  if (!controllers) {
+    NS_WARNING("Could not get controllers");
+    return;
+  }
+
+  const char* commandStr = WidgetKeyboardEvent::GetCommandStr(aCommand);
+
+  nsCOMPtr<nsIController> controller;
+  controllers->GetControllerForCommand(commandStr, getter_AddRefs(controller));
+  if (!controller) {
+    return;
+  }
+
+  bool commandEnabled;
+  if (NS_WARN_IF(NS_FAILED(
+          controller->IsCommandEnabled(commandStr, &commandEnabled)))) {
+    return;
+  }
+  if (commandEnabled) {
+    controller->DoCommand(commandStr);
+  }
+}
+
+void TextInputListener::StartToHandleShortcutKeys() {
+  if (mListeningToKeyboardEvents) {
+    return;
+  }
+  EventListenerManager* const manager =
+      mTxtCtrlElement->GetOrCreateListenerManager();
+  if (!manager) {
+    return;
+  }
+  mListeningToKeyboardEvents = true;
+  manager->AddEventListenerByType(this, u"keydown"_ns,
+                                  TrustedEventsAtSystemGroupBubble());
+  manager->AddEventListenerByType(this, u"keypress"_ns,
+                                  TrustedEventsAtSystemGroupBubble());
+  manager->AddEventListenerByType(this, u"keyup"_ns,
+                                  TrustedEventsAtSystemGroupBubble());
+}
+
+void TextInputListener::EndHandlingShortcutKeys() {
+  if (!mListeningToKeyboardEvents) {
+    return;
+  }
+  mListeningToKeyboardEvents = false;
+  EventListenerManager* const manager =
+      mTxtCtrlElement->GetExistingListenerManager();
+  if (manager) {
+    manager->RemoveEventListenerByType(this, u"keydown"_ns,
+                                       TrustedEventsAtSystemGroupBubble());
+    manager->RemoveEventListenerByType(this, u"keypress"_ns,
+                                       TrustedEventsAtSystemGroupBubble());
+    manager->RemoveEventListenerByType(this, u"keyup"_ns,
+                                       TrustedEventsAtSystemGroupBubble());
+  }
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHODIMP
+TextInputListener::HandleEvent(Event* aEvent) {
+  if (aEvent->DefaultPrevented()) {
+    return NS_OK;
+  }
+
+  if (!aEvent->IsTrusted()) {
+    return NS_OK;
+  }
+
+  RefPtr<KeyboardEvent> keyEvent = aEvent->AsKeyboardEvent();
+  if (!keyEvent) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  WidgetKeyboardEvent* widgetKeyEvent =
+      aEvent->WidgetEventPtr()->AsKeyboardEvent();
+  if (!widgetKeyEvent) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  {
+    auto* input = HTMLInputElement::FromNode(mTxtCtrlElement);
+    if (input && input->StepsInputValue(*widgetKeyEvent)) {
+      return NS_OK;
+    }
+  }
+
+  auto ExecuteOurShortcutKeys = [&](TextControlElement& aTextControlElement)
+                                    MOZ_CAN_RUN_SCRIPT_FOR_DEFINITION -> bool {
+    KeyEventHandler* keyHandlers = ShortcutKeys::GetHandlers(
+        aTextControlElement.IsTextArea() ? HandlerType::eTextArea
+                                         : HandlerType::eInput);
+
+    RefPtr<nsAtom> eventTypeAtom =
+        ShortcutKeys::ConvertEventToDOMEventType(widgetKeyEvent);
+    for (KeyEventHandler* handler = keyHandlers; handler;
+         handler = handler->GetNextHandler()) {
+      if (!handler->EventTypeEquals(eventTypeAtom)) {
+        continue;
+      }
+
+      if (!handler->KeyEventMatched(keyEvent, 0, IgnoreModifierState())) {
+        continue;
+      }
+
+      nsresult rv = handler->ExecuteHandler(&aTextControlElement, aEvent);
+      if (NS_SUCCEEDED(rv)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  auto ExecuteNativeKeyBindings =
+      [&](TextControlElement& aTextControlElement)
+          MOZ_CAN_RUN_SCRIPT_FOR_DEFINITION -> bool {
+    if (widgetKeyEvent->mMessage != eKeyPress) {
+      return false;
+    }
+
+    NativeKeyBindingsType nativeKeyBindingsType =
+        aTextControlElement.IsTextArea()
+            ? NativeKeyBindingsType::MultiLineEditor
+            : NativeKeyBindingsType::SingleLineEditor;
+
+    nsIWidget* widget = widgetKeyEvent->mWidget;
+    if (MOZ_UNLIKELY(!widget)) {
+      widget = nsContentUtils::WidgetForContent(&aTextControlElement);
+      if (MOZ_UNLIKELY(NS_WARN_IF(!widget))) {
+        return false;
+      }
+    }
+
+    AutoRestore<nsCOMPtr<nsIWidget>> saveWidget(widgetKeyEvent->mWidget);
+    widgetKeyEvent->mWidget = widget;
+    if (widgetKeyEvent->ExecuteEditCommands(
+            nativeKeyBindingsType, DoCommandCallback, &aTextControlElement)) {
+      aEvent->PreventDefault();
+      return true;
+    }
+    return false;
+  };
+
+  OwningNonNull<TextControlElement> textControlElement(*mTxtCtrlElement);
+  if (StaticPrefs::
+          ui_key_textcontrol_prefer_native_key_bindings_over_builtin_shortcut_key_definitions()) {
+    if (!ExecuteNativeKeyBindings(textControlElement)) {
+      ExecuteOurShortcutKeys(textControlElement);
+    }
+  } else {
+    if (!ExecuteOurShortcutKeys(textControlElement)) {
+      ExecuteNativeKeyBindings(textControlElement);
+    }
+  }
+  return NS_OK;
+}
+
+nsresult TextInputListener::OnEditActionHandled(TextEditor& aTextEditor) {
+  size_t numUndoItems = aTextEditor.NumberOfUndoItems();
+  size_t numRedoItems = aTextEditor.NumberOfRedoItems();
+  if ((numUndoItems && !mHadUndoItems) || (!numUndoItems && mHadUndoItems) ||
+      (numRedoItems && !mHadRedoItems) || (!numRedoItems && mHadRedoItems)) {
+    UpdateTextInputCommands(u"undo"_ns);
+
+    mHadUndoItems = numUndoItems != 0;
+    mHadRedoItems = numRedoItems != 0;
+  }
+
+  HandleValueChanged(aTextEditor);
+
+  return mTextControlState ? mTextControlState->OnEditActionHandled() : NS_OK;
+}
+
+void TextInputListener::HandleValueChanged(TextEditor& aTextEditor) {
+  if (mSetValueChanged) {
+    mTxtCtrlElement->SetValueChanged(true);
+  }
+
+  if (!mSettingValue) {
+    mTxtCtrlElement->OnValueChanged(ValueChangeKind::UserInteraction,
+                                    aTextEditor.IsEmpty(), nullptr);
+    if (mTextControlState) {
+      mTextControlState->ClearLastInteractiveValue();
+    }
+  }
+}
+
+nsresult TextInputListener::UpdateTextInputCommands(
+    const nsAString& aCommandsToUpdate) {
+  nsCOMPtr<Document> doc = mTxtCtrlElement->GetComposedDoc();
+  if (NS_WARN_IF(!doc)) {
+    return NS_ERROR_FAILURE;
+  }
+  nsPIDOMWindowOuter* domWindow = doc->GetWindow();
+  if (NS_WARN_IF(!domWindow)) {
+    return NS_ERROR_FAILURE;
+  }
+  domWindow->UpdateCommands(aCommandsToUpdate);
+  return NS_OK;
+}
+
+
+enum class TextControlAction {
+  CommitComposition,
+  Destructor,
+  PrepareEditor,
+  SetRangeText,
+  SetSelectionRange,
+  SetValue,
+  DeinitSelection,
+  Unlink,
+};
+
+class MOZ_STACK_CLASS AutoTextControlHandlingState {
+ public:
+  AutoTextControlHandlingState() = delete;
+  explicit AutoTextControlHandlingState(const AutoTextControlHandlingState&) =
+      delete;
+  AutoTextControlHandlingState(AutoTextControlHandlingState&&) = delete;
+  void operator=(AutoTextControlHandlingState&) = delete;
+  void operator=(const AutoTextControlHandlingState&) = delete;
+
+  MOZ_CAN_RUN_SCRIPT AutoTextControlHandlingState(
+      TextControlState& aTextControlState, TextControlAction aTextControlAction)
+      : mParent(aTextControlState.mHandlingState),
+        mTextControlState(aTextControlState),
+        mTextCtrlElement(aTextControlState.mTextCtrlElement),
+        mTextControlAction(aTextControlAction) {
+    MOZ_ASSERT(aTextControlAction != TextControlAction::SetValue,
+               "Use specific constructor");
+    mTextControlState.mHandlingState = this;
+    if (Is(TextControlAction::CommitComposition)) {
+      MOZ_ASSERT(mParent);
+      MOZ_ASSERT(mParent->Is(TextControlAction::SetValue));
+      mParent->InvalidateOldValue();
+    }
+  }
+
+  MOZ_CAN_RUN_SCRIPT AutoTextControlHandlingState(
+      TextControlState& aTextControlState, TextControlAction aTextControlAction,
+      const nsAString& aSettingValue, const nsAString* aOldValue,
+      const ValueSetterOptions& aOptions, ErrorResult& aRv)
+      : mParent(aTextControlState.mHandlingState),
+        mTextControlState(aTextControlState),
+        mTextCtrlElement(aTextControlState.mTextCtrlElement),
+        mSettingValue(aSettingValue),
+        mOldValue(aOldValue),
+        mValueSetterOptions(aOptions),
+        mTextControlAction(aTextControlAction) {
+    MOZ_ASSERT(aTextControlAction == TextControlAction::SetValue,
+               "Use generic constructor");
+    mTextControlState.mHandlingState = this;
+    if (!nsContentUtils::PlatformToDOMLineBreaks(mSettingValue, fallible)) {
+      aRv.Throw(NS_ERROR_OUT_OF_MEMORY);
+      return;
+    }
+    if (mParent) {
+      mParent->UpdateSettingValueAndInvalidateOldValue(mSettingValue);
+    }
+  }
+
+  MOZ_CAN_RUN_SCRIPT ~AutoTextControlHandlingState() {
+    mTextControlState.mHandlingState = mParent;
+    if (!mParent && mTextControlStateDestroyed) {
+      mTextControlState.DeleteOrCacheForReuse();
+    }
+    if (!mTextControlStateDestroyed && mPrepareEditorLater) {
+      MOZ_ASSERT(nsContentUtils::IsSafeToRunScript());
+      MOZ_ASSERT(Is(TextControlAction::SetValue));
+      mTextControlState.PrepareEditor();
+    }
+  }
+
+  void OnDestroyTextControlState() {
+    if (IsHandling(TextControlAction::Destructor)) {
+      return;
+    }
+    mTextControlStateDestroyed = true;
+    if (mParent) {
+      mParent->OnDestroyTextControlState();
+    }
+  }
+
+  void PrepareEditorLater() {
+    MOZ_ASSERT(IsHandling(TextControlAction::SetValue));
+    MOZ_ASSERT(!IsHandling(TextControlAction::PrepareEditor));
+    AutoTextControlHandlingState* settingValue = nullptr;
+    for (AutoTextControlHandlingState* handlingSomething = this;
+         handlingSomething; handlingSomething = handlingSomething->mParent) {
+      if (handlingSomething->Is(TextControlAction::SetValue)) {
+        settingValue = handlingSomething;
+      }
+    }
+    settingValue->mPrepareEditorLater = true;
+  }
+
+  void WillSetValueWithTextEditor() {
+    MOZ_ASSERT(Is(TextControlAction::SetValue));
+    if (mValueSetterOptions.contains(ValueSetterOption::BySetUserInputAPI)) {
+      return;
+    }
+    if (auto* const listener = GetTextInputListener()) [[likely]] {
+      listener->SettingValue(true);
+      listener->SetValueChanged(
+          mValueSetterOptions.contains(ValueSetterOption::SetValueChanged));
+    }
+    mEditActionHandled = false;
+    WillDispatchBeforeInputEvent();
+  }
+
+  void WillDispatchBeforeInputEvent() {
+    mBeforeInputEventHasBeenDispatched = true;
+  }
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult OnEditActionHandled() {
+    MOZ_ASSERT(!mEditActionHandled);
+    mEditActionHandled = true;
+    if (!Is(TextControlAction::SetValue)) {
+      return NS_OK;
+    }
+    if (!mValueSetterOptions.contains(ValueSetterOption::BySetUserInputAPI)) {
+      if (auto* const listener = GetTextInputListener()) {
+        listener->SetValueChanged(true);
+        listener->SettingValue(
+            mParent && mParent->IsHandling(TextControlAction::SetValue));
+      }
+    }
+    return NS_OK;
+  }
+
+  bool IsTextControlStateDestroyed() const {
+    return mTextControlStateDestroyed;
+  }
+  bool HasEditActionHandled() const { return mEditActionHandled; }
+  bool HasBeforeInputEventDispatched() const {
+    return mBeforeInputEventHasBeenDispatched;
+  }
+  bool Is(TextControlAction aTextControlAction) const {
+    return mTextControlAction == aTextControlAction;
+  }
+  bool IsHandling(TextControlAction aTextControlAction) const {
+    if (mTextControlAction == aTextControlAction) {
+      return true;
+    }
+    return mParent && mParent->IsHandling(aTextControlAction);
+  }
+  TextControlElement* GetTextControlElement() const { return mTextCtrlElement; }
+  TextInputListener* GetTextInputListener() const {
+    return mTextControlState.mTextInputListener;
+  }
+  const ValueSetterOptions& ValueSetterOptionsRef() const {
+    MOZ_ASSERT(Is(TextControlAction::SetValue));
+    return mValueSetterOptions;
+  }
+  const nsAString* GetOldValue() const {
+    MOZ_ASSERT(Is(TextControlAction::SetValue));
+    return mOldValue;
+  }
+  const nsString& GetSettingValue() const {
+    MOZ_ASSERT(IsHandling(TextControlAction::SetValue));
+    if (mTextControlAction == TextControlAction::SetValue) {
+      return mSettingValue;
+    }
+    return mParent->GetSettingValue();
+  }
+
+ private:
+  void UpdateSettingValueAndInvalidateOldValue(const nsString& aSettingValue) {
+    if (mTextControlAction == TextControlAction::SetValue) {
+      mSettingValue = aSettingValue;
+    }
+    mOldValue = nullptr;
+    if (mParent) {
+      mParent->UpdateSettingValueAndInvalidateOldValue(aSettingValue);
+    }
+  }
+  void InvalidateOldValue() {
+    mOldValue = nullptr;
+    if (mParent) {
+      mParent->InvalidateOldValue();
+    }
+  }
+
+  AutoTextControlHandlingState* const mParent;
+  TextControlState& mTextControlState;
+  RefPtr<TextControlElement> const mTextCtrlElement;
+  nsAutoString mSettingValue;
+  const nsAString* mOldValue = nullptr;
+  ValueSetterOptions mValueSetterOptions;
+  TextControlAction const mTextControlAction;
+  bool mTextControlStateDestroyed = false;
+  bool mEditActionHandled = false;
+  bool mPrepareEditorLater = false;
+  bool mBeforeInputEventHasBeenDispatched = false;
+};
+
+
+static constexpr size_t kMaxCountOfCacheToReuse = 25;
+static AutoTArray<void*, kMaxCountOfCacheToReuse>* sReleasedInstances = nullptr;
+static bool sHasShutDown = false;
+
+TextControlState::TextControlState(TextControlElement* aOwningElement)
+    : mTextCtrlElement(aOwningElement),
+      mEverInited(false),
+      mEditorInitialized(false),
+      mSelectionCached(true)
+{
+  MOZ_COUNT_CTOR(TextControlState);
+  static_assert(sizeof(*this) <= 128,
+                "Please keep small TextControlState as far as possible");
+}
+
+TextControlState* TextControlState::Construct(
+    TextControlElement* aOwningElement) {
+  void* mem;
+  if (sReleasedInstances && !sReleasedInstances->IsEmpty()) {
+    mem = sReleasedInstances->PopLastElement();
+  } else {
+    mem = moz_xmalloc(sizeof(TextControlState));
+  }
+
+  return new (mem) TextControlState(aOwningElement);
+}
+
+TextControlState::~TextControlState() {
+  MOZ_ASSERT(!mHandlingState);
+  MOZ_COUNT_DTOR(TextControlState);
+  AutoTextControlHandlingState handlingDesctructor(
+      *this, TextControlAction::Destructor);
+  Clear();
+}
+
+void TextControlState::Shutdown() {
+  sHasShutDown = true;
+  if (sReleasedInstances) {
+    for (void* mem : *sReleasedInstances) {
+      free(mem);
+    }
+    delete sReleasedInstances;
+  }
+}
+
+void TextControlState::Destroy() {
+  if (mHandlingState) {
+    mHandlingState->OnDestroyTextControlState();
+    return;
+  }
+  DeleteOrCacheForReuse();
+}
+
+void TextControlState::DeleteOrCacheForReuse() {
+  MOZ_ASSERT(!IsBusy());
+
+  void* mem = this;
+  this->~TextControlState();
+
+  if (!sHasShutDown && (!sReleasedInstances || sReleasedInstances->Length() <
+                                                   kMaxCountOfCacheToReuse)) {
+    if (!sReleasedInstances) {
+      sReleasedInstances = new AutoTArray<void*, kMaxCountOfCacheToReuse>;
+    }
+    sReleasedInstances->AppendElement(mem);
+  } else {
+    free(mem);
+  }
+}
+
+nsresult TextControlState::OnEditActionHandled() {
+  return mHandlingState ? mHandlingState->OnEditActionHandled() : NS_OK;
+}
+
+Element* TextControlState::GetRootNode() {
+  return mTextCtrlElement ? mTextCtrlElement->GetTextEditorRoot() : nullptr;
+}
+
+Element* TextControlState::GetPreviewNode() {
+  return mTextCtrlElement ? mTextCtrlElement->GetTextEditorPreview() : nullptr;
+}
+
+void TextControlState::Clear() {
+  MOZ_ASSERT(mHandlingState);
+  MOZ_ASSERT(mHandlingState->Is(TextControlAction::Destructor) ||
+             mHandlingState->Is(TextControlAction::Unlink));
+  if (mTextEditor) {
+    mTextEditor->SetTextInputListener(nullptr);
+  }
+  if (mTextInputListener) {
+    mTextInputListener->EndHandlingShortcutKeys();
+  }
+  DestroyEditor();
+  mTextEditor = nullptr;
+  mTextInputListener = nullptr;
+}
+
+void TextControlState::Unlink() {
+  AutoTextControlHandlingState handlingUnlink(*this, TextControlAction::Unlink);
+  UnlinkInternal();
+}
+
+void TextControlState::UnlinkInternal() {
+  MOZ_ASSERT(mHandlingState);
+  MOZ_ASSERT(mHandlingState->Is(TextControlAction::Unlink));
+  TextControlState* tmp = this;
+  tmp->Clear();
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mSelCon)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mTextEditor)
+}
+
+void TextControlState::Traverse(nsCycleCollectionTraversalCallback& cb) {
+  TextControlState* tmp = this;
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mSelCon)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mTextEditor)
+}
+
+nsFrameSelection* TextControlState::GetIndependentFrameSelection() const {
+  return mSelCon ? mSelCon->GetIndependentFrameSelection() : nullptr;
+}
+
+TextEditor* TextControlState::GetTextEditor() {
+  if (!mTextEditor && NS_WARN_IF(NS_FAILED(PrepareEditor()))) {
+    return nullptr;
+  }
+  return mTextEditor;
+}
+
+TextEditor* TextControlState::GetExtantTextEditor() const {
+  return mTextEditor;
+}
+
+nsISelectionController* TextControlState::GetSelectionController() const {
+  return mSelCon;
+}
+
+class PrepareEditorEvent final : public Runnable {
+ public:
+  explicit PrepareEditorEvent(TextControlState& aState)
+      : Runnable("PrepareEditorEvent"), mState(&aState) {}
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHOD Run() override {
+    if (NS_WARN_IF(!mState)) {
+      return NS_ERROR_NULL_POINTER;
+    }
+
+    mState->PrepareEditor();
+    return NS_OK;
+  }
+
+ private:
+  WeakPtr<TextControlState> mState;
+};
+
+nsresult TextControlState::InitializeSelection(PresShell* aPresShell) {
+  MOZ_ASSERT(
+      !nsContentUtils::IsSafeToRunScript(),
+      "TextControlState::BindToFrame() has to be called with script blocker");
+  if (NS_WARN_IF(mSelCon)) {
+    return NS_ERROR_FAILURE;
+  }
+  auto* editorRoot = GetRootNode();
+  if (NS_WARN_IF(!editorRoot)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mSelCon = new TextInputSelectionController(aPresShell, *editorRoot);
+  EnsureTextInputListener();
+
+  mSelCon->SetDisplaySelection(nsISelectionController::SELECTION_HIDDEN);
+
+  Selection* selection = mSelCon->GetSelection(SelectionType::eNormal);
+  if (selection) {
+    RefPtr<nsCaret> caret = aPresShell->GetOriginalCaret();
+    if (caret) {
+      selection->AddSelectionListener(caret);
+    }
+    mTextInputListener->StartToListenToSelectionChange();
+  }
+
+  if (mTextEditor) {
+    nsContentUtils::AddScriptRunner(MakeAndAddRef<PrepareEditorEvent>(*this));
+  }
+
+  return NS_OK;
+}
+
+struct MOZ_STACK_CLASS PreDestroyer {
+  void Init(TextEditor* aTextEditor) { mTextEditor = aTextEditor; }
+  ~PreDestroyer() {
+    if (mTextEditor) {
+      UniquePtr<PasswordMaskData> passwordMaskData = mTextEditor->PreDestroy();
+    }
+  }
+  void Swap(RefPtr<TextEditor>& aTextEditor) {
+    return mTextEditor.swap(aTextEditor);
+  }
+
+ private:
+  RefPtr<TextEditor> mTextEditor;
+};
+
+void TextControlState::UpdateEditorOnTypeChange() {
+  if (!mEditorInitialized) {
+    return;
+  }
+  const auto oldFlags = mTextEditor->Flags();
+  auto newFlags = oldFlags;
+  if (IsPasswordTextControl()) {
+    newFlags |= nsIEditor::eEditorPasswordMask;
+  } else {
+    newFlags &= ~nsIEditor::eEditorPasswordMask;
+  }
+  if (oldFlags != newFlags) {
+    RefPtr editor = mTextEditor;
+    editor->SetFlags(newFlags);
+  }
+}
+
+void TextControlState::EnsureTextInputListener() {
+  if (!mTextInputListener) {
+    mTextInputListener = new TextInputListener(mTextCtrlElement);
+    if (mEditorInitialized) {
+      mTextEditor->SetTextInputListener(mTextInputListener);
+    }
+  }
+  mTextInputListener->StartToHandleShortcutKeys();
+}
+
+nsresult TextControlState::PrepareEditor() {
+  if (mEditorInitialized) {
+    return NS_OK;
+  }
+
+  AutoHideSelectionChanges hideSelectionChanges(GetIndependentFrameSelection());
+
+  if (mHandlingState) {
+    if (mHandlingState->IsHandling(TextControlAction::PrepareEditor)) {
+      return NS_ERROR_NOT_INITIALIZED;
+    }
+    if (mHandlingState->IsHandling(TextControlAction::SetValue)) {
+      mHandlingState->PrepareEditorLater();
+      return NS_ERROR_NOT_INITIALIZED;
+    }
+  }
+
+  MOZ_ASSERT(mTextCtrlElement);
+
+  AutoTextControlHandlingState preparingEditor(
+      *this, TextControlAction::PrepareEditor);
+
+
+
+  uint32_t editorFlags = 0;
+
+  if (IsSingleLineTextControl()) {
+    editorFlags |= nsIEditor::eEditorSingleLineMask;
+  }
+  if (IsPasswordTextControl()) {
+    editorFlags |= nsIEditor::eEditorPasswordMask;
+  }
+
+  bool shouldInitializeEditor = false;
+  RefPtr<TextEditor> newTextEditor;  
+  PreDestroyer preDestroyer;
+  if (!mTextEditor) {
+    shouldInitializeEditor = true;
+
+    newTextEditor = new TextEditor();
+    preDestroyer.Init(newTextEditor);
+  } else {
+    newTextEditor = mTextEditor;  
+
+    if (newTextEditor->IsMailEditor()) {
+      editorFlags |= nsIEditor::eEditorMailMask;
+    }
+  }
+
+  nsAutoString defaultValue;
+  GetValue(defaultValue,  true);
+
+  if (!mEditorInitialized) {
+
+    nsCOMPtr<Document> doc = mTextCtrlElement->OwnerDoc();
+
+    AutoNoJSAPI nojsapi;
+
+    RefPtr<Element> anonymousDivElement = GetRootNode();
+    if (NS_WARN_IF(!anonymousDivElement) || NS_WARN_IF(!mSelCon)) {
+      return NS_ERROR_FAILURE;
+    }
+    OwningNonNull<TextInputSelectionController> selectionController(*mSelCon);
+    UniquePtr<PasswordMaskData> passwordMaskData;
+    if (editorFlags & nsIEditor::eEditorPasswordMask) {
+      if (mPasswordMaskData) {
+        passwordMaskData = std::move(mPasswordMaskData);
+      } else {
+        passwordMaskData = MakeUnique<PasswordMaskData>();
+      }
+    } else {
+      mPasswordMaskData = nullptr;
+    }
+    nsresult rv =
+        newTextEditor->Init(*doc, *anonymousDivElement, selectionController,
+                            editorFlags, std::move(passwordMaskData));
+    if (NS_FAILED(rv)) {
+      NS_WARNING("TextEditor::Init() failed");
+      return rv;
+    }
+  }
+
+
+  nsresult rv = NS_OK;
+  if (!SuppressEventHandlers(mTextCtrlElement)) {
+    nsCOMPtr<nsIControllers> controllers;
+    if (auto* inputElement = HTMLInputElement::FromNode(mTextCtrlElement)) {
+      nsresult rv = inputElement->GetControllers(getter_AddRefs(controllers));
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        return rv;
+      }
+    } else {
+      auto* textAreaElement = HTMLTextAreaElement::FromNode(mTextCtrlElement);
+      if (!textAreaElement) {
+        return NS_ERROR_FAILURE;
+      }
+
+      nsresult rv =
+          textAreaElement->GetControllers(getter_AddRefs(controllers));
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        return rv;
+      }
+    }
+
+    if (controllers) {
+      uint32_t numControllers;
+      bool found = false;
+      rv = controllers->GetControllerCount(&numControllers);
+      for (uint32_t i = 0; i < numControllers; i++) {
+        nsCOMPtr<nsIController> controller;
+        rv = controllers->GetControllerAt(i, getter_AddRefs(controller));
+        if (NS_SUCCEEDED(rv) && controller) {
+          nsCOMPtr<nsBaseCommandController> baseController =
+              do_QueryInterface(controller);
+          if (baseController) {
+            baseController->SetContext(newTextEditor);
+            found = true;
+          }
+        }
+      }
+      if (!found) {
+        rv = NS_ERROR_FAILURE;
+      }
+    }
+  }
+
+  if (shouldInitializeEditor) {
+    const int32_t wrapCols = GetWrapCols();
+    MOZ_ASSERT(wrapCols >= 0);
+    newTextEditor->SetWrapColumn(wrapCols);
+  }
+
+  newTextEditor->SetMaxTextLength(mTextCtrlElement->UsedMaxLength());
+
+  editorFlags = newTextEditor->Flags();
+
+  if (mTextCtrlElement->IsDisabledOrReadOnly()) {
+    editorFlags |= nsIEditor::eEditorReadonlyMask;
+  }
+
+  SetEditorFlagsIfNecessary(*newTextEditor, editorFlags);
+
+  if (shouldInitializeEditor) {
+    preDestroyer.Swap(mTextEditor);
+  }
+
+
+  if (!defaultValue.IsEmpty()) {
+    rv = SetEditorFlagsIfNecessary(*newTextEditor, editorFlags);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+
+
+    if (NS_WARN_IF(!SetValue(defaultValue, ValueSetterOption::ByInternalAPI))) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    rv = SetEditorFlagsIfNecessary(*newTextEditor, editorFlags);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+  }
+
+  DebugOnly<bool> enabledUndoRedo =
+      newTextEditor->EnableUndoRedo(TextControlElement::DEFAULT_UNDO_CAP);
+  NS_WARNING_ASSERTION(enabledUndoRedo,
+                       "Failed to enable undo/redo transaction");
+
+  EnsureTextInputListener();
+
+  if (!mEditorInitialized) {
+    newTextEditor->PostCreate();
+    mEverInited = true;
+    mEditorInitialized = true;
+  }
+  newTextEditor->SetTextInputListener(mTextInputListener);
+
+  if (mSelectionCached) {
+    mSelectionCached = false;
+    const auto& props = GetSelectionProperties();
+    if (props.IsDirty()) {
+      SetSelectionRange(props.GetStart(), props.GetEnd(), props.GetDirection(),
+                        IgnoreErrors(), ScrollAfterSelection::No);
+    }
+  } else {
+    uint32_t position = 0;
+
+    if (mTextCtrlElement->ValueChanged()) {
+      nsAutoString val;
+      GetValue(val,  true);
+      position = val.Length();
+    }
+
+    SetSelectionRange(position, position, SelectionDirection::None,
+                      IgnoreErrors(), ScrollAfterSelection::No);
+  }
+
+  return preparingEditor.IsTextControlStateDestroyed()
+             ? NS_ERROR_NOT_INITIALIZED
+             : rv;
+}
+
+void TextControlState::SetSelectionProperties(
+    TextControlState::SelectionProperties& aProps) {
+  if (IsSelectionCached() && aProps.HasMaxLength()) {
+    GetSelectionProperties().SetMaxLength(*aProps.GetMaxLength());
+  }
+  SetSelectionRange(aProps.GetStart(), aProps.GetEnd(), aProps.GetDirection(),
+                    IgnoreErrors());
+}
+
+void TextControlState::GetSelectionRange(uint32_t* aSelectionStart,
+                                         uint32_t* aSelectionEnd,
+                                         ErrorResult& aRv) {
+  MOZ_ASSERT(aSelectionStart);
+  MOZ_ASSERT(aSelectionEnd);
+  MOZ_ASSERT(IsSelectionCached() || GetSelectionController(),
+             "How can we not have a cached selection if we have no selection "
+             "controller?");
+
+  if (IsSelectionCached()) {
+    const SelectionProperties& props = GetSelectionProperties();
+    *aSelectionStart = props.GetStart();
+    *aSelectionEnd = props.GetEnd();
+    return;
+  }
+
+  Selection* sel = mSelCon->GetSelection(SelectionType::eNormal);
+  if (NS_WARN_IF(!sel)) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+
+  Element* root = GetRootNode();
+  if (NS_WARN_IF(!root)) {
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return;
+  }
+  nsContentUtils::GetSelectionInTextControl(sel, root, *aSelectionStart,
+                                            *aSelectionEnd);
+}
+
+SelectionDirection TextControlState::GetSelectionDirection(ErrorResult& aRv) {
+  MOZ_ASSERT(IsSelectionCached() || GetSelectionController(),
+             "How can we not have a cached selection if we have no selection "
+             "controller?");
+
+  if (IsSelectionCached()) {
+    return GetSelectionProperties().GetDirection();
+  }
+
+  Selection* sel = mSelCon->GetSelection(SelectionType::eNormal);
+  if (NS_WARN_IF(!sel)) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return SelectionDirection::Forward;
+  }
+
+  nsDirection direction = sel->GetDirection();
+  if (direction == eDirNext) {
+    return SelectionDirection::Forward;
+  }
+
+  MOZ_ASSERT(direction == eDirPrevious);
+  return SelectionDirection::Backward;
+}
+
+void TextControlState::EnsureEditorInitialized() {
+  NS_ENSURE_SUCCESS_VOID(PrepareEditor());
+}
+
+void TextControlState::SetSelectionRange(uint32_t aStart, uint32_t aEnd,
+                                         SelectionDirection aDirection,
+                                         ErrorResult& aRv,
+                                         ScrollAfterSelection aScroll) {
+  AutoTextControlHandlingState handlingSetSelectionRange(
+      *this, TextControlAction::SetSelectionRange);
+
+  if (aStart > aEnd) {
+    aStart = aEnd;
+  }
+
+  if (!IsSelectionCached()) {
+    RefPtr controller = mTextCtrlElement->GetSelectionController();
+    if (!controller) {
+      return aRv.Throw(NS_ERROR_UNEXPECTED);
+    }
+    RefPtr selection =
+        controller->GetSelection(nsISelectionController::SELECTION_NORMAL);
+    if (!selection) {
+      return aRv.Throw(NS_ERROR_UNEXPECTED);
+    }
+    nsDirection direction = selection->GetDirection();
+    if (aDirection != SelectionDirection::None) {
+      direction =
+          aDirection == SelectionDirection::Backward ? eDirPrevious : eDirNext;
+    }
+
+    RefPtr root = GetRootNode();
+    if (!root) {
+      return aRv.Throw(NS_ERROR_UNEXPECTED);
+    }
+    nsCOMPtr<nsINode> text = root->GetFirstChild();
+    if (NS_WARN_IF(!text)) {
+      return aRv.Throw(NS_ERROR_UNEXPECTED);
+    }
+
+    uint32_t textLength = text->Length();
+    aStart = std::min(aStart, textLength);
+    aEnd = std::min(aEnd, textLength);
+    auto result = selection->SetStartAndEndInLimiter(
+        *text, aStart, *text, aEnd, direction, nsISelectionListener::JS_REASON);
+    if (result.isErr()) {
+      return aRv.Throw(result.unwrapErr());
+    }
+    if (handlingSetSelectionRange.IsTextControlStateDestroyed()) {
+      return;
+    }
+    if (aScroll == ScrollAfterSelection::Yes) {
+      mTextCtrlElement->ScrollSelectionIntoViewAsync();
+    }
+    return;
+  }
+
+  SelectionProperties& props = GetSelectionProperties();
+  if (!props.HasMaxLength()) {
+    nsAutoString value;
+    GetValue(value,  true);
+    props.SetMaxLength(value.Length());
+  }
+
+  bool changed = props.SetStart(aStart);
+  changed |= props.SetEnd(aEnd);
+  changed |= props.SetDirection(aDirection);
+
+  if (!changed) {
+    return;
+  }
+
+  RefPtr<AsyncEventDispatcher> asyncDispatcher =
+      new AsyncEventDispatcher(mTextCtrlElement, eFormSelect, CanBubble::eYes);
+  asyncDispatcher->PostDOMEvent();
+
+  if (IsSelectionCached() &&
+      StaticPrefs::dom_select_events_textcontrols_selectionchange_enabled() &&
+      !mTextCtrlElement->HasScheduledSelectionChangeEvent()) {
+    mTextCtrlElement->SetHasScheduledSelectionChangeEvent();
+    asyncDispatcher = new AsyncSelectionChangeEventDispatcher(
+        mTextCtrlElement, eSelectionChange, CanBubble::eYes);
+    asyncDispatcher->PostDOMEvent();
+  }
+}
+
+void TextControlState::SetSelectionStart(const Nullable<uint32_t>& aStart,
+                                         ErrorResult& aRv) {
+  uint32_t start = 0;
+  if (!aStart.IsNull()) {
+    start = aStart.Value();
+  }
+
+  uint32_t ignored, end;
+  GetSelectionRange(&ignored, &end, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  SelectionDirection dir = GetSelectionDirection(aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  if (end < start) {
+    end = start;
+  }
+
+  SetSelectionRange(start, end, dir, aRv);
+}
+
+void TextControlState::SetSelectionEnd(const Nullable<uint32_t>& aEnd,
+                                       ErrorResult& aRv) {
+  uint32_t end = 0;
+  if (!aEnd.IsNull()) {
+    end = aEnd.Value();
+  }
+
+  uint32_t start, ignored;
+  GetSelectionRange(&start, &ignored, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  SelectionDirection dir = GetSelectionDirection(aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  SetSelectionRange(start, end, dir, aRv);
+}
+
+static void DirectionToName(SelectionDirection dir, nsAString& aDirection) {
+  switch (dir) {
+    case SelectionDirection::None:
+      NS_WARNING("We don't actually support this... how did we get it?");
+      return aDirection.AssignLiteral("none");
+    case SelectionDirection::Forward:
+      return aDirection.AssignLiteral("forward");
+    case SelectionDirection::Backward:
+      return aDirection.AssignLiteral("backward");
+  }
+  MOZ_ASSERT_UNREACHABLE("Invalid SelectionDirection value");
+}
+
+void TextControlState::GetSelectionDirectionString(nsAString& aDirection,
+                                                   ErrorResult& aRv) {
+  SelectionDirection dir = GetSelectionDirection(aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+  DirectionToName(dir, aDirection);
+}
+
+static SelectionDirection DirectionStringToSelectionDirection(
+    const nsAString& aDirection) {
+  if (aDirection.EqualsLiteral("backward")) {
+    return SelectionDirection::Backward;
+  }
+  return SelectionDirection::Forward;
+}
+
+void TextControlState::SetSelectionDirection(const nsAString& aDirection,
+                                             ErrorResult& aRv) {
+  SelectionDirection dir = DirectionStringToSelectionDirection(aDirection);
+
+  uint32_t start, end;
+  GetSelectionRange(&start, &end, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  SetSelectionRange(start, end, dir, aRv);
+}
+
+static SelectionDirection DirectionStringToSelectionDirection(
+    const Optional<nsAString>& aDirection) {
+  if (!aDirection.WasPassed()) {
+    return SelectionDirection::Forward;
+  }
+
+  return DirectionStringToSelectionDirection(aDirection.Value());
+}
+
+void TextControlState::SetSelectionRange(uint32_t aSelectionStart,
+                                         uint32_t aSelectionEnd,
+                                         const Optional<nsAString>& aDirection,
+                                         ErrorResult& aRv,
+                                         ScrollAfterSelection aScroll) {
+  SelectionDirection dir = DirectionStringToSelectionDirection(aDirection);
+
+  SetSelectionRange(aSelectionStart, aSelectionEnd, dir, aRv, aScroll);
+}
+
+void TextControlState::SetRangeText(const nsAString& aReplacement,
+                                    ErrorResult& aRv) {
+  uint32_t start, end;
+  GetSelectionRange(&start, &end, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  SetRangeText(aReplacement, start, end, SelectionMode::Preserve, aRv,
+               Some(start), Some(end));
+}
+
+void TextControlState::SetRangeText(const nsAString& aReplacement,
+                                    uint32_t aStart, uint32_t aEnd,
+                                    SelectionMode aSelectMode, ErrorResult& aRv,
+                                    const Maybe<uint32_t>& aSelectionStart,
+                                    const Maybe<uint32_t>& aSelectionEnd) {
+  if (aStart > aEnd) {
+    aRv.Throw(NS_ERROR_DOM_INDEX_SIZE_ERR);
+    return;
+  }
+
+  AutoTextControlHandlingState handlingSetRangeText(
+      *this, TextControlAction::SetRangeText);
+
+  nsAutoString value;
+  mTextCtrlElement->GetValueFromSetRangeText(value);
+  uint32_t inputValueLength = value.Length();
+
+  if (aStart > inputValueLength) {
+    aStart = inputValueLength;
+  }
+
+  if (aEnd > inputValueLength) {
+    aEnd = inputValueLength;
+  }
+
+  uint32_t selectionStart, selectionEnd;
+  if (!aSelectionStart) {
+    MOZ_ASSERT(!aSelectionEnd);
+    GetSelectionRange(&selectionStart, &selectionEnd, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  } else {
+    MOZ_ASSERT(aSelectionEnd);
+    selectionStart = *aSelectionStart;
+    selectionEnd = *aSelectionEnd;
+  }
+
+  Selection* selection =
+      mSelCon ? mSelCon->GetSelection(SelectionType::eNormal) : nullptr;
+  SelectionBatcher selectionBatcher(
+      MOZ_KnownLive(selection), __FUNCTION__,
+      nsISelectionListener::JS_REASON);  
+
+  MOZ_ASSERT(aStart <= aEnd);
+  value.Replace(aStart, aEnd - aStart, aReplacement);
+  nsresult rv =
+      MOZ_KnownLive(mTextCtrlElement)->SetValueFromSetRangeText(value);
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+    return;
+  }
+
+  uint32_t newEnd = aStart + aReplacement.Length();
+  int32_t delta = aReplacement.Length() - (aEnd - aStart);
+
+  switch (aSelectMode) {
+    case SelectionMode::Select:
+      selectionStart = aStart;
+      selectionEnd = newEnd;
+      break;
+    case SelectionMode::Start:
+      selectionStart = selectionEnd = aStart;
+      break;
+    case SelectionMode::End:
+      selectionStart = selectionEnd = newEnd;
+      break;
+    case SelectionMode::Preserve:
+      if (selectionStart > aEnd) {
+        selectionStart += delta;
+      } else if (selectionStart > aStart) {
+        selectionStart = aStart;
+      }
+
+      if (selectionEnd > aEnd) {
+        selectionEnd += delta;
+      } else if (selectionEnd > aStart) {
+        selectionEnd = newEnd;
+      }
+      break;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unknown mode!");
+  }
+
+  SetSelectionRange(selectionStart, selectionEnd, Optional<nsAString>(), aRv);
+  if (IsSelectionCached()) {
+    GetSelectionProperties().SetMaxLength(value.Length());
+  }
+}
+
+void TextControlState::DestroyEditor() {
+  if (mEditorInitialized) {
+    MOZ_ASSERT(!mPasswordMaskData);
+    RefPtr<TextEditor> textEditor = mTextEditor;
+    mPasswordMaskData = textEditor->PreDestroy();
+    MOZ_ASSERT_IF(mPasswordMaskData, !mPasswordMaskData->mTimer);
+    mEditorInitialized = false;
+  }
+}
+
+void TextControlState::DeinitSelection() {
+  AutoTextControlHandlingState handling(*this,
+                                        TextControlAction::DeinitSelection);
+  if (mSelCon) {
+    mSelCon->SelectionWillLoseFocus();
+  }
+
+  if (mEditorInitialized) {
+    GetValue(mValue,  true);
+  }
+
+  if (!IsSelectionCached()) {
+    uint32_t start = 0, end = 0;
+    GetSelectionRange(&start, &end, IgnoreErrors());
+
+    SelectionDirection direction = GetSelectionDirection(IgnoreErrors());
+
+    SelectionProperties& props = GetSelectionProperties();
+    props.SetMaxLength(mValue.Length());
+    props.SetStart(start);
+    props.SetEnd(end);
+    props.SetDirection(direction);
+    props.SetIsDirty();
+    mSelectionCached = true;
+  }
+
+  DestroyEditor();
+
+  if (!SuppressEventHandlers(mTextCtrlElement)) {
+    const nsCOMPtr<nsIControllers> controllers = [&]() -> nsIControllers* {
+      if (const auto* const inputElement =
+              HTMLInputElement::FromNode(mTextCtrlElement)) {
+        return inputElement->GetExtantControllers();
+      }
+      if (const auto* const textAreaElement =
+              HTMLTextAreaElement::FromNode(mTextCtrlElement)) {
+        return textAreaElement->GetExtantControllers();
+      }
+      return nullptr;
+    }();
+
+    if (controllers) {
+      uint32_t numControllers;
+      nsresult rv = controllers->GetControllerCount(&numControllers);
+      NS_ASSERTION((NS_SUCCEEDED(rv)),
+                   "bad result in gfx text control destructor");
+      for (uint32_t i = 0; i < numControllers; i++) {
+        nsCOMPtr<nsIController> controller;
+        rv = controllers->GetControllerAt(i, getter_AddRefs(controller));
+        if (NS_SUCCEEDED(rv) && controller) {
+          nsCOMPtr<nsBaseCommandController> editController =
+              do_QueryInterface(controller);
+          if (editController) {
+            editController->SetContext(nullptr);
+          }
+        }
+      }
+    }
+  }
+
+  if (mSelCon) {
+    if (mTextInputListener) {
+      mTextInputListener->EndListeningToSelectionChange();
+    }
+
+    mSelCon->DisconnectFromPresShell();
+    mSelCon = nullptr;
+  }
+
+  if (mTextInputListener) {
+    mTextInputListener->EndHandlingShortcutKeys();
+  }
+}
+
+void TextControlState::GetValue(nsAString& aValue, bool aForDisplay) const {
+  if (mHandlingState &&
+      mHandlingState->IsHandling(TextControlAction::CommitComposition)) {
+    aValue = mHandlingState->GetSettingValue();
+    MOZ_ASSERT(aValue.FindChar(u'\r') == -1);
+    return;
+  }
+
+  if (mTextEditor && mEditorInitialized) {
+    aValue.Truncate();  
+    DebugOnly<nsresult> rv = mTextEditor->ComputeTextValue(aValue);
+    MOZ_ASSERT(aValue.FindChar(u'\r') == -1);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv), "Failed to get value");
+  } else if (!mTextCtrlElement->ValueChanged() || mValue.IsVoid()) {
+    nsString value;
+    mTextCtrlElement->GetDefaultValueFromContent(value, aForDisplay);
+    nsContentUtils::PlatformToDOMLineBreaks(value);
+    aValue = std::move(value);
+  } else {
+    aValue = mValue;
+    MOZ_ASSERT(aValue.FindChar(u'\r') == -1);
+  }
+}
+
+bool TextControlState::ValueEquals(const nsAString& aValue) const {
+  nsAutoString value;
+  GetValue(value,  true);
+  return aValue.Equals(value);
+}
+
+#ifdef DEBUG
+bool AreFlagsNotDemandingContradictingMovements(
+    const ValueSetterOptions& aOptions) {
+  return !aOptions.contains(
+      {ValueSetterOption::MoveCursorToBeginSetSelectionDirectionForward,
+       ValueSetterOption::MoveCursorToEndIfValueChanged});
+}
+#endif  // DEBUG
+
+bool TextControlState::SetValue(const nsAString& aValue,
+                                const nsAString* aOldValue,
+                                const ValueSetterOptions& aOptions) {
+  if (mHandlingState &&
+      mHandlingState->IsHandling(TextControlAction::CommitComposition)) {
+    aOldValue = nullptr;
+  }
+
+  if (mPasswordMaskData) {
+    mPasswordMaskData->Reset();
+  }
+
+  const bool wasHandlingSetValue =
+      mHandlingState && mHandlingState->IsHandling(TextControlAction::SetValue);
+
+  ErrorResult error;
+  AutoTextControlHandlingState handlingSetValue(
+      *this, TextControlAction::SetValue, aValue, aOldValue, aOptions, error);
+  if (error.Failed()) [[unlikely]] {
+    MOZ_ASSERT(error.ErrorCodeIs(NS_ERROR_OUT_OF_MEMORY));
+    error.SuppressException();
+    return false;
+  }
+
+  const auto changeKind = [&] {
+    if (aOptions.contains(ValueSetterOption::ByInternalAPI)) {
+      return ValueChangeKind::Internal;
+    }
+    if (aOptions.contains(ValueSetterOption::BySetUserInputAPI)) {
+      return ValueChangeKind::UserInteraction;
+    }
+    return ValueChangeKind::Script;
+  }();
+
+  if (changeKind == ValueChangeKind::Script) {
+    if (auto* input = HTMLInputElement::FromNode(mTextCtrlElement)) {
+      if (input->LastValueChangeWasInteractive()) {
+        GetValue(mLastInteractiveValue,  true);
+      }
+    }
+  }
+
+  if (aOptions.contains(ValueSetterOption::BySetUserInputAPI) ||
+      aOptions.contains(ValueSetterOption::ByContentAPI)) {
+    RefPtr<TextComposition> compositionInEditor =
+        mTextEditor ? mTextEditor->GetComposition() : nullptr;
+    if (compositionInEditor && compositionInEditor->IsComposing()) {
+      if (handlingSetValue.IsHandling(TextControlAction::CommitComposition)) {
+        return true;
+      }
+      MOZ_ASSERT(!aOldValue || ValueEquals(*aOldValue));
+      bool isSameAsCurrentValue =
+          aOldValue ? aOldValue->Equals(handlingSetValue.GetSettingValue())
+                    : ValueEquals(handlingSetValue.GetSettingValue());
+      if (isSameAsCurrentValue) {
+        return true;
+      }
+      AutoTextControlHandlingState handlingCommitComposition(
+          *this, TextControlAction::CommitComposition);
+      if (nsContentUtils::IsSafeToRunScript()) {
+        Maybe<AutoInputEventSuppresser> preventInputEventsDuringCommit;
+        if (mTextEditor->IsDispatchingInputEvent() ||
+            compositionInEditor->EditorHasHandledLatestChange()) {
+          preventInputEventsDuringCommit.emplace(mTextEditor);
+        }
+        OwningNonNull<TextEditor> textEditor(*mTextEditor);
+        nsresult rv = textEditor->CommitComposition();
+        if (handlingCommitComposition.IsTextControlStateDestroyed()) {
+          return true;
+        }
+        if (NS_FAILED(rv)) {
+          NS_WARNING("TextControlState failed to commit composition");
+          return true;
+        }
+      } else {
+        NS_WARNING(
+            "SetValue() is called when there is composition but "
+            "it's not safe to request to commit the composition");
+      }
+    }
+  }
+
+  if (mEditorInitialized) {
+    if (!SetValueWithTextEditor(handlingSetValue)) {
+      return false;
+    }
+  } else if (!SetValueWithoutTextEditor(handlingSetValue)) {
+    return false;
+  }
+
+  if (!wasHandlingSetValue) {
+    handlingSetValue.GetTextControlElement()->OnValueChanged(
+        changeKind, handlingSetValue.GetSettingValue());
+  }
+  return true;
+}
+
+bool TextControlState::SetValueWithTextEditor(
+    AutoTextControlHandlingState& aHandlingSetValue) {
+  MOZ_ASSERT(aHandlingSetValue.Is(TextControlAction::SetValue));
+  MOZ_ASSERT(mTextEditor);
+  MOZ_DIAGNOSTIC_ASSERT(mEditorInitialized);
+  MOZ_DIAGNOSTIC_ASSERT(mTextInputListener);
+  NS_WARNING_ASSERTION(!EditorHasComposition(),
+                       "Failed to commit composition before setting value.  "
+                       "Investigate the cause!");
+
+#ifdef DEBUG
+  if (IsSingleLineTextControl()) {
+    NS_ASSERTION(mEditorInitialized || aHandlingSetValue.IsHandling(
+                                           TextControlAction::PrepareEditor),
+                 "We should never try to use the editor if we're not "
+                 "initialized unless we're being initialized");
+  }
+#endif
+
+  MOZ_ASSERT(!aHandlingSetValue.GetOldValue() ||
+             ValueEquals(*aHandlingSetValue.GetOldValue()));
+  const bool isSameAsCurrentValue =
+      aHandlingSetValue.GetOldValue()
+          ? aHandlingSetValue.GetOldValue()->Equals(
+                aHandlingSetValue.GetSettingValue())
+          : ValueEquals(aHandlingSetValue.GetSettingValue());
+
+  if (isSameAsCurrentValue) {
+    return true;
+  }
+
+  RefPtr<TextEditor> textEditor = mTextEditor;
+
+  nsCOMPtr<Document> document = textEditor->GetDocument();
+  if (NS_WARN_IF(!document)) {
+    return true;
+  }
+
+  AutoNoJSAPI nojsapi;
+
+  Selection* selection = mSelCon->GetSelection(SelectionType::eNormal);
+  SelectionBatcher selectionBatcher(
+      MOZ_KnownLive(selection), __FUNCTION__);
+
+  AutoRestoreEditorState restoreState(textEditor);
+
+  aHandlingSetValue.WillSetValueWithTextEditor();
+
+  if (aHandlingSetValue.ValueSetterOptionsRef().contains(
+          ValueSetterOption::BySetUserInputAPI)) {
+    nsresult rv = textEditor->ReplaceTextAsAction(
+        aHandlingSetValue.GetSettingValue(), nullptr,
+        StaticPrefs::dom_input_event_allow_to_cancel_set_user_input()
+            ? TextEditor::AllowBeforeInputEventCancelable::Yes
+            : TextEditor::AllowBeforeInputEventCancelable::No);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "EditorBase::ReplaceTextAsAction() failed");
+    return rv != NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  AutoInputEventSuppresser suppressInputEventDispatching(textEditor);
+
+  Maybe<AutoDisableUndo> disableUndo;
+  if (!aHandlingSetValue.ValueSetterOptionsRef().contains(
+          ValueSetterOption::PreserveUndoHistory)) {
+    disableUndo.emplace(textEditor);
+  }
+
+  if (selection) {
+    IgnoredErrorResult ignoredError;
+    MOZ_KnownLive(selection)->RemoveAllRanges(ignoredError);
+    NS_WARNING_ASSERTION(!ignoredError.Failed(),
+                         "Selection::RemoveAllRanges() failed, but ignored");
+  }
+
+  nsresult rv = textEditor->SetTextAsAction(
+      aHandlingSetValue.GetSettingValue(),
+      aHandlingSetValue.ValueSetterOptionsRef().contains(
+          ValueSetterOption::BySetUserInputAPI) &&
+              !StaticPrefs::dom_input_event_allow_to_cancel_set_user_input()
+          ? TextEditor::AllowBeforeInputEventCancelable::No
+          : TextEditor::AllowBeforeInputEventCancelable::Yes,
+      nullptr);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "TextEditor::SetTextAsAction() failed");
+
+  if (!aHandlingSetValue.HasEditActionHandled()) {
+    nsresult rvOnEditActionHandled =
+        MOZ_KnownLive(aHandlingSetValue.GetTextInputListener())
+            ->OnEditActionHandled(*textEditor);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rvOnEditActionHandled),
+                         "TextInputListener::OnEditActionHandled() failed");
+    if (rv != NS_ERROR_OUT_OF_MEMORY) {
+      rv = rvOnEditActionHandled;
+    }
+  }
+
+  return rv != NS_ERROR_OUT_OF_MEMORY;
+}
+
+bool TextControlState::SetValueWithoutTextEditor(
+    AutoTextControlHandlingState& aHandlingSetValue) {
+  MOZ_ASSERT(aHandlingSetValue.Is(TextControlAction::SetValue));
+  MOZ_ASSERT(!mEditorInitialized);
+  NS_WARNING_ASSERTION(!EditorHasComposition(),
+                       "Failed to commit composition before setting value.  "
+                       "Investigate the cause!");
+
+  if (mValue.IsVoid()) {
+    mValue.SetIsVoid(false);
+  }
+
+  if (mValue.Equals(aHandlingSetValue.GetSettingValue())) {
+    if (IsSelectionCached()) {
+      GetSelectionProperties().SetIsDirty();
+    }
+    return true;
+  }
+  bool handleSettingValue = true;
+  nsString inputEventData(aHandlingSetValue.GetSettingValue());
+  if (aHandlingSetValue.ValueSetterOptionsRef().contains(
+          ValueSetterOption::BySetUserInputAPI) &&
+      !aHandlingSetValue.HasBeforeInputEventDispatched()) {
+    MOZ_ASSERT(aHandlingSetValue.GetTextControlElement());
+    MOZ_ASSERT(!aHandlingSetValue.GetSettingValue().IsVoid());
+    aHandlingSetValue.WillDispatchBeforeInputEvent();
+    nsEventStatus status = nsEventStatus_eIgnore;
+    DebugOnly<nsresult> rvIgnored = nsContentUtils::DispatchInputEvent(
+        MOZ_KnownLive(aHandlingSetValue.GetTextControlElement()),
+        eEditorBeforeInput, EditorInputType::eInsertReplacementText, nullptr,
+        InputEventOptions(
+            inputEventData,
+            StaticPrefs::dom_input_event_allow_to_cancel_set_user_input()
+                ? InputEventOptions::NeverCancelable::No
+                : InputEventOptions::NeverCancelable::Yes),
+        &status);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                         "Failed to dispatch beforeinput event");
+    if (status == nsEventStatus_eConsumeNoDefault) {
+      return true;  
+    }
+    if (aHandlingSetValue.IsTextControlStateDestroyed()) {
+      return true;
+    }
+    if (mEditorInitialized) {
+      AutoInputEventSuppresser suppressInputEvent(mTextEditor);
+      if (!SetValueWithTextEditor(aHandlingSetValue)) {
+        return false;
+      }
+      if (aHandlingSetValue.IsTextControlStateDestroyed()) {
+        return true;
+      }
+      handleSettingValue = false;
+    }
+  }
+
+  if (handleSettingValue) {
+    if (!mValue.Assign(aHandlingSetValue.GetSettingValue(), fallible)) {
+      return false;
+    }
+
+    if (IsSelectionCached()) {
+      MOZ_ASSERT(AreFlagsNotDemandingContradictingMovements(
+          aHandlingSetValue.ValueSetterOptionsRef()));
+
+      SelectionProperties& props = GetSelectionProperties();
+      props.SetMaxLength(aHandlingSetValue.ValueSetterOptionsRef().contains(
+                             ValueSetterOption::BySetRangeTextAPI)
+                             ? UINT32_MAX
+                             : aHandlingSetValue.GetSettingValue().Length());
+      if (aHandlingSetValue.ValueSetterOptionsRef().contains(
+              ValueSetterOption::MoveCursorToEndIfValueChanged)) {
+        props.SetStart(aHandlingSetValue.GetSettingValue().Length());
+        props.SetEnd(aHandlingSetValue.GetSettingValue().Length());
+        props.SetDirection(SelectionDirection::Forward);
+      } else if (aHandlingSetValue.ValueSetterOptionsRef().contains(
+                     ValueSetterOption::
+                         MoveCursorToBeginSetSelectionDirectionForward)) {
+        props.SetStart(0);
+        props.SetEnd(0);
+        props.SetDirection(SelectionDirection::Forward);
+      }
+    }
+
+    const bool deinittingSelection =
+        mHandlingState &&
+        mHandlingState->IsHandling(TextControlAction::DeinitSelection);
+    mTextCtrlElement->UpdateValueDisplay(!deinittingSelection);
+  }
+
+  if (aHandlingSetValue.ValueSetterOptionsRef().contains(
+          ValueSetterOption::BySetUserInputAPI)) {
+    MOZ_ASSERT(aHandlingSetValue.GetTextControlElement());
+
+    aHandlingSetValue.GetTextControlElement()->OnValueChanged(
+        ValueChangeKind::UserInteraction, aHandlingSetValue.GetSettingValue());
+
+    ClearLastInteractiveValue();
+
+    MOZ_ASSERT(!aHandlingSetValue.GetSettingValue().IsVoid());
+    DebugOnly<nsresult> rvIgnored = nsContentUtils::DispatchInputEvent(
+        MOZ_KnownLive(aHandlingSetValue.GetTextControlElement()), eEditorInput,
+        EditorInputType::eInsertReplacementText, nullptr,
+        InputEventOptions(inputEventData,
+                          InputEventOptions::NeverCancelable::No));
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                         "Failed to dispatch input event");
+  }
+
+  return true;
+}
+
+bool TextControlState::EditorHasComposition() {
+  return mTextEditor && mTextEditor->IsIMEComposing();
+}
+
+}  

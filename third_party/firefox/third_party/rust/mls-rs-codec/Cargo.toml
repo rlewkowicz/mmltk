@@ -1,0 +1,48 @@
+
+[package]
+edition = "2021"
+name = "mls-rs-codec"
+version = "0.7.0"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "TLS codec and MLS specific encoding used by mls-rs"
+homepage = "https://github.com/awslabs/mls-rs"
+keywords = [
+    "mls",
+    "mls-rs",
+]
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/awslabs/mls-rs"
+
+[features]
+default = [
+    "std",
+    "preallocate",
+]
+preallocate = []
+std = ["dep:thiserror"]
+
+[lib]
+name = "mls_rs_codec"
+path = "src/lib.rs"
+
+[dependencies.itertools]
+version = "0.14.0"
+features = ["use_alloc"]
+default-features = false
+
+[dependencies.mls-rs-codec-derive]
+version = "0.2.0"
+
+[dependencies.thiserror]
+version = "2"
+optional = true
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = ["cfg(mls_build_async)"]

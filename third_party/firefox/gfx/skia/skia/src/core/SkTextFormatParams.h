@@ -1,0 +1,27 @@
+/*
+ * Copyright 2010 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+#if !defined(SkTextFormatParams_DEFINES)
+#define SkTextFormatParams_DEFINES
+
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+
+#include <iterator>
+
+static const SkScalar kStdFakeBoldInterpKeys[] = {
+    SK_Scalar1*9,
+    SK_Scalar1*36,
+};
+static const SkScalar kStdFakeBoldInterpValues[] = {
+    SK_Scalar1/24,
+    SK_Scalar1/32,
+};
+static_assert(std::size(kStdFakeBoldInterpKeys) == std::size(kStdFakeBoldInterpValues),
+              "mismatched_array_size");
+static const int kStdFakeBoldInterpLength = std::size(kStdFakeBoldInterpKeys);
+
+#endif

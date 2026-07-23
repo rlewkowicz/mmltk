@@ -1,0 +1,126 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2003 - 2013, International Business Machines Corporation and  *
+* others. All Rights Reserved.                                                *
+*******************************************************************************
+*/
+
+#ifndef ETHPCCAL_H
+#define ETHPCCAL_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/calendar.h"
+#include "cecal.h"
+
+U_NAMESPACE_BEGIN
+
+class EthiopicCalendar : public CECalendar {
+
+public:
+    enum EMonths {
+        MESKEREM,
+
+        TEKEMT,
+
+        HEDAR,
+
+        TAHSAS,
+
+        TER,
+
+        YEKATIT,
+
+        MEGABIT,
+
+        MIAZIA,
+
+        GENBOT,
+
+        SENE,
+
+        HAMLE,
+
+        NEHASSE,
+
+        PAGUMEN
+    };
+
+    enum EEras {
+        AMETE_ALEM,     
+        AMETE_MIHRET    
+    };
+
+    EthiopicCalendar(const Locale& aLocale, UErrorCode& success);
+
+    EthiopicCalendar(const EthiopicCalendar& other) = default;
+
+    virtual ~EthiopicCalendar();
+
+    virtual EthiopicCalendar* clone() const override;
+
+    virtual const char * getType() const override;
+
+protected:
+
+    int32_t getRelatedYearDifference() const override;
+
+    virtual int32_t handleGetExtendedYear(UErrorCode& status) override;
+
+    DECLARE_OVERRIDE_SYSTEM_DEFAULT_CENTURY
+
+    int32_t getJDEpochOffset() const override;
+
+    int32_t extendedYearToEra(int32_t extendedYear) const override;
+
+    int32_t extendedYearToYear(int32_t extendedYear) const override;
+
+public:
+    virtual UClassID getDynamicClassID() const override;
+
+    U_I18N_API static UClassID U_EXPORT2 getStaticClassID();  
+
+#if 0
+
+public:
+
+    int32_t ethiopicToJD(int32_t year, int32_t month, int32_t day);
+#endif
+};
+
+class EthiopicAmeteAlemCalendar : public EthiopicCalendar {
+
+public:
+    EthiopicAmeteAlemCalendar(const Locale& aLocale, UErrorCode& success);
+
+    EthiopicAmeteAlemCalendar(const EthiopicAmeteAlemCalendar& other) = default;
+
+    virtual ~EthiopicAmeteAlemCalendar();
+
+    virtual EthiopicAmeteAlemCalendar* clone() const override;
+
+    virtual const char * getType() const override;
+
+    virtual UClassID getDynamicClassID() const override;
+
+    U_I18N_API static UClassID U_EXPORT2 getStaticClassID(); 
+
+protected:
+
+    virtual int32_t handleGetExtendedYear(UErrorCode& status) override;
+
+    virtual int32_t handleGetLimit(UCalendarDateFields field, ELimitType limitType) const override;
+
+    int32_t getJDEpochOffset() const override;
+
+    int32_t extendedYearToEra(int32_t extendedYear) const override;
+
+    int32_t extendedYearToYear(int32_t extendedYear) const override;
+};
+
+U_NAMESPACE_END
+#endif /* #if !UCONFIG_NO_FORMATTING */
+#endif /* ETHPCCAL_H */

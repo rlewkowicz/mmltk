@@ -1,0 +1,69 @@
+/*
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+
+#ifndef AVCODEC_AVCODEC_INTERNAL_H
+#define AVCODEC_AVCODEC_INTERNAL_H
+
+#include "libavutil/frame.h"
+
+#include "packet.h"
+
+struct AVCodecContext;
+
+typedef struct SideDataMap {
+    enum AVPacketSideDataType packet;
+    enum AVFrameSideDataType frame;
+} SideDataMap;
+
+extern const SideDataMap ff_sd_global_map[];
+
+int ff_decode_receive_frame(struct AVCodecContext *avctx, struct AVFrame *frame,
+                            unsigned flags);
+
+int ff_encode_receive_frame(struct AVCodecContext *avctx, struct AVFrame *frame);
+
+int ff_encode_preinit(struct AVCodecContext *avctx);
+
+int ff_decode_preinit(struct AVCodecContext *avctx);
+
+void ff_decode_flush_buffers(struct AVCodecContext *avctx);
+void ff_encode_flush_buffers(struct AVCodecContext *avctx);
+
+struct AVCodecInternal *ff_decode_internal_alloc(void);
+void ff_decode_internal_sync(struct AVCodecContext *dst,
+                             const struct AVCodecContext *src);
+void ff_decode_internal_uninit(struct AVCodecContext *avctx);
+
+struct AVCodecInternal *ff_encode_internal_alloc(void);
+
+void ff_codec_close(struct AVCodecContext *avctx);
+
+int ff_thread_init(struct AVCodecContext *s);
+void ff_thread_free(struct AVCodecContext *s);
+
+void ff_thread_flush(struct AVCodecContext *avctx);
+
+int ff_thread_receive_frame(struct AVCodecContext *avctx, AVFrame *frame,
+                            unsigned flags);
+
+int ff_decode_receive_frame_internal(struct AVCodecContext *avctx, AVFrame *frame);
+
+int ff_thread_get_packet(struct AVCodecContext *avctx, AVPacket *pkt);
+
+#endif // AVCODEC_AVCODEC_INTERNAL_H

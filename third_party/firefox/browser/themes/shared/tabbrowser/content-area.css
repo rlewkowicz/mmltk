@@ -1,0 +1,638 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+@namespace html url("http://www.w3.org/1999/xhtml");
+
+:root {
+  --tabpanel-background-color: #f9f9fb;
+  @media (-moz-content-prefers-color-scheme: dark) {
+    --tabpanel-background-color: #2b2a33;
+  }
+  &[privatebrowsingmode="temporary"] {
+    --tabpanel-background-color: linear-gradient(45deg, #722291 0%, #45278d 50%, #393473 100%) !important;
+  }
+}
+
+@media -moz-pref("browser.nova.enabled") {
+  #navigator-toolbox {
+    will-change: background-color;
+    transition: background-color var(--inactive-window-transition);
+    margin-block-start: var(--chrome-window-gap);
+    margin-block-end: var(--chrome-window-gap);
+    margin-inline: var(--chrome-window-gap);
+    overflow: hidden;
+
+    :root:is([inFullscreen], [inDOMFullscreen]) & {
+      margin: 0;
+    }
+  }
+
+  #browser {
+    display: flex;
+    box-sizing: border-box;
+    gap: var(--chrome-window-gap);
+  }
+
+  :root:not([inFullscreen], [inDOMFullscreen]) #browser {
+    padding: var(--chrome-window-gap);
+    padding-block-start: 0;
+  }
+
+  #tabbrowser-tabbox {
+    flex: 1;
+    box-sizing: border-box;
+  }
+
+  #tabbrowser-tabpanels > :not(.split-view-panel) .browserContainer {
+    border-radius: var(--chrome-block-radius);
+    overflow: clip;
+    outline: none;
+    box-shadow: none;
+    border: 1px solid var(--chrome-content-separator-color);
+
+    :root:is([inDOMFullscreen], [inFullscreen]) & {
+      border-radius: 0;
+      border: none;
+    }
+  }
+
+  #tabbrowser-tabpanels[splitview] .split-view-splitter {
+    background-color: transparent;
+    border: none;
+    border-radius: var(--border-radius-large);
+    min-width: auto;
+    min-height: auto;
+    width: 4px;
+    margin-inline: 1px;
+    transition: background-color 0.5s ease-in-out;
+
+    &:hover {
+      background-color: var(--focus-outline-color);
+    }
+  }
+
+  #tabbrowser-tabpanels[splitview]:has(.split-view-panel[column="0"].deck-selected) .split-view-splitter {
+    margin-inline-start: 3px;
+  }
+
+  #tabbrowser-tabpanels[splitview]:has(.split-view-panel[column="1"].deck-selected) .split-view-splitter {
+    margin-inline-end: 3px;
+  }
+}
+
+#navigator-toolbox {
+  border-bottom: 0.01px solid var(--chrome-content-separator-color);
+
+  @media -moz-pref("sidebar.revamp") {
+    border-bottom-color: var(--toolbar-background-color);
+  }
+
+  @media -moz-pref("sidebar.verticalTabs") {
+    border-bottom-style: none;
+  }
+
+  @media -moz-pref("browser.nova.enabled") {
+    border-bottom: 1px solid var(--chrome-content-separator-color);
+  }
+}
+
+#browser {
+  position: relative;
+}
+
+#browser,
+#tabbrowser-tabbox,
+#tabbrowser-tabpanels,
+.browserSidebarContainer {
+  min-width: 0;
+  min-height: 0;
+}
+
+@media (not -moz-pref("sidebar.verticalTabs")) and (not -moz-pref("browser.nova.enabled")) {
+  #browser {
+    background-color: var(--toolbar-background-color);
+    color: var(--toolbar-text-color);
+  }
+}
+
+#tabbrowser-tabbox {
+  position: relative;
+  z-index: var(--browser-area-z-index-tabbox);
+  margin: 0;
+}
+
+.browserContainer {
+  flex: 10000 10000;
+  position: relative;
+
+  min-height: 0;
+
+  background: var(--tabpanel-background-color);
+
+  @media -moz-pref("sidebar.revamp") {
+    outline: 0.01px solid var(--chrome-content-separator-color);
+    box-shadow: var(--content-area-shadow);
+  }
+
+  @media -moz-pref("sidebar.revamp") and -moz-pref("sidebar.revamp.round-content-area") {
+    overflow: clip;
+
+    @media not -moz-pref("browser.nova.enabled") {
+      :root:not([inDOMFullscreen]) #tabbrowser-tabbox[sidebar-shown] & {
+        @media -moz-pref("sidebar.position_start") {
+          border-start-start-radius: var(--border-radius-medium);
+        }
+        @media not -moz-pref("sidebar.position_start") {
+          border-start-end-radius: var(--border-radius-medium);
+        }
+      }
+    }
+  }
+}
+
+.browserSidebarContainer {
+  position: absolute;
+  inset: 0;
+  anchor-scope: --browser-with-dialog;
+}
+
+.sidebar-browser-stack {
+  flex: 1;
+}
+
+.browserStack {
+  flex: 10000 10000;
+  min-height: 25px;
+  min-width: 25px;
+}
+
+#tabbrowser-tabpanels {
+  appearance: none;
+  padding: 0;
+  color-scheme: unset;
+  display: flex;
+
+  &[pendingpaint] {
+    background-image: url("chrome://global/skin/icons/pendingpaint.png");
+    background-repeat: no-repeat;
+    background-position: center center;
+    background-size: 30px;
+  }
+
+  browser:is([blank], [pendingpaint]) {
+    opacity: 0;
+  }
+
+  browser[type="content"] {
+    color-scheme: env(-moz-content-preferred-color-scheme);
+  }
+
+  browser[tabDialogShowing] {
+    -moz-user-focus: none !important;
+    anchor-name: --browser-with-dialog;
+  }
+
+  .split-view-panel {
+    --panel-min-width: 140px;
+    min-width: var(--panel-min-width);
+    max-width: calc(100% - var(--panel-min-width));
+    flex: 1;
+    width: 49.4%;
+  }
+
+  &[splitview] {
+    .split-view-panel:not(.split-view-panel-active) {
+      display: none;
+    }
+
+    .split-view-panel.split-view-panel-active {
+      margin: var(--space-xsmall);
+      position: relative;
+      width: unset;
+
+      @media -moz-pref("browser.nova.enabled") and -moz-pref("sidebar.revamp") {
+        margin: var(--chrome-window-gap);
+      }
+    }
+
+    :root:not([inDOMFullscreen]) & > .split-view-panel:not(.deck-selected) {
+      overflow: clip;
+    }
+
+    :root[inDOMFullscreen] & > .split-view-panel-active:not(.deck-selected) {
+      -moz-subtree-hidden-only-visually: 1;
+    }
+
+    :root[inDOMFullscreen] & > .split-view-splitter {
+      display: none;
+    }
+
+    :root[inDOMFullscreen] & > .split-view-panel-active.deck-selected {
+      margin: 0;
+      position: absolute;
+      max-width: none;
+      width: 100% !important;
+
+      & > .browserContainer {
+        border-radius: 0;
+      }
+    }
+
+    .split-view-panel {
+      .browserContainer {
+        border-radius: var(--border-radius-medium);
+        overflow: clip;
+      }
+
+      &.deck-selected > .browserContainer {
+        z-index: 1;
+        outline: var(--focus-outline);
+      }
+    }
+
+    .split-view-panel[column="0"] {
+      order: 0;
+      margin-inline-end: 0;
+
+      @media not (-moz-platform: macos) {
+        z-index: 1;
+      }
+
+      @media -moz-pref("browser.nova.enabled") {
+        #tabbrowser-tabbox:is([sidebar-shown], [sidebar-panel-open]) & {
+          margin-inline-start: 0;
+        }
+      }
+    }
+
+    .split-view-splitter {
+      order: 1;
+      flex: none;
+      -moz-user-focus: normal;
+      border-color: transparent;
+
+      &:focus-visible {
+        outline: auto;
+      }
+    }
+
+    .split-view-panel[column="1"] {
+      order: 2;
+      margin-inline-start: 0;
+    }
+
+    .split-view-panel[width] {
+      flex: none;
+
+      @media not (prefers-reduced-motion) {
+        transition: width 50ms ease-out;
+      }
+    }
+
+    .split-view-panel:not(.deck-selected) > .browserContainer > .browserStack > split-view-footer {
+      display: flex;
+
+      &[hidden] {
+        display: none;
+      }
+    }
+  }
+}
+
+@media -moz-pref("browser.nova.enabled") {
+  #tabbrowser-tabpanels[splitview] .split-view-panel > .browserContainer {
+    border-radius: var(--chrome-block-radius);
+  }
+
+  #tabbrowser-tabpanels[splitview] .split-view-panel:not(.deck-selected) > .browserContainer {
+    border: var(--border-width) solid var(--chrome-content-separator-color);
+  }
+
+  #tabbrowser-tabpanels[splitview] .split-view-panel.split-view-panel-active {
+    margin-block: 0;
+  }
+}
+
+
+split-view-footer {
+  max-width: calc(100% - var(--space-xsmall));
+  display: none;
+  position: absolute;
+  inset-block-end: 0;
+  inset-inline-end: 0;
+
+  border-block-start: 1px solid var(--border-color);
+  border-inline-start: 1px solid var(--border-color);
+  border-start-start-radius: var(--border-radius-medium);
+  border-start-end-radius: 0;
+  border-end-end-radius: var(--border-radius-medium);
+  border-end-start-radius: 0;
+
+  padding-block: var(--space-xxsmall);
+  padding-inline: var(--space-small) var(--space-xsmall);
+
+  -moz-context-properties: fill;
+  fill: var(--button-icon-fill);
+}
+
+.split-view-icon {
+  width: var(--icon-size);
+  height: var(--icon-size);
+}
+
+.split-view-uri {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+split-view-footer,
+.split-view-security-warning {
+  align-items: center;
+  gap: var(--space-small);
+  white-space: nowrap;
+}
+
+
+#statuspanel {
+  &:not([hidden]) {
+    max-width: calc(100% - 5px);
+    pointer-events: none;
+
+    padding-top: 2em;
+
+    position: absolute;
+    bottom: 0;
+    left: 0;
+  }
+
+  &:not([mirror]):-moz-locale-dir(rtl),
+  &[mirror]:-moz-locale-dir(ltr) {
+    left: auto;
+    right: 0;
+  }
+
+  &[sizelimit] {
+    max-width: 50%;
+  }
+
+  &[type="status"] {
+    min-width: min(23em, 33%);
+  }
+
+  &[type="overLink"] {
+    transition:
+      opacity 120ms ease-out,
+      visibility 120ms;
+  }
+
+  &:is([type="overLink"], [inactive][previoustype="overLink"]) {
+    direction: ltr;
+  }
+
+  &[inactive],
+  :root[inDOMFullscreen] &:not([type="overLink"]) {
+    transition: none;
+    opacity: 0;
+    visibility: hidden;
+
+    &[previoustype="overLink"] {
+      transition:
+        opacity 200ms ease-out,
+        visibility 200ms;
+    }
+  }
+
+  @media -moz-pref("browser.tabs.hideStatusPanel") {
+    visibility: hidden;
+  }
+
+  .split-view-panel & {
+    z-index: 1;
+  }
+}
+
+#statuspanel-label,
+split-view-footer {
+  color-scheme: env(-moz-content-preferred-color-scheme);
+  background-color: -moz-dialog;
+  border-color: ThreeDShadow;
+  color: -moz-dialogText;
+  text-shadow: none;
+
+  @media (not (prefers-contrast)) and (not (-moz-platform: linux)) {
+    background-color: light-dark(#f9f9fa, hsl(240, 1%, 20%));
+    border-color: light-dark(#ddd, hsl(240, 1%, 40%));
+    color: light-dark(#444, rgb(249, 249, 250));
+  }
+}
+
+#statuspanel-label {
+  margin: 0;
+  padding: 2px 4px;
+  border-width: 1px;
+  border-style: none;
+  border-top-style: solid;
+
+  @media (-moz-mac-tahoe-theme) {
+    padding: 3px 5px;
+  }
+
+  #statuspanel:not([mirror]) > &:-moz-locale-dir(ltr),
+  #statuspanel[mirror] > &:-moz-locale-dir(rtl) {
+    border-right-style: solid;
+    @media not (-moz-platform: windows) {
+      border-top-right-radius: 0.3em;
+    }
+    margin-right: 1em;
+  }
+
+  #statuspanel:not([mirror]) > &:-moz-locale-dir(rtl),
+  #statuspanel[mirror] > &:-moz-locale-dir(ltr) {
+    border-left-style: solid;
+    @media not (-moz-platform: windows) {
+      border-top-left-radius: 0.3em;
+    }
+    margin-left: 1em;
+  }
+}
+
+
+#clipboardReadPasteMenuPopup,
+#contentAreaContextMenu,
+#DateTimePickerPanel,
+#PopupAutoComplete,
+#remoteBrowserTooltip,
+#aHTMLTooltip[contenttooltip] {
+  color-scheme: env(-moz-content-preferred-color-scheme);
+}
+
+#DateTimePickerPanel {
+  --panel-background-color: Field;
+  --panel-text-color: FieldText;
+}
+
+
+#selection-shortcut-action-panel {
+  --panel-subview-body-padding: 0;
+}
+
+#ai-action-button {
+  --button-min-height: 34px;
+  --button-size-icon: 34px;
+  --button-border-radius: 7px;
+  margin: 1px;
+}
+
+#ask-chat-shortcuts {
+  font: menu;
+  max-width: 345px;
+}
+
+.ask-chat-shortcut-warning {
+  margin: var(--panel-menuitem-margin);
+  margin-bottom: var(--space-xsmall);
+}
+
+.ask-chat-shortcuts-custom-prompt {
+  margin: var(--panel-menuitem-margin);
+  margin-top: var(--space-small);
+}
+
+
+.dialogStack {
+  z-index: var(--browser-stack-z-index-dialog-stack);
+  position: absolute;
+  inset: 0;
+  position-anchor: --browser-with-dialog;
+  position-area: center;
+  width: 100%;
+  height: 100%;
+
+  :root[window-modal-open] .browserStack > &,
+  &.temporarilyHidden {
+    visibility: hidden;
+  }
+}
+
+.dialogOverlay {
+  align-items: center;
+  visibility: hidden;
+
+  &[topmost="true"] {
+    z-index: 1;
+  }
+
+  .content-prompt-dialog > & {
+    display: grid;
+    align-items: unset;
+    place-content: center;
+    grid-auto-rows: min(90%, var(--doc-height-px));
+  }
+}
+
+.dialogBox {
+  min-width: 0;
+  background-clip: content-box;
+  display: flex;
+  padding: 0;
+  overflow-x: auto;
+  outline: 0.5px solid var(--card-border-color);
+
+  will-change: transform;
+
+  &:not(.spotlightBox) {
+    box-shadow: var(--popup-box-shadow);
+    border-radius: var(--border-radius-medium);
+  }
+
+  @media (prefers-contrast) {
+    outline-color: WindowText;
+  }
+
+  &[resizable="true"] {
+    resize: both;
+    overflow: hidden;
+    min-height: 20em;
+  }
+
+  &[sizeto="available"] {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+
+    --box-max-width-default: clamp(80%, 100% + (600px - 100%) / 2, 100%);
+    --box-max-height-default: clamp(90%, 100% + (600px - 100%) / 2, 100%);
+    max-width: var(--box-max-width-requested, var(--box-max-width-default));
+    max-height: var(--box-max-height-requested, var(--box-max-height-default));
+  }
+
+  :not(.content-prompt-dialog) > .dialogOverlay > &:not(.spotlightBox) {
+    margin-top: -5px;
+
+    .deck-selected.split-view-panel & {
+      margin-top: -8px;
+    }
+  }
+
+  &.spotlightBox {
+    max-width: none;
+    max-height: none;
+  }
+
+  #window-modal-dialog > .dialogOverlay > &:not(.spotlightBox) {
+    margin-top: clamp(3px, var(--chrome-offset, 20px) - 5px, calc(100vh - var(--subdialog-inner-height) - 5px));
+  }
+}
+
+#window-modal-dialog {
+  overflow: visible;
+  padding: 0;
+  border-width: 0;
+  background-color: transparent;
+  bottom: auto;
+  outline: none;
+
+  &.spotlight {
+    inset: 0;
+    height: auto;
+    width: auto;
+    max-height: none;
+    max-width: none;
+
+    > .dialogOverlay {
+      width: 100%;
+      height: 100%;
+    }
+  }
+}
+
+.dialogFrame {
+  margin: 0;
+  flex: 1;
+  width: 34em;
+}
+
+:root:not([inDOMFullscreen]) #tabbrowser-tabbox[sidebar-shown] .dialogOverlay[topmost="true"] {
+  @media -moz-pref("sidebar.revamp.round-content-area") {
+    border-start-end-radius: var(--border-radius-medium);
+
+    @media -moz-pref("sidebar.position_start") {
+      border-start-start-radius: var(--border-radius-medium);
+      border-start-end-radius: 0;
+    }
+  }
+}
+
+.dialogOverlay[topmost="true"],
+#window-modal-dialog::backdrop {
+  background-color: var(--background-color-overlay);
+}
+
+.dialogOverlay[hideContent="true"][topmost="true"] {
+  background-color: var(--tabpanel-background-color);
+}
+
+#window-modal-dialog > .dialogOverlay[topmost="true"] {
+  background-color: transparent;
+}

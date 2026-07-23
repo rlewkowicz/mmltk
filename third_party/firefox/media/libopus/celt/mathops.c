@@ -1,0 +1,266 @@
+/* Copyright (c) 2002-2008 Jean-Marc Valin
+   Copyright (c) 2007-2008 CSIRO
+   Copyright (c) 2007-2009 Xiph.Org Foundation
+   Copyright (c) 2024 Arm Limited
+   Written by Jean-Marc Valin */
+/*
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions
+   are met:
+
+   - Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+   - Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+   ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
+   OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+   EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+   PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+   PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "float_cast.h"
+#include "mathops.h"
+
+unsigned isqrt32(opus_uint32 _val){
+  unsigned b;
+  unsigned g;
+  int      bshift;
+  g=0;
+  bshift=(EC_ILOG(_val)-1)>>1;
+  b=1U<<bshift;
+  do{
+    opus_uint32 t;
+    t=(((opus_uint32)g<<1)+b)<<bshift;
+    if(t<=_val){
+      g+=b;
+      _val-=t;
+    }
+    b>>=1;
+    bshift--;
+  }
+  while(bshift>=0);
+  return g;
+}
+
+#ifdef FIXED_POINT
+
+opus_val32 frac_div32_q29(opus_val32 a, opus_val32 b)
+{
+   opus_val16 rcp;
+   opus_val32 result, rem;
+   int shift = celt_ilog2(b)-29;
+   a = VSHR32(a,shift);
+   b = VSHR32(b,shift);
+   rcp = ROUND16(celt_rcp(ROUND16(b,16)),3);
+   result = MULT16_32_Q15(rcp, a);
+   rem = PSHR32(a,2)-MULT32_32_Q31(result, b);
+   result = ADD32(result, SHL32(MULT16_32_Q15(rcp, rem),2));
+   return result;
+}
+
+opus_val32 frac_div32(opus_val32 a, opus_val32 b) {
+   opus_val32 result = frac_div32_q29(a,b);
+   if (result >= 536870912)       
+      return 2147483647;          
+   else if (result <= -536870912) 
+      return -2147483647;         
+   else
+      return SHL32(result, 2);
+}
+
+opus_val16 celt_rsqrt_norm(opus_val32 x)
+{
+   opus_val16 n;
+   opus_val16 r;
+   opus_val16 r2;
+   opus_val16 y;
+   n = x-32768;
+   r = ADD16(23557, MULT16_16_Q15(n, ADD16(-13490, MULT16_16_Q15(n, 6713))));
+   r2 = MULT16_16_Q15(r, r);
+   y = SHL16(SUB16(ADD16(MULT16_16_Q15(r2, n), r2), 16384), 1);
+   return ADD16(r, MULT16_16_Q15(r, MULT16_16_Q15(y,
+              SUB16(MULT16_16_Q15(y, 12288), 16384))));
+}
+
+opus_val32 celt_rsqrt_norm32(opus_val32 x)
+{
+   opus_int32 tmp;
+   opus_int32 r_q29 = SHL32(celt_rsqrt_norm(SHR32(x, 31-16)), 15);
+   tmp = MULT32_32_Q31(r_q29, r_q29);
+   tmp = MULT32_32_Q31(1073741824 , tmp);
+   tmp = MULT32_32_Q31(x, tmp);
+   return SHL32(MULT32_32_Q31(r_q29, SUB32(201326592 , tmp)), 4);
+}
+
+opus_val32 celt_sqrt(opus_val32 x)
+{
+   int k;
+   opus_val16 n;
+   opus_val32 rt;
+   static const opus_val16 C[6] = {23171, 11574, -2901, 1592, -1002, 336};
+   if (x==0)
+      return 0;
+   else if (x>=1073741824)
+      return 32767;
+   k = (celt_ilog2(x)>>1)-7;
+   x = VSHR32(x, 2*k);
+   n = x-32768;
+   rt = ADD32(C[0], MULT16_16_Q15(n, ADD16(C[1], MULT16_16_Q15(n, ADD16(C[2],
+              MULT16_16_Q15(n, ADD16(C[3], MULT16_16_Q15(n, ADD16(C[4], MULT16_16_Q15(n, (C[5])))))))))));
+   rt = VSHR32(rt,7-k);
+   return rt;
+}
+
+opus_val32 celt_sqrt32(opus_val32 x)
+{
+   int k;
+   opus_int32 x_frac;
+   if (x==0)
+      return 0;
+   else if (x>=1073741824)
+      return 2147483647; 
+   k = (celt_ilog2(x)>>1);
+   x_frac = VSHR32(x, 2*(k-14)-1);
+   x_frac = MULT32_32_Q31(celt_rsqrt_norm32(x_frac), x_frac);
+   if (k < 12) return PSHR32(x_frac, 12-k);
+   else return SHL32(x_frac, k-12);
+}
+
+#define L1 32767
+#define L2 -7651
+#define L3 8277
+#define L4 -626
+
+static OPUS_INLINE opus_val16 _celt_cos_pi_2(opus_val16 x)
+{
+   opus_val16 x2;
+
+   x2 = MULT16_16_P15(x,x);
+   return ADD16(1,MIN16(32766,ADD32(SUB16(L1,x2), MULT16_16_P15(x2, ADD32(L2, MULT16_16_P15(x2, ADD32(L3, MULT16_16_P15(L4, x2
+                                                                                ))))))));
+}
+
+#undef L1
+#undef L2
+#undef L3
+#undef L4
+
+opus_val16 celt_cos_norm(opus_val32 x)
+{
+   x = x&0x0001ffff;
+   if (x>SHL32(EXTEND32(1), 16))
+      x = SUB32(SHL32(EXTEND32(1), 17),x);
+   if (x&0x00007fff)
+   {
+      if (x<SHL32(EXTEND32(1), 15))
+      {
+         return _celt_cos_pi_2(EXTRACT16(x));
+      } else {
+         return NEG16(_celt_cos_pi_2(EXTRACT16(65536-x)));
+      }
+   } else {
+      if (x&0x0000ffff)
+         return 0;
+      else if (x&0x0001ffff)
+         return -32767;
+      else
+         return 32767;
+   }
+}
+
+opus_val32 celt_cos_norm32(opus_val32 x)
+{
+   static const opus_val32 COS_NORM_COEFF_A0 = 134217720;   
+   static const opus_val32 COS_NORM_COEFF_A1 = -662336704;  
+   static const opus_val32 COS_NORM_COEFF_A2 = 544710848;   
+   static const opus_val32 COS_NORM_COEFF_A3 = -178761936;  
+   static const opus_val32 COS_NORM_COEFF_A4 = 29487206;    
+   opus_int32 x_sq_q29, tmp;
+   celt_sig_assert((x >= -1073741824) && (x <= 1073741824));
+   if (ABS32(x) == 1<<30) return 0;
+   x_sq_q29 = MULT32_32_Q31(x, x);
+   tmp = ADD32(COS_NORM_COEFF_A3, MULT32_32_Q31(x_sq_q29, COS_NORM_COEFF_A4));
+   tmp = ADD32(COS_NORM_COEFF_A2, MULT32_32_Q31(x_sq_q29, tmp));
+   tmp = ADD32(COS_NORM_COEFF_A1, MULT32_32_Q31(x_sq_q29, tmp));
+   return SHL32(ADD32(COS_NORM_COEFF_A0, MULT32_32_Q31(x_sq_q29, tmp)), 4);
+}
+
+opus_val16 celt_rcp_norm16(opus_val16 x)
+{
+   opus_val16 r;
+   r = ADD16(30840, MULT16_16_Q15(-15420, x));
+   r = SUB16(r, MULT16_16_Q15(r,
+             ADD16(MULT16_16_Q15(r, x), ADD16(r, -32768))));
+   return SUB16(r, ADD16(1, MULT16_16_Q15(r,
+                ADD16(MULT16_16_Q15(r, x), ADD16(r, -32768)))));
+}
+
+opus_val32 celt_rcp_norm32(opus_val32 x)
+{
+   opus_val32 r_q30;
+   celt_sig_assert(x >= 1073741824);
+   r_q30 = SHL32(EXTEND32(celt_rcp_norm16(SHR32(x, 15)-32768)), 16);
+   return SUB32(r_q30, ADD32(SHL32(
+                MULT32_32_Q31(ADD32(MULT32_32_Q31(r_q30, x), -1073741824),
+                              r_q30), 1), 1));
+}
+
+opus_val32 celt_rcp(opus_val32 x)
+{
+   int i;
+   opus_val16 r;
+   celt_sig_assert(x>0);
+   i = celt_ilog2(x);
+
+   r = celt_rcp_norm16(VSHR32(x,i-15)-32768);
+
+   return VSHR32(EXTEND32(r),i-16);
+}
+
+#endif
+
+#ifndef DISABLE_FLOAT_API
+
+void celt_float2int16_c(const float * OPUS_RESTRICT in, short * OPUS_RESTRICT out, int cnt)
+{
+   int i;
+   for (i = 0; i < cnt; i++)
+   {
+      out[i] = FLOAT2INT16(in[i]);
+   }
+}
+
+int opus_limit2_checkwithin1_c(float * samples, int cnt)
+{
+   int i;
+   if (cnt <= 0)
+   {
+      return 1;
+   }
+
+   for (i = 0; i < cnt; i++)
+   {
+      float clippedVal = samples[i];
+      clippedVal = FMAX(-2.0f, clippedVal);
+      clippedVal = FMIN(2.0f, clippedVal);
+      samples[i] = clippedVal;
+   }
+
+   return 0;
+}
+
+#endif /* DISABLE_FLOAT_API */

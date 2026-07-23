@@ -1,0 +1,1568 @@
+/*
+ * Copyright 2021 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_codegen_types_h
+#define wasm_codegen_types_h
+
+#include "mozilla/CheckedInt.h"
+#include "mozilla/EnumeratedArray.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Span.h"
+
+#include <stdint.h>
+
+#include "jit/IonTypes.h"
+#include "jit/PerfSpewer.h"
+#include "threading/ExclusiveData.h"
+#include "wasm/WasmBuiltins.h"
+#include "wasm/WasmCodegenConstants.h"
+#include "wasm/WasmConstants.h"
+#include "wasm/WasmInstanceData.h"
+#include "wasm/WasmSerialize.h"
+#include "wasm/WasmShareable.h"
+#include "wasm/WasmTypeDef.h"
+#include "wasm/WasmUtility.h"
+
+namespace js {
+
+namespace jit {
+template <class VecT>
+class ABIArgIter;
+}  
+
+namespace wasm {
+
+struct CodeMetadata;
+struct TableDesc;
+struct V128;
+
+
+enum class StackResults { HasStackResults, NoStackResults };
+
+class ArgTypeVector {
+  const ValTypeVector& args_;
+  bool hasStackResults_;
+
+  size_t length() const { return args_.length() + size_t(hasStackResults_); }
+  template <class VecT>
+  friend class jit::ABIArgIter;
+
+ public:
+  ArgTypeVector(const ValTypeVector& args, StackResults stackResults)
+      : args_(args),
+        hasStackResults_(stackResults == StackResults::HasStackResults) {}
+  explicit ArgTypeVector(const FuncType& funcType);
+
+  bool hasSyntheticStackResultPointerArg() const { return hasStackResults_; }
+  StackResults stackResults() const {
+    return hasSyntheticStackResultPointerArg() ? StackResults::HasStackResults
+                                               : StackResults::NoStackResults;
+  }
+  size_t lengthWithoutStackResults() const { return args_.length(); }
+  bool isSyntheticStackResultPointerArg(size_t idx) const {
+    MOZ_ASSERT(idx < lengthWithStackResults());
+    return idx == args_.length();
+  }
+  bool isNaturalArg(size_t idx) const {
+    return !isSyntheticStackResultPointerArg(idx);
+  }
+  size_t naturalIndex(size_t idx) const {
+    MOZ_ASSERT(isNaturalArg(idx));
+    return idx;
+  }
+
+  size_t lengthWithStackResults() const { return length(); }
+  jit::MIRType operator[](size_t i) const {
+    MOZ_ASSERT(i < lengthWithStackResults());
+    if (isSyntheticStackResultPointerArg(i)) {
+      return jit::MIRType::StackResults;
+    }
+    return args_[naturalIndex(i)].toMIRType();
+  }
+};
+
+
+class BytecodeOffset {
+  static const uint32_t INVALID = UINT32_MAX;
+  static_assert(INVALID > wasm::MaxModuleBytes);
+  uint32_t offset_;
+
+  WASM_CHECK_CACHEABLE_POD(offset_);
+
+ public:
+  BytecodeOffset() : offset_(INVALID) {}
+  explicit BytecodeOffset(uint32_t offset) : offset_(offset) {}
+
+  bool isValid() const { return offset_ != INVALID; }
+  uint32_t offset() const {
+    MOZ_ASSERT(isValid());
+    return offset_;
+  }
+};
+
+WASM_DECLARE_CACHEABLE_POD(BytecodeOffset);
+using BytecodeOffsetVector =
+    mozilla::Vector<BytecodeOffset, 4, SystemAllocPolicy>;
+using BytecodeOffsetSpan = mozilla::Span<const BytecodeOffset>;
+using ShareableBytecodeOffsetVector =
+    ShareableVector<BytecodeOffset, 4, SystemAllocPolicy>;
+using SharedBytecodeOffsetVector = RefPtr<const ShareableBytecodeOffsetVector>;
+using MutableBytecodeOffsetVector = RefPtr<ShareableBytecodeOffsetVector>;
+
+enum class TrapMachineInsn {
+  OfficialUD,
+  Load8,
+  Load16,
+  Load32,
+  Load64,
+  Load128,
+  Store8,
+  Store16,
+  Store32,
+  Store64,
+  Store128,
+  Atomic
+};
+using TrapMachineInsnVector =
+    mozilla::Vector<TrapMachineInsn, 0, SystemAllocPolicy>;
+
+static inline TrapMachineInsn TrapMachineInsnForLoad(int byteSize) {
+  switch (byteSize) {
+    case 1:
+      return TrapMachineInsn::Load8;
+    case 2:
+      return TrapMachineInsn::Load16;
+    case 4:
+      return TrapMachineInsn::Load32;
+    case 8:
+      return TrapMachineInsn::Load64;
+    case 16:
+      return TrapMachineInsn::Load128;
+    default:
+      MOZ_CRASH("TrapMachineInsnForLoad");
+  }
+}
+static inline TrapMachineInsn TrapMachineInsnForLoadWord() {
+  return TrapMachineInsnForLoad(sizeof(void*));
+}
+
+static inline TrapMachineInsn TrapMachineInsnForStore(int byteSize) {
+  switch (byteSize) {
+    case 1:
+      return TrapMachineInsn::Store8;
+    case 2:
+      return TrapMachineInsn::Store16;
+    case 4:
+      return TrapMachineInsn::Store32;
+    case 8:
+      return TrapMachineInsn::Store64;
+    case 16:
+      return TrapMachineInsn::Store128;
+    default:
+      MOZ_CRASH("TrapMachineInsnForStore");
+  }
+}
+static inline TrapMachineInsn TrapMachineInsnForStoreWord() {
+  return TrapMachineInsnForStore(sizeof(void*));
+}
+#ifdef DEBUG
+const char* ToString(Trap trap);
+const char* ToString(TrapMachineInsn tmi);
+#endif
+
+
+class FaultingCodeOffset {
+  static constexpr uint32_t INVALID = UINT32_MAX;
+  uint32_t offset_;
+
+ public:
+  FaultingCodeOffset() : offset_(INVALID) {}
+  explicit FaultingCodeOffset(uint32_t offset) : offset_(offset) {
+    MOZ_ASSERT(offset != INVALID);
+  }
+  bool isValid() const { return offset_ != INVALID; }
+  uint32_t get() const {
+    MOZ_ASSERT(isValid());
+    return offset_;
+  }
+};
+static_assert(sizeof(FaultingCodeOffset) == 4);
+
+using FaultingCodeOffsetPair =
+    std::pair<FaultingCodeOffset, FaultingCodeOffset>;
+static_assert(sizeof(FaultingCodeOffsetPair) == 8);
+
+using InlinedCallerOffsets = BytecodeOffsetVector;
+
+struct InlinedCallerOffsetIndex {
+ private:
+  static constexpr uint32_t NONE = UINT32_MAX;
+
+  uint32_t value_;
+
+ public:
+  static constexpr uint32_t MAX = UINT32_MAX - 1;
+
+  InlinedCallerOffsetIndex() : value_(NONE) {}
+
+  explicit InlinedCallerOffsetIndex(uint32_t index) : value_(index) {
+    MOZ_RELEASE_ASSERT(index <= MAX);
+  }
+
+  uint32_t value() const {
+    MOZ_RELEASE_ASSERT(!isNone());
+    return value_;
+  }
+
+  bool isNone() const { return value_ == NONE; }
+};
+static_assert(sizeof(InlinedCallerOffsetIndex) == sizeof(uint32_t));
+
+using InlinedCallerOffsetsIndexHashMap =
+    mozilla::HashMap<uint32_t, InlinedCallerOffsetIndex,
+                     mozilla::DefaultHasher<uint32_t>, SystemAllocPolicy>;
+
+class InliningContext {
+  using Storage = mozilla::Vector<InlinedCallerOffsets, 0, SystemAllocPolicy>;
+  Storage storage_;
+  bool mutable_ = true;
+
+ public:
+  InliningContext() = default;
+
+  bool empty() const { return storage_.empty(); }
+  uint32_t length() const { return storage_.length(); }
+
+  void setImmutable() {
+    MOZ_RELEASE_ASSERT(mutable_);
+    mutable_ = false;
+  }
+
+  const InlinedCallerOffsets* operator[](InlinedCallerOffsetIndex index) const {
+    MOZ_RELEASE_ASSERT(!mutable_);
+    MOZ_RELEASE_ASSERT(index.value() < length());
+    return &storage_[index.value()];
+  }
+
+  [[nodiscard]] bool append(InlinedCallerOffsets&& inlinedCallerOffsets,
+                            InlinedCallerOffsetIndex* index) {
+    MOZ_RELEASE_ASSERT(mutable_);
+
+    if (inlinedCallerOffsets.empty()) {
+      *index = InlinedCallerOffsetIndex();
+      return true;
+    }
+
+    if (storage_.length() == InlinedCallerOffsetIndex::MAX ||
+        !storage_.append(std::move(inlinedCallerOffsets))) {
+      return false;
+    }
+    *index = InlinedCallerOffsetIndex(storage_.length() - 1);
+    return true;
+  }
+
+  [[nodiscard]] bool appendAll(InliningContext&& other) {
+    MOZ_RELEASE_ASSERT(mutable_);
+    if (!storage_.appendAll(std::move(other.storage_))) {
+      return false;
+    }
+
+    return storage_.length() <= InlinedCallerOffsetIndex::MAX;
+  }
+
+  void swap(InliningContext& other) {
+    MOZ_RELEASE_ASSERT(mutable_);
+    storage_.swap(other.storage_);
+  }
+
+  void shrinkStorageToFit() { storage_.shrinkStorageToFit(); }
+
+  void clear() {
+    MOZ_RELEASE_ASSERT(mutable_);
+    storage_.clear();
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return storage_.sizeOfExcludingThis(mallocSizeOf);
+  }
+};
+
+
+struct TrapSiteDesc {
+  explicit TrapSiteDesc(BytecodeOffset bytecodeOffset,
+                        InlinedCallerOffsetIndex inlinedCallerOffsetsIndex =
+                            InlinedCallerOffsetIndex())
+      : bytecodeOffset(bytecodeOffset),
+        inlinedCallerOffsetsIndex(inlinedCallerOffsetsIndex) {}
+  TrapSiteDesc() : TrapSiteDesc(BytecodeOffset(0)) {};
+
+  bool isValid() const { return bytecodeOffset.isValid(); }
+
+  BytecodeOffset bytecodeOffset;
+  InlinedCallerOffsetIndex inlinedCallerOffsetsIndex;
+};
+
+using MaybeTrapSiteDesc = mozilla::Maybe<TrapSiteDesc>;
+
+
+struct TrapSite : TrapSiteDesc {
+  const InlinedCallerOffsets* inlinedCallerOffsets = nullptr;
+
+  BytecodeOffsetSpan inlinedCallerOffsetsSpan() const {
+    if (!inlinedCallerOffsets) {
+      return BytecodeOffsetSpan();
+    }
+    return BytecodeOffsetSpan(inlinedCallerOffsets->begin(),
+                              inlinedCallerOffsets->end());
+  }
+};
+
+class TrapSitesForKind {
+  using Uint32Vector = Vector<uint32_t, 0, SystemAllocPolicy>;
+  using BytecodeOffsetVector =
+      mozilla::Vector<BytecodeOffset, 0, SystemAllocPolicy>;
+
+#ifdef DEBUG
+  TrapMachineInsnVector machineInsns_;
+#endif
+  Uint32Vector pcOffsets_;
+  BytecodeOffsetVector bytecodeOffsets_;
+  InlinedCallerOffsetsIndexHashMap inlinedCallerOffsetsMap_;
+
+ public:
+  explicit TrapSitesForKind() = default;
+
+  static constexpr size_t MAX_LENGTH = UINT32_MAX - 1;
+
+  uint32_t length() const {
+    size_t result = pcOffsets_.length();
+    MOZ_ASSERT(result <= MAX_LENGTH);
+    return (uint32_t)result;
+  }
+
+  bool empty() const { return pcOffsets_.empty(); }
+
+  [[nodiscard]]
+  bool reserve(size_t length) {
+    if (length > MAX_LENGTH) {
+      return false;
+    }
+
+#ifdef DEBUG
+    if (!machineInsns_.reserve(length)) {
+      return false;
+    }
+#endif
+    return pcOffsets_.reserve(length) && bytecodeOffsets_.reserve(length);
+  }
+
+  [[nodiscard]]
+  bool append(TrapMachineInsn insn, uint32_t pcOffset,
+              const TrapSiteDesc& desc) {
+    MOZ_ASSERT(desc.bytecodeOffset.isValid());
+
+#ifdef DEBUG
+    if (!machineInsns_.reserve(machineInsns_.length() + 1)) {
+      return false;
+    }
+#endif
+    if (!pcOffsets_.reserve(pcOffsets_.length() + 1) ||
+        !bytecodeOffsets_.reserve(bytecodeOffsets_.length() + 1)) {
+      return false;
+    }
+
+    uint32_t index = length();
+
+    if (!desc.inlinedCallerOffsetsIndex.isNone() &&
+        !inlinedCallerOffsetsMap_.putNew(index,
+                                         desc.inlinedCallerOffsetsIndex)) {
+      return false;
+    }
+
+#ifdef DEBUG
+    machineInsns_.infallibleAppend(insn);
+#endif
+    pcOffsets_.infallibleAppend(pcOffset);
+    bytecodeOffsets_.infallibleAppend(desc.bytecodeOffset);
+
+    return true;
+  }
+
+  [[nodiscard]]
+  bool appendAll(TrapSitesForKind&& other, uint32_t baseCodeOffset,
+                 InlinedCallerOffsetIndex baseInlinedCallerOffsetIndex) {
+    mozilla::CheckedUint32 newLength =
+        mozilla::CheckedUint32(length()) + other.length();
+    if (!newLength.isValid() || newLength.value() > MAX_LENGTH) {
+      return false;
+    }
+
+#ifdef DEBUG
+    if (!machineInsns_.reserve(newLength.value())) {
+      return false;
+    }
+#endif
+    if (!pcOffsets_.reserve(newLength.value()) ||
+        !bytecodeOffsets_.reserve(newLength.value())) {
+      return false;
+    }
+    if (!inlinedCallerOffsetsMap_.reserve(
+            inlinedCallerOffsetsMap_.count() +
+            other.inlinedCallerOffsetsMap_.count())) {
+      return false;
+    }
+
+    uint32_t baseTrapSiteIndex = length();
+    for (auto iter = other.inlinedCallerOffsetsMap_.modIter(); !iter.done();
+         iter.next()) {
+      uint32_t newTrapSiteIndex = baseTrapSiteIndex + iter.get().key();
+      uint32_t newInlinedCallerOffsetIndex =
+          iter.get().value().value() + baseInlinedCallerOffsetIndex.value();
+
+      inlinedCallerOffsetsMap_.putNewInfallible(newTrapSiteIndex,
+                                                newInlinedCallerOffsetIndex);
+    }
+
+    for (uint32_t& pcOffset : other.pcOffsets_) {
+      pcOffset += baseCodeOffset;
+    }
+
+#ifdef DEBUG
+    machineInsns_.infallibleAppend(other.machineInsns_.begin(),
+                                   other.machineInsns_.end());
+#endif
+    pcOffsets_.infallibleAppend(other.pcOffsets_.begin(),
+                                other.pcOffsets_.end());
+    bytecodeOffsets_.infallibleAppend(other.bytecodeOffsets_.begin(),
+                                      other.bytecodeOffsets_.end());
+    return true;
+  }
+
+  void clear() {
+#ifdef DEBUG
+    machineInsns_.clear();
+#endif
+    pcOffsets_.clear();
+    bytecodeOffsets_.clear();
+    inlinedCallerOffsetsMap_.clear();
+  }
+
+  void swap(TrapSitesForKind& other) {
+#ifdef DEBUG
+    machineInsns_.swap(other.machineInsns_);
+#endif
+    pcOffsets_.swap(other.pcOffsets_);
+    bytecodeOffsets_.swap(other.bytecodeOffsets_);
+    inlinedCallerOffsetsMap_.swap(other.inlinedCallerOffsetsMap_);
+  }
+
+  void shrinkStorageToFit() {
+#ifdef DEBUG
+    machineInsns_.shrinkStorageToFit();
+#endif
+    pcOffsets_.shrinkStorageToFit();
+    bytecodeOffsets_.shrinkStorageToFit();
+    inlinedCallerOffsetsMap_.compact();
+  }
+
+  bool lookup(uint32_t trapInstructionOffset,
+              const InliningContext& inliningContext, TrapSite* trapOut) const;
+
+  void checkInvariants(const uint8_t* codeBase) const;
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    size_t result = 0;
+#ifdef DEBUG
+    result += machineInsns_.sizeOfExcludingThis(mallocSizeOf);
+#endif
+    ShareableBytecodeOffsetVector::SeenSet seen;
+    return result + pcOffsets_.sizeOfExcludingThis(mallocSizeOf) +
+           bytecodeOffsets_.sizeOfExcludingThis(mallocSizeOf) +
+           inlinedCallerOffsetsMap_.shallowSizeOfExcludingThis(mallocSizeOf);
+  }
+
+  WASM_DECLARE_FRIEND_SERIALIZE(TrapSitesForKind);
+};
+
+class TrapSites {
+  using TrapSiteVectorArray =
+      mozilla::EnumeratedArray<Trap, TrapSitesForKind, size_t(Trap::Limit)>;
+
+  TrapSiteVectorArray array_;
+
+ public:
+  explicit TrapSites() = default;
+
+  bool empty() const {
+    for (Trap trap : mozilla::MakeEnumeratedRange(Trap::Limit)) {
+      if (!array_[trap].empty()) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  [[nodiscard]]
+  bool reserve(Trap trap, size_t length) {
+    return array_[trap].reserve(length);
+  }
+
+  [[nodiscard]]
+  bool append(Trap trap, TrapMachineInsn insn, uint32_t pcOffset,
+              const TrapSiteDesc& desc) {
+    return array_[trap].append(insn, pcOffset, desc);
+  }
+
+  [[nodiscard]]
+  bool appendAll(TrapSites&& other, uint32_t baseCodeOffset,
+                 InlinedCallerOffsetIndex baseInlinedCallerOffsetIndex) {
+    for (Trap trap : mozilla::MakeEnumeratedRange(Trap::Limit)) {
+      if (!array_[trap].appendAll(std::move(other.array_[trap]), baseCodeOffset,
+                                  baseInlinedCallerOffsetIndex)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void clear() {
+    for (Trap trap : mozilla::MakeEnumeratedRange(Trap::Limit)) {
+      array_[trap].clear();
+    }
+  }
+
+  void swap(TrapSites& rhs) {
+    for (Trap trap : mozilla::MakeEnumeratedRange(Trap::Limit)) {
+      array_[trap].swap(rhs.array_[trap]);
+    }
+  }
+
+  void shrinkStorageToFit() {
+    for (Trap trap : mozilla::MakeEnumeratedRange(Trap::Limit)) {
+      array_[trap].shrinkStorageToFit();
+    }
+  }
+
+  [[nodiscard]]
+  bool lookup(uint32_t trapInstructionOffset,
+              const InliningContext& inliningContext, Trap* kindOut,
+              TrapSite* trapOut) const {
+    for (Trap trap : mozilla::MakeEnumeratedRange(Trap::Limit)) {
+      const TrapSitesForKind& trapSitesForKind = array_[trap];
+      if (trapSitesForKind.lookup(trapInstructionOffset, inliningContext,
+                                  trapOut)) {
+        *kindOut = trap;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void checkInvariants(const uint8_t* codeBase) const {
+    for (Trap trap : mozilla::MakeEnumeratedRange(Trap::Limit)) {
+      array_[trap].checkInvariants(codeBase);
+    }
+  }
+
+  size_t sumOfLengths() const {
+    size_t result = 0;
+    for (Trap trap : mozilla::MakeEnumeratedRange(Trap::Limit)) {
+      result += array_[trap].length();
+    }
+    return result;
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    size_t result = 0;
+    for (Trap trap : mozilla::MakeEnumeratedRange(Trap::Limit)) {
+      result += array_[trap].sizeOfExcludingThis(mallocSizeOf);
+    }
+    return result;
+  }
+
+  WASM_DECLARE_FRIEND_SERIALIZE(TrapSites);
+};
+
+struct CallFarJump {
+  uint32_t targetFuncIndex;
+  uint32_t jumpOffset;
+  WASM_CHECK_CACHEABLE_POD(targetFuncIndex, jumpOffset);
+
+  CallFarJump(uint32_t targetFuncIndex, uint32_t jumpOffset)
+      : targetFuncIndex(targetFuncIndex), jumpOffset(jumpOffset) {}
+};
+WASM_DECLARE_CACHEABLE_POD(CallFarJump);
+
+using CallFarJumpVector = Vector<CallFarJump, 0, SystemAllocPolicy>;
+
+class CallRefMetricsPatch {
+ private:
+  uint32_t offsetOfOffsetPatch_;
+  static constexpr uint32_t NO_OFFSET = UINT32_MAX;
+
+  WASM_CHECK_CACHEABLE_POD(offsetOfOffsetPatch_);
+
+ public:
+  explicit CallRefMetricsPatch() : offsetOfOffsetPatch_(NO_OFFSET) {}
+
+  bool hasOffsetOfOffsetPatch() const {
+    return offsetOfOffsetPatch_ != NO_OFFSET;
+  }
+  uint32_t offsetOfOffsetPatch() const { return offsetOfOffsetPatch_; }
+  void setOffset(uint32_t indexOffset) {
+    MOZ_ASSERT(!hasOffsetOfOffsetPatch());
+    MOZ_ASSERT(indexOffset != NO_OFFSET);
+    offsetOfOffsetPatch_ = indexOffset;
+  }
+};
+
+using CallRefMetricsPatchVector =
+    Vector<CallRefMetricsPatch, 0, SystemAllocPolicy>;
+
+class AllocSitePatch {
+ private:
+  uint32_t patchOffset_;
+  static constexpr uint32_t NO_OFFSET = UINT32_MAX;
+
+ public:
+  explicit AllocSitePatch() : patchOffset_(NO_OFFSET) {}
+
+  bool hasPatchOffset() const { return patchOffset_ != NO_OFFSET; }
+  uint32_t patchOffset() const { return patchOffset_; }
+  void setPatchOffset(uint32_t offset) {
+    MOZ_ASSERT(!hasPatchOffset());
+    MOZ_ASSERT(offset != NO_OFFSET);
+    patchOffset_ = offset;
+  }
+};
+
+using AllocSitePatchVector = Vector<AllocSitePatch, 0, SystemAllocPolicy>;
+
+
+struct TrapData {
+  void* resumePC;
+
+  void* unwoundPC;
+
+  Trap trap;
+  TrapSite trapSite;
+
+  bool failedUnwindSignatureMismatch;
+
+  struct FaultInfo {
+    uint32_t memoryIndex;
+    uint64_t byteOffset;
+  };
+
+  mozilla::Maybe<FaultInfo> faultInfo;
+};
+
+
+struct Offsets {
+  explicit Offsets(uint32_t begin = 0, uint32_t end = 0)
+      : begin(begin), end(end) {}
+
+  uint32_t begin;
+  uint32_t end;
+
+  WASM_CHECK_CACHEABLE_POD(begin, end);
+};
+
+WASM_DECLARE_CACHEABLE_POD(Offsets);
+
+struct CallableOffsets : Offsets {
+  MOZ_IMPLICIT CallableOffsets(uint32_t ret = 0) : ret(ret) {}
+
+  uint32_t ret;
+
+  WASM_CHECK_CACHEABLE_POD_WITH_PARENT(Offsets, ret);
+};
+
+WASM_DECLARE_CACHEABLE_POD(CallableOffsets);
+
+struct ImportOffsets : CallableOffsets {
+  MOZ_IMPLICIT ImportOffsets() : afterFallbackCheck(0) {}
+
+  uint32_t afterFallbackCheck;
+
+  WASM_CHECK_CACHEABLE_POD_WITH_PARENT(CallableOffsets, afterFallbackCheck);
+};
+
+WASM_DECLARE_CACHEABLE_POD(ImportOffsets);
+
+struct FuncOffsets : CallableOffsets {
+  MOZ_IMPLICIT FuncOffsets() : uncheckedCallEntry(0), tierEntry(0) {}
+
+  uint32_t uncheckedCallEntry;
+
+  uint32_t tierEntry;
+
+  WASM_CHECK_CACHEABLE_POD_WITH_PARENT(CallableOffsets, uncheckedCallEntry,
+                                       tierEntry);
+};
+
+WASM_DECLARE_CACHEABLE_POD(FuncOffsets);
+
+using FuncOffsetsVector = Vector<FuncOffsets, 0, SystemAllocPolicy>;
+
+
+class CodeRange {
+ public:
+  enum Kind {
+    Function,                  
+    InterpEntry,               
+    JitEntry,                  
+    ImportInterpExit,          
+    ImportJitExit,             
+    BuiltinThunk,              
+    TrapExit,                  
+    DebugStub,                 
+    RequestTierUpStub,         
+    UpdateCallRefMetricsStub,  
+#ifdef ENABLE_WASM_JSPI
+    ContBaseFrame,  
+#endif
+    FarJumpIsland,  
+    Throw           
+  };
+
+ private:
+  uint32_t begin_;
+  uint32_t ret_;
+  uint32_t end_;
+  union {
+    struct {
+      uint32_t funcIndex_;
+      union {
+        struct {
+          uint16_t beginToUncheckedCallEntry_;
+          uint16_t beginToTierEntry_;
+          bool hasUnwindInfo_;
+        } func;
+        uint16_t jitExitEntry_;
+      };
+    };
+    Trap trap_;
+  } u;
+  Kind kind_ : 8;
+
+  WASM_CHECK_CACHEABLE_POD(begin_, ret_, end_, u.funcIndex_,
+                           u.func.beginToUncheckedCallEntry_,
+                           u.func.beginToTierEntry_, u.func.hasUnwindInfo_,
+                           u.trap_, kind_);
+
+ public:
+  CodeRange() = default;
+  CodeRange(Kind kind, Offsets offsets);
+  CodeRange(Kind kind, uint32_t funcIndex, Offsets offsets);
+  CodeRange(Kind kind, CallableOffsets offsets);
+  CodeRange(Kind kind, uint32_t funcIndex, CallableOffsets);
+  CodeRange(Kind kind, uint32_t funcIndex, ImportOffsets offsets);
+  CodeRange(uint32_t funcIndex, FuncOffsets offsets, bool hasUnwindInfo);
+
+  void offsetBy(uint32_t offset) {
+    begin_ += offset;
+    end_ += offset;
+    if (hasReturn()) {
+      ret_ += offset;
+    }
+  }
+
+
+  uint32_t begin() const { return begin_; }
+  uint32_t end() const { return end_; }
+
+
+  Kind kind() const { return kind_; }
+
+  bool isFunction() const { return kind() == Function; }
+  bool isImportExit() const {
+    return kind() == ImportJitExit || kind() == ImportInterpExit ||
+           kind() == BuiltinThunk;
+  }
+  bool isImportInterpExit() const { return kind() == ImportInterpExit; }
+  bool isImportJitExit() const { return kind() == ImportJitExit; }
+  bool isTrapExit() const { return kind() == TrapExit; }
+  bool isDebugStub() const { return kind() == DebugStub; }
+  bool isRequestTierUpStub() const { return kind() == RequestTierUpStub; }
+  bool isUpdateCallRefMetricsStub() const {
+    return kind() == UpdateCallRefMetricsStub;
+  }
+  bool isThunk() const { return kind() == FarJumpIsland; }
+
+
+  bool hasReturn() const {
+    return isFunction() || isImportExit() || isDebugStub() ||
+           isRequestTierUpStub() || isUpdateCallRefMetricsStub() ||
+           isJitEntry();
+  }
+  uint32_t ret() const {
+    MOZ_ASSERT(hasReturn());
+    return ret_;
+  }
+
+
+  bool isJitEntry() const { return kind() == JitEntry; }
+  bool isInterpEntry() const { return kind() == InterpEntry; }
+  bool isEntry() const { return isInterpEntry() || isJitEntry(); }
+#ifdef ENABLE_WASM_JSPI
+  bool isContBaseFrame() const { return kind() == ContBaseFrame; }
+#endif
+  bool hasFuncIndex() const {
+    return isFunction() || isImportExit() || isEntry();
+  }
+  uint32_t funcIndex() const {
+    MOZ_ASSERT(hasFuncIndex());
+    return u.funcIndex_;
+  }
+
+
+  Trap trap() const {
+    MOZ_ASSERT(isTrapExit());
+    return u.trap_;
+  }
+
+
+  uint32_t funcCheckedCallEntry() const {
+    MOZ_ASSERT(isFunction());
+    MOZ_ASSERT(u.func.beginToUncheckedCallEntry_ != 0);
+    return begin_;
+  }
+  uint32_t funcUncheckedCallEntry() const {
+    MOZ_ASSERT(isFunction());
+    return begin_ + u.func.beginToUncheckedCallEntry_;
+  }
+  uint32_t funcTierEntry() const {
+    MOZ_ASSERT(isFunction());
+    return begin_ + u.func.beginToTierEntry_;
+  }
+  bool funcHasUnwindInfo() const {
+    MOZ_ASSERT(isFunction());
+    return u.func.hasUnwindInfo_;
+  }
+  uint32_t importJitExitEntry() const {
+    MOZ_ASSERT(isImportJitExit());
+    return begin_ + u.jitExitEntry_;
+  }
+
+
+  struct OffsetInCode {
+    size_t offset;
+    explicit OffsetInCode(size_t offset) : offset(offset) {}
+    bool operator==(const CodeRange& rhs) const {
+      return offset >= rhs.begin() && offset < rhs.end();
+    }
+    bool operator<(const CodeRange& rhs) const { return offset < rhs.begin(); }
+  };
+};
+
+WASM_DECLARE_CACHEABLE_POD(CodeRange);
+WASM_DECLARE_POD_VECTOR(CodeRange, CodeRangeVector)
+
+extern const CodeRange* LookupInSorted(const CodeRangeVector& codeRanges,
+                                       CodeRange::OffsetInCode target);
+
+
+enum class CallSiteKind : uint8_t {
+  Func,           
+  Import,         
+  Indirect,       
+  IndirectFast,   
+  FuncRef,        
+  FuncRefFast,    
+  ReturnFunc,     
+  ReturnStub,     
+  Symbolic,       
+  EnterFrame,     
+  LeaveFrame,     
+  CollapseFrame,  
+  StackSwitch,    
+  Breakpoint,     
+  RequestTierUp   
+};
+
+WASM_DECLARE_CACHEABLE_POD(CallSiteKind);
+WASM_DECLARE_POD_VECTOR(CallSiteKind, CallSiteKindVector)
+
+class CallSiteDesc {
+  uint32_t bytecodeOffset_;
+  InlinedCallerOffsetIndex inlinedCallerOffsetsIndex_;
+  CallSiteKind kind_;
+
+ public:
+  static constexpr uint32_t NO_BYTECODE_OFFSET = 0;
+  static constexpr uint32_t FIRST_VALID_BYTECODE_OFFSET =
+      NO_BYTECODE_OFFSET + 1;
+  static_assert(NO_BYTECODE_OFFSET < sizeof(wasm::MagicNumber));
+  static constexpr uint32_t MAX_BYTECODE_OFFSET_VALUE = wasm::MaxModuleBytes;
+
+  CallSiteDesc()
+      : bytecodeOffset_(NO_BYTECODE_OFFSET), kind_(CallSiteKind::Func) {}
+  explicit CallSiteDesc(CallSiteKind kind)
+      : bytecodeOffset_(NO_BYTECODE_OFFSET), kind_(kind) {
+    MOZ_ASSERT(kind == CallSiteKind(kind_));
+  }
+  CallSiteDesc(uint32_t bytecodeOffset, CallSiteKind kind)
+      : bytecodeOffset_(bytecodeOffset), kind_(kind) {
+    MOZ_ASSERT(kind == CallSiteKind(kind_));
+    MOZ_ASSERT(bytecodeOffset == bytecodeOffset_);
+  }
+  CallSiteDesc(BytecodeOffset bytecodeOffset, CallSiteKind kind)
+      : bytecodeOffset_(bytecodeOffset.offset()), kind_(kind) {
+    MOZ_ASSERT(kind == CallSiteKind(kind_));
+    MOZ_ASSERT(bytecodeOffset.offset() == bytecodeOffset_);
+  }
+  CallSiteDesc(uint32_t bytecodeOffset,
+               InlinedCallerOffsetIndex inlinedCallerOffsetsIndex,
+               CallSiteKind kind)
+      : bytecodeOffset_(bytecodeOffset),
+        inlinedCallerOffsetsIndex_(inlinedCallerOffsetsIndex),
+        kind_(kind) {
+    MOZ_ASSERT(kind == CallSiteKind(kind_));
+    MOZ_ASSERT(bytecodeOffset == bytecodeOffset_);
+  }
+  CallSiteDesc(BytecodeOffset bytecodeOffset,
+               uint32_t inlinedCallerOffsetsIndex, CallSiteKind kind)
+      : bytecodeOffset_(bytecodeOffset.offset()),
+        inlinedCallerOffsetsIndex_(inlinedCallerOffsetsIndex),
+        kind_(kind) {
+    MOZ_ASSERT(kind == CallSiteKind(kind_));
+    MOZ_ASSERT(bytecodeOffset.offset() == bytecodeOffset_);
+  }
+  uint32_t bytecodeOffset() const { return bytecodeOffset_; }
+  InlinedCallerOffsetIndex inlinedCallerOffsetsIndex() const {
+    return inlinedCallerOffsetsIndex_;
+  }
+  TrapSiteDesc toTrapSiteDesc() const {
+    return TrapSiteDesc(wasm::BytecodeOffset(bytecodeOffset()),
+                        inlinedCallerOffsetsIndex_);
+  }
+  CallSiteKind kind() const { return kind_; }
+  bool isImportCall() const { return kind() == CallSiteKind::Import; }
+  bool isIndirectCall() const { return kind() == CallSiteKind::Indirect; }
+  bool isFuncRefCall() const { return kind() == CallSiteKind::FuncRef; }
+  bool isReturnStub() const { return kind() == CallSiteKind::ReturnStub; }
+  bool isStackSwitch() const { return kind() == CallSiteKind::StackSwitch; }
+  bool mightBeCrossInstance() const {
+    return isImportCall() || isIndirectCall() || isFuncRefCall() ||
+           isReturnStub() || isStackSwitch();
+  }
+};
+
+using CallSiteDescVector = mozilla::Vector<CallSiteDesc, 0, SystemAllocPolicy>;
+
+class CallSite : public CallSiteDesc {
+  uint32_t returnAddressOffset_;
+  const InlinedCallerOffsets* inlinedCallerOffsets_;
+
+  CallSite(const CallSiteDesc& desc, uint32_t returnAddressOffset,
+           const InlinedCallerOffsets* inlinedCallerOffsets)
+      : CallSiteDesc(desc),
+        returnAddressOffset_(returnAddressOffset),
+        inlinedCallerOffsets_(inlinedCallerOffsets) {}
+  friend class CallSites;
+
+ public:
+  CallSite() : returnAddressOffset_(0), inlinedCallerOffsets_(nullptr) {}
+
+  uint32_t returnAddressOffset() const { return returnAddressOffset_; }
+  BytecodeOffsetSpan inlinedCallerOffsetsSpan() const {
+    if (!inlinedCallerOffsets_) {
+      return BytecodeOffsetSpan();
+    }
+    return BytecodeOffsetSpan(inlinedCallerOffsets_->begin(),
+                              inlinedCallerOffsets_->end());
+  }
+  const InlinedCallerOffsets* inlinedCallerOffsets() const {
+    return inlinedCallerOffsets_;
+  }
+};
+
+class CallSites {
+  using Uint32Vector = Vector<uint32_t, 0, SystemAllocPolicy>;
+
+  CallSiteKindVector kinds_;
+  Uint32Vector bytecodeOffsets_;
+  Uint32Vector returnAddressOffsets_;
+  InlinedCallerOffsetsIndexHashMap inlinedCallerOffsetsMap_;
+
+ public:
+  explicit CallSites() = default;
+
+  static constexpr size_t MAX_LENGTH = UINT32_MAX - 1;
+
+  uint32_t length() const {
+    size_t result = kinds_.length();
+    MOZ_ASSERT(result <= MAX_LENGTH);
+    return (uint32_t)result;
+  }
+
+  bool empty() const { return kinds_.empty(); }
+
+  CallSiteKind kind(size_t index) const { return kinds_[index]; }
+  BytecodeOffset bytecodeOffset(size_t index) const {
+    return BytecodeOffset(bytecodeOffsets_[index]);
+  }
+  uint32_t returnAddressOffset(size_t index) const {
+    return returnAddressOffsets_[index];
+  }
+
+  CallSite get(size_t index, const InliningContext& inliningContext) const {
+    InlinedCallerOffsetIndex inlinedCallerOffsetsIndex;
+    const InlinedCallerOffsets* inlinedCallerOffsets = nullptr;
+    if (auto entry = inlinedCallerOffsetsMap_.readonlyThreadsafeLookup(index)) {
+      inlinedCallerOffsetsIndex = entry->value();
+      inlinedCallerOffsets = inliningContext[entry->value()];
+    }
+    return CallSite(CallSiteDesc(bytecodeOffsets_[index],
+                                 inlinedCallerOffsetsIndex, kinds_[index]),
+                    returnAddressOffsets_[index], inlinedCallerOffsets);
+  }
+
+  [[nodiscard]]
+  bool lookup(uint32_t returnAddressOffset,
+              const InliningContext& inliningContext, CallSite* callSite) const;
+
+  [[nodiscard]]
+  bool append(const CallSiteDesc& callSiteDesc, uint32_t returnAddressOffset) {
+    if (length() == MAX_LENGTH) {
+      return false;
+    }
+
+    uint32_t index = length();
+
+    InlinedCallerOffsetIndex inlinedCallerOffsetsIndex =
+        callSiteDesc.inlinedCallerOffsetsIndex();
+
+    if (!kinds_.reserve(kinds_.length() + 1) ||
+        !bytecodeOffsets_.reserve(bytecodeOffsets_.length() + 1) ||
+        !returnAddressOffsets_.reserve(returnAddressOffsets_.length() + 1)) {
+      return false;
+    }
+
+    if (!inlinedCallerOffsetsIndex.isNone() &&
+        !inlinedCallerOffsetsMap_.putNew(index, inlinedCallerOffsetsIndex)) {
+      return false;
+    }
+
+    kinds_.infallibleAppend(callSiteDesc.kind());
+    bytecodeOffsets_.infallibleAppend(callSiteDesc.bytecodeOffset());
+    returnAddressOffsets_.infallibleAppend(returnAddressOffset);
+
+    return true;
+  }
+
+  [[nodiscard]]
+  bool appendAll(CallSites&& other, uint32_t baseCodeOffset,
+                 InlinedCallerOffsetIndex baseInlinedCallerOffsetIndex) {
+    mozilla::CheckedUint32 newLength =
+        mozilla::CheckedUint32(length()) + other.length();
+    if (!newLength.isValid() || newLength.value() > MAX_LENGTH) {
+      return false;
+    }
+
+    if (!kinds_.reserve(newLength.value()) ||
+        !bytecodeOffsets_.reserve(newLength.value()) ||
+        !returnAddressOffsets_.reserve(newLength.value())) {
+      return false;
+    }
+    if (!inlinedCallerOffsetsMap_.reserve(
+            inlinedCallerOffsetsMap_.count() +
+            other.inlinedCallerOffsetsMap_.count())) {
+      return false;
+    }
+
+    uint32_t baseCallSiteIndex = length();
+    for (auto iter = other.inlinedCallerOffsetsMap_.modIter(); !iter.done();
+         iter.next()) {
+      uint32_t newCallSiteIndex = iter.get().key() + baseCallSiteIndex;
+      uint32_t newInlinedCallerOffsetIndex =
+          iter.get().value().value() + baseInlinedCallerOffsetIndex.value();
+
+      inlinedCallerOffsetsMap_.putNewInfallible(newCallSiteIndex,
+                                                newInlinedCallerOffsetIndex);
+    }
+
+    for (uint32_t& pcOffset : other.returnAddressOffsets_) {
+      pcOffset += baseCodeOffset;
+    }
+
+    kinds_.infallibleAppend(other.kinds_.begin(), other.kinds_.end());
+    bytecodeOffsets_.infallibleAppend(other.bytecodeOffsets_.begin(),
+                                      other.bytecodeOffsets_.end());
+    returnAddressOffsets_.infallibleAppend(other.returnAddressOffsets_.begin(),
+                                           other.returnAddressOffsets_.end());
+    return true;
+  }
+
+  void swap(CallSites& other) {
+    kinds_.swap(other.kinds_);
+    bytecodeOffsets_.swap(other.bytecodeOffsets_);
+    returnAddressOffsets_.swap(other.returnAddressOffsets_);
+    inlinedCallerOffsetsMap_.swap(other.inlinedCallerOffsetsMap_);
+  }
+
+  void clear() {
+    kinds_.clear();
+    bytecodeOffsets_.clear();
+    returnAddressOffsets_.clear();
+    inlinedCallerOffsetsMap_.clear();
+  }
+
+  [[nodiscard]]
+  bool reserve(size_t length) {
+    if (length > MAX_LENGTH) {
+      return false;
+    }
+
+    return kinds_.reserve(length) && bytecodeOffsets_.reserve(length) &&
+           returnAddressOffsets_.reserve(length);
+  }
+
+  void shrinkStorageToFit() {
+    kinds_.shrinkStorageToFit();
+    bytecodeOffsets_.shrinkStorageToFit();
+    returnAddressOffsets_.shrinkStorageToFit();
+    inlinedCallerOffsetsMap_.compact();
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return kinds_.sizeOfExcludingThis(mallocSizeOf) +
+           bytecodeOffsets_.sizeOfExcludingThis(mallocSizeOf) +
+           returnAddressOffsets_.sizeOfExcludingThis(mallocSizeOf) +
+           inlinedCallerOffsetsMap_.shallowSizeOfExcludingThis(mallocSizeOf);
+  }
+
+  void checkInvariants() const {
+#ifdef DEBUG
+    MOZ_ASSERT(kinds_.length() == bytecodeOffsets_.length());
+    MOZ_ASSERT(kinds_.length() == returnAddressOffsets_.length());
+    uint32_t last = 0;
+    for (uint32_t returnAddressOffset : returnAddressOffsets_) {
+      MOZ_ASSERT(returnAddressOffset >= last);
+      last = returnAddressOffset;
+    }
+    for (auto iter = inlinedCallerOffsetsMap_.iter(); !iter.done();
+         iter.next()) {
+      MOZ_ASSERT(iter.get().key() < length());
+      MOZ_ASSERT(!iter.get().value().isNone());
+    }
+#endif
+  }
+
+  WASM_DECLARE_FRIEND_SERIALIZE(CallSites);
+};
+
+
+class CallSiteTarget {
+  uint32_t packed_;
+
+  WASM_CHECK_CACHEABLE_POD(packed_);
+#ifdef DEBUG
+  enum Kind { None, FuncIndex, TrapExit } kind_;
+  WASM_CHECK_CACHEABLE_POD(kind_);
+#endif
+
+ public:
+  explicit CallSiteTarget()
+      : packed_(UINT32_MAX)
+#ifdef DEBUG
+        ,
+        kind_(None)
+#endif
+  {
+  }
+
+  explicit CallSiteTarget(uint32_t funcIndex)
+      : packed_(funcIndex)
+#ifdef DEBUG
+        ,
+        kind_(FuncIndex)
+#endif
+  {
+  }
+
+  explicit CallSiteTarget(Trap trap)
+      : packed_(uint32_t(trap))
+#ifdef DEBUG
+        ,
+        kind_(TrapExit)
+#endif
+  {
+  }
+
+  uint32_t funcIndex() const {
+    MOZ_ASSERT(kind_ == FuncIndex);
+    return packed_;
+  }
+
+  Trap trap() const {
+    MOZ_ASSERT(kind_ == TrapExit);
+    MOZ_ASSERT(packed_ < uint32_t(Trap::Limit));
+    return Trap(packed_);
+  }
+};
+
+WASM_DECLARE_CACHEABLE_POD(CallSiteTarget);
+
+using CallSiteTargetVector = Vector<CallSiteTarget, 0, SystemAllocPolicy>;
+
+struct TryNote {
+ private:
+  static const uint32_t BEGIN_NONE = UINT32_MAX;
+
+  static const uint32_t IS_DELEGATE = UINT32_MAX;
+
+  uint32_t begin_;
+  uint32_t end_;
+  uint32_t entryPointOrIsDelegate_;
+  uint32_t framePushedOrDelegateOffset_;
+
+  WASM_CHECK_CACHEABLE_POD(begin_, end_, entryPointOrIsDelegate_,
+                           framePushedOrDelegateOffset_);
+
+ public:
+  explicit TryNote()
+      : begin_(BEGIN_NONE),
+        end_(0),
+        entryPointOrIsDelegate_(0),
+        framePushedOrDelegateOffset_(0) {}
+
+  bool hasTryBody() const { return begin_ != BEGIN_NONE; }
+
+  uint32_t tryBodyBegin() const { return begin_; }
+
+  uint32_t tryBodyEnd() const { return end_; }
+
+  bool offsetWithinTryBody(uint32_t offset) const {
+    return offset > begin_ && offset <= end_;
+  }
+
+  bool isDelegate() const { return entryPointOrIsDelegate_ == IS_DELEGATE; }
+
+  uint32_t delegateOffset() const {
+    MOZ_ASSERT(isDelegate());
+    return framePushedOrDelegateOffset_;
+  }
+
+  uint32_t landingPadEntryPoint() const {
+    MOZ_ASSERT(!isDelegate());
+    return entryPointOrIsDelegate_;
+  }
+
+  uint32_t landingPadFramePushed() const {
+    MOZ_ASSERT(!isDelegate());
+    return framePushedOrDelegateOffset_;
+  }
+
+  void setTryBodyBegin(uint32_t begin) {
+    MOZ_ASSERT(begin_ == BEGIN_NONE);
+    begin_ = begin;
+  }
+
+  void setTryBodyEnd(uint32_t end) {
+    MOZ_ASSERT(begin_ != BEGIN_NONE);
+    end_ = end;
+    MOZ_ASSERT(end_ > begin_);
+  }
+
+  void setDelegate(uint32_t delegateOffset) {
+    entryPointOrIsDelegate_ = IS_DELEGATE;
+    framePushedOrDelegateOffset_ = delegateOffset;
+  }
+
+  void setLandingPad(uint32_t entryPoint, uint32_t framePushed) {
+    MOZ_ASSERT(!isDelegate());
+    entryPointOrIsDelegate_ = entryPoint;
+    framePushedOrDelegateOffset_ = framePushed;
+  }
+
+  void offsetBy(uint32_t offset) {
+    begin_ += offset;
+    end_ += offset;
+    if (isDelegate()) {
+      framePushedOrDelegateOffset_ += offset;
+    } else {
+      entryPointOrIsDelegate_ += offset;
+    }
+  }
+
+  bool operator<(const TryNote& other) const {
+    if (this == &other) {
+      return false;
+    }
+    MOZ_ASSERT(end_ <= other.begin_ || begin_ >= other.end_ ||
+               (begin_ > other.begin_ && end_ < other.end_) ||
+               (other.begin_ > begin_ && other.end_ < end_));
+    return end_ < other.end_;
+  }
+};
+
+WASM_DECLARE_CACHEABLE_POD(TryNote);
+WASM_DECLARE_POD_VECTOR(TryNote, TryNoteVector)
+
+class CodeRangeUnwindInfo {
+ public:
+  enum UnwindHow {
+    Normal,
+    RestoreFpRa,
+    RestoreFp,
+    UseFpLr,
+    UseFp,
+  };
+
+ private:
+  uint32_t offset_;
+  UnwindHow unwindHow_;
+
+  WASM_CHECK_CACHEABLE_POD(offset_, unwindHow_);
+
+ public:
+  CodeRangeUnwindInfo(uint32_t offset, UnwindHow unwindHow)
+      : offset_(offset), unwindHow_(unwindHow) {}
+
+  uint32_t offset() const { return offset_; }
+  UnwindHow unwindHow() const { return unwindHow_; }
+
+  void offsetBy(uint32_t offset) { offset_ += offset; }
+};
+
+WASM_DECLARE_CACHEABLE_POD(CodeRangeUnwindInfo);
+WASM_DECLARE_POD_VECTOR(CodeRangeUnwindInfo, CodeRangeUnwindInfoVector)
+
+enum class CallIndirectIdKind {
+  Immediate,
+  Global,
+  None
+};
+
+
+class CallIndirectId {
+  CallIndirectIdKind kind_;
+  union {
+    size_t immediate_;
+    struct {
+      size_t instanceDataOffset_;
+      bool hasSuperType_;
+    } global_;
+  };
+
+  explicit CallIndirectId(CallIndirectIdKind kind) : kind_(kind) {}
+
+ public:
+  CallIndirectId() : kind_(CallIndirectIdKind::None) {}
+
+  static CallIndirectId forFunc(const CodeMetadata& codeMeta,
+                                uint32_t funcIndex);
+
+  static CallIndirectId forFuncType(const CodeMetadata& codeMeta,
+                                    uint32_t funcTypeIndex);
+
+  CallIndirectIdKind kind() const { return kind_; }
+  bool isGlobal() const { return kind_ == CallIndirectIdKind::Global; }
+
+  uint32_t immediate() const {
+    MOZ_ASSERT(kind_ == CallIndirectIdKind::Immediate);
+    return immediate_;
+  }
+
+  uint32_t instanceDataOffset() const {
+    MOZ_ASSERT(kind_ == CallIndirectIdKind::Global);
+    return global_.instanceDataOffset_;
+  }
+
+  bool hasSuperType() const {
+    MOZ_ASSERT(kind_ == CallIndirectIdKind::Global);
+    return global_.hasSuperType_;
+  }
+};
+
+
+class CalleeDesc {
+ public:
+  enum Which {
+    Func,
+
+    Import,
+
+    WasmTable,
+
+    Builtin,
+
+    BuiltinInstanceMethod,
+
+    FuncRef,
+  };
+
+ private:
+  MOZ_INIT_OUTSIDE_CTOR Which which_;
+  union U {
+    U() : funcIndex_(0) {}
+    uint32_t funcIndex_;
+    struct {
+      uint32_t instanceDataOffset_;
+    } import;
+    struct {
+      uint32_t instanceDataOffset_;
+      uint64_t minLength_;
+      mozilla::Maybe<uint64_t> maxLength_;
+      CallIndirectId callIndirectId_;
+    } table;
+    SymbolicAddress builtin_;
+  } u;
+
+ public:
+  CalleeDesc() = default;
+  static CalleeDesc function(uint32_t funcIndex);
+  static CalleeDesc import(uint32_t instanceDataOffset);
+  static CalleeDesc wasmTable(const CodeMetadata& codeMeta,
+                              const TableDesc& desc, uint32_t tableIndex,
+                              CallIndirectId callIndirectId);
+  static CalleeDesc builtin(SymbolicAddress callee);
+  static CalleeDesc builtinInstanceMethod(SymbolicAddress callee);
+  static CalleeDesc wasmFuncRef();
+  Which which() const { return which_; }
+  uint32_t funcIndex() const {
+    MOZ_ASSERT(which_ == Func);
+    return u.funcIndex_;
+  }
+  uint32_t importInstanceDataOffset() const {
+    MOZ_ASSERT(which_ == Import);
+    return u.import.instanceDataOffset_;
+  }
+  bool isTable() const { return which_ == WasmTable; }
+  uint32_t tableLengthInstanceDataOffset() const {
+    MOZ_ASSERT(isTable());
+    return u.table.instanceDataOffset_ + offsetof(TableInstanceData, length);
+  }
+  uint32_t tableFunctionBaseInstanceDataOffset() const {
+    MOZ_ASSERT(isTable());
+    return u.table.instanceDataOffset_ + offsetof(TableInstanceData, elements);
+  }
+  CallIndirectId wasmTableSigId() const {
+    MOZ_ASSERT(which_ == WasmTable);
+    return u.table.callIndirectId_;
+  }
+  uint64_t wasmTableMinLength() const {
+    MOZ_ASSERT(which_ == WasmTable);
+    return u.table.minLength_;
+  }
+  mozilla::Maybe<uint64_t> wasmTableMaxLength() const {
+    MOZ_ASSERT(which_ == WasmTable);
+    return u.table.maxLength_;
+  }
+  SymbolicAddress builtin() const {
+    MOZ_ASSERT(which_ == Builtin || which_ == BuiltinInstanceMethod);
+    return u.builtin_;
+  }
+  bool isFuncRef() const { return which_ == FuncRef; }
+};
+
+struct FuncIonPerfSpewer {
+  uint32_t funcIndex = 0;
+  jit::IonPerfSpewer spewer;
+
+  FuncIonPerfSpewer() = default;
+  FuncIonPerfSpewer(uint32_t funcIndex, jit::IonPerfSpewer&& spewer)
+      : funcIndex(funcIndex), spewer(std::move(spewer)) {}
+  FuncIonPerfSpewer(FuncIonPerfSpewer&) = delete;
+  FuncIonPerfSpewer(FuncIonPerfSpewer&&) = default;
+  FuncIonPerfSpewer& operator=(FuncIonPerfSpewer&) = delete;
+  FuncIonPerfSpewer& operator=(FuncIonPerfSpewer&&) = default;
+};
+
+using FuncIonPerfSpewerVector = Vector<FuncIonPerfSpewer, 8, SystemAllocPolicy>;
+using FuncIonPerfSpewerSpan = mozilla::Span<FuncIonPerfSpewer>;
+
+struct FuncBaselinePerfSpewer {
+  uint32_t funcIndex = 0;
+  jit::WasmBaselinePerfSpewer spewer;
+
+  FuncBaselinePerfSpewer() = default;
+  FuncBaselinePerfSpewer(uint32_t funcIndex,
+                         jit::WasmBaselinePerfSpewer&& spewer)
+      : funcIndex(funcIndex), spewer(std::move(spewer)) {}
+  FuncBaselinePerfSpewer(FuncBaselinePerfSpewer&) = delete;
+  FuncBaselinePerfSpewer(FuncBaselinePerfSpewer&&) = default;
+  FuncBaselinePerfSpewer& operator=(FuncBaselinePerfSpewer&) = delete;
+  FuncBaselinePerfSpewer& operator=(FuncBaselinePerfSpewer&&) = default;
+};
+
+using FuncBaselinePerfSpewerVector =
+    Vector<FuncBaselinePerfSpewer, 8, SystemAllocPolicy>;
+using FuncBaselinePerfSpewerSpan = mozilla::Span<FuncBaselinePerfSpewer>;
+
+struct CompileStats {
+  size_t numFuncs;
+  size_t bytecodeSize;
+  size_t inlinedDirectCallCount;
+  size_t inlinedCallRefCount;
+  size_t inlinedDirectCallBytecodeSize;
+  size_t inlinedCallRefBytecodeSize;
+  size_t numInliningBudgetOverruns;
+  size_t numLargeFunctionBackoffs = 0;
+
+  void clear() {
+    numFuncs = 0;
+    bytecodeSize = 0;
+    inlinedDirectCallCount = 0;
+    inlinedCallRefCount = 0;
+    inlinedDirectCallBytecodeSize = 0;
+    inlinedCallRefBytecodeSize = 0;
+    numInliningBudgetOverruns = 0;
+    numLargeFunctionBackoffs = 0;
+  }
+  CompileStats() { clear(); }
+
+  bool empty() const {
+    return 0 == (numFuncs | bytecodeSize | inlinedDirectCallCount |
+                 inlinedCallRefCount | inlinedDirectCallBytecodeSize |
+                 inlinedCallRefBytecodeSize | numInliningBudgetOverruns |
+                 numLargeFunctionBackoffs);
+  }
+
+  void merge(const CompileStats& other);
+};
+
+struct CompileAndLinkStats : public CompileStats {
+  size_t codeBytesMapped;
+  size_t codeBytesUsed;
+
+  void clear() {
+    CompileStats::clear();
+    codeBytesMapped = 0;
+    codeBytesUsed = 0;
+  }
+  CompileAndLinkStats() { clear(); }
+
+  bool empty() const {
+    return 0 == (codeBytesMapped | codeBytesUsed) && CompileStats::empty();
+  }
+
+  void merge(const CompileAndLinkStats& other);
+
+  void mergeCompileStats(const CompileStats& other) {
+    CompileStats::merge(other);
+  }
+
+  void print() const;
+};
+
+}  
+}  
+
+#endif  // wasm_codegen_types_h

@@ -1,0 +1,51 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+#if !defined(SkMasks_DEFINED)
+#define SkMasks_DEFINED
+
+#include "include/core/SkTypes.h"
+
+#include <cstdint>
+
+class SkMasks {
+public:
+    struct MaskInfo {
+        uint32_t mask;
+        uint32_t shift;  
+        uint32_t size;   
+    };
+
+    constexpr SkMasks(const MaskInfo red,
+                      const MaskInfo green,
+                      const MaskInfo blue,
+                      const MaskInfo alpha)
+            : fRed(red), fGreen(green), fBlue(blue), fAlpha(alpha) {}
+
+    struct InputMasks {
+        uint32_t red;
+        uint32_t green;
+        uint32_t blue;
+        uint32_t alpha;
+    };
+
+    static SkMasks* CreateMasks(InputMasks masks, int bytesPerPixel);
+
+    uint8_t getRed(uint32_t pixel) const;
+    uint8_t getGreen(uint32_t pixel) const;
+    uint8_t getBlue(uint32_t pixel) const;
+    uint8_t getAlpha(uint32_t pixel) const;
+
+    uint32_t getAlphaMask() const { return fAlpha.mask; }
+
+private:
+    const MaskInfo fRed;
+    const MaskInfo fGreen;
+    const MaskInfo fBlue;
+    const MaskInfo fAlpha;
+};
+
+#endif

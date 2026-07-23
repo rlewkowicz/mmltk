@@ -1,0 +1,193 @@
+
+#ifndef LIBUS_USE_IO_URING
+
+#include "libusockets.h"
+#include "internal/internal.h"
+#include "internal/socket_timeout.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+int us_socket_local_port(int ssl, struct us_socket_t* s) {
+    struct bsd_addr_t addr;
+    if (bsd_local_addr(us_poll_fd(&s->p), &addr)) {
+        return -1;
+    } else {
+        return bsd_addr_get_port(&addr);
+    }
+}
+
+int us_socket_remote_port(int ssl, struct us_socket_t* s) {
+    struct bsd_addr_t addr;
+    if (bsd_remote_addr(us_poll_fd(&s->p), &addr)) {
+        return -1;
+    } else {
+        return bsd_addr_get_port(&addr);
+    }
+}
+
+void us_socket_shutdown_read(int ssl, struct us_socket_t* s) {
+    bsd_shutdown_socket_read(us_poll_fd((struct us_poll_t*)s));
+}
+
+void us_socket_remote_address(int ssl, struct us_socket_t* s, char* buf, int* length) {
+    struct bsd_addr_t addr;
+    if (bsd_remote_addr(us_poll_fd(&s->p), &addr) || *length < bsd_addr_get_ip_length(&addr)) {
+        *length = 0;
+    } else {
+        *length = bsd_addr_get_ip_length(&addr);
+        memcpy(buf, bsd_addr_get_ip(&addr), *length);
+    }
+}
+
+struct us_socket_context_t* us_socket_context(int ssl, struct us_socket_t* s) {
+    return s->context;
+}
+
+void us_socket_timeout(int ssl, struct us_socket_t* s, unsigned int seconds) {
+    us_internal_socket_timeout(s, seconds);
+}
+
+void us_socket_long_timeout(int ssl, struct us_socket_t* s, unsigned int minutes) {
+    us_internal_socket_long_timeout(s, minutes);
+}
+
+void us_socket_flush(int ssl, struct us_socket_t* s) {
+    if (!us_socket_is_shut_down(0, s)) {
+        bsd_socket_flush(us_poll_fd((struct us_poll_t*)s));
+    }
+}
+
+int us_socket_is_closed(int ssl, struct us_socket_t* s) {
+    return s->prev == (struct us_socket_t*)s->context;
+}
+
+int us_socket_is_established(int ssl, struct us_socket_t* s) {
+    return us_internal_poll_type((struct us_poll_t*)s) != POLL_TYPE_SEMI_SOCKET;
+}
+
+struct us_socket_t* us_socket_close_connecting(int ssl, struct us_socket_t* s) {
+    if (!us_socket_is_closed(0, s)) {
+        us_internal_socket_context_unlink_socket(s->context, s);
+        us_poll_stop((struct us_poll_t*)s, s->context->loop);
+        bsd_close_socket(us_poll_fd((struct us_poll_t*)s));
+
+        s->next = s->context->loop->data.closed_head;
+        s->context->loop->data.closed_head = s;
+
+        s->prev = (struct us_socket_t*)s->context;
+    }
+    return s;
+}
+
+struct us_socket_t* us_socket_close(int ssl, struct us_socket_t* s, int code, void* reason) {
+    if (!us_socket_is_closed(0, s)) {
+        if (s->low_prio_state == 1) {
+            if (!s->prev)
+                s->context->loop->data.low_prio_head = s->next;
+            else
+                s->prev->next = s->next;
+
+            if (s->next)
+                s->next->prev = s->prev;
+
+            s->prev = 0;
+            s->next = 0;
+            s->low_prio_state = 0;
+        } else {
+            us_internal_socket_context_unlink_socket(s->context, s);
+        }
+        us_poll_stop((struct us_poll_t*)s, s->context->loop);
+        bsd_close_socket(us_poll_fd((struct us_poll_t*)s));
+
+        s->next = s->context->loop->data.closed_head;
+        s->context->loop->data.closed_head = s;
+
+        s->prev = (struct us_socket_t*)s->context;
+
+        return s->context->on_close(s, code, reason);
+    }
+    return s;
+}
+
+void* us_socket_get_native_handle(int ssl, struct us_socket_t* s) {
+#ifndef LIBUS_NO_SSL
+    if (ssl) {
+        return us_internal_ssl_socket_get_native_handle((struct us_internal_ssl_socket_t*)s);
+    }
+#endif
+
+    // NOLINTNEXTLINE(performance-no-int-to-ptr)
+    return (void*)(uintptr_t)us_poll_fd((struct us_poll_t*)s);
+}
+
+int us_socket_write2(int ssl, struct us_socket_t* s, const char* header, int header_length, const char* payload,
+                     int payload_length) {
+    if (us_socket_is_closed(ssl, s) || us_socket_is_shut_down(ssl, s)) {
+        return 0;
+    }
+
+    int written = bsd_write2(us_poll_fd(&s->p), header, header_length, payload, payload_length);
+    if (written != header_length + payload_length) {
+        us_poll_change(&s->p, s->context->loop, LIBUS_SOCKET_READABLE | LIBUS_SOCKET_WRITABLE);
+    }
+
+    return written < 0 ? 0 : written;
+}
+
+int us_socket_write(int ssl, struct us_socket_t* s, const char* data, int length, int msg_more) {
+#ifndef LIBUS_NO_SSL
+    if (ssl) {
+        return us_internal_ssl_socket_write((struct us_internal_ssl_socket_t*)s, data, length, msg_more);
+    }
+#endif
+
+    if (us_socket_is_closed(ssl, s) || us_socket_is_shut_down(ssl, s)) {
+        return 0;
+    }
+
+    int written = bsd_send(us_poll_fd(&s->p), data, length, msg_more);
+    if (written != length) {
+        s->context->loop->data.last_write_failed = 1;
+        us_poll_change(&s->p, s->context->loop, LIBUS_SOCKET_READABLE | LIBUS_SOCKET_WRITABLE);
+    }
+
+    return written < 0 ? 0 : written;
+}
+
+void* us_socket_ext(int ssl, struct us_socket_t* s) {
+#ifndef LIBUS_NO_SSL
+    if (ssl) {
+        return us_internal_ssl_socket_ext((struct us_internal_ssl_socket_t*)s);
+    }
+#endif
+
+    return s + 1;
+}
+
+int us_socket_is_shut_down(int ssl, struct us_socket_t* s) {
+#ifndef LIBUS_NO_SSL
+    if (ssl) {
+        return us_internal_ssl_socket_is_shut_down((struct us_internal_ssl_socket_t*)s);
+    }
+#endif
+
+    return us_internal_poll_type(&s->p) == POLL_TYPE_SOCKET_SHUT_DOWN;
+}
+
+void us_socket_shutdown(int ssl, struct us_socket_t* s) {
+#ifndef LIBUS_NO_SSL
+    if (ssl) {
+        us_internal_ssl_socket_shutdown((struct us_internal_ssl_socket_t*)s);
+        return;
+    }
+#endif
+
+    if (!us_socket_is_closed(ssl, s) && !us_socket_is_shut_down(ssl, s)) {
+        us_internal_poll_set_type(&s->p, POLL_TYPE_SOCKET_SHUT_DOWN);
+        us_poll_change(&s->p, s->context->loop, us_poll_events(&s->p) & LIBUS_SOCKET_READABLE);
+        bsd_shutdown_socket(us_poll_fd((struct us_poll_t*)s));
+    }
+}
+
+#endif

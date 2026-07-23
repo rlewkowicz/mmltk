@@ -1,0 +1,80 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsAsyncRedirectVerifyHelper_h
+#define nsAsyncRedirectVerifyHelper_h
+
+#include "nsIRunnable.h"
+#include "nsIChannelEventSink.h"
+#include "nsIAsyncVerifyRedirectCallback.h"
+#include "nsINamed.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+
+class nsIChannel;
+
+namespace mozilla {
+namespace net {
+
+class nsAsyncRedirectVerifyHelper final
+    : public nsIRunnable,
+      public nsINamed,
+      public nsIAsyncVerifyRedirectCallback {
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIRUNNABLE
+  NS_DECL_NSINAMED
+  NS_DECL_NSIASYNCVERIFYREDIRECTCALLBACK
+
+ public:
+  nsAsyncRedirectVerifyHelper() = default;
+
+  nsresult DelegateOnChannelRedirect(nsIChannelEventSink* sink,
+                                     nsIChannel* oldChannel,
+                                     nsIChannel* newChannel, uint32_t flags);
+
+  nsresult Init(nsIChannel* oldChan, nsIChannel* newChan, uint32_t flags,
+                nsIEventTarget* mainThreadEventTarget,
+                bool synchronize = false);
+
+ protected:
+  nsCOMPtr<nsIChannel> mOldChan;
+  nsCOMPtr<nsIChannel> mNewChan;
+  uint32_t mFlags{0};
+  bool mWaitingForRedirectCallback{false};
+  nsCOMPtr<nsIEventTarget> mCallbackEventTarget;
+  bool mCallbackInitiated{false};
+  int32_t mExpectedCallbacks{0};
+  nsresult mResult{NS_OK};  
+
+  void InitCallback();
+
+  void ExplicitCallback(nsresult result);
+
+ private:
+  ~nsAsyncRedirectVerifyHelper();
+
+  bool IsOldChannelCanceled();
+};
+
+class nsAsyncRedirectAutoCallback {
+ public:
+  explicit nsAsyncRedirectAutoCallback(
+      nsIAsyncVerifyRedirectCallback* aCallback)
+      : mCallback(aCallback) {
+    mResult = NS_OK;
+  }
+  ~nsAsyncRedirectAutoCallback() {
+    if (mCallback) mCallback->OnRedirectVerifyCallback(mResult);
+  }
+  void SetResult(nsresult aRes) { mResult = aRes; }
+  void DontCallback() { mCallback = nullptr; }
+
+ private:
+  nsIAsyncVerifyRedirectCallback* mCallback;
+  nsresult mResult;
+};
+
+}  
+}  
+#endif

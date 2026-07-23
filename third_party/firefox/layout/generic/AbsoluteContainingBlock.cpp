@@ -1,0 +1,1827 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/AbsoluteContainingBlock.h"
+
+#include "AnchorPositioningUtils.h"
+#include "mozilla/CSSAlignUtils.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ReflowInput.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/ServoStyleSet.h"
+#include "mozilla/ViewportFrame.h"
+#include "mozilla/WritingModes.h"
+#include "mozilla/dom/ViewTransition.h"
+#include "nsBlockFrame.h"
+#include "nsCSSFrameConstructor.h"
+#include "nsContainerFrame.h"
+#include "nsGridContainerFrame.h"
+#include "nsIFrameInlines.h"
+#include "nsLayoutUtils.h"
+#include "nsPlaceholderFrame.h"
+#include "nsPresContext.h"
+#include "nsPresContextInlines.h"
+
+#ifdef DEBUG
+#  include "fmt/format.h"
+#  include "nsBlockFrame.h"
+#endif
+
+using namespace mozilla;
+
+void AbsoluteContainingBlock::SetInitialChildList(nsIFrame* aDelegatingFrame,
+                                                  FrameChildListID aListID,
+                                                  nsFrameList&& aChildList) {
+  MOZ_ASSERT(aListID == FrameChildListID::Absolute, "unexpected child list");
+#ifdef DEBUG
+  nsIFrame::VerifyDirtyBitSet(aChildList);
+  for (nsIFrame* f : aChildList) {
+    MOZ_ASSERT(f->GetParent() == aDelegatingFrame, "Unexpected parent");
+  }
+#endif
+  mAbsoluteFrames = std::move(aChildList);
+}
+
+void AbsoluteContainingBlock::AppendFrames(nsIFrame* aDelegatingFrame,
+                                           FrameChildListID aListID,
+                                           nsFrameList&& aFrameList) {
+  MOZ_ASSERT(aListID == FrameChildListID::Absolute, "unexpected child list");
+
+#ifdef DEBUG
+  nsIFrame::VerifyDirtyBitSet(aFrameList);
+#endif
+  mAbsoluteFrames.AppendFrames(nullptr, std::move(aFrameList));
+
+  aDelegatingFrame->PresShell()->FrameNeedsReflow(
+      aDelegatingFrame, IntrinsicDirty::None, NS_FRAME_HAS_DIRTY_CHILDREN);
+}
+
+void AbsoluteContainingBlock::InsertFrames(nsIFrame* aDelegatingFrame,
+                                           FrameChildListID aListID,
+                                           nsIFrame* aPrevFrame,
+                                           nsFrameList&& aFrameList) {
+  MOZ_ASSERT(aListID == FrameChildListID::Absolute, "unexpected child list");
+  NS_ASSERTION(!aPrevFrame || aPrevFrame->GetParent() == aDelegatingFrame,
+               "inserting after sibling frame with different parent");
+
+#ifdef DEBUG
+  nsIFrame::VerifyDirtyBitSet(aFrameList);
+#endif
+  mAbsoluteFrames.InsertFrames(nullptr, aPrevFrame, std::move(aFrameList));
+
+  aDelegatingFrame->PresShell()->FrameNeedsReflow(
+      aDelegatingFrame, IntrinsicDirty::None, NS_FRAME_HAS_DIRTY_CHILDREN);
+}
+
+void AbsoluteContainingBlock::RemoveFrame(FrameDestroyContext& aContext,
+                                          FrameChildListID aListID,
+                                          nsIFrame* aOldFrame) {
+  MOZ_ASSERT(aListID == FrameChildListID::Absolute, "unexpected child list");
+
+  AutoTArray<nsIFrame*, 8> delFrames;
+  for (nsIFrame* f = aOldFrame; f; f = f->GetNextInFlow()) {
+    delFrames.AppendElement(f);
+  }
+  for (nsIFrame* delFrame : Reversed(delFrames)) {
+    delFrame->GetParent()->GetAbsoluteContainingBlock()->StealFrame(delFrame);
+    delFrame->Destroy(aContext);
+  }
+}
+
+NS_DECLARE_FRAME_PROPERTY_DELETABLE(UnfragmentedPositionProperty, LogicalPoint)
+
+NS_DECLARE_FRAME_PROPERTY_DELETABLE(UnfragmentedSizeProperty, LogicalSize)
+
+NS_DECLARE_FRAME_PROPERTY_DELETABLE(
+    UnfragmentedContainingBlockProperty,
+    AbsoluteContainingBlock::ContainingBlockRects)
+
+static LogicalPoint* GetUnfragmentedPosition(const ReflowInput& aCBReflowInput,
+                                             const nsIFrame* aFrame) {
+  return aCBReflowInput.mFlags.mIsInFragmentainerMeasuringReflow
+             ? nullptr
+             : aFrame->GetProperty(UnfragmentedPositionProperty());
+}
+
+static LogicalSize* GetUnfragmentedSize(const ReflowInput& aCBReflowInput,
+                                        const nsIFrame* aFrame) {
+  return aCBReflowInput.mFlags.mIsInFragmentainerMeasuringReflow
+             ? nullptr
+             : aFrame->FirstInFlow()->GetProperty(UnfragmentedSizeProperty());
+}
+
+static nsIFrame* GetFirstInlineContinuationInPrevFragmentainer(
+    nsIFrame* aInlineFrame) {
+  MOZ_ASSERT(aInlineFrame->IsInlineFrameOrSubclass());
+  const nsBlockFrame* myBlock =
+      nsLayoutUtils::FindNearestBlockAncestor(aInlineFrame);
+  nsIFrame* candidate = nullptr;
+  const nsBlockFrame* candidateBlock = nullptr;
+  for (nsIFrame* prev =
+           nsLayoutUtils::GetPrevContinuationOrIBSplitSibling(aInlineFrame);
+       prev; prev = nsLayoutUtils::GetPrevContinuationOrIBSplitSibling(prev)) {
+    if (prev->IsBlockFrameOrSubclass()) {
+      continue;
+    }
+    const nsBlockFrame* prevBlock =
+        nsLayoutUtils::FindNearestBlockAncestor(prev);
+    if (prevBlock == myBlock) {
+      continue;
+    }
+    if (!candidate) {
+      candidate = prev;
+      candidateBlock = prevBlock;
+    } else if (prevBlock == candidateBlock) {
+      candidate = prev;
+    } else {
+      break;
+    }
+  }
+  return candidate;
+}
+
+static nsIFrame* GetFirstInlineContinuationInNextFragmentainer(
+    nsIFrame* aInlineFrame) {
+  MOZ_ASSERT(aInlineFrame->IsInlineFrameOrSubclass());
+  const nsBlockFrame* myBlock =
+      nsLayoutUtils::FindNearestBlockAncestor(aInlineFrame);
+  for (nsIFrame* next =
+           nsLayoutUtils::GetNextContinuationOrIBSplitSibling(aInlineFrame);
+       next; next = nsLayoutUtils::GetNextContinuationOrIBSplitSibling(next)) {
+    if (next->IsBlockFrameOrSubclass()) {
+      continue;
+    }
+    if (nsLayoutUtils::FindNearestBlockAncestor(next) != myBlock) {
+      return next;
+    }
+  }
+  return nullptr;
+}
+
+static nsIFrame* GetFirstContinuationInPrevFragmentainer(nsIFrame* aFrame) {
+  return StaticPrefs::layout_abspos_fragment_aware_inline_cb_enabled() &&
+                 aFrame->IsInlineFrameOrSubclass()
+             ? GetFirstInlineContinuationInPrevFragmentainer(aFrame)
+             : aFrame->GetPrevInFlow();
+}
+
+static nsIFrame* GetFirstContinuationInNextFragmentainer(nsIFrame* aFrame) {
+  return StaticPrefs::layout_abspos_fragment_aware_inline_cb_enabled() &&
+                 aFrame->IsInlineFrameOrSubclass()
+             ? GetFirstInlineContinuationInNextFragmentainer(aFrame)
+             : aFrame->GetNextInFlow();
+}
+
+nsFrameList AbsoluteContainingBlock::StealPushedChildList() {
+  return std::move(mPushedAbsoluteFrames);
+}
+
+void AbsoluteContainingBlock::DrainPushedChildList(
+    const nsIFrame* aDelegatingFrame) {
+  MOZ_ASSERT(aDelegatingFrame->GetAbsoluteContainingBlock() == this,
+             "aDelegatingFrame's absCB should be us!");
+
+  for (auto iter = mPushedAbsoluteFrames.begin();
+       iter != mPushedAbsoluteFrames.end();) {
+    nsIFrame* const child = *iter++;
+    if (!child->GetPrevInFlow() ||
+        child->GetPrevInFlow()->GetParent() != aDelegatingFrame) {
+      mPushedAbsoluteFrames.RemoveFrame(child);
+      mAbsoluteFrames.AppendFrame(nullptr, child);
+      if (!child->GetPrevInFlow()) {
+        child->RemoveStateBits(NS_FRAME_IS_PUSHED_OUT_OF_FLOW);
+      }
+    }
+  }
+}
+
+bool AbsoluteContainingBlock::PrepareAbsoluteFrames(
+    nsContainerFrame* aDelegatingFrame) {
+  if (const nsIFrame* prev =
+          GetFirstContinuationInPrevFragmentainer(aDelegatingFrame)) {
+    AbsoluteContainingBlock* prevAbsCB = prev->GetAbsoluteContainingBlock();
+    MOZ_ASSERT(prevAbsCB,
+               "If this delegating frame has an absCB, |prev| must "
+               "have one, too!");
+
+    nsFrameList pushedFrames = prevAbsCB->StealPushedChildList();
+    if (pushedFrames.NotEmpty()) {
+      mAbsoluteFrames.InsertFrames(aDelegatingFrame, nullptr,
+                                   std::move(pushedFrames));
+
+      nsFrameList newPushedAbsoluteFrames;
+      for (auto iter = mAbsoluteFrames.begin();
+           iter != mAbsoluteFrames.end();) {
+        nsIFrame* const child = *iter++;
+        nsIFrame* const childPrevInFlow = child->GetPrevInFlow();
+        if (childPrevInFlow &&
+            childPrevInFlow->GetParent() == aDelegatingFrame) {
+          mAbsoluteFrames.RemoveFrame(child);
+          newPushedAbsoluteFrames.AppendFrame(nullptr, child);
+        }
+      }
+      if (newPushedAbsoluteFrames.NotEmpty()) {
+        mPushedAbsoluteFrames.InsertFrames(nullptr, nullptr,
+                                           std::move(newPushedAbsoluteFrames));
+      }
+    }
+  }
+
+  DrainPushedChildList(aDelegatingFrame);
+
+  for (nsIFrame* next =
+           GetFirstContinuationInNextFragmentainer(aDelegatingFrame);
+       next; next = GetFirstContinuationInNextFragmentainer(next)) {
+    AbsoluteContainingBlock* nextAbsCB = next->GetAbsoluteContainingBlock();
+    MOZ_ASSERT(nextAbsCB,
+               "If this delegating frame has an absCB, |next| must "
+               "have one, too!");
+
+    nextAbsCB->DrainPushedChildList(next);
+
+    for (auto iter = nextAbsCB->GetChildList().begin();
+         iter != nextAbsCB->GetChildList().end();) {
+      nsIFrame* const child = *iter++;
+      if (!child->GetPrevInFlow()) {
+        nextAbsCB->StealFrame(child);
+        mAbsoluteFrames.AppendFrame(aDelegatingFrame, child);
+        child->RemoveStateBits(NS_FRAME_IS_PUSHED_OUT_OF_FLOW);
+      }
+    }
+  }
+
+  return HasAbsoluteFrames();
+}
+
+void AbsoluteContainingBlock::StealFrame(nsIFrame* aFrame) {
+  const DebugOnly<bool> frameRemoved =
+      mAbsoluteFrames.StartRemoveFrame(aFrame) ||
+      mPushedAbsoluteFrames.ContinueRemoveFrame(aFrame);
+  MOZ_ASSERT(frameRemoved, "Failed to find aFrame from our child lists!");
+}
+
+#ifdef DEBUG
+void AbsoluteContainingBlock::SanityCheckChildListsBeforeReflow(
+    const nsIFrame* aDelegatingFrame) const {
+  for (const nsIFrame* child : mAbsoluteFrames) {
+    for (nsIFrame* prev = child->GetPrevInFlow(); prev;
+         prev = prev->GetPrevInFlow()) {
+      MOZ_ASSERT(!GetChildList().ContainsFrame(prev),
+                 "It is wrong that both a child and its prev-in-flow are in "
+                 "our child list!");
+    }
+  }
+
+  {
+    nsTHashSet<const nsIFrame*> allFrames;
+    for (const nsFrameList* list : {&mAbsoluteFrames, &mPushedAbsoluteFrames}) {
+      for (const nsIFrame* child : *list) {
+        allFrames.Insert(child);
+      }
+    }
+
+    nsTHashSet<const nsIFrame*> seen;
+    auto CheckOrder = [&](const nsIFrame* child) {
+      seen.Insert(child);
+      const nsIFrame* prev = child->GetPrevInFlow();
+      if (prev && allFrames.Contains(prev)) {
+        MOZ_ASSERT(seen.Contains(prev),
+                   "A frame's continuation appears before the frame in "
+                   "mAbsoluteFrames + mPushedAbsoluteFrames!");
+      }
+    };
+    for (const nsFrameList* list : {&mAbsoluteFrames, &mPushedAbsoluteFrames}) {
+      for (const nsIFrame* child : *list) {
+        CheckOrder(child);
+      }
+    }
+  }
+
+  for (const nsIFrame* next = aDelegatingFrame->GetNextInFlow(); next;
+       next = next->GetNextInFlow()) {
+    auto* nextAbsCB = next->GetAbsoluteContainingBlock();
+    MOZ_ASSERT(nextAbsCB,
+               "Delegating frame's next-in-flow should have "
+               "AbsoluteContainingBlock!");
+    for (nsIFrame* child : nextAbsCB->GetChildList()) {
+      MOZ_ASSERT(
+          child->GetPrevInFlow(),
+          "We should've pulled all abspos first-in-flows to our child list!");
+    }
+  }
+}
+#endif
+
+static void MaybeMarkAncestorsAsHavingDescendantDependentOnItsStaticPos(
+    nsIFrame* aFrame, nsIFrame* aContainingBlockFrame) {
+  MOZ_ASSERT(aFrame->HasAnyStateBits(NS_FRAME_OUT_OF_FLOW));
+  if (!aFrame->StylePosition()->NeedsHypotheticalPositionIfAbsPos()) {
+    return;
+  }
+  if (aFrame->GetPrevContinuation()) {
+    return;
+  }
+
+  auto* placeholder = aFrame->GetPlaceholderFrame();
+  MOZ_ASSERT(placeholder);
+
+  if (!placeholder->HasAnyStateBits(PLACEHOLDER_FOR_FIXEDPOS)) {
+    return;
+  }
+
+  for (nsIFrame* ancestor = placeholder->GetParent(); ancestor;
+       ancestor = ancestor->GetParent()) {
+    do {
+      if (ancestor->DescendantMayDependOnItsStaticPosition()) {
+        return;
+      }
+      if (aFrame == aContainingBlockFrame) {
+        return;
+      }
+      ancestor->SetDescendantMayDependOnItsStaticPosition(true);
+      nsIFrame* prev = ancestor->GetPrevContinuation();
+      if (!prev) {
+        break;
+      }
+      ancestor = prev;
+    } while (true);
+  }
+}
+
+static bool IsSnapshotContainingBlock(const nsIFrame* aFrame) {
+  return aFrame->Style()->GetPseudoType() ==
+         PseudoStyleType::MozSnapshotContainingBlock;
+}
+
+static PhysicalAxes CheckEarlyCompensatingForScroll(const nsIFrame* aKidFrame) {
+  if (!aKidFrame->StylePosition()->mPositionArea.IsNone()) {
+    return PhysicalAxes{PhysicalAxis::Horizontal, PhysicalAxis::Vertical};
+  }
+  PhysicalAxes result;
+  const auto cbwm = aKidFrame->GetParent()->GetWritingMode();
+  if (aKidFrame->StylePosition()->mAlignSelf._0 &
+      StyleAlignFlags::ANCHOR_CENTER) {
+    result +=
+        cbwm.IsVertical() ? PhysicalAxis::Horizontal : PhysicalAxis::Vertical;
+  }
+  if (aKidFrame->StylePosition()->mJustifySelf._0 &
+      StyleAlignFlags::ANCHOR_CENTER) {
+    result +=
+        cbwm.IsVertical() ? PhysicalAxis::Vertical : PhysicalAxis::Horizontal;
+  }
+  return result;
+}
+
+static AnchorPosResolutionCache PopulateAnchorResolutionCache(
+    const nsIFrame* aKidFrame, AnchorPosReferenceData* aData,
+    bool aReuseUnfragmentedAnchorPosReferences) {
+  MOZ_ASSERT(aKidFrame->HasAnchorPosReference());
+  if (aReuseUnfragmentedAnchorPosReferences) [[unlikely]] {
+    MOZ_ASSERT(
+        aKidFrame->FirstInFlow()->HasProperty(UnfragmentedPositionProperty()));
+    AnchorPosDefaultAnchorCache cache;
+    if (aData->mDefaultAnchorName) {
+      const auto* presShell = aKidFrame->PresShell();
+      cache.mAnchor = presShell->GetAnchorPosAnchor(
+          ScopedNameRef{aData->mDefaultAnchorName, aData->mAnchorTreeScope},
+          aKidFrame->FirstInFlow());
+      MOZ_ASSERT(cache.mAnchor);
+      cache.mScrollContainer =
+          AnchorPositioningUtils::GetNearestScrollFrame(cache.mAnchor)
+              .mScrollContainer;
+    }
+    return {aData, cache};
+  }
+
+  AnchorPosResolutionCache result{aData, {}};
+  const auto defaultAnchorInfo = AnchorPositioningUtils::ResolveAnchorPosRect(
+      aKidFrame, aKidFrame->GetParent(),
+      {nullptr, StyleCascadeLevel::Default()}, false, &result);
+  if (defaultAnchorInfo) {
+    aData->AdjustCompensatingForScroll(
+        CheckEarlyCompensatingForScroll(aKidFrame));
+  }
+  return result;
+}
+
+static nsRect ComputeScrollableContainingBlock(
+    const nsContainerFrame* aDelegatingFrame, const nsRect& aContainingBlock,
+    const OverflowAreas* aOverflowAreas) {
+  if (aOverflowAreas && aDelegatingFrame->Style()->GetPseudoType() ==
+                            PseudoStyleType::MozScrolledContent) {
+    ScrollContainerFrame* sf = do_QueryFrame(aDelegatingFrame->GetParent());
+    return sf->GetUnsnappedScrolledRectInternal(
+        aOverflowAreas->ScrollableOverflow(), aContainingBlock.Size());
+  }
+  return aContainingBlock;
+}
+
+static SideBits GetScrollCompensatedSidesFor(
+    const StylePositionArea& aPositionArea) {
+  SideBits sides{SideBits::eNone};
+  if (aPositionArea.first == StylePositionAreaKeyword::Left ||
+      aPositionArea.first == StylePositionAreaKeyword::SpanLeft) {
+    sides |= SideBits::eRight;
+  } else if (aPositionArea.first == StylePositionAreaKeyword::Right ||
+             aPositionArea.first == StylePositionAreaKeyword::SpanRight) {
+    sides |= SideBits::eLeft;
+  } else if (aPositionArea.first == StylePositionAreaKeyword::Center) {
+    sides |= SideBits::eLeftRight;
+  }
+
+  if (aPositionArea.second == StylePositionAreaKeyword::Top ||
+      aPositionArea.second == StylePositionAreaKeyword::SpanTop) {
+    sides |= SideBits::eBottom;
+  } else if (aPositionArea.second == StylePositionAreaKeyword::Bottom ||
+             aPositionArea.second == StylePositionAreaKeyword::SpanBottom) {
+    sides |= SideBits::eTop;
+  } else if (aPositionArea.second == StylePositionAreaKeyword::Center) {
+    sides |= SideBits::eTopBottom;
+  }
+
+  return sides;
+}
+
+struct ModifiedContainingBlock {
+  using AnchorOffsetInfo = AbsoluteContainingBlock::AnchorOffsetInfo;
+
+  Maybe<AnchorOffsetInfo> mAnchorOffsetInfo;
+  nsRect mMaybeScrollableRect;
+  nsRect mFinalRect;
+
+  explicit ModifiedContainingBlock(const nsRect& aRect)
+      : mMaybeScrollableRect{aRect}, mFinalRect{aRect} {}
+  ModifiedContainingBlock(const nsRect& aMaybeScrollableRect,
+                          const nsRect& aFinalRect)
+      : mMaybeScrollableRect{aMaybeScrollableRect}, mFinalRect{aFinalRect} {}
+  ModifiedContainingBlock(const nsPoint& aOffset,
+                          const StylePositionArea& aResolvedArea,
+                          const nsRect& aMaybeScrollableRect,
+                          const nsRect& aFinalRect)
+      : mAnchorOffsetInfo{Some(AnchorOffsetInfo{aOffset, aResolvedArea})},
+        mMaybeScrollableRect{aMaybeScrollableRect},
+        mFinalRect{aFinalRect} {}
+
+  AnchorOffsetInfo GetAnchorOffsetInfo() const {
+    return mAnchorOffsetInfo.valueOr(AnchorOffsetInfo{});
+  }
+  StylePositionArea ResolvedPositionArea() const {
+    return mAnchorOffsetInfo
+        .map([](const AnchorOffsetInfo& aInfo) {
+          return aInfo.mResolvedPositionArea;
+        })
+        .valueOr(StylePositionArea{});
+  }
+};
+
+static ModifiedContainingBlock ComputeContainingBlock(
+    bool aIsGrid, const nsContainerFrame* aDelegatingFrame,
+    const ReflowInput& aReflowInput,
+    const AbsoluteContainingBlock::ContainingBlockRects& aContainingBlockRects,
+    nsIFrame* aKidFrame, AnchorPosResolutionCache* aAnchorPosResolutionCache,
+    bool aReuseUnfragmentedAnchorPosReferences) {
+  if (aReuseUnfragmentedAnchorPosReferences) {
+    MOZ_ASSERT(aAnchorPosResolutionCache);
+    const auto* referenceData = aAnchorPosResolutionCache->mReferenceData;
+    if (const auto positionArea = aKidFrame->StylePosition()->mPositionArea;
+        !positionArea.IsNone()) {
+      return ModifiedContainingBlock{
+          referenceData->mDefaultScrollShift,
+          AnchorPositioningUtils::PhysicalizePositionArea(positionArea,
+                                                          aKidFrame),
+          referenceData->mOriginalContainingBlockRect,
+          referenceData->mAdjustedContainingBlock};
+    }
+    return ModifiedContainingBlock{referenceData->mOriginalContainingBlockRect,
+                                   referenceData->mAdjustedContainingBlock};
+  }
+  nsRect containingBlock = aContainingBlockRects.mLocal;
+  nsRect scrollableContainingBlock = aContainingBlockRects.mScrollable;
+  const auto defaultAnchorInfo = [&]() -> Maybe<AnchorPosInfo> {
+    if (!aAnchorPosResolutionCache) {
+      return Nothing{};
+    }
+    return AnchorPositioningUtils::ResolveAnchorPosRect(
+        aKidFrame, aDelegatingFrame, {nullptr, StyleCascadeLevel::Default()},
+        false, aAnchorPosResolutionCache);
+  }();
+  if (defaultAnchorInfo) {
+    containingBlock = aContainingBlockRects.mScrollable;
+  }
+
+  if (const ViewportFrame* viewport = do_QueryFrame(aDelegatingFrame)) {
+    if (IsSnapshotContainingBlock(aKidFrame)) {
+      return ModifiedContainingBlock{
+          dom::ViewTransition::SnapshotContainingBlockRect(
+              viewport->PresContext())};
+    }
+    MOZ_ASSERT(aContainingBlockRects.mScrollable ==
+               aContainingBlockRects.mLocal);
+    containingBlock = scrollableContainingBlock =
+        viewport->GetContainingBlockAdjustedForScrollbars(aReflowInput);
+  }
+
+  if (aIsGrid) {
+    const auto border = aDelegatingFrame->GetUsedBorder();
+    const nsPoint borderShift{border.left, border.top};
+    const nsRect preGridCB = containingBlock;
+    containingBlock = nsGridContainerFrame::GridItemCB(aKidFrame) + borderShift;
+    if (!defaultAnchorInfo) {
+      return ModifiedContainingBlock{preGridCB, containingBlock};
+    }
+  }
+  if (defaultAnchorInfo) {
+    auto positionArea = aKidFrame->StylePosition()->mPositionArea;
+    const auto offset = AnchorPositioningUtils::GetScrollOffsetFor(
+        aAnchorPosResolutionCache->mReferenceData->CompensatingForScrollAxes(),
+        aKidFrame, aAnchorPosResolutionCache->mDefaultAnchorCache);
+    StylePositionArea resolvedPositionArea{};
+    if (!positionArea.IsNone()) {
+      const auto scrolledAnchorRect = defaultAnchorInfo->mRect - offset;
+      const auto scrolledAnchorCb = AnchorPositioningUtils::
+          AdjustAbsoluteContainingBlockRectForPositionArea(
+              scrolledAnchorRect + aContainingBlockRects.mLocal.TopLeft(),
+              containingBlock, aKidFrame->GetWritingMode(),
+              aDelegatingFrame->GetWritingMode(), positionArea,
+              &resolvedPositionArea);
+      aAnchorPosResolutionCache->mReferenceData->mScrollCompensatedSides =
+          GetScrollCompensatedSidesFor(resolvedPositionArea);
+      containingBlock = scrolledAnchorCb + offset;
+    }
+    return ModifiedContainingBlock{offset, resolvedPositionArea,
+                                   scrollableContainingBlock, containingBlock};
+  }
+  return ModifiedContainingBlock{containingBlock};
+}
+
+void AbsoluteContainingBlock::Reflow(nsContainerFrame* aDelegatingFrame,
+                                     nsPresContext* aPresContext,
+                                     const ReflowInput& aReflowInput,
+                                     nsReflowStatus& aReflowStatus,
+                                     const nsRect& aContainingBlock,
+                                     AbsPosReflowFlags aFlags,
+                                     OverflowAreas* aOverflowAreas) {
+  MOZ_ASSERT(aReflowStatus.IsEmpty(),
+             "Caller should pass a fresh reflow status!");
+
+  const auto scrollableContainingBlock = ComputeScrollableContainingBlock(
+      aDelegatingFrame, aContainingBlock, aOverflowAreas);
+  const ContainingBlockRects passedContainingBlock{aContainingBlock,
+                                                   scrollableContainingBlock};
+
+  const auto* unfragmentedContainingBlockRects =
+      [&]() -> const ContainingBlockRects* {
+    if (aReflowInput.mFlags.mIsInFragmentainerMeasuringReflow) {
+      NS_WARNING_ASSERTION(aDelegatingFrame->FirstInFlow() == aDelegatingFrame,
+                           "Saving unfragmented CB into non-first-in-flow");
+      aDelegatingFrame->SetOrUpdateDeletableProperty(
+          UnfragmentedContainingBlockProperty(), passedContainingBlock);
+      return &passedContainingBlock;
+    }
+    if (const auto* unfragmented = aDelegatingFrame->FirstInFlow()->GetProperty(
+            UnfragmentedContainingBlockProperty())) {
+      return unfragmented;
+    }
+    return &passedContainingBlock;
+  }();
+
+  const auto* fragmentedContainingBlockRects =
+      unfragmentedContainingBlockRects != &passedContainingBlock
+          ? &passedContainingBlock
+          : nullptr;
+
+#ifdef DEBUG
+  SanityCheckChildListsBeforeReflow(aDelegatingFrame);
+#endif
+
+  if (const nsIFrame* prev =
+          GetFirstContinuationInPrevFragmentainer(aDelegatingFrame)) {
+    const auto* prevAbsCB = prev->GetAbsoluteContainingBlock();
+    MOZ_ASSERT(prevAbsCB,
+               "If this delegating frame has an absCB, |prev| must "
+               "have one, too!");
+    mCumulativeContainingBlockBSize =
+        prevAbsCB->mCumulativeContainingBlockBSize;
+  } else {
+    mCumulativeContainingBlockBSize = 0;
+  }
+
+  const bool reflowAll = aReflowInput.ShouldReflowAllKids() ||
+                         aReflowInput.IsInFragmentedContext();
+  const bool cbWidthChanged = aFlags.contains(AbsPosReflowFlag::CBWidthChanged);
+  const bool cbHeightChanged =
+      aFlags.contains(AbsPosReflowFlag::CBHeightChanged);
+  const nscoord availBSize = aReflowInput.AvailableBSize();
+  const WritingMode containerWM = aReflowInput.GetWritingMode();
+  nsFrameList newPushedAbsoluteFrames;
+  for (auto iter = mAbsoluteFrames.begin(); iter != mAbsoluteFrames.end();) {
+    nsIFrame* const kidFrame = *iter++;
+    bool reuseUnfragmentedAnchorPosReferences = false;
+    Maybe<AnchorPosResolutionCache> anchorPosResolutionCache;
+    if (kidFrame->HasAnchorPosReference()) {
+      AnchorPosReferenceData* referenceData = nullptr;
+      if (const auto* firstInFlow = kidFrame->FirstInFlow();
+          GetUnfragmentedPosition(aReflowInput, firstInFlow)) {
+        referenceData =
+            firstInFlow->GetProperty(nsIFrame::AnchorPosReferences());
+        reuseUnfragmentedAnchorPosReferences = true;
+      }
+      if (!referenceData) {
+        referenceData = kidFrame->SetOrUpdateDeletableProperty(
+            nsIFrame::AnchorPosReferences());
+      }
+      anchorPosResolutionCache = Some(PopulateAnchorResolutionCache(
+          kidFrame, referenceData, reuseUnfragmentedAnchorPosReferences));
+    } else {
+      kidFrame->RemoveProperty(nsIFrame::AnchorPosReferences());
+    }
+
+    bool kidNeedsReflow =
+        reflowAll || kidFrame->IsSubtreeDirty() ||
+        FrameDependsOnContainer(kidFrame, cbWidthChanged, cbHeightChanged,
+                                anchorPosResolutionCache.ptrOr(nullptr));
+    if (kidFrame->IsSubtreeDirty()) {
+      MaybeMarkAncestorsAsHavingDescendantDependentOnItsStaticPos(
+          kidFrame, aDelegatingFrame);
+    }
+    if (kidNeedsReflow && !aPresContext->HasPendingInterrupt()) {
+      const LogicalSize cbSize(containerWM,
+                               unfragmentedContainingBlockRects->mLocal.Size());
+      const LogicalMargin border =
+          aDelegatingFrame->GetLogicalUsedBorder(containerWM)
+              .ApplySkipSides(
+                  aDelegatingFrame->PreReflowBlockLevelLogicalSkipSides());
+      const nsSize cbBorderBoxSize =
+          (cbSize + border.Size(containerWM)).GetPhysicalSize(containerWM);
+
+      bool kidFrameNeedsPush = false;
+      if (const auto* unfragPos =
+              GetUnfragmentedPosition(aReflowInput, kidFrame);
+          unfragPos && availBSize != NS_UNCONSTRAINEDSIZE) {
+        const nscoord kidBPosInThisFragment =
+            unfragPos->B(containerWM) - mCumulativeContainingBlockBSize;
+        if (kidBPosInThisFragment > availBSize) {
+          kidFrameNeedsPush = true;
+        }
+      }
+
+      OverflowAreas kidOverflowAreas;
+      nsReflowStatus kidStatus;
+      if (!kidFrameNeedsPush) {
+        ReflowAbsoluteFrame(aDelegatingFrame, aPresContext, aReflowInput,
+                            *unfragmentedContainingBlockRects, aFlags, kidFrame,
+                            kidStatus, aOverflowAreas,
+                            fragmentedContainingBlockRects,
+                            anchorPosResolutionCache.ptrOr(nullptr),
+                            reuseUnfragmentedAnchorPosReferences);
+
+        if (aReflowInput.mFlags.mIsInFragmentainerMeasuringReflow) {
+          LogicalPoint unfragPos(containerWM);
+          if (StaticPrefs::layout_abspos_fragment_aware_inline_cb_enabled() &&
+              aDelegatingFrame->IsInlineFrameOrSubclass()) {
+            nsIFrame* blockAncestor =
+                nsLayoutUtils::FindNearestBlockAncestor(aDelegatingFrame);
+            nsSize blockAncestorSize =
+                aReflowInput.mContainingBlockSize.GetPhysicalSize(containerWM);
+            nsRect kidRect = kidFrame->GetRectRelativeToSelf() +
+                             kidFrame->GetOffsetTo(blockAncestor);
+            unfragPos = LogicalRect(containerWM, kidRect, blockAncestorSize)
+                            .Origin(containerWM);
+          } else {
+            unfragPos =
+                kidFrame->GetLogicalPosition(containerWM, cbBorderBoxSize);
+          }
+          kidFrame->SetOrUpdateDeletableProperty(UnfragmentedPositionProperty(),
+                                                 unfragPos);
+
+          const LogicalSize kidSize =
+              kidFrame->StylePosition()->mBoxSizing == StyleBoxSizing::BorderBox
+                  ? kidFrame->GetLogicalSize()
+                  : kidFrame->ContentSize();
+          kidFrame->SetOrUpdateDeletableProperty(UnfragmentedSizeProperty(),
+                                                 kidSize);
+
+          NS_ASSERTION(
+              !kidFrame->GetPrevInFlow(),
+              "UnfragmentedPositionProperty and UnfragmentedSizeProperty "
+              "should only be set on first-in-flow!");
+        }
+        MOZ_ASSERT(!kidStatus.IsInlineBreakBefore(),
+                   "ShouldAvoidBreakInside should prevent this from happening");
+      }
+
+      nsIFrame* nextFrame = kidFrame->GetNextInFlow();
+      if (kidFrameNeedsPush) {
+        StealFrame(kidFrame);
+        kidFrame->AddStateBits(NS_FRAME_IS_PUSHED_OUT_OF_FLOW);
+        newPushedAbsoluteFrames.AppendFrame(nullptr, kidFrame);
+      } else if (!kidStatus.IsFullyComplete()) {
+        if (!nextFrame) {
+          nextFrame = aPresContext->PresShell()
+                          ->FrameConstructor()
+                          ->CreateContinuingFrame(kidFrame, aDelegatingFrame);
+          nextFrame->AddStateBits(NS_FRAME_IS_PUSHED_OUT_OF_FLOW);
+          newPushedAbsoluteFrames.AppendFrame(nullptr, nextFrame);
+        } else if (nextFrame->GetParent() !=
+                   aDelegatingFrame->GetNextInFlow()) {
+          nextFrame->GetParent()->GetAbsoluteContainingBlock()->StealFrame(
+              nextFrame);
+          mPushedAbsoluteFrames.AppendFrame(aDelegatingFrame, nextFrame);
+        }
+        aReflowStatus.MergeCompletionStatusFrom(kidStatus);
+      } else if (nextFrame) {
+        FrameDestroyContext context(aPresContext->PresShell());
+        nextFrame->GetParent()->GetAbsoluteContainingBlock()->RemoveFrame(
+            context, FrameChildListID::Absolute, nextFrame);
+      }
+    } else {
+      if (aOverflowAreas) {
+        aDelegatingFrame->ConsiderChildOverflow(*aOverflowAreas, kidFrame);
+      }
+    }
+
+    if (kidNeedsReflow && aPresContext->CheckForInterrupt(aDelegatingFrame)) {
+      if (aDelegatingFrame->HasAnyStateBits(NS_FRAME_IS_DIRTY)) {
+        kidFrame->MarkSubtreeDirty();
+      } else {
+        kidFrame->AddStateBits(NS_FRAME_HAS_DIRTY_CHILDREN);
+      }
+    }
+  }
+
+  if (newPushedAbsoluteFrames.NotEmpty()) {
+    mPushedAbsoluteFrames.InsertFrames(nullptr, nullptr,
+                                       std::move(newPushedAbsoluteFrames));
+  }
+
+  if (availBSize != NS_UNCONSTRAINEDSIZE) {
+    mCumulativeContainingBlockBSize += availBSize;
+  }
+
+  if (aReflowStatus.IsIncomplete() || mPushedAbsoluteFrames.NotEmpty()) {
+    aReflowStatus.SetOverflowIncomplete();
+    aReflowStatus.SetNextInFlowNeedsReflow();
+  }
+}
+
+static inline bool IsFixedPaddingSize(const LengthPercentage& aCoord) {
+  return aCoord.ConvertsToLength();
+}
+static inline bool IsFixedMarginSize(const AnchorResolvedMargin& aCoord) {
+  return aCoord->ConvertsToLength();
+}
+static inline bool IsFixedOffset(const AnchorResolvedInset& aInset) {
+  return aInset->ConvertsToLength();
+}
+
+bool AbsoluteContainingBlock::FrameDependsOnContainer(
+    nsIFrame* f, bool aCBWidthChanged, bool aCBHeightChanged,
+    AnchorPosResolutionCache* aAnchorPosResolutionCache) {
+  const nsStylePosition* pos = f->StylePosition();
+  if (pos->NeedsHypotheticalPositionIfAbsPos()) {
+    return true;
+  }
+  if (!aCBWidthChanged && !aCBHeightChanged) {
+    return false;
+  }
+  const nsStylePadding* padding = f->StylePadding();
+  const nsStyleMargin* margin = f->StyleMargin();
+  WritingMode wm = f->GetWritingMode();
+  const auto anchorResolutionParams =
+      AnchorPosResolutionParams::From(f, aAnchorPosResolutionCache);
+  if (wm.IsVertical() ? aCBHeightChanged : aCBWidthChanged) {
+    if (nsStylePosition::ISizeDependsOnContainer(
+            pos->ISize(wm, anchorResolutionParams)) ||
+        nsStylePosition::MinISizeDependsOnContainer(
+            pos->MinISize(wm, anchorResolutionParams)) ||
+        nsStylePosition::MaxISizeDependsOnContainer(
+            pos->MaxISize(wm, anchorResolutionParams)) ||
+        !IsFixedPaddingSize(padding->mPadding.GetIStart(wm)) ||
+        !IsFixedPaddingSize(padding->mPadding.GetIEnd(wm))) {
+      return true;
+    }
+
+    if (!IsFixedMarginSize(margin->GetMargin(LogicalSide::IStart, wm,
+                                             anchorResolutionParams)) ||
+        !IsFixedMarginSize(
+            margin->GetMargin(LogicalSide::IEnd, wm, anchorResolutionParams))) {
+      return true;
+    }
+  }
+  if (wm.IsVertical() ? aCBWidthChanged : aCBHeightChanged) {
+    const auto bSize = pos->BSize(wm, anchorResolutionParams);
+    const auto anchorOffsetResolutionParams =
+        AnchorPosOffsetResolutionParams::UseCBFrameSize(anchorResolutionParams);
+    if ((nsStylePosition::BSizeDependsOnContainer(bSize) &&
+         !(bSize->IsAuto() &&
+           pos->GetAnchorResolvedInset(LogicalSide::BEnd, wm,
+                                       anchorOffsetResolutionParams)
+               ->IsAuto() &&
+           !pos->GetAnchorResolvedInset(LogicalSide::BStart, wm,
+                                        anchorOffsetResolutionParams)
+                ->IsAuto())) ||
+        nsStylePosition::MinBSizeDependsOnContainer(
+            pos->MinBSize(wm, anchorResolutionParams)) ||
+        nsStylePosition::MaxBSizeDependsOnContainer(
+            pos->MaxBSize(wm, anchorResolutionParams)) ||
+        !IsFixedPaddingSize(padding->mPadding.GetBStart(wm)) ||
+        !IsFixedPaddingSize(padding->mPadding.GetBEnd(wm))) {
+      return true;
+    }
+
+    if (!IsFixedMarginSize(margin->GetMargin(LogicalSide::BStart, wm,
+                                             anchorResolutionParams)) ||
+        !IsFixedMarginSize(
+            margin->GetMargin(LogicalSide::BEnd, wm, anchorResolutionParams))) {
+      return true;
+    }
+  }
+
+  if (aCBWidthChanged) {
+    const auto anchorOffsetResolutionParams =
+        AnchorPosOffsetResolutionParams::UseCBFrameSize(anchorResolutionParams);
+    if (!IsFixedOffset(pos->GetAnchorResolvedInset(
+            eSideLeft, anchorOffsetResolutionParams))) {
+      return true;
+    }
+    if ((wm.GetInlineDir() == WritingMode::InlineDir::RTL ||
+         wm.GetBlockDir() == WritingMode::BlockDir::RL) &&
+        !pos->GetAnchorResolvedInset(eSideRight, anchorOffsetResolutionParams)
+             ->IsAuto()) {
+      return true;
+    }
+  }
+  if (aCBHeightChanged) {
+    const auto anchorOffsetResolutionParams =
+        AnchorPosOffsetResolutionParams::UseCBFrameSize(anchorResolutionParams);
+    if (!IsFixedOffset(pos->GetAnchorResolvedInset(
+            eSideTop, anchorOffsetResolutionParams))) {
+      return true;
+    }
+    if (wm.GetInlineDir() == WritingMode::InlineDir::BTT &&
+        !pos->GetAnchorResolvedInset(eSideBottom, anchorOffsetResolutionParams)
+             ->IsAuto()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void AbsoluteContainingBlock::DestroyFrames(DestroyContext& aContext) {
+  mAbsoluteFrames.DestroyFrames(aContext);
+  mPushedAbsoluteFrames.DestroyFrames(aContext);
+}
+
+void AbsoluteContainingBlock::MarkSizeDependentFramesDirty() {
+  DoMarkFramesDirty(false);
+}
+
+void AbsoluteContainingBlock::MarkAllFramesDirty() { DoMarkFramesDirty(true); }
+
+void AbsoluteContainingBlock::DoMarkFramesDirty(bool aMarkAllDirty) {
+  for (nsIFrame* kidFrame : mAbsoluteFrames) {
+    if (aMarkAllDirty) {
+      kidFrame->MarkSubtreeDirty();
+    } else if (FrameDependsOnContainer(kidFrame, true, true)) {
+      kidFrame->AddStateBits(NS_FRAME_HAS_DIRTY_CHILDREN);
+    }
+  }
+}
+
+static nsContainerFrame* GetPlaceholderContainer(nsIFrame* aPositionedFrame) {
+  nsIFrame* placeholder = aPositionedFrame->GetPlaceholderFrame();
+  return placeholder ? placeholder->GetParent() : nullptr;
+}
+
+struct NonAutoAlignParams {
+  nscoord mCurrentStartInset;
+  nscoord mCurrentEndInset;
+
+  NonAutoAlignParams(nscoord aStartInset, nscoord aEndInset)
+      : mCurrentStartInset(aStartInset), mCurrentEndInset(aEndInset) {}
+};
+
+static nscoord OffsetToAlignedStaticPos(
+    const ReflowInput& aKidReflowInput, const LogicalSize& aKidSizeInAbsPosCBWM,
+    const LogicalSize& aAbsPosCBSize,
+    const nsContainerFrame* aPlaceholderContainer, WritingMode aAbsPosCBWM,
+    LogicalAxis aAbsPosCBAxis, Maybe<NonAutoAlignParams> aNonAutoAlignParams,
+    const AbsoluteContainingBlock::AnchorOffsetInfo& aAnchorOffsetInfo) {
+  if (!aPlaceholderContainer) {
+    NS_ERROR(
+        "Missing placeholder-container when computing a "
+        "CSS Box Alignment static position");
+    return 0;
+  }
+
+
+  WritingMode pcWM = aPlaceholderContainer->GetWritingMode();
+  LogicalSize absPosCBSizeInPCWM = aAbsPosCBSize.ConvertTo(pcWM, aAbsPosCBWM);
+
+  const LogicalAxis pcAxis = aAbsPosCBWM.ConvertAxisTo(aAbsPosCBAxis, pcWM);
+  const LogicalSize alignAreaSize = [&]() {
+    if (!aNonAutoAlignParams) {
+      const bool placeholderContainerIsContainingBlock =
+          aPlaceholderContainer == aKidReflowInput.mCBReflowInput->mFrame;
+
+      LayoutFrameType parentType = aPlaceholderContainer->Type();
+      LogicalSize alignAreaSize(pcWM);
+      if (parentType == LayoutFrameType::FlexContainer) {
+        if (placeholderContainerIsContainingBlock) {
+          alignAreaSize = aAbsPosCBSize.ConvertTo(pcWM, aAbsPosCBWM);
+          alignAreaSize -=
+              aPlaceholderContainer->GetLogicalUsedPadding(pcWM).Size(pcWM);
+        } else {
+          alignAreaSize = aPlaceholderContainer->GetLogicalSize(pcWM);
+          LogicalMargin pcBorderPadding =
+              aPlaceholderContainer->GetLogicalUsedBorderAndPadding(pcWM);
+          alignAreaSize -= pcBorderPadding.Size(pcWM);
+        }
+        return alignAreaSize;
+      }
+      if (parentType == LayoutFrameType::GridContainer) {
+        if (placeholderContainerIsContainingBlock) {
+          alignAreaSize = aAbsPosCBSize.ConvertTo(pcWM, aAbsPosCBWM);
+        } else {
+          alignAreaSize = aPlaceholderContainer->GetLogicalSize(pcWM);
+          LogicalMargin pcBorderPadding =
+              aPlaceholderContainer->GetLogicalUsedBorderAndPadding(pcWM);
+          alignAreaSize -= pcBorderPadding.Size(pcWM);
+        }
+        return alignAreaSize;
+      }
+    }
+    return aAbsPosCBSize.ConvertTo(pcWM, aAbsPosCBWM);
+  }();
+
+  const nscoord existingOffset = aNonAutoAlignParams
+                                     ? aNonAutoAlignParams->mCurrentStartInset +
+                                           aNonAutoAlignParams->mCurrentEndInset
+                                     : 0;
+  const nscoord alignAreaSizeInAxis =
+      ((pcAxis == LogicalAxis::Inline) ? alignAreaSize.ISize(pcWM)
+                                       : alignAreaSize.BSize(pcWM)) -
+      existingOffset;
+
+  using AlignJustifyFlag = CSSAlignUtils::AlignJustifyFlag;
+  CSSAlignUtils::AlignJustifyFlags flags(AlignJustifyFlag::IgnoreAutoMargins);
+  StyleAlignFlags alignConst =
+      aNonAutoAlignParams
+          ? aPlaceholderContainer
+                ->CSSAlignmentForAbsPosChildWithinContainingBlock(
+                    aKidReflowInput, pcAxis,
+                    aAnchorOffsetInfo.mResolvedPositionArea, absPosCBSizeInPCWM)
+          : aPlaceholderContainer->CSSAlignmentForAbsPosChild(aKidReflowInput,
+                                                              pcAxis);
+  const auto safetyBits =
+      alignConst & (StyleAlignFlags::SAFE | StyleAlignFlags::UNSAFE);
+  alignConst &= ~StyleAlignFlags::FLAG_BITS;
+  if (safetyBits & StyleAlignFlags::SAFE) {
+    flags += AlignJustifyFlag::OverflowSafe;
+  }
+
+  WritingMode kidWM = aKidReflowInput.GetWritingMode();
+  if (pcWM.ParallelAxisStartsOnSameSide(pcAxis, kidWM)) {
+    flags += AlignJustifyFlag::SameSide;
+  }
+
+  if (aNonAutoAlignParams) {
+    flags += AlignJustifyFlag::AligningMarginBox;
+  }
+
+  const nscoord baselineAdjust = nscoord(0);
+
+  LogicalSize kidSizeInOwnWM =
+      aKidSizeInAbsPosCBWM.ConvertTo(kidWM, aAbsPosCBWM);
+  const LogicalAxis kidAxis = aAbsPosCBWM.ConvertAxisTo(aAbsPosCBAxis, kidWM);
+
+  Maybe<CSSAlignUtils::AnchorAlignInfo> anchorAlignInfo;
+  if (alignConst == StyleAlignFlags::ANCHOR_CENTER &&
+      aKidReflowInput.mAnchorPosResolutionCache) {
+    AnchorPosReferenceData* referenceData =
+        aKidReflowInput.mAnchorPosResolutionCache->mReferenceData;
+    if (referenceData) {
+      const auto* cachedData = referenceData->Lookup(
+          {referenceData->mDefaultAnchorName, referenceData->mAnchorTreeScope});
+      if (cachedData && *cachedData) {
+        referenceData->AdjustCompensatingForScroll(
+            aAbsPosCBWM.PhysicalAxis(aAbsPosCBAxis));
+        const auto& data = cachedData->ref();
+        if (data.mOffsetData) {
+          const nsSize containerSize =
+              aAbsPosCBSize.GetPhysicalSize(aAbsPosCBWM);
+          const auto cbOffset =
+              referenceData->mAdjustedContainingBlock.TopLeft() -
+              referenceData->mOriginalContainingBlockRect.TopLeft();
+          const nsRect anchorRect(data.mOffsetData->mOrigin - cbOffset,
+                                  data.mSize);
+          const LogicalRect logicalAnchorRect{aAbsPosCBWM, anchorRect,
+                                              containerSize};
+          const auto axisInAbsPosCBWM =
+              kidWM.ConvertAxisTo(kidAxis, aAbsPosCBWM);
+          const auto anchorStart =
+              logicalAnchorRect.Start(axisInAbsPosCBWM, aAbsPosCBWM);
+          const auto anchorSize =
+              logicalAnchorRect.Size(axisInAbsPosCBWM, aAbsPosCBWM);
+          anchorAlignInfo =
+              Some(CSSAlignUtils::AnchorAlignInfo{anchorStart, anchorSize});
+          if (aNonAutoAlignParams) {
+            anchorAlignInfo->mAnchorStart -=
+                aNonAutoAlignParams->mCurrentStartInset;
+          }
+        }
+      }
+    }
+  }
+
+  nscoord offset = CSSAlignUtils::AlignJustifySelf(
+      alignConst, kidAxis, flags, baselineAdjust, alignAreaSizeInAxis,
+      aKidReflowInput, kidSizeInOwnWM, anchorAlignInfo);
+
+  if ((!aNonAutoAlignParams || (safetyBits & StyleAlignFlags::SAFE)) &&
+      alignConst == StyleAlignFlags::ANCHOR_CENTER) {
+    const auto cbSize = aAbsPosCBSize.Size(aAbsPosCBAxis, aAbsPosCBWM);
+    const auto kidSize = aKidSizeInAbsPosCBWM.Size(aAbsPosCBAxis, aAbsPosCBWM);
+
+    if (aNonAutoAlignParams) {
+      const nscoord currentStartInset = aNonAutoAlignParams->mCurrentStartInset;
+      const nscoord finalStart = currentStartInset + offset;
+      const nscoord clampedStart =
+          CSSMinMax(finalStart, nscoord(0), cbSize - kidSize);
+      offset = clampedStart - currentStartInset;
+    } else {
+      offset = CSSMinMax(offset, nscoord(0), cbSize - kidSize);
+    }
+  }
+
+  const auto rawAlignConst =
+      (pcAxis == LogicalAxis::Inline)
+          ? aKidReflowInput.mStylePosition->mJustifySelf._0
+          : aKidReflowInput.mStylePosition->mAlignSelf._0;
+  if (aNonAutoAlignParams && !safetyBits &&
+      (rawAlignConst != StyleAlignFlags::AUTO ||
+       alignConst == StyleAlignFlags::ANCHOR_CENTER)) {
+    const auto cbSize = aAbsPosCBSize.Size(aAbsPosCBAxis, aAbsPosCBWM);
+    const auto imcbStart = aNonAutoAlignParams->mCurrentStartInset;
+    const auto imcbEnd = cbSize - aNonAutoAlignParams->mCurrentEndInset;
+    const auto scrollOffset = aAnchorOffsetInfo.mResolvedPositionArea.IsNone()
+                                  ? aAbsPosCBWM.PhysicalAxis(aAbsPosCBAxis) ==
+                                            PhysicalAxis::Horizontal
+                                        ? aAnchorOffsetInfo.mScrollOffset.x
+                                        : aAnchorOffsetInfo.mScrollOffset.y
+                                  : 0;
+    const auto kidSize = aKidSizeInAbsPosCBWM.Size(aAbsPosCBAxis, aAbsPosCBWM);
+    const auto kidStart =
+        aNonAutoAlignParams->mCurrentStartInset + offset - scrollOffset;
+    const auto kidEnd = kidStart + kidSize;
+    const auto overflowLimitRectStart = std::min(0, imcbStart);
+    const auto overflowLimitRectEnd = std::max(cbSize, imcbEnd);
+
+    if (kidStart >= imcbStart && kidEnd <= imcbEnd) {
+    } else if (kidSize <= overflowLimitRectEnd - overflowLimitRectStart) {
+      if (kidStart <= imcbStart && kidEnd >= imcbEnd) {
+        if (kidStart < overflowLimitRectStart) {
+          offset += overflowLimitRectStart - kidStart;
+        } else if (kidEnd > overflowLimitRectEnd) {
+          offset -= kidEnd - overflowLimitRectEnd;
+        }
+      } else if (kidEnd < imcbEnd && kidStart < imcbStart) {
+        offset += std::min(imcbStart - kidStart, imcbEnd - kidEnd);
+      } else if (kidStart > imcbStart && kidEnd > imcbEnd) {
+        offset -= std::min(kidEnd - imcbEnd, kidStart - imcbStart);
+      }
+    } else {
+      offset =
+          -aNonAutoAlignParams->mCurrentStartInset + overflowLimitRectStart;
+    }
+  }
+
+  if (!pcWM.ParallelAxisStartsOnSameSide(pcAxis, aAbsPosCBWM)) {
+    return -offset;
+  }
+  return offset;
+}
+
+void AbsoluteContainingBlock::ResolveSizeDependentOffsets(
+    ReflowInput& aKidReflowInput, const LogicalSize& aCBSize,
+    const LogicalSize& aKidSize, const LogicalMargin& aMargin,
+    const AnchorOffsetInfo& aAnchorOffsetInfo, LogicalMargin& aOffsets) {
+  WritingMode outerWM = aKidReflowInput.mParentReflowInput->GetWritingMode();
+
+  if ((NS_AUTOOFFSET == aOffsets.IStart(outerWM)) ||
+      (NS_AUTOOFFSET == aOffsets.BStart(outerWM)) ||
+      aKidReflowInput.mFlags.mIOffsetsNeedCSSAlign ||
+      aKidReflowInput.mFlags.mBOffsetsNeedCSSAlign) {
+    nsContainerFrame* placeholderContainer = nullptr;
+
+    if (NS_AUTOOFFSET == aOffsets.IStart(outerWM)) {
+      NS_ASSERTION(NS_AUTOOFFSET != aOffsets.IEnd(outerWM),
+                   "Can't solve for both start and end");
+      aOffsets.IStart(outerWM) =
+          aCBSize.ISize(outerWM) - aOffsets.IEnd(outerWM) -
+          aMargin.IStartEnd(outerWM) - aKidSize.ISize(outerWM);
+    } else if (aKidReflowInput.mFlags.mIOffsetsNeedCSSAlign) {
+      placeholderContainer = GetPlaceholderContainer(aKidReflowInput.mFrame);
+      nscoord offset = OffsetToAlignedStaticPos(
+          aKidReflowInput, aKidSize, aCBSize, placeholderContainer, outerWM,
+          LogicalAxis::Inline, Nothing{}, aAnchorOffsetInfo);
+      aOffsets.IStart(outerWM) += offset;
+      aOffsets.IEnd(outerWM) =
+          aCBSize.ISize(outerWM) -
+          (aOffsets.IStart(outerWM) + aKidSize.ISize(outerWM));
+    }
+
+    if (NS_AUTOOFFSET == aOffsets.BStart(outerWM)) {
+      aOffsets.BStart(outerWM) =
+          aCBSize.BSize(outerWM) - aOffsets.BEnd(outerWM) -
+          aMargin.BStartEnd(outerWM) - aKidSize.BSize(outerWM);
+    } else if (aKidReflowInput.mFlags.mBOffsetsNeedCSSAlign) {
+      if (!placeholderContainer) {
+        placeholderContainer = GetPlaceholderContainer(aKidReflowInput.mFrame);
+      }
+      nscoord offset = OffsetToAlignedStaticPos(
+          aKidReflowInput, aKidSize, aCBSize, placeholderContainer, outerWM,
+          LogicalAxis::Block, Nothing{}, aAnchorOffsetInfo);
+      aOffsets.BStart(outerWM) += offset;
+      aOffsets.BEnd(outerWM) =
+          aCBSize.BSize(outerWM) -
+          (aOffsets.BStart(outerWM) + aKidSize.BSize(outerWM));
+    }
+    aKidReflowInput.SetComputedLogicalOffsets(outerWM, aOffsets);
+  }
+}
+
+void AbsoluteContainingBlock::ResolveAutoMarginsAfterLayout(
+    ReflowInput& aKidReflowInput, const LogicalSize& aCBSize,
+    const LogicalSize& aKidSize, LogicalMargin& aMargin,
+    const LogicalMargin& aOffsets) {
+  WritingMode outerWM = aKidReflowInput.mParentReflowInput->GetWritingMode();
+  const auto& styleMargin = aKidReflowInput.mStyleMargin;
+  const auto anchorResolutionParams =
+      AnchorPosResolutionParams::From(&aKidReflowInput);
+
+  auto ResolveMarginsInAxis = [&](LogicalAxis aAxis) {
+    const auto startSide = MakeLogicalSide(aAxis, LogicalEdge::Start);
+    const auto endSide = MakeLogicalSide(aAxis, LogicalEdge::End);
+
+    const bool autoOffset =
+        aOffsets.Side(startSide, outerWM) == NS_AUTOOFFSET ||
+        aOffsets.Side(endSide, outerWM) == NS_AUTOOFFSET;
+
+    nscoord availMarginSpace;
+    if (autoOffset) {
+      availMarginSpace = 0;
+    } else {
+      const nscoord stretchFitSize = std::max(
+          0, aCBSize.Size(aAxis, outerWM) - aOffsets.StartEnd(aAxis, outerWM) -
+                 aMargin.StartEnd(aAxis, outerWM));
+      availMarginSpace = stretchFitSize - aKidSize.Size(aAxis, outerWM);
+    }
+
+    const bool startSideMarginIsAuto =
+        styleMargin->GetMargin(startSide, outerWM, anchorResolutionParams)
+            ->IsAuto();
+    const bool endSideMarginIsAuto =
+        styleMargin->GetMargin(endSide, outerWM, anchorResolutionParams)
+            ->IsAuto();
+
+    if (aAxis == LogicalAxis::Inline) {
+      ReflowInput::ComputeAbsPosInlineAutoMargin(availMarginSpace, outerWM,
+                                                 startSideMarginIsAuto,
+                                                 endSideMarginIsAuto, aMargin);
+    } else {
+      ReflowInput::ComputeAbsPosBlockAutoMargin(availMarginSpace, outerWM,
+                                                startSideMarginIsAuto,
+                                                endSideMarginIsAuto, aMargin);
+    }
+  };
+
+  ResolveMarginsInAxis(LogicalAxis::Inline);
+  ResolveMarginsInAxis(LogicalAxis::Block);
+  aKidReflowInput.SetComputedLogicalMargin(outerWM, aMargin);
+
+  nsMargin* propValue =
+      aKidReflowInput.mFrame->GetProperty(nsIFrame::UsedMarginProperty());
+  MOZ_ASSERT_IF(
+      styleMargin->HasInlineAxisAuto(outerWM, anchorResolutionParams) ||
+          styleMargin->HasBlockAxisAuto(outerWM, anchorResolutionParams),
+      propValue);
+  if (propValue) {
+    *propValue = aMargin.GetPhysicalMargin(outerWM);
+  }
+}
+
+struct None {};
+using OldCacheState = Variant<None, AnchorPosResolutionCache::PositionTryBackup,
+                              AnchorPosResolutionCache::PositionTryFullBackup>;
+
+struct MOZ_STACK_CLASS MOZ_RAII AutoFallbackStyleSetter {
+  AutoFallbackStyleSetter(nsIFrame* aFrame, ComputedStyle* aFallbackStyle,
+                          AnchorPosResolutionCache* aCache, bool aIsFirstTry)
+      : mFrame(aFrame), mCache{aCache}, mOldCacheState{None{}} {
+    if (aFallbackStyle) {
+      mOldStyle = aFrame->SetComputedStyleWithoutNotification(aFallbackStyle);
+    }
+    if (!aIsFirstTry && aCache) {
+      if (mOldStyle && mOldStyle->StylePosition()->mPositionAnchor !=
+                           aFrame->StylePosition()->mPositionAnchor) {
+        mOldCacheState =
+            OldCacheState{aCache->TryPositionWithDifferentDefaultAnchor()};
+        *aCache = PopulateAnchorResolutionCache(aFrame, aCache->mReferenceData,
+                                                false);
+      } else {
+        mOldCacheState =
+            OldCacheState{aCache->TryPositionWithSameDefaultAnchor()};
+        if (aCache->mDefaultAnchorCache.mAnchor) {
+          aCache->mReferenceData->AdjustCompensatingForScroll(
+              CheckEarlyCompensatingForScroll(aFrame));
+        }
+      }
+    }
+  }
+
+  ~AutoFallbackStyleSetter() {
+    if (mOldStyle) {
+      mFrame->SetComputedStyleWithoutNotification(std::move(mOldStyle));
+    }
+    std::move(mOldCacheState)
+        .match(
+            [](None&&) {},
+            [&](AnchorPosResolutionCache::PositionTryBackup&& aBackup) {
+              mCache->UndoTryPositionWithSameDefaultAnchor(std::move(aBackup));
+            },
+            [&](AnchorPosResolutionCache::PositionTryFullBackup&& aBackup) {
+              mCache->UndoTryPositionWithDifferentDefaultAnchor(
+                  std::move(aBackup));
+            });
+  }
+
+  void CommitCurrentFallback() {
+    mOldCacheState = OldCacheState{None{}};
+    nsMargin margin;
+    if (mOldStyle &&
+        !mOldStyle->StyleMargin()->MarginEquals(*mFrame->StyleMargin()) &&
+        mFrame->StyleMargin()->GetMargin(margin)) {
+      mFrame->SetOrUpdateDeletableProperty(nsIFrame::UsedMarginProperty(),
+                                           margin);
+    }
+  }
+
+ private:
+  nsIFrame* const mFrame;
+  RefPtr<ComputedStyle> mOldStyle;
+  AnchorPosResolutionCache* const mCache;
+  OldCacheState mOldCacheState;
+};
+
+void AbsoluteContainingBlock::ReflowAbsoluteFrame(
+    nsContainerFrame* aDelegatingFrame, nsPresContext* aPresContext,
+    const ReflowInput& aReflowInput,
+    const ContainingBlockRects& aContainingBlockRects, AbsPosReflowFlags aFlags,
+    nsIFrame* aKidFrame, nsReflowStatus& aStatus, OverflowAreas* aOverflowAreas,
+    const ContainingBlockRects* aFragmentedContainingBlockRects,
+    AnchorPosResolutionCache* aAnchorPosResolutionCache,
+    bool aReuseUnfragmentedAnchorPosReferences) {
+  MOZ_ASSERT(aStatus.IsEmpty(), "Caller should pass a fresh reflow status!");
+
+#ifdef DEBUG
+  if (nsBlockFrame::gNoisyReflow) {
+    nsIFrame::IndentBy(stdout, nsBlockFrame::gNoiseIndent);
+    fmt::println("abspos {}: begin reflow: availSize={}, orig cbRect={}",
+                 aKidFrame->ListTag(), ToString(aReflowInput.AvailableSize()),
+                 ToString(aContainingBlockRects.mLocal));
+  }
+  AutoNoisyIndenter indent(nsBlockFrame::gNoisy);
+#endif  // DEBUG
+
+  const WritingMode outerWM = aReflowInput.GetWritingMode();
+  const WritingMode wm = aKidFrame->GetWritingMode();
+
+  const bool isGrid = aFlags.contains(AbsPosReflowFlag::IsGridContainerCB);
+  const auto* kidStylePosition = aKidFrame->StylePosition();
+  auto fallbacks = kidStylePosition->mPositionTryFallbacks.value._0.AsSpan();
+  const auto fallbackScope = kidStylePosition->mPositionTryFallbacks.scope;
+  Maybe<uint32_t> currentFallbackIndex;
+  const StylePositionTryFallbacksItem* currentFallback = nullptr;
+  RefPtr<ComputedStyle> currentFallbackStyle;
+  RefPtr<ComputedStyle> firstTryStyle;
+  Maybe<uint32_t> firstTryIndex;
+  Maybe<uint32_t> bestIndex;
+  nscoord bestSize = -1;
+  bool finalizing = false;
+
+  auto tryOrder = kidStylePosition->mPositionTryOrder;
+  switch (tryOrder) {
+    case StylePositionTryOrder::MostInlineSize:
+      tryOrder = outerWM.IsVertical() ? StylePositionTryOrder::MostHeight
+                                      : StylePositionTryOrder::MostWidth;
+      break;
+    case StylePositionTryOrder::MostBlockSize:
+      tryOrder = outerWM.IsVertical() ? StylePositionTryOrder::MostWidth
+                                      : StylePositionTryOrder::MostHeight;
+      break;
+    default:
+      break;
+  }
+
+  const auto* baseStyle = aKidFrame->Style();
+  auto SeekFallbackTo = [&](Maybe<uint32_t> aIndex) -> bool {
+    if (!aIndex) {
+      currentFallbackIndex = Nothing();
+      currentFallback = nullptr;
+      currentFallbackStyle = nullptr;
+      return true;
+    }
+    uint32_t index = *aIndex;
+    if (index >= fallbacks.Length()) {
+      return false;
+    }
+
+    const StylePositionTryFallbacksItem* nextFallback;
+    RefPtr<ComputedStyle> nextFallbackStyle;
+    while (true) {
+      nextFallback = &fallbacks[index];
+      nextFallbackStyle = aPresContext->StyleSet()->ResolvePositionTry(
+          fallbackScope, *aKidFrame->GetContent()->AsElement(), *baseStyle,
+          *nextFallback);
+      if (nextFallbackStyle) {
+        break;
+      }
+      index++;
+      if (index >= fallbacks.Length()) {
+        return false;
+      }
+    }
+    currentFallbackIndex = Some(index);
+    currentFallback = nextFallback;
+    currentFallbackStyle = std::move(nextFallbackStyle);
+    return true;
+  };
+
+  auto TryAdvanceFallback = [&]() -> bool {
+    if (fallbacks.IsEmpty()) {
+      return false;
+    }
+    if (firstTryIndex && currentFallbackIndex == firstTryIndex) {
+      return SeekFallbackTo(Nothing());
+    }
+    uint32_t nextFallbackIndex =
+        currentFallbackIndex ? *currentFallbackIndex + 1 : 0;
+    if (firstTryIndex && nextFallbackIndex == *firstTryIndex) {
+      ++nextFallbackIndex;
+    }
+    return SeekFallbackTo(Some(nextFallbackIndex));
+  };
+
+  Maybe<nsRect> firstTryRect;
+  if (auto* lastSuccessfulPosition =
+          aKidFrame->GetProperty(nsIFrame::LastSuccessfulPositionFallback());
+      lastSuccessfulPosition && lastSuccessfulPosition->mRecordedIndex &&
+      SeekFallbackTo(lastSuccessfulPosition->mRecordedIndex)) {
+    firstTryIndex = lastSuccessfulPosition->mRecordedIndex;
+    firstTryStyle = currentFallbackStyle;
+  }
+
+  bool isOverflowingCB = true;
+
+  do {
+    AutoFallbackStyleSetter fallback(aKidFrame, currentFallbackStyle,
+                                     aAnchorPosResolutionCache,
+                                     firstTryIndex == currentFallbackIndex);
+    auto cb = ComputeContainingBlock(isGrid, aDelegatingFrame, aReflowInput,
+                                     aContainingBlockRects, aKidFrame,
+                                     aAnchorPosResolutionCache,
+                                     aReuseUnfragmentedAnchorPosReferences);
+    PhysicalAxes earlyScrollCompensation;
+    if (aAnchorPosResolutionCache) {
+      const auto& originalCb = cb.mMaybeScrollableRect;
+      aAnchorPosResolutionCache->mReferenceData->mOriginalContainingBlockRect =
+          originalCb;
+      aAnchorPosResolutionCache->mReferenceData->mAdjustedContainingBlock =
+          cb.mFinalRect;
+      earlyScrollCompensation = aAnchorPosResolutionCache->mReferenceData
+                                    ->CompensatingForScrollAxes();
+    }
+    const LogicalSize cbSize(outerWM, cb.mFinalRect.Size());
+
+    ReflowInput::InitFlags initFlags;
+    const bool staticPosIsCBOrigin = [&] {
+      if (aFlags.contains(AbsPosReflowFlag::IsGridContainerCB)) {
+        nsIFrame* placeholder = aKidFrame->GetPlaceholderFrame();
+        if (placeholder && placeholder->GetParent() == aDelegatingFrame) {
+          return true;
+        }
+      }
+      if (aKidFrame->IsMenuPopupFrame()) {
+        return true;
+      }
+      return false;
+    }();
+
+    if (staticPosIsCBOrigin) {
+      initFlags += ReflowInput::InitFlag::StaticPosIsCBOrigin;
+    }
+
+    const bool kidFrameMaySplit =
+        aReflowInput.AvailableBSize() != NS_UNCONSTRAINEDSIZE &&
+
+        aFlags.contains(AbsPosReflowFlag::AllowFragmentation) &&
+
+        (StaticPrefs::layout_abspos_fragment_aware_inline_cb_enabled() ||
+         !aDelegatingFrame->IsInlineFrameOrSubclass()) &&
+
+        !aKidFrame->IsColumnSetWrapperFrame();
+
+    const LogicalMargin border =
+        aDelegatingFrame->GetLogicalUsedBorder(outerWM).ApplySkipSides(
+            aDelegatingFrame->PreReflowBlockLevelLogicalSkipSides());
+
+    const nsIFrame* kidPrevInFlow = aKidFrame->GetPrevInFlow();
+    const LogicalPoint* const unfragmentedPosition =
+        GetUnfragmentedPosition(aReflowInput, aKidFrame);
+    nscoord availBSize;
+    if (kidFrameMaySplit) {
+      if (unfragmentedPosition) {
+        const nscoord kidBPosInThisFragment =
+            unfragmentedPosition->B(outerWM) - mCumulativeContainingBlockBSize;
+        availBSize = aReflowInput.AvailableBSize() - kidBPosInThisFragment;
+        NS_ASSERTION(availBSize >= 0, "Why is available block-size < 0?");
+      } else if (!aDelegatingFrame->GetPrevInFlow()) {
+        availBSize = aReflowInput.AvailableBSize() - border.BStart(outerWM);
+      } else {
+        // parent might have (including borders generated by
+        availBSize = aReflowInput.AvailableBSize();
+      }
+    } else {
+      availBSize = NS_UNCONSTRAINEDSIZE;
+    }
+    StyleSizeOverrides sizeOverrides;
+    Maybe<nscoord> unfragmentedBSizeAsMinBSize;
+    if (const auto* unfragmentedSize =
+            GetUnfragmentedSize(aReflowInput, aKidFrame)) {
+      auto resolutionParams =
+          AnchorPosResolutionParams::From(aKidFrame, aAnchorPosResolutionCache);
+      const auto* stylePos = aKidFrame->StylePosition();
+      if (stylePos->ISize(wm, resolutionParams)->IsAuto()) {
+        sizeOverrides.mStyleISize.emplace(
+            StyleSize::FromAppUnits(unfragmentedSize->ISize(wm)));
+      }
+      if (stylePos->BSize(wm, resolutionParams)->IsAuto()) {
+        unfragmentedBSizeAsMinBSize = Some(unfragmentedSize->BSize(wm));
+      }
+    }
+    const LogicalSize availSize(outerWM, cbSize.ISize(outerWM), availBSize);
+    ReflowInput kidReflowInput(aPresContext, aReflowInput, aKidFrame,
+                               availSize.ConvertTo(wm, outerWM),
+                               Some(cbSize.ConvertTo(wm, outerWM)), initFlags,
+                               sizeOverrides, {}, aAnchorPosResolutionCache);
+
+    if (unfragmentedBSizeAsMinBSize) {
+      const nscoord contentBSize =
+          *unfragmentedBSizeAsMinBSize -
+          (kidReflowInput.mStylePosition->mBoxSizing ==
+                   StyleBoxSizing::BorderBox
+               ? kidReflowInput.ComputedLogicalBorderPadding(wm).BStartEnd(wm)
+               : 0);
+      kidReflowInput.SetComputedMinBSize(contentBSize);
+    }
+
+    if (unfragmentedPosition) {
+    } else if (!kidPrevInFlow) {
+      nscoord kidAvailBSize = kidReflowInput.AvailableBSize();
+      if (kidAvailBSize != NS_UNCONSTRAINEDSIZE) {
+        kidAvailBSize -= kidReflowInput.ComputedLogicalMargin(wm).BStart(wm);
+        nscoord kidOffsetBStart =
+            kidReflowInput.ComputedLogicalOffsets(wm).BStart(wm);
+        if (kidOffsetBStart != NS_AUTOOFFSET) {
+          kidOffsetBStart -= mCumulativeContainingBlockBSize;
+          kidAvailBSize -= kidOffsetBStart;
+        }
+        kidReflowInput.SetAvailableBSize(kidAvailBSize);
+      }
+    }
+
+    ReflowOutput kidDesiredSize(kidReflowInput);
+    aKidFrame->Reflow(aPresContext, kidDesiredSize, kidReflowInput, aStatus);
+
+    nsMargin insets;
+    if (aKidFrame->IsMenuPopupFrame()) {
+    } else if (unfragmentedPosition || kidPrevInFlow) {
+      LogicalPoint kidPos(outerWM);
+      if (unfragmentedPosition) {
+        MOZ_ASSERT(!kidPrevInFlow, "aKidFrame should be a first-in-flow!");
+
+        kidPos = *unfragmentedPosition;
+        kidPos.B(outerWM) -= mCumulativeContainingBlockBSize;
+      } else {
+        const LogicalPoint* unfragPos =
+            GetUnfragmentedPosition(aReflowInput, aKidFrame->FirstInFlow());
+        MOZ_ASSERT(unfragPos,
+                   "A first-in-flow should have stored an unfragmented "
+                   "position during a measuring reflow!");
+        if (unfragPos) [[likely]] {
+          kidPos = *unfragPos;
+          kidPos.B(outerWM) = 0;
+        }
+      }
+      const LogicalSize kidSize = kidDesiredSize.Size(outerWM);
+      nsRect kidRect;
+      if (StaticPrefs::layout_abspos_fragment_aware_inline_cb_enabled() &&
+          aDelegatingFrame->IsInlineFrameOrSubclass()) {
+        nsIFrame* blockAncestor =
+            nsLayoutUtils::FindNearestBlockAncestor(aDelegatingFrame);
+
+        const nsSize blockAncestorSize =
+            aReflowInput.mContainingBlockSize.GetPhysicalSize(outerWM);
+        kidRect = LogicalRect(outerWM, kidPos, kidSize)
+                      .GetPhysicalRect(outerWM, blockAncestorSize) -
+                  aDelegatingFrame->GetOffsetTo(blockAncestor);
+      } else {
+        const auto maybeFragmentedCbSize =
+            (aFragmentedContainingBlockRects ? *aFragmentedContainingBlockRects
+                                             : aContainingBlockRects)
+                .mLocal.Size();
+        const LogicalSize unmodifiedCBSize(outerWM, maybeFragmentedCbSize);
+        const nsSize cbBorderBoxSize =
+            (unmodifiedCBSize + border.Size(outerWM)).GetPhysicalSize(outerWM);
+        kidRect = LogicalRect(outerWM, kidPos, kidSize)
+                      .GetPhysicalRect(outerWM, cbBorderBoxSize);
+      }
+      aKidFrame->SetRect(kidRect);
+    } else {
+      const LogicalSize kidSize = kidDesiredSize.Size(outerWM);
+
+      LogicalMargin offsets = kidReflowInput.ComputedLogicalOffsets(outerWM);
+      LogicalMargin margin = kidReflowInput.ComputedLogicalMargin(outerWM);
+
+      if (kidReflowInput.mFlags.mIOffsetsNeedCSSAlign) {
+        margin.IStart(outerWM) = margin.IEnd(outerWM) = 0;
+      }
+      if (kidReflowInput.mFlags.mBOffsetsNeedCSSAlign) {
+        margin.BStart(outerWM) = margin.BEnd(outerWM) = 0;
+      }
+
+      ResolveSizeDependentOffsets(kidReflowInput, cbSize, kidSize, margin,
+                                  cb.GetAnchorOffsetInfo(), offsets);
+
+      ResolveAutoMarginsAfterLayout(kidReflowInput, cbSize, kidSize, margin,
+                                    offsets);
+
+      const auto* stylePos = aKidFrame->StylePosition();
+      const auto anchorResolutionParams =
+          AnchorPosOffsetResolutionParams::ExplicitCBFrameSize(
+              AnchorPosResolutionParams::From(aKidFrame,
+                                              aAnchorPosResolutionCache),
+              &cbSize);
+      const bool iStartInsetAuto =
+          stylePos
+              ->GetAnchorResolvedInset(LogicalSide::IStart, outerWM,
+                                       anchorResolutionParams)
+              ->IsAuto();
+      const bool iEndInsetAuto =
+          stylePos
+              ->GetAnchorResolvedInset(LogicalSide::IEnd, outerWM,
+                                       anchorResolutionParams)
+              ->IsAuto();
+      const bool iInsetAuto = iStartInsetAuto || iEndInsetAuto;
+
+      const bool bStartInsetAuto =
+          stylePos
+              ->GetAnchorResolvedInset(LogicalSide::BStart, outerWM,
+                                       anchorResolutionParams)
+              ->IsAuto();
+      const bool bEndInsetAuto =
+          stylePos
+              ->GetAnchorResolvedInset(LogicalSide::BEnd, outerWM,
+                                       anchorResolutionParams)
+              ->IsAuto();
+      const bool bInsetAuto = bStartInsetAuto || bEndInsetAuto;
+      const LogicalSize kidMarginBox{
+          outerWM, margin.IStartEnd(outerWM) + kidSize.ISize(outerWM),
+          margin.BStartEnd(outerWM) + kidSize.BSize(outerWM)};
+      const auto* placeholderContainer =
+          GetPlaceholderContainer(kidReflowInput.mFrame);
+
+      insets = [&]() {
+        auto result = offsets;
+        if (iStartInsetAuto && !iEndInsetAuto) {
+          result.IStart(outerWM) = 0;
+        } else if (iInsetAuto) {
+          result.IEnd(outerWM) = 0;
+        }
+        if (bStartInsetAuto && !bEndInsetAuto) {
+          result.BStart(outerWM) = 0;
+        } else if (bInsetAuto) {
+          result.BEnd(outerWM) = 0;
+        }
+        return result.GetPhysicalMargin(outerWM);
+      }();
+      if (aAnchorPosResolutionCache) {
+        aAnchorPosResolutionCache->mReferenceData->mInsets = insets;
+      }
+      if (!iInsetAuto) {
+        MOZ_ASSERT(
+            !kidReflowInput.mFlags.mIOffsetsNeedCSSAlign,
+            "Non-auto inline inset but requires CSS alignment for static "
+            "position?");
+        auto alignOffset = OffsetToAlignedStaticPos(
+            kidReflowInput, kidMarginBox, cbSize, placeholderContainer, outerWM,
+            LogicalAxis::Inline,
+            Some(NonAutoAlignParams{
+                offsets.IStart(outerWM),
+                offsets.IEnd(outerWM),
+            }),
+            cb.GetAnchorOffsetInfo());
+
+        offsets.IStart(outerWM) += alignOffset;
+        offsets.IEnd(outerWM) =
+            cbSize.ISize(outerWM) -
+            (offsets.IStart(outerWM) + kidMarginBox.ISize(outerWM));
+      }
+      if (!bInsetAuto) {
+        MOZ_ASSERT(!kidReflowInput.mFlags.mBOffsetsNeedCSSAlign,
+                   "Non-auto block inset but requires CSS alignment for static "
+                   "position?");
+        auto alignOffset = OffsetToAlignedStaticPos(
+            kidReflowInput, kidMarginBox, cbSize, placeholderContainer, outerWM,
+            LogicalAxis::Block,
+            Some(NonAutoAlignParams{
+                offsets.BStart(outerWM),
+                offsets.BEnd(outerWM),
+            }),
+            cb.GetAnchorOffsetInfo());
+        offsets.BStart(outerWM) += alignOffset;
+        offsets.BEnd(outerWM) =
+            cbSize.BSize(outerWM) -
+            (offsets.BStart(outerWM) + kidMarginBox.BSize(outerWM));
+      }
+
+      LogicalRect rect(
+          outerWM, offsets.StartOffset(outerWM) + margin.StartOffset(outerWM),
+          kidSize);
+      nsRect r = rect.GetPhysicalRect(outerWM, cbSize.GetPhysicalSize(outerWM));
+
+      r += cb.mFinalRect.TopLeft();
+
+      const auto scrollShift = [&]() -> nsPoint {
+        if (!aAnchorPosResolutionCache) {
+          return {};
+        }
+        auto* referenceData = aAnchorPosResolutionCache->mReferenceData;
+        if (referenceData->CompensatingForScrollAxes().isEmpty()) {
+          return {};
+        }
+        if (cb.mAnchorOffsetInfo &&
+            earlyScrollCompensation ==
+                referenceData->CompensatingForScrollAxes()) {
+          return cb.mAnchorOffsetInfo->mScrollOffset;
+        }
+        return AnchorPositioningUtils::GetScrollOffsetFor(
+            referenceData->CompensatingForScrollAxes(), aKidFrame,
+            aAnchorPosResolutionCache->mDefaultAnchorCache);
+      }();
+      if (aAnchorPosResolutionCache) {
+        aAnchorPosResolutionCache->mReferenceData->mDefaultScrollShift =
+            scrollShift;
+      }
+      r -= scrollShift;
+      aKidFrame->SetRect(r);
+    }
+
+    aKidFrame->DidReflow(aPresContext, &kidReflowInput);
+
+    if (!firstTryRect) {
+      firstTryRect.emplace(aKidFrame->GetRect());
+    }
+
+    const auto FitsInContainingBlock = [&]() {
+      if (aAnchorPosResolutionCache) {
+        return AnchorPositioningUtils::FitsInContainingBlock(
+            aKidFrame, *aAnchorPosResolutionCache->mReferenceData);
+      }
+      auto imcbSize = cb.mFinalRect.Size();
+      imcbSize -= nsSize{insets.LeftRight(), insets.TopBottom()};
+      return aKidFrame->GetMarginRectRelativeToSelf().Size() <= imcbSize;
+    };
+
+    const auto fits = aStatus.IsComplete() && FitsInContainingBlock();
+    if (fallbacks.IsEmpty() || finalizing ||
+        (fits && (tryOrder == StylePositionTryOrder::Normal ||
+                  currentFallbackIndex == firstTryIndex))) {
+      isOverflowingCB = !fits;
+      fallback.CommitCurrentFallback();
+      if (currentFallbackIndex.isNothing()) {
+        if (auto* prop = aKidFrame->GetProperty(
+                nsIFrame::LastSuccessfulPositionFallback())) {
+          MOZ_ASSERT(!fallbacks.IsEmpty(), "how?");
+          prop->mLastIndex.reset();
+          prop->mLastStyle = nullptr;
+          prop->mTriedAllFallbacks = isOverflowingCB;
+        }
+      }
+      break;
+    }
+
+    if (fits) {
+      auto imcbSize = cb.mFinalRect.Size();
+      imcbSize -= nsSize{insets.LeftRight(), insets.TopBottom()};
+      switch (tryOrder) {
+        case StylePositionTryOrder::MostWidth:
+          if (imcbSize.Width() > bestSize) {
+            bestSize = imcbSize.Width();
+            bestIndex = currentFallbackIndex;
+          }
+          break;
+        case StylePositionTryOrder::MostHeight:
+          if (imcbSize.Height() > bestSize) {
+            bestSize = imcbSize.Height();
+            bestIndex = currentFallbackIndex;
+          }
+          break;
+        default:
+          MOZ_ASSERT_UNREACHABLE("unexpected try-order value");
+          break;
+      }
+    }
+
+    if (!TryAdvanceFallback()) {
+      if (bestSize >= 0) {
+        SeekFallbackTo(bestIndex);
+      } else {
+        if (isOverflowingCB && firstTryRect &&
+            firstTryRect->Size() != aKidFrame->GetSize()) {
+          SeekFallbackTo(firstTryIndex);
+        } else {
+          break;
+        }
+      }
+      finalizing = true;
+    }
+
+    aKidFrame->AddStateBits(NS_FRAME_IS_DIRTY);
+    aStatus.Reset();
+  } while (true);
+
+  [&]() {
+    if (!isOverflowingCB || !firstTryRect) {
+      return;
+    }
+    currentFallbackIndex = firstTryIndex;
+    currentFallbackStyle = firstTryStyle;
+    auto rect = *firstTryRect;
+    if (isOverflowingCB &&
+        !aKidFrame->StylePosition()->mPositionArea.IsNone()) {
+      if (rect.width <= aContainingBlockRects.mLocal.width &&
+          rect.height <= aContainingBlockRects.mLocal.height) {
+        if (rect.x < aContainingBlockRects.mLocal.x) {
+          rect.x = aContainingBlockRects.mLocal.x;
+        } else if (rect.XMost() > aContainingBlockRects.mLocal.XMost()) {
+          rect.x = aContainingBlockRects.mLocal.XMost() - rect.width;
+        }
+        if (rect.y < aContainingBlockRects.mLocal.y) {
+          rect.y = aContainingBlockRects.mLocal.y;
+        } else if (rect.YMost() > aContainingBlockRects.mLocal.YMost()) {
+          rect.y = aContainingBlockRects.mLocal.YMost() - rect.height;
+        }
+      }
+    }
+    if (rect.TopLeft() == aKidFrame->GetPosition()) {
+      return;
+    }
+    aKidFrame->SetPosition(rect.TopLeft());
+    if (aKidFrame->FrameMaintainsOverflow()) {
+      aKidFrame->UpdateOverflow();
+    }
+  }();
+
+  if (currentFallbackIndex) {
+    auto* lastSuccessfulPosition = aKidFrame->GetOrCreateDeletableProperty(
+        nsIFrame::LastSuccessfulPositionFallback());
+    lastSuccessfulPosition->mLastIndex = currentFallbackIndex;
+    lastSuccessfulPosition->mLastStyle = std::move(currentFallbackStyle);
+    lastSuccessfulPosition->mTriedAllFallbacks = isOverflowingCB;
+  }
+
+#ifdef DEBUG
+  if (nsBlockFrame::gNoisyReflow) {
+    nsIFrame::IndentBy(stdout, nsBlockFrame::gNoiseIndent - 1);
+    fmt::println("abspos {}: rect {}", aKidFrame->ListTag().get(),
+                 ToString(aKidFrame->GetRect()));
+  }
+#endif
+  if (!aAnchorPosResolutionCache) {
+    aKidFrame->AddOrRemoveStateBits(
+        NS_FRAME_POSITION_VISIBILITY_HIDDEN,
+        isOverflowingCB && aKidFrame->StylePosition()->mPositionVisibility &
+                               StylePositionVisibility::NO_OVERFLOW);
+  }
+
+  if (aOverflowAreas) {
+    aDelegatingFrame->ConsiderChildOverflow(
+        *aOverflowAreas, aKidFrame, OverflowAreaUnionFlags::ChildIsAbsPos);
+  }
+}

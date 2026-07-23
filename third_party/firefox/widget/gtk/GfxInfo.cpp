@@ -1,0 +1,1632 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "GfxInfo.h"
+
+#include <errno.h>
+#include <unistd.h>
+#include <string>
+#include <poll.h>
+#include <sys/types.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
+#include <glib.h>
+#include <fcntl.h>
+
+#include "mozilla/gfx/Logging.h"
+#include "mozilla/SSE.h"
+#include "mozilla/XREAppData.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/GUniquePtr.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "nsCRTGlue.h"
+#include "nsPrintfCString.h"
+#include "nsString.h"
+#include "nsStringFwd.h"
+#include "nsUnicharUtils.h"
+#include "nsCharSeparatedTokenizer.h"
+#include "nsWhitespaceTokenizer.h"
+#include "prenv.h"
+#include "WidgetUtilsGtk.h"
+#include "MediaCodecsSupport.h"
+#include "nsAppRunner.h"
+#include <gbm.h>
+
+#ifndef GBM_FORMAT_P010
+#  define GBM_FORMAT_P010 __gbm_fourcc_code('P', '0', '1', '0')
+#endif
+
+#define GFX_TEST_TIMEOUT 4000
+#define VAAPI_TEST_TIMEOUT 2000
+#define V4L2_TEST_TIMEOUT 2000
+#define VULKAN_TEST_TIMEOUT 2000
+
+#define GLX_PROBE_BINARY u"glxtest"_ns
+#define VAAPI_PROBE_BINARY u"vaapitest"_ns
+#define V4L2_PROBE_BINARY u"v4l2test"_ns
+#define VULKAN_PROBE_BINARY u"vulkantest"_ns
+
+namespace mozilla::widget {
+
+#ifdef DEBUG
+NS_IMPL_ISUPPORTS_INHERITED(GfxInfo, GfxInfoBase, nsIGfxInfoDebug)
+#endif
+
+int GfxInfo::sGLXTestPipe = -1;
+pid_t GfxInfo::sGLXTestPID = 0;
+
+constexpr int CODEC_HW_DEC_H264 = 1 << 4;
+constexpr int CODEC_HW_ENC_H264 = 1 << 5;
+constexpr int CODEC_HW_DEC_VP8 = 1 << 6;
+constexpr int CODEC_HW_ENC_VP8 = 1 << 7;
+constexpr int CODEC_HW_DEC_VP9 = 1 << 8;
+constexpr int CODEC_HW_ENC_VP9 = 1 << 9;
+constexpr int CODEC_HW_DEC_AV1 = 1 << 10;
+constexpr int CODEC_HW_ENC_AV1 = 1 << 11;
+constexpr int CODEC_HW_DEC_HEVC = 1 << 12;
+constexpr int CODEC_HW_ENC_HEVC = 1 << 13;
+
+nsresult GfxInfo::Init() {
+  mGLMajorVersion = 0;
+  mGLMinorVersion = 0;
+  mHasTextureFromPixmap = false;
+  mIsMesa = false;
+  mIsAccelerated = true;
+  mIsWayland = false;
+  mIsXWayland = false;
+  mHasMultipleGPUs = false;
+  mGlxTestError = false;
+  return GfxInfoBase::Init();
+}
+
+const nsTArray<uint64_t>& GfxInfo::GetDMABufEGLModifiers(
+    uint32_t aDrmFourcc) const {
+  switch (aDrmFourcc) {
+    case GBM_FORMAT_XRGB8888:
+      return mDMABufEGLModifiersXRGB;
+    case GBM_FORMAT_ARGB8888:
+      return mDMABufEGLModifiersARGB;
+    case GBM_FORMAT_NV12:
+      return mDMABufEGLModifiersNV12;
+    case GBM_FORMAT_P010:
+      return mDMABufEGLModifiersP010;
+    case GBM_FORMAT_YUV420:
+      return mDMABufEGLModifiersYUV420;
+    default: {
+      NS_WARNING("GfxInfo::GetDMABufEGLModifiers(): unsupported format!");
+      static const nsTArray<uint64_t> empty;
+      return empty;
+    }
+  }
+}
+
+static bool MakeFdNonBlocking(int fd) {
+  return fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) != -1;
+}
+
+static bool ManageChildProcess(const char* aProcessName, int* aPID, int* aPipe,
+                               int aTimeout, char** aData) {
+  if (*aPID < 0) {
+    return false;
+  }
+
+  GIOChannel* channel = nullptr;
+  *aData = nullptr;
+
+  auto free = mozilla::MakeScopeExit([&] {
+    if (channel) {
+      g_io_channel_unref(channel);
+    }
+    if (*aPipe >= 0) {
+      close(*aPipe);
+      *aPipe = -1;
+    }
+  });
+
+  const TimeStamp deadline =
+      TimeStamp::Now() + TimeDuration::FromMilliseconds(aTimeout);
+
+  struct pollfd pfd{};
+  pfd.fd = *aPipe;
+  pfd.events = POLLIN;
+
+  while (poll(&pfd, 1, aTimeout) != 1) {
+    if (errno != EAGAIN && errno != EINTR) {
+      gfxCriticalNote << "ManageChildProcess(" << aProcessName
+                      << "): poll failed: " << strerror(errno) << "\n";
+      return false;
+    }
+    if (TimeStamp::Now() > deadline) {
+      gfxCriticalNote << "ManageChildProcess(" << aProcessName
+                      << "): process hangs\n";
+      return false;
+    }
+  }
+
+  channel = g_io_channel_unix_new(*aPipe);
+  MakeFdNonBlocking(*aPipe);
+
+  GUniquePtr<GError> error;
+  gsize length = 0;
+  int ret;
+  do {
+    error = nullptr;
+    ret = g_io_channel_read_to_end(channel, aData, &length,
+                                   getter_Transfers(error));
+  } while (ret == G_IO_STATUS_AGAIN && TimeStamp::Now() < deadline);
+  if (error || ret != G_IO_STATUS_NORMAL) {
+    gfxCriticalNote << "ManageChildProcess(" << aProcessName
+                    << "): failed to read data from child process: ";
+    if (error) {
+      gfxCriticalNote << error->message;
+    } else {
+      gfxCriticalNote << "timeout";
+    }
+    return false;
+  }
+
+  int status = 0;
+  int pid = *aPID;
+  *aPID = -1;
+
+  while (true) {
+    int ret = waitpid(pid, &status, WNOHANG);
+    if (ret > 0) {
+      break;
+    }
+    if (ret < 0) {
+      if (errno == ECHILD) {
+        return true;
+      }
+      if (errno != EAGAIN && errno != EINTR) {
+        gfxCriticalNote << "ManageChildProcess(" << aProcessName
+                        << "): waitpid failed: " << strerror(errno) << "\n";
+        return false;
+      }
+    }
+    if (TimeStamp::Now() > deadline) {
+      gfxCriticalNote << "ManageChildProcess(" << aProcessName
+                      << "): process hangs\n";
+      return false;
+    }
+    usleep(50000);
+  }
+
+  return WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS;
+}
+
+void GfxInfo::GetData() {
+  if (mInitialized) {
+    return;
+  }
+  mInitialized = true;
+
+  GfxInfo::FireGLXTestProcess();
+
+  GfxInfoBase::GetData();
+
+  char* glxData = nullptr;
+  auto free = mozilla::MakeScopeExit([&] { g_free((void*)glxData); });
+
+  bool error = !ManageChildProcess("glxtest", &sGLXTestPID, &sGLXTestPipe,
+                                   GFX_TEST_TIMEOUT, &glxData);
+  if (error) {
+    gfxWarning()
+        << "Failed to get GPU info from glxtest. Fallback to SW rendering! Run "
+           "with MOZ_GFX_DEBUG=1 env variable to get further info.\n";
+  }
+
+  nsCString glVendor;
+  nsCString glRenderer;
+  nsCString glVersion;
+  nsCString textureFromPixmap;
+  nsCString testType;
+
+  nsCString mesaVendor;
+  nsCString mesaDevice;
+  nsCString mesaAccelerated;
+  nsCString driDriver;
+  nsCString adapterRam;
+
+  nsCString drmRenderDevice;
+
+  nsCString ddxDriver;
+
+  AutoTArray<nsCString, 2> pciVendors;
+  AutoTArray<nsCString, 2> pciDevices;
+
+  nsCString dmabufModifiersXRGB;
+  nsCString dmabufModifiersARGB;
+  nsCString dmabufModifiersNV12;
+  nsCString dmabufModifiersP010;
+  nsCString dmabufModifiersYUV420;
+
+  nsCString* stringToFill = nullptr;
+  bool logString = false;
+  bool errorLog = false;
+
+  char* bufptr = glxData;
+
+  while (true) {
+    char* line = NS_strtok("\n", &bufptr);
+    if (!line) break;
+    if (stringToFill) {
+      stringToFill->Assign(line);
+      stringToFill = nullptr;
+    } else if (logString) {
+      gfxWarning() << "glxtest: " << line;
+      logString = false;
+    } else if (!strcmp(line, "VENDOR")) {
+      stringToFill = &glVendor;
+    } else if (!strcmp(line, "RENDERER")) {
+      stringToFill = &glRenderer;
+    } else if (!strcmp(line, "VERSION")) {
+      stringToFill = &glVersion;
+    } else if (!strcmp(line, "TFP")) {
+      stringToFill = &textureFromPixmap;
+    } else if (!strcmp(line, "MESA_VENDOR_ID")) {
+      stringToFill = &mesaVendor;
+    } else if (!strcmp(line, "MESA_DEVICE_ID")) {
+      stringToFill = &mesaDevice;
+    } else if (!strcmp(line, "MESA_ACCELERATED")) {
+      stringToFill = &mesaAccelerated;
+    } else if (!strcmp(line, "MESA_VRAM")) {
+      stringToFill = &adapterRam;
+    } else if (!strcmp(line, "DDX_DRIVER")) {
+      stringToFill = &ddxDriver;
+    } else if (!strcmp(line, "DRI_DRIVER")) {
+      stringToFill = &driDriver;
+    } else if (!strcmp(line, "PCI_VENDOR_ID")) {
+      stringToFill = pciVendors.AppendElement();
+    } else if (!strcmp(line, "PCI_DEVICE_ID")) {
+      stringToFill = pciDevices.AppendElement();
+    } else if (!strcmp(line, "DRM_RENDERDEVICE")) {
+      stringToFill = &drmRenderDevice;
+    } else if (!strcmp(line, "TEST_TYPE")) {
+      stringToFill = &testType;
+    } else if (!strcmp(line, "DMABUF_MODIFIERS_XRGB")) {
+      stringToFill = &dmabufModifiersXRGB;
+    } else if (!strcmp(line, "DMABUF_MODIFIERS_ARGB")) {
+      stringToFill = &dmabufModifiersARGB;
+    } else if (!strcmp(line, "DMABUF_MODIFIERS_NV12")) {
+      stringToFill = &dmabufModifiersNV12;
+    } else if (!strcmp(line, "DMABUF_MODIFIERS_P010")) {
+      stringToFill = &dmabufModifiersP010;
+    } else if (!strcmp(line, "DMABUF_MODIFIERS_YUV420")) {
+      stringToFill = &dmabufModifiersYUV420;
+    } else if (!strcmp(line, "WARNING")) {
+      logString = true;
+    } else if (!strcmp(line, "ERROR")) {
+      logString = true;
+      errorLog = true;
+    }
+  }
+
+  auto parseModifiers = [](const nsCString& aStr, nsTArray<uint64_t>& aOut) {
+    if (aStr.IsEmpty()) {
+      return;
+    }
+    nsCCharSeparatedTokenizer tokenizer(aStr, ',');
+    while (tokenizer.hasMoreTokens()) {
+      const auto& token = tokenizer.nextToken();
+      nsresult rv;
+      uint64_t val = token.ToUnsignedInteger64(&rv, 16);
+      if (NS_SUCCEEDED(rv)) {
+        aOut.AppendElement(val);
+      }
+    }
+  };
+  parseModifiers(dmabufModifiersXRGB, mDMABufEGLModifiersXRGB);
+  parseModifiers(dmabufModifiersARGB, mDMABufEGLModifiersARGB);
+  parseModifiers(dmabufModifiersNV12, mDMABufEGLModifiersNV12);
+  parseModifiers(dmabufModifiersP010, mDMABufEGLModifiersP010);
+  parseModifiers(dmabufModifiersYUV420, mDMABufEGLModifiersYUV420);
+
+  MOZ_ASSERT(pciDevices.Length() == pciVendors.Length(),
+             "Missing PCI vendors/devices");
+
+  size_t pciLen = std::min(pciVendors.Length(), pciDevices.Length());
+  mHasMultipleGPUs = pciLen > 1;
+
+  if (!strcmp(textureFromPixmap.get(), "TRUE")) mHasTextureFromPixmap = true;
+
+  struct utsname unameobj{};
+  if (uname(&unameobj) >= 0) {
+    mOS.Assign(unameobj.sysname);
+    mOSRelease.Assign(unameobj.release);
+  }
+
+  const char* spoofedVendor = PR_GetEnv("MOZ_GFX_SPOOF_GL_VENDOR");
+  if (spoofedVendor) glVendor.Assign(spoofedVendor);
+  const char* spoofedRenderer = PR_GetEnv("MOZ_GFX_SPOOF_GL_RENDERER");
+  if (spoofedRenderer) glRenderer.Assign(spoofedRenderer);
+  const char* spoofedVersion = PR_GetEnv("MOZ_GFX_SPOOF_GL_VERSION");
+  if (spoofedVersion) glVersion.Assign(spoofedVersion);
+  const char* spoofedOS = PR_GetEnv("MOZ_GFX_SPOOF_OS");
+  if (spoofedOS) mOS.Assign(spoofedOS);
+  const char* spoofedOSRelease = PR_GetEnv("MOZ_GFX_SPOOF_OS_RELEASE");
+  if (spoofedOSRelease) mOSRelease.Assign(spoofedOSRelease);
+
+  nsCWhitespaceTokenizer tokenizer(glVersion);
+  while (tokenizer.hasMoreTokens()) {
+    nsCString token(tokenizer.nextToken());
+    unsigned int major = 0, minor = 0, revision = 0, patch = 0;
+    if (sscanf(token.get(), "%u.%u.%u.%u", &major, &minor, &revision, &patch) >=
+        2) {
+      if (mGLMajorVersion == 0) {
+        mGLMajorVersion = major;
+        mGLMinorVersion = minor;
+      } else if (mDriverVersion.IsEmpty()) {  
+        mDriverVersion =
+            nsPrintfCString("%u.%u.%u.%u", major, minor, revision, patch);
+      }
+    }
+  }
+
+  if (mGLMajorVersion == 0) {
+    NS_WARNING("Failed to parse GL version!");
+  }
+
+  mDrmRenderDevice = std::move(drmRenderDevice);
+  mTestType = std::move(testType);
+
+  mIsMesa = glVersion.Find("Mesa") != -1;
+
+  if (mIsMesa) {
+    mIsAccelerated = !mesaAccelerated.Equals("FALSE");
+    if (strcasestr(glRenderer.get(), "llvmpipe")) {
+      CopyUTF16toUTF8(
+          GfxDriverInfo::GetDriverVendor(DriverVendor::MesaLLVMPipe),
+          mDriverVendor);
+      mIsAccelerated = false;
+    } else if (strcasestr(glRenderer.get(), "softpipe")) {
+      CopyUTF16toUTF8(
+          GfxDriverInfo::GetDriverVendor(DriverVendor::MesaSoftPipe),
+          mDriverVendor);
+      mIsAccelerated = false;
+    } else if (strcasestr(glRenderer.get(), "software rasterizer")) {
+      CopyUTF16toUTF8(GfxDriverInfo::GetDriverVendor(DriverVendor::MesaSWRast),
+                      mDriverVendor);
+      mIsAccelerated = false;
+    } else if (strcasestr(driDriver.get(), "vmwgfx")) {
+      CopyUTF16toUTF8(GfxDriverInfo::GetDriverVendor(DriverVendor::MesaVM),
+                      mDriverVendor);
+      mIsAccelerated = false;
+    } else if (!mIsAccelerated) {
+      CopyUTF16toUTF8(
+          GfxDriverInfo::GetDriverVendor(DriverVendor::MesaSWUnknown),
+          mDriverVendor);
+    } else if (!driDriver.IsEmpty()) {
+      mDriverVendor = nsPrintfCString("mesa/%s", driDriver.get());
+    } else {
+      NS_WARNING("Failed to detect Mesa driver being used!");
+      CopyUTF16toUTF8(GfxDriverInfo::GetDriverVendor(DriverVendor::MesaUnknown),
+                      mDriverVendor);
+    }
+
+    if (!mesaVendor.IsEmpty()) {
+      mVendorId = mesaVendor;
+    }
+
+    if (!mesaDevice.IsEmpty()) {
+      mDeviceId = mesaDevice;
+    }
+
+    if (!mIsAccelerated && mVendorId.IsEmpty()) {
+      mVendorId.Assign(glVendor.get());
+    }
+
+    if (!mIsAccelerated && mDeviceId.IsEmpty()) {
+      mDeviceId.Assign(glRenderer.get());
+    }
+  } else if (glVendor.EqualsLiteral("NVIDIA Corporation")) {
+    CopyUTF16toUTF8(GfxDriverInfo::GetDeviceVendor(DeviceVendor::NVIDIA),
+                    mVendorId);
+    mDriverVendor.AssignLiteral("nvidia/unknown");
+  } else if (glVendor.EqualsLiteral("ATI Technologies Inc.")) {
+    CopyUTF16toUTF8(GfxDriverInfo::GetDeviceVendor(DeviceVendor::ATI),
+                    mVendorId);
+    mDriverVendor.AssignLiteral("ati/unknown");
+  } else {
+    NS_WARNING("Failed to detect GL vendor!");
+  }
+
+  if (!adapterRam.IsEmpty()) {
+    mAdapterRAM = (uint32_t)atoi(adapterRam.get());
+  }
+
+  if (mVendorId.IsEmpty() && !driDriver.IsEmpty()) {
+    const char* nvidiaDrivers[] = {"nouveau", "tegra", nullptr};
+    for (size_t i = 0; nvidiaDrivers[i]; ++i) {
+      if (driDriver.Equals(nvidiaDrivers[i])) {
+        CopyUTF16toUTF8(GfxDriverInfo::GetDeviceVendor(DeviceVendor::NVIDIA),
+                        mVendorId);
+        break;
+      }
+    }
+
+    if (mVendorId.IsEmpty()) {
+      const char* intelDrivers[] = {"iris", "crocus", "i915", "i965",
+                                    "i810", "intel",  nullptr};
+      for (size_t i = 0; intelDrivers[i]; ++i) {
+        if (driDriver.Equals(intelDrivers[i])) {
+          CopyUTF16toUTF8(GfxDriverInfo::GetDeviceVendor(DeviceVendor::Intel),
+                          mVendorId);
+          break;
+        }
+      }
+    }
+
+    if (mVendorId.IsEmpty()) {
+      const char* amdDrivers[] = {"r600",   "r200",     "r100",
+                                  "radeon", "radeonsi", nullptr};
+      for (size_t i = 0; amdDrivers[i]; ++i) {
+        if (driDriver.Equals(amdDrivers[i])) {
+          CopyUTF16toUTF8(GfxDriverInfo::GetDeviceVendor(DeviceVendor::ATI),
+                          mVendorId);
+          break;
+        }
+      }
+    }
+
+    if (mVendorId.IsEmpty()) {
+      if (driDriver.EqualsLiteral("freedreno")) {
+        CopyUTF16toUTF8(GfxDriverInfo::GetDeviceVendor(DeviceVendor::Qualcomm),
+                        mVendorId);
+      }
+    }
+  }
+
+  if (mVendorId.IsEmpty()) {
+    if (pciVendors.IsEmpty()) {
+      gfxWarning() << "No GPUs detected via PCI\n";
+    } else {
+      for (size_t i = 0; i < pciVendors.Length(); ++i) {
+        if (mVendorId.IsEmpty()) {
+          mVendorId = pciVendors[i];
+        } else if (mVendorId != pciVendors[i]) {
+          gfxWarning() << "More than 1 GPU vendor detected via PCI, cannot "
+                          "deduce vendor\n";
+          mVendorId.Truncate();
+          break;
+        }
+      }
+    }
+  }
+
+  if (mDeviceId.IsEmpty() && !mVendorId.IsEmpty()) {
+    for (size_t i = 0; i < pciLen; ++i) {
+      if (mVendorId.Equals(pciVendors[i])) {
+        if (mDeviceId.IsEmpty()) {
+          mDeviceId = pciDevices[i];
+        } else if (mDeviceId != pciDevices[i]) {
+          gfxWarning() << "More than 1 GPU from same vendor detected via "
+                          "PCI, cannot deduce device\n";
+          mDeviceId.Truncate();
+          break;
+        }
+      }
+    }
+  }
+
+  if (!mVendorId.IsEmpty()) {
+    if (pciLen > 2) {
+      gfxWarning()
+          << "More than 2 GPUs detected via PCI, secondary GPU is arbitrary\n";
+    }
+    for (size_t i = 0; i < pciLen; ++i) {
+      if (!mVendorId.Equals(pciVendors[i]) ||
+          (!mDeviceId.IsEmpty() && !mDeviceId.Equals(pciDevices[i]))) {
+        mSecondaryVendorId = pciVendors[i];
+        mSecondaryDeviceId = pciDevices[i];
+        break;
+      }
+    }
+  }
+
+  if (mVendorId.IsEmpty()) {
+    for (size_t i = 0; i < pciLen; ++i) {
+      gfxWarning() << "PCI candidate " << pciVendors[i].get() << "/"
+                   << pciDevices[i].get() << "\n";
+    }
+  }
+
+  if (mVendorId.IsEmpty()) {
+    mVendorId.Assign(glVendor.get());
+  }
+  if (mDeviceId.IsEmpty()) {
+    mDeviceId.Assign(glRenderer.get());
+  }
+
+  mAdapterDescription.Assign(glRenderer);
+
+  mIsWayland = GdkIsWaylandDisplay();
+  mIsXWayland = IsXWaylandProtocol();
+
+  if (!ddxDriver.IsEmpty()) {
+    PRInt32 start = 0;
+    PRInt32 loc = ddxDriver.Find(";", start);
+    while (loc != kNotFound) {
+      nsCString line(ddxDriver.get() + start, loc - start);
+      mDdxDrivers.AppendElement(std::move(line));
+
+      start = loc + 1;
+      loc = ddxDriver.Find(";", start);
+    }
+  }
+
+  if (error || errorLog || mTestType.IsEmpty()) {
+    if (!mAdapterDescription.IsEmpty()) {
+      mAdapterDescription.AppendLiteral(" (See failure log)");
+    } else {
+      mAdapterDescription.AppendLiteral("See failure log");
+    }
+
+    mGlxTestError = true;
+  }
+
+}
+
+int GfxInfo::FireTestProcess(const nsAString& aBinaryFile, int* aOutPipe,
+                             const char** aStringArgs) {
+  nsCOMPtr<nsIFile> appFile;
+  nsresult rv = XRE_GetBinaryPath(getter_AddRefs(appFile));
+  if (NS_FAILED(rv)) {
+    gfxCriticalNote << "Couldn't find application file.\n";
+    return false;
+  }
+  nsCOMPtr<nsIFile> exePath;
+  rv = appFile->GetParent(getter_AddRefs(exePath));
+  if (NS_FAILED(rv)) {
+    gfxCriticalNote << "Couldn't get application directory.\n";
+    return false;
+  }
+  exePath->Append(aBinaryFile);
+
+#define MAX_ARGS 8
+  char* argv[MAX_ARGS + 2];
+
+  argv[0] = strdup(exePath->NativePath().get());
+  for (int i = 0; i < MAX_ARGS; i++) {
+    if (aStringArgs[i]) {
+      argv[i + 1] = strdup(aStringArgs[i]);
+    } else {
+      argv[i + 1] = nullptr;
+      break;
+    }
+  }
+
+  int pid;
+  GUniquePtr<GError> err;
+  g_spawn_async_with_pipes(
+      nullptr, argv, nullptr,
+      GSpawnFlags(G_SPAWN_LEAVE_DESCRIPTORS_OPEN | G_SPAWN_DO_NOT_REAP_CHILD),
+      nullptr, nullptr, &pid, nullptr, aOutPipe, nullptr,
+      getter_Transfers(err));
+  if (err) {
+    gfxCriticalNote << "FireTestProcess failed: " << err->message << "\n";
+    pid = 0;
+  }
+  for (auto& arg : argv) {
+    if (!arg) {
+      break;
+    }
+    free(arg);
+  }
+  return pid;
+}
+
+bool GfxInfo::FireGLXTestProcess() {
+  if (sGLXTestPID != 0) {
+    return true;
+  }
+
+  int pfd[2];
+  if (pipe(pfd) == -1) {
+    gfxCriticalNote << "FireGLXTestProcess failed to create pipe\n";
+    return false;
+  }
+  sGLXTestPipe = pfd[0];
+
+  auto pipeID = std::to_string(pfd[1]);
+  const char* args[] = {"-f", pipeID.c_str(),
+                        IsWaylandEnabled() ? "-w" : nullptr, nullptr};
+  sGLXTestPID = FireTestProcess(GLX_PROBE_BINARY, nullptr, args);
+  if (!sGLXTestPID) {
+    sGLXTestPID = -1;
+  }
+  close(pfd[1]);
+  return true;
+}
+
+void GfxInfo::GetDataVAAPI() {
+  if (mIsVAAPISupported.isSome()) {
+    return;
+  }
+  mIsVAAPISupported = Some(false);
+
+#ifdef MOZ_ENABLE_VAAPI
+  char* vaapiData = nullptr;
+  auto free = mozilla::MakeScopeExit([&] { g_free((void*)vaapiData); });
+
+  int vaapiPipe = -1;
+  int vaapiPID = 0;
+  const char* args[] = {"-d", mDrmRenderDevice.get(), nullptr};
+  vaapiPID = FireTestProcess(VAAPI_PROBE_BINARY, &vaapiPipe, args);
+  if (!vaapiPID) {
+    return;
+  }
+
+  if (!ManageChildProcess("vaapitest", &vaapiPID, &vaapiPipe,
+                          VAAPI_TEST_TIMEOUT, &vaapiData)) {
+    gfxCriticalNote << "vaapitest: ManageChildProcess failed\n";
+    return;
+  }
+
+  char* bufptr = vaapiData;
+  char* line;
+  while ((line = NS_strtok("\n", &bufptr))) {
+    if (!strcmp(line, "VAAPI_SUPPORTED")) {
+      line = NS_strtok("\n", &bufptr);
+      if (!line) {
+        gfxCriticalNote << "vaapitest: Failed to get VAAPI support\n";
+        return;
+      }
+      mIsVAAPISupported = Some(!strcmp(line, "TRUE"));
+    } else if (!strcmp(line, "VAAPI_HWCODECS")) {
+      line = NS_strtok("\n", &bufptr);
+      if (!line) {
+        gfxCriticalNote << "vaapitest: Failed to get VAAPI codecs\n";
+        return;
+      }
+
+      std::istringstream(line) >> mVAAPISupportedCodecs;
+
+#  define VAAPI_CODEC_CHECK(name)                           \
+    if (mVAAPISupportedCodecs & CODEC_HW_DEC_##name) {      \
+      media::MCSInfo::AddSupport(                           \
+          media::MediaCodecsSupport::name##HardwareDecode); \
+    }                                                       \
+    if (mVAAPISupportedCodecs & CODEC_HW_ENC_##name) {      \
+      media::MCSInfo::AddSupport(                           \
+          media::MediaCodecsSupport::name##HardwareEncode); \
+    }
+      VAAPI_CODEC_CHECK(H264)
+      VAAPI_CODEC_CHECK(VP8)
+      VAAPI_CODEC_CHECK(VP9)
+      VAAPI_CODEC_CHECK(AV1)
+      VAAPI_CODEC_CHECK(HEVC)
+#  undef VAAPI_CODEC_CHECK
+    } else if (!strcmp(line, "WARNING") || !strcmp(line, "ERROR")) {
+      gfxCriticalNote << "vaapitest: " << line;
+      line = NS_strtok("\n", &bufptr);
+      if (line) {
+        gfxCriticalNote << "vaapitest: " << line << "\n";
+      }
+      return;
+    }
+  }
+#endif
+}
+
+void GfxInfo::GetDataV4L2() {
+  if (mIsV4L2Supported.isSome()) {
+    return;
+  }
+  mIsV4L2Supported = Some(false);
+
+#ifdef MOZ_ENABLE_V4L2
+  DIR* dir = opendir("/dev");
+  if (!dir) {
+    gfxCriticalNote << "Could not list /dev\n";
+    return;
+  }
+  struct dirent* dir_entry;
+  while ((dir_entry = readdir(dir))) {
+    if (!strncmp(dir_entry->d_name, "video", 5)) {
+      nsCString path = "/dev/"_ns;
+      path += nsDependentCString(dir_entry->d_name);
+      V4L2ProbeDevice(path);
+    }
+  }
+  closedir(dir);
+#endif  // MOZ_ENABLE_V4L2
+}
+
+void GfxInfo::GetDataVulkan() {
+  if (mIsVulkanSupported.isSome()) {
+    return;
+  }
+  mIsVulkanSupported = Some(false);
+  mVulkanSupportedCodecs = 0;
+
+#if defined(MOZ_ENABLE_VULKAN_VIDEO)
+  char* vulkanData = nullptr;
+  auto freeVulkan = mozilla::MakeScopeExit([&] { g_free((void*)vulkanData); });
+
+  int vulkanPipe = -1;
+  int vulkanPID = 0;
+  const char* args[3];
+  if (mDrmRenderDevice.IsEmpty()) {
+    args[0] = "-p";
+    args[1] = nullptr;
+  } else {
+    args[0] = "-d";
+    args[1] = mDrmRenderDevice.get();
+    args[2] = nullptr;
+  }
+  vulkanPID = FireTestProcess(VULKAN_PROBE_BINARY, &vulkanPipe, args);
+  if (!vulkanPID) {
+    gfxCriticalNote << "Failed to start vulkantest process\n";
+    return;
+  }
+
+  if (!ManageChildProcess("vulkantest", &vulkanPID, &vulkanPipe,
+                          VULKAN_TEST_TIMEOUT, &vulkanData)) {
+    gfxCriticalNote << "vulkantest: ManageChildProcess failed\n";
+    return;
+  }
+
+  char* bufptr = vulkanData;
+  char* line;
+  while ((line = NS_strtok("\n", &bufptr))) {
+    if (!strcmp(line, "VULKAN_SUPPORTED")) {
+      line = NS_strtok("\n", &bufptr);
+      if (!line) {
+        gfxCriticalNote << "vulkantest: Failed to get Vulkan support\n";
+        return;
+      }
+      mIsVulkanSupported = Some(!strcmp(line, "TRUE"));
+    } else if (!strcmp(line, "VULKAN_HWCODECS")) {
+      line = NS_strtok("\n", &bufptr);
+      if (!line) {
+        gfxCriticalNote << "vulkantest: Failed to get Vulkan codecs\n";
+        return;
+      }
+      std::istringstream(line) >> mVulkanSupportedCodecs;
+
+#  define VULKAN_CODEC_CHECK(name)                          \
+    if (mVulkanSupportedCodecs & CODEC_HW_DEC_##name) {     \
+      media::MCSInfo::AddSupport(                           \
+          media::MediaCodecsSupport::name##HardwareDecode); \
+    }
+      VULKAN_CODEC_CHECK(H264)
+      VULKAN_CODEC_CHECK(VP8)
+      VULKAN_CODEC_CHECK(VP9)
+      VULKAN_CODEC_CHECK(AV1)
+      VULKAN_CODEC_CHECK(HEVC)
+#  undef VULKAN_CODEC_CHECK
+    } else if (!strcmp(line, "WARNING") || !strcmp(line, "ERROR")) {
+      gfxCriticalNote << "vulkantest: " << line;
+      line = NS_strtok("\n", &bufptr);
+      if (line) {
+        gfxCriticalNote << "vulkantest: " << line << "\n";
+      }
+      return;
+    }
+  }
+#endif
+}
+
+void GfxInfo::V4L2ProbeDevice(nsCString& dev) {
+  char* v4l2Data = nullptr;
+  auto free = mozilla::MakeScopeExit([&] { g_free((void*)v4l2Data); });
+
+  int v4l2Pipe = -1;
+  int v4l2PID = 0;
+  const char* args[] = {"-d", dev.get(), nullptr};
+  v4l2PID = FireTestProcess(V4L2_PROBE_BINARY, &v4l2Pipe, args);
+  if (!v4l2PID) {
+    gfxCriticalNote << "Failed to start v4l2test process\n";
+    return;
+  }
+
+  if (!ManageChildProcess("v4l2test", &v4l2PID, &v4l2Pipe, V4L2_TEST_TIMEOUT,
+                          &v4l2Data)) {
+    gfxCriticalNote << "v4l2test: ManageChildProcess failed\n";
+    return;
+  }
+
+  char* bufptr = v4l2Data;
+  char* line;
+  nsTArray<nsCString> capFormats;
+  nsTArray<nsCString> outFormats;
+  bool supported = false;
+
+  while ((line = NS_strtok("\n", &bufptr))) {
+    if (!strcmp(line, "V4L2_SUPPORTED")) {
+      line = NS_strtok("\n", &bufptr);
+      if (!line) {
+        gfxWarning() << "v4l2test: Failed to get V4L2 support\n";
+        return;
+      }
+      supported = !strcmp(line, "TRUE");
+    } else if (!strcmp(line, "V4L2_CAPTURE_FMTS")) {
+      line = NS_strtok("\n", &bufptr);
+      if (!line) {
+        gfxWarning() << "v4l2test: Failed to get V4L2 CAPTURE formats\n";
+        return;
+      }
+      char* capture_fmt;
+      while ((capture_fmt = NS_strtok(" ", &line))) {
+        capFormats.AppendElement(capture_fmt);
+      }
+    } else if (!strcmp(line, "V4L2_OUTPUT_FMTS")) {
+      line = NS_strtok("\n", &bufptr);
+      if (!line) {
+        gfxWarning() << "v4l2test: Failed to get V4L2 OUTPUT formats\n";
+        return;
+      }
+      char* output_fmt;
+      while ((output_fmt = NS_strtok(" ", &line))) {
+        outFormats.AppendElement(output_fmt);
+      }
+    } else if (!strcmp(line, "WARNING") || !strcmp(line, "ERROR")) {
+      line = NS_strtok("\n", &bufptr);
+      if (line) {
+        gfxWarning() << "v4l2test: " << line << "\n";
+      }
+      return;
+    }
+  }
+
+  if (!supported) {
+    return;
+  }
+
+  if (!capFormats.Contains("YV12") && !capFormats.Contains("NV12")) {
+    return;
+  }
+
+  if (outFormats.Contains("H264")) {
+    mIsV4L2Supported = Some(true);
+    media::MCSInfo::AddSupport(media::MediaCodecsSupport::H264HardwareDecode);
+    mV4L2SupportedCodecs |= CODEC_HW_DEC_H264;
+  }
+  if (outFormats.Contains("VP80")) {
+    mIsV4L2Supported = Some(true);
+    media::MCSInfo::AddSupport(media::MediaCodecsSupport::VP8HardwareDecode);
+    mV4L2SupportedCodecs |= CODEC_HW_DEC_VP8;
+  }
+  if (outFormats.Contains("VP90")) {
+    mIsV4L2Supported = Some(true);
+    media::MCSInfo::AddSupport(media::MediaCodecsSupport::VP9HardwareDecode);
+    mV4L2SupportedCodecs |= CODEC_HW_DEC_VP9;
+  }
+  if (outFormats.Contains("HEVC")) {
+    mIsV4L2Supported = Some(true);
+    media::MCSInfo::AddSupport(media::MediaCodecsSupport::HEVCHardwareDecode);
+    mV4L2SupportedCodecs |= CODEC_HW_DEC_HEVC;
+  }
+  if (outFormats.Contains("AV01")) {
+    mIsV4L2Supported = Some(true);
+    media::MCSInfo::AddSupport(media::MediaCodecsSupport::AV1HardwareDecode);
+    mV4L2SupportedCodecs |= CODEC_HW_DEC_AV1;
+  }
+}
+
+const nsTArray<RefPtr<GfxDriverInfo>>& GfxInfo::GetGfxDriverInfo() {
+  if (!sDriverInfo->Length()) {
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaAll, DeviceFamily::All,
+        GfxDriverInfo::optionalFeatures,
+        nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION, DRIVER_LESS_THAN,
+        V(10, 0, 0, 0), "FEATURE_FAILURE_OLD_MESA", "Mesa 10.0");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaNouveau, DeviceFamily::All,
+        GfxDriverInfo::optionalFeatures,
+        nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION, DRIVER_LESS_THAN,
+        V(11, 0, 0, 0), "FEATURE_FAILURE_OLD_NV_MESA", "Mesa 11.0");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::NonMesaAll, DeviceFamily::NvidiaAll,
+        GfxDriverInfo::optionalFeatures,
+        nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION, DRIVER_LESS_THAN,
+        V(257, 21, 0, 0), "FEATURE_FAILURE_OLD_NVIDIA", "NVIDIA 257.21");
+
+    APPEND_TO_DRIVER_BLOCKLIST(
+        OperatingSystem::Linux, DeviceFamily::AtiAll,
+        GfxDriverInfo::optionalFeatures,
+        nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION, DRIVER_LESS_THAN,
+        V(13, 15, 100, 1), "FEATURE_FAILURE_OLD_FGLRX", "fglrx 13.15.100.1");
+
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::SoftwareMesaAll, DeviceFamily::All,
+        nsIGfxInfo::FEATURE_WEBRENDER, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_COMPARISON_IGNORED, V(0, 0, 0, 0), "FEATURE_FAILURE_SOFTWARE_GL",
+        "");
+
+    APPEND_TO_DRIVER_BLOCKLIST(
+        OperatingSystem::Linux, DeviceFamily::IntelWebRenderBlocked,
+        nsIGfxInfo::FEATURE_WEBRENDER, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_COMPARISON_IGNORED, V(0, 0, 0, 0), "INTEL_DEVICE_GEN5_OR_OLDER",
+        "");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaAll, DeviceFamily::NvidiaAll,
+        nsIGfxInfo::FEATURE_WEBRENDER,
+        nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION, DRIVER_LESS_THAN,
+        V(18, 2, 0, 0), "FEATURE_FAILURE_WEBRENDER_OLD_MESA", "Mesa 18.2.0.0");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::NonMesaAll, DeviceFamily::NvidiaAll,
+        nsIGfxInfo::FEATURE_WEBRENDER, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_LESS_THAN, V(470, 82, 0, 0),
+        "FEATURE_FAILURE_WEBRENDER_OLD_NVIDIA", "470.82.0");
+
+    APPEND_TO_DRIVER_BLOCKLIST(
+        OperatingSystem::Linux, DeviceFamily::NvidiaWebRenderBlocked,
+        nsIGfxInfo::FEATURE_WEBRENDER, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_COMPARISON_IGNORED, V(0, 0, 0, 0),
+        "NVIDIA_EARLY_TESLA_AND_C67_C68", "");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaAll, DeviceFamily::All,
+        nsIGfxInfo::FEATURE_WEBRENDER,
+        nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION, DRIVER_LESS_THAN,
+        V(17, 0, 0, 0), "FEATURE_FAILURE_WEBRENDER_OLD_MESA", "Mesa 17.0.0.0");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaNonIntelNvidiaAtiAll,
+        DeviceFamily::All, nsIGfxInfo::FEATURE_WEBRENDER,
+        nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION, DRIVER_LESS_THAN,
+        V(22, 2, 0, 0), "FEATURE_FAILURE_WEBRENDER_OLD_MESA_OTHER",
+        "Mesa 22.2.0.0");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaR600, DeviceFamily::All,
+        nsIGfxInfo::FEATURE_WEBRENDER,
+        nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION, DRIVER_LESS_THAN,
+        V(17, 3, 0, 0), "FEATURE_FAILURE_WEBRENDER_OLD_MESA_R600",
+        "Mesa 17.3.0.0");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::NonMesaAll, DeviceFamily::AtiAll,
+        nsIGfxInfo::FEATURE_WEBRENDER, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_COMPARISON_IGNORED, V(0, 0, 0, 0),
+        "FEATURE_FAILURE_WEBRENDER_NO_LINUX_ATI", "");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaAll, DeviceFamily::AmdR600,
+        nsIGfxInfo::FEATURE_WEBRENDER, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_COMPARISON_IGNORED, V(0, 0, 0, 0),
+        "FEATURE_FAILURE_WEBRENDER_BUG_1673939",
+        "https://gitlab.freedesktop.org/mesa/mesa/-/issues/3720");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::XWayland, DriverVendor::MesaAll, DeviceFamily::All,
+        nsIGfxInfo::FEATURE_WEBRENDER,
+        nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION, DRIVER_LESS_THAN,
+        V(17, 0, 0, 0), "FEATURE_FAILURE_WEBRENDER_BUG_1635186",
+        "Mesa 17.0.0.0");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaVM, DeviceFamily::All,
+        nsIGfxInfo::FEATURE_WEBRENDER, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_COMPARISON_IGNORED, V(0, 0, 0, 0),
+        "FEATURE_FAILURE_WEBRENDER_MESA_VM", "");
+
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaNouveau, DeviceFamily::All,
+        nsIGfxInfo::FEATURE_MESA_THREADING, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_LESS_THAN_OR_EQUAL, V(23, 2, 1, 0),
+        "FEATURE_FAILURE_MESA_THREADING_OLD_NOUVEAU", "Mesa 23.2.1.0");
+
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaVM, DeviceFamily::All,
+        nsIGfxInfo::FEATURE_WEBGL_USE_HARDWARE,
+        nsIGfxInfo::FEATURE_BLOCKED_DEVICE, DRIVER_COMPARISON_IGNORED,
+        V(0, 0, 0, 0), "FEATURE_FAILURE_WEBGL_MESA_VM", "");
+
+    APPEND_TO_DRIVER_BLOCKLIST_RANGE_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::NonMesaAll, DeviceFamily::NvidiaAll,
+        nsIGfxInfo::FEATURE_WEBGL_USE_HARDWARE,
+        nsIGfxInfo::FEATURE_BLOCKED_DEVICE, DRIVER_BETWEEN_INCLUSIVE_START,
+        V(390, 157, 0, 0), V(391, 0, 0, 0), "FEATURE_FAILURE_WEBGL_OLD_NVIDIA",
+        "391.0.0");
+
+    APPEND_TO_DRIVER_BLOCKLIST(
+        OperatingSystem::Linux, DeviceFamily::All,
+        nsIGfxInfo::FEATURE_WEBRENDER_COMPOSITOR,
+        nsIGfxInfo::FEATURE_BLOCKED_DEVICE, DRIVER_COMPARISON_IGNORED,
+        V(0, 0, 0, 0), "FEATURE_FAILURE_WEBRENDER_COMPOSITOR_DISABLED", "");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaAll, DeviceFamily::All,
+        nsIGfxInfo::FEATURE_X11_EGL, nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION,
+        DRIVER_LESS_THAN, V(17, 0, 0, 0), "FEATURE_X11_EGL_OLD_MESA",
+        "Mesa 17.0.0.0");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaAll, DeviceFamily::NvidiaAll,
+        nsIGfxInfo::FEATURE_X11_EGL, nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION,
+        DRIVER_LESS_THAN, V(18, 2, 0, 0), "FEATURE_X11_EGL_OLD_MESA_NOUVEAU",
+        "Mesa 18.2.0.0");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::NonMesaAll, DeviceFamily::NvidiaAll,
+        nsIGfxInfo::FEATURE_X11_EGL, nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION,
+        DRIVER_LESS_THAN, V(470, 82, 0, 0),
+        "FEATURE_ROLLOUT_X11_EGL_NVIDIA_BINARY", "470.82.0");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::NonMesaAll, DeviceFamily::AtiAll,
+        nsIGfxInfo::FEATURE_X11_EGL, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_COMPARISON_IGNORED, V(0, 0, 0, 0),
+        "FEATURE_FAILURE_X11_EGL_NO_LINUX_ATI", "");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::NonMesaAll, DeviceFamily::NvidiaAll,
+        nsIGfxInfo::FEATURE_DMABUF, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_LESS_THAN, V(545, 23, 6, 0), "FEATURE_FAILURE_BUG_1788573", "");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::NonMesaAll, DeviceFamily::NvidiaAll,
+        nsIGfxInfo::FEATURE_DMABUF, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_LESS_THAN, V(575, 64, 5, 0), "FEATURE_FAILURE_BUG_1978911", "");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaRadeonsi, DeviceFamily::AtiAll,
+        nsIGfxInfo::FEATURE_DMABUF, nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION,
+        DRIVER_EQUAL, V(24, 1, 3, 0), "FEATURE_FAILURE_BUG_1913778", "");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaAll, DeviceFamily::All,
+        nsIGfxInfo::FEATURE_DMABUF_SURFACE_EXPORT,
+        nsIGfxInfo::FEATURE_BLOCKED_DEVICE, DRIVER_COMPARISON_IGNORED,
+        V(0, 0, 0, 0), "FEATURE_FAILURE_BROKEN_DRIVER", "");
+
+#ifdef NIGHTLY_BUILD
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::NonMesaAll, DeviceFamily::NvidiaAll,
+        nsIGfxInfo::FEATURE_DMABUF_WEBGL, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_LESS_THAN, V(470, 256, 2, 0), "FEATURE_FAILURE_BUG_1981326",
+        "NVIDIA 470.256.02 / 580.76.05");
+
+    APPEND_TO_DRIVER_BLOCKLIST_RANGE_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::NonMesaAll, DeviceFamily::NvidiaAll,
+        nsIGfxInfo::FEATURE_DMABUF_WEBGL,
+        nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION,
+        DRIVER_BETWEEN_INCLUSIVE_START, V(471, 0, 0, 0), V(580, 76, 5, 0),
+        "FEATURE_FAILURE_BUG_1981326", "NVIDIA 470.256.02 / 580.76.05");
+#else
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::NonMesaAll, DeviceFamily::NvidiaAll,
+        nsIGfxInfo::FEATURE_DMABUF_WEBGL, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_COMPARISON_IGNORED, V(0, 0, 0, 0), "FEATURE_FAILURE_BUG_1924578",
+        "");
+#endif
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaAll, DeviceFamily::All,
+        nsIGfxInfo::FEATURE_HARDWARE_VIDEO_DECODING,
+        nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION, DRIVER_LESS_THAN,
+        V(21, 0, 0, 0), "FEATURE_HARDWARE_VIDEO_DECODING_MESA",
+        "Mesa 21.0.0.0");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::All, DeviceFamily::NvidiaAll,
+        nsIGfxInfo::FEATURE_HARDWARE_VIDEO_DECODING,
+        nsIGfxInfo::FEATURE_BLOCKED_DEVICE, DRIVER_COMPARISON_IGNORED,
+        V(0, 0, 0, 0), "FEATURE_HARDWARE_VIDEO_DECODING_NO_LINUX_NVIDIA", "");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::NonMesaAll, DeviceFamily::AtiAll,
+        nsIGfxInfo::FEATURE_HARDWARE_VIDEO_DECODING,
+        nsIGfxInfo::FEATURE_BLOCKED_DEVICE, DRIVER_COMPARISON_IGNORED,
+        V(0, 0, 0, 0), "FEATURE_HARDWARE_VIDEO_DECODING_NO_LINUX_AMD", "");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaR600, DeviceFamily::All,
+        nsIGfxInfo::FEATURE_HARDWARE_VIDEO_DECODING,
+        nsIGfxInfo::FEATURE_BLOCKED_DEVICE, DRIVER_COMPARISON_IGNORED,
+        V(0, 0, 0, 0), "FEATURE_HARDWARE_VIDEO_DECODING_NO_R600", "");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaAll, DeviceFamily::AtiAll,
+        nsIGfxInfo::FEATURE_HARDWARE_VIDEO_DECODING,
+        nsIGfxInfo::FEATURE_BLOCKED_DEVICE, DRIVER_LESS_THAN, V(24, 2, 0, 0),
+        "FEATURE_HARDWARE_VIDEO_DECODING_AMD_DISABLE", "Mesa 24.2.0");
+
+    APPEND_TO_DRIVER_BLOCKLIST2(OperatingSystem::Linux, DeviceFamily::All,
+                                nsIGfxInfo::FEATURE_HW_DECODED_VIDEO_ZERO_COPY,
+                                nsIGfxInfo::FEATURE_ALLOW_ALWAYS,
+                                DRIVER_COMPARISON_IGNORED, V(0, 0, 0, 0),
+                                "FEATURE_ROLLOUT_ALL");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaAll, DeviceFamily::AtiAll,
+        nsIGfxInfo::FEATURE_HW_DECODED_VIDEO_ZERO_COPY,
+        nsIGfxInfo::FEATURE_BLOCKED_DEVICE, DRIVER_LESS_THAN, V(24, 2, 0, 0),
+        "FEATURE_HARDWARE_VIDEO_ZERO_COPY_LINUX_AMD_DISABLE", "Mesa 24.2.0.0");
+
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::X11, DriverVendor::NonMesaAll, DeviceFamily::NvidiaAll,
+        nsIGfxInfo::FEATURE_WEBRENDER_PARTIAL_PRESENT,
+        nsIGfxInfo::FEATURE_BLOCKED_DEVICE, DRIVER_COMPARISON_IGNORED,
+        V(0, 0, 0, 0), "FEATURE_ROLLOUT_WR_PARTIAL_PRESENT_NVIDIA_BINARY", "");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::XWayland, DriverVendor::MesaAll, DeviceFamily::All,
+        nsIGfxInfo::FEATURE_WEBRENDER_PARTIAL_PRESENT,
+        nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION, DRIVER_LESS_THAN,
+        V(21, 0, 0, 0), "FEATURE_FAILURE_WEBRENDER_PARTIAL_PRESENT_BUG_1677892",
+        "Mesa 21.0.0.0");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaAll, DeviceFamily::All,
+        nsIGfxInfo::FEATURE_WEBGPU, nsIGfxInfo::FEATURE_BLOCKED_DRIVER_VERSION,
+        DRIVER_LESS_THAN, V(25, 0, 4, 0),
+        "FEATURE_FAILURE_WEBGPU_MESA_BUG_1979007", "Mesa 25.0.4");
+
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::MesaNouveau, DeviceFamily::All,
+        nsIGfxInfo::FEATURE_THREADSAFE_GL, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_COMPARISON_IGNORED, V(0, 0, 0, 0),
+        "FEATURE_FAILURE_THREADSAFE_GL_NOUVEAU", "");
+
+    APPEND_TO_DRIVER_BLOCKLIST_EXT(
+        OperatingSystem::Linux, ScreenSizeStatus::All, BatteryStatus::All,
+        WindowProtocol::All, DriverVendor::NonMesaAll, DeviceFamily::NvidiaAll,
+        nsIGfxInfo::FEATURE_THREADSAFE_GL, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_LESS_THAN, V(545, 23, 6, 0), "FEATURE_FAILURE_BUG_1788573", "");
+
+    APPEND_TO_DRIVER_BLOCKLIST(
+        OperatingSystem::Linux, DeviceFamily::AmdR600,
+        nsIGfxInfo::FEATURE_WEBRENDER, nsIGfxInfo::FEATURE_BLOCKED_DEVICE,
+        DRIVER_COMPARISON_IGNORED, V(0, 0, 0, 0), "AMD_R600_FAMILY", "");
+  }
+  return *sDriverInfo;
+}
+
+bool GfxInfo::DoesWindowProtocolMatch(const nsAString& aBlocklistWindowProtocol,
+                                      const nsAString& aWindowProtocol) {
+  if (mIsWayland &&
+      aBlocklistWindowProtocol.Equals(
+          GfxDriverInfo::GetWindowProtocol(WindowProtocol::WaylandAll),
+          nsCaseInsensitiveStringComparator)) {
+    return true;
+  }
+  if (!mIsWayland &&
+      aBlocklistWindowProtocol.Equals(
+          GfxDriverInfo::GetWindowProtocol(WindowProtocol::X11All),
+          nsCaseInsensitiveStringComparator)) {
+    return true;
+  }
+  return GfxInfoBase::DoesWindowProtocolMatch(aBlocklistWindowProtocol,
+                                              aWindowProtocol);
+}
+
+bool GfxInfo::DoesDriverVendorMatch(const nsAString& aBlocklistVendor,
+                                    const nsAString& aDriverVendor) {
+  if (mIsMesa) {
+    if (aBlocklistVendor.Equals(
+            GfxDriverInfo::GetDriverVendor(DriverVendor::MesaAll),
+            nsCaseInsensitiveStringComparator)) {
+      return true;
+    }
+    if (mIsAccelerated &&
+        aBlocklistVendor.Equals(
+            GfxDriverInfo::GetDriverVendor(DriverVendor::HardwareMesaAll),
+            nsCaseInsensitiveStringComparator)) {
+      return true;
+    }
+    if (!mIsAccelerated &&
+        aBlocklistVendor.Equals(
+            GfxDriverInfo::GetDriverVendor(DriverVendor::SoftwareMesaAll),
+            nsCaseInsensitiveStringComparator)) {
+      return true;
+    }
+    if (aBlocklistVendor.Equals(GfxDriverInfo::GetDriverVendor(
+                                    DriverVendor::MesaNonIntelNvidiaAtiAll),
+                                nsCaseInsensitiveStringComparator)) {
+      return !mVendorId.Equals("0x8086") && !mVendorId.Equals("0x10de") &&
+             !mVendorId.Equals("0x1002");
+    }
+  }
+  if (!mIsMesa && aBlocklistVendor.Equals(
+                      GfxDriverInfo::GetDriverVendor(DriverVendor::NonMesaAll),
+                      nsCaseInsensitiveStringComparator)) {
+    return true;
+  }
+  return GfxInfoBase::DoesDriverVendorMatch(aBlocklistVendor, aDriverVendor);
+}
+
+nsresult GfxInfo::GetFeatureStatusImpl(
+    int32_t aFeature, int32_t* aStatus, nsAString& aSuggestedDriverVersion,
+    const nsTArray<RefPtr<GfxDriverInfo>>& aDriverInfo, nsACString& aFailureId,
+    OperatingSystem* aOS )
+
+{
+  NS_ENSURE_ARG_POINTER(aStatus);
+  *aStatus = nsIGfxInfo::FEATURE_STATUS_UNKNOWN;
+  aSuggestedDriverVersion.SetIsVoid(true);
+  OperatingSystem os = OperatingSystem::Linux;
+  if (aOS) *aOS = os;
+
+  if (sShutdownOccurred) {
+    return NS_OK;
+  }
+
+  GetData();
+
+  if (mGlxTestError) {
+    if (OnlyAllowFeatureOnKnownConfig(aFeature)) {
+      *aStatus = nsIGfxInfo::FEATURE_BLOCKED_DEVICE;
+      aFailureId = "FEATURE_FAILURE_GLXTEST_FAILED";
+    } else {
+      *aStatus = nsIGfxInfo::FEATURE_STATUS_OK;
+    }
+    return NS_OK;
+  }
+
+  if (mGLMajorVersion == 1) {
+    if (OnlyAllowFeatureOnKnownConfig(aFeature)) {
+      *aStatus = nsIGfxInfo::FEATURE_BLOCKED_DEVICE;
+      aFailureId = "FEATURE_FAILURE_OPENGL_1";
+    } else {
+      *aStatus = nsIGfxInfo::FEATURE_STATUS_OK;
+    }
+    return NS_OK;
+  }
+
+  if (aFeature == nsIGfxInfo::FEATURE_OPENGL_LAYERS && !mIsAccelerated &&
+      !PR_GetEnv("MOZ_LAYERS_ALLOW_SOFTWARE_GL")) {
+    *aStatus = nsIGfxInfo::FEATURE_BLOCKED_DEVICE;
+    aFailureId = "FEATURE_FAILURE_SOFTWARE_GL";
+    return NS_OK;
+  }
+
+  if (aFeature == nsIGfxInfo::FEATURE_WEBRENDER) {
+    if (mGLMajorVersion < 3) {
+      *aStatus = nsIGfxInfo::FEATURE_BLOCKED_DEVICE;
+      aFailureId = "FEATURE_FAILURE_OPENGL_LESS_THAN_3";
+      return NS_OK;
+    }
+
+    for (const nsCString& driver : mDdxDrivers) {
+      if (strcasestr(driver.get(), "Intel")) {
+        *aStatus = nsIGfxInfo::FEATURE_BLOCKED_DEVICE;
+        aFailureId = "FEATURE_FAILURE_DDX_INTEL";
+        return NS_OK;
+      }
+    }
+  }
+
+  const struct {
+    int32_t mFeature;
+    int32_t mCodec;
+    nsLiteralCString mFailureId;
+  } kFeatureToCodecs[] = {
+      {nsIGfxInfo::FEATURE_H264_HW_DECODE, CODEC_HW_DEC_H264,
+       "FEATURE_FAILURE_VIDEO_DECODING_MISSING"_ns},
+      {nsIGfxInfo::FEATURE_H264_HW_ENCODE, CODEC_HW_ENC_H264,
+       "FEATURE_FAILURE_VIDEO_ENCODING_MISSING"_ns},
+      {nsIGfxInfo::FEATURE_VP8_HW_DECODE, CODEC_HW_DEC_VP8,
+       "FEATURE_FAILURE_VIDEO_DECODING_MISSING"_ns},
+      {nsIGfxInfo::FEATURE_VP8_HW_ENCODE, CODEC_HW_ENC_VP8,
+       "FEATURE_FAILURE_VIDEO_ENCODING_MISSING"_ns},
+      {nsIGfxInfo::FEATURE_VP9_HW_DECODE, CODEC_HW_DEC_VP9,
+       "FEATURE_FAILURE_VIDEO_DECODING_MISSING"_ns},
+      {nsIGfxInfo::FEATURE_VP9_HW_ENCODE, CODEC_HW_ENC_VP9,
+       "FEATURE_FAILURE_VIDEO_ENCODING_MISSING"_ns},
+      {nsIGfxInfo::FEATURE_AV1_HW_DECODE, CODEC_HW_DEC_AV1,
+       "FEATURE_FAILURE_VIDEO_DECODING_MISSING"_ns},
+      {nsIGfxInfo::FEATURE_AV1_HW_ENCODE, CODEC_HW_ENC_AV1,
+       "FEATURE_FAILURE_VIDEO_ENCODING_MISSING"_ns},
+      {nsIGfxInfo::FEATURE_HEVC_HW_DECODE, CODEC_HW_DEC_HEVC,
+       "FEATURE_FAILURE_VIDEO_DECODING_MISSING"_ns},
+      {nsIGfxInfo::FEATURE_HEVC_HW_ENCODE, CODEC_HW_ENC_HEVC,
+       "FEATURE_FAILURE_VIDEO_ENCODING_MISSING"_ns}};
+
+  for (const auto& pair : kFeatureToCodecs) {
+    if (aFeature != pair.mFeature) {
+      continue;
+    }
+    if ((mVAAPISupportedCodecs & pair.mCodec) ||
+        (mV4L2SupportedCodecs & pair.mCodec) ||
+        (mVulkanSupportedCodecs & pair.mCodec)) {
+      *aStatus = nsIGfxInfo::FEATURE_STATUS_OK;
+    } else {
+      *aStatus = nsIGfxInfo::FEATURE_BLOCKED_PLATFORM_TEST;
+      aFailureId = pair.mFailureId;
+    }
+    return NS_OK;
+  }
+
+  auto ret = GfxInfoBase::GetFeatureStatusImpl(
+      aFeature, aStatus, aSuggestedDriverVersion, aDriverInfo, aFailureId, &os);
+
+  if (aFeature == nsIGfxInfo::FEATURE_HARDWARE_VIDEO_DECODING_VULKAN) {
+    if (!StaticPrefs::
+            media_hardware_video_decoding_vulkan_enabled_AtStartup()) {
+      *aStatus = nsIGfxInfo::FEATURE_BLOCKED_PLATFORM_TEST;
+      aFailureId = "FEATURE_HARDWARE_VIDEO_DECODING_VULKAN_PREF_DISABLED"_ns;
+      return NS_OK;
+    }
+    if (!StaticPrefs::media_hardware_video_decoding_enabled_AtStartup()) {
+      return ret;
+    }
+    bool probeHWDecode =
+        mIsAccelerated &&
+        (*aStatus == nsIGfxInfo::FEATURE_STATUS_OK ||
+         StaticPrefs::media_hardware_video_decoding_force_enabled_AtStartup());
+    if (probeHWDecode) {
+      GetDataVulkan();
+    } else {
+      mIsVulkanSupported = Some(false);
+    }
+    if (!mIsVulkanSupported.value()) {
+      *aStatus = nsIGfxInfo::FEATURE_BLOCKED_PLATFORM_TEST;
+      aFailureId = "FEATURE_FAILURE_VIDEO_DECODING_VULKAN_TEST_FAILED";
+    }
+  }
+
+  if (aFeature == nsIGfxInfo::FEATURE_HARDWARE_VIDEO_DECODING) {
+    if (!StaticPrefs::media_hardware_video_decoding_enabled_AtStartup()) {
+      return ret;
+    }
+    bool probeHWDecode =
+        mIsAccelerated &&
+        (*aStatus == nsIGfxInfo::FEATURE_STATUS_OK ||
+         StaticPrefs::media_hardware_video_decoding_force_enabled_AtStartup());
+    if (probeHWDecode) {
+      GetDataVAAPI();
+      GetDataV4L2();
+    } else {
+      mIsVAAPISupported = Some(false);
+      mIsV4L2Supported = Some(false);
+    }
+    if (!mIsVAAPISupported.value() && !mIsV4L2Supported.value()) {
+      *aStatus = nsIGfxInfo::FEATURE_BLOCKED_PLATFORM_TEST;
+      aFailureId = "FEATURE_FAILURE_VIDEO_DECODING_TEST_FAILED";
+    }
+  }
+
+  return ret;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetDWriteEnabled(bool* aEnabled) { return NS_ERROR_FAILURE; }
+
+NS_IMETHODIMP
+GfxInfo::GetDWriteVersion(nsAString& aDwriteVersion) {
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP GfxInfo::GetHasBattery(bool* aHasBattery) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetEmbeddedInFirefoxReality(bool* aEmbeddedInFirefoxReality) {
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetCleartypeParameters(nsAString& aCleartypeParams) {
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetWindowProtocol(nsAString& aWindowProtocol) {
+  GetData();
+  if (mIsWayland) {
+    aWindowProtocol = GfxDriverInfo::GetWindowProtocol(WindowProtocol::Wayland);
+  } else if (mIsXWayland) {
+    aWindowProtocol =
+        GfxDriverInfo::GetWindowProtocol(WindowProtocol::XWayland);
+  } else {
+    aWindowProtocol = GfxDriverInfo::GetWindowProtocol(WindowProtocol::X11);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetTestType(nsAString& aTestType) {
+  GetData();
+  AppendASCIItoUTF16(mTestType, aTestType);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterDescription(nsAString& aAdapterDescription) {
+  GetData();
+  AppendASCIItoUTF16(mAdapterDescription, aAdapterDescription);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterDescription2(nsAString& aAdapterDescription) {
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterRAM(uint32_t* aAdapterRAM) {
+  GetData();
+  *aAdapterRAM = mAdapterRAM;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterRAM2(uint32_t* aAdapterRAM) { return NS_ERROR_FAILURE; }
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterDriver(nsAString& aAdapterDriver) {
+  aAdapterDriver.Truncate();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterDriver2(nsAString& aAdapterDriver) {
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterDriverVendor(nsAString& aAdapterDriverVendor) {
+  GetData();
+  CopyASCIItoUTF16(mDriverVendor, aAdapterDriverVendor);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterDriverVendor2(nsAString& aAdapterDriverVendor) {
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterDriverVersion(nsAString& aAdapterDriverVersion) {
+  GetData();
+  CopyASCIItoUTF16(mDriverVersion, aAdapterDriverVersion);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterDriverVersion2(nsAString& aAdapterDriverVersion) {
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterDriverDate(nsAString& aAdapterDriverDate) {
+  aAdapterDriverDate.Truncate();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterDriverDate2(nsAString& aAdapterDriverDate) {
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterVendorID(nsAString& aAdapterVendorID) {
+  GetData();
+  CopyUTF8toUTF16(mVendorId, aAdapterVendorID);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterVendorID2(nsAString& aAdapterVendorID) {
+  GetData();
+  CopyUTF8toUTF16(mSecondaryVendorId, aAdapterVendorID);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterDeviceID(nsAString& aAdapterDeviceID) {
+  GetData();
+  CopyUTF8toUTF16(mDeviceId, aAdapterDeviceID);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterDeviceID2(nsAString& aAdapterDeviceID) {
+  GetData();
+  CopyUTF8toUTF16(mSecondaryDeviceId, aAdapterDeviceID);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterSubsysID(nsAString& aAdapterSubsysID) {
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetAdapterSubsysID2(nsAString& aAdapterSubsysID) {
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetIsGPU2Active(bool* aIsGPU2Active) {
+  *aIsGPU2Active = false;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+GfxInfo::GetDrmRenderDevice(nsACString& aDrmRenderDevice) {
+  GetData();
+  aDrmRenderDevice.Assign(mDrmRenderDevice);
+  return NS_OK;
+}
+
+#ifdef DEBUG
+
+
+NS_IMETHODIMP GfxInfo::SpoofVendorID(const nsAString& aVendorID) {
+  GetData();
+  CopyUTF16toUTF8(aVendorID, mVendorId);
+  mIsAccelerated = true;
+  return NS_OK;
+}
+
+NS_IMETHODIMP GfxInfo::SpoofDeviceID(const nsAString& aDeviceID) {
+  GetData();
+  CopyUTF16toUTF8(aDeviceID, mDeviceId);
+  return NS_OK;
+}
+
+NS_IMETHODIMP GfxInfo::SpoofDriverVersion(const nsAString& aDriverVersion) {
+  GetData();
+  CopyUTF16toUTF8(aDriverVersion, mDriverVersion);
+  return NS_OK;
+}
+
+NS_IMETHODIMP GfxInfo::SpoofOSVersion(uint32_t aVersion) {
+  return NS_OK;
+}
+
+NS_IMETHODIMP GfxInfo::SpoofOSVersionEx(uint32_t aMajor, uint32_t aMinor,
+                                        uint32_t aBuild, uint32_t aRevision) {
+#  ifdef DEBUG
+  mOSVersionEx = GfxVersionEx(aMajor, aMinor, aBuild, aRevision);
+#  endif
+  return NS_OK;
+}
+
+#endif
+
+}  

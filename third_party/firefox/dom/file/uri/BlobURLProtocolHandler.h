@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_BlobURLProtocolHandler_h
+#define mozilla_dom_BlobURLProtocolHandler_h
+
+#include <functional>
+
+#include "mozilla/dom/ipc/IdType.h"
+#include "nsCOMPtr.h"
+#include "nsIProtocolHandler.h"
+#include "nsIURI.h"
+#include "nsTArray.h"
+#include "nsWeakReference.h"
+
+#define BLOBURI_SCHEME "blob"
+
+class nsIPrincipal;
+
+namespace mozilla {
+class BlobURLsReporter;
+class OriginAttributes;
+template <class T>
+class Maybe;
+
+namespace dom {
+
+class BlobImpl;
+class BlobURLRegistrationData;
+class ContentParent;
+class MediaSource;
+
+class BlobURLProtocolHandler final : public nsIProtocolHandler,
+                                     public nsSupportsWeakReference {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIPROTOCOLHANDLER
+
+  BlobURLProtocolHandler();
+
+  static nsresult CreateNewURI(const nsACString& aSpec, const char* aCharset,
+                               nsIURI* aBaseURI, nsIURI** result);
+
+  static nsresult AddDataEntry(BlobImpl*, nsIPrincipal*,
+                               const nsCString& aPartitionKey,
+                               nsACString& aUri);
+  static void AddDataEntryParent(const nsACString& aURI,
+                                 nsIPrincipal* aPrincipal,
+                                 const nsCString& aPartitionKey,
+                                 BlobImpl* aBlobImpl,
+                                 const ContentParentId& aContentParentId);
+
+  static void AddDataEntryChild(const nsACString& aURI,
+                                nsIPrincipal* aPrincipal,
+                                const nsCString& aPartitionKey);
+
+  static void RemoveDataEntries(const nsTArray<nsCString>& aUris,
+                                bool aBroadcastToOTherProcesses = true);
+  static void RemoveDataEntriesPerContentParent(
+      const ContentParentId& aContentParentId);
+  static bool RemoveDataEntry(const nsACString& aUri, nsIPrincipal* aPrincipal,
+                              const nsCString& aPartitionKey);
+
+  static void RemoveDataEntries();
+
+  static bool HasDataEntryTypeBlob(const nsACString& aUri);
+
+  static bool GetDataEntry(const nsACString& aUri, BlobImpl** aBlobImpl,
+                           nsIPrincipal* aLoadingPrincipal,
+                           nsIPrincipal* aTriggeringPrincipal,
+                           const OriginAttributes& aOriginAttributes,
+                           uint64_t aInnerWindowId,
+                           const nsCString& aPartitionKey,
+                           bool aAlsoIfRevoked = false);
+
+  static bool ForEachBlobURL(
+      std::function<bool(BlobImpl*, nsIPrincipal*, const nsCString&,
+                         const nsACString&, bool aRevoked)>&& aCb);
+
+  static bool GetBlobURLPrincipal(nsIURI* aURI, const OriginAttributes& aAttrs,
+                                  nsIPrincipal** aPrincipal);
+
+  static bool IsBlobURLBroadcastPrincipal(nsIPrincipal* aPrincipal);
+
+  static nsresult GenerateURIString(nsIPrincipal* aPrincipal, nsACString& aUri);
+  static nsresult GetURIPrefix(nsIPrincipal* aPrincipal,
+                               nsACString& aUriPrefix);
+
+  static bool IsBlobURLValid(nsIPrincipal* aPrincipal, const nsACString& aSpec);
+
+ private:
+  ~BlobURLProtocolHandler();
+
+  static void Init();
+};
+
+bool IsBlobURI(nsIURI* aUri);
+
+}  
+}  
+
+#endif /* mozilla_dom_BlobURLProtocolHandler_h */

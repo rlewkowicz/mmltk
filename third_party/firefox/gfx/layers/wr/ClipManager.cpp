@@ -1,0 +1,580 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/layers/ClipManager.h"
+
+#include "DisplayItemClipChain.h"
+#include "FrameMetrics.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/layers/StackingContextHelper.h"
+#include "mozilla/layers/WebRenderLayerManager.h"
+#include "mozilla/StaticPrefs_apz.h"
+#include "mozilla/webrender/WebRenderAPI.h"
+#include "nsDisplayList.h"
+#include "nsLayoutUtils.h"
+#include "nsRefreshDriver.h"
+#include "nsStyleStructInlines.h"
+#include "UnitTransforms.h"
+
+static mozilla::LazyLogModule sClipLog("wr.clip");
+#define CLIP_LOG(...) MOZ_LOG(sClipLog, LogLevel::Debug, (__VA_ARGS__))
+
+namespace mozilla::layers {
+
+ClipManager::ClipManager() : mManager(nullptr), mBuilder(nullptr) {}
+
+void ClipManager::PushCacheScope() {
+  if (mCacheStackTop < mCacheStack.size()) {
+    mCacheStack[mCacheStackTop].clear();
+  } else {
+    mCacheStack.emplace_back();
+  }
+  mCacheStackTop++;
+}
+
+void ClipManager::PopCacheScope() {
+  MOZ_ASSERT(mCacheStackTop > 0);
+  mCacheStackTop--;
+}
+
+void ClipManager::BeginBuild(WebRenderLayerManager* aManager,
+                             wr::DisplayListBuilder& aBuilder) {
+  MOZ_ASSERT(!mManager);
+  mManager = aManager;
+  MOZ_ASSERT(!mBuilder);
+  mBuilder = &aBuilder;
+  MOZ_ASSERT(mCacheStackTop == 0);
+  PushCacheScope();
+  MOZ_ASSERT(mASROverride.empty());
+  MOZ_ASSERT(mItemClipStack.empty());
+}
+
+void ClipManager::EndBuild() {
+  mBuilder = nullptr;
+  mManager = nullptr;
+  PopCacheScope();
+  MOZ_ASSERT(mCacheStackTop == 0);
+  MOZ_ASSERT(mASROverride.empty());
+  MOZ_ASSERT(mItemClipStack.empty());
+}
+
+void ClipManager::BeginList(const StackingContextHelper& aStackingContext) {
+  CLIP_LOG("begin list %p affects = %d, ref-frame = %d\n", &aStackingContext,
+           aStackingContext.AffectsClipPositioning(),
+           aStackingContext.ReferenceFrameId().isSome());
+
+  ItemClips clips(nullptr, nullptr, 0);
+  if (!mItemClipStack.empty()) {
+    clips = mItemClipStack.top();
+  }
+
+  if (aStackingContext.AffectsClipPositioning()) {
+    if (auto referenceFrameId = aStackingContext.ReferenceFrameId()) {
+      PushOverrideForASR(clips.mASR, *referenceFrameId);
+      clips.mScrollId = *referenceFrameId;
+    } else {
+      PushCacheScope();
+    }
+    clips.mClipChainId.reset();
+  }
+
+  CLIP_LOG("  push: clip: %p, asr: %p, scroll =%" PRIuPTR ", clip =%" PRIu64
+           "\n",
+           clips.mChain, clips.mASR, clips.mScrollId.id,
+           clips.mClipChainId.valueOr(wr::WrClipChainId{0}).id);
+
+  mItemClipStack.push(clips);
+}
+
+void ClipManager::EndList(const StackingContextHelper& aStackingContext) {
+  MOZ_ASSERT(!mItemClipStack.empty());
+
+  CLIP_LOG("end list %p\n", &aStackingContext);
+
+  mItemClipStack.pop();
+
+  if (aStackingContext.AffectsClipPositioning()) {
+    if (aStackingContext.ReferenceFrameId()) {
+      PopOverrideForASR(mItemClipStack.empty() ? nullptr
+                                               : mItemClipStack.top().mASR);
+    } else {
+      PopCacheScope();
+    }
+  }
+}
+
+void ClipManager::PushOverrideForASR(const ActiveScrolledRoot* aASR,
+                                     const wr::WrSpatialId& aSpatialId) {
+  wr::WrSpatialId space = GetSpatialId(aASR);
+
+  CLIP_LOG("Pushing %p override %zu -> %zu\n", aASR, space.id, aSpatialId.id);
+  auto it = mASROverride.insert({space, std::stack<wr::WrSpatialId>()});
+  it.first->second.push(aSpatialId);
+
+  PushCacheScope();
+
+  if (!mItemClipStack.empty()) {
+    auto& top = mItemClipStack.top();
+    if (top.mASR == aASR) {
+      top.mScrollId = aSpatialId;
+      top.mClipChainId.reset();
+    }
+  }
+}
+
+void ClipManager::PopOverrideForASR(const ActiveScrolledRoot* aASR) {
+  PopCacheScope();
+
+  wr::WrSpatialId space = GetSpatialId(aASR);
+  auto it = mASROverride.find(space);
+  if (it == mASROverride.end()) {
+    MOZ_ASSERT_UNREACHABLE("Push/PopOverrideForASR should be balanced");
+  } else {
+    CLIP_LOG("Popping %p override %zu -> %zu\n", aASR, space.id,
+             it->second.top().id);
+    it->second.pop();
+  }
+
+  if (!mItemClipStack.empty()) {
+    auto& top = mItemClipStack.top();
+    if (top.mASR == aASR) {
+      top.mScrollId = (it == mASROverride.end() || it->second.empty())
+                          ? space
+                          : it->second.top();
+      top.mClipChainId.reset();
+    }
+  }
+
+  if (it != mASROverride.end() && it->second.empty()) {
+    mASROverride.erase(it);
+  }
+}
+
+wr::WrSpatialId ClipManager::SpatialIdAfterOverride(
+    const wr::WrSpatialId& aSpatialId) {
+  auto it = mASROverride.find(aSpatialId);
+  if (it == mASROverride.end()) {
+    return aSpatialId;
+  }
+  MOZ_ASSERT(!it->second.empty());
+  CLIP_LOG("Overriding %zu with %zu\n", aSpatialId.id, it->second.top().id);
+  return it->second.top();
+}
+
+wr::WrSpaceAndClipChain ClipManager::SwitchItem(nsDisplayListBuilder* aBuilder,
+                                                nsDisplayItem* aItem) {
+  const DisplayItemClipChain* clip = aItem->GetClipChain();
+  const DisplayItemClipChain* inheritedClipChain =
+      mBuilder->GetInheritedClipChain();
+  if (inheritedClipChain && inheritedClipChain != clip) {
+    if (!clip) {
+      clip = mBuilder->GetInheritedClipChain();
+    } else {
+      clip = aBuilder->CreateClipChainIntersection(
+          mBuilder->GetInheritedClipChain(), clip);
+    }
+  }
+  const ActiveScrolledRoot* asr = aItem->GetActiveScrolledRoot();
+  DisplayItemType type = aItem->GetType();
+  const ActiveScrolledRoot* stickyAsr = nullptr;
+  if (type == DisplayItemType::TYPE_STICKY_POSITION) {
+    auto* sticky = static_cast<nsDisplayStickyPosition*>(aItem);
+    asr = sticky->GetContainerASR();
+    stickyAsr = ActiveScrolledRoot::GetStickyASRFromFrame(sticky->Frame());
+    MOZ_ASSERT(stickyAsr);
+  }
+
+  CLIP_LOG("processing item %p (%s) asr %p clip %p, inherited = %p\n", aItem,
+           DisplayItemTypeName(aItem->GetType()), asr, clip,
+           inheritedClipChain);
+
+  const int32_t auPerDevPixel = [&] {
+    if (type == DisplayItemType::TYPE_ZOOM) {
+      return static_cast<nsDisplayZoom*>(aItem)->GetParentAppUnitsPerDevPixel();
+    }
+    return aItem->Frame()->PresContext()->AppUnitsPerDevPixel();
+  }();
+
+  ItemClips clips(asr, clip, auPerDevPixel);
+  MOZ_ASSERT(!mItemClipStack.empty());
+  if (clips.HasSameInputs(mItemClipStack.top())) {
+    CLIP_LOG("\tearly-exit for %p\n", aItem);
+    auto& clips = mItemClipStack.top();
+    if (!clips.mClipChainId && clips.mChain) {
+      clips.mClipChainId =
+          DefineClipChain(clips.mChain, clips.mAppUnitsPerDevPixel);
+    }
+    return wr::WrSpaceAndClipChain{clips.mScrollId, clips.mClipChainId
+                                                        ? clips.mClipChainId->id
+                                                        : wr::ROOT_CLIP_CHAIN};
+  }
+
+  mItemClipStack.pop();
+
+  (void)DefineSpatialNodes(aBuilder, asr, aItem);
+  if (clip && clip->mASR != asr) {
+    (void)DefineSpatialNodes(aBuilder, clip->mASR, aItem);
+  }
+  if (stickyAsr && stickyAsr != asr) {
+    (void)DefineSpatialNodes(aBuilder, stickyAsr, aItem);
+  }
+
+  clips.mClipChainId = DefineClipChain(clip, auPerDevPixel);
+
+  wr::WrSpatialId space = GetSpatialId(asr);
+  clips.mScrollId = SpatialIdAfterOverride(space);
+  CLIP_LOG("\tassigning %d -> %d\n", (int)space.id, (int)clips.mScrollId.id);
+
+  const wr::WrSpaceAndClipChain spaceAndClipChain{
+      clips.mScrollId,
+      clips.mClipChainId ? clips.mClipChainId->id : wr::ROOT_CLIP_CHAIN};
+
+  CLIP_LOG("  push: clip: %p, asr: %p, scroll = %" PRIuPTR ", clip = %" PRIu64
+           "\n",
+           clips.mChain, clips.mASR, spaceAndClipChain.space.id,
+           spaceAndClipChain.clip_chain);
+
+  mItemClipStack.push(clips);
+
+  CLIP_LOG("done setup for %p\n", aItem);
+  return spaceAndClipChain;
+}
+
+wr::WrSpatialId ClipManager::GetSpatialId(const ActiveScrolledRoot* aASR) {
+  for (const ActiveScrolledRoot* asr = aASR; asr; asr = asr->mParent) {
+    Maybe<wr::WrSpatialId> space = mBuilder->GetSpatialIdForDefinedLayer(asr);
+
+    if (space) {
+      return *space;
+    }
+  }
+
+  Maybe<wr::WrSpatialId> space = mBuilder->GetSpatialIdForDefinedLayer(nullptr);
+  MOZ_ASSERT(space.isSome());
+  return *space;
+}
+
+StickyScrollContainer* ClipManager::GetStickyScrollContainer(
+    const ActiveScrolledRoot* aASR) {
+  MOZ_ASSERT(aASR->mKind == ActiveScrolledRoot::ASRKind::Sticky);
+  StickyScrollContainer* stickyScrollContainer =
+      StickyScrollContainer::GetOrCreateForFrame(aASR->mFrame);
+  if (stickyScrollContainer) {
+    if (!stickyScrollContainer->ScrollContainer()
+             ->IsMaybeAsynchronouslyScrolled()) {
+      stickyScrollContainer = nullptr;
+    }
+  }
+  return stickyScrollContainer;
+}
+
+static nscoord DistanceToRange(nscoord min, nscoord max) {
+  MOZ_ASSERT(min <= max);
+  if (max < 0) {
+    return max;
+  }
+  if (min > 0) {
+    return min;
+  }
+  MOZ_ASSERT(min <= 0 && max >= 0);
+  return 0;
+}
+
+static nscoord PositivePart(nscoord min, nscoord max) {
+  MOZ_ASSERT(min <= max);
+  if (min >= 0) {
+    return max - min;
+  }
+  if (max > 0) {
+    return max;
+  }
+  return 0;
+}
+
+static nscoord NegativePart(nscoord min, nscoord max) {
+  MOZ_ASSERT(min <= max);
+  if (max <= 0) {
+    return max - min;
+  }
+  if (min < 0) {
+    return 0 - min;
+  }
+  return 0;
+}
+
+Maybe<wr::WrSpatialId> ClipManager::DefineStickyNode(
+    nsDisplayListBuilder* aBuilder, Maybe<wr::WrSpatialId> aParentSpatialId,
+    const ActiveScrolledRoot* aASR, nsDisplayItem* aItem) {
+  nsIFrame* stickyFrame = aASR->mFrame;
+
+  StickyScrollContainer* stickyScrollContainer = GetStickyScrollContainer(aASR);
+  if (!stickyScrollContainer) {
+    return Nothing();
+  }
+
+  if (stickyScrollContainer->ShouldFlattenAway()) {
+    return Nothing();
+  }
+
+  float auPerDevPixel = stickyFrame->PresContext()->AppUnitsPerDevPixel();
+
+  nsRect itemBounds;
+
+  nsRect scrollPort =
+      stickyScrollContainer->ScrollContainer()->GetScrollPortRect();
+  const nsIFrame* referenceFrame =
+      aBuilder->FindReferenceFrameFor(stickyFrame->GetParent());
+  nsRect transformedBounds = stickyFrame->GetRectRelativeToSelf();
+  DebugOnly transformResult = nsLayoutUtils::TransformRect(
+      stickyFrame, referenceFrame, transformedBounds);
+  MOZ_ASSERT(transformResult == nsLayoutUtils::TRANSFORM_SUCCEEDED);
+  itemBounds = transformedBounds;
+  scrollPort = scrollPort +
+               stickyScrollContainer->ScrollContainer()->GetOffsetToCrossDoc(
+                   referenceFrame);
+
+  Maybe<float> topMargin;
+  Maybe<float> rightMargin;
+  Maybe<float> bottomMargin;
+  Maybe<float> leftMargin;
+  wr::StickyOffsetBounds vBounds = {0.0, 0.0};
+  wr::StickyOffsetBounds hBounds = {0.0, 0.0};
+  nsPoint appliedOffset;
+
+  nsRectAbsolute outer;
+  nsRectAbsolute inner;
+  stickyScrollContainer->GetScrollRanges(stickyFrame, &outer, &inner);
+
+
+  if (outer.YMost() != inner.YMost()) {
+    nscoord distance = DistanceToRange(inner.YMost(), outer.YMost());
+    if (distance > 0) {
+      distance -= PositivePart(outer.Y(), inner.Y());
+    }
+    topMargin = Some(NSAppUnitsToFloatPixels(
+        itemBounds.y - scrollPort.y - distance, auPerDevPixel));
+    vBounds.max =
+        NSAppUnitsToFloatPixels(outer.YMost() - inner.YMost(), auPerDevPixel);
+    if (inner.YMost() < 0) {
+      appliedOffset.y = std::min(0, outer.YMost()) - inner.YMost();
+      MOZ_ASSERT(appliedOffset.y > 0);
+    }
+  }
+  if (outer.Y() != inner.Y()) {
+    nscoord distance = DistanceToRange(outer.Y(), inner.Y());
+    if (distance < 0) {
+      distance += NegativePart(inner.YMost(), outer.YMost());
+    }
+    bottomMargin = Some(NSAppUnitsToFloatPixels(
+        scrollPort.YMost() - itemBounds.YMost() + distance, auPerDevPixel));
+    vBounds.min = NSAppUnitsToFloatPixels(outer.Y() - inner.Y(), auPerDevPixel);
+    if (appliedOffset.y == 0 && inner.Y() > 0) {
+      appliedOffset.y = std::max(0, outer.Y()) - inner.Y();
+      MOZ_ASSERT(appliedOffset.y < 0);
+    }
+  }
+  if (outer.XMost() != inner.XMost()) {
+    nscoord distance = DistanceToRange(inner.XMost(), outer.XMost());
+    if (distance > 0) {
+      distance -= PositivePart(outer.X(), inner.X());
+    }
+    leftMargin = Some(NSAppUnitsToFloatPixels(
+        itemBounds.x - scrollPort.x - distance, auPerDevPixel));
+    hBounds.max =
+        NSAppUnitsToFloatPixels(outer.XMost() - inner.XMost(), auPerDevPixel);
+    if (inner.XMost() < 0) {
+      appliedOffset.x = std::min(0, outer.XMost()) - inner.XMost();
+      MOZ_ASSERT(appliedOffset.x > 0);
+    }
+  }
+  if (outer.X() != inner.X()) {
+    nscoord distance = DistanceToRange(outer.X(), inner.X());
+    if (distance < 0) {
+      distance += NegativePart(inner.XMost(), outer.XMost());
+    }
+    rightMargin = Some(NSAppUnitsToFloatPixels(
+        scrollPort.XMost() - itemBounds.XMost() + distance, auPerDevPixel));
+    hBounds.min = NSAppUnitsToFloatPixels(outer.X() - inner.X(), auPerDevPixel);
+    if (appliedOffset.x == 0 && inner.X() > 0) {
+      appliedOffset.x = std::max(0, outer.X()) - inner.X();
+      MOZ_ASSERT(appliedOffset.x < 0);
+    }
+  }
+
+  LayoutDeviceRect bounds =
+      LayoutDeviceRect::FromAppUnits(itemBounds, auPerDevPixel);
+  wr::LayoutVector2D applied = {
+      NSAppUnitsToFloatPixels(appliedOffset.x, auPerDevPixel),
+      NSAppUnitsToFloatPixels(appliedOffset.y, auPerDevPixel)};
+  bool needsProp =
+      nsDisplayStickyPosition::ShouldGetStickyAnimationId(stickyFrame);
+  Maybe<wr::WrAnimationProperty> prop;
+  if (needsProp) {
+    auto displayItemKey = nsDisplayItem::GetPerFrameKey(
+        0, 0, DisplayItemType::TYPE_STICKY_POSITION);
+    RefPtr<WebRenderAPZAnimationData> animationData =
+        mManager->CommandBuilder()
+            .CreateOrRecycleWebRenderUserData<WebRenderAPZAnimationData>(
+                displayItemKey, stickyFrame);
+    uint64_t animationId = animationData->GetAnimationId();
+
+    prop.emplace();
+    prop->id = animationId;
+    prop->effect_type = wr::WrAnimationType::Transform;
+  }
+  wr::WrSpatialId spatialId = mBuilder->DefineStickyFrame(
+      aASR, aParentSpatialId, wr::ToLayoutRect(bounds),
+      topMargin.ptrOr(nullptr), rightMargin.ptrOr(nullptr),
+      bottomMargin.ptrOr(nullptr), leftMargin.ptrOr(nullptr), vBounds, hBounds,
+      applied, prop.ptrOr(nullptr));
+
+  return Some(spatialId);
+}
+
+Maybe<wr::WrSpatialId> ClipManager::DefineSpatialNodes(
+    nsDisplayListBuilder* aBuilder, const ActiveScrolledRoot* aASR,
+    nsDisplayItem* aItem) {
+  if (!aASR) {
+    return Nothing();
+  }
+
+  Maybe<wr::WrSpatialId> space = mBuilder->GetSpatialIdForDefinedLayer(aASR);
+  if (space) {
+    return space;
+  }
+
+  Maybe<wr::WrSpatialId> ancestorSpace =
+      DefineSpatialNodes(aBuilder, aASR->mParent, aItem);
+
+  Maybe<wr::WrSpatialId> parent = ancestorSpace;
+  if (parent) {
+    *parent = SpatialIdAfterOverride(*parent);
+  }
+
+  if (aASR->mKind == ActiveScrolledRoot::ASRKind::Sticky) {
+    return ClipManager::DefineStickyNode(aBuilder, parent, aASR, aItem);
+  }
+
+  MOZ_ASSERT(aASR->mKind == ActiveScrolledRoot::ASRKind::Scroll);
+  ScrollableLayerGuid::ViewID viewId = aASR->GetViewId();
+
+  MOZ_ASSERT(viewId != ScrollableLayerGuid::NULL_SCROLL_ID);
+
+  ScrollContainerFrame* scrollContainerFrame = aASR->ScrollFrame();
+  Maybe<ScrollMetadata> metadata = scrollContainerFrame->ComputeScrollMetadata(
+      mManager, aItem->Frame(), aItem->ToReferenceFrame());
+  if (!metadata) {
+    MOZ_ASSERT_UNREACHABLE("Expected scroll metadata to be available!");
+    return ancestorSpace;
+  }
+
+  FrameMetrics& metrics = metadata->GetMetrics();
+  if (!metrics.IsScrollable()) {
+    return ancestorSpace;
+  }
+
+  nsPoint offset = scrollContainerFrame->GetOffsetToCrossDoc(aItem->Frame()) +
+                   aItem->ToReferenceFrame();
+  int32_t auPerDevPixel = aItem->Frame()->PresContext()->AppUnitsPerDevPixel();
+  nsRect scrollPort = scrollContainerFrame->GetScrollPortRect() + offset;
+  LayoutDeviceRect clipBounds =
+      LayoutDeviceRect::FromAppUnits(scrollPort, auPerDevPixel);
+
+  LayoutDeviceRect contentRect =
+      metrics.GetExpandedScrollableRect() * metrics.GetDevPixelsPerCSSPixel();
+  contentRect.MoveTo(clipBounds.TopLeft());
+
+  const bool useRoundedOffset =
+      StaticPrefs::apz_rounded_external_scroll_offset();
+  LayoutDevicePoint scrollOffset =
+      useRoundedOffset
+          ? LayoutDevicePoint::FromAppUnitsRounded(
+                scrollContainerFrame->GetScrollPosition(), auPerDevPixel)
+          : LayoutDevicePoint::FromAppUnits(
+                scrollContainerFrame->GetScrollPosition(), auPerDevPixel);
+
+  nsPresContext* presContext = aItem->Frame()->PresContext();
+  const bool hasScrollLinkedEffect =
+      !StaticPrefs::apz_disable_for_scroll_linked_effects() &&
+      presContext->Document()->HasScrollLinkedEffect();
+
+  return Some(mBuilder->DefineScrollLayer(
+      aASR, viewId, parent, wr::ToLayoutRect(contentRect),
+      wr::ToLayoutRect(clipBounds), wr::ToLayoutVector2D(scrollOffset),
+      wr::ToWrAPZScrollGeneration(
+          scrollContainerFrame->ScrollGenerationOnApz()),
+      wr::ToWrHasScrollLinkedEffect(hasScrollLinkedEffect)));
+}
+
+Maybe<wr::WrClipChainId> ClipManager::DefineClipChain(
+    const DisplayItemClipChain* aChain, int32_t aAppUnitsPerDevPixel) {
+  MOZ_ASSERT(mCacheStackTop > 0);
+  if (!aChain) {
+    return Nothing();
+  }
+
+  ClipIdMap& cache = mCacheStack[mCacheStackTop - 1];
+  MOZ_DIAGNOSTIC_ASSERT(aChain->mOnStack || !aChain->mASR ||
+                        aChain->mASR->mFrame);
+
+  if (auto iter = cache.find(aChain); iter != cache.end()) {
+    CLIP_LOG("cache[%p] => hit\n", aChain);
+    return iter->second.mWrChainID;
+  }
+
+  const auto parentChain =
+      DefineClipChain(aChain->mParent, aAppUnitsPerDevPixel);
+  if (!aChain->mClip.HasClip()) {
+    cache[aChain] = {parentChain};
+    return parentChain;
+  }
+
+  auto clip = LayoutDeviceRect::FromAppUnits(aChain->mClip.GetClipRect(),
+                                             aAppUnitsPerDevPixel);
+  AutoTArray<wr::ComplexClipRegion, 6> wrRoundedRects;
+  aChain->mClip.ToComplexClipRegions(aAppUnitsPerDevPixel, wrRoundedRects);
+  wr::WrSpatialId space = GetSpatialId(aChain->mASR);
+  space = SpatialIdAfterOverride(space);
+  AutoTArray<wr::WrClipId, 6> clipChainClipIds;
+  auto rectClipId =
+      mBuilder->DefineRectClip(Some(space), wr::ToLayoutRect(clip));
+  CLIP_LOG("cache[%p] <= %zu\n", aChain, rectClipId.id);
+  clipChainClipIds.AppendElement(rectClipId);
+
+  for (const auto& complexClip : wrRoundedRects) {
+    auto complexClipId =
+        mBuilder->DefineRoundedRectClip(Some(space), complexClip);
+    CLIP_LOG("cache[%p] <= %zu\n", aChain, complexClipId.id);
+    clipChainClipIds.AppendElement(complexClipId);
+  }
+  auto id = Some(mBuilder->DefineClipChain(clipChainClipIds, parentChain));
+  cache[aChain] = {id};
+  return id;
+}
+
+ClipManager::~ClipManager() {
+  MOZ_ASSERT(!mBuilder);
+  MOZ_ASSERT(mCacheStackTop == 0);
+  MOZ_ASSERT(mItemClipStack.empty());
+}
+
+ClipManager::ItemClips::ItemClips(const ActiveScrolledRoot* aASR,
+                                  const DisplayItemClipChain* aChain,
+                                  int32_t aAppUnitsPerDevPixel)
+    : mASR(aASR), mChain(aChain), mAppUnitsPerDevPixel(aAppUnitsPerDevPixel) {
+  mScrollId = wr::wr_root_scroll_node_id();
+}
+
+bool ClipManager::ItemClips::HasSameInputs(const ItemClips& aOther) {
+  if (mASR != aOther.mASR || mChain != aOther.mChain) {
+    return false;
+  }
+  if (mChain && mAppUnitsPerDevPixel != aOther.mAppUnitsPerDevPixel) {
+    return false;
+  }
+  return true;
+}
+
+}  

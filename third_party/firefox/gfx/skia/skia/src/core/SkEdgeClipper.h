@@ -1,0 +1,65 @@
+/*
+ * Copyright 2009 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+
+#if !defined(SkEdgeClipper_DEFINED)
+#define SkEdgeClipper_DEFINED
+
+#include "include/core/SkPathTypes.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkScalar.h"
+#include "include/private/base/SkDebug.h"
+
+#include <optional>
+
+struct SkPathRaw;
+struct SkRect;
+
+class SkEdgeClipper {
+public:
+    explicit SkEdgeClipper(bool canCullToTheRight) : fCanCullToTheRight(canCullToTheRight) {}
+
+    bool clipLine(SkPoint p0, SkPoint p1, const SkRect& clip);
+    bool clipQuad(const SkPoint pts[3], const SkRect& clip);
+    bool clipCubic(const SkPoint pts[4], const SkRect& clip);
+
+    std::optional<SkPathVerb> next(SkPoint pts[]);
+
+    bool canCullToTheRight() const { return fCanCullToTheRight; }
+
+    static void ClipPath(const SkPathRaw&, const SkRect& clip, bool canCullToTheRight,
+                         void (*consume)(SkEdgeClipper*, bool newCtr, void* ctx), void* ctx);
+
+private:
+    SkPoint*    fCurrPoint;
+    SkPathVerb* fCurrVerb, *fCurrVerbStop;
+    const bool  fCanCullToTheRight;
+
+    enum {
+        kMaxVerbs = 18,  
+        kMaxPoints = 54  
+    };
+    SkPoint     fPoints[kMaxPoints];
+    SkPathVerb  fVerbs[kMaxVerbs];
+
+    void clipMonoQuad(const SkPoint srcPts[3], const SkRect& clip);
+    void clipMonoCubic(const SkPoint srcPts[4], const SkRect& clip);
+    void appendLine(SkPoint p0, SkPoint p1);
+    void appendVLine(SkScalar x, SkScalar y0, SkScalar y1, bool reverse);
+    void appendQuad(const SkPoint pts[3], bool reverse);
+    void appendCubic(const SkPoint pts[4], bool reverse);
+};
+
+#if defined(SK_DEBUG)
+    void sk_assert_monotonic_x(const SkPoint pts[], int count);
+    void sk_assert_monotonic_y(const SkPoint pts[], int count);
+#else
+    #define sk_assert_monotonic_x(pts, count)
+    #define sk_assert_monotonic_y(pts, count)
+#endif
+
+#endif

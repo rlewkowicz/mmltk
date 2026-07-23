@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_DOM_IPC_JSACTOR_JSIPCVALUEUTILS_H_
+#define MOZILLA_DOM_IPC_JSACTOR_JSIPCVALUEUTILS_H_
+
+#include "js/RootingAPI.h"
+#include "js/Value.h"
+#include "jstypes.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/dom/JSActor.h"
+#include "mozilla/dom/JSIPCValue.h"
+
+
+namespace mozilla::dom {
+
+bool JSActorSupportsTypedSend(const nsACString& aName);
+
+class JSIPCValueUtils {
+ public:
+  struct Context {
+    explicit Context(JSContext* aCx, bool aStrict = true)
+        : mCx(aCx), mStrict(aStrict) {}
+
+    MOZ_IMPLICIT operator JSContext*() const { return mCx; }
+
+    JSContext* mCx;
+
+    bool mStrict;
+  };
+
+  static JSIPCValue FromJSVal(Context& aCx, JS::Handle<JS::Value> aVal,
+                              bool aSendTyped, ErrorResult& aError);
+
+  static JSIPCValue FromJSVal(Context& aCx, JS::Handle<JS::Value> aVal,
+                              JS::Handle<JS::Value> aTransferable,
+                              bool aSendTyped, ErrorResult& aError);
+
+  static JSIPCValue TypedFromJSVal(Context& aCx, JS::Handle<JS::Value> aVal,
+                                   ErrorResult& aError);
+
+  static void ToJSVal(JSContext* aCx, JSIPCValue&& aIn,
+                      JS::MutableHandle<JS::Value> aOut, ErrorResult& aError);
+};
+
+}  
+
+#endif  // MOZILLA_DOM_IPC_JSACTOR_JSIPCVALUEUTILS_H_

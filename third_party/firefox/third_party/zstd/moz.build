@@ -1,0 +1,9 @@
+EXPORTS.zstd += ['lib/zstd.h', 'lib/zstd_errors.h']
+UNIFIED_SOURCES += ['lib/common/debug.c', 'lib/common/entropy_common.c', 'lib/common/error_private.c', 'lib/common/fse_decompress.c', 'lib/common/pool.c', 'lib/common/threading.c', 'lib/common/xxhash.c', 'lib/common/zstd_common.c', 'lib/decompress/huf_decompress.c', 'lib/decompress/zstd_ddict.c', 'lib/decompress/zstd_decompress.c', 'lib/decompress/zstd_decompress_block.c']
+COMPILE_FLAGS['WARNINGS_CFLAGS'] += ['-Wextra', '-Wcast-qual', '-Wcast-align', '-Wshadow', '-Wstrict-aliasing=1', '-Wswitch-enum', '-Wdeclaration-after-statement', '-Wstrict-prototypes', '-Wundef', '-Wpointer-arith', '-Wvla', '-Wformat=2', '-Winit-self', '-Wfloat-equal', '-Wwrite-strings', '-Wredundant-decls', '-Wmissing-prototypes', '-Wc++-compat']
+CXXFLAGS += ['-DXXH_NAMESPACE=ZSTD_', '-DDEBUGLEVEL=0', '-DZSTD_MULTITHREAD=1']
+LOCAL_INCLUDES += ['lib/decompress']
+SOURCES += ['lib/decompress/huf_decompress_amd64.S']
+AllowCompilerWarnings()
+Library('zstd')
+FINAL_LIBRARY = 'xul'

@@ -1,0 +1,54 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_BodyUtil_h
+#define mozilla_dom_BodyUtil_h
+
+#include "js/Utility.h"  // JS::FreePolicy
+#include "mozilla/dom/File.h"
+#include "mozilla/dom/FormData.h"
+#include "nsError.h"
+#include "nsString.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+class BodyUtil final {
+ public:
+  BodyUtil() = delete;
+
+  static void ConsumeArrayBuffer(JSContext* aCx,
+                                 JS::MutableHandle<JSObject*> aValue,
+                                 uint32_t aInputLength,
+                                 UniquePtr<uint8_t[], JS::FreePolicy> aInput,
+                                 ErrorResult& aRv);
+
+  static already_AddRefed<Blob> ConsumeBlob(nsIGlobalObject* aParent,
+                                            const nsString& aMimeType,
+                                            uint32_t aInputLength,
+                                            uint8_t* aInput, ErrorResult& aRv);
+
+  static void ConsumeBytes(JSContext* aCx, JS::MutableHandle<JSObject*> aValue,
+                           uint32_t aInputLength,
+                           UniquePtr<uint8_t[], JS::FreePolicy> aInput,
+                           ErrorResult& aRv);
+
+  static already_AddRefed<FormData> ConsumeFormData(
+      nsIGlobalObject* aParent, const nsCString& aMimeType,
+      const nsACString& aMixedCaseMimeType, const nsCString& aStr,
+      ErrorResult& aRv);
+
+  static nsresult ConsumeText(uint32_t aInputLength, uint8_t* aInput,
+                              nsString& aText);
+
+  static void ConsumeJson(JSContext* aCx, JS::MutableHandle<JS::Value> aValue,
+                          const nsString& aStr, ErrorResult& aRv);
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_BodyUtil_h

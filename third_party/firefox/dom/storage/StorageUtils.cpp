@@ -1,0 +1,93 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "StorageUtils.h"
+
+#include "mozilla/OriginAttributes.h"
+#include "mozilla/StorageOriginAttributes.h"
+#include "nsDebug.h"
+#include "nsIPrincipal.h"
+#include "nsIURI.h"
+#include "nsIURL.h"
+#include "nsNetUtil.h"
+#include "nsPrintfCString.h"
+
+namespace mozilla::dom::StorageUtils {
+
+bool PrincipalsEqual(nsIPrincipal* aObjectPrincipal,
+                     nsIPrincipal* aSubjectPrincipal) {
+  if (!aSubjectPrincipal) {
+    return true;
+  }
+
+  if (!aObjectPrincipal) {
+    return false;
+  }
+
+  return aSubjectPrincipal->Equals(aObjectPrincipal);
+}
+
+void ReverseString(const nsACString& aSource, nsACString& aResult) {
+  nsACString::const_iterator sourceBegin, sourceEnd;
+  aSource.BeginReading(sourceBegin);
+  aSource.EndReading(sourceEnd);
+
+  aResult.SetLength(aSource.Length());
+  auto destEnd = aResult.EndWriting();
+
+  while (sourceBegin != sourceEnd) {
+    *(--destEnd) = *sourceBegin;
+    ++sourceBegin;
+  }
+}
+
+nsresult CreateReversedDomain(const nsACString& aAsciiDomain,
+                              nsACString& aKey) {
+  if (aAsciiDomain.IsEmpty()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  ReverseString(aAsciiDomain, aKey);
+
+  aKey.Append('.');
+  return NS_OK;
+}
+
+nsCString Scheme0Scope(const nsACString& aOriginSuffix,
+                       const nsACString& aOriginNoSuffix) {
+  nsCString result;
+
+  StorageOriginAttributes oa;
+  if (!aOriginSuffix.IsEmpty()) {
+    DebugOnly<bool> success = oa.PopulateFromSuffix(aOriginSuffix);
+    MOZ_ASSERT(success);
+  }
+
+  if (oa.InIsolatedMozBrowser()) {
+    result.AppendInt(0);  
+    result.Append(':');
+    result.Append(oa.InIsolatedMozBrowser() ? 't' : 'f');
+    result.Append(':');
+  }
+
+  nsAutoCString remaining;
+  oa.SetInIsolatedMozBrowser(false);
+  oa.CreateSuffix(remaining);
+  if (!remaining.IsEmpty()) {
+    MOZ_ASSERT(!aOriginSuffix.IsEmpty());
+
+    if (result.IsEmpty()) {
+      result.AppendLiteral("0:f:");
+    }
+
+    result.Append(aOriginSuffix);
+    result.Append(':');
+  }
+
+  result.Append(aOriginNoSuffix);
+
+  return result;
+}
+
+}  

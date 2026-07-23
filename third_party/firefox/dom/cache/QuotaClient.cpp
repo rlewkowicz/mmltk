@@ -1,0 +1,470 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DBAction.h"
+#include "FileUtilsImpl.h"
+#include "QuotaClientImpl.h"
+#include "mozilla/ResultExtensions.h"
+#include "mozilla/dom/cache/DBSchema.h"
+#include "mozilla/dom/cache/Manager.h"
+#include "mozilla/dom/quota/PersistenceType.h"
+#include "mozilla/dom/quota/QuotaCommon.h"
+#include "mozilla/dom/quota/QuotaManager.h"
+#include "mozilla/dom/quota/UsageInfo.h"
+#include "mozilla/ipc/BackgroundParent.h"
+#include "nsIFile.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla::dom::cache {
+
+using mozilla::dom::quota::AssertIsOnIOThread;
+using mozilla::dom::quota::Client;
+using mozilla::dom::quota::CloneFileAndAppend;
+using mozilla::dom::quota::DatabaseUsageType;
+using mozilla::dom::quota::GetDirEntryKind;
+using mozilla::dom::quota::nsIFileKind;
+using mozilla::dom::quota::OriginMetadata;
+using mozilla::dom::quota::PrincipalMetadata;
+using mozilla::dom::quota::QuotaManager;
+using mozilla::dom::quota::UsageInfo;
+using mozilla::ipc::AssertIsOnBackgroundThread;
+
+namespace {
+
+template <typename StepFunc>
+Result<UsageInfo, nsresult> ReduceUsageInfo(nsIFile& aDir,
+                                            const Atomic<bool>& aCanceled,
+                                            const StepFunc& aStepFunc) {
+  QM_TRY_RETURN(quota::ReduceEachFileAtomicCancelable(
+      aDir, aCanceled, UsageInfo{},
+      [&aStepFunc](UsageInfo usageInfo, const nsCOMPtr<nsIFile>& bodyDir)
+          -> Result<UsageInfo, nsresult> {
+        QM_TRY(OkIf(!QuotaManager::IsShuttingDown()).mapErr([](const auto&) {
+          return NS_ERROR_ABORT;
+        }));
+
+        QM_TRY_INSPECT(const auto& stepUsageInfo, aStepFunc(bodyDir));
+
+        return usageInfo + stepUsageInfo;
+      }));
+}
+
+Result<int64_t, nsresult> GetPaddingSizeFromDB(
+    nsIFile& aDir, nsIFile& aDBFile, const OriginMetadata& aOriginMetadata,
+    const Maybe<CipherKey>& aMaybeCipherKey) {
+  CacheDirectoryMetadata directoryMetadata(aOriginMetadata);
+  MOZ_DIAGNOSTIC_ASSERT(directoryMetadata.mDirectoryLockId == -1);
+
+#ifdef DEBUG
+  {
+    QM_TRY_INSPECT(const bool& exists,
+                   MOZ_TO_RESULT_INVOKE_MEMBER(aDBFile, Exists));
+    MOZ_ASSERT(exists);
+  }
+#endif
+
+  QM_TRY_INSPECT(const auto& conn,
+                 OpenDBConnection(directoryMetadata, aDBFile, aMaybeCipherKey));
+
+  QM_TRY(MOZ_TO_RESULT(db::CreateOrMigrateSchema(aDir, *conn)));
+
+  QM_TRY_RETURN(DirectoryPaddingRestore(aDir, *conn,
+                                         false));
+}
+
+Result<int64_t, nsresult> GetTotalDiskUsageFromDB(
+    nsIFile& aDir, nsIFile& aDBFile, const OriginMetadata& aOriginMetadata,
+    const Maybe<CipherKey>& aMaybeCipherKey) {
+  CacheDirectoryMetadata directoryMetadata(aOriginMetadata);
+  MOZ_DIAGNOSTIC_ASSERT(directoryMetadata.mDirectoryLockId == -1);
+
+#ifdef DEBUG
+  {
+    QM_TRY_INSPECT(const bool& exists,
+                   MOZ_TO_RESULT_INVOKE_MEMBER(aDBFile, Exists));
+    MOZ_ASSERT(exists);
+  }
+#endif
+
+  QM_TRY_INSPECT(const auto& conn,
+                 OpenDBConnection(directoryMetadata, aDBFile, aMaybeCipherKey));
+
+  QM_TRY(MOZ_TO_RESULT(db::CreateOrMigrateSchema(aDir, *conn)));
+
+  QM_TRY_RETURN(db::GetTotalDiskUsage(*conn));
+}
+
+}  
+
+const nsLiteralString kCachesSQLiteFilename = u"caches.sqlite"_ns;
+const nsLiteralString kMorgueDirectoryFilename = u"morgue"_ns;
+
+CacheQuotaClient::CacheQuotaClient() {
+  AssertIsOnBackgroundThread();
+  MOZ_DIAGNOSTIC_ASSERT(!sInstance);
+  sInstance = this;
+}
+
+CacheQuotaClient* CacheQuotaClient::Get() {
+  MOZ_DIAGNOSTIC_ASSERT(sInstance);
+  return sInstance;
+}
+
+CacheQuotaClient::Type CacheQuotaClient::GetType() { return DOMCACHE; }
+
+Result<UsageInfo, nsresult> CacheQuotaClient::InitOrigin(
+    PersistenceType aPersistenceType, const OriginMetadata& aOriginMetadata,
+    const AtomicBool& aCanceled) {
+  AssertIsOnIOThread();
+  MOZ_ASSERT(aOriginMetadata.mPersistenceType == aPersistenceType);
+
+  QuotaManager* const qm = QuotaManager::Get();
+  MOZ_DIAGNOSTIC_ASSERT(qm);
+
+  QM_TRY_INSPECT(const auto& dir, qm->GetOriginDirectory(aOriginMetadata));
+
+  QM_TRY(MOZ_TO_RESULT(
+      dir->Append(NS_LITERAL_STRING_FROM_CSTRING(DOMCACHE_DIRECTORY_NAME))));
+
+  QM_TRY_INSPECT(
+      const auto& cachesSQLiteFile,
+      ([dir]() -> Result<nsCOMPtr<nsIFile>, nsresult> {
+        QM_TRY_INSPECT(const auto& cachesSQLite,
+                       CloneFileAndAppend(*dir, kCachesSQLiteFilename));
+
+        QM_TRY_INSPECT(const auto& dirEntryKind,
+                       GetDirEntryKind(*cachesSQLite));
+        if (dirEntryKind == nsIFileKind::DoesNotExist) {
+          QM_TRY(MOZ_TO_RESULT(mozilla::dom::cache::DirectoryPaddingDeleteFile(
+              *dir, DirPaddingFile::TMP_FILE)));
+
+          QM_TRY(MOZ_TO_RESULT(mozilla::dom::cache::DirectoryPaddingDeleteFile(
+              *dir, DirPaddingFile::FILE)));
+
+          QM_TRY_INSPECT(const auto& morgueDir,
+                         CloneFileAndAppend(*dir, kMorgueDirectoryFilename));
+
+          QM_TRY(MOZ_TO_RESULT(mozilla::dom::cache::RemoveNsIFileRecursively(
+              Nothing(), *morgueDir,
+               false)));
+
+          return nsCOMPtr<nsIFile>{nullptr};
+        }
+
+        QM_TRY(OkIf(dirEntryKind == nsIFileKind::ExistsAsFile),
+               Err(NS_ERROR_FAILURE));
+
+        return cachesSQLite;
+      }()));
+
+  QM_TRY(OkIf(!!cachesSQLiteFile), UsageInfo{});
+
+  const auto maybeCipherKey = [this, &aOriginMetadata] {
+    Maybe<CipherKey> maybeCipherKey;
+    auto cipherKeyManager = GetOrCreateCipherKeyManager(aOriginMetadata);
+    if (cipherKeyManager) {
+      maybeCipherKey = Some(cipherKeyManager->Ensure());
+    }
+    return maybeCipherKey;
+  }();
+
+  QM_TRY_INSPECT(
+      const auto& paddingSize,
+      ([dir, cachesSQLiteFile, &aOriginMetadata,
+        &maybeCipherKey]() -> Result<int64_t, nsresult> {
+        if (!DirectoryPaddingFileExists(*dir, DirPaddingFile::TMP_FILE)) {
+          QM_WARNONLY_TRY_UNWRAP(const auto maybePaddingSize,
+                                 DirectoryPaddingGet(*dir));
+          if (maybePaddingSize) {
+            return maybePaddingSize.ref();
+          }
+        }
+
+        QM_TRY_RETURN(GetPaddingSizeFromDB(*dir, *cachesSQLiteFile,
+                                           aOriginMetadata, maybeCipherKey));
+      }()));
+
+  QM_TRY_INSPECT(const auto& totalDiskUsage,
+                 GetTotalDiskUsageFromDB(*dir, *cachesSQLiteFile,
+                                         aOriginMetadata, maybeCipherKey));
+
+  QM_TRY_INSPECT(
+      const auto& innerUsageInfo,
+      ReduceUsageInfo(
+          *dir, aCanceled,
+          [](const nsCOMPtr<nsIFile>& file) -> Result<UsageInfo, nsresult> {
+            QM_TRY_INSPECT(const auto& leafName,
+                           MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(nsAutoString, file,
+                                                             GetLeafName));
+
+            QM_TRY_INSPECT(const auto& dirEntryKind, GetDirEntryKind(*file));
+
+            switch (dirEntryKind) {
+              case nsIFileKind::ExistsAsDirectory:
+                if (!leafName.EqualsLiteral("morgue")) {
+                  NS_WARNING("Unknown Cache directory found!");
+                }
+
+                break;
+
+              case nsIFileKind::ExistsAsFile:
+                if (leafName.EqualsLiteral("caches.sqlite-journal") ||
+                    leafName.EqualsLiteral("caches.sqlite-shm") ||
+                    StringBeginsWith(leafName, u"caches.sqlite-mj"_ns) ||
+                    leafName.EqualsLiteral("context_open.marker")) {
+                  break;
+                }
+
+                if (leafName.Equals(kCachesSQLiteFilename) ||
+                    leafName.EqualsLiteral("caches.sqlite-wal")) {
+                  QM_TRY_INSPECT(
+                      const int64_t& fileSize,
+                      MOZ_TO_RESULT_INVOKE_MEMBER(file, GetFileSize));
+                  MOZ_DIAGNOSTIC_ASSERT(fileSize >= 0);
+
+                  return UsageInfo{DatabaseUsageType(Some(fileSize))};
+                }
+
+                if (leafName.EqualsLiteral(PADDING_FILE_NAME) ||
+                    leafName.EqualsLiteral(PADDING_TMP_FILE_NAME)) {
+                  break;
+                }
+
+                NS_WARNING("Unknown Cache file found!");
+
+                break;
+
+              case nsIFileKind::DoesNotExist:
+                break;
+            }
+
+            return UsageInfo{};
+          }));
+
+  return UsageInfo{DatabaseUsageType(Some(paddingSize))} +
+         UsageInfo{DatabaseUsageType(Some(totalDiskUsage))} + innerUsageInfo;
+}
+
+nsresult CacheQuotaClient::InitOriginWithoutTracking(
+    PersistenceType aPersistenceType, const OriginMetadata& aOriginMetadata,
+    const AtomicBool& aCanceled) {
+  AssertIsOnIOThread();
+
+  UNKNOWN_FILE_WARNING(NS_LITERAL_STRING_FROM_CSTRING(DOMCACHE_DIRECTORY_NAME));
+  return NS_OK;
+}
+
+Result<UsageInfo, nsresult> CacheQuotaClient::GetUsageForOrigin(
+    PersistenceType aPersistenceType, const OriginMetadata& aOriginMetadata,
+    const AtomicBool& aCanceled) {
+  AssertIsOnIOThread();
+
+
+  QuotaManager* quotaManager = QuotaManager::Get();
+  MOZ_ASSERT(quotaManager);
+
+  return quotaManager->GetUsageForClient(aOriginMetadata.mPersistenceType,
+                                         aOriginMetadata, Client::DOMCACHE);
+}
+
+void CacheQuotaClient::OnOriginClearCompleted(
+    const OriginMetadata& aOriginMetadata) {
+  AssertIsOnIOThread();
+
+  if (aOriginMetadata.mPersistenceType == quota::PERSISTENCE_TYPE_PRIVATE) {
+    if (auto entry = mCipherKeyManagers.Lookup(aOriginMetadata.mOrigin)) {
+      entry.Data()->Invalidate();
+      entry.Remove();
+    }
+  }
+}
+
+void CacheQuotaClient::OnRepositoryClearCompleted(
+    PersistenceType aPersistenceType) {
+  AssertIsOnIOThread();
+
+  if (aPersistenceType == quota::PERSISTENCE_TYPE_PRIVATE) {
+    for (const auto& cipherKeyManager : mCipherKeyManagers.Values()) {
+      cipherKeyManager->Invalidate();
+    }
+
+    mCipherKeyManagers.Clear();
+  }
+}
+
+void CacheQuotaClient::ReleaseIOThreadObjects() {
+}
+
+void CacheQuotaClient::AbortOperationsForLocks(
+    const DirectoryLockIdTable& aDirectoryLockIds) {
+  AssertIsOnBackgroundThread();
+
+  Manager::Abort(aDirectoryLockIds);
+}
+
+void CacheQuotaClient::AbortOperationsForProcess(
+    ContentParentId aContentParentId) {
+}
+
+void CacheQuotaClient::AbortAllOperations() {
+  AssertIsOnBackgroundThread();
+
+  Manager::AbortAll();
+}
+
+void CacheQuotaClient::StartIdleMaintenance() {}
+
+void CacheQuotaClient::StopIdleMaintenance() {}
+
+void CacheQuotaClient::InitiateShutdown() {
+  AssertIsOnBackgroundThread();
+
+  Manager::InitiateShutdown();
+}
+
+bool CacheQuotaClient::IsShutdownCompleted() const {
+  AssertIsOnBackgroundThread();
+
+  return Manager::IsShutdownAllComplete();
+}
+
+void CacheQuotaClient::ForceKillActors() {
+}
+
+nsCString CacheQuotaClient::GetShutdownStatus() const {
+  AssertIsOnBackgroundThread();
+
+  return Manager::GetShutdownStatus();
+}
+
+void CacheQuotaClient::FinalizeShutdown() {
+}
+
+nsresult CacheQuotaClient::UpgradeStorageFrom2_0To2_1(nsIFile* aDirectory) {
+  AssertIsOnIOThread();
+  MOZ_DIAGNOSTIC_ASSERT(aDirectory);
+
+  QM_TRY(MOZ_TO_RESULT(DirectoryPaddingInit(*aDirectory)));
+
+  return NS_OK;
+}
+
+nsresult CacheQuotaClient::RestorePaddingFileInternal(
+    nsIFile* aBaseDir, mozIStorageConnection* aConn) {
+  MOZ_ASSERT(!NS_IsMainThread());
+  MOZ_DIAGNOSTIC_ASSERT(aBaseDir);
+  MOZ_DIAGNOSTIC_ASSERT(aConn);
+
+  QM_TRY_INSPECT(const int64_t& dummyPaddingSize,
+                 DirectoryPaddingRestore(*aBaseDir, *aConn,
+                                          true));
+  (void)dummyPaddingSize;
+
+  return NS_OK;
+}
+
+nsresult CacheQuotaClient::WipePaddingFileInternal(
+    const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile* aBaseDir) {
+  MOZ_ASSERT(!NS_IsMainThread());
+  MOZ_DIAGNOSTIC_ASSERT(aBaseDir);
+
+  MOZ_ASSERT(DirectoryPaddingFileExists(*aBaseDir, DirPaddingFile::FILE));
+
+  QM_TRY_INSPECT(
+      const int64_t& paddingSize, ([&aBaseDir]() -> Result<int64_t, nsresult> {
+        const bool temporaryPaddingFileExist =
+            DirectoryPaddingFileExists(*aBaseDir, DirPaddingFile::TMP_FILE);
+
+        Maybe<int64_t> directoryPaddingGetResult;
+        if (!temporaryPaddingFileExist) {
+          QM_TRY_UNWRAP(directoryPaddingGetResult,
+                        ([&aBaseDir]() -> Result<Maybe<int64_t>, nsresult> {
+                          QM_TRY_RETURN(
+                              DirectoryPaddingGet(*aBaseDir).map(Some<int64_t>),
+                              Maybe<int64_t>{});
+                        }()));
+        }
+
+        if (temporaryPaddingFileExist || !directoryPaddingGetResult) {
+          NS_WARNING("Cannnot read padding size from file!");
+          return 0;
+        }
+
+        return *directoryPaddingGetResult;
+      }()));
+
+  if (paddingSize > 0) {
+    DecreaseUsageForDirectoryMetadata(aDirectoryMetadata, paddingSize);
+  }
+
+  QM_TRY(MOZ_TO_RESULT(
+      DirectoryPaddingDeleteFile(*aBaseDir, DirPaddingFile::FILE)));
+
+  QM_TRY(MOZ_TO_RESULT(
+      DirectoryPaddingDeleteFile(*aBaseDir, DirPaddingFile::TMP_FILE)));
+
+  QM_TRY(MOZ_TO_RESULT(DirectoryPaddingInit(*aBaseDir)));
+
+  return NS_OK;
+}
+
+RefPtr<CipherKeyManager> CacheQuotaClient::GetOrCreateCipherKeyManager(
+    const PrincipalMetadata& aMetadata) {
+  AssertIsOnIOThread();
+
+  auto privateOrigin = aMetadata.mIsPrivate;
+  if (!privateOrigin) {
+    return nullptr;
+  }
+
+  const auto& origin = aMetadata.mOrigin;
+  return mCipherKeyManagers.LookupOrInsertWith(
+      origin, [] { return new CipherKeyManager("CacheCipherKeyManager"); });
+}
+
+CacheQuotaClient::~CacheQuotaClient() {
+  AssertIsOnBackgroundThread();
+  MOZ_DIAGNOSTIC_ASSERT(sInstance == this);
+
+  sInstance = nullptr;
+}
+
+CacheQuotaClient* CacheQuotaClient::sInstance = nullptr;
+
+already_AddRefed<quota::Client> CreateQuotaClient() {
+  AssertIsOnBackgroundThread();
+
+  RefPtr<CacheQuotaClient> ref = new CacheQuotaClient();
+  return ref.forget();
+}
+
+nsresult RestorePaddingFile(nsIFile* aBaseDir, mozIStorageConnection* aConn) {
+  MOZ_ASSERT(!NS_IsMainThread());
+  MOZ_DIAGNOSTIC_ASSERT(aBaseDir);
+  MOZ_DIAGNOSTIC_ASSERT(aConn);
+
+  RefPtr<CacheQuotaClient> cacheQuotaClient = CacheQuotaClient::Get();
+  MOZ_DIAGNOSTIC_ASSERT(cacheQuotaClient);
+
+  QM_TRY(MOZ_TO_RESULT(
+      cacheQuotaClient->RestorePaddingFileInternal(aBaseDir, aConn)));
+
+  return NS_OK;
+}
+
+nsresult WipePaddingFile(const CacheDirectoryMetadata& aDirectoryMetadata,
+                         nsIFile* aBaseDir) {
+  MOZ_ASSERT(!NS_IsMainThread());
+  MOZ_DIAGNOSTIC_ASSERT(aBaseDir);
+
+  RefPtr<CacheQuotaClient> cacheQuotaClient = CacheQuotaClient::Get();
+  MOZ_DIAGNOSTIC_ASSERT(cacheQuotaClient);
+
+  QM_TRY(MOZ_TO_RESULT(
+      cacheQuotaClient->WipePaddingFileInternal(aDirectoryMetadata, aBaseDir)));
+
+  return NS_OK;
+}
+
+}  

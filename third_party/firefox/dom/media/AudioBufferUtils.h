@@ -1,0 +1,183 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_SCRATCHBUFFER_H_
+#define MOZILLA_SCRATCHBUFFER_H_
+
+#include <algorithm>
+
+#include "AudioSegment.h"
+#include "mozilla/PodOperations.h"
+#include "mozilla/UniquePtr.h"
+#include "nsDebug.h"
+
+namespace mozilla {
+
+static inline uint32_t FramesToSamples(uint32_t aChannels, uint32_t aFrames) {
+  return aFrames * aChannels;
+}
+
+static inline uint32_t SamplesToFrames(uint32_t aChannels, uint32_t aSamples) {
+  MOZ_ASSERT(!(aSamples % aChannels), "Frame alignment is wrong.");
+  return aSamples / aChannels;
+}
+
+template <typename T>
+class AudioCallbackBufferWrapper {
+ public:
+  AudioCallbackBufferWrapper()
+      : mBuffer(nullptr), mSamples(0), mSampleWriteOffset(1), mChannels(0) {}
+
+  explicit AudioCallbackBufferWrapper(uint32_t aChannels)
+      : mBuffer(nullptr),
+        mSamples(0),
+        mSampleWriteOffset(1),
+        mChannels(aChannels)
+
+  {
+    MOZ_ASSERT(aChannels);
+  }
+
+  AudioCallbackBufferWrapper& operator=(
+      const AudioCallbackBufferWrapper& aOther) {
+    MOZ_ASSERT(!aOther.mBuffer,
+               "Don't use this ctor after AudioCallbackDriver::Init");
+    MOZ_ASSERT(aOther.mSamples == 0,
+               "Don't use this ctor after AudioCallbackDriver::Init");
+    MOZ_ASSERT(aOther.mSampleWriteOffset == 1,
+               "Don't use this ctor after AudioCallbackDriver::Init");
+    MOZ_ASSERT(aOther.mChannels != 0);
+
+    mBuffer = nullptr;
+    mSamples = 0;
+    mSampleWriteOffset = 1;
+    mChannels = aOther.mChannels;
+
+    return *this;
+  }
+
+  void SetBuffer(T* aBuffer, uint32_t aFrames) {
+    MOZ_ASSERT(!mBuffer && !mSamples, "SetBuffer called twice.");
+    mBuffer = aBuffer;
+    mSamples = FramesToSamples(mChannels, aFrames);
+    mSampleWriteOffset = 0;
+  }
+
+  void WriteSilence(const uint32_t aFrames) {
+    MOZ_ASSERT(aFrames <= Available(),
+               "Writing more than we can in the audio buffer.");
+
+    std::fill_n(mBuffer + mSampleWriteOffset, aFrames, static_cast<T>(0));
+    mSampleWriteOffset += FramesToSamples(mChannels, aFrames);
+  }
+  void WriteFrames(T* aBuffer, uint32_t aFrames) {
+    MOZ_ASSERT(aFrames <= Available(),
+               "Writing more than we can in the audio buffer.");
+
+    PodCopy(mBuffer + mSampleWriteOffset, aBuffer,
+            FramesToSamples(mChannels, aFrames));
+    mSampleWriteOffset += FramesToSamples(mChannels, aFrames);
+  }
+  void WriteFrames(const AudioChunk& aChunk, uint32_t aFrames) {
+    MOZ_ASSERT(aFrames <= Available(),
+               "Writing more than we can in the audio buffer.");
+
+    InterleaveAndConvertBuffer(aChunk.ChannelData<T>().Elements(), aFrames,
+                               aChunk.mVolume, aChunk.ChannelCount(),
+                               mBuffer + mSampleWriteOffset);
+    mSampleWriteOffset += FramesToSamples(mChannels, aFrames);
+  }
+
+  uint32_t Available() {
+    return SamplesToFrames(mChannels, mSamples - mSampleWriteOffset);
+  }
+
+  void BufferFilled() {
+    MOZ_ASSERT(Available() == 0, "Frames should have been written");
+    MOZ_ASSERT(mBuffer, "Buffer not set.");
+    mSamples = 0;
+    mSampleWriteOffset = 0;
+    mBuffer = nullptr;
+  }
+
+ private:
+  T* mBuffer;
+  uint32_t mSamples;
+  uint32_t mSampleWriteOffset;
+  uint32_t mChannels;
+};
+
+template <typename T, uint32_t BLOCK_SIZE>
+class SpillBuffer {
+ public:
+  SpillBuffer() : mBuffer(nullptr), mPosition(0), mChannels(0) {}
+
+  explicit SpillBuffer(uint32_t aChannels)
+      : mPosition(0), mChannels(aChannels) {
+    MOZ_ASSERT(aChannels);
+    mBuffer = MakeUnique<T[]>(BLOCK_SIZE * mChannels);
+    PodZero(mBuffer.get(), BLOCK_SIZE * mChannels);
+  }
+
+  SpillBuffer& operator=(SpillBuffer& aOther) {
+    MOZ_ASSERT(aOther.mPosition == 0,
+               "Don't use this ctor after AudioCallbackDriver::Init");
+    MOZ_ASSERT(aOther.mChannels != 0);
+    MOZ_ASSERT(aOther.mBuffer);
+
+    mPosition = aOther.mPosition;
+    mChannels = aOther.mChannels;
+    mBuffer = std::move(aOther.mBuffer);
+
+    return *this;
+  }
+
+  SpillBuffer& operator=(SpillBuffer&& aOther) {
+    return this->operator=(aOther);
+  }
+
+  bool IsEmpty() const { return mPosition == 0; }
+  void Empty() { mPosition = 0; }
+  uint32_t Empty(AudioCallbackBufferWrapper<T>& aBuffer) {
+    uint32_t framesToWrite =
+        std::min(aBuffer.Available(), SamplesToFrames(mChannels, mPosition));
+
+    aBuffer.WriteFrames(mBuffer.get(), framesToWrite);
+
+    mPosition -= FramesToSamples(mChannels, framesToWrite);
+    if (mPosition > 0) {
+      MOZ_ASSERT(FramesToSamples(mChannels, framesToWrite) + mPosition <=
+                 BLOCK_SIZE * mChannels);
+      PodMove(mBuffer.get(),
+              mBuffer.get() + FramesToSamples(mChannels, framesToWrite),
+              mPosition);
+    }
+
+    return framesToWrite;
+  }
+  uint32_t Fill(const AudioChunk& aInput) {
+    uint32_t framesToWrite =
+        std::min(static_cast<uint32_t>(aInput.mDuration),
+                 BLOCK_SIZE - SamplesToFrames(mChannels, mPosition));
+
+    MOZ_ASSERT(FramesToSamples(mChannels, framesToWrite) + mPosition <=
+               BLOCK_SIZE * mChannels);
+    InterleaveAndConvertBuffer(
+        aInput.ChannelData<T>().Elements(), framesToWrite, aInput.mVolume,
+        aInput.ChannelCount(), mBuffer.get() + mPosition);
+
+    mPosition += FramesToSamples(mChannels, framesToWrite);
+
+    return framesToWrite;
+  }
+
+ private:
+  UniquePtr<T[]> mBuffer;
+  uint32_t mPosition;
+  uint32_t mChannels;
+};
+
+}  
+
+#endif  // MOZILLA_SCRATCHBUFFER_H_

@@ -1,0 +1,83 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*****************************************************************************************
+* Copyright (C) 2014, International Business Machines
+* Corporation and others. All Rights Reserved.
+*****************************************************************************************
+*/
+
+#ifndef UREGION_H
+#define UREGION_H
+
+#include "unicode/utypes.h"
+#include "unicode/uenum.h"
+
+
+typedef enum URegionType {
+    URGN_UNKNOWN,
+
+    URGN_TERRITORY,
+
+    URGN_WORLD,
+
+    URGN_CONTINENT,
+
+    URGN_SUBCONTINENT,
+
+    URGN_GROUPING,
+
+    URGN_DEPRECATED,
+
+#ifndef U_HIDE_DEPRECATED_API
+    URGN_LIMIT
+#endif  /* U_HIDE_DEPRECATED_API */
+} URegionType;
+
+#if !UCONFIG_NO_FORMATTING
+
+struct URegion;
+typedef struct URegion URegion; 
+
+U_CAPI const URegion* U_EXPORT2
+uregion_getRegionFromCode(const char *regionCode, UErrorCode *status);
+
+U_CAPI const URegion* U_EXPORT2
+uregion_getRegionFromNumericCode (int32_t code, UErrorCode *status);
+
+U_CAPI UEnumeration* U_EXPORT2
+uregion_getAvailable(URegionType type, UErrorCode *status);
+
+U_CAPI UBool U_EXPORT2
+uregion_areEqual(const URegion* uregion, const URegion* otherRegion);
+
+U_CAPI const URegion* U_EXPORT2
+uregion_getContainingRegion(const URegion* uregion);
+
+U_CAPI const URegion* U_EXPORT2
+uregion_getContainingRegionOfType(const URegion* uregion, URegionType type);
+
+U_CAPI UEnumeration* U_EXPORT2
+uregion_getContainedRegions(const URegion* uregion, UErrorCode *status);
+
+U_CAPI UEnumeration* U_EXPORT2
+uregion_getContainedRegionsOfType(const URegion* uregion, URegionType type, UErrorCode *status);
+
+U_CAPI UBool U_EXPORT2
+uregion_contains(const URegion* uregion, const URegion* otherRegion);
+
+U_CAPI UEnumeration* U_EXPORT2
+uregion_getPreferredValues(const URegion* uregion, UErrorCode *status);
+
+U_CAPI const char* U_EXPORT2
+uregion_getRegionCode(const URegion* uregion);
+
+U_CAPI int32_t U_EXPORT2
+uregion_getNumericCode(const URegion* uregion);
+
+U_CAPI URegionType U_EXPORT2
+uregion_getType(const URegion* uregion);
+
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif

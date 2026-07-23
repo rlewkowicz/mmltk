@@ -1,0 +1,713 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsTHashtable_h_
+#define nsTHashtable_h_
+
+#include <iterator>
+#include <new>
+#include <type_traits>
+#include <utility>
+
+#include "PLDHashTable.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/OperatorNewExtensions.h"
+#include "mozilla/fallible.h"
+#include "nsPointerHashKeys.h"
+#include "nsTArrayForwardDeclare.h"
+#include "nsCycleCollectionContainerParticipant.h"
+
+template <class EntryType>
+class nsTHashtable;
+
+namespace detail {
+class nsTHashtableIteratorBase {
+ public:
+  using EndIteratorTag = PLDHashTable::Iterator::EndIteratorTag;
+
+  nsTHashtableIteratorBase(nsTHashtableIteratorBase&& aOther) = default;
+
+  nsTHashtableIteratorBase& operator=(nsTHashtableIteratorBase&& aOther) {
+    return operator=(static_cast<const nsTHashtableIteratorBase&>(aOther));
+  }
+
+  nsTHashtableIteratorBase(const nsTHashtableIteratorBase& aOther)
+      : mIterator{aOther.mIterator.Clone()} {}
+  nsTHashtableIteratorBase& operator=(const nsTHashtableIteratorBase& aOther) {
+    mIterator.~Iterator();
+    new (&mIterator) PLDHashTable::Iterator(aOther.mIterator.Clone());
+    return *this;
+  }
+
+  explicit nsTHashtableIteratorBase(PLDHashTable::Iterator aFrom)
+      : mIterator{std::move(aFrom)} {}
+
+  explicit nsTHashtableIteratorBase(const PLDHashTable& aTable)
+      : mIterator{&const_cast<PLDHashTable&>(aTable)} {}
+
+  nsTHashtableIteratorBase(const PLDHashTable& aTable, EndIteratorTag aTag)
+      : mIterator{&const_cast<PLDHashTable&>(aTable), aTag} {}
+
+  bool operator==(const nsTHashtableIteratorBase& aRhs) const {
+    return mIterator == aRhs.mIterator;
+  }
+  bool operator!=(const nsTHashtableIteratorBase& aRhs) const {
+    return !(*this == aRhs);
+  }
+
+ protected:
+  PLDHashTable::Iterator mIterator;
+};
+
+template <typename T>
+class nsTHashtableEntryIterator : public nsTHashtableIteratorBase {
+  friend class nsTHashtable<std::remove_const_t<T>>;
+
+ public:
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = T;
+  using difference_type = int32_t;
+  using pointer = value_type*;
+  using reference = value_type&;
+
+  using iterator_type = nsTHashtableEntryIterator;
+  using const_iterator_type = nsTHashtableEntryIterator<const T>;
+
+  using nsTHashtableIteratorBase::nsTHashtableIteratorBase;
+
+  value_type* operator->() const {
+    return static_cast<value_type*>(mIterator.Get());
+  }
+  value_type& operator*() const {
+    return *static_cast<value_type*>(mIterator.Get());
+  }
+
+  iterator_type& operator++() {
+    mIterator.Next();
+    return *this;
+  }
+  iterator_type operator++(int) {
+    iterator_type it = *this;
+    ++*this;
+    return it;
+  }
+
+  operator const_iterator_type() const {
+    return const_iterator_type{mIterator.Clone()};
+  }
+};
+
+template <typename EntryType>
+class nsTHashtableKeyIterator : public nsTHashtableIteratorBase {
+  friend class nsTHashtable<EntryType>;
+
+ public:
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = const std::decay_t<typename EntryType::KeyType>;
+  using difference_type = int32_t;
+  using pointer = value_type*;
+  using reference = value_type&;
+
+  using iterator_type = nsTHashtableKeyIterator;
+  using const_iterator_type = nsTHashtableKeyIterator;
+
+  using nsTHashtableIteratorBase::nsTHashtableIteratorBase;
+
+  value_type* operator->() const {
+    return &static_cast<const EntryType*>(mIterator.Get())->GetKey();
+  }
+  decltype(auto) operator*() const {
+    return static_cast<const EntryType*>(mIterator.Get())->GetKey();
+  }
+
+  iterator_type& operator++() {
+    mIterator.Next();
+    return *this;
+  }
+  iterator_type operator++(int) {
+    iterator_type it = *this;
+    ++*this;
+    return it;
+  }
+};
+
+template <typename EntryType>
+class nsTHashtableKeyRange {
+ public:
+  using IteratorType = nsTHashtableKeyIterator<EntryType>;
+  using iterator = IteratorType;
+
+  explicit nsTHashtableKeyRange(const PLDHashTable& aHashtable)
+      : mHashtable{aHashtable} {}
+
+  auto begin() const { return IteratorType{mHashtable}; }
+  auto end() const {
+    return IteratorType{mHashtable, typename IteratorType::EndIteratorTag{}};
+  }
+  auto cbegin() const { return begin(); }
+  auto cend() const { return end(); }
+
+  uint32_t Count() const { return mHashtable.EntryCount(); }
+
+ private:
+  const PLDHashTable& mHashtable;
+};
+
+template <typename EntryType>
+size_t RangeSizeEstimate(
+    const ::detail::nsTHashtableKeyRange<EntryType>& aRange) {
+  return aRange.Count();
+}
+
+template <class EntryType, bool = EntryType::ALLOW_MEMMOVE>
+struct MOZ_NEEDS_MEMMOVABLE_TYPE CheckAllowMemmove : std::true_type {};
+template <class EntryType>
+struct CheckAllowMemmove<EntryType, false> : std::false_type {};
+
+template <size_t N>
+static void FixedSizeEntryMover(PLDHashTable*, const PLDHashEntryHdr* aFrom,
+                                PLDHashEntryHdr* aTo) {
+  memcpy(aTo, aFrom, N);
+}
+
+}  
+
+
+template <class EntryType>
+class MOZ_NEEDS_NO_VTABLE_TYPE nsTHashtable {
+  typedef mozilla::fallible_t fallible_t;
+  static_assert(std::is_pointer_v<typename EntryType::KeyTypePointer>,
+                "KeyTypePointer should be a pointer");
+
+ public:
+  constexpr nsTHashtable()
+      : mTable(&sOps, sizeof(EntryType), PLDHashTable::kDefaultInitialLength) {}
+  explicit nsTHashtable(uint32_t aInitLength)
+      : mTable(&sOps, sizeof(EntryType), aInitLength) {}
+
+  ~nsTHashtable() = default;
+
+  nsTHashtable(nsTHashtable<EntryType>&& aOther) = default;
+  nsTHashtable<EntryType>& operator=(nsTHashtable<EntryType>&& aOther) =
+      default;
+
+  nsTHashtable(const nsTHashtable<EntryType>&) = delete;
+  nsTHashtable& operator=(const nsTHashtable<EntryType>&) = delete;
+
+  uint32_t GetGeneration() const { return mTable.Generation(); }
+
+  typedef typename EntryType::KeyType KeyType;
+
+  typedef typename EntryType::KeyTypePointer KeyTypePointer;
+
+  uint32_t Count() const { return mTable.EntryCount(); }
+
+  bool IsEmpty() const { return Count() == 0; }
+
+  EntryType* GetEntry(KeyType aKey) const {
+    return static_cast<EntryType*>(
+        mTable.Search(EntryType::KeyToPointer(aKey)));
+  }
+
+  bool Contains(KeyType aKey) const { return !!GetEntry(aKey); }
+
+  EntryType* PutEntry(KeyType aKey) {
+    return WithEntryHandle(
+        aKey, [](auto entryHandle) { return entryHandle.OrInsert(); });
+  }
+
+  [[nodiscard]] EntryType* PutEntry(KeyType aKey, const fallible_t& aFallible) {
+    return WithEntryHandle(aKey, aFallible, [](auto maybeEntryHandle) {
+      return maybeEntryHandle ? maybeEntryHandle->OrInsert() : nullptr;
+    });
+  }
+
+  [[nodiscard]] bool EnsureInserted(KeyType aKey,
+                                    EntryType** aEntry = nullptr) {
+    auto oldCount = Count();
+    EntryType* entry = PutEntry(aKey);
+    if (aEntry) {
+      *aEntry = entry;
+    }
+    return oldCount != Count();
+  }
+
+  void RemoveEntry(KeyType aKey) {
+    mTable.Remove(EntryType::KeyToPointer(aKey));
+  }
+
+  bool EnsureRemoved(KeyType aKey) {
+    auto* entry = GetEntry(aKey);
+    if (entry) {
+      RemoveEntry(entry);
+      return true;
+    }
+    return false;
+  }
+
+  void RemoveEntry(EntryType* aEntry) { mTable.RemoveEntry(aEntry); }
+
+  void RawRemoveEntry(EntryType* aEntry) { mTable.RawRemove(aEntry); }
+
+ protected:
+  class EntryHandle {
+   public:
+    EntryHandle(EntryHandle&& aOther) = default;
+    ~EntryHandle() = default;
+
+    EntryHandle(const EntryHandle&) = delete;
+    EntryHandle& operator=(const EntryHandle&) = delete;
+    EntryHandle& operator=(const EntryHandle&&) = delete;
+
+    KeyType Key() const { return mKey; }
+
+    bool HasEntry() const { return mEntryHandle.HasEntry(); }
+
+    explicit operator bool() const { return mEntryHandle.operator bool(); }
+
+    EntryType* Entry() { return static_cast<EntryType*>(mEntryHandle.Entry()); }
+
+    void Insert() { InsertInternal(); }
+
+    EntryType* OrInsert() {
+      if (!HasEntry()) {
+        Insert();
+      }
+      return Entry();
+    }
+
+    void Remove() { mEntryHandle.Remove(); }
+
+    void OrRemove() { mEntryHandle.OrRemove(); }
+
+   protected:
+    template <typename... Args>
+    void InsertInternal(Args&&... aArgs) {
+      MOZ_RELEASE_ASSERT(!HasEntry());
+      mEntryHandle.Insert([&](PLDHashEntryHdr* entry) {
+        new (mozilla::KnownNotNull, entry) EntryType(
+            EntryType::KeyToPointer(mKey), std::forward<Args>(aArgs)...);
+      });
+    }
+
+   private:
+    friend class nsTHashtable;
+
+    EntryHandle(KeyType aKey, PLDHashTable::EntryHandle&& aEntryHandle)
+        : mKey(aKey), mEntryHandle(std::move(aEntryHandle)) {}
+
+    KeyType mKey;
+    PLDHashTable::EntryHandle mEntryHandle;
+  };
+
+  template <class F>
+  auto WithEntryHandle(KeyType aKey, F&& aFunc)
+      -> std::invoke_result_t<F, EntryHandle&&> {
+    return this->mTable.WithEntryHandle(
+        EntryType::KeyToPointer(aKey),
+        [&aKey, &aFunc](auto entryHandle) -> decltype(auto) {
+          return std::forward<F>(aFunc)(
+              EntryHandle{aKey, std::move(entryHandle)});
+        });
+  }
+
+  template <class F>
+  auto WithEntryHandle(KeyType aKey, const mozilla::fallible_t& aFallible,
+                       F&& aFunc)
+      -> std::invoke_result_t<F, mozilla::Maybe<EntryHandle>&&> {
+    return this->mTable.WithEntryHandle(
+        EntryType::KeyToPointer(aKey), aFallible,
+        [&aKey, &aFunc](auto maybeEntryHandle) {
+          return std::forward<F>(aFunc)(
+              maybeEntryHandle
+                  ? mozilla::Some(EntryHandle{aKey, maybeEntryHandle.extract()})
+                  : mozilla::Nothing());
+        });
+  }
+
+ public:
+  class ConstIterator {
+   public:
+    explicit ConstIterator(nsTHashtable* aTable)
+        : mBaseIterator(&aTable->mTable) {}
+    ~ConstIterator() = default;
+
+    KeyType Key() const { return Get()->GetKey(); }
+
+    const EntryType* Get() const {
+      return static_cast<const EntryType*>(mBaseIterator.Get());
+    }
+
+    bool Done() const { return mBaseIterator.Done(); }
+    void Next() { mBaseIterator.Next(); }
+
+    ConstIterator() = delete;
+    ConstIterator(const ConstIterator&) = delete;
+    ConstIterator(ConstIterator&& aOther) = delete;
+    ConstIterator& operator=(const ConstIterator&) = delete;
+    ConstIterator& operator=(ConstIterator&&) = delete;
+
+   protected:
+    PLDHashTable::Iterator mBaseIterator;
+  };
+
+  class Iterator final : public ConstIterator {
+   public:
+    using ConstIterator::ConstIterator;
+
+    using ConstIterator::Get;
+
+    EntryType* Get() const {
+      return static_cast<EntryType*>(this->mBaseIterator.Get());
+    }
+
+    void Remove() { this->mBaseIterator.Remove(); }
+  };
+
+  Iterator Iter() { return Iterator(this); }
+
+  ConstIterator ConstIter() const {
+    return ConstIterator(const_cast<nsTHashtable*>(this));
+  }
+
+  using const_iterator = ::detail::nsTHashtableEntryIterator<const EntryType>;
+  using iterator = ::detail::nsTHashtableEntryIterator<EntryType>;
+
+  iterator begin() { return iterator{mTable}; }
+  const_iterator begin() const { return const_iterator{mTable}; }
+  const_iterator cbegin() const { return begin(); }
+  iterator end() {
+    return iterator{mTable, typename iterator::EndIteratorTag{}};
+  }
+  const_iterator end() const {
+    return const_iterator{mTable, typename const_iterator::EndIteratorTag{}};
+  }
+  const_iterator cend() const { return end(); }
+
+  void Remove(const_iterator& aIter) { aIter.mIterator.Remove(); }
+
+  auto Keys() const {
+    return ::detail::nsTHashtableKeyRange<EntryType>{mTable};
+  }
+
+  void Remove(::detail::nsTHashtableKeyIterator<EntryType>& aIter) {
+    aIter.mIterator.Remove();
+  }
+
+  void Clear() { mTable.Clear(); }
+
+  void ClearAndRetainStorage() { mTable.ClearAndRetainStorage(); }
+
+  size_t ShallowSizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return mTable.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  size_t ShallowSizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + ShallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    size_t n = ShallowSizeOfExcludingThis(aMallocSizeOf);
+    for (auto iter = ConstIter(); !iter.Done(); iter.Next()) {
+      n += (*iter.Get()).SizeOfExcludingThis(aMallocSizeOf);
+    }
+    return n;
+  }
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  void SwapElements(nsTHashtable<EntryType>& aOther) {
+    MOZ_ASSERT_IF(this->mTable.Ops() && aOther.mTable.Ops(),
+                  this->mTable.Ops() == aOther.mTable.Ops());
+    std::swap(this->mTable, aOther.mTable);
+  }
+
+  void MarkImmutable() { mTable.MarkImmutable(); }
+
+ protected:
+  PLDHashTable mTable;
+
+  static PLDHashNumber s_HashKey(const void* aKey);
+
+  static bool s_MatchEntry(const PLDHashEntryHdr* aEntry, const void* aKey);
+
+  static void s_CopyEntry(PLDHashTable* aTable, const PLDHashEntryHdr* aFrom,
+                          PLDHashEntryHdr* aTo);
+
+  static void s_ClearEntry(PLDHashTable* aTable, PLDHashEntryHdr* aEntry);
+
+ private:
+  nsTHashtable(nsTHashtable<EntryType>& aToCopy) = delete;
+
+  static constexpr PLDHashTableOps sOps{
+      .hashKey = s_HashKey,
+      .matchEntry = s_MatchEntry,
+      .moveEntry = ::detail::CheckAllowMemmove<EntryType>::value
+                       ? ::detail::FixedSizeEntryMover<sizeof(EntryType)>
+                       : s_CopyEntry,
+      .clearEntry =
+          std::is_trivially_destructible_v<EntryType> ? nullptr : s_ClearEntry,
+      .initEntry = nullptr};
+
+  nsTHashtable<EntryType>& operator=(nsTHashtable<EntryType>& aToEqual) =
+      delete;
+};
+
+
+template <class EntryType>
+PLDHashNumber nsTHashtable<EntryType>::s_HashKey(const void* aKey) {
+  return EntryType::HashKey(static_cast<KeyTypePointer>(aKey));
+}
+
+template <class EntryType>
+bool nsTHashtable<EntryType>::s_MatchEntry(const PLDHashEntryHdr* aEntry,
+                                           const void* aKey) {
+  return (static_cast<const EntryType*>(aEntry))
+      ->KeyEquals(static_cast<KeyTypePointer>(aKey));
+}
+
+template <class EntryType>
+void nsTHashtable<EntryType>::s_CopyEntry(PLDHashTable* aTable,
+                                          const PLDHashEntryHdr* aFrom,
+                                          PLDHashEntryHdr* aTo) {
+  auto* fromEntry = const_cast<std::remove_const_t<EntryType>*>(
+      static_cast<const EntryType*>(aFrom));
+
+  new (mozilla::KnownNotNull, aTo) EntryType(std::move(*fromEntry));
+
+  fromEntry->~EntryType();
+}
+
+template <class EntryType>
+void nsTHashtable<EntryType>::s_ClearEntry(PLDHashTable* aTable,
+                                           PLDHashEntryHdr* aEntry) {
+  static_cast<EntryType*>(aEntry)->~EntryType();
+}
+
+class nsCycleCollectionTraversalCallback;
+struct TraceCallbacks;
+
+template <class EntryType>
+inline void ImplCycleCollectionUnlink(nsTHashtable<EntryType>& aField) {
+  aField.Clear();
+}
+
+template <typename Container, typename Callback,
+          EnableCycleCollectionIf<Container, nsTHashtable> = nullptr>
+inline void ImplCycleCollectionContainer(Container&& aField,
+                                         Callback&& aCallback) {
+  for (auto& entry : aField) {
+    aCallback(entry);
+  }
+}
+
+
+namespace detail {
+
+class VoidPtrHashKey : public nsPtrHashKey<const void> {
+  typedef nsPtrHashKey<const void> Base;
+
+ public:
+  explicit VoidPtrHashKey(const void* aKey) : Base(aKey) {}
+};
+
+}  
+
+template <typename T>
+class nsTHashtable<nsPtrHashKey<T>>
+    : protected nsTHashtable<::detail::VoidPtrHashKey> {
+  typedef nsTHashtable<::detail::VoidPtrHashKey> Base;
+  typedef nsPtrHashKey<T> EntryType;
+
+  static_assert(sizeof(nsPtrHashKey<T>) == sizeof(::detail::VoidPtrHashKey),
+                "hash keys must be the same size");
+
+  nsTHashtable(const nsTHashtable& aOther) = delete;
+  nsTHashtable& operator=(const nsTHashtable& aOther) = delete;
+
+ public:
+  nsTHashtable() = default;
+  explicit nsTHashtable(uint32_t aInitLength) : Base(aInitLength) {}
+
+  ~nsTHashtable() = default;
+
+  nsTHashtable(nsTHashtable&&) = default;
+
+  using Base::Clear;
+  using Base::Count;
+  using Base::GetGeneration;
+  using Base::IsEmpty;
+
+  using Base::MarkImmutable;
+  using Base::ShallowSizeOfExcludingThis;
+  using Base::ShallowSizeOfIncludingThis;
+
+  EntryType* GetEntry(T* aKey) const {
+    return reinterpret_cast<EntryType*>(Base::GetEntry(aKey));
+  }
+
+  bool Contains(const T* aKey) const { return Base::Contains(aKey); }
+
+  EntryType* PutEntry(T* aKey) {
+    return reinterpret_cast<EntryType*>(Base::PutEntry(aKey));
+  }
+
+  [[nodiscard]] EntryType* PutEntry(T* aKey,
+                                    const mozilla::fallible_t& aFallible) {
+    return reinterpret_cast<EntryType*>(Base::PutEntry(aKey, aFallible));
+  }
+
+  [[nodiscard]] bool EnsureInserted(T* aKey, EntryType** aEntry = nullptr) {
+    return Base::EnsureInserted(
+        aKey, reinterpret_cast<::detail::VoidPtrHashKey**>(aEntry));
+  }
+
+  void RemoveEntry(T* aKey) { Base::RemoveEntry(aKey); }
+
+  bool EnsureRemoved(T* aKey) { return Base::EnsureRemoved(aKey); }
+
+  void RemoveEntry(EntryType* aEntry) {
+    Base::RemoveEntry(reinterpret_cast<::detail::VoidPtrHashKey*>(aEntry));
+  }
+
+  void RawRemoveEntry(EntryType* aEntry) {
+    Base::RawRemoveEntry(reinterpret_cast<::detail::VoidPtrHashKey*>(aEntry));
+  }
+
+ protected:
+  class EntryHandle : protected Base::EntryHandle {
+   public:
+    using Base = nsTHashtable::Base::EntryHandle;
+
+    EntryHandle(EntryHandle&& aOther) = default;
+    ~EntryHandle() = default;
+
+    EntryHandle(const EntryHandle&) = delete;
+    EntryHandle& operator=(const EntryHandle&) = delete;
+    EntryHandle& operator=(const EntryHandle&&) = delete;
+
+    using Base::Key;
+
+    using Base::HasEntry;
+
+    using Base::operator bool;
+
+    EntryType* Entry() { return reinterpret_cast<EntryType*>(Base::Entry()); }
+
+    using Base::Insert;
+
+    EntryType* OrInsert() {
+      if (!HasEntry()) {
+        Insert();
+      }
+      return Entry();
+    }
+
+    using Base::Remove;
+
+    using Base::OrRemove;
+
+   private:
+    friend class nsTHashtable;
+
+    explicit EntryHandle(Base&& aBase) : Base(std::move(aBase)) {}
+  };
+
+  template <class F>
+  auto WithEntryHandle(KeyType aKey, F aFunc)
+      -> std::invoke_result_t<F, EntryHandle&&> {
+    return Base::WithEntryHandle(aKey, [&aFunc](auto entryHandle) {
+      return aFunc(EntryHandle{std::move(entryHandle)});
+    });
+  }
+
+  template <class F>
+  auto WithEntryHandle(KeyType aKey, const mozilla::fallible_t& aFallible,
+                       F aFunc)
+      -> std::invoke_result_t<F, mozilla::Maybe<EntryHandle>&&> {
+    return Base::WithEntryHandle(
+        aKey, aFallible, [&aFunc](auto maybeEntryHandle) {
+          return aFunc(maybeEntryHandle ? mozilla::Some(EntryHandle{
+                                              maybeEntryHandle.extract()})
+                                        : mozilla::Nothing());
+        });
+  }
+
+ public:
+  class ConstIterator {
+   public:
+    explicit ConstIterator(nsTHashtable* aTable)
+        : mBaseIterator(&aTable->mTable) {}
+    ~ConstIterator() = default;
+
+    KeyType Key() const { return Get()->GetKey(); }
+
+    const EntryType* Get() const {
+      return static_cast<const EntryType*>(mBaseIterator.Get());
+    }
+
+    bool Done() const { return mBaseIterator.Done(); }
+    void Next() { mBaseIterator.Next(); }
+
+    ConstIterator() = delete;
+    ConstIterator(const ConstIterator&) = delete;
+    ConstIterator(ConstIterator&& aOther) = delete;
+    ConstIterator& operator=(const ConstIterator&) = delete;
+    ConstIterator& operator=(ConstIterator&&) = delete;
+
+   protected:
+    PLDHashTable::Iterator mBaseIterator;
+  };
+
+  class Iterator final : public ConstIterator {
+   public:
+    using ConstIterator::ConstIterator;
+
+    using ConstIterator::Get;
+
+    EntryType* Get() const {
+      return static_cast<EntryType*>(this->mBaseIterator.Get());
+    }
+
+    void Remove() { this->mBaseIterator.Remove(); }
+  };
+
+  Iterator Iter() { return Iterator(this); }
+
+  ConstIterator ConstIter() const {
+    return ConstIterator(const_cast<nsTHashtable*>(this));
+  }
+
+  using const_iterator = ::detail::nsTHashtableEntryIterator<const EntryType>;
+  using iterator = ::detail::nsTHashtableEntryIterator<EntryType>;
+
+  iterator begin() { return iterator{mTable}; }
+  const_iterator begin() const { return const_iterator{mTable}; }
+  const_iterator cbegin() const { return begin(); }
+  iterator end() {
+    return iterator{mTable, typename iterator::EndIteratorTag{}};
+  }
+  const_iterator end() const {
+    return const_iterator{mTable, typename const_iterator::EndIteratorTag{}};
+  }
+  const_iterator cend() const { return end(); }
+
+  auto Keys() const {
+    return ::detail::nsTHashtableKeyRange<nsPtrHashKey<T>>{mTable};
+  }
+
+  void Remove(::detail::nsTHashtableKeyIterator<EntryType>& aIter) {
+    aIter.mIterator.Remove();
+  }
+
+  void SwapElements(nsTHashtable& aOther) { Base::SwapElements(aOther); }
+};
+
+#endif  // nsTHashtable_h_

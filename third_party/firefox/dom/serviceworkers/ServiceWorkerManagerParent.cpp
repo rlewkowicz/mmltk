@@ -1,0 +1,89 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ServiceWorkerManagerParent.h"
+
+#include "ServiceWorkerUtils.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/ServiceWorkerRegistrar.h"
+#include "mozilla/ipc/BackgroundParent.h"
+#include "mozilla/ipc/BackgroundUtils.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla {
+
+using namespace ipc;
+
+namespace dom {
+
+ServiceWorkerManagerParent::ServiceWorkerManagerParent() {
+  AssertIsOnBackgroundThread();
+}
+
+ServiceWorkerManagerParent::~ServiceWorkerManagerParent() {
+  AssertIsOnBackgroundThread();
+}
+
+mozilla::ipc::IPCResult ServiceWorkerManagerParent::RecvRegister(
+    const ServiceWorkerRegistrationData& aData) {
+  AssertIsInMainProcess();
+  AssertIsOnBackgroundThread();
+  MOZ_ASSERT(!BackgroundParent::IsOtherProcessActor(Manager()));
+
+  if (aData.scope().IsEmpty() ||
+      aData.principal().type() == PrincipalInfo::TNullPrincipalInfo ||
+      aData.principal().type() == PrincipalInfo::TSystemPrincipalInfo) {
+    return IPC_FAIL_NO_REASON(this);
+  }
+
+  if (const RefPtr<dom::ServiceWorkerRegistrar> service =
+          dom::ServiceWorkerRegistrar::Get()) {
+    service->RegisterServiceWorker(aData);
+  }
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult ServiceWorkerManagerParent::RecvUnregister(
+    const PrincipalInfo& aPrincipalInfo, const nsString& aScope) {
+  AssertIsInMainProcess();
+  AssertIsOnBackgroundThread();
+  MOZ_ASSERT(!BackgroundParent::IsOtherProcessActor(Manager()));
+
+  if (aScope.IsEmpty() ||
+      aPrincipalInfo.type() == PrincipalInfo::TNullPrincipalInfo ||
+      aPrincipalInfo.type() == PrincipalInfo::TSystemPrincipalInfo) {
+    return IPC_FAIL_NO_REASON(this);
+  }
+
+  if (const RefPtr<dom::ServiceWorkerRegistrar> service =
+          dom::ServiceWorkerRegistrar::Get()) {
+    service->UnregisterServiceWorker(aPrincipalInfo,
+                                     NS_ConvertUTF16toUTF8(aScope));
+  }
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult ServiceWorkerManagerParent::RecvPropagateUnregister(
+    const PrincipalInfo& aPrincipalInfo, const nsString& aScope) {
+  AssertIsOnBackgroundThread();
+
+  RefPtr<dom::ServiceWorkerRegistrar> service =
+      dom::ServiceWorkerRegistrar::Get();
+  MOZ_ASSERT(service);
+
+  service->UnregisterServiceWorker(aPrincipalInfo,
+                                   NS_ConvertUTF16toUTF8(aScope));
+
+
+  return IPC_OK();
+}
+
+void ServiceWorkerManagerParent::ActorDestroy(ActorDestroyReason aWhy) {
+  AssertIsOnBackgroundThread();
+}
+
+}  
+}  

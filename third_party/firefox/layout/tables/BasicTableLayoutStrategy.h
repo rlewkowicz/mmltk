@@ -1,0 +1,45 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef BasicTableLayoutStrategy_h_
+#define BasicTableLayoutStrategy_h_
+
+#include "nsITableLayoutStrategy.h"
+
+class nsTableFrame;
+
+class BasicTableLayoutStrategy : public nsITableLayoutStrategy {
+ public:
+  explicit BasicTableLayoutStrategy(nsTableFrame* aTableFrame);
+  virtual ~BasicTableLayoutStrategy();
+
+  virtual nscoord GetMinISize(gfxContext* aRenderingContext) override;
+  virtual nscoord GetPrefISize(gfxContext* aRenderingContext,
+                               bool aComputingSize) override;
+  virtual void MarkIntrinsicISizesDirty() override;
+  virtual void ComputeColumnISizes(const ReflowInput& aReflowInput) override;
+
+ private:
+  enum class BtlsISizeType : uint8_t { MinISize, PrefISize, FinalISize };
+
+  void ComputeColumnIntrinsicISizes(gfxContext* aRenderingContext);
+
+  void DistributePctISizeToColumns(float aSpanPrefPct, int32_t aFirstCol,
+                                   int32_t aColCount);
+
+  void DistributeISizeToColumns(nscoord aISize, int32_t aFirstCol,
+                                int32_t aColCount, BtlsISizeType aISizeType,
+                                bool aSpanHasSpecifiedISize);
+
+  void ComputeIntrinsicISizes(gfxContext* aRenderingContext);
+
+  nsTableFrame* mTableFrame;
+  nscoord mMinISize;
+  nscoord mPrefISize;
+  nscoord mPrefISizePctExpand;
+  nscoord mLastCalcISize;
+};
+
+#endif /* !defined(BasicTableLayoutStrategy_h_) */

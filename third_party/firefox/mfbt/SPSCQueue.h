@@ -1,0 +1,209 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_LockFreeQueue_h
+#define mozilla_LockFreeQueue_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/PodOperations.h"
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <limits>
+#include <memory>
+#include <type_traits>
+#ifdef DEBUG
+#  include <thread>
+#endif
+
+namespace mozilla {
+
+namespace detail {
+template <typename T, bool IsPod = std::is_trivial<T>::value>
+struct MemoryOperations {
+  static void ConstructDefault(T* aDestination, size_t aCount);
+  static void MoveOrCopy(T* aDestination, T* aSource, size_t aCount);
+};
+
+template <typename T>
+struct MemoryOperations<T, true> {
+  static void ConstructDefault(T* aDestination, size_t aCount) {
+    PodZero(aDestination, aCount);
+  }
+  static void MoveOrCopy(T* aDestination, T* aSource, size_t aCount) {
+    PodCopy(aDestination, aSource, aCount);
+  }
+};
+
+template <typename T>
+struct MemoryOperations<T, false> {
+  static void ConstructDefault(T* aDestination, size_t aCount) {
+    for (size_t i = 0; i < aCount; i++) {
+      aDestination[i] = T();
+    }
+  }
+  static void MoveOrCopy(T* aDestination, T* aSource, size_t aCount) {
+    std::move(aSource, aSource + aCount, aDestination);
+  }
+};
+}  
+
+template <typename T>
+class SPSCRingBufferBase {
+ public:
+  explicit SPSCRingBufferBase(int aCapacity)
+      : mReadIndex(0),
+        mWriteIndex(0),
+        mCapacity(aCapacity + 1) {
+    MOZ_RELEASE_ASSERT(aCapacity != std::numeric_limits<int>::max());
+    MOZ_RELEASE_ASSERT(mCapacity > 0);
+
+    mData = std::make_unique<T[]>(StorageCapacity());
+
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+  }
+  [[nodiscard]] int EnqueueDefault(int aCount) {
+    return Enqueue(nullptr, aCount);
+  }
+  [[nodiscard]] int Enqueue(T& aElement) { return Enqueue(&aElement, 1); }
+  [[nodiscard]] int Enqueue(T* aElements, int aCount) {
+#ifdef DEBUG
+    AssertCorrectThread(mProducerId);
+#endif
+
+    int rdIdx = mReadIndex.load(std::memory_order_acquire);
+    int wrIdx = mWriteIndex.load(std::memory_order_relaxed);
+
+    if (IsFull(rdIdx, wrIdx)) {
+      return 0;
+    }
+
+    int toWrite = std::min(AvailableWriteInternal(rdIdx, wrIdx), aCount);
+
+    int firstPart = std::min(StorageCapacity() - wrIdx, toWrite);
+    int secondPart = toWrite - firstPart;
+
+    if (aElements) {
+      detail::MemoryOperations<T>::MoveOrCopy(mData.get() + wrIdx, aElements,
+                                              firstPart);
+      detail::MemoryOperations<T>::MoveOrCopy(
+          mData.get(), aElements + firstPart, secondPart);
+    } else {
+      detail::MemoryOperations<T>::ConstructDefault(mData.get() + wrIdx,
+                                                    firstPart);
+      detail::MemoryOperations<T>::ConstructDefault(mData.get(), secondPart);
+    }
+
+    mWriteIndex.store(IncrementIndex(wrIdx, toWrite),
+                      std::memory_order_release);
+
+    return toWrite;
+  }
+  [[nodiscard]] int Dequeue(T* elements, int count) {
+#ifdef DEBUG
+    AssertCorrectThread(mConsumerId);
+#endif
+
+    int wrIdx = mWriteIndex.load(std::memory_order_acquire);
+    int rdIdx = mReadIndex.load(std::memory_order_relaxed);
+
+    if (IsEmpty(rdIdx, wrIdx)) {
+      return 0;
+    }
+
+    int toRead = std::min(AvailableReadInternal(rdIdx, wrIdx), count);
+
+    int firstPart = std::min(StorageCapacity() - rdIdx, toRead);
+    int secondPart = toRead - firstPart;
+
+    if (elements) {
+      detail::MemoryOperations<T>::MoveOrCopy(elements, mData.get() + rdIdx,
+                                              firstPart);
+      detail::MemoryOperations<T>::MoveOrCopy(elements + firstPart, mData.get(),
+                                              secondPart);
+    }
+
+    mReadIndex.store(IncrementIndex(rdIdx, toRead), std::memory_order_release);
+
+    return toRead;
+  }
+  int AvailableRead() const {
+    return AvailableReadInternal(mReadIndex.load(std::memory_order_relaxed),
+                                 mWriteIndex.load(std::memory_order_relaxed));
+  }
+  int AvailableWrite() const {
+    return AvailableWriteInternal(mReadIndex.load(std::memory_order_relaxed),
+                                  mWriteIndex.load(std::memory_order_relaxed));
+  }
+  int Capacity() const { return StorageCapacity() - 1; }
+
+  void ResetConsumerThreadId() {
+#ifdef DEBUG
+    mConsumerId = std::this_thread::get_id();
+#endif
+
+    std::ignore = mReadIndex.load(std::memory_order_acquire);
+  }
+
+  void ResetProducerThreadId() {
+#ifdef DEBUG
+    mProducerId = std::this_thread::get_id();
+#endif
+
+    std::ignore = mWriteIndex.load(std::memory_order_acquire);
+  }
+
+ private:
+  bool IsEmpty(int aReadIndex, int aWriteIndex) const {
+    return aWriteIndex == aReadIndex;
+  }
+  bool IsFull(int aReadIndex, int aWriteIndex) const {
+    return (aWriteIndex + 1) % StorageCapacity() == aReadIndex;
+  }
+  int StorageCapacity() const { return mCapacity; }
+  int AvailableReadInternal(int aReadIndex, int aWriteIndex) const {
+    if (aWriteIndex >= aReadIndex) {
+      return aWriteIndex - aReadIndex;
+    } else {
+      return aWriteIndex + StorageCapacity() - aReadIndex;
+    }
+  }
+  int AvailableWriteInternal(int aReadIndex, int aWriteIndex) const {
+    int rv = aReadIndex - aWriteIndex - 1;
+    if (aWriteIndex >= aReadIndex) {
+      rv += StorageCapacity();
+    }
+    return rv;
+  }
+  int IncrementIndex(int aIndex, int aIncrement) const {
+    MOZ_ASSERT(aIncrement >= 0 && aIncrement < StorageCapacity() &&
+               aIndex < StorageCapacity());
+    return (aIndex + aIncrement) % StorageCapacity();
+  }
+#ifdef DEBUG
+  static void AssertCorrectThread(std::thread::id& aId) {
+    if (aId == std::thread::id()) {
+      aId = std::this_thread::get_id();
+      return;
+    }
+    MOZ_ASSERT(aId == std::this_thread::get_id());
+  }
+#endif
+  std::atomic<int> mReadIndex;
+  std::atomic<int> mWriteIndex;
+  const int mCapacity;
+  std::unique_ptr<T[]> mData;
+#ifdef DEBUG
+  mutable std::thread::id mConsumerId;
+  mutable std::thread::id mProducerId;
+#endif
+};
+
+template <typename T>
+using SPSCQueue = SPSCRingBufferBase<T>;
+
+}  
+
+#endif  // mozilla_LockFreeQueue_h

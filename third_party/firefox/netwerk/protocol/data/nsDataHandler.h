@@ -1,0 +1,35 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsDataHandler_h_
+#define nsDataHandler_h_
+
+#include "mozilla/dom/MimeType.h"
+#include "nsIProtocolHandler.h"
+#include "nsWeakReference.h"
+
+class nsDataHandler : public nsIProtocolHandler,
+                      public nsSupportsWeakReference {
+  virtual ~nsDataHandler() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_DECL_NSIPROTOCOLHANDLER
+
+  nsDataHandler() = default;
+
+  static nsresult CreateNewURI(const nsACString& aSpec, const char* aCharset,
+                               nsIURI* aBaseURI, nsIURI** result);
+
+  [[nodiscard]] static nsresult Create(const nsIID& aIID, void** aResult);
+
+  [[nodiscard]] static nsresult ParseURI(
+      const nsACString& aSpec, nsCString& aContentType,
+      nsCString* aContentCharset, bool& aIsBase64,
+      nsDependentCSubstring* aDataBuffer = nullptr,
+      RefPtr<CMimeType>* aMimeType = nullptr);
+};
+
+#endif /* nsDataHandler_h_ */

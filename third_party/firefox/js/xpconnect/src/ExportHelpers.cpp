@@ -1,0 +1,515 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "xpcprivate.h"
+#include "WrapperFactory.h"
+#include "AccessCheck.h"
+#include "jsfriendapi.h"
+#include "js/CallAndConstruct.h"  // JS::IsConstructor, JS::Call, JS::Construct, JS::IsCallable
+#include "js/Exception.h"
+#include "js/PropertyAndElement.h"  // JS_DefineProperty, JS_DefinePropertyById
+#include "js/Proxy.h"
+#include "js/Wrapper.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/dom/BindingUtils.h"
+#include "mozilla/dom/BlobBinding.h"
+#include "mozilla/dom/BlobImpl.h"
+#include "mozilla/dom/File.h"
+#include "mozilla/dom/StructuredCloneHolder.h"
+#include "nsContentUtils.h"
+#include "nsJSUtils.h"
+#include "js/Object.h"  // JS::GetCompartment
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using namespace JS;
+
+namespace xpc {
+
+bool IsReflector(JSObject* obj, JSContext* cx) {
+  obj = js::CheckedUnwrapDynamic(obj, cx,  false);
+  if (!obj) {
+    return false;
+  }
+  return IsWrappedNativeReflector(obj) || dom::IsDOMObject(obj);
+}
+
+enum StackScopedCloneTags : uint32_t {
+  SCTAG_BASE = JS_SCTAG_USER_MIN,
+  SCTAG_REFLECTOR,
+  SCTAG_BLOB,
+  SCTAG_FUNCTION,
+};
+
+class MOZ_STACK_CLASS StackScopedCloneData : public StructuredCloneHolderBase {
+ public:
+  StackScopedCloneData(JSContext* aCx, StackScopedCloneOptions* aOptions)
+      : mOptions(aOptions), mReflectors(aCx), mFunctions(aCx) {}
+
+  ~StackScopedCloneData() { Clear(); }
+
+  JSObject* CustomReadHandler(JSContext* aCx, JSStructuredCloneReader* aReader,
+                              const JS::CloneDataPolicy& aCloneDataPolicy,
+                              uint32_t aTag, uint32_t aData) override {
+    if (aTag == SCTAG_REFLECTOR) {
+      MOZ_ASSERT(!aData);
+
+      size_t idx;
+      if (!JS_ReadBytes(aReader, &idx, sizeof(size_t))) {
+        return nullptr;
+      }
+
+      RootedObject reflector(aCx, mReflectors[idx]);
+      MOZ_ASSERT(reflector, "No object pointer?");
+      MOZ_ASSERT(IsReflector(reflector, aCx),
+                 "Object pointer must be a reflector!");
+
+      if (!JS_WrapObject(aCx, &reflector)) {
+        return nullptr;
+      }
+
+      return reflector;
+    }
+
+    if (aTag == SCTAG_FUNCTION) {
+      MOZ_ASSERT(aData < mFunctions.length());
+
+      RootedValue functionValue(aCx);
+      RootedObject obj(aCx, mFunctions[aData]);
+
+      if (!JS_WrapObject(aCx, &obj)) {
+        return nullptr;
+      }
+
+      FunctionForwarderOptions forwarderOptions;
+      if (!xpc::NewFunctionForwarder(aCx, JS::VoidHandlePropertyKey, obj,
+                                     forwarderOptions, &functionValue)) {
+        return nullptr;
+      }
+
+      return &functionValue.toObject();
+    }
+
+    if (aTag == SCTAG_BLOB) {
+      MOZ_ASSERT(!aData);
+
+      size_t idx;
+      if (!JS_ReadBytes(aReader, &idx, sizeof(size_t))) {
+        return nullptr;
+      }
+
+      nsIGlobalObject* global = xpc::CurrentNativeGlobal(aCx);
+      MOZ_ASSERT(global);
+
+      JS::Rooted<JS::Value> val(aCx);
+      {
+        RefPtr<Blob> blob = Blob::Create(global, mBlobImpls[idx]);
+        if (NS_WARN_IF(!blob)) {
+          return nullptr;
+        }
+
+        if (!ToJSValue(aCx, blob, &val)) {
+          return nullptr;
+        }
+      }
+
+      return val.toObjectOrNull();
+    }
+
+    MOZ_ASSERT_UNREACHABLE("Encountered garbage in the clone stream!");
+    return nullptr;
+  }
+
+  bool CustomWriteHandler(JSContext* aCx, JSStructuredCloneWriter* aWriter,
+                          JS::Handle<JSObject*> aObj,
+                          bool* aSameProcessScopeRequired) override {
+    {
+      JS::Rooted<JSObject*> obj(aCx, aObj);
+      Blob* blob = nullptr;
+      if (NS_SUCCEEDED(UNWRAP_OBJECT(Blob, &obj, blob))) {
+        BlobImpl* blobImpl = blob->Impl();
+        MOZ_ASSERT(blobImpl);
+
+        mBlobImpls.AppendElement(blobImpl);
+
+        size_t idx = mBlobImpls.Length() - 1;
+        return JS_WriteUint32Pair(aWriter, SCTAG_BLOB, 0) &&
+               JS_WriteBytes(aWriter, &idx, sizeof(size_t));
+      }
+    }
+
+    if (mOptions->wrapReflectors && IsReflector(aObj, aCx)) {
+      if (!mReflectors.append(aObj)) {
+        return false;
+      }
+
+      size_t idx = mReflectors.length() - 1;
+      if (!JS_WriteUint32Pair(aWriter, SCTAG_REFLECTOR, 0)) {
+        return false;
+      }
+      if (!JS_WriteBytes(aWriter, &idx, sizeof(size_t))) {
+        return false;
+      }
+      return true;
+    }
+
+    if (JS::IsCallable(aObj)) {
+      if (mOptions->cloneFunctions) {
+        if (!mFunctions.append(aObj)) {
+          return false;
+        }
+        return JS_WriteUint32Pair(aWriter, SCTAG_FUNCTION,
+                                  mFunctions.length() - 1);
+      } else {
+        JS_ReportErrorASCII(
+            aCx, "Permission denied to pass a Function via structured clone");
+        return false;
+      }
+    }
+
+    JS_ReportErrorASCII(aCx,
+                        "Encountered unsupported value type writing "
+                        "stack-scoped structured clone");
+    return false;
+  }
+
+  StackScopedCloneOptions* mOptions;
+  RootedObjectVector mReflectors;
+  RootedObjectVector mFunctions;
+  nsTArray<RefPtr<BlobImpl>> mBlobImpls;
+};
+
+bool StackScopedClone(JSContext* cx, StackScopedCloneOptions& options,
+                      HandleObject sourceScope, MutableHandleValue val) {
+  ErrorResult error;
+  StackScopedCloneData data(cx, &options);
+  {
+    JSAutoRealm ar(cx, sourceScope);
+    data.Write(cx, val, error);
+    if (error.MaybeSetPendingException(cx)) {
+      return false;
+    }
+  }
+
+  data.Read(cx, val, error);
+  if (error.MaybeSetPendingException(cx)) {
+    return false;
+  }
+
+  if (options.deepFreeze && val.isObject()) {
+    RootedObject obj(cx, &val.toObject());
+    if (!JS_DeepFreezeObject(cx, obj)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool CheckSameOriginArg(JSContext* cx, FunctionForwarderOptions& options,
+                               HandleValue v) {
+  if (options.allowCrossOriginArguments) {
+    return true;
+  }
+
+  if (!v.isObject()) {
+    return true;
+  }
+  RootedObject obj(cx, &v.toObject());
+  MOZ_ASSERT(JS::GetCompartment(obj) != js::GetContextCompartment(cx),
+             "This should be invoked after entering the compartment but before "
+             "wrapping the values");
+
+  if (!js::IsWrapper(obj)) {
+    return true;
+  }
+
+  if (JS::GetCompartment(js::UncheckedUnwrap(obj)) ==
+      js::GetContextCompartment(cx)) {
+    return true;
+  }
+
+  if (AccessCheck::wrapperSubsumes(obj)) {
+    return true;
+  }
+
+  JS_ReportErrorASCII(cx,
+                      "Permission denied to pass object to exported function");
+  return false;
+}
+
+static void MaybeSanitizeException(JSContext* cx,
+                                   JS::Handle<JSObject*> unwrappedFun) {
+  nsIPrincipal* callerPrincipal = nsContentUtils::SubjectPrincipal(cx);
+
+  if (!JS_IsExceptionPending(cx)) {
+    return;
+  }
+
+  {  
+    JSAutoRealm ar(cx, unwrappedFun);
+
+    JS::ExceptionStack exnStack(cx);
+
+    if (!JS::GetPendingExceptionStack(cx, &exnStack)) {
+      JS_ClearPendingException(cx);
+      return;
+    }
+
+    if (!exnStack.exception().isObject() ||
+        callerPrincipal->Subsumes(nsContentUtils::ObjectPrincipal(
+            js::UncheckedUnwrap(&exnStack.exception().toObject())))) {
+      return;
+    }
+
+    JS_ClearPendingException(cx);
+    {  
+      AutoJSAPI jsapi;
+      if (jsapi.Init(unwrappedFun)) {
+        JS::SetPendingExceptionStack(cx, exnStack);
+      }
+
+    }
+  }
+
+  ErrorResult rv;
+  rv.ThrowInvalidStateError("An exception was thrown");
+  (void)rv.MaybeSetPendingException(cx);
+}
+
+static bool FunctionForwarder(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedObject optionsObj(
+      cx, &js::GetFunctionNativeReserved(&args.callee(), 1).toObject());
+  FunctionForwarderOptions options(cx, optionsObj);
+  if (!options.Parse()) {
+    return false;
+  }
+
+  RootedValue v(cx, js::GetFunctionNativeReserved(&args.callee(), 0));
+  RootedObject unwrappedFun(cx, js::UncheckedUnwrap(&v.toObject()));
+
+  RootedValue thisVal(cx, NullValue());
+  if (!args.isConstructing()) {
+    RootedObject thisObject(cx);
+    if (!args.computeThis(cx, &thisObject)) {
+      return false;
+    }
+    thisVal.setObject(*thisObject);
+  }
+
+  bool ok = true;
+  {
+    JSAutoRealm ar(cx, unwrappedFun);
+    bool crossCompartment =
+        JS::GetCompartment(unwrappedFun) != JS::GetCompartment(&args.callee());
+    if (crossCompartment) {
+      if (!CheckSameOriginArg(cx, options, thisVal) ||
+          !JS_WrapValue(cx, &thisVal)) {
+        return false;
+      }
+
+      for (size_t n = 0; n < args.length(); ++n) {
+        if (!CheckSameOriginArg(cx, options, args[n]) ||
+            !JS_WrapValue(cx, args[n])) {
+          return false;
+        }
+      }
+    }
+
+    RootedValue fval(cx, ObjectValue(*unwrappedFun));
+    if (args.isConstructing()) {
+      RootedObject obj(cx);
+      ok = JS::Construct(cx, fval, args, &obj);
+      if (ok) {
+        args.rval().setObject(*obj);
+      }
+    } else {
+      ok = JS::Call(cx, thisVal, fval, args, args.rval());
+    }
+  }
+
+  if (!ok) {
+    MaybeSanitizeException(cx, unwrappedFun);
+    return false;
+  }
+
+  return JS_WrapValue(cx, args.rval());
+}
+
+bool NewFunctionForwarder(JSContext* cx, HandleId idArg, HandleObject callable,
+                          FunctionForwarderOptions& options,
+                          MutableHandleValue vp) {
+  RootedId id(cx, idArg);
+  if (!id.isString()) {
+    id = GetJSIDByIndex(cx, XPCJSContext::IDX_EMPTYSTRING);
+  }
+
+  unsigned nargs = 0;
+  RootedObject unwrapped(cx, js::UncheckedUnwrap(callable));
+  if (unwrapped) {
+    if (JSFunction* fun = JS_GetObjectFunction(unwrapped)) {
+      nargs = JS_GetFunctionArity(fun);
+    }
+  }
+
+  unsigned flags = JS::IsConstructor(callable) ? JSFUN_CONSTRUCTOR : 0;
+  JSFunction* fun =
+      js::NewFunctionByIdWithReserved(cx, FunctionForwarder, nargs, flags, id);
+  if (!fun) {
+    return false;
+  }
+
+  AssertSameCompartment(cx, callable);
+  RootedObject funobj(cx, JS_GetFunctionObject(fun));
+  js::SetFunctionNativeReserved(funobj, 0, ObjectValue(*callable));
+
+  RootedObject optionsObj(cx, options.ToJSObject(cx));
+  if (!optionsObj) {
+    return false;
+  }
+  js::SetFunctionNativeReserved(funobj, 1, ObjectValue(*optionsObj));
+
+  vp.setObject(*funobj);
+  return true;
+}
+
+bool ExportFunction(JSContext* cx, HandleValue vfunction, HandleValue vscope,
+                    HandleValue voptions, MutableHandleValue rval) {
+  bool hasOptions = !voptions.isUndefined();
+  if (!vscope.isObject() || !vfunction.isObject() ||
+      (hasOptions && !voptions.isObject())) {
+    JS_ReportErrorASCII(cx, "Invalid argument");
+    return false;
+  }
+
+  RootedObject funObj(cx, &vfunction.toObject());
+  RootedObject targetScope(cx, &vscope.toObject());
+  ExportFunctionOptions options(cx,
+                                hasOptions ? &voptions.toObject() : nullptr);
+  if (hasOptions && !options.Parse()) {
+    return false;
+  }
+
+  targetScope = js::CheckedUnwrapDynamic(targetScope, cx);
+  funObj = js::CheckedUnwrapStatic(funObj);
+  if (!targetScope || !funObj) {
+    JS_ReportErrorASCII(cx, "Permission denied to export function into scope");
+    return false;
+  }
+
+  if (js::IsScriptedProxy(targetScope)) {
+    JS_ReportErrorASCII(cx, "Defining property on proxy object is not allowed");
+    return false;
+  }
+
+  {
+    JSAutoRealm ar(cx, targetScope);
+
+    funObj = UncheckedUnwrap(funObj);
+    if (!JS::IsCallable(funObj)) {
+      JS_ReportErrorASCII(cx, "First argument must be a function");
+      return false;
+    }
+
+    RootedId id(cx, options.defineAs);
+    if (id.isVoid()) {
+      RootedString funName(cx);
+      JS::Rooted<JSFunction*> fun(cx, JS_GetObjectFunction(funObj));
+      if (fun) {
+        if (!JS_GetFunctionId(cx, fun, &funName)) {
+          return false;
+        }
+      }
+      if (!funName) {
+        funName = JS_GetEmptyString(cx);
+      }
+      JS_MarkCrossZoneIdValue(cx, StringValue(funName));
+
+      if (!JS_StringToId(cx, funName, &id)) {
+        return false;
+      }
+    } else {
+      JS_MarkCrossZoneId(cx, id);
+    }
+
+    if (!id.isString()) {
+      JS_ReportErrorASCII(cx, "defineAs must be a string");
+      return false;
+    }
+
+    if (!JS_WrapObject(cx, &funObj)) {
+      return false;
+    }
+
+    FunctionForwarderOptions forwarderOptions;
+    forwarderOptions.allowCrossOriginArguments =
+        options.allowCrossOriginArguments;
+    if (!NewFunctionForwarder(cx, id, funObj, forwarderOptions, rval)) {
+      JS_ReportErrorASCII(cx, "Exporting function failed");
+      return false;
+    }
+
+    if (!options.defineAs.isVoid()) {
+      if (!JS_DefinePropertyById(cx, targetScope, id, rval, JSPROP_ENUMERATE)) {
+        return false;
+      }
+    }
+  }
+
+  if (!JS_WrapValue(cx, rval)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool CreateObjectIn(JSContext* cx, HandleValue vobj,
+                    CreateObjectInOptions& options, MutableHandleValue rval) {
+  if (!vobj.isObject()) {
+    JS_ReportErrorASCII(cx, "Expected an object as the target scope");
+    return false;
+  }
+
+  RootedObject scope(cx, js::CheckedUnwrapDynamic(&vobj.toObject(), cx));
+  if (!scope) {
+    JS_ReportErrorASCII(
+        cx, "Permission denied to create object in the target scope");
+    return false;
+  }
+
+  bool define = !options.defineAs.isVoid();
+
+  if (define && js::IsScriptedProxy(scope)) {
+    JS_ReportErrorASCII(cx, "Defining property on proxy object is not allowed");
+    return false;
+  }
+
+  RootedObject obj(cx);
+  {
+    JSAutoRealm ar(cx, scope);
+    JS_MarkCrossZoneId(cx, options.defineAs);
+
+    obj = JS_NewPlainObject(cx);
+    if (!obj) {
+      return false;
+    }
+
+    if (define) {
+      if (!JS_DefinePropertyById(cx, scope, options.defineAs, obj,
+                                 JSPROP_ENUMERATE))
+        return false;
+    }
+  }
+
+  rval.setObject(*obj);
+  if (!WrapperFactory::WaiveXrayAndWrap(cx, rval)) {
+    return false;
+  }
+
+  return true;
+}
+
+} 

@@ -1,0 +1,42 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsITableLayoutStrategy_h_
+#define nsITableLayoutStrategy_h_
+
+#include "nsCoord.h"
+#include "nscore.h"
+
+class gfxContext;
+namespace mozilla {
+struct ReflowInput;
+}  
+
+class nsITableLayoutStrategy {
+ public:
+  using ReflowInput = mozilla::ReflowInput;
+
+  virtual ~nsITableLayoutStrategy() = default;
+
+  virtual nscoord GetMinISize(gfxContext* aRenderingContext) = 0;
+
+  virtual nscoord GetPrefISize(gfxContext* aRenderingContext,
+                               bool aComputingSize) = 0;
+
+  virtual void MarkIntrinsicISizesDirty() = 0;
+
+  virtual void ComputeColumnISizes(const ReflowInput& aReflowInput) = 0;
+
+  enum Type { Auto, Fixed };
+  Type GetType() const { return mType; }
+
+ protected:
+  explicit nsITableLayoutStrategy(Type aType) : mType(aType) {}
+
+ private:
+  Type mType;
+};
+
+#endif /* !defined(nsITableLayoutStrategy_h_) */

@@ -1,0 +1,189 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_WindowGlobalChild_h
+#define mozilla_dom_WindowGlobalChild_h
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/PWindowGlobalChild.h"
+#include "mozilla/dom/WindowGlobalActor.h"
+#include "mozilla/dom/WindowProxyHolder.h"
+#include "nsRefPtrHashtable.h"
+#include "nsWrapperCache.h"
+
+class nsGlobalWindowInner;
+class nsDocShell;
+
+namespace mozilla::dom {
+
+class BrowsingContext;
+class WindowContext;
+class WindowGlobalParent;
+class JSWindowActorChild;
+class JSActorMessageMeta;
+class BrowserChild;
+
+class WindowGlobalChild final : public WindowGlobalActor,
+                                public nsWrapperCache,
+                                public PWindowGlobalChild,
+                                public SupportsWeakPtr {
+  friend class PWindowGlobalChild;
+
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(WindowGlobalChild)
+
+  static already_AddRefed<WindowGlobalChild> GetByInnerWindowId(
+      uint64_t aInnerWindowId);
+
+  static already_AddRefed<WindowGlobalChild> GetByInnerWindowId(
+      const GlobalObject& aGlobal, uint64_t aInnerWindowId) {
+    return GetByInnerWindowId(aInnerWindowId);
+  }
+
+  dom::BrowsingContext* BrowsingContext() override;
+  dom::WindowContext* WindowContext() const { return mWindowContext; }
+  nsGlobalWindowInner* GetWindowGlobal() const { return mWindowGlobal; }
+
+  Nullable<WindowProxyHolder> GetContentWindow();
+
+  bool IsClosed() { return !CanSend(); }
+  void Destroy();
+
+  bool IsInProcess() { return XRE_IsParentProcess(); }
+
+  nsIURI* GetDocumentURI() override { return mDocumentURI; }
+  void SetDocumentURI(nsIURI* aDocumentURI);
+  void SetDocumentPrincipal(nsIPrincipal* aNewDocumentPrincipal,
+                            nsIPrincipal* aNewDocumentStoragePrincipal);
+
+  nsIPrincipal* DocumentPrincipal() { return mDocumentPrincipal; }
+
+  uint64_t InnerWindowId();
+  uint64_t OuterWindowId();
+
+  uint64_t ContentParentId();
+
+  int64_t BeforeUnloadListeners() { return mBeforeUnloadListeners; }
+  void BeforeUnloadAdded();
+  void BeforeUnloadRemoved();
+
+  void NavigateAdded();
+  void NavigateRemoved();
+
+  bool IsCurrentGlobal();
+
+  bool IsProcessRoot();
+
+  already_AddRefed<WindowGlobalParent> GetParentActor();
+
+  already_AddRefed<BrowserChild> GetBrowserChild();
+
+  already_AddRefed<JSWindowActorChild> GetActor(JSContext* aCx,
+                                                const nsACString& aName,
+                                                ErrorResult& aRv);
+  already_AddRefed<JSWindowActorChild> GetExistingActor(
+      const nsACString& aName);
+
+  static already_AddRefed<WindowGlobalChild> Create(
+      nsGlobalWindowInner* aWindow);
+  static already_AddRefed<WindowGlobalChild> CreateDisconnected(
+      const WindowGlobalInit& aInit);
+
+  void Init();
+
+  void InitWindowGlobal(nsGlobalWindowInner* aWindow);
+
+  void OnNewDocument(Document* aNewDocument);
+
+  bool IsSameOriginWith(const dom::WindowContext* aOther) const;
+
+  bool SameOriginWithTop();
+
+  bool CanNavigate(dom::BrowsingContext* aTarget, bool aConsiderOpener = true);
+
+  dom::BrowsingContext* FindBrowsingContextWithName(
+      const nsAString& aName, bool aUseEntryGlobalForAccessCheck = true);
+
+  nsISupports* GetParentObject();
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  void UnblockBFCacheFor(BFCacheStatus aStatus);
+  void BlockBFCacheFor(BFCacheStatus aStatus);
+
+ protected:
+  const nsACString& GetRemoteType() const override;
+
+  already_AddRefed<JSActor> InitJSActor(JS::Handle<JSObject*> aMaybeActor,
+                                        const nsACString& aName,
+                                        ErrorResult& aRv) override;
+  mozilla::ipc::IProtocol* AsNativeActor() override { return this; }
+
+  mozilla::ipc::IPCResult RecvRawMessage(const JSActorMessageMeta& aMeta,
+                                         JSIPCValue&& aData,
+                                         StructuredCloneData* aStack);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  mozilla::ipc::IPCResult RecvMakeFrameLocal(
+      const MaybeDiscarded<dom::BrowsingContext>& aFrameContext,
+      uint64_t aPendingSwitchId);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  mozilla::ipc::IPCResult RecvMakeFrameRemote(
+      const MaybeDiscarded<dom::BrowsingContext>& aFrameContext,
+      ManagedEndpoint<PBrowserBridgeChild>&& aEndpoint, const TabId& aTabId,
+      const LayersId& aLayersId, MakeFrameRemoteResolver&& aResolve);
+
+  mozilla::ipc::IPCResult RecvDrawSnapshot(const Maybe<IntRect>& aRect,
+                                           const float& aScale,
+                                           const nscolor& aBackgroundColor,
+                                           const CrossProcessPaintFlags& aFlags,
+                                           DrawSnapshotResolver&& aResolve);
+
+  mozilla::ipc::IPCResult RecvDispatchSecurityPolicyViolation(
+      const nsString& aViolationEventJSON, const nsString& aReportGroupName);
+
+  mozilla::ipc::IPCResult RecvSaveStorageAccessPermissionGranted();
+
+  mozilla::ipc::IPCResult RecvResetScalingZoom();
+
+  mozilla::ipc::IPCResult RecvRestoreDocShellState(
+      const dom::sessionstore::DocShellRestoreState& aState,
+      RestoreDocShellStateResolver&& aResolve);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY mozilla::ipc::IPCResult RecvRestoreTabContent(
+      dom::SessionStoreRestoreData* aData,
+      RestoreTabContentResolver&& aResolve);
+
+  mozilla::ipc::IPCResult RecvNotifyAudioSessionStateChanged(
+      const dom::AudioSessionState& aState);
+
+  mozilla::ipc::IPCResult RecvNotifyPermissionChange(const nsCString& aType,
+                                                     uint32_t aPermission);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY mozilla::ipc::IPCResult RecvProcessCloseRequest(
+      const MaybeDiscarded<dom::BrowsingContext>& aFrameContext);
+
+  virtual void ActorDestroy(ActorDestroyReason aWhy) override;
+
+ private:
+  WindowGlobalChild(dom::WindowContext* aWindowContext,
+                    nsIPrincipal* aPrincipal, nsIURI* aURI);
+
+  ~WindowGlobalChild();
+
+  RefPtr<nsGlobalWindowInner> mWindowGlobal;
+  RefPtr<dom::WindowContext> mWindowContext;
+  nsCOMPtr<nsIPrincipal> mDocumentPrincipal;
+  RefPtr<dom::FeaturePolicy> mContainerFeaturePolicy;
+  nsCOMPtr<nsIURI> mDocumentURI;
+  int64_t mBeforeUnloadListeners = 0;
+};
+
+}  
+
+#endif  // !defined(mozilla_dom_WindowGlobalChild_h)

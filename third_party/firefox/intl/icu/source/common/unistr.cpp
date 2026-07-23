@@ -1,0 +1,1787 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+* Copyright (C) 1999-2016, International Business Machines Corporation and
+* others. All Rights Reserved.
+******************************************************************************
+*
+* File unistr.cpp
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   09/25/98    stephen     Creation.
+*   04/20/99    stephen     Overhauled per 4/16 code review.
+*   07/09/99    stephen     Renamed {hi,lo},{byte,word} to icu_X for HP/UX
+*   11/18/99    aliu        Added handleReplaceBetween() to make inherit from
+*                           Replaceable.
+*   06/25/01    grhoten     Removed the dependency on iostream
+******************************************************************************
+*/
+
+#include <string_view>
+
+#include "unicode/utypes.h"
+#include "unicode/appendable.h"
+#include "unicode/putil.h"
+#include "cstring.h"
+#include "cmemory.h"
+#include "unicode/ustring.h"
+#include "unicode/unistr.h"
+#include "unicode/utf.h"
+#include "unicode/utf16.h"
+#include "uelement.h"
+#include "ustr_imp.h"
+#include "umutex.h"
+#include "uassert.h"
+
+
+
+static
+inline void
+us_arrayCopy(const char16_t *src, int32_t srcStart,
+         char16_t *dst, int32_t dstStart, int32_t count)
+{
+  if(count>0) {
+    uprv_memmove(dst+dstStart, src+srcStart, (size_t)count*sizeof(*src));
+  }
+}
+
+U_CDECL_BEGIN
+static char16_t U_CALLCONV
+UnicodeString_charAt(int32_t offset, void *context) {
+    return ((icu::UnicodeString*) context)->charAt(offset);
+}
+U_CDECL_END
+
+U_NAMESPACE_BEGIN
+
+Replaceable::~Replaceable() {}
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(UnicodeString)
+
+UnicodeString U_EXPORT2
+operator+ (const UnicodeString &s1, const UnicodeString &s2) {
+  int32_t sumLengths;
+  if (uprv_add32_overflow(s1.length(), s2.length(), &sumLengths)) {
+    UnicodeString bogus;
+    bogus.setToBogus();
+    return bogus;
+  }
+  if (sumLengths != INT32_MAX) {
+    ++sumLengths;  
+  }
+  return UnicodeString(sumLengths, static_cast<UChar32>(0), 0).append(s1).append(s2);
+}
+
+U_COMMON_API UnicodeString U_EXPORT2
+unistr_internalConcat(const UnicodeString &s1, std::u16string_view s2) {
+  int32_t sumLengths;
+  if (s2.length() > INT32_MAX ||
+      uprv_add32_overflow(s1.length(), static_cast<int32_t>(s2.length()), &sumLengths)) {
+    UnicodeString bogus;
+    bogus.setToBogus();
+    return bogus;
+  }
+  if (sumLengths != INT32_MAX) {
+    ++sumLengths;  
+  }
+  return UnicodeString(sumLengths, static_cast<UChar32>(0), 0).append(s1).append(s2);
+}
+
+
+
+void
+UnicodeString::addRef() {
+  umtx_atomic_inc(reinterpret_cast<u_atomic_int32_t*>(fUnion.fFields.fArray) - 1);
+}
+
+int32_t
+UnicodeString::removeRef() {
+  return umtx_atomic_dec(reinterpret_cast<u_atomic_int32_t*>(fUnion.fFields.fArray) - 1);
+}
+
+int32_t
+UnicodeString::refCount() const {
+  return umtx_loadAcquire(*(reinterpret_cast<u_atomic_int32_t*>(fUnion.fFields.fArray) - 1));
+}
+
+void
+UnicodeString::releaseArray() {
+  if((fUnion.fFields.fLengthAndFlags & kRefCounted) && removeRef() == 0) {
+    uprv_free(reinterpret_cast<int32_t*>(fUnion.fFields.fArray) - 1);
+  }
+}
+
+
+
+
+
+UnicodeString::UnicodeString(int32_t capacity, UChar32 c, int32_t count) {
+  fUnion.fFields.fLengthAndFlags = 0;
+  if (count <= 0 || static_cast<uint32_t>(c) > 0x10ffff) {
+    allocate(capacity);
+  } else if(c <= 0xffff) {
+    int32_t length = count;
+    if(capacity < length) {
+      capacity = length;
+    }
+    if(allocate(capacity)) {
+      char16_t *array = getArrayStart();
+      char16_t unit = static_cast<char16_t>(c);
+      for(int32_t i = 0; i < length; ++i) {
+        array[i] = unit;
+      }
+      setLength(length);
+    }
+  } else {  
+    if(count > (INT32_MAX / 2)) {
+      allocate(capacity);
+      return;
+    }
+    int32_t length = count * 2;
+    if(capacity < length) {
+      capacity = length;
+    }
+    if(allocate(capacity)) {
+      char16_t *array = getArrayStart();
+      char16_t lead = U16_LEAD(c);
+      char16_t trail = U16_TRAIL(c);
+      for(int32_t i = 0; i < length; i += 2) {
+        array[i] = lead;
+        array[i + 1] = trail;
+      }
+      setLength(length);
+    }
+  }
+}
+
+UnicodeString::UnicodeString(char16_t ch) {
+  fUnion.fFields.fLengthAndFlags = kLength1 | kShortString;
+  fUnion.fStackFields.fBuffer[0] = ch;
+}
+
+UnicodeString::UnicodeString(UChar32 ch) {
+  fUnion.fFields.fLengthAndFlags = kShortString;
+  int32_t i = 0;
+  UBool isError = false;
+  U16_APPEND(fUnion.fStackFields.fBuffer, i, US_STACKBUF_SIZE, ch, isError);
+  if(!isError) {
+    setShortLength(i);
+  }
+}
+
+UnicodeString::UnicodeString(const char16_t *text,
+                             int32_t textLength) {
+  fUnion.fFields.fLengthAndFlags = kShortString;
+  doAppend(text, 0, textLength);
+}
+
+UnicodeString::UnicodeString(UBool isTerminated,
+                             ConstChar16Ptr textPtr,
+                             int32_t textLength) {
+  fUnion.fFields.fLengthAndFlags = kReadonlyAlias;
+  const char16_t *text = textPtr;
+  if(text == nullptr) {
+    setToEmpty();
+  } else if(textLength < -1 ||
+            (textLength == -1 && !isTerminated) ||
+            (textLength >= 0 && isTerminated && text[textLength] != 0)
+  ) {
+    setToBogus();
+  } else {
+    if(textLength == -1) {
+      textLength = u_strlen(text);
+    }
+    setArray(const_cast<char16_t *>(text), textLength,
+             isTerminated ? textLength + 1 : textLength);
+  }
+}
+
+UnicodeString::UnicodeString(char16_t *buff,
+                             int32_t buffLength,
+                             int32_t buffCapacity) {
+  fUnion.fFields.fLengthAndFlags = kWritableAlias;
+  if(buff == nullptr) {
+    setToEmpty();
+  } else if(buffLength < -1 || buffCapacity < 0 || buffLength > buffCapacity) {
+    setToBogus();
+  } else {
+    if(buffLength == -1) {
+      const char16_t *p = buff, *limit = buff + buffCapacity;
+      while(p != limit && *p != 0) {
+        ++p;
+      }
+      buffLength = static_cast<int32_t>(p - buff);
+    }
+    setArray(buff, buffLength, buffCapacity);
+  }
+}
+
+UnicodeString::UnicodeString(const char *src, int32_t length, EInvariant) {
+  fUnion.fFields.fLengthAndFlags = kShortString;
+  if(src==nullptr) {
+  } else {
+    if(length<0) {
+      length = static_cast<int32_t>(uprv_strlen(src));
+    }
+    if(cloneArrayIfNeeded(length, length, false)) {
+      u_charsToUChars(src, getArrayStart(), length);
+      setLength(length);
+    } else {
+      setToBogus();
+    }
+  }
+}
+
+UnicodeString UnicodeString::readOnlyAliasFromU16StringView(std::u16string_view text) {
+  UnicodeString result;
+  if (text.length() <= INT32_MAX) {
+    result.setTo(false, text.data(), static_cast<int32_t>(text.length()));
+  } else {
+    result.setToBogus();
+  }
+  return result;
+}
+
+UnicodeString UnicodeString::readOnlyAliasFromUnicodeString(const UnicodeString &text) {
+  UnicodeString result;
+  if (text.isBogus()) {
+    result.setToBogus();
+  } else {
+    result.setTo(false, text.getBuffer(), text.length());
+  }
+  return result;
+}
+
+#if U_CHARSET_IS_UTF8
+
+UnicodeString::UnicodeString(const char *codepageData) {
+  fUnion.fFields.fLengthAndFlags = kShortString;
+  if (codepageData != nullptr) {
+    setToUTF8(codepageData);
+  }
+}
+
+UnicodeString::UnicodeString(const char *codepageData, int32_t dataLength) {
+  fUnion.fFields.fLengthAndFlags = kShortString;
+  if (codepageData == nullptr || dataLength == 0 || dataLength < -1) {
+    return;
+  }
+  if(dataLength == -1) {
+    dataLength = static_cast<int32_t>(uprv_strlen(codepageData));
+  }
+  setToUTF8(StringPiece(codepageData, dataLength));
+}
+
+#endif
+
+UnicodeString::UnicodeString(const UnicodeString& that) {
+  fUnion.fFields.fLengthAndFlags = kShortString;
+  copyFrom(that);
+}
+
+UnicodeString::UnicodeString(UnicodeString &&src) noexcept {
+  copyFieldsFrom(src, true);
+}
+
+UnicodeString::UnicodeString(const UnicodeString& that,
+                             int32_t srcStart) {
+  fUnion.fFields.fLengthAndFlags = kShortString;
+  setTo(that, srcStart);
+}
+
+UnicodeString::UnicodeString(const UnicodeString& that,
+                             int32_t srcStart,
+                             int32_t srcLength) {
+  fUnion.fFields.fLengthAndFlags = kShortString;
+  setTo(that, srcStart, srcLength);
+}
+
+Replaceable *
+Replaceable::clone() const {
+  return nullptr;
+}
+
+UnicodeString *
+UnicodeString::clone() const {
+  LocalPointer<UnicodeString> clonedString(new UnicodeString(*this));
+  return clonedString.isValid() && !clonedString->isBogus() ? clonedString.orphan() : nullptr;
+}
+
+
+namespace {
+
+const int32_t kGrowSize = 128;
+
+const int32_t kMaxCapacity = 0x7ffffff5;
+
+int32_t getGrowCapacity(int32_t newLength) {
+  int32_t growSize = (newLength >> 2) + kGrowSize;
+  if(growSize <= (kMaxCapacity - newLength)) {
+    return newLength + growSize;
+  } else {
+    return kMaxCapacity;
+  }
+}
+
+}  
+
+UBool
+UnicodeString::allocate(int32_t capacity) {
+  if(capacity <= US_STACKBUF_SIZE) {
+    fUnion.fFields.fLengthAndFlags = kShortString;
+    return true;
+  }
+  if(capacity <= kMaxCapacity) {
+    ++capacity;  
+    size_t numBytes = sizeof(int32_t) + static_cast<size_t>(capacity) * U_SIZEOF_UCHAR;
+    numBytes = (numBytes + 15) & ~15;
+    int32_t* array = static_cast<int32_t*>(uprv_malloc(numBytes));
+    if(array != nullptr) {
+      *array++ = 1;
+      numBytes -= sizeof(int32_t);
+
+      fUnion.fFields.fArray = reinterpret_cast<char16_t*>(array);
+      fUnion.fFields.fCapacity = static_cast<int32_t>(numBytes / U_SIZEOF_UCHAR);
+      fUnion.fFields.fLengthAndFlags = kLongString;
+      return true;
+    }
+  }
+  fUnion.fFields.fLengthAndFlags = kIsBogus;
+  fUnion.fFields.fArray = nullptr;
+  fUnion.fFields.fCapacity = 0;
+  return false;
+}
+
+
+#if defined(UNISTR_COUNT_FINAL_STRING_LENGTHS)
+static u_atomic_int32_t finalLengthCounts[0x400];  
+static u_atomic_int32_t beyondCount(0);
+
+U_CAPI void unistr_printLengths() {
+  int32_t i;
+  for(i = 0; i <= 59; ++i) {
+    printf("%2d,  %9d\n", i, (int32_t)finalLengthCounts[i]);
+  }
+  int32_t beyond = beyondCount;
+  for(; i < UPRV_LENGTHOF(finalLengthCounts); ++i) {
+    beyond += finalLengthCounts[i];
+  }
+  printf(">59, %9d\n", beyond);
+}
+#endif
+
+UnicodeString::~UnicodeString()
+{
+#if defined(UNISTR_COUNT_FINAL_STRING_LENGTHS)
+  if((fUnion.fFields.fLengthAndFlags&(kOpenGetBuffer|kReadonlyAlias|kWritableAlias)) == 0) {
+    if(hasShortLength()) {
+      umtx_atomic_inc(finalLengthCounts + getShortLength());
+    } else {
+      umtx_atomic_inc(&beyondCount);
+    }
+  }
+#endif
+
+  releaseArray();
+}
+
+
+UnicodeString UnicodeString::fromUTF8(StringPiece utf8) {
+  UnicodeString result;
+  result.setToUTF8(utf8);
+  return result;
+}
+
+UnicodeString UnicodeString::fromUTF32(const UChar32 *utf32, int32_t length) {
+  UnicodeString result;
+  int32_t capacity;
+  if(length <= US_STACKBUF_SIZE) {
+    capacity = US_STACKBUF_SIZE;
+  } else {
+    capacity = length + (length >> 4) + 4;
+  }
+  do {
+    char16_t *utf16 = result.getBuffer(capacity);
+    int32_t length16;
+    UErrorCode errorCode = U_ZERO_ERROR;
+    u_strFromUTF32WithSub(utf16, result.getCapacity(), &length16,
+        utf32, length,
+        0xfffd,  
+        nullptr,    
+        &errorCode);
+    result.releaseBuffer(length16);
+    if(errorCode == U_BUFFER_OVERFLOW_ERROR) {
+      capacity = length16 + 1;  
+      continue;
+    } else if(U_FAILURE(errorCode)) {
+      result.setToBogus();
+    }
+    break;
+  } while(true);
+  return result;
+}
+
+
+UnicodeString &
+UnicodeString::operator=(const UnicodeString &src) {
+  return copyFrom(src);
+}
+
+UnicodeString &
+UnicodeString::fastCopyFrom(const UnicodeString &src) {
+  return copyFrom(src, true);
+}
+
+UnicodeString &
+UnicodeString::copyFrom(const UnicodeString &src, UBool fastCopy) {
+  if(this == &src) {
+    return *this;
+  }
+
+  if(src.isBogus()) {
+    setToBogus();
+    return *this;
+  }
+
+  releaseArray();
+
+  if(src.isEmpty()) {
+    setToEmpty();
+    return *this;
+  }
+
+  fUnion.fFields.fLengthAndFlags = src.fUnion.fFields.fLengthAndFlags;
+  switch(src.fUnion.fFields.fLengthAndFlags & kAllStorageFlags) {
+  case kShortString:
+    uprv_memcpy(fUnion.fStackFields.fBuffer, src.fUnion.fStackFields.fBuffer,
+                getShortLength() * U_SIZEOF_UCHAR);
+    break;
+  case kLongString:
+    const_cast<UnicodeString &>(src).addRef();
+    fUnion.fFields.fArray = src.fUnion.fFields.fArray;
+    fUnion.fFields.fCapacity = src.fUnion.fFields.fCapacity;
+    if(!hasShortLength()) {
+      fUnion.fFields.fLength = src.fUnion.fFields.fLength;
+    }
+    break;
+  case kReadonlyAlias:
+    if(fastCopy) {
+      fUnion.fFields.fArray = src.fUnion.fFields.fArray;
+      fUnion.fFields.fCapacity = src.fUnion.fFields.fCapacity;
+      if(!hasShortLength()) {
+        fUnion.fFields.fLength = src.fUnion.fFields.fLength;
+      }
+      break;
+    }
+    // else if(!fastCopy) fall through to case kWritableAlias
+    U_FALLTHROUGH;
+  case kWritableAlias: {
+    int32_t srcLength = src.length();
+    if(allocate(srcLength)) {
+      u_memcpy(getArrayStart(), src.getArrayStart(), srcLength);
+      setLength(srcLength);
+      break;
+    }
+    // if there is not enough memory, then fall through to setting to bogus
+    U_FALLTHROUGH;
+  }
+  default:
+    fUnion.fFields.fLengthAndFlags = kIsBogus;
+    fUnion.fFields.fArray = nullptr;
+    fUnion.fFields.fCapacity = 0;
+    break;
+  }
+
+  return *this;
+}
+
+UnicodeString &UnicodeString::operator=(UnicodeString &&src) noexcept {
+  releaseArray();
+  copyFieldsFrom(src, true);
+  return *this;
+}
+
+void UnicodeString::copyFieldsFrom(UnicodeString &src, UBool setSrcToBogus) noexcept {
+  int16_t lengthAndFlags = fUnion.fFields.fLengthAndFlags = src.fUnion.fFields.fLengthAndFlags;
+  if(lengthAndFlags & kUsingStackBuffer) {
+    if(this != &src) {
+      uprv_memcpy(fUnion.fStackFields.fBuffer, src.fUnion.fStackFields.fBuffer,
+                  getShortLength() * U_SIZEOF_UCHAR);
+    }
+  } else {
+    fUnion.fFields.fArray = src.fUnion.fFields.fArray;
+    fUnion.fFields.fCapacity = src.fUnion.fFields.fCapacity;
+    if(!hasShortLength()) {
+      fUnion.fFields.fLength = src.fUnion.fFields.fLength;
+    }
+    if(setSrcToBogus) {
+      src.fUnion.fFields.fLengthAndFlags = kIsBogus;
+      src.fUnion.fFields.fArray = nullptr;
+      src.fUnion.fFields.fCapacity = 0;
+    }
+  }
+}
+
+void UnicodeString::swap(UnicodeString &other) noexcept {
+  UnicodeString temp;  
+  temp.copyFieldsFrom(*this, false);
+  this->copyFieldsFrom(other, false);
+  other.copyFieldsFrom(temp, false);
+  temp.fUnion.fFields.fLengthAndFlags = kShortString;
+}
+
+
+UnicodeString UnicodeString::unescape() const {
+    UnicodeString result(length(), static_cast<UChar32>(0), static_cast<int32_t>(0)); 
+    if (result.isBogus()) {
+        return result;
+    }
+    const char16_t *array = getBuffer();
+    int32_t len = length();
+    int32_t prev = 0;
+    for (int32_t i=0;;) {
+        if (i == len) {
+            result.append(array, prev, len - prev);
+            break;
+        }
+        if (array[i++] == 0x5C ) {
+            result.append(array, prev, (i - 1) - prev);
+            UChar32 c = unescapeAt(i); 
+            if (c < 0) {
+                result.remove(); 
+                break; 
+            }
+            result.append(c);
+            prev = i;
+        }
+    }
+    return result;
+}
+
+UChar32 UnicodeString::unescapeAt(int32_t &offset) const {
+    return u_unescapeAt(UnicodeString_charAt, &offset, length(), (void*)this);
+}
+
+UBool
+UnicodeString::doEquals(const char16_t *text, int32_t len) const {
+  return uprv_memcmp(getArrayStart(), text, len * U_SIZEOF_UCHAR) == 0;
+}
+
+UBool
+UnicodeString::doEqualsSubstring( int32_t start,
+              int32_t length,
+              const char16_t *srcChars,
+              int32_t srcStart,
+              int32_t srcLength) const
+{
+  if(isBogus()) {
+    return false;
+  }
+  
+  pinIndices(start, length);
+
+  if(srcChars == nullptr) {
+    return length == 0 ? true : false;
+  }
+
+  const char16_t *chars = getArrayStart();
+
+  chars += start;
+  srcChars += srcStart;
+
+  if(srcLength < 0) {
+    srcLength = u_strlen(srcChars + srcStart);
+  }
+
+  if (length != srcLength) {
+    return false;
+  }
+
+  if(length == 0 || chars == srcChars) {
+    return true;
+  }
+
+  return u_memcmp(chars, srcChars, srcLength) == 0;
+}
+
+int8_t
+UnicodeString::doCompare( int32_t start,
+              int32_t length,
+              const char16_t *srcChars,
+              int32_t srcStart,
+              int32_t srcLength) const
+{
+  if(isBogus()) {
+    return -1;
+  }
+  
+  pinIndices(start, length);
+
+  if(srcChars == nullptr) {
+    return length == 0 ? 0 : 1;
+  }
+
+  const char16_t *chars = getArrayStart();
+
+  chars += start;
+  srcChars += srcStart;
+
+  int32_t minLength;
+  int8_t lengthResult;
+
+  if(srcLength < 0) {
+    srcLength = u_strlen(srcChars + srcStart);
+  }
+
+  if(length != srcLength) {
+    if(length < srcLength) {
+      minLength = length;
+      lengthResult = -1;
+    } else {
+      minLength = srcLength;
+      lengthResult = 1;
+    }
+  } else {
+    minLength = length;
+    lengthResult = 0;
+  }
+
+
+  if(minLength > 0 && chars != srcChars) {
+    int32_t result;
+
+#if U_IS_BIG_ENDIAN
+      result = uprv_memcmp(chars, srcChars, minLength * sizeof(char16_t));
+      if(result != 0) {
+        return (int8_t)(result >> 15 | 1);
+      }
+#else
+      do {
+        result = static_cast<int32_t>(*(chars++)) - static_cast<int32_t>(*(srcChars++));
+        if(result != 0) {
+          return static_cast<int8_t>(result >> 15 | 1);
+        }
+      } while(--minLength > 0);
+#endif
+  }
+  return lengthResult;
+}
+
+int8_t
+UnicodeString::doCompareCodePointOrder(int32_t start,
+                                       int32_t length,
+                                       const char16_t *srcChars,
+                                       int32_t srcStart,
+                                       int32_t srcLength) const
+{
+  if(isBogus()) {
+    return -1;
+  }
+
+  pinIndices(start, length);
+
+  if(srcChars == nullptr) {
+    srcStart = srcLength = 0;
+  }
+
+  int32_t diff = uprv_strCompare(getArrayStart() + start, length, (srcChars!=nullptr)?(srcChars + srcStart):nullptr, srcLength, false, true);
+  if(diff!=0) {
+    return static_cast<int8_t>(diff >> 15 | 1);
+  } else {
+    return 0;
+  }
+}
+
+int32_t
+UnicodeString::getLength() const {
+    return length();
+}
+
+char16_t
+UnicodeString::getCharAt(int32_t offset) const {
+  return charAt(offset);
+}
+
+UChar32
+UnicodeString::getChar32At(int32_t offset) const {
+  return char32At(offset);
+}
+
+UChar32
+UnicodeString::char32At(int32_t offset) const
+{
+  int32_t len = length();
+  if (static_cast<uint32_t>(offset) < static_cast<uint32_t>(len)) {
+    const char16_t *array = getArrayStart();
+    UChar32 c;
+    U16_GET(array, 0, offset, len, c);
+    return c;
+  } else {
+    return kInvalidUChar;
+  }
+}
+
+int32_t
+UnicodeString::getChar32Start(int32_t offset) const {
+  if (static_cast<uint32_t>(offset) < static_cast<uint32_t>(length())) {
+    const char16_t *array = getArrayStart();
+    U16_SET_CP_START(array, 0, offset);
+    return offset;
+  } else {
+    return 0;
+  }
+}
+
+int32_t
+UnicodeString::getChar32Limit(int32_t offset) const {
+  int32_t len = length();
+  if (static_cast<uint32_t>(offset) < static_cast<uint32_t>(len)) {
+    const char16_t *array = getArrayStart();
+    U16_SET_CP_LIMIT(array, 0, offset, len);
+    return offset;
+  } else {
+    return len;
+  }
+}
+
+int32_t
+UnicodeString::countChar32(int32_t start, int32_t length) const {
+  pinIndices(start, length);
+  return u_countChar32(getArrayStart()+start, length);
+}
+
+UBool
+UnicodeString::hasMoreChar32Than(int32_t start, int32_t length, int32_t number) const {
+  pinIndices(start, length);
+  return u_strHasMoreChar32Than(getArrayStart()+start, length, number);
+}
+
+int32_t
+UnicodeString::moveIndex32(int32_t index, int32_t delta) const {
+  int32_t len = length();
+  if(index<0) {
+    index=0;
+  } else if(index>len) {
+    index=len;
+  }
+
+  const char16_t *array = getArrayStart();
+  if(delta>0) {
+    U16_FWD_N(array, index, len, delta);
+  } else {
+    U16_BACK_N(array, 0, index, -delta);
+  }
+
+  return index;
+}
+
+void
+UnicodeString::doExtract(int32_t start,
+             int32_t length,
+             char16_t *dst,
+             int32_t dstStart) const
+{
+  pinIndices(start, length);
+
+  const char16_t *array = getArrayStart();
+  if(array + start != dst + dstStart) {
+    us_arrayCopy(array, start, dst, dstStart, length);
+  }
+}
+
+int32_t
+UnicodeString::extract(Char16Ptr dest, int32_t destCapacity,
+                       UErrorCode &errorCode) const {
+  int32_t len = length();
+  if(U_SUCCESS(errorCode)) {
+    if (isBogus() || destCapacity < 0 || (destCapacity > 0 && dest == nullptr)) {
+      errorCode=U_ILLEGAL_ARGUMENT_ERROR;
+    } else {
+      const char16_t *array = getArrayStart();
+      if(len>0 && len<=destCapacity && array!=dest) {
+        u_memcpy(dest, array, len);
+      }
+      return u_terminateUChars(dest, destCapacity, len, &errorCode);
+    }
+  }
+
+  return len;
+}
+
+int32_t
+UnicodeString::extract(int32_t start,
+                       int32_t length,
+                       char *target,
+                       int32_t targetCapacity,
+                       enum EInvariant) const
+{
+  if(targetCapacity < 0 || (targetCapacity > 0 && target == nullptr)) {
+    return 0;
+  }
+
+  pinIndices(start, length);
+
+  if(length <= targetCapacity) {
+    u_UCharsToChars(getArrayStart() + start, target, length);
+  }
+  UErrorCode status = U_ZERO_ERROR;
+  return u_terminateChars(target, targetCapacity, length, &status);
+}
+
+UnicodeString
+UnicodeString::tempSubString(int32_t start, int32_t len) const {
+  pinIndices(start, len);
+  const char16_t *array = getBuffer();  
+  if(array==nullptr) {
+    array=fUnion.fStackFields.fBuffer;  
+    len=-2;  
+  }
+  return UnicodeString(false, array + start, len);
+}
+
+int32_t
+UnicodeString::toUTF8(int32_t start, int32_t len,
+                      char *target, int32_t capacity) const {
+  pinIndices(start, len);
+  int32_t length8;
+  UErrorCode errorCode = U_ZERO_ERROR;
+  u_strToUTF8WithSub(target, capacity, &length8,
+                     getBuffer() + start, len,
+                     0xFFFD,  
+                     nullptr,    
+                     &errorCode);
+  return length8;
+}
+
+#if U_CHARSET_IS_UTF8
+
+int32_t
+UnicodeString::extract(int32_t start, int32_t len,
+                       char *target, uint32_t dstSize) const {
+  if ((dstSize > 0 && target == nullptr)) {
+    return 0;
+  }
+  return toUTF8(start, len, target, dstSize <= 0x7fffffff ? static_cast<int32_t>(dstSize) : 0x7fffffff);
+}
+
+#endif
+
+void 
+UnicodeString::extractBetween(int32_t start,
+                  int32_t limit,
+                  UnicodeString& target) const {
+  pinIndex(start);
+  pinIndex(limit);
+  doExtract(start, limit - start, target);
+}
+
+void
+UnicodeString::toUTF8(ByteSink &sink) const {
+  int32_t length16 = length();
+  if(length16 != 0) {
+    char stackBuffer[1024];
+    int32_t capacity = static_cast<int32_t>(sizeof(stackBuffer));
+    UBool utf8IsOwned = false;
+    char *utf8 = sink.GetAppendBuffer(length16 < capacity ? length16 : capacity,
+                                      3*length16,
+                                      stackBuffer, capacity,
+                                      &capacity);
+    int32_t length8 = 0;
+    UErrorCode errorCode = U_ZERO_ERROR;
+    u_strToUTF8WithSub(utf8, capacity, &length8,
+                       getBuffer(), length16,
+                       0xFFFD,  
+                       nullptr,    
+                       &errorCode);
+    if(errorCode == U_BUFFER_OVERFLOW_ERROR) {
+      utf8 = static_cast<char*>(uprv_malloc(length8));
+      if(utf8 != nullptr) {
+        utf8IsOwned = true;
+        errorCode = U_ZERO_ERROR;
+        u_strToUTF8WithSub(utf8, length8, &length8,
+                           getBuffer(), length16,
+                           0xFFFD,  
+                           nullptr,    
+                           &errorCode);
+      } else {
+        errorCode = U_MEMORY_ALLOCATION_ERROR;
+      }
+    }
+    if(U_SUCCESS(errorCode)) {
+      sink.Append(utf8, length8);
+      sink.Flush();
+    }
+    if(utf8IsOwned) {
+      uprv_free(utf8);
+    }
+  }
+}
+
+int32_t
+UnicodeString::toUTF32(UChar32 *utf32, int32_t capacity, UErrorCode &errorCode) const {
+  int32_t length32=0;
+  if(U_SUCCESS(errorCode)) {
+    u_strToUTF32WithSub(utf32, capacity, &length32,
+        getBuffer(), length(),
+        0xfffd,  
+        nullptr,    
+        &errorCode);
+  }
+  return length32;
+}
+
+int32_t 
+UnicodeString::indexOf(const char16_t *srcChars,
+               int32_t srcStart,
+               int32_t srcLength,
+               int32_t start,
+               int32_t length) const
+{
+  if (isBogus() || srcChars == nullptr || srcStart < 0 || srcLength == 0) {
+    return -1;
+  }
+
+  if(srcLength < 0 && srcChars[srcStart] == 0) {
+    return -1;
+  }
+
+  pinIndices(start, length);
+
+  const char16_t *array = getArrayStart();
+  const char16_t *match = u_strFindFirst(array + start, length, srcChars + srcStart, srcLength);
+  if(match == nullptr) {
+    return -1;
+  } else {
+    return static_cast<int32_t>(match - array);
+  }
+}
+
+int32_t
+UnicodeString::doIndexOf(char16_t c,
+             int32_t start,
+             int32_t length) const
+{
+  pinIndices(start, length);
+
+  const char16_t *array = getArrayStart();
+  const char16_t *match = u_memchr(array + start, c, length);
+  if(match == nullptr) {
+    return -1;
+  } else {
+    return static_cast<int32_t>(match - array);
+  }
+}
+
+int32_t
+UnicodeString::doIndexOf(UChar32 c,
+                         int32_t start,
+                         int32_t length) const {
+  pinIndices(start, length);
+
+  const char16_t *array = getArrayStart();
+  const char16_t *match = u_memchr32(array + start, c, length);
+  if(match == nullptr) {
+    return -1;
+  } else {
+    return static_cast<int32_t>(match - array);
+  }
+}
+
+int32_t 
+UnicodeString::lastIndexOf(const char16_t *srcChars,
+               int32_t srcStart,
+               int32_t srcLength,
+               int32_t start,
+               int32_t length) const
+{
+  if (isBogus() || srcChars == nullptr || srcStart < 0 || srcLength == 0) {
+    return -1;
+  }
+
+  if(srcLength < 0 && srcChars[srcStart] == 0) {
+    return -1;
+  }
+
+  pinIndices(start, length);
+
+  const char16_t *array = getArrayStart();
+  const char16_t *match = u_strFindLast(array + start, length, srcChars + srcStart, srcLength);
+  if(match == nullptr) {
+    return -1;
+  } else {
+    return static_cast<int32_t>(match - array);
+  }
+}
+
+int32_t
+UnicodeString::doLastIndexOf(char16_t c,
+                 int32_t start,
+                 int32_t length) const
+{
+  if(isBogus()) {
+    return -1;
+  }
+
+  pinIndices(start, length);
+
+  const char16_t *array = getArrayStart();
+  const char16_t *match = u_memrchr(array + start, c, length);
+  if(match == nullptr) {
+    return -1;
+  } else {
+    return static_cast<int32_t>(match - array);
+  }
+}
+
+int32_t
+UnicodeString::doLastIndexOf(UChar32 c,
+                             int32_t start,
+                             int32_t length) const {
+  pinIndices(start, length);
+
+  const char16_t *array = getArrayStart();
+  const char16_t *match = u_memrchr32(array + start, c, length);
+  if(match == nullptr) {
+    return -1;
+  } else {
+    return static_cast<int32_t>(match - array);
+  }
+}
+
+
+UnicodeString& 
+UnicodeString::findAndReplace(int32_t start,
+                  int32_t length,
+                  const UnicodeString& oldText,
+                  int32_t oldStart,
+                  int32_t oldLength,
+                  const UnicodeString& newText,
+                  int32_t newStart,
+                  int32_t newLength)
+{
+  if(isBogus() || oldText.isBogus() || newText.isBogus()) {
+    return *this;
+  }
+
+  pinIndices(start, length);
+  oldText.pinIndices(oldStart, oldLength);
+  newText.pinIndices(newStart, newLength);
+
+  if(oldLength == 0) {
+    return *this;
+  }
+
+  while(length > 0 && length >= oldLength) {
+    int32_t pos = indexOf(oldText, oldStart, oldLength, start, length);
+    if(pos < 0) {
+      break;
+    } else {
+      replace(pos, oldLength, newText, newStart, newLength);
+      length -= pos + oldLength - start;
+      start = pos + newLength;
+    }
+  }
+
+  return *this;
+}
+
+
+void
+UnicodeString::setToBogus()
+{
+  releaseArray();
+
+  fUnion.fFields.fLengthAndFlags = kIsBogus;
+  fUnion.fFields.fArray = nullptr;
+  fUnion.fFields.fCapacity = 0;
+}
+
+void
+UnicodeString::unBogus() {
+  if(fUnion.fFields.fLengthAndFlags & kIsBogus) {
+    setToEmpty();
+  }
+}
+
+const char16_t *
+UnicodeString::getTerminatedBuffer() {
+  if(!isWritable()) {
+    return nullptr;
+  }
+  char16_t *array = getArrayStart();
+  int32_t len = length();
+  if(len < getCapacity()) {
+    if(fUnion.fFields.fLengthAndFlags & kBufferIsReadonly) {
+      if(array[len] == 0) {
+        return array;
+      }
+    } else if(((fUnion.fFields.fLengthAndFlags & kRefCounted) == 0 || refCount() == 1)) {
+
+      array[len] = 0;
+      return array;
+    }
+  }
+  if(len<INT32_MAX && cloneArrayIfNeeded(len+1)) {
+    array = getArrayStart();
+    array[len] = 0;
+    return array;
+  } else {
+    return nullptr;
+  }
+}
+
+UnicodeString &
+UnicodeString::setTo(UBool isTerminated,
+                     ConstChar16Ptr textPtr,
+                     int32_t textLength)
+{
+  if(fUnion.fFields.fLengthAndFlags & kOpenGetBuffer) {
+    // do not modify a string that has an "open" getBuffer(minCapacity)
+    return *this;
+  }
+
+  const char16_t *text = textPtr;
+  if(text == nullptr) {
+    releaseArray();
+    setToEmpty();
+    return *this;
+  }
+
+  if( textLength < -1 ||
+      (textLength == -1 && !isTerminated) ||
+      (textLength >= 0 && isTerminated && text[textLength] != 0)
+  ) {
+    setToBogus();
+    return *this;
+  }
+
+  releaseArray();
+
+  if(textLength == -1) {
+    textLength = u_strlen(text);
+  }
+  fUnion.fFields.fLengthAndFlags = kReadonlyAlias;
+  setArray(const_cast<char16_t*>(text), textLength, isTerminated ? textLength + 1 : textLength);
+  return *this;
+}
+
+UnicodeString &
+UnicodeString::setTo(char16_t *buffer,
+                     int32_t buffLength,
+                     int32_t buffCapacity) {
+  if(fUnion.fFields.fLengthAndFlags & kOpenGetBuffer) {
+    // do not modify a string that has an "open" getBuffer(minCapacity)
+    return *this;
+  }
+
+  if(buffer == nullptr) {
+    releaseArray();
+    setToEmpty();
+    return *this;
+  }
+
+  if(buffLength < -1 || buffCapacity < 0 || buffLength > buffCapacity) {
+    setToBogus();
+    return *this;
+  } else if(buffLength == -1) {
+    const char16_t *p = buffer, *limit = buffer + buffCapacity;
+    while(p != limit && *p != 0) {
+      ++p;
+    }
+    buffLength = static_cast<int32_t>(p - buffer);
+  }
+
+  releaseArray();
+
+  fUnion.fFields.fLengthAndFlags = kWritableAlias;
+  setArray(buffer, buffLength, buffCapacity);
+  return *this;
+}
+
+UnicodeString &UnicodeString::setToUTF8(StringPiece utf8) {
+  unBogus();
+  int32_t length = utf8.length();
+  int32_t capacity;
+  if(length <= US_STACKBUF_SIZE) {
+    capacity = US_STACKBUF_SIZE;
+  } else {
+    capacity = length + 1;  
+  }
+  char16_t *utf16 = getBuffer(capacity);
+  int32_t length16;
+  UErrorCode errorCode = U_ZERO_ERROR;
+  u_strFromUTF8WithSub(utf16, getCapacity(), &length16,
+      utf8.data(), length,
+      0xfffd,  
+      nullptr,    
+      &errorCode);
+  releaseBuffer(length16);
+  if(U_FAILURE(errorCode)) {
+    setToBogus();
+  }
+  return *this;
+}
+
+UnicodeString&
+UnicodeString::setCharAt(int32_t offset,
+             char16_t c)
+{
+  int32_t len = length();
+  if(cloneArrayIfNeeded() && len > 0) {
+    if(offset < 0) {
+      offset = 0;
+    } else if(offset >= len) {
+      offset = len - 1;
+    }
+
+    getArrayStart()[offset] = c;
+  }
+  return *this;
+}
+
+UnicodeString&
+UnicodeString::replace(int32_t start,
+               int32_t _length,
+               UChar32 srcChar) {
+  char16_t buffer[U16_MAX_LENGTH];
+  int32_t count = 0;
+  UBool isError = false;
+  U16_APPEND(buffer, count, U16_MAX_LENGTH, srcChar, isError);
+  return doReplace(start, _length, buffer, 0, isError ? 0 : count);
+}
+
+UnicodeString&
+UnicodeString::append(UChar32 srcChar) {
+  char16_t buffer[U16_MAX_LENGTH];
+  int32_t _length = 0;
+  UBool isError = false;
+  U16_APPEND(buffer, _length, U16_MAX_LENGTH, srcChar, isError);
+  return isError ? *this : doAppend(buffer, 0, _length);
+}
+
+UnicodeString&
+UnicodeString::doReplace( int32_t start,
+              int32_t length,
+              const UnicodeString& src,
+              int32_t srcStart,
+              int32_t srcLength)
+{
+  src.pinIndices(srcStart, srcLength);
+
+  return doReplace(start, length, src.getArrayStart(), srcStart, srcLength);
+}
+
+UnicodeString&
+UnicodeString::doReplace(int32_t start,
+             int32_t length,
+             const char16_t *srcChars,
+             int32_t srcStart,
+             int32_t srcLength)
+{
+  if(!isWritable()) {
+    return *this;
+  }
+
+  int32_t oldLength = this->length();
+
+  if((fUnion.fFields.fLengthAndFlags&kBufferIsReadonly) && srcLength == 0) {
+    if(start == 0) {
+      pinIndex(length);
+      fUnion.fFields.fArray += length;
+      fUnion.fFields.fCapacity -= length;
+      setLength(oldLength - length);
+      return *this;
+    } else {
+      pinIndex(start);
+      if(length >= (oldLength - start)) {
+        setLength(start);
+        fUnion.fFields.fCapacity = start;  
+        return *this;
+      }
+    }
+  }
+
+  if(start == oldLength) {
+    return doAppend(srcChars, srcStart, srcLength);
+  }
+
+  if (srcChars == nullptr) {
+    srcLength = 0;
+  } else {
+    srcChars += srcStart;
+    if (srcLength < 0) {
+      srcLength = u_strlen(srcChars);
+    }
+  }
+
+  pinIndices(start, length);
+
+  int32_t newLength = oldLength - length;
+  if(srcLength > (INT32_MAX - newLength)) {
+    setToBogus();
+    return *this;
+  }
+  newLength += srcLength;
+
+  const char16_t *oldArray = getArrayStart();
+  if (isBufferWritable() &&
+      oldArray < srcChars + srcLength &&
+      srcChars < oldArray + oldLength) {
+    UnicodeString copy(srcChars, srcLength);
+    if (copy.isBogus()) {
+      setToBogus();
+      return *this;
+    }
+    return doReplace(start, length, copy.getArrayStart(), 0, srcLength);
+  }
+
+  char16_t oldStackBuffer[US_STACKBUF_SIZE];
+  if((fUnion.fFields.fLengthAndFlags&kUsingStackBuffer) && (newLength > US_STACKBUF_SIZE)) {
+    u_memcpy(oldStackBuffer, oldArray, oldLength);
+    oldArray = oldStackBuffer;
+  }
+
+  int32_t *bufferToDelete = nullptr;
+  if(!cloneArrayIfNeeded(newLength, getGrowCapacity(newLength),
+                         false, &bufferToDelete)
+  ) {
+    return *this;
+  }
+
+
+  char16_t *newArray = getArrayStart();
+  if(newArray != oldArray) {
+    us_arrayCopy(oldArray, 0, newArray, 0, start);
+    us_arrayCopy(oldArray, start + length,
+                 newArray, start + srcLength,
+                 oldLength - (start + length));
+  } else if(length != srcLength) {
+    us_arrayCopy(oldArray, start + length,
+                 newArray, start + srcLength,
+                 oldLength - (start + length));
+  }
+
+  us_arrayCopy(srcChars, 0, newArray, start, srcLength);
+
+  setLength(newLength);
+
+  if (bufferToDelete) {
+    uprv_free(bufferToDelete);
+  }
+
+  return *this;
+}
+
+UnicodeString&
+UnicodeString::doReplace(int32_t start, int32_t length, std::u16string_view src) {
+  if (!isWritable()) {
+    return *this;
+  }
+  if (src.length() > INT32_MAX) {
+    setToBogus();
+    return *this;
+  }
+  return doReplace(start, length, src.data(), 0, static_cast<int32_t>(src.length()));
+}
+
+
+UnicodeString&
+UnicodeString::doAppend(const UnicodeString& src, int32_t srcStart, int32_t srcLength) {
+  if(srcLength == 0) {
+    return *this;
+  }
+
+  src.pinIndices(srcStart, srcLength);
+  return doAppend(src.getArrayStart(), srcStart, srcLength);
+}
+
+UnicodeString&
+UnicodeString::doAppend(const char16_t *srcChars, int32_t srcStart, int32_t srcLength) {
+  if(!isWritable() || srcLength == 0 || srcChars == nullptr) {
+    return *this;
+  }
+
+  srcChars += srcStart;
+
+  if(srcLength < 0) {
+    if((srcLength = u_strlen(srcChars)) == 0) {
+      return *this;
+    }
+  }
+
+  int32_t oldLength = length();
+  int32_t newLength;
+
+  if (srcLength <= getCapacity() - oldLength && isBufferWritable()) {
+    newLength = oldLength + srcLength;
+    if (srcLength <= 4) {
+      char16_t *arr = getArrayStart();
+      arr[oldLength] = srcChars[0];
+      if (srcLength > 1) arr[oldLength+1] = srcChars[1];
+      if (srcLength > 2) arr[oldLength+2] = srcChars[2];
+      if (srcLength > 3) arr[oldLength+3] = srcChars[3];
+      setLength(newLength);
+      return *this;
+    }
+  } else {
+    if (uprv_add32_overflow(oldLength, srcLength, &newLength)) {
+      setToBogus();
+      return *this;
+    }
+
+    const char16_t* oldArray = getArrayStart();
+    if (isBufferWritable() &&
+        oldArray < srcChars + srcLength &&
+        srcChars < oldArray + oldLength) {
+      UnicodeString copy(srcChars, srcLength);
+      if (copy.isBogus()) {
+        setToBogus();
+        return *this;
+      }
+      return doAppend(copy.getArrayStart(), 0, srcLength);
+    }
+
+    if (!cloneArrayIfNeeded(newLength, getGrowCapacity(newLength))) {
+      return *this;
+    }
+  }
+
+  char16_t *newArray = getArrayStart();
+  if(srcChars != newArray + oldLength) {
+    us_arrayCopy(srcChars, 0, newArray, oldLength, srcLength);
+  }
+  setLength(newLength);
+
+  return *this;
+}
+
+UnicodeString&
+UnicodeString::doAppend(std::u16string_view src) {
+  if (!isWritable() || src.empty()) {
+    return *this;
+  }
+  if (src.length() > INT32_MAX) {
+    setToBogus();
+    return *this;
+  }
+  return doAppend(src.data(), 0, static_cast<int32_t>(src.length()));
+}
+
+void
+UnicodeString::handleReplaceBetween(int32_t start,
+                                    int32_t limit,
+                                    const UnicodeString& text) {
+    replaceBetween(start, limit, text);
+}
+
+void 
+UnicodeString::copy(int32_t start, int32_t limit, int32_t dest) {
+    if (limit <= start) {
+        return; 
+    }
+    char16_t* text = static_cast<char16_t*>(uprv_malloc(sizeof(char16_t) * (limit - start)));
+    if (text != nullptr) {
+	    extractBetween(start, limit, text, 0);
+	    insert(dest, text, 0, limit - start);    
+	    uprv_free(text);
+    }
+}
+
+UBool Replaceable::hasMetaData() const {
+    return true;
+}
+
+UBool UnicodeString::hasMetaData() const {
+    return false;
+}
+
+UnicodeString&
+UnicodeString::doReverse(int32_t start, int32_t length) {
+  if(length <= 1 || !cloneArrayIfNeeded()) {
+    return *this;
+  }
+
+  pinIndices(start, length);
+  if(length <= 1) {  
+    return *this;
+  }
+
+  char16_t *left = getArrayStart() + start;
+  char16_t *right = left + length - 1;  
+  char16_t swap;
+  UBool hasSupplementary = false;
+
+  do {
+    hasSupplementary |= static_cast<UBool>(U16_IS_LEAD(swap = *left));
+    hasSupplementary |= static_cast<UBool>(U16_IS_LEAD(*left++ = *right));
+    *right-- = swap;
+  } while(left < right);
+  hasSupplementary |= static_cast<UBool>(U16_IS_LEAD(*left));
+
+  if(hasSupplementary) {
+    char16_t swap2;
+
+    left = getArrayStart() + start;
+    right = left + length - 1; 
+    while(left < right) {
+      if(U16_IS_TRAIL(swap = *left) && U16_IS_LEAD(swap2 = *(left + 1))) {
+        *left++ = swap2;
+        *left++ = swap;
+      } else {
+        ++left;
+      }
+    }
+  }
+
+  return *this;
+}
+
+UBool 
+UnicodeString::padLeading(int32_t targetLength,
+                          char16_t padChar)
+{
+  int32_t oldLength = length();
+  if(oldLength >= targetLength || !cloneArrayIfNeeded(targetLength)) {
+    return false;
+  } else {
+    char16_t *array = getArrayStart();
+    int32_t start = targetLength - oldLength;
+    us_arrayCopy(array, 0, array, start, oldLength);
+
+    while(--start >= 0) {
+      array[start] = padChar;
+    }
+    setLength(targetLength);
+    return true;
+  }
+}
+
+UBool 
+UnicodeString::padTrailing(int32_t targetLength,
+                           char16_t padChar)
+{
+  int32_t oldLength = length();
+  if(oldLength >= targetLength || !cloneArrayIfNeeded(targetLength)) {
+    return false;
+  } else {
+    char16_t *array = getArrayStart();
+    int32_t length = targetLength;
+    while(--length >= oldLength) {
+      array[length] = padChar;
+    }
+    setLength(targetLength);
+    return true;
+  }
+}
+
+int32_t
+UnicodeString::doHashCode() const
+{
+    int32_t hashCode = ustr_hashUCharsN(getArrayStart(), length());
+    if (hashCode == kInvalidHashCode) {
+        hashCode = kEmptyHashCode;
+    }
+    return hashCode;
+}
+
+
+char16_t *
+UnicodeString::getBuffer(int32_t minCapacity) {
+  if(minCapacity>=-1 && cloneArrayIfNeeded(minCapacity)) {
+    fUnion.fFields.fLengthAndFlags|=kOpenGetBuffer;
+    setZeroLength();
+    return getArrayStart();
+  } else {
+    return nullptr;
+  }
+}
+
+void
+UnicodeString::releaseBuffer(int32_t newLength) {
+  if(fUnion.fFields.fLengthAndFlags&kOpenGetBuffer && newLength>=-1) {
+    int32_t capacity=getCapacity();
+    if(newLength==-1) {
+      const char16_t *array=getArrayStart(), *p=array, *limit=array+capacity;
+      while(p<limit && *p!=0) {
+        ++p;
+      }
+      newLength = static_cast<int32_t>(p - array);
+    } else if(newLength>capacity) {
+      newLength=capacity;
+    }
+    setLength(newLength);
+    fUnion.fFields.fLengthAndFlags&=~kOpenGetBuffer;
+  }
+}
+
+UBool
+UnicodeString::cloneArrayIfNeeded(int32_t newCapacity,
+                                  int32_t growCapacity,
+                                  UBool doCopyArray,
+                                  int32_t **pBufferToDelete,
+                                  UBool forceClone) {
+  if(newCapacity == -1) {
+    newCapacity = getCapacity();
+  }
+
+  if(!isWritable()) {
+    return false;
+  }
+
+  if(forceClone ||
+     fUnion.fFields.fLengthAndFlags & kBufferIsReadonly ||
+     (fUnion.fFields.fLengthAndFlags & kRefCounted && refCount() > 1) ||
+     newCapacity > getCapacity()
+  ) {
+    if(growCapacity < 0) {
+      growCapacity = newCapacity;
+    } else if(newCapacity <= US_STACKBUF_SIZE && growCapacity > US_STACKBUF_SIZE) {
+      growCapacity = US_STACKBUF_SIZE;
+    } else if(newCapacity > growCapacity) {
+      setToBogus();
+      return false;  
+    }
+    if(growCapacity > kMaxCapacity) {
+      setToBogus();
+      return false;
+    }
+
+    char16_t oldStackBuffer[US_STACKBUF_SIZE];
+    char16_t *oldArray;
+    int32_t oldLength = length();
+    int16_t flags = fUnion.fFields.fLengthAndFlags;
+
+    if(flags&kUsingStackBuffer) {
+      U_ASSERT(!(flags&kRefCounted)); 
+      if(doCopyArray && growCapacity > US_STACKBUF_SIZE) {
+        us_arrayCopy(fUnion.fStackFields.fBuffer, 0, oldStackBuffer, 0, oldLength);
+        oldArray = oldStackBuffer;
+      } else {
+        oldArray = nullptr; 
+      }
+    } else {
+      oldArray = fUnion.fFields.fArray;
+      U_ASSERT(oldArray!=nullptr); 
+    }
+
+    if(allocate(growCapacity) ||
+       (newCapacity < growCapacity && allocate(newCapacity))
+    ) {
+      if(doCopyArray) {
+        int32_t minLength = oldLength;
+        newCapacity = getCapacity();
+        if(newCapacity < minLength) {
+          minLength = newCapacity;
+        }
+        if(oldArray != nullptr) {
+          us_arrayCopy(oldArray, 0, getArrayStart(), 0, minLength);
+        }
+        setLength(minLength);
+      } else {
+        setZeroLength();
+      }
+
+      if(flags & kRefCounted) {
+        u_atomic_int32_t* pRefCount = reinterpret_cast<u_atomic_int32_t*>(oldArray) - 1;
+        if(umtx_atomic_dec(pRefCount) == 0) {
+          if (pBufferToDelete == nullptr) {
+            uprv_free((void *)pRefCount);
+          } else {
+            *pBufferToDelete = reinterpret_cast<int32_t*>(pRefCount);
+          }
+        }
+      }
+    } else {
+      if(!(flags&kUsingStackBuffer)) {
+        fUnion.fFields.fArray = oldArray;
+      }
+      fUnion.fFields.fLengthAndFlags = flags;
+      setToBogus();
+      return false;
+    }
+  }
+  return true;
+}
+
+
+UnicodeStringAppendable::~UnicodeStringAppendable() {}
+
+UBool
+UnicodeStringAppendable::appendCodeUnit(char16_t c) {
+  return str.doAppend(&c, 0, 1).isWritable();
+}
+
+UBool
+UnicodeStringAppendable::appendCodePoint(UChar32 c) {
+  char16_t buffer[U16_MAX_LENGTH];
+  int32_t cLength = 0;
+  UBool isError = false;
+  U16_APPEND(buffer, cLength, U16_MAX_LENGTH, c, isError);
+  return !isError && str.doAppend(buffer, 0, cLength).isWritable();
+}
+
+UBool
+UnicodeStringAppendable::appendString(const char16_t *s, int32_t length) {
+  return str.doAppend(s, 0, length).isWritable();
+}
+
+UBool
+UnicodeStringAppendable::reserveAppendCapacity(int32_t appendCapacity) {
+  return str.cloneArrayIfNeeded(str.length() + appendCapacity);
+}
+
+char16_t *
+UnicodeStringAppendable::getAppendBuffer(int32_t minCapacity,
+                                         int32_t desiredCapacityHint,
+                                         char16_t *scratch, int32_t scratchCapacity,
+                                         int32_t *resultCapacity) {
+  if(minCapacity < 1 || scratchCapacity < minCapacity) {
+    *resultCapacity = 0;
+    return nullptr;
+  }
+  int32_t oldLength = str.length();
+  if(minCapacity <= (kMaxCapacity - oldLength) &&
+      desiredCapacityHint <= (kMaxCapacity - oldLength) &&
+      str.cloneArrayIfNeeded(oldLength + minCapacity, oldLength + desiredCapacityHint)) {
+    *resultCapacity = str.getCapacity() - oldLength;
+    return str.getArrayStart() + oldLength;
+  }
+  *resultCapacity = scratchCapacity;
+  return scratch;
+}
+
+U_NAMESPACE_END
+
+U_NAMESPACE_USE
+
+U_CAPI int32_t U_EXPORT2
+uhash_hashUnicodeString(const UElement key) {
+    const UnicodeString *str = (const UnicodeString*) key.pointer;
+    return (str == nullptr) ? 0 : str->hashCode();
+}
+
+U_CAPI UBool U_EXPORT2
+uhash_compareUnicodeString(const UElement key1, const UElement key2) {
+    const UnicodeString *str1 = (const UnicodeString*) key1.pointer;
+    const UnicodeString *str2 = (const UnicodeString*) key2.pointer;
+    if (str1 == str2) {
+        return true;
+    }
+    if (str1 == nullptr || str2 == nullptr) {
+        return false;
+    }
+    return *str1 == *str2;
+}
+
+#if defined(U_STATIC_IMPLEMENTATION)
+#if defined(__clang__) || U_GCC_MAJOR_MINOR >= 1100
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+static void uprv_UnicodeStringDummy() {
+    delete [] (new UnicodeString[2]);
+}
+#pragma GCC diagnostic pop
+#endif
+#endif

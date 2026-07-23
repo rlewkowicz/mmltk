@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DocGroup_h
+#define DocGroup_h
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/BrowsingContextGroup.h"
+#include "mozilla/dom/HTMLSlotElement.h"
+#include "nsIPrincipal.h"
+#include "nsISupportsImpl.h"
+#include "nsString.h"
+#include "nsTHashSet.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla {
+class AbstractThread;
+namespace dom {
+
+class CustomElementReactionsStack;
+class JSExecutionManager;
+class MediaSource;
+
+class DocGroup final {
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(DocGroup)
+  NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(DocGroup)
+
+  static already_AddRefed<DocGroup> Create(
+      BrowsingContextGroup* aBrowsingContextGroup, const DocGroupKey& aKey);
+
+  void AssertMatches(const Document* aDocument) const;
+
+  const DocGroupKey& GetKey() const { return mKey; }
+
+  bool IsOriginKeyed() const { return mKey.mOriginKeyed; }
+
+  JSExecutionManager* GetExecutionManager() const { return mExecutionManager; }
+  void SetExecutionManager(JSExecutionManager*);
+
+  BrowsingContextGroup* GetBrowsingContextGroup() const {
+    return mBrowsingContextGroup;
+  }
+
+  mozilla::dom::DOMArena* ArenaAllocator() { return mArena; }
+
+  mozilla::dom::CustomElementReactionsStack* CustomElementReactionsStack();
+
+  void AddDocument(Document* aDocument);
+
+  void RemoveDocument(Document* aDocument);
+
+  bool* GetValidAccessPtr();
+
+  void SignalSlotChange(HTMLSlotElement& aSlot);
+
+  nsTArray<RefPtr<HTMLSlotElement>> MoveSignalSlotList();
+
+  nsresult RegisterMediaSourceURL(nsGlobalWindowInner* aWindow,
+                                  MediaSource* aMediaSource, nsACString& aURL);
+  bool UnregisterMediaSourceURL(const nsACString& aURL,
+                                bool aNotifyWindow = true);
+  already_AddRefed<MediaSource> LookupMediaSourceURL(nsIURI* aURI);
+
+  static AutoTArray<RefPtr<DocGroup>, 2>* sPendingDocGroups;
+
+  bool IsActive() const;
+
+  const nsID& AgentClusterId() const { return mAgentClusterId; }
+
+  bool IsEmpty() const { return mDocuments.IsEmpty(); }
+
+ private:
+  DocGroup(BrowsingContextGroup* aBrowsingContextGroup,
+           const DocGroupKey& aKey);
+
+  ~DocGroup();
+
+  DocGroupKey mKey;
+
+  nsTArray<Document*> mDocuments;
+  RefPtr<mozilla::dom::CustomElementReactionsStack> mReactionsStack;
+  nsTArray<RefPtr<HTMLSlotElement>> mSignalSlotList;
+  RefPtr<BrowsingContextGroup> mBrowsingContextGroup;
+
+  struct MediaSourceURLEntry {
+    RefPtr<MediaSource> mMediaSource;
+    RefPtr<nsGlobalWindowInner> mOwner;
+  };
+  nsTHashMap<nsCString, MediaSourceURLEntry> mMediaSourceURLs;
+
+  RefPtr<JSExecutionManager> mExecutionManager;
+
+  const nsID mAgentClusterId;
+
+  RefPtr<mozilla::dom::DOMArena> mArena;
+};
+
+}  
+}  
+
+#endif  // defined(DocGroup_h)

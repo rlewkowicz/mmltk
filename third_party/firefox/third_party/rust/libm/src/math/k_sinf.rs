@@ -1,0 +1,23 @@
+/*
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunPro, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ */
+
+const S1: f64 = -0.166666666416265235595; 
+const S2: f64 = 0.0083333293858894631756; 
+const S3: f64 = -0.000198393348360966317347; 
+const S4: f64 = 0.0000027183114939898219064; 
+
+pub(crate) fn k_sinf(x: f64) -> f32 {
+    let z = x * x;
+    let w = z * z;
+    let r = S3 + z * S4;
+    let s = z * x;
+    ((x + s * (S1 + z * S2)) + s * w * r) as f32
+}

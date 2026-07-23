@@ -1,0 +1,75 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+*   Copyright (C) 2011-2012, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*******************************************************************************
+*   file name:  appendable.h
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+*   created on: 2010dec07
+*   created by: Markus W. Scherer
+*/
+
+#ifndef __APPENDABLE_H__
+#define __APPENDABLE_H__
+
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/uobject.h"
+
+U_NAMESPACE_BEGIN
+
+class UnicodeString;
+
+class U_COMMON_API Appendable : public UObject {
+public:
+    ~Appendable();
+
+    virtual UBool appendCodeUnit(char16_t c) = 0;
+
+    virtual UBool appendCodePoint(UChar32 c);
+
+    virtual UBool appendString(const char16_t *s, int32_t length);
+
+    virtual UBool reserveAppendCapacity(int32_t appendCapacity);
+
+    virtual char16_t *getAppendBuffer(int32_t minCapacity,
+                                   int32_t desiredCapacityHint,
+                                   char16_t *scratch, int32_t scratchCapacity,
+                                   int32_t *resultCapacity);
+};
+
+class U_COMMON_API UnicodeStringAppendable : public Appendable {
+public:
+    explicit UnicodeStringAppendable(UnicodeString &s) : str(s) {}
+
+    ~UnicodeStringAppendable();
+
+    virtual UBool appendCodeUnit(char16_t c) override;
+
+    virtual UBool appendCodePoint(UChar32 c) override;
+
+    virtual UBool appendString(const char16_t *s, int32_t length) override;
+
+    virtual UBool reserveAppendCapacity(int32_t appendCapacity) override;
+
+    virtual char16_t *getAppendBuffer(int32_t minCapacity,
+                                   int32_t desiredCapacityHint,
+                                   char16_t *scratch, int32_t scratchCapacity,
+                                   int32_t *resultCapacity) override;
+
+private:
+    UnicodeString &str;
+};
+
+U_NAMESPACE_END
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif  // __APPENDABLE_H__

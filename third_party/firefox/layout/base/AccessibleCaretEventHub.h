@@ -1,0 +1,192 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_AccessibleCaretEventHub_h
+#define mozilla_AccessibleCaretEventHub_h
+
+#include "LayoutConstants.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/WeakPtr.h"
+#include "nsCOMPtr.h"
+#include "nsDocShell.h"
+#include "nsIReflowObserver.h"
+#include "nsIScrollObserver.h"
+#include "nsPoint.h"
+#include "nsWeakReference.h"
+
+class nsITimer;
+
+namespace mozilla {
+class AccessibleCaretManager;
+class PresShell;
+class WidgetKeyboardEvent;
+class WidgetMouseEvent;
+class WidgetTouchEvent;
+
+class AccessibleCaretEventHub : public nsIReflowObserver,
+                                public nsIScrollObserver,
+                                public nsSupportsWeakReference {
+ public:
+  explicit AccessibleCaretEventHub(PresShell* aPresShell);
+  void Init();
+  void Terminate();
+
+  MOZ_CAN_RUN_SCRIPT
+  nsEventStatus HandleEvent(WidgetEvent* aEvent);
+
+  MOZ_CAN_RUN_SCRIPT
+  void NotifyBlur(bool aIsLeavingDocument);
+
+  NS_DECL_ISUPPORTS
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  NS_IMETHOD Reflow(DOMHighResTimeStamp start, DOMHighResTimeStamp end) final;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  NS_IMETHOD ReflowInterruptible(DOMHighResTimeStamp start,
+                                 DOMHighResTimeStamp end) final;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  virtual void ScrollPositionChanged() override;
+  MOZ_CAN_RUN_SCRIPT
+  virtual void AsyncPanZoomStarted() override;
+  MOZ_CAN_RUN_SCRIPT
+  virtual void AsyncPanZoomStopped() override;
+
+  class State;
+  State* GetState() const;
+
+  MOZ_CAN_RUN_SCRIPT
+  void OnSelectionChange(dom::Document* aDocument, dom::Selection* aSelection,
+                         int16_t aReason);
+
+  bool ShouldDisableApz() const;
+
+ protected:
+  virtual ~AccessibleCaretEventHub() = default;
+
+#define MOZ_DECL_STATE_CLASS_GETTER(aClassName) \
+  class aClassName;                             \
+  static State* aClassName();
+
+#define MOZ_IMPL_STATE_CLASS_GETTER(aClassName)                           \
+  AccessibleCaretEventHub::State* AccessibleCaretEventHub::aClassName() { \
+    static class aClassName singleton;                                    \
+    return &singleton;                                                    \
+  }
+
+  MOZ_DECL_STATE_CLASS_GETTER(NoActionState)
+  MOZ_DECL_STATE_CLASS_GETTER(PressCaretState)
+  MOZ_DECL_STATE_CLASS_GETTER(DragCaretState)
+  MOZ_DECL_STATE_CLASS_GETTER(PressNoCaretState)
+  MOZ_DECL_STATE_CLASS_GETTER(ScrollState)
+  MOZ_DECL_STATE_CLASS_GETTER(LongTapState)
+
+  void SetState(State* aState);
+
+  MOZ_CAN_RUN_SCRIPT
+  nsEventStatus HandleMouseEvent(WidgetMouseEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT
+  nsEventStatus HandleTouchEvent(WidgetTouchEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT
+  nsEventStatus HandleKeyboardEvent(WidgetKeyboardEvent* aEvent);
+
+  virtual nsPoint GetTouchEventPosition(WidgetTouchEvent* aEvent,
+                                        int32_t aIdentifier) const;
+  virtual nsPoint GetMouseEventPosition(WidgetMouseEvent* aEvent) const;
+
+  bool MoveDistanceIsLarge(const nsPoint& aPoint) const;
+
+  void LaunchLongTapInjector();
+  void CancelLongTapInjector();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  static void FireLongTap(nsITimer* aTimer, void* aAccessibleCaretEventHub);
+
+  void LaunchScrollEndInjector();
+  void CancelScrollEndInjector();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  static void FireScrollEnd(nsITimer* aTimer, void* aAccessibleCaretEventHub);
+
+  State* mState = NoActionState();
+
+  PresShell* MOZ_NON_OWNING_REF mPresShell = nullptr;
+
+  UniquePtr<AccessibleCaretManager> mManager;
+
+  WeakPtr<nsDocShell> mDocShell;
+
+  nsCOMPtr<nsITimer> mLongTapInjectorTimer;
+
+  nsPoint mPressPoint{NS_UNCONSTRAINEDSIZE, NS_UNCONSTRAINEDSIZE};
+
+  int32_t mActiveTouchId = kInvalidTouchId;
+
+  bool mInitialized = false;
+
+  bool mIsInReflowCallback = false;
+
+  static const int32_t kMoveStartToleranceInPixel = 5;
+  static const int32_t kInvalidTouchId = -1;
+  static const int32_t kDefaultTouchId = 0;  
+};
+
+class AccessibleCaretEventHub::State {
+ public:
+  virtual const char* Name() const { return ""; }
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual nsEventStatus OnPress(AccessibleCaretEventHub* aContext,
+                                const nsPoint& aPoint, int32_t aTouchId,
+                                EventClassID aEventClass) {
+    return nsEventStatus_eIgnore;
+  }
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual nsEventStatus OnMove(AccessibleCaretEventHub* aContext,
+                               const nsPoint& aPoint,
+                               WidgetMouseEvent::Reason aReason) {
+    return nsEventStatus_eIgnore;
+  }
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual nsEventStatus OnRelease(AccessibleCaretEventHub* aContext) {
+    return nsEventStatus_eIgnore;
+  }
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual nsEventStatus OnLongTap(AccessibleCaretEventHub* aContext,
+                                  const nsPoint& aPoint) {
+    return nsEventStatus_eIgnore;
+  }
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual void OnScrollStart(AccessibleCaretEventHub* aContext) {}
+  MOZ_CAN_RUN_SCRIPT
+  virtual void OnScrollEnd(AccessibleCaretEventHub* aContext) {}
+  MOZ_CAN_RUN_SCRIPT
+  virtual void OnScrollPositionChanged(AccessibleCaretEventHub* aContext) {}
+  MOZ_CAN_RUN_SCRIPT
+  virtual void OnBlur(AccessibleCaretEventHub* aContext,
+                      bool aIsLeavingDocument) {}
+  MOZ_CAN_RUN_SCRIPT
+  virtual void OnSelectionChanged(AccessibleCaretEventHub* aContext,
+                                  dom::Document* aDoc, dom::Selection* aSel,
+                                  int16_t aReason) {}
+  MOZ_CAN_RUN_SCRIPT
+  virtual void OnReflow(AccessibleCaretEventHub* aContext) {}
+  virtual void Enter(AccessibleCaretEventHub* aContext) {}
+  virtual void Leave(AccessibleCaretEventHub* aContext) {}
+
+  explicit State() = default;
+  virtual ~State() = default;
+  State(const State&) = delete;
+  State& operator=(const State&) = delete;
+};
+
+}  
+
+#endif  // mozilla_AccessibleCaretEventHub_h

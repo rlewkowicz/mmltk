@@ -1,0 +1,62 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_CacheIRHealth_h
+#define jit_CacheIRHealth_h
+
+#ifdef JS_CACHEIR_SPEW
+
+#  include "mozilla/Sprintf.h"
+
+#  include "NamespaceImports.h"
+
+#  include "jit/CacheIR.h"
+#  include "js/TypeDecls.h"
+
+enum class JSOp : uint8_t;
+
+namespace js {
+
+class AutoStructuredSpewer;
+
+namespace jit {
+
+class ICEntry;
+class ICStub;
+class ICCacheIRStub;
+class ICFallbackStub;
+
+enum SpewContext : uint8_t { Shell, Transition, TrialInlining };
+
+class CacheIRHealth {
+  enum Happiness : uint8_t { Sad, MediumSad, MediumHappy, Happy };
+
+  Happiness determineStubHappiness(uint32_t stubHealthScore);
+  Happiness spewStubHealth(AutoStructuredSpewer& spew, ICCacheIRStub* stub);
+  bool spewNonFallbackICInformation(AutoStructuredSpewer& spew, JSContext* cx,
+                                    ICStub* firstStub,
+                                    Happiness* entryHappiness);
+  bool spewICEntryHealth(AutoStructuredSpewer& spew, JSContext* cx,
+                         HandleScript script, ICEntry* entry,
+                         ICFallbackStub* fallback, jsbytecode* pc, JSOp op,
+                         Happiness* entryHappiness);
+  void spewShapeInformation(AutoStructuredSpewer& spew, JSContext* cx,
+                            ICStub* stub);
+  BaseScript* maybeExtractBaseScript(JSContext* cx, Shape* shape);
+
+ public:
+  void spewScriptFinalWarmUpCount(JSContext* cx, const char* filename,
+                                  JSScript* script, uint32_t warmUpCount);
+  void healthReportForIC(JSContext* cx, ICEntry* entry,
+                         ICFallbackStub* fallback, HandleScript script,
+                         SpewContext context);
+  void healthReportForScript(JSContext* cx, HandleScript script,
+                             SpewContext context);
+};
+
+}  
+}  
+
+#endif /* JS_CACHEIR_SPEW */
+#endif /* jit_CacheIRHealth_h */

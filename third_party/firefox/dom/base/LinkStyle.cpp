@@ -1,0 +1,350 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/dom/LinkStyle.h"
+
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StyleSheet.h"
+#include "mozilla/StyleSheetInlines.h"
+#include "mozilla/css/Loader.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/FragmentOrElement.h"
+#include "mozilla/dom/HTMLLinkElement.h"
+#include "mozilla/dom/HTMLStyleElement.h"
+#include "mozilla/dom/SRILogHelper.h"
+#include "mozilla/dom/SVGStyleElement.h"
+#include "mozilla/dom/ShadowRoot.h"
+#include "nsCRT.h"
+#include "nsContentUtils.h"
+#include "nsIContent.h"
+#include "nsQueryObject.h"
+#include "nsStyleUtil.h"
+#include "nsUnicharInputStream.h"
+#include "nsUnicharUtils.h"
+#include "nsXPCOMCIDInternal.h"
+
+namespace mozilla::dom {
+
+LinkStyle::SheetInfo::SheetInfo(
+    const Document& aDocument, nsIContent* aContent,
+    already_AddRefed<nsIURI> aURI,
+    already_AddRefed<nsIPrincipal> aTriggeringPrincipal,
+    already_AddRefed<nsIReferrerInfo> aReferrerInfo,
+    mozilla::CORSMode aCORSMode, const nsAString& aTitle,
+    const nsAString& aMedia, const nsAString& aIntegrity,
+    const nsAString& aNonce, HasAlternateRel aHasAlternateRel,
+    IsInline aIsInline, IsExplicitlyEnabled aIsExplicitlyEnabled,
+    FetchPriority aFetchPriority)
+    : mContent(aContent),
+      mURI(aURI),
+      mTriggeringPrincipal(aTriggeringPrincipal),
+      mReferrerInfo(aReferrerInfo),
+      mCORSMode(aCORSMode),
+      mTitle(aTitle),
+      mMedia(aMedia),
+      mIntegrity(aIntegrity),
+      mNonce(aNonce),
+      mFetchPriority(aFetchPriority),
+      mHasAlternateRel(aHasAlternateRel == HasAlternateRel::Yes),
+      mIsInline(aIsInline == IsInline::Yes),
+      mIsExplicitlyEnabled(aIsExplicitlyEnabled) {
+  MOZ_ASSERT(!mIsInline || aContent);
+  MOZ_ASSERT_IF(aContent, aContent->OwnerDoc() == &aDocument);
+  MOZ_ASSERT(mReferrerInfo);
+  MOZ_ASSERT(mIntegrity.IsEmpty() || !mIsInline,
+             "Integrity only applies to <link>");
+}
+
+LinkStyle::SheetInfo::~SheetInfo() = default;
+LinkStyle::LinkStyle() = default;
+
+LinkStyle::~LinkStyle() { LinkStyle::SetStyleSheet(nullptr); }
+
+StyleSheet* LinkStyle::GetSheetForBindings() const {
+  if (mStyleSheet && mStyleSheet->IsComplete()) {
+    return mStyleSheet;
+  }
+  return nullptr;
+}
+
+void LinkStyle::GetTitleAndMediaForElement(const Element& aSelf,
+                                           nsString& aTitle, nsString& aMedia) {
+  if (aSelf.IsInUncomposedDoc()) {
+    aSelf.GetAttr(nsGkAtoms::title, aTitle);
+    aTitle.CompressWhitespace();
+  }
+
+  aSelf.GetAttr(nsGkAtoms::media, aMedia);
+  nsContentUtils::ASCIIToLower(aMedia);
+}
+
+bool LinkStyle::IsCSSMimeTypeAttributeForStyleElement(const Element& aSelf) {
+  nsAutoString type;
+  aSelf.GetAttr(nsGkAtoms::type, type);
+  return type.IsEmpty() || type.LowerCaseEqualsLiteral("text/css");
+}
+
+void LinkStyle::Unlink() { LinkStyle::SetStyleSheet(nullptr); }
+
+void LinkStyle::Traverse(nsCycleCollectionTraversalCallback& cb) {
+  LinkStyle* tmp = this;
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mStyleSheet);
+}
+
+void LinkStyle::SetStyleSheet(StyleSheet* aStyleSheet) {
+  if (mStyleSheet) {
+    mStyleSheet->SetOwningNode(nullptr);
+  }
+
+  mStyleSheet = aStyleSheet;
+  if (mStyleSheet) {
+    mStyleSheet->SetOwningNode(&AsContent());
+  }
+}
+
+void LinkStyle::GetCharset(nsAString& aCharset) { aCharset.Truncate(); }
+
+static uint32_t ToLinkMask(const nsAString& aLink) {
+  uint32_t mask = 0;
+  if (aLink.EqualsLiteral("prefetch")) {
+    mask = LinkStyle::ePREFETCH;
+  } else if (aLink.EqualsLiteral("dns-prefetch")) {
+    mask = LinkStyle::eDNS_PREFETCH;
+  } else if (aLink.EqualsLiteral("stylesheet")) {
+    mask = LinkStyle::eSTYLESHEET;
+  } else if (aLink.EqualsLiteral("next")) {
+    mask = LinkStyle::eNEXT;
+  } else if (aLink.EqualsLiteral("alternate")) {
+    mask = LinkStyle::eALTERNATE;
+  } else if (aLink.EqualsLiteral("preconnect")) {
+    mask = LinkStyle::ePRECONNECT;
+  } else if (aLink.EqualsLiteral("preload")) {
+    mask = LinkStyle::ePRELOAD;
+  } else if (aLink.EqualsLiteral("modulepreload")) {
+    mask = LinkStyle::eMODULE_PRELOAD;
+  } else if (aLink.EqualsLiteral("compression-dictionary")) {
+    mask = LinkStyle::eCOMPRESSION_DICTIONARY;
+  }
+
+  return mask;
+}
+
+uint32_t LinkStyle::ParseLinkTypes(const nsAString& aTypes) {
+  uint32_t linkMask = 0;
+  nsAString::const_iterator start, done;
+  aTypes.BeginReading(start);
+  aTypes.EndReading(done);
+  if (start == done) return linkMask;
+
+  nsAString::const_iterator current(start);
+  bool inString = !nsContentUtils::IsHTMLWhitespace(*current);
+  nsAutoString subString;
+
+  while (current != done) {
+    if (nsContentUtils::IsHTMLWhitespace(*current)) {
+      if (inString) {
+        nsContentUtils::ASCIIToLower(Substring(start, current), subString);
+        linkMask |= ToLinkMask(subString);
+        inString = false;
+      }
+    } else {
+      if (!inString) {
+        start = current;
+        inString = true;
+      }
+    }
+    ++current;
+  }
+  if (inString) {
+    nsContentUtils::ASCIIToLower(Substring(start, current), subString);
+    linkMask |= ToLinkMask(subString);
+  }
+  return linkMask;
+}
+
+Result<LinkStyle::Update, nsresult> LinkStyle::UpdateStyleSheetInternal(
+    Document* aOldDocument, ShadowRoot* aOldShadowRoot,
+    ForceUpdate aForceUpdate) {
+  return DoUpdateStyleSheet(aOldDocument, aOldShadowRoot, nullptr,
+                            aForceUpdate);
+}
+
+LinkStyle* LinkStyle::FromNode(Element& aElement) {
+  nsAtom* name = aElement.NodeInfo()->NameAtom();
+  if (name == nsGkAtoms::link) {
+    MOZ_ASSERT(aElement.IsHTMLElement() == !!aElement.AsLinkStyle());
+    return aElement.IsHTMLElement() ? static_cast<HTMLLinkElement*>(&aElement)
+                                    : nullptr;
+  }
+  if (name == nsGkAtoms::style) {
+    if (aElement.IsHTMLElement()) {
+      MOZ_ASSERT(aElement.AsLinkStyle());
+      return static_cast<HTMLStyleElement*>(&aElement);
+    }
+    if (aElement.IsSVGElement()) {
+      MOZ_ASSERT(aElement.AsLinkStyle());
+      return static_cast<SVGStyleElement*>(&aElement);
+    }
+  }
+  MOZ_ASSERT(!aElement.AsLinkStyle());
+  return nullptr;
+}
+
+void LinkStyle::BindToTree() {
+  if (mUpdatesEnabled) {
+    nsContentUtils::AddScriptRunner(NS_NewRunnableFunction(
+        "LinkStyle::BindToTree",
+        [this, pin = RefPtr{&AsContent()}] { UpdateStyleSheetInternal(); }));
+  }
+}
+
+Result<LinkStyle::Update, nsresult> LinkStyle::DoUpdateStyleSheet(
+    Document* aOldDocument, ShadowRoot* aOldShadowRoot,
+    nsICSSLoaderObserver* aObserver, ForceUpdate aForceUpdate) {
+  nsIContent& thisContent = AsContent();
+  if (thisContent.IsInSVGUseShadowTree()) {
+    return Update{};
+  }
+
+  if (mStyleSheet && (aOldDocument || aOldShadowRoot)) {
+    MOZ_ASSERT(!(aOldDocument && aOldShadowRoot),
+               "ShadowRoot content is never in document, thus "
+               "there should not be a old document and old "
+               "ShadowRoot simultaneously.");
+
+    if (mStyleSheet->IsComplete()) {
+      if (aOldShadowRoot) {
+        aOldShadowRoot->RemoveStyleSheet(*mStyleSheet);
+      } else {
+        aOldDocument->RemoveStyleSheet(*mStyleSheet);
+      }
+    }
+
+    SetStyleSheet(nullptr);
+  }
+
+  Document* doc = thisContent.GetComposedDoc();
+
+  if (!doc || !doc->EnsureCSSLoader().GetEnabled() || !mUpdatesEnabled) {
+    return Update{};
+  }
+
+  if (doc->IsStaticDocument()) {
+    MaybeFinishCopyStyleSheet(doc);
+    return Update{};
+  }
+
+  Maybe<SheetInfo> info = GetStyleSheetInfo();
+  if (aForceUpdate == ForceUpdate::No && mStyleSheet && info &&
+      !info->mIsInline && info->mURI) {
+    if (nsIURI* oldURI = mStyleSheet->GetOriginalURI()) {
+      bool equal;
+      nsresult rv = oldURI->Equals(info->mURI, &equal);
+      if (NS_SUCCEEDED(rv) && equal) {
+        return Update{};
+      }
+    }
+  }
+
+  if (mStyleSheet) {
+    if (mStyleSheet->IsComplete()) {
+      if (thisContent.IsInShadowTree()) {
+        ShadowRoot* containingShadow = thisContent.GetContainingShadow();
+        if (MOZ_LIKELY(containingShadow)) {
+          containingShadow->RemoveStyleSheet(*mStyleSheet);
+        }
+      } else {
+        doc->RemoveStyleSheet(*mStyleSheet);
+      }
+    }
+
+    SetStyleSheet(nullptr);
+  }
+
+  if (!info) {
+    return Update{};
+  }
+
+  if (!info->mURI && !info->mIsInline) {
+    return Update{};
+  }
+
+  if (info->mIsInline) {
+    nsAutoString text;
+    if (!nsContentUtils::GetNodeTextContent(&thisContent, false, text,
+                                            fallible)) {
+      return Err(NS_ERROR_OUT_OF_MEMORY);
+    }
+
+    MOZ_ASSERT(thisContent.NodeInfo()->NameAtom() != nsGkAtoms::link,
+               "<link> is not 'inline', and needs different CSP checks");
+    MOZ_ASSERT(thisContent.IsElement());
+    nsresult rv = NS_OK;
+    if (!nsStyleUtil::CSPAllowsInlineStyle(
+            thisContent.AsElement(), doc, info->mTriggeringPrincipal,
+            mLineNumber, mColumnNumber, text, &rv)) {
+      if (NS_FAILED(rv)) {
+        return Err(rv);
+      }
+      return Update{};
+    }
+
+    return doc->EnsureCSSLoader().LoadInlineStyle(*info, text, aObserver);
+  }
+  if (thisContent.IsElement()) {
+    nsAutoString integrity;
+    thisContent.AsElement()->GetAttr(nsGkAtoms::integrity, integrity);
+    if (!integrity.IsEmpty()) {
+      MOZ_LOG(SRILogHelper::GetSriLog(), mozilla::LogLevel::Debug,
+              ("LinkStyle::DoUpdateStyleSheet, integrity=%s",
+               NS_ConvertUTF16toUTF8(integrity).get()));
+    }
+  }
+  auto resultOrError = doc->EnsureCSSLoader().LoadStyleLink(*info, aObserver);
+  if (resultOrError.isErr()) {
+    return Update{};
+  }
+  return resultOrError;
+}
+
+void LinkStyle::MaybeStartCopyStyleSheetTo(LinkStyle* aDest,
+                                           Document* aDoc) const {
+  MOZ_ASSERT(aDoc, "Copying to null Document?");
+  if (!aDoc->IsStaticDocument() || !mStyleSheet ||
+      !mStyleSheet->IsApplicable()) {
+    return;
+  }
+
+  aDest->mStyleSheet = mStyleSheet->Clone(nullptr, nullptr);
+}
+
+void LinkStyle::MaybeFinishCopyStyleSheet(Document* aDocument) {
+  if (!mStyleSheet) {
+    return;
+  }
+  auto& thisContent = AsContent();
+  if (mStyleSheet->GetOwnerNode() == &thisContent) {
+    return;
+  }
+  MOZ_ASSERT(aDocument->IsStaticDocument(),
+             "Copying stylesheet over into a non-static document?");
+
+  DocumentOrShadowRoot* root = aDocument;
+  auto* shadowRoot = thisContent.GetContainingShadow();
+  if (shadowRoot) {
+    root = shadowRoot;
+    if (MOZ_UNLIKELY(!root)) {
+      mStyleSheet = nullptr;
+      return;
+    }
+  }
+  RefPtr<StyleSheet> sheet = mStyleSheet->Clone(nullptr, root);
+  SetStyleSheet(sheet.get());
+  aDocument->EnsureCSSLoader().InsertSheetInTree(*sheet);
+}
+
+}  

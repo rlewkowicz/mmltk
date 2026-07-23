@@ -1,0 +1,145 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "StackArena.h"
+
+#include "mozilla/gfx/NumericTools.h"
+#include "nsDebug.h"
+
+namespace mozilla {
+
+struct StackBlock {
+  static const size_t MAX_USABLE_SIZE = 4096 - sizeof(StackBlock*);
+
+  char mBlock[MAX_USABLE_SIZE];
+
+  StackBlock* mNext;
+
+  StackBlock() : mNext(nullptr) {}
+  ~StackBlock() = default;
+};
+
+static_assert(sizeof(StackBlock) == 4096, "StackBlock must be 4096 bytes");
+
+struct StackMark {
+  StackBlock* mBlock;
+
+  size_t mPos;
+};
+
+StackArena* AutoStackArena::gStackArena;
+
+StackArena::StackArena() {
+  mMarkLength = 0;
+  mMarks = nullptr;
+
+  mBlocks = new StackBlock();
+  mCurBlock = mBlocks;
+
+  mStackTop = 0;
+  mPos = 0;
+}
+
+StackArena::~StackArena() {
+  delete[] mMarks;
+  while (mBlocks) {
+    StackBlock* toDelete = mBlocks;
+    mBlocks = mBlocks->mNext;
+    delete toDelete;
+  }
+}
+
+size_t StackArena::SizeOfExcludingThis(
+    mozilla::MallocSizeOf aMallocSizeOf) const {
+  size_t n = 0;
+  StackBlock* block = mBlocks;
+  while (block) {
+    n += aMallocSizeOf(block);
+    block = block->mNext;
+  }
+  n += aMallocSizeOf(mMarks);
+  return n;
+}
+
+static const int STACK_ARENA_MARK_INCREMENT = 50;
+
+void StackArena::Push() {
+  if (mStackTop >= mMarkLength) {
+    uint32_t newLength = mStackTop + STACK_ARENA_MARK_INCREMENT;
+    StackMark* newMarks = new StackMark[newLength];
+    if (newMarks) {
+      if (mMarkLength) {
+        memcpy(newMarks, mMarks, sizeof(StackMark) * mMarkLength);
+      }
+      for (; mMarkLength < mStackTop; ++mMarkLength) {
+        MOZ_ASSERT_UNREACHABLE("should only hit this on out-of-memory");
+        newMarks[mMarkLength].mBlock = mCurBlock;
+        newMarks[mMarkLength].mPos = mPos;
+      }
+      delete[] mMarks;
+      mMarks = newMarks;
+      mMarkLength = newLength;
+    }
+  }
+
+  NS_ASSERTION(mStackTop < mMarkLength, "out of memory");
+  if (mStackTop < mMarkLength) {
+    mMarks[mStackTop].mBlock = mCurBlock;
+    mMarks[mStackTop].mPos = mPos;
+  }
+
+  mStackTop++;
+}
+
+void* StackArena::Allocate(size_t aSize) {
+  NS_ASSERTION(mStackTop > 0, "Allocate called without Push");
+
+  aSize = RoundUpToMultiple(aSize, 8);
+
+  if (mPos + aSize >= StackBlock::MAX_USABLE_SIZE) {
+    NS_ASSERTION(aSize <= StackBlock::MAX_USABLE_SIZE,
+                 "Requested memory is greater that our block size!!");
+    if (mCurBlock->mNext == nullptr) {
+      mCurBlock->mNext = new StackBlock();
+    }
+
+    mCurBlock = mCurBlock->mNext;
+    mPos = 0;
+  }
+
+  void* result = mCurBlock->mBlock + mPos;
+  mPos += aSize;
+
+  return result;
+}
+
+void StackArena::Pop() {
+  NS_ASSERTION(mStackTop > 0, "unmatched pop");
+  mStackTop--;
+
+  if (mStackTop >= mMarkLength) {
+    MOZ_ASSERT_UNREACHABLE("out of memory");
+    if (mStackTop == 0) {
+      mCurBlock = mBlocks;
+      mPos = 0;
+    }
+    return;
+  }
+
+#ifdef DEBUG
+  {
+    StackBlock *block = mMarks[mStackTop].mBlock, *block_end = mCurBlock;
+    size_t pos = mMarks[mStackTop].mPos;
+    for (; block != block_end; block = block->mNext, pos = 0) {
+      memset(block->mBlock + pos, 0xdd, sizeof(block->mBlock) - pos);
+    }
+    memset(block->mBlock + pos, 0xdd, mPos - pos);
+  }
+#endif
+
+  mCurBlock = mMarks[mStackTop].mBlock;
+  mPos = mMarks[mStackTop].mPos;
+}
+
+}  

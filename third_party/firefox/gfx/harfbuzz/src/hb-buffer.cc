@@ -1,0 +1,1468 @@
+/*
+ * Copyright © 1998-2004  David Turner and Werner Lemberg
+ * Copyright © 2004,2007,2009,2010  Red Hat, Inc.
+ * Copyright © 2011,2012  Google, Inc.
+ *
+ *  This is part of HarfBuzz, a text shaping library.
+ *
+ * Permission is hereby granted, without written agreement and without
+ * license or royalty fees, to use, copy, modify, and distribute this
+ * software and its documentation for any purpose, provided that the
+ * above copyright notice and the following two paragraphs appear in
+ * all copies of this software.
+ *
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE TO ANY PARTY FOR
+ * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES
+ * ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN
+ * IF THE COPYRIGHT HOLDER HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ *
+ * THE COPYRIGHT HOLDER SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING,
+ * BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+ * FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ * ON AN "AS IS" BASIS, AND THE COPYRIGHT HOLDER HAS NO OBLIGATION TO
+ * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ *
+ * Red Hat Author(s): Owen Taylor, Behdad Esfahbod
+ * Google Author(s): Behdad Esfahbod
+ */
+
+#include "hb-buffer.hh"
+#include "hb-utf.hh"
+
+
+
+
+hb_bool_t
+hb_segment_properties_equal (const hb_segment_properties_t *a,
+			     const hb_segment_properties_t *b)
+{
+  return a->direction == b->direction &&
+	 a->script    == b->script    &&
+	 a->language  == b->language  &&
+	 a->reserved1 == b->reserved1 &&
+	 a->reserved2 == b->reserved2;
+
+}
+
+unsigned int
+hb_segment_properties_hash (const hb_segment_properties_t *p)
+{
+  return ((unsigned int) p->direction * 31 +
+	  (unsigned int) p->script) * 31 +
+	 (intptr_t) (p->language);
+}
+
+void
+hb_segment_properties_overlay (hb_segment_properties_t *p,
+			       const hb_segment_properties_t *src)
+{
+  if (unlikely (!p || !src))
+    return;
+
+  if (!p->direction)
+    p->direction = src->direction;
+
+  if (p->direction != src->direction)
+    return;
+
+  if (!p->script)
+    p->script = src->script;
+
+  if (p->script != src->script)
+    return;
+
+  if (!p->language)
+    p->language = src->language;
+}
+
+
+
+
+
+bool
+hb_buffer_t::enlarge (unsigned int size)
+{
+  if (unlikely (size > max_len))
+  {
+    successful = false;
+    return false;
+  }
+
+  if (unlikely (!successful))
+    return false;
+
+  unsigned int new_allocated = allocated;
+  hb_glyph_position_t *new_pos = nullptr;
+  hb_glyph_info_t *new_info = nullptr;
+  bool separate_out = out_info != info;
+
+  if (unlikely (hb_unsigned_mul_overflows (size, sizeof (info[0]))))
+    goto done;
+
+  while (size >= new_allocated)
+    new_allocated += (new_allocated >> 1) + 32;
+
+  unsigned new_bytes;
+  if (unlikely (hb_unsigned_mul_overflows (new_allocated, sizeof (info[0]), &new_bytes)))
+    goto done;
+
+  static_assert (sizeof (info[0]) == sizeof (pos[0]), "");
+  new_pos = (hb_glyph_position_t *) hb_realloc (pos, new_bytes);
+  new_info = (hb_glyph_info_t *) hb_realloc (info, new_bytes);
+
+done:
+  if (unlikely (!new_pos || !new_info))
+    successful = false;
+
+  if (likely (new_pos))
+    pos = new_pos;
+
+  if (likely (new_info))
+    info = new_info;
+
+  out_info = separate_out ? (hb_glyph_info_t *) pos : info;
+  if (likely (successful))
+    allocated = new_allocated;
+
+  return likely (successful);
+}
+
+bool
+hb_buffer_t::make_room_for (unsigned int num_in,
+			    unsigned int num_out)
+{
+  if (unlikely (!ensure (out_len + num_out))) return false;
+
+  if (out_info == info &&
+      out_len + num_out > idx + num_in)
+  {
+    assert (have_output);
+
+    out_info = (hb_glyph_info_t *) pos;
+    hb_memcpy (out_info, info, out_len * sizeof (out_info[0]));
+  }
+
+  return true;
+}
+
+bool
+hb_buffer_t::shift_forward (unsigned int count)
+{
+  assert (have_output);
+  if (unlikely (!ensure (len + count))) return false;
+
+  max_ops -= len - idx;
+  if (unlikely (max_ops < 0))
+  {
+    successful = false;
+    return false;
+  }
+
+  memmove (info + idx + count, info + idx, (len - idx) * sizeof (info[0]));
+  if (idx + count > len)
+  {
+    hb_memset (info + len, 0, (idx + count - len) * sizeof (info[0]));
+  }
+  len += count;
+  idx += count;
+
+  return true;
+}
+
+hb_buffer_t::scratch_buffer_t *
+hb_buffer_t::get_scratch_buffer (unsigned int *size)
+{
+  have_output = false;
+  have_positions = false;
+
+  out_len = 0;
+  out_info = info;
+
+  assert ((uintptr_t) pos % sizeof (scratch_buffer_t) == 0);
+  *size = allocated * sizeof (pos[0]) / sizeof (scratch_buffer_t);
+  return (scratch_buffer_t *) (void *) pos;
+}
+
+
+
+
+void
+hb_buffer_t::similar (const hb_buffer_t &src)
+{
+  hb_unicode_funcs_destroy (unicode);
+  unicode = hb_unicode_funcs_reference (src.unicode);
+  flags = src.flags;
+  cluster_level = src.cluster_level;
+  replacement = src.replacement;
+  invisible = src.invisible;
+  not_found = src.not_found;
+  not_found_variation_selector = src.not_found_variation_selector;
+}
+
+void
+hb_buffer_t::reset ()
+{
+  hb_unicode_funcs_destroy (unicode);
+  unicode = hb_unicode_funcs_reference (hb_unicode_funcs_get_default ());
+  flags = HB_BUFFER_FLAG_DEFAULT;
+  cluster_level = HB_BUFFER_CLUSTER_LEVEL_DEFAULT;
+  replacement = HB_BUFFER_REPLACEMENT_CODEPOINT_DEFAULT;
+  invisible = 0;
+  not_found = 0;
+  not_found_variation_selector = HB_CODEPOINT_INVALID;
+
+  clear ();
+}
+
+void
+hb_buffer_t::clear ()
+{
+  content_type = HB_BUFFER_CONTENT_TYPE_INVALID;
+  hb_segment_properties_t default_props = HB_SEGMENT_PROPERTIES_DEFAULT;
+  props = default_props;
+
+  successful = true;
+  have_output = false;
+  have_positions = false;
+
+  idx = 0;
+  len = 0;
+  out_len = 0;
+  out_info = info;
+
+  hb_memset (context, 0, sizeof context);
+  hb_memset (context_len, 0, sizeof context_len);
+
+  deallocate_var_all ();
+  serial = 0;
+  random_state = 1;
+  scratch_flags = HB_BUFFER_SCRATCH_FLAG_DEFAULT;
+}
+
+void
+hb_buffer_t::enter ()
+{
+  deallocate_var_all ();
+  serial = 0;
+  scratch_flags = HB_BUFFER_SCRATCH_FLAG_DEFAULT;
+  unsigned mul;
+  if (likely (!hb_unsigned_mul_overflows (len, HB_BUFFER_MAX_LEN_FACTOR, &mul)))
+  {
+    max_len = hb_max (mul, (unsigned) HB_BUFFER_MAX_LEN_MIN);
+  }
+  if (likely (!hb_unsigned_mul_overflows (len, HB_BUFFER_MAX_OPS_FACTOR, &mul)))
+  {
+    max_ops = hb_max (mul, (unsigned) HB_BUFFER_MAX_OPS_MIN);
+  }
+}
+void
+hb_buffer_t::leave ()
+{
+  max_len = HB_BUFFER_MAX_LEN_DEFAULT;
+  max_ops = HB_BUFFER_MAX_OPS_DEFAULT;
+  deallocate_var_all ();
+  serial = 0;
+}
+
+
+void
+hb_buffer_t::add (hb_codepoint_t  codepoint,
+		  unsigned int    cluster)
+{
+  hb_glyph_info_t *glyph;
+
+  if (unlikely (!ensure (len + 1))) return;
+
+  glyph = &info[len];
+
+  hb_memset (glyph, 0, sizeof (*glyph));
+  glyph->codepoint = codepoint;
+  glyph->mask = 0;
+  glyph->cluster = cluster;
+
+  len++;
+}
+
+void
+hb_buffer_t::add_info (const hb_glyph_info_t &glyph_info)
+{
+  if (unlikely (!ensure (len + 1))) return;
+
+  info[len] = glyph_info;
+
+  len++;
+}
+void
+hb_buffer_t::add_info_and_pos (const hb_glyph_info_t &glyph_info,
+			       const hb_glyph_position_t &glyph_pos)
+{
+  if (unlikely (!ensure (len + 1))) return;
+
+  info[len] = glyph_info;
+  assert (have_positions);
+  pos[len] = glyph_pos;
+
+  len++;
+}
+
+
+void
+hb_buffer_t::clear_output ()
+{
+  have_output = true;
+  have_positions = false;
+
+  idx = 0;
+  out_len = 0;
+  out_info = info;
+}
+
+void
+hb_buffer_t::clear_positions ()
+{
+  have_output = false;
+  have_positions = true;
+
+  out_len = 0;
+  out_info = info;
+
+  hb_memset (pos, 0, sizeof (pos[0]) * len);
+}
+
+bool
+hb_buffer_t::sync ()
+{
+  bool ret = false;
+
+  assert (have_output);
+
+  assert (idx <= len);
+
+  if (unlikely (!successful || !next_glyphs (len - idx)))
+    goto reset;
+
+  if (out_info != info)
+  {
+    pos = (hb_glyph_position_t *) info;
+    info = out_info;
+  }
+  len = out_len;
+  ret = true;
+
+reset:
+  have_output = false;
+  out_len = 0;
+  out_info = info;
+  idx = 0;
+
+  return ret;
+}
+
+int
+hb_buffer_t::sync_so_far ()
+{
+  bool had_output = have_output;
+  unsigned out_i = out_len;
+  unsigned i = idx;
+  unsigned old_idx = idx;
+
+  if (sync ())
+    idx = out_i;
+  else
+    idx = i;
+
+  if (had_output)
+  {
+    have_output = true;
+    out_len = idx;
+  }
+
+  assert (idx <= len);
+
+  return idx - old_idx;
+}
+
+bool
+hb_buffer_t::move_to (unsigned int i)
+{
+  if (!have_output)
+  {
+    assert (i <= len);
+    idx = i;
+    return true;
+  }
+  if (unlikely (!successful))
+    return false;
+
+  assert (i <= out_len + (len - idx));
+
+  if (out_len < i)
+  {
+    unsigned int count = i - out_len;
+    if (unlikely (!make_room_for (count, count))) return false;
+
+    memmove (out_info + out_len, info + idx, count * sizeof (out_info[0]));
+    idx += count;
+    out_len += count;
+  }
+  else if (out_len > i)
+  {
+    unsigned int count = out_len - i;
+
+    if (unlikely (idx < count && !shift_forward (count - idx))) return false;
+
+    assert (idx >= count);
+
+    idx -= count;
+    out_len -= count;
+    memmove (info + idx, out_info + out_len, count * sizeof (out_info[0]));
+  }
+
+  return true;
+}
+
+
+void
+hb_buffer_t::set_masks (hb_mask_t    value,
+			hb_mask_t    mask,
+			unsigned int cluster_start,
+			unsigned int cluster_end)
+{
+  if (!mask)
+    return;
+
+  hb_mask_t not_mask = ~mask;
+  value &= mask;
+
+  max_ops -= len;
+  if (unlikely (max_ops < 0))
+    successful = false;
+
+  unsigned int count = len;
+
+  if (cluster_start == 0 && cluster_end == (unsigned int) -1)
+  {
+    for (unsigned int i = 0; i < count; i++)
+      info[i].mask = (info[i].mask & not_mask) | value;
+    return;
+  }
+
+  for (unsigned int i = 0; i < count; i++)
+    if (cluster_start <= info[i].cluster && info[i].cluster < cluster_end)
+      info[i].mask = (info[i].mask & not_mask) | value;
+}
+
+void
+hb_buffer_t::merge_clusters_impl (unsigned int start,
+				  unsigned int end)
+{
+  max_ops -= end - start;
+  if (unlikely (max_ops < 0))
+    successful = false;
+
+  unsigned int cluster = info[start].cluster;
+
+  for (unsigned int i = start + 1; i < end; i++)
+    cluster = hb_min (cluster, info[i].cluster);
+
+  if (cluster != info[end - 1].cluster)
+    while (end < len && info[end - 1].cluster == info[end].cluster)
+      end++;
+
+  if (cluster != info[start].cluster)
+    while (idx < start && info[start - 1].cluster == info[start].cluster)
+      start--;
+
+  if (idx == start && info[start].cluster != cluster)
+    for (unsigned int i = out_len; i && out_info[i - 1].cluster == info[start].cluster; i--)
+      set_cluster (out_info[i - 1], cluster);
+
+  for (unsigned int i = start; i < end; i++)
+    set_cluster (info[i], cluster);
+}
+void
+hb_buffer_t::merge_out_clusters_impl (unsigned int start,
+				      unsigned int end)
+{
+  max_ops -= end - start;
+  if (unlikely (max_ops < 0))
+    successful = false;
+
+  unsigned int cluster = out_info[start].cluster;
+
+  for (unsigned int i = start + 1; i < end; i++)
+    cluster = hb_min (cluster, out_info[i].cluster);
+
+  while (start && out_info[start - 1].cluster == out_info[start].cluster)
+    start--;
+
+  while (end < out_len && out_info[end - 1].cluster == out_info[end].cluster)
+    end++;
+
+  if (end == out_len)
+    for (unsigned int i = idx; i < len && info[i].cluster == out_info[end - 1].cluster; i++)
+      set_cluster (info[i], cluster);
+
+  for (unsigned int i = start; i < end; i++)
+    set_cluster (out_info[i], cluster);
+}
+void
+hb_buffer_t::delete_glyph ()
+{
+
+  unsigned int cluster = info[idx].cluster;
+  if ((idx + 1 < len && cluster == info[idx + 1].cluster) ||
+      (out_len && cluster == out_info[out_len - 1].cluster))
+  {
+    goto done;
+  }
+
+  if (out_len)
+  {
+    if (cluster < out_info[out_len - 1].cluster)
+    {
+      unsigned int mask = info[idx].mask;
+      unsigned int old_cluster = out_info[out_len - 1].cluster;
+      for (unsigned i = out_len; i && out_info[i - 1].cluster == old_cluster; i--)
+	set_cluster (out_info[i - 1], cluster, mask);
+    }
+    goto done;
+  }
+
+  if (idx + 1 < len)
+  {
+    merge_clusters (idx, idx + 2);
+    goto done;
+  }
+
+done:
+  skip_glyph ();
+}
+
+void
+hb_buffer_t::delete_glyphs_inplace (bool (*filter) (const hb_glyph_info_t *info))
+{
+  unsigned int j = 0;
+  unsigned int count = len;
+  for (unsigned int i = 0; i < count; i++)
+  {
+    if (filter (&info[i]))
+    {
+
+      unsigned int cluster = info[i].cluster;
+      if (i + 1 < count && cluster == info[i + 1].cluster)
+	continue; 
+
+      if (j)
+      {
+	if (cluster < info[j - 1].cluster)
+	{
+	  unsigned int mask = info[i].mask;
+	  unsigned int old_cluster = info[j - 1].cluster;
+	  for (unsigned k = j; k && info[k - 1].cluster == old_cluster; k--)
+	    set_cluster (info[k - 1], cluster, mask);
+	}
+	continue;
+      }
+
+      if (i + 1 < count)
+	merge_clusters (i, i + 2); 
+
+      continue;
+    }
+
+    if (j != i)
+    {
+      info[j] = info[i];
+      pos[j] = pos[i];
+    }
+    j++;
+  }
+  len = j;
+}
+
+void
+hb_buffer_t::guess_segment_properties ()
+{
+  assert_unicode ();
+
+  if (props.script == HB_SCRIPT_INVALID) {
+    for (unsigned int i = 0; i < len; i++) {
+      hb_script_t script = unicode->script (info[i].codepoint);
+      if (likely (script != HB_SCRIPT_COMMON &&
+		  script != HB_SCRIPT_INHERITED &&
+		  script != HB_SCRIPT_UNKNOWN)) {
+	props.script = script;
+	break;
+      }
+    }
+  }
+
+  if (props.direction == HB_DIRECTION_INVALID) {
+    props.direction = hb_script_get_horizontal_direction (props.script);
+    if (props.direction == HB_DIRECTION_INVALID)
+      props.direction = HB_DIRECTION_LTR;
+  }
+
+  if (props.language == HB_LANGUAGE_INVALID) {
+    props.language = hb_language_get_default ();
+  }
+}
+
+
+
+DEFINE_NULL_INSTANCE (hb_buffer_t) =
+{
+  HB_OBJECT_HEADER_STATIC,
+
+  const_cast<hb_unicode_funcs_t *> (&_hb_Null_hb_unicode_funcs_t),
+  HB_BUFFER_FLAG_DEFAULT,
+  HB_BUFFER_CLUSTER_LEVEL_DEFAULT,
+  HB_BUFFER_REPLACEMENT_CODEPOINT_DEFAULT,
+  0, 
+  0, 
+  HB_CODEPOINT_INVALID, 
+
+
+  HB_BUFFER_CONTENT_TYPE_INVALID,
+  HB_SEGMENT_PROPERTIES_DEFAULT,
+
+  false, 
+  false, 
+  true  
+
+};
+
+
+hb_buffer_t *
+hb_buffer_create ()
+{
+  hb_buffer_t *buffer;
+
+  if (!(buffer = hb_object_create<hb_buffer_t> ()))
+    return hb_buffer_get_empty ();
+
+  buffer->max_len = HB_BUFFER_MAX_LEN_DEFAULT;
+  buffer->max_ops = HB_BUFFER_MAX_OPS_DEFAULT;
+
+  buffer->reset ();
+
+  return buffer;
+}
+
+hb_buffer_t *
+hb_buffer_create_similar (const hb_buffer_t *src)
+{
+  hb_buffer_t *buffer = hb_buffer_create ();
+
+  buffer->similar (*src);
+
+  return buffer;
+}
+
+void
+hb_buffer_reset (hb_buffer_t *buffer)
+{
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return;
+
+  buffer->reset ();
+}
+
+hb_buffer_t *
+hb_buffer_get_empty ()
+{
+  return const_cast<hb_buffer_t *> (&Null (hb_buffer_t));
+}
+
+hb_buffer_t *
+hb_buffer_reference (hb_buffer_t *buffer)
+{
+  return hb_object_reference (buffer);
+}
+
+void
+hb_buffer_destroy (hb_buffer_t *buffer)
+{
+  if (!hb_object_destroy (buffer)) return;
+
+  hb_unicode_funcs_destroy (buffer->unicode);
+
+  hb_free (buffer->info);
+  hb_free (buffer->pos);
+#ifndef HB_NO_BUFFER_MESSAGE
+  if (buffer->message_destroy)
+    buffer->message_destroy (buffer->message_data);
+#endif
+
+  hb_free (buffer);
+}
+
+hb_bool_t
+hb_buffer_set_user_data (hb_buffer_t        *buffer,
+			 hb_user_data_key_t *key,
+			 void *              data,
+			 hb_destroy_func_t   destroy,
+			 hb_bool_t           replace)
+{
+  return hb_object_set_user_data (buffer, key, data, destroy, replace);
+}
+
+void *
+hb_buffer_get_user_data (const hb_buffer_t  *buffer,
+			 hb_user_data_key_t *key)
+{
+  return hb_object_get_user_data (buffer, key);
+}
+
+
+void
+hb_buffer_set_content_type (hb_buffer_t              *buffer,
+			    hb_buffer_content_type_t  content_type)
+{
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return;
+
+  buffer->content_type = content_type;
+}
+
+hb_buffer_content_type_t
+hb_buffer_get_content_type (const hb_buffer_t *buffer)
+{
+  return buffer->content_type;
+}
+
+
+void
+hb_buffer_set_unicode_funcs (hb_buffer_t        *buffer,
+			     hb_unicode_funcs_t *unicode_funcs)
+{
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return;
+
+  if (!unicode_funcs)
+    unicode_funcs = hb_unicode_funcs_get_default ();
+
+  hb_unicode_funcs_reference (unicode_funcs);
+  hb_unicode_funcs_destroy (buffer->unicode);
+  buffer->unicode = unicode_funcs;
+}
+
+hb_unicode_funcs_t *
+hb_buffer_get_unicode_funcs (const hb_buffer_t *buffer)
+{
+  return buffer->unicode;
+}
+
+void
+hb_buffer_set_direction (hb_buffer_t    *buffer,
+			 hb_direction_t  direction)
+{
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return;
+
+  buffer->props.direction = direction;
+}
+
+hb_direction_t
+hb_buffer_get_direction (const hb_buffer_t *buffer)
+{
+  return buffer->props.direction;
+}
+
+void
+hb_buffer_set_script (hb_buffer_t *buffer,
+		      hb_script_t  script)
+{
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return;
+
+  buffer->props.script = script;
+}
+
+hb_script_t
+hb_buffer_get_script (const hb_buffer_t *buffer)
+{
+  return buffer->props.script;
+}
+
+void
+hb_buffer_set_language (hb_buffer_t   *buffer,
+			hb_language_t  language)
+{
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return;
+
+  buffer->props.language = language;
+}
+
+hb_language_t
+hb_buffer_get_language (const hb_buffer_t *buffer)
+{
+  return buffer->props.language;
+}
+
+void
+hb_buffer_set_segment_properties (hb_buffer_t *buffer,
+				  const hb_segment_properties_t *props)
+{
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return;
+
+  buffer->props = *props;
+}
+
+void
+hb_buffer_get_segment_properties (const hb_buffer_t *buffer,
+				  hb_segment_properties_t *props)
+{
+  *props = buffer->props;
+}
+
+
+void
+hb_buffer_set_flags (hb_buffer_t       *buffer,
+		     hb_buffer_flags_t  flags)
+{
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return;
+
+  buffer->flags = flags;
+}
+
+hb_buffer_flags_t
+hb_buffer_get_flags (const hb_buffer_t *buffer)
+{
+  return buffer->flags;
+}
+
+void
+hb_buffer_set_cluster_level (hb_buffer_t               *buffer,
+			     hb_buffer_cluster_level_t  cluster_level)
+{
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return;
+
+  buffer->cluster_level = cluster_level;
+}
+
+hb_buffer_cluster_level_t
+hb_buffer_get_cluster_level (const hb_buffer_t *buffer)
+{
+  return buffer->cluster_level;
+}
+
+
+void
+hb_buffer_set_replacement_codepoint (hb_buffer_t    *buffer,
+				     hb_codepoint_t  replacement)
+{
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return;
+
+  buffer->replacement = replacement;
+}
+
+hb_codepoint_t
+hb_buffer_get_replacement_codepoint (const hb_buffer_t *buffer)
+{
+  return buffer->replacement;
+}
+
+
+void
+hb_buffer_set_invisible_glyph (hb_buffer_t    *buffer,
+			       hb_codepoint_t  invisible)
+{
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return;
+
+  buffer->invisible = invisible;
+}
+
+hb_codepoint_t
+hb_buffer_get_invisible_glyph (const hb_buffer_t *buffer)
+{
+  return buffer->invisible;
+}
+
+void
+hb_buffer_set_not_found_glyph (hb_buffer_t    *buffer,
+			       hb_codepoint_t  not_found)
+{
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return;
+
+  buffer->not_found = not_found;
+}
+
+hb_codepoint_t
+hb_buffer_get_not_found_glyph (const hb_buffer_t *buffer)
+{
+  return buffer->not_found;
+}
+
+void
+hb_buffer_set_not_found_variation_selector_glyph (hb_buffer_t    *buffer,
+						  hb_codepoint_t  not_found_variation_selector)
+{
+  buffer->not_found_variation_selector = not_found_variation_selector;
+}
+
+hb_codepoint_t
+hb_buffer_get_not_found_variation_selector_glyph (const hb_buffer_t *buffer)
+{
+  return buffer->not_found_variation_selector;
+}
+
+void
+hb_buffer_set_random_state (hb_buffer_t    *buffer,
+			    unsigned        state)
+{
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return;
+
+  buffer->random_state = state;
+}
+
+unsigned
+hb_buffer_get_random_state (const hb_buffer_t *buffer)
+{
+  return buffer->random_state;
+}
+
+void
+hb_buffer_clear_contents (hb_buffer_t *buffer)
+{
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return;
+
+  buffer->clear ();
+}
+
+hb_bool_t
+hb_buffer_pre_allocate (hb_buffer_t *buffer, unsigned int size)
+{
+  return buffer->ensure (size);
+}
+
+hb_bool_t
+hb_buffer_allocation_successful (hb_buffer_t  *buffer)
+{
+  return buffer->successful;
+}
+
+void
+hb_buffer_add (hb_buffer_t    *buffer,
+	       hb_codepoint_t  codepoint,
+	       unsigned int    cluster)
+{
+  buffer->add (codepoint, cluster);
+  buffer->clear_context (1);
+}
+
+hb_bool_t
+hb_buffer_set_length (hb_buffer_t  *buffer,
+		      unsigned int  length)
+{
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return length == 0;
+
+  if (unlikely (!buffer->ensure (length)))
+    return false;
+
+  if (length > buffer->len) {
+    hb_memset (buffer->info + buffer->len, 0, sizeof (buffer->info[0]) * (length - buffer->len));
+    if (buffer->have_positions)
+      hb_memset (buffer->pos + buffer->len, 0, sizeof (buffer->pos[0]) * (length - buffer->len));
+  }
+
+  buffer->len = length;
+
+  if (!length)
+  {
+    buffer->content_type = HB_BUFFER_CONTENT_TYPE_INVALID;
+    buffer->clear_context (0);
+  }
+  buffer->clear_context (1);
+
+  return true;
+}
+
+unsigned int
+hb_buffer_get_length (const hb_buffer_t *buffer)
+{
+  return buffer->len;
+}
+
+hb_glyph_info_t *
+hb_buffer_get_glyph_infos (hb_buffer_t  *buffer,
+			   unsigned int *length)
+{
+  if (length)
+    *length = buffer->len;
+
+  return (hb_glyph_info_t *) buffer->info;
+}
+
+hb_glyph_position_t *
+hb_buffer_get_glyph_positions (hb_buffer_t  *buffer,
+			       unsigned int *length)
+{
+  if (length)
+    *length = buffer->len;
+
+  if (!buffer->have_positions)
+  {
+    if (unlikely (buffer->message_depth))
+      return nullptr;
+
+    buffer->clear_positions ();
+  }
+
+  return (hb_glyph_position_t *) buffer->pos;
+}
+
+HB_EXTERN hb_bool_t
+hb_buffer_has_positions (hb_buffer_t  *buffer)
+{
+  return buffer->have_positions;
+}
+
+hb_glyph_flags_t
+(hb_glyph_info_get_glyph_flags) (const hb_glyph_info_t *info)
+{
+  return hb_glyph_info_get_glyph_flags (info);
+}
+
+void
+hb_buffer_reverse (hb_buffer_t *buffer)
+{
+  buffer->reverse ();
+}
+
+void
+hb_buffer_reverse_range (hb_buffer_t *buffer,
+			 unsigned int start, unsigned int end)
+{
+  buffer->reverse_range (start, end);
+}
+
+void
+hb_buffer_reverse_clusters (hb_buffer_t *buffer)
+{
+  buffer->reverse_clusters ();
+}
+
+void
+hb_buffer_guess_segment_properties (hb_buffer_t *buffer)
+{
+  buffer->guess_segment_properties ();
+}
+
+template <typename utf_t>
+static inline void
+hb_buffer_add_utf (hb_buffer_t  *buffer,
+		   const typename utf_t::codepoint_t *text,
+		   int           text_length,
+		   unsigned int  item_offset,
+		   int           item_length)
+{
+  typedef typename utf_t::codepoint_t T;
+  const hb_codepoint_t replacement = buffer->replacement;
+
+  buffer->assert_unicode ();
+
+  if (unlikely (hb_object_is_immutable (buffer)))
+    return;
+
+  if (text_length == -1)
+    text_length = utf_t::strlen (text);
+
+  if (item_length == -1)
+    item_length = text_length - item_offset;
+
+  item_offset = hb_min (item_offset, (unsigned) text_length);
+  item_length = hb_clamp (item_length, 0, text_length - (int) item_offset);
+
+  if (unlikely (item_length < 0 ||
+		item_length > INT_MAX / 8 ||
+		!buffer->ensure (buffer->len + item_length * sizeof (T) / 4)))
+    return;
+
+  if (!buffer->len && item_offset > 0)
+  {
+    buffer->clear_context (0);
+    const T *prev = text + item_offset;
+    const T *start = text;
+    while (start < prev && buffer->context_len[0] < buffer->CONTEXT_LENGTH)
+    {
+      hb_codepoint_t u;
+      prev = utf_t::prev (prev, start, &u, replacement);
+      buffer->context[0][buffer->context_len[0]++] = u;
+    }
+  }
+
+  const T *next = text + item_offset;
+  const T *end = next + item_length;
+  while (next < end)
+  {
+    hb_codepoint_t u;
+    const T *old_next = next;
+    next = utf_t::next (next, end, &u, replacement);
+    buffer->add (u, old_next - (const T *) text);
+  }
+
+  buffer->clear_context (1);
+  end = text + text_length;
+  while (next < end && buffer->context_len[1] < buffer->CONTEXT_LENGTH)
+  {
+    hb_codepoint_t u;
+    next = utf_t::next (next, end, &u, replacement);
+    buffer->context[1][buffer->context_len[1]++] = u;
+  }
+
+  buffer->content_type = HB_BUFFER_CONTENT_TYPE_UNICODE;
+}
+
+void
+hb_buffer_add_utf8 (hb_buffer_t  *buffer,
+		    const char   *text,
+		    int           text_length,
+		    unsigned int  item_offset,
+		    int           item_length)
+{
+  hb_buffer_add_utf<hb_utf8_t> (buffer, (const uint8_t *) text, text_length, item_offset, item_length);
+}
+
+void
+hb_buffer_add_utf16 (hb_buffer_t    *buffer,
+		     const uint16_t *text,
+		     int             text_length,
+		     unsigned int    item_offset,
+		     int             item_length)
+{
+  hb_buffer_add_utf<hb_utf16_t> (buffer, text, text_length, item_offset, item_length);
+}
+
+void
+hb_buffer_add_utf32 (hb_buffer_t    *buffer,
+		     const uint32_t *text,
+		     int             text_length,
+		     unsigned int    item_offset,
+		     int             item_length)
+{
+  hb_buffer_add_utf<hb_utf32_t> (buffer, text, text_length, item_offset, item_length);
+}
+
+void
+hb_buffer_add_latin1 (hb_buffer_t   *buffer,
+		      const uint8_t *text,
+		      int            text_length,
+		      unsigned int   item_offset,
+		      int            item_length)
+{
+  hb_buffer_add_utf<hb_latin1_t> (buffer, text, text_length, item_offset, item_length);
+}
+
+void
+hb_buffer_add_codepoints (hb_buffer_t          *buffer,
+			  const hb_codepoint_t *text,
+			  int                   text_length,
+			  unsigned int          item_offset,
+			  int                   item_length)
+{
+  hb_buffer_add_utf<hb_utf32_novalidate_t> (buffer, text, text_length, item_offset, item_length);
+}
+
+
+HB_EXTERN void
+hb_buffer_append (hb_buffer_t *buffer,
+		  const hb_buffer_t *source,
+		  unsigned int start,
+		  unsigned int end)
+{
+  assert (!buffer->have_output && !source->have_output);
+  assert (buffer->have_positions == source->have_positions ||
+	  !buffer->len || !source->len);
+  assert (buffer->content_type == source->content_type ||
+	  !buffer->len || !source->len);
+
+  if (end > source->len)
+    end = source->len;
+  if (start > end)
+    start = end;
+  if (start == end)
+    return;
+
+  if (buffer->len + (end - start) < buffer->len) 
+  {
+    buffer->successful = false;
+    return;
+  }
+
+  unsigned int orig_len = buffer->len;
+  hb_buffer_set_length (buffer, buffer->len + (end - start));
+  if (unlikely (!buffer->successful))
+    return;
+
+  if (!orig_len)
+    buffer->content_type = source->content_type;
+  if (!buffer->have_positions && source->have_positions)
+    buffer->clear_positions ();
+
+  hb_segment_properties_overlay (&buffer->props, &source->props);
+
+  hb_memcpy (buffer->info + orig_len, source->info + start, (end - start) * sizeof (buffer->info[0]));
+  if (buffer->have_positions)
+    hb_memcpy (buffer->pos + orig_len, source->pos + start, (end - start) * sizeof (buffer->pos[0]));
+
+  if (source->content_type == HB_BUFFER_CONTENT_TYPE_UNICODE)
+  {
+
+    if (!orig_len && start + source->context_len[0] > 0)
+    {
+      buffer->clear_context (0);
+      while (start > 0 && buffer->context_len[0] < buffer->CONTEXT_LENGTH)
+	buffer->context[0][buffer->context_len[0]++] = source->info[--start].codepoint;
+      for (auto i = 0u; i < source->context_len[0] && buffer->context_len[0] < buffer->CONTEXT_LENGTH; i++)
+	buffer->context[0][buffer->context_len[0]++] = source->context[0][i];
+    }
+
+    buffer->clear_context (1);
+    while (end < source->len && buffer->context_len[1] < buffer->CONTEXT_LENGTH)
+      buffer->context[1][buffer->context_len[1]++] = source->info[end++].codepoint;
+    for (auto i = 0u; i < source->context_len[1] && buffer->context_len[1] < buffer->CONTEXT_LENGTH; i++)
+      buffer->context[1][buffer->context_len[1]++] = source->context[1][i];
+  }
+}
+
+
+static int
+compare_info_codepoint (const hb_glyph_info_t *pa,
+			const hb_glyph_info_t *pb)
+{
+  return (int) pb->codepoint - (int) pa->codepoint;
+}
+
+static inline void
+normalize_glyphs_cluster (hb_buffer_t *buffer,
+			  unsigned int start,
+			  unsigned int end,
+			  bool backward)
+{
+  hb_glyph_position_t *pos = buffer->pos;
+
+  hb_position_t total_x_advance = 0, total_y_advance = 0;
+  for (unsigned int i = start; i < end; i++)
+  {
+    total_x_advance += pos[i].x_advance;
+    total_y_advance += pos[i].y_advance;
+  }
+
+  hb_position_t x_advance = 0, y_advance = 0;
+  for (unsigned int i = start; i < end; i++)
+  {
+    pos[i].x_offset += x_advance;
+    pos[i].y_offset += y_advance;
+
+    x_advance += pos[i].x_advance;
+    y_advance += pos[i].y_advance;
+
+    pos[i].x_advance = 0;
+    pos[i].y_advance = 0;
+  }
+
+  if (backward)
+  {
+    pos[end - 1].x_advance = total_x_advance;
+    pos[end - 1].y_advance = total_y_advance;
+
+    hb_stable_sort (buffer->info + start, end - start - 1, compare_info_codepoint, buffer->pos + start);
+  } else {
+    pos[start].x_advance += total_x_advance;
+    pos[start].y_advance += total_y_advance;
+    for (unsigned int i = start + 1; i < end; i++) {
+      pos[i].x_offset -= total_x_advance;
+      pos[i].y_offset -= total_y_advance;
+    }
+    hb_stable_sort (buffer->info + start + 1, end - start - 1, compare_info_codepoint, buffer->pos + start + 1);
+  }
+}
+
+void
+hb_buffer_normalize_glyphs (hb_buffer_t *buffer)
+{
+  assert (buffer->have_positions);
+
+  buffer->assert_glyphs ();
+
+  bool backward = HB_DIRECTION_IS_BACKWARD (buffer->props.direction);
+
+  foreach_cluster (buffer, start, end)
+    normalize_glyphs_cluster (buffer, start, end, backward);
+}
+
+void
+hb_buffer_t::sort (unsigned int start, unsigned int end, int(*compar)(const hb_glyph_info_t *, const hb_glyph_info_t *))
+{
+  assert (!have_positions);
+  for (unsigned int i = start + 1; i < end; i++)
+  {
+    unsigned int j = i;
+    while (j > start && compar (&info[j - 1], &info[i]) > 0)
+      j--;
+    if (i == j)
+      continue;
+    merge_clusters (j, i + 1);
+    {
+      hb_glyph_info_t t = info[i];
+      memmove (&info[j + 1], &info[j], (i - j) * sizeof (hb_glyph_info_t));
+      info[j] = t;
+    }
+  }
+}
+
+
+
+hb_buffer_diff_flags_t
+hb_buffer_diff (hb_buffer_t *buffer,
+		hb_buffer_t *reference,
+		hb_codepoint_t dottedcircle_glyph,
+		unsigned int position_fuzz)
+{
+  if (buffer->content_type != reference->content_type && buffer->len && reference->len)
+    return HB_BUFFER_DIFF_FLAG_CONTENT_TYPE_MISMATCH;
+
+  hb_buffer_diff_flags_t result = HB_BUFFER_DIFF_FLAG_EQUAL;
+  bool contains = dottedcircle_glyph != (hb_codepoint_t) -1;
+
+  unsigned int count = reference->len;
+
+  if (buffer->len != count)
+  {
+    const hb_glyph_info_t *info = reference->info;
+    unsigned int i;
+    for (i = 0; i < count; i++)
+    {
+      if (contains && info[i].codepoint == dottedcircle_glyph)
+	result |= HB_BUFFER_DIFF_FLAG_DOTTED_CIRCLE_PRESENT;
+      if (contains && info[i].codepoint == 0)
+	result |= HB_BUFFER_DIFF_FLAG_NOTDEF_PRESENT;
+    }
+    result |= HB_BUFFER_DIFF_FLAG_LENGTH_MISMATCH;
+    return hb_buffer_diff_flags_t (result);
+  }
+
+  if (!count)
+    return hb_buffer_diff_flags_t (result);
+
+  const hb_glyph_info_t *buf_info = buffer->info;
+  const hb_glyph_info_t *ref_info = reference->info;
+  for (unsigned int i = 0; i < count; i++)
+  {
+    if (buf_info->codepoint != ref_info->codepoint)
+      result |= HB_BUFFER_DIFF_FLAG_CODEPOINT_MISMATCH;
+    if (buf_info->cluster != ref_info->cluster)
+      result |= HB_BUFFER_DIFF_FLAG_CLUSTER_MISMATCH;
+    if ((buf_info->mask ^ ref_info->mask) & HB_GLYPH_FLAG_DEFINED)
+      result |= HB_BUFFER_DIFF_FLAG_GLYPH_FLAGS_MISMATCH;
+    if (contains && ref_info->codepoint == dottedcircle_glyph)
+      result |= HB_BUFFER_DIFF_FLAG_DOTTED_CIRCLE_PRESENT;
+    if (contains && ref_info->codepoint == 0)
+      result |= HB_BUFFER_DIFF_FLAG_NOTDEF_PRESENT;
+    buf_info++;
+    ref_info++;
+  }
+
+  if (buffer->content_type == HB_BUFFER_CONTENT_TYPE_GLYPHS)
+  {
+    assert (buffer->have_positions);
+    const hb_glyph_position_t *buf_pos = buffer->pos;
+    const hb_glyph_position_t *ref_pos = reference->pos;
+    for (unsigned int i = 0; i < count; i++)
+    {
+      if ((unsigned int) abs (buf_pos->x_advance - ref_pos->x_advance) > position_fuzz ||
+	  (unsigned int) abs (buf_pos->y_advance - ref_pos->y_advance) > position_fuzz ||
+	  (unsigned int) abs (buf_pos->x_offset - ref_pos->x_offset) > position_fuzz ||
+	  (unsigned int) abs (buf_pos->y_offset - ref_pos->y_offset) > position_fuzz)
+      {
+	result |= HB_BUFFER_DIFF_FLAG_POSITION_MISMATCH;
+	break;
+      }
+      buf_pos++;
+      ref_pos++;
+    }
+  }
+
+  return result;
+}
+
+
+
+void
+hb_buffer_t::changed ()
+{
+#ifdef HB_NO_BUFFER_MESSAGE
+  return;
+#else
+  if (!message_depth)
+    return;
+
+  if (changed_func)
+    changed_func (this, changed_data);
+  else
+    update_digest ();
+#endif
+}
+
+#ifndef HB_NO_BUFFER_MESSAGE
+void
+hb_buffer_set_message_func (hb_buffer_t *buffer,
+			    hb_buffer_message_func_t func,
+			    void *user_data, hb_destroy_func_t destroy)
+{
+  if (unlikely (hb_object_is_immutable (buffer)) ||
+      unlikely (buffer->message_depth))
+  {
+    if (destroy)
+      destroy (user_data);
+    return;
+  }
+
+  if (buffer->message_destroy)
+    buffer->message_destroy (buffer->message_data);
+
+  if (func) {
+    buffer->message_func = func;
+    buffer->message_data = user_data;
+    buffer->message_destroy = destroy;
+  } else {
+    buffer->message_func = nullptr;
+    buffer->message_data = nullptr;
+    buffer->message_destroy = nullptr;
+  }
+}
+void
+hb_buffer_changed (hb_buffer_t *buffer)
+{
+  buffer->changed ();
+}
+
+bool
+hb_buffer_t::message_impl (hb_font_t *font, const char *fmt, va_list ap)
+{
+  assert (!have_output || (out_info == info && out_len == idx));
+
+  message_depth++;
+
+  char buf[100];
+  vsnprintf (buf, sizeof (buf), fmt, ap);
+  bool ret = (bool) this->message_func (this, font, buf, this->message_data);
+
+  message_depth--;
+
+  return ret;
+}
+#endif

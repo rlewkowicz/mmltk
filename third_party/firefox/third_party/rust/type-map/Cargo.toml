@@ -1,0 +1,26 @@
+
+[package]
+edition = "2018"
+name = "type-map"
+version = "0.5.1"
+authors = ["Jacob Brown <kardeiz@gmail.com>"]
+build = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Provides a typemap container with FxHashMap"
+keywords = [
+    "typemap",
+    "extensions",
+    "hashmap",
+]
+license = "MIT/Apache-2.0"
+repository = "https://github.com/kardeiz/type-map"
+
+[lib]
+name = "type_map"
+path = "src/lib.rs"
+
+[dependencies.rustc-hash]
+version = "2"

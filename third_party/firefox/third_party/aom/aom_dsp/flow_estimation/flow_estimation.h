@@ -1,0 +1,72 @@
+/*
+ * Copyright (c) 2016, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ */
+
+#if !defined(AOM_AOM_DSP_FLOW_ESTIMATION_H_)
+#define AOM_AOM_DSP_FLOW_ESTIMATION_H_
+
+#include "aom_dsp/pyramid.h"
+#include "aom_dsp/flow_estimation/corner_detect.h"
+#include "aom_ports/mem.h"
+#include "aom_scale/yv12config.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#define MAX_PARAMDIM 6
+#define MIN_INLIER_PROB 0.1
+
+/* clang-format off */
+enum {
+  IDENTITY = 0,      
+  TRANSLATION = 1,   
+  ROTZOOM = 2,       
+  AFFINE = 3,        
+  TRANS_TYPES,
+} UENUM1BYTE(TransformationType);
+/* clang-format on */
+
+static const int trans_model_params[TRANS_TYPES] = { 0, 2, 4, 6 };
+
+typedef enum {
+  GLOBAL_MOTION_METHOD_FEATURE_MATCH,
+  GLOBAL_MOTION_METHOD_DISFLOW,
+  GLOBAL_MOTION_METHOD_LAST = GLOBAL_MOTION_METHOD_DISFLOW,
+  GLOBAL_MOTION_METHODS
+} GlobalMotionMethod;
+
+typedef struct {
+  double params[MAX_PARAMDIM];
+  int *inliers;
+  int num_inliers;
+} MotionModel;
+
+typedef struct {
+  double x, y;
+  double rx, ry;
+} Correspondence;
+
+static const GlobalMotionMethod default_global_motion_method =
+    GLOBAL_MOTION_METHOD_DISFLOW;
+
+extern const double kIdentityParams[MAX_PARAMDIM];
+
+bool aom_compute_global_motion(TransformationType type, YV12_BUFFER_CONFIG *src,
+                               YV12_BUFFER_CONFIG *ref, int bit_depth,
+                               GlobalMotionMethod gm_method,
+                               int downsample_level, MotionModel *motion_models,
+                               int num_motion_models, bool *mem_alloc_failed);
+
+#if defined(__cplusplus)
+}
+#endif
+
+#endif

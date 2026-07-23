@@ -1,0 +1,70 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_STACKINGCONTEXTHELPER_H
+#define GFX_STACKINGCONTEXTHELPER_H
+
+#include "mozilla/Attributes.h"
+#include "mozilla/gfx/MatrixFwd.h"
+#include "mozilla/webrender/WebRenderAPI.h"
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "Units.h"
+
+namespace mozilla {
+
+class nsDisplayTransform;
+struct ActiveScrolledRoot;
+
+namespace layers {
+
+class MOZ_RAII StackingContextHelper {
+ public:
+  StackingContextHelper(const StackingContextHelper& aParentSC,
+                        const ActiveScrolledRoot* aAsr,
+                        nsIFrame* aContainerFrame,
+                        nsDisplayItem* aContainerItem,
+                        wr::DisplayListBuilder& aBuilder,
+                        const wr::StackingContextParams& aParams,
+                        const LayoutDeviceRect& aBounds = LayoutDeviceRect());
+
+  StackingContextHelper();
+
+  ~StackingContextHelper();
+
+  gfx::MatrixScales GetInheritedScale() const { return mScale; }
+
+  const gfx::Matrix& GetInheritedTransform() const {
+    return mInheritedTransform;
+  }
+
+  const gfx::Matrix& GetSnappingSurfaceTransform() const {
+    return mSnappingSurfaceTransform;
+  }
+
+  nsDisplayTransform* GetDeferredTransformItem() const;
+  Maybe<gfx::Matrix4x4> GetDeferredTransformMatrix() const;
+  void ClearDeferredTransformItem() const;
+  void RestoreDeferredTransformItem(nsDisplayTransform* aItem) const;
+
+  bool AffectsClipPositioning() const { return mAffectsClipPositioning; }
+  Maybe<wr::WrSpatialId> ReferenceFrameId() const { return mReferenceFrameId; }
+
+ private:
+  wr::DisplayListBuilder* mBuilder;
+  gfx::MatrixScales mScale;
+  gfx::Matrix mInheritedTransform;
+
+  gfx::Matrix mSnappingSurfaceTransform;
+  bool mAffectsClipPositioning;
+  Maybe<wr::WrSpatialId> mReferenceFrameId;
+  Maybe<wr::SpaceAndClipChainHelper> mSpaceAndClipChainHelper;
+
+  mutable nsDisplayTransform* mDeferredTransformItem;
+  Maybe<gfx::Matrix4x4> mDeferredAncestorTransform;
+};
+
+}  
+}  
+
+#endif /* GFX_STACKINGCONTEXTHELPER_H */

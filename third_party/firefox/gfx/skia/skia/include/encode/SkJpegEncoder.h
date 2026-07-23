@@ -1,0 +1,72 @@
+/*
+ * Copyright 2017 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkJpegEncoder_DEFINED)
+#define SkJpegEncoder_DEFINED
+
+#include "include/codec/SkEncodedOrigin.h"
+#include "include/core/SkRefCnt.h"
+#include "include/private/base/SkAPI.h"
+
+#include <memory>
+#include <optional>
+
+class SkColorSpace;
+class SkData;
+class SkEncoder;
+class SkPixmap;
+class SkWStream;
+class SkImage;
+class GrDirectContext;
+class SkYUVAPixmaps;
+struct skcms_ICCProfile;
+
+namespace SkJpegEncoder {
+
+enum class AlphaOption {
+    kIgnore,
+    kBlendOnBlack,
+};
+
+enum class Downsample {
+    k420,
+
+    k422,
+
+    k444,
+};
+
+struct Options {
+    int fQuality = 100;
+
+    Downsample fDownsample = Downsample::k420;
+
+    AlphaOption fAlphaOption = AlphaOption::kIgnore;
+
+    const SkData* xmpMetadata = nullptr;
+
+    std::optional<SkEncodedOrigin> fOrigin;
+};
+
+SK_API bool Encode(SkWStream* dst, const SkPixmap& src, const Options& options);
+SK_API bool Encode(SkWStream* dst,
+                   const SkYUVAPixmaps& src,
+                   const SkColorSpace* srcColorSpace,
+                   const Options& options);
+
+SK_API sk_sp<SkData> Encode(const SkPixmap& src, const Options& options);
+
+SK_API sk_sp<SkData> Encode(GrDirectContext* ctx, const SkImage* img, const Options& options);
+
+SK_API std::unique_ptr<SkEncoder> Make(SkWStream* dst, const SkPixmap& src, const Options& options);
+SK_API std::unique_ptr<SkEncoder> Make(SkWStream* dst,
+                                       const SkYUVAPixmaps& src,
+                                       const SkColorSpace* srcColorSpace,
+                                       const Options& options);
+}  
+
+#endif

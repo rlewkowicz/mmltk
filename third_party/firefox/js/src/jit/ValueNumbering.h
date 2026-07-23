@@ -1,0 +1,116 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_ValueNumbering_h
+#define jit_ValueNumbering_h
+
+#include "jit/JitAllocPolicy.h"
+#include "js/HashTable.h"
+#include "js/Vector.h"
+
+namespace js {
+namespace jit {
+
+class MDefinition;
+class MBasicBlock;
+class MIRGraph;
+class MPhi;
+class MIRGenerator;
+class MResumePoint;
+
+class ValueNumberer {
+  class VisibleValues {
+    struct ValueHasher {
+      using Lookup = const MDefinition*;
+      using Key = MDefinition*;
+      static HashNumber hash(Lookup ins);
+      static bool match(Key k, Lookup l);
+      static void rekey(Key& k, Key newKey);
+    };
+
+    using ValueSet = HashSet<MDefinition*, ValueHasher, JitAllocPolicy>;
+
+    ValueSet set_;  
+
+   public:
+    explicit VisibleValues(TempAllocator& alloc);
+
+    using Ptr = ValueSet::Ptr;
+    using AddPtr = ValueSet::AddPtr;
+
+    Ptr findLeader(const MDefinition* def) const;
+    AddPtr findLeaderForAdd(MDefinition* def);
+    [[nodiscard]] bool add(AddPtr p, MDefinition* def);
+    void overwrite(AddPtr p, MDefinition* def);
+    void forget(const MDefinition* def);
+    void clear();
+#ifdef DEBUG
+    bool has(const MDefinition* def) const;
+#endif
+  };
+
+  using BlockWorklist = Vector<MBasicBlock*, 4, JitAllocPolicy>;
+  using DefWorklist = Vector<MDefinition*, 4, JitAllocPolicy>;
+
+  const MIRGenerator* const mir_;
+  MIRGraph& graph_;
+  VisibleValues values_;           
+  DefWorklist deadDefs_;           
+  BlockWorklist remainingBlocks_;  
+  MDefinition* nextDef_;           
+  size_t totalNumVisited_;         
+  bool rerun_;                     
+  bool blocksRemoved_;             
+  bool updateAliasAnalysis_;       
+  bool dependenciesBroken_;        
+  bool hasOSRFixups_;              
+
+  enum ImplicitUseOption { DontSetImplicitUse, SetImplicitUse };
+  enum class AllowEffectful : bool { No, Yes };
+
+  [[nodiscard]] bool handleUseReleased(MDefinition* def,
+                                       ImplicitUseOption implicitUseOption);
+  [[nodiscard]] bool discardDefsRecursively(
+      MDefinition* def, AllowEffectful allowEffectful = AllowEffectful::No);
+  [[nodiscard]] bool releaseResumePointOperands(MResumePoint* resume);
+  [[nodiscard]] bool releaseAndRemovePhiOperands(MPhi* phi);
+  [[nodiscard]] bool releaseOperands(MDefinition* def);
+  [[nodiscard]] bool discardDef(
+      MDefinition* def, AllowEffectful allowEffectful = AllowEffectful::No);
+  [[nodiscard]] bool processDeadDefs();
+
+  [[nodiscard]] bool fixupOSROnlyLoop(MBasicBlock* block);
+  [[nodiscard]] bool removePredecessorAndDoDCE(MBasicBlock* block,
+                                               MBasicBlock* pred,
+                                               size_t predIndex);
+  [[nodiscard]] bool removePredecessorAndCleanUp(MBasicBlock* block,
+                                                 MBasicBlock* pred);
+
+  MDefinition* simplified(MDefinition* def) const;
+  MDefinition* leader(MDefinition* def);
+  bool hasLeader(const MPhi* phi, const MBasicBlock* phiBlock) const;
+  bool loopHasOptimizablePhi(MBasicBlock* header) const;
+
+  [[nodiscard]] bool visitDefinition(MDefinition* def);
+  [[nodiscard]] bool visitControlInstruction(MBasicBlock* block);
+  [[nodiscard]] bool visitUnreachableBlock(MBasicBlock* block);
+  [[nodiscard]] bool visitBlock(MBasicBlock* block);
+  [[nodiscard]] bool visitDominatorTree(MBasicBlock* root);
+  [[nodiscard]] bool visitGraph();
+
+  [[nodiscard]] bool insertOSRFixups();
+  [[nodiscard]] bool cleanupOSRFixups();
+
+ public:
+  ValueNumberer(const MIRGenerator* mir, MIRGraph& graph);
+
+  enum UpdateAliasAnalysisFlag { DontUpdateAliasAnalysis, UpdateAliasAnalysis };
+
+  [[nodiscard]] bool run(UpdateAliasAnalysisFlag updateAliasAnalysis);
+};
+
+}  
+}  
+
+#endif /* jit_ValueNumbering_h */

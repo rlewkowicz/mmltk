@@ -1,0 +1,346 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef Tokenizer_h_
+#define Tokenizer_h_
+
+#include <type_traits>
+
+#include "nsString.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/UniquePtr.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+template <typename TChar>
+class TokenizerBase {
+ public:
+  typedef nsTSubstring<TChar> TAString;
+  typedef nsTString<TChar> TString;
+  typedef nsTDependentString<TChar> TDependentString;
+  typedef nsTDependentSubstring<TChar> TDependentSubstring;
+
+  static TChar const sWhitespaces[];
+
+  TokenizerBase() = delete;
+  TokenizerBase(const TokenizerBase&) = delete;
+  TokenizerBase(TokenizerBase&&) = delete;
+  TokenizerBase(const TokenizerBase&&) = delete;
+  TokenizerBase& operator=(const TokenizerBase&) = delete;
+
+  enum TokenType : uint32_t {
+    TOKEN_UNKNOWN,
+    TOKEN_RAW,
+    TOKEN_ERROR,
+    TOKEN_INTEGER,
+    TOKEN_WORD,
+    TOKEN_CHAR,
+    TOKEN_WS,
+    TOKEN_EOL,
+    TOKEN_EOF,
+    TOKEN_CUSTOM0 = 1000
+  };
+
+  enum ECaseSensitivity { CASE_SENSITIVE, CASE_INSENSITIVE };
+
+  class Token {
+    TokenType mType;
+    TDependentSubstring mWord;
+    TString mCustom;
+    TChar mChar;
+    uint64_t mInteger;
+    ECaseSensitivity mCustomCaseInsensitivity;
+    bool mCustomEnabled;
+
+    TDependentSubstring mFragment;
+
+    friend class TokenizerBase<TChar>;
+    void AssignFragment(typename TAString::const_char_iterator begin,
+                        typename TAString::const_char_iterator end);
+
+    static Token Raw();
+
+   public:
+    Token();
+    Token(const Token& aOther);
+    Token& operator=(const Token& aOther);
+
+    static Token Word(TAString const& aWord);
+    static Token Char(TChar const aChar);
+    static Token Number(uint64_t const aNumber);
+    static Token Whitespace();
+    static Token NewLine();
+    static Token EndOfFile();
+    static Token Error();
+
+    bool Equals(const Token& aOther) const;
+
+    TokenType Type() const { return mType; }
+    TChar AsChar() const;
+    TDependentSubstring const& AsString() const;
+    uint64_t AsInteger() const;
+
+    TDependentSubstring const& Fragment() const { return mFragment; }
+  };
+
+  Token AddCustomToken(const TAString& aValue,
+                       ECaseSensitivity aCaseInsensitivity,
+                       bool aEnabled = true);
+  template <uint32_t N>
+  Token AddCustomToken(const TChar (&aValue)[N],
+                       ECaseSensitivity aCaseInsensitivity,
+                       bool aEnabled = true) {
+    return AddCustomToken(TDependentSubstring(aValue, N - 1),
+                          aCaseInsensitivity, aEnabled);
+  }
+  void RemoveCustomToken(Token& aToken);
+  void EnableCustomToken(Token const& aToken, bool aEnable);
+
+  enum class Mode { FULL, CUSTOM_ONLY };
+  void SetTokenizingMode(Mode aMode);
+
+  [[nodiscard]] bool HasFailed() const;
+
+ protected:
+  explicit TokenizerBase(const TChar* aWhitespaces = nullptr,
+                         const TChar* aAdditionalWordChars = nullptr);
+
+  bool HasInput() const;
+  typename TAString::const_char_iterator Parse(Token& aToken) const;
+  bool IsEnd(const typename TAString::const_char_iterator& caret) const;
+  bool IsPending(const typename TAString::const_char_iterator& caret) const;
+  bool IsWordFirst(const TChar aInput) const;
+  bool IsWord(const TChar aInput) const;
+  bool IsNumber(const TChar aInput) const;
+  bool IsCustom(const typename TAString::const_char_iterator& caret,
+                const Token& aCustomToken, uint32_t* aLongest = nullptr) const;
+
+  static void AssignFragment(Token& aToken,
+                             typename TAString::const_char_iterator begin,
+                             typename TAString::const_char_iterator end);
+
+#ifdef DEBUG
+  void Validate(Token const& aToken);
+#endif
+
+  bool mPastEof;
+  bool mHasFailed;
+  bool mInputFinished;
+  Mode mMode;
+  uint32_t mMinRawDelivery;
+
+  const TChar* mWhitespaces;
+  const TChar* mAdditionalWordChars;
+
+  typename TAString::const_char_iterator
+      mCursor;  
+  typename TAString::const_char_iterator mEnd;  
+
+  nsTArray<UniquePtr<Token>> mCustomTokens;
+  uint32_t mNextCustomTokenID;
+};
+
+template <typename TChar>
+class TTokenizer : public TokenizerBase<TChar> {
+ public:
+  typedef TokenizerBase<TChar> base;
+
+  explicit TTokenizer(const typename base::TAString& aSource,
+                      const TChar* aWhitespaces = nullptr,
+                      const TChar* aAdditionalWordChars = nullptr);
+  explicit TTokenizer(const TChar* aSource, const TChar* aWhitespaces = nullptr,
+                      const TChar* aAdditionalWordChars = nullptr);
+
+  [[nodiscard]] bool Next(typename base::Token& aToken);
+
+  [[nodiscard]] bool Check(const typename base::TokenType aTokenType,
+                           typename base::Token& aResult);
+  [[nodiscard]] bool Check(const typename base::Token& aToken);
+
+  enum WhiteSkipping {
+    DONT_INCLUDE_NEW_LINE = 0,
+    INCLUDE_NEW_LINE = 1
+  };
+
+  void SkipWhites(WhiteSkipping aIncludeNewLines = DONT_INCLUDE_NEW_LINE);
+
+  void SkipUntil(typename base::Token const& aToken);
+
+
+  [[nodiscard]] bool CheckWhite() { return Check(base::Token::Whitespace()); }
+  [[nodiscard]] bool CheckChar(const TChar aChar) {
+    return Check(base::Token::Char(aChar));
+  }
+  [[nodiscard]] bool CheckChar(bool (*aClassifier)(const TChar aChar));
+  [[nodiscard]] bool CheckWord(const typename base::TAString& aWord) {
+    return Check(base::Token::Word(aWord));
+  }
+  template <uint32_t N>
+  [[nodiscard]] bool CheckWord(const TChar (&aWord)[N]) {
+    return Check(
+        base::Token::Word(typename base::TDependentString(aWord, N - 1)));
+  }
+  [[nodiscard]] bool CheckPhrase(const typename base::TAString& aPhrase);
+  template <uint32_t N>
+  [[nodiscard]] bool CheckPhrase(const TChar (&aPhrase)[N]) {
+    return CheckPhrase(typename base::TDependentString(aPhrase, N - 1));
+  }
+  [[nodiscard]] bool CheckEOL() { return Check(base::Token::NewLine()); }
+  [[nodiscard]] bool CheckEOF() { return Check(base::Token::EndOfFile()); }
+
+  [[nodiscard]] bool ReadChar(TChar* aValue);
+  [[nodiscard]] bool ReadChar(bool (*aClassifier)(const TChar aChar),
+                              TChar* aValue);
+  [[nodiscard]] bool ReadWord(typename base::TAString& aValue);
+  [[nodiscard]] bool ReadWord(typename base::TDependentSubstring& aValue);
+
+  template <typename T>
+  [[nodiscard]] bool ReadInteger(T* aValue) {
+    MOZ_RELEASE_ASSERT(aValue);
+
+    typename base::TAString::const_char_iterator rollback = mRollback;
+    typename base::TAString::const_char_iterator cursor = base::mCursor;
+    typename base::Token t;
+    if (!Check(base::TOKEN_INTEGER, t)) {
+      return false;
+    }
+
+    mozilla::CheckedInt<T> checked(t.AsInteger());
+    if (!checked.isValid()) {
+      mRollback = rollback;
+      base::mCursor = cursor;
+      base::mHasFailed = true;
+      return false;
+    }
+
+    *aValue = checked.value();
+    return true;
+  }
+
+  template <typename T, typename V = std::enable_if_t<
+                            std::is_signed_v<std::remove_pointer_t<T>>,
+                            std::remove_pointer_t<T>>>
+  [[nodiscard]] bool ReadSignedInteger(T* aValue) {
+    MOZ_RELEASE_ASSERT(aValue);
+
+    typename base::TAString::const_char_iterator rollback = mRollback;
+    typename base::TAString::const_char_iterator cursor = base::mCursor;
+    auto revert = MakeScopeExit([&] {
+      mRollback = rollback;
+      base::mCursor = cursor;
+      base::mHasFailed = true;
+    });
+
+    bool minus = CheckChar([](const TChar aChar) { return aChar == '-'; });
+
+    typename base::Token t;
+    if (!Check(base::TOKEN_INTEGER, t)) {
+      return false;
+    }
+
+    mozilla::CheckedInt<T> checked(t.AsInteger());
+    if (minus) {
+      checked *= -1;
+    }
+
+    if (!checked.isValid()) {
+      return false;
+    }
+
+    *aValue = checked.value();
+    revert.release();
+    return true;
+  }
+
+  template <typename T>
+  [[nodiscard]] bool ReadHexadecimal(T* aValue, bool aPrefixed = true) {
+    MOZ_RELEASE_ASSERT(aValue);
+
+    typename base::TAString::const_char_iterator rollback = mRollback;
+    typename base::TAString::const_char_iterator cursor = base::mCursor;
+    auto revert = MakeScopeExit([&] {
+      mRollback = rollback;
+      base::mCursor = cursor;
+      base::mHasFailed = true;
+    });
+
+    if (aPrefixed) {
+      typename base::Token t;
+      if (!Check(base::TOKEN_INTEGER, t) && t.AsInteger() != 0) {
+        return false;
+      }
+
+      if (!CheckChar([](const TChar aChar) { return aChar == 'x'; })) {
+        return false;
+      }
+    }
+
+    TChar c = 'z';
+    mozilla::CheckedInt<T> resultingNumber = 0;
+    while (ReadChar(
+        [](const TChar aChar) {
+          return (aChar >= '0' && aChar <= '9') ||
+                 (aChar >= 'A' && aChar <= 'F') ||
+                 (aChar >= 'a' && aChar <= 'f');
+        },
+        &c)) {
+      resultingNumber *= 16;
+      if (c <= '9') {
+        resultingNumber += static_cast<uint64_t>(c - '0');
+      } else if (c <= 'F') {
+        resultingNumber += static_cast<uint64_t>(c - 'A') + 0xa;
+      } else {
+        resultingNumber += static_cast<uint64_t>(c - 'a') + 0xa;
+      }
+    }
+    if (c == 'z' || !resultingNumber.isValid()) {
+      return false;
+    }
+
+    *aValue = resultingNumber.value();
+    revert.release();
+    return true;
+  }
+
+  void Rollback();
+
+  enum ClaimInclusion {
+    INCLUDE_LAST,
+    EXCLUDE_LAST
+  };
+
+  void Record(ClaimInclusion aInclude = EXCLUDE_LAST);
+  void Claim(typename base::TAString& aResult,
+             ClaimInclusion aInclude = EXCLUDE_LAST);
+  void Claim(typename base::TDependentSubstring& aResult,
+             ClaimInclusion aInclude = EXCLUDE_LAST);
+
+  [[nodiscard]] bool ReadUntil(typename base::Token const& aToken,
+                               typename base::TDependentSubstring& aResult,
+                               ClaimInclusion aInclude = EXCLUDE_LAST);
+  [[nodiscard]] bool ReadUntil(typename base::Token const& aToken,
+                               typename base::TAString& aResult,
+                               ClaimInclusion aInclude = EXCLUDE_LAST);
+
+  TTokenizer() = delete;
+  TTokenizer(const TTokenizer&) = delete;
+  TTokenizer(TTokenizer&&) = delete;
+  TTokenizer(const TTokenizer&&) = delete;
+  TTokenizer& operator=(const TTokenizer&) = delete;
+
+ protected:
+  typename base::TAString::const_char_iterator
+      mRecord;  
+  typename base::TAString::const_char_iterator
+      mRollback;  
+};
+
+typedef TTokenizer<char> Tokenizer;
+typedef TTokenizer<char16_t> Tokenizer16;
+
+}  
+
+#endif  // Tokenizer_h_

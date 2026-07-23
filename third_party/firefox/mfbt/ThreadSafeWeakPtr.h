@@ -1,0 +1,191 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+
+#ifndef mozilla_ThreadSafeWeakPtr_h
+#define mozilla_ThreadSafeWeakPtr_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/RefCountType.h"
+#include "mozilla/RefCounted.h"
+#include "mozilla/RefPtr.h"
+
+namespace mozilla {
+
+template <typename T>
+class ThreadSafeWeakPtr;
+
+template <typename T>
+class SupportsThreadSafeWeakPtr;
+
+namespace detail {
+
+class SupportsThreadSafeWeakPtrBase {};
+
+class ThreadSafeWeakReference
+    : public external::AtomicRefCounted<ThreadSafeWeakReference> {
+ public:
+  explicit ThreadSafeWeakReference(SupportsThreadSafeWeakPtrBase* aPtr)
+      : mPtr(aPtr) {}
+
+#ifdef MOZ_REFCOUNTED_LEAK_CHECKING
+  const char* typeName() const { return "ThreadSafeWeakReference"; }
+  size_t typeSize() const { return sizeof(*this); }
+#endif
+
+ private:
+  template <typename U>
+  friend class mozilla::SupportsThreadSafeWeakPtr;
+  template <typename U>
+  friend class mozilla::ThreadSafeWeakPtr;
+
+  RC<MozRefCountType, AtomicRefCount> mStrongCnt{0};
+
+  SupportsThreadSafeWeakPtrBase* MOZ_NON_OWNING_REF mPtr;
+};
+
+}  
+
+template <typename T>
+class SupportsThreadSafeWeakPtr : public detail::SupportsThreadSafeWeakPtrBase {
+ protected:
+  using ThreadSafeWeakReference = detail::ThreadSafeWeakReference;
+
+  SupportsThreadSafeWeakPtr() : mWeakRef(new ThreadSafeWeakReference(this)) {
+    static_assert(std::is_base_of_v<SupportsThreadSafeWeakPtr, T>,
+                  "T must derive from SupportsThreadSafeWeakPtr");
+  }
+
+ public:
+  MozExternalRefCountType AddRef() const {
+    auto& refCnt = mWeakRef->mStrongCnt;
+    MOZ_ASSERT(int32_t(refCnt) >= 0);
+    MozRefCountType cnt = ++refCnt;
+    detail::RefCountLogger::logAddRef(static_cast<const T*>(this), cnt);
+    return cnt;
+  }
+
+  MozExternalRefCountType Release() const {
+    auto& refCnt = mWeakRef->mStrongCnt;
+    MOZ_ASSERT(int32_t(refCnt) > 0);
+    detail::RefCountLogger::ReleaseLogger logger(static_cast<const T*>(this));
+    MozRefCountType cnt = --refCnt;
+    logger.logRelease(cnt);
+    if (0 == cnt) {
+      delete static_cast<const T*>(this);
+    }
+    return cnt;
+  }
+
+  using HasThreadSafeRefCnt = std::true_type;
+
+  void ref() { AddRef(); }
+  void deref() { Release(); }
+  MozRefCountType refCount() const { return mWeakRef->mStrongCnt; }
+  bool hasOneRef() const { return refCount() == 1; }
+
+ private:
+  template <typename U>
+  friend class ThreadSafeWeakPtr;
+
+  ThreadSafeWeakReference* getThreadSafeWeakReference() const {
+    return mWeakRef;
+  }
+
+  const RefPtr<ThreadSafeWeakReference> mWeakRef;
+};
+
+template <typename T>
+class ThreadSafeWeakPtr {
+  using ThreadSafeWeakReference = detail::ThreadSafeWeakReference;
+
+ public:
+  ThreadSafeWeakPtr() = default;
+
+  ThreadSafeWeakPtr& operator=(const ThreadSafeWeakPtr& aOther) = default;
+  ThreadSafeWeakPtr(const ThreadSafeWeakPtr& aOther) = default;
+
+  ThreadSafeWeakPtr& operator=(ThreadSafeWeakPtr&& aOther) = default;
+  ThreadSafeWeakPtr(ThreadSafeWeakPtr&& aOther) = default;
+
+  ThreadSafeWeakPtr& operator=(const RefPtr<T>& aOther) {
+    if (aOther) {
+      mRef = aOther->getThreadSafeWeakReference();
+    } else {
+      mRef = nullptr;
+    }
+    return *this;
+  }
+
+  explicit ThreadSafeWeakPtr(const RefPtr<T>& aOther) { *this = aOther; }
+
+  ThreadSafeWeakPtr& operator=(decltype(nullptr)) {
+    mRef = nullptr;
+    return *this;
+  }
+
+  explicit ThreadSafeWeakPtr(decltype(nullptr)) {}
+
+  explicit operator bool() const = delete;
+
+  bool IsNull() const { return !mRef; }
+
+  bool IsDead() const { return IsNull() || size_t(mRef->mStrongCnt) == 0; }
+
+  bool operator==(const ThreadSafeWeakPtr& aOther) const {
+    return mRef == aOther.mRef;
+  }
+
+  bool operator==(const RefPtr<T>& aOther) const {
+    return *this == aOther.get();
+  }
+
+  friend bool operator==(const RefPtr<T>& aStrong,
+                         const ThreadSafeWeakPtr& aWeak) {
+    return aWeak == aStrong.get();
+  }
+
+  bool operator==(const T* aOther) const {
+    if (!mRef) {
+      return !aOther;
+    }
+    return aOther && aOther->getThreadSafeWeakReference() == mRef;
+  }
+
+  template <typename U>
+  bool operator!=(const U& aOther) const {
+    return !(*this == aOther);
+  }
+
+  explicit operator RefPtr<T>() const { return getRefPtr(); }
+
+ private:
+  already_AddRefed<T> getRefPtr() const {
+    if (!mRef) {
+      return nullptr;
+    }
+    MozRefCountType cnt = mRef->mStrongCnt.IncrementIfNonzero();
+    if (cnt == 0) {
+      return nullptr;
+    }
+
+    RefPtr<T> ptr = already_AddRefed<T>(static_cast<T*>(mRef->mPtr));
+    detail::RefCountLogger::logAddRef(ptr.get(), cnt);
+    return ptr.forget();
+  }
+
+  RefPtr<ThreadSafeWeakReference> mRef;
+};
+
+}  
+
+template <typename T>
+inline already_AddRefed<T> do_AddRef(
+    const mozilla::ThreadSafeWeakPtr<T>& aObj) {
+  RefPtr<T> ref(aObj);
+  return ref.forget();
+}
+
+#endif /* mozilla_ThreadSafeWeakPtr_h */

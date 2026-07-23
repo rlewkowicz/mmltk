@@ -1,0 +1,1025 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include <string.h>  // for nullptr, strcmp
+
+#include "imgIContainer.h"                    // for imgIContainer, etc
+#include "mozilla/ComposerCommandsUpdater.h"  // for ComposerCommandsUpdater
+#include "mozilla/FlushType.h"                // for FlushType::Frames
+#include "mozilla/HTMLEditor.h"               // for HTMLEditor
+#include "mozilla/mozalloc.h"                 // for operator new
+#include "mozilla/PresShell.h"                // for PresShell
+#include "mozilla/Try.h"                      // for MOZ_TRY
+#include "nsAString.h"
+#include "nsBaseCommandController.h"  // for nsBaseCommandController
+#include "nsCommandManager.h"         // for nsCommandManager
+#include "nsComponentManagerUtils.h"  // for do_CreateInstance
+#include "nsContentUtils.h"
+#include "nsDebug.h"     // for NS_ENSURE_SUCCESS, etc
+#include "nsDocShell.h"  // for nsDocShell
+#include "nsEditingSession.h"
+#include "nsError.h"                     // for NS_ERROR_FAILURE, NS_OK, etc
+#include "nsIChannel.h"                  // for nsIChannel
+#include "nsIDocumentViewer.h"           // for nsIDocumentViewer
+#include "nsIControllers.h"              // for nsIControllers
+#include "nsID.h"                        // for NS_GET_IID, etc
+#include "nsHTMLDocument.h"              // for nsHTMLDocument
+#include "nsIDocShell.h"                 // for nsIDocShell
+#include "mozilla/dom/Document.h"        // for Document
+#include "nsIEditor.h"                   // for nsIEditor
+#include "nsIInterfaceRequestorUtils.h"  // for do_GetInterface
+#include "nsIRefreshURI.h"               // for nsIRefreshURI
+#include "nsIRequest.h"                  // for nsIRequest
+#include "nsITimer.h"                    // for nsITimer, etc
+#include "nsIWeakReference.h"            // for nsISupportsWeakReference, etc
+#include "nsIWebNavigation.h"            // for nsIWebNavigation
+#include "nsIWebProgress.h"              // for nsIWebProgress, etc
+#include "nsLiteralString.h"             // for NS_LITERAL_STRING
+#include "nsPIDOMWindow.h"               // for nsPIDOMWindow
+#include "nsPIDOMWindowInlines.h"  // for nsPIDOMWindowOuter::GetDocShell(), etc
+#include "nsPresContext.h"         // for nsPresContext
+#include "nsReadableUtils.h"       // for AppendUTF16toUTF8
+#include "nsStringFwd.h"           // for nsString
+#include "mozilla/dom/BrowsingContext.h"  // for BrowsingContext
+#include "mozilla/dom/Selection.h"        // for AutoHideSelectionChanges, etc
+#include "mozilla/dom/WindowContext.h"    // for WindowContext
+#include "nsFrameSelection.h"             // for nsFrameSelection
+#include "nsBaseCommandController.h"      // for nsBaseCommandController
+#include "mozilla/dom/LoadURIOptionsBinding.h"
+
+class nsISupports;
+class nsIURI;
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+nsEditingSession::nsEditingSession()
+    : mDoneSetup(false),
+      mCanCreateEditor(false),
+      mInteractive(false),
+      mMakeWholeDocumentEditable(true),
+      mDisabledJS(false),
+      mScriptsEnabled(true),
+      mProgressListenerRegistered(false),
+      mImageAnimationMode(0),
+      mEditorFlags(0),
+      mEditorStatus(eEditorOK),
+      mBaseCommandControllerId(0),
+      mDocStateControllerId(0),
+      mHTMLCommandControllerId(0) {}
+
+nsEditingSession::~nsEditingSession() {
+  if (mLoadBlankDocTimer) mLoadBlankDocTimer->Cancel();
+}
+
+NS_IMPL_ISUPPORTS(nsEditingSession, nsIEditingSession, nsIWebProgressListener,
+                  nsISupportsWeakReference)
+
+#define DEFAULT_EDITOR_TYPE "html"
+
+NS_IMETHODIMP
+nsEditingSession::MakeWindowEditable(mozIDOMWindowProxy* aWindow,
+                                     const char* aEditorType,
+                                     bool aDoAfterUriLoad,
+                                     bool aMakeWholeDocumentEditable,
+                                     bool aInteractive) {
+  mEditorType.Truncate();
+  mEditorFlags = 0;
+
+  NS_ENSURE_TRUE(aWindow, NS_ERROR_FAILURE);
+  auto* window = nsPIDOMWindowOuter::From(aWindow);
+
+  nsCOMPtr<nsIDocShell> docShell = window->GetDocShell();
+  NS_ENSURE_TRUE(docShell, NS_ERROR_FAILURE);
+  mDocShell = do_GetWeakReference(docShell);
+
+  mInteractive = aInteractive;
+  mMakeWholeDocumentEditable = aMakeWholeDocumentEditable;
+
+  nsresult rv;
+  if (!mInteractive) {
+    rv = DisableJS(window->GetCurrentInnerWindow());
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  TearDownEditorOnWindow(aWindow);
+
+  mEditorStatus = eEditorCreationInProgress;
+
+  if (!aEditorType) aEditorType = DEFAULT_EDITOR_TYPE;
+  mEditorType = aEditorType;
+
+  rv = PrepareForEditing(window);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = docShell->MakeEditable(aDoAfterUriLoad);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = SetupEditorCommandController(
+      nsBaseCommandController::CreateEditingController, aWindow, this,
+      &mBaseCommandControllerId);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = SetupEditorCommandController(
+      nsBaseCommandController::CreateHTMLEditorDocStateController, aWindow,
+      this, &mDocStateControllerId);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (!aDoAfterUriLoad) {
+    rv = SetupEditorOnWindow(MOZ_KnownLive(*window));
+
+    if (NS_FAILED(rv)) {
+      TearDownEditorOnWindow(aWindow);
+    }
+  }
+  return rv;
+}
+
+nsresult nsEditingSession::DisableJS(nsPIDOMWindowInner* aWindow) {
+  WindowContext* wc = aWindow->GetWindowContext();
+
+  mScriptsEnabled = wc->GetAllowJavascript();
+  MOZ_TRY(wc->SetAllowJavascript(false));
+  mDisabledJS = true;
+  return NS_OK;
+}
+
+nsresult nsEditingSession::RestoreJS(nsPIDOMWindowInner* aWindow) {
+  if (!mDisabledJS) {
+    return NS_OK;
+  }
+
+  mDisabledJS = false;
+
+  if (NS_WARN_IF(!aWindow)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  WindowContext* wc = aWindow->GetWindowContext();
+  return wc->SetAllowJavascript(mScriptsEnabled);
+}
+
+NS_IMETHODIMP
+nsEditingSession::WindowIsEditable(mozIDOMWindowProxy* aWindow,
+                                   bool* outIsEditable) {
+  NS_ENSURE_STATE(aWindow);
+  nsCOMPtr<nsIDocShell> docShell =
+      nsPIDOMWindowOuter::From(aWindow)->GetDocShell();
+  NS_ENSURE_STATE(docShell);
+
+  return docShell->GetEditable(outIsEditable);
+}
+
+bool IsSupportedTextType(const nsAString& aMIMEType) {
+  static constexpr nsLiteralString sSupportedTextTypes[] = {
+      u"text/plain"_ns,
+      u"text/css"_ns,
+      u"text/rdf"_ns,
+      u"text/xsl"_ns,
+      u"text/javascript"_ns,  
+      u"text/ecmascript"_ns,  
+      u"application/javascript"_ns,
+      u"application/ecmascript"_ns,
+      u"application/x-javascript"_ns,  
+      u"text/xul"_ns                   
+  };
+
+  for (const nsLiteralString& supportedTextType : sSupportedTextTypes) {
+    if (aMIMEType.Equals(supportedTextType)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+nsresult nsEditingSession::SetupEditorOnWindow(nsPIDOMWindowOuter& aWindow) {
+  mDoneSetup = true;
+
+  nsAutoString mimeType;
+
+  if (RefPtr<Document> doc = aWindow.GetDoc()) {
+    doc->GetContentType(mimeType);
+
+    if (IsSupportedTextType(mimeType)) {
+      mEditorType.AssignLiteral("text");
+      mimeType.AssignLiteral("text/plain");
+    } else if (!doc->IsHTMLOrXHTML()) {
+      mEditorStatus = eEditorErrorCantEditMimeType;
+
+      mEditorType.AssignLiteral("html");
+      mimeType.AssignLiteral("text/html");
+    }
+
+    doc->FlushPendingNotifications(mozilla::FlushType::Frames);
+    if (mMakeWholeDocumentEditable) {
+      doc->SetDocumentEditableFlag(true);
+      doc->SetEditingState(Document::EditingState::eDesignMode);
+    }
+  }
+  bool needHTMLController = false;
+
+  if (mEditorType.EqualsLiteral("textmail")) {
+    mEditorFlags = nsIEditor::eEditorPlaintextMask |
+                   nsIEditor::eEditorEnableWrapHackMask |
+                   nsIEditor::eEditorMailMask;
+  } else if (mEditorType.EqualsLiteral("text")) {
+    mEditorFlags =
+        nsIEditor::eEditorPlaintextMask | nsIEditor::eEditorEnableWrapHackMask;
+  } else if (mEditorType.EqualsLiteral("htmlmail")) {
+    if (mimeType.EqualsLiteral("text/html")) {
+      needHTMLController = true;
+      mEditorFlags = nsIEditor::eEditorMailMask;
+    } else {
+      mEditorFlags = nsIEditor::eEditorPlaintextMask |
+                     nsIEditor::eEditorEnableWrapHackMask;
+    }
+  } else {
+    needHTMLController = true;
+  }
+
+  if (mInteractive) {
+    mEditorFlags |= nsIEditor::eEditorAllowInteraction;
+  }
+
+  RefPtr commandsUpdater = MakeRefPtr<ComposerCommandsUpdater>();
+  mComposerCommandsUpdater = commandsUpdater;
+
+  commandsUpdater->Init(aWindow);
+
+  if (mEditorStatus != eEditorCreationInProgress) {
+    commandsUpdater->OnHTMLEditorCreated();
+
+    return NS_OK;
+  }
+
+  const RefPtr<nsDocShell> docShell = nsDocShell::Cast(aWindow.GetDocShell());
+  if (NS_WARN_IF(!docShell)) {
+    return NS_ERROR_FAILURE;
+  }
+  const RefPtr<PresShell> presShell = docShell->GetPresShell();
+  if (NS_WARN_IF(!presShell)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (!mInteractive) {
+    nsPresContext* presContext = presShell->GetPresContext();
+    NS_ENSURE_TRUE(presContext, NS_ERROR_FAILURE);
+
+    mImageAnimationMode = presContext->ImageAnimationMode();
+    presContext->SetImageAnimationMode(imgIContainer::kDontAnimMode);
+  }
+
+  RefPtr<nsFrameSelection> fs = presShell->FrameSelection();
+  NS_ENSURE_TRUE(fs, NS_ERROR_FAILURE);
+  AutoHideSelectionChanges hideSelectionChanges(fs);
+
+  nsCOMPtr<nsIDocumentViewer> viewer;
+  nsresult rv = docShell->GetDocViewer(getter_AddRefs(viewer));
+  if (NS_FAILED(rv) || NS_WARN_IF(!viewer)) {
+    NS_WARNING("nsDocShell::GetDocViewer() failed");
+    return rv;
+  }
+
+  const RefPtr<Document> doc = viewer->GetDocument();
+  if (NS_WARN_IF(!doc)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsIEditor> editor = do_QueryReferent(mExistingEditor);
+  RefPtr<HTMLEditor> htmlEditor = HTMLEditor::GetFrom(editor);
+  MOZ_ASSERT_IF(editor, htmlEditor);
+  if (htmlEditor) {
+    htmlEditor->PreDestroy();
+  } else {
+    htmlEditor = new HTMLEditor(*doc);
+    mExistingEditor =
+        do_GetWeakReference(static_cast<nsIEditor*>(htmlEditor.get()));
+  }
+  rv = docShell->SetHTMLEditor(htmlEditor);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (needHTMLController) {
+    rv = SetupEditorCommandController(
+        nsBaseCommandController::CreateHTMLEditorController, &aWindow,
+        htmlEditor, &mHTMLCommandControllerId);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  rv = htmlEditor->SetContentsMIMEType(mimeType);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  MOZ_ASSERT(docShell->HasDocumentViewer());
+  MOZ_ASSERT(viewer->GetDocument());
+
+  MOZ_DIAGNOSTIC_ASSERT(commandsUpdater == mComposerCommandsUpdater);
+  if (MOZ_UNLIKELY(commandsUpdater != mComposerCommandsUpdater)) {
+    commandsUpdater = mComposerCommandsUpdater;
+  }
+  rv = htmlEditor->Init(*doc, *commandsUpdater, mEditorFlags);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  RefPtr<Selection> selection = htmlEditor->GetSelection();
+  if (NS_WARN_IF(!selection)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  rv = SetEditorOnControllers(aWindow, htmlEditor);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mEditorStatus = eEditorOK;
+
+  return htmlEditor->PostCreate();
+}
+
+void nsEditingSession::RemoveListenersAndControllers(
+    nsPIDOMWindowOuter* aWindow, HTMLEditor* aHTMLEditor) {
+  if (!mComposerCommandsUpdater || !aHTMLEditor) {
+    return;
+  }
+
+  RefPtr<ComposerCommandsUpdater> composertCommandsUpdater =
+      std::move(mComposerCommandsUpdater);
+  MOZ_ASSERT(!mComposerCommandsUpdater);
+  aHTMLEditor->Detach(*composertCommandsUpdater);
+
+  RemoveEditorControllers(aWindow);
+}
+
+NS_IMETHODIMP
+nsEditingSession::TearDownEditorOnWindow(mozIDOMWindowProxy* aWindow) {
+  if (!mDoneSetup) {
+    return NS_OK;
+  }
+
+  NS_ENSURE_TRUE(aWindow, NS_ERROR_NULL_POINTER);
+
+  if (mLoadBlankDocTimer) {
+    mLoadBlankDocTimer->Cancel();
+    mLoadBlankDocTimer = nullptr;
+  }
+
+  mDoneSetup = false;
+
+  auto* window = nsPIDOMWindowOuter::From(aWindow);
+
+  RefPtr<Document> doc = window->GetDoc();
+  bool stopEditing = doc && doc->IsEditingOn();
+  if (stopEditing) {
+    RemoveWebProgressListener(window);
+  }
+
+  nsCOMPtr<nsIDocShell> docShell = window->GetDocShell();
+  NS_ENSURE_STATE(docShell);
+
+  RefPtr<HTMLEditor> htmlEditor = docShell->GetHTMLEditor();
+  if (stopEditing) {
+    doc->TearingDownEditor();
+  }
+
+  if (mComposerCommandsUpdater && htmlEditor) {
+    SetEditorOnControllers(*window, nullptr);
+  }
+
+  docShell->SetEditor(nullptr);
+
+  RemoveListenersAndControllers(window, htmlEditor);
+
+  if (stopEditing) {
+    RestoreJS(window->GetCurrentInnerWindow());
+    RestoreAnimationMode(window);
+
+    if (mMakeWholeDocumentEditable) {
+      doc->SetDocumentEditableFlag(false);
+      doc->SetEditingState(Document::EditingState::eOff);
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsEditingSession::GetEditorForWindow(mozIDOMWindowProxy* aWindow,
+                                     nsIEditor** outEditor) {
+  if (NS_WARN_IF(!aWindow)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  nsCOMPtr<nsIEditor> editor = GetHTMLEditorForWindow(aWindow);
+  editor.forget(outEditor);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsEditingSession::OnStateChange(nsIWebProgress* aWebProgress,
+                                nsIRequest* aRequest, uint32_t aStateFlags,
+                                nsresult aStatus) {
+#ifdef NOISY_DOC_LOADING
+  nsCOMPtr<nsIChannel> channel(do_QueryInterface(aRequest));
+  if (channel) {
+    nsAutoCString contentType;
+    channel->GetContentType(contentType);
+    if (!contentType.IsEmpty()) {
+      printf(" ++++++ MIMETYPE = %s\n", contentType.get());
+    }
+  }
+#endif
+
+  if (aStateFlags & nsIWebProgressListener::STATE_START) {
+#ifdef NOISY_DOC_LOADING
+    {
+      nsCOMPtr<nsIChannel> channel(do_QueryInterface(aRequest));
+      if (channel) {
+        nsCOMPtr<nsIURI> uri;
+        channel->GetURI(getter_AddRefs(uri));
+        if (uri) {
+          nsCString spec;
+          uri->GetSpec(spec);
+          printf(" **** STATE_START: CHANNEL URI=%s, flags=%x\n", spec.get(),
+                 aStateFlags);
+        }
+      } else {
+        printf("    STATE_START: NO CHANNEL flags=%x\n", aStateFlags);
+      }
+    }
+#endif
+    if (aStateFlags & nsIWebProgressListener::STATE_IS_NETWORK) {
+      nsCOMPtr<nsIChannel> channel(do_QueryInterface(aRequest));
+      StartPageLoad(channel);
+#ifdef NOISY_DOC_LOADING
+      printf("STATE_START & STATE_IS_NETWORK flags=%x\n", aStateFlags);
+#endif
+    }
+
+    if (aStateFlags & nsIWebProgressListener::STATE_IS_DOCUMENT &&
+        !(aStateFlags & nsIWebProgressListener::STATE_RESTORING)) {
+#ifdef NOISY_DOC_LOADING
+      printf("STATE_START & STATE_IS_DOCUMENT flags=%x\n", aStateFlags);
+#endif
+
+      bool progressIsForTargetDocument =
+          IsProgressForTargetDocument(aWebProgress);
+
+      if (progressIsForTargetDocument) {
+        nsCOMPtr<mozIDOMWindowProxy> window;
+        aWebProgress->GetDOMWindow(getter_AddRefs(window));
+
+        auto* piWindow = nsPIDOMWindowOuter::From(window);
+        RefPtr<Document> doc = piWindow->GetDoc();
+        nsHTMLDocument* htmlDoc =
+            doc && doc->IsHTMLOrXHTML() ? doc->AsHTMLDocument() : nullptr;
+        if (htmlDoc && doc->IsWriting()) {
+          nsAutoString designMode;
+          htmlDoc->GetDesignMode(designMode);
+
+          if (designMode.EqualsLiteral("on")) {
+
+            return NS_OK;
+          }
+        }
+
+        mCanCreateEditor = true;
+        StartDocumentLoad(aWebProgress, progressIsForTargetDocument);
+      }
+    }
+  }
+  else if (aStateFlags & nsIWebProgressListener::STATE_TRANSFERRING) {
+    if (aStateFlags & nsIWebProgressListener::STATE_IS_DOCUMENT) {
+    }
+  }
+  else if (aStateFlags & nsIWebProgressListener::STATE_REDIRECTING) {
+    if (aStateFlags & nsIWebProgressListener::STATE_IS_DOCUMENT) {
+    }
+  }
+  else if (aStateFlags & nsIWebProgressListener::STATE_STOP) {
+#ifdef NOISY_DOC_LOADING
+    {
+      nsCOMPtr<nsIChannel> channel(do_QueryInterface(aRequest));
+      if (channel) {
+        nsCOMPtr<nsIURI> uri;
+        channel->GetURI(getter_AddRefs(uri));
+        if (uri) {
+          nsCString spec;
+          uri->GetSpec(spec);
+          printf(" **** STATE_STOP: CHANNEL URI=%s, flags=%x\n", spec.get(),
+                 aStateFlags);
+        }
+      } else {
+        printf("     STATE_STOP: NO CHANNEL  flags=%x\n", aStateFlags);
+      }
+    }
+#endif
+
+    if (aStateFlags & nsIWebProgressListener::STATE_IS_DOCUMENT) {
+      nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest);
+      EndDocumentLoad(aWebProgress, channel, aStatus,
+                      IsProgressForTargetDocument(aWebProgress));
+#ifdef NOISY_DOC_LOADING
+      printf("STATE_STOP & STATE_IS_DOCUMENT flags=%x\n", aStateFlags);
+#endif
+    }
+
+    if (aStateFlags & nsIWebProgressListener::STATE_IS_NETWORK) {
+      nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest);
+      (void)EndPageLoad(aWebProgress, channel, aStatus);
+#ifdef NOISY_DOC_LOADING
+      printf("STATE_STOP & STATE_IS_NETWORK flags=%x\n", aStateFlags);
+#endif
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsEditingSession::OnProgressChange(nsIWebProgress* aWebProgress,
+                                   nsIRequest* aRequest,
+                                   int32_t aCurSelfProgress,
+                                   int32_t aMaxSelfProgress,
+                                   int32_t aCurTotalProgress,
+                                   int32_t aMaxTotalProgress) {
+  MOZ_ASSERT_UNREACHABLE("notification excluded in AddProgressListener(...)");
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsEditingSession::OnLocationChange(nsIWebProgress* aWebProgress,
+                                   nsIRequest* aRequest, nsIURI* aURI,
+                                   uint32_t aFlags) {
+  nsCOMPtr<mozIDOMWindowProxy> domWindow;
+  nsresult rv = aWebProgress->GetDOMWindow(getter_AddRefs(domWindow));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  auto* piWindow = nsPIDOMWindowOuter::From(domWindow);
+
+  RefPtr<Document> doc = piWindow->GetDoc();
+  NS_ENSURE_TRUE(doc, NS_ERROR_FAILURE);
+
+  doc->SetDocumentURI(aURI);
+
+  nsIDocShell* docShell = piWindow->GetDocShell();
+  NS_ENSURE_TRUE(docShell, NS_ERROR_FAILURE);
+
+  RefPtr<nsCommandManager> commandManager = docShell->GetCommandManager();
+  commandManager->CommandStatusChanged("obs_documentLocationChanged");
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsEditingSession::OnStatusChange(nsIWebProgress* aWebProgress,
+                                 nsIRequest* aRequest, nsresult aStatus,
+                                 const char16_t* aMessage) {
+  MOZ_ASSERT_UNREACHABLE("notification excluded in AddProgressListener(...)");
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsEditingSession::OnSecurityChange(nsIWebProgress* aWebProgress,
+                                   nsIRequest* aRequest, uint32_t aState) {
+  MOZ_ASSERT_UNREACHABLE("notification excluded in AddProgressListener(...)");
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsEditingSession::OnContentBlockingEvent(nsIWebProgress* aWebProgress,
+                                         nsIRequest* aRequest,
+                                         uint32_t aEvent) {
+  MOZ_ASSERT_UNREACHABLE("notification excluded in AddProgressListener(...)");
+  return NS_OK;
+}
+
+
+bool nsEditingSession::IsProgressForTargetDocument(
+    nsIWebProgress* aWebProgress) {
+  nsCOMPtr<nsIWebProgress> editedWebProgress = do_QueryReferent(mDocShell);
+  return editedWebProgress == aWebProgress;
+}
+
+NS_IMETHODIMP
+nsEditingSession::GetEditorStatus(uint32_t* aStatus) {
+  NS_ENSURE_ARG_POINTER(aStatus);
+  *aStatus = mEditorStatus;
+  return NS_OK;
+}
+
+nsresult nsEditingSession::StartDocumentLoad(nsIWebProgress* aWebProgress,
+                                             bool aIsToBeMadeEditable) {
+#ifdef NOISY_DOC_LOADING
+  printf("======= StartDocumentLoad ========\n");
+#endif
+
+  NS_ENSURE_ARG_POINTER(aWebProgress);
+
+  if (aIsToBeMadeEditable) {
+    mEditorStatus = eEditorCreationInProgress;
+  }
+
+  return NS_OK;
+}
+
+nsresult nsEditingSession::EndDocumentLoad(nsIWebProgress* aWebProgress,
+                                           nsIChannel* aChannel,
+                                           nsresult aStatus,
+                                           bool aIsToBeMadeEditable) {
+  NS_ENSURE_ARG_POINTER(aWebProgress);
+
+#ifdef NOISY_DOC_LOADING
+  printf("======= EndDocumentLoad ========\n");
+  printf("with status %d, ", aStatus);
+  nsCOMPtr<nsIURI> uri;
+  nsCString spec;
+  if (NS_SUCCEEDED(aChannel->GetURI(getter_AddRefs(uri)))) {
+    uri->GetSpec(spec);
+    printf(" uri %s\n", spec.get());
+  }
+#endif
+
+
+  nsCOMPtr<mozIDOMWindowProxy> domWindow;
+  aWebProgress->GetDOMWindow(getter_AddRefs(domWindow));
+  NS_ENSURE_TRUE(domWindow, NS_ERROR_FAILURE);
+
+  if (aIsToBeMadeEditable && aStatus == NS_ERROR_FILE_NOT_FOUND) {
+    mEditorStatus = eEditorErrorFileNotFound;
+  }
+
+  auto* window = nsPIDOMWindowOuter::From(domWindow);
+  nsIDocShell* docShell = window->GetDocShell();
+  NS_ENSURE_TRUE(docShell, NS_ERROR_FAILURE);  
+
+  nsCOMPtr<nsIRefreshURI> refreshURI = do_QueryInterface(docShell);
+  if (refreshURI) {
+    refreshURI->CancelRefreshURITimers();
+  }
+
+  nsresult rv = NS_OK;
+
+  if (aIsToBeMadeEditable && mCanCreateEditor) {
+    bool makeEditable;
+    docShell->GetEditable(&makeEditable);
+
+    if (makeEditable) {
+      bool needsSetup = false;
+      if (mMakeWholeDocumentEditable) {
+        needsSetup = true;
+      } else {
+        needsSetup = !docShell->GetHTMLEditor();
+      }
+
+      if (needsSetup) {
+        mCanCreateEditor = false;
+        rv = SetupEditorOnWindow(MOZ_KnownLive(*window));
+        if (NS_FAILED(rv)) {
+          if (mLoadBlankDocTimer) {
+            mLoadBlankDocTimer->Cancel();
+            mLoadBlankDocTimer = nullptr;
+          }
+
+          rv = NS_NewTimerWithFuncCallback(
+              getter_AddRefs(mLoadBlankDocTimer),
+              nsEditingSession::TimerCallback,
+              static_cast<void*>(mDocShell.get()), 10, nsITimer::TYPE_ONE_SHOT,
+              "nsEditingSession::EndDocumentLoad"_ns);
+          NS_ENSURE_SUCCESS(rv, rv);
+
+          mEditorStatus = eEditorCreationInProgress;
+        }
+      }
+    }
+  }
+  return rv;
+}
+
+void nsEditingSession::TimerCallback(nsITimer* aTimer, void* aClosure) {
+  nsCOMPtr<nsIDocShell> docShell =
+      do_QueryReferent(static_cast<nsIWeakReference*>(aClosure));
+  if (docShell) {
+    nsCOMPtr<nsIWebNavigation> webNav(do_QueryInterface(docShell));
+    if (webNav) {
+      LoadURIOptions loadURIOptions;
+      loadURIOptions.mTriggeringPrincipal =
+          nsContentUtils::GetSystemPrincipal();
+      nsCOMPtr<nsIURI> uri;
+      MOZ_ALWAYS_SUCCEEDS(NS_NewURI(getter_AddRefs(uri), "about:blank"_ns));
+      webNav->LoadURI(uri, loadURIOptions);
+    }
+  }
+}
+
+nsresult nsEditingSession::StartPageLoad(nsIChannel* aChannel) {
+#ifdef NOISY_DOC_LOADING
+  printf("======= StartPageLoad ========\n");
+#endif
+  return NS_OK;
+}
+
+nsresult nsEditingSession::EndPageLoad(nsIWebProgress* aWebProgress,
+                                       nsIChannel* aChannel, nsresult aStatus) {
+#ifdef NOISY_DOC_LOADING
+  printf("======= EndPageLoad ========\n");
+  printf("  with status %d, ", aStatus);
+  nsCOMPtr<nsIURI> uri;
+  nsCString spec;
+  if (NS_SUCCEEDED(aChannel->GetURI(getter_AddRefs(uri)))) {
+    uri->GetSpec(spec);
+    printf("uri %s\n", spec.get());
+  }
+
+  nsAutoCString contentType;
+  aChannel->GetContentType(contentType);
+  if (!contentType.IsEmpty()) {
+    printf("   flags = %d, status = %d, MIMETYPE = %s\n", mEditorFlags,
+           mEditorStatus, contentType.get());
+  }
+#endif
+
+  if (aStatus == NS_ERROR_FILE_NOT_FOUND) {
+    mEditorStatus = eEditorErrorFileNotFound;
+  }
+
+  nsCOMPtr<mozIDOMWindowProxy> domWindow;
+  aWebProgress->GetDOMWindow(getter_AddRefs(domWindow));
+
+  nsIDocShell* docShell =
+      domWindow ? nsPIDOMWindowOuter::From(domWindow)->GetDocShell() : nullptr;
+  NS_ENSURE_TRUE(docShell, NS_ERROR_FAILURE);
+
+  nsCOMPtr<nsIRefreshURI> refreshURI = do_QueryInterface(docShell);
+  if (refreshURI) {
+    refreshURI->CancelRefreshURITimers();
+  }
+
+#if 0
+  return MakeWindowEditable(domWindow, "html", false, mInteractive);
+#else
+  return NS_OK;
+#endif
+}
+
+nsresult nsEditingSession::PrepareForEditing(nsPIDOMWindowOuter* aWindow) {
+  if (mProgressListenerRegistered) {
+    return NS_OK;
+  }
+
+  nsIDocShell* docShell = aWindow ? aWindow->GetDocShell() : nullptr;
+
+  nsCOMPtr<nsIWebProgress> webProgress = do_GetInterface(docShell);
+  NS_ENSURE_TRUE(webProgress, NS_ERROR_FAILURE);
+
+  nsresult rv = webProgress->AddProgressListener(
+      this, (nsIWebProgress::NOTIFY_STATE_NETWORK |
+             nsIWebProgress::NOTIFY_STATE_DOCUMENT |
+             nsIWebProgress::NOTIFY_LOCATION));
+
+  mProgressListenerRegistered = NS_SUCCEEDED(rv);
+
+  return rv;
+}
+
+nsresult nsEditingSession::SetupEditorCommandController(
+    nsEditingSession::ControllerCreatorFn aControllerCreatorFn,
+    mozIDOMWindowProxy* aWindow, nsISupportsWeakReference* aContext,
+    uint32_t* aControllerId) {
+  NS_ENSURE_ARG_POINTER(aControllerCreatorFn);
+  NS_ENSURE_ARG_POINTER(aWindow);
+  NS_ENSURE_ARG_POINTER(aContext);
+  NS_ENSURE_ARG_POINTER(aControllerId);
+
+  auto* piWindow = nsPIDOMWindowOuter::From(aWindow);
+  MOZ_ASSERT(piWindow);
+
+  nsCOMPtr<nsIControllers> controllers;
+  nsresult rv = piWindow->GetControllers(getter_AddRefs(controllers));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (!*aControllerId) {
+    RefPtr<nsBaseCommandController> commandController = aControllerCreatorFn();
+    NS_ENSURE_TRUE(commandController, NS_ERROR_FAILURE);
+
+    rv = controllers->InsertControllerAt(0, commandController);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = controllers->GetControllerId(commandController, aControllerId);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  return SetContextOnControllerById(controllers, aContext, *aControllerId);
+}
+
+nsresult nsEditingSession::SetEditorOnControllers(nsPIDOMWindowOuter& aWindow,
+                                                  HTMLEditor* aEditor) {
+  nsCOMPtr<nsIControllers> controllers;
+  nsresult rv = aWindow.GetControllers(getter_AddRefs(controllers));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (mBaseCommandControllerId) {
+    rv = SetContextOnControllerById(controllers, aEditor,
+                                    mBaseCommandControllerId);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  if (mDocStateControllerId) {
+    rv =
+        SetContextOnControllerById(controllers, aEditor, mDocStateControllerId);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  if (mHTMLCommandControllerId) {
+    rv = SetContextOnControllerById(controllers, aEditor,
+                                    mHTMLCommandControllerId);
+  }
+
+  return rv;
+}
+
+nsresult nsEditingSession::SetContextOnControllerById(
+    nsIControllers* aControllers, nsISupportsWeakReference* aContext,
+    uint32_t aID) {
+  NS_ENSURE_ARG_POINTER(aControllers);
+
+  nsCOMPtr<nsIController> controller;
+  aControllers->GetControllerById(aID, getter_AddRefs(controller));
+
+  nsCOMPtr<nsBaseCommandController> editorController =
+      do_QueryInterface(controller);
+  NS_ENSURE_TRUE(editorController, NS_ERROR_FAILURE);
+
+  editorController->SetContext(aContext);
+  return NS_OK;
+}
+
+void nsEditingSession::RemoveEditorControllers(nsPIDOMWindowOuter* aWindow) {
+
+  nsCOMPtr<nsIControllers> controllers;
+  if (aWindow) {
+    aWindow->GetControllers(getter_AddRefs(controllers));
+  }
+
+  if (controllers) {
+    nsCOMPtr<nsIController> controller;
+    if (mBaseCommandControllerId) {
+      controllers->GetControllerById(mBaseCommandControllerId,
+                                     getter_AddRefs(controller));
+      if (controller) {
+        controllers->RemoveController(controller);
+      }
+    }
+
+    if (mDocStateControllerId) {
+      controllers->GetControllerById(mDocStateControllerId,
+                                     getter_AddRefs(controller));
+      if (controller) {
+        controllers->RemoveController(controller);
+      }
+    }
+
+    if (mHTMLCommandControllerId) {
+      controllers->GetControllerById(mHTMLCommandControllerId,
+                                     getter_AddRefs(controller));
+      if (controller) {
+        controllers->RemoveController(controller);
+      }
+    }
+  }
+
+  mBaseCommandControllerId = 0;
+  mDocStateControllerId = 0;
+  mHTMLCommandControllerId = 0;
+}
+
+void nsEditingSession::RemoveWebProgressListener(nsPIDOMWindowOuter* aWindow) {
+  nsIDocShell* docShell = aWindow ? aWindow->GetDocShell() : nullptr;
+  nsCOMPtr<nsIWebProgress> webProgress = do_GetInterface(docShell);
+  if (webProgress) {
+    webProgress->RemoveProgressListener(this);
+    mProgressListenerRegistered = false;
+  }
+}
+
+void nsEditingSession::RestoreAnimationMode(nsPIDOMWindowOuter* aWindow) {
+  if (mInteractive) {
+    return;
+  }
+
+  nsCOMPtr<nsIDocShell> docShell = aWindow ? aWindow->GetDocShell() : nullptr;
+  NS_ENSURE_TRUE_VOID(docShell);
+  RefPtr<PresShell> presShell = docShell->GetPresShell();
+  if (NS_WARN_IF(!presShell)) {
+    return;
+  }
+  nsPresContext* presContext = presShell->GetPresContext();
+  NS_ENSURE_TRUE_VOID(presContext);
+
+  presContext->SetImageAnimationMode(mImageAnimationMode);
+}
+
+nsresult nsEditingSession::DetachFromWindow(nsPIDOMWindowOuter* aWindow) {
+  NS_ENSURE_TRUE(mDoneSetup, NS_OK);
+
+  NS_ASSERTION(mComposerCommandsUpdater,
+               "mComposerCommandsUpdater should exist.");
+
+  if (mLoadBlankDocTimer) {
+    mLoadBlankDocTimer->Cancel();
+    mLoadBlankDocTimer = nullptr;
+  }
+
+  RemoveEditorControllers(aWindow);
+  RemoveWebProgressListener(aWindow);
+  RestoreJS(aWindow->GetCurrentInnerWindow());
+  RestoreAnimationMode(aWindow);
+
+  mDocShell = nullptr;
+
+  return NS_OK;
+}
+
+nsresult nsEditingSession::ReattachToWindow(nsPIDOMWindowOuter* aWindow) {
+  NS_ENSURE_TRUE(mDoneSetup, NS_OK);
+  NS_ENSURE_TRUE(aWindow, NS_ERROR_FAILURE);
+
+  NS_ASSERTION(mComposerCommandsUpdater,
+               "mComposerCommandsUpdater should exist.");
+
+  nsresult rv;
+
+  nsIDocShell* docShell = aWindow->GetDocShell();
+  NS_ENSURE_TRUE(docShell, NS_ERROR_FAILURE);
+  mDocShell = do_GetWeakReference(docShell);
+
+  if (!mInteractive) {
+    rv = DisableJS(aWindow->GetCurrentInnerWindow());
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  mEditorStatus = eEditorCreationInProgress;
+
+  rv = PrepareForEditing(aWindow);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = SetupEditorCommandController(
+      nsBaseCommandController::CreateEditingController, aWindow, this,
+      &mBaseCommandControllerId);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = SetupEditorCommandController(
+      nsBaseCommandController::CreateHTMLEditorDocStateController, aWindow,
+      this, &mDocStateControllerId);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (mComposerCommandsUpdater) {
+    mComposerCommandsUpdater->Init(*aWindow);
+  }
+
+  RefPtr<HTMLEditor> htmlEditor = GetHTMLEditorForWindow(aWindow);
+  if (NS_WARN_IF(!htmlEditor)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (!mInteractive) {
+    RefPtr<PresShell> presShell = docShell->GetPresShell();
+    if (NS_WARN_IF(!presShell)) {
+      return NS_ERROR_FAILURE;
+    }
+    nsPresContext* presContext = presShell->GetPresContext();
+    NS_ENSURE_TRUE(presContext, NS_ERROR_FAILURE);
+
+    mImageAnimationMode = presContext->ImageAnimationMode();
+    presContext->SetImageAnimationMode(imgIContainer::kDontAnimMode);
+  }
+
+  rv = SetupEditorCommandController(
+      nsBaseCommandController::CreateHTMLEditorController, aWindow, htmlEditor,
+      &mHTMLCommandControllerId);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = SetEditorOnControllers(*aWindow, htmlEditor);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+#ifdef DEBUG
+  {
+    bool isEditable;
+    rv = WindowIsEditable(aWindow, &isEditable);
+    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ASSERTION(isEditable,
+                 "Window is not editable after reattaching editor.");
+  }
+#endif  // DEBUG
+
+  return NS_OK;
+}
+
+HTMLEditor* nsIEditingSession::GetHTMLEditorForWindow(
+    mozIDOMWindowProxy* aWindow) {
+  if (NS_WARN_IF(!aWindow)) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIDocShell> docShell =
+      nsPIDOMWindowOuter::From(aWindow)->GetDocShell();
+  if (NS_WARN_IF(!docShell)) {
+    return nullptr;
+  }
+
+  return docShell->GetHTMLEditor();
+}

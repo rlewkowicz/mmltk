@@ -1,0 +1,326 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/JitOptions.h"
+
+#include <bit>
+#include <cstdlib>
+#include <type_traits>
+
+#include "vm/JSScript.h"
+
+using namespace js;
+using namespace js::jit;
+
+using mozilla::Maybe;
+
+namespace js {
+namespace jit {
+
+MOZ_RUNINIT DefaultJitOptions JitOptions;
+
+static void Warn(const char* env, const char* value) {
+  fprintf(stderr, "Warning: I didn't understand %s=\"%s\"\n", env, value);
+}
+
+static Maybe<int> ParseInt(const char* str) {
+  char* endp;
+  int retval = strtol(str, &endp, 0);
+  if (*endp == '\0') {
+    return mozilla::Some(retval);
+  }
+  return mozilla::Nothing();
+}
+
+template <typename T>
+T overrideDefault(const char* param, T dflt) {
+  char* str = getenv(param);
+  if (!str) {
+    return dflt;
+  }
+  if constexpr (std::is_same_v<T, bool>) {
+    if (strcmp(str, "true") == 0 || strcmp(str, "yes") == 0) {
+      return true;
+    }
+    if (strcmp(str, "false") == 0 || strcmp(str, "no") == 0) {
+      return false;
+    }
+    Warn(param, str);
+  } else {
+    Maybe<int> value = ParseInt(str);
+    if (value.isSome()) {
+      return value.ref();
+    }
+    Warn(param, str);
+  }
+  return dflt;
+}
+
+#define SET_DEFAULT(var, dflt) var = overrideDefault("JIT_OPTION_" #var, dflt)
+DefaultJitOptions::DefaultJitOptions() {
+  SET_DEFAULT(checkGraphConsistency, true);
+
+#ifdef CHECK_OSIPOINT_REGISTERS
+  SET_DEFAULT(checkOsiPointRegisters, false);
+#endif
+
+  SET_DEFAULT(checkRangeAnalysis, false);
+
+  SET_DEFAULT(disableEaa, false);
+
+  SET_DEFAULT(disableEdgeCaseAnalysis, false);
+
+  SET_DEFAULT(disableGvn, false);
+
+  SET_DEFAULT(disableInlining, false);
+
+  SET_DEFAULT(disableLicm, false);
+
+  SET_DEFAULT(disablePruning, false);
+
+  SET_DEFAULT(disableIteratorIndices, false);
+
+  SET_DEFAULT(disableInstructionReordering, false);
+
+  SET_DEFAULT(disableMarkLoadsUsedAsPropertyKeys, false);
+
+  SET_DEFAULT(disableRangeAnalysis, false);
+
+  SET_DEFAULT(disableRecoverIns, false);
+
+  SET_DEFAULT(disableScalarReplacement, false);
+
+  SET_DEFAULT(disableCacheIR, false);
+
+  SET_DEFAULT(disableStubFolding, false);
+
+  SET_DEFAULT(disableStubFoldingLoadsAndStores, false);
+
+  SET_DEFAULT(disableRedundantShapeGuards, false);
+
+  SET_DEFAULT(disableRedundantGCBarriers, false);
+
+  SET_DEFAULT(disableBailoutLoopCheck, false);
+
+  SET_DEFAULT(baselineInterpreter, true);
+
+  SET_DEFAULT(disableObjectKeysScalarReplacement, false);
+
+  SET_DEFAULT(disableCanonicalizeNaNAtUses, true);
+
+#ifdef ENABLE_PORTABLE_BASELINE_INTERP
+  SET_DEFAULT(portableBaselineInterpreter, false);
+#endif
+
+#ifdef ENABLE_PORTABLE_BASELINE_INTERP_FORCE
+  SET_DEFAULT(portableBaselineInterpreter, true);
+  SET_DEFAULT(portableBaselineInterpreterWarmUpThreshold, 0);
+#endif
+
+  bool perfEnabled = !!getenv("IONPERF");
+  SET_DEFAULT(emitInterpreterEntryTrampoline, perfEnabled);
+  SET_DEFAULT(enableICFramePointers, perfEnabled);
+
+  SET_DEFAULT(baselineJit, true);
+
+  SET_DEFAULT(ion, true);
+
+  SET_DEFAULT(jitForTrustedPrincipals, false);
+
+  SET_DEFAULT(nativeRegExp, true);
+
+  SET_DEFAULT(baselineBatching, false);
+
+  SET_DEFAULT(forceInlineCaches, false);
+
+  SET_DEFAULT(forceMegamorphicICs, false);
+
+  SET_DEFAULT(limitScriptSize, true);
+
+  SET_DEFAULT(osr, true);
+
+  SET_DEFAULT(disableJitBackend, false);
+
+  SET_DEFAULT(runExtraChecks, false);
+
+#ifdef ENABLE_JS_AOT_ICS
+  SET_DEFAULT(enableAOTICs, false);
+  SET_DEFAULT(enableAOTICEnforce, false);
+#endif
+
+#ifdef ENABLE_JS_AOT_ICS_FORCE
+  SET_DEFAULT(enableAOTICs, true);
+#endif
+
+#ifdef ENABLE_JS_AOT_ICS_ENFORCE
+  SET_DEFAULT(enableAOTICs, true);
+  SET_DEFAULT(enableAOTICEnforce, true);
+#endif
+
+  SET_DEFAULT(baselineInterpreterWarmUpThreshold, 10);
+
+#ifdef ENABLE_PORTABLE_BASELINE_INTERP
+  SET_DEFAULT(portableBaselineInterpreterWarmUpThreshold, 10);
+#endif
+
+  SET_DEFAULT(baselineJitWarmUpThreshold, 100);
+
+  SET_DEFAULT(baselineQueueCapacity, 8);
+
+  SET_DEFAULT(disableJitHints, false);
+
+  SET_DEFAULT(trialInliningWarmUpThreshold, 500);
+
+  SET_DEFAULT(trialInliningInitialWarmUpCount, 250);
+
+  SET_DEFAULT(normalIonWarmUpThreshold, 1500);
+
+  SET_DEFAULT(regexpWarmUpThreshold, 10);
+
+  SET_DEFAULT(exceptionBailoutThreshold, 10);
+
+  SET_DEFAULT(frequentBailoutThreshold, 10);
+
+  SET_DEFAULT(fullDebugChecks, true);
+
+  SET_DEFAULT(maxStackArgs, 20'000);
+
+  SET_DEFAULT(osrPcMismatchesBeforeRecompile, 6000);
+
+  SET_DEFAULT(smallFunctionMaxBytecodeLength, 140);
+
+  SET_DEFAULT(inliningEntryThreshold, 95);
+
+  SET_DEFAULT(jumpThreshold, UINT32_MAX);
+
+  SET_DEFAULT(branchPruningHitCountFactor, 1);
+  SET_DEFAULT(branchPruningInstFactor, 10);
+  SET_DEFAULT(branchPruningBlockSpanFactor, 100);
+  SET_DEFAULT(branchPruningEffectfulInstFactor, 3500);
+  SET_DEFAULT(branchPruningThreshold, 4000);
+
+  SET_DEFAULT(ionMaxScriptSize, 100 * 1000);
+  SET_DEFAULT(ionMaxScriptSizeMainThread, 2 * 1000);
+  SET_DEFAULT(ionMaxLocalsAndArgs, 10 * 1000);
+  SET_DEFAULT(ionMaxLocalsAndArgsMainThread, 256);
+
+  SET_DEFAULT(spectreIndexMasking, false);
+  SET_DEFAULT(spectreObjectMitigations, false);
+  SET_DEFAULT(spectreStringMitigations, false);
+  SET_DEFAULT(spectreValueMasking, false);
+  SET_DEFAULT(spectreJitToCxxCalls, false);
+
+#ifdef JS_USE_APPLE_FAST_WX
+  SET_DEFAULT(writeProtectCode, false);
+#else
+  SET_DEFAULT(writeProtectCode, true);
+#endif
+
+  SET_DEFAULT(supportsUnalignedAccesses, false);
+
+#if defined(JS_CODEGEN_X86) || defined(JS_CODEGEN_X64)
+  baseRegForLocals = BaseRegForAddress::FP;
+#else
+  baseRegForLocals = BaseRegForAddress::SP;
+#endif
+
+  SET_DEFAULT(wasmFoldOffsets, true);
+
+  SET_DEFAULT(wasmDelayTier2, false);
+
+  SET_DEFAULT(wasmBatchBaselineThreshold, 25000);
+  SET_DEFAULT(wasmBatchIonThreshold, 1100);
+
+  SET_DEFAULT(lessDebugCode, false);
+
+  SET_DEFAULT(onlyInlineSelfHosted, false);
+
+  SET_DEFAULT(enableWasmJitExit, true);
+  SET_DEFAULT(enableWasmJitEntry, true);
+  SET_DEFAULT(enableWasmIonFastCalls, true);
+#ifdef WASM_CODEGEN_DEBUG
+  SET_DEFAULT(enableWasmImportCallSpew, false);
+  SET_DEFAULT(enableWasmFuncCallSpew, false);
+#endif
+
+  SET_DEFAULT(regexp_tier_up, true);
+
+  SET_DEFAULT(trace_regexp_parser, false);
+  SET_DEFAULT(trace_regexp_assembler, false);
+  SET_DEFAULT(trace_regexp_compiler, false);
+  SET_DEFAULT(trace_regexp_graph_building, false);
+  SET_DEFAULT(trace_regexp_bytecodes, false);
+  SET_DEFAULT(trace_regexp_peephole_optimization, false);
+  SET_DEFAULT(log_colour, false);
+
+
+  SET_DEFAULT(js_regexp_modifiers, true);
+  SET_DEFAULT(js_regexp_duplicate_named_groups, true);
+  SET_DEFAULT(js_regexp_buffer_boundaries, false);
+  SET_DEFAULT(correctness_fuzzer_suppressions, false);
+  SET_DEFAULT(enable_regexp_unaligned_accesses, false);
+  SET_DEFAULT(regexp_possessive_quantifier, false);
+  SET_DEFAULT(regexp_optimization, true);
+  SET_DEFAULT(regexp_quick_check, true);
+  SET_DEFAULT(regexp_unroll, true);
+  SET_DEFAULT(regexp_bytecode_analysis, false);
+  SET_DEFAULT(trace_regexp_bytecode_analysis, false);
+  SET_DEFAULT(enable_slow_asserts, true);
+  SET_DEFAULT(regexp_peephole_optimization,
+              std::endian::native == std::endian::little);
+}
+
+bool DefaultJitOptions::isSmallFunction(JSScript* script) const {
+  return script->length() <= smallFunctionMaxBytecodeLength;
+}
+
+void DefaultJitOptions::enableGvn(bool enable) { disableGvn = !enable; }
+
+#ifdef ENABLE_PORTABLE_BASELINE_INTERP
+void DefaultJitOptions::setEagerPortableBaselineInterpreter() {
+  portableBaselineInterpreterWarmUpThreshold = 0;
+}
+#endif
+
+void DefaultJitOptions::setEagerBaselineCompilation() {
+  baselineInterpreterWarmUpThreshold = 0;
+  baselineJitWarmUpThreshold = 0;
+  regexpWarmUpThreshold = 0;
+}
+
+void DefaultJitOptions::setEagerIonCompilation() {
+  setEagerBaselineCompilation();
+  normalIonWarmUpThreshold = 0;
+}
+
+void DefaultJitOptions::setFastWarmUp() {
+  baselineInterpreterWarmUpThreshold = 4;
+  baselineJitWarmUpThreshold = 10;
+  trialInliningWarmUpThreshold = 14;
+  trialInliningInitialWarmUpCount = 12;
+  normalIonWarmUpThreshold = 30;
+
+  inliningEntryThreshold = 2;
+  smallFunctionMaxBytecodeLength = 2000;
+}
+
+void DefaultJitOptions::setNormalIonWarmUpThreshold(uint32_t warmUpThreshold) {
+  normalIonWarmUpThreshold = warmUpThreshold;
+}
+
+void DefaultJitOptions::resetNormalIonWarmUpThreshold() {
+  jit::DefaultJitOptions defaultValues;
+  setNormalIonWarmUpThreshold(defaultValues.normalIonWarmUpThreshold);
+}
+
+void DefaultJitOptions::maybeSetWriteProtectCode(bool val) {
+#ifdef JS_USE_APPLE_FAST_WX
+  MOZ_ASSERT(!writeProtectCode);
+#else
+  writeProtectCode = val;
+#endif
+}
+
+}  
+}  

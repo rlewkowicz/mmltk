@@ -1,0 +1,1077 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "AOMDecoder.h"
+#include "mozilla/ScopeExit.h"
+
+#include <aom/aom_image.h>
+#include <aom/aomdx.h>
+#include <stdint.h>
+
+#include <algorithm>
+
+#include "BitReader.h"
+#include "BitWriter.h"
+#include "BufferReader.h"
+#include "ImageContainer.h"
+#include "MediaResult.h"
+#include "TimeUnits.h"
+#include "VideoUtils.h"
+#include "gfx2DGlue.h"
+#include "gfxUtils.h"
+#include "mozilla/PodOperations.h"
+#include "mozilla/SyncRunnable.h"
+#include "mozilla/TaskQueue.h"
+#include "nsError.h"
+#include "nsThreadUtils.h"
+#include "prsystem.h"
+
+#undef LOG
+#define LOG(arg, ...)                                                      \
+  DDMOZ_LOG_FMT(sPDMLog, mozilla::LogLevel::Debug, "::{}: " arg, __func__, \
+                ##__VA_ARGS__)
+#define LOG_RESULT(code, message, ...)                   \
+  DDMOZ_LOG_FMT(sPDMLog, mozilla::LogLevel::Debug,       \
+                "::{}: {} (code {}) " message, __func__, \
+                aom_codec_err_to_string(code), (int)code, ##__VA_ARGS__)
+#define LOGEX_RESULT(_this, code, message, ...)             \
+  DDMOZ_LOGEX_FMT(_this, sPDMLog, mozilla::LogLevel::Debug, \
+                  "::{}: {} (code {}) " message, __func__,  \
+                  aom_codec_err_to_string(code), (int)code, ##__VA_ARGS__)
+#define LOG_STATIC_RESULT(code, message, ...)                    \
+  MOZ_LOG_FMT(sPDMLog, mozilla::LogLevel::Debug,                 \
+              "AOMDecoder::{}: {} (code {}) " message, __func__, \
+              aom_codec_err_to_string(code), (int)code, ##__VA_ARGS__)
+
+#define ASSERT_BYTE_ALIGNED(bitIO) MOZ_ASSERT((bitIO).BitCount() % 8 == 0)
+
+namespace mozilla {
+
+using namespace gfx;
+using namespace layers;
+using gfx::CICP::ColourPrimaries;
+using gfx::CICP::MatrixCoefficients;
+using gfx::CICP::TransferCharacteristics;
+
+static MediaResult InitContext(AOMDecoder& aAOMDecoder, aom_codec_ctx_t* aCtx,
+                               const VideoInfo& aInfo) {
+  aom_codec_iface_t* dx = aom_codec_av1_dx();
+  if (!dx) {
+    return MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
+                       RESULT_DETAIL("Couldn't get AV1 decoder interface."));
+  }
+
+  size_t decode_threads = 2;
+  if (aInfo.mDisplay.width >= 2048) {
+    decode_threads = 8;
+  } else if (aInfo.mDisplay.width >= 1024) {
+    decode_threads = 4;
+  }
+  decode_threads = std::min(decode_threads, GetNumberOfProcessors());
+
+  aom_codec_dec_cfg_t config;
+  PodZero(&config);
+  config.threads = static_cast<unsigned int>(decode_threads);
+  config.w = config.h = 0;  
+  config.allow_lowbitdepth = true;
+
+  aom_codec_flags_t flags = 0;
+
+  auto res = aom_codec_dec_init(aCtx, dx, &config, flags);
+  if (res != AOM_CODEC_OK) {
+    LOGEX_RESULT(&aAOMDecoder, res, "Codec initialization failed, res={}",
+                 int(res));
+    return MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
+                       RESULT_DETAIL("AOM error initializing AV1 decoder: %s",
+                                     aom_codec_err_to_string(res)));
+  }
+  return NS_OK;
+}
+
+AOMDecoder::AOMDecoder(const CreateDecoderParams& aParams)
+    : mImageContainer(aParams.mImageContainer),
+      mTaskQueue(TaskQueue::Create(
+          GetMediaThreadPool(MediaThreadType::PLATFORM_DECODER), "AOMDecoder")),
+      mInfo(aParams.VideoConfig()),
+      mTrackingId(aParams.mTrackingId) {
+  PodZero(&mCodec);
+}
+
+AOMDecoder::~AOMDecoder() = default;
+
+RefPtr<ShutdownPromise> AOMDecoder::Shutdown() {
+  RefPtr<AOMDecoder> self = this;
+  return InvokeAsync(mTaskQueue, __func__, [self]() {
+    auto res = aom_codec_destroy(&self->mCodec);
+    if (res != AOM_CODEC_OK) {
+      LOGEX_RESULT(self.get(), res, "aom_codec_destroy");
+    }
+    return self->mTaskQueue->BeginShutdown();
+  });
+}
+
+RefPtr<MediaDataDecoder::InitPromise> AOMDecoder::Init() {
+  MediaResult rv = InitContext(*this, &mCodec, mInfo);
+  if (NS_FAILED(rv)) {
+    return AOMDecoder::InitPromise::CreateAndReject(rv, __func__);
+  }
+  return AOMDecoder::InitPromise::CreateAndResolve(TrackInfo::kVideoTrack,
+                                                   __func__);
+}
+
+RefPtr<MediaDataDecoder::FlushPromise> AOMDecoder::Flush() {
+  return InvokeAsync(mTaskQueue, __func__, [this, self = RefPtr(this)]() {
+    mPerformanceRecorder.Record(std::numeric_limits<int64_t>::max());
+    return FlushPromise::CreateAndResolve(true, __func__);
+  });
+}
+
+struct AomImageFree {
+  void operator()(aom_image_t* img) { aom_img_free(img); }
+};
+
+RefPtr<MediaDataDecoder::DecodePromise> AOMDecoder::ProcessDecode(
+    MediaRawData* aSample) {
+  MOZ_ASSERT(mTaskQueue->IsCurrentThreadIn());
+
+#if defined(DEBUG)
+  NS_ASSERTION(
+      IsKeyframe(*aSample) == aSample->mKeyframe,
+      "AOM Decode Keyframe error sample->mKeyframe and si.si_kf out of sync");
+#endif
+
+  MediaInfoFlag flag = MediaInfoFlag::None;
+  flag |= (aSample->mKeyframe ? MediaInfoFlag::KeyFrame
+                              : MediaInfoFlag::NonKeyFrame);
+  flag |= MediaInfoFlag::SoftwareDecoding;
+  flag |= MediaInfoFlag::VIDEO_AV1;
+
+  mTrackingId.apply([&](const auto& aId) {
+    mPerformanceRecorder.Start(aSample->mTimecode.ToMicroseconds(),
+                               "AOMDecoder"_ns, aId, flag);
+  });
+
+  if (aom_codec_err_t r = aom_codec_decode(&mCodec, aSample->Data(),
+                                           aSample->Size(), nullptr)) {
+    LOG_RESULT(r, "Decode error!");
+    return DecodePromise::CreateAndReject(
+        MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
+                    RESULT_DETAIL("AOM error decoding AV1 sample: %s",
+                                  aom_codec_err_to_string(r))),
+        __func__);
+  }
+
+  aom_codec_iter_t iter = nullptr;
+  aom_image_t* img;
+  UniquePtr<aom_image_t, AomImageFree> img8;
+  DecodedData results;
+
+  while ((img = aom_codec_get_frame(&mCodec, &iter))) {
+    NS_ASSERTION(
+        img->fmt == AOM_IMG_FMT_I420 || img->fmt == AOM_IMG_FMT_I42016 ||
+            img->fmt == AOM_IMG_FMT_I444 || img->fmt == AOM_IMG_FMT_I44416,
+        "AV1 image format not I420 or I444");
+
+    VideoData::YCbCrBuffer b;
+    b.mPlanes[0].mData = img->planes[0];
+    b.mPlanes[0].mStride = img->stride[0];
+    b.mPlanes[0].mHeight = img->d_h;
+    b.mPlanes[0].mWidth = img->d_w;
+    b.mPlanes[0].mSkip = 0;
+
+    b.mPlanes[1].mData = img->planes[1];
+    b.mPlanes[1].mStride = img->stride[1];
+    b.mPlanes[1].mSkip = 0;
+
+    b.mPlanes[2].mData = img->planes[2];
+    b.mPlanes[2].mStride = img->stride[2];
+    b.mPlanes[2].mSkip = 0;
+
+    if (img->fmt == AOM_IMG_FMT_I420 || img->fmt == AOM_IMG_FMT_I42016) {
+      b.mChromaSubsampling = gfx::ChromaSubsampling::HALF_WIDTH_AND_HEIGHT;
+
+      b.mPlanes[1].mHeight = (img->d_h + 1) >> img->y_chroma_shift;
+      b.mPlanes[1].mWidth = (img->d_w + 1) >> img->x_chroma_shift;
+
+      b.mPlanes[2].mHeight = (img->d_h + 1) >> img->y_chroma_shift;
+      b.mPlanes[2].mWidth = (img->d_w + 1) >> img->x_chroma_shift;
+    } else if (img->fmt == AOM_IMG_FMT_I444 || img->fmt == AOM_IMG_FMT_I44416) {
+      b.mPlanes[1].mHeight = img->d_h;
+      b.mPlanes[1].mWidth = img->d_w;
+
+      b.mPlanes[2].mHeight = img->d_h;
+      b.mPlanes[2].mWidth = img->d_w;
+    } else {
+      LOG("AOM Unknown image format");
+      return DecodePromise::CreateAndReject(
+          MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
+                      RESULT_DETAIL("AOM Unknown image format")),
+          __func__);
+    }
+
+    if (img->bit_depth == 10) {
+      b.mColorDepth = ColorDepth::COLOR_10;
+    } else if (img->bit_depth == 12) {
+      b.mColorDepth = ColorDepth::COLOR_12;
+    }
+
+    switch (img->mc) {
+      case AOM_CICP_MC_BT_601:
+        b.mYUVColorSpace = YUVColorSpace::BT601;
+        break;
+      case AOM_CICP_MC_BT_2020_NCL:
+      case AOM_CICP_MC_BT_2020_CL:
+        b.mYUVColorSpace = YUVColorSpace::BT2020;
+        break;
+      case AOM_CICP_MC_BT_709:
+        b.mYUVColorSpace = YUVColorSpace::BT709;
+        break;
+      default:
+        b.mYUVColorSpace = DefaultColorSpace({img->d_w, img->d_h});
+        break;
+    }
+    b.mColorRange = img->range == AOM_CR_FULL_RANGE ? ColorRange::FULL
+                                                    : ColorRange::LIMITED;
+
+    switch (img->cp) {
+      case AOM_CICP_CP_BT_709:
+        b.mColorPrimaries = ColorSpace2::BT709;
+        break;
+      case AOM_CICP_CP_BT_2020:
+        b.mColorPrimaries = ColorSpace2::BT2020;
+        break;
+      default:
+        b.mColorPrimaries = ColorSpace2::BT709;
+        break;
+    }
+
+    Result<already_AddRefed<VideoData>, MediaResult> r =
+        VideoData::CreateAndCopyData(
+            mInfo, mImageContainer, aSample->mOffset, aSample->mTime,
+            aSample->mDuration, b, aSample->mKeyframe, aSample->mTimecode,
+            mInfo.ScaledImageRect(img->d_w, img->d_h), nullptr);
+
+    if (r.isErr()) {
+      MediaResult rs = r.unwrapErr();
+      LOG("VideoData::CreateAndCopyData error (source {}x{} display {}x{} "
+          "picture {}x{})  - {}: {}",
+          img->d_w, img->d_h, mInfo.mDisplay.width, mInfo.mDisplay.height,
+          mInfo.mImage.width, mInfo.mImage.height, rs.ErrorName().get(),
+          rs.Message().get());
+
+      return DecodePromise::CreateAndReject(std::move(rs), __func__);
+    }
+
+    RefPtr<VideoData> v = r.unwrap();
+    MOZ_ASSERT(v);
+
+    mPerformanceRecorder.Record(
+        aSample->mTimecode.ToMicroseconds(), [&](DecodeStage& aStage) {
+          aStage.SetResolution(mInfo.mImage.width, mInfo.mImage.height);
+          auto format = [&]() -> Maybe<DecodeStage::ImageFormat> {
+            switch (img->fmt) {
+              case AOM_IMG_FMT_I420:
+              case AOM_IMG_FMT_I42016:
+                return Some(DecodeStage::YUV420P);
+              case AOM_IMG_FMT_I444:
+              case AOM_IMG_FMT_I44416:
+                return Some(DecodeStage::YUV444P);
+              default:
+                return Nothing();
+            }
+          }();
+          format.apply([&](auto& aFmt) { aStage.SetImageFormat(aFmt); });
+          aStage.SetYUVColorSpace(b.mYUVColorSpace);
+          aStage.SetColorRange(b.mColorRange);
+          aStage.SetColorDepth(b.mColorDepth);
+          aStage.SetStartTimeAndEndTime(v->mTime.ToMicroseconds(),
+                                        v->GetEndTime().ToMicroseconds());
+        });
+    results.AppendElement(std::move(v));
+  }
+  return DecodePromise::CreateAndResolve(std::move(results), __func__);
+}
+
+RefPtr<MediaDataDecoder::DecodePromise> AOMDecoder::Decode(
+    MediaRawData* aSample) {
+  return InvokeAsync<MediaRawData*>(mTaskQueue, this, __func__,
+                                    &AOMDecoder::ProcessDecode, aSample);
+}
+
+RefPtr<MediaDataDecoder::DecodePromise> AOMDecoder::Drain() {
+  return InvokeAsync(mTaskQueue, __func__, [] {
+    return DecodePromise::CreateAndResolve(DecodedData(), __func__);
+  });
+}
+
+bool AOMDecoder::IsAV1(const nsACString& aMimeType) {
+  return aMimeType.EqualsLiteral("video/av1");
+}
+
+bool AOMDecoder::IsMainProfile(const MediaByteBuffer* aBox) {
+  if (!aBox || aBox->IsEmpty()) {
+    return false;
+  }
+  AV1SequenceInfo av1Info;
+  MediaResult seqHdrResult;
+  TryReadAV1CBox(aBox, av1Info, seqHdrResult);
+  return seqHdrResult.Code() == NS_OK && av1Info.mProfile == 0;
+}
+
+bool AOMDecoder::IsKeyframe(Span<const uint8_t> aBuffer) {
+  aom_codec_stream_info_t info;
+  PodZero(&info);
+
+  auto res = aom_codec_peek_stream_info(aom_codec_av1_dx(), aBuffer.Elements(),
+                                        aBuffer.Length(), &info);
+  if (res != AOM_CODEC_OK) {
+    LOG_STATIC_RESULT(
+        res, "couldn't get keyframe flag with aom_codec_peek_stream_info");
+    return false;
+  }
+
+  return bool(info.is_kf);
+}
+
+gfx::IntSize AOMDecoder::GetFrameSize(Span<const uint8_t> aBuffer) {
+  aom_codec_stream_info_t info;
+  PodZero(&info);
+
+  auto res = aom_codec_peek_stream_info(aom_codec_av1_dx(), aBuffer.Elements(),
+                                        aBuffer.Length(), &info);
+  if (res != AOM_CODEC_OK) {
+    LOG_STATIC_RESULT(
+        res, "couldn't get frame size with aom_codec_peek_stream_info");
+  }
+
+  return gfx::IntSize(info.w, info.h);
+}
+
+AOMDecoder::OBUIterator AOMDecoder::ReadOBUs(const Span<const uint8_t>& aData) {
+  return OBUIterator(aData);
+}
+
+void AOMDecoder::OBUIterator::UpdateNext() {
+  if (!mGoNext) {
+    return;
+  }
+  if (mPosition >= mData.Length()) {
+    return;
+  }
+  mGoNext = false;
+
+  auto resetExit = MakeScopeExit([&]() {
+    mCurrent = OBUInfo();
+    mPosition = mData.Length();
+  });
+
+  auto subspan = mData.Subspan(mPosition, mData.Length() - mPosition);
+  BitReader br(subspan.Elements(), subspan.Length() * 8);
+  OBUInfo temp;
+
+
+
+  br.ReadBit();  
+  temp.mType = static_cast<OBUType>(br.ReadBits(4));
+  if (!temp.IsValid()) {
+    NS_WARNING(nsPrintfCString("Encountered unknown OBU type (%" PRIu8
+                               ", OBU may be invalid",
+                               static_cast<uint8_t>(temp.mType))
+                   .get());
+  }
+  temp.mExtensionFlag = br.ReadBit();
+  bool hasSizeField = br.ReadBit();
+  br.ReadBit();  
+
+  if (temp.mExtensionFlag) {
+    if (br.BitsLeft() < 8) {
+      mResult = MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
+                            "Not enough bits left for an OBU extension header");
+      return;
+    }
+    br.ReadBits(3);  
+    br.ReadBits(2);  
+    br.ReadBits(3);  
+  }
+
+  size_t size;
+  if (hasSizeField) {
+    if (br.BitsLeft() < 8) {
+      mResult = MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
+                            "Not enough bits left for an OBU size field");
+      return;
+    }
+    CheckedUint32 checkedSize = br.ReadULEB128().toChecked<uint32_t>();
+    if (!checkedSize.isValid()) {
+      mResult =
+          MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR, "OBU size was too large");
+      return;
+    }
+    size = checkedSize.value();
+  } else {
+    size = mData.Length() - 1 - temp.mExtensionFlag;
+  }
+
+  if (br.BitsLeft() / 8 < size) {
+    mResult = MediaResult(
+        NS_ERROR_DOM_MEDIA_DECODE_ERR,
+        nsPrintfCString("Size specified by the OBU header (%zu) is more "
+                        "than the actual remaining OBU data (%zu)",
+                        size, br.BitsLeft() / 8)
+            .get());
+    return;
+  }
+
+  ASSERT_BYTE_ALIGNED(br);
+
+  size_t bytes = br.BitCount() / 8;
+  temp.mContents = mData.Subspan(mPosition + bytes, size);
+  mCurrent = temp;
+
+  mPosition += bytes + size;
+  resetExit.release();
+  mResult = NS_OK;
+}
+
+already_AddRefed<MediaByteBuffer> AOMDecoder::CreateOBU(
+    const OBUType aType, const Span<const uint8_t>& aContents) {
+  RefPtr<MediaByteBuffer> buffer = new MediaByteBuffer();
+
+  BitWriter bw(buffer);
+  bw.WriteBits(0, 1);  
+  bw.WriteBits(static_cast<uint8_t>(aType), 4);
+  bw.WriteBit(false);  
+  bw.WriteBit(true);   
+  bw.WriteBits(0, 1);  
+  ASSERT_BYTE_ALIGNED(bw);
+  bw.WriteULEB128(aContents.Length());
+  ASSERT_BYTE_ALIGNED(bw);
+
+  buffer->AppendElements(aContents.Elements(), aContents.Length());
+  return buffer.forget();
+}
+
+MediaResult AOMDecoder::ReadSequenceHeaderInfo(
+    const Span<const uint8_t>& aSample, AV1SequenceInfo& aDestInfo) {
+  OBUIterator iter = ReadOBUs(aSample);
+  OBUInfo seqOBU;
+
+  while (true) {
+    if (!iter.HasNext()) {
+      MediaResult result = iter.GetResult();
+      if (result.Code() != NS_OK) {
+        return result;
+      }
+      break;
+    }
+    OBUInfo obu = iter.Next();
+    if (obu.mType == OBUType::SequenceHeader) {
+      seqOBU = obu;
+    }
+  }
+
+  if (seqOBU.mType != OBUType::SequenceHeader) {
+    return NS_ERROR_DOM_MEDIA_WAITING_FOR_DATA;
+  }
+
+
+  BitReader br(seqOBU.mContents.Elements(), seqOBU.mContents.Length() * 8);
+  AV1SequenceInfo tempInfo;
+
+  tempInfo.mProfile = br.ReadBits(3);
+  const bool still_picture = br.ReadBit();
+  const bool reduced_still_picture_header = br.ReadBit();
+  if (!still_picture && reduced_still_picture_header) {
+    return MediaResult(
+        NS_ERROR_DOM_MEDIA_DECODE_ERR,
+        "reduced_still_picture is true while still_picture is false");
+  }
+
+  if (reduced_still_picture_header) {
+    OperatingPoint op;
+    op.mLayers = 0;
+    op.mLevel = br.ReadBits(5);  
+    op.mTier = 0;
+    tempInfo.mOperatingPoints.SetCapacity(1);
+    tempInfo.mOperatingPoints.AppendElement(op);
+  } else {
+    bool decoder_model_info_present_flag;
+    uint8_t operating_points_cnt_minus_1;
+    uint8_t buffer_delay_length_minus_1;
+    if (br.ReadBit()) {  
+      br.ReadBits(32);     
+      br.ReadBits(32);     
+      if (br.ReadBit()) {  
+        br.ReadUE();       
+      }
+
+      decoder_model_info_present_flag = br.ReadBit();
+      if (decoder_model_info_present_flag) {
+        buffer_delay_length_minus_1 = br.ReadBits(5);
+        br.ReadBits(32);  
+        br.ReadBits(5);   
+        br.ReadBits(5);   
+      }
+    } else {
+      decoder_model_info_present_flag = false;
+    }
+
+    bool initial_display_delay_present_flag = br.ReadBit();
+    operating_points_cnt_minus_1 = br.ReadBits(5);
+    tempInfo.mOperatingPoints.SetCapacity(operating_points_cnt_minus_1 + 1);
+    for (uint8_t i = 0; i <= operating_points_cnt_minus_1; i++) {
+      OperatingPoint op;
+      op.mLayers = br.ReadBits(12);  
+      op.mLevel = br.ReadBits(5);    
+      op.mTier = op.mLevel > 7 ? br.ReadBits(1) : 0;
+      if (decoder_model_info_present_flag) {
+        if (br.ReadBit()) {  
+          uint8_t n = buffer_delay_length_minus_1 + 1;
+          br.ReadBits(n);  
+          br.ReadBits(n);  
+          br.ReadBit();    
+        }
+      }
+      if (initial_display_delay_present_flag) {
+        if (br.ReadBit()) {  
+          br.ReadBits(4);    
+        }
+      }
+      tempInfo.mOperatingPoints.AppendElement(op);
+    }
+  }
+
+  uint8_t frame_width_bits_minus_1 = br.ReadBits(4);
+  uint8_t frame_height_bits_minus_1 = br.ReadBits(4);
+  uint32_t max_frame_width_minus_1 = br.ReadBits(frame_width_bits_minus_1 + 1);
+  uint32_t max_frame_height_minus_1 =
+      br.ReadBits(frame_height_bits_minus_1 + 1);
+  tempInfo.mImage =
+      gfx::IntSize(max_frame_width_minus_1 + 1, max_frame_height_minus_1 + 1);
+
+  if (!reduced_still_picture_header) {
+    if (br.ReadBit()) {  
+      br.ReadBits(4);    
+      br.ReadBits(3);    
+    }
+  }
+
+  br.ReadBit();  
+  br.ReadBit();  
+  br.ReadBit();  
+
+  if (reduced_still_picture_header) {
+  } else {
+    br.ReadBit();  
+    br.ReadBit();  
+    br.ReadBit();  
+    br.ReadBit();  
+
+    const bool enable_order_hint = br.ReadBit();
+    if (enable_order_hint) {
+      br.ReadBit();  
+      br.ReadBit();  
+    }
+
+    uint8_t seq_choose_screen_content_tools = br.ReadBit();
+    if (seq_choose_screen_content_tools) {
+      seq_choose_screen_content_tools = 2;  
+    } else {
+      seq_choose_screen_content_tools = br.ReadBits(1);
+    }
+    if (seq_choose_screen_content_tools > 0) {
+      if (!br.ReadBit()) {  
+        br.ReadBit();       
+      }
+    }
+
+    if (enable_order_hint) {
+      br.ReadBits(3);  
+    }
+  }
+
+  br.ReadBit();  
+  br.ReadBit();  
+  br.ReadBit();  
+
+  const bool highBitDepth = br.ReadBit();
+  if (tempInfo.mProfile == 2 && highBitDepth) {
+    const bool twelveBit = br.ReadBit();
+    tempInfo.mBitDepth = twelveBit ? 12 : 10;
+  } else {
+    tempInfo.mBitDepth = highBitDepth ? 10 : 8;
+  }
+
+  tempInfo.mMonochrome = tempInfo.mProfile == 1 ? false : br.ReadBit();
+
+  VideoColorSpace* colors = &tempInfo.mColorSpace;
+
+  if (br.ReadBit()) {  
+    colors->mPrimaries = static_cast<ColourPrimaries>(br.ReadBits(8));
+    colors->mTransfer = static_cast<TransferCharacteristics>(br.ReadBits(8));
+    colors->mMatrix = static_cast<MatrixCoefficients>(br.ReadBits(8));
+  } else {
+    colors->mPrimaries = ColourPrimaries::CP_UNSPECIFIED;
+    colors->mTransfer = TransferCharacteristics::TC_UNSPECIFIED;
+    colors->mMatrix = MatrixCoefficients::MC_UNSPECIFIED;
+  }
+
+  if (tempInfo.mMonochrome) {
+    colors->mRange = br.ReadBit() ? ColorRange::FULL : ColorRange::LIMITED;
+    tempInfo.mSubsamplingX = true;
+    tempInfo.mSubsamplingY = true;
+    tempInfo.mChromaSamplePosition = ChromaSamplePosition::Unknown;
+  } else if (colors->mPrimaries == ColourPrimaries::CP_BT709 &&
+             colors->mTransfer == TransferCharacteristics::TC_SRGB &&
+             colors->mMatrix == MatrixCoefficients::MC_IDENTITY) {
+    colors->mRange = ColorRange::FULL;
+    tempInfo.mSubsamplingX = false;
+    tempInfo.mSubsamplingY = false;
+  } else {
+    colors->mRange = br.ReadBit() ? ColorRange::FULL : ColorRange::LIMITED;
+    switch (tempInfo.mProfile) {
+      case 0:
+        tempInfo.mSubsamplingX = true;
+        tempInfo.mSubsamplingY = true;
+        break;
+      case 1:
+        tempInfo.mSubsamplingX = false;
+        tempInfo.mSubsamplingY = false;
+        break;
+      case 2:
+        if (tempInfo.mBitDepth == 12) {
+          tempInfo.mSubsamplingX = br.ReadBit();
+          tempInfo.mSubsamplingY =
+              tempInfo.mSubsamplingX ? br.ReadBit() : false;
+        } else {
+          tempInfo.mSubsamplingX = true;
+          tempInfo.mSubsamplingY = false;
+        }
+        break;
+    }
+    tempInfo.mChromaSamplePosition =
+        tempInfo.mSubsamplingX && tempInfo.mSubsamplingY
+            ? static_cast<ChromaSamplePosition>(br.ReadBits(2))
+            : ChromaSamplePosition::Unknown;
+  }
+
+  br.ReadBit();  
+
+  br.ReadBit();  
+
+  if (br.BitsLeft() > 8) {
+    NS_WARNING(
+        "AV1 sequence header finished reading with more than "
+        "a byte of aligning bits, may indicate an error");
+  }
+  bool correct = br.ReadBit();
+  correct &= br.ReadBits(br.BitsLeft() % 8) == 0;
+  while (br.BitsLeft() > 0) {
+    correct &= br.ReadBits(8) == 0;
+  }
+  if (!correct) {
+    return MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
+                       "AV1 sequence header was corrupted");
+  }
+
+  aDestInfo = tempInfo;
+  return NS_OK;
+}
+
+mozilla::Maybe<mozilla::gfx::HDRMetadata> AOMDecoder::ReadMetadataOBUHDR(
+    const Span<const uint8_t>& aSample) {
+  static constexpr uint64_t kMetadataTypeCLL = 1;
+  static constexpr uint64_t kMetadataTypeMDCV = 2;
+  static constexpr float kPrimariesDivisor = 65536.0f;
+  static constexpr float kMaxLuminanceDivisor = 256.0f;
+  static constexpr float kMinLuminanceDivisor = 16384.0f;
+
+  gfx::HDRMetadata hdr;
+  bool hasMDCV = false;
+  bool hasCLL = false;
+
+  OBUIterator iter = ReadOBUs(aSample);
+  while (iter.HasNext()) {
+    OBUInfo obu = iter.Next();
+    if (obu.mType != OBUType::Metadata || obu.mContents.IsEmpty()) {
+      continue;
+    }
+
+    BitReader br(obu.mContents.Elements(), obu.mContents.Length() * 8);
+    CheckedUint64 checkedMetadataType = br.ReadULEB128();
+    if (!checkedMetadataType.isValid()) {
+      continue;
+    }
+    uint64_t metadataType = checkedMetadataType.value();
+    size_t headerBytes = br.BitCount() / 8;
+    if (headerBytes >= obu.mContents.Length()) {
+      continue;
+    }
+    const uint8_t* payload = obu.mContents.Elements() + headerBytes;
+    size_t payloadLen = obu.mContents.Length() - headerBytes;
+
+    if (metadataType == kMetadataTypeMDCV) {
+      if (payloadLen < 24) {
+        NS_WARNING("AV1 MDCV metadata OBU: unexpected payload size");
+        continue;
+      }
+      BufferReader br(payload, payloadLen);
+      auto r0x = br.ReadU16();
+      auto r0y = br.ReadU16();
+      auto g1x = br.ReadU16();
+      auto g1y = br.ReadU16();
+      auto b2x = br.ReadU16();
+      auto b2y = br.ReadU16();
+      auto wpx = br.ReadU16();
+      auto wpy = br.ReadU16();
+      auto maxL = br.ReadU32();
+      auto minL = br.ReadU32();
+      if (r0x.isErr() || r0y.isErr() || g1x.isErr() || g1y.isErr() ||
+          b2x.isErr() || b2y.isErr() || wpx.isErr() || wpy.isErr() ||
+          maxL.isErr() || minL.isErr()) {
+        MOZ_LOG_FMT(
+            sPDMLog, mozilla::LogLevel::Debug,
+            "AOMDecoder::ReadMetadataOBUHDR: failed to read MDCV fields");
+        continue;
+      }
+      gfx::Chromaticity red{r0x.unwrap() / kPrimariesDivisor,
+                            r0y.unwrap() / kPrimariesDivisor};
+      gfx::Chromaticity green{g1x.unwrap() / kPrimariesDivisor,
+                              g1y.unwrap() / kPrimariesDivisor};
+      gfx::Chromaticity blue{b2x.unwrap() / kPrimariesDivisor,
+                             b2y.unwrap() / kPrimariesDivisor};
+      gfx::Chromaticity whitePoint{wpx.unwrap() / kPrimariesDivisor,
+                                   wpy.unwrap() / kPrimariesDivisor};
+      float maxLuminance = maxL.unwrap() / kMaxLuminanceDivisor;
+      float minLuminance = minL.unwrap() / kMinLuminanceDivisor;
+
+      hdr.mSmpte2086 = Some(gfx::Smpte2086Metadata{red, green, blue, whitePoint,
+                                                   maxLuminance, minLuminance});
+      hasMDCV = true;
+    } else if (metadataType == kMetadataTypeCLL) {
+      if (payloadLen < 4) {
+        NS_WARNING("AV1 CLL metadata OBU: unexpected payload size");
+        continue;
+      }
+      BufferReader br(payload, payloadLen);
+      auto maxCLL = br.ReadU16();
+      auto maxFALL = br.ReadU16();
+      if (maxCLL.isErr() || maxFALL.isErr()) {
+        MOZ_LOG_FMT(
+            sPDMLog, mozilla::LogLevel::Debug,
+            "AOMDecoder::ReadMetadataOBUHDR: failed to read CLL fields");
+        continue;
+      }
+      hdr.mContentLightLevel =
+          Some(gfx::ContentLightLevel{maxCLL.unwrap(), maxFALL.unwrap()});
+      hasCLL = true;
+    }
+  }
+
+  if (!hasMDCV && !hasCLL) {
+    return Nothing();
+  }
+  MOZ_ASSERT(hdr.IsValid());
+  return Some(hdr);
+}
+
+already_AddRefed<MediaByteBuffer> AOMDecoder::CreateSequenceHeader(
+    const AV1SequenceInfo& aInfo, nsresult& aResult) {
+  aResult = NS_ERROR_FAILURE;
+
+  RefPtr<MediaByteBuffer> seqHdrBuffer = new MediaByteBuffer();
+  BitWriter bw(seqHdrBuffer);
+
+  bw.WriteBits(aInfo.mProfile, 3);
+  bw.WriteBit(false);  
+  bw.WriteBit(false);  
+
+  bw.WriteBit(false);  
+  bw.WriteBit(false);  
+
+  size_t opCount = aInfo.mOperatingPoints.Length();
+  bw.WriteBits(opCount - 1, 5);  
+  for (size_t i = 0; i < opCount; i++) {
+    OperatingPoint op = aInfo.mOperatingPoints[i];
+    bw.WriteBits(op.mLayers, 12);  
+    bw.WriteBits(op.mLevel, 5);
+    if (op.mLevel > 7) {
+      bw.WriteBits(op.mTier, 1);
+    } else {
+      if (op.mTier != 0) {
+        NS_WARNING("Operating points cannot specify tier for levels under 8.");
+        return nullptr;
+      }
+    }
+  }
+
+  if (aInfo.mImage.IsEmpty()) {
+    NS_WARNING("Sequence header requires a valid image size");
+    return nullptr;
+  }
+  auto getBits = [](int32_t value) {
+    uint8_t bit = 0;
+    do {
+      value >>= 1;
+      bit++;
+    } while (value > 0);
+    return bit;
+  };
+  uint8_t bitsW = getBits(aInfo.mImage.Width());
+  uint8_t bitsH = getBits(aInfo.mImage.Height());
+  bw.WriteBits(bitsW - 1, 4);
+  bw.WriteBits(bitsH - 1, 4);
+  bw.WriteBits(aInfo.mImage.Width() - 1, bitsW);
+  bw.WriteBits(aInfo.mImage.Height() - 1, bitsH);
+
+  bw.WriteBit(false);  
+
+
+  bw.WriteBit(true);  
+  bw.WriteBit(true);  
+  bw.WriteBit(true);  
+
+  bw.WriteBit(false);  
+  bw.WriteBit(true);   
+  bw.WriteBit(true);   
+  bw.WriteBit(false);  
+
+  bw.WriteBit(true);  
+  bw.WriteBit(false);  
+  bw.WriteBit(true);   
+
+  bw.WriteBit(true);  
+
+  bw.WriteBit(true);  
+
+  bw.WriteBits(6, 3);  
+
+  bw.WriteBit(false);  
+  bw.WriteBit(false);  
+  bw.WriteBit(true);   
+
+  bool highBitDepth = aInfo.mBitDepth >= 10;
+  bw.WriteBit(highBitDepth);
+
+  if (aInfo.mBitDepth == 12 && aInfo.mProfile != 2) {
+    NS_WARNING("Profile must be 2 for 12-bit");
+    return nullptr;
+  }
+  if (aInfo.mProfile == 2 && highBitDepth) {
+    bw.WriteBit(aInfo.mBitDepth == 12);  
+  }
+
+  if (aInfo.mMonochrome && aInfo.mProfile == 1) {
+    NS_WARNING("Profile 1 does not support monochrome");
+    return nullptr;
+  }
+  if (aInfo.mProfile != 1) {
+    bw.WriteBit(aInfo.mMonochrome);
+  }
+
+  const VideoColorSpace colors = aInfo.mColorSpace;
+  bool colorsPresent =
+      colors.mPrimaries != ColourPrimaries::CP_UNSPECIFIED ||
+      colors.mTransfer != TransferCharacteristics::TC_UNSPECIFIED ||
+      colors.mMatrix != MatrixCoefficients::MC_UNSPECIFIED;
+  bw.WriteBit(colorsPresent);
+
+  if (colorsPresent) {
+    bw.WriteBits(static_cast<uint8_t>(colors.mPrimaries), 8);
+    bw.WriteBits(static_cast<uint8_t>(colors.mTransfer), 8);
+    bw.WriteBits(static_cast<uint8_t>(colors.mMatrix), 8);
+  }
+
+  if (aInfo.mMonochrome) {
+    if (!aInfo.mSubsamplingX || !aInfo.mSubsamplingY) {
+      NS_WARNING("Monochrome requires 4:0:0 subsampling");
+      return nullptr;
+    }
+    if (aInfo.mChromaSamplePosition != ChromaSamplePosition::Unknown) {
+      NS_WARNING(
+          "Cannot specify chroma sample position on monochrome sequence");
+      return nullptr;
+    }
+    bw.WriteBit(colors.mRange == ColorRange::FULL);
+  } else if (colors.mPrimaries == ColourPrimaries::CP_BT709 &&
+             colors.mTransfer == TransferCharacteristics::TC_SRGB &&
+             colors.mMatrix == MatrixCoefficients::MC_IDENTITY) {
+    if (aInfo.mSubsamplingX || aInfo.mSubsamplingY ||
+        colors.mRange != ColorRange::FULL ||
+        aInfo.mChromaSamplePosition != ChromaSamplePosition::Unknown) {
+      NS_WARNING("sRGB requires 4:4:4 subsampling with full color range");
+      return nullptr;
+    }
+  } else {
+    bw.WriteBit(colors.mRange == ColorRange::FULL);
+    switch (aInfo.mProfile) {
+      case 0:
+        if (!aInfo.mSubsamplingX || !aInfo.mSubsamplingY) {
+          NS_WARNING("Main Profile requires 4:2:0 subsampling");
+          return nullptr;
+        }
+        break;
+      case 1:
+        if (aInfo.mSubsamplingX || aInfo.mSubsamplingY) {
+          NS_WARNING("High Profile requires 4:4:4 subsampling");
+          return nullptr;
+        }
+        break;
+      case 2:
+        if (aInfo.mBitDepth == 12) {
+          bw.WriteBit(aInfo.mSubsamplingX);
+          if (aInfo.mSubsamplingX) {
+            bw.WriteBit(aInfo.mSubsamplingY);
+          }
+        } else {
+          if (!aInfo.mSubsamplingX || aInfo.mSubsamplingY) {
+            NS_WARNING(
+                "Professional Profile < 12-bit requires 4:2:2 subsampling");
+            return nullptr;
+          }
+        }
+        break;
+    }
+
+    if (aInfo.mSubsamplingX && aInfo.mSubsamplingY) {
+      bw.WriteBits(static_cast<uint8_t>(aInfo.mChromaSamplePosition), 2);
+    } else {
+      if (aInfo.mChromaSamplePosition != ChromaSamplePosition::Unknown) {
+        NS_WARNING("Only 4:2:0 subsampling can specify chroma position");
+        return nullptr;
+      }
+    }
+  }
+
+  bw.WriteBit(false);  
+
+  bw.WriteBit(true);  
+
+  size_t numTrailingBits = 8 - (bw.BitCount() % 8);
+  bw.WriteBit(true);
+  bw.WriteBits(0, numTrailingBits - 1);
+  ASSERT_BYTE_ALIGNED(bw);
+
+  Span<const uint8_t> seqHdr(seqHdrBuffer->Elements(), seqHdrBuffer->Length());
+  aResult = NS_OK;
+  return CreateOBU(OBUType::SequenceHeader, seqHdr);
+}
+
+void AOMDecoder::TryReadAV1CBox(const MediaByteBuffer* aBox,
+                                AV1SequenceInfo& aDestInfo,
+                                MediaResult& aSeqHdrResult) {
+  BitReader br(aBox);
+
+  br.ReadBits(8);  
+
+  aDestInfo.mProfile = br.ReadBits(3);
+
+  OperatingPoint op;
+  op.mLevel = br.ReadBits(5);
+  op.mTier = br.ReadBits(1);
+  aDestInfo.mOperatingPoints.AppendElement(op);
+
+  bool highBitDepth = br.ReadBit();
+  bool twelveBit = br.ReadBit();
+  aDestInfo.mBitDepth = highBitDepth ? twelveBit ? 12 : 10 : 8;
+
+  aDestInfo.mMonochrome = br.ReadBit();
+  aDestInfo.mSubsamplingX = br.ReadBit();
+  aDestInfo.mSubsamplingY = br.ReadBit();
+  aDestInfo.mChromaSamplePosition =
+      static_cast<ChromaSamplePosition>(br.ReadBits(2));
+
+  br.ReadBits(3);  
+  br.ReadBit();    
+  br.ReadBits(4);  
+
+  ASSERT_BYTE_ALIGNED(br);
+
+  size_t skipBytes = br.BitCount() / 8;
+  Span<const uint8_t> obus(aBox->Elements() + skipBytes,
+                           aBox->Length() - skipBytes);
+
+  if (obus.Length() < 1) {
+    aSeqHdrResult = NS_ERROR_DOM_MEDIA_WAITING_FOR_DATA;
+    return;
+  }
+
+  aSeqHdrResult = ReadSequenceHeaderInfo(obus, aDestInfo);
+}
+
+void AOMDecoder::WriteAV1CBox(const AV1SequenceInfo& aInfo,
+                              MediaByteBuffer* aDestBox, bool& aHasSeqHdr) {
+  aHasSeqHdr = false;
+
+  BitWriter bw(aDestBox);
+
+  bw.WriteBit(true);   
+  bw.WriteBits(1, 7);  
+
+  bw.WriteBits(aInfo.mProfile, 3);
+
+  MOZ_DIAGNOSTIC_ASSERT(aInfo.mOperatingPoints.Length() > 0);
+  bw.WriteBits(aInfo.mOperatingPoints[0].mLevel, 5);
+  bw.WriteBits(aInfo.mOperatingPoints[0].mTier, 1);
+
+  bw.WriteBit(aInfo.mBitDepth >= 10);  
+  bw.WriteBit(aInfo.mBitDepth == 12);  
+
+  bw.WriteBit(aInfo.mMonochrome);
+  bw.WriteBit(aInfo.mSubsamplingX);
+  bw.WriteBit(aInfo.mSubsamplingY);
+  bw.WriteBits(static_cast<uint8_t>(aInfo.mChromaSamplePosition), 2);
+
+  bw.WriteBits(0, 3);  
+  bw.WriteBit(false);  
+  bw.WriteBits(0, 4);  
+
+  ASSERT_BYTE_ALIGNED(bw);
+
+  nsresult rv;
+  RefPtr<MediaByteBuffer> seqHdrBuffer = CreateSequenceHeader(aInfo, rv);
+
+  if (NS_SUCCEEDED(rv)) {
+    aDestBox->AppendElements(seqHdrBuffer->Elements(), seqHdrBuffer->Length());
+    aHasSeqHdr = true;
+  }
+}
+
+Maybe<AOMDecoder::AV1SequenceInfo> AOMDecoder::CreateSequenceInfoFromCodecs(
+    const nsAString& aCodec) {
+  AV1SequenceInfo info;
+  OperatingPoint op;
+  uint8_t chromaSamplePosition;
+  if (!ExtractAV1CodecDetails(aCodec, info.mProfile, op.mLevel, op.mTier,
+                              info.mBitDepth, info.mMonochrome,
+                              info.mSubsamplingX, info.mSubsamplingY,
+                              chromaSamplePosition, info.mColorSpace)) {
+    return Nothing();
+  }
+  info.mOperatingPoints.AppendElement(op);
+  info.mChromaSamplePosition =
+      static_cast<ChromaSamplePosition>(chromaSamplePosition);
+  return Some(info);
+}
+
+bool AOMDecoder::SetVideoInfo(VideoInfo* aDestInfo, const nsAString& aCodec) {
+  Maybe<AV1SequenceInfo> info = CreateSequenceInfoFromCodecs(aCodec);
+  if (info.isNothing()) {
+    return false;
+  }
+
+  if (!aDestInfo->mImage.IsEmpty()) {
+    info->mImage = aDestInfo->mImage;
+  }
+
+  RefPtr<MediaByteBuffer> extraData = new MediaByteBuffer();
+  bool hasSeqHdr;
+  WriteAV1CBox(info.value(), extraData, hasSeqHdr);
+  aDestInfo->mExtraData = extraData;
+  return true;
+}
+
+}  
+#undef LOG
+#undef ASSERT_BYTE_ALIGNED

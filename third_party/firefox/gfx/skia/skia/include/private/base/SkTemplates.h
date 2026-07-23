@@ -1,0 +1,426 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkTemplates_DEFINED)
+#define SkTemplates_DEFINED
+
+#include "include/private/base/SkAlign.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkDebug.h"
+#include "include/private/base/SkMalloc.h"
+#include "include/private/base/SkTLogic.h"
+#include "include/private/base/SkTo.h"
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <type_traits>
+#include <utility>
+
+
+
+template<typename T> inline void sk_ignore_unused_variable(const T&) { }
+
+template <typename T> static inline T SkTAbs(T value) {
+    if (value < 0) {
+        value = -value;
+    }
+    return value;
+}
+
+template <typename D, typename S> inline D* SkTAfter(S* ptr, size_t count = 1) {
+    return reinterpret_cast<D*>(ptr + count);
+}
+
+template <typename D, typename S> inline D* SkTAddOffset(S* ptr, ptrdiff_t byteOffset) {
+    return reinterpret_cast<D*>(reinterpret_cast<sknonstd::same_cv_t<char, D>*>(ptr) + byteOffset);
+}
+
+template <typename T, T* P> struct SkOverloadedFunctionObject {
+    template <typename... Args>
+    auto operator()(Args&&... args) const -> decltype(P(std::forward<Args>(args)...)) {
+        return P(std::forward<Args>(args)...);
+    }
+};
+
+template <auto F> using SkFunctionObject =
+    SkOverloadedFunctionObject<std::remove_pointer_t<decltype(F)>, F>;
+
+template <typename T, void (*P)(T*)> class [[nodiscard]] SkAutoTCallVProc
+    : public std::unique_ptr<T, SkFunctionObject<P>> {
+    using inherited = std::unique_ptr<T, SkFunctionObject<P>>;
+public:
+    using inherited::inherited;
+    SkAutoTCallVProc(const SkAutoTCallVProc&) = delete;
+    SkAutoTCallVProc(SkAutoTCallVProc&& that) : inherited(std::move(that)) {}
+
+    operator T*() const { return this->get(); }
+};
+
+
+namespace skia_private {
+template <typename T> class AutoTArray  {
+public:
+    AutoTArray() {}
+    explicit AutoTArray(size_t size)
+        : fData(size > 0 ? new T[check_size_bytes_too_big<T>(size)] : nullptr)
+        , fSize(size) {}
+
+    explicit AutoTArray(int size) : AutoTArray(SkToSizeT(size)) {}
+
+    AutoTArray(AutoTArray&& other)
+        : fData(std::move(other.fData))
+        , fSize(std::exchange(other.fSize, 0)) {}
+
+    AutoTArray& operator=(AutoTArray&& other) {
+        if (this != &other) {
+            fData = std::move(other.fData);
+            fSize = std::exchange(other.fSize, 0);
+        }
+        return *this;
+    }
+
+    SK_REINITIALIZES
+    void reset(size_t count = 0) {
+        *this = AutoTArray(count);
+    }
+
+    T* get() const { return fData.get(); }
+
+    T&  operator[](size_t index) const {
+        return fData[sk_collection_check_bounds(index, fSize)];
+    }
+
+    const T* data() const { return fData.get(); }
+    T* data() { return fData.get(); }
+
+    size_t size() const { return fSize; }
+    bool empty() const { return fSize == 0; }
+    size_t size_bytes() const { return sizeof(T) * fSize; }
+
+    T* begin() {
+        return fData.get();
+    }
+    const T* begin() const {
+        return fData.get();
+    }
+
+    T* end() {
+        if (fData == nullptr) {
+            SkASSERT(fSize == 0);
+        }
+        return this->begin() + fSize;
+    }
+    const T* end() const {
+        if (fData == nullptr) {
+            SkASSERT(fSize == 0);
+        }
+        return this->begin() + fSize;
+    }
+
+private:
+    std::unique_ptr<T[]> fData;
+    size_t fSize = 0;
+};
+
+template <int kCountRequested, typename T> class AutoSTArray {
+public:
+    AutoSTArray(const AutoSTArray&) = delete;
+    AutoSTArray& operator=(const AutoSTArray&) = delete;
+
+    AutoSTArray(AutoSTArray&& that) {
+        if (that.fArray == nullptr) {
+            fArray = nullptr;
+            fCount = 0;
+        } else if (that.fArray == (T*) that.fStorage) {
+            fArray = (T*) fStorage;
+            fCount = that.fCount;
+            std::uninitialized_move(that.fArray, that.fArray + that.fCount, fArray);
+        } else {
+            fArray = std::exchange(that.fArray, nullptr);
+            fCount = std::exchange(that.fCount, 0);
+        }
+    }
+    AutoSTArray& operator=(AutoSTArray&&) = delete;
+
+    AutoSTArray() {
+        fArray = nullptr;
+        fCount = 0;
+    }
+
+    AutoSTArray(int count) {
+        fArray = nullptr;
+        fCount = 0;
+        this->reset(count);
+    }
+
+    ~AutoSTArray() {
+        this->reset(0);
+    }
+
+    SK_REINITIALIZES
+    void reset(int count) {
+        T* start = begin();
+        T* iter = end();
+        while (iter > start) {
+            (--iter)->~T();
+        }
+
+        SkASSERT(count >= 0);
+        if (fCount != count) {
+            if (fArray != (T*) fStorage) {
+                sk_free(fArray);
+            }
+
+            if (count > kCount) {
+                fArray = (T*) sk_malloc_throw(count, sizeof(T));
+            } else if (count > 0) {
+                fArray = (T*) fStorage;
+            } else {
+                fArray = nullptr;
+            }
+
+            fCount = count;
+        }
+
+        iter = begin();
+        T* stop = end();
+        while (iter < stop) {
+            new (iter++) T;
+        }
+    }
+
+    void trimTo(int count) {
+        SkASSERT(count >= 0);
+        if (count >= fCount) {
+            return;
+        }
+        T* start = begin() + count;
+        T* iter = end();
+        while (iter > start) {
+            (--iter)->~T();
+        }
+        fCount = count;
+    }
+
+    int count() const { return fCount; }
+
+    T* get() const { return fArray; }
+
+    T* begin() { return fArray; }
+
+    const T* begin() const { return fArray; }
+
+    T* end() { return fArray + fCount; }
+
+    const T* end() const { return fArray + fCount; }
+
+    T&  operator[](int index) const {
+        return fArray[sk_collection_check_bounds(index, fCount)];
+    }
+
+    const T* data() const { return fArray; }
+    T* data() { return fArray; }
+    size_t size() const { return fCount; }
+
+private:
+#if defined(SK_BUILD_FOR_GOOGLE3)
+    static constexpr int kMaxBytes = 4 * 1024;
+    static constexpr int kMinCount = kCountRequested * sizeof(T) > kMaxBytes
+        ? kMaxBytes / sizeof(T)
+        : kCountRequested;
+#else
+    static constexpr int kMinCount = kCountRequested;
+#endif
+
+    static_assert(alignof(int) <= alignof(T*) || alignof(int) <= alignof(T));
+public:
+    static constexpr int kCount =
+            SkAlignTo(kMinCount*sizeof(T) + sizeof(int), std::max(alignof(T*), alignof(T))) / sizeof(T);
+
+private:
+    T* fArray;
+    alignas(T) std::byte fStorage[kCount * sizeof(T)];
+    int fCount;
+};
+
+template <typename T,
+          typename = std::enable_if_t<std::is_trivially_default_constructible<T>::value &&
+                                      std::is_trivially_destructible<T>::value>>
+class AutoTMalloc  {
+public:
+    explicit AutoTMalloc(T* ptr = nullptr) : fPtr(ptr) {}
+
+    explicit AutoTMalloc(size_t count)
+        : fPtr(count ? (T*)sk_malloc_throw(count, sizeof(T)) : nullptr) {}
+
+    AutoTMalloc(AutoTMalloc&&) = default;
+    AutoTMalloc& operator=(AutoTMalloc&&) = default;
+
+    void realloc(size_t count) {
+        fPtr.reset(count ? (T*)sk_realloc_throw(fPtr.release(), count * sizeof(T)) : nullptr);
+    }
+
+    SK_REINITIALIZES
+    T* reset(size_t count = 0) {
+        fPtr.reset(count ? (T*)sk_malloc_throw(count, sizeof(T)) : nullptr);
+        return this->get();
+    }
+
+    T* get() const { return fPtr.get(); }
+
+    operator T*() { return fPtr.get(); }
+
+    operator const T*() const { return fPtr.get(); }
+
+    T& operator[](int index) { return fPtr.get()[index]; }
+
+    const T& operator[](int index) const { return fPtr.get()[index]; }
+
+    const T* data() const { return fPtr.get(); }
+    T* data() { return fPtr.get(); }
+
+    T* release() { return fPtr.release(); }
+
+private:
+    std::unique_ptr<T, SkOverloadedFunctionObject<void(void*), sk_free>> fPtr;
+};
+
+template <size_t kCountRequested,
+          typename T,
+          typename = std::enable_if_t<std::is_trivially_default_constructible<T>::value &&
+                                      std::is_trivially_destructible<T>::value>>
+class AutoSTMalloc {
+public:
+    AutoSTMalloc() : fPtr(fTStorage) {}
+
+    AutoSTMalloc(size_t count) {
+        if (count > kCount) {
+            fPtr = (T*)sk_malloc_throw(count, sizeof(T));
+        } else if (count) {
+            fPtr = fTStorage;
+        } else {
+            fPtr = nullptr;
+        }
+    }
+
+    AutoSTMalloc(const AutoSTMalloc&) = delete;
+    AutoSTMalloc& operator=(const AutoSTMalloc&) = delete;
+
+    AutoSTMalloc(AutoSTMalloc&& that) {
+        if (that.fPtr == nullptr) {
+            fPtr = nullptr;
+        } else if (that.fPtr == that.fTStorage) {
+            fPtr = fTStorage;
+            memcpy(fPtr, that.fPtr, kCount * sizeof(T));
+        } else {
+            fPtr = std::exchange(that.fPtr, nullptr);
+        }
+    }
+    AutoSTMalloc& operator=(AutoSTMalloc&&) = delete;
+
+    ~AutoSTMalloc() {
+        if (fPtr != fTStorage) {
+            sk_free(fPtr);
+        }
+    }
+
+    SK_REINITIALIZES
+    T* reset(size_t count) {
+        if (fPtr != fTStorage) {
+            sk_free(fPtr);
+        }
+        if (count > kCount) {
+            fPtr = (T*)sk_malloc_throw(count, sizeof(T));
+        } else if (count) {
+            fPtr = fTStorage;
+        } else {
+            fPtr = nullptr;
+        }
+        return fPtr;
+    }
+
+    T* get() const { return fPtr; }
+
+    operator T*() {
+        return fPtr;
+    }
+
+    operator const T*() const {
+        return fPtr;
+    }
+
+    T& operator[](int index) {
+        return fPtr[index];
+    }
+
+    const T& operator[](int index) const {
+        return fPtr[index];
+    }
+
+    const T* data() const { return fPtr; }
+    T* data() { return fPtr; }
+
+    void realloc(size_t count) {
+        if (count > kCount) {
+            if (fPtr == fTStorage) {
+                fPtr = (T*)sk_malloc_throw(count, sizeof(T));
+                memcpy((void*)fPtr, fTStorage, kCount * sizeof(T));
+            } else {
+                fPtr = (T*)sk_realloc_throw(fPtr, count, sizeof(T));
+            }
+        } else if (count) {
+            if (fPtr != fTStorage) {
+                fPtr = (T*)sk_realloc_throw(fPtr, count, sizeof(T));
+            }
+        } else {
+            this->reset(0);
+        }
+    }
+
+private:
+    static constexpr size_t kCountWithPadding = SkAlign4(kCountRequested*sizeof(T)) / sizeof(T);
+#if defined(SK_BUILD_FOR_GOOGLE3)
+    static constexpr size_t kMaxBytes = 4 * 1024;
+    static constexpr size_t kMinCount = kCountRequested * sizeof(T) > kMaxBytes
+        ? kMaxBytes / sizeof(T)
+        : kCountWithPadding;
+#else
+    static constexpr size_t kMinCount = kCountWithPadding;
+#endif
+
+public:
+    static constexpr size_t kCount = kMinCount;
+
+private:
+
+    T*          fPtr;
+    union {
+        uint32_t    fStorage32[SkAlign4(kCount*sizeof(T)) >> 2];
+        T           fTStorage[1];   
+    };
+};
+
+using UniqueVoidPtr = std::unique_ptr<void, SkOverloadedFunctionObject<void(void*), sk_free>>;
+
+}  
+
+template<typename C, std::size_t... Is>
+constexpr auto SkMakeArrayFromIndexSequence(C c, std::index_sequence<Is...> is)
+-> std::array<decltype(c(std::declval<typename decltype(is)::value_type>())), sizeof...(Is)> {
+    return {{ c(Is)... }};
+}
+
+template<size_t N, typename C> constexpr auto SkMakeArray(C c)
+-> std::array<decltype(c(std::declval<typename std::index_sequence<N>::value_type>())), N> {
+    return SkMakeArrayFromIndexSequence(c, std::make_index_sequence<N>{});
+}
+
+#endif

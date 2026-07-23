@@ -1,0 +1,16 @@
+
+[package]
+rust-version = "1.6"
+name = "equivalent"
+version = "1.0.1"
+description = "Traits for key comparison in maps."
+keywords = [
+    "hashmap",
+    "no_std",
+]
+categories = [
+    "data-structures",
+    "no-std",
+]
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/cuviper/equivalent"

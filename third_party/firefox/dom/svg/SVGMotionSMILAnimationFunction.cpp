@@ -1,0 +1,371 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SVGMotionSMILAnimationFunction.h"
+
+#include "SVGAnimatedOrient.h"
+#include "SVGMotionSMILPathUtils.h"
+#include "SVGMotionSMILType.h"
+#include "mozilla/SMILParserUtils.h"
+#include "mozilla/dom/SVGAnimationElement.h"
+#include "mozilla/dom/SVGMPathElement.h"
+#include "mozilla/dom/SVGPathElement.h"
+#include "mozilla/gfx/2D.h"
+#include "nsAttrValue.h"
+#include "nsAttrValueInlines.h"
+#include "nsAttrValueOrString.h"
+
+using namespace mozilla::dom;
+using namespace mozilla::dom::SVGAngle_Binding;
+using namespace mozilla::gfx;
+
+namespace mozilla {
+
+void SVGMotionSMILAnimationFunction::MarkStaleIfAttributeAffectsPath(
+    nsAtom* aAttribute) {
+  bool isAffected;
+  if (aAttribute == nsGkAtoms::path) {
+    isAffected = (mPathSourceType <= PathSourceType::PathAttr);
+  } else if (aAttribute == nsGkAtoms::values) {
+    isAffected = (mPathSourceType <= PathSourceType::ValuesAttr);
+  } else if (aAttribute == nsGkAtoms::from || aAttribute == nsGkAtoms::to) {
+    isAffected = (mPathSourceType <= PathSourceType::ToAttr);
+  } else if (aAttribute == nsGkAtoms::by) {
+    isAffected = (mPathSourceType <= PathSourceType::ByAttr);
+  } else {
+    MOZ_ASSERT_UNREACHABLE(
+        "Should only call this method for path-describing "
+        "attrs");
+    isAffected = false;
+  }
+
+  if (isAffected) {
+    mIsPathStale = true;
+    mHasChanged = true;
+  }
+}
+
+bool SVGMotionSMILAnimationFunction::SetAttr(nsAtom* aAttribute,
+                                             const nsAString& aValue,
+                                             nsAttrValue& aResult,
+                                             nsresult* aParseResult) {
+  if (aAttribute == nsGkAtoms::keyPoints) {
+    nsresult rv = SetKeyPoints(aValue, aResult);
+    if (aParseResult) {
+      *aParseResult = rv;
+    }
+  } else if (aAttribute == nsGkAtoms::rotate) {
+    nsresult rv = SetRotate(aValue, aResult);
+    if (aParseResult) {
+      *aParseResult = rv;
+    }
+  } else if (aAttribute == nsGkAtoms::path || aAttribute == nsGkAtoms::by ||
+             aAttribute == nsGkAtoms::from || aAttribute == nsGkAtoms::to ||
+             aAttribute == nsGkAtoms::values) {
+    aResult.SetTo(aValue);
+    MarkStaleIfAttributeAffectsPath(aAttribute);
+    if (aParseResult) {
+      *aParseResult = NS_OK;
+    }
+  } else {
+    return SMILAnimationFunction::SetAttr(aAttribute, aValue, aResult,
+                                          aParseResult);
+  }
+
+  return true;
+}
+
+bool SVGMotionSMILAnimationFunction::UnsetAttr(nsAtom* aAttribute) {
+  if (aAttribute == nsGkAtoms::keyPoints) {
+    UnsetKeyPoints();
+  } else if (aAttribute == nsGkAtoms::rotate) {
+    UnsetRotate();
+  } else if (aAttribute == nsGkAtoms::path || aAttribute == nsGkAtoms::by ||
+             aAttribute == nsGkAtoms::from || aAttribute == nsGkAtoms::to ||
+             aAttribute == nsGkAtoms::values) {
+    MarkStaleIfAttributeAffectsPath(aAttribute);
+  } else {
+    return SMILAnimationFunction::UnsetAttr(aAttribute);
+  }
+
+  return true;
+}
+
+SMILAnimationFunction::SMILCalcMode
+SVGMotionSMILAnimationFunction::GetCalcMode() const {
+  const nsAttrValue* value = GetAttr(nsGkAtoms::calcMode);
+  if (!value) {
+    return SMILCalcMode::Paced;  
+  }
+
+  return SMILCalcMode(value->GetEnumValue());
+}
+
+
+
+static SVGMPathElement* GetFirstMPathChild(nsIContent* aElem) {
+  for (nsIContent* child = aElem->GetFirstChild(); child;
+       child = child->GetNextSibling()) {
+    if (child->IsSVGElement(nsGkAtoms::mpath)) {
+      return static_cast<SVGMPathElement*>(child);
+    }
+  }
+
+  return nullptr;
+}
+
+void SVGMotionSMILAnimationFunction::RebuildPathAndVerticesFromBasicAttrs(
+    const nsIContent* aContextElem) {
+  MOZ_ASSERT(!HasAttr(nsGkAtoms::path),
+             "Should be using |path| attr if we have it");
+  MOZ_ASSERT(!mPath, "regenerating when we already have path");
+  MOZ_ASSERT(mPathVertices.IsEmpty(),
+             "regenerating when we already have vertices");
+
+  const auto* context = SVGElement::FromNode(aContextElem);
+  if (!context) {
+    NS_ERROR("Uh oh, SVG animateMotion element targeting a non-SVG node");
+    return;
+  }
+  SVGMotionSMILPathUtils::PathGenerator pathGenerator(context);
+
+  bool success = false;
+  if (HasAttr(nsGkAtoms::values)) {
+    mPathSourceType = PathSourceType::ValuesAttr;
+    nsAttrValueOrString valuesVal(GetAttr(nsGkAtoms::values));
+    SVGMotionSMILPathUtils::MotionValueParser parser(&pathGenerator,
+                                                     &mPathVertices);
+    success = SMILParserUtils::ParseValuesGeneric(valuesVal.String(), parser);
+  } else if (HasAttr(nsGkAtoms::to) || HasAttr(nsGkAtoms::by)) {
+    if (HasAttr(nsGkAtoms::from)) {
+      nsAttrValueOrString fromVal(GetAttr(nsGkAtoms::from));
+      success = pathGenerator.MoveToAbsolute(fromVal.String());
+      if (!mPathVertices.AppendElement(0.0, fallible)) {
+        success = false;
+      }
+    } else {
+      pathGenerator.MoveToOrigin();
+      success = true;
+      if (!HasAttr(nsGkAtoms::to)) {
+        if (!mPathVertices.AppendElement(0.0, fallible)) {
+          success = false;
+        }
+      }
+    }
+
+    if (success) {
+      double dist;
+      if (HasAttr(nsGkAtoms::to)) {
+        mPathSourceType = PathSourceType::ToAttr;
+        nsAttrValueOrString toVal(GetAttr(nsGkAtoms::to));
+        success = pathGenerator.LineToAbsolute(toVal.String(), dist);
+      } else {  
+        mPathSourceType = PathSourceType::ByAttr;
+        nsAttrValueOrString byVal(GetAttr(nsGkAtoms::by));
+        success = pathGenerator.LineToRelative(byVal.String(), dist);
+      }
+      if (success) {
+        if (!mPathVertices.AppendElement(dist, fallible)) {
+          success = false;
+        }
+      }
+    }
+  }
+  if (success) {
+    mPath = pathGenerator.GetResultingPath();
+  } else {
+    mPathVertices.Clear();
+  }
+}
+
+void SVGMotionSMILAnimationFunction::RebuildPathAndVerticesFromMpathElem(
+    SVGMPathElement* aMpathElem) {
+  mPathSourceType = PathSourceType::Mpath;
+
+  SVGGeometryElement* shape = aMpathElem->GetReferencedPath();
+  if (!shape || !shape->HasValidDimensions()) {
+    return;
+  }
+  if (!shape->GetDistancesFromOriginToEndsOfVisibleSegments(&mPathVertices)) {
+    mPathVertices.Clear();
+    return;
+  }
+  if (mPathVertices.IsEmpty()) {
+    return;
+  }
+  mPath = shape->GetOrBuildPathForMeasuring();
+  if (!mPath) {
+    mPathVertices.Clear();
+    return;
+  }
+}
+
+void SVGMotionSMILAnimationFunction::RebuildPathAndVerticesFromPathAttr() {
+  nsString pathSpec(nsAttrValueOrString(GetAttr(nsGkAtoms::path)).String());
+  mPathSourceType = PathSourceType::PathAttr;
+
+  SVGPathData path{NS_ConvertUTF16toUTF8(pathSpec)};
+
+  if (path.IsEmpty()) {
+    return;
+  }
+
+  mPath = path.BuildPathForMeasuring(1.0f);
+  bool ok = path.GetDistancesFromOriginToEndsOfVisibleSegments(&mPathVertices);
+  if (!ok || mPathVertices.IsEmpty() || !mPath) {
+    mPath = nullptr;
+    mPathVertices.Clear();
+  }
+}
+
+void SVGMotionSMILAnimationFunction::RebuildPathAndVertices(
+    const nsIContent* aTargetElement) {
+  MOZ_ASSERT(mIsPathStale, "rebuilding path when it isn't stale");
+
+  mPath = nullptr;
+  mPathVertices.Clear();
+  mPathSourceType = PathSourceType::None;
+
+  SVGMPathElement* firstMpathChild = GetFirstMPathChild(mAnimationElement);
+
+  if (firstMpathChild) {
+    RebuildPathAndVerticesFromMpathElem(firstMpathChild);
+    mValueNeedsReparsingEverySample = false;
+  } else if (HasAttr(nsGkAtoms::path)) {
+    RebuildPathAndVerticesFromPathAttr();
+    mValueNeedsReparsingEverySample = false;
+  } else {
+    RebuildPathAndVerticesFromBasicAttrs(aTargetElement);
+    mValueNeedsReparsingEverySample = true;
+  }
+  mIsPathStale = false;
+}
+
+nsresult SVGMotionSMILAnimationFunction::GenerateValuesForPathAndPoints(
+    Path* aPath, bool aIsKeyPoints, FallibleTArray<double>& aPointDistances,
+    SMILValueArray& aResult) {
+  MOZ_ASSERT(aResult.IsEmpty(), "outparam is non-empty");
+
+  double distanceMultiplier = aIsKeyPoints ? aPath->ComputeLength() : 1.0;
+  if (!std::isfinite(distanceMultiplier)) {
+    return NS_ERROR_FAILURE;
+  }
+  const uint32_t numPoints = aPointDistances.Length();
+  for (uint32_t i = 0; i < numPoints; ++i) {
+    double curDist = aPointDistances[i] * distanceMultiplier;
+    if (!std::isfinite(curDist)) {
+      return NS_ERROR_FAILURE;
+    }
+    if (!aResult.AppendElement(SVGMotionSMILType::ConstructSMILValue(
+                                   aPath, curDist, mRotateType, mRotateAngle),
+                               fallible)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+  }
+  return NS_OK;
+}
+
+nsresult SVGMotionSMILAnimationFunction::GetValues(const SMILAttr& aSMILAttr,
+                                                   SMILValueArray& aResult) {
+  if (mIsPathStale) {
+    RebuildPathAndVertices(aSMILAttr.GetTargetNode());
+  }
+  MOZ_ASSERT(!mIsPathStale, "Forgot to clear 'is path stale' state");
+
+  if (!mPath) {
+    MOZ_ASSERT(mPathVertices.IsEmpty(), "have vertices but no path");
+    return NS_ERROR_FAILURE;
+  }
+  MOZ_ASSERT(!mPathVertices.IsEmpty(), "have a path but no vertices");
+
+  bool isUsingKeyPoints = !mKeyPoints.IsEmpty();
+  return GenerateValuesForPathAndPoints(
+      mPath, isUsingKeyPoints, isUsingKeyPoints ? mKeyPoints : mPathVertices,
+      aResult);
+}
+
+void SVGMotionSMILAnimationFunction::CheckValueListDependentAttrs(
+    uint32_t aNumValues) {
+  SMILAnimationFunction::CheckValueListDependentAttrs(aNumValues);
+
+  CheckKeyPoints();
+}
+
+bool SVGMotionSMILAnimationFunction::IsToAnimation() const {
+  return !GetFirstMPathChild(mAnimationElement) && !HasAttr(nsGkAtoms::path) &&
+         SMILAnimationFunction::IsToAnimation();
+}
+
+void SVGMotionSMILAnimationFunction::CheckKeyPoints() {
+  if (!HasAttr(nsGkAtoms::keyPoints)) return;
+
+  if (GetCalcMode() == SMILCalcMode::Paced) {
+    SetKeyPointsErrorFlag(false);
+    return;
+  }
+
+  if (mKeyPoints.Length() != mKeyTimes.Length()) {
+    SetKeyPointsErrorFlag(true);
+    return;
+  }
+
+  SetKeyPointsErrorFlag(false);
+}
+
+nsresult SVGMotionSMILAnimationFunction::SetKeyPoints(
+    const nsAString& aKeyPoints, nsAttrValue& aResult) {
+  mKeyPoints.Clear();
+  aResult.SetTo(aKeyPoints);
+
+  mHasChanged = true;
+
+  if (!SMILParserUtils::ParseSemicolonDelimitedProgressList(aKeyPoints, false,
+                                                            mKeyPoints)) {
+    mKeyPoints.Clear();
+    return NS_ERROR_FAILURE;
+  }
+
+  return NS_OK;
+}
+
+void SVGMotionSMILAnimationFunction::UnsetKeyPoints() {
+  mKeyPoints.Clear();
+  SetKeyPointsErrorFlag(false);
+  mHasChanged = true;
+}
+
+nsresult SVGMotionSMILAnimationFunction::SetRotate(const nsAString& aRotate,
+                                                   nsAttrValue& aResult) {
+  mHasChanged = true;
+
+  aResult.SetTo(aRotate);
+  if (aRotate.EqualsLiteral("auto")) {
+    mRotateType = RotateType::Auto;
+  } else if (aRotate.EqualsLiteral("auto-reverse")) {
+    mRotateType = RotateType::AutoReverse;
+  } else {
+    mRotateType = RotateType::Explicit;
+
+    uint16_t angleUnit;
+    if (!SVGAnimatedOrient::GetValueFromString(aRotate, mRotateAngle,
+                                               &angleUnit)) {
+      mRotateAngle = 0.0f;  
+      return NS_ERROR_DOM_SYNTAX_ERR;
+    }
+
+    if (angleUnit != SVG_ANGLETYPE_RAD) {
+      mRotateAngle *= SVGAnimatedOrient::GetDegreesPerUnit(angleUnit) /
+                      SVGAnimatedOrient::GetDegreesPerUnit(SVG_ANGLETYPE_RAD);
+    }
+  }
+  return NS_OK;
+}
+
+void SVGMotionSMILAnimationFunction::UnsetRotate() {
+  mRotateAngle = 0.0f;  
+  mRotateType = RotateType::Explicit;
+  mHasChanged = true;
+}
+
+}  

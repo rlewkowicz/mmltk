@@ -1,0 +1,706 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/css/ImageLoader.h"
+
+#include "Image.h"
+#include "imgIContainer.h"
+#include "imgINotificationObserver.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/SVGObserverUtils.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/LargestContentfulPaint.h"
+#include "mozilla/layers/WebRenderUserData.h"
+#include "nsCanvasFrame.h"
+#include "nsContentUtils.h"
+#include "nsDisplayList.h"
+#include "nsError.h"
+#include "nsIFrameInlines.h"
+#include "nsIReflowCallback.h"
+#include "nsLayoutUtils.h"
+#include "nsTHashSet.h"
+
+using namespace mozilla::dom;
+
+namespace mozilla::css {
+
+struct GlobalImageObserver final : public imgINotificationObserver {
+  NS_DECL_ISUPPORTS
+  NS_DECL_IMGINOTIFICATIONOBSERVER
+
+  GlobalImageObserver() = default;
+
+ private:
+  virtual ~GlobalImageObserver() = default;
+};
+
+NS_IMPL_ADDREF(GlobalImageObserver)
+NS_IMPL_RELEASE(GlobalImageObserver)
+
+NS_INTERFACE_MAP_BEGIN(GlobalImageObserver)
+  NS_INTERFACE_MAP_ENTRY(imgINotificationObserver)
+NS_INTERFACE_MAP_END
+
+struct ImageTableEntry {
+  nsTHashSet<ImageLoader*> mImageLoaders;
+
+  uint32_t mSharedCount = 1;
+};
+
+using GlobalRequestTable =
+    nsClassHashtable<nsRefPtrHashKey<imgIRequest>, ImageTableEntry>;
+
+static StaticAutoPtr<GlobalRequestTable> sImages;
+static StaticRefPtr<GlobalImageObserver> sImageObserver;
+
+void ImageLoader::Init() {
+  sImages = new GlobalRequestTable();
+  sImageObserver = MakeRefPtr<GlobalImageObserver>();
+}
+
+void ImageLoader::Shutdown() {
+  for (const auto& entry : *sImages) {
+    imgIRequest* imgRequest = entry.GetKey();
+    auto* req = static_cast<imgRequestProxy*>(imgRequest);
+    req->SetCancelable(true);
+    req->CancelAndForgetObserver(NS_BINDING_ABORTED);
+  }
+
+  sImages = nullptr;
+  sImageObserver = nullptr;
+}
+
+void ImageLoader::DropDocumentReference() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  ClearFrames(GetPresContext());
+
+  mDocument = nullptr;
+}
+
+template <typename Elem, typename Item,
+          typename Comparator = nsDefaultComparator<Elem, Item>>
+static size_t GetMaybeSortedIndex(const nsTArray<Elem>& aArray,
+                                  const Item& aItem, bool* aFound,
+                                  Comparator aComparator = Comparator()) {
+  size_t index = aArray.IndexOfFirstElementGt(aItem, aComparator);
+  *aFound = index > 0 && aComparator.Equals(aItem, aArray.ElementAt(index - 1));
+  return index;
+}
+
+static bool TriggerAsyncDecodeAtIntrinsicSize(imgIRequest* aRequest) {
+  uint32_t status = 0;
+  if (NS_SUCCEEDED(aRequest->GetImageStatus(&status))) {
+    if (status & imgIRequest::STATUS_FRAME_COMPLETE) {
+      return false;
+    }
+    if (status & imgIRequest::STATUS_ERROR) {
+      return false;
+    }
+  }
+
+  nsCOMPtr<imgIContainer> imgContainer;
+  aRequest->GetImage(getter_AddRefs(imgContainer));
+  if (imgContainer) {
+    imgContainer->RequestDecodeForSize(gfx::IntSize(0, 0),
+                                       imgIContainer::DECODE_FLAGS_DEFAULT);
+  } else {
+    aRequest->StartDecoding(imgIContainer::FLAG_NONE);
+  }
+  return true;
+}
+
+void ImageLoader::AssociateRequestToFrame(imgIRequest* aRequest,
+                                          nsIFrame* aFrame, Flags aFlags) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!(aFlags & Flags::IsBlockingLoadEvent),
+             "Shouldn't be used in the public API");
+
+  {
+    nsCOMPtr<imgINotificationObserver> observer;
+    aRequest->GetNotificationObserver(getter_AddRefs(observer));
+    if (!observer) {
+      return;
+    }
+    MOZ_ASSERT(observer == sImageObserver);
+  }
+
+  auto* const frameSet =
+      mRequestToFrameMap
+          .LookupOrInsertWith(
+              aRequest,
+              [&] {
+                mDocument->TrackImage(aRequest);
+
+                if (auto entry = sImages->Lookup(aRequest)) {
+                  DebugOnly<bool> inserted =
+                      entry.Data()->mImageLoaders.EnsureInserted(this);
+                  MOZ_ASSERT(inserted);
+                } else {
+                  MOZ_ASSERT_UNREACHABLE(
+                      "Shouldn't be associating images not in sImages");
+                }
+
+                if (nsPresContext* presContext = GetPresContext()) {
+                  nsLayoutUtils::RegisterImageRequestIfAnimated(
+                      presContext, aRequest, nullptr);
+                }
+                return MakeUnique<FrameSet>();
+              })
+          .get();
+
+  auto* const requestSet =
+      mFrameToRequestMap
+          .LookupOrInsertWith(aFrame,
+                              [=]() {
+                                aFrame->SetHasImageRequest(true);
+                                return MakeUnique<RequestSet>();
+                              })
+          .get();
+
+  FrameWithFlags fwf(aFrame);
+  FrameWithFlags* fwfToModify = &fwf;
+
+  bool found;
+  uint32_t i =
+      GetMaybeSortedIndex(*frameSet, fwf, &found, FrameOnlyComparator());
+  if (found) {
+    fwfToModify = &frameSet->ElementAt(i - 1);
+  }
+
+  if (aFlags & Flags::RequiresReflowOnSizeAvailable) {
+    MOZ_ASSERT(!(aFlags &
+                 Flags::RequiresReflowOnFirstFrameCompleteAndLoadEventBlocking),
+               "These two are exclusive");
+    fwfToModify->mFlags |= Flags::RequiresReflowOnSizeAvailable;
+  }
+
+  if (aFlags & Flags::RequiresReflowOnFirstFrameCompleteAndLoadEventBlocking) {
+    fwfToModify->mFlags |=
+        Flags::RequiresReflowOnFirstFrameCompleteAndLoadEventBlocking;
+
+    if (!(fwfToModify->mFlags & Flags::IsBlockingLoadEvent)) {
+      if (TriggerAsyncDecodeAtIntrinsicSize(aRequest)) {
+        fwfToModify->mFlags |= Flags::IsBlockingLoadEvent;
+
+        mDocument->BlockOnload();
+      }
+    }
+  }
+
+  DebugOnly<bool> didAddToFrameSet(false);
+  DebugOnly<bool> didAddToRequestSet(false);
+
+  if (!found) {
+    frameSet->InsertElementAt(i, fwf);
+    didAddToFrameSet = true;
+  }
+
+  i = GetMaybeSortedIndex(*requestSet, aRequest, &found);
+  if (!found) {
+    requestSet->InsertElementAt(i, aRequest);
+    didAddToRequestSet = true;
+  }
+
+  MOZ_ASSERT(didAddToFrameSet == didAddToRequestSet,
+             "We should only add to one map iff we also add to the other map.");
+}
+
+void ImageLoader::RemoveRequestToFrameMapping(imgIRequest* aRequest,
+                                              nsIFrame* aFrame) {
+#if defined(DEBUG)
+  {
+    nsCOMPtr<imgINotificationObserver> observer;
+    aRequest->GetNotificationObserver(getter_AddRefs(observer));
+    MOZ_ASSERT(!observer || observer == sImageObserver);
+  }
+#endif
+
+  if (auto entry = mRequestToFrameMap.Lookup(aRequest)) {
+    const auto& frameSet = entry.Data();
+    MOZ_ASSERT(frameSet, "This should never be null");
+
+    bool found;
+    uint32_t i = GetMaybeSortedIndex(*frameSet, FrameWithFlags(aFrame), &found,
+                                     FrameOnlyComparator());
+    if (found) {
+      UnblockOnloadIfNeeded(frameSet->ElementAt(i - 1));
+      frameSet->RemoveElementAtUnsafe(i - 1);
+    }
+
+    if (frameSet->IsEmpty()) {
+      DeregisterImageRequest(aRequest, GetPresContext());
+      entry.Remove();
+    }
+  }
+}
+
+void ImageLoader::DeregisterImageRequest(imgIRequest* aRequest,
+                                         nsPresContext* aPresContext) {
+  mDocument->UntrackImage(aRequest);
+
+  if (auto entry = sImages->Lookup(aRequest)) {
+    entry.Data()->mImageLoaders.EnsureRemoved(this);
+  }
+
+  if (aPresContext) {
+    nsLayoutUtils::DeregisterImageRequest(aPresContext, aRequest, nullptr);
+  }
+}
+
+void ImageLoader::RemoveFrameToRequestMapping(imgIRequest* aRequest,
+                                              nsIFrame* aFrame) {
+  if (auto entry = mFrameToRequestMap.Lookup(aFrame)) {
+    const auto& requestSet = entry.Data();
+    MOZ_ASSERT(requestSet, "This should never be null");
+    requestSet->RemoveElementSorted(aRequest);
+    if (requestSet->IsEmpty()) {
+      aFrame->SetHasImageRequest(false);
+      entry.Remove();
+    }
+  }
+}
+
+void ImageLoader::DisassociateRequestFromFrame(imgIRequest* aRequest,
+                                               nsIFrame* aFrame) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aFrame->HasImageRequest(), "why call me?");
+
+  RemoveRequestToFrameMapping(aRequest, aFrame);
+  RemoveFrameToRequestMapping(aRequest, aFrame);
+}
+
+void ImageLoader::DropRequestsForFrame(nsIFrame* aFrame) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aFrame->HasImageRequest(), "why call me?");
+
+  UniquePtr<RequestSet> requestSet;
+  mFrameToRequestMap.Remove(aFrame, &requestSet);
+  aFrame->SetHasImageRequest(false);
+  if (MOZ_UNLIKELY(!requestSet)) {
+    MOZ_ASSERT_UNREACHABLE("HasImageRequest was lying");
+    return;
+  }
+  for (imgIRequest* request : *requestSet) {
+    RemoveRequestToFrameMapping(request, aFrame);
+  }
+}
+
+void ImageLoader::SetAnimationMode(uint16_t aMode) {
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ASSERTION(aMode == imgIContainer::kNormalAnimMode ||
+                   aMode == imgIContainer::kDontAnimMode ||
+                   aMode == imgIContainer::kLoopOnceAnimMode,
+               "Wrong Animation Mode is being set!");
+
+  for (nsISupports* key : mRequestToFrameMap.Keys()) {
+    auto* request = static_cast<imgIRequest*>(key);
+
+#if defined(DEBUG)
+    {
+      nsCOMPtr<imgIRequest> debugRequest = request;
+      NS_ASSERTION(debugRequest == request, "This is bad");
+    }
+#endif
+
+    nsCOMPtr<imgIContainer> container;
+    request->GetImage(getter_AddRefs(container));
+    if (!container) {
+      continue;
+    }
+
+    container->SetAnimationMode(aMode);
+  }
+}
+
+void ImageLoader::ClearFrames(nsPresContext* aPresContext) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  for (const auto& key : mRequestToFrameMap.Keys()) {
+    auto* request = static_cast<imgIRequest*>(key);
+
+#if defined(DEBUG)
+    {
+      nsCOMPtr<imgIRequest> debugRequest = request;
+      NS_ASSERTION(debugRequest == request, "This is bad");
+    }
+#endif
+
+    DeregisterImageRequest(request, aPresContext);
+  }
+
+  mRequestToFrameMap.Clear();
+  mFrameToRequestMap.Clear();
+}
+
+static CORSMode EffectiveCorsMode(nsIURI* aURI,
+                                  const StyleComputedUrl& aImage) {
+  MOZ_ASSERT(aURI);
+  StyleCorsMode mode = aImage.CorsMode();
+  if (mode == StyleCorsMode::None) {
+    return CORSMode::CORS_NONE;
+  }
+  MOZ_ASSERT(mode == StyleCorsMode::Anonymous);
+  if (aURI->SchemeIs("resource")) {
+    return CORSMode::CORS_NONE;
+  }
+  return CORSMode::CORS_ANONYMOUS;
+}
+
+already_AddRefed<imgRequestProxy> ImageLoader::LoadImage(
+    const StyleComputedUrl& aImage, Document& aDocument) {
+  MOZ_ASSERT(NS_IsMainThread());
+  nsIURI* uri = aImage.GetURI();
+  if (!uri) {
+    return nullptr;
+  }
+
+  if (aImage.HasRef()) {
+    bool isEqualExceptRef = false;
+    nsIURI* docURI = aDocument.GetDocumentURI();
+    if (NS_SUCCEEDED(uri->EqualsExceptRef(docURI, &isEqualExceptRef)) &&
+        isEqualExceptRef) {
+      return nullptr;
+    }
+  }
+
+  int32_t loadFlags =
+      nsIRequest::LOAD_NORMAL |
+      nsContentUtils::CORSModeToLoadImageFlags(EffectiveCorsMode(uri, aImage));
+
+  const URLExtraData& data = aImage.ExtraData();
+
+  RefPtr<imgRequestProxy> request;
+  nsresult rv = nsContentUtils::LoadImage(
+      uri, &aDocument, &aDocument, data.Principal(), 0, data.ReferrerInfo(),
+      sImageObserver, loadFlags, u"css"_ns, getter_AddRefs(request));
+
+  if (NS_FAILED(rv) || !request) {
+    return nullptr;
+  }
+
+  request->SetCancelable(false);
+  sImages->GetOrInsertNew(request);
+  return request.forget();
+}
+
+void ImageLoader::UnloadImage(imgRequestProxy* aImage) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aImage);
+
+  if (MOZ_UNLIKELY(!sImages)) {
+    return;  
+  }
+
+  auto lookup = sImages->Lookup(aImage);
+  MOZ_DIAGNOSTIC_ASSERT(lookup, "Unregistered image?");
+  if (MOZ_UNLIKELY(!lookup)) {
+    return;
+  }
+
+  if (MOZ_UNLIKELY(--lookup.Data()->mSharedCount)) {
+    return;
+  }
+
+  aImage->SetCancelable(true);
+  aImage->CancelAndForgetObserver(NS_BINDING_ABORTED);
+  MOZ_DIAGNOSTIC_ASSERT(lookup.Data()->mImageLoaders.IsEmpty(),
+                        "Shouldn't be keeping references to any loader "
+                        "by now");
+  lookup.Remove();
+}
+
+void ImageLoader::NoteSharedLoad(imgRequestProxy* aImage) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aImage);
+
+  auto lookup = sImages->Lookup(aImage);
+  MOZ_DIAGNOSTIC_ASSERT(lookup, "Unregistered image?");
+  if (MOZ_UNLIKELY(!lookup)) {
+    return;
+  }
+
+  lookup.Data()->mSharedCount++;
+}
+
+nsPresContext* ImageLoader::GetPresContext() {
+  if (!mDocument) {
+    return nullptr;
+  }
+
+  return mDocument->GetPresContext();
+}
+
+static bool IsRenderNoImages(uint32_t aDisplayItemKey) {
+  DisplayItemType type = GetDisplayItemTypeFromKey(aDisplayItemKey);
+  uint8_t flags = GetDisplayItemFlagsForType(type);
+  return flags & TYPE_RENDERS_NO_IMAGES;
+}
+
+static void InvalidateImages(nsIFrame* aFrame, imgIRequest* aRequest,
+                             bool aForcePaint) {
+  if (!aFrame->StyleVisibility()->IsVisible()) {
+    return;
+  }
+
+  if (aFrame->IsTablePart()) {
+    return aFrame->InvalidateFrame();
+  }
+
+  if (aFrame->ShouldPropagateRepaintsToRoot()) {
+    if (auto* canvas = aFrame->PresShell()->GetCanvasFrame()) {
+      InvalidateImages(canvas, aRequest, aForcePaint);
+    }
+  }
+
+  bool invalidateFrame = aForcePaint;
+
+  if (auto userDataTable =
+          aFrame->GetProperty(layers::WebRenderUserDataProperty::Key())) {
+    for (RefPtr<layers::WebRenderUserData> data : userDataTable->Values()) {
+      switch (data->GetType()) {
+        case layers::WebRenderUserData::UserDataType::eFallback:
+          if (!IsRenderNoImages(data->GetDisplayItemKey())) {
+            static_cast<layers::WebRenderFallbackData*>(data.get())
+                ->SetInvalid(true);
+          }
+          invalidateFrame = true;
+          break;
+        case layers::WebRenderUserData::UserDataType::eMask:
+          static_cast<layers::WebRenderMaskData*>(data.get())->Invalidate();
+          invalidateFrame = true;
+          break;
+        case layers::WebRenderUserData::UserDataType::eImageProvider:
+          if (static_cast<layers::WebRenderImageProviderData*>(data.get())
+                  ->Invalidate(aRequest->GetProviderId())) {
+            break;
+          }
+          [[fallthrough]];
+        default:
+          invalidateFrame = true;
+          break;
+      }
+    }
+  }
+
+  {
+    nsIFrame* f = aFrame;
+    while (f && !f->HasAnyStateBits(NS_FRAME_DESCENDANT_NEEDS_PAINT)) {
+      SVGObserverUtils::InvalidateDirectRenderingObservers(f);
+      f = nsLayoutUtils::GetCrossDocParentFrameInProcess(f);
+    }
+  }
+
+  if (invalidateFrame) {
+    aFrame->SchedulePaint();
+  }
+}
+
+void ImageLoader::UnblockOnloadIfNeeded(FrameWithFlags& aFwf) {
+  if (aFwf.mFlags & Flags::IsBlockingLoadEvent) {
+    mDocument->UnblockOnload(false);
+    aFwf.mFlags &= ~Flags::IsBlockingLoadEvent;
+  }
+}
+
+void ImageLoader::UnblockOnloadIfNeeded(nsIFrame* aFrame,
+                                        imgIRequest* aRequest) {
+  MOZ_ASSERT(aFrame);
+  MOZ_ASSERT(aRequest);
+
+  FrameSet* frameSet = mRequestToFrameMap.Get(aRequest);
+  if (!frameSet) {
+    return;
+  }
+
+  size_t i =
+      frameSet->BinaryIndexOf(FrameWithFlags(aFrame), FrameOnlyComparator());
+  if (i != FrameSet::NoIndex) {
+    UnblockOnloadIfNeeded(frameSet->ElementAt(i));
+  }
+}
+
+struct ImageLoader::ImageReflowCallback final : public nsIReflowCallback {
+  RefPtr<ImageLoader> mLoader;
+  WeakFrame mFrame;
+  nsCOMPtr<imgIRequest> const mRequest;
+
+  ImageReflowCallback(ImageLoader* aLoader, nsIFrame* aFrame,
+                      imgIRequest* aRequest)
+      : mLoader(aLoader), mFrame(aFrame), mRequest(aRequest) {}
+
+  bool ReflowFinished() override;
+  void ReflowCallbackCanceled() override;
+};
+
+bool ImageLoader::ImageReflowCallback::ReflowFinished() {
+  if (mFrame.IsAlive()) {
+    mLoader->UnblockOnloadIfNeeded(mFrame, mRequest);
+  }
+
+  delete this;
+
+  return false;
+}
+
+void ImageLoader::ImageReflowCallback::ReflowCallbackCanceled() {
+  if (mFrame.IsAlive()) {
+    mLoader->UnblockOnloadIfNeeded(mFrame, mRequest);
+  }
+
+  delete this;
+}
+
+void GlobalImageObserver::Notify(imgIRequest* aRequest, int32_t aType,
+                                 const nsIntRect* aData) {
+  auto entry = sImages->Lookup(aRequest);
+  MOZ_DIAGNOSTIC_ASSERT(entry);
+  if (MOZ_UNLIKELY(!entry)) {
+    return;
+  }
+
+  const auto loadersToNotify =
+      ToTArray<nsTArray<RefPtr<ImageLoader>>>(entry.Data()->mImageLoaders);
+  for (const auto& loader : loadersToNotify) {
+    loader->Notify(aRequest, aType, aData);
+  }
+}
+
+void ImageLoader::Notify(imgIRequest* aRequest, int32_t aType,
+                         const nsIntRect* aData) {
+  if (aType == imgINotificationObserver::SIZE_AVAILABLE) {
+    nsCOMPtr<imgIContainer> image;
+    aRequest->GetImage(getter_AddRefs(image));
+    return OnSizeAvailable(aRequest, image);
+  }
+
+  if (aType == imgINotificationObserver::IS_ANIMATED) {
+    return OnImageIsAnimated(aRequest);
+  }
+
+  if (aType == imgINotificationObserver::FRAME_COMPLETE) {
+    return OnFrameComplete(aRequest);
+  }
+
+  if (aType == imgINotificationObserver::FRAME_UPDATE) {
+    return OnFrameUpdate(aRequest);
+  }
+
+  if (aType == imgINotificationObserver::LOAD_COMPLETE) {
+    return OnLoadComplete(aRequest);
+  }
+}
+
+void ImageLoader::OnSizeAvailable(imgIRequest* aRequest,
+                                  imgIContainer* aImage) {
+  nsPresContext* presContext = GetPresContext();
+  if (!presContext) {
+    return;
+  }
+
+  aImage->SetAnimationMode(presContext->ImageAnimationMode());
+
+  FrameSet* frameSet = mRequestToFrameMap.Get(aRequest);
+  if (!frameSet) {
+    return;
+  }
+
+  for (const FrameWithFlags& fwf : *frameSet) {
+    if (fwf.mFlags & Flags::RequiresReflowOnSizeAvailable) {
+      fwf.mFrame->PresShell()->FrameNeedsReflow(
+          fwf.mFrame, IntrinsicDirty::FrameAncestorsAndDescendants,
+          NS_FRAME_IS_DIRTY);
+    }
+  }
+}
+
+void ImageLoader::OnImageIsAnimated(imgIRequest* aRequest) {
+  if (!mDocument) {
+    return;
+  }
+
+  FrameSet* frameSet = mRequestToFrameMap.Get(aRequest);
+  if (!frameSet) {
+    return;
+  }
+
+  nsPresContext* presContext = GetPresContext();
+  if (presContext) {
+    nsLayoutUtils::RegisterImageRequest(presContext, aRequest, nullptr);
+  }
+}
+
+void ImageLoader::OnFrameComplete(imgIRequest* aRequest) {
+  ImageFrameChanged(aRequest,  true);
+}
+
+void ImageLoader::OnFrameUpdate(imgIRequest* aRequest) {
+  ImageFrameChanged(aRequest,  false);
+}
+
+void ImageLoader::ImageFrameChanged(imgIRequest* aRequest, bool aFirstFrame) {
+  if (!mDocument) {
+    return;
+  }
+
+  FrameSet* frameSet = mRequestToFrameMap.Get(aRequest);
+  if (!frameSet) {
+    return;
+  }
+
+  for (FrameWithFlags& fwf : *frameSet) {
+    const bool forceRepaint = aFirstFrame;
+    InvalidateImages(fwf.mFrame, aRequest, forceRepaint);
+    if (!aFirstFrame) {
+      continue;
+    }
+    if (fwf.mFlags &
+        Flags::RequiresReflowOnFirstFrameCompleteAndLoadEventBlocking) {
+      nsIFrame* parent = fwf.mFrame->GetInFlowParent();
+      parent->PresShell()->FrameNeedsReflow(
+          parent, IntrinsicDirty::FrameAncestorsAndDescendants,
+          NS_FRAME_IS_DIRTY);
+      if (fwf.mFlags & Flags::IsBlockingLoadEvent) {
+        auto* unblocker = new ImageReflowCallback(this, fwf.mFrame, aRequest);
+        parent->PresShell()->PostReflowCallback(unblocker);
+      }
+    }
+  }
+}
+
+void ImageLoader::OnLoadComplete(imgIRequest* aRequest) {
+  if (!mDocument) {
+    return;
+  }
+
+  uint32_t status = 0;
+  if (NS_FAILED(aRequest->GetImageStatus(&status))) {
+    return;
+  }
+
+  FrameSet* frameSet = mRequestToFrameMap.Get(aRequest);
+  if (!frameSet) {
+    return;
+  }
+
+  for (FrameWithFlags& fwf : *frameSet) {
+    if (status & imgIRequest::STATUS_ERROR) {
+      UnblockOnloadIfNeeded(fwf);
+    }
+    nsIFrame* frame = fwf.mFrame;
+    if (frame->StyleVisibility()->IsVisible()) {
+      frame->SchedulePaint();
+    }
+
+    if (StaticPrefs::dom_enable_largest_contentful_paint()) {
+      LargestContentfulPaint::MaybeProcessImageForElementTiming(
+          static_cast<imgRequestProxy*>(aRequest),
+          frame->GetContent()->AsElement());
+    }
+  }
+}
+}  

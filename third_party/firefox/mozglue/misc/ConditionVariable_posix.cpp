@@ -1,0 +1,122 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/Assertions.h"
+#include "mozilla/CheckedInt.h"
+
+#include <errno.h>
+#include <pthread.h>
+#include <time.h>
+
+#include "mozilla/PlatformConditionVariable.h"
+#include "mozilla/PlatformMutex.h"
+
+using mozilla::CheckedInt;
+using mozilla::TimeDuration;
+
+static const long NanoSecPerSec = 1000000000;
+
+#if defined(HAVE_CLOCK_MONOTONIC) && !0
+#  define CV_USE_CLOCK_API
+#endif
+
+#if defined(CV_USE_CLOCK_API)
+static const clockid_t WhichClock = CLOCK_MONOTONIC;
+
+static void moz_timespecadd(struct timespec* lhs, struct timespec* rhs,
+                            struct timespec* result) {
+  MOZ_RELEASE_ASSERT(lhs->tv_nsec < NanoSecPerSec);
+  MOZ_RELEASE_ASSERT(rhs->tv_nsec < NanoSecPerSec);
+  result->tv_nsec = lhs->tv_nsec + rhs->tv_nsec;
+
+  CheckedInt<time_t> sec = CheckedInt<time_t>(lhs->tv_sec) + rhs->tv_sec;
+
+  if (result->tv_nsec >= NanoSecPerSec) {
+    MOZ_RELEASE_ASSERT(result->tv_nsec < 2 * NanoSecPerSec);
+    result->tv_nsec -= NanoSecPerSec;
+    sec += 1;
+  }
+
+  MOZ_RELEASE_ASSERT(sec.isValid());
+  result->tv_sec = sec.value();
+}
+#endif
+
+mozilla::detail::ConditionVariableImpl::ConditionVariableImpl() {
+#if defined(CV_USE_CLOCK_API)
+  pthread_condattr_t attr;
+  int r0 = pthread_condattr_init(&attr);
+  MOZ_RELEASE_ASSERT(!r0);
+
+  int r1 = pthread_condattr_setclock(&attr, WhichClock);
+  MOZ_RELEASE_ASSERT(!r1);
+
+  int r2 = pthread_cond_init(&mCond, &attr);
+  MOZ_RELEASE_ASSERT(!r2);
+
+  int r3 = pthread_condattr_destroy(&attr);
+  MOZ_RELEASE_ASSERT(!r3);
+#else
+  int r = pthread_cond_init(&mCond, nullptr);
+  MOZ_RELEASE_ASSERT(!r);
+#endif
+}
+
+mozilla::detail::ConditionVariableImpl::~ConditionVariableImpl() {
+  int r = pthread_cond_destroy(&mCond);
+  MOZ_RELEASE_ASSERT(r == 0);
+}
+
+void mozilla::detail::ConditionVariableImpl::notify_one() {
+  int r = pthread_cond_signal(&mCond);
+  MOZ_RELEASE_ASSERT(r == 0);
+}
+
+void mozilla::detail::ConditionVariableImpl::notify_all() {
+  int r = pthread_cond_broadcast(&mCond);
+  MOZ_RELEASE_ASSERT(r == 0);
+}
+
+void mozilla::detail::ConditionVariableImpl::wait(MutexImpl& lock) {
+  int r = pthread_cond_wait(&mCond, &lock.mMutex);
+  MOZ_RELEASE_ASSERT(r == 0);
+}
+
+mozilla::CVStatus mozilla::detail::ConditionVariableImpl::wait_for(
+    MutexImpl& lock, const TimeDuration& a_rel_time) {
+  if (a_rel_time == TimeDuration::Forever()) {
+    wait(lock);
+    return CVStatus::NoTimeout;
+  }
+
+  int r;
+
+  TimeDuration rel_time = a_rel_time < TimeDuration::FromSeconds(0)
+                              ? TimeDuration::FromSeconds(0)
+                              : a_rel_time;
+
+  struct timespec rel_ts;
+  rel_ts.tv_sec = static_cast<time_t>(rel_time.ToSeconds());
+  rel_ts.tv_nsec =
+      static_cast<uint64_t>(rel_time.ToMicroseconds() * 1000.0) % NanoSecPerSec;
+
+#if defined(CV_USE_CLOCK_API)
+  struct timespec now_ts;
+  r = clock_gettime(WhichClock, &now_ts);
+  MOZ_RELEASE_ASSERT(!r);
+
+  struct timespec abs_ts;
+  moz_timespecadd(&now_ts, &rel_ts, &abs_ts);
+
+  r = pthread_cond_timedwait(&mCond, &lock.mMutex, &abs_ts);
+#else
+  r = pthread_cond_timedwait_relative_np(&mCond, &lock.mMutex, &rel_ts);
+#endif
+
+  if (r == 0) {
+    return CVStatus::NoTimeout;
+  }
+  MOZ_RELEASE_ASSERT(r == ETIMEDOUT);
+  return CVStatus::Timeout;
+}

@@ -1,0 +1,51 @@
+// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(BASE_AT_EXIT_H_)
+#define BASE_AT_EXIT_H_
+
+#include <stack>
+
+#include "base/basictypes.h"
+
+#include "mozilla/Mutex.h"
+
+namespace base {
+
+
+class AtExitManager {
+ protected:
+  explicit AtExitManager(bool shadow);
+
+ public:
+  typedef void (*AtExitCallbackType)(void*);
+
+  AtExitManager();
+
+  ~AtExitManager();
+
+  static void RegisterCallback(AtExitCallbackType func, void* param);
+
+  static void ProcessCallbacksNow();
+
+  static bool AlreadyRegistered();
+
+ private:
+  struct CallbackAndParam {
+    CallbackAndParam(AtExitCallbackType func, void* param)
+        : func_(func), param_(param) {}
+    AtExitCallbackType func_;
+    void* param_;
+  };
+
+  mozilla::Mutex lock_;
+  std::stack<CallbackAndParam> stack_ MOZ_GUARDED_BY(lock_);
+  AtExitManager* next_manager_;  
+
+  DISALLOW_COPY_AND_ASSIGN(AtExitManager);
+};
+
+}  
+
+#endif

@@ -1,0 +1,41 @@
+/*
+ * Copyright 2020 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_MEMORYPOOL)
+#define SKSL_MEMORYPOOL
+
+#include <memory>
+
+#include "include/core/SkTypes.h"
+#include "src/base/SkArenaAlloc.h"
+
+namespace SkSL {
+
+class MemoryPool {
+public:
+    static std::unique_ptr<MemoryPool> Make() {
+        return std::make_unique<MemoryPool>();
+    }
+    void* allocate(size_t size) {
+        return fArena.makeBytesAlignedTo(size, kAlignment);
+    }
+    void release(void*) {
+    }
+
+private:
+#if defined(SK_FORCE_8_BYTE_ALIGNMENT)
+    static constexpr size_t kAlignment = 8;
+#else
+    static constexpr size_t kAlignment = alignof(std::max_align_t);
+#endif
+
+    SkSTArenaAlloc<65536> fArena{32768};
+};
+
+}  
+
+#endif

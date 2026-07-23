@@ -1,0 +1,614 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/MotionPathUtils.h"
+
+#include <math.h>
+
+#include "gfxPlatform.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/SVGObserverUtils.h"
+#include "mozilla/ShapeUtils.h"
+#include "mozilla/dom/SVGGeometryElement.h"
+#include "mozilla/dom/SVGPathData.h"
+#include "mozilla/dom/SVGViewportElement.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/gfx/Matrix.h"
+#include "mozilla/layers/LayersMessages.h"
+#include "nsIFrame.h"
+#include "nsLayoutUtils.h"
+#include "nsStyleTransformMatrix.h"
+
+namespace mozilla {
+
+using nsStyleTransformMatrix::TransformReferenceBox;
+
+CSSPoint MotionPathUtils::ComputeAnchorPointAdjustment(const nsIFrame& aFrame) {
+  if (!aFrame.HasAnyStateBits(NS_FRAME_SVG_LAYOUT)) {
+    return {};
+  }
+
+  auto transformBox = aFrame.StyleDisplay()->mTransformBox;
+  if (transformBox == StyleTransformBox::ViewBox ||
+      transformBox == StyleTransformBox::BorderBox) {
+    return {};
+  }
+
+  if (aFrame.IsSVGContainerFrame()) {
+    nsRect boxRect = nsLayoutUtils::ComputeSVGReferenceRect(
+        const_cast<nsIFrame*>(&aFrame), StyleGeometryBox::FillBox);
+    return CSSPoint::FromAppUnits(boxRect.TopLeft());
+  }
+  return CSSPoint::FromAppUnits(aFrame.GetPosition());
+}
+
+static StyleGeometryBox CoordBoxToGeometryBoxInCSSLayout(
+    StyleCoordBox aCoordBox) {
+  switch (aCoordBox) {
+    case StyleCoordBox::ContentBox:
+      return StyleGeometryBox::ContentBox;
+    case StyleCoordBox::PaddingBox:
+      return StyleGeometryBox::PaddingBox;
+    case StyleCoordBox::BorderBox:
+      return StyleGeometryBox::BorderBox;
+    case StyleCoordBox::FillBox:
+      return StyleGeometryBox::ContentBox;
+    case StyleCoordBox::StrokeBox:
+    case StyleCoordBox::ViewBox:
+      return StyleGeometryBox::BorderBox;
+  }
+  MOZ_ASSERT_UNREACHABLE("Unknown coord-box type");
+  return StyleGeometryBox::BorderBox;
+}
+
+const nsIFrame* MotionPathUtils::GetOffsetPathReferenceBox(
+    const nsIFrame* aFrame, nsRect& aOutputRect) {
+  const StyleOffsetPath& offsetPath = aFrame->StyleDisplay()->mOffsetPath;
+  if (offsetPath.IsNone()) {
+    return nullptr;
+  }
+
+  if (aFrame->HasAnyStateBits(NS_FRAME_SVG_LAYOUT)) {
+    MOZ_ASSERT(aFrame->GetContent()->IsSVGElement());
+    auto* viewportElement =
+        dom::SVGElement::FromNode(aFrame->GetContent())->GetCtx();
+    aOutputRect = nsLayoutUtils::ComputeSVGOriginBox(viewportElement);
+    return viewportElement ? viewportElement->GetPrimaryFrame() : nullptr;
+  }
+
+  const nsIFrame* containingBlock = aFrame->GetContainingBlock();
+  const StyleCoordBox coordBox = offsetPath.IsCoordBox()
+                                     ? offsetPath.AsCoordBox()
+                                     : offsetPath.AsOffsetPath().coord_box;
+  aOutputRect = nsLayoutUtils::ComputeHTMLReferenceRect(
+      containingBlock, CoordBoxToGeometryBoxInCSSLayout(coordBox));
+  return containingBlock;
+}
+
+CSSCoord MotionPathUtils::GetRayContainReferenceSize(nsIFrame* aFrame) {
+
+
+  const auto size = CSSSize::FromAppUnits(
+      (aFrame->HasAnyStateBits(NS_FRAME_SVG_LAYOUT)
+           ? nsLayoutUtils::ComputeSVGReferenceRect(
+                 aFrame,
+                 aFrame->StyleSVGReset()->HasNonScalingStroke()
+                     ? StyleGeometryBox::FillBox
+                     : StyleGeometryBox::StrokeBox,
+                 nsLayoutUtils::MayHaveNonScalingStrokeCyclicDependency::Yes)
+           : nsLayoutUtils::ComputeHTMLReferenceRect(
+                 aFrame, StyleGeometryBox::BorderBox))
+          .Size());
+  return std::max(size.width, size.height);
+}
+
+nsTArray<nscoord> MotionPathUtils::ComputeBorderRadii(
+    const StyleBorderRadius& aBorderRadius, const nsRect& aCoordBox) {
+  const nsRect insetRect = ShapeUtils::ComputeInsetRect(
+      StyleRect<LengthPercentage>::WithAllSides(LengthPercentage::Zero()),
+      aCoordBox);
+  nsTArray<nscoord> result;
+  nsRectCornerRadii radii;
+  if (ShapeUtils::ComputeRectRadii(aBorderRadius, aCoordBox, insetRect,
+                                   radii)) {
+    result.SetCapacity(8);
+    for (auto hc : AllPhysicalHalfCorners()) {
+      result.AppendElement(radii[hc]);
+    }
+  }
+  return result;
+}
+
+static CSSCoord ComputeSides(const CSSPoint& aOrigin,
+                             const CSSRect& aContainingBlock,
+                             const StyleAngle& aAngle) {
+  const CSSPoint& topLeft = aContainingBlock.TopLeft();
+  const double theta = aAngle.ToRadians();
+  double sint = std::sin(theta);
+  double cost = std::cos(theta);
+
+  const double b = cost >= 0 ? aOrigin.y.value - topLeft.y
+                             : aContainingBlock.YMost() - aOrigin.y.value;
+  const double bPrime = sint >= 0 ? aContainingBlock.XMost() - aOrigin.x.value
+                                  : aOrigin.x.value - topLeft.x;
+  sint = std::fabs(sint);
+  cost = std::fabs(cost);
+
+  if (sint < std::numeric_limits<double>::epsilon()) {
+    return static_cast<float>(b);
+  }
+
+  if (cost < std::numeric_limits<double>::epsilon()) {
+    return static_cast<float>(bPrime);
+  }
+
+  if (b * sint > bPrime * cost) {
+    return bPrime / sint;
+  }
+  return b / cost;
+}
+
+static nsPoint ComputePosition(const StylePositionOrAuto& aAtPosition,
+                               const StyleOffsetPosition& aOffsetPosition,
+                               const nsRect& aCoordBox,
+                               const nsPoint& aCurrentCoord) {
+  if (aAtPosition.IsPosition()) {
+    return ShapeUtils::ComputePosition(aAtPosition.AsPosition(), aCoordBox);
+  }
+
+  MOZ_ASSERT(aAtPosition.IsAuto(), "\"at <position>\" should be omitted");
+
+  if (aOffsetPosition.IsPosition()) {
+    return ShapeUtils::ComputePosition(aOffsetPosition.AsPosition(), aCoordBox);
+  }
+
+  if (aOffsetPosition.IsNormal()) {
+    const StylePosition& center = StylePosition::FromPercentage(0.5);
+    return ShapeUtils::ComputePosition(center, aCoordBox);
+  }
+
+  MOZ_ASSERT(aOffsetPosition.IsAuto());
+  return aCurrentCoord;
+}
+
+static CSSCoord ComputeRayPathLength(const StyleRaySize aRaySizeType,
+                                     const StyleAngle& aAngle,
+                                     const CSSPoint& aOrigin,
+                                     const CSSRect& aContainingBlock) {
+  if (aRaySizeType == StyleRaySize::Sides) {
+    if (!aContainingBlock.ContainsInclusively(aOrigin)) {
+      return 0.0;
+    }
+
+    return ComputeSides(aOrigin, aContainingBlock, aAngle);
+  }
+
+  const CSSPoint& topLeft = aContainingBlock.TopLeft();
+  const CSSCoord left = std::abs(aOrigin.x - topLeft.x);
+  const CSSCoord right = std::abs(aContainingBlock.XMost() - aOrigin.x);
+  const CSSCoord top = std::abs(aOrigin.y - topLeft.y);
+  const CSSCoord bottom = std::abs(aContainingBlock.YMost() - aOrigin.y);
+
+  switch (aRaySizeType) {
+    case StyleRaySize::ClosestSide:
+      return std::min({left, right, top, bottom});
+
+    case StyleRaySize::FarthestSide:
+      return std::max({left, right, top, bottom});
+
+    case StyleRaySize::ClosestCorner:
+    case StyleRaySize::FarthestCorner: {
+      CSSCoord h = 0;
+      CSSCoord v = 0;
+      if (aRaySizeType == StyleRaySize::ClosestCorner) {
+        h = std::min(left, right);
+        v = std::min(top, bottom);
+      } else {
+        h = std::max(left, right);
+        v = std::max(top, bottom);
+      }
+      return sqrt(h.value * h.value + v.value * v.value);
+    }
+    case StyleRaySize::Sides:
+      MOZ_ASSERT_UNREACHABLE("Unsupported ray size");
+  }
+
+  return 0.0;
+}
+
+static CSSCoord ComputeRayUsedDistance(
+    const StyleRayFunction& aRay, const LengthPercentage& aDistance,
+    const CSSCoord& aPathLength, const CSSCoord& aRayContainReferenceLength) {
+  CSSCoord usedDistance = aDistance.ResolveToCSSPixels(aPathLength);
+  if (!aRay.contain) {
+    return usedDistance;
+  }
+
+  return std::max((usedDistance - aRayContainReferenceLength / 2.0f).value,
+                  0.0f);
+}
+
+Maybe<ResolvedMotionPathData> MotionPathUtils::ResolveMotionPath(
+    const OffsetPathData& aPath, const LengthPercentage& aDistance,
+    const StyleOffsetRotate& aRotate, const StylePositionOrAuto& aAnchor,
+    const StyleOffsetPosition& aPosition, const CSSPoint& aTransformOrigin,
+    TransformReferenceBox& aRefBox, const CSSPoint& aAnchorPointAdjustment) {
+  if (aPath.IsNone()) {
+    return Nothing();
+  }
+
+  double directionAngle = 0.0;
+  gfx::Point point;
+  if (aPath.IsShape()) {
+    const auto& data = aPath.AsShape();
+    RefPtr<gfx::Path> path = data.mGfxPath;
+    MOZ_ASSERT(path, "The empty path is not allowed");
+
+    gfx::Float pathLength = path->ComputeLength();
+    gfx::Float usedDistance =
+        aDistance.ResolveToCSSPixels(CSSCoord(pathLength));
+    if (data.mIsClosedLoop) {
+      usedDistance = pathLength > 0.0 ? fmod(usedDistance, pathLength) : 0.0;
+      if (usedDistance < 0.0) {
+        usedDistance += pathLength;
+      }
+    } else {
+      usedDistance = std::clamp(usedDistance, 0.0f, pathLength);
+    }
+    gfx::Point tangent;
+    point = path->ComputePointAtLength(usedDistance, &tangent);
+    point -= NSPointToPoint(data.mCurrentPosition, AppUnitsPerCSSPixel());
+    directionAngle =
+        pathLength < std::numeric_limits<gfx::Float>::epsilon()
+            ? 0.0
+            : atan2((double)tangent.y, (double)tangent.x);  
+  } else if (aPath.IsRay()) {
+    const auto& ray = aPath.AsRay();
+    MOZ_ASSERT(ray.mRay);
+
+    const CSSPoint origin = CSSPoint::FromAppUnits(ComputePosition(
+        ray.mRay->position, aPosition, ray.mCoordBox, ray.mCurrentPosition));
+    const CSSCoord pathLength =
+        ComputeRayPathLength(ray.mRay->size, ray.mRay->angle, origin,
+                             CSSRect::FromAppUnits(ray.mCoordBox));
+    const CSSCoord usedDistance = ComputeRayUsedDistance(
+        *ray.mRay, aDistance, pathLength, ray.mContainReferenceLength);
+
+    directionAngle =
+        StyleAngle{ray.mRay->angle.ToDegrees() - 90.0f}.ToRadians();
+
+    const gfx::Point vectorToOrigin =
+        (origin - CSSPoint::FromAppUnits(ray.mCurrentPosition))
+            .ToUnknownPoint();
+    point =
+        vectorToOrigin +
+        gfx::Point(usedDistance * static_cast<gfx::Float>(cos(directionAngle)),
+                   usedDistance * static_cast<gfx::Float>(sin(directionAngle)));
+  } else {
+    MOZ_ASSERT_UNREACHABLE("Unsupported offset-path value");
+    return Nothing();
+  }
+
+  gfx::Float angle = static_cast<gfx::Float>(
+      (aRotate.auto_ ? directionAngle : 0.0) + aRotate.angle.ToRadians());
+
+  CSSPoint anchorPoint(aTransformOrigin);
+  gfx::Point shift;
+  if (!aAnchor.IsAuto()) {
+    const auto& pos = aAnchor.AsPosition();
+    anchorPoint = nsStyleTransformMatrix::Convert2DPosition(
+        pos.horizontal, pos.vertical, aRefBox);
+    shift = (anchorPoint - aTransformOrigin).ToUnknownPoint();
+  }
+
+  anchorPoint += aAnchorPointAdjustment;
+
+  return Some(ResolvedMotionPathData{point - anchorPoint.ToUnknownPoint(),
+                                     angle, shift});
+}
+
+static inline bool IsClosedLoop(const StyleSVGPathData& aPathData) {
+  return !aPathData._0.AsSpan().empty() &&
+         aPathData._0.AsSpan().rbegin()->IsClose();
+}
+
+static already_AddRefed<gfx::Path> BuildSimpleInsetPath(
+    const StyleBorderRadius& aBorderRadius, const nsRect& aCoordBox,
+    gfx::PathBuilder* aPathBuilder) {
+  if (!aPathBuilder) {
+    return nullptr;
+  }
+
+  const nsRect insetRect = ShapeUtils::ComputeInsetRect(
+      StyleRect<LengthPercentage>::WithAllSides(LengthPercentage::Zero()),
+      aCoordBox);
+  nsRectCornerRadii radii;
+  const bool hasRadii =
+      ShapeUtils::ComputeRectRadii(aBorderRadius, aCoordBox, insetRect, radii);
+  return ShapeUtils::BuildRectPath(insetRect, hasRadii ? &radii : nullptr,
+                                   aCoordBox, AppUnitsPerCSSPixel(),
+                                   aPathBuilder);
+}
+
+static already_AddRefed<gfx::Path> BuildDefaultPathForURL(
+    gfx::PathBuilder* aBuilder) {
+  if (!aBuilder) {
+    return nullptr;
+  }
+
+  using CommandEndPoint =
+      StyleCommandEndPoint<StyleSVGPathPosition, StyleCSSFloat>;
+  Array<const StylePathCommand, 1> array(
+      StylePathCommand::Move(CommandEndPoint::ByCoordinate({0.0, 0.0})));
+  return SVGPathData::BuildPath(array, aBuilder, StyleStrokeLinecap::Butt, 0.0);
+}
+
+static OffsetPathData GenerateOffsetPathData(const nsIFrame* aFrame) {
+  const StyleOffsetPath& offsetPath = aFrame->StyleDisplay()->mOffsetPath;
+  if (offsetPath.IsNone()) {
+    return OffsetPathData::None();
+  }
+
+  if (offsetPath.IsRay()) {
+    nsRect coordBox;
+    const nsIFrame* containingBlockFrame =
+        MotionPathUtils::GetOffsetPathReferenceBox(aFrame, coordBox);
+    return !containingBlockFrame
+               ? OffsetPathData::None()
+               : OffsetPathData::Ray(
+                     offsetPath.AsRay(), std::move(coordBox),
+                     aFrame->GetOffsetTo(containingBlockFrame),
+                     MotionPathUtils::GetRayContainReferenceSize(
+                         const_cast<nsIFrame*>(aFrame)));
+  }
+
+  if (offsetPath.IsPath()) {
+    const StyleSVGPathData& pathData = offsetPath.AsSVGPathData();
+    RefPtr<gfx::Path> gfxPath =
+        aFrame->GetProperty(nsIFrame::OffsetPathCache());
+    MOZ_ASSERT(gfxPath || pathData._0.IsEmpty(),
+               "Should have a valid cached gfx::Path or an empty path string");
+    return OffsetPathData::Shape(gfxPath.forget(), {}, IsClosedLoop(pathData));
+  }
+
+  nsRect coordBox;
+  const nsIFrame* containingFrame =
+      MotionPathUtils::GetOffsetPathReferenceBox(aFrame, coordBox);
+  if (!containingFrame || coordBox.IsEmpty()) {
+    return OffsetPathData::None();
+  }
+  nsPoint currentPosition = aFrame->GetOffsetTo(containingFrame);
+  RefPtr<gfx::PathBuilder> builder = MotionPathUtils::GetPathBuilder();
+
+  if (offsetPath.IsUrl()) {
+    dom::SVGGeometryElement* element =
+        SVGObserverUtils::GetAndObserveGeometry(const_cast<nsIFrame*>(aFrame));
+    if (!element) {
+      RefPtr<gfx::Path> path = BuildDefaultPathForURL(builder);
+      return path ? OffsetPathData::Shape(path.forget(), {}, false)
+                  : OffsetPathData::None();
+    }
+
+    RefPtr<gfx::Path> path = element->GetOrBuildPathForMeasuring();
+
+    nsPoint positionInCoordBox = currentPosition - coordBox.TopLeft();
+    return path ? OffsetPathData::Shape(path.forget(),
+                                        std::move(positionInCoordBox),
+                                        element->IsClosedLoop())
+                : OffsetPathData::None();
+  }
+
+  MOZ_ASSERT(offsetPath.IsBasicShapeOrCoordBox());
+
+  const nsStyleDisplay* disp = aFrame->StyleDisplay();
+  RefPtr<gfx::Path> path =
+      disp->mOffsetPath.IsCoordBox()
+          ? BuildSimpleInsetPath(containingFrame->StyleBorder()->mBorderRadius,
+                                 coordBox, builder)
+          : MotionPathUtils::BuildPath(
+                disp->mOffsetPath.AsOffsetPath().path->AsShape(),
+                disp->mOffsetPosition, coordBox, currentPosition, builder);
+  return path ? OffsetPathData::Shape(path.forget(), std::move(currentPosition),
+                                      true)
+              : OffsetPathData::None();
+}
+
+Maybe<ResolvedMotionPathData> MotionPathUtils::ResolveMotionPath(
+    const nsIFrame* aFrame, TransformReferenceBox& aRefBox) {
+  MOZ_ASSERT(aFrame);
+
+  const nsStyleDisplay* display = aFrame->StyleDisplay();
+
+  CSSPoint transformOrigin = nsStyleTransformMatrix::Convert2DPosition(
+      display->mTransformOrigin.horizontal, display->mTransformOrigin.vertical,
+      aRefBox);
+
+  return ResolveMotionPath(
+      GenerateOffsetPathData(aFrame), display->mOffsetDistance,
+      display->mOffsetRotate, display->mOffsetAnchor, display->mOffsetPosition,
+      transformOrigin, aRefBox, ComputeAnchorPointAdjustment(*aFrame));
+}
+
+static OffsetPathData GenerateOffsetPathData(
+    const StyleOffsetPath& aOffsetPath,
+    const StyleOffsetPosition& aOffsetPosition,
+    const layers::MotionPathData& aMotionPathData,
+    gfx::Path* aCachedMotionPath) {
+  if (aOffsetPath.IsNone()) {
+    return OffsetPathData::None();
+  }
+
+  if (aOffsetPath.IsRay()) {
+    return aMotionPathData.coordBox().IsEmpty()
+               ? OffsetPathData::None()
+               : OffsetPathData::Ray(
+                     aOffsetPath.AsRay(), aMotionPathData.coordBox(),
+                     aMotionPathData.currentPosition(),
+                     aMotionPathData.rayContainReferenceLength());
+  }
+
+  if (aOffsetPath.IsPath()) {
+    const StyleSVGPathData& pathData = aOffsetPath.AsSVGPathData();
+    RefPtr<gfx::Path> path = aCachedMotionPath;
+    if (!path) {
+      RefPtr<gfx::PathBuilder> builder =
+          MotionPathUtils::GetCompositorPathBuilder();
+      path = MotionPathUtils::BuildSVGPath(pathData, builder);
+    }
+    return OffsetPathData::Shape(path.forget(), {}, IsClosedLoop(pathData));
+  }
+
+  MOZ_ASSERT(aOffsetPath.IsBasicShapeOrCoordBox());
+
+  const nsRect& coordBox = aMotionPathData.coordBox();
+  if (coordBox.IsEmpty()) {
+    return OffsetPathData::None();
+  }
+
+  RefPtr<gfx::PathBuilder> builder =
+      MotionPathUtils::GetCompositorPathBuilder();
+  if (!builder) {
+    return OffsetPathData::None();
+  }
+
+  RefPtr<gfx::Path> path;
+  if (aOffsetPath.IsCoordBox()) {
+    const nsRect insetRect = ShapeUtils::ComputeInsetRect(
+        StyleRect<LengthPercentage>::WithAllSides(LengthPercentage::Zero()),
+        coordBox);
+    const nsTArray<nscoord>& radii = aMotionPathData.coordBoxInsetRadii();
+    nsRectCornerRadii rectRadii;
+    if (!radii.IsEmpty()) {
+      for (auto hc : AllPhysicalHalfCorners()) {
+        rectRadii[hc] = radii[hc];
+      }
+    }
+    path = ShapeUtils::BuildRectPath(insetRect,
+                                     radii.IsEmpty() ? nullptr : &rectRadii,
+                                     coordBox, AppUnitsPerCSSPixel(), builder);
+  } else {
+    path = MotionPathUtils::BuildPath(
+        aOffsetPath.AsOffsetPath().path->AsShape(), aOffsetPosition, coordBox,
+        aMotionPathData.currentPosition(), builder);
+  }
+
+  return path ? OffsetPathData::Shape(
+                    path.forget(), nsPoint(aMotionPathData.currentPosition()),
+                    true)
+              : OffsetPathData::None();
+}
+
+Maybe<ResolvedMotionPathData> MotionPathUtils::ResolveMotionPath(
+    const StyleOffsetPath* aPath, const StyleLengthPercentage* aDistance,
+    const StyleOffsetRotate* aRotate, const StylePositionOrAuto* aAnchor,
+    const StyleOffsetPosition* aPosition,
+    const Maybe<layers::MotionPathData>& aMotionPathData,
+    TransformReferenceBox& aRefBox, gfx::Path* aCachedMotionPath) {
+  if (!aPath) {
+    return Nothing();
+  }
+
+  MOZ_ASSERT(aMotionPathData);
+
+  auto zeroOffsetDistance = LengthPercentage::Zero();
+  auto autoOffsetRotate = StyleOffsetRotate{true, StyleAngle::Zero()};
+  auto autoOffsetAnchor = StylePositionOrAuto::Auto();
+  auto autoOffsetPosition = StyleOffsetPosition::Auto();
+  return ResolveMotionPath(
+      GenerateOffsetPathData(*aPath,
+                             aPosition ? *aPosition : autoOffsetPosition,
+                             *aMotionPathData, aCachedMotionPath),
+      aDistance ? *aDistance : zeroOffsetDistance,
+      aRotate ? *aRotate : autoOffsetRotate,
+      aAnchor ? *aAnchor : autoOffsetAnchor,
+      aPosition ? *aPosition : autoOffsetPosition, aMotionPathData->origin(),
+      aRefBox, aMotionPathData->anchorAdjustment());
+}
+
+already_AddRefed<gfx::Path> MotionPathUtils::BuildSVGPath(
+    const StyleSVGPathData& aPath, gfx::PathBuilder* aPathBuilder) {
+  if (!aPathBuilder) {
+    return nullptr;
+  }
+
+  const Span<const StylePathCommand>& path = aPath._0.AsSpan();
+  return SVGPathData::BuildPath(path, aPathBuilder, StyleStrokeLinecap::Butt,
+                                0.0);
+}
+
+static already_AddRefed<gfx::Path> BuildShape(
+    const Span<const StyleShapeCommand>& aShape, gfx::PathBuilder* aPathBuilder,
+    const nsRect& aCoordBox) {
+  if (!aPathBuilder) {
+    return nullptr;
+  }
+
+  const auto rect = CSSRect::FromAppUnits(aCoordBox);
+  return SVGPathData::BuildPath(aShape, aPathBuilder, StyleStrokeLinecap::Butt,
+                                0.0, rect.Size(),
+                                rect.TopLeft().ToUnknownPoint());
+}
+
+already_AddRefed<gfx::Path> MotionPathUtils::BuildPath(
+    const StyleBasicShape& aBasicShape,
+    const StyleOffsetPosition& aOffsetPosition, const nsRect& aCoordBox,
+    const nsPoint& aCurrentPosition, gfx::PathBuilder* aPathBuilder) {
+  if (!aPathBuilder) {
+    return nullptr;
+  }
+
+  switch (aBasicShape.tag) {
+    case StyleBasicShape::Tag::Circle: {
+      const nsPoint center =
+          ComputePosition(aBasicShape.AsCircle().position, aOffsetPosition,
+                          aCoordBox, aCurrentPosition);
+      return ShapeUtils::BuildCirclePath(aBasicShape, aCoordBox, center,
+                                         AppUnitsPerCSSPixel(), aPathBuilder);
+    }
+    case StyleBasicShape::Tag::Ellipse: {
+      const nsPoint center =
+          ComputePosition(aBasicShape.AsEllipse().position, aOffsetPosition,
+                          aCoordBox, aCurrentPosition);
+      return ShapeUtils::BuildEllipsePath(aBasicShape, aCoordBox, center,
+                                          AppUnitsPerCSSPixel(), aPathBuilder);
+    }
+    case StyleBasicShape::Tag::Rect:
+      return ShapeUtils::BuildInsetPath(aBasicShape, aCoordBox,
+                                        AppUnitsPerCSSPixel(), aPathBuilder);
+    case StyleBasicShape::Tag::Polygon:
+      return ShapeUtils::BuildPolygonPath(aBasicShape, aCoordBox,
+                                          AppUnitsPerCSSPixel(), aPathBuilder);
+    case StyleBasicShape::Tag::PathOrShape: {
+      const auto& pathOrShape = aBasicShape.AsPathOrShape();
+      if (pathOrShape.IsPath()) {
+        return BuildSVGPath(pathOrShape.AsPath().path, aPathBuilder);
+      }
+
+      return BuildShape(pathOrShape.AsShape().commands.AsSpan(), aPathBuilder,
+                        aCoordBox);
+    }
+  }
+
+  return nullptr;
+}
+
+already_AddRefed<gfx::PathBuilder> MotionPathUtils::GetPathBuilder() {
+  RefPtr<gfx::PathBuilder> builder =
+      gfxPlatform::GetPlatform()
+          ->ScreenReferenceDrawTarget()
+          ->CreatePathBuilder(gfx::FillRule::FILL_WINDING);
+  return builder.forget();
+}
+
+already_AddRefed<gfx::PathBuilder> MotionPathUtils::GetCompositorPathBuilder() {
+  RefPtr<gfx::PathBuilder> builder =
+      gfxPlatform::Initialized()
+          ? gfxPlatform::GetPlatform()
+                ->ScreenReferenceDrawTarget()
+                ->CreatePathBuilder(gfx::FillRule::FILL_WINDING)
+          : gfx::Factory::CreateSimplePathBuilder();
+  return builder.forget();
+}
+
+}  

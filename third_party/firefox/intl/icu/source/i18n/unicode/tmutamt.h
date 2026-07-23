@@ -1,0 +1,76 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ *******************************************************************************
+ * Copyright (C) 2009-2010, Google, International Business Machines Corporation and *
+ * others. All Rights Reserved.                                                *
+ *******************************************************************************
+ */ 
+
+#ifndef __TMUTAMT_H__
+#define __TMUTAMT_H__
+
+
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/measure.h"
+#include "unicode/tmunit.h"
+
+U_NAMESPACE_BEGIN
+
+
+class U_I18N_API TimeUnitAmount: public Measure {
+public:
+    TimeUnitAmount(const Formattable& number, 
+                   TimeUnit::UTimeUnitFields timeUnitField,
+                   UErrorCode& status);
+
+    TimeUnitAmount(double amount, TimeUnit::UTimeUnitFields timeUnitField,
+                   UErrorCode& status);
+
+
+    TimeUnitAmount(const TimeUnitAmount& other);
+
+
+    TimeUnitAmount& operator=(const TimeUnitAmount& other);
+
+
+    virtual TimeUnitAmount* clone() const override;
+
+    
+    virtual ~TimeUnitAmount();
+
+    
+    virtual bool operator==(const UObject& other) const;
+
+
+    bool operator!=(const UObject& other) const;
+
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual UClassID getDynamicClassID() const override;
+
+    const TimeUnit& getTimeUnit() const;
+
+    TimeUnit::UTimeUnitFields getTimeUnitField() const;
+};
+
+
+
+inline bool
+TimeUnitAmount::operator!=(const UObject& other) const {
+    return !operator==(other);
+}
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // __TMUTAMT_H__

@@ -1,0 +1,51 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_QueuedInput_h
+#define mozilla_layers_QueuedInput_h
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
+
+namespace mozilla {
+
+class InputData;
+class MultiTouchInput;
+class ScrollWheelInput;
+class MouseInput;
+class PanGestureInput;
+class PinchGestureInput;
+class KeyboardInput;
+
+namespace layers {
+
+class InputBlockState;
+class TouchBlockState;
+class WheelBlockState;
+class DragBlockState;
+class PanGestureBlockState;
+class PinchGestureBlockState;
+class KeyboardBlockState;
+
+class QueuedInput {
+ public:
+  QueuedInput(const MultiTouchInput& aInput, TouchBlockState& aBlock);
+  QueuedInput(const ScrollWheelInput& aInput, WheelBlockState& aBlock);
+  QueuedInput(const MouseInput& aInput, DragBlockState& aBlock);
+  QueuedInput(const PanGestureInput& aInput, PanGestureBlockState& aBlock);
+  QueuedInput(const PinchGestureInput& aInput, PinchGestureBlockState& aBlock);
+  QueuedInput(const KeyboardInput& aInput, KeyboardBlockState& aBlock);
+
+  InputData* Input();
+  InputBlockState* Block();
+
+ private:
+  UniquePtr<InputData> mInput;
+  RefPtr<InputBlockState> mBlock;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_QueuedInput_h

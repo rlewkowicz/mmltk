@@ -1,0 +1,95 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ViewportMetaData.h"
+
+#include "nsCRT.h"
+#include "nsContentUtils.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+static void ProcessViewportToken(ViewportMetaData& aData,
+                                 const nsAString& token) {
+  nsAString::const_iterator tip, tail, end;
+  token.BeginReading(tip);
+  tail = tip;
+  token.EndReading(end);
+
+  while ((tip != end) && (*tip != '=')) {
+    ++tip;
+  }
+
+  if (tip == end) {
+    return;
+  }
+
+  const nsAString& key = nsContentUtils::TrimWhitespace<nsCRT::IsAsciiSpace>(
+      Substring(tail, tip), true);
+  const nsAString& value = nsContentUtils::TrimWhitespace<nsCRT::IsAsciiSpace>(
+      Substring(++tip, end), true);
+
+  RefPtr<nsAtom> key_atom = NS_Atomize(key);
+  if (key_atom == nsGkAtoms::height) {
+    aData.mHeight.Assign(value);
+  } else if (key_atom == nsGkAtoms::width) {
+    aData.mWidth.Assign(value);
+  } else if (key_atom == nsGkAtoms::initial_scale) {
+    aData.mInitialScale.Assign(value);
+  } else if (key_atom == nsGkAtoms::minimum_scale) {
+    aData.mMinimumScale.Assign(value);
+  } else if (key_atom == nsGkAtoms::maximum_scale) {
+    aData.mMaximumScale.Assign(value);
+  } else if (key_atom == nsGkAtoms::user_scalable) {
+    aData.mUserScalable.Assign(value);
+  } else if (key_atom == nsGkAtoms::viewport_fit) {
+    aData.mViewportFit.Assign(value);
+  } else if (key_atom == nsGkAtoms::interactive_widget) {
+    aData.mInteractiveWidgetMode.Assign(value);
+  }
+}
+
+#define IS_SEPARATOR(c)                                             \
+  (((c) == '=') || ((c) == ',') || ((c) == ';') || ((c) == '\t') || \
+   ((c) == '\n') || ((c) == '\r'))
+
+ViewportMetaData::ViewportMetaData(const nsAString& aViewportInfo) {
+  nsAString::const_iterator tip, tail, end;
+  aViewportInfo.BeginReading(tip);
+  tail = tip;
+  aViewportInfo.EndReading(end);
+
+  while ((tip != end) && (IS_SEPARATOR(*tip) || nsCRT::IsAsciiSpace(*tip))) {
+    ++tip;
+  }
+
+  while (tip != end) {
+    tail = tip;
+
+    while ((tip != end) && !IS_SEPARATOR(*tip)) {
+      ++tip;
+    }
+
+    if ((tip != end) && (*tip == '=')) {
+      ++tip;
+
+      while ((tip != end) && nsCRT::IsAsciiSpace(*tip)) {
+        ++tip;
+      }
+
+      while ((tip != end) &&
+             !(IS_SEPARATOR(*tip) || nsCRT::IsAsciiSpace(*tip))) {
+        ++tip;
+      }
+    }
+
+    ProcessViewportToken(*this, Substring(tail, tip));
+
+    while ((tip != end) && (IS_SEPARATOR(*tip) || nsCRT::IsAsciiSpace(*tip))) {
+      ++tip;
+    }
+  }
+}
+
+#undef IS_SEPARATOR

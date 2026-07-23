@@ -1,0 +1,71 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+#ifndef __LOCALEBUILDER_H__
+#define __LOCALEBUILDER_H__
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/locid.h"
+#include "unicode/localematcher.h"
+#include "unicode/stringpiece.h"
+#include "unicode/uobject.h"
+
+
+U_NAMESPACE_BEGIN
+class FixedString;
+
+class U_COMMON_API LocaleBuilder : public UObject {
+public:
+    LocaleBuilder();
+
+    virtual ~LocaleBuilder();
+
+    LocaleBuilder& setLocale(const Locale& locale);
+
+    LocaleBuilder& setLanguageTag(StringPiece tag);
+
+    LocaleBuilder& setLanguage(StringPiece language);
+
+    LocaleBuilder& setScript(StringPiece script);
+
+    LocaleBuilder& setRegion(StringPiece region);
+
+    LocaleBuilder& setVariant(StringPiece variant);
+
+    LocaleBuilder& setExtension(char key, StringPiece value);
+
+    LocaleBuilder& setUnicodeLocaleKeyword(
+        StringPiece key, StringPiece type);
+
+    LocaleBuilder& addUnicodeLocaleAttribute(StringPiece attribute);
+
+    LocaleBuilder& removeUnicodeLocaleAttribute(StringPiece attribute);
+
+    LocaleBuilder& clear();
+
+    LocaleBuilder& clearExtensions();
+
+    Locale build(UErrorCode& status);
+
+    UBool copyErrorTo(UErrorCode &outErrorCode) const;
+
+private:
+    friend class LocaleMatcher::Result;
+
+    void copyExtensionsFrom(const Locale& src, UErrorCode& errorCode);
+
+    UErrorCode status_;
+    char language_[9];
+    char script_[5];
+    char region_[4];
+    FixedString *variant_;  
+    icu::Locale *extensions_;  
+
+};
+
+U_NAMESPACE_END
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif  // __LOCALEBUILDER_H__

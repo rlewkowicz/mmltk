@@ -1,0 +1,851 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "TextEventDispatcher.h"
+
+#include "IMEData.h"
+#include "PuppetWidget.h"
+#include "TextEvents.h"
+
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/Utf16.h"
+#include "nsCharTraits.h"
+#include "nsIFrame.h"
+#include "nsIWidget.h"
+
+namespace mozilla {
+namespace widget {
+
+TextEventDispatcher::TextEventDispatcher(nsIWidget* aWidget)
+    : mWidget(aWidget),
+      mDispatchingEvent(0),
+      mInputTransactionType(eNoInputTransaction),
+      mIsComposing(false),
+      mIsHandlingComposition(false),
+      mHasFocus(false) {
+  MOZ_RELEASE_ASSERT(mWidget, "aWidget must not be nullptr");
+
+  ClearNotificationRequests();
+}
+
+nsresult TextEventDispatcher::BeginInputTransaction(
+    TextEventDispatcherListener* aListener) {
+  return BeginInputTransactionInternal(aListener,
+                                       eSameProcessSyncInputTransaction);
+}
+
+nsresult TextEventDispatcher::BeginTestInputTransaction(
+    TextEventDispatcherListener* aListener, bool aIsAPZAware) {
+  return BeginInputTransactionInternal(
+      aListener, aIsAPZAware ? eAsyncTestInputTransaction
+                             : eSameProcessSyncTestInputTransaction);
+}
+
+nsresult TextEventDispatcher::BeginNativeInputTransaction() {
+  if (NS_WARN_IF(!mWidget)) {
+    return NS_ERROR_FAILURE;
+  }
+  RefPtr<TextEventDispatcherListener> listener =
+      mWidget->GetNativeTextEventDispatcherListener();
+  if (NS_WARN_IF(!listener)) {
+    return NS_ERROR_FAILURE;
+  }
+  return BeginInputTransactionInternal(listener, eNativeInputTransaction);
+}
+
+nsresult TextEventDispatcher::BeginInputTransactionInternal(
+    TextEventDispatcherListener* aListener, InputTransactionType aType) {
+  if (NS_WARN_IF(!aListener)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  nsCOMPtr<TextEventDispatcherListener> listener = do_QueryReferent(mListener);
+  if (listener) {
+    if (listener == aListener && mInputTransactionType == aType) {
+      UpdateNotificationRequests();
+      return NS_OK;
+    }
+    if (IsComposing() || IsDispatchingEvent()) {
+      return NS_ERROR_ALREADY_INITIALIZED;
+    }
+  }
+  mListener = do_GetWeakReference(aListener);
+  mInputTransactionType = aType;
+  if (listener && listener != aListener) {
+    listener->OnRemovedFrom(this);
+  }
+  UpdateNotificationRequests();
+  return NS_OK;
+}
+
+nsresult TextEventDispatcher::BeginInputTransactionFor(
+    const WidgetGUIEvent* aEvent, PuppetWidget* aPuppetWidget) {
+  MOZ_ASSERT(XRE_IsContentProcess());
+  MOZ_ASSERT(!IsDispatchingEvent());
+
+  switch (aEvent->mMessage) {
+    case eKeyDown:
+    case eKeyPress:
+    case eKeyUp:
+      MOZ_ASSERT(aEvent->mClass == eKeyboardEventClass);
+      break;
+    case eCompositionStart:
+    case eCompositionChange:
+    case eCompositionCommit:
+    case eCompositionCommitAsIs:
+      MOZ_ASSERT(aEvent->mClass == eCompositionEventClass);
+      break;
+    default:
+      return NS_ERROR_INVALID_ARG;
+  }
+
+  if (aEvent->mFlags.mIsSynthesizedForTests) {
+    if (mInputTransactionType == eAsyncTestInputTransaction) {
+      return NS_OK;
+    }
+    nsresult rv = BeginInputTransactionInternal(
+        static_cast<TextEventDispatcherListener*>(aPuppetWidget),
+        eSameProcessSyncTestInputTransaction);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+  } else {
+    nsresult rv = BeginNativeInputTransaction();
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+  }
+
+  switch (aEvent->mMessage) {
+    case eKeyDown:
+    case eKeyPress:
+    case eKeyUp:
+      return NS_OK;
+    case eCompositionStart:
+      MOZ_ASSERT(!mIsComposing);
+      mIsComposing = mIsHandlingComposition = true;
+      return NS_OK;
+    case eCompositionChange:
+      MOZ_ASSERT(mIsComposing);
+      MOZ_ASSERT(mIsHandlingComposition);
+      mIsComposing = mIsHandlingComposition = true;
+      return NS_OK;
+    case eCompositionCommit:
+    case eCompositionCommitAsIs:
+      MOZ_ASSERT(mIsComposing);
+      MOZ_ASSERT(mIsHandlingComposition);
+      mIsComposing = false;
+      mIsHandlingComposition = true;
+      return NS_OK;
+    default:
+      MOZ_ASSERT_UNREACHABLE("You forgot to handle the event");
+      return NS_ERROR_UNEXPECTED;
+  }
+}
+void TextEventDispatcher::EndInputTransaction(
+    TextEventDispatcherListener* aListener) {
+  if (NS_WARN_IF(IsComposing()) || NS_WARN_IF(IsDispatchingEvent())) {
+    return;
+  }
+
+  mInputTransactionType = eNoInputTransaction;
+
+  nsCOMPtr<TextEventDispatcherListener> listener = do_QueryReferent(mListener);
+  if (NS_WARN_IF(!listener)) {
+    return;
+  }
+
+  if (NS_WARN_IF(listener != aListener)) {
+    return;
+  }
+
+  mListener = nullptr;
+  listener->OnRemovedFrom(this);
+  UpdateNotificationRequests();
+}
+
+void TextEventDispatcher::OnDestroyWidget() {
+  mWidget = nullptr;
+  mHasFocus = false;
+  ClearNotificationRequests();
+  mPendingComposition.Clear();
+  nsCOMPtr<TextEventDispatcherListener> listener = do_QueryReferent(mListener);
+  mListener = nullptr;
+  mWritingMode.reset();
+  mInputTransactionType = eNoInputTransaction;
+  if (listener) {
+    listener->OnRemovedFrom(this);
+  }
+}
+
+nsresult TextEventDispatcher::GetState() const {
+  nsCOMPtr<TextEventDispatcherListener> listener = do_QueryReferent(mListener);
+  if (!listener) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+  if (!mWidget || mWidget->Destroyed()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  return NS_OK;
+}
+
+void TextEventDispatcher::InitEvent(WidgetGUIEvent& aEvent) const {
+  aEvent.mRefPoint = LayoutDeviceIntPoint(0, 0);
+  aEvent.mFlags.mIsSynthesizedForTests = IsForTests();
+  if (aEvent.mClass != eCompositionEventClass) {
+    return;
+  }
+  void* pseudoIMEContext = GetPseudoIMEContext();
+  if (pseudoIMEContext) {
+    aEvent.AsCompositionEvent()->mNativeIMEContext.InitWithRawNativeIMEContext(
+        pseudoIMEContext);
+  }
+#ifdef DEBUG
+  else {
+    MOZ_ASSERT(!XRE_IsContentProcess(),
+               "Why did the content process start native event transaction?");
+    MOZ_ASSERT(aEvent.AsCompositionEvent()->mNativeIMEContext.IsValid(),
+               "Native IME context shouldn't be invalid");
+  }
+#endif  // #ifdef DEBUG
+}
+
+Maybe<WritingMode> TextEventDispatcher::MaybeQueryWritingModeAtSelection()
+    const {
+  if (mHasFocus || mWritingMode.isSome()) {
+    return mWritingMode;
+  }
+
+  if (NS_WARN_IF(!mWidget)) {
+    return Nothing();
+  }
+
+  const InputContext inputContext = mWidget->GetInputContext();
+  if (XRE_IsE10sParentProcess() && inputContext.IsOriginContentProcess() &&
+      !inputContext.mIMEState.IsEditable()) {
+    return Nothing();
+  }
+
+  WidgetQueryContentEvent querySelectedTextEvent(true, eQuerySelectedText,
+                                                 mWidget);
+  const_cast<TextEventDispatcher*>(this)->DispatchEvent(mWidget,
+                                                        querySelectedTextEvent);
+  if (!querySelectedTextEvent.FoundSelection()) {
+    return Nothing();
+  }
+
+  return Some(querySelectedTextEvent.mReply->mWritingMode);
+}
+
+nsEventStatus TextEventDispatcher::DispatchEvent(nsIWidget* aWidget,
+                                                 WidgetGUIEvent& aEvent) {
+  MOZ_ASSERT(!aEvent.AsInputEvent(), "Use DispatchInputEvent()");
+
+  RefPtr<TextEventDispatcher> kungFuDeathGrip(this);
+  nsCOMPtr<nsIWidget> widget(aWidget);
+  mDispatchingEvent++;
+  auto status = widget->DispatchEvent(&aEvent);
+  mDispatchingEvent--;
+  return status;
+}
+
+nsEventStatus TextEventDispatcher::DispatchInputEvent(
+    nsIWidget* aWidget, WidgetInputEvent& aEvent) {
+  RefPtr<TextEventDispatcher> kungFuDeathGrip(this);
+  nsCOMPtr<nsIWidget> widget(aWidget);
+  mDispatchingEvent++;
+
+  nsEventStatus status =
+      ShouldSendInputEventToAPZ()
+          ? widget->DispatchInputEvent(&aEvent).mContentStatus
+          : widget->DispatchEvent(&aEvent);
+
+  mDispatchingEvent--;
+  return status;
+}
+
+nsresult TextEventDispatcher::StartComposition(
+    nsEventStatus& aStatus, const WidgetEventTime* aEventTime) {
+  aStatus = nsEventStatus_eIgnore;
+
+  nsresult rv = GetState();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  if (NS_WARN_IF(mIsComposing)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mIsComposing = mIsHandlingComposition = true;
+  WidgetCompositionEvent compositionStartEvent(true, eCompositionStart,
+                                               mWidget);
+  InitEvent(compositionStartEvent);
+  if (aEventTime) {
+    compositionStartEvent.AssignEventTime(*aEventTime);
+  }
+  DispatchEvent(mWidget, compositionStartEvent);
+  return NS_OK;
+}
+
+nsresult TextEventDispatcher::StartCompositionAutomaticallyIfNecessary(
+    nsEventStatus& aStatus, const WidgetEventTime* aEventTime) {
+  if (IsComposing()) {
+    return NS_OK;
+  }
+
+  nsresult rv = StartComposition(aStatus, aEventTime);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  if (!IsComposing()) {
+    aStatus = nsEventStatus_eConsumeNoDefault;
+    return NS_OK;
+  }
+
+  rv = GetState();
+  if (NS_FAILED(rv)) {
+    MOZ_ASSERT(rv != NS_ERROR_NOT_INITIALIZED,
+               "aDispatcher must still be initialized in this case");
+    aStatus = nsEventStatus_eConsumeNoDefault;
+    return NS_OK;  
+  }
+
+  aStatus = nsEventStatus_eIgnore;
+  return NS_OK;
+}
+
+nsresult TextEventDispatcher::CommitComposition(
+    nsEventStatus& aStatus, const nsAString* aCommitString,
+    const WidgetEventTime* aEventTime) {
+  aStatus = nsEventStatus_eIgnore;
+
+  nsresult rv = GetState();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  if (NS_WARN_IF(!IsComposing() &&
+                 (!aCommitString || aCommitString->IsEmpty()))) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsIWidget> widget(mWidget);
+  rv = StartCompositionAutomaticallyIfNecessary(aStatus, aEventTime);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+  if (aStatus == nsEventStatus_eConsumeNoDefault) {
+    return NS_OK;
+  }
+
+
+  mIsComposing = false;
+
+  EventMessage message =
+      aCommitString ? eCompositionCommit : eCompositionCommitAsIs;
+  WidgetCompositionEvent compositionCommitEvent(true, message, widget);
+  InitEvent(compositionCommitEvent);
+  if (aEventTime) {
+    compositionCommitEvent.AssignEventTime(*aEventTime);
+  }
+  if (message == eCompositionCommit) {
+    compositionCommitEvent.mData = *aCommitString;
+    compositionCommitEvent.mData.SetIsVoid(false);
+    compositionCommitEvent.mData.ReplaceSubstring(u"\r\n"_ns, u"\n"_ns);
+    compositionCommitEvent.mData.ReplaceSubstring(u"\r"_ns, u"\n"_ns);
+  }
+  aStatus = DispatchEvent(widget, compositionCommitEvent);
+  return NS_OK;
+}
+
+nsresult TextEventDispatcher::NotifyIME(
+    const IMENotification& aIMENotification) {
+  nsresult rv = NS_ERROR_NOT_IMPLEMENTED;
+
+  switch (aIMENotification.mMessage) {
+    case NOTIFY_IME_OF_FOCUS: {
+      mWritingMode = MaybeQueryWritingModeAtSelection();
+      break;
+    }
+    case NOTIFY_IME_OF_BLUR:
+      mHasFocus = false;
+      mWritingMode.reset();
+      ClearNotificationRequests();
+      break;
+    case NOTIFY_IME_OF_COMPOSITION_EVENT_HANDLED:
+      if (!IsComposing()) {
+        mIsHandlingComposition = false;
+      }
+      break;
+    case NOTIFY_IME_OF_SELECTION_CHANGE:
+      if (mHasFocus && aIMENotification.mSelectionChangeData.HasRange()) {
+        mWritingMode =
+            Some(aIMENotification.mSelectionChangeData.GetWritingMode());
+      }
+      break;
+    default:
+      break;
+  }
+
+  nsCOMPtr<TextEventDispatcherListener> listener = do_QueryReferent(mListener);
+  if (listener) {
+    rv = listener->NotifyIME(this, aIMENotification);
+  }
+
+  if (!mWidget) {
+    return rv;
+  }
+
+  nsCOMPtr<TextEventDispatcherListener> nativeListener =
+      mWidget->GetNativeTextEventDispatcherListener();
+  if (listener != nativeListener && nativeListener) {
+    switch (aIMENotification.mMessage) {
+      case REQUEST_TO_COMMIT_COMPOSITION:
+      case REQUEST_TO_CANCEL_COMPOSITION:
+        break;
+      default: {
+        nsresult rv2 = nativeListener->NotifyIME(this, aIMENotification);
+        if (rv == NS_ERROR_NOT_IMPLEMENTED) {
+          rv = rv2;
+        }
+        break;
+      }
+    }
+  }
+
+  if (aIMENotification.mMessage == NOTIFY_IME_OF_FOCUS) {
+    mHasFocus = true;
+    UpdateNotificationRequests();
+  }
+
+  return rv;
+}
+
+void TextEventDispatcher::ClearNotificationRequests() {
+  mIMENotificationRequests = IMENotificationRequests();
+}
+
+void TextEventDispatcher::UpdateNotificationRequests() {
+  ClearNotificationRequests();
+
+  if (!mHasFocus || !mWidget) {
+    return;
+  }
+
+  nsCOMPtr<TextEventDispatcherListener> listener = do_QueryReferent(mListener);
+  if (listener) {
+    mIMENotificationRequests = listener->GetIMENotificationRequests();
+  }
+
+  if (!IsInNativeInputTransaction()) {
+    nsCOMPtr<TextEventDispatcherListener> nativeListener =
+        mWidget->GetNativeTextEventDispatcherListener();
+    if (nativeListener) {
+      mIMENotificationRequests += nativeListener->GetIMENotificationRequests();
+    }
+  }
+}
+
+bool TextEventDispatcher::DispatchKeyboardEvent(
+    EventMessage aMessage, const WidgetKeyboardEvent& aKeyboardEvent,
+    nsEventStatus& aStatus, void* aData) {
+  return DispatchKeyboardEventInternal(aMessage, aKeyboardEvent, aStatus,
+                                       aData);
+}
+
+bool TextEventDispatcher::DispatchKeyboardEventInternal(
+    EventMessage aMessage, const WidgetKeyboardEvent& aKeyboardEvent,
+    nsEventStatus& aStatus, void* aData, uint32_t aIndexOfKeypress,
+    bool aNeedsCallback) {
+  MOZ_ASSERT(
+      aMessage == eKeyDown || aMessage == eKeyUp || aMessage == eKeyPress,
+      "Invalid aMessage value");
+  nsresult rv = GetState();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return false;
+  }
+
+  if (aMessage == eKeyPress && !aKeyboardEvent.ShouldCauseKeypressEvents()) {
+    return false;
+  }
+
+  if (IsComposing() && aMessage == eKeyPress) {
+    return false;
+  }
+
+  WidgetKeyboardEvent keyEvent(true, aMessage, mWidget);
+  InitEvent(keyEvent);
+  keyEvent.AssignKeyEventData(aKeyboardEvent, false);
+  if (XRE_IsContentProcess() && keyEvent.mIsSynthesizedByTIP) {
+    if (aMessage == eKeyPress) {
+      keyEvent.AssignCommands(aKeyboardEvent);
+    } else {
+      keyEvent.PreventNativeKeyBindings();
+    }
+  }
+
+  if (aStatus == nsEventStatus_eConsumeNoDefault) {
+    keyEvent.PreventDefaultBeforeDispatch(CrossProcessForwarding::eAllow);
+  }
+
+  if (XRE_IsParentProcess() &&
+      aKeyboardEvent.IsWaitingReplyFromRemoteProcess()) {
+    keyEvent.MarkAsWaitingReplyFromRemoteProcess();
+  }
+
+  if (keyEvent.mKeyNameIndex != KEY_NAME_INDEX_USE_STRING) {
+    MOZ_ASSERT(!aIndexOfKeypress,
+               "aIndexOfKeypress must be 0 for non-printable key");
+    keyEvent.SetCharCode(0);
+  } else {
+    MOZ_DIAGNOSTIC_ASSERT_IF(aMessage == eKeyDown || aMessage == eKeyUp,
+                             !aIndexOfKeypress);
+    MOZ_DIAGNOSTIC_ASSERT_IF(
+        aMessage == eKeyPress,
+        aIndexOfKeypress < std::max<size_t>(keyEvent.mKeyValue.Length(), 1));
+    char16_t ch =
+        keyEvent.mKeyValue.IsEmpty() ? 0 : keyEvent.mKeyValue[aIndexOfKeypress];
+    keyEvent.SetCharCode(static_cast<uint32_t>(ch));
+    if (aMessage == eKeyPress) {
+      keyEvent.mKeyCode = 0;
+      if (ch) {
+        if (!IsSurrogate(ch)) {
+          keyEvent.mKeyValue.Assign(ch);
+        } else {
+          const bool isHighSurrogateFollowedByLowSurrogate =
+              aIndexOfKeypress + 1 < keyEvent.mKeyValue.Length() &&
+              IsHighSurrogate(ch) &&
+              IsLowSurrogate(keyEvent.mKeyValue[aIndexOfKeypress + 1]);
+          const bool isLowSurrogateFollowingHighSurrogate =
+              !isHighSurrogateFollowedByLowSurrogate && aIndexOfKeypress > 0 &&
+              IsLowSurrogate(ch) &&
+              IsHighSurrogate(keyEvent.mKeyValue[aIndexOfKeypress - 1]);
+          NS_WARNING_ASSERTION(isHighSurrogateFollowedByLowSurrogate ||
+                                   isLowSurrogateFollowingHighSurrogate,
+                               "Lone surrogate input should not happen");
+          if (StaticPrefs::
+                  dom_event_keypress_dispatch_once_per_surrogate_pair()) {
+            if (isHighSurrogateFollowedByLowSurrogate) {
+              keyEvent.mKeyValue.Assign(
+                  keyEvent.mKeyValue.BeginReading() + aIndexOfKeypress, 2);
+              keyEvent.SetCharCode(SurrogateToUCS4(ch, keyEvent.mKeyValue[1]));
+            } else if (isLowSurrogateFollowingHighSurrogate) {
+              return true;
+            }
+            else {
+              keyEvent.mKeyValue.Truncate();
+            }
+          } else if (!StaticPrefs::
+                         dom_event_keypress_key_allow_lone_surrogate()) {
+            if (isHighSurrogateFollowedByLowSurrogate) {
+              keyEvent.mKeyValue.Assign(
+                  keyEvent.mKeyValue.BeginReading() + aIndexOfKeypress, 2);
+            }
+            else {
+              keyEvent.mKeyValue.Truncate();
+            }
+          } else {
+            keyEvent.mKeyValue.Assign(ch);
+          }
+        }
+      } else {
+        keyEvent.mKeyValue.Truncate();
+      }
+    }
+  }
+  if (aMessage == eKeyUp) {
+    keyEvent.mIsRepeat = false;
+  }
+  keyEvent.mIsComposing = false;
+  if (mInputTransactionType == eNativeInputTransaction) {
+    keyEvent.mNativeKeyEvent = aKeyboardEvent.mNativeKeyEvent;
+  } else {
+    keyEvent.mNativeKeyEvent = nullptr;
+  }
+
+  keyEvent.mAlternativeCharCodes.Clear();
+  if ((aMessage == eKeyDown || aMessage == eKeyPress) &&
+      (aNeedsCallback || keyEvent.IsControl() || keyEvent.IsAlt() ||
+       keyEvent.IsMeta())) {
+    nsCOMPtr<TextEventDispatcherListener> listener =
+        do_QueryReferent(mListener);
+    if (listener) {
+      DebugOnly<WidgetKeyboardEvent> original(keyEvent);
+      listener->WillDispatchKeyboardEvent(this, keyEvent, aIndexOfKeypress,
+                                          aData);
+      MOZ_ASSERT(keyEvent.mMessage ==
+                 static_cast<WidgetKeyboardEvent&>(original).mMessage);
+      MOZ_ASSERT(keyEvent.mKeyCode ==
+                 static_cast<WidgetKeyboardEvent&>(original).mKeyCode);
+      MOZ_ASSERT(keyEvent.mLocation ==
+                 static_cast<WidgetKeyboardEvent&>(original).mLocation);
+      MOZ_ASSERT(keyEvent.mIsRepeat ==
+                 static_cast<WidgetKeyboardEvent&>(original).mIsRepeat);
+      MOZ_ASSERT(keyEvent.mIsComposing ==
+                 static_cast<WidgetKeyboardEvent&>(original).mIsComposing);
+      MOZ_ASSERT(keyEvent.mKeyNameIndex ==
+                 static_cast<WidgetKeyboardEvent&>(original).mKeyNameIndex);
+      MOZ_ASSERT(keyEvent.mCodeNameIndex ==
+                 static_cast<WidgetKeyboardEvent&>(original).mCodeNameIndex);
+      MOZ_ASSERT(keyEvent.mKeyValue ==
+                 static_cast<WidgetKeyboardEvent&>(original).mKeyValue);
+      MOZ_ASSERT(keyEvent.mCodeValue ==
+                 static_cast<WidgetKeyboardEvent&>(original).mCodeValue);
+    }
+  }
+
+  if (StaticPrefs::
+          dom_keyboardevent_keypress_dispatch_non_printable_keys_only_system_group_in_content() &&
+      keyEvent.mMessage == eKeyPress &&
+      !keyEvent.ShouldKeyPressEventBeFiredOnContent()) {
+    keyEvent.mFlags.mOnlySystemGroupDispatchInContent = true;
+  }
+
+  if (XRE_IsParentProcess() && mHasFocus &&
+      (aMessage == eKeyDown || aMessage == eKeyPress)) {
+    keyEvent.InitAllEditCommands(mWritingMode);
+  }
+
+  aStatus = DispatchInputEvent(mWidget, keyEvent);
+  return true;
+}
+
+bool TextEventDispatcher::MaybeDispatchKeypressEvents(
+    const WidgetKeyboardEvent& aKeyboardEvent, nsEventStatus& aStatus,
+    void* aData, bool aNeedsCallback) {
+  if (aStatus == nsEventStatus_eConsumeNoDefault) {
+    return false;
+  }
+
+  if (!aKeyboardEvent.ShouldCauseKeypressEvents()) {
+    return false;
+  }
+
+  size_t keypressCount =
+      aKeyboardEvent.mKeyNameIndex != KEY_NAME_INDEX_USE_STRING
+          ? 1
+          : std::max(static_cast<nsAString::size_type>(1),
+                     aKeyboardEvent.mKeyValue.Length());
+  bool isDispatched = false;
+  bool consumed = false;
+  for (size_t i = 0; i < keypressCount; i++) {
+    aStatus = nsEventStatus_eIgnore;
+    if (!DispatchKeyboardEventInternal(eKeyPress, aKeyboardEvent, aStatus,
+                                       aData, i, aNeedsCallback)) {
+      break;
+    }
+    isDispatched = true;
+    if (!consumed) {
+      consumed = (aStatus == nsEventStatus_eConsumeNoDefault);
+    }
+  }
+
+  if (consumed) {
+    aStatus = nsEventStatus_eConsumeNoDefault;
+  }
+
+  return isDispatched;
+}
+
+
+TextEventDispatcher::PendingComposition::PendingComposition() { Clear(); }
+
+void TextEventDispatcher::PendingComposition::Clear() {
+  mString.Truncate();
+  mClauses = nullptr;
+  mCaret.mRangeType = TextRangeType::eUninitialized;
+  mReplacedNativeLineBreakers = false;
+}
+
+void TextEventDispatcher::PendingComposition::EnsureClauseArray() {
+  if (mClauses) {
+    return;
+  }
+  mClauses = new TextRangeArray();
+}
+
+nsresult TextEventDispatcher::PendingComposition::SetString(
+    const nsAString& aString) {
+  MOZ_ASSERT(!mReplacedNativeLineBreakers);
+  mString = aString;
+  return NS_OK;
+}
+
+nsresult TextEventDispatcher::PendingComposition::AppendClause(
+    uint32_t aLength, TextRangeType aTextRangeType) {
+  MOZ_ASSERT(!mReplacedNativeLineBreakers);
+
+  if (NS_WARN_IF(!aLength)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  switch (aTextRangeType) {
+    case TextRangeType::eRawClause:
+    case TextRangeType::eSelectedRawClause:
+    case TextRangeType::eConvertedClause:
+    case TextRangeType::eSelectedClause: {
+      EnsureClauseArray();
+      TextRange textRange;
+      textRange.mStartOffset =
+          mClauses->IsEmpty() ? 0 : mClauses->LastElement().mEndOffset;
+      textRange.mEndOffset = textRange.mStartOffset + aLength;
+      textRange.mRangeType = aTextRangeType;
+      mClauses->AppendElement(textRange);
+      return NS_OK;
+    }
+    default:
+      return NS_ERROR_INVALID_ARG;
+  }
+}
+
+nsresult TextEventDispatcher::PendingComposition::SetCaret(uint32_t aOffset,
+                                                           uint32_t aLength) {
+  MOZ_ASSERT(!mReplacedNativeLineBreakers);
+
+  mCaret.mStartOffset = aOffset;
+  mCaret.mEndOffset = mCaret.mStartOffset + aLength;
+  mCaret.mRangeType = TextRangeType::eCaret;
+  return NS_OK;
+}
+
+nsresult TextEventDispatcher::PendingComposition::Set(
+    const nsAString& aString, const TextRangeArray* aRanges) {
+  Clear();
+
+  nsresult rv = SetString(aString);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  if (!aRanges || aRanges->IsEmpty()) {
+    if (!mString.IsEmpty()) {
+      rv = AppendClause(mString.Length(), TextRangeType::eRawClause);
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        return rv;
+      }
+      ReplaceNativeLineBreakers();
+    }
+    return NS_OK;
+  }
+
+  for (uint32_t i = 0; i < aRanges->Length(); ++i) {
+    TextRange range = aRanges->ElementAt(i);
+    if (range.mRangeType == TextRangeType::eCaret) {
+      mCaret = range;
+    } else {
+      EnsureClauseArray();
+      mClauses->AppendElement(range);
+    }
+  }
+  ReplaceNativeLineBreakers();
+  return NS_OK;
+}
+
+void TextEventDispatcher::PendingComposition::ReplaceNativeLineBreakers() {
+  mReplacedNativeLineBreakers = true;
+
+  if (mString.IsEmpty()) {
+    return;
+  }
+
+  nsAutoString nativeString(mString);
+  mString.ReplaceSubstring(u"\r\n"_ns, u"\n"_ns);
+  mString.ReplaceSubstring(u"\r"_ns, u"\n"_ns);
+
+  if (nativeString.Length() == mString.Length()) {
+    return;
+  }
+
+  if (mClauses) {
+    for (TextRange& clause : *mClauses) {
+      AdjustRange(clause, nativeString);
+    }
+  }
+  if (mCaret.mRangeType == TextRangeType::eCaret) {
+    AdjustRange(mCaret, nativeString);
+  }
+}
+
+void TextEventDispatcher::PendingComposition::AdjustRange(
+    TextRange& aRange, const nsAString& aNativeString) {
+  TextRange nativeRange = aRange;
+  if (nativeRange.mStartOffset > 0) {
+    nsAutoString preText(Substring(aNativeString, 0, nativeRange.mStartOffset));
+    preText.ReplaceSubstring(u"\r\n"_ns, u"\n"_ns);
+    aRange.mStartOffset = preText.Length();
+  }
+  if (nativeRange.Length() == 0) {
+    aRange.mEndOffset = aRange.mStartOffset;
+  } else {
+    nsAutoString clause(Substring(aNativeString, nativeRange.mStartOffset,
+                                  nativeRange.Length()));
+    clause.ReplaceSubstring(u"\r\n"_ns, u"\n"_ns);
+    aRange.mEndOffset = aRange.mStartOffset + clause.Length();
+  }
+}
+
+nsresult TextEventDispatcher::PendingComposition::Flush(
+    TextEventDispatcher* aDispatcher, nsEventStatus& aStatus,
+    const WidgetEventTime* aEventTime) {
+  aStatus = nsEventStatus_eIgnore;
+
+  nsresult rv = aDispatcher->GetState();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  if (mClauses && !mClauses->IsEmpty() &&
+      mClauses->LastElement().mEndOffset != mString.Length()) {
+    NS_WARNING(
+        "Sum of length of the all clauses must be same as the string "
+        "length");
+    Clear();
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
+  if (mCaret.mRangeType == TextRangeType::eCaret) {
+    if (mCaret.mEndOffset > mString.Length()) {
+      NS_WARNING("Caret position is out of the composition string");
+      Clear();
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    EnsureClauseArray();
+    mClauses->AppendElement(mCaret);
+  }
+
+  if (!mReplacedNativeLineBreakers) {
+    ReplaceNativeLineBreakers();
+  }
+
+  RefPtr<TextEventDispatcher> kungFuDeathGrip(aDispatcher);
+  nsCOMPtr<nsIWidget> widget(aDispatcher->mWidget);
+  WidgetCompositionEvent compChangeEvent(true, eCompositionChange, widget);
+  aDispatcher->InitEvent(compChangeEvent);
+  if (aEventTime) {
+    compChangeEvent.AssignEventTime(*aEventTime);
+  }
+  compChangeEvent.mData = mString;
+  compChangeEvent.mData.SetIsVoid(false);
+  if (mClauses) {
+    MOZ_ASSERT(!mClauses->IsEmpty(),
+               "mClauses must be non-empty array when it's not nullptr");
+    compChangeEvent.mRanges = mClauses;
+  }
+
+  Clear();
+
+  rv = aDispatcher->StartCompositionAutomaticallyIfNecessary(aStatus,
+                                                             aEventTime);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+  if (aStatus == nsEventStatus_eConsumeNoDefault) {
+    return NS_OK;
+  }
+  aStatus = aDispatcher->DispatchEvent(widget, compChangeEvent);
+  return NS_OK;
+}
+
+}  
+}  

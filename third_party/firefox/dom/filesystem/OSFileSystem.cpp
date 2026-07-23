@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/OSFileSystem.h"
+
+#include "mozilla/dom/Directory.h"
+#include "mozilla/dom/File.h"
+#include "mozilla/dom/FileSystemUtils.h"
+#include "nsCOMPtr.h"
+#include "nsDebug.h"
+#include "nsIFile.h"
+#include "nsIGlobalObject.h"
+
+namespace mozilla::dom {
+
+OSFileSystem::OSFileSystem(const nsAString& aRootDir) {
+  mLocalRootPath = aRootDir;
+}
+
+already_AddRefed<FileSystemBase> OSFileSystem::Clone() {
+  AssertIsOnOwningThread();
+
+  RefPtr<OSFileSystem> fs = new OSFileSystem(mLocalRootPath);
+  if (mGlobal) {
+    fs->Init(mGlobal);
+  }
+
+  return fs.forget();
+}
+
+void OSFileSystem::Init(nsIGlobalObject* aGlobal) {
+  AssertIsOnOwningThread();
+  MOZ_ASSERT(!mGlobal, "No duple Init() calls");
+  MOZ_ASSERT(aGlobal);
+
+  mGlobal = aGlobal;
+}
+
+nsIGlobalObject* OSFileSystem::GetParentObject() const {
+  AssertIsOnOwningThread();
+  return mGlobal;
+}
+
+bool OSFileSystem::IsSafeFile(nsIFile* aFile) const {
+  MOZ_CRASH("Don't use OSFileSystem with the Device Storage API");
+  return true;
+}
+
+bool OSFileSystem::IsSafeDirectory(Directory* aDir) const {
+  MOZ_CRASH("Don't use OSFileSystem with the Device Storage API");
+  return true;
+}
+
+void OSFileSystem::Unlink() {
+  AssertIsOnOwningThread();
+  mGlobal = nullptr;
+}
+
+void OSFileSystem::Traverse(nsCycleCollectionTraversalCallback& cb) {
+  AssertIsOnOwningThread();
+
+  OSFileSystem* tmp = this;
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mGlobal);
+}
+
+void OSFileSystem::SerializeDOMPath(nsAString& aOutput) const {
+  AssertIsOnOwningThread();
+  aOutput = mLocalRootPath;
+}
+
+
+OSFileSystemParent::OSFileSystemParent(const nsAString& aRootDir) {
+  mLocalRootPath = aRootDir;
+}
+
+}  

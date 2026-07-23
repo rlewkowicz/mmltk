@@ -1,0 +1,55 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2003 - 2008, International Business Machines Corporation and  *
+* others. All Rights Reserved.                                                *
+*******************************************************************************
+*/
+
+#ifndef CECAL_H
+#define CECAL_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/calendar.h"
+
+U_NAMESPACE_BEGIN
+
+class U_I18N_API CECalendar : public Calendar {
+
+public:
+
+    virtual const char* getTemporalMonthCode(UErrorCode& status) const override;
+
+    virtual void setTemporalMonthCode(const char* code, UErrorCode& status) override;
+
+protected:
+
+    CECalendar(const Locale& aLocale, UErrorCode& success);
+
+    CECalendar (const CECalendar& other);
+
+    virtual ~CECalendar();
+
+protected:
+
+    virtual int64_t handleComputeMonthStart(int32_t eyear, int32_t month, UBool useMonth, UErrorCode& status) const override;
+
+    virtual int32_t handleGetLimit(UCalendarDateFields field, ELimitType limitType) const override;
+
+    virtual void handleComputeFields(int32_t julianDay, UErrorCode &status) override;
+
+protected:
+    virtual int32_t getJDEpochOffset() const = 0;
+
+    virtual int32_t extendedYearToEra(int32_t extendedYear) const = 0;
+
+    virtual int32_t extendedYearToYear(int32_t extendedYear) const = 0;
+};
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+#endif

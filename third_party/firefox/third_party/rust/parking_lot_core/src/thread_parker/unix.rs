@@ -1,0 +1,201 @@
+// Copyright 2016 Amanieu d'Antras
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
+use core::{
+    cell::{Cell, UnsafeCell},
+    mem::MaybeUninit,
+};
+use libc;
+use std::time::Instant;
+use std::{thread, time::Duration};
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "32"))]
+#[allow(non_camel_case_types)]
+type tv_nsec_t = i64;
+#[cfg(not(all(target_arch = "x86_64", target_pointer_width = "32")))]
+#[allow(non_camel_case_types)]
+type tv_nsec_t = libc::c_long;
+
+pub struct ThreadParker {
+    should_park: Cell<bool>,
+    mutex: UnsafeCell<libc::pthread_mutex_t>,
+    condvar: UnsafeCell<libc::pthread_cond_t>,
+    initialized: Cell<bool>,
+}
+
+impl super::ThreadParkerT for ThreadParker {
+    type UnparkHandle = UnparkHandle;
+
+    const IS_CHEAP_TO_CONSTRUCT: bool = false;
+
+    #[inline]
+    fn new() -> ThreadParker {
+        ThreadParker {
+            should_park: Cell::new(false),
+            mutex: UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER),
+            condvar: UnsafeCell::new(libc::PTHREAD_COND_INITIALIZER),
+            initialized: Cell::new(false),
+        }
+    }
+
+    #[inline]
+    unsafe fn prepare_park(&self) {
+        self.should_park.set(true);
+        if !self.initialized.get() {
+            self.init();
+            self.initialized.set(true);
+        }
+    }
+
+    #[inline]
+    unsafe fn timed_out(&self) -> bool {
+        let r = libc::pthread_mutex_lock(self.mutex.get());
+        debug_assert_eq!(r, 0);
+        let should_park = self.should_park.get();
+        let r = libc::pthread_mutex_unlock(self.mutex.get());
+        debug_assert_eq!(r, 0);
+        should_park
+    }
+
+    #[inline]
+    unsafe fn park(&self) {
+        let r = libc::pthread_mutex_lock(self.mutex.get());
+        debug_assert_eq!(r, 0);
+        while self.should_park.get() {
+            let r = libc::pthread_cond_wait(self.condvar.get(), self.mutex.get());
+            debug_assert_eq!(r, 0);
+        }
+        let r = libc::pthread_mutex_unlock(self.mutex.get());
+        debug_assert_eq!(r, 0);
+    }
+
+    #[inline]
+    unsafe fn park_until(&self, timeout: Instant) -> bool {
+        let r = libc::pthread_mutex_lock(self.mutex.get());
+        debug_assert_eq!(r, 0);
+        while self.should_park.get() {
+            let now = Instant::now();
+            if timeout <= now {
+                let r = libc::pthread_mutex_unlock(self.mutex.get());
+                debug_assert_eq!(r, 0);
+                return false;
+            }
+
+            if let Some(ts) = timeout_to_timespec(timeout - now) {
+                let r = libc::pthread_cond_timedwait(self.condvar.get(), self.mutex.get(), &ts);
+                if ts.tv_sec < 0 {
+                    debug_assert!(r == 0 || r == libc::ETIMEDOUT || r == libc::EINVAL);
+                } else {
+                    debug_assert!(r == 0 || r == libc::ETIMEDOUT);
+                }
+            } else {
+                let r = libc::pthread_cond_wait(self.condvar.get(), self.mutex.get());
+                debug_assert_eq!(r, 0);
+            }
+        }
+        let r = libc::pthread_mutex_unlock(self.mutex.get());
+        debug_assert_eq!(r, 0);
+        true
+    }
+
+    #[inline]
+    unsafe fn unpark_lock(&self) -> UnparkHandle {
+        let r = libc::pthread_mutex_lock(self.mutex.get());
+        debug_assert_eq!(r, 0);
+
+        UnparkHandle {
+            thread_parker: self,
+        }
+    }
+}
+
+impl ThreadParker {
+    /// Initializes the condvar to use CLOCK_MONOTONIC instead of CLOCK_REALTIME.
+#[cfg(target_os = "espidf")]
+#[inline]
+    unsafe fn init(&self) {}
+
+    /// Initializes the condvar to use CLOCK_MONOTONIC instead of CLOCK_REALTIME.
+#[cfg(not(target_os = "espidf"))]
+#[inline]
+    unsafe fn init(&self) {
+        let mut attr = MaybeUninit::<libc::pthread_condattr_t>::uninit();
+        let r = libc::pthread_condattr_init(attr.as_mut_ptr());
+        debug_assert_eq!(r, 0);
+        let r = libc::pthread_condattr_setclock(attr.as_mut_ptr(), libc::CLOCK_MONOTONIC);
+        debug_assert_eq!(r, 0);
+        let r = libc::pthread_cond_init(self.condvar.get(), attr.as_ptr());
+        debug_assert_eq!(r, 0);
+        let r = libc::pthread_condattr_destroy(attr.as_mut_ptr());
+        debug_assert_eq!(r, 0);
+    }
+}
+
+impl Drop for ThreadParker {
+    #[inline]
+    fn drop(&mut self) {
+        unsafe {
+            let r = libc::pthread_mutex_destroy(self.mutex.get());
+            debug_assert!(r == 0 || r == libc::EINVAL);
+            let r = libc::pthread_cond_destroy(self.condvar.get());
+            debug_assert!(r == 0 || r == libc::EINVAL);
+        }
+    }
+}
+
+pub struct UnparkHandle {
+    thread_parker: *const ThreadParker,
+}
+
+impl super::UnparkHandleT for UnparkHandle {
+    #[inline]
+    unsafe fn unpark(self) {
+        (*self.thread_parker).should_park.set(false);
+
+        let r = libc::pthread_cond_signal((*self.thread_parker).condvar.get());
+        debug_assert_eq!(r, 0);
+        let r = libc::pthread_mutex_unlock((*self.thread_parker).mutex.get());
+        debug_assert_eq!(r, 0);
+    }
+}
+
+#[inline]
+fn timespec_now() -> libc::timespec {
+    let mut now = MaybeUninit::<libc::timespec>::uninit();
+    let clock = if cfg!(target_os = "android") {
+        libc::CLOCK_REALTIME
+    } else {
+        libc::CLOCK_MONOTONIC
+    };
+    let r = unsafe { libc::clock_gettime(clock, now.as_mut_ptr()) };
+    debug_assert_eq!(r, 0);
+    unsafe { now.assume_init() }
+}
+
+#[inline]
+fn timeout_to_timespec(timeout: Duration) -> Option<libc::timespec> {
+    if timeout.as_secs() > libc::time_t::max_value() as u64 {
+        return None;
+    }
+
+    let now = timespec_now();
+    let mut nsec = now.tv_nsec + timeout.subsec_nanos() as tv_nsec_t;
+    let mut sec = now.tv_sec.checked_add(timeout.as_secs() as libc::time_t);
+    if nsec >= 1_000_000_000 {
+        nsec -= 1_000_000_000;
+        sec = sec.and_then(|sec| sec.checked_add(1));
+    }
+
+    sec.map(|sec| libc::timespec {
+        tv_nsec: nsec,
+        tv_sec: sec,
+    })
+}
+
+#[inline]
+pub fn thread_yield() {
+    thread::yield_now();
+}

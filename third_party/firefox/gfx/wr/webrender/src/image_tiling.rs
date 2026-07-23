@@ -1,0 +1,549 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+use crate::api::TileSize;
+use crate::api::units::*;
+use crate::segment::EdgeMask;
+use euclid::{point2, size2};
+use std::i32;
+use std::ops::Range;
+
+/// If repetitions are far enough apart that only one is within
+/// the primitive rect, then we can simplify the parameters and
+/// treat the primitive as not repeated.
+/// This can let us avoid unnecessary work later to handle some
+/// of the parameters.
+pub use api::prim_geometry::simplify_repeated_primitive;
+
+pub struct Repetition {
+    pub origin: LayoutPoint,
+    pub edge_flags: EdgeMask,
+}
+
+pub struct RepetitionIterator {
+    current_x: i32,
+    x_count: i32,
+    current_y: i32,
+    y_count: i32,
+    row_flags: EdgeMask,
+    current_origin: LayoutPoint,
+    initial_origin: LayoutPoint,
+    stride: LayoutSize,
+}
+
+impl Iterator for RepetitionIterator {
+    type Item = Repetition;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_x >= self.x_count {
+            self.current_y += 1;
+            if self.current_y >= self.y_count {
+                return None;
+            }
+            self.current_x = 0;
+
+            self.row_flags = EdgeMask::empty();
+            if self.current_y == self.y_count - 1 {
+                self.row_flags |= EdgeMask::BOTTOM;
+            }
+
+            self.current_origin.x = self.initial_origin.x;
+            self.current_origin.y += self.stride.height;
+        }
+
+        let mut edge_flags = self.row_flags;
+        if self.current_x == 0 {
+            edge_flags |= EdgeMask::LEFT;
+        }
+
+        if self.current_x == self.x_count - 1 {
+            edge_flags |= EdgeMask::RIGHT;
+        }
+
+        let repetition = Repetition {
+            origin: self.current_origin,
+            edge_flags,
+        };
+
+        self.current_origin.x += self.stride.width;
+        self.current_x += 1;
+
+        Some(repetition)
+    }
+}
+
+pub fn repetitions(
+    prim_rect: &LayoutRect,
+    visible_rect: &LayoutRect,
+    stride: LayoutSize,
+) -> RepetitionIterator {
+    let visible_rect = match prim_rect.intersection(&visible_rect) {
+        Some(rect) => rect,
+        None => {
+            return RepetitionIterator {
+                current_origin: LayoutPoint::zero(),
+                initial_origin: LayoutPoint::zero(),
+                current_x: 0,
+                current_y: 0,
+                x_count: 0,
+                y_count: 0,
+                stride,
+                row_flags: EdgeMask::empty(),
+            }
+        }
+    };
+
+    assert!(stride.width > 0.0);
+    assert!(stride.height > 0.0);
+
+    let nx = if visible_rect.min.x > prim_rect.min.x {
+        f32::floor((visible_rect.min.x - prim_rect.min.x) / stride.width)
+    } else {
+        0.0
+    };
+
+    let ny = if visible_rect.min.y > prim_rect.min.y {
+        f32::floor((visible_rect.min.y - prim_rect.min.y) / stride.height)
+    } else {
+        0.0
+    };
+
+    let x0 = prim_rect.min.x + nx * stride.width;
+    let y0 = prim_rect.min.y + ny * stride.height;
+
+    let x_most = visible_rect.max.x;
+    let y_most = visible_rect.max.y;
+
+    let mut x_count = f32::ceil((x_most - x0) / stride.width);
+    let mut y_count = f32::ceil((y_most - y0) / stride.height);
+
+    let valid = x_count.is_finite()
+        & y_count.is_finite()
+        & stride.is_finite();
+
+    if !valid {
+        x_count = 0.0;
+        y_count = 0.0;
+    }
+
+
+    let mut row_flags = EdgeMask::TOP;
+    if y_count as i32 == 1 {
+        row_flags |= EdgeMask::BOTTOM;
+    }
+
+
+    RepetitionIterator {
+        current_origin: LayoutPoint::new(x0, y0),
+        initial_origin: LayoutPoint::new(x0, y0),
+        current_x: 0,
+        current_y: 0,
+        x_count: x_count as i32,
+        y_count: y_count as i32,
+        row_flags,
+        stride,
+    }
+}
+
+#[derive(Debug)]
+pub struct Tile {
+    pub rect: LayoutRect,
+    pub offset: TileOffset,
+    pub edge_flags: EdgeMask,
+}
+
+#[derive(Debug)]
+pub struct TileIteratorExtent {
+    /// Range of visible tiles to iterate over in number of tiles.
+    tile_range: Range<i32>,
+    /// Range of tiles of the full image including tiles that are culled out.
+    image_tiles: Range<i32>,
+    /// Size of the first tile in layout space.
+    first_tile_layout_size: f32,
+    /// Size of the last tile in layout space.
+    last_tile_layout_size: f32,
+    /// Position of blob point (0, 0) in layout space.
+    layout_tiling_origin: f32,
+    /// Position of the top-left corner of the primitive rect in layout space.
+    layout_prim_start: f32,
+}
+
+#[derive(Debug)]
+pub struct TileIterator {
+    current_tile: TileOffset,
+    x: TileIteratorExtent,
+    y: TileIteratorExtent,
+    regular_tile_size: LayoutSize,
+}
+
+impl Iterator for TileIterator {
+    type Item = Tile;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_tile.x >= self.x.tile_range.end {
+            self.current_tile.y += 1;
+            self.current_tile.x = self.x.tile_range.start;
+        }
+
+        if self.current_tile.x >= self.x.tile_range.end || self.current_tile.y >= self.y.tile_range.end {
+            return None;
+        }
+
+        let tile_offset = self.current_tile;
+
+        let mut segment_rect = LayoutRect::from_origin_and_size(
+            LayoutPoint::new(
+                self.x.layout_tiling_origin + tile_offset.x as f32 * self.regular_tile_size.width,
+                self.y.layout_tiling_origin + tile_offset.y as f32 * self.regular_tile_size.height,
+            ),
+            self.regular_tile_size,
+        );
+
+        let mut edge_flags = EdgeMask::empty();
+
+        if tile_offset.x == self.x.image_tiles.start {
+            edge_flags |= EdgeMask::LEFT;
+            segment_rect.min.x = self.x.layout_prim_start;
+            segment_rect.max.x = segment_rect.min.x + self.x.first_tile_layout_size;
+        }
+        if tile_offset.x == self.x.image_tiles.end - 1 {
+            edge_flags |= EdgeMask::RIGHT;
+            segment_rect.max.x = segment_rect.min.x + self.x.last_tile_layout_size;
+        }
+
+        if tile_offset.y == self.y.image_tiles.start {
+            segment_rect.min.y = self.y.layout_prim_start;
+            segment_rect.max.y = segment_rect.min.y + self.y.first_tile_layout_size;
+            edge_flags |= EdgeMask::TOP;
+        }
+        if tile_offset.y == self.y.image_tiles.end - 1 {
+            segment_rect.max.y = segment_rect.min.y + self.y.last_tile_layout_size;
+            edge_flags |= EdgeMask::BOTTOM;
+        }
+
+        assert!(tile_offset.y < self.y.tile_range.end);
+        let tile = Tile {
+            rect: segment_rect,
+            offset: tile_offset,
+            edge_flags,
+        };
+
+        self.current_tile.x += 1;
+
+        Some(tile)
+    }
+}
+
+pub fn tiles(
+    prim_rect: &LayoutRect,
+    visible_rect: &LayoutRect,
+    image_rect: &DeviceIntRect,
+    device_tile_size: i32,
+) -> TileIterator {
+
+
+    let visible_rect = match prim_rect.intersection(&visible_rect) {
+        Some(rect) => rect,
+        None => {
+            return TileIterator {
+                current_tile: TileOffset::zero(),
+                x: TileIteratorExtent {
+                    tile_range: 0..0,
+                    image_tiles: 0..0,
+                    first_tile_layout_size: 0.0,
+                    last_tile_layout_size: 0.0,
+                    layout_tiling_origin: 0.0,
+                    layout_prim_start: prim_rect.min.x,
+                },
+                y: TileIteratorExtent {
+                    tile_range: 0..0,
+                    image_tiles: 0..0,
+                    first_tile_layout_size: 0.0,
+                    last_tile_layout_size: 0.0,
+                    layout_tiling_origin: 0.0,
+                    layout_prim_start: prim_rect.min.y,
+                },
+                regular_tile_size: LayoutSize::zero(),
+            }
+        }
+    };
+
+    let layout_tile_size = LayoutSize::new(
+        device_tile_size as f32 / image_rect.width() as f32 * prim_rect.width(),
+        device_tile_size as f32 / image_rect.height() as f32 * prim_rect.height(),
+    );
+
+
+    let x_extent = tiles_1d(
+        layout_tile_size.width,
+        visible_rect.x_range(),
+        prim_rect.min.x,
+        image_rect.x_range(),
+        device_tile_size,
+    );
+
+    let y_extent = tiles_1d(
+        layout_tile_size.height,
+        visible_rect.y_range(),
+        prim_rect.min.y,
+        image_rect.y_range(),
+        device_tile_size,
+    );
+
+    TileIterator {
+        current_tile: point2(
+            x_extent.tile_range.start,
+            y_extent.tile_range.start,
+        ),
+        x: x_extent,
+        y: y_extent,
+        regular_tile_size: layout_tile_size,
+    }
+}
+
+/// Decompose tiles along an arbitrary axis.
+///
+/// This does most of the heavy lifting needed for `tiles` but in a single dimension for
+/// the sake of simplicity since the problem is independent on the x and y axes.
+fn tiles_1d(
+    layout_tile_size: f32,
+    layout_visible_range: Range<f32>,
+    layout_prim_start: f32,
+    device_image_range: Range<i32>,
+    device_tile_size: i32,
+) -> TileIteratorExtent {
+    debug_assert!(layout_tile_size > 0.0);
+    debug_assert!(layout_visible_range.end >= layout_visible_range.start);
+    debug_assert!(device_image_range.end > device_image_range.start);
+    debug_assert!(device_tile_size > 0);
+
+    let first_tile_device_size = first_tile_size_1d(&device_image_range, device_tile_size);
+    let last_tile_device_size = last_tile_size_1d(&device_image_range, device_tile_size);
+
+    let image_tiles = tile_range_1d(&device_image_range, device_tile_size);
+
+    let layout_offset = device_image_range.start as f32 * layout_tile_size / device_tile_size as f32;
+    let layout_tiling_origin = layout_prim_start - layout_offset;
+
+    let visible_tiles_start = f32::floor((layout_visible_range.start - layout_tiling_origin) / layout_tile_size) as i32;
+    let visible_tiles_end = f32::ceil((layout_visible_range.end - layout_tiling_origin) / layout_tile_size) as i32;
+
+    let mut tiles_start = i32::max(image_tiles.start, visible_tiles_start);
+    let tiles_end = i32::min(image_tiles.end, visible_tiles_end);
+    if tiles_start > tiles_end {
+        tiles_start = tiles_end;
+    }
+
+    let first_tile_layout_size = if tiles_start == image_tiles.start {
+        first_tile_device_size as f32 * layout_tile_size / device_tile_size as f32
+    } else {
+        layout_tile_size
+    };
+
+    let last_tile_layout_size = if tiles_end == image_tiles.end {
+        last_tile_device_size as f32 * layout_tile_size / device_tile_size as f32
+    } else {
+        layout_tile_size
+    };
+
+    TileIteratorExtent {
+        tile_range: tiles_start..tiles_end,
+        image_tiles,
+        first_tile_layout_size,
+        last_tile_layout_size,
+        layout_tiling_origin,
+        layout_prim_start,
+    }
+}
+
+/// Compute the range of tiles (in number of tiles) that intersect the provided
+/// image range (in pixels) in an arbitrary dimension.
+///
+/// ```ignore
+///
+///         0
+///         :
+///   #-+---+---+---+---+---+--#
+///   # |   |   |   |   |   |  #
+///   #-+---+---+---+---+---+--#
+/// ^       :                   ^
+///
+///  +------------------------+  image_range
+///        +---+  regular_tile_size
+///
+/// ```
+fn tile_range_1d(
+    image_range: &Range<i32>,
+    regular_tile_size: i32,
+) -> Range<i32> {
+
+    let mut start = image_range.start / regular_tile_size;
+    if image_range.start % regular_tile_size < 0 {
+        start -= 1;
+    }
+
+    let mut end = image_range.end / regular_tile_size;
+    if image_range.end % regular_tile_size > 0 {
+        end += 1;
+    }
+
+    start..end
+}
+
+fn first_tile_size_1d(
+    image_range: &Range<i32>,
+    regular_tile_size: i32,
+) -> i32 {
+    let image_size = image_range.end - image_range.start;
+    i32::min(
+        match image_range.start % regular_tile_size {
+            0 => regular_tile_size,
+            m if m > 0 => regular_tile_size - m,
+            m => -m,
+        },
+        image_size
+    )
+}
+
+fn last_tile_size_1d(
+    image_range: &Range<i32>,
+    regular_tile_size: i32,
+) -> i32 {
+    let image_size = image_range.end - image_range.start;
+    i32::min(
+        match image_range.end % regular_tile_size {
+            0 => regular_tile_size,
+            m if m < 0 => regular_tile_size + m,
+            m => m,
+        },
+        image_size,
+    )
+}
+
+pub fn compute_tile_rect(
+    image_rect: &DeviceIntRect,
+    regular_tile_size: TileSize,
+    tile: TileOffset,
+) -> DeviceIntRect {
+    let regular_tile_size = regular_tile_size as i32;
+    DeviceIntRect::from_origin_and_size(
+        point2(
+            compute_tile_origin_1d(image_rect.x_range(), regular_tile_size, tile.x as i32),
+            compute_tile_origin_1d(image_rect.y_range(), regular_tile_size, tile.y as i32),
+        ),
+        size2(
+            compute_tile_size_1d(image_rect.x_range(), regular_tile_size, tile.x as i32),
+            compute_tile_size_1d(image_rect.y_range(), regular_tile_size, tile.y as i32),
+        ),
+    )
+}
+
+fn compute_tile_origin_1d(
+    img_range: Range<i32>,
+    regular_tile_size: i32,
+    tile_offset: i32,
+) -> i32 {
+    let tile_range = tile_range_1d(&img_range, regular_tile_size);
+    if tile_offset == tile_range.start {
+        img_range.start
+    } else {
+        tile_offset * regular_tile_size
+    }
+}
+
+pub fn compute_tile_size(
+    image_rect: &DeviceIntRect,
+    regular_tile_size: TileSize,
+    tile: TileOffset,
+) -> DeviceIntSize {
+    let regular_tile_size = regular_tile_size as i32;
+    size2(
+        compute_tile_size_1d(image_rect.x_range(), regular_tile_size, tile.x as i32),
+        compute_tile_size_1d(image_rect.y_range(), regular_tile_size, tile.y as i32),
+    )
+}
+
+fn compute_tile_size_1d(
+    img_range: Range<i32>,
+    regular_tile_size: i32,
+    tile_offset: i32,
+) -> i32 {
+    let tile_range = tile_range_1d(&img_range, regular_tile_size);
+
+    let actual_size = if tile_offset == tile_range.start {
+        first_tile_size_1d(&img_range, regular_tile_size)
+    } else if tile_offset == tile_range.end - 1 {
+        last_tile_size_1d(&img_range, regular_tile_size)
+    } else {
+        regular_tile_size
+    };
+
+    assert!(actual_size > 0);
+
+    actual_size
+}
+
+pub fn compute_tile_range(
+    visible_area: &DeviceIntRect,
+    tile_size: u16,
+) -> TileRange {
+    let tile_size = tile_size as i32;
+    let x_range = tile_range_1d(&visible_area.x_range(), tile_size);
+    let y_range = tile_range_1d(&visible_area.y_range(), tile_size);
+
+    TileRange {
+        min: point2(x_range.start, y_range.start),
+        max: point2(x_range.end, y_range.end),
+    }
+}
+
+pub fn for_each_tile_in_range(
+    range: &TileRange,
+    mut callback: impl FnMut(TileOffset),
+) {
+    for y in range.y_range() {
+        for x in range.x_range() {
+            callback(point2(x, y));
+        }
+    }
+}
+
+pub fn compute_valid_tiles_if_bounds_change(
+    prev_rect: &DeviceIntRect,
+    new_rect: &DeviceIntRect,
+    tile_size: u16,
+) -> Option<TileRange> {
+    let intersection = match prev_rect.intersection(new_rect) {
+        Some(rect) => rect,
+        None => {
+            return Some(TileRange::zero());
+        }
+    };
+
+    let left = prev_rect.min.x != new_rect.min.x;
+    let right = prev_rect.max.x != new_rect.max.x;
+    let top = prev_rect.min.y != new_rect.min.y;
+    let bottom = prev_rect.max.y != new_rect.max.y;
+
+    if !left && !right && !top && !bottom {
+        return None;
+    }
+
+    let tw = 1.0 / (tile_size as f32);
+    let th = 1.0 / (tile_size as f32);
+
+    let tiles = intersection
+        .cast::<f32>()
+        .scale(tw, th);
+
+    let min_x = if left { f32::ceil(tiles.min.x) } else { f32::floor(tiles.min.x) };
+    let min_y = if top { f32::ceil(tiles.min.y) } else { f32::floor(tiles.min.y) };
+    let max_x = if right { f32::floor(tiles.max.x) } else { f32::ceil(tiles.max.x) };
+    let max_y = if bottom { f32::floor(tiles.max.y) } else { f32::ceil(tiles.max.y) };
+
+    Some(TileRange {
+        min: point2(min_x as i32, min_y as i32),
+        max: point2(max_x as i32, max_y as i32),
+    })
+}

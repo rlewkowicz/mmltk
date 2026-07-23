@@ -1,0 +1,167 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_HTMLVideoElement_h
+#define mozilla_dom_HTMLVideoElement_h
+
+#include "ImageTypes.h"
+#include "Units.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "mozilla/dom/HTMLMediaElement.h"
+#include "mozilla/dom/VideoFrameProvider.h"
+
+namespace mozilla {
+
+class FrameStatistics;
+
+namespace dom {
+
+class WakeLock;
+class VideoPlaybackQuality;
+
+class HTMLVideoElement final : public HTMLMediaElement {
+  class SecondaryVideoOutput;
+
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(HTMLVideoElement, HTMLMediaElement)
+
+  typedef mozilla::dom::NodeInfo NodeInfo;
+
+  explicit HTMLVideoElement(already_AddRefed<NodeInfo> aNodeInfo);
+
+  NS_IMPL_FROMNODE_HTML_WITH_TAG(HTMLVideoElement, video)
+
+  using HTMLMediaElement::GetPaused;
+
+  HTMLVideoElement* AsHTMLVideoElement() override { return this; };
+
+  void Invalidate(ImageSizeChanged aImageSizeChanged,
+                  const Maybe<nsIntSize>& aNewIntrinsicSize,
+                  ForceInvalidate aForceInvalidate) override;
+
+  bool IsVideo() const override { return true; }
+
+  bool ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                      const nsAString& aValue,
+                      nsIPrincipal* aMaybeScriptedPrincipal,
+                      nsAttrValue& aResult) override;
+  NS_IMETHOD_(bool) IsAttributeMapped(const nsAtom* aAttribute) const override;
+
+  nsMapRuleToAttributesFunc GetAttributeMappingFunction() const override;
+
+  nsresult Clone(NodeInfo*, nsINode** aResult) const override;
+
+  nsresult CopyInnerTo(Element* aDest);
+
+  mozilla::Maybe<mozilla::CSSIntSize> GetVideoSize() const;
+
+  void UpdateMediaSize(const nsIntSize& aSize) override;
+
+  nsresult SetAcceptHeader(nsIHttpChannel* aChannel) override;
+
+  bool IsInteractiveHTMLContent() const override;
+
+
+  uint32_t Width() const {
+    return GetDimensionAttrAsUnsignedInt(nsGkAtoms::width, 0);
+  }
+
+  void SetWidth(uint32_t aValue, ErrorResult& aRv) {
+    SetUnsignedIntAttr(nsGkAtoms::width, aValue, 0, aRv);
+  }
+
+  uint32_t Height() const {
+    return GetDimensionAttrAsUnsignedInt(nsGkAtoms::height, 0);
+  }
+
+  void SetHeight(uint32_t aValue, ErrorResult& aRv) {
+    SetUnsignedIntAttr(nsGkAtoms::height, aValue, 0, aRv);
+  }
+
+  uint32_t VideoWidth();
+
+  uint32_t VideoHeight();
+
+  VideoRotation RotationDegrees() const { return mMediaInfo.mVideo.mRotation; }
+
+  bool HasAlpha() const { return mMediaInfo.mVideo.HasAlpha(); }
+
+  void GetPoster(nsAString& aValue) {
+    GetURIAttr(nsGkAtoms::poster, nullptr, aValue);
+  }
+  void SetPoster(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::poster, aValue, aRv);
+  }
+
+  uint32_t MozParsedFrames() const;
+
+  uint32_t MozDecodedFrames() const;
+
+  uint32_t MozPresentedFrames();
+
+  uint32_t MozPaintedFrames();
+
+  double MozFrameDelay();
+
+  bool MozHasAudio() const;
+
+  already_AddRefed<VideoPlaybackQuality> GetVideoPlaybackQuality();
+
+  void OnVisibilityChange(Visibility aNewVisibility) override;
+
+ protected:
+  virtual ~HTMLVideoElement();
+
+  virtual JSObject* WrapNode(JSContext* aCx,
+                             JS::Handle<JSObject*> aGivenProto) override;
+
+  void WakeLockRelease() override;
+  void UpdateWakeLock() override;
+
+  bool ShouldCreateVideoWakeLock() const;
+  void CreateVideoWakeLockIfNeeded();
+  void ReleaseVideoWakeLockIfExists();
+
+  gfx::IntSize GetVideoIntrinsicDimensions();
+
+  RefPtr<WakeLock> mScreenWakeLock;
+
+ private:
+  void ResetState() override;
+
+  bool HasPendingCallbacks() const final {
+    return !mVideoFrameRequestManager.IsEmpty();
+  }
+
+  VideoFrameRequestManager mVideoFrameRequestManager;
+  layers::ContainerFrameID mLastPresentedFrameID =
+      layers::kContainerFrameID_Invalid;
+  uint32_t mPresentedFrames = 0;
+
+ public:
+  uint32_t RequestVideoFrameCallback(VideoFrameRequestCallback& aCallback,
+                                     ErrorResult& aRv);
+  void CancelVideoFrameCallback(uint32_t aHandle);
+  [[nodiscard]] bool WillFireVideoFrameCallbacks(
+      const TimeStamp& aNowTime, const Maybe<TimeStamp>& aNextTickTime,
+      VideoFrameCallbackMetadata& aMd);
+  VideoFrameRequestManager& FrameRequestManager() {
+    return mVideoFrameRequestManager;
+  }
+  void FinishedVideoFrameRequestCallbacks();
+
+ private:
+  static void MapAttributesIntoRule(MappedDeclarationsBuilder&);
+
+  static bool IsVideoStatsEnabled();
+  double TotalPlayTime() const;
+
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_HTMLVideoElement_h

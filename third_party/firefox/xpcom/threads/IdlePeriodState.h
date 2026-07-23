@@ -1,0 +1,113 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_IdlePeriodState_h
+#define mozilla_IdlePeriodState_h
+
+
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/TimeStamp.h"
+#include "nsCOMPtr.h"
+
+#include <stdint.h>
+
+class nsIIdlePeriod;
+
+namespace mozilla {
+class TaskManager;
+namespace ipc {
+class IdleSchedulerChild;
+}  
+
+class IdlePeriodState {
+ public:
+  explicit IdlePeriodState(already_AddRefed<nsIIdlePeriod> aIdlePeriod);
+
+  ~IdlePeriodState();
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const;
+
+  void FlagNotIdle();
+
+  void RanOutOfTasks(const MutexAutoUnlock& aProofOfUnlock);
+
+  void EnforcePendingTaskGuarantee() {
+    mHasPendingEventsPromisedIdleEvent = true;
+  }
+
+  void ForgetPendingTaskGuarantee() {
+    mHasPendingEventsPromisedIdleEvent = false;
+  }
+
+  void UpdateCachedIdleDeadline(const MutexAutoUnlock& aProofOfUnlock) {
+    mCachedIdleDeadline = GetIdleDeadlineInternal(false, aProofOfUnlock);
+  }
+
+  void RequestIdleDeadlineIfNeeded(const MutexAutoUnlock& aProofOfUnlock) {
+    GetIdleDeadlineInternal(false, aProofOfUnlock);
+  }
+
+  void ClearCachedIdleDeadline() { mCachedIdleDeadline = TimeStamp(); }
+
+  TimeStamp GetCachedIdleDeadline() { return mCachedIdleDeadline; }
+
+  void CachePeekedIdleDeadline(const MutexAutoUnlock& aProofOfUnlock) {
+    mCachedIdleDeadline = GetIdleDeadlineInternal(true, aProofOfUnlock);
+  }
+
+  void SetIdleToken(uint64_t aId, TimeDuration aDuration);
+
+  bool IsActive() { return mActive; }
+
+ protected:
+  void EnsureIsActive() {
+    if (!mActive) {
+      SetActive();
+    }
+  }
+
+  void EnsureIsPaused(const MutexAutoUnlock& aProofOfUnlock) {
+    if (mActive) {
+      SetPaused(aProofOfUnlock);
+    }
+  }
+
+  TimeStamp GetLocalIdleDeadline(bool& aShuttingDown,
+                                 const MutexAutoUnlock& aProofOfUnlock);
+
+  TimeStamp GetIdleToken(TimeStamp aLocalIdlePeriodHint,
+                         const MutexAutoUnlock& aProofOfUnlock);
+
+  void RequestIdleToken(TimeStamp aLocalIdlePeriodHint);
+
+  void ClearIdleToken();
+
+  void SetActive();
+  void SetPaused(const MutexAutoUnlock& aProofOfUnlock);
+
+  TimeStamp GetIdleDeadlineInternal(bool aIsPeek,
+                                    const MutexAutoUnlock& aProofOfUnlock);
+
+  bool ShouldGetIdleToken();
+
+  bool mHasPendingEventsPromisedIdleEvent = false;
+
+  nsCOMPtr<nsIIdlePeriod> mIdlePeriod;
+
+  TimeStamp mIdleToken;
+
+  uint64_t mIdleRequestId = 0;
+
+  RefPtr<mozilla::ipc::IdleSchedulerChild> mIdleScheduler;
+
+  TimeStamp mCachedIdleDeadline;
+
+  bool mActive = true;
+};
+
+}  
+
+#endif  // mozilla_IdlePeriodState_h

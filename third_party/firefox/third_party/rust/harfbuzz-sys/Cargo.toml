@@ -1,0 +1,49 @@
+
+[package]
+edition = "2021"
+name = "harfbuzz-sys"
+version = "0.6.1"
+authors = ["The Servo Project Developers"]
+build = false
+exclude = [
+    "harfbuzz/docs/*",
+    "harfbuzz/subprojects/benchmark-1.5.2/*",
+    "harfbuzz/test/*",
+    "update.sh",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Rust bindings to the HarfBuzz text shaping engine"
+documentation = "https://docs.rs/harfbuzz/"
+keywords = [
+    "opentype",
+    "font",
+    "text",
+    "unicode",
+    "shaping",
+]
+categories = [
+    "external-ffi-bindings",
+    "internationalization",
+    "text-processing",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/servo/rust-harfbuzz"
+
+[features]
+bundled = []
+default = [
+    "freetype",
+]
+freetype = ["dep:freetype-sys"]
+
+[lib]
+name = "harfbuzz_sys"
+path = "src/lib.rs"
+
+[dependencies.freetype-sys]
+version = "0.23.0"
+optional = true

@@ -1,0 +1,461 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "GLUploadHelpers.h"
+
+#include <bit>
+
+#include "GLContext.h"
+#include "mozilla/gfx/2D.h"
+#include "gfxUtils.h"
+#include "mozilla/gfx/Tools.h"  // For BytesPerPixel
+#include "nsRegion.h"
+#include "GfxTexturesReporter.h"
+#include "mozilla/gfx/Logging.h"
+
+namespace mozilla {
+
+using namespace gfx;
+
+namespace gl {
+
+static unsigned int DataOffset(const IntPoint& aPoint, int32_t aStride,
+                               SurfaceFormat aFormat) {
+  unsigned int data = aPoint.y * aStride;
+  data += aPoint.x * BytesPerPixel(aFormat);
+  return data;
+}
+
+static bool CheckUploadBounds(const IntSize& aDst, const IntSize& aSrc,
+                              const IntPoint& aOffset) {
+  if (aOffset.x < 0 || aOffset.y < 0 || aOffset.x >= aSrc.width ||
+      aOffset.y >= aSrc.height) {
+    MOZ_ASSERT_UNREACHABLE("Offset outside source bounds");
+    return false;
+  }
+  if (aDst.width > (aSrc.width - aOffset.x) ||
+      aDst.height > (aSrc.height - aOffset.y)) {
+    MOZ_ASSERT_UNREACHABLE("Source has insufficient data");
+    return false;
+  }
+  return true;
+}
+
+static GLint GetAddressAlignment(ptrdiff_t aAddress) {
+  if (!(aAddress & 0x7)) {
+    return 8;
+  } else if (!(aAddress & 0x3)) {
+    return 4;
+  } else if (!(aAddress & 0x1)) {
+    return 2;
+  } else {
+    return 1;
+  }
+}
+
+static void CopyAndPadTextureData(const GLvoid* srcBuffer, GLvoid* dstBuffer,
+                                  GLsizei srcWidth, GLsizei srcHeight,
+                                  GLsizei dstWidth, GLsizei dstHeight,
+                                  GLsizei stride, GLint pixelsize) {
+  unsigned char* rowDest = static_cast<unsigned char*>(dstBuffer);
+  const unsigned char* source = static_cast<const unsigned char*>(srcBuffer);
+
+  for (GLsizei h = 0; h < srcHeight; ++h) {
+    memcpy(rowDest, source, srcWidth * pixelsize);
+    rowDest += dstWidth * pixelsize;
+    source += stride;
+  }
+
+  GLsizei padHeight = srcHeight;
+
+  if (dstHeight > srcHeight) {
+    memcpy(rowDest, source - stride, srcWidth * pixelsize);
+    padHeight++;
+  }
+
+  if (dstWidth > srcWidth) {
+    rowDest = static_cast<unsigned char*>(dstBuffer) + srcWidth * pixelsize;
+    for (GLsizei h = 0; h < padHeight; ++h) {
+      memcpy(rowDest, rowDest - pixelsize, pixelsize);
+      rowDest += dstWidth * pixelsize;
+    }
+  }
+}
+
+bool ShouldUploadSubTextures(GLContext* gl) {
+  if (!gl->WorkAroundDriverBugs()) return true;
+
+  if (gl->Renderer() == GLRenderer::Adreno200 ||
+      gl->Renderer() == GLRenderer::Adreno205) {
+    return false;
+  }
+
+  if (gl->Renderer() == GLRenderer::SGX540 ||
+      gl->Renderer() == GLRenderer::SGX530) {
+    return false;
+  }
+
+  return true;
+}
+
+static void TexSubImage2DWithUnpackSubimageGLES(
+    GLContext* gl, GLenum target, GLint level, GLint xoffset, GLint yoffset,
+    GLsizei width, GLsizei height, GLsizei stride, GLint pixelsize,
+    GLenum format, GLenum type, const GLvoid* pixels) {
+  gl->fPixelStorei(LOCAL_GL_UNPACK_ALIGNMENT,
+                   std::min(GetAddressAlignment((ptrdiff_t)pixels),
+                            GetAddressAlignment((ptrdiff_t)stride)));
+  int rowLength = stride / pixelsize;
+  if (gl->HasPBOState()) {
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ROW_LENGTH, rowLength);
+    gl->fTexSubImage2D(target, level, xoffset, yoffset, width, height, format,
+                       type, pixels);
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ROW_LENGTH, 0);
+  } else {
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ROW_LENGTH, rowLength);
+    gl->fTexSubImage2D(target, level, xoffset, yoffset, width, height - 1,
+                       format, type, pixels);
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ROW_LENGTH, 0);
+    gl->fTexSubImage2D(target, level, xoffset, yoffset + height - 1, width, 1,
+                       format, type,
+                       (const unsigned char*)pixels + (height - 1) * stride);
+  }
+  gl->fPixelStorei(LOCAL_GL_UNPACK_ALIGNMENT, 4);
+}
+
+static void TexSubImage2DWithoutUnpackSubimage(
+    GLContext* gl, GLenum target, GLint level, GLint xoffset, GLint yoffset,
+    GLsizei width, GLsizei height, GLsizei stride, GLint pixelsize,
+    GLenum format, GLenum type, const GLvoid* pixels) {
+
+  MOZ_ASSERT(width <= 16384);
+  MOZ_ASSERT(height <= 16384);
+  MOZ_ASSERT(pixelsize < 8);
+
+  const auto size = CheckedInt<size_t>(width) * height * pixelsize;
+  if (!size.isValid()) {
+    MOZ_ASSERT_UNREACHABLE("Unacceptable size calculated.!");
+    return;
+  }
+
+  unsigned char* newPixels = new (fallible) unsigned char[size.value()];
+
+  if (newPixels) {
+    unsigned char* rowDest = newPixels;
+    const unsigned char* rowSource = (const unsigned char*)pixels;
+    for (int h = 0; h < height; h++) {
+      memcpy(rowDest, rowSource, width * pixelsize);
+      rowDest += width * pixelsize;
+      rowSource += stride;
+    }
+
+    stride = width * pixelsize;
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ALIGNMENT,
+                     std::min(GetAddressAlignment((ptrdiff_t)newPixels),
+                              GetAddressAlignment((ptrdiff_t)stride)));
+    gl->fTexSubImage2D(target, level, xoffset, yoffset, width, height, format,
+                       type, newPixels);
+    delete[] newPixels;
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ALIGNMENT, 4);
+
+  } else {
+    const unsigned char* rowSource = (const unsigned char*)pixels;
+
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ALIGNMENT,
+                     std::min(GetAddressAlignment((ptrdiff_t)pixels),
+                              GetAddressAlignment((ptrdiff_t)stride)));
+
+    for (int i = 0; i < height; i++) {
+      gl->fTexSubImage2D(target, level, xoffset, yoffset + i, width, 1, format,
+                         type, rowSource);
+      rowSource += stride;
+    }
+
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ALIGNMENT, 4);
+  }
+}
+static void TexSubImage2DHelper(GLContext* gl, GLenum target, GLint level,
+                                GLint xoffset, GLint yoffset, GLsizei width,
+                                GLsizei height, GLsizei stride, GLint pixelsize,
+                                GLenum format, GLenum type,
+                                const GLvoid* pixels) {
+  if (gl->IsGLES()) {
+    if (stride == width * pixelsize) {
+      gl->fPixelStorei(LOCAL_GL_UNPACK_ALIGNMENT,
+                       std::min(GetAddressAlignment((ptrdiff_t)pixels),
+                                GetAddressAlignment((ptrdiff_t)stride)));
+      gl->fTexSubImage2D(target, level, xoffset, yoffset, width, height, format,
+                         type, pixels);
+      gl->fPixelStorei(LOCAL_GL_UNPACK_ALIGNMENT, 4);
+    } else if (gl->IsExtensionSupported(GLContext::EXT_unpack_subimage) ||
+               gl->HasPBOState()) {
+      TexSubImage2DWithUnpackSubimageGLES(gl, target, level, xoffset, yoffset,
+                                          width, height, stride, pixelsize,
+                                          format, type, pixels);
+
+    } else {
+      TexSubImage2DWithoutUnpackSubimage(gl, target, level, xoffset, yoffset,
+                                         width, height, stride, pixelsize,
+                                         format, type, pixels);
+    }
+  } else {
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ALIGNMENT,
+                     std::min(GetAddressAlignment((ptrdiff_t)pixels),
+                              GetAddressAlignment((ptrdiff_t)stride)));
+    int rowLength = stride / pixelsize;
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ROW_LENGTH, rowLength);
+    gl->fTexSubImage2D(target, level, xoffset, yoffset, width, height, format,
+                       type, pixels);
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ROW_LENGTH, 0);
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ALIGNMENT, 4);
+  }
+}
+
+static void TexImage2DHelper(GLContext* gl, GLenum target, GLint level,
+                             GLint internalformat, GLsizei width,
+                             GLsizei height, GLsizei stride, GLint pixelsize,
+                             GLint border, GLenum format, GLenum type,
+                             const GLvoid* pixels) {
+  if (gl->IsGLES()) {
+    NS_ASSERTION(
+        format == (GLenum)internalformat,
+        "format and internalformat not the same for glTexImage2D on GLES2");
+
+    MOZ_ASSERT(width >= 0 && height >= 0);
+    if (!CanUploadNonPowerOfTwo(gl) &&
+        (stride != width * pixelsize || !std::has_single_bit((uint32_t)width) ||
+         !std::has_single_bit((uint32_t)height))) {
+      GLsizei paddedWidth = RoundUpPow2((uint32_t)width);
+      GLsizei paddedHeight = RoundUpPow2((uint32_t)height);
+
+      MOZ_ASSERT(width <= 16384);
+      MOZ_ASSERT(height <= 16384);
+      MOZ_ASSERT(pixelsize < 8);
+
+      const auto size =
+          CheckedInt<size_t>(paddedWidth) * paddedHeight * pixelsize;
+      if (!size.isValid()) {
+        MOZ_ASSERT_UNREACHABLE("Unacceptable size calculated.!");
+        return;
+      }
+
+      GLvoid* paddedPixels = new unsigned char[size.value()];
+
+      CopyAndPadTextureData(pixels, paddedPixels, width, height, paddedWidth,
+                            paddedHeight, stride, pixelsize);
+
+      gl->fPixelStorei(
+          LOCAL_GL_UNPACK_ALIGNMENT,
+          std::min(GetAddressAlignment((ptrdiff_t)paddedPixels),
+                   GetAddressAlignment((ptrdiff_t)paddedWidth * pixelsize)));
+      gl->fTexImage2D(target, border, internalformat, paddedWidth, paddedHeight,
+                      border, format, type, paddedPixels);
+      gl->fPixelStorei(LOCAL_GL_UNPACK_ALIGNMENT, 4);
+
+      delete[] static_cast<unsigned char*>(paddedPixels);
+      return;
+    }
+
+    if (stride == width * pixelsize) {
+      gl->fPixelStorei(LOCAL_GL_UNPACK_ALIGNMENT,
+                       std::min(GetAddressAlignment((ptrdiff_t)pixels),
+                                GetAddressAlignment((ptrdiff_t)stride)));
+      gl->fTexImage2D(target, border, internalformat, width, height, border,
+                      format, type, pixels);
+      gl->fPixelStorei(LOCAL_GL_UNPACK_ALIGNMENT, 4);
+    } else {
+      gl->fTexImage2D(target, border, internalformat, width, height, border,
+                      format, type, nullptr);
+      TexSubImage2DHelper(gl, target, level, 0, 0, width, height, stride,
+                          pixelsize, format, type, pixels);
+    }
+  } else {
+
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ALIGNMENT,
+                     std::min(GetAddressAlignment((ptrdiff_t)pixels),
+                              GetAddressAlignment((ptrdiff_t)stride)));
+    int rowLength = stride / pixelsize;
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ROW_LENGTH, rowLength);
+    gl->fTexImage2D(target, level, internalformat, width, height, border,
+                    format, type, pixels);
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ROW_LENGTH, 0);
+    gl->fPixelStorei(LOCAL_GL_UNPACK_ALIGNMENT, 4);
+  }
+}
+
+SurfaceFormat UploadImageDataToTexture(
+    GLContext* gl, unsigned char* aData, const gfx::IntSize& aDataSize,
+    const IntPoint& aDstOffset, int32_t aStride, SurfaceFormat aFormat,
+    const nsIntRegion& aDstRegion, GLuint aTexture, const gfx::IntSize& aSize,
+    size_t* aOutUploadSize, bool aNeedInit, GLenum aTextureUnit,
+    GLenum aTextureTarget) {
+  gl->MakeCurrent();
+  gl->fActiveTexture(aTextureUnit);
+  gl->fBindTexture(aTextureTarget, aTexture);
+
+  GLenum format = 0;
+  GLenum internalFormat = 0;
+  GLenum type = 0;
+  int32_t pixelSize = BytesPerPixel(aFormat);
+  SurfaceFormat surfaceFormat = gfx::SurfaceFormat::UNKNOWN;
+
+  MOZ_ASSERT(gl->GetPreferredARGB32Format() == LOCAL_GL_BGRA ||
+             gl->GetPreferredARGB32Format() == LOCAL_GL_RGBA);
+
+  switch (aFormat) {
+    case SurfaceFormat::B8G8R8A8:
+      if (gl->GetPreferredARGB32Format() == LOCAL_GL_BGRA) {
+        format = LOCAL_GL_BGRA;
+        surfaceFormat = SurfaceFormat::R8G8B8A8;
+        type = LOCAL_GL_UNSIGNED_INT_8_8_8_8_REV;
+      } else {
+        format = LOCAL_GL_RGBA;
+        surfaceFormat = SurfaceFormat::B8G8R8A8;
+        type = LOCAL_GL_UNSIGNED_BYTE;
+      }
+      internalFormat = LOCAL_GL_RGBA;
+      break;
+    case SurfaceFormat::B8G8R8X8:
+      if (gl->GetPreferredARGB32Format() == LOCAL_GL_BGRA) {
+        format = LOCAL_GL_BGRA;
+        surfaceFormat = SurfaceFormat::R8G8B8X8;
+        type = LOCAL_GL_UNSIGNED_INT_8_8_8_8_REV;
+      } else {
+        format = LOCAL_GL_RGBA;
+        surfaceFormat = SurfaceFormat::B8G8R8X8;
+        type = LOCAL_GL_UNSIGNED_BYTE;
+      }
+      internalFormat = LOCAL_GL_RGBA;
+      break;
+    case SurfaceFormat::R8G8B8A8:
+      if (gl->GetPreferredARGB32Format() == LOCAL_GL_BGRA) {
+        format = LOCAL_GL_BGRA;
+        type = LOCAL_GL_UNSIGNED_INT_8_8_8_8_REV;
+        surfaceFormat = SurfaceFormat::B8G8R8A8;
+      } else {
+        format = LOCAL_GL_RGBA;
+        type = LOCAL_GL_UNSIGNED_BYTE;
+        surfaceFormat = SurfaceFormat::R8G8B8A8;
+      }
+      internalFormat = LOCAL_GL_RGBA;
+      break;
+    case SurfaceFormat::R8G8B8X8:
+      if (gl->GetPreferredARGB32Format() == LOCAL_GL_BGRA) {
+        format = LOCAL_GL_BGRA;
+        type = LOCAL_GL_UNSIGNED_INT_8_8_8_8_REV;
+        surfaceFormat = SurfaceFormat::B8G8R8X8;
+      } else {
+        format = LOCAL_GL_RGBA;
+        type = LOCAL_GL_UNSIGNED_BYTE;
+        surfaceFormat = SurfaceFormat::R8G8B8X8;
+      }
+      internalFormat = LOCAL_GL_RGBA;
+      break;
+    case SurfaceFormat::R5G6B5_UINT16:
+      internalFormat = format = LOCAL_GL_RGB;
+      type = LOCAL_GL_UNSIGNED_SHORT_5_6_5;
+      surfaceFormat = SurfaceFormat::R5G6B5_UINT16;
+      break;
+    case SurfaceFormat::A8:
+      if (gl->IsGLES()) {
+        format = LOCAL_GL_LUMINANCE;
+        internalFormat = LOCAL_GL_LUMINANCE;
+      } else {
+        format = LOCAL_GL_RED;
+        internalFormat = LOCAL_GL_R8;
+      }
+      type = LOCAL_GL_UNSIGNED_BYTE;
+      surfaceFormat = SurfaceFormat::A8;
+      break;
+    case SurfaceFormat::A16:
+      if (gl->IsGLES()) {
+        format = LOCAL_GL_LUMINANCE;
+        internalFormat = LOCAL_GL_LUMINANCE16;
+      } else {
+        format = LOCAL_GL_RED;
+        internalFormat = LOCAL_GL_R16;
+      }
+      type = LOCAL_GL_UNSIGNED_SHORT;
+      surfaceFormat = SurfaceFormat::A8;
+      pixelSize = 2;
+      break;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unhandled image surface format!");
+  }
+
+  if (aOutUploadSize) {
+    *aOutUploadSize = 0;
+  }
+
+  if (surfaceFormat == gfx::SurfaceFormat::UNKNOWN) {
+    return gfx::SurfaceFormat::UNKNOWN;
+  }
+
+  if (aNeedInit || (!ShouldUploadSubTextures(gl) && aDstOffset == IntPoint())) {
+    if (!CheckUploadBounds(aSize, aDataSize, IntPoint())) {
+      return SurfaceFormat::UNKNOWN;
+    }
+    TexImage2DHelper(gl, aTextureTarget, 0, internalFormat, aSize.width,
+                     aSize.height, aStride, pixelSize, 0, format, type, aData);
+
+    if (aOutUploadSize && aNeedInit) {
+      uint32_t texelSize = GetBytesPerTexel(internalFormat, type);
+      size_t numTexels = size_t(aSize.width) * size_t(aSize.height);
+      *aOutUploadSize += texelSize * numTexels;
+    }
+  } else {
+    for (auto iter = aDstRegion.RectIter(); !iter.Done(); iter.Next()) {
+      IntRect rect = iter.Get();
+      if (!CheckUploadBounds(rect.Size(), aDataSize, rect.TopLeft())) {
+        return SurfaceFormat::UNKNOWN;
+      }
+
+      const unsigned char* rectData =
+          aData + DataOffset(rect.TopLeft(), aStride, aFormat);
+
+      rect += aDstOffset;
+      TexSubImage2DHelper(gl, aTextureTarget, 0, rect.X(), rect.Y(),
+                          rect.Width(), rect.Height(), aStride, pixelSize,
+                          format, type, rectData);
+    }
+  }
+
+  return surfaceFormat;
+}
+
+SurfaceFormat UploadSurfaceToTexture(GLContext* gl, DataSourceSurface* aSurface,
+                                     const nsIntRegion& aDstRegion,
+                                     GLuint aTexture, const gfx::IntSize& aSize,
+                                     size_t* aOutUploadSize, bool aNeedInit,
+                                     const gfx::IntPoint& aSrcOffset,
+                                     const gfx::IntPoint& aDstOffset,
+                                     GLenum aTextureUnit,
+                                     GLenum aTextureTarget) {
+  DataSourceSurface::ScopedMap map(aSurface, DataSourceSurface::READ);
+  int32_t stride = map.GetStride();
+  SurfaceFormat format = aSurface->GetFormat();
+  gfx::IntSize size = aSurface->GetSize();
+
+  if (aNeedInit && !CheckUploadBounds(aSize, size, aSrcOffset)) {
+    return SurfaceFormat::UNKNOWN;
+  }
+
+  unsigned char* data = map.GetData() + DataOffset(aSrcOffset, stride, format);
+  size.width -= aSrcOffset.x;
+  size.height -= aSrcOffset.y;
+
+  return UploadImageDataToTexture(gl, data, size, aDstOffset, stride, format,
+                                  aDstRegion, aTexture, aSize, aOutUploadSize,
+                                  aNeedInit, aTextureUnit, aTextureTarget);
+}
+
+bool CanUploadNonPowerOfTwo(GLContext* gl) {
+  if (!gl->WorkAroundDriverBugs()) return true;
+
+  return gl->Renderer() != GLRenderer::Adreno200 &&
+         gl->Renderer() != GLRenderer::Adreno205;
+}
+
+}  
+}  

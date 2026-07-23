@@ -1,0 +1,343 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifdef MOZ_WAYLAND
+
+#  include "WaylandVsyncSource.h"
+#  include "nsThreadUtils.h"
+#  include "nsISupportsImpl.h"
+#  include "MainThreadUtils.h"
+#  include "nsGtkUtils.h"
+#  include "mozilla/StaticPrefs_layout.h"
+#  include "mozilla/StaticPrefs_widget.h"
+#  include "mozilla/widget/WindowOcclusionState.h"
+#  include "nsWindow.h"
+
+#  include <gdk/gdkwayland.h>
+
+#  ifdef MOZ_LOGGING
+#    include "mozilla/Logging.h"
+#    include "nsTArray.h"
+#    include "Units.h"
+extern mozilla::LazyLogModule gWidgetVsync;
+#    undef LOG
+#    define LOG(str, ...)                             \
+      MOZ_LOG(gWidgetVsync, mozilla::LogLevel::Debug, \
+              ("[%p]: " str, GetWindowForLogging(), ##__VA_ARGS__))
+#    define LOGS(str, ...) \
+      MOZ_LOG(gWidgetVsync, mozilla::LogLevel::Debug, (str, ##__VA_ARGS__))
+#  else
+#    define LOG(...)
+#  endif /* MOZ_LOGGING */
+
+using namespace mozilla::widget;
+
+namespace mozilla {
+
+static float GetFPS(TimeDuration aVsyncRate) {
+  return 1000.0f / float(aVsyncRate.ToMilliseconds());
+}
+
+constinit static nsTArray<WaylandVsyncSource*> gWaylandVsyncSources;
+
+Maybe<TimeDuration> WaylandVsyncSource::GetFastestVsyncRate() {
+  Maybe<TimeDuration> retVal;
+  for (auto* source : gWaylandVsyncSources) {
+    auto rate = source->GetVsyncRateIfEnabled();
+    if (!rate) {
+      continue;
+    }
+    if (!retVal.isSome()) {
+      retVal.emplace(*rate);
+    } else if (*rate < *retVal) {
+      retVal.ref() = *rate;
+    }
+  }
+
+  return retVal;
+}
+
+void WaylandVsyncSource::Init() {
+  MutexAutoLock lock(mMutex);
+  WaylandSurfaceLock surfaceLock(mWaylandSurface);
+
+  mWaylandSurface->SetVSyncCallbackHandlerLocked(
+      surfaceLock,
+      [this, self = RefPtr{this}](wl_callback* aCallback, uint32_t aTime,
+                                  bool aEmulated) -> void {
+        {
+          MutexAutoLock lock(mMutex);
+          if (!mVsyncSourceEnabled || !mVsyncEnabled || !mWaylandSurface) {
+            return;
+          }
+
+          if (mLastTimeEmulated == aEmulated && mLastTime == aTime) {
+            return;
+          }
+          mLastTimeEmulated = aEmulated;
+          mLastTime = aTime;
+        }
+        LOG("WaylandVsyncSource frame callback, routed %d time %d emulated %d",
+            !aCallback, aTime, aEmulated);
+
+        VisibleWindowCallback(aTime);
+
+        SetHiddenWindowVSync();
+      },
+       true);
+
+  mWaylandSurface->SetVSyncEmulateCheckLocked(
+      surfaceLock, [surface = RefPtr{mWaylandSurface}]() -> bool {
+        return !surface->IsMapped() || !surface->HasBufferAttached();
+      });
+}
+
+WaylandVsyncSource::WaylandVsyncSource(nsWindow* aWindow)
+    : mMutex("WaylandVsyncSource"),
+      mWindow(aWindow),
+      mWaylandSurface(MOZ_WL_SURFACE(aWindow->GetMozContainer())),
+      mVsyncRate(TimeDuration::FromMilliseconds(1000.0 / 60.0)),
+      mLastVsyncTimeStamp(TimeStamp::Now()),
+      mHiddenWindowTimeout(1000 / StaticPrefs::layout_throttled_frame_rate()) {
+  MOZ_ASSERT(NS_IsMainThread());
+  gWaylandVsyncSources.AppendElement(this);
+  LOG("WaylandVsyncSource::WaylandVsyncSource()");
+}
+
+WaylandVsyncSource::~WaylandVsyncSource() {
+  LOG("WaylandVsyncSource::~WaylandVsyncSource()");
+  gWaylandVsyncSources.RemoveElement(this);
+}
+
+void WaylandVsyncSource::SetHiddenWindowVSync() {
+  MOZ_DIAGNOSTIC_ASSERT(NS_IsMainThread());
+  if (!mHiddenWindowTimerID) {
+    LOG("WaylandVsyncSource::SetHiddenWindowVSync()");
+    mHiddenWindowTimerID = g_timeout_add(
+        mHiddenWindowTimeout,
+        [](void* data) -> gint {
+          RefPtr vsync = static_cast<WaylandVsyncSource*>(data);
+          if (vsync->HiddenWindowCallback()) {
+            return G_SOURCE_CONTINUE;
+          }
+          vsync->mHiddenWindowTimerID = 0;
+          return G_SOURCE_REMOVE;
+        },
+        this);
+  }
+}
+
+void WaylandVsyncSource::SetVSyncEventsStateLocked(
+    const MutexAutoLock& aProofOfLock, bool aEnabled) {
+  MOZ_DIAGNOSTIC_ASSERT(NS_IsMainThread());
+  mMutex.AssertCurrentThreadOwns();
+  if (aEnabled) {
+    mLastVsyncTimeStamp = TimeStamp::Now();
+  } else {
+    MozClearHandleID(mHiddenWindowTimerID, g_source_remove);
+  }
+  WaylandSurfaceLock lock(mWaylandSurface);
+  mWaylandSurface->SetVSyncCallbackStateLocked(lock, aEnabled);
+}
+
+void WaylandVsyncSource::EnableVsync() {
+  MOZ_DIAGNOSTIC_ASSERT(NS_IsMainThread());
+  MutexAutoLock lock(mMutex);
+  LOG("WaylandVsyncSource::EnableVsync fps %f\n", GetFPS(mVsyncRate));
+  if (mVsyncEnabled || mIsShutdown) {
+    LOG("  early quit");
+    return;
+  }
+  mVsyncEnabled = true;
+  SetVSyncEventsStateLocked(lock, mVsyncEnabled && mVsyncSourceEnabled);
+}
+
+void WaylandVsyncSource::DisableVsync() {
+  MOZ_DIAGNOSTIC_ASSERT(NS_IsMainThread());
+  MutexAutoLock lock(mMutex);
+  LOG("WaylandVsyncSource::DisableVsync fps %f\n", GetFPS(mVsyncRate));
+  if (!mVsyncEnabled || mIsShutdown) {
+    LOG("  early quit");
+    return;
+  }
+  mVsyncEnabled = false;
+  SetVSyncEventsStateLocked(lock, mVsyncEnabled && mVsyncSourceEnabled);
+}
+
+void WaylandVsyncSource::EnableVSyncSource() {
+  MutexAutoLock lock(mMutex);
+  LOG("WaylandVsyncSource::EnableVSyncSource() WaylandSurface [%p] fps %f",
+      mWaylandSurface.get(), GetFPS(mVsyncRate));
+  mVsyncSourceEnabled = true;
+
+  MOZ_DIAGNOSTIC_ASSERT(NS_IsMainThread());
+  MOZ_DIAGNOSTIC_ASSERT(mWaylandSurface);
+  SetVSyncEventsStateLocked(lock, mVsyncEnabled && mVsyncSourceEnabled);
+}
+
+void WaylandVsyncSource::DisableVSyncSource() {
+  MutexAutoLock lock(mMutex);
+  LOG("WaylandVsyncSource::DisableVSyncSource() WaylandSurface [%p]",
+      mWaylandSurface.get());
+  mVsyncSourceEnabled = false;
+
+  MOZ_DIAGNOSTIC_ASSERT(NS_IsMainThread());
+  MOZ_DIAGNOSTIC_ASSERT(mWaylandSurface);
+  SetVSyncEventsStateLocked(lock, mVsyncEnabled && mVsyncSourceEnabled);
+}
+
+bool WaylandVsyncSource::HiddenWindowCallback() {
+  MOZ_DIAGNOSTIC_ASSERT(NS_IsMainThread());
+
+  RefPtr<nsWindow> window;
+  TimeStamp lastVSync;
+  TimeStamp outputTimestamp;
+  {
+    MutexAutoLock lock(mMutex);
+
+    if (!mVsyncSourceEnabled || !mVsyncEnabled) {
+      LOG("WaylandVsyncSource::HiddenWindowCallback(): quit, mVsyncEnabled %d "
+          "mWaylandSurface %p",
+          mVsyncEnabled && mVsyncSourceEnabled, mWaylandSurface.get());
+      return false;
+    }
+
+    const auto now = TimeStamp::Now();
+    const auto timeSinceLastVSync = now - mLastVsyncTimeStamp;
+    if (timeSinceLastVSync.ToMilliseconds() < mHiddenWindowTimeout) {
+      return true;
+    }
+
+    LOG("WaylandVsyncSource::HiddenWindowCallback() we're hidden, time since "
+        "last VSync %d ms",
+        (int)timeSinceLastVSync.ToMilliseconds());
+
+    CalculateVsyncRateLocked(lock, now);
+    mLastVsyncTimeStamp = lastVSync = now;
+
+    outputTimestamp = mLastVsyncTimeStamp + mVsyncRate;
+    window = mWindow;
+  }
+
+  window->NotifyOcclusionState(OcclusionState::OCCLUDED);
+
+  if (window->IsDestroyed()) {
+    return false;
+  }
+
+  NotifyVsync(lastVSync, outputTimestamp);
+  return StaticPrefs::widget_wayland_vsync_keep_firing_at_idle();
+}
+
+void WaylandVsyncSource::VisibleWindowCallback(uint32_t aTime) {
+#  ifdef MOZ_LOGGING
+  if (!aTime) {
+    LOG("WaylandVsyncSource::EmulatedWindowCallback()");
+  } else {
+    LOG("WaylandVsyncSource::VisibleWindowCallback() time %d", aTime);
+  }
+#  endif
+  MOZ_DIAGNOSTIC_ASSERT(NS_IsMainThread());
+
+  {
+    RefPtr window = mWindow;
+    window->NotifyOcclusionState(OcclusionState::VISIBLE);
+    if (window->IsDestroyed()) {
+      return;
+    }
+  }
+
+  MutexAutoLock lock(mMutex);
+  if (!mVsyncEnabled || !mVsyncSourceEnabled) {
+    LOG("  quit, mVsyncEnabled %d mWaylandSurface %p",
+        mVsyncEnabled && mVsyncSourceEnabled, mWaylandSurface.get());
+    return;
+  }
+
+  const auto now = TimeStamp::Now();
+  TimeStamp vsyncTimestamp;
+  if (aTime) {
+    const auto callbackTimeStamp = TimeStamp::FromSystemTime(
+        BaseTimeDurationPlatformUtils::TicksFromMilliseconds(aTime));
+    vsyncTimestamp = std::abs((now - callbackTimeStamp).ToMilliseconds()) < 50.0
+                         ? callbackTimeStamp
+                         : now;
+  } else {
+    vsyncTimestamp = now;
+  }
+
+  CalculateVsyncRateLocked(lock, vsyncTimestamp);
+  mLastVsyncTimeStamp = vsyncTimestamp;
+  const TimeStamp outputTimestamp = mLastVsyncTimeStamp + mVsyncRate;
+
+  {
+    MutexAutoUnlock unlock(mMutex);
+    NotifyVsync(vsyncTimestamp, outputTimestamp);
+  }
+}
+
+TimeDuration WaylandVsyncSource::GetVsyncRate() {
+  MutexAutoLock lock(mMutex);
+  return mVsyncRate;
+}
+
+Maybe<TimeDuration> WaylandVsyncSource::GetVsyncRateIfEnabled() {
+  MutexAutoLock lock(mMutex);
+  if (!mVsyncEnabled) {
+    return Nothing();
+  }
+  return Some(mVsyncRate);
+}
+
+void WaylandVsyncSource::CalculateVsyncRateLocked(
+    const MutexAutoLock& aProofOfLock, TimeStamp aVsyncTimestamp) {
+  mMutex.AssertCurrentThreadOwns();
+
+  double duration = (aVsyncTimestamp - mLastVsyncTimeStamp).ToMilliseconds();
+  double curVsyncRate = mVsyncRate.ToMilliseconds();
+
+  LOG("WaylandVsyncSource::CalculateVsyncRateLocked start fps %f\n",
+      GetFPS(mVsyncRate));
+
+  double correction;
+  if (duration > curVsyncRate) {
+    correction = fmin(curVsyncRate, (duration - curVsyncRate) / 10);
+    mVsyncRate += TimeDuration::FromMilliseconds(correction);
+  } else {
+    correction = fmin(curVsyncRate / 2, (curVsyncRate - duration) / 10);
+    mVsyncRate -= TimeDuration::FromMilliseconds(correction);
+  }
+
+  LOG("  new fps %f correction %f\n", GetFPS(mVsyncRate), correction);
+}
+
+bool WaylandVsyncSource::IsVsyncEnabled() {
+  MutexAutoLock lock(mMutex);
+  return mVsyncEnabled && mWaylandSurface;
+}
+
+void WaylandVsyncSource::Shutdown() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MutexAutoLock lock(mMutex);
+
+  LOG("WaylandVsyncSource::Shutdown fps %f\n", GetFPS(mVsyncRate));
+
+  {
+    WaylandSurfaceLock surfaceLock(mWaylandSurface);
+    mWaylandSurface->ClearVSyncCallbackHandlerLocked(surfaceLock);
+    mWaylandSurface->SetVSyncEmulateCheckLocked(surfaceLock, nullptr,
+                                                 true);
+  }
+
+  mWaylandSurface = nullptr;
+  mWindow = nullptr;
+  mIsShutdown = true;
+  mVsyncEnabled = false;
+  mVsyncSourceEnabled = false;
+  MozClearHandleID(mHiddenWindowTimerID, g_source_remove);
+}
+
+}  
+
+#endif  // MOZ_WAYLAND

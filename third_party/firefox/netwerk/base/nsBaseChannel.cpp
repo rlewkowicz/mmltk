@@ -1,0 +1,913 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsBaseChannel.h"
+#include "nsContentUtils.h"
+#include "nsURLHelper.h"
+#include "nsNetCID.h"
+#include "nsUnknownDecoder.h"
+#include "nsIScriptSecurityManager.h"
+#include "nsMimeTypes.h"
+#include "nsICancelable.h"
+#include "nsIChannelEventSink.h"
+#include "nsIStreamConverterService.h"
+#include "nsAsyncRedirectVerifyHelper.h"
+#include "nsProxyRelease.h"
+#include "nsXULAppAPI.h"
+#include "nsContentSecurityManager.h"
+#include "LoadInfo.h"
+#include "nsServiceManagerUtils.h"
+#include "nsRedirectHistoryEntry.h"
+#include "mozilla/AntiTrackingUtils.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/dom/ParentProcessChannelHandle.h"
+
+using namespace mozilla;
+
+class ScopedRequestSuspender {
+ public:
+  explicit ScopedRequestSuspender(nsIRequest* request) : mRequest(request) {
+    if (mRequest && NS_FAILED(mRequest->Suspend())) {
+      NS_WARNING("Couldn't suspend pump");
+      mRequest = nullptr;
+    }
+  }
+  ~ScopedRequestSuspender() {
+    if (mRequest) mRequest->Resume();
+  }
+
+ private:
+  nsCOMPtr<nsIRequest> mRequest;
+};
+
+#define SUSPEND_PUMP_FOR_SCOPE() \
+  ScopedRequestSuspender pump_suspender__(mRequest)
+
+
+nsBaseChannel::nsBaseChannel() : NeckoTargetHolder(nullptr) {
+  mContentType.AssignLiteral(UNKNOWN_CONTENT_TYPE);
+}
+
+nsBaseChannel::~nsBaseChannel() {
+  NS_ReleaseOnMainThread("nsBaseChannel::mLoadInfo", mLoadInfo.forget());
+}
+
+nsresult nsBaseChannel::Redirect(nsIChannel* newChannel, uint32_t redirectFlags,
+                                 bool openNewChannel) {
+  SUSPEND_PUMP_FOR_SCOPE();
+
+
+  newChannel->SetLoadGroup(mLoadGroup);
+  newChannel->SetNotificationCallbacks(mCallbacks);
+  newChannel->SetLoadFlags(mLoadFlags | LOAD_REPLACE);
+
+  nsSecurityFlags secFlags =
+      mLoadInfo->GetSecurityFlags() & ~nsILoadInfo::SEC_FORCE_INHERIT_PRINCIPAL;
+  nsCOMPtr<nsILoadInfo> newLoadInfo =
+      static_cast<net::LoadInfo*>(mLoadInfo.get())
+          ->CloneWithNewSecFlags(secFlags);
+
+  bool isInternalRedirect =
+      (redirectFlags & (nsIChannelEventSink::REDIRECT_INTERNAL |
+                        nsIChannelEventSink::REDIRECT_STS_UPGRADE));
+
+  newLoadInfo->AppendRedirectHistoryEntry(this, isInternalRedirect);
+
+  nsCOMPtr<nsIURI> resultPrincipalURI;
+
+  nsCOMPtr<nsILoadInfo> existingLoadInfo = newChannel->LoadInfo();
+  if (existingLoadInfo) {
+    existingLoadInfo->GetResultPrincipalURI(getter_AddRefs(resultPrincipalURI));
+  }
+  if (!resultPrincipalURI) {
+    newChannel->GetOriginalURI(getter_AddRefs(resultPrincipalURI));
+  }
+
+  newLoadInfo->SetResultPrincipalURI(resultPrincipalURI);
+
+  newChannel->SetLoadInfo(newLoadInfo);
+
+  if (mPrivateBrowsingOverriden) {
+    nsCOMPtr<nsIPrivateBrowsingChannel> newPBChannel =
+        do_QueryInterface(newChannel);
+    if (newPBChannel) {
+      newPBChannel->SetPrivate(mPrivateBrowsing);
+    }
+  }
+
+  if (nsCOMPtr<nsIWritablePropertyBag> bag = ::do_QueryInterface(newChannel)) {
+    nsHashPropertyBag::CopyFrom(bag, static_cast<nsIPropertyBag2*>(this));
+  }
+
+
+  auto redirectCallbackHelper = MakeRefPtr<net::nsAsyncRedirectVerifyHelper>();
+
+  bool checkRedirectSynchronously = !openNewChannel;
+  nsCOMPtr<nsIEventTarget> target = GetNeckoTarget();
+
+  mRedirectChannel = newChannel;
+  mRedirectFlags = redirectFlags;
+  mOpenRedirectChannel = openNewChannel;
+  nsresult rv = redirectCallbackHelper->Init(
+      this, newChannel, redirectFlags, target, checkRedirectSynchronously);
+  if (NS_FAILED(rv)) return rv;
+
+  if (checkRedirectSynchronously && NS_FAILED(mStatus)) return mStatus;
+
+  return NS_OK;
+}
+
+nsresult nsBaseChannel::ContinueRedirect() {
+  mRedirectChannel->SetOriginalURI(OriginalURI());
+
+
+  if (mOpenRedirectChannel) {
+    nsresult rv = NS_OK;
+    rv = mRedirectChannel->AsyncOpen(mListener);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  mRedirectChannel = nullptr;
+
+  Cancel(NS_BINDING_REDIRECTED);
+  ChannelDone();
+
+  return NS_OK;
+}
+
+bool nsBaseChannel::HasContentTypeHint() const {
+  NS_ASSERTION(!Pending(), "HasContentTypeHint called too late");
+  return !mContentType.EqualsLiteral(UNKNOWN_CONTENT_TYPE);
+}
+
+nsresult nsBaseChannel::BeginPumpingData() {
+  nsresult rv;
+
+  rv = BeginAsyncRead(this, getter_AddRefs(mRequest),
+                      getter_AddRefs(mCancelableAsyncRequest));
+  if (NS_SUCCEEDED(rv)) {
+    MOZ_ASSERT(mRequest || mCancelableAsyncRequest,
+               "should have got a request or cancelable");
+    mPumpingData = true;
+    return NS_OK;
+  }
+  if (rv != NS_ERROR_NOT_IMPLEMENTED) {
+    return rv;
+  }
+
+  nsCOMPtr<nsIInputStream> stream;
+  nsCOMPtr<nsIChannel> channel;
+  rv = OpenContentStream(true, getter_AddRefs(stream), getter_AddRefs(channel));
+  if (NS_FAILED(rv)) return rv;
+
+  NS_ASSERTION(!stream || !channel, "Got both a channel and a stream?");
+
+  if (channel) {
+    nsCOMPtr<nsIRunnable> runnable = new RedirectRunnable(this, channel);
+    rv = Dispatch(runnable.forget());
+    if (NS_SUCCEEDED(rv)) mWaitingOnAsyncRedirect = true;
+    return rv;
+  }
+
+
+  nsCOMPtr<nsISerialEventTarget> target = GetNeckoTarget();
+  rv = nsInputStreamPump::Create(getter_AddRefs(mPump), stream, 0, 0, true,
+                                 target);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  mPumpingData = true;
+  mRequest = mPump;
+  rv = mPump->AsyncRead(this);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  RefPtr<BlockingPromise> promise;
+  rv = ListenerBlockingPromise(getter_AddRefs(promise));
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (promise) {
+    mPump->Suspend();
+
+    RefPtr<nsBaseChannel> self(this);
+
+    promise->Then(
+        target, __func__,
+        [self, this](nsresult rv) {
+          MOZ_ASSERT(mPump);
+          MOZ_ASSERT(NS_SUCCEEDED(rv));
+          mPump->Resume();
+        },
+        [self, this](nsresult rv) {
+          MOZ_ASSERT(mPump);
+          MOZ_ASSERT(NS_FAILED(rv));
+          Cancel(rv);
+          mPump->Resume();
+        });
+  }
+
+  return NS_OK;
+}
+
+void nsBaseChannel::HandleAsyncRedirect(nsIChannel* newChannel) {
+  NS_ASSERTION(!mPumpingData, "Shouldn't have gotten here");
+
+  nsresult rv = mStatus;
+  if (NS_SUCCEEDED(mStatus)) {
+    rv = Redirect(newChannel, nsIChannelEventSink::REDIRECT_TEMPORARY, true);
+    if (NS_SUCCEEDED(rv)) {
+      return;
+    }
+  }
+
+  ContinueHandleAsyncRedirect(rv);
+}
+
+void nsBaseChannel::ContinueHandleAsyncRedirect(nsresult result) {
+  mWaitingOnAsyncRedirect = false;
+
+  if (NS_FAILED(result)) Cancel(result);
+
+  if (NS_FAILED(result) && mListener) {
+    nsCOMPtr<nsIStreamListener> listener = mListener;
+    listener->OnStartRequest(this);
+    listener->OnStopRequest(this, mStatus);
+    ChannelDone();
+  }
+
+  if (mLoadGroup) mLoadGroup->RemoveRequest(this, nullptr, mStatus);
+
+  mCallbacks = nullptr;
+  CallbacksChanged();
+}
+
+
+NS_IMPL_ADDREF(nsBaseChannel)
+NS_IMPL_RELEASE(nsBaseChannel)
+
+NS_INTERFACE_MAP_BEGIN(nsBaseChannel)
+  NS_INTERFACE_MAP_ENTRY(nsIRequest)
+  NS_INTERFACE_MAP_ENTRY(nsIChannel)
+  NS_INTERFACE_MAP_ENTRY(nsIBaseChannel)
+  NS_INTERFACE_MAP_ENTRY(nsIThreadRetargetableRequest)
+  NS_INTERFACE_MAP_ENTRY(nsIInterfaceRequestor)
+  NS_INTERFACE_MAP_ENTRY(nsITransportEventSink)
+  NS_INTERFACE_MAP_ENTRY(nsIRequestObserver)
+  NS_INTERFACE_MAP_ENTRY(nsIStreamListener)
+  NS_INTERFACE_MAP_ENTRY(nsIThreadRetargetableStreamListener)
+  NS_INTERFACE_MAP_ENTRY(nsIAsyncVerifyRedirectCallback)
+  NS_INTERFACE_MAP_ENTRY(nsIPrivateBrowsingChannel)
+NS_INTERFACE_MAP_END_INHERITING(nsHashPropertyBag)
+
+
+NS_IMETHODIMP
+nsBaseChannel::GetName(nsACString& result) {
+  if (!mURI) {
+    result.Truncate();
+    return NS_OK;
+  }
+  return mURI->GetSpec(result);
+}
+
+NS_IMETHODIMP
+nsBaseChannel::IsPending(bool* result) {
+  *result = Pending();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetStatus(nsresult* status) {
+  if (mRequest && NS_SUCCEEDED(mStatus)) {
+    mRequest->GetStatus(status);
+  } else {
+    *status = mStatus;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsBaseChannel::SetCanceledReason(const nsACString& aReason) {
+  return SetCanceledReasonImpl(aReason);
+}
+
+NS_IMETHODIMP nsBaseChannel::GetCanceledReason(nsACString& aReason) {
+  return GetCanceledReasonImpl(aReason);
+}
+
+NS_IMETHODIMP nsBaseChannel::CancelWithReason(nsresult aStatus,
+                                              const nsACString& aReason) {
+  return CancelWithReasonImpl(aStatus, aReason);
+}
+
+NS_IMETHODIMP
+nsBaseChannel::Cancel(nsresult status) {
+  if (mCanceled) {
+    return NS_OK;
+  }
+
+  mCanceled = true;
+  mStatus = status;
+
+  if (mCancelableAsyncRequest) {
+    mCancelableAsyncRequest->Cancel(status);
+  }
+
+  if (mRequest) {
+    mRequest->Cancel(status);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::Suspend() {
+  NS_ENSURE_TRUE(mPumpingData, NS_ERROR_NOT_INITIALIZED);
+  NS_ENSURE_TRUE(mRequest, NS_ERROR_NOT_IMPLEMENTED);
+  return mRequest->Suspend();
+}
+
+NS_IMETHODIMP
+nsBaseChannel::Resume() {
+  NS_ENSURE_TRUE(mPumpingData, NS_ERROR_NOT_INITIALIZED);
+  NS_ENSURE_TRUE(mRequest, NS_ERROR_NOT_IMPLEMENTED);
+  return mRequest->Resume();
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetLoadFlags(nsLoadFlags* aLoadFlags) {
+  *aLoadFlags = mLoadFlags;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::SetLoadFlags(nsLoadFlags aLoadFlags) {
+  mLoadFlags = aLoadFlags;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetTRRMode(nsIRequest::TRRMode* aTRRMode) {
+  return GetTRRModeImpl(aTRRMode);
+}
+
+NS_IMETHODIMP
+nsBaseChannel::SetTRRMode(nsIRequest::TRRMode aTRRMode) {
+  return SetTRRModeImpl(aTRRMode);
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetLoadGroup(nsILoadGroup** aLoadGroup) {
+  nsCOMPtr<nsILoadGroup> loadGroup(mLoadGroup);
+  loadGroup.forget(aLoadGroup);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::SetLoadGroup(nsILoadGroup* aLoadGroup) {
+  if (!CanSetLoadGroup(aLoadGroup)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mLoadGroup = aLoadGroup;
+  CallbacksChanged();
+  UpdatePrivateBrowsing();
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+nsBaseChannel::GetOriginalURI(nsIURI** aURI) {
+  RefPtr<nsIURI> uri = OriginalURI();
+  uri.forget(aURI);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::SetOriginalURI(nsIURI* aURI) {
+  NS_ENSURE_ARG_POINTER(aURI);
+  mOriginalURI = aURI;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetURI(nsIURI** aURI) {
+  nsCOMPtr<nsIURI> uri(mURI);
+  uri.forget(aURI);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetOwner(nsISupports** aOwner) {
+  nsCOMPtr<nsISupports> owner(mOwner);
+  owner.forget(aOwner);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::SetOwner(nsISupports* aOwner) {
+  mOwner = aOwner;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::SetLoadInfo(nsILoadInfo* aLoadInfo) {
+  MOZ_RELEASE_ASSERT(aLoadInfo, "loadinfo can't be null");
+  mLoadInfo = aLoadInfo;
+
+  SetupNeckoTarget();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetLoadInfo(nsILoadInfo** aLoadInfo) {
+  nsCOMPtr<nsILoadInfo> loadInfo(mLoadInfo);
+  loadInfo.forget(aLoadInfo);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetIsDocument(bool* aIsDocument) {
+  return NS_GetIsDocumentChannel(this, aIsDocument);
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetNotificationCallbacks(nsIInterfaceRequestor** aCallbacks) {
+  nsCOMPtr<nsIInterfaceRequestor> callbacks(mCallbacks);
+  callbacks.forget(aCallbacks);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::SetNotificationCallbacks(nsIInterfaceRequestor* aCallbacks) {
+  if (!CanSetCallbacks(aCallbacks)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mCallbacks = aCallbacks;
+  CallbacksChanged();
+  UpdatePrivateBrowsing();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetSecurityInfo(nsITransportSecurityInfo** aSecurityInfo) {
+  *aSecurityInfo = do_AddRef(mSecurityInfo).take();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetContentType(nsACString& aContentType) {
+  aContentType = mContentType;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::SetContentType(const nsACString& aContentType) {
+  bool dummy;
+  net_ParseContentType(aContentType, mContentType, mContentCharset, &dummy);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetContentCharset(nsACString& aContentCharset) {
+  aContentCharset = mContentCharset;
+  if (mContentCharset.IsEmpty() && (mOriginalURI->SchemeIs("chrome") ||
+                                    mOriginalURI->SchemeIs("resource"))) {
+    aContentCharset.AssignLiteral("UTF-8");
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::SetContentCharset(const nsACString& aContentCharset) {
+  mContentCharset = aContentCharset;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetContentDisposition(uint32_t* aContentDisposition) {
+  if (mContentDispositionHint == UINT32_MAX) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  *aContentDisposition = mContentDispositionHint;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::SetContentDisposition(uint32_t aContentDisposition) {
+  mContentDispositionHint = aContentDisposition;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetContentDispositionFilename(
+    nsAString& aContentDispositionFilename) {
+  if (!mContentDispositionFilename) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  aContentDispositionFilename = *mContentDispositionFilename;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::SetContentDispositionFilename(
+    const nsAString& aContentDispositionFilename) {
+  mContentDispositionFilename =
+      MakeUnique<nsString>(aContentDispositionFilename);
+
+  mContentDispositionFilename->ReplaceChar(char16_t(0), '_');
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetContentDispositionHeader(
+    nsACString& aContentDispositionHeader) {
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetContentLength(int64_t* aContentLength) {
+  *aContentLength = mContentLength;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::SetContentLength(int64_t aContentLength) {
+  mContentLength = aContentLength;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::Open(nsIInputStream** aStream) {
+  nsCOMPtr<nsIStreamListener> listener;
+  nsresult rv =
+      nsContentSecurityManager::doContentSecurityCheck(this, listener);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  NS_ENSURE_TRUE(mURI, NS_ERROR_NOT_INITIALIZED);
+  NS_ENSURE_TRUE(!mPumpingData, NS_ERROR_IN_PROGRESS);
+  NS_ENSURE_TRUE(!mWasOpened, NS_ERROR_IN_PROGRESS);
+
+  nsCOMPtr<nsIChannel> chan;
+  rv = OpenContentStream(false, aStream, getter_AddRefs(chan));
+  NS_ASSERTION(!chan || !*aStream, "Got both a channel and a stream?");
+  if (NS_SUCCEEDED(rv) && chan) {
+    rv = Redirect(chan, nsIChannelEventSink::REDIRECT_INTERNAL, false);
+    if (NS_FAILED(rv)) return rv;
+    rv = chan->Open(aStream);
+  } else if (rv == NS_ERROR_NOT_IMPLEMENTED) {
+    return NS_ImplementChannelOpen(this, aStream);
+  }
+
+  if (NS_SUCCEEDED(rv)) {
+    mWasOpened = true;
+  }
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::AsyncOpen(nsIStreamListener* aListener) {
+  nsCOMPtr<nsIStreamListener> listener = aListener;
+
+  nsresult rv =
+      nsContentSecurityManager::doContentSecurityCheck(this, listener);
+  if (NS_FAILED(rv)) {
+    mCallbacks = nullptr;
+    return rv;
+  }
+
+  MOZ_ASSERT(
+      mLoadInfo->GetSecurityMode() == 0 ||
+          mLoadInfo->GetInitialSecurityCheckDone() ||
+          (mLoadInfo->GetSecurityMode() ==
+               nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL &&
+           mLoadInfo->GetLoadingPrincipal() &&
+           mLoadInfo->GetLoadingPrincipal()->IsSystemPrincipal()),
+      "security flags in loadInfo but doContentSecurityCheck() not called");
+
+  NS_ENSURE_TRUE(mURI, NS_ERROR_NOT_INITIALIZED);
+  NS_ENSURE_TRUE(!mPumpingData, NS_ERROR_IN_PROGRESS);
+  NS_ENSURE_TRUE(!mWasOpened, NS_ERROR_ALREADY_OPENED);
+  NS_ENSURE_ARG(listener);
+
+  SetupNeckoTarget();
+
+  nsAutoCString scheme;
+  mURI->GetScheme(scheme);
+  if (!scheme.EqualsLiteral("file")) {
+    NS_CompareLoadInfoAndLoadContext(this);
+  }
+
+  rv = NS_CheckPortSafety(mURI);
+  if (NS_FAILED(rv)) {
+    mCallbacks = nullptr;
+    return rv;
+  }
+
+  AntiTrackingUtils::UpdateAntiTrackingInfoForChannel(this);
+
+  mListener = std::move(listener);
+
+  rv = BeginPumpingData();
+  if (NS_FAILED(rv)) {
+    mPump = nullptr;
+    mRequest = nullptr;
+    mPumpingData = false;
+    ChannelDone();
+    mCallbacks = nullptr;
+    return rv;
+  }
+
+
+  mWasOpened = true;
+
+  SUSPEND_PUMP_FOR_SCOPE();
+
+  if (mLoadGroup) mLoadGroup->AddRequest(this, nullptr);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetParentProcessChannelHandle(
+    mozilla::dom::ParentProcessChannelHandle** aValue) {
+  *aValue = do_AddRef(mParentProcessChannelHandle).take();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::SetParentProcessChannelHandle(
+    mozilla::dom::ParentProcessChannelHandle* aValue) {
+  if (XRE_IsParentProcess()) {
+    MOZ_ASSERT_UNREACHABLE(
+        "SetParentProcessChannelHandle in the parent process would leak");
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  mParentProcessChannelHandle = aValue;
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+nsBaseChannel::OnTransportStatus(nsITransport* transport, nsresult status,
+                                 int64_t progress, int64_t progressMax) {
+
+  if (!mPumpingData || NS_FAILED(mStatus)) {
+    return NS_OK;
+  }
+
+  SUSPEND_PUMP_FOR_SCOPE();
+
+  if (!mProgressSink) {
+    if (mQueriedProgressSink) {
+      return NS_OK;
+    }
+    GetCallback(mProgressSink);
+    mQueriedProgressSink = true;
+    if (!mProgressSink) {
+      return NS_OK;
+    }
+  }
+
+  if (!HasLoadFlag(LOAD_BACKGROUND)) {
+    nsAutoString statusArg;
+    if (GetStatusArg(status, statusArg)) {
+      mProgressSink->OnStatus(this, status, statusArg.get());
+    }
+  }
+
+  if (progress) {
+    mProgressSink->OnProgress(this, progress, progressMax);
+  }
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+nsBaseChannel::GetInterface(const nsIID& iid, void** result) {
+  NS_QueryNotificationCallbacks(mCallbacks, mLoadGroup, iid, result);
+  return *result ? NS_OK : NS_ERROR_NO_INTERFACE;
+}
+
+
+static void CallTypeSniffers(void* aClosure, const uint8_t* aData,
+                             uint32_t aCount) {
+  nsIChannel* chan = static_cast<nsIChannel*>(aClosure);
+
+  nsAutoCString newType;
+  NS_SniffContent(NS_CONTENT_SNIFFER_CATEGORY, chan, aData, aCount, newType);
+  if (!newType.IsEmpty()) {
+    chan->SetContentType(newType);
+  }
+}
+
+static void CallUnknownTypeSniffer(void* aClosure, const uint8_t* aData,
+                                   uint32_t aCount) {
+  nsIChannel* chan = static_cast<nsIChannel*>(aClosure);
+
+  RefPtr<nsUnknownDecoder> sniffer = new nsUnknownDecoder();
+
+  nsAutoCString detected;
+  nsresult rv = sniffer->GetMIMETypeFromContent(chan, aData, aCount, detected);
+  if (NS_SUCCEEDED(rv)) chan->SetContentType(detected);
+}
+
+NS_IMETHODIMP
+nsBaseChannel::OnStartRequest(nsIRequest* request) {
+  MOZ_ASSERT_IF(mRequest, request == mRequest);
+  MOZ_ASSERT_IF(mCancelableAsyncRequest, !mRequest);
+
+  if (mPump) {
+    if (NS_SUCCEEDED(mStatus) &&
+        mContentType.EqualsLiteral(UNKNOWN_CONTENT_TYPE)) {
+      mPump->PeekStream(CallUnknownTypeSniffer, static_cast<nsIChannel*>(this));
+    }
+
+    if (mLoadFlags & LOAD_CALL_CONTENT_SNIFFERS) {
+      mPump->PeekStream(CallTypeSniffers, static_cast<nsIChannel*>(this));
+    }
+  }
+
+  SUSPEND_PUMP_FOR_SCOPE();
+
+  if (nsCOMPtr<nsIStreamListener> listener = mListener) {
+    return listener->OnStartRequest(this);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::OnStopRequest(nsIRequest* request, nsresult status) {
+  if (NS_SUCCEEDED(mStatus)) mStatus = status;
+
+  mPump = nullptr;
+  mRequest = nullptr;
+  mCancelableAsyncRequest = nullptr;
+  mPumpingData = false;
+
+  if (nsCOMPtr<nsIStreamListener> listener = mListener) {
+    listener->OnStopRequest(this, mStatus);
+  }
+  ChannelDone();
+
+
+  if (mLoadGroup) mLoadGroup->RemoveRequest(this, nullptr, mStatus);
+
+  mCallbacks = nullptr;
+  CallbacksChanged();
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+nsBaseChannel::OnDataAvailable(nsIRequest* request, nsIInputStream* stream,
+                               uint64_t offset, uint32_t count) {
+  SUSPEND_PUMP_FOR_SCOPE();
+
+  nsCOMPtr<nsIStreamListener> listener = mListener;
+  nsresult rv = listener->OnDataAvailable(this, stream, offset, count);
+  if (mSynthProgressEvents && NS_SUCCEEDED(rv)) {
+    int64_t prog = offset + count;
+    if (NS_IsMainThread()) {
+      OnTransportStatus(nullptr, NS_NET_STATUS_READING, prog, mContentLength);
+    } else {
+      class OnTransportStatusAsyncEvent : public Runnable {
+        RefPtr<nsBaseChannel> mChannel;
+        int64_t mProgress;
+        int64_t mContentLength;
+
+       public:
+        OnTransportStatusAsyncEvent(nsBaseChannel* aChannel, int64_t aProgress,
+                                    int64_t aContentLength)
+            : Runnable("OnTransportStatusAsyncEvent"),
+              mChannel(aChannel),
+              mProgress(aProgress),
+              mContentLength(aContentLength) {}
+
+        NS_IMETHOD Run() override {
+          return mChannel->OnTransportStatus(nullptr, NS_NET_STATUS_READING,
+                                             mProgress, mContentLength);
+        }
+      };
+
+      nsCOMPtr<nsIRunnable> runnable =
+          new OnTransportStatusAsyncEvent(this, prog, mContentLength);
+      Dispatch(runnable.forget());
+    }
+  }
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::OnRedirectVerifyCallback(nsresult result) {
+  if (NS_SUCCEEDED(result)) result = ContinueRedirect();
+
+  if (NS_FAILED(result) && !mWaitingOnAsyncRedirect) {
+    if (NS_SUCCEEDED(mStatus)) mStatus = result;
+    return NS_OK;
+  }
+
+  if (mWaitingOnAsyncRedirect) ContinueHandleAsyncRedirect(result);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseChannel::RetargetDeliveryTo(nsISerialEventTarget* aEventTarget) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!mRequest) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  nsCOMPtr<nsIThreadRetargetableRequest> req;
+  if (mAllowThreadRetargeting) {
+    req = do_QueryInterface(mRequest);
+  }
+
+  NS_ENSURE_TRUE(req, NS_ERROR_NOT_IMPLEMENTED);
+
+  return req->RetargetDeliveryTo(aEventTarget);
+}
+
+NS_IMETHODIMP
+nsBaseChannel::GetDeliveryTarget(nsISerialEventTarget** aEventTarget) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  NS_ENSURE_TRUE(mRequest, NS_ERROR_NOT_INITIALIZED);
+
+  nsCOMPtr<nsIThreadRetargetableRequest> req;
+  req = do_QueryInterface(mRequest);
+
+  NS_ENSURE_TRUE(req, NS_ERROR_NOT_IMPLEMENTED);
+  return req->GetDeliveryTarget(aEventTarget);
+}
+
+NS_IMETHODIMP
+nsBaseChannel::CheckListenerChain() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!mAllowThreadRetargeting) {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  nsCOMPtr<nsIThreadRetargetableStreamListener> listener =
+      do_QueryInterface(mListener);
+  if (!listener) {
+    return NS_ERROR_NO_INTERFACE;
+  }
+
+  return listener->CheckListenerChain();
+}
+
+NS_IMETHODIMP
+nsBaseChannel::OnDataFinished(nsresult aStatus) {
+  if (!mListener) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (!mAllowThreadRetargeting) {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  nsCOMPtr<nsIThreadRetargetableStreamListener> listener =
+      do_QueryInterface(mListener);
+  if (listener) {
+    return listener->OnDataFinished(aStatus);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsBaseChannel::GetCanceled(bool* aCanceled) {
+  *aCanceled = mCanceled;
+  return NS_OK;
+}
+
+void nsBaseChannel::SetupNeckoTarget() {
+  mNeckoTarget = GetMainThreadSerialEventTarget();
+}
+
+NS_IMETHODIMP nsBaseChannel::GetFullMimeType(RefPtr<TMimeType<char>>* aOut) {
+  if (aOut) {
+    *aOut = mFullMimeType;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsBaseChannel::SetFullMimeType(RefPtr<TMimeType<char>> aType) {
+  mFullMimeType = aType;
+  return NS_OK;
+}

@@ -1,0 +1,157 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_audiochannelservice_h_
+#define mozilla_dom_audiochannelservice_h_
+
+#include <functional>
+
+#include "AudioChannelAgent.h"
+#include "mozilla/DefineEnum.h"
+#include "mozilla/Logging.h"
+#include "mozilla/UniquePtr.h"
+#include "nsAttrValue.h"
+#include "nsIObserver.h"
+#include "nsTArray.h"
+#include "nsTObserverArray.h"
+
+class nsPIDOMWindowOuter;
+struct PRLogModuleInfo;
+
+namespace mozilla::dom {
+
+class AudioPlaybackConfig {
+ public:
+  AudioPlaybackConfig()
+      : mVolume(1.0),
+        mMuted(false),
+        mSuspend(nsISuspendedTypes::NONE_SUSPENDED),
+        mNumberOfAgents(0) {}
+
+  AudioPlaybackConfig(float aVolume, bool aMuted, uint32_t aSuspended)
+      : mVolume(aVolume),
+        mMuted(aMuted),
+        mSuspend(aSuspended),
+        mNumberOfAgents(0) {}
+
+  float mVolume;
+  bool mMuted;
+  uint32_t mSuspend;
+  bool mCapturedAudio = false;
+  uint32_t mNumberOfAgents;
+};
+
+class AudioChannelService final : public nsIObserver {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  MOZ_DEFINE_ENUM_WITH_BASE_AND_TOSTRING_AT_CLASS_SCOPE(
+      AudibleState, uint8_t, (eNotAudible, eMaybeAudible, eAudible));
+
+  enum AudioCaptureState : bool { eCapturing = true, eNotCapturing = false };
+
+  MOZ_DEFINE_ENUM_WITH_BASE_AND_TOSTRING_AT_CLASS_SCOPE(
+      AudibleChangedReasons, uint32_t,
+      (eVolumeChanged, eDataAudibleChanged, ePauseStateChanged));
+
+  static already_AddRefed<AudioChannelService> GetOrCreate();
+
+  static already_AddRefed<AudioChannelService> Get();
+
+  static LogModule* GetAudioChannelLog();
+
+  static bool IsEnableAudioCompeting();
+
+  void RegisterAudioChannelAgent(AudioChannelAgent* aAgent,
+                                 AudibleState aAudible);
+
+  void UnregisterAudioChannelAgent(AudioChannelAgent* aAgent);
+
+  AudioPlaybackConfig GetMediaConfig(nsPIDOMWindowOuter* aWindow) const;
+
+  void AudioAudibleChanged(AudioChannelAgent* aAgent, AudibleState aAudible,
+                           AudibleChangedReasons aReason);
+
+  bool IsWindowActive(nsPIDOMWindowOuter* aWindow);
+
+  void RefreshAgentsVolume(nsPIDOMWindowOuter* aWindow, float aVolume,
+                           bool aMuted);
+
+  void SetWindowAudioCaptured(nsPIDOMWindowOuter* aWindow,
+                              uint64_t aInnerWindowID, bool aCapture);
+
+  void NotifyResumingDelayedMedia(nsPIDOMWindowOuter* aWindow);
+
+ private:
+  AudioChannelService();
+  ~AudioChannelService();
+
+  void RefreshAgents(nsPIDOMWindowOuter* aWindow,
+                     const std::function<void(AudioChannelAgent*)>& aFunc);
+
+  void RefreshAgentsSuspend(nsPIDOMWindowOuter* aWindow,
+                            nsSuspendedTypes aSuspend);
+
+  static void CreateServiceIfNeeded();
+
+  static void Shutdown();
+
+  void RefreshAgentsAudioFocusChanged(AudioChannelAgent* aAgent);
+
+  class AudioChannelWindow final {
+   public:
+    explicit AudioChannelWindow(uint64_t aWindowID)
+        : mWindowID(aWindowID),
+          mIsAudioCaptured(false),
+          mShouldSendActiveMediaBlockStopEvent(false) {}
+
+    void AudioAudibleChanged(AudioChannelAgent* aAgent, AudibleState aAudible,
+                             AudibleChangedReasons aReason);
+
+    void AppendAgent(AudioChannelAgent* aAgent, AudibleState aAudible);
+    void RemoveAgent(AudioChannelAgent* aAgent);
+
+    void NotifyMediaBlockStop(nsPIDOMWindowOuter* aWindow);
+
+    uint64_t mWindowID;
+    bool mIsAudioCaptured;
+    AudioPlaybackConfig mConfig;
+
+    nsTObserverArray<AudioChannelAgent*> mAgents;
+    nsTObserverArray<AudioChannelAgent*> mAudibleAgents;
+
+    bool mShouldSendActiveMediaBlockStopEvent;
+
+   private:
+    void AppendAudibleAgentIfNotContained(AudioChannelAgent* aAgent,
+                                          AudibleChangedReasons aReason);
+    void RemoveAudibleAgentIfContained(AudioChannelAgent* aAgent,
+                                       AudibleChangedReasons aReason);
+
+    void AppendAgentAndIncreaseAgentsNum(AudioChannelAgent* aAgent);
+    void RemoveAgentAndReduceAgentsNum(AudioChannelAgent* aAgent);
+
+    bool IsFirstAudibleAgent() const;
+    bool IsLastAudibleAgent() const;
+
+    void NotifyAudioAudibleChanged(nsPIDOMWindowOuter* aWindow,
+                                   AudibleState aAudible,
+                                   AudibleChangedReasons aReason);
+
+    void MaybeNotifyMediaBlockStart(AudioChannelAgent* aAgent);
+  };
+
+  AudioChannelWindow* GetOrCreateWindowData(nsPIDOMWindowOuter* aWindow);
+
+  AudioChannelWindow* GetWindowData(uint64_t aWindowID) const;
+
+  nsTObserverArray<UniquePtr<AudioChannelWindow>> mWindows;
+};
+
+const char* SuspendTypeToStr(const nsSuspendedTypes& aSuspend);
+
+}  
+
+#endif

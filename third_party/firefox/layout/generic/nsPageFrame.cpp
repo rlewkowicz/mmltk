@@ -1,0 +1,842 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsPageFrame.h"
+
+#include "PrintedSheetFrame.h"
+#include "gfxContext.h"
+#include "mozilla/AppUnits.h"
+#include "mozilla/Logging.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ReflowInput.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/intl/Segmenter.h"
+#include "nsBidiUtils.h"
+#include "nsDeviceContext.h"
+#include "nsDisplayList.h"
+#include "nsFieldSetFrame.h"
+#include "nsFontMetrics.h"
+#include "nsGkAtoms.h"
+#include "nsIFrame.h"
+#include "nsIPrintSettings.h"
+#include "nsLayoutUtils.h"
+#include "nsPageContentFrame.h"
+#include "nsPageSequenceFrame.h"  // for nsSharedPageData
+#include "nsPresContext.h"
+#include "nsTextFormatter.h"  // for page number localization formatting
+extern mozilla::LazyLogModule gLayoutPrintingLog;
+#define PR_PL(_p1) MOZ_LOG(gLayoutPrintingLog, mozilla::LogLevel::Debug, _p1)
+
+using namespace mozilla;
+using namespace mozilla::gfx;
+
+nsPageFrame* NS_NewPageFrame(PresShell* aPresShell, ComputedStyle* aStyle) {
+  return new (aPresShell) nsPageFrame(aStyle, aPresShell->GetPresContext());
+}
+
+NS_IMPL_FRAMEARENA_HELPERS(nsPageFrame)
+
+NS_QUERYFRAME_HEAD(nsPageFrame)
+  NS_QUERYFRAME_ENTRY(nsPageFrame)
+NS_QUERYFRAME_TAIL_INHERITING(nsContainerFrame)
+
+nsPageFrame::nsPageFrame(ComputedStyle* aStyle, nsPresContext* aPresContext)
+    : nsContainerFrame(aStyle, aPresContext, kClassID) {}
+
+nsPageFrame::~nsPageFrame() = default;
+
+nsReflowStatus nsPageFrame::ReflowPageContent(
+    nsPresContext* aPresContext, const ReflowInput& aPageReflowInput) {
+  nsPageContentFrame* const frame = PageContentFrame();
+  frame->EnsurePageName();
+  const nsSize pageSize = ComputePageSize();
+  const auto* ppsInfo = GetSharedPageData()->PagesPerSheetInfo();
+  const float pageSizeScale =
+      ppsInfo->mNumPages == 1 ? ComputeSinglePPSPageSizeScale(pageSize) : 1.0f;
+  const float extraContentScale = aPresContext->GetPageScale();
+  nsSize availableSpace = pageSize;
+
+  availableSpace.width =
+      NSToCoordCeil(availableSpace.width / extraContentScale);
+  if (availableSpace.height != NS_UNCONSTRAINEDSIZE) {
+    availableSpace.height =
+        NSToCoordCeil(availableSpace.height / extraContentScale);
+  }
+
+  const nscoord onePixel = AppUnitsPerCSSPixel();
+
+  if (availableSpace.width < onePixel || availableSpace.height < onePixel) {
+    NS_WARNING("Reflow aborted; no space for content");
+    return {};
+  }
+
+  const auto kidWM = frame->GetWritingMode();
+  LogicalSize availSizeForKid(kidWM, availableSpace);
+  if (aPageReflowInput.mFlags.mIsInFragmentainerMeasuringReflow) {
+    availSizeForKid.BSize(kidWM) = NS_UNCONSTRAINEDSIZE;
+  }
+  ReflowInput kidReflowInput(aPresContext, aPageReflowInput, frame,
+                             availSizeForKid);
+  kidReflowInput.mFlags.mIsTopOfPage = true;
+  kidReflowInput.mFlags.mTableIsSplittable = true;
+
+  nsMargin defaultMargins = aPresContext->GetDefaultPageMargin();
+  for (const auto side : mozilla::AllPhysicalSides()) {
+    defaultMargins.Side(side) =
+        NSToCoordRound((float)defaultMargins.Side(side) / pageSizeScale);
+  }
+  mPageContentMargin = defaultMargins;
+
+  const auto anchorResolutionParams =
+      AnchorPosResolutionParams::From(&kidReflowInput);
+  if (mPD->mPrintSettings->GetHonorPageRuleMargins()) {
+    for (const auto side : mozilla::AllPhysicalSides()) {
+      if (!kidReflowInput.mStyleMargin->GetMargin(side, anchorResolutionParams)
+               ->IsAuto()) {
+        const nscoord computed =
+            kidReflowInput.ComputedPhysicalMargin().Side(side);
+        if (computed == 0 ||
+            mPD->mPrintSettings->GetIgnoreUnwriteableMargins()) {
+          mPageContentMargin.Side(side) = computed;
+        } else {
+          const int32_t unwriteableTwips =
+              mPD->mPrintSettings->GetUnwriteableMarginInTwips().Side(side);
+          const nscoord unwriteable = nsPresContext::CSSTwipsToAppUnits(
+              (float)unwriteableTwips / pageSizeScale);
+          mPageContentMargin.Side(side) = std::max(
+              kidReflowInput.ComputedPhysicalMargin().Side(side), unwriteable);
+        }
+      }
+    }
+  }
+
+  nscoord computedWidth =
+      availableSpace.width - mPageContentMargin.LeftRight() / extraContentScale;
+  nscoord computedHeight;
+  if (availableSpace.height == NS_UNCONSTRAINEDSIZE) {
+    computedHeight = NS_UNCONSTRAINEDSIZE;
+  } else {
+    computedHeight = availableSpace.height -
+                     mPageContentMargin.TopBottom() / extraContentScale;
+  }
+
+  if (computedWidth < onePixel || computedHeight < onePixel) {
+    mPageContentMargin = defaultMargins;
+    computedWidth = availableSpace.width -
+                    mPageContentMargin.LeftRight() / extraContentScale;
+    if (computedHeight != NS_UNCONSTRAINEDSIZE) {
+      computedHeight = availableSpace.height -
+                       mPageContentMargin.TopBottom() / extraContentScale;
+    }
+    if (computedWidth < onePixel || computedHeight < onePixel) {
+      NS_WARNING("Reflow aborted; no space for content");
+      return {};
+    }
+  }
+
+  kidReflowInput.SetComputedWidth(computedWidth);
+  kidReflowInput.SetComputedHeight(computedHeight);
+
+  const nscoord xc = mPageContentMargin.left;
+  const nscoord yc = mPageContentMargin.top;
+
+  ReflowOutput kidOutput(kidReflowInput);
+  nsReflowStatus kidStatus;
+  ReflowChild(frame, aPresContext, kidOutput, kidReflowInput, xc, yc,
+              ReflowChildFlags::Default, kidStatus);
+
+  FinishReflowChild(frame, aPresContext, kidOutput, &kidReflowInput, xc, yc,
+                    ReflowChildFlags::Default);
+
+  NS_ASSERTION(!kidStatus.IsFullyComplete() || !frame->GetNextInFlow(),
+               "bad child flow list");
+  return kidStatus;
+}
+
+void nsPageFrame::Reflow(nsPresContext* aPresContext,
+                         ReflowOutput& aReflowOutput,
+                         const ReflowInput& aReflowInput,
+                         nsReflowStatus& aStatus) {
+  MarkInReflow();
+  DO_GLOBAL_REFLOW_COUNT("nsPageFrame");
+  MOZ_ASSERT(aStatus.IsEmpty(), "Caller should pass a fresh reflow status!");
+  MOZ_ASSERT(mPD, "Need a pointer to nsSharedPageData before reflow starts");
+
+  aStatus = ReflowPageContent(aPresContext, aReflowInput);
+
+  PR_PL(("PageFrame::Reflow %p ", this));
+  PR_PL(("[%d,%d][%d,%d]\n", aReflowOutput.Width(), aReflowOutput.Height(),
+         aReflowInput.AvailableWidth(), aReflowInput.AvailableHeight()));
+
+  WritingMode wm = aReflowInput.GetWritingMode();
+  aReflowOutput.ISize(wm) = aReflowInput.AvailableISize();
+  if (aReflowInput.AvailableBSize() != NS_UNCONSTRAINEDSIZE) {
+    aReflowOutput.BSize(wm) = aReflowInput.AvailableBSize();
+  }
+
+  aReflowOutput.SetOverflowAreasToDesiredBounds();
+  FinishAndStoreOverflow(&aReflowOutput);
+
+  PR_PL(("PageFrame::Reflow %p ", this));
+  PR_PL(("[%d,%d]\n", aReflowInput.AvailableWidth(),
+         aReflowInput.AvailableHeight()));
+}
+
+#ifdef DEBUG_FRAME_DUMP
+nsresult nsPageFrame::GetFrameName(nsAString& aResult) const {
+  return MakeFrameName(u"Page"_ns, aResult);
+}
+#endif
+
+void nsPageFrame::ProcessSpecialCodes(const nsString& aStr, nsString& aNewStr) {
+  aNewStr = aStr;
+
+  constexpr char16_t kFirstStrongIsolate = char16_t(0x2068);
+  constexpr char16_t kPopDirectionalIsolate = char16_t(0x2069);
+  auto bidiIsolateWrap = [](nsString& aString) {
+    aString.Insert(kFirstStrongIsolate, 0);
+    aString.Append(kPopDirectionalIsolate);
+  };
+
+  constexpr auto kDate = u"&D"_ns;
+  if (aStr.Find(kDate) != kNotFound) {
+    nsAutoString uStr(mPD->mDateTimeStr);
+    bidiIsolateWrap(uStr);
+    aNewStr.ReplaceSubstring(kDate, uStr);
+  }
+
+  constexpr auto kPageAndTotal = u"&PT"_ns;
+  if (aStr.Find(kPageAndTotal) != kNotFound) {
+    nsAutoString uStr;
+    nsTextFormatter::ssprintf(uStr, mPD->mPageNumAndTotalsFormat.get(),
+                              mPageNum, mPD->mRawNumPages);
+    bidiIsolateWrap(uStr);
+    aNewStr.ReplaceSubstring(kPageAndTotal, uStr);
+  }
+
+  constexpr auto kPage = u"&P"_ns;
+  if (aStr.Find(kPage) != kNotFound) {
+    nsAutoString uStr;
+    nsTextFormatter::ssprintf(uStr, mPD->mPageNumFormat.get(), mPageNum);
+    bidiIsolateWrap(uStr);
+    aNewStr.ReplaceSubstring(kPage, uStr);
+  }
+
+  constexpr auto kTitle = u"&T"_ns;
+  if (aStr.Find(kTitle) != kNotFound) {
+    nsAutoString uStr(mPD->mDocTitle);
+    bidiIsolateWrap(uStr);
+    aNewStr.ReplaceSubstring(kTitle, uStr);
+  }
+
+  constexpr auto kDocURL = u"&U"_ns;
+  if (aStr.Find(kDocURL) != kNotFound) {
+    nsAutoString uStr(mPD->mDocURL);
+    bidiIsolateWrap(uStr);
+    aNewStr.ReplaceSubstring(kDocURL, uStr);
+  }
+
+  constexpr auto kPageTotal = u"&L"_ns;
+  if (aStr.Find(kPageTotal) != kNotFound) {
+    nsAutoString uStr;
+    nsTextFormatter::ssprintf(uStr, mPD->mPageNumFormat.get(),
+                              mPD->mRawNumPages);
+    bidiIsolateWrap(uStr);
+    aNewStr.ReplaceSubstring(kPageTotal, uStr);
+  }
+}
+
+nscoord nsPageFrame::GetXPosition(gfxContext& aRenderingContext,
+                                  nsFontMetrics& aFontMetrics,
+                                  const nsRect& aRect, int32_t aJust,
+                                  const nsString& aStr) {
+  nscoord width = nsLayoutUtils::AppUnitWidthOfStringBidi(
+      aStr, this, aFontMetrics, aRenderingContext);
+  nscoord x = aRect.x;
+  switch (aJust) {
+    case nsIPrintSettings::kJustLeft:
+      x += mPD->mEdgePaperMargin.left;
+      break;
+
+    case nsIPrintSettings::kJustCenter:
+      x += (aRect.width - width) / 2;
+      break;
+
+    case nsIPrintSettings::kJustRight:
+      x += aRect.width - width - mPD->mEdgePaperMargin.right;
+      break;
+  }  
+
+  return x;
+}
+
+void nsPageFrame::DrawHeaderFooter(
+    gfxContext& aRenderingContext, nsFontMetrics& aFontMetrics,
+    nsHeaderFooterEnum aHeaderFooter, const nsString& aStrLeft,
+    const nsString& aStrCenter, const nsString& aStrRight, const nsRect& aRect,
+    nscoord aAscent, nscoord aHeight) {
+  int32_t numStrs = 0;
+  if (!aStrLeft.IsEmpty()) {
+    numStrs++;
+  }
+  if (!aStrCenter.IsEmpty()) {
+    numStrs++;
+  }
+  if (!aStrRight.IsEmpty()) {
+    numStrs++;
+  }
+
+  if (numStrs == 0) {
+    return;
+  }
+  const nscoord contentWidth =
+      aRect.width - (mPD->mEdgePaperMargin.left + mPD->mEdgePaperMargin.right);
+  const nscoord strSpace = contentWidth / numStrs;
+
+  if (!aStrLeft.IsEmpty()) {
+    DrawHeaderFooter(aRenderingContext, aFontMetrics, aHeaderFooter,
+                     nsIPrintSettings::kJustLeft, aStrLeft, aRect, aAscent,
+                     aHeight, strSpace);
+  }
+  if (!aStrCenter.IsEmpty()) {
+    DrawHeaderFooter(aRenderingContext, aFontMetrics, aHeaderFooter,
+                     nsIPrintSettings::kJustCenter, aStrCenter, aRect, aAscent,
+                     aHeight, strSpace);
+  }
+  if (!aStrRight.IsEmpty()) {
+    DrawHeaderFooter(aRenderingContext, aFontMetrics, aHeaderFooter,
+                     nsIPrintSettings::kJustRight, aStrRight, aRect, aAscent,
+                     aHeight, strSpace);
+  }
+}
+
+void nsPageFrame::DrawHeaderFooter(gfxContext& aRenderingContext,
+                                   nsFontMetrics& aFontMetrics,
+                                   nsHeaderFooterEnum aHeaderFooter,
+                                   int32_t aJust, const nsString& aStr,
+                                   const nsRect& aRect, nscoord aAscent,
+                                   nscoord aHeight, nscoord aWidth) {
+  DrawTarget* drawTarget = aRenderingContext.GetDrawTarget();
+
+  if ((aHeaderFooter == eHeader && aHeight < mPageContentMargin.top) ||
+      (aHeaderFooter == eFooter && aHeight < mPageContentMargin.bottom)) {
+    nsAutoString str;
+    ProcessSpecialCodes(aStr, str);
+
+    int32_t len = (int32_t)str.Length();
+    if (len == 0) {
+      return;  
+    }
+
+    int32_t index;
+    int32_t textWidth = 0;
+    const char16_t* text = str.get();
+    if (nsLayoutUtils::BinarySearchForPosition(drawTarget, aFontMetrics, text,
+                                               0, 0, 0, len, int32_t(aWidth),
+                                               index, textWidth)) {
+      if (index < len - 1) {
+
+        mozilla::intl::GraphemeClusterBreakReverseIteratorUtf16 revIter(str);
+
+        revIter.Seek(index);
+
+        revIter.Next();
+        revIter.Next();
+        if (const Maybe<uint32_t> maybeIndex = revIter.Next()) {
+          str.Truncate(*maybeIndex);
+          str.AppendLiteral("...");
+        } else {
+          str.Truncate();
+        }
+      }
+    } else {
+      return;  
+    }
+
+    if (HasRTLChars(str)) {
+      PresContext()->SetBidiEnabled();
+    }
+
+    nscoord x =
+        GetXPosition(aRenderingContext, aFontMetrics, aRect, aJust, str);
+    nscoord y;
+    if (aHeaderFooter == eHeader) {
+      y = aRect.y + mPD->mEdgePaperMargin.top;
+    } else {
+      y = aRect.YMost() - aHeight - mPD->mEdgePaperMargin.bottom;
+    }
+
+    aRenderingContext.Save();
+    aRenderingContext.Clip(NSRectToSnappedRect(
+        aRect, PresContext()->AppUnitsPerDevPixel(), *drawTarget));
+    aRenderingContext.SetColor(sRGBColor::OpaqueBlack());
+    nsLayoutUtils::DrawString(this, aFontMetrics, &aRenderingContext, str.get(),
+                              str.Length(), nsPoint(x, y + aAscent), nullptr,
+                              DrawStringFlags::ForceHorizontal);
+    aRenderingContext.Restore();
+  }
+}
+
+class nsDisplayHeaderFooter final : public nsPaintedDisplayItem {
+ public:
+  nsDisplayHeaderFooter(nsDisplayListBuilder* aBuilder, nsPageFrame* aFrame)
+      : nsPaintedDisplayItem(aBuilder, aFrame) {
+    MOZ_COUNT_CTOR(nsDisplayHeaderFooter);
+  }
+
+  MOZ_COUNTED_DTOR_FINAL(nsDisplayHeaderFooter)
+
+  virtual void Paint(nsDisplayListBuilder* aBuilder,
+                     gfxContext* aCtx) override {
+#ifdef DEBUG
+    nsPageFrame* pageFrame = do_QueryFrame(mFrame);
+    MOZ_ASSERT(pageFrame, "We should have an nsPageFrame");
+#endif
+#ifdef ACCESSIBILITY
+    aCtx->GetDrawTarget()->AccessibleId(0, 0);
+#endif
+    static_cast<nsPageFrame*>(mFrame)->PaintHeaderFooter(
+        *aCtx, ToReferenceFrame(), false);
+  }
+  NS_DISPLAY_DECL_NAME("HeaderFooter", TYPE_HEADER_FOOTER)
+
+  virtual nsRect GetComponentAlphaBounds(
+      nsDisplayListBuilder* aBuilder) const override {
+    bool snap;
+    return GetBounds(aBuilder, &snap);
+  }
+};
+
+static void PaintMarginGuides(nsIFrame* aFrame, DrawTarget* aDrawTarget,
+                              const nsRect& aDirtyRect, nsPoint aPt) {
+  ColorPattern pattern(ToDeviceColor(sRGBColor(0.0f, 0.0f, 1.0f)));
+  Float dashes[] = {2.0f, 2.0f};
+  StrokeOptions stroke( 0.5f,
+                       JoinStyle::MITER_OR_BEVEL, CapStyle::BUTT,
+                        10.0f,
+                       std::size(dashes), dashes,
+                        0.0f);
+  DrawOptions options;
+
+  MOZ_RELEASE_ASSERT(aFrame->IsPageFrame());
+  const nsMargin& margin =
+      static_cast<nsPageFrame*>(aFrame)->GetUsedPageContentMargin();
+  int32_t appUnitsPerDevPx = aFrame->PresContext()->AppUnitsPerDevPixel();
+
+  nsRect rect(aPt, aFrame->GetSize());
+  rect.Deflate(nsMargin(margin.top, 0, margin.bottom, 0));
+  Rect r = NSRectToRect(rect, appUnitsPerDevPx);
+  aDrawTarget->StrokeLine(r.TopLeft(), r.TopRight(), pattern, stroke, options);
+  aDrawTarget->StrokeLine(r.BottomLeft(), r.BottomRight(), pattern, stroke,
+                          options);
+
+  rect = nsRect(aPt, aFrame->GetSize());
+  rect.Deflate(nsMargin(0, margin.right, 0, margin.left));
+  r = NSRectToRect(rect, appUnitsPerDevPx);
+  aDrawTarget->StrokeLine(r.TopLeft(), r.BottomLeft(), pattern, stroke,
+                          options);
+  aDrawTarget->StrokeLine(r.TopRight(), r.BottomRight(), pattern, stroke,
+                          options);
+}
+
+static std::tuple<uint32_t, uint32_t> GetRowAndColFromIdx(uint32_t aIdxOnSheet,
+                                                          uint32_t aNumCols) {
+  return {aIdxOnSheet / aNumCols, aIdxOnSheet % aNumCols};
+}
+
+constexpr float kCenterPageRatioThreshold = 0.9f;
+
+enum {
+  kPrintCenterPageOnSheetNever = 0,
+  kPrintCenterPageOnSheetAlways = 1,
+  kPrintCenterPageOnSheetAuto = 2
+};
+
+static float OffsetToCenterPage(nscoord aContentSize, nscoord aSheetSize,
+                                float aScale, float aAppUnitsPerPixel) {
+  MOZ_ASSERT(aScale <= 1.0f && aScale > 0.0f,
+             "Scale must be in the range (0,1]");
+  constexpr unsigned centerPagePref = kPrintCenterPageOnSheetAuto;
+  if (centerPagePref == kPrintCenterPageOnSheetNever) {
+    return 0.0f;
+  }
+
+  const float sheetSize =
+      NSAppUnitsToFloatPixels(aSheetSize, aAppUnitsPerPixel);
+  const float scaledContentSize =
+      NSAppUnitsToFloatPixels(aContentSize, aAppUnitsPerPixel) * aScale;
+  const float ratio = scaledContentSize / sheetSize;
+
+  if (centerPagePref == kPrintCenterPageOnSheetAlways ||
+      ratio >= kCenterPageRatioThreshold) {
+    return (sheetSize - scaledContentSize) * 0.5f;
+  }
+  return 0.0f;
+}
+
+static gfx::Matrix4x4 ComputePagesPerSheetAndPageSizeTransform(
+    const nsIFrame* aFrame, float aAppUnitsPerPixel) {
+  MOZ_ASSERT(aFrame->IsPageFrame());
+  auto* pageFrame = static_cast<const nsPageFrame*>(aFrame);
+  const nsSize contentPageSize = pageFrame->ComputePageSize();
+  MOZ_ASSERT(contentPageSize.width > 0 && contentPageSize.height > 0);
+  nsSharedPageData* pd = pageFrame->GetSharedPageData();
+  const auto* ppsInfo = pd->PagesPerSheetInfo();
+
+  const nsContainerFrame* const parentFrame = pageFrame->GetParent();
+  MOZ_ASSERT(parentFrame->IsPrintedSheetFrame(),
+             "Parent of nsPageFrame should be PrintedSheetFrame");
+  const auto* sheetFrame = static_cast<const PrintedSheetFrame*>(parentFrame);
+
+  const double rotation =
+      pageFrame->GetPageOrientationRotation(pageFrame->GetSharedPageData());
+
+  gfx::Matrix4x4 transform;
+
+  if (ppsInfo->mNumPages == 1) {
+    const nsSize sheetSize = sheetFrame->GetSizeForChildren();
+    if (rotation != 0.0) {
+      const bool sheetIsPortrait = sheetSize.width < sheetSize.height;
+      const bool rotatingClockwise = rotation > 0.0;
+
+      int32_t x, y;
+      if (rotatingClockwise != sheetIsPortrait) {
+        x = y = std::min(sheetSize.width, sheetSize.height) / 2;
+      } else {
+        x = y = std::max(sheetSize.width, sheetSize.height) / 2;
+      }
+
+      transform = gfx::Matrix4x4::Translation(
+          NSAppUnitsToFloatPixels(x, aAppUnitsPerPixel),
+          NSAppUnitsToFloatPixels(y, aAppUnitsPerPixel), 0);
+      transform.RotateZ(rotation);
+      transform.PreTranslate(NSAppUnitsToFloatPixels(-x, aAppUnitsPerPixel),
+                             NSAppUnitsToFloatPixels(-y, aAppUnitsPerPixel), 0);
+    }
+
+    const float scale =
+        pageFrame->ComputeSinglePPSPageSizeScale(contentPageSize);
+    const float centeringOffset = OffsetToCenterPage(
+        contentPageSize.width, sheetSize.width, scale, aAppUnitsPerPixel);
+
+    if (centeringOffset >= 1.0f) {
+      transform.PreTranslate(centeringOffset, 0, 0);
+    }
+    transform.PreScale(scale, scale, 1);
+    return transform;
+  }
+
+
+  const nsPoint gridOrigin = sheetFrame->GetGridOrigin();
+  const nscoord cellWidth = sheetFrame->GetGridCellWidth();
+  const nscoord cellHeight = sheetFrame->GetGridCellHeight();
+  uint32_t rowIdx, colIdx;
+  std::tie(rowIdx, colIdx) = GetRowAndColFromIdx(pageFrame->IndexOnSheet(),
+                                                 sheetFrame->GetGridNumCols());
+  transform = gfx::Matrix4x4::Translation(
+      NSAppUnitsToFloatPixels(gridOrigin.x + nscoord(colIdx) * cellWidth,
+                              aAppUnitsPerPixel),
+      NSAppUnitsToFloatPixels(gridOrigin.y + nscoord(rowIdx) * cellHeight,
+                              aAppUnitsPerPixel),
+      0.0f);
+
+  float scaleX = float(cellWidth) / float(contentPageSize.width);
+  float scaleY = float(cellHeight) / float(contentPageSize.height);
+  MOZ_ASSERT(scaleX > 0.0f && scaleX <= 1.0f && scaleY > 0.0f &&
+             scaleY <= 1.0f);
+  float scale;
+  float dx = 0.0f, dy = 0.0f;
+  if (scaleX < scaleY) {
+    scale = scaleX;
+    nscoord extraSpace =
+        cellHeight - NSToCoordRound(float(contentPageSize.height) * scale);
+    dy = NSAppUnitsToFloatPixels(extraSpace / 2, aAppUnitsPerPixel);
+  } else {
+    scale = scaleY;
+    nscoord extraSpace =
+        cellWidth - NSToCoordRound(float(contentPageSize.width) * scale);
+    dx = NSAppUnitsToFloatPixels(extraSpace / 2, aAppUnitsPerPixel);
+  }
+  transform.PreTranslate(dx, dy, 0.0f);
+  transform.PreScale(scale, scale, 1.0f);
+
+  if (rotation != 0.0) {
+
+    float fitScale = 1.0f;
+    if (MOZ_LIKELY(cellWidth != cellHeight &&
+                   contentPageSize.width != contentPageSize.height)) {
+      float cellRatio = float(cellWidth) / float(cellHeight);
+      float pageRatio =
+          float(contentPageSize.width) / float(contentPageSize.height);
+      const bool orientationWillMatchAfterRotation =
+          floor(cellRatio) != floor(pageRatio);
+      if (cellRatio > 1.0f) {
+        cellRatio = 1.0f / cellRatio;  
+      }
+      if (pageRatio > 1.0f) {
+        pageRatio = 1.0f / pageRatio;  
+      }
+      fitScale = std::max(cellRatio, pageRatio);
+      if (orientationWillMatchAfterRotation) {
+        fitScale = 1.0f / fitScale;
+      }
+    }
+
+    transform.PreTranslate(
+        NSAppUnitsToFloatPixels(contentPageSize.width / 2, aAppUnitsPerPixel),
+        NSAppUnitsToFloatPixels(contentPageSize.height / 2, aAppUnitsPerPixel),
+        0);
+    if (MOZ_LIKELY(fitScale != 1.0f)) {
+      transform.PreScale(fitScale, fitScale, 1.0f);
+    }
+    transform.RotateZ(rotation);
+    transform.PreTranslate(
+        NSAppUnitsToFloatPixels(-contentPageSize.width / 2, aAppUnitsPerPixel),
+        NSAppUnitsToFloatPixels(-contentPageSize.height / 2, aAppUnitsPerPixel),
+        0);
+  }
+
+  return transform;
+}
+
+nsIFrame::ComputeTransformFunction nsPageFrame::GetTransformGetter() const {
+  return ComputePagesPerSheetAndPageSizeTransform;
+}
+
+nsPageContentFrame* nsPageFrame::PageContentFrame() const {
+  nsIFrame* const frame = mFrames.FirstChild();
+  MOZ_ASSERT(frame, "pageFrame must have one child");
+  MOZ_ASSERT(frame->IsPageContentFrame(),
+             "pageFrame must have pageContentFrame as the first child");
+  return static_cast<nsPageContentFrame*>(frame);
+}
+
+nsSize nsPageFrame::ComputePageSize() const {
+  const StylePageSize& pageSize = PageContentFrame()->StylePage()->mSize;
+  nsSize size = PresContext()->GetPageSize();
+  if (pageSize.IsSize()) {
+    nscoord cssPageWidth = pageSize.AsSize().width.ToAppUnits();
+    nscoord cssPageHeight = pageSize.AsSize().height.ToAppUnits();
+    if (cssPageWidth > 0 && cssPageHeight > 0) {
+      return nsSize{cssPageWidth, cssPageHeight};
+    }
+    return size;
+  }
+
+  if (pageSize.IsOrientation()) {
+    if (pageSize.AsOrientation() == StylePageSizeOrientation::Portrait) {
+      if (size.width > size.height) {
+        std::swap(size.width, size.height);
+      }
+    } else {
+      MOZ_ASSERT(pageSize.AsOrientation() ==
+                 StylePageSizeOrientation::Landscape);
+      if (size.width < size.height) {
+        std::swap(size.width, size.height);
+      }
+    }
+  } else {
+    MOZ_ASSERT(pageSize.IsAuto(), "Impossible page-size value?");
+  }
+  return size;
+}
+
+float nsPageFrame::ComputeSinglePPSPageSizeScale(
+    const nsSize aContentPageSize) const {
+  MOZ_ASSERT(GetSharedPageData()->PagesPerSheetInfo()->mNumPages == 1,
+             "Only intended for the pps==1 case");
+  MOZ_ASSERT(aContentPageSize == ComputePageSize(),
+             "Incorrect content page size");
+
+  if (PageContentFrame()->StylePage()->mSize.IsAuto()) {
+    return 1.0f;
+  }
+
+  const nsContainerFrame* const parent = GetParent();
+  MOZ_ASSERT(parent && parent->IsPrintedSheetFrame(),
+             "Parent of nsPageFrame should be PrintedSheetFrame");
+  const auto* sheet = static_cast<const PrintedSheetFrame*>(parent);
+
+  float scale = 1.0f;
+
+  const nsSize sheetSize = sheet->GetSizeForChildren();
+  nscoord contentPageHeight = aContentPageSize.height;
+  if (aContentPageSize.width > sheetSize.width) {
+    scale *= float(sheetSize.width) / float(aContentPageSize.width);
+    contentPageHeight = NSToCoordRound(contentPageHeight * scale);
+  }
+  if (contentPageHeight > sheetSize.height) {
+    scale *= float(sheetSize.height) / float(contentPageHeight);
+  }
+  MOZ_ASSERT(
+      scale <= 1.0f,
+      "Page-size mismatches should only have caused us to scale down, not up.");
+  return scale;
+}
+
+double nsPageFrame::GetPageOrientationRotation(nsSharedPageData* aPD) const {
+  if (aPD->PagesPerSheetInfo()->mNumPages == 1 && !PresContext()->IsScreen() &&
+      aPD->mPrintSettings->GetOutputFormat() !=
+          nsIPrintSettings::kOutputFormatPDF) {
+    return 0.0;
+  }
+
+  const StylePageOrientation& orientation =
+      PageContentFrame()->StylePage()->mPageOrientation;
+
+  if (orientation == StylePageOrientation::RotateLeft) {
+    return -M_PI / 2.0;
+  }
+  if (orientation == StylePageOrientation::RotateRight) {
+    return M_PI / 2.0;
+  }
+  return 0.0;
+}
+
+void nsPageFrame::BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                                   const nsDisplayListSet& aLists) {
+  nsDisplayList content(aBuilder);
+  nsDisplayListSet set(&content, &content, &content, &content, &content,
+                       &content);
+  {
+    DisplayListClipState::AutoSaveRestore clipState(aBuilder);
+    clipState.Clear();
+
+    nsPresContext* const pc = PresContext();
+    {
+      const float scale = pc->GetPageScale();
+      const nsSize pageSize = ComputePageSize();
+      const nsRect scaledPageRect{0, 0, NSToCoordCeil(pageSize.width / scale),
+                                  NSToCoordCeil(pageSize.height / scale)};
+      nsDisplayListBuilder::AutoBuildingDisplayList buildingForPageContentFrame(
+          aBuilder, this, scaledPageRect, scaledPageRect);
+
+      nsContainerFrame::BuildDisplayList(aBuilder, set);
+    }
+
+    if (pc->IsRootPaginatedDocument()) {
+      content.AppendNewToTop<nsDisplayHeaderFooter>(aBuilder, this);
+
+      if (pc->Type() == nsPresContext::eContext_PrintPreview &&
+          mPD->mPrintSettings->GetShowMarginGuides()) {
+        content.AppendNewToTop<nsDisplayGeneric>(
+            aBuilder, this, PaintMarginGuides, "MarginGuides",
+            DisplayItemType::TYPE_MARGIN_GUIDES);
+      }
+    }
+  }
+
+  content.AppendNewToTop<nsDisplayTransform>(
+      aBuilder, this, &content, content.GetBuildingRect(),
+      nsDisplayTransform::WithTransformGetter);
+
+  set.MoveTo(aLists);
+}
+
+void nsPageFrame::DeterminePageNum() {
+  auto* prevContinuation = static_cast<nsPageFrame*>(GetPrevContinuation());
+  mPageNum = prevContinuation ? prevContinuation->GetPageNum() + 1 : 1;
+}
+
+void nsPageFrame::PaintHeaderFooter(gfxContext& aRenderingContext, nsPoint aPt,
+                                    bool aDisableSubpixelAA) {
+  nsPresContext* pc = PresContext();
+
+  nsRect rect(aPt, ComputePageSize());
+  aRenderingContext.SetColor(sRGBColor::OpaqueBlack());
+
+  DrawTargetAutoDisableSubpixelAntialiasing disable(
+      aRenderingContext.GetDrawTarget(), aDisableSubpixelAA);
+
+  nsFontMetrics::Params params;
+  params.userFontSet = pc->GetUserFontSet();
+  params.textPerf = pc->GetTextPerfMetrics();
+  params.featureValueLookup = pc->GetFontFeatureValuesLookup();
+  RefPtr<nsFontMetrics> fontMet = pc->GetMetricsFor(mPD->mHeadFootFont, params);
+
+  nscoord ascent = fontMet->MaxAscent();
+  nscoord visibleHeight = fontMet->MaxHeight();
+
+  nsString headerLeft, headerCenter, headerRight;
+  mPD->mPrintSettings->GetHeaderStrLeft(headerLeft);
+  mPD->mPrintSettings->GetHeaderStrCenter(headerCenter);
+  mPD->mPrintSettings->GetHeaderStrRight(headerRight);
+  DrawHeaderFooter(aRenderingContext, *fontMet, eHeader, headerLeft,
+                   headerCenter, headerRight, rect, ascent, visibleHeight);
+
+  nsString footerLeft, footerCenter, footerRight;
+  mPD->mPrintSettings->GetFooterStrLeft(footerLeft);
+  mPD->mPrintSettings->GetFooterStrCenter(footerCenter);
+  mPD->mPrintSettings->GetFooterStrRight(footerRight);
+  DrawHeaderFooter(aRenderingContext, *fontMet, eFooter, footerLeft,
+                   footerCenter, footerRight, rect, ascent, visibleHeight);
+}
+
+void nsPageFrame::SetSharedPageData(nsSharedPageData* aPD) {
+  mPD = aPD;
+  PageContentFrame()->SetSharedPageData(mPD);
+}
+
+nsIFrame* NS_NewPageBreakFrame(PresShell* aPresShell, ComputedStyle* aStyle) {
+  MOZ_ASSERT(aPresShell, "null PresShell");
+  NS_ASSERTION(aPresShell->GetPresContext()->IsPaginated(),
+               "created a page break frame while not printing");
+
+  return new (aPresShell)
+      nsPageBreakFrame(aStyle, aPresShell->GetPresContext());
+}
+
+NS_IMPL_FRAMEARENA_HELPERS(nsPageBreakFrame)
+
+nsPageBreakFrame::nsPageBreakFrame(ComputedStyle* aStyle,
+                                   nsPresContext* aPresContext)
+    : nsLeafFrame(aStyle, aPresContext, kClassID) {}
+
+nsPageBreakFrame::~nsPageBreakFrame() = default;
+
+IntrinsicSize nsPageBreakFrame::GetIntrinsicSize() {
+  IntrinsicSize intrinsicSize;
+  intrinsicSize.ISize(GetWritingMode())
+      .emplace(nsPresContext::CSSPixelsToAppUnits(1));
+  return intrinsicSize;
+}
+
+void nsPageBreakFrame::Reflow(nsPresContext* aPresContext,
+                              ReflowOutput& aReflowOutput,
+                              const ReflowInput& aReflowInput,
+                              nsReflowStatus& aStatus) {
+  DO_GLOBAL_REFLOW_COUNT("nsPageBreakFrame");
+  MOZ_ASSERT(aStatus.IsEmpty(), "Caller should pass a fresh reflow status!");
+
+  const WritingMode wm = aReflowInput.GetWritingMode();
+  nscoord bSize = aReflowInput.AvailableBSize();
+  if (aReflowInput.AvailableBSize() == NS_UNCONSTRAINEDSIZE) {
+    bSize = nscoord(0);
+  } else if (GetContent()->IsHTMLElement(nsGkAtoms::legend)) {
+    const nsContainerFrame* parent = GetParent();
+    if (parent && parent->Style()->GetPseudoType() ==
+                      PseudoStyleType::MozFieldsetContent) {
+      while ((parent = parent->GetParent())) {
+        if (const nsFieldSetFrame* const fieldset = do_QueryFrame(parent)) {
+          const auto* const legend = fieldset->GetLegend();
+          if (legend && legend->GetContent() == GetContent()) {
+            bSize = nscoord(0);
+          }
+          break;
+        }
+      }
+    }
+  }
+  LogicalSize finalSize(wm, *GetIntrinsicSize().ISize(wm), bSize);
+  finalSize.BSize(wm) -=
+      finalSize.BSize(wm) % nsPresContext::CSSPixelsToAppUnits(1);
+  aReflowOutput.SetSize(wm, finalSize);
+}
+
+#ifdef DEBUG_FRAME_DUMP
+nsresult nsPageBreakFrame::GetFrameName(nsAString& aResult) const {
+  return MakeFrameName(u"PageBreak"_ns, aResult);
+}
+#endif

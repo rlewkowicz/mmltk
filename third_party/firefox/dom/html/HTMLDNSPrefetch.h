@@ -1,0 +1,131 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_HTMLDNSPrefetch_h_
+#define mozilla_dom_HTMLDNSPrefetch_h_
+
+#include "nsCOMPtr.h"
+#include "nsIDNSService.h"
+#include "nsIRequest.h"
+#include "nsString.h"
+
+class nsITimer;
+class nsIURI;
+namespace mozilla {
+
+class OriginAttributes;
+
+namespace net {
+class NeckoParent;
+}  
+
+namespace dom {
+class Document;
+class Element;
+
+class SupportsDNSPrefetch;
+
+class HTMLDNSPrefetch {
+ public:
+  static bool IsAllowed(Document* aDocument);
+
+  static nsresult Initialize();
+  static nsresult Shutdown();
+
+
+  enum class Priority {
+    Low,
+    Medium,
+    High,
+  };
+  enum class PrefetchSource {
+    LinkDnsPrefetch,
+    AnchorSpeculativePrefetch,
+  };
+  static nsresult DeferPrefetch(SupportsDNSPrefetch& aSupports,
+                                Element& aElement, Priority aPriority);
+  static void SendRequest(Element& aElement, nsIDNSService::DNSFlags aFlags);
+  static nsresult Prefetch(
+      const nsAString& host, bool isHttps,
+      const OriginAttributes& aPartitionedPrincipalOriginAttributes,
+      nsIRequest::TRRMode aTRRMode, Priority);
+  static nsresult CancelPrefetch(
+      const nsAString& host, bool isHttps,
+      const OriginAttributes& aPartitionedPrincipalOriginAttributes,
+      nsIRequest::TRRMode aTRRMode, Priority, nsresult aReason);
+  static nsresult CancelPrefetch(SupportsDNSPrefetch&, Element&, Priority,
+                                 nsresult aReason);
+  static void ElementDestroyed(Element&, SupportsDNSPrefetch&);
+
+  static nsIDNSService::DNSFlags PriorityToDNSServiceFlags(Priority);
+
+ private:
+  static nsresult Prefetch(
+      const nsAString& host, bool isHttps,
+      const OriginAttributes& aPartitionedPrincipalOriginAttributes,
+      nsIDNSService::DNSFlags flags);
+  static nsresult CancelPrefetch(
+      const nsAString& hostname, bool isHttps,
+      const OriginAttributes& aPartitionedPrincipalOriginAttributes,
+      nsIDNSService::DNSFlags flags, nsresult aReason);
+
+  friend class net::NeckoParent;
+};
+
+class SupportsDNSPrefetch {
+ public:
+  bool IsInDNSPrefetch() { return mInDNSPrefetch; }
+  void SetIsInDNSPrefetch() { mInDNSPrefetch = true; }
+  void ClearIsInDNSPrefetch() { mInDNSPrefetch = false; }
+
+  void DNSPrefetchRequestStarted() {
+    mDNSPrefetchDeferred = false;
+    mDNSPrefetchRequested = true;
+  }
+
+  void DNSPrefetchRequestDeferred() {
+    mDNSPrefetchDeferred = true;
+    mDNSPrefetchRequested = false;
+  }
+
+  bool IsDNSPrefetchRequestDeferred() const { return mDNSPrefetchDeferred; }
+
+  nsIURI* GetURIForDNSPrefetch(Element& aOwner);
+
+ protected:
+  SupportsDNSPrefetch()
+      : mInDNSPrefetch(false),
+        mDNSPrefetchRequested(false),
+        mDNSPrefetchDeferred(false),
+        mDestroyedCalled(false) {}
+
+  void CancelDNSPrefetch(Element& aOwner);
+  void TryDNSPrefetch(Element& aOwner, HTMLDNSPrefetch::PrefetchSource aSource);
+
+  void Destroyed(Element& aOwner) {
+    MOZ_DIAGNOSTIC_ASSERT(!mDestroyedCalled,
+                          "Multiple calls to SupportsDNSPrefetch::Destroyed?");
+    mDestroyedCalled = true;
+    if (mInDNSPrefetch) {
+      HTMLDNSPrefetch::ElementDestroyed(aOwner, *this);
+    }
+  }
+
+  ~SupportsDNSPrefetch() {
+    MOZ_DIAGNOSTIC_ASSERT(mDestroyedCalled,
+                          "Need to call SupportsDNSPrefetch::Destroyed "
+                          "from the owner element");
+  }
+
+ private:
+  bool mInDNSPrefetch : 1;
+  bool mDNSPrefetchRequested : 1;
+  bool mDNSPrefetchDeferred : 1;
+  bool mDestroyedCalled : 1;
+};
+
+}  
+}  
+
+#endif

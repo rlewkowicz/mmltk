@@ -1,0 +1,42 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsPreloadedStream_h_
+#define nsPreloadedStream_h_
+
+#include "nsIAsyncInputStream.h"
+#include "nsCOMPtr.h"
+#include "mozilla/DataMutex.h"
+
+namespace mozilla {
+namespace net {
+
+class nsPreloadedStream final : public nsIAsyncInputStream,
+                                public nsIInputStreamCallback {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIINPUTSTREAM
+  NS_DECL_NSIASYNCINPUTSTREAM
+  NS_DECL_NSIINPUTSTREAMCALLBACK
+
+  nsPreloadedStream(nsIAsyncInputStream* aStream, const char* data,
+                    uint32_t datalen);
+
+ private:
+  ~nsPreloadedStream();
+
+  nsCOMPtr<nsIAsyncInputStream> mStream;
+
+  char* mBuf;
+  uint32_t mOffset;
+  uint32_t mLen;
+
+  DataMutex<nsCOMPtr<nsIInputStreamCallback>> mCallback;
+};
+
+}  
+}  
+
+#endif

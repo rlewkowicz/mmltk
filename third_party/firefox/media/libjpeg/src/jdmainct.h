@@ -1,0 +1,70 @@
+/*
+ * jdmainct.h
+ *
+ * This file was part of the Independent JPEG Group's software:
+ * Copyright (C) 1994-1996, Thomas G. Lane.
+ * libjpeg-turbo Modifications:
+ * Copyright (C) 2022, D. R. Commander.
+ * For conditions of distribution and use, see the accompanying README.ijg
+ * file.
+ */
+
+#define JPEG_INTERNALS
+#include "jpeglib.h"
+#include "jpegapicomp.h"
+#include "jsamplecomp.h"
+
+
+#if BITS_IN_JSAMPLE != 16 || defined(D_LOSSLESS_SUPPORTED)
+
+
+typedef struct {
+  struct jpeg_d_main_controller pub; 
+
+  _JSAMPARRAY buffer[MAX_COMPONENTS];
+
+  boolean buffer_full;          
+  JDIMENSION rowgroup_ctr;      
+
+
+  _JSAMPIMAGE xbuffer[2];       
+
+  int whichptr;                 
+  int context_state;            
+  JDIMENSION rowgroups_avail;   
+  JDIMENSION iMCU_row_ctr;      
+} my_main_controller;
+
+typedef my_main_controller *my_main_ptr;
+
+
+#define CTX_PREPARE_FOR_IMCU    0       /* need to prepare for MCU row */
+#define CTX_PROCESS_IMCU        1       /* feeding iMCU to postprocessor */
+#define CTX_POSTPONED_ROW       2       /* feeding postponed row group */
+
+
+LOCAL(void)
+set_wraparound_pointers(j_decompress_ptr cinfo)
+{
+  my_main_ptr main_ptr = (my_main_ptr)cinfo->main;
+  int ci, i, rgroup;
+  int M = cinfo->_min_DCT_scaled_size;
+  jpeg_component_info *compptr;
+  _JSAMPARRAY xbuf0, xbuf1;
+
+  for (ci = 0, compptr = cinfo->comp_info; ci < cinfo->num_components;
+       ci++, compptr++) {
+    rgroup = (compptr->v_samp_factor * compptr->_DCT_scaled_size) /
+      cinfo->_min_DCT_scaled_size; 
+    xbuf0 = main_ptr->xbuffer[0][ci];
+    xbuf1 = main_ptr->xbuffer[1][ci];
+    for (i = 0; i < rgroup; i++) {
+      xbuf0[i - rgroup] = xbuf0[rgroup * (M + 1) + i];
+      xbuf1[i - rgroup] = xbuf1[rgroup * (M + 1) + i];
+      xbuf0[rgroup * (M + 2) + i] = xbuf0[i];
+      xbuf1[rgroup * (M + 2) + i] = xbuf1[i];
+    }
+  }
+}
+
+#endif /* BITS_IN_JSAMPLE != 16 || defined(D_LOSSLESS_SUPPORTED) */

@@ -1,0 +1,45 @@
+// Copyright 2012 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+
+#if !defined(COMPILER_PREPROCESSOR_NUMERICLEX_H_)
+#define COMPILER_PREPROCESSOR_NUMERICLEX_H_
+
+#include <sstream>
+
+namespace angle
+{
+
+namespace pp
+{
+
+inline std::ios::fmtflags numeric_base_int(const std::string &str)
+{
+    if ((str.size() >= 2) && (str[0] == '0') && (str[1] == 'x' || str[1] == 'X'))
+    {
+        return std::ios::hex;
+    }
+    if ((str.size() >= 1) && (str[0] == '0'))
+    {
+        return std::ios::oct;
+    }
+    return std::ios::dec;
+}
+
+
+template <typename IntType>
+bool numeric_lex_int(const std::string &str, IntType *value)
+{
+    std::istringstream stream(str);
+    stream.setf(numeric_base_int(str), std::ios::basefield);
+
+    stream >> (*value);
+    return !stream.fail();
+}
+
+}  
+
+}  
+
+#endif

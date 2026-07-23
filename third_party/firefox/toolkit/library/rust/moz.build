@@ -1,0 +1,16 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+include("gkrust-features.mozbuild")
+
+RustLibrary("gkrust", gkrust_features, is_gkrust=True)
+
+# Export the `rure` crate's included .h file. The symbols defined in that file
+# will be exported from the `gkrust-shared` crate.
+EXPORTS += [
+    "/third_party/rust/rure/include/rure.h",
+]
+
+COMPILE_FLAGS["BASE_INCLUDES"] = []
+HOST_COMPILE_FLAGS["BASE_INCLUDES"] = []

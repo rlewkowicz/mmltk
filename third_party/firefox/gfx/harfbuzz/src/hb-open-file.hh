@@ -1,0 +1,496 @@
+/*
+ * Copyright © 2007,2008,2009  Red Hat, Inc.
+ * Copyright © 2012  Google, Inc.
+ *
+ *  This is part of HarfBuzz, a text shaping library.
+ *
+ * Permission is hereby granted, without written agreement and without
+ * license or royalty fees, to use, copy, modify, and distribute this
+ * software and its documentation for any purpose, provided that the
+ * above copyright notice and the following two paragraphs appear in
+ * all copies of this software.
+ *
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE TO ANY PARTY FOR
+ * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES
+ * ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN
+ * IF THE COPYRIGHT HOLDER HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ *
+ * THE COPYRIGHT HOLDER SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING,
+ * BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+ * FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ * ON AN "AS IS" BASIS, AND THE COPYRIGHT HOLDER HAS NO OBLIGATION TO
+ * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ *
+ * Red Hat Author(s): Behdad Esfahbod
+ * Google Author(s): Behdad Esfahbod
+ */
+
+#ifndef HB_OPEN_FILE_HH
+#define HB_OPEN_FILE_HH
+
+#include "hb-open-type.hh"
+#include "hb-ot-head-table.hh"
+
+
+namespace OT {
+
+
+
+
+struct OpenTypeFontFile;
+struct OpenTypeOffsetTable;
+struct TTCHeader;
+
+
+typedef struct TableRecord
+{
+  int cmp (Tag t) const { return -t.cmp (tag); }
+
+  HB_INTERNAL static int cmp (const void *pa, const void *pb)
+  {
+    const TableRecord *a = (const TableRecord *) pa;
+    const TableRecord *b = (const TableRecord *) pb;
+    return b->cmp (a->tag);
+  }
+
+  bool sanitize (hb_sanitize_context_t *c) const
+  {
+    TRACE_SANITIZE (this);
+    return_trace (c->check_struct (this));
+  }
+
+  Tag		tag;		
+  CheckSum	checkSum;	
+  Offset32	offset;		
+  HBUINT32	length;		
+  public:
+  DEFINE_SIZE_STATIC (16);
+} OpenTypeTable;
+
+typedef struct OpenTypeOffsetTable
+{
+  friend struct OpenTypeFontFile;
+
+  unsigned int get_table_count () const { return tables.len; }
+  const TableRecord& get_table (unsigned int i) const
+  { return tables[i]; }
+  unsigned int get_table_tags (unsigned int  start_offset,
+			       unsigned int *table_count, 
+			       hb_tag_t     *table_tags ) const
+  {
+    if (table_count)
+    {
+      + tables.as_array ().sub_array (start_offset, table_count)
+      | hb_map (&TableRecord::tag)
+      | hb_sink (hb_array (table_tags, *table_count))
+      ;
+    }
+    return tables.len;
+  }
+  bool find_table_index (hb_tag_t tag, unsigned int *table_index) const
+  {
+    Tag t;
+    t = tag;
+    if (tables.len < 16)
+      return tables.lfind (t, table_index, HB_NOT_FOUND_STORE, Index::NOT_FOUND_INDEX);
+    else
+      return tables.bfind (t, table_index, HB_NOT_FOUND_STORE, Index::NOT_FOUND_INDEX);
+  }
+  const TableRecord& get_table_by_tag (hb_tag_t tag) const
+  {
+    unsigned int table_index;
+    find_table_index (tag, &table_index);
+    return get_table (table_index);
+  }
+
+  public:
+
+  template <typename Iterator,
+	    hb_requires ((hb_is_source_of<Iterator, hb_pair_t<hb_tag_t, hb_blob_t *>>::value))>
+  bool serialize (hb_serialize_context_t *c,
+		  hb_tag_t sfnt_tag,
+		  Iterator it)
+  {
+    TRACE_SERIALIZE (this);
+    if (unlikely (!c->extend_min (this))) return_trace (false);
+    sfnt_version = sfnt_tag;
+    unsigned num_items = hb_len (it);
+    if (unlikely (!tables.serialize (c, num_items))) return_trace (false);
+
+    const char *dir_end = (const char *) c->head;
+    HBUINT32 *checksum_adjustment = nullptr;
+
+    unsigned i = 0;
+    for (hb_pair_t<hb_tag_t, hb_blob_t*> entry : it)
+    {
+      hb_blob_t *blob = entry.second;
+      unsigned len = blob->length;
+
+      char *start = (char *) c->allocate_size<void> (len, false);
+      if (unlikely (!start)) return false;
+
+      TableRecord &rec = tables.arrayZ[i];
+      rec.tag = entry.first;
+      rec.length = len;
+      rec.offset = 0;
+      if (unlikely (!c->check_assign (rec.offset,
+				      (unsigned) ((char *) start - (char *) this),
+				      HB_SERIALIZE_ERROR_OFFSET_OVERFLOW)))
+        return_trace (false);
+
+      if (likely (len))
+	hb_memcpy (start, blob->data, len);
+
+      c->align (4);
+      const char *end = (const char *) c->head;
+
+      if (entry.first == HB_OT_TAG_head &&
+	  (unsigned) (end - start) >= head::static_size)
+      {
+	head *h = (head *) start;
+	checksum_adjustment = &h->checkSumAdjustment;
+	*checksum_adjustment = 0;
+      }
+
+      rec.checkSum.set_for_data (start, end - start);
+      i++;
+    }
+
+    tables.qsort ();
+
+    if (checksum_adjustment)
+    {
+      CheckSum checksum;
+
+      checksum.set_for_data (this, dir_end - (const char *) this);
+      for (unsigned int i = 0; i < num_items; i++)
+      {
+	TableRecord &rec = tables.arrayZ[i];
+	checksum = checksum + rec.checkSum;
+      }
+
+      *checksum_adjustment = 0xB1B0AFBAu - checksum;
+    }
+
+    return_trace (true);
+  }
+
+  bool sanitize (hb_sanitize_context_t *c) const
+  {
+    TRACE_SANITIZE (this);
+    return_trace (c->check_struct (this) && tables.sanitize (c));
+  }
+
+  protected:
+  Tag		sfnt_version;	
+  BinSearchArrayOf<TableRecord>
+		tables;
+  public:
+  DEFINE_SIZE_ARRAY (12, tables);
+} OpenTypeFontFace;
+
+
+
+struct TTCHeaderVersion1
+{
+  friend struct TTCHeader;
+
+  unsigned int get_face_count () const { return table.len; }
+  const OpenTypeFontFace& get_face (unsigned int i) const { return this+table[i]; }
+
+  bool sanitize (hb_sanitize_context_t *c) const
+  {
+    TRACE_SANITIZE (this);
+    return_trace (table.sanitize (c, this));
+  }
+
+  protected:
+  Tag		ttcTag;		
+  FixedVersion<>version;	
+  Array32Of<Offset32To<OpenTypeOffsetTable>>
+		table;		
+  public:
+  DEFINE_SIZE_ARRAY (12, table);
+};
+
+struct TTCHeader
+{
+  friend struct OpenTypeFontFile;
+
+  private:
+
+  unsigned int get_face_count () const
+  {
+    switch (u.header.version.major) {
+    case 2: 
+    case 1: hb_barrier (); return u.version1.get_face_count ();
+    default:return 0;
+    }
+  }
+  const OpenTypeFontFace& get_face (unsigned int i) const
+  {
+    switch (u.header.version.major) {
+    case 2: 
+    case 1: hb_barrier (); return u.version1.get_face (i);
+    default:return Null (OpenTypeFontFace);
+    }
+  }
+
+  bool sanitize (hb_sanitize_context_t *c) const
+  {
+    TRACE_SANITIZE (this);
+    if (unlikely (!u.header.version.sanitize (c))) return_trace (false);
+    hb_barrier ();
+    switch (u.header.version.major) {
+    case 2: 
+    case 1: hb_barrier (); return_trace (u.version1.sanitize (c));
+    default:return_trace (true);
+    }
+  }
+
+  protected:
+  union {
+  struct {
+  Tag		ttcTag;		
+  FixedVersion<>version;	
+  }			header;
+  TTCHeaderVersion1	version1;
+  } u;
+};
+
+
+struct ResourceRecord
+{
+  const OpenTypeFontFace & get_face (const void *data_base) const
+  { return * reinterpret_cast<const OpenTypeFontFace *> ((data_base+offset).arrayZ); }
+
+  bool sanitize (hb_sanitize_context_t *c,
+		 const void *data_base) const
+  {
+    TRACE_SANITIZE (this);
+    return_trace (c->check_struct (this) &&
+		  offset.sanitize (c, data_base) &&
+		  hb_barrier () &&
+		  get_face (data_base).sanitize (c));
+  }
+
+  protected:
+  HBUINT16	id;		
+  HBINT16	nameOffset;	
+  HBUINT8	attrs;		
+  NNOffset24To<Array32Of<HBUINT8>>
+		offset;		
+  HBUINT32	reserved;	
+  public:
+  DEFINE_SIZE_STATIC (12);
+};
+
+#define HB_TAG_sfnt HB_TAG ('s','f','n','t')
+
+struct ResourceTypeRecord
+{
+  unsigned int get_resource_count () const
+  { return tag == HB_TAG_sfnt ? resCountM1 + 1 : 0; }
+
+  bool is_sfnt () const { return tag == HB_TAG_sfnt; }
+
+  const ResourceRecord& get_resource_record (unsigned int i,
+					     const void *type_base) const
+  { return (type_base+resourcesZ).as_array (get_resource_count ())[i]; }
+
+  bool sanitize (hb_sanitize_context_t *c,
+		 const void *type_base,
+		 const void *data_base) const
+  {
+    TRACE_SANITIZE (this);
+    return_trace (c->check_struct (this) &&
+		  hb_barrier () &&
+		  resourcesZ.sanitize (c, type_base,
+				       get_resource_count (),
+				       data_base));
+  }
+
+  protected:
+  Tag		tag;		
+  HBUINT16	resCountM1;	
+  NNOffset16To<UnsizedArrayOf<ResourceRecord>>
+		resourcesZ;	
+  public:
+  DEFINE_SIZE_STATIC (8);
+};
+
+struct ResourceMap
+{
+  unsigned int get_face_count () const
+  {
+    unsigned int count = get_type_count ();
+    for (unsigned int i = 0; i < count; i++)
+    {
+      const ResourceTypeRecord& type = get_type_record (i);
+      if (type.is_sfnt ())
+	return type.get_resource_count ();
+    }
+    return 0;
+  }
+
+  const OpenTypeFontFace& get_face (unsigned int idx,
+				    const void *data_base) const
+  {
+    unsigned int count = get_type_count ();
+    for (unsigned int i = 0; i < count; i++)
+    {
+      const ResourceTypeRecord& type = get_type_record (i);
+      if (type.is_sfnt () && idx < type.get_resource_count ())
+	return type.get_resource_record (idx, &(this+typeList)).get_face (data_base);
+    }
+    return Null (OpenTypeFontFace);
+  }
+
+  bool sanitize (hb_sanitize_context_t *c, const void *data_base) const
+  {
+    TRACE_SANITIZE (this);
+    return_trace (c->check_struct (this) &&
+		  hb_barrier () &&
+		  typeList.sanitize (c, this,
+				     &(this+typeList),
+				     data_base));
+  }
+
+  private:
+  unsigned int get_type_count () const { return (this+typeList).lenM1 + 1; }
+
+  const ResourceTypeRecord& get_type_record (unsigned int i) const
+  { return (this+typeList)[i]; }
+
+  protected:
+  HBUINT8	reserved0[16];	
+  HBUINT32	reserved1;	
+  HBUINT16	resreved2;	
+  HBUINT16	attrs;		
+  NNOffset16To<ArrayOfM1<ResourceTypeRecord>>
+		typeList;	
+  Offset16	nameList;	
+  public:
+  DEFINE_SIZE_STATIC (28);
+};
+
+struct ResourceForkHeader
+{
+  unsigned int get_face_count () const
+  { return (this+map).get_face_count (); }
+
+  const OpenTypeFontFace& get_face (unsigned int idx,
+				    unsigned int *base_offset = nullptr) const
+  {
+    const OpenTypeFontFace &face = (this+map).get_face (idx, &(this+data));
+    if (base_offset)
+      *base_offset = (const char *) &face - (const char *) this;
+    return face;
+  }
+
+  bool sanitize (hb_sanitize_context_t *c) const
+  {
+    TRACE_SANITIZE (this);
+    return_trace (c->check_struct (this) &&
+		  hb_barrier () &&
+		  data.sanitize (c, this, dataLen) &&
+		  map.sanitize (c, this, &(this+data)));
+  }
+
+  protected:
+  NNOffset32To<UnsizedArrayOf<HBUINT8>>
+		data;		
+  NNOffset32To<ResourceMap >
+		map;		
+  HBUINT32	dataLen;	
+  HBUINT32	mapLen;		
+  public:
+  DEFINE_SIZE_STATIC (16);
+};
+
+
+struct OpenTypeFontFile
+{
+  enum {
+    CFFTag		= HB_TAG ('O','T','T','O'), 
+    TrueTypeTag		= HB_TAG ( 0 , 1 , 0 , 0 ), 
+    TTCTag		= HB_TAG ('t','t','c','f'), 
+    DFontTag		= HB_TAG ( 0 , 0 , 1 , 0 ), 
+    TrueTag		= HB_TAG ('t','r','u','e'), 
+    Typ1Tag		= HB_TAG ('t','y','p','1')  
+  };
+
+  hb_tag_t get_tag () const { return u.tag.v; }
+
+  unsigned int get_face_count () const
+  {
+    switch (u.tag.v) {
+    case CFFTag:	
+    case TrueTag:
+    case Typ1Tag:
+    case TrueTypeTag:	return 1;
+    case TTCTag:	return u.ttcHeader.get_face_count ();
+    case DFontTag:	return u.rfHeader.get_face_count ();
+    default:		return 0;
+    }
+  }
+  const OpenTypeFontFace& get_face (unsigned int i, unsigned int *base_offset = nullptr) const
+  {
+    if (base_offset)
+      *base_offset = 0;
+    switch (u.tag.v) {
+    case CFFTag:	
+    case TrueTag:
+    case Typ1Tag:
+    case TrueTypeTag:	return u.fontFace;
+    case TTCTag:	return u.ttcHeader.get_face (i);
+    case DFontTag:	return u.rfHeader.get_face (i, base_offset);
+    default:		return Null (OpenTypeFontFace);
+    }
+  }
+
+  template <typename Iterator,
+	    hb_requires ((hb_is_source_of<Iterator, hb_pair_t<hb_tag_t, hb_blob_t *>>::value))>
+  bool serialize_single (hb_serialize_context_t *c,
+			 hb_tag_t sfnt_tag,
+			 Iterator items)
+  {
+    TRACE_SERIALIZE (this);
+    assert (sfnt_tag != TTCTag);
+    if (unlikely (!c->extend_min (this))) return_trace (false);
+    return_trace (u.fontFace.serialize (c, sfnt_tag, items));
+  }
+
+  bool sanitize (hb_sanitize_context_t *c) const
+  {
+    TRACE_SANITIZE (this);
+    if (unlikely (!u.tag.v.sanitize (c))) return_trace (false);
+    hb_barrier ();
+    switch (u.tag.v) {
+    case CFFTag:	
+    case TrueTag:
+    case Typ1Tag:
+    case TrueTypeTag:	return_trace (u.fontFace.sanitize (c));
+    case TTCTag:	return_trace (u.ttcHeader.sanitize (c));
+    case DFontTag:	return_trace (u.rfHeader.sanitize (c));
+    default:		return_trace (true);
+    }
+  }
+
+  protected:
+  union {
+  struct { Tag v; }	tag;		
+  OpenTypeFontFace	fontFace;
+  TTCHeader		ttcHeader;
+  ResourceForkHeader	rfHeader;
+  } u;
+  public:
+  DEFINE_SIZE_UNION (4, tag.v);
+};
+
+
+} 
+
+
+#endif /* HB_OPEN_FILE_HH */

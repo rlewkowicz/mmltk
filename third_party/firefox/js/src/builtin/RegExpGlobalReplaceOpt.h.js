@@ -1,0 +1,163 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+function FUNC_NAME(
+  rx,
+  S,
+  lengthS,
+  replaceValue,
+  flags,
+#ifdef SUBSTITUTION
+  firstDollarIndex,
+#endif
+#ifdef ELEMBASE
+  elemBase
+#endif
+) {
+  var fullUnicode = !!(flags & REGEXP_ANY_UNICODE_MASK);
+
+  var lastIndex = 0;
+  rx.lastIndex = 0;
+
+#if defined(FUNCTIONAL) || defined(ELEMBASE)
+  var originalSource = UnsafeGetStringFromReservedSlot(rx, REGEXP_SOURCE_SLOT);
+  var originalFlags = flags;
+#endif
+
+#if defined(FUNCTIONAL)
+  var hasCaptureGroups = RegExpHasCaptureGroups(rx, S);
+#endif
+
+  var accumulatedResult = "";
+
+  var nextSourcePosition = 0;
+
+  while (true) {
+    var replacement;
+    var matchLength;
+#if defined(FUNCTIONAL)
+    if (!hasCaptureGroups) {
+      var position = RegExpSearcher(rx, S, lastIndex);
+
+      if (position === -1) {
+        break;
+      }
+
+      lastIndex = RegExpSearcherLastLimit(S);
+      var matched = Substring(S, position, lastIndex - position);
+      matchLength = matched.length;
+
+      replacement = ToString(
+        callContentFunction(
+          replaceValue,
+          undefined,
+          matched,
+          position,
+          S
+        )
+      );
+    } else
+#endif
+    {
+      var result = RegExpMatcher(rx, S, lastIndex);
+
+      if (result === null) {
+        break;
+      }
+
+      assert(result.length >= 1, "RegExpMatcher doesn't return an empty array");
+
+      var matched = result[0];
+
+      matchLength = matched.length | 0;
+
+      var position = result.index | 0;
+      lastIndex = position + matchLength;
+
+#if defined(FUNCTIONAL)
+      replacement = RegExpGetFunctionalReplacement(
+        result,
+        S,
+        position,
+        replaceValue
+      );
+#elif defined(SUBSTITUTION)
+      var namedCaptures = result.groups;
+      if (namedCaptures !== undefined) {
+        namedCaptures = ToObject(namedCaptures);
+      }
+      replacement = RegExpGetSubstitution(
+        result,
+        S,
+        position,
+        replaceValue,
+        firstDollarIndex,
+        namedCaptures
+      );
+#elif defined(ELEMBASE)
+      if (IsObject(elemBase)) {
+        var prop = GetStringDataProperty(elemBase, matched);
+        if (prop !== undefined) {
+          assert(
+            typeof prop === "string",
+            "GetStringDataProperty should return either string or undefined"
+          );
+          replacement = prop;
+        } else {
+          elemBase = undefined;
+        }
+      }
+
+      if (!IsObject(elemBase)) {
+        replacement = RegExpGetFunctionalReplacement(
+          result,
+          S,
+          position,
+          replaceValue
+        );
+      }
+#else
+#error "Unexpected case"
+#endif
+    }
+
+    accumulatedResult +=
+      Substring(S, nextSourcePosition, position - nextSourcePosition) +
+      replacement;
+
+    nextSourcePosition = lastIndex;
+
+    if (matchLength === 0) {
+      lastIndex = fullUnicode
+        ? AdvanceStringIndex(S, lastIndex)
+        : lastIndex + 1;
+      if (lastIndex > lengthS) {
+        break;
+      }
+      lastIndex |= 0;
+    }
+
+#if defined(FUNCTIONAL) || defined(ELEMBASE)
+    if (
+      UnsafeGetStringFromReservedSlot(rx, REGEXP_SOURCE_SLOT) !==
+        originalSource ||
+      UnsafeGetInt32FromReservedSlot(rx, REGEXP_FLAGS_SLOT) !== originalFlags
+    ) {
+      var legacy = !!(originalFlags & REGEXP_LEGACY_FEATURES_ENABLED_FLAG);
+      var newFlags = originalFlags & ~REGEXP_LEGACY_FEATURES_ENABLED_FLAG;
+      rx = RegExpConstructRaw(originalSource, newFlags, legacy);
+    }
+#endif
+  }
+
+  if (nextSourcePosition >= lengthS) {
+    return accumulatedResult;
+  }
+
+  return (
+    accumulatedResult +
+    Substring(S, nextSourcePosition, lengthS - nextSourcePosition)
+  );
+}

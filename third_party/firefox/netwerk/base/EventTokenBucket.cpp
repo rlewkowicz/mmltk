@@ -1,0 +1,295 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "EventTokenBucket.h"
+
+#include "nsICancelable.h"
+#include "nsIIOService.h"
+#include "nsNetCID.h"
+#include "nsNetUtil.h"
+#include "nsServiceManagerUtils.h"
+#include "nsSocketTransportService2.h"
+
+#include "mozilla/Components.h"
+
+#if defined(DEBUG)
+#  include "MainThreadUtils.h"
+#endif
+
+
+namespace mozilla {
+namespace net {
+
+
+class TokenBucketCancelable : public nsICancelable {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSICANCELABLE
+
+  explicit TokenBucketCancelable(class ATokenBucketEvent* event);
+  void Fire();
+
+ private:
+  virtual ~TokenBucketCancelable() = default;
+
+  friend class EventTokenBucket;
+  ATokenBucketEvent* mEvent;
+};
+
+NS_IMPL_ISUPPORTS(TokenBucketCancelable, nsICancelable)
+
+TokenBucketCancelable::TokenBucketCancelable(ATokenBucketEvent* event)
+    : mEvent(event) {}
+
+NS_IMETHODIMP
+TokenBucketCancelable::Cancel(nsresult reason) {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+  mEvent = nullptr;
+  return NS_OK;
+}
+
+void TokenBucketCancelable::Fire() {
+  if (!mEvent) return;
+
+  ATokenBucketEvent* event = mEvent;
+  mEvent = nullptr;
+  event->OnTokenBucketAdmitted();
+}
+
+
+NS_IMPL_ISUPPORTS(EventTokenBucket, nsITimerCallback, nsINamed)
+
+EventTokenBucket::EventTokenBucket(uint32_t eventsPerSecond, uint32_t burstSize)
+    : mUnitCost(kUsecPerSec),
+      mMaxCredit(kUsecPerSec),
+      mCredit(kUsecPerSec),
+      mPaused(false),
+      mStopped(false),
+      mTimerArmed(false)
+{
+  mLastUpdate = TimeStamp::Now();
+
+  MOZ_ASSERT(NS_IsMainThread());
+
+  nsresult rv;
+  nsCOMPtr<nsIEventTarget> sts;
+  nsCOMPtr<nsIIOService> ioService = do_GetIOService(&rv);
+  if (NS_SUCCEEDED(rv)) {
+    sts = mozilla::components::SocketTransport::Service(&rv);
+  }
+  if (NS_SUCCEEDED(rv)) mTimer = NS_NewTimer(sts);
+  SetRate(eventsPerSecond, burstSize);
+}
+
+EventTokenBucket::~EventTokenBucket() {
+  SOCKET_LOG(
+      ("EventTokenBucket::dtor %p events=%zu\n", this, mEvents.GetSize()));
+
+  CleanupTimers();
+
+  while (mEvents.GetSize()) {
+    RefPtr<TokenBucketCancelable> cancelable = mEvents.PopFront();
+    cancelable->Fire();
+  }
+}
+
+void EventTokenBucket::CleanupTimers() {
+  if (mTimer && mTimerArmed) {
+    mTimer->Cancel();
+  }
+  mTimer = nullptr;
+  mTimerArmed = false;
+
+}
+
+void EventTokenBucket::SetRate(uint32_t eventsPerSecond, uint32_t burstSize) {
+  SOCKET_LOG(("EventTokenBucket::SetRate %p %u %u\n", this, eventsPerSecond,
+              burstSize));
+
+  if (eventsPerSecond > kMaxHz) {
+    eventsPerSecond = kMaxHz;
+    SOCKET_LOG(("  eventsPerSecond out of range\n"));
+  }
+
+  if (!eventsPerSecond) {
+    eventsPerSecond = 1;
+    SOCKET_LOG(("  eventsPerSecond out of range\n"));
+  }
+
+  mUnitCost = kUsecPerSec / eventsPerSecond;
+  mMaxCredit = mUnitCost * burstSize;
+  if (mMaxCredit > kUsecPerSec * 60 * 15) {
+    SOCKET_LOG(("  burstSize out of range\n"));
+    mMaxCredit = kUsecPerSec * 60 * 15;
+  }
+  mCredit = mMaxCredit;
+  mLastUpdate = TimeStamp::Now();
+}
+
+void EventTokenBucket::ClearCredits() {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+  SOCKET_LOG(("EventTokenBucket::ClearCredits %p\n", this));
+  mCredit = 0;
+}
+
+uint32_t EventTokenBucket::BurstEventsAvailable() {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+  return static_cast<uint32_t>(mCredit / mUnitCost);
+}
+
+uint32_t EventTokenBucket::QueuedEvents() {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+  return mEvents.GetSize();
+}
+
+void EventTokenBucket::Pause() {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+  SOCKET_LOG(("EventTokenBucket::Pause %p\n", this));
+  if (mPaused || mStopped) return;
+
+  mPaused = true;
+  if (mTimerArmed) {
+    mTimer->Cancel();
+    mTimerArmed = false;
+  }
+}
+
+void EventTokenBucket::UnPause() {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+  SOCKET_LOG(("EventTokenBucket::UnPause %p\n", this));
+  if (!mPaused || mStopped) return;
+
+  mPaused = false;
+  DispatchEvents();
+  UpdateTimer();
+}
+
+void EventTokenBucket::Stop() {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+  SOCKET_LOG(("EventTokenBucket::Stop %p armed=%d\n", this, mTimerArmed));
+  mStopped = true;
+  CleanupTimers();
+
+  while (mEvents.GetSize()) {
+    RefPtr<TokenBucketCancelable> cancelable = mEvents.PopFront();
+    cancelable->Fire();
+  }
+}
+
+nsresult EventTokenBucket::SubmitEvent(ATokenBucketEvent* event,
+                                       nsICancelable** cancelable) {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+  SOCKET_LOG(("EventTokenBucket::SubmitEvent %p\n", this));
+
+  if (mStopped || !mTimer) return NS_ERROR_FAILURE;
+
+  UpdateCredits();
+
+  RefPtr<TokenBucketCancelable> cancelEvent = new TokenBucketCancelable(event);
+
+  *cancelable = do_AddRef(cancelEvent).take();
+
+  if (mPaused || !TryImmediateDispatch(cancelEvent.get())) {
+    SOCKET_LOG(("   queued\n"));
+    mEvents.Push(cancelEvent.forget());
+    UpdateTimer();
+  } else {
+    SOCKET_LOG(("   dispatched synchronously\n"));
+  }
+
+  return NS_OK;
+}
+
+bool EventTokenBucket::TryImmediateDispatch(TokenBucketCancelable* cancelable) {
+  if (mCredit < mUnitCost) return false;
+
+  mCredit -= mUnitCost;
+  cancelable->Fire();
+  return true;
+}
+
+void EventTokenBucket::DispatchEvents() {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+  SOCKET_LOG(("EventTokenBucket::DispatchEvents %p %d\n", this, mPaused));
+  if (mPaused || mStopped) return;
+
+  while (mEvents.GetSize() && mUnitCost <= mCredit) {
+    RefPtr<TokenBucketCancelable> cancelable = mEvents.PopFront();
+    if (cancelable->mEvent) {
+      SOCKET_LOG(
+          ("EventTokenBucket::DispachEvents [%p] "
+           "Dispatching queue token bucket event cost=%" PRIu64
+           " credit=%" PRIu64 "\n",
+           this, mUnitCost, mCredit));
+      mCredit -= mUnitCost;
+      cancelable->Fire();
+    }
+  }
+
+}
+
+void EventTokenBucket::UpdateTimer() {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+  if (mTimerArmed || mPaused || mStopped || !mEvents.GetSize() || !mTimer) {
+    return;
+  }
+
+  if (mCredit >= mUnitCost) return;
+
+  uint64_t deficit = mUnitCost - mCredit;
+  uint64_t msecWait = (deficit + (kUsecPerMsec - 1)) / kUsecPerMsec;
+
+  if (msecWait < 4) {  
+    msecWait = 4;
+  } else if (msecWait > 60000) {  
+    msecWait = 60000;
+  }
+
+
+  SOCKET_LOG(
+      ("EventTokenBucket::UpdateTimer %p for %" PRIu64 "ms\n", this, msecWait));
+  nsresult rv = mTimer->InitWithCallback(this, static_cast<uint32_t>(msecWait),
+                                         nsITimer::TYPE_ONE_SHOT);
+  mTimerArmed = NS_SUCCEEDED(rv);
+}
+
+NS_IMETHODIMP
+EventTokenBucket::Notify(nsITimer* timer) {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+
+
+  SOCKET_LOG(("EventTokenBucket::Notify() %p\n", this));
+  mTimerArmed = false;
+  if (mStopped) return NS_OK;
+
+  UpdateCredits();
+  DispatchEvents();
+  UpdateTimer();
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+EventTokenBucket::GetName(nsACString& aName) {
+  aName.AssignLiteral("EventTokenBucket");
+  return NS_OK;
+}
+
+void EventTokenBucket::UpdateCredits() {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+
+  TimeStamp now = TimeStamp::Now();
+  TimeDuration elapsed = now - mLastUpdate;
+  mLastUpdate = now;
+
+  mCredit += static_cast<uint64_t>(elapsed.ToMicroseconds());
+  if (mCredit > mMaxCredit) mCredit = mMaxCredit;
+  SOCKET_LOG(("EventTokenBucket::UpdateCredits %p to %" PRIu64 " (%" PRIu64
+              " each.. %3.2f)\n",
+              this, mCredit, mUnitCost, (double)mCredit / mUnitCost));
+}
+
+
+}  
+}  

@@ -1,0 +1,10 @@
+//! Pre-computed tables for parsing float strings.
+
+#![doc(hidden)]
+
+#[cfg(feature = "compact")]
+pub use crate::table_bellerophon::*;
+#[cfg(not(feature = "compact"))]
+pub use crate::table_lemire::*;
+#[cfg(not(feature = "compact"))]
+pub use crate::table_small::*;

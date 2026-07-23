@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_InputAPZContext_h
+#define mozilla_layers_InputAPZContext_h
+
+#include "mozilla/EventForwards.h"
+#include "mozilla/layers/ScrollableLayerGuid.h"
+
+namespace mozilla {
+namespace layers {
+
+class MOZ_STACK_CLASS InputAPZContext {
+ private:
+  static ScrollableLayerGuid sGuid;
+  static uint64_t sBlockId;
+  static nsEventStatus sApzResponse;
+  static bool sPendingLayerization;
+
+  static bool sRoutedToChildProcess;
+  static bool sDropped;
+
+ public:
+  static ScrollableLayerGuid GetTargetLayerGuid();
+  static uint64_t GetInputBlockId();
+  static nsEventStatus GetApzResponse();
+  static bool HavePendingLayerization();
+
+  static bool WasRoutedToChildProcess();
+
+  static bool WasDropped();
+
+  InputAPZContext(const ScrollableLayerGuid& aGuid, const uint64_t& aBlockId,
+                  const nsEventStatus& aApzResponse,
+                  bool aPendingLayerization = false);
+  ~InputAPZContext();
+
+  static void SetRoutedToChildProcess();
+  static void SetDropped();
+
+ private:
+  ScrollableLayerGuid mOldGuid;
+  uint64_t mOldBlockId;
+  nsEventStatus mOldApzResponse;
+  bool mOldPendingLayerization;
+
+  bool mOldRoutedToChildProcess;
+  bool mOldDropped;
+};
+
+}  
+}  
+
+#endif /* mozilla_layers_InputAPZContext_h */

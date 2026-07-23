@@ -1,0 +1,132 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "AudioBlock.h"
+
+#include "AlignmentUtils.h"
+
+namespace mozilla {
+
+class AudioBlockBuffer final : public ThreadSharedObject {
+ public:
+  virtual AudioBlockBuffer* AsAudioBlockBuffer() override { return this; };
+
+  uint32_t ChannelsAllocated() const { return mChannelsAllocated; }
+  float* ChannelData(uint32_t aChannel) const {
+    float* base =
+        reinterpret_cast<float*>(((uintptr_t)(this + 1) + 15) & ~0x0F);
+    ASSERT_ALIGNED16(base);
+    return base + aChannel * WEBAUDIO_BLOCK_SIZE;
+  }
+
+  static already_AddRefed<AudioBlockBuffer> Create(uint32_t aChannelCount) {
+    CheckedInt<size_t> size = WEBAUDIO_BLOCK_SIZE;
+    size *= aChannelCount;
+    size *= sizeof(float);
+    size += sizeof(AudioBlockBuffer);
+    size += 15;  
+    if (!size.isValid()) {
+      MOZ_CRASH();
+    }
+
+    void* m = operator new(size.value());
+    RefPtr<AudioBlockBuffer> p = new (m) AudioBlockBuffer(aChannelCount);
+    NS_ASSERTION((reinterpret_cast<char*>(p.get() + 1) -
+                  reinterpret_cast<char*>(p.get())) %
+                         4 ==
+                     0,
+                 "AudioBlockBuffers should be at least 4-byte aligned");
+    return p.forget();
+  }
+
+  void DownstreamRefAdded() { ++mDownstreamRefCount; }
+  void DownstreamRefRemoved() {
+    MOZ_ASSERT(mDownstreamRefCount > 0);
+    --mDownstreamRefCount;
+  }
+  bool HasLastingShares() const {
+    nsrefcnt count = mRefCnt;
+    MOZ_ASSERT(mDownstreamRefCount < count);
+    return count != mDownstreamRefCount + 1;
+  }
+
+  virtual size_t SizeOfIncludingThis(
+      MallocSizeOf aMallocSizeOf) const override {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+ private:
+  explicit AudioBlockBuffer(uint32_t aChannelsAllocated)
+      : mChannelsAllocated(aChannelsAllocated) {}
+  ~AudioBlockBuffer() override { MOZ_ASSERT(mDownstreamRefCount == 0); }
+
+  nsAutoRefCnt mDownstreamRefCount;
+  const uint32_t mChannelsAllocated;
+};
+
+AudioBlock::~AudioBlock() { ClearDownstreamMark(); }
+
+void AudioBlock::SetBuffer(ThreadSharedObject* aNewBuffer) {
+  if (aNewBuffer == mBuffer) {
+    return;
+  }
+
+  ClearDownstreamMark();
+
+  mBuffer = aNewBuffer;
+
+  if (!aNewBuffer) {
+    return;
+  }
+
+  AudioBlockBuffer* buffer = aNewBuffer->AsAudioBlockBuffer();
+  if (buffer) {
+    buffer->DownstreamRefAdded();
+    mBufferIsDownstreamRef = true;
+  }
+}
+
+void AudioBlock::ClearDownstreamMark() {
+  if (mBufferIsDownstreamRef) {
+    mBuffer->AsAudioBlockBuffer()->DownstreamRefRemoved();
+    mBufferIsDownstreamRef = false;
+  }
+}
+
+bool AudioBlock::CanWrite() {
+  return !mBufferIsDownstreamRef &&
+         !mBuffer->AsAudioBlockBuffer()->HasLastingShares();
+}
+
+void AudioBlock::AllocateChannels(uint32_t aChannelCount) {
+  MOZ_ASSERT(mDuration == WEBAUDIO_BLOCK_SIZE);
+
+  if (mBufferIsDownstreamRef) {
+    ClearDownstreamMark();
+  } else if (mBuffer) {
+    AudioBlockBuffer* buffer = mBuffer->AsAudioBlockBuffer();
+    if (buffer && !buffer->HasLastingShares() &&
+        buffer->ChannelsAllocated() >= aChannelCount) {
+      MOZ_ASSERT(mBufferFormat == AUDIO_FORMAT_FLOAT32);
+      uint32_t previousChannelCount = ChannelCount();
+      mChannelData.SetLength(aChannelCount);
+      for (uint32_t i = previousChannelCount; i < aChannelCount; ++i) {
+        mChannelData[i] = buffer->ChannelData(i);
+      }
+      mVolume = 1.0f;
+      return;
+    }
+  }
+
+  RefPtr<AudioBlockBuffer> buffer = AudioBlockBuffer::Create(aChannelCount);
+  mChannelData.SetLength(aChannelCount);
+  for (uint32_t i = 0; i < aChannelCount; ++i) {
+    mChannelData[i] = buffer->ChannelData(i);
+  }
+  mBuffer = std::move(buffer);
+  mVolume = 1.0f;
+  mBufferFormat = AUDIO_FORMAT_FLOAT32;
+}
+
+}  

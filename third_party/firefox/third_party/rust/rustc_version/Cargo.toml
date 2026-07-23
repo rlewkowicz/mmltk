@@ -1,0 +1,13 @@
+
+[package]
+edition = "2018"
+name = "rustc_version"
+version = "0.4.0"
+authors = ["Dirkjan Ochtman <dirkjan@ochtman.nl>", "Marvin Löbel <loebel.marvin@gmail.com>"]
+description = "A library for querying the version of a installed rustc compiler"
+documentation = "https://docs.rs/rustc_version/"
+keywords = ["version", "rustc"]
+license = "MIT/Apache-2.0"
+repository = "https://github.com/Kimundi/rustc-version-rs"
+[dependencies.semver]
+version = "1.0"

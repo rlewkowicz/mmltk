@@ -1,0 +1,910 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+* Copyright (c) 2003-2013, International Business Machines
+* Corporation and others.  All Rights Reserved.
+**********************************************************************
+* Author: Alan Liu
+* Created: July 21 2003
+* Since: ICU 2.8
+**********************************************************************
+*/
+
+#include "utypeinfo.h"  // for 'typeid' to work
+
+#include "olsontz.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/ures.h"
+#include "unicode/simpletz.h"
+#include "unicode/gregocal.h"
+#include "gregoimp.h"
+#include "cmemory.h"
+#include "uassert.h"
+#include "uvector.h"
+#include <float.h> // DBL_MAX
+#include "uresimp.h"
+#include "zonemeta.h"
+#include "umutex.h"
+
+#ifdef U_DEBUG_TZ
+# include <stdio.h>
+# include "uresimp.h" // for debugging
+
+static void debug_tz_loc(const char *f, int32_t l)
+{
+  fprintf(stderr, "%s:%d: ", f, l);
+}
+
+static void debug_tz_msg(const char *pat, ...)
+{
+  va_list ap;
+  va_start(ap, pat);
+  vfprintf(stderr, pat, ap);
+  fflush(stderr);
+}
+#define U_DEBUG_TZ_MSG(x) {debug_tz_loc(__FILE__,__LINE__);debug_tz_msg x;}
+#else
+#define U_DEBUG_TZ_MSG(x)
+#endif
+
+static UBool arrayEqual(const void *a1, const void *a2, int32_t size) {
+    if (a1 == nullptr && a2 == nullptr) {
+        return true;
+    }
+    if ((a1 != nullptr && a2 == nullptr) || (a1 == nullptr && a2 != nullptr)) {
+        return false;
+    }
+    if (a1 == a2) {
+        return true;
+    }
+
+    return (uprv_memcmp(a1, a2, size) == 0);
+}
+
+U_NAMESPACE_BEGIN
+
+#define kTRANS          "trans"
+#define kTRANSPRE32     "transPre32"
+#define kTRANSPOST32    "transPost32"
+#define kTYPEOFFSETS    "typeOffsets"
+#define kTYPEMAP        "typeMap"
+#define kLINKS          "links"
+#define kFINALRULE      "finalRule"
+#define kFINALRAW       "finalRaw"
+#define kFINALYEAR      "finalYear"
+
+#define SECONDS_PER_DAY (24*60*60)
+
+static const int32_t ZEROS[] = {0,0};
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(OlsonTimeZone)
+
+
+void OlsonTimeZone::constructEmpty() {
+    canonicalID = nullptr;
+
+    transitionCountPre32 = transitionCount32 = transitionCountPost32 = 0;
+    transitionTimesPre32 = transitionTimes32 = transitionTimesPost32 = nullptr;
+
+    typeMapData = nullptr;
+
+    typeCount = 1;
+    typeOffsets = ZEROS;
+
+    finalZone = nullptr;
+}
+
+OlsonTimeZone::OlsonTimeZone(const UResourceBundle* top,
+                             const UResourceBundle* res,
+                             const UnicodeString& tzid,
+                             UErrorCode& ec) :
+  BasicTimeZone(tzid), finalZone(nullptr)
+{
+    clearTransitionRules();
+    U_DEBUG_TZ_MSG(("OlsonTimeZone(%s)\n", ures_getKey((UResourceBundle*)res)));
+    if ((top == nullptr || res == nullptr) && U_SUCCESS(ec)) {
+        ec = U_ILLEGAL_ARGUMENT_ERROR;
+    }
+    if (U_SUCCESS(ec)) {
+
+        int32_t len;
+        StackUResourceBundle r;
+
+        ures_getByKey(res, kTRANSPRE32, r.getAlias(), &ec);
+        transitionTimesPre32 = ures_getIntVector(r.getAlias(), &len, &ec);
+        transitionCountPre32 = static_cast<int16_t>(len >> 1);
+        if (ec == U_MISSING_RESOURCE_ERROR) {
+            transitionTimesPre32 = nullptr;
+            transitionCountPre32 = 0;
+            ec = U_ZERO_ERROR;
+        } else if (U_SUCCESS(ec) && (len < 0 || len > 0x7FFF || (len & 1) != 0) ) {
+            ec = U_INVALID_FORMAT_ERROR;
+        }
+
+        ures_getByKey(res, kTRANS, r.getAlias(), &ec);
+        transitionTimes32 = ures_getIntVector(r.getAlias(), &len, &ec);
+        transitionCount32 = static_cast<int16_t>(len);
+        if (ec == U_MISSING_RESOURCE_ERROR) {
+            transitionTimes32 = nullptr;
+            transitionCount32 = 0;
+            ec = U_ZERO_ERROR;
+        } else if (U_SUCCESS(ec) && (len < 0 || len > 0x7FFF)) {
+            ec = U_INVALID_FORMAT_ERROR;
+        }
+
+        ures_getByKey(res, kTRANSPOST32, r.getAlias(), &ec);
+        transitionTimesPost32 = ures_getIntVector(r.getAlias(), &len, &ec);
+        transitionCountPost32 = static_cast<int16_t>(len >> 1);
+        if (ec == U_MISSING_RESOURCE_ERROR) {
+            transitionTimesPost32 = nullptr;
+            transitionCountPost32 = 0;
+            ec = U_ZERO_ERROR;
+        } else if (U_SUCCESS(ec) && (len < 0 || len > 0x7FFF || (len & 1) != 0) ) {
+            ec = U_INVALID_FORMAT_ERROR;
+        }
+
+        ures_getByKey(res, kTYPEOFFSETS, r.getAlias(), &ec);
+        typeOffsets = ures_getIntVector(r.getAlias(), &len, &ec);
+        if (U_SUCCESS(ec) && (len < 2 || len > 0x7FFE || (len & 1) != 0)) {
+            ec = U_INVALID_FORMAT_ERROR;
+        }
+        typeCount = static_cast<int16_t>(len) >> 1;
+
+        typeMapData =  nullptr;
+        if (transitionCount() > 0) {
+            ures_getByKey(res, kTYPEMAP, r.getAlias(), &ec);
+            typeMapData = ures_getBinary(r.getAlias(), &len, &ec);
+            if (ec == U_MISSING_RESOURCE_ERROR) {
+                ec = U_INVALID_FORMAT_ERROR;
+            } else if (U_SUCCESS(ec) && len != transitionCount()) {
+                ec = U_INVALID_FORMAT_ERROR;
+            }
+        }
+
+        if (U_SUCCESS(ec)) {
+            const char16_t *ruleIdUStr = ures_getStringByKey(res, kFINALRULE, &len, &ec);
+            ures_getByKey(res, kFINALRAW, r.getAlias(), &ec);
+            int32_t ruleRaw = ures_getInt(r.getAlias(), &ec);
+            ures_getByKey(res, kFINALYEAR, r.getAlias(), &ec);
+            int32_t ruleYear = ures_getInt(r.getAlias(), &ec);
+            if (U_SUCCESS(ec)) {
+                UnicodeString ruleID(true, ruleIdUStr, len);
+                UResourceBundle *rule = TimeZone::loadRule(top, ruleID, nullptr, ec);
+                const int32_t *ruleData = ures_getIntVector(rule, &len, &ec); 
+                if (U_SUCCESS(ec) && len == 11) {
+                    UnicodeString emptyStr;
+                    finalZone = new SimpleTimeZone(
+                        ruleRaw * U_MILLIS_PER_SECOND,
+                        emptyStr,
+                        static_cast<int8_t>(ruleData[0]), static_cast<int8_t>(ruleData[1]), static_cast<int8_t>(ruleData[2]),
+                        ruleData[3] * U_MILLIS_PER_SECOND,
+                        static_cast<SimpleTimeZone::TimeMode>(ruleData[4]),
+                        static_cast<int8_t>(ruleData[5]), static_cast<int8_t>(ruleData[6]), static_cast<int8_t>(ruleData[7]),
+                        ruleData[8] * U_MILLIS_PER_SECOND,
+                        static_cast<SimpleTimeZone::TimeMode>(ruleData[9]),
+                        ruleData[10] * U_MILLIS_PER_SECOND, ec);
+                    if (finalZone == nullptr) {
+                        ec = U_MEMORY_ALLOCATION_ERROR;
+                    } else {
+                        finalStartYear = ruleYear;
+
+
+
+
+
+                        finalStartMillis = Grego::fieldsToDay(finalStartYear, 0, 1) * U_MILLIS_PER_DAY;
+                    }
+                } else {
+                    ec = U_INVALID_FORMAT_ERROR;
+                }
+                ures_close(rule);
+            } else if (ec == U_MISSING_RESOURCE_ERROR) {
+                ec = U_ZERO_ERROR;
+            }
+        }
+
+        canonicalID = ZoneMeta::getCanonicalCLDRID(tzid, ec);
+    }
+
+    if (U_FAILURE(ec)) {
+        constructEmpty();
+    }
+}
+
+OlsonTimeZone::OlsonTimeZone(const OlsonTimeZone& other) :
+    BasicTimeZone(other), finalZone(nullptr) {
+    *this = other;
+}
+
+OlsonTimeZone& OlsonTimeZone::operator=(const OlsonTimeZone& other) {
+    if (this == &other) { return *this; }  
+    canonicalID = other.canonicalID;
+
+    transitionTimesPre32 = other.transitionTimesPre32;
+    transitionTimes32 = other.transitionTimes32;
+    transitionTimesPost32 = other.transitionTimesPost32;
+
+    transitionCountPre32 = other.transitionCountPre32;
+    transitionCount32 = other.transitionCount32;
+    transitionCountPost32 = other.transitionCountPost32;
+
+    typeCount = other.typeCount;
+    typeOffsets = other.typeOffsets;
+    typeMapData = other.typeMapData;
+
+    delete finalZone;
+    finalZone = other.finalZone != nullptr ? other.finalZone->clone() : nullptr;
+
+    finalStartYear = other.finalStartYear;
+    finalStartMillis = other.finalStartMillis;
+
+    clearTransitionRules();
+
+    return *this;
+}
+
+OlsonTimeZone::~OlsonTimeZone() {
+    deleteTransitionRules();
+    delete finalZone;
+}
+
+bool OlsonTimeZone::operator==(const TimeZone& other) const {
+    return ((this == &other) ||
+            (typeid(*this) == typeid(other) &&
+            TimeZone::operator==(other) &&
+            hasSameRules(other)));
+}
+
+OlsonTimeZone* OlsonTimeZone::clone() const {
+    return new OlsonTimeZone(*this);
+}
+
+int32_t OlsonTimeZone::getOffset(uint8_t era, int32_t year, int32_t month,
+                                 int32_t dom, uint8_t dow,
+                                 int32_t millis, UErrorCode& ec) const {
+    if (month < UCAL_JANUARY || month > UCAL_DECEMBER) {
+        if (U_SUCCESS(ec)) {
+            ec = U_ILLEGAL_ARGUMENT_ERROR;
+        }
+        return 0;
+    } else {
+        return getOffset(era, year, month, dom, dow, millis,
+                         Grego::monthLength(year, month),
+                         ec);
+    }
+}
+
+int32_t OlsonTimeZone::getOffset(uint8_t era, int32_t year, int32_t month,
+                                 int32_t dom, uint8_t dow,
+                                 int32_t millis, int32_t monthLength,
+                                 UErrorCode& ec) const {
+    if (U_FAILURE(ec)) {
+        return 0;
+    }
+
+    if ((era != GregorianCalendar::AD && era != GregorianCalendar::BC)
+        || month < UCAL_JANUARY
+        || month > UCAL_DECEMBER
+        || dom < 1
+        || dom > monthLength
+        || dow < UCAL_SUNDAY
+        || dow > UCAL_SATURDAY
+        || millis < 0
+        || millis >= U_MILLIS_PER_DAY
+        || monthLength < 28
+        || monthLength > 31) {
+        ec = U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+
+    if (era == GregorianCalendar::BC) {
+        year = -year;
+    }
+
+    if (finalZone != nullptr && year >= finalStartYear) {
+        return finalZone->getOffset(era, year, month, dom, dow,
+                                    millis, monthLength, ec);
+    }
+
+    UDate date = static_cast<UDate>(Grego::fieldsToDay(year, month, dom) * U_MILLIS_PER_DAY + millis);
+    int32_t rawoff, dstoff;
+    getHistoricalOffset(date, true, kDaylight, kStandard, rawoff, dstoff);
+    return rawoff + dstoff;
+}
+
+void OlsonTimeZone::getOffset(UDate date, UBool local, int32_t& rawoff,
+                              int32_t& dstoff, UErrorCode& ec) const {
+    if (U_FAILURE(ec)) {
+        return;
+    }
+    if (finalZone != nullptr && date >= finalStartMillis) {
+        finalZone->getOffset(date, local, rawoff, dstoff, ec);
+    } else {
+        getHistoricalOffset(date, local, kFormer, kLatter, rawoff, dstoff);
+    }
+}
+
+void OlsonTimeZone::getOffsetFromLocal(UDate date, UTimeZoneLocalOption nonExistingTimeOpt,
+                                       UTimeZoneLocalOption duplicatedTimeOpt,
+                                       int32_t& rawoff, int32_t& dstoff, UErrorCode& ec) const {
+    if (U_FAILURE(ec)) {
+        return;
+    }
+    if (finalZone != nullptr && date >= finalStartMillis) {
+        finalZone->getOffsetFromLocal(date, nonExistingTimeOpt, duplicatedTimeOpt, rawoff, dstoff, ec);
+    } else {
+        getHistoricalOffset(date, true, nonExistingTimeOpt, duplicatedTimeOpt, rawoff, dstoff);
+    }
+}
+
+
+void OlsonTimeZone::setRawOffset(int32_t ) {
+
+}
+
+int32_t OlsonTimeZone::getRawOffset() const {
+    UErrorCode ec = U_ZERO_ERROR;
+    int32_t raw, dst;
+    getOffset(uprv_getUTCtime(), false, raw, dst, ec);
+    return raw;
+}
+
+#if defined U_DEBUG_TZ
+void printTime(double ms) {
+            int32_t year;
+            int8_t month, dom, dow;
+            int32_t millis=0;
+            UErrorCode status = U_ZERO_ERROR;
+            Grego::timeToFields(ms, year, month, dom, dow, millis, status);
+            U_DEBUG_TZ_MSG(("   getHistoricalOffset:  time %.1f (%04d.%02d.%02d+%.1fh)\n", ms,
+                            year, month+1, dom, (millis/kOneHour)));
+    }
+#endif
+
+int64_t
+OlsonTimeZone::transitionTimeInSeconds(int16_t transIdx) const {
+    U_ASSERT(transIdx >= 0 && transIdx < transitionCount()); 
+
+    if (transIdx < transitionCountPre32) {
+        return (static_cast<int64_t>(static_cast<uint32_t>(transitionTimesPre32[transIdx << 1])) << 32)
+            | static_cast<int64_t>(static_cast<uint32_t>(transitionTimesPre32[(transIdx << 1) + 1]));
+    }
+
+    transIdx -= transitionCountPre32;
+    if (transIdx < transitionCount32) {
+        return static_cast<int64_t>(transitionTimes32[transIdx]);
+    }
+
+    transIdx -= transitionCount32;
+    return (static_cast<int64_t>(static_cast<uint32_t>(transitionTimesPost32[transIdx << 1])) << 32)
+        | static_cast<int64_t>(static_cast<uint32_t>(transitionTimesPost32[(transIdx << 1) + 1]));
+}
+
+#define MAX_OFFSET_SECONDS 86400
+
+void
+OlsonTimeZone::getHistoricalOffset(UDate date, UBool local,
+                                   int32_t NonExistingTimeOpt, int32_t DuplicatedTimeOpt,
+                                   int32_t& rawoff, int32_t& dstoff) const {
+    U_DEBUG_TZ_MSG(("getHistoricalOffset(%.1f, %s, %d, %d, raw, dst)\n",
+        date, local?"T":"F", NonExistingTimeOpt, DuplicatedTimeOpt));
+#if defined U_DEBUG_TZ
+        printTime(date*1000.0);
+#endif
+    int16_t transCount = transitionCount();
+
+    if (transCount > 0) {
+        double sec = uprv_floor(date / U_MILLIS_PER_SECOND);
+        if (!local && sec < transitionTimeInSeconds(0)) {
+            rawoff = initialRawOffset() * U_MILLIS_PER_SECOND;
+            dstoff = initialDstOffset() * U_MILLIS_PER_SECOND;
+        } else {
+            int16_t transIdx;
+            for (transIdx = transCount - 1; transIdx >= 0; transIdx--) {
+                int64_t transition = transitionTimeInSeconds(transIdx);
+
+                if (local && (sec >= (transition - MAX_OFFSET_SECONDS))) {
+                    int32_t offsetBefore = zoneOffsetAt(transIdx - 1);
+                    UBool dstBefore = dstOffsetAt(transIdx - 1) != 0;
+
+                    int32_t offsetAfter = zoneOffsetAt(transIdx);
+                    UBool dstAfter = dstOffsetAt(transIdx) != 0;
+
+                    UBool dstToStd = dstBefore && !dstAfter;
+                    UBool stdToDst = !dstBefore && dstAfter;
+                    
+                    if (offsetAfter - offsetBefore >= 0) {
+                        if (((NonExistingTimeOpt & kStdDstMask) == kStandard && dstToStd)
+                                || ((NonExistingTimeOpt & kStdDstMask) == kDaylight && stdToDst)) {
+                            transition += offsetBefore;
+                        } else if (((NonExistingTimeOpt & kStdDstMask) == kStandard && stdToDst)
+                                || ((NonExistingTimeOpt & kStdDstMask) == kDaylight && dstToStd)) {
+                            transition += offsetAfter;
+                        } else if ((NonExistingTimeOpt & kFormerLatterMask) == kLatter) {
+                            transition += offsetBefore;
+                        } else {
+                            transition += offsetAfter;
+                        }
+                    } else {
+                        if (((DuplicatedTimeOpt & kStdDstMask) == kStandard && dstToStd)
+                                || ((DuplicatedTimeOpt & kStdDstMask) == kDaylight && stdToDst)) {
+                            transition += offsetAfter;
+                        } else if (((DuplicatedTimeOpt & kStdDstMask) == kStandard && stdToDst)
+                                || ((DuplicatedTimeOpt & kStdDstMask) == kDaylight && dstToStd)) {
+                            transition += offsetBefore;
+                        } else if ((DuplicatedTimeOpt & kFormerLatterMask) == kFormer) {
+                            transition += offsetBefore;
+                        } else {
+                            transition += offsetAfter;
+                        }
+                    }
+                }
+                if (sec >= transition) {
+                    break;
+                }
+            }
+            rawoff = rawOffsetAt(transIdx) * U_MILLIS_PER_SECOND;
+            dstoff = dstOffsetAt(transIdx) * U_MILLIS_PER_SECOND;
+        }
+    } else {
+        rawoff = initialRawOffset() * U_MILLIS_PER_SECOND;
+        dstoff = initialDstOffset() * U_MILLIS_PER_SECOND;
+    }
+    U_DEBUG_TZ_MSG(("getHistoricalOffset(%.1f, %s, %d, %d, raw, dst) - raw=%d, dst=%d\n",
+        date, local?"T":"F", NonExistingTimeOpt, DuplicatedTimeOpt, rawoff, dstoff));
+}
+
+UBool OlsonTimeZone::useDaylightTime() const {
+
+    UDate current = uprv_getUTCtime();
+    if (finalZone != nullptr && current >= finalStartMillis) {
+        return finalZone->useDaylightTime();
+    }
+
+    UErrorCode status = U_ZERO_ERROR;
+    int32_t year = Grego::timeToYear(current, status);
+    U_ASSERT(U_SUCCESS(status));
+    if (U_FAILURE(status)) return false; 
+
+    double start = Grego::fieldsToDay(year, 0, 1) * SECONDS_PER_DAY;
+    double limit = Grego::fieldsToDay(year+1, 0, 1) * SECONDS_PER_DAY;
+
+    for (int16_t i = 0; i < transitionCount(); ++i) {
+        double transition = static_cast<double>(transitionTimeInSeconds(i));
+        if (transition >= limit) {
+            break;
+        }
+        if ((transition >= start && dstOffsetAt(i) != 0)
+                || (transition > start && dstOffsetAt(i - 1) != 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+int32_t 
+OlsonTimeZone::getDSTSavings() const{
+    if (finalZone != nullptr){
+        return finalZone->getDSTSavings();
+    }
+    return TimeZone::getDSTSavings();
+}
+UBool OlsonTimeZone::inDaylightTime(UDate date, UErrorCode& ec) const {
+    int32_t raw, dst;
+    getOffset(date, false, raw, dst, ec);
+    return dst != 0;
+}
+
+UBool
+OlsonTimeZone::hasSameRules(const TimeZone &other) const {
+    if (this == &other) {
+        return true;
+    }
+    const OlsonTimeZone* z = dynamic_cast<const OlsonTimeZone*>(&other);
+    if (z == nullptr) {
+        return false;
+    }
+
+    if (typeMapData == z->typeMapData) {
+        return true;
+    }
+    
+    if ((finalZone == nullptr && z->finalZone != nullptr)
+        || (finalZone != nullptr && z->finalZone == nullptr)
+        || (finalZone != nullptr && z->finalZone != nullptr && *finalZone != *z->finalZone)) {
+        return false;
+    }
+
+    if (finalZone != nullptr) {
+        if (finalStartYear != z->finalStartYear || finalStartMillis != z->finalStartMillis) {
+            return false;
+        }
+    }
+    if (typeCount != z->typeCount
+        || transitionCountPre32 != z->transitionCountPre32
+        || transitionCount32 != z->transitionCount32
+        || transitionCountPost32 != z->transitionCountPost32) {
+        return false;
+    }
+
+    return
+        arrayEqual(transitionTimesPre32, z->transitionTimesPre32, sizeof(transitionTimesPre32[0]) * transitionCountPre32 << 1)
+        && arrayEqual(transitionTimes32, z->transitionTimes32, sizeof(transitionTimes32[0]) * transitionCount32)
+        && arrayEqual(transitionTimesPost32, z->transitionTimesPost32, sizeof(transitionTimesPost32[0]) * transitionCountPost32 << 1)
+        && arrayEqual(typeOffsets, z->typeOffsets, sizeof(typeOffsets[0]) * typeCount << 1)
+        && arrayEqual(typeMapData, z->typeMapData, sizeof(typeMapData[0]) * transitionCount());
+}
+
+void
+OlsonTimeZone::clearTransitionRules() {
+    initialRule = nullptr;
+    firstTZTransition = nullptr;
+    firstFinalTZTransition = nullptr;
+    historicRules = nullptr;
+    historicRuleCount = 0;
+    finalZoneWithStartYear = nullptr;
+    firstTZTransitionIdx = 0;
+    transitionRulesInitOnce.reset();
+}
+
+void
+OlsonTimeZone::deleteTransitionRules() {
+    delete initialRule;
+    delete firstTZTransition;
+    delete firstFinalTZTransition;
+    delete finalZoneWithStartYear;
+    if (historicRules != nullptr) {
+        for (int i = 0; i < historicRuleCount; i++) {
+            if (historicRules[i] != nullptr) {
+                delete historicRules[i];
+            }
+        }
+        uprv_free(historicRules);
+    }
+    clearTransitionRules();
+}
+
+
+static void U_CALLCONV initRules(OlsonTimeZone *This, UErrorCode &status) {
+    This->initTransitionRules(status);
+}
+    
+void
+OlsonTimeZone::checkTransitionRules(UErrorCode& status) const {
+    OlsonTimeZone *ncThis = const_cast<OlsonTimeZone *>(this);
+    umtx_initOnce(ncThis->transitionRulesInitOnce, &initRules, ncThis, status);
+}
+
+void
+OlsonTimeZone::initTransitionRules(UErrorCode& status) {
+    if(U_FAILURE(status)) {
+        return;
+    }
+    deleteTransitionRules();
+    UnicodeString tzid;
+    getID(tzid);
+
+    UnicodeString stdName = tzid + UNICODE_STRING_SIMPLE("(STD)");
+    UnicodeString dstName = tzid + UNICODE_STRING_SIMPLE("(DST)");
+
+    int32_t raw, dst;
+
+    raw = initialRawOffset() * U_MILLIS_PER_SECOND;
+    dst = initialDstOffset() * U_MILLIS_PER_SECOND;
+    initialRule = new InitialTimeZoneRule((dst == 0 ? stdName : dstName), raw, dst);
+    if (initialRule == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        deleteTransitionRules();
+        return;
+    }
+
+    int32_t transCount = transitionCount();
+    if (transCount > 0) {
+        int16_t transitionIdx, typeIdx;
+
+        firstTZTransitionIdx = 0;
+        for (transitionIdx = 0; transitionIdx < transCount; transitionIdx++) {
+            if (typeMapData[transitionIdx] != 0) { 
+                break;
+            }
+            firstTZTransitionIdx++;
+        }
+        if (transitionIdx == transCount) {
+        } else {
+            UDate* times = static_cast<UDate*>(uprv_malloc(sizeof(UDate) * transCount)); 
+            if (times == nullptr) {
+                status = U_MEMORY_ALLOCATION_ERROR;
+                deleteTransitionRules();
+                return;
+            }
+            for (typeIdx = 0; typeIdx < typeCount; typeIdx++) {
+                int32_t nTimes = 0;
+                for (transitionIdx = firstTZTransitionIdx; transitionIdx < transCount; transitionIdx++) {
+                    if (typeIdx == static_cast<int16_t>(typeMapData[transitionIdx])) {
+                        UDate tt = static_cast<UDate>(transitionTime(transitionIdx));
+                        if (finalZone == nullptr || tt <= finalStartMillis) {
+                            times[nTimes++] = tt;
+                        }
+                    }
+                }
+                if (nTimes > 0) {
+                    raw = typeOffsets[typeIdx << 1] * U_MILLIS_PER_SECOND;
+                    dst = typeOffsets[(typeIdx << 1) + 1] * U_MILLIS_PER_SECOND;
+                    if (historicRules == nullptr) {
+                        historicRuleCount = typeCount;
+                        historicRules = static_cast<TimeArrayTimeZoneRule**>(uprv_malloc(sizeof(TimeArrayTimeZoneRule*) * historicRuleCount));
+                        if (historicRules == nullptr) {
+                            status = U_MEMORY_ALLOCATION_ERROR;
+                            deleteTransitionRules();
+                            uprv_free(times);
+                            return;
+                        }
+                        for (int i = 0; i < historicRuleCount; i++) {
+                            historicRules[i] = nullptr;
+                        }
+                    }
+                    historicRules[typeIdx] = new TimeArrayTimeZoneRule((dst == 0 ? stdName : dstName),
+                        raw, dst, times, nTimes, DateTimeRule::UTC_TIME);
+                    if (historicRules[typeIdx] == nullptr) {
+                        status = U_MEMORY_ALLOCATION_ERROR;
+                        deleteTransitionRules();
+                        return;
+                    }
+                }
+            }
+            uprv_free(times);
+
+            typeIdx = static_cast<int16_t>(typeMapData[firstTZTransitionIdx]);
+            firstTZTransition = new TimeZoneTransition(static_cast<UDate>(transitionTime(firstTZTransitionIdx)),
+                    *initialRule, *historicRules[typeIdx]);
+            if (firstTZTransition == nullptr) {
+                status = U_MEMORY_ALLOCATION_ERROR;
+                deleteTransitionRules();
+                return;
+            }
+        }
+    }
+    if (finalZone != nullptr) {
+        UDate startTime = static_cast<UDate>(finalStartMillis);
+        TimeZoneRule *firstFinalRule = nullptr;
+
+        if (finalZone->useDaylightTime()) {
+            finalZoneWithStartYear = finalZone->clone();
+            if (finalZoneWithStartYear == nullptr) {
+                status = U_MEMORY_ALLOCATION_ERROR;
+                deleteTransitionRules();
+                return;
+            }
+            finalZoneWithStartYear->setStartYear(finalStartYear);
+
+            TimeZoneTransition tzt;
+            finalZoneWithStartYear->getNextTransition(startTime, false, tzt);
+            firstFinalRule  = tzt.getTo()->clone();
+            if (firstFinalRule == nullptr) {
+                status = U_MEMORY_ALLOCATION_ERROR;
+                deleteTransitionRules();
+                return;
+            }
+            startTime = tzt.getTime();
+        } else {
+            finalZoneWithStartYear = finalZone->clone();
+            if (finalZoneWithStartYear == nullptr) {
+                status = U_MEMORY_ALLOCATION_ERROR;
+                deleteTransitionRules();
+                return;
+            }
+            finalZone->getID(tzid);
+            firstFinalRule = new TimeArrayTimeZoneRule(tzid,
+                finalZone->getRawOffset(), 0, &startTime, 1, DateTimeRule::UTC_TIME);
+            if (firstFinalRule == nullptr) {
+                status = U_MEMORY_ALLOCATION_ERROR;
+                deleteTransitionRules();
+                return;
+            }
+        }
+        TimeZoneRule *prevRule = nullptr;
+        if (transCount > 0) {
+            prevRule = historicRules[typeMapData[transCount - 1]];
+        }
+        if (prevRule == nullptr) {
+            prevRule = initialRule;
+        }
+        firstFinalTZTransition = new TimeZoneTransition();
+        if (firstFinalTZTransition == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            deleteTransitionRules();
+            return;
+        }
+        firstFinalTZTransition->setTime(startTime);
+        firstFinalTZTransition->adoptFrom(prevRule->clone());
+        firstFinalTZTransition->adoptTo(firstFinalRule);
+    }
+}
+
+UBool
+OlsonTimeZone::getNextTransition(UDate base, UBool inclusive, TimeZoneTransition& result) const {
+    UErrorCode status = U_ZERO_ERROR;
+    checkTransitionRules(status);
+    if (U_FAILURE(status)) {
+        return false;
+    }
+
+    if (finalZone != nullptr) {
+        if (inclusive && base == firstFinalTZTransition->getTime()) {
+            result = *firstFinalTZTransition;
+            return true;
+        } else if (base >= firstFinalTZTransition->getTime()) {
+            if (finalZone->useDaylightTime()) {
+                return finalZoneWithStartYear->getNextTransition(base, inclusive, result);
+            } else {
+                return false;
+            }
+        }
+    }
+    if (historicRules != nullptr) {
+        int16_t transCount = transitionCount();
+        int16_t ttidx = transCount - 1;
+        for (; ttidx >= firstTZTransitionIdx; ttidx--) {
+            UDate t = static_cast<UDate>(transitionTime(ttidx));
+            if (base > t || (!inclusive && base == t)) {
+                break;
+            }
+        }
+        if (ttidx == transCount - 1)  {
+            if (firstFinalTZTransition != nullptr) {
+                result = *firstFinalTZTransition;
+                return true;
+            } else {
+                return false;
+            }
+        } else if (ttidx < firstTZTransitionIdx) {
+            result = *firstTZTransition;
+            return true;
+        } else {
+            TimeZoneRule *to = historicRules[typeMapData[ttidx + 1]];
+            TimeZoneRule *from = historicRules[typeMapData[ttidx]];
+            UDate startTime = static_cast<UDate>(transitionTime(ttidx + 1));
+
+            UnicodeString fromName, toName;
+            from->getName(fromName);
+            to->getName(toName);
+            if (fromName == toName && from->getRawOffset() == to->getRawOffset()
+                    && from->getDSTSavings() == to->getDSTSavings()) {
+                return getNextTransition(startTime, false, result);
+            }
+            result.setTime(startTime);
+            result.adoptFrom(from->clone());
+            result.adoptTo(to->clone());
+            return true;
+        }
+    }
+    return false;
+}
+
+UBool
+OlsonTimeZone::getPreviousTransition(UDate base, UBool inclusive, TimeZoneTransition& result) const {
+    UErrorCode status = U_ZERO_ERROR;
+    checkTransitionRules(status);
+    if (U_FAILURE(status)) {
+        return false;
+    }
+
+    if (finalZone != nullptr) {
+        if (inclusive && base == firstFinalTZTransition->getTime()) {
+            result = *firstFinalTZTransition;
+            return true;
+        } else if (base > firstFinalTZTransition->getTime()) {
+            if (finalZone->useDaylightTime()) {
+                return finalZoneWithStartYear->getPreviousTransition(base, inclusive, result);
+            } else {
+                result = *firstFinalTZTransition;
+                return true;
+            }
+        }
+    }
+
+    if (historicRules != nullptr) {
+        int16_t ttidx = transitionCount() - 1;
+        for (; ttidx >= firstTZTransitionIdx; ttidx--) {
+            UDate t = static_cast<UDate>(transitionTime(ttidx));
+            if (base > t || (inclusive && base == t)) {
+                break;
+            }
+        }
+        if (ttidx < firstTZTransitionIdx) {
+            return false;
+        } else if (ttidx == firstTZTransitionIdx) {
+            result = *firstTZTransition;
+            return true;
+        } else {
+            TimeZoneRule *to = historicRules[typeMapData[ttidx]];
+            TimeZoneRule *from = historicRules[typeMapData[ttidx-1]];
+            UDate startTime = static_cast<UDate>(transitionTime(ttidx));
+
+            UnicodeString fromName, toName;
+            from->getName(fromName);
+            to->getName(toName);
+            if (fromName == toName && from->getRawOffset() == to->getRawOffset()
+                    && from->getDSTSavings() == to->getDSTSavings()) {
+                return getPreviousTransition(startTime, false, result);
+            }
+            result.setTime(startTime);
+            result.adoptFrom(from->clone());
+            result.adoptTo(to->clone());
+            return true;
+        }
+    }
+    return false;
+}
+
+int32_t
+OlsonTimeZone::countTransitionRules(UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    checkTransitionRules(status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    int32_t count = 0;
+    if (historicRules != nullptr) {
+        for (int32_t i = 0; i < historicRuleCount; i++) {
+            if (historicRules[i] != nullptr) {
+                count++;
+            }
+        }
+    }
+    if (finalZone != nullptr) {
+        if (finalZone->useDaylightTime()) {
+            count += 2;
+        } else {
+            count++;
+        }
+    }
+    return count;
+}
+
+void
+OlsonTimeZone::getTimeZoneRules(const InitialTimeZoneRule*& initial,
+                                const TimeZoneRule* trsrules[],
+                                int32_t& trscount,
+                                UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    checkTransitionRules(status);
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    initial = initialRule;
+
+    int32_t cnt = 0;
+    if (historicRules != nullptr && trscount > cnt) {
+        for (int32_t i = 0; i < historicRuleCount; i++) {
+            if (historicRules[i] != nullptr) {
+                trsrules[cnt++] = historicRules[i];
+                if (cnt >= trscount) {
+                    break;
+                }
+            }
+        }
+    }
+    if (finalZoneWithStartYear != nullptr && trscount > cnt) {
+        const InitialTimeZoneRule *tmpini;
+        int32_t tmpcnt = trscount - cnt;
+        finalZoneWithStartYear->getTimeZoneRules(tmpini, &trsrules[cnt], tmpcnt, status);
+        if (U_FAILURE(status)) {
+            return;
+        }
+        cnt += tmpcnt;
+    }
+    trscount = cnt;
+}
+
+U_NAMESPACE_END
+
+#endif // !UCONFIG_NO_FORMATTING
+

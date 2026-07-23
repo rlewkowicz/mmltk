@@ -1,0 +1,30 @@
+[package]
+name = "itertools"
+version = "0.14.0"
+
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-itertools/itertools"
+documentation = "https://docs.rs/itertools/"
+authors = ["bluss"]
+
+description = "Extra iterator adaptors, iterator methods, free functions, and macros."
+
+keywords = ["iterator", "data-structure", "zip", "product"]
+categories = ["algorithms", "rust-patterns", "no-std", "no-std::no-alloc"]
+
+edition = "2018"
+
+# When bumping, please resolve all `#[allow(clippy::*)]` that are newly resolvable.
+rust-version = "1.63.0"
+
+[lib]
+
+[dependencies]
+either = { version = "1.0", default-features = false }
+
+[features]
+default = ["use_std"]
+use_std = ["use_alloc", "either/use_std"]
+use_alloc = []
+
+[profile]

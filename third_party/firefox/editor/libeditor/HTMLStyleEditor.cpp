@@ -1,0 +1,3872 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ErrorList.h"
+#include "HTMLEditor.h"
+#include "HTMLEditorInlines.h"
+#include "HTMLEditorNestedClasses.h"
+
+#include "AutoClonedRangeArray.h"
+#include "CSSEditUtils.h"
+#include "EditAction.h"
+#include "EditorLineBreak.h"
+#include "EditorUtils.h"
+#include "HTMLEditHelpers.h"
+#include "HTMLEditUtils.h"
+#include "PendingStyles.h"
+#include "SelectionState.h"
+#include "WSRunScanner.h"
+
+#include "mozilla/Assertions.h"
+#include "mozilla/ContentIterator.h"
+#include "mozilla/EditorForwards.h"
+#include "mozilla/mozalloc.h"
+#include "mozilla/SelectionState.h"
+#include "mozilla/dom/AncestorIterator.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/ElementInlines.h"
+#include "mozilla/dom/HTMLBRElement.h"
+#include "mozilla/dom/NameSpaceConstants.h"
+#include "mozilla/dom/Selection.h"
+#include "mozilla/dom/Text.h"
+
+#include "nsAString.h"
+#include "nsAtom.h"
+#include "nsAttrName.h"
+#include "nsAttrValue.h"
+#include "nsCaseTreatment.h"
+#include "nsColor.h"
+#include "nsComponentManagerUtils.h"
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsGkAtoms.h"
+#include "nsIContent.h"
+#include "nsINode.h"
+#include "nsIPrincipal.h"
+#include "nsISupportsImpl.h"
+#include "nsLiteralString.h"
+#include "nsNameSpaceManager.h"
+#include "nsRange.h"
+#include "nsReadableUtils.h"
+#include "nsString.h"
+#include "nsStringFwd.h"
+#include "nsStyledElement.h"
+#include "nsTArray.h"
+#include "nsTextNode.h"
+#include "nsUnicharUtils.h"
+
+#ifdef small
+#  undef small
+#endif
+
+namespace mozilla {
+
+using namespace dom;
+
+using EditablePointOption = HTMLEditUtils::EditablePointOption;
+using EditablePointOptions = HTMLEditUtils::EditablePointOptions;
+using EmptyCheckOption = HTMLEditUtils::EmptyCheckOption;
+using LeafNodeOption = HTMLEditUtils::LeafNodeOption;
+using TreatInvisibleLineBreakAs = HTMLEditUtils::TreatInvisibleLineBreakAs;
+
+template nsresult HTMLEditor::SetInlinePropertiesAsSubAction(
+    const AutoTArray<EditorInlineStyleAndValue, 1>& aStylesToSet,
+    const Element& aEditingHost);
+template nsresult HTMLEditor::SetInlinePropertiesAsSubAction(
+    const AutoTArray<EditorInlineStyleAndValue, 32>& aStylesToSet,
+    const Element& aEditingHost);
+
+template nsresult HTMLEditor::SetInlinePropertiesAroundRanges(
+    AutoClonedRangeArray&, const AutoTArray<EditorInlineStyleAndValue, 1>&,
+    const Element&);
+template nsresult HTMLEditor::SetInlinePropertiesAroundRanges(
+    AutoClonedRangeArray&, const AutoTArray<EditorInlineStyleAndValue, 32>&,
+    const Element&);
+
+nsresult HTMLEditor::SetInlinePropertyAsAction(nsStaticAtom& aProperty,
+                                               nsStaticAtom* aAttribute,
+                                               const nsAString& aValue,
+                                               nsIPrincipal* aPrincipal) {
+  AutoEditActionDataSetter editActionData(
+      *this,
+      HTMLEditUtils::GetEditActionForFormatText(aProperty, aAttribute, true),
+      aPrincipal);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  const RefPtr<Element> editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (NS_WARN_IF(!editingHost)) {
+    return NS_ERROR_FAILURE;
+  }
+  if (!IsStyleEditable(editingHost)) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  switch (editActionData.GetEditAction()) {
+    case EditAction::eSetFontFamilyProperty:
+      MOZ_ASSERT(!aValue.IsVoid());
+      editActionData.SetData(aValue);
+      break;
+    case EditAction::eSetColorProperty:
+    case EditAction::eSetBackgroundColorPropertyInline:
+      editActionData.SetColorData(aValue);
+      break;
+    default:
+      break;
+  }
+
+  nsresult rv = editActionData.MaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "MaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  AutoPlaceholderBatch treatAsOneTransaction(*this, ScrollSelectionIntoView::No,
+                                             __FUNCTION__);
+
+  nsStaticAtom* property = &aProperty;
+  nsStaticAtom* attribute = aAttribute;
+  nsString value(aValue);
+  if (attribute == nsGkAtoms::color || attribute == nsGkAtoms::bgcolor) {
+    if (!IsCSSEnabled()) {
+      if (!HTMLEditUtils::MaybeCSSSpecificColorValue(value)) {
+        HTMLEditUtils::GetNormalizedHTMLColorValue(value, value);
+      }
+    } else {
+      HTMLEditUtils::GetNormalizedCSSColorValue(
+          value, HTMLEditUtils::ZeroAlphaColor::RGBAValue, value);
+    }
+  }
+
+  AutoTArray<EditorInlineStyle, 1> stylesToRemove;
+  if (&aProperty == nsGkAtoms::sup) {
+    stylesToRemove.AppendElement(EditorInlineStyle(*nsGkAtoms::sub));
+  } else if (&aProperty == nsGkAtoms::sub) {
+    stylesToRemove.AppendElement(EditorInlineStyle(*nsGkAtoms::sup));
+  }
+  else if (!aPrincipal) {
+    if (&aProperty == nsGkAtoms::tt) {
+      stylesToRemove.AppendElement(
+          EditorInlineStyle(*nsGkAtoms::font, nsGkAtoms::face));
+    } else if (&aProperty == nsGkAtoms::font && aAttribute == nsGkAtoms::face) {
+      if (!value.LowerCaseEqualsASCII("tt")) {
+        stylesToRemove.AppendElement(EditorInlineStyle(*nsGkAtoms::tt));
+      } else {
+        stylesToRemove.AppendElement(
+            EditorInlineStyle(*nsGkAtoms::font, nsGkAtoms::face));
+        property = nsGkAtoms::tt;
+        attribute = nullptr;
+        value.Truncate();
+      }
+    }
+  }
+
+  if (!stylesToRemove.IsEmpty()) {
+    nsresult rv =
+        RemoveInlinePropertiesAsSubAction(stylesToRemove, *editingHost);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("HTMLEditor::RemoveInlinePropertiesAsSubAction() failed");
+      return rv;
+    }
+  }
+
+  AutoTArray<EditorInlineStyleAndValue, 1> styleToSet;
+  styleToSet.AppendElement(
+      attribute
+          ? EditorInlineStyleAndValue(*property, *attribute, std::move(value))
+          : EditorInlineStyleAndValue(*property));
+  rv = SetInlinePropertiesAsSubAction(styleToSet, *editingHost);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::SetInlinePropertiesAsSubAction() failed");
+  return EditorBase::ToGenericNSResult(rv);
+}
+
+NS_IMETHODIMP HTMLEditor::SetInlineProperty(const nsAString& aProperty,
+                                            const nsAString& aAttribute,
+                                            const nsAString& aValue) {
+  nsStaticAtom* property = NS_GetStaticAtom(aProperty);
+  if (NS_WARN_IF(!property)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  nsStaticAtom* attribute = EditorUtils::GetAttributeAtom(aAttribute);
+  AutoEditActionDataSetter editActionData(
+      *this,
+      HTMLEditUtils::GetEditActionForFormatText(*property, attribute, true));
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  const RefPtr<Element> editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (NS_WARN_IF(!editingHost)) {
+    return NS_ERROR_FAILURE;
+  }
+  if (!IsStyleEditable(editingHost)) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  switch (editActionData.GetEditAction()) {
+    case EditAction::eSetFontFamilyProperty:
+      MOZ_ASSERT(!aValue.IsVoid());
+      editActionData.SetData(aValue);
+      break;
+    case EditAction::eSetColorProperty:
+    case EditAction::eSetBackgroundColorPropertyInline:
+      editActionData.SetColorData(aValue);
+      break;
+    default:
+      break;
+  }
+  nsresult rv = editActionData.MaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "MaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  AutoTArray<EditorInlineStyleAndValue, 1> styleToSet;
+  styleToSet.AppendElement(
+      attribute ? EditorInlineStyleAndValue(*property, *attribute, aValue)
+                : EditorInlineStyleAndValue(*property));
+  rv = SetInlinePropertiesAsSubAction(styleToSet, *editingHost);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::SetInlinePropertiesAsSubAction() failed");
+  return EditorBase::ToGenericNSResult(rv);
+}
+
+template <size_t N>
+nsresult HTMLEditor::SetInlinePropertiesAsSubAction(
+    const AutoTArray<EditorInlineStyleAndValue, N>& aStylesToSet,
+    const Element& aEditingHost) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+  MOZ_ASSERT(!aStylesToSet.IsEmpty());
+
+  DebugOnly<nsresult> rvIgnored = CommitComposition();
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                       "EditorBase::CommitComposition() failed, but ignored");
+  if (MOZ_UNLIKELY(&aEditingHost !=
+                   ComputeEditingHost(LimitInBodyElement::No))) {
+    NS_WARNING("Editing host has been changed during committing composition");
+    return NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE;
+  }
+
+  if (SelectionRef().IsCollapsed()) {
+    mPendingStylesToApplyToNewContent->PreserveStyles(aStylesToSet);
+    return NS_OK;
+  }
+
+  {
+    Result<EditActionResult, nsresult> result = CanHandleHTMLEditSubAction();
+    if (MOZ_UNLIKELY(result.isErr())) {
+      NS_WARNING("HTMLEditor::CanHandleHTMLEditSubAction() failed");
+      return result.unwrapErr();
+    }
+    if (result.inspect().Canceled()) {
+      return NS_OK;
+    }
+  }
+
+  AutoPlaceholderBatch treatAsOneTransaction(
+      *this, ScrollSelectionIntoView::Yes, __FUNCTION__);
+  IgnoredErrorResult ignoredError;
+  AutoEditSubActionNotifier startToHandleEditSubAction(
+      *this, EditSubAction::eInsertElement, nsIEditor::eNext, ignoredError);
+  if (NS_WARN_IF(ignoredError.ErrorCodeIs(NS_ERROR_EDITOR_DESTROYED))) {
+    return ignoredError.StealNSResult();
+  }
+  NS_WARNING_ASSERTION(
+      !ignoredError.Failed(),
+      "HTMLEditor::OnStartToHandleTopLevelEditSubAction() failed, but ignored");
+
+  AutoTransactionsConserveSelection dontChangeMySelection(*this);
+
+  AutoClonedSelectionRangeArray selectionRanges(SelectionRef());
+  nsresult rv = SetInlinePropertiesAroundRanges(selectionRanges, aStylesToSet,
+                                                aEditingHost);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("HTMLEditor::SetInlinePropertiesAroundRanges() failed");
+    return rv;
+  }
+  MOZ_ASSERT(!selectionRanges.HasSavedRanges());
+  rv = selectionRanges.ApplyTo(SelectionRef());
+  if (NS_WARN_IF(Destroyed())) {
+    return NS_ERROR_EDITOR_DESTROYED;
+  }
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "AutoClonedSelectionRangeArray::ApplyTo() failed");
+  return rv;
+}
+
+template <size_t N>
+nsresult HTMLEditor::SetInlinePropertiesAroundRanges(
+    AutoClonedRangeArray& aRanges,
+    const AutoTArray<EditorInlineStyleAndValue, N>& aStylesToSet,
+    const Element& aEditingHost) {
+  MOZ_ASSERT(!aRanges.HasSavedRanges());
+  for (const EditorInlineStyleAndValue& styleToSet : aStylesToSet) {
+    AutoInlineStyleSetter inlineStyleSetter(styleToSet);
+    for (OwningNonNull<nsRange>& domRange : aRanges.Ranges()) {
+      inlineStyleSetter.Reset();
+      auto rangeOrError =
+          [&]() MOZ_CAN_RUN_SCRIPT -> Result<EditorDOMRange, nsresult> {
+        EditorDOMRange range(domRange);
+        if (styleToSet.IsStyleOfFontElement()) {
+          Result<SplitRangeOffResult, nsresult> splitAncestorsResult =
+              SplitAncestorStyledInlineElementsAtRangeEdges(
+                  range, styleToSet, SplitAtEdges::eDoNotCreateEmptyContainer);
+          if (MOZ_UNLIKELY(splitAncestorsResult.isErr())) {
+            NS_WARNING(
+                "HTMLEditor::SplitAncestorStyledInlineElementsAtRangeEdges() "
+                "failed");
+            return splitAncestorsResult.propagateErr();
+          }
+          SplitRangeOffResult unwrappedResult = splitAncestorsResult.unwrap();
+          unwrappedResult.IgnoreCaretPointSuggestion();
+          range = unwrappedResult.RangeRef();
+          if (NS_WARN_IF(!range.IsPositionedAndValid())) {
+            return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+          }
+        }
+        Result<EditorRawDOMRange, nsresult> rangeOrError =
+            inlineStyleSetter.ExtendOrShrinkRangeToApplyTheStyle(*this, range,
+                                                                 aEditingHost);
+        if (MOZ_UNLIKELY(rangeOrError.isErr())) {
+          NS_WARNING(
+              "HTMLEditor::ExtendOrShrinkRangeToApplyTheStyle() failed, but "
+              "ignored");
+          return EditorDOMRange();
+        }
+        return EditorDOMRange(rangeOrError.unwrap());
+      }();
+      if (MOZ_UNLIKELY(rangeOrError.isErr())) {
+        return rangeOrError.unwrapErr();
+      }
+
+      const EditorDOMRange range = rangeOrError.unwrap();
+      if (!range.IsPositioned()) {
+        continue;
+      }
+
+      if (range.Collapsed()) {
+        Result<RefPtr<Text>, nsresult> emptyTextNodeOrError =
+            AutoInlineStyleSetter::GetEmptyTextNodeToApplyNewStyle(
+                *this, range.StartRef());
+        if (MOZ_UNLIKELY(emptyTextNodeOrError.isErr())) {
+          NS_WARNING(
+              "AutoInlineStyleSetter::GetEmptyTextNodeToApplyNewStyle() "
+              "failed");
+          return emptyTextNodeOrError.unwrapErr();
+        }
+        if (MOZ_UNLIKELY(!emptyTextNodeOrError.inspect())) {
+          continue;  
+        }
+        RefPtr<Text> emptyTextNode = emptyTextNodeOrError.unwrap();
+        Result<CaretPoint, nsresult> caretPointOrError =
+            inlineStyleSetter
+                .ApplyStyleToNodeOrChildrenAndRemoveNestedSameStyle(
+                    *this, *emptyTextNode);
+        if (MOZ_UNLIKELY(caretPointOrError.isErr())) {
+          NS_WARNING(
+              "AutoInlineStyleSetter::"
+              "ApplyStyleToNodeOrChildrenAndRemoveNestedSameStyle() failed");
+          return caretPointOrError.unwrapErr();
+        }
+        DebugOnly<nsresult> rvIgnored = domRange->CollapseTo(emptyTextNode, 0);
+        NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                             "nsRange::CollapseTo() failed, but ignored");
+        continue;
+      }
+
+      AutoTrackDOMRange trackRange(RangeUpdaterRef(),
+                                   const_cast<EditorDOMRange*>(&range));
+      auto UpdateSelectionRange = [&]() MOZ_CAN_RUN_SCRIPT {
+        if (inlineStyleSetter.FirstHandledPointRef().IsInContentNode()) {
+          MOZ_ASSERT(inlineStyleSetter.LastHandledPointRef().IsInContentNode());
+          const auto startPoint =
+              !inlineStyleSetter.FirstHandledPointRef().IsStartOfContainer()
+                  ? inlineStyleSetter.FirstHandledPointRef()
+                        .To<EditorRawDOMPoint>()
+                  : HTMLEditUtils::GetDeepestEditableStartPointOf<
+                        EditorRawDOMPoint>(
+                        *inlineStyleSetter.FirstHandledPointRef()
+                             .ContainerAs<nsIContent>(),
+                        {EditablePointOption::RecognizeInvisibleWhiteSpaces,
+                         EditablePointOption::StopAtComment});
+          const auto endPoint =
+              !inlineStyleSetter.LastHandledPointRef().IsEndOfContainer()
+                  ? inlineStyleSetter.LastHandledPointRef()
+                        .To<EditorRawDOMPoint>()
+                  : HTMLEditUtils::GetDeepestEditableEndPointOf<
+                        EditorRawDOMPoint>(
+                        *inlineStyleSetter.LastHandledPointRef()
+                             .ContainerAs<nsIContent>(),
+                        {EditablePointOption::RecognizeInvisibleWhiteSpaces,
+                         EditablePointOption::StopAtComment});
+          nsresult rv = domRange->SetStartAndEnd(
+              startPoint.ToRawRangeBoundary(), endPoint.ToRawRangeBoundary());
+          if (NS_SUCCEEDED(rv)) {
+            trackRange.StopTracking();
+            return;
+          }
+        }
+        trackRange.Flush(StopTracking::Yes);
+        domRange->SetStartAndEnd(range.StartRef().ToRawRangeBoundary(),
+                                 range.EndRef().ToRawRangeBoundary());
+      };
+
+      if (range.InSameContainer() && range.StartRef().IsInTextNode()) {
+        Result<SplitRangeOffFromNodeResult, nsresult>
+            wrapTextInStyledElementResult =
+                inlineStyleSetter.SplitTextNodeAndApplyStyleToMiddleNode(
+                    *this, MOZ_KnownLive(*range.StartRef().ContainerAs<Text>()),
+                    range.StartRef().Offset(), range.EndRef().Offset());
+        if (MOZ_UNLIKELY(wrapTextInStyledElementResult.isErr())) {
+          NS_WARNING("HTMLEditor::SetInlinePropertyOnTextNode() failed");
+          return wrapTextInStyledElementResult.unwrapErr();
+        }
+        wrapTextInStyledElementResult.inspect().IgnoreCaretPointSuggestion();
+        UpdateSelectionRange();
+        continue;
+      }
+
+      AutoTArray<OwningNonNull<nsIContent>, 64> arrayOfContentsAroundRange;
+      {
+        ContentSubtreeIterator subtreeIter;
+        if (NS_SUCCEEDED(
+                subtreeIter.Init(range.StartRef().ToRawRangeBoundary(),
+                                 range.EndRef().ToRawRangeBoundary()))) {
+          for (; !subtreeIter.IsDone(); subtreeIter.Next()) {
+            nsINode* node = subtreeIter.GetCurrentNode();
+            if (NS_WARN_IF(!node)) {
+              return NS_ERROR_FAILURE;
+            }
+            if (MOZ_UNLIKELY(!node->IsContent())) {
+              continue;
+            }
+            if (!EditorUtils::IsEditableContent(*node->AsContent(),
+                                                EditorType::HTML)) {
+              continue;
+            }
+            if (node->IsText() &&
+                !HTMLEditUtils::IsVisibleTextNode(
+                    *node->AsText(), TreatInvisibleLineBreakAs::Visible)) {
+              continue;
+            }
+            arrayOfContentsAroundRange.AppendElement(*node->AsContent());
+          }
+        }
+      }
+
+      if (range.StartRef().IsInTextNode() &&
+          EditorUtils::IsEditableContent(*range.StartRef().ContainerAs<Text>(),
+                                         EditorType::HTML)) {
+        Result<SplitRangeOffFromNodeResult, nsresult>
+            wrapTextInStyledElementResult =
+                inlineStyleSetter.SplitTextNodeAndApplyStyleToMiddleNode(
+                    *this, MOZ_KnownLive(*range.StartRef().ContainerAs<Text>()),
+                    range.StartRef().Offset(),
+                    range.StartRef().ContainerAs<Text>()->TextDataLength());
+        if (MOZ_UNLIKELY(wrapTextInStyledElementResult.isErr())) {
+          NS_WARNING("HTMLEditor::SetInlinePropertyOnTextNode() failed");
+          return wrapTextInStyledElementResult.unwrapErr();
+        }
+        wrapTextInStyledElementResult.inspect().IgnoreCaretPointSuggestion();
+      }
+
+      for (auto& content : arrayOfContentsAroundRange) {
+        Result<CaretPoint, nsresult> pointToPutCaretOrError =
+            inlineStyleSetter
+                .ApplyStyleToNodeOrChildrenAndRemoveNestedSameStyle(
+                    *this, MOZ_KnownLive(*content));
+        if (MOZ_UNLIKELY(pointToPutCaretOrError.isErr())) {
+          NS_WARNING(
+              "AutoInlineStyleSetter::"
+              "ApplyStyleToNodeOrChildrenAndRemoveNestedSameStyle() failed");
+          return pointToPutCaretOrError.unwrapErr();
+        }
+        pointToPutCaretOrError.inspect().IgnoreCaretPointSuggestion();
+      }
+
+      if (range.EndRef().IsInTextNode() &&
+          EditorUtils::IsEditableContent(*range.EndRef().ContainerAs<Text>(),
+                                         EditorType::HTML)) {
+        Result<SplitRangeOffFromNodeResult, nsresult>
+            wrapTextInStyledElementResult =
+                inlineStyleSetter.SplitTextNodeAndApplyStyleToMiddleNode(
+                    *this, MOZ_KnownLive(*range.EndRef().ContainerAs<Text>()),
+                    0, range.EndRef().Offset());
+        if (MOZ_UNLIKELY(wrapTextInStyledElementResult.isErr())) {
+          NS_WARNING("HTMLEditor::SetInlinePropertyOnTextNode() failed");
+          return wrapTextInStyledElementResult.unwrapErr();
+        }
+        wrapTextInStyledElementResult.inspect().IgnoreCaretPointSuggestion();
+      }
+      UpdateSelectionRange();
+    }
+  }
+  return NS_OK;
+}
+
+Result<RefPtr<Text>, nsresult>
+HTMLEditor::AutoInlineStyleSetter::GetEmptyTextNodeToApplyNewStyle(
+    HTMLEditor& aHTMLEditor, const EditorDOMPoint& aCandidatePointToInsert) {
+  auto pointToInsertNewText =
+      HTMLEditUtils::GetBetterCaretPositionToInsertText<EditorDOMPoint>(
+          aCandidatePointToInsert);
+  if (MOZ_UNLIKELY(!pointToInsertNewText.IsSet())) {
+    return RefPtr<Text>();  
+  }
+  auto pointToInsertNewStyleOrError =
+      [&]() MOZ_CAN_RUN_SCRIPT -> Result<EditorDOMPoint, nsresult> {
+    if (!pointToInsertNewText.IsInTextNode()) {
+      return pointToInsertNewText;
+    }
+    if (!pointToInsertNewText.ContainerAs<Text>()->TextDataLength()) {
+      return pointToInsertNewText;  
+    }
+    if (pointToInsertNewText.IsStartOfContainer()) {
+      return pointToInsertNewText.ParentPoint();
+    }
+    if (pointToInsertNewText.IsEndOfContainer()) {
+      return EditorDOMPoint::After(*pointToInsertNewText.ContainerAs<Text>());
+    }
+    Result<SplitNodeResult, nsresult> splitTextNodeResult =
+        aHTMLEditor.SplitNodeWithTransaction(pointToInsertNewText);
+    if (MOZ_UNLIKELY(splitTextNodeResult.isErr())) {
+      NS_WARNING("HTMLEditor::SplitNodeWithTransaction() failed");
+      return splitTextNodeResult.propagateErr();
+    }
+    SplitNodeResult unwrappedSplitTextNodeResult = splitTextNodeResult.unwrap();
+    unwrappedSplitTextNodeResult.IgnoreCaretPointSuggestion();
+    return unwrappedSplitTextNodeResult.AtSplitPoint<EditorDOMPoint>();
+  }();
+  if (MOZ_UNLIKELY(pointToInsertNewStyleOrError.isErr())) {
+    return pointToInsertNewStyleOrError.propagateErr();
+  }
+
+  if (pointToInsertNewStyleOrError.inspect().IsInTextNode()) {
+    return RefPtr<Text>(
+        pointToInsertNewStyleOrError.inspect().ContainerAs<Text>());
+  }
+
+  RefPtr<Text> newEmptyTextNode = aHTMLEditor.CreateTextNode(u""_ns);
+  if (MOZ_UNLIKELY(!newEmptyTextNode)) {
+    NS_WARNING("EditorBase::CreateTextNode() failed");
+    return Err(NS_ERROR_FAILURE);
+  }
+  Result<CreateTextResult, nsresult> insertNewTextNodeResult =
+      aHTMLEditor.InsertNodeWithTransaction<Text>(
+          *newEmptyTextNode, pointToInsertNewStyleOrError.inspect());
+  if (MOZ_UNLIKELY(insertNewTextNodeResult.isErr())) {
+    NS_WARNING("EditorBase::InsertNodeWithTransaction() failed");
+    return insertNewTextNodeResult.propagateErr();
+  }
+  insertNewTextNodeResult.inspect().IgnoreCaretPointSuggestion();
+  return newEmptyTextNode;
+}
+
+Result<bool, nsresult>
+HTMLEditor::AutoInlineStyleSetter::ElementIsGoodContainerForTheStyle(
+    HTMLEditor& aHTMLEditor, Element& aElement) const {
+  const bool isCSSEditable = IsCSSSettable(aElement);
+  if (!aHTMLEditor.IsCSSEnabled() || !isCSSEditable) {
+    if (aElement.IsHTMLElement(&HTMLPropertyRef()) &&
+        !HTMLEditUtils::ElementHasAttribute(aElement) && !mAttribute) {
+      return true;
+    }
+
+    if (mAttribute) {
+      nsString attrValue;
+      if (aElement.IsHTMLElement(&HTMLPropertyRef()) &&
+          !HTMLEditUtils::ElementHasAttributeExcept(aElement, *mAttribute) &&
+          aElement.GetAttr(mAttribute, attrValue)) {
+        if (attrValue.Equals(mAttributeValue,
+                             nsCaseInsensitiveStringComparator)) {
+          return true;
+        }
+        if (mAttribute == nsGkAtoms::color ||
+            mAttribute == nsGkAtoms::bgcolor) {
+          if (aHTMLEditor.IsCSSEnabled()) {
+            if (HTMLEditUtils::IsSameCSSColorValue(mAttributeValue,
+                                                   attrValue)) {
+              return true;
+            }
+          } else if (HTMLEditUtils::IsSameHTMLColorValue(
+                         mAttributeValue, attrValue,
+                         HTMLEditUtils::TransparentKeyword::Allowed)) {
+            return true;
+          }
+        }
+      }
+    }
+
+    if (!isCSSEditable) {
+      return false;
+    }
+  }
+
+  if (!aElement.IsHTMLElement(nsGkAtoms::span) ||
+      !aElement.HasAttr(nsGkAtoms::style) ||
+      HTMLEditUtils::ElementHasAttributeExcept(aElement, *nsGkAtoms::style)) {
+    return false;
+  }
+
+  nsStyledElement* styledElement = nsStyledElement::FromNode(&aElement);
+  if (MOZ_UNLIKELY(!styledElement)) {
+    return false;
+  }
+
+  RefPtr<Element> newSpanElement =
+      aHTMLEditor.CreateHTMLContent(nsGkAtoms::span);
+  if (MOZ_UNLIKELY(!newSpanElement)) {
+    NS_WARNING("EditorBase::CreateHTMLContent(nsGkAtoms::span) failed");
+    return false;
+  }
+  nsStyledElement* styledNewSpanElement =
+      nsStyledElement::FromNode(newSpanElement);
+  if (MOZ_UNLIKELY(!styledNewSpanElement)) {
+    return false;
+  }
+  Result<size_t, nsresult> result = CSSEditUtils::SetCSSEquivalentToStyle(
+      WithTransaction::No, aHTMLEditor, MOZ_KnownLive(*styledNewSpanElement),
+      *this, &mAttributeValue);
+  if (MOZ_UNLIKELY(result.isErr())) {
+    MOZ_ASSERT_UNREACHABLE("How did you destroy this editor?");
+    if (NS_WARN_IF(result.inspectErr() == NS_ERROR_EDITOR_DESTROYED)) {
+      return Err(NS_ERROR_EDITOR_DESTROYED);
+    }
+    return false;
+  }
+  return CSSEditUtils::DoStyledElementsHaveSameStyle(*styledNewSpanElement,
+                                                     *styledElement);
+}
+
+bool HTMLEditor::AutoInlineStyleSetter::ElementIsGoodContainerToSetStyle(
+    nsStyledElement& aStyledElement) const {
+  if (!HTMLEditUtils::IsContainerNode(aStyledElement) ||
+      !EditorUtils::IsEditableContent(aStyledElement, EditorType::HTML)) {
+    return false;
+  }
+
+  if (aStyledElement.HasAttr(nsGkAtoms::style)) {
+    return true;
+  }
+
+  if (aStyledElement.HasAttr(nsGkAtoms::id) ||
+      aStyledElement.HasAttr(nsGkAtoms::_class)) {
+    return true;
+  }
+
+  if (IsStyleOfTextDecoration(IgnoreSElement::No) &&
+      aStyledElement.IsAnyOfHTMLElements(nsGkAtoms::u, nsGkAtoms::s,
+                                         nsGkAtoms::strike, nsGkAtoms::ins,
+                                         nsGkAtoms::del)) {
+    return true;
+  }
+
+  if (&HTMLPropertyRef() == nsGkAtoms::font &&
+      aStyledElement.IsHTMLElement(nsGkAtoms::font)) {
+    return true;
+  }
+
+  if (aStyledElement.QuerySelector("br"_ns, IgnoreErrors())) {
+    return false;
+  }
+
+
+  if (aStyledElement.GetParentElement() &&
+      HTMLEditUtils::IsBlockElement(
+          *aStyledElement.GetParentElement(),
+          BlockInlineCheck::UseComputedDisplayStyle)) {
+    for (nsIContent* previousSibling = aStyledElement.GetPreviousSibling();
+         previousSibling;
+         previousSibling = previousSibling->GetPreviousSibling()) {
+      if (previousSibling->IsElement()) {
+        return false;  
+      }
+      if (Text* text = Text::FromNode(previousSibling)) {
+        if (HTMLEditUtils::IsVisibleTextNode(
+                *text, TreatInvisibleLineBreakAs::Visible)) {
+          return false;
+        }
+        continue;
+      }
+    }
+    for (nsIContent* nextSibling = aStyledElement.GetNextSibling(); nextSibling;
+         nextSibling = nextSibling->GetNextSibling()) {
+      if (nextSibling->IsElement()) {
+        if (!HTMLEditUtils::IsBRElementFollowedByBlockBoundary(*nextSibling)) {
+          return false;
+        }
+        continue;  
+      }
+      if (Text* text = Text::FromNode(nextSibling)) {
+        if (HTMLEditUtils::IsVisibleTextNode(
+                *text, TreatInvisibleLineBreakAs::Visible)) {
+          return false;
+        }
+        continue;
+      }
+    }
+    return true;
+  }
+
+  return false;
+}
+
+Result<SplitRangeOffFromNodeResult, nsresult>
+HTMLEditor::AutoInlineStyleSetter::SplitTextNodeAndApplyStyleToMiddleNode(
+    HTMLEditor& aHTMLEditor, Text& aText, uint32_t aStartOffset,
+    uint32_t aEndOffset) {
+  const RefPtr<Element> element = aText.GetParentElement();
+  if (!element || !HTMLEditUtils::CanNodeContain(*element, HTMLPropertyRef())) {
+    OnHandled(EditorDOMPoint(&aText, aStartOffset),
+              EditorDOMPoint(&aText, aEndOffset));
+    return SplitRangeOffFromNodeResult(nullptr, &aText, nullptr);
+  }
+
+  if (aStartOffset == aEndOffset) {
+    OnHandled(EditorDOMPoint(&aText, aStartOffset),
+              EditorDOMPoint(&aText, aEndOffset));
+    return SplitRangeOffFromNodeResult(nullptr, &aText, nullptr);
+  }
+
+  if (IsCSSSettable(*element)) {
+    nsAutoString value(mAttributeValue);
+    Result<bool, nsresult> isComputedCSSEquivalentToStyleOrError =
+        CSSEditUtils::IsComputedCSSEquivalentTo(aHTMLEditor, *element, *this,
+                                                value);
+    if (MOZ_UNLIKELY(isComputedCSSEquivalentToStyleOrError.isErr())) {
+      NS_WARNING("CSSEditUtils::IsComputedCSSEquivalentTo() failed");
+      return isComputedCSSEquivalentToStyleOrError.propagateErr();
+    }
+    if (isComputedCSSEquivalentToStyleOrError.unwrap()) {
+      OnHandled(EditorDOMPoint(&aText, aStartOffset),
+                EditorDOMPoint(&aText, aEndOffset));
+      return SplitRangeOffFromNodeResult(nullptr, &aText, nullptr);
+    }
+  } else if (HTMLEditUtils::IsInlineStyleSetByElement(aText, *this,
+                                                      &mAttributeValue)) {
+    OnHandled(EditorDOMPoint(&aText, aStartOffset),
+              EditorDOMPoint(&aText, aEndOffset));
+    return SplitRangeOffFromNodeResult(nullptr, &aText, nullptr);
+  }
+
+  auto splitAtEndResult =
+      [&]() MOZ_CAN_RUN_SCRIPT -> Result<SplitNodeResult, nsresult> {
+    EditorDOMPoint atEnd(&aText, aEndOffset);
+    if (atEnd.IsEndOfContainer()) {
+      return SplitNodeResult::NotHandled(atEnd);
+    }
+    Result<SplitNodeResult, nsresult> splitNodeResult =
+        aHTMLEditor.SplitNodeWithTransaction(atEnd);
+    if (splitNodeResult.isErr()) {
+      NS_WARNING("HTMLEditor::SplitNodeWithTransaction() failed");
+      return splitNodeResult;
+    }
+    if (MOZ_UNLIKELY(!splitNodeResult.inspect().HasCaretPointSuggestion())) {
+      NS_WARNING(
+          "HTMLEditor::SplitNodeWithTransaction() didn't suggest caret "
+          "point");
+      return Err(NS_ERROR_FAILURE);
+    }
+    return splitNodeResult;
+  }();
+  if (MOZ_UNLIKELY(splitAtEndResult.isErr())) {
+    return splitAtEndResult.propagateErr();
+  }
+  SplitNodeResult unwrappedSplitAtEndResult = splitAtEndResult.unwrap();
+  EditorDOMPoint pointToPutCaret = unwrappedSplitAtEndResult.UnwrapCaretPoint();
+  auto splitAtStartResult =
+      [&]() MOZ_CAN_RUN_SCRIPT -> Result<SplitNodeResult, nsresult> {
+    EditorDOMPoint atStart(unwrappedSplitAtEndResult.DidSplit()
+                               ? unwrappedSplitAtEndResult.GetPreviousContent()
+                               : &aText,
+                           aStartOffset);
+    if (atStart.IsStartOfContainer()) {
+      return SplitNodeResult::NotHandled(atStart);
+    }
+    Result<SplitNodeResult, nsresult> splitNodeResult =
+        aHTMLEditor.SplitNodeWithTransaction(atStart);
+    if (MOZ_UNLIKELY(splitNodeResult.isErr())) {
+      NS_WARNING("HTMLEditor::SplitNodeWithTransaction() failed");
+      return splitNodeResult;
+    }
+    if (MOZ_UNLIKELY(!splitNodeResult.inspect().HasCaretPointSuggestion())) {
+      NS_WARNING(
+          "HTMLEditor::SplitNodeWithTransaction() didn't suggest caret "
+          "point");
+      return Err(NS_ERROR_FAILURE);
+    }
+    return splitNodeResult;
+  }();
+  if (MOZ_UNLIKELY(splitAtStartResult.isErr())) {
+    return splitAtStartResult.propagateErr();
+  }
+  SplitNodeResult unwrappedSplitAtStartResult = splitAtStartResult.unwrap();
+  if (unwrappedSplitAtStartResult.HasCaretPointSuggestion()) {
+    pointToPutCaret = unwrappedSplitAtStartResult.UnwrapCaretPoint();
+  }
+
+  MOZ_ASSERT_IF(unwrappedSplitAtStartResult.DidSplit(),
+                unwrappedSplitAtStartResult.GetPreviousContent()->IsText());
+  MOZ_ASSERT_IF(unwrappedSplitAtStartResult.DidSplit(),
+                unwrappedSplitAtStartResult.GetNextContent()->IsText());
+  MOZ_ASSERT_IF(unwrappedSplitAtEndResult.DidSplit(),
+                unwrappedSplitAtEndResult.GetPreviousContent()->IsText());
+  MOZ_ASSERT_IF(unwrappedSplitAtEndResult.DidSplit(),
+                unwrappedSplitAtEndResult.GetNextContent()->IsText());
+  Text* const leftTextNode =
+      unwrappedSplitAtStartResult.DidSplit()
+          ? unwrappedSplitAtStartResult.GetPreviousContentAs<Text>()
+          : nullptr;
+  Text* const middleTextNode =
+      unwrappedSplitAtStartResult.DidSplit()
+          ? unwrappedSplitAtStartResult.GetNextContentAs<Text>()
+          : (unwrappedSplitAtEndResult.DidSplit()
+                 ? unwrappedSplitAtEndResult.GetPreviousContentAs<Text>()
+                 : &aText);
+  Text* const rightTextNode =
+      unwrappedSplitAtEndResult.DidSplit()
+          ? unwrappedSplitAtEndResult.GetNextContentAs<Text>()
+          : nullptr;
+  if (mAttribute) {
+    nsIContent* sibling = HTMLEditUtils::GetPreviousSibling(
+        *middleTextNode, {LeafNodeOption::IgnoreNonEditableNode},
+        BlockInlineCheck::UseComputedDisplayOutsideStyle);
+    if (sibling && sibling->IsElement()) {
+      OwningNonNull<Element> element(*sibling->AsElement());
+      Result<bool, nsresult> result =
+          ElementIsGoodContainerForTheStyle(aHTMLEditor, element);
+      if (MOZ_UNLIKELY(result.isErr())) {
+        NS_WARNING("HTMLEditor::ElementIsGoodContainerForTheStyle() failed");
+        return result.propagateErr();
+      }
+      if (result.inspect()) {
+        Result<MoveNodeResult, nsresult> moveTextNodeResult =
+            aHTMLEditor.MoveNodeToEndWithTransaction(
+                MOZ_KnownLive(*middleTextNode), element);
+        if (MOZ_UNLIKELY(moveTextNodeResult.isErr())) {
+          NS_WARNING("HTMLEditor::MoveNodeToEndWithTransaction() failed");
+          return moveTextNodeResult.propagateErr();
+        }
+        MoveNodeResult unwrappedMoveTextNodeResult =
+            moveTextNodeResult.unwrap();
+        unwrappedMoveTextNodeResult.MoveCaretPointTo(
+            pointToPutCaret, {SuggestCaret::OnlyIfHasSuggestion});
+        OnHandled(*middleTextNode);
+        return SplitRangeOffFromNodeResult(leftTextNode, middleTextNode,
+                                           rightTextNode,
+                                           std::move(pointToPutCaret));
+      }
+    }
+    sibling = HTMLEditUtils::GetNextSibling(
+        *middleTextNode, {LeafNodeOption::IgnoreNonEditableNode},
+        BlockInlineCheck::UseComputedDisplayOutsideStyle);
+    if (sibling && sibling->IsElement()) {
+      OwningNonNull<Element> element(*sibling->AsElement());
+      Result<bool, nsresult> result =
+          ElementIsGoodContainerForTheStyle(aHTMLEditor, element);
+      if (MOZ_UNLIKELY(result.isErr())) {
+        NS_WARNING("HTMLEditor::ElementIsGoodContainerForTheStyle() failed");
+        return result.propagateErr();
+      }
+      if (result.inspect()) {
+        Result<MoveNodeResult, nsresult> moveTextNodeResult =
+            aHTMLEditor.MoveNodeWithTransaction(MOZ_KnownLive(*middleTextNode),
+                                                EditorDOMPoint(sibling, 0u));
+        if (MOZ_UNLIKELY(moveTextNodeResult.isErr())) {
+          NS_WARNING("HTMLEditor::MoveNodeWithTransaction() failed");
+          return moveTextNodeResult.propagateErr();
+        }
+        MoveNodeResult unwrappedMoveTextNodeResult =
+            moveTextNodeResult.unwrap();
+        unwrappedMoveTextNodeResult.MoveCaretPointTo(
+            pointToPutCaret, {SuggestCaret::OnlyIfHasSuggestion});
+        OnHandled(*middleTextNode);
+        return SplitRangeOffFromNodeResult(leftTextNode, middleTextNode,
+                                           rightTextNode,
+                                           std::move(pointToPutCaret));
+      }
+    }
+  }
+
+  Result<CaretPoint, nsresult> setStyleResult =
+      ApplyStyleToNodeOrChildrenAndRemoveNestedSameStyle(
+          aHTMLEditor, MOZ_KnownLive(*middleTextNode));
+  if (MOZ_UNLIKELY(setStyleResult.isErr())) {
+    NS_WARNING(
+        "AutoInlineStyleSetter::"
+        "ApplyStyleToNodeOrChildrenAndRemoveNestedSameStyle() failed");
+    return setStyleResult.propagateErr();
+  }
+  return SplitRangeOffFromNodeResult(
+      leftTextNode, middleTextNode, rightTextNode,
+      setStyleResult.unwrap().UnwrapCaretPoint());
+}
+
+Result<CaretPoint, nsresult> HTMLEditor::AutoInlineStyleSetter::ApplyStyle(
+    HTMLEditor& aHTMLEditor, nsIContent& aContent) {
+  if (!HTMLEditUtils::CanNodeContain(*nsGkAtoms::span, aContent)) {
+    if (!aContent.HasChildren()) {
+      return CaretPoint(EditorDOMPoint());
+    }
+
+    AutoTArray<OwningNonNull<nsIContent>, 32> arrayOfContents;
+    HTMLEditUtils::CollectChildren(
+        aContent, arrayOfContents,
+        {CollectChildrenOption::IgnoreNonEditableChildren,
+         CollectChildrenOption::IgnoreInvisibleTextNodes});
+
+    EditorDOMPoint pointToPutCaret;
+    for (const OwningNonNull<nsIContent>& content : arrayOfContents) {
+      Result<CaretPoint, nsresult> setInlinePropertyResult =
+          ApplyStyleToNodeOrChildrenAndRemoveNestedSameStyle(
+              aHTMLEditor, MOZ_KnownLive(content));
+      if (MOZ_UNLIKELY(setInlinePropertyResult.isErr())) {
+        NS_WARNING(
+            "AutoInlineStyleSetter::"
+            "ApplyStyleToNodeOrChildrenAndRemoveNestedSameStyle() failed");
+        return setInlinePropertyResult;
+      }
+      setInlinePropertyResult.unwrap().MoveCaretPointTo(
+          pointToPutCaret, {SuggestCaret::OnlyIfHasSuggestion});
+    }
+    return CaretPoint(std::move(pointToPutCaret));
+  }
+
+  const nsCOMPtr<nsIContent> previousSibling =
+      HTMLEditUtils::GetPreviousSibling(
+          aContent, {LeafNodeOption::IgnoreNonEditableNode},
+          BlockInlineCheck::UseComputedDisplayOutsideStyle);
+  const nsCOMPtr<nsIContent> nextSibling = HTMLEditUtils::GetNextSibling(
+      aContent, {LeafNodeOption::IgnoreNonEditableNode},
+      BlockInlineCheck::UseComputedDisplayOutsideStyle);
+  if (RefPtr<Element> previousElement =
+          Element::FromNodeOrNull(previousSibling)) {
+    Result<bool, nsresult> canMoveIntoPreviousSibling =
+        ElementIsGoodContainerForTheStyle(aHTMLEditor, *previousElement);
+    if (MOZ_UNLIKELY(canMoveIntoPreviousSibling.isErr())) {
+      NS_WARNING("HTMLEditor::ElementIsGoodContainerForTheStyle() failed");
+      return canMoveIntoPreviousSibling.propagateErr();
+    }
+    if (canMoveIntoPreviousSibling.inspect()) {
+      Result<MoveNodeResult, nsresult> moveNodeResult =
+          aHTMLEditor.MoveNodeToEndWithTransaction(aContent, *previousSibling);
+      if (MOZ_UNLIKELY(moveNodeResult.isErr())) {
+        NS_WARNING("HTMLEditor::MoveNodeToEndWithTransaction() failed");
+        return moveNodeResult.propagateErr();
+      }
+      MoveNodeResult unwrappedMoveNodeResult = moveNodeResult.unwrap();
+      RefPtr<Element> nextElement = Element::FromNodeOrNull(nextSibling);
+      if (!nextElement) {
+        OnHandled(aContent);
+        return CaretPoint(unwrappedMoveNodeResult.UnwrapCaretPoint());
+      }
+      Result<bool, nsresult> canMoveIntoNextSibling =
+          ElementIsGoodContainerForTheStyle(aHTMLEditor, *nextElement);
+      if (MOZ_UNLIKELY(canMoveIntoNextSibling.isErr())) {
+        NS_WARNING("HTMLEditor::ElementIsGoodContainerForTheStyle() failed");
+        unwrappedMoveNodeResult.IgnoreCaretPointSuggestion();
+        return canMoveIntoNextSibling.propagateErr();
+      }
+      if (!canMoveIntoNextSibling.inspect()) {
+        OnHandled(aContent);
+        return CaretPoint(unwrappedMoveNodeResult.UnwrapCaretPoint());
+      }
+      unwrappedMoveNodeResult.IgnoreCaretPointSuggestion();
+
+      AutoTransactionsConserveSelection dontChangeMySelection(aHTMLEditor);
+      Result<JoinNodesResult, nsresult> joinNodesResult =
+          aHTMLEditor.JoinNodesWithTransaction(*previousElement, *nextElement);
+      if (MOZ_UNLIKELY(joinNodesResult.isErr())) {
+        NS_WARNING("HTMLEditor::JoinNodesWithTransaction() failed");
+        return joinNodesResult.propagateErr();
+      }
+      OnHandled(aContent);
+      return CaretPoint(
+          joinNodesResult.inspect().AtJoinedPoint<EditorDOMPoint>());
+    }
+  }
+
+  if (RefPtr<Element> nextElement = Element::FromNodeOrNull(nextSibling)) {
+    Result<bool, nsresult> canMoveIntoNextSibling =
+        ElementIsGoodContainerForTheStyle(aHTMLEditor, *nextElement);
+    if (MOZ_UNLIKELY(canMoveIntoNextSibling.isErr())) {
+      NS_WARNING("HTMLEditor::ElementIsGoodContainerForTheStyle() failed");
+      return canMoveIntoNextSibling.propagateErr();
+    }
+    if (canMoveIntoNextSibling.inspect()) {
+      Result<MoveNodeResult, nsresult> moveNodeResult =
+          aHTMLEditor.MoveNodeWithTransaction(aContent,
+                                              EditorDOMPoint(nextElement, 0u));
+      if (MOZ_UNLIKELY(moveNodeResult.isErr())) {
+        NS_WARNING("HTMLEditor::MoveNodeWithTransaction() failed");
+        return moveNodeResult.propagateErr();
+      }
+      OnHandled(aContent);
+      return CaretPoint(moveNodeResult.unwrap().UnwrapCaretPoint());
+    }
+  }
+
+  if (const RefPtr<Element> element = aContent.GetAsElementOrParentElement()) {
+    if (IsCSSSettable(*element)) {
+      nsAutoString value(mAttributeValue);
+      Result<bool, nsresult> isComputedCSSEquivalentToStyleOrError =
+          CSSEditUtils::IsComputedCSSEquivalentTo(aHTMLEditor, *element, *this,
+                                                  value);
+      if (MOZ_UNLIKELY(isComputedCSSEquivalentToStyleOrError.isErr())) {
+        NS_WARNING("CSSEditUtils::IsComputedCSSEquivalentTo() failed");
+        return isComputedCSSEquivalentToStyleOrError.propagateErr();
+      }
+      if (isComputedCSSEquivalentToStyleOrError.unwrap()) {
+        OnHandled(aContent);
+        return CaretPoint(EditorDOMPoint());
+      }
+    } else if (HTMLEditUtils::IsInlineStyleSetByElement(*element, *this,
+                                                        &mAttributeValue)) {
+      OnHandled(aContent);
+      return CaretPoint(EditorDOMPoint());
+    }
+  }
+
+  auto ShouldUseCSS = [&]() {
+    if (aHTMLEditor.IsCSSEnabled() && aContent.GetAsElementOrParentElement() &&
+        IsCSSSettable(*aContent.GetAsElementOrParentElement())) {
+      return true;
+    }
+    if (mAttribute == nsGkAtoms::bgcolor) {
+      return true;
+    }
+    if (IsStyleToInvert()) {
+      return true;
+    }
+    if (mAttribute == nsGkAtoms::color) {
+      return mAttributeValue.First() != '#' &&
+             !HTMLEditUtils::CanConvertToHTMLColorValue(mAttributeValue);
+    }
+    return false;
+  };
+
+  if (ShouldUseCSS()) {
+    if (IsStyleOfTextDecoration(IgnoreSElement::No)) {
+      Result<CaretPoint, nsresult> result =
+          ApplyCSSTextDecoration(aHTMLEditor, aContent);
+      NS_WARNING_ASSERTION(
+          result.isOk(),
+          "AutoInlineStyleSetter::ApplyCSSTextDecoration() failed");
+      return result;
+    }
+    EditorDOMPoint pointToPutCaret;
+    RefPtr<nsStyledElement> styledElement = [&]() -> nsStyledElement* {
+      auto* const styledElement = nsStyledElement::FromNode(&aContent);
+      return styledElement && ElementIsGoodContainerToSetStyle(*styledElement)
+                 ? styledElement
+                 : nullptr;
+    }();
+
+    if (!styledElement) {
+      Result<CreateElementResult, nsresult> wrapInSpanElementResult =
+          aHTMLEditor.InsertContainerWithTransaction(aContent,
+                                                     *nsGkAtoms::span);
+      if (MOZ_UNLIKELY(wrapInSpanElementResult.isErr())) {
+        NS_WARNING(
+            "HTMLEditor::InsertContainerWithTransaction(nsGkAtoms::span) "
+            "failed");
+        return wrapInSpanElementResult.propagateErr();
+      }
+      CreateElementResult unwrappedWrapInSpanElementResult =
+          wrapInSpanElementResult.unwrap();
+      MOZ_ASSERT(unwrappedWrapInSpanElementResult.GetNewNode());
+      unwrappedWrapInSpanElementResult.MoveCaretPointTo(
+          pointToPutCaret, {SuggestCaret::OnlyIfHasSuggestion});
+      styledElement = nsStyledElement::FromNode(
+          unwrappedWrapInSpanElementResult.GetNewNode());
+      MOZ_ASSERT(styledElement);
+      if (MOZ_UNLIKELY(!styledElement)) {
+        OnHandled(aContent);
+        return CaretPoint(pointToPutCaret);
+      }
+    }
+
+    if (IsCSSSettable(*styledElement)) {
+      Result<size_t, nsresult> result = CSSEditUtils::SetCSSEquivalentToStyle(
+          WithTransaction::Yes, aHTMLEditor, *styledElement, *this,
+          &mAttributeValue);
+      if (MOZ_UNLIKELY(result.isErr())) {
+        if (NS_WARN_IF(result.inspectErr() == NS_ERROR_EDITOR_DESTROYED)) {
+          return Err(NS_ERROR_EDITOR_DESTROYED);
+        }
+        NS_WARNING(
+            "CSSEditUtils::SetCSSEquivalentToStyle() failed, but ignored");
+      }
+    }
+    OnHandled(aContent);
+    return CaretPoint(pointToPutCaret);
+  }
+
+  nsAutoString attributeValue(mAttributeValue);
+  if (mAttribute == nsGkAtoms::color && mAttributeValue.First() != '#') {
+    HTMLEditUtils::ConvertToNormalizedHTMLColorValue(attributeValue,
+                                                     attributeValue);
+  }
+
+  if (aContent.IsHTMLElement(&HTMLPropertyRef())) {
+    if (NS_WARN_IF(!mAttribute)) {
+      return Err(NS_ERROR_INVALID_ARG);
+    }
+    nsresult rv = aHTMLEditor.SetAttributeWithTransaction(
+        MOZ_KnownLive(*aContent.AsElement()), *mAttribute, attributeValue);
+    if (NS_WARN_IF(aHTMLEditor.Destroyed())) {
+      return Err(NS_ERROR_EDITOR_DESTROYED);
+    }
+    if (NS_FAILED(rv)) {
+      NS_WARNING("EditorBase::SetAttributeWithTransaction() failed");
+      return Err(rv);
+    }
+    OnHandled(aContent);
+    return CaretPoint(EditorDOMPoint());
+  }
+
+  Result<CreateElementResult, nsresult> wrapWithNewElementToFormatResult =
+      aHTMLEditor.InsertContainerWithTransaction(
+          aContent, MOZ_KnownLive(HTMLPropertyRef()),
+          !mAttribute ? HTMLEditor::DoNothingForNewElement
+                      : [&](HTMLEditor& aHTMLEditor, Element& aNewElement,
+                            const EditorDOMPoint&) MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+                          nsresult rv =
+                              aNewElement.SetAttr(kNameSpaceID_None, mAttribute,
+                                                  attributeValue, false);
+                          NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                                               "Element::SetAttr() failed");
+                          return rv;
+                        });
+  if (MOZ_UNLIKELY(wrapWithNewElementToFormatResult.isErr())) {
+    NS_WARNING("HTMLEditor::InsertContainerWithTransaction() failed");
+    return wrapWithNewElementToFormatResult.propagateErr();
+  }
+  OnHandled(aContent);
+  MOZ_ASSERT(wrapWithNewElementToFormatResult.inspect().GetNewNode());
+  return CaretPoint(
+      wrapWithNewElementToFormatResult.unwrap().UnwrapCaretPoint());
+}
+
+Result<CaretPoint, nsresult>
+HTMLEditor::AutoInlineStyleSetter::ApplyCSSTextDecoration(
+    HTMLEditor& aHTMLEditor, nsIContent& aContent) {
+  MOZ_ASSERT(IsStyleOfTextDecoration(IgnoreSElement::No));
+
+  EditorDOMPoint pointToPutCaret;
+  RefPtr<nsStyledElement> styledElement = nsStyledElement::FromNode(aContent);
+  nsAutoString newTextDecorationValue;
+  if (&HTMLPropertyRef() == nsGkAtoms::u) {
+    newTextDecorationValue.AssignLiteral(u"underline");
+  } else if (&HTMLPropertyRef() == nsGkAtoms::s ||
+             &HTMLPropertyRef() == nsGkAtoms::strike) {
+    newTextDecorationValue.AssignLiteral(u"line-through");
+  } else {
+    MOZ_ASSERT_UNREACHABLE(
+        "Was new value added in "
+        "IsStyleOfTextDecoration(IgnoreSElement::No))?");
+  }
+  if (styledElement && IsCSSSettable(*styledElement) &&
+      ElementIsGoodContainerToSetStyle(*styledElement)) {
+    nsAutoString textDecorationValue;
+    nsresult rv = CSSEditUtils::GetSpecifiedProperty(
+        *styledElement, *nsGkAtoms::text_decoration, textDecorationValue);
+    if (NS_FAILED(rv)) {
+      NS_WARNING(
+          "CSSEditUtils::GetSpecifiedProperty(nsGkAtoms::text_decoration) "
+          "failed");
+      return Err(rv);
+    }
+    if (styledElement && styledElement->IsAnyOfHTMLElements(
+                             nsGkAtoms::u, nsGkAtoms::s, nsGkAtoms::strike)) {
+      Result<CreateElementResult, nsresult> replaceResult =
+          aHTMLEditor.ReplaceContainerAndCloneAttributesWithTransaction(
+              *styledElement, *nsGkAtoms::span);
+      if (MOZ_UNLIKELY(replaceResult.isErr())) {
+        NS_WARNING(
+            "HTMLEditor::ReplaceContainerAndCloneAttributesWithTransaction() "
+            "failed");
+        return replaceResult.propagateErr();
+      }
+      CreateElementResult unwrappedReplaceResult = replaceResult.unwrap();
+      MOZ_ASSERT(unwrappedReplaceResult.GetNewNode());
+      unwrappedReplaceResult.MoveCaretPointTo(
+          pointToPutCaret, {SuggestCaret::OnlyIfHasSuggestion});
+      if (textDecorationValue.IsEmpty()) {
+        if (!newTextDecorationValue.IsEmpty()) {
+          newTextDecorationValue.Append(HTMLEditUtils::kSpace);
+        }
+        if (styledElement->IsHTMLElement(nsGkAtoms::u)) {
+          newTextDecorationValue.AppendLiteral(u"underline");
+        } else {
+          newTextDecorationValue.AppendLiteral(u"line-through");
+        }
+      }
+      styledElement =
+          nsStyledElement::FromNode(unwrappedReplaceResult.GetNewNode());
+      if (NS_WARN_IF(!styledElement)) {
+        OnHandled(aContent);
+        return CaretPoint(pointToPutCaret);
+      }
+    }
+    else if (textDecorationValue.IsEmpty() &&
+             styledElement->IsAnyOfHTMLElements(nsGkAtoms::u, nsGkAtoms::ins)) {
+      if (!newTextDecorationValue.IsEmpty()) {
+        newTextDecorationValue.Append(HTMLEditUtils::kSpace);
+      }
+      newTextDecorationValue.AppendLiteral(u"underline");
+    } else if (textDecorationValue.IsEmpty() &&
+               styledElement->IsAnyOfHTMLElements(
+                   nsGkAtoms::s, nsGkAtoms::strike, nsGkAtoms::del)) {
+      if (!newTextDecorationValue.IsEmpty()) {
+        newTextDecorationValue.Append(HTMLEditUtils::kSpace);
+      }
+      newTextDecorationValue.AppendLiteral(u"line-through");
+    }
+  }
+  else {
+    Result<CreateElementResult, nsresult> wrapInSpanElementResult =
+        aHTMLEditor.InsertContainerWithTransaction(aContent, *nsGkAtoms::span);
+    if (MOZ_UNLIKELY(wrapInSpanElementResult.isErr())) {
+      NS_WARNING(
+          "HTMLEditor::InsertContainerWithTransaction(nsGkAtoms::span) failed");
+      return wrapInSpanElementResult.propagateErr();
+    }
+    CreateElementResult unwrappedWrapInSpanElementResult =
+        wrapInSpanElementResult.unwrap();
+    MOZ_ASSERT(unwrappedWrapInSpanElementResult.GetNewNode());
+    unwrappedWrapInSpanElementResult.MoveCaretPointTo(
+        pointToPutCaret, {SuggestCaret::OnlyIfHasSuggestion});
+    styledElement = nsStyledElement::FromNode(
+        unwrappedWrapInSpanElementResult.GetNewNode());
+    if (NS_WARN_IF(!styledElement)) {
+      OnHandled(aContent);
+      return CaretPoint(pointToPutCaret);
+    }
+  }
+
+  nsresult rv = CSSEditUtils::SetCSSPropertyWithTransaction(
+      aHTMLEditor, *styledElement, *nsGkAtoms::text_decoration,
+      newTextDecorationValue);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("CSSEditUtils::SetCSSPropertyWithTransaction() failed");
+    return Err(rv);
+  }
+  OnHandled(aContent);
+  return CaretPoint(pointToPutCaret);
+}
+
+Result<CaretPoint, nsresult> HTMLEditor::AutoInlineStyleSetter::
+    ApplyStyleToNodeOrChildrenAndRemoveNestedSameStyle(HTMLEditor& aHTMLEditor,
+                                                       nsIContent& aContent) {
+  if (NS_WARN_IF(!aContent.GetParentNode())) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  OwningNonNull<nsINode> parent = *aContent.GetParentNode();
+  nsCOMPtr<nsIContent> previousSibling = aContent.GetPreviousSibling(),
+                       nextSibling = aContent.GetNextSibling();
+  EditorDOMPoint pointToPutCaret;
+  if (aContent.IsElement()) {
+    Result<EditorDOMPoint, nsresult> removeStyleResult =
+        aHTMLEditor.RemoveStyleInside(MOZ_KnownLive(*aContent.AsElement()),
+                                      *this, SpecifiedStyle::Preserve);
+    if (MOZ_UNLIKELY(removeStyleResult.isErr())) {
+      NS_WARNING("HTMLEditor::RemoveStyleInside() failed");
+      return removeStyleResult.propagateErr();
+    }
+    if (removeStyleResult.inspect().IsSet()) {
+      pointToPutCaret = removeStyleResult.unwrap();
+    }
+    if (nsStaticAtom* similarElementNameAtom = GetSimilarElementNameAtom()) {
+      Result<EditorDOMPoint, nsresult> removeStyleResult =
+          aHTMLEditor.RemoveStyleInside(
+              MOZ_KnownLive(*aContent.AsElement()),
+              EditorInlineStyle(*similarElementNameAtom),
+              SpecifiedStyle::Preserve);
+      if (MOZ_UNLIKELY(removeStyleResult.isErr())) {
+        NS_WARNING("HTMLEditor::RemoveStyleInside() failed");
+        return removeStyleResult.propagateErr();
+      }
+      if (removeStyleResult.inspect().IsSet()) {
+        pointToPutCaret = removeStyleResult.unwrap();
+      }
+    }
+  }
+
+  if (aContent.GetParentNode()) {
+    Result<CaretPoint, nsresult> pointToPutCaretOrError =
+        ApplyStyle(aHTMLEditor, aContent);
+    NS_WARNING_ASSERTION(pointToPutCaretOrError.isOk(),
+                         "AutoInlineStyleSetter::ApplyStyle() failed");
+    return pointToPutCaretOrError;
+  }
+
+  if (NS_WARN_IF(previousSibling &&
+                 previousSibling->GetParentNode() != parent) ||
+      NS_WARN_IF(nextSibling && nextSibling->GetParentNode() != parent) ||
+      NS_WARN_IF(!parent->IsInComposedDoc())) {
+    return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+  }
+  AutoTArray<OwningNonNull<nsIContent>, 24> nodesToSet;
+  for (nsIContent* content = previousSibling ? previousSibling->GetNextSibling()
+                                             : parent->GetFirstChild();
+       content && content != nextSibling; content = content->GetNextSibling()) {
+    if (EditorUtils::IsEditableContent(*content, EditorType::HTML)) {
+      nodesToSet.AppendElement(*content);
+    }
+  }
+
+  for (OwningNonNull<nsIContent>& content : nodesToSet) {
+    Result<CaretPoint, nsresult> pointToPutCaretOrError =
+        ApplyStyle(aHTMLEditor, MOZ_KnownLive(content));
+    if (MOZ_UNLIKELY(pointToPutCaretOrError.isErr())) {
+      NS_WARNING("AutoInlineStyleSetter::ApplyStyle() failed");
+      return pointToPutCaretOrError;
+    }
+    pointToPutCaretOrError.unwrap().MoveCaretPointTo(
+        pointToPutCaret, {SuggestCaret::OnlyIfHasSuggestion});
+  }
+
+  return CaretPoint(pointToPutCaret);
+}
+
+bool HTMLEditor::AutoInlineStyleSetter::ContentIsElementSettingTheStyle(
+    const HTMLEditor& aHTMLEditor, nsIContent& aContent) const {
+  Element* const element = Element::FromNode(&aContent);
+  if (!element) {
+    return false;
+  }
+  if (IsRepresentedBy(*element)) {
+    return true;
+  }
+  Result<bool, nsresult> specified = IsSpecifiedBy(aHTMLEditor, *element);
+  NS_WARNING_ASSERTION(specified.isOk(),
+                       "EditorInlineStyle::IsSpecified() failed, but ignored");
+  return specified.unwrapOr(false);
+}
+
+nsIContent* HTMLEditor::AutoInlineStyleSetter::GetNextEditableInlineContent(
+    const nsIContent& aContent, const nsINode* aLimiter) {
+  auto* const nextContentInRange = [&]() -> nsIContent* {
+    for (nsIContent* parent : aContent.InclusiveAncestorsOfType<nsIContent>()) {
+      if (parent == aLimiter ||
+          !EditorUtils::IsEditableContent(*parent, EditorType::HTML) ||
+          (parent->IsElement() &&
+           (HTMLEditUtils::IsBlockElement(
+                *parent->AsElement(),
+                BlockInlineCheck::UseComputedDisplayOutsideStyle) ||
+            HTMLEditUtils::IsDisplayInsideFlowRoot(*parent->AsElement())))) {
+        return nullptr;
+      }
+      if (nsIContent* nextSibling = parent->GetNextSibling()) {
+        return nextSibling;
+      }
+    }
+    return nullptr;
+  }();
+  return nextContentInRange &&
+                 EditorUtils::IsEditableContent(*nextContentInRange,
+                                                EditorType::HTML) &&
+                 !HTMLEditUtils::IsBlockElement(
+                     *nextContentInRange,
+                     BlockInlineCheck::UseComputedDisplayOutsideStyle)
+             ? nextContentInRange
+             : nullptr;
+}
+
+nsIContent* HTMLEditor::AutoInlineStyleSetter::GetPreviousEditableInlineContent(
+    const nsIContent& aContent, const nsINode* aLimiter) {
+  auto* const previousContentInRange = [&]() -> nsIContent* {
+    for (nsIContent* parent : aContent.InclusiveAncestorsOfType<nsIContent>()) {
+      if (parent == aLimiter ||
+          !EditorUtils::IsEditableContent(*parent, EditorType::HTML) ||
+          (parent->IsElement() &&
+           (HTMLEditUtils::IsBlockElement(
+                *parent->AsElement(),
+                BlockInlineCheck::UseComputedDisplayOutsideStyle) ||
+            HTMLEditUtils::IsDisplayInsideFlowRoot(*parent->AsElement())))) {
+        return nullptr;
+      }
+      if (nsIContent* previousSibling = parent->GetPreviousSibling()) {
+        return previousSibling;
+      }
+    }
+    return nullptr;
+  }();
+  return previousContentInRange &&
+                 EditorUtils::IsEditableContent(*previousContentInRange,
+                                                EditorType::HTML) &&
+                 !HTMLEditUtils::IsBlockElement(
+                     *previousContentInRange,
+                     BlockInlineCheck::UseComputedDisplayOutsideStyle)
+             ? previousContentInRange
+             : nullptr;
+}
+
+EditorRawDOMPoint HTMLEditor::AutoInlineStyleSetter::GetShrunkenRangeStart(
+    const HTMLEditor& aHTMLEditor, const EditorDOMRange& aRange,
+    const nsINode& aCommonAncestorOfRange,
+    const nsIContent* aFirstEntirelySelectedContentNodeInRange) const {
+  const EditorDOMPoint& startRef = aRange.StartRef();
+  if (IsStyleOfAnchorElement()) {
+    return startRef.To<EditorRawDOMPoint>();
+  }
+  auto* const nextContentOrStartContainer = [&]() -> nsIContent* {
+    if (!startRef.IsInContentNode()) {
+      return nullptr;
+    }
+    if (!startRef.IsEndOfContainer()) {
+      return startRef.ContainerAs<nsIContent>();
+    }
+    nsIContent* const nextContent =
+        AutoInlineStyleSetter::GetNextEditableInlineContent(
+            *startRef.ContainerAs<nsIContent>(), &aCommonAncestorOfRange);
+    return nextContent ? nextContent : startRef.ContainerAs<nsIContent>();
+  }();
+  if (MOZ_UNLIKELY(!nextContentOrStartContainer)) {
+    return startRef.To<EditorRawDOMPoint>();
+  }
+  EditorRawDOMPoint startPoint =
+      nextContentOrStartContainer != startRef.ContainerAs<nsIContent>()
+          ? EditorRawDOMPoint(nextContentOrStartContainer)
+          : startRef.To<EditorRawDOMPoint>();
+  MOZ_ASSERT(startPoint.IsSet());
+  while (nsIContent* child = startPoint.GetChild()) {
+    if (!EditorUtils::IsEditableContent(*child, EditorType::HTML) ||
+        HTMLEditUtils::IsBlockElement(
+            *child, BlockInlineCheck::UseComputedDisplayOutsideStyle)) {
+      break;
+    }
+    if (child->IsText()) {
+      startPoint.Set(child, 0u);
+      break;
+    }
+    if (child == aFirstEntirelySelectedContentNodeInRange) {
+      break;
+    }
+    if (!HTMLEditUtils::IsContainerNode(*child)) {
+      break;
+    }
+    if (ContentIsElementSettingTheStyle(aHTMLEditor, *child)) {
+      break;
+    }
+    if (child->IsHTMLElement(nsGkAtoms::a)) {
+      break;
+    }
+    startPoint.Set(child, 0u);
+  }
+  return startPoint;
+}
+
+EditorRawDOMPoint HTMLEditor::AutoInlineStyleSetter::GetShrunkenRangeEnd(
+    const HTMLEditor& aHTMLEditor, const EditorDOMRange& aRange,
+    const nsINode& aCommonAncestorOfRange,
+    const nsIContent* aLastEntirelySelectedContentNodeInRange) const {
+  const EditorDOMPoint& endRef = aRange.EndRef();
+  if (IsStyleOfAnchorElement()) {
+    return endRef.To<EditorRawDOMPoint>();
+  }
+  auto* const previousContentOrEndContainer = [&]() -> nsIContent* {
+    if (!endRef.IsInContentNode()) {
+      return nullptr;
+    }
+    if (!endRef.IsStartOfContainer()) {
+      return endRef.ContainerAs<nsIContent>();
+    }
+    nsIContent* const previousContent =
+        AutoInlineStyleSetter::GetPreviousEditableInlineContent(
+            *endRef.ContainerAs<nsIContent>(), &aCommonAncestorOfRange);
+    return previousContent ? previousContent : endRef.ContainerAs<nsIContent>();
+  }();
+  if (MOZ_UNLIKELY(!previousContentOrEndContainer)) {
+    return endRef.To<EditorRawDOMPoint>();
+  }
+  EditorRawDOMPoint endPoint =
+      previousContentOrEndContainer != endRef.ContainerAs<nsIContent>()
+          ? EditorRawDOMPoint::After(*previousContentOrEndContainer)
+          : endRef.To<EditorRawDOMPoint>();
+  MOZ_ASSERT(endPoint.IsSet());
+  while (nsIContent* child = endPoint.GetPreviousSiblingOfChild()) {
+    if (!EditorUtils::IsEditableContent(*child, EditorType::HTML) ||
+        HTMLEditUtils::IsBlockElement(
+            *child, BlockInlineCheck::UseComputedDisplayOutsideStyle)) {
+      break;
+    }
+    if (child->IsText()) {
+      endPoint.SetToEndOf(child);
+      break;
+    }
+    if (child == aLastEntirelySelectedContentNodeInRange) {
+      break;
+    }
+    if (!HTMLEditUtils::IsContainerNode(*child)) {
+      break;
+    }
+    if (ContentIsElementSettingTheStyle(aHTMLEditor, *child)) {
+      break;
+    }
+    if (child->IsHTMLElement(nsGkAtoms::a)) {
+      break;
+    }
+    endPoint.SetToEndOf(child);
+  }
+  return endPoint;
+}
+
+EditorRawDOMPoint HTMLEditor::AutoInlineStyleSetter::
+    GetExtendedRangeStartToWrapAncestorApplyingSameStyle(
+        const HTMLEditor& aHTMLEditor,
+        const EditorRawDOMPoint& aStartPoint) const {
+  MOZ_ASSERT(aStartPoint.IsSetAndValid());
+
+  EditorRawDOMPoint startPoint = aStartPoint;
+  if (!startPoint.IsStartOfContainer() ||
+      startPoint.GetContainer()->GetPreviousSibling()) {
+    return startPoint;
+  }
+
+  const bool isSettingFontElement =
+      IsStyleOfFontSize() ||
+      (!aHTMLEditor.IsCSSEnabled() && IsStyleOfFontElement());
+  Element* mostDistantStartParentHavingStyle = nullptr;
+  for (Element* parent :
+       startPoint.GetContainer()->InclusiveAncestorsOfType<Element>()) {
+    if (!EditorUtils::IsEditableContent(*parent, EditorType::HTML) ||
+        HTMLEditUtils::IsBlockElement(
+            *parent, BlockInlineCheck::UseComputedDisplayOutsideStyle) ||
+        HTMLEditUtils::IsDisplayInsideFlowRoot(*parent)) {
+      break;
+    }
+    if (ContentIsElementSettingTheStyle(aHTMLEditor, *parent)) {
+      mostDistantStartParentHavingStyle = parent;
+    }
+    else if (isSettingFontElement && parent->IsHTMLElement(nsGkAtoms::font)) {
+      mostDistantStartParentHavingStyle = parent;
+    }
+    if (parent->GetPreviousSibling()) {
+      break;  
+    }
+  }
+  if (mostDistantStartParentHavingStyle) {
+    startPoint.Set(mostDistantStartParentHavingStyle);
+  }
+  return startPoint;
+}
+
+EditorRawDOMPoint HTMLEditor::AutoInlineStyleSetter::
+    GetExtendedRangeEndToWrapAncestorApplyingSameStyle(
+        const HTMLEditor& aHTMLEditor,
+        const EditorRawDOMPoint& aEndPoint) const {
+  MOZ_ASSERT(aEndPoint.IsSetAndValid());
+
+  EditorRawDOMPoint endPoint = aEndPoint;
+  if (!endPoint.IsEndOfContainer() ||
+      endPoint.GetContainer()->GetNextSibling()) {
+    return endPoint;
+  }
+
+  const bool isSettingFontElement =
+      IsStyleOfFontSize() ||
+      (!aHTMLEditor.IsCSSEnabled() && IsStyleOfFontElement());
+  Element* mostDistantEndParentHavingStyle = nullptr;
+  for (Element* parent :
+       endPoint.GetContainer()->InclusiveAncestorsOfType<Element>()) {
+    if (!EditorUtils::IsEditableContent(*parent, EditorType::HTML) ||
+        HTMLEditUtils::IsBlockElement(
+            *parent, BlockInlineCheck::UseComputedDisplayOutsideStyle) ||
+        HTMLEditUtils::IsDisplayInsideFlowRoot(*parent)) {
+      break;
+    }
+    if (ContentIsElementSettingTheStyle(aHTMLEditor, *parent)) {
+      mostDistantEndParentHavingStyle = parent;
+    }
+    else if (isSettingFontElement && parent->IsHTMLElement(nsGkAtoms::font)) {
+      mostDistantEndParentHavingStyle = parent;
+    }
+    if (parent->GetNextSibling()) {
+      break;  
+    }
+  }
+  if (mostDistantEndParentHavingStyle) {
+    endPoint.SetAfter(mostDistantEndParentHavingStyle);
+  }
+  return endPoint;
+}
+
+EditorRawDOMRange HTMLEditor::AutoInlineStyleSetter::
+    GetExtendedRangeToMinimizeTheNumberOfNewElements(
+        const HTMLEditor& aHTMLEditor, const nsINode& aCommonAncestor,
+        EditorRawDOMPoint&& aStartPoint, EditorRawDOMPoint&& aEndPoint) const {
+  MOZ_ASSERT(aStartPoint.IsSet());
+  MOZ_ASSERT(aEndPoint.IsSet());
+
+  if (aStartPoint.GetContainer() != aEndPoint.GetContainer()) {
+    while (aStartPoint.GetContainer() != &aCommonAncestor &&
+           aStartPoint.IsInContentNode() && aStartPoint.GetContainerParent() &&
+           aStartPoint.IsStartOfContainer()) {
+      if (!EditorUtils::IsEditableContent(
+              *aStartPoint.ContainerAs<nsIContent>(), EditorType::HTML) ||
+          (aStartPoint.ContainerAs<nsIContent>()->IsElement() &&
+           (HTMLEditUtils::IsBlockElement(
+                *aStartPoint.ContainerAs<Element>(),
+                BlockInlineCheck::UseComputedDisplayOutsideStyle) ||
+            HTMLEditUtils::IsDisplayInsideFlowRoot(
+                *aStartPoint.ContainerAs<Element>())))) {
+        break;
+      }
+      aStartPoint = aStartPoint.ParentPoint();
+    }
+    while (aEndPoint.GetContainer() != &aCommonAncestor &&
+           aEndPoint.IsInContentNode() && aEndPoint.GetContainerParent() &&
+           aEndPoint.IsEndOfContainer()) {
+      if (!EditorUtils::IsEditableContent(*aEndPoint.ContainerAs<nsIContent>(),
+                                          EditorType::HTML) ||
+          (aEndPoint.ContainerAs<nsIContent>()->IsElement() &&
+           (HTMLEditUtils::IsBlockElement(
+                *aEndPoint.ContainerAs<Element>(),
+                BlockInlineCheck::UseComputedDisplayOutsideStyle) ||
+            HTMLEditUtils::IsDisplayInsideFlowRoot(
+                *aEndPoint.ContainerAs<Element>())))) {
+        break;
+      }
+      aEndPoint.SetAfter(aEndPoint.ContainerAs<nsIContent>());
+    }
+  }
+
+  if (!IsRepresentableWithHTML() ||
+      (aHTMLEditor.IsCSSEnabled() && IsCSSSettable(*nsGkAtoms::span))) {
+    if (aStartPoint.IsInContentNode() && aStartPoint.IsStartOfContainer() &&
+        aStartPoint.GetContainerParentAs<nsIContent>() &&
+        EditorUtils::IsEditableContent(
+            *aStartPoint.ContainerParentAs<nsIContent>(), EditorType::HTML) &&
+        (!aStartPoint.GetContainerAs<Element>() ||
+         !HTMLEditUtils::IsContainerNode(
+             *aStartPoint.ContainerAs<nsIContent>())) &&
+        EditorUtils::IsEditableContent(*aStartPoint.ContainerAs<nsIContent>(),
+                                       EditorType::HTML)) {
+      aStartPoint = aStartPoint.ParentPoint();
+      MOZ_ASSERT(aStartPoint.IsSet());
+    }
+    if (aEndPoint.IsInContentNode() && aEndPoint.IsEndOfContainer() &&
+        aEndPoint.GetContainerParentAs<nsIContent>() &&
+        EditorUtils::IsEditableContent(
+            *aEndPoint.ContainerParentAs<nsIContent>(), EditorType::HTML) &&
+        (!aEndPoint.GetContainerAs<Element>() ||
+         !HTMLEditUtils::IsContainerNode(
+             *aEndPoint.ContainerAs<nsIContent>())) &&
+        EditorUtils::IsEditableContent(*aEndPoint.ContainerAs<nsIContent>(),
+                                       EditorType::HTML)) {
+      aEndPoint.SetAfter(aEndPoint.GetContainer());
+      MOZ_ASSERT(aEndPoint.IsSet());
+    }
+    if (aStartPoint.IsInContentNode() && aStartPoint.GetContainerParent() &&
+        aStartPoint.IsStartOfContainer() &&
+        (!aStartPoint.GetChildAs<nsStyledElement>() ||
+         !ElementIsGoodContainerToSetStyle(
+             *aStartPoint.ChildAs<nsStyledElement>())) &&
+        !HTMLEditUtils::IsBlockElement(
+            *aStartPoint.ContainerAs<nsIContent>(),
+            BlockInlineCheck::UseComputedDisplayOutsideStyle) &&
+        aStartPoint.GetContainerAs<nsStyledElement>() &&
+        ElementIsGoodContainerToSetStyle(
+            *aStartPoint.ContainerAs<nsStyledElement>())) {
+      aStartPoint = aStartPoint.ParentPoint();
+      MOZ_ASSERT(aStartPoint.IsSet());
+    }
+    if (aEndPoint.IsInContentNode() && aEndPoint.GetContainerParent() &&
+        aEndPoint.IsEndOfContainer() &&
+        (aEndPoint.IsStartOfContainer() ||
+         !aEndPoint.GetPreviousSiblingOfChildAs<nsStyledElement>() ||
+         !ElementIsGoodContainerToSetStyle(
+             *aEndPoint.GetPreviousSiblingOfChildAs<nsStyledElement>())) &&
+        !HTMLEditUtils::IsBlockElement(
+            *aEndPoint.ContainerAs<nsIContent>(),
+            BlockInlineCheck::UseComputedDisplayOutsideStyle) &&
+        aEndPoint.GetContainerAs<nsStyledElement>() &&
+        ElementIsGoodContainerToSetStyle(
+            *aEndPoint.ContainerAs<nsStyledElement>())) {
+      aEndPoint.SetAfter(aEndPoint.GetContainer());
+      MOZ_ASSERT(aEndPoint.IsSet());
+    }
+  }
+
+  return EditorRawDOMRange(std::move(aStartPoint), std::move(aEndPoint));
+}
+
+Result<EditorRawDOMRange, nsresult>
+HTMLEditor::AutoInlineStyleSetter::ExtendOrShrinkRangeToApplyTheStyle(
+    const HTMLEditor& aHTMLEditor, const EditorDOMRange& aRange,
+    const Element& aEditingHost) const {
+  if (NS_WARN_IF(!aRange.IsPositioned())) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  nsINode* commonAncestor = aRange.GetClosestCommonInclusiveAncestor();
+  if (NS_WARN_IF(!commonAncestor)) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  EditorDOMRange range(aRange);
+  if (range.EndRef().IsInContentNode()) {
+    const WSScanResult nextThing =
+        HTMLEditUtils::ScanInclusiveNextThingWithIgnoringUnnecessaryLineBreak(
+            range.EndRef(),
+            PaddingForEmptyBlock::Unnecessary, aEditingHost);
+    if (nextThing.MaybeIgnoredLineBreak().isSome() &&
+        nextThing.MaybeIgnoredLineBreak()->IsInclusiveDescendantOf(
+            aEditingHost) &&
+        nextThing.MaybeIgnoredLineBreak()->ContentRef().GetParentElement() &&
+        HTMLEditUtils::IsInlineContent(
+            *nextThing.MaybeIgnoredLineBreak()->ContentRef().GetParentElement(),
+            BlockInlineCheck::UseComputedDisplayOutsideStyle)) {
+      range.SetEnd(
+          nextThing.MaybeIgnoredLineBreak()->After<EditorRawDOMPoint>());
+      MOZ_ASSERT(range.EndRef().IsSet());
+      commonAncestor = range.GetClosestCommonInclusiveAncestor();
+      if (NS_WARN_IF(!commonAncestor)) {
+        return Err(NS_ERROR_FAILURE);
+      }
+    }
+  }
+
+  if (range.Collapsed() && range.StartRef().GetContainer()->Length()) {
+    return EditorRawDOMRange(range);
+  }
+
+  EditorRawDOMPoint startPoint, endPoint;
+  if (range.Collapsed()) {
+    startPoint = endPoint = range.StartRef().To<EditorRawDOMPoint>();
+  } else {
+    ContentSubtreeIterator iter;
+    if (NS_FAILED(iter.Init(range.StartRef().ToRawRangeBoundary(),
+                            range.EndRef().ToRawRangeBoundary()))) {
+      NS_WARNING("ContentSubtreeIterator::Init() failed");
+      return Err(NS_ERROR_FAILURE);
+    }
+    nsIContent* const firstContentEntirelyInRange =
+        nsIContent::FromNodeOrNull(iter.GetCurrentNode());
+    nsIContent* const lastContentEntirelyInRange = [&]() {
+      iter.Last();
+      return nsIContent::FromNodeOrNull(iter.GetCurrentNode());
+    }();
+
+    startPoint = GetShrunkenRangeStart(aHTMLEditor, range, *commonAncestor,
+                                       firstContentEntirelyInRange);
+    MOZ_ASSERT(startPoint.IsSet());
+    endPoint = GetShrunkenRangeEnd(aHTMLEditor, range, *commonAncestor,
+                                   lastContentEntirelyInRange);
+    MOZ_ASSERT(endPoint.IsSet());
+
+    if (MOZ_UNLIKELY(!startPoint.EqualsOrIsBefore(endPoint))) {
+      startPoint = range.StartRef().To<EditorRawDOMPoint>();
+      endPoint = range.EndRef().To<EditorRawDOMPoint>();
+    }
+  }
+
+  startPoint = GetExtendedRangeStartToWrapAncestorApplyingSameStyle(aHTMLEditor,
+                                                                    startPoint);
+  MOZ_ASSERT(startPoint.IsSet());
+  endPoint =
+      GetExtendedRangeEndToWrapAncestorApplyingSameStyle(aHTMLEditor, endPoint);
+  MOZ_ASSERT(endPoint.IsSet());
+
+  EditorRawDOMRange finalRange =
+      GetExtendedRangeToMinimizeTheNumberOfNewElements(
+          aHTMLEditor, *commonAncestor, std::move(startPoint),
+          std::move(endPoint));
+#if 0
+  fprintf(stderr,
+          "ExtendOrShrinkRangeToApplyTheStyle:\n"
+          "  Result: {(\n    %s\n  ) - (\n    %s\n  )},\n"
+          "  Input: {(\n    %s\n  ) - (\n    %s\n  )}\n",
+          ToString(finalRange.StartRef()).c_str(),
+          ToString(finalRange.EndRef()).c_str(),
+          ToString(aRange.StartRef()).c_str(),
+          ToString(aRange.EndRef()).c_str());
+#endif
+  return finalRange;
+}
+
+Result<SplitRangeOffResult, nsresult>
+HTMLEditor::SplitAncestorStyledInlineElementsAtRangeEdges(
+    const EditorDOMRange& aRange, const EditorInlineStyle& aStyle,
+    SplitAtEdges aSplitAtEdges) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  if (NS_WARN_IF(!aRange.IsPositioned())) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  EditorDOMRange range(aRange);
+
+  auto resultAtStart =
+      [&]() MOZ_CAN_RUN_SCRIPT -> Result<SplitNodeResult, nsresult> {
+    AutoTrackDOMRange tracker(RangeUpdaterRef(), &range);
+    Result<SplitNodeResult, nsresult> result =
+        SplitAncestorStyledInlineElementsAt(range.StartRef(), aStyle,
+                                            aSplitAtEdges);
+    if (MOZ_UNLIKELY(result.isErr())) {
+      NS_WARNING("HTMLEditor::SplitAncestorStyledInlineElementsAt() failed");
+      return result;
+    }
+    tracker.Flush(StopTracking::Yes);
+    if (result.inspect().Handled()) {
+      auto startOfRange = result.inspect().AtSplitPoint<EditorDOMPoint>();
+      if (!startOfRange.IsSet()) {
+        result.inspect().IgnoreCaretPointSuggestion();
+        NS_WARNING(
+            "HTMLEditor::SplitAncestorStyledInlineElementsAt() didn't return "
+            "split point");
+        return Err(NS_ERROR_FAILURE);
+      }
+      range.SetStart(std::move(startOfRange));
+    } else if (MOZ_UNLIKELY(!range.IsPositioned())) {
+      NS_WARNING(
+          "HTMLEditor::SplitAncestorStyledInlineElementsAt() caused unexpected "
+          "DOM tree");
+      return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+    }
+    return result;
+  }();
+  if (MOZ_UNLIKELY(resultAtStart.isErr())) {
+    return resultAtStart.propagateErr();
+  }
+  SplitNodeResult unwrappedResultAtStart = resultAtStart.unwrap();
+
+  auto resultAtEnd =
+      [&]() MOZ_CAN_RUN_SCRIPT -> Result<SplitNodeResult, nsresult> {
+    AutoTrackDOMRange tracker(RangeUpdaterRef(), &range);
+    Result<SplitNodeResult, nsresult> result =
+        SplitAncestorStyledInlineElementsAt(range.EndRef(), aStyle,
+                                            aSplitAtEdges);
+    if (MOZ_UNLIKELY(result.isErr())) {
+      NS_WARNING("HTMLEditor::SplitAncestorStyledInlineElementsAt() failed");
+      return result;
+    }
+    tracker.Flush(StopTracking::Yes);
+    if (result.inspect().Handled()) {
+      auto endOfRange = result.inspect().AtSplitPoint<EditorDOMPoint>();
+      if (!endOfRange.IsSet()) {
+        result.inspect().IgnoreCaretPointSuggestion();
+        NS_WARNING(
+            "HTMLEditor::SplitAncestorStyledInlineElementsAt() didn't return "
+            "split point");
+        return Err(NS_ERROR_FAILURE);
+      }
+      range.SetEnd(std::move(endOfRange));
+    } else if (MOZ_UNLIKELY(!range.IsPositioned())) {
+      NS_WARNING(
+          "HTMLEditor::SplitAncestorStyledInlineElementsAt() caused unexpected "
+          "DOM tree");
+      return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+    }
+    return result;
+  }();
+  if (MOZ_UNLIKELY(resultAtEnd.isErr())) {
+    unwrappedResultAtStart.IgnoreCaretPointSuggestion();
+    return resultAtEnd.propagateErr();
+  }
+
+  return SplitRangeOffResult(std::move(range),
+                             std::move(unwrappedResultAtStart),
+                             resultAtEnd.unwrap());
+}
+
+Result<SplitNodeResult, nsresult>
+HTMLEditor::SplitAncestorStyledInlineElementsAt(
+    const EditorDOMPoint& aPointToSplit, const EditorInlineStyle& aStyle,
+    SplitAtEdges aSplitAtEdges) {
+  if (MOZ_UNLIKELY(!aPointToSplit.IsInContentNode())) {
+    return SplitNodeResult::NotHandled(aPointToSplit);
+  }
+
+  const bool handleCSS =
+      aStyle.mHTMLProperty != nsGkAtoms::tt || IsCSSEnabled();
+
+  AutoTArray<OwningNonNull<Element>, 24> arrayOfParents;
+  for (Element* element :
+       aPointToSplit.GetContainer()->InclusiveAncestorsOfType<Element>()) {
+    if (element->IsAnyOfHTMLElements(nsGkAtoms::body, nsGkAtoms::head,
+                                     nsGkAtoms::html) ||
+        HTMLEditUtils::IsBlockElement(
+            *element, BlockInlineCheck::UseComputedDisplayOutsideStyle) ||
+        !element->GetParent() ||
+        !EditorUtils::IsEditableContent(*element->GetParent(),
+                                        EditorType::HTML) ||
+        NS_WARN_IF(!HTMLEditUtils::IsSplittableNode(*element))) {
+      break;
+    }
+    arrayOfParents.AppendElement(*element);
+  }
+
+  SplitNodeResult result = SplitNodeResult::NotHandled(aPointToSplit);
+  MOZ_ASSERT(!result.Handled());
+  EditorDOMPoint pointToPutCaret;
+  for (const OwningNonNull<Element>& element : arrayOfParents) {
+    auto isSetByCSSOrError = [&]() -> Result<bool, nsresult> {
+      if (!handleCSS) {
+        return false;
+      }
+      if (aStyle.IsCSSRemovable(*element)) {
+        nsAutoString firstValue;
+        Result<bool, nsresult> isSpecifiedByCSSOrError =
+            CSSEditUtils::IsSpecifiedCSSEquivalentTo(*this, *element, aStyle,
+                                                     firstValue);
+        if (MOZ_UNLIKELY(isSpecifiedByCSSOrError.isErr())) {
+          result.IgnoreCaretPointSuggestion();
+          NS_WARNING("CSSEditUtils::IsSpecifiedCSSEquivalentTo() failed");
+          return isSpecifiedByCSSOrError;
+        }
+        if (isSpecifiedByCSSOrError.unwrap()) {
+          return true;
+        }
+      }
+      if (aStyle.IsStyleConflictingWithVerticalAlign()) {
+        nsAutoString value;
+        nsresult rv = CSSEditUtils::GetSpecifiedProperty(
+            *element, *nsGkAtoms::vertical_align, value);
+        if (NS_FAILED(rv)) {
+          NS_WARNING("CSSEditUtils::GetSpecifiedProperty() failed");
+          result.IgnoreCaretPointSuggestion();
+          return Err(rv);
+        }
+        if (!value.IsEmpty()) {
+          return true;
+        }
+      }
+      return false;
+    }();
+    if (MOZ_UNLIKELY(isSetByCSSOrError.isErr())) {
+      return isSetByCSSOrError.propagateErr();
+    }
+    if (!isSetByCSSOrError.inspect()) {
+      if (!aStyle.IsStyleToClearAllInlineStyles()) {
+        if (aStyle.mHTMLProperty == nsGkAtoms::href &&
+            HTMLEditUtils::IsHyperlinkElement(element)) {
+        }
+        else if (!element->IsHTMLElement(aStyle.mHTMLProperty) ||
+                 (aStyle.mAttribute && !element->HasAttr(aStyle.mAttribute))) {
+          continue;
+        }
+        if (aStyle.IsStyleOfFontElement() && aStyle.MaybeHasValue()) {
+          const nsAttrValue* const attrValue =
+              element->GetParsedAttr(aStyle.mAttribute);
+          if (attrValue) {
+            if (aStyle.mAttribute == nsGkAtoms::size) {
+              if (attrValue->Type() == nsAttrValue::eInteger &&
+                  nsContentUtils::ParseLegacyFontSize(
+                      aStyle.AsInlineStyleAndValue().mAttributeValue) ==
+                      attrValue->GetIntegerValue()) {
+                continue;
+              }
+            } else if (aStyle.mAttribute == nsGkAtoms::color) {
+              nsAttrValue newValue;
+              nscolor oldColor, newColor;
+              if (attrValue->Type() == nsAttrValue::eColor &&
+                  attrValue->GetColorValue(oldColor) &&
+                  newValue.ParseColor(
+                      aStyle.AsInlineStyleAndValue().mAttributeValue) &&
+                  newValue.GetColorValue(newColor) && oldColor == newColor) {
+                continue;
+              }
+            } else if (attrValue->Equals(
+                           aStyle.AsInlineStyleAndValue().mAttributeValue,
+                           eIgnoreCase)) {
+              continue;
+            }
+          }
+        }
+      }
+      else if (!EditorUtils::IsEditableContent(element, EditorType::HTML) ||
+               !HTMLEditUtils::IsRemovableInlineStyleElement(*element)) {
+        continue;
+      }
+    }
+
+    AutoTrackDOMPoint trackPointToPutCaret(RangeUpdaterRef(), &pointToPutCaret);
+    Result<SplitNodeResult, nsresult> splitNodeResult =
+        SplitNodeDeepWithTransaction(MOZ_KnownLive(element),
+                                     result.AtSplitPoint<EditorDOMPoint>(),
+                                     aSplitAtEdges);
+    if (MOZ_UNLIKELY(splitNodeResult.isErr())) {
+      NS_WARNING("HTMLEditor::SplitNodeDeepWithTransaction() failed");
+      return splitNodeResult;
+    }
+    SplitNodeResult unwrappedSplitNodeResult = splitNodeResult.unwrap();
+    trackPointToPutCaret.Flush(StopTracking::Yes);
+    unwrappedSplitNodeResult.MoveCaretPointTo(
+        pointToPutCaret, {SuggestCaret::OnlyIfHasSuggestion});
+
+    if (!unwrappedSplitNodeResult.Handled()) {
+      continue;
+    }
+    if (!result.DidSplit() || unwrappedSplitNodeResult.DidSplit()) {
+      result = unwrappedSplitNodeResult.ToHandledResult();
+    }
+    MOZ_ASSERT(result.Handled());
+  }
+
+  return pointToPutCaret.IsSet()
+             ? SplitNodeResult(std::move(result), std::move(pointToPutCaret))
+             : std::move(result);
+}
+
+Result<EditorDOMPoint, nsresult> HTMLEditor::ClearStyleAt(
+    const EditorDOMPoint& aPoint, const EditorInlineStyle& aStyleToRemove,
+    SpecifiedStyle aSpecifiedStyle, const Element& aEditingHost) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  if (NS_WARN_IF(!aPoint.IsSet())) {
+    return Err(NS_ERROR_INVALID_ARG);
+  }
+
+
+  EditorDOMPoint pointToPutCaret(aPoint);
+  AutoTrackDOMPoint trackPointToPutCaret(RangeUpdaterRef(), &pointToPutCaret);
+  Result<SplitNodeResult, nsresult> splitNodeResult =
+      SplitAncestorStyledInlineElementsAt(
+          aPoint, aStyleToRemove, SplitAtEdges::eAllowToCreateEmptyContainer);
+  if (MOZ_UNLIKELY(splitNodeResult.isErr())) {
+    NS_WARNING("HTMLEditor::SplitAncestorStyledInlineElementsAt() failed");
+    return splitNodeResult.propagateErr();
+  }
+  trackPointToPutCaret.Flush(StopTracking::Yes);
+  SplitNodeResult unwrappedSplitNodeResult = splitNodeResult.unwrap();
+  unwrappedSplitNodeResult.MoveCaretPointTo(
+      pointToPutCaret, *this,
+      {SuggestCaret::OnlyIfHasSuggestion,
+       SuggestCaret::OnlyIfTransactionsAllowedToDoIt});
+
+  if (!unwrappedSplitNodeResult.Handled()) {
+    return pointToPutCaret;
+  }
+
+  if (unwrappedSplitNodeResult.GetPreviousContent() &&
+      HTMLEditUtils::IsEmptyNode(
+          *unwrappedSplitNodeResult.GetPreviousContent(),
+          {EmptyCheckOption::TreatSingleBRElementAsVisible,
+           EmptyCheckOption::TreatListItemAsVisible,
+           EmptyCheckOption::TreatTableCellAsVisible})) {
+    AutoTrackDOMPoint trackPointToPutCaret(RangeUpdaterRef(), &pointToPutCaret);
+    nsresult rv = DeleteNodeWithTransaction(
+        MOZ_KnownLive(*unwrappedSplitNodeResult.GetPreviousContent()));
+    if (NS_FAILED(rv)) {
+      NS_WARNING("EditorBase::DeleteNodeWithTransaction() failed");
+      return Err(rv);
+    }
+  }
+
+  if (!unwrappedSplitNodeResult.GetNextContent()) {
+    return pointToPutCaret;
+  }
+
+  nsIContent* firstLeafChildOfNextNode = HTMLEditUtils::GetFirstLeafContent(
+      *unwrappedSplitNodeResult.GetNextContent(), {});
+  EditorDOMPoint atStartOfNextNode(
+      firstLeafChildOfNextNode ? firstLeafChildOfNextNode
+                               : unwrappedSplitNodeResult.GetNextContent(),
+      0);
+  Maybe<EditorLineBreak> lineBreak;
+  if (!atStartOfNextNode.IsInContentNode() ||
+      !HTMLEditUtils::IsContainerNode(
+          *atStartOfNextNode.ContainerAs<nsIContent>())) {
+    auto* const brElement =
+        HTMLBRElement::FromNode(atStartOfNextNode.GetContainer());
+    if (brElement) {
+      lineBreak.emplace(*brElement);
+    }
+    if (!atStartOfNextNode.GetContainerParentAs<nsIContent>()) {
+      NS_WARNING("atStartOfNextNode was in an orphan node");
+      return Err(NS_ERROR_FAILURE);
+    }
+    atStartOfNextNode.Set(atStartOfNextNode.GetContainerParent(), 0);
+  }
+  AutoTrackDOMPoint trackPointToPutCaret2(RangeUpdaterRef(), &pointToPutCaret);
+  Result<SplitNodeResult, nsresult> splitResultAtStartOfNextNode =
+      SplitAncestorStyledInlineElementsAt(
+          atStartOfNextNode, aStyleToRemove,
+          SplitAtEdges::eAllowToCreateEmptyContainer);
+  if (MOZ_UNLIKELY(splitResultAtStartOfNextNode.isErr())) {
+    NS_WARNING("HTMLEditor::SplitAncestorStyledInlineElementsAt() failed");
+    return splitResultAtStartOfNextNode.propagateErr();
+  }
+  trackPointToPutCaret2.Flush(StopTracking::Yes);
+  SplitNodeResult unwrappedSplitResultAtStartOfNextNode =
+      splitResultAtStartOfNextNode.unwrap();
+  unwrappedSplitResultAtStartOfNextNode.MoveCaretPointTo(
+      pointToPutCaret, *this,
+      {SuggestCaret::OnlyIfHasSuggestion,
+       SuggestCaret::OnlyIfTransactionsAllowedToDoIt});
+
+  if (unwrappedSplitResultAtStartOfNextNode.Handled() &&
+      unwrappedSplitResultAtStartOfNextNode.GetNextContent()) {
+    bool seenBR = false;
+    if (HTMLEditUtils::IsEmptyNode(
+            *unwrappedSplitResultAtStartOfNextNode.GetNextContent(),
+            {EmptyCheckOption::TreatListItemAsVisible,
+             EmptyCheckOption::TreatTableCellAsVisible},
+            &seenBR)) {
+      nsresult rv = DeleteNodeWithTransaction(MOZ_KnownLive(
+          *unwrappedSplitResultAtStartOfNextNode.GetNextContent()));
+      if (NS_FAILED(rv)) {
+        NS_WARNING("EditorBase::DeleteNodeWithTransaction() failed");
+        return Err(rv);
+      }
+    }
+  }
+
+  if (!unwrappedSplitResultAtStartOfNextNode.Handled()) {
+    return std::move(pointToPutCaret);
+  }
+
+  if (!unwrappedSplitResultAtStartOfNextNode.GetPreviousContent()) {
+    const auto splitPoint =
+        unwrappedSplitNodeResult.AtSplitPoint<EditorRawDOMPoint>();
+    const auto splitPointAtStartOfNextNode =
+        unwrappedSplitResultAtStartOfNextNode.AtSplitPoint<EditorRawDOMPoint>();
+    return EditorDOMPoint(splitPoint.GetContainer(),
+                          splitPointAtStartOfNextNode.Offset());
+  }
+
+  nsIContent* firstLeafChildOfPreviousNode = HTMLEditUtils::GetFirstLeafContent(
+      *unwrappedSplitResultAtStartOfNextNode.GetPreviousContent(), {});
+  pointToPutCaret.Set(
+      firstLeafChildOfPreviousNode
+          ? firstLeafChildOfPreviousNode
+          : unwrappedSplitResultAtStartOfNextNode.GetPreviousContent(),
+      0);
+
+  if (lineBreak.isSome()) {
+    if (lineBreak->IsInComposedDoc()) {
+      Result<EditorDOMPoint, nsresult> lineBreakPointOrError =
+          DeleteLineBreakWithTransaction(lineBreak.ref(), nsIEditor::eStrip,
+                                         aEditingHost);
+      if (MOZ_UNLIKELY(lineBreakPointOrError.isErr())) {
+        NS_WARNING("HTMLEditor::DeleteLineBreakWithTransaction() failed");
+        return lineBreakPointOrError.propagateErr();
+      }
+    }
+    Result<CreateLineBreakResult, nsresult> insertBRElementResultOrError =
+        InsertLineBreak(WithTransaction::Yes, LineBreakType::BRElement,
+                        pointToPutCaret);
+    if (MOZ_UNLIKELY(insertBRElementResultOrError.isErr())) {
+      NS_WARNING(
+          "HTMLEditor::InsertLineBreak(WithTransaction::Yes, "
+          "LineBreakType::BRElement) failed");
+      return insertBRElementResultOrError.propagateErr();
+    }
+    CreateLineBreakResult insertBRElementResult =
+        insertBRElementResultOrError.unwrap();
+    insertBRElementResult.MoveCaretPointTo(
+        pointToPutCaret, *this,
+        {SuggestCaret::OnlyIfHasSuggestion,
+         SuggestCaret::OnlyIfTransactionsAllowedToDoIt});
+
+    if (unwrappedSplitResultAtStartOfNextNode.GetNextContent() &&
+        unwrappedSplitResultAtStartOfNextNode.GetNextContent()
+            ->IsInComposedDoc()) {
+      if (HTMLEditUtils::IsEmptyNode(
+              *unwrappedSplitResultAtStartOfNextNode.GetNextContent(),
+              {EmptyCheckOption::TreatSingleBRElementAsVisible,
+               EmptyCheckOption::TreatListItemAsVisible,
+               EmptyCheckOption::TreatTableCellAsVisible})) {
+        nsresult rv = DeleteNodeWithTransaction(MOZ_KnownLive(
+            *unwrappedSplitResultAtStartOfNextNode.GetNextContent()));
+        if (NS_FAILED(rv)) {
+          NS_WARNING("EditorBase::DeleteNodeWithTransaction() failed");
+          return Err(rv);
+        }
+      }
+      else if (HTMLEditUtils::IsEmptyNode(
+                   *unwrappedSplitResultAtStartOfNextNode.GetNextContent(),
+                   {EmptyCheckOption::TreatListItemAsVisible,
+                    EmptyCheckOption::TreatTableCellAsVisible})) {
+        AutoTArray<OwningNonNull<nsIContent>, 4> emptyInlineContainerElements;
+        HTMLEditUtils::CollectEmptyInlineContainerDescendants(
+            *unwrappedSplitResultAtStartOfNextNode.GetNextContentAs<Element>(),
+            emptyInlineContainerElements,
+            {EmptyCheckOption::TreatSingleBRElementAsVisible,
+             EmptyCheckOption::TreatListItemAsVisible,
+             EmptyCheckOption::TreatTableCellAsVisible},
+            BlockInlineCheck::UseComputedDisplayOutsideStyle);
+        for (const OwningNonNull<nsIContent>& emptyInlineContainerElement :
+             emptyInlineContainerElements) {
+          nsresult rv = DeleteNodeWithTransaction(
+              MOZ_KnownLive(emptyInlineContainerElement));
+          if (NS_FAILED(rv)) {
+            NS_WARNING("EditorBase::DeleteNodeWithTransaction() failed");
+            return Err(rv);
+          }
+        }
+      }
+    }
+
+    pointToPutCaret.Set(pointToPutCaret.GetContainer(), 0);
+  }
+  if (auto* const previousElementOfSplitPoint =
+          unwrappedSplitResultAtStartOfNextNode
+              .GetPreviousContentAs<Element>()) {
+    AutoTrackDOMPoint tracker(RangeUpdaterRef(), &pointToPutCaret);
+    Result<EditorDOMPoint, nsresult> removeStyleResult =
+        RemoveStyleInside(MOZ_KnownLive(*previousElementOfSplitPoint),
+                          aStyleToRemove, aSpecifiedStyle);
+    if (MOZ_UNLIKELY(removeStyleResult.isErr())) {
+      NS_WARNING("HTMLEditor::RemoveStyleInside() failed");
+      return removeStyleResult;
+    }
+  }
+  return pointToPutCaret;
+}
+
+Result<EditorDOMPoint, nsresult> HTMLEditor::RemoveStyleInside(
+    Element& aElement, const EditorInlineStyle& aStyleToRemove,
+    SpecifiedStyle aSpecifiedStyle) {
+  AutoTArray<OwningNonNull<nsIContent>, 32> arrayOfChildContents;
+  HTMLEditUtils::CollectAllChildren(aElement, arrayOfChildContents);
+  EditorDOMPoint pointToPutCaret;
+  for (const OwningNonNull<nsIContent>& child : arrayOfChildContents) {
+    if (!child->IsElement()) {
+      continue;
+    }
+    Result<EditorDOMPoint, nsresult> removeStyleResult = RemoveStyleInside(
+        MOZ_KnownLive(*child->AsElement()), aStyleToRemove, aSpecifiedStyle);
+    if (MOZ_UNLIKELY(removeStyleResult.isErr())) {
+      NS_WARNING("HTMLEditor::RemoveStyleInside() failed");
+      return removeStyleResult;
+    }
+    if (removeStyleResult.inspect().IsSet()) {
+      pointToPutCaret = removeStyleResult.unwrap();
+    }
+  }
+
+  if (!EditorUtils::IsEditableContent(aElement, EditorType::HTML)) {
+    return pointToPutCaret;
+  }
+
+  auto isStyleSpecifiedOrError = [&]() -> Result<bool, nsresult> {
+    if (!aStyleToRemove.IsCSSRemovable(aElement)) {
+      return false;
+    }
+    MOZ_ASSERT(!aStyleToRemove.IsStyleToClearAllInlineStyles());
+    Result<bool, nsresult> elementHasSpecifiedCSSEquivalentStylesOrError =
+        CSSEditUtils::HaveSpecifiedCSSEquivalentStyles(*this, aElement,
+                                                       aStyleToRemove);
+    NS_WARNING_ASSERTION(
+        elementHasSpecifiedCSSEquivalentStylesOrError.isOk(),
+        "CSSEditUtils::HaveSpecifiedCSSEquivalentStyles() failed");
+    return elementHasSpecifiedCSSEquivalentStylesOrError;
+  }();
+  if (MOZ_UNLIKELY(isStyleSpecifiedOrError.isErr())) {
+    return isStyleSpecifiedOrError.propagateErr();
+  }
+  bool styleSpecified = isStyleSpecifiedOrError.unwrap();
+  if (nsStyledElement* styledElement = nsStyledElement::FromNode(&aElement)) {
+    if (styleSpecified) {
+      nsresult rv = CSSEditUtils::RemoveCSSEquivalentToStyle(
+          WithTransaction::Yes, *this, MOZ_KnownLive(*styledElement),
+          aStyleToRemove, nullptr);
+      if (NS_WARN_IF(rv == NS_ERROR_EDITOR_DESTROYED)) {
+        return Err(NS_ERROR_EDITOR_DESTROYED);
+      }
+      NS_WARNING_ASSERTION(
+          NS_SUCCEEDED(rv),
+          "CSSEditUtils::RemoveCSSEquivalentToStyle() failed, but ignored");
+    }
+
+    if (aStyleToRemove.IsStyleConflictingWithVerticalAlign()) {
+      nsAutoString value;
+      nsresult rv = CSSEditUtils::GetSpecifiedProperty(
+          aElement, *nsGkAtoms::vertical_align, value);
+      if (NS_FAILED(rv)) {
+        NS_WARNING("CSSEditUtils::GetSpecifiedProperty() failed");
+        return Err(rv);
+      }
+      if (!value.IsEmpty()) {
+        nsresult rv = CSSEditUtils::RemoveCSSPropertyWithTransaction(
+            *this, MOZ_KnownLive(*styledElement), *nsGkAtoms::vertical_align,
+            value);
+        if (NS_FAILED(rv)) {
+          NS_WARNING("CSSEditUtils::RemoveCSSPropertyWithTransaction() failed");
+          return Err(rv);
+        }
+        styleSpecified = true;
+      }
+    }
+  }
+
+  const bool isStyleRepresentedByElement =
+      !aStyleToRemove.IsStyleToClearAllInlineStyles() &&
+      aStyleToRemove.IsRepresentedBy(aElement);
+
+  auto ShouldUpdateDOMTree = [&]() {
+    if (aStyleToRemove.IsStyleToClearAllInlineStyles() &&
+        HTMLEditUtils::IsRemovableInlineStyleElement(aElement)) {
+      return true;
+    }
+    if (isStyleRepresentedByElement) {
+      return true;
+    }
+    return aElement.IsHTMLElement(nsGkAtoms::span) && styleSpecified;
+  };
+  if (!ShouldUpdateDOMTree()) {
+    return pointToPutCaret;
+  }
+
+  const bool elementHasNecessaryAttributes = [&]() {
+    if (!isStyleRepresentedByElement) {
+      return HTMLEditUtils::ElementHasAttributeExcept(aElement,
+                                                      *nsGkAtoms::_empty);
+    }
+    if (aStyleToRemove.IsStyleOfAnchorElement()) {
+      return aSpecifiedStyle == SpecifiedStyle::Preserve &&
+             (aElement.HasNonEmptyAttr(nsGkAtoms::style) ||
+              aElement.HasNonEmptyAttr(nsGkAtoms::_class));
+    }
+    nsAtom& attrKeepStaying = aStyleToRemove.mAttribute
+                                  ? *aStyleToRemove.mAttribute
+                                  : *nsGkAtoms::_empty;
+    return aSpecifiedStyle == SpecifiedStyle::Preserve
+               ? HTMLEditUtils::ElementHasAttributeExcept(aElement,
+                                                          attrKeepStaying)
+               : HTMLEditUtils::ElementHasAttributeExcept(
+                     aElement, attrKeepStaying, *nsGkAtoms::style,
+                     *nsGkAtoms::_class);
+  }();
+
+  auto ReplaceWithNewSpan = [&]() {
+    if (aStyleToRemove.IsStyleToClearAllInlineStyles()) {
+      return false;  
+    }
+    if (aElement.IsHTMLElement(nsGkAtoms::span)) {
+      return false;  
+    }
+    if (!isStyleRepresentedByElement) {
+      return false;  
+    }
+    if (!elementHasNecessaryAttributes) {
+      return false;  
+    }
+    if (aElement.IsHTMLElement(nsGkAtoms::font)) {
+      return (aStyleToRemove.mHTMLProperty == nsGkAtoms::color ||
+              !aElement.HasAttr(nsGkAtoms::color)) &&
+             (aStyleToRemove.mHTMLProperty == nsGkAtoms::face ||
+              !aElement.HasAttr(nsGkAtoms::face)) &&
+             (aStyleToRemove.mHTMLProperty == nsGkAtoms::size ||
+              !aElement.HasAttr(nsGkAtoms::size));
+    }
+    return true;
+  };
+
+  if (ReplaceWithNewSpan()) {
+    if (aStyleToRemove.mAttribute) {
+      nsresult rv =
+          RemoveAttributeWithTransaction(aElement, *aStyleToRemove.mAttribute);
+      if (NS_FAILED(rv)) {
+        NS_WARNING("EditorBase::RemoveAttributeWithTransaction() failed");
+        return Err(rv);
+      }
+    }
+    if (aSpecifiedStyle == SpecifiedStyle::Discard) {
+      nsresult rv = RemoveAttributeWithTransaction(aElement, *nsGkAtoms::style);
+      if (NS_FAILED(rv)) {
+        NS_WARNING(
+            "EditorBase::RemoveAttributeWithTransaction(nsGkAtoms::style) "
+            "failed");
+        return Err(rv);
+      }
+      rv = RemoveAttributeWithTransaction(aElement, *nsGkAtoms::_class);
+      if (NS_FAILED(rv)) {
+        NS_WARNING(
+            "EditorBase::RemoveAttributeWithTransaction(nsGkAtoms::_class) "
+            "failed");
+        return Err(rv);
+      }
+    }
+    auto replaceWithSpanResult =
+        [&]() MOZ_CAN_RUN_SCRIPT -> Result<CreateElementResult, nsresult> {
+      if (!aStyleToRemove.IsStyleOfAnchorElement()) {
+        return ReplaceContainerAndCloneAttributesWithTransaction(
+            aElement, *nsGkAtoms::span);
+      }
+      nsString styleValue;  
+      aElement.GetAttr(nsGkAtoms::style, styleValue);
+      return ReplaceContainerWithTransaction(aElement, *nsGkAtoms::span,
+                                             *nsGkAtoms::style, styleValue);
+    }();
+    if (MOZ_UNLIKELY(replaceWithSpanResult.isErr())) {
+      NS_WARNING(
+          "HTMLEditor::ReplaceContainerWithTransaction(nsGkAtoms::span) "
+          "failed");
+      return replaceWithSpanResult.propagateErr();
+    }
+    CreateElementResult unwrappedReplaceWithSpanResult =
+        replaceWithSpanResult.unwrap();
+    if (AllowsTransactionsToChangeSelection()) {
+      unwrappedReplaceWithSpanResult.MoveCaretPointTo(
+          pointToPutCaret, {SuggestCaret::OnlyIfHasSuggestion});
+    } else {
+      unwrappedReplaceWithSpanResult.IgnoreCaretPointSuggestion();
+    }
+    return pointToPutCaret;
+  }
+
+  auto RemoveElement = [&]() {
+    if (aStyleToRemove.IsStyleToClearAllInlineStyles()) {
+      MOZ_ASSERT(HTMLEditUtils::IsRemovableInlineStyleElement(aElement));
+      return true;
+    }
+    if (elementHasNecessaryAttributes) {
+      return false;
+    }
+    if (isStyleRepresentedByElement) {
+      return true;
+    }
+    if (styleSpecified && aElement.IsHTMLElement(nsGkAtoms::span)) {
+      return true;
+    }
+    return false;
+  };
+
+  if (RemoveElement()) {
+    Result<EditorDOMPoint, nsresult> unwrapElementResult =
+        RemoveContainerWithTransaction(aElement);
+    if (MOZ_UNLIKELY(unwrapElementResult.isErr())) {
+      NS_WARNING("HTMLEditor::RemoveContainerWithTransaction() failed");
+      return unwrapElementResult.propagateErr();
+    }
+    if (AllowsTransactionsToChangeSelection() &&
+        unwrapElementResult.inspect().IsSet()) {
+      pointToPutCaret = unwrapElementResult.unwrap();
+    }
+    return pointToPutCaret;
+  }
+
+  if (isStyleRepresentedByElement && aStyleToRemove.mAttribute) {
+    nsresult rv =
+        RemoveAttributeWithTransaction(aElement, *aStyleToRemove.mAttribute);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("EditorBase::RemoveAttributeWithTransaction() failed");
+      return Err(rv);
+    }
+  }
+  return pointToPutCaret;
+}
+
+EditorRawDOMRange HTMLEditor::GetExtendedRangeWrappingNamedAnchor(
+    const EditorRawDOMRange& aRange) const {
+  MOZ_ASSERT(aRange.StartRef().IsSet());
+  MOZ_ASSERT(aRange.EndRef().IsSet());
+
+
+  EditorRawDOMRange newRange(aRange);
+  for (Element* element :
+       aRange.StartRef().GetContainer()->InclusiveAncestorsOfType<Element>()) {
+    if (!HTMLEditUtils::IsNamedAnchorElement(*element)) {
+      continue;
+    }
+    newRange.SetStart(EditorRawDOMPoint(element));
+  }
+  for (Element* element :
+       aRange.EndRef().GetContainer()->InclusiveAncestorsOfType<Element>()) {
+    if (!HTMLEditUtils::IsNamedAnchorElement(*element)) {
+      continue;
+    }
+    newRange.SetEnd(EditorRawDOMPoint::After(*element));
+  }
+  return newRange;
+}
+
+EditorRawDOMRange HTMLEditor::GetExtendedRangeWrappingEntirelySelectedElements(
+    const EditorRawDOMRange& aRange) const {
+  MOZ_ASSERT(aRange.StartRef().IsSet());
+  MOZ_ASSERT(aRange.EndRef().IsSet());
+
+
+  EditorRawDOMRange newRange(aRange);
+  while (newRange.StartRef().IsInContentNode() &&
+         newRange.StartRef().IsStartOfContainer()) {
+    if (!EditorUtils::IsEditableContent(
+            *newRange.StartRef().ContainerAs<nsIContent>(), EditorType::HTML)) {
+      break;
+    }
+    newRange.SetStart(newRange.StartRef().ParentPoint());
+  }
+  while (newRange.EndRef().IsInContentNode() &&
+         newRange.EndRef().IsEndOfContainer()) {
+    if (!EditorUtils::IsEditableContent(
+            *newRange.EndRef().ContainerAs<nsIContent>(), EditorType::HTML)) {
+      break;
+    }
+    newRange.SetEnd(
+        EditorRawDOMPoint::After(*newRange.EndRef().ContainerAs<nsIContent>()));
+  }
+  return newRange;
+}
+
+nsresult HTMLEditor::GetInlinePropertyBase(const EditorInlineStyle& aStyle,
+                                           const nsAString* aValue,
+                                           bool* aFirst, bool* aAny, bool* aAll,
+                                           nsAString* outValue) const {
+  MOZ_ASSERT(!aStyle.IsStyleToClearAllInlineStyles());
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  *aAny = false;
+  *aAll = true;
+  *aFirst = false;
+  bool first = true;
+
+  const bool isCollapsed = SelectionRef().IsCollapsed();
+  RefPtr<nsRange> range = SelectionRef().GetRangeAt(0);
+  if (range) {
+    bool firstNodeInRange = true;
+
+    if (isCollapsed) {
+      if (NS_WARN_IF(!range->GetStartContainer())) {
+        return NS_ERROR_FAILURE;
+      }
+      nsString tOutString;
+      const PendingStyleState styleState = [&]() {
+        if (aStyle.mAttribute) {
+          auto state = mPendingStylesToApplyToNewContent->GetStyleState(
+              *aStyle.mHTMLProperty, aStyle.mAttribute, &tOutString);
+          if (outValue) {
+            outValue->Assign(tOutString);
+          }
+          return state;
+        }
+        return mPendingStylesToApplyToNewContent->GetStyleState(
+            *aStyle.mHTMLProperty);
+      }();
+      if (styleState != PendingStyleState::NotUpdated) {
+        *aFirst = *aAny = *aAll =
+            (styleState == PendingStyleState::BeingPreserved);
+        return NS_OK;
+      }
+
+      nsIContent* const collapsedContent =
+          nsIContent::FromNode(range->GetStartContainer());
+      if (MOZ_LIKELY(collapsedContent &&
+                     collapsedContent->GetAsElementOrParentElement()) &&
+          aStyle.IsCSSSettable(
+              *collapsedContent->GetAsElementOrParentElement())) {
+        if (aValue) {
+          tOutString.Assign(*aValue);
+        }
+        Result<bool, nsresult> isComputedCSSEquivalentToStyleOrError =
+            CSSEditUtils::IsComputedCSSEquivalentTo(
+                *this, MOZ_KnownLive(*collapsedContent), aStyle, tOutString);
+        if (MOZ_UNLIKELY(isComputedCSSEquivalentToStyleOrError.isErr())) {
+          NS_WARNING("CSSEditUtils::IsComputedCSSEquivalentTo() failed");
+          return isComputedCSSEquivalentToStyleOrError.unwrapErr();
+        }
+        *aFirst = *aAny = *aAll =
+            isComputedCSSEquivalentToStyleOrError.unwrap();
+        if (outValue) {
+          outValue->Assign(tOutString);
+        }
+        return NS_OK;
+      }
+
+      *aFirst = *aAny = *aAll =
+          collapsedContent && HTMLEditUtils::IsInlineStyleSetByElement(
+                                  *collapsedContent, aStyle, aValue, outValue);
+      return NS_OK;
+    }
+
+
+    nsAutoString firstValue, theValue;
+
+    nsCOMPtr<nsINode> endNode = range->GetEndContainer();
+    uint32_t endOffset = range->EndOffset();
+
+    PostContentIterator postOrderIter;
+    DebugOnly<nsresult> rvIgnored = postOrderIter.Init(range);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                         "Failed to initialize post-order content iterator");
+    for (; !postOrderIter.IsDone(); postOrderIter.Next()) {
+      if (postOrderIter.GetCurrentNode()->IsHTMLElement(nsGkAtoms::body)) {
+        break;
+      }
+      RefPtr<Text> textNode = Text::FromNode(postOrderIter.GetCurrentNode());
+      if (!textNode) {
+        continue;
+      }
+
+      if (!EditorUtils::IsEditableContent(*textNode, EditorType::HTML) ||
+          !HTMLEditUtils::IsVisibleTextNode(
+              *textNode, TreatInvisibleLineBreakAs::Visible)) {
+        continue;
+      }
+
+      if (!isCollapsed && first && firstNodeInRange) {
+        firstNodeInRange = false;
+        if (range->StartOffset() == textNode->TextDataLength()) {
+          continue;
+        }
+      } else if (textNode == endNode && !endOffset) {
+        continue;
+      }
+
+      const RefPtr<Element> element = textNode->GetParentElement();
+
+      bool isSet = false;
+      if (first) {
+        if (element) {
+          if (aStyle.IsCSSSettable(*element)) {
+            if (aValue) {
+              firstValue.Assign(*aValue);
+            }
+            Result<bool, nsresult> isComputedCSSEquivalentToStyleOrError =
+                CSSEditUtils::IsComputedCSSEquivalentTo(*this, *element, aStyle,
+                                                        firstValue);
+            if (MOZ_UNLIKELY(isComputedCSSEquivalentToStyleOrError.isErr())) {
+              NS_WARNING("CSSEditUtils::IsComputedCSSEquivalentTo() failed");
+              return isComputedCSSEquivalentToStyleOrError.unwrapErr();
+            }
+            isSet = isComputedCSSEquivalentToStyleOrError.unwrap();
+          } else {
+            isSet = HTMLEditUtils::IsInlineStyleSetByElement(
+                *element, aStyle, aValue, &firstValue);
+          }
+        }
+        *aFirst = isSet;
+        first = false;
+        if (outValue) {
+          *outValue = firstValue;
+        }
+      } else {
+        if (element) {
+          if (aStyle.IsCSSSettable(*element)) {
+            if (aValue) {
+              theValue.Assign(*aValue);
+            }
+            Result<bool, nsresult> isComputedCSSEquivalentToStyleOrError =
+                CSSEditUtils::IsComputedCSSEquivalentTo(*this, *element, aStyle,
+                                                        theValue);
+            if (MOZ_UNLIKELY(isComputedCSSEquivalentToStyleOrError.isErr())) {
+              NS_WARNING("CSSEditUtils::IsComputedCSSEquivalentTo() failed");
+              return isComputedCSSEquivalentToStyleOrError.unwrapErr();
+            }
+            isSet = isComputedCSSEquivalentToStyleOrError.unwrap();
+          } else {
+            isSet = HTMLEditUtils::IsInlineStyleSetByElement(*element, aStyle,
+                                                             aValue, &theValue);
+          }
+        }
+
+        if (firstValue != theValue &&
+            (!aStyle.IsStyleOfTextDecoration(
+                 EditorInlineStyle::IgnoreSElement::Yes) ||
+             *aFirst != isSet)) {
+          *aAll = false;
+        }
+      }
+
+      if (isSet) {
+        *aAny = true;
+      } else {
+        *aAll = false;
+      }
+    }
+  }
+  if (!*aAny) {
+    *aAll = false;
+  }
+  return NS_OK;
+}
+
+nsresult HTMLEditor::GetInlineProperty(nsStaticAtom& aHTMLProperty,
+                                       nsAtom* aAttribute,
+                                       const nsAString& aValue, bool* aFirst,
+                                       bool* aAny, bool* aAll) const {
+  if (NS_WARN_IF(!aFirst) || NS_WARN_IF(!aAny) || NS_WARN_IF(!aAll)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  const nsAString* val = !aValue.IsEmpty() ? &aValue : nullptr;
+  nsresult rv =
+      GetInlinePropertyBase(EditorInlineStyle(aHTMLProperty, aAttribute), val,
+                            aFirst, aAny, aAll, nullptr);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::GetInlinePropertyBase() failed");
+  return EditorBase::ToGenericNSResult(rv);
+}
+
+NS_IMETHODIMP HTMLEditor::GetInlinePropertyWithAttrValue(
+    const nsAString& aHTMLProperty, const nsAString& aAttribute,
+    const nsAString& aValue, bool* aFirst, bool* aAny, bool* aAll,
+    nsAString& outValue) {
+  nsStaticAtom* property = NS_GetStaticAtom(aHTMLProperty);
+  if (NS_WARN_IF(!property)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  nsStaticAtom* attribute = EditorUtils::GetAttributeAtom(aAttribute);
+  nsresult rv = GetInlinePropertyWithAttrValue(MOZ_KnownLive(*property),
+                                               MOZ_KnownLive(attribute), aValue,
+                                               aFirst, aAny, aAll, outValue);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::GetInlinePropertyWithAttrValue() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::GetInlinePropertyWithAttrValue(
+    nsStaticAtom& aHTMLProperty, nsAtom* aAttribute, const nsAString& aValue,
+    bool* aFirst, bool* aAny, bool* aAll, nsAString& outValue) {
+  if (NS_WARN_IF(!aFirst) || NS_WARN_IF(!aAny) || NS_WARN_IF(!aAll)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  const nsAString* val = !aValue.IsEmpty() ? &aValue : nullptr;
+  nsresult rv =
+      GetInlinePropertyBase(EditorInlineStyle(aHTMLProperty, aAttribute), val,
+                            aFirst, aAny, aAll, &outValue);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::GetInlinePropertyBase() failed");
+  return EditorBase::ToGenericNSResult(rv);
+}
+
+nsresult HTMLEditor::RemoveAllInlinePropertiesAsAction(
+    nsIPrincipal* aPrincipal) {
+  AutoEditActionDataSetter editActionData(
+      *this, EditAction::eRemoveAllInlineStyleProperties, aPrincipal);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  const RefPtr<Element> editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (!editingHost || !IsStyleEditable(editingHost)) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  nsresult rv = editActionData.MaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "MaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  AutoPlaceholderBatch treatAsOneTransaction(
+      *this, ScrollSelectionIntoView::Yes, __FUNCTION__);
+  IgnoredErrorResult ignoredError;
+  AutoEditSubActionNotifier startToHandleEditSubAction(
+      *this, EditSubAction::eRemoveAllTextProperties, nsIEditor::eNext,
+      ignoredError);
+  if (NS_WARN_IF(ignoredError.ErrorCodeIs(NS_ERROR_EDITOR_DESTROYED))) {
+    return EditorBase::ToGenericNSResult(ignoredError.StealNSResult());
+  }
+  NS_WARNING_ASSERTION(
+      !ignoredError.Failed(),
+      "HTMLEditor::OnStartToHandleTopLevelEditSubAction() failed, but ignored");
+
+  AutoTArray<EditorInlineStyle, 1> removeAllInlineStyles;
+  removeAllInlineStyles.AppendElement(EditorInlineStyle::RemoveAllStyles());
+  rv = RemoveInlinePropertiesAsSubAction(removeAllInlineStyles, *editingHost);
+  NS_WARNING_ASSERTION(
+      NS_SUCCEEDED(rv),
+      "HTMLEditor::RemoveInlinePropertiesAsSubAction() failed");
+  return EditorBase::ToGenericNSResult(rv);
+}
+
+nsresult HTMLEditor::RemoveInlinePropertyAsAction(nsStaticAtom& aHTMLProperty,
+                                                  nsStaticAtom* aAttribute,
+                                                  nsIPrincipal* aPrincipal) {
+  AutoEditActionDataSetter editActionData(
+      *this,
+      HTMLEditUtils::GetEditActionForFormatText(aHTMLProperty, aAttribute,
+                                                false),
+      aPrincipal);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  const RefPtr<Element> editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (!editingHost || !IsStyleEditable(editingHost)) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  switch (editActionData.GetEditAction()) {
+    case EditAction::eRemoveFontFamilyProperty:
+      MOZ_ASSERT(!u""_ns.IsVoid());
+      editActionData.SetData(u""_ns);
+      break;
+    case EditAction::eRemoveColorProperty:
+    case EditAction::eRemoveBackgroundColorPropertyInline:
+      editActionData.SetColorData(u""_ns);
+      break;
+    default:
+      break;
+  }
+  nsresult rv = editActionData.MaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "MaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  AutoTArray<EditorInlineStyle, 8> removeInlineStyleAndRelatedElements;
+  AppendInlineStyleAndRelatedStyle(EditorInlineStyle(aHTMLProperty, aAttribute),
+                                   removeInlineStyleAndRelatedElements);
+  rv = RemoveInlinePropertiesAsSubAction(removeInlineStyleAndRelatedElements,
+                                         *editingHost);
+  NS_WARNING_ASSERTION(
+      NS_SUCCEEDED(rv),
+      "HTMLEditor::RemoveInlinePropertiesAsSubAction() failed");
+  return EditorBase::ToGenericNSResult(rv);
+}
+
+NS_IMETHODIMP HTMLEditor::RemoveInlineProperty(const nsAString& aProperty,
+                                               const nsAString& aAttribute) {
+  nsStaticAtom* property = NS_GetStaticAtom(aProperty);
+  nsStaticAtom* attribute = EditorUtils::GetAttributeAtom(aAttribute);
+
+  AutoEditActionDataSetter editActionData(
+      *this,
+      HTMLEditUtils::GetEditActionForFormatText(*property, attribute, false));
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  const RefPtr<Element> editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (!editingHost || !IsStyleEditable(editingHost)) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  switch (editActionData.GetEditAction()) {
+    case EditAction::eRemoveFontFamilyProperty:
+      MOZ_ASSERT(!EmptyString().IsVoid());
+      editActionData.SetData(EmptyString());
+      break;
+    case EditAction::eRemoveColorProperty:
+    case EditAction::eRemoveBackgroundColorPropertyInline:
+      editActionData.SetColorData(EmptyString());
+      break;
+    default:
+      break;
+  }
+  nsresult rv = editActionData.MaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "MaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  AutoTArray<EditorInlineStyle, 1> removeOneInlineStyle;
+  removeOneInlineStyle.AppendElement(EditorInlineStyle(*property, attribute));
+  rv = RemoveInlinePropertiesAsSubAction(removeOneInlineStyle, *editingHost);
+  NS_WARNING_ASSERTION(
+      NS_SUCCEEDED(rv),
+      "HTMLEditor::RemoveInlinePropertiesAsSubAction() failed");
+  return EditorBase::ToGenericNSResult(rv);
+}
+
+void HTMLEditor::AppendInlineStyleAndRelatedStyle(
+    const EditorInlineStyle& aStyleToRemove,
+    nsTArray<EditorInlineStyle>& aStylesToRemove) const {
+  if (nsStaticAtom* similarElementName =
+          aStyleToRemove.GetSimilarElementNameAtom()) {
+    EditorInlineStyle anotherStyle(*similarElementName);
+    if (!aStylesToRemove.Contains(anotherStyle)) {
+      aStylesToRemove.AppendElement(std::move(anotherStyle));
+    }
+  } else if (aStyleToRemove.mHTMLProperty == nsGkAtoms::font) {
+    if (aStyleToRemove.mAttribute == nsGkAtoms::size) {
+      EditorInlineStyle big(*nsGkAtoms::big), small(*nsGkAtoms::small);
+      if (!aStylesToRemove.Contains(big)) {
+        aStylesToRemove.AppendElement(std::move(big));
+      }
+      if (!aStylesToRemove.Contains(small)) {
+        aStylesToRemove.AppendElement(std::move(small));
+      }
+    }
+    else if (aStyleToRemove.mAttribute == nsGkAtoms::face &&
+             !GetEditActionPrincipal()) {
+      EditorInlineStyle tt(*nsGkAtoms::tt);
+      if (!aStylesToRemove.Contains(tt)) {
+        aStylesToRemove.AppendElement(std::move(tt));
+      }
+    }
+  }
+  if (!aStylesToRemove.Contains(aStyleToRemove)) {
+    aStylesToRemove.AppendElement(aStyleToRemove);
+  }
+}
+
+nsresult HTMLEditor::RemoveInlinePropertiesAsSubAction(
+    const nsTArray<EditorInlineStyle>& aStylesToRemove,
+    const Element& aEditingHost) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+  MOZ_ASSERT(!aStylesToRemove.IsEmpty());
+
+  DebugOnly<nsresult> rvIgnored = CommitComposition();
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                       "EditorBase::CommitComposition() failed, but ignored");
+
+  if (SelectionRef().IsCollapsed()) {
+    mPendingStylesToApplyToNewContent->ClearStyles(aStylesToRemove);
+    return NS_OK;
+  }
+
+  {
+    Result<EditActionResult, nsresult> result = CanHandleHTMLEditSubAction();
+    if (MOZ_UNLIKELY(result.isErr())) {
+      NS_WARNING("HTMLEditor::CanHandleHTMLEditSubAction() failed");
+      return result.unwrapErr();
+    }
+    if (result.inspect().Canceled()) {
+      return NS_OK;
+    }
+  }
+
+  AutoPlaceholderBatch treatAsOneTransaction(
+      *this, ScrollSelectionIntoView::Yes, __FUNCTION__);
+  IgnoredErrorResult ignoredError;
+  AutoEditSubActionNotifier startToHandleEditSubAction(
+      *this, EditSubAction::eRemoveTextProperty, nsIEditor::eNext,
+      ignoredError);
+  if (NS_WARN_IF(ignoredError.ErrorCodeIs(NS_ERROR_EDITOR_DESTROYED))) {
+    return ignoredError.StealNSResult();
+  }
+  NS_WARNING_ASSERTION(
+      !ignoredError.Failed(),
+      "HTMLEditor::OnStartToHandleTopLevelEditSubAction() failed, but ignored");
+
+  AutoTransactionsConserveSelection dontChangeMySelection(*this);
+
+  AutoClonedSelectionRangeArray selectionRanges(SelectionRef());
+  for (const EditorInlineStyle& styleToRemove : aStylesToRemove) {
+    Maybe<AutoInlineStyleSetter> styleInverter;
+    if (styleToRemove.IsInvertibleWithCSS()) {
+      styleInverter.emplace(EditorInlineStyleAndValue::ToInvert(styleToRemove));
+    }
+    for (OwningNonNull<nsRange>& selectionRange : selectionRanges.Ranges()) {
+      AutoTrackDOMRange trackSelectionRange(RangeUpdaterRef(), &selectionRange);
+      const EditorDOMRange range(
+          styleToRemove.mHTMLProperty == nsGkAtoms::name
+              ? GetExtendedRangeWrappingNamedAnchor(
+                    EditorRawDOMRange(selectionRange))
+              : GetExtendedRangeWrappingEntirelySelectedElements(
+                    EditorRawDOMRange(selectionRange)));
+      if (NS_WARN_IF(!range.IsPositioned())) {
+        continue;
+      }
+
+      Result<SplitRangeOffResult, nsresult> splitRangeOffResult =
+          SplitAncestorStyledInlineElementsAtRangeEdges(
+              range, styleToRemove, SplitAtEdges::eAllowToCreateEmptyContainer);
+      if (MOZ_UNLIKELY(splitRangeOffResult.isErr())) {
+        NS_WARNING(
+            "HTMLEditor::SplitAncestorStyledInlineElementsAtRangeEdges() "
+            "failed");
+        return splitRangeOffResult.unwrapErr();
+      }
+      splitRangeOffResult.inspect().IgnoreCaretPointSuggestion();
+
+      const EditorDOMRange& splitRange =
+          splitRangeOffResult.inspect().RangeRef();
+      if (NS_WARN_IF(!splitRange.IsPositioned())) {
+        continue;
+      }
+
+      AutoTArray<OwningNonNull<nsIContent>, 64> arrayOfContentsToInvertStyle;
+      {
+        AutoTArray<OwningNonNull<nsIContent>, 64> arrayOfContentsAroundRange;
+        if (splitRange.InSameContainer() &&
+            splitRange.StartRef().IsInTextNode()) {
+          if (!EditorUtils::IsEditableContent(
+                  *splitRange.StartRef().ContainerAs<Text>(),
+                  EditorType::HTML)) {
+            continue;
+          }
+          arrayOfContentsAroundRange.AppendElement(
+              *splitRange.StartRef().ContainerAs<Text>());
+        } else if (splitRange.IsInTextNodes() &&
+                   splitRange.InAdjacentSiblings()) {
+          if (!EditorUtils::IsEditableContent(
+                  *splitRange.StartRef().ContainerAs<Text>(),
+                  EditorType::HTML)) {
+            continue;
+          }
+          arrayOfContentsAroundRange.AppendElement(
+              *splitRange.StartRef().ContainerAs<Text>());
+          arrayOfContentsAroundRange.AppendElement(
+              *splitRange.EndRef().ContainerAs<Text>());
+        } else {
+          if (splitRange.StartRef().IsInTextNode() &&
+              !splitRange.StartRef().IsStartOfContainer() &&
+              EditorUtils::IsEditableContent(
+                  *splitRange.StartRef().ContainerAs<Text>(),
+                  EditorType::HTML)) {
+            arrayOfContentsAroundRange.AppendElement(
+                *splitRange.StartRef().ContainerAs<Text>());
+          }
+          ContentSubtreeIterator subtreeIter;
+          if (NS_SUCCEEDED(
+                  subtreeIter.Init(splitRange.StartRef().ToRawRangeBoundary(),
+                                   splitRange.EndRef().ToRawRangeBoundary()))) {
+            for (; !subtreeIter.IsDone(); subtreeIter.Next()) {
+              nsCOMPtr<nsINode> node = subtreeIter.GetCurrentNode();
+              if (NS_WARN_IF(!node)) {
+                return NS_ERROR_FAILURE;
+              }
+              if (node->IsContent() &&
+                  EditorUtils::IsEditableContent(*node->AsContent(),
+                                                 EditorType::HTML)) {
+                arrayOfContentsAroundRange.AppendElement(*node->AsContent());
+              }
+            }
+          }
+          if (!splitRange.InSameContainer() &&
+              splitRange.EndRef().IsInTextNode() &&
+              !splitRange.EndRef().IsEndOfContainer() &&
+              EditorUtils::IsEditableContent(
+                  *splitRange.EndRef().ContainerAs<Text>(), EditorType::HTML)) {
+            arrayOfContentsAroundRange.AppendElement(
+                *splitRange.EndRef().ContainerAs<Text>());
+          }
+        }
+        if (styleToRemove.IsInvertibleWithCSS()) {
+          arrayOfContentsToInvertStyle.SetCapacity(
+              arrayOfContentsAroundRange.Length());
+        }
+
+        for (OwningNonNull<nsIContent>& content : arrayOfContentsAroundRange) {
+          if (content->IsElement()) {
+            Result<EditorDOMPoint, nsresult> removeStyleResult =
+                RemoveStyleInside(MOZ_KnownLive(*content->AsElement()),
+                                  styleToRemove, SpecifiedStyle::Preserve);
+            if (MOZ_UNLIKELY(removeStyleResult.isErr())) {
+              NS_WARNING("HTMLEditor::RemoveStyleInside() failed");
+              return removeStyleResult.unwrapErr();
+            }
+
+            if (!content->GetParentNode()) {
+              continue;
+            }
+          }
+
+          if (styleToRemove.IsInvertibleWithCSS()) {
+            arrayOfContentsToInvertStyle.AppendElement(content);
+          }
+        }  
+      }
+
+      auto FlushAndStopTrackingAndShrinkSelectionRange =
+          [&]() MOZ_CAN_RUN_SCRIPT {
+            trackSelectionRange.Flush(StopTracking::Yes);
+            if (NS_WARN_IF(!selectionRange->IsPositioned())) {
+              return;
+            }
+            EditorRawDOMRange range(selectionRange);
+            nsINode* const commonAncestor =
+                range.GetClosestCommonInclusiveAncestor();
+            nsIContent* const maybeNextContent =
+                range.StartRef().IsInContentNode() &&
+                        range.StartRef().IsEndOfContainer()
+                    ? AutoInlineStyleSetter::GetNextEditableInlineContent(
+                          *range.StartRef().ContainerAs<nsIContent>(),
+                          commonAncestor)
+                    : nullptr;
+            nsIContent* const maybePreviousContent =
+                range.EndRef().IsInContentNode() &&
+                        range.EndRef().IsStartOfContainer()
+                    ? AutoInlineStyleSetter::GetPreviousEditableInlineContent(
+                          *range.EndRef().ContainerAs<nsIContent>(),
+                          commonAncestor)
+                    : nullptr;
+            if (!maybeNextContent && !maybePreviousContent) {
+              return;
+            }
+            const auto startPoint =
+                maybeNextContent &&
+                        maybeNextContent != selectionRange->GetStartContainer()
+                    ? HTMLEditUtils::GetDeepestEditableStartPointOf<
+                          EditorRawDOMPoint>(
+                          *maybeNextContent,
+                          {EditablePointOption::RecognizeInvisibleWhiteSpaces,
+                           EditablePointOption::StopAtComment})
+                    : range.StartRef();
+            const auto endPoint =
+                maybePreviousContent && maybePreviousContent !=
+                                            selectionRange->GetEndContainer()
+                    ? HTMLEditUtils::GetDeepestEditableEndPointOf<
+                          EditorRawDOMPoint>(
+                          *maybePreviousContent,
+                          {EditablePointOption::RecognizeInvisibleWhiteSpaces,
+                           EditablePointOption::StopAtComment})
+                    : range.EndRef();
+            DebugOnly<nsresult> rvIgnored = selectionRange->SetStartAndEnd(
+                startPoint.ToRawRangeBoundary(), endPoint.ToRawRangeBoundary());
+            NS_WARNING_ASSERTION(
+                NS_SUCCEEDED(rvIgnored),
+                "nsRange::SetStartAndEnd() failed, but ignored");
+          };
+
+      if (arrayOfContentsToInvertStyle.IsEmpty()) {
+        FlushAndStopTrackingAndShrinkSelectionRange();
+        continue;
+      }
+      MOZ_ASSERT(styleToRemove.IsInvertibleWithCSS());
+
+      for (OwningNonNull<nsIContent>& content : arrayOfContentsToInvertStyle) {
+        if (Element* element = Element::FromNode(content)) {
+          nsresult rv = styleInverter->InvertStyleIfApplied(
+              *this, MOZ_KnownLive(*element));
+          if (NS_FAILED(rv)) {
+            if (NS_WARN_IF(rv == NS_ERROR_EDITOR_DESTROYED)) {
+              NS_WARNING(
+                  "AutoInlineStyleSetter::InvertStyleIfApplied() failed");
+              return NS_ERROR_EDITOR_DESTROYED;
+            }
+            NS_WARNING(
+                "AutoInlineStyleSetter::InvertStyleIfApplied() failed, but "
+                "ignored");
+          }
+          continue;
+        }
+
+        if (Text* textNode = Text::FromNode(content)) {
+          const uint32_t startOffset =
+              content == splitRange.StartRef().GetContainer()
+                  ? splitRange.StartRef().Offset()
+                  : 0u;
+          const uint32_t endOffset =
+              content == splitRange.EndRef().GetContainer()
+                  ? splitRange.EndRef().Offset()
+                  : textNode->TextDataLength();
+          Result<SplitRangeOffFromNodeResult, nsresult>
+              wrapTextInStyledElementResult =
+                  styleInverter->InvertStyleIfApplied(
+                      *this, MOZ_KnownLive(*textNode), startOffset, endOffset);
+          if (MOZ_UNLIKELY(wrapTextInStyledElementResult.isErr())) {
+            NS_WARNING("AutoInlineStyleSetter::InvertStyleIfApplied() failed");
+            return wrapTextInStyledElementResult.unwrapErr();
+          }
+          SplitRangeOffFromNodeResult unwrappedWrapTextInStyledElementResult =
+              wrapTextInStyledElementResult.unwrap();
+          unwrappedWrapTextInStyledElementResult.IgnoreCaretPointSuggestion();
+          if (unwrappedWrapTextInStyledElementResult.DidSplit() &&
+              styleToRemove.IsInvertibleWithCSS()) {
+            MOZ_ASSERT(unwrappedWrapTextInStyledElementResult
+                           .GetMiddleContentAs<Text>());
+            if (Text* styledTextNode = unwrappedWrapTextInStyledElementResult
+                                           .GetMiddleContentAs<Text>()) {
+              if (styledTextNode != content) {
+                arrayOfContentsToInvertStyle.ReplaceElementAt(
+                    arrayOfContentsToInvertStyle.Length() - 1,
+                    OwningNonNull<nsIContent>(*styledTextNode));
+              }
+            }
+          }
+          continue;
+        }
+
+      }
+
+      AutoTArray<OwningNonNull<Text>, 32> leafTextNodes;
+      for (const OwningNonNull<nsIContent>& content :
+           arrayOfContentsToInvertStyle) {
+        if (content->IsElement()) {
+          CollectEditableLeafTextNodes(*content->AsElement(), leafTextNodes);
+        }
+      }
+      for (const OwningNonNull<Text>& textNode : leafTextNodes) {
+        Result<SplitRangeOffFromNodeResult, nsresult>
+            wrapTextInStyledElementResult = styleInverter->InvertStyleIfApplied(
+                *this, MOZ_KnownLive(*textNode), 0, textNode->TextLength());
+        if (MOZ_UNLIKELY(wrapTextInStyledElementResult.isErr())) {
+          NS_WARNING(
+              "AutoInlineStyleSetter::SplitTextNodeAndApplyStyleToMiddleNode() "
+              "failed");
+          return wrapTextInStyledElementResult.unwrapErr();
+        }
+        wrapTextInStyledElementResult.inspect().IgnoreCaretPointSuggestion();
+      }  
+
+      FlushAndStopTrackingAndShrinkSelectionRange();
+    }  
+  }  
+
+  MOZ_ASSERT(!selectionRanges.HasSavedRanges());
+  nsresult rv = selectionRanges.ApplyTo(SelectionRef());
+  if (NS_WARN_IF(Destroyed())) {
+    return NS_ERROR_EDITOR_DESTROYED;
+  }
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "AutoClonedSelectionRangeArray::ApplyTo() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::AutoInlineStyleSetter::InvertStyleIfApplied(
+    HTMLEditor& aHTMLEditor, Element& aElement) {
+  MOZ_ASSERT(IsStyleToInvert());
+
+  Result<bool, nsresult> isRemovableParentStyleOrError =
+      aHTMLEditor.IsRemovableParentStyleWithNewSpanElement(aElement, *this);
+  if (MOZ_UNLIKELY(isRemovableParentStyleOrError.isErr())) {
+    NS_WARNING("HTMLEditor::IsRemovableParentStyleWithNewSpanElement() failed");
+    return isRemovableParentStyleOrError.unwrapErr();
+  }
+  if (!isRemovableParentStyleOrError.unwrap()) {
+    return NS_OK;
+  }
+
+  Result<CaretPoint, nsresult> pointToPutCaretOrError =
+      ApplyStyleToNodeOrChildrenAndRemoveNestedSameStyle(aHTMLEditor, aElement);
+  if (MOZ_UNLIKELY(pointToPutCaretOrError.isErr())) {
+    NS_WARNING(
+        "AutoInlineStyleSetter::"
+        "ApplyStyleToNodeOrChildrenAndRemoveNestedSameStyle() failed");
+    return pointToPutCaretOrError.unwrapErr();
+  }
+  pointToPutCaretOrError.unwrap().IgnoreCaretPointSuggestion();
+  return NS_OK;
+}
+
+Result<SplitRangeOffFromNodeResult, nsresult>
+HTMLEditor::AutoInlineStyleSetter::InvertStyleIfApplied(HTMLEditor& aHTMLEditor,
+                                                        Text& aTextNode,
+                                                        uint32_t aStartOffset,
+                                                        uint32_t aEndOffset) {
+  MOZ_ASSERT(IsStyleToInvert());
+
+  Result<bool, nsresult> isRemovableParentStyleOrError =
+      aHTMLEditor.IsRemovableParentStyleWithNewSpanElement(aTextNode, *this);
+  if (MOZ_UNLIKELY(isRemovableParentStyleOrError.isErr())) {
+    NS_WARNING("HTMLEditor::IsRemovableParentStyleWithNewSpanElement() failed");
+    return isRemovableParentStyleOrError.propagateErr();
+  }
+  if (!isRemovableParentStyleOrError.unwrap()) {
+    return SplitRangeOffFromNodeResult(nullptr, &aTextNode, nullptr);
+  }
+
+  Result<SplitRangeOffFromNodeResult, nsresult> wrapTextInStyledElementResult =
+      SplitTextNodeAndApplyStyleToMiddleNode(aHTMLEditor, aTextNode,
+                                             aStartOffset, aEndOffset);
+  NS_WARNING_ASSERTION(
+      wrapTextInStyledElementResult.isOk(),
+      "AutoInlineStyleSetter::SplitTextNodeAndApplyStyleToMiddleNode() failed");
+  return wrapTextInStyledElementResult;
+}
+
+Result<bool, nsresult> HTMLEditor::IsRemovableParentStyleWithNewSpanElement(
+    nsIContent& aContent, const EditorInlineStyle& aStyle) const {
+  if (aStyle.IsStyleToClearAllInlineStyles()) {
+    return false;
+  }
+
+  if (!aStyle.IsInvertibleWithCSS()) {
+    return false;
+  }
+
+  const RefPtr<Element> element = aContent.GetAsElementOrParentElement();
+  if (MOZ_UNLIKELY(!element)) {
+    return false;
+  }
+
+  if (!aStyle.IsCSSSettable(*element)) {
+    return false;
+  }
+  nsAutoString emptyString;
+  Result<bool, nsresult> isComputedCSSEquivalentToStyleOrError =
+      CSSEditUtils::IsComputedCSSEquivalentTo(*this, *element, aStyle,
+                                              emptyString);
+  NS_WARNING_ASSERTION(isComputedCSSEquivalentToStyleOrError.isOk(),
+                       "CSSEditUtils::IsComputedCSSEquivalentTo() failed");
+  return isComputedCSSEquivalentToStyleOrError;
+}
+
+void HTMLEditor::CollectEditableLeafTextNodes(
+    Element& aElement, nsTArray<OwningNonNull<Text>>& aLeafTextNodes) const {
+  for (nsIContent* child = aElement.GetFirstChild(); child;
+       child = child->GetNextSibling()) {
+    if (child->IsElement()) {
+      CollectEditableLeafTextNodes(*child->AsElement(), aLeafTextNodes);
+      continue;
+    }
+    if (child->IsText()) {
+      aLeafTextNodes.AppendElement(*child->AsText());
+    }
+  }
+}
+
+nsresult HTMLEditor::IncreaseFontSizeAsAction(nsIPrincipal* aPrincipal) {
+  AutoEditActionDataSetter editActionData(*this, EditAction::eIncrementFontSize,
+                                          aPrincipal);
+  nsresult rv = editActionData.CanHandleAndMaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "CanHandleAndMaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  rv = IncrementOrDecrementFontSizeAsSubAction(FontSize::incr);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::IncrementOrDecrementFontSizeAsSubAction("
+                       "FontSize::incr) failed");
+  return EditorBase::ToGenericNSResult(rv);
+}
+
+nsresult HTMLEditor::DecreaseFontSizeAsAction(nsIPrincipal* aPrincipal) {
+  AutoEditActionDataSetter editActionData(*this, EditAction::eDecrementFontSize,
+                                          aPrincipal);
+  nsresult rv = editActionData.CanHandleAndMaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "CanHandleAndMaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  rv = IncrementOrDecrementFontSizeAsSubAction(FontSize::decr);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::IncrementOrDecrementFontSizeAsSubAction("
+                       "FontSize::decr) failed");
+  return EditorBase::ToGenericNSResult(rv);
+}
+
+nsresult HTMLEditor::IncrementOrDecrementFontSizeAsSubAction(
+    FontSize aIncrementOrDecrement) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  AutoPlaceholderBatch treatAsOneTransaction(
+      *this, ScrollSelectionIntoView::Yes, __FUNCTION__);
+
+  DebugOnly<nsresult> rvIgnored = CommitComposition();
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                       "EditorBase::CommitComposition() failed, but ignored");
+
+  if (SelectionRef().IsCollapsed()) {
+    nsStaticAtom& bigOrSmallTagName = aIncrementOrDecrement == FontSize::incr
+                                          ? *nsGkAtoms::big
+                                          : *nsGkAtoms::small;
+
+    if (!SelectionRef().RangeCount()) {
+      return NS_OK;
+    }
+    const auto firstRangeStartPoint =
+        EditorBase::GetFirstSelectionStartPoint<EditorRawDOMPoint>();
+    if (NS_WARN_IF(!firstRangeStartPoint.IsSet())) {
+      return NS_OK;
+    }
+    Element* element =
+        firstRangeStartPoint.GetContainerOrContainerParentElement();
+    if (NS_WARN_IF(!element)) {
+      return NS_OK;
+    }
+    if (!HTMLEditUtils::CanNodeContain(*element, bigOrSmallTagName)) {
+      return NS_OK;
+    }
+
+    mPendingStylesToApplyToNewContent->PreserveStyle(bigOrSmallTagName, nullptr,
+                                                     u""_ns);
+    return NS_OK;
+  }
+
+  IgnoredErrorResult ignoredError;
+  AutoEditSubActionNotifier startToHandleEditSubAction(
+      *this, EditSubAction::eSetTextProperty, nsIEditor::eNext, ignoredError);
+  if (NS_WARN_IF(ignoredError.ErrorCodeIs(NS_ERROR_EDITOR_DESTROYED))) {
+    return ignoredError.StealNSResult();
+  }
+  NS_WARNING_ASSERTION(
+      !ignoredError.Failed(),
+      "HTMLEditor::OnStartToHandleTopLevelEditSubAction() failed, but ignored");
+
+  AutoTransactionsConserveSelection dontChangeMySelection(*this);
+
+  AutoClonedSelectionRangeArray selectionRanges(SelectionRef());
+  MOZ_ALWAYS_TRUE(selectionRanges.SaveAndTrackRanges(*this));
+  for (const OwningNonNull<nsRange>& domRange : selectionRanges.Ranges()) {
+    const EditorDOMRange range(GetExtendedRangeWrappingEntirelySelectedElements(
+        EditorRawDOMRange(domRange)));
+    if (NS_WARN_IF(!range.IsPositioned())) {
+      continue;
+    }
+
+    if (range.InSameContainer() && range.StartRef().IsInTextNode()) {
+      Result<CreateElementResult, nsresult> wrapInBigOrSmallElementResult =
+          SetFontSizeOnTextNode(
+              MOZ_KnownLive(*range.StartRef().ContainerAs<Text>()),
+              range.StartRef().Offset(), range.EndRef().Offset(),
+              aIncrementOrDecrement);
+      if (MOZ_UNLIKELY(wrapInBigOrSmallElementResult.isErr())) {
+        NS_WARNING("HTMLEditor::SetFontSizeOnTextNode() failed");
+        return wrapInBigOrSmallElementResult.unwrapErr();
+      }
+      wrapInBigOrSmallElementResult.inspect().IgnoreCaretPointSuggestion();
+      continue;
+    }
+
+
+
+    ContentSubtreeIterator subtreeIter;
+    if (NS_SUCCEEDED(subtreeIter.Init(range.StartRef().ToRawRangeBoundary(),
+                                      range.EndRef().ToRawRangeBoundary()))) {
+      nsTArray<OwningNonNull<nsIContent>> arrayOfContents;
+      for (; !subtreeIter.IsDone(); subtreeIter.Next()) {
+        if (NS_WARN_IF(!subtreeIter.GetCurrentNode()->IsContent())) {
+          return NS_ERROR_FAILURE;
+        }
+        OwningNonNull<nsIContent> content =
+            *subtreeIter.GetCurrentNode()->AsContent();
+
+        if (EditorUtils::IsEditableContent(content, EditorType::HTML)) {
+          arrayOfContents.AppendElement(content);
+        }
+      }
+
+      for (OwningNonNull<nsIContent>& content : arrayOfContents) {
+        Result<EditorDOMPoint, nsresult> fontChangeOnNodeResult =
+            SetFontSizeWithBigOrSmallElement(MOZ_KnownLive(content),
+                                             aIncrementOrDecrement);
+        if (MOZ_UNLIKELY(fontChangeOnNodeResult.isErr())) {
+          NS_WARNING("HTMLEditor::SetFontSizeWithBigOrSmallElement() failed");
+          return fontChangeOnNodeResult.unwrapErr();
+        }
+      }
+    }
+    if (range.StartRef().IsInTextNode() &&
+        !range.StartRef().IsEndOfContainer() &&
+        EditorUtils::IsEditableContent(*range.StartRef().ContainerAs<Text>(),
+                                       EditorType::HTML)) {
+      Result<CreateElementResult, nsresult> wrapInBigOrSmallElementResult =
+          SetFontSizeOnTextNode(
+              MOZ_KnownLive(*range.StartRef().ContainerAs<Text>()),
+              range.StartRef().Offset(),
+              range.StartRef().ContainerAs<Text>()->TextDataLength(),
+              aIncrementOrDecrement);
+      if (MOZ_UNLIKELY(wrapInBigOrSmallElementResult.isErr())) {
+        NS_WARNING("HTMLEditor::SetFontSizeOnTextNode() failed");
+        return wrapInBigOrSmallElementResult.unwrapErr();
+      }
+      wrapInBigOrSmallElementResult.inspect().IgnoreCaretPointSuggestion();
+    }
+    if (range.EndRef().IsInTextNode() && !range.EndRef().IsStartOfContainer() &&
+        EditorUtils::IsEditableContent(*range.EndRef().ContainerAs<Text>(),
+                                       EditorType::HTML)) {
+      Result<CreateElementResult, nsresult> wrapInBigOrSmallElementResult =
+          SetFontSizeOnTextNode(
+              MOZ_KnownLive(*range.EndRef().ContainerAs<Text>()), 0u,
+              range.EndRef().Offset(), aIncrementOrDecrement);
+      if (MOZ_UNLIKELY(wrapInBigOrSmallElementResult.isErr())) {
+        NS_WARNING("HTMLEditor::SetFontSizeOnTextNode() failed");
+        return wrapInBigOrSmallElementResult.unwrapErr();
+      }
+      wrapInBigOrSmallElementResult.inspect().IgnoreCaretPointSuggestion();
+    }
+  }
+
+  MOZ_ASSERT(selectionRanges.HasSavedRanges());
+  selectionRanges.RestoreFromSavedRanges();
+  nsresult rv = selectionRanges.ApplyTo(SelectionRef());
+  if (NS_WARN_IF(Destroyed())) {
+    return NS_ERROR_EDITOR_DESTROYED;
+  }
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "AutoClonedSelectionRangeArray::ApplyTo() failed");
+  return rv;
+}
+
+Result<CreateElementResult, nsresult> HTMLEditor::SetFontSizeOnTextNode(
+    Text& aTextNode, uint32_t aStartOffset, uint32_t aEndOffset,
+    FontSize aIncrementOrDecrement) {
+  if (aStartOffset == aEndOffset) {
+    return CreateElementResult::NotHandled();
+  }
+
+  if (!aTextNode.GetParentNode() ||
+      !HTMLEditUtils::CanNodeContain(*aTextNode.GetParentNode(),
+                                     *nsGkAtoms::big)) {
+    return CreateElementResult::NotHandled();
+  }
+
+  aEndOffset = std::min(aTextNode.Length(), aEndOffset);
+
+  RefPtr<Text> textNodeForTheRange = &aTextNode;
+
+  EditorDOMPoint pointToPutCaret;
+  {
+    auto pointToPutCaretOrError =
+        [&]() MOZ_CAN_RUN_SCRIPT -> Result<EditorDOMPoint, nsresult> {
+      EditorDOMPoint pointToPutCaret;
+      EditorDOMPoint atEnd(textNodeForTheRange, aEndOffset);
+      if (!atEnd.IsEndOfContainer()) {
+        Result<SplitNodeResult, nsresult> splitAtEndResult =
+            SplitNodeWithTransaction(atEnd);
+        if (MOZ_UNLIKELY(splitAtEndResult.isErr())) {
+          NS_WARNING("HTMLEditor::SplitNodeWithTransaction() failed");
+          return splitAtEndResult.propagateErr();
+        }
+        SplitNodeResult unwrappedSplitAtEndResult = splitAtEndResult.unwrap();
+        if (MOZ_UNLIKELY(
+                !unwrappedSplitAtEndResult.HasCaretPointSuggestion())) {
+          NS_WARNING(
+              "HTMLEditor::SplitNodeWithTransaction() didn't suggest caret "
+              "point");
+          return Err(NS_ERROR_FAILURE);
+        }
+        unwrappedSplitAtEndResult.MoveCaretPointTo(pointToPutCaret, *this, {});
+        MOZ_ASSERT_IF(AllowsTransactionsToChangeSelection(),
+                      pointToPutCaret.IsSet());
+        textNodeForTheRange =
+            unwrappedSplitAtEndResult.GetPreviousContentAs<Text>();
+        MOZ_DIAGNOSTIC_ASSERT(textNodeForTheRange);
+      }
+
+      EditorDOMPoint atStart(textNodeForTheRange, aStartOffset);
+      if (!atStart.IsStartOfContainer()) {
+        Result<SplitNodeResult, nsresult> splitAtStartResult =
+            SplitNodeWithTransaction(atStart);
+        if (MOZ_UNLIKELY(splitAtStartResult.isErr())) {
+          NS_WARNING("HTMLEditor::SplitNodeWithTransaction() failed");
+          return splitAtStartResult.propagateErr();
+        }
+        SplitNodeResult unwrappedSplitAtStartResult =
+            splitAtStartResult.unwrap();
+        if (MOZ_UNLIKELY(
+                !unwrappedSplitAtStartResult.HasCaretPointSuggestion())) {
+          NS_WARNING(
+              "HTMLEditor::SplitNodeWithTransaction() didn't suggest caret "
+              "point");
+          return Err(NS_ERROR_FAILURE);
+        }
+        unwrappedSplitAtStartResult.MoveCaretPointTo(pointToPutCaret, *this,
+                                                     {});
+        MOZ_ASSERT_IF(AllowsTransactionsToChangeSelection(),
+                      pointToPutCaret.IsSet());
+        textNodeForTheRange =
+            unwrappedSplitAtStartResult.GetNextContentAs<Text>();
+        MOZ_DIAGNOSTIC_ASSERT(textNodeForTheRange);
+      }
+
+      return pointToPutCaret;
+    }();
+    if (MOZ_UNLIKELY(pointToPutCaretOrError.isErr())) {
+      return pointToPutCaretOrError.propagateErr();
+    }
+    pointToPutCaret = pointToPutCaretOrError.unwrap();
+  }
+
+  nsStaticAtom* const bigOrSmallTagName =
+      aIncrementOrDecrement == FontSize::incr ? nsGkAtoms::big
+                                              : nsGkAtoms::small;
+  nsCOMPtr<nsIContent> sibling = HTMLEditUtils::GetPreviousSibling(
+      *textNodeForTheRange, {LeafNodeOption::IgnoreNonEditableNode},
+      BlockInlineCheck::UseComputedDisplayOutsideStyle);
+  if (sibling && sibling->IsHTMLElement(bigOrSmallTagName)) {
+    Result<MoveNodeResult, nsresult> moveTextNodeResult =
+        MoveNodeToEndWithTransaction(*textNodeForTheRange, *sibling);
+    if (MOZ_UNLIKELY(moveTextNodeResult.isErr())) {
+      NS_WARNING("HTMLEditor::MoveNodeToEndWithTransaction() failed");
+      return moveTextNodeResult.propagateErr();
+    }
+    MoveNodeResult unwrappedMoveTextNodeResult = moveTextNodeResult.unwrap();
+    unwrappedMoveTextNodeResult.MoveCaretPointTo(
+        pointToPutCaret, *this, {SuggestCaret::OnlyIfHasSuggestion});
+    return CreateElementResult::NotHandled(std::move(pointToPutCaret));
+  }
+  sibling = HTMLEditUtils::GetNextSibling(
+      *textNodeForTheRange, {LeafNodeOption::IgnoreNonEditableNode},
+      BlockInlineCheck::UseComputedDisplayOutsideStyle);
+  if (sibling && sibling->IsHTMLElement(bigOrSmallTagName)) {
+    Result<MoveNodeResult, nsresult> moveTextNodeResult =
+        MoveNodeWithTransaction(*textNodeForTheRange,
+                                EditorDOMPoint(sibling, 0u));
+    if (MOZ_UNLIKELY(moveTextNodeResult.isErr())) {
+      NS_WARNING("HTMLEditor::MoveNodeWithTransaction() failed");
+      return moveTextNodeResult.propagateErr();
+    }
+    MoveNodeResult unwrappedMoveTextNodeResult = moveTextNodeResult.unwrap();
+    unwrappedMoveTextNodeResult.MoveCaretPointTo(
+        pointToPutCaret, *this, {SuggestCaret::OnlyIfHasSuggestion});
+    return CreateElementResult::NotHandled(std::move(pointToPutCaret));
+  }
+
+  Result<CreateElementResult, nsresult> wrapTextInBigOrSmallElementResult =
+      InsertContainerWithTransaction(*textNodeForTheRange,
+                                     MOZ_KnownLive(*bigOrSmallTagName));
+  if (wrapTextInBigOrSmallElementResult.isErr()) {
+    NS_WARNING("HTMLEditor::InsertContainerWithTransaction() failed");
+    return wrapTextInBigOrSmallElementResult;
+  }
+  CreateElementResult unwrappedWrapTextInBigOrSmallElementResult =
+      wrapTextInBigOrSmallElementResult.unwrap();
+  unwrappedWrapTextInBigOrSmallElementResult.MoveCaretPointTo(
+      pointToPutCaret, {SuggestCaret::OnlyIfHasSuggestion});
+  return CreateElementResult(
+      unwrappedWrapTextInBigOrSmallElementResult.UnwrapNewNode(),
+      std::move(pointToPutCaret));
+}
+
+Result<EditorDOMPoint, nsresult> HTMLEditor::SetFontSizeOfFontElementChildren(
+    nsIContent& aContent, FontSize aIncrementOrDecrement) {
+
+  if (aContent.IsHTMLElement(nsGkAtoms::font) &&
+      aContent.AsElement()->HasAttr(nsGkAtoms::size)) {
+    EditorDOMPoint pointToPutCaret;
+
+    AutoTArray<OwningNonNull<nsIContent>, 32> arrayOfContents;
+    HTMLEditUtils::CollectAllChildren(aContent, arrayOfContents);
+    for (const auto& child : arrayOfContents) {
+      Result<EditorDOMPoint, nsresult> setFontSizeOfChildResult =
+          SetFontSizeWithBigOrSmallElement(MOZ_KnownLive(child),
+                                           aIncrementOrDecrement);
+      if (MOZ_UNLIKELY(setFontSizeOfChildResult.isErr())) {
+        NS_WARNING("HTMLEditor::WrapContentInBigOrSmallElement() failed");
+        return setFontSizeOfChildResult;
+      }
+      if (setFontSizeOfChildResult.inspect().IsSet()) {
+        pointToPutCaret = setFontSizeOfChildResult.unwrap();
+      }
+    }
+
+    return pointToPutCaret;
+  }
+
+  EditorDOMPoint pointToPutCaret;
+  AutoTArray<OwningNonNull<nsIContent>, 32> arrayOfContents;
+  HTMLEditUtils::CollectAllChildren(aContent, arrayOfContents);
+  for (const auto& child : arrayOfContents) {
+    Result<EditorDOMPoint, nsresult> fontSizeChangeResult =
+        SetFontSizeOfFontElementChildren(MOZ_KnownLive(child),
+                                         aIncrementOrDecrement);
+    if (MOZ_UNLIKELY(fontSizeChangeResult.isErr())) {
+      NS_WARNING("HTMLEditor::SetFontSizeOfFontElementChildren() failed");
+      return fontSizeChangeResult;
+    }
+    if (fontSizeChangeResult.inspect().IsSet()) {
+      pointToPutCaret = fontSizeChangeResult.unwrap();
+    }
+  }
+
+  return pointToPutCaret;
+}
+
+Result<EditorDOMPoint, nsresult> HTMLEditor::SetFontSizeWithBigOrSmallElement(
+    nsIContent& aContent, FontSize aIncrementOrDecrement) {
+  nsStaticAtom* const bigOrSmallTagName =
+      aIncrementOrDecrement == FontSize::incr ? nsGkAtoms::big
+                                              : nsGkAtoms::small;
+
+  if ((aIncrementOrDecrement == FontSize::incr &&
+       aContent.IsHTMLElement(nsGkAtoms::small)) ||
+      (aIncrementOrDecrement == FontSize::decr &&
+       aContent.IsHTMLElement(nsGkAtoms::big))) {
+    Result<EditorDOMPoint, nsresult> fontSizeChangeOfDescendantsResult =
+        SetFontSizeOfFontElementChildren(aContent, aIncrementOrDecrement);
+    if (MOZ_UNLIKELY(fontSizeChangeOfDescendantsResult.isErr())) {
+      NS_WARNING("HTMLEditor::SetFontSizeOfFontElementChildren() failed");
+      return fontSizeChangeOfDescendantsResult;
+    }
+    EditorDOMPoint pointToPutCaret = fontSizeChangeOfDescendantsResult.unwrap();
+    Result<EditorDOMPoint, nsresult> unwrapBigOrSmallElementResult =
+        RemoveContainerWithTransaction(MOZ_KnownLive(*aContent.AsElement()));
+    if (MOZ_UNLIKELY(unwrapBigOrSmallElementResult.isErr())) {
+      NS_WARNING("HTMLEditor::RemoveContainerWithTransaction() failed");
+      return unwrapBigOrSmallElementResult;
+    }
+    if (unwrapBigOrSmallElementResult.inspect().IsSet()) {
+      pointToPutCaret = unwrapBigOrSmallElementResult.unwrap();
+    }
+    return pointToPutCaret;
+  }
+
+  if (HTMLEditUtils::CanNodeContain(*bigOrSmallTagName, aContent)) {
+    Result<EditorDOMPoint, nsresult> fontSizeChangeOfDescendantsResult =
+        SetFontSizeOfFontElementChildren(aContent, aIncrementOrDecrement);
+    if (MOZ_UNLIKELY(fontSizeChangeOfDescendantsResult.isErr())) {
+      NS_WARNING("HTMLEditor::SetFontSizeOfFontElementChildren() failed");
+      return fontSizeChangeOfDescendantsResult;
+    }
+
+    EditorDOMPoint pointToPutCaret = fontSizeChangeOfDescendantsResult.unwrap();
+
+    nsCOMPtr<nsIContent> sibling = HTMLEditUtils::GetPreviousSibling(
+        aContent, {LeafNodeOption::IgnoreNonEditableNode},
+        BlockInlineCheck::UseComputedDisplayOutsideStyle);
+    if (sibling && sibling->IsHTMLElement(bigOrSmallTagName)) {
+      Result<MoveNodeResult, nsresult> moveNodeResult =
+          MoveNodeToEndWithTransaction(aContent, *sibling);
+      if (MOZ_UNLIKELY(moveNodeResult.isErr())) {
+        NS_WARNING("HTMLEditor::MoveNodeToEndWithTransaction() failed");
+        return moveNodeResult.propagateErr();
+      }
+      MoveNodeResult unwrappedMoveNodeResult = moveNodeResult.unwrap();
+      unwrappedMoveNodeResult.MoveCaretPointTo(
+          pointToPutCaret, {SuggestCaret::OnlyIfHasSuggestion});
+      return pointToPutCaret;
+    }
+
+    sibling = HTMLEditUtils::GetNextSibling(
+        aContent, {LeafNodeOption::IgnoreNonEditableNode},
+        BlockInlineCheck::UseComputedDisplayOutsideStyle);
+    if (sibling && sibling->IsHTMLElement(bigOrSmallTagName)) {
+      Result<MoveNodeResult, nsresult> moveNodeResult =
+          MoveNodeWithTransaction(aContent, EditorDOMPoint(sibling, 0u));
+      if (MOZ_UNLIKELY(moveNodeResult.isErr())) {
+        NS_WARNING("HTMLEditor::MoveNodeWithTransaction() failed");
+        return moveNodeResult.propagateErr();
+      }
+      MoveNodeResult unwrappedMoveNodeResult = moveNodeResult.unwrap();
+      unwrappedMoveNodeResult.MoveCaretPointTo(
+          pointToPutCaret, {SuggestCaret::OnlyIfHasSuggestion});
+      return pointToPutCaret;
+    }
+
+    Result<CreateElementResult, nsresult> wrapInBigOrSmallElementResult =
+        InsertContainerWithTransaction(aContent,
+                                       MOZ_KnownLive(*bigOrSmallTagName));
+    if (MOZ_UNLIKELY(wrapInBigOrSmallElementResult.isErr())) {
+      NS_WARNING("HTMLEditor::InsertContainerWithTransaction() failed");
+      return Err(wrapInBigOrSmallElementResult.unwrapErr());
+    }
+    CreateElementResult unwrappedWrapInBigOrSmallElementResult =
+        wrapInBigOrSmallElementResult.unwrap();
+    MOZ_ASSERT(unwrappedWrapInBigOrSmallElementResult.GetNewNode());
+    unwrappedWrapInBigOrSmallElementResult.MoveCaretPointTo(
+        pointToPutCaret, {SuggestCaret::OnlyIfHasSuggestion});
+    return pointToPutCaret;
+  }
+
+  EditorDOMPoint pointToPutCaret;
+  AutoTArray<OwningNonNull<nsIContent>, 32> arrayOfContents;
+  HTMLEditUtils::CollectAllChildren(aContent, arrayOfContents);
+  for (const auto& child : arrayOfContents) {
+    Result<EditorDOMPoint, nsresult> setFontSizeOfChildResult =
+        SetFontSizeWithBigOrSmallElement(MOZ_KnownLive(child),
+                                         aIncrementOrDecrement);
+    if (MOZ_UNLIKELY(setFontSizeOfChildResult.isErr())) {
+      NS_WARNING("HTMLEditor::SetFontSizeWithBigOrSmallElement() failed");
+      return setFontSizeOfChildResult;
+    }
+    if (setFontSizeOfChildResult.inspect().IsSet()) {
+      pointToPutCaret = setFontSizeOfChildResult.unwrap();
+    }
+  }
+
+  return pointToPutCaret;
+}
+
+NS_IMETHODIMP HTMLEditor::GetFontFaceState(bool* aMixed, nsAString& outFace) {
+  if (NS_WARN_IF(!aMixed)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  *aMixed = true;
+  outFace.Truncate();
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  bool first, any, all;
+
+  nsresult rv = GetInlinePropertyBase(
+      EditorInlineStyle(*nsGkAtoms::font, nsGkAtoms::face), nullptr, &first,
+      &any, &all, &outFace);
+  if (NS_FAILED(rv)) {
+    NS_WARNING(
+        "HTMLEditor::GetInlinePropertyBase(nsGkAtoms::font, nsGkAtoms::face) "
+        "failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+  if (any && !all) {
+    return NS_OK;  
+  }
+  if (all) {
+    *aMixed = false;
+    return NS_OK;
+  }
+
+  rv = GetInlinePropertyBase(EditorInlineStyle(*nsGkAtoms::tt), nullptr, &first,
+                             &any, &all, nullptr);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("HTMLEditor::GetInlinePropertyBase(nsGkAtoms::tt) failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+  if (any && !all) {
+    return NS_OK;  
+  }
+  if (all) {
+    *aMixed = false;
+    outFace.AssignLiteral("tt");
+  }
+
+  if (!any) {
+    outFace.Truncate();
+    *aMixed = false;
+  }
+  return NS_OK;
+}
+
+nsresult HTMLEditor::GetFontColorState(bool* aMixed, nsAString& aOutColor) {
+  if (NS_WARN_IF(!aMixed)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  *aMixed = true;
+  aOutColor.Truncate();
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  bool first, any, all;
+  nsresult rv = GetInlinePropertyBase(
+      EditorInlineStyle(*nsGkAtoms::font, nsGkAtoms::color), nullptr, &first,
+      &any, &all, &aOutColor);
+  if (NS_FAILED(rv)) {
+    NS_WARNING(
+        "HTMLEditor::GetInlinePropertyBase(nsGkAtoms::font, nsGkAtoms::color) "
+        "failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  if (any && !all) {
+    return NS_OK;  
+  }
+  if (all) {
+    *aMixed = false;
+    return NS_OK;
+  }
+
+  if (!any) {
+    aOutColor.Truncate();
+    *aMixed = false;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP HTMLEditor::GetIsCSSEnabled(bool* aIsCSSEnabled) {
+  *aIsCSSEnabled = IsCSSEnabled();
+  return NS_OK;
+}
+
+bool HTMLEditor::HasStyleOrIdOrClassAttribute(Element& aElement) {
+  return aElement.HasNonEmptyAttr(nsGkAtoms::style) ||
+         aElement.HasNonEmptyAttr(nsGkAtoms::_class) ||
+         aElement.HasNonEmptyAttr(nsGkAtoms::id);
+}
+
+}  

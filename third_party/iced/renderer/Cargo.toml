@@ -1,0 +1,39 @@
+[package]
+name = "iced_renderer"
+description = "The official renderer for iced"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+wgpu = []
+wgpu-bare = ["iced_wgpu"]
+tiny-skia = []
+image = []
+svg = []
+svg-text = []
+svg-raster-images = []
+geometry = ["iced_graphics/geometry", "iced_wgpu?/geometry"]
+web-colors = ["iced_wgpu?/web-colors"]
+webgl = []
+fira-sans = ["iced_graphics/fira-sans"]
+strict-assertions = []
+x11 = []
+wayland = []
+
+[dependencies]
+iced_graphics.workspace = true
+
+iced_wgpu.workspace = true
+iced_wgpu.optional = true
+
+log.workspace = true
+thiserror.workspace = true

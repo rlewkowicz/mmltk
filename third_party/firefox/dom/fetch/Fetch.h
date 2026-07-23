@@ -1,0 +1,234 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_Fetch_h
+#define mozilla_dom_Fetch_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/dom/AbortSignal.h"
+#include "mozilla/dom/BodyConsumer.h"
+#include "mozilla/dom/FetchStreamReader.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/ReadableStream.h"
+#include "mozilla/dom/ReadableStreamDefaultReaderBinding.h"
+#include "mozilla/dom/RequestBinding.h"
+#include "mozilla/dom/workerinternals/RuntimeService.h"
+#include "nsCOMPtr.h"
+#include "nsError.h"
+#include "nsProxyRelease.h"
+#include "nsString.h"
+
+class nsIGlobalObject;
+class nsIEventTarget;
+
+namespace mozilla {
+class ErrorResult;
+
+namespace ipc {
+class PrincipalInfo;
+}  
+
+namespace dom {
+
+class BlobOrArrayBufferViewOrArrayBufferOrFormDataOrURLSearchParamsOrUSVString;
+class
+    BlobOrArrayBufferViewOrArrayBufferOrFormDataOrURLSearchParamsOrReadableStreamOrUSVString;
+class BlobImpl;
+class InternalRequest;
+class
+    OwningBlobOrArrayBufferViewOrArrayBufferOrFormDataOrURLSearchParamsOrUSVString;
+
+class ReadableStreamDefaultReader;
+class RequestOrUTF8String;
+class WorkerPrivate;
+
+enum class CallerType : uint32_t;
+
+already_AddRefed<Promise> FetchRequest(nsIGlobalObject* aGlobal,
+                                       const RequestOrUTF8String& aInput,
+                                       const RequestInit& aInit,
+                                       CallerType aCallerType,
+                                       ErrorResult& aRv);
+
+nsresult UpdateRequestReferrer(nsIGlobalObject* aGlobal,
+                               InternalRequest* aRequest);
+
+namespace fetch {
+using BodyInit =
+    BlobOrArrayBufferViewOrArrayBufferOrFormDataOrURLSearchParamsOrUSVString;
+using ResponseBodyInit =
+    BlobOrArrayBufferViewOrArrayBufferOrFormDataOrURLSearchParamsOrReadableStreamOrUSVString;
+using OwningBodyInit =
+    OwningBlobOrArrayBufferViewOrArrayBufferOrFormDataOrURLSearchParamsOrUSVString;
+};  
+
+nsresult ExtractByteStreamFromBody(const fetch::OwningBodyInit& aBodyInit,
+                                   nsIInputStream** aStream,
+                                   nsCString& aContentType,
+                                   uint64_t& aContentLength);
+
+nsresult ExtractByteStreamFromBody(const fetch::BodyInit& aBodyInit,
+                                   nsIInputStream** aStream,
+                                   nsCString& aContentType,
+                                   uint64_t& aContentLength);
+
+nsresult ExtractByteStreamFromBody(const fetch::ResponseBodyInit& aBodyInit,
+                                   nsIInputStream** aStream,
+                                   nsCString& aContentType,
+                                   uint64_t& aContentLength);
+
+
+class FetchBodyBase : public nsISupports {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS(FetchBodyBase)
+
+ protected:
+  virtual ~FetchBodyBase() = default;
+
+  RefPtr<ReadableStream> mReadableStreamBody;
+};
+
+template <class Derived>
+class FetchBody : public FetchBodyBase, public AbortFollower {
+ public:
+  using FetchBodyBase::QueryInterface;
+
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(FetchBody, FetchBodyBase)
+
+  bool BodyUsed() const;
+
+  already_AddRefed<Promise> ArrayBuffer(JSContext* aCx, ErrorResult& aRv) {
+    return ConsumeBody(aCx, BodyConsumer::ConsumeType::ArrayBuffer, aRv);
+  }
+
+  already_AddRefed<Promise> Blob(JSContext* aCx, ErrorResult& aRv) {
+    return ConsumeBody(aCx, BodyConsumer::ConsumeType::Blob, aRv);
+  }
+
+  already_AddRefed<Promise> Bytes(JSContext* aCx, ErrorResult& aRv) {
+    return ConsumeBody(aCx, BodyConsumer::ConsumeType::Bytes, aRv);
+  }
+
+  already_AddRefed<Promise> FormData(JSContext* aCx, ErrorResult& aRv) {
+    return ConsumeBody(aCx, BodyConsumer::ConsumeType::FormData, aRv);
+  }
+
+  already_AddRefed<Promise> Json(JSContext* aCx, ErrorResult& aRv) {
+    return ConsumeBody(aCx, BodyConsumer::ConsumeType::JSON, aRv);
+  }
+
+  already_AddRefed<Promise> Text(JSContext* aCx, ErrorResult& aRv) {
+    return ConsumeBody(aCx, BodyConsumer::ConsumeType::Text, aRv);
+  }
+
+  already_AddRefed<ReadableStream> GetBody(JSContext* aCx, ErrorResult& aRv);
+  void GetMimeType(nsACString& aMimeType, nsACString& aMixedCaseMimeType);
+
+  BlobImpl* BodyBlobImpl() const;
+
+  const nsAString& BodyLocalPath() const;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void MaybeTeeReadableStreamBody(JSContext* aCx, ReadableStream** aBodyOut,
+                                  FetchStreamReader** aStreamReader,
+                                  nsIInputStream** aInputStream,
+                                  ErrorResult& aRv);
+
+  void MaybeRebindReadableStreamBody();
+
+
+  void SetBodyUsed(JSContext* aCx, ErrorResult& aRv);
+
+  virtual AbortSignalImpl* GetSignalImpl() const = 0;
+
+  virtual AbortSignalImpl* GetSignalImplToConsumeBody() const = 0;
+
+  void RunAbortAlgorithm() override;
+
+  already_AddRefed<Promise> ConsumeBody(JSContext* aCx,
+                                        BodyConsumer::ConsumeType aType,
+                                        ErrorResult& aRv);
+
+ protected:
+  nsCOMPtr<nsIGlobalObject> mGlobal;
+
+  RefPtr<FetchStreamReader> mFetchStreamReader;
+
+  explicit FetchBody(nsIGlobalObject* aGlobal);
+
+  virtual ~FetchBody();
+
+  void SetReadableStreamBody(JSContext* aCx, ReadableStream* aBody);
+
+ private:
+  Derived* DerivedClass() const {
+    return static_cast<Derived*>(const_cast<FetchBody*>(this));
+  }
+
+  void LockStream(JSContext* aCx, ReadableStream* aStream, ErrorResult& aRv);
+
+  void AssertIsOnTargetThread() {
+    MOZ_ASSERT(NS_IsMainThread() == !GetCurrentThreadWorkerPrivate());
+  }
+
+  bool mBodyUsed;
+
+  nsCOMPtr<nsISerialEventTarget> mMainThreadEventTarget;
+};
+
+class EmptyBody final : public FetchBody<EmptyBody> {
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_INHERITED(EmptyBody,
+                                                         FetchBody<EmptyBody>)
+
+ public:
+  static already_AddRefed<EmptyBody> Create(
+      nsIGlobalObject* aGlobal, mozilla::ipc::PrincipalInfo* aPrincipalInfo,
+      AbortSignalImpl* aAbortSignalImpl, const nsACString& aMimeType,
+      const nsACString& aMixedCaseMimeType, ErrorResult& aRv);
+
+  nsIGlobalObject* GetParentObject() const { return mGlobal; }
+
+  AbortSignalImpl* GetSignalImpl() const override { return mAbortSignalImpl; }
+  AbortSignalImpl* GetSignalImplToConsumeBody() const final { return nullptr; }
+
+  const UniquePtr<mozilla::ipc::PrincipalInfo>& GetPrincipalInfo() const {
+    return mPrincipalInfo;
+  }
+
+  void GetMimeType(nsACString& aMimeType, nsACString& aMixedCaseMimeType) {
+    aMimeType = mMimeType;
+    aMixedCaseMimeType = mMixedCaseMimeType;
+  }
+
+  void GetBody(nsIInputStream** aStream, int64_t* aBodyLength = nullptr);
+
+  using FetchBody::BodyBlobImpl;
+
+  BlobImpl* BodyBlobImpl() const { return nullptr; }
+
+  using FetchBody::BodyLocalPath;
+
+  const nsAString& BodyLocalPath() const { return EmptyString(); }
+
+ private:
+  EmptyBody(nsIGlobalObject* aGlobal,
+            mozilla::ipc::PrincipalInfo* aPrincipalInfo,
+            AbortSignalImpl* aAbortSignalImpl, const nsACString& aMimeType,
+            const nsACString& aMixedCaseMimeType,
+            already_AddRefed<nsIInputStream> aBodyStream);
+
+  ~EmptyBody();
+
+  UniquePtr<mozilla::ipc::PrincipalInfo> mPrincipalInfo;
+  RefPtr<AbortSignalImpl> mAbortSignalImpl;
+  nsCString mMimeType;
+  nsCString mMixedCaseMimeType;
+  nsCOMPtr<nsIInputStream> mBodyStream;
+};
+}  
+}  
+
+#endif  // mozilla_dom_Fetch_h

@@ -1,0 +1,235 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __NUMBER_DECIMALQUANTITY_H__
+#define __NUMBER_DECIMALQUANTITY_H__
+
+#include <cstdint>
+#include "unicode/umachine.h"
+#include "standardplural.h"
+#include "plurrule_impl.h"
+#include "number_types.h"
+
+U_NAMESPACE_BEGIN
+namespace number::impl {
+
+class DecNum;
+
+class U_I18N_API DecimalQuantity : public IFixedDecimal, public UMemory {
+  public:
+    DecimalQuantity(const DecimalQuantity &other);
+
+    DecimalQuantity(DecimalQuantity &&src) noexcept;
+
+    DecimalQuantity();
+
+    ~DecimalQuantity() override;
+
+    DecimalQuantity &operator=(const DecimalQuantity &other);
+
+    DecimalQuantity &operator=(DecimalQuantity&& src) noexcept;
+
+    void decreaseMinIntegerTo(int32_t minInt);
+
+    void increaseMinIntegerTo(int32_t minInt);
+
+    void setMinFraction(int32_t minFrac);
+
+    void applyMaxInteger(int32_t maxInt);
+
+    void roundToIncrement(
+        uint64_t increment,
+        digits_t magnitude,
+        RoundingMode roundingMode,
+        UErrorCode& status);
+
+    void truncate();
+
+    void roundToNickel(int32_t magnitude, RoundingMode roundingMode, UErrorCode& status);
+
+    void roundToMagnitude(int32_t magnitude, RoundingMode roundingMode, UErrorCode& status);
+
+    void roundToInfinity();
+
+    void multiplyBy(const DecNum& multiplicand, UErrorCode& status);
+
+    void divideBy(const DecNum& divisor, UErrorCode& status);
+
+    void negate();
+
+    bool adjustMagnitude(int32_t delta);
+
+    int32_t adjustToZeroScale();
+
+    int32_t getMagnitude() const;
+
+    int32_t getExponent() const;
+
+    void adjustExponent(int32_t delta);
+
+    void resetExponent();
+
+    bool isZeroish() const;
+
+    bool isNegative() const;
+
+    Signum signum() const;
+
+    bool isInfinite() const override;
+
+    bool isNaN() const override;
+
+    int64_t toLong(bool truncateIfOverflow = false) const;
+
+    uint64_t toFractionLong(bool includeTrailingZeros) const;
+
+    bool fitsInLong(bool ignoreFraction = false) const;
+
+    double toDouble() const;
+
+    DecNum& toDecNum(DecNum& output, UErrorCode& status) const;
+
+    DecimalQuantity &setToInt(int32_t n);
+
+    DecimalQuantity &setToLong(int64_t n);
+
+    DecimalQuantity &setToDouble(double n);
+
+    DecimalQuantity &setToDecNumber(StringPiece n, UErrorCode& status);
+
+    DecimalQuantity &setToDecNum(const DecNum& n, UErrorCode& status);
+
+    static DecimalQuantity fromExponentString(UnicodeString n, UErrorCode& status);
+
+    void appendDigit(int8_t value, int32_t leadingZeros, bool appendAsInteger);
+
+    double getPluralOperand(PluralOperand operand) const override;
+
+    bool hasIntegerValue() const override;
+
+    int8_t getDigit(int32_t magnitude) const;
+
+    int32_t getUpperDisplayMagnitude() const;
+
+    int32_t getLowerDisplayMagnitude() const;
+
+    int32_t fractionCount() const;
+
+    int32_t fractionCountWithoutTrailingZeros() const;
+
+    void clear();
+
+    uint64_t getPositionFingerprint() const;
+
+
+    const char16_t* checkHealth() const;
+
+    UnicodeString toString() const;
+
+    UnicodeString toScientificString() const;
+
+    UnicodeString toPlainString() const;
+
+    UnicodeString toExponentString() const;
+
+    inline bool isUsingBytes() { return usingBytes; }
+
+    inline bool isExplicitExactDouble() { return explicitExactDouble; }
+
+    bool operator==(const DecimalQuantity& other) const;
+
+    inline bool operator!=(const DecimalQuantity& other) const {
+        return !(*this == other);
+    }
+
+    bool bogus = false;
+
+  private:
+    int32_t scale;
+
+    int32_t precision;
+
+    int8_t flags;
+
+
+    UBool isApproximate;
+
+    double origDouble;
+
+    int32_t origDelta;
+
+    int32_t lReqPos = 0;
+    int32_t rReqPos = 0;
+
+    int32_t exponent = 0;
+
+    union {
+        struct {
+            int8_t *ptr;
+            int32_t len;
+        } bcdBytes;
+        uint64_t bcdLong;
+    } fBCD;
+
+    bool usingBytes = false;
+
+    bool explicitExactDouble = false;
+
+    void roundToMagnitude(int32_t magnitude, RoundingMode roundingMode, bool nickel, UErrorCode& status);
+
+    int8_t getDigitPos(int32_t position) const;
+
+    void setDigitPos(int32_t position, int8_t value);
+
+    void shiftLeft(int32_t numDigits);
+
+    void shiftRight(int32_t numDigits);
+
+    void popFromLeft(int32_t numDigits);
+
+    void setBcdToZero();
+
+    void readIntToBcd(int32_t n);
+
+    void readLongToBcd(int64_t n);
+
+    void readDecNumberToBcd(const DecNum& dn);
+
+    void readDoubleConversionToBcd(const char* buffer, int32_t length, int32_t point);
+
+    void copyFieldsFrom(const DecimalQuantity& other);
+
+    void copyBcdFrom(const DecimalQuantity &other);
+
+    void moveBcdFrom(DecimalQuantity& src);
+
+    void compact();
+
+    void _setToInt(int32_t n);
+
+    void _setToLong(int64_t n);
+
+    void _setToDoubleFast(double n);
+
+    void _setToDecNum(const DecNum& dn, UErrorCode& status);
+
+    static int32_t getVisibleFractionCount(UnicodeString value);
+
+    void convertToAccurateDouble();
+
+    void ensureCapacity();
+
+    void ensureCapacity(int32_t capacity);
+
+    void switchStorage();
+};
+
+} 
+U_NAMESPACE_END
+
+
+#endif //__NUMBER_DECIMALQUANTITY_H__
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

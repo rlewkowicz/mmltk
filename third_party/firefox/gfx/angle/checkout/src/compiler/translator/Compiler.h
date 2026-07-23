@@ -1,0 +1,306 @@
+// Copyright 2002 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(COMPILER_TRANSLATOR_COMPILER_H_)
+#define COMPILER_TRANSLATOR_COMPILER_H_
+
+
+#include <GLSLANG/ShaderVars.h>
+
+#include "common/PackedEnums.h"
+#include "common/span.h"
+#include "compiler/translator/CallDAG.h"
+#include "compiler/translator/Diagnostics.h"
+#include "compiler/translator/ExtensionBehavior.h"
+#include "compiler/translator/HashNames.h"
+#include "compiler/translator/InfoSink.h"
+#include "compiler/translator/Pragma.h"
+#include "compiler/translator/SymbolTable.h"
+#include "compiler/translator/ValidateAST.h"
+
+namespace sh
+{
+
+class TCompiler;
+class TParseContext;
+
+using MetadataFlagBits   = angle::PackedEnumBitSet<sh::MetadataFlags, uint32_t>;
+using SpecConstUsageBits = angle::PackedEnumBitSet<vk::SpecConstUsage, uint32_t>;
+
+bool IsGLSL150OrNewer(ShShaderOutput output);
+bool IsGLSL420OrNewer(ShShaderOutput output);
+bool IsGLSL410OrOlder(ShShaderOutput output);
+
+bool RemoveInvariant(sh::GLenum shaderType,
+                     int shaderVersion,
+                     ShShaderOutput outputType,
+                     const ShCompileOptions &compileOptions);
+
+class TShHandleBase
+{
+  public:
+    TShHandleBase();
+    virtual ~TShHandleBase();
+    virtual TCompiler *getAsCompiler() { return nullptr; }
+
+  protected:
+    angle::PoolAllocator allocator;
+};
+
+struct TFunctionMetadata
+{
+    bool used = false;
+};
+
+class TCompiler : public TShHandleBase
+{
+  public:
+    TCompiler(sh::GLenum type, ShShaderSpec spec, ShShaderOutput output);
+    ~TCompiler() override;
+    TCompiler *getAsCompiler() override { return this; }
+
+    bool Init(const ShBuiltInResources &resources);
+
+    TIntermBlock *compileTreeForTesting(angle::Span<const char *const> shaderStrings,
+                                        const ShCompileOptions &compileOptions);
+
+    bool compile(angle::Span<const char *const> shaderStrings,
+                 const ShCompileOptions &compileOptions);
+
+    int getShaderVersion() const { return mShaderVersion; }
+    TInfoSink &getInfoSink() { return mInfoSink; }
+
+    bool specifyEarlyFragmentTests() { return mEarlyFragmentTestsSpecified = true; }
+    bool isEarlyFragmentTestsSpecified() const { return mEarlyFragmentTestsSpecified; }
+    MetadataFlagBits getMetadataFlags() const { return mMetadataFlags; }
+    SpecConstUsageBits getSpecConstUsageBits() const { return mSpecConstUsageBits; }
+
+    bool isComputeShaderLocalSizeDeclared() const { return mComputeShaderLocalSizeDeclared; }
+    const sh::WorkGroupSize &getComputeShaderLocalSize() const { return mComputeShaderLocalSize; }
+    int getNumViews() const { return mNumViews; }
+
+    void clearResults();
+
+    const std::vector<sh::ShaderVariable> &getAttributes() const { return mAttributes; }
+    const std::vector<sh::ShaderVariable> &getOutputVariables() const { return mOutputVariables; }
+    const std::vector<sh::ShaderVariable> &getUniforms() const { return mUniforms; }
+    const std::vector<sh::ShaderVariable> &getInputVaryings() const { return mInputVaryings; }
+    const std::vector<sh::ShaderVariable> &getOutputVaryings() const { return mOutputVaryings; }
+    const std::vector<sh::InterfaceBlock> &getInterfaceBlocks() const { return mInterfaceBlocks; }
+    const std::vector<sh::InterfaceBlock> &getUniformBlocks() const { return mUniformBlocks; }
+    const std::vector<sh::InterfaceBlock> &getShaderStorageBlocks() const
+    {
+        return mShaderStorageBlocks;
+    }
+
+    ShHashFunction64 getHashFunction() const { return mResources.HashFunction; }
+    char getUserVariableNamePrefix() const { return mResources.UserVariableNamePrefix; }
+    NameMap &getNameMap() { return mNameMap; }
+    TSymbolTable &getSymbolTable() { return mSymbolTable; }
+    ShShaderSpec getShaderSpec() const { return mShaderSpec; }
+    ShShaderOutput getOutputType() const { return mOutputType; }
+    const ShBuiltInResources &getBuiltInResources() const { return mResources; }
+    const std::string &getBuiltInResourcesString() const { return mBuiltInResourcesString; }
+
+    bool shouldRunLoopAndIndexingValidation(const ShCompileOptions &compileOptions) const;
+
+    const ShBuiltInResources &getResources() const;
+
+    const TPragma &getPragma() const { return mPragma; }
+
+    int getGeometryShaderMaxVertices() const { return mGeometryShaderMaxVertices; }
+    int getGeometryShaderInvocations() const { return mGeometryShaderInvocations; }
+    TLayoutPrimitiveType getGeometryShaderInputPrimitiveType() const
+    {
+        return mGeometryShaderInputPrimitiveType;
+    }
+    TLayoutPrimitiveType getGeometryShaderOutputPrimitiveType() const
+    {
+        return mGeometryShaderOutputPrimitiveType;
+    }
+
+    unsigned int getStructSize(const ShaderVariable &var) const;
+
+    int getTessControlShaderOutputVertices() const { return mTessControlShaderOutputVertices; }
+    TLayoutTessEvaluationType getTessEvaluationShaderInputPrimitiveType() const
+    {
+        return mTessEvaluationShaderInputPrimitiveType;
+    }
+    TLayoutTessEvaluationType getTessEvaluationShaderInputVertexSpacingType() const
+    {
+        return mTessEvaluationShaderInputVertexSpacingType;
+    }
+    TLayoutTessEvaluationType getTessEvaluationShaderInputOrderingType() const
+    {
+        return mTessEvaluationShaderInputOrderingType;
+    }
+    TLayoutTessEvaluationType getTessEvaluationShaderInputPointType() const
+    {
+        return mTessEvaluationShaderInputPointType;
+    }
+
+    bool hasAnyPreciseType() const { return mHasAnyPreciseType; }
+
+    AdvancedBlendEquations getAdvancedBlendEquations() const { return mAdvancedBlendEquations; }
+
+    bool hasPixelLocalStorageUniforms() const { return !mPixelLocalStorageLayouts.empty(); }
+    const std::vector<ShPixelLocalStorageLayout> &getPixelLocalStorageLayouts() const
+    {
+        return mPixelLocalStorageLayouts;
+    }
+
+    ShPixelLocalStorageType getPixelLocalStorageType() const { return mCompileOptions.pls.type; }
+
+    unsigned int getSharedMemorySize() const;
+
+    sh::GLenum getShaderType() const { return mShaderType; }
+
+    bool getShaderBinary(const ShHandle compilerHandle,
+                         angle::Span<const char *const> shaderStrings,
+                         const ShCompileOptions &compileOptions,
+                         ShaderBinaryBlob *const binaryOut);
+
+    bool validateAST(TIntermNode *root);
+    bool disableValidateFunctionCall();
+    void restoreValidateFunctionCall(bool enable);
+    bool disableValidateVariableReferences();
+    void restoreValidateVariableReferences(bool enable);
+    void enableValidateNoMoreTransformations();
+
+    bool areClipDistanceOrCullDistanceUsed() const
+    {
+        return mClipDistanceSize > 0 || mCullDistanceSize > 0;
+    }
+
+    uint8_t getClipDistanceArraySize() const { return mClipDistanceSize; }
+
+    uint8_t getCullDistanceArraySize() const { return mCullDistanceSize; }
+
+    bool usesDerivatives() const { return mUsesDerivatives; }
+
+    bool supportsAttributeAliasing() const
+    {
+        return mShaderVersion == 100 && !IsWebGLBasedSpec(mShaderSpec);
+    }
+
+    const TExtensionBehavior &getExtensionBehavior() const;
+
+  protected:
+    [[nodiscard]] virtual bool translate(TIntermBlock *root,
+                                         const ShCompileOptions &compileOptions,
+                                         PerformanceDiagnostics *perfDiagnostics) = 0;
+    const char *getSourcePath() const;
+    bool isVaryingDefined(const char *varyingName);
+
+    virtual bool shouldFlattenPragmaStdglInvariantAll() = 0;
+
+    std::vector<sh::ShaderVariable> mAttributes;
+    std::vector<sh::ShaderVariable> mOutputVariables;
+    std::vector<sh::ShaderVariable> mUniforms;
+    std::vector<sh::ShaderVariable> mInputVaryings;
+    std::vector<sh::ShaderVariable> mOutputVaryings;
+    std::vector<sh::ShaderVariable> mSharedVariables;
+    std::vector<sh::InterfaceBlock> mInterfaceBlocks;
+    std::vector<sh::InterfaceBlock> mUniformBlocks;
+    std::vector<sh::InterfaceBlock> mShaderStorageBlocks;
+
+    ValidateASTOptions mValidateASTOptions;
+
+    MetadataFlagBits mMetadataFlags;
+
+    SpecConstUsageBits mSpecConstUsageBits;
+
+  private:
+    bool initBuiltInSymbolTable(const ShBuiltInResources &resources);
+    void setResourceString();
+    [[nodiscard]] bool useAllMembersInUnusedStandardAndSharedBlocks(TIntermBlock *root);
+    [[nodiscard]] bool initializeOutputVariables(TIntermBlock *root);
+    [[nodiscard]] bool initializeGLPosition(TIntermBlock *root);
+    bool limitExpressionComplexity(TIntermBlock *root);
+    void initCallDag(TIntermNode *root);
+    void tagUsedFunctions();
+    void internalTagUsedFunction(size_t index);
+
+    void collectVariables(TIntermBlock *root);
+    void collectInterfaceBlocks();
+
+    bool sortUniforms(TIntermBlock *root);
+
+    bool pruneUnusedFunctions(TIntermBlock *root);
+
+    ShCompileOptions adjustOptions(const ShCompileOptions &compileOptionsIn);
+    TIntermBlock *compileTreeImpl(angle::Span<const char *const> shaderStrings,
+                                  const ShCompileOptions &compileOptions);
+
+    void setShaderMetadata(const TParseContext &parseContext);
+
+    bool checkShaderVersion(TParseContext *parseContext);
+
+    bool checkAndSimplifyAST(TIntermBlock *root,
+                             const TParseContext &parseContext,
+                             const ShCompileOptions &compileOptions);
+
+    sh::GLenum mShaderType;
+    ShShaderSpec mShaderSpec;
+    ShShaderOutput mOutputType;
+
+    CallDAG mCallDag;
+    std::vector<TFunctionMetadata> mFunctionMetadata;
+
+    ShBuiltInResources mResources;
+    std::string mBuiltInResourcesString;
+
+    TSymbolTable mSymbolTable;
+    TExtensionBehavior mExtensionBehavior;
+
+    int mShaderVersion;
+    TInfoSink mInfoSink;  
+    TDiagnostics mDiagnostics;
+    const char *mSourcePath;  
+
+    bool mVariablesCollected;
+    bool mGLPositionInitialized;
+
+    bool mEarlyFragmentTestsSpecified;
+
+    bool mComputeShaderLocalSizeDeclared;
+    sh::WorkGroupSize mComputeShaderLocalSize;
+
+    int mNumViews;
+
+    uint8_t mClipDistanceSize;
+    uint8_t mCullDistanceSize;
+
+    int mGeometryShaderMaxVertices;
+    int mGeometryShaderInvocations;
+    TLayoutPrimitiveType mGeometryShaderInputPrimitiveType;
+    TLayoutPrimitiveType mGeometryShaderOutputPrimitiveType;
+
+    int mTessControlShaderOutputVertices;
+    TLayoutTessEvaluationType mTessEvaluationShaderInputPrimitiveType;
+    TLayoutTessEvaluationType mTessEvaluationShaderInputVertexSpacingType;
+    TLayoutTessEvaluationType mTessEvaluationShaderInputOrderingType;
+    TLayoutTessEvaluationType mTessEvaluationShaderInputPointType;
+
+    bool mHasAnyPreciseType;
+
+    AdvancedBlendEquations mAdvancedBlendEquations;
+
+    std::vector<ShPixelLocalStorageLayout> mPixelLocalStorageLayouts;
+
+    bool mUsesDerivatives;
+
+    NameMap mNameMap;
+
+    TPragma mPragma;
+
+    ShCompileOptions mCompileOptions;
+};
+
+TCompiler *ConstructCompiler(sh::GLenum type, ShShaderSpec spec, ShShaderOutput output);
+void DeleteCompiler(TCompiler *);
+
+}  
+
+#endif

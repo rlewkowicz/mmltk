@@ -1,0 +1,335 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ *
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "FetchPreloader.h"
+
+#include "mozilla/Assertions.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/LoadInfo.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/dom/ReferrerInfo.h"
+#include "nsContentPolicyUtils.h"
+#include "nsContentSecurityManager.h"
+#include "nsContentUtils.h"
+#include "nsIChannel.h"
+#include "nsIChildChannel.h"
+#include "nsIClassOfService.h"
+#include "nsIHttpChannel.h"
+#include "nsIHttpChannelInternal.h"
+#include "nsISupportsPriority.h"
+#include "nsITimedChannel.h"
+#include "nsNetUtil.h"
+#include "nsStringStream.h"
+#include "nsIDocShell.h"
+
+namespace mozilla {
+
+NS_IMPL_ISUPPORTS(FetchPreloader, nsIStreamListener, nsIRequestObserver)
+
+FetchPreloader::FetchPreloader()
+    : FetchPreloader(nsIContentPolicy::TYPE_INTERNAL_FETCH_PRELOAD) {}
+
+FetchPreloader::FetchPreloader(nsContentPolicyType aContentPolicyType)
+    : mContentPolicyType(aContentPolicyType) {}
+
+nsresult FetchPreloader::OpenChannel(const PreloadHashKey& aKey, nsIURI* aURI,
+                                     const CORSMode aCORSMode,
+                                     const dom::ReferrerPolicy& aReferrerPolicy,
+                                     dom::Document* aDocument,
+                                     uint64_t aEarlyHintPreloaderId,
+                                     int32_t aSupportsPriorityValue) {
+  nsresult rv;
+  nsCOMPtr<nsIChannel> channel;
+
+  auto notify = MakeScopeExit([&]() {
+    if (NS_FAILED(rv)) {
+      NotifyStart(channel);
+      NotifyStop(rv);
+    }
+  });
+
+  nsCOMPtr<nsILoadGroup> loadGroup = aDocument->GetDocumentLoadGroup();
+  nsCOMPtr<nsPIDOMWindowOuter> window = aDocument->GetWindow();
+  nsCOMPtr<nsIInterfaceRequestor> prompter;
+  if (window) {
+    nsIDocShell* docshell = window->GetDocShell();
+    prompter = do_QueryInterface(docshell);
+  }
+
+  rv = CreateChannel(getter_AddRefs(channel), aURI, aCORSMode, aReferrerPolicy,
+                     aDocument, loadGroup, prompter, aEarlyHintPreloaderId,
+                     aSupportsPriorityValue);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = CheckContentPolicy(aURI, aDocument);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  FetchPreloader::PrioritizeAsPreload(channel);
+  AddLoadBackgroundFlag(channel);
+
+  NotifyOpen(aKey, channel, aDocument, true);
+
+  if (aEarlyHintPreloaderId) {
+    nsCOMPtr<nsIHttpChannelInternal> channelInternal =
+        do_QueryInterface(channel);
+    NS_ENSURE_TRUE(channelInternal != nullptr, NS_ERROR_FAILURE);
+
+    rv = channelInternal->SetEarlyHintPreloaderId(aEarlyHintPreloaderId);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return mAsyncConsumeResult = rv = channel->AsyncOpen(this);
+}
+
+nsresult FetchPreloader::CreateChannel(
+    nsIChannel** aChannel, nsIURI* aURI, const CORSMode aCORSMode,
+    const dom::ReferrerPolicy& aReferrerPolicy, dom::Document* aDocument,
+    nsILoadGroup* aLoadGroup, nsIInterfaceRequestor* aCallbacks,
+    uint64_t aEarlyHintPreloaderId, int32_t aSupportsPriorityValue) {
+  nsresult rv;
+
+  nsSecurityFlags securityFlags =
+      nsContentSecurityManager::ComputeSecurityFlags(
+          aCORSMode, nsContentSecurityManager::CORSSecurityMapping::
+                         CORS_NONE_MAPS_TO_DISABLED_CORS_CHECKS);
+
+  nsCOMPtr<nsIChannel> channel;
+  rv = NS_NewChannelWithTriggeringPrincipal(
+      getter_AddRefs(channel), aURI, aDocument, aDocument->NodePrincipal(),
+      securityFlags, nsIContentPolicy::TYPE_FETCH, nullptr, aLoadGroup,
+      aCallbacks);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  AdjustPriority(channel, aSupportsPriorityValue);
+
+  if (nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(channel)) {
+    nsCOMPtr<nsIReferrerInfo> referrerInfo = new dom::ReferrerInfo(
+        aDocument->GetDocumentURIAsReferrer(), aReferrerPolicy);
+    rv = httpChannel->SetReferrerInfoWithoutClone(referrerInfo);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+  }
+
+  if (nsCOMPtr<nsITimedChannel> timedChannel = do_QueryInterface(channel)) {
+    if (aEarlyHintPreloaderId) {
+      timedChannel->SetInitiatorType(u"early-hints"_ns);
+    } else {
+      timedChannel->SetInitiatorType(u"link"_ns);
+    }
+  }
+
+  channel.forget(aChannel);
+  return NS_OK;
+}
+
+void FetchPreloader::AdjustPriority(nsIChannel* aChannel,
+                                    int32_t aSupportsPriorityValue) {
+  if (nsCOMPtr<nsISupportsPriority> supportsPriority{
+          do_QueryInterface(aChannel)}) {
+    supportsPriority->SetPriority(aSupportsPriorityValue);
+  }
+}
+
+nsresult FetchPreloader::CheckContentPolicy(nsIURI* aURI,
+                                            dom::Document* aDocument) {
+  if (!aDocument) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsILoadInfo> secCheckLoadInfo = MOZ_TRY(net::LoadInfo::Create(
+      aDocument->NodePrincipal(), aDocument->NodePrincipal(), aDocument,
+      nsILoadInfo::SEC_ONLY_FOR_EXPLICIT_CONTENTSEC_CHECK, mContentPolicyType));
+
+  int16_t shouldLoad = nsIContentPolicy::ACCEPT;
+  nsresult rv = NS_CheckContentLoadPolicy(aURI, secCheckLoadInfo, &shouldLoad,
+                                          nsContentUtils::GetContentPolicy());
+  if (NS_SUCCEEDED(rv) && NS_CP_ACCEPTED(shouldLoad)) {
+    return NS_OK;
+  }
+
+  return NS_ERROR_CONTENT_BLOCKED;
+}
+
+
+nsresult FetchPreloader::AsyncConsume(nsIStreamListener* aListener) {
+  if (NS_FAILED(mAsyncConsumeResult)) {
+    return mAsyncConsumeResult;
+  }
+
+  mAsyncConsumeResult = NS_ERROR_NOT_AVAILABLE;
+
+  if (!mConsumeListener) {
+    mConsumeListener = aListener;
+  } else {
+    Cache* cache = static_cast<Cache*>(mConsumeListener.get());
+    cache->AsyncConsume(aListener);
+  }
+
+  return NS_OK;
+}
+
+void FetchPreloader::PrioritizeAsPreload(nsIChannel* aChannel) {
+  if (nsCOMPtr<nsIClassOfService> cos = do_QueryInterface(aChannel)) {
+    cos->AddClassFlags(nsIClassOfService::Unblocked);
+  }
+}
+
+
+NS_IMETHODIMP FetchPreloader::OnStartRequest(nsIRequest* request) {
+  NotifyStart(request);
+
+  if (!mConsumeListener) {
+    mConsumeListener = new Cache();
+  }
+
+  nsCOMPtr<nsIStreamListener> consumeListener = mConsumeListener;
+  return consumeListener->OnStartRequest(request);
+}
+
+NS_IMETHODIMP FetchPreloader::OnDataAvailable(nsIRequest* request,
+                                              nsIInputStream* input,
+                                              uint64_t offset, uint32_t count) {
+  nsCOMPtr<nsIStreamListener> consumeListener = mConsumeListener;
+  return consumeListener->OnDataAvailable(request, input, offset, count);
+}
+
+NS_IMETHODIMP FetchPreloader::OnStopRequest(nsIRequest* request,
+                                            nsresult status) {
+  nsCOMPtr<nsIStreamListener> consumeListener = mConsumeListener;
+  consumeListener->OnStopRequest(request, status);
+
+  if (nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(request)) {
+    uint32_t responseStatus = 0;
+    (void)httpChannel->GetResponseStatus(&responseStatus);
+    if (responseStatus / 100 != 2) {
+      status = NS_ERROR_FAILURE;
+    }
+  }
+
+  nsCOMPtr<nsIChannel> channel = mChannel;
+  NotifyStop(request, status);
+  mChannel.swap(channel);
+  return NS_OK;
+}
+
+
+NS_IMPL_ISUPPORTS(FetchPreloader::Cache, nsIStreamListener, nsIRequestObserver)
+
+NS_IMETHODIMP FetchPreloader::Cache::OnStartRequest(nsIRequest* request) {
+  mRequest = request;
+
+  if (nsCOMPtr<nsIStreamListener> finalListener = mFinalListener) {
+    return finalListener->OnStartRequest(mRequest);
+  }
+
+  mCalls.AppendElement(Call{VariantIndex<0>{}, StartRequest{}});
+  return NS_OK;
+}
+
+NS_IMETHODIMP FetchPreloader::Cache::OnDataAvailable(nsIRequest* request,
+                                                     nsIInputStream* input,
+                                                     uint64_t offset,
+                                                     uint32_t count) {
+  if (nsCOMPtr<nsIStreamListener> finalListener = mFinalListener) {
+    return finalListener->OnDataAvailable(mRequest, input, offset, count);
+  }
+
+  DataAvailable data;
+  if (!data.mData.SetLength(count, fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  uint32_t read;
+  nsresult rv = input->Read(data.mData.BeginWriting(), count, &read);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  mCalls.AppendElement(Call{VariantIndex<1>{}, std::move(data)});
+  return NS_OK;
+}
+
+NS_IMETHODIMP FetchPreloader::Cache::OnStopRequest(nsIRequest* request,
+                                                   nsresult status) {
+  if (nsCOMPtr<nsIStreamListener> finalListener = mFinalListener) {
+    return finalListener->OnStopRequest(mRequest, status);
+  }
+
+  mCalls.AppendElement(Call{VariantIndex<2>{}, StopRequest{status}});
+  return NS_OK;
+}
+
+void FetchPreloader::Cache::AsyncConsume(nsIStreamListener* aListener) {
+
+
+  nsCOMPtr<nsIStreamListener> listener(aListener);
+  NS_DispatchToMainThread(NewRunnableMethod<nsCOMPtr<nsIStreamListener>>(
+      "FetchPreloader::Cache::Consume", this, &FetchPreloader::Cache::Consume,
+      listener));
+}
+
+void FetchPreloader::Cache::Consume(nsCOMPtr<nsIStreamListener> aListener) {
+  MOZ_ASSERT(!mFinalListener, "Duplicate call");
+
+  mFinalListener = std::move(aListener);
+
+  nsresult status = NS_OK;
+  nsCOMPtr<nsIChannel> channel(do_QueryInterface(mRequest));
+
+  RefPtr<Cache> self(this);
+  for (auto& call : mCalls) {
+    nsresult rv = call.match(
+        [&](const StartRequest& startRequest) mutable {
+          nsCOMPtr<nsIStreamListener> finalListener = self->mFinalListener;
+          return finalListener->OnStartRequest(self->mRequest);
+        },
+        [&](const DataAvailable& dataAvailable) mutable {
+          if (NS_FAILED(status)) {
+            return NS_OK;
+          }
+
+          nsCOMPtr<nsIInputStream> input;
+          rv = NS_NewCStringInputStream(getter_AddRefs(input),
+                                        dataAvailable.mData);
+          if (NS_FAILED(rv)) {
+            return rv;
+          }
+
+          nsCOMPtr<nsIStreamListener> finalListener = self->mFinalListener;
+          return finalListener->OnDataAvailable(self->mRequest, input, 0,
+                                                dataAvailable.mData.Length());
+        },
+        [&](const StopRequest& stopRequest) {
+          nsresult stopStatus =
+              NS_FAILED(status) ? status : stopRequest.mStatus;
+          nsCOMPtr<nsIStreamListener> finalListener = self->mFinalListener;
+          finalListener->OnStopRequest(self->mRequest, stopStatus);
+          self->mFinalListener = nullptr;
+          self->mRequest = nullptr;
+          return NS_OK;
+        });
+
+    if (!mRequest) {
+      break;
+    }
+
+    bool isCancelled = false;
+    (void)channel->GetCanceled(&isCancelled);
+    if (isCancelled) {
+      mRequest->GetStatus(&status);
+    } else if (NS_FAILED(rv)) {
+      status = rv;
+      mRequest->Cancel(status);
+    }
+  }
+
+  mCalls.Clear();
+}
+
+}  

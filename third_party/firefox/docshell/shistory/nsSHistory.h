@@ -1,0 +1,308 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsSHistory_h
+#define nsSHistory_h
+
+#include "nsCOMPtr.h"
+#include "nsDocShellLoadState.h"
+#include "nsExpirationTracker.h"
+#include "nsIDocumentViewer.h"
+#include "nsISHistory.h"
+#include "nsSHEntryShared.h"
+#include "nsSimpleEnumerator.h"
+#include "nsTObserverArray.h"
+#include "nsWeakReference.h"
+
+#include "mozilla/dom/SessionHistoryEntry.h"
+#include "mozilla/dom/ipc/IdType.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/UniquePtr.h"
+
+class nsIDocShell;
+class nsDocShell;
+class nsSHistoryObserver;
+
+namespace mozilla {
+namespace dom {
+class EntryList;
+class LoadSHEntryResult;
+}  
+}  
+
+class nsSHistory : public mozilla::LinkedListElement<nsSHistory>,
+                   public nsISHistory,
+                   public nsSupportsWeakReference {
+  using SessionHistoryEntry = mozilla::dom::SessionHistoryEntry;
+
+ public:
+  class HistoryTracker final
+      : public nsExpirationTracker<mozilla::dom::SHEntrySharedParentState, 3> {
+   public:
+    explicit HistoryTracker(nsSHistory* aSHistory, uint32_t aTimeout,
+                            nsIEventTarget* aEventTarget)
+        : nsExpirationTracker(1000 * aTimeout / 2, "HistoryTracker"_ns,
+                              aEventTarget) {
+      MOZ_ASSERT(aSHistory);
+      mSHistory = aSHistory;
+    }
+
+   protected:
+    virtual void NotifyExpired(
+        mozilla::dom::SHEntrySharedParentState* aObj) override {
+      RemoveObject(aObj);
+      mSHistory->EvictExpiredDocumentViewerForEntry(aObj);
+    }
+
+   private:
+    nsSHistory* mSHistory;
+  };
+
+  struct SwapEntriesData {
+    mozilla::dom::BrowsingContext*
+        ignoreBC;  
+    SessionHistoryEntry* destTreeRoot;  
+    SessionHistoryEntry*
+        destTreeParent;  
+  };
+
+  explicit nsSHistory(mozilla::dom::BrowsingContext* aRootBC);
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSISHISTORY
+
+  static nsresult Startup();
+  static void Shutdown();
+  static void UpdatePrefs();
+
+  static uint32_t GetMaxTotalViewers() { return sHistoryMaxTotalViewers; }
+
+  static already_AddRefed<SessionHistoryEntry> GetRootSHEntry(
+      SessionHistoryEntry* aEntry);
+
+  typedef nsresult (*WalkHistoryEntriesFunc)(SessionHistoryEntry* aEntry,
+                                             mozilla::dom::BrowsingContext* aBC,
+                                             int32_t aChildIndex, void* aData);
+
+  static nsresult CloneAndReplace(SessionHistoryEntry* aSrcEntry,
+                                  mozilla::dom::BrowsingContext* aOwnerBC,
+                                  uint32_t aCloneID,
+                                  SessionHistoryEntry* aReplaceEntry,
+                                  bool aCloneChildren,
+                                  SessionHistoryEntry** aDestEntry);
+
+  static nsresult CloneAndReplaceChild(SessionHistoryEntry* aEntry,
+                                       mozilla::dom::BrowsingContext* aOwnerBC,
+                                       int32_t aChildIndex, void* aData);
+
+  static nsresult SetChildHistoryEntry(SessionHistoryEntry* aEntry,
+                                       mozilla::dom::BrowsingContext* aBC,
+                                       int32_t aEntryIndex, void* aData);
+
+  static nsresult WalkHistoryEntries(SessionHistoryEntry* aRootEntry,
+                                     mozilla::dom::BrowsingContext* aBC,
+                                     WalkHistoryEntriesFunc aCallback,
+                                     void* aData);
+
+  static void WalkContiguousEntries(
+      SessionHistoryEntry* aEntry,
+      const std::function<void(SessionHistoryEntry*)>& aCallback);
+  static void WalkContiguousEntriesInOrder(
+      SessionHistoryEntry* aEntry,
+      const std::function<bool(SessionHistoryEntry*)>& aCallback);
+  static void WalkClosestContiguousEntriesFrom(
+      SessionHistoryEntry* aEntry,
+      const std::function<bool(SessionHistoryEntry*)>& aCallback);
+
+  nsTArray<RefPtr<SessionHistoryEntry>>& Entries() { return mEntries; }
+
+  void NotifyOnHistoryReplaceEntry();
+
+  void RemoveEntries(nsTArray<nsID>& aIDs, int32_t aStartIndex,
+                     bool* aDidRemove);
+
+  static const int32_t VIEWER_WINDOW = 3;
+
+  struct LoadEntryResult {
+    RefPtr<mozilla::dom::BrowsingContext> mBrowsingContext;
+    RefPtr<nsDocShellLoadState> mLoadState;
+  };
+
+  MOZ_CAN_RUN_SCRIPT
+  static void LoadURIs(
+      const nsTArray<LoadEntryResult>& aLoadResults, bool aCheckForCancelation,
+      const std::function<void(nsresult)>& aResolver = [](auto) {},
+      mozilla::dom::BrowsingContext* aTraversable = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT
+  static void LoadURIOrBFCache(const LoadEntryResult& aLoadEntry);
+
+  nsresult Reload(uint32_t aReloadFlags,
+                  nsTArray<LoadEntryResult>& aLoadResults);
+  nsresult ReloadCurrentEntry(nsTArray<LoadEntryResult>& aLoadResults);
+  nsresult GotoIndex(mozilla::dom::BrowsingContext* aSourceBrowsingContext,
+                     int32_t aIndex, nsTArray<LoadEntryResult>& aLoadResults,
+                     bool aSameEpoch, bool aLoadCurrentEntry,
+                     bool aUserActivation);
+
+  void WindowIndices(int32_t aIndex, int32_t* aOutStartIndex,
+                     int32_t* aOutEndIndex);
+  void NotifyListenersDocumentViewerEvicted(uint32_t aNumEvicted);
+
+  int32_t Length() { return int32_t(mEntries.Length()); }
+  int32_t Index() { return mIndex; }
+  already_AddRefed<mozilla::dom::BrowsingContext> GetBrowsingContext() {
+    return mozilla::dom::BrowsingContext::Get(mRootBC);
+  }
+  bool HasOngoingUpdate() { return mHasOngoingUpdate; }
+  void SetHasOngoingUpdate(bool aVal) { mHasOngoingUpdate = aVal; }
+
+  void SetBrowsingContext(mozilla::dom::BrowsingContext* aRootBC) {
+    uint64_t newID = aRootBC ? aRootBC->Id() : 0;
+    if (mRootBC != newID) {
+      mRootBC = newID;
+    }
+  }
+
+  int32_t GetTargetIndexForHistoryOperation() {
+    return mRequestedIndex == -1 ? mIndex : mRequestedIndex;
+  }
+
+  void GetEpoch(uint64_t& aEpoch,
+                mozilla::Maybe<mozilla::dom::ContentParentId>& aId) const {
+    aEpoch = mEpoch;
+    aId = mEpochParentId;
+  }
+  void SetEpoch(uint64_t aEpoch,
+                mozilla::Maybe<mozilla::dom::ContentParentId> aId) {
+    mEpoch = aEpoch;
+    mEpochParentId = std::move(aId);
+  }
+
+  void LogHistory();
+
+  enum class SearchDirection : int8_t { Left = -1, Right = 1 };
+
+  mozilla::dom::SessionHistoryEntry* FindAdjacentEntryFor(
+      mozilla::dom::SessionHistoryEntry* aEntry,
+      SearchDirection aSearchDirection);
+
+  mozilla::dom::SessionHistoryEntry* FindClosestAdjacentContiguousEntryFor(
+      mozilla::dom::SessionHistoryEntry* aEntry,
+      SearchDirection aSearchDirection);
+
+  mozilla::dom::SessionHistoryEntry* FindLeftmostAdjacentContiguousEntryFor(
+      mozilla::dom::SessionHistoryEntry* aEntry,
+      SearchDirection aSearchDirection);
+
+  bool ContainsEntry(SessionHistoryEntry* aEntry);
+
+ protected:
+  virtual ~nsSHistory();
+
+  uint64_t mRootBC;
+
+ private:
+  friend class nsSHistoryObserver;
+
+  bool ForEachDifferingEntry(
+      SessionHistoryEntry* aPrevEntry, SessionHistoryEntry* aNextEntry,
+      mozilla::dom::BrowsingContext* aParent,
+      const std::function<void(SessionHistoryEntry*,
+                               mozilla::dom::BrowsingContext*)>& aCallback);
+  static void InitiateLoad(
+      mozilla::dom::BrowsingContext* aSourceBrowsingContext,
+      SessionHistoryEntry* aFrameEntry, mozilla::dom::BrowsingContext* aFrameBC,
+      long aLoadType, nsTArray<LoadEntryResult>& aLoadResult,
+      bool aLoadCurrentEntry, bool aUserActivation, int32_t aOffset,
+      nsISHEntry* aPreviousEntryForActivation);
+
+  nsresult LoadEntry(mozilla::dom::BrowsingContext* aSourceBrowsingContext,
+                     int32_t aIndex, long aLoadType, uint32_t aHistCmd,
+                     nsTArray<LoadEntryResult>& aLoadResults, bool aSameEpoch,
+                     bool aLoadCurrentEntry, bool aUserActivation);
+
+  nsresult FindEntryForBFCache(mozilla::dom::SHEntrySharedParentState* aEntry,
+                               SessionHistoryEntry** aResult,
+                               int32_t* aResultIndex);
+
+  virtual void EvictOutOfRangeWindowDocumentViewers(int32_t aIndex);
+
+ public:
+  void EvictDocumentViewerForEntry(SessionHistoryEntry* aEntry);
+
+ private:
+  static void GloballyEvictDocumentViewers();
+  static void GloballyEvictAllDocumentViewers();
+
+  static uint32_t CalcMaxTotalViewers();
+
+  nsresult LoadNextPossibleEntry(
+      mozilla::dom::BrowsingContext* aSourceBrowsingContext, int32_t aNewIndex,
+      long aLoadType, uint32_t aHistCmd,
+      nsTArray<LoadEntryResult>& aLoadResults, bool aLoadCurrentEntry,
+      bool aUserActivation);
+
+  bool RemoveDuplicate(int32_t aIndex, bool aKeepNext);
+
+  static void HandleEntriesToSwapInDocShell(mozilla::dom::BrowsingContext* aBC,
+                                            SessionHistoryEntry* aOldEntry,
+                                            SessionHistoryEntry* aNewEntry);
+
+  void UpdateEntryLength(SessionHistoryEntry* aOldEntry,
+                         SessionHistoryEntry* aNewEntry, bool aMove);
+
+  MOZ_CAN_RUN_SCRIPT
+  static bool MaybeCheckUnloadingIsCanceled(
+      const nsTArray<nsSHistory::LoadEntryResult>& aLoadResults,
+      mozilla::dom::BrowsingContext* aTraversable,
+      std::function<void(nsTArray<nsSHistory::LoadEntryResult>&,
+                         nsIDocumentViewer::PermitUnloadResult)>&& aResolver);
+
+ protected:
+  bool mHasOngoingUpdate;
+  nsTArray<RefPtr<SessionHistoryEntry>> mEntries;  
+ private:
+  mozilla::UniquePtr<HistoryTracker> mHistoryTracker;
+
+  int32_t mIndex;           
+  int32_t mRequestedIndex;  
+
+  nsAutoTObserverArray<nsWeakPtr, 2> mListeners;
+
+  nsID mRootDocShellID;
+
+  static int32_t sHistoryMaxTotalViewers;
+
+  uint64_t mEpoch = 0;
+  mozilla::Maybe<mozilla::dom::ContentParentId> mEpochParentId;
+
+  nsTHashMap<nsIDHashKey, mozilla::WeakPtr<mozilla::dom::EntryList>>
+      mEntryLists;
+};
+
+class MOZ_STACK_CLASS CallerWillNotifyHistoryIndexAndLengthChanges {
+ public:
+  explicit CallerWillNotifyHistoryIndexAndLengthChanges(
+      nsISHistory* aSHistory) {
+    nsSHistory* shistory = static_cast<nsSHistory*>(aSHistory);
+    if (shistory && !shistory->HasOngoingUpdate()) {
+      shistory->SetHasOngoingUpdate(true);
+      mSHistory = shistory;
+    }
+  }
+
+  ~CallerWillNotifyHistoryIndexAndLengthChanges() {
+    if (mSHistory) {
+      mSHistory->SetHasOngoingUpdate(false);
+    }
+  }
+
+  RefPtr<nsSHistory> mSHistory;
+};
+
+inline nsISupports* ToSupports(nsSHistory* aObj) {
+  return static_cast<nsISHistory*>(aObj);
+}
+
+#endif /* nsSHistory */

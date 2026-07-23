@@ -1,0 +1,78 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/WebTransportSendStream.h"
+
+#include "mozilla/dom/UnderlyingSinkCallbackHelpers.h"
+#include "mozilla/dom/WebTransport.h"
+#include "mozilla/dom/WebTransportSendReceiveStreamBinding.h"
+#include "mozilla/dom/WritableStream.h"
+#include "mozilla/ipc/DataPipe.h"
+
+using namespace mozilla::ipc;
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(WebTransportSendStream, WritableStream,
+                                   mTransport)
+NS_IMPL_ADDREF_INHERITED(WebTransportSendStream, WritableStream)
+NS_IMPL_RELEASE_INHERITED(WebTransportSendStream, WritableStream)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(WebTransportSendStream)
+NS_INTERFACE_MAP_END_INHERITING(WritableStream)
+
+WebTransportSendStream::WebTransportSendStream(nsIGlobalObject* aGlobal,
+                                               WebTransport* aTransport)
+    : WritableStream(aGlobal,
+                     WritableStream::HoldDropJSObjectsCaller::Explicit),
+      mTransport(aTransport) {
+  mozilla::HoldJSObjects(this);
+}
+
+JSObject* WebTransportSendStream::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return WebTransportSendStream_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+already_AddRefed<WebTransportSendStream> WebTransportSendStream::Create(
+    WebTransport* aWebTransport, nsIGlobalObject* aGlobal, uint64_t aStreamId,
+    DataPipeSender* aSender, Maybe<int64_t> aSendOrder, ErrorResult& aRv) {
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(aGlobal)) {
+    return nullptr;
+  }
+  JSContext* cx = jsapi.cx();
+
+  auto stream = MakeRefPtr<WebTransportSendStream>(aGlobal, aWebTransport);
+
+  nsCOMPtr<nsIAsyncOutputStream> outputStream = aSender;
+  auto algorithms = MakeRefPtr<WritableStreamToOutputAlgorithms>(
+      stream->GetParentObject(), outputStream);
+
+  stream->mStreamId = aStreamId;
+
+  if (aSendOrder.isSome()) {
+    stream->mSendOrder.SetValue(aSendOrder.value());
+  }
+
+  RefPtr<QueuingStrategySize> writableSizeAlgorithm;
+  stream->SetUpNative(cx, *algorithms, Nothing(), writableSizeAlgorithm, aRv);
+
+
+  aWebTransport->mSendStreams.InsertOrUpdate(aStreamId, stream);
+  return stream.forget();
+}
+
+void WebTransportSendStream::SetSendOrder(Nullable<int64_t> aSendOrder) {
+  mSendOrder = aSendOrder;
+  mTransport->SendSetSendOrder(
+      mStreamId, aSendOrder.IsNull() ? Nothing() : Some(aSendOrder.Value()));
+}
+
+already_AddRefed<Promise> WebTransportSendStream::GetStats() {
+  RefPtr<Promise> promise = Promise::CreateInfallible(WritableStream::mGlobal);
+  promise->MaybeRejectWithNotSupportedError("GetStats isn't supported yet");
+  return promise.forget();
+}
+
+}  

@@ -1,0 +1,84 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+EXPORTS += [
+    'pixman-version.h',
+    'pixman.h',
+]
+
+SOURCES += [
+    'pixman-access-accessors.c',
+    'pixman-access.c',
+    'pixman-arm.c',
+    'pixman-bits-image.c',
+    'pixman-combine-float.c',
+    'pixman-combine32.c',
+    'pixman-conical-gradient.c',
+    'pixman-edge-accessors.c',
+    'pixman-edge.c',
+    'pixman-fast-path.c',
+    'pixman-filter.c',
+    'pixman-general.c',
+    'pixman-glyph.c',
+    'pixman-gradient-walker.c',
+    'pixman-image.c',
+    'pixman-implementation.c',
+    'pixman-linear-gradient.c',
+    'pixman-matrix.c',
+    'pixman-mips.c',
+    'pixman-noop.c',
+    'pixman-ppc.c',
+    'pixman-radial-gradient.c',
+    'pixman-region16.c',
+    'pixman-region32.c',
+    'pixman-region64f.c',
+    'pixman-riscv.c',
+    'pixman-solid-fill.c',
+    'pixman-trap.c',
+    'pixman-utils.c',
+    'pixman-x86.c',
+    'pixman.c',
+]
+
+# We allow warnings for third-party code that can be updated from upstream.
+AllowCompilerWarnings()
+
+FINAL_LIBRARY = 'xul'
+LOCAL_INCLUDES += [
+    '../../cairo/src',
+]
+
+if CONFIG['MOZ_USE_PTHREADS']:
+    DEFINES['HAVE_PTHREADS'] = True
+
+DEFINES['PACKAGE'] = 'mozpixman'
+
+if CONFIG['INTEL_ARCHITECTURE']:
+    DEFINES['USE_X86_MMX'] = True
+    DEFINES['USE_SSE2'] = True
+    DEFINES['USE_SSSE3'] = True
+    SOURCES += [
+        'pixman-mmx.c',
+        'pixman-sse2.c',
+        'pixman-ssse3.c',
+    ]
+    SOURCES['pixman-mmx.c'].flags += CONFIG['MMX_FLAGS']
+    SOURCES['pixman-sse2.c'].flags += CONFIG['SSE_FLAGS'] + CONFIG['SSE2_FLAGS']
+    SOURCES['pixman-ssse3.c'].flags += CONFIG['SSSE3_FLAGS']
+# Suppress warnings in third-party code.
+CFLAGS += [
+    '-Wno-address',
+    '-Wno-braced-scalar-init',
+    '-Wno-missing-field-initializers',
+    '-Wno-sign-compare',
+    '-Wno-incompatible-pointer-types',
+    '-Wno-unused',                      # too many unused warnings; ignore
+]
+CFLAGS += [
+    '-Wno-incompatible-pointer-types',
+    '-Wno-tautological-compare',
+    '-Wno-tautological-constant-out-of-range-compare',
+]
+
+# See bug 386897.

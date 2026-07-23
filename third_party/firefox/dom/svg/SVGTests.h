@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGTESTS_H_
+#define DOM_SVG_SVGTESTS_H_
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/SVGStringList.h"
+#include "nsStringFwd.h"
+
+class nsAttrValue;
+class nsAtom;
+class nsIContent;
+class nsStaticAtom;
+
+namespace mozilla {
+
+namespace dom {
+class DOMSVGStringList;
+class SVGSwitchElement;
+}  
+
+#define MOZILLA_DOMSVGTESTS_IID \
+  {0x92370da8, 0xda28, 0x4895, {0x9b, 0x1b, 0xe0, 0x06, 0x0d, 0xb7, 0x3f, 0xc3}}
+
+namespace dom {
+
+class SVGElement;
+
+class SVGTests : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(MOZILLA_DOMSVGTESTS_IID)
+
+  SVGTests();
+
+  friend class dom::DOMSVGStringList;
+  using SVGStringList = mozilla::SVGStringList;
+
+  static nsIContent* FindActiveSwitchChild(
+      const dom::SVGSwitchElement* aSwitch);
+
+  bool PassesConditionalProcessingTests() const;
+
+  bool IsConditionalProcessingAttribute(const nsAtom* aAttribute) const;
+
+  bool ParseConditionalProcessingAttribute(nsAtom* aAttribute,
+                                           const nsAString& aValue,
+                                           nsAttrValue& aResult);
+
+  void UnsetAttr(const nsAtom* aAttribute);
+
+  nsStaticAtom* GetAttrName(uint8_t aAttrEnum) const;
+  void GetAttrValue(uint8_t aAttrEnum, nsAttrValue& aValue) const;
+
+  void MaybeInvalidate();
+
+  already_AddRefed<DOMSVGStringList> RequiredExtensions();
+  already_AddRefed<DOMSVGStringList> SystemLanguage();
+
+  bool HasExtension(const nsAString& aExtension) const;
+
+  virtual SVGElement* AsSVGElement() = 0;
+
+  const SVGElement* AsSVGElement() const {
+    return const_cast<SVGTests*>(this)->AsSVGElement();
+  }
+
+ protected:
+  virtual ~SVGTests() = default;
+
+ private:
+  bool PassesRequiredExtensionsTests() const;
+
+  enum { EXTENSIONS, LANGUAGE };
+  SVGStringList mStringListAttributes[2];
+  static nsStaticAtom* const sStringListNames[2];
+  mutable Maybe<bool> mPassesConditionalProcessingTests = Some(true);
+};
+
+}  
+}  
+
+#endif  // DOM_SVG_SVGTESTS_H_

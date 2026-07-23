@@ -1,0 +1,868 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_RangeBoundary_h
+#define mozilla_RangeBoundary_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/ToString.h"
+#include "mozilla/dom/ChildIterator.h"
+#include "mozilla/dom/HTMLSlotElement.h"
+#include "mozilla/dom/ShadowRoot.h"
+#include "nsCOMPtr.h"
+#include "nsFmtString.h"
+#include "nsIContent.h"
+
+class nsRange;
+
+namespace mozilla {
+namespace dom {
+class CrossShadowBoundaryRange;
+}
+
+template <typename T, typename U>
+class EditorDOMPointBase;
+
+
+template <typename ParentType, typename RefType>
+class RangeBoundaryBase;
+
+using RangeBoundary =
+    RangeBoundaryBase<nsCOMPtr<nsINode>, nsCOMPtr<nsIContent>>;
+using RawRangeBoundary = RangeBoundaryBase<nsINode*, nsIContent*>;
+using ConstRawRangeBoundary =
+    RangeBoundaryBase<const nsINode*, const nsIContent*>;
+
+enum class RangeBoundarySetBy : bool { Offset = false, Ref = true };
+
+enum class RangeBoundaryFor {
+  Start,
+  End,
+  Collapsed,
+};
+
+inline std::ostream& operator<<(std::ostream& aStream, RangeBoundaryFor aFor) {
+  constexpr static const char* sNames[] = {
+      "Start",
+      "End",
+      "Collapsed",
+  };
+  return aStream << sNames[static_cast<size_t>(aFor)];
+}
+
+inline auto format_as(RangeBoundaryFor aFor) { return ToString(aFor); }
+
+template <typename ParentType, typename RefType>
+class RangeBoundaryBase {
+  template <typename T, typename U>
+  friend class RangeBoundaryBase;
+  template <typename T, typename U>
+  friend class EditorDOMPointBase;
+
+  friend nsRange;
+
+  friend class mozilla::dom::CrossShadowBoundaryRange;
+
+  friend void ImplCycleCollectionTraverse(nsCycleCollectionTraversalCallback&,
+                                          RangeBoundary&, const char*,
+                                          uint32_t);
+  friend void ImplCycleCollectionUnlink(RangeBoundary&);
+
+  static const uint32_t kFallbackOffset = 0;
+
+  template <typename T, typename Enable = void>
+  struct GetNodeType;
+  template <typename T>
+  struct GetNodeType<T, std::enable_if_t<std::is_pointer_v<T>>> {
+    using type = std::remove_pointer_t<T>;
+  };
+  template <typename T>
+  struct GetNodeType<T, std::enable_if_t<!std::is_pointer_v<T>>> {
+    using type = typename T::element_type;
+  };
+
+ public:
+  using RawParentType = typename GetNodeType<ParentType>::type;
+  static_assert(std::is_same_v<RawParentType, nsINode> ||
+                std::is_same_v<RawParentType, const nsINode>);
+  using RawRefType = typename GetNodeType<RefType>::type;
+  static_assert(std::is_same_v<RawRefType, nsIContent> ||
+                std::is_same_v<RawRefType, const nsIContent>);
+
+ private:
+  [[nodiscard]] static RangeBoundaryBase FromRef(
+      RawRefType& aRef, TreeKind aTreeKind = TreeKind::DOM) {
+    nsINode* const parentNode = ComputeParentNode(&aRef, aTreeKind);
+    if (MOZ_UNLIKELY(!parentNode)) {
+      return RangeBoundaryBase(aTreeKind);
+    }
+    return RangeBoundaryBase(parentNode, &aRef, aTreeKind);
+  }
+
+ public:
+  [[nodiscard]] static RangeBoundaryBase FromChild(
+      RawRefType& aChild, TreeKind aTreeKind = TreeKind::DOM) {
+    nsINode* const parentNode = ComputeParentNode(&aChild, aTreeKind);
+    if (MOZ_UNLIKELY(!parentNode)) {
+      return RangeBoundaryBase(aTreeKind);
+    }
+    nsIContent* const ref = ComputeRef(parentNode, &aChild, aTreeKind);
+    return RangeBoundaryBase(parentNode, ref, aTreeKind);
+  }
+
+  [[nodiscard]] static RangeBoundaryBase After(
+      RawRefType& aChild, TreeKind aTreeKind = TreeKind::DOM) {
+    return FromRef(aChild, aTreeKind);
+  }
+
+  [[nodiscard]] static RangeBoundaryBase StartOfParent(
+      RawParentType& aParent,
+      RangeBoundarySetBy aPointTo = RangeBoundarySetBy::Ref,
+      TreeKind aTreeKind = TreeKind::DOM) {
+    if (MOZ_UNLIKELY(aParent.NodeType() == nsINode::DOCUMENT_TYPE_NODE)) {
+      return RangeBoundaryBase(aTreeKind);
+    }
+    return RangeBoundaryBase(&aParent, nullptr, 0, aPointTo, aTreeKind);
+  }
+
+  [[nodiscard]] static RangeBoundaryBase EndOfParent(
+      RawParentType& aParent,
+      RangeBoundarySetBy aSetBy = RangeBoundarySetBy::Ref,
+      TreeKind aTreeKind = TreeKind::DOM) {
+    if (MOZ_UNLIKELY(aParent.NodeType() == nsINode::DOCUMENT_TYPE_NODE)) {
+      return RangeBoundaryBase(aTreeKind);
+    }
+    if (aSetBy == RangeBoundarySetBy::Ref && aParent.IsContainerNode()) {
+      MOZ_ASSERT(!aParent.IsCharacterData());
+      nsIContent* const lastChild = ComputeLastChild(&aParent, aTreeKind);
+      return RangeBoundaryBase(&aParent, lastChild, aTreeKind);
+    }
+    const uint32_t length = ComputeLength(&aParent, aTreeKind);
+    return RangeBoundaryBase(&aParent, length, aSetBy, aTreeKind);
+  }
+
+  RangeBoundaryBase(RawParentType* aContainer, RawRefType* aRef,
+                    TreeKind aTreeKind = TreeKind::DOM)
+      : mParent(aContainer),
+        mRef(aRef),
+        mSetBy(RangeBoundarySetBy::Ref),
+        mTreeKind(aTreeKind) {
+    MOZ_ASSERT(
+        aTreeKind == TreeKind::DOM || aTreeKind == TreeKind::FlatForSelection,
+        "Only TreeKind::DOM and TreeKind::FlatForSelection are valid at the "
+        "moment.");
+    if (mRef) {
+      NS_WARNING_ASSERTION(
+          IsValidParent(mParent, mRef),
+          nsFmtCString(
+              FMT_STRING(
+                  "Constructing RangeBoundary with invalid value:\nthis={}"),
+              *this)
+              .get());
+      MOZ_ASSERT(IsValidParent(mParent, mRef),
+                 "Initializing RangeBoundary with invalid value");
+    } else {
+      mOffset.emplace(0);
+    }
+  }
+
+  [[nodiscard]] static RangeBoundaryBase MakeIfValidRef(
+      RawParentType* aContainer, RawRefType* aRef,
+      TreeKind aTreeKind = TreeKind::DOM) {
+    if (MOZ_UNLIKELY(!aContainer ||
+                     aContainer->NodeType() == nsINode::DOCUMENT_TYPE_NODE ||
+                     (aRef && !IsValidParent(aContainer, aRef, aTreeKind)))) {
+      return RangeBoundaryBase(aTreeKind);
+    }
+    return RangeBoundaryBase(aContainer, aRef, aTreeKind);
+  }
+
+  RangeBoundaryBase(RawParentType* aContainer, uint32_t aOffset,
+                    RangeBoundarySetBy aSetBy = RangeBoundarySetBy::Ref,
+                    TreeKind aTreeKind = TreeKind::DOM)
+      : mParent(aContainer),
+        mRef(nullptr),
+        mOffset(mozilla::Some(aOffset)),
+        mSetBy(aSetBy),
+        mTreeKind(aTreeKind) {
+    MOZ_ASSERT(
+        aTreeKind == TreeKind::DOM || aTreeKind == TreeKind::FlatForSelection,
+        "Only TreeKind::DOM and TreeKind::FlatForSelection are valid at the "
+        "moment.");
+    if (IsSetByOffset()) {
+      return;
+    }
+    if (mParent && mParent->IsContainerNode()) {
+      if (aOffset == GetLength(mParent)) {
+        mRef = GetLastChild(mParent);
+      } else if (aOffset > 0) {
+        mRef = GetChildAt(mParent, aOffset - 1);
+      }
+      NS_WARNING_ASSERTION(
+          mRef || aOffset == 0,
+          nsFmtCString(
+              FMT_STRING(
+                  "Constructing RangeBoundary with invalid value:\nthis={}"),
+              *this)
+              .get());
+      MOZ_ASSERT(mRef || aOffset == 0);
+      return;
+    }
+    NS_WARNING_ASSERTION(
+        !mRef || IsValidParent(mParent, mRef),
+        nsFmtCString(
+            FMT_STRING(
+                "Constructing RangeBoundary with invalid value:\nthis={}"),
+            *this)
+            .get());
+    MOZ_ASSERT(!mRef || IsValidParent(mParent, mRef));
+  }
+
+  [[nodiscard]] static RangeBoundaryBase MakeIfValidOffset(
+      RawParentType* aContainer, uint32_t aOffset,
+      RangeBoundarySetBy aSetBy = RangeBoundarySetBy::Ref,
+      TreeKind aTreeKind = TreeKind::DOM) {
+    if (MOZ_UNLIKELY(!aContainer ||
+                     aContainer->NodeType() == nsINode::DOCUMENT_TYPE_NODE ||
+                     aOffset > ComputeLength(aContainer, aTreeKind))) {
+      return RangeBoundaryBase(aTreeKind);
+    }
+    return RangeBoundaryBase(aContainer, aOffset, aSetBy, aTreeKind);
+  }
+
+  [[nodiscard]] TreeKind GetTreeKind() const { return mTreeKind; }
+
+  RangeBoundaryBase AsRangeBoundaryInFlatTreeOrNonFlattenedNode(
+      RangeBoundaryFor aFor) const {
+    if (mTreeKind == TreeKind::FlatForSelection) {
+      return *this;
+    }
+    MOZ_ASSERT(IsSet());
+    if (!mParent->IsContainerNode()) {
+      MOZ_ASSERT(mOffset);
+      return RangeBoundaryBase(mParent, *mOffset, mSetBy,
+                               TreeKind::FlatForSelection);
+    }
+    enum class ChildKind : bool { ChildAtOffset, Ref };
+    const auto ComputeRangeBoundaryInFlatTreeFromChildNode =
+        [&](RawRefType* aChild, ChildKind aChildKind) {
+          RangeBoundaryBase ret =
+              aChildKind == ChildKind::ChildAtOffset
+                  ? FromChild(*aChild, TreeKind::FlatForSelection)
+                  : FromRef(*aChild, TreeKind::FlatForSelection);
+          if (MOZ_LIKELY(ret.IsSet())) {
+            return ret;
+          }
+          dom::ShadowRoot* const shadowRoot =
+              mParent->GetShadowRootForSelection();
+          RawParentType* const slot =
+              mParent->GetAsHTMLSlotElementIfFilledForSelection();
+          MOZ_ASSERT(shadowRoot || slot);
+          MOZ_ASSERT_IF(shadowRoot,
+                        aChild->GetContainingShadow() != shadowRoot);
+          return IsStartOfContainer()
+                     ? StartOfParent(shadowRoot ? *shadowRoot : *slot, mSetBy,
+                                     TreeKind::FlatForSelection)
+                     : EndOfParent(shadowRoot ? *shadowRoot : *slot, mSetBy,
+                                   TreeKind::FlatForSelection);
+        };
+    if (aFor == RangeBoundaryFor::Start) {
+      if (RawRefType* const child = GetChildAtOffset()) {
+        return ComputeRangeBoundaryInFlatTreeFromChildNode(
+            child, ChildKind::ChildAtOffset);
+      }
+      if (RawRefType* const lastChild = Ref()) {
+        return ComputeRangeBoundaryInFlatTreeFromChildNode(lastChild,
+                                                           ChildKind::Ref);
+      }
+    } else {
+      MOZ_ASSERT(aFor == RangeBoundaryFor::End ||
+                 aFor == RangeBoundaryFor::Collapsed);
+      if (RawRefType* const ref = Ref()) {
+        return ComputeRangeBoundaryInFlatTreeFromChildNode(ref, ChildKind::Ref);
+      }
+      if (RawRefType* const child = GetChildAtOffset()) {
+        return ComputeRangeBoundaryInFlatTreeFromChildNode(
+            child, ChildKind::ChildAtOffset);
+      }
+    }
+    NS_ASSERTION(
+        !mParent->HasChildNodes(),
+        fmt::format("Called with invalid offset?\nthis={}", *this).c_str());
+    return EndOfParent(*mParent, mSetBy, TreeKind::FlatForSelection);
+  }
+
+  RangeBoundaryBase GetRangeBoundaryInFlatTree(RangeBoundaryFor aFor) const {
+    MOZ_ASSERT(IsSet());
+    RangeBoundaryBase inFlatTree =
+        AsRangeBoundaryInFlatTreeOrNonFlattenedNode(aFor);
+    if (NS_WARN_IF(!inFlatTree.IsSet())) {
+      MOZ_ASSERT(inFlatTree.mTreeKind == TreeKind::FlatForSelection);
+      return inFlatTree;
+    }
+    dom::Element* const shadowHostOrSlotElementNotFlatingTheParent =
+        inFlatTree.mParent
+            ->template GetFlatTreeAncestorElementForNonFlatTreeNode<
+                TreeKind::FlatForSelection>();
+    if (!shadowHostOrSlotElementNotFlatingTheParent) [[likely]] {
+      return inFlatTree;
+    }
+    nsIContent* const shadowRoot =
+        shadowHostOrSlotElementNotFlatingTheParent->GetShadowRootForSelection();
+    MOZ_ASSERT_IF(!shadowRoot,
+                  shadowHostOrSlotElementNotFlatingTheParent
+                      ->GetAsHTMLSlotElementIfFilledForSelection());
+    return EndOfParent(
+        shadowRoot ? *shadowRoot : *shadowHostOrSlotElementNotFlatingTheParent,
+        mSetBy, TreeKind::FlatForSelection);
+  }
+
+  RangeBoundaryBase AsRangeBoundaryInDOMTree() const {
+    if (mTreeKind == TreeKind::DOM) {
+      return *this;
+    }
+    MOZ_ASSERT(IsSet());
+    if (!mParent->IsContainerNode()) {
+      MOZ_ASSERT(mOffset);
+      return RangeBoundaryBase(mParent, *mOffset, mSetBy, TreeKind::DOM);
+    }
+    if (RawRefType* const child = GetChildAtOffset()) {
+      return FromChild(*child, TreeKind::DOM);
+    }
+    if (nsIContent* const lastChild = GetLastChild(mParent)) {
+      return FromRef(*lastChild, TreeKind::DOM);
+    }
+    return EndOfParent(*mParent, mSetBy, TreeKind::DOM);
+  }
+
+  RangeBoundaryBase(RawParentType* aContainer, RawRefType* aRef,
+                    uint32_t aOffset,
+                    RangeBoundarySetBy aSetBy = RangeBoundarySetBy::Ref,
+                    TreeKind aTreeKind = TreeKind::DOM)
+      : mParent(const_cast<nsINode*>(aContainer)),
+        mRef(const_cast<nsIContent*>(aRef)),
+        mOffset(mozilla::Some(aOffset)),
+        mSetBy(aSetBy),
+        mTreeKind(aTreeKind) {
+    MOZ_ASSERT(IsSetAndValid());
+  }
+
+  explicit RangeBoundaryBase(TreeKind aTreeKind = TreeKind::DOM)
+      : mParent(nullptr),
+        mRef(nullptr),
+        mSetBy(RangeBoundarySetBy::Ref),
+        mTreeKind(aTreeKind) {}
+
+  template <typename PT, typename RT,
+            typename = std::enable_if_t<
+                std::is_const_v<RawParentType> ||
+                !std::is_const_v<PT>>>
+  RangeBoundaryBase(const RangeBoundaryBase<PT, RT>& aOther,
+                    RangeBoundarySetBy aSetBy)
+      : mParent(aOther.mParent),
+        mRef(aOther.mRef),
+        mOffset(aOther.mOffset),
+        mSetBy(aSetBy),
+        mTreeKind(aOther.mTreeKind) {}
+
+  RawRefType* Ref() const {
+    if (IsSetByRef()) {
+      return mRef;
+    }
+    MOZ_ASSERT(mParent);
+    MOZ_ASSERT(mOffset);
+
+    const uint32_t parentLength = GetLength(mParent);
+    if (*mOffset > parentLength) {
+      mRef = nullptr;
+    } else if (*mOffset == parentLength) {
+      mRef = GetLastChild(mParent);
+    } else if (*mOffset) {
+      const Maybe<uint32_t> indexOfRefObject =
+          mRef ? ComputeIndexOf(mParent, mRef, mTreeKind) : Nothing();
+      if (indexOfRefObject.isNothing() || *mOffset != *indexOfRefObject + 1) {
+        mRef = GetChildAt(mParent, *mOffset - 1);
+      }
+    } else {
+      mRef = nullptr;
+    }
+    return mRef;
+  }
+
+  RawParentType* GetContainer() const { return mParent; }
+
+  dom::Document* GetComposedDoc() const {
+    return mParent ? mParent->GetComposedDoc() : nullptr;
+  }
+
+  RawRefType* GetChildAtOffset() const {
+    if (!mParent || !mParent->IsContainerNode()) {
+      return nullptr;
+    }
+    RawRefType* const ref = Ref();
+    if (!ref) {
+      if (!MaybeMutationObserved() && *mOffset != 0) {
+        return nullptr;
+      }
+      MOZ_ASSERT_IF(mTreeKind == TreeKind::DOM,
+                    *Offset(OffsetFilter::kValidOrInvalidOffsets) == 0);
+      NS_ASSERTION(
+          *Offset(OffsetFilter::kValidOrInvalidOffsets) == 0,
+          nsFmtCString(FMT_STRING("Invalid range boundary:\nthis=%{}"), *this)
+              .get());
+      return GetFirstChild(mParent);
+    }
+    NS_ASSERTION(
+        GetChildAt(mParent, *Offset(OffsetFilter::kValidOrInvalidOffsets)) ==
+            GetNextSibling(ref),
+        nsFmtCString(
+            "Invalid range "
+            "boundary:\nthis={}\nGetChildAt()={}\nGetNextSibling(ref)={}\n",
+            *this,
+            ToString(
+                RefPtr{GetChildAt(
+                    mParent, *Offset(OffsetFilter::kValidOrInvalidOffsets))})
+                .c_str(),
+            ToString(RefPtr{GetNextSibling(ref)}).c_str())
+            .get());
+    return GetNextSibling(ref);
+  }
+
+  RawRefType* GetNextSiblingOfChildAtOffset() const {
+    if (NS_WARN_IF(!mParent) || NS_WARN_IF(!mParent->IsContainerNode())) {
+      return nullptr;
+    }
+    RawRefType* const ref = Ref();
+    if (!ref) {
+      if (!MaybeMutationObserved() && *mOffset != 0) {
+        return nullptr;
+      }
+      MOZ_ASSERT(*Offset(OffsetFilter::kValidOffsets) == 0,
+                 "invalid RangeBoundary");
+      nsIContent* firstChild = GetFirstChild(mParent);
+      if (!firstChild) {
+        return nullptr;
+      }
+      return GetNextSibling(firstChild);
+    }
+    if (!GetNextSibling(ref)) {
+      return nullptr;
+    }
+    return GetNextSibling(GetNextSibling(ref));
+  }
+
+  RawRefType* GetPreviousSiblingOfChildAtOffset() const {
+    if (NS_WARN_IF(!mParent) || NS_WARN_IF(!mParent->IsContainerNode())) {
+      return nullptr;
+    }
+    RawRefType* const ref = Ref();
+    if (!ref) {
+      return nullptr;
+    }
+    return ref;
+  }
+
+  [[nodiscard]] bool HasOffset() const { return mOffset.isSome(); }
+
+  enum class OffsetFilter { kValidOffsets, kValidOrInvalidOffsets };
+
+  Maybe<uint32_t> Offset(const OffsetFilter aOffsetFilter) const {
+    switch (aOffsetFilter) {
+      case OffsetFilter::kValidOffsets: {
+        if (IsSetAndValid()) {
+          MOZ_ASSERT_IF(IsSetByOffset(), mOffset);
+          if (!mOffset && IsSetByRef()) {
+            DetermineOffsetFromReference();
+          }
+        }
+        return IsSetByOffset() && *mOffset > GetLength(mParent) ? Nothing{}
+                                                                : mOffset;
+      }
+      case OffsetFilter::kValidOrInvalidOffsets: {
+        MOZ_ASSERT_IF(IsSetByOffset(), mOffset.isSome());
+        if (mOffset.isSome()) {
+          return mOffset;
+        }
+        if (mParent && IsSetByRef()) {
+          DetermineOffsetFromReference();
+          if (mOffset.isSome()) {
+            return mOffset;
+          }
+        }
+
+        return Some(kFallbackOffset);
+      }
+    }
+
+    MOZ_ASSERT_UNREACHABLE();
+    return Some(kFallbackOffset);
+  }
+
+  [[nodiscard]] static Maybe<uint32_t> ComputeIndexOf(const nsINode* aParent,
+                                                      const nsIContent* aChild,
+                                                      TreeKind aKind) {
+    MOZ_ASSERT(aParent);
+    MOZ_ASSERT(aChild);
+    return aKind == TreeKind::DOM
+               ? aParent->ComputeIndexOf(aChild)
+               : dom::FlattenedChildIteratorForSelection::GetIndexOf(aParent,
+                                                                     aChild);
+  }
+
+  friend std::ostream& operator<<(
+      std::ostream& aStream,
+      const RangeBoundaryBase<ParentType, RefType>& aRangeBoundary) {
+    aStream << "{ mParent=" << aRangeBoundary.GetContainer();
+    if (aRangeBoundary.GetContainer()) {
+      aStream << " (" << *aRangeBoundary.GetContainer() << ", Length="
+              << aRangeBoundary.GetLength(aRangeBoundary.GetContainer()) << ")";
+    }
+    if (aRangeBoundary.IsSetByRef()) {
+      aStream << ", mRef=" << aRangeBoundary.mRef;
+      if (aRangeBoundary.mRef) {
+        aStream << " (" << *aRangeBoundary.mRef << ")";
+      }
+    }
+
+    aStream << ", mOffset=" << aRangeBoundary.mOffset;
+    aStream << ", mSetBy=" << (aRangeBoundary.IsSetByRef() ? "Ref" : "Offset");
+    aStream << ", mTreeKind=" << aRangeBoundary.mTreeKind;
+    aStream << " }";
+    return aStream;
+  }
+
+  friend auto format_as(
+      const RangeBoundaryBase<ParentType, RefType>& aRangeBoundary) {
+    return ToString(aRangeBoundary);
+  }
+
+ private:
+  void DetermineOffsetFromReference() const {
+    MOZ_ASSERT(mParent);
+    MOZ_ASSERT(mRef);
+    MOZ_ASSERT(IsValidParent(mParent, mRef));
+    MOZ_ASSERT(IsSetByRef());
+    MOZ_ASSERT(mOffset.isNothing());
+
+    if (mRef->IsBeingRemoved()) {
+      return;
+    }
+
+    const Maybe<uint32_t> index = ComputeIndexOf(mParent, mRef, mTreeKind);
+    NS_WARNING_ASSERTION(
+        index.isSome(),
+        nsFmtCString(
+            FMT_STRING("mRef is not a child of mParent:\nthis={}\nmRef is in "
+                       "shadow tree={}\n"),
+            *this, YesOrNo(mRef && mRef->IsInShadowTree()))
+            .get());
+    MOZ_ASSERT(*index != UINT32_MAX);
+    mOffset.emplace(MOZ_LIKELY(index.isSome()) ? *index + 1u : 0u);
+  }
+
+  RawRefType* GetNextSibling(const nsIContent* aCurrentNode) const {
+    MOZ_ASSERT(mParent);
+    MOZ_ASSERT(aCurrentNode);
+    return mTreeKind == TreeKind::DOM
+               ? aCurrentNode->GetNextSibling()
+               : dom::FlattenedChildIteratorForSelection::GetNextChild(
+                     aCurrentNode);
+  }
+
+  [[nodiscard]] static nsIContent* ComputeRef(const nsINode* aParent,
+                                              const nsIContent* aChild,
+                                              TreeKind aKind) {
+    MOZ_ASSERT(aParent);
+    MOZ_ASSERT(aChild);
+    MOZ_ASSERT(aParent == ComputeParentNode(aChild, aKind));
+    return aKind == TreeKind::DOM
+               ? aChild->GetPreviousSibling()
+               : dom::FlattenedChildIteratorForSelection::GetPreviousChild(
+                     aChild);
+  }
+
+  RawRefType* GetFirstChild(const nsINode* aNode) const {
+    MOZ_ASSERT(aNode);
+    return mTreeKind == TreeKind::DOM
+               ? aNode->GetFirstChild()
+               : dom::FlattenedChildIteratorForSelection::GetFirstChild(aNode);
+  }
+
+  [[nodiscard]] static nsINode* ComputeParentNode(const nsIContent* aChild,
+                                                  TreeKind aKind) {
+    MOZ_ASSERT(aChild);
+    if (aKind == TreeKind::DOM) {
+      return aChild->GetParentNode();
+    }
+
+    if (dom::HTMLSlotElement* const slot =
+            aChild->GetAssignedSlotForSelection()) {
+      return slot;
+    }
+
+    nsINode* const parentNode = aChild->GetParentNode();
+    if (!parentNode) {
+      return nullptr;
+    }
+    if (parentNode->GetAsHTMLSlotElementIfFilledForSelection()) {
+      return nullptr;
+    }
+    const dom::ShadowRoot* const shadowRoot = parentNode->GetShadowRoot();
+    if (!shadowRoot) {
+      return parentNode;
+    }
+    if (!shadowRoot->IsUAWidget()) {
+      return nullptr;
+    }
+    return shadowRoot->GetHost();
+  }
+
+  [[nodiscard]] static bool IsValidParent(const nsINode* aParent,
+                                          const nsIContent* aChild,
+                                          TreeKind aKind) {
+    MOZ_ASSERT(aParent);
+    MOZ_ASSERT(aChild);
+    if (aParent == ComputeParentNode(aChild, aKind)) {
+      return true;
+    }
+    if (aKind == TreeKind::FlatForSelection) {
+      if (aParent->GetShadowRootForSelection() == aChild->GetParentNode()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  [[nodiscard]] bool IsValidParent(const nsINode* aParent,
+                                   const nsIContent* aChild) const {
+    return IsValidParent(aParent, aChild, mTreeKind);
+  }
+
+  [[nodiscard]] static uint32_t ComputeLength(const nsINode* aNode,
+                                              TreeKind aKind) {
+    MOZ_ASSERT(aNode);
+    return aKind == TreeKind::DOM
+               ? aNode->Length()
+               : dom::FlattenedChildIteratorForSelection::GetLength(aNode);
+  }
+
+  [[nodiscard]] uint32_t GetLength(const nsINode* aNode) const {
+    return ComputeLength(aNode, mTreeKind);
+  }
+
+  RawRefType* GetChildAt(const nsINode* aParent, uint32_t aOffset) const {
+    MOZ_ASSERT(aParent);
+    return mTreeKind == TreeKind::DOM
+               ? aParent->GetChildAt_Deprecated(aOffset)
+               : dom::FlattenedChildIteratorForSelection::GetChildAt(aParent,
+                                                                     aOffset);
+  }
+
+  [[nodiscard]] static nsIContent* ComputeLastChild(const nsINode* aParent,
+                                                    TreeKind aKind) {
+    MOZ_ASSERT(aParent);
+    return aKind == TreeKind::DOM
+               ? aParent->GetLastChild()
+               : dom::FlattenedChildIteratorForSelection::GetLastChild(aParent);
+  }
+
+  [[nodiscard]] nsIContent* GetLastChild(const nsINode* aParent) const {
+    return ComputeLastChild(aParent, mTreeKind);
+  }
+
+  void InvalidateOffset() {
+    MOZ_ASSERT(mParent);
+    MOZ_ASSERT(mParent->IsContainerNode(),
+               "Range is positioned on a text node!");
+    if (IsSetByOffset()) {
+      return;
+    }
+    if (!mRef) {
+      MOZ_ASSERT(mOffset.isSome() && mOffset.value() == 0,
+                 "Invalidating offset of invalid RangeBoundary?");
+      return;
+    }
+    mOffset.reset();
+  }
+
+ public:
+  void NotifyParentBecomesShadowHost() {
+    MOZ_ASSERT(mParent);
+    MOZ_ASSERT(mParent->IsContainerNode(),
+               "Range is positioned on a text node!");
+    if (!MaybeMutationObserved()) {
+      return;
+    }
+
+    if (!mRef) {
+      MOZ_ASSERT(mOffset.isSome() && mOffset.value() == 0,
+                 "Invalidating offset of invalid RangeBoundary?");
+      return;
+    }
+
+    if (dom::ShadowRoot* shadowRoot = mParent->GetShadowRootForSelection()) {
+      mParent = shadowRoot;
+    }
+
+    mOffset = Some(0);
+  }
+
+  bool IsSet() const { return mParent && (mRef || mOffset.isSome()); }
+
+  [[nodiscard]] bool IsSetAndInComposedDoc() const {
+    return IsSet() && mParent->IsInComposedDoc();
+  }
+
+  bool IsSetAndValid() const {
+    if (!IsSet() ||
+        MOZ_UNLIKELY(mParent->NodeType() == nsINode::DOCUMENT_TYPE_NODE)) {
+      return false;
+    }
+
+    if (IsSetByRef() && Ref()) {
+      return IsValidParent(GetContainer(), Ref()) && !Ref()->IsBeingRemoved();
+    }
+
+    MOZ_ASSERT(mOffset.isSome());
+    return *mOffset <= GetContainer()->Length();
+  }
+
+  bool IsStartOfContainer() const {
+    return IsSetByRef() ? !Ref() && mOffset.value() == 0 : mOffset.value() == 0;
+  }
+
+  bool IsEndOfContainer() const {
+    return IsSetByRef() && Ref() ? !GetNextSibling(Ref())
+                                 : mOffset.value() == GetLength(mParent);
+  }
+
+  template <typename PT = RawParentType,
+            typename = std::enable_if_t<!std::is_const_v<PT>>>
+  RawRangeBoundary AsRaw() const {
+    return RawRangeBoundary(*this, mSetBy);
+  }
+  ConstRawRangeBoundary AsConstRaw() const {
+    return ConstRawRangeBoundary(*this, mSetBy);
+  }
+
+  RangeBoundaryBase& operator=(const RangeBoundaryBase& aOther) {
+    MOZ_ASSERT(mTreeKind == aOther.mTreeKind);
+    if (this != &aOther) {
+      mParent = aOther.mParent;
+      mRef = aOther.mRef;
+      mOffset = aOther.mOffset;
+      mSetBy = aOther.mSetBy;
+    }
+    return *this;
+  }
+
+  template <
+      typename PT, typename RT, typename RPT = RawParentType,
+      typename = std::enable_if_t<!std::is_const_v<PT> || std::is_const_v<RPT>>>
+  RangeBoundaryBase& CopyFrom(const RangeBoundaryBase<PT, RT>& aOther,
+                              RangeBoundarySetBy aSetBy) {
+    MOZ_ASSERT(mTreeKind == aOther.mTreeKind);
+    if (mParent != aOther.mParent) {
+      mParent = aOther.mParent;
+    }
+    if (mRef != aOther.mRef) {
+      mRef = aOther.mRef;
+    }
+
+    mSetBy = aSetBy;
+    if (IsSetByOffset() && aOther.mOffset.isNothing()) {
+      mOffset = aOther.Offset(
+          RangeBoundaryBase<PT, RT>::OffsetFilter::kValidOrInvalidOffsets);
+      MOZ_DIAGNOSTIC_ASSERT(mOffset.isSome());
+    } else {
+      mOffset = aOther.mOffset;
+    }
+    if (IsSetByRef() && !mRef && mParent && mOffset.isSome() && *mOffset) {
+      if (*mOffset == mParent->GetChildCount()) {
+        mRef = GetLastChild(mParent);
+      } else {
+        mRef = GetChildAt(mParent, *mOffset - 1);
+      }
+    }
+    return *this;
+  }
+
+  bool Equals(const RawParentType* aNode, uint32_t aOffset) const {
+    if (mParent != aNode) {
+      return false;
+    }
+
+    const Maybe<uint32_t> offset = Offset(OffsetFilter::kValidOffsets);
+    return offset && (*offset == aOffset);
+  }
+
+  template <typename A, typename B>
+  [[nodiscard]] bool operator==(const RangeBoundaryBase<A, B>& aOther) const {
+    if (!mParent && !aOther.mParent) {
+      return true;
+    }
+    if (mParent != aOther.mParent) {
+      return false;
+    }
+    if (RefIsFixed() && aOther.RefIsFixed()) {
+      return mRef == aOther.mRef;
+    }
+
+    if (mTreeKind != aOther.mTreeKind) {
+      return false;
+    }
+
+    return Offset(OffsetFilter::kValidOrInvalidOffsets) ==
+           aOther.Offset(
+               RangeBoundaryBase<A, B>::OffsetFilter::kValidOrInvalidOffsets);
+  }
+
+  template <typename A, typename B>
+  bool operator!=(const RangeBoundaryBase<A, B>& aOther) const {
+    return !(*this == aOther);
+  }
+
+ private:
+  [[nodiscard]] bool RefIsFixed() const {
+    return mParent &&
+           (
+               (IsSetByRef() && (mRef || mParent->IsContainerNode())) ||
+               mOffset.isNothing());
+  }
+
+  [[nodiscard]] bool IsSetByOffset() const {
+    return !static_cast<bool>(mSetBy);
+  }
+  [[nodiscard]] bool IsSetByRef() const { return static_cast<bool>(mSetBy); }
+
+  [[nodiscard]] bool MaybeMutationObserved() const { return IsSetByRef(); }
+
+  ParentType mParent;
+  mutable RefType mRef;
+
+  mutable mozilla::Maybe<uint32_t> mOffset;
+  RangeBoundarySetBy mSetBy;
+  const TreeKind mTreeKind;
+};
+
+template <typename ParentType, typename RefType>
+const uint32_t RangeBoundaryBase<ParentType, RefType>::kFallbackOffset;
+
+inline void ImplCycleCollectionUnlink(RangeBoundary& aField) {
+  ImplCycleCollectionUnlink(aField.mParent);
+  ImplCycleCollectionUnlink(aField.mRef);
+}
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback, RangeBoundary& aField,
+    const char* aName, uint32_t aFlags) {
+  ImplCycleCollectionTraverse(aCallback, aField.mParent, "mParent", 0);
+  ImplCycleCollectionTraverse(aCallback, aField.mRef, "mRef", 0);
+}
+
+}  
+
+#endif  // defined(mozilla_RangeBoundary_h)

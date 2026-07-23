@@ -1,0 +1,39 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/cache/ActorChild.h"
+
+#include "mozilla/dom/cache/CacheWorkerRef.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla::dom::cache {
+
+void CacheActorChild::SetWorkerRef(SafeRefPtr<CacheWorkerRef> aWorkerRef) {
+  if (mWorkerRef) {
+
+    MOZ_DIAGNOSTIC_ASSERT(mWorkerRef == aWorkerRef);
+    return;
+  }
+
+  mWorkerRef = std::move(aWorkerRef);
+  if (mWorkerRef) {
+    mWorkerRef->AddActor(*this);
+  }
+}
+
+void CacheActorChild::RemoveWorkerRef() {
+  MOZ_ASSERT_IF(!NS_IsMainThread(), mWorkerRef);
+  if (mWorkerRef) {
+    mWorkerRef->RemoveActor(*this);
+    mWorkerRef = nullptr;
+  }
+}
+
+const SafeRefPtr<CacheWorkerRef>& CacheActorChild::GetWorkerRefPtr() const {
+  return mWorkerRef;
+}
+
+CacheActorChild::~CacheActorChild() { MOZ_DIAGNOSTIC_ASSERT(!mWorkerRef); }
+
+}  

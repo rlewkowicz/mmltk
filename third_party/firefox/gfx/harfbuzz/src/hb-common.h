@@ -1,0 +1,269 @@
+/*
+ * Copyright © 2007,2008,2009  Red Hat, Inc.
+ * Copyright © 2011,2012  Google, Inc.
+ *
+ *  This is part of HarfBuzz, a text shaping library.
+ *
+ * Permission is hereby granted, without written agreement and without
+ * license or royalty fees, to use, copy, modify, and distribute this
+ * software and its documentation for any purpose, provided that the
+ * above copyright notice and the following two paragraphs appear in
+ * all copies of this software.
+ *
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE TO ANY PARTY FOR
+ * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES
+ * ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN
+ * IF THE COPYRIGHT HOLDER HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ *
+ * THE COPYRIGHT HOLDER SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING,
+ * BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+ * FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ * ON AN "AS IS" BASIS, AND THE COPYRIGHT HOLDER HAS NO OBLIGATION TO
+ * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ *
+ * Red Hat Author(s): Behdad Esfahbod
+ * Google Author(s): Behdad Esfahbod
+ */
+
+#if !defined(HB_H_IN) && !defined(HB_NO_SINGLE_HEADER_ERROR)
+#error "Include <hb.h> instead."
+#endif
+
+#if !defined(HB_COMMON_H)
+#define HB_COMMON_H
+
+#if !defined(HB_EXTERN)
+#define HB_EXTERN extern
+#endif
+
+#if !defined(HB_BEGIN_DECLS)
+#if defined(__cplusplus)
+#  define HB_BEGIN_DECLS	extern "C" {
+#  define HB_END_DECLS		}
+#else
+#  define HB_BEGIN_DECLS
+#  define HB_END_DECLS
+#endif
+#endif
+
+#if defined (_MSC_VER) && _MSC_VER < 1600
+typedef __int8 int8_t;
+typedef unsigned __int8 uint8_t;
+typedef __int16 int16_t;
+typedef unsigned __int16 uint16_t;
+typedef __int32 int32_t;
+typedef unsigned __int32 uint32_t;
+typedef __int64 int64_t;
+typedef unsigned __int64 uint64_t;
+#elif defined (_MSC_VER) && _MSC_VER < 1800
+#  include <stdint.h>
+#else
+#  include <inttypes.h>
+#endif
+#include <stddef.h>
+
+#if defined(__GNUC__) && ((__GNUC__ > 3) || (__GNUC__ == 3 && __GNUC_MINOR__ >= 1))
+#define HB_DEPRECATED __attribute__((__deprecated__))
+#elif defined(_MSC_VER) && (_MSC_VER >= 1300)
+#define HB_DEPRECATED __declspec(deprecated)
+#else
+#define HB_DEPRECATED
+#endif
+
+#if defined(__GNUC__) && ((__GNUC__ > 4) || (__GNUC__ == 4 && __GNUC_MINOR__ >= 5))
+#define HB_DEPRECATED_FOR(f) __attribute__((__deprecated__("Use '" #f "' instead")))
+#elif defined(_MSC_FULL_VER) && (_MSC_FULL_VER > 140050320)
+#define HB_DEPRECATED_FOR(f) __declspec(deprecated("is deprecated. Use '" #f "' instead"))
+#else
+#define HB_DEPRECATED_FOR(f) HB_DEPRECATED
+#endif
+
+
+HB_BEGIN_DECLS
+
+typedef int hb_bool_t;
+
+typedef uint32_t hb_codepoint_t;
+
+#define HB_CODEPOINT_INVALID ((hb_codepoint_t) -1)
+
+typedef int32_t hb_position_t;
+typedef uint32_t hb_mask_t;
+
+typedef union _hb_var_int_t {
+  uint32_t u32;
+  int32_t i32;
+  uint16_t u16[2];
+  int16_t i16[2];
+  uint8_t u8[4];
+  int8_t i8[4];
+} hb_var_int_t;
+
+typedef union _hb_var_num_t {
+  float f;
+  uint32_t u32;
+  int32_t i32;
+  uint16_t u16[2];
+  int16_t i16[2];
+  uint8_t u8[4];
+  int8_t i8[4];
+} hb_var_num_t;
+
+
+
+typedef uint32_t hb_tag_t;
+
+#define HB_TAG(c1,c2,c3,c4) ((hb_tag_t)((((uint32_t)(c1)&0xFF)<<24)|(((uint32_t)(c2)&0xFF)<<16)|(((uint32_t)(c3)&0xFF)<<8)|((uint32_t)(c4)&0xFF)))
+
+#define HB_UNTAG(tag)   (uint8_t)(((tag)>>24)&0xFF), (uint8_t)(((tag)>>16)&0xFF), (uint8_t)(((tag)>>8)&0xFF), (uint8_t)((tag)&0xFF)
+
+#define HB_TAG_NONE HB_TAG(0,0,0,0)
+#define HB_TAG_MAX HB_TAG(0xff,0xff,0xff,0xff)
+#define HB_TAG_MAX_SIGNED HB_TAG(0x7f,0xff,0xff,0xff)
+
+HB_EXTERN hb_tag_t
+hb_tag_from_string (const char *str, int len);
+
+HB_EXTERN void
+hb_tag_to_string (hb_tag_t tag, char *buf);
+
+
+typedef enum {
+  HB_DIRECTION_INVALID = 0,
+  HB_DIRECTION_LTR = 4,
+  HB_DIRECTION_RTL,
+  HB_DIRECTION_TTB,
+  HB_DIRECTION_BTT
+} hb_direction_t;
+
+HB_EXTERN hb_direction_t
+hb_direction_from_string (const char *str, int len);
+
+HB_EXTERN const char *
+hb_direction_to_string (hb_direction_t direction);
+
+#define HB_DIRECTION_IS_VALID(dir)	((((unsigned int) (dir)) & ~3U) == 4)
+#define HB_DIRECTION_IS_HORIZONTAL(dir)	((((unsigned int) (dir)) & ~1U) == 4)
+#define HB_DIRECTION_IS_VERTICAL(dir)	((((unsigned int) (dir)) & ~1U) == 6)
+#define HB_DIRECTION_IS_FORWARD(dir)	((((unsigned int) (dir)) & ~2U) == 4)
+#define HB_DIRECTION_IS_BACKWARD(dir)	((((unsigned int) (dir)) & ~2U) == 5)
+#define HB_DIRECTION_REVERSE(dir)	((hb_direction_t) (((unsigned int) (dir)) ^ 1))
+
+
+
+typedef const struct hb_language_impl_t *hb_language_t;
+
+HB_EXTERN hb_language_t
+hb_language_from_string (const char *str, int len);
+
+HB_EXTERN const char *
+hb_language_to_string (hb_language_t language);
+
+#define HB_LANGUAGE_INVALID ((hb_language_t) 0)
+
+HB_EXTERN hb_language_t
+hb_language_get_default (void);
+
+HB_EXTERN hb_bool_t
+hb_language_matches (hb_language_t language,
+		     hb_language_t specific);
+
+#include "hb-script-list.h"
+
+
+HB_EXTERN hb_script_t
+hb_script_from_iso15924_tag (hb_tag_t tag);
+
+HB_EXTERN hb_script_t
+hb_script_from_string (const char *str, int len);
+
+HB_EXTERN hb_tag_t
+hb_script_to_iso15924_tag (hb_script_t script);
+
+HB_EXTERN hb_direction_t
+hb_script_get_horizontal_direction (hb_script_t script);
+
+
+
+typedef struct hb_user_data_key_t {
+  char unused;
+} hb_user_data_key_t;
+
+typedef void (*hb_destroy_func_t) (void *user_data);
+
+
+
+#define HB_FEATURE_GLOBAL_START	0
+
+#define HB_FEATURE_GLOBAL_END	((unsigned int) -1)
+
+typedef struct hb_feature_t {
+  hb_tag_t      tag;
+  uint32_t      value;
+  unsigned int  start;
+  unsigned int  end;
+} hb_feature_t;
+
+HB_EXTERN hb_bool_t
+hb_feature_from_string (const char *str, int len,
+			hb_feature_t *feature);
+
+HB_EXTERN void
+hb_feature_to_string (hb_feature_t *feature,
+		      char *buf, unsigned int size);
+
+typedef struct hb_variation_t {
+  hb_tag_t tag;
+  float    value;
+} hb_variation_t;
+
+HB_EXTERN hb_bool_t
+hb_variation_from_string (const char *str, int len,
+			  hb_variation_t *variation);
+
+HB_EXTERN void
+hb_variation_to_string (hb_variation_t *variation,
+			char *buf, unsigned int size);
+
+typedef uint32_t hb_color_t;
+
+#define HB_COLOR(b,g,r,a) ((hb_color_t) HB_TAG ((b),(g),(r),(a)))
+
+HB_EXTERN uint8_t
+hb_color_get_alpha (hb_color_t color);
+#define hb_color_get_alpha(color)	((color) & 0xFF)
+
+HB_EXTERN uint8_t
+hb_color_get_red (hb_color_t color);
+#define hb_color_get_red(color)		(((color) >> 8) & 0xFF)
+
+HB_EXTERN uint8_t
+hb_color_get_green (hb_color_t color);
+#define hb_color_get_green(color)	(((color) >> 16) & 0xFF)
+
+HB_EXTERN uint8_t
+hb_color_get_blue (hb_color_t color);
+#define hb_color_get_blue(color)	(((color) >> 24) & 0xFF)
+
+typedef struct hb_glyph_extents_t {
+  hb_position_t x_bearing;
+  hb_position_t y_bearing;
+  hb_position_t width;
+  hb_position_t height;
+} hb_glyph_extents_t;
+
+typedef struct hb_font_t hb_font_t;
+
+HB_EXTERN void*
+hb_malloc (size_t size);
+HB_EXTERN void*
+hb_calloc (size_t nmemb, size_t size);
+HB_EXTERN void*
+hb_realloc (void *ptr, size_t size);
+HB_EXTERN void
+hb_free (void *ptr);
+
+HB_END_DECLS
+
+#endif

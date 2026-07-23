@@ -1,0 +1,108 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_MIDIPlatformService_h
+#define mozilla_dom_MIDIPlatformService_h
+
+#include "mozilla/Mutex.h"
+#include "mozilla/dom/MIDIPortBinding.h"
+#include "nsClassHashtable.h"
+#include "nsHashKeys.h"
+
+#include "mozilla/dom/MIDIMessageQueue.h"
+
+namespace mozilla::dom {
+
+class MIDIManagerParent;
+class MIDIPortParent;
+class MIDIMessage;
+class MIDIMessageQueue;
+class MIDIPortInfo;
+
+class MIDIPlatformService {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MIDIPlatformService);
+  void AddPortInfo(MIDIPortInfo& aPortInfo);
+
+  void RemovePortInfo(MIDIPortInfo& aPortInfo);
+
+  void AddManager(MIDIManagerParent* aManager);
+
+  void RemoveManager(MIDIManagerParent* aManager);
+
+  void AddPort(MIDIPortParent* aPort);
+
+  void RemovePort(MIDIPortParent* aPort);
+
+  virtual void Init() = 0;
+
+  virtual void Refresh() = 0;
+
+  virtual void Open(MIDIPortParent* aPort) = 0;
+
+  void Clear(MIDIPortParent* aPort);
+
+  void MaybeStop();
+
+  static void InitStatics();
+
+  static nsISerialEventTarget* OwnerThread();
+
+  static void AssertThread() {
+    MOZ_DIAGNOSTIC_ASSERT(OwnerThread()->IsOnCurrentThread());
+  }
+
+  static bool IsRunning();
+
+  static MIDIPlatformService* Get();
+
+  void SendPortList();
+
+  void CheckAndReceive(const nsAString& aPortID,
+                       const nsTArray<MIDIMessage>& aMsgs);
+
+  void UpdateStatus(MIDIPortParent* aPort,
+                    const MIDIPortDeviceState& aDeviceState,
+                    const MIDIPortConnectionState& aConnectionState);
+
+  void QueueMessages(const nsAString& aId, nsTArray<MIDIMessage>& aMsgs);
+
+  void Close(MIDIPortParent* aPort);
+
+  bool HasDevice() { return !mPortInfo.IsEmpty(); }
+
+ protected:
+  MIDIPlatformService();
+  virtual ~MIDIPlatformService();
+  virtual void Stop() = 0;
+
+  void BroadcastState(const MIDIPortInfo& aPortInfo,
+                      const MIDIPortDeviceState& aState);
+
+  virtual void ScheduleClose(MIDIPortParent* aPort) = 0;
+
+  virtual void ScheduleSend(const nsAString& aPortId) = 0;
+
+  void GetMessages(const nsAString& aPortId, nsTArray<MIDIMessage>& aMsgs);
+
+  void GetMessagesBefore(const nsAString& aPortId, const TimeStamp& aTimeStamp,
+                         nsTArray<MIDIMessage>& aMsgs);
+
+ private:
+  bool mHasSentPortList;
+
+  nsTArray<RefPtr<MIDIManagerParent>> mManagers;
+
+  nsTArray<MIDIPortInfo> mPortInfo;
+
+  nsTArray<RefPtr<MIDIPortParent>> mPorts;
+
+  nsClassHashtable<nsStringHashKey, MIDIMessageQueue> mMessageQueues;
+
+  Mutex mMessageQueueMutex MOZ_UNANNOTATED;
+};
+
+}  
+
+#endif  // mozilla_dom_MIDIPlatformService_h

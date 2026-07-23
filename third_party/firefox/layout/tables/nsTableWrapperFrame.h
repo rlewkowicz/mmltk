@@ -1,0 +1,199 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsTableWrapperFrame_h_
+#define nsTableWrapperFrame_h_
+
+#include "LayoutConstants.h"
+#include "mozilla/Maybe.h"
+#include "nsCellMap.h"
+#include "nsContainerFrame.h"
+#include "nsTableFrame.h"
+#include "nscore.h"
+
+namespace mozilla {
+class PresShell;
+}  
+
+class nsTableWrapperFrame : public nsContainerFrame {
+ public:
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsTableWrapperFrame)
+
+  friend nsTableWrapperFrame* NS_NewTableWrapperFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle);
+
+
+  void Destroy(DestroyContext&) override;
+
+  void AppendFrames(ChildListID aListID, nsFrameList&& aFrameList) override;
+  void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                    const nsLineList::iterator* aPrevFrameLine,
+                    nsFrameList&& aFrameList) override;
+  void RemoveFrame(DestroyContext&, ChildListID, nsIFrame*) override;
+
+  nsContainerFrame* GetContentInsertionFrame() override {
+    return PrincipalChildList().FirstChild()->GetContentInsertionFrame();
+  }
+
+#ifdef ACCESSIBILITY
+  mozilla::a11y::AccType AccessibleType() override;
+#endif
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  Maybe<nscoord> GetNaturalBaselineBOffset(
+      mozilla::WritingMode aWM, BaselineSharingGroup aBaselineGroup,
+      BaselineExportContext aExportContext) const override;
+
+  nscoord IntrinsicISize(const mozilla::IntrinsicSizeInput& aInput,
+                         mozilla::IntrinsicISizeType aType) override;
+
+  SizeComputationResult ComputeSize(
+      const SizeComputationInput& aSizingInput, mozilla::WritingMode aWM,
+      const mozilla::LogicalSize& aCBSize, nscoord aAvailableISize,
+      const mozilla::LogicalSize& aMargin,
+      const mozilla::LogicalSize& aBorderPadding,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      mozilla::ComputeSizeFlags aFlags) override;
+
+  mozilla::LogicalSize ComputeAutoSize(
+      const SizeComputationInput& aSizingInput, mozilla::WritingMode aWM,
+      const mozilla::LogicalSize& aCBSize, nscoord aAvailableISize,
+      const mozilla::LogicalSize& aMargin,
+      const mozilla::LogicalSize& aBorderPadding,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      mozilla::ComputeSizeFlags aFlags) override;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+  ComputedStyle* GetParentComputedStyle(
+      nsIFrame** aProviderFrame) const override;
+
+  nsIContent* GetCellAt(uint32_t aRowIdx, uint32_t aColIdx) const;
+
+  int32_t GetRowCount() const { return InnerTableFrame()->GetRowCount(); }
+
+  int32_t GetColCount() const { return InnerTableFrame()->GetColCount(); }
+
+  int32_t GetIndexByRowAndColumn(int32_t aRowIdx, int32_t aColIdx) const {
+    nsTableCellMap* cellMap = InnerTableFrame()->GetCellMap();
+    if (!cellMap) {
+      return -1;
+    }
+
+    return cellMap->GetIndexByRowAndColumn(aRowIdx, aColIdx);
+  }
+
+  void GetRowAndColumnByIndex(int32_t aCellIdx, int32_t* aRowIdx,
+                              int32_t* aColIdx) const {
+    *aRowIdx = *aColIdx = 0;
+    nsTableCellMap* cellMap = InnerTableFrame()->GetCellMap();
+    if (cellMap) {
+      cellMap->GetRowAndColumnByIndex(aCellIdx, aRowIdx, aColIdx);
+    }
+  }
+
+  nsTableCellFrame* GetCellFrameAt(uint32_t aRowIdx, uint32_t aColIdx) const {
+    nsTableCellMap* map = InnerTableFrame()->GetCellMap();
+    if (!map) {
+      return nullptr;
+    }
+
+    return map->GetCellInfoAt(aRowIdx, aColIdx);
+  }
+
+  uint32_t GetEffectiveColSpanAt(uint32_t aRowIdx, uint32_t aColIdx) const {
+    nsTableCellMap* map = InnerTableFrame()->GetCellMap();
+    return map->GetEffectiveColSpan(aRowIdx, aColIdx);
+  }
+
+  uint32_t GetEffectiveRowSpanAt(uint32_t aRowIdx, uint32_t aColIdx) const {
+    nsTableCellMap* map = InnerTableFrame()->GetCellMap();
+    return map->GetEffectiveRowSpan(aRowIdx, aColIdx);
+  }
+
+  bool HasCaption() const { return !mFrames.OnlyChild(); }
+  nsIFrame* GetCaption() const {
+    return HasCaption() ? mFrames.FirstChild()->GetNextSibling() : nullptr;
+  }
+
+  nsTableFrame* InnerTableFrame() const {
+    return static_cast<nsTableFrame*>(mFrames.FirstChild());
+  }
+
+ protected:
+  nsTableWrapperFrame(ComputedStyle* aStyle, nsPresContext* aPresContext,
+                      ClassID aID = kClassID);
+  virtual ~nsTableWrapperFrame();
+
+  using MaybeCaptionSide = Maybe<mozilla::StyleCaptionSide>;
+
+  MaybeCaptionSide GetCaptionSide() const;
+
+  nscoord ComputeFinalBSize(const mozilla::LogicalSize& aInnerSize,
+                            const mozilla::LogicalSize& aCaptionSize,
+                            const mozilla::LogicalMargin& aCaptionMargin,
+                            const mozilla::WritingMode aWM) const;
+
+  void GetCaptionOrigin(mozilla::StyleCaptionSide,
+                        const mozilla::LogicalSize& aInnerSize,
+                        const mozilla::LogicalSize& aCaptionSize,
+                        mozilla::LogicalMargin& aCaptionMargin,
+                        mozilla::LogicalPoint& aOrigin,
+                        mozilla::WritingMode aWM) const;
+
+  void GetInnerOrigin(const MaybeCaptionSide&,
+                      const mozilla::LogicalSize& aCaptionSize,
+                      const mozilla::LogicalMargin& aCaptionMargin,
+                      const mozilla::LogicalSize& aInnerSize,
+                      mozilla::LogicalPoint& aOrigin,
+                      mozilla::WritingMode aWM) const;
+
+  mozilla::ComputeSizeFlags CreateComputeSizeFlagsForChild() const;
+
+  void CreateReflowInputForInnerTable(
+      nsPresContext* aPresContext, nsTableFrame* aTableFrame,
+      const ReflowInput& aOuterRI, Maybe<ReflowInput>& aChildRI,
+      const nscoord aAvailISize, nscoord aBSizeOccupiedByCaption = 0) const;
+  void CreateReflowInputForCaption(nsPresContext* aPresContext,
+                                   nsIFrame* aCaptionFrame,
+                                   const ReflowInput& aOuterRI,
+                                   Maybe<ReflowInput>& aChildRI,
+                                   const nscoord aAvailISize) const;
+
+  void ReflowChild(nsPresContext* aPresContext, nsIFrame* aChildFrame,
+                   const ReflowInput& aChildRI, ReflowOutput& aMetrics,
+                   nsReflowStatus& aStatus);
+
+  void UpdateOverflowAreas(ReflowOutput& aMet);
+
+  mozilla::LogicalSize InnerTableShrinkWrapSize(
+      const SizeComputationInput& aSizingInput, nsTableFrame* aTableFrame,
+      mozilla::WritingMode aWM, const mozilla::LogicalSize& aCBSize,
+      nscoord aAvailableISize,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      mozilla::ComputeSizeFlags aFlag) const;
+  mozilla::LogicalSize CaptionShrinkWrapSize(
+      const SizeComputationInput& aSizingInput, nsIFrame* aCaptionFrame,
+      mozilla::WritingMode aWM, const mozilla::LogicalSize& aCBSize,
+      nscoord aAvailableISize, mozilla::ComputeSizeFlags aFlag) const;
+
+  mozilla::StyleSize ReduceStyleSizeBy(const mozilla::StyleSize& aStyleSize,
+                                       const nscoord aAmountToReduce) const;
+
+  mozilla::StyleSizeOverrides ComputeSizeOverridesForInnerTable(
+      const nsTableFrame* aTableFrame,
+      const mozilla::StyleSizeOverrides& aWrapperSizeOverrides,
+      const mozilla::LogicalSize& aBorderPadding,
+      nscoord aBSizeOccupiedByCaption) const;
+};
+
+#endif

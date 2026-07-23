@@ -1,0 +1,97 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+********************************************************************************
+* Copyright (C) 2013-2014, International Business Machines Corporation and others.
+* All Rights Reserved.
+********************************************************************************
+*
+* File UFORMATTABLE.H
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   2013 Jun 7  srl         New
+********************************************************************************
+*/
+
+
+#ifndef UFORMATTABLE_H
+#define UFORMATTABLE_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#if U_SHOW_CPLUSPLUS_API
+#include "unicode/localpointer.h"
+#endif   // U_SHOW_CPLUSPLUS_API
+
+typedef enum UFormattableType {
+  UFMT_DATE = 0, 
+  UFMT_DOUBLE,   
+  UFMT_LONG,     
+  UFMT_STRING,   
+  UFMT_ARRAY,    
+  UFMT_INT64,    
+  UFMT_OBJECT,   
+#ifndef U_HIDE_DEPRECATED_API
+    UFMT_COUNT
+#endif  /* U_HIDE_DEPRECATED_API */
+} UFormattableType;
+
+
+typedef void *UFormattable;
+
+U_CAPI UFormattable* U_EXPORT2
+ufmt_open(UErrorCode* status);
+
+U_CAPI void U_EXPORT2
+ufmt_close(UFormattable* fmt);
+
+#if U_SHOW_CPLUSPLUS_API
+
+U_NAMESPACE_BEGIN
+
+U_DEFINE_LOCAL_OPEN_POINTER(LocalUFormattablePointer, UFormattable, ufmt_close);
+
+U_NAMESPACE_END
+
+#endif
+
+U_CAPI UFormattableType U_EXPORT2
+ufmt_getType(const UFormattable* fmt, UErrorCode *status);
+
+U_CAPI UBool U_EXPORT2
+ufmt_isNumeric(const UFormattable* fmt);
+
+U_CAPI UDate U_EXPORT2
+ufmt_getDate(const UFormattable* fmt, UErrorCode *status);
+
+U_CAPI double U_EXPORT2
+ufmt_getDouble(UFormattable* fmt, UErrorCode *status);
+
+U_CAPI int32_t U_EXPORT2
+ufmt_getLong(UFormattable* fmt, UErrorCode *status);
+
+
+U_CAPI int64_t U_EXPORT2
+ufmt_getInt64(UFormattable* fmt, UErrorCode *status);
+
+U_CAPI const void *U_EXPORT2
+ufmt_getObject(const UFormattable* fmt, UErrorCode *status);
+
+U_CAPI const UChar* U_EXPORT2
+ufmt_getUChars(UFormattable* fmt, int32_t *len, UErrorCode *status);
+
+U_CAPI int32_t U_EXPORT2
+ufmt_getArrayLength(const UFormattable* fmt, UErrorCode *status);
+
+U_CAPI UFormattable * U_EXPORT2
+ufmt_getArrayItemByIndex(UFormattable* fmt, int32_t n, UErrorCode *status);
+
+U_CAPI const char * U_EXPORT2
+ufmt_getDecNumChars(UFormattable *fmt, int32_t *len, UErrorCode *status);
+
+#endif
+
+#endif

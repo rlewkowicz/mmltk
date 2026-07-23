@@ -1,0 +1,81 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkMipmap_DEFINED)
+#define SkMipmap_DEFINED
+
+#include "include/core/SkPixmap.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkSize.h"
+#include "src/core/SkCachedData.h"
+#include "src/core/SkImageInfoPriv.h"
+#include "src/shaders/SkShaderBase.h"
+#include <memory>
+
+class SkBitmap;
+class SkData;
+class SkDiscardableMemory;
+class SkMipmapBuilder;
+
+typedef SkDiscardableMemory* (*SkDiscardableFactoryProc)(size_t bytes);
+
+struct SkMipmapDownSampler {
+    virtual ~SkMipmapDownSampler() {}
+
+    virtual void buildLevel(const SkPixmap& dst, const SkPixmap& src) = 0;
+};
+
+class SkMipmap : public SkCachedData {
+public:
+    ~SkMipmap() override;
+    static SkMipmap* Build(const SkPixmap& src, SkDiscardableFactoryProc,
+                           bool computeContents = true);
+
+    static SkMipmap* Build(const SkBitmap& src, SkDiscardableFactoryProc);
+
+    static int ComputeLevelCount(int baseWidth, int baseHeight);
+    static int ComputeLevelCount(SkISize s) { return ComputeLevelCount(s.width(), s.height()); }
+
+    static SkISize ComputeLevelSize(int baseWidth, int baseHeight, int level);
+    static SkISize ComputeLevelSize(SkISize s, int level) {
+        return ComputeLevelSize(s.width(), s.height(), level);
+    }
+
+    static float ComputeLevel(SkSize scaleSize);
+
+    struct alignas(8) Level {
+        SkPixmap    fPixmap;
+        SkSize      fScale; 
+    };
+
+    bool extractLevel(SkSize scale, Level*) const;
+
+    int countLevels() const;
+
+    bool getLevel(int index, Level*) const;
+
+    bool validForRootLevel(const SkImageInfo&) const;
+
+    static std::unique_ptr<SkMipmapDownSampler> MakeDownSampler(const SkPixmap&);
+
+protected:
+    void onDataChange(void* oldData, void* newData) override {
+        fLevels = (Level*)newData; 
+    }
+
+private:
+    sk_sp<SkColorSpace> fCS;
+    Level*              fLevels;    
+    int                 fCount;
+
+    SkMipmap(void* malloc, size_t size);
+    SkMipmap(size_t size, SkDiscardableMemory* dm);
+
+    static size_t AllocLevelsSize(int levelCount, size_t pixelSize);
+};
+
+#endif

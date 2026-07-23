@@ -1,0 +1,539 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_BaselineCodeGen_h
+#define jit_BaselineCodeGen_h
+
+#include "jit/BaselineFrameInfo.h"
+#include "jit/BytecodeAnalysis.h"
+#include "jit/CompileWrappers.h"
+#include "jit/FixedList.h"
+#include "jit/MacroAssembler.h"
+#include "jit/PerfSpewer.h"
+
+namespace js {
+
+class NamedLambdaObject;
+class SourceLocationIterator;  
+
+namespace jit {
+
+class BaselineSnapshot;
+
+enum class ScriptGCThingType {
+  Atom,
+  String,
+  RegExp,
+  Object,
+  Function,
+  Scope,
+  BigInt
+};
+
+template <typename Handler>
+class BaselineCodeGen {
+ protected:
+  Handler handler;
+
+  CompileRuntime* runtime;
+  MacroAssembler& masm;
+
+  typename Handler::FrameInfoT& frame;
+
+  NonAssertingLabel return_;
+
+  NonAssertingLabel postBarrierSlot_;
+
+  NonAssertingLabel bailoutPrologue_;
+
+  CodeOffset profilerEnterFrameToggleOffset_;
+  CodeOffset profilerExitFrameToggleOffset_;
+
+  CodeOffset bailoutPrologueOffset_;
+
+  CodeOffset warmUpCheckPrologueOffset_;
+
+  uint32_t pushedBeforeCall_ = 0;
+#ifdef DEBUG
+  bool inCall_ = false;
+#endif
+
+  template <typename... HandlerArgs>
+  explicit BaselineCodeGen(TempAllocator& alloc, MacroAssembler& masmArg,
+                           CompileRuntime* runtimeArg, HandlerArgs&&... args);
+
+  template <typename T>
+  void pushArg(const T& t) {
+    masm.Push(t);
+  }
+
+  void pushScriptArg();
+
+  void pushBytecodePCArg();
+
+  void loadScriptGCThing(ScriptGCThingType type, Register dest,
+                         Register scratch);
+  void loadScriptGCThingInternal(ScriptGCThingType type, Register dest,
+                                 Register scratch);
+  void pushScriptGCThingArg(ScriptGCThingType type, Register scratch1,
+                            Register scratch2);
+  void pushScriptNameArg(Register scratch1, Register scratch2);
+
+  void pushUint8BytecodeOperandArg(Register scratch);
+  void pushUint16BytecodeOperandArg(Register scratch);
+
+  void loadInt32LengthBytecodeOperand(Register dest);
+  void loadNumFormalArguments(Register dest);
+
+  void loadScript(Register dest);
+  void loadJitScript(Register dest);
+
+  void saveInterpreterPCReg();
+  void restoreInterpreterPCReg();
+
+  void subtractScriptSlotsSize(Register reg, Register scratch);
+
+  void loadBaselineScriptResumeEntries(Register dest, Register scratch);
+
+  void jumpToResumeEntry(Register resumeIndex, Register scratch1,
+                         Register scratch2);
+
+  void loadGlobalLexicalEnvironment(Register dest);
+  void pushGlobalLexicalEnvironmentValue(ValueOperand scratch);
+
+  void loadGlobalThisValue(ValueOperand dest);
+
+  void computeFrameSize(Register dest);
+
+  void prepareVMCall();
+
+  void storeFrameSizeAndPushDescriptor(uint32_t argSize, Register scratch);
+
+  enum class CallVMPhase { BeforePushingLocals, AfterPushingLocals };
+  bool callVMInternal(VMFunctionId id, RetAddrEntry::Kind kind,
+                      CallVMPhase phase);
+
+  template <typename Fn, Fn fn>
+  bool callVM(RetAddrEntry::Kind kind = RetAddrEntry::Kind::CallVM,
+              CallVMPhase phase = CallVMPhase::AfterPushingLocals);
+
+  template <typename Fn, Fn fn>
+  bool callVMNonOp(CallVMPhase phase = CallVMPhase::AfterPushingLocals) {
+    return callVM<Fn, fn>(RetAddrEntry::Kind::NonOpCallVM, phase);
+  }
+
+  template <typename T>
+  void emitGuardedCallPreBarrierAnyZone(const T& address, MIRType type,
+                                        Register scratch) {
+    MOZ_ASSERT_IF(handler.realmIndependentJitcode(), !masm.maybeRealm());
+    masm.guardedCallPreBarrierAnyZone(address, type, scratch);
+  }
+
+  template <typename F1, typename F2>
+  [[nodiscard]] bool emitDebugInstrumentation(
+      const F1& ifDebuggee, const mozilla::Maybe<F2>& ifNotDebuggee);
+  template <typename F>
+  [[nodiscard]] bool emitDebugInstrumentation(const F& ifDebuggee) {
+    return emitDebugInstrumentation(ifDebuggee, mozilla::Maybe<F>());
+  }
+
+  bool emitSuspend(JSOp op);
+
+  [[nodiscard]] bool emitAfterYieldDebugInstrumentation(Register scratch);
+  [[nodiscard]] bool emitDebugAfterYield();
+
+  template <typename F1, typename F2>
+  [[nodiscard]] bool emitTestScriptFlag(JSScript::ImmutableFlags flag,
+                                        const F1& ifSet, const F2& ifNotSet,
+                                        Register scratch);
+
+  template <typename F>
+  [[nodiscard]] bool emitTestScriptFlag(JSScript::ImmutableFlags flag,
+                                        bool value, const F& emit,
+                                        Register scratch);
+  template <typename F>
+  [[nodiscard]] bool emitTestScriptFlag(JSScript::MutableFlags flag, bool value,
+                                        const F& emit, Register scratch);
+
+  [[nodiscard]] bool emitEnterGeneratorCode(Register script,
+                                            Register resumeIndex,
+                                            Register scratch);
+
+  void emitInterpJumpToResumeEntry(Register script, Register resumeIndex,
+                                   Register scratch);
+  void emitJumpToInterpretOpLabel();
+
+  [[nodiscard]] bool emitCheckThis(ValueOperand val, bool reinit = false);
+  void emitLoadReturnValue(ValueOperand val);
+  void emitGetAliasedVar(ValueOperand dest);
+  [[nodiscard]] bool emitGetAliasedDebugVar(ValueOperand dest);
+
+  [[nodiscard]] bool emitNextIC();
+  [[nodiscard]] bool emitInterruptCheck();
+  [[nodiscard]] bool emitWarmUpCounterIncrement();
+
+#define EMIT_OP(op, ...) bool emit_##op();
+  FOR_EACH_OPCODE(EMIT_OP)
+#undef EMIT_OP
+
+  [[nodiscard]] bool emitUnaryArith();
+
+  [[nodiscard]] bool emitBinaryArith();
+
+  [[nodiscard]] bool emitCompare();
+
+  [[nodiscard]] bool emitConstantStrictEq(JSOp op);
+
+  [[nodiscard]] bool emitNewObject();
+
+  void emitJump();
+
+  void emitTestBooleanTruthy(bool branchIfTrue, ValueOperand val);
+
+  void emitGetTableSwitchIndex(ValueOperand val, Register dest,
+                               Register scratch1, Register scratch2);
+
+  void emitTableSwitchJump(Register key, Register scratch1, Register scratch2);
+
+  [[nodiscard]] bool emitReturn();
+
+  [[nodiscard]] bool emitTest(bool branchIfTrue);
+  [[nodiscard]] bool emitAndOr(bool branchIfTrue);
+  [[nodiscard]] bool emitCoalesce();
+
+  [[nodiscard]] bool emitCall(JSOp op);
+  [[nodiscard]] bool emitSpreadCall(JSOp op);
+
+  [[nodiscard]] bool emitDelElem(bool strict);
+  [[nodiscard]] bool emitDelProp(bool strict);
+  [[nodiscard]] bool emitSetElemSuper(bool strict);
+  [[nodiscard]] bool emitSetPropSuper(bool strict);
+
+  bool tryOptimizeBindUnqualifiedGlobalName();
+
+  [[nodiscard]] bool emitInitPropGetterSetter();
+  [[nodiscard]] bool emitInitElemGetterSetter();
+
+  [[nodiscard]] bool emitFormalArgAccess(JSOp op);
+
+  [[nodiscard]] bool emitUninitializedLexicalCheck(const ValueOperand& val);
+
+  [[nodiscard]] bool emitIsMagicValue(JSWhyMagic why);
+
+  void getEnvironmentCoordinateObject(Register reg);
+  Address getEnvironmentCoordinateAddressFromObject(Register objReg,
+                                                    Register reg);
+  Address getEnvironmentCoordinateAddress(Register reg);
+
+  [[nodiscard]] bool emitPrologue();
+  [[nodiscard]] bool emitEpilogue();
+  [[nodiscard]] bool emitStackCheck();
+  [[nodiscard]] bool emitDebugPrologue();
+  [[nodiscard]] bool emitDebugEpilogue();
+
+  [[nodiscard]] bool initEnvironmentChain();
+
+  [[nodiscard]] bool emitHandleCodeCoverageAtPrologue();
+
+  void emitInitFrameFields(Register nonFunctionEnv);
+  [[nodiscard]] bool emitIsDebuggeeCheck();
+  void emitInitializeLocals();
+
+  void emitProfilerEnterFrame();
+  void emitProfilerExitFrame();
+  void emitProfilerCallSiteInstrumentation();
+
+  void emitOutOfLinePostBarrierSlot();
+};
+
+using RetAddrEntryVector = js::Vector<RetAddrEntry, 16, SystemAllocPolicy>;
+using AllocSiteIndexVector = js::Vector<uint32_t, 16, SystemAllocPolicy>;
+
+class BaselineCompilerHandler {
+  CompilerFrameInfo frame_;
+  TempAllocator& alloc_;
+  BytecodeAnalysis analysis_;
+#ifdef DEBUG
+  const MacroAssembler& masm_;
+#endif
+  FixedList<Label> labels_;
+  RetAddrEntryVector retAddrEntries_;
+  AllocSiteIndexVector allocSiteIndices_;
+
+  using OSREntryVector =
+      Vector<BaselineScript::OSREntry, 16, SystemAllocPolicy>;
+  OSREntryVector osrEntries_;
+
+  JSScript* script_;
+  jsbytecode* pc_;
+
+  size_t nargs_;
+
+  JSObject* globalLexicalEnvironment_;
+  JSObject* globalThis_;
+
+  CallObject* callObjectTemplate_;
+  NamedLambdaObject* namedLambdaTemplate_;
+
+  mutable mozilla::Maybe<SourceLocationIterator> srcLocIter_;
+
+  uint32_t icEntryIndex_;
+
+  uint32_t baseWarmUpThreshold_;
+
+  bool compileDebugInstrumentation_;
+  bool ionCompileable_;
+
+  bool compilingOffThread_ = false;
+
+  bool needsEnvAllocSite_ = false;
+
+  const SourceLocationIterator& sourceLocationIterAtCurrentPc() const;
+
+ public:
+  using FrameInfoT = CompilerFrameInfo;
+
+  BaselineCompilerHandler(MacroAssembler& masm, TempAllocator& alloc,
+                          BaselineSnapshot* snapshot);
+
+  [[nodiscard]] bool init();
+
+  CompilerFrameInfo& frame() { return frame_; }
+
+  jsbytecode* pc() const { return pc_; }
+  jsbytecode* maybePC() const { return pc_; }
+
+  void moveToNextPC() { pc_ += GetBytecodeLength(pc_); }
+
+  unsigned line() const;
+  JS::LimitedColumnNumberOneOrigin column() const;
+
+  Label* labelOf(jsbytecode* pc) { return &labels_[script_->pcToOffset(pc)]; }
+
+  bool isDefinitelyLastOp() const { return pc_ == script_->lastPC(); }
+
+  bool shouldEmitDebugEpilogueAtReturnOp() const {
+    return true;
+  }
+
+  JSScript* script() const { return script_; }
+  JSScript* maybeScript() const { return script_; }
+
+  size_t nargs() const {
+    MOZ_ASSERT(isFunction());
+    return nargs_;
+  }
+  CallObject* callObjectTemplate() const { return callObjectTemplate_; }
+  NamedLambdaObject* namedLambdaTemplate() const {
+    return namedLambdaTemplate_;
+  }
+
+  bool isFunction() const { return !!script_->function(); }
+
+  ModuleObject* module() const { return script_->module(); }
+
+  bool compileDebugInstrumentation() const {
+    return compileDebugInstrumentation_;
+  }
+
+  bool maybeIonCompileable() const { return ionCompileable_; }
+  void setIonCompileable(bool value) { ionCompileable_ = value; }
+
+  uint32_t icEntryIndex() const { return icEntryIndex_; }
+  void moveToNextICEntry() { icEntryIndex_++; }
+
+  BytecodeAnalysis& analysis() { return analysis_; }
+
+  RetAddrEntryVector& retAddrEntries() { return retAddrEntries_; }
+  OSREntryVector& osrEntries() { return osrEntries_; }
+
+  [[nodiscard]] bool recordCallRetAddr(RetAddrEntry::Kind kind,
+                                       uint32_t retOffset);
+
+  bool mustIncludeSlotsInStackCheck() const {
+    static constexpr size_t NumSlotsLimit = 128;
+    return script()->nslots() > NumSlotsLimit;
+  }
+
+  bool canHaveFixedSlots() const { return script()->nfixed() != 0; }
+
+  JSObject* maybeGlobalLexicalEnvironment() const {
+    return globalLexicalEnvironment_;
+  }
+  JSObject* globalThis() const { return globalThis_; }
+
+  uint32_t baseWarmUpThreshold() const { return baseWarmUpThreshold_; }
+
+  void maybeDisableIon();
+
+  [[nodiscard]] bool addAllocSiteIndex(uint32_t entryIndex) {
+    return allocSiteIndices_.append(entryIndex);
+  }
+  void createAllocSites();
+
+  bool compilingOffThread() const { return compilingOffThread_; }
+  void setCompilingOffThread() { compilingOffThread_ = true; }
+
+  bool addEnvAllocSite() {
+    needsEnvAllocSite_ = true;
+    return true;
+  }
+
+  bool realmIndependentJitcode() const {
+    return JS::Prefs::experimental_self_hosted_cache() &&
+           script()->selfHosted();
+  }
+
+  bool needsProfilerCallSiteInstrumentation() const { return true; }
+};
+
+using BaselineCompilerCodeGen = BaselineCodeGen<BaselineCompilerHandler>;
+
+class BaselineCompiler final : private BaselineCompilerCodeGen {
+  ResumeOffsetEntryVector resumeOffsetEntries_;
+
+  using DebugTrapEntryVector =
+      Vector<BaselineScript::DebugTrapEntry, 0, SystemAllocPolicy>;
+  DebugTrapEntryVector debugTrapEntries_;
+
+  CodeOffset profilerPushToggleOffset_;
+
+  BaselinePerfSpewer perfSpewer_;
+
+ public:
+  BaselineCompiler(TempAllocator& alloc, CompileRuntime* runtime,
+                   MacroAssembler& masm, BaselineSnapshot* snapshot);
+  [[nodiscard]] bool init();
+
+  static bool PrepareToCompile(JSContext* cx, Handle<JSScript*> script,
+                               bool compileDebugInstrumentation);
+
+  MethodStatus compile(JSContext* cx);
+  MethodStatus compileOffThread();
+
+  bool finishCompile(JSContext* cx);
+
+  bool compileDebugInstrumentation() const {
+    return handler.compileDebugInstrumentation();
+  }
+
+ private:
+  bool compileImpl();
+
+  bool emitBody();
+
+  [[nodiscard]] bool emitDebugTrap();
+};
+
+class BaselineInterpreterHandler {
+  InterpreterFrameInfo frame_;
+
+  NonAssertingLabel interpretOp_;
+
+  NonAssertingLabel interpretOpWithPCReg_;
+
+  using CodeOffsetVector = Vector<uint32_t, 0, SystemAllocPolicy>;
+  CodeOffsetVector debugInstrumentationOffsets_;
+
+  CodeOffsetVector codeCoverageOffsets_;
+  NonAssertingLabel codeCoverageAtPrologueLabel_;
+  NonAssertingLabel codeCoverageAtPCLabel_;
+
+  BaselineInterpreter::ICReturnOffsetVector icReturnOffsets_;
+
+  BaselineInterpreter::CallVMOffsets callVMOffsets_;
+
+  mozilla::Maybe<JSOp> currentOp_;
+
+ public:
+  using FrameInfoT = InterpreterFrameInfo;
+
+  explicit BaselineInterpreterHandler(MacroAssembler& masm);
+
+  InterpreterFrameInfo& frame() { return frame_; }
+
+  Label* interpretOpLabel() { return &interpretOp_; }
+  Label* interpretOpWithPCRegLabel() { return &interpretOpWithPCReg_; }
+
+  Label* codeCoverageAtPrologueLabel() { return &codeCoverageAtPrologueLabel_; }
+  Label* codeCoverageAtPCLabel() { return &codeCoverageAtPCLabel_; }
+
+  CodeOffsetVector& debugInstrumentationOffsets() {
+    return debugInstrumentationOffsets_;
+  }
+  CodeOffsetVector& codeCoverageOffsets() { return codeCoverageOffsets_; }
+
+  BaselineInterpreter::ICReturnOffsetVector& icReturnOffsets() {
+    return icReturnOffsets_;
+  }
+
+  void setCurrentOp(JSOp op) { currentOp_.emplace(op); }
+  void resetCurrentOp() { currentOp_.reset(); }
+  mozilla::Maybe<JSOp> currentOp() const { return currentOp_; }
+
+  jsbytecode* maybePC() const { return nullptr; }
+  bool isDefinitelyLastOp() const { return false; }
+  JSScript* maybeScript() const { return nullptr; }
+
+  bool shouldEmitDebugEpilogueAtReturnOp() const {
+    return false;
+  }
+
+  [[nodiscard]] bool addDebugInstrumentationOffset(CodeOffset offset);
+
+  const BaselineInterpreter::CallVMOffsets& callVMOffsets() const {
+    return callVMOffsets_;
+  }
+
+  [[nodiscard]] bool recordCallRetAddr(RetAddrEntry::Kind kind,
+                                       uint32_t retOffset);
+
+  bool maybeIonCompileable() const { return true; }
+
+  bool mustIncludeSlotsInStackCheck() const { return true; }
+
+  bool canHaveFixedSlots() const { return true; }
+  JSObject* maybeGlobalLexicalEnvironment() const { return nullptr; }
+
+  bool addEnvAllocSite() { return false; }  
+
+  bool realmIndependentJitcode() const { return true; }
+
+  bool needsProfilerCallSiteInstrumentation() const { return false; }
+};
+
+using BaselineInterpreterCodeGen = BaselineCodeGen<BaselineInterpreterHandler>;
+
+class BaselineInterpreterGenerator final : private BaselineInterpreterCodeGen {
+  Vector<uint32_t, 0, SystemAllocPolicy> debugTrapOffsets_;
+
+  Vector<CodeOffset, 0, SystemAllocPolicy> tableLabels_;
+
+  uint32_t tableOffset_ = 0;
+
+  uint32_t interpretOpOffset_ = 0;
+
+  uint32_t interpretOpNoDebugTrapOffset_ = 0;
+
+  uint32_t debugTrapHandlerOffset_ = 0;
+
+  BaselineInterpreterPerfSpewer perfSpewer_;
+
+ public:
+  explicit BaselineInterpreterGenerator(JSContext* cx, TempAllocator& alloc,
+                                        MacroAssembler& masm);
+
+  [[nodiscard]] bool generate(JSContext* cx, BaselineInterpreter& interpreter);
+
+ private:
+  [[nodiscard]] bool emitInterpreterLoop();
+  [[nodiscard]] bool emitDebugTrap();
+
+  void emitOutOfLineCodeCoverageInstrumentation();
+};
+
+}  
+}  
+
+#endif /* jit_BaselineCodeGen_h */

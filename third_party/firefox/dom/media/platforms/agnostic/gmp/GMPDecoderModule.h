@@ -1,0 +1,44 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(GMPDecoderModule_h_)
+#  define GMPDecoderModule_h_
+
+#  include "PlatformDecoderModule.h"
+#  include "mozilla/Maybe.h"
+
+#  define SHARED_GMP_DECODING_NODE_ID "gmp-shared-decoding"_ns
+
+namespace mozilla {
+
+class GMPDecoderModule : public PlatformDecoderModule {
+  const char* Name() const override { return "GMP"; }
+  template <typename T, typename... Args>
+  friend already_AddRefed<T> MakeAndAddRef(Args&&...);
+
+ public:
+  static already_AddRefed<PlatformDecoderModule> Create();
+
+  already_AddRefed<MediaDataDecoder> CreateVideoDecoder(
+      const CreateDecoderParams& aParams) override;
+
+  already_AddRefed<MediaDataDecoder> CreateAudioDecoder(
+      const CreateDecoderParams& aParams) override;
+
+  media::DecodeSupportSet SupportsMimeType(
+      const nsACString& aMimeType,
+      DecoderDoctorDiagnostics* aDiagnostics) const override;
+
+  static media::DecodeSupportSet SupportsMimeType(
+      const nsACString& aMimeType, const nsACString& aApi,
+      const Maybe<nsCString>& aKeySystem);
+
+ private:
+  GMPDecoderModule() = default;
+  virtual ~GMPDecoderModule() = default;
+};
+
+}  
+
+#endif  // GMPDecoderModule_h_

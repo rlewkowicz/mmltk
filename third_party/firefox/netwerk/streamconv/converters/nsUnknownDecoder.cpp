@@ -1,0 +1,762 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsUnknownDecoder.h"
+#include "nsIPipe.h"
+#include "nsIInputStream.h"
+#include "nsIOutputStream.h"
+#include "nsMimeTypes.h"
+
+#include "nsCRT.h"
+
+#include "nsIMIMEService.h"
+
+#include "nsIViewSourceChannel.h"
+#include "nsIHttpChannel.h"
+#include "nsIForcePendingChannel.h"
+#include "nsIEncodedChannel.h"
+#include "nsIURI.h"
+#include "nsStringStream.h"
+#include "nsNetCID.h"
+#include "nsNetUtil.h"
+#include "nsQueryObject.h"
+#include "nsComponentManagerUtils.h"
+#include "nsServiceManagerUtils.h"
+#include "mozilla/StaticPrefs_network.h"
+
+#include <algorithm>
+
+#define MAX_BUFFER_SIZE 512u
+
+using namespace mozilla;
+
+NS_IMPL_ISUPPORTS(nsUnknownDecoder::ConvertedStreamListener, nsIStreamListener,
+                  nsIRequestObserver)
+
+nsUnknownDecoder::ConvertedStreamListener::ConvertedStreamListener(
+    nsUnknownDecoder* aDecoder) {
+  mDecoder = aDecoder;
+}
+
+nsresult nsUnknownDecoder::ConvertedStreamListener::AppendDataToString(
+    nsIInputStream* inputStream, void* closure, const char* rawSegment,
+    uint32_t toOffset, uint32_t count, uint32_t* writeCount) {
+  nsCString* decodedData = static_cast<nsCString*>(closure);
+  decodedData->Append(rawSegment, count);
+  *writeCount = count;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsUnknownDecoder::ConvertedStreamListener::OnStartRequest(nsIRequest* request) {
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsUnknownDecoder::ConvertedStreamListener::OnDataAvailable(
+    nsIRequest* request, nsIInputStream* stream, uint64_t offset,
+    uint32_t count) {
+  uint32_t read;
+  nsAutoCString decodedData;
+  {
+    MutexAutoLock lock(mDecoder->mMutex);
+    decodedData = mDecoder->mDecodedData;
+  }
+  nsresult rv =
+      stream->ReadSegments(AppendDataToString, &decodedData, count, &read);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  MutexAutoLock lock(mDecoder->mMutex);
+  mDecoder->mDecodedData = decodedData;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsUnknownDecoder::ConvertedStreamListener::OnStopRequest(nsIRequest* request,
+                                                         nsresult status) {
+  return NS_OK;
+}
+
+nsUnknownDecoder::nsUnknownDecoder(nsIStreamListener* aListener)
+    : mNextListener(aListener),
+      mBuffer(nullptr),
+      mBufferLen(0),
+      mMutex("nsUnknownDecoder"),
+      mDecodedData("") {}
+
+nsUnknownDecoder::~nsUnknownDecoder() {
+  if (mBuffer) {
+    delete[] mBuffer;
+    mBuffer = nullptr;
+  }
+}
+
+
+NS_IMPL_ADDREF(nsUnknownDecoder)
+NS_IMPL_RELEASE(nsUnknownDecoder)
+
+NS_INTERFACE_MAP_BEGIN(nsUnknownDecoder)
+  NS_INTERFACE_MAP_ENTRY(nsIStreamConverter)
+  NS_INTERFACE_MAP_ENTRY(nsIStreamListener)
+  NS_INTERFACE_MAP_ENTRY(nsIRequestObserver)
+  NS_INTERFACE_MAP_ENTRY(nsIContentSniffer)
+  NS_INTERFACE_MAP_ENTRY(nsIThreadRetargetableStreamListener)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports,
+                                   nsIThreadRetargetableStreamListener)
+NS_INTERFACE_MAP_END
+
+
+NS_IMETHODIMP
+nsUnknownDecoder::Convert(nsIInputStream* aFromStream, const char* aFromType,
+                          const char* aToType, nsISupports* aCtxt,
+                          nsIInputStream** aResultStream) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+nsUnknownDecoder::AsyncConvertData(const char* aFromType, const char* aToType,
+                                   nsIStreamListener* aListener,
+                                   nsISupports* aCtxt) {
+  NS_ASSERTION(aListener && aFromType && aToType,
+               "null pointer passed into multi mixed converter");
+
+  MutexAutoLock lock(mMutex);
+  mNextListener = aListener;
+  return (aListener) ? NS_OK : NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+nsUnknownDecoder::GetConvertedType(const nsACString& aFromType,
+                                   nsIChannel* aChannel, nsACString& aToType) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+
+NS_IMETHODIMP
+nsUnknownDecoder::OnDataAvailable(nsIRequest* request, nsIInputStream* aStream,
+                                  uint64_t aSourceOffset, uint32_t aCount) {
+  nsresult rv = NS_OK;
+
+  bool contentTypeEmpty;
+  {
+    MutexAutoLock lock(mMutex);
+    if (!mNextListener) return NS_ERROR_FAILURE;
+
+    contentTypeEmpty = mContentType.IsEmpty();
+  }
+
+  if (contentTypeEmpty) {
+    uint32_t count, len;
+
+    if (!mBuffer) return NS_ERROR_OUT_OF_MEMORY;
+
+    if (aCount >= MAX_BUFFER_SIZE - mBufferLen) {
+      count = MAX_BUFFER_SIZE - mBufferLen;
+    } else {
+      count = aCount;
+    }
+
+    rv = aStream->Read((mBuffer + mBufferLen), count, &len);
+    if (NS_FAILED(rv)) return rv;
+
+    mBufferLen += len;
+    aCount -= len;
+
+    if (aCount) {
+      aSourceOffset += mBufferLen;
+
+      DetermineContentType(request);
+
+      rv = FireListenerNotifications(request, nullptr);
+    }
+  }
+
+  if (aCount && NS_SUCCEEDED(rv)) {
+#ifdef DEBUG
+    {
+      MutexAutoLock lock(mMutex);
+      NS_ASSERTION(!mContentType.IsEmpty(),
+                   "Content type should be known by now.");
+    }
+#endif
+
+    nsCOMPtr<nsIStreamListener> listener;
+    {
+      MutexAutoLock lock(mMutex);
+      listener = mNextListener;
+    }
+    rv = listener->OnDataAvailable(request, aStream, aSourceOffset, aCount);
+  }
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsUnknownDecoder::MaybeRetarget(nsIRequest* request) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+
+NS_IMETHODIMP
+nsUnknownDecoder::OnStartRequest(nsIRequest* request) {
+  nsresult rv = NS_OK;
+
+  {
+    MutexAutoLock lock(mMutex);
+    if (!mNextListener) return NS_ERROR_FAILURE;
+  }
+
+  if (NS_SUCCEEDED(rv) && !mBuffer) {
+    mBuffer = new char[MAX_BUFFER_SIZE];
+
+    if (!mBuffer) {
+      rv = NS_ERROR_OUT_OF_MEMORY;
+    }
+  }
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsUnknownDecoder::OnStopRequest(nsIRequest* request, nsresult aStatus) {
+  nsresult rv = NS_OK;
+
+  bool contentTypeEmpty;
+  {
+    MutexAutoLock lock(mMutex);
+    if (!mNextListener) return NS_ERROR_FAILURE;
+
+    contentTypeEmpty = mContentType.IsEmpty();
+  }
+
+  if (contentTypeEmpty) {
+    DetermineContentType(request);
+
+    nsCOMPtr<nsIForcePendingChannel> forcePendingChannel =
+        do_QueryInterface(request);
+    if (forcePendingChannel) {
+      forcePendingChannel->ForcePending(true);
+    }
+
+    rv = FireListenerNotifications(request, nullptr);
+
+    if (NS_FAILED(rv)) {
+      aStatus = rv;
+    }
+
+    if (forcePendingChannel) {
+      forcePendingChannel->ForcePending(false);
+    }
+  }
+
+  nsCOMPtr<nsIStreamListener> listener;
+  {
+    MutexAutoLock lock(mMutex);
+    listener = mNextListener;
+    mNextListener = nullptr;
+  }
+  rv = listener->OnStopRequest(request, aStatus);
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsUnknownDecoder::GetMIMETypeFromContent(nsIRequest* aRequest,
+                                         const uint8_t* aData, uint32_t aLength,
+                                         nsACString& type) {
+  nsCOMPtr<nsIChannel> channel(do_QueryInterface(aRequest));
+  if (channel) {
+    nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+    if (loadInfo->GetSkipContentSniffing()) {
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+  }
+
+  mBuffer = const_cast<char*>(reinterpret_cast<const char*>(aData));
+  mBufferLen = aLength;
+  DetermineContentType(aRequest);
+  mBuffer = nullptr;
+  mBufferLen = 0;
+  {
+    MutexAutoLock lock(mMutex);
+    type.Assign(mContentType);
+    mContentType.Truncate();
+  }
+  return type.IsEmpty() ? NS_ERROR_NOT_AVAILABLE : NS_OK;
+}
+
+
+nsUnknownDecoder::nsSnifferEntry nsUnknownDecoder::sSnifferEntries[] = {
+    SNIFFER_ENTRY("%PDF-", APPLICATION_PDF),
+
+    SNIFFER_ENTRY("%!PS-Adobe-", APPLICATION_POSTSCRIPT),
+
+    SNIFFER_ENTRY("From", TEXT_PLAIN), SNIFFER_ENTRY(">From", TEXT_PLAIN),
+
+    SNIFFER_ENTRY_WITH_FUNC("#!", &nsUnknownDecoder::SniffBinary),
+
+    SNIFFER_ENTRY_WITH_FUNC("<?xml", &nsUnknownDecoder::SniffForXML)};
+
+uint32_t nsUnknownDecoder::sSnifferEntryNum =
+    sizeof(nsUnknownDecoder::sSnifferEntries) /
+    sizeof(nsUnknownDecoder::nsSnifferEntry);
+
+void nsUnknownDecoder::DetermineContentType(nsIRequest* aRequest) {
+  {
+    MutexAutoLock lock(mMutex);
+    NS_ASSERTION(mContentType.IsEmpty(), "Content type is already known.");
+    if (!mContentType.IsEmpty()) return;
+  }
+
+  nsCOMPtr<nsIChannel> channel(do_QueryInterface(aRequest));
+  nsCOMPtr<nsIHttpChannel> httpChannel(do_QueryInterface(aRequest));
+  if (channel) {
+    nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+    if (loadInfo->GetSkipContentSniffing()) {
+      SniffBinary(aRequest);
+
+      if (httpChannel) {
+        nsAutoCString type;
+        httpChannel->GetContentType(type);
+        nsCOMPtr<nsIURI> requestUri;
+        httpChannel->GetURI(getter_AddRefs(requestUri));
+        nsAutoCString spec;
+        requestUri->GetSpec(spec);
+        if (spec.Length() > 50) {
+          spec.Truncate(50);
+          spec.AppendLiteral("...");
+        }
+        httpChannel->LogMimeTypeMismatch(
+            "XTCOWithMIMEValueMissing"_ns, false, NS_ConvertUTF8toUTF16(spec),
+            NS_ConvertUTF8toUTF16(type));
+      }
+      return;
+    }
+  }
+
+  const char* testData = mBuffer;
+  uint32_t testDataLen = mBufferLen;
+  nsAutoCString decodedData;
+
+  if (channel) {
+    nsresult rv = ConvertEncodedData(aRequest, mBuffer, mBufferLen);
+    if (NS_SUCCEEDED(rv)) {
+      MutexAutoLock lock(mMutex);
+      decodedData = mDecodedData;
+    }
+    if (!decodedData.IsEmpty()) {
+      testData = decodedData.get();
+      testDataLen = std::min<uint32_t>(decodedData.Length(), MAX_BUFFER_SIZE);
+    }
+  }
+
+  if (httpChannel) {
+    nsAutoCString contentType;
+    httpChannel->GetContentType(contentType);
+    if (contentType.EqualsLiteral("text/plain")) {
+      SniffBinary(aRequest);
+      return;
+    }
+  }
+
+  uint32_t i;
+  for (i = 0; i < sSnifferEntryNum; ++i) {
+    if (testDataLen >= sSnifferEntries[i].mByteLen &&  
+        memcmp(testData, sSnifferEntries[i].mBytes,
+               sSnifferEntries[i].mByteLen) == 0) {  
+      NS_ASSERTION(
+          sSnifferEntries[i].mMimeType ||
+              sSnifferEntries[i].mContentTypeSniffer,
+          "Must have either a type string or a function to set the type");
+      NS_ASSERTION(!sSnifferEntries[i].mMimeType ||
+                       !sSnifferEntries[i].mContentTypeSniffer,
+                   "Both a type string and a type sniffing function set;"
+                   " using type string");
+      if (sSnifferEntries[i].mMimeType) {
+        MutexAutoLock lock(mMutex);
+        mContentType = sSnifferEntries[i].mMimeType;
+        NS_ASSERTION(!mContentType.IsEmpty(),
+                     "Content type should be known by now.");
+        return;
+      }
+      if ((this->*(sSnifferEntries[i].mContentTypeSniffer))(aRequest)) {
+#ifdef DEBUG
+        MutexAutoLock lock(mMutex);
+        NS_ASSERTION(!mContentType.IsEmpty(),
+                     "Content type should be known by now.");
+#endif
+        return;
+      }
+    }
+  }
+
+  nsAutoCString sniffedType;
+  NS_SniffContent(NS_DATA_SNIFFER_CATEGORY, aRequest, (const uint8_t*)testData,
+                  testDataLen, sniffedType);
+  {
+    MutexAutoLock lock(mMutex);
+    mContentType = sniffedType;
+    if (!mContentType.IsEmpty()) {
+      return;
+    }
+  }
+
+  if (SniffForHTML(aRequest)) {
+#ifdef DEBUG
+    MutexAutoLock lock(mMutex);
+    NS_ASSERTION(!mContentType.IsEmpty(),
+                 "Content type should be known by now.");
+#endif
+    return;
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  NS_GetFinalChannelURI(channel, getter_AddRefs(uri));
+
+  if ((StaticPrefs::network_sniff_use_extension() ||
+       (uri && uri->SchemeIs("file"))) &&
+      SniffURI(aRequest)) {
+#ifdef DEBUG
+    MutexAutoLock lock(mMutex);
+    NS_ASSERTION(!mContentType.IsEmpty(),
+                 "Content type should be known by now.");
+#endif
+    return;
+  }
+
+  SniffBinary(aRequest);
+#ifdef DEBUG
+  MutexAutoLock lock(mMutex);
+  NS_ASSERTION(!mContentType.IsEmpty(), "Content type should be known by now.");
+#endif
+}
+
+bool nsUnknownDecoder::SniffForHTML(nsIRequest* aRequest) {
+  MutexAutoLock lock(mMutex);
+
+  const char* str;
+  const char* end;
+  if (mDecodedData.IsEmpty()) {
+    str = mBuffer;
+    end = mBuffer + mBufferLen;
+  } else {
+    str = mDecodedData.get();
+    end = mDecodedData.get() +
+          std::min<uint32_t>(mDecodedData.Length(), MAX_BUFFER_SIZE);
+  }
+
+  while (str != end && nsCRT::IsAsciiSpace(*str)) {
+    ++str;
+  }
+
+  if (str == end || *str != '<' || ++str == end) {
+    return false;
+  }
+
+  uint32_t bufSize = end - str;
+  nsDependentCSubstring substr(str, bufSize);
+
+  if (StringBeginsWith(substr, "?xml"_ns)) {
+    mContentType = TEXT_XML;
+    return true;
+  }
+
+#define MATCHES_TAG(_tagstr)                               \
+  (substr.Length() >= sizeof(_tagstr) &&                   \
+   StringBeginsWith(substr, _tagstr##_ns,                  \
+                    nsCaseInsensitiveCStringComparator) && \
+   (substr[sizeof(_tagstr) - 1] == ' ' || substr[sizeof(_tagstr) - 1] == '>'))
+
+  if (MATCHES_TAG("!DOCTYPE HTML") || MATCHES_TAG("html") ||
+      MATCHES_TAG("head") || MATCHES_TAG("script") || MATCHES_TAG("iframe") ||
+      MATCHES_TAG("h1") || MATCHES_TAG("div") || MATCHES_TAG("font") ||
+      MATCHES_TAG("table") || MATCHES_TAG("a") || MATCHES_TAG("style") ||
+      MATCHES_TAG("title") || MATCHES_TAG("b") || MATCHES_TAG("body") ||
+      MATCHES_TAG("br") || MATCHES_TAG("p") || MATCHES_TAG("!--")) {
+    mContentType = TEXT_HTML;
+    return true;
+  }
+
+  if (StaticPrefs::network_mimesniff_non_standard_html_comment() &&
+      StringBeginsWith(substr, "!--"_ns)) {
+    mContentType = TEXT_HTML;
+    return true;
+  }
+
+  if (StaticPrefs::network_mimesniff_extra_moz_html_tags()) {
+    if (MATCHES_TAG("frameset") || MATCHES_TAG("img") || MATCHES_TAG("link") ||
+        MATCHES_TAG("base") || MATCHES_TAG("applet") || MATCHES_TAG("meta") ||
+        MATCHES_TAG("center") || MATCHES_TAG("form") ||
+        MATCHES_TAG("isindex") || MATCHES_TAG("h2") || MATCHES_TAG("h3") ||
+        MATCHES_TAG("h4") || MATCHES_TAG("h5") || MATCHES_TAG("h6") ||
+        MATCHES_TAG("pre")) {
+      mContentType = TEXT_HTML;
+      return true;
+    }
+  }
+
+#undef MATCHES_TAG
+
+  return false;
+}
+
+bool nsUnknownDecoder::SniffForXML(nsIRequest* aRequest) {
+  if (!StaticPrefs::network_sniff_use_extension() || !SniffURI(aRequest)) {
+    MutexAutoLock lock(mMutex);
+    mContentType = TEXT_XML;
+  }
+
+  return true;
+}
+
+bool nsUnknownDecoder::SniffURI(nsIRequest* aRequest) {
+  nsCOMPtr<nsIChannel> channel(do_QueryInterface(aRequest));
+  nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+  if (loadInfo->GetSkipContentSniffing()) {
+    return false;
+  }
+  nsCOMPtr<nsIMIMEService> mimeService(do_GetService("@mozilla.org/mime;1"));
+  if (mimeService) {
+    nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest);
+    if (channel) {
+      nsCOMPtr<nsIURI> uri;
+      nsresult result = channel->GetURI(getter_AddRefs(uri));
+      if (NS_SUCCEEDED(result) && uri) {
+        nsAutoCString type;
+        result = mimeService->GetTypeFromURI(uri, type);
+        if (NS_SUCCEEDED(result)) {
+          MutexAutoLock lock(mMutex);
+          mContentType = type;
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+#define IS_TEXT_CHAR(ch) \
+  (((unsigned char)(ch)) > 31 || (9 <= (ch) && (ch) <= 13) || (ch) == 27)
+
+bool nsUnknownDecoder::SniffBinary(nsIRequest* aRequest) {
+
+  MutexAutoLock lock(mMutex);
+
+  const char* testData;
+  uint32_t testDataLen;
+  if (mDecodedData.IsEmpty()) {
+    testData = mBuffer;
+    testDataLen = std::min<uint32_t>(mBufferLen, MAX_BUFFER_SIZE);
+  } else {
+    testData = mDecodedData.get();
+    testDataLen = std::min<uint32_t>(mDecodedData.Length(), MAX_BUFFER_SIZE);
+  }
+
+  if (testDataLen >= 4) {
+    const unsigned char* buf = (const unsigned char*)testData;
+    if ((buf[0] == 0xFE && buf[1] == 0xFF) ||  
+        (buf[0] == 0xFF && buf[1] == 0xFE) ||  
+        (buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF) ||  
+        (buf[0] == 0 && buf[1] == 0 && buf[2] == 0xFE &&
+         buf[3] == 0xFF)) {  
+
+      mContentType = TEXT_PLAIN;
+      return true;
+    }
+  }
+
+  uint32_t i;
+  for (i = 0; i < testDataLen && IS_TEXT_CHAR(testData[i]); i++) {
+  }
+
+  if (i == testDataLen) {
+    mContentType = TEXT_PLAIN;
+  } else {
+    mContentType = APPLICATION_OCTET_STREAM;
+  }
+
+  return true;
+}
+
+nsresult nsUnknownDecoder::FireListenerNotifications(nsIRequest* request,
+                                                     nsISupports* aCtxt) {
+  nsresult rv = NS_OK;
+
+  nsCOMPtr<nsIStreamListener> listener;
+  nsAutoCString contentType;
+  {
+    MutexAutoLock lock(mMutex);
+    if (!mNextListener) return NS_ERROR_FAILURE;
+
+    listener = mNextListener;
+    contentType = mContentType;
+  }
+
+  if (!contentType.IsEmpty()) {
+    nsCOMPtr<nsIViewSourceChannel> viewSourceChannel =
+        do_QueryInterface(request);
+    if (viewSourceChannel) {
+      rv = viewSourceChannel->SetOriginalContentType(contentType);
+    } else {
+      nsCOMPtr<nsIChannel> channel = do_QueryInterface(request, &rv);
+      if (NS_SUCCEEDED(rv)) {
+        rv = channel->SetContentType(contentType);
+      }
+    }
+
+    NS_ASSERTION(NS_SUCCEEDED(rv), "Unable to set content type on channel!");
+
+    if (NS_FAILED(rv)) {
+      request->Cancel(rv);
+      listener->OnStartRequest(request);
+      return rv;
+    }
+  }
+
+  rv = listener->OnStartRequest(request);
+
+  if (NS_SUCCEEDED(rv)) {
+    nsCOMPtr<nsIEncodedChannel> encodedChannel = do_QueryInterface(request);
+    if (encodedChannel) {
+      nsCOMPtr<nsIStreamListener> listenerNew;
+      rv = encodedChannel->DoApplyContentConversions(
+          listener, getter_AddRefs(listenerNew), aCtxt);
+      if (NS_SUCCEEDED(rv) && listenerNew) {
+        MutexAutoLock lock(mMutex);
+        mNextListener = listenerNew;
+        listener = listenerNew;
+      }
+    }
+  }
+
+  if (!mBuffer) return NS_ERROR_OUT_OF_MEMORY;
+
+  if (NS_SUCCEEDED(rv)) request->GetStatus(&rv);
+
+  if (NS_SUCCEEDED(rv) && (mBufferLen > 0)) {
+    uint32_t len = 0;
+    nsCOMPtr<nsIInputStream> in;
+    nsCOMPtr<nsIOutputStream> out;
+
+    NS_NewPipe(getter_AddRefs(in), getter_AddRefs(out), MAX_BUFFER_SIZE,
+               MAX_BUFFER_SIZE);
+
+    rv = out->Write(mBuffer, mBufferLen, &len);
+    if (NS_SUCCEEDED(rv)) {
+      if (len == mBufferLen) {
+        rv = listener->OnDataAvailable(request, in, 0, len);
+      } else {
+        NS_ERROR("Unable to write all the data into the pipe.");
+        rv = NS_ERROR_FAILURE;
+      }
+    }
+  }
+
+  delete[] mBuffer;
+  mBuffer = nullptr;
+  mBufferLen = 0;
+
+  return rv;
+}
+
+nsresult nsUnknownDecoder::ConvertEncodedData(nsIRequest* request,
+                                              const char* data,
+                                              uint32_t length) {
+  nsresult rv = NS_OK;
+
+  {
+    MutexAutoLock lock(mMutex);
+    mDecodedData = "";
+  }
+  nsCOMPtr<nsIEncodedChannel> encodedChannel(do_QueryInterface(request));
+  if (encodedChannel) {
+    RefPtr<ConvertedStreamListener> strListener =
+        new ConvertedStreamListener(this);
+
+    nsCOMPtr<nsIStreamListener> listener;
+    rv = encodedChannel->DoApplyContentConversions(
+        strListener, getter_AddRefs(listener), nullptr);
+
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+
+    if (listener) {
+      listener->OnStartRequest(request);
+
+      if (length) {
+        nsCOMPtr<nsIStringInputStream> rawStream =
+            do_CreateInstance(NS_STRINGINPUTSTREAM_CONTRACTID);
+        if (!rawStream) return NS_ERROR_FAILURE;
+
+        rv = rawStream->CopyData((const char*)data, length);
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        rv = listener->OnDataAvailable(request, rawStream, 0, length);
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+      listener->OnStopRequest(request, NS_OK);
+    }
+  }
+  return rv;
+}
+
+NS_IMETHODIMP
+nsUnknownDecoder::CheckListenerChain() { return NS_ERROR_NO_INTERFACE; }
+
+NS_IMETHODIMP
+nsUnknownDecoder::OnDataFinished(nsresult aStatus) {
+  nsCOMPtr<nsIThreadRetargetableStreamListener> listener;
+  {
+    MutexAutoLock lock(mMutex);
+    listener = do_QueryInterface(mNextListener);
+  }
+  if (listener) {
+    return listener->OnDataFinished(aStatus);
+  }
+
+  return NS_OK;
+}
+
+void nsBinaryDetector::DetermineContentType(nsIRequest* aRequest) {
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(aRequest);
+  if (!httpChannel) {
+    return;
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo = httpChannel->LoadInfo();
+  if (loadInfo->GetSkipContentSniffing()) {
+    SniffBinary(aRequest);
+    return;
+  }
+  nsAutoCString contentTypeHdr;
+  (void)httpChannel->GetResponseHeader("Content-Type"_ns, contentTypeHdr);
+  nsAutoCString contentType;
+  httpChannel->GetContentType(contentType);
+
+  if (!contentType.EqualsLiteral("text/plain") ||
+      (!contentTypeHdr.EqualsLiteral("text/plain") &&
+       !contentTypeHdr.EqualsLiteral("text/plain; charset=ISO-8859-1") &&
+       !contentTypeHdr.EqualsLiteral("text/plain; charset=iso-8859-1") &&
+       !contentTypeHdr.EqualsLiteral("text/plain; charset=UTF-8"))) {
+    return;
+  }
+
+  nsAutoCString contentEncoding;
+  (void)httpChannel->GetResponseHeader("Content-Encoding"_ns, contentEncoding);
+  if (!contentEncoding.IsEmpty()) {
+    return;
+  }
+
+  SniffBinary(aRequest);
+  MutexAutoLock lock(mMutex);
+  if (mContentType.EqualsLiteral(APPLICATION_OCTET_STREAM)) {
+    mContentType = APPLICATION_GUESS_FROM_EXT;
+  } else {
+    mContentType.Truncate();
+  }
+}

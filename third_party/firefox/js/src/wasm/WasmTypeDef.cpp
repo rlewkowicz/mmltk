@@ -1,0 +1,517 @@
+/*
+ * Copyright 2015 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "wasm/WasmTypeDef.h"
+
+#include "jit/JitOptions.h"
+#include "js/friend/ErrorMessages.h"  // JSMSG_*
+#include "js/HashTable.h"
+#include "js/Printf.h"
+#include "js/Value.h"
+#include "threading/ExclusiveData.h"
+#include "vm/Runtime.h"
+#include "vm/StringType.h"
+#include "wasm/WasmCodegenConstants.h"
+#include "wasm/WasmGcObject.h"
+#include "wasm/WasmJS.h"
+
+#include "gc/ObjectKind-inl.h"
+
+using namespace js;
+using namespace js::jit;
+using namespace js::wasm;
+
+using mozilla::CheckedInt32;
+using mozilla::CheckedUint32;
+using mozilla::MallocSizeOf;
+
+
+
+using ImmediateType = uint32_t;
+static const unsigned sTotalBits = sizeof(ImmediateType) * 8;
+static const unsigned sTagBits = 1;
+static const unsigned sNumResultsBits = 1;
+static const unsigned sNumArgsBits = 3;
+static const unsigned sValTypeBits = 3;
+static const unsigned sMaxValTypes = 8;
+
+static_assert(((1 << sNumResultsBits) - 1) + ((1 << sNumArgsBits) - 1) ==
+                  sMaxValTypes,
+              "sNumResultsBits, sNumArgsBits, sMaxValTypes are consistent");
+
+static_assert(sTagBits + sNumResultsBits + sNumArgsBits +
+                      sValTypeBits * sMaxValTypes <=
+                  sTotalBits,
+              "have room");
+
+static bool IsImmediateValType(ValType vt) {
+  switch (vt.kind()) {
+    case ValType::I32:
+    case ValType::I64:
+    case ValType::F32:
+    case ValType::F64:
+    case ValType::V128:
+      return true;
+    case ValType::Ref:
+      if (!vt.isNullable()) {
+        return false;
+      }
+      switch (vt.refType().kind()) {
+        case RefType::Func:
+        case RefType::Extern:
+        case RefType::Any:
+          return true;
+        default:
+          return false;
+      }
+    default:
+      return false;
+  }
+}
+
+static unsigned EncodeImmediateValType(ValType vt) {
+  static_assert(7 < (1 << sValTypeBits), "enough space for ValType kind");
+
+  switch (vt.kind()) {
+    case ValType::I32:
+      return 0;
+    case ValType::I64:
+      return 1;
+    case ValType::F32:
+      return 2;
+    case ValType::F64:
+      return 3;
+    case ValType::V128:
+      return 4;
+    case ValType::Ref:
+      MOZ_ASSERT(vt.isNullable());
+      switch (vt.refType().kind()) {
+        case RefType::Func:
+          return 5;
+        case RefType::Extern:
+          return 6;
+        case RefType::Any:
+          return 7;
+        default:
+          MOZ_CRASH("bad RefType");
+      }
+    default:
+      MOZ_CRASH("bad ValType");
+  }
+}
+
+static bool IsImmediateFuncType(const FuncType& funcType) {
+  const ValTypeVector& results = funcType.results();
+  const ValTypeVector& args = funcType.args();
+
+  if (results.length() > ((1 << sNumResultsBits) - 1) ||
+      args.length() > ((1 << sNumArgsBits) - 1)) {
+    return false;
+  }
+
+  for (ValType v : results) {
+    if (!IsImmediateValType(v)) {
+      return false;
+    }
+  }
+
+  for (ValType v : args) {
+    if (!IsImmediateValType(v)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static ImmediateType EncodeNumResults(uint32_t numResults) {
+  MOZ_ASSERT(numResults <= (1 << sNumResultsBits) - 1);
+  return numResults;
+}
+
+static ImmediateType EncodeNumArgs(uint32_t numArgs) {
+  MOZ_ASSERT(numArgs <= (1 << sNumArgsBits) - 1);
+  return numArgs;
+}
+
+static ImmediateType EncodeImmediateFuncType(const FuncType& funcType) {
+  ImmediateType immediate = FuncType::ImmediateBit;
+  uint32_t shift = sTagBits;
+
+  immediate |= EncodeNumResults(funcType.results().length()) << shift;
+  shift += sNumResultsBits;
+
+  for (ValType resultType : funcType.results()) {
+    immediate |= EncodeImmediateValType(resultType) << shift;
+    shift += sValTypeBits;
+  }
+
+  immediate |= EncodeNumArgs(funcType.args().length()) << shift;
+  shift += sNumArgsBits;
+
+  for (ValType argType : funcType.args()) {
+    immediate |= EncodeImmediateValType(argType) << shift;
+    shift += sValTypeBits;
+  }
+
+  MOZ_ASSERT(shift <= sTotalBits);
+  return immediate;
+}
+
+
+void FuncType::initImmediateTypeId(bool isFinal, const TypeDef* superTypeDef,
+                                   uint32_t recGroupLength) {
+  if (!isFinal || superTypeDef || recGroupLength != 1) {
+    immediateTypeId_ = NO_IMMEDIATE_TYPE_ID;
+    return;
+  }
+
+  if (!IsImmediateFuncType(*this)) {
+    immediateTypeId_ = NO_IMMEDIATE_TYPE_ID;
+    return;
+  }
+  immediateTypeId_ = EncodeImmediateFuncType(*this);
+}
+
+bool FuncType::canHaveJitEntry() const {
+  return !hasUnexposableArgOrRet() &&
+         !temporarilyUnsupportedReftypeForEntry() &&
+         !temporarilyUnsupportedResultCountForJitEntry() &&
+         JitOptions.enableWasmJitEntry;
+}
+
+bool FuncType::canHaveJitExit() const {
+  return !hasUnexposableArgOrRet() && !temporarilyUnsupportedReftypeForExit() &&
+         !hasInt64Arg() && !temporarilyUnsupportedResultCountForJitExit() &&
+         JitOptions.enableWasmJitExit;
+}
+
+size_t FuncType::sizeOfExcludingThis(MallocSizeOf mallocSizeOf) const {
+  return args_.sizeOfExcludingThis(mallocSizeOf);
+}
+
+UniqueChars wasm::ToString(const FuncType& type, const TypeContext* types) {
+  UniqueChars str = JS_smprintf("(func");
+  if (!str) {
+    return nullptr;
+  }
+
+  if (!type.args().empty()) {
+    str = JS_sprintf_append(std::move(str), " (param");
+    if (!str) {
+      return nullptr;
+    }
+    for (ValType arg : type.args()) {
+      UniqueChars argStr = ToString(arg, types);
+      if (!argStr) {
+        return nullptr;
+      }
+      str = JS_sprintf_append(std::move(str), " %s", argStr.get());
+      if (!str) {
+        return nullptr;
+      }
+    }
+    str = JS_sprintf_append(std::move(str), ")");
+    if (!str) {
+      return nullptr;
+    }
+  }
+
+  if (!type.results().empty()) {
+    str = JS_sprintf_append(std::move(str), " (result");
+    if (!str) {
+      return nullptr;
+    }
+    for (ValType result : type.results()) {
+      UniqueChars resultStr = ToString(result, types);
+      if (!resultStr) {
+        return nullptr;
+      }
+      str = JS_sprintf_append(std::move(str), " %s", resultStr.get());
+      if (!str) {
+        return nullptr;
+      }
+    }
+    str = JS_sprintf_append(std::move(str), ")");
+    if (!str) {
+      return nullptr;
+    }
+  }
+
+  return JS_sprintf_append(std::move(str), ")");
+}
+
+
+bool StructType::init() {
+  isDefaultable_ = true;
+
+  static_assert((sizeof(WasmStructObject) % sizeof(uintptr_t)) == 0);
+
+  MOZ_ASSERT(fieldAccessPaths_.empty() && outlineTraceOffsets_.empty() &&
+             inlineTraceOffsets_.empty());
+  if (!fieldAccessPaths_.reserve(fields_.length())) {
+    return false;
+  }
+
+  static_assert(WasmStructObject_Size_ASSUMED <
+                (1 << (8 * sizeof(StructType::payloadOffsetIL_))));
+  payloadOffsetIL_ = WasmStructObject_Size_ASSUMED;
+
+  StructLayout layout;
+  if (!layout.init(payloadOffsetIL_, WasmStructObject_MaxInlineBytes_ASSUMED)) {
+    return false;
+  }
+
+  for (FieldType& field : fields_) {
+    FieldAccessPath path;
+    if (!layout.addField(field.type.size(), &path)) {
+      return false;
+    }
+
+    fieldAccessPaths_.infallibleAppend(path);
+
+    if (!field.type.isDefaultable()) {
+      isDefaultable_ = false;
+    }
+
+    if (field.type.isRefRepr()) {
+      if (path.hasOOL()) {
+        if (!outlineTraceOffsets_.append(path.oolOffset())) {
+          return false;
+        }
+      } else {
+        if (!inlineTraceOffsets_.append(path.ilOffset())) {
+          return false;
+        }
+      }
+    }
+  }
+
+  if (layout.hasOOL()) {
+    totalSizeOOL_ = layout.totalSizeOOL();
+    MOZ_ASSERT(totalSizeOOL_ > 0);
+    if (totalSizeOOL_ < sizeof(uintptr_t)) {
+      totalSizeOOL_ = sizeof(uintptr_t);
+    }
+    FieldAccessPath oolPointerPath = layout.oolPointerPath();
+    MOZ_ASSERT(!oolPointerPath.hasOOL());
+    oolPointerOffset_ = oolPointerPath.ilOffset();
+  } else {
+    totalSizeOOL_ = 0;
+    oolPointerOffset_ = StructType::InvalidOffset;
+  }
+
+  totalSizeIL_ = layout.totalSizeIL();
+  allocKind_ = gc::GetGCObjectKindForBytes(totalSizeIL_);
+
+  return true;
+}
+
+bool StructType::createImmutable(const ValTypeVector& types,
+                                 StructType* struct_) {
+  FieldTypeVector fields;
+  if (!fields.resize(types.length())) {
+    return false;
+  }
+  for (size_t i = 0; i < types.length(); i++) {
+    fields[i].type = StorageType(types[i].packed());
+    fields[i].isMutable = false;
+  }
+  *struct_ = StructType(std::move(fields));
+  return struct_->init();
+}
+
+size_t StructType::sizeOfExcludingThis(MallocSizeOf mallocSizeOf) const {
+  return fields_.sizeOfExcludingThis(mallocSizeOf);
+}
+
+size_t ArrayType::sizeOfExcludingThis(MallocSizeOf mallocSizeOf) const {
+  return 0;
+}
+
+#ifdef ENABLE_WASM_JSPI
+const FuncType& ContType::funcType() const { return funcTypeDef_->funcType(); }
+
+size_t ContType::sizeOfExcludingThis(MallocSizeOf mallocSizeOf) const {
+  return 0;
+}
+#endif  // ENABLE_WASM_JSPI
+
+size_t TypeDef::sizeOfExcludingThis(MallocSizeOf mallocSizeOf) const {
+  switch (kind_) {
+    case TypeDefKind::Struct: {
+      return structType_.sizeOfExcludingThis(mallocSizeOf);
+    }
+    case TypeDefKind::Func: {
+      return funcType_.sizeOfExcludingThis(mallocSizeOf);
+    }
+    case TypeDefKind::Array: {
+      return arrayType_.sizeOfExcludingThis(mallocSizeOf);
+    }
+#ifdef ENABLE_WASM_JSPI
+    case TypeDefKind::Cont: {
+      return contType_.sizeOfExcludingThis(mallocSizeOf);
+    }
+#endif
+    case TypeDefKind::None: {
+      return 0;
+    }
+    default:
+      break;
+  }
+  MOZ_ASSERT_UNREACHABLE();
+  return 0;
+}
+
+
+size_t SuperTypeVector::offsetOfSTVInVector(uint32_t subTypingDepth) {
+  return offsetof(SuperTypeVector, types_) + sizeof(void*) * subTypingDepth;
+}
+
+size_t SuperTypeVector::lengthForTypeDef(const TypeDef& typeDef) {
+  return std::max(uint32_t(typeDef.subTypingDepth()) + 1,
+                  MinSuperTypeVectorLength);
+}
+
+size_t SuperTypeVector::byteSizeForTypeDef(const TypeDef& typeDef) {
+  static_assert(
+      sizeof(SuperTypeVector) + sizeof(void*) * (MaxSubTypingDepth + 1) <=
+          UINT16_MAX,
+      "cannot overflow");
+  return sizeof(SuperTypeVector) + (sizeof(void*) * lengthForTypeDef(typeDef));
+}
+
+const SuperTypeVector* SuperTypeVector::createMultipleForRecGroup(
+    RecGroup* recGroup) {
+  CheckedUint32 totalBytes = 0;
+  for (uint32_t typeIndex = 0; typeIndex < recGroup->numTypes(); typeIndex++) {
+    totalBytes +=
+        SuperTypeVector::byteSizeForTypeDef(recGroup->type(typeIndex));
+  }
+  if (!totalBytes.isValid()) {
+    return nullptr;
+  }
+
+  SuperTypeVector* firstVector =
+      (SuperTypeVector*)js_malloc(totalBytes.value());
+  if (!firstVector) {
+    return nullptr;
+  }
+
+  SuperTypeVector* currentVector = firstVector;
+  for (uint32_t typeIndex = 0; typeIndex < recGroup->numTypes(); typeIndex++) {
+    TypeDef& typeDef = recGroup->type(typeIndex);
+
+    size_t vectorByteSize = SuperTypeVector::byteSizeForTypeDef(typeDef);
+
+    typeDef.setSuperTypeVector(currentVector);
+    currentVector->typeDef_ = &typeDef;
+    currentVector->subTypingDepth_ = typeDef.subTypingDepth();
+
+    currentVector->length_ = SuperTypeVector::lengthForTypeDef(typeDef);
+
+    const TypeDef* currentTypeDef = &typeDef;
+    for (uint32_t index = 0; index < currentVector->length(); index++) {
+      uint32_t reverseIndex = currentVector->length() - index - 1;
+
+      if (reverseIndex > typeDef.subTypingDepth()) {
+        currentVector->types_[reverseIndex] = nullptr;
+        continue;
+      }
+
+      MOZ_ASSERT(reverseIndex == currentTypeDef->subTypingDepth());
+
+      currentVector->types_[reverseIndex] = currentTypeDef->superTypeVector();
+      currentTypeDef = currentTypeDef->superTypeDef();
+    }
+
+    MOZ_ASSERT(currentTypeDef == nullptr);
+
+    currentVector =
+        (SuperTypeVector*)(((const char*)currentVector) + vectorByteSize);
+  }
+
+  return firstVector;
+}
+
+
+struct RecGroupHashPolicy {
+  using Lookup = const SharedRecGroup&;
+
+  static HashNumber hash(Lookup lookup) { return lookup->hash(); }
+
+  static bool match(const SharedRecGroup& lhs, Lookup rhs) {
+    return RecGroup::isoEquals(*rhs, *lhs);
+  }
+};
+
+class TypeIdSet {
+  using Set = HashSet<SharedRecGroup, RecGroupHashPolicy, SystemAllocPolicy>;
+  Set set_;
+
+ public:
+  SharedRecGroup insert(SharedRecGroup recGroup) {
+    Set::AddPtr p = set_.lookupForAdd(recGroup);
+    if (p) {
+      return *p;
+    }
+
+    if (!set_.add(p, recGroup)) {
+      return nullptr;
+    }
+    return recGroup;
+  }
+
+  void purge() {
+    for (auto iter = set_.modIter(); !iter.done(); iter.next()) {
+      if (iter.get()->hasOneRef()) {
+        iter.remove();
+      }
+    }
+  }
+
+  void clearRecGroup(SharedRecGroup* recGroupCell) {
+    if (Set::Ptr p = set_.lookup(*recGroupCell)) {
+      *recGroupCell = nullptr;
+      if ((*p)->hasOneRef()) {
+        set_.remove(p);
+      }
+    } else {
+      *recGroupCell = nullptr;
+    }
+  }
+};
+
+MOZ_RUNINIT ExclusiveData<TypeIdSet> typeIdSet(mutexid::WasmTypeIdSet);
+
+void wasm::PurgeCanonicalTypes() {
+  ExclusiveData<TypeIdSet>::Guard locked = typeIdSet.lock();
+  locked->purge();
+}
+
+SharedRecGroup TypeContext::canonicalizeGroup(SharedRecGroup recGroup) {
+  ExclusiveData<TypeIdSet>::Guard locked = typeIdSet.lock();
+  return locked->insert(recGroup);
+}
+
+TypeContext::~TypeContext() {
+  ExclusiveData<TypeIdSet>::Guard locked = typeIdSet.lock();
+
+  for (int32_t groupIndex = recGroups_.length() - 1; groupIndex >= 0;
+       groupIndex--) {
+    locked->clearRecGroup(&recGroups_[groupIndex]);
+  }
+}

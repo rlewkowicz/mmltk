@@ -1,0 +1,218 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(DNS_h_)
+#define DNS_h_
+
+#include "nsILoadInfo.h"
+#include "nscore.h"
+#include "nsString.h"
+#include "prio.h"
+#include "prnetdb.h"
+#include "nsISupportsImpl.h"
+#include "mozilla/MemoryReporting.h"
+#include "nsTArray.h"
+
+#  include <arpa/inet.h>
+
+
+#if !defined(AF_LOCAL)
+#  define AF_LOCAL 1  // used for named pipe
+#endif
+
+#define IPv6ADDR_IS_LOOPBACK(a)                                      \
+  (((a)->u32[0] == 0) && ((a)->u32[1] == 0) && ((a)->u32[2] == 0) && \
+   ((a)->u8[12] == 0) && ((a)->u8[13] == 0) && ((a)->u8[14] == 0) && \
+   ((a)->u8[15] == 0x1U))
+
+#define IPv6ADDR_IS_V4MAPPED(a)                                     \
+  (((a)->u32[0] == 0) && ((a)->u32[1] == 0) && ((a)->u8[8] == 0) && \
+   ((a)->u8[9] == 0) && ((a)->u8[10] == 0xff) && ((a)->u8[11] == 0xff))
+
+#define IPv6ADDR_V4MAPPED_TO_IPADDR(a) ((a)->u32[3])
+
+#define IPv6ADDR_IS_UNSPECIFIED(a)                                   \
+  (((a)->u32[0] == 0) && ((a)->u32[1] == 0) && ((a)->u32[2] == 0) && \
+   ((a)->u32[3] == 0))
+
+namespace mozilla {
+namespace net {
+
+enum HTTPSSVC_RECEIVED_STAGE : uint32_t {
+  HTTPSSVC_NOT_PRESENT = 0,
+  HTTPSSVC_WITH_IPHINT_RECEIVED_STAGE_0 = 1,
+  HTTPSSVC_WITHOUT_IPHINT_RECEIVED_STAGE_0 = 2,
+  HTTPSSVC_WITH_IPHINT_RECEIVED_STAGE_1 = 3,
+  HTTPSSVC_WITHOUT_IPHINT_RECEIVED_STAGE_1 = 4,
+  HTTPSSVC_WITH_IPHINT_RECEIVED_STAGE_2 = 5,
+  HTTPSSVC_WITHOUT_IPHINT_RECEIVED_STAGE_2 = 6,
+  HTTPSSVC_NOT_USED = 7,
+  HTTPSSVC_NO_USABLE_RECORD = 8,
+};
+
+#define HTTPS_RR_IS_USED(s) \
+  (s > HTTPSSVC_NOT_PRESENT && s < HTTPSSVC_WITH_IPHINT_RECEIVED_STAGE_2)
+
+const int kIPv4CStrBufSize = 16;
+const int kIPv6CStrBufSize = 46;
+const int kLocalCStrBufSize = 108;
+const int kNetAddrMaxCStrBufSize = kLocalCStrBufSize;
+
+
+union IPv6Addr {
+  uint8_t u8[16];
+  uint16_t u16[8];
+  uint32_t u32[4];
+  uint64_t u64[2];
+};
+
+union NetAddr {
+  struct {
+    uint16_t family; 
+    char data[14];   
+  } raw{};
+  struct {
+    uint16_t family; 
+    uint16_t port;   
+    uint32_t ip;     
+  } inet;
+  struct {
+    uint16_t family;   
+    uint16_t port;     
+    uint32_t flowinfo; 
+    IPv6Addr ip;       
+    uint32_t scope_id; 
+  } inet6;
+#if defined(XP_UNIX) || 0
+  struct {           
+    uint16_t family; 
+    char path[104];  
+  } local;
+#endif
+  bool operator==(const NetAddr& other) const;
+  bool operator<(const NetAddr& other) const;
+
+  NetAddr(const NetAddr&) = default;
+  inline NetAddr& operator=(const NetAddr& other) = default;
+
+  NetAddr() { memset((void*)this, 0, sizeof(NetAddr)); }
+  explicit NetAddr(const PRNetAddr* prAddr);
+
+  nsresult InitFromString(const nsACString& aString, uint16_t aPort = 0);
+
+  bool IsIPAddrAny() const;
+  bool IsLoopbackAddr() const;
+  bool IsLoopBackAddressWithoutIPv6Mapping() const;
+  bool IsIPAddrV4() const;
+  bool IsBenchMarkingAddress() const;
+  bool IsIPAddrV4Mapped() const;
+  bool IsIPAddrLocal() const;
+  bool IsIPAddrShared() const;
+  nsresult GetPort(uint16_t* aResult) const;
+  bool ToStringBuffer(char* buf, uint32_t bufSize) const;
+  bool ToString(nsACString& aOutput) const;
+  nsCString ToString() const;
+  void ToAddrPortString(nsACString& aOutput) const;
+  nsILoadInfo::IPAddressSpace GetIpAddressSpace() const;
+};
+
+enum class DNSResolverType : uint32_t { Native = 0, TRR };
+
+class AddrInfo {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(AddrInfo)
+
+ public:
+  static const uint32_t NO_TTL_DATA = (uint32_t)-1;
+
+  explicit AddrInfo(const nsACString& host, const PRAddrInfo* prAddrInfo,
+                    bool disableIPv4, bool filterNameCollision,
+                    const nsACString& cname);
+
+  explicit AddrInfo(const nsACString& host, const nsACString& cname,
+                    DNSResolverType aResolverType, unsigned int aTRRType,
+                    nsTArray<NetAddr>&& addresses);
+
+  explicit AddrInfo(const nsACString& host, DNSResolverType aResolverType,
+                    unsigned int aTRRType, nsTArray<NetAddr>&& addresses,
+                    uint32_t aTTL = NO_TTL_DATA);
+
+  explicit AddrInfo(const AddrInfo* src);  
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+
+  bool IsTRR() const { return mResolverType == DNSResolverType::TRR; }
+  DNSResolverType ResolverType() const { return mResolverType; }
+  unsigned int TRRType() { return mTRRType; }
+
+  double GetTrrFetchDuration() { return mTrrFetchDuration; }
+  double GetTrrFetchDurationNetworkOnly() {
+    return mTrrFetchDurationNetworkOnly;
+  }
+
+  const nsTArray<NetAddr>& Addresses() { return mAddresses; }
+  const nsCString& Hostname() { return mHostName; }
+  const nsCString& CanonicalHostname() { return mCanonicalName; }
+  uint32_t TTL() { return ttl; }
+
+  class MOZ_STACK_CLASS AddrInfoBuilder {
+   public:
+    explicit AddrInfoBuilder(AddrInfo* aInfo) {
+      mInfo = new AddrInfo(aInfo);  
+    }
+
+    void SetTrrFetchDurationNetworkOnly(double aTime) {
+      mInfo->mTrrFetchDurationNetworkOnly = aTime;
+    }
+
+    void SetTrrFetchDuration(double aTime) { mInfo->mTrrFetchDuration = aTime; }
+
+    void SetTTL(uint32_t aTTL) { mInfo->ttl = aTTL; }
+
+    void SetAddresses(nsTArray<NetAddr>&& addresses) {
+      mInfo->mAddresses = std::move(addresses);
+    }
+
+    template <class Comparator>
+    void SortAddresses(const Comparator& aComp) {
+      mInfo->mAddresses.Sort(aComp);
+    }
+
+    void SetCanonicalHostname(const nsACString& aCname) {
+      mInfo->mCanonicalName = aCname;
+    }
+
+    already_AddRefed<AddrInfo> Finish() { return mInfo.forget(); }
+
+   private:
+    RefPtr<AddrInfo> mInfo;
+  };
+
+  AddrInfoBuilder Build() { return AddrInfoBuilder(this); }
+
+ private:
+  ~AddrInfo();
+  uint32_t ttl = NO_TTL_DATA;
+
+  nsCString mHostName;
+  nsCString mCanonicalName;
+  DNSResolverType mResolverType = DNSResolverType::Native;
+  unsigned int mTRRType = 0;
+  double mTrrFetchDuration = 0;
+  double mTrrFetchDurationNetworkOnly = 0;
+
+  nsTArray<NetAddr> mAddresses;
+};
+
+void PRNetAddrToNetAddr(const PRNetAddr* prAddr, NetAddr* addr);
+
+void NetAddrToPRNetAddr(const NetAddr* addr, PRNetAddr* prAddr);
+
+bool IsLoopbackHostname(const nsACString& aAsciiHost);
+
+bool HostIsIPLiteral(const nsACString& aAsciiHost);
+
+}  
+}  
+
+#endif

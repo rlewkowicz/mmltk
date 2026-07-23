@@ -1,0 +1,55 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+* Copyright (C) 1999-2010, International Business Machines Corporation and others.
+* All Rights Reserved.
+**********************************************************************
+*   Date        Name        Description
+*   11/17/99    aliu        Creation.
+**********************************************************************
+*/
+#ifndef UNIFILT_H
+#define UNIFILT_H
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/unifunct.h"
+#include "unicode/unimatch.h"
+
+
+U_NAMESPACE_BEGIN
+
+#define U_ETHER ((char16_t)0xFFFF)
+
+class U_COMMON_API UnicodeFilter : public UnicodeFunctor, public UnicodeMatcher {
+
+public:
+    virtual ~UnicodeFilter();
+
+    virtual UnicodeFilter* clone() const override = 0;
+
+    virtual UBool contains(UChar32 c) const = 0;
+
+    virtual UnicodeMatcher* toMatcher() const override;
+
+    virtual UMatchDegree matches(const Replaceable& text,
+                                 int32_t& offset,
+                                 int32_t limit,
+                                 UBool incremental) override;
+
+    virtual void setData(const TransliterationRuleData*) override;
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+protected:
+
+};
+
+
+U_NAMESPACE_END
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif

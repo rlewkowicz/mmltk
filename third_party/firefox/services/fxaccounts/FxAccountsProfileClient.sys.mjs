@@ -1,0 +1,166 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+import {
+  ERRNO_NETWORK,
+  ERRNO_PARSE,
+  ERRNO_UNKNOWN_ERROR,
+  ERROR_CODE_METHOD_NOT_ALLOWED,
+  ERROR_MSG_METHOD_NOT_ALLOWED,
+  ERROR_NETWORK,
+  ERROR_PARSE,
+  ERROR_UNKNOWN,
+  log,
+  SCOPE_PROFILE,
+  SCOPE_PROFILE_WRITE,
+} from "resource://gre/modules/FxAccountsCommon.sys.mjs";
+
+import { getFxAccountsSingleton } from "resource://gre/modules/FxAccounts.sys.mjs";
+
+const fxAccounts = getFxAccountsSingleton();
+import { RESTRequest } from "resource://services-common/rest.sys.mjs";
+
+export var FxAccountsProfileClient = function (options) {
+  if (!options?.serverURL) {
+    throw new Error("Missing 'serverURL' configuration option");
+  }
+
+  this.fxai = options.fxai || fxAccounts._internal;
+
+  this.serverURL = URL.parse(options.serverURL);
+  if (!this.serverURL) {
+    throw new Error("Invalid 'serverURL'");
+  }
+  log.debug("FxAccountsProfileClient: Initialized");
+};
+
+FxAccountsProfileClient.prototype = {
+  serverURL: null,
+
+  _Request: RESTRequest,
+
+  async _createRequest(path, method = "GET", etag = null, body = null) {
+    method = method.toUpperCase();
+    let token = await this._getTokenForRequest(method);
+    try {
+      return await this._rawRequest(path, method, token, etag, body);
+    } catch (ex) {
+      if (!(ex instanceof FxAccountsProfileClientError) || ex.code != 401) {
+        throw ex;
+      }
+      log.info(
+        "Fetching the profile returned a 401 - revoking our token and retrying"
+      );
+      await this.fxai.removeCachedOAuthToken({ token });
+      token = await this._getTokenForRequest(method);
+      try {
+        return await this._rawRequest(path, method, token, etag, body);
+      } catch (ex) {
+        if (!(ex instanceof FxAccountsProfileClientError) || ex.code != 401) {
+          throw ex;
+        }
+        log.info(
+          "Retry fetching the profile still returned a 401 - revoking our token and failing"
+        );
+        await this.fxai.removeCachedOAuthToken({ token });
+        throw ex;
+      }
+    }
+  },
+
+  async _getTokenForRequest(method) {
+    let scope = SCOPE_PROFILE;
+    if (method === "POST") {
+      scope = SCOPE_PROFILE_WRITE;
+    }
+    return this.fxai.getOAuthToken({ scope });
+  },
+
+  async _rawRequest(path, method, token, etag = null, payload = null) {
+    let profileDataUrl = this.serverURL + path;
+    let request = new this._Request(profileDataUrl);
+
+    request.setHeader("Authorization", "Bearer " + token);
+    request.setHeader("Accept", "application/json");
+    if (etag) {
+      request.setHeader("If-None-Match", etag);
+    }
+
+    if (method != "GET" && method != "POST") {
+      throw new FxAccountsProfileClientError({
+        error: ERROR_NETWORK,
+        errno: ERRNO_NETWORK,
+        code: ERROR_CODE_METHOD_NOT_ALLOWED,
+        message: ERROR_MSG_METHOD_NOT_ALLOWED,
+      });
+    }
+    try {
+      await request.dispatch(method, payload);
+    } catch (error) {
+      throw new FxAccountsProfileClientError({
+        error: ERROR_NETWORK,
+        errno: ERRNO_NETWORK,
+        message: error.toString(),
+      });
+    }
+
+    let body = null;
+    try {
+      if (request.response.status == 304) {
+        return null;
+      }
+      body = JSON.parse(request.response.body);
+    } catch (e) {
+      throw new FxAccountsProfileClientError({
+        error: ERROR_PARSE,
+        errno: ERRNO_PARSE,
+        code: request.response.status,
+        message: request.response.body,
+      });
+    }
+
+    if (!request.response.success) {
+      throw new FxAccountsProfileClientError({
+        error: body.error || ERROR_UNKNOWN,
+        errno: body.errno || ERRNO_UNKNOWN_ERROR,
+        code: request.response.status,
+        message: body.message || body,
+      });
+    }
+    return {
+      body,
+      etag: request.response.headers.etag,
+    };
+  },
+
+  fetchProfile(etag) {
+    log.debug("FxAccountsProfileClient: Requested profile");
+    return this._createRequest("/profile", "GET", etag);
+  },
+};
+
+export var FxAccountsProfileClientError = function (details) {
+  details = details || {};
+
+  this.name = "FxAccountsProfileClientError";
+  this.code = details.code || null;
+  this.errno = details.errno || ERRNO_UNKNOWN_ERROR;
+  this.error = details.error || ERROR_UNKNOWN;
+  this.message = details.message || null;
+};
+
+FxAccountsProfileClientError.prototype._toStringFields = function () {
+  return {
+    name: this.name,
+    code: this.code,
+    errno: this.errno,
+    error: this.error,
+    message: this.message,
+  };
+};
+
+FxAccountsProfileClientError.prototype.toString = function () {
+  return this.name + "(" + JSON.stringify(this._toStringFields()) + ")";
+};

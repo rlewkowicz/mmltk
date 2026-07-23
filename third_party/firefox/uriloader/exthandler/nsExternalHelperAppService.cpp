@@ -1,0 +1,3108 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "base/basictypes.h"
+
+#include "mozilla/Base64.h"
+#include "mozilla/ResultExtensions.h"
+
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/dom/BrowserChild.h"
+#include "mozilla/dom/CanonicalBrowsingContext.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/WindowGlobalParent.h"
+#include "mozilla/RandomNum.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/StaticPrefs_security.h"
+#include "mozilla/StaticPtr.h"
+#include "nsXULAppAPI.h"
+
+#include "ExternalHelperAppParent.h"
+#include "nsExternalHelperAppService.h"
+#include "nsCExternalHandlerService.h"
+#include "nsIURI.h"
+#include "nsIURL.h"
+#include "nsIFile.h"
+#include "nsIFileURL.h"
+#include "nsIChannel.h"
+#include "nsAppDirectoryServiceDefs.h"
+#include "nsICategoryManager.h"
+#include "nsDependentSubstring.h"
+#include "nsSandboxFlags.h"
+#include "nsString.h"
+#include "nsUnicharUtils.h"
+#include "nsIStringEnumerator.h"
+#include "nsIStreamListener.h"
+#include "nsIMIMEService.h"
+#include "nsILoadGroup.h"
+#include "nsIWebProgressListener.h"
+#include "nsITransfer.h"
+#include "nsReadableUtils.h"
+#include "nsIRequest.h"
+#include "nsDirectoryServiceDefs.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsThreadUtils.h"
+#include "nsIMutableArray.h"
+#include "nsIRedirectHistoryEntry.h"
+#include "nsOSHelperAppService.h"
+#include "nsOSHelperAppServiceChild.h"
+#include "nsContentSecurityUtils.h"
+#include "nsUnicodeProperties.h"
+#include "mozilla/Utf16.h"
+#include "mozilla/Utf8.h"
+
+#include "nsIHandlerService.h"
+#include "nsIMIMEInfo.h"
+#include "nsIHelperAppLauncherDialog.h"
+#include "nsIContentDispatchChooser.h"
+#include "nsNetUtil.h"
+#include "nsIPrivateBrowsingChannel.h"
+#include "nsIIOService.h"
+#include "nsNetCID.h"
+
+#include "nsDSURIContentListener.h"
+#include "nsMimeTypes.h"
+#include "nsMIMEInfoImpl.h"
+#include "nsIHttpChannel.h"
+#include "nsIHttpChannelInternal.h"
+#include "nsIEncodedChannel.h"
+#include "nsIMultiPartChannel.h"
+#include "nsIFileChannel.h"
+#include "nsIObserverService.h"  // so we can be a profile change observer
+#include "nsIPropertyBag2.h"     // for the 64-bit content length
+
+
+#include "nsEscape.h"
+
+#include "nsIStringBundle.h"  // XXX needed to localize error msgs
+#include "nsIPrompt.h"
+
+#include "nsITextToSubURI.h"  // to unescape the filename
+
+#include "nsDocShellCID.h"
+
+#include "nsCRT.h"
+#include "nsLocalHandlerApp.h"
+
+#include "nsIRandomGenerator.h"
+
+#include "ContentChild.h"
+#include "nsXULAppAPI.h"
+#include "nsPIDOMWindow.h"
+#include "nsPIDOMWindowInlines.h"
+#include "ExternalHelperAppChild.h"
+
+#include "mozilla/dom/nsHTTPSOnlyUtils.h"
+
+
+#include "mozilla/Components.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/ipc/URIUtils.h"
+
+using namespace mozilla;
+using namespace mozilla::ipc;
+using namespace mozilla::dom;
+
+#define kDefaultMaxFileNameLength 254
+
+#define NS_PREF_DOWNLOAD_DIR "browser.download.dir"
+#define NS_PREF_DOWNLOAD_FOLDERLIST "browser.download.folderList"
+enum {
+  NS_FOLDER_VALUE_DESKTOP = 0,
+  NS_FOLDER_VALUE_DOWNLOADS = 1,
+  NS_FOLDER_VALUE_CUSTOM = 2
+};
+
+LazyLogModule nsExternalHelperAppService::sLog("HelperAppService");
+
+#undef LOG
+#define LOG(...)                                                     \
+  MOZ_LOG(nsExternalHelperAppService::sLog, mozilla::LogLevel::Info, \
+          (__VA_ARGS__))
+#define LOG_ENABLED() \
+  MOZ_LOG_TEST(nsExternalHelperAppService::sLog, mozilla::LogLevel::Info)
+
+static const char NEVER_ASK_FOR_SAVE_TO_DISK_PREF[] =
+    "browser.helperApps.neverAsk.saveToDisk";
+static const char NEVER_ASK_FOR_OPEN_FILE_PREF[] =
+    "browser.helperApps.neverAsk.openFile";
+
+StaticRefPtr<nsIFile> sFallbackDownloadDir;
+
+
+static nsresult UnescapeFragment(const nsACString& aFragment, nsIURI* aURI,
+                                 nsAString& aResult) {
+  nsresult rv;
+  nsCOMPtr<nsITextToSubURI> textToSubURI =
+      do_GetService(NS_ITEXTTOSUBURI_CONTRACTID, &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return textToSubURI->UnEscapeURIForUI(aFragment,  true,
+                                        aResult);
+}
+
+static nsresult UnescapeFragment(const nsACString& aFragment, nsIURI* aURI,
+                                 nsACString& aResult) {
+  nsAutoString result;
+  nsresult rv = UnescapeFragment(aFragment, aURI, result);
+  if (NS_SUCCEEDED(rv)) CopyUTF16toUTF8(result, aResult);
+  return rv;
+}
+
+static Result<nsCOMPtr<nsIFile>, nsresult> GetOsTmpDownloadDirectory() {
+  nsCOMPtr<nsIFile> dir;
+  MOZ_TRY(NS_GetSpecialDirectory(NS_OS_TEMP_DIR, getter_AddRefs(dir)));
+
+#if !0 && defined(XP_UNIX)
+
+  uint32_t permissions;
+  MOZ_TRY(dir->GetPermissions(&permissions));
+
+  if (permissions != PR_IRWXU) {
+    const char* userName = PR_GetEnv("USERNAME");
+    if (!userName || !*userName) {
+      userName = PR_GetEnv("USER");
+    }
+    if (!userName || !*userName) {
+      userName = PR_GetEnv("LOGNAME");
+    }
+    if (!userName || !*userName) {
+      userName = "mozillaUser";
+    }
+
+    nsAutoString userDir;
+    userDir.AssignLiteral("mozilla_");
+    userDir.AppendASCII(userName);
+    userDir.ReplaceChar(u"" FILE_PATH_SEPARATOR FILE_ILLEGAL_CHARACTERS, '_');
+
+    int counter = 0;
+    bool pathExists;
+    nsCOMPtr<nsIFile> finalPath;
+
+    while (true) {
+      nsAutoString countedUserDir(userDir);
+      countedUserDir.AppendInt(counter, 10);
+      dir->Clone(getter_AddRefs(finalPath));
+      finalPath->Append(countedUserDir);
+
+      MOZ_TRY(finalPath->Exists(&pathExists));
+
+      if (pathExists) {
+        MOZ_TRY(finalPath->GetPermissions(&permissions));
+
+        bool isWritable;
+        MOZ_TRY(finalPath->IsWritable(&isWritable));
+
+        if (permissions == PR_IRWXU && isWritable) {
+          dir = finalPath;
+          break;
+        }
+      }
+
+      nsresult const rv = finalPath->Create(nsIFile::DIRECTORY_TYPE, PR_IRWXU);
+      if (NS_SUCCEEDED(rv)) {
+        dir = finalPath;
+        break;
+      }
+      if (rv != NS_ERROR_FILE_ALREADY_EXISTS) {
+        return Err(rv);
+      }
+      counter++;
+    }
+  }
+
+#endif
+  NS_ASSERTION(dir, "Somehow we didn't get a download directory!");
+  return dir;
+}
+
+static nsresult EnsureDirectoryExists(nsIFile* aDir) {
+  nsresult const rv = aDir->Create(nsIFile::DIRECTORY_TYPE, 0755);
+  if (rv == NS_ERROR_FILE_ALREADY_EXISTS || NS_SUCCEEDED(rv)) {
+    return NS_OK;
+  }
+  return rv;
+};
+
+static Result<nsCOMPtr<nsIFile>, nsresult> GetPreferredDownloadsDirectory(
+    bool aSkipChecks = false) {
+  nsresult rv;
+  switch (Preferences::GetInt(NS_PREF_DOWNLOAD_FOLDERLIST, -1)) {
+    case NS_FOLDER_VALUE_DESKTOP: {
+      nsCOMPtr<nsIFile> dir;
+      if (NS_SUCCEEDED(
+              NS_GetSpecialDirectory(NS_OS_DESKTOP_DIR, getter_AddRefs(dir)))) {
+        return dir;
+      }
+    } break;
+
+    case NS_FOLDER_VALUE_CUSTOM: {
+      nsCOMPtr<nsIFile> dir;
+      Preferences::GetComplex(NS_PREF_DOWNLOAD_DIR, NS_GET_IID(nsIFile),
+                              getter_AddRefs(dir));
+      if (!dir) break;
+
+      if (!aSkipChecks && NS_FAILED(EnsureDirectoryExists(dir))) {
+        break;
+      }
+
+      return dir;
+    } break;
+
+    default:
+    case NS_FOLDER_VALUE_DOWNLOADS:
+      break;
+  }
+
+
+  nsCOMPtr<nsIFile> dir;
+  rv = NS_GetSpecialDirectory(NS_OS_DEFAULT_DOWNLOAD_DIR, getter_AddRefs(dir));
+  if (NS_SUCCEEDED(rv)) {
+    return dir;
+  }
+
+
+  if (sFallbackDownloadDir) {
+    MOZ_TRY(sFallbackDownloadDir->Clone(getter_AddRefs(dir)));
+    return dir;
+  }
+
+  MOZ_TRY(NS_GetSpecialDirectory(NS_OS_HOME_DIR, getter_AddRefs(dir)));
+
+  nsAutoString downloadLocalized;
+  rv = [&downloadLocalized]() {
+    nsresult rv;
+
+    nsCOMPtr<nsIStringBundleService> bundleService =
+        do_GetService(NS_STRINGBUNDLE_CONTRACTID, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    nsCOMPtr<nsIStringBundle> downloadBundle;
+    rv = bundleService->CreateBundle(
+        "chrome://mozapps/locale/downloads/downloads.properties",
+        getter_AddRefs(downloadBundle));
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    return downloadBundle->GetStringFromName("downloadsFolder",
+                                             downloadLocalized);
+  }();
+  if (NS_FAILED(rv)) {
+    downloadLocalized.AssignLiteral("Downloads");
+  }
+  MOZ_TRY(dir->Append(downloadLocalized));
+
+  {
+    nsCOMPtr<nsIFile> copy;
+    dir->Clone(getter_AddRefs(copy));
+    sFallbackDownloadDir = copy.forget();
+    ClearOnShutdown(&sFallbackDownloadDir);
+  }
+
+  if (!aSkipChecks) {
+    MOZ_TRY(EnsureDirectoryExists(dir));
+  }
+
+  return dir;
+}
+
+NS_IMETHODIMP nsExternalHelperAppService::GetPreferredDownloadsDirectory(
+    nsIFile** aOutFile) {
+  auto res = ::GetPreferredDownloadsDirectory();
+  if (res.isErr()) return res.unwrapErr();
+  res.unwrap().forget(aOutFile);
+  return NS_OK;
+}
+
+static Result<nsCOMPtr<nsIFile>, nsresult> GetInitialDownloadDirectory(
+    bool aSkipChecks = false,
+    CanonicalBrowsingContext* aBrowsingContext = nullptr) {
+
+  if (aBrowsingContext) {
+    nsString folderPath;
+    aBrowsingContext->Top()->GetDownloadFolderOverride(folderPath);
+    if (!folderPath.IsEmpty()) {
+      nsCOMPtr<nsIFile> dir;
+      nsresult rv = NS_NewLocalFile(folderPath, getter_AddRefs(dir));
+      if (NS_SUCCEEDED(rv)) {
+        return dir;
+      }
+    }
+  }
+
+  if (StaticPrefs::browser_download_start_downloads_in_tmp_dir()) {
+    return GetOsTmpDownloadDirectory();
+  }
+
+  return GetPreferredDownloadsDirectory(aSkipChecks);
+}
+
+nsresult GenerateRandomName(nsACString& result) {
+
+  nsresult rv;
+  const uint32_t wantedFileNameLength = 8;
+  const uint32_t requiredBytesLength =
+      static_cast<uint32_t>((wantedFileNameLength + 1) / 4 * 3);
+
+  uint8_t buffer[requiredBytesLength];
+  if (!mozilla::GenerateRandomBytesFromOS(buffer, requiredBytesLength)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsAutoCString tempLeafName;
+  rv = Base64URLEncode(requiredBytesLength, buffer,
+                       Base64URLEncodePaddingPolicy::Omit, tempLeafName);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  tempLeafName.Truncate(wantedFileNameLength);
+
+  result.Assign(tempLeafName);
+  return NS_OK;
+}
+
+struct nsDefaultMimeTypeEntry {
+  const char* mMimeType;
+  const char* mFileExtension;
+};
+
+static const nsDefaultMimeTypeEntry defaultMimeEntries[] = {
+    {TEXT_XML, "xml"},
+    {IMAGE_PNG, "png"},
+    {TEXT_CSS, "css"},
+    {IMAGE_JPEG, "jpeg"},
+    {IMAGE_JPEG, "jpg"},
+    {IMAGE_SVG_XML, "svg"},
+    {TEXT_HTML, "html"},
+    {TEXT_HTML, "htm"},
+    {IMAGE_GIF, "gif"},
+    {IMAGE_WEBP, "webp"},
+    {APPLICATION_XPINSTALL, "xpi"},
+    {APPLICATION_XHTML_XML, "xhtml"},
+    {APPLICATION_XHTML_XML, "xht"},
+    {TEXT_PLAIN, "txt"},
+    {TEXT_CSV, "csv"},
+    {APPLICATION_JSON, "json"},
+    {APPLICATION_RDF, "rdf"},
+    {APPLICATION_XJAVASCRIPT, "mjs"},
+    {APPLICATION_XJAVASCRIPT, "js"},
+    {APPLICATION_XJAVASCRIPT, "jsm"},
+    {VIDEO_OGG, "ogv"},
+    {APPLICATION_OGG, "ogg"},
+    {AUDIO_OGG, "oga"},
+    {AUDIO_OGG, "opus"},
+    {APPLICATION_PDF, "pdf"},
+    {VIDEO_WEBM, "webm"},
+    {AUDIO_WEBM, "webm"},
+    {IMAGE_ICO, "ico"},
+    {TEXT_PLAIN, "properties"},
+    {TEXT_PLAIN, "locale"},
+    {TEXT_PLAIN, "ftl"},
+#if defined(MOZ_RAW)
+    {VIDEO_RAW, "yuv"}
+#endif
+};
+
+struct nsExtraMimeTypeEntry {
+  const char* mMimeType;
+  const char* mFileExtensions;
+  const char* mDescription;
+};
+
+static const nsExtraMimeTypeEntry extraMimeEntries[] = {
+#if 0  // don't define .bin on the mac...use internet config to
+    {APPLICATION_OCTET_STREAM, "exe,com", "Binary File"},
+#else
+    {APPLICATION_OCTET_STREAM, "exe,com,bin", "Binary File"},
+#endif
+    {APPLICATION_GZIP2, "gz", "gzip"},
+    {"application/x-arj", "arj", "ARJ file"},
+    {"application/rtf", "rtf", "Rich Text Format File"},
+    {APPLICATION_ZIP, "zip", "ZIP Archive"},
+    {APPLICATION_XPINSTALL, "xpi", "XPInstall Install"},
+    {APPLICATION_PDF, "pdf", "Portable Document Format"},
+    {APPLICATION_POSTSCRIPT, "ps,eps,ai", "Postscript File"},
+    {APPLICATION_XJAVASCRIPT, "js", "Javascript Source File"},
+    {APPLICATION_XJAVASCRIPT, "jsm,mjs", "Javascript Module Source File"},
+
+    {"application/vnd.oasis.opendocument.text", "odt", "OpenDocument Text"},
+    {"application/vnd.oasis.opendocument.presentation", "odp",
+     "OpenDocument Presentation"},
+    {"application/vnd.oasis.opendocument.spreadsheet", "ods",
+     "OpenDocument Spreadsheet"},
+    {"application/vnd.oasis.opendocument.graphics", "odg",
+     "OpenDocument Graphics"},
+
+    {"application/msword", "doc", "Microsoft Word"},
+    {"application/vnd.ms-powerpoint", "ppt", "Microsoft PowerPoint"},
+    {"application/vnd.ms-excel", "xls", "Microsoft Excel"},
+
+    {"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+     "docx", "Microsoft Word (Open XML)"},
+    {"application/"
+     "vnd.openxmlformats-officedocument.presentationml.presentation",
+     "pptx", "Microsoft PowerPoint (Open XML)"},
+    {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+     "xlsx", "Microsoft Excel (Open XML)"},
+
+    {IMAGE_ART, "art", "ART Image"},
+    {IMAGE_BMP, "bmp", "BMP Image"},
+    {IMAGE_GIF, "gif", "GIF Image"},
+    {IMAGE_ICO, "ico,cur", "ICO Image"},
+    {IMAGE_JPEG, "jpg,jpeg,jfif,pjpeg,pjp", "JPEG Image"},
+    {IMAGE_PNG, "png", "PNG Image"},
+    {IMAGE_APNG, "apng", "APNG Image"},
+    {IMAGE_TIFF, "tiff,tif", "TIFF Image"},
+    {IMAGE_XBM, "xbm", "XBM Image"},
+    {IMAGE_SVG_XML, "svg", "Scalable Vector Graphics"},
+    {IMAGE_WEBP, "webp", "WebP Image"},
+    {IMAGE_AVIF, "avif", "AV1 Image File"},
+    {IMAGE_JXL, "jxl", "JPEG XL Image File"},
+
+    {MESSAGE_RFC822, "eml", "RFC-822 data"},
+    {TEXT_PLAIN, "txt,text", "Text File"},
+    {APPLICATION_JSON, "json", "JavaScript Object Notation"},
+    {TEXT_VTT, "vtt", "Web Video Text Tracks"},
+    {TEXT_CACHE_MANIFEST, "appcache", "Application Cache Manifest"},
+    {TEXT_HTML, "html,htm,shtml,ehtml", "HyperText Markup Language"},
+    {"application/xhtml+xml", "xhtml,xht",
+     "Extensible HyperText Markup Language"},
+    {APPLICATION_MATHML_XML, "mml", "Mathematical Markup Language"},
+    {APPLICATION_RDF, "rdf", "Resource Description Framework"},
+    {"text/csv", "csv", "CSV File"},
+    {TEXT_XML, "xml,xsl,xbl", "Extensible Markup Language"},
+    {TEXT_CSS, "css", "Style Sheet"},
+    {TEXT_VCARD, "vcf,vcard", "Contact Information"},
+    {TEXT_CALENDAR, "ics,ical,ifb,icalendar", "iCalendar"},
+    {VIDEO_OGG, "ogv,ogg", "Ogg Video"},
+    {APPLICATION_OGG, "ogg", "Ogg Video"},
+    {AUDIO_OGG, "oga", "Ogg Audio"},
+    {AUDIO_OGG, "opus", "Opus Audio"},
+    {VIDEO_WEBM, "webm", "Web Media Video"},
+    {AUDIO_WEBM, "webm", "Web Media Audio"},
+    {AUDIO_MP3, "mp3,mpega,mp2", "MPEG Audio"},
+    {VIDEO_MP4, "mp4,m4a,m4b", "MPEG-4 Video"},
+    {AUDIO_MP4, "m4a,m4b", "MPEG-4 Audio"},
+    {VIDEO_RAW, "yuv", "Raw YUV Video"},
+    {AUDIO_WAV, "wav", "Waveform Audio"},
+    {VIDEO_3GPP, "3gpp,3gp", "3GPP Video"},
+    {VIDEO_3GPP2, "3g2", "3GPP2 Video"},
+    {AUDIO_AAC, "aac", "AAC Audio"},
+    {AUDIO_FLAC, "flac", "FLAC Audio"},
+    {AUDIO_MIDI, "mid", "Standard MIDI Audio"},
+    {APPLICATION_WASM, "wasm", "WebAssembly Module"},
+    {"application/epub+zip", "epub", "Electronic publication (EPUB)"}};
+
+static const nsDefaultMimeTypeEntry sForbiddenPrimaryExtensions[] = {
+    {IMAGE_JPEG, "jfif"}, {AUDIO_MP3, "mpga"}};
+
+static const nsDefaultMimeTypeEntry nonDecodableExtensions[] = {
+    {APPLICATION_GZIP, "gz"},
+    {APPLICATION_GZIP, "tgz"},
+    {APPLICATION_ZIP, "zip"},
+    {APPLICATION_COMPRESS, "z"},
+    {APPLICATION_GZIP, "svgz"}};
+
+static const char* forcedExtensionMimetypes[] = {
+    APPLICATION_PDF, APPLICATION_OGG, APPLICATION_WASM,
+    TEXT_CALENDAR,   TEXT_CSS,        TEXT_VCARD};
+
+static const char* descriptionOverwriteExtensions[] = {
+    "avif", "jxl", "pdf", "svg", "webp", "xml",
+};
+
+static StaticRefPtr<nsExternalHelperAppService> sExtHelperAppSvcSingleton;
+
+already_AddRefed<nsExternalHelperAppService>
+nsExternalHelperAppService::GetSingleton() {
+  if (!sExtHelperAppSvcSingleton) {
+    if (XRE_IsParentProcess()) {
+      sExtHelperAppSvcSingleton = new nsOSHelperAppService();
+    } else {
+      sExtHelperAppSvcSingleton = new nsOSHelperAppServiceChild();
+    }
+    ClearOnShutdown(&sExtHelperAppSvcSingleton);
+  }
+
+  return do_AddRef(sExtHelperAppSvcSingleton);
+}
+
+NS_IMPL_ISUPPORTS(nsExternalHelperAppService, nsIExternalHelperAppService,
+                  nsPIExternalAppLauncher, nsIExternalProtocolService,
+                  nsIMIMEService, nsIObserver, nsISupportsWeakReference)
+
+nsExternalHelperAppService::nsExternalHelperAppService() = default;
+nsresult nsExternalHelperAppService::Init() {
+  nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+  if (!obs) return NS_ERROR_FAILURE;
+
+  nsresult rv = obs->AddObserver(this, "profile-before-change", true);
+  NS_ENSURE_SUCCESS(rv, rv);
+  return obs->AddObserver(this, "last-pb-context-exited", true);
+}
+
+nsExternalHelperAppService::~nsExternalHelperAppService() = default;
+
+nsresult nsExternalHelperAppService::DoContentContentProcessHelper(
+    const nsACString& aMimeContentType, nsIChannel* aChannel,
+    BrowsingContext* aContentContext, bool aForceSave,
+    nsIInterfaceRequestor* aWindowContext,
+    nsIStreamListener** aStreamListener) {
+  NS_ENSURE_ARG_POINTER(aChannel);
+
+  using mozilla::dom::ContentChild;
+  using mozilla::dom::ExternalHelperAppChild;
+  ContentChild* child = ContentChild::GetSingleton();
+  if (!child) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCString disp;
+  nsCOMPtr<nsIURI> uri;
+  int64_t contentLength = -1;
+  uint32_t contentDisposition = -1;
+  nsAutoString fileName;
+  nsCOMPtr<nsILoadInfo> loadInfo;
+
+  aChannel->GetURI(getter_AddRefs(uri));
+  aChannel->GetContentLength(&contentLength);
+  aChannel->GetContentDisposition(&contentDisposition);
+  aChannel->GetContentDispositionFilename(fileName);
+  aChannel->GetContentDispositionHeader(disp);
+  loadInfo = aChannel->LoadInfo();
+
+  nsCOMPtr<nsIURI> referrer;
+  NS_GetReferrerFromChannel(aChannel, getter_AddRefs(referrer));
+
+  mozilla::net::LoadInfoArgs loadInfoArgs;
+  MOZ_ALWAYS_SUCCEEDS(LoadInfoToLoadInfoArgs(loadInfo, &loadInfoArgs));
+
+  RefPtr childListener = MakeRefPtr<ExternalHelperAppChild>();
+  MOZ_ALWAYS_TRUE(child->SendPExternalHelperAppConstructor(
+      childListener, uri, loadInfoArgs, nsCString(aMimeContentType), disp,
+      contentDisposition, fileName, aForceSave, contentLength, referrer,
+      aContentContext));
+
+  NS_ADDREF(*aStreamListener = childListener);
+
+  nsIHelperAppLauncherDialog::reason reason =
+      nsIHelperAppLauncherDialog::REASON_CANTHANDLE;
+
+  SanitizeFileName(fileName, 0);
+
+  RefPtr handler = MakeRefPtr<nsExternalAppHandler>(
+      nullptr, u""_ns, aContentContext, aWindowContext, this, fileName, reason,
+      aForceSave);
+
+  childListener->SetHandler(handler);
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsExternalHelperAppService::CreateListener(
+    const nsACString& aMimeContentType, nsIChannel* aChannel,
+    BrowsingContext* aContentContext, bool aForceSave,
+    nsIInterfaceRequestor* aWindowContext,
+    nsIStreamListener** aStreamListener) {
+  MOZ_ASSERT(!XRE_IsContentProcess());
+  NS_ENSURE_ARG_POINTER(aChannel);
+
+  nsAutoString fileName;
+  nsAutoCString fileExtension;
+  nsIHelperAppLauncherDialog::reason reason =
+      nsIHelperAppLauncherDialog::REASON_CANTHANDLE;
+
+  uint32_t contentDisposition = -1;
+  aChannel->GetContentDisposition(&contentDisposition);
+  if (contentDisposition == nsIChannel::DISPOSITION_ATTACHMENT) {
+    reason = nsIHelperAppLauncherDialog::REASON_SERVERREQUEST;
+  }
+
+  *aStreamListener = nullptr;
+
+  nsCOMPtr<nsIURI> uri;
+  bool allowURLExtension =
+      GetFileNameFromChannel(aChannel, fileName, getter_AddRefs(uri));
+
+  uint32_t flags = VALIDATE_ALLOW_EMPTY;
+  if (aMimeContentType.Equals(APPLICATION_GUESS_FROM_EXT,
+                              nsCaseInsensitiveCStringComparator)) {
+    flags |= VALIDATE_GUESS_FROM_EXTENSION;
+  }
+
+  nsCOMPtr<nsIMIMEInfo> mimeInfo = ValidateFileNameForSaving(
+      fileName, aMimeContentType, uri, nullptr, flags, allowURLExtension);
+
+  LOG("Type/Ext lookup found 0x%p\n", mimeInfo.get());
+
+  if (!mimeInfo) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  if (flags & VALIDATE_GUESS_FROM_EXTENSION) {
+    nsAutoCString mimeType;
+    mimeInfo->GetMIMEType(mimeType);
+    aChannel->SetContentType(mimeType);
+
+    if (reason == nsIHelperAppLauncherDialog::REASON_CANTHANDLE) {
+      reason = nsIHelperAppLauncherDialog::REASON_TYPESNIFFED;
+    }
+  }
+
+  nsAutoString extension;
+  int32_t dotidx = fileName.RFindChar(u'.');
+  if (dotidx != -1) {
+    extension = Substring(fileName, dotidx + 1);
+  }
+
+  nsExternalAppHandler* handler = new nsExternalAppHandler(
+      mimeInfo, extension, aContentContext, aWindowContext, this, fileName,
+      reason, aForceSave);
+  if (!handler) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  NS_ADDREF(*aStreamListener = handler);
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsExternalHelperAppService::DoContent(
+    const nsACString& aMimeContentType, nsIChannel* aChannel,
+    nsIInterfaceRequestor* aContentContext, bool aForceSave,
+    nsIInterfaceRequestor* aWindowContext,
+    nsIStreamListener** aStreamListener) {
+  RefPtr<BrowsingContext> bc;
+  nsCOMPtr<nsIDOMWindow> domWindow = do_GetInterface(aContentContext);
+  if (nsCOMPtr<nsPIDOMWindowOuter> outerWindow = do_QueryInterface(domWindow)) {
+    bc = outerWindow->GetBrowsingContext();
+  } else if (nsCOMPtr<nsPIDOMWindowInner> innerWindow =
+                 do_QueryInterface(domWindow)) {
+    bc = innerWindow->GetBrowsingContext();
+  }
+
+  if (XRE_IsContentProcess()) {
+    return DoContentContentProcessHelper(aMimeContentType, aChannel, bc,
+                                         aForceSave, aWindowContext,
+                                         aStreamListener);
+  }
+
+  nsresult rv = CreateListener(aMimeContentType, aChannel, bc, aForceSave,
+                               aWindowContext, aStreamListener);
+  return rv;
+}
+
+NS_IMETHODIMP nsExternalHelperAppService::ApplyDecodingForExtension(
+    const nsACString& aExtension, const nsACString& aEncodingType,
+    bool* aApplyDecoding) {
+  *aApplyDecoding = true;
+  if (StaticPrefs::
+          network_http_decode_content_for_known_compressed_extensions()) {
+    return NS_OK;
+  }
+  uint32_t i;
+  for (i = 0; i < std::size(nonDecodableExtensions); ++i) {
+    if (aExtension.LowerCaseEqualsASCII(
+            nonDecodableExtensions[i].mFileExtension) &&
+        aEncodingType.LowerCaseEqualsASCII(
+            nonDecodableExtensions[i].mMimeType)) {
+      *aApplyDecoding = false;
+      break;
+    }
+  }
+  return NS_OK;
+}
+
+nsresult nsExternalHelperAppService::GetFileTokenForPath(
+    const char16_t* aPlatformAppPath, nsIFile** aFile) {
+  nsDependentString platformAppPath(aPlatformAppPath);
+  nsIFile* localFile = nullptr;
+  nsresult rv = NS_NewLocalFile(platformAppPath, &localFile);
+  if (NS_SUCCEEDED(rv)) {
+    *aFile = localFile;
+    bool exists;
+    if (NS_FAILED((*aFile)->Exists(&exists)) || !exists) {
+      NS_RELEASE(*aFile);
+      return NS_ERROR_FILE_NOT_FOUND;
+    }
+    return NS_OK;
+  }
+
+  rv = NS_GetSpecialDirectory(NS_XPCOM_CURRENT_PROCESS_DIR, aFile);
+  if (NS_SUCCEEDED(rv)) {
+    rv = (*aFile)->Append(platformAppPath);
+    if (NS_SUCCEEDED(rv)) {
+      bool exists = false;
+      rv = (*aFile)->Exists(&exists);
+      if (NS_SUCCEEDED(rv) && exists) return NS_OK;
+    }
+    NS_RELEASE(*aFile);
+  }
+
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+NS_IMETHODIMP nsExternalHelperAppService::ExternalProtocolHandlerExists(
+    const char* aProtocolScheme, bool* aHandlerExists) {
+  nsCOMPtr<nsIHandlerInfo> handlerInfo;
+  nsresult rv = GetProtocolHandlerInfo(nsDependentCString(aProtocolScheme),
+                                       getter_AddRefs(handlerInfo));
+  if (NS_SUCCEEDED(rv)) {
+    nsCOMPtr<nsIMutableArray> possibleHandlers;
+    handlerInfo->GetPossibleApplicationHandlers(
+        getter_AddRefs(possibleHandlers));
+
+    uint32_t length;
+    possibleHandlers->GetLength(&length);
+    if (length) {
+      *aHandlerExists = true;
+      return NS_OK;
+    }
+  }
+
+  return OSProtocolHandlerExists(aProtocolScheme, aHandlerExists);
+}
+
+NS_IMETHODIMP nsExternalHelperAppService::IsExposedProtocol(
+    const char* aProtocolScheme, bool* aResult) {
+
+  nsAutoCString prefName("network.protocol-handler.expose.");
+  prefName += aProtocolScheme;
+  bool val;
+  if (NS_SUCCEEDED(Preferences::GetBool(prefName.get(), &val))) {
+    *aResult = val;
+    return NS_OK;
+  }
+
+  *aResult = Preferences::GetBool("network.protocol-handler.expose-all", false);
+
+  return NS_OK;
+}
+
+static const char kExternalProtocolPrefPrefix[] =
+    "network.protocol-handler.external.";
+static const char kExternalProtocolDefaultPref[] =
+    "network.protocol-handler.external-default";
+
+nsresult nsExternalHelperAppService::EscapeURI(nsIURI* aURI, nsIURI** aResult) {
+  MOZ_ASSERT(aURI);
+  MOZ_ASSERT(aResult);
+
+  nsAutoCString spec;
+  aURI->GetSpec(spec);
+
+  if (spec.Find("%00") != -1) return NS_ERROR_MALFORMED_URI;
+
+  nsAutoCString escapedSpec;
+  nsresult rv = NS_EscapeURL(spec, esc_AlwaysCopy | esc_ExtHandler, escapedSpec,
+                             fallible);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIIOService> ios(do_GetIOService());
+  return ios->NewURI(escapedSpec, nullptr, nullptr, aResult);
+}
+
+bool nsExternalHelperAppService::ExternalProtocolIsBlockedBySandbox(
+    BrowsingContext* aBrowsingContext,
+    const bool aHasValidUserGestureActivation) {
+  if (!aBrowsingContext || aBrowsingContext->IsTop()) {
+    return false;
+  }
+
+  uint32_t sandboxFlags = aBrowsingContext->GetSandboxFlags();
+
+  if (sandboxFlags == SANDBOXED_NONE) {
+    return false;
+  }
+
+  if (!(sandboxFlags & SANDBOXED_AUXILIARY_NAVIGATION)) {
+    return false;
+  }
+
+  if (!(sandboxFlags & SANDBOXED_TOPLEVEL_NAVIGATION)) {
+    return false;
+  }
+
+  if (!(sandboxFlags & SANDBOXED_TOPLEVEL_NAVIGATION_CUSTOM_PROTOCOLS)) {
+    return false;
+  }
+
+  if (!(sandboxFlags & SANDBOXED_TOPLEVEL_NAVIGATION_USER_ACTIVATION) &&
+      aHasValidUserGestureActivation) {
+    return false;
+  }
+
+  return true;
+}
+
+NS_IMETHODIMP
+nsExternalHelperAppService::LoadURI(nsIURI* aURI,
+                                    nsIPrincipal* aTriggeringPrincipal,
+                                    nsIPrincipal* aRedirectPrincipal,
+                                    BrowsingContext* aBrowsingContext,
+                                    bool aTriggeredExternally,
+                                    bool aHasValidUserGestureActivation,
+                                    bool aNewWindowTarget) {
+  NS_ENSURE_ARG_POINTER(aURI);
+  NS_ENSURE_ARG_POINTER(aTriggeringPrincipal);
+
+  if (XRE_IsContentProcess()) {
+    mozilla::dom::ContentChild::GetSingleton()->SendLoadURIExternal(
+        WrapNotNull(aURI), WrapNotNull(aTriggeringPrincipal),
+        aRedirectPrincipal, aBrowsingContext, aTriggeredExternally,
+        aHasValidUserGestureActivation, aNewWindowTarget);
+    return NS_OK;
+  }
+
+  if (aBrowsingContext &&
+      ExternalProtocolIsBlockedBySandbox(aBrowsingContext,
+                                         aHasValidUserGestureActivation)) {
+    nsAutoString localizedMsg;
+    nsAutoCString spec;
+    aURI->GetSpec(spec);
+
+    AutoTArray<nsString, 1> params = {NS_ConvertUTF8toUTF16(spec)};
+    nsresult rv = nsContentUtils::FormatLocalizedString(
+        PropertiesFile::SECURITY_PROPERTIES, "SandboxBlockedCustomProtocols",
+        params, localizedMsg);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    WindowContext* windowContext = aBrowsingContext->GetParentWindowContext();
+    if (!windowContext) {
+      windowContext = aBrowsingContext->GetCurrentWindowContext();
+    }
+
+    NS_ENSURE_TRUE(windowContext, NS_ERROR_FAILURE);
+
+    nsContentUtils::ReportToConsoleByWindowID(
+        localizedMsg, nsIScriptError::errorFlag, "Security"_ns,
+        windowContext->InnerWindowId(),
+        SourceLocation(windowContext->Canonical()->GetDocumentURI()));
+
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIURI> escapedURI;
+  nsresult rv = EscapeURI(aURI, getter_AddRefs(escapedURI));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString scheme;
+  escapedURI->GetScheme(scheme);
+  if (scheme.IsEmpty()) return NS_OK;  
+
+  nsAutoCString externalPref(kExternalProtocolPrefPrefix);
+  externalPref += scheme;
+  bool allowLoad = false;
+  if (NS_FAILED(Preferences::GetBool(externalPref.get(), &allowLoad))) {
+    if (NS_FAILED(
+            Preferences::GetBool(kExternalProtocolDefaultPref, &allowLoad))) {
+      return NS_OK;  
+    }
+  }
+
+  if (!allowLoad) {
+    return NS_OK;  
+  }
+
+  if (aBrowsingContext && !aTriggeringPrincipal->IsSystemPrincipal()) {
+    RefPtr<BrowsingContext> bc = aBrowsingContext;
+    WindowGlobalParent* wgp = bc->Canonical()->GetCurrentWindowGlobal();
+    bool foundAccessibleFrame = false;
+
+    if (aNewWindowTarget) {
+      MOZ_ASSERT(bc->IsTop());
+      foundAccessibleFrame = true;
+    }
+
+    if (!foundAccessibleFrame && bc->IsTop() &&
+        !bc->GetTopLevelCreatedByWebContent() && wgp) {
+      nsIURI* uri = wgp->GetDocumentURI();
+      foundAccessibleFrame = uri && NS_IsAboutBlank(uri);
+    }
+
+    while (!foundAccessibleFrame) {
+      if (wgp) {
+        foundAccessibleFrame =
+            aTriggeringPrincipal->Subsumes(wgp->DocumentPrincipal());
+      }
+      BrowsingContext* parent = bc->GetParent();
+      if (!parent) {
+        break;
+      }
+      bc = parent;
+      wgp = parent->Canonical()->GetCurrentWindowGlobal();
+    }
+
+    if (!foundAccessibleFrame) {
+      nsTArray<RefPtr<BrowsingContext>> contexts;
+      aBrowsingContext->GetAllBrowsingContextsInSubtree(contexts);
+      for (const auto& kid : contexts) {
+        wgp = kid->Canonical()->GetCurrentWindowGlobal();
+        if (wgp && aTriggeringPrincipal->Subsumes(wgp->DocumentPrincipal())) {
+          foundAccessibleFrame = true;
+          break;
+        }
+      }
+    }
+
+    if (!foundAccessibleFrame) {
+      return NS_OK;  
+    }
+  }
+
+  nsCOMPtr<nsIHandlerInfo> handler;
+  rv = GetProtocolHandlerInfo(scheme, getter_AddRefs(handler));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIContentDispatchChooser> chooser =
+      do_CreateInstance("@mozilla.org/content-dispatch-chooser;1", &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return chooser->HandleURI(
+      handler, escapedURI,
+      aRedirectPrincipal ? aRedirectPrincipal : aTriggeringPrincipal,
+      aBrowsingContext, aTriggeredExternally);
+}
+
+
+nsresult nsExternalHelperAppService::DeleteTemporaryFileHelper(
+    nsIFile* aTemporaryFile, nsCOMArray<nsIFile>& aFileList) {
+  bool isFile = false;
+
+  aTemporaryFile->IsFile(&isFile);
+  if (!isFile) return NS_OK;
+
+  aFileList.AppendObject(aTemporaryFile);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsExternalHelperAppService::DeleteTemporaryFileOnExit(nsIFile* aTemporaryFile) {
+  return DeleteTemporaryFileHelper(aTemporaryFile, mTemporaryFilesList);
+}
+
+NS_IMETHODIMP
+nsExternalHelperAppService::DeletePrivateFileWhenPossible(
+    nsIFile* aPrivateFile) {
+  return DeleteTemporaryFileHelper(aPrivateFile, mPrivateFilesList);
+}
+
+NS_IMETHODIMP
+nsExternalHelperAppService::DeleteTemporaryPrivateFileWhenPossible(
+    nsIFile* aTemporaryFile) {
+  return DeleteTemporaryFileHelper(aTemporaryFile, mTemporaryPrivateFilesList);
+}
+
+void nsExternalHelperAppService::ExpungeTemporaryFilesHelper(
+    nsCOMArray<nsIFile>& fileList) {
+  int32_t numEntries = fileList.Count();
+  nsIFile* localFile;
+  for (int32_t index = 0; index < numEntries; index++) {
+    localFile = fileList[index];
+    if (localFile) {
+      localFile->SetPermissions(0600);
+      localFile->Remove(false);
+    }
+  }
+
+  fileList.Clear();
+}
+
+void nsExternalHelperAppService::ExpungeTemporaryFiles() {
+  ExpungeTemporaryFilesHelper(mTemporaryFilesList);
+}
+
+void nsExternalHelperAppService::ExpungePrivateFiles() {
+  ExpungeTemporaryFilesHelper(mPrivateFilesList);
+}
+
+void nsExternalHelperAppService::ExpungeTemporaryPrivateFiles() {
+  ExpungeTemporaryFilesHelper(mTemporaryPrivateFilesList);
+}
+
+static const char kExternalWarningPrefPrefix[] =
+    "network.protocol-handler.warn-external.";
+static const char kExternalWarningDefaultPref[] =
+    "network.protocol-handler.warn-external-default";
+
+NS_IMETHODIMP
+nsExternalHelperAppService::GetProtocolHandlerInfo(
+    const nsACString& aScheme, nsIHandlerInfo** aHandlerInfo) {
+
+  bool exists;
+  nsresult rv = GetProtocolHandlerInfoFromOS(aScheme, &exists, aHandlerInfo);
+  if (NS_FAILED(rv)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsIHandlerService> handlerSvc =
+      do_GetService(NS_HANDLERSERVICE_CONTRACTID);
+  if (handlerSvc) {
+    bool hasHandler = false;
+    (void)handlerSvc->Exists(*aHandlerInfo, &hasHandler);
+    if (hasHandler) {
+      rv = handlerSvc->FillHandlerInfo(*aHandlerInfo, ""_ns);
+      if (NS_SUCCEEDED(rv)) return NS_OK;
+    }
+  }
+
+  return SetProtocolHandlerDefaults(*aHandlerInfo, exists);
+}
+
+NS_IMETHODIMP
+nsExternalHelperAppService::SetProtocolHandlerDefaults(
+    nsIHandlerInfo* aHandlerInfo, bool aOSHandlerExists) {
+
+  if (aOSHandlerExists) {
+    aHandlerInfo->SetPreferredAction(nsIHandlerInfo::useSystemDefault);
+
+    nsAutoCString scheme;
+    aHandlerInfo->GetType(scheme);
+
+    nsAutoCString warningPref(kExternalWarningPrefPrefix);
+    warningPref += scheme;
+    bool warn;
+    if (NS_FAILED(Preferences::GetBool(warningPref.get(), &warn))) {
+      warn = Preferences::GetBool(kExternalWarningDefaultPref, true);
+    }
+    aHandlerInfo->SetAlwaysAskBeforeHandling(warn);
+  } else {
+    aHandlerInfo->SetPreferredAction(nsIHandlerInfo::alwaysAsk);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsExternalHelperAppService::Observe(nsISupports* aSubject, const char* aTopic,
+                                    const char16_t* someData) {
+  if (!strcmp(aTopic, "profile-before-change")) {
+    ExpungeTemporaryFiles();
+  } else if (!strcmp(aTopic, "last-pb-context-exited")) {
+    if (StaticPrefs::browser_download_enableDeletePrivate() &&
+        StaticPrefs::browser_download_deletePrivate()) {
+      ExpungePrivateFiles();
+    }
+    ExpungeTemporaryPrivateFiles();
+  }
+  return NS_OK;
+}
+
+
+NS_IMPL_ADDREF(nsExternalAppHandler)
+NS_IMPL_RELEASE(nsExternalAppHandler)
+
+NS_INTERFACE_MAP_BEGIN(nsExternalAppHandler)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIStreamListener)
+  NS_INTERFACE_MAP_ENTRY(nsIStreamListener)
+  NS_INTERFACE_MAP_ENTRY(nsIRequestObserver)
+  NS_INTERFACE_MAP_ENTRY(nsIHelperAppLauncher)
+  NS_INTERFACE_MAP_ENTRY(nsICancelable)
+  NS_INTERFACE_MAP_ENTRY(nsIBackgroundFileSaverObserver)
+  NS_INTERFACE_MAP_ENTRY(nsINamed)
+  NS_INTERFACE_MAP_ENTRY_CONCRETE(nsExternalAppHandler)
+NS_INTERFACE_MAP_END
+
+nsExternalAppHandler::nsExternalAppHandler(
+    nsIMIMEInfo* aMIMEInfo, const nsAString& aFileExtension,
+    BrowsingContext* aBrowsingContext, nsIInterfaceRequestor* aWindowContext,
+    nsExternalHelperAppService* aExtProtSvc,
+    const nsAString& aSuggestedFileName,
+    nsIHelperAppLauncherDialog::reason aReason, bool aForceSave)
+    : mMimeInfo(aMIMEInfo),
+      mBrowsingContext(aBrowsingContext),
+      mWindowContext(aWindowContext),
+      mSuggestedFileName(aSuggestedFileName),
+      mForceSave(aForceSave),
+      mForceSaveInternallyHandled(false),
+      mCanceled(false),
+      mStopRequestIssued(false),
+      mIsFileChannel(false),
+      mHandleInternally(false),
+      mDialogShowing(false),
+      mReason(aReason),
+      mTempFileIsExecutable(false),
+      mTimeDownloadStarted(0),
+      mContentLength(-1),
+      mProgress(0),
+      mSaver(nullptr),
+      mDialogProgressListener(nullptr),
+      mTransfer(nullptr),
+      mRequest(nullptr),
+      mExtProtSvc(aExtProtSvc) {
+  if (!aFileExtension.IsEmpty() && aFileExtension.First() != '.') {
+    mFileExtension = char16_t('.');
+  }
+  mFileExtension.Append(aFileExtension);
+
+  mBufferSize = Preferences::GetUint("network.buffer.cache.size", 4096);
+}
+
+nsExternalAppHandler::~nsExternalAppHandler() {
+  MOZ_ASSERT(!mSaver, "Saver should hold a reference to us until deleted");
+}
+
+void nsExternalAppHandler::DidDivertRequest(nsIRequest* request) {
+  MOZ_ASSERT(XRE_IsContentProcess(), "in child process");
+  RetargetLoadNotifications(request);
+}
+
+NS_IMETHODIMP nsExternalAppHandler::SetWebProgressListener(
+    nsIWebProgressListener2* aWebProgressListener) {
+  mDialogProgressListener = aWebProgressListener;
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsExternalAppHandler::GetTargetFile(nsIFile** aTarget) {
+  if (mFinalFileDestination)
+    *aTarget = mFinalFileDestination;
+  else
+    *aTarget = mTempFile;
+
+  NS_IF_ADDREF(*aTarget);
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsExternalAppHandler::GetTargetFileIsExecutable(bool* aExec) {
+  if (mFinalFileDestination) return mFinalFileDestination->IsExecutable(aExec);
+
+  *aExec = mTempFileIsExecutable;
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsExternalAppHandler::GetTimeDownloadStarted(PRTime* aTime) {
+  *aTime = mTimeDownloadStarted;
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsExternalAppHandler::GetContentLength(int64_t* aContentLength) {
+  *aContentLength = mContentLength;
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsExternalAppHandler::GetBrowsingContextId(
+    uint64_t* aBrowsingContextId) {
+  *aBrowsingContextId = mBrowsingContext ? mBrowsingContext->Id() : 0;
+  return NS_OK;
+}
+
+void nsExternalAppHandler::RetargetLoadNotifications(nsIRequest* request) {
+  nsCOMPtr<nsIChannel> aChannel = do_QueryInterface(request);
+  if (!aChannel) return;
+
+  bool isPrivate = NS_UsePrivateBrowsing(aChannel);
+
+  nsCOMPtr<nsILoadGroup> oldLoadGroup;
+  aChannel->GetLoadGroup(getter_AddRefs(oldLoadGroup));
+
+  if (oldLoadGroup) {
+    oldLoadGroup->RemoveRequest(request, nullptr, NS_BINDING_RETARGETED);
+  }
+
+  aChannel->SetLoadGroup(nullptr);
+  aChannel->SetNotificationCallbacks(nullptr);
+
+  nsCOMPtr<nsIPrivateBrowsingChannel> pbChannel = do_QueryInterface(aChannel);
+  if (pbChannel) {
+    pbChannel->SetPrivate(isPrivate);
+  }
+}
+
+nsresult nsExternalAppHandler::SetUpTempFile(nsIChannel* aChannel) {
+  auto res = GetInitialDownloadDirectory(
+      false, mBrowsingContext ? mBrowsingContext->Canonical() : nullptr);
+  if (res.isErr()) return res.unwrapErr();
+  mTempFile = res.unwrap();
+
+  nsAutoCString tempLeafName;
+  nsresult rv = GenerateRandomName(tempLeafName);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString ext;
+  mMimeInfo->GetPrimaryExtension(ext);
+  if (!ext.IsEmpty()) {
+    ext.ReplaceChar(KNOWN_PATH_SEPARATORS FILE_ILLEGAL_CHARACTERS, '_');
+    if (ext.First() != '.') tempLeafName.Append('.');
+    tempLeafName.Append(ext);
+  }
+
+  nsCOMPtr<nsIFile> dummyFile;
+  rv = mTempFile->Clone(getter_AddRefs(dummyFile));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = dummyFile->Append(NS_ConvertUTF8toUTF16(tempLeafName));
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = dummyFile->CreateUnique(nsIFile::NORMAL_FILE_TYPE, 0600);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  dummyFile->IsExecutable(&mTempFileIsExecutable);
+  dummyFile->Remove(false);
+
+  tempLeafName.AppendLiteral(".part");
+
+  rv = mTempFile->Append(NS_ConvertUTF8toUTF16(tempLeafName));
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mTempFile->CreateUnique(nsIFile::NORMAL_FILE_TYPE, 0600);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = mTempFile->GetLeafName(mTempLeafName);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  NS_ENSURE_TRUE(StringEndsWith(mTempLeafName, u".part"_ns),
+                 NS_ERROR_UNEXPECTED);
+
+  mTempLeafName.Truncate(mTempLeafName.Length() - std::size(".part") + 1);
+
+  MOZ_ASSERT(!mSaver, "Output file initialization called more than once!");
+  mSaver =
+      do_CreateInstance(NS_BACKGROUNDFILESAVERSTREAMLISTENER_CONTRACTID, &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = mSaver->SetObserver(this);
+  if (NS_FAILED(rv)) {
+    mSaver = nullptr;
+    return rv;
+  }
+
+  rv = mSaver->SetTarget(mTempFile, false);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return rv;
+}
+
+void nsExternalAppHandler::MaybeApplyDecodingForExtension(
+    nsIRequest* aRequest) {
+  MOZ_ASSERT(aRequest);
+
+  nsCOMPtr<nsIEncodedChannel> encChannel = do_QueryInterface(aRequest);
+  if (!encChannel) {
+    return;
+  }
+
+  bool applyConversion = true;
+
+  encChannel->GetApplyConversion(&applyConversion);
+  if (!applyConversion) {
+    return;
+  }
+
+  nsCOMPtr<nsIURL> sourceURL(do_QueryInterface(mSourceUrl));
+  if (sourceURL) {
+    nsAutoCString extension;
+    sourceURL->GetFileExtension(extension);
+    if (!extension.IsEmpty()) {
+      nsCOMPtr<nsIUTF8StringEnumerator> encEnum;
+      encChannel->GetContentEncodings(getter_AddRefs(encEnum));
+      if (encEnum) {
+        bool hasMore;
+        nsresult rv = encEnum->HasMore(&hasMore);
+        if (NS_SUCCEEDED(rv) && hasMore) {
+          nsAutoCString encType;
+          rv = encEnum->GetNext(encType);
+          if (NS_SUCCEEDED(rv) && !encType.IsEmpty()) {
+            MOZ_ASSERT(mExtProtSvc);
+            mExtProtSvc->ApplyDecodingForExtension(extension, encType,
+                                                   &applyConversion);
+          }
+        }
+      }
+    }
+  }
+
+  encChannel->SetApplyConversion(applyConversion);
+}
+
+already_AddRefed<nsIInterfaceRequestor>
+nsExternalAppHandler::GetDialogParent() {
+  nsCOMPtr<nsIInterfaceRequestor> dialogParent = mWindowContext;
+
+  if (!dialogParent && mBrowsingContext) {
+    dialogParent = do_QueryInterface(mBrowsingContext->GetDOMWindow());
+  }
+  if (!dialogParent && mBrowsingContext && XRE_IsParentProcess()) {
+    RefPtr<Element> element = mBrowsingContext->Top()->GetEmbedderElement();
+    if (element) {
+      dialogParent = do_QueryInterface(element->OwnerDoc()->GetWindow());
+    }
+  }
+  return dialogParent.forget();
+}
+
+NS_IMETHODIMP nsExternalAppHandler::OnStartRequest(nsIRequest* request) {
+  MOZ_ASSERT(request, "OnStartRequest without request?");
+
+  mTimeDownloadStarted = PR_Now();
+
+  mRequest = request;
+
+  nsCOMPtr<nsIChannel> aChannel = do_QueryInterface(request);
+
+  nsresult rv;
+  nsAutoCString MIMEType;
+  if (mMimeInfo) {
+    mMimeInfo->GetMIMEType(MIMEType);
+  }
+  if (aChannel) {
+    aChannel->GetURI(getter_AddRefs(mSourceUrl));
+    nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+    if (nsHTTPSOnlyUtils::GetUpgradeMode(loadInfo) !=
+        nsHTTPSOnlyUtils::NO_UPGRADE_MODE) {
+      uint32_t httpsOnlyStatus = loadInfo->GetHttpsOnlyStatus();
+      httpsOnlyStatus |= nsILoadInfo::HTTPS_ONLY_DOWNLOAD_IN_PROGRESS;
+      loadInfo->SetHttpsOnlyStatus(httpsOnlyStatus);
+    }
+  }
+
+  if (!mForceSave && StaticPrefs::browser_download_enable_spam_prevention() &&
+      IsDownloadSpam(aChannel)) {
+    return NS_OK;
+  }
+
+  mDownloadClassification = nsContentSecurityUtils::ClassifyDownload(aChannel);
+
+  if (mDownloadClassification == nsITransfer::DOWNLOAD_FORBIDDEN) {
+    mCanceled = true;
+    request->Cancel(NS_ERROR_ABORT);
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIFileChannel> fileChan(do_QueryInterface(request));
+  mIsFileChannel = fileChan != nullptr;
+  if (!mIsFileChannel) {
+    nsCOMPtr<dom::nsIExternalHelperAppParent> parent(
+        do_QueryInterface(request));
+    mIsFileChannel = parent && parent->WasFileChannel();
+  }
+
+  if (aChannel) {
+    aChannel->GetContentLength(&mContentLength);
+  }
+
+  if (mBrowsingContext) {
+    mMaybeCloseWindowHelper = new MaybeCloseWindowHelper(mBrowsingContext);
+
+    if (aChannel) {
+      nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+      mMaybeCloseWindowHelper->SetShouldCloseWindow(
+          loadInfo->GetIsNewWindowTarget());
+    }
+  }
+
+  RetargetLoadNotifications(request);
+
+  if (!XRE_IsContentProcess() && mMaybeCloseWindowHelper) {
+    mBrowsingContext = mMaybeCloseWindowHelper->MaybeCloseWindow();
+  }
+
+  MaybeApplyDecodingForExtension(aChannel);
+
+  if (XRE_IsContentProcess()) {
+    return NS_OK;
+  }
+
+  rv = SetUpTempFile(aChannel);
+  if (NS_FAILED(rv)) {
+    nsresult transferError = rv;
+
+    rv = CreateFailedTransfer();
+    if (NS_FAILED(rv)) {
+      LOG("Failed to create transfer to report failure."
+          "Will fallback to prompter!");
+    }
+
+    mCanceled = true;
+    request->Cancel(transferError);
+
+    auto res = GetInitialDownloadDirectory(
+        true, mBrowsingContext ? mBrowsingContext->Canonical() : nullptr);
+    if (res.isErr()) {
+      SendStatusChange(kWriteError, transferError, request, mSuggestedFileName);
+      return res.unwrapErr();
+    }
+
+    nsCOMPtr<nsIFile> pseudoFile = res.unwrap();
+    MOZ_ALWAYS_SUCCEEDS(pseudoFile->Append(mSuggestedFileName));
+    nsAutoString path;
+    MOZ_ALWAYS_SUCCEEDS(pseudoFile->GetPath(path));
+    SendStatusChange(kWriteError, transferError, request, path);
+
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIHttpChannelInternal> httpInternal = do_QueryInterface(aChannel);
+  if (httpInternal) {
+    rv = httpInternal->SetChannelIsForDownload(true);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+  }
+
+  if (mSourceUrl->SchemeIs("data")) {
+    nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+    loadInfo->SetForceAllowDataURI(true);
+  }
+
+
+
+
+  bool alwaysAsk = true;
+  mMimeInfo->GetAlwaysAskBeforeHandling(&alwaysAsk);
+  if (alwaysAsk) {
+
+    bool mimeTypeIsInDatastore = false;
+    nsCOMPtr<nsIHandlerService> handlerSvc =
+        do_GetService(NS_HANDLERSERVICE_CONTRACTID);
+    if (handlerSvc) {
+      handlerSvc->Exists(mMimeInfo, &mimeTypeIsInDatastore);
+    }
+    if (!handlerSvc || !mimeTypeIsInDatastore) {
+      if (!GetNeverAskFlagFromPref(NEVER_ASK_FOR_SAVE_TO_DISK_PREF,
+                                   MIMEType.get())) {
+        alwaysAsk = false;
+        mMimeInfo->SetPreferredAction(nsIMIMEInfo::saveToDisk);
+      } else if (!GetNeverAskFlagFromPref(NEVER_ASK_FOR_OPEN_FILE_PREF,
+                                          MIMEType.get())) {
+        alwaysAsk = false;
+      }
+    }
+  }
+
+  int32_t action = nsIMIMEInfo::saveToDisk;
+  mMimeInfo->GetPreferredAction(&action);
+
+  bool forcePrompt = mReason == nsIHelperAppLauncherDialog::REASON_TYPESNIFFED;
+
+  if (!alwaysAsk && forcePrompt) {
+    alwaysAsk = (action != nsIMIMEInfo::saveToDisk);
+  }
+
+  bool shouldAutomaticallyHandleInternally =
+      action == nsIMIMEInfo::handleInternally;
+
+  if (aChannel) {
+    uint32_t disposition = -1;
+    aChannel->GetContentDisposition(&disposition);
+    mForceSaveInternallyHandled =
+        shouldAutomaticallyHandleInternally &&
+        disposition == nsIChannel::DISPOSITION_ATTACHMENT &&
+        mozilla::StaticPrefs::
+            browser_download_force_save_internally_handled_attachments();
+  }
+
+  if (!alwaysAsk) {
+    alwaysAsk = action != nsIMIMEInfo::saveToDisk &&
+                action != nsIMIMEInfo::useHelperApp &&
+                action != nsIMIMEInfo::useSystemDefault &&
+                !shouldAutomaticallyHandleInternally;
+  }
+
+  if (!alwaysAsk && action == nsIMIMEInfo::useSystemDefault) {
+    bool areOSDefault = false;
+    alwaysAsk = NS_SUCCEEDED(mMimeInfo->IsCurrentAppOSDefault(&areOSDefault)) &&
+                areOSDefault;
+  } else if (!alwaysAsk && action == nsIMIMEInfo::useHelperApp) {
+    nsCOMPtr<nsIHandlerApp> preferredApp;
+    mMimeInfo->GetPreferredApplicationHandler(getter_AddRefs(preferredApp));
+    nsCOMPtr<nsILocalHandlerApp> handlerApp = do_QueryInterface(preferredApp);
+    if (handlerApp) {
+      nsCOMPtr<nsIFile> executable;
+      handlerApp->GetExecutable(getter_AddRefs(executable));
+      nsCOMPtr<nsIFile> ourselves;
+      if (executable &&
+          NS_SUCCEEDED(NS_GetSpecialDirectory(XRE_EXECUTABLE_FILE,
+                                              getter_AddRefs(ourselves)))) {
+        ourselves = nsMIMEInfoBase::GetCanonicalExecutable(ourselves);
+        executable = nsMIMEInfoBase::GetCanonicalExecutable(executable);
+        bool isSameApp = false;
+        alwaysAsk =
+            NS_FAILED(executable->Equals(ourselves, &isSameApp)) || isSameApp;
+      }
+    }
+  }
+
+  if (mForceSave || mForceSaveInternallyHandled) {
+    alwaysAsk = false;
+    action = nsIMIMEInfo::saveToDisk;
+    shouldAutomaticallyHandleInternally = false;
+  }
+  if (mSourceUrl->SchemeIs("file") && !alwaysAsk &&
+      action == nsIMIMEInfo::saveToDisk) {
+    alwaysAsk = true;
+  }
+
+
+  if (alwaysAsk) {
+    mDialog = do_CreateInstance(NS_HELPERAPPLAUNCHERDLG_CONTRACTID, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    nsCOMPtr<nsIInterfaceRequestor> dialogParent = GetDialogParent();
+    mDialogShowing = true;
+    rv = mDialog->Show(this, dialogParent, mReason);
+
+  } else {
+    if (action == nsIMIMEInfo::useHelperApp ||
+        action == nsIMIMEInfo::useSystemDefault ||
+        shouldAutomaticallyHandleInternally) {
+      rv = mIsFileChannel ? LaunchLocalFile()
+                          : SetDownloadToLaunch(
+                                shouldAutomaticallyHandleInternally, nullptr);
+    } else {
+      rv = PromptForSaveDestination();
+    }
+  }
+  return NS_OK;
+}
+
+bool nsExternalAppHandler::IsDownloadSpam(nsIChannel* aChannel) {
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  nsCOMPtr<nsIPermissionManager> permissionManager =
+      mozilla::services::GetPermissionManager();
+  nsCOMPtr<nsIPrincipal> principal = loadInfo->TriggeringPrincipal();
+  bool exactHostMatch = false;
+  constexpr auto type = "automatic-download"_ns;
+  nsCOMPtr<nsIPermission> permission;
+
+  permissionManager->GetPermissionObject(principal, type, exactHostMatch,
+                                         getter_AddRefs(permission));
+
+  if (permission) {
+    uint32_t capability;
+    permission->GetCapability(&capability);
+    if (capability == nsIPermissionManager::DENY_ACTION) {
+      mCanceled = true;
+      aChannel->Cancel(NS_ERROR_ABORT);
+      return true;
+    }
+    if (capability == nsIPermissionManager::ALLOW_ACTION) {
+      return false;
+    }
+    if (capability == nsIPermissionManager::PROMPT_ACTION) {
+      nsCOMPtr<nsIObserverService> observerService =
+          mozilla::services::GetObserverService();
+      RefPtr<BrowsingContext> browsingContext;
+      loadInfo->GetBrowsingContext(getter_AddRefs(browsingContext));
+
+      nsAutoCString cStringURI;
+      loadInfo->TriggeringPrincipal()->GetPrePath(cStringURI);
+      observerService->NotifyObservers(
+          browsingContext, "blocked-automatic-download",
+          NS_ConvertASCIItoUTF16(cStringURI.get()).get());
+      mCanceled = true;
+      aChannel->Cancel(NS_ERROR_ABORT);
+      return true;
+    }
+  }
+  if (!loadInfo->GetHasValidUserGestureActivation()) {
+    permissionManager->AddFromPrincipal(
+        principal, type, nsIPermissionManager::PROMPT_ACTION,
+        nsIPermissionManager::EXPIRE_NEVER, 0 );
+  }
+
+  return false;
+}
+
+void nsExternalAppHandler::SendStatusChange(ErrorType type, nsresult rv,
+                                            nsIRequest* aRequest,
+                                            const nsString& path) {
+  const char* msgId = nullptr;
+  switch (rv) {
+    case NS_ERROR_OUT_OF_MEMORY:
+      msgId = "noMemory";
+      break;
+
+    case NS_ERROR_FILE_NO_DEVICE_SPACE:
+      msgId = "diskFull";
+      break;
+
+    case NS_ERROR_FILE_READ_ONLY:
+      msgId = "readOnly";
+      break;
+
+    case NS_ERROR_FILE_ACCESS_DENIED:
+      if (type == kWriteError) {
+        msgId = "accessError";
+      } else {
+        msgId = "launchError";
+      }
+      break;
+
+    case NS_ERROR_FILE_NOT_FOUND:
+    case NS_ERROR_FILE_UNRECOGNIZED_PATH:
+      if (type == kLaunchError) {
+        msgId = "helperAppNotFound";
+        break;
+      }
+      [[fallthrough]];
+
+    default:
+      switch (type) {
+        case kReadError:
+          msgId = "readError";
+          break;
+        case kWriteError:
+          msgId = "writeError";
+          break;
+        case kLaunchError:
+          msgId = "launchError";
+          break;
+      }
+      break;
+  }
+
+  MOZ_LOG(
+      nsExternalHelperAppService::sLog, LogLevel::Error,
+      ("Error: %s, type=%i, listener=0x%p, transfer=0x%p, rv=0x%08" PRIX32 "\n",
+       msgId, type, mDialogProgressListener.get(), mTransfer.get(),
+       static_cast<uint32_t>(rv)));
+
+  MOZ_LOG(nsExternalHelperAppService::sLog, LogLevel::Error,
+          ("       path='%s'\n", NS_ConvertUTF16toUTF8(path).get()));
+
+  nsCOMPtr<nsIStringBundleService> stringService =
+      mozilla::components::StringBundle::Service();
+  if (stringService) {
+    nsCOMPtr<nsIStringBundle> bundle;
+    if (NS_SUCCEEDED(stringService->CreateBundle(
+            "chrome://global/locale/nsWebBrowserPersist.properties",
+            getter_AddRefs(bundle)))) {
+      nsAutoString msgText;
+      AutoTArray<nsString, 1> strings = {path};
+      if (NS_SUCCEEDED(bundle->FormatStringFromName(msgId, strings, msgText))) {
+        if (mDialogProgressListener) {
+          mDialogProgressListener->OnStatusChange(
+              nullptr, (type == kReadError) ? aRequest : nullptr, rv,
+              msgText.get());
+        } else if (mTransfer) {
+          mTransfer->OnStatusChange(nullptr,
+                                    (type == kReadError) ? aRequest : nullptr,
+                                    rv, msgText.get());
+        } else if (XRE_IsParentProcess()) {
+          nsCOMPtr<nsIInterfaceRequestor> dialogParent = GetDialogParent();
+          nsresult qiRv;
+          nsCOMPtr<nsIPrompt> prompter(do_GetInterface(dialogParent, &qiRv));
+          nsAutoString title;
+          bundle->FormatStringFromName("title", strings, title);
+
+          MOZ_LOG(
+              nsExternalHelperAppService::sLog, LogLevel::Debug,
+              ("mBrowsingContext=0x%p, prompter=0x%p, qi rv=0x%08" PRIX32
+               ", title='%s', msg='%s'",
+               mBrowsingContext.get(), prompter.get(),
+               static_cast<uint32_t>(qiRv), NS_ConvertUTF16toUTF8(title).get(),
+               NS_ConvertUTF16toUTF8(msgText).get()));
+
+          if (!prompter) {
+            nsCOMPtr<nsPIDOMWindowOuter> window(do_GetInterface(dialogParent));
+            if (!window || !window->GetDocShell()) {
+              return;
+            }
+
+            prompter = do_GetInterface(window->GetDocShell(), &qiRv);
+
+            MOZ_LOG(nsExternalHelperAppService::sLog, LogLevel::Debug,
+                    ("No prompter from mBrowsingContext, using DocShell, "
+                     "window=0x%p, docShell=0x%p, "
+                     "prompter=0x%p, qi rv=0x%08" PRIX32,
+                     window.get(), window->GetDocShell(), prompter.get(),
+                     static_cast<uint32_t>(qiRv)));
+
+            if (!prompter) {
+              MOZ_LOG(nsExternalHelperAppService::sLog, LogLevel::Error,
+                      ("No prompter from DocShell, no way to alert user"));
+              return;
+            }
+          }
+
+          prompter->Alert(title.get(), msgText.get());
+        }
+      }
+    }
+  }
+}
+
+NS_IMETHODIMP
+nsExternalAppHandler::OnDataAvailable(nsIRequest* request,
+                                      nsIInputStream* inStr,
+                                      uint64_t sourceOffset, uint32_t count) {
+  nsresult rv = NS_OK;
+  if (mCanceled || !mSaver) {
+    return request->Cancel(NS_BINDING_ABORTED);
+  }
+
+  if (count > 0) {
+    mProgress += count;
+
+    nsCOMPtr<nsIStreamListener> saver = do_QueryInterface(mSaver);
+    rv = saver->OnDataAvailable(request, inStr, sourceOffset, count);
+    if (NS_SUCCEEDED(rv)) {
+      if (mTransfer) {
+        mTransfer->OnProgressChange64(nullptr, request, mProgress,
+                                      mContentLength, mProgress,
+                                      mContentLength);
+      }
+    } else {
+      nsAutoString tempFilePath;
+      if (mTempFile) {
+        mTempFile->GetPath(tempFilePath);
+      }
+      SendStatusChange(kReadError, rv, request, tempFilePath);
+
+      Cancel(rv);
+    }
+  }
+  return rv;
+}
+
+NS_IMETHODIMP nsExternalAppHandler::OnStopRequest(nsIRequest* request,
+                                                  nsresult aStatus) {
+  LOG("nsExternalAppHandler::OnStopRequest\n"
+      "  mCanceled=%d, mTransfer=0x%p, aStatus=0x%08" PRIX32 "\n",
+      mCanceled, mTransfer.get(), static_cast<uint32_t>(aStatus));
+
+  mStopRequestIssued = true;
+
+  if (!mCanceled && NS_FAILED(aStatus)) {
+    nsAutoString tempFilePath;
+    if (mTempFile) mTempFile->GetPath(tempFilePath);
+    SendStatusChange(kReadError, aStatus, request, tempFilePath);
+
+    Cancel(aStatus);
+  }
+
+  if (mCanceled || !mSaver) {
+    return NS_OK;
+  }
+
+  return mSaver->Finish(NS_OK);
+}
+
+NS_IMETHODIMP
+nsExternalAppHandler::OnTargetChange(nsIBackgroundFileSaver* aSaver,
+                                     nsIFile* aTarget) {
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsExternalAppHandler::OnSaveComplete(nsIBackgroundFileSaver* aSaver,
+                                     nsresult aStatus) {
+  LOG("nsExternalAppHandler::OnSaveComplete\n"
+      "  aSaver=0x%p, aStatus=0x%08" PRIX32 ", mCanceled=%d, mTransfer=0x%p\n",
+      aSaver, static_cast<uint32_t>(aStatus), mCanceled, mTransfer.get());
+
+  if (!mCanceled) {
+    mSaver = nullptr;
+
+    nsCOMPtr<nsIChannel> channel = do_QueryInterface(mRequest);
+    if (channel) {
+      nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+      nsresult rv = NS_OK;
+      nsCOMPtr<nsIMutableArray> redirectChain =
+          do_CreateInstance(NS_ARRAY_CONTRACTID, &rv);
+      NS_ENSURE_SUCCESS(rv, rv);
+      LOG("nsExternalAppHandler: Got %zu redirects\n",
+          loadInfo->RedirectChain().Length());
+      for (nsIRedirectHistoryEntry* entry : loadInfo->RedirectChain()) {
+        redirectChain->AppendElement(entry);
+      }
+      mRedirects = redirectChain;
+    }
+
+    if (NS_FAILED(aStatus)) {
+      nsAutoString path;
+      mTempFile->GetPath(path);
+
+      if (!mTransfer) {
+        CreateFailedTransfer();
+      }
+
+      SendStatusChange(kWriteError, aStatus, nullptr, path);
+      if (!mCanceled) Cancel(aStatus);
+      return NS_OK;
+    }
+  }
+
+  if (mTransfer) {
+    NotifyTransfer(aStatus);
+  }
+
+  return NS_OK;
+}
+
+void nsExternalAppHandler::NotifyTransfer(nsresult aStatus) {
+  MOZ_ASSERT(NS_IsMainThread(), "Must notify on main thread");
+  MOZ_ASSERT(mTransfer, "We must have an nsITransfer");
+
+  LOG("Notifying progress listener");
+
+  if (NS_SUCCEEDED(aStatus)) {
+    (void)mTransfer->SetRedirects(mRedirects);
+    (void)mTransfer->OnProgressChange64(
+        nullptr, nullptr, mProgress, mContentLength, mProgress, mContentLength);
+  }
+
+  (void)mTransfer->OnStateChange(nullptr, nullptr,
+                                 nsIWebProgressListener::STATE_STOP |
+                                     nsIWebProgressListener::STATE_IS_REQUEST |
+                                     nsIWebProgressListener::STATE_IS_NETWORK,
+                                 aStatus);
+
+  mTransfer = nullptr;
+}
+
+NS_IMETHODIMP nsExternalAppHandler::GetMIMEInfo(nsIMIMEInfo** aMIMEInfo) {
+  *aMIMEInfo = mMimeInfo;
+  NS_ADDREF(*aMIMEInfo);
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsExternalAppHandler::GetSource(nsIURI** aSourceURI) {
+  NS_ENSURE_ARG(aSourceURI);
+  *aSourceURI = mSourceUrl;
+  NS_IF_ADDREF(*aSourceURI);
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsExternalAppHandler::GetSuggestedFileName(
+    nsAString& aSuggestedFileName) {
+  aSuggestedFileName = mSuggestedFileName;
+  return NS_OK;
+}
+
+nsresult nsExternalAppHandler::CreateTransfer() {
+  LOG("nsExternalAppHandler::CreateTransfer");
+
+  MOZ_ASSERT(NS_IsMainThread(), "Must create transfer on main thread");
+  mDialog = nullptr;
+  if (!mDialogProgressListener) {
+    NS_WARNING("The dialog should nullify the dialog progress listener");
+  }
+  if (mDownloadClassification != nsITransfer::DOWNLOAD_ACCEPTABLE) {
+    mCanceled = true;
+    mRequest->Cancel(NS_ERROR_ABORT);
+    if (mSaver) {
+      mSaver->Finish(NS_ERROR_ABORT);
+      mSaver = nullptr;
+    }
+    return CreateFailedTransfer();
+  }
+  nsresult rv;
+
+  nsCOMPtr<nsITransfer> transfer =
+      do_CreateInstance(NS_TRANSFER_CONTRACTID, &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIURI> target;
+  rv = NS_NewFileURI(getter_AddRefs(target), mFinalFileDestination);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIChannel> channel = do_QueryInterface(mRequest);
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(mRequest);
+  nsCOMPtr<nsIReferrerInfo> referrerInfo = nullptr;
+  if (httpChannel) {
+    referrerInfo = httpChannel->GetReferrerInfo();
+  }
+
+  if (mBrowsingContext) {
+    rv = transfer->InitWithBrowsingContext(
+        mSourceUrl, target, u""_ns, mMimeInfo, mTimeDownloadStarted, mTempFile,
+        this, channel && NS_UsePrivateBrowsing(channel),
+        mDownloadClassification, referrerInfo, !mDialogShowing,
+        mBrowsingContext, mHandleInternally, nullptr);
+  } else {
+    rv = transfer->Init(mSourceUrl, nullptr, target, u""_ns, mMimeInfo,
+                        mTimeDownloadStarted, mTempFile, this,
+                        channel && NS_UsePrivateBrowsing(channel),
+                        mDownloadClassification, referrerInfo, !mDialogShowing);
+  }
+  mDialogShowing = false;
+
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (mCanceled) {
+    return NS_OK;
+  }
+  rv = transfer->OnStateChange(nullptr, mRequest,
+                               nsIWebProgressListener::STATE_START |
+                                   nsIWebProgressListener::STATE_IS_REQUEST |
+                                   nsIWebProgressListener::STATE_IS_NETWORK,
+                               NS_OK);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (mCanceled) {
+    return NS_OK;
+  }
+
+  mRequest = nullptr;
+  mTransfer = transfer;
+  transfer = nullptr;
+
+  if (mStopRequestIssued && !mSaver && mTransfer) {
+    NotifyTransfer(NS_OK);
+  }
+
+  return rv;
+}
+
+nsresult nsExternalAppHandler::CreateFailedTransfer() {
+  nsresult rv;
+  nsCOMPtr<nsITransfer> transfer =
+      do_CreateInstance(NS_TRANSFER_CONTRACTID, &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (mTempFile) {
+    if (mSaver) {
+      mSaver->Finish(NS_BINDING_ABORTED);
+      mSaver = nullptr;
+    }
+    mTempFile->Remove(false);
+  }
+
+  nsCOMPtr<nsIURI> pseudoTarget;
+  if (!mFinalFileDestination) {
+    auto res = GetInitialDownloadDirectory(
+        true, mBrowsingContext ? mBrowsingContext->Canonical() : nullptr);
+    if (res.isErr()) return res.unwrapErr();
+    nsCOMPtr<nsIFile> pseudoFile = res.unwrap();
+
+    rv = pseudoFile->Append(mSuggestedFileName);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = NS_NewFileURI(getter_AddRefs(pseudoTarget), pseudoFile);
+    NS_ENSURE_SUCCESS(rv, rv);
+  } else {
+    rv = NS_NewFileURI(getter_AddRefs(pseudoTarget), mFinalFileDestination);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  nsCOMPtr<nsIChannel> channel = do_QueryInterface(mRequest);
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(mRequest);
+  nsCOMPtr<nsIReferrerInfo> referrerInfo = nullptr;
+  if (httpChannel) {
+    referrerInfo = httpChannel->GetReferrerInfo();
+  }
+
+  if (mBrowsingContext) {
+    rv = transfer->InitWithBrowsingContext(
+        mSourceUrl, pseudoTarget, u""_ns, mMimeInfo, mTimeDownloadStarted,
+        mTempFile, this, channel && NS_UsePrivateBrowsing(channel),
+        mDownloadClassification, referrerInfo, true, mBrowsingContext,
+        mHandleInternally, httpChannel);
+  } else {
+    rv = transfer->Init(mSourceUrl, nullptr, pseudoTarget, u""_ns, mMimeInfo,
+                        mTimeDownloadStarted, mTempFile, this,
+                        channel && NS_UsePrivateBrowsing(channel),
+                        mDownloadClassification, referrerInfo, true);
+  }
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mTransfer = std::move(transfer);
+
+  return NS_OK;
+}
+
+nsresult nsExternalAppHandler::SaveDestinationAvailable(nsIFile* aFile,
+                                                        bool aDialogWasShown) {
+  if (aFile) {
+    if (aDialogWasShown) {
+      mDialogShowing = true;
+    }
+    ContinueSave(aFile);
+  } else {
+    Cancel(NS_BINDING_ABORTED);
+  }
+
+  return NS_OK;
+}
+
+void nsExternalAppHandler::RequestSaveDestination(
+    const nsString& aDefaultFile, const nsString& aFileExtension) {
+  nsresult rv = NS_OK;
+  if (!mDialog) {
+    mDialog = do_CreateInstance(NS_HELPERAPPLAUNCHERDLG_CONTRACTID, &rv);
+    if (rv != NS_OK) {
+      Cancel(NS_BINDING_ABORTED);
+      return;
+    }
+  }
+
+
+  RefPtr<nsExternalAppHandler> kungFuDeathGrip(this);
+  nsCOMPtr<nsIHelperAppLauncherDialog> dlg(mDialog);
+  nsCOMPtr<nsIInterfaceRequestor> dialogParent = GetDialogParent();
+
+  rv = dlg->PromptForSaveToFileAsync(this, dialogParent, aDefaultFile.get(),
+                                     aFileExtension.get(), mForceSave);
+  if (NS_FAILED(rv)) {
+    Cancel(NS_BINDING_ABORTED);
+  }
+}
+
+NS_IMETHODIMP nsExternalAppHandler::PromptForSaveDestination() {
+  if (mCanceled) return NS_OK;
+
+  if (mForceSave || mForceSaveInternallyHandled) {
+    mMimeInfo->SetPreferredAction(nsIMIMEInfo::saveToDisk);
+  }
+
+  if (mSuggestedFileName.IsEmpty()) {
+    RequestSaveDestination(mTempLeafName, mFileExtension);
+  } else {
+    nsAutoString fileExt;
+    int32_t pos = mSuggestedFileName.RFindChar('.');
+    if (pos >= 0) {
+      mSuggestedFileName.Right(fileExt, mSuggestedFileName.Length() - pos);
+    }
+    if (fileExt.IsEmpty()) {
+      fileExt = mFileExtension;
+    }
+
+    RequestSaveDestination(mSuggestedFileName, fileExt);
+  }
+
+  return NS_OK;
+}
+nsresult nsExternalAppHandler::ContinueSave(nsIFile* aNewFileLocation) {
+  if (mCanceled) return NS_OK;
+
+  MOZ_ASSERT(aNewFileLocation, "Must be called with a non-null file");
+
+  int32_t action = nsIMIMEInfo::saveToDisk;
+  mMimeInfo->GetPreferredAction(&action);
+  mHandleInternally = action == nsIMIMEInfo::handleInternally;
+
+  nsresult rv = NS_OK;
+  nsCOMPtr<nsIFile> fileToUse = aNewFileLocation;
+  mFinalFileDestination = std::move(fileToUse);
+
+  if (mFinalFileDestination && mSaver && !mStopRequestIssued) {
+    nsCOMPtr<nsIFile> movedFile;
+    mFinalFileDestination->Clone(getter_AddRefs(movedFile));
+    if (movedFile) {
+      nsAutoCString randomChars;
+      rv = GenerateRandomName(randomChars);
+      if (NS_SUCCEEDED(rv)) {
+        nsAutoString leafName;
+        mFinalFileDestination->GetLeafName(leafName);
+        auto nameWithoutExtensionLength = leafName.FindChar('.');
+        nsAutoString extensions(u"");
+        if (nameWithoutExtensionLength == kNotFound) {
+          nameWithoutExtensionLength = leafName.Length();
+        } else {
+          extensions = Substring(leafName, nameWithoutExtensionLength);
+        }
+        leafName.Truncate(nameWithoutExtensionLength);
+
+        nsAutoString suffix = u"."_ns + NS_ConvertASCIItoUTF16(randomChars) +
+                              extensions + u".part"_ns;
+        leafName.Append(suffix);
+        movedFile->SetLeafName(leafName);
+
+        rv = mSaver->SetTarget(movedFile, true);
+        if (NS_FAILED(rv)) {
+          nsAutoString path;
+          mTempFile->GetPath(path);
+          SendStatusChange(kWriteError, rv, nullptr, path);
+          Cancel(rv);
+          return NS_OK;
+        }
+
+        mTempFile = std::move(movedFile);
+      }
+    }
+  }
+
+  rv = CreateTransfer();
+  if (NS_FAILED(rv)) {
+    Cancel(rv);
+    return rv;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsExternalAppHandler::SetDownloadToLaunch(
+    bool aHandleInternally, nsIFile* aNewFileLocation) {
+  if (mCanceled) return NS_OK;
+
+  mHandleInternally = aHandleInternally;
+
+  nsCOMPtr<nsIFile> fileToUse;
+  if (aNewFileLocation) {
+    fileToUse = aNewFileLocation;
+  } else {
+    auto res = GetInitialDownloadDirectory(
+        false, mBrowsingContext ? mBrowsingContext->Canonical() : nullptr);
+    if (res.isErr()) return res.unwrapErr();
+    fileToUse = res.unwrap();
+
+    if (mSuggestedFileName.IsEmpty()) {
+      mSuggestedFileName = mTempLeafName;
+    }
+
+    fileToUse->Append(mSuggestedFileName);
+  }
+
+  nsresult rv = fileToUse->CreateUnique(nsIFile::NORMAL_FILE_TYPE, 0600);
+  if (NS_SUCCEEDED(rv)) {
+    mFinalFileDestination = std::move(fileToUse);
+    rv = CreateTransfer();
+    if (NS_FAILED(rv)) {
+      Cancel(rv);
+    }
+  } else {
+    nsAutoString path;
+    mTempFile->GetPath(path);
+    SendStatusChange(kWriteError, rv, nullptr, path);
+    Cancel(rv);
+  }
+  return rv;
+}
+
+nsresult nsExternalAppHandler::LaunchLocalFile() {
+  nsCOMPtr<nsIFileURL> fileUrl(do_QueryInterface(mSourceUrl));
+  if (!fileUrl) {
+    return NS_OK;
+  }
+  Cancel(NS_BINDING_ABORTED);
+  nsCOMPtr<nsIFile> file;
+  nsresult rv = fileUrl->GetFile(getter_AddRefs(file));
+
+  if (NS_SUCCEEDED(rv)) {
+    rv = mMimeInfo->LaunchWithFile(file);
+    if (NS_SUCCEEDED(rv)) return NS_OK;
+  }
+  nsAutoString path;
+  if (file) file->GetPath(path);
+  SendStatusChange(kLaunchError, rv, nullptr, path);
+  return rv;
+}
+
+NS_IMETHODIMP nsExternalAppHandler::Cancel(nsresult aReason) {
+  NS_ENSURE_ARG(NS_FAILED(aReason));
+
+  if (mCanceled) {
+    return NS_OK;
+  }
+  mCanceled = true;
+
+  if (mSaver) {
+    mSaver->Finish(aReason);
+    mSaver = nullptr;
+  } else {
+    if (mStopRequestIssued && mTempFile) {
+      (void)mTempFile->Remove(false);
+    }
+
+    if (mTransfer) {
+      NotifyTransfer(aReason);
+    }
+  }
+
+  mDialog = nullptr;
+  mDialogShowing = false;
+
+  mRequest = nullptr;
+
+  mDialogProgressListener = nullptr;
+
+  return NS_OK;
+}
+
+bool nsExternalAppHandler::GetNeverAskFlagFromPref(const char* prefName,
+                                                   const char* aContentType) {
+  nsAutoCString prefCString;
+  Preferences::GetCString(prefName, prefCString);
+  if (prefCString.IsEmpty()) {
+    return true;
+  }
+
+  NS_UnescapeURL(prefCString);
+  nsACString::const_iterator start, end;
+  prefCString.BeginReading(start);
+  prefCString.EndReading(end);
+  return !CaseInsensitiveFindInReadable(nsDependentCString(aContentType), start,
+                                        end);
+}
+
+NS_IMETHODIMP
+nsExternalAppHandler::GetName(nsACString& aName) {
+  aName.AssignLiteral("nsExternalAppHandler");
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP nsExternalHelperAppService::GetFromTypeAndExtension(
+    const nsACString& aMIMEType, const nsACString& aFileExt,
+    nsIMIMEInfo** _retval) {
+  MOZ_ASSERT(!aMIMEType.IsEmpty() || !aFileExt.IsEmpty(),
+             "Give me something to work with");
+  MOZ_DIAGNOSTIC_ASSERT(aFileExt.FindChar('\0') == kNotFound,
+                        "The extension should never contain null characters");
+  LOG("Getting mimeinfo from type '%s' ext '%s'\n",
+      PromiseFlatCString(aMIMEType).get(), PromiseFlatCString(aFileExt).get());
+
+  *_retval = nullptr;
+
+  nsAutoCString typeToUse(aMIMEType);
+  if (typeToUse.IsEmpty()) {
+    nsresult rv = GetTypeFromExtension(aFileExt, typeToUse);
+    if (NS_FAILED(rv)) return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  ToLowerCase(typeToUse);
+
+  bool found;
+  nsresult rv = GetMIMEInfoFromOS(typeToUse, aFileExt, &found, _retval);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  LOG("OS gave back 0x%p - found: %i\n", *_retval, found);
+  if (!*_retval) return NS_ERROR_OUT_OF_MEMORY;
+
+  bool trustMIMEType = false;
+
+  if (!typeToUse.Equals(APPLICATION_OCTET_STREAM,
+                        nsCaseInsensitiveCStringComparator)) {
+    rv = FillMIMEInfoForMimeTypeFromExtras(typeToUse, !found, *_retval);
+    LOG("Searched extras (by type), rv 0x%08" PRIX32 "\n",
+        static_cast<uint32_t>(rv));
+    trustMIMEType = NS_SUCCEEDED(rv);
+    found = found || NS_SUCCEEDED(rv);
+  }
+
+  nsCOMPtr<nsIHandlerService> handlerSvc =
+      do_GetService(NS_HANDLERSERVICE_CONTRACTID);
+  if (handlerSvc) {
+    bool hasHandler = false;
+    (void)handlerSvc->Exists(*_retval, &hasHandler);
+    if (hasHandler) {
+      rv = handlerSvc->FillHandlerInfo(*_retval, ""_ns);
+      LOG("Data source: Via type: retval 0x%08" PRIx32 "\n",
+          static_cast<uint32_t>(rv));
+      trustMIMEType = trustMIMEType || NS_SUCCEEDED(rv);
+    } else {
+      rv = NS_ERROR_NOT_AVAILABLE;
+    }
+
+    found = found || NS_SUCCEEDED(rv);
+  }
+
+  if (!found && !aFileExt.IsEmpty()) {
+    rv = FillMIMEInfoForExtensionFromExtras(aFileExt, *_retval);
+    LOG("Searched extras (by ext), rv 0x%08" PRIX32 "\n",
+        static_cast<uint32_t>(rv));
+  }
+
+  if ((!found || !trustMIMEType) && handlerSvc && !aFileExt.IsEmpty()) {
+    nsAutoCString overrideType;
+    rv = handlerSvc->GetTypeFromExtension(aFileExt, overrideType);
+    if (NS_SUCCEEDED(rv) && !overrideType.IsEmpty()) {
+      rv = handlerSvc->FillHandlerInfo(*_retval, overrideType);
+      LOG("Data source: Via ext: retval 0x%08" PRIx32 "\n",
+          static_cast<uint32_t>(rv));
+      found = found || NS_SUCCEEDED(rv);
+    }
+  }
+
+  if (!found && !aFileExt.IsEmpty()) {
+    nsAutoCString desc(aFileExt);
+    desc.AppendLiteral(" File");
+    (*_retval)->SetDescription(NS_ConvertUTF8toUTF16(desc));
+    LOG("Falling back to 'File' file description\n");
+  }
+
+  nsAutoCString primaryExtension;
+  (*_retval)->GetPrimaryExtension(primaryExtension);
+  if (!primaryExtension.EqualsIgnoreCase(PromiseFlatCString(aFileExt).get())) {
+    if (MaybeReplacePrimaryExtension(primaryExtension, *_retval)) {
+      (*_retval)->GetPrimaryExtension(primaryExtension);
+    }
+  }
+
+  if (!aFileExt.IsEmpty()) {
+    bool matches = false;
+    (*_retval)->ExtensionExists(aFileExt, &matches);
+    LOG("Extension '%s' matches mime info: %i\n",
+        PromiseFlatCString(aFileExt).get(), matches);
+    if (matches) {
+      nsAutoCString fileExt;
+      ToLowerCase(aFileExt, fileExt);
+      (*_retval)->SetPrimaryExtension(fileExt);
+      primaryExtension = fileExt;
+    }
+  }
+
+  if (!primaryExtension.IsEmpty()) {
+    for (const char* ext : descriptionOverwriteExtensions) {
+      if (primaryExtension.Equals(ext)) {
+        nsCOMPtr<nsIStringBundleService> bundleService =
+            do_GetService(NS_STRINGBUNDLE_CONTRACTID, &rv);
+        NS_ENSURE_SUCCESS(rv, rv);
+        nsCOMPtr<nsIStringBundle> unknownContentTypeBundle;
+        rv = bundleService->CreateBundle(
+            "chrome://mozapps/locale/downloads/unknownContentType.properties",
+            getter_AddRefs(unknownContentTypeBundle));
+        if (NS_SUCCEEDED(rv)) {
+          nsAutoCString stringName(ext);
+          stringName.AppendLiteral("ExtHandlerDescription");
+          nsAutoString handlerDescription;
+          rv = unknownContentTypeBundle->GetStringFromName(stringName.get(),
+                                                           handlerDescription);
+          if (NS_SUCCEEDED(rv)) {
+            (*_retval)->SetDescription(handlerDescription);
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  if (LOG_ENABLED()) {
+    nsAutoCString type;
+    (*_retval)->GetMIMEType(type);
+
+    LOG("MIME Info Summary: Type '%s', Primary Ext '%s'\n", type.get(),
+        primaryExtension.get());
+  }
+
+  return NS_OK;
+}
+
+bool nsExternalHelperAppService::GetMIMETypeFromDefaultForExtension(
+    const nsACString& aExtension, nsACString& aMIMEType) {
+  for (auto& entry : defaultMimeEntries) {
+    if (aExtension.LowerCaseEqualsASCII(entry.mFileExtension)) {
+      aMIMEType = entry.mMimeType;
+      return true;
+    }
+  }
+  return false;
+}
+
+NS_IMETHODIMP
+nsExternalHelperAppService::GetTypeFromExtension(const nsACString& aFileExt,
+                                                 nsACString& aContentType) {
+
+  if (aFileExt.IsEmpty()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  if (GetMIMETypeFromDefaultForExtension(aFileExt, aContentType)) {
+    return NS_OK;
+  }
+
+  if (GetMIMETypeFromOSForExtension(aFileExt, aContentType)) {
+    return NS_OK;
+  }
+
+  bool found = GetTypeFromExtras(aFileExt, aContentType);
+  if (found) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsICategoryManager> catMan(
+      do_GetService("@mozilla.org/categorymanager;1"));
+  if (catMan) {
+    nsAutoCString lowercaseFileExt(aFileExt);
+    ToLowerCase(lowercaseFileExt);
+    nsCString type;
+    nsresult rv =
+        catMan->GetCategoryEntry("ext-to-type-mapping", lowercaseFileExt, type);
+    if (NS_SUCCEEDED(rv)) {
+      aContentType = type;
+      return NS_OK;
+    }
+  }
+
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+NS_IMETHODIMP nsExternalHelperAppService::GetPrimaryExtension(
+    const nsACString& aMIMEType, const nsACString& aFileExt,
+    nsACString& _retval) {
+  NS_ENSURE_ARG(!aMIMEType.IsEmpty());
+
+  nsCOMPtr<nsIMIMEInfo> mi;
+  nsresult rv =
+      GetFromTypeAndExtension(aMIMEType, aFileExt, getter_AddRefs(mi));
+  if (NS_FAILED(rv)) return rv;
+
+  return mi->GetPrimaryExtension(_retval);
+}
+
+NS_IMETHODIMP nsExternalHelperAppService::GetDefaultTypeFromURI(
+    nsIURI* aURI, nsACString& aContentType) {
+  NS_ENSURE_ARG_POINTER(aURI);
+  nsresult rv = NS_ERROR_NOT_AVAILABLE;
+  aContentType.Truncate();
+
+  nsCOMPtr<nsIURL> url = do_QueryInterface(aURI);
+  if (!url) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  nsAutoCString ext;
+  rv = url->GetFileExtension(ext);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (!ext.IsEmpty()) {
+    UnescapeFragment(ext, url, ext);
+
+    if (GetMIMETypeFromDefaultForExtension(ext, aContentType)) {
+      return NS_OK;
+    }
+  }
+
+  return NS_ERROR_NOT_AVAILABLE;
+};
+
+NS_IMETHODIMP nsExternalHelperAppService::GetTypeFromURI(
+    nsIURI* aURI, nsACString& aContentType) {
+  NS_ENSURE_ARG_POINTER(aURI);
+  nsresult rv = NS_ERROR_NOT_AVAILABLE;
+  aContentType.Truncate();
+
+  nsCOMPtr<nsIFileURL> fileUrl = do_QueryInterface(aURI);
+  if (fileUrl) {
+    nsCOMPtr<nsIFile> file;
+    rv = fileUrl->GetFile(getter_AddRefs(file));
+    if (NS_SUCCEEDED(rv)) {
+      rv = GetTypeFromFile(file, aContentType);
+      if (NS_SUCCEEDED(rv)) {
+        return rv;
+      }
+    }
+  }
+
+  nsCOMPtr<nsIURL> url = do_QueryInterface(aURI);
+  if (url) {
+    nsAutoCString ext;
+    rv = url->GetFileExtension(ext);
+    if (NS_FAILED(rv)) return rv;
+    if (ext.IsEmpty()) return NS_ERROR_NOT_AVAILABLE;
+
+    UnescapeFragment(ext, url, ext);
+
+    return GetTypeFromExtension(ext, aContentType);
+  }
+
+  nsAutoCString specStr;
+  rv = aURI->GetSpec(specStr);
+  if (NS_FAILED(rv)) return rv;
+  UnescapeFragment(specStr, aURI, specStr);
+
+  int32_t extLoc = specStr.RFindChar('.');
+  int32_t specLength = specStr.Length();
+  if (-1 != extLoc && extLoc != specLength - 1 &&
+      specLength - extLoc < 20) {
+    return GetTypeFromExtension(Substring(specStr, extLoc + 1), aContentType);
+  }
+
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+NS_IMETHODIMP nsExternalHelperAppService::GetTypeFromFile(
+    nsIFile* aFile, nsACString& aContentType) {
+  NS_ENSURE_ARG_POINTER(aFile);
+  nsresult rv;
+
+  nsAutoString fileName;
+  rv = aFile->GetLeafName(fileName);
+  if (NS_FAILED(rv)) return rv;
+
+  nsAutoCString fileExt;
+  if (!fileName.IsEmpty()) {
+    int32_t len = fileName.Length();
+    for (int32_t i = len; i >= 0; i--) {
+      if (fileName[i] == char16_t('.')) {
+        CopyUTF16toUTF8(Substring(fileName, i + 1), fileExt);
+        break;
+      }
+    }
+  }
+
+  if (fileExt.IsEmpty()) return NS_ERROR_FAILURE;
+
+  return GetTypeFromExtension(fileExt, aContentType);
+}
+
+nsresult nsExternalHelperAppService::FillMIMEInfoForMimeTypeFromExtras(
+    const nsACString& aContentType, bool aOverwriteDescription,
+    nsIMIMEInfo* aMIMEInfo) {
+  NS_ENSURE_ARG(aMIMEInfo);
+
+  NS_ENSURE_ARG(!aContentType.IsEmpty());
+
+  nsAutoCString MIMEType(aContentType);
+  ToLowerCase(MIMEType);
+  for (auto entry : extraMimeEntries) {
+    if (MIMEType.Equals(entry.mMimeType)) {
+      nsDependentCString extensions(entry.mFileExtensions);
+      nsACString::const_iterator start, end;
+      extensions.BeginReading(start);
+      extensions.EndReading(end);
+      while (start != end) {
+        nsACString::const_iterator cursor = start;
+        (void)FindCharInReadable(',', cursor, end);
+        aMIMEInfo->AppendExtension(Substring(start, cursor));
+        start = cursor != end ? ++cursor : cursor;
+      }
+
+      nsAutoString desc;
+      aMIMEInfo->GetDescription(desc);
+      if (aOverwriteDescription || desc.IsEmpty()) {
+        aMIMEInfo->SetDescription(NS_ConvertASCIItoUTF16(entry.mDescription));
+      }
+      return NS_OK;
+    }
+  }
+
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+nsresult nsExternalHelperAppService::FillMIMEInfoForExtensionFromExtras(
+    const nsACString& aExtension, nsIMIMEInfo* aMIMEInfo) {
+  nsAutoCString type;
+  bool found = GetTypeFromExtras(aExtension, type);
+  if (!found) return NS_ERROR_NOT_AVAILABLE;
+  return FillMIMEInfoForMimeTypeFromExtras(type, true, aMIMEInfo);
+}
+
+bool nsExternalHelperAppService::MaybeReplacePrimaryExtension(
+    const nsACString& aPrimaryExtension, nsIMIMEInfo* aMIMEInfo) {
+  for (const auto& entry : sForbiddenPrimaryExtensions) {
+    if (aPrimaryExtension.LowerCaseEqualsASCII(entry.mFileExtension)) {
+      nsDependentCString mime(entry.mMimeType);
+      for (const auto& extraEntry : extraMimeEntries) {
+        if (mime.LowerCaseEqualsASCII(extraEntry.mMimeType)) {
+          nsDependentCString goodExts(extraEntry.mFileExtensions);
+          int32_t commaPos = goodExts.FindChar(',');
+          commaPos = commaPos == kNotFound ? goodExts.Length() : commaPos;
+          auto goodExt = Substring(goodExts, 0, commaPos);
+          aMIMEInfo->SetPrimaryExtension(goodExt);
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+bool nsExternalHelperAppService::GetTypeFromExtras(const nsACString& aExtension,
+                                                   nsACString& aMIMEType) {
+  NS_ASSERTION(!aExtension.IsEmpty(), "Empty aExtension parameter!");
+
+  nsDependentCString::const_iterator start, end, iter;
+  int32_t numEntries = std::size(extraMimeEntries);
+  for (int32_t index = 0; index < numEntries; index++) {
+    nsDependentCString extList(extraMimeEntries[index].mFileExtensions);
+    extList.BeginReading(start);
+    extList.EndReading(end);
+    iter = start;
+    while (start != end) {
+      FindCharInReadable(',', iter, end);
+      if (Substring(start, iter)
+              .Equals(aExtension, nsCaseInsensitiveCStringComparator)) {
+        aMIMEType = extraMimeEntries[index].mMimeType;
+        return true;
+      }
+      if (iter != end) {
+        ++iter;
+      }
+      start = iter;
+    }
+  }
+
+  return false;
+}
+
+bool nsExternalHelperAppService::GetMIMETypeFromOSForExtension(
+    const nsACString& aExtension, nsACString& aMIMEType) {
+  bool found = false;
+  nsCOMPtr<nsIMIMEInfo> mimeInfo;
+  nsresult rv =
+      GetMIMEInfoFromOS(""_ns, aExtension, &found, getter_AddRefs(mimeInfo));
+  return NS_SUCCEEDED(rv) && found && mimeInfo &&
+         NS_SUCCEEDED(mimeInfo->GetMIMEType(aMIMEType));
+}
+
+nsresult nsExternalHelperAppService::GetMIMEInfoFromOS(
+    const nsACString& aMIMEType, const nsACString& aFileExt, bool* aFound,
+    nsIMIMEInfo** aMIMEInfo) {
+  *aMIMEInfo = nullptr;
+  *aFound = false;
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+nsresult nsExternalHelperAppService::UpdateDefaultAppInfo(
+    nsIMIMEInfo* aMIMEInfo) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+bool nsExternalHelperAppService::GetFileNameFromChannel(nsIChannel* aChannel,
+                                                        nsAString& aFileName,
+                                                        nsIURI** aURI) {
+  if (!aChannel) {
+    return false;
+  }
+
+  aChannel->GetURI(aURI);
+  nsCOMPtr<nsIURL> url = do_QueryInterface(*aURI);
+
+  bool allowURLExt = !net::ChannelIsPost(aChannel);
+
+  if (url && allowURLExt) {
+    nsAutoCString query;
+
+    if (net::SchemeIsHttpOrHttps(url)) {
+      url->GetQuery(query);
+    }
+
+    allowURLExt = query.IsEmpty();
+  }
+
+  aChannel->GetContentDispositionFilename(aFileName);
+
+  return allowURLExt;
+}
+
+NS_IMETHODIMP
+nsExternalHelperAppService::GetValidFileName(nsIChannel* aChannel,
+                                             const nsACString& aType,
+                                             nsIURI* aOriginalURI,
+                                             uint32_t aFlags,
+                                             nsAString& aOutFileName) {
+  nsCOMPtr<nsIURI> uri;
+  bool allowURLExtension =
+      GetFileNameFromChannel(aChannel, aOutFileName, getter_AddRefs(uri));
+
+  nsCOMPtr<nsIMIMEInfo> mimeInfo = ValidateFileNameForSaving(
+      aOutFileName, aType, uri, aOriginalURI, aFlags, allowURLExtension);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsExternalHelperAppService::ValidateFileNameForSaving(
+    const nsAString& aFileName, const nsACString& aType, uint32_t aFlags,
+    nsAString& aOutFileName) {
+  nsAutoString fileName(aFileName);
+
+  if (aFlags & VALIDATE_SANITIZE_ONLY) {
+    SanitizeFileName(fileName, aFlags);
+  } else {
+    nsCOMPtr<nsIMIMEInfo> mimeInfo = ValidateFileNameForSaving(
+        fileName, aType, nullptr, nullptr, aFlags, true);
+  }
+
+  aOutFileName = fileName;
+  return NS_OK;
+}
+
+already_AddRefed<nsIMIMEInfo>
+nsExternalHelperAppService::ValidateFileNameForSaving(
+    nsAString& aFileName, const nsACString& aMimeType, nsIURI* aURI,
+    nsIURI* aOriginalURI, uint32_t aFlags, bool aAllowURLExtension) {
+  nsAutoString fileName(aFileName);
+  nsAutoCString extension;
+  nsCOMPtr<nsIMIMEInfo> mimeInfo;
+
+  bool isBinaryType = aMimeType.EqualsLiteral(APPLICATION_OCTET_STREAM) ||
+                      aMimeType.EqualsLiteral(BINARY_OCTET_STREAM) ||
+                      aMimeType.EqualsLiteral("application/x-msdownload");
+
+  fileName.Trim(".");
+
+  bool urlIsFile = !!aURI && aURI->SchemeIs("file");
+
+  nsCOMPtr<nsIMIMEService> mimeService = do_GetService("@mozilla.org/mime;1");
+  if (mimeService) {
+    if (fileName.IsEmpty()) {
+      nsCOMPtr<nsIURL> url = do_QueryInterface(aURI);
+      if (url) {
+        nsAutoCString leafName;
+        url->GetFileName(leafName);
+        if (!leafName.IsEmpty()) {
+          if (NS_FAILED(UnescapeFragment(leafName, url, fileName))) {
+            CopyUTF8toUTF16(leafName, fileName);  
+            fileName.Trim(".");
+          }
+        }
+
+        if (aAllowURLExtension || isBinaryType || urlIsFile) {
+          url->GetFileExtension(extension);
+        }
+      }
+    } else {
+      int32_t dotidx = fileName.RFind(u".");
+      if (dotidx != -1) {
+        CopyUTF16toUTF8(Substring(fileName, dotidx + 1), extension);
+      }
+    }
+
+    if (aFlags & VALIDATE_GUESS_FROM_EXTENSION) {
+      nsAutoCString mimeType;
+      if (!extension.IsEmpty()) {
+        mimeService->GetFromTypeAndExtension(EmptyCString(), extension,
+                                             getter_AddRefs(mimeInfo));
+        if (mimeInfo) {
+          mimeInfo->GetMIMEType(mimeType);
+        }
+      }
+
+      if (mimeType.IsEmpty()) {
+        mimeService->GetFromTypeAndExtension(
+            nsLiteralCString(APPLICATION_OCTET_STREAM), extension,
+            getter_AddRefs(mimeInfo));
+      }
+    } else if (!aMimeType.IsEmpty()) {
+      bool useExtension =
+          isBinaryType || urlIsFile || aMimeType.EqualsLiteral(APPLICATION_OGG);
+      mimeService->GetFromTypeAndExtension(
+          aMimeType, useExtension ? extension : EmptyCString(),
+          getter_AddRefs(mimeInfo));
+      if (mimeInfo) {
+        nsAutoCString primaryExtension;
+        mimeInfo->GetPrimaryExtension(primaryExtension);
+        if (primaryExtension.IsEmpty()) {
+          mimeService->GetFromTypeAndExtension(aMimeType, extension,
+                                               getter_AddRefs(mimeInfo));
+        }
+      }
+    }
+  }
+
+  if (aFlags & VALIDATE_ALLOW_EMPTY && fileName.IsEmpty()) {
+    aFileName.Truncate();
+    return mimeInfo.forget();
+  }
+
+  if (mimeInfo) {
+    bool isValidExtension;
+    if (extension.IsEmpty() ||
+        NS_FAILED(mimeInfo->ExtensionExists(extension, &isValidExtension)) ||
+        !isValidExtension) {
+      if (aMimeType.EqualsLiteral(TEXT_PLAIN) || isBinaryType) {
+        extension.Truncate();
+      } else {
+        nsAutoCString originalExtension(extension);
+        bool useOldExtension = false;
+        if (aOriginalURI) {
+          nsCOMPtr<nsIURL> originalURL(do_QueryInterface(aOriginalURI));
+          if (originalURL) {
+            nsAutoCString uriExtension;
+            originalURL->GetFileExtension(uriExtension);
+            if (!uriExtension.IsEmpty()) {
+              mimeInfo->ExtensionExists(uriExtension, &useOldExtension);
+              if (useOldExtension) {
+                extension = uriExtension;
+              }
+            }
+          }
+        }
+
+        if (!useOldExtension) {
+          nsAutoCString primaryExtension;
+          mimeInfo->GetPrimaryExtension(primaryExtension);
+          if (!primaryExtension.IsEmpty()) {
+            extension = primaryExtension;
+          }
+        }
+
+        if (!extension.IsEmpty()) {
+          ModifyExtensionType modify = ShouldModifyExtension(
+              mimeInfo, aFlags & VALIDATE_FORCE_APPEND_EXTENSION,
+              originalExtension);
+          if (modify == ModifyExtension_Replace) {
+            int32_t dotidx = fileName.RFind(u".");
+            if (dotidx != -1) {
+              fileName.Truncate(dotidx);
+            }
+          }
+
+          if (modify != ModifyExtension_Ignore) {
+            fileName.AppendLiteral(".");
+            fileName.Append(NS_ConvertUTF8toUTF16(extension));
+          }
+        }
+      }
+    }
+  }
+
+  CheckDefaultFileName(fileName, aFlags);
+
+  SanitizeFileName(fileName, aFlags);
+
+  aFileName = fileName;
+  return mimeInfo.forget();
+}
+
+void nsExternalHelperAppService::CheckDefaultFileName(nsAString& aFileName,
+                                                      uint32_t aFlags) {
+  if (!(aFlags & VALIDATE_NO_DEFAULT_FILENAME) &&
+      (aFileName.Length() == 0 || aFileName.RFind(u".") == 0)) {
+    nsCOMPtr<nsIStringBundleService> stringService =
+        mozilla::components::StringBundle::Service();
+    if (stringService) {
+      nsCOMPtr<nsIStringBundle> bundle;
+      if (NS_SUCCEEDED(stringService->CreateBundle(
+              "chrome://global/locale/contentAreaCommands.properties",
+              getter_AddRefs(bundle)))) {
+        nsAutoString defaultFileName;
+        bundle->GetStringFromName("UntitledSaveFileName", defaultFileName);
+        aFileName = defaultFileName + aFileName;
+      }
+    }
+
+    if (!aFileName.Length()) {
+      aFileName.AssignLiteral("Untitled");
+    }
+  }
+}
+
+void nsExternalHelperAppService::SanitizeFileName(nsAString& aFileName,
+                                                  uint32_t aFlags) {
+  const bool collapseWhitespace = !(aFlags & VALIDATE_DONT_COLLAPSE_WHITESPACE);
+
+  char16_t* dest = aFileName.BeginWriting();
+  const auto kInvalidChars =
+      u"" KNOWN_PATH_SEPARATORS FILE_ILLEGAL_CHARACTERS "%"_ns;
+  bool lastWasWhitespace = false;
+  char32_t allBits = 0;
+  const char16_t* end = aFileName.EndReading();
+  for (const char16_t* cp = aFileName.BeginReading(); cp < end;) {
+    if (kInvalidChars.Contains(*cp)) {
+      *dest++ = u'_';
+      cp++;
+      lastWasWhitespace = false;
+      continue;
+    }
+
+    const char16_t* charStart = cp;
+    bool err = false;
+    char32_t nextChar = DecodeOneUtf16CodePoint(&cp, end, &err);
+    allBits |= nextChar;
+    if (NS_WARN_IF(err)) {
+      MOZ_ASSERT(nextChar == u'\uFFFD');
+      *dest++ = nextChar;
+      lastWasWhitespace = false;
+      continue;
+    }
+
+    auto unicodeCategory = unicode::GetGeneralCategory(nextChar);
+    if (unicodeCategory == HB_UNICODE_GENERAL_CATEGORY_CONTROL ||
+        unicodeCategory == HB_UNICODE_GENERAL_CATEGORY_LINE_SEPARATOR ||
+        unicodeCategory == HB_UNICODE_GENERAL_CATEGORY_PARAGRAPH_SEPARATOR) {
+      continue;
+    }
+
+    if (unicodeCategory == HB_UNICODE_GENERAL_CATEGORY_SPACE_SEPARATOR ||
+        nextChar == u'\ufeff') {
+      if (dest == aFileName.BeginWriting() ||
+          (collapseWhitespace && lastWasWhitespace)) {
+        continue;
+      }
+      lastWasWhitespace = true;
+      if (nextChar != u'\u3000') {
+        nextChar = u' ';
+      }
+      *dest++ = nextChar;
+      continue;
+    } else {
+      lastWasWhitespace = false;
+    }
+
+    if ((nextChar == u'.' || nextChar == u'\u180e')) {
+      if (dest == aFileName.BeginWriting()) {
+        continue;
+      }
+    } else if (unicodeCategory == HB_UNICODE_GENERAL_CATEGORY_FORMAT) {
+      *dest++ = u'_';
+      continue;
+    }
+
+    while (charStart < cp) {
+      *dest++ = *charStart++;
+    }
+  }
+
+  auto trimIfTrailing = [](char16_t aCh) -> bool {
+    return aCh == u' ' || aCh == u'\u3000' || aCh == u'.' || aCh == u'\u180e';
+  };
+
+  while (dest > aFileName.BeginWriting()) {
+    char16_t ch = *(dest - 1);
+    if (trimIfTrailing(ch)) {
+      dest--;
+    } else {
+      break;
+    }
+  }
+
+  aFileName.SetLength(dest - aFileName.BeginWriting());
+
+  nsAutoString ext;
+  int32_t dotidx = aFileName.RFindChar(u'.');
+  if (dotidx != -1) {
+    ext = Substring(aFileName, dotidx);
+    aFileName.Truncate(dotidx);
+  }
+
+  if (!(aFlags & VALIDATE_ALLOW_DIRECTORY_NAMES)) {
+    ext.StripWhitespace();
+  }
+
+  nsAutoString downloadSuffix;
+  if (!(aFlags & VALIDATE_ALLOW_INVALID_FILENAMES)) {
+    if (nsContentUtils::EqualsIgnoreASCIICase(ext, u".lnk"_ns) ||
+        nsContentUtils::EqualsIgnoreASCIICase(ext, u".local"_ns) ||
+        nsContentUtils::EqualsIgnoreASCIICase(ext, u".url"_ns) ||
+        nsContentUtils::EqualsIgnoreASCIICase(ext, u".scf"_ns) ||
+        nsContentUtils::EqualsIgnoreASCIICase(ext, u".desktop"_ns)) {
+      downloadSuffix = u".download"_ns;
+    }
+  }
+
+  auto finalizeName = MakeScopeExit([&]() {
+    aFileName.Append(ext);
+    aFileName.Append(downloadSuffix);
+#if defined(DEBUG)
+    if (!(aFlags & VALIDATE_DONT_TRUNCATE)) {
+      NS_ConvertUTF16toUTF8 utf8name(aFileName);
+      MOZ_ASSERT(utf8name.Length() <= kDefaultMaxFileNameLength);
+      int32_t dotidx = utf8name.RFindChar('.');
+      if (dotidx >= 0) {
+        utf8name.Truncate(dotidx);
+      }
+      utf8name.Append("_files");
+      MOZ_ASSERT(utf8name.Length() <= kDefaultMaxFileNameLength);
+    }
+#endif
+  });
+
+  uint32_t safeUtf16Length = (allBits & ~0x7f) == 0 ? kDefaultMaxFileNameLength
+                             : (allBits & ~0x7ff) == 0
+                                 ? kDefaultMaxFileNameLength / 2
+                                 : kDefaultMaxFileNameLength / 3;
+  safeUtf16Length -= downloadSuffix.Length();
+
+  const auto kFiles = u"_files"_ns;
+  if ((aFlags & VALIDATE_DONT_TRUNCATE) ||
+      (aFileName.Length() + ext.Length() <= safeUtf16Length &&
+       aFileName.Length() + kFiles.Length() <= safeUtf16Length)) {
+    return;
+  }
+
+
+  uint32_t byteLimit = kDefaultMaxFileNameLength;
+  byteLimit -= downloadSuffix.Length();
+
+  auto utf8Length = [](const nsAString& aString) -> size_t {
+    size_t result = 0;
+    const char16_t* end = aString.EndReading();
+    for (const char16_t* cp = aString.BeginReading(); cp < end;) {
+      bool err = false;
+      char32_t ch = DecodeOneUtf16CodePoint(&cp, end, &err);
+      MOZ_ASSERT(!err, "unexpected lone surrogate");
+      result += ch < 0x80 ? 1 : ch < 0x800 ? 2 : ch < 0x10000 ? 3 : 4;
+    }
+    return result;
+  };
+
+  size_t fileNameBytes = utf8Length(aFileName);
+  size_t extBytes = utf8Length(ext);
+
+  if (extBytes >= byteLimit) {
+    int32_t dotidx = aFileName.FindChar(u'.');
+    if (dotidx > 0) {
+      aFileName.Truncate(dotidx);
+    }
+    fileNameBytes = utf8Length(aFileName);
+    ext.Truncate();
+    extBytes = 0;
+  }
+
+  if (fileNameBytes + extBytes <= byteLimit &&
+      fileNameBytes + kFiles.Length() <= byteLimit) {
+    return;
+  }
+
+  NS_ConvertUTF16toUTF8 truncated(aFileName);
+  truncated.Truncate(byteLimit - std::max(extBytes, kFiles.Length()));
+
+  aFileName.Truncate();
+  const char* endUtf8 = truncated.EndReading();
+  for (const char* cp = truncated.BeginReading(); cp < endUtf8;) {
+    Utf8Unit unit(*cp++);
+    if (IsAscii(unit)) {
+      aFileName.Append(char(unit.toUint8()));
+      continue;
+    }
+    Maybe<char32_t> ch = DecodeOneUtf8CodePoint(unit, &cp, endUtf8);
+    if (ch.isNothing()) {
+      break;
+    }
+    AppendUCS4ToUTF16(ch.value(), aFileName);
+  }
+
+  while (!aFileName.IsEmpty() && trimIfTrailing(aFileName.Last())) {
+    aFileName.Truncate(aFileName.Length() - 1);
+  }
+}
+
+nsExternalHelperAppService::ModifyExtensionType
+nsExternalHelperAppService::ShouldModifyExtension(nsIMIMEInfo* aMimeInfo,
+                                                  bool aForceAppend,
+                                                  const nsCString& aFileExt) {
+  nsAutoCString MIMEType;
+  if (!aMimeInfo || NS_FAILED(aMimeInfo->GetMIMEType(MIMEType))) {
+    return ModifyExtension_Append;
+  }
+
+  static constexpr std::pair<nsLiteralCString, nsLiteralCString>
+      ignoreMimeExtPairs[] = {
+          {"video/3gpp"_ns, "mp4"_ns},   
+          {"audio/x-wav"_ns, "mp2"_ns},  
+          {"audio/mp4"_ns, "mp4"_ns},    
+          {"video/mp4"_ns, "m4a"_ns},    
+      };
+
+  nsAutoCString fileExtLowerCase(aFileExt);
+  ToLowerCase(fileExtLowerCase);
+  for (const auto& [mime, ext] : ignoreMimeExtPairs) {
+    if (MIMEType.Equals(mime) && fileExtLowerCase.Equals(ext)) {
+      return ModifyExtension_Ignore;
+    }
+  }
+
+  bool canForce = StringBeginsWith(MIMEType, "image/"_ns) ||
+                  StringBeginsWith(MIMEType, "audio/"_ns) ||
+                  StringBeginsWith(MIMEType, "video/"_ns) || aFileExt.IsEmpty();
+
+  if (!canForce) {
+    for (const char* mime : forcedExtensionMimetypes) {
+      if (MIMEType.Equals(mime)) {
+        if (!StaticPrefs::browser_download_sanitize_non_media_extensions()) {
+          return ModifyExtension_Ignore;
+        }
+        canForce = true;
+        break;
+      }
+    }
+
+    if (!canForce) {
+      return aForceAppend ? ModifyExtension_Append : ModifyExtension_Ignore;
+    }
+  }
+
+  bool knownExtension = false;
+  if (aFileExt.IsEmpty() ||
+      (NS_SUCCEEDED(aMimeInfo->ExtensionExists(aFileExt, &knownExtension)) &&
+       !knownExtension)) {
+    return ModifyExtension_Replace;
+  }
+
+  return ModifyExtension_Append;
+}

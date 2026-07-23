@@ -1,0 +1,70 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_PermissionStatus_h_
+#define mozilla_dom_PermissionStatus_h_
+
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/dom/PermissionStatusBinding.h"
+#include "mozilla/dom/PermissionsBinding.h"
+
+namespace mozilla::dom {
+
+class PermissionStatusSink;
+
+class PermissionStatus : public DOMEventTargetHelper {
+  friend class PermissionStatusSink;
+
+ public:
+  using SimplePromise = MozPromise<nsresult, nsresult, true>;
+
+  PermissionStatus(nsIGlobalObject* aGlobal, PermissionName aName);
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  PermissionState State() const {
+    if (mState == PermissionState::Granted &&
+        mSystemState != PermissionState::Granted) {
+      return mSystemState;
+    }
+    return mState;
+  }
+  void SetState(PermissionState aState) { mState = aState; }
+
+  IMPL_EVENT_HANDLER(change)
+
+  void DisconnectFromOwner() override;
+
+  PermissionName Name() const { return mName; }
+
+  void GetType(nsACString& aName) const;
+
+  RefPtr<SimplePromise> Init();
+
+ protected:
+  ~PermissionStatus();
+
+  virtual nsLiteralCString GetPermissionType() const;
+
+ private:
+  virtual already_AddRefed<PermissionStatusSink> CreateSink();
+
+  void PermissionChanged(uint32_t aAction);
+  void SystemPermissionChanged(PermissionState aNewSystemState);
+
+  PermissionState ComputeStateFromAction(uint32_t aAction);
+
+  PermissionName mName;
+  RefPtr<PermissionStatusSink> mSink;
+
+ protected:
+  PermissionState mState = PermissionState::Denied;
+  PermissionState mSystemState = PermissionState::Denied;
+};
+
+}  
+
+#endif  // mozilla_dom_permissionstatus_h_

@@ -1,0 +1,41 @@
+/*
+ * Copyright 2014 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+#if !defined(SkDistanceFieldGen_DEFINED)
+#define SkDistanceFieldGen_DEFINED
+
+#include "include/core/SkTypes.h"
+
+#include <cstddef>
+
+#if !defined(SK_DISABLE_SDF_TEXT)
+
+#define SK_DistanceFieldMagnitude   4
+#define SK_DistanceFieldPad         4
+#define SK_DistanceFieldInset       2
+
+#define SK_DistanceFieldMultiplier   "7.96875"
+#define SK_DistanceFieldThreshold    "0.50196078431"
+
+bool SkGenerateDistanceFieldFromA8Image(unsigned char* distanceField,
+                                        const unsigned char* image,
+                                        int w, int h, size_t rowBytes);
+
+bool SkGenerateDistanceFieldFromLCD16Mask(unsigned char* distanceField,
+                                          const unsigned char* image,
+                                          int w, int h, size_t rowBytes);
+
+bool SkGenerateDistanceFieldFromBWImage(unsigned char* distanceField,
+                                        const unsigned char* image,
+                                        int w, int h, size_t rowBytes);
+
+inline size_t SkComputeDistanceFieldSize(int w, int h) {
+    return (w + 2*SK_DistanceFieldPad) * (h + 2*SK_DistanceFieldPad) * sizeof(unsigned char);
+}
+
+#endif
+
+#endif

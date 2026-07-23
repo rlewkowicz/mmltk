@@ -1,0 +1,1298 @@
+// Copyright (c) 2012-2017 The OTS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "cff.h"
+
+#include <cstring>
+#include <utility>
+#include <vector>
+
+#include "maxp.h"
+#include "cff_charstring.h"
+#include "variations.h"
+
+
+#define TABLE_NAME "CFF"
+
+namespace {
+
+enum DICT_OPERAND_TYPE {
+  DICT_OPERAND_INTEGER,
+  DICT_OPERAND_REAL,
+  DICT_OPERATOR,
+};
+
+enum DICT_DATA_TYPE {
+  DICT_DATA_TOPLEVEL,
+  DICT_DATA_FDARRAY,
+  DICT_DATA_PRIVATE,
+};
+
+enum FONT_FORMAT {
+  FORMAT_UNKNOWN,
+  FORMAT_CID_KEYED,
+  FORMAT_OTHER,  
+};
+
+const size_t kNStdString = 390;
+
+typedef std::pair<int32_t, DICT_OPERAND_TYPE> Operand;
+
+bool ReadOffset(ots::Buffer &table, uint8_t off_size, uint32_t *offset) {
+  if (off_size > 4) {
+    return OTS_FAILURE();
+  }
+
+  uint32_t tmp32 = 0;
+  for (unsigned i = 0; i < off_size; ++i) {
+    uint8_t tmp8 = 0;
+    if (!table.ReadU8(&tmp8)) {
+      return OTS_FAILURE();
+    }
+    tmp32 <<= 8;
+    tmp32 += tmp8;
+  }
+  *offset = tmp32;
+  return true;
+}
+
+bool ParseIndex(ots::Buffer &table, ots::CFFIndex &index, bool cff2 = false) {
+  index.off_size = 0;
+  index.offsets.clear();
+
+  if (cff2) {
+    if (!table.ReadU32(&(index.count))) {
+      return OTS_FAILURE();
+    }
+  } else {
+    uint16_t count;
+    if (!table.ReadU16(&count)) {
+      return OTS_FAILURE();
+    }
+    index.count = count;
+  }
+
+  if (index.count == 0) {
+    index.offset_to_next = table.offset();
+    return true;
+  }
+
+  if (!table.ReadU8(&(index.off_size))) {
+    return OTS_FAILURE();
+  }
+  if (index.off_size < 1 || index.off_size > 4) {
+    return OTS_FAILURE();
+  }
+
+  const size_t array_size = (index.count + 1) * index.off_size;
+  const size_t object_data_offset = table.offset() + array_size;
+
+  if (object_data_offset >= table.length()) {
+    return OTS_FAILURE();
+  }
+
+  for (unsigned i = 0; i <= index.count; ++i) {  
+    uint32_t rel_offset = 0;
+    if (!ReadOffset(table, index.off_size, &rel_offset)) {
+      return OTS_FAILURE();
+    }
+    if (rel_offset < 1) {
+      return OTS_FAILURE();
+    }
+    if (i == 0 && rel_offset != 1) {
+      return OTS_FAILURE();
+    }
+
+    if (rel_offset > table.length()) {
+      return OTS_FAILURE();
+    }
+
+    if (object_data_offset > table.length() - (rel_offset - 1)) {
+      return OTS_FAILURE();
+    }
+
+    index.offsets.push_back(
+        object_data_offset + (rel_offset - 1));  
+  }
+
+  for (unsigned i = 1; i < index.offsets.size(); ++i) {
+    if (index.offsets[i] < index.offsets[i - 1]) {
+      return OTS_FAILURE();
+    }
+  }
+
+  index.offset_to_next = index.offsets.back();
+  return true;
+}
+
+bool ParseNameData(
+    ots::Buffer *table, const ots::CFFIndex &index, std::string* out_name) {
+  uint8_t name[256] = {0};
+
+  const size_t length = index.offsets[1] - index.offsets[0];
+  if (length > 127) {
+    return OTS_FAILURE();
+  }
+
+  table->set_offset(index.offsets[0]);
+  if (!table->Read(name, length)) {
+    return OTS_FAILURE();
+  }
+
+  for (size_t i = 0; i < length; ++i) {
+    if (i == 0 && name[i] == 0) continue;
+    if (name[i] < 33 || name[i] > 126) {
+      return OTS_FAILURE();
+    }
+    if (std::strchr("[](){}<>/% ", name[i])) {
+      return OTS_FAILURE();
+    }
+  }
+
+  *out_name = reinterpret_cast<char *>(name);
+  return true;
+}
+
+bool CheckOffset(const Operand& operand, size_t table_length) {
+  if (operand.second != DICT_OPERAND_INTEGER) {
+    return OTS_FAILURE();
+  }
+  if (operand.first >= static_cast<int32_t>(table_length) || operand.first < 0) {
+    return OTS_FAILURE();
+  }
+  return true;
+}
+
+bool CheckSid(const Operand& operand, size_t sid_max) {
+  if (operand.second != DICT_OPERAND_INTEGER) {
+    return OTS_FAILURE();
+  }
+  if (operand.first > static_cast<int32_t>(sid_max) || operand.first < 0) {
+    return OTS_FAILURE();
+  }
+  return true;
+}
+
+bool ParseDictDataBcd(ots::Buffer &table, std::vector<Operand> &operands) {
+  bool read_decimal_point = false;
+  bool read_e = false;
+
+  uint8_t nibble = 0;
+  size_t count = 0;
+  while (true) {
+    if (!table.ReadU8(&nibble)) {
+      return OTS_FAILURE();
+    }
+    if ((nibble & 0xf0) == 0xf0) {
+      if ((nibble & 0xf) == 0xf) {
+        operands.push_back(std::make_pair(0, DICT_OPERAND_REAL));
+        return true;
+      }
+      return OTS_FAILURE();
+    }
+    if ((nibble & 0x0f) == 0x0f) {
+      operands.push_back(std::make_pair(0, DICT_OPERAND_REAL));
+      return true;
+    }
+
+    uint8_t nibbles[2];
+    nibbles[0] = (nibble & 0xf0) >> 4;
+    nibbles[1] = (nibble & 0x0f);
+    for (unsigned i = 0; i < 2; ++i) {
+      if (nibbles[i] == 0xd) {  
+        return OTS_FAILURE();
+      }
+      if ((nibbles[i] == 0xe) &&  
+          ((count > 0) || (i > 0))) {
+        return OTS_FAILURE();  
+      }
+      if (nibbles[i] == 0xa) {  
+        if (!read_decimal_point) {
+          read_decimal_point = true;
+        } else {
+          return OTS_FAILURE();  
+        }
+      }
+      if ((nibbles[i] == 0xb) ||  
+          (nibbles[i] == 0xc)) {  
+        if (!read_e) {
+          read_e = true;
+        } else {
+          return OTS_FAILURE();  
+        }
+      }
+    }
+    ++count;
+  }
+}
+
+bool ParseDictDataEscapedOperator(ots::Buffer &table,
+                                  std::vector<Operand> &operands) {
+  uint8_t op = 0;
+  if (!table.ReadU8(&op)) {
+    return OTS_FAILURE();
+  }
+
+  if ((op <= 14) ||
+      (op >= 17 && op <= 23) ||
+      (op >= 30 && op <= 38)) {
+    operands.push_back(std::make_pair((12 << 8) + op, DICT_OPERATOR));
+    return true;
+  }
+
+  return OTS_FAILURE();
+}
+
+bool ParseDictDataNumber(ots::Buffer &table, uint8_t b0,
+                         std::vector<Operand> &operands) {
+  uint8_t b1 = 0;
+  uint8_t b2 = 0;
+  uint8_t b3 = 0;
+  uint8_t b4 = 0;
+
+  switch (b0) {
+    case 28:  
+      if (!table.ReadU8(&b1) ||
+          !table.ReadU8(&b2)) {
+        return OTS_FAILURE();
+      }
+      operands.push_back(std::make_pair(
+          static_cast<int16_t>((b1 << 8) + b2), DICT_OPERAND_INTEGER));
+      return true;
+
+    case 29:  
+      if (!table.ReadU8(&b1) ||
+          !table.ReadU8(&b2) ||
+          !table.ReadU8(&b3) ||
+          !table.ReadU8(&b4)) {
+        return OTS_FAILURE();
+      }
+      operands.push_back(std::make_pair(
+          (b1 << 24) + (b2 << 16) + (b3 << 8) + b4,
+          DICT_OPERAND_INTEGER));
+      return true;
+
+    case 30:  
+      return ParseDictDataBcd(table, operands);
+
+    default:
+      break;
+  }
+
+  int32_t result;
+  if (b0 >=32 && b0 <=246) {
+    result = b0 - 139;
+  } else if (b0 >=247 && b0 <= 250) {
+    if (!table.ReadU8(&b1)) {
+      return OTS_FAILURE();
+    }
+    result = (b0 - 247) * 256 + b1 + 108;
+  } else if (b0 >= 251 && b0 <= 254) {
+    if (!table.ReadU8(&b1)) {
+      return OTS_FAILURE();
+    }
+    result = -(b0 - 251) * 256 - b1 - 108;
+  } else {
+    return OTS_FAILURE();
+  }
+
+  operands.push_back(std::make_pair(result, DICT_OPERAND_INTEGER));
+  return true;
+}
+
+bool ParseDictDataReadNext(ots::Buffer &table,
+                           std::vector<Operand> &operands) {
+  uint8_t op = 0;
+  if (!table.ReadU8(&op)) {
+    return OTS_FAILURE();
+  }
+  if (op <= 24) {
+    if (op == 12) {
+      return ParseDictDataEscapedOperator(table, operands);
+    }
+    operands.push_back(std::make_pair(
+        static_cast<int32_t>(op), DICT_OPERATOR));
+    return true;
+  } else if (op <= 27 || op == 31 || op == 255) {
+    return OTS_FAILURE();
+  }
+
+  return ParseDictDataNumber(table, op, operands);
+}
+
+bool OperandsOverflow(std::vector<Operand>& operands, bool cff2) {
+  if ((cff2 && operands.size() > ots::kMaxCFF2ArgumentStack) ||
+      (!cff2 && operands.size() > ots::kMaxCFF1ArgumentStack)) {
+    return true;
+  }
+  return false;
+}
+
+bool ParseDictDataReadOperands(ots::Buffer& dict,
+                               std::vector<Operand>& operands,
+                               bool cff2) {
+  if (!ParseDictDataReadNext(dict, operands)) {
+    return OTS_FAILURE();
+  }
+  if (operands.empty()) {
+    return OTS_FAILURE();
+  }
+  if (OperandsOverflow(operands, cff2)) {
+    return OTS_FAILURE();
+  }
+  return true;
+}
+
+bool ValidCFF2DictOp(int32_t op, DICT_DATA_TYPE type) {
+  if (type == DICT_DATA_TOPLEVEL) {
+    switch (op) {
+      case (12 << 8) + 7:  
+      case 17:              
+      case (12 << 8) + 36: 
+      case (12 << 8) + 37: 
+      case 24:              
+        return true;
+      default:
+        return false;
+    }
+  } else if (type == DICT_DATA_FDARRAY) {
+    if (op == 18) 
+      return true;
+  } else if (type == DICT_DATA_PRIVATE) {
+    switch (op) {
+      case (12 << 8) + 14: 
+      case (12 << 8) + 19: 
+      case 20:              
+      case 21:              
+        return false;
+      default:
+        return true;
+    }
+  }
+
+  return false;
+}
+
+bool ParsePrivateDictData(
+    ots::Buffer &table, size_t offset, size_t dict_length,
+    DICT_DATA_TYPE type, ots::OpenTypeCFF *out_cff) {
+  ots::Buffer dict(table.buffer() + offset, dict_length);
+  std::vector<Operand> operands;
+  bool cff2 = (out_cff->major == 2);
+  bool blend_seen = false;
+  int32_t vsindex = 0;
+
+  if (type == DICT_DATA_FDARRAY) {
+    out_cff->local_subrs_per_font.push_back(new ots::CFFIndex);
+    if (cff2) {
+      out_cff->vsindex_per_font.push_back(vsindex);
+    }
+  }
+
+  while (dict.offset() < dict.length()) {
+    if (!ParseDictDataReadOperands(dict, operands, cff2)) {
+      return OTS_FAILURE();
+    }
+    if (operands.back().second != DICT_OPERATOR) {
+      continue;
+    }
+
+    const int32_t op = operands.back().first;
+    operands.pop_back();
+
+    if (cff2 && !ValidCFF2DictOp(op, DICT_DATA_PRIVATE)) {
+      return OTS_FAILURE();
+    }
+
+    bool clear_operands = true;
+    switch (op) {
+      case 6:  
+      case 7:  
+      case 8:  
+      case 9:  
+        if ((operands.size() % 2) != 0) {
+          return OTS_FAILURE();
+        }
+        break;
+
+      case (12 << 8) + 12:  
+      case (12 << 8) + 13:  
+        if (operands.empty()) {
+          return OTS_FAILURE();
+        }
+        break;
+
+      case 10:  
+      case 11:  
+      case 20:  
+      case 21:  
+      case (12 << 8) + 9:   
+      case (12 << 8) + 10:  
+      case (12 << 8) + 11:  
+      case (12 << 8) + 17:  
+      case (12 << 8) + 18:  
+      case (12 << 8) + 19:  
+        if (operands.size() != 1) {
+          return OTS_FAILURE();
+        }
+        break;
+
+      case 19: {
+        if (operands.size() != 1) {
+          return OTS_FAILURE();
+        }
+        if (operands.back().second != DICT_OPERAND_INTEGER) {
+          return OTS_FAILURE();
+        }
+        if (operands.back().first >= 1024 * 1024 * 1024 || operands.back().first < 0) {
+          return OTS_FAILURE();
+        }
+        if (operands.back().first + offset >= table.length()) {
+          return OTS_FAILURE();
+        }
+        table.set_offset(operands.back().first + offset);
+        ots::CFFIndex *local_subrs_index = NULL;
+        if (type == DICT_DATA_FDARRAY) {
+          if (out_cff->local_subrs_per_font.empty()) {
+            return OTS_FAILURE();  
+          }
+          local_subrs_index = out_cff->local_subrs_per_font.back();
+        } else { 
+          if (out_cff->local_subrs) {
+            return OTS_FAILURE();  
+          }
+          local_subrs_index = new ots::CFFIndex;
+          out_cff->local_subrs = local_subrs_index;
+        }
+        if (!ParseIndex(table, *local_subrs_index, cff2)) {
+          return OTS_FAILURE();
+        }
+        break;
+      }
+
+      case (12 << 8) + 14:  
+        if (operands.size() != 1) {
+          return OTS_FAILURE();
+        }
+        if (operands.back().second != DICT_OPERAND_INTEGER) {
+          return OTS_FAILURE();
+        }
+        if (operands.back().first >= 2 || operands.back().first < 0) {
+          return OTS_FAILURE();
+        }
+        break;
+
+      case 22: { 
+        if (!cff2) {
+          return OTS_FAILURE();
+        }
+        if (operands.size() != 1) {
+          return OTS_FAILURE();
+        }
+        if (operands.back().second != DICT_OPERAND_INTEGER) {
+          return OTS_FAILURE();
+        }
+        if (blend_seen) {
+          return OTS_FAILURE();
+        }
+        vsindex = operands.back().first;
+        if (vsindex < 0 ||
+            vsindex >= static_cast<int32_t>(out_cff->region_index_count.size())) {
+          return OTS_FAILURE();
+        }
+        out_cff->vsindex_per_font.back() = vsindex;
+        break;
+      }
+
+      case 23: { 
+        if (!cff2) {
+          return OTS_FAILURE();
+        }
+        if (operands.size() < 1) {
+          return OTS_FAILURE();
+        }
+        if (vsindex >= static_cast<int32_t>(out_cff->region_index_count.size())) {
+          return OTS_FAILURE();
+        }
+        uint16_t k = out_cff->region_index_count.at(vsindex);
+
+        if (operands.back().first > static_cast<uint16_t>(0xffff) || operands.back().first < 0){
+          return OTS_FAILURE();
+        }
+        uint16_t n = static_cast<uint16_t>(operands.back().first);
+        if (operands.size() < n * (k + 1) + 1) {
+          return OTS_FAILURE();
+        }
+        size_t operands_size = operands.size();
+        while (operands.size() > operands_size - ((n * k) + 1))
+          operands.pop_back();
+        clear_operands = false;
+        blend_seen = true;
+        break;
+      }
+
+      default:
+        return OTS_FAILURE();
+    }
+    if (clear_operands) {
+      operands.clear();
+    }
+  }
+
+  return true;
+}
+
+bool ParseVariationStore(ots::OpenTypeCFF& out_cff, ots::Buffer& table) {
+  uint16_t length;
+
+  if (!table.ReadU16(&length)) {
+    return OTS_FAILURE();
+  }
+
+  if (!length) {
+    return true;
+  }
+
+  if (length > table.remaining()) {
+    return OTS_FAILURE();
+  }
+
+  if (!ParseItemVariationStore(out_cff.GetFont(),
+                               table.buffer() + table.offset(), length,
+                               &(out_cff.region_index_count))) {
+    return OTS_FAILURE();
+  }
+
+  return true;
+}
+
+bool ParseDictData(ots::Buffer& table, ots::Buffer& dict,
+                   uint16_t glyphs, size_t sid_max, DICT_DATA_TYPE type,
+                   ots::OpenTypeCFF *out_cff);
+
+bool ParseDictData(ots::Buffer& table, const ots::CFFIndex &index,
+                   uint16_t glyphs, size_t sid_max, DICT_DATA_TYPE type,
+                   ots::OpenTypeCFF *out_cff) {
+  for (unsigned i = 1; i < index.offsets.size(); ++i) {
+    size_t dict_length = index.offsets[i] - index.offsets[i - 1];
+    ots::Buffer dict(table.buffer() + index.offsets[i - 1], dict_length);
+
+    if (!ParseDictData(table, dict, glyphs, sid_max, type, out_cff)) {
+      return OTS_FAILURE();
+    }
+  }
+  return true;
+}
+
+bool ParseDictData(ots::Buffer& table, ots::Buffer& dict,
+                   uint16_t glyphs, size_t sid_max, DICT_DATA_TYPE type,
+                   ots::OpenTypeCFF *out_cff) {
+  bool cff2 = (out_cff->major == 2);
+  std::vector<Operand> operands;
+
+  FONT_FORMAT font_format = FORMAT_UNKNOWN;
+  bool have_ros = false;
+  bool have_charstrings = false;
+  bool have_vstore = false;
+  size_t charset_offset = 0;
+  bool have_private = false;
+
+  if (cff2) {
+    size_t dict_offset = dict.offset();
+    while (dict.offset() < dict.length()) {
+      if (!ParseDictDataReadOperands(dict, operands, cff2)) {
+        return OTS_FAILURE();
+      }
+      if (operands.back().second != DICT_OPERATOR) continue;
+
+      const int32_t op = operands.back().first;
+      operands.pop_back();
+
+      if (op == 18 && type == DICT_DATA_FDARRAY) {
+        have_private = true;
+      }
+
+      if (op == 24) {  
+        if (type != DICT_DATA_TOPLEVEL) {
+          return OTS_FAILURE();
+        }
+        if (operands.size() != 1) {
+          return OTS_FAILURE();
+        }
+        if (!CheckOffset(operands.back(), table.length())) {
+          return OTS_FAILURE();
+        }
+        table.set_offset(operands.back().first);
+        if (!ParseVariationStore(*out_cff, table)) {
+          return OTS_FAILURE();
+        }
+        break;
+      }
+      operands.clear();
+    }
+    operands.clear();
+    dict.set_offset(dict_offset);
+
+    if (type == DICT_DATA_FDARRAY && !have_private) {
+      return OTS_FAILURE();  
+    }
+
+  }
+
+  while (dict.offset() < dict.length()) {
+    if (!ParseDictDataReadOperands(dict, operands, cff2)) {
+      return OTS_FAILURE();
+    }
+    if (operands.back().second != DICT_OPERATOR) continue;
+
+    const int32_t op = operands.back().first;
+    operands.pop_back();
+
+    if (cff2 && !ValidCFF2DictOp(op, type)) {
+      return OTS_FAILURE();
+    }
+
+    switch (op) {
+      case 0:   
+      case 1:   
+      case 2:   // Copyright
+      case 3:   
+      case 4:   
+      case (12 << 8) + 0:   // Copyright
+      case (12 << 8) + 21:  
+      case (12 << 8) + 22:  
+      case (12 << 8) + 38:  
+        if (operands.size() != 1) {
+          return OTS_FAILURE();
+        }
+        if (!CheckSid(operands.back(), sid_max)) {
+          return OTS_FAILURE();
+        }
+        break;
+
+      case 5:   
+      case 14:  
+      case (12 << 8) + 7:   
+      case (12 << 8) + 23:  
+        if (operands.empty()) {
+          return OTS_FAILURE();
+        }
+        break;
+
+      case 13:  
+      case (12 << 8) + 2:   
+      case (12 << 8) + 3:   
+      case (12 << 8) + 4:   
+      case (12 << 8) + 5:   
+      case (12 << 8) + 8:   
+      case (12 << 8) + 20:  
+        if (operands.size() != 1) {
+          return OTS_FAILURE();
+        }
+        break;
+      case (12 << 8) + 31:  
+      case (12 << 8) + 32:  
+      case (12 << 8) + 33:  
+      case (12 << 8) + 34:  
+      case (12 << 8) + 35:  
+        if (operands.size() != 1) {
+          return OTS_FAILURE();
+        }
+        if (font_format != FORMAT_CID_KEYED) {
+          return OTS_FAILURE();
+        }
+        break;
+      case (12 << 8) + 6:   
+        if (operands.size() != 1) {
+          return OTS_FAILURE();
+        }
+        if(operands.back().second != DICT_OPERAND_INTEGER) {
+          return OTS_FAILURE();
+        }
+        if (operands.back().first != 2) {
+          return OTS_FAILURE();
+        }
+        break;
+
+      case (12 << 8) + 1:   
+        if (operands.size() != 1) {
+          return OTS_FAILURE();
+        }
+        if (operands.back().second != DICT_OPERAND_INTEGER) {
+          return OTS_FAILURE();
+        }
+        if (operands.back().first >= 2 || operands.back().first < 0) {
+          return OTS_FAILURE();
+        }
+        break;
+
+      case 15:  
+        if (operands.size() != 1) {
+          return OTS_FAILURE();
+        }
+        if (operands.back().first <= 2 && operands.back().first >= 0) {
+          break;
+        }
+        if (!CheckOffset(operands.back(), table.length())) {
+          return OTS_FAILURE();
+        }
+        if (charset_offset) {
+          return OTS_FAILURE();  
+        }
+        charset_offset = operands.back().first;
+        break;
+
+      case 16: {  
+        if (operands.size() != 1) {
+          return OTS_FAILURE();
+        }
+        if (operands.back().first <= 1 && operands.back().first >= 0) {
+          break;  
+        }
+        if (!CheckOffset(operands.back(), table.length())) {
+          return OTS_FAILURE();
+        }
+
+        table.set_offset(operands.back().first);
+        uint8_t format = 0;
+        if (!table.ReadU8(&format)) {
+          return OTS_FAILURE();
+        }
+        if (format & 0x80) {
+          return OTS_FAILURE();
+        }
+        break;
+      }
+
+      case 17: {  
+        if (type != DICT_DATA_TOPLEVEL) {
+          return OTS_FAILURE();
+        }
+        if (operands.size() != 1) {
+          return OTS_FAILURE();
+        }
+        if (!CheckOffset(operands.back(), table.length())) {
+          return OTS_FAILURE();
+        }
+        table.set_offset(operands.back().first);
+        ots::CFFIndex *charstring_index = out_cff->charstrings_index;
+        if (!ParseIndex(table, *charstring_index, cff2)) {
+          return OTS_FAILURE();
+        }
+        if (charstring_index->count < 2) {
+          return OTS_FAILURE();
+        }
+        if (have_charstrings) {
+          return OTS_FAILURE();  
+        }
+        have_charstrings = true;
+        if (charstring_index->count != glyphs) {
+          return OTS_FAILURE();  
+        }
+        break;
+      }
+
+      case 24: {  
+        if (!cff2) {
+          return OTS_FAILURE();
+        }
+        if (have_vstore) {
+          return OTS_FAILURE();  
+        }
+        have_vstore = true;
+        break;
+      }
+
+      case (12 << 8) + 36: {  
+        if (type != DICT_DATA_TOPLEVEL) {
+          return OTS_FAILURE();
+        }
+        if (operands.size() != 1) {
+          return OTS_FAILURE();
+        }
+        if (!CheckOffset(operands.back(), table.length())) {
+          return OTS_FAILURE();
+        }
+
+        table.set_offset(operands.back().first);
+        ots::CFFIndex sub_dict_index;
+        if (!ParseIndex(table, sub_dict_index, cff2)) {
+          return OTS_FAILURE();
+        }
+        if (!ParseDictData(table, sub_dict_index,
+                           glyphs, sid_max, DICT_DATA_FDARRAY,
+                           out_cff)) {
+          return OTS_FAILURE();
+        }
+        if (out_cff->font_dict_length != 0) {
+          return OTS_FAILURE();  
+        }
+        out_cff->font_dict_length = sub_dict_index.count;
+        break;
+      }
+
+      case (12 << 8) + 37: {  
+        if (type != DICT_DATA_TOPLEVEL) {
+          return OTS_FAILURE();
+        }
+        if (!out_cff->fd_select.empty()) {
+          return OTS_FAILURE();
+        }
+        if (operands.size() != 1) {
+          return OTS_FAILURE();
+        }
+        if (!CheckOffset(operands.back(), table.length())) {
+          return OTS_FAILURE();
+        }
+
+        table.set_offset(operands.back().first);
+        uint8_t format = 0;
+        if (!table.ReadU8(&format)) {
+          return OTS_FAILURE();
+        }
+        if (format == 0) {
+          for (uint16_t j = 0; j < glyphs; ++j) {
+            uint8_t fd_index = 0;
+            if (!table.ReadU8(&fd_index)) {
+              return OTS_FAILURE();
+            }
+            (out_cff->fd_select)[j] = fd_index;
+          }
+        } else if (format == 3) {
+          uint16_t n_ranges = 0;
+          if (!table.ReadU16(&n_ranges)) {
+            return OTS_FAILURE();
+          }
+          if (n_ranges == 0) {
+            return OTS_FAILURE();
+          }
+
+          uint16_t last_gid = 0;
+          uint8_t fd_index = 0;
+          for (unsigned j = 0; j < n_ranges; ++j) {
+            uint16_t first = 0;  
+            if (!table.ReadU16(&first)) {
+              return OTS_FAILURE();
+            }
+
+            if ((j == 0) && (first != 0)) {
+              return OTS_FAILURE();
+            }
+            if ((j != 0) && (last_gid >= first)) {
+              return OTS_FAILURE();  
+            }
+            if (first >= glyphs) {
+              return OTS_FAILURE();  
+            }
+
+            if (j != 0) {
+              for (auto k = last_gid; k < first; ++k) {
+                if (!out_cff->fd_select.insert(
+                        std::make_pair(k, fd_index)).second) {
+                  return OTS_FAILURE();
+                }
+              }
+            }
+
+            if (!table.ReadU8(&fd_index)) {
+              return OTS_FAILURE();
+            }
+            last_gid = first;
+          }
+          uint16_t sentinel = 0;
+          if (!table.ReadU16(&sentinel)) {
+            return OTS_FAILURE();
+          }
+          if (last_gid >= sentinel) {
+            return OTS_FAILURE();
+          }
+          if (sentinel > glyphs) {
+            return OTS_FAILURE();  
+          }
+          for (auto k = last_gid; k < sentinel; ++k) {
+            if (!out_cff->fd_select.insert(
+                    std::make_pair(k, fd_index)).second) {
+              return OTS_FAILURE();
+            }
+          }
+        } else if (cff2 && format == 4) {
+          uint32_t n_ranges = 0;
+          if (!table.ReadU32(&n_ranges)) {
+            return OTS_FAILURE();
+          }
+          if (n_ranges == 0) {
+            return OTS_FAILURE();
+          }
+
+          uint32_t last_gid = 0;
+          uint16_t fd_index = 0;
+          for (unsigned j = 0; j < n_ranges; ++j) {
+            uint32_t first = 0;  
+            if (!table.ReadU32(&first)) {
+              return OTS_FAILURE();
+            }
+
+            if ((j == 0) && (first != 0)) {
+              return OTS_FAILURE();
+            }
+            if ((j != 0) && (last_gid >= first)) {
+              return OTS_FAILURE();  
+            }
+            if (first >= glyphs) {
+              return OTS_FAILURE();  
+            }
+
+            if (j != 0) {
+              for (auto k = last_gid; k < first; ++k) {
+                if (!out_cff->fd_select.insert(
+                        std::make_pair(k, fd_index)).second) {
+                  return OTS_FAILURE();
+                }
+              }
+            }
+
+            if (!table.ReadU16(&fd_index)) {
+              return OTS_FAILURE();
+            }
+            last_gid = first;
+          }
+          uint32_t sentinel = 0;
+          if (!table.ReadU32(&sentinel)) {
+            return OTS_FAILURE();
+          }
+          if (last_gid >= sentinel) {
+            return OTS_FAILURE();
+          }
+          if (sentinel > glyphs) {
+            return OTS_FAILURE();  
+          }
+          for (auto k = last_gid; k < sentinel; ++k) {
+            if (!out_cff->fd_select.insert(
+                    std::make_pair(k, fd_index)).second) {
+              return OTS_FAILURE();
+            }
+          }
+        } else {
+          return OTS_FAILURE();
+        }
+        break;
+      }
+
+      case 18: {
+        if (operands.size() != 2) {
+          return OTS_FAILURE();
+        }
+        if (!CheckOffset(operands.back(), table.length() + 1)) {
+          return OTS_FAILURE();
+        }
+        const int32_t private_offset = operands.back().first;
+        operands.pop_back();
+        if (!CheckOffset(operands.back(), table.length())) {
+          return OTS_FAILURE();
+        }
+        const int32_t private_length = operands.back().first;
+        if (private_length + private_offset > static_cast<int32_t>(table.length()) || private_length + private_offset < 0) {
+          return OTS_FAILURE();
+        }
+        if (!ParsePrivateDictData(table, private_offset, private_length,
+                                  type, out_cff)) {
+          return OTS_FAILURE();
+        }
+        break;
+      }
+
+      case (12 << 8) + 30:
+        if (font_format != FORMAT_UNKNOWN) {
+          return OTS_FAILURE();
+        }
+        font_format = FORMAT_CID_KEYED;
+        if (operands.size() != 3) {
+          return OTS_FAILURE();
+        }
+        operands.pop_back();  
+        if (!CheckSid(operands.back(), sid_max)) {
+          return OTS_FAILURE();
+        }
+        operands.pop_back();
+        if (!CheckSid(operands.back(), sid_max)) {
+          return OTS_FAILURE();
+        }
+        if (have_ros) {
+          return OTS_FAILURE();  
+        }
+        have_ros = true;
+        break;
+
+      default:
+        return OTS_FAILURE();
+    }
+    operands.clear();
+
+    if (font_format == FORMAT_UNKNOWN) {
+      font_format = FORMAT_OTHER;
+    }
+  }
+
+  if (charset_offset) {
+    table.set_offset(charset_offset);
+    uint8_t format = 0;
+    if (!table.ReadU8(&format)) {
+      return OTS_FAILURE();
+    }
+    switch (format) {
+      case 0:
+        for (uint16_t j = 1 ; j < glyphs; ++j) {
+          uint16_t sid = 0;
+          if (!table.ReadU16(&sid)) {
+            return OTS_FAILURE();
+          }
+          if (!have_ros && (sid > sid_max)) {
+            return OTS_FAILURE();
+          }
+        }
+        break;
+
+      case 1:
+      case 2: {
+        uint32_t total = 1;  
+        while (total < glyphs) {
+          uint16_t sid = 0;
+          if (!table.ReadU16(&sid)) {
+            return OTS_FAILURE();
+          }
+          if (!have_ros && (sid > sid_max)) {
+            return OTS_FAILURE();
+          }
+
+          if (format == 1) {
+            uint8_t left = 0;
+            if (!table.ReadU8(&left)) {
+              return OTS_FAILURE();
+            }
+            total += (left + 1);
+          } else {
+            uint16_t left = 0;
+            if (!table.ReadU16(&left)) {
+              return OTS_FAILURE();
+            }
+            total += (left + 1);
+          }
+        }
+        break;
+      }
+
+      default:
+        return OTS_FAILURE();
+    }
+  }
+  return true;
+}
+
+}  
+
+namespace ots {
+
+bool OpenTypeCFF::ValidateFDSelect(uint16_t num_glyphs) {
+  for (const auto& fd_select : this->fd_select) {
+    if (fd_select.first >= num_glyphs) {
+      return Error("Invalid glyph index in FDSelect: %d >= %d\n",
+                   fd_select.first, num_glyphs);
+    }
+    if (fd_select.second >= this->font_dict_length) {
+      return Error("Invalid FD index: %d >= %d\n",
+                   fd_select.second, this->font_dict_length);
+    }
+  }
+  return true;
+}
+
+bool OpenTypeCFF::Parse(const uint8_t *data, size_t length) {
+  Buffer table(data, length);
+
+  Font *font = GetFont();
+
+  this->m_data = data;
+  this->m_length = length;
+
+  uint8_t major = 0;
+  uint8_t minor = 0;
+  uint8_t hdr_size = 0;
+  uint8_t off_size = 0;
+  if (!table.ReadU8(&major) ||
+      !table.ReadU8(&minor) ||
+      !table.ReadU8(&hdr_size) ||
+      !table.ReadU8(&off_size)) {
+    return Error("Failed to read table header");
+  }
+
+  if (off_size < 1 || off_size > 4) {
+    return Error("Bad offSize: %d", off_size);
+  }
+
+  if (major != 1 || minor != 0) {
+    return Error("Unsupported table version: %d.%d", major, minor);
+  }
+
+  this->major = major;
+
+  if (hdr_size != 4 || hdr_size >= length) {
+    return Error("Bad hdrSize: %d", hdr_size);
+  }
+
+  table.set_offset(hdr_size);
+  CFFIndex name_index;
+  if (!ParseIndex(table, name_index)) {
+    return Error("Failed to parse Name INDEX");
+  }
+  if (name_index.count != 1 || name_index.offsets.size() != 2) {
+    return Error("Name INDEX must contain only one entry, not %d",
+                 name_index.count);
+  }
+  if (!ParseNameData(&table, name_index, &(this->name))) {
+    return Error("Failed to parse Name INDEX data");
+  }
+
+  table.set_offset(name_index.offset_to_next);
+  CFFIndex top_dict_index;
+  if (!ParseIndex(table, top_dict_index)) {
+    return Error("Failed to parse Top DICT INDEX");
+  }
+  if (top_dict_index.count != 1) {
+    return Error("Top DICT INDEX must contain only one entry, not %d",
+                 top_dict_index.count);
+  }
+
+  table.set_offset(top_dict_index.offset_to_next);
+  CFFIndex string_index;
+  if (!ParseIndex(table, string_index)) {
+    return Error("Failed to parse String INDEX");
+  }
+  if (string_index.count >= 65000 - kNStdString) {
+    return Error("Too many entries in String INDEX: %d", string_index.count);
+  }
+
+  OpenTypeMAXP *maxp = static_cast<OpenTypeMAXP*>(
+    font->GetTypedTable(OTS_TAG_MAXP));
+  if (!maxp) {
+    return Error("Required maxp table missing");
+  }
+  const uint16_t num_glyphs = maxp->num_glyphs;
+  const size_t sid_max = string_index.count + kNStdString;
+
+  this->charstrings_index = new ots::CFFIndex;
+  if (!ParseDictData(table, top_dict_index,
+                     num_glyphs, sid_max,
+                     DICT_DATA_TOPLEVEL, this)) {
+    return Error("Failed to parse Top DICT Data");
+  }
+
+  table.set_offset(string_index.offset_to_next);
+  CFFIndex global_subrs_index;
+  if (!ParseIndex(table, global_subrs_index)) {
+    return Error("Failed to parse Global Subrs INDEX");
+  }
+
+  if (!ValidateFDSelect(num_glyphs)) {
+    return Error("Failed to validate FDSelect");
+  }
+
+  if (!ValidateCFFCharStrings(*this, global_subrs_index, &table)) {
+    return Error("Failed validating CharStrings INDEX");
+  }
+
+  return true;
+}
+
+bool OpenTypeCFF::Serialize(OTSStream *out) {
+  if (!out->Write(this->m_data, this->m_length)) {
+    return Error("Failed to write table");
+  }
+  return true;
+}
+
+OpenTypeCFF::~OpenTypeCFF() {
+  for (size_t i = 0; i < this->local_subrs_per_font.size(); ++i) {
+    delete (this->local_subrs_per_font)[i];
+  }
+  delete this->charstrings_index;
+  delete this->local_subrs;
+}
+
+bool OpenTypeCFF2::Parse(const uint8_t *data, size_t length) {
+  Buffer table(data, length);
+
+  Font *font = GetFont();
+
+  this->m_data = data;
+  this->m_length = length;
+
+  uint8_t major = 0;
+  uint8_t minor = 0;
+  uint8_t hdr_size = 0;
+  uint16_t top_dict_size = 0;
+  if (!table.ReadU8(&major) ||
+      !table.ReadU8(&minor) ||
+      !table.ReadU8(&hdr_size) ||
+      !table.ReadU16(&top_dict_size)) {
+    return Error("Failed to read table header");
+  }
+
+  if (major != 2 || minor != 0) {
+    return Error("Unsupported table version: %d.%d", major, minor);
+  }
+
+  this->major = major;
+
+  if (hdr_size >= length) {
+    return Error("Bad hdrSize: %d", hdr_size);
+  }
+
+  if (top_dict_size == 0 || hdr_size + top_dict_size > length) {
+    return Error("Bad topDictLength: %d", top_dict_size);
+  }
+
+  OpenTypeMAXP *maxp = static_cast<OpenTypeMAXP*>(
+    font->GetTypedTable(OTS_TAG_MAXP));
+  if (!maxp) {
+    return Error("Required maxp table missing");
+  }
+  const uint16_t num_glyphs = maxp->num_glyphs;
+  const size_t sid_max = kNStdString;
+
+  ots::Buffer top_dict(data + hdr_size, top_dict_size);
+  table.set_offset(hdr_size);
+  this->charstrings_index = new ots::CFFIndex;
+  if (!ParseDictData(table, top_dict,
+                     num_glyphs, sid_max,
+                     DICT_DATA_TOPLEVEL, this)) {
+    return Error("Failed to parse Top DICT Data");
+  }
+
+  table.set_offset(hdr_size + top_dict_size);
+  CFFIndex global_subrs_index;
+  if (!ParseIndex(table, global_subrs_index, true)) {
+    return Error("Failed to parse Global Subrs INDEX");
+  }
+
+  if (!ValidateFDSelect(num_glyphs)) {
+    return Error("Failed to validate FDSelect");
+  }
+
+  if (!ValidateCFFCharStrings(*this, global_subrs_index, &table)) {
+    return Error("Failed validating CharStrings INDEX");
+  }
+
+  return true;
+}
+
+bool OpenTypeCFF2::Serialize(OTSStream *out) {
+  if (!out->Write(this->m_data, this->m_length)) {
+    return Error("Failed to write table");
+  }
+  return true;
+}
+
+}  
+
+#undef TABLE_NAME

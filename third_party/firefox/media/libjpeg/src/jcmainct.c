@@ -1,0 +1,149 @@
+/*
+ * jcmainct.c
+ *
+ * This file was part of the Independent JPEG Group's software:
+ * Copyright (C) 1994-1996, Thomas G. Lane.
+ * Lossless JPEG Modifications:
+ * Copyright (C) 1999, Ken Murchison.
+ * libjpeg-turbo Modifications:
+ * Copyright (C) 2022, 2024, D. R. Commander.
+ * For conditions of distribution and use, see the accompanying README.ijg
+ * file.
+ *
+ * This file contains the main buffer controller for compression.
+ * The main buffer lies between the pre-processor and the JPEG
+ * compressor proper; it holds downsampled data in the JPEG colorspace.
+ */
+
+#define JPEG_INTERNALS
+#include "jinclude.h"
+#include "jpeglib.h"
+#include "jsamplecomp.h"
+
+
+#if BITS_IN_JSAMPLE != 16 || defined(C_LOSSLESS_SUPPORTED)
+
+
+typedef struct {
+  struct jpeg_c_main_controller pub; 
+
+  JDIMENSION cur_iMCU_row;      
+  JDIMENSION rowgroup_ctr;      
+  boolean suspended;            
+  J_BUF_MODE pass_mode;         
+
+  _JSAMPARRAY buffer[MAX_COMPONENTS];
+} my_main_controller;
+
+typedef my_main_controller *my_main_ptr;
+
+
+METHODDEF(void) process_data_simple_main(j_compress_ptr cinfo,
+                                         _JSAMPARRAY input_buf,
+                                         JDIMENSION *in_row_ctr,
+                                         JDIMENSION in_rows_avail);
+
+
+
+METHODDEF(void)
+start_pass_main(j_compress_ptr cinfo, J_BUF_MODE pass_mode)
+{
+  my_main_ptr main_ptr = (my_main_ptr)cinfo->main;
+
+  if (cinfo->raw_data_in)
+    return;
+
+  if (pass_mode != JBUF_PASS_THRU)
+    ERREXIT(cinfo, JERR_BAD_BUFFER_MODE);
+
+  main_ptr->cur_iMCU_row = 0;   
+  main_ptr->rowgroup_ctr = 0;
+  main_ptr->suspended = FALSE;
+  main_ptr->pass_mode = pass_mode;      
+  main_ptr->pub._process_data = process_data_simple_main;
+}
+
+
+
+METHODDEF(void)
+process_data_simple_main(j_compress_ptr cinfo, _JSAMPARRAY input_buf,
+                         JDIMENSION *in_row_ctr, JDIMENSION in_rows_avail)
+{
+  my_main_ptr main_ptr = (my_main_ptr)cinfo->main;
+  JDIMENSION data_unit = cinfo->master->lossless ? 1 : DCTSIZE;
+
+  while (main_ptr->cur_iMCU_row < cinfo->total_iMCU_rows) {
+    if (main_ptr->rowgroup_ctr < data_unit)
+      (*cinfo->prep->_pre_process_data) (cinfo, input_buf, in_row_ctr,
+                                         in_rows_avail, main_ptr->buffer,
+                                         &main_ptr->rowgroup_ctr, data_unit);
+
+    if (main_ptr->rowgroup_ctr != data_unit)
+      return;
+
+    if (!(*cinfo->coef->_compress_data) (cinfo, main_ptr->buffer)) {
+      if (!main_ptr->suspended) {
+        (*in_row_ctr)--;
+        main_ptr->suspended = TRUE;
+      }
+      return;
+    }
+    if (main_ptr->suspended) {
+      (*in_row_ctr)++;
+      main_ptr->suspended = FALSE;
+    }
+    main_ptr->rowgroup_ctr = 0;
+    main_ptr->cur_iMCU_row++;
+  }
+}
+
+
+
+GLOBAL(void)
+_jinit_c_main_controller(j_compress_ptr cinfo, boolean need_full_buffer)
+{
+  my_main_ptr main_ptr;
+  int ci;
+  jpeg_component_info *compptr;
+  int data_unit = cinfo->master->lossless ? 1 : DCTSIZE;
+
+#ifdef C_LOSSLESS_SUPPORTED
+  if (cinfo->master->lossless) {
+#if BITS_IN_JSAMPLE == 8
+    if (cinfo->data_precision > BITS_IN_JSAMPLE || cinfo->data_precision < 2)
+#else
+    if (cinfo->data_precision > BITS_IN_JSAMPLE ||
+        cinfo->data_precision < BITS_IN_JSAMPLE - 3)
+#endif
+      ERREXIT1(cinfo, JERR_BAD_PRECISION, cinfo->data_precision);
+  } else
+#endif
+  {
+    if (cinfo->data_precision != BITS_IN_JSAMPLE)
+      ERREXIT1(cinfo, JERR_BAD_PRECISION, cinfo->data_precision);
+  }
+
+  main_ptr = (my_main_ptr)
+    (*cinfo->mem->alloc_small) ((j_common_ptr)cinfo, JPOOL_IMAGE,
+                                sizeof(my_main_controller));
+  memset(main_ptr, 0, sizeof(my_main_controller));
+  cinfo->main = (struct jpeg_c_main_controller *)main_ptr;
+  main_ptr->pub.start_pass = start_pass_main;
+
+  if (cinfo->raw_data_in)
+    return;
+
+  if (need_full_buffer) {
+    ERREXIT(cinfo, JERR_BAD_BUFFER_MODE);
+  } else {
+    for (ci = 0, compptr = cinfo->comp_info; ci < cinfo->num_components;
+         ci++, compptr++) {
+      main_ptr->buffer[ci] = (_JSAMPARRAY)(*cinfo->mem->alloc_sarray)
+        ((j_common_ptr)cinfo, JPOOL_IMAGE,
+         compptr->width_in_blocks * data_unit,
+         (JDIMENSION)(compptr->v_samp_factor * data_unit));
+    }
+  }
+}
+
+#endif /* BITS_IN_JSAMPLE != 16 || defined(C_LOSSLESS_SUPPORTED) */

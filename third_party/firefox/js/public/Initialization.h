@@ -1,0 +1,93 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_Initialization_h
+#define js_Initialization_h
+
+#include "mozilla/Span.h"
+
+#include "jstypes.h"
+
+struct JS_PUBLIC_API JSContext;
+
+namespace JS {
+namespace detail {
+
+enum class InitState { Uninitialized = 0, Initializing, Running, ShutDown };
+
+extern JS_PUBLIC_DATA InitState libraryInitState;
+
+enum class FrontendOnly { No, Yes };
+
+extern JS_PUBLIC_API const char* InitWithFailureDiagnostic(
+    bool isDebugBuild, FrontendOnly frontendOnly = FrontendOnly::No);
+
+}  
+}  
+
+typedef void* (*JS_ICUAllocFn)(const void*, size_t size);
+typedef void* (*JS_ICUReallocFn)(const void*, void* p, size_t size);
+typedef void (*JS_ICUFreeFn)(const void*, void* p);
+
+extern JS_PUBLIC_API bool JS_SetICUMemoryFunctions(JS_ICUAllocFn allocFn,
+                                                   JS_ICUReallocFn reallocFn,
+                                                   JS_ICUFreeFn freeFn);
+
+inline bool JS_Init(void) {
+#ifdef DEBUG
+  return !JS::detail::InitWithFailureDiagnostic(true);
+#else
+  return !JS::detail::InitWithFailureDiagnostic(false);
+#endif
+}
+
+inline const char* JS_InitWithFailureDiagnostic(void) {
+#ifdef DEBUG
+  return JS::detail::InitWithFailureDiagnostic(true);
+#else
+  return JS::detail::InitWithFailureDiagnostic(false);
+#endif
+}
+
+inline bool JS_FrontendOnlyInit(void) {
+#ifdef DEBUG
+  return !JS::detail::InitWithFailureDiagnostic(true,
+                                                JS::detail::FrontendOnly::Yes);
+#else
+  return !JS::detail::InitWithFailureDiagnostic(false,
+                                                JS::detail::FrontendOnly::Yes);
+#endif
+}
+
+inline bool JS_IsInitialized(void) {
+  return JS::detail::libraryInitState >= JS::detail::InitState::Running;
+}
+
+namespace JS {
+
+using SelfHostedCache = mozilla::Span<const uint8_t>;
+
+using SelfHostedWriter = bool (*)(JSContext*, SelfHostedCache);
+
+JS_PUBLIC_API bool InitSelfHostedCode(JSContext* cx,
+                                      SelfHostedCache cache = nullptr,
+                                      SelfHostedWriter writer = nullptr);
+
+JS_PUBLIC_API void DisableJitBackend();
+
+}  
+
+extern JS_PUBLIC_API void JS_ShutDown(void);
+
+extern JS_PUBLIC_API void JS_FrontendOnlyShutDown(void);
+
+#if defined(ENABLE_WASM_SIMD) && \
+    (defined(JS_CODEGEN_X64) || defined(JS_CODEGEN_X86))
+namespace JS {
+void SetAVXEnabled(bool enabled);
+}  
+#endif
+
+#endif /* js_Initialization_h */

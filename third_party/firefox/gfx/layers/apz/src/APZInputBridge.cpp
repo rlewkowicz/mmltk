@@ -1,0 +1,409 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/layers/APZInputBridge.h"
+
+#include "AsyncPanZoomController.h"
+#include "InputData.h"               // for MouseInput, etc
+#include "InputBlockState.h"         // for InputBlockState
+#include "OverscrollHandoffState.h"  // for OverscrollHandoffState
+#include "nsLayoutUtils.h"           // for IsSmoothScrollingEnabled
+#include "mozilla/EventForwards.h"
+#include "mozilla/dom/WheelEventBinding.h"  // for WheelEvent constants
+#include "mozilla/EventStateManager.h"      // for EventStateManager
+#include "mozilla/layers/APZThreadUtils.h"  // for AssertOnControllerThread, etc
+#include "mozilla/MouseEvents.h"            // for WidgetMouseEvent
+#include "mozilla/StaticPrefs_apz.h"
+#include "mozilla/StaticPrefs_general.h"
+#include "mozilla/TextEvents.h"           // for WidgetKeyboardEvent
+#include "mozilla/TouchEvents.h"          // for WidgetTouchEvent
+#include "mozilla/WheelHandlingHelper.h"  // for WheelDeltaHorizontalizer,
+
+namespace mozilla {
+namespace layers {
+
+APZHandledResult::APZHandledResult(APZHandledPlace aPlace,
+                                   const AsyncPanZoomController* aTarget,
+                                   bool aPopulateDirectionsForUnhandled)
+    : mPlace(aPlace) {
+  MOZ_ASSERT(aTarget);
+  switch (aPlace) {
+    case APZHandledPlace::Unhandled:
+      if (aTarget && aPopulateDirectionsForUnhandled) {
+        mScrollableDirections = aTarget->ScrollableDirections();
+        mOverscrollDirections = aTarget->GetAllowedHandoffDirections(
+            HandoffConsumer::PullToRefresh);
+      }
+      break;
+    case APZHandledPlace::HandledByContent:
+      if (aTarget) {
+        mScrollableDirections = aTarget->ScrollableDirections();
+        mOverscrollDirections = aTarget->GetAllowedHandoffDirections(
+            HandoffConsumer::PullToRefresh);
+      }
+      break;
+    case APZHandledPlace::HandledByRoot: {
+      MOZ_ASSERT(aTarget->IsRootContent());
+      if (aTarget) {
+        mScrollableDirections = aTarget->ScrollableDirections();
+        mOverscrollDirections = aTarget->GetAllowedHandoffDirections(
+            HandoffConsumer::PullToRefresh);
+      }
+      break;
+    }
+    default:
+      MOZ_ASSERT_UNREACHABLE("Invalid APZHandledPlace");
+      break;
+  }
+}
+
+Maybe<APZHandledResult> APZHandledResult::Initialize(
+    const AsyncPanZoomController* aInitialTarget,
+    DispatchToContent aDispatchToContent) {
+  if (!aInitialTarget->IsRootContent()) {
+    return Some(
+        APZHandledResult{APZHandledPlace::HandledByContent, aInitialTarget});
+  }
+
+  if (!bool(aDispatchToContent)) {
+    return Some(
+        APZHandledResult{APZHandledPlace::HandledByRoot, aInitialTarget});
+  }
+
+  return Nothing();
+}
+
+void APZHandledResult::UpdateForTouchEvent(
+    Maybe<APZHandledResult>& aHandledResult, const InputBlockState& aBlock,
+    PointerEventsConsumableFlags aConsumableFlags,
+    const AsyncPanZoomController* aTarget,
+    DispatchToContent aDispatchToContent) {
+  if (!aConsumableFlags.mAllowedByTouchAction) {
+    aHandledResult =
+        Some(APZHandledResult{APZHandledPlace::HandledByContent, aTarget});
+    aHandledResult->mOverscrollDirections = ScrollDirections();
+    return;
+  }
+
+  if (aHandledResult && !bool(aDispatchToContent) &&
+      !aConsumableFlags.mHasRoom) {
+    aHandledResult->mPlace = APZHandledPlace::Unhandled;
+  }
+
+  if (aTarget && !aTarget->IsRootContent()) {
+    bool mayTriggerPullToRefresh =
+        aBlock.GetOverscrollHandoffChain()->ScrollingUpWillTriggerPullToRefresh(
+            aTarget);
+    if (mayTriggerPullToRefresh) {
+      aHandledResult = bool(aDispatchToContent)
+                           ? Nothing()
+                           : Some(APZHandledResult{APZHandledPlace::Unhandled,
+                                                   aTarget, true});
+    }
+
+    auto [mayMoveDynamicToolbar, rootApzc] =
+        aBlock.GetOverscrollHandoffChain()->ScrollingDownWillMoveDynamicToolbar(
+            aTarget);
+    if (mayMoveDynamicToolbar) {
+      MOZ_ASSERT(rootApzc && rootApzc->IsRootContent());
+      aHandledResult =
+          bool(aDispatchToContent)
+              ? Nothing()
+              : Some(APZHandledResult{aConsumableFlags.IsConsumable()
+                                          ? APZHandledPlace::HandledByRoot
+                                          : APZHandledPlace::Unhandled,
+                                      rootApzc});
+      if (aHandledResult && aHandledResult->IsHandledByRoot() &&
+          !mayTriggerPullToRefresh) {
+        MOZ_ASSERT(
+            !(aTarget->ScrollableDirections() & SideBits::eBottom),
+            "If we allowed moving the dynamic toolbar for the sub scroll "
+            "container, the sub scroll container should NOT be scrollable to "
+            "bottom");
+
+        aHandledResult->mOverscrollDirections -= ScrollDirection::eVertical;
+      }
+    }
+  }
+}
+
+APZEventResult::APZEventResult()
+    : mStatus(nsEventStatus_eIgnore),
+      mInputBlockId(InputBlockState::NO_BLOCK_ID) {}
+
+APZEventResult::APZEventResult(
+    const RefPtr<AsyncPanZoomController>& aInitialTarget,
+    TargetConfirmationFlags aFlags)
+    : APZEventResult() {
+  mHandledResult = APZHandledResult::Initialize(aInitialTarget,
+                                                aFlags.NeedDispatchToContent());
+  aInitialTarget->GetGuid(&mTargetGuid);
+}
+
+void APZEventResult::SetStatusAsConsumeDoDefault(
+    const InputBlockState& aBlock) {
+  SetStatusAsConsumeDoDefault(aBlock.GetTargetApzc());
+}
+
+void APZEventResult::SetStatusAsConsumeDoDefault(
+    const RefPtr<AsyncPanZoomController>& aTarget) {
+  mStatus = nsEventStatus_eConsumeDoDefault;
+  mHandledResult =
+      Some(aTarget && aTarget->IsRootContent()
+               ? APZHandledResult{APZHandledPlace::HandledByRoot, aTarget}
+               : APZHandledResult{APZHandledPlace::HandledByContent, aTarget});
+}
+
+void APZEventResult::SetStatusForTouchEvent(
+    const InputBlockState& aBlock, TargetConfirmationFlags aFlags,
+    PointerEventsConsumableFlags aConsumableFlags,
+    const AsyncPanZoomController* aTarget) {
+  mStatus = aConsumableFlags.IsConsumable() ? nsEventStatus_eConsumeDoDefault
+                                            : nsEventStatus_eIgnore;
+
+  APZHandledResult::UpdateForTouchEvent(mHandledResult, aBlock,
+                                        aConsumableFlags, aTarget,
+                                        aFlags.NeedDispatchToContent());
+}
+
+void APZEventResult::SetStatusForFastFling(
+    const TouchBlockState& aBlock, TargetConfirmationFlags aFlags,
+    PointerEventsConsumableFlags aConsumableFlags,
+    const AsyncPanZoomController* aTarget) {
+  MOZ_ASSERT(aBlock.IsDuringFastFling());
+
+  mStatus = nsEventStatus_eConsumeNoDefault;
+
+  mHandledResult = APZHandledResult::Initialize(aTarget, DispatchToContent::No);
+
+  APZHandledResult::UpdateForTouchEvent(
+      mHandledResult, aBlock, aConsumableFlags, aTarget, DispatchToContent::No);
+}
+
+static bool WillHandleMouseEvent(const WidgetMouseEventBase& aEvent) {
+  return aEvent.mMessage == eMouseMove || aEvent.mMessage == eMouseDown ||
+         aEvent.mMessage == eMouseUp || aEvent.mMessage == eDragEnd ||
+         (false &&
+          aEvent.mMessage == eMouseHitTest);
+}
+
+Maybe<APZWheelAction> APZInputBridge::ActionForWheelEvent(
+    WidgetWheelEvent* aEvent) {
+  if (!(aEvent->mDeltaMode == dom::WheelEvent_Binding::DOM_DELTA_LINE ||
+        aEvent->mDeltaMode == dom::WheelEvent_Binding::DOM_DELTA_PIXEL ||
+        aEvent->mDeltaMode == dom::WheelEvent_Binding::DOM_DELTA_PAGE)) {
+    return Nothing();
+  }
+  return EventStateManager::APZWheelActionFor(aEvent);
+}
+
+APZEventResult APZInputBridge::ReceiveInputEvent(
+    WidgetInputEvent& aEvent, InputBlockCallback&& aCallback) {
+  APZThreadUtils::AssertOnControllerThread();
+
+  APZEventResult result;
+
+  switch (aEvent.mClass) {
+    case eMouseEventClass:
+    case eDragEventClass: {
+      WidgetMouseEvent& mouseEvent = *aEvent.AsMouseEvent();
+      if (WillHandleMouseEvent(mouseEvent)) {
+        MouseInput input(mouseEvent);
+        input.mOrigin =
+            ScreenPoint(mouseEvent.mRefPoint.x, mouseEvent.mRefPoint.y);
+
+        result = ReceiveInputEvent(input, std::move(aCallback));
+
+        mouseEvent.mRefPoint = TruncatedToInt(ViewAs<LayoutDevicePixel>(
+            input.mOrigin,
+            PixelCastJustification::LayoutDeviceIsScreenForUntransformedEvent));
+        mouseEvent.mFlags.mHandledByAPZ = input.mHandledByAPZ;
+        mouseEvent.mFocusSequenceNumber = input.mFocusSequenceNumber;
+        MOZ_ASSERT(
+            !mouseEvent.mClickEventPrevented,
+            "It's not assumed that the click event has already been prevented");
+        mouseEvent.mClickEventPrevented |= input.mPreventClickEvent;
+        MOZ_ASSERT_IF(mouseEvent.mClickEventPrevented,
+                      mouseEvent.mMessage == eMouseDown ||
+                          mouseEvent.mMessage == eMouseUp);
+        aEvent.mLayersId = input.mLayersId;
+
+        if (mouseEvent.IsReal()) {
+          UpdateWheelTransaction(mouseEvent.mRefPoint, mouseEvent.mMessage,
+                                 Some(result.mTargetGuid));
+        }
+
+        return result;
+      }
+
+      if (mouseEvent.IsReal()) {
+        UpdateWheelTransaction(mouseEvent.mRefPoint, mouseEvent.mMessage,
+                               Nothing());
+      }
+
+      ProcessUnhandledEvent(&mouseEvent.mRefPoint, &result.mTargetGuid,
+                            &aEvent.mFocusSequenceNumber, &aEvent.mLayersId);
+      return result;
+    }
+    case eTouchEventClass: {
+      WidgetTouchEvent& touchEvent = *aEvent.AsTouchEvent();
+      MultiTouchInput touchInput(touchEvent);
+      result = ReceiveInputEvent(touchInput, std::move(aCallback));
+      touchEvent.mTouches.Clear();
+      touchEvent.mTouches.SetCapacity(touchInput.mTouches.Length());
+      for (size_t i = 0; i < touchInput.mTouches.Length(); i++) {
+        *touchEvent.mTouches.AppendElement() =
+            touchInput.mTouches[i].ToNewDOMTouch();
+      }
+      touchEvent.mFlags.mHandledByAPZ = touchInput.mHandledByAPZ;
+      touchEvent.mFocusSequenceNumber = touchInput.mFocusSequenceNumber;
+      aEvent.mLayersId = touchInput.mLayersId;
+      return result;
+    }
+    case eWheelEventClass: {
+      WidgetWheelEvent& wheelEvent = *aEvent.AsWheelEvent();
+
+      if (Maybe<APZWheelAction> action = ActionForWheelEvent(&wheelEvent)) {
+        ScrollWheelInput::ScrollMode scrollMode =
+            ScrollWheelInput::SCROLLMODE_INSTANT;
+        if (nsLayoutUtils::IsSmoothScrollingEnabled() &&
+            ((wheelEvent.mDeltaMode ==
+                  dom::WheelEvent_Binding::DOM_DELTA_LINE &&
+              StaticPrefs::general_smoothScroll_mouseWheel()) ||
+             (wheelEvent.mDeltaMode ==
+                  dom::WheelEvent_Binding::DOM_DELTA_PAGE &&
+              StaticPrefs::general_smoothScroll_pages()))) {
+          scrollMode = ScrollWheelInput::SCROLLMODE_SMOOTH;
+        }
+
+        WheelDeltaAdjustmentStrategy strategy =
+            EventStateManager::GetWheelDeltaAdjustmentStrategy(wheelEvent);
+        WheelDeltaHorizontalizer horizontalizer(wheelEvent);
+        if (WheelDeltaAdjustmentStrategy::eHorizontalize == strategy) {
+          horizontalizer.Horizontalize();
+        }
+
+        if (wheelEvent.mDeltaX || wheelEvent.mDeltaY) {
+          ScreenPoint origin(wheelEvent.mRefPoint.x, wheelEvent.mRefPoint.y);
+          ScrollWheelInput input(
+              wheelEvent.mTimeStamp, 0, scrollMode,
+              ScrollWheelInput::DeltaTypeForDeltaMode(wheelEvent.mDeltaMode),
+              origin, wheelEvent.mDeltaX, wheelEvent.mDeltaY,
+              wheelEvent.mAllowToOverrideSystemScrollSpeed, strategy);
+          input.mAPZAction = action.value();
+
+          EventStateManager::GetUserPrefsForWheelEvent(
+              &wheelEvent, &input.mUserDeltaMultiplierX,
+              &input.mUserDeltaMultiplierY);
+
+          result = ReceiveInputEvent(input, std::move(aCallback));
+          wheelEvent.mRefPoint = TruncatedToInt(ViewAs<LayoutDevicePixel>(
+              input.mOrigin, PixelCastJustification::
+                                 LayoutDeviceIsScreenForUntransformedEvent));
+          wheelEvent.mFlags.mHandledByAPZ = input.mHandledByAPZ;
+          wheelEvent.mFocusSequenceNumber = input.mFocusSequenceNumber;
+          aEvent.mLayersId = input.mLayersId;
+
+          return result;
+        }
+      }
+
+      UpdateWheelTransaction(aEvent.mRefPoint, aEvent.mMessage, Nothing());
+      ProcessUnhandledEvent(&aEvent.mRefPoint, &result.mTargetGuid,
+                            &aEvent.mFocusSequenceNumber, &aEvent.mLayersId);
+      MOZ_ASSERT(result.GetStatus() == nsEventStatus_eIgnore);
+      return result;
+    }
+    case eKeyboardEventClass: {
+      WidgetKeyboardEvent& keyboardEvent = *aEvent.AsKeyboardEvent();
+
+      KeyboardInput input(keyboardEvent);
+
+      result = ReceiveInputEvent(input, std::move(aCallback));
+
+      keyboardEvent.mFlags.mHandledByAPZ = input.mHandledByAPZ;
+      keyboardEvent.mFocusSequenceNumber = input.mFocusSequenceNumber;
+      return result;
+    }
+    default: {
+      UpdateWheelTransaction(aEvent.mRefPoint, aEvent.mMessage, Nothing());
+      ProcessUnhandledEvent(&aEvent.mRefPoint, &result.mTargetGuid,
+                            &aEvent.mFocusSequenceNumber, &aEvent.mLayersId);
+      return result;
+    }
+  }
+
+  MOZ_ASSERT_UNREACHABLE("Invalid WidgetInputEvent type.");
+  result.SetStatusAsConsumeNoDefault();
+  return result;
+}
+
+std::ostream& operator<<(std::ostream& aOut, const SideBits& aSideBits) {
+  if ((aSideBits & SideBits::eAll) == SideBits::eAll) {
+    aOut << "all";
+  } else {
+    AutoTArray<nsCString, 4> strings;
+    if (aSideBits & SideBits::eTop) {
+      strings.AppendElement("top"_ns);
+    }
+    if (aSideBits & SideBits::eRight) {
+      strings.AppendElement("right"_ns);
+    }
+    if (aSideBits & SideBits::eBottom) {
+      strings.AppendElement("bottom"_ns);
+    }
+    if (aSideBits & SideBits::eLeft) {
+      strings.AppendElement("left"_ns);
+    }
+    aOut << strings;
+  }
+  return aOut;
+}
+
+std::ostream& operator<<(std::ostream& aOut,
+                         const ScrollDirections& aScrollDirections) {
+  if (aScrollDirections.contains(EitherScrollDirection)) {
+    aOut << "either";
+  } else if (aScrollDirections.contains(HorizontalScrollDirection)) {
+    aOut << "horizontal";
+  } else if (aScrollDirections.contains(VerticalScrollDirection)) {
+    aOut << "vertical";
+  } else {
+    aOut << "none";
+  }
+  return aOut;
+}
+
+std::ostream& operator<<(std::ostream& aOut,
+                         const APZHandledPlace& aHandledPlace) {
+  switch (aHandledPlace) {
+    case APZHandledPlace::Unhandled:
+      aOut << "unhandled";
+      break;
+    case APZHandledPlace::HandledByRoot: {
+      aOut << "handled-by-root";
+      break;
+    }
+    case APZHandledPlace::HandledByContent: {
+      aOut << "handled-by-content";
+      break;
+    }
+    case APZHandledPlace::Invalid: {
+      aOut << "INVALID";
+      break;
+    }
+  }
+  return aOut;
+}
+
+std::ostream& operator<<(std::ostream& aOut,
+                         const APZHandledResult& aHandledResult) {
+  aOut << "handled: " << aHandledResult.mPlace << ", ";
+  aOut << "scrollable: " << aHandledResult.mScrollableDirections << ", ";
+  aOut << "overscroll: " << aHandledResult.mOverscrollDirections << std::endl;
+  return aOut;
+}
+
+}  
+}  

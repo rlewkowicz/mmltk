@@ -1,0 +1,142 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef txKey_h_
+#define txKey_h_
+
+#include "nsTHashtable.h"
+#include "txExpandedNameMap.h"
+#include "txList.h"
+#include "txNodeSet.h"
+#include "txXMLUtils.h"
+#include "txXSLTPatterns.h"
+
+class txPattern;
+class Expr;
+class txExecutionState;
+
+class txKeyValueHashKey {
+ public:
+  txKeyValueHashKey(const txExpandedName& aKeyName, int32_t aRootIdentifier,
+                    const nsAString& aKeyValue)
+      : mKeyName(aKeyName),
+        mKeyValue(aKeyValue),
+        mRootIdentifier(aRootIdentifier) {}
+
+  txExpandedName mKeyName;
+  nsString mKeyValue;
+  int32_t mRootIdentifier;
+};
+
+struct txKeyValueHashEntry : public PLDHashEntryHdr {
+ public:
+  using KeyType = const txKeyValueHashKey&;
+  using KeyTypePointer = const txKeyValueHashKey*;
+
+  explicit txKeyValueHashEntry(KeyTypePointer aKey)
+      : mKey(*aKey), mNodeSet(new txNodeSet(nullptr)) {}
+
+  txKeyValueHashEntry(const txKeyValueHashEntry& entry)
+      : mKey(entry.mKey), mNodeSet(entry.mNodeSet) {}
+
+  bool KeyEquals(KeyTypePointer aKey) const;
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+
+  static PLDHashNumber HashKey(KeyTypePointer aKey);
+
+  enum { ALLOW_MEMMOVE = true };
+
+  txKeyValueHashKey mKey;
+  RefPtr<txNodeSet> mNodeSet;
+};
+
+using txKeyValueHash = nsTHashtable<txKeyValueHashEntry>;
+
+class txIndexedKeyHashKey {
+ public:
+  txIndexedKeyHashKey(txExpandedName aKeyName, int32_t aRootIdentifier)
+      : mKeyName(aKeyName), mRootIdentifier(aRootIdentifier) {}
+
+  txExpandedName mKeyName;
+  int32_t mRootIdentifier;
+};
+
+struct txIndexedKeyHashEntry : public PLDHashEntryHdr {
+ public:
+  using KeyType = const txIndexedKeyHashKey&;
+  using KeyTypePointer = const txIndexedKeyHashKey*;
+
+  explicit txIndexedKeyHashEntry(KeyTypePointer aKey) : mKey(*aKey) {}
+
+  txIndexedKeyHashEntry(const txIndexedKeyHashEntry& entry)
+      : mKey(entry.mKey),
+        mIndexed(entry.mIndexed),
+        mIsBeingIndexed(entry.mIsBeingIndexed) {}
+
+  bool KeyEquals(KeyTypePointer aKey) const;
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+
+  static PLDHashNumber HashKey(KeyTypePointer aKey);
+
+  enum { ALLOW_MEMMOVE = true };
+
+  txIndexedKeyHashKey mKey;
+  bool mIndexed = false;
+  bool mIsBeingIndexed = false;
+};
+
+using txIndexedKeyHash = nsTHashtable<txIndexedKeyHashEntry>;
+
+class txXSLKey {
+ public:
+  explicit txXSLKey(const txExpandedName& aName) : mName(aName) {}
+
+  bool addKey(mozilla::UniquePtr<txPattern>&& aMatch,
+              mozilla::UniquePtr<Expr>&& aUse);
+
+  nsresult indexSubtreeRoot(const txXPathNode& aRoot,
+                            txKeyValueHash& aKeyValueHash,
+                            txExecutionState& aEs);
+
+ private:
+  nsresult indexTree(const txXPathNode& aNode, txKeyValueHashKey& aKey,
+                     txKeyValueHash& aKeyValueHash, txExecutionState& aEs);
+
+  nsresult testNode(const txXPathNode& aNode, txKeyValueHashKey& aKey,
+                    txKeyValueHash& aKeyValueHash, txExecutionState& aEs);
+
+  struct Key {
+    mozilla::UniquePtr<txPattern> matchPattern;
+    mozilla::UniquePtr<Expr> useExpr;
+  };
+
+  nsTArray<Key> mKeys;
+
+  txExpandedName mName;
+};
+
+class txKeyHash {
+ public:
+  explicit txKeyHash(const txOwningExpandedNameMap<txXSLKey>& aKeys)
+      : mKeyValues(4), mIndexedKeys(1), mKeys(aKeys) {}
+
+  nsresult init();
+
+  nsresult getKeyNodes(const txExpandedName& aKeyName, const txXPathNode& aRoot,
+                       const nsAString& aKeyValue, bool aIndexIfNotFound,
+                       txExecutionState& aEs, txNodeSet** aResult);
+
+ private:
+  txKeyValueHash mKeyValues;
+
+  txIndexedKeyHash mIndexedKeys;
+
+  const txOwningExpandedNameMap<txXSLKey>& mKeys;
+
+  RefPtr<txNodeSet> mEmptyNodeSet;
+};
+
+#endif  // txKey_h_

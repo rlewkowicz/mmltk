@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_BASE_BASELINE_H_
+#define LAYOUT_BASE_BASELINE_H_
+
+#include "mozilla/WritingModes.h"
+#include "nsCoord.h"
+
+class nsIFrame;
+
+namespace mozilla {
+
+enum class BaselineSharingGroup : uint8_t {
+  First = 0,
+  Last = 1,
+};
+
+inline BaselineSharingGroup GetOppositeBaselineSharingGroup(
+    BaselineSharingGroup aBaselineSharingGroup) {
+  return aBaselineSharingGroup == BaselineSharingGroup::First
+             ? BaselineSharingGroup::Last
+             : BaselineSharingGroup::First;
+}
+
+enum class BaselineExportContext : uint8_t {
+  LineLayout = 0,
+  Other = 1,
+};
+
+class Baseline {
+ public:
+  static nscoord SynthesizeBOffsetFromMarginBox(const nsIFrame* aFrame,
+                                                WritingMode aWM,
+                                                BaselineSharingGroup);
+
+  static nscoord SynthesizeBOffsetFromBorderBox(const nsIFrame* aFrame,
+                                                WritingMode aWM,
+                                                BaselineSharingGroup);
+  static nscoord SynthesizeBOffsetFromContentBox(const nsIFrame*, WritingMode,
+                                                 BaselineSharingGroup);
+  static nscoord SynthesizeBOffsetFromPaddingBox(const nsIFrame*, WritingMode,
+                                                 BaselineSharingGroup);
+};
+
+}  
+
+#endif  // LAYOUT_BASE_BASELINE_H_

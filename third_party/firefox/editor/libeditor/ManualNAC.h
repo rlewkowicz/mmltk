@@ -1,0 +1,109 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ManualNAC_h
+#define mozilla_ManualNAC_h
+
+#include "mozilla/dom/Element.h"
+#include "mozilla/RefPtr.h"
+
+namespace mozilla {
+
+using ManualNACArray = AutoTArray<RefPtr<dom::Element>, 16>;
+
+class ManualNACPtr final {
+ public:
+  ManualNACPtr() = default;
+  MOZ_IMPLICIT ManualNACPtr(decltype(nullptr)) {}
+  explicit ManualNACPtr(already_AddRefed<dom::Element> aNewNAC)
+      : mPtr(aNewNAC) {
+    if (!mPtr) {
+      return;
+    }
+
+    nsIContent* parentContent = mPtr->GetParent();
+    auto nac = static_cast<ManualNACArray*>(
+        parentContent->GetProperty(nsGkAtoms::manualNACProperty));
+    if (!nac) {
+      nac = new ManualNACArray();
+      parentContent->SetProperty(nsGkAtoms::manualNACProperty, nac,
+                                 nsINode::DeleteProperty<ManualNACArray>);
+    }
+    nac->AppendElement(mPtr);
+  }
+
+  ManualNACPtr(ManualNACPtr&& aOther) : mPtr(std::move(aOther.mPtr)) {}
+  ManualNACPtr(ManualNACPtr& aOther) = delete;
+  ManualNACPtr& operator=(ManualNACPtr&& aOther) {
+    Reset();
+    mPtr = std::move(aOther.mPtr);
+    return *this;
+  }
+  ManualNACPtr& operator=(ManualNACPtr& aOther) = delete;
+
+  ~ManualNACPtr() { Reset(); }
+
+  void Reset() {
+    if (!mPtr) {
+      return;
+    }
+    RemoveContentFromNACArray(mPtr);
+    mPtr = nullptr;
+  }
+
+  static bool IsManualNAC(nsIContent* aAnonContent) {
+    MOZ_ASSERT(aAnonContent->IsRootOfNativeAnonymousSubtree());
+    MOZ_ASSERT(aAnonContent->IsInComposedDoc());
+
+    auto* nac = static_cast<ManualNACArray*>(
+        aAnonContent->GetParent()->GetProperty(nsGkAtoms::manualNACProperty));
+    return nac && nac->Contains(aAnonContent);
+  }
+
+  template <typename StrongNodePtr>
+  static void RemoveContentFromNACArray(StrongNodePtr& aAnonymousContent) {
+    static_assert(std::is_same_v<StrongNodePtr, RefPtr<dom::Element>> ||
+                  std::is_same_v<StrongNodePtr, nsCOMPtr<nsIContent>>);
+    StrongNodePtr anonymousContent =
+        std::forward<StrongNodePtr>(aAnonymousContent);
+    MOZ_ASSERT(!aAnonymousContent);
+    nsIContent* parentContent = anonymousContent->GetParent();
+    if (!parentContent) {
+      NS_WARNING("Potentially leaking manual NAC");
+      return;
+    }
+
+    auto* nac = static_cast<ManualNACArray*>(
+        parentContent->GetProperty(nsGkAtoms::manualNACProperty));
+    if (nac) {
+      nac->RemoveElement(anonymousContent);
+      if (nac->IsEmpty()) {
+        parentContent->RemoveProperty(nsGkAtoms::manualNACProperty);
+      }
+    }
+
+    anonymousContent->UnbindFromTree();
+  }
+
+  dom::Element* get() const { return mPtr.get(); }
+  dom::Element* operator->() const { return get(); }
+  operator dom::Element*() const& { return get(); }
+
+ private:
+  RefPtr<dom::Element> mPtr;
+};
+
+}  
+
+inline void ImplCycleCollectionUnlink(mozilla::ManualNACPtr& field) {
+  field.Reset();
+}
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& callback,
+    const mozilla::ManualNACPtr& field, const char* name, uint32_t flags = 0) {
+  CycleCollectionNoteChild(callback, field.get(), name, flags);
+}
+
+#endif  // #ifndef mozilla_ManualNAC_h

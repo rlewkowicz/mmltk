@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ipc_FileDescriptor_h
+#define mozilla_ipc_FileDescriptor_h
+
+#include "base/basictypes.h"
+#include "base/process.h"
+#include "mozilla/UniquePtrExtensions.h"
+
+namespace mozilla {
+namespace ipc {
+
+class FileDescriptor {
+ public:
+  typedef base::ProcessId ProcessId;
+
+  using UniquePlatformHandle = mozilla::UniqueFileHandle;
+  using PlatformHandleType = UniquePlatformHandle::element_type;
+
+  struct IPDLPrivate {};
+
+  FileDescriptor();
+
+  FileDescriptor(const FileDescriptor& aOther);
+
+  FileDescriptor(FileDescriptor&& aOther);
+
+  explicit FileDescriptor(PlatformHandleType aHandle);
+
+  explicit FileDescriptor(UniquePlatformHandle&& aHandle);
+
+  ~FileDescriptor();
+
+  FileDescriptor& operator=(const FileDescriptor& aOther);
+
+  FileDescriptor& operator=(FileDescriptor&& aOther);
+
+  bool IsValid() const;
+
+  UniquePlatformHandle ClonePlatformHandle() const;
+
+  UniquePlatformHandle TakePlatformHandle();
+
+  bool operator==(const FileDescriptor& aOther) const;
+
+ private:
+  UniquePlatformHandle mHandle;
+};
+
+}  
+}  
+
+#endif  // mozilla_ipc_FileDescriptor_h

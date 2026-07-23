@@ -1,0 +1,90 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkColorFilter_DEFINED)
+#define SkColorFilter_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkFlattenable.h"
+#include "include/core/SkRefCnt.h"
+#include "include/private/base/SkAPI.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+
+class SkColorMatrix;
+class SkColorSpace;
+class SkColorTable;
+
+enum class SkBlendMode;
+struct SkDeserialProcs;
+
+class SK_API SkColorFilter : public SkFlattenable {
+public:
+    bool asAColorMode(SkColor* color, SkBlendMode* mode) const;
+
+    bool asAColorMatrix(float matrix[20]) const;
+
+    bool isAlphaUnchanged() const;
+
+    SkColor4f filterColor4f(const SkColor4f& srcColor, SkColorSpace* srcCS,
+                            SkColorSpace* dstCS) const;
+
+    sk_sp<SkColorFilter> makeComposed(sk_sp<SkColorFilter> inner) const;
+
+    sk_sp<SkColorFilter> makeWithWorkingColorSpace(sk_sp<SkColorSpace>) const;
+
+    static sk_sp<SkColorFilter> Deserialize(const void* data, size_t size,
+                                            const SkDeserialProcs* procs = nullptr);
+
+private:
+    SkColorFilter() = default;
+    friend class SkColorFilterBase;
+
+    using INHERITED = SkFlattenable;
+};
+
+class SK_API SkColorFilters {
+public:
+    static sk_sp<SkColorFilter> Compose(const sk_sp<SkColorFilter>& outer,
+                                        sk_sp<SkColorFilter> inner) {
+        return outer ? outer->makeComposed(std::move(inner))
+                     : std::move(inner);
+    }
+
+    static sk_sp<SkColorFilter> Blend(const SkColor4f& c, sk_sp<SkColorSpace>, SkBlendMode mode);
+    static sk_sp<SkColorFilter> Blend(SkColor c, SkBlendMode mode);
+
+    enum class Clamp : bool { kNo, kYes };
+
+    static sk_sp<SkColorFilter> Matrix(const SkColorMatrix&, Clamp clamp = Clamp::kYes);
+    static sk_sp<SkColorFilter> Matrix(const float rowMajor[20], Clamp clamp = Clamp::kYes);
+
+    static sk_sp<SkColorFilter> HSLAMatrix(const SkColorMatrix&);
+    static sk_sp<SkColorFilter> HSLAMatrix(const float rowMajor[20]);
+
+    static sk_sp<SkColorFilter> LinearToSRGBGamma();
+    static sk_sp<SkColorFilter> SRGBToLinearGamma();
+    static sk_sp<SkColorFilter> Lerp(float t, sk_sp<SkColorFilter> dst, sk_sp<SkColorFilter> src);
+
+    static sk_sp<SkColorFilter> Table(const uint8_t table[256]);
+
+    static sk_sp<SkColorFilter> TableARGB(const uint8_t tableA[256],
+                                          const uint8_t tableR[256],
+                                          const uint8_t tableG[256],
+                                          const uint8_t tableB[256]);
+
+    static sk_sp<SkColorFilter> Table(sk_sp<SkColorTable> table);
+
+    static sk_sp<SkColorFilter> Lighting(SkColor mul, SkColor add);
+
+private:
+    SkColorFilters() = delete;
+};
+
+#endif

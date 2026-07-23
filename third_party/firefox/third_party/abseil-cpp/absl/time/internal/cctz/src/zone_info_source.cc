@@ -1,0 +1,103 @@
+// Copyright 2016 Google Inc. All Rights Reserved.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//   https://www.apache.org/licenses/LICENSE-2.0
+//   Unless required by applicable law or agreed to in writing, software
+//   distributed under the License is distributed on an "AS IS" BASIS,
+//   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//   See the License for the specific language governing permissions and
+//   limitations under the License.
+
+#include "absl/time/internal/cctz/include/cctz/zone_info_source.h"
+
+#include "absl/base/config.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace time_internal {
+namespace cctz {
+
+ZoneInfoSource::~ZoneInfoSource() {}
+std::string ZoneInfoSource::Version() const { return std::string(); }
+
+}  
+}  
+ABSL_NAMESPACE_END
+}  
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace time_internal {
+namespace cctz_extension {
+
+namespace {
+
+std::unique_ptr<absl::time_internal::cctz::ZoneInfoSource> DefaultFactory(
+    const std::string& name,
+    const std::function<
+        std::unique_ptr<absl::time_internal::cctz::ZoneInfoSource>(
+            const std::string& name)>& fallback_factory) {
+  return fallback_factory(name);
+}
+
+}  
+
+#if !defined(__has_attribute)
+#define __has_attribute(x) 0
+#endif
+#if (__has_attribute(weak) || defined(__GNUC__)) && !defined(__MINGW32__) && \
+    !0
+ZoneInfoSourceFactory zone_info_source_factory __attribute__((weak)) =
+    DefaultFactory;
+#elif defined(_MSC_VER) && !defined(__MINGW32__) && !defined(_LIBCPP_VERSION)
+extern ZoneInfoSourceFactory zone_info_source_factory;
+extern ZoneInfoSourceFactory default_factory;
+ZoneInfoSourceFactory default_factory = DefaultFactory;
+#if defined(_M_IX86) || defined(_M_ARM)
+#pragma comment(                                                                                                         \
+    linker,                                                                                                              \
+    "/alternatename:?zone_info_source_factory@cctz_extension@time_internal@" ABSL_INTERNAL_MANGLED_NS                    \
+    "@@3P6A?AV?$unique_ptr@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                                 \
+    "@@U?$default_delete@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                                   \
+    "@@@std@@@std@@ABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@" ABSL_INTERNAL_MANGLED_BACKREFERENCE      \
+    "@ABV?$function@$$A6A?AV?$unique_ptr@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                   \
+    "@@U?$default_delete@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                                   \
+    "@@@std@@@std@@ABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@2@@Z@" ABSL_INTERNAL_MANGLED_BACKREFERENCE \
+    "@@ZA=?default_factory@cctz_extension@time_internal@" ABSL_INTERNAL_MANGLED_NS                                       \
+    "@@3P6A?AV?$unique_ptr@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                                 \
+    "@@U?$default_delete@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                                   \
+    "@@@std@@@std@@ABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@" ABSL_INTERNAL_MANGLED_BACKREFERENCE      \
+    "@ABV?$function@$$A6A?AV?$unique_ptr@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                   \
+    "@@U?$default_delete@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                                   \
+    "@@@std@@@std@@ABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@2@@Z@" ABSL_INTERNAL_MANGLED_BACKREFERENCE \
+    "@@ZA")
+#elif defined(_M_IA_64) || defined(_M_AMD64) || defined(_M_ARM64)
+#pragma comment(                                                                                                          \
+    linker,                                                                                                               \
+    "/alternatename:?zone_info_source_factory@cctz_extension@time_internal@" ABSL_INTERNAL_MANGLED_NS                     \
+    "@@3P6A?AV?$unique_ptr@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                                  \
+    "@@U?$default_delete@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                                    \
+    "@@@std@@@std@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@" ABSL_INTERNAL_MANGLED_BACKREFERENCE      \
+    "@AEBV?$function@$$A6A?AV?$unique_ptr@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                   \
+    "@@U?$default_delete@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                                    \
+    "@@@std@@@std@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@2@@Z@" ABSL_INTERNAL_MANGLED_BACKREFERENCE \
+    "@@ZEA=?default_factory@cctz_extension@time_internal@" ABSL_INTERNAL_MANGLED_NS                                       \
+    "@@3P6A?AV?$unique_ptr@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                                  \
+    "@@U?$default_delete@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                                    \
+    "@@@std@@@std@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@" ABSL_INTERNAL_MANGLED_BACKREFERENCE      \
+    "@AEBV?$function@$$A6A?AV?$unique_ptr@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                   \
+    "@@U?$default_delete@VZoneInfoSource@cctz@time_internal@" ABSL_INTERNAL_MANGLED_NS                                    \
+    "@@@std@@@std@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@2@@Z@" ABSL_INTERNAL_MANGLED_BACKREFERENCE \
+    "@@ZEA")
+#else
+#error Unsupported MSVC platform
+#endif
+#else
+ZoneInfoSourceFactory zone_info_source_factory = DefaultFactory;
+#endif
+
+}  
+}  
+ABSL_NAMESPACE_END
+}  

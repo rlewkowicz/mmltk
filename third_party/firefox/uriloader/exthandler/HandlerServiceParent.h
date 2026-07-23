@@ -1,0 +1,53 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef handler_service_parent_h
+#define handler_service_parent_h
+
+#include "mozilla/dom/PHandlerServiceParent.h"
+#include "nsIMIMEInfo.h"
+
+class nsIHandlerApp;
+
+class HandlerServiceParent final : public mozilla::dom::PHandlerServiceParent {
+ public:
+  HandlerServiceParent();
+  NS_INLINE_DECL_REFCOUNTING(HandlerServiceParent, final)
+
+ private:
+  virtual ~HandlerServiceParent();
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  mozilla::ipc::IPCResult RecvFillHandlerInfo(
+      const HandlerInfo& aHandlerInfoData, const nsACString& aOverrideType,
+      HandlerInfo* handlerInfoData) override;
+
+  mozilla::ipc::IPCResult RecvGetMIMEInfoFromOS(const nsACString& aMIMEType,
+                                                const nsACString& aExtension,
+                                                nsresult* aRv,
+                                                HandlerInfo* aHandlerInfoData,
+                                                bool* aFound) override;
+
+  mozilla::ipc::IPCResult RecvExists(const HandlerInfo& aHandlerInfo,
+                                     bool* exists) override;
+
+  mozilla::ipc::IPCResult RecvGetTypeFromExtension(
+      const nsACString& aFileExtension, nsCString* type) override;
+
+  mozilla::ipc::IPCResult RecvExistsForProtocolOS(
+      const nsACString& aProtocolScheme, bool* aHandlerExists) override;
+
+  mozilla::ipc::IPCResult RecvExistsForProtocol(
+      const nsACString& aProtocolScheme, bool* aHandlerExists) override;
+
+  mozilla::ipc::IPCResult RecvGetApplicationDescription(
+      const nsACString& aScheme, nsresult* aRv,
+      nsString* aDescription) override;
+
+  static const size_t MAX_MIMETYPE_LENGTH = 129; 
+  static const size_t MAX_EXT_LENGTH = 64;       
+  static const size_t MAX_SCHEME_LENGTH = 1024;  
+};
+
+#endif

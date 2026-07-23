@@ -1,0 +1,47 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_OriginTrials_h
+#define mozilla_OriginTrials_h
+
+#include "mozilla/EnumSet.h"
+#include "mozilla/origin_trials_ffi_generated.h"
+#include "nsStringFwd.h"
+
+class nsIPrincipal;
+class nsGlobalWindowInner;
+struct JSContext;
+class JSObject;
+
+namespace mozilla {
+
+using OriginTrial = origin_trials_ffi::OriginTrial;
+
+class OriginTrials final {
+ public:
+  using RawType = EnumSet<OriginTrial>;
+
+  OriginTrials() = default;
+
+  static OriginTrials FromRaw(RawType aRaw) { return OriginTrials(aRaw); }
+  const RawType& Raw() const { return mEnabledTrials; }
+
+  void UpdateFromToken(const nsAString& aBase64EncodedToken,
+                       nsIPrincipal* aPrincipal);
+
+  bool IsEnabled(OriginTrial aTrial) const;
+
+  static bool IsEnabled(JSContext*, JSObject*, OriginTrial);
+
+  static OriginTrials FromWindow(const nsGlobalWindowInner*);
+
+ private:
+  explicit OriginTrials(RawType aRaw) : mEnabledTrials(aRaw) {}
+
+  RawType mEnabledTrials;
+};
+
+}  
+
+#endif

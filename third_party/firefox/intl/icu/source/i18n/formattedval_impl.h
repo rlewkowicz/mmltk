@@ -1,0 +1,207 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#ifndef __FORMVAL_IMPL_H__
+#define __FORMVAL_IMPL_H__
+
+#include "unicode/utypes.h"
+#if !UCONFIG_NO_FORMATTING
+
+
+#include "unicode/formattedvalue.h"
+#include "capi_helper.h"
+#include "fphdlimp.h"
+#include "util.h"
+#include "uvectr32.h"
+#include "formatted_string_builder.h"
+
+
+typedef enum UCFPosConstraintType {
+    UCFPOS_CONSTRAINT_NONE = 0,
+
+    UCFPOS_CONSTRAINT_CATEGORY,
+
+    UCFPOS_CONSTRAINT_FIELD
+} UCFPosConstraintType;
+
+
+U_NAMESPACE_BEGIN
+
+
+class FormattedValueFieldPositionIteratorImpl : public UMemory, public FormattedValue {
+public:
+
+    FormattedValueFieldPositionIteratorImpl(int32_t initialFieldCapacity, UErrorCode& status);
+
+    virtual ~FormattedValueFieldPositionIteratorImpl();
+
+
+    UnicodeString toString(UErrorCode& status) const override;
+    UnicodeString toTempString(UErrorCode& status) const override;
+    Appendable& appendTo(Appendable& appendable, UErrorCode& status) const override;
+    UBool nextPosition(ConstrainedFieldPosition& cfpos, UErrorCode& status) const override;
+
+
+    FieldPositionIteratorHandler getHandler(UErrorCode& status);
+    void appendString(UnicodeString string, UErrorCode& status);
+
+    void addOverlapSpans(UFieldCategory spanCategory, int8_t firstIndex, UErrorCode& status);
+
+    void sort();
+
+private:
+    UnicodeString fString;
+    UVector32 fFields;
+};
+
+
+struct U_I18N_API SpanInfo {
+    UFieldCategory category;
+    int32_t spanValue;
+    int32_t start;
+    int32_t length;
+};
+
+class U_I18N_API_CLASS FormattedValueStringBuilderImpl : public UMemory, public FormattedValue {
+public:
+    U_I18N_API FormattedValueStringBuilderImpl(FormattedStringBuilder::Field numericField);
+
+    U_I18N_API virtual ~FormattedValueStringBuilderImpl();
+
+    FormattedValueStringBuilderImpl(FormattedValueStringBuilderImpl&&) = default;
+    FormattedValueStringBuilderImpl& operator=(FormattedValueStringBuilderImpl&&) = default;
+
+
+    UnicodeString toString(UErrorCode& status) const override;
+    UnicodeString toTempString(UErrorCode& status) const override;
+    Appendable& appendTo(Appendable& appendable, UErrorCode& status) const override;
+    UBool nextPosition(ConstrainedFieldPosition& cfpos, UErrorCode& status) const override;
+
+    U_I18N_API UBool nextFieldPosition(FieldPosition& fp, UErrorCode& status) const;
+    U_I18N_API void getAllFieldPositions(FieldPositionIteratorHandler& fpih, UErrorCode& status) const;
+    inline FormattedStringBuilder& getStringRef() {
+        return fString;
+    }
+    inline const FormattedStringBuilder& getStringRef() const {
+        return fString;
+    }
+    void resetString();
+
+    void appendSpanInfo(UFieldCategory category, int32_t spanValue, int32_t start, int32_t length, UErrorCode& status);
+    void prependSpanInfo(UFieldCategory category, int32_t spanValue, int32_t start, int32_t length, UErrorCode& status);
+
+private:
+    FormattedStringBuilder fString;
+    FormattedStringBuilder::Field fNumericField;
+    MaybeStackArray<SpanInfo, 8> spanIndices;
+    int32_t spanIndicesCount = 0;
+
+    bool nextPositionImpl(ConstrainedFieldPosition& cfpos, FormattedStringBuilder::Field numericField, UErrorCode& status) const;
+    static bool isIntOrGroup(FormattedStringBuilder::Field field);
+    static bool isTrimmable(FormattedStringBuilder::Field field);
+    int32_t trimBack(int32_t limit) const;
+    int32_t trimFront(int32_t start) const;
+};
+
+
+struct UFormattedValueImpl;
+typedef IcuCApiHelper<UFormattedValue, UFormattedValueImpl, 0x55465600> UFormattedValueApiHelper;
+struct UFormattedValueImpl : public UMemory, public UFormattedValueApiHelper {
+    FormattedValue* fFormattedValue = nullptr;
+};
+
+
+#define UPRV_FORMATTED_VALUE_METHOD_GUARD(returnExpression) \
+    if (U_FAILURE(status)) { \
+        return returnExpression; \
+    } \
+    if (fData == nullptr) { \
+        status = fErrorCode; \
+        return returnExpression; \
+    } \
+
+
+#define UPRV_FORMATTED_VALUE_SUBCLASS_AUTO_IMPL(Name) \
+    Name::Name(Name&& src) noexcept \
+            : fData(src.fData), fErrorCode(src.fErrorCode) { \
+        src.fData = nullptr; \
+        src.fErrorCode = U_INVALID_STATE_ERROR; \
+    } \
+    Name::~Name() { \
+        delete fData; \
+        fData = nullptr; \
+    } \
+    Name& Name::operator=(Name&& src) noexcept { \
+        delete fData; \
+        fData = src.fData; \
+        src.fData = nullptr; \
+        fErrorCode = src.fErrorCode; \
+        src.fErrorCode = U_INVALID_STATE_ERROR; \
+        return *this; \
+    } \
+    UnicodeString Name::toString(UErrorCode& status) const { \
+        UPRV_FORMATTED_VALUE_METHOD_GUARD(ICU_Utility::makeBogusString()) \
+        return fData->toString(status); \
+    } \
+    UnicodeString Name::toTempString(UErrorCode& status) const { \
+        UPRV_FORMATTED_VALUE_METHOD_GUARD(ICU_Utility::makeBogusString()) \
+        return fData->toTempString(status); \
+    } \
+    Appendable& Name::appendTo(Appendable& appendable, UErrorCode& status) const { \
+        UPRV_FORMATTED_VALUE_METHOD_GUARD(appendable) \
+        return fData->appendTo(appendable, status); \
+    } \
+    UBool Name::nextPosition(ConstrainedFieldPosition& cfpos, UErrorCode& status) const { \
+        UPRV_FORMATTED_VALUE_METHOD_GUARD(false) \
+        return fData->nextPosition(cfpos, status); \
+    }
+
+
+#define UPRV_FORMATTED_VALUE_CAPI_NO_IMPLTYPE_AUTO_IMPL(CType, ImplType, HelperType, Prefix) \
+    U_CAPI CType* U_EXPORT2 \
+    Prefix ## _openResult (UErrorCode* ec) { \
+        if (U_FAILURE(*ec)) { \
+            return nullptr; \
+        } \
+        ImplType* impl = new ImplType(); \
+        if (impl == nullptr) { \
+            *ec = U_MEMORY_ALLOCATION_ERROR; \
+            return nullptr; \
+        } \
+        return static_cast<HelperType*>(impl)->exportForC(); \
+    } \
+    U_CAPI const UFormattedValue* U_EXPORT2 \
+    Prefix ## _resultAsValue (const CType* uresult, UErrorCode* ec) { \
+        const ImplType* result = HelperType::validate(uresult, *ec); \
+        if (U_FAILURE(*ec)) { return nullptr; } \
+        return static_cast<const UFormattedValueApiHelper*>(result)->exportConstForC(); \
+    } \
+    U_CAPI void U_EXPORT2 \
+    Prefix ## _closeResult (CType* uresult) { \
+        UErrorCode localStatus = U_ZERO_ERROR; \
+        const ImplType* impl = HelperType::validate(uresult, localStatus); \
+        delete impl; \
+    }
+
+
+#define UPRV_FORMATTED_VALUE_CAPI_AUTO_IMPL(CPPType, CType, ImplType, HelperType, Prefix, MagicNumber) \
+    U_NAMESPACE_BEGIN \
+    class ImplType; \
+    typedef IcuCApiHelper<CType, ImplType, MagicNumber> HelperType; \
+    class ImplType : public UFormattedValueImpl, public HelperType { \
+    public: \
+        ImplType(); \
+        ~ImplType(); \
+        CPPType fImpl; \
+    }; \
+    ImplType::ImplType() { \
+        fFormattedValue = &fImpl; \
+    } \
+    ImplType::~ImplType() {} \
+    U_NAMESPACE_END \
+    UPRV_FORMATTED_VALUE_CAPI_NO_IMPLTYPE_AUTO_IMPL(CType, ImplType, HelperType, Prefix)
+
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+#endif // __FORMVAL_IMPL_H__

@@ -1,0 +1,176 @@
+// Copyright 2019 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_STRINGS_INTERNAL_CORDZ_INFO_H_
+#define ABSL_STRINGS_INTERNAL_CORDZ_INFO_H_
+
+#include <atomic>
+#include <cstdint>
+#include <functional>
+
+#include "absl/base/config.h"
+#include "absl/base/const_init.h"
+#include "absl/base/internal/raw_logging.h"
+#include "absl/base/thread_annotations.h"
+#include "absl/strings/internal/cord_internal.h"
+#include "absl/strings/internal/cordz_handle.h"
+#include "absl/strings/internal/cordz_statistics.h"
+#include "absl/strings/internal/cordz_update_tracker.h"
+#include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace cord_internal {
+
+class ABSL_LOCKABLE CordzInfo : public CordzHandle {
+ public:
+  using MethodIdentifier = CordzUpdateTracker::MethodIdentifier;
+
+  static void TrackCord(InlineData& cord, MethodIdentifier method,
+                        int64_t sampling_stride);
+
+  static void TrackCord(InlineData& cord, const InlineData& src,
+                        MethodIdentifier method);
+
+  static void MaybeTrackCord(InlineData& cord, MethodIdentifier method);
+
+  static void MaybeTrackCord(InlineData& cord, const InlineData& src,
+                             MethodIdentifier method);
+
+  void Untrack();
+
+  static void MaybeUntrackCord(CordzInfo* info);
+
+  CordzInfo() = delete;
+  CordzInfo(const CordzInfo&) = delete;
+  CordzInfo& operator=(const CordzInfo&) = delete;
+
+  static CordzInfo* Head(const CordzSnapshot& snapshot);
+
+  CordzInfo* Next(const CordzSnapshot& snapshot) const;
+
+  void Lock(MethodIdentifier method) ABSL_EXCLUSIVE_LOCK_FUNCTION(mutex_);
+
+  void Unlock() ABSL_UNLOCK_FUNCTION(mutex_);
+
+  void AssertHeld() ABSL_ASSERT_EXCLUSIVE_LOCK(mutex_);
+
+  void SetCordRep(CordRep* rep);
+
+  CordRep* RefCordRep() const ABSL_LOCKS_EXCLUDED(mutex_);
+
+  CordRep* GetCordRepForTesting() const ABSL_NO_THREAD_SAFETY_ANALYSIS {
+    return rep_;
+  }
+
+  void SetCordRepForTesting(CordRep* rep) ABSL_NO_THREAD_SAFETY_ANALYSIS {
+    rep_ = rep;
+  }
+
+  absl::Span<void* const> GetStack() const;
+
+  absl::Span<void* const> GetParentStack() const;
+
+  CordzStatistics GetCordzStatistics() const;
+
+  int64_t sampling_stride() const { return sampling_stride_; }
+
+ private:
+  struct List {
+    absl::Mutex mutex;
+    CordzInfo* head ABSL_GUARDED_BY(mutex){nullptr};
+  };
+
+  static List* GlobalList();
+
+  static constexpr size_t kMaxStackDepth = 64;
+
+  explicit CordzInfo(CordRep* rep, const CordzInfo* src,
+                     MethodIdentifier method, int64_t weight);
+  ~CordzInfo() override;
+
+  void UnsafeSetCordRep(CordRep* rep) ABSL_NO_THREAD_SAFETY_ANALYSIS;
+
+  void Track();
+
+  static MethodIdentifier GetParentMethod(const CordzInfo* src);
+
+  static size_t FillParentStack(const CordzInfo* src, void** stack);
+
+  void ODRCheck() const {
+#ifndef NDEBUG
+    ABSL_RAW_CHECK(list_ == GlobalList(), "ODR violation in Cord");
+#endif
+  }
+
+  static void MaybeTrackCordImpl(InlineData& cord, const InlineData& src,
+                                 MethodIdentifier method);
+
+  List* const list_ = GlobalList();
+
+  std::atomic<CordzInfo*> ci_prev_{nullptr};
+  std::atomic<CordzInfo*> ci_next_{nullptr};
+
+  mutable absl::Mutex mutex_;
+  CordRep* rep_ ABSL_GUARDED_BY(mutex_);
+
+  void* stack_[kMaxStackDepth];
+  void* parent_stack_[kMaxStackDepth];
+  const size_t stack_depth_;
+  const size_t parent_stack_depth_;
+  const MethodIdentifier method_;
+  const MethodIdentifier parent_method_;
+  CordzUpdateTracker update_tracker_;
+  const absl::Time create_time_;
+  const int64_t sampling_stride_;
+};
+
+inline ABSL_ATTRIBUTE_ALWAYS_INLINE void CordzInfo::MaybeTrackCord(
+    InlineData&, MethodIdentifier) {}
+
+inline ABSL_ATTRIBUTE_ALWAYS_INLINE void CordzInfo::MaybeTrackCord(
+    InlineData& cord, const InlineData& src, MethodIdentifier method) {
+  if (ABSL_PREDICT_FALSE(InlineData::is_either_profiled(cord, src))) {
+    MaybeTrackCordImpl(cord, src, method);
+  }
+}
+
+inline ABSL_ATTRIBUTE_ALWAYS_INLINE void CordzInfo::MaybeUntrackCord(
+    CordzInfo* info) {
+  if (ABSL_PREDICT_FALSE(info)) {
+    info->Untrack();
+  }
+}
+
+inline void CordzInfo::AssertHeld() ABSL_ASSERT_EXCLUSIVE_LOCK(mutex_) {
+#ifndef NDEBUG
+  mutex_.AssertHeld();
+#endif
+}
+
+inline void CordzInfo::SetCordRep(CordRep* rep) {
+  AssertHeld();
+  rep_ = rep;
+}
+
+inline void CordzInfo::UnsafeSetCordRep(CordRep* rep) { rep_ = rep; }
+
+inline CordRep* CordzInfo::RefCordRep() const ABSL_LOCKS_EXCLUDED(mutex_) {
+  MutexLock lock(mutex_);
+  return rep_ ? CordRep::Ref(rep_) : nullptr;
+}
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_STRINGS_INTERNAL_CORDZ_INFO_H_

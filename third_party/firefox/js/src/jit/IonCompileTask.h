@@ -1,0 +1,85 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_IonCompileTask_h
+#define jit_IonCompileTask_h
+
+#include "mozilla/LinkedList.h"
+
+#include "jit/CompilationDependencyTracker.h"
+#include "jit/MIRGenerator.h"
+
+#include "js/Utility.h"
+#include "vm/HelperThreadTask.h"
+
+struct JS_PUBLIC_API JSContext;
+
+namespace js {
+namespace jit {
+
+class CodeGenerator;
+class WarpSnapshot;
+
+class IonCompileTask final : public HelperThreadTask,
+                             public mozilla::LinkedListElement<IonCompileTask> {
+  MIRGenerator& mirGen_;
+
+  CodeGenerator* backgroundCodegen_ = nullptr;
+
+  WarpSnapshot* snapshot_ = nullptr;
+
+  const mozilla::Atomic<bool, mozilla::ReleaseAcquire>& isExecuting_;
+
+ public:
+  explicit IonCompileTask(JSContext* cx, MIRGenerator& mirGen,
+                          WarpSnapshot* snapshot);
+
+  JSScript* script() { return mirGen_.outerInfo().script(); }
+  MIRGenerator& mirGen() { return mirGen_; }
+  TempAllocator& alloc() { return mirGen_.alloc(); }
+  WarpSnapshot* snapshot() { return snapshot_; }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf);
+  void trace(JSTracer* trc);
+
+  CodeGenerator* backgroundCodegen() const { return backgroundCodegen_; }
+  void setBackgroundCodegen(CodeGenerator* codegen) {
+    backgroundCodegen_ = codegen;
+  }
+
+  bool isMainThreadRunningJS() const { return isExecuting_; }
+
+  ThreadType threadType() override { return THREAD_TYPE_ION; }
+  void runTask();
+  void runHelperThreadTask(AutoLockHelperThreadState& locked) override;
+
+  const char* getName() override { return "IonCompileTask"; }
+};
+
+class IonFreeTask : public HelperThreadTask {
+  IonFreeCompileTasks tasks_;
+
+ public:
+  explicit IonFreeTask(IonFreeCompileTasks&& tasks) : tasks_(std::move(tasks)) {
+    MOZ_ASSERT(!tasks_.empty());
+  }
+
+  const IonFreeCompileTasks& compileTasks() const { return tasks_; }
+
+  ThreadType threadType() override { return THREAD_TYPE_ION_FREE; }
+  void runHelperThreadTask(AutoLockHelperThreadState& locked) override;
+
+  const char* getName() override { return "IonFreeTask"; }
+};
+
+void AttachFinishedCompilations(JSContext* cx);
+void FinishOffThreadTask(JSRuntime* runtime, AutoStartIonFreeTask& freeTask,
+                         IonCompileTask* task);
+void FreeIonCompileTasks(const IonFreeCompileTasks& tasks);
+UniquePtr<LifoAlloc> FreeIonCompileTaskAndReuseLifoAlloc(IonCompileTask* task);
+
+}  
+}  
+
+#endif /* jit_IonCompileTask_h */

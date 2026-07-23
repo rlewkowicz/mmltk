@@ -1,0 +1,145 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+function CreateListFromArrayLikeForArgs(obj) {
+
+  assert(
+    IsObject(obj),
+    "object must be passed to CreateListFromArrayLikeForArgs"
+  );
+
+  var len = ToLength(obj.length);
+
+  if (len > MAX_ARGS_LENGTH) {
+    ThrowRangeError(JSMSG_TOO_MANY_ARGUMENTS);
+  }
+
+  var list = std_Array(len);
+  for (var i = 0; i < len; i++) {
+    DefineDataProperty(list, i, obj[i]);
+  }
+
+  return list;
+}
+
+function Reflect_apply(target, thisArgument, argumentsList) {
+  if (!IsCallable(target)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, target));
+  }
+
+  if (!IsObject(argumentsList)) {
+    ThrowTypeError(
+      JSMSG_OBJECT_REQUIRED_ARG,
+      "`argumentsList`",
+      "Reflect.apply",
+      ToSource(argumentsList)
+    );
+  }
+
+  return callFunction(std_Function_apply, target, thisArgument, argumentsList);
+}
+SetIsInlinableLargeFunction(Reflect_apply);
+
+function Reflect_construct(target, argumentsList ) {
+  if (!IsConstructor(target)) {
+    ThrowTypeError(JSMSG_NOT_CONSTRUCTOR, DecompileArg(0, target));
+  }
+
+  var newTarget;
+  if (ArgumentsLength() > 2) {
+    newTarget = GetArgument(2);
+    if (!IsConstructor(newTarget)) {
+      ThrowTypeError(JSMSG_NOT_CONSTRUCTOR, DecompileArg(2, newTarget));
+    }
+  } else {
+    newTarget = target;
+  }
+
+  if (!IsObject(argumentsList)) {
+    ThrowTypeError(
+      JSMSG_OBJECT_REQUIRED_ARG,
+      "`argumentsList`",
+      "Reflect.construct",
+      ToSource(argumentsList)
+    );
+  }
+
+  var args =
+    IsPackedArray(argumentsList) && argumentsList.length <= MAX_ARGS_LENGTH
+      ? argumentsList
+      : CreateListFromArrayLikeForArgs(argumentsList);
+
+  switch (args.length) {
+    case 0:
+      return constructContentFunction(target, newTarget);
+    case 1:
+      return constructContentFunction(target, newTarget, SPREAD(args, 1));
+    case 2:
+      return constructContentFunction(target, newTarget, SPREAD(args, 2));
+    case 3:
+      return constructContentFunction(target, newTarget, SPREAD(args, 3));
+    case 4:
+      return constructContentFunction(target, newTarget, SPREAD(args, 4));
+    case 5:
+      return constructContentFunction(target, newTarget, SPREAD(args, 5));
+    case 6:
+      return constructContentFunction(target, newTarget, SPREAD(args, 6));
+    case 7:
+      return constructContentFunction(target, newTarget, SPREAD(args, 7));
+    case 8:
+      return constructContentFunction(target, newTarget, SPREAD(args, 8));
+    case 9:
+      return constructContentFunction(target, newTarget, SPREAD(args, 9));
+    case 10:
+      return constructContentFunction(target, newTarget, SPREAD(args, 10));
+    case 11:
+      return constructContentFunction(target, newTarget, SPREAD(args, 11));
+    case 12:
+      return constructContentFunction(target, newTarget, SPREAD(args, 12));
+    default:
+      return ConstructFunction(target, newTarget, args);
+  }
+}
+
+function Reflect_defineProperty(obj, propertyKey, attributes) {
+  return ObjectOrReflectDefineProperty(obj, propertyKey, attributes, false);
+}
+
+function Reflect_getOwnPropertyDescriptor(target, propertyKey) {
+  if (!IsObject(target)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, DecompileArg(0, target));
+  }
+
+  return ObjectGetOwnPropertyDescriptor(target, propertyKey);
+}
+
+function Reflect_has(target, propertyKey) {
+  if (!IsObject(target)) {
+    ThrowTypeError(
+      JSMSG_OBJECT_REQUIRED_ARG,
+      "`target`",
+      "Reflect.has",
+      ToSource(target)
+    );
+  }
+
+  return propertyKey in target;
+}
+
+function Reflect_get(target, propertyKey ) {
+  if (!IsObject(target)) {
+    ThrowTypeError(
+      JSMSG_OBJECT_REQUIRED_ARG,
+      "`target`",
+      "Reflect.get",
+      ToSource(target)
+    );
+  }
+
+  if (ArgumentsLength() > 2) {
+    return getPropertySuper(target, propertyKey, GetArgument(2));
+  }
+
+  return target[propertyKey];
+}

@@ -1,0 +1,117 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_TryEmitter_h
+#define frontend_TryEmitter_h
+
+#include "mozilla/Maybe.h"  // mozilla::Maybe, mozilla::Nothing
+
+#include <stdint.h>  // uint32_t
+
+#include "frontend/BytecodeControlStructures.h"  // TryFinallyControl
+#include "frontend/BytecodeOffset.h"             // BytecodeOffset
+#include "frontend/JumpList.h"                   // JumpList, JumpTarget
+#include "js/UniquePtr.h"                        // js::UniquePtr
+
+namespace js {
+namespace frontend {
+
+struct BytecodeEmitter;
+
+class TryEmitter {
+ public:
+  enum class Kind { TryCatch, TryCatchFinally, TryFinally };
+
+  enum class ControlKind {
+    Syntactic,
+    NonSyntactic,
+
+    Disposal,
+  };
+
+ private:
+  BytecodeEmitter* bce_;
+  Kind kind_;
+  ControlKind controlKind_;
+
+  js::UniquePtr<TryFinallyControl> controlInfo_;
+
+  int depth_;
+
+  BytecodeOffset tryOpOffset_;
+
+  JumpList catchAndFinallyJump_;
+
+  JumpTarget tryEnd_;
+
+  JumpTarget finallyStart_;
+
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    Try,
+
+    Catch,
+
+    Finally,
+
+    End
+  };
+  State state_;
+#endif
+
+  bool hasCatch() const {
+    return kind_ == Kind::TryCatch || kind_ == Kind::TryCatchFinally;
+  }
+  bool hasFinally() const {
+    return kind_ == Kind::TryCatchFinally || kind_ == Kind::TryFinally;
+  }
+
+  bool requiresControlInfo() const {
+    return controlKind_ == ControlKind::Syntactic ||
+           controlKind_ == ControlKind::Disposal;
+  }
+
+  BytecodeOffset offsetAfterTryOp() const {
+    return tryOpOffset_ + BytecodeOffsetDiff(JSOpLength_Try);
+  }
+
+  // fall through to the code following the finally block.
+  [[nodiscard]] bool emitJumpToFinallyWithFallthrough();
+
+ public:
+  TryEmitter(BytecodeEmitter* bce, Kind kind, ControlKind controlKind);
+
+  bool shouldUpdateRval() const;
+
+#ifdef DEBUG
+  bool hasControlInfo();
+#endif
+
+  [[nodiscard]] bool emitTry();
+
+  enum class ExceptionStack : bool {
+    No,
+
+    Yes,
+  };
+
+  [[nodiscard]] bool emitCatch(ExceptionStack stack = ExceptionStack::No);
+
+  [[nodiscard]] bool emitFinally(
+      const mozilla::Maybe<uint32_t>& finallyPos = mozilla::Nothing());
+
+  [[nodiscard]] bool emitEnd();
+
+ private:
+  [[nodiscard]] bool emitTryEnd();
+  [[nodiscard]] bool emitCatchEnd();
+  [[nodiscard]] bool emitFinallyEnd();
+};
+
+} 
+} 
+
+#endif /* frontend_TryEmitter_h */

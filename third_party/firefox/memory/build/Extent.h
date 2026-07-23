@@ -1,0 +1,97 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#ifndef EXTENT_H
+#define EXTENT_H
+
+#include "mozjemalloc_types.h"
+
+#include "BaseAlloc.h"
+#include "RedBlackTree.h"
+
+#include "mozilla/UniquePtr.h"
+
+
+struct arena_t;
+
+enum ChunkType;
+
+struct extent_node_t : public BaseAllocClass {
+  union {
+    RedBlackTreeNode<extent_node_t> mLinkBySize;
+    arena_id_t mArenaId;
+  };
+
+  RedBlackTreeNode<extent_node_t> mLinkByAddr;
+
+  void* mAddr;
+
+  size_t mSize;
+
+  union {
+    ChunkType mChunkType;
+
+    arena_t* mArena;
+  };
+};
+
+struct ExtentTreeSzTrait {
+  static RedBlackTreeNode<extent_node_t>& GetTreeNode(extent_node_t* aThis) {
+    return aThis->mLinkBySize;
+  }
+
+  static inline Order Compare(extent_node_t* aNode, extent_node_t* aOther) {
+    Order ret = CompareInt(aNode->mSize, aOther->mSize);
+    return (ret != Order::eEqual) ? ret
+                                  : CompareAddr(aNode->mAddr, aOther->mAddr);
+  }
+
+  using SearchKey = size_t;
+
+  static inline Order Compare(SearchKey aKey, extent_node_t* aOther) {
+    Order ret = CompareInt(aKey, aOther->mSize);
+    return (ret != Order::eEqual) ? ret : Order::eLess;
+  }
+};
+
+struct ExtentTreeTrait {
+  static RedBlackTreeNode<extent_node_t>& GetTreeNode(extent_node_t* aThis) {
+    return aThis->mLinkByAddr;
+  }
+
+  static inline Order Compare(extent_node_t* aNode, extent_node_t* aOther) {
+    return CompareAddr(aNode->mAddr, aOther->mAddr);
+  }
+
+  using SearchKey = void*;
+
+  static inline Order Compare(SearchKey aKey, extent_node_t* aOther) {
+    return CompareAddr(aKey, aOther->mAddr);
+  }
+};
+
+struct ExtentTreeBoundsTrait : public ExtentTreeTrait {
+  static inline Order CompareBounds(void* aKey, extent_node_t* aNode) {
+    uintptr_t key_addr = reinterpret_cast<uintptr_t>(aKey);
+    uintptr_t node_addr = reinterpret_cast<uintptr_t>(aNode->mAddr);
+    size_t node_size = aNode->mSize;
+
+    if (node_addr <= key_addr && key_addr < node_addr + node_size) {
+      return Order::eEqual;
+    }
+
+    return CompareAddr(aKey, aNode->mAddr);
+  }
+
+  static inline Order Compare(extent_node_t* aKey, extent_node_t* aNode) {
+    return CompareBounds(aKey->mAddr, aNode);
+  }
+  static inline Order Compare(SearchKey aKey, extent_node_t* aNode) {
+    return CompareBounds(aKey, aNode);
+  }
+};
+
+using UniqueBaseNode = mozilla::UniquePtr<extent_node_t>;
+
+#endif /* ! EXTENT_H */

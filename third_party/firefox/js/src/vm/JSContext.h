@@ -1,0 +1,1039 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#if !defined(vm_JSContext_h)
+#define vm_JSContext_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "builtin/AtomicsObject.h"
+#include "ds/TraceableFifo.h"
+#include "frontend/NameCollections.h"
+#include "gc/Allocator.h"
+#include "gc/GCEnum.h"
+#include "gc/Memory.h"
+#include "irregexp/RegExpTypes.h"
+#include "js/ContextOptions.h"  // JS::ContextOptions
+#include "js/Debug.h"           // JS::CustomObjectSummaryCallback
+#include "js/Exception.h"
+#include "js/friend/MicroTask.h"
+#include "js/GCVector.h"
+#include "js/Interrupt.h"
+#include "js/Promise.h"
+#include "js/Result.h"
+#include "js/RootingAPI.h"
+#include "js/Stack.h"  // JS::NativeStackBase, JS::NativeStackLimit
+#include "js/Utility.h"
+#include "js/Vector.h"
+#include "threading/ProtectedData.h"
+#include "util/StructuredSpewer.h"
+#include "vm/Activation.h"  // js::Activation
+#include "vm/MallocProvider.h"
+#include "vm/Runtime.h"
+#include "wasm/WasmContext.h"
+
+struct JS_PUBLIC_API JSContext;
+
+struct DtoaState;
+
+namespace js {
+
+class AutoAllocInAtomsZone;
+class AutoMaybeLeaveAtomsZone;
+class AutoRealm;
+struct PortableBaselineStack;
+
+#if defined(MOZ_EXECUTION_TRACING)
+class ExecutionTracer;
+#endif
+
+namespace jit {
+class JitActivation;
+class JitContext;
+class DebugModeOSRVolatileJitFrameIter;
+}  
+
+class MOZ_RAII AutoCycleDetector {
+ public:
+  using Vector = GCVector<JSObject*, 8>;
+
+  AutoCycleDetector(JSContext* cx, HandleObject objArg)
+      : cx(cx), obj(cx, objArg), cyclic(true) {}
+
+  ~AutoCycleDetector();
+
+  bool init();
+
+  bool foundCycle() { return cyclic; }
+
+ private:
+  JSContext* cx;
+  RootedObject obj;
+  bool cyclic;
+};
+
+struct AutoResolving;
+
+class InternalJobQueue : public JS::JobQueue {
+ public:
+  explicit InternalJobQueue(JSContext* cx)
+      : draining_(false), interrupted_(false) {}
+  ~InternalJobQueue() = default;
+
+  bool getHostDefinedData(
+      JSContext* cx, JS::MutableHandle<JSObject*> incumbentGlobal,
+      JS::MutableHandle<JSObject*> optionalHostDefinedData) const override;
+
+  bool getHostDefinedGlobal(JSContext*,
+                            JS::MutableHandle<JSObject*>) const override;
+
+  void runJobs(JSContext* cx) override;
+
+  bool isDrainingStopped() const override { return interrupted_; }
+
+  void interrupt() { interrupted_ = true; }
+
+  void uninterrupt() { interrupted_ = false; }
+
+#if defined(DEBUG)
+  JSObject* copyJobs(JSContext* cx);
+#endif
+
+ private:
+  bool draining_;
+
+  bool interrupted_;
+
+  class SavedQueue;
+  js::UniquePtr<JobQueue::SavedJobQueue> saveJobQueue(JSContext*) override;
+};
+
+class AutoLockScriptData;
+
+extern MOZ_THREAD_LOCAL(JSContext*) TlsContext;
+
+#if defined(DEBUG)
+JSContext* MaybeGetJSContext();
+#endif
+
+enum class InterruptReason : uint32_t {
+  MinorGC = 1 << 0,
+  MajorGC = 1 << 1,
+  AttachOffThreadCompilations = 1 << 2,
+  CallbackUrgent = 1 << 3,
+  CallbackCanWait = 1 << 4,
+  OOMStackTrace = 1 << 5,
+};
+
+enum class ShouldCaptureStack { Maybe, Always };
+
+struct MicroTaskQueueElement {
+  MOZ_IMPLICIT
+  MicroTaskQueueElement(const JS::Value& val) : value(val) {}
+
+  operator JS::Value() const { return value; }
+
+  void trace(JSTracer* trc);
+
+ private:
+  JS::Value value;
+};
+
+using MicroTaskQueue =
+    js::TraceableFifo<MicroTaskQueueElement, 0, TempAllocPolicy>;
+
+struct MicroTaskQueueSet {
+  explicit MicroTaskQueueSet(JSContext* cx)
+      : microTaskQueue(cx), debugMicroTaskQueue(cx) {}
+
+  MicroTaskQueueSet(MicroTaskQueueSet&&) = default;
+  MicroTaskQueueSet& operator=(MicroTaskQueueSet&&) = default;
+
+  MicroTaskQueueSet(const MicroTaskQueueSet&) = delete;
+  MicroTaskQueueSet& operator=(const MicroTaskQueueSet&) = delete;
+
+  bool enqueueRegularMicroTask(JSContext* cx, const JS::GenericMicroTask&);
+  bool enqueueDebugMicroTask(JSContext* cx, const JS::GenericMicroTask&);
+  bool prependRegularMicroTask(JSContext* cx, const JS::GenericMicroTask&);
+
+  JS::GenericMicroTask popFront();
+  JS::GenericMicroTask popDebugFront();
+  JS::GenericMicroTask peekFront();
+
+  bool empty() { return microTaskQueue.empty() && debugMicroTaskQueue.empty(); }
+
+  void trace(JSTracer* trc) {
+    microTaskQueue.trace(trc);
+    debugMicroTaskQueue.trace(trc);
+  }
+
+  void clear() {
+    microTaskQueue.clear();
+    debugMicroTaskQueue.clear();
+  }
+
+  MicroTaskQueue microTaskQueue;
+  MicroTaskQueue debugMicroTaskQueue;
+};
+
+} 
+
+struct JS_PUBLIC_API JSContext : public JS::RootingContext,
+                                 public js::MallocProvider<JSContext> {
+  JSContext(JSRuntime* runtime, const JS::ContextOptions& options);
+  ~JSContext();
+
+  bool init();
+
+  static JSContext* from(JS::RootingContext* rcx) {
+    return static_cast<JSContext*>(rcx);
+  }
+
+ private:
+  js::UnprotectedData<JSRuntime*> runtime_;
+#if defined(DEBUG)
+  js::WriteOnceData<bool> initialized_;
+#endif
+
+  js::ContextData<JS::ContextOptions> options_;
+
+  js::ContextData<bool> measuringExecutionTimeEnabled_;
+
+  mozilla::Atomic<bool, mozilla::ReleaseAcquire> isExecuting_;
+
+ public:
+  void setRuntime(JSRuntime* rt);
+
+  bool measuringExecutionTimeEnabled() const {
+    return measuringExecutionTimeEnabled_;
+  }
+  void setMeasuringExecutionTimeEnabled(bool value) {
+    measuringExecutionTimeEnabled_ = value;
+  }
+
+  const mozilla::Atomic<bool, mozilla::ReleaseAcquire>& isExecutingRef() const {
+    return isExecuting_;
+  }
+  void setIsExecuting(bool value) { isExecuting_ = value; }
+
+#if defined(DEBUG)
+  bool isInitialized() const { return initialized_; }
+#endif
+
+  template <typename T>
+  bool isInsideCurrentZone(T thing) const {
+    return thing->zoneFromAnyThread() == zone_;
+  }
+
+  template <typename T>
+  inline bool isInsideCurrentCompartment(T thing) const {
+    return thing->compartment() == compartment();
+  }
+
+  void onOutOfMemory();
+  void* onOutOfMemory(js::AllocFunction allocFunc, arena_id_t arena,
+                      size_t nbytes, void* reallocPtr = nullptr) {
+    return runtime_->onOutOfMemory(allocFunc, arena, nbytes, reallocPtr, this);
+  }
+
+  void onOverRecursed();
+
+  template <typename T, js::AllowGC allowGC = js::CanGC, typename... Args>
+  T* newCell(Args&&... args);
+
+  void recoverFromOutOfMemory();
+
+  void recoverFromResourceExhaustion() {
+    MOZ_ASSERT(isThrowingOutOfMemory() || isThrowingOverRecursed());
+    clearPendingException();
+  }
+
+  void reportAllocOverflow();
+
+  JSAtomState& names() { return *runtime_->commonNames; }
+  js::StaticStrings& staticStrings() { return *runtime_->staticStrings; }
+  bool permanentAtomsPopulated() { return runtime_->permanentAtomsPopulated(); }
+  const js::FrozenAtomSet& permanentAtoms() {
+    return *runtime_->permanentAtoms();
+  }
+  js::WellKnownSymbols& wellKnownSymbols() {
+    return *runtime_->wellKnownSymbols;
+  }
+  js::PropertyName* emptyString() { return runtime_->emptyString; }
+  JS::GCContext* gcContext() { return runtime_->gcContext(); }
+  JS::StackKind stackKindForCurrentPrincipal();
+  JS::NativeStackLimit stackLimitForCurrentPrincipal();
+  JS::NativeStackLimit stackLimit(JS::StackKind kind) {
+    return nativeStackLimit[kind];
+  }
+  JS::NativeStackLimit stackLimitForJitCode(JS::StackKind kind);
+  bool stackContainsAddress(uintptr_t address, JS::StackKind kind);
+  size_t gcSystemPageSize() { return js::gc::SystemPageSize(); }
+
+ private:
+  inline void setRealm(JS::Realm* realm);
+  inline void enterRealm(JS::Realm* realm);
+
+  inline void enterAtomsZone();
+  inline void leaveAtomsZone(JS::Realm* oldRealm);
+  inline void setZone(js::Zone* zone);
+
+  friend class js::AutoAllocInAtomsZone;
+  friend class js::AutoMaybeLeaveAtomsZone;
+  friend class js::AutoRealm;
+
+ public:
+  inline void enterRealmOf(JSObject* target);
+  inline void enterRealmOf(JSScript* target);
+  inline void enterRealmOf(js::Shape* target);
+  inline void enterNullRealm();
+
+  inline void setRealmForJitExceptionHandler(JS::Realm* realm);
+
+  inline void leaveRealm(JS::Realm* oldRealm);
+
+  JS::Compartment* compartment() const {
+    return realm_ ? JS::GetCompartmentForRealm(realm_) : nullptr;
+  }
+
+  JS::Realm* realm() const { return realm_; }
+
+#if defined(DEBUG)
+  bool inAtomsZone() const;
+#endif
+
+  JS::Zone* zone() const {
+    MOZ_ASSERT_IF(!realm() && zone_, inAtomsZone());
+    MOZ_ASSERT_IF(realm(), js::GetRealmZone(realm()) == zone_);
+    return zone_;
+  }
+
+  static size_t offsetOfZone() { return offsetof(JSContext, zone_); }
+
+  inline js::Handle<js::GlobalObject*> global() const;
+
+  js::AtomsTable& atoms() { return runtime_->atoms(); }
+
+  js::SymbolRegistry& symbolRegistry() { return runtime_->symbolRegistry(); }
+
+  js::gc::AtomMarkingRuntime& atomMarking() { return runtime_->gc.atomMarking; }
+  void markAtom(JSAtom* atom) { atomMarking().markAtom(this, atom); }
+  void markAtom(JS::Symbol* symbol) { atomMarking().markAtom(this, symbol); }
+  void markId(jsid id) { atomMarking().markId(this, id); }
+  void markAtomValue(const js::Value& value) {
+    atomMarking().markAtomValue(this, value);
+  }
+
+  JSRuntime* runtime() { return runtime_; }
+  const JSRuntime* runtime() const { return runtime_; }
+
+  static size_t offsetOfRuntime() {
+    return offsetof(JSContext, runtime_) +
+           js::UnprotectedData<JSRuntime*>::offsetOfValue();
+  }
+  static size_t offsetOfRealm() { return offsetof(JSContext, realm_); }
+
+  friend class JS::AutoSaveExceptionState;
+  friend class js::jit::DebugModeOSRVolatileJitFrameIter;
+  friend void js::ReportOutOfMemory(JSContext*);
+  friend void js::ReportOverRecursed(JSContext*);
+  friend void js::ReportOversizedAllocation(JSContext*, const unsigned);
+
+ public:
+  template <typename V, typename E>
+  bool resultToBool(const JS::Result<V, E>& result) {
+    return result.isOk();
+  }
+
+  template <typename V, typename E>
+  V* resultToPtr(JS::Result<V*, E>& result) {
+    return result.isOk() ? result.unwrap() : nullptr;
+  }
+
+  mozilla::GenericErrorResult<JS::OOM> alreadyReportedOOM();
+  mozilla::GenericErrorResult<JS::Error> alreadyReportedError();
+
+  js::ContextData<js::jit::JitActivation*> jitActivation;
+
+  js::ContextData<js::irregexp::Isolate*> isolate;
+
+  js::ContextData<js::Activation*> activation_;
+
+  js::Activation* volatile profilingActivation_;
+
+ public:
+  js::Activation* activation() const { return activation_; }
+  static size_t offsetOfActivation() {
+    return offsetof(JSContext, activation_);
+  }
+
+  js::Activation* profilingActivation() const { return profilingActivation_; }
+  static size_t offsetOfProfilingActivation() {
+    return offsetof(JSContext, profilingActivation_);
+  }
+
+  static size_t offsetOfJitActivation() {
+    return offsetof(JSContext, jitActivation);
+  }
+
+#if defined(JS_CHECK_UNSAFE_CALL_WITH_ABI)
+  static size_t offsetOfInUnsafeCallWithABI() {
+    return offsetof(JSContext, inUnsafeCallWithABI);
+  }
+#endif
+
+ public:
+  js::InterpreterStack& interpreterStack() {
+    return runtime()->interpreterStack();
+  }
+#if defined(ENABLE_PORTABLE_BASELINE_INTERP)
+  js::PortableBaselineStack& portableBaselineStack() {
+    return runtime()->portableBaselineStack();
+  }
+#endif
+
+ private:
+  mozilla::Maybe<JS::NativeStackBase> nativeStackBase_;
+
+ public:
+  JS::NativeStackBase nativeStackBase() const { return *nativeStackBase_; }
+
+ public:
+  bool brittleMode = false;
+
+  js::ContextData<js::EnterDebuggeeNoExecute*> noExecuteDebuggerTop;
+
+#if defined(JS_CHECK_UNSAFE_CALL_WITH_ABI)
+  js::ContextData<uint32_t> inUnsafeCallWithABI;
+  js::ContextData<bool> hasAutoUnsafeCallWithABI;
+#endif
+
+#if defined(DEBUG)
+  js::ContextData<uint32_t> liveArraySortDataInstances;
+#endif
+
+#if defined(JS_SIMULATOR)
+ private:
+  js::ContextData<js::jit::Simulator*> simulator_;
+
+ public:
+  js::jit::Simulator* simulator() const;
+  JS::NativeStackLimit* addressOfSimulatorStackLimit();
+#endif
+
+ public:
+  js::ContextData<DtoaState*> dtoaState;
+
+  js::ContextData<int32_t> suppressGC;
+
+
+#if defined(DEBUG)
+  js::ContextData<size_t> noNurseryAllocationCheck;
+
+  js::ContextData<uintptr_t> disableStrictProxyCheckingCount;
+
+  bool isNurseryAllocAllowed() { return noNurseryAllocationCheck == 0; }
+  void disallowNurseryAlloc() { ++noNurseryAllocationCheck; }
+  void allowNurseryAlloc() {
+    MOZ_ASSERT(!isNurseryAllocAllowed());
+    --noNurseryAllocationCheck;
+  }
+
+  bool isStrictProxyCheckingEnabled() {
+    return disableStrictProxyCheckingCount == 0;
+  }
+  void disableStrictProxyChecking() { ++disableStrictProxyCheckingCount; }
+  void enableStrictProxyChecking() {
+    MOZ_ASSERT(disableStrictProxyCheckingCount > 0);
+    --disableStrictProxyCheckingCount;
+  }
+#endif
+
+#if defined(DEBUG) || defined(JS_OOM_BREAKPOINT)
+  js::ContextData<bool> runningOOMTest;
+#endif
+
+  js::ContextData<int> inUnsafeRegion;
+
+  js::ContextData<unsigned> generationalDisabled;
+
+  js::ContextData<unsigned> compactingDisabledCount;
+
+  js::ContextData<uint32_t> regExpSearcherLastLimit;
+
+  static constexpr size_t offsetOfRegExpSearcherLastLimit() {
+    return offsetof(JSContext, regExpSearcherLastLimit);
+  }
+
+  js::ContextData<uint32_t> isEvaluatingModule;
+
+ private:
+  js::ContextData<js::frontend::NameCollectionPool> frontendCollectionPool_;
+
+ public:
+  js::frontend::NameCollectionPool& frontendCollectionPool() {
+    return frontendCollectionPool_.ref();
+  }
+
+  void verifyIsSafeToGC() {
+    MOZ_DIAGNOSTIC_ASSERT(!inUnsafeRegion,
+                          "[AutoAssertNoGC] possible GC in GC-unsafe region");
+  }
+
+  bool isInUnsafeRegion() const { return bool(inUnsafeRegion); }
+
+  MOZ_NEVER_INLINE void resetInUnsafeRegion() {
+    MOZ_ASSERT(inUnsafeRegion >= 0);
+    inUnsafeRegion = 0;
+  }
+
+  static constexpr size_t offsetOfInUnsafeRegion() {
+    return offsetof(JSContext, inUnsafeRegion);
+  }
+
+ private:
+  mozilla::Atomic<bool, mozilla::SequentiallyConsistent>
+      suppressProfilerSampling;
+
+ public:
+  bool isProfilerSamplingEnabled() const { return !suppressProfilerSampling; }
+  void disableProfilerSampling() { suppressProfilerSampling = true; }
+  void enableProfilerSampling() { suppressProfilerSampling = false; }
+
+ private:
+  js::wasm::Context wasm_;
+
+ public:
+  js::wasm::Context& wasm() { return wasm_; }
+  static constexpr size_t offsetOfWasm() { return offsetof(JSContext, wasm_); }
+
+  static const size_t TEMP_LIFO_ALLOC_PRIMARY_CHUNK_SIZE = 4 * 1024;
+
+ private:
+  js::ContextData<js::LifoAlloc> tempLifoAlloc_;
+
+ public:
+  js::LifoAlloc& tempLifoAlloc() { return tempLifoAlloc_.ref(); }
+  const js::LifoAlloc& tempLifoAlloc() const { return tempLifoAlloc_.ref(); }
+
+  js::ContextData<uint32_t> debuggerMutations;
+
+ private:
+  js::ContextData<JS::ExceptionStatus> status;
+  js::ContextData<JS::PersistentRooted<JS::Value>>
+      unwrappedException_; 
+  js::ContextData<JS::PersistentRooted<js::SavedFrame*>>
+      unwrappedExceptionStack_; 
+
+  JS::Value& unwrappedException() {
+    if (!unwrappedException_.ref().initialized()) {
+      unwrappedException_.ref().init(this);
+    }
+    return unwrappedException_.ref().get();
+  }
+
+  js::SavedFrame*& unwrappedExceptionStack() {
+    if (!unwrappedExceptionStack_.ref().initialized()) {
+      unwrappedExceptionStack_.ref().init(this);
+    }
+    return unwrappedExceptionStack_.ref().get();
+  }
+
+#if defined(DEBUG)
+  js::ContextData<bool> hadResourceExhaustion_;
+
+  js::ContextData<bool> hadUncatchableException_;
+
+ public:
+  bool hadResourceExhaustion() const {
+    return hadResourceExhaustion_ || js::oom::simulator.isThreadSimulatingAny();
+  }
+  bool hadUncatchableException() const { return hadUncatchableException_; }
+#endif
+
+ public:
+  void reportResourceExhaustion() {
+#if defined(DEBUG)
+    hadResourceExhaustion_ = true;
+#endif
+  }
+  void reportUncatchableException() {
+    clearPendingException();
+#if defined(DEBUG)
+    hadUncatchableException_ = true;
+#endif
+  }
+
+  void unsetOOMStackTrace();
+  const char* getOOMStackTrace() const;
+  bool hasOOMStackTrace() const;
+  void captureOOMStackTrace();
+
+  js::ContextData<int32_t> reportGranularity; 
+
+  js::ContextData<js::AutoResolving*> resolvingList;
+
+#if defined(DEBUG)
+  js::ContextData<js::AutoEnterPolicy*> enteredPolicy;
+#endif
+
+  js::ContextData<bool> generatingError;
+
+ private:
+  js::ContextData<js::AutoCycleDetector::Vector> cycleDetectorVector_;
+
+ public:
+  js::AutoCycleDetector::Vector& cycleDetectorVector() {
+    return cycleDetectorVector_.ref();
+  }
+  const js::AutoCycleDetector::Vector& cycleDetectorVector() const {
+    return cycleDetectorVector_.ref();
+  }
+
+  js::UnprotectedData<void*> data;
+
+  void initJitStackLimit();
+  void resetJitStackLimit();
+
+ public:
+  JS::ContextOptions& options() { return options_.ref(); }
+
+  bool runtimeMatches(JSRuntime* rt) const { return runtime_ == rt; }
+
+ private:
+  js::ContextData<JS::PersistentRooted<js::SavedFrame*>>
+      asyncStackForNewActivations_;
+
+ public:
+  js::SavedFrame*& asyncStackForNewActivations() {
+    if (!asyncStackForNewActivations_.ref().initialized()) {
+      asyncStackForNewActivations_.ref().init(this);
+    }
+    return asyncStackForNewActivations_.ref().get();
+  }
+
+  js::ContextData<const char*> asyncCauseForNewActivations;
+
+  js::ContextData<bool> asyncCallIsExplicit;
+
+  bool currentlyRunningInInterpreter() const {
+    return activation()->isInterpreter();
+  }
+  bool currentlyRunningInJit() const { return activation()->isJit(); }
+  js::InterpreterFrame* interpreterFrame() const {
+    return activation()->asInterpreter()->current();
+  }
+  js::InterpreterRegs& interpreterRegs() const {
+    return activation()->asInterpreter()->regs();
+  }
+
+  enum class AllowCrossRealm { DontAllow = false, Allow = true };
+  JSScript* currentScript(
+      jsbytecode** ppc = nullptr,
+      AllowCrossRealm allowCrossRealm = AllowCrossRealm::DontAllow);
+
+  inline void minorGC(JS::GCReason reason);
+
+ public:
+  bool isExceptionPending() const {
+    return JS::IsCatchableExceptionStatus(status);
+  }
+
+  [[nodiscard]] bool getPendingException(JS::MutableHandleValue rval);
+
+  [[nodiscard]] bool getPendingExceptionStack(JS::MutableHandleValue rval);
+
+  js::SavedFrame* getPendingExceptionStack();
+
+#if defined(DEBUG)
+  const JS::Value& getPendingExceptionUnwrapped();
+#endif
+
+  bool isThrowingDebuggeeWouldRun();
+  bool isClosingGenerator();
+
+  void setPendingException(JS::HandleValue v,
+                           JS::Handle<js::SavedFrame*> stack);
+  void setPendingException(JS::HandleValue v,
+                           js::ShouldCaptureStack captureStack);
+
+  void clearPendingException() {
+    status = JS::ExceptionStatus::None;
+    unwrappedException().setUndefined();
+    unwrappedExceptionStack() = nullptr;
+  }
+
+  bool isThrowingOutOfMemory() const {
+    return status == JS::ExceptionStatus::OutOfMemory;
+  }
+  bool isThrowingOverRecursed() const {
+    return status == JS::ExceptionStatus::OverRecursed;
+  }
+  bool isPropagatingForcedReturn() const {
+    return status == JS::ExceptionStatus::ForcedReturn;
+  }
+  void setPropagatingForcedReturn() {
+    MOZ_ASSERT(status == JS::ExceptionStatus::None);
+    status = JS::ExceptionStatus::ForcedReturn;
+  }
+  void clearPropagatingForcedReturn() {
+    MOZ_ASSERT(status == JS::ExceptionStatus::ForcedReturn);
+    status = JS::ExceptionStatus::None;
+  }
+
+  inline bool runningWithTrustedPrincipals();
+
+  bool isRuntimeCodeGenEnabled(
+      JS::RuntimeCode kind, JS::Handle<JSString*> codeString,
+      JS::CompilationType compilationType,
+      JS::Handle<JS::StackGCVector<JSString*>> parameterStrings,
+      JS::Handle<JSString*> bodyString,
+      JS::Handle<JS::StackGCVector<JS::Value>> parameterArgs,
+      JS::Handle<JS::Value> bodyArg, bool* outCanCompileStrings);
+
+  bool getCodeForEval(JS::HandleObject code,
+                      JS::MutableHandle<JSString*> outCode);
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+
+  void trace(JSTracer* trc);
+
+  inline js::RuntimeCaches& caches();
+
+ public:
+  using InterruptCallbackVector =
+      js::Vector<JSInterruptCallback, 2, js::SystemAllocPolicy>;
+
+ private:
+  js::ContextData<InterruptCallbackVector> interruptCallbacks_;
+
+ public:
+  InterruptCallbackVector& interruptCallbacks() {
+    return interruptCallbacks_.ref();
+  }
+
+  js::ContextData<bool> interruptCallbackDisabled;
+  js::ContextData<bool> shouldWarnAboutInterruptTermination_;
+
+  void resetInterruptTerminationWarning() {
+    shouldWarnAboutInterruptTermination_ = true;
+  }
+  void suppressInterruptTerminationWarning() {
+    shouldWarnAboutInterruptTermination_ = false;
+  }
+  bool shouldWarnAboutInterruptTermination() const {
+    return shouldWarnAboutInterruptTermination_;
+  }
+
+  mozilla::Atomic<uint32_t, mozilla::Relaxed> interruptBits_;
+
+  void requestInterrupt(js::InterruptReason reason);
+  bool handleInterrupt();
+  bool handleInterruptNoCallbacks();
+
+  MOZ_ALWAYS_INLINE bool hasAnyPendingInterrupt() const {
+    static_assert(sizeof(interruptBits_) == sizeof(uint32_t),
+                  "Assumed by JIT callers");
+    return interruptBits_ != 0;
+  }
+  bool hasPendingInterrupt(js::InterruptReason reason) const {
+    return interruptBits_ & uint32_t(reason);
+  }
+  void clearPendingInterrupt(js::InterruptReason reason);
+
+ public:
+  void* addressOfInterruptBits() { return &interruptBits_; }
+  void* addressOfJitStackLimit() { return &jitStackLimit; }
+  void* addressOfJitStackLimitNoInterrupt() {
+    return &jitStackLimitNoInterrupt;
+  }
+  void* addressOfZone() { return &zone_; }
+
+  const void* addressOfRealm() const { return &realm_; }
+
+  const void* addressOfJitActivation() const { return &jitActivation; }
+
+  js::FutexThread fx;
+
+  mozilla::Atomic<JS::NativeStackLimit, mozilla::Relaxed> jitStackLimit;
+
+  js::ContextData<JS::NativeStackLimit> jitStackLimitNoInterrupt;
+
+  js::ContextData<JS::JobQueue*> jobQueue;
+
+  js::ContextData<js::UniquePtr<js::InternalJobQueue>> internalJobQueue;
+
+  js::ContextData<bool> canSkipEnqueuingJobs;
+
+  js::ContextData<uint32_t> asyncResumeDepth;
+
+  js::ContextData<JS::PromiseRejectionTrackerCallback>
+      promiseRejectionTrackerCallback;
+  js::ContextData<void*> promiseRejectionTrackerCallbackData;
+
+  static constexpr size_t OOMStackTraceBufferSize = 4096;
+  js::ContextData<char*> oomStackTraceBuffer_;
+  js::ContextData<bool> oomStackTraceBufferValid_;
+
+  JSObject* getIncumbentGlobal(JSContext* cx);
+  bool enqueuePromiseJob(JSContext* cx, js::HandleFunction job,
+                         js::HandleObject promise,
+                         js::HandleObject incumbentGlobal);
+  void addUnhandledRejectedPromise(JSContext* cx, js::HandleObject promise);
+  void removeUnhandledRejectedPromise(JSContext* cx, js::HandleObject promise);
+
+ private:
+  template <class... Args>
+  inline void checkImpl(const Args&... args);
+
+  bool contextChecksEnabled() const {
+    return !RuntimeHeapIsCollecting(runtime()->heapState());
+  }
+
+ public:
+  template <class... Args>
+  inline void check(const Args&... args);
+  template <class... Args>
+  inline void releaseCheck(const Args&... args);
+  template <class... Args>
+  MOZ_ALWAYS_INLINE void debugOnlyCheck(const Args&... args);
+
+#if defined(JS_STRUCTURED_SPEW)
+ private:
+  js::UnprotectedData<js::StructuredSpewer> structuredSpewer_;
+
+ public:
+  js::StructuredSpewer& spewer() { return structuredSpewer_.ref(); }
+#endif
+
+  js::ContextData<bool> bypassCSPForDebugger;
+
+  js::ContextData<bool> hasDebuggerForcedLexicalInit;
+
+  js::ContextData<js::Debugger*> insideExclusiveDebuggerOnEval;
+
+#if defined(MOZ_EXECUTION_TRACING)
+ private:
+  CustomObjectSummaryCallback customObjectSummaryCallback_ = nullptr;
+
+  js::UniquePtr<js::ExecutionTracer> executionTracer_;
+
+  bool executionTracerSuspended_ = false;
+
+  void cleanUpExecutionTracingState();
+
+ public:
+  js::ExecutionTracer& getExecutionTracer() {
+    MOZ_ASSERT(hasExecutionTracer());
+    return *executionTracer_;
+  }
+
+  CustomObjectSummaryCallback getCustomObjectSummaryCallback() {
+    MOZ_ASSERT(hasExecutionTracer());
+    return customObjectSummaryCallback_;
+  }
+
+  void setCustomObjectSummaryCallback(CustomObjectSummaryCallback cb) {
+    customObjectSummaryCallback_ = cb;
+  }
+
+  [[nodiscard]] bool enableExecutionTracing();
+  void disableExecutionTracing();
+
+  void suspendExecutionTracing();
+
+  bool hasExecutionTracer() {
+    return !!executionTracer_ && !executionTracerSuspended_;
+  }
+#else
+  bool hasExecutionTracer() { return false; }
+#endif
+
+  JS::PersistentRooted<js::UniquePtr<js::MicroTaskQueueSet>> microTaskQueues;
+}; 
+
+inline JSContext* JSRuntime::mainContextFromOwnThread() {
+  MOZ_ASSERT(mainContextFromAnyThread() == js::TlsContext.get());
+  return mainContextFromAnyThread();
+}
+
+namespace js {
+
+struct MOZ_RAII AutoResolving {
+ public:
+  AutoResolving(JSContext* cx, HandleObject obj, HandleId id)
+      : context(cx), object(obj), id(id), link(cx->resolvingList) {
+    MOZ_ASSERT(obj);
+    cx->resolvingList = this;
+  }
+
+  ~AutoResolving() {
+    MOZ_ASSERT(context->resolvingList == this);
+    context->resolvingList = link;
+  }
+
+  bool alreadyStarted() const { return link && alreadyStartedSlow(); }
+
+ private:
+  bool alreadyStartedSlow() const;
+
+  JSContext* const context;
+  HandleObject object;
+  HandleId id;
+  AutoResolving* const link;
+};
+
+extern JSContext* NewContext(uint32_t maxBytes, JSRuntime* parentRuntime);
+
+extern void DestroyContext(JSContext* cx);
+
+extern void ReportUsageErrorASCII(JSContext* cx, HandleObject callee,
+                                  const char* msg);
+
+extern void ReportIsNotDefined(JSContext* cx, Handle<PropertyName*> name);
+
+extern void ReportIsNotDefined(JSContext* cx, HandleId id);
+
+extern void ReportIsNullOrUndefinedForPropertyAccess(JSContext* cx,
+                                                     HandleValue v, int vIndex);
+extern void ReportIsNullOrUndefinedForPropertyAccess(JSContext* cx,
+                                                     HandleValue v, int vIndex,
+                                                     HandleId key);
+
+extern bool ReportValueError(JSContext* cx, const unsigned errorNumber,
+                             int spindex, HandleValue v, HandleString fallback,
+                             const char* arg1 = nullptr,
+                             const char* arg2 = nullptr);
+
+JSObject* CreateErrorNotesArray(JSContext* cx, JSErrorReport* report);
+
+
+class MOZ_STACK_CLASS ExternalValueArray {
+ public:
+  ExternalValueArray(size_t len, Value* vec) : array_(vec), length_(len) {}
+
+  Value* begin() { return array_; }
+  size_t length() { return length_; }
+
+  void trace(JSTracer* trc);
+
+ private:
+  Value* array_;
+  size_t length_;
+};
+
+class MOZ_RAII RootedExternalValueArray
+    : public JS::Rooted<ExternalValueArray> {
+ public:
+  RootedExternalValueArray(JSContext* cx, size_t len, Value* vec)
+      : JS::Rooted<ExternalValueArray>(cx, ExternalValueArray(len, vec)) {}
+
+ private:
+};
+
+class AutoAssertNoPendingException {
+#if defined(DEBUG)
+  JSContext* cx_;
+
+ public:
+  explicit AutoAssertNoPendingException(JSContext* cxArg) : cx_(cxArg) {
+    MOZ_ASSERT(!JS_IsExceptionPending(cx_));
+  }
+
+  ~AutoAssertNoPendingException() { MOZ_ASSERT(!JS_IsExceptionPending(cx_)); }
+#else
+ public:
+  explicit AutoAssertNoPendingException(JSContext* cxArg) {}
+#endif
+};
+
+class MOZ_RAII AutoNoteExclusiveDebuggerOnEval {
+  JSContext* cx;
+  Debugger* oldValue;
+
+ public:
+  AutoNoteExclusiveDebuggerOnEval(JSContext* cx, Debugger* dbg)
+      : cx(cx), oldValue(cx->insideExclusiveDebuggerOnEval) {
+    cx->insideExclusiveDebuggerOnEval = dbg;
+  }
+
+  ~AutoNoteExclusiveDebuggerOnEval() {
+    cx->insideExclusiveDebuggerOnEval = oldValue;
+  }
+};
+
+class MOZ_RAII AutoSetBypassCSPForDebugger {
+  JSContext* cx;
+  bool oldValue;
+
+ public:
+  AutoSetBypassCSPForDebugger(JSContext* cx, bool value)
+      : cx(cx), oldValue(cx->bypassCSPForDebugger) {
+    cx->bypassCSPForDebugger = value;
+  }
+
+  ~AutoSetBypassCSPForDebugger() { cx->bypassCSPForDebugger = oldValue; }
+};
+
+enum UnsafeABIStrictness { NoExceptions, AllowPendingExceptions };
+
+class MOZ_RAII AutoUnsafeCallWithABI {
+#if defined(JS_CHECK_UNSAFE_CALL_WITH_ABI)
+  JSContext* cx_;
+  bool nested_;
+  bool checkForPendingException_ = false;
+#endif
+  JS::AutoCheckCannotGC nogc;
+
+ public:
+#if defined(JS_CHECK_UNSAFE_CALL_WITH_ABI)
+  explicit AutoUnsafeCallWithABI(
+      UnsafeABIStrictness strictness = UnsafeABIStrictness::NoExceptions);
+  ~AutoUnsafeCallWithABI();
+#else
+  explicit AutoUnsafeCallWithABI(
+      UnsafeABIStrictness unused_ = UnsafeABIStrictness::NoExceptions) {}
+#endif
+};
+
+template <typename T>
+inline BufferHolder<T>::BufferHolder(JSContext* cx, T* buffer)
+    : BufferHolder(cx->zone(), buffer) {}
+
+} 
+
+#define CHECK_THREAD(cx) \
+  MOZ_ASSERT_IF(cx, js::CurrentThreadCanAccessRuntime(cx->runtime()))
+
+
+#define JS_TRY_OR_RETURN_FALSE(cx, expr)                           \
+  do {                                                             \
+    auto tmpResult_ = (expr);                                      \
+    if (tmpResult_.isErr()) return (cx)->resultToBool(tmpResult_); \
+  } while (0)
+
+#define JS_TRY_VAR_OR_RETURN_FALSE(cx, target, expr)               \
+  do {                                                             \
+    auto tmpResult_ = (expr);                                      \
+    if (tmpResult_.isErr()) return (cx)->resultToBool(tmpResult_); \
+    (target) = tmpResult_.unwrap();                                \
+  } while (0)
+
+#define JS_TRY_VAR_OR_RETURN_NULL(cx, target, expr)     \
+  do {                                                  \
+    auto tmpResult_ = (expr);                           \
+    if (tmpResult_.isErr()) {                           \
+      MOZ_ALWAYS_FALSE((cx)->resultToBool(tmpResult_)); \
+      return nullptr;                                   \
+    }                                                   \
+    (target) = tmpResult_.unwrap();                     \
+  } while (0)
+
+#endif

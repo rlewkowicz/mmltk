@@ -1,0 +1,611 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ScrollAnchorContainer.h"
+
+#include <cstddef>
+
+#include "mozilla/PresShell.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/ToString.h"
+#include "mozilla/dom/Text.h"
+#include "nsBlockFrame.h"
+#include "nsIFrame.h"
+#include "nsIFrameInlines.h"
+#include "nsLayoutUtils.h"
+#include "nsPlaceholderFrame.h"
+
+using namespace mozilla::dom;
+
+#ifdef DEBUG
+static mozilla::LazyLogModule sAnchorLog("scrollanchor");
+
+#  define ANCHOR_LOG_WITH(anchor_, fmt, ...)              \
+    MOZ_LOG(sAnchorLog, LogLevel::Debug,                  \
+            ("ANCHOR(%p, %s, root: %d): " fmt, (anchor_), \
+             (anchor_)                                    \
+                 ->Frame()                                \
+                 ->PresContext()                          \
+                 ->Document()                             \
+                 ->GetDocumentURI()                       \
+                 ->GetSpecOrDefault()                     \
+                 .get(),                                  \
+             (anchor_)->Frame()->mIsRoot, ##__VA_ARGS__));
+
+#  define ANCHOR_LOG(fmt, ...) ANCHOR_LOG_WITH(this, fmt, ##__VA_ARGS__)
+#else
+#  define ANCHOR_LOG(...)
+#  define ANCHOR_LOG_WITH(...)
+#endif
+
+namespace mozilla::layout {
+
+ScrollContainerFrame* ScrollAnchorContainer::Frame() const {
+  return reinterpret_cast<ScrollContainerFrame*>(
+      ((char*)this) - offsetof(ScrollContainerFrame, mAnchor));
+}
+
+ScrollAnchorContainer::ScrollAnchorContainer(ScrollContainerFrame* aScrollFrame)
+    : mDisabled(false),
+      mAnchorMightBeSubOptimal(false),
+      mAnchorNodeIsDirty(true),
+      mApplyingAnchorAdjustment(false),
+      mSuppressAnchorAdjustment(false) {
+  MOZ_ASSERT(aScrollFrame == Frame());
+}
+
+ScrollAnchorContainer* ScrollAnchorContainer::FindFor(nsIFrame* aFrame) {
+  aFrame = aFrame->GetParent();
+  if (!aFrame) {
+    return nullptr;
+  }
+  ScrollContainerFrame* nearest = nsLayoutUtils::GetNearestScrollContainerFrame(
+      aFrame, nsLayoutUtils::SCROLLABLE_SAME_DOC |
+                  nsLayoutUtils::SCROLLABLE_INCLUDE_HIDDEN);
+  if (nearest) {
+    return nearest->Anchor();
+  }
+  return nullptr;
+}
+
+ScrollContainerFrame* ScrollAnchorContainer::ScrollContainer() const {
+  return Frame()->GetScrollTargetFrame();
+}
+
+static void SetAnchorFlags(const nsIFrame* aScrolledFrame,
+                           nsIFrame* aAnchorNode, bool aInScrollAnchorChain) {
+  nsIFrame* frame = aAnchorNode;
+  while (frame && frame != aScrolledFrame) {
+    frame->SetInScrollAnchorChain(aInScrollAnchorChain);
+    frame = frame->GetParent();
+  }
+  MOZ_ASSERT(frame,
+             "The anchor node should be a descendant of the scrolled frame");
+  if (StaticPrefs::layout_css_scroll_anchoring_highlight()) {
+    for (nsIFrame* frame = aAnchorNode->FirstContinuation(); !!frame;
+         frame = frame->GetNextContinuation()) {
+      frame->InvalidateFrame();
+    }
+  }
+}
+
+static nsRect FindScrollAnchoringBoundingRect(const nsIFrame* aScrollFrame,
+                                              nsIFrame* aCandidate) {
+  MOZ_ASSERT(nsLayoutUtils::IsProperAncestorFrame(aScrollFrame, aCandidate));
+  if (!!Text::FromNodeOrNull(aCandidate->GetContent())) {
+    nsIFrame* blockAncestor =
+        nsLayoutUtils::FindNearestBlockAncestor(aCandidate);
+    MOZ_ASSERT(
+        nsLayoutUtils::IsProperAncestorFrame(aScrollFrame, blockAncestor));
+    nsRect bounding;
+    for (nsIFrame* continuation = aCandidate->FirstContinuation(); continuation;
+         continuation = continuation->GetNextContinuation()) {
+      nsRect overflowRect =
+          continuation->ScrollableOverflowRectRelativeToSelf();
+      overflowRect += continuation->GetOffsetTo(blockAncestor);
+      bounding = bounding.Union(overflowRect);
+    }
+    return nsLayoutUtils::TransformFrameRectToAncestor(blockAncestor, bounding,
+                                                       aScrollFrame);
+  }
+
+  nsRect borderRect = aCandidate->GetRectRelativeToSelf();
+  nsRect overflowRect = aCandidate->ScrollableOverflowRectRelativeToSelf();
+
+  NS_ASSERTION(overflowRect.Contains(borderRect),
+               "overflow rect must include border rect, and the clamping logic "
+               "here depends on that");
+
+  WritingMode writingMode = aScrollFrame->GetWritingMode();
+  switch (writingMode.GetBlockDir()) {
+    case WritingMode::BlockDir::TB: {
+      overflowRect.SetBoxY(borderRect.Y(), overflowRect.YMost());
+      break;
+    }
+    case WritingMode::BlockDir::LR: {
+      overflowRect.SetBoxX(borderRect.X(), overflowRect.XMost());
+      break;
+    }
+    case WritingMode::BlockDir::RL: {
+      overflowRect.SetBoxX(overflowRect.X(), borderRect.XMost());
+      break;
+    }
+  }
+
+  nsRect transformed = nsLayoutUtils::TransformFrameRectToAncestor(
+      aCandidate, overflowRect, aScrollFrame);
+  return transformed;
+}
+
+static nscoord FindScrollAnchoringBoundingOffset(
+    const ScrollContainerFrame* aScrollContainerFrame, nsIFrame* aCandidate) {
+  WritingMode writingMode = aScrollContainerFrame->GetWritingMode();
+  nsRect physicalBounding =
+      FindScrollAnchoringBoundingRect(aScrollContainerFrame, aCandidate);
+  LogicalRect logicalBounding(
+      writingMode, physicalBounding,
+      aScrollContainerFrame->GetScrolledFrame()->GetSize());
+  return logicalBounding.BStart(writingMode);
+}
+
+bool ScrollAnchorContainer::CanMaintainAnchor() const {
+  if (!StaticPrefs::layout_css_scroll_anchoring_enabled()) {
+    return false;
+  }
+
+  if (mDisabled) {
+    return false;
+  }
+
+  const nsStyleDisplay& disp = *Frame()->StyleDisplay();
+  if (disp.mOverflowAnchor != mozilla::StyleOverflowAnchor::Auto) {
+    return false;
+  }
+
+  const nsPoint pos = Frame()->GetLogicalScrollPosition();
+  const nscoord blockOffset =
+      Frame()->GetWritingMode().IsVertical() ? pos.x : pos.y;
+  if (blockOffset == 0) {
+    return false;
+  }
+
+  if (Frame()->ChildrenHavePerspective()) {
+    return false;
+  }
+
+  return true;
+}
+
+void ScrollAnchorContainer::SelectAnchor() {
+  MOZ_ASSERT(Frame()->mScrolledFrame);
+  MOZ_ASSERT(mAnchorNodeIsDirty);
+
+  ANCHOR_LOG("Selecting anchor with scroll-port=%s.\n",
+             mozilla::ToString(Frame()->GetVisualOptimalViewingRect()).c_str());
+
+  nsIFrame* oldAnchor = mAnchorNode;
+  if (CanMaintainAnchor()) {
+    MOZ_DIAGNOSTIC_ASSERT(
+        !Frame()->mScrolledFrame->IsInScrollAnchorChain(),
+        "Our scrolled frame can't serve as or contain an anchor for an "
+        "ancestor if it can maintain its own anchor");
+    ANCHOR_LOG("Beginning selection.\n");
+    mAnchorNode = FindAnchorIn(Frame()->mScrolledFrame);
+  } else {
+    ANCHOR_LOG("Skipping selection, doesn't maintain a scroll anchor.\n");
+    mAnchorNode = nullptr;
+  }
+  mAnchorMightBeSubOptimal =
+      mAnchorNode && mAnchorNode->HasAnyStateBits(NS_FRAME_HAS_DIRTY_CHILDREN);
+
+  if (oldAnchor != mAnchorNode) {
+    ANCHOR_LOG("Anchor node has changed from (%p) to (%p).\n", oldAnchor,
+               mAnchorNode);
+
+    if (oldAnchor) {
+      SetAnchorFlags(Frame()->mScrolledFrame, oldAnchor, false);
+    }
+
+    if (mAnchorNode) {
+      SetAnchorFlags(Frame()->mScrolledFrame, mAnchorNode, true);
+    }
+  } else {
+    ANCHOR_LOG("Anchor node has remained (%p).\n", mAnchorNode);
+  }
+
+  if (mAnchorNode) {
+    mLastAnchorOffset = FindScrollAnchoringBoundingOffset(Frame(), mAnchorNode);
+    ANCHOR_LOG("Using last anchor offset = %s.\n",
+               ToString(CSSPixel::FromAppUnits(mLastAnchorOffset)).c_str());
+  } else {
+    mLastAnchorOffset = 0;
+  }
+
+  mAnchorNodeIsDirty = false;
+}
+
+void ScrollAnchorContainer::UserScrolled() {
+  if (mApplyingAnchorAdjustment) {
+    return;
+  }
+  InvalidateAnchor();
+
+  if (!StaticPrefs::
+          layout_css_scroll_anchoring_reset_heuristic_during_animation() &&
+      Frame()->ScrollAnimationState().contains(
+          ScrollContainerFrame::AnimationState::APZInProgress)) {
+    return;
+  }
+
+  mHeuristic.Reset();
+}
+
+void ScrollAnchorContainer::DisablingHeuristic::Reset() {
+  mConsecutiveScrollAnchoringAdjustments = SaturateUint32(0);
+  mConsecutiveScrollAnchoringAdjustmentLength = 0;
+  mTimeStamp = {};
+}
+
+void ScrollAnchorContainer::AdjustmentMade(nscoord aAdjustment) {
+  MOZ_ASSERT(!mDisabled, "How?");
+  mDisabled = mHeuristic.AdjustmentMade(*this, aAdjustment);
+}
+
+bool ScrollAnchorContainer::DisablingHeuristic::AdjustmentMade(
+    const ScrollAnchorContainer& aAnchor, nscoord aAdjustment) {
+  static const uint32_t kAnchorCheckCountLimit = 100000;
+
+  MOZ_ASSERT(aAdjustment, "Don't call this API for zero-length adjustments");
+
+  const uint32_t maxConsecutiveAdjustments =
+      StaticPrefs::layout_css_scroll_anchoring_max_consecutive_adjustments();
+
+  if (!maxConsecutiveAdjustments) {
+    return false;
+  }
+
+  const auto now = TimeStamp::NowLoRes();
+  if (mConsecutiveScrollAnchoringAdjustments++ == 0) {
+    MOZ_ASSERT(mTimeStamp.IsNull());
+    mTimeStamp = now;
+  } else if (
+      const auto timeoutMs = StaticPrefs::
+          layout_css_scroll_anchoring_max_consecutive_adjustments_timeout_ms();
+      timeoutMs && (now - mTimeStamp).ToMilliseconds() > timeoutMs) {
+    Reset();
+    return false;
+  }
+
+  mConsecutiveScrollAnchoringAdjustmentLength = NSCoordSaturatingAdd(
+      mConsecutiveScrollAnchoringAdjustmentLength, aAdjustment);
+
+  uint32_t consecutiveAdjustments =
+      mConsecutiveScrollAnchoringAdjustments.value();
+  if (consecutiveAdjustments < maxConsecutiveAdjustments ||
+      consecutiveAdjustments > kAnchorCheckCountLimit) {
+    return false;
+  }
+
+  auto cssPixels =
+      CSSPixel::FromAppUnits(mConsecutiveScrollAnchoringAdjustmentLength);
+  double average = double(cssPixels) / consecutiveAdjustments;
+  uint32_t minAverage = StaticPrefs::
+      layout_css_scroll_anchoring_min_average_adjustment_threshold();
+  if (MOZ_LIKELY(std::abs(average) >= double(minAverage))) {
+    return false;
+  }
+
+  ANCHOR_LOG_WITH(&aAnchor,
+                  "Disabled scroll anchoring for container: "
+                  "%f average, %f total out of %u consecutive adjustments\n",
+                  average, float(cssPixels), consecutiveAdjustments);
+
+  AutoTArray<nsString, 3> arguments;
+  arguments.AppendElement()->AppendInt(consecutiveAdjustments);
+  arguments.AppendElement()->AppendFloat(average);
+  arguments.AppendElement()->AppendFloat(cssPixels);
+
+  nsContentUtils::ReportToConsole(nsIScriptError::warningFlag, "Layout"_ns,
+                                  aAnchor.Frame()->PresContext()->Document(),
+                                  PropertiesFile::LAYOUT_PROPERTIES,
+                                  "ScrollAnchoringDisabledInContainer",
+                                  arguments);
+  return true;
+}
+
+void ScrollAnchorContainer::SuppressAdjustments() {
+  ANCHOR_LOG("Received a scroll anchor suppression for %p.\n", this);
+  mSuppressAnchorAdjustment = true;
+
+  if (!mAnchorNode && !CanMaintainAnchor()) {
+    if (ScrollAnchorContainer* container = FindFor(Frame())) {
+      ANCHOR_LOG(" > Forwarding to parent anchor\n");
+      container->SuppressAdjustments();
+    }
+  }
+}
+
+void ScrollAnchorContainer::InvalidateAnchor(ScheduleSelection aSchedule) {
+  ANCHOR_LOG("Invalidating scroll anchor %p for %p.\n", mAnchorNode, this);
+
+  if (mAnchorNode) {
+    SetAnchorFlags(Frame()->mScrolledFrame, mAnchorNode, false);
+  } else if (Frame()->mScrolledFrame->IsInScrollAnchorChain()) {
+    ANCHOR_LOG(" > Forwarding to parent anchor\n");
+    FindFor(Frame())->InvalidateAnchor();
+  }
+  mAnchorNode = nullptr;
+  mAnchorMightBeSubOptimal = false;
+  mAnchorNodeIsDirty = true;
+  mLastAnchorOffset = 0;
+
+  if (!CanMaintainAnchor() || aSchedule == ScheduleSelection::No) {
+    return;
+  }
+
+  Frame()->PresShell()->PostPendingScrollAnchorSelection(this);
+}
+
+void ScrollAnchorContainer::Destroy() {
+  InvalidateAnchor(ScheduleSelection::No);
+}
+
+void ScrollAnchorContainer::ApplyAdjustments() {
+  if (!mAnchorNode || mAnchorNodeIsDirty || mDisabled ||
+      Frame()->HasPendingScrollRestoration() ||
+      (StaticPrefs::
+           layout_css_scroll_anchoring_reset_heuristic_during_animation() &&
+       Frame()->IsProcessingScrollEvent()) ||
+      Frame()->ScrollAnimationState().contains(
+          ScrollContainerFrame::AnimationState::TriggeredByScript) ||
+      Frame()->GetScrollPosition() == nsPoint()) {
+    ANCHOR_LOG(
+        "Ignoring post-reflow (anchor=%p, dirty=%d, disabled=%d, "
+        "pendingRestoration=%d, scrollevent=%d, scriptAnimating=%d, "
+        "zeroScrollPos=%d pendingSuppression=%d, "
+        "container=%p).\n",
+        mAnchorNode, mAnchorNodeIsDirty, mDisabled,
+        Frame()->HasPendingScrollRestoration(),
+        Frame()->IsProcessingScrollEvent(),
+        Frame()->ScrollAnimationState().contains(
+            ScrollContainerFrame::AnimationState::TriggeredByScript),
+        Frame()->GetScrollPosition() == nsPoint(), mSuppressAnchorAdjustment,
+        this);
+    if (mSuppressAnchorAdjustment) {
+      mSuppressAnchorAdjustment = false;
+      InvalidateAnchor();
+    }
+    return;
+  }
+
+  nscoord current = FindScrollAnchoringBoundingOffset(Frame(), mAnchorNode);
+  nscoord logicalAdjustment = current - mLastAnchorOffset;
+  WritingMode writingMode = Frame()->GetWritingMode();
+
+  ANCHOR_LOG("Anchor has moved from %s to %s.\n",
+             ToString(CSSPixel::FromAppUnits(mLastAnchorOffset)).c_str(),
+             ToString(CSSPixel::FromAppUnits(current)).c_str());
+
+  auto maybeInvalidate = MakeScopeExit([&] {
+    if (mAnchorMightBeSubOptimal &&
+        StaticPrefs::layout_css_scroll_anchoring_reselect_if_suboptimal()) {
+      ANCHOR_LOG(
+          "Anchor might be suboptimal, invalidating to try finding a better "
+          "one\n");
+      InvalidateAnchor();
+    }
+  });
+
+  if (logicalAdjustment == 0) {
+    ANCHOR_LOG("Ignoring zero delta anchor adjustment for %p.\n", this);
+    mSuppressAnchorAdjustment = false;
+    return;
+  }
+
+  if (mSuppressAnchorAdjustment) {
+    ANCHOR_LOG("Applying anchor adjustment suppression for %p.\n", this);
+    mSuppressAnchorAdjustment = false;
+    InvalidateAnchor();
+    return;
+  }
+
+  ANCHOR_LOG("Applying anchor adjustment of %s in %s with anchor %p.\n",
+             ToString(CSSPixel::FromAppUnits(logicalAdjustment)).c_str(),
+             ToString(writingMode).c_str(), mAnchorNode);
+
+  AdjustmentMade(logicalAdjustment);
+
+  nsPoint physicalAdjustment;
+  switch (writingMode.GetBlockDir()) {
+    case WritingMode::BlockDir::TB: {
+      physicalAdjustment.y = logicalAdjustment;
+      break;
+    }
+    case WritingMode::BlockDir::LR: {
+      physicalAdjustment.x = logicalAdjustment;
+      break;
+    }
+    case WritingMode::BlockDir::RL: {
+      physicalAdjustment.x = -logicalAdjustment;
+      break;
+    }
+  }
+
+  MOZ_RELEASE_ASSERT(!mApplyingAnchorAdjustment);
+  mApplyingAnchorAdjustment = true;
+  Frame()->ScrollToInternal(Frame()->GetScrollPosition() + physicalAdjustment,
+                            ScrollMode::Instant, ScrollOrigin::Relative);
+  mApplyingAnchorAdjustment = false;
+
+  if (Frame()->mIsRoot) {
+    Frame()->PresShell()->RootScrollFrameAdjusted(physicalAdjustment.y);
+  }
+
+  mLastAnchorOffset = FindScrollAnchoringBoundingOffset(Frame(), mAnchorNode);
+}
+
+ScrollAnchorContainer::ExamineResult
+ScrollAnchorContainer::ExamineAnchorCandidate(nsIFrame* aFrame) const {
+#ifdef DEBUG_FRAME_DUMP
+  nsCString tag = aFrame->ListTag();
+  ANCHOR_LOG("\tVisiting frame=%s (%p).\n", tag.get(), aFrame);
+#else
+  ANCHOR_LOG("\t\tVisiting frame=%p.\n", aFrame);
+#endif
+  bool isText = !!Text::FromNodeOrNull(aFrame->GetContent());
+  bool isContinuation = !!aFrame->GetPrevContinuation();
+
+  if (isText && isContinuation) {
+    ANCHOR_LOG("\t\tExcluding continuation text node.\n");
+    return ExamineResult::Exclude;
+  }
+
+  const nsStyleDisplay* disp = aFrame->StyleDisplay();
+  if (disp->mOverflowAnchor == mozilla::StyleOverflowAnchor::None) {
+    ANCHOR_LOG("\t\tExcluding `overflow-anchor: none`.\n");
+    return ExamineResult::Exclude;
+  }
+
+  if (aFrame->IsStickyPositioned()) {
+    ANCHOR_LOG("\t\tExcluding `position: sticky`.\n");
+    return ExamineResult::Exclude;
+  }
+
+  if (aFrame->IsBrFrame()) {
+    ANCHOR_LOG("\t\tExcluding <br>.\n");
+    return ExamineResult::Exclude;
+  }
+
+  bool isChrome =
+      aFrame->GetContent() && aFrame->GetContent()->ChromeOnlyAccess();
+  bool isPseudo = aFrame->Style()->IsPseudoElement();
+  if (isChrome && !isPseudo) {
+    ANCHOR_LOG("\t\tExcluding chrome only content.\n");
+    return ExamineResult::Exclude;
+  }
+
+  const bool isReplaced = aFrame->IsReplaced();
+  const bool isNonReplacedInline =
+      aFrame->StyleDisplay()->IsInlineInsideStyle() && !isReplaced;
+
+  const bool isAnonBox = aFrame->Style()->IsAnonBox();
+
+  const bool isScrollableWithAnchor = [&] {
+    ScrollContainerFrame* scrollContainer = do_QueryFrame(aFrame);
+    if (!scrollContainer) {
+      return false;
+    }
+    auto* anchor = scrollContainer->Anchor();
+    return anchor->AnchorNode() || anchor->CanMaintainAnchor();
+  }();
+
+  const bool canDescend = !isScrollableWithAnchor && !isReplaced;
+
+  if (!isText && (isNonReplacedInline || isAnonBox)) {
+    ANCHOR_LOG(
+        "\t\tSearching descendants of anon or non-replaced inline box (a=%d, "
+        "i=%d).\n",
+        isAnonBox, isNonReplacedInline);
+    if (canDescend) {
+      return ExamineResult::PassThrough;
+    }
+    return ExamineResult::Exclude;
+  }
+
+  nsRect rect = FindScrollAnchoringBoundingRect(Frame(), aFrame);
+  ANCHOR_LOG("\t\trect = %s.\n", ToString(CSSRect::FromAppUnits(rect)).c_str());
+
+  nsRect visibleRect;
+  if (!visibleRect.IntersectRect(rect,
+                                 Frame()->GetVisualOptimalViewingRect())) {
+    return ExamineResult::Exclude;
+  }
+
+  if (canDescend && isContinuation) {
+    ANCHOR_LOG("\t\tSearching descendants of a continuation.\n");
+    return ExamineResult::PassThrough;
+  }
+
+  if (visibleRect.IsEqualEdges(rect)) {
+    ANCHOR_LOG("\t\tFully visible, taking.\n");
+    return ExamineResult::Accept;
+  }
+
+  if (!canDescend) {
+    ANCHOR_LOG("\t\tIntersects a frame that we can't descend into, taking.\n");
+    return ExamineResult::Accept;
+  }
+
+  ANCHOR_LOG("\t\tIntersects valid candidate, checking descendants.\n");
+  return ExamineResult::Traverse;
+}
+
+nsIFrame* ScrollAnchorContainer::FindAnchorIn(nsIFrame* aFrame) const {
+  for (const auto& [list, listID] : aFrame->ChildLists()) {
+    if (listID == FrameChildListID::Absolute ||
+        listID == FrameChildListID::Float ||
+        listID == FrameChildListID::OverflowOutOfFlow) {
+      continue;
+    }
+
+    if (nsIFrame* anchor = FindAnchorInList(list)) {
+      return anchor;
+    }
+  }
+
+  const nsFrameList& absPosList =
+      aFrame->GetChildList(FrameChildListID::Absolute);
+  if (nsIFrame* anchor = FindAnchorInList(absPosList)) {
+    return anchor;
+  }
+
+  return nullptr;
+}
+
+nsIFrame* ScrollAnchorContainer::FindAnchorInList(
+    const nsFrameList& aFrameList) const {
+  for (nsIFrame* child : aFrameList) {
+    nsIFrame* realFrame = nsPlaceholderFrame::GetRealFrameFor(child);
+    if (child != realFrame) {
+      if (!nsLayoutUtils::IsProperAncestorFrame(Frame(), realFrame)) {
+        ANCHOR_LOG(
+            "\t\tSkipping out of flow frame that is not a descendant of the "
+            "scroll frame.\n");
+        continue;
+      }
+      ANCHOR_LOG("\t\tFollowing placeholder to out of flow frame.\n");
+      child = realFrame;
+    }
+
+    ExamineResult examine = ExamineAnchorCandidate(child);
+
+    switch (examine) {
+      case ExamineResult::Exclude: {
+        continue;
+      }
+      case ExamineResult::PassThrough: {
+        nsIFrame* candidate = FindAnchorIn(child);
+        if (!candidate) {
+          continue;
+        }
+        return candidate;
+      }
+      case ExamineResult::Traverse: {
+        nsIFrame* candidate = FindAnchorIn(child);
+        if (!candidate) {
+          return child;
+        }
+        return candidate;
+      }
+      case ExamineResult::Accept: {
+        return child;
+      }
+    }
+  }
+  return nullptr;
+}
+
+}  

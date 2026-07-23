@@ -1,0 +1,614 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+* Copyright (C) 2003-2016, International Business Machines Corporation
+* and others. All Rights Reserved.
+******************************************************************************
+*
+* File HEBRWCAL.CPP
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   12/03/2003  srl         ported from java HebrewCalendar
+*****************************************************************************
+*/
+
+#include "hebrwcal.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "cmemory.h"
+#include "cstring.h"
+#include "umutex.h"
+#include <float.h>
+#include "gregoimp.h" // ClockMath
+#include "astro.h" // CalendarCache
+#include "uhash.h"
+#include "ucln_in.h"
+
+
+
+static const int32_t LIMITS[UCAL_FIELD_COUNT][4] = {
+    {        0,        0,        0,        0}, 
+    { -5000000, -5000000,  5000000,  5000000}, 
+    {        0,        0,       12,       12}, 
+    {        1,        1,       51,       56}, 
+    {-1,-1,-1,-1}, 
+    {        1,        1,       29,       30}, 
+    {        1,        1,      353,      385}, 
+    {-1,-1,-1,-1}, 
+    {       -1,       -1,        5,        5}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    { -5000000, -5000000,  5000000,  5000000}, 
+    {-1,-1,-1,-1}, 
+    { -5000000, -5000000,  5000000,  5000000}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {        0,        0,       11,       12}, 
+};
+
+static const int8_t MONTH_LENGTH[][3] = {
+    {   30,         30,         30     },           
+    {   29,         29,         30     },           
+    {   29,         30,         30     },           
+    {   29,         29,         29     },           
+    {   30,         30,         30     },           
+    {   30,         30,         30     },           
+    {   29,         29,         29     },           
+    {   30,         30,         30     },           
+    {   29,         29,         29     },           
+    {   30,         30,         30     },           
+    {   29,         29,         29     },           
+    {   30,         30,         30     },           
+    {   29,         29,         29     },           
+};
+
+
+static const int16_t MONTH_START[][3] = {
+    {    0,          0,          0  },          
+    {   30,         30,         30  },          
+    {   59,         59,         60  },          
+    {   88,         89,         90  },          
+    {  117,        118,        119  },          
+    {  147,        148,        149  },          
+    {  147,        148,        149  },          
+    {  176,        177,        178  },          
+    {  206,        207,        208  },          
+    {  235,        236,        237  },          
+    {  265,        266,        267  },          
+    {  294,        295,        296  },          
+    {  324,        325,        326  },          
+    {  353,        354,        355  },          
+};
+
+static const int16_t  LEAP_MONTH_START[][3] = {
+    {    0,          0,          0  },          
+    {   30,         30,         30  },          
+    {   59,         59,         60  },          
+    {   88,         89,         90  },          
+    {  117,        118,        119  },          
+    {  147,        148,        149  },          
+    {  177,        178,        179  },          
+    {  206,        207,        208  },          
+    {  236,        237,        238  },          
+    {  265,        266,        267  },          
+    {  295,        296,        297  },          
+    {  324,        325,        326  },          
+    {  354,        355,        356  },          
+    {  383,        384,        385  },          
+};
+
+static const int32_t MONTHS_IN_CYCLE = 235;
+static const int32_t YEARS_IN_CYCLE = 19;
+
+static icu::CalendarCache *gCache =  nullptr;
+
+U_CDECL_BEGIN
+static UBool calendar_hebrew_cleanup() {
+    delete gCache;
+    gCache = nullptr;
+    return true;
+}
+U_CDECL_END
+
+U_NAMESPACE_BEGIN
+
+HebrewCalendar::HebrewCalendar(const Locale& aLocale, UErrorCode& success)
+:   Calendar(TimeZone::forLocaleOrDefault(aLocale), aLocale, success)
+
+{
+}
+
+
+HebrewCalendar::~HebrewCalendar() {
+}
+
+const char *HebrewCalendar::getType() const {
+    return "hebrew";
+}
+
+HebrewCalendar* HebrewCalendar::clone() const {
+    return new HebrewCalendar(*this);
+}
+
+HebrewCalendar::HebrewCalendar(const HebrewCalendar& other) : Calendar(other) {
+}
+
+
+
+void HebrewCalendar::add(UCalendarDateFields field, int32_t amount, UErrorCode& status)
+{
+    if(U_FAILURE(status)) {
+        return;
+    }
+    switch (field) {
+  case UCAL_MONTH:
+  case UCAL_ORDINAL_MONTH:
+      {
+          int64_t month = get(UCAL_MONTH, status);
+          int32_t year = get(UCAL_YEAR, status);
+          UBool acrossAdar1;
+          if (amount > 0) {
+              acrossAdar1 = (month < ADAR_1); 
+              month += amount;
+              if (month >= MONTHS_IN_CYCLE) {
+                  if (uprv_add32_overflow(year, (month / MONTHS_IN_CYCLE) * YEARS_IN_CYCLE, &year)) {
+                      status = U_ILLEGAL_ARGUMENT_ERROR;
+                      return;
+                  }
+                  month %= MONTHS_IN_CYCLE;
+              }
+
+              for (;;) {
+                  if (acrossAdar1 && month>=ADAR_1 && !isLeapYear(year)) {
+                      ++month;
+                  }
+                  if (month <= ELUL) {
+                      break;
+                  }
+                  month -= ELUL+1;
+                  ++year;
+                  acrossAdar1 = true;
+              }
+          } else {
+              acrossAdar1 = (month > ADAR_1); 
+              month += amount;
+              if (month <= -MONTHS_IN_CYCLE) {
+                  if (uprv_add32_overflow(year, (month / MONTHS_IN_CYCLE) * YEARS_IN_CYCLE, &year)) {
+                      status = U_ILLEGAL_ARGUMENT_ERROR;
+                      return;
+                  }
+                  month %= MONTHS_IN_CYCLE;
+              }
+              for (;;) {
+                  if (acrossAdar1 && month<=ADAR_1 && !isLeapYear(year)) {
+                      --month;
+                  }
+                  if (month >= 0) {
+                      break;
+                  }
+                  month += ELUL+1;
+                  --year;
+                  acrossAdar1 = true;
+              }
+          }
+          set(UCAL_MONTH, month);
+          set(UCAL_YEAR, year);
+          pinField(UCAL_DAY_OF_MONTH, status);
+          break;
+      }
+
+  default:
+      Calendar::add(field, amount, status);
+      break;
+    }
+}
+
+void HebrewCalendar::add(EDateFields field, int32_t amount, UErrorCode& status)
+{
+    add(static_cast<UCalendarDateFields>(field), amount, status);
+}
+
+namespace {
+
+int32_t monthsInYear(int32_t year);
+
+}  
+
+void HebrewCalendar::roll(UCalendarDateFields field, int32_t amount, UErrorCode& status)
+{
+    if(U_FAILURE(status)) {
+        return;
+    }
+    switch (field) {
+  case UCAL_MONTH:
+  case UCAL_ORDINAL_MONTH:
+      {
+          int32_t month = get(UCAL_MONTH, status);
+          int32_t year = get(UCAL_YEAR, status);
+
+          UBool leapYear = isLeapYear(year);
+          int32_t yearLength = monthsInYear(year);
+          int32_t newMonth = month + (amount % yearLength);
+          if (!leapYear) {
+              if (amount > 0 && month < ADAR_1 && newMonth >= ADAR_1) {
+                  newMonth++;
+              } else if (amount < 0 && month > ADAR_1 && newMonth <= ADAR_1) {
+                  newMonth--;
+              }
+          }
+          set(UCAL_MONTH, (newMonth + 13) % 13);
+          pinField(UCAL_DAY_OF_MONTH, status);
+          return;
+      }
+  default:
+      Calendar::roll(field, amount, status);
+    }
+}
+
+void HebrewCalendar::roll(EDateFields field, int32_t amount, UErrorCode& status) {
+    roll(static_cast<UCalendarDateFields>(field), amount, status);
+}
+
+
+static const int32_t HOUR_PARTS = 1080;
+static const int32_t DAY_PARTS  = 24*HOUR_PARTS;
+
+static const int32_t  MONTH_DAYS = 29;
+static const int32_t MONTH_FRACT = 12*HOUR_PARTS + 793;
+static const int32_t MONTH_PARTS = MONTH_DAYS*DAY_PARTS + MONTH_FRACT;
+
+static const int32_t BAHARAD = 11*HOUR_PARTS + 204;
+
+namespace {
+
+int32_t startOfYear(int32_t year, UErrorCode &status)
+{
+    ucln_i18n_registerCleanup(UCLN_I18N_HEBREW_CALENDAR, calendar_hebrew_cleanup);
+    int64_t day = CalendarCache::get(&gCache, year, status);
+    if(U_FAILURE(status)) {
+        return 0;
+    }
+
+    if (day == 0) {
+        int64_t months = ClockMath::floorDivideInt64(
+            (235LL * static_cast<int64_t>(year) - 234LL), 19LL);
+
+        int64_t frac = months * MONTH_FRACT + BAHARAD;  
+        day  = months * 29LL + frac / DAY_PARTS;        
+        frac = frac % DAY_PARTS;                        
+
+        int32_t wd = (day % 7);                        
+
+        if (wd == 2 || wd == 4 || wd == 6) {
+            day += 1;
+            wd = (day % 7);
+        } else if (wd == 1 && frac > 15*HOUR_PARTS+204 && !HebrewCalendar::isLeapYear(year) ) {
+            day += 2;
+        }
+        else if (wd == 0 && frac > 21*HOUR_PARTS+589 && HebrewCalendar::isLeapYear(year-1) ) {
+            day += 1;
+        }
+        if (day > INT32_MAX || day < INT32_MIN) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return 0;
+        }
+        CalendarCache::put(&gCache, year, static_cast<int32_t>(day), status);
+    }
+    U_ASSERT(INT32_MIN <= day  &&  day <= INT32_MAX);
+    return day;
+}
+
+int32_t daysInYear(int32_t eyear, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+       return 0;
+    }
+    return startOfYear(eyear+1, status) - startOfYear(eyear, status);
+}
+
+int32_t yearType(int32_t year, UErrorCode& status)
+{
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    int32_t yearLength = daysInYear(year, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    if (yearLength > 380) {
+        yearLength -= 30;        
+    }
+
+    int type = 0;
+
+    switch (yearLength) {
+  case 353:
+      type = 0; break;
+  case 354:
+      type = 1; break;
+  case 355:
+      type = 2; break;
+  default:
+      type = 1;
+    }
+    return type;
+}
+
+}  
+UBool HebrewCalendar::isLeapYear(int32_t year) {
+    int64_t x = (year*12LL + 17) % YEARS_IN_CYCLE;
+    return x >= ((x < 0) ? -7 : 12);
+}
+
+namespace{
+
+int32_t monthsInYear(int32_t year) {
+    return HebrewCalendar::isLeapYear(year) ? 13 : 12;
+}
+
+}  
+
+
+int32_t HebrewCalendar::handleGetLimit(UCalendarDateFields field, ELimitType limitType) const {
+    return LIMITS[field][limitType];
+}
+
+int32_t HebrewCalendar::handleGetMonthLength(int32_t extendedYear, int32_t month, UErrorCode& status) const {
+    if(U_FAILURE(status)) {
+        return 0;
+    }
+    while (month < 0) {
+        month += monthsInYear(--extendedYear);
+    }
+    while (month > 12) {
+        month -= monthsInYear(extendedYear++);
+    }
+
+    switch (month) {
+    case HESHVAN:
+    case KISLEV:
+      {
+          int32_t type = yearType(extendedYear, status);
+          if(U_FAILURE(status)) {
+              return 0;
+          }
+          return MONTH_LENGTH[month][type];
+      }
+
+    default:
+      return MONTH_LENGTH[month][0];
+    }
+}
+
+int32_t HebrewCalendar::handleGetYearLength(int32_t eyear, UErrorCode& status) const {
+    return daysInYear(eyear, status);
+}
+
+void HebrewCalendar::validateField(UCalendarDateFields field, UErrorCode &status) {
+    if ((field == UCAL_MONTH || field == UCAL_ORDINAL_MONTH)
+        && !isLeapYear(handleGetExtendedYear(status)) && internalGetMonth(status) == ADAR_1) {
+        if (U_FAILURE(status)) {
+            return;
+        }
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+    Calendar::validateField(field, status);
+}
+
+void HebrewCalendar::handleComputeFields(int32_t julianDay, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    int32_t d = julianDay - 347997;
+    double m = ClockMath::floorDivide((d * static_cast<double>(DAY_PARTS)), static_cast<double>(MONTH_PARTS)); 
+    int32_t year = static_cast<int32_t>(ClockMath::floorDivide((19. * m + 234.), 235.) + 1.); 
+    int32_t ys  = startOfYear(year, status);                   
+    if (U_FAILURE(status)) {
+        return;
+    }
+    int32_t dayOfYear = (d - ys);
+
+    while (dayOfYear < 1) {
+        year--;
+        ys  = startOfYear(year, status);
+        if (U_FAILURE(status)) {
+            return;
+        }
+        dayOfYear = (d - ys);
+    }
+
+    int32_t type = yearType(year, status);
+    if (U_FAILURE(status)) {
+        return;
+    }
+    UBool isLeap = isLeapYear(year);
+
+    int32_t month = 0;
+    int32_t momax = UPRV_LENGTHOF(MONTH_START);
+    while (month < momax &&
+           dayOfYear > (  isLeap ? LEAP_MONTH_START[month][type] : MONTH_START[month][type] ) ) {
+        month++;
+    }
+    if (month >= momax || month<=0) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+    month--;
+    int dayOfMonth = dayOfYear - (isLeap ? LEAP_MONTH_START[month][type] : MONTH_START[month][type]);
+
+    internalSet(UCAL_ERA, 0);
+    int32_t min_year = handleGetLimit(UCAL_EXTENDED_YEAR, UCAL_LIMIT_MINIMUM);
+    if (year < min_year) {
+        if (!isLenient()) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return;
+        }
+        year = min_year;
+    }
+    int32_t max_year = handleGetLimit(UCAL_EXTENDED_YEAR, UCAL_LIMIT_MAXIMUM);
+    if (max_year < year) {
+        if (!isLenient()) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return;
+        }
+        year = max_year;
+    }
+    internalSet(UCAL_YEAR, year);
+    internalSet(UCAL_EXTENDED_YEAR, year);
+    int32_t ordinal_month = month;
+    if (!isLeap && ordinal_month > ADAR_1) {
+        ordinal_month--;
+    }
+    internalSet(UCAL_ORDINAL_MONTH, ordinal_month);
+    internalSet(UCAL_MONTH, month);
+    internalSet(UCAL_DAY_OF_MONTH, dayOfMonth);
+    internalSet(UCAL_DAY_OF_YEAR, dayOfYear);
+}
+
+
+int32_t HebrewCalendar::handleGetExtendedYear(UErrorCode& status ) {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    if (newerField(UCAL_EXTENDED_YEAR, UCAL_YEAR) == UCAL_EXTENDED_YEAR) {
+        return internalGet(UCAL_EXTENDED_YEAR, 1); 
+    }
+    return internalGet(UCAL_YEAR, 1); 
+}
+
+int64_t HebrewCalendar::handleComputeMonthStart(
+    int32_t eyear, int32_t month, UBool , UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    if (month <= -MONTHS_IN_CYCLE || month >= MONTHS_IN_CYCLE) {
+        if (uprv_add32_overflow(eyear, (month / MONTHS_IN_CYCLE) * YEARS_IN_CYCLE, &eyear)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return 0;
+        }
+        month %= MONTHS_IN_CYCLE;
+    }
+    while (month < 0) {
+        if (uprv_add32_overflow(eyear, -1, &eyear) ||
+            uprv_add32_overflow(month, monthsInYear(eyear), &month)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return 0;
+        }
+    }
+    while (month > 12) {
+        if (uprv_add32_overflow(month, -monthsInYear(eyear), &month) ||
+            uprv_add32_overflow(eyear, 1, &eyear)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return 0;
+        }
+    }
+
+    int64_t day = startOfYear(eyear, status);
+
+    if(U_FAILURE(status)) {
+        return 0;
+    }
+
+    if (month != 0) {
+        int32_t type = yearType(eyear, status);
+        if (U_FAILURE(status)) {
+            return 0;
+        }
+        if (isLeapYear(eyear)) {
+            day += LEAP_MONTH_START[month][type];
+        } else {
+            day += MONTH_START[month][type];
+        }
+    }
+
+    return day + 347997LL;
+}
+
+IMPL_SYSTEM_DEFAULT_CENTURY(HebrewCalendar, "@calendar=hebrew")
+
+bool HebrewCalendar::inTemporalLeapYear(UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return false;
+    }
+    int32_t eyear = get(UCAL_EXTENDED_YEAR, status);
+    if (U_FAILURE(status)) {
+        return false;
+    }
+    return isLeapYear(eyear);
+}
+
+static const char * const gTemporalMonthCodesForHebrew[] = {
+    "M01", "M02", "M03", "M04", "M05", "M05L", "M06",
+    "M07", "M08", "M09", "M10", "M11", "M12", nullptr
+};
+
+const char* HebrewCalendar::getTemporalMonthCode(UErrorCode& status) const {
+    int32_t month = get(UCAL_MONTH, status);
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    return gTemporalMonthCodesForHebrew[month];
+}
+
+void HebrewCalendar::setTemporalMonthCode(const char* code, UErrorCode& status )
+{
+    if (U_FAILURE(status)) {
+        return;
+    }
+    int32_t len = static_cast<int32_t>(uprv_strlen(code));
+    if (len == 3 || len == 4) {
+        for (int m = 0; gTemporalMonthCodesForHebrew[m] != nullptr; m++) {
+            if (uprv_strcmp(code, gTemporalMonthCodesForHebrew[m]) == 0) {
+                set(UCAL_MONTH, m);
+                return;
+            }
+        }
+    }
+    status = U_ILLEGAL_ARGUMENT_ERROR;
+}
+
+int32_t HebrewCalendar::internalGetMonth(UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    if (resolveFields(kMonthPrecedence) == UCAL_ORDINAL_MONTH) {
+        int32_t ordinalMonth = internalGet(UCAL_ORDINAL_MONTH);
+        HebrewCalendar* nonConstThis = const_cast<HebrewCalendar*>(this); 
+
+        int32_t year = nonConstThis->handleGetExtendedYear(status);
+        if (U_FAILURE(status)) {
+            return 0;
+        }
+        if (isLeapYear(year) || ordinalMonth <= ADAR_1) {
+            return ordinalMonth;
+        }
+        if (!uprv_add32_overflow(ordinalMonth, 1, &ordinalMonth)) {
+            return ordinalMonth;
+        }
+    }
+    return Calendar::internalGetMonth(status);
+}
+
+int32_t HebrewCalendar::getRelatedYearDifference() const {
+    constexpr int32_t kHebrewCalendarRelatedYearDifference = -3760;
+    return kHebrewCalendarRelatedYearDifference;
+}
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(HebrewCalendar)
+
+U_NAMESPACE_END
+
+#endif // UCONFIG_NO_FORMATTING
+

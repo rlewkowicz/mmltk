@@ -1,0 +1,104 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_ASpdySession_h
+#define mozilla_net_ASpdySession_h
+
+#include "nsAHttpTransaction.h"
+#include "prinrval.h"
+#include "nsHttp.h"
+#include "nsString.h"
+
+class nsISocketTransport;
+
+namespace mozilla {
+namespace net {
+
+class nsHttpConnection;
+class WebTransportSessionBase;
+
+class ASpdySession : public nsAHttpTransaction {
+ public:
+  ASpdySession() = default;
+  virtual ~ASpdySession() = default;
+
+  [[nodiscard]] virtual bool AddStream(nsAHttpTransaction*, int32_t,
+                                       nsIInterfaceRequestor*) = 0;
+  virtual bool CanReuse() = 0;
+  virtual bool RoomForMoreStreams() = 0;
+  virtual PRIntervalTime IdleTime() = 0;
+  virtual uint32_t ReadTimeoutTick(PRIntervalTime now) = 0;
+  virtual void DontReuse() = 0;
+  virtual enum SpdyVersion SpdyVersion() = 0;
+
+  static ASpdySession* NewSpdySession(net::SpdyVersion version,
+                                      nsISocketTransport*, bool);
+
+  virtual bool TestJoinConnection(const nsACString& hostname, int32_t port) = 0;
+  virtual bool JoinConnection(const nsACString& hostname, int32_t port) = 0;
+
+  virtual void PrintDiagnostics(nsCString& log) = 0;
+
+  bool ResponseTimeoutEnabled() const final { return true; }
+
+  virtual void SendPing() = 0;
+
+  const static uint32_t kSendingChunkSize = 16000;
+  const static uint32_t kTCPSendBufferSize = 131072;
+  const static uint32_t kInitialPushAllowance = 131072;  
+
+  const static uint32_t kInitialRwin = 12 * 1024 * 1024;  
+
+  const static uint32_t kDefaultMaxConcurrent = 100;
+
+  static bool SoftStreamError(nsresult code) {
+    if (NS_SUCCEEDED(code) || code == NS_BASE_STREAM_WOULD_BLOCK) {
+      return false;
+    }
+
+    if (code == NS_ERROR_FAILURE || code == NS_ERROR_OUT_OF_MEMORY) {
+      return false;
+    }
+
+    if (NS_ERROR_GET_MODULE(code) != NS_ERROR_MODULE_NETWORK) {
+      return true;
+    }
+
+    return (code == NS_BASE_STREAM_CLOSED || code == NS_BINDING_FAILED ||
+            code == NS_BINDING_ABORTED || code == NS_BINDING_REDIRECTED ||
+            code == NS_ERROR_INVALID_CONTENT_ENCODING ||
+            code == NS_BINDING_RETARGETED ||
+            code == NS_ERROR_CORRUPTED_CONTENT ||
+            code == NS_ERROR_NET_TIMEOUT_EXTERNAL);
+  }
+
+  virtual void SetCleanShutdown(bool) = 0;
+  virtual ExtendedCONNECTSupport GetExtendedCONNECTSupport() = 0;
+
+  virtual Result<already_AddRefed<mozilla::net::nsHttpConnection>, nsresult>
+  CreateTunnelStream(nsAHttpTransaction* aHttpTransaction,
+                     nsIInterfaceRequestor* aCallbacks, PRIntervalTime aRtt,
+                     bool aIsExtendedCONNECT = false) = 0;
+
+  virtual WebTransportSessionBase* GetWebTransportSession(
+      nsAHttpTransaction* aTransaction) = 0;
+};
+
+using ALPNCallback = bool (*)(nsITLSSocketControl*);
+
+class SpdyInformation {
+ public:
+  SpdyInformation();
+  ~SpdyInformation() = default;
+
+  SpdyVersion Version;      
+  nsCString VersionString;  
+
+  ALPNCallback ALPNCallbacks;
+};
+
+}  
+}  
+
+#endif  // mozilla_net_ASpdySession_h

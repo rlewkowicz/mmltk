@@ -1,0 +1,1026 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+// See the LICENSE file in the project root for more information.
+
+
+
+
+const FORCE_TRIANGLES: bool = true;
+
+
+
+const FLOAT_ZERO: f32 = 0.;
+const FLOAT_ONE: f32 = 1.;
+
+
+use crate::{types::*, geometry_sink::IGeometrySink, aacoverage::c_nShiftSizeSquared, OutputVertex, nullable_ref::Ref};
+
+
+
+/*pub struct CHwVertexBufferBuilder /* : public IGeometrySink */
+{
+    /* 
+public:
+
+    static HRESULT Create(
+        MilVertexFormat vfIn,
+        MilVertexFormat vfOut,
+        MilVertexFormatAttribute vfaAntiAliasScaleLocation,
+        __in_ecount_opt(1) CHwPipeline *pPipeline,
+        __in_ecount_opt(1) CD3DDeviceLevel1 *pDevice,
+        __in_ecount(1) CBufferDispenser *pBufferDispenser,
+        __deref_out_ecount(1) CHwVertexBuffer::Builder **ppVertexBufferBuilder
+        );
+
+    virtual ~Builder()
+    {
+#if DBG
+        Assert(!m_fDbgDestroyed);
+        m_fDbgDestroyed = true;
+#endif DBG
+    }
+
+    //+------------------------------------------------------------------------
+    //
+    //  Member:    SetConstantMapping
+    //
+    //  Synopsis:  Use this method to specify that the given color source for
+    //             the given vertex destination is constant (won't differ per
+    //             vertex)
+    //
+    //-------------------------------------------------------------------------
+
+    virtual HRESULT SetConstantMapping(
+        MilVertexFormatAttribute mvfaDestination,
+        __in_ecount(1) const CHwConstantColorSource *pConstCS
+        ) PURE;
+
+
+    //+------------------------------------------------------------------------
+    //
+    //  Member:    FinalizeMappings
+    //
+    //  Synopsis:  Use this method to let builder know that all mappings have
+    //             been sent
+    //
+    //-------------------------------------------------------------------------
+
+    virtual HRESULT FinalizeMappings(
+        ) PURE;
+
+    //+------------------------------------------------------------------------
+    //
+    //  Member:    SetOutsideBounds
+    //
+    //  Synopsis:  Enables rendering zero-alpha geometry outside of the input
+    //             shape but within the given bounding rectangle, if fNeedInside
+    //             isn't true then it doesn't render geometry with full alpha.
+    //
+    //-------------------------------------------------------------------------
+    virtual void SetOutsideBounds(
+        __in_ecount_opt(1) const CMILSurfaceRect *prcBounds,
+        bool fNeedInside
+        ) PURE;
+
+    //+------------------------------------------------------------------------
+    //
+    //  Member:    HasOutsideBounds
+    //
+    //  Synopsis:  Returns true if outside bounds have been set.
+    //
+    //-------------------------------------------------------------------------
+    virtual bool HasOutsideBounds() const PURE;
+
+    //+------------------------------------------------------------------------
+    //
+    //  Member:    BeginBuilding
+    //
+    //  Synopsis:  This method lets the builder know it should start from a
+    //             clean slate
+    //
+    //-------------------------------------------------------------------------
+
+    virtual HRESULT BeginBuilding(
+        ) PURE;
+
+    //+------------------------------------------------------------------------
+    //
+    //  Member:    EndBuilding
+    //
+    //  Synopsis:  Use this method to let the builder know that all of the
+    //             vertex data has been sent
+    //
+    //-------------------------------------------------------------------------
+
+    virtual HRESULT EndBuilding(
+        __deref_opt_out_ecount(1) CHwVertexBuffer **ppVertexBuffer
+        ) PURE;
+
+    //+------------------------------------------------------------------------
+    //
+    //  Member:    FlushReset
+    //
+    //  Synopsis:  Send pending state and geometry to the device and reset
+    //             the vertex buffer.
+    //
+    //-------------------------------------------------------------------------
+
+    MIL_FORCEINLINE HRESULT FlushReset()
+    {
+        return FlushInternal(NULL);
+    }
+        
+    //
+    // Currently all CHwVertexBuffer::Builder are supposed to be allocated via
+    // a CBufferDispenser.
+    //
+
+    DECLARE_BUFFERDISPENSER_DELETE
+
+protected:
+
+    Builder()
+    {
+        m_mvfIn = MILVFAttrNone;
+
+#if DBG
+        m_mvfDbgOut = MILVFAttrNone;
+#endif
+
+        m_mvfaAntiAliasScaleLocation = MILVFAttrNone;
+
+        m_pPipelineNoRef = NULL;
+        m_pDeviceNoRef = NULL;
+        
+#if DBG
+        m_fDbgDestroyed = false;
+#endif DBG
+    }
+
+    //+------------------------------------------------------------------------
+    //
+    //  Member:    FlushInternal
+    //
+    //  Synopsis:  Send any pending state and geometry to the device.
+    //             If the optional argument is NULL then reset the
+    //             vertex buffer.
+    //             If the optional argument is non-NULL AND we have
+    //             not yet flushed the vertex buffer return the vertex
+    //             buffer.
+    //
+    //-------------------------------------------------------------------------
+
+    virtual HRESULT FlushInternal(
+        __deref_opt_out_ecount_opt(1) CHwVertexBuffer **ppVertexBuffer
+        ) PURE;
+
+
+    CHwPipeline *m_pPipelineNoRef;
+    CD3DDeviceLevel1 *m_pDeviceNoRef;
+
+    MilVertexFormat m_mvfIn;         // Vertex fields that are pre-generated
+
+#if DBG
+    MilVertexFormat m_mvfDbgOut;     // Output format of the vertex
+#endif
+
+    MilVertexFormat m_mvfGenerated;  // Vertex fields that are dynamically
+                                     // generated by this builder
+
+    MilVertexFormatAttribute m_mvfaAntiAliasScaleLocation;  // Vertex field that
+                                                            // contains PPAA
+                                                            // falloff factor
+
+#if DBG
+private:
+
+    bool m_fDbgDestroyed;     // Used to check single Release pattern
+
+#endif DBG
+*/
+}*/
+#[derive(Default)]
+pub struct CD3DVertexXYZDUV2 {
+    x: f32,
+    y: f32,
+    coverage: f32,
+}
+pub type CHwVertexBuffer<'z> = CHwTVertexBuffer<'z, OutputVertex>;
+#[derive(Default)]
+pub struct CHwTVertexBuffer<'z, TVertex>
+{
+
+
+
+
+    m_rgVerticesTriList: DynArray<TVertex>,            
+
+    m_rgVerticesBuffer: Option<&'z mut [TVertex]>,
+    m_rgVerticesBufferOffset: usize,
+
+    #[cfg(debug_assertions)]
+    m_fDbgNonLineSegmentTriangleStrip: bool,
+    subpixel_bias: f32,
+}
+
+impl<'z, TVertex: Default> CHwTVertexBuffer<'z, TVertex> {
+    pub fn new(rasterization_truncates: bool, output_buffer: Option<&'z mut [TVertex]>) -> Self {
+        CHwTVertexBuffer::<TVertex> {
+            subpixel_bias: if rasterization_truncates {
+                1./512.
+            } else {
+                0.
+            },
+            m_rgVerticesBuffer: output_buffer,
+            m_rgVerticesBufferOffset: 0,
+            ..Default::default()
+        }
+    }
+
+    pub fn flush_output(&mut self) -> Box<[TVertex]> {
+        std::mem::take(&mut self.m_rgVerticesTriList).into_boxed_slice()
+    }
+
+    pub fn get_output_buffer_size(&self) -> Option<usize> {
+        if self.m_rgVerticesBuffer.is_some() {
+            Some(self.m_rgVerticesBufferOffset)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Default)]
+struct CHwTVertexMappings<TVertex>
+{
+    m_vStatic: TVertex,
+    subpixel_bias: f32,
+}
+
+impl<TVertex> CHwTVertexBuffer<'_, TVertex> {
+    pub fn Reset(&mut self,
+        )
+    {
+        #[cfg(debug_assertions)]
+        {
+            self.m_fDbgNonLineSegmentTriangleStrip = false;
+        }
+
+        self.m_rgVerticesTriList.SetCount(0);
+        self.m_rgVerticesBufferOffset = 0;
+
+    }
+
+    fn IsEmpty(&self) -> bool
+    {
+        return true
+            && (self.m_rgVerticesTriList.GetCount() == 0)
+            && self.m_rgVerticesBufferOffset == 0
+    }
+
+}
+
+
+pub struct CHwTVertexBufferBuilder<'y, 'z, TVertex>
+{
+    m_mvfIn: MilVertexFormat,         
+
+    #[cfg(debug_assertions)]
+    m_mvfDbgOut: MilVertexFormat,     
+    
+    m_mvfGenerated: MilVertexFormat,  
+
+    m_mvfaAntiAliasScaleLocation: MilVertexFormatAttribute,  
+
+
+    m_pVB: &'y mut CHwTVertexBuffer<'z, TVertex>,
+
+
+
+
+
+    m_fHasFlushed: bool,
+
+    m_fNeedOutsideGeometry: bool,
+    m_fNeedInsideGeometry: bool,
+    m_rcOutsideBounds: CMILSurfaceRect, 
+
+    m_rCurStratumTop: f32,
+    m_rCurStratumBottom: f32,
+
+    m_rLastTrapezoidRight: f32,
+
+    m_rLastTrapezoidTopRight: f32,
+    m_rLastTrapezoidBottomRight: f32,
+}
+
+
+impl CHwVertexBuffer<'_> {
+fn AddLine(&mut self,
+    v0: &PointXYA,
+    v1: &PointXYA
+    ) -> HRESULT
+{
+    type TVertex = CD3DVertexXYZDUV2;
+    let hr = S_OK;
+
+    let pVertices: &mut [TVertex];
+    let mut rgScratchVertices: [TVertex; 2] = Default::default();
+
+    assert!(!(v0.y != v1.y));
+    
+    let fUseTriangles =  FORCE_TRIANGLES;
+
+        pVertices = &mut rgScratchVertices;
+    
+    pVertices[0].x = v0.x;
+    pVertices[0].y = v0.y;
+    pVertices[0].coverage = v0.a;
+    pVertices[1].x = v1.x;
+    pVertices[1].y = v1.y;
+    pVertices[1].coverage = v1.a;
+
+    if (fUseTriangles)
+    {
+        IFC!(self.AddLineAsTriangleList(&pVertices[0],&pVertices[1]));
+    }
+    
+    RRETURN!(hr);
+}
+}
+
+impl<TVertex: Clone + Default> CHwTVertexBuffer<'_, TVertex> {
+
+fn AddTriVertices(&mut self, v0: TVertex, v1: TVertex, v2: TVertex) {
+    if let Some(output_buffer) = &mut self.m_rgVerticesBuffer {
+        let offset = self.m_rgVerticesBufferOffset;
+        if offset + 3 <= output_buffer.len() {
+            output_buffer[offset] = v0;
+            output_buffer[offset + 1] = v1;
+            output_buffer[offset + 2] = v2;
+        }
+        self.m_rgVerticesBufferOffset = offset + 3;
+    } else {
+        self.m_rgVerticesTriList.reserve(3);
+        self.m_rgVerticesTriList.push(v0);
+        self.m_rgVerticesTriList.push(v1);
+        self.m_rgVerticesTriList.push(v2);
+    }
+}
+
+fn AddTrapezoidVertices(&mut self, v0: TVertex, v1: TVertex, v2: TVertex, v3: TVertex) {
+    if let Some(output_buffer) = &mut self.m_rgVerticesBuffer {
+        let offset = self.m_rgVerticesBufferOffset;
+        if offset + 6 <= output_buffer.len() {
+            output_buffer[offset] = v0;
+            output_buffer[offset + 1] = v1.clone();
+            output_buffer[offset + 2] = v2.clone();
+
+            output_buffer[offset + 3] = v1;
+            output_buffer[offset + 4] = v2;
+            output_buffer[offset + 5] = v3;
+        }
+        self.m_rgVerticesBufferOffset = offset + 6;
+    } else {
+        self.m_rgVerticesTriList.reserve(6);
+
+        self.m_rgVerticesTriList.push(v0);
+        self.m_rgVerticesTriList.push(v1.clone());
+        self.m_rgVerticesTriList.push(v2.clone());
+
+        self.m_rgVerticesTriList.push(v1);
+        self.m_rgVerticesTriList.push(v2);
+        self.m_rgVerticesTriList.push(v3);
+    }
+}
+
+fn AddedNonLineSegment(&mut self) {
+    #[cfg(debug_assertions)]
+    {
+        self.m_fDbgNonLineSegmentTriangleStrip = true;
+    }
+}
+
+}
+
+pub type CHwVertexBufferBuilder<'y, 'z> = CHwTVertexBufferBuilder<'y, 'z, OutputVertex>;
+impl<'y, 'z> CHwVertexBufferBuilder<'y, 'z> {
+pub fn Create(
+     vfIn: MilVertexFormat,
+     vfOut: MilVertexFormat,
+     mvfaAntiAliasScaleLocation: MilVertexFormatAttribute,
+    pVertexBuffer: &'y mut CHwVertexBuffer<'z>,
+    ) -> CHwVertexBufferBuilder<'y, 'z>
+{
+    CHwVertexBufferBuilder::CreateTemplate(pVertexBuffer, vfIn, vfOut, mvfaAntiAliasScaleLocation)
+
+
+}
+
+        fn OutsideLeft(&self) -> f32  { return self.m_rcOutsideBounds.left as f32; }
+        fn OutsideRight(&self) -> f32 { return self.m_rcOutsideBounds.right as f32; }
+        fn OutsideTop(&self) -> f32 { return self.m_rcOutsideBounds.top as f32; }
+        fn OutsideBottom(&self) -> f32 { return self.m_rcOutsideBounds.bottom as f32; }
+}
+
+
+
+impl<'y, 'z, TVertex: Default> CHwTVertexBufferBuilder<'y, 'z, TVertex> {
+
+
+fn CreateTemplate(
+     pVertexBuffer: &'y mut CHwTVertexBuffer<'z, TVertex>,
+     mvfIn: MilVertexFormat,
+     mvfOut: MilVertexFormat,
+     mvfaAntiAliasScaleLocation: MilVertexFormatAttribute,
+    ) -> Self
+{
+
+
+
+    let mut pVertexBufferBuilder = CHwTVertexBufferBuilder::<TVertex>::new(pVertexBuffer);
+
+    IFC!(pVertexBufferBuilder.SetupConverter(
+        mvfIn,
+        mvfOut,
+        mvfaAntiAliasScaleLocation
+        ));
+
+    return pVertexBufferBuilder;
+}
+
+
+fn new(pVertexBuffer: &'y mut CHwTVertexBuffer<'z, TVertex>) -> Self
+{
+    Self {
+    m_pVB: pVertexBuffer,
+
+
+
+
+    m_rCurStratumTop: f32::MAX,
+    m_rCurStratumBottom:  -f32::MAX,
+    m_fNeedOutsideGeometry: false,
+    m_fNeedInsideGeometry: true,
+
+    m_rLastTrapezoidRight: -f32::MAX,
+    m_rLastTrapezoidTopRight: -f32::MAX,
+    m_rLastTrapezoidBottomRight: -f32::MAX,
+
+    m_fHasFlushed: false,
+    m_rcOutsideBounds: Default::default(),
+        #[cfg(debug_assertions)]
+        m_mvfDbgOut: MilVertexFormatAttribute::MILVFAttrNone as MilVertexFormat,
+        m_mvfIn: MilVertexFormatAttribute::MILVFAttrNone as MilVertexFormat,
+        m_mvfGenerated: MilVertexFormatAttribute::MILVFAttrNone  as MilVertexFormat,
+        m_mvfaAntiAliasScaleLocation: MilVertexFormatAttribute::MILVFAttrNone,
+    }
+}
+
+
+fn SetupConverter(&mut self,
+     mvfIn: MilVertexFormat,
+     mvfOut: MilVertexFormat,
+     mvfaAntiAliasScaleLocation: MilVertexFormatAttribute,
+     ) -> HRESULT
+{
+    let hr = S_OK;
+
+    self.m_mvfIn = mvfIn;
+
+    #[cfg(debug_assertions)]
+    {
+    self.m_mvfDbgOut = mvfOut;
+    }
+
+    self.m_mvfGenerated = mvfOut & !self.m_mvfIn;
+    self.m_mvfaAntiAliasScaleLocation = mvfaAntiAliasScaleLocation;
+
+    assert!((self.m_mvfGenerated & MilVertexFormatAttribute::MILVFAttrXY as MilVertexFormat) == 0);
+
+    RRETURN!(hr);
+}
+}
+impl<TVertex> CHwTVertexBufferBuilder<'_, '_, TVertex> {
+
+
+pub fn SetOutsideBounds(&mut self,
+    prcOutsideBounds: Option<&CMILSurfaceRect>,
+    fNeedInside: bool,
+    )
+{
+
+    if let Some(prcOutsideBounds) = prcOutsideBounds
+    {
+        self.m_rcOutsideBounds = prcOutsideBounds.clone();
+        self.m_fNeedOutsideGeometry = true;
+        self.m_fNeedInsideGeometry = fNeedInside;
+    }
+    else
+    {
+        self.m_fNeedOutsideGeometry = false;
+        self.m_fNeedInsideGeometry = true;
+    }
+}
+
+pub fn BeginBuilding(&mut self,
+    ) -> HRESULT
+{
+    
+    let hr: HRESULT = S_OK;
+
+    self.m_fHasFlushed = false;
+    self.m_pVB.Reset();
+
+    RRETURN!(hr);
+}
+}
+impl IGeometrySink for CHwVertexBufferBuilder<'_, '_> {
+
+    fn AddTrapezoid(&mut self,
+        rPixelYTop: f32,              
+        rPixelXTopLeft: f32,          
+        rPixelXTopRight: f32,         
+        rPixelYBottom: f32,           
+        rPixelXBottomLeft: f32,       
+        rPixelXBottomRight: f32,      
+        rPixelXLeftDelta: f32,        
+        rPixelXRightDelta: f32        
+        ) -> HRESULT
+    {
+        let hr = S_OK;
+    
+        if ( false)
+        {
+        }
+        else
+        {
+            IFC!(self.AddTrapezoidStandard(
+                    rPixelYTop,
+                    rPixelXTopLeft,
+                    rPixelXTopRight,
+                    rPixelYBottom,
+                    rPixelXBottomLeft,
+                    rPixelXBottomRight,
+                    rPixelXLeftDelta,
+                    rPixelXRightDelta));
+        }
+    
+        RRETURN!(hr);
+    }
+    
+
+    fn IsEmpty(&self) -> bool {
+        self.m_pVB.IsEmpty()
+    }
+
+
+
+    fn AddComplexScan(&mut self,
+        nPixelY: INT,
+            mut pIntervalSpanStart: Ref<crate::aacoverage::CCoverageInterval>
+        ) -> HRESULT {
+
+    let hr: HRESULT = S_OK;
+
+    IFC!(self.PrepareStratum((nPixelY) as f32,
+                  (nPixelY+1) as f32, 
+                  false,  
+                  0., 0.,
+                0., 0., 0., 0.));
+
+    let rPixelY: f32;
+    rPixelY = (nPixelY) as f32 + 0.5;
+
+
+    let mut pLineSink = None;
+
+    
+    if ( FORCE_TRIANGLES)
+    {
+        pLineSink = Some(&mut self.m_pVB);
+    }
+
+
+    if (pLineSink.is_none())
+    {
+    }
+
+
+    while ((*pIntervalSpanStart).m_nPixelX.get() != INT::MAX)
+    {
+        assert!(!(*pIntervalSpanStart).m_pNext.get().is_null());
+
+        if (self.NeedCoverageGeometry((*pIntervalSpanStart).m_nCoverage.get()))
+        {
+            let rCoverage: f32 = ((*pIntervalSpanStart).m_nCoverage.get() as f32)/(c_nShiftSizeSquared as f32);
+            
+            let mut iBegin: LONG = (*pIntervalSpanStart).m_nPixelX.get();
+            let mut iEnd: LONG = (*(*pIntervalSpanStart).m_pNext.get()).m_nPixelX.get();
+            if (self.NeedOutsideGeometry())
+            {
+
+
+                iBegin = iBegin.max(iEnd.min(self.m_rcOutsideBounds.left));
+                iEnd = iEnd.min(iBegin.max(self.m_rcOutsideBounds.right));
+            }
+            let rPixelXBegin: f32= (iBegin as f32) + 0.5;
+            let rPixelXEnd: f32 = (iEnd as f32) + 0.5;
+
+
+            {
+                let mut v0: PointXYA = Default::default(); let mut v1: PointXYA = Default::default();
+                v0.x = rPixelXBegin;
+                v0.y = rPixelY;
+                v0.a = rCoverage;
+
+                v1.x = rPixelXEnd;
+                v1.y = rPixelY;
+                v1.a = rCoverage;
+
+                IFC!(self.m_pVB.AddLine(&v0,&v1));
+            }
+            {
+            }
+        }
+
+
+        pIntervalSpanStart = (*pIntervalSpanStart).m_pNext.get();
+    }
+
+
+    RRETURN!(hr);
+
+}
+}
+
+impl CHwVertexBuffer<'_> {
+    fn AddLineAsTriangleList(&mut self,
+    pBegin: &CD3DVertexXYZDUV2, 
+    pEnd: &CD3DVertexXYZDUV2    
+    ) -> HRESULT
+{
+    let hr = S_OK;
+
+    debug_assert!(pBegin.y == pEnd.y);
+    debug_assert!(pBegin.coverage == pEnd.coverage);
+
+    let x0 = pBegin.x - 0.5;
+    let x1 = pEnd.x - 0.5;
+    let y = pBegin.y;
+    let dwDiffuse = pBegin.coverage;
+
+
+    let subpixel_bias = self.subpixel_bias;
+
+
+    self.AddTriVertices(
+        OutputVertex{ x: x0, y: y - 0.5, coverage: dwDiffuse },
+        OutputVertex{ x: x0, y: y + 0.5, coverage: dwDiffuse },
+        OutputVertex{ x: x1, y: y + subpixel_bias, coverage: dwDiffuse },
+    );
+
+    self.AddedNonLineSegment();
+
+    RRETURN!(hr);
+}
+}
+
+impl CHwVertexBufferBuilder<'_, '_> {
+
+
+fn AddTrapezoidStandard(&mut self,
+    rPixelYTop: f32,              
+    rPixelXTopLeft: f32,          
+    rPixelXTopRight: f32,         
+    rPixelYBottom: f32,           
+    rPixelXBottomLeft: f32,       
+    rPixelXBottomRight: f32,      
+    rPixelXLeftDelta: f32,        
+    rPixelXRightDelta: f32        
+    ) -> HRESULT
+{
+    type TVertex = CD3DVertexXYZDUV2;
+    let hr = S_OK;
+
+    IFC!(self.PrepareStratum(
+        rPixelYTop,
+        rPixelYBottom,
+        true, 
+        rPixelXTopLeft.min(rPixelXBottomLeft),
+        rPixelXTopRight.max(rPixelXBottomRight),
+        rPixelXTopLeft - rPixelXLeftDelta, rPixelXBottomLeft - rPixelXLeftDelta,
+        rPixelXTopRight + rPixelXRightDelta, rPixelXBottomRight + rPixelXRightDelta
+        ));
+    
+
+	let fNeedOutsideGeometry: bool; let fNeedInsideGeometry: bool;
+    fNeedOutsideGeometry = self.NeedOutsideGeometry();
+    fNeedInsideGeometry = self.NeedInsideGeometry();
+
+
+    self.m_pVB.AddTrapezoidVertices(
+        OutputVertex{
+            x: rPixelXTopLeft - rPixelXLeftDelta,
+            y: rPixelYTop,
+            coverage: FLOAT_ZERO,
+        },
+        OutputVertex{
+            x: rPixelXBottomLeft - rPixelXLeftDelta,
+            y: rPixelYBottom,
+            coverage: FLOAT_ZERO,
+        },
+        OutputVertex{
+            x: rPixelXTopLeft + rPixelXLeftDelta,
+            y: rPixelYTop,
+            coverage: FLOAT_ONE,
+        },
+        OutputVertex{
+            x: rPixelXBottomLeft + rPixelXLeftDelta,
+            y: rPixelYBottom,
+            coverage: FLOAT_ONE,
+        }
+    );
+
+
+    if (fNeedInsideGeometry)
+    {
+        self.m_pVB.AddTrapezoidVertices(
+            OutputVertex{
+                x: rPixelXTopLeft + rPixelXLeftDelta,
+                y: rPixelYTop,
+                coverage: FLOAT_ONE,
+            },
+            OutputVertex{
+                x: rPixelXBottomLeft + rPixelXLeftDelta,
+                y: rPixelYBottom,
+                coverage: FLOAT_ONE,
+            },
+            OutputVertex{
+                x: rPixelXTopRight - rPixelXRightDelta,
+                y: rPixelYTop,
+                coverage: FLOAT_ONE,
+            },
+            OutputVertex{
+                x: rPixelXBottomRight - rPixelXRightDelta,
+                y: rPixelYBottom,
+                coverage: FLOAT_ONE,
+            }
+        );
+    }
+
+    self.m_pVB.AddTrapezoidVertices(
+        OutputVertex{
+            x: rPixelXTopRight - rPixelXRightDelta,
+            y: rPixelYTop,
+            coverage: FLOAT_ONE,
+        },
+        OutputVertex{
+            x: rPixelXBottomRight - rPixelXRightDelta,
+            y: rPixelYBottom,
+            coverage: FLOAT_ONE,
+        },
+        OutputVertex{
+            x: rPixelXTopRight + rPixelXRightDelta,
+            y: rPixelYTop,
+            coverage: FLOAT_ZERO,
+        },
+        OutputVertex{
+            x: rPixelXBottomRight + rPixelXRightDelta,
+            y: rPixelYBottom,
+            coverage: FLOAT_ZERO,
+        }
+    );
+
+    if (!fNeedOutsideGeometry)
+    {
+
+    }
+
+    self.m_pVB.AddedNonLineSegment();
+
+    RRETURN!(hr);
+}
+}
+impl CHwVertexBufferBuilder<'_, '_> {
+
+fn NeedCoverageGeometry(&self,
+    nCoverage: INT
+    ) -> bool
+{
+    return    (self.NeedInsideGeometry()  || nCoverage != c_nShiftSizeSquared)
+           && (self.NeedOutsideGeometry() || nCoverage != 0);
+}
+
+    fn NeedOutsideGeometry(&self) -> bool
+    {
+        return self.m_fNeedOutsideGeometry;
+    }
+
+    fn NeedInsideGeometry(&self) -> bool
+    {
+        assert!(self.m_fNeedOutsideGeometry || self.m_fNeedInsideGeometry);
+        return self.m_fNeedInsideGeometry;
+    }
+
+
+
+    fn PrepareStratum(&mut self,
+        rStratumTop: f32,
+        rStratumBottom: f32,
+        fTrapezoid: bool,
+        rTrapezoidLeft: f32,
+        rTrapezoidRight: f32,
+        rTrapezoidTopLeft: f32, 
+        rTrapezoidBottomLeft: f32, 
+        rTrapezoidTopRight: f32, 
+        rTrapezoidBottomRight: f32, 
+
+        ) -> HRESULT
+    {
+        return if self.NeedOutsideGeometry() {
+            self.PrepareStratumSlow(
+                rStratumTop,
+                rStratumBottom,
+                fTrapezoid,
+                rTrapezoidLeft,
+                rTrapezoidRight,
+                rTrapezoidTopLeft,
+                rTrapezoidBottomLeft,
+                rTrapezoidTopRight,
+                rTrapezoidBottomRight
+                )
+     } else { S_OK };
+    }
+
+fn PrepareStratumSlow(&mut self,
+    rStratumTop: f32,
+    rStratumBottom: f32,
+    fTrapezoid: bool,
+    rTrapezoidLeft: f32,
+    rTrapezoidRight: f32,
+    rTrapezoidTopLeft: f32,
+    rTrapezoidBottomLeft: f32,
+    rTrapezoidTopRight: f32,
+    rTrapezoidBottomRight: f32,
+    ) -> HRESULT
+{
+    type TVertex = OutputVertex;
+    let hr: HRESULT = S_OK;
+    
+    assert!(!(rStratumTop > rStratumBottom));
+    assert!(self.NeedOutsideGeometry());
+
+        
+    let fEndBuildingOutside: f32 = (rStratumBottom == self.OutsideBottom() &&
+                                rStratumTop == self.OutsideBottom()) as i32 as f32;
+
+    if (fEndBuildingOutside == 1.)
+    {
+        assert!(!fTrapezoid);
+    }
+    else
+    {
+        assert!(!(rStratumBottom < self.m_rCurStratumBottom));
+    }
+    
+    if (   fEndBuildingOutside == 1.
+        || rStratumBottom != self.m_rCurStratumBottom)
+    {
+        
+        
+        if (self.m_rCurStratumTop != f32::MAX)
+        {
+            
+            let rOutsideRight: f32 = self.OutsideRight().max(self.m_rLastTrapezoidRight);
+
+
+            self.m_pVB.AddTrapezoidVertices(
+                OutputVertex{
+                    x: self.m_rLastTrapezoidTopRight,
+                    y: self.m_rCurStratumTop,
+                    coverage: FLOAT_ZERO,
+                },
+                OutputVertex{
+                    x: self.m_rLastTrapezoidBottomRight,
+                    y: self.m_rCurStratumBottom,
+                    coverage: FLOAT_ZERO,
+                },
+                OutputVertex{
+                    x: rOutsideRight,
+                    y: self.m_rCurStratumTop,
+                    coverage: FLOAT_ZERO,
+                },
+                OutputVertex{
+                    x: rOutsideRight,
+                    y: self.m_rCurStratumBottom,
+                    coverage: FLOAT_ZERO,
+                }
+            );
+        }
+        let flGap: f32 = rStratumTop - self.m_rCurStratumBottom;
+
+        if (flGap > 0.)
+        {
+
+            let flRectTop: f32 = if self.m_rCurStratumBottom == -f32::MAX {
+                              self.OutsideTop() } else {
+                              self.m_rCurStratumBottom };
+            let flRectBot: f32  = (rStratumTop as f32);
+
+            assert!(self.m_rCurStratumBottom != -f32::MAX || self.m_rCurStratumTop == f32::MAX);
+
+            let outside_left = self.OutsideLeft();
+            let outside_right = self.OutsideRight();
+            
+            self.m_pVB.AddTrapezoidVertices(
+                OutputVertex{
+                    x: outside_left,
+                    y: flRectTop,
+                    coverage: FLOAT_ZERO,
+                },
+                OutputVertex{
+                    x: outside_left,
+                    y: flRectBot,
+                    coverage: FLOAT_ZERO,
+                },
+                OutputVertex{
+                    x: outside_right,
+                    y: flRectTop,
+                    coverage: FLOAT_ZERO,
+                },
+                OutputVertex{
+                    x: outside_right,
+                    y: flRectBot,
+                    coverage: FLOAT_ZERO,
+                }
+            );
+        }
+
+        if (fTrapezoid)
+        {
+
+            
+            let rOutsideLeft: f32 = self.OutsideLeft().min(rTrapezoidLeft);
+
+
+            self.m_pVB.AddTrapezoidVertices(
+                OutputVertex{
+                    x: rOutsideLeft,
+                    y: rStratumTop,
+                    coverage: FLOAT_ZERO,
+                },
+                OutputVertex{
+                    x: rOutsideLeft,
+                    y: rStratumBottom,
+                    coverage: FLOAT_ZERO,
+                },
+                OutputVertex{
+                    x: rTrapezoidTopLeft,
+                    y: rStratumTop,
+                    coverage: FLOAT_ZERO,
+                },
+                OutputVertex{
+                    x: rTrapezoidBottomLeft,
+                    y: rStratumBottom,
+                    coverage: FLOAT_ZERO,
+                }
+            );
+        }
+    }
+    
+    if (fTrapezoid)
+    {
+        self.m_rLastTrapezoidTopRight = rTrapezoidTopRight;
+        self.m_rLastTrapezoidBottomRight = rTrapezoidBottomRight;
+        self.m_rLastTrapezoidRight = rTrapezoidRight;
+    }
+
+    self.m_rCurStratumTop = if fTrapezoid { rStratumTop } else { f32::MAX };
+    self.m_rCurStratumBottom = rStratumBottom;
+
+    RRETURN!(hr);
+}
+ 
+fn EndBuildingOutside(&mut self) -> HRESULT
+{
+    return self.PrepareStratum(
+        self.OutsideBottom(),
+        self.OutsideBottom(),
+        false, 
+        0., 0.,
+        0., 0.,
+        0., 0.,
+        );
+}
+
+pub fn EndBuilding(&mut self) -> HRESULT
+{
+    let hr = S_OK;
+
+    IFC!(self.EndBuildingOutside());
+    
+    RRETURN!(hr);
+}
+
+}

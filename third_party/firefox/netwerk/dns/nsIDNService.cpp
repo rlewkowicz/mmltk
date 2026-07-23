@@ -1,0 +1,599 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MainThreadUtils.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/Preferences.h"
+#include "nsIDNService.h"
+#include "nsReadableUtils.h"
+#include "nsCRT.h"
+#include "nsServiceManagerUtils.h"
+#include "nsString.h"
+#include "nsStringFwd.h"
+#include "nsUnicharUtils.h"
+#include "nsUnicodeProperties.h"
+#include "harfbuzz/hb.h"
+#include "mozilla/Casting.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/intl/UnicodeProperties.h"
+#include "mozilla/intl/UnicodeScriptCodes.h"
+#include "nsNetUtil.h"
+#include "nsStandardURL.h"
+
+using namespace mozilla;
+using namespace mozilla::intl;
+using namespace mozilla::unicode;
+using namespace mozilla::net;
+using mozilla::Preferences;
+
+
+#define ISDIGIT(c) ((c) >= '0' && (c) <= '9')
+
+template <int N>
+static inline bool TLDEqualsLiteral(mozilla::Span<const char32_t> aTLD,
+                                    const char (&aStr)[N]) {
+  if (aTLD.Length() != N - 1) {
+    return false;
+  }
+  const char* a = aStr;
+  for (const char32_t c : aTLD) {
+    if (c != char32_t(*a)) {
+      return false;
+    }
+    ++a;
+  }
+  return true;
+}
+
+template <int N>
+static inline bool TLDStartsWith(mozilla::Span<const char32_t> aTLD,
+                                 const char (&aStr)[N]) {
+  if (aTLD.Length() < N - 1) {
+    return false;
+  }
+
+  for (size_t i = 0; i < N - 1; ++i) {
+    if (aTLD[i] != char32_t(aStr[i])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static inline bool isOnlySafeChars(mozilla::Span<const char32_t> aLabel,
+                                   const nsTArray<BlocklistRange>& aBlocklist) {
+  if (aBlocklist.IsEmpty()) {
+    return true;
+  }
+  for (const char32_t c : aLabel) {
+    if (c > 0xFFFF) {
+      continue;
+    }
+    if (CharInBlocklist(char16_t(c), aBlocklist)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool isCyrillicDomain(mozilla::Span<const char32_t>& aTLD) {
+  return TLDEqualsLiteral(aTLD, "bg") || TLDEqualsLiteral(aTLD, "by") ||
+         TLDEqualsLiteral(aTLD, "kz") || TLDEqualsLiteral(aTLD, "pyc") ||
+         TLDEqualsLiteral(aTLD, "ru") || TLDEqualsLiteral(aTLD, "su") ||
+         TLDEqualsLiteral(aTLD, "ua") || TLDEqualsLiteral(aTLD, "uz");
+}
+
+
+NS_IMPL_ISUPPORTS(nsIDNService, nsIIDNService)
+
+nsresult nsIDNService::Init() {
+  MOZ_ASSERT(NS_IsMainThread());
+  InitializeBlocklist(mIDNBlocklist);
+
+  InitCJKSlashConfusables();
+  InitCJKIdeographs();
+  InitDigitConfusables();
+  InitCyrillicLatinConfusables();
+  InitThaiLatinConfusables();
+  return NS_OK;
+}
+
+void nsIDNService::InitCJKSlashConfusables() {
+  mCJKSlashConfusables.Insert(0x30CE);  
+  mCJKSlashConfusables.Insert(0x30BD);  
+  mCJKSlashConfusables.Insert(0x30BE);  
+  mCJKSlashConfusables.Insert(0x30F3);  
+  mCJKSlashConfusables.Insert(0x4E36);  
+  mCJKSlashConfusables.Insert(0x4E40);  
+  mCJKSlashConfusables.Insert(0x4E41);  
+  mCJKSlashConfusables.Insert(0x4E3F);  
+}
+
+void nsIDNService::InitCJKIdeographs() {
+  mCJKIdeographs.Insert(0x4E00);  
+  mCJKIdeographs.Insert(0x3127);  
+  mCJKIdeographs.Insert(0x4E28);  
+  mCJKIdeographs.Insert(0x4E5B);  
+  mCJKIdeographs.Insert(0x4E03);  
+  mCJKIdeographs.Insert(0x4E05);  
+  mCJKIdeographs.Insert(0x5341);  
+  mCJKIdeographs.Insert(0x3007);  
+  mCJKIdeographs.Insert(0x3112);  
+  mCJKIdeographs.Insert(0x311A);  
+  mCJKIdeographs.Insert(0x311F);  
+  mCJKIdeographs.Insert(0x3128);  
+  mCJKIdeographs.Insert(0x3129);  
+  mCJKIdeographs.Insert(0x3108);  
+  mCJKIdeographs.Insert(0x31BA);  
+  mCJKIdeographs.Insert(0x31B3);  
+  mCJKIdeographs.Insert(0x5DE5);  
+  mCJKIdeographs.Insert(0x31B2);  
+  mCJKIdeographs.Insert(0x8BA0);  
+  mCJKIdeographs.Insert(0x4E01);  
+}
+
+void nsIDNService::InitDigitConfusables() {
+  mDigitConfusables.Insert(0x03B8);  
+  mDigitConfusables.Insert(0x0968);  
+  mDigitConfusables.Insert(0x09E8);  
+  mDigitConfusables.Insert(0x0A68);  
+  mDigitConfusables.Insert(0x0AE8);  
+  mDigitConfusables.Insert(0x0CE9);  
+  mDigitConfusables.Insert(0x0577);  
+  mDigitConfusables.Insert(0x0437);  
+  mDigitConfusables.Insert(0x0499);  
+  mDigitConfusables.Insert(0x04E1);  
+  mDigitConfusables.Insert(0x0909);  
+  mDigitConfusables.Insert(0x0993);  
+  mDigitConfusables.Insert(0x0A24);  
+  mDigitConfusables.Insert(0x0A69);  
+  mDigitConfusables.Insert(0x0AE9);  
+  mDigitConfusables.Insert(0x0C69);  
+  mDigitConfusables.Insert(0x1012);  
+  mDigitConfusables.Insert(0x10D5);  
+  mDigitConfusables.Insert(0x10DE);  
+  mDigitConfusables.Insert(0x0A5C);  
+  mDigitConfusables.Insert(0x10D9);  
+  mDigitConfusables.Insert(0x0A6B);  
+  mDigitConfusables.Insert(0x4E29);  
+  mDigitConfusables.Insert(0x3110);  
+  mDigitConfusables.Insert(0x0573);  
+  mDigitConfusables.Insert(0x09EA);  
+  mDigitConfusables.Insert(0x0A6A);  
+  mDigitConfusables.Insert(0x0B6B);  
+  mDigitConfusables.Insert(0x0AED);  
+  mDigitConfusables.Insert(0x0B68);  
+  mDigitConfusables.Insert(0x0C68);  
+}
+
+void nsIDNService::InitCyrillicLatinConfusables() {
+  mCyrillicLatinConfusables.Insert(0x0430);  
+  mCyrillicLatinConfusables.Insert(0x044B);  
+  mCyrillicLatinConfusables.Insert(0x0441);  
+  mCyrillicLatinConfusables.Insert(0x0501);  
+  mCyrillicLatinConfusables.Insert(0x0435);  
+  mCyrillicLatinConfusables.Insert(0x050D);  
+  mCyrillicLatinConfusables.Insert(0x04BB);  
+  mCyrillicLatinConfusables.Insert(
+      0x0456);  
+  mCyrillicLatinConfusables.Insert(0x044E);  
+  mCyrillicLatinConfusables.Insert(0x043A);  
+  mCyrillicLatinConfusables.Insert(0x0458);  
+  mCyrillicLatinConfusables.Insert(0x04CF);  
+  mCyrillicLatinConfusables.Insert(0x043C);  
+  mCyrillicLatinConfusables.Insert(0x043E);  
+  mCyrillicLatinConfusables.Insert(0x0440);  
+  mCyrillicLatinConfusables.Insert(
+      0x0517);  
+  mCyrillicLatinConfusables.Insert(0x051B);  
+  mCyrillicLatinConfusables.Insert(0x0455);  
+  mCyrillicLatinConfusables.Insert(0x051D);  
+  mCyrillicLatinConfusables.Insert(0x0445);  
+  mCyrillicLatinConfusables.Insert(0x0443);  
+  mCyrillicLatinConfusables.Insert(
+      0x044A);  
+  mCyrillicLatinConfusables.Insert(
+      0x044C);  
+  mCyrillicLatinConfusables.Insert(
+      0x04BD);  
+  mCyrillicLatinConfusables.Insert(0x043F);  
+  mCyrillicLatinConfusables.Insert(0x0433);  
+  mCyrillicLatinConfusables.Insert(0x0475);  
+  mCyrillicLatinConfusables.Insert(0x0461);  
+}
+
+void nsIDNService::InitThaiLatinConfusables() {
+#if defined(XP_LINUX) && !0
+  mThaiLatinConfusables.Insert(0x0E14);  
+  mThaiLatinConfusables.Insert(0x0E17);  
+  mThaiLatinConfusables.Insert(0x0E19);  
+  mThaiLatinConfusables.Insert(0x0E1B);  
+  mThaiLatinConfusables.Insert(0x0E21);  
+  mThaiLatinConfusables.Insert(0x0E25);  
+  mThaiLatinConfusables.Insert(0x0E2B);  
+#endif
+
+  mThaiLatinConfusables.Insert(0x0E1A);  
+  mThaiLatinConfusables.Insert(0x0E1E);  
+  mThaiLatinConfusables.Insert(0x0E1F);  
+  mThaiLatinConfusables.Insert(0x0E23);  
+  mThaiLatinConfusables.Insert(0x0E40);  
+  mThaiLatinConfusables.Insert(0x0E41);  
+  mThaiLatinConfusables.Insert(0x0E50);  
+}
+
+nsIDNService::nsIDNService() { MOZ_ASSERT(NS_IsMainThread()); }
+
+nsIDNService::~nsIDNService() = default;
+
+NS_IMETHODIMP nsIDNService::DomainToASCII(const nsACString& input,
+                                          nsACString& ace) {
+  return NS_DomainToASCII(input, ace);
+}
+
+NS_IMETHODIMP nsIDNService::ConvertUTF8toACE(const nsACString& input,
+                                             nsACString& ace) {
+  return NS_DomainToASCIIAllowAnyGlyphfulASCII(input, ace);
+}
+
+NS_IMETHODIMP nsIDNService::ConvertACEtoUTF8(const nsACString& input,
+                                             nsACString& _retval) {
+  return NS_DomainToUnicodeAllowAnyGlyphfulASCII(input, _retval);
+}
+
+NS_IMETHODIMP nsIDNService::DomainToDisplay(const nsACString& input,
+                                            nsACString& _retval) {
+  nsresult rv = NS_DomainToDisplay(input, _retval);
+  return rv;
+}
+
+NS_IMETHODIMP nsIDNService::ConvertToDisplayIDN(const nsACString& input,
+                                                nsACString& _retval) {
+  nsresult rv = NS_DomainToDisplayAllowAnyGlyphfulASCII(input, _retval);
+  return rv;
+}
+
+
+namespace mozilla::net {
+
+enum ScriptCombo : int32_t {
+  UNSET = -1,
+  BOPO = 0,
+  CYRL = 1,
+  GREK = 2,
+  HANG = 3,
+  HANI = 4,
+  HIRA = 5,
+  KATA = 6,
+  LATN = 7,
+  OTHR = 8,
+  JPAN = 9,   
+  CHNA = 10,  
+  KORE = 11,  
+  HNLT = 12,  
+  FAIL = 13,
+};
+
+enum class LookalikeStatus { Ignore, Safe, Block };
+
+class MOZ_STACK_CLASS LookalikeStatusChecker {
+ public:
+  LookalikeStatusChecker(nsTHashSet<char32_t>& aConfusables,
+                         mozilla::Span<const char32_t>& aTLD, Script aTLDScript,
+                         bool aValidTLD)
+      : mConfusables(aConfusables),
+        mStatus(aValidTLD ? LookalikeStatus::Ignore : LookalikeStatus::Safe),
+        mTLDMatchesScript(doesTLDScriptMatch(aTLD, aTLDScript)),
+        mTLDScript(aTLDScript) {}
+
+  explicit LookalikeStatusChecker(nsTHashSet<char32_t>& aConfusables)
+      : mConfusables(aConfusables), mStatus(LookalikeStatus::Safe) {}
+
+  virtual void CheckCharacter(char32_t aChar, Script aScript) {
+    if (mStatus != LookalikeStatus::Ignore && !mTLDMatchesScript &&
+        aScript == mTLDScript) {
+      mStatus = mConfusables.Contains(aChar) ? LookalikeStatus::Block
+                                             : LookalikeStatus::Ignore;
+    }
+  }
+
+  virtual LookalikeStatus Status() { return mStatus; }
+
+ protected:
+  nsTHashSet<char32_t>& mConfusables;
+
+  LookalikeStatus mStatus;
+
+  bool doesTLDScriptMatch(mozilla::Span<const char32_t>& aTLD, Script aScript) {
+    mozilla::Span<const char32_t>::const_iterator current = aTLD.cbegin();
+    mozilla::Span<const char32_t>::const_iterator end = aTLD.cend();
+
+    while (current != end) {
+      char32_t ch = *current++;
+      if (UnicodeProperties::GetScriptCode(ch) == aScript) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+ private:
+  bool mTLDMatchesScript{false};
+
+  Script mTLDScript{Script::INVALID};
+};
+
+class DigitLookalikeStatusChecker : public LookalikeStatusChecker {
+ public:
+  explicit DigitLookalikeStatusChecker(nsTHashSet<char32_t>& aConfusables)
+      : LookalikeStatusChecker(aConfusables) {}
+
+  void CheckCharacter(char32_t aChar, Script aScript) override {
+    if (mStatus == LookalikeStatus::Ignore) {
+      return;
+    }
+
+    if (!ISDIGIT(aChar)) {
+      mStatus = mConfusables.Contains(aChar) ? LookalikeStatus::Block
+                                             : LookalikeStatus::Ignore;
+    }
+  }
+};
+
+}  
+
+bool nsIDNService::IsLabelSafe(mozilla::Span<const char32_t> aLabel,
+                               mozilla::Span<const char32_t> aTLD) {
+  if (StaticPrefs::network_IDN_show_punycode()) {
+    return false;
+  }
+
+  if (!isOnlySafeChars(aLabel, mIDNBlocklist)) {
+    return false;
+  }
+
+  if (TLDStartsWith(aTLD, "xn--")) {
+    return false;
+  }
+
+  mozilla::Span<const char32_t>::const_iterator current = aLabel.cbegin();
+  mozilla::Span<const char32_t>::const_iterator end = aLabel.cend();
+
+  Script lastScript = Script::INVALID;
+  char32_t previousChar = 0;
+  char32_t baseChar = 0;  
+  char32_t savedNumberingSystem = 0;
+
+  DigitLookalikeStatusChecker digitStatusChecker(mDigitConfusables);
+  LookalikeStatusChecker cyrillicStatusChecker(mCyrillicLatinConfusables, aTLD,
+                                               Script::CYRILLIC,
+                                               isCyrillicDomain(aTLD));
+  LookalikeStatusChecker thaiStatusChecker(
+      mThaiLatinConfusables, aTLD, Script::THAI, TLDEqualsLiteral(aTLD, "th"));
+
+
+  ScriptCombo savedScript = ScriptCombo::UNSET;
+
+  while (current != end) {
+    char32_t ch = *current++;
+
+    IdentifierType idType = GetIdentifierType(ch);
+    if (idType == IDTYPE_RESTRICTED) {
+      return false;
+    }
+    MOZ_ASSERT(idType == IDTYPE_ALLOWED);
+
+    Script script = UnicodeProperties::GetScriptCode(ch);
+    if (script != Script::COMMON && script != Script::INHERITED &&
+        script != lastScript) {
+      if (illegalScriptCombo(script, savedScript)) {
+        return false;
+      }
+    }
+
+
+    if (ch == 0x30fc && lastScript != Script::HIRAGANA &&
+        lastScript != Script::KATAKANA) {
+      return false;
+    }
+
+    Script nextScript = Script::INVALID;
+    if (current != end) {
+      nextScript = UnicodeProperties::GetScriptCode(*current);
+    }
+
+    if (ch >= 0x3078 && ch <= 0x307A &&
+        (lastScript == Script::KATAKANA || nextScript == Script::KATAKANA)) {
+      return false;
+    }
+    if (ch >= 0x30D8 && ch <= 0x30DA &&
+        (lastScript == Script::HIRAGANA || nextScript == Script::HIRAGANA)) {
+      return false;
+    }
+    if ((ch == 0x30FD || ch == 0x30FE) && lastScript != Script::KATAKANA) {
+      return false;
+    }
+
+    if (isCJKSlashConfusable(ch) && aLabel.Length() > 1 &&
+        lastScript != Script::HAN && lastScript != Script::HIRAGANA &&
+        lastScript != Script::KATAKANA && nextScript != Script::HAN &&
+        nextScript != Script::HIRAGANA && nextScript != Script::KATAKANA) {
+      return false;
+    }
+
+    if (ch == 0x30FB &&
+        (lastScript == Script::LATIN || nextScript == Script::LATIN)) {
+      return false;
+    }
+
+    if (ch >= 0x300 && ch <= 0x339 && lastScript != Script::LATIN &&
+        lastScript != Script::GREEK && lastScript != Script::CYRILLIC) {
+      return false;
+    }
+
+    if (ch == 0x307 &&
+        (previousChar == 'i' || previousChar == 'j' || previousChar == 'l')) {
+      return false;
+    }
+
+    if (ch == 0xB7 && (!TLDEqualsLiteral(aTLD, "cat") || previousChar != 'l' ||
+                       current == end || *current != 'l')) {
+      return false;
+    }
+
+    if ((ch == 0xFE || ch == 0xF0) && !TLDEqualsLiteral(aTLD, "is") &&
+        !TLDEqualsLiteral(aTLD, "fo")) {
+      return false;
+    }
+
+    if (ch == 0x259 && !TLDEqualsLiteral(aTLD, "az")) {
+      return false;
+    }
+
+    if (ch == 0x2BB || ch == 0x2BC) {
+      return false;
+    }
+
+    digitStatusChecker.CheckCharacter(ch, script);
+    cyrillicStatusChecker.CheckCharacter(ch, script);
+    thaiStatusChecker.CheckCharacter(ch, script);
+
+    if (isCJKIdeograph(ch)) {
+      if (lastScript != Script::BOPOMOFO && lastScript != Script::HIRAGANA &&
+          lastScript != Script::KATAKANA && lastScript != Script::HAN &&
+          previousChar && !ISDIGIT(previousChar)) {
+        return false;
+      }
+      if (nextScript != Script::BOPOMOFO && nextScript != Script::HIRAGANA &&
+          nextScript != Script::KATAKANA && nextScript != Script::HAN &&
+          current != aLabel.end() && !ISDIGIT(*current)) {
+        return false;
+      }
+    }
+
+    auto genCat = GetGeneralCategory(ch);
+    if (genCat == HB_UNICODE_GENERAL_CATEGORY_DECIMAL_NUMBER) {
+      uint32_t zeroCharacter =
+          ch - mozilla::intl::UnicodeProperties::GetNumericValue(ch);
+      if (savedNumberingSystem == 0) {
+        savedNumberingSystem = zeroCharacter;
+      } else if (zeroCharacter != savedNumberingSystem) {
+        return false;
+      }
+    }
+
+    if (genCat == HB_UNICODE_GENERAL_CATEGORY_NON_SPACING_MARK) {
+      if (previousChar != 0 && previousChar == ch) {
+        return false;
+      }
+      if (lastScript != Script::INVALID) {
+        UnicodeProperties::ScriptExtensionVector scripts;
+        auto extResult = UnicodeProperties::GetExtensions(ch, scripts);
+        MOZ_ASSERT(extResult.isOk());
+        if (extResult.isErr()) {
+          return false;
+        }
+
+        int nScripts = AssertedCast<int>(scripts.length());
+
+        if (nScripts > 1 || (Script(scripts[0]) != Script::COMMON &&
+                             Script(scripts[0]) != Script::INHERITED)) {
+          while (--nScripts >= 0) {
+            if (Script(scripts[nScripts]) == lastScript) {
+              break;
+            }
+          }
+          if (nScripts == -1) {
+            return false;
+          }
+        }
+      }
+      if (baseChar == 0x0131 &&
+          ((ch >= 0x0300 && ch <= 0x0314) || ch == 0x031a)) {
+        return false;
+      }
+    } else {
+      baseChar = ch;
+    }
+
+    if (script != Script::COMMON && script != Script::INHERITED) {
+      lastScript = script;
+    }
+
+
+    previousChar = ch;
+  }
+  return digitStatusChecker.Status() != LookalikeStatus::Block &&
+         (!StaticPrefs::network_idn_punycode_cyrillic_confusables() ||
+          cyrillicStatusChecker.Status() != LookalikeStatus::Block) &&
+         thaiStatusChecker.Status() != LookalikeStatus::Block;
+}
+
+static inline ScriptCombo findScriptIndex(Script aScript) {
+  switch (aScript) {
+    case Script::BOPOMOFO:
+      return ScriptCombo::BOPO;
+    case Script::CYRILLIC:
+      return ScriptCombo::CYRL;
+    case Script::GREEK:
+      return ScriptCombo::GREK;
+    case Script::HANGUL:
+      return ScriptCombo::HANG;
+    case Script::HAN:
+      return ScriptCombo::HANI;
+    case Script::HIRAGANA:
+      return ScriptCombo::HIRA;
+    case Script::KATAKANA:
+      return ScriptCombo::KATA;
+    case Script::LATIN:
+      return ScriptCombo::LATN;
+    default:
+      return ScriptCombo::OTHR;
+  }
+}
+
+static const ScriptCombo scriptComboTable[13][9] = {
+     {BOPO, FAIL, FAIL, FAIL, CHNA, FAIL, FAIL, CHNA, FAIL},
+     {FAIL, CYRL, FAIL, FAIL, FAIL, FAIL, FAIL, FAIL, FAIL},
+     {FAIL, FAIL, GREK, FAIL, FAIL, FAIL, FAIL, FAIL, FAIL},
+     {FAIL, FAIL, FAIL, HANG, KORE, FAIL, FAIL, KORE, FAIL},
+     {CHNA, FAIL, FAIL, KORE, HANI, JPAN, JPAN, HNLT, FAIL},
+     {FAIL, FAIL, FAIL, FAIL, JPAN, HIRA, JPAN, JPAN, FAIL},
+     {FAIL, FAIL, FAIL, FAIL, JPAN, JPAN, KATA, JPAN, FAIL},
+     {CHNA, FAIL, FAIL, KORE, HNLT, JPAN, JPAN, LATN, OTHR},
+     {FAIL, FAIL, FAIL, FAIL, FAIL, FAIL, FAIL, OTHR, FAIL},
+     {FAIL, FAIL, FAIL, FAIL, JPAN, JPAN, JPAN, JPAN, FAIL},
+     {CHNA, FAIL, FAIL, FAIL, CHNA, FAIL, FAIL, CHNA, FAIL},
+     {FAIL, FAIL, FAIL, KORE, KORE, FAIL, FAIL, KORE, FAIL},
+     {CHNA, FAIL, FAIL, KORE, HNLT, JPAN, JPAN, HNLT, FAIL}};
+
+bool nsIDNService::illegalScriptCombo(Script script, ScriptCombo& savedScript) {
+  if (savedScript == ScriptCombo::UNSET) {
+    savedScript = findScriptIndex(script);
+    return false;
+  }
+
+  savedScript = scriptComboTable[savedScript][findScriptIndex(script)];
+
+  return savedScript == OTHR || savedScript == FAIL;
+}
+
+extern "C" MOZ_EXPORT bool mozilla_net_is_label_safe(const char32_t* aLabel,
+                                                     size_t aLabelLen,
+                                                     const char32_t* aTld,
+                                                     size_t aTldLen) {
+  return static_cast<nsIDNService*>(nsStandardURL::GetIDNService())
+      ->IsLabelSafe(mozilla::Span<const char32_t>(aLabel, aLabelLen),
+                    mozilla::Span<const char32_t>(aTld, aTldLen));
+}
+
+bool nsIDNService::isCJKSlashConfusable(char32_t aChar) {
+  return mCJKSlashConfusables.Contains(aChar);
+}
+
+bool nsIDNService::isCJKIdeograph(char32_t aChar) {
+  return mCJKIdeographs.Contains(aChar);
+}

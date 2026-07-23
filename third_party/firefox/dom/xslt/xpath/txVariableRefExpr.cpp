@@ -1,0 +1,47 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsAtom.h"
+#include "nsGkAtoms.h"
+#include "txExpr.h"
+#include "txIXPathContext.h"
+#include "txNodeSet.h"
+
+
+VariableRefExpr::VariableRefExpr(nsAtom* aPrefix, nsAtom* aLocalName,
+                                 int32_t aNSID)
+    : mPrefix(aPrefix), mLocalName(aLocalName), mNamespace(aNSID) {
+  NS_ASSERTION(mLocalName, "VariableRefExpr without local name?");
+  if (mPrefix == nsGkAtoms::_empty) mPrefix = nullptr;
+}
+
+nsresult VariableRefExpr::evaluate(txIEvalContext* aContext,
+                                   txAExprResult** aResult) {
+  nsresult rv = aContext->getVariable(mNamespace, mLocalName, *aResult);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  return NS_OK;
+}
+
+TX_IMPL_EXPR_STUBS_0(VariableRefExpr, ANY_RESULT)
+
+bool VariableRefExpr::isSensitiveTo(ContextSensitivity aContext) {
+  return !!(aContext & VARIABLES_CONTEXT);
+}
+
+#ifdef TX_TO_STRING
+void VariableRefExpr::toString(nsAString& aDest) {
+  aDest.Append(char16_t('$'));
+  if (mPrefix) {
+    nsAutoString prefix;
+    mPrefix->ToString(prefix);
+    aDest.Append(prefix);
+    aDest.Append(char16_t(':'));
+  }
+  nsAutoString lname;
+  mLocalName->ToString(lname);
+  aDest.Append(lname);
+}
+#endif

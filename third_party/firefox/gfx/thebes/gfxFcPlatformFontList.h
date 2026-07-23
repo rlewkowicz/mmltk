@@ -1,0 +1,355 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFXFCPLATFORMFONTLIST_H_
+#define GFXFCPLATFORMFONTLIST_H_
+
+#include "gfxFT2FontBase.h"
+#include "gfxPlatformFontList.h"
+#include "mozilla/FontPropertyTypes.h"
+#include "mozilla/RefPtr.h"
+#include "nsClassHashtable.h"
+
+#include <fontconfig/fontconfig.h>
+#include "ft2build.h"
+#include FT_FREETYPE_H
+#include FT_TRUETYPE_TABLES_H
+#include FT_MULTIPLE_MASTERS_H
+
+
+namespace mozilla {
+namespace dom {
+class SystemFontListEntry;
+class SystemFontList;
+class SystemFontOptions;
+};  
+
+template <>
+class RefPtrTraits<FcPattern> {
+ public:
+  static void Release(FcPattern* ptr) { FcPatternDestroy(ptr); }
+  static void AddRef(FcPattern* ptr) { FcPatternReference(ptr); }
+};
+
+template <>
+class RefPtrTraits<FcConfig> {
+ public:
+  static void Release(FcConfig* ptr) { FcConfigDestroy(ptr); }
+  static void AddRef(FcConfig* ptr) { FcConfigReference(ptr); }
+};
+
+}  
+
+namespace std {
+template <>
+struct default_delete<FcFontSet> {
+  void operator()(FcFontSet* aPtr) { FcFontSetDestroy(aPtr); }
+};
+
+template <>
+struct default_delete<FcObjectSet> {
+  void operator()(FcObjectSet* aPtr) { FcObjectSetDestroy(aPtr); }
+};
+
+}  
+
+
+class gfxFontconfigFontEntry final : public gfxFT2FontEntryBase {
+  friend class gfxFcPlatformFontList;
+  using FTUserFontData = mozilla::gfx::FTUserFontData;
+
+ public:
+  explicit gfxFontconfigFontEntry(const nsACString& aFaceName,
+                                  FcPattern* aFontPattern,
+                                  bool aIgnoreFcCharmap);
+
+  explicit gfxFontconfigFontEntry(const nsACString& aFaceName,
+                                  WeightRange aWeight, StretchRange aStretch,
+                                  SlantStyleRange aStyle,
+                                  RefPtr<mozilla::gfx::SharedFTFace>&& aFace);
+
+  explicit gfxFontconfigFontEntry(const nsACString& aFaceName,
+                                  FcPattern* aFontPattern, WeightRange aWeight,
+                                  StretchRange aStretch,
+                                  SlantStyleRange aStyle);
+
+  gfxFontEntry* Clone() const override;
+
+  AutoHBFace GetHBFace() override;
+
+  FcPattern* GetPattern() { return mFontPattern; }
+
+  nsresult ReadCMAP(FontInfoData* aFontInfoData = nullptr) override;
+  bool TestCharacterMap(uint32_t aCh) override;
+
+  mozilla::gfx::SharedFTFace* GetFTFace();
+  FTUserFontData* GetUserFontData() override;
+
+  FT_MM_Var* GetMMVar() override;
+
+  bool HasVariations() override;
+  void GetVariationAxes(nsTArray<gfxFontVariationAxis>& aAxes) override;
+  void GetVariationInstances(
+      nsTArray<gfxFontVariationInstance>& aInstances) override;
+
+  bool HasFontTable(uint32_t aTableTag) override;
+  nsresult CopyFontTable(uint32_t aTableTag, nsTArray<uint8_t>&) override;
+  hb_blob_t* GetFontTable(uint32_t aTableTag) override;
+  FontTableCache* GetFontTableCache(bool aCreate) override {
+    return mFontTableCache;
+  };
+
+  double GetAspect(uint8_t aSizeAdjustBasis);
+
+ protected:
+  virtual ~gfxFontconfigFontEntry();
+
+  gfxFont* CreateFontInstance(const gfxFontStyle* aFontStyle) override;
+
+  void GetUserFontFeatures(FcPattern* aPattern);
+
+  RefPtr<FcPattern> mFontPattern;
+
+  mozilla::Atomic<mozilla::gfx::SharedFTFace*> mFTFace;
+  mozilla::Atomic<bool> mFTFaceInitialized;
+
+  mozilla::Atomic<hb_face_t*> mHBFace;
+
+  mozilla::Atomic<FontTableCache*> mFontTableCache;
+
+  bool mIgnoreFcCharmap;
+
+  enum class HasVariationsState : int8_t {
+    Uninitialized = -1,
+    No = 0,
+    Yes = 1,
+  };
+  std::atomic<HasVariationsState> mHasVariations =
+      HasVariationsState::Uninitialized;
+
+  class UnscaledFontCache {
+   public:
+    already_AddRefed<mozilla::gfx::UnscaledFontFontconfig> Lookup(
+        const std::string& aFile, uint32_t aIndex);
+
+    void Add(const RefPtr<mozilla::gfx::UnscaledFontFontconfig>& aUnscaledFont);
+
+   private:
+    static const size_t kNumEntries = 3;
+    mozilla::ThreadSafeWeakPtr<mozilla::gfx::UnscaledFontFontconfig>
+        mUnscaledFonts[kNumEntries];
+    mozilla::Atomic<int32_t> mGenerations[kNumEntries];
+    mozilla::Atomic<int32_t> mLastGeneration{0};
+  };
+
+  UnscaledFontCache mUnscaledFontCache;
+
+  FT_MM_Var* mMMVar = nullptr;
+  bool mMMVarInitialized = false;
+};
+
+class gfxFontconfigFontFamily final : public gfxFontFamily {
+ public:
+  gfxFontconfigFontFamily(const nsACString& aName, FontVisibility aVisibility)
+      : gfxFontFamily(aName, aVisibility),
+        mContainsAppFonts(false),
+        mHasNonScalableFaces(false),
+        mForceScalable(false) {}
+
+  template <typename Func>
+  void AddFacesToFontList(Func aAddPatternFunc);
+
+  void FindStyleVariationsLocked(FontInfoData* aFontInfoData = nullptr)
+      MOZ_REQUIRES(mLock) override;
+
+  void AddFontPattern(FcPattern* aFontPattern, bool aSingleName);
+
+  void SetFamilyContainsAppFonts(bool aContainsAppFonts) {
+    mContainsAppFonts = aContainsAppFonts;
+  }
+
+  void FindAllFontsForStyle(const gfxFontStyle& aFontStyle,
+                            nsTArray<gfxFontEntry*>& aFontEntryList,
+                            bool aIgnoreSizeTolerance) override;
+
+  bool FilterForFontList(nsAtom* aLangGroup,
+                         const nsACString& aGeneric) const final {
+    return SupportsLangGroup(aLangGroup);
+  }
+
+ protected:
+  virtual ~gfxFontconfigFontFamily();
+
+  bool SupportsLangGroup(nsAtom* aLangGroup) const;
+
+  nsTArray<RefPtr<FcPattern>> mFontPatterns;
+
+  uint32_t mUniqueNameFaceCount = 0;
+  bool mContainsAppFonts : 1;
+  bool mHasNonScalableFaces : 1;
+  bool mForceScalable : 1;
+};
+
+class gfxFontconfigFont final : public gfxFT2FontBase {
+ public:
+  gfxFontconfigFont(
+      const RefPtr<mozilla::gfx::UnscaledFontFontconfig>& aUnscaledFont,
+      RefPtr<mozilla::gfx::SharedFTFace>&& aFTFace, FcPattern* aPattern,
+      gfxFloat aAdjustedSize, gfxFontEntry* aFontEntry,
+      const gfxFontStyle* aFontStyle, int aLoadFlags, bool aEmbolden);
+
+  FontType GetType() const override { return FONT_TYPE_FONTCONFIG; }
+  FcPattern* GetPattern() const { return mPattern; }
+
+  already_AddRefed<mozilla::gfx::ScaledFont> GetScaledFont(
+      const TextRunDrawParams& aRunParams) override;
+
+  bool ShouldHintMetrics() const override;
+
+ private:
+  ~gfxFontconfigFont() override;
+
+  RefPtr<FcPattern> mPattern;
+};
+
+class gfxFcPlatformFontList final : public gfxPlatformFontList {
+  using FontPatternListEntry = mozilla::dom::SystemFontListEntry;
+
+ public:
+  gfxFcPlatformFontList();
+
+  static gfxFcPlatformFontList* PlatformFontList() {
+    return static_cast<gfxFcPlatformFontList*>(
+        gfxPlatformFontList::PlatformFontList());
+  }
+
+  nsresult InitFontListForPlatform() MOZ_REQUIRES(mLock) override;
+  void InitSharedFontListForPlatform() MOZ_REQUIRES(mLock) override;
+
+  void GetFontList(nsAtom* aLangGroup, const nsACString& aGenericFamily,
+                   nsTArray<nsString>& aListOfFonts) override;
+
+  void ReadSystemFontList(mozilla::dom::SystemFontList*);
+
+  already_AddRefed<gfxFontEntry> CreateFontEntry(
+      mozilla::fontlist::Face* aFace,
+      const mozilla::fontlist::Family* aFamily) override;
+
+  already_AddRefed<gfxFontEntry> LookupLocalFont(
+      FontVisibilityProvider* aFontVisibilityProvider,
+      const nsACString& aFontName, WeightRange aWeightForEntry,
+      StretchRange aStretchForEntry, SlantStyleRange aStyleForEntry) override;
+
+  already_AddRefed<gfxFontEntry> MakePlatformFont(
+      const nsACString& aFontName, WeightRange aWeightForEntry,
+      StretchRange aStretchForEntry, SlantStyleRange aStyleForEntry,
+      const uint8_t* aFontData, uint32_t aLength) override;
+
+  bool FindAndAddFamiliesLocked(
+      FontVisibilityProvider* aFontVisibilityProvider,
+      mozilla::StyleGenericFontFamily aGeneric, const nsACString& aFamily,
+      nsTArray<FamilyAndGeneric>* aOutput, FindFamiliesFlags aFlags,
+      gfxFontStyle* aStyle = nullptr, nsAtom* aLanguage = nullptr,
+      gfxFloat aDevToCssSize = 1.0) MOZ_REQUIRES(mLock) override;
+
+  bool GetStandardFamilyName(const nsCString& aFontName,
+                             nsACString& aFamilyName) override;
+
+  FcConfig* GetLastConfig() const { return mLastConfig; }
+
+  void AddGenericFonts(FontVisibilityProvider* aFontVisibilityProvider,
+                       mozilla::StyleGenericFontFamily, nsAtom* aLanguage,
+                       nsTArray<FamilyAndGeneric>& aFamilyList) override;
+
+  void ClearLangGroupPrefFontsLocked() MOZ_REQUIRES(mLock) override;
+
+  void ClearGenericMappings() {
+    AutoLock lock(mLock);
+    ClearGenericMappingsLocked();
+  }
+  void ClearGenericMappingsLocked() MOZ_REQUIRES(mLock) {
+    mGenericMappings.Clear();
+  }
+
+  void GetSampleLangForGroup(nsAtom* aLanguage, nsACString& aLangStr);
+
+ protected:
+  virtual ~gfxFcPlatformFontList();
+
+  nsTArray<std::pair<const char**, uint32_t>> GetFilteredPlatformFontLists()
+      override;
+
+  struct SandboxPolicy {};
+
+  void AddFontSetFamilies(FcFontSet* aFontSet, const SandboxPolicy* aPolicy,
+                          bool aAppFonts) MOZ_REQUIRES(mLock);
+
+  void AddPatternToFontList(FcPattern* aFont, FcChar8*& aLastFamilyName,
+                            nsACString& aFamilyName,
+                            RefPtr<gfxFontconfigFontFamily>& aFontFamily,
+                            bool aAppFonts) MOZ_REQUIRES(mLock);
+
+  PrefFontList* FindGenericFamilies(
+      FontVisibilityProvider* aFontVisibilityProvider,
+      const nsCString& aGeneric, nsAtom* aLanguage) MOZ_REQUIRES(mLock);
+
+  bool PrefFontListsUseOnlyGenerics() MOZ_REQUIRES(mLock);
+
+  static void CheckFontUpdates(nsITimer* aTimer, void* aThis);
+
+  FontFamily GetDefaultFontForPlatform(
+      FontVisibilityProvider* aFontVisibilityProvider,
+      const gfxFontStyle* aStyle, nsAtom* aLanguage = nullptr)
+      MOZ_REQUIRES(mLock) override;
+
+  FontVisibility GetVisibilityForFamily(const nsACString& aName) const;
+
+  already_AddRefed<gfxFontFamily> CreateFontFamily(
+      const nsACString& aName, FontVisibility aVisibility) const override;
+
+  bool TryLangForGroup(const nsACString& aOSLang, nsAtom* aLangGroup,
+                       nsACString& aLang);
+
+#ifdef MOZ_BUNDLED_FONTS
+  void ActivateBundledFonts();
+  nsCString mBundledFontsPath;
+  bool mBundledFontsInitialized;
+#endif
+
+  nsTHashMap<nsCString, RefPtr<FcPattern>> mLocalNames;
+
+  nsClassHashtable<nsCStringHashKey, PrefFontList> mGenericMappings;
+
+  nsTHashMap<nsCStringHashKey, nsTArray<FamilyAndGeneric>> mFcSubstituteCache;
+
+  nsCOMPtr<nsITimer> mCheckFontUpdatesTimer;
+  RefPtr<FcConfig> mLastConfig;
+
+#ifdef MOZ_WIDGET_GTK
+  cairo_font_options_t* mSystemFontOptions = nullptr;
+  int32_t mFreetypeLcdSetting = -1;  
+
+  void ClearSystemFontOptions();
+
+  bool UpdateSystemFontOptions();
+
+  void UpdateSystemFontOptionsFromIpc(const mozilla::dom::SystemFontOptions&);
+  void SystemFontOptionsToIpc(mozilla::dom::SystemFontOptions&);
+
+ public:
+  void SubstituteSystemFontOptions(FcPattern*);
+
+ private:
+#endif
+
+  RefPtr<nsAtom> mPrevLanguage;
+  nsCString mSampleLang;
+  bool mUseCustomLookups = false;
+
+  bool mAlwaysUseFontconfigGenerics;
+
+  static FT_Library sFTLibrary;
+};
+
+#endif /* GFXPLATFORMFONTLIST_H_ */

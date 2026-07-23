@@ -1,0 +1,35 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+XPIDL_MODULE = "toolkit_processtools"
+
+XPCOM_MANIFESTS += [
+    "components.conf",
+]
+
+XPIDL_SOURCES += [
+    "nsIProcessToolsService.idl",
+]
+
+EXPORTS.mozilla += [
+    "ProcInfo.h",
+    "ProcInfo_linux.h",
+]
+
+EXPORTS += [
+    "ProcessToolsService.h",
+]
+
+UNIFIED_SOURCES += [
+    "ProcessToolsService.cpp",
+    "ProcInfo_common.cpp",
+]
+
+FINAL_LIBRARY = "xul"
+
+# Platform-specific implementations of `ProcInfo`.
+toolkit = CONFIG["MOZ_WIDGET_TOOLKIT"]
+UNIFIED_SOURCES += ["ProcInfo_linux.cpp"]
+
+include("/ipc/chromium/chromium-config.mozbuild")

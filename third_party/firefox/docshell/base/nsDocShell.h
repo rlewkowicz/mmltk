@@ -1,0 +1,892 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsDocShell_h_
+#define nsDocShell_h_
+
+#include "Units.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/NotNull.h"
+#include "mozilla/Result.h"
+#include "mozilla/ScrollbarPreferences.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/NavigationBinding.h"
+#include "mozilla/dom/SessionHistoryEntry.h"
+#include "mozilla/dom/WindowProxyHolder.h"
+#include "nsCOMPtr.h"
+#include "nsCharsetSource.h"
+#include "nsDocLoader.h"
+#include "nsIAuthPromptProvider.h"
+#include "nsIBaseWindow.h"
+#include "nsIDocShell.h"
+#include "nsIDocShellTreeItem.h"
+#include "nsIDocumentViewer.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsILoadContext.h"
+#include "nsINetworkInterceptController.h"
+#include "nsIRefreshURI.h"
+#include "nsIWebNavigation.h"
+#include "nsIWebPageDescriptor.h"
+#include "nsIWebProgressListener.h"
+#include "nsPoint.h"  // mCurrent/mDefaultScrollbarPreferences
+#include "nsRect.h"
+#include "nsString.h"
+#include "nsThreadUtils.h"
+#include "prtime.h"
+
+
+namespace mozilla {
+class Encoding;
+class HTMLEditor;
+class ObservedDocShell;
+class ScrollContainerFrame;
+enum class TaskCategory;
+class PresShell;
+namespace dom {
+class ClientInfo;
+class ClientSource;
+class EventTarget;
+class WindowGlobalChild;
+enum class NavigationHistoryBehavior : uint8_t;
+struct NavigationAPIMethodTracker;
+class SessionHistoryInfo;
+struct LoadingSessionHistoryInfo;
+struct Wireframe;
+}  
+namespace net {
+class LoadInfo;
+class DocumentLoadListener;
+}  
+}  
+
+class nsIController;
+class nsIDocShellTreeOwner;
+class nsIDocumentViewer;
+class nsIHttpChannel;
+class nsIMutableArray;
+class nsIPolicyContainer;
+class nsIPrompt;
+class nsIStringBundle;
+class nsIURIFixup;
+class nsIURIFixupInfo;
+class nsIURILoader;
+class nsIWebBrowserFind;
+class nsIWidget;
+class nsIReferrerInfo;
+class nsIOpenWindowInfo;
+
+class nsBrowserStatusFilter;
+class nsCommandManager;
+class nsDocShellEditorData;
+class nsDOMNavigationTiming;
+class nsDSURIContentListener;
+class nsGlobalWindowOuter;
+
+class FramingChecker;
+class OnLinkClickEvent;
+
+enum ViewMode { viewNormal = 0x0, viewSource = 0x1 };
+
+enum eCharsetReloadState {
+  eCharsetReloadInit,
+  eCharsetReloadRequested,
+  eCharsetReloadStopOrigional
+};
+
+struct SameDocumentNavigationState;
+
+class nsDocShell final : public nsDocLoader,
+                         public nsIDocShell,
+                         public nsIWebNavigation,
+                         public nsIBaseWindow,
+                         public nsIRefreshURI,
+                         public nsIWebProgressListener,
+                         public nsIWebPageDescriptor,
+                         public nsIAuthPromptProvider,
+                         public nsILoadContext,
+                         public nsINetworkInterceptController,
+                         public mozilla::SupportsWeakPtr {
+ public:
+  enum InternalLoad : uint32_t {
+    INTERNAL_LOAD_FLAGS_NONE = 0x0,
+    INTERNAL_LOAD_FLAGS_INHERIT_PRINCIPAL = 0x1,
+    INTERNAL_LOAD_FLAGS_DONT_SEND_REFERRER = 0x2,
+    INTERNAL_LOAD_FLAGS_ALLOW_THIRD_PARTY_FIXUP = 0x4,
+
+    INTERNAL_LOAD_FLAGS_FIRST_LOAD = 0x8,
+
+    INTERNAL_LOAD_FLAGS_LOADURI_SETUP_FLAGS = 0xf,
+
+    INTERNAL_LOAD_FLAGS_BYPASS_CLASSIFIER = 0x10,
+    INTERNAL_LOAD_FLAGS_FORCE_ALLOW_COOKIES = 0x20,
+
+    INTERNAL_LOAD_FLAGS_IS_SRCDOC = 0x40,
+
+    INTERNAL_LOAD_FLAGS_ORIGINAL_FRAME_SRC = 0x80,
+
+    INTERNAL_LOAD_FLAGS_NO_OPENER = 0x100,
+
+    INTERNAL_LOAD_FLAGS_FORCE_ALLOW_DATA_URI = 0x200,
+
+    INTERNAL_LOAD_FLAGS_BYPASS_LOAD_URI_DELEGATE = 0x2000,
+  };
+
+  class InterfaceRequestorProxy : public nsIInterfaceRequestor {
+   public:
+    explicit InterfaceRequestorProxy(nsIInterfaceRequestor* aRequestor);
+    NS_DECL_THREADSAFE_ISUPPORTS
+    NS_DECL_NSIINTERFACEREQUESTOR
+
+   private:
+    virtual ~InterfaceRequestorProxy();
+    InterfaceRequestorProxy() = default;
+    nsWeakPtr mWeakPtr;
+  };
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(nsDocShell, nsDocLoader)
+  NS_DECL_NSIDOCSHELL
+  NS_DECL_NSIDOCSHELLTREEITEM
+  NS_DECL_NSIWEBNAVIGATION
+  NS_DECL_NSIBASEWINDOW
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSIWEBPROGRESSLISTENER
+  NS_DECL_NSIREFRESHURI
+  NS_DECL_NSIWEBPAGEDESCRIPTOR
+  NS_DECL_NSIAUTHPROMPTPROVIDER
+  NS_DECL_NSINETWORKINTERCEPTCONTROLLER
+
+  using nsIBaseWindow::GetMainWidget;
+
+  static already_AddRefed<nsDocShell> Create(
+      mozilla::dom::BrowsingContext* aBrowsingContext,
+      uint64_t aContentWindowID = 0);
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  Initialize(nsIOpenWindowInfo* aOpenWindowInfo,
+             mozilla::dom::WindowGlobalChild* aWindowActor);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY nsresult
+  InitWindow(nsIWidget* aParentWidget, int32_t aX, int32_t aY, int32_t aWidth,
+             int32_t aHeight, nsIOpenWindowInfo* aOpenWindowInfo,
+             mozilla::dom::WindowGlobalChild* aWindowActor);
+
+  NS_IMETHOD Stop() override {
+    return nsDocLoader::Stop();
+  }
+
+  mozilla::ScrollbarPreference ScrollbarPreference() const {
+    return mScrollbarPref;
+  }
+  void SetScrollbarPreference(mozilla::ScrollbarPreference);
+
+  const mozilla::CSSIntSize& GetFrameMargins() const { return mFrameMargins; }
+
+  bool UpdateFrameMargins(const mozilla::CSSIntSize& aMargins) {
+    if (mFrameMargins == aMargins) {
+      return false;
+    }
+    mFrameMargins = aMargins;
+    return true;
+  }
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult OnLinkClick(nsIContent* aContent, nsIURI* aURI,
+                       const nsAString& aTargetSpec, const nsAString& aFileName,
+                       nsIInputStream* aPostDataStream,
+                       nsIInputStream* aHeadersDataStream,
+                       bool aIsUserTriggered,
+                       mozilla::dom::UserNavigationInvolvement aUserInvolvement,
+                       nsIPrincipal* aTriggeringPrincipal,
+                       nsIPolicyContainer* aPolicyContainer);
+  nsresult OnFormSubmit(mozilla::dom::HTMLFormElement* aForm,
+                        nsDocShellLoadState* aLoadState);
+
+  nsresult OnOverLink(nsIContent* aContent, nsIURI* aURI,
+                      const nsAString& aTargetSpec);
+  nsresult OnLeaveLink();
+
+  NS_IMETHOD GetAssociatedWindow(mozIDOMWindowProxy**) override;
+  NS_IMETHOD GetTopWindow(mozIDOMWindowProxy**) override;
+  NS_IMETHOD GetTopFrameElement(mozilla::dom::Element**) override;
+  NS_IMETHOD GetIsContent(bool*) override;
+  NS_IMETHOD GetUsePrivateBrowsing(bool*) override;
+  NS_IMETHOD SetUsePrivateBrowsing(bool) override;
+  NS_IMETHOD SetPrivateBrowsing(bool) override;
+  NS_IMETHOD GetUseRemoteTabs(bool*) override;
+  NS_IMETHOD SetRemoteTabs(bool) override;
+  NS_IMETHOD GetUseRemoteSubframes(bool*) override;
+  NS_IMETHOD SetRemoteSubframes(bool) override;
+  NS_IMETHOD GetScriptableOriginAttributes(
+      JSContext*, JS::MutableHandle<JS::Value>) override;
+  NS_IMETHOD_(void)
+  GetOriginAttributes(mozilla::OriginAttributes& aAttrs) override;
+
+  void SetupRefreshURIFromHeader(mozilla::dom::Document* aDocument,
+                                 const nsAString& aHeader);
+
+  nsresult ForceRefreshURIFromTimer(nsIURI* aURI, nsIPrincipal* aPrincipal,
+                                    uint32_t aDelay, nsITimer* aTimer);
+
+  void FireDummyOnLocationChange() {
+    FireOnLocationChange(this, nullptr, mCurrentURI,
+                         LOCATION_CHANGE_SAME_DOCUMENT);
+  }
+
+  nsresult HistoryEntryRemoved(int32_t aIndex);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void NotifyAsyncPanZoomStarted();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void NotifyAsyncPanZoomStopped();
+
+  void SetInFrameSwap(bool aInSwap) { mInFrameSwap = aInSwap; }
+  bool InFrameSwap();
+
+  bool GetForcedAutodetection() { return mForcedAutodetection; }
+
+  void ResetForcedAutodetection() { mForcedAutodetection = false; }
+
+  mozilla::HTMLEditor* GetHTMLEditorInternal();
+  nsresult SetHTMLEditorInternal(mozilla::HTMLEditor* aHTMLEditor);
+
+  nsresult CharsetChangeReloadDocument(
+      mozilla::NotNull<const mozilla::Encoding*> aEncoding, int32_t aSource);
+  nsresult CharsetChangeStopDocumentLoad();
+
+  nsDOMNavigationTiming* GetNavigationTiming() const;
+
+  nsresult SetOriginAttributes(const mozilla::OriginAttributes& aAttrs);
+
+  const mozilla::OriginAttributes& GetOriginAttributes() {
+    return mBrowsingContext->OriginAttributesRef();
+  }
+
+  bool GetCreatedDynamically() const {
+    return mBrowsingContext && mBrowsingContext->CreatedDynamically();
+  }
+
+  mozilla::gfx::Matrix5x4* GetColorMatrix() { return mColorMatrix.get(); }
+
+  static bool SandboxFlagsImplyCookies(const uint32_t& aSandboxFlags);
+
+  static void CopyFavicon(nsIURI* aOldURI, nsIURI* aNewURI,
+                          bool aInPrivateBrowsing);
+
+  static nsDocShell* Cast(nsIDocShell* aDocShell) {
+    return static_cast<nsDocShell*>(aDocShell);
+  }
+
+  static bool CanLoadInParentProcess(nsIURI* aURI);
+
+  bool IsForceReloading();
+
+  mozilla::dom::WindowProxyHolder GetWindowProxy() {
+    EnsureScriptEnvironment();
+    return mozilla::dom::WindowProxyHolder(mBrowsingContext);
+  }
+
+  nsPIDOMWindowInner* GetActiveWindow();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsresult InternalLoad(
+      nsDocShellLoadState* aLoadState,
+      mozilla::Maybe<uint32_t> aCacheKey = mozilla::Nothing());
+
+  void MaybeRestoreWindowName();
+
+  void StoreWindowNameToSHEntries();
+
+  void SetWillChangeProcess() { mWillChangeProcess = true; }
+  bool WillChangeProcess() { return mWillChangeProcess; }
+
+  static nsresult CreateRealChannelForDocument(
+      nsIChannel** aChannel, nsIURI* aURI, nsILoadInfo* aLoadInfo,
+      nsIInterfaceRequestor* aCallbacks, nsLoadFlags aLoadFlags,
+      const nsAString& aSrcdoc, nsIURI* aBaseURI);
+
+  static bool CreateAndConfigureRealChannelForLoadState(
+      mozilla::dom::BrowsingContext* aBrowsingContext,
+      nsDocShellLoadState* aLoadState, mozilla::net::LoadInfo* aLoadInfo,
+      nsIInterfaceRequestor* aCallbacks, nsDocShell* aDocShell,
+      const mozilla::OriginAttributes& aOriginAttributes,
+      nsLoadFlags aLoadFlags, uint32_t aCacheKey, nsresult& rv,
+      nsIChannel** aChannel);
+
+  static already_AddRefed<nsIURI> AttemptURIFixup(
+      nsIChannel* aChannel, nsresult aStatus,
+      const mozilla::Maybe<nsCString>& aOriginalURIString, uint32_t aLoadType,
+      bool aIsTopFrame, bool aAllowKeywordFixup, bool aUsePrivateBrowsing,
+      bool aNotifyKeywordSearchLoading = false,
+      nsIInputStream** aNewPostData = nullptr,
+      nsILoadInfo::SchemelessInputType* outSchemelessInput = nullptr);
+
+  static already_AddRefed<nsIURI> MaybeFixBadCertDomainErrorURI(
+      nsIChannel* aChannel, nsIURI* aUrl);
+
+  static nsresult FilterStatusForErrorPage(
+      nsresult aStatus, nsIChannel* aChannel, uint32_t aLoadType,
+      bool aIsTopFrame, bool aUseErrorPages,
+      bool* aSkippedUnknownProtocolNavigation = nullptr);
+
+  static void MaybeNotifyKeywordSearchLoading(const nsString& aProviderId,
+                                              const nsString& aKeyword);
+
+  nsDocShell* GetInProcessChildAt(int32_t aIndex);
+
+  static bool ShouldAddURIVisit(nsIChannel* aChannel);
+
+  static void ExtractLastVisit(nsIChannel* aChannel, nsIURI** aURI,
+                               uint32_t* aChannelRedirectFlags);
+
+  bool HasDocumentViewer() const { return !!mDocumentViewer; }
+
+  static uint32_t ComputeURILoaderFlags(
+      mozilla::dom::BrowsingContext* aBrowsingContext, uint32_t aLoadType,
+      bool aIsDocumentLoad = true);
+
+  mozilla::dom::SessionHistoryInfo* GetActiveSessionHistoryInfo() const;
+
+  void SetLoadingSessionHistoryInfo(
+      const mozilla::dom::LoadingSessionHistoryInfo& aLoadingInfo,
+      bool aNeedToReportActiveAfterLoadingBecomesActive = false);
+  const mozilla::dom::LoadingSessionHistoryInfo*
+  GetLoadingSessionHistoryInfo() {
+    return mLoadingEntry.get();
+  }
+
+  already_AddRefed<nsIInputStream> GetPostDataFromCurrentEntry() const;
+  mozilla::Maybe<uint32_t> GetCacheKeyFromCurrentEntry() const;
+
+  bool FillLoadStateFromCurrentEntry(nsDocShellLoadState& aLoadState);
+
+  mozilla::dom::ChildSHistory* GetSessionHistory() {
+    return mBrowsingContext->GetChildSessionHistory();
+  }
+
+  bool IsLoadingFromSessionHistory();
+
+  NS_IMETHODIMP OnStartRequest(nsIRequest* aRequest) override;
+  NS_IMETHODIMP OnStopRequest(nsIRequest* aRequest,
+                              nsresult aStatusCode) override;
+
+ private:  
+  friend class nsAppShellService;
+  friend class nsDSURIContentListener;
+  friend class FramingChecker;
+  friend class OnLinkClickEvent;
+  friend class nsIDocShell;
+  friend class mozilla::dom::BrowsingContext;
+  friend class mozilla::net::DocumentLoadListener;
+  friend class nsGlobalWindowOuter;
+
+  nsDocShell(mozilla::dom::BrowsingContext* aBrowsingContext,
+             uint64_t aContentWindowID);
+
+  static inline uint32_t PRTimeToSeconds(PRTime aTimeUsec) {
+    return uint32_t(aTimeUsec / PR_USEC_PER_SEC);
+  }
+
+  virtual ~nsDocShell();
+
+
+  virtual void DestroyChildren() override;
+
+  virtual void OnRedirectStateChange(nsIChannel* aOldChannel,
+                                     nsIChannel* aNewChannel,
+                                     uint32_t aRedirectFlags,
+                                     uint32_t aStateFlags) override;
+
+  virtual nsresult SetDocLoaderParent(nsDocLoader* aLoader) override;
+
+
+  bool VerifyDocumentViewer();
+
+  void DestroyDocumentViewer();
+
+  MOZ_CAN_RUN_SCRIPT nsresult CreateInitialDocumentViewer(
+      nsIOpenWindowInfo* aOpenWindowInfo = nullptr,
+      mozilla::dom::WindowGlobalChild* aWindowActor = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT nsresult CreateAboutBlankDocumentViewer(
+      nsIPrincipal* aPrincipal, nsIPrincipal* aPartitionedPrincipal,
+      nsIPolicyContainer* aPolicyContainer, nsIURI* aBaseURI,
+      bool aIsInitialDocument,
+      const mozilla::Maybe<nsILoadInfo::CrossOriginEmbedderPolicy>& aCOEP =
+          mozilla::Nothing(),
+      bool aTryToSaveOldPresentation = true, bool aCheckPermitUnload = true,
+      mozilla::dom::WindowGlobalChild* aActor = nullptr);
+
+  nsresult CreateDocumentViewer(const nsACString& aContentType,
+                                nsIRequest* aRequest,
+                                nsIStreamListener** aContentHandler);
+
+  nsresult NewDocumentViewerObj(const nsACString& aContentType,
+                                nsIRequest* aRequest, nsILoadGroup* aLoadGroup,
+                                nsIStreamListener** aContentHandler,
+                                nsIDocumentViewer** aViewer);
+
+  already_AddRefed<nsILoadURIDelegate> GetLoadURIDelegate();
+
+  nsresult SetupNewViewer(
+      nsIDocumentViewer* aNewViewer,
+      mozilla::dom::WindowGlobalChild* aWindowActor = nullptr);
+
+  nsresult ComputeNamedTargetBrowsingContext(nsDocShellLoadState* aLoadState);
+
+  nsresult OnLinkClickSync(nsIContent* aContent,
+                           nsDocShellLoadState* aLoadState,
+                           bool aNoOpenerImplied,
+                           nsIPrincipal* aTriggeringPrincipal);
+  mozilla::Result<RefPtr<OnLinkClickEvent>, nsresult> OnLinkClickWithLoadState(
+      nsIContent* aContent, nsDocShellLoadState* aLoadState,
+      bool aNoOpenerImplied, nsIPrincipal* aTriggeringPrincipal);
+
+
+  void UpdateActiveEntry(
+      bool aReplace, const mozilla::Maybe<nsPoint>& aPreviousScrollPos,
+      nsIURI* aURI, nsIURI* aOriginalURI, nsIReferrerInfo* aReferrerInfo,
+      nsIPrincipal* aTriggeringPrincipal, nsIPolicyContainer* aPolicyContainer,
+      const nsAString& aTitle, bool aScrollRestorationIsManual,
+      nsIStructuredCloneContainer* aData, bool aURIWasModified);
+
+  static nsresult ReloadDocument(
+      nsDocShell* aDocShell, mozilla::dom::Document* aDocument,
+      uint32_t aLoadType, mozilla::dom::BrowsingContext* aBrowsingContext,
+      nsIURI* aCurrentURI, nsIReferrerInfo* aReferrerInfo,
+      bool aNotifiedBeforeUnloadListeners = false);
+
+ public:
+  bool ShouldDoInitialAboutBlankSyncLoad(nsIURI* aURI,
+                                         nsDocShellLoadState* aLoadState,
+                                         nsIPrincipal* aPrincipalToInherit);
+
+  void UnsuppressPaintingIfNoNavigationAwayFromAboutBlank(
+      mozilla::PresShell* aPresShell);
+
+  bool HasStartedLoadingOtherThanInitialBlankURI();
+
+ private:
+
+  MOZ_CAN_RUN_SCRIPT nsresult DoURILoad(nsDocShellLoadState* aLoadState,
+                                        mozilla::Maybe<uint32_t> aCacheKey,
+                                        nsIRequest** aRequest);
+
+  MOZ_CAN_RUN_SCRIPT nsresult PerformTrustedTypesPreNavigationCheck(
+      nsDocShellLoadState* aLoadState, nsGlobalWindowInner* aWindow) const;
+
+  MOZ_CAN_RUN_SCRIPT nsresult CompleteInitialAboutBlankLoad(
+      nsDocShellLoadState* aLoadState, nsILoadInfo* aLoadInfo);
+
+  static nsresult AddHeadersToChannel(nsIInputStream* aHeadersData,
+                                      nsIChannel* aChannel);
+
+  nsresult OpenInitializedChannel(nsIChannel* aChannel,
+                                  nsIURILoader* aURILoader,
+                                  uint32_t aOpenFlags);
+  nsresult OpenRedirectedChannel(nsDocShellLoadState* aLoadState);
+
+  void UpdateMixedContentChannelForNewLoad(nsIChannel* aChannel);
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult ScrollToAnchor(bool aCurHasRef, bool aNewHasRef,
+                          nsACString& aNewHash, uint32_t aLoadType);
+
+  uint32_t GetLoadTypeForFormSubmission(
+      mozilla::dom::BrowsingContext* aTargetBC,
+      nsDocShellLoadState* aLoadState);
+
+ private:
+  bool OnNewURI(nsIURI* aURI, nsIChannel* aChannel,
+                nsIPrincipal* aTriggeringPrincipal,
+                nsIPrincipal* aPrincipalToInherit,
+                nsIPrincipal* aPartitionedPrincipalToInherit,
+                nsIPolicyContainer* aPolicyContainer, bool aAddToGlobalHistory,
+                bool aCloneSHChildren);
+
+ public:
+  mozilla::Maybe<mozilla::dom::Wireframe> GetWireframe();
+
+  bool CollectWireframe();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsresult EndPageLoad(nsIWebProgress* aProgress, nsIChannel* aChannel,
+                       nsresult aResult);
+
+  nsresult LoadErrorPage(nsIURI* aURI, const char16_t* aURL,
+                         const char* aErrorPage, const char* aErrorType,
+                         const char16_t* aDescription, const char* aCSSClass,
+                         nsIChannel* aFailedChannel);
+
+  nsresult LoadErrorPage(nsIURI* aErrorURI, nsIURI* aFailedURI,
+                         nsIChannel* aFailedChannel);
+
+  bool DisplayLoadError(nsresult aError, nsIURI* aURI, const char16_t* aURL,
+                        nsIChannel* aFailedChannel) {
+    bool didDisplayLoadError = false;
+    DisplayLoadError(aError, aURI, aURL, aFailedChannel, &didDisplayLoadError);
+    return didDisplayLoadError;
+  }
+
+  void DisplayRestrictedContentError();
+
+
+  nsIPrincipal* GetInheritedPrincipal(
+      bool aConsiderCurrentDocument,
+      bool aConsiderPartitionedPrincipal = false);
+
+  static void SaveLastVisit(nsIChannel* aChannel, nsIURI* aURI,
+                            uint32_t aChannelRedirectFlags);
+
+  void AddURIVisit(nsIURI* aURI, nsIURI* aPreviousURI,
+                   uint32_t aChannelRedirectFlags, uint32_t aResponseStatus = 0,
+                   bool aIsPost = false);
+
+  static void InternalAddURIVisit(
+      nsIURI* aURI, nsIURI* aPreviousURI, uint32_t aChannelRedirectFlags,
+      uint32_t aResponseStatus, mozilla::dom::BrowsingContext* aBrowsingContext,
+      nsIWidget* aWidget, uint32_t aLoadType, bool aWasUpgraded,
+      bool aIsPost = false);
+
+  static already_AddRefed<nsIURIFixupInfo> KeywordToURI(
+      const nsACString& aKeyword, bool aIsPrivateContext);
+
+  void SetDocCurrentStateObj(mozilla::dom::SessionHistoryInfo* aInfo);
+
+  bool SetCurrentURI(nsIURI* aURI, nsIRequest* aRequest,
+                     bool aFireOnLocationChange, bool aIsInitialAboutBlank,
+                     uint32_t aLocationFlags);
+
+
+
+  void DoGetPositionAndSize(int32_t* aX, int32_t* aY, int32_t* aWidth,
+                            int32_t* aHeight);
+
+  bool IsOKToLoadURI(nsIURI* aURI);
+
+  nsresult GetControllerForCommand(const char* aCommand,
+                                   nsIController** aResult);
+
+  void MaybeCreateInitialClientSource(nsIPrincipal* aPrincipal = nullptr);
+
+  void MaybeInheritController(mozilla::dom::ClientSource* aClientSource,
+                              nsIPrincipal* aPrincipal);
+
+  bool ServiceWorkerAllowedToControlWindow(nsIPrincipal* aPrincipal,
+                                           nsIURI* aURI);
+
+  mozilla::Maybe<mozilla::dom::ClientInfo> GetInitialClientInfo() const;
+
+  [[nodiscard]] bool MaybeInitTiming();
+  void MaybeResetInitTiming(bool aReset);
+
+  already_AddRefed<nsDocShell> GetInProcessParentDocshell();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void FirePageHideNotificationInternal(
+      bool aSkipCheckingDynEntries);
+
+  void ThawFreezeNonRecursive(bool aThaw);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void FirePageHideShowNonRecursive(bool aShow);
+
+  nsresult Dispatch(already_AddRefed<nsIRunnable> aRunnable);
+
+  static bool ShouldUpdateGlobalHistory(uint32_t aLoadType);
+  void UpdateGlobalHistoryTitle(nsIURI* aURI);
+  bool IsSubframe() { return mBrowsingContext->IsSubframe(); }
+  bool CanSetOriginAttributes();
+  bool ShouldBlockLoadingForBackButton();
+  static bool ShouldDiscardLayoutState(nsIHttpChannel* aChannel);
+  bool HasUnloadedParent();
+  bool JustStartedNetworkLoad();
+  bool NavigationBlockedByPrinting(bool aDisplayErrorDialog = true);
+  bool IsNavigationAllowed(bool aDisplayPrintErrorDialog = true,
+                           bool aCheckIfUnloadFired = true);
+  mozilla::ScrollContainerFrame* GetRootScrollContainerFrame();
+  nsIChannel* GetCurrentDocChannel();
+  nsresult EnsureScriptEnvironment();
+  nsresult EnsureEditorData();
+  nsresult EnsureTransferableHookData();
+  nsresult EnsureFind();
+  nsresult EnsureCommandHandler();
+  nsresult RefreshURIFromQueue();
+  void RefreshURIToQueue();
+  nsresult Embed(nsIDocumentViewer* aDocumentViewer,
+                 mozilla::dom::WindowGlobalChild* aWindowActor,
+                 bool aIsTransientAboutBlank, nsIRequest* aRequest,
+                 nsIURI* aPreviousURI);
+  nsPresContext* GetEldestPresContext();
+  nsresult CheckLoadingPermissions();
+
+  MOZ_CAN_RUN_SCRIPT
+  void MaybeFireTraverseHistory(nsDocShellLoadState* aLoadState);
+  MOZ_CAN_RUN_SCRIPT
+  nsIDocumentViewer::PermitUnloadResult MaybeFireTraversableTraverseHistory(
+      nsDocShellLoadState* aLoadState,
+      mozilla::Maybe<mozilla::dom::UserNavigationInvolvement> aUserInvolvement);
+
+  nsresult LoadHistoryEntry(
+      const mozilla::dom::LoadingSessionHistoryInfo& aEntry, uint32_t aLoadType,
+      bool aUserActivation, bool aNotifiedBeforeUnloadListeners,
+      bool aIsResumingInterceptedNavigation);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsresult LoadHistoryEntry(nsDocShellLoadState* aLoadState, uint32_t aLoadType,
+                            bool aLoadingCurrentEntry);
+  nsresult GetHttpChannel(nsIChannel* aChannel, nsIHttpChannel** aReturn);
+  nsresult ConfirmRepost(bool* aRepost);
+  nsresult GetPromptAndStringBundle(nsIPrompt** aPrompt,
+                                    nsIStringBundle** aStringBundle);
+  nsresult SetCurScrollPosEx(int32_t aCurHorizontalPos,
+                             int32_t aCurVerticalPos);
+  nsPoint GetCurScrollPos();
+
+  void RestoreScrollPositionFromTargetSessionHistoryInfo(
+      mozilla::dom::SessionHistoryInfo* aTarget);
+
+  already_AddRefed<mozilla::dom::ChildSHistory> GetRootSessionHistory();
+
+  bool CSSErrorReportingEnabled() const { return mCSSErrorReportingEnabled; }
+
+  bool MaybeHandleSubframeHistory(nsDocShellLoadState* aLoadState,
+                                  bool aContinueHandlingSubframeHistory);
+
+  nsresult PerformRetargeting(nsDocShellLoadState* aLoadState);
+
+  nsContentPolicyType DetermineContentType();
+
+  void UnblockEmbedderLoadEventForFailure(bool aFireFrameErrorEvent = false);
+
+  bool IsSameDocumentNavigation(nsDocShellLoadState* aLoadState,
+                                SameDocumentNavigationState& aState);
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult HandleSameDocumentNavigation(nsDocShellLoadState* aLoadState,
+                                        SameDocumentNavigationState& aState,
+                                        bool& aSameDocument);
+
+  uint32_t GetSameDocumentNavigationFlags(nsIURI* aNewURI);
+
+  void NotifyPrivateBrowsingChanged();
+
+  void SetLoadGroupDefaultLoadFlags(nsLoadFlags aLoadFlags);
+
+  void SetTitleOnHistoryEntry(bool aUpdateEntryInSessionHistory);
+
+  void SetScrollRestorationIsManualOnHistoryEntry(bool aIsManual);
+
+  void SetCacheKeyOnHistoryEntry(uint32_t aCacheKey);
+
+  nsresult CheckDisallowedJavascriptLoad(nsDocShellLoadState* aLoadState);
+
+  nsresult LoadURI(nsDocShellLoadState* aLoadState, bool aSetNavigating,
+                   bool aContinueHandlingSubframeHistory);
+
+  void MoveLoadingToActiveEntry(bool aExpired, uint32_t aCacheKey,
+                                nsIURI* aPreviousURI);
+
+  void ActivenessMaybeChanged();
+
+  bool NoopenerForceEnabled();
+
+  bool ShouldOpenInBlankTarget(const nsAString& aOriginalTarget,
+                               nsIURI* aLinkURI, nsIContent* aContent,
+                               bool aIsUserTriggered);
+
+  void RecordSingleChannelId(bool aStartRequest, nsIRequest* aRequest);
+
+  void SetChannelToDisconnectOnPageHide(uint64_t aChannelId) {
+    MOZ_ASSERT(mChannelToDisconnectOnPageHide == 0);
+    mChannelToDisconnectOnPageHide = aChannelId;
+  }
+  void MaybeDisconnectChildListenersOnPageHide();
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult UpdateURLAndHistory(
+      mozilla::dom::Document* aDocument, nsIURI* aNewURI,
+      nsIStructuredCloneContainer* aData,
+      mozilla::dom::NavigationHistoryBehavior aHistoryHandling,
+      nsIURI* aCurrentURI, bool aEqualURIs, bool aFiredNavigateEvent = true);
+
+  bool IsSameDocumentAsActiveEntry(
+      const mozilla::dom::SessionHistoryInfo& aSHInfo);
+
+  using nsIWebNavigation::Reload;
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult ReloadNavigable(
+      mozilla::Maybe<mozilla::NotNull<JSContext*>> aCx, uint32_t aReloadFlags,
+      nsIStructuredCloneContainer* aNavigationAPIState = nullptr,
+      mozilla::dom::UserNavigationInvolvement aUserInvolvement =
+          mozilla::dom::UserNavigationInvolvement::None,
+      mozilla::dom::NavigationAPIMethodTracker* aNavigationAPIMethodTracker =
+          nullptr);
+
+  MOZ_CAN_RUN_SCRIPT
+  void InformNavigationAPIAboutAbortingNavigation();
+
+ private:
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void InformNavigationAPIAboutChildNavigableDestruction();
+
+  enum class OngoingNavigation : uint8_t { NavigationID, Traversal };
+  enum class UnsetOngoingNavigation : bool { No, Yes };
+  MOZ_CAN_RUN_SCRIPT
+  nsresult StopInternal(uint32_t aStopFlags,
+                        UnsetOngoingNavigation aUnsetOngoingNavigation);
+
+  MOZ_CAN_RUN_SCRIPT
+  void SetOngoingNavigation(
+      const mozilla::Maybe<OngoingNavigation>& aOngoingNavigation);
+
+  void SetCurrentURIInternal(nsIURI* aURI);
+
+  void StopPendingJavascriptURLNavigations();
+
+  already_AddRefed<nsIWebProgressListener> BCWebProgressListener();
+
+  nsString mTitle;
+  nsCString mOriginalUriString;
+  nsTObserverArray<nsWeakPtr> mPrivacyObservers;
+  nsTObserverArray<nsWeakPtr> mReflowObservers;
+  nsTObserverArray<nsWeakPtr> mScrollObservers;
+  mozilla::UniquePtr<mozilla::dom::ClientSource> mInitialClientSource;
+  nsCOMPtr<nsINetworkInterceptController> mInterceptController;
+  RefPtr<nsDOMNavigationTiming> mTiming;
+  RefPtr<nsDSURIContentListener> mContentListener;
+  RefPtr<nsGlobalWindowOuter> mScriptGlobal;
+  nsCOMPtr<nsIPrincipal> mParentCharsetPrincipal;
+  nsCOMPtr<nsIMutableArray> mRefreshURIList;
+  nsCOMPtr<nsIMutableArray> mSavedRefreshURIList;
+  nsCOMPtr<nsIMutableArray> mBFCachedRefreshURIList;
+  uint64_t mContentWindowID;
+  nsCOMPtr<nsIDocumentViewer> mDocumentViewer;
+  nsCOMPtr<nsIWidget> mParentWidget;
+  RefPtr<mozilla::dom::ChildSHistory> mSessionHistory;
+  nsCOMPtr<nsIWebBrowserFind> mFind;
+  RefPtr<nsCommandManager> mCommandManager;
+  RefPtr<mozilla::dom::BrowsingContext> mBrowsingContext;
+  RefPtr<nsBrowserStatusFilter> mBCWebProgressStatusFilter;
+
+  nsWeakPtr mBrowserChild;
+
+  mozilla::LayoutDeviceIntRect mBounds;
+
+  nsCString mContentTypeHint;
+
+  nsCOMPtr<nsIURI> mCurrentURI;
+  nsCOMPtr<nsIReferrerInfo> mReferrerInfo;
+
+#ifdef DEBUG
+  static unsigned long gNumberOfDocShells;
+
+  nsCOMPtr<nsIURI> mLastOpenedURI;
+#endif
+
+  mozilla::Maybe<OngoingNavigation> mOngoingNavigation;
+
+  mozilla::UniquePtr<mozilla::dom::SessionHistoryInfo> mActiveEntry;
+  bool mActiveEntryIsLoadingFromSessionHistory = false;
+  mozilla::UniquePtr<mozilla::dom::LoadingSessionHistoryInfo> mLoadingEntry;
+
+  mozilla::UniquePtr<nsDocShellEditorData> mEditorData;
+
+  nsCOMPtr<nsIURI> mLoadingURI;
+
+  nsCOMPtr<nsIURI> mFailedURI;
+  nsCOMPtr<nsIChannel> mFailedChannel;
+
+  mozilla::WeakPtr<OnLinkClickEvent> mPlannedFormNavigation;
+
+  mozilla::UniquePtr<mozilla::gfx::Matrix5x4> mColorMatrix;
+
+  const mozilla::Encoding* mParentCharset;
+
+
+  nsIDocShellTreeOwner* mTreeOwner;  
+
+  RefPtr<mozilla::dom::EventTarget> mChromeEventHandler;
+
+  mozilla::ScrollbarPreference mScrollbarPref;  
+
+  eCharsetReloadState mCharsetReloadState;
+
+  int32_t mParentCharsetSource;
+  mozilla::CSSIntSize mFrameMargins;
+
+  const int32_t mItemType;
+
+  int32_t mPreviousEntryIndex;
+  int32_t mLoadedEntryIndex;
+
+  BusyFlags mBusyFlags;
+  AppType mAppType;
+  uint32_t mLoadType;
+  uint32_t mFailedLoadType;
+
+  mozilla::Maybe<uint64_t> mSingleChannelId;
+  uint32_t mRequestForBlockingFromBFCacheCount = 0;
+
+  uint64_t mChannelToDisconnectOnPageHide;
+
+  uint32_t mPendingReloadCount = 0;
+
+  bool mCreatingDocument;  
+#ifdef DEBUG
+  bool mInEnsureScriptEnv;
+  uint64_t mDocShellID = 0;
+#endif
+
+  bool mInitialized : 1;
+  bool mAllowSubframes : 1;
+  bool mAllowMetaRedirects : 1;
+  bool mAllowImages : 1;
+  bool mAllowMedia : 1;
+  bool mAllowDNSPrefetch : 1;
+  bool mAllowWindowControl : 1;
+  bool mCSSErrorReportingEnabled : 1;
+  bool mAllowAuth : 1;
+  bool mAllowKeywordFixup : 1;
+  bool mDisableMetaRefreshWhenInactive : 1;
+  bool mIsAppTab : 1;
+  bool mWindowDraggingAllowed : 1;
+  bool mInFrameSwap : 1;
+
+  bool mFiredUnloadEvent : 1;
+
+  bool mEODForCurrentDocument : 1;
+  bool mURIResultedInDocument : 1;
+
+  bool mIsBeingDestroyed : 1;
+
+  bool mIsExecutingOnLoadHandler : 1;
+
+  bool mInvisible : 1;
+
+  bool mHasLoadedNonBlankURI : 1;
+
+  bool mHasStartedLoadingOtherThanInitialBlankURI : 1;
+
+  bool mBlankTiming : 1;
+
+  bool mTitleValidForCurrentURI : 1;
+
+  bool mWillChangeProcess : 1;
+
+  bool mIsNavigating : 1;
+
+  bool mForcedAutodetection : 1;
+
+  bool mCheckingSessionHistory : 1;
+
+  bool mNeedToReportActiveAfterLoadingBecomesActive : 1;
+};
+
+inline nsISupports* ToSupports(nsDocShell* aDocShell) {
+  return static_cast<nsIDocumentLoader*>(aDocShell);
+}
+
+#endif /* nsDocShell_h_ */

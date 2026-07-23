@@ -1,0 +1,83 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SMIL_SMILCOMPOSITOR_H_
+#define DOM_SMIL_SMILCOMPOSITOR_H_
+
+#include <memory>
+#include <utility>
+
+#include "NonCustomCSSPropertyId.h"
+#include "PLDHashTable.h"
+#include "SMILTargetIdentifier.h"
+#include "mozilla/SMILAnimationFunction.h"
+#include "mozilla/SMILCompositorTable.h"
+#include "nsString.h"
+#include "nsTHashtable.h"
+
+namespace mozilla {
+
+class ComputedStyle;
+
+
+class SMILCompositor : public PLDHashEntryHdr {
+ public:
+  using KeyType = SMILTargetIdentifier;
+  using KeyTypeRef = const KeyType&;
+  using KeyTypePointer = const KeyType*;
+
+  explicit SMILCompositor(KeyTypePointer aKey) : mKey(*aKey) {}
+  SMILCompositor(SMILCompositor&& toMove) noexcept
+      : PLDHashEntryHdr(std::move(toMove)),
+        mKey(std::move(toMove.mKey)),
+        mAnimationFunctions(std::move(toMove.mAnimationFunctions)) {}
+
+  KeyTypeRef GetKey() const { return mKey; }
+  bool KeyEquals(KeyTypePointer aKey) const;
+  static KeyTypePointer KeyToPointer(KeyTypeRef aKey) { return &aKey; }
+  static PLDHashNumber HashKey(KeyTypePointer aKey);
+  enum { ALLOW_MEMMOVE = false };
+
+  void AddAnimationFunction(SMILAnimationFunction* aFunc);
+
+  void ComposeAttribute(bool& aMightHavePendingStyleUpdates);
+
+  void ClearAnimationEffects();
+
+  void Traverse(nsCycleCollectionTraversalCallback* aCallback);
+
+  void ToggleForceCompositing() { mForceCompositing = true; }
+
+  void StealCachedBaseValue(SMILCompositor* aOther) {
+    mCachedBaseValue = std::move(aOther->mCachedBaseValue);
+  }
+
+  bool HasSameNumberOfAnimationFunctionsAs(const SMILCompositor& aOther) const {
+    return mAnimationFunctions.Length() == aOther.mAnimationFunctions.Length();
+  }
+
+ private:
+  std::unique_ptr<SMILAttr> CreateSMILAttr(
+      const ComputedStyle* aBaseComputedStyle);
+
+  NonCustomCSSPropertyId GetCSSPropertyToAnimate() const;
+
+  bool MightNeedBaseStyle() const;
+
+  uint32_t GetFirstFuncToAffectSandwich();
+
+  void UpdateCachedBaseValue(const SMILValue& aBaseValue);
+
+  KeyType mKey;
+
+  nsTArray<SMILAnimationFunction*> mAnimationFunctions;
+
+  SMILValue mCachedBaseValue;
+
+  bool mForceCompositing = false;
+};
+
+}  
+
+#endif  // DOM_SMIL_SMILCOMPOSITOR_H_

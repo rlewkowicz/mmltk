@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef XPCOM_BASE_CYCLECOLLECTORSTATS_H_
+#define XPCOM_BASE_CYCLECOLLECTORSTATS_H_
+
+#include <cstdint>
+#include "mozilla/TimeStamp.h"
+
+namespace mozilla {
+
+struct CycleCollectorStats {
+  static CycleCollectorStats* Get();
+
+  CycleCollectorStats();
+  void Clear();
+  void PrepareForCycleCollection(TimeStamp aNow);
+  void AfterPrepareForCycleCollectionSlice(TimeStamp aDeadline,
+                                           TimeStamp aBeginTime,
+                                           TimeStamp aMaybeAfterGCTime);
+  void AfterCycleCollectionSlice();
+  void AfterSyncForgetSkippable(TimeStamp beginTime);
+  void AfterForgetSkippable(TimeStamp aStartTime, TimeStamp aEndTime,
+                            uint32_t aRemovedPurples, bool aInIdle);
+  void AfterCycleCollection();
+
+
+  TimeStamp mBeginSliceTime;
+
+  TimeStamp mEndSliceTime;
+
+  TimeStamp mBeginTime;
+
+  TimeDuration mMaxGCDuration;
+
+  bool mRanSyncForgetSkippable = false;
+
+  uint32_t mSuspected = 0;
+
+  TimeDuration mMaxSkippableDuration;
+
+  TimeDuration mMaxSliceTime;
+
+  TimeDuration mMaxSliceTimeSinceClear;
+
+  TimeDuration mTotalSliceTime;
+
+  bool mAnyLockedOut = false;
+
+  FILE* mFile = nullptr;
+
+  TimeStamp mIdleDeadline;
+
+  TimeDuration mMinForgetSkippableTime;
+  TimeDuration mMaxForgetSkippableTime;
+  TimeDuration mTotalForgetSkippableTime;
+  uint32_t mForgetSkippableBeforeCC = 0;
+
+  uint32_t mRemovedPurples = 0;
+};
+
+}  
+
+#endif  // XPCOM_BASE_CYCLECOLLECTORSTATS_H_

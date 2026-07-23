@@ -1,0 +1,142 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_AtomicsObject_h
+#define builtin_AtomicsObject_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/TimeStamp.h"
+
+#include "threading/ConditionVariable.h"
+#include "threading/ProtectedData.h"  // js::ThreadData
+#include "vm/NativeObject.h"
+#include "vm/PlainObject.h"
+
+namespace js {
+
+class SharedArrayRawBuffer;
+
+class AtomicsObject : public NativeObject {
+ public:
+  static const JSClass class_;
+};
+
+enum class FutexWaiterKind { Sync, Async, ListHead };
+
+class FutexWaiter;
+class SyncFutexWaiter;
+class AsyncFutexWaiter;
+
+class FutexWaiterListNode {
+ private:
+  FutexWaiterListNode* next_ = nullptr;  
+  FutexWaiterListNode* prev_ = nullptr;  
+
+ protected:
+  explicit FutexWaiterListNode(FutexWaiterKind kind) : kind_(kind) {}
+  FutexWaiterKind kind_;
+
+ public:
+  FutexWaiter* toWaiter() {
+    MOZ_ASSERT(kind_ != FutexWaiterKind::ListHead);
+    return reinterpret_cast<FutexWaiter*>(this);
+  }
+
+  FutexWaiterKind kind() const { return kind_; }
+
+  FutexWaiterListNode* next() { return next_; }
+  void setNext(FutexWaiterListNode* next) { next_ = next; }
+  FutexWaiterListNode* prev() { return prev_; }
+  void setPrev(FutexWaiterListNode* prev) { prev_ = prev; }
+};
+
+class FutexWaiterListHead : public FutexWaiterListNode {
+ public:
+  FutexWaiterListHead() : FutexWaiterListNode(FutexWaiterKind::ListHead) {
+    setNext(this);
+    setPrev(this);
+  }
+  ~FutexWaiterListHead();
+};
+
+class FutexThread {
+  friend class AutoLockFutexAPI;
+
+ public:
+  [[nodiscard]] static bool initialize();
+  static void destroy();
+
+  static void lock();
+  static void unlock();
+
+  FutexThread();
+  [[nodiscard]] bool initInstance();
+  void destroyInstance();
+
+  enum NotifyReason {
+    NotifyExplicit,       
+    NotifyForJSInterrupt  
+  };
+
+  enum class WaitResult {
+    Error,     
+    NotEqual,  
+    OK,        
+    TimedOut   
+  };
+
+  [[nodiscard]] WaitResult wait(
+      JSContext* cx, js::UniqueLock<js::Mutex>& locked,
+      const mozilla::Maybe<mozilla::TimeDuration>& timeout);
+
+  void notify(NotifyReason reason);
+
+  bool isWaiting();
+
+  bool canWait() { return canWait_; }
+
+  void setCanWait(bool flag) { canWait_ = flag; }
+
+ private:
+  enum FutexState {
+    Idle,                         
+    Waiting,                      
+    WaitingNotifiedForInterrupt,  
+    WaitingInterrupted,           
+    Woken                         
+  };
+
+  js::ConditionVariable* cond_;
+
+  FutexState state_;
+
+  static mozilla::Atomic<js::Mutex*, mozilla::SequentiallyConsistent> lock_;
+
+  ThreadData<bool> canWait_;
+};
+
+[[nodiscard]] FutexThread::WaitResult atomics_wait_impl(
+    JSContext* cx, SharedArrayRawBuffer* sarb, size_t byteOffset, int32_t value,
+    const mozilla::Maybe<mozilla::TimeDuration>& timeout);
+
+[[nodiscard]] FutexThread::WaitResult atomics_wait_impl(
+    JSContext* cx, SharedArrayRawBuffer* sarb, size_t byteOffset, int64_t value,
+    const mozilla::Maybe<mozilla::TimeDuration>& timeout);
+
+[[nodiscard]] PlainObject* atomics_wait_async_impl(
+    JSContext* cx, SharedArrayRawBuffer* sarb, size_t byteOffset, int32_t value,
+    const mozilla::Maybe<mozilla::TimeDuration>& timeout);
+
+[[nodiscard]] PlainObject* atomics_wait_async_impl(
+    JSContext* cx, SharedArrayRawBuffer* sarb, size_t byteOffset, int64_t value,
+    const mozilla::Maybe<mozilla::TimeDuration>& timeout);
+
+[[nodiscard]] bool atomics_notify_impl(JSContext* cx,
+                                       SharedArrayRawBuffer* sarb,
+                                       size_t byteOffset, int64_t count,
+                                       int64_t* woken);
+
+} 
+
+#endif /* builtin_AtomicsObject_h */

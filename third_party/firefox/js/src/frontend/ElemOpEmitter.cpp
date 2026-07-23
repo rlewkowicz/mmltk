@@ -1,0 +1,208 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "frontend/ElemOpEmitter.h"
+
+#include "frontend/BytecodeEmitter.h"
+#include "frontend/SharedContext.h"
+#include "vm/Opcodes.h"
+#include "vm/ThrowMsgKind.h"  // ThrowMsgKind
+
+using namespace js;
+using namespace js::frontend;
+
+ElemOpEmitter::ElemOpEmitter(BytecodeEmitter* bce, Kind kind, ObjKind objKind)
+    : bce_(bce), kind_(kind), objKind_(objKind) {}
+
+bool ElemOpEmitter::prepareForObj() {
+  MOZ_ASSERT(state_ == State::Start);
+
+#ifdef DEBUG
+  state_ = State::Obj;
+#endif
+  return true;
+}
+
+bool ElemOpEmitter::prepareForKey() {
+  MOZ_ASSERT(state_ == State::Obj);
+
+  if (isCall()) {
+    if (!bce_->emit1(JSOp::Dup)) {
+      return false;
+    }
+  }
+
+#ifdef DEBUG
+  state_ = State::Key;
+#endif
+  return true;
+}
+
+bool ElemOpEmitter::emitGet() {
+  MOZ_ASSERT(state_ == State::Key);
+
+  if (isSuper()) {
+    if (!bce_->emitSuperBase()) {
+      return false;
+    }
+  }
+
+  if (isIncDec() || isCompoundAssignment()) {
+    if (isSuper()) {
+      if (!bce_->emit1(JSOp::Swap)) {
+        return false;
+      }
+      if (!bce_->emit1(JSOp::ToPropertyKey)) {
+        return false;
+      }
+      if (!bce_->emit1(JSOp::Swap)) {
+        return false;
+      }
+      if (!bce_->emitDupAt(2, 3)) {
+        return false;
+      }
+    } else {
+      if (!bce_->emit1(JSOp::ToPropertyKey)) {
+        return false;
+      }
+      if (!bce_->emit1(JSOp::Dup2)) {
+        return false;
+      }
+    }
+  }
+
+  JSOp op;
+  if (isSuper()) {
+    op = JSOp::GetElemSuper;
+  } else {
+    op = JSOp::GetElem;
+  }
+  if (!bce_->emitElemOpBase(op)) {
+    return false;
+  }
+  if (isCall()) {
+    if (!bce_->emit1(JSOp::Swap)) {
+      return false;
+    }
+  }
+
+#ifdef DEBUG
+  state_ = State::Get;
+#endif
+  return true;
+}
+
+bool ElemOpEmitter::prepareForRhs() {
+  MOZ_ASSERT(isSimpleAssignment() || isPropInit() || isCompoundAssignment());
+  MOZ_ASSERT_IF(isSimpleAssignment() || isPropInit(), state_ == State::Key);
+  MOZ_ASSERT_IF(isCompoundAssignment(), state_ == State::Get);
+
+  if (isSimpleAssignment() || isPropInit()) {
+    if (isSuper()) {
+      if (!bce_->emitSuperBase()) {
+        return false;
+      }
+    }
+  }
+
+#ifdef DEBUG
+  state_ = State::Rhs;
+#endif
+  return true;
+}
+
+bool ElemOpEmitter::emitDelete() {
+  MOZ_ASSERT(state_ == State::Key);
+  MOZ_ASSERT(isDelete());
+
+  if (isSuper()) {
+    if (!bce_->emitSuperBase()) {
+      return false;
+    }
+
+    if (!bce_->emit2(JSOp::ThrowMsg, uint8_t(ThrowMsgKind::CantDeleteSuper))) {
+      return false;
+    }
+
+    if (!bce_->emitPopN(2)) {
+      return false;
+    }
+  } else {
+    JSOp op = bce_->sc->strict() ? JSOp::StrictDelElem : JSOp::DelElem;
+    if (!bce_->emitElemOpBase(op)) {
+      return false;
+    }
+  }
+
+#ifdef DEBUG
+  state_ = State::Delete;
+#endif
+  return true;
+}
+
+bool ElemOpEmitter::emitAssignment() {
+  MOZ_ASSERT(isSimpleAssignment() || isPropInit() || isCompoundAssignment());
+  MOZ_ASSERT(state_ == State::Rhs);
+
+  MOZ_ASSERT_IF(isPropInit(), !isSuper());
+
+  JSOp setOp = isPropInit() ? JSOp::InitElem
+               : isSuper()  ? bce_->sc->strict() ? JSOp::StrictSetElemSuper
+                                                 : JSOp::SetElemSuper
+               : bce_->sc->strict() ? JSOp::StrictSetElem
+                                    : JSOp::SetElem;
+  if (!bce_->emitElemOpBase(setOp)) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::Assignment;
+#endif
+  return true;
+}
+
+bool ElemOpEmitter::emitIncDec(ValueUsage valueUsage) {
+  MOZ_ASSERT(state_ == State::Key);
+  MOZ_ASSERT(isIncDec());
+
+  if (!emitGet()) {
+    return false;
+  }
+
+  MOZ_ASSERT(state_ == State::Get);
+
+  JSOp incOp = isInc() ? JSOp::Inc : JSOp::Dec;
+  if (!bce_->emit1(JSOp::ToNumeric)) {
+    return false;
+  }
+  if (isPostIncDec() && valueUsage == ValueUsage::WantValue) {
+    if (!bce_->emit1(JSOp::Dup)) {
+      return false;
+    }
+    if (!bce_->emit2(JSOp::Unpick, 3 + isSuper())) {
+      return false;
+    }
+  }
+  if (!bce_->emit1(incOp)) {
+    return false;
+  }
+
+  JSOp setOp =
+      isSuper()
+          ? (bce_->sc->strict() ? JSOp::StrictSetElemSuper : JSOp::SetElemSuper)
+          : (bce_->sc->strict() ? JSOp::StrictSetElem : JSOp::SetElem);
+  if (!bce_->emitElemOpBase(setOp)) {
+    return false;
+  }
+  if (isPostIncDec() && valueUsage == ValueUsage::WantValue) {
+    if (!bce_->emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+#ifdef DEBUG
+  state_ = State::IncDec;
+#endif
+  return true;
+}

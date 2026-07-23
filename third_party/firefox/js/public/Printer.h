@@ -1,0 +1,401 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_Printer_h
+#define js_Printer_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/glue/Debug.h"
+#include "mozilla/Range.h"
+#include "mozilla/Vector.h"
+
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "js/TypeDecls.h"
+#include "js/Utility.h"
+
+
+namespace js {
+
+class LifoAlloc;
+
+class JS_PUBLIC_API GenericPrinter {
+ protected:
+  bool hadOOM_;  
+
+  constexpr GenericPrinter() : hadOOM_(false) {}
+
+ public:
+  virtual void put(const char* s, size_t len) = 0;
+  inline void put(const char* s) { put(s, strlen(s)); }
+  inline void put(mozilla::Span<const char> s) { put(s.data(), s.size()); };
+
+  virtual void put(mozilla::Span<const JS::Latin1Char> str);
+  virtual void put(mozilla::Span<const char16_t> str);
+
+  virtual inline void putChar(const char c) { put(&c, 1); }
+  virtual inline void putChar(const JS::Latin1Char c) { putChar(char(c)); }
+  virtual inline void putChar(const char16_t c) {
+    MOZ_CRASH("Use an EscapePrinter to handle all characters");
+  }
+
+  virtual void putString(JSContext* cx, JSString* str);
+
+  void printf(const char* fmt, ...) MOZ_FORMAT_PRINTF(2, 3);
+  void vprintf(const char* fmt, va_list ap) MOZ_FORMAT_PRINTF(2, 0);
+
+  virtual bool canPutFromIndex() const { return false; }
+
+  virtual void putFromIndex(size_t index, size_t length) {
+    MOZ_CRASH("Calls to putFromIndex should be guarded by canPutFromIndex.");
+  }
+
+  virtual size_t index() const { return 0; }
+
+  virtual void flush() {  }
+
+  virtual void setPendingOutOfMemory();
+
+  virtual bool hadOutOfMemory() const { return hadOOM_; }
+};
+
+class JS_PUBLIC_API StringPrinter : public GenericPrinter {
+ public:
+  struct InvariantChecker {
+    const StringPrinter* parent;
+
+    explicit InvariantChecker(const StringPrinter* p) : parent(p) {
+      parent->checkInvariants();
+    }
+
+    ~InvariantChecker() { parent->checkInvariants(); }
+  };
+
+  JSContext* maybeCx;
+
+ private:
+  static const size_t DefaultSize;
+#ifdef DEBUG
+  bool initialized;  
+#endif
+  bool shouldReportOOM;  
+  char* base;            
+  size_t size;           
+  ptrdiff_t offset;      
+
+  arena_id_t arena;
+
+ private:
+  [[nodiscard]] bool realloc_(size_t newSize);
+
+ protected:
+  explicit StringPrinter(arena_id_t arena, JSContext* maybeCx = nullptr,
+                         bool shouldReportOOM = true);
+  ~StringPrinter();
+
+  JS::UniqueChars releaseChars();
+  JSString* releaseJS(JSContext* cx);
+
+ public:
+  [[nodiscard]] bool init();
+
+  void checkInvariants() const;
+
+  char* reserve(size_t len);
+
+  virtual void put(const char* s, size_t len) final;
+  using GenericPrinter::put;  
+
+  virtual bool canPutFromIndex() const final { return true; }
+  virtual void putFromIndex(size_t index, size_t length) final {
+    MOZ_ASSERT(index <= this->index());
+    MOZ_ASSERT(index + length <= this->index());
+    put(base + index, length);
+  }
+  virtual size_t index() const final { return length(); }
+
+  virtual void putString(JSContext* cx, JSString* str) final;
+
+  size_t length() const;
+
+  void forwardOutOfMemory();
+};
+
+class JS_PUBLIC_API Sprinter : public StringPrinter {
+ public:
+  explicit Sprinter(JSContext* maybeCx = nullptr, bool shouldReportOOM = true)
+      : StringPrinter(js::MallocArena, maybeCx, shouldReportOOM) {}
+  ~Sprinter() {}
+
+  JS::UniqueChars release() { return releaseChars(); }
+};
+
+class JS_PUBLIC_API JSSprinter : public StringPrinter {
+ public:
+  explicit JSSprinter(JSContext* cx)
+      : StringPrinter(js::StringBufferArena, cx, true) {}
+  ~JSSprinter() {}
+
+  JSString* release(JSContext* cx) { return releaseJS(cx); }
+};
+
+class FixedBufferPrinter final : public GenericPrinter {
+ private:
+  char* buffer_;
+  size_t size_;
+
+ public:
+  constexpr FixedBufferPrinter(char* buf, size_t size)
+      : buffer_(buf), size_(size) {
+    MOZ_ASSERT(buffer_);
+    memset(buffer_, 0, size_);
+  }
+
+  void put(const char* s, size_t len) override;
+  using GenericPrinter::put;  
+};
+
+class JS_PUBLIC_API Fprinter final : public GenericPrinter {
+ private:
+  FILE* file_;
+  bool init_;
+
+ public:
+  explicit Fprinter(FILE* fp);
+
+  constexpr Fprinter() : file_(nullptr), init_(false) {}
+
+#ifdef DEBUG
+  ~Fprinter();
+#endif
+
+  [[nodiscard]] bool init(const char* path);
+  void init(FILE* fp);
+  bool isInitialized() const { return file_ != nullptr; }
+  void flush() override;
+  void finish();
+
+  void put(const char* s, size_t len) override;
+  using GenericPrinter::put;  
+};
+
+class SEprinter final : public GenericPrinter {
+ public:
+  constexpr SEprinter() {}
+
+  virtual void put(const char* s, size_t len) override {
+    printf_stderr("%.*s", int(len), s);
+  }
+  using GenericPrinter::put;  
+};
+
+class JS_PUBLIC_API LSprinter final : public GenericPrinter {
+ private:
+  struct Chunk {
+    Chunk* next;
+    size_t length;
+
+    char* chars() { return reinterpret_cast<char*>(this + 1); }
+    char* end() { return chars() + length; }
+  };
+
+ private:
+  LifoAlloc* alloc_;  
+  Chunk* head_;
+  Chunk* tail_;
+  size_t unused_;
+
+ public:
+  explicit LSprinter(LifoAlloc* lifoAlloc);
+
+  ~LSprinter() = default;
+
+  void exportInto(GenericPrinter& out) const;
+
+  void clear();
+
+  virtual void put(const char* s, size_t len) override;
+  using GenericPrinter::put;  
+};
+
+template <typename Delegate, typename Escape>
+class JS_PUBLIC_API EscapePrinter final : public GenericPrinter {
+  size_t lengthOfSafeChars(const char* s, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+      if (!esc.isSafeChar(uint8_t(s[i]))) {
+        return i;
+      }
+    }
+    return len;
+  }
+
+ private:
+  Delegate& out;
+  Escape& esc;
+
+ public:
+  EscapePrinter(Delegate& out, Escape& esc) : out(out), esc(esc) {}
+  ~EscapePrinter() {}
+
+  using GenericPrinter::put;
+  void put(const char* s, size_t len) override {
+    const char* b = s;
+    while (len) {
+      size_t index = lengthOfSafeChars(b, len);
+      if (index) {
+        out.put(b, index);
+        len -= index;
+        b += index;
+      }
+      if (len) {
+        esc.convertInto(out, char16_t(uint8_t(*b)));
+        len -= 1;
+        b += 1;
+      }
+    }
+  }
+
+  inline void putChar(const char c) override {
+    if (esc.isSafeChar(char16_t(uint8_t(c)))) {
+      out.putChar(char(c));
+      return;
+    }
+    esc.convertInto(out, char16_t(uint8_t(c)));
+  }
+
+  inline void putChar(const JS::Latin1Char c) override {
+    if (esc.isSafeChar(char16_t(c))) {
+      out.putChar(char(c));
+      return;
+    }
+    esc.convertInto(out, char16_t(c));
+  }
+
+  inline void putChar(const char16_t c) override {
+    if (esc.isSafeChar(c)) {
+      out.putChar(char(c));
+      return;
+    }
+    esc.convertInto(out, c);
+  }
+
+  bool canPutFromIndex() const override { return out.canPutFromIndex(); }
+  void putFromIndex(size_t index, size_t length) final {
+    out.putFromIndex(index, length);
+  }
+  size_t index() const final { return out.index(); }
+  void flush() final { out.flush(); }
+  void setPendingOutOfMemory() final { out.setPendingOutOfMemory(); }
+  bool hadOutOfMemory() const final { return out.hadOutOfMemory(); }
+};
+
+class JS_PUBLIC_API JSONEscape {
+ public:
+  bool isSafeChar(char16_t c);
+  void convertInto(GenericPrinter& out, char16_t c);
+};
+
+class JS_PUBLIC_API StringEscape {
+ private:
+  const char quote = '\0';
+
+ public:
+  explicit StringEscape(const char quote = '\0') : quote(quote) {}
+
+  bool isSafeChar(char16_t c);
+  void convertInto(GenericPrinter& out, char16_t c);
+};
+
+class JS_PUBLIC_API WATStringEscape {
+ public:
+  bool isSafeChar(char16_t c);
+  void convertInto(GenericPrinter& out, char16_t c);
+};
+
+class JS_PUBLIC_API StructuredPrinter final : public GenericPrinter {
+  GenericPrinter& out_;
+
+  int indentAmount_;
+  bool pendingIndent_;
+
+  int expandedDepth_ = -1;
+
+  struct Break {
+    uint32_t bufferPos;
+    bool isCollapsed;
+    const char* collapsed;
+    const char* expanded;
+  };
+
+  struct ScopeInfo {
+    uint32_t startPos;
+    int indent;
+  };
+
+  mozilla::Vector<char, 80> buffer_;
+  mozilla::Vector<Break, 8> breaks_;
+  mozilla::Vector<ScopeInfo, 16> scopes_;
+
+  int scopeDepth() { return int(scopes_.length()) - 1; }
+
+  void putIndent(int level = -1);
+  void putBreak(const Break& brk);
+  void putWithMaybeIndent(const char* s, size_t len, int level = -1);
+
+ public:
+  explicit StructuredPrinter(GenericPrinter& out, int indentAmount = 2)
+      : out_(out), indentAmount_(indentAmount) {
+    pushScope();
+  }
+  ~StructuredPrinter() {
+    popScope();
+    flush();
+  }
+
+  void pushScope();
+  void popScope();
+
+  void brk(const char* collapsed, const char* expanded);
+  void expand();
+  bool isExpanded();
+
+  void flush() override;
+
+  class Scope {
+    StructuredPrinter& printer_;
+
+   public:
+    explicit Scope(StructuredPrinter& printer) : printer_(printer) {
+      printer_.pushScope();
+    }
+    ~Scope() { printer_.popScope(); }
+  };
+
+  virtual void put(const char* s, size_t len) override;
+  using GenericPrinter::put;  
+};
+
+extern const char js_EscapeMap[];
+
+extern JS_PUBLIC_API JS::UniqueChars QuoteString(JSContext* cx, JSString* str,
+                                                 char quote = '\0');
+
+extern JS_PUBLIC_API void QuoteString(Sprinter* sp, JSString* str,
+                                      char quote = '\0');
+
+extern JS_PUBLIC_API void JSONQuoteString(StringPrinter* sp, JSString* str);
+
+enum class QuoteTarget { String, JSON };
+
+template <QuoteTarget target, typename CharT>
+void JS_PUBLIC_API QuoteString(Sprinter* sp,
+                               const mozilla::Range<const CharT>& chars,
+                               char quote = '\0');
+
+}  
+
+#endif  // js_Printer_h

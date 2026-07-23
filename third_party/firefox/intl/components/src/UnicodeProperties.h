@@ -1,0 +1,294 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef intl_components_UnicodeProperties_h_
+#define intl_components_UnicodeProperties_h_
+
+#include "mozilla/intl/BidiClass.h"
+#include "mozilla/intl/GeneralCategory.h"
+#include "mozilla/intl/ICU4CGlue.h"
+#include "mozilla/intl/UnicodeScriptCodes.h"
+#include "mozilla/Vector.h"
+
+#include "unicode/uchar.h"
+#include "unicode/uscript.h"
+
+extern "C" {
+
+uint8_t mozilla_canonical_combining_class(uint32_t c);
+
+}  
+
+namespace mozilla::intl {
+
+class UnicodeProperties final {
+ public:
+  static inline BidiClass GetBidiClass(uint32_t aCh) {
+    return BidiClass(u_charDirection(aCh));
+  }
+
+  static inline uint32_t CharMirror(uint32_t aCh) { return u_charMirror(aCh); }
+
+  static inline GeneralCategory CharType(uint32_t aCh) {
+    return GeneralCategory(u_charType(aCh));
+  }
+
+  static inline bool IsMirrored(uint32_t aCh) { return u_isMirrored(aCh); }
+
+  static inline uint8_t GetCombiningClass(uint32_t aCh) {
+    return mozilla_canonical_combining_class(aCh);
+  }
+
+  enum class IntProperty {
+    BidiPairedBracketType,
+    EastAsianWidth,
+    HangulSyllableType,
+    IdentifierStatus,
+    LineBreak,
+    NumericType,
+    VerticalOrientation,
+  };
+
+  static inline int32_t GetIntPropertyValue(uint32_t aCh, IntProperty aProp) {
+    UProperty prop;
+    switch (aProp) {
+      case IntProperty::BidiPairedBracketType:
+        prop = UCHAR_BIDI_PAIRED_BRACKET_TYPE;
+        break;
+      case IntProperty::EastAsianWidth:
+        prop = UCHAR_EAST_ASIAN_WIDTH;
+        break;
+      case IntProperty::HangulSyllableType:
+        prop = UCHAR_HANGUL_SYLLABLE_TYPE;
+        break;
+      case IntProperty::LineBreak:
+        prop = UCHAR_LINE_BREAK;
+        break;
+      case IntProperty::NumericType:
+        prop = UCHAR_NUMERIC_TYPE;
+        break;
+      case IntProperty::VerticalOrientation:
+        prop = UCHAR_VERTICAL_ORIENTATION;
+        break;
+      case IntProperty::IdentifierStatus:
+        prop = UCHAR_IDENTIFIER_STATUS;
+        break;
+    }
+    return u_getIntPropertyValue(aCh, prop);
+  }
+
+  static inline int8_t GetNumericValue(uint32_t aCh) {
+    UNumericType type =
+        UNumericType(GetIntPropertyValue(aCh, IntProperty::NumericType));
+    return type == U_NT_DECIMAL || type == U_NT_DIGIT
+               ? int8_t(u_getNumericValue(aCh))
+               : -1;
+  }
+
+  static inline uint32_t GetBidiPairedBracket(uint32_t aCh) {
+    return u_getBidiPairedBracket(aCh);
+  }
+
+  static inline uint32_t ToUpper(uint32_t aCh) { return u_toupper(aCh); }
+
+  static inline uint32_t ToLower(uint32_t aCh) { return u_tolower(aCh); }
+
+  static inline bool IsLowercase(uint32_t aCh) { return u_isULowercase(aCh); }
+
+  static inline uint32_t ToTitle(uint32_t aCh) { return u_totitle(aCh); }
+
+  static inline uint32_t FoldCase(uint32_t aCh) {
+    return u_foldCase(aCh, U_FOLD_CASE_DEFAULT);
+  }
+
+  enum class BinaryProperty {
+    DefaultIgnorableCodePoint,
+    Emoji,
+    EmojiPresentation,
+  };
+
+  static inline bool HasBinaryProperty(uint32_t aCh, BinaryProperty aProp) {
+    UProperty prop;
+    switch (aProp) {
+      case BinaryProperty::DefaultIgnorableCodePoint:
+        prop = UCHAR_DEFAULT_IGNORABLE_CODE_POINT;
+        break;
+      case BinaryProperty::Emoji:
+        prop = UCHAR_EMOJI;
+        break;
+      case BinaryProperty::EmojiPresentation:
+        prop = UCHAR_EMOJI_PRESENTATION;
+        break;
+    }
+    return u_hasBinaryProperty(aCh, prop);
+  }
+
+  static inline bool IsEastAsianWidthFHW(uint32_t aCh) {
+    switch (GetIntPropertyValue(aCh, IntProperty::EastAsianWidth)) {
+      case U_EA_FULLWIDTH:
+      case U_EA_HALFWIDTH:
+      case U_EA_WIDE:
+        return true;
+      case U_EA_AMBIGUOUS:
+      case U_EA_NARROW:
+      case U_EA_NEUTRAL:
+        return false;
+    }
+    return false;
+  }
+
+  static inline bool IsEastAsianWidthFHWexcludingEmoji(uint32_t aCh) {
+    switch (GetIntPropertyValue(aCh, IntProperty::EastAsianWidth)) {
+      case U_EA_FULLWIDTH:
+      case U_EA_HALFWIDTH:
+        return true;
+      case U_EA_WIDE:
+        return HasBinaryProperty(aCh, BinaryProperty::Emoji) ? false : true;
+      case U_EA_AMBIGUOUS:
+      case U_EA_NARROW:
+      case U_EA_NEUTRAL:
+        return false;
+    }
+    return false;
+  }
+
+  static inline bool IsEastAsianWidthAFW(uint32_t aCh) {
+    switch (GetIntPropertyValue(aCh, IntProperty::EastAsianWidth)) {
+      case U_EA_AMBIGUOUS:
+      case U_EA_FULLWIDTH:
+      case U_EA_WIDE:
+        return true;
+      case U_EA_HALFWIDTH:
+      case U_EA_NARROW:
+      case U_EA_NEUTRAL:
+        return false;
+    }
+    return false;
+  }
+
+  static inline bool IsEastAsianWidthFW(uint32_t aCh) {
+    switch (GetIntPropertyValue(aCh, IntProperty::EastAsianWidth)) {
+      case U_EA_FULLWIDTH:
+      case U_EA_WIDE:
+        return true;
+      case U_EA_AMBIGUOUS:
+      case U_EA_HALFWIDTH:
+      case U_EA_NARROW:
+      case U_EA_NEUTRAL:
+        return false;
+    }
+    return false;
+  }
+
+  static inline bool IsEastAsianFullWidth(char32_t aCh) {
+    return GetIntPropertyValue(aCh, IntProperty::EastAsianWidth) ==
+           U_EA_FULLWIDTH;
+  }
+
+  static inline bool IsLetter(char32_t aCh) {
+    switch (CharType(aCh)) {
+      case GeneralCategory::Uppercase_Letter:
+      case GeneralCategory::Lowercase_Letter:
+      case GeneralCategory::Titlecase_Letter:
+      case GeneralCategory::Modifier_Letter:
+      case GeneralCategory::Other_Letter:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  static inline bool IsCombiningMark(char32_t aCh) {
+    switch (CharType(aCh)) {
+      case GeneralCategory::Nonspacing_Mark:
+      case GeneralCategory::Spacing_Mark:
+      case GeneralCategory::Enclosing_Mark:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  static inline bool IsPunctuation(uint32_t aCh) {
+    switch (CharType(aCh)) {
+      case GeneralCategory::Dash_Punctuation:
+      case GeneralCategory::Open_Punctuation:
+      case GeneralCategory::Close_Punctuation:
+      case GeneralCategory::Connector_Punctuation:
+      case GeneralCategory::Other_Punctuation:
+      case GeneralCategory::Initial_Punctuation:
+      case GeneralCategory::Final_Punctuation:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  static inline bool IsMathOrMusicSymbol(uint32_t aCh) {
+    return CharType(aCh) == GeneralCategory::Math_Symbol ||
+           CharType(aCh) == GeneralCategory::Other_Symbol;
+  }
+
+  static inline Script GetScriptCode(uint32_t aCh) {
+    UErrorCode err = U_ZERO_ERROR;
+    return Script(uscript_getScript(aCh, &err));
+  }
+
+  static inline bool HasScript(uint32_t aCh, Script aScript) {
+    return uscript_hasScript(aCh, UScriptCode(aScript));
+  }
+
+  static inline const char* GetScriptShortName(Script aScript) {
+    return uscript_getShortName(UScriptCode(aScript));
+  }
+
+  static inline int32_t GetMaxNumberOfScripts() {
+    return u_getIntPropertyMaxValue(UCHAR_SCRIPT);
+  }
+
+  static bool IsScriptioContinua(char16_t aChar) {
+    Script sc = GetScriptCode(aChar);
+    return sc == Script::THAI || sc == Script::MYANMAR || sc == Script::KHMER ||
+           sc == Script::JAVANESE || sc == Script::BALINESE ||
+           sc == Script::SUNDANESE || sc == Script::LAO;
+  }
+
+  static bool IsCursiveScript(char32_t aChar) {
+    Script sc = GetScriptCode(aChar);
+    return sc == Script::ARABIC || sc == Script::SYRIAC || sc == Script::NKO ||
+           sc == Script::MANDAIC || sc == Script::MONGOLIAN ||
+           sc == Script::PHAGS_PA || sc == Script::HANIFI_ROHINGYA;
+  }
+
+  static constexpr size_t kMaxScripts = 32;
+
+  using ScriptExtensionVector = Vector<Script, kMaxScripts>;
+
+  static ICUResult GetExtensions(char32_t aCodePoint,
+                                 ScriptExtensionVector& aExtensions) {
+    aExtensions.clear();
+
+    UScriptCode ext[kMaxScripts];
+    UErrorCode status = U_ZERO_ERROR;
+    int32_t len = uscript_getScriptExtensions(static_cast<UChar32>(aCodePoint),
+                                              ext, kMaxScripts, &status);
+    if (U_FAILURE(status)) {
+      MOZ_DIAGNOSTIC_ASSERT(status != U_BUFFER_OVERFLOW_ERROR);
+      return Err(ToICUError(status));
+    }
+
+    if (!aExtensions.reserve(len)) {
+      return Err(ICUError::OutOfMemory);
+    }
+
+    for (int32_t i = 0; i < len; i++) {
+      aExtensions.infallibleAppend(Script(ext[i]));
+    }
+
+    return Ok();
+  }
+};
+
+}  
+
+#endif

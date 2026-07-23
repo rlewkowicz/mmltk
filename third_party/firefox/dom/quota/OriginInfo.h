@@ -1,0 +1,172 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_QUOTA_ORIGININFO_H_
+#define DOM_QUOTA_ORIGININFO_H_
+
+#include "Assertions.h"
+#include "ClientUsageArray.h"
+#include "mozilla/ThreadSafeWeakPtr.h"
+#include "mozilla/dom/quota/QuotaManager.h"
+
+namespace mozilla::dom::quota {
+
+class CanonicalQuotaObject;
+class GroupInfo;
+
+class OriginInfo final : public SupportsThreadSafeWeakPtr<OriginInfo> {
+  friend class CanonicalQuotaObject;
+  friend class GroupInfo;
+  friend class PersistOp;
+  friend class QuotaManager;
+  friend class SupportsThreadSafeWeakPtr<OriginInfo>;
+
+ public:
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(OriginInfo)
+
+  OriginInfo(GroupInfo* aGroupInfo, const nsACString& aOrigin,
+             const nsACString& aStorageOrigin, bool aIsPrivate,
+             const ClientUsageArray& aClientUsages, uint64_t aUsage,
+             int64_t aAccessTime, int32_t aMaintenanceDate, bool aPersisted,
+             bool aDirectoryExists);
+
+  GroupInfo* GetGroupInfo() const { return mGroupInfo; }
+
+  const nsCString& Origin() const { return mOrigin; }
+
+  int64_t LockedUsage() const {
+    AssertCurrentThreadOwnsQuotaMutex();
+
+#ifdef DEBUG
+    QuotaManager* quotaManager = QuotaManager::Get();
+    MOZ_ASSERT(quotaManager);
+
+    uint64_t usage = 0;
+    for (Client::Type type : quotaManager->AllClientTypes()) {
+      AssertNoOverflow(usage, mClientUsages[type].valueOr(0));
+      usage += mClientUsages[type].valueOr(0);
+    }
+    MOZ_ASSERT(mUsage == usage);
+#endif
+
+    return mUsage;
+  }
+
+  int64_t LockedAccessTime() const {
+    AssertCurrentThreadOwnsQuotaMutex();
+
+    return mAccessTime;
+  }
+
+  int32_t LockedMaintenanceDate() const {
+    AssertCurrentThreadOwnsQuotaMutex();
+
+    return mMaintenanceDate;
+  }
+
+  bool LockedAccessed() const {
+    AssertCurrentThreadOwnsQuotaMutex();
+
+    return mAccessed;
+  }
+
+  bool LockedPersisted() const {
+    AssertCurrentThreadOwnsQuotaMutex();
+
+    return mPersisted;
+  }
+
+  bool LockedDirectoryExists() const {
+    AssertCurrentThreadOwnsQuotaMutex();
+
+    return mDirectoryExists;
+  }
+
+  OriginMetadata FlattenToOriginMetadata() const;
+
+  OriginStateMetadata LockedFlattenToOriginStateMetadata() const;
+
+  FullOriginMetadata LockedFlattenToFullOriginMetadata() const;
+
+  nsresult LockedBindToStatement(mozIStorageStatement* aStatement) const;
+
+ private:
+  ~OriginInfo() {
+    MOZ_COUNT_DTOR(OriginInfo);
+
+    MOZ_ASSERT(!mCanonicalQuotaObjects.Count());
+  }
+
+  void LockedDecreaseUsage(Client::Type aClientType, int64_t aSize);
+
+  void LockedResetUsageForClient(Client::Type aClientType);
+
+  UsageInfo LockedGetUsageForClient(Client::Type aClientType);
+
+  void LockedUpdateAccessTime(int64_t aAccessTime) {
+    AssertCurrentThreadOwnsQuotaMutex();
+
+    mAccessTime = aAccessTime;
+    if (!mAccessed) {
+      mAccessed = true;
+    }
+  }
+
+  void LockedUpdateMaintenanceDate(int32_t aMaintenanceDate) {
+    AssertCurrentThreadOwnsQuotaMutex();
+
+    mMaintenanceDate = aMaintenanceDate;
+  }
+
+  void LockedUpdateAccessed() {
+    AssertCurrentThreadOwnsQuotaMutex();
+
+    if (!mAccessed) {
+      mAccessed = true;
+    }
+  }
+
+  void LockedPersist();
+
+  void LockedDirectoryCreated();
+
+  void LockedTruncateUsages(Client::Type aClientType, uint64_t aDelta);
+
+  Maybe<bool> LockedUpdateUsages(Client::Type aClientType, uint64_t aDelta);
+
+  bool LockedUpdateUsagesForEviction(Client::Type aClientType, uint64_t aDelta);
+
+  nsTHashMap<nsStringHashKey, NotNull<CanonicalQuotaObject*>>
+      mCanonicalQuotaObjects;
+  GroupInfo* mGroupInfo;
+  const nsCString mOrigin;
+  const nsCString mStorageOrigin;
+  int64_t mAccessTime;
+  int32_t mMaintenanceDate;
+  bool mIsPrivate;
+  bool mAccessed;
+  bool mPersisted;
+  bool mDirectoryExists;
+
+ private:
+  ClientUsageArray mClientUsages;
+  uint64_t mUsage;
+};
+
+class OriginInfoAccessTimeComparator {
+ public:
+  bool Equals(const NotNull<RefPtr<const OriginInfo>>& a,
+              const NotNull<RefPtr<const OriginInfo>>& b) const {
+    return a->LockedAccessTime() == b->LockedAccessTime();
+  }
+
+  bool LessThan(const NotNull<RefPtr<const OriginInfo>>& a,
+                const NotNull<RefPtr<const OriginInfo>>& b) const {
+    return a->LockedAccessTime() < b->LockedAccessTime();
+  }
+};
+
+}  
+
+#endif  // DOM_QUOTA_ORIGININFO_H_

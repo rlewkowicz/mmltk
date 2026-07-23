@@ -1,0 +1,361 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_StorageDBThread_h
+#define mozilla_dom_StorageDBThread_h
+
+#include "mozilla/Atomics.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/OriginAttributes.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/storage/StatementCache.h"
+#include "nsCOMPtr.h"
+#include "nsClassHashtable.h"
+#include "nsIFile.h"
+#include "nsIThreadInternal.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nsTHashSet.h"
+#include "nsThreadUtils.h"
+#include "prinrval.h"
+#include "prthread.h"
+
+class mozIStorageConnection;
+
+namespace mozilla::dom {
+
+class LocalStorageCacheBridge;
+class StorageUsageBridge;
+class StorageUsage;
+
+using StatementCache = mozilla::storage::StatementCache<mozIStorageStatement>;
+
+#if 0
+class StorageDBBridge
+{
+public:
+  StorageDBBridge();
+  virtual ~StorageDBBridge() {}
+
+  virtual nsresult Init() = 0;
+
+  virtual nsresult Shutdown() = 0;
+
+  virtual void AsyncPreload(LocalStorageCacheBridge* aCache,
+                            bool aPriority = false) = 0;
+
+  virtual void AsyncGetUsage(StorageUsageBridge* aUsage) = 0;
+
+  virtual void SyncPreload(LocalStorageCacheBridge* aCache,
+                           bool aForceSync = false) = 0;
+
+  virtual nsresult AsyncAddItem(LocalStorageCacheBridge* aCache,
+                                const nsAString& aKey,
+                                const nsAString& aValue) = 0;
+
+  virtual nsresult AsyncUpdateItem(LocalStorageCacheBridge* aCache,
+                                   const nsAString& aKey,
+                                   const nsAString& aValue) = 0;
+
+  virtual nsresult AsyncRemoveItem(LocalStorageCacheBridge* aCache,
+                                   const nsAString& aKey) = 0;
+
+  virtual nsresult AsyncClear(LocalStorageCacheBridge* aCache) = 0;
+
+  virtual void AsyncClearAll() = 0;
+
+  virtual void AsyncClearMatchingOrigin(const nsACString& aOriginNoSuffix) = 0;
+
+  virtual void AsyncClearMatchingOriginAttributes(const OriginAttributesPattern& aPattern) = 0;
+
+  virtual void AsyncFlush() = 0;
+
+  virtual bool ShouldPreloadOrigin(const nsACString& aOriginNoSuffix) = 0;
+};
+#endif
+
+class StorageDBThread final {
+ public:
+  class PendingOperations;
+
+  class DBOperation {
+   public:
+    enum OperationType {
+      opPreload,
+      opPreloadUrgent,
+
+      opGetUsage,
+
+      opAddItem,
+      opUpdateItem,
+      opRemoveItem,
+      opClear,
+
+
+      opClearAll,
+      opClearMatchingOrigin,
+      opClearMatchingOriginAttributes,
+    };
+
+    explicit DBOperation(const OperationType aType,
+                         LocalStorageCacheBridge* aCache = nullptr,
+                         const nsAString& aKey = u""_ns,
+                         const nsAString& aValue = u""_ns);
+    DBOperation(const OperationType aType, StorageUsageBridge* aUsage);
+    DBOperation(const OperationType aType, const nsACString& aOriginNoSuffix);
+    DBOperation(const OperationType aType,
+                const OriginAttributesPattern& aOriginNoSuffix);
+    ~DBOperation();
+
+    void PerformAndFinalize(StorageDBThread* aThread);
+
+    void Finalize(nsresult aRv);
+
+    OperationType Type() const { return mType; }
+
+    const nsCString OriginNoSuffix() const;
+
+    const nsCString OriginSuffix() const;
+
+    const nsCString Origin() const;
+
+    const nsCString Target() const;
+
+    const OriginAttributesPattern& OriginPattern() const {
+      return mOriginPattern;
+    }
+
+   private:
+    nsresult Perform(StorageDBThread* aThread);
+
+    friend class PendingOperations;
+    OperationType mType;
+    RefPtr<LocalStorageCacheBridge> mCache;
+    RefPtr<StorageUsageBridge> mUsage;
+    nsString const mKey;
+    nsString const mValue;
+    nsCString const mOrigin;
+    OriginAttributesPattern const mOriginPattern;
+  };
+
+  class PendingOperations {
+   public:
+    PendingOperations();
+
+    void Add(UniquePtr<DBOperation> aOperation);
+
+    bool HasTasks() const;
+
+    bool Prepare();
+
+    nsresult Execute(StorageDBThread* aThread);
+
+    bool Finalize(nsresult aRv);
+
+    bool IsOriginClearPending(const nsACString& aOriginSuffix,
+                              const nsACString& aOriginNoSuffix) const;
+
+    bool IsOriginUpdatePending(const nsACString& aOriginSuffix,
+                               const nsACString& aOriginNoSuffix) const;
+
+   private:
+    bool CheckForCoalesceOpportunity(DBOperation* aNewOp,
+                                     DBOperation::OperationType aPendingType,
+                                     DBOperation::OperationType aNewType);
+
+    nsClassHashtable<nsCStringHashKey, DBOperation> mClears;
+
+    nsClassHashtable<nsCStringHashKey, DBOperation> mUpdates;
+
+    nsTArray<UniquePtr<DBOperation> > mExecList;
+
+    uint32_t mFlushFailureCount;
+  };
+
+  class ThreadObserver final : public nsIThreadObserver {
+    NS_DECL_THREADSAFE_ISUPPORTS
+    NS_DECL_NSITHREADOBSERVER
+
+    ThreadObserver()
+        : mHasPendingEvents(false), mMonitor("StorageThreadMonitor") {}
+
+    bool HasPendingEvents() {
+      mMonitor.AssertCurrentThreadOwns();
+      return mHasPendingEvents;
+    }
+    void ClearPendingEvents() {
+      mMonitor.AssertCurrentThreadOwns();
+      mHasPendingEvents = false;
+    }
+    Monitor& GetMonitor() { return mMonitor; }
+
+   private:
+    virtual ~ThreadObserver() = default;
+    bool mHasPendingEvents;
+    Monitor mMonitor MOZ_UNANNOTATED;
+  };
+
+  class InitHelper;
+
+  class NoteBackgroundThreadRunnable;
+
+  class ShutdownRunnable : public Runnable {
+    const uint32_t mPrivateBrowsingId;
+    bool& mDone;
+
+   public:
+    explicit ShutdownRunnable(const uint32_t aPrivateBrowsingId, bool& aDone)
+        : Runnable("dom::StorageDBThread::ShutdownRunnable"),
+          mPrivateBrowsingId(aPrivateBrowsingId),
+          mDone(aDone) {
+      MOZ_ASSERT(NS_IsMainThread());
+    }
+
+   private:
+    ~ShutdownRunnable() = default;
+
+    NS_DECL_NSIRUNNABLE
+  };
+
+ public:
+  explicit StorageDBThread(uint32_t aPrivateBrowsingId);
+  virtual ~StorageDBThread() = default;
+
+  static StorageDBThread* Get(uint32_t aPrivateBrowsingId);
+
+  static StorageDBThread* GetOrCreate(const nsString& aProfilePath,
+                                      uint32_t aPrivateBrowsingId);
+
+  static nsresult GetProfilePath(nsString& aProfilePath);
+
+  virtual nsresult Init(const nsString& aProfilePath);
+
+  virtual nsresult Shutdown();
+
+  virtual void AsyncPreload(LocalStorageCacheBridge* aCache,
+                            bool aPriority = false) {
+    InsertDBOp(MakeUnique<DBOperation>(
+        aPriority ? DBOperation::opPreloadUrgent : DBOperation::opPreload,
+        aCache));
+  }
+
+  virtual void SyncPreload(LocalStorageCacheBridge* aCache,
+                           bool aForce = false);
+
+  virtual void AsyncGetUsage(StorageUsageBridge* aUsage) {
+    InsertDBOp(MakeUnique<DBOperation>(DBOperation::opGetUsage, aUsage));
+  }
+
+  virtual nsresult AsyncAddItem(LocalStorageCacheBridge* aCache,
+                                const nsAString& aKey,
+                                const nsAString& aValue) {
+    return InsertDBOp(
+        MakeUnique<DBOperation>(DBOperation::opAddItem, aCache, aKey, aValue));
+  }
+
+  virtual nsresult AsyncUpdateItem(LocalStorageCacheBridge* aCache,
+                                   const nsAString& aKey,
+                                   const nsAString& aValue) {
+    return InsertDBOp(MakeUnique<DBOperation>(DBOperation::opUpdateItem, aCache,
+                                              aKey, aValue));
+  }
+
+  virtual nsresult AsyncRemoveItem(LocalStorageCacheBridge* aCache,
+                                   const nsAString& aKey) {
+    return InsertDBOp(
+        MakeUnique<DBOperation>(DBOperation::opRemoveItem, aCache, aKey));
+  }
+
+  virtual nsresult AsyncClear(LocalStorageCacheBridge* aCache) {
+    return InsertDBOp(MakeUnique<DBOperation>(DBOperation::opClear, aCache));
+  }
+
+  virtual void AsyncClearAll() {
+    InsertDBOp(MakeUnique<DBOperation>(DBOperation::opClearAll));
+  }
+
+  virtual void AsyncClearMatchingOrigin(const nsACString& aOriginNoSuffix) {
+    InsertDBOp(MakeUnique<DBOperation>(DBOperation::opClearMatchingOrigin,
+                                       aOriginNoSuffix));
+  }
+
+  virtual void AsyncClearMatchingOriginAttributes(
+      const OriginAttributesPattern& aPattern) {
+    InsertDBOp(MakeUnique<DBOperation>(
+        DBOperation::opClearMatchingOriginAttributes, aPattern));
+  }
+
+  virtual void AsyncFlush();
+
+  virtual bool ShouldPreloadOrigin(const nsACString& aOrigin);
+
+  void GetOriginsHavingData(nsTArray<nsCString>* aOrigins);
+
+ private:
+  nsCOMPtr<nsIFile> mDatabaseFile;
+  PRThread* mThread;
+
+  RefPtr<ThreadObserver> mThreadObserver;
+
+  bool mStopIOThread;
+
+  bool mWALModeEnabled;
+
+  Atomic<bool, ReleaseAcquire> mDBReady;
+
+  nsresult mStatus;
+
+  nsTHashSet<nsCString> mOriginsHavingData;
+
+  nsCOMPtr<mozIStorageConnection> mWorkerConnection;
+
+  nsCOMPtr<mozIStorageConnection> mReaderConnection;
+
+  StatementCache mWorkerStatements;
+  StatementCache mReaderStatements;
+
+  TimeStamp mDirtyEpoch;
+
+  bool mFlushImmediately;
+
+  nsTArray<DBOperation*> mPreloads;
+
+  PendingOperations mPendingTasks;
+
+  const uint32_t mPrivateBrowsingId;
+
+  int32_t mPriorityCounter;
+
+  nsresult InsertDBOp(UniquePtr<DBOperation> aOperation);
+
+  nsresult OpenDatabaseConnection();
+  nsresult OpenAndUpdateDatabase();
+  nsresult InitDatabase();
+  nsresult ShutdownDatabase();
+
+  nsresult SetJournalMode(bool aIsWal);
+  nsresult TryJournalMode();
+
+  nsresult ConfigureWALBehavior();
+
+  void SetHigherPriority();
+  void SetDefaultPriority();
+
+  void ScheduleFlush();
+
+  void UnscheduleFlush();
+
+  TimeDuration TimeUntilFlush();
+
+  void NotifyFlushCompletion();
+
+  static void ThreadFunc(void* aArg);
+  void ThreadFunc();
+};
+
+}  
+
+#endif  // mozilla_dom_StorageDBThread_h

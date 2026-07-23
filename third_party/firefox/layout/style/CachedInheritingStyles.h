@@ -1,0 +1,76 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_CachedInheritingStyles_h
+#define mozilla_CachedInheritingStyles_h
+
+#include "nsAtom.h"
+#include "nsCOMPtr.h"
+#include "nsTArray.h"
+
+class nsWindowSizes;
+
+namespace mozilla {
+
+struct PseudoStyleRequest;
+enum class PseudoStyleType : uint8_t;
+class ComputedStyle;
+
+struct CachedStyleEntry {
+  RefPtr<ComputedStyle> mStyle;
+  RefPtr<nsAtom> mFunctionalPseudoParameter;
+  PseudoStyleType mPseudoType;
+};
+
+class CachedInheritingStyles {
+ public:
+  void Insert(ComputedStyle* aStyle, PseudoStyleType aType,
+              nsAtom* aFunctionalPseudoParameter = nullptr);
+  ComputedStyle* Lookup(const PseudoStyleRequest& aRequest) const;
+  bool HasEntry(const PseudoStyleRequest& aRequest) const;
+
+  void AppendTo(nsTArray<const ComputedStyle*>& aArray) const;
+
+  template <typename Func>
+  void ForEachLazyPseudoEntry(Func&& aFunc) const;
+
+  CachedInheritingStyles() : mBits(0) {}
+  ~CachedInheritingStyles() {
+    if (IsIndirect()) {
+      delete AsIndirect();
+    } else if (!IsEmpty() && !IsNullDirect()) {
+      RefPtr<ComputedStyle> ref = dont_AddRef(AsDirect());
+    }
+  }
+
+  void AddSizeOfIncludingThis(nsWindowSizes& aSizes, size_t* aCVsSize) const;
+
+ private:
+  using IndirectCache = AutoTArray<CachedStyleEntry, 4>;
+
+  bool IsEmpty() const { return !mBits; }
+  bool IsIndirect() const { return (mBits & 1); }
+  bool IsNullDirect() const { return (mBits & 3) == 2; }
+
+  ComputedStyle* AsDirect() const {
+    MOZ_ASSERT(!IsIndirect() && !IsNullDirect());
+    return reinterpret_cast<ComputedStyle*>(mBits);
+  }
+
+  PseudoStyleType NullDirectType() const {
+    MOZ_ASSERT(IsNullDirect());
+    return static_cast<PseudoStyleType>(mBits >> 2);
+  }
+
+  IndirectCache* AsIndirect() const {
+    MOZ_ASSERT(IsIndirect());
+    return reinterpret_cast<IndirectCache*>(mBits & ~uintptr_t(1));
+  }
+
+  uintptr_t mBits;
+};
+
+}  
+
+#endif  // mozilla_CachedInheritingStyles_h

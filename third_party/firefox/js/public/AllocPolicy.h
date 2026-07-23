@@ -1,0 +1,293 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_AllocPolicy_h
+#define js_AllocPolicy_h
+
+#include "mozilla/MemoryReporting.h"  // For MallocSizeOf
+#include "mozilla/mozalloc.h"         // For InfallibleAllocPolicy
+
+#include "js/TypeDecls.h"
+#include "js/Utility.h"
+
+class JS_PUBLIC_API JSTracer;
+
+extern MOZ_COLD JS_PUBLIC_API void JS_ReportOutOfMemory(JSContext* cx);
+
+namespace js {
+
+class FrontendContext;
+
+enum class AllocFunction { Malloc, Calloc, Realloc };
+
+namespace gc {
+class Cell;
+}  
+
+class AllocPolicyBase {
+ public:
+  void reportAllocOverflow() const {}
+
+  bool checkSimulatedOOM() const { return !js::oom::ShouldFailWithOOM(); }
+
+  void updateOwningGCThing(gc::Cell* maybeOwner) {}
+
+  template <typename T>
+  void traceOwnedAlloc(JSTracer* trc, T** ptrp, const char* name) {}
+
+  size_t getAllocSize(void* ptr, mozilla::MallocSizeOf mallocSizeOf) {
+    return mallocSizeOf(ptr);
+  }
+};
+
+template <typename Container>
+void TraceOwnedAllocs(JSTracer* trc, gc::Cell* maybeOwner, Container& container,
+                      const char* name) {
+  auto& allocPolicy = container.allocPolicy();
+  allocPolicy.updateOwningGCThing(maybeOwner);
+  container.traceOwnedAllocs(
+      [&](auto** ptrp) { allocPolicy.traceOwnedAlloc(trc, ptrp, name); });
+}
+
+template <typename Container>
+size_t SizeOfOwnedAllocs(Container& container,
+                         mozilla::MallocSizeOf mallocSizeOf) {
+  size_t size = 0;
+  auto& allocPolicy = container.allocPolicy();
+  container.traceOwnedAllocs([&](auto** ptrp) {
+    size += allocPolicy.getAllocSize(*ptrp, mallocSizeOf);
+  });
+  return size;
+}
+
+class MallocArenaAllocPolicyBase : public AllocPolicyBase {
+ public:
+  template <typename T>
+  T* maybe_pod_arena_malloc(arena_id_t arenaId, size_t numElems) {
+    return js_pod_arena_malloc<T>(arenaId, numElems);
+  }
+  template <typename T>
+  T* maybe_pod_arena_calloc(arena_id_t arenaId, size_t numElems) {
+    return js_pod_arena_calloc<T>(arenaId, numElems);
+  }
+  template <typename T>
+  T* maybe_pod_arena_realloc(arena_id_t arenaId, T* p, size_t oldSize,
+                             size_t newSize) {
+    return js_pod_arena_realloc<T>(arenaId, p, oldSize, newSize);
+  }
+  template <typename T>
+  T* pod_arena_malloc(arena_id_t arenaId, size_t numElems) {
+    return maybe_pod_arena_malloc<T>(arenaId, numElems);
+  }
+  template <typename T>
+  T* pod_arena_calloc(arena_id_t arenaId, size_t numElems) {
+    return maybe_pod_arena_calloc<T>(arenaId, numElems);
+  }
+  template <typename T>
+  T* pod_arena_realloc(arena_id_t arenaId, T* p, size_t oldSize,
+                       size_t newSize) {
+    return maybe_pod_arena_realloc<T>(arenaId, p, oldSize, newSize);
+  }
+};
+
+class MallocAllocPolicyBase : public MallocArenaAllocPolicyBase {
+ public:
+  template <typename T>
+  T* maybe_pod_malloc(size_t numElems) {
+    return maybe_pod_arena_malloc<T>(js::MallocArena, numElems);
+  }
+  template <typename T>
+  T* maybe_pod_calloc(size_t numElems) {
+    return maybe_pod_arena_calloc<T>(js::MallocArena, numElems);
+  }
+  template <typename T>
+  T* maybe_pod_realloc(T* p, size_t oldSize, size_t newSize) {
+    return maybe_pod_arena_realloc<T>(js::MallocArena, p, oldSize, newSize);
+  }
+  template <typename T>
+  T* pod_malloc(size_t numElems) {
+    return pod_arena_malloc<T>(js::MallocArena, numElems);
+  }
+  template <typename T>
+  T* pod_calloc(size_t numElems) {
+    return pod_arena_calloc<T>(js::MallocArena, numElems);
+  }
+  template <typename T>
+  T* pod_realloc(T* p, size_t oldSize, size_t newSize) {
+    return pod_arena_realloc<T>(js::MallocArena, p, oldSize, newSize);
+  }
+
+  template <typename T>
+  void free_(T* p, size_t numElems = 0) {
+    js_free(p);
+  }
+};
+
+class BackgroundAllocPolicyBase : public MallocArenaAllocPolicyBase {
+ public:
+  template <typename T>
+  T* maybe_pod_malloc(size_t numElems) {
+    return maybe_pod_arena_malloc<T>(js::BackgroundMallocArena, numElems);
+  }
+  template <typename T>
+  T* maybe_pod_calloc(size_t numElems) {
+    return maybe_pod_arena_calloc<T>(js::BackgroundMallocArena, numElems);
+  }
+  template <typename T>
+  T* maybe_pod_realloc(T* p, size_t oldSize, size_t newSize) {
+    return maybe_pod_arena_realloc<T>(js::BackgroundMallocArena, p, oldSize,
+                                      newSize);
+  }
+  template <typename T>
+  T* pod_malloc(size_t numElems) {
+    return pod_arena_malloc<T>(js::BackgroundMallocArena, numElems);
+  }
+  template <typename T>
+  T* pod_calloc(size_t numElems) {
+    return pod_arena_calloc<T>(js::BackgroundMallocArena, numElems);
+  }
+  template <typename T>
+  T* pod_realloc(T* p, size_t oldSize, size_t newSize) {
+    return pod_arena_realloc<T>(js::BackgroundMallocArena, p, oldSize, newSize);
+  }
+
+  template <typename T>
+  void free_(T* p, size_t numElems = 0) {
+    js_free(p);
+  }
+};
+
+class SystemAllocPolicy : public MallocAllocPolicyBase {};
+
+class BackgroundSystemAllocPolicy : public BackgroundAllocPolicyBase {};
+
+MOZ_COLD JS_PUBLIC_API void ReportOutOfMemory(JSContext* cx);
+MOZ_COLD JS_PUBLIC_API void ReportOutOfMemory(FrontendContext* fc);
+
+MOZ_COLD JS_PUBLIC_API void ReportLargeOutOfMemory(JSContext* cx);
+
+class JS_PUBLIC_API TempAllocPolicy : public MallocAllocPolicyBase {
+  static constexpr uintptr_t JsContextTag = 0x1;
+
+  uintptr_t const context_bits_;
+
+  MOZ_ALWAYS_INLINE bool hasJSContext() const {
+    return (context_bits_ & JsContextTag) == JsContextTag;
+  }
+
+  MOZ_ALWAYS_INLINE JSContext* cx() const {
+    MOZ_ASSERT(hasJSContext());
+    return reinterpret_cast<JSContext*>(context_bits_ ^ JsContextTag);
+  }
+
+  MOZ_ALWAYS_INLINE FrontendContext* fc() const {
+    MOZ_ASSERT(!hasJSContext());
+    return reinterpret_cast<FrontendContext*>(context_bits_);
+  }
+
+  void* onOutOfMemory(arena_id_t arenaId, AllocFunction allocFunc,
+                      size_t nbytes, void* reallocPtr = nullptr);
+
+  template <typename T>
+  T* onOutOfMemoryTyped(arena_id_t arenaId, AllocFunction allocFunc,
+                        size_t numElems, void* reallocPtr = nullptr) {
+    size_t bytes;
+    if (MOZ_UNLIKELY(!CalculateAllocSize<T>(numElems, &bytes))) {
+      return nullptr;
+    }
+    return static_cast<T*>(
+        onOutOfMemory(arenaId, allocFunc, bytes, reallocPtr));
+  }
+
+ public:
+  MOZ_IMPLICIT TempAllocPolicy(JSContext* cx)
+      : context_bits_(uintptr_t(cx) | JsContextTag) {
+    MOZ_ASSERT((uintptr_t(cx) & JsContextTag) == 0);
+  }
+  MOZ_IMPLICIT TempAllocPolicy(FrontendContext* fc)
+      : context_bits_(uintptr_t(fc)) {
+    MOZ_ASSERT((uintptr_t(fc) & JsContextTag) == 0);
+  }
+
+  template <typename T>
+  T* pod_arena_malloc(arena_id_t arenaId, size_t numElems) {
+    T* p = this->maybe_pod_arena_malloc<T>(arenaId, numElems);
+    if (MOZ_UNLIKELY(!p)) {
+      p = onOutOfMemoryTyped<T>(arenaId, AllocFunction::Malloc, numElems);
+    }
+    return p;
+  }
+
+  template <typename T>
+  T* pod_arena_calloc(arena_id_t arenaId, size_t numElems) {
+    T* p = this->maybe_pod_arena_calloc<T>(arenaId, numElems);
+    if (MOZ_UNLIKELY(!p)) {
+      p = onOutOfMemoryTyped<T>(arenaId, AllocFunction::Calloc, numElems);
+    }
+    return p;
+  }
+
+  template <typename T>
+  T* pod_arena_realloc(arena_id_t arenaId, T* prior, size_t oldSize,
+                       size_t newSize) {
+    T* p2 = this->maybe_pod_arena_realloc<T>(arenaId, prior, oldSize, newSize);
+    if (MOZ_UNLIKELY(!p2)) {
+      p2 = onOutOfMemoryTyped<T>(arenaId, AllocFunction::Realloc, newSize,
+                                 prior);
+    }
+    return p2;
+  }
+
+  template <typename T>
+  T* pod_malloc(size_t numElems) {
+    return pod_arena_malloc<T>(js::MallocArena, numElems);
+  }
+
+  template <typename T>
+  T* pod_calloc(size_t numElems) {
+    return pod_arena_calloc<T>(js::MallocArena, numElems);
+  }
+
+  template <typename T>
+  T* pod_realloc(T* prior, size_t oldSize, size_t newSize) {
+    return pod_arena_realloc<T>(js::MallocArena, prior, oldSize, newSize);
+  }
+
+  template <typename T>
+  void free_(T* p, size_t numElems = 0) {
+    js_free(p);
+  }
+
+  void reportAllocOverflow() const;
+
+  bool checkSimulatedOOM() const {
+    if (js::oom::ShouldFailWithOOM()) {
+      if (hasJSContext()) {
+        ReportOutOfMemory(cx());
+      } else {
+        ReportOutOfMemory(fc());
+      }
+      return false;
+    }
+
+    return true;
+  }
+};
+
+class MallocAllocPolicy : public MallocAllocPolicyBase {
+ public:
+  [[nodiscard]] bool checkSimulatedOOM() const { return true; }
+};
+
+} 
+
+class MOZ_EMPTY_BASES JSInfallibleAllocPolicy : public js::AllocPolicyBase,
+                                                public ::InfallibleAllocPolicy {
+ public:
+  using ::InfallibleAllocPolicy::reportAllocOverflow;
+  using ::InfallibleAllocPolicy::checkSimulatedOOM;
+};
+
+#endif /* js_AllocPolicy_h */

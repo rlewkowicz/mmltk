@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_MEDIACONTROL_AUDIOSESSIONMANAGER_H_
+#define DOM_MEDIA_MEDIACONTROL_AUDIOSESSIONMANAGER_H_
+
+#include "AudioSessionRecord.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/DefineEnum.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/dom/AudioSessionBinding.h"
+#include "nsTHashMap.h"
+#include "nsTHashSet.h"
+
+namespace mozilla::dom {
+
+class MediaController;
+
+MOZ_DEFINE_ENUM_CLASS_WITH_BASE_AND_TOSTRING(AudioSessionInterruptKind, uint8_t,
+                                             (Transient, Permanent));
+
+class AudioSessionManager final {
+ public:
+  explicit AudioSessionManager(MediaController* aController);
+  ~AudioSessionManager() = default;
+
+  AudioSessionManager(const AudioSessionManager&) = delete;
+  AudioSessionManager& operator=(const AudioSessionManager&) = delete;
+
+  void SetTypeOverride(uint64_t aBrowsingContextId, AudioSessionType aType);
+  void NotifyAudibilityChanged(uint64_t aBrowsingContextId);
+  void NotifyBcDiscarded(uint64_t aBrowsingContextId);
+
+  void InterruptAudioSessions(AudioSessionInterruptKind aKind);
+  void RestoreAudioSessions();
+
+  AudioSessionType EffectiveTypeForBc(uint64_t aBrowsingContextId) const;
+
+  AudioSessionType GetEffectiveType() const;
+
+  const AudioSessionRecord* GetRecordForTesting(
+      uint64_t aBrowsingContextId) const;
+
+ private:
+  Maybe<AudioSessionType> GetSelectedAudioSessionType() const;
+
+  void UpdateSelectedAudioSession();
+
+  void InactivateAudioSession(uint64_t aBrowsingContextId);
+
+  void TryActivateAudioSession(uint64_t aBrowsingContextId);
+
+  void SetAudioSessionState(uint64_t aBrowsingContextId,
+                            AudioSessionState aNewState);
+
+  void RemoveRecordIfEmpty(uint64_t aBrowsingContextId);
+
+  void AddInterruptedBcId(uint64_t aBrowsingContextId);
+  void RemoveInterruptedBcId(uint64_t aBrowsingContextId);
+  void ClearInterruptedBcIds();
+
+  void UpdateAllAudioSessionStates(uint64_t aUpdatedBcId);
+
+  bool IsBcAutoTyped(uint64_t aBrowsingContextId) const;
+
+  void MaybeFireEffectiveTypeChanged();
+
+  MediaController* const MOZ_NON_OWNING_REF mController;
+
+  nsTHashMap<nsUint64HashKey, AudioSessionRecord> mAudioSessions;
+
+  Maybe<uint64_t> mSelectedAudioSessionBcId;
+
+  AudioSessionType mLastDispatchedEffectiveType = AudioSessionType::Auto;
+
+  nsTHashSet<uint64_t> mInterruptedBcIds;
+};
+
+}  
+
+#endif  // DOM_MEDIA_MEDIACONTROL_AUDIOSESSIONMANAGER_H_

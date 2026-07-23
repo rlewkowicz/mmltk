@@ -1,0 +1,2052 @@
+/*
+ * Copyright 2014 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "wasm/WasmFrameIter.h"
+
+#include "jit/JitFrames.h"
+#include "jit/JitRuntime.h"
+#include "jit/shared/IonAssemblerBuffer.h"  // jit::BufferOffset
+#include "js/ColumnNumber.h"  // JS::WasmFunctionIndex, LimitedColumnNumberOneOrigin, JS::TaggedColumnNumberOneOrigin, JS::TaggedColumnNumberOneOrigin
+#include "vm/JitActivation.h"  // js::jit::JitActivation
+#include "vm/JSAtomState.h"
+#include "vm/JSContext.h"
+#include "wasm/WasmBuiltinModuleGenerated.h"
+#include "wasm/WasmDebugFrame.h"
+#include "wasm/WasmInstance.h"
+#include "wasm/WasmInstanceData.h"
+#include "wasm/WasmPI.h"
+#include "wasm/WasmStacks.h"
+#include "wasm/WasmStubs.h"
+
+#include "jit/MacroAssembler-inl.h"
+#include "wasm/WasmInstance-inl.h"
+
+
+using namespace js;
+using namespace js::jit;
+using namespace js::wasm;
+
+using mozilla::DebugOnly;
+using mozilla::Maybe;
+
+static Instance* ExtractCallerInstanceFromFrameWithInstances(Frame* fp) {
+  return *reinterpret_cast<Instance**>(
+      reinterpret_cast<uint8_t*>(fp) +
+      FrameWithInstances::callerInstanceOffset());
+}
+
+static const Instance* ExtractCalleeInstanceFromFrameWithInstances(
+    const Frame* fp) {
+  return *reinterpret_cast<Instance* const*>(
+      reinterpret_cast<const uint8_t*>(fp) +
+      FrameWithInstances::calleeInstanceOffset());
+}
+
+static uint32_t FuncIndexForBytecodeOffset(const Code& code,
+                                           uint32_t bytecodeOffset,
+                                           const CodeRange& codeRange) {
+  if (bytecodeOffset == CallSite::NO_BYTECODE_OFFSET) {
+    return codeRange.funcIndex();
+  }
+  return code.codeTailMeta().findFuncIndex(bytecodeOffset);
+}
+
+
+WasmFrameIter::WasmFrameIter(JitActivation* activation, wasm::Frame* fp)
+    : cx_(activation->cx()),
+      activation_(activation),
+      fp_(fp ? fp : activation->wasmExitFP())
+#if defined(ENABLE_WASM_JSPI)
+      ,
+      contStack_(nullptr)
+#endif
+{
+  MOZ_ASSERT(fp_);
+  instance_ = GetNearestEffectiveInstance(fp_);
+
+#if defined(ENABLE_WASM_JSPI)
+  contStack_ =
+      cx()->wasm().findStackForAddress(cx(), reinterpret_cast<uintptr_t>(fp_));
+  bool dynamicSwitchToMainStack = contStack_ && fp_ == activation->wasmExitFP();
+#endif
+
+
+  if (activation->isWasmTrapping() && fp_ == activation->wasmExitFP()) {
+    const TrapData& trapData = activation->wasmTrapData();
+    void* unwoundPC = trapData.unwoundPC;
+
+    code_ = &instance_->code();
+    MOZ_ASSERT(code_ == LookupCode(unwoundPC));
+
+    const CodeRange* codeRange = code_->lookupFuncRange(unwoundPC);
+    bytecodeOffset_ = trapData.trapSite.bytecodeOffset.offset();
+    funcIndex_ =
+        FuncIndexForBytecodeOffset(*code_, bytecodeOffset_, *codeRange);
+    inlinedCallerOffsets_ = trapData.trapSite.inlinedCallerOffsetsSpan();
+    failedUnwindSignatureMismatch_ = trapData.failedUnwindSignatureMismatch;
+#if defined(ENABLE_WASM_JSPI)
+    currentFrameStackSwitched_ = dynamicSwitchToMainStack;
+#endif
+
+    CallSite site;
+    if (code_->lookupCallSite(unwoundPC, &site) &&
+        site.kind() == CallSiteKind::ReturnStub) {
+      MOZ_ASSERT(trapData.trap == Trap::IndirectCallBadSig);
+      resumePCinCurrentFrame_ = (uint8_t*)unwoundPC;
+    } else {
+      resumePCinCurrentFrame_ = (uint8_t*)trapData.resumePC;
+    }
+
+    MOZ_ASSERT(!done());
+    return;
+  }
+
+
+  popFrame(false);
+  MOZ_ASSERT(!done() || unwoundCallerFP_);
+
+#if defined(ENABLE_WASM_JSPI)
+  if (!done()) {
+    currentFrameStackSwitched_ = dynamicSwitchToMainStack;
+  }
+#endif
+}
+
+WasmFrameIter::WasmFrameIter(Instance* instance, Frame* fp, void* returnAddress)
+    : cx_(instance->cx()),
+      activation_(nullptr),
+      bytecodeOffset_(0),
+      fp_(fp),
+      instance_(instance),
+      resumePCinCurrentFrame_((uint8_t*)returnAddress)
+#if defined(ENABLE_WASM_JSPI)
+      ,
+      contStack_(nullptr)
+#endif
+{
+  const CodeRange* codeRange;
+  code_ = LookupCode(returnAddress, &codeRange);
+
+  MOZ_RELEASE_ASSERT(code_);
+#if defined(ENABLE_WASM_JSPI)
+  MOZ_RELEASE_ASSERT(codeRange->kind() == CodeRange::Function ||
+                     codeRange->kind() == CodeRange::ContBaseFrame);
+#else
+  MOZ_RELEASE_ASSERT(codeRange->kind() == CodeRange::Function);
+#endif
+
+  if (codeRange->kind() == CodeRange::Function) {
+    CallSite site;
+    MOZ_ALWAYS_TRUE(code_->lookupCallSite(returnAddress, &site));
+    MOZ_RELEASE_ASSERT(site.mightBeCrossInstance());
+
+#if defined(ENABLE_WASM_JSPI)
+    currentFrameStackSwitched_ = site.isStackSwitch();
+    contStack_ = cx()->wasm().findStackForAddress(
+        cx(), reinterpret_cast<uintptr_t>(fp_));
+#endif
+
+    MOZ_ASSERT(code_ == &instance_->code());
+    bytecodeOffset_ = site.bytecodeOffset();
+    funcIndex_ =
+        FuncIndexForBytecodeOffset(*code_, site.bytecodeOffset(), *codeRange);
+    inlinedCallerOffsets_ = site.inlinedCallerOffsetsSpan();
+
+    MOZ_ASSERT(!done());
+  }
+#if defined(ENABLE_WASM_JSPI)
+  else if (codeRange->kind() == CodeRange::ContBaseFrame) {
+    currentFrameStackSwitched_ = false;
+    contStack_ = nullptr;
+    bytecodeOffset_ = 0;
+    funcIndex_ = 0;
+    inlinedCallerOffsets_ = BytecodeOffsetSpan();
+    fp_ = nullptr;
+    code_ = nullptr;
+    resumePCinCurrentFrame_ = nullptr;
+    MOZ_ASSERT(done());
+  }
+#endif
+}
+
+bool WasmFrameIter::done() const {
+  MOZ_ASSERT(!!fp_ == !!code_);
+  return !fp_;
+}
+
+void WasmFrameIter::operator++() {
+  MOZ_ASSERT(!done());
+  popFrame(isLeavingFrames_);
+}
+
+static inline void AssertJitExitFrame(const void* fp,
+                                      jit::ExitFrameType expected) {
+#if defined(DEBUG)
+  auto* jitCaller = (ExitFrameLayout*)fp;
+  MOZ_ASSERT(jitCaller->footer()->type() == expected);
+#endif
+}
+
+static inline void AssertDirectJitCall(const void* fp) {
+  AssertJitExitFrame(fp, jit::ExitFrameType::DirectWasmJitCall);
+}
+
+void WasmFrameIter::popFrame(bool isLeavingFrame) {
+  if (enableInlinedFrames_ && inlinedCallerOffsets_.size() > 0) {
+    MOZ_ASSERT(!code_->debugEnabled());
+
+    const BytecodeOffset* first = inlinedCallerOffsets_.data();
+    const BytecodeOffset* last =
+        inlinedCallerOffsets_.data() + inlinedCallerOffsets_.size() - 1;
+    bytecodeOffset_ = last->offset();
+    inlinedCallerOffsets_ = BytecodeOffsetSpan(first, last);
+    MOZ_ASSERT(bytecodeOffset_ != CallSite::NO_BYTECODE_OFFSET);
+    funcIndex_ = code_->codeTailMeta().findFuncIndex(bytecodeOffset_);
+    currentFrameStackSwitched_ = false;
+    failedUnwindSignatureMismatch_ = false;
+    resumePCinCurrentFrame_ = nullptr;
+    return;
+  }
+
+  uint8_t* returnAddress = fp_->returnAddress();
+  const CodeRange* codeRange;
+  code_ = LookupCode(returnAddress, &codeRange);
+#if defined(ENABLE_WASM_JSPI)
+  currentFrameStackSwitched_ = false;
+#endif
+
+  if (isLeavingFrame) {
+    MOZ_ASSERT(activation_->hasWasmExitFP());
+
+    if (activation_->isWasmTrapping()) {
+      activation_->finishWasmTrap();
+    }
+  }
+
+  if (!code_) {
+    AssertDirectJitCall(fp_->jitEntryCaller());
+
+    unwoundCallerFP_ = fp_->jitEntryCaller();
+    unwoundCallerFPIsJSJit_ = true;
+    unwoundAddressOfReturnAddress_ = fp_->addressOfReturnAddress();
+
+    if (isLeavingFrame) {
+      activation_->setJSExitFP(unwoundCallerFP_);
+    }
+
+    fp_ = nullptr;
+    code_ = nullptr;
+    funcIndex_ = UINT32_MAX;
+    bytecodeOffset_ = UINT32_MAX;
+    inlinedCallerOffsets_ = BytecodeOffsetSpan();
+    resumePCinCurrentFrame_ = nullptr;
+
+    MOZ_ASSERT(done());
+    return;
+  }
+
+  MOZ_ASSERT(codeRange);
+
+  Frame* prevFP = fp_;
+  fp_ = fp_->wasmCaller();
+  resumePCinCurrentFrame_ = returnAddress;
+
+  if (codeRange->isInterpEntry()) {
+    unwoundCallerFP_ = reinterpret_cast<uint8_t*>(fp_);
+    MOZ_ASSERT(!unwoundCallerFPIsJSJit_);
+    unwoundAddressOfReturnAddress_ = prevFP->addressOfReturnAddress();
+
+    fp_ = nullptr;
+    code_ = nullptr;
+    funcIndex_ = UINT32_MAX;
+    bytecodeOffset_ = UINT32_MAX;
+    inlinedCallerOffsets_ = BytecodeOffsetSpan();
+
+    if (isLeavingFrame) {
+      activation_->setWasmExitFP(nullptr);
+    }
+
+    MOZ_ASSERT(done());
+    return;
+  }
+
+  if (codeRange->isJitEntry()) {
+    unwoundCallerFP_ = reinterpret_cast<uint8_t*>(fp_);
+    unwoundCallerFPIsJSJit_ = true;
+    AssertJitExitFrame(unwoundCallerFP_,
+                       jit::ExitFrameType::WasmGenericJitEntry);
+    unwoundAddressOfReturnAddress_ = prevFP->addressOfReturnAddress();
+
+    fp_ = nullptr;
+    code_ = nullptr;
+    funcIndex_ = UINT32_MAX;
+    bytecodeOffset_ = UINT32_MAX;
+    inlinedCallerOffsets_ = BytecodeOffsetSpan();
+
+    if (isLeavingFrame) {
+      activation_->setJSExitFP(unwoundCallerFP());
+    }
+
+    MOZ_ASSERT(done());
+    return;
+  }
+
+#if defined(ENABLE_WASM_JSPI)
+  if (codeRange->isContBaseFrame()) {
+    ContStack* stack = ContStack::fromBaseFrameFP(fp_);
+    MOZ_ASSERT(cx()->wasm().findStackForAddress(
+                   cx(), reinterpret_cast<uintptr_t>(fp_)) == stack);
+    MOZ_ASSERT(stack == contStack_);
+
+    const Handlers* handlers = stack->handlers();
+    fp_ = (wasm::Frame*)handlers->returnTarget.framePointer;
+    returnAddress = (uint8_t*)handlers->returnTarget.resumePC;
+    instance_ = handlers->returnTarget.instance;
+    code_ = LookupCode(returnAddress, &codeRange);
+    resumePCinCurrentFrame_ = returnAddress;
+
+    CallSite site;
+    MOZ_ALWAYS_TRUE(code_->lookupCallSite(returnAddress, &site));
+    MOZ_ASSERT(site.kind() == CallSiteKind::StackSwitch);
+
+    funcIndex_ =
+        FuncIndexForBytecodeOffset(*code_, site.bytecodeOffset(), *codeRange);
+    inlinedCallerOffsets_ = site.inlinedCallerOffsetsSpan();
+    failedUnwindSignatureMismatch_ = false;
+
+    currentFrameStackSwitched_ = true;
+    contStack_ = handlers->returnTarget.stack->stack;
+
+    if (isLeavingFrame) {
+      activation_->setWasmExitFP(prevFP);
+    }
+
+    MOZ_ASSERT(!done());
+    return;
+  }
+#endif
+
+  MOZ_ASSERT(codeRange->kind() == CodeRange::Function);
+
+  CallSite site;
+  MOZ_ALWAYS_TRUE(code_->lookupCallSite(returnAddress, &site));
+
+  if (site.mightBeCrossInstance()) {
+    instance_ = ExtractCallerInstanceFromFrameWithInstances(prevFP);
+  }
+
+#if defined(ENABLE_WASM_JSPI)
+  MOZ_RELEASE_ASSERT(!site.isStackSwitch());
+  currentFrameStackSwitched_ = false;
+#endif
+
+  MOZ_ASSERT(code_ == &instance_->code());
+
+  bytecodeOffset_ = site.bytecodeOffset();
+  funcIndex_ =
+      FuncIndexForBytecodeOffset(*code_, site.bytecodeOffset(), *codeRange);
+  inlinedCallerOffsets_ = site.inlinedCallerOffsetsSpan();
+  failedUnwindSignatureMismatch_ = false;
+
+  if (isLeavingFrame) {
+    activation_->setWasmExitFP(prevFP);
+  }
+
+  MOZ_ASSERT(!done());
+}
+
+bool WasmFrameIter::hasSourceInfo() const {
+  return enableInlinedFrames_ || code_->debugEnabled();
+}
+
+const char* WasmFrameIter::filename() const {
+  MOZ_ASSERT(!done());
+  MOZ_ASSERT(hasSourceInfo());
+  return code_->codeMeta().scriptedCaller().source.get();
+}
+
+JSAtom* WasmFrameIter::functionDisplayAtom() const {
+  MOZ_ASSERT(!done());
+  MOZ_ASSERT(hasSourceInfo());
+
+  JSAtom* atom = instance_->getFuncDisplayAtom(cx(), funcIndex_);
+  if (!atom) {
+    cx()->clearPendingException();
+    return cx()->names().empty_;
+  }
+
+  return atom;
+}
+
+unsigned WasmFrameIter::bytecodeOffset() const {
+  MOZ_ASSERT(!done());
+  MOZ_ASSERT(hasSourceInfo());
+  return bytecodeOffset_;
+}
+
+uint32_t WasmFrameIter::funcIndex() const {
+  MOZ_ASSERT(!done());
+  MOZ_ASSERT(hasSourceInfo());
+  return funcIndex_;
+}
+
+unsigned WasmFrameIter::computeLine(
+    JS::TaggedColumnNumberOneOrigin* column) const {
+  MOZ_ASSERT(!done());
+  MOZ_ASSERT(hasSourceInfo());
+
+  MOZ_ASSERT(!(funcIndex_ & JS::TaggedColumnNumberOneOrigin::WasmFunctionTag));
+  if (column) {
+    *column =
+        JS::TaggedColumnNumberOneOrigin(JS::WasmFunctionIndex(funcIndex_));
+  }
+  return bytecodeOffset_;
+}
+
+bool WasmFrameIter::debugEnabled() const {
+  MOZ_ASSERT(!done());
+
+  if (!code_->debugEnabled()) {
+    return false;
+  }
+
+  if (failedUnwindSignatureMismatch_) {
+    return false;
+  }
+
+  if (funcIndex_ < code_->funcImports().length()) {
+    return false;
+  }
+
+  CallSite site;
+  return !(code_->lookupCallSite((void*)resumePCinCurrentFrame_, &site) &&
+           site.kind() == CallSiteKind::ReturnStub);
+}
+
+DebugFrame* WasmFrameIter::debugFrame() const {
+  MOZ_ASSERT(!done());
+  return DebugFrame::from(fp_);
+}
+
+
+#if defined(JS_CODEGEN_X64)
+static const unsigned PushedRetAddr = 0;
+static const unsigned PushedFP = 1;
+static const unsigned SetFP = 4;
+static const unsigned PoppedFP = 0;
+static const unsigned PoppedFPJitEntry = 0;
+#elif defined(JS_CODEGEN_X86)
+static const unsigned PushedRetAddr = 0;
+static const unsigned PushedFP = 1;
+static const unsigned SetFP = 3;
+static const unsigned PoppedFP = 0;
+static const unsigned PoppedFPJitEntry = 0;
+#elif defined(JS_CODEGEN_ARM)
+static const unsigned BeforePushRetAddr = 0;
+static const unsigned PushedRetAddr = 4;
+static const unsigned PushedFP = 8;
+static const unsigned SetFP = 12;
+static const unsigned PoppedFP = 0;
+static const unsigned PoppedFPJitEntry = 0;
+#elif defined(JS_CODEGEN_ARM64)
+static const unsigned BeforePushRetAddr = 0;
+static const unsigned PushedRetAddr = 4;
+static const unsigned PushedFP = 4;
+static const unsigned SetFP = 8;
+static const unsigned PoppedFP = 4;
+static const unsigned PoppedFPJitEntry = 4;
+static_assert(BeforePushRetAddr == 0, "Required by StartUnwinding");
+#elif defined(JS_CODEGEN_MIPS64)
+static const unsigned PushedRetAddr = 8;
+static const unsigned PushedFP = 16;
+static const unsigned SetFP = 20;
+static const unsigned PoppedFP = 4;
+static const unsigned PoppedFPJitEntry = 8;
+#elif defined(JS_CODEGEN_LOONG64)
+static const unsigned PushedRetAddr = 8;
+static const unsigned PushedFP = 16;
+static const unsigned SetFP = 20;
+static const unsigned PoppedFP = 4;
+static const unsigned PoppedFPJitEntry = 8;
+#elif defined(JS_CODEGEN_RISCV64)
+static const unsigned PushedRetAddr = 8;
+static const unsigned PushedFP = 16;
+static const unsigned SetFP = 20;
+static const unsigned PoppedFP = 4;
+static const unsigned PoppedFPJitEntry = 8;
+#elif defined(JS_CODEGEN_NONE) || defined(JS_CODEGEN_WASM32)
+static const unsigned PushedRetAddr = 0;
+static const unsigned PushedFP = 1;
+static const unsigned SetFP = 2;
+static const unsigned PoppedFP = 3;
+static const unsigned PoppedFPJitEntry = 4;
+#else
+#  error "Unknown architecture!"
+#endif
+
+void wasm::LoadActivation(MacroAssembler& masm, Register instance,
+                          Register dest) {
+  masm.loadPtr(Address(instance, wasm::Instance::offsetOfCx()), dest);
+  masm.loadPtr(Address(dest, JSContext::offsetOfActivation()), dest);
+}
+
+void wasm::SetExitFP(MacroAssembler& masm, ExitReason reason,
+                     Register activation, Register scratch) {
+  MOZ_ASSERT(!reason.isNone());
+  MOZ_ASSERT(activation != scratch);
+
+  masm.store32(
+      Imm32(reason.encode()),
+      Address(activation, JitActivation::offsetOfEncodedWasmExitReason()));
+
+  masm.orPtr(Imm32(ExitFPTag), FramePointer, scratch);
+
+  masm.storePtr(scratch,
+                Address(activation, JitActivation::offsetOfPackedExitFP()));
+}
+
+void wasm::ClearExitFP(MacroAssembler& masm, Register activation) {
+  masm.storePtr(ImmWord(0x0),
+                Address(activation, JitActivation::offsetOfPackedExitFP()));
+  masm.store32(
+      Imm32(0x0),
+      Address(activation, JitActivation::offsetOfEncodedWasmExitReason()));
+}
+
+static void GenerateCallablePrologue(MacroAssembler& masm, uint32_t* entry) {
+  AutoCreatedBy acb(masm, "GenerateCallablePrologue");
+  masm.setFramePushed(0);
+
+
+#if defined(JS_CODEGEN_MIPS64)
+  {
+    *entry = masm.currentOffset();
+
+    masm.ma_push(ra);
+    MOZ_ASSERT_IF(!masm.oom(), PushedRetAddr == masm.currentOffset() - *entry);
+    masm.ma_push(FramePointer);
+    MOZ_ASSERT_IF(!masm.oom(), PushedFP == masm.currentOffset() - *entry);
+    masm.moveStackPtrTo(FramePointer);
+    MOZ_ASSERT_IF(!masm.oom(), SetFP == masm.currentOffset() - *entry);
+  }
+#elif defined(JS_CODEGEN_LOONG64)
+  {
+    *entry = masm.currentOffset();
+
+    masm.ma_push(ra);
+    MOZ_ASSERT_IF(!masm.oom(), PushedRetAddr == masm.currentOffset() - *entry);
+    masm.ma_push(FramePointer);
+    MOZ_ASSERT_IF(!masm.oom(), PushedFP == masm.currentOffset() - *entry);
+    masm.moveStackPtrTo(FramePointer);
+    MOZ_ASSERT_IF(!masm.oom(), SetFP == masm.currentOffset() - *entry);
+  }
+#elif defined(JS_CODEGEN_RISCV64)
+  {
+    AutoForbidPoolsAndNops afp(&masm, 5);
+
+    *entry = masm.currentOffset();
+    masm.ma_push(ra);
+    MOZ_ASSERT_IF(!masm.oom(), PushedRetAddr == masm.currentOffset() - *entry);
+    masm.ma_push(FramePointer);
+    MOZ_ASSERT_IF(!masm.oom(), PushedFP == masm.currentOffset() - *entry);
+    masm.moveStackPtrTo(FramePointer);
+    MOZ_ASSERT_IF(!masm.oom(), SetFP == masm.currentOffset() - *entry);
+  }
+#elif defined(JS_CODEGEN_ARM64)
+  {
+    const vixl::Register stashedSPreg = masm.GetStackPointer64();
+    masm.SetStackPointer64(vixl::sp);
+
+    AutoForbidPoolsAndNops afp(&masm,
+                                2);
+
+    *entry = masm.currentOffset();
+
+    static_assert(Frame::callerFPOffset() == 0 &&
+                  Frame::returnAddressOffset() == 8);
+    masm.Stp(ARMRegister(FramePointer, 64), ARMRegister(lr, 64),
+             MemOperand(sp, -(int64_t)sizeof(Frame), vixl::PreIndex));
+    MOZ_ASSERT_IF(!masm.oom(), PushedRetAddr == masm.currentOffset() - *entry);
+    MOZ_ASSERT_IF(!masm.oom(), PushedFP == masm.currentOffset() - *entry);
+    masm.Mov(ARMRegister(FramePointer, 64), sp);
+    MOZ_ASSERT_IF(!masm.oom(), SetFP == masm.currentOffset() - *entry);
+
+    masm.SetStackPointer64(stashedSPreg);
+  }
+#else
+  {
+#if defined(JS_CODEGEN_ARM)
+    AutoForbidPoolsAndNops afp(&masm,
+                                3);
+
+    *entry = masm.currentOffset();
+
+    static_assert(BeforePushRetAddr == 0);
+    masm.push(lr);
+#else
+    *entry = masm.currentOffset();
+#endif
+
+    MOZ_ASSERT_IF(!masm.oom(), PushedRetAddr == masm.currentOffset() - *entry);
+    masm.push(FramePointer);
+    MOZ_ASSERT_IF(!masm.oom(), PushedFP == masm.currentOffset() - *entry);
+    masm.moveStackPtrTo(FramePointer);
+    MOZ_ASSERT_IF(!masm.oom(), SetFP == masm.currentOffset() - *entry);
+  }
+#endif
+}
+
+static void GenerateCallableEpilogue(MacroAssembler& masm, unsigned framePushed,
+                                     uint32_t* ret) {
+  AutoCreatedBy acb(masm, "GenerateCallableEpilogue");
+
+  if (framePushed) {
+    masm.freeStack(framePushed);
+  }
+
+  DebugOnly<uint32_t> poppedFP{};
+
+#if defined(JS_CODEGEN_MIPS64)
+
+  masm.loadPtr(Address(StackPointer, Frame::callerFPOffset()), FramePointer);
+  poppedFP = masm.currentOffset();
+  masm.loadPtr(Address(StackPointer, Frame::returnAddressOffset()), ra);
+
+  *ret = masm.currentOffset();
+  masm.as_jr(ra);
+  masm.addToStackPtr(Imm32(sizeof(Frame)));
+
+#elif defined(JS_CODEGEN_LOONG64)
+
+  masm.loadPtr(Address(StackPointer, Frame::returnAddressOffset()), ra);
+  masm.loadPtr(Address(StackPointer, Frame::callerFPOffset()), FramePointer);
+  poppedFP = masm.currentOffset();
+
+  masm.addToStackPtr(Imm32(sizeof(Frame)));
+  *ret = masm.currentOffset();
+  masm.as_jirl(zero, ra, BOffImm16(0));
+
+#elif defined(JS_CODEGEN_RISCV64)
+  {
+    AutoForbidPoolsAndNops afp(&masm, 20);
+
+    masm.loadPtr(Address(StackPointer, Frame::callerFPOffset()), FramePointer);
+    poppedFP = masm.currentOffset();
+    masm.loadPtr(Address(StackPointer, Frame::returnAddressOffset()), ra);
+
+    *ret = masm.currentOffset();
+    masm.addToStackPtr(Imm32(sizeof(Frame)));
+    masm.jalr(zero, ra, 0);
+    masm.nop();
+  }
+#elif defined(JS_CODEGEN_ARM64)
+
+  const vixl::Register stashedSPreg = masm.GetStackPointer64();
+  masm.SetStackPointer64(vixl::sp);
+
+  AutoForbidPoolsAndNops afp(&masm,  3);
+
+  static_assert(Frame::callerFPOffset() == 0 &&
+                Frame::returnAddressOffset() == 8);
+  masm.Ldp(ARMRegister(FramePointer, 64), ARMRegister(lr, 64),
+           MemOperand(sp, sizeof(Frame), vixl::PostIndex));
+  poppedFP = masm.currentOffset();
+
+  masm.Mov(PseudoStackPointer64, vixl::sp);
+
+  *ret = masm.currentOffset();
+  masm.Ret(ARMRegister(lr, 64));
+
+  masm.SetStackPointer64(stashedSPreg);
+
+#else
+#if defined(JS_CODEGEN_ARM)
+  AutoForbidPoolsAndNops afp(&masm,  6);
+#endif
+
+
+  masm.pop(FramePointer);
+  poppedFP = masm.currentOffset();
+
+  *ret = masm.currentOffset();
+  masm.ret();
+
+#endif
+
+  MOZ_ASSERT_IF(!masm.oom(), PoppedFP == *ret - poppedFP);
+}
+
+void wasm::GenerateMinimalPrologue(MacroAssembler& masm, uint32_t* entry) {
+  MOZ_ASSERT(masm.framePushed() == 0);
+  GenerateCallablePrologue(masm, entry);
+}
+
+void wasm::GenerateMinimalEpilogue(MacroAssembler& masm, uint32_t* ret) {
+  MOZ_ASSERT(masm.framePushed() == 0);
+  GenerateCallableEpilogue(masm, 0, ret);
+}
+
+void wasm::GenerateFunctionPrologue(MacroAssembler& masm,
+                                    const CallIndirectId& callIndirectId,
+                                    const Maybe<uint32_t>& tier1FuncIndex,
+                                    FuncOffsets* offsets) {
+  AutoCreatedBy acb(masm, "wasm::GenerateFunctionPrologue");
+
+
+  static_assert(WasmCheckedCallEntryOffset % CodeAlignment == 0,
+                "code aligned");
+
+#if defined(JS_CODEGEN_ARM) || defined(JS_CODEGEN_ARM64) || \
+    defined(JS_CODEGEN_RISCV64)
+  AutoForbidNops afn(&masm);
+#endif
+
+  masm.flushBuffer();
+  masm.haltingAlign(CodeAlignment);
+
+  Label functionBody;
+
+  offsets->begin = masm.currentOffset();
+
+  if (callIndirectId.kind() != CallIndirectIdKind::None) {
+    MOZ_ASSERT_IF(!masm.oom(), masm.currentOffset() - offsets->begin ==
+                                   WasmCheckedCallEntryOffset);
+    uint32_t dummy;
+    GenerateCallablePrologue(masm, &dummy);
+
+    switch (callIndirectId.kind()) {
+      case CallIndirectIdKind::Global: {
+        Label fail;
+        Register scratch1 = WasmTableCallScratchReg0;
+        Register scratch2 = WasmTableCallScratchReg1;
+
+        masm.loadPtr(
+            Address(InstanceReg,
+                    Instance::offsetInData(
+                        callIndirectId.instanceDataOffset() +
+                        offsetof(wasm::TypeDefInstanceData, superTypeVector))),
+            scratch1);
+
+        if (callIndirectId.hasSuperType()) {
+          masm.branchPtr(Assembler::Condition::Equal, WasmTableCallSigReg,
+                         scratch1, &functionBody);
+
+
+          masm.branchTestPtr(Assembler::Condition::NonZero, WasmTableCallSigReg,
+                             Imm32(FuncType::ImmediateBit), &fail);
+
+          Register subTypingDepth = WasmTableCallIndexReg;
+          masm.load32(
+              Address(WasmTableCallSigReg,
+                      int32_t(SuperTypeVector::offsetOfSubTypingDepth())),
+              subTypingDepth);
+
+          masm.branchWasmSTVIsSubtypeDynamicDepth(scratch1, WasmTableCallSigReg,
+                                                  subTypingDepth, scratch2,
+                                                  &fail, false);
+        } else {
+          masm.branchPtr(Assembler::Condition::NotEqual, WasmTableCallSigReg,
+                         scratch1, &fail);
+        }
+        masm.jump(&functionBody);
+
+        masm.bind(&fail);
+        masm.wasmTrap(Trap::IndirectCallBadSig, TrapSiteDesc());
+        break;
+      }
+      case CallIndirectIdKind::Immediate: {
+        Label fail;
+        masm.branch32(Assembler::Condition::NotEqual, WasmTableCallSigReg,
+                      Imm32(callIndirectId.immediate()), &fail);
+        masm.jump(&functionBody);
+
+        masm.bind(&fail);
+        masm.wasmTrap(Trap::IndirectCallBadSig, TrapSiteDesc());
+        break;
+      }
+      case CallIndirectIdKind::None:
+        break;
+    }
+
+
+    masm.nopAlign(CodeAlignment);
+  }
+
+  DebugOnly<uint32_t> expectedEntry = masm.currentOffset();
+  GenerateCallablePrologue(masm, &offsets->uncheckedCallEntry);
+  MOZ_ASSERT(expectedEntry == offsets->uncheckedCallEntry);
+  masm.bind(&functionBody);
+#if defined(JS_CODEGEN_ARM64)
+  masm.Mov(PseudoStackPointer64, vixl::sp);
+#endif
+
+  if (tier1FuncIndex) {
+    Register scratch = ABINonArgReg0;
+    masm.loadPtr(Address(InstanceReg, Instance::offsetOfJumpTable()), scratch);
+    masm.jump(Address(scratch, *tier1FuncIndex * sizeof(uintptr_t)));
+  }
+
+  offsets->tierEntry = masm.currentOffset();
+
+  MOZ_ASSERT(masm.framePushed() == 0);
+}
+
+void wasm::GenerateFunctionEpilogue(MacroAssembler& masm, unsigned framePushed,
+                                    FuncOffsets* offsets) {
+  MOZ_ASSERT(masm.framePushed() == framePushed);
+  GenerateCallableEpilogue(masm, framePushed, &offsets->ret);
+  MOZ_ASSERT(masm.framePushed() == 0);
+}
+
+#if defined(ENABLE_WASM_JSPI)
+void wasm::GenerateExitPrologueMainStackSwitch(
+    MacroAssembler& masm, Address savedStackSlots, Register instance,
+    Register scratch1, Register scratch2, Register scratch3) {
+  MOZ_ASSERT(savedStackSlots.base != scratch1 &&
+             savedStackSlots.base != scratch2 &&
+             savedStackSlots.base != scratch3);
+  Address savedCurrentStackSlot = savedStackSlots;
+  Address savedBaseHandlersSlot =
+      Address(savedStackSlots.base, savedStackSlots.offset + sizeof(void*));
+
+  masm.loadPtr(Address(instance, wasm::Instance::offsetOfCx()), scratch1);
+
+  masm.loadPtr(Address(scratch1, JSContext::offsetOfWasm() +
+                                     wasm::Context::offsetOfCurrentStack()),
+               scratch2);
+
+  masm.storePtr(scratch2, savedCurrentStackSlot);
+
+  Label alreadyOnSystemStack;
+  masm.branchTestPtr(Assembler::Zero, scratch2, scratch2,
+                     &alreadyOnSystemStack);
+
+  masm.assertPtrNonZero(Address(
+      scratch1,
+      JSContext::offsetOfWasm() + wasm::Context::offsetOfBaseHandlers()));
+
+  masm.loadPtr(Address(scratch1, JSContext::offsetOfWasm() +
+                                     wasm::Context::offsetOfBaseHandlers()),
+               scratch3);
+  masm.storePtr(scratch3, savedBaseHandlersSlot);
+
+  masm.moveToStackPtr(scratch3);
+  masm.assertStackAlignment(WasmStackAlignment);
+
+  masm.loadPtr(Address(scratch1, JSContext::offsetOfWasm() +
+                                     wasm::Context::offsetOfMainStackTarget() +
+                                     offsetof(wasm::StackTarget, jitLimit)),
+               scratch2);
+  masm.storePtr(scratch2,
+                Address(scratch1, JSContext::offsetOfWasm() +
+                                      wasm::Context::offsetOfStackLimit()));
+
+  masm.storePtr(ImmWord(0),
+                Address(scratch1, JSContext::offsetOfWasm() +
+                                      wasm::Context::offsetOfCurrentStack()));
+  masm.storePtr(ImmWord(0),
+                Address(scratch1, JSContext::offsetOfWasm() +
+                                      wasm::Context::offsetOfBaseHandlers()));
+
+
+  masm.bind(&alreadyOnSystemStack);
+}
+
+void wasm::GenerateExitEpilogueMainStackReturn(MacroAssembler& masm,
+                                               jit::Address savedStackSlots,
+                                               Register instance,
+                                               Register scratch1,
+                                               Register scratch2) {
+  MOZ_ASSERT(savedStackSlots.base != scratch1 &&
+             savedStackSlots.base != scratch2);
+  Address savedCurrentStackSlot = savedStackSlots;
+  Address savedBaseHandlersSlot =
+      Address(savedStackSlots.base, savedStackSlots.offset + sizeof(void*));
+
+  masm.loadPtr(savedCurrentStackSlot, scratch2);
+
+  Label originallyOnSystemStack;
+  masm.branchTestPtr(Assembler::Zero, scratch2, scratch2,
+                     &originallyOnSystemStack);
+
+  masm.loadPtr(Address(InstanceReg, wasm::Instance::offsetOfCx()), scratch1);
+
+  masm.assertPtrZero(Address(
+      scratch1,
+      JSContext::offsetOfWasm() + wasm::Context::offsetOfCurrentStack()));
+  masm.assertPtrZero(Address(
+      scratch1,
+      JSContext::offsetOfWasm() + wasm::Context::offsetOfBaseHandlers()));
+
+  masm.storePtr(scratch2,
+                Address(scratch1, JSContext::offsetOfWasm() +
+                                      wasm::Context::offsetOfCurrentStack()));
+
+
+  {
+#if defined(JS_CODEGEN_ARM64)
+    masm.reserveStack(16);
+    masm.storePtr(instance, Address(masm.getStackPointer(), 0));
+#else
+    masm.Push(instance);
+#endif
+    Register scratch3 = instance;
+    masm.computeEffectiveAddress(
+        Address(scratch2, wasm::ContStack::offsetOfStackTarget()), scratch2);
+    EmitEnterStackTarget(masm, scratch1, scratch2, scratch3);
+
+#if defined(JS_CODEGEN_ARM64)
+    masm.loadPtr(Address(masm.getStackPointer(), 0), instance);
+    masm.freeStack(16);
+#else
+    masm.Pop(instance);
+#endif
+  }
+
+  masm.loadPtr(Address(InstanceReg, wasm::Instance::offsetOfCx()), scratch1);
+
+  masm.loadPtr(savedBaseHandlersSlot, scratch2);
+  masm.storePtr(scratch2,
+                Address(scratch1, JSContext::offsetOfWasm() +
+                                      wasm::Context::offsetOfBaseHandlers()));
+
+  masm.bind(&originallyOnSystemStack);
+}
+#endif
+
+void wasm::GenerateExitPrologue(MacroAssembler& masm, ExitReason reason,
+                                bool switchToMainStack,
+                                ExitFrameAlignment alignment,
+                                unsigned frameSize, CallableOffsets* offsets) {
+  MOZ_ASSERT(masm.framePushed() == 0);
+  MOZ_ASSERT_IF(alignment == ExitFrameAlignment::Dynamic, frameSize == 0);
+
+  masm.haltingAlign(CodeAlignment);
+  GenerateCallablePrologue(masm, &offsets->begin);
+
+  Register scratch1 = ABINonArgReg0;
+  Register scratch2 = ABINonArgReg1;
+#if defined(ENABLE_WASM_JSPI)
+  Register scratch3 = ABINonArgReg2;
+#endif
+
+  unsigned frameStaticAlignment = 0;
+  if (alignment == ExitFrameAlignment::Static) {
+    frameStaticAlignment =
+        ComputeByteAlignment(sizeof(Frame), ABIStackAlignment);
+  }
+
+  LoadActivation(masm, InstanceReg, scratch1);
+  SetExitFP(masm, reason, scratch1, scratch2);
+
+#if defined(ENABLE_WASM_JSPI)
+  if (switchToMainStack) {
+    uint32_t frameStackSaveSlots =
+        AlignBytes(sizeof(void*) * 2, ABIStackAlignment);
+    masm.reserveStack(frameStaticAlignment + frameStackSaveSlots);
+    uint32_t framePushedForSavedStack = masm.framePushed();
+    Address savedStackSlots(FramePointer,
+                            -static_cast<int32_t>(framePushedForSavedStack));
+
+    GenerateExitPrologueMainStackSwitch(masm, savedStackSlots, InstanceReg,
+                                        scratch1, scratch2, scratch3);
+
+    masm.setFramePushed(0);
+    masm.reserveStack(frameSize);
+  } else {
+    masm.reserveStack(frameStaticAlignment + frameSize);
+  }
+#else
+  masm.reserveStack(frameStaticAlignment + frameSize);
+#endif
+
+  if (alignment == ExitFrameAlignment::Dynamic) {
+#if defined(JS_CODEGEN_ARM64)
+    static_assert(ABIStackAlignment == 16, "ARM64 SP alignment");
+#else
+    Register scratch = ABINonArgReturnReg0;
+    masm.moveStackPtrTo(scratch);
+    masm.subFromStackPtr(Imm32(sizeof(intptr_t)));
+    masm.andToStackPtr(Imm32(~(ABIStackAlignment - 1)));
+    masm.storePtr(scratch, Address(masm.getStackPointer(), 0));
+#endif
+  }
+}
+
+void wasm::GenerateExitEpilogue(MacroAssembler& masm, ExitReason reason,
+                                bool switchToMainStack,
+                                ExitFrameAlignment alignment,
+                                CallableOffsets* offsets) {
+  Register scratch1 = ABINonArgReturnReg0;
+#if ENABLE_WASM_JSPI
+  Register scratch2 = ABINonArgReturnReg1;
+#endif
+
+  if (alignment == ExitFrameAlignment::Dynamic) {
+#if !defined(JS_CODEGEN_ARM64)
+    masm.pop(scratch1);
+    masm.moveToStackPtr(scratch1);
+#endif
+  }
+
+  LoadActivation(masm, InstanceReg, scratch1);
+  ClearExitFP(masm, scratch1);
+
+#if defined(ENABLE_WASM_JSPI)
+  if (switchToMainStack) {
+    unsigned frameStaticAlignment = 0;
+    if (alignment == ExitFrameAlignment::Static) {
+      frameStaticAlignment =
+          ComputeByteAlignment(sizeof(Frame), ABIStackAlignment);
+    }
+
+    uint32_t frameStackSaveSlots =
+        AlignBytes(sizeof(void*) * 2, ABIStackAlignment);
+    uint32_t framePushedForSavedStack =
+        frameStaticAlignment + frameStackSaveSlots;
+    Address savedStackSlots(FramePointer,
+                            -static_cast<int32_t>(framePushedForSavedStack));
+    GenerateExitEpilogueMainStackReturn(masm, savedStackSlots, InstanceReg,
+                                        scratch1, scratch2);
+  }
+#endif
+
+  masm.moveToStackPtr(FramePointer);
+  masm.setFramePushed(0);
+
+  GenerateCallableEpilogue(masm,  0, &offsets->ret);
+  MOZ_ASSERT(masm.framePushed() == 0);
+}
+
+static void AssertNoWasmExitFPInJitExit(MacroAssembler& masm) {
+#if defined(DEBUG)
+  Register scratch = ABINonArgReturnReg0;
+  LoadActivation(masm, InstanceReg, scratch);
+
+  Label ok;
+  masm.branchTestPtr(Assembler::Zero,
+                     Address(scratch, JitActivation::offsetOfPackedExitFP()),
+                     Imm32(ExitFPTag), &ok);
+  masm.breakpoint();
+  masm.bind(&ok);
+#endif
+}
+
+void wasm::GenerateJitExitPrologue(MacroAssembler& masm,
+                                   uint32_t fallbackOffset,
+                                   ImportOffsets* offsets) {
+  masm.haltingAlign(CodeAlignment);
+
+#if defined(ENABLE_WASM_JSPI)
+  {
+#if defined(JS_CODEGEN_ARM64)
+    AutoForbidPoolsAndNops afp(&masm,
+                                3);
+#endif
+    offsets->begin = masm.currentOffset();
+    Label fallback;
+    masm.bind(&fallback, BufferOffset(fallbackOffset));
+
+    const Register scratch = ABINonArgReg0;
+    masm.loadPtr(Address(InstanceReg, Instance::offsetOfCx()), scratch);
+    masm.loadPtr(Address(scratch, JSContext::offsetOfWasm() +
+                                      wasm::Context::offsetOfCurrentStack()),
+                 scratch);
+    masm.branchTestPtr(Assembler::NonZero, scratch, scratch, &fallback);
+  }
+
+  uint32_t entryOffset;
+  GenerateCallablePrologue(masm, &entryOffset);
+  offsets->afterFallbackCheck = entryOffset;
+#else
+  GenerateCallablePrologue(masm, &offsets->begin);
+  offsets->afterFallbackCheck = offsets->begin;
+#endif
+
+  AssertNoWasmExitFPInJitExit(masm);
+
+  MOZ_ASSERT(masm.framePushed() == 0);
+}
+
+void wasm::GenerateJitExitEpilogue(MacroAssembler& masm,
+                                   CallableOffsets* offsets) {
+  MOZ_ASSERT(masm.framePushed() == 0);
+  AssertNoWasmExitFPInJitExit(masm);
+  GenerateCallableEpilogue(masm,  0, &offsets->ret);
+  MOZ_ASSERT(masm.framePushed() == 0);
+}
+
+void wasm::GenerateJitEntryPrologue(MacroAssembler& masm,
+                                    CallableOffsets* offsets) {
+  masm.haltingAlign(CodeAlignment);
+
+  {
+#if defined(JS_CODEGEN_ARM)
+    AutoForbidPoolsAndNops afp(&masm,
+                                3);
+    offsets->begin = masm.currentOffset();
+    static_assert(BeforePushRetAddr == 0);
+    masm.push(lr);
+#elif defined(JS_CODEGEN_MIPS64)
+    offsets->begin = masm.currentOffset();
+    masm.push(ra);
+#elif defined(JS_CODEGEN_LOONG64)
+    offsets->begin = masm.currentOffset();
+    masm.push(ra);
+#elif defined(JS_CODEGEN_RISCV64)
+    AutoForbidPoolsAndNops afp(&masm, 10);
+    offsets->begin = masm.currentOffset();
+    masm.push(ra);
+#elif defined(JS_CODEGEN_ARM64)
+    AutoForbidPoolsAndNops afp(&masm,
+                                3);
+    offsets->begin = masm.currentOffset();
+    static_assert(BeforePushRetAddr == 0);
+    static_assert(JitFrameLayout::offsetOfCallerFramePtr() == 0);
+    static_assert(JitFrameLayout::offsetOfReturnAddress() == 8);
+    masm.Stp(ARMRegister(FramePointer, 64), ARMRegister(lr, 64),
+             MemOperand(sp, -16, vixl::PreIndex));
+#else
+    offsets->begin = masm.currentOffset();
+#endif
+    MOZ_ASSERT_IF(!masm.oom(),
+                  PushedRetAddr == masm.currentOffset() - offsets->begin);
+#if !defined(JS_CODEGEN_ARM64)
+    masm.Push(FramePointer);
+#endif
+    MOZ_ASSERT_IF(!masm.oom(),
+                  PushedFP == masm.currentOffset() - offsets->begin);
+
+    masm.moveStackPtrTo(FramePointer);
+    MOZ_ASSERT_IF(!masm.oom(), SetFP == masm.currentOffset() - offsets->begin);
+  }
+
+  masm.setFramePushed(0);
+}
+
+void wasm::GenerateJitEntryEpilogue(MacroAssembler& masm,
+                                    CallableOffsets* offsets) {
+  DebugOnly<uint32_t> poppedFP{};
+#if defined(JS_CODEGEN_ARM64)
+  {
+    const ARMRegister& sp = masm.GetStackPointer64();
+    AutoForbidPoolsAndNops afp(&masm,
+                                3);
+    masm.Ldp(ARMRegister(FramePointer, 64), ARMRegister(lr, 64),
+             MemOperand(sp, 2 * sizeof(void*), vixl::PostIndex));
+    poppedFP = masm.currentOffset();
+
+    masm.moveStackPtrTo(PseudoStackPointer);
+
+    offsets->ret = masm.currentOffset();
+    masm.Ret(ARMRegister(lr, 64));
+    masm.setFramePushed(0);
+  }
+#else
+#if defined(JS_CODEGEN_ARM)
+  AutoForbidPoolsAndNops afp(&masm,  2);
+#elif defined(JS_CODEGEN_RISCV64)
+  AutoForbidPoolsAndNops afp(&masm,  5);
+#endif
+
+  masm.pop(FramePointer);
+  poppedFP = masm.currentOffset();
+
+  offsets->ret = masm.ret().getOffset();
+#endif
+  MOZ_ASSERT_IF(!masm.oom(), PoppedFPJitEntry == offsets->ret - poppedFP);
+}
+
+
+ProfilingFrameIterator::ProfilingFrameIterator()
+    : code_(nullptr),
+      codeRange_(nullptr),
+      category_(Category::Other),
+      callerFP_(nullptr),
+      callerPC_(nullptr),
+      stackAddress_(nullptr),
+      unwoundJitCallerFP_(nullptr),
+      exitReason_(ExitReason::Fixed::None) {
+  MOZ_ASSERT(done());
+}
+
+ProfilingFrameIterator::ProfilingFrameIterator(const JitActivation& activation)
+    : code_(nullptr),
+      codeRange_(nullptr),
+      category_(Category::Other),
+      callerFP_(nullptr),
+      callerPC_(nullptr),
+      stackAddress_(nullptr),
+      unwoundJitCallerFP_(nullptr),
+      exitReason_(activation.wasmExitReason()) {
+  initFromExitFP(activation.wasmExitFP());
+}
+
+ProfilingFrameIterator::ProfilingFrameIterator(const Frame* fp)
+    : code_(nullptr),
+      codeRange_(nullptr),
+      category_(Category::Other),
+      callerFP_(nullptr),
+      callerPC_(nullptr),
+      stackAddress_(nullptr),
+      unwoundJitCallerFP_(nullptr),
+      exitReason_(ExitReason::Fixed::ImportJit) {
+  MOZ_ASSERT(fp);
+  initFromExitFP(fp);
+}
+
+static inline void AssertMatchesCallSite(void* callerPC, uint8_t* callerFP) {
+#if defined(DEBUG)
+  const CodeRange* callerCodeRange;
+  const Code* code = LookupCode(callerPC, &callerCodeRange);
+
+  if (!code) {
+    AssertDirectJitCall(callerFP);
+    return;
+  }
+
+  MOZ_ASSERT(callerCodeRange);
+
+  if (callerCodeRange->isInterpEntry()) {
+    return;
+  }
+
+  if (callerCodeRange->isJitEntry()) {
+    MOZ_ASSERT(callerFP != nullptr);
+    return;
+  }
+
+  CallSite site;
+  MOZ_ALWAYS_TRUE(code->lookupCallSite(callerPC, &site));
+#endif
+}
+
+void ProfilingFrameIterator::initFromExitFP(const Frame* fp) {
+  MOZ_ASSERT(fp);
+  stackAddress_ = (void*)fp;
+  endStackAddress_ = stackAddress_;
+  const CodeBlock* codeBlock =
+      LookupCodeBlock(fp->returnAddress(), &codeRange_);
+
+  if (!codeBlock) {
+    category_ = Category::Other;
+    code_ = nullptr;
+  } else {
+    code_ = codeBlock->code;
+    category_ = categoryFromCodeBlock(codeBlock->kind);
+  }
+
+  if (!code_) {
+    AssertDirectJitCall(fp->jitEntryCaller());
+
+    unwoundJitCallerFP_ = fp->jitEntryCaller();
+    MOZ_ASSERT(done());
+    return;
+  }
+
+  MOZ_ASSERT(codeRange_);
+
+  switch (codeRange_->kind()) {
+    case CodeRange::InterpEntry:
+      callerPC_ = nullptr;
+      callerFP_ = nullptr;
+      break;
+    case CodeRange::JitEntry:
+      callerPC_ = nullptr;
+      callerFP_ = fp->rawCaller();
+      break;
+    case CodeRange::Function:
+      fp = fp->wasmCaller();
+      callerPC_ = fp->returnAddress();
+      callerFP_ = fp->rawCaller();
+      AssertMatchesCallSite(callerPC_, callerFP_);
+      break;
+#if defined(ENABLE_WASM_JSPI)
+    case CodeRange::ContBaseFrame: {
+      category_ = Category::Other;
+      Frame* baseFrame = fp->wasmCaller();
+      ContStack* stack = ContStack::fromBaseFrameFP(baseFrame);
+      Handlers* handlers = stack->handlers();
+      MOZ_ASSERT(handlers);
+      stackAddress_ = handlers->returnTarget.stackPointer;
+      callerPC_ = handlers->returnTarget.resumePC;
+      AssertMatchesCallSite(callerPC_, baseFrame->rawCaller());
+      callerFP_ =
+          reinterpret_cast<uint8_t*>(handlers->returnTarget.framePointer);
+      break;
+    }
+#endif
+    case CodeRange::ImportJitExit:
+    case CodeRange::ImportInterpExit:
+    case CodeRange::BuiltinThunk:
+    case CodeRange::TrapExit:
+    case CodeRange::DebugStub:
+    case CodeRange::RequestTierUpStub:
+    case CodeRange::UpdateCallRefMetricsStub:
+    case CodeRange::Throw:
+    case CodeRange::FarJumpIsland:
+      MOZ_CRASH("Unexpected CodeRange kind");
+  }
+
+  MOZ_ASSERT(!done());
+}
+
+static bool IsSignatureCheckFail(uint32_t offsetInCode,
+                                 const CodeRange* codeRange) {
+  if (!codeRange->isFunction()) {
+    return false;
+  }
+  return offsetInCode < codeRange->funcUncheckedCallEntry() &&
+         (offsetInCode - codeRange->funcCheckedCallEntry()) > SetFP;
+}
+
+static bool CanUnwindSignatureCheck(uint8_t* fp) {
+  const auto* frame = Frame::fromUntaggedWasmExitFP(fp);
+  uint8_t* const pc = frame->returnAddress();
+
+  const CodeRange* codeRange;
+  const Code* code = LookupCode(pc, &codeRange);
+  return code && !codeRange->isEntry();
+}
+
+static bool GetUnwindInfo(const CodeBlock* codeBlock,
+                          const CodeRange* codeRange, uint8_t* pc,
+                          const CodeRangeUnwindInfo** info) {
+  if (!codeRange->isFunction() || !codeRange->funcHasUnwindInfo()) {
+    return false;
+  }
+
+  *info = codeBlock->code->lookupUnwindInfo(pc);
+  return *info;
+}
+
+const Instance* js::wasm::GetNearestEffectiveInstance(const Frame* fp) {
+  while (true) {
+    uint8_t* returnAddress = fp->returnAddress();
+    const CodeRange* codeRange = nullptr;
+    const Code* code = LookupCode(returnAddress, &codeRange);
+
+    if (!code) {
+      AssertDirectJitCall(fp->jitEntryCaller());
+      return ExtractCalleeInstanceFromFrameWithInstances(fp);
+    }
+
+    MOZ_ASSERT(codeRange);
+
+    if (codeRange->isEntry()) {
+      return ExtractCalleeInstanceFromFrameWithInstances(fp);
+    }
+
+#if defined(ENABLE_WASM_JSPI)
+    MOZ_ASSERT(codeRange->kind() == CodeRange::Function ||
+               codeRange->kind() == CodeRange::ContBaseFrame);
+#else
+    MOZ_ASSERT(codeRange->kind() == CodeRange::Function);
+#endif
+    MOZ_ASSERT(code);
+    CallSite site;
+    MOZ_ALWAYS_TRUE(code->lookupCallSite(returnAddress, &site));
+    if (site.mightBeCrossInstance()) {
+      return ExtractCalleeInstanceFromFrameWithInstances(fp);
+    }
+#if defined(ENABLE_WASM_JSPI)
+    if (codeRange->isContBaseFrame()) {
+      return ExtractCalleeInstanceFromFrameWithInstances(fp->wasmCaller());
+    }
+#endif
+
+    fp = fp->wasmCaller();
+  }
+}
+
+Instance* js::wasm::GetNearestEffectiveInstance(Frame* fp) {
+  return const_cast<Instance*>(
+      GetNearestEffectiveInstance(const_cast<const Frame*>(fp)));
+}
+
+bool js::wasm::StartUnwinding(const RegisterState& registers,
+                              UnwindState* unwindState, bool* unwoundCaller) {
+  uint8_t* const pc = (uint8_t*)registers.pc;
+  void** const sp = (void**)registers.sp;
+
+  uint8_t* fp = Frame::isExitFP(registers.fp)
+                    ? Frame::untagExitFP(registers.fp)
+                    : reinterpret_cast<uint8_t*>(registers.fp);
+
+  const CodeRange* codeRange;
+  const uint8_t* codeBase;
+  const Code* code = nullptr;
+
+  const CodeBlock* codeBlock = LookupCodeBlock(pc, &codeRange);
+  if (codeBlock) {
+    code = codeBlock->code;
+    codeBase = codeBlock->base();
+    MOZ_ASSERT(codeRange);
+  } else if (!LookupBuiltinThunk(pc, &codeRange, &codeBase)) {
+    return false;
+  }
+
+  uint32_t offsetInCode = pc - codeBase;
+  MOZ_ASSERT(offsetInCode >= codeRange->begin());
+  MOZ_ASSERT(offsetInCode < codeRange->end());
+
+  uint32_t offsetFromEntry;
+  if (codeRange->isFunction()) {
+    if (offsetInCode < codeRange->funcUncheckedCallEntry()) {
+      offsetFromEntry = offsetInCode - codeRange->funcCheckedCallEntry();
+    } else {
+      offsetFromEntry = offsetInCode - codeRange->funcUncheckedCallEntry();
+    }
+  } else if (codeRange->isImportJitExit()) {
+    if (offsetInCode < codeRange->importJitExitEntry()) {
+      offsetFromEntry = 0;
+    } else {
+      offsetFromEntry = offsetInCode - codeRange->importJitExitEntry();
+    }
+  } else {
+    offsetFromEntry = offsetInCode - codeRange->begin();
+  }
+
+  *unwoundCaller = true;
+
+  uint8_t* fixedFP = nullptr;
+  void* fixedPC = nullptr;
+  switch (codeRange->kind()) {
+    case CodeRange::Function:
+    case CodeRange::FarJumpIsland:
+    case CodeRange::ImportJitExit:
+    case CodeRange::ImportInterpExit:
+    case CodeRange::BuiltinThunk:
+    case CodeRange::DebugStub:
+    case CodeRange::RequestTierUpStub:
+    case CodeRange::UpdateCallRefMetricsStub:
+#if defined(JS_CODEGEN_MIPS64)
+      if (codeRange->isThunk()) {
+        fixedPC = pc;
+        fixedFP = fp;
+        *unwoundCaller = false;
+        AssertMatchesCallSite(
+            Frame::fromUntaggedWasmExitFP(fp)->returnAddress(),
+            Frame::fromUntaggedWasmExitFP(fp)->rawCaller());
+      } else if (offsetFromEntry < PushedFP) {
+        fixedPC = (uint8_t*)registers.lr;
+        fixedFP = fp;
+        AssertMatchesCallSite(fixedPC, fixedFP);
+      } else
+#elif defined(JS_CODEGEN_LOONG64)
+      if (codeRange->isThunk()) {
+        fixedPC = pc;
+        fixedFP = fp;
+        *unwoundCaller = false;
+        AssertMatchesCallSite(
+            Frame::fromUntaggedWasmExitFP(fp)->returnAddress(),
+            Frame::fromUntaggedWasmExitFP(fp)->rawCaller());
+      } else if (offsetFromEntry < PushedFP) {
+        fixedPC = (uint8_t*)registers.lr;
+        fixedFP = fp;
+        AssertMatchesCallSite(fixedPC, fixedFP);
+      } else
+#elif defined(JS_CODEGEN_RISCV64)
+      if (codeRange->isThunk()) {
+        fixedPC = pc;
+        fixedFP = fp;
+        *unwoundCaller = false;
+        AssertMatchesCallSite(
+            Frame::fromUntaggedWasmExitFP(fp)->returnAddress(),
+            Frame::fromUntaggedWasmExitFP(fp)->rawCaller());
+      } else if (offsetFromEntry < PushedFP) {
+        fixedPC = (uint8_t*)registers.lr;
+        fixedFP = fp;
+        AssertMatchesCallSite(fixedPC, fixedFP);
+      } else
+#elif defined(JS_CODEGEN_ARM64)
+      if (offsetFromEntry < SetFP || codeRange->isThunk()) {
+        fixedPC = (uint8_t*)registers.lr;
+        fixedFP = fp;
+        AssertMatchesCallSite(fixedPC, fixedFP);
+      } else
+#elif defined(JS_CODEGEN_ARM)
+      if (offsetFromEntry == BeforePushRetAddr || codeRange->isThunk()) {
+        fixedPC = (uint8_t*)registers.lr;
+        fixedFP = fp;
+        AssertMatchesCallSite(fixedPC, fixedFP);
+      } else
+#endif
+          if (offsetFromEntry == PushedRetAddr || codeRange->isThunk()) {
+        fixedPC = sp[0];
+        fixedFP = fp;
+        AssertMatchesCallSite(fixedPC, fixedFP);
+      } else if (offsetFromEntry == PushedFP) {
+        const auto* frame = Frame::fromUntaggedWasmExitFP(sp);
+        MOZ_ASSERT(frame->rawCaller() == fp);
+        fixedPC = frame->returnAddress();
+        fixedFP = fp;
+        AssertMatchesCallSite(fixedPC, fixedFP);
+#if defined(JS_CODEGEN_MIPS64)
+      } else if (offsetInCode >= codeRange->ret() - PoppedFP &&
+                 offsetInCode <= codeRange->ret()) {
+        MOZ_ASSERT(*sp == fp);
+        fixedPC = Frame::fromUntaggedWasmExitFP(sp)->returnAddress();
+        fixedFP = fp;
+        AssertMatchesCallSite(fixedPC, fixedFP);
+#elif defined(JS_CODEGEN_RISCV64)
+      } else if (offsetInCode >= codeRange->ret() - PoppedFP &&
+                 offsetInCode <= codeRange->ret()) {
+        MOZ_ASSERT(*sp == fp);
+        fixedPC = Frame::fromUntaggedWasmExitFP(sp)->returnAddress();
+        fixedFP = fp;
+        AssertMatchesCallSite(fixedPC, fixedFP);
+#elif defined(JS_CODEGEN_ARM64) || defined(JS_CODEGEN_LOONG64)
+      } else if (offsetInCode >= codeRange->ret() - PoppedFP &&
+                 offsetInCode <= codeRange->ret()) {
+        fixedPC = (uint8_t*)registers.lr;
+        fixedFP = fp;
+        AssertMatchesCallSite(fixedPC, fixedFP);
+#else
+      } else if (offsetInCode >= codeRange->ret() - PoppedFP &&
+                 offsetInCode < codeRange->ret()) {
+        fixedPC = sp[1];
+        fixedFP = fp;
+        AssertMatchesCallSite(fixedPC, fixedFP);
+      } else if (offsetInCode == codeRange->ret()) {
+        fixedPC = sp[0];
+        fixedFP = fp;
+        AssertMatchesCallSite(fixedPC, fixedFP);
+#endif
+      } else {
+        if (IsSignatureCheckFail(offsetInCode, codeRange) &&
+            CanUnwindSignatureCheck(fp)) {
+          const auto* frame = Frame::fromUntaggedWasmExitFP(fp);
+          fixedFP = frame->rawCaller();
+          fixedPC = frame->returnAddress();
+          AssertMatchesCallSite(fixedPC, fixedFP);
+          break;
+        }
+
+        const CodeRangeUnwindInfo* unwindInfo;
+        if (codeBlock && GetUnwindInfo(codeBlock, codeRange, pc, &unwindInfo)) {
+          switch (unwindInfo->unwindHow()) {
+            case CodeRangeUnwindInfo::RestoreFpRa:
+              fixedPC = (uint8_t*)registers.tempRA;
+              fixedFP = (uint8_t*)registers.tempFP;
+              break;
+            case CodeRangeUnwindInfo::RestoreFp:
+              fixedPC = sp[0];
+              fixedFP = (uint8_t*)registers.tempFP;
+              break;
+            case CodeRangeUnwindInfo::UseFpLr:
+              fixedPC = (uint8_t*)registers.lr;
+              fixedFP = fp;
+              break;
+            case CodeRangeUnwindInfo::UseFp:
+              fixedPC = sp[0];
+              fixedFP = fp;
+              break;
+            default:
+              MOZ_CRASH();
+          }
+          MOZ_ASSERT(fixedPC && fixedFP);
+          break;
+        }
+
+        fixedPC = pc;
+        fixedFP = fp;
+        *unwoundCaller = false;
+        AssertMatchesCallSite(
+            Frame::fromUntaggedWasmExitFP(fp)->returnAddress(),
+            Frame::fromUntaggedWasmExitFP(fp)->rawCaller());
+        break;
+      }
+      break;
+#if defined(ENABLE_WASM_JSPI)
+    case CodeRange::ContBaseFrame:
+#endif
+    case CodeRange::TrapExit:
+      fixedPC = pc;
+      fixedFP = fp;
+      *unwoundCaller = false;
+      AssertMatchesCallSite(Frame::fromUntaggedWasmExitFP(fp)->returnAddress(),
+                            Frame::fromUntaggedWasmExitFP(fp)->rawCaller());
+      break;
+    case CodeRange::InterpEntry:
+      break;
+    case CodeRange::JitEntry:
+      if (offsetFromEntry < PushedFP) {
+        return false;
+      }
+      if (offsetInCode >= codeRange->ret() - PoppedFPJitEntry &&
+          offsetInCode <= codeRange->ret()) {
+        return false;
+      }
+      if (offsetFromEntry < SetFP) {
+        fixedFP = reinterpret_cast<uint8_t*>(sp);
+      } else {
+        fixedFP = fp;
+      }
+      fixedPC = nullptr;
+      break;
+    case CodeRange::Throw:
+      return false;
+  }
+
+  unwindState->code = code;
+  unwindState->codeRange = codeRange;
+  unwindState->fp = fixedFP;
+  unwindState->pc = fixedPC;
+  return true;
+}
+
+ProfilingFrameIterator::ProfilingFrameIterator(const JitActivation& activation,
+                                               const RegisterState& state)
+    : code_(nullptr),
+      codeRange_(nullptr),
+      category_(Category::Other),
+      callerFP_(nullptr),
+      callerPC_(nullptr),
+      stackAddress_(nullptr),
+      unwoundJitCallerFP_(nullptr),
+      exitReason_(ExitReason::Fixed::None) {
+  if (activation.hasWasmExitFP()) {
+    exitReason_ = activation.wasmExitReason();
+    initFromExitFP(activation.wasmExitFP());
+    return;
+  }
+
+  bool unwoundCaller;
+  UnwindState unwindState;
+  if (!StartUnwinding(state, &unwindState, &unwoundCaller)) {
+    MOZ_ASSERT(done());
+    return;
+  }
+
+  MOZ_ASSERT(unwindState.codeRange);
+
+  if (unwoundCaller) {
+    callerFP_ = unwindState.fp;
+    callerPC_ = unwindState.pc;
+  } else {
+    callerFP_ = Frame::fromUntaggedWasmExitFP(unwindState.fp)->rawCaller();
+    callerPC_ = Frame::fromUntaggedWasmExitFP(unwindState.fp)->returnAddress();
+  }
+
+  code_ = unwindState.code;
+  codeRange_ = unwindState.codeRange;
+  stackAddress_ = state.sp;
+  endStackAddress_ = state.sp;
+
+  if (const CodeBlock* codeBlock = LookupCodeBlock(callerPC_)) {
+    category_ = categoryFromCodeBlock(codeBlock->kind);
+  }
+
+  MOZ_ASSERT(!done());
+}
+
+void ProfilingFrameIterator::operator++() {
+  MOZ_ASSERT(!done());
+  MOZ_ASSERT(!unwoundJitCallerFP_);
+
+  if (!exitReason_.isNone()) {
+    if (const CodeBlock* codeBlock = LookupCodeBlock(callerPC_)) {
+      category_ = categoryFromCodeBlock(codeBlock->kind);
+    } else {
+      category_ = Category::Other;
+    }
+    exitReason_ = ExitReason::None();
+    MOZ_ASSERT(codeRange_);
+    MOZ_ASSERT(!done());
+    return;
+  }
+
+  if (codeRange_->isInterpEntry()) {
+    category_ = Category::Other;
+    codeRange_ = nullptr;
+    MOZ_ASSERT(done());
+    return;
+  }
+
+  if (codeRange_->isJitEntry()) {
+    category_ = Category::Other;
+    MOZ_ASSERT(callerFP_);
+    unwoundJitCallerFP_ = callerFP_;
+    callerPC_ = nullptr;
+    callerFP_ = nullptr;
+    codeRange_ = nullptr;
+    MOZ_ASSERT(done());
+    return;
+  }
+
+  MOZ_RELEASE_ASSERT(callerPC_);
+
+  const CodeBlock* codeBlock = LookupCodeBlock(callerPC_, &codeRange_);
+  code_ = codeBlock ? codeBlock->code : nullptr;
+
+  if (!code_) {
+    category_ = Category::Other;
+    MOZ_ASSERT(!codeRange_);
+    AssertDirectJitCall(callerFP_);
+    unwoundJitCallerFP_ = callerFP_;
+    MOZ_ASSERT(done());
+    return;
+  }
+
+  MOZ_ASSERT(codeRange_);
+
+  if (codeRange_->isInterpEntry()) {
+    category_ = Category::Other;
+    callerPC_ = nullptr;
+    callerFP_ = nullptr;
+    MOZ_ASSERT(!done());
+    return;
+  }
+
+  if (codeRange_->isJitEntry()) {
+    category_ = Category::Other;
+    MOZ_ASSERT(!done());
+    return;
+  }
+
+#if defined(ENABLE_WASM_JSPI)
+  if (codeRange_->kind() == CodeRange::ContBaseFrame) {
+    category_ = Category::Other;
+    const auto* frame = Frame::fromUntaggedWasmExitFP(callerFP_);
+    ContStack* stack = ContStack::fromBaseFrameFP(callerFP_);
+    Handlers* handlers = stack->handlers();
+    if (!handlers) {
+      codeRange_ = nullptr;
+      MOZ_ASSERT(done());
+      return;
+    }
+    stackAddress_ = handlers->returnTarget.stackPointer;
+    callerPC_ = handlers->returnTarget.resumePC;
+    AssertMatchesCallSite(callerPC_, frame->rawCaller());
+    callerFP_ = reinterpret_cast<uint8_t*>(handlers->returnTarget.framePointer);
+    MOZ_ASSERT(!done());
+    return;
+  }
+#endif
+
+  mozilla::DebugOnly<const wasm::Instance*> effectiveInstance =
+      GetNearestEffectiveInstance(Frame::fromUntaggedWasmExitFP(callerFP_));
+  MOZ_ASSERT_IF(effectiveInstance, code_ == &effectiveInstance->code());
+
+  category_ = categoryFromCodeBlock(codeBlock->kind);
+
+  switch (codeRange_->kind()) {
+    case CodeRange::Function:
+    case CodeRange::ImportJitExit:
+    case CodeRange::ImportInterpExit:
+    case CodeRange::BuiltinThunk:
+    case CodeRange::TrapExit:
+    case CodeRange::DebugStub:
+    case CodeRange::RequestTierUpStub:
+    case CodeRange::UpdateCallRefMetricsStub:
+    case CodeRange::FarJumpIsland: {
+      stackAddress_ = callerFP_;
+      const auto* frame = Frame::fromUntaggedWasmExitFP(callerFP_);
+      callerPC_ = frame->returnAddress();
+      AssertMatchesCallSite(callerPC_, frame->rawCaller());
+      callerFP_ = frame->rawCaller();
+      break;
+    }
+#if defined(ENABLE_WASM_JSPI)
+    case CodeRange::ContBaseFrame:
+#endif
+    case CodeRange::InterpEntry:
+    case CodeRange::JitEntry:
+      MOZ_CRASH("should have been guarded above");
+    case CodeRange::Throw:
+      MOZ_CRASH("code range doesn't have frame");
+  }
+
+  MOZ_ASSERT(!done());
+}
+
+const char* wasm::ThunkedNativeToDescription(SymbolicAddress func) {
+  MOZ_ASSERT(NeedsBuiltinThunk(func));
+  switch (func) {
+    case SymbolicAddress::HandleDebugTrap:
+    case SymbolicAddress::HandleRequestTierUp:
+    case SymbolicAddress::HandleThrow:
+    case SymbolicAddress::HandleTrap:
+    case SymbolicAddress::CallImport_General:
+    case SymbolicAddress::CoerceInPlace_ToInt32:
+    case SymbolicAddress::CoerceInPlace_ToNumber:
+    case SymbolicAddress::CoerceInPlace_ToBigInt:
+    case SymbolicAddress::BoxValue_Anyref:
+      MOZ_ASSERT(!NeedsBuiltinThunk(func),
+                 "not in sync with NeedsBuiltinThunk");
+      break;
+    case SymbolicAddress::ToInt32:
+      return "call to native ToInt32 coercion (in wasm)";
+    case SymbolicAddress::DivI64:
+      return "call to native i64.div_s (in wasm)";
+    case SymbolicAddress::UDivI64:
+      return "call to native i64.div_u (in wasm)";
+    case SymbolicAddress::ModI64:
+      return "call to native i64.rem_s (in wasm)";
+    case SymbolicAddress::UModI64:
+      return "call to native i64.rem_u (in wasm)";
+    case SymbolicAddress::TruncateDoubleToUint64:
+      return "call to native i64.trunc_f64_u (in wasm)";
+    case SymbolicAddress::TruncateDoubleToInt64:
+      return "call to native i64.trunc_f64_s (in wasm)";
+    case SymbolicAddress::SaturatingTruncateDoubleToUint64:
+      return "call to native i64.trunc_sat_f64_u (in wasm)";
+    case SymbolicAddress::SaturatingTruncateDoubleToInt64:
+      return "call to native i64.trunc_sat_f64_s (in wasm)";
+    case SymbolicAddress::Uint64ToDouble:
+      return "call to native f64.convert_i64_u (in wasm)";
+    case SymbolicAddress::Uint64ToFloat32:
+      return "call to native f32.convert_i64_u (in wasm)";
+    case SymbolicAddress::Int64ToDouble:
+      return "call to native f64.convert_i64_s (in wasm)";
+    case SymbolicAddress::Int64ToFloat32:
+      return "call to native f32.convert_i64_s (in wasm)";
+#if defined(JS_CODEGEN_ARM)
+    case SymbolicAddress::aeabi_idivmod:
+      return "call to native i32.div_s (in wasm)";
+    case SymbolicAddress::aeabi_uidivmod:
+      return "call to native i32.div_u (in wasm)";
+#endif
+    case SymbolicAddress::AllocateBigInt:
+      return "call to native newCell<BigInt, NoGC> (in wasm)";
+    case SymbolicAddress::ModD:
+      return "call to native f64 % (mod) (in wasm)";
+    case SymbolicAddress::CeilD:
+      return "call to native f64.ceil (in wasm)";
+    case SymbolicAddress::CeilF:
+      return "call to native f32.ceil (in wasm)";
+    case SymbolicAddress::FloorD:
+      return "call to native f64.floor (in wasm)";
+    case SymbolicAddress::FloorF:
+      return "call to native f32.floor (in wasm)";
+    case SymbolicAddress::TruncD:
+      return "call to native f64.trunc (in wasm)";
+    case SymbolicAddress::TruncF:
+      return "call to native f32.trunc (in wasm)";
+    case SymbolicAddress::NearbyIntD:
+      return "call to native f64.nearest (in wasm)";
+    case SymbolicAddress::NearbyIntF:
+      return "call to native f32.nearest (in wasm)";
+    case SymbolicAddress::AddSubI128:
+      return "call to native 128-bit add/sub function";
+    case SymbolicAddress::MulI64Wide:
+      return "call to native 64x64-to-128-bit multiply function";
+    case SymbolicAddress::ArrayMemMove:
+      return "call to native array.copy (data)";
+    case SymbolicAddress::ArrayRefsMove:
+      return "call to native array.copy (references)";
+    case SymbolicAddress::MemoryGrowM32:
+      return "call to native memory.grow m32 (in wasm)";
+    case SymbolicAddress::MemoryGrowM64:
+      return "call to native memory.grow m64 (in wasm)";
+    case SymbolicAddress::MemorySizeM32:
+      return "call to native memory.size m32 (in wasm)";
+    case SymbolicAddress::MemorySizeM64:
+      return "call to native memory.size m64 (in wasm)";
+    case SymbolicAddress::WaitI32M32:
+      return "call to native i32.wait m32 (in wasm)";
+    case SymbolicAddress::WaitI32M64:
+      return "call to native i32.wait m64 (in wasm)";
+    case SymbolicAddress::WaitI64M32:
+      return "call to native i64.wait m32 (in wasm)";
+    case SymbolicAddress::WaitI64M64:
+      return "call to native i64.wait m64 (in wasm)";
+    case SymbolicAddress::WakeM32:
+      return "call to native wake m32 (in wasm)";
+    case SymbolicAddress::WakeM64:
+      return "call to native wake m64 (in wasm)";
+    case SymbolicAddress::CoerceInPlace_JitEntry:
+      return "out-of-line coercion for jit entry arguments (in wasm)";
+    case SymbolicAddress::ReportV128JSCall:
+      return "jit call to v128 wasm function";
+    case SymbolicAddress::MemCopyM32:
+    case SymbolicAddress::MemCopySharedM32:
+      return "call to native memory.copy m32 function";
+    case SymbolicAddress::MemCopyM64:
+    case SymbolicAddress::MemCopySharedM64:
+      return "call to native memory.copy m64 function";
+    case SymbolicAddress::MemCopyAny:
+      return "call to native memory.copy any function";
+    case SymbolicAddress::DataDrop:
+      return "call to native data.drop function";
+    case SymbolicAddress::MemFillM32:
+    case SymbolicAddress::MemFillSharedM32:
+      return "call to native memory.fill m32 function";
+    case SymbolicAddress::MemFillM64:
+    case SymbolicAddress::MemFillSharedM64:
+      return "call to native memory.fill m64 function";
+    case SymbolicAddress::MemInitM32:
+      return "call to native memory.init m32 function";
+    case SymbolicAddress::MemInitM64:
+      return "call to native memory.init m64 function";
+    case SymbolicAddress::TableCopy:
+      return "call to native table.copy function";
+    case SymbolicAddress::TableFill:
+      return "call to native table.fill function";
+    case SymbolicAddress::MemDiscardM32:
+    case SymbolicAddress::MemDiscardSharedM32:
+      return "call to native memory.discard m32 function";
+    case SymbolicAddress::MemDiscardM64:
+    case SymbolicAddress::MemDiscardSharedM64:
+      return "call to native memory.discard m64 function";
+    case SymbolicAddress::ElemDrop:
+      return "call to native elem.drop function";
+    case SymbolicAddress::TableGet:
+      return "call to native table.get function";
+    case SymbolicAddress::TableGrow:
+      return "call to native table.grow function";
+    case SymbolicAddress::TableInit:
+      return "call to native table.init function";
+    case SymbolicAddress::TableSet:
+      return "call to native table.set function";
+    case SymbolicAddress::TableSize:
+      return "call to native table.size function";
+    case SymbolicAddress::RefFunc:
+      return "call to native ref.func function";
+    case SymbolicAddress::PostBarrierEdge:
+    case SymbolicAddress::PostBarrierEdgePrecise:
+    case SymbolicAddress::PostBarrierWholeCell:
+      return "call to native GC postbarrier (in wasm)";
+#if defined(ENABLE_WASM_JSPI)
+    case SymbolicAddress::ResumeBarrier:
+      return "call to native GC resume barrier (in wasm)";
+#endif
+    case SymbolicAddress::ExceptionNew:
+      return "call to native exception new (in wasm)";
+    case SymbolicAddress::ThrowException:
+      return "call to native throw exception (in wasm)";
+    case SymbolicAddress::StructNewIL_true:
+    case SymbolicAddress::StructNewIL_false:
+    case SymbolicAddress::StructNewOOL_true:
+    case SymbolicAddress::StructNewOOL_false:
+      return "call to native struct.new (in wasm)";
+    case SymbolicAddress::ArrayNew_true:
+    case SymbolicAddress::ArrayNew_false:
+      return "call to native array.new (in wasm)";
+    case SymbolicAddress::ArrayNewData:
+      return "call to native array.new_data function";
+    case SymbolicAddress::ArrayNewElem:
+      return "call to native array.new_elem function";
+    case SymbolicAddress::ArrayInitData:
+      return "call to native array.init_data function";
+    case SymbolicAddress::ArrayInitElem:
+      return "call to native array.init_elem function";
+    case SymbolicAddress::ArrayCopy:
+      return "call to native array.copy function";
+#if defined(ENABLE_WASM_JSPI)
+    case SymbolicAddress::ContNew:
+      return "call to native cont.new function";
+    case SymbolicAddress::ContNewEmpty:
+      return "call to native cont.new_empty function";
+    case SymbolicAddress::ContUnwind:
+      return "call to native cont.unwind function";
+#endif
+    case SymbolicAddress::SlotsToAllocKindBytesTable:
+      MOZ_CRASH(
+          "symbolic address was not code and should not have appeared here");
+#define VISIT_BUILTIN_FUNC(op, export, sa_name, ...) \
+  case SymbolicAddress::sa_name:                     \
+    return "call to native " #op " builtin (in wasm)";
+      FOR_EACH_BUILTIN_MODULE_FUNC(VISIT_BUILTIN_FUNC)
+#undef VISIT_BUILTIN_FUNC
+#if defined(WASM_CODEGEN_DEBUG)
+    case SymbolicAddress::PrintI32:
+    case SymbolicAddress::PrintPtr:
+    case SymbolicAddress::PrintF32:
+    case SymbolicAddress::PrintF64:
+    case SymbolicAddress::PrintText:
+    case SymbolicAddress::Printf:
+#endif
+    case SymbolicAddress::Limit:
+      break;
+  }
+  return "?";
+}
+
+const char* ProfilingFrameIterator::label() const {
+  MOZ_ASSERT(!done());
+
+  static const char importJitDescription[] = "fast exit trampoline (in wasm)";
+  static const char importInterpDescription[] =
+      "slow exit trampoline (in wasm)";
+  static const char builtinNativeDescription[] =
+      "fast exit trampoline to native (in wasm)";
+  static const char trapDescription[] = "trap handling (in wasm)";
+  static const char debugStubDescription[] = "debug trap handling (in wasm)";
+  static const char requestTierUpDescription[] = "tier-up request (in wasm)";
+  static const char updateCallRefMetricsDescription[] =
+      "update call_ref metrics (in wasm)";
+
+  if (!exitReason_.isFixed()) {
+    return ThunkedNativeToDescription(exitReason_.symbolic());
+  }
+
+  switch (exitReason_.fixed()) {
+    case ExitReason::Fixed::None:
+      break;
+    case ExitReason::Fixed::ImportJit:
+      return importJitDescription;
+    case ExitReason::Fixed::ImportInterp:
+      return importInterpDescription;
+    case ExitReason::Fixed::BuiltinNative:
+      return builtinNativeDescription;
+    case ExitReason::Fixed::Trap:
+      return trapDescription;
+    case ExitReason::Fixed::DebugStub:
+      return debugStubDescription;
+    case ExitReason::Fixed::RequestTierUp:
+      return requestTierUpDescription;
+  }
+
+  switch (codeRange_->kind()) {
+    case CodeRange::Function:
+      return code_->profilingLabel(codeRange_->funcIndex());
+    case CodeRange::InterpEntry:
+      return "slow entry trampoline (in wasm)";
+    case CodeRange::JitEntry:
+      return "fast entry trampoline (in wasm)";
+    case CodeRange::ImportJitExit:
+      return importJitDescription;
+    case CodeRange::BuiltinThunk:
+      return builtinNativeDescription;
+    case CodeRange::ImportInterpExit:
+      return importInterpDescription;
+    case CodeRange::TrapExit:
+      return trapDescription;
+    case CodeRange::DebugStub:
+      return debugStubDescription;
+    case CodeRange::RequestTierUpStub:
+      return requestTierUpDescription;
+    case CodeRange::UpdateCallRefMetricsStub:
+      return updateCallRefMetricsDescription;
+#if defined(ENABLE_WASM_JSPI)
+    case CodeRange::ContBaseFrame:
+      return "cont base frame";
+#endif
+    case CodeRange::FarJumpIsland:
+      return "interstitial (in wasm)";
+    case CodeRange::Throw:
+      MOZ_CRASH("does not have a frame");
+  }
+
+  MOZ_CRASH("bad code range kind");
+}
+
+ProfilingFrameIterator::Category ProfilingFrameIterator::category() const {
+  MOZ_ASSERT(!done());
+  return category_;
+}

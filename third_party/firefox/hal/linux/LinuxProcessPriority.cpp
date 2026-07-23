@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Hal.h"
+#include "HalLog.h"
+
+#include "mozilla/Sprintf.h"
+
+#include <fcntl.h>
+#include <unistd.h>
+
+using namespace mozilla::hal;
+
+namespace mozilla::hal_impl {
+
+
+const uint32_t kParentOomScoreAdjust = 0;
+const uint32_t kForegroundHighOomScoreAdjust = 100;
+const uint32_t kForegroundOomScoreAdjust = 133;
+const uint32_t kBackgroundPerceivableOomScoreAdjust = 167;
+const uint32_t kBackgroundOomScoreAdjust = 200;
+const uint32_t kPreallocOomScoreAdjust = 233;
+
+static uint32_t OomScoreAdjForPriority(ProcessPriority aPriority) {
+  switch (aPriority) {
+    case PROCESS_PRIORITY_BACKGROUND:
+      return kBackgroundOomScoreAdjust;
+    case PROCESS_PRIORITY_BACKGROUND_PERCEIVABLE:
+      return kBackgroundPerceivableOomScoreAdjust;
+    case PROCESS_PRIORITY_PREALLOC:
+      return kPreallocOomScoreAdjust;
+    case PROCESS_PRIORITY_FOREGROUND:
+      return kForegroundOomScoreAdjust;
+    case PROCESS_PRIORITY_FOREGROUND_HIGH:
+      return kForegroundHighOomScoreAdjust;
+    default:
+      return kParentOomScoreAdjust;
+  }
+}
+
+void SetProcessPriority(int aPid, ProcessPriority aPriority) {
+  HAL_LOG("LinuxProcessPriority - SetProcessPriority(%d, %s)\n", aPid,
+          ProcessPriorityToString(aPriority));
+
+  uint32_t oomScoreAdj = OomScoreAdjForPriority(aPriority);
+
+  char path[32] = {};
+  SprintfLiteral(path, "/proc/%d/oom_score_adj", aPid);
+
+  char oomScoreAdjStr[11] = {};
+  SprintfLiteral(oomScoreAdjStr, "%d", oomScoreAdj);
+
+  int fd = open(path, O_WRONLY);
+  if (fd < 0) {
+    return;
+  }
+  const size_t len = strlen(oomScoreAdjStr);
+  [[maybe_unused]] ssize_t _ = write(fd, oomScoreAdjStr, len);
+  (void)close(fd);
+}
+
+}  

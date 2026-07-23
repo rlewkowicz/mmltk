@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#if !defined(mozilla_StackWalk_h)
+#define mozilla_StackWalk_h
+
+#include "mozilla/Types.h"
+#include <stdint.h>
+#include <stdio.h>
+
+MOZ_BEGIN_EXTERN_C
+
+#define CallerPC() __builtin_extract_return_addr(__builtin_return_address(0))
+
+typedef void (*MozWalkStackCallback)(uint32_t aFrameNumber, void* aPC,
+                                     void* aSP, void* aClosure);
+
+MFBT_API void MozStackWalk(MozWalkStackCallback aCallback,
+                           const void* aFirstFramePC, uint32_t aMaxFrames,
+                           void* aClosure);
+
+typedef struct {
+  char library[256];
+  ptrdiff_t loffset;
+  char filename[256];
+  unsigned long lineno;
+  char function[256];
+  ptrdiff_t foffset;
+} MozCodeAddressDetails;
+
+MFBT_API bool MozDescribeCodeAddress(void* aPC,
+                                     MozCodeAddressDetails* aDetails);
+
+MFBT_API int MozFormatCodeAddress(char* aBuffer, uint32_t aBufferSize,
+                                  uint32_t aFrameNumber, const void* aPC,
+                                  const char* aFunction, const char* aLibrary,
+                                  ptrdiff_t aLOffset, const char* aFileName,
+                                  uint32_t aLineNo);
+
+MFBT_API int MozFormatCodeAddressDetails(char* aBuffer, uint32_t aBufferSize,
+                                         uint32_t aFrameNumber, void* aPC,
+                                         const MozCodeAddressDetails* aDetails);
+
+#if defined(__cplusplus)
+#  define FRAMES_DEFAULT = 0
+#else
+#  define FRAMES_DEFAULT
+#endif
+MFBT_API void MozWalkTheStack(FILE* aStream,
+                              const void* aFirstFramePC FRAMES_DEFAULT,
+                              uint32_t aMaxFrames FRAMES_DEFAULT);
+
+MFBT_API void MozWalkTheStackWithWriter(
+    void (*aWriter)(const char*), const void* aFirstFramePC FRAMES_DEFAULT,
+    uint32_t aMaxFrames FRAMES_DEFAULT);
+
+#undef FRAMES_DEFAULT
+
+MOZ_END_EXTERN_C
+
+#if defined(__cplusplus)
+namespace mozilla {
+
+MFBT_API void FramePointerStackWalk(MozWalkStackCallback aCallback,
+                                    uint32_t aMaxFrames, void* aClosure,
+                                    void** aBp, void* aStackEnd);
+
+#if defined(XP_LINUX) || 0
+MFBT_API void DemangleSymbol(const char* aSymbol, char* aBuffer, int aBufLen);
+#endif
+
+}  
+#endif
+
+#endif

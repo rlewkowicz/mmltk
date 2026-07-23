@@ -1,0 +1,80 @@
+/*
+ * Copyright 2017 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkSerialProcs_DEFINED)
+#define SkSerialProcs_DEFINED
+
+#include "include/core/SkRefCnt.h"
+#include "include/private/base/SkAPI.h"
+
+#include <cstddef>
+#include <optional>
+
+class SkData;
+class SkImage;
+class SkPicture;
+class SkTypeface;
+class SkReadBuffer;
+class SkStream;
+enum SkAlphaType : int;
+namespace sktext::gpu {
+    class Slug;
+}
+
+using SkSerialReturnType = sk_sp<const SkData>;
+using SkSerialPictureProc = SkSerialReturnType (*)(SkPicture*, void* ctx);
+using SkSerialImageProc = SkSerialReturnType (*)(SkImage*, void* ctx);
+using SkSerialTypefaceProc = SkSerialReturnType (*)(SkTypeface*, void* ctx);
+
+using SkDeserialPictureProc = sk_sp<SkPicture> (*)(const void* data, size_t length, void* ctx);
+
+#if !defined(SK_LEGACY_DESERIAL_IMAGE_PROC)
+using SkDeserialImageProc = sk_sp<SkImage> (*)(const void* data, size_t length, void* ctx);
+#else
+using SkDeserialImageProc = sk_sp<SkImage> (*)(const void* data,
+                                               size_t length,
+                                               std::optional<SkAlphaType>,
+                                               void* ctx);
+#endif
+using SkDeserialImageFromDataProc = sk_sp<SkImage> (*)(sk_sp<SkData>,
+                                                       std::optional<SkAlphaType>,
+                                                       void* ctx);
+
+using SkSlugProc = sk_sp<sktext::gpu::Slug> (*)(SkReadBuffer&, void* ctx);
+
+using SkDeserialTypefaceStreamProc = sk_sp<SkTypeface> (*)(SkStream&, void* ctx);
+using SkDeserialTypefaceProc = sk_sp<SkTypeface> (*)(const void* data, size_t length, void* ctx);
+
+struct SK_API SkSerialProcs {
+    SkSerialPictureProc fPictureProc = nullptr;
+    void*               fPictureCtx = nullptr;
+
+    SkSerialImageProc   fImageProc = nullptr;
+    void*               fImageCtx = nullptr;
+
+    SkSerialTypefaceProc fTypefaceProc = nullptr;
+    void*                fTypefaceCtx = nullptr;
+};
+
+struct SK_API SkDeserialProcs {
+    SkDeserialPictureProc        fPictureProc = nullptr;
+    void*                        fPictureCtx = nullptr;
+
+    SkDeserialImageProc          fImageProc = nullptr;
+    SkDeserialImageFromDataProc  fImageDataProc = nullptr;
+    void*                        fImageCtx = nullptr;
+
+    SkSlugProc                   fSlugProc = nullptr;
+    void*                        fSlugCtx = nullptr;
+
+    SkDeserialTypefaceStreamProc fTypefaceStreamProc = nullptr;
+    void*                        fTypefaceCtx = nullptr;
+
+    bool                         fAllowSkSL = true;
+};
+
+#endif

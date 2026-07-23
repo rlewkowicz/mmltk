@@ -1,0 +1,95 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_RemoteWorkerService_h
+#define mozilla_dom_RemoteWorkerService_h
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/DataMutex.h"
+#include "mozilla/dom/RemoteWorkerTypes.h"
+#include "mozilla/ipc/Endpoint.h"
+#include "nsCOMPtr.h"
+#include "nsIObserver.h"
+#include "nsISupportsImpl.h"
+
+class nsIThread;
+
+namespace mozilla::dom {
+
+class RemoteWorkerDebuggerManagerChild;
+class RemoteWorkerDebuggerManagerParent;
+class RemoteWorkerService;
+class RemoteWorkerServiceChild;
+class RemoteWorkerServiceShutdownBlocker;
+class PRemoteWorkerDebuggerManagerChild;
+class PRemoteWorkerDebuggerParent;
+class PRemoteWorkerServiceChild;
+
+class RemoteWorkerServiceKeepAlive {
+ public:
+  explicit RemoteWorkerServiceKeepAlive(
+      RemoteWorkerServiceShutdownBlocker* aBlocker);
+
+ private:
+  ~RemoteWorkerServiceKeepAlive();
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(RemoteWorkerServiceKeepAlive);
+
+  RefPtr<RemoteWorkerServiceShutdownBlocker> mBlocker;
+};
+
+class RemoteWorkerService final : public nsIObserver {
+  friend class RemoteWorkerServiceShutdownBlocker;
+  friend class RemoteWorkerServiceKeepAlive;
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  static void InitializeParent();
+  static void InitializeChild(
+      mozilla::ipc::Endpoint<PRemoteWorkerServiceChild> aEndpoint,
+      mozilla::ipc::Endpoint<PRemoteWorkerDebuggerManagerChild>
+          aDebuggerChildEp);
+
+  static nsIThread* Thread();
+  static void RegisterRemoteDebugger(
+      RemoteWorkerDebuggerInfo aDebuggerInfo,
+      mozilla::ipc::Endpoint<PRemoteWorkerDebuggerParent> aDebuggerParentEp);
+
+  static bool IsInitialized();
+
+  static already_AddRefed<RemoteWorkerServiceKeepAlive> MaybeGetKeepAlive();
+
+ private:
+  RemoteWorkerService();
+  ~RemoteWorkerService();
+
+  nsresult InitializeOnMainThread(
+      mozilla::ipc::Endpoint<PRemoteWorkerServiceChild> aEndpoint,
+      mozilla::ipc::Endpoint<PRemoteWorkerDebuggerManagerChild>
+          aDebuggerChildEp);
+
+  void InitializeOnTargetThread(
+      mozilla::ipc::Endpoint<PRemoteWorkerServiceChild> aEndpoint,
+      mozilla::ipc::Endpoint<PRemoteWorkerDebuggerManagerChild>
+          aDebuggerMgrEndpoint);
+
+  void CloseActorOnTargetThread();
+
+  void BeginShutdown();
+
+  void FinishShutdown();
+
+  nsCOMPtr<nsIThread> mThread;
+  RefPtr<RemoteWorkerServiceChild> mActor;
+  RefPtr<RemoteWorkerDebuggerManagerChild> mDebuggerManagerChild;
+  RefPtr<RemoteWorkerDebuggerManagerParent> mDebuggerManagerParent;
+  DataMutex<RefPtr<RemoteWorkerServiceKeepAlive>> mKeepAlive;
+  RefPtr<RemoteWorkerServiceShutdownBlocker> mShutdownBlocker;
+};
+
+}  
+
+#endif  // mozilla_dom_RemoteWorkerService_h

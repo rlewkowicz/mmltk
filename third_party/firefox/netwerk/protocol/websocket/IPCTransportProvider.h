@@ -1,0 +1,61 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_IPCTransportProvider_h
+#define mozilla_net_IPCTransportProvider_h
+
+#include "nsISupportsImpl.h"
+#include "mozilla/net/PTransportProviderParent.h"
+#include "mozilla/net/PTransportProviderChild.h"
+#include "nsIHttpChannelInternal.h"
+#include "nsISocketTransport.h"
+#include "nsITransportProvider.h"
+
+
+class nsISocketTransport;
+class nsIAsyncInputStream;
+class nsIAsyncOutputStream;
+
+namespace mozilla {
+namespace net {
+
+class TransportProviderParent final : public PTransportProviderParent,
+                                      public nsITransportProvider,
+                                      public nsIHttpUpgradeListener {
+ public:
+  TransportProviderParent() = default;
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSITRANSPORTPROVIDER
+  NS_DECL_NSIHTTPUPGRADELISTENER
+
+  void ActorDestroy(ActorDestroyReason aWhy) override {}
+
+ private:
+  ~TransportProviderParent() = default;
+
+  void MaybeNotify();
+
+  nsCOMPtr<nsIHttpUpgradeListener> mListener;
+  nsCOMPtr<nsISocketTransport> mTransport;
+  nsCOMPtr<nsIAsyncInputStream> mSocketIn;
+  nsCOMPtr<nsIAsyncOutputStream> mSocketOut;
+};
+
+class TransportProviderChild final : public PTransportProviderChild,
+                                     public nsITransportProvider {
+ public:
+  TransportProviderChild() = default;
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSITRANSPORTPROVIDER
+
+ private:
+  ~TransportProviderChild();
+};
+
+}  
+}  
+
+#endif

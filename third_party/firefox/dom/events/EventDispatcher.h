@@ -1,0 +1,205 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifdef MOZILLA_INTERNAL_API
+#  ifndef mozilla_EventDispatcher_h_
+#    define mozilla_EventDispatcher_h_
+
+#    include "mozilla/EventForwards.h"
+#    include "mozilla/Maybe.h"
+#    include "mozilla/dom/BindingDeclarations.h"
+#    include "mozilla/dom/Touch.h"
+#    include "nsCOMPtr.h"
+#    include "nsTArray.h"
+
+#    undef CreateEvent
+
+class nsIContent;
+class nsPresContext;
+
+template <class E>
+class nsCOMArray;
+
+namespace mozilla {
+namespace dom {
+class Event;
+class EventTarget;
+}  
+
+
+class MOZ_STACK_CLASS EventChainVisitor {
+ public:
+  MOZ_CAN_RUN_SCRIPT
+  EventChainVisitor(nsPresContext* aPresContext, WidgetEvent* aEvent,
+                    dom::Event* aDOMEvent,
+                    nsEventStatus aEventStatus = nsEventStatus_eIgnore)
+      : mPresContext(aPresContext),
+        mEvent(aEvent),
+        mDOMEvent(aDOMEvent),
+        mEventStatus(aEventStatus),
+        mItemFlags(0) {}
+
+  MOZ_KNOWN_LIVE nsPresContext* const mPresContext;
+
+  WidgetEvent* const mEvent;
+
+  dom::Event* mDOMEvent;
+
+  nsEventStatus mEventStatus;
+
+  uint16_t mItemFlags;
+
+  nsCOMPtr<nsISupports> mItemData;
+};
+
+class MOZ_STACK_CLASS EventChainPreVisitor final : public EventChainVisitor {
+ public:
+  MOZ_CAN_RUN_SCRIPT
+  EventChainPreVisitor(nsPresContext* aPresContext, WidgetEvent* aEvent,
+                       dom::Event* aDOMEvent, nsEventStatus aEventStatus,
+                       bool aIsInAnon,
+                       dom::EventTarget* aTargetInKnownToBeHandledScope)
+      : EventChainVisitor(aPresContext, aEvent, aDOMEvent, aEventStatus),
+        mCanHandle(true),
+        mAutomaticChromeDispatch(true),
+        mForceContentDispatch(false),
+        mRelatedTargetIsInAnon(false),
+        mOriginalTargetIsInAnon(aIsInAnon),
+        mWantsWillHandleEvent(false),
+        mMayHaveListenerManager(true),
+        mWantsPreHandleEvent(false),
+        mRootOfClosedTree(false),
+        mItemInShadowTree(false),
+        mParentIsSlotInClosedTree(false),
+        mParentIsChromeHandler(false),
+        mRelatedTargetRetargetedInCurrentScope(false),
+        mIgnoreBecauseOfShadowDOM(false),
+        mWantsActivationBehavior(false),
+        mMaybeUncancelable(false),
+        mParentTarget(nullptr),
+        mEventTargetAtParent(nullptr),
+        mRetargetedRelatedTarget(nullptr),
+        mTargetInKnownToBeHandledScope(aTargetInKnownToBeHandledScope) {}
+
+  void Reset() {
+    mItemFlags = 0;
+    mItemData = nullptr;
+    mCanHandle = true;
+    mAutomaticChromeDispatch = true;
+    mForceContentDispatch = false;
+    mWantsWillHandleEvent = false;
+    mMayHaveListenerManager = true;
+    mWantsPreHandleEvent = false;
+    mRootOfClosedTree = false;
+    mItemInShadowTree = false;
+    mParentIsSlotInClosedTree = false;
+    mParentIsChromeHandler = false;
+    mIgnoreBecauseOfShadowDOM = false;
+    mWantsActivationBehavior = false;
+    mParentTarget = nullptr;
+    mEventTargetAtParent = nullptr;
+    mRetargetedRelatedTarget = nullptr;
+    mRetargetedTouchTargets.reset();
+  }
+
+  dom::EventTarget* GetParentTarget() { return mParentTarget; }
+
+  void SetParentTarget(dom::EventTarget* aParentTarget, bool aIsChromeHandler) {
+    mParentTarget = aParentTarget;
+    if (mParentTarget) {
+      mParentIsChromeHandler = aIsChromeHandler;
+    }
+  }
+
+  void IgnoreCurrentTargetBecauseOfShadowDOMRetargeting();
+
+  bool mCanHandle;
+
+  bool mAutomaticChromeDispatch;
+
+  bool mForceContentDispatch;
+
+  bool mRelatedTargetIsInAnon;
+
+  bool mOriginalTargetIsInAnon;
+
+  bool mWantsWillHandleEvent;
+
+  bool mMayHaveListenerManager;
+
+  bool mWantsPreHandleEvent;
+
+  bool mRootOfClosedTree;
+
+  bool mItemInShadowTree;
+
+  bool mParentIsSlotInClosedTree;
+
+  bool mParentIsChromeHandler;
+
+  bool mRelatedTargetRetargetedInCurrentScope;
+
+  bool mIgnoreBecauseOfShadowDOM;
+
+  bool mWantsActivationBehavior;
+
+  bool mMaybeUncancelable;
+
+ private:
+  dom::EventTarget* mParentTarget;
+
+ public:
+  dom::EventTarget* mEventTargetAtParent;
+
+  dom::EventTarget* mRetargetedRelatedTarget;
+
+  mozilla::Maybe<nsTArray<RefPtr<dom::EventTarget>>> mRetargetedTouchTargets;
+
+  dom::EventTarget* mTargetInKnownToBeHandledScope;
+};
+
+class MOZ_STACK_CLASS EventChainPostVisitor final
+    : public mozilla::EventChainVisitor {
+ public:
+  MOZ_CAN_RUN_SCRIPT
+  explicit EventChainPostVisitor(EventChainVisitor& aOther)
+      : EventChainVisitor(aOther.mPresContext, aOther.mEvent,
+                          MOZ_KnownLive(aOther.mDOMEvent),
+                          aOther.mEventStatus) {}
+};
+
+class MOZ_STACK_CLASS EventDispatchingCallback {
+ public:
+  MOZ_CAN_RUN_SCRIPT
+  virtual void HandleEvent(EventChainPostVisitor& aVisitor) = 0;
+};
+
+class EventDispatcher {
+ public:
+  MOZ_CAN_RUN_SCRIPT static nsresult Dispatch(
+      dom::EventTarget* aTarget, nsPresContext* aPresContext,
+      WidgetEvent* aEvent, dom::Event* aDOMEvent = nullptr,
+      nsEventStatus* aEventStatus = nullptr,
+      EventDispatchingCallback* aCallback = nullptr,
+      nsTArray<dom::EventTarget*>* aTargets = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT static nsresult DispatchDOMEvent(
+      dom::EventTarget* aTarget, WidgetEvent* aEvent, dom::Event* aDOMEvent,
+      nsPresContext* aPresContext, nsEventStatus* aEventStatus);
+
+  static already_AddRefed<dom::Event> CreateEvent(
+      dom::EventTarget* aOwner, nsPresContext* aPresContext,
+      WidgetEvent* aEvent, const nsAString& aEventType,
+      dom::CallerType aCallerType = dom::CallerType::System);
+
+  static void GetComposedPathFor(WidgetEvent* aEvent,
+                                 nsTArray<RefPtr<dom::EventTarget>>& aPath);
+
+  static void Shutdown();
+};
+
+}  
+
+#  endif  // mozilla_EventDispatcher_h_
+#endif

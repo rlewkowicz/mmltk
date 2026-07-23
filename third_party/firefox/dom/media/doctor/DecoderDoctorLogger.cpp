@@ -1,0 +1,137 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DecoderDoctorLogger.h"
+
+#include "DDLogUtils.h"
+#include "DDMediaLogs.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/StaticPtr.h"
+
+namespace mozilla {
+
+ Atomic<DecoderDoctorLogger::LogState, ReleaseAcquire>
+    DecoderDoctorLogger::sLogState{DecoderDoctorLogger::scDisabled};
+
+ const char* DecoderDoctorLogger::sShutdownReason = nullptr;
+
+static DDMediaLogs* sMediaLogs;
+
+void DecoderDoctorLogger::Init() {
+  MOZ_ASSERT(static_cast<LogState>(sLogState) == scDisabled);
+  if (MOZ_LOG_TEST(sDecoderDoctorLoggerLog, LogLevel::Error) ||
+      MOZ_LOG_TEST(sDecoderDoctorLoggerEndLog, LogLevel::Error)) {
+    EnableLogging();
+  }
+}
+
+#ifndef RELEASE_OR_BETA
+struct DDLogShutdowner {
+  ~DDLogShutdowner() {
+    DDL_INFO("Shutting down");
+    DecoderDoctorLogger::ShutdownLogging();
+  }
+};
+static StaticAutoPtr<DDLogShutdowner> sDDLogShutdowner;
+
+struct DDLogDeleter {
+  ~DDLogDeleter() {
+    if (sMediaLogs) {
+      DDL_INFO("Final processing of collected logs");
+      delete sMediaLogs;
+      sMediaLogs = nullptr;
+    }
+  }
+};
+static StaticAutoPtr<DDLogDeleter> sDDLogDeleter;
+#endif
+
+void DecoderDoctorLogger::PanicInternal(const char* aReason, bool aDontBlock) {
+  for (;;) {
+    const LogState state = static_cast<LogState>(sLogState);
+    if (state == scEnabling && !aDontBlock) {
+      continue;
+    }
+    if (state == scShutdown) {
+      break;
+    }
+    if (sLogState.compareExchange(state, scShutdown)) {
+      sShutdownReason = aReason;
+      if (sMediaLogs) {
+        sMediaLogs->Panic();
+      }
+    }
+  }
+}
+
+bool DecoderDoctorLogger::EnsureLogIsEnabled() {
+#ifdef RELEASE_OR_BETA
+  return false;
+#else
+  for (;;) {
+    LogState state = static_cast<LogState>(sLogState);
+    switch (state) {
+      case scDisabled:
+        if (sLogState.compareExchange(scDisabled, scEnabling)) {
+          DDMediaLogs::ConstructionResult mediaLogsConstruction =
+              DDMediaLogs::New();
+          if (NS_FAILED(mediaLogsConstruction.mRv)) {
+            PanicInternal("Failed to enable logging",  true);
+            return false;
+          }
+          MOZ_ASSERT(mediaLogsConstruction.mMediaLogs);
+          sMediaLogs = mediaLogsConstruction.mMediaLogs;
+          MOZ_ALWAYS_SUCCEEDS(SchedulerGroup::Dispatch(
+              NS_NewRunnableFunction("DDLogger shutdown setup", [] {
+                sDDLogShutdowner = new DDLogShutdowner();
+                ClearOnShutdown(&sDDLogShutdowner,
+                                ShutdownPhase::XPCOMShutdown);
+                sDDLogDeleter = new DDLogDeleter();
+                ClearOnShutdown(&sDDLogDeleter,
+                                ShutdownPhase::XPCOMShutdownThreads);
+              })));
+
+          MOZ_ASSERT(sLogState == scEnabling);
+          sLogState = scEnabled;
+          DDL_INFO("Logging enabled");
+          return true;
+        }
+        break;
+      case scEnabled:
+        return true;
+      case scEnabling:
+        break;
+      case scShutdown:
+        return false;
+    }
+  }
+#endif
+}
+
+void DecoderDoctorLogger::EnableLogging() { (void)EnsureLogIsEnabled(); }
+
+ RefPtr<DecoderDoctorLogger::LogMessagesPromise>
+DecoderDoctorLogger::RetrieveMessages(
+    const dom::HTMLMediaElement* aMediaElement) {
+  if (MOZ_UNLIKELY(!EnsureLogIsEnabled())) {
+    DDL_WARN("Request (for {}) but there are no logs", fmt::ptr(aMediaElement));
+    return DecoderDoctorLogger::LogMessagesPromise::CreateAndReject(
+        NS_ERROR_DOM_MEDIA_ABORT_ERR, __func__);
+  }
+  return sMediaLogs->RetrieveMessages(aMediaElement);
+}
+
+void DecoderDoctorLogger::Log(const char* aSubjectTypeName,
+                              const void* aSubjectPointer,
+                              DDLogCategory aCategory, const char* aLabel,
+                              DDLogValue&& aValue) {
+  if (IsDDLoggingEnabled()) {
+    MOZ_ASSERT(sMediaLogs);
+    sMediaLogs->Log(aSubjectTypeName, aSubjectPointer, aCategory, aLabel,
+                    std::move(aValue));
+  }
+}
+
+}  

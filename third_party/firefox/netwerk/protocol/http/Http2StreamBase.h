@@ -1,0 +1,330 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_Http2StreamBase_h
+#define mozilla_net_Http2StreamBase_h
+
+
+#include "mozilla/UniquePtr.h"
+#include "mozilla/WeakPtr.h"
+#include "nsAHttpTransaction.h"
+#include "nsISupportsPriority.h"
+#include "SimpleBuffer.h"
+#include "nsISupportsImpl.h"
+#include "nsIURI.h"
+
+class nsISocketTransport;
+class nsIInputStream;
+class nsIOutputStream;
+
+namespace mozilla {
+class OriginAttributes;
+}
+
+namespace mozilla::net {
+
+class nsStandardURL;
+class Http2Session;
+class Http2Stream;
+class Http2PushedStream;
+class Http2Decompressor;
+class Http2WebTransportSession;
+
+class Http2StreamBase : public nsISupports,
+                        public nsAHttpSegmentReader,
+                        public nsAHttpSegmentWriter,
+                        public SupportsWeakPtr {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSAHTTPSEGMENTREADER
+
+  enum stateType {
+    IDLE,
+    RESERVED_BY_REMOTE,
+    OPEN,
+    CLOSED_BY_LOCAL,
+    CLOSED_BY_REMOTE,
+    CLOSED
+  };
+
+  const static int32_t kNormalPriority = 0x1000;
+  const static int32_t kWorstPriority =
+      kNormalPriority + nsISupportsPriority::PRIORITY_LOWEST;
+  const static int32_t kBestPriority =
+      kNormalPriority + nsISupportsPriority::PRIORITY_HIGHEST;
+
+  Http2StreamBase(uint64_t, Http2Session*, int32_t, uint64_t);
+
+  uint32_t StreamID() { return mStreamID; }
+
+  stateType HTTPState() { return mState; }
+  void SetHTTPState(stateType val) { mState = val; }
+
+  [[nodiscard]] virtual nsresult ReadSegments(nsAHttpSegmentReader*, uint32_t,
+                                              uint32_t*);
+  [[nodiscard]] virtual nsresult WriteSegments(nsAHttpSegmentWriter*, uint32_t,
+                                               uint32_t*);
+  virtual bool DeferCleanup(nsresult status);
+
+  const nsCString& Origin() const { return mOrigin; }
+  const nsCString& Host() const { return mHeaderHost; }
+  const nsCString& Path() const { return mHeaderPath; }
+
+  bool RequestBlockedOnRead() {
+    return static_cast<bool>(mRequestBlockedOnRead);
+  }
+
+  bool HasRegisteredID() { return mStreamID != 0; }
+
+  virtual nsAHttpTransaction* Transaction() { return nullptr; }
+  nsHttpTransaction* HttpTransaction();
+  virtual nsIRequestContext* RequestContext() { return nullptr; }
+
+  virtual void CloseStream(nsresult reason) = 0;
+  void SetResponseIsComplete();
+
+  void SetRecvdFin(bool aStatus);
+  bool RecvdFin() { return mRecvdFin; }
+
+  void SetRecvdData(bool aStatus) { mReceivedData = aStatus ? 1 : 0; }
+  bool RecvdData() { return mReceivedData; }
+
+  void SetSentFin(bool aStatus);
+  bool SentFin() { return mSentFin; }
+
+  void SetRecvdReset(bool aStatus);
+  bool RecvdReset() { return mRecvdReset; }
+
+  void SetSentReset(bool aStatus);
+  bool SentReset() { return mSentReset; }
+
+  void SetQueued(bool aStatus) { mQueued = aStatus ? 1 : 0; }
+  bool Queued() { return mQueued; }
+  void SetInWriteQueue(bool aStatus) { mInWriteQueue = aStatus ? 1 : 0; }
+  bool InWriteQueue() { return mInWriteQueue; }
+  void SetInReadQueue(bool aStatus) { mInReadQueue = aStatus ? 1 : 0; }
+  bool InReadQueue() { return mInReadQueue; }
+
+  void SetCountAsActive(bool aStatus) { mCountAsActive = aStatus ? 1 : 0; }
+  bool CountAsActive() { return mCountAsActive; }
+
+  void SetAllHeadersReceived();
+  void UnsetAllHeadersReceived() { mAllHeadersReceived = 0; }
+  bool AllHeadersReceived() { return mAllHeadersReceived; }
+
+  void UpdateTransportSendEvents(uint32_t count);
+  void UpdateTransportReadEvents(uint32_t count);
+
+  [[nodiscard]] nsresult ConvertResponseHeaders(Http2Decompressor*, nsACString&,
+                                                nsACString&, int32_t&);
+  [[nodiscard]] nsresult ConvertResponseTrailers(Http2Decompressor*,
+                                                 nsACString&);
+
+  bool AllowFlowControlledWrite();
+  void UpdateServerReceiveWindow(int32_t delta);
+  int64_t ServerReceiveWindow() { return mServerReceiveWindow; }
+
+  void DecrementClientReceiveWindow(uint32_t delta) {
+    mClientReceiveWindow -= delta;
+    mLocalUnacked += delta;
+  }
+
+  void IncrementClientReceiveWindow(uint32_t delta) {
+    mClientReceiveWindow += delta;
+    mLocalUnacked -= delta;
+  }
+
+  uint64_t LocalUnAcked();
+  int64_t ClientReceiveWindow() { return mClientReceiveWindow; }
+
+  bool BlockedOnRwin() { return mBlockedOnRwin; }
+
+  uint32_t RFC7540Priority() { return mRFC7540Priority; }
+  uint32_t PriorityDependency() { return mPriorityDependency; }
+  uint8_t PriorityWeight() { return mPriorityWeight; }
+  void SetPriority(uint32_t);
+  void SetPriorityDependency(uint32_t, uint32_t);
+  void UpdatePriorityDependency();
+
+  uint64_t TransactionBrowserId() { return mTransactionBrowserId; }
+
+  virtual bool HasSink() { return true; }
+
+  already_AddRefed<Http2Session> Session();
+
+  bool Do0RTT();
+  nsresult Finish0RTT(bool aRestart, bool aAlpnChanged);
+
+  nsresult GetOriginAttributes(mozilla::OriginAttributes* oa);
+
+  virtual void CurrentBrowserIdChanged(uint64_t id);
+  void CurrentBrowserIdChangedInternal(uint64_t id);
+
+  virtual void UpdatePriorityRFC7540(Http2Session* session);
+  virtual void UpdatePriority(Http2Session* session);
+
+  virtual bool IsTunnel() { return false; }
+
+  virtual uint32_t GetWireStreamId() { return mStreamID; }
+  virtual Http2Stream* GetHttp2Stream() { return nullptr; }
+  virtual Http2PushedStream* GetHttp2PushedStream() { return nullptr; }
+  virtual Http2WebTransportSession* GetHttp2WebTransportSession() {
+    return nullptr;
+  }
+
+  [[nodiscard]] virtual nsresult OnWriteSegment(char*, uint32_t,
+                                                uint32_t*) override;
+
+  virtual nsHttpConnectionInfo* ConnectionInfo();
+
+  bool DataBuffered() { return mSimpleBuffer.Available(); }
+
+  virtual nsresult Condition() { return NS_OK; }
+
+  virtual void DisableSpdy() {
+    if (Transaction()) {
+      Transaction()->DisableSpdy();
+    }
+  }
+  virtual void ReuseConnectionOnRestartOK(bool aReuse) {
+    if (Transaction()) {
+      Transaction()->ReuseConnectionOnRestartOK(aReuse);
+    }
+  }
+  virtual void MakeNonSticky() {
+    if (Transaction()) {
+      Transaction()->MakeNonSticky();
+    }
+  }
+
+  bool Closed() const { return mClosed; }
+
+ protected:
+  virtual ~Http2StreamBase();
+  friend class DeleteHttp2StreamBase;
+  void DeleteSelfOnSocketThread();
+  virtual void HandleResponseHeaders(nsACString& aHeadersOut,
+                                     int32_t httpResponseCode) {}
+  virtual nsresult CallToWriteData(uint32_t count, uint32_t* countRead) = 0;
+  virtual nsresult CallToReadData(uint32_t count, uint32_t* countWritten) = 0;
+  virtual bool CloseSendStreamWhenDone() { return true; }
+
+  enum upstreamStateType {
+    GENERATING_HEADERS,
+    GENERATING_BODY,
+    SENDING_BODY,
+    SENDING_FIN_STREAM,
+    UPSTREAM_COMPLETE
+  };
+
+  uint32_t mStreamID{0};
+
+  nsWeakPtr mSession;
+
+  RefPtr<nsAHttpSegmentReader> mSegmentReader;
+  nsAHttpSegmentWriter* mSegmentWriter{nullptr};
+
+  nsCString mOrigin;
+  nsCString mHeaderHost;
+  nsCString mHeaderScheme;
+  nsCString mHeaderPath;
+
+  enum upstreamStateType mUpstreamState { GENERATING_HEADERS };
+
+  enum stateType mState { IDLE };
+
+  uint32_t mRequestHeadersDone : 1;
+
+  uint32_t mOpenGenerated : 1;
+
+  uint32_t mAllHeadersReceived : 1;
+
+  uint32_t mQueued : 1;
+
+  uint32_t mInWriteQueue : 1;
+  uint32_t mInReadQueue : 1;
+
+  void ChangeState(enum upstreamStateType);
+
+  virtual void AdjustInitialWindow();
+  [[nodiscard]] nsresult TransmitFrame(const char*, uint32_t*,
+                                       bool forceCommitment);
+
+  nsCOMPtr<nsISocketTransport> mSocketTransport;
+
+  uint8_t mPriorityWeight = 0;       
+  uint32_t mPriorityDependency = 0;  
+  uint64_t mCurrentBrowserId;
+  uint64_t mTransactionBrowserId{0};
+
+  UniquePtr<uint8_t[]> mTxInlineFrame;
+  uint32_t mTxInlineFrameSize{0};
+  uint32_t mTxInlineFrameUsed{0};
+
+  uint32_t mRFC7540Priority = 0;  
+
+  nsCString mFlatHttpRequestHeaders;
+
+  int64_t mRequestBodyLenRemaining{0};
+
+  bool mClosed{false};
+
+ private:
+  friend mozilla::DefaultDelete<Http2StreamBase>;
+
+  [[nodiscard]] nsresult ParseHttpRequestHeaders(const char*, uint32_t,
+                                                 uint32_t*);
+  [[nodiscard]] nsresult GenerateOpen();
+
+  virtual nsresult GenerateHeaders(nsCString& aCompressedData,
+                                   uint8_t& firstFrameFlags) = 0;
+
+  void GenerateDataFrameHeader(uint32_t, bool);
+
+  [[nodiscard]] nsresult BufferInput(uint32_t, uint32_t*);
+
+  uint32_t mChunkSize;
+
+  uint32_t mRequestBlockedOnRead : 1;
+
+  uint32_t mRecvdFin : 1;
+
+  uint32_t mReceivedData : 1;
+
+  uint32_t mRecvdReset : 1;
+
+  uint32_t mSentReset : 1;
+
+  uint32_t mCountAsActive : 1;
+
+  uint32_t mSentFin : 1;
+
+  uint32_t mSentWaitingFor : 1;
+
+  uint32_t mSetTCPSocketBuffer : 1;
+
+  uint32_t mBypassInputBuffer : 1;
+
+  uint32_t mTxStreamFrameSize{0};
+
+
+  int64_t mClientReceiveWindow;
+
+  int64_t mServerReceiveWindow;
+
+  uint64_t mLocalUnacked{0};
+
+  bool mBlockedOnRwin{false};
+
+  uint64_t mTotalSent{0};
+  uint64_t mTotalRead{0};
+
+  SimpleBuffer mSimpleBuffer;
+
+  bool mAttempting0RTT{false};
+};
+
+}  
+
+#endif  // mozilla_net_Http2StreamBase_h

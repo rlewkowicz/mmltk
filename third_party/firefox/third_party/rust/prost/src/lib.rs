@@ -1,0 +1,34 @@
+#![doc(html_root_url = "https://docs.rs/prost/0.13.5")]
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[doc(hidden)]
+pub extern crate alloc;
+
+pub use bytes;
+
+mod error;
+mod message;
+mod name;
+mod types;
+
+#[doc(hidden)]
+pub mod encoding;
+
+pub use crate::encoding::length_delimiter::{
+    decode_length_delimiter, encode_length_delimiter, length_delimiter_len,
+};
+pub use crate::error::{DecodeError, EncodeError, UnknownEnumValue};
+pub use crate::message::Message;
+pub use crate::name::Name;
+
+// See `encoding::DecodeContext` for more info.
+#[cfg(not(feature = "no-recursion-limit"))]
+const RECURSION_LIMIT: u32 = 100;
+
+#[cfg(feature = "derive")]
+#[allow(unused_imports)]
+#[macro_use]
+extern crate prost_derive;
+#[cfg(feature = "derive")]
+#[doc(hidden)]
+pub use prost_derive::*;

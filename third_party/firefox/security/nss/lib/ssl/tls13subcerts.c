@@ -1,0 +1,683 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nss.h"
+#include "pk11func.h"
+#include "secder.h"
+#include "sechash.h"
+#include "ssl.h"
+#include "sslproto.h"
+#include "sslimpl.h"
+#include "ssl3exthandle.h"
+#include "tls13exthandle.h"
+#include "tls13hkdf.h"
+#include "tls13subcerts.h"
+
+SECStatus
+tls13_ReadDelegatedCredential(PRUint8 *b, PRUint32 length,
+                              sslDelegatedCredential **dcp)
+{
+    sslDelegatedCredential *dc = NULL;
+    SECStatus rv;
+    PRUint64 n;
+    sslReadBuffer tmp;
+    sslReader rdr = SSL_READER(b, length);
+
+    PORT_Assert(!*dcp);
+
+    dc = PORT_ZNew(sslDelegatedCredential);
+    if (!dc) {
+        PORT_SetError(SEC_ERROR_NO_MEMORY);
+        goto loser;
+    }
+
+    rv = sslRead_ReadNumber(&rdr, 4, &n);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+    dc->validTime = n;
+
+    rv = sslRead_ReadNumber(&rdr, 2, &n);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+    dc->expectedCertVerifyAlg = n;
+
+    rv = sslRead_ReadVariable(&rdr, 3, &tmp);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+    rv = SECITEM_MakeItem(NULL, &dc->derSpki, tmp.buf, tmp.len);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+
+    dc->spki = SECKEY_DecodeDERSubjectPublicKeyInfo(&dc->derSpki);
+    if (!dc->spki) {
+        goto loser;
+    }
+
+    rv = sslRead_ReadNumber(&rdr, 2, &n);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+    dc->alg = n;
+
+    rv = sslRead_ReadVariable(&rdr, 2, &tmp);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+    rv = SECITEM_MakeItem(NULL, &dc->signature, tmp.buf, tmp.len);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+
+    if (SSL_READER_REMAINING(&rdr) > 0) {
+        goto loser;
+    }
+
+    *dcp = dc;
+    return SECSuccess;
+
+loser:
+    tls13_DestroyDelegatedCredential(dc);
+    *dcp = NULL;
+    return SECFailure;
+}
+
+void
+tls13_DestroyDelegatedCredential(sslDelegatedCredential *dc)
+{
+    if (!dc) {
+        return;
+    }
+
+    SECKEY_DestroySubjectPublicKeyInfo(dc->spki);
+    SECITEM_FreeItem(&dc->derSpki, PR_FALSE);
+    SECITEM_FreeItem(&dc->signature, PR_FALSE);
+    PORT_ZFree(dc, sizeof(sslDelegatedCredential));
+}
+
+static SECStatus
+tls13_GetExpectedCertVerifyAlg(SECItem in, SSLSignatureScheme *certVerifyAlg)
+{
+    SECStatus rv;
+    PRUint64 n;
+    sslReader rdr = SSL_READER(in.data, in.len);
+
+    if (in.len < 6) { 
+        return SECFailure;
+    }
+
+    rv = sslRead_ReadNumber(&rdr, 4, &n);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    rv = sslRead_ReadNumber(&rdr, 2, &n);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+    *certVerifyAlg = n;
+
+    return SECSuccess;
+}
+
+PRBool
+tls13_IsVerifyingWithDelegatedCredential(const sslSocket *ss)
+{
+    if (ss->sec.isServer ||
+        !ss->opt.enableDelegatedCredentials ||
+        !ss->xtnData.peerDelegCred) {
+        return PR_FALSE;
+    }
+
+    return PR_TRUE;
+}
+
+PRBool
+tls13_IsSigningWithDelegatedCredential(const sslSocket *ss)
+{
+    if (!ss->sec.isServer ||
+        !ss->xtnData.sendingDelegCredToPeer ||
+        !ss->xtnData.peerRequestedDelegCred) {
+        return PR_FALSE;
+    }
+
+    return PR_TRUE;
+}
+
+SECStatus
+tls13_MaybeSetDelegatedCredential(sslSocket *ss)
+{
+    SECStatus rv;
+    PRBool doesRsaPss;
+    SECKEYPrivateKey *priv;
+    SSLSignatureScheme scheme;
+
+    PORT_Assert(ss->sec.isServer);
+    PORT_Assert(ss->sec.serverCert);
+    PORT_Assert(ss->version >= SSL_LIBRARY_VERSION_TLS_1_3);
+    PORT_Assert(ss->xtnData.peerRequestedDelegCred == !!ss->xtnData.delegCredSigSchemes);
+
+    if (!ss->xtnData.peerRequestedDelegCred ||
+        !ss->xtnData.delegCredSigSchemes ||
+        !ss->sec.serverCert->delegCred.len ||
+        !ss->sec.serverCert->delegCredKeyPair) {
+        return SECSuccess;
+    }
+
+    rv = tls13_GetExpectedCertVerifyAlg(ss->sec.serverCert->delegCred,
+                                        &scheme);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    priv = ss->sec.serverCert->delegCredKeyPair->privKey;
+    rv = ssl_PrivateKeySupportsRsaPss(priv, NULL, NULL, &doesRsaPss);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    if (!ssl_SignatureSchemeEnabled(ss, scheme) ||
+        !ssl_CanUseSignatureScheme(scheme,
+                                   ss->xtnData.delegCredSigSchemes,
+                                   ss->xtnData.numDelegCredSigSchemes,
+                                   PR_FALSE ,
+                                   doesRsaPss)) {
+        return SECSuccess;
+    }
+
+    ss->xtnData.sendingDelegCredToPeer = PR_TRUE;
+    ss->ssl3.hs.signatureScheme = scheme;
+    return SECSuccess;
+}
+
+static SECStatus
+tls13_AppendCredentialParams(sslBuffer *buf, sslDelegatedCredential *dc)
+{
+    SECStatus rv;
+    rv = sslBuffer_AppendNumber(buf, dc->validTime, 4);
+    if (rv != SECSuccess) {
+        return SECFailure; 
+    }
+
+    rv = sslBuffer_AppendNumber(buf, dc->expectedCertVerifyAlg, 2);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    rv = sslBuffer_AppendVariable(buf, dc->derSpki.data, dc->derSpki.len, 3);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    rv = sslBuffer_AppendNumber(buf, dc->alg, 2);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    return SECSuccess;
+}
+
+static SECStatus
+tls13_AppendCredentialSignature(sslBuffer *buf, sslDelegatedCredential *dc)
+{
+    SECStatus rv;
+    rv = sslBuffer_AppendVariable(buf, dc->signature.data,
+                                  dc->signature.len, 2);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    return SECSuccess;
+}
+
+static SECStatus
+tls13_HashCredentialAndSignOrVerifyMessage(SECKEYPrivateKey *privKey,
+                                           SECKEYPublicKey *pubKey,
+                                           SSLSignatureScheme scheme,
+                                           sslSignOrVerify direction,
+                                           const CERTCertificate *cert,
+                                           const sslBuffer *dcBuf,
+                                           SECItem *signature, void *pwArg)
+{
+    SECStatus rv;
+    tlsSignOrVerifyContext ctx;
+
+    ctx = tls_CreateSignOrVerifyContext(privKey, pubKey, scheme, direction,
+                                        signature, pwArg);
+    if (!ctx.u.ptr) {
+        PORT_SetError(SEC_ERROR_NO_MEMORY);
+        goto loser;
+    }
+
+    const PRUint8 kCtxStrPadding[64] = {
+        0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20
+    };
+
+    const PRUint8 kCtxStr[] = "TLS, server delegated credentials";
+
+    rv = tls_SignOrVerifyUpdate(ctx, kCtxStrPadding, sizeof kCtxStrPadding);
+    if (rv != SECSuccess)
+        goto loser;
+    rv = tls_SignOrVerifyUpdate(ctx, kCtxStr, sizeof kCtxStr);
+    if (rv != SECSuccess)
+        goto loser;
+    rv = tls_SignOrVerifyUpdate(ctx, cert->derCert.data, cert->derCert.len);
+    if (rv != SECSuccess)
+        goto loser;
+    rv = tls_SignOrVerifyUpdate(ctx, dcBuf->buf, dcBuf->len);
+    if (rv != SECSuccess)
+        goto loser;
+    rv = tls_SignOrVerifyEnd(ctx, signature);
+    if (rv != SECSuccess)
+        goto loser;
+
+    return SECSuccess;
+
+loser:
+    tls_DestroySignOrVerifyContext(&ctx);
+    return SECFailure;
+}
+
+static SECStatus
+tls13_VerifyCredentialSignature(sslSocket *ss, sslDelegatedCredential *dc)
+{
+    SECStatus rv = SECSuccess;
+    sslBuffer dcBuf = SSL_BUFFER_EMPTY;
+    CERTCertificate *cert = ss->sec.peerCert;
+    SECKEYPublicKey *pubKey = NULL;
+    void *pwArg = ss->pkcs11PinArg;
+
+    rv = tls13_AppendCredentialParams(&dcBuf, dc);
+    if (rv != SECSuccess) {
+        goto loser; 
+    }
+
+    pubKey = SECKEY_ExtractPublicKey(&cert->subjectPublicKeyInfo);
+    if (pubKey == NULL) {
+        FATAL_ERROR(ss, SSL_ERROR_EXTRACT_PUBLIC_KEY_FAILURE, internal_error);
+        goto loser;
+    }
+
+    rv = tls13_HashCredentialAndSignOrVerifyMessage(NULL, pubKey, dc->alg,
+                                                    sig_verify, cert, &dcBuf,
+                                                    &dc->signature, pwArg);
+    if (rv != SECSuccess) {
+        FATAL_ERROR(ss, SSL_ERROR_DC_BAD_SIGNATURE, illegal_parameter);
+        goto loser;
+    }
+
+    SECOidTag spkiAlg = SECOID_GetAlgorithmTag(&(dc->spki->algorithm));
+    if (spkiAlg == SEC_OID_PKCS1_RSA_ENCRYPTION) {
+        FATAL_ERROR(ss, SSL_ERROR_INCORRECT_SIGNATURE_ALGORITHM, illegal_parameter);
+        goto loser;
+    }
+
+    SECKEY_DestroyPublicKey(pubKey);
+    sslBuffer_Clear(&dcBuf);
+    return SECSuccess;
+
+loser:
+    SECKEY_DestroyPublicKey(pubKey);
+    sslBuffer_Clear(&dcBuf);
+    return SECFailure;
+}
+
+static SECStatus
+tls13_CheckCertDelegationUsage(sslSocket *ss)
+{
+    int i;
+    PRBool found;
+    CERTCertExtension *ext;
+    SECItem delegUsageOid = { siBuffer, NULL, 0 };
+    const CERTCertificate *cert = ss->sec.peerCert;
+
+    static unsigned char kDelegationUsageOid[] = {
+        0x2b,
+        0x06,
+        0x01,
+        0x04,
+        0x01,
+        0x82,
+        0xda,
+        0x4b,
+        0x2c
+    };
+
+    delegUsageOid.data = kDelegationUsageOid;
+    delegUsageOid.len = sizeof kDelegationUsageOid;
+
+    found = PR_FALSE;
+    for (i = 0; cert->extensions[i] != NULL; i++) {
+        ext = cert->extensions[i];
+        if (SECITEM_CompareItem(&ext->id, &delegUsageOid) == SECEqual) {
+            found = PR_TRUE;
+            break;
+        }
+    }
+
+    if (!found ||
+        !cert->keyUsagePresent ||
+        !(cert->keyUsage & KU_DIGITAL_SIGNATURE)) {
+        FATAL_ERROR(ss, SSL_ERROR_DC_INVALID_KEY_USAGE, illegal_parameter);
+        return SECFailure;
+    }
+
+    return SECSuccess;
+}
+
+static SECStatus
+tls13_CheckCredentialExpiration(sslSocket *ss, sslDelegatedCredential *dc)
+{
+    SECStatus rv;
+    CERTCertificate *cert = ss->sec.peerCert;
+    static const PRTime kMaxDcValidity = ((PRTime)7 * 24 * 60 * 60 * PR_USEC_PER_SEC);
+    PRTime start, now, end; 
+
+    rv = DER_DecodeTimeChoice(&start, &cert->validity.notBefore);
+    if (rv != SECSuccess) {
+        FATAL_ERROR(ss, PORT_GetError(), internal_error);
+        return SECFailure;
+    }
+
+    end = start + ((PRTime)dc->validTime * PR_USEC_PER_SEC);
+    now = ssl_Time(ss);
+    if (now > end || end < 0) {
+        FATAL_ERROR(ss, SSL_ERROR_DC_EXPIRED, illegal_parameter);
+        return SECFailure;
+    }
+
+    if (end - now > kMaxDcValidity) {
+        FATAL_ERROR(ss, SSL_ERROR_DC_INAPPROPRIATE_VALIDITY_PERIOD, illegal_parameter);
+        return SECFailure;
+    }
+
+    return SECSuccess;
+}
+
+SECStatus
+tls13_VerifyDelegatedCredential(sslSocket *ss,
+                                sslDelegatedCredential *dc)
+{
+    SECStatus rv;
+    PRTime start;
+    PRExplodedTime end;
+    CERTCertificate *cert = ss->sec.peerCert;
+    char endStr[256];
+
+    rv = DER_DecodeTimeChoice(&start, &cert->validity.notBefore);
+    if (rv != SECSuccess) {
+        FATAL_ERROR(ss, PORT_GetError(), internal_error);
+        return SECFailure;
+    }
+
+    PR_ExplodeTime(start + (dc->validTime * PR_USEC_PER_SEC),
+                   PR_GMTParameters, &end);
+    if (PR_FormatTime(endStr, sizeof(endStr), "%a %b %d %H:%M:%S %Y", &end)) {
+        SSL_TRC(20, ("%d: TLS13[%d]: Received delegated credential (expires %s)",
+                     SSL_GETPID(), ss->fd, endStr));
+    } else {
+        SSL_TRC(20, ("%d: TLS13[%d]: Received delegated credential",
+                     SSL_GETPID(), ss->fd));
+    }
+
+    rv = SECSuccess;
+    rv |= tls13_VerifyCredentialSignature(ss, dc);
+    rv |= tls13_CheckCertDelegationUsage(ss);
+    rv |= tls13_CheckCredentialExpiration(ss, dc);
+    return rv;
+}
+
+static CERTSubjectPublicKeyInfo *
+tls13_MakePssSpki(const SECKEYPublicKey *pub, SECOidTag hashOid)
+{
+    SECStatus rv;
+    PLArenaPool *arena = PORT_NewArena(DER_DEFAULT_CHUNKSIZE);
+    if (!arena) {
+        goto loser; 
+    }
+    CERTSubjectPublicKeyInfo *spki = PORT_ArenaZNew(arena, CERTSubjectPublicKeyInfo);
+    if (!spki) {
+        goto loser; 
+    }
+    spki->arena = arena;
+
+    SECKEYRSAPSSParams params = { 0 };
+    params.hashAlg = PORT_ArenaZNew(arena, SECAlgorithmID);
+    rv = SECOID_SetAlgorithmID(arena, params.hashAlg, hashOid, NULL);
+    if (rv != SECSuccess) {
+        goto loser; 
+    }
+
+    SECAlgorithmID maskHashAlg;
+    memset(&maskHashAlg, 0, sizeof(maskHashAlg));
+    rv = SECOID_SetAlgorithmID(arena, &maskHashAlg, hashOid, NULL);
+    if (rv != SECSuccess) {
+        goto loser; 
+    }
+    SECItem *maskHashAlgItem =
+        SEC_ASN1EncodeItem(arena, NULL, &maskHashAlg,
+                           SEC_ASN1_GET(SECOID_AlgorithmIDTemplate));
+    if (!maskHashAlgItem) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        goto loser;
+    }
+
+    params.maskAlg = PORT_ArenaZNew(arena, SECAlgorithmID);
+    rv = SECOID_SetAlgorithmID(arena, params.maskAlg, SEC_OID_PKCS1_MGF1,
+                               maskHashAlgItem);
+    if (rv != SECSuccess) {
+        goto loser; 
+    }
+
+    unsigned int saltLength = HASH_ResultLenByOidTag(hashOid);
+    PORT_Assert(saltLength > 20);
+    if (!SEC_ASN1EncodeInteger(arena, &params.saltLength, saltLength)) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        goto loser;
+    }
+
+    SECItem *algorithmItem =
+        SEC_ASN1EncodeItem(arena, NULL, &params,
+                           SEC_ASN1_GET(SECKEY_RSAPSSParamsTemplate));
+    if (!algorithmItem) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        goto loser; 
+    }
+    rv = SECOID_SetAlgorithmID(arena, &spki->algorithm,
+                               SEC_OID_PKCS1_RSA_PSS_SIGNATURE, algorithmItem);
+    if (rv != SECSuccess) {
+        goto loser; 
+    }
+
+    SECItem *pubItem = SEC_ASN1EncodeItem(arena, &spki->subjectPublicKey, pub,
+                                          SEC_ASN1_GET(SECKEY_RSAPublicKeyTemplate));
+    if (!pubItem) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        goto loser;
+    }
+    spki->subjectPublicKey.len *= 8; 
+    return spki;
+
+loser:
+    PORT_FreeArena(arena, PR_FALSE);
+    return NULL;
+}
+
+static CERTSubjectPublicKeyInfo *
+tls13_MakeDcSpki(const SECKEYPublicKey *dcPub, SSLSignatureScheme dcCertVerifyAlg)
+{
+    switch (SECKEY_GetPublicKeyType(dcPub)) {
+        case rsaKey: {
+            SECOidTag hashOid;
+            switch (dcCertVerifyAlg) {
+                case ssl_sig_rsa_pss_rsae_sha256:
+                case ssl_sig_rsa_pss_rsae_sha384:
+                case ssl_sig_rsa_pss_rsae_sha512:
+                    return SECKEY_CreateSubjectPublicKeyInfo(dcPub);
+                case ssl_sig_rsa_pss_pss_sha256:
+                    hashOid = SEC_OID_SHA256;
+                    break;
+                case ssl_sig_rsa_pss_pss_sha384:
+                    hashOid = SEC_OID_SHA384;
+                    break;
+                case ssl_sig_rsa_pss_pss_sha512:
+                    hashOid = SEC_OID_SHA512;
+                    break;
+
+                default:
+                    PORT_SetError(SSL_ERROR_INCORRECT_SIGNATURE_ALGORITHM);
+                    return NULL;
+            }
+            return tls13_MakePssSpki(dcPub, hashOid);
+        }
+
+        case ecKey: {
+            const sslNamedGroupDef *group = ssl_ECPubKey2NamedGroup(dcPub);
+            if (!group) {
+                PORT_SetError(SSL_ERROR_INCORRECT_SIGNATURE_ALGORITHM);
+                return NULL;
+            }
+            SSLSignatureScheme keyScheme;
+            switch (group->name) {
+                case ssl_grp_ec_secp256r1:
+                    keyScheme = ssl_sig_ecdsa_secp256r1_sha256;
+                    break;
+                case ssl_grp_ec_secp384r1:
+                    keyScheme = ssl_sig_ecdsa_secp384r1_sha384;
+                    break;
+                case ssl_grp_ec_secp521r1:
+                    keyScheme = ssl_sig_ecdsa_secp521r1_sha512;
+                    break;
+                default:
+                    PORT_SetError(SEC_ERROR_INVALID_KEY);
+                    return NULL;
+            }
+            if (keyScheme != dcCertVerifyAlg) {
+                PORT_SetError(SSL_ERROR_INCORRECT_SIGNATURE_ALGORITHM);
+                return NULL;
+            }
+            return SECKEY_CreateSubjectPublicKeyInfo(dcPub);
+        }
+
+        default:
+            break;
+    }
+
+    PORT_SetError(SEC_ERROR_INVALID_KEY);
+    return NULL;
+}
+
+SECStatus
+SSLExp_DelegateCredential(const CERTCertificate *cert,
+                          const SECKEYPrivateKey *certPriv,
+                          const SECKEYPublicKey *dcPub,
+                          SSLSignatureScheme dcCertVerifyAlg,
+                          PRUint32 dcValidFor,
+                          PRTime now,
+                          SECItem *out)
+{
+    SECStatus rv;
+    CERTSubjectPublicKeyInfo *spki = NULL;
+    SECKEYPrivateKey *tmpPriv = NULL;
+    void *pwArg = certPriv->wincx;
+    sslDelegatedCredential *dc = NULL;
+    sslBuffer dcBuf = SSL_BUFFER_EMPTY;
+
+    if (!cert || !certPriv || !dcPub || !out) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return SECFailure;
+    }
+
+    dc = PORT_ZNew(sslDelegatedCredential);
+    if (!dc) {
+        PORT_SetError(SEC_ERROR_NO_MEMORY);
+        goto loser;
+    }
+
+    PRTime start;
+    rv = DER_DecodeTimeChoice(&start, &cert->validity.notBefore);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+    dc->validTime = ((now - start) / PR_USEC_PER_SEC) + dcValidFor;
+
+    spki = tls13_MakeDcSpki(dcPub, dcCertVerifyAlg);
+    if (!spki) {
+        goto loser;
+    }
+    dc->expectedCertVerifyAlg = dcCertVerifyAlg;
+
+    SECItem *spkiDer =
+        SEC_ASN1EncodeItem(NULL , &dc->derSpki, spki,
+                           SEC_ASN1_GET(CERT_SubjectPublicKeyInfoTemplate));
+    if (!spkiDer) {
+        goto loser;
+    }
+
+    rv = ssl_SignatureSchemeFromSpki(&cert->subjectPublicKeyInfo,
+                                     PR_TRUE , &dc->alg);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+
+    if (dc->alg == ssl_sig_none) {
+        SECOidTag spkiOid = SECOID_GetAlgorithmTag(&cert->subjectPublicKeyInfo.algorithm);
+        if (spkiOid == SEC_OID_PKCS1_RSA_ENCRYPTION) {
+            SSLSignatureScheme scheme = ssl_sig_rsa_pss_rsae_sha256;
+            if (ssl_SignatureSchemeValid(scheme, spkiOid, PR_TRUE )) {
+                dc->alg = scheme;
+            }
+        }
+    }
+    PORT_Assert(dc->alg != ssl_sig_none);
+
+    rv = tls13_AppendCredentialParams(&dcBuf, dc);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+
+    tmpPriv = SECKEY_CopyPrivateKey(certPriv);
+    rv = tls13_HashCredentialAndSignOrVerifyMessage(tmpPriv, NULL, dc->alg,
+                                                    sig_sign, cert, &dcBuf,
+                                                    &dc->signature, pwArg);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+
+    rv = tls13_AppendCredentialSignature(&dcBuf, dc);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+
+    rv = SECITEM_MakeItem(NULL, out, dcBuf.buf, dcBuf.len);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+
+    PRINT_BUF(20, (NULL, "delegated credential", dcBuf.buf, dcBuf.len));
+
+    SECKEY_DestroySubjectPublicKeyInfo(spki);
+    SECKEY_DestroyPrivateKey(tmpPriv);
+    tls13_DestroyDelegatedCredential(dc);
+    sslBuffer_Clear(&dcBuf);
+    return SECSuccess;
+
+loser:
+    SECKEY_DestroySubjectPublicKeyInfo(spki);
+    SECKEY_DestroyPrivateKey(tmpPriv);
+    tls13_DestroyDelegatedCredential(dc);
+    sslBuffer_Clear(&dcBuf);
+    return SECFailure;
+}

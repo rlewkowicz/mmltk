@@ -1,0 +1,226 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef BASE_H
+#include "base.h"
+#endif /* BASE_H */
+
+#ifdef DEBUG
+
+static PLHashNumber PR_CALLBACK
+identity_hash(const void *key)
+{
+    return (PLHashNumber)((char *)key - (char *)NULL);
+}
+
+
+static PRStatus
+trackerOnceFunc(void *arg)
+{
+    nssPointerTracker *tracker = (nssPointerTracker *)arg;
+
+    tracker->lock = PR_NewLock();
+    if ((PRLock *)NULL == tracker->lock) {
+        return PR_FAILURE;
+    }
+
+    tracker->table =
+        PL_NewHashTable(0, identity_hash, PL_CompareValues, PL_CompareValues,
+                        (PLHashAllocOps *)NULL, (void *)NULL);
+    if ((PLHashTable *)NULL == tracker->table) {
+        PR_DestroyLock(tracker->lock);
+        tracker->lock = (PRLock *)NULL;
+        return PR_FAILURE;
+    }
+
+    return PR_SUCCESS;
+}
+
+
+NSS_IMPLEMENT PRStatus
+nssPointerTracker_initialize(nssPointerTracker *tracker)
+{
+    PRStatus rv = PR_CallOnceWithArg(&tracker->once, trackerOnceFunc, tracker);
+    if (PR_SUCCESS != rv) {
+        nss_SetError(NSS_ERROR_NO_MEMORY);
+    }
+
+    return rv;
+}
+
+#ifdef DONT_DESTROY_EMPTY_TABLES
+
+static PRIntn PR_CALLBACK
+count_entries(PLHashEntry *he, PRIntn index, void *arg)
+{
+    return HT_ENUMERATE_NEXT;
+}
+#endif /* DONT_DESTROY_EMPTY_TABLES */
+
+
+static const PRCallOnceType zero_once;
+
+
+NSS_IMPLEMENT PRStatus
+nssPointerTracker_finalize(nssPointerTracker *tracker)
+{
+    PRLock *lock;
+
+    if ((nssPointerTracker *)NULL == tracker) {
+        nss_SetError(NSS_ERROR_INVALID_POINTER);
+        return PR_FAILURE;
+    }
+
+    if ((PRLock *)NULL == tracker->lock) {
+        nss_SetError(NSS_ERROR_TRACKER_NOT_INITIALIZED);
+        return PR_FAILURE;
+    }
+
+    lock = tracker->lock;
+    PR_Lock(lock);
+
+    if ((PLHashTable *)NULL == tracker->table) {
+        PR_Unlock(lock);
+        nss_SetError(NSS_ERROR_TRACKER_NOT_INITIALIZED);
+        return PR_FAILURE;
+    }
+
+#ifdef DONT_DESTROY_EMPTY_TABLES
+    count = PL_HashTableEnumerateEntries(tracker->table, count_entries,
+                                         (void *)NULL);
+
+    if (0 != count) {
+        PR_Unlock(lock);
+        nss_SetError(NSS_ERROR_TRACKER_NOT_EMPTY);
+        return PR_FAILURE;
+    }
+#endif /* DONT_DESTROY_EMPTY_TABLES */
+
+    PL_HashTableDestroy(tracker->table);
+    tracker->once = zero_once;
+    tracker->lock = (PRLock *)NULL;
+    tracker->table = (PLHashTable *)NULL;
+
+    PR_Unlock(lock);
+    PR_DestroyLock(lock);
+
+    return PR_SUCCESS;
+}
+
+
+NSS_IMPLEMENT PRStatus
+nssPointerTracker_add(nssPointerTracker *tracker, const void *pointer)
+{
+    void *check;
+    PLHashEntry *entry;
+
+    if ((nssPointerTracker *)NULL == tracker) {
+        nss_SetError(NSS_ERROR_INVALID_POINTER);
+        return PR_FAILURE;
+    }
+
+    if ((PRLock *)NULL == tracker->lock) {
+        nss_SetError(NSS_ERROR_TRACKER_NOT_INITIALIZED);
+        return PR_FAILURE;
+    }
+
+    PR_Lock(tracker->lock);
+
+    if ((PLHashTable *)NULL == tracker->table) {
+        PR_Unlock(tracker->lock);
+        nss_SetError(NSS_ERROR_TRACKER_NOT_INITIALIZED);
+        return PR_FAILURE;
+    }
+
+    check = PL_HashTableLookup(tracker->table, pointer);
+    if ((void *)NULL != check) {
+        PR_Unlock(tracker->lock);
+        nss_SetError(NSS_ERROR_DUPLICATE_POINTER);
+        return PR_FAILURE;
+    }
+
+    entry = PL_HashTableAdd(tracker->table, pointer, (void *)pointer);
+
+    PR_Unlock(tracker->lock);
+
+    if ((PLHashEntry *)NULL == entry) {
+        nss_SetError(NSS_ERROR_NO_MEMORY);
+        return PR_FAILURE;
+    }
+
+    return PR_SUCCESS;
+}
+
+
+NSS_IMPLEMENT PRStatus
+nssPointerTracker_remove(nssPointerTracker *tracker, const void *pointer)
+{
+    PRBool registered;
+
+    if ((nssPointerTracker *)NULL == tracker) {
+        nss_SetError(NSS_ERROR_INVALID_POINTER);
+        return PR_FAILURE;
+    }
+
+    if ((PRLock *)NULL == tracker->lock) {
+        nss_SetError(NSS_ERROR_TRACKER_NOT_INITIALIZED);
+        return PR_FAILURE;
+    }
+
+    PR_Lock(tracker->lock);
+
+    if ((PLHashTable *)NULL == tracker->table) {
+        PR_Unlock(tracker->lock);
+        nss_SetError(NSS_ERROR_TRACKER_NOT_INITIALIZED);
+        return PR_FAILURE;
+    }
+
+    registered = PL_HashTableRemove(tracker->table, pointer);
+    PR_Unlock(tracker->lock);
+
+    if (!registered) {
+        nss_SetError(NSS_ERROR_POINTER_NOT_REGISTERED);
+        return PR_FAILURE;
+    }
+
+    return PR_SUCCESS;
+}
+
+
+NSS_IMPLEMENT PRStatus
+nssPointerTracker_verify(nssPointerTracker *tracker, const void *pointer)
+{
+    void *check;
+
+    if ((nssPointerTracker *)NULL == tracker) {
+        nss_SetError(NSS_ERROR_INVALID_POINTER);
+        return PR_FAILURE;
+    }
+
+    if ((PRLock *)NULL == tracker->lock) {
+        nss_SetError(NSS_ERROR_TRACKER_NOT_INITIALIZED);
+        return PR_FAILURE;
+    }
+
+    PR_Lock(tracker->lock);
+
+    if ((PLHashTable *)NULL == tracker->table) {
+        PR_Unlock(tracker->lock);
+        nss_SetError(NSS_ERROR_TRACKER_NOT_INITIALIZED);
+        return PR_FAILURE;
+    }
+
+    check = PL_HashTableLookup(tracker->table, pointer);
+    PR_Unlock(tracker->lock);
+
+    if ((void *)NULL == check) {
+        nss_SetError(NSS_ERROR_POINTER_NOT_REGISTERED);
+        return PR_FAILURE;
+    }
+
+    return PR_SUCCESS;
+}
+
+#endif /* DEBUG */

@@ -1,0 +1,83 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+EXPORTS.mozilla.webrender += [
+    "RenderBufferTextureHost.h",
+    "RenderCompositor.h",
+    "RenderCompositorEGL.h",
+    "RenderCompositorLayerNative.h",
+    "RenderCompositorOGL.h",
+    "RenderEGLImageTextureHost.h",
+    "RendererOGL.h",
+    "RenderExternalTextureHost.h",
+    "RenderSharedSurfaceTextureHost.h",
+    "RenderTextureHost.h",
+    "RenderTextureHostWrapper.h",
+    "RenderThread.h",
+    "webrender_ffi.h",
+    "WebRenderAPI.h",
+    "WebRenderTypes.h",
+]
+
+UNIFIED_SOURCES += [
+    "Moz2DImageRenderer.cpp",
+    "RenderBufferTextureHost.cpp",
+    "RenderCompositor.cpp",
+    "RenderCompositorEGL.cpp",
+    "RenderCompositorLayerNative.cpp",
+    "RenderCompositorOGL.cpp",
+    "RenderEGLImageTextureHost.cpp",
+    "RendererOGL.cpp",
+    "RenderExternalTextureHost.cpp",
+    "RenderSharedSurfaceTextureHost.cpp",
+    "RenderTextureHost.cpp",
+    "RenderTextureHostWrapper.cpp",
+    "RenderThread.cpp",
+    "WebRenderAPI.cpp",
+    "WebRenderTypes.cpp",
+]
+
+
+
+
+EXPORTS.mozilla.webrender += [
+    "RenderDMABUFTextureHost.h",
+]
+SOURCES += [
+    "RenderDMABUFTextureHost.cpp",
+]
+
+EXPORTS.mozilla.webrender += [
+    "RenderCompositorNative.h",
+]
+SOURCES += [
+    "RenderCompositorNative.cpp",
+]
+
+CXXFLAGS += CONFIG["CAIRO_FT_CFLAGS"]
+
+if CONFIG["COMPILE_ENVIRONMENT"]:
+    EXPORTS.mozilla.webrender += [
+        "!webrender_ffi_generated.h",
+    ]
+
+    CbindgenHeader(
+        "webrender_ffi_generated.h",
+        inputs=[
+            "/gfx/webrender_bindings",
+            "/gfx/wr/webrender",
+            "/gfx/wr/webrender_api",
+        ],
+    )
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+FINAL_LIBRARY = "xul"
+
+LOCAL_INCLUDES += [
+    "/gfx/cairo/cairo/src",
+]
+CXXFLAGS += CONFIG["MOZ_GTK3_CFLAGS"]
+
+COMPILE_FLAGS["WARNINGS_CXXFLAGS"] += ["-Werror=switch"]

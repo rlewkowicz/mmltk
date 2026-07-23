@@ -1,0 +1,89 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_HighlightRegistry_h
+#define mozilla_dom_HighlightRegistry_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/CompactPair.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsHashKeys.h"
+#include "nsHashtablesFwd.h"
+#include "nsTHashMap.h"
+#include "nsWrapperCache.h"
+
+class nsFrameSelection;
+
+namespace mozilla {
+class ErrorResult;
+}
+namespace mozilla::dom {
+
+class AbstractRange;
+class Document;
+class Highlight;
+struct HighlightHitResult;
+struct HighlightsFromPointOptions;
+
+class HighlightRegistry final : public nsISupports, public nsWrapperCache {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(HighlightRegistry)
+
+ public:
+  explicit HighlightRegistry(Document* aDocument);
+
+ protected:
+  ~HighlightRegistry();
+
+ public:
+  MOZ_CAN_RUN_SCRIPT void AddHighlightSelectionsToFrameSelection();
+
+  MOZ_CAN_RUN_SCRIPT void MaybeAddRangeToHighlightSelection(
+      AbstractRange& aRange, Highlight& aHighlight);
+
+  MOZ_CAN_RUN_SCRIPT void MaybeRemoveRangeFromHighlightSelection(
+      AbstractRange& aRange, Highlight& aHighlight);
+
+  MOZ_CAN_RUN_SCRIPT void RemoveHighlightSelection(Highlight& aHighlight);
+
+  void RepaintHighlightSelection(Highlight& aHighlight);
+
+  void RepaintAllHighlightSelections();
+
+
+  Document* GetParentObject() const { return mDocument; };
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  MOZ_CAN_RUN_SCRIPT HighlightRegistry* Set(const nsAString& aKey,
+                                            Highlight& aValue,
+                                            ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void Clear(ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT bool Delete(const nsAString& aKey, ErrorResult& aRv);
+
+  void HighlightsFromPoint(float aX, float aY,
+                           const HighlightsFromPointOptions& aOptions,
+                           nsTArray<HighlightHitResult>& aResult);
+
+  RefPtr<nsFrameSelection> GetFrameSelection();
+
+  nsTArray<CompactPair<RefPtr<nsAtom>, RefPtr<Highlight>>> const&
+  HighlightsOrdered() {
+    return mHighlightsOrdered;
+  }
+
+ private:
+  RefPtr<Document> mDocument;
+
+  nsTArray<CompactPair<RefPtr<nsAtom>, RefPtr<Highlight>>> mHighlightsOrdered;
+};
+
+}  
+
+#endif  // mozilla_dom_HighlightRegistry_h

@@ -1,0 +1,80 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef AppShutdown_h
+#define AppShutdown_h
+
+#include "nsCOMPtr.h"
+#include "nsISupports.h"
+#include "ShutdownPhase.h"
+
+namespace mozilla {
+
+enum class AppShutdownMode {
+  Normal,
+  Restart,
+};
+
+enum class AppShutdownReason {
+  Unknown,
+  AppClose,
+  AppRestart,
+  OSForceClose,
+  OSSessionEnd,
+  OSShutdown,
+};
+
+class AppShutdown {
+ public:
+  static ShutdownPhase GetCurrentShutdownPhase();
+  static bool IsInOrBeyond(ShutdownPhase aPhase);
+
+  static int GetExitCode();
+
+  static void SaveEnvVarsForPotentialRestart();
+
+  static void Init(AppShutdownMode aMode, int aExitCode,
+                   AppShutdownReason aReason);
+
+  static void OnShutdownConfirmed();
+
+  static void MaybeDoRestart();
+
+  static void DoImmediateExit(int aExitCode = 0);
+
+  static bool IsRestarting();
+
+  static bool IsShutdownImpending();
+
+  static void SetImpendingShutdown();
+
+  static void AdvanceShutdownPhase(
+      ShutdownPhase aPhase, const char16_t* aNotificationData = nullptr,
+      const nsCOMPtr<nsISupports>& aNotificationSubject =
+          nsCOMPtr<nsISupports>(nullptr));
+
+  static void AdvanceShutdownPhaseWithoutNotify(ShutdownPhase aPhase);
+
+  static const char* GetObserverKey(ShutdownPhase aPhase);
+
+  static const char* GetShutdownPhaseName(ShutdownPhase aPhase);
+
+  static ShutdownPhase GetShutdownPhaseFromTopic(const char* aTopic);
+
+#ifdef DEBUG
+  static bool IsNoOrLegalShutdownTopic(const char* aTopic);
+#endif
+
+ private:
+
+  static void MaybeFastShutdown(ShutdownPhase aPhase);
+
+  static void AdvanceShutdownPhaseInternal(
+      ShutdownPhase aPhase, bool doNotify, const char16_t* aNotificationData,
+      const nsCOMPtr<nsISupports>& aNotificationSubject);
+};
+
+}  
+
+#endif  // AppShutdown_h

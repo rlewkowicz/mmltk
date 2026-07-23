@@ -1,0 +1,48 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef IPC_PROCESSTYPE_H_
+#define IPC_PROCESSTYPE_H_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Types.h"
+
+#include <cstdint>
+
+enum GeckoProcessType {
+#define GECKO_PROCESS_TYPE(enum_value, enum_name, string_name, proc_typename, \
+                           process_bin_type, procinfo_typename,               \
+                           webidl_typename, allcaps_name)                     \
+  GeckoProcessType_##enum_name = (enum_value),
+#include "mozilla/GeckoProcessTypes.h"
+#undef GECKO_PROCESS_TYPE
+  GeckoProcessType_End,
+  GeckoProcessType_Invalid = GeckoProcessType_End
+};
+
+using GeckoChildID = int32_t;
+
+inline constexpr GeckoChildID kInvalidGeckoChildID = -1;
+
+namespace mozilla {
+namespace startup {
+extern MFBT_DATA GeckoProcessType sChildProcessType;
+extern MFBT_DATA GeckoChildID sGeckoChildID;
+}  
+
+MOZ_ALWAYS_INLINE GeckoProcessType GetGeckoProcessType() {
+  return startup::sChildProcessType;
+}
+
+MFBT_API void SetGeckoProcessType(const char* aProcessTypeString);
+
+MOZ_ALWAYS_INLINE GeckoChildID GetGeckoChildID() {
+  return startup::sGeckoChildID;
+}
+
+MFBT_API void SetGeckoChildID(const char* aGeckoChildIDString);
+
+}  
+
+#endif  // IPC_PROCESSTYPE_H_

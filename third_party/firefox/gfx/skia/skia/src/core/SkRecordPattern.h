@@ -1,0 +1,193 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkRecordPattern_DEFINED)
+#define SkRecordPattern_DEFINED
+
+#include "include/private/base/SkTLogic.h"
+#include "src/core/SkRecord.h"
+
+namespace SkRecords {
+
+
+template <typename T>
+class Is {
+public:
+    Is() : fPtr(nullptr) {}
+
+    typedef T type;
+    type* get() { return fPtr; }
+
+    bool operator()(T* ptr) {
+        fPtr = ptr;
+        return true;
+    }
+
+    template <typename U>
+    bool operator()(U*) {
+        fPtr = nullptr;
+        return false;
+    }
+
+private:
+    type* fPtr;
+};
+
+class IsDraw {
+public:
+    IsDraw() : fPaint(nullptr) {}
+
+    SkPaint* get() { return fPaint; }
+
+    template <typename T>
+    std::enable_if_t<(T::kTags & kDrawWithPaint_Tag) == kDrawWithPaint_Tag, bool>
+    operator()(T* draw) {
+        fPaint = AsPtr(draw->paint);
+        return true;
+    }
+
+    template <typename T>
+    std::enable_if_t<(T::kTags & kDrawWithPaint_Tag) == kDraw_Tag, bool> operator()(T* draw) {
+        fPaint = nullptr;
+        return true;
+    }
+
+    template <typename T>
+    std::enable_if_t<!(T::kTags & kDraw_Tag), bool> operator()(T* draw) {
+        fPaint = nullptr;
+        return false;
+    }
+
+private:
+    template <typename T> static T* AsPtr(SkRecords::Optional<T>& x) { return x; }
+    template <typename T> static T* AsPtr(T& x) { return &x; }
+
+    SkPaint* fPaint;
+};
+
+class IsSingleDraw {
+public:
+    IsSingleDraw() : fPaint(nullptr) {}
+
+    SkPaint* get() { return fPaint; }
+
+    template <typename T>
+    std::enable_if_t<(T::kTags & kDrawWithPaint_Tag) == kDrawWithPaint_Tag &&
+                             !(T::kTags & kMultiDraw_Tag),
+                     bool>
+    operator()(T* draw) {
+        fPaint = AsPtr(draw->paint);
+        return true;
+    }
+
+    template <typename T>
+    std::enable_if_t<(T::kTags & kDrawWithPaint_Tag) == kDraw_Tag &&
+                             !(T::kTags & kMultiDraw_Tag),
+                     bool>
+    operator()(T* draw) {
+        fPaint = nullptr;
+        return true;
+    }
+
+    template <typename T>
+    std::enable_if_t<!(T::kTags & kDraw_Tag) || (T::kTags & kMultiDraw_Tag), bool>
+    operator()(T* draw) {
+        fPaint = nullptr;
+        return false;
+    }
+
+private:
+    template <typename T> static T* AsPtr(SkRecords::Optional<T>& x) { return x; }
+    template <typename T> static T* AsPtr(T& x) { return &x; }
+
+    SkPaint* fPaint;
+};
+
+template <typename Matcher>
+struct Not {
+    template <typename T>
+    bool operator()(T* ptr) { return !Matcher()(ptr); }
+};
+
+template <typename First, typename... Rest>
+struct Or {
+    template <typename T>
+    bool operator()(T* ptr) { return First()(ptr) || Or<Rest...>()(ptr); }
+};
+template <typename First>
+struct Or<First> {
+    template <typename T>
+    bool operator()(T* ptr) { return First()(ptr); }
+};
+
+
+template <typename Matcher>
+struct Greedy {
+    template <typename T>
+    bool operator()(T* ptr) { return Matcher()(ptr); }
+};
+
+
+template <typename... Matchers> class Pattern;
+
+template <> class Pattern<> {
+public:
+    int match(SkRecord*, int i) { return i; }
+};
+
+template <typename First, typename... Rest>
+class Pattern<First, Rest...> {
+public:
+    SK_ALWAYS_INLINE int match(SkRecord* record, int i) {
+        i = this->matchFirst(&fFirst, record, i);
+        return i > 0 ? fRest.match(record, i) : 0;
+    }
+
+    SK_ALWAYS_INLINE bool search(SkRecord* record, int* begin, int* end) {
+        for (*begin = *end; *begin < record->count(); ++(*begin)) {
+            *end = this->match(record, *begin);
+            if (*end != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    template <typename T> T* first()  { return fFirst.get();   }
+    template <typename T> T* second() { return fRest.template first<T>();  }
+    template <typename T> T* third()  { return fRest.template second<T>(); }
+    template <typename T> T* fourth() { return fRest.template third<T>();  }
+
+private:
+    template <typename T>
+    int matchFirst(T* first, SkRecord* record, int i) {
+        if (i < record->count()) {
+            if (record->mutate(i, *first)) {
+                return i+1;
+            }
+        }
+        return 0;
+    }
+
+    template <typename T>
+    int matchFirst(Greedy<T>* first, SkRecord* record, int i) {
+        while (i < record->count()) {
+            if (!record->mutate(i, *first)) {
+                return i;
+            }
+            i++;
+        }
+        return 0;
+    }
+
+    First            fFirst;
+    Pattern<Rest...> fRest;
+};
+
+}  
+
+#endif

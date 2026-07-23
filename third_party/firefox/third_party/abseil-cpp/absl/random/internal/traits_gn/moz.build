@@ -1,0 +1,62 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+
+  ### This moz.build was AUTOMATICALLY GENERATED from a GN config,  ###
+  ### DO NOT edit it by hand.                                       ###
+
+COMPILE_FLAGS["OS_INCLUDES"] = []
+AllowCompilerWarnings()
+
+DEFINES["ABSL_ALLOCATOR_NOTHROW"] = "1"
+
+FINAL_LIBRARY = "abseil"
+
+
+LOCAL_INCLUDES += [
+    "!/ipc/ipdl/_ipdlheaders",
+    "!/third_party/abseil-cpp/gen",
+    "/ipc/chromium/src",
+    "/third_party/abseil-cpp/",
+]
+
+if not CONFIG["MOZ_DEBUG"]:
+
+    DEFINES["DYNAMIC_ANNOTATIONS_ENABLED"] = "0"
+    DEFINES["NDEBUG"] = True
+    DEFINES["NVALGRIND"] = True
+
+if CONFIG["MOZ_DEBUG"] == "1":
+
+    DEFINES["DYNAMIC_ANNOTATIONS_ENABLED"] = "1"
+
+
+DEFINES["USE_AURA"] = "1"
+DEFINES["USE_GLIB"] = "1"
+DEFINES["USE_OZONE"] = "1"
+DEFINES["USE_UDEV"] = True
+DEFINES["_FILE_OFFSET_BITS"] = "64"
+DEFINES["_LARGEFILE64_SOURCE"] = True
+DEFINES["_LARGEFILE_SOURCE"] = True
+
+
+
+
+
+
+
+
+
+if CONFIG["MOZ_DEBUG"] == "1" and CONFIG["OS_TARGET"] == "Linux":
+
+    DEFINES["_DEBUG"] = True
+
+
+
+
+
+
+DEFINES["_GNU_SOURCE"] = True
+
+Library("traits_gn")

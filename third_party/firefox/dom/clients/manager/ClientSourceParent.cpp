@@ -1,0 +1,207 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ClientSourceParent.h"
+
+#include "ClientHandleParent.h"
+#include "ClientManagerService.h"
+#include "ClientSourceOpParent.h"
+#include "ClientValidation.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/dom/ClientIPCTypes.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/PClientManagerParent.h"
+#include "mozilla/dom/ServiceWorkerManager.h"
+#include "mozilla/dom/ServiceWorkerUtils.h"
+#include "mozilla/ipc/BackgroundParent.h"
+
+namespace mozilla::dom {
+
+using mozilla::ipc::AssertIsOnBackgroundThread;
+using mozilla::ipc::BackgroundParent;
+using mozilla::ipc::IPCResult;
+using mozilla::ipc::PrincipalInfo;
+
+mozilla::ipc::IPCResult ClientSourceParent::RecvWorkerSyncPing() {
+  AssertIsOnBackgroundThread();
+  return IPC_OK();
+}
+
+IPCResult ClientSourceParent::RecvTeardown() {
+  (void)Send__delete__(this);
+  return IPC_OK();
+}
+
+IPCResult ClientSourceParent::RecvExecutionReady(
+    const ClientSourceExecutionReadyArgs& aArgs) {
+  if (!ClientIsValidCreationURL(mClientInfo.PrincipalInfo(), aArgs.url())) {
+    return IPC_FAIL(this, "Invalid creation URL!");
+  }
+
+  mClientInfo.SetURL(aArgs.url());
+  mClientInfo.SetFrameType(aArgs.frameType());
+  mExecutionReady = true;
+
+  for (ClientHandleParent* handle : mHandleList) {
+    (void)handle->SendExecutionReady(mClientInfo.ToIPC());
+  }
+
+  mExecutionReadyPromise.ResolveIfExists(true, __func__);
+
+  return IPC_OK();
+};
+
+IPCResult ClientSourceParent::RecvFreeze() {
+  MOZ_DIAGNOSTIC_ASSERT(!mFrozen);
+  mFrozen = true;
+
+  return IPC_OK();
+}
+
+IPCResult ClientSourceParent::RecvThaw() {
+  MOZ_DIAGNOSTIC_ASSERT(mFrozen);
+  mFrozen = false;
+  return IPC_OK();
+}
+
+IPCResult ClientSourceParent::RecvInheritController(
+    const ClientControlledArgs& aArgs) {
+  mController.reset();
+  mController.emplace(aArgs.serviceWorker());
+
+  nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(
+      "ClientSourceParent::RecvInheritController",
+      [clientInfo = mClientInfo, controller = mController.ref()]() {
+        RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+        NS_ENSURE_TRUE_VOID(swm);
+
+        swm->NoteInheritedController(clientInfo, controller);
+      });
+
+  MOZ_ALWAYS_SUCCEEDS(SchedulerGroup::Dispatch(r.forget()));
+
+  return IPC_OK();
+}
+
+IPCResult ClientSourceParent::RecvNoteDOMContentLoaded() {
+  if (mController.isSome()) {
+    nsCOMPtr<nsIRunnable> r =
+        NS_NewRunnableFunction("ClientSourceParent::RecvNoteDOMContentLoaded",
+                               [clientInfo = mClientInfo]() {
+                                 RefPtr<ServiceWorkerManager> swm =
+                                     ServiceWorkerManager::GetInstance();
+                                 NS_ENSURE_TRUE_VOID(swm);
+
+                                 swm->MaybeCheckNavigationUpdate(clientInfo);
+                               });
+
+    MOZ_ALWAYS_SUCCEEDS(SchedulerGroup::Dispatch(r.forget()));
+  }
+  return IPC_OK();
+}
+
+void ClientSourceParent::ActorDestroy(ActorDestroyReason aReason) {
+  DebugOnly<bool> removed = mService->RemoveSource(this);
+  MOZ_ASSERT(removed);
+
+  for (ClientHandleParent* handle : mHandleList.Clone()) {
+    (void)ClientHandleParent::Send__delete__(handle);
+  }
+  MOZ_DIAGNOSTIC_ASSERT(mHandleList.IsEmpty());
+}
+
+PClientSourceOpParent* ClientSourceParent::AllocPClientSourceOpParent(
+    const ClientOpConstructorArgs& aArgs) {
+  MOZ_ASSERT_UNREACHABLE(
+      "ClientSourceOpParent should be explicitly constructed.");
+  return nullptr;
+}
+
+bool ClientSourceParent::DeallocPClientSourceOpParent(
+    PClientSourceOpParent* aActor) {
+  delete aActor;
+  return true;
+}
+
+ClientSourceParent::ClientSourceParent(
+    const ClientSourceConstructorArgs& aArgs,
+    ThreadsafeContentParentHandle* aContentParentHandle)
+    : mClientInfo(aArgs.id(), aArgs.agentClusterId(), aArgs.type(),
+                  aArgs.principalInfo(), aArgs.creationTime(), aArgs.url(),
+                  aArgs.frameType()),
+      mContentParentHandle(aContentParentHandle),
+      mService(ClientManagerService::GetOrCreateInstance()),
+      mExecutionReady(false),
+      mFrozen(false) {}
+
+ClientSourceParent::~ClientSourceParent() {
+  MOZ_DIAGNOSTIC_ASSERT(mHandleList.IsEmpty());
+
+  mExecutionReadyPromise.RejectIfExists(NS_ERROR_FAILURE, __func__);
+}
+
+IPCResult ClientSourceParent::Init() {
+  if (NS_WARN_IF(!ClientIsValidPrincipalInfo(
+          mClientInfo.PrincipalInfo(),
+          mContentParentHandle ? mContentParentHandle->GetRemoteType()
+                               : NOT_REMOTE_TYPE))) {
+    mService->ForgetFutureSource(mClientInfo.ToIPC());
+    return IPC_FAIL(Manager(), "Invalid PrincipalInfo!");
+  }
+
+  if (NS_WARN_IF(!mService->AddSource(this))) {
+    return IPC_FAIL(Manager(), "Already registered!");
+  }
+
+  return IPC_OK();
+}
+
+const ClientInfo& ClientSourceParent::Info() const { return mClientInfo; }
+
+bool ClientSourceParent::IsFrozen() const { return mFrozen; }
+
+bool ClientSourceParent::ExecutionReady() const { return mExecutionReady; }
+
+RefPtr<GenericNonExclusivePromise> ClientSourceParent::ExecutionReadyPromise() {
+  MOZ_ASSERT(!mExecutionReady);
+  return mExecutionReadyPromise.Ensure(__func__);
+}
+
+const Maybe<ServiceWorkerDescriptor>& ClientSourceParent::GetController()
+    const {
+  return mController;
+}
+
+void ClientSourceParent::ClearController() { mController.reset(); }
+
+void ClientSourceParent::AttachHandle(ClientHandleParent* aClientHandle) {
+  MOZ_DIAGNOSTIC_ASSERT(aClientHandle);
+  MOZ_ASSERT(!mHandleList.Contains(aClientHandle));
+  mHandleList.AppendElement(aClientHandle);
+}
+
+void ClientSourceParent::DetachHandle(ClientHandleParent* aClientHandle) {
+  MOZ_DIAGNOSTIC_ASSERT(aClientHandle);
+  MOZ_ASSERT(mHandleList.Contains(aClientHandle));
+  mHandleList.RemoveElement(aClientHandle);
+}
+
+RefPtr<ClientOpPromise> ClientSourceParent::StartOp(
+    ClientOpConstructorArgs&& aArgs) {
+  RefPtr<ClientOpPromise::Private> promise =
+      new ClientOpPromise::Private(__func__);
+
+  if (aArgs.type() == ClientOpConstructorArgs::TClientControlledArgs) {
+    mController.reset();
+    mController.emplace(aArgs.get_ClientControlledArgs().serviceWorker());
+  }
+
+  ClientSourceOpParent* actor =
+      new ClientSourceOpParent(std::move(aArgs), promise);
+  (void)SendPClientSourceOpConstructor(actor, actor->Args());
+
+  return promise;
+}
+
+}  

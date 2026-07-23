@@ -1,0 +1,59 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MultiLogCTVerifier_h
+#define MultiLogCTVerifier_h
+
+#include <vector>
+
+#include "CTLogVerifier.h"
+#include "CTVerifyResult.h"
+#include "SignedCertificateTimestamp.h"
+#include "mozpkix/Input.h"
+#include "mozpkix/Result.h"
+#include "mozpkix/Time.h"
+#include "signature_cache_ffi.h"
+#include "mozilla/UniquePtr.h"
+
+namespace mozilla {
+namespace ct {
+
+void DecodeSCTs(pkix::Input encodedSctList,
+                std::vector<SignedCertificateTimestamp>& decodedSCTs,
+                size_t& decodingErrors);
+
+class MultiLogCTVerifier {
+ public:
+  MultiLogCTVerifier();
+
+  void AddLog(CTLogVerifier&& log);
+
+  pkix::Result Verify(pkix::Input cert, pkix::Input issuerSubjectPublicKeyInfo,
+                      pkix::Input sctListFromCert,
+                      pkix::Input sctListFromOCSPResponse,
+                      pkix::Input sctListFromTLSExtension, pkix::Time time,
+                      Maybe<pkix::Time> distrustAfterTime,
+                      CTVerifyResult& result);
+
+ private:
+  pkix::Result VerifySCTs(pkix::Input encodedSctList,
+                          const LogEntry& expectedEntry, SCTOrigin origin,
+                          pkix::Time time, Maybe<pkix::Time> distrustAfterTime,
+                          CTVerifyResult& result);
+
+  pkix::Result VerifySingleSCT(SignedCertificateTimestamp&& sct,
+                               const ct::LogEntry& expectedEntry,
+                               SCTOrigin origin, pkix::Time time,
+                               Maybe<pkix::Time> distrustAfterTime,
+                               CTVerifyResult& result);
+
+  std::vector<CTLogVerifier> mLogs;
+
+  UniquePtr<SignatureCache, decltype(&signature_cache_free)> mSignatureCache;
+};
+
+}  
+}  
+
+#endif  // MultiLogCTVerifier_h

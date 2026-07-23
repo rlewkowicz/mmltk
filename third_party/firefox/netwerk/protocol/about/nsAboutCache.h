@@ -1,0 +1,187 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsAboutCache_h_
+#define nsAboutCache_h_
+
+#include "nsIAboutModule.h"
+#include "nsICacheStorageVisitor.h"
+#include "nsICacheStorage.h"
+
+#include "nsString.h"
+#include "nsIChannel.h"
+#include "nsIOutputStream.h"
+#include "nsILoadContextInfo.h"
+
+#include "nsCOMPtr.h"
+#include "nsTArray.h"
+
+#define NS_FORWARD_SAFE_NSICHANNEL_SUBSET(_to)                                 \
+  NS_IMETHOD GetOriginalURI(nsIURI** aOriginalURI) override {                  \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->GetOriginalURI(aOriginalURI);                       \
+  }                                                                            \
+  NS_IMETHOD SetOriginalURI(nsIURI* aOriginalURI) override {                   \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->SetOriginalURI(aOriginalURI);                       \
+  }                                                                            \
+  NS_IMETHOD GetURI(nsIURI** aURI) override {                                  \
+    return !(_to) ? NS_ERROR_NULL_POINTER : (_to)->GetURI(aURI);               \
+  }                                                                            \
+  NS_IMETHOD GetOwner(nsISupports** aOwner) override {                         \
+    return !(_to) ? NS_ERROR_NULL_POINTER : (_to)->GetOwner(aOwner);           \
+  }                                                                            \
+  NS_IMETHOD SetOwner(nsISupports* aOwner) override {                          \
+    return !(_to) ? NS_ERROR_NULL_POINTER : (_to)->SetOwner(aOwner);           \
+  }                                                                            \
+  NS_IMETHOD GetNotificationCallbacks(                                         \
+      nsIInterfaceRequestor** aNotificationCallbacks) override {               \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->GetNotificationCallbacks(aNotificationCallbacks);   \
+  }                                                                            \
+  NS_IMETHOD SetNotificationCallbacks(                                         \
+      nsIInterfaceRequestor* aNotificationCallbacks) override {                \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->SetNotificationCallbacks(aNotificationCallbacks);   \
+  }                                                                            \
+  NS_IMETHOD GetSecurityInfo(nsITransportSecurityInfo** aSecurityInfo)         \
+      override {                                                               \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->GetSecurityInfo(aSecurityInfo);                     \
+  }                                                                            \
+  NS_IMETHOD GetContentType(nsACString& aContentType) override {               \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->GetContentType(aContentType);                       \
+  }                                                                            \
+  NS_IMETHOD SetContentType(const nsACString& aContentType) override {         \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->SetContentType(aContentType);                       \
+  }                                                                            \
+  NS_IMETHOD GetContentCharset(nsACString& aContentCharset) override {         \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->GetContentCharset(aContentCharset);                 \
+  }                                                                            \
+  NS_IMETHOD SetContentCharset(const nsACString& aContentCharset) override {   \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->SetContentCharset(aContentCharset);                 \
+  }                                                                            \
+  NS_IMETHOD GetContentLength(int64_t* aContentLength) override {              \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->GetContentLength(aContentLength);                   \
+  }                                                                            \
+  NS_IMETHOD SetContentLength(int64_t aContentLength) override {               \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->SetContentLength(aContentLength);                   \
+  }                                                                            \
+  NS_IMETHOD GetContentDisposition(uint32_t* aContentDisposition) override {   \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->GetContentDisposition(aContentDisposition);         \
+  }                                                                            \
+  NS_IMETHOD SetContentDisposition(uint32_t aContentDisposition) override {    \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->SetContentDisposition(aContentDisposition);         \
+  }                                                                            \
+  NS_IMETHOD GetContentDispositionFilename(                                    \
+      nsAString& aContentDispositionFilename) override {                       \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->GetContentDispositionFilename(                      \
+                        aContentDispositionFilename);                          \
+  }                                                                            \
+  NS_IMETHOD SetContentDispositionFilename(                                    \
+      const nsAString& aContentDispositionFilename) override {                 \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->SetContentDispositionFilename(                      \
+                        aContentDispositionFilename);                          \
+  }                                                                            \
+  NS_IMETHOD GetContentDispositionHeader(                                      \
+      nsACString& aContentDispositionHeader) override {                        \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->GetContentDispositionHeader(                        \
+                        aContentDispositionHeader);                            \
+  }                                                                            \
+  NS_IMETHOD GetLoadInfo(nsILoadInfo** aLoadInfo) override {                   \
+    return !(_to) ? NS_ERROR_NULL_POINTER : (_to)->GetLoadInfo(aLoadInfo);     \
+  }                                                                            \
+  NS_IMETHOD SetLoadInfo(nsILoadInfo* aLoadInfo) override {                    \
+    return !(_to) ? NS_ERROR_NULL_POINTER : (_to)->SetLoadInfo(aLoadInfo);     \
+  }                                                                            \
+  NS_IMETHOD GetIsDocument(bool* aIsDocument) override {                       \
+    return !(_to) ? NS_ERROR_NULL_POINTER : (_to)->GetIsDocument(aIsDocument); \
+  }                                                                            \
+  NS_IMETHOD GetCanceled(bool* aCanceled) override {                           \
+    return !(_to) ? NS_ERROR_NULL_POINTER : (_to)->GetCanceled(aCanceled);     \
+  }                                                                            \
+  NS_IMETHOD GetParentProcessChannelHandle(                                    \
+      mozilla::dom::ParentProcessChannelHandle** aValue) override {            \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->GetParentProcessChannelHandle(aValue);              \
+  }                                                                            \
+  NS_IMETHOD SetParentProcessChannelHandle(                                    \
+      mozilla::dom::ParentProcessChannelHandle* aValue) override {             \
+    return !(_to) ? NS_ERROR_NULL_POINTER                                      \
+                  : (_to)->SetParentProcessChannelHandle(aValue);              \
+  }
+
+class nsAboutCache final : public nsIAboutModule {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIABOUTMODULE
+
+  nsAboutCache() = default;
+
+  [[nodiscard]] static nsresult Create(REFNSIID aIID, void** aResult);
+
+  [[nodiscard]] static nsresult GetStorage(nsACString const& storageName,
+                                           nsILoadContextInfo* loadInfo,
+                                           nsICacheStorage** storage);
+
+ protected:
+  virtual ~nsAboutCache() = default;
+
+  class Channel final : public nsIChannel, public nsICacheStorageVisitor {
+    NS_DECL_ISUPPORTS
+    NS_DECL_NSICACHESTORAGEVISITOR
+    NS_FORWARD_SAFE_NSIREQUEST(mChannel)
+    NS_FORWARD_SAFE_NSICHANNEL_SUBSET(mChannel)
+    NS_IMETHOD AsyncOpen(nsIStreamListener* aListener) override;
+    NS_IMETHOD Open(nsIInputStream** _retval) override;
+
+   private:
+    virtual ~Channel() = default;
+
+   public:
+    [[nodiscard]] nsresult Init(nsIURI* aURI, nsILoadInfo* aLoadInfo);
+    [[nodiscard]] nsresult ParseURI(nsIURI* uri, nsACString& storage);
+
+    [[nodiscard]] nsresult VisitNextStorage();
+    void FireVisitStorage();
+    [[nodiscard]] nsresult VisitStorage(nsACString const& storageName);
+
+    [[nodiscard]] nsresult FlushBuffer();
+
+    bool mOverview = false;
+
+    bool mEntriesHeaderAdded = false;
+
+    bool mCancel = false;
+
+    nsTArray<nsCString> mStorageList;
+    nsCString mStorageName;
+    nsCOMPtr<nsICacheStorage> mStorage;
+
+    nsCString mBuffer;
+    nsCOMPtr<nsIOutputStream> mStream;
+
+    nsCOMPtr<nsIChannel> mChannel;
+  };
+};
+
+#define NS_ABOUT_CACHE_MODULE_CID             \
+  { \
+   0x9158c470,                                \
+   0x86e4,                                    \
+   0x11d4,                                    \
+   {0x9b, 0xe2, 0x00, 0xe0, 0x98, 0x72, 0xa4, 0x16}}
+
+#endif  // nsAboutCache_h_

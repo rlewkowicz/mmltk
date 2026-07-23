@@ -1,0 +1,58 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_battery_BatteryManager_h
+#define mozilla_dom_battery_BatteryManager_h
+
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/HalBatteryInformation.h"
+
+namespace mozilla {
+
+namespace hal {
+class BatteryInformation;
+}  
+
+namespace dom::battery {
+
+class BatteryManager final : public DOMEventTargetHelper,
+                             public hal::BatteryObserver {
+ public:
+  explicit BatteryManager(nsPIDOMWindowInner* aWindow);
+
+  void Init();
+  void Shutdown();
+
+  void Notify(const hal::BatteryInformation& aBatteryInfo) override;
+
+
+  nsIGlobalObject* GetParentObject() const { return GetRelevantGlobal(); }
+
+  JSObject* WrapObject(JSContext*, JS::Handle<JSObject*> aGivenProto) override;
+
+  bool Charging() const;
+
+  double ChargingTime() const;
+
+  double DischargingTime() const;
+
+  double Level() const;
+
+  IMPL_EVENT_HANDLER(chargingchange)
+  IMPL_EVENT_HANDLER(chargingtimechange)
+  IMPL_EVENT_HANDLER(dischargingtimechange)
+  IMPL_EVENT_HANDLER(levelchange)
+
+ private:
+  void UpdateFromBatteryInfo(const hal::BatteryInformation& aBatteryInfo);
+
+  double mLevel;
+  bool mCharging;
+  double mRemainingTime;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_battery_BatteryManager_h

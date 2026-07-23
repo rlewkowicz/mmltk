@@ -1,0 +1,188 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsHTMLFrameset_h_
+#define nsHTMLFrameset_h_
+
+#include "nsColor.h"
+#include "nsContainerFrame.h"
+#include "nsTArray.h"
+
+class nsIContent;
+class nsPresContext;
+struct nsRect;
+struct nsSize;
+class nsAtom;
+class nsHTMLFramesetBorderFrame;
+class nsHTMLFramesetFrame;
+
+#define NO_COLOR 0xFFFFFFFA
+
+struct nsFramesetSpec;
+
+struct nsBorderColor {
+  nscolor mLeft;
+  nscolor mRight;
+  nscolor mTop;
+  nscolor mBottom;
+
+  nsBorderColor() { Set(NO_COLOR); }
+  ~nsBorderColor() = default;
+  void Set(nscolor aColor) { mLeft = mRight = mTop = mBottom = aColor; }
+};
+
+enum nsFrameborder {
+  eFrameborder_Yes = 0,
+  eFrameborder_No,
+  eFrameborder_Notset
+};
+
+struct nsFramesetDrag {
+  nsHTMLFramesetFrame* mSource;  
+  int32_t mIndex;   
+  int32_t mChange;  
+  bool mVertical;   
+
+  nsFramesetDrag();
+  void Reset(bool aVertical, int32_t aIndex, int32_t aChange,
+             nsHTMLFramesetFrame* aSource);
+  void UnSet();
+};
+
+class nsHTMLFramesetFrame final : public nsContainerFrame {
+ public:
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsHTMLFramesetFrame)
+
+  explicit nsHTMLFramesetFrame(ComputedStyle* aStyle,
+                               nsPresContext* aPresContext);
+
+  virtual ~nsHTMLFramesetFrame();
+
+  virtual void Init(nsIContent* aContent, nsContainerFrame* aParent,
+                    nsIFrame* aPrevInFlow) override;
+
+  void SetInitialChildList(ChildListID aListID,
+                           nsFrameList&& aChildList) override;
+
+  static bool gDragInProgress;
+
+  void GetSizeOfChild(nsIFrame* aChild, mozilla::WritingMode aWM,
+                      mozilla::LogicalSize& aSize);
+
+  void GetSizeOfChildAt(int32_t aIndexInParent, mozilla::WritingMode aWM,
+                        mozilla::LogicalSize& aSize, nsIntPoint& aCellIndex);
+
+  virtual nsresult HandleEvent(nsPresContext* aPresContext,
+                               mozilla::WidgetGUIEvent* aEvent,
+                               nsEventStatus* aEventStatus) override;
+
+  Cursor GetCursor(const nsPoint&) override;
+
+  virtual void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                                const nsDisplayListSet& aLists) override;
+
+  virtual void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+                      const ReflowInput& aReflowInput,
+                      nsReflowStatus& aStatus) override;
+
+#ifdef DEBUG_FRAME_DUMP
+  virtual nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+  void StartMouseDrag(nsPresContext* aPresContext,
+                      nsHTMLFramesetBorderFrame* aBorder,
+                      mozilla::WidgetGUIEvent* aEvent);
+
+  void MouseDrag(nsPresContext* aPresContext, mozilla::WidgetGUIEvent* aEvent);
+
+  void EndMouseDrag(nsPresContext* aPresContext);
+
+  nsFrameborder GetParentFrameborder() { return mParentFrameborder; }
+
+  void SetParentFrameborder(nsFrameborder aValue) {
+    mParentFrameborder = aValue;
+  }
+
+  nsFramesetDrag& GetDrag() { return mDrag; }
+
+  void RecalculateBorderResize();
+
+ protected:
+  void Scale(nscoord aDesired, int32_t aNumIndicies,
+             const nsTArray<int32_t>& aIndicies, nsTArray<int32_t>& aItems);
+
+  void CalculateRowCol(nsPresContext* aPresContext, nscoord aSize,
+                       const mozilla::Span<const nsFramesetSpec>& aSpecs,
+                       nsTArray<nscoord>& aValues);
+
+  void GenerateRowCol(nsPresContext* aPresContext, nscoord aSize,
+                      const mozilla::Span<const nsFramesetSpec>& aSpecs,
+                      const nsTArray<nscoord>& aValues, nsString& aNewAttr);
+
+  virtual void GetDesiredSize(nsPresContext* aPresContext,
+                              const ReflowInput& aReflowInput,
+                              ReflowOutput& aDesiredSize);
+
+  int32_t GetBorderWidth(nsPresContext* aPresContext,
+                         bool aTakeForcingIntoAccount);
+
+  int32_t GetParentBorderWidth() { return mParentBorderWidth; }
+
+  void SetParentBorderWidth(int32_t aWidth) { mParentBorderWidth = aWidth; }
+
+  nscolor GetParentBorderColor() { return mParentBorderColor; }
+
+  void SetParentBorderColor(nscolor aColor) { mParentBorderColor = aColor; }
+
+  nsFrameborder GetFrameBorder();
+
+  nsFrameborder GetFrameBorder(nsIContent* aContent);
+
+  nscolor GetBorderColor();
+
+  nscolor GetBorderColor(nsIContent* aFrameContent);
+
+  bool GetNoResize(nsIFrame* aChildFrame);
+
+  void ReflowPlaceChild(nsIFrame* aChild, nsPresContext* aPresContext,
+                        const ReflowInput& aReflowInput, nsPoint& aOffset,
+                        nsSize& aSize, nsIntPoint* aCellIndex = nullptr);
+
+  bool CanResize(bool aVertical, bool aLeft);
+
+  bool CanChildResize(bool aVertical, bool aLeft, int32_t aChildX);
+
+  void SetBorderResize(nsHTMLFramesetBorderFrame* aBorderFrame);
+
+  int32_t NumRows() const;
+  int32_t NumCols() const;
+
+  nsFramesetDrag mDrag;
+  nsBorderColor mEdgeColors;
+  nsHTMLFramesetBorderFrame* mDragger;
+  nsHTMLFramesetFrame* mTopLevelFrameset;
+  nsTArray<nsHTMLFramesetBorderFrame*> mVerBorders;  
+  nsTArray<nsHTMLFramesetBorderFrame*> mHorBorders;  
+  nsTArray<nsFrameborder>
+      mChildFrameborder;  
+  nsTArray<nsBorderColor> mChildBorderColors;
+  nsTArray<nscoord> mRowSizes;  
+  nsTArray<nscoord> mColSizes;  
+  mozilla::LayoutDeviceIntPoint mFirstDragPoint;
+  int32_t mNonBorderChildCount;
+  int32_t mNonBlankChildCount;
+  int32_t mEdgeVisibility;
+  nsFrameborder mParentFrameborder;
+  bool mNeedFirstReflowWork = false;
+  nscolor mParentBorderColor;
+  int32_t mParentBorderWidth;
+  int32_t mPrevNeighborOrigSize;  
+  int32_t mNextNeighborOrigSize;
+  int32_t mMinDrag;
+  int32_t mChildCount;
+};
+
+#endif

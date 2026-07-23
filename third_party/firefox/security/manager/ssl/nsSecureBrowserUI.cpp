@@ -1,0 +1,153 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsSecureBrowserUI.h"
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Logging.h"
+#include "mozilla/dom/Document.h"
+#include "nsContentUtils.h"
+#include "nsIChannel.h"
+#include "nsDocShell.h"
+#include "nsIDocShellTreeItem.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsITransportSecurityInfo.h"
+#include "nsIWebProgress.h"
+#include "nsNetUtil.h"
+#include "mozilla/dom/CanonicalBrowsingContext.h"
+#include "mozilla/dom/WindowGlobalParent.h"
+#include "mozilla/dom/Element.h"
+#include "nsIBrowser.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+LazyLogModule gSecureBrowserUILog("nsSecureBrowserUI");
+
+nsSecureBrowserUI::nsSecureBrowserUI(CanonicalBrowsingContext* aBrowsingContext)
+    : mState(0) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  mBrowsingContextId = aBrowsingContext->Id();
+}
+
+NS_IMPL_ISUPPORTS(nsSecureBrowserUI, nsISecureBrowserUI,
+                  nsISupportsWeakReference)
+
+NS_IMETHODIMP
+nsSecureBrowserUI::GetState(uint32_t* aState) {
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_ARG(aState);
+
+  MOZ_LOG(gSecureBrowserUILog, LogLevel::Debug,
+          ("GetState %p mState: %x", this, mState));
+  *aState = mState;
+  return NS_OK;
+}
+
+void nsSecureBrowserUI::RecomputeSecurityFlags() {
+
+  RefPtr<WindowGlobalParent> win = GetCurrentWindow();
+  mState = nsIWebProgressListener::STATE_IS_INSECURE;
+
+  nsCOMPtr<nsITransportSecurityInfo> securityInfo;
+  if (win && win->GetIsSecure()) {
+    if (nsCOMPtr<nsIChannel> chan = win->GetDocumentChannel()) {
+      nsresult rv = chan->GetSecurityInfo(getter_AddRefs(securityInfo));
+      if (NS_SUCCEEDED(rv) && securityInfo) {
+        MOZ_LOG(gSecureBrowserUILog, LogLevel::Debug,
+                ("  we have a security info %p", securityInfo.get()));
+
+        rv = securityInfo->GetSecurityState(&mState);
+
+        if (NS_SUCCEEDED(rv) &&
+            mState != nsIWebProgressListener::STATE_IS_INSECURE) {
+          MOZ_LOG(gSecureBrowserUILog, LogLevel::Debug,
+                  ("  set mTopLevelSecurityInfo"));
+          bool isEV;
+          rv = securityInfo->GetIsExtendedValidation(&isEV);
+          if (NS_SUCCEEDED(rv) && isEV) {
+            MOZ_LOG(gSecureBrowserUILog, LogLevel::Debug, ("  is EV"));
+            mState |= nsIWebProgressListener::STATE_IDENTITY_EV_TOPLEVEL;
+          }
+        }
+      }
+    }
+  }
+
+  if (win) {
+    uint32_t httpsOnlyStatus = win->HttpsOnlyStatus();
+    if (!(httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_UNINITIALIZED) &&
+        !(httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_EXEMPT)) {
+      mState |= nsIWebProgressListener::STATE_HTTPS_ONLY_MODE_UPGRADED;
+    }
+    if (httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_UPGRADED_HTTPS_FIRST) {
+      if (win->GetDocumentURI()->SchemeIs("https")) {
+        mState |= nsIWebProgressListener::STATE_HTTPS_ONLY_MODE_UPGRADED_FIRST;
+      } else {
+        mState |= nsIWebProgressListener::STATE_HTTPS_ONLY_MODE_UPGRADE_FAILED;
+      }
+    }
+    mState |= win->GetSecurityFlags();
+  }
+
+  static const uint32_t kLoadedMixedContentFlags =
+      nsIWebProgressListener::STATE_LOADED_MIXED_DISPLAY_CONTENT |
+      nsIWebProgressListener::STATE_LOADED_MIXED_ACTIVE_CONTENT;
+  if (win && win->GetIsSecure() && (mState & kLoadedMixedContentFlags)) {
+    mState = mState >> 4 << 4;
+    mState |= nsIWebProgressListener::STATE_IS_BROKEN;
+  }
+
+  RefPtr<CanonicalBrowsingContext> ctx =
+      CanonicalBrowsingContext::Get(mBrowsingContextId);
+  if (!ctx) {
+    return;
+  }
+
+  if (ctx->GetDocShell()) {
+    nsDocShell* nativeDocShell = nsDocShell::Cast(ctx->GetDocShell());
+    nativeDocShell->nsDocLoader::OnSecurityChange(nullptr, mState);
+  } else if (ctx->GetWebProgress()) {
+    ctx->GetWebProgress()->OnSecurityChange(ctx->GetWebProgress(), nullptr,
+                                            mState);
+  }
+}
+
+NS_IMETHODIMP
+nsSecureBrowserUI::GetIsSecureContext(bool* aIsSecureContext) {
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_ARG(aIsSecureContext);
+
+  if (WindowGlobalParent* parent = GetCurrentWindow()) {
+    *aIsSecureContext = parent->GetIsSecureContext();
+  } else {
+    *aIsSecureContext = false;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsSecureBrowserUI::GetSecInfo(nsITransportSecurityInfo** result) {
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_ARG_POINTER(result);
+
+  if (WindowGlobalParent* parent = GetCurrentWindow()) {
+    if (nsCOMPtr<nsIChannel> chan = parent->GetDocumentChannel()) {
+      return chan->GetSecurityInfo(result);
+    }
+  }
+
+  *result = nullptr;
+  return NS_OK;
+}
+
+WindowGlobalParent* nsSecureBrowserUI::GetCurrentWindow() {
+  RefPtr<CanonicalBrowsingContext> ctx =
+      CanonicalBrowsingContext::Get(mBrowsingContextId);
+  if (!ctx) {
+    return nullptr;
+  }
+  return ctx->GetCurrentWindowGlobal();
+}

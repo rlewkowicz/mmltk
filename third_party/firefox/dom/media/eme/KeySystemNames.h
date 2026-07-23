@@ -1,0 +1,29 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_EME_KEY_SYSTEM_NAMES_H_
+#define DOM_MEDIA_EME_KEY_SYSTEM_NAMES_H_
+
+
+namespace mozilla {
+inline constexpr char kClearKeyKeySystemName[] = "org.w3.clearkey";
+inline constexpr char kWidevineKeySystemName[] = "com.widevine.alpha";
+#ifdef MOZ_WMF_CDM
+inline constexpr char kWidevineExperimentKeySystemName[] =
+    "com.widevine.alpha.experiment";
+inline constexpr char kWidevineExperiment2KeySystemName[] =
+    "com.widevine.alpha.experiment2";
+inline constexpr char kWidevineExperimentAPIName[] = "windows-mf-cdm";
+
+inline constexpr char kPlayReadyKeySystemName[] =
+    "com.microsoft.playready.recommendation";
+inline constexpr char kPlayReadyKeySystemHardware[] =
+    "com.microsoft.playready.recommendation.3000";
+
+inline constexpr char kPlayReadyHardwareClearLeadKeySystemName[] =
+    "com.microsoft.playready.recommendation.3000.clearlead";
+#endif
+}  
+
+#endif  // DOM_MEDIA_EME_KEY_SYSTEM_NAMES_H_

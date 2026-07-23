@@ -1,0 +1,76 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_StorageAccess_h
+#define mozilla_StorageAccess_h
+
+#include <cstdint>
+
+#include "mozilla/MozPromise.h"
+
+#include "mozilla/dom/BrowsingContext.h"
+
+class nsIChannel;
+class nsICookieJarSettings;
+class nsIPrincipal;
+class nsIURI;
+class nsPIDOMWindowInner;
+
+namespace mozilla {
+namespace dom {
+class Document;
+}
+
+enum class StorageAccess {
+  ePartitionForeignOrDeny = -2,
+  ePartitionTrackersOrDeny = -1,
+  eDeny = 0,
+  ePrivateBrowsing = 1,
+  eAllow = 2,
+  eNumValues = 3,
+};
+
+StorageAccess StorageAllowedForWindow(nsPIDOMWindowInner* aWindow,
+                                      uint32_t* aRejectedReason = nullptr);
+
+StorageAccess StorageAllowedForDocument(const dom::Document* aDoc);
+
+StorageAccess CookieAllowedForDocument(const dom::Document* aDoc);
+
+StorageAccess StorageAllowedForNewWindow(nsIPrincipal* aPrincipal, nsIURI* aURI,
+                                         nsPIDOMWindowInner* aParent);
+
+StorageAccess StorageAllowedForChannel(nsIChannel* aChannel);
+
+StorageAccess StorageAllowedForServiceWorker(
+    nsIPrincipal* aPrincipal, nsICookieJarSettings* aCookieJarSettings);
+
+bool ShouldPartitionStorage(StorageAccess aAccess);
+
+bool ShouldPartitionStorage(uint32_t aRejectedReason);
+
+bool StoragePartitioningEnabled(StorageAccess aAccess,
+                                nsICookieJarSettings* aCookieJarSettings);
+
+bool StoragePartitioningEnabled(uint32_t aRejectedReason,
+                                nsICookieJarSettings* aCookieJarSettings);
+
+bool ShouldAllowAccessFor(nsPIDOMWindowInner* a3rdPartyTrackingWindow,
+                          nsIURI* aURI, bool aCookies,
+                          uint32_t* aRejectedReason);
+
+bool ShouldAllowAccessFor(nsIChannel* aChannel, nsIURI* aURI,
+                          uint32_t* aRejectedReason);
+
+bool ShouldAllowAccessFor(nsIPrincipal* aPrincipal,
+                          nsICookieJarSettings* aCookieJarSettings);
+
+namespace detail {
+uint32_t CheckCookiePermissionForPrincipal(
+    nsICookieJarSettings* aCookieJarSettings, nsIPrincipal* aPrincipal);
+}
+
+}  
+
+#endif  // mozilla_StorageAccess_h

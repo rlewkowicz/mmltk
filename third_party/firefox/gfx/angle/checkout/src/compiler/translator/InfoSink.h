@@ -1,0 +1,138 @@
+// Copyright 2002 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(COMPILER_TRANSLATOR_INFOSINK_H_)
+#define COMPILER_TRANSLATOR_INFOSINK_H_
+
+#include <math.h>
+#include <stdlib.h>
+#include "GLSLANG/ShaderLang.h"
+#include "compiler/translator/Common.h"
+#include "compiler/translator/Severity.h"
+
+namespace sh
+{
+
+class ImmutableString;
+class TField;
+class TSymbol;
+class TType;
+
+inline float fractionalPart(float f)
+{
+    float intPart = 0.0f;
+    return modff(f, &intPart);
+}
+
+class ImmutableString;
+
+class TInfoSinkBase
+{
+  public:
+    TInfoSinkBase() {}
+
+    template <typename T>
+    TInfoSinkBase &operator<<(const T &t)
+    {
+        TPersistStringStream stream = sh::InitializeStream<TPersistStringStream>();
+        stream << t;
+        sink.append(stream.str());
+        return *this;
+    }
+    TInfoSinkBase &operator<<(char c)
+    {
+        sink.append(1, c);
+        return *this;
+    }
+    TInfoSinkBase &operator<<(const char *str)
+    {
+        sink.append(str);
+        return *this;
+    }
+    TInfoSinkBase &operator<<(const TPersistString &str)
+    {
+        sink.append(str);
+        return *this;
+    }
+    TInfoSinkBase &operator<<(const TString &str)
+    {
+        sink.append(str.c_str());
+        return *this;
+    }
+    TInfoSinkBase &operator<<(const ImmutableString &str);
+
+    TInfoSinkBase &operator<<(const TType &type);
+    TInfoSinkBase &operator<<(const TSymbol &symbol);
+    TInfoSinkBase &operator<<(const TField &symbol);
+
+    TInfoSinkBase &operator<<(float f)
+    {
+        TPersistStringStream stream = sh::InitializeStream<TPersistStringStream>();
+        if (fractionalPart(f) == 0.0f)
+        {
+            stream.precision(1);
+            stream << std::showpoint << std::fixed << f;
+        }
+        else
+        {
+            stream.unsetf(std::ios::fixed);
+            stream.unsetf(std::ios::scientific);
+            stream.precision(9);
+            stream << f;
+        }
+        sink.append(stream.str());
+        return *this;
+    }
+    TInfoSinkBase &operator<<(bool b)
+    {
+        const char *str = b ? "true" : "false";
+        sink.append(str);
+        return *this;
+    }
+
+    void erase()
+    {
+        sink.clear();
+        binarySink.clear();
+    }
+    int size() { return static_cast<int>(isBinary() ? binarySink.size() : sink.size()); }
+
+    const TPersistString &str() const
+    {
+        ASSERT(!isBinary());
+        return sink;
+    }
+    const char *c_str() const
+    {
+        ASSERT(!isBinary());
+        return sink.c_str();
+    }
+
+    void prefix(Severity severity);
+    void location(int file, int line);
+
+    bool isBinary() const { return !binarySink.empty(); }
+    void setBinary(BinaryBlob &&binary) { binarySink = std::move(binary); }
+    const BinaryBlob &getBinary() const
+    {
+        ASSERT(isBinary());
+        return binarySink;
+    }
+
+  private:
+    TPersistString sink;
+    BinaryBlob binarySink;
+};
+
+class TInfoSink
+{
+  public:
+    TInfoSinkBase info;
+    TInfoSinkBase debug;
+    TInfoSinkBase obj;
+};
+
+}  
+
+#endif

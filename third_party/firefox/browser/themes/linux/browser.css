@@ -1,0 +1,243 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+@import url("chrome://browser/skin/browser-shared.css");
+@import url("chrome://browser/skin/contextmenu.css");
+
+@media not (prefers-contrast) {
+  :root:not([lwtheme]) {
+    @media (-moz-gtk-theme-family) {
+      --tabs-navbar-separator-style: none;
+      @media (prefers-color-scheme: light) and (not -moz-pref("browser.nova.enabled")) {
+        --urlbar-box-background-color: #fafafa;
+      }
+    }
+  }
+}
+
+#menubar-items {
+  flex-direction: column; 
+  justify-content: normal; 
+}
+
+@media (-moz-gtk-csd-transparency-available) {
+  :root[customtitlebar] {
+    background-color: transparent;
+
+    &[sizemode="normal"]:not([gtktiledwindow]) {
+      -moz-default-appearance: -moz-window-decorations;
+      appearance: auto;
+
+      body,
+      dialog::backdrop {
+        border-top-left-radius: env(-moz-gtk-csd-titlebar-radius);
+        border-top-right-radius: env(-moz-gtk-csd-titlebar-radius);
+        @media -moz-pref("widget.gtk.rounded-bottom-corners.enabled") {
+          border-radius: env(-moz-gtk-csd-titlebar-radius);
+        }
+      }
+    }
+  }
+}
+
+.bookmark-item {
+  &:is(menu, menuitem) {
+    min-width: 0;
+    max-width: 32em;
+  }
+
+  &:not(.subviewbutton) > .menu-icon {
+    margin-block: 0;
+  }
+
+  &[dragover-into="true"] {
+    background: SelectedItem !important;
+    color: SelectedItemText !important;
+  }
+}
+
+.urlbar,
+#searchbar {
+  font-size: 1.05em;
+}
+
+
+#PopupAutoComplete > richlistbox > richlistitem[originaltype~="datalist-first"] {
+  border-top: 1px solid ThreeDShadow;
+}
+
+
+#tabbrowser-tabs {
+  border-bottom: 0;
+}
+
+#TabsToolbar {
+  min-height: 0;
+}
+
+.browser-titlebar,
+#main-menubar {
+  appearance: none;
+  background-color: transparent;
+  color: inherit;
+}
+
+
+.alltabs-item[selected="true"] {
+  font-weight: var(--font-weight-bold);
+}
+
+#UITourHighlight {
+  animation-name: none !important;
+  outline: 4px solid rgb(0, 200, 215);
+  border-radius: 0 !important;
+}
+
+#UITourTooltipDescription {
+  font-size: 1.05rem;
+}
+
+#UITourTooltipClose {
+  margin-inline-end: -4px;
+}
+
+#UITourTooltipButtons {
+  margin-inline-start: -10px;
+  margin-bottom: -10px;
+}
+
+.titlebar-buttonbox {
+  z-index: 1;
+  align-items: stretch;
+  --titlebar-button-size: 24px;
+  --titlebar-button-spacing: 6.5px;
+  --titlebar-button-end-spacing: 10px;
+  @media (-moz-gtk-theme-family: breeze) {
+    --titlebar-button-size: round(1.3em, 2 * env(hairline));
+    --titlebar-button-spacing: calc(var(--titlebar-button-size) / 4);
+    --titlebar-button-end-spacing: calc(2 * max(2px, round(down, var(--titlebar-button-size) / 4, env(hairline))));
+  }
+  --max-titlebar-button-position: max(
+    env(-moz-gtk-csd-maximize-button-position),
+    env(-moz-gtk-csd-minimize-button-position),
+    env(-moz-gtk-csd-close-button-position)
+  );
+}
+
+@media (-moz-gtk-csd-reversed-placement) {
+  .titlebar-buttonbox-container {
+    order: -1;
+  }
+}
+
+.titlebar-button {
+  appearance: none;
+  color: inherit;
+  align-items: center;
+  padding: 0;
+  padding-inline: var(--titlebar-button-spacing);
+  padding-inline-end: max(
+    var(--titlebar-button-spacing),
+    var(--titlebar-button-end-spacing) * (var(--titlebar-button-position) - var(--max-titlebar-button-position) + 1)
+  );
+  order: var(--titlebar-button-position);
+  -moz-window-dragging: drag;
+
+  > .toolbarbutton-icon {
+    border-radius: var(--border-radius-circle);
+    background-position: center center;
+    background-size: min(16px, var(--titlebar-button-size) - 2 * env(hairline));
+    background-repeat: no-repeat;
+    -moz-context-properties: stroke;
+    stroke: currentColor;
+    width: var(--titlebar-button-size);
+    height: var(--titlebar-button-size);
+
+    @media not (-moz-gtk-theme-family: breeze) {
+      transition: background-color 0.2s ease;
+    }
+
+    @media (-moz-gtk-theme-family: adwaita) or (-moz-gtk-theme-family: yaru) {
+      background-color: color-mix(in srgb, currentColor 10%, transparent);
+    }
+  }
+
+  &:hover > .toolbarbutton-icon {
+    background-color: color-mix(in srgb, currentColor 15%, transparent);
+  }
+
+  &:hover:active > .toolbarbutton-icon {
+    background-color: color-mix(in srgb, currentColor 30%, transparent);
+  }
+
+  &:focus-visible > .toolbarbutton-icon {
+    outline: var(--focus-outline);
+    outline-offset: var(--focus-outline-inset);
+  }
+
+  @media (-moz-gtk-theme-family: breeze) {
+    &:hover > .toolbarbutton-icon {
+      color: var(--toolbox-background-color);
+      background-color: var(--toolbox-text-color);
+      &:-moz-window-inactive {
+        color: var(--toolbox-background-color-inactive);
+        background-color: var(--toolbox-text-color-inactive);
+      }
+    }
+    &:hover:active > .toolbarbutton-icon {
+      background-color: color-mix(in srgb, var(--toolbox-text-color) 50%, transparent);
+    }
+    &.titlebar-close:hover > .toolbarbutton-icon {
+      background-color: #ff98a2;
+    }
+    &.titlebar-close:hover:active > .toolbarbutton-icon {
+      background-color: #6d2229;
+    }
+  }
+}
+
+.titlebar-restore,
+.titlebar-max {
+  --titlebar-button-position: env(-moz-gtk-csd-maximize-button-position);
+
+  > .toolbarbutton-icon {
+    background-image: -moz-symbolic-icon(window-maximize-symbolic);
+  }
+
+  @media not (-moz-gtk-csd-maximize-button) {
+    display: none;
+  }
+}
+
+.titlebar-restore > .toolbarbutton-icon {
+  background-image: -moz-symbolic-icon(window-restore-symbolic);
+}
+
+.titlebar-close {
+  --titlebar-button-position: env(-moz-gtk-csd-close-button-position);
+
+  > .toolbarbutton-icon {
+    background-image: -moz-symbolic-icon(window-close-symbolic);
+  }
+
+  @media not (-moz-gtk-csd-close-button) {
+    display: none;
+  }
+}
+
+.titlebar-min {
+  --titlebar-button-position: env(-moz-gtk-csd-minimize-button-position);
+
+  > .toolbarbutton-icon {
+    background-image: -moz-symbolic-icon(window-minimize-symbolic);
+  }
+
+  @media not (-moz-gtk-csd-minimize-button) {
+    display: none;
+  }
+}
+
+.titlebar-return-to-opener {
+  --titlebar-button-position: env(-moz-gtk-csd-minimize-button-position);
+}

@@ -1,0 +1,212 @@
+/*
+ * Copyright 2021 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "wasm/WasmMemory.h"
+
+#include "js/Conversions.h"
+#include "js/ErrorReport.h"
+#include "vm/ArrayBufferObject.h"
+#include "wasm/WasmCodegenTypes.h"
+#include "wasm/WasmProcess.h"
+
+using namespace js;
+using namespace js::wasm;
+
+const char* wasm::ToString(AddressType addressType) {
+  switch (addressType) {
+    case AddressType::I32:
+      return "i32";
+    case AddressType::I64:
+      return "i64";
+    default:
+      MOZ_CRASH();
+  }
+}
+
+bool wasm::ToAddressType(JSContext* cx, HandleValue value,
+                         AddressType* addressType) {
+  RootedString typeStr(cx, ToString(cx, value));
+  if (!typeStr) {
+    return false;
+  }
+
+  Rooted<JSLinearString*> typeLinearStr(cx, typeStr->ensureLinear(cx));
+  if (!typeLinearStr) {
+    return false;
+  }
+
+  if (StringEqualsLiteral(typeLinearStr, "i32")) {
+    *addressType = AddressType::I32;
+  } else if (StringEqualsLiteral(typeLinearStr, "i64")) {
+    *addressType = AddressType::I64;
+  } else {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                             JSMSG_WASM_BAD_STRING_ADDR_TYPE);
+    return false;
+  }
+  return true;
+}
+
+bool wasm::ToPageSize(JSContext* cx, HandleValue value, PageSize* pageSize) {
+  if (!value.isInt32()) {
+    JS_ReportErrorASCII(cx, "page size must be an integer");
+    return false;
+  }
+  uint32_t pageSizeBytes = uint32_t(value.toInt32());
+  if (pageSizeBytes == PageSizeInBytes(PageSize::Standard)) {
+    *pageSize = PageSize::Standard;
+#ifdef ENABLE_WASM_CUSTOM_PAGE_SIZES
+  } else if (pageSizeBytes == PageSizeInBytes(PageSize::Tiny)) {
+    *pageSize = PageSize::Tiny;
+#endif
+  } else {
+    JS_ReportErrorASCII(cx, "bad page size");
+    return false;
+  }
+  return true;
+}
+
+
+
+static const unsigned MaxMemoryAccessSize = LitVal::sizeofLargestValue();
+
+static_assert(MaxMemoryAccessSize >= 8, "MaxMemoryAccessSize too low");
+static_assert(MaxMemoryAccessSize <= 64, "MaxMemoryAccessSize too high");
+static_assert((MaxMemoryAccessSize & (MaxMemoryAccessSize - 1)) == 0,
+              "MaxMemoryAccessSize is not a power of two");
+
+#ifdef WASM_SUPPORTS_HUGE_MEMORY
+
+static_assert(MaxMemoryAccessSize <= HugeUnalignedGuardPage,
+              "rounded up to static page size");
+static_assert(HugeOffsetGuardLimit < UINT32_MAX,
+              "checking for overflow against OffsetGuardLimit is enough.");
+
+#  if !(defined(JS_CODEGEN_X64) || defined(JS_CODEGEN_ARM64) || \
+        defined(JS_CODEGEN_RISCV64))
+#    error "Not an expected configuration"
+#  endif
+
+#endif
+
+
+static const size_t OffsetGuardLimit =
+    StandardPageSizeBytes - MaxMemoryAccessSize;
+
+static_assert(MaxMemoryAccessSize < GuardSize,
+              "Guard page handles partial out-of-bounds");
+static_assert(OffsetGuardLimit < UINT32_MAX,
+              "checking for overflow against OffsetGuardLimit is enough.");
+
+uint64_t wasm::GetMaxOffsetGuardLimit(bool hugeMemory, PageSize sz) {
+#ifndef ENABLE_WASM_CUSTOM_PAGE_SIZES
+  MOZ_ASSERT(sz == PageSize::Standard);
+#endif
+
+  uint64_t guardLimit = sz == PageSize::Standard ? OffsetGuardLimit : 0;
+#ifdef WASM_SUPPORTS_HUGE_MEMORY
+  return hugeMemory ? HugeOffsetGuardLimit : guardLimit;
+#else
+  return guardLimit;
+#endif
+}
+
+static const size_t MinOffsetGuardLimit = OffsetGuardLimit;
+static_assert(MaxInlineMemoryCopyLength < MinOffsetGuardLimit, "precondition");
+static_assert(MaxInlineMemoryFillLength < MinOffsetGuardLimit, "precondition");
+
+wasm::Pages wasm::MaxMemoryPages(AddressType t, PageSize pageSize) {
+#ifdef JS_64BIT
+  MOZ_ASSERT_IF(t == AddressType::I64, !IsHugeMemoryEnabled(t, pageSize));
+  size_t desired = MaxMemoryPagesValidation(t, pageSize);
+  size_t actual =
+      ArrayBufferObject::ByteLengthLimit / PageSizeInBytes(pageSize);
+  return wasm::Pages::fromPageCount(std::min(desired, actual), pageSize);
+#else
+  MOZ_ASSERT(ArrayBufferObject::ByteLengthLimit >=
+             INT32_MAX / PageSizeInBytes(pageSize));
+  return wasm::Pages::fromPageCount(INT32_MAX / PageSizeInBytes(pageSize),
+                                    pageSize);
+#endif
+}
+
+size_t wasm::MaxMemoryBoundsCheckLimit(AddressType t, PageSize pageSize) {
+  return MaxMemoryBytes(t, pageSize);
+}
+
+Pages wasm::ClampedMaxPages(AddressType t, Pages initialPages,
+                            const mozilla::Maybe<Pages>& sourceMaxPages,
+                            bool useHugeMemory) {
+  PageSize pageSize = initialPages.pageSize();
+  Pages clampedMaxPages = Pages::forPageSize(pageSize);
+
+  if (sourceMaxPages.isSome()) {
+    clampedMaxPages =
+        std::min(*sourceMaxPages, wasm::MaxMemoryPages(t, pageSize));
+
+#ifndef JS_64BIT
+    static_assert(sizeof(uintptr_t) == 4, "assuming not 64 bit implies 32 bit");
+
+    static const uint64_t OneGib = 1 << 30;
+    const Pages OneGibPages = Pages::fromByteLengthExact(OneGib, pageSize);
+
+    Pages clampedPages = std::max(OneGibPages, initialPages);
+    clampedMaxPages = std::min(clampedPages, clampedMaxPages);
+#endif
+  } else {
+    clampedMaxPages = wasm::MaxMemoryPages(t, pageSize);
+  }
+
+  MOZ_RELEASE_ASSERT(sourceMaxPages.isNothing() ||
+                     clampedMaxPages <= *sourceMaxPages);
+  MOZ_RELEASE_ASSERT(clampedMaxPages <= wasm::MaxMemoryPages(t, pageSize));
+  MOZ_RELEASE_ASSERT(initialPages <= clampedMaxPages);
+
+  return clampedMaxPages;
+}
+
+size_t wasm::ComputeMappedSize(wasm::Pages clampedMaxPages) {
+  size_t maxSize = clampedMaxPages.byteLength();
+
+#ifdef ENABLE_WASM_CUSTOM_PAGE_SIZES
+  if (clampedMaxPages.pageSize() == wasm::PageSize::Tiny) {
+    mozilla::CheckedInt<size_t> length(maxSize);
+
+    if (length.value() % gc::SystemPageSize() != 0) {
+      length += ComputeByteAlignment(length.value(), gc::SystemPageSize());
+      MOZ_RELEASE_ASSERT(length.isValid());
+      MOZ_ASSERT(length.value() % gc::SystemPageSize() == 0);
+      maxSize = length.value();
+    }
+
+    MOZ_ASSERT(maxSize <= clampedMaxPages.byteLength() + GuardSize);
+  }
+#endif
+
+  MOZ_ASSERT(maxSize % gc::SystemPageSize() == 0);
+  MOZ_ASSERT(GuardSize % gc::SystemPageSize() == 0);
+  if (clampedMaxPages.pageSize() == PageSize::Standard) {
+    maxSize += GuardSize;
+  } else {
+#ifdef ENABLE_WASM_CUSTOM_PAGE_SIZES
+    MOZ_ASSERT(clampedMaxPages.pageSize() == PageSize::Tiny);
+#else
+    MOZ_CRASH();
+#endif
+  }
+
+  return maxSize;
+}

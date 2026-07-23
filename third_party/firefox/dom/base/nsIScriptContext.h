@@ -1,0 +1,50 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsIScriptContext_h_
+#define nsIScriptContext_h_
+
+#include "js/experimental/JSStencil.h"
+#include "jspubtd.h"
+#include "nsCOMPtr.h"
+#include "nsISupports.h"
+#include "nsString.h"
+#include "nscore.h"
+
+class nsIScriptGlobalObject;
+
+#define NS_ISCRIPTCONTEXT_IID \
+  {0x54cbe9cf, 0x7282, 0x421a, {0x91, 0x6f, 0xd0, 0x70, 0x73, 0xde, 0xb8, 0xc0}}
+
+class nsIOffThreadScriptReceiver;
+
+class nsIScriptContext : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_ISCRIPTCONTEXT_IID)
+
+  virtual nsIScriptGlobalObject* GetGlobalObject() = 0;
+
+  virtual nsresult SetProperty(JS::Handle<JSObject*> aTarget,
+                               const char* aPropName, nsISupports* aVal) = 0;
+  virtual bool GetProcessingScriptTag() = 0;
+  virtual void SetProcessingScriptTag(bool aResult) = 0;
+
+  virtual nsresult InitClasses(JS::Handle<JSObject*> aGlobalObj) = 0;
+
+  virtual void SetWindowProxy(JS::Handle<JSObject*> aWindowProxy) = 0;
+  virtual JSObject* GetWindowProxy() = 0;
+};
+
+#define NS_IOFFTHREADSCRIPTRECEIVER_IID \
+  {0x3a980010, 0x878d, 0x46a9, {0x93, 0xad, 0xbc, 0xfd, 0xd3, 0x8e, 0xa0, 0xc2}}
+
+class nsIOffThreadScriptReceiver : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_IOFFTHREADSCRIPTRECEIVER_IID)
+
+  NS_IMETHOD OnScriptCompileComplete(JS::Stencil* aStencil,
+                                     nsresult aStatus) = 0;
+};
+
+#endif  // nsIScriptContext_h_

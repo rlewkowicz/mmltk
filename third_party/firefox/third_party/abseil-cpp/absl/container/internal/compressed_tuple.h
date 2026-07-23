@@ -1,0 +1,215 @@
+// Copyright 2018 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_CONTAINER_INTERNAL_COMPRESSED_TUPLE_H_
+#define ABSL_CONTAINER_INTERNAL_COMPRESSED_TUPLE_H_
+
+#include <initializer_list>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+
+#include "absl/utility/utility.h"
+
+#if defined(_MSC_VER) && !defined(__NVCC__)
+#define ABSL_INTERNAL_COMPRESSED_TUPLE_DECLSPEC __declspec(empty_bases)
+#else
+#define ABSL_INTERNAL_COMPRESSED_TUPLE_DECLSPEC
+#endif
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace container_internal {
+
+template <typename... Ts>
+class CompressedTuple;
+
+namespace internal_compressed_tuple {
+
+template <typename D, size_t I>
+struct Elem;
+template <typename... B, size_t I>
+struct Elem<CompressedTuple<B...>, I>
+    : std::tuple_element<I, std::tuple<B...>> {};
+template <typename D, size_t I>
+using ElemT = typename Elem<D, I>::type;
+
+
+template <typename T>
+constexpr bool ShouldUseBase() {
+  return std::is_class_v<T> && std::is_empty_v<T> && !std::is_final_v<T>;
+}
+
+template <typename... Ts>
+struct StorageTag;
+
+template <typename T, size_t I, typename Tag, bool UseBase = ShouldUseBase<T>()>
+struct Storage {
+  T value;
+  constexpr Storage() = default;
+  template <typename V>
+  explicit constexpr Storage(std::in_place_t, V&& v)
+      : value(std::forward<V>(v)) {}
+  constexpr const T& get() const& { return value; }
+  constexpr T& get() & { return value; }
+  constexpr const T&& get() const&& { return std::move(*this).value; }
+  constexpr T&& get() && { return std::move(*this).value; }
+};
+
+template <typename T, size_t I, typename Tag>
+struct ABSL_INTERNAL_COMPRESSED_TUPLE_DECLSPEC Storage<T, I, Tag, true> : T {
+  constexpr Storage() = default;
+
+  template <typename V>
+  explicit constexpr Storage(std::in_place_t, V&& v) : T(std::forward<V>(v)) {}
+
+  constexpr const T& get() const& { return *this; }
+  constexpr T& get() & { return *this; }
+  constexpr const T&& get() const&& { return std::move(*this); }
+  constexpr T&& get() && { return std::move(*this); }
+};
+
+template <typename D, typename I, bool ShouldAnyUseBase>
+struct ABSL_INTERNAL_COMPRESSED_TUPLE_DECLSPEC CompressedTupleImpl;
+
+template <typename... Ts, size_t... I, bool ShouldAnyUseBase>
+struct ABSL_INTERNAL_COMPRESSED_TUPLE_DECLSPEC
+    CompressedTupleImpl<CompressedTuple<Ts...>, std::index_sequence<I...>,
+                        ShouldAnyUseBase>
+    : Storage<Ts, std::integral_constant<size_t, I>::value,
+              StorageTag<Ts...>>... {
+  constexpr CompressedTupleImpl() = default;
+  template <typename... Vs>
+  explicit constexpr CompressedTupleImpl(std::in_place_t, Vs&&... args)
+      : Storage<Ts, I, StorageTag<Ts...>>(std::in_place,
+                                          std::forward<Vs>(args))... {}
+  friend CompressedTuple<Ts...>;
+};
+
+template <typename... Ts, size_t... I>
+struct ABSL_INTERNAL_COMPRESSED_TUPLE_DECLSPEC
+    CompressedTupleImpl<CompressedTuple<Ts...>, std::index_sequence<I...>,
+                        false>
+    : Storage<Ts, std::integral_constant<size_t, I>::value, StorageTag<Ts...>,
+              false>... {
+  constexpr CompressedTupleImpl() = default;
+  template <typename... Vs>
+  explicit constexpr CompressedTupleImpl(std::in_place_t, Vs&&... args)
+      : Storage<Ts, I, StorageTag<Ts...>, false>(std::in_place,
+                                                 std::forward<Vs>(args))... {}
+  friend CompressedTuple<Ts...>;
+};
+
+std::false_type Or(std::initializer_list<std::false_type>);
+std::true_type Or(std::initializer_list<bool>);
+
+template <typename... Ts>
+constexpr bool ShouldAnyUseBase() {
+  return decltype(
+      Or({std::integral_constant<bool, ShouldUseBase<Ts>()>()...})){};
+}
+
+template <typename T, typename V>
+using TupleElementMoveConstructible =
+    std::conditional_t<std::is_reference_v<T>, std::is_convertible<V, T>,
+                       std::is_constructible<T, V&&>>;
+
+template <bool SizeMatches, class T, class... Vs>
+struct TupleMoveConstructible : std::false_type {};
+
+template <class... Ts, class... Vs>
+struct TupleMoveConstructible<true, CompressedTuple<Ts...>, Vs...>
+    : std::integral_constant<
+          bool,
+          std::conjunction_v<TupleElementMoveConstructible<Ts, Vs&&>...>> {};
+
+template <typename T>
+struct compressed_tuple_size;
+
+template <typename... Es>
+struct compressed_tuple_size<CompressedTuple<Es...>>
+    : public std::integral_constant<std::size_t, sizeof...(Es)> {};
+
+template <class T, class... Vs>
+struct TupleItemsMoveConstructible
+    : std::integral_constant<
+          bool, TupleMoveConstructible<compressed_tuple_size<T>::value ==
+                                           sizeof...(Vs),
+                                       T, Vs...>::value> {};
+
+}  
+
+template <typename... Ts>
+class ABSL_INTERNAL_COMPRESSED_TUPLE_DECLSPEC CompressedTuple
+    : private internal_compressed_tuple::CompressedTupleImpl<
+          CompressedTuple<Ts...>, std::index_sequence_for<Ts...>,
+          internal_compressed_tuple::ShouldAnyUseBase<Ts...>()> {
+ private:
+  template <int I>
+  using ElemT = internal_compressed_tuple::ElemT<CompressedTuple, I>;
+
+  template <int I>
+  using StorageT = internal_compressed_tuple::Storage<
+      ElemT<I>, I, internal_compressed_tuple::StorageTag<Ts...>>;
+
+ public:
+#if defined(_MSC_VER)
+  constexpr CompressedTuple() : CompressedTuple::CompressedTupleImpl() {}
+#else
+  constexpr CompressedTuple() = default;
+#endif
+  explicit constexpr CompressedTuple(const Ts&... base)
+      : CompressedTuple::CompressedTupleImpl(std::in_place, base...) {}
+
+  template <typename First, typename... Vs,
+            std::enable_if_t<
+                std::conjunction_v<
+                    std::negation<std::is_same<void(CompressedTuple),
+                                               void(std::decay_t<First>)>>,
+                    internal_compressed_tuple::TupleItemsMoveConstructible<
+                        CompressedTuple<Ts...>, First, Vs...>>,
+                bool> = true>
+  explicit constexpr CompressedTuple(First&& first, Vs&&... base)
+      : CompressedTuple::CompressedTupleImpl(std::in_place,
+                                             std::forward<First>(first),
+                                             std::forward<Vs>(base)...) {}
+
+  template <int I>
+  constexpr ElemT<I>& get() & {
+    return StorageT<I>::get();
+  }
+
+  template <int I>
+  constexpr const ElemT<I>& get() const& {
+    return StorageT<I>::get();
+  }
+
+  template <int I>
+  constexpr ElemT<I>&& get() && {
+    return std::move(*this).StorageT<I>::get();
+  }
+
+  template <int I>
+  constexpr const ElemT<I>&& get() const&& {
+    return std::move(*this).StorageT<I>::get();
+  }
+};
+
+template <>
+class ABSL_INTERNAL_COMPRESSED_TUPLE_DECLSPEC CompressedTuple<> {};
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#undef ABSL_INTERNAL_COMPRESSED_TUPLE_DECLSPEC
+
+#endif  // ABSL_CONTAINER_INTERNAL_COMPRESSED_TUPLE_H_

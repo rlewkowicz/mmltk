@@ -1,0 +1,1521 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Sanitizer.h"
+
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/Span.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/BindingUtils.h"
+#include "mozilla/dom/CustomElementRegistry.h"
+#include "mozilla/dom/DocumentFragment.h"
+#include "mozilla/dom/HTMLTemplateElement.h"
+#include "mozilla/dom/SanitizerBinding.h"
+#include "mozilla/dom/SanitizerDefaultConfig.h"
+#include "nsContentUtils.h"
+#include "nsFmtString.h"
+#include "nsGenericHTMLElement.h"
+#include "nsIContentInlines.h"
+#include "nsNameSpaceManager.h"
+
+namespace mozilla::dom {
+using namespace sanitizer;
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(Sanitizer, mGlobal)
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(Sanitizer)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(Sanitizer)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Sanitizer)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+using ElementsWithAttributes =
+    nsTHashMap<const nsStaticAtom*, UniquePtr<StaticAtomSet>>;
+
+StaticAutoPtr<ElementsWithAttributes> sDefaultHTMLElements;
+StaticAutoPtr<ElementsWithAttributes> sDefaultMathMLElements;
+StaticAutoPtr<ElementsWithAttributes> sDefaultSVGElements;
+StaticAutoPtr<StaticAtomSet> sDefaultAttributes;
+
+JSObject* Sanitizer::WrapObject(JSContext* aCx,
+                                JS::Handle<JSObject*> aGivenProto) {
+  return Sanitizer_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+already_AddRefed<Sanitizer> Sanitizer::GetInstance(
+    nsIGlobalObject* aGlobal,
+    const OwningSanitizerOrSanitizerConfigOrSanitizerPresets& aOptions,
+    bool aSafe, ErrorResult& aRv) {
+  if (aOptions.IsSanitizerPresets()) {
+    MOZ_ASSERT(aOptions.GetAsSanitizerPresets() == SanitizerPresets::Default);
+
+    RefPtr<Sanitizer> sanitizer = new Sanitizer(aGlobal);
+    sanitizer->SetDefaultConfig();
+    return sanitizer.forget();
+  }
+
+  if (aOptions.IsSanitizerConfig()) {
+    RefPtr<Sanitizer> sanitizer = new Sanitizer(aGlobal);
+
+    sanitizer->SetConfig(aOptions.GetAsSanitizerConfig(), !aSafe, aRv);
+
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+
+    return sanitizer.forget();
+  }
+
+  MOZ_ASSERT(aOptions.IsSanitizer());
+
+  RefPtr<Sanitizer> sanitizer = aOptions.GetAsSanitizer();
+  return sanitizer.forget();
+}
+
+already_AddRefed<Sanitizer> Sanitizer::Constructor(
+    const GlobalObject& aGlobal,
+    const SanitizerConfigOrSanitizerPresets& aConfig, ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+  RefPtr<Sanitizer> sanitizer = new Sanitizer(global);
+
+  if (aConfig.IsSanitizerPresets()) {
+    MOZ_ASSERT(aConfig.GetAsSanitizerPresets() == SanitizerPresets::Default);
+
+    sanitizer->SetDefaultConfig();
+
+    return sanitizer.forget();
+  }
+
+  sanitizer->SetConfig(aConfig.GetAsSanitizerConfig(), true, aRv);
+
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  return sanitizer.forget();
+}
+
+void Sanitizer::SetDefaultConfig() {
+  MOZ_ASSERT(NS_IsMainThread());
+  AssertNoLists();
+  MOZ_ASSERT(!mComments);
+  MOZ_ASSERT(mDataAttributes.isNothing());
+
+  mIsDefaultConfig = true;
+
+  mComments = false;
+  mDataAttributes = Some(false);
+
+  if (sDefaultHTMLElements) {
+    return;
+  }
+
+  auto createElements = [](mozilla::Span<nsStaticAtom* const> aElements,
+                           nsStaticAtom* const* aElementWithAttributes) {
+    auto elements = new ElementsWithAttributes(aElements.Length());
+
+    size_t i = 0;
+    for (nsStaticAtom* name : aElements) {
+      UniquePtr<StaticAtomSet> attributes = nullptr;
+
+      if (name == aElementWithAttributes[i]) {
+        attributes = MakeUnique<StaticAtomSet>();
+        while (aElementWithAttributes[++i]) {
+          attributes->Insert(aElementWithAttributes[i]);
+        }
+        i++;
+      }
+
+      elements->InsertOrUpdate(name, std::move(attributes));
+    }
+
+    return elements;
+  };
+
+  sDefaultHTMLElements =
+      createElements(Span(kDefaultHTMLElements), kHTMLElementWithAttributes);
+  sDefaultMathMLElements = createElements(Span(kDefaultMathMLElements),
+                                          kMathMLElementWithAttributes);
+  sDefaultSVGElements =
+      createElements(Span(kDefaultSVGElements), kSVGElementWithAttributes);
+
+  sDefaultAttributes = new StaticAtomSet(std::size(kDefaultAttributes));
+  for (nsStaticAtom* name : kDefaultAttributes) {
+    sDefaultAttributes->Insert(name);
+  }
+
+  ClearOnShutdown(&sDefaultHTMLElements);
+  ClearOnShutdown(&sDefaultMathMLElements);
+  ClearOnShutdown(&sDefaultAttributes);
+}
+
+template <typename SanitizerElement>
+static CanonicalElement CanonicalizeElement(const SanitizerElement& aElement) {
+
+
+  if (aElement.IsString()) {
+    RefPtr<nsAtom> nameAtom = NS_AtomizeMainThread(aElement.GetAsString());
+    return CanonicalElement(nameAtom, nsGkAtoms::nsuri_xhtml);
+  }
+
+  const auto& elem = GetAsDictionary(aElement);
+  MOZ_ASSERT(!elem.mName.IsVoid());
+
+  RefPtr<nsAtom> namespaceAtom;
+  if (!elem.mNamespace.IsEmpty()) {
+    namespaceAtom = NS_AtomizeMainThread(elem.mNamespace);
+  }
+
+  RefPtr<nsAtom> nameAtom = NS_AtomizeMainThread(elem.mName);
+  return CanonicalElement(nameAtom, namespaceAtom);
+}
+
+template <typename SanitizerPI>
+static already_AddRefed<nsAtom> CanonicalizeProcessingInstruction(
+    const SanitizerPI& aPI) {
+  if (aPI.IsString()) {
+    RefPtr<nsAtom> piAtom = NS_AtomizeMainThread(aPI.GetAsString());
+    return piAtom.forget();
+  }
+
+  const auto& pi = GetAsDictionary(aPI);
+  return NS_AtomizeMainThread(pi.mTarget);
+}
+
+template <typename SanitizerAttribute>
+static CanonicalAttribute CanonicalizeAttribute(
+    const SanitizerAttribute& aAttribute) {
+
+
+  if (aAttribute.IsString()) {
+    RefPtr<nsAtom> nameAtom = NS_AtomizeMainThread(aAttribute.GetAsString());
+    return CanonicalAttribute(nameAtom, nullptr);
+  }
+
+  const auto& attr = aAttribute.GetAsSanitizerAttributeNamespace();
+  MOZ_ASSERT(!attr.mName.IsVoid());
+
+  RefPtr<nsAtom> namespaceAtom;
+  if (!attr.mNamespace.IsEmpty()) {
+    namespaceAtom = NS_AtomizeMainThread(attr.mNamespace);
+  }
+
+  RefPtr<nsAtom> nameAtom = NS_AtomizeMainThread(attr.mName);
+  return CanonicalAttribute(nameAtom, namespaceAtom);
+}
+
+template <typename SanitizerElementWithAttributes>
+static CanonicalElementAttributes CanonicalizeElementAttributes(
+    const SanitizerElementWithAttributes& aElement,
+    nsACString* aErrorMsg = nullptr) {
+  CanonicalElementAttributes result{};
+
+  if (aElement.IsSanitizerElementNamespaceWithAttributes()) {
+    auto& elem = aElement.GetAsSanitizerElementNamespaceWithAttributes();
+
+    if (elem.mAttributes.WasPassed()) {
+      CanonicalAttributeSet attributes;
+
+      for (const auto& attribute : elem.mAttributes.Value()) {
+        CanonicalAttribute canonicalAttr = CanonicalizeAttribute(attribute);
+        if (!attributes.EnsureInserted(canonicalAttr)) {
+          if (aErrorMsg) {
+            aErrorMsg->Assign(
+                nsFmtCString("Duplicate attribute {} in 'attributes' of {}.",
+                             canonicalAttr, CanonicalizeElement(aElement)));
+            return CanonicalElementAttributes();
+          }
+        }
+      }
+
+      result.mAttributes = Some(std::move(attributes));
+    }
+
+    if (elem.mRemoveAttributes.WasPassed()) {
+      CanonicalAttributeSet attributes;
+
+      for (const auto& attribute : elem.mRemoveAttributes.Value()) {
+        CanonicalAttribute canonicalAttr = CanonicalizeAttribute(attribute);
+        if (!attributes.EnsureInserted(canonicalAttr)) {
+          if (aErrorMsg) {
+            aErrorMsg->Assign(nsFmtCString(
+                "Duplicate attribute {} in 'removeAttributes' of {}.",
+                canonicalAttr, CanonicalizeElement(aElement)));
+            return CanonicalElementAttributes();
+          }
+        }
+      }
+
+      result.mRemoveAttributes = Some(std::move(attributes));
+    }
+  }
+
+  if (!result.mAttributes && !result.mRemoveAttributes) {
+    CanonicalAttributeSet set{};
+    result.mRemoveAttributes = Some(std::move(set));
+  }
+
+  return result;
+}
+
+void Sanitizer::CanonicalizeConfiguration(
+    const SanitizerConfig& aConfig, bool aAllowCommentsPIsAndDataAttributes,
+    ErrorResult& aRv) {
+  AssertNoLists();
+
+  if (!aConfig.mElements.WasPassed() && !aConfig.mRemoveElements.WasPassed()) {
+    mRemoveElements.emplace();
+  }
+
+  if (!aConfig.mAttributes.WasPassed() &&
+      !aConfig.mRemoveAttributes.WasPassed()) {
+    mRemoveAttributes.emplace();
+  }
+
+  if (!aConfig.mProcessingInstructions.WasPassed() &&
+      !aConfig.mRemoveProcessingInstructions.WasPassed()) {
+    if (aAllowCommentsPIsAndDataAttributes) {
+      mRemoveProcessingInstructions.emplace();
+    } else {
+      mProcessingInstructions.emplace();
+    }
+  }
+
+  if (aConfig.mElements.WasPassed()) {
+    CanonicalElementMap elements;
+
+    nsAutoCString errorMsg;
+    for (const auto& element : aConfig.mElements.Value()) {
+      CanonicalElement elementName = CanonicalizeElement(element);
+      if (elements.Contains(elementName)) {
+        aRv.ThrowTypeError(
+            nsFmtCString("Duplicate element {} in 'elements'.", elementName));
+        return;
+      }
+
+      CanonicalElementAttributes elementAttributes =
+          CanonicalizeElementAttributes(element, &errorMsg);
+      if (!errorMsg.IsEmpty()) {
+        aRv.ThrowTypeError(errorMsg);
+        return;
+      }
+
+      elements.InsertOrUpdate(elementName, std::move(elementAttributes));
+    }
+
+    mElements = Some(std::move(elements));
+  }
+
+  if (aConfig.mRemoveElements.WasPassed()) {
+    CanonicalElementSet elements;
+    for (const auto& element : aConfig.mRemoveElements.Value()) {
+      CanonicalElement canonical = CanonicalizeElement(element);
+      if (!elements.EnsureInserted(canonical)) {
+        aRv.ThrowTypeError(nsFmtCString(
+            "Duplicate element {} in 'removeElements'.", canonical));
+        return;
+      }
+    }
+    mRemoveElements = Some(std::move(elements));
+  }
+
+  if (aConfig.mAttributes.WasPassed()) {
+    CanonicalAttributeSet attributes;
+    for (const auto& attribute : aConfig.mAttributes.Value()) {
+      CanonicalAttribute canonical = CanonicalizeAttribute(attribute);
+      if (!attributes.EnsureInserted(canonical)) {
+        aRv.ThrowTypeError(
+            nsFmtCString("Duplicate attribute {} in 'attributes'.", canonical));
+        return;
+      }
+    }
+    mAttributes = Some(std::move(attributes));
+  }
+
+  if (aConfig.mRemoveAttributes.WasPassed()) {
+    CanonicalAttributeSet attributes;
+    for (const auto& attribute : aConfig.mRemoveAttributes.Value()) {
+      CanonicalAttribute canonical = CanonicalizeAttribute(attribute);
+      if (!attributes.EnsureInserted(canonical)) {
+        aRv.ThrowTypeError(nsFmtCString(
+            "Duplicate attribute {} in 'removeAttributes'.", canonical));
+        return;
+      }
+    }
+    mRemoveAttributes = Some(std::move(attributes));
+  }
+
+  if (aConfig.mReplaceWithChildrenElements.WasPassed()) {
+    CanonicalElementSet elements;
+    for (const auto& element : aConfig.mReplaceWithChildrenElements.Value()) {
+      CanonicalElement canonical = CanonicalizeElement(element);
+      if (!elements.EnsureInserted(canonical)) {
+        aRv.ThrowTypeError(nsFmtCString(
+            "Duplicate element {} in 'replaceWithChildrenElements'.",
+            canonical));
+        return;
+      }
+    }
+    mReplaceWithChildrenElements = Some(std::move(elements));
+  }
+
+  if (aConfig.mProcessingInstructions.WasPassed()) {
+    CanonicalPISet pis;
+    for (const auto& pi : aConfig.mProcessingInstructions.Value()) {
+      RefPtr<nsAtom> canonical = CanonicalizeProcessingInstruction(pi);
+      if (!pis.EnsureInserted(canonical)) {
+        nsAutoCString name;
+        canonical->ToUTF8String(name);
+        aRv.ThrowTypeError(
+            nsFmtCString("Duplicate processing instruction \"{}\" in "
+                         "'processingInstructions'.",
+                         name));
+        return;
+      }
+    }
+    mProcessingInstructions = Some(std::move(pis));
+  }
+
+  if (aConfig.mRemoveProcessingInstructions.WasPassed()) {
+    CanonicalPISet pis;
+    for (const auto& pi : aConfig.mRemoveProcessingInstructions.Value()) {
+      RefPtr<nsAtom> canonical = CanonicalizeProcessingInstruction(pi);
+      if (!pis.EnsureInserted(canonical)) {
+        nsAutoCString name;
+        canonical->ToUTF8String(name);
+        aRv.ThrowTypeError(
+            nsFmtCString("Duplicate processing instruction \"{}\" in "
+                         "'removeProcessingInstructions'.",
+                         name));
+        return;
+      }
+    }
+    mRemoveProcessingInstructions = Some(std::move(pis));
+  }
+
+  if (aConfig.mComments.WasPassed()) {
+    mComments = aConfig.mComments.Value();
+  } else {
+    mComments = aAllowCommentsPIsAndDataAttributes;
+  }
+
+  if (aConfig.mDataAttributes.WasPassed()) {
+    mDataAttributes = Some(aConfig.mDataAttributes.Value());
+  } else if (aConfig.mAttributes.WasPassed()) {
+    mDataAttributes = Some(aAllowCommentsPIsAndDataAttributes);
+  }
+}
+
+static bool IsNonReplaceableElement(const CanonicalElement& aElement) {
+  return aElement ==
+             CanonicalElement(nsGkAtoms::html, nsGkAtoms::nsuri_xhtml) ||
+         aElement == CanonicalElement(nsGkAtoms::svg, nsGkAtoms::nsuri_svg) ||
+         aElement == CanonicalElement(nsGkAtoms::math, nsGkAtoms::nsuri_mathml);
+}
+
+void Sanitizer::IsValid(ErrorResult& aRv) {
+  MOZ_ASSERT(mElements || mRemoveElements,
+             "Must have either due to CanonicalizeConfiguration");
+  if (mElements && mRemoveElements) {
+    aRv.ThrowTypeError(
+        "'elements' and 'removeElements' are not allowed at the same time.");
+    return;
+  }
+
+  MOZ_ASSERT(mProcessingInstructions || mRemoveProcessingInstructions);
+  if (mProcessingInstructions && mRemoveProcessingInstructions) {
+    aRv.ThrowTypeError(
+        "'processingInstructions' and 'removeProcessingInstructions' are not "
+        "allowed at the same time.");
+    return;
+  }
+
+  MOZ_ASSERT(mAttributes || mRemoveAttributes,
+             "Must have either due to CanonicalizeConfiguration");
+  if (mAttributes && mRemoveAttributes) {
+    aRv.ThrowTypeError(
+        "'attributes' and 'removeAttributes' are not allowed at the same "
+        "time.");
+    return;
+  }
+
+
+
+  if (mReplaceWithChildrenElements) {
+    for (const CanonicalElement& element : *mReplaceWithChildrenElements) {
+      if (IsNonReplaceableElement(element)) {
+        aRv.ThrowTypeError(nsFmtCString(
+            "Element {} is not allowed in 'replaceWithChildrenElements'",
+            element));
+        return;
+      }
+    }
+
+    if (mElements) {
+      for (const CanonicalElement& name : mElements->Keys()) {
+        if (mReplaceWithChildrenElements->Contains(name)) {
+          aRv.ThrowTypeError(
+              nsFmtCString("Element {} can't be in both 'elements' "
+                           "and 'replaceWithChildrenElements'.",
+                           name));
+          return;
+        }
+      }
+    } else {
+      for (const CanonicalElement& name : *mRemoveElements) {
+        if (mReplaceWithChildrenElements->Contains(name)) {
+          aRv.ThrowTypeError(
+              nsFmtCString("Element {} can't be in both 'removeElements' and "
+                           "'replaceWithChildrenElements'.",
+                           name));
+          return;
+        }
+      }
+    }
+  }
+
+  if (mAttributes) {
+    if (mElements) {
+      for (const auto& entry : *mElements) {
+        const CanonicalElementAttributes& elemAttributes = entry.GetData();
+        MOZ_ASSERT(
+            elemAttributes.mAttributes || elemAttributes.mRemoveAttributes,
+            "Canonical elements must at least have removeAttributes");
+
+
+        if (elemAttributes.mAttributes) {
+          for (const CanonicalAttribute& name : *elemAttributes.mAttributes) {
+            if (mAttributes->Contains(name)) {
+              aRv.ThrowTypeError(nsFmtCString(
+                  "Attribute {} can't be part of both the 'attributes' of "
+                  "the element {} and the global 'attributes'.",
+                  name, entry.GetKey()));
+              return;
+            }
+          }
+        }
+
+        if (elemAttributes.mRemoveAttributes) {
+          for (const CanonicalAttribute& name :
+               *elemAttributes.mRemoveAttributes) {
+            if (!mAttributes->Contains(name)) {
+              aRv.ThrowTypeError(nsFmtCString(
+                  "Attribute {} can't be in 'removeAttributes' of the "
+                  "element {} but not in the global 'attributes'.",
+                  name, entry.GetKey()));
+              return;
+            }
+          }
+        }
+
+        MOZ_ASSERT(mDataAttributes.isSome(),
+                   "mDataAttributes exists iff mAttributes exists");
+
+        if (*mDataAttributes && elemAttributes.mAttributes) {
+          for (const CanonicalAttribute& name : *elemAttributes.mAttributes) {
+            if (name.IsDataAttribute()) {
+              aRv.ThrowTypeError(nsFmtCString(
+                  "Data attribute {} in the 'attributes' of the element {} "
+                  "is redundant with 'dataAttributes' being true.",
+                  name, entry.GetKey()));
+              return;
+            }
+          }
+        }
+      }
+    }
+
+    MOZ_ASSERT(mDataAttributes.isSome(),
+               "mDataAttributes exists iff mAttributes exists");
+
+    if (*mDataAttributes) {
+      for (const CanonicalAttribute& name : *mAttributes) {
+        if (name.IsDataAttribute()) {
+          aRv.ThrowTypeError(
+              nsFmtCString("Data attribute {} in the global 'attributes' is "
+                           "redundant with 'dataAttributes' being true.",
+                           name));
+          return;
+        }
+      }
+    }
+  }
+
+  if (mRemoveAttributes) {
+    if (mElements) {
+      for (const auto& entry : *mElements) {
+        const CanonicalElementAttributes& elemAttributes = entry.GetData();
+
+        if (elemAttributes.mAttributes && elemAttributes.mRemoveAttributes) {
+          return aRv.ThrowTypeError(
+              nsFmtCString("Element {} can't have both 'attributes' "
+                           "and 'removeAttributes'.",
+                           entry.GetKey()));
+        }
+
+
+        if (elemAttributes.mAttributes) {
+          for (const CanonicalAttribute& name : *elemAttributes.mAttributes) {
+            if (mRemoveAttributes->Contains(name)) {
+              aRv.ThrowTypeError(nsFmtCString(
+                  "Attribute {} can't be in 'attributes' of the element {} "
+                  "while in the global 'removeAttributes'.",
+                  name, entry.GetKey()));
+              return;
+            }
+          }
+        }
+
+        if (elemAttributes.mRemoveAttributes) {
+          for (const CanonicalAttribute& name :
+               *elemAttributes.mRemoveAttributes) {
+            if (mRemoveAttributes->Contains(name)) {
+              aRv.ThrowTypeError(
+                  nsFmtCString("Attribute {} can't be part of both the "
+                               "'removeAttributes' of the element {} and the "
+                               "global 'removeAttributes'.",
+                               name, entry.GetKey()));
+              return;
+            }
+          }
+        }
+      }
+    }
+
+    if (mDataAttributes) {
+      aRv.ThrowTypeError(
+          "'removeAttributes' and 'dataAttributes' aren't allowed at the "
+          "same time.");
+    }
+  }
+}
+
+void Sanitizer::AssertIsValid() {
+#ifdef DEBUG
+  IgnoredErrorResult rv;
+  IsValid(rv);
+  MOZ_ASSERT(!rv.Failed());
+#endif
+}
+
+void Sanitizer::SetConfig(const SanitizerConfig& aConfig,
+                          bool aAllowCommentsPIsAndDataAttributes,
+                          ErrorResult& aRv) {
+  CanonicalizeConfiguration(aConfig, aAllowCommentsPIsAndDataAttributes, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  IsValid(aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+}
+
+void Sanitizer::MaybeMaterializeDefaultConfig() {
+  if (!mIsDefaultConfig) {
+    AssertIsValid();
+    return;
+  }
+
+  AssertNoLists();
+
+  CanonicalElementMap elements;
+  auto insertElements = [&elements](
+                            mozilla::Span<nsStaticAtom* const> aElements,
+                            nsStaticAtom* aNamespace,
+                            nsStaticAtom* const* aElementWithAttributes) {
+    size_t i = 0;
+    for (nsStaticAtom* name : aElements) {
+      CanonicalElementAttributes elementAttributes{};
+
+      if (name == aElementWithAttributes[i]) {
+        CanonicalAttributeSet attributes;
+        while (aElementWithAttributes[++i]) {
+          attributes.Insert(
+              CanonicalAttribute(aElementWithAttributes[i], nullptr));
+        }
+        i++;
+        elementAttributes.mAttributes = Some(std::move(attributes));
+      } else {
+        CanonicalAttributeSet set{};
+        elementAttributes.mAttributes = Some(std::move(set));
+      }
+
+      CanonicalElement elementName(name, aNamespace);
+      elements.InsertOrUpdate(elementName, std::move(elementAttributes));
+    }
+  };
+  insertElements(Span(kDefaultHTMLElements), nsGkAtoms::nsuri_xhtml,
+                 kHTMLElementWithAttributes);
+  insertElements(Span(kDefaultMathMLElements), nsGkAtoms::nsuri_mathml,
+                 kMathMLElementWithAttributes);
+  insertElements(Span(kDefaultSVGElements), nsGkAtoms::nsuri_svg,
+                 kSVGElementWithAttributes);
+  mElements = Some(std::move(elements));
+
+  mProcessingInstructions = Some(CanonicalPISet{});
+
+  CanonicalAttributeSet attributes;
+  for (nsStaticAtom* name : kDefaultAttributes) {
+    attributes.Insert(CanonicalAttribute(name, nullptr));
+  }
+  mAttributes = Some(std::move(attributes));
+
+  mIsDefaultConfig = false;
+}
+
+void Sanitizer::Get(SanitizerConfig& aConfig) {
+  MaybeMaterializeDefaultConfig();
+
+  if (mElements) {
+    nsTArray<OwningStringOrSanitizerElementNamespaceWithAttributes> elements;
+    for (const auto& entry : *mElements) {
+      OwningStringOrSanitizerElementNamespaceWithAttributes owning;
+      owning.SetAsSanitizerElementNamespaceWithAttributes() =
+          entry.GetKey().ToSanitizerElementNamespaceWithAttributes(
+              entry.GetData());
+
+      elements.InsertElementSorted(owning,
+                                   SanitizerComparator<decltype(owning)>());
+    }
+    aConfig.mElements.Construct(std::move(elements));
+  } else {
+    nsTArray<OwningStringOrSanitizerElementNamespace> removeElements;
+    for (const CanonicalElement& canonical : *mRemoveElements) {
+      OwningStringOrSanitizerElementNamespace owning;
+      owning.SetAsSanitizerElementNamespace() =
+          canonical.ToSanitizerElementNamespace();
+      removeElements.InsertElementSorted(
+          owning, SanitizerComparator<decltype(owning)>());
+    }
+    aConfig.mRemoveElements.Construct(std::move(removeElements));
+  }
+
+  if (mReplaceWithChildrenElements) {
+    nsTArray<OwningStringOrSanitizerElementNamespace>
+        replaceWithChildrenElements;
+    for (const CanonicalElement& canonical : *mReplaceWithChildrenElements) {
+      OwningStringOrSanitizerElementNamespace owning;
+      owning.SetAsSanitizerElementNamespace() =
+          canonical.ToSanitizerElementNamespace();
+      replaceWithChildrenElements.InsertElementSorted(
+          owning, SanitizerComparator<decltype(owning)>());
+    }
+    aConfig.mReplaceWithChildrenElements.Construct(
+        std::move(replaceWithChildrenElements));
+  }
+
+  if (mProcessingInstructions) {
+    nsTArray<OwningStringOrSanitizerProcessingInstruction>
+        processingInstructions;
+    for (const RefPtr<nsAtom>& canonical : *mProcessingInstructions) {
+      SanitizerProcessingInstruction pi;
+      canonical->ToString(pi.mTarget);
+      OwningStringOrSanitizerProcessingInstruction owning;
+      owning.SetAsSanitizerProcessingInstruction() = pi;
+      processingInstructions.InsertElementSorted(owning, PIComparator());
+    }
+    aConfig.mProcessingInstructions.Construct(
+        std::move(processingInstructions));
+  } else {
+    nsTArray<OwningStringOrSanitizerProcessingInstruction>
+        removeProcessingInstructions;
+    for (const RefPtr<nsAtom>& canonical : *mRemoveProcessingInstructions) {
+      SanitizerProcessingInstruction pi;
+      canonical->ToString(pi.mTarget);
+      OwningStringOrSanitizerProcessingInstruction owning;
+      owning.SetAsSanitizerProcessingInstruction() = pi;
+      removeProcessingInstructions.InsertElementSorted(owning, PIComparator());
+    }
+    aConfig.mRemoveProcessingInstructions.Construct(
+        std::move(removeProcessingInstructions));
+  }
+
+  if (mAttributes) {
+    aConfig.mAttributes.Construct(ToSanitizerAttributes(*mAttributes));
+  } else {
+    aConfig.mRemoveAttributes.Construct(
+        ToSanitizerAttributes(*mRemoveAttributes));
+  }
+
+  aConfig.mComments.Construct(mComments);
+  if (mDataAttributes) {
+    aConfig.mDataAttributes.Construct(*mDataAttributes);
+  }
+
+}
+
+bool Sanitizer::AllowElement(
+    const StringOrSanitizerElementNamespaceWithAttributes& aElement) {
+  MaybeMaterializeDefaultConfig();
+
+  CanonicalElement elementName = CanonicalizeElement(aElement);
+  CanonicalElementAttributes elementAttributes =
+      CanonicalizeElementAttributes(aElement);
+
+  if (mElements) {
+    bool modified =
+        mReplaceWithChildrenElements
+            ? mReplaceWithChildrenElements->EnsureRemoved(elementName)
+            : false;
+
+
+    if (mAttributes) {
+      if (elementAttributes.mAttributes) {
+        CanonicalAttributeSet attributes;
+        for (const CanonicalAttribute& attr : *elementAttributes.mAttributes) {
+          MOZ_ASSERT(!attributes.Contains(attr));
+
+          if (mAttributes->Contains(attr)) {
+            continue;
+          }
+
+          MOZ_ASSERT(mDataAttributes.isSome(),
+                     "mDataAttributes exists iff mAttributes");
+          if (*mDataAttributes) {
+            if (attr.IsDataAttribute()) {
+              continue;
+            }
+          }
+
+          attributes.Insert(attr.Clone());
+        }
+        elementAttributes.mAttributes = Some(std::move(attributes));
+      }
+
+      if (elementAttributes.mRemoveAttributes) {
+        CanonicalAttributeSet removeAttributes;
+        for (const CanonicalAttribute& attr :
+             *elementAttributes.mRemoveAttributes) {
+          MOZ_ASSERT(!removeAttributes.Contains(attr));
+
+          if (!mAttributes->Contains(attr)) {
+            continue;
+          }
+
+          removeAttributes.Insert(attr.Clone());
+        }
+        elementAttributes.mRemoveAttributes = Some(std::move(removeAttributes));
+      }
+    } else {
+
+      if (elementAttributes.mAttributes) {
+        CanonicalAttributeSet attributes;
+        for (const CanonicalAttribute& attr : *elementAttributes.mAttributes) {
+          MOZ_ASSERT(!attributes.Contains(attr));
+
+          if (elementAttributes.mRemoveAttributes &&
+              elementAttributes.mRemoveAttributes->Contains(attr)) {
+            continue;
+          }
+
+          if (mRemoveAttributes->Contains(attr)) {
+            continue;
+          }
+
+          attributes.Insert(attr.Clone());
+        }
+        elementAttributes.mAttributes = Some(std::move(attributes));
+
+        elementAttributes.mRemoveAttributes = Nothing();
+      }
+
+      if (elementAttributes.mRemoveAttributes) {
+        CanonicalAttributeSet removeAttributes;
+        for (const CanonicalAttribute& attr :
+             *elementAttributes.mRemoveAttributes) {
+          MOZ_ASSERT(!removeAttributes.Contains(attr));
+
+          if (mRemoveAttributes->Contains(attr)) {
+            continue;
+          }
+
+          removeAttributes.Insert(attr.Clone());
+        }
+        elementAttributes.mRemoveAttributes = Some(std::move(removeAttributes));
+      }
+    }
+
+    const CanonicalElementAttributes* existingElementAttributes =
+        mElements->Lookup(elementName).DataPtrOrNull();
+    if (!existingElementAttributes) {
+
+      mElements->InsertOrUpdate(elementName, std::move(elementAttributes));
+
+      return true;
+    }
+
+
+
+    if (elementAttributes.Equals(*existingElementAttributes)) {
+      return modified;
+    }
+
+    mElements->InsertOrUpdate(elementName, std::move(elementAttributes));
+
+    return true;
+  }
+
+  if (elementAttributes.mAttributes ||
+      (elementAttributes.mRemoveAttributes &&
+       !elementAttributes.mRemoveAttributes->IsEmpty())) {
+    if (auto* win = mGlobal->GetAsInnerWindow()) {
+      nsContentUtils::ReportToConsole(
+          nsIScriptError::warningFlag, "Sanitizer"_ns, win->GetDoc(),
+          PropertiesFile::SECURITY_PROPERTIES, "SanitizerAllowElementIgnored2");
+    }
+
+    return false;
+  }
+
+  bool modified = mReplaceWithChildrenElements
+                      ? mReplaceWithChildrenElements->EnsureRemoved(elementName)
+                      : false;
+
+  if (!mRemoveElements->Contains(elementName)) {
+
+    return modified;
+  }
+
+
+  mRemoveElements->Remove(elementName);
+
+  return true;
+}
+
+bool Sanitizer::RemoveElement(
+    const StringOrSanitizerElementNamespace& aElement) {
+  MaybeMaterializeDefaultConfig();
+
+  CanonicalElement element = CanonicalizeElement(aElement);
+
+  return RemoveElementCanonical(std::move(element));
+}
+
+bool Sanitizer::RemoveElementCanonical(CanonicalElement&& aElement) {
+  bool modified = mReplaceWithChildrenElements
+                      ? mReplaceWithChildrenElements->EnsureRemoved(aElement)
+                      : false;
+
+  if (mElements) {
+    if (mElements->Contains(aElement)) {
+
+      mElements->Remove(aElement);
+
+      return true;
+    }
+
+
+    return modified;
+  }
+
+  if (mRemoveElements->Contains(aElement)) {
+
+    return modified;
+  }
+
+
+  mRemoveElements->Insert(std::move(aElement));
+
+  return true;
+}
+
+bool Sanitizer::ReplaceElementWithChildren(
+    const StringOrSanitizerElementNamespace& aElement) {
+  MaybeMaterializeDefaultConfig();
+
+  CanonicalElement element = CanonicalizeElement(aElement);
+
+  if (IsNonReplaceableElement(element)) {
+    return false;
+  }
+
+  if (mReplaceWithChildrenElements &&
+      mReplaceWithChildrenElements->Contains(element)) {
+    return false;
+  }
+
+  if (mRemoveElements) {
+    mRemoveElements->Remove(element);
+  } else {
+    mElements->Remove(element);
+  }
+
+  if (!mReplaceWithChildrenElements) {
+    mReplaceWithChildrenElements.emplace();
+  }
+  mReplaceWithChildrenElements->Insert(std::move(element));
+
+  return true;
+}
+
+bool Sanitizer::AllowProcessingInstruction(
+    const StringOrSanitizerProcessingInstruction& aPI) {
+  MaybeMaterializeDefaultConfig();
+
+  RefPtr<nsAtom> pi = CanonicalizeProcessingInstruction(aPI);
+
+  if (mProcessingInstructions) {
+    return mProcessingInstructions->EnsureInserted(pi);
+  }
+
+  if (mRemoveProcessingInstructions->Contains(pi)) {
+    mRemoveProcessingInstructions->Remove(pi);
+    return true;
+  }
+
+  return false;
+}
+
+bool Sanitizer::RemoveProcessingInstruction(
+    const StringOrSanitizerProcessingInstruction& aPI) {
+  MaybeMaterializeDefaultConfig();
+
+  RefPtr<nsAtom> pi = CanonicalizeProcessingInstruction(aPI);
+
+  if (mProcessingInstructions) {
+    if (mProcessingInstructions->Contains(pi)) {
+      mProcessingInstructions->Remove(pi);
+      return true;
+    }
+
+    return false;
+  }
+
+  return mRemoveProcessingInstructions->EnsureInserted(pi);
+}
+
+bool Sanitizer::AllowAttribute(
+    const StringOrSanitizerAttributeNamespace& aAttribute) {
+  MaybeMaterializeDefaultConfig();
+
+  CanonicalAttribute attribute = CanonicalizeAttribute(aAttribute);
+
+  if (mAttributes) {
+
+    MOZ_ASSERT(mDataAttributes.isSome(),
+               "mDataAttributes exists iff mAttributes exists");
+
+    if (*mDataAttributes && attribute.IsDataAttribute()) {
+      return false;
+    }
+
+    if (mAttributes->Contains(attribute)) {
+      return false;
+    }
+
+
+    if (mElements) {
+      for (auto iter = mElements->Iter(); !iter.Done(); iter.Next()) {
+        CanonicalElementAttributes& elemAttributes = iter.Data();
+
+        if (elemAttributes.mAttributes &&
+            elemAttributes.mAttributes->Contains(attribute)) {
+          elemAttributes.mAttributes->Remove(attribute);
+        }
+
+        MOZ_ASSERT_IF(elemAttributes.mRemoveAttributes,
+                      !elemAttributes.mRemoveAttributes->Contains(attribute));
+      }
+    }
+
+    mAttributes->Insert(std::move(attribute));
+
+    return true;
+  }
+
+
+
+  if (!mRemoveAttributes->Contains(attribute)) {
+    return false;
+  }
+
+  mRemoveAttributes->Remove(attribute);
+
+  return true;
+}
+
+bool Sanitizer::RemoveAttribute(
+    const StringOrSanitizerAttributeNamespace& aAttribute) {
+  MaybeMaterializeDefaultConfig();
+
+  CanonicalAttribute attribute = CanonicalizeAttribute(aAttribute);
+
+  return RemoveAttributeCanonical(std::move(attribute));
+}
+
+bool Sanitizer::RemoveAttributeCanonical(CanonicalAttribute&& aAttribute) {
+  if (mAttributes) {
+
+    bool modified = mAttributes->EnsureRemoved(aAttribute);
+
+
+    if (mElements) {
+      for (auto iter = mElements->Iter(); !iter.Done(); iter.Next()) {
+        CanonicalElementAttributes& elemAttributes = iter.Data();
+        if (elemAttributes.mAttributes &&
+            elemAttributes.mAttributes->Contains(aAttribute)) {
+          modified = true;
+
+          elemAttributes.mAttributes->Remove(aAttribute);
+        }
+
+        if (elemAttributes.mRemoveAttributes &&
+            elemAttributes.mRemoveAttributes->Contains(aAttribute)) {
+          MOZ_ASSERT(modified,
+                     "Must have removed attribute from mAttributes already");
+
+          elemAttributes.mRemoveAttributes->Remove(aAttribute);
+        }
+      }
+    }
+
+    return modified;
+  }
+
+
+  if (mRemoveAttributes->Contains(aAttribute)) {
+    return false;
+  }
+
+  if (mElements) {
+    for (auto iter = mElements->Iter(); !iter.Done(); iter.Next()) {
+      CanonicalElementAttributes& elemAttributes = iter.Data();
+      if (elemAttributes.mAttributes &&
+          elemAttributes.mAttributes->Contains(aAttribute)) {
+        elemAttributes.mAttributes->Remove(aAttribute);
+      }
+
+      if (elemAttributes.mRemoveAttributes &&
+          elemAttributes.mRemoveAttributes->Contains(aAttribute)) {
+        elemAttributes.mRemoveAttributes->Remove(aAttribute);
+      }
+    }
+  }
+
+  mRemoveAttributes->Insert(std::move(aAttribute));
+
+  return true;
+}
+
+bool Sanitizer::SetComments(bool aAllow) {
+
+  if (mComments == aAllow) {
+    return false;
+  }
+
+  mComments = aAllow;
+
+  return true;
+}
+
+bool Sanitizer::SetDataAttributes(bool aAllow) {
+
+  if (!mIsDefaultConfig && !mAttributes) {
+    return false;
+  }
+
+  MOZ_ASSERT(mDataAttributes.isSome(),
+             "mDataAttributes exists iff mAttributes exists (or in the default "
+             "config)");
+
+  if (*mDataAttributes == aAllow) {
+    return false;
+  }
+
+  if (!mIsDefaultConfig && aAllow) {
+
+    mAttributes->RemoveIf([](const CanonicalAttribute& aAttribute) {
+      return aAttribute.IsDataAttribute();
+    });
+
+    if (mElements) {
+      for (auto iter = mElements->Iter(); !iter.Done(); iter.Next()) {
+        CanonicalElementAttributes& elemAttributes = iter.Data();
+        if (elemAttributes.mAttributes) {
+          elemAttributes.mAttributes->RemoveIf(
+              [](const CanonicalAttribute& aAttribute) {
+                return aAttribute.IsDataAttribute();
+              });
+        }
+      }
+    }
+  }
+
+  mDataAttributes = Some(aAllow);
+
+  return true;
+}
+
+#define FOR_EACH_BASELINE_REMOVE_ELEMENT(ELEMENT) \
+  ELEMENT(XHTML, xhtml, base)                     \
+  ELEMENT(XHTML, xhtml, embed)                    \
+  ELEMENT(XHTML, xhtml, frame)                    \
+  ELEMENT(XHTML, xhtml, iframe)                   \
+  ELEMENT(XHTML, xhtml, object)                   \
+  ELEMENT(XHTML, xhtml, script)                   \
+  ELEMENT(SVG, svg, script)                       \
+  ELEMENT(SVG, svg, use)
+
+bool Sanitizer::RemoveUnsafe() {
+  MaybeMaterializeDefaultConfig();
+
+
+  bool result = false;
+
+#define ELEMENT(_, NSURI, LOCAL_NAME)                                       \
+          \
+  if (RemoveElementCanonical(CanonicalElement(nsGkAtoms::LOCAL_NAME,        \
+                                              nsGkAtoms::nsuri_##NSURI))) { \
+              \
+    result = true;                                                          \
+  }
+
+  FOR_EACH_BASELINE_REMOVE_ELEMENT(ELEMENT)
+
+#undef ELEMENT
+
+
+  nsContentUtils::ForEachEventAttributeName(
+      EventNameType_All & ~EventNameType_XUL,
+      [self = MOZ_KnownLive(this), &result](nsAtom* aName) {
+        if (self->RemoveAttributeCanonical(
+                CanonicalAttribute(aName, nullptr))) {
+          result = true;
+        }
+      });
+
+  return result;
+}
+
+void Sanitizer::Sanitize(nsINode* aNode, bool aSafe, ErrorResult& aRv) {
+  MOZ_ASSERT(aNode->OwnerDoc()->IsLoadedAsData(),
+             "SanitizeChildren relies on the document being inert to be safe");
+
+
+
+  if (mIsDefaultConfig) {
+    AssertNoLists();
+    SanitizeChildren<true>(aNode, aSafe);
+  } else {
+    AssertIsValid();
+    SanitizeChildren<false>(aNode, aSafe);
+  }
+}
+
+static RefPtr<nsAtom> ToNamespace(int32_t aNamespaceID) {
+  if (aNamespaceID == kNameSpaceID_None) {
+    return nullptr;
+  }
+
+  RefPtr<nsAtom> atom =
+      nsNameSpaceManager::GetInstance()->NameSpaceURIAtom(aNamespaceID);
+  return atom;
+}
+
+static bool IsUnsafeElement(nsAtom* aLocalName, int32_t aNamespaceID) {
+#define ELEMENT(NSID, _, LOCAL_NAME)           \
+  if (aNamespaceID == kNameSpaceID_##NSID) {   \
+    if (aLocalName == nsGkAtoms::LOCAL_NAME) { \
+      return true;                             \
+    }                                          \
+  }
+
+  FOR_EACH_BASELINE_REMOVE_ELEMENT(ELEMENT)
+
+#undef ELEMENT
+
+  return false;
+}
+
+static bool RemoveJavascriptNavigationURLAttribute(Element* aElement,
+                                                   nsAtom* aLocalName,
+                                                   int32_t aNamespaceID) {
+  auto containsJavascriptURL = [&]() {
+    nsAutoString value;
+    if (!aElement->GetAttr(aNamespaceID, aLocalName, value)) {
+      return false;
+    }
+
+    nsCOMPtr<nsIURI> uri;
+    if (NS_FAILED(NS_NewURI(getter_AddRefs(uri), value))) {
+      return false;
+    }
+
+    return uri->SchemeIs("javascript");
+  };
+
+  if ((aElement->IsAnyOfHTMLElements(nsGkAtoms::a, nsGkAtoms::area) &&
+       aLocalName == nsGkAtoms::href && aNamespaceID == kNameSpaceID_None) ||
+      (aElement->IsAnyOfHTMLElements(nsGkAtoms::button, nsGkAtoms::input) &&
+       aLocalName == nsGkAtoms::formaction &&
+       aNamespaceID == kNameSpaceID_None) ||
+      (aElement->IsHTMLElement(nsGkAtoms::form) &&
+       aLocalName == nsGkAtoms::action && aNamespaceID == kNameSpaceID_None) ||
+      (aElement->IsHTMLElement(nsGkAtoms::iframe) &&
+       aLocalName == nsGkAtoms::src && aNamespaceID == kNameSpaceID_None) ||
+      (aElement->IsSVGElement(nsGkAtoms::a) && aLocalName == nsGkAtoms::href &&
+       (aNamespaceID == kNameSpaceID_None ||
+        aNamespaceID == kNameSpaceID_XLink))) {
+    if (containsJavascriptURL()) {
+      return true;
+    }
+  };
+
+  if (aElement->IsMathMLElement() && aLocalName == nsGkAtoms::href &&
+      (aNamespaceID == kNameSpaceID_None ||
+       aNamespaceID == kNameSpaceID_XLink)) {
+    if (containsJavascriptURL()) {
+      return true;
+    }
+  }
+
+  if (aLocalName == nsGkAtoms::attributeName &&
+      aNamespaceID == kNameSpaceID_None &&
+      aElement->IsAnyOfSVGElements(
+          nsGkAtoms::animate, nsGkAtoms::animateTransform, nsGkAtoms::set)) {
+    nsAutoString value;
+    if (!aElement->GetAttr(aNamespaceID, aLocalName, value)) {
+      return false;
+    }
+
+    return value.EqualsLiteral("href") || StringEndsWith(value, u":href"_ns);
+  }
+
+  return false;
+}
+
+template <bool IsDefaultConfig>
+void Sanitizer::SanitizeChildren(nsINode* aNode, bool aSafe) const {
+  nsCOMPtr<nsIContent> next = nullptr;
+  for (nsCOMPtr<nsIContent> child = aNode->GetFirstChild(); child;
+       child = next) {
+    next = child->GetNextSibling();
+
+    MOZ_ASSERT(child->IsText() || child->IsComment() || child->IsElement() ||
+               child->NodeType() == nsINode::DOCUMENT_TYPE_NODE);
+
+    if (child->NodeType() == nsINode::DOCUMENT_TYPE_NODE || child->IsText()) {
+      continue;
+    }
+
+    if (child->IsComment()) {
+      if (!mComments) {
+        child->Remove();
+      }
+      continue;
+    }
+
+
+    MOZ_ASSERT(child->IsElement());
+
+    nsAtom* nameAtom = child->NodeInfo()->NameAtom();
+    int32_t namespaceID = child->NodeInfo()->NamespaceID();
+    Maybe<CanonicalElement> elementName;
+    std::conditional_t<IsDefaultConfig, StaticAtomSet*,
+                       CanonicalElementAttributes*>
+        elementAttributes = nullptr;
+    if constexpr (!IsDefaultConfig) {
+      elementName.emplace(nameAtom, ToNamespace(namespaceID));
+
+      if (aSafe && IsUnsafeElement(nameAtom, namespaceID)) {
+        child->Remove();
+        continue;
+      }
+
+      if (mReplaceWithChildrenElements &&
+          mReplaceWithChildrenElements->Contains(*elementName)) {
+        nsCOMPtr<nsIContent> parent = child->GetParent();
+        MOZ_DIAGNOSTIC_ASSERT(parent);
+        nsCOMPtr<nsIContent> firstChild = child->GetFirstChild();
+        nsCOMPtr<nsIContent> newChild = firstChild;
+        for (; newChild; newChild = child->GetFirstChild()) {
+          ErrorResult rv;
+          parent->InsertBefore(*newChild, child, rv);
+          if (rv.Failed()) {
+            break;
+          }
+        }
+
+        child->Remove();
+        if (firstChild) {
+          next = firstChild;
+        }
+        continue;
+      }
+
+      if (mRemoveElements) {
+        if (mRemoveElements->Contains(*elementName)) {
+          child->Remove();
+          continue;
+        }
+      }
+
+      if (mElements) {
+        elementAttributes = mElements->Lookup(*elementName).DataPtrOrNull();
+        if (!elementAttributes) {
+          child->Remove();
+          continue;
+        }
+      }
+    } else {
+
+
+      bool found = false;
+      if (nameAtom->IsStatic()) {
+        ElementsWithAttributes* elements = nullptr;
+        if (namespaceID == kNameSpaceID_XHTML) {
+          elements = sDefaultHTMLElements;
+        } else if (namespaceID == kNameSpaceID_MathML) {
+          elements = sDefaultMathMLElements;
+        } else if (namespaceID == kNameSpaceID_SVG) {
+          elements = sDefaultSVGElements;
+        }
+        if (elements) {
+          if (auto lookup = elements->Lookup(nameAtom->AsStatic())) {
+            found = true;
+            elementAttributes = lookup->get();
+          }
+        }
+      }
+      if (!found) {
+        child->Remove();
+        continue;
+      }
+
+      MOZ_ASSERT(!IsUnsafeElement(nameAtom, namespaceID),
+                 "The default config has no unsafe elements");
+    }
+
+    if (auto* templateEl = HTMLTemplateElement::FromNode(child)) {
+      RefPtr<DocumentFragment> frag = templateEl->Content();
+      SanitizeChildren<IsDefaultConfig>(frag, aSafe);
+    }
+
+    if (RefPtr<ShadowRoot> shadow = child->GetShadowRoot();
+        shadow && !shadow->IsUAWidget()) {
+      SanitizeChildren<IsDefaultConfig>(shadow, aSafe);
+    }
+
+    if (CustomElementData* data = child->AsElement()->GetCustomElementData();
+        data && data->GetIs(child->AsElement())) [[unlikely]] {
+      if (IsDefaultConfig ||
+          !IsAttributeAllowed(elementAttributes, nsGkAtoms::is,
+                              kNameSpaceID_None, aSafe)) {
+        child->AsElement()->ClearCustomElementData();
+      }
+    }
+
+    int32_t attrCount = int32_t(child->AsElement()->GetAttrCount());
+    for (int32_t i = attrCount - 1; i >= 0; --i) {
+      const nsAttrName* attr = child->AsElement()->GetAttrNameAt(i);
+      RefPtr<nsAtom> attrLocalName = attr->LocalName();
+      int32_t attrNs = attr->NamespaceID();
+
+      bool remove =
+          !IsAttributeAllowed(elementAttributes, attrLocalName, attrNs, aSafe);
+
+      if (aSafe && !remove) {
+        remove = RemoveJavascriptNavigationURLAttribute(child->AsElement(),
+                                                        attrLocalName, attrNs);
+      }
+
+      if (remove) {
+        child->AsElement()->UnsetAttr(attrNs, attrLocalName,
+                                       false);
+
+        --attrCount;
+        i = attrCount;  
+      }
+    }
+
+    SanitizeChildren<IsDefaultConfig>(child, aSafe);
+  }
+}
+
+static inline bool IsDataAttribute(nsAtom* aName, int32_t aNamespaceID) {
+  return StringBeginsWith(nsDependentAtomString(aName), u"data-"_ns) &&
+         aNamespaceID == kNameSpaceID_None;
+}
+
+bool Sanitizer::IsAttributeAllowed(StaticAtomSet* aElementAttributes,
+                                   nsAtom* aAttrLocalName, int32_t aAttrNs,
+                                   bool) const {
+  MOZ_ASSERT(mIsDefaultConfig);
+
+
+
+
+  bool globallyAllowed = aAttrNs == kNameSpaceID_None &&
+                         sDefaultAttributes->Contains(aAttrLocalName);
+
+  bool locallyAllowed = aAttrNs == kNameSpaceID_None && aElementAttributes &&
+                        aElementAttributes->Contains(aAttrLocalName);
+
+  bool isDataAttributeAllowed =
+      *mDataAttributes && IsDataAttribute(aAttrLocalName, aAttrNs);
+
+  if (!globallyAllowed && !locallyAllowed && !isDataAttributeAllowed) {
+    return false;
+  }
+
+
+  MOZ_ASSERT(!nsContentUtils::IsEventAttributeName(
+      aAttrLocalName, EventNameType_All & ~EventNameType_XUL));
+
+  return true;
+}
+
+bool Sanitizer::IsAttributeAllowed(
+    CanonicalElementAttributes* aElementAttributes, nsAtom* aAttrLocalName,
+    int32_t aAttrNs, bool aSafe) const {
+  MOZ_ASSERT(!mIsDefaultConfig);
+
+
+  if (aSafe && aAttrNs == kNameSpaceID_None &&
+      nsContentUtils::IsEventAttributeName(
+          aAttrLocalName, EventNameType_All & ~EventNameType_XUL)) {
+    return false;
+  }
+
+  CanonicalAttribute attrName(aAttrLocalName, ToNamespace(aAttrNs));
+  if (aElementAttributes && aElementAttributes->mRemoveAttributes &&
+      aElementAttributes->mRemoveAttributes->Contains(attrName)) {
+    return false;
+  }
+
+  if (mAttributes) {
+    bool globallyAllowed = mAttributes->Contains(attrName);
+
+    bool locallyAllowed = aElementAttributes &&
+                          aElementAttributes->mAttributes &&
+                          aElementAttributes->mAttributes->Contains(attrName);
+
+    bool isDataAttributeAllowed =
+        *mDataAttributes && IsDataAttribute(aAttrLocalName, aAttrNs);
+
+    if (!globallyAllowed && !locallyAllowed && !isDataAttributeAllowed) {
+      return false;
+    }
+  }
+  else {
+    if (aElementAttributes && aElementAttributes->mAttributes &&
+        !aElementAttributes->mAttributes->Contains(attrName)) {
+      return false;
+    }
+
+    if (mRemoveAttributes->Contains(attrName)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+}  

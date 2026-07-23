@@ -1,0 +1,191 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsToolkitProfileService_h
+#define nsToolkitProfileService_h
+
+#include "mozilla/Components.h"
+#include "mozilla/LinkedList.h"
+#include "nsIToolkitProfileService.h"
+#include "nsIToolkitProfile.h"
+#include "nsIFactory.h"
+#include "nsSimpleEnumerator.h"
+#include "nsProfileLock.h"
+#include "nsINIParser.h"
+#include "mozilla/MozPromise.h"
+#include "nsProxyRelease.h"
+
+class nsStartupLock;
+
+struct CurrentProfileData {
+  nsCString mPath;
+  nsCString mStoreID;
+  bool mShowSelector;
+  bool mIsRelative;
+};
+
+struct IniData {
+  nsCString mProfiles;
+  nsCString mInstalls;
+};
+
+class nsToolkitProfile final
+    : public nsIToolkitProfile,
+      public mozilla::LinkedListElement<RefPtr<nsToolkitProfile>> {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSITOOLKITPROFILE
+
+  friend class nsToolkitProfileService;
+
+ private:
+  ~nsToolkitProfile() = default;
+
+  nsToolkitProfile(const nsACString& aName, nsIFile* aRootDir,
+                   nsIFile* aLocalDir, bool aFromDB, const nsACString& aStoreID,
+                   bool aShowProfileSelector);
+
+  nsresult RemoveInternal(bool aRemoveFiles, bool aInBackground);
+
+  friend class nsToolkitProfileLock;
+
+  nsCString mName;
+  nsCOMPtr<nsIFile> mRootDir;
+  nsCOMPtr<nsIFile> mLocalDir;
+  nsCString mStoreID;
+  bool mShowProfileSelector;
+  nsIProfileLock* mLock;
+  uint32_t mIndex;
+  nsCString mSection;
+};
+
+class nsToolkitProfileLock final : public nsIProfileLock {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIPROFILELOCK
+
+  nsresult Init(nsToolkitProfile* aProfile, nsIProfileUnlocker** aUnlocker);
+  nsresult Init(nsIFile* aDirectory, nsIFile* aLocalDirectory,
+                nsIProfileUnlocker** aUnlocker);
+
+  nsToolkitProfileLock() = default;
+
+ private:
+  ~nsToolkitProfileLock();
+
+  RefPtr<nsToolkitProfile> mProfile;
+  nsCOMPtr<nsIFile> mDirectory;
+  nsCOMPtr<nsIFile> mLocalDirectory;
+
+  nsProfileLock mLock;
+};
+
+class nsToolkitProfileService final : public nsIToolkitProfileService {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSITOOLKITPROFILESERVICE
+  nsresult SelectStartupProfile(int* aArgc, char* aArgv[], bool aIsResetting,
+                                nsIFile** aRootDir, nsIFile** aLocalDir,
+                                nsIToolkitProfile** aProfile, bool* aDidCreate,
+                                bool* aWasDefaultSelection);
+  nsresult CreateResetProfile(nsIToolkitProfile** aNewProfile);
+  nsresult ApplyResetProfile(nsIToolkitProfile* aOldProfile);
+  bool HasShowProfileSelector();
+  void UpdateCurrentProfile();
+  void CompleteStartup();
+
+  using AsyncFlushPromise =
+      mozilla::MozPromise<bool , nsresult, false>;
+
+ private:
+  friend class nsToolkitProfile;
+  friend already_AddRefed<nsToolkitProfileService>
+  NS_GetToolkitProfileService();
+
+  nsToolkitProfileService();
+  ~nsToolkitProfileService();
+
+  nsresult Init();
+
+  nsresult CreateTimesInternal(nsIFile* profileDir, const nsACString& aSource);
+  void GetProfileByDir(nsIFile* aRootDir, nsIFile* aLocalDir,
+                       nsToolkitProfile** aResult);
+  already_AddRefed<nsToolkitProfile> GetProfileByStoreID(
+      const nsACString& aStoreID);
+  nsresult GetProfileDescriptor(nsToolkitProfile* aProfile, bool* aIsRelative,
+                                nsACString& aDescriptor);
+  bool IsProfileForCurrentInstall(nsToolkitProfile* aProfile);
+  void ClearProfileFromOtherInstalls(nsToolkitProfile* aProfile);
+  nsresult MaybeMakeDefaultDedicatedProfile(nsToolkitProfile* aProfile,
+                                            bool* aResult);
+  bool IsSnapEnvironment();
+  bool UseLegacyProfiles();
+  nsresult CreateDefaultProfile(const nsACString& aSource,
+                                nsToolkitProfile** aResult);
+  nsresult CreateUniqueProfile(nsIFile* aRootDir, const nsACString& aNamePrefix,
+                               const nsACString& aSource,
+                               nsToolkitProfile** aResult);
+  nsresult CreateProfile(nsIFile* aRootDir, const nsACString& aName,
+                         const nsACString& aSource, nsToolkitProfile** aResult);
+  already_AddRefed<nsToolkitProfile> GetProfileByName(const nsACString& aName);
+  void SetNormalDefault(nsToolkitProfile* aProfile);
+  already_AddRefed<nsToolkitProfile> GetDefaultProfile();
+  void FlushProfileData(
+      const nsMainThreadPtrHandle<nsStartupLock>& aStartupLock,
+      const CurrentProfileData* aProfileInfo);
+  void BuildIniData(nsCString& aProfilesIniData, nsCString& aInstallsIniData);
+  nsresult FlushData(const nsCString& aProfilesIniData,
+                     const nsCString& aInstallsIniData);
+
+  nsTArray<nsCString> GetKnownInstalls();
+
+  bool mStartupProfileSelected;
+  mozilla::LinkedList<RefPtr<nsToolkitProfile>> mProfiles;
+  RefPtr<nsToolkitProfile> mCurrent;
+  RefPtr<nsToolkitProfile> mDedicatedProfile;
+  RefPtr<nsToolkitProfile> mNormalDefault;
+  RefPtr<nsToolkitProfile> mDevEditionDefault;
+  nsCOMPtr<nsIFile> mAppData;
+  nsCOMPtr<nsIFile> mTempData;
+  nsCOMPtr<nsIFile> mProfileDBFile;
+  nsCOMPtr<nsIFile> mInstallDBFile;
+  nsINIParser mProfileDB;
+  nsCString mInstallSection;
+  nsCString mLegacyInstallSection;
+  bool mStartWithLast;
+  bool mIsFirstRun;
+  bool mUseDevEditionProfile;
+  const bool mUseDedicatedProfile;
+  nsCString mStartupReason;
+  nsCString mStartupFileVersion;
+  bool mMaybeLockProfile;
+  nsCString mUpdateChannel;
+  bool mProfileDBExists;
+  int64_t mProfileDBFileSize;
+  PRTime mProfileDBModifiedTime;
+  nsCString mIniStatus;
+
+  nsCOMPtr<nsISerialEventTarget> mAsyncQueue;
+  nsISerialEventTarget* AsyncQueue();
+
+  static nsToolkitProfileService* gService;
+
+  class ProfileEnumerator final : public nsSimpleEnumerator {
+   public:
+    NS_DECL_NSISIMPLEENUMERATOR
+
+    const nsID& DefaultInterface() override {
+      return NS_GET_IID(nsIToolkitProfile);
+    }
+
+    explicit ProfileEnumerator(nsToolkitProfile* first) { mCurrent = first; }
+
+   private:
+    RefPtr<nsToolkitProfile> mCurrent;
+  };
+};
+
+already_AddRefed<nsToolkitProfileService> NS_GetToolkitProfileService();
+
+#endif

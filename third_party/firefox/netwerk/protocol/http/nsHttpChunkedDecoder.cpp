@@ -1,0 +1,131 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HttpLog.h"
+
+#include <errno.h>
+#include "nsHttpChunkedDecoder.h"
+#include <algorithm>
+#include <string.h>
+
+namespace mozilla {
+namespace net {
+
+
+nsresult nsHttpChunkedDecoder::HandleChunkedContent(
+    char* buf, uint32_t count, uint32_t* contentRead,
+    uint32_t* contentRemaining) {
+  LOG(("nsHttpChunkedDecoder::HandleChunkedContent [count=%u]\n", count));
+
+  *contentRead = 0;
+
+
+  while (count) {
+    if (mChunkRemaining) {
+      uint32_t amt = std::min(mChunkRemaining, count);
+
+      count -= amt;
+      mChunkRemaining -= amt;
+
+      *contentRead += amt;
+      buf += amt;
+    } else if (mReachedEOF) {
+      break;  
+    } else {
+      uint32_t bytesConsumed = 0;
+
+      nsresult rv = ParseChunkRemaining(buf, count, &bytesConsumed);
+      if (NS_FAILED(rv)) return rv;
+
+      count -= bytesConsumed;
+
+      if (count) {
+        memmove(buf, buf + bytesConsumed, count);
+      }
+    }
+  }
+
+  *contentRemaining = count;
+  return NS_OK;
+}
+
+
+nsresult nsHttpChunkedDecoder::ParseChunkRemaining(char* buf, uint32_t count,
+                                                   uint32_t* bytesConsumed) {
+  MOZ_ASSERT(mChunkRemaining == 0, "chunk remaining should be zero");
+  MOZ_ASSERT(count, "unexpected");
+
+  *bytesConsumed = 0;
+
+  char* p = static_cast<char*>(memchr(buf, '\n', count));
+  if (p) {
+    *p = 0;
+    count = p - buf;                        
+    *bytesConsumed = count + 1;             
+    if ((p > buf) && (*(p - 1) == '\r')) {  
+      *(p - 1) = 0;
+      count--;
+    }
+
+    if (!mLineBuf.IsEmpty()) {
+      mLineBuf.Append(buf, count);
+      buf = (char*)mLineBuf.get();
+      count = mLineBuf.Length();
+    }
+
+    if (mWaitEOF) {
+      if (*buf) {
+        LOG(("got trailer: %s\n", buf));
+        if (!mTrailers) {
+          mTrailers = MakeUnique<nsHttpHeaderArray>();
+        }
+
+        nsHttpAtom hdr;
+        nsAutoCString headerNameOriginal;
+        nsAutoCString val;
+        if (NS_SUCCEEDED(
+                mTrailers->ParseHeaderLine(nsDependentCSubstring(buf, count),
+                                           &hdr, &headerNameOriginal, &val))) {
+          if (hdr == nsHttp::Server_Timing) {
+            (void)mTrailers->SetHeaderFromNet(hdr, headerNameOriginal, val,
+                                              true);
+          }
+        }
+      } else {
+        mWaitEOF = false;
+        mReachedEOF = true;
+        LOG(("reached end of chunked-body\n"));
+      }
+    } else if (*buf) {
+      char* endptr;
+      unsigned long parsedval;  
+
+      if ((p = strchr(buf, ';')) != nullptr) {
+        *p = 0;
+      }
+
+      parsedval = strtoul(buf, &endptr, 16);
+      mChunkRemaining = (uint32_t)parsedval;
+
+      if ((endptr == buf) || ((errno == ERANGE) && (parsedval == ULONG_MAX)) ||
+          (parsedval != mChunkRemaining)) {
+        LOG(("failed parsing hex on string [%s]\n", buf));
+        return NS_ERROR_UNEXPECTED;
+      }
+
+      if (mChunkRemaining == 0) mWaitEOF = true;
+    }
+
+    mLineBuf.Truncate();
+  } else {
+    *bytesConsumed = count;
+    if (buf[count - 1] == '\r') count--;
+    mLineBuf.Append(buf, count);
+  }
+
+  return NS_OK;
+}
+
+}  
+}  

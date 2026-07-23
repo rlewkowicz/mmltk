@@ -1,0 +1,21 @@
+
+[package]
+edition = "2021"
+name = "weedle2"
+version = "5.0.0"
+authors = [
+    "Sharad Chand <sharad.d.chand@gmail.com>",
+    "Jan-Erik Rediger <jrediger@mozilla.com>",
+]
+exclude = ["tests"]
+description = "A WebIDL Parser"
+homepage = "https://github.com/mozilla/uniffi-rs/tree/main/weedle2"
+documentation = "https://docs.rs/weedle2"
+license = "MIT"
+repository = "https://github.com/mozilla/uniffi-rs"
+
+[lib]
+name = "weedle"
+
+[dependencies.nom]
+version = "7.1.0"

@@ -1,0 +1,137 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ChannelMediaDecoder_h_
+#define ChannelMediaDecoder_h_
+
+#include "MediaChannelStatistics.h"
+#include "MediaDecoder.h"
+#include "MediaResourceCallback.h"
+
+class nsIChannel;
+class nsIStreamListener;
+
+namespace mozilla {
+
+class BaseMediaResource;
+
+DDLoggedTypeDeclNameAndBase(ChannelMediaDecoder, MediaDecoder);
+
+class ChannelMediaDecoder
+    : public MediaDecoder,
+      public DecoderDoctorLifeLogger<ChannelMediaDecoder> {
+  class ResourceCallback : public MediaResourceCallback {
+    static const uint32_t sDelay = 500;
+
+   public:
+    explicit ResourceCallback(AbstractThread* aMainThread);
+    void Connect(ChannelMediaDecoder* aDecoder);
+    void Disconnect();
+
+   private:
+    ~ResourceCallback();
+
+    AbstractThread* AbstractMainThread() const override;
+    MediaDecoderOwner* GetMediaOwner() const override;
+    void NotifyNetworkError(const MediaResult& aError) override;
+    void NotifyDataArrived() override;
+    void NotifyDataEnded(nsresult aStatus) override;
+    void NotifyPrincipalChanged() override;
+    void NotifySuspendedStatusChanged(bool aSuspendedByCache) override;
+
+    static void TimerCallback(nsITimer* aTimer, void* aClosure);
+
+    ChannelMediaDecoder* mDecoder = nullptr;
+    nsCOMPtr<nsITimer> mTimer;
+    bool mTimerArmed = false;
+    const RefPtr<AbstractThread> mAbstractMainThread;
+  };
+
+ protected:
+  void ShutdownInternal() override;
+  void OnPlaybackEvent(const MediaPlaybackEvent& aEvent) override;
+  void DurationChanged() override;
+  void MetadataLoaded(UniquePtr<MediaInfo> aInfo, UniquePtr<MetadataTags> aTags,
+                      MediaDecoderEventVisibility aEventVisibility) override;
+  void NotifyPrincipalChanged() override;
+
+  RefPtr<ResourceCallback> mResourceCallback;
+  RefPtr<BaseMediaResource> mResource;
+
+  explicit ChannelMediaDecoder(MediaDecoderInit& aInit);
+
+  void GetDebugInfo(dom::MediaDecoderDebugInfo& aInfo);
+
+ public:
+  static already_AddRefed<ChannelMediaDecoder> Create(
+      MediaDecoderInit& aInit, DecoderDoctorDiagnostics* aDiagnostics);
+
+  void Shutdown() override;
+
+  bool CanClone();
+
+  already_AddRefed<ChannelMediaDecoder> Clone(MediaDecoderInit& aInit);
+
+  nsresult Load(nsIChannel* aChannel, bool aIsPrivateBrowsing,
+                nsIStreamListener** aStreamListener);
+
+  void AddSizeOfResources(ResourceSizes* aSizes) override;
+  already_AddRefed<nsIPrincipal> GetCurrentPrincipal() override;
+  bool HadCrossOriginRedirects() override;
+  bool IsTransportSeekable() override;
+  void SetLoadInBackground(bool aLoadInBackground) override;
+  void Suspend() override;
+  void Resume() override;
+
+ private:
+  struct MediaStatistics {
+    double mPlaybackByteRate;
+    double mDownloadByteRate;
+    int64_t mTotalBytes;
+    int64_t mDownloadBytePosition;
+    int64_t mPlaybackByteOffset;
+    bool mDownloadByteRateReliable;
+    bool mPlaybackByteRateReliable;
+
+    bool CanPlayThrough() const;
+    nsCString ToString() const;
+  };
+
+  void DownloadProgressed();
+
+  already_AddRefed<MediaDecoderStateMachineBase> CreateStateMachine() override;
+
+  nsresult Load(BaseMediaResource* aOriginal);
+
+  void NotifyDownloadEnded(nsresult aStatus);
+
+  void NotifyBytesConsumed(int64_t aBytes, int64_t aOffset);
+
+  bool CanPlayThroughImpl() final;
+
+  struct PlaybackRateInfo {
+    uint32_t mRate;  
+    bool mReliable;  
+  };
+
+  static PlaybackRateInfo UpdateResourceOfPlaybackByteRate(
+      const MediaChannelStatistics& aStats, BaseMediaResource* aResource,
+      const media::TimeUnit& aDuration);
+
+  bool ShouldThrottleDownload(const MediaStatistics& aStats);
+
+  MediaChannelStatistics mPlaybackStatistics;
+
+  int64_t mPlaybackByteOffset = 0;
+
+  bool mCanPlayThrough = false;
+
+  bool mInitialChannelPrincipalKnown = false;
+
+  RefPtr<GenericPromise> mResourceClosePromise;
+};
+
+}  
+
+#endif  // ChannelMediaDecoder_h_

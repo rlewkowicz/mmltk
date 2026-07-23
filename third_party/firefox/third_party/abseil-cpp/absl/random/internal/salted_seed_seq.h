@@ -1,0 +1,135 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_RANDOM_INTERNAL_SALTED_SEED_SEQ_H_
+#define ABSL_RANDOM_INTERNAL_SALTED_SEED_SEQ_H_
+
+#include <cstdint>
+#include <cstdlib>
+#include <initializer_list>
+#include <iterator>
+#include <memory>
+#include <optional>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "absl/container/inlined_vector.h"
+#include "absl/meta/type_traits.h"
+#include "absl/random/internal/seed_material.h"
+#include "absl/types/optional.h"
+#include "absl/types/span.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace random_internal {
+
+template <typename SSeq>
+class SaltedSeedSeq {
+ public:
+  using inner_sequence_type = SSeq;
+  using result_type = typename SSeq::result_type;
+
+  SaltedSeedSeq() : seq_(std::make_unique<SSeq>()) {}
+
+  template <typename Iterator>
+  SaltedSeedSeq(Iterator begin, Iterator end)
+      : seq_(std::make_unique<SSeq>(begin, end)) {}
+
+  template <typename T>
+  SaltedSeedSeq(std::initializer_list<T> il)
+      : SaltedSeedSeq(il.begin(), il.end()) {}
+
+  SaltedSeedSeq(const SaltedSeedSeq&) = delete;
+  SaltedSeedSeq& operator=(const SaltedSeedSeq&) = delete;
+
+  SaltedSeedSeq(SaltedSeedSeq&&) = default;
+  SaltedSeedSeq& operator=(SaltedSeedSeq&&) = default;
+
+  template <typename RandomAccessIterator>
+  void generate(RandomAccessIterator begin, RandomAccessIterator end) {
+    using U = typename std::iterator_traits<RandomAccessIterator>::value_type;
+
+    using TagType = std::conditional_t<
+        (std::is_same_v<U, uint32_t> &&
+         (std::is_pointer_v<RandomAccessIterator> ||
+          std::is_same_v<RandomAccessIterator,
+                         typename std::vector<U>::iterator>)),
+        ContiguousAndUint32Tag, DefaultTag>;
+    if (begin != end) {
+      generate_impl(TagType{}, begin, end, std::distance(begin, end));
+    }
+  }
+
+  template <typename OutIterator>
+  void param(OutIterator out) const {
+    seq_->param(out);
+  }
+
+  size_t size() const { return seq_->size(); }
+
+ private:
+  struct ContiguousAndUint32Tag {};
+  struct DefaultTag {};
+
+  template <typename Contiguous>
+  void generate_impl(ContiguousAndUint32Tag, Contiguous begin, Contiguous end,
+                     size_t n) {
+    seq_->generate(begin, end);
+    const uint32_t salt = absl::random_internal::GetSaltMaterial().value_or(0);
+    auto span = absl::Span<uint32_t>(&*begin, n);
+    MixIntoSeedMaterial(absl::MakeConstSpan(&salt, 1), span);
+  }
+
+  template <typename RandomAccessIterator>
+  void generate_impl(DefaultTag, RandomAccessIterator begin,
+                     RandomAccessIterator, size_t n) {
+    absl::InlinedVector<uint32_t, 8> data(n, 0);
+    generate_impl(ContiguousAndUint32Tag{}, data.begin(), data.end(), n);
+    std::copy(data.begin(), data.end(), begin);
+  }
+
+  std::unique_ptr<SSeq> seq_;
+};
+
+template <typename T, typename = void>
+struct is_salted_seed_seq : public std::false_type {};
+
+template <typename T>
+struct is_salted_seed_seq<
+    T, std::enable_if_t<
+           std::is_same_v<T, SaltedSeedSeq<typename T::inner_sequence_type>>>>
+    : public std::true_type {};
+
+template <
+    typename SSeq,  
+    typename EnableIf = std::enable_if_t<is_salted_seed_seq<SSeq>::value>>
+SSeq MakeSaltedSeedSeq(SSeq&& seq) {
+  return SSeq(std::forward<SSeq>(seq));
+}
+
+template <
+    typename SSeq,  
+    typename EnableIf = std::enable_if_t<!is_salted_seed_seq<SSeq>::value>>
+SaltedSeedSeq<std::decay_t<SSeq>> MakeSaltedSeedSeq(SSeq&& seq) {
+  using sseq_type = std::decay_t<SSeq>;
+  using result_type = typename sseq_type::result_type;
+
+  absl::InlinedVector<result_type, 8> data;
+  seq.param(std::back_inserter(data));
+  return SaltedSeedSeq<sseq_type>(data.begin(), data.end());
+}
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_RANDOM_INTERNAL_SALTED_SEED_SEQ_H_

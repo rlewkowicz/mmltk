@@ -1,0 +1,605 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsDocShellLoadState_h_
+#define nsDocShellLoadState_h_
+
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/NavigationBinding.h"
+#include "mozilla/dom/SessionHistoryEntry.h"
+#include "mozilla/dom/UserNavigationInvolvement.h"
+#include "mozilla/dom/LoadURIOptionsBinding.h"
+
+#include "nsIClassifiedChannel.h"
+#include "nsILoadInfo.h"
+
+#include "mozilla/Maybe.h"
+#include "nsCOMPtr.h"
+#include "nsString.h"
+#include "nsDocShellLoadTypes.h"
+#include "nsTArrayForwardDeclare.h"
+
+class nsIInputStream;
+class nsIURI;
+class nsIDocShell;
+class nsIChannel;
+class nsIReferrerInfo;
+struct HTTPSFirstDowngradeData;
+namespace mozilla {
+class OriginAttributes;
+namespace net {
+class DocumentLoadListener;
+}
+namespace dom {
+class FormData;
+class DocShellLoadStateInit;
+struct NavigationAPIMethodTracker;
+class SessionHistoryEntry;
+}  
+}  
+
+class nsDocShellLoadState final {
+  using BrowsingContext = mozilla::dom::BrowsingContext;
+  template <typename T>
+  using MaybeDiscarded = mozilla::dom::MaybeDiscarded<T>;
+  using SessionHistoryEntry = mozilla::dom::SessionHistoryEntry;
+
+ public:
+  NS_INLINE_DECL_REFCOUNTING(nsDocShellLoadState);
+
+  explicit nsDocShellLoadState(nsIURI* aURI);
+  explicit nsDocShellLoadState(
+      const mozilla::dom::DocShellLoadStateInit& aLoadState,
+      mozilla::ipc::IProtocol* aActor, bool* aReadSuccess);
+  explicit nsDocShellLoadState(const nsDocShellLoadState& aOther);
+  nsDocShellLoadState(nsIURI* aURI, uint64_t aLoadIdentifier);
+
+  static nsresult CreateFromPendingChannel(nsIChannel* aPendingChannel,
+                                           uint64_t aLoadIdentifier,
+                                           uint64_t aRegistarId,
+                                           nsDocShellLoadState** aResult);
+
+  static nsresult CreateFromLoadURIOptions(
+      BrowsingContext* aBrowsingContext, const nsAString& aURI,
+      const mozilla::dom::LoadURIOptions& aLoadURIOptions,
+      nsDocShellLoadState** aResult);
+  static nsresult CreateFromLoadURIOptions(
+      BrowsingContext* aBrowsingContext, nsIURI* aURI,
+      const mozilla::dom::LoadURIOptions& aLoadURIOptions,
+      nsDocShellLoadState** aResult);
+
+
+  nsIReferrerInfo* GetReferrerInfo() const;
+
+  void SetReferrerInfo(nsIReferrerInfo* aReferrerInfo);
+
+  nsIURI* URI() const;
+
+  void SetURI(nsIURI* aURI);
+
+  nsIURI* OriginalURI() const;
+
+  void SetOriginalURI(nsIURI* aOriginalURI);
+
+  nsIURI* ResultPrincipalURI() const;
+
+  void SetResultPrincipalURI(nsIURI* aResultPrincipalURI);
+
+  bool ResultPrincipalURIIsSome() const;
+
+  void SetResultPrincipalURIIsSome(bool aIsSome);
+
+  bool KeepResultPrincipalURIIfSet() const;
+
+  void SetKeepResultPrincipalURIIfSet(bool aKeep);
+
+  nsIPrincipal* PrincipalToInherit() const;
+
+  void SetPrincipalToInherit(nsIPrincipal* aPrincipalToInherit);
+
+  nsIPrincipal* PartitionedPrincipalToInherit() const;
+
+  void SetPartitionedPrincipalToInherit(
+      nsIPrincipal* aPartitionedPrincipalToInherit);
+
+  bool LoadReplace() const;
+
+  void SetLoadReplace(bool aLoadReplace);
+
+  nsIPrincipal* TriggeringPrincipal() const;
+
+  void SetTriggeringPrincipal(nsIPrincipal* aTriggeringPrincipal);
+
+  uint32_t TriggeringSandboxFlags() const;
+
+  void SetTriggeringSandboxFlags(uint32_t aTriggeringSandboxFlags);
+
+  uint64_t TriggeringWindowId() const;
+
+  void SetTriggeringWindowId(uint64_t aTriggeringWindowId);
+
+  bool TriggeringStorageAccess() const;
+
+  void SetTriggeringStorageAccess(bool aTriggeringStorageAccess);
+
+  mozilla::net::ClassificationFlags TriggeringClassificationFlags() const;
+  void SetTriggeringClassificationFlags(
+      mozilla::net::ClassificationFlags aFlags);
+
+  nsIPolicyContainer* PolicyContainer() const;
+
+  void SetPolicyContainer(nsIPolicyContainer* aPolicyContainer);
+
+  bool InheritPrincipal() const;
+
+  void SetInheritPrincipal(bool aInheritPrincipal);
+
+  bool PrincipalIsExplicit() const;
+
+  void SetPrincipalIsExplicit(bool aPrincipalIsExplicit);
+
+  bool NotifiedBeforeUnloadListeners() const;
+
+  void SetNotifiedBeforeUnloadListeners(bool aNotifiedBeforeUnloadListeners);
+
+  bool ForceAllowDataURI() const;
+
+  void SetForceAllowDataURI(bool aForceAllowDataURI);
+
+  bool IsExemptFromHTTPSFirstMode() const;
+
+  void SetIsExemptFromHTTPSFirstMode(bool aIsExemptFromHTTPSFirstMode);
+
+  RefPtr<HTTPSFirstDowngradeData> GetHttpsFirstDowngradeData() const;
+
+  void SetHttpsFirstDowngradeData(
+      RefPtr<HTTPSFirstDowngradeData> const& aHttpsFirstTelemetryData);
+
+  bool OriginalFrameSrc() const;
+
+  void SetOriginalFrameSrc(bool aOriginalFrameSrc);
+
+  bool ShouldCheckForRecursion() const;
+
+  void SetShouldCheckForRecursion(bool aShouldCheckForRecursion);
+
+  bool IsFormSubmission() const;
+
+  void SetIsFormSubmission(bool aIsFormSubmission);
+
+  bool NeedsCompletelyLoadedDocument() const;
+
+  void SetNeedsCompletelyLoadedDocument(bool aNeedsCompletelyLoadedDocument);
+
+  mozilla::Maybe<mozilla::dom::NavigationHistoryBehavior> HistoryBehavior()
+      const;
+
+  void SetHistoryBehavior(
+      mozilla::dom::NavigationHistoryBehavior aHistoryBehavior);
+
+  void ResetHistoryBehavior();
+
+  uint32_t LoadType() const;
+
+  void SetLoadType(uint32_t aLoadType);
+
+  mozilla::dom::UserNavigationInvolvement UserNavigationInvolvement() const;
+
+  void SetUserNavigationInvolvement(
+      mozilla::dom::UserNavigationInvolvement aUserNavigationInvolvement);
+
+  SessionHistoryEntry* SHEntry() const;
+
+  void SetSHEntry(SessionHistoryEntry* aSHEntry);
+
+  void SetPreviousEntryForActivation(nsISHEntry* aSHEntry);
+  void SetPreviousEntryForActivation(
+      const mozilla::Maybe<mozilla::dom::PreviousSessionHistoryInfo>& aInfo);
+
+  const mozilla::dom::LoadingSessionHistoryInfo* GetLoadingSessionHistoryInfo()
+      const;
+
+  void SetLoadingSessionHistoryInfo(
+      const mozilla::dom::LoadingSessionHistoryInfo& aLoadingInfo);
+
+  void SetLoadingSessionHistoryInfo(
+      mozilla::UniquePtr<mozilla::dom::LoadingSessionHistoryInfo> aLoadingInfo);
+
+  bool LoadIsFromSessionHistory() const;
+
+  const nsString& Target() const;
+
+  void SetTarget(const nsAString& aTarget);
+
+  nsIInputStream* PostDataStream() const;
+
+  void SetPostDataStream(nsIInputStream* aStream);
+
+  nsIInputStream* HeadersStream() const;
+
+  void SetHeadersStream(nsIInputStream* aHeadersStream);
+
+  bool IsSrcdocLoad() const;
+
+  const nsString& SrcdocData() const;
+
+  void SetSrcdocData(const nsAString& aSrcdocData);
+
+  const MaybeDiscarded<BrowsingContext>& SourceBrowsingContext() const {
+    return mSourceBrowsingContext;
+  }
+
+  void SetSourceBrowsingContext(BrowsingContext*);
+
+  void SetAllowFocusMove(bool aAllow) { mAllowFocusMove = aAllow; }
+
+  bool AllowFocusMove() const { return mAllowFocusMove; }
+
+  const MaybeDiscarded<BrowsingContext>& TargetBrowsingContext() const {
+    return mTargetBrowsingContext;
+  }
+
+  void SetTargetBrowsingContext(BrowsingContext* aTargetBrowsingContext);
+
+  nsIURI* BaseURI() const;
+
+  void SetBaseURI(nsIURI* aBaseURI);
+
+  void GetMaybeResultPrincipalURI(
+      mozilla::Maybe<nsCOMPtr<nsIURI>>& aRPURI) const;
+
+  void SetMaybeResultPrincipalURI(
+      mozilla::Maybe<nsCOMPtr<nsIURI>> const& aRPURI);
+
+  uint32_t LoadFlags() const;
+
+  void SetLoadFlags(uint32_t aFlags);
+
+  void SetLoadFlag(uint32_t aFlag);
+
+  void UnsetLoadFlag(uint32_t aFlag);
+
+  bool HasLoadFlags(uint32_t aFlag);
+
+  uint32_t InternalLoadFlags() const;
+
+  void SetInternalLoadFlags(uint32_t aFlags);
+
+  void SetInternalLoadFlag(uint32_t aFlag);
+
+  void UnsetInternalLoadFlag(uint32_t aFlag);
+
+  bool HasInternalLoadFlags(uint32_t aFlag);
+
+  bool FirstParty() const;
+
+  void SetFirstParty(bool aFirstParty);
+
+  bool HasValidUserGestureActivation() const;
+
+  void SetHasValidUserGestureActivation(bool HasValidUserGestureActivation);
+
+  void SetTextDirectiveUserActivation(bool aTextDirectiveUserActivation);
+
+  bool GetTextDirectiveUserActivation();
+
+  const nsCString& TypeHint() const;
+
+  void SetTypeHint(const nsCString& aTypeHint);
+
+  const nsString& FileName() const;
+
+  void SetFileName(const nsAString& aFileName);
+
+  nsIURI* GetUnstrippedURI() const;
+
+  void SetUnstrippedURI(nsIURI* aUnstrippedURI);
+
+  nsresult SetupInheritingPrincipal(
+      mozilla::dom::BrowsingContext::Type aType,
+      const mozilla::OriginAttributes& aOriginAttributes);
+
+  nsresult SetupTriggeringPrincipal(
+      const mozilla::OriginAttributes& aOriginAttributes);
+
+  void SetIsFromProcessingFrameAttributes() {
+    mIsFromProcessingFrameAttributes = true;
+  }
+  bool GetIsFromProcessingFrameAttributes() const {
+    return mIsFromProcessingFrameAttributes;
+  }
+
+  nsIChannel* GetPendingRedirectedChannel() {
+    return mPendingRedirectedChannel;
+  }
+
+  uint64_t GetPendingRedirectChannelRegistrarId() const {
+    return mChannelRegistrarId;
+  }
+
+  void SetOriginalURIString(const nsCString& aOriginalURI) {
+    mOriginalURIString.emplace(aOriginalURI);
+  }
+  const mozilla::Maybe<nsCString>& GetOriginalURIString() const {
+    return mOriginalURIString;
+  }
+
+  void SetCancelContentJSEpoch(int32_t aCancelEpoch) {
+    mCancelContentJSEpoch.emplace(aCancelEpoch);
+  }
+  const mozilla::Maybe<int32_t>& GetCancelContentJSEpoch() const {
+    return mCancelContentJSEpoch;
+  }
+
+  uint64_t GetLoadIdentifier() const { return mLoadIdentifier; }
+
+  void SetSpeculativeListener(mozilla::net::DocumentLoadListener* aListener);
+  already_AddRefed<mozilla::net::DocumentLoadListener>
+  TakeSpeculativeListener();
+
+  void SetIsMetaRefresh(bool aMetaRefresh) { mIsMetaRefresh = aMetaRefresh; }
+
+  bool IsMetaRefresh() const { return mIsMetaRefresh; }
+
+  const mozilla::Maybe<nsCString>& GetRemoteTypeOverride() const {
+    return mRemoteTypeOverride;
+  }
+
+  void SetRemoteTypeOverride(const nsCString& aRemoteTypeOverride);
+
+  void SetSchemelessInput(nsILoadInfo::SchemelessInputType aSchemelessInput) {
+    mSchemelessInput = aSchemelessInput;
+  }
+
+  nsILoadInfo::SchemelessInputType GetSchemelessInput() {
+    return mSchemelessInput;
+  }
+
+  void SetForceMediaDocument(
+      mozilla::dom::ForceMediaDocument aForceMediaDocument) {
+    mForceMediaDocument = aForceMediaDocument;
+  }
+
+  mozilla::dom::ForceMediaDocument GetForceMediaDocument() const {
+    return mForceMediaDocument;
+  }
+
+  void SetHttpsUpgradeTelemetry(
+      nsILoadInfo::HTTPSUpgradeTelemetryType aHttpsUpgradeTelemetry) {
+    mHttpsUpgradeTelemetry = aHttpsUpgradeTelemetry;
+  }
+
+  nsILoadInfo::HTTPSUpgradeTelemetryType GetHttpsUpgradeTelemetry() {
+    return mHttpsUpgradeTelemetry;
+  }
+
+  const nsCString& GetEffectiveTriggeringRemoteType() const;
+
+  void SetTriggeringRemoteType(const nsACString& aTriggeringRemoteType);
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  void AssertProcessCouldTriggerLoadIfSystem();
+#else
+  void AssertProcessCouldTriggerLoadIfSystem() {}
+#endif
+
+  void CalculateLoadURIFlags();
+
+  nsLoadFlags CalculateChannelLoadFlags(
+      mozilla::dom::BrowsingContext* aBrowsingContext, bool aUriModified,
+      mozilla::Maybe<bool> aIsEmbeddingBlockedError);
+
+  mozilla::dom::DocShellLoadStateInit Serialize(
+      mozilla::ipc::IProtocol* aActor);
+
+  void SetLoadIsFromSessionHistory(int32_t aOffset, bool aLoadingCurrentEntry);
+  void ClearLoadIsFromSessionHistory();
+
+  void MaybeStripTrackerQueryStrings(mozilla::dom::BrowsingContext* aContext);
+
+  void SetSourceElement(mozilla::dom::Element* aElement);
+  already_AddRefed<mozilla::dom::Element> GetSourceElement() const;
+  bool HasSourceElement() const {
+    return mSourceElement && mSourceElement->IsAlive();
+  }
+
+  nsIStructuredCloneContainer* GetNavigationAPIState() const;
+  void SetNavigationAPIState(nsIStructuredCloneContainer* aNavigationAPIState);
+
+  mozilla::dom::NavigationAPIMethodTracker* GetNavigationAPIMethodTracker()
+      const;
+  void SetNavigationAPIMethodTracker(
+      mozilla::dom::NavigationAPIMethodTracker* aTracker);
+
+  mozilla::dom::NavigationType GetNavigationType() const;
+
+  mozilla::dom::FormData* GetFormDataEntryList();
+  void SetFormDataEntryList(mozilla::dom::FormData* aFormDataEntryList);
+
+  uint32_t GetAppLinkLaunchType() const;
+  void SetAppLinkLaunchType(uint32_t aAppLinkLaunchType);
+
+  bool GetIsCaptivePortalTab() const;
+  void SetIsCaptivePortalTab(bool aIsCaptivePortalTab);
+
+  void ProhibitInitialAboutBlankHandling() {
+    mIsInitialAboutBlankHandlingProhibited = true;
+  }
+  bool IsInitialAboutBlankHandlingProhibited() {
+    return mIsInitialAboutBlankHandlingProhibited;
+  }
+
+  void SetIsResumingInterceptedNavigation(
+      bool aIsResumingInterceptedNavigation) {
+    mIsResumingInterceptedNavigation = aIsResumingInterceptedNavigation;
+  }
+
+  bool IsResumingInterceptedNavigation() const {
+    return mIsResumingInterceptedNavigation;
+  }
+
+  bool HasComputedNamedTargetBrowsingContext() const {
+    return mHasComputedNamedTargetBrowsingContext;
+  }
+  void SetHasComputedNamedTargetBrowsingContext(bool aValue) {
+    mHasComputedNamedTargetBrowsingContext = aValue;
+  }
+
+ protected:
+  ~nsDocShellLoadState();
+
+  const char* ValidateWithOriginalState(nsDocShellLoadState* aOriginalState);
+
+  static nsresult CreateFromLoadURIOptions(
+      BrowsingContext* aBrowsingContext, nsIURI* aURI,
+      const mozilla::dom::LoadURIOptions& aLoadURIOptions,
+      uint32_t aLoadFlagsOverride, nsIInputStream* aPostDataOverride,
+      nsDocShellLoadState** aResult);
+
+  nsCOMPtr<nsIReferrerInfo> mReferrerInfo;
+
+  nsCOMPtr<nsIURI> mURI;
+
+  nsCOMPtr<nsIURI> mOriginalURI;
+
+  nsCOMPtr<nsIURI> mResultPrincipalURI;
+  bool mResultPrincipalURIIsSome;
+
+  nsCOMPtr<nsIPrincipal> mTriggeringPrincipal;
+
+  uint32_t mTriggeringSandboxFlags;
+
+  uint64_t mTriggeringWindowId;
+  bool mTriggeringStorageAccess;
+
+  mozilla::net::ClassificationFlags mTriggeringClassificationFlags;
+
+  nsCOMPtr<nsIPolicyContainer> mPolicyContainer;
+
+  bool mKeepResultPrincipalURIIfSet;
+
+  bool mLoadReplace;
+
+  bool mInheritPrincipal;
+
+  bool mPrincipalIsExplicit;
+
+  bool mNotifiedBeforeUnloadListeners;
+
+
+  nsCOMPtr<nsIPrincipal> mPrincipalToInherit;
+
+  nsCOMPtr<nsIPrincipal> mPartitionedPrincipalToInherit;
+
+  bool mForceAllowDataURI;
+
+  bool mIsExemptFromHTTPSFirstMode;
+
+  RefPtr<HTTPSFirstDowngradeData> mHttpsFirstDowngradeData;
+
+  bool mOriginalFrameSrc;
+
+  bool mShouldCheckForRecursion;
+
+  bool mIsFormSubmission;
+
+  bool mNeedsCompletelyLoadedDocument;
+
+  mozilla::Maybe<mozilla::dom::NavigationHistoryBehavior> mHistoryBehavior;
+
+  uint32_t mLoadType;
+
+  mozilla::dom::UserNavigationInvolvement mUserNavigationInvolvement =
+      mozilla::dom::UserNavigationInvolvement::None;
+
+  RefPtr<SessionHistoryEntry> mSHEntry;
+
+  mozilla::UniquePtr<mozilla::dom::LoadingSessionHistoryInfo>
+      mLoadingSessionHistoryInfo;
+
+  nsString mTarget;
+
+  MaybeDiscarded<BrowsingContext> mTargetBrowsingContext;
+
+  nsCOMPtr<nsIInputStream> mPostDataStream;
+
+  nsCOMPtr<nsIInputStream> mHeadersStream;
+
+  nsString mSrcdocData;
+
+  MaybeDiscarded<BrowsingContext> mSourceBrowsingContext;
+
+  nsCOMPtr<nsIURI> mBaseURI;
+
+  uint32_t mLoadFlags;
+
+  uint32_t mInternalLoadFlags;
+
+  bool mFirstParty;
+
+  bool mHasValidUserGestureActivation;
+
+  bool mTextDirectiveUserActivation = false;
+
+  bool mAllowFocusMove;
+
+  nsCString mTypeHint;
+
+  nsString mFileName;
+
+  bool mIsFromProcessingFrameAttributes;
+
+  bool mHasComputedNamedTargetBrowsingContext = false;
+
+  nsCOMPtr<nsIChannel> mPendingRedirectedChannel;
+
+  mozilla::Maybe<nsCString> mOriginalURIString;
+
+  mozilla::Maybe<int32_t> mCancelContentJSEpoch;
+
+  uint64_t mChannelRegistrarId;
+
+  const uint64_t mLoadIdentifier;
+
+  RefPtr<mozilla::net::DocumentLoadListener> mSpeculativeListener;
+
+  bool mHasSpeculativeListener = false;
+
+  bool mIsMetaRefresh;
+
+  bool mWasCreatedRemotely = false;
+
+  nsCOMPtr<nsIURI> mUnstrippedURI;
+
+  mozilla::Maybe<nsCString> mRemoteTypeOverride;
+
+  nsCString mTriggeringRemoteType;
+
+  nsILoadInfo::SchemelessInputType mSchemelessInput =
+      nsILoadInfo::SchemelessInputTypeUnset;
+
+  mozilla::dom::ForceMediaDocument mForceMediaDocument =
+      mozilla::dom::ForceMediaDocument::None;
+
+  nsILoadInfo::HTTPSUpgradeTelemetryType mHttpsUpgradeTelemetry =
+      nsILoadInfo::NOT_INITIALIZED;
+
+  nsWeakPtr mSourceElement;
+
+  RefPtr<nsStructuredCloneContainer> mNavigationAPIState;
+
+  RefPtr<mozilla::dom::NavigationAPIMethodTracker> mNavigationAPIMethodTracker;
+
+  RefPtr<mozilla::dom::FormData> mFormDataEntryList;
+
+  uint32_t mAppLinkLaunchType = 0;
+
+  bool mIsCaptivePortalTab = false;
+
+  bool mIsInitialAboutBlankHandlingProhibited;
+
+  bool mIsResumingInterceptedNavigation = false;
+};
+
+#endif /* nsDocShellLoadState_h_ */

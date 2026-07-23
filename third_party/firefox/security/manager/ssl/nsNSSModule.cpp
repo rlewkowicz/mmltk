@@ -1,0 +1,78 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsNSSModule.h"
+
+#include "mozilla/ModuleUtils.h"
+#include "mozilla/SyncRunnable.h"
+#include "nsCertTree.h"
+#include "nsNSSCertificateDB.h"
+#include "nsRandomGenerator.h"
+#include "nsXULAppAPI.h"
+
+namespace mozilla {
+namespace psm {
+
+
+template <class InstanceClass, nsresult (InstanceClass::*InitMethod)()>
+MOZ_ALWAYS_INLINE static nsresult Instantiate(REFNSIID aIID, void** aResult) {
+  InstanceClass* inst = new InstanceClass();
+  NS_ADDREF(inst);
+  nsresult rv = InitMethod != nullptr ? (inst->*InitMethod)() : NS_OK;
+  if (NS_SUCCEEDED(rv)) {
+    rv = inst->QueryInterface(aIID, aResult);
+  }
+  NS_RELEASE(inst);
+  return rv;
+}
+
+enum class ThreadRestriction {
+  MainThreadOnly,
+  AnyThread,
+};
+
+enum class ProcessRestriction {
+  ParentProcessOnly,
+  AnyProcess,
+};
+
+template <class InstanceClass,
+          nsresult (InstanceClass::*InitMethod)() = nullptr,
+          ProcessRestriction processRestriction =
+              ProcessRestriction::ParentProcessOnly,
+          ThreadRestriction threadRestriction = ThreadRestriction::AnyThread>
+static nsresult Constructor(REFNSIID aIID, void** aResult) {
+  *aResult = nullptr;
+
+  if (processRestriction == ProcessRestriction::ParentProcessOnly &&
+      !XRE_IsParentProcess()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  if (!EnsureNSSInitializedChromeOrContent()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (threadRestriction == ThreadRestriction::MainThreadOnly &&
+      !NS_IsMainThread()) {
+    return NS_ERROR_NOT_SAME_THREAD;
+  }
+
+  return Instantiate<InstanceClass, InitMethod>(aIID, aResult);
+}
+
+#define IMPL(type, ...)                                              \
+  template <>                                                        \
+  nsresult NSSConstructor<type>(const nsIID& aIID, void** aResult) { \
+    return Constructor<type, __VA_ARGS__>(aIID, aResult);            \
+  }
+
+IMPL(nsNSSCertificateDB, nullptr)
+IMPL(nsCertTree, nullptr)
+IMPL(nsRandomGenerator, nullptr, ProcessRestriction::AnyProcess)
+#undef IMPL
+
+}  
+}  

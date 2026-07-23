@@ -1,0 +1,34 @@
+
+[package]
+edition = "2018"
+rust-version = "1.31"
+name = "rustversion"
+version = "1.0.19"
+authors = ["David Tolnay <dtolnay@gmail.com>"]
+build = "build/build.rs"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Conditional compilation according to rustc compiler version"
+documentation = "https://docs.rs/rustversion"
+categories = [
+    "development-tools::build-utils",
+    "no-std",
+    "no-std::no-alloc",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dtolnay/rustversion"
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--generate-link-to-definition"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[lib]
+name = "rustversion"
+path = "src/lib.rs"
+proc-macro = true

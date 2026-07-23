@@ -1,0 +1,73 @@
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
+
+#ifndef SPA_PARAM_H
+#define SPA_PARAM_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+
+#include <spa/utils/defs.h>
+
+enum spa_param_type {
+	SPA_PARAM_Invalid,		
+	SPA_PARAM_PropInfo,		
+	SPA_PARAM_Props,		
+	SPA_PARAM_EnumFormat,		
+	SPA_PARAM_Format,		
+	SPA_PARAM_Buffers,		
+	SPA_PARAM_Meta,			
+	SPA_PARAM_IO,			
+	SPA_PARAM_EnumProfile,		
+	SPA_PARAM_Profile,		
+	SPA_PARAM_EnumPortConfig,	
+	SPA_PARAM_PortConfig,		
+	SPA_PARAM_EnumRoute,		
+	SPA_PARAM_Route,		
+	SPA_PARAM_Control,		
+	SPA_PARAM_Latency,		
+	SPA_PARAM_ProcessLatency,	
+	SPA_PARAM_Tag,			
+};
+
+struct spa_param_info {
+	uint32_t id;			
+#define SPA_PARAM_INFO_SERIAL		(1<<0)	/**< bit to signal update even when the
+						 *   read/write flags don't change */
+#define SPA_PARAM_INFO_READ		(1<<1)
+#define SPA_PARAM_INFO_WRITE		(1<<2)
+#define SPA_PARAM_INFO_READWRITE	(SPA_PARAM_INFO_WRITE|SPA_PARAM_INFO_READ)
+	uint32_t flags;
+	uint32_t user;			
+	int32_t seq;			
+	uint32_t padding[4];
+};
+
+#define SPA_PARAM_INFO(id,flags) ((struct spa_param_info){ (id), (flags) })
+
+enum spa_param_bitorder {
+	SPA_PARAM_BITORDER_unknown,	
+	SPA_PARAM_BITORDER_msb,		
+	SPA_PARAM_BITORDER_lsb,		
+};
+
+enum spa_param_availability {
+	SPA_PARAM_AVAILABILITY_unknown,	
+	SPA_PARAM_AVAILABILITY_no,	
+	SPA_PARAM_AVAILABILITY_yes,	
+};
+
+#include <spa/param/buffers.h>
+#include <spa/param/profile.h>
+#include <spa/param/port-config.h>
+#include <spa/param/route.h>
+
+
+#ifdef __cplusplus
+}  
+#endif
+
+#endif /* SPA_PARAM_H */

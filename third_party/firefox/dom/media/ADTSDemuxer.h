@@ -1,0 +1,109 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ADTS_DEMUXER_H_
+#define ADTS_DEMUXER_H_
+
+#include "Adts.h"
+#include "MediaDataDemuxer.h"
+#include "MediaResource.h"
+
+namespace mozilla {
+
+class ADTSTrackDemuxer;
+
+DDLoggedTypeDeclNameAndBase(ADTSDemuxer, MediaDataDemuxer);
+
+class ADTSDemuxer : public MediaDataDemuxer,
+                    public DecoderDoctorLifeLogger<ADTSDemuxer> {
+ public:
+  explicit ADTSDemuxer(MediaResource* aSource);
+  RefPtr<InitPromise> Init() override;
+  uint32_t GetNumberTracks(TrackInfo::TrackType aType) const override;
+  already_AddRefed<MediaTrackDemuxer> GetTrackDemuxer(
+      TrackInfo::TrackType aType, uint32_t aTrackNumber) override;
+  bool IsSeekable() const override;
+
+  static bool ADTSSniffer(const uint8_t* aData, const uint32_t aLength);
+
+ private:
+  bool InitInternal();
+
+  RefPtr<MediaResource> mSource;
+  RefPtr<ADTSTrackDemuxer> mTrackDemuxer;
+};
+
+DDLoggedTypeNameAndBase(ADTSTrackDemuxer, MediaTrackDemuxer);
+
+class ADTSTrackDemuxer : public MediaTrackDemuxer,
+                         public DecoderDoctorLifeLogger<ADTSTrackDemuxer> {
+ public:
+  explicit ADTSTrackDemuxer(MediaResource* aSource);
+
+  bool Init();
+
+  int64_t StreamLength() const;
+
+  media::TimeUnit Duration() const;
+
+  media::TimeUnit Duration(int64_t aNumFrames) const;
+
+  UniquePtr<TrackInfo> GetInfo() const override;
+  RefPtr<SeekPromise> Seek(const media::TimeUnit& aTime) override;
+  RefPtr<SamplesPromise> GetSamples(int32_t aNumSamples = 1) override;
+  void Reset() override;
+  RefPtr<SkipAccessPointPromise> SkipToNextRandomAccessPoint(
+      const media::TimeUnit& aTimeThreshold) override;
+  int64_t GetResourceOffset() const override;
+  media::TimeIntervals GetBuffered() override;
+
+ private:
+  ~ADTSTrackDemuxer();
+
+  media::TimeUnit FastSeek(const media::TimeUnit& aTime);
+
+  media::TimeUnit ScanUntil(const media::TimeUnit& aTime);
+
+  const ADTS::Frame& FindNextFrame(bool findFirstFrame = false);
+
+  bool SkipNextFrame(const ADTS::Frame& aFrame);
+
+  already_AddRefed<MediaRawData> GetNextFrame(const ADTS::Frame& aFrame);
+
+  void UpdateState(const ADTS::Frame& aFrame);
+
+  int64_t FrameIndexFromOffset(uint64_t aOffset) const;
+
+  int64_t FrameIndexFromTime(const media::TimeUnit& aTime) const;
+
+  uint32_t Read(uint8_t* aBuffer, int64_t aOffset, int32_t aSize);
+
+  double AverageFrameLength() const;
+
+  MediaResourceIndex mSource;
+
+  ADTS::FrameParser* mParser;
+
+  uint64_t mOffset;
+
+  uint64_t mNumParsedFrames;
+
+  int64_t mFrameIndex;
+
+  uint64_t mTotalFrameLen;
+
+  uint32_t mSamplesPerFrame;
+
+  uint32_t mSamplesPerSecond;
+
+  uint32_t mChannels;
+
+  UniquePtr<AudioInfo> mInfo;
+
+  media::TimeUnit mPreRoll;
+};
+
+}  
+
+#endif  // !ADTS_DEMUXER_H_

@@ -1,0 +1,88 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef SwipeTracker_h
+#define SwipeTracker_h
+
+#include "EventForwards.h"
+#include "mozilla/layers/AxisPhysicsMSDModel.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/TimeStamp.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsRefreshObservers.h"
+#include "Units.h"
+
+class nsIWidget;
+class nsRefreshDriver;
+
+namespace mozilla {
+
+class PanGestureInput;
+
+class SwipeTracker final : public nsARefreshObserver {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(SwipeTracker, override)
+
+  SwipeTracker(nsIWidget& aWidget, const PanGestureInput& aSwipeStartEvent,
+               uint32_t aAllowedDirections, uint32_t aSwipeDirection);
+
+  void Destroy();
+
+  void StartTracking(const PanGestureInput& aSwipeStartEvent);
+
+  nsEventStatus ProcessEvent(const PanGestureInput& aEvent,
+                             bool aProcessingFirstEvent = false);
+  void CancelSwipe(const TimeStamp& aTimeStamp);
+
+  static WidgetSimpleGestureEvent CreateSwipeGestureEvent(
+      EventMessage aMsg, nsIWidget* aWidget,
+      const LayoutDeviceIntPoint& aPosition, const TimeStamp& aTimeStamp);
+
+  void WillRefresh(mozilla::TimeStamp aTime) override;
+
+  static bool CanTriggerSwipe(const PanGestureInput& aPanInput);
+
+ protected:
+  ~SwipeTracker();
+
+  bool SwipingInAllowedDirection() const {
+    return mAllowedDirections & mSwipeDirection;
+  }
+  double SwipeSuccessTargetValue() const;
+  double ClampToAllowedRange(double aGestureAmount) const;
+  bool ComputeSwipeSuccess() const;
+  void StartAnimating(double aStartValue, double aTargetValue);
+  void SwipeFinished(const TimeStamp& aTimeStamp);
+  void UnregisterFromRefreshDriver();
+  void SendSwipeEvent(EventMessage aMsg, uint32_t aDirection, double aDelta,
+                      const TimeStamp& aTimeStamp);
+
+  nsWeakPtr mWidget;
+  RefPtr<nsRefreshDriver> mRefreshDriver;
+  layers::AxisPhysicsMSDModel mAxis;
+  const LayoutDeviceIntPoint mEventPosition;
+  TimeStamp mLastEventTimeStamp;
+  TimeStamp mLastAnimationFrameTime;
+  const uint32_t mAllowedDirections;
+  const uint32_t mSwipeDirection;
+  double mGestureAmount = 0.0;
+  double mCurrentVelocity = 0.0;
+  bool mDeltaTypeIsPage = false;
+  bool mEventsAreControllingSwipe = true;
+  bool mEventsHaveStartedNewGesture = false;
+  bool mRegisteredWithRefreshDriver = false;
+};
+
+struct SwipeEventQueue {
+  SwipeEventQueue(uint32_t aAllowedDirections, uint64_t aInputBlockId)
+      : allowedDirections(aAllowedDirections), inputBlockId(aInputBlockId) {}
+
+  nsTArray<PanGestureInput> queuedEvents;
+  uint32_t allowedDirections;
+  uint64_t inputBlockId;
+};
+
+}  
+
+#endif  // SwipeTracker_h

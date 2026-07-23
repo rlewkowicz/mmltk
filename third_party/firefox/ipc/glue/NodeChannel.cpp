@@ -1,0 +1,234 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/ipc/NodeChannel.h"
+#include "chrome/common/ipc_message.h"
+#include "chrome/common/ipc_message_utils.h"
+#include "mojo/core/ports/name.h"
+#include "mozilla/ipc/IOThread.h"
+#include "mozilla/ipc/GeckoChildProcessHost.h"
+#include "mozilla/ipc/ProtocolMessageUtils.h"
+#include "mozilla/ipc/ProtocolUtils.h"
+#include "nsThreadUtils.h"
+#include "nsXULAppAPI.h"
+
+
+template <>
+struct IPC::ParamTraits<mozilla::ipc::NodeChannel::Introduction> {
+  using paramType = mozilla::ipc::NodeChannel::Introduction;
+  static void Write(MessageWriter* aWriter, paramType&& aParam) {
+    WriteParam(aWriter, aParam.mName);
+    WriteParam(aWriter, std::move(aParam.mHandle));
+    WriteParam(aWriter, aParam.mMyPid);
+    WriteParam(aWriter, aParam.mOtherPid);
+  }
+  static bool Read(MessageReader* aReader, paramType* aResult) {
+    return ReadParam(aReader, &aResult->mName) &&
+           ReadParam(aReader, &aResult->mHandle) &&
+           ReadParam(aReader, &aResult->mMyPid) &&
+           ReadParam(aReader, &aResult->mOtherPid);
+  }
+};
+
+namespace mozilla::ipc {
+
+NodeChannel::NodeChannel(const NodeName& aName, IPC::Channel* aChannel,
+                         Listener* aListener, base::ProcessId aPid,
+                         GeckoChildProcessHost* aChildProcessHost)
+    : mListener(aListener),
+      mName(aName),
+      mOtherPid(aPid),
+      mChannel(std::move(aChannel)),
+      mChildProcessHost(aChildProcessHost) {}
+
+NodeChannel::~NodeChannel() { Close(); }
+
+void NodeChannel::Destroy() {
+  nsISerialEventTarget* ioThread = XRE_GetAsyncIOEventTarget();
+
+  if (ioThread->IsOnCurrentThread() && MessageLoop::current() &&
+      !MessageLoop::current()->IsAcceptingTasks()) {
+    FinalDestroy();
+    return;
+  }
+
+  MOZ_ALWAYS_SUCCEEDS(ioThread->Dispatch(NewNonOwningRunnableMethod(
+      "NodeChannel::Destroy", this, &NodeChannel::FinalDestroy)));
+}
+
+void NodeChannel::FinalDestroy() {
+  AssertIOThread();
+  delete this;
+}
+
+void NodeChannel::Start() {
+  AssertIOThread();
+
+  if (!mChannel->Connect(this)) {
+    OnChannelError();
+  }
+}
+
+void NodeChannel::Close() {
+  AssertIOThread();
+
+  if (mState.exchange(State::Closed) != State::Closed) {
+    mChannel->Close();
+  }
+}
+
+void NodeChannel::SetOtherPid(base::ProcessId aNewPid) {
+  AssertIOThread();
+  MOZ_ASSERT(aNewPid != base::kInvalidProcessId);
+
+  base::ProcessId previousPid = base::kInvalidProcessId;
+  if (!mOtherPid.compare_exchange_strong(previousPid, aNewPid)) {
+    MOZ_RELEASE_ASSERT(previousPid == aNewPid,
+                       "Different sources disagree on the correct pid?");
+  }
+
+  mChannel->SetOtherPid(aNewPid);
+}
+
+
+void NodeChannel::SendEventMessage(UniquePtr<IPC::Message> aMessage) {
+  MOZ_DIAGNOSTIC_ASSERT(aMessage->type() != BROADCAST_MESSAGE_TYPE &&
+                        aMessage->type() != INTRODUCE_MESSAGE_TYPE &&
+                        aMessage->type() != REQUEST_INTRODUCTION_MESSAGE_TYPE &&
+                        aMessage->type() != ACCEPT_INVITE_MESSAGE_TYPE);
+  SendMessage(std::move(aMessage));
+}
+
+void NodeChannel::RequestIntroduction(const NodeName& aPeerName) {
+  MOZ_ASSERT(aPeerName != mojo::core::ports::kInvalidNodeName);
+  auto message = MakeUnique<IPC::Message>(MSG_ROUTING_CONTROL,
+                                          REQUEST_INTRODUCTION_MESSAGE_TYPE);
+  IPC::MessageWriter writer(*message);
+  WriteParam(&writer, aPeerName);
+  SendMessage(std::move(message));
+}
+
+void NodeChannel::Introduce(Introduction aIntroduction) {
+  auto message =
+      MakeUnique<IPC::Message>(MSG_ROUTING_CONTROL, INTRODUCE_MESSAGE_TYPE);
+  IPC::MessageWriter writer(*message);
+  WriteParam(&writer, std::move(aIntroduction));
+  SendMessage(std::move(message));
+}
+
+void NodeChannel::Broadcast(UniquePtr<IPC::Message> aMessage) {
+  MOZ_DIAGNOSTIC_ASSERT(aMessage->type() == BROADCAST_MESSAGE_TYPE,
+                        "Can only broadcast messages with the correct type");
+  SendMessage(std::move(aMessage));
+}
+
+void NodeChannel::AcceptInvite(const NodeName& aRealName,
+                               const PortName& aInitialPort) {
+  MOZ_ASSERT(aRealName != mojo::core::ports::kInvalidNodeName);
+  MOZ_ASSERT(aInitialPort != mojo::core::ports::kInvalidPortName);
+  auto message =
+      MakeUnique<IPC::Message>(MSG_ROUTING_CONTROL, ACCEPT_INVITE_MESSAGE_TYPE);
+  IPC::MessageWriter writer(*message);
+  WriteParam(&writer, aRealName);
+  WriteParam(&writer, aInitialPort);
+  SendMessage(std::move(message));
+}
+
+void NodeChannel::SendMessage(UniquePtr<IPC::Message> aMessage) {
+  if (aMessage->size() > IPC::Channel::kMaximumMessageSize) {
+    MOZ_CRASH("IPC message size is too large");
+  }
+  aMessage->AssertAsLargeAsHeader();
+
+
+  if (mState != State::Active) {
+    NS_WARNING("Dropping message as channel has been closed");
+    return;
+  }
+
+  if (!mChannel->Send(std::move(aMessage))) {
+    NS_WARNING("Call to Send() failed");
+
+    State expected = State::Active;
+    if (mState.compare_exchange_strong(expected, State::Closing)) {
+      XRE_GetAsyncIOEventTarget()->Dispatch(
+          NewRunnableMethod("NodeChannel::CloseForSendError", this,
+                            &NodeChannel::OnChannelError));
+    }
+  }
+}
+
+void NodeChannel::OnMessageReceived(UniquePtr<IPC::Message> aMessage) {
+  AssertIOThread();
+
+
+  IPC::MessageReader reader(*aMessage);
+  switch (aMessage->type()) {
+    case REQUEST_INTRODUCTION_MESSAGE_TYPE: {
+      NodeName name;
+      if (IPC::ReadParam(&reader, &name)) {
+        mListener->OnRequestIntroduction(mName, name);
+        return;
+      }
+      break;
+    }
+    case INTRODUCE_MESSAGE_TYPE: {
+      Introduction introduction;
+      if (IPC::ReadParam(&reader, &introduction)) {
+        mListener->OnIntroduce(mName, std::move(introduction));
+        return;
+      }
+      break;
+    }
+    case BROADCAST_MESSAGE_TYPE: {
+      mListener->OnBroadcast(mName, std::move(aMessage));
+      return;
+    }
+    case ACCEPT_INVITE_MESSAGE_TYPE: {
+      NodeName realName;
+      PortName initialPort;
+      if (IPC::ReadParam(&reader, &realName) &&
+          IPC::ReadParam(&reader, &initialPort)) {
+        mListener->OnAcceptInvite(mName, realName, initialPort);
+        return;
+      }
+      break;
+    }
+    case EVENT_MESSAGE_TYPE:
+    default: {
+
+      mListener->OnEventMessage(mName, std::move(aMessage));
+      return;
+    }
+  }
+
+
+  NS_WARNING("NodeChannel received a malformed message");
+  OnChannelError();
+}
+
+void NodeChannel::OnChannelConnected(base::ProcessId aPeerPid) {
+  AssertIOThread();
+
+  SetOtherPid(aPeerPid);
+
+  if (mChildProcessHost) {
+    mChildProcessHost->OnChannelConnected(aPeerPid);
+  }
+}
+
+void NodeChannel::OnChannelError() {
+  AssertIOThread();
+
+  State prev = mState.exchange(State::Closed);
+  if (prev == State::Closed) {
+    return;
+  }
+
+  mChannel->Close();
+
+  mListener->OnChannelError(mName);
+}
+
+}  

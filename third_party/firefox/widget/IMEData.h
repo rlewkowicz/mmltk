@@ -1,0 +1,823 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(mozilla_widget_IMEData_h_)
+#define mozilla_widget_IMEData_h_
+
+#include "mozilla/CheckedInt.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/EnumTypeTraits.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/NativeKeyBindingsType.h"
+
+#include "nsCOMPtr.h"
+#include "nsIURI.h"
+#include "nsPoint.h"
+#include "nsRect.h"
+#include "nsString.h"
+#include "nsXULAppAPI.h"
+#include "Units.h"
+
+class nsIWidget;
+
+namespace mozilla {
+
+class ContentSelection;
+class WritingMode;
+
+template <class T>
+class Maybe;
+
+class MOZ_STACK_CLASS PrintStringDetail : public nsAutoCString {
+ public:
+  static constexpr uint32_t kMaxLengthForCompositionString = 8;
+  static constexpr uint32_t kMaxLengthForSelectedString = 12;
+  static constexpr uint32_t kMaxLengthForEditor = 20;
+
+  PrintStringDetail() = delete;
+  explicit PrintStringDetail(const nsAString& aString,
+                             uint32_t aMaxLength = UINT32_MAX);
+  template <typename StringType>
+  explicit PrintStringDetail(const Maybe<StringType>& aMaybeString,
+                             uint32_t aMaxLength = UINT32_MAX);
+
+ private:
+  static nsCString PrintCharData(char32_t aChar);
+};
+
+template <typename IntType>
+class StartAndEndOffsets {
+ protected:
+  static IntType MaxOffset() { return std::numeric_limits<IntType>::max(); }
+
+ public:
+  StartAndEndOffsets() = delete;
+  explicit StartAndEndOffsets(IntType aStartOffset, IntType aEndOffset)
+      : mStartOffset(aStartOffset),
+        mEndOffset(aStartOffset <= aEndOffset ? aEndOffset : aStartOffset) {
+    MOZ_ASSERT(aStartOffset <= mEndOffset);
+  }
+
+  IntType StartOffset() const { return mStartOffset; }
+  IntType Length() const { return mEndOffset - mStartOffset; }
+  IntType EndOffset() const { return mEndOffset; }
+
+  bool IsOffsetInRange(IntType aOffset) const {
+    return aOffset >= mStartOffset && aOffset < mEndOffset;
+  }
+  bool IsOffsetInRangeOrEndOffset(IntType aOffset) const {
+    return aOffset >= mStartOffset && aOffset <= mEndOffset;
+  }
+
+  void MoveTo(IntType aNewStartOffset) {
+    auto delta = static_cast<int64_t>(mStartOffset) - aNewStartOffset;
+    mStartOffset += delta;
+    mEndOffset += delta;
+  }
+  void SetOffsetAndLength(IntType aNewOffset, IntType aNewLength) {
+    mStartOffset = aNewOffset;
+    CheckedInt<IntType> endOffset(aNewOffset + aNewLength);
+    mEndOffset = endOffset.isValid() ? endOffset.value() : MaxOffset();
+  }
+  void SetEndOffset(IntType aEndOffset) {
+    MOZ_ASSERT(mStartOffset <= aEndOffset);
+    mEndOffset = std::max(aEndOffset, mStartOffset);
+  }
+  void SetStartAndEndOffsets(IntType aStartOffset, IntType aEndOffset) {
+    MOZ_ASSERT(aStartOffset <= aEndOffset);
+    mStartOffset = aStartOffset;
+    mEndOffset = aStartOffset <= aEndOffset ? aEndOffset : aStartOffset;
+  }
+  void SetLength(IntType aNewLength) {
+    CheckedInt<IntType> endOffset(mStartOffset + aNewLength);
+    mEndOffset = endOffset.isValid() ? endOffset.value() : MaxOffset();
+  }
+
+  friend std::ostream& operator<<(
+      std::ostream& aStream,
+      const StartAndEndOffsets<IntType>& aStartAndEndOffsets) {
+    aStream << "{ mStartOffset=" << aStartAndEndOffsets.mStartOffset
+            << ", mEndOffset=" << aStartAndEndOffsets.mEndOffset
+            << ", Length()=" << aStartAndEndOffsets.Length() << " }";
+    return aStream;
+  }
+
+ private:
+  IntType mStartOffset;
+  IntType mEndOffset;
+};
+
+enum class OffsetAndDataFor {
+  CompositionString,
+  SelectedString,
+  EditorString,
+};
+template <typename IntType>
+class OffsetAndData {
+ protected:
+  static IntType MaxOffset() { return std::numeric_limits<IntType>::max(); }
+
+ public:
+  OffsetAndData() = delete;
+  explicit OffsetAndData(
+      IntType aStartOffset, const nsAString& aData,
+      OffsetAndDataFor aFor = OffsetAndDataFor::CompositionString)
+      : mData(aData), mOffset(aStartOffset), mFor(aFor) {}
+
+  bool IsValid() const {
+    CheckedInt<IntType> offset(mOffset);
+    offset += mData.Length();
+    return offset.isValid();
+  }
+  IntType StartOffset() const { return mOffset; }
+  IntType Length() const {
+    CheckedInt<IntType> endOffset(CheckedInt<IntType>(mOffset) +
+                                  mData.Length());
+    return endOffset.isValid() ? mData.Length() : MaxOffset() - mOffset;
+  }
+  IntType EndOffset() const { return mOffset + Length(); }
+  StartAndEndOffsets<IntType> CreateStartAndEndOffsets() const {
+    return StartAndEndOffsets<IntType>(StartOffset(), EndOffset());
+  }
+  const nsString& DataRef() const {
+    return mData;
+  }
+  bool IsDataEmpty() const { return mData.IsEmpty(); }
+
+  bool IsOffsetInRange(IntType aOffset) const {
+    return aOffset >= mOffset && aOffset < EndOffset();
+  }
+  bool IsOffsetInRangeOrEndOffset(IntType aOffset) const {
+    return aOffset >= mOffset && aOffset <= EndOffset();
+  }
+
+  void Collapse(IntType aOffset) {
+    mOffset = aOffset;
+    mData.Truncate();
+  }
+  void MoveTo(IntType aNewOffset) { mOffset = aNewOffset; }
+  void SetOffsetAndData(IntType aStartOffset, const nsAString& aData) {
+    mOffset = aStartOffset;
+    mData = aData;
+  }
+  void SetData(const nsAString& aData) { mData = aData; }
+  void TruncateData(uint32_t aLength = 0) { mData.Truncate(aLength); }
+  void ReplaceData(nsAString::size_type aCutStart,
+                   nsAString::size_type aCutLength,
+                   const nsAString& aNewString) {
+    mData.Replace(aCutStart, aCutLength, aNewString);
+  }
+
+  friend std::ostream& operator<<(
+      std::ostream& aStream, const OffsetAndData<IntType>& aOffsetAndData) {
+    const auto maxDataLength =
+        aOffsetAndData.mFor == OffsetAndDataFor::CompositionString
+            ? PrintStringDetail::kMaxLengthForCompositionString
+            : (aOffsetAndData.mFor == OffsetAndDataFor::SelectedString
+                   ? PrintStringDetail::kMaxLengthForSelectedString
+                   : PrintStringDetail::kMaxLengthForEditor);
+    aStream << "{ mOffset=" << aOffsetAndData.mOffset << ", mData="
+            << PrintStringDetail(aOffsetAndData.mData, maxDataLength).get()
+            << ", Length()=" << aOffsetAndData.Length()
+            << ", EndOffset()=" << aOffsetAndData.EndOffset() << " }";
+    return aStream;
+  }
+
+ private:
+  nsString mData;
+  IntType mOffset;
+  OffsetAndDataFor mFor;
+};
+
+namespace widget {
+
+enum class IMENotificationRequest : uint8_t {
+  TextChange,
+  PositionChange,
+  MouseEventOnChar,
+  NotifyDuringInactive,
+};
+
+}  
+
+template <>
+struct MaxEnumValue<widget::IMENotificationRequest> {
+  static constexpr uint8_t value = static_cast<uint8_t>(
+      widget::IMENotificationRequest::NotifyDuringInactive);
+};
+
+namespace widget {
+
+using IMENotificationRequests = EnumSet<IMENotificationRequest>;
+inline constexpr const IMENotificationRequests AllIMENotificationRequests = {
+    IMENotificationRequest::TextChange, IMENotificationRequest::PositionChange,
+    IMENotificationRequest::MouseEventOnChar};
+
+enum class IMEEnabled {
+  Disabled,
+  Enabled,
+  Password,
+  Unknown,
+};
+
+
+struct IMEState final {
+  IMEEnabled mEnabled;
+
+  enum Open {
+    OPEN_STATE_NOT_SUPPORTED,
+    DONT_CHANGE_OPEN_STATE = OPEN_STATE_NOT_SUPPORTED,
+    OPEN,
+    CLOSED
+  };
+  Open mOpen;
+
+  IMEState() : mEnabled(IMEEnabled::Enabled), mOpen(DONT_CHANGE_OPEN_STATE) {}
+
+  explicit IMEState(IMEEnabled aEnabled, Open aOpen = DONT_CHANGE_OPEN_STATE)
+      : mEnabled(aEnabled), mOpen(aOpen) {}
+
+  bool IsEditable() const {
+    return mEnabled == IMEEnabled::Enabled || mEnabled == IMEEnabled::Password;
+  }
+};
+
+#define NS_ONLY_ONE_NATIVE_IME_CONTEXT \
+  (reinterpret_cast<void*>(static_cast<intptr_t>(-1)))
+
+struct NativeIMEContext final {
+  uintptr_t mRawNativeIMEContext;
+  uint64_t mOriginProcessID;
+
+  NativeIMEContext() : mRawNativeIMEContext(0), mOriginProcessID(0) {
+    Init(nullptr);
+  }
+
+  explicit NativeIMEContext(nsIWidget* aWidget)
+      : mRawNativeIMEContext(0), mOriginProcessID(0) {
+    Init(aWidget);
+  }
+
+  bool IsValid() const {
+    return mRawNativeIMEContext &&
+           mOriginProcessID != static_cast<uint64_t>(-1);
+  }
+
+  bool IsOriginatedInParentProcess() const {
+    return mOriginProcessID != 0 &&
+           mOriginProcessID != static_cast<uint64_t>(-1);
+  }
+
+  void Init(nsIWidget* aWidget);
+  void InitWithRawNativeIMEContext(const void* aRawNativeIMEContext) {
+    InitWithRawNativeIMEContext(const_cast<void*>(aRawNativeIMEContext));
+  }
+  void InitWithRawNativeIMEContext(void* aRawNativeIMEContext);
+
+  bool operator==(const NativeIMEContext& aOther) const {
+    return mRawNativeIMEContext == aOther.mRawNativeIMEContext &&
+           mOriginProcessID == aOther.mOriginProcessID;
+  }
+  bool operator!=(const NativeIMEContext& aOther) const {
+    return !(*this == aOther);
+  }
+};
+
+struct InputContext final {
+  InputContext()
+      : mOrigin(XRE_IsParentProcess() ? ORIGIN_MAIN : ORIGIN_CONTENT),
+        mHasHandledUserInput(false),
+        mInPrivateBrowsing(false) {}
+
+  void ShutDown() {
+    mURI = nullptr;
+    mHTMLInputType.Truncate();
+    mHTMLInputMode.Truncate();
+    mActionHint.Truncate();
+    mAutocapitalize.Truncate();
+    mAutocorrect = true;
+  }
+
+  bool IsPasswordEditor() const {
+    return mHTMLInputType.LowerCaseEqualsLiteral("password");
+  }
+
+  NativeKeyBindingsType GetNativeKeyBindingsType() const {
+    MOZ_DIAGNOSTIC_ASSERT(mIMEState.IsEditable());
+    if (mHTMLInputType.IsEmpty()) {
+      return NativeKeyBindingsType::RichTextEditor;
+    }
+    return mHTMLInputType.EqualsLiteral("textarea")
+               ? NativeKeyBindingsType::MultiLineEditor
+               : NativeKeyBindingsType::SingleLineEditor;
+  }
+
+  bool IsAutocapitalizeSupported() const {
+    return !mHTMLInputType.EqualsLiteral("password") &&
+           !mHTMLInputType.EqualsLiteral("url") &&
+           !mHTMLInputType.EqualsLiteral("email");
+  }
+
+  bool IsInputAttributeChanged(const InputContext& aOldContext) const {
+    return mIMEState.mEnabled != aOldContext.mIMEState.mEnabled ||
+#if 0 || defined(MOZ_WIDGET_GTK) || 0 || \
+    0
+           mHTMLInputType != aOldContext.mHTMLInputType ||
+           mHTMLInputMode != aOldContext.mHTMLInputMode ||
+#endif
+#if 0 || defined(MOZ_WIDGET_GTK) || 0
+           mAutocapitalize != aOldContext.mAutocapitalize ||
+#endif
+           false;
+  }
+
+  IMEState mIMEState;
+
+  nsCOMPtr<nsIURI> mURI;
+
+  nsString mHTMLInputType;
+
+  nsString mHTMLInputMode;
+
+  nsString mActionHint;
+
+  nsString mAutocapitalize;
+
+  bool mAutocorrect = true;  
+
+  enum Origin {
+    ORIGIN_MAIN,
+    ORIGIN_CONTENT
+  };
+  Origin mOrigin;
+
+  bool mHasHandledUserInput;
+
+  bool mInPrivateBrowsing;
+
+  bool IsOriginMainProcess() const { return mOrigin == ORIGIN_MAIN; }
+
+  bool IsOriginContentProcess() const { return mOrigin == ORIGIN_CONTENT; }
+
+  bool IsOriginCurrentProcess() const {
+    if (XRE_IsParentProcess()) {
+      return IsOriginMainProcess();
+    }
+    return IsOriginContentProcess();
+  }
+};
+
+const char* ToChar(InputContext::Origin aOrigin);
+
+struct InputContextAction final {
+  enum Cause {
+    CAUSE_UNKNOWN,
+    CAUSE_UNKNOWN_CHROME,
+    CAUSE_KEY,
+    CAUSE_MOUSE,
+    CAUSE_TOUCH,
+    CAUSE_LONGPRESS,
+    CAUSE_UNKNOWN_DURING_NON_KEYBOARD_INPUT,
+    CAUSE_UNKNOWN_DURING_KEYBOARD_INPUT,
+  };
+  Cause mCause;
+
+  enum FocusChange {
+    FOCUS_NOT_CHANGED,
+    GOT_FOCUS,
+    LOST_FOCUS,
+    MENU_GOT_PSEUDO_FOCUS,
+    MENU_LOST_PSEUDO_FOCUS,
+    WIDGET_CREATED
+  };
+  FocusChange mFocusChange;
+
+  bool ContentGotFocusByTrustedCause() const {
+    return (mFocusChange == GOT_FOCUS && mCause != CAUSE_UNKNOWN);
+  }
+
+  bool UserMightRequestOpenVKB() const {
+    if (mFocusChange != FOCUS_NOT_CHANGED) {
+      return false;
+    }
+    switch (mCause) {
+      case CAUSE_MOUSE:
+      case CAUSE_TOUCH:
+      case CAUSE_UNKNOWN_DURING_NON_KEYBOARD_INPUT:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  static bool IsHandlingUserInput(Cause aCause) {
+    switch (aCause) {
+      case CAUSE_KEY:
+      case CAUSE_MOUSE:
+      case CAUSE_TOUCH:
+      case CAUSE_LONGPRESS:
+      case CAUSE_UNKNOWN_DURING_NON_KEYBOARD_INPUT:
+      case CAUSE_UNKNOWN_DURING_KEYBOARD_INPUT:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  bool IsHandlingUserInput() const { return IsHandlingUserInput(mCause); }
+
+  InputContextAction()
+      : mCause(CAUSE_UNKNOWN), mFocusChange(FOCUS_NOT_CHANGED) {}
+
+  explicit InputContextAction(Cause aCause,
+                              FocusChange aFocusChange = FOCUS_NOT_CHANGED)
+      : mCause(aCause), mFocusChange(aFocusChange) {}
+};
+
+using IMEMessageType = int8_t;
+enum IMEMessage : IMEMessageType {
+  NOTIFY_IME_OF_NOTHING,
+  NOTIFY_IME_OF_FOCUS,
+  NOTIFY_IME_OF_BLUR,
+  NOTIFY_IME_OF_SELECTION_CHANGE,
+  NOTIFY_IME_OF_TEXT_CHANGE,
+  NOTIFY_IME_OF_COMPOSITION_EVENT_HANDLED,
+  NOTIFY_IME_OF_POSITION_CHANGE,
+  NOTIFY_IME_OF_MOUSE_BUTTON_EVENT,
+  REQUEST_TO_COMMIT_COMPOSITION,
+  REQUEST_TO_CANCEL_COMPOSITION
+};
+
+const char* ToChar(IMEMessage aIMEMessage);
+
+struct IMENotification final {
+  IMENotification() : mMessage(NOTIFY_IME_OF_NOTHING), mSelectionChangeData() {}
+
+  IMENotification(const IMENotification& aOther)
+      : mMessage(NOTIFY_IME_OF_NOTHING) {
+    Assign(aOther);
+  }
+
+  ~IMENotification() { Clear(); }
+
+  MOZ_IMPLICIT IMENotification(IMEMessage aMessage)
+      : mMessage(aMessage), mSelectionChangeData() {
+    switch (aMessage) {
+      case NOTIFY_IME_OF_SELECTION_CHANGE:
+        mSelectionChangeData.mString = new nsString();
+        mSelectionChangeData.Clear();
+        break;
+      case NOTIFY_IME_OF_TEXT_CHANGE:
+        mTextChangeData.Clear();
+        break;
+      case NOTIFY_IME_OF_MOUSE_BUTTON_EVENT:
+        mMouseButtonEventData.mEventMessage = eVoidEvent;
+        mMouseButtonEventData.mOffset = UINT32_MAX;
+        mMouseButtonEventData.mCursorPos.MoveTo(0, 0);
+        mMouseButtonEventData.mCharRect.SetRect(0, 0, 0, 0);
+        mMouseButtonEventData.mButton = -1;
+        mMouseButtonEventData.mButtons = 0;
+        mMouseButtonEventData.mModifiers = 0;
+        break;
+      default:
+        break;
+    }
+  }
+
+  void Assign(const IMENotification& aOther) {
+    bool changingMessage = mMessage != aOther.mMessage;
+    if (changingMessage) {
+      Clear();
+      mMessage = aOther.mMessage;
+    }
+    switch (mMessage) {
+      case NOTIFY_IME_OF_SELECTION_CHANGE:
+        if (changingMessage) {
+          mSelectionChangeData.mString = new nsString();
+        }
+        mSelectionChangeData.Assign(aOther.mSelectionChangeData);
+        break;
+      case NOTIFY_IME_OF_TEXT_CHANGE:
+        mTextChangeData = aOther.mTextChangeData;
+        break;
+      case NOTIFY_IME_OF_MOUSE_BUTTON_EVENT:
+        mMouseButtonEventData = aOther.mMouseButtonEventData;
+        break;
+      default:
+        break;
+    }
+  }
+
+  IMENotification& operator=(const IMENotification& aOther) {
+    Assign(aOther);
+    return *this;
+  }
+
+  void Clear() {
+    if (mMessage == NOTIFY_IME_OF_SELECTION_CHANGE) {
+      MOZ_ASSERT(mSelectionChangeData.mString);
+      delete mSelectionChangeData.mString;
+      mSelectionChangeData.mString = nullptr;
+    }
+    mMessage = NOTIFY_IME_OF_NOTHING;
+  }
+
+  bool HasNotification() const { return mMessage != NOTIFY_IME_OF_NOTHING; }
+
+  void MergeWith(const IMENotification& aNotification) {
+    switch (mMessage) {
+      case NOTIFY_IME_OF_NOTHING:
+        MOZ_ASSERT(aNotification.mMessage != NOTIFY_IME_OF_NOTHING);
+        Assign(aNotification);
+        break;
+      case NOTIFY_IME_OF_SELECTION_CHANGE:
+        MOZ_ASSERT(aNotification.mMessage == NOTIFY_IME_OF_SELECTION_CHANGE);
+        mSelectionChangeData.Assign(aNotification.mSelectionChangeData);
+        break;
+      case NOTIFY_IME_OF_TEXT_CHANGE:
+        MOZ_ASSERT(aNotification.mMessage == NOTIFY_IME_OF_TEXT_CHANGE);
+        mTextChangeData += aNotification.mTextChangeData;
+        break;
+      case NOTIFY_IME_OF_POSITION_CHANGE:
+      case NOTIFY_IME_OF_COMPOSITION_EVENT_HANDLED:
+        MOZ_ASSERT(aNotification.mMessage == mMessage);
+        break;
+      default:
+        MOZ_CRASH("Merging notification isn't supported");
+        break;
+    }
+  }
+
+  IMEMessage mMessage;
+
+  struct SelectionChangeDataBase {
+    uint32_t mOffset;
+
+    nsString* mString;
+
+    uint8_t mWritingModeBits;
+
+    bool mIsInitialized;
+    bool mHasRange;
+    bool mReversed;
+    bool mCausedByComposition;
+    bool mCausedBySelectionEvent;
+    bool mOccurredDuringComposition;
+
+    void SetWritingMode(const WritingMode& aWritingMode);
+    WritingMode GetWritingMode() const;
+
+    uint32_t StartOffset() const {
+      MOZ_ASSERT(mHasRange);
+      return mOffset;
+    }
+    uint32_t EndOffset() const {
+      MOZ_ASSERT(mHasRange);
+      return mOffset + Length();
+    }
+    uint32_t AnchorOffset() const {
+      MOZ_ASSERT(mHasRange);
+      return mOffset + (mReversed ? Length() : 0);
+    }
+    uint32_t FocusOffset() const {
+      MOZ_ASSERT(mHasRange);
+      return mOffset + (mReversed ? 0 : Length());
+    }
+    const nsString& String() const {
+      MOZ_ASSERT(mHasRange);
+      return *mString;
+    }
+    uint32_t Length() const {
+      MOZ_ASSERT(mHasRange);
+      return mString->Length();
+    }
+    bool IsInInt32Range() const {
+      return mHasRange && mOffset <= INT32_MAX && Length() <= INT32_MAX &&
+             mOffset + Length() <= INT32_MAX;
+    }
+    bool HasRange() const { return mIsInitialized && mHasRange; }
+    bool IsCollapsed() const { return !mHasRange || mString->IsEmpty(); }
+    void ClearSelectionData() {
+      mIsInitialized = false;
+      mHasRange = false;
+      mOffset = UINT32_MAX;
+      mString->Truncate();
+      mWritingModeBits = 0;
+      mReversed = false;
+    }
+    void Clear() {
+      ClearSelectionData();
+      mCausedByComposition = false;
+      mCausedBySelectionEvent = false;
+      mOccurredDuringComposition = false;
+    }
+    bool IsInitialized() const { return mIsInitialized; }
+    void Assign(const SelectionChangeDataBase& aOther) {
+      mIsInitialized = aOther.mIsInitialized;
+      mHasRange = aOther.mHasRange;
+      if (mIsInitialized && mHasRange) {
+        mOffset = aOther.mOffset;
+        *mString = aOther.String();
+        mReversed = aOther.mReversed;
+        mWritingModeBits = aOther.mWritingModeBits;
+      } else {
+        mOffset = UINT32_MAX;
+        mString->Truncate();
+        mReversed = false;
+      }
+      AssignReason(aOther.mCausedByComposition, aOther.mCausedBySelectionEvent,
+                   aOther.mOccurredDuringComposition);
+    }
+    void Assign(const WidgetQueryContentEvent& aQuerySelectedTextEvent);
+    void AssignReason(bool aCausedByComposition, bool aCausedBySelectionEvent,
+                      bool aOccurredDuringComposition) {
+      mCausedByComposition = aCausedByComposition;
+      mCausedBySelectionEvent = aCausedBySelectionEvent;
+      mOccurredDuringComposition = aOccurredDuringComposition;
+    }
+
+    bool EqualsRange(const SelectionChangeDataBase& aOther) const {
+      if (HasRange() != aOther.HasRange()) {
+        return false;
+      }
+      if (!HasRange()) {
+        return true;
+      }
+      return mOffset == aOther.mOffset && mString->Equals(*aOther.mString);
+    }
+    bool EqualsRangeAndDirection(const SelectionChangeDataBase& aOther) const {
+      return EqualsRange(aOther) &&
+             (!HasRange() || mReversed == aOther.mReversed);
+    }
+    bool EqualsRangeAndDirectionAndWritingMode(
+        const SelectionChangeDataBase& aOther) const {
+      return EqualsRangeAndDirection(aOther) &&
+             mWritingModeBits == aOther.mWritingModeBits;
+    }
+
+    bool EqualsRange(const ContentSelection& aContentSelection) const;
+    bool EqualsRangeAndWritingMode(
+        const ContentSelection& aContentSelection) const;
+
+    OffsetAndData<uint32_t> ToUint32OffsetAndData() const {
+      return OffsetAndData<uint32_t>(mOffset, *mString,
+                                     OffsetAndDataFor::SelectedString);
+    }
+  };
+
+  struct SelectionChangeData final : public SelectionChangeDataBase {
+    SelectionChangeData() {
+      mString = &mStringInstance;
+      Clear();
+    }
+    explicit SelectionChangeData(const SelectionChangeDataBase& aOther) {
+      mString = &mStringInstance;
+      Assign(aOther);
+    }
+    SelectionChangeData(const SelectionChangeData& aOther) {
+      mString = &mStringInstance;
+      Assign(aOther);
+    }
+    SelectionChangeData& operator=(const SelectionChangeDataBase& aOther) {
+      mString = &mStringInstance;
+      Assign(aOther);
+      return *this;
+    }
+    SelectionChangeData& operator=(const SelectionChangeData& aOther) {
+      mString = &mStringInstance;
+      Assign(aOther);
+      return *this;
+    }
+
+   private:
+    nsString mStringInstance;
+  };
+
+  struct TextChangeDataBase {
+    uint32_t mStartOffset;
+    uint32_t mRemovedEndOffset;
+    uint32_t mAddedEndOffset;
+
+
+    bool mCausedOnlyByComposition;
+    bool mIncludingChangesDuringComposition;
+    bool mIncludingChangesWithoutComposition;
+
+    uint32_t OldLength() const {
+      MOZ_ASSERT(IsValid());
+      return mRemovedEndOffset - mStartOffset;
+    }
+    uint32_t NewLength() const {
+      MOZ_ASSERT(IsValid());
+      return mAddedEndOffset - mStartOffset;
+    }
+
+    int64_t Difference() const { return mAddedEndOffset - mRemovedEndOffset; }
+
+    bool IsInInt32Range() const {
+      MOZ_ASSERT(IsValid());
+      return mStartOffset <= INT32_MAX && mRemovedEndOffset <= INT32_MAX &&
+             mAddedEndOffset <= INT32_MAX;
+    }
+
+    bool IsValid() const {
+      return !(mStartOffset == UINT32_MAX && !mRemovedEndOffset &&
+               !mAddedEndOffset);
+    }
+
+    void Clear() {
+      mStartOffset = UINT32_MAX;
+      mRemovedEndOffset = mAddedEndOffset = 0;
+    }
+
+    void MergeWith(const TextChangeDataBase& aOther);
+    TextChangeDataBase& operator+=(const TextChangeDataBase& aOther) {
+      MergeWith(aOther);
+      return *this;
+    }
+
+    [[nodiscard]] uint32_t ComputeNewOffset(uint32_t aOldOffset) const {
+      if (mStartOffset >= aOldOffset) {
+        return aOldOffset;
+      }
+      if (mRemovedEndOffset <= aOldOffset) {
+        return aOldOffset + Difference();
+      }
+      return mAddedEndOffset;
+    }
+
+#if defined(DEBUG)
+    void Test();
+#endif
+  };
+
+  struct TextChangeData : public TextChangeDataBase {
+    TextChangeData() { Clear(); }
+
+    TextChangeData(uint32_t aStartOffset, uint32_t aRemovedEndOffset,
+                   uint32_t aAddedEndOffset, bool aCausedByComposition,
+                   bool aOccurredDuringComposition) {
+      MOZ_ASSERT(aRemovedEndOffset >= aStartOffset,
+                 "removed end offset must not be smaller than start offset");
+      MOZ_ASSERT(aAddedEndOffset >= aStartOffset,
+                 "added end offset must not be smaller than start offset");
+      mStartOffset = aStartOffset;
+      mRemovedEndOffset = aRemovedEndOffset;
+      mAddedEndOffset = aAddedEndOffset;
+      mCausedOnlyByComposition = aCausedByComposition;
+      mIncludingChangesDuringComposition =
+          !aCausedByComposition && aOccurredDuringComposition;
+      mIncludingChangesWithoutComposition =
+          !aCausedByComposition && !aOccurredDuringComposition;
+    }
+  };
+
+  struct MouseButtonEventData {
+    EventMessage mEventMessage;
+    uint32_t mOffset;
+    LayoutDeviceIntPoint mCursorPos;
+    LayoutDeviceIntRect mCharRect;
+    int16_t mButton;
+    int16_t mButtons;
+    Modifiers mModifiers;
+  };
+
+  union {
+    SelectionChangeDataBase mSelectionChangeData;
+
+    TextChangeDataBase mTextChangeData;
+
+    MouseButtonEventData mMouseButtonEventData;
+  };
+
+  void SetData(const SelectionChangeDataBase& aSelectionChangeData) {
+    MOZ_RELEASE_ASSERT(mMessage == NOTIFY_IME_OF_SELECTION_CHANGE);
+    mSelectionChangeData.Assign(aSelectionChangeData);
+  }
+
+  void SetData(const TextChangeDataBase& aTextChangeData) {
+    MOZ_RELEASE_ASSERT(mMessage == NOTIFY_IME_OF_TEXT_CHANGE);
+    mTextChangeData = aTextChangeData;
+  }
+};
+
+std::ostream& operator<<(std::ostream& aStream, const IMEEnabled& aEnabled);
+std::ostream& operator<<(std::ostream& aStream, const IMEState::Open& aOpen);
+std::ostream& operator<<(std::ostream& aStream, const IMEState& aState);
+std::ostream& operator<<(std::ostream& aStream,
+                         const InputContext::Origin& aOrigin);
+std::ostream& operator<<(std::ostream& aStream, const InputContext& aContext);
+std::ostream& operator<<(std::ostream& aStream,
+                         const InputContextAction::Cause& aCause);
+std::ostream& operator<<(std::ostream& aStream,
+                         const InputContextAction::FocusChange& aFocusChange);
+std::ostream& operator<<(std::ostream& aStream,
+                         const IMENotification::SelectionChangeDataBase& aData);
+std::ostream& operator<<(std::ostream& aStream,
+                         const IMENotification::TextChangeDataBase& aData);
+
+}  
+}  
+
+#endif

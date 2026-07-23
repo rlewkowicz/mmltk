@@ -1,0 +1,225 @@
+// called LICENSE at the top level of the ICU4X source tree
+// (online at: https://github.com/unicode-org/icu4x/blob/main/LICENSE ).
+
+use super::*;
+use alloc::vec::Vec;
+
+type MapF<K, V> = fn(&(K, V)) -> (&K, &V);
+
+#[inline]
+fn map_f<K, V>(input: &(K, V)) -> (&K, &V) {
+    (&input.0, &input.1)
+}
+
+type MapFMut<K, V> = fn(&mut (K, V)) -> (&K, &mut V);
+
+#[inline]
+fn map_f_mut<K, V>(input: &mut (K, V)) -> (&K, &mut V) {
+    (&input.0, &mut input.1)
+}
+
+impl<K, V> StoreConstEmpty<K, V> for Vec<(K, V)> {
+    const EMPTY: Vec<(K, V)> = Vec::new();
+}
+
+impl<K, V> Store<K, V> for Vec<(K, V)> {
+    #[inline]
+    fn lm_len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    #[inline]
+    fn lm_is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    #[inline]
+    fn lm_get(&self, index: usize) -> Option<(&K, &V)> {
+        self.as_slice().get(index).map(map_f)
+    }
+
+    #[inline]
+    fn lm_last(&self) -> Option<(&K, &V)> {
+        self.as_slice().last().map(map_f)
+    }
+
+    #[inline]
+    fn lm_binary_search_by<F>(&self, mut cmp: F) -> Result<usize, usize>
+    where
+        F: FnMut(&K) -> Ordering,
+    {
+        self.as_slice().binary_search_by(|(k, _)| cmp(k))
+    }
+}
+
+impl<K, V> StoreSlice<K, V> for Vec<(K, V)> {
+    type Slice = [(K, V)];
+
+    fn lm_get_range(&self, range: Range<usize>) -> Option<&Self::Slice> {
+        self.get(range)
+    }
+}
+
+impl<K, V> StoreMut<K, V> for Vec<(K, V)> {
+    #[inline]
+    fn lm_with_capacity(capacity: usize) -> Self {
+        Self::with_capacity(capacity)
+    }
+
+    #[inline]
+    fn lm_reserve(&mut self, additional: usize) {
+        self.reserve(additional)
+    }
+
+    #[inline]
+    fn lm_get_mut(&mut self, index: usize) -> Option<(&K, &mut V)> {
+        self.as_mut_slice().get_mut(index).map(map_f_mut)
+    }
+
+    #[inline]
+    fn lm_push(&mut self, key: K, value: V) {
+        self.push((key, value))
+    }
+
+    #[inline]
+    fn lm_insert(&mut self, index: usize, key: K, value: V) {
+        self.insert(index, (key, value))
+    }
+
+    #[inline]
+    fn lm_remove(&mut self, index: usize) -> (K, V) {
+        self.remove(index)
+    }
+
+    #[inline]
+    fn lm_clear(&mut self) {
+        self.clear()
+    }
+}
+
+impl<K: Ord, V> StoreBulkMut<K, V> for Vec<(K, V)> {
+    #[inline]
+    fn lm_retain<F>(&mut self, mut predicate: F)
+    where
+        F: FnMut(&K, &V) -> bool,
+    {
+        self.retain(|(k, v)| predicate(k, v))
+    }
+
+    /// Extends this store with items from an iterator.
+    ///
+    /// It uses a two-pass (sort + dedup) approach to avoid any potential quadratic costs.
+    ///
+    /// The asymptotic worst case complexity is O((n + m) log(n + m)), where `n`
+    /// is the number of elements already in `self` and `m` is the number of elements
+    /// in the iterator. The best case complexity is O(m), when the input iterator is
+    /// already sorted, keys aren't duplicated and all keys sort after the existing ones.
+    #[inline]
+    fn lm_extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Ord,
+    {
+        let mut sorted_len = self.len();
+        self.extend(iter);
+        #[allow(clippy::indexing_slicing)]
+        {
+            sorted_len += self[sorted_len.saturating_sub(1)..]
+                .windows(2)
+                .take_while(|w| w[0].0 < w[1].0)
+                .count();
+        }
+        sorted_len += (sorted_len == 0 && !self.is_empty()) as usize;
+
+        if sorted_len >= self.len() {
+            return;
+        }
+
+        self.sort_by(|a, b| a.0.cmp(&b.0));
+        let (dedup, _merged_dup) = partition_dedup_by(self);
+        sorted_len = dedup.len();
+        self.truncate(sorted_len);
+    }
+}
+
+/// Moves all but the _last_ of consecutive elements to the end of the slice satisfying
+/// equality on K.
+///
+/// Returns two slices. The first contains no consecutive repeated elements.
+/// The second contains all the duplicates in no specified order.
+///
+/// This is based on std::slice::partition_dedup_by (currently unstable) but retains the
+/// _last_ element of the duplicate run in the first slice (instead of first).
+#[inline]
+#[allow(clippy::type_complexity)]
+fn partition_dedup_by<K: Eq, V>(v: &mut [(K, V)]) -> (&mut [(K, V)], &mut [(K, V)]) {
+
+    if v.len() <= 1 {
+        return (v, &mut []);
+    }
+
+    let mut read_idx: usize = 1;
+    let mut write_idx: usize = 1;
+
+    while let Some((before_read, [read, ..])) = v.split_at_mut_checked(read_idx) {
+        #[allow(clippy::indexing_slicing)]
+        let prev_write = &mut before_read[write_idx - 1];
+        if read.0 == prev_write.0 {
+            core::mem::swap(read, prev_write);
+        } else {
+            if let Some(write) = before_read.get_mut(write_idx) {
+                core::mem::swap(read, write);
+            }
+            write_idx += 1;
+        }
+        read_idx += 1;
+    }
+    v.split_at_mut(write_idx)
+}
+
+impl<K: Ord, V> StoreFromIterable<K, V> for Vec<(K, V)> {
+    fn lm_sort_from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        let mut v = Self::new();
+        v.lm_extend(iter);
+        v
+    }
+}
+
+impl<'a, K: 'a, V: 'a> StoreIterable<'a, K, V> for Vec<(K, V)> {
+    type KeyValueIter = core::iter::Map<core::slice::Iter<'a, (K, V)>, MapF<K, V>>;
+
+    #[inline]
+    fn lm_iter(&'a self) -> Self::KeyValueIter {
+        self.as_slice().iter().map(map_f)
+    }
+}
+
+impl<'a, K: 'a, V: 'a> StoreIterableMut<'a, K, V> for Vec<(K, V)> {
+    type KeyValueIterMut = core::iter::Map<core::slice::IterMut<'a, (K, V)>, MapFMut<K, V>>;
+
+    #[inline]
+    fn lm_iter_mut(&'a mut self) -> Self::KeyValueIterMut {
+        self.as_mut_slice().iter_mut().map(map_f_mut)
+    }
+}
+
+impl<K, V> StoreIntoIterator<K, V> for Vec<(K, V)> {
+    type KeyValueIntoIter = alloc::vec::IntoIter<(K, V)>;
+
+    #[inline]
+    fn lm_into_iter(self) -> Self::KeyValueIntoIter {
+        IntoIterator::into_iter(self)
+    }
+
+    #[inline]
+    fn lm_extend_end(&mut self, other: Self) {
+        self.extend(other)
+    }
+
+    #[inline]
+    fn lm_extend_start(&mut self, other: Self) {
+        self.splice(0..0, other);
+    }
+}
+
+impl<K, V> StoreFromIterator<K, V> for Vec<(K, V)> {}

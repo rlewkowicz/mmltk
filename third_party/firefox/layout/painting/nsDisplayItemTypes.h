@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+// IWYU pragma: private, include "nsDisplayList.h"
+
+
+#ifndef NSDISPLAYITEMTYPES_H_
+#define NSDISPLAYITEMTYPES_H_
+
+enum class DisplayItemType : uint8_t {
+  TYPE_ZERO = 0, 
+
+#define DECLARE_DISPLAY_ITEM_TYPE(name, flags) TYPE_##name,
+#include "nsDisplayItemTypesList.inc"
+#undef DECLARE_DISPLAY_ITEM_TYPE
+
+  TYPE_MAX
+};
+
+enum {
+  TYPE_BITS = 8
+};
+
+enum DisplayItemFlags {
+  TYPE_RENDERS_NO_IMAGES = 1 << 0,
+  TYPE_IS_CONTENTFUL = 1 << 1,
+  TYPE_IS_CONTAINER = 1 << 2
+};
+
+inline const char* DisplayItemTypeName(DisplayItemType aType) {
+  switch (aType) {
+#define DECLARE_DISPLAY_ITEM_TYPE(name, flags) \
+  case DisplayItemType::TYPE_##name:           \
+    return #name;
+#include "nsDisplayItemTypesList.inc"
+#undef DECLARE_DISPLAY_ITEM_TYPE
+
+    default:
+      return "TYPE_UNKNOWN";
+  }
+}
+
+inline uint8_t GetDisplayItemFlagsForType(DisplayItemType aType) {
+  static const uint8_t flags[static_cast<uint32_t>(DisplayItemType::TYPE_MAX)] =
+      {0
+#define DECLARE_DISPLAY_ITEM_TYPE(name, flags) , flags
+#include "nsDisplayItemTypesList.inc"
+#undef DECLARE_DISPLAY_ITEM_TYPE
+      };
+
+  return flags[static_cast<uint32_t>(aType)];
+}
+
+inline DisplayItemType GetDisplayItemTypeFromKey(uint32_t aDisplayItemKey) {
+  static const uint32_t typeMask = (1 << TYPE_BITS) - 1;
+  DisplayItemType type =
+      static_cast<DisplayItemType>(aDisplayItemKey & typeMask);
+  NS_ASSERTION(
+      type >= DisplayItemType::TYPE_ZERO && type < DisplayItemType::TYPE_MAX,
+      "Invalid display item type!");
+  return type;
+}
+
+#endif /*NSDISPLAYITEMTYPES_H_*/

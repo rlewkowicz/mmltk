@@ -1,0 +1,233 @@
+/*
+ * Anti-replay measures for TLS 1.3.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nss.h" /* for NSS_RegisterShutdown */
+#include "pk11pub.h"
+#include "prmon.h"
+#include "prtime.h"
+#include "secerr.h"
+#include "ssl.h"
+#include "sslbloom.h"
+#include "sslimpl.h"
+#include "tls13hkdf.h"
+#include "tls13psk.h"
+
+struct SSLAntiReplayContextStr {
+    PRInt32 refCount;
+    PRMonitor *lock;
+    sslBloomFilter filters[2];
+    PRUint8 current;
+    PRTime nextUpdate;
+    PRTime window;
+    PK11SymKey *key;
+};
+
+void
+tls13_ReleaseAntiReplayContext(SSLAntiReplayContext *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+    if (PR_ATOMIC_DECREMENT(&ctx->refCount) >= 1) {
+        return;
+    }
+
+    if (ctx->lock) {
+        PR_DestroyMonitor(ctx->lock);
+        ctx->lock = NULL;
+    }
+    PK11_FreeSymKey(ctx->key);
+    ctx->key = NULL;
+    sslBloom_Destroy(&ctx->filters[0]);
+    sslBloom_Destroy(&ctx->filters[1]);
+    PORT_Free(ctx);
+}
+
+SECStatus
+SSLExp_ReleaseAntiReplayContext(SSLAntiReplayContext *ctx)
+{
+    tls13_ReleaseAntiReplayContext(ctx);
+    return SECSuccess;
+}
+
+SSLAntiReplayContext *
+tls13_RefAntiReplayContext(SSLAntiReplayContext *ctx)
+{
+    PORT_Assert(ctx);
+    PR_ATOMIC_INCREMENT(&ctx->refCount);
+    return ctx;
+}
+
+static SECStatus
+tls13_AntiReplayKeyGen(SSLAntiReplayContext *ctx)
+{
+    PK11SlotInfo *slot;
+
+    PORT_Assert(ctx);
+
+    slot = PK11_GetBestSlot(CKM_HKDF_DERIVE, NULL);
+    if (!slot) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+
+    ctx->key = PK11_KeyGen(slot, CKM_HKDF_KEY_GEN, NULL, 32, NULL);
+    if (!ctx->key) {
+        goto loser;
+    }
+
+    PK11_FreeSlot(slot);
+    return SECSuccess;
+
+loser:
+    PK11_FreeSlot(slot);
+    return SECFailure;
+}
+
+#define SSL_MAX_BLOOM_FILTER_SIZE 64
+
+SECStatus
+SSLExp_CreateAntiReplayContext(PRTime now, PRTime window, unsigned int k,
+                               unsigned int bits, SSLAntiReplayContext **pctx)
+{
+    SECStatus rv;
+
+    if (window <= 0 || k == 0 || bits == 0 || pctx == NULL) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return SECFailure;
+    }
+    if ((k * (bits + 7) / 8) > SSL_MAX_BLOOM_FILTER_SIZE) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return SECFailure;
+    }
+
+    SSLAntiReplayContext *ctx = PORT_ZNew(SSLAntiReplayContext);
+    if (!ctx) {
+        return SECFailure; 
+    }
+
+    ctx->refCount = 1;
+    ctx->lock = PR_NewMonitor();
+    if (!ctx->lock) {
+        goto loser; 
+    }
+
+    rv = tls13_AntiReplayKeyGen(ctx);
+    if (rv != SECSuccess) {
+        goto loser; 
+    }
+
+    rv = sslBloom_Init(&ctx->filters[0], k, bits);
+    if (rv != SECSuccess) {
+        goto loser; 
+    }
+    rv = sslBloom_Init(&ctx->filters[1], k, bits);
+    if (rv != SECSuccess) {
+        goto loser; 
+    }
+    sslBloom_Fill(&ctx->filters[1]);
+
+    ctx->current = 0;
+    ctx->nextUpdate = now + window;
+    ctx->window = window;
+    *pctx = ctx;
+    return SECSuccess;
+
+loser:
+    tls13_ReleaseAntiReplayContext(ctx);
+    return SECFailure;
+}
+
+SECStatus
+SSLExp_SetAntiReplayContext(PRFileDesc *fd, SSLAntiReplayContext *ctx)
+{
+    sslSocket *ss = ssl_FindSocket(fd);
+    if (!ss) {
+        return SECFailure; 
+    }
+    tls13_ReleaseAntiReplayContext(ss->antiReplay);
+    if (ctx != NULL) {
+        ss->antiReplay = tls13_RefAntiReplayContext(ctx);
+    } else {
+        ss->antiReplay = NULL;
+    }
+    return SECSuccess;
+}
+
+static void
+tls13_AntiReplayUpdate(SSLAntiReplayContext *ctx, PRTime now)
+{
+    PR_ASSERT_CURRENT_THREAD_IN_MONITOR(ctx->lock);
+    if (now >= ctx->nextUpdate) {
+        ctx->current ^= 1;
+        ctx->nextUpdate = now + ctx->window;
+        sslBloom_Zero(ctx->filters + ctx->current);
+    }
+}
+
+PRBool
+tls13_InWindow(const sslSocket *ss, const sslSessionID *sid)
+{
+    PRInt32 timeDelta;
+
+    timeDelta = ss->xtnData.ticketAge -
+                ((ssl_Time(ss) - sid->creationTime) / PR_USEC_PER_MSEC);
+
+    PRInt32 allowance = ss->antiReplay->window / (PR_USEC_PER_MSEC * 2);
+    SSL_TRC(10, ("%d: TLS13[%d]: replay check time delta=%d, allow=%d",
+                 SSL_GETPID(), ss->fd, timeDelta, allowance));
+    return PR_ABS(timeDelta) < allowance;
+}
+
+PRBool
+tls13_IsReplay(const sslSocket *ss, const sslSessionID *sid)
+{
+    PRBool replay;
+    unsigned int size;
+    PRUint8 index;
+    SECStatus rv;
+    static const char *label = "anti-replay";
+    PRUint8 buf[SSL_MAX_BLOOM_FILTER_SIZE];
+    SSLAntiReplayContext *ctx = ss->antiReplay;
+
+    if (ctx == NULL) {
+        return PR_TRUE;
+    }
+
+    if (!sid) {
+        PORT_Assert(ss->xtnData.selectedPsk->type == ssl_psk_external);
+    } else if (!tls13_InWindow(ss, sid)) {
+        return PR_TRUE;
+    }
+
+    size = ctx->filters[0].k * (ctx->filters[0].bits + 7) / 8;
+    PORT_Assert(size <= SSL_MAX_BLOOM_FILTER_SIZE);
+    rv = tls13_HkdfExpandLabelRaw(ctx->key, ssl_hash_sha256,
+                                  ss->xtnData.pskBinder.data,
+                                  ss->xtnData.pskBinder.len,
+                                  label, strlen(label),
+                                  ss->protocolVariant, buf, size);
+    if (rv != SECSuccess) {
+        return PR_TRUE;
+    }
+
+    PR_EnterMonitor(ctx->lock);
+    tls13_AntiReplayUpdate(ctx, ssl_Time(ss));
+
+    index = ctx->current;
+    replay = sslBloom_Add(&ctx->filters[index], buf);
+    SSL_TRC(10, ("%d: TLS13[%d]: replay check current window: %s",
+                 SSL_GETPID(), ss->fd, replay ? "replay" : "ok"));
+    if (!replay) {
+        replay = sslBloom_Check(&ctx->filters[index ^ 1], buf);
+        SSL_TRC(10, ("%d: TLS13[%d]: replay check previous window: %s",
+                     SSL_GETPID(), ss->fd, replay ? "replay" : "ok"));
+    }
+
+    PR_ExitMonitor(ctx->lock);
+    return replay;
+}

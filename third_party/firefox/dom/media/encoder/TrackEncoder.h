@@ -1,0 +1,238 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef TrackEncoder_h_
+#define TrackEncoder_h_
+
+#include "AudioSegment.h"
+#include "EncodedFrame.h"
+#include "MediaQueue.h"
+#include "MediaTrackGraph.h"
+#include "TrackMetadataBase.h"
+#include "VideoSegment.h"
+
+namespace mozilla {
+
+class AbstractThread;
+class DriftCompensator;
+class TrackEncoder;
+
+class TrackEncoderListener {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(TrackEncoderListener)
+
+  virtual void Started(TrackEncoder* aEncoder) = 0;
+
+  virtual void Initialized(TrackEncoder* aEncoder) = 0;
+
+  virtual void Error(TrackEncoder* aEncoder) = 0;
+
+ protected:
+  virtual ~TrackEncoderListener() = default;
+};
+
+class TrackEncoder {
+ public:
+  TrackEncoder(TrackRate aTrackRate,
+               MediaQueue<EncodedFrame>& aEncodedDataQueue);
+
+  virtual void Cancel() = 0;
+
+  virtual void NotifyEndOfStream() = 0;
+
+  virtual already_AddRefed<TrackMetadataBase> GetMetadata() = 0;
+
+  MediaQueue<EncodedFrame>& EncodedDataQueue() { return mEncodedDataQueue; }
+
+  bool IsInitialized();
+
+  bool IsStarted();
+
+  bool IsEncodingComplete() const;
+
+  void RegisterListener(TrackEncoderListener* aListener);
+
+  bool UnregisterListener(TrackEncoderListener* aListener);
+
+  virtual void SetBitrate(const uint32_t aBitrate) = 0;
+
+  void SetWorkerThread(AbstractThread* aWorkerThread);
+
+  virtual size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) = 0;
+
+ protected:
+  virtual ~TrackEncoder() { MOZ_ASSERT(mListeners.IsEmpty()); }
+
+  void SetInitialized();
+
+  void SetStarted();
+
+  void OnError();
+
+  bool mInitialized;
+
+  bool mStarted;
+
+  bool mEndOfStream;
+
+  bool mCanceled;
+
+  uint32_t mInitCounter;
+
+  bool mSuspended;
+
+  const TrackRate mTrackRate;
+
+  RefPtr<AbstractThread> mWorkerThread;
+
+  MediaQueue<EncodedFrame>& mEncodedDataQueue;
+
+  nsTArray<RefPtr<TrackEncoderListener>> mListeners;
+};
+
+class AudioTrackEncoder : public TrackEncoder {
+ public:
+  AudioTrackEncoder(TrackRate aTrackRate,
+                    MediaQueue<EncodedFrame>& aEncodedDataQueue)
+      : TrackEncoder(aTrackRate, aEncodedDataQueue),
+        mChannels(0),
+        mNotInitDuration(0),
+        mAudioBitrate(0) {}
+
+  void Suspend();
+
+  void Resume();
+
+  void AppendAudioSegment(AudioSegment&& aSegment);
+
+  template <typename T>
+  static void InterleaveTrackData(nsTArray<const T*>& aInput, int32_t aDuration,
+                                  uint32_t aOutputChannels,
+                                  AudioDataValue* aOutput, float aVolume) {
+    if (aInput.Length() < aOutputChannels) {
+      AudioChannelsUpMix(&aInput, aOutputChannels,
+                         static_cast<const T*>(nullptr));
+    }
+
+    if (aInput.Length() > aOutputChannels) {
+      DownmixAndInterleave<T>(aInput, aDuration, aVolume, aOutputChannels,
+                              aOutput);
+    } else {
+      InterleaveAndConvertBuffer(aInput.Elements(), aDuration, aVolume,
+                                 aOutputChannels, aOutput);
+    }
+  }
+
+  static void InterleaveTrackData(AudioChunk& aChunk, int32_t aDuration,
+                                  uint32_t aOutputChannels,
+                                  AudioDataValue* aOutput);
+
+  static void DeInterleaveTrackData(AudioDataValue* aInput, int32_t aDuration,
+                                    int32_t aChannels, AudioDataValue* aOutput);
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) override;
+
+  void SetBitrate(const uint32_t aBitrate) override {
+    mAudioBitrate = aBitrate;
+  }
+
+  void TryInit(const AudioSegment& aSegment, TrackTime aDuration);
+
+  void Cancel() override;
+
+  void NotifyEndOfStream() override;
+
+ protected:
+  virtual int NumInputFramesPerPacket() const { return 0; }
+
+  virtual nsresult Init(int aChannels) = 0;
+
+  virtual nsresult Encode(AudioSegment* aSegment) = 0;
+
+  int mChannels;
+
+  AudioSegment mOutgoingBuffer;
+
+  TrackTime mNotInitDuration;
+
+  uint32_t mAudioBitrate;
+};
+
+enum class FrameDroppingMode {
+  ALLOW,     
+  DISALLOW,  
+};
+
+class VideoTrackEncoder : public TrackEncoder {
+ public:
+  VideoTrackEncoder(RefPtr<DriftCompensator> aDriftCompensator,
+                    TrackRate aTrackRate,
+                    MediaQueue<EncodedFrame>& aEncodedDataQueue,
+                    FrameDroppingMode aFrameDroppingMode);
+
+  void Suspend(const TimeStamp& aTime);
+
+  void Resume(const TimeStamp& aTime);
+
+  void Disable(const TimeStamp& aTime);
+
+  void Enable(const TimeStamp& aTime);
+
+  void AppendVideoSegment(VideoSegment&& aSegment);
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) override;
+
+  void SetBitrate(const uint32_t aBitrate) override {
+    mVideoBitrate = aBitrate;
+  }
+
+  void Init(const VideoSegment& aSegment, const TimeStamp& aTime,
+            size_t aFrameRateDetectionMinChunks);
+
+  TrackTime SecondsToMediaTime(double aS) const {
+    NS_ASSERTION(0 <= aS && aS <= TRACK_TICKS_MAX / TRACK_RATE_MAX,
+                 "Bad seconds");
+    return mTrackRate * aS;
+  }
+
+  void SetStartOffset(const TimeStamp& aStartOffset);
+
+  void Cancel() override;
+
+  void NotifyEndOfStream() override;
+
+  void AdvanceCurrentTime(const TimeStamp& aTime);
+
+ protected:
+  virtual nsresult Init(int32_t aWidth, int32_t aHeight, int32_t aDisplayWidth,
+                        int32_t aDisplayHeight, float aEstimatedFrameRate) = 0;
+
+  virtual nsresult Encode(VideoSegment* aSegment) = 0;
+
+  const RefPtr<DriftCompensator> mDriftCompensator;
+
+  VideoChunk mLastChunk;
+
+  VideoSegment mIncomingBuffer;
+
+  VideoSegment mOutgoingBuffer;
+
+  TrackTime mEncodedTicks;
+
+  TimeStamp mCurrentTime;
+
+  TimeStamp mStartTime;
+
+  TimeStamp mSuspendTime;
+
+  uint32_t mVideoBitrate;
+
+  FrameDroppingMode mFrameDroppingMode;
+
+  bool mEnabled;
+};
+
+}  
+
+#endif

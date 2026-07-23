@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_ParentChannelListener_h
+#define mozilla_net_ParentChannelListener_h
+
+#include "mozilla/dom/CanonicalBrowsingContext.h"
+#include "nsIAuthPromptProvider.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIMultiPartChannel.h"
+#include "nsINetworkInterceptController.h"
+#include "nsIStreamListener.h"
+#include "nsIThreadRetargetableStreamListener.h"
+
+namespace mozilla {
+namespace net {
+
+#define PARENT_CHANNEL_LISTENER \
+  {0xa4e2c10c, 0xceba, 0x457f, {0xa8, 0x0d, 0x78, 0x2b, 0x23, 0xba, 0xbd, 0x16}}
+
+class ParentChannelListener final : public nsIInterfaceRequestor,
+                                    public nsIMultiPartChannelListener,
+                                    public nsINetworkInterceptController,
+                                    public nsIThreadRetargetableStreamListener,
+                                    private nsIAuthPromptProvider {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSIMULTIPARTCHANNELLISTENER
+  NS_DECL_NSINETWORKINTERCEPTCONTROLLER
+  NS_DECL_NSIAUTHPROMPTPROVIDER
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+
+  NS_INLINE_DECL_STATIC_IID(PARENT_CHANNEL_LISTENER)
+
+  explicit ParentChannelListener(
+      nsIStreamListener* aListener,
+      dom::CanonicalBrowsingContext* aBrowsingContext);
+
+  void SetListenerAfterRedirect(nsIStreamListener* aListener);
+
+  dom::CanonicalBrowsingContext* GetBrowsingContext() const {
+    return mBrowsingContext;
+  }
+
+ private:
+  ~ParentChannelListener();
+
+  nsCOMPtr<nsIStreamListener> mNextListener;
+
+  nsCOMPtr<nsINetworkInterceptController> mInterceptController;
+
+  RefPtr<dom::CanonicalBrowsingContext> mBrowsingContext;
+
+  bool mIsMultiPart = false;
+};
+
+inline nsISupports* ToSupports(ParentChannelListener* aDoc) {
+  return static_cast<nsIInterfaceRequestor*>(aDoc);
+}
+
+}  
+}  
+
+#endif  // mozilla_net_ParentChannelListener_h

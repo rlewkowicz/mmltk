@@ -1,0 +1,37 @@
+// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(BASE_MESSAGE_PUMP_DEFAULT_H_)
+#define BASE_MESSAGE_PUMP_DEFAULT_H_
+
+#include "base/message_pump.h"
+#include "base/time.h"
+#include "base/waitable_event.h"
+
+namespace base {
+
+class MessagePumpDefault : public MessagePump {
+ public:
+  MessagePumpDefault();
+  ~MessagePumpDefault() = default;
+
+  virtual void Run(Delegate* delegate) override;
+  virtual void Quit() override;
+  virtual void ScheduleWork() override;
+  virtual void ScheduleDelayedWork(const TimeTicks& delayed_work_time) override;
+
+ protected:
+  bool keep_running_;
+
+  WaitableEvent event_;
+
+  TimeTicks delayed_work_time_;
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(MessagePumpDefault);
+};
+
+}  
+
+#endif

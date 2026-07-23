@@ -1,0 +1,208 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/DocGroup.h"
+
+#include "mozilla/AbstractThread.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/ThrottledEventQueue.h"
+#include "mozilla/dom/BlobURLProtocolHandler.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/CustomElementRegistry.h"
+#include "mozilla/dom/DOMTypes.h"
+#include "mozilla/dom/JSExecutionManager.h"
+#include "mozilla/dom/MediaSource.h"
+#include "mozilla/dom/WindowContext.h"
+#include "nsDOMMutationObserver.h"
+#include "nsIDirectTaskDispatcher.h"
+#include "nsIXULRuntime.h"
+#include "nsProxyRelease.h"
+#include "nsThread.h"
+#  include <unistd.h>  // for getpid()
+
+namespace mozilla::dom {
+
+AutoTArray<RefPtr<DocGroup>, 2>* DocGroup::sPendingDocGroups = nullptr;
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(DocGroup)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(DocGroup)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mSignalSlotList)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mBrowsingContextGroup)
+
+  for (const MediaSourceURLEntry& entry : tmp->mMediaSourceURLs.Values()) {
+    CycleCollectionNoteChild(cb, entry.mMediaSource.get(),
+                             "mMediaSourceURLs[].mMediaSource");
+    CycleCollectionNoteChild(cb, entry.mOwner.get(),
+                             "mMediaSourceURLs[].mOwner");
+  }
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(DocGroup)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mSignalSlotList)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mBrowsingContextGroup)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mMediaSourceURLs)
+
+  tmp->mDocuments.Clear();
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+already_AddRefed<DocGroup> DocGroup::Create(
+    BrowsingContextGroup* aBrowsingContextGroup, const DocGroupKey& aKey) {
+  return do_AddRef(new DocGroup(aBrowsingContextGroup, aKey));
+}
+
+void DocGroup::AssertMatches(const Document* aDocument) const {
+  nsCOMPtr<nsIPrincipal> principal = aDocument->NodePrincipal();
+
+  Maybe<bool> usesOriginAgentCluster =
+      mBrowsingContextGroup->UsesOriginAgentCluster(principal);
+  MOZ_RELEASE_ASSERT(
+      usesOriginAgentCluster.isSome(),
+      "Document principal with unknown OriginAgentCluster behaviour");
+  MOZ_RELEASE_ASSERT(*usesOriginAgentCluster == mKey.mOriginKeyed,
+                     "DocGroup origin keying does not match Principal");
+
+  nsresult rv = NS_ERROR_FAILURE;
+  nsAutoCString key;
+  if (mKey.mOriginKeyed) {
+    rv = principal->GetOrigin(key);
+  } else {
+    rv = principal->GetSiteOrigin(key);
+  }
+  if (NS_SUCCEEDED(rv)) {
+    MOZ_RELEASE_ASSERT(key == mKey.mKey,
+                       "DocGroup Key does not match Document");
+  }
+}
+
+void DocGroup::SetExecutionManager(JSExecutionManager* aManager) {
+  mExecutionManager = aManager;
+}
+
+mozilla::dom::CustomElementReactionsStack*
+DocGroup::CustomElementReactionsStack() {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (!mReactionsStack) {
+    mReactionsStack = new mozilla::dom::CustomElementReactionsStack();
+  }
+
+  return mReactionsStack;
+}
+
+void DocGroup::AddDocument(Document* aDocument) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!mDocuments.Contains(aDocument));
+  MOZ_ASSERT(mBrowsingContextGroup);
+  MOZ_ASSERT_IF(
+      aDocument->GetBrowsingContext(),
+      aDocument->GetBrowsingContext()->Group() == mBrowsingContextGroup);
+  mDocuments.AppendElement(aDocument);
+}
+
+void DocGroup::RemoveDocument(Document* aDocument) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mDocuments.Contains(aDocument));
+  mDocuments.RemoveElement(aDocument);
+
+  if (mDocuments.IsEmpty()) {
+    mBrowsingContextGroup = nullptr;
+  }
+}
+
+DocGroup::DocGroup(BrowsingContextGroup* aBrowsingContextGroup,
+                   const DocGroupKey& aKey)
+    : mKey(aKey),
+      mBrowsingContextGroup(aBrowsingContextGroup),
+      mAgentClusterId(nsID::GenerateUUID()) {
+  MOZ_ASSERT(NS_IsMainThread());
+  mArena = new mozilla::dom::DOMArena(aKey.mKey);
+}
+
+DocGroup::~DocGroup() {
+  MOZ_RELEASE_ASSERT(NS_IsMainThread());
+  MOZ_RELEASE_ASSERT(mDocuments.IsEmpty());
+}
+
+void DocGroup::SignalSlotChange(HTMLSlotElement& aSlot) {
+  MOZ_ASSERT(!mSignalSlotList.Contains(&aSlot));
+  mSignalSlotList.AppendElement(&aSlot);
+
+  if (!sPendingDocGroups) {
+    nsDOMMutationObserver::QueueMutationObserverMicroTask();
+    sPendingDocGroups = new AutoTArray<RefPtr<DocGroup>, 2>;
+  }
+
+  sPendingDocGroups->AppendElement(this);
+}
+
+nsTArray<RefPtr<HTMLSlotElement>> DocGroup::MoveSignalSlotList() {
+  for (const RefPtr<HTMLSlotElement>& slot : mSignalSlotList) {
+    slot->RemovedFromSignalSlotList();
+  }
+  return std::move(mSignalSlotList);
+}
+
+bool DocGroup::IsActive() const {
+  for (Document* doc : mDocuments) {
+    if (doc->IsCurrentActiveDocument()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+nsresult DocGroup::RegisterMediaSourceURL(nsGlobalWindowInner* aWindow,
+                                          MediaSource* aMediaSource,
+                                          nsACString& aURL) {
+  NS_ENSURE_ARG(aWindow);
+  NS_ENSURE_ARG(aMediaSource);
+
+  if (NS_WARN_IF(aWindow->IsDying()) ||
+      NS_WARN_IF(aWindow->GetDocGroup() != this)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsIPrincipal> principal = aWindow->PrincipalOrNull();
+  if (NS_WARN_IF(!principal)) {
+    return NS_ERROR_DOM_SECURITY_ERR;
+  }
+  nsresult rv = BlobURLProtocolHandler::GenerateURIString(principal, aURL);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  MOZ_ASSERT(!mMediaSourceURLs.Contains(aURL), "URL collision?");
+  mMediaSourceURLs.InsertOrUpdate(
+      aURL,
+      MediaSourceURLEntry{.mMediaSource = aMediaSource, .mOwner = aWindow});
+
+  aWindow->NoteMediaSourceURL(aURL);
+  return NS_OK;
+}
+
+bool DocGroup::UnregisterMediaSourceURL(const nsACString& aURL,
+                                        bool aNotifyWindow) {
+  auto removed = mMediaSourceURLs.Extract(aURL);
+  if (aNotifyWindow && removed && removed->mOwner) {
+    removed->mOwner->UnnoteMediaSourceURL(aURL);
+  }
+  return removed.isSome();
+}
+
+already_AddRefed<MediaSource> DocGroup::LookupMediaSourceURL(nsIURI* aURI) {
+  MOZ_ASSERT(aURI && aURI->SchemeIs(BLOBURI_SCHEME));
+
+  nsAutoCString spec;
+  if (NS_WARN_IF(NS_FAILED(aURI->GetSpec(spec)))) {
+    return nullptr;
+  }
+  if (auto entry = mMediaSourceURLs.Lookup(spec)) {
+    return do_AddRef(entry->mMediaSource);
+  }
+  return nullptr;
+}
+
+}  

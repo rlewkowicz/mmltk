@@ -1,0 +1,124 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_CodeCoverage_h
+#define vm_CodeCoverage_h
+
+#include "mozilla/Vector.h"
+
+#include "ds/LifoAlloc.h"
+
+#include "js/AllocPolicy.h"
+#include "js/HashTable.h"
+#include "js/Printer.h"
+#include "js/TypeDecls.h"
+#include "js/Utility.h"
+#include "vm/JSScript.h"
+
+namespace js {
+namespace coverage {
+
+class LCovSource {
+ public:
+  LCovSource(LifoAlloc* alloc, JS::UniqueChars name);
+
+  bool match(const char* name) const { return strcmp(name_.get(), name) == 0; }
+
+  bool hadOutOfMemory() const { return hadOOM_; }
+
+  bool isComplete() const { return hasTopLevelScript_; }
+
+  void writeScript(JSScript* script, const char* scriptName);
+
+  void exportInto(GenericPrinter& out);
+
+ private:
+  JS::UniqueChars name_;
+
+  LSprinter outFN_;
+  LSprinter outFNDA_;
+  size_t numFunctionsFound_;
+  size_t numFunctionsHit_;
+
+  LSprinter outBRDA_;
+  size_t numBranchesFound_;
+  size_t numBranchesHit_;
+
+  HashMap<size_t, uint64_t, DefaultHasher<size_t>, SystemAllocPolicy> linesHit_;
+  size_t numLinesInstrumented_;
+  size_t numLinesHit_;
+  size_t maxLineHit_;
+
+  bool hasTopLevelScript_ : 1;
+  bool hadOOM_ : 1;
+};
+
+class LCovRealm {
+ public:
+  explicit LCovRealm(JS::Realm* realm);
+  ~LCovRealm();
+
+  void exportInto(GenericPrinter& out, bool* isEmpty) const;
+
+  friend bool InitScriptCoverage(JSContext* cx, JSScript* script);
+
+ private:
+  void writeRealmName(JS::Realm* realm);
+
+  LCovSource* lookupOrAdd(const char* name);
+
+  const char* getScriptName(JSScript* script);
+
+ private:
+  using LCovSourceVector =
+      mozilla::Vector<LCovSource*, 16, LifoAllocPolicy<Fallible>>;
+
+  LifoAlloc alloc_;
+
+  LSprinter outTN_;
+
+  LCovSourceVector sources_;
+};
+
+class LCovRuntime {
+ public:
+  LCovRuntime();
+  ~LCovRuntime();
+
+  void init();
+
+  void writeLCovResult(LCovRealm& realm);
+
+ private:
+  bool fillWithFilename(char* name, size_t length);
+
+  void finishFile();
+
+ private:
+  Fprinter out_;
+
+  uint32_t pid_;
+
+  bool isEmpty_;
+};
+
+void InitLCov();
+
+void EnableLCov();
+
+inline bool IsLCovEnabled() {
+  extern bool gLCovIsEnabled;
+  return gLCovIsEnabled;
+}
+
+bool InitScriptCoverage(JSContext* cx, JSScript* script);
+
+bool CollectScriptCoverage(JSScript* script);
+
+bool MaybeWriteScriptCoverage(JSScript* script, const ScriptLCovEntry& entry);
+
+}  
+}  
+
+#endif  // vm_CodeCoverage_h

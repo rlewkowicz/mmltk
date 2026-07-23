@@ -1,0 +1,272 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "IdleTaskRunner.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/TaskController.h"
+#include "nsRefreshDriver.h"
+
+namespace mozilla {
+
+already_AddRefed<IdleTaskRunner> IdleTaskRunner::Create(
+    const CallbackType& aCallback, const nsACString& aRunnableName,
+    TimeDuration aStartDelay, TimeDuration aMaxDelay,
+    TimeDuration aMinimumUsefulBudget, bool aRepeating,
+    const MayStopProcessingCallbackType& aMayStopProcessing,
+    const RequestInterruptCallbackType& aRequestInterrupt) {
+  if (aMayStopProcessing && aMayStopProcessing()) {
+    return nullptr;
+  }
+
+  RefPtr<IdleTaskRunner> runner = new IdleTaskRunner(
+      aCallback, aRunnableName, aStartDelay, aMaxDelay, aMinimumUsefulBudget,
+      aRepeating, aMayStopProcessing, aRequestInterrupt);
+  runner->Schedule(false);  
+  return runner.forget();
+}
+
+class IdleTaskRunnerTask : public Task {
+ public:
+  explicit IdleTaskRunnerTask(IdleTaskRunner* aRunner)
+      : Task(Kind::MainThreadOnly, EventQueuePriority::Idle),
+        mRunner(aRunner),
+        mRequestInterrupt(aRunner->mRequestInterrupt) {
+    SetManager(TaskController::Get()->GetIdleTaskManager());
+  }
+
+  TaskResult Run() override {
+    if (mRunner) {
+      RefPtr<IdleTaskRunner> runner(mRunner);
+      runner->Run();
+    }
+    return TaskResult::Complete;
+  }
+
+  void SetIdleDeadline(TimeStamp aDeadline) override {
+    if (mRunner) {
+      mRunner->SetIdleDeadline(aDeadline);
+    }
+  }
+
+  void Cancel() { mRunner = nullptr; }
+
+  bool GetName(nsACString& aName) override {
+    if (mRunner) {
+      aName.Assign(mRunner->GetName());
+    } else {
+      aName = "ExpiredIdleTaskRunner"_ns;
+    }
+    return true;
+  }
+
+  void RequestInterrupt(uint32_t aInterruptPriority) override {
+    if (mRequestInterrupt) {
+      mRequestInterrupt(aInterruptPriority);
+    }
+  }
+
+ private:
+  IdleTaskRunner* mRunner;
+
+  IdleTaskRunner::RequestInterruptCallbackType mRequestInterrupt;
+};
+
+IdleTaskRunner::IdleTaskRunner(
+    const CallbackType& aCallback, const nsACString& aRunnableName,
+    TimeDuration aStartDelay, TimeDuration aMaxDelay,
+    TimeDuration aMinimumUsefulBudget, bool aRepeating,
+    const MayStopProcessingCallbackType& aMayStopProcessing,
+    const RequestInterruptCallbackType& aRequestInterrupt)
+    : mCallback(aCallback),
+      mStartTime(TimeStamp::Now() + aStartDelay),
+      mMaxDelay(aMaxDelay),
+      mMinimumUsefulBudget(aMinimumUsefulBudget),
+      mRepeating(aRepeating),
+      mTimerActive(false),
+      mMayStopProcessing(aMayStopProcessing),
+      mRequestInterrupt(aRequestInterrupt),
+      mName(aRunnableName) {}
+
+void IdleTaskRunner::Run() {
+  if (!mCallback) {
+    return;
+  }
+
+  TimeStamp now = TimeStamp::Now();
+
+  bool overdueForIdle = mDeadline.IsNull();
+  bool didRun = false;
+  bool allowIdleDispatch = false;
+
+  if (mTask) {
+    nsRefreshDriver::CancelIdleTask(mTask);
+    mTask->Cancel();
+    mTask = nullptr;
+  }
+
+  if (overdueForIdle || ((now + mMinimumUsefulBudget) < mDeadline)) {
+    CancelTimer();
+    didRun = mCallback(mDeadline);
+    allowIdleDispatch = didRun;
+  } else if (now >= mDeadline) {
+    allowIdleDispatch = true;
+  }
+
+  if (mCallback && (mRepeating || !didRun)) {
+    Schedule(allowIdleDispatch);
+  } else {
+    mCallback = nullptr;
+  }
+}
+
+void IdleTaskRunner::TimedOut(nsITimer* aTimer, void* aClosure) {
+  RefPtr<IdleTaskRunner> runner = static_cast<IdleTaskRunner*>(aClosure);
+  runner->mTimerActive = false;
+  runner->Run();
+}
+
+void IdleTaskRunner::SetIdleDeadline(mozilla::TimeStamp aDeadline) {
+  mDeadline = aDeadline;
+}
+
+void IdleTaskRunner::SetMinimumUsefulBudget(int64_t aMinimumUsefulBudget) {
+  mMinimumUsefulBudget = TimeDuration::FromMilliseconds(aMinimumUsefulBudget);
+}
+
+void IdleTaskRunner::SetTimer(TimeDuration aDelay, nsIEventTarget* aTarget) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aTarget->IsOnCurrentThread());
+  SetTimerInternal(aDelay);
+}
+
+void IdleTaskRunner::Cancel() {
+  CancelTimer();
+  mTimer = nullptr;
+  mScheduleTimer = nullptr;
+  mCallback = nullptr;
+}
+
+static void ScheduleTimedOut(nsITimer* aTimer, void* aClosure) {
+  RefPtr<IdleTaskRunner> runnable = static_cast<IdleTaskRunner*>(aClosure);
+  runnable->Schedule(true);
+}
+
+void IdleTaskRunner::Schedule(bool aAllowIdleDispatch) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (!mCallback) {
+    return;
+  }
+
+  if (mMayStopProcessing && mMayStopProcessing()) {
+    Cancel();
+    return;
+  }
+
+  mDeadline = TimeStamp();
+
+  TimeStamp now = TimeStamp::Now();
+
+  if (aAllowIdleDispatch) {
+    SetTimerInternal(mMaxDelay);
+    if (!mTask) {
+      mTask = new IdleTaskRunnerTask(this);
+      RefPtr<Task> task(mTask);
+      TaskController::Get()->AddTask(task.forget());
+    }
+    return;
+  }
+
+  bool useRefreshDriver = false;
+  if (now >= mStartTime) {
+    useRefreshDriver =
+        (nsRefreshDriver::GetIdleDeadlineHint(
+             now, nsRefreshDriver::IdleCheck::OnlyThisProcessRefreshDriver) !=
+         now);
+  }
+
+  if (useRefreshDriver) {
+    if (!mTask) {
+      mTask = new IdleTaskRunnerTask(this);
+      nsRefreshDriver::DispatchIdleTaskAfterTickUnlessExists(mTask);
+    }
+    SetTimerInternal(mMaxDelay);
+  } else {
+    if (!mScheduleTimer) {
+      mScheduleTimer = NS_NewTimer();
+      if (!mScheduleTimer) {
+        return;
+      }
+    } else {
+      mScheduleTimer->Cancel();
+    }
+    uint32_t waitToSchedule = 16; 
+    if (now < mStartTime) {
+      waitToSchedule = (mStartTime - now).ToMilliseconds() + 1;
+    }
+    DebugOnly<nsresult> rv = mScheduleTimer->InitWithNamedFuncCallback(
+        ScheduleTimedOut, this, waitToSchedule,
+        nsITimer::TYPE_ONE_SHOT_LOW_PRIORITY, mName);
+#ifdef DEBUG
+    if (NS_FAILED(rv)) {
+      NS_WARNING(nsCString("Failed to set IdleTaskRunner timer for:"_ns + mName)
+                     .get());
+    }
+#endif
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+  }
+}
+
+IdleTaskRunner::~IdleTaskRunner() { CancelTimer(); }
+
+void IdleTaskRunner::CancelTimer() {
+  if (mTask) {
+    nsRefreshDriver::CancelIdleTask(mTask);
+    mTask->Cancel();
+    mTask = nullptr;
+  }
+  if (mTimer) {
+    mTimer->Cancel();
+  }
+  if (mScheduleTimer) {
+    mScheduleTimer->Cancel();
+  }
+  mTimerActive = false;
+}
+
+void IdleTaskRunner::SetTimerInternal(TimeDuration aDelay) {
+  if (mTimerActive) {
+    return;
+  }
+  ResetTimer(aDelay);
+}
+
+void IdleTaskRunner::ResetTimer(TimeDuration aDelay) {
+  MOZ_ASSERT(NS_IsMainThread());
+  mTimerActive = false;
+
+  if (!mTimer) {
+    mTimer = NS_NewTimer();
+  } else {
+    mTimer->Cancel();
+  }
+
+  if (mTimer) {
+    nsresult rv = mTimer->InitWithNamedFuncCallback(
+        TimedOut, this, aDelay.ToMilliseconds(), nsITimer::TYPE_ONE_SHOT,
+        mName);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      if (AppShutdown::IsInOrBeyond(ShutdownPhase::XPCOMShutdownThreads)) {
+        Cancel();
+      } else {
+        MOZ_ASSERT_UNREACHABLE(
+            "We rely on timers that target the main thread to be infallible "
+            "before shutdown.");
+      }
+    } else {
+      mTimerActive = true;
+    }
+  }
+}
+
+}  

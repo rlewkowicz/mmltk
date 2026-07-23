@@ -1,0 +1,72 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_SurfaceFromElementResult_h
+#define mozilla_SurfaceFromElementResult_h
+
+#include <cstdint>
+
+#include "ImageContainer.h"
+#include "gfxTypes.h"
+#include "mozilla/gfx/Point.h"
+#include "nsCOMPtr.h"
+
+class imgIContainer;
+class imgIRequest;
+class nsIPrincipal;
+class nsLayoutUtils;
+
+namespace mozilla {
+
+namespace dom {
+class CanvasRenderingContext2D;
+class ImageBitmap;
+}  
+
+namespace gfx {
+class SourceSurface;
+}
+
+struct DirectDrawInfo {
+  nsCOMPtr<imgIContainer> mImgContainer;
+  uint32_t mWhichFrame;
+  uint32_t mDrawingFlags;
+};
+
+struct SurfaceFromElementResult {
+  friend class mozilla::dom::CanvasRenderingContext2D;
+  friend class mozilla::dom::ImageBitmap;
+  friend class ::nsLayoutUtils;
+
+
+  RefPtr<mozilla::layers::Image> mLayersImage;
+
+ protected:
+  RefPtr<mozilla::gfx::SourceSurface> mSourceSurface;
+
+ public:
+  DirectDrawInfo mDrawInfo;
+
+  mozilla::gfx::IntSize mSize;
+  mozilla::gfx::IntSize mIntrinsicSize;
+  mozilla::Maybe<mozilla::gfx::IntRect> mCropRect;
+  nsCOMPtr<nsIPrincipal> mPrincipal;
+  nsCOMPtr<imgIRequest> mImageRequest;
+  bool mHadCrossOriginRedirects;
+  bool mIsWriteOnly;
+  bool mIsStillLoading;
+  bool mHasSize;
+  bool mCORSUsed;
+
+  gfxAlphaType mAlphaType;
+
+
+  SurfaceFromElementResult();
+
+  const RefPtr<mozilla::gfx::SourceSurface>& GetSourceSurface();
+};
+
+}  
+
+#endif  // mozilla_SurfaceFromElementResult_h

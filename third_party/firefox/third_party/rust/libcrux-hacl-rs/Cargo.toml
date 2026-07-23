@@ -1,0 +1,23 @@
+
+[package]
+edition = "2021"
+name = "libcrux-hacl-rs"
+version = "0.0.3"
+authors = ["Cryspen"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Formally verified Rust code extracted from HACL* - helper library"
+homepage = "https://github.com/cryspen/libcrux"
+license = "Apache-2.0"
+repository = "https://github.com/cryspen/libcrux"
+
+[lib]
+name = "libcrux_hacl_rs"
+path = "src/lib.rs"
+
+[dependencies.libcrux-macros]
+version = "=0.0.3"

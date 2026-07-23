@@ -1,0 +1,150 @@
+// Copyright 2016 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "compiler/translator/tree_ops/DeferGlobalInitializers.h"
+
+#include <vector>
+
+#include "compiler/translator/Compiler.h"
+#include "compiler/translator/IntermNode.h"
+#include "compiler/translator/StaticType.h"
+#include "compiler/translator/SymbolTable.h"
+#include "compiler/translator/tree_ops/InitializeVariables.h"
+#include "compiler/translator/tree_util/FindMain.h"
+#include "compiler/translator/tree_util/IntermNode_util.h"
+#include "compiler/translator/tree_util/ReplaceVariable.h"
+
+namespace sh
+{
+
+namespace
+{
+
+constexpr const ImmutableString kInitGlobalsString("initGlobals");
+
+void GetDeferredInitializers(TIntermDeclaration *declaration,
+                             bool initializeUninitializedGlobals,
+                             bool canUseLoopsToInitialize,
+                             bool forceDeferNonConstGlobalInitializers,
+                             TIntermSequence *deferredInitializersOut,
+                             std::vector<const TVariable *> *variablesToReplaceOut,
+                             TSymbolTable *symbolTable)
+{
+    ASSERT(declaration->getSequence()->size() == 1);
+
+    TIntermNode *declarator = declaration->getSequence()->back();
+    TIntermBinary *init     = declarator->getAsBinaryNode();
+    if (init)
+    {
+        TIntermSymbol *symbolNode = init->getLeft()->getAsSymbolNode();
+        ASSERT(symbolNode);
+        TIntermTyped *expression = init->getRight();
+
+        if (expression->getQualifier() != EvqConst || !expression->hasConstantValue() ||
+            (forceDeferNonConstGlobalInitializers && symbolNode->getQualifier() != EvqConst))
+        {
+
+            ASSERT(symbolNode->getQualifier() == EvqConst ||
+                   symbolNode->getQualifier() == EvqGlobal);
+            if (symbolNode->getQualifier() == EvqConst)
+            {
+                variablesToReplaceOut->push_back(&symbolNode->variable());
+            }
+
+            TIntermBinary *deferredInit =
+                new TIntermBinary(EOpAssign, symbolNode->deepCopy(), init->getRight());
+            deferredInitializersOut->push_back(deferredInit);
+
+            declaration->replaceChildNode(init, symbolNode);
+        }
+    }
+    else if (initializeUninitializedGlobals)
+    {
+        TIntermSymbol *symbolNode = declarator->getAsSymbolNode();
+        ASSERT(symbolNode);
+
+        if (symbolNode->variable().symbolType() == SymbolType::AngleInternal ||
+            symbolNode->variable().symbolType() == SymbolType::Empty)
+            return;
+
+        if (symbolNode->getQualifier() == EvqGlobal)
+        {
+            TIntermSequence initCode;
+            CreateInitCode(symbolNode, canUseLoopsToInitialize, &initCode, symbolTable);
+            deferredInitializersOut->insert(deferredInitializersOut->end(), initCode.begin(),
+                                            initCode.end());
+        }
+    }
+}
+
+void InsertInitCallToMain(TIntermBlock *root,
+                          TIntermSequence *deferredInitializers,
+                          TSymbolTable *symbolTable)
+{
+    TIntermBlock *initGlobalsBlock = new TIntermBlock();
+    initGlobalsBlock->getSequence()->swap(*deferredInitializers);
+
+    TFunction *initGlobalsFunction =
+        new TFunction(symbolTable, kInitGlobalsString, SymbolType::AngleInternal,
+                      StaticType::GetBasic<EbtVoid, EbpUndefined>(), false);
+
+    TIntermFunctionPrototype *initGlobalsFunctionPrototype =
+        CreateInternalFunctionPrototypeNode(*initGlobalsFunction);
+    root->getSequence()->insert(root->getSequence()->begin(), initGlobalsFunctionPrototype);
+    TIntermFunctionDefinition *initGlobalsFunctionDefinition =
+        CreateInternalFunctionDefinitionNode(*initGlobalsFunction, initGlobalsBlock);
+    root->appendStatement(initGlobalsFunctionDefinition);
+
+    TIntermSequence emptySequence;
+    TIntermAggregate *initGlobalsCall =
+        TIntermAggregate::CreateFunctionCall(*initGlobalsFunction, &emptySequence);
+
+    TIntermBlock *mainBody = FindMainBody(root);
+    mainBody->getSequence()->insert(mainBody->getSequence()->begin(), initGlobalsCall);
+}
+
+}  
+
+bool DeferGlobalInitializers(TCompiler *compiler,
+                             TIntermBlock *root,
+                             bool initializeUninitializedGlobals,
+                             bool canUseLoopsToInitialize,
+                             bool forceDeferNonConstGlobalInitializers,
+                             TSymbolTable *symbolTable)
+{
+    TIntermSequence deferredInitializers;
+    std::vector<const TVariable *> variablesToReplace;
+
+    for (TIntermNode *statement : *root->getSequence())
+    {
+        TIntermDeclaration *declaration = statement->getAsDeclarationNode();
+        if (declaration)
+        {
+            GetDeferredInitializers(declaration, initializeUninitializedGlobals,
+                                    canUseLoopsToInitialize, forceDeferNonConstGlobalInitializers,
+                                    &deferredInitializers, &variablesToReplace, symbolTable);
+        }
+    }
+
+    if (!deferredInitializers.empty())
+    {
+        InsertInitCallToMain(root, &deferredInitializers, symbolTable);
+    }
+
+    for (const TVariable *var : variablesToReplace)
+    {
+        TType *replacementType = new TType(var->getType());
+        replacementType->setQualifier(EvqGlobal);
+        TVariable *replacement =
+            new TVariable(symbolTable, var->name(), replacementType, var->symbolType());
+        if (!ReplaceVariable(compiler, root, var, replacement))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+}  

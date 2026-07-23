@@ -1,0 +1,387 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "TimeUnits.h"
+
+#include <inttypes.h>
+
+#include <cmath>
+#include <cstdint>
+#include <limits>
+
+#include "Intervals.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/FloatingPoint.h"
+#include "mozilla/IntegerPrintfMacros.h"
+#include "mozilla/TimeStamp.h"
+#include "nsDebug.h"
+#include "nsPrintfCString.h"
+#include "nsStringFwd.h"
+
+namespace mozilla::media {
+class TimeIntervals;
+}  
+
+namespace mozilla {
+
+namespace {
+struct Int96 {
+  bool operator==(const Int96& aOther) const {
+    return high == aOther.high && low == aOther.low;
+  }
+  bool operator>=(const Int96& aOther) const {
+    if (high == aOther.high) {
+      return low >= aOther.low;
+    }
+    return high > aOther.high;
+  }
+  bool operator<=(const Int96& aOther) const {
+    if (high == aOther.high) {
+      return low <= aOther.low;
+    }
+    return high < aOther.high;
+  }
+
+  const int64_t high;
+  const uint32_t low;
+};
+}  
+
+static Int96 MultS64xU32(const CheckedInt64& a, int64_t b) {
+  MOZ_ASSERT(b >= 0);
+  MOZ_ASSERT(b <= UINT32_MAX);
+  int64_t high = (a.value() >> 32) * b;
+  uint64_t low = a.value() & 0xFFFFFFFF;
+  low *= b;
+  high += AssertedCast<int64_t>(low >> 32);
+  return Int96{high, AssertedCast<uint32_t>(low & 0xFFFFFFFF)};
+};
+
+namespace media {
+
+TimeUnit TimeUnit::FromSeconds(double aValue, int64_t aBase) {
+  MOZ_ASSERT(!std::isnan(aValue));
+  MOZ_ASSERT(aBase > 0);
+
+  if (std::isinf(aValue)) {
+    return aValue > 0 ? FromInfinity() : FromNegativeInfinity();
+  }
+  double inBase = aValue * static_cast<double>(aBase);
+  if (std::abs(inBase) >=
+      static_cast<double>(std::numeric_limits<int64_t>::max())) {
+    NS_WARNING(
+        nsPrintfCString("Warning: base %" PRId64
+                        " is too high to represent %lfs, returning Infinity.",
+                        aBase, aValue)
+            .get());
+    if (inBase > 0) {
+      return TimeUnit::FromInfinity();
+    }
+    return TimeUnit::FromNegativeInfinity();
+  }
+
+  if (inBase > std::pow(2, std::numeric_limits<double>::digits) - 1) {
+    NS_WARNING(nsPrintfCString("Warning: base %" PRId64
+                               " is too high to represent %lfs accurately.",
+                               aBase, aValue)
+                   .get());
+  }
+  return TimeUnit(static_cast<int64_t>(std::round(inBase)), aBase);
+}
+
+TimeUnit TimeUnit::FromInfinity() { return TimeUnit(INT64_MAX); }
+
+TimeUnit TimeUnit::FromNegativeInfinity() { return TimeUnit(INT64_MIN); }
+
+TimeUnit TimeUnit::FromTimeDuration(const TimeDuration& aDuration) {
+  return TimeUnit(AssertedCast<int64_t>(aDuration.ToMicroseconds()),
+                  USECS_PER_S);
+}
+
+TimeUnit TimeUnit::Invalid() {
+  TimeUnit ret;
+  ret.mTicks = CheckedInt64(INT64_MAX);
+  ret.mTicks += 1;
+  return ret;
+}
+
+int64_t TimeUnit::ToMilliseconds() const { return ToCommonUnit(MSECS_PER_S); }
+
+int64_t TimeUnit::ToMicroseconds() const { return ToCommonUnit(USECS_PER_S); }
+
+int64_t TimeUnit::ToNanoseconds() const { return ToCommonUnit(NSECS_PER_S); }
+
+int64_t TimeUnit::ToTicksAtRate(int64_t aRate) const {
+  if (aRate == mBase) {
+    return mTicks.value();
+  }
+  return mTicks.value() * aRate / mBase;
+}
+
+bool TimeUnit::IsBase(int64_t aBase) const { return aBase == mBase; }
+
+double TimeUnit::ToSeconds() const {
+  if (IsPosInf()) {
+    return PositiveInfinity<double>();
+  }
+  if (IsNegInf()) {
+    return NegativeInfinity<double>();
+  }
+  return static_cast<double>(mTicks.value()) / static_cast<double>(mBase);
+}
+
+nsCString TimeUnit::ToString() const {
+  nsCString dump;
+  if (mTicks.isValid()) {
+    dump += nsPrintfCString("{%" PRId64 ",%" PRId64 "}", mTicks.value(), mBase);
+  } else {
+    dump += nsLiteralCString("{invalid}"_ns);
+  }
+  return dump;
+}
+
+TimeDuration TimeUnit::ToTimeDuration() const {
+  return TimeDuration::FromSeconds(ToSeconds());
+}
+
+bool TimeUnit::IsInfinite() const { return IsPosInf() || IsNegInf(); }
+
+bool TimeUnit::IsPositive() const { return mTicks.value() > 0; }
+
+bool TimeUnit::IsPositiveOrZero() const { return mTicks.value() >= 0; }
+
+bool TimeUnit::IsZero() const { return mTicks.value() == 0; }
+
+bool TimeUnit::IsNegative() const { return mTicks.value() < 0; }
+
+bool TimeUnit::EqualsAtLowestResolution(const TimeUnit& aOther) const {
+  MOZ_ASSERT(IsValid() && aOther.IsValid());
+  if (aOther.mBase == mBase) {
+    return mTicks == aOther.mTicks;
+  }
+  if (mBase > aOther.mBase) {
+    TimeUnit thisInBase = ToBase(aOther.mBase);
+    return thisInBase.mTicks == aOther.mTicks;
+  }
+  TimeUnit otherInBase = aOther.ToBase(mBase);
+  return otherInBase.mTicks == mTicks;
+}
+
+bool TimeUnit::operator==(const TimeUnit& aOther) const {
+  MOZ_ASSERT(IsValid() && aOther.IsValid());
+  if (aOther.mBase == mBase) {
+    return mTicks == aOther.mTicks;
+  }
+  if ((IsPosInf() && aOther.IsPosInf()) || (IsNegInf() && aOther.IsNegInf())) {
+    return true;
+  }
+  if ((IsPosInf() && !aOther.IsPosInf()) ||
+      (IsNegInf() && !aOther.IsNegInf())) {
+    return false;
+  }
+  Int96 lhs = MultS64xU32(mTicks, aOther.mBase);
+  Int96 rhs = MultS64xU32(aOther.mTicks, mBase);
+  return lhs == rhs;
+}
+bool TimeUnit::operator!=(const TimeUnit& aOther) const {
+  MOZ_ASSERT(IsValid() && aOther.IsValid());
+  return !(aOther == *this);
+}
+bool TimeUnit::operator>=(const TimeUnit& aOther) const {
+  MOZ_ASSERT(IsValid() && aOther.IsValid());
+  if (aOther.mBase == mBase) {
+    return mTicks.value() >= aOther.mTicks.value();
+  }
+  if ((!IsPosInf() && aOther.IsPosInf()) ||
+      (IsNegInf() && !aOther.IsNegInf())) {
+    return false;
+  }
+  if ((IsPosInf() && !aOther.IsPosInf()) ||
+      (!IsNegInf() && aOther.IsNegInf())) {
+    return true;
+  }
+  Int96 lhs = MultS64xU32(mTicks, aOther.mBase);
+  Int96 rhs = MultS64xU32(aOther.mTicks, mBase);
+  return lhs >= rhs;
+}
+bool TimeUnit::operator>(const TimeUnit& aOther) const {
+  return !(*this <= aOther);
+}
+bool TimeUnit::operator<=(const TimeUnit& aOther) const {
+  MOZ_ASSERT(IsValid() && aOther.IsValid());
+  if (aOther.mBase == mBase) {
+    return mTicks.value() <= aOther.mTicks.value();
+  }
+  if ((!IsPosInf() && aOther.IsPosInf()) ||
+      (IsNegInf() && !aOther.IsNegInf())) {
+    return true;
+  }
+  if ((IsPosInf() && !aOther.IsPosInf()) ||
+      (!IsNegInf() && aOther.IsNegInf())) {
+    return false;
+  }
+  Int96 lhs = MultS64xU32(mTicks, aOther.mBase);
+  Int96 rhs = MultS64xU32(aOther.mTicks, mBase);
+  return lhs <= rhs;
+}
+bool TimeUnit::operator<(const TimeUnit& aOther) const {
+  return !(*this >= aOther);
+}
+
+TimeUnit TimeUnit::operator%(const TimeUnit& aOther) const {
+  MOZ_ASSERT(IsValid() && aOther.IsValid());
+  if (aOther.mBase == mBase) {
+    return TimeUnit(mTicks % aOther.mTicks, mBase);
+  }
+  double a = ToSeconds();
+  double b = aOther.ToSeconds();
+  return TimeUnit::FromSeconds(fmod(a, b), mBase);
+}
+
+TimeUnit TimeUnit::operator+(const TimeUnit& aOther) const {
+  if (IsInfinite() || aOther.IsInfinite()) {
+    double result = ToSeconds() + aOther.ToSeconds();
+    return std::isnan(result) ? TimeUnit::Invalid() : FromSeconds(result);
+  }
+  if (aOther.mBase == mBase) {
+    return TimeUnit(mTicks + aOther.mTicks, mBase);
+  }
+  if (aOther.IsZero()) {
+    return *this;
+  }
+  if (IsZero()) {
+    return aOther;
+  }
+
+  double error;
+  TimeUnit inBase = aOther.ToBase(mBase, error);
+  if (error == 0.0 && inBase.IsValid()) {
+    return *this + inBase;
+  }
+
+  double a = ToSeconds();
+  double b = aOther.ToSeconds();
+  return TimeUnit::FromSeconds(a + b, mBase);
+}
+
+TimeUnit TimeUnit::operator-(const TimeUnit& aOther) const {
+  if (IsInfinite() || aOther.IsInfinite()) {
+    double result = ToSeconds() - aOther.ToSeconds();
+    return std::isnan(result) ? TimeUnit::Invalid() : FromSeconds(result);
+  }
+  if (aOther.mBase == mBase) {
+    return TimeUnit(mTicks - aOther.mTicks, mBase);
+  }
+  if (aOther.IsZero()) {
+    return *this;
+  }
+
+  if (IsZero()) {
+    return TimeUnit(-aOther.mTicks, aOther.mBase);
+  }
+
+  double error = 0.0;
+  TimeUnit inBase = aOther.ToBase(mBase, error);
+  if (error == 0 && inBase.IsValid()) {
+    return *this - inBase;
+  }
+
+  double a = ToSeconds();
+  double b = aOther.ToSeconds();
+  return TimeUnit::FromSeconds(a - b, mBase);
+}
+TimeUnit& TimeUnit::operator+=(const TimeUnit& aOther) {
+  if (aOther.mBase == mBase) {
+    mTicks += aOther.mTicks;
+    return *this;
+  }
+  *this = *this + aOther;
+  return *this;
+}
+TimeUnit& TimeUnit::operator-=(const TimeUnit& aOther) {
+  if (aOther.mBase == mBase) {
+    mTicks -= aOther.mTicks;
+    return *this;
+  }
+  *this = *this - aOther;
+  return *this;
+}
+
+TimeUnit TimeUnit::MultDouble(double aVal) const {
+  double multiplied = AssertedCast<double>(mTicks.value()) * aVal;
+  if (multiplied > std::pow(2, std::numeric_limits<double>::digits) - 1) {
+    printf_stderr("TimeUnit tick count after multiplication %" PRId64
+                  " * %lf is too"
+                  " high for the result to be exact",
+                  mTicks.value(), aVal);
+    MOZ_CRASH();
+  }
+  return TimeUnit(static_cast<int64_t>(multiplied), mBase);
+}
+
+bool TimeUnit::IsValid() const { return mTicks.isValid(); }
+
+bool TimeUnit::IsPosInf() const {
+  return mTicks.isValid() && mTicks.value() == INT64_MAX;
+}
+bool TimeUnit::IsNegInf() const {
+  return mTicks.isValid() && mTicks.value() == INT64_MIN;
+}
+
+int64_t TimeUnit::ToCommonUnit(int64_t aRatio) const {
+  CheckedInt<int64_t> rv = mTicks;
+  if (mBase == aRatio) {
+    return rv.value();
+  }
+  if (aRatio < mBase && (mBase % aRatio) == 0) {
+    int64_t exactDivisor = mBase / aRatio;
+    rv /= exactDivisor;
+    return rv.value();
+  }
+  rv *= aRatio;
+  rv /= mBase;
+  if (rv.isValid()) {
+    return rv.value();
+  }
+  double ratioFloating = AssertedCast<double>(aRatio);
+  double baseFloating = AssertedCast<double>(mBase);
+  double ticksFloating = static_cast<double>(mTicks.value());
+  double approx = ticksFloating * (ratioFloating / baseFloating);
+  if (approx > static_cast<double>(std::numeric_limits<int64_t>::max())) {
+    return std::numeric_limits<int64_t>::max();
+  }
+  if (approx < static_cast<double>(std::numeric_limits<int64_t>::lowest())) {
+    return std::numeric_limits<int64_t>::lowest();
+  }
+  return static_cast<int64_t>(approx);
+}
+
+TimeUnit TimeUnit::Reduced() const {
+  int64_t posTicks = abs(mTicks.value());
+  bool wasNeg = mTicks.value() < 0;
+  int64_t gcd = GCD(posTicks, mBase);
+  int64_t signedTicks = wasNeg ? -posTicks : posTicks;
+  signedTicks /= gcd;
+  return TimeUnit(signedTicks, mBase / gcd);
+}
+
+double RoundToMicrosecondResolution(double aSeconds) {
+  return std::round(aSeconds * USECS_PER_S) / USECS_PER_S;
+}
+
+TimeRanges TimeRanges::ToMicrosecondResolution() const {
+  TimeRanges output;
+
+  for (const auto& interval : mIntervals) {
+    TimeRange reducedPrecision{RoundToMicrosecondResolution(interval.mStart),
+                               RoundToMicrosecondResolution(interval.mEnd),
+                               RoundToMicrosecondResolution(interval.mFuzz)};
+    output += reducedPrecision;
+  }
+  return output;
+}
+
+};  
+
+}  

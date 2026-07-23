@@ -1,0 +1,105 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_JSActorService_h
+#define mozilla_dom_JSActorService_h
+
+#include "mozilla/EventListenerManager.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/JSActor.h"
+#include "nsIDOMEventListener.h"
+#include "nsIObserver.h"
+#include "nsIURI.h"
+#include "nsRefPtrHashtable.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+struct ProcessActorOptions;
+struct WindowActorOptions;
+class JSProcessActorInfo;
+class JSWindowActorInfo;
+class EventTarget;
+class JSWindowActorProtocol;
+class JSProcessActorProtocol;
+
+class JSActorService final {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(JSActorService)
+
+  static already_AddRefed<JSActorService> GetSingleton();
+
+  void RegisterChromeEventTarget(EventTarget* aTarget);
+
+  static void UnregisterChromeEventTarget(EventTarget* aTarget);
+
+  void LoadJSActorInfos(nsTArray<JSProcessActorInfo>& aProcess,
+                        nsTArray<JSWindowActorInfo>& aWindow);
+
+
+  void RegisterWindowActor(const nsACString& aName,
+                           const WindowActorOptions& aOptions,
+                           ErrorResult& aRv);
+
+  void UnregisterWindowActor(const nsACString& aName);
+
+  void GetJSWindowActorInfos(nsTArray<JSWindowActorInfo>& aInfos);
+
+  already_AddRefed<JSWindowActorProtocol> GetJSWindowActorProtocol(
+      const nsACString& aName);
+
+
+  void RegisterProcessActor(const nsACString& aName,
+                            const ProcessActorOptions& aOptions,
+                            ErrorResult& aRv);
+
+  void UnregisterProcessActor(const nsACString& aName);
+
+  void GetJSProcessActorInfos(nsTArray<JSProcessActorInfo>& aInfos);
+
+  already_AddRefed<JSProcessActorProtocol> GetJSProcessActorProtocol(
+      const nsACString& aName);
+
+ private:
+  JSActorService();
+  ~JSActorService();
+
+  nsTArray<EventTarget*> mChromeEventTargets;
+
+  nsRefPtrHashtable<nsCStringHashKey, JSWindowActorProtocol>
+      mWindowActorDescriptors;
+
+  nsRefPtrHashtable<nsCStringHashKey, JSProcessActorProtocol>
+      mProcessActorDescriptors;
+};
+
+class JSActorProtocol : public nsISupports {
+ public:
+  struct Sided {
+    Maybe<nsCString> mESModuleURI;
+  };
+
+  virtual const Sided& Parent() const = 0;
+  virtual const Sided& Child() const = 0;
+  bool mLoadInDevToolsLoader = false;
+
+ protected:
+  explicit JSActorProtocol(const nsACString& aName) : mName(aName) {}
+  void LogMatch(const nsACString& aRemoteType);
+  bool RemoteTypePrefixMatches(const nsACString& aRemoteType);
+
+  nsCString mName;
+  nsTArray<nsCString> mRemoteTypes;
+  nsTArray<nsCString> mLoggedRemoteTypes;
+  bool mSafeForUntrustedWebProcess = false;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_JSActorService_h

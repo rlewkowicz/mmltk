@@ -1,0 +1,510 @@
+/* cairo - a vector graphics library with display and print output
+ *
+ * Copyright © 2005 Red Hat Inc.
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it either under the terms of the GNU Lesser General Public
+ * License version 2.1 as published by the Free Software Foundation
+ * (the "LGPL") or, at your option, under the terms of the Mozilla
+ * Public License Version 1.1 (the "MPL"). If you do not alter this
+ * notice, a recipient may use your version of this file under either
+ * the MPL or the LGPL.
+ *
+ * You should have received a copy of the LGPL along with this library
+ * in the file COPYING-LGPL-2.1; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Suite 500, Boston, MA 02110-1335, USA
+ * You should have received a copy of the MPL along with this library
+ * in the file COPYING-MPL-1.1
+ *
+ * The contents of this file are subject to the Mozilla Public License
+ * Version 1.1 (the "License"); you may not use this file except in
+ * compliance with the License. You may obtain a copy of the License at
+ * http://www.mozilla.org/MPL/
+ *
+ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY
+ * OF ANY KIND, either express or implied. See the LGPL or the MPL for
+ * the specific language governing rights and limitations.
+ *
+ * The Original Code is the cairo graphics library.
+ *
+ * The Initial Developer of the Original Code is University of Southern
+ * California.
+ *
+ * Contributor(s):
+ *      Owen Taylor <otaylor@redhat.com>
+ */
+
+#include "cairoint.h"
+#include "cairo-error-private.h"
+
+
+static const cairo_font_options_t _cairo_font_options_nil = {
+    CAIRO_ANTIALIAS_DEFAULT,
+    CAIRO_SUBPIXEL_ORDER_DEFAULT,
+    CAIRO_LCD_FILTER_DEFAULT,
+    CAIRO_HINT_STYLE_DEFAULT,
+    CAIRO_HINT_METRICS_DEFAULT,
+    CAIRO_ROUND_GLYPH_POS_DEFAULT,
+    NULL, 
+    CAIRO_COLOR_MODE_DEFAULT,
+    CAIRO_COLOR_PALETTE_DEFAULT,
+    NULL, 0, 
+};
+
+void
+_cairo_font_options_init_default (cairo_font_options_t *options)
+{
+    options->antialias = CAIRO_ANTIALIAS_DEFAULT;
+    options->subpixel_order = CAIRO_SUBPIXEL_ORDER_DEFAULT;
+    options->lcd_filter = CAIRO_LCD_FILTER_DEFAULT;
+    options->hint_style = CAIRO_HINT_STYLE_DEFAULT;
+    options->hint_metrics = CAIRO_HINT_METRICS_DEFAULT;
+    options->round_glyph_positions = CAIRO_ROUND_GLYPH_POS_DEFAULT;
+    options->variations = NULL;
+    options->color_mode = CAIRO_COLOR_MODE_DEFAULT;
+    options->palette_index = CAIRO_COLOR_PALETTE_DEFAULT;
+    options->custom_palette = NULL;
+    options->custom_palette_size = 0;
+}
+
+void
+_cairo_font_options_init_copy (cairo_font_options_t		*options,
+			       const cairo_font_options_t	*other)
+{
+    options->antialias = other->antialias;
+    options->subpixel_order = other->subpixel_order;
+    options->lcd_filter = other->lcd_filter;
+    options->hint_style = other->hint_style;
+    options->hint_metrics = other->hint_metrics;
+    options->round_glyph_positions = other->round_glyph_positions;
+    options->variations = other->variations ? strdup (other->variations) : NULL;
+    options->color_mode = other->color_mode;
+    options->palette_index = other->palette_index;
+    options->custom_palette_size = other->custom_palette_size;
+    options->custom_palette = NULL;
+    if (other->custom_palette) {
+        options->custom_palette = (cairo_palette_color_t *) malloc (sizeof (cairo_palette_color_t) * options->custom_palette_size);
+        memcpy (options->custom_palette, other->custom_palette, sizeof (cairo_palette_color_t) * options->custom_palette_size);
+    }
+}
+
+cairo_bool_t
+_cairo_font_options_compare (const cairo_font_options_t	*a,
+                             const cairo_font_options_t	*b)
+{
+    if (a->antialias != b->antialias ||
+        a->subpixel_order != b->subpixel_order ||
+        a->lcd_filter != b->lcd_filter ||
+        a->hint_style != b->hint_style ||
+        a->hint_metrics != b->hint_metrics ||
+        a->round_glyph_positions != b->round_glyph_positions ||
+        a->color_mode != b->color_mode ||
+        a->palette_index != b->palette_index ||
+        a->custom_palette_size != b->custom_palette_size)
+    {
+        return FALSE;
+    }
+
+    if (a->variations && b->variations && strcmp (a->variations, b->variations) != 0)
+        return FALSE;
+    else if (a->variations != b->variations)
+        return FALSE;
+
+    if (a->custom_palette && b->custom_palette &&
+        memcmp (a->custom_palette, b->custom_palette, sizeof (cairo_palette_color_t) * a->custom_palette_size) != 0)
+    {
+        return FALSE;
+    }
+    else if (a->custom_palette != b->custom_palette)
+    {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+cairo_font_options_t *
+cairo_font_options_create (void)
+{
+    cairo_font_options_t *options;
+
+    options = _cairo_calloc (sizeof (cairo_font_options_t));
+    if (!options) {
+	_cairo_error_throw (CAIRO_STATUS_NO_MEMORY);
+	return (cairo_font_options_t *) &_cairo_font_options_nil;
+    }
+
+    _cairo_font_options_init_default (options);
+
+    return options;
+}
+
+cairo_font_options_t *
+cairo_font_options_copy (const cairo_font_options_t *original)
+{
+    cairo_font_options_t *options;
+
+    if (cairo_font_options_status ((cairo_font_options_t *) original))
+	return (cairo_font_options_t *) &_cairo_font_options_nil;
+
+    options = _cairo_calloc (sizeof (cairo_font_options_t));
+    if (!options) {
+	_cairo_error_throw (CAIRO_STATUS_NO_MEMORY);
+	return (cairo_font_options_t *) &_cairo_font_options_nil;
+    }
+
+    _cairo_font_options_init_copy (options, original);
+
+    return options;
+}
+
+void
+_cairo_font_options_fini (cairo_font_options_t *options)
+{
+    free (options->variations);
+    free (options->custom_palette);
+}
+
+void
+cairo_font_options_destroy (cairo_font_options_t *options)
+{
+    if (cairo_font_options_status (options))
+	return;
+
+    _cairo_font_options_fini (options);
+    free (options);
+}
+
+cairo_status_t
+cairo_font_options_status (cairo_font_options_t *options)
+{
+    if (options == NULL)
+	return CAIRO_STATUS_NULL_POINTER;
+    else if (options == (cairo_font_options_t *) &_cairo_font_options_nil)
+	return CAIRO_STATUS_NO_MEMORY;
+    else
+	return CAIRO_STATUS_SUCCESS;
+}
+
+void
+cairo_font_options_merge (cairo_font_options_t       *options,
+			  const cairo_font_options_t *other)
+{
+    if (cairo_font_options_status (options))
+	return;
+
+    if (cairo_font_options_status ((cairo_font_options_t *) other))
+	return;
+
+    if (other->antialias != CAIRO_ANTIALIAS_DEFAULT)
+	options->antialias = other->antialias;
+    if (other->subpixel_order != CAIRO_SUBPIXEL_ORDER_DEFAULT)
+	options->subpixel_order = other->subpixel_order;
+    if (other->lcd_filter != CAIRO_LCD_FILTER_DEFAULT)
+	options->lcd_filter = other->lcd_filter;
+    if (other->hint_style != CAIRO_HINT_STYLE_DEFAULT)
+	options->hint_style = other->hint_style;
+    if (other->hint_metrics != CAIRO_HINT_METRICS_DEFAULT)
+	options->hint_metrics = other->hint_metrics;
+    if (other->round_glyph_positions != CAIRO_ROUND_GLYPH_POS_DEFAULT)
+	options->round_glyph_positions = other->round_glyph_positions;
+
+    if (other->variations) {
+      if (options->variations) {
+        char *p;
+
+        p = malloc (strlen (other->variations) + strlen (options->variations) + 2);
+        p[0] = 0;
+        strcat (p, options->variations);
+        strcat (p, ",");
+        strcat (p, other->variations);
+        free (options->variations);
+        options->variations = p;
+      }
+      else {
+        options->variations = strdup (other->variations);
+      }
+    }
+
+    if (other->color_mode != CAIRO_COLOR_MODE_DEFAULT)
+	options->color_mode = other->color_mode;
+    if (other->palette_index != CAIRO_COLOR_PALETTE_DEFAULT)
+	options->palette_index = other->palette_index;
+    if (other->custom_palette) {
+        options->custom_palette_size = other->custom_palette_size;
+        free (options->custom_palette);
+        options->custom_palette = (cairo_palette_color_t *) malloc (sizeof (cairo_palette_color_t) * options->custom_palette_size);
+        memcpy (options->custom_palette, other->custom_palette, sizeof (cairo_palette_color_t) * options->custom_palette_size);
+    }
+}
+
+cairo_bool_t
+cairo_font_options_equal (const cairo_font_options_t *options,
+			  const cairo_font_options_t *other)
+{
+    if (cairo_font_options_status ((cairo_font_options_t *) options))
+	return FALSE;
+    if (cairo_font_options_status ((cairo_font_options_t *) other))
+	return FALSE;
+
+    if (options == other)
+	return TRUE;
+
+    return (options->antialias == other->antialias &&
+	    options->subpixel_order == other->subpixel_order &&
+	    options->lcd_filter == other->lcd_filter &&
+	    options->hint_style == other->hint_style &&
+	    options->hint_metrics == other->hint_metrics &&
+	    options->round_glyph_positions == other->round_glyph_positions &&
+            ((options->variations == NULL && other->variations == NULL) ||
+             (options->variations != NULL && other->variations != NULL &&
+              strcmp (options->variations, other->variations) == 0)) &&
+	    options->color_mode == other->color_mode &&
+	    options->palette_index == other->palette_index &&
+            ((options->custom_palette == NULL && other->custom_palette == NULL) ||
+             (options->custom_palette != NULL && other->custom_palette != NULL &&
+              options->custom_palette_size == other->custom_palette_size &&
+              memcmp (options->custom_palette, other->custom_palette,
+                      sizeof (cairo_palette_color_t) * options->custom_palette_size) == 0)));
+}
+
+unsigned long
+cairo_font_options_hash (const cairo_font_options_t *options)
+{
+    unsigned long hash = 0;
+
+    if (cairo_font_options_status ((cairo_font_options_t *) options))
+	options = &_cairo_font_options_nil; 
+
+    if (options->variations)
+      hash = _cairo_string_hash (options->variations, strlen (options->variations));
+
+    hash ^= options->palette_index;
+
+    return ((options->antialias) |
+	    (options->subpixel_order << 4) |
+	    (options->lcd_filter << 8) |
+	    (options->hint_style << 12) |
+	    (options->hint_metrics << 16) |
+            (options->color_mode << 20)) ^ hash;
+}
+
+void
+cairo_font_options_set_antialias (cairo_font_options_t *options,
+				  cairo_antialias_t     antialias)
+{
+    if (cairo_font_options_status (options))
+	return;
+
+    options->antialias = antialias;
+}
+
+cairo_antialias_t
+cairo_font_options_get_antialias (const cairo_font_options_t *options)
+{
+    if (cairo_font_options_status ((cairo_font_options_t *) options))
+	return CAIRO_ANTIALIAS_DEFAULT;
+
+    return options->antialias;
+}
+
+void
+cairo_font_options_set_subpixel_order (cairo_font_options_t   *options,
+				       cairo_subpixel_order_t  subpixel_order)
+{
+    if (cairo_font_options_status (options))
+	return;
+
+    options->subpixel_order = subpixel_order;
+}
+
+cairo_subpixel_order_t
+cairo_font_options_get_subpixel_order (const cairo_font_options_t *options)
+{
+    if (cairo_font_options_status ((cairo_font_options_t *) options))
+	return CAIRO_SUBPIXEL_ORDER_DEFAULT;
+
+    return options->subpixel_order;
+}
+
+void
+cairo_font_options_set_lcd_filter (cairo_font_options_t *options,
+				   cairo_lcd_filter_t    lcd_filter)
+{
+    if (cairo_font_options_status (options))
+	return;
+
+    options->lcd_filter = lcd_filter;
+}
+
+cairo_lcd_filter_t
+cairo_font_options_get_lcd_filter (const cairo_font_options_t *options)
+{
+    if (cairo_font_options_status ((cairo_font_options_t *) options))
+	return CAIRO_LCD_FILTER_DEFAULT;
+
+    return options->lcd_filter;
+}
+
+void
+_cairo_font_options_set_round_glyph_positions (cairo_font_options_t *options,
+					       cairo_round_glyph_positions_t  round)
+{
+    if (cairo_font_options_status (options))
+	return;
+
+    options->round_glyph_positions = round;
+}
+
+cairo_round_glyph_positions_t
+_cairo_font_options_get_round_glyph_positions (const cairo_font_options_t *options)
+{
+    if (cairo_font_options_status ((cairo_font_options_t *) options))
+	return CAIRO_ROUND_GLYPH_POS_DEFAULT;
+
+    return options->round_glyph_positions;
+}
+
+void
+cairo_font_options_set_hint_style (cairo_font_options_t *options,
+				   cairo_hint_style_t    hint_style)
+{
+    if (cairo_font_options_status (options))
+	return;
+
+    options->hint_style = hint_style;
+}
+
+cairo_hint_style_t
+cairo_font_options_get_hint_style (const cairo_font_options_t *options)
+{
+    if (cairo_font_options_status ((cairo_font_options_t *) options))
+	return CAIRO_HINT_STYLE_DEFAULT;
+
+    return options->hint_style;
+}
+
+void
+cairo_font_options_set_hint_metrics (cairo_font_options_t *options,
+				     cairo_hint_metrics_t  hint_metrics)
+{
+    if (cairo_font_options_status (options))
+	return;
+
+    options->hint_metrics = hint_metrics;
+}
+
+cairo_hint_metrics_t
+cairo_font_options_get_hint_metrics (const cairo_font_options_t *options)
+{
+    if (cairo_font_options_status ((cairo_font_options_t *) options))
+	return CAIRO_HINT_METRICS_DEFAULT;
+
+    return options->hint_metrics;
+}
+
+void
+cairo_font_options_set_variations (cairo_font_options_t *options,
+                                   const char           *variations)
+{
+  char *tmp = variations ? strdup (variations) : NULL;
+  free (options->variations);
+  options->variations = tmp;
+}
+
+const char *
+cairo_font_options_get_variations (cairo_font_options_t *options)
+{
+  return options->variations;
+}
+
+cairo_public void
+cairo_font_options_set_color_mode (cairo_font_options_t *options,
+                                   cairo_color_mode_t    color_mode)
+{
+    if (cairo_font_options_status (options))
+	return;
+
+    options->color_mode = color_mode;
+}
+
+cairo_public cairo_color_mode_t
+cairo_font_options_get_color_mode (const cairo_font_options_t *options)
+{
+    if (cairo_font_options_status ((cairo_font_options_t *) options))
+	return CAIRO_COLOR_MODE_DEFAULT;
+
+    return options->color_mode;
+}
+
+
+void
+cairo_font_options_set_color_palette (cairo_font_options_t *options,
+                                      unsigned int          palette_index)
+{
+    if (cairo_font_options_status (options))
+	return;
+
+    options->palette_index = palette_index;
+}
+
+unsigned int
+cairo_font_options_get_color_palette (const cairo_font_options_t *options)
+{
+    if (cairo_font_options_status ((cairo_font_options_t *) options))
+	return CAIRO_COLOR_PALETTE_DEFAULT;
+
+    return options->palette_index;
+}
+
+void
+cairo_font_options_set_custom_palette_color (cairo_font_options_t *options,
+                                             unsigned int index,
+                                             double red, double green,
+                                             double blue, double alpha)
+{
+    unsigned int idx;
+
+    for (idx = 0; idx < options->custom_palette_size; idx++) {
+        if (options->custom_palette[idx].index == index) {
+            break;
+        }
+    }
+
+    if (idx == options->custom_palette_size) {
+        options->custom_palette_size++;
+        options->custom_palette = (cairo_palette_color_t *)
+            _cairo_realloc_ab (options->custom_palette,
+                               sizeof (cairo_palette_color_t),
+                               options->custom_palette_size);
+    }
+
+    memset (&options->custom_palette[idx], 0, sizeof (cairo_palette_color_t));
+
+    options->custom_palette[idx].index = index;
+    options->custom_palette[idx].red = red;
+    options->custom_palette[idx].green = green;
+    options->custom_palette[idx].blue = blue;
+    options->custom_palette[idx].alpha = alpha;
+}
+
+cairo_status_t
+cairo_font_options_get_custom_palette_color (cairo_font_options_t *options,
+                                             unsigned int index,
+                                             double *red, double *green,
+                                             double *blue, double *alpha)
+{
+    unsigned int idx;
+
+    for (idx = 0; idx < options->custom_palette_size; idx++) {
+        if (options->custom_palette[idx].index == index) {
+            *red = options->custom_palette[idx].red;
+            *green = options->custom_palette[idx].green;
+            *blue = options->custom_palette[idx].blue;
+            *alpha = options->custom_palette[idx].alpha;
+            return CAIRO_STATUS_SUCCESS;
+        }
+    }
+
+    return CAIRO_STATUS_INVALID_INDEX;
+}

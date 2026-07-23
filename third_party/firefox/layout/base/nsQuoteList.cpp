@@ -1,0 +1,154 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsQuoteList.h"
+
+#include "mozilla/ContainStyleScopeManager.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/dom/Text.h"
+#include "mozilla/intl/Quotes.h"
+#include "nsContainerFrame.h"
+#include "nsIContent.h"
+#include "nsIFrame.h"
+#include "nsIFrameInlines.h"
+#include "nsReadableUtils.h"
+
+using namespace mozilla;
+
+bool nsQuoteNode::InitTextFrame(nsGenConList* aList, nsIFrame* aPseudoFrame,
+                                nsIFrame* aTextFrame) {
+  nsGenConNode::InitTextFrame(aList, aPseudoFrame, aTextFrame);
+
+  nsQuoteList* quoteList = static_cast<nsQuoteList*>(aList);
+  bool dirty = false;
+  quoteList->Insert(this);
+  if (quoteList->IsLast(this)) {
+    quoteList->Calc(this);
+  } else {
+    dirty = true;
+  }
+
+  if (IsRealQuote()) {
+    aTextFrame->GetContent()->AsText()->SetText(Text(), false);
+  }
+  return dirty;
+}
+
+nsString nsQuoteNode::Text() {
+  NS_ASSERTION(mType == StyleContentType::OpenQuote ||
+                   mType == StyleContentType::CloseQuote,
+               "should only be called when mText should be non-null");
+  nsString result;
+  int32_t depth = Depth();
+  MOZ_ASSERT(depth >= -1);
+
+  if (depth < 0) {
+    return result;
+  }
+
+  const auto& quotesProp = mPseudoFrame->StyleList()->mQuotes;
+
+  if (quotesProp.IsAuto()) {
+    const nsIFrame* frame = mPseudoFrame->GetInFlowParent();
+    if (!frame->Style()->IsRootElementStyle()) {
+      if (const nsIFrame* parent = frame->GetInFlowParent()) {
+        frame = parent;
+      }
+    }
+    const intl::Quotes* quotes =
+        intl::QuotesForLang(frame->StyleFont()->mLanguage);
+    if (!quotes) {
+      static const intl::Quotes sDefaultQuotes = {
+          {0x201c, 0x201d, 0x2018, 0x2019}};
+      quotes = &sDefaultQuotes;
+    }
+    size_t index = (depth == 0 ? 0 : 2);  
+    index += (mType == StyleContentType::OpenQuote ? 0 : 1);  
+    result.Append(quotes->mChars[index]);
+    return result;
+  }
+
+  MOZ_ASSERT(quotesProp.IsQuoteList());
+  const Span<const StyleQuotePair> quotes = quotesProp.AsQuoteList().AsSpan();
+
+  if (depth >= static_cast<int32_t>(quotes.Length())) {
+    depth = static_cast<int32_t>(quotes.Length()) - 1;
+  }
+
+  if (depth == -1) {
+    return result;
+  }
+
+  const StyleQuotePair& pair = quotes[depth];
+  const StyleOwnedStr& quote =
+      mType == StyleContentType::OpenQuote ? pair.opening : pair.closing;
+  result.Assign(NS_ConvertUTF8toUTF16(quote.AsString()));
+  return result;
+}
+
+static int32_t GetDepthBeforeFirstQuoteNode(ContainStyleScope* aScope) {
+  for (auto* ancestor = aScope->GetParent(); ancestor;
+       ancestor = ancestor->GetParent()) {
+    auto& quoteList = ancestor->GetQuoteList();
+    if (auto* node = static_cast<nsQuoteNode*>(
+            aScope->GetPrecedingElementInGenConList(&quoteList))) {
+      return node->DepthAfter();
+    }
+  }
+  return 0;
+}
+
+void nsQuoteList::Calc(nsQuoteNode* aNode) {
+  if (aNode == FirstNode()) {
+    aNode->mDepthBefore = GetDepthBeforeFirstQuoteNode(mScope);
+  } else {
+    aNode->mDepthBefore = Prev(aNode)->DepthAfter();
+  }
+}
+
+void nsQuoteList::RecalcAll() {
+  for (nsQuoteNode* node = FirstNode(); node; node = Next(node)) {
+    int32_t oldDepth = node->mDepthBefore;
+    Calc(node);
+
+    if (node->mDepthBefore != oldDepth && node->mText && node->IsRealQuote()) {
+      node->mText->SetData(node->Text(), IgnoreErrors());
+    }
+  }
+}
+
+#ifdef DEBUG
+void nsQuoteList::PrintChain() {
+  using StyleContentType = nsQuoteNode::StyleContentType;
+
+  printf("Chain: \n");
+  for (nsQuoteNode* node = FirstNode(); node; node = Next(node)) {
+    printf("  %p %d - ", static_cast<void*>(node), node->mDepthBefore);
+    switch (node->mType) {
+      case StyleContentType::OpenQuote:
+        printf("open");
+        break;
+      case StyleContentType::NoOpenQuote:
+        printf("noOpen");
+        break;
+      case StyleContentType::CloseQuote:
+        printf("close");
+        break;
+      case StyleContentType::NoCloseQuote:
+        printf("noClose");
+        break;
+      default:
+        printf("unknown!!!");
+    }
+    printf(" %d - %d,", node->Depth(), node->DepthAfter());
+    if (node->mText) {
+      nsAutoString data;
+      node->mText->GetData(data);
+      printf(" \"%s\",", NS_ConvertUTF16toUTF8(data).get());
+    }
+    printf("\n");
+  }
+}
+#endif

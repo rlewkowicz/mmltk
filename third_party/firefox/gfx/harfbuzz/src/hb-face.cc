@@ -1,0 +1,618 @@
+/*
+ * Copyright © 2009  Red Hat, Inc.
+ * Copyright © 2012  Google, Inc.
+ *
+ *  This is part of HarfBuzz, a text shaping library.
+ *
+ * Permission is hereby granted, without written agreement and without
+ * license or royalty fees, to use, copy, modify, and distribute this
+ * software and its documentation for any purpose, provided that the
+ * above copyright notice and the following two paragraphs appear in
+ * all copies of this software.
+ *
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE TO ANY PARTY FOR
+ * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES
+ * ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN
+ * IF THE COPYRIGHT HOLDER HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ *
+ * THE COPYRIGHT HOLDER SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING,
+ * BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+ * FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ * ON AN "AS IS" BASIS, AND THE COPYRIGHT HOLDER HAS NO OBLIGATION TO
+ * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ *
+ * Red Hat Author(s): Behdad Esfahbod
+ * Google Author(s): Behdad Esfahbod
+ */
+
+#include "hb.hh"
+
+#include "hb-face.hh"
+#include "hb-blob.hh"
+#include "hb-open-file.hh"
+#include "hb-ot-face.hh"
+#include "hb-ot-cmap-table.hh"
+
+#ifdef HAVE_FREETYPE
+#include "hb-ft.h"
+#endif
+#ifdef HAVE_CORETEXT
+#include "hb-coretext.h"
+#endif
+#ifdef HAVE_DIRECTWRITE
+#include "hb-directwrite.h"
+#endif
+
+
+
+
+unsigned int
+hb_face_count (hb_blob_t *blob)
+{
+  if (unlikely (!blob))
+    return 0;
+
+  hb_sanitize_context_t c (blob);
+
+  auto *ot = blob->as<OT::OpenTypeFontFile> ();
+  if (unlikely (!ot->sanitize (&c)))
+    return 0;
+
+  return ot->get_face_count ();
+}
+
+
+DEFINE_NULL_INSTANCE (hb_face_t) =
+{
+  HB_OBJECT_HEADER_STATIC,
+
+  0,    
+  1000, 
+  0,    
+
+};
+
+
+hb_face_t *
+hb_face_create_for_tables (hb_reference_table_func_t  reference_table_func,
+			   void                      *user_data,
+			   hb_destroy_func_t          destroy)
+{
+  hb_face_t *face;
+
+  if (!reference_table_func || !(face = hb_object_create<hb_face_t> ())) {
+    if (destroy)
+      destroy (user_data);
+    return hb_face_get_empty ();
+  }
+
+  face->reference_table_func = reference_table_func;
+  face->user_data = user_data;
+  face->destroy = destroy;
+
+  face->num_glyphs = -1;
+
+  face->data.init0 (face);
+  face->table.init0 (face);
+
+  return face;
+}
+
+
+typedef struct hb_face_for_data_closure_t {
+  hb_blob_t *blob;
+  uint16_t  index;
+} hb_face_for_data_closure_t;
+
+static hb_face_for_data_closure_t *
+_hb_face_for_data_closure_create (hb_blob_t *blob, unsigned int index)
+{
+  hb_face_for_data_closure_t *closure;
+
+  closure = (hb_face_for_data_closure_t *) hb_calloc (1, sizeof (hb_face_for_data_closure_t));
+  if (unlikely (!closure))
+    return nullptr;
+
+  closure->blob = blob;
+  closure->index = (uint16_t) (index & 0xFFFFu);
+
+  return closure;
+}
+
+static void
+_hb_face_for_data_closure_destroy (void *data)
+{
+  hb_face_for_data_closure_t *closure = (hb_face_for_data_closure_t *) data;
+
+  hb_blob_destroy (closure->blob);
+  hb_free (closure);
+}
+
+static hb_blob_t *
+_hb_face_for_data_reference_table (hb_face_t *face HB_UNUSED, hb_tag_t tag, void *user_data)
+{
+  hb_face_for_data_closure_t *data = (hb_face_for_data_closure_t *) user_data;
+
+  if (tag == HB_TAG_NONE)
+    return hb_blob_reference (data->blob);
+
+  const OT::OpenTypeFontFile &ot_file = *data->blob->as<OT::OpenTypeFontFile> ();
+  unsigned int base_offset;
+  const OT::OpenTypeFontFace &ot_face = ot_file.get_face (data->index, &base_offset);
+
+  const OT::OpenTypeTable &table = ot_face.get_table_by_tag (tag);
+
+  hb_blob_t *blob = hb_blob_create_sub_blob (data->blob, base_offset + table.offset, table.length);
+
+  return blob;
+}
+
+static unsigned
+_hb_face_for_data_get_table_tags (const hb_face_t *face HB_UNUSED,
+				  unsigned int start_offset,
+				  unsigned int *table_count,
+				  hb_tag_t *table_tags,
+				  void *user_data)
+{
+  hb_face_for_data_closure_t *data = (hb_face_for_data_closure_t *) user_data;
+
+  const OT::OpenTypeFontFile &ot_file = *data->blob->as<OT::OpenTypeFontFile> ();
+  const OT::OpenTypeFontFace &ot_face = ot_file.get_face (data->index);
+
+  return ot_face.get_table_tags (start_offset, table_count, table_tags);
+}
+
+
+hb_face_t *
+hb_face_create (hb_blob_t    *blob,
+		unsigned int  index)
+{
+  hb_face_t *face;
+
+  if (unlikely (!blob))
+    blob = hb_blob_get_empty ();
+
+  blob = hb_sanitize_context_t ().sanitize_blob<OT::OpenTypeFontFile> (hb_blob_reference (blob));
+
+  hb_face_for_data_closure_t *closure = _hb_face_for_data_closure_create (blob, index);
+
+  if (unlikely (!closure))
+  {
+    hb_blob_destroy (blob);
+    return hb_face_get_empty ();
+  }
+
+  face = hb_face_create_for_tables (_hb_face_for_data_reference_table,
+				    closure,
+				    _hb_face_for_data_closure_destroy);
+  hb_face_set_get_table_tags_func (face,
+				   _hb_face_for_data_get_table_tags,
+				   closure,
+				   nullptr);
+
+  face->index = index;
+
+  return face;
+}
+
+hb_face_t *
+hb_face_create_or_fail (hb_blob_t    *blob,
+			unsigned int  index)
+{
+  unsigned num_faces = hb_face_count (blob);
+  if (index >= num_faces)
+    return nullptr;
+
+  hb_face_t *face = hb_face_create (blob, index);
+  if (hb_object_is_immutable (face))
+    return nullptr;
+
+  return face;
+}
+
+#ifndef HB_NO_OPEN
+HB_EXTERN hb_face_t *
+hb_face_create_from_file_or_fail (const char   *file_name,
+				  unsigned int  index)
+{
+  hb_blob_t *blob = hb_blob_create_from_file_or_fail (file_name);
+  if (unlikely (!blob))
+    return nullptr;
+
+  hb_face_t *face = hb_face_create_or_fail (blob, index);
+  hb_blob_destroy (blob);
+
+  return face;
+}
+
+static const struct supported_face_loaders_t {
+	char name[16];
+	hb_face_t * (*from_file) (const char *font_file, unsigned face_index);
+	hb_face_t * (*from_blob) (hb_blob_t *blob, unsigned face_index);
+} supported_face_loaders[] =
+{
+  {"ot",
+#ifndef HB_NO_OPEN
+   hb_face_create_from_file_or_fail,
+#else
+   nullptr,
+#endif
+   hb_face_create_or_fail
+  },
+#ifdef HAVE_FREETYPE
+  {"ft",
+   hb_ft_face_create_from_file_or_fail,
+   hb_ft_face_create_from_blob_or_fail
+  },
+#endif
+#ifdef HAVE_CORETEXT
+  {"coretext",
+   hb_coretext_face_create_from_file_or_fail,
+   hb_coretext_face_create_from_blob_or_fail
+  },
+#endif
+#ifdef HAVE_DIRECTWRITE
+  {"directwrite",
+   hb_directwrite_face_create_from_file_or_fail,
+   hb_directwrite_face_create_from_blob_or_fail
+  },
+#endif
+};
+
+static const char *get_default_loader_name ()
+{
+  static hb_atomic_t<const char *> static_loader_name;
+  const char *loader_name = static_loader_name.get_acquire ();
+  if (!loader_name)
+  {
+    loader_name = getenv ("HB_FACE_LOADER");
+    if (!loader_name)
+      loader_name = "";
+    if (!static_loader_name.cmpexch (nullptr, loader_name))
+      loader_name = static_loader_name.get_acquire ();
+  }
+  return loader_name;
+}
+
+hb_face_t *
+hb_face_create_from_file_or_fail_using (const char   *file_name,
+					unsigned int  index,
+					const char   *loader_name)
+{
+  bool retry = false;
+  if (!loader_name || !*loader_name)
+  {
+    loader_name = get_default_loader_name ();
+    retry = true;
+  }
+  if (loader_name && !*loader_name) loader_name = nullptr;
+
+retry:
+  for (unsigned i = 0; i < ARRAY_LENGTH (supported_face_loaders); i++)
+  {
+    if (!loader_name || (supported_face_loaders[i].from_file && !strcmp (supported_face_loaders[i].name, loader_name)))
+      return supported_face_loaders[i].from_file (file_name, index);
+  }
+
+  if (retry)
+  {
+    retry = false;
+    loader_name = nullptr;
+    goto retry;
+  }
+
+  return nullptr;
+}
+
+hb_face_t *
+hb_face_create_or_fail_using (hb_blob_t    *blob,
+			      unsigned int  index,
+			      const char   *loader_name)
+{
+  bool retry = false;
+  if (!loader_name || !*loader_name)
+  {
+    loader_name = get_default_loader_name ();
+    retry = true;
+  }
+  if (loader_name && !*loader_name) loader_name = nullptr;
+
+retry:
+  for (unsigned i = 0; i < ARRAY_LENGTH (supported_face_loaders); i++)
+  {
+    if (!loader_name || (supported_face_loaders[i].from_blob && !strcmp (supported_face_loaders[i].name, loader_name)))
+      return supported_face_loaders[i].from_blob (blob, index);
+  }
+
+  if (retry)
+  {
+    retry = false;
+    loader_name = nullptr;
+    goto retry;
+  }
+
+  return nullptr;
+}
+
+static inline void free_static_face_loader_list ();
+
+static const char * const nil_face_loader_list[] = {nullptr};
+
+static struct hb_face_loader_list_lazy_loader_t : hb_lazy_loader_t<const char *,
+								  hb_face_loader_list_lazy_loader_t>
+{
+  static const char ** create ()
+  {
+    const char **face_loader_list = (const char **) hb_calloc (1 + ARRAY_LENGTH (supported_face_loaders), sizeof (const char *));
+    if (unlikely (!face_loader_list))
+      return nullptr;
+
+    unsigned i;
+    for (i = 0; i < ARRAY_LENGTH (supported_face_loaders); i++)
+      face_loader_list[i] = supported_face_loaders[i].name;
+    face_loader_list[i] = nullptr;
+
+    hb_atexit (free_static_face_loader_list);
+
+    return face_loader_list;
+  }
+  static void destroy (const char **l)
+  { hb_free (l); }
+  static const char * const * get_null ()
+  { return nil_face_loader_list; }
+} static_face_loader_list;
+
+static inline
+void free_static_face_loader_list ()
+{
+  static_face_loader_list.free_instance ();
+}
+
+const char **
+hb_face_list_loaders ()
+{
+  return static_face_loader_list.get_unconst ();
+}
+#endif
+
+
+hb_face_t *
+hb_face_get_empty ()
+{
+  return const_cast<hb_face_t *> (&Null (hb_face_t));
+}
+
+
+hb_face_t *
+hb_face_reference (hb_face_t *face)
+{
+  return hb_object_reference (face);
+}
+
+void
+hb_face_destroy (hb_face_t *face)
+{
+  if (!hb_object_destroy (face)) return;
+
+#ifndef HB_NO_SHAPER
+  for (hb_face_t::plan_node_t *node = face->shape_plans; node; )
+  {
+    hb_face_t::plan_node_t *next = node->next;
+    hb_shape_plan_destroy (node->shape_plan);
+    hb_free (node);
+    node = next;
+  }
+#endif
+
+  face->data.fini ();
+  face->table.fini ();
+
+  if (face->get_table_tags_destroy)
+    face->get_table_tags_destroy (face->get_table_tags_user_data);
+
+  if (face->destroy)
+    face->destroy (face->user_data);
+
+  hb_free (face);
+}
+
+hb_bool_t
+hb_face_set_user_data (hb_face_t          *face,
+		       hb_user_data_key_t *key,
+		       void *              data,
+		       hb_destroy_func_t   destroy,
+		       hb_bool_t           replace)
+{
+  return hb_object_set_user_data (face, key, data, destroy, replace);
+}
+
+void *
+hb_face_get_user_data (const hb_face_t    *face,
+		       hb_user_data_key_t *key)
+{
+  return hb_object_get_user_data (face, key);
+}
+
+void
+hb_face_make_immutable (hb_face_t *face)
+{
+  if (hb_object_is_immutable (face))
+    return;
+
+  hb_object_make_immutable (face);
+}
+
+hb_bool_t
+hb_face_is_immutable (hb_face_t *face)
+{
+  return hb_object_is_immutable (face);
+}
+
+
+hb_blob_t *
+hb_face_reference_table (const hb_face_t *face,
+			 hb_tag_t tag)
+{
+  if (unlikely (tag == HB_TAG_NONE))
+    return hb_blob_get_empty ();
+
+  return face->reference_table (tag);
+}
+
+hb_blob_t *
+hb_face_reference_blob (hb_face_t *face)
+{
+  hb_blob_t *blob = face->reference_table (HB_TAG_NONE);
+
+  if (blob == hb_blob_get_empty ())
+  {
+    unsigned total_count = hb_face_get_table_tags (face, 0, nullptr, nullptr);
+    if (total_count)
+    {
+      hb_tag_t tags[64];
+      unsigned count = ARRAY_LENGTH (tags);
+      hb_face_t* builder = hb_face_builder_create ();
+
+      for (unsigned offset = 0; offset < total_count; offset += count)
+      {
+        hb_face_get_table_tags (face, offset, &count, tags);
+	if (unlikely (!count))
+	  break; 
+        for (unsigned i = 0; i < count; i++)
+        {
+	  if (unlikely (!tags[i]))
+	    continue;
+	  hb_blob_t *table = hb_face_reference_table (face, tags[i]);
+	  hb_face_builder_add_table (builder, tags[i], table);
+	  hb_blob_destroy (table);
+        }
+      }
+
+      blob = hb_face_reference_blob (builder);
+      hb_face_destroy (builder);
+    }
+  }
+
+  return blob;
+}
+
+void
+hb_face_set_index (hb_face_t    *face,
+		   unsigned int  index)
+{
+  if (hb_object_is_immutable (face))
+    return;
+
+  face->index = index;
+}
+
+unsigned int
+hb_face_get_index (const hb_face_t *face)
+{
+  return face->index;
+}
+
+void
+hb_face_set_upem (hb_face_t    *face,
+		  unsigned int  upem)
+{
+  if (hb_object_is_immutable (face))
+    return;
+
+  face->upem = upem;
+}
+
+unsigned int
+hb_face_get_upem (const hb_face_t *face)
+{
+  return face->get_upem ();
+}
+
+void
+hb_face_set_glyph_count (hb_face_t    *face,
+			 unsigned int  glyph_count)
+{
+  if (hb_object_is_immutable (face))
+    return;
+
+  face->num_glyphs = glyph_count;
+}
+
+unsigned int
+hb_face_get_glyph_count (const hb_face_t *face)
+{
+  return face->get_num_glyphs ();
+}
+
+HB_EXTERN void
+hb_face_set_get_table_tags_func (hb_face_t *face,
+				 hb_get_table_tags_func_t func,
+				 void                    *user_data,
+				 hb_destroy_func_t        destroy)
+{
+  if (hb_object_is_immutable (face))
+  {
+    if (destroy)
+      destroy (user_data);
+    return;
+  }
+
+  if (face->get_table_tags_destroy)
+    face->get_table_tags_destroy (face->get_table_tags_user_data);
+
+  face->get_table_tags_func = func;
+  face->get_table_tags_user_data = user_data;
+  face->get_table_tags_destroy = destroy;
+}
+
+unsigned int
+hb_face_get_table_tags (const hb_face_t *face,
+			unsigned int  start_offset,
+			unsigned int *table_count, 
+			hb_tag_t     *table_tags )
+{
+  if (!face->get_table_tags_func)
+  {
+    if (table_count)
+      *table_count = 0;
+    return 0;
+  }
+
+  return face->get_table_tags_func (face, start_offset, table_count, table_tags, face->get_table_tags_user_data);
+}
+
+
+
+
+#ifndef HB_NO_FACE_COLLECT_UNICODES
+void
+hb_face_collect_unicodes (hb_face_t *face,
+			  hb_set_t  *out)
+{
+  face->table.cmap->collect_unicodes (out, face->get_num_glyphs ());
+}
+void
+hb_face_collect_nominal_glyph_mapping (hb_face_t *face,
+				       hb_map_t  *mapping,
+				       hb_set_t  *unicodes)
+{
+  hb_set_t stack_unicodes;
+  if (!unicodes)
+    unicodes = &stack_unicodes;
+  face->table.cmap->collect_mapping (unicodes, mapping, face->get_num_glyphs ());
+}
+void
+hb_face_collect_variation_selectors (hb_face_t *face,
+				     hb_set_t  *out)
+{
+  face->table.cmap->collect_variation_selectors (out);
+}
+void
+hb_face_collect_variation_unicodes (hb_face_t *face,
+				    hb_codepoint_t variation_selector,
+				    hb_set_t  *out)
+{
+  face->table.cmap->collect_variation_unicodes (variation_selector, out);
+}
+#endif

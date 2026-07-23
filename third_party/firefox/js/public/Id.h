@@ -1,0 +1,313 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_Id_h
+#define js_Id_h
+
+
+#include "mozilla/Maybe.h"
+
+#include "jstypes.h"
+
+#include "js/GCAnnotations.h"
+#include "js/HeapAPI.h"
+#include "js/RootingAPI.h"
+#include "js/TraceKind.h"
+#include "js/TracingAPI.h"
+#include "js/TypeDecls.h"
+
+namespace js {
+class JS_PUBLIC_API GenericPrinter;
+class JSONPrinter;
+}  
+
+namespace JS {
+
+enum class SymbolCode : uint32_t;
+
+class PropertyKey {
+  uintptr_t asBits_;
+
+ public:
+  static constexpr uintptr_t IntTagBit = 0x1;
+  static constexpr uintptr_t StringTypeTag = 0x0;
+  static constexpr uintptr_t VoidTypeTag = 0x2;
+  static constexpr uintptr_t SymbolTypeTag = 0x4;
+  static constexpr uintptr_t TypeMask = 0x7;
+
+  static constexpr uint32_t IntMin = 0;
+  static constexpr uint32_t IntMax = INT32_MAX;
+
+  constexpr PropertyKey() : asBits_(VoidTypeTag) {}
+
+  static constexpr MOZ_ALWAYS_INLINE PropertyKey fromRawBits(uintptr_t bits) {
+    PropertyKey id;
+    id.asBits_ = bits;
+    return id;
+  }
+
+  bool operator==(const PropertyKey& rhs) const {
+    return asBits_ == rhs.asBits_;
+  }
+  bool operator!=(const PropertyKey& rhs) const {
+    return asBits_ != rhs.asBits_;
+  }
+
+  MOZ_ALWAYS_INLINE bool isVoid() const {
+    MOZ_ASSERT_IF((asBits_ & TypeMask) == VoidTypeTag, asBits_ == VoidTypeTag);
+    return asBits_ == VoidTypeTag;
+  }
+
+  MOZ_ALWAYS_INLINE bool isInt() const { return !!(asBits_ & IntTagBit); }
+
+  MOZ_ALWAYS_INLINE bool isString() const {
+    return (asBits_ & TypeMask) == StringTypeTag;
+  }
+
+  MOZ_ALWAYS_INLINE bool isSymbol() const {
+    return (asBits_ & TypeMask) == SymbolTypeTag;
+  }
+
+  MOZ_ALWAYS_INLINE bool isGCThing() const { return isString() || isSymbol(); }
+
+  constexpr uintptr_t asRawBits() const { return asBits_; }
+
+  MOZ_ALWAYS_INLINE int32_t toInt() const {
+    MOZ_ASSERT(isInt());
+    uint32_t bits = static_cast<uint32_t>(asBits_) >> 1;
+    return static_cast<int32_t>(bits);
+  }
+
+  MOZ_ALWAYS_INLINE JSString* toString() const {
+    MOZ_ASSERT(isString());
+    return reinterpret_cast<JSString*>(asBits_ ^ StringTypeTag);
+  }
+
+  MOZ_ALWAYS_INLINE JS::Symbol* toSymbol() const {
+    MOZ_ASSERT(isSymbol());
+    return reinterpret_cast<JS::Symbol*>(asBits_ ^ SymbolTypeTag);
+  }
+
+  js::gc::Cell* toGCThing() const {
+    MOZ_ASSERT(isGCThing());
+    return reinterpret_cast<js::gc::Cell*>(asBits_ & ~TypeMask);
+  }
+
+  GCCellPtr toGCCellPtr() const {
+    js::gc::Cell* thing = toGCThing();
+    if (isString()) {
+      return JS::GCCellPtr(thing, JS::TraceKind::String);
+    }
+    MOZ_ASSERT(isSymbol());
+    return JS::GCCellPtr(thing, JS::TraceKind::Symbol);
+  }
+
+  bool isPrivateName() const;
+
+  bool isWellKnownSymbol(JS::SymbolCode code) const;
+
+  static constexpr PropertyKey Void() { return PropertyKey(); }
+
+  static constexpr bool fitsInInt(int32_t i) { return i >= 0; }
+
+  static constexpr PropertyKey Int(int32_t i) {
+    MOZ_ASSERT(fitsInInt(i));
+    uint32_t bits = (static_cast<uint32_t>(i) << 1) | IntTagBit;
+    return PropertyKey::fromRawBits(bits);
+  }
+
+  static PropertyKey Symbol(JS::Symbol* sym) {
+    MOZ_ASSERT(sym != nullptr);
+    MOZ_ASSERT((uintptr_t(sym) & TypeMask) == 0);
+    MOZ_ASSERT(!js::gc::IsInsideNursery(reinterpret_cast<js::gc::Cell*>(sym)));
+    return PropertyKey::fromRawBits(uintptr_t(sym) | SymbolTypeTag);
+  }
+
+  static PropertyKey NonIntAtom(JSAtom* atom) {
+    MOZ_ASSERT((uintptr_t(atom) & TypeMask) == 0);
+    MOZ_ASSERT(PropertyKey::isNonIntAtom(atom));
+    return PropertyKey::fromRawBits(uintptr_t(atom) | StringTypeTag);
+  }
+
+  static PropertyKey NonIntAtom(JSString* str) {
+    MOZ_ASSERT((uintptr_t(str) & TypeMask) == 0);
+    MOZ_ASSERT(PropertyKey::isNonIntAtom(str));
+    return PropertyKey::fromRawBits(uintptr_t(str) | StringTypeTag);
+  }
+
+  static PropertyKey fromPinnedString(JSString* str);
+
+  MOZ_ALWAYS_INLINE bool isAtom() const { return isString(); }
+
+  MOZ_ALWAYS_INLINE bool isAtom(JSAtom* atom) const {
+    MOZ_ASSERT(PropertyKey::isNonIntAtom(atom));
+    return *this == NonIntAtom(atom);
+  }
+
+  MOZ_ALWAYS_INLINE JSAtom* toAtom() const {
+    return reinterpret_cast<JSAtom*>(toString());
+  }
+  MOZ_ALWAYS_INLINE JSLinearString* toLinearString() const {
+    return reinterpret_cast<JSLinearString*>(toString());
+  }
+
+  PropertyKey atomicGet() const {
+    return fromRawBits(__atomic_load_n(&asBits_, __ATOMIC_RELAXED));
+  }
+  void atomicSet(const PropertyKey& other) {
+    __atomic_store_n(&asBits_, other.asBits_, __ATOMIC_RELAXED);
+  }
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  void dump() const;
+  void dump(js::GenericPrinter& out) const;
+  void dump(js::JSONPrinter& json) const;
+
+  void dumpFields(js::JSONPrinter& json) const;
+  void dumpPropertyName(js::GenericPrinter& out) const;
+  void dumpStringContent(js::GenericPrinter& out) const;
+#endif
+
+ private:
+  static bool isNonIntAtom(JSAtom* atom);
+  static bool isNonIntAtom(JSString* atom);
+} JS_HAZ_GC_POINTER;
+
+}  
+
+using jsid = JS::PropertyKey;
+
+namespace JS {
+
+extern JS_PUBLIC_DATA const JS::HandleId VoidHandlePropertyKey;
+
+template <>
+struct GCPolicy<jsid> : public GCPolicyBase<jsid> {
+  static void trace(JSTracer* trc, jsid* idp, const char* name) {
+    TraceRoot(trc, idp, name);
+  }
+  static bool isValid(jsid id) {
+    return !id.isGCThing() ||
+           js::gc::IsCellPointerValid(id.toGCCellPtr().asCell());
+  }
+
+  static constexpr bool mightBeInNursery() { return false; }
+  static bool isTenured(jsid id) {
+    MOZ_ASSERT_IF(id.isGCThing(),
+                  !js::gc::IsInsideNursery(id.toGCCellPtr().asCell()));
+    return true;
+  }
+};
+
+#ifdef DEBUG
+MOZ_ALWAYS_INLINE void AssertIdIsNotGray(jsid id) {
+  if (id.isGCThing()) {
+    AssertCellIsNotGray(id.toGCCellPtr().asCell());
+  }
+}
+#endif
+
+extern JS_PUBLIC_API PropertyKey GetWellKnownSymbolKey(JSContext* cx,
+                                                       SymbolCode which);
+
+extern JS_PUBLIC_API bool ToGetterId(
+    JSContext* cx, JS::Handle<JS::PropertyKey> id,
+    JS::MutableHandle<JS::PropertyKey> getterId);
+extern JS_PUBLIC_API bool ToSetterId(
+    JSContext* cx, JS::Handle<JS::PropertyKey> id,
+    JS::MutableHandle<JS::PropertyKey> setterId);
+
+}  
+
+namespace js {
+
+template <>
+struct BarrierMethods<jsid> {
+  static gc::Cell* asGCThingOrNull(jsid id) {
+    if (id.isGCThing()) {
+      return id.toGCThing();
+    }
+    return nullptr;
+  }
+  static void writeBarriers(jsid* idp, jsid prev, jsid next) {
+    if (prev.isString()) {
+      JS::IncrementalPreWriteBarrier(JS::GCCellPtr(prev.toString()));
+    }
+    if (prev.isSymbol()) {
+      JS::IncrementalPreWriteBarrier(JS::GCCellPtr(prev.toSymbol()));
+    }
+    postWriteBarrier(idp, prev, next);
+  }
+  static void postWriteBarrier(jsid* idp, jsid prev, jsid next) {
+    MOZ_ASSERT_IF(next.isString(), !gc::IsInsideNursery(next.toString()));
+  }
+  static void exposeToJS(jsid id) {
+    if (id.isGCThing()) {
+      js::gc::ExposeGCThingToActiveJS(id.toGCCellPtr());
+    }
+  }
+  static void readBarrier(jsid id) {
+    if (id.isGCThing()) {
+      js::gc::IncrementalReadBarrier(id.toGCCellPtr());
+    }
+  }
+};
+
+template <typename F>
+auto MapGCThingTyped(const jsid& id, F&& f) {
+  if (id.isString()) {
+    return mozilla::Some(f(id.toString()));
+  }
+  if (id.isSymbol()) {
+    return mozilla::Some(f(id.toSymbol()));
+  }
+  MOZ_ASSERT(!id.isGCThing());
+  using ReturnType = decltype(f(static_cast<JSString*>(nullptr)));
+  return mozilla::Maybe<ReturnType>();
+}
+
+template <typename F>
+bool ApplyGCThingTyped(const jsid& id, F&& f) {
+  return MapGCThingTyped(id,
+                         [&f](auto t) {
+                           f(t);
+                           return true;
+                         })
+      .isSome();
+}
+
+template <typename Wrapper>
+class WrappedPtrOperations<JS::PropertyKey, Wrapper> {
+  const JS::PropertyKey& id() const {
+    return static_cast<const Wrapper*>(this)->get();
+  }
+
+ public:
+  bool isVoid() const { return id().isVoid(); }
+  bool isInt() const { return id().isInt(); }
+  bool isString() const { return id().isString(); }
+  bool isSymbol() const { return id().isSymbol(); }
+  bool isGCThing() const { return id().isGCThing(); }
+
+  int32_t toInt() const { return id().toInt(); }
+  JSString* toString() const { return id().toString(); }
+  JS::Symbol* toSymbol() const { return id().toSymbol(); }
+
+  bool isPrivateName() const { return id().isPrivateName(); }
+
+  bool isWellKnownSymbol(JS::SymbolCode code) const {
+    return id().isWellKnownSymbol(code);
+  }
+
+  uintptr_t asRawBits() const { return id().asRawBits(); }
+
+  bool isAtom() const { return id().isAtom(); }
+  bool isAtom(JSAtom* atom) const { return id().isAtom(atom); }
+  JSAtom* toAtom() const { return id().toAtom(); }
+  JSLinearString* toLinearString() const { return id().toLinearString(); }
+};
+
+}  
+
+#endif /* js_Id_h */

@@ -1,0 +1,263 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+<html:template id="appMenu-viewCache">
+  <panelview id="appMenu-mainView" class="PanelUI-subView"
+             lockpanelvertical="true">
+    <vbox class="panel-subview-body">
+      <toolbarbutton id="appMenu-new-tab-button2"
+                     class="subviewbutton"
+                     data-l10n-id="appmenuitem-new-tab"
+                     key="key_newNavigatorTab"
+                     command="cmd_newNavigatorTab"/>
+      <toolbarbutton id="appMenu-new-window-button2"
+                     class="subviewbutton"
+                     data-l10n-id="appmenuitem-new-window"
+                     key="key_newNavigator"
+                     command="cmd_newNavigator"/>
+      <toolbarbutton id="appMenu-new-private-window-button2"
+                     class="subviewbutton"
+                     data-l10n-id="appmenuitem-new-private-window"
+                     key="key_privatebrowsing"
+                     command="Tools:PrivateBrowsing"/>
+      <toolbarseparator/>
+      <toolbarbutton id="appMenu-bookmarks-button"
+                     class="subviewbutton subviewbutton-nav"
+                     data-l10n-id="library-bookmarks-menu"
+                     closemenu="none"/>
+      <toolbarbutton id="appMenu-history-button"
+                     class="subviewbutton subviewbutton-nav"
+                     data-l10n-id="appmenuitem-history"
+                     closemenu="none"/>
+      <toolbarbutton id="appMenu-tab-groups-button"
+                     class="subviewbutton subviewbutton-nav"
+                     data-l10n-id="appmenuitem-tab-groups"
+                     closemenu="none"
+                     hidden="true"/>
+      <toolbarbutton id="appMenu-downloads-button"
+                     class="subviewbutton"
+                     data-l10n-id="appmenuitem-downloads"
+                     key="key_openDownloads"
+                     command="Tools:Downloads"/>
+      <toolbarseparator/>
+      <toolbarbutton id="appMenu-save-file-button2"
+                     class="subviewbutton"
+                     data-l10n-id="appmenuitem-save-page"
+                     key="key_savePage"
+                     command="Browser:SavePage"/>
+      <toolbarbutton id="appMenu-find-button2"
+                     class="subviewbutton"
+                     data-l10n-id="appmenuitem-find-in-page"
+                     key="key_find"
+                     command="cmd_find"/>
+      <toolbaritem id="appMenu-zoom-controls"
+                   class="subviewbutton toolbaritem-combined-buttons"
+                   closemenu="none">
+        <label class="toolbarbutton-text" data-l10n-id="appmenuitem-zoom"/>
+        <toolbarbutton id="appMenu-zoomReduce-button2"
+                       class="subviewbutton subviewbutton-iconic"
+                       command="cmd_fullZoomReduce"
+                       data-l10n-id="appmenuitem-zoom-reduce"
+                       tooltip="dynamic-shortcut-tooltip"/>
+        <toolbarbutton id="appMenu-zoomReset-button2"
+                       class="subviewbutton"
+                       command="cmd_fullZoomReset"
+                       tooltip="dynamic-shortcut-tooltip"/>
+        <toolbarbutton id="appMenu-zoomEnlarge-button2"
+                       class="subviewbutton subviewbutton-iconic"
+                       command="cmd_fullZoomEnlarge"
+                       data-l10n-id="appmenuitem-zoom-enlarge"
+                       tooltip="dynamic-shortcut-tooltip"/>
+        <toolbarbutton id="appMenu-fullscreen-button2"
+                       class="subviewbutton subviewbutton-iconic"
+                       data-l10n-id="appmenuitem-fullscreen"
+                       type="checkbox"
+                       tooltip="dynamic-shortcut-tooltip">
+          <observes element="View:FullScreen" attribute="checked"/>
+        </toolbarbutton>
+      </toolbaritem>
+      <toolbarseparator/>
+      <toolbarbutton id="appMenu-settings-button"
+                     class="subviewbutton"
+                     data-l10n-id="appmenuitem-settings"/>
+      <toolbarbutton id="appMenu-more-button2"
+                     class="subviewbutton subviewbutton-nav"
+                     data-l10n-id="appmenuitem-more-tools"
+                     closemenu="none"/>
+      <toolbarbutton id="appMenu-help-button2"
+                     class="subviewbutton subviewbutton-nav"
+                     data-l10n-id="appmenuitem-help"
+                     closemenu="none"/>
+      <toolbarseparator/>
+      <toolbarbutton id="appMenu-quit-button2"
+                     class="subviewbutton"
+                     data-l10n-id="appmenuitem-exit2"
+                     key="key_quitApplication"
+                     command="cmd_quitApplication"/>
+    </vbox>
+  </panelview>
+  <panelview id="PanelUI-history">
+    <vbox class="panel-subview-body">
+      <toolbarbutton id="appMenuRecentlyClosedTabs"
+                     data-l10n-id="appmenu-recently-closed-tabs"
+                     class="subviewbutton subviewbutton-nav"
+                     closemenu="none"
+                     />
+      <toolbarbutton id="appMenuRecentlyClosedWindows"
+                     data-l10n-id="appmenu-recently-closed-windows"
+                     class="subviewbutton subviewbutton-nav"
+                     closemenu="none"
+                     />
+      <toolbarbutton id="appMenuSearchHistory"
+                     data-l10n-id="appmenu-search-history"
+                     class="subviewbutton"
+                     />
+      <toolbarbutton id="appMenu-restoreSession"
+                     data-l10n-id="appmenu-restore-session"
+                     class="subviewbutton"
+                     command="Browser:RestoreLastSession"/>
+      <toolbarseparator/>
+      <toolbarbutton id="appMenuClearRecentHistory"
+                     data-l10n-id="appmenu-clear-history"
+                     class="subviewbutton"
+                     command="Tools:Sanitize"/>
+      <toolbarseparator/>
+      <html:h2 id="panelMenu_recentHistory" class="subview-subheader" data-l10n-id="appmenu-recent-history-subheader"></html:h2>
+      <toolbaritem id="appMenu_historyMenu"
+                   orient="vertical"
+                   smoothscroll="false"
+                   flatList="true"
+                   tooltip="bhTooltip"
+                   role="group"
+                   aria-labelledby="panelMenu_recentHistory">
+      </toolbaritem>
+    </vbox>
+    <toolbarseparator/>
+    <toolbarbutton id="PanelUI-historyMore"
+                   class="subviewbutton panel-subview-footer-button"
+                   data-l10n-id="appmenu-manage-history"
+                   key="showAllHistoryKb"
+                   command="Browser:ShowAllHistory"
+                   />
+  </panelview>
+
+  <panelview id="appMenu-library-recentlyClosedTabs"/>
+  <panelview id="appMenu-library-recentlyClosedWindows"/>
+
+  <panelview id="PanelUI-containers">
+    <vbox id="PanelUI-containersItems"/>
+  </panelview>
+
+  <panelview id="PanelUI-helpView" class="PanelUI-subView" data-l10n-id="appmenu-help-header" data-l10n-attrs="title">
+    <vbox id="PanelUI-helpItems" class="panel-subview-body"/>
+  </panelview>
+
+  <panelview id="PanelUI-bookmarks" class="PanelUI-subView">
+    <vbox class="panel-subview-body">
+      <toolbarbutton id="panelMenuBookmarkThisPage"
+                     class="subviewbutton"
+                     command="Browser:AddBookmarkAs"
+                     />
+      <toolbarbutton id="panelMenu_searchBookmarks"
+                     data-l10n-id="bookmarks-search"
+                     class="subviewbutton"
+                     />
+      <toolbarbutton id="panelMenu_viewBookmarksToolbar"
+                     class="subviewbutton"
+                     data-l10n-id="bookmarks-tools-toolbar-visibility-panel"
+                     data-l10n-args='{ "isVisible": false }'
+                     />
+      <toolbarseparator/>
+      <html:h2 id="panelMenu_recentBookmarks"
+          data-l10n-id="bookmarks-recent-bookmarks-panel-subheader"
+          class="subview-subheader"/>
+      <toolbaritem id="panelMenu_bookmarksMenu"
+                   orient="vertical"
+                   smoothscroll="false"
+                   flatList="true"
+                   tooltip="bhTooltip"
+                   role="group"
+                   aria-labelledby="panelMenu_recentBookmarks">
+      </toolbaritem>
+    </vbox>
+    <toolbarseparator/>
+    <toolbarbutton id="panelMenu_showAllBookmarks"
+                   data-l10n-id="bookmarks-manage-bookmarks"
+                   class="subviewbutton panel-subview-footer-button"
+                   command="Browser:ShowAllBookmarks"
+                   />
+  </panelview>
+
+  <panelview id="appmenu-moreTools" class="PanelUI-subView">
+    <vbox class="panel-subview-body">
+      <toolbarbutton id="appmenu-moreTools-button"
+                     class="subviewbutton"
+                     data-l10n-id="appmenu-customizetoolbar"
+                     command="cmd_CustomizeToolbars"/>
+    </vbox>
+  </panelview>
+
+  <panelview id="appMenu-libraryView" class="PanelUI-subView">
+    <vbox class="panel-subview-body">
+      <toolbarbutton id="appMenu-library-bookmarks-button"
+                     class="subviewbutton subviewbutton-nav"
+                     data-l10n-id="library-bookmarks-menu"
+                     closemenu="none"
+                     />
+      <toolbarbutton id="appMenu-library-history-button"
+                     class="subviewbutton subviewbutton-nav"
+                     data-l10n-id="appmenuitem-history"
+                     closemenu="none"
+                     />
+      <toolbarbutton id="appMenu-library-downloads-button"
+                     class="subviewbutton"
+                     data-l10n-id="appmenuitem-downloads"
+                     />
+    </vbox>
+  </panelview>
+
+  <panelview id="reset-pbm-panel" class="PanelUI-subView" role="document">
+    <vbox id="reset-pbm-panel-container" role="alertdialog" aria-labelledby="reset-pbm-panel-header">
+      <hbox id="reset-pbm-panel-header">
+        <description data-l10n-id="reset-pbm-panel-heading2" role="heading" aria-level="2"/>
+      </hbox>
+
+      <description id="reset-pbm-panel-description" data-l10n-id="reset-pbm-panel-description2"/>
+      <checkbox id="reset-pbm-panel-checkbox" data-l10n-id="reset-pbm-panel-always-ask-checkbox"/>
+
+      <html:moz-button-group id="reset-pbm-panel-footer" class="panel-footer">
+        <button id="reset-pbm-panel-cancel-button"
+                class="footer-button"
+                data-l10n-id="reset-pbm-panel-cancel-button"
+                ></button>
+        <button slot="primary"
+                id="reset-pbm-panel-confirm-button"
+                class="footer-button"
+                data-l10n-id="reset-pbm-panel-confirm-button2"
+                ></button>
+      </html:moz-button-group>
+    </vbox>
+  </panelview>
+
+  <panelview id="appMenu-tabGroupsListView" class="PanelUI-subView">
+    <vbox class="panel-subview-body">
+      <html:tab-groups-list/>
+    </vbox>
+  </panelview>
+
+  <panelview id="toolbar-tabGroupsListView"
+             class="PanelUI-subView"
+             mainview-with-header="true">
+    <box class="panel-header">
+      <html:h1>
+        <html:span data-l10n-id="tab-groups-list-title"></html:span>
+      </html:h1>
+    </box>
+    <toolbarseparator />
+    <vbox class="panel-subview-body">
+      <html:tab-groups-list/>
+    </vbox>
+  </panelview>
+
+</html:template>

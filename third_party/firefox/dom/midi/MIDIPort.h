@@ -1,0 +1,97 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_MIDIPort_h
+#define mozilla_dom_MIDIPort_h
+
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/dom/MIDIAccess.h"
+#include "mozilla/dom/MIDIPortChild.h"
+#include "mozilla/dom/MIDIPortInterface.h"
+
+struct JSContext;
+
+namespace mozilla::dom {
+
+class Promise;
+class MIDIPortInfo;
+class MIDIAccess;
+class MIDIPortChangeEvent;
+class MIDIPortChild;
+class MIDIMessage;
+
+class MIDIPort : public DOMEventTargetHelper {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_INHERITED(MIDIPort,
+                                                         DOMEventTargetHelper)
+ protected:
+  explicit MIDIPort(nsPIDOMWindowInner* aWindow);
+  bool Initialize(const MIDIPortInfo& aPortInfo, bool aSysexEnabled,
+                  MIDIAccess* aMIDIAccessParent);
+  virtual ~MIDIPort();
+
+ public:
+  nsIGlobalObject* GetParentObject() const { return GetRelevantGlobal(); }
+
+  void GetId(nsString& aRetVal) const;
+  void GetManufacturer(nsString& aRetVal) const;
+  void GetName(nsString& aRetVal) const;
+  void GetVersion(nsString& aRetVal) const;
+  MIDIPortType Type() const;
+  MIDIPortConnectionState Connection() const;
+  MIDIPortDeviceState State() const;
+  bool SysexEnabled() const;
+
+  already_AddRefed<Promise> Open(ErrorResult& aError);
+  already_AddRefed<Promise> Close(ErrorResult& aError);
+
+  void FireStateChangeEvent();
+
+  virtual void StateChange();
+  virtual void Receive(const nsTArray<MIDIMessage>& aMsg);
+
+  void UnsetIPCPort();
+
+  IMPL_EVENT_HANDLER(statechange)
+
+  void DisconnectFromOwner() override;
+  const nsString& StableId();
+
+ protected:
+  class PortHolder {
+   public:
+    void Init(already_AddRefed<MIDIPortChild> aArg) {
+      MOZ_ASSERT(!mInner);
+      mInner = aArg;
+    }
+    void Clear() {
+      if (mInner) {
+        mInner->DetachOwner();
+        mInner = nullptr;
+      }
+    }
+    ~PortHolder() { Clear(); }
+    MIDIPortChild* Get() const { return mInner; }
+
+   private:
+    RefPtr<MIDIPortChild> mInner;
+  };
+
+  PortHolder mPortHolder;
+  MIDIPortChild* Port() const { return mPortHolder.Get(); }
+
+ private:
+  void KeepAliveOnStatechange();
+  void DontKeepAliveOnStatechange();
+
+  RefPtr<MIDIAccess> mMIDIAccessParent;
+  RefPtr<Promise> mOpeningPromise;
+  RefPtr<Promise> mClosingPromise;
+  bool mKeepAlive;
+};
+
+}  
+
+#endif  // mozilla_dom_MIDIPort_h

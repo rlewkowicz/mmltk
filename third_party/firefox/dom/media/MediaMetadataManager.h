@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(MediaMetadataManager_h_)
+#  define MediaMetadataManager_h_
+
+#  include "MediaEventSource.h"
+#  include "TimeUnits.h"
+#  include "VideoUtils.h"
+#  include "mozilla/AbstractThread.h"
+#  include "mozilla/LinkedList.h"
+
+namespace mozilla {
+
+class TimedMetadata;
+typedef MediaEventProducerExc<TimedMetadata> TimedMetadataEventProducer;
+typedef MediaEventSourceExc<TimedMetadata> TimedMetadataEventSource;
+
+class TimedMetadata : public LinkedListElement<TimedMetadata> {
+ public:
+  TimedMetadata(const media::TimeUnit& aPublishTime,
+                UniquePtr<MetadataTags>&& aTags, UniquePtr<MediaInfo>&& aInfo)
+      : mPublishTime(aPublishTime),
+        mTags(std::move(aTags)),
+        mInfo(std::move(aInfo)) {}
+
+  TimedMetadata(TimedMetadata&& aOther)
+      : mPublishTime(aOther.mPublishTime),
+        mTags(std::move(aOther.mTags)),
+        mInfo(std::move(aOther.mInfo)) {}
+
+  media::TimeUnit mPublishTime;
+  UniquePtr<MetadataTags> mTags;
+  UniquePtr<MediaInfo> mInfo;
+};
+
+class MediaMetadataManager {
+ public:
+  ~MediaMetadataManager() {
+    TimedMetadata* element;
+    while ((element = mMetadataQueue.popFirst()) != nullptr) {
+      delete element;
+    }
+  }
+
+  void Connect(TimedMetadataEventSource& aEvent, AbstractThread* aThread) {
+    mListener =
+        aEvent.Connect(aThread, this, &MediaMetadataManager::OnMetadataQueued);
+  }
+
+  void Disconnect() { mListener.Disconnect(); }
+
+  TimedMetadataEventSource& TimedMetadataEvent() { return mTimedMetadataEvent; }
+
+  void DispatchMetadataIfNeeded(const media::TimeUnit& aCurrentTime) {
+    TimedMetadata* metadata = mMetadataQueue.getFirst();
+    while (metadata && aCurrentTime >= metadata->mPublishTime) {
+      mTimedMetadataEvent.Notify(std::move(*metadata));
+      delete mMetadataQueue.popFirst();
+      metadata = mMetadataQueue.getFirst();
+    }
+  }
+
+ protected:
+  void OnMetadataQueued(TimedMetadata&& aMetadata) {
+    mMetadataQueue.insertBack(new TimedMetadata(std::move(aMetadata)));
+  }
+
+  LinkedList<TimedMetadata> mMetadataQueue;
+  MediaEventListener mListener;
+  TimedMetadataEventProducer mTimedMetadataEvent;
+};
+
+}  
+
+#endif

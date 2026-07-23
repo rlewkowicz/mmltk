@@ -1,0 +1,1913 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "vm/HelperThreads.h"
+
+#include "mozilla/ReverseIterator.h"  // mozilla::Reversed(...)
+#include "mozilla/ScopeExit.h"
+#include "mozilla/Span.h"  // mozilla::Span<TaggedScriptThingIndex>
+
+#include <algorithm>
+
+#include "frontend/CompilationStencil.h"  // frontend::CompilationStencil
+#include "gc/GC.h"
+#include "gc/Zone.h"
+#include "jit/BaselineCompileTask.h"
+#include "jit/BaselineJIT.h"
+#include "jit/Ion.h"
+#include "jit/IonCompileTask.h"
+#include "jit/JitRuntime.h"
+#include "jit/JitScript.h"
+#include "js/CompileOptions.h"  // JS::PrefableCompileOptions, JS::ReadOnlyCompileOptions
+#include "js/experimental/CompileScript.h"  // JS::ThreadStackQuotaForSize
+#include "js/friend/StackLimits.h"          // js::ReportOverRecursed
+#include "js/HelperThreadAPI.h"
+#include "js/Stack.h"
+#include "js/UniquePtr.h"
+#include "js/Utility.h"
+#include "threading/CpuCount.h"
+#include "vm/ErrorReporting.h"
+#include "vm/HelperThreadState.h"
+#include "vm/InternalThreadPool.h"
+#include "vm/MutexIDs.h"
+#include "wasm/WasmGenerator.h"
+
+using namespace js;
+
+using mozilla::TimeDuration;
+
+static void CancelOffThreadWasmCompleteTier2GeneratorLocked(
+    AutoLockHelperThreadState& lock);
+static void CancelOffThreadWasmPartialTier2CompileLocked(
+    AutoLockHelperThreadState& lock);
+
+
+
+namespace js {
+
+MOZ_RUNINIT Mutex gHelperThreadLock(mutexid::GlobalHelperThreadState);
+GlobalHelperThreadState* gHelperThreadState = nullptr;
+
+}  
+
+bool js::CreateHelperThreadsState() {
+  MOZ_ASSERT(!gHelperThreadState);
+  gHelperThreadState = js_new<GlobalHelperThreadState>();
+  return gHelperThreadState;
+}
+
+void js::DestroyHelperThreadsState() {
+  AutoLockHelperThreadState lock;
+
+  if (!gHelperThreadState) {
+    return;
+  }
+
+  gHelperThreadState->finish(lock);
+  js_delete(gHelperThreadState);
+  gHelperThreadState = nullptr;
+}
+
+bool js::EnsureHelperThreadsInitialized() {
+  MOZ_ASSERT(gHelperThreadState);
+  return gHelperThreadState->ensureInitialized();
+}
+
+static size_t ClampDefaultCPUCount(size_t cpuCount) {
+  return std::min<size_t>(cpuCount, 8);
+}
+
+static size_t ThreadCountForCPUCount(size_t cpuCount) {
+  return std::max<size_t>(cpuCount, 2);
+}
+
+bool js::SetFakeCPUCount(size_t count) {
+  HelperThreadState().setCpuCount(count);
+  return true;
+}
+
+void GlobalHelperThreadState::setCpuCount(size_t count) {
+  AutoLockHelperThreadState lock;
+  MOZ_ASSERT(!isInitialized(lock));
+
+  MOZ_ASSERT(!dispatchTaskCallback);
+
+  cpuCount = count;
+  threadCount = ThreadCountForCPUCount(count);
+}
+
+size_t js::GetHelperThreadCount() { return HelperThreadState().threadCount; }
+
+size_t js::GetHelperThreadCPUCount() { return HelperThreadState().cpuCount; }
+
+void JS::SetProfilingThreadCallbacks(
+    JS::RegisterThreadCallback registerThread,
+    JS::UnregisterThreadCallback unregisterThread) {
+  HelperThreadState().registerThread = registerThread;
+  HelperThreadState().unregisterThread = unregisterThread;
+}
+
+JS_PUBLIC_API MOZ_NEVER_INLINE void JS::SetHelperThreadTaskCallback(
+    HelperThreadTaskCallback callback, size_t threadCount, size_t stackSize) {
+  AutoLockHelperThreadState lock;
+  HelperThreadState().setDispatchTaskCallback(callback, threadCount, stackSize,
+                                              lock);
+}
+
+JS_PUBLIC_API MOZ_NEVER_INLINE const char* JS::GetHelperThreadTaskName(
+    HelperThreadTask* task) {
+  return task->getName();
+}
+
+void GlobalHelperThreadState::setDispatchTaskCallback(
+    JS::HelperThreadTaskCallback callback, size_t threadCount, size_t stackSize,
+    const AutoLockHelperThreadState& lock) {
+  MOZ_ASSERT(!isInitialized(lock));
+  MOZ_ASSERT(!dispatchTaskCallback);
+  MOZ_ASSERT(threadCount != 0);
+  MOZ_ASSERT(stackSize >= 16 * 1024);
+
+  dispatchTaskCallback = callback;
+  this->threadCount = threadCount;
+  this->stackQuota = JS::ThreadStackQuotaForSize(stackSize);
+}
+
+bool GlobalHelperThreadState::ensureInitialized() {
+  MOZ_ASSERT(CanUseExtraThreads());
+  MOZ_ASSERT(this == &HelperThreadState());
+
+  AutoLockHelperThreadState lock;
+
+  if (isInitialized(lock)) {
+    return true;
+  }
+
+  for (size_t& i : runningTaskCount) {
+    i = 0;
+  }
+
+  useInternalThreadPool_ = !dispatchTaskCallback;
+  if (useInternalThreadPool(lock)) {
+    if (!InternalThreadPool::Initialize(threadCount, lock)) {
+      return false;
+    }
+  }
+
+  MOZ_ASSERT(dispatchTaskCallback);
+
+  if (!ensureThreadCount(threadCount, lock)) {
+    finishThreads(lock);
+    return false;
+  }
+
+  MOZ_ASSERT(threadCount != 0);
+  isInitialized_ = true;
+  return true;
+}
+
+bool GlobalHelperThreadState::ensureThreadCount(
+    size_t count, AutoLockHelperThreadState& lock) {
+  if (!helperTasks_.reserve(count)) {
+    return false;
+  }
+
+  if (useInternalThreadPool(lock)) {
+    InternalThreadPool& pool = InternalThreadPool::Get();
+    if (pool.threadCount(lock) < count) {
+      if (!pool.ensureThreadCount(count, lock)) {
+        return false;
+      }
+
+      threadCount = pool.threadCount(lock);
+    }
+  }
+
+  return true;
+}
+
+GlobalHelperThreadState::GlobalHelperThreadState()
+    : cpuCount(0),
+      threadCount(0),
+      totalCountRunningTasks(0),
+      registerThread(nullptr),
+      unregisterThread(nullptr),
+      wasmCompleteTier2GeneratorsFinished_(0) {
+  MOZ_ASSERT(!gHelperThreadState);
+
+  cpuCount = ClampDefaultCPUCount(GetCPUCount());
+  threadCount = ThreadCountForCPUCount(cpuCount);
+
+  MOZ_ASSERT(cpuCount > 0, "GetCPUCount() seems broken");
+}
+
+void GlobalHelperThreadState::finish(AutoLockHelperThreadState& lock) {
+  if (!isInitialized(lock)) {
+    return;
+  }
+
+  MOZ_ASSERT_IF(!JSRuntime::hasLiveRuntimes(), gcParallelMarkingThreads == 0);
+
+  finishThreads(lock);
+
+  auto& freeList = ionFreeList(lock);
+  while (!freeList.empty()) {
+    UniquePtr<jit::IonFreeTask> task = std::move(freeList.back());
+    freeList.popBack();
+    jit::FreeIonCompileTasks(task->compileTasks());
+  }
+}
+
+void GlobalHelperThreadState::finishThreads(AutoLockHelperThreadState& lock) {
+  waitForAllTasksLocked(lock);
+  terminating_ = true;
+
+  if (InternalThreadPool::IsInitialized()) {
+    InternalThreadPool::ShutDown(lock);
+  }
+}
+
+#ifdef DEBUG
+void GlobalHelperThreadState::assertIsLockedByCurrentThread() const {
+  gHelperThreadLock.assertOwnedByCurrentThread();
+}
+#endif  // DEBUG
+
+void GlobalHelperThreadState::dispatch(const AutoLockHelperThreadState& lock) {
+  if (helperTasks_.length() >= threadCount) {
+    return;
+  }
+
+  HelperThreadTask* task = findHighestPriorityTask(lock);
+  if (!task) {
+    return;
+  }
+
+#ifdef DEBUG
+  MOZ_ASSERT(tasksPending_ < threadCount);
+  tasksPending_++;
+#endif
+
+  helperTasks(lock).infallibleEmplaceBack(task);
+  runningTaskCount[task->threadType()]++;
+  totalCountRunningTasks++;
+
+  lock.queueTaskToDispatch(task);
+}
+
+void GlobalHelperThreadState::wait(
+    AutoLockHelperThreadState& lock,
+    TimeDuration timeout ) {
+  MOZ_ASSERT(!lock.hasQueuedTasks());
+  consumerWakeup.wait_for(lock, timeout);
+}
+
+void GlobalHelperThreadState::notifyAll(const AutoLockHelperThreadState&) {
+  consumerWakeup.notify_all();
+}
+
+void GlobalHelperThreadState::notifyOne(const AutoLockHelperThreadState&) {
+  consumerWakeup.notify_one();
+}
+
+bool GlobalHelperThreadState::hasActiveThreads(
+    const AutoLockHelperThreadState& lock) {
+  return !helperTasks(lock).empty();
+}
+
+void js::WaitForAllHelperThreads() { HelperThreadState().waitForAllTasks(); }
+
+void js::WaitForAllHelperThreads(AutoLockHelperThreadState& lock) {
+  HelperThreadState().waitForAllTasksLocked(lock);
+}
+
+void GlobalHelperThreadState::waitForAllTasks() {
+  AutoLockHelperThreadState lock;
+  waitForAllTasksLocked(lock);
+}
+
+void GlobalHelperThreadState::waitForAllTasksLocked(
+    AutoLockHelperThreadState& lock) {
+  CancelOffThreadWasmCompleteTier2GeneratorLocked(lock);
+  CancelOffThreadWasmPartialTier2CompileLocked(lock);
+
+  while (canStartTasks(lock) || hasActiveThreads(lock)) {
+    wait(lock);
+  }
+
+  MOZ_ASSERT(tasksPending_ == 0);
+  MOZ_ASSERT(gcParallelWorklist().isEmpty(lock));
+  MOZ_ASSERT(ionWorklist(lock).empty());
+  MOZ_ASSERT(wasmWorklist(lock, wasm::CompileState::EagerTier1).empty());
+  MOZ_ASSERT(promiseHelperTasks(lock).empty());
+  MOZ_ASSERT(compressionWorklist(lock).empty());
+  MOZ_ASSERT(ionFreeList(lock).empty());
+  MOZ_ASSERT(wasmWorklist(lock, wasm::CompileState::EagerTier2).empty());
+  MOZ_ASSERT(wasmCompleteTier2GeneratorWorklist(lock).empty());
+  MOZ_ASSERT(wasmPartialTier2CompileWorklist(lock).empty());
+  MOZ_ASSERT(!tasksPending_);
+  MOZ_ASSERT(!hasActiveThreads(lock));
+}
+
+
+bool GlobalHelperThreadState::checkTaskThreadLimit(
+    ThreadType threadType, size_t maxThreads, bool isMaster,
+    const AutoLockHelperThreadState& lock) const {
+  MOZ_ASSERT(maxThreads >= 1);
+  MOZ_ASSERT(maxThreads <= threadCount);
+
+  size_t count = runningTaskCount[threadType];
+  if (count >= maxThreads) {
+    return false;
+  }
+
+  MOZ_ASSERT(threadCount >= totalCountRunningTasks);
+  size_t idleCount = threadCount - totalCountRunningTasks;
+  size_t idleRequired = isMaster ? 2 : 1;
+  return idleCount >= idleRequired;
+}
+
+static inline bool IsHelperThreadSimulatingOOM(js::ThreadType threadType) {
+#if defined(DEBUG) || defined(JS_OOM_BREAKPOINT)
+  return js::oom::simulator.targetThread() == threadType;
+#else
+  return false;
+#endif
+}
+
+void GlobalHelperThreadState::addSizeOfIncludingThis(
+    JS::GlobalStats* stats, const AutoLockHelperThreadState& lock) const {
+#ifdef DEBUG
+  assertIsLockedByCurrentThread();
+#endif
+
+  mozilla::MallocSizeOf mallocSizeOf = stats->mallocSizeOf_;
+  JS::HelperThreadStats& htStats = stats->helperThread;
+
+  htStats.stateData += mallocSizeOf(this);
+
+  if (InternalThreadPool::IsInitialized()) {
+    htStats.stateData +=
+        InternalThreadPool::Get().sizeOfIncludingThis(mallocSizeOf, lock);
+  }
+
+  htStats.stateData +=
+      ionWorklist_.sizeOfExcludingThis(mallocSizeOf) +
+      ionFinishedList_.sizeOfExcludingThis(mallocSizeOf) +
+      ionFreeList_.sizeOfExcludingThis(mallocSizeOf) +
+      wasmWorklist_tier1_.sizeOfExcludingThis(mallocSizeOf) +
+      wasmWorklist_tier2_.sizeOfExcludingThis(mallocSizeOf) +
+      wasmCompleteTier2GeneratorWorklist_.sizeOfExcludingThis(mallocSizeOf) +
+      wasmPartialTier2CompileWorklist_.sizeOfExcludingThis(mallocSizeOf) +
+      promiseHelperTasks_.sizeOfExcludingThis(mallocSizeOf) +
+      compressionWorklist_.sizeOfExcludingThis(mallocSizeOf) +
+      compressionFinishedList_.sizeOfExcludingThis(mallocSizeOf) +
+      gcParallelWorklist_.sizeOfExcludingThis(mallocSizeOf, lock) +
+      helperTasks_.sizeOfExcludingThis(mallocSizeOf);
+
+  for (auto task : ionWorklist_) {
+    htStats.ionCompileTask += task->sizeOfExcludingThis(mallocSizeOf);
+  }
+  for (auto task : ionFinishedList_) {
+    htStats.ionCompileTask += task->sizeOfExcludingThis(mallocSizeOf);
+  }
+  for (const auto& task : ionFreeList_) {
+    for (auto* compileTask : task->compileTasks()) {
+      htStats.ionCompileTask += compileTask->sizeOfExcludingThis(mallocSizeOf);
+    }
+  }
+
+  for (auto task : wasmWorklist_tier1_) {
+    htStats.wasmCompile += task->sizeOfExcludingThis(mallocSizeOf);
+  }
+  for (auto task : wasmWorklist_tier2_) {
+    htStats.wasmCompile += task->sizeOfExcludingThis(mallocSizeOf);
+  }
+
+  MOZ_ASSERT(htStats.idleThreadCount == 0);
+  MOZ_ASSERT(threadCount >= totalCountRunningTasks);
+  htStats.activeThreadCount = totalCountRunningTasks;
+  htStats.idleThreadCount = threadCount - totalCountRunningTasks;
+}
+
+size_t GlobalHelperThreadState::maxBaselineCompilationThreads() const {
+  if (IsHelperThreadSimulatingOOM(js::THREAD_TYPE_BASELINE)) {
+    return 1;
+  }
+  return threadCount;
+}
+
+size_t GlobalHelperThreadState::maxIonCompilationThreads() const {
+  if (IsHelperThreadSimulatingOOM(js::THREAD_TYPE_ION)) {
+    return 1;
+  }
+  return threadCount;
+}
+
+size_t GlobalHelperThreadState::maxIonFreeThreads() const {
+  return 1;
+}
+
+size_t GlobalHelperThreadState::maxPromiseHelperThreads() const {
+  if (IsHelperThreadSimulatingOOM(js::THREAD_TYPE_PROMISE_TASK)) {
+    return 1;
+  }
+  return std::min(cpuCount, threadCount);
+}
+
+size_t GlobalHelperThreadState::maxDelazifyThreads() const {
+  if (IsHelperThreadSimulatingOOM(js::THREAD_TYPE_DELAZIFY)) {
+    return 1;
+  }
+  return std::min(cpuCount, threadCount);
+}
+
+size_t GlobalHelperThreadState::maxCompressionThreads() const {
+  if (IsHelperThreadSimulatingOOM(js::THREAD_TYPE_COMPRESS)) {
+    return 1;
+  }
+
+  return 1;
+}
+
+size_t GlobalHelperThreadState::maxGCParallelThreads() const {
+  if (IsHelperThreadSimulatingOOM(js::THREAD_TYPE_GCPARALLEL)) {
+    return 1;
+  }
+  return threadCount;
+}
+
+size_t GlobalHelperThreadState::maxWasmCompilationThreads() const {
+  if (IsHelperThreadSimulatingOOM(js::THREAD_TYPE_WASM_COMPILE_TIER1) ||
+      IsHelperThreadSimulatingOOM(js::THREAD_TYPE_WASM_COMPILE_TIER2)) {
+    return 1;
+  }
+  return std::min(cpuCount, threadCount);
+}
+
+size_t js::GetMaxWasmCompilationThreads() {
+  return HelperThreadState().maxWasmCompilationThreads();
+}
+
+size_t GlobalHelperThreadState::maxWasmCompleteTier2GeneratorThreads() const {
+  return MaxCompleteTier2GeneratorTasks;
+}
+
+size_t GlobalHelperThreadState::maxWasmPartialTier2CompileThreads() const {
+  return MaxPartialTier2CompileTasks;
+}
+
+void GlobalHelperThreadState::trace(JSTracer* trc) {
+  {
+    AutoLockHelperThreadState lock;
+
+#ifdef DEBUG
+    GCMarker* marker = nullptr;
+    if (trc->isMarkingTracer()) {
+      marker = GCMarker::fromTracer(trc);
+      marker->setCheckAtomMarking(false);
+    }
+    auto reenableAtomMarkingCheck = mozilla::MakeScopeExit([marker] {
+      if (marker) {
+        marker->setCheckAtomMarking(true);
+      }
+    });
+#endif
+
+    for (auto task : baselineWorklist(lock)) {
+      task->trace(trc);
+    }
+    for (auto task : baselineFinishedList(lock)) {
+      task->trace(trc);
+    }
+
+    for (auto task : ionWorklist(lock)) {
+      task->alloc().lifoAlloc()->setReadWrite();
+      task->trace(trc);
+      task->alloc().lifoAlloc()->setReadOnly();
+    }
+    for (auto task : ionFinishedList(lock)) {
+      task->trace(trc);
+    }
+
+    for (auto* helper : helperTasks(lock)) {
+      if (helper->is<jit::IonCompileTask>()) {
+        jit::IonCompileTask* ionCompileTask = helper->as<jit::IonCompileTask>();
+        ionCompileTask->alloc().lifoAlloc()->setReadWrite();
+        ionCompileTask->trace(trc);
+      } else if (helper->is<jit::BaselineCompileTask>()) {
+        helper->as<jit::BaselineCompileTask>()->trace(trc);
+      }
+    }
+  }
+
+  JSRuntime* rt = trc->runtime();
+  if (auto* jitRuntime = rt->jitRuntime()) {
+    jit::IonCompileTask* task = jitRuntime->ionLazyLinkList(rt).getFirst();
+    while (task) {
+      task->trace(trc);
+      task = task->getNext();
+    }
+  }
+}
+
+const GlobalHelperThreadState::Selector GlobalHelperThreadState::selectors[] = {
+    &GlobalHelperThreadState::maybeGetGCParallelTask,
+    &GlobalHelperThreadState::maybeGetBaselineCompileTask,
+    &GlobalHelperThreadState::maybeGetIonCompileTask,
+    &GlobalHelperThreadState::maybeGetWasmTier1CompileTask,
+    &GlobalHelperThreadState::maybeGetPromiseHelperTask,
+    &GlobalHelperThreadState::maybeGetFreeDelazifyTask,
+    &GlobalHelperThreadState::maybeGetDelazifyTask,
+    &GlobalHelperThreadState::maybeGetCompressionTask,
+    &GlobalHelperThreadState::maybeGetLowPrioIonCompileTask,
+    &GlobalHelperThreadState::maybeGetIonFreeTask,
+    &GlobalHelperThreadState::maybeGetWasmPartialTier2CompileTask,
+    &GlobalHelperThreadState::maybeGetWasmTier2CompileTask,
+    &GlobalHelperThreadState::maybeGetWasmCompleteTier2GeneratorTask};
+
+bool GlobalHelperThreadState::canStartTasks(
+    const AutoLockHelperThreadState& lock) {
+  return canStartGCParallelTask(lock) || canStartBaselineCompileTask(lock) ||
+         canStartIonCompileTask(lock) || canStartWasmTier1CompileTask(lock) ||
+         canStartPromiseHelperTask(lock) || canStartFreeDelazifyTask(lock) ||
+         canStartDelazifyTask(lock) || canStartCompressionTask(lock) ||
+         canStartIonFreeTask(lock) || canStartWasmTier2CompileTask(lock) ||
+         canStartWasmCompleteTier2GeneratorTask(lock) ||
+         canStartWasmPartialTier2CompileTask(lock);
+}
+
+void JS::RunHelperThreadTask(HelperThreadTask* task) {
+  MOZ_ASSERT(task);
+  MOZ_ASSERT(CanUseExtraThreads());
+
+  AutoLockHelperThreadState lock;
+
+  if (!gHelperThreadState || HelperThreadState().isTerminating(lock)) {
+    return;
+  }
+
+  HelperThreadState().runOneTask(task, lock);
+  HelperThreadState().dispatch(lock);
+}
+
+void GlobalHelperThreadState::runOneTask(HelperThreadTask* task,
+                                         AutoLockHelperThreadState& lock) {
+#ifdef DEBUG
+  MOZ_ASSERT(tasksPending_ > 0);
+  tasksPending_--;
+#endif
+
+  runTaskLocked(task, lock);
+
+  notifyAll(lock);
+}
+
+HelperThreadTask* GlobalHelperThreadState::findHighestPriorityTask(
+    const AutoLockHelperThreadState& locked) {
+
+  for (const auto& selector : selectors) {
+    if (auto* task = (this->*(selector))(locked)) {
+      return task;
+    }
+  }
+
+  return nullptr;
+}
+
+#ifdef DEBUG
+static bool VectorHasTask(
+    const Vector<HelperThreadTask*, 0, SystemAllocPolicy>& tasks,
+    HelperThreadTask* task) {
+  for (HelperThreadTask* t : tasks) {
+    if (t == task) {
+      return true;
+    }
+  }
+
+  return false;
+}
+#endif
+
+void GlobalHelperThreadState::runTaskLocked(HelperThreadTask* task,
+                                            AutoLockHelperThreadState& locked) {
+  ThreadType threadType = task->threadType();
+
+  MOZ_ASSERT(VectorHasTask(helperTasks(locked), task));
+  MOZ_ASSERT(totalCountRunningTasks != 0);
+  MOZ_ASSERT(runningTaskCount[threadType] != 0);
+
+  js::oom::SetThreadType(threadType);
+
+  {
+    JS::AutoSuppressGCAnalysis nogc;
+    task->runHelperThreadTask(locked);
+  }
+
+  js::oom::SetThreadType(js::THREAD_TYPE_NONE);
+
+  helperTasks(locked).eraseIfEqual(task);
+  totalCountRunningTasks--;
+  runningTaskCount[threadType]--;
+}
+
+void AutoHelperTaskQueue::queueTaskToDispatch(
+    JS::HelperThreadTask* task) const {
+
+  task->onThreadPoolDispatch();
+
+  AutoEnterOOMUnsafeRegion oomUnsafe;
+  if (!tasksToDispatch.append(task)) {
+    oomUnsafe.crash("AutoLockHelperThreadState::queueTaskToDispatch");
+  }
+}
+
+void AutoHelperTaskQueue::dispatchQueuedTasks() {
+  JS::AutoSuppressGCAnalysis nogc;
+
+  for (size_t i = 0; i < tasksToDispatch.length(); i++) {
+    HelperThreadState().dispatchTaskCallback(tasksToDispatch[i]);
+  }
+  tasksToDispatch.clear();
+}
+
+
+
+bool GlobalHelperThreadState::canStartIonCompileTask(
+    const AutoLockHelperThreadState& lock) {
+  return !ionWorklist(lock).empty() &&
+         checkTaskThreadLimit(THREAD_TYPE_ION, maxIonCompilationThreads(),
+                              lock);
+}
+
+static bool IonCompileTaskHasHigherPriority(jit::IonCompileTask* first,
+                                            jit::IonCompileTask* second) {
+
+  jit::JitScript* firstJitScript = first->script()->jitScript();
+  jit::JitScript* secondJitScript = second->script()->jitScript();
+  return firstJitScript->warmUpCount() / first->script()->length() >
+         secondJitScript->warmUpCount() / second->script()->length();
+}
+
+jit::IonCompileTask* GlobalHelperThreadState::highestPriorityPendingIonCompile(
+    const AutoLockHelperThreadState& lock, bool checkExecutionStatus) {
+  auto& worklist = ionWorklist(lock);
+  MOZ_ASSERT(!worklist.empty());
+
+  size_t index = worklist.length();
+  for (size_t i = 0; i < worklist.length(); i++) {
+    if (checkExecutionStatus && !worklist[i]->isMainThreadRunningJS()) {
+      continue;
+    }
+    if (i < index ||
+        IonCompileTaskHasHigherPriority(worklist[i], worklist[index])) {
+      index = i;
+    }
+  }
+
+  if (index == worklist.length()) {
+    return nullptr;
+  }
+  jit::IonCompileTask* task = worklist[index];
+  worklist.erase(&worklist[index]);
+  return task;
+}
+
+HelperThreadTask* GlobalHelperThreadState::maybeGetIonCompileTask(
+    const AutoLockHelperThreadState& lock) {
+  if (!canStartIonCompileTask(lock)) {
+    return nullptr;
+  }
+
+  return highestPriorityPendingIonCompile(lock,
+                                           true);
+}
+
+HelperThreadTask* GlobalHelperThreadState::maybeGetLowPrioIonCompileTask(
+    const AutoLockHelperThreadState& lock) {
+  if (!canStartIonCompileTask(lock)) {
+    return nullptr;
+  }
+
+  return highestPriorityPendingIonCompile(lock,
+                                           false);
+}
+
+bool GlobalHelperThreadState::submitTask(
+    jit::IonCompileTask* task, const AutoLockHelperThreadState& locked) {
+  MOZ_ASSERT(isInitialized(locked));
+
+  if (!ionWorklist(locked).append(task)) {
+    return false;
+  }
+
+  task->alloc().lifoAlloc()->setReadOnly();
+
+  dispatch(locked);
+  return true;
+}
+
+bool js::StartOffThreadIonCompile(jit::IonCompileTask* task,
+                                  const AutoLockHelperThreadState& lock) {
+  return HelperThreadState().submitTask(task, lock);
+}
+
+void js::FinishOffThreadIonCompile(jit::IonCompileTask* task,
+                                   const AutoLockHelperThreadState& lock) {
+  AutoEnterOOMUnsafeRegion oomUnsafe;
+  if (!HelperThreadState().ionFinishedList(lock).append(task)) {
+    oomUnsafe.crash("FinishOffThreadIonCompile");
+  }
+  task->script()
+      ->runtimeFromAnyThread()
+      ->jitRuntime()
+      ->numFinishedOffThreadTasksRef(lock)++;
+}
+
+static JSRuntime* GetSelectorRuntime(const CompilationSelector& selector) {
+  struct Matcher {
+    JSRuntime* operator()(JSScript* script) {
+      return script->runtimeFromMainThread();
+    }
+    JSRuntime* operator()(Zone* zone) { return zone->runtimeFromMainThread(); }
+    JSRuntime* operator()(ZonesInState zbs) { return zbs.runtime; }
+    JSRuntime* operator()(JSRuntime* runtime) { return runtime; }
+  };
+
+  return selector.match(Matcher());
+}
+
+static bool IonCompileTaskMatches(const CompilationSelector& selector,
+                                  jit::IonCompileTask* task) {
+  struct TaskMatches {
+    jit::IonCompileTask* task_;
+
+    bool operator()(JSScript* script) { return script == task_->script(); }
+    bool operator()(Zone* zone) {
+      return zone == task_->script()->zoneFromAnyThread();
+    }
+    bool operator()(JSRuntime* runtime) {
+      return runtime == task_->script()->runtimeFromAnyThread();
+    }
+    bool operator()(ZonesInState zbs) {
+      return zbs.runtime == task_->script()->runtimeFromAnyThread() &&
+             zbs.state == task_->script()->zoneFromAnyThread()->gcState();
+    }
+  };
+
+  return selector.match(TaskMatches{task});
+}
+
+static bool ShouldForceIonFreeTask(const CompilationSelector& selector) {
+  struct Matcher {
+    bool operator()(JSScript* script) { return false; }
+    bool operator()(Zone* zone) { return true; }
+    bool operator()(ZonesInState zbs) { return true; }
+    bool operator()(JSRuntime* runtime) { return true; }
+  };
+
+  return selector.match(Matcher());
+}
+
+void GlobalHelperThreadState::cancelOffThreadIonCompile(
+    const CompilationSelector& selector) {
+  jit::JitRuntime* jitRuntime = GetSelectorRuntime(selector)->jitRuntime();
+  MOZ_ASSERT(jitRuntime);
+
+  AutoStartIonFreeTask freeTask(jitRuntime, ShouldForceIonFreeTask(selector));
+
+  {
+    AutoLockHelperThreadState lock;
+    if (!isInitialized(lock)) {
+      return;
+    }
+
+    GlobalHelperThreadState::IonCompileTaskVector& worklist = ionWorklist(lock);
+    for (size_t i = 0; i < worklist.length(); i++) {
+      jit::IonCompileTask* task = worklist[i];
+      if (IonCompileTaskMatches(selector, task)) {
+        worklist[i]->alloc().lifoAlloc()->setReadWrite();
+
+        FinishOffThreadIonCompile(task, lock);
+        remove(worklist, &i);
+      }
+    }
+
+    bool cancelled;
+    do {
+      cancelled = false;
+      for (auto* helper : helperTasks(lock)) {
+        if (!helper->is<jit::IonCompileTask>()) {
+          continue;
+        }
+
+        jit::IonCompileTask* ionCompileTask = helper->as<jit::IonCompileTask>();
+        if (IonCompileTaskMatches(selector, ionCompileTask)) {
+          ionCompileTask->alloc().lifoAlloc()->setReadWrite();
+          ionCompileTask->mirGen().cancel();
+          cancelled = true;
+        }
+      }
+      if (cancelled) {
+        wait(lock);
+      }
+    } while (cancelled);
+
+    GlobalHelperThreadState::IonCompileTaskVector& finished =
+        ionFinishedList(lock);
+    for (size_t i = 0; i < finished.length(); i++) {
+      jit::IonCompileTask* task = finished[i];
+      if (IonCompileTaskMatches(selector, task)) {
+        JSRuntime* rt = task->script()->runtimeFromAnyThread();
+        jitRuntime->numFinishedOffThreadTasksRef(lock)--;
+        jit::FinishOffThreadTask(rt, freeTask, task);
+        remove(finished, &i);
+      }
+    }
+  }
+
+  JSRuntime* runtime = GetSelectorRuntime(selector);
+  jit::IonCompileTask* task = jitRuntime->ionLazyLinkList(runtime).getFirst();
+  while (task) {
+    jit::IonCompileTask* next = task->getNext();
+    if (IonCompileTaskMatches(selector, task)) {
+      jit::FinishOffThreadTask(runtime, freeTask, task);
+    }
+    task = next;
+  }
+}
+
+static bool JitDataStructuresExist(const CompilationSelector& selector) {
+  struct Matcher {
+    bool operator()(JSScript* script) { return !!script->zone()->jitZone(); }
+    bool operator()(Zone* zone) { return !!zone->jitZone(); }
+    bool operator()(ZonesInState zbs) { return zbs.runtime->hasJitRuntime(); }
+    bool operator()(JSRuntime* runtime) { return runtime->hasJitRuntime(); }
+  };
+
+  return selector.match(Matcher());
+}
+
+static bool MayHaveOffThreadIonCompileTask(JSScript* script) {
+  jit::JitScript* jitScript = script->maybeJitScript();
+  if (!jitScript) {
+    return false;
+  }
+  if (jitScript->isIonCompilingOffThread()) {
+    return true;
+  }
+  return jitScript->hasBaselineScript() &&
+         jitScript->baselineScript()->hasPendingIonCompileTask();
+}
+
+void js::CancelOffThreadIonCompile(const CompilationSelector& selector) {
+  if (!JitDataStructuresExist(selector)) {
+    return;
+  }
+
+  if (jit::IsPortableBaselineInterpreterEnabled()) {
+    return;
+  }
+
+  if (selector.is<JSScript*>() &&
+      !MayHaveOffThreadIonCompileTask(selector.as<JSScript*>())) {
+    return;
+  }
+
+  HelperThreadState().cancelOffThreadIonCompile(selector);
+}
+
+#ifdef DEBUG
+bool GlobalHelperThreadState::hasOffThreadIonCompile(
+    Zone* zone, AutoLockHelperThreadState& lock) {
+  for (jit::IonCompileTask* task : ionWorklist(lock)) {
+    if (task->script()->zoneFromAnyThread() == zone) {
+      return true;
+    }
+  }
+
+  for (auto* helper : helperTasks(lock)) {
+    if (helper->is<jit::IonCompileTask>()) {
+      JSScript* script = helper->as<jit::IonCompileTask>()->script();
+      if (script->zoneFromAnyThread() == zone) {
+        return true;
+      }
+    }
+  }
+
+  for (jit::IonCompileTask* task : ionFinishedList(lock)) {
+    if (task->script()->zoneFromAnyThread() == zone) {
+      return true;
+    }
+  }
+
+  JSRuntime* rt = zone->runtimeFromMainThread();
+  if (rt->hasJitRuntime()) {
+    for (jit::IonCompileTask* task : rt->jitRuntime()->ionLazyLinkList(rt)) {
+      if (task->script()->zone() == zone) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+bool js::HasOffThreadIonCompile(Zone* zone) {
+  if (jit::IsPortableBaselineInterpreterEnabled()) {
+    return false;
+  }
+
+  AutoLockHelperThreadState lock;
+
+  if (!HelperThreadState().isInitialized(lock)) {
+    return false;
+  }
+
+  return HelperThreadState().hasOffThreadIonCompile(zone, lock);
+}
+#endif
+
+
+bool GlobalHelperThreadState::canStartIonFreeTask(
+    const AutoLockHelperThreadState& lock) {
+  return !ionFreeList(lock).empty() &&
+         checkTaskThreadLimit(THREAD_TYPE_ION_FREE, maxIonFreeThreads(), lock);
+}
+
+HelperThreadTask* GlobalHelperThreadState::maybeGetIonFreeTask(
+    const AutoLockHelperThreadState& lock) {
+  if (!canStartIonFreeTask(lock)) {
+    return nullptr;
+  }
+
+  UniquePtr<jit::IonFreeTask> task = std::move(ionFreeList(lock).back());
+  ionFreeList(lock).popBack();
+  return task.release();
+}
+
+void jit::JitRuntime::maybeStartIonFreeTask(bool force) {
+  IonFreeCompileTasks& tasks = ionFreeTaskBatch_.ref();
+  if (tasks.empty()) {
+    return;
+  }
+
+  if (!force) {
+    constexpr size_t MinBatchSize = 8;
+    static_assert(IonFreeCompileTasks::InlineLength >= MinBatchSize,
+                  "Minimum batch size shouldn't require malloc");
+    if (tasks.length() < MinBatchSize) {
+      return;
+    }
+  }
+
+  auto freeTask = js::MakeUnique<jit::IonFreeTask>(std::move(tasks));
+  if (!freeTask) {
+    MOZ_ASSERT(!tasks.empty(), "shouldn't have moved tasks on OOM");
+    jit::FreeIonCompileTasks(tasks);
+    tasks.clearAndFree();
+    return;
+  }
+
+  AutoLockHelperThreadState lock;
+  if (!HelperThreadState().submitTask(std::move(freeTask), lock)) {
+    jit::FreeIonCompileTasks(freeTask->compileTasks());
+  }
+
+  tasks.clearAndFree();
+}
+
+bool GlobalHelperThreadState::submitTask(
+    UniquePtr<jit::IonFreeTask>&& task,
+    const AutoLockHelperThreadState& locked) {
+  MOZ_ASSERT(isInitialized(locked));
+
+  if (!ionFreeList(locked).append(std::move(task))) {
+    return false;
+  }
+
+  dispatch(locked);
+  return true;
+}
+
+bool js::AutoStartIonFreeTask::addIonCompileToFreeTaskBatch(
+    jit::IonCompileTask* task) {
+  return jitRuntime_->addIonCompileToFreeTaskBatch(task);
+}
+
+js::AutoStartIonFreeTask::~AutoStartIonFreeTask() {
+  jitRuntime_->maybeStartIonFreeTask(force_);
+}
+
+
+bool GlobalHelperThreadState::canStartBaselineCompileTask(
+    const AutoLockHelperThreadState& lock) {
+  return !baselineWorklist(lock).empty() &&
+         checkTaskThreadLimit(THREAD_TYPE_BASELINE,
+                              maxBaselineCompilationThreads(), lock);
+}
+
+HelperThreadTask* GlobalHelperThreadState::maybeGetBaselineCompileTask(
+    const AutoLockHelperThreadState& lock) {
+  if (!canStartBaselineCompileTask(lock)) {
+    return nullptr;
+  }
+
+  return baselineWorklist(lock).popCopy();
+}
+
+bool GlobalHelperThreadState::submitTask(
+    jit::BaselineCompileTask* task, const AutoLockHelperThreadState& locked) {
+  MOZ_ASSERT(isInitialized(locked));
+
+  if (!baselineWorklist(locked).append(task)) {
+    return false;
+  }
+
+  dispatch(locked);
+  return true;
+}
+
+bool js::StartOffThreadBaselineCompile(jit::BaselineCompileTask* task,
+                                       const AutoLockHelperThreadState& lock) {
+  return HelperThreadState().submitTask(task, lock);
+}
+
+void js::FinishOffThreadBaselineCompile(jit::BaselineCompileTask* task,
+                                        const AutoLockHelperThreadState& lock) {
+  AutoEnterOOMUnsafeRegion oomUnsafe;
+  if (!HelperThreadState().baselineFinishedList(lock).append(task)) {
+    oomUnsafe.crash("FinishOffThreadBaselineCompile");
+  }
+  task->runtimeFromAnyThread()->jitRuntime()->numFinishedOffThreadTasksRef(
+      lock)++;
+}
+
+static bool BaselineCompileTaskMatches(const CompilationSelector& selector,
+                                       jit::BaselineCompileTask* task) {
+  struct TaskMatches {
+    jit::BaselineCompileTask* task_;
+
+    bool operator()(JSScript* script) { return task_->scriptMatches(script); }
+    bool operator()(Zone* zone) { return zone == task_->zoneFromAnyThread(); }
+    bool operator()(JSRuntime* runtime) {
+      return runtime == task_->runtimeFromAnyThread();
+    }
+    bool operator()(ZonesInState zbs) {
+      return zbs.runtime == task_->runtimeFromAnyThread() &&
+             zbs.state == task_->zoneFromAnyThread()->gcState();
+    }
+  };
+
+  return selector.match(TaskMatches{task});
+}
+
+void GlobalHelperThreadState::cancelOffThreadBaselineCompile(
+    const CompilationSelector& selector) {
+  jit::JitRuntime* jitRuntime = GetSelectorRuntime(selector)->jitRuntime();
+  MOZ_ASSERT(jitRuntime);
+
+  {
+    AutoLockHelperThreadState lock;
+    if (!isInitialized(lock)) {
+      return;
+    }
+
+    GlobalHelperThreadState::BaselineCompileTaskVector& worklist =
+        baselineWorklist(lock);
+    for (size_t i = 0; i < worklist.length(); i++) {
+      jit::BaselineCompileTask* task = worklist[i];
+      if (BaselineCompileTaskMatches(selector, task)) {
+        FinishOffThreadBaselineCompile(task, lock);
+        remove(worklist, &i);
+      }
+    }
+
+    while (true) {
+      bool inProgress = false;
+      for (auto* helper : helperTasks(lock)) {
+        if (!helper->is<jit::BaselineCompileTask>()) {
+          continue;
+        }
+
+        jit::BaselineCompileTask* task = helper->as<jit::BaselineCompileTask>();
+        if (BaselineCompileTaskMatches(selector, task)) {
+          inProgress = true;
+          break;
+        }
+      }
+      if (!inProgress) {
+        break;
+      }
+      wait(lock);
+    }
+
+    GlobalHelperThreadState::BaselineCompileTaskVector& finished =
+        baselineFinishedList(lock);
+    for (size_t i = 0; i < finished.length(); i++) {
+      jit::BaselineCompileTask* task = finished[i];
+      if (BaselineCompileTaskMatches(selector, task)) {
+        jitRuntime->numFinishedOffThreadTasksRef(lock)--;
+        jit::BaselineCompileTask::FinishOffThreadTask(task);
+        remove(finished, &i);
+      }
+    }
+  }
+}
+
+void js::CancelOffThreadBaselineCompile(const CompilationSelector& selector) {
+  if (!JitDataStructuresExist(selector)) {
+    return;
+  }
+
+  if (jit::IsPortableBaselineInterpreterEnabled()) {
+    return;
+  }
+
+  HelperThreadState().cancelOffThreadBaselineCompile(selector);
+}
+
+
+bool GlobalHelperThreadState::canStartDelazifyTask(
+    const AutoLockHelperThreadState& lock) {
+  return !delazifyWorklist(lock).isEmpty() &&
+         checkTaskThreadLimit(THREAD_TYPE_DELAZIFY, maxDelazifyThreads(),
+                              true, lock);
+}
+
+HelperThreadTask* GlobalHelperThreadState::maybeGetDelazifyTask(
+    const AutoLockHelperThreadState& lock) {
+  auto& worklist = delazifyWorklist(lock);
+  if (worklist.isEmpty()) {
+    return nullptr;
+  }
+  return worklist.popFirst();
+}
+
+void GlobalHelperThreadState::submitTask(
+    DelazifyTask* task, const AutoLockHelperThreadState& locked) {
+  delazifyWorklist(locked).insertBack(task);
+  dispatch(locked);
+}
+
+void js::StartOffThreadDelazification(
+    JSContext* maybeCx, const JS::ReadOnlyCompileOptions& options,
+    frontend::InitialStencilAndDelazifications* stencils) {
+  auto strategy = options.eagerDelazificationStrategy();
+  if (strategy == JS::DelazificationOption::OnDemandOnly ||
+      strategy == JS::DelazificationOption::ParseEverythingEagerly) {
+    return;
+  }
+
+  if (maybeCx && maybeCx->realm()->collectCoverageForDebug()) {
+    return;
+  }
+
+  if (!CanUseExtraThreads()) {
+    return;
+  }
+
+  JSRuntime* maybeRuntime = maybeCx ? maybeCx->runtime() : nullptr;
+  UniquePtr<DelazifyTask> task;
+  task = DelazifyTask::Create(maybeRuntime, options, stencils);
+  if (!task) {
+    return;
+  }
+
+  if (!task->done()) {
+    AutoLockHelperThreadState lock;
+    HelperThreadState().submitTask(task.release(), lock);
+  }
+}
+
+UniquePtr<DelazifyTask> DelazifyTask::Create(
+    JSRuntime* maybeRuntime, const JS::ReadOnlyCompileOptions& options,
+    frontend::InitialStencilAndDelazifications* stencils) {
+  UniquePtr<DelazifyTask> task;
+  task.reset(js_new<DelazifyTask>(maybeRuntime, options.prefableOptions()));
+  if (!task) {
+    return nullptr;
+  }
+
+  if (!task->init(options, stencils)) {
+    return nullptr;
+  }
+
+  return task;
+}
+
+DelazifyTask::DelazifyTask(
+    JSRuntime* maybeRuntime,
+    const JS::PrefableCompileOptions& initialPrefableOptions)
+    : maybeRuntime(maybeRuntime),
+      delazificationCx(initialPrefableOptions, HelperThreadState().stackQuota) {
+}
+
+DelazifyTask::~DelazifyTask() {
+  MOZ_DIAGNOSTIC_ASSERT(!isInList());
+}
+
+bool DelazifyTask::init(const JS::ReadOnlyCompileOptions& options,
+                        frontend::InitialStencilAndDelazifications* stencils) {
+  return delazificationCx.init(options, stencils);
+}
+
+size_t DelazifyTask::sizeOfExcludingThis(
+    mozilla::MallocSizeOf mallocSizeOf) const {
+  return delazificationCx.sizeOfExcludingThis(mallocSizeOf);
+}
+
+void DelazifyTask::runHelperThreadTask(AutoLockHelperThreadState& lock) {
+  {
+    AutoUnlockHelperThreadState unlock(lock);
+    (void)runTask();
+  }
+
+  if (!delazificationCx.done()) {
+    HelperThreadState().submitTask(this, lock);
+  } else {
+    UniquePtr<FreeDelazifyTask> freeTask(js_new<FreeDelazifyTask>(this));
+    if (freeTask) {
+      HelperThreadState().submitTask(std::move(freeTask), lock);
+    }
+  }
+}
+
+bool DelazifyTask::runTask() { return delazificationCx.delazify(); }
+
+bool DelazifyTask::done() const { return delazificationCx.done(); }
+
+void GlobalHelperThreadState::cancelPendingDelazifyTask(
+    JSRuntime* rt, AutoLockHelperThreadState& lock) {
+  auto& delazifyList = delazifyWorklist(lock);
+
+  auto end = delazifyList.end();
+  for (auto iter = delazifyList.begin(); iter != end;) {
+    DelazifyTask* task = *iter;
+    ++iter;
+    if (task->runtimeMatchesOrNoRuntime(rt)) {
+      task->removeFrom(delazifyList);
+      js_delete(task);
+    }
+  }
+}
+
+void GlobalHelperThreadState::waitUntilCancelledDelazifyTasks(
+    JSRuntime* rt, AutoLockHelperThreadState& lock) {
+  while (true) {
+    cancelPendingDelazifyTask(rt, lock);
+
+    bool inProgress = false;
+    for (auto* helper : helperTasks(lock)) {
+      if (helper->is<DelazifyTask>() &&
+          helper->as<DelazifyTask>()->runtimeMatchesOrNoRuntime(rt)) {
+        inProgress = true;
+        break;
+      }
+    }
+    if (!inProgress) {
+      break;
+    }
+
+    wait(lock);
+  }
+
+  MOZ_ASSERT(!hasAnyDelazifyTask(rt, lock));
+}
+
+void GlobalHelperThreadState::waitUntilEmptyFreeDelazifyTaskVector(
+    AutoLockHelperThreadState& lock) {
+  while (true) {
+    bool inProgress = false;
+    if (!freeDelazifyTaskVector(lock).empty()) {
+      inProgress = true;
+    }
+
+    for (auto* helper : helperTasks(lock)) {
+      if (helper->is<FreeDelazifyTask>()) {
+        inProgress = true;
+        break;
+      }
+    }
+    if (!inProgress) {
+      break;
+    }
+
+    wait(lock);
+  }
+}
+
+void js::CancelOffThreadDelazify(JSRuntime* runtime) {
+  AutoLockHelperThreadState lock;
+
+  if (!HelperThreadState().isInitialized(lock)) {
+    return;
+  }
+
+  HelperThreadState().waitUntilCancelledDelazifyTasks(runtime, lock);
+
+  HelperThreadState().waitUntilEmptyFreeDelazifyTaskVector(lock);
+}
+
+bool GlobalHelperThreadState::hasAnyDelazifyTask(
+    JSRuntime* rt, AutoLockHelperThreadState& lock) {
+  for (auto task : delazifyWorklist(lock)) {
+    if (task->runtimeMatchesOrNoRuntime(rt)) {
+      return true;
+    }
+  }
+
+  for (auto* helper : helperTasks(lock)) {
+    if (helper->is<DelazifyTask>() &&
+        helper->as<DelazifyTask>()->runtimeMatchesOrNoRuntime(rt)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void js::WaitForAllDelazifyTasks(JSRuntime* rt) {
+  AutoLockHelperThreadState lock;
+  if (!HelperThreadState().isInitialized(lock)) {
+    return;
+  }
+
+  while (true) {
+    if (!HelperThreadState().hasAnyDelazifyTask(rt, lock)) {
+      break;
+    }
+
+    HelperThreadState().wait(lock);
+  }
+}
+
+
+bool GlobalHelperThreadState::canStartFreeDelazifyTask(
+    const AutoLockHelperThreadState& lock) {
+  return !freeDelazifyTaskVector(lock).empty() &&
+         checkTaskThreadLimit(THREAD_TYPE_DELAZIFY_FREE, maxDelazifyThreads(),
+                              true, lock);
+}
+
+HelperThreadTask* GlobalHelperThreadState::maybeGetFreeDelazifyTask(
+    const AutoLockHelperThreadState& lock) {
+  auto& freeList = freeDelazifyTaskVector(lock);
+  if (!freeList.empty()) {
+    UniquePtr<FreeDelazifyTask> task = std::move(freeList.back());
+    freeList.popBack();
+    return task.release();
+  }
+  return nullptr;
+}
+
+bool GlobalHelperThreadState::submitTask(
+    UniquePtr<FreeDelazifyTask> task, const AutoLockHelperThreadState& locked) {
+  if (!freeDelazifyTaskVector(locked).append(std::move(task))) {
+    return false;
+  }
+  dispatch(locked);
+  return true;
+}
+
+void FreeDelazifyTask::runHelperThreadTask(AutoLockHelperThreadState& locked) {
+  {
+    AutoUnlockHelperThreadState unlock(locked);
+    js_delete(task);
+    task = nullptr;
+  }
+
+  js_delete(this);
+}
+
+
+bool GlobalHelperThreadState::canStartPromiseHelperTask(
+    const AutoLockHelperThreadState& lock) {
+  return !promiseHelperTasks(lock).empty() &&
+         checkTaskThreadLimit(THREAD_TYPE_PROMISE_TASK,
+                              maxPromiseHelperThreads(),
+                              true, lock);
+}
+
+HelperThreadTask* GlobalHelperThreadState::maybeGetPromiseHelperTask(
+    const AutoLockHelperThreadState& lock) {
+  if (!canStartPromiseHelperTask(lock)) {
+    return nullptr;
+  }
+
+  return promiseHelperTasks(lock).popCopy();
+}
+
+bool GlobalHelperThreadState::submitTask(PromiseHelperTask* task) {
+  AutoLockHelperThreadState lock;
+
+  if (!promiseHelperTasks(lock).append(task)) {
+    return false;
+  }
+
+  dispatch(lock);
+  return true;
+}
+
+void PromiseHelperTask::executeAndResolveAndDestroy(JSContext* cx) {
+  execute();
+  run(cx, JS::Dispatchable::NotShuttingDown);
+}
+
+void PromiseHelperTask::runHelperThreadTask(AutoLockHelperThreadState& lock) {
+  {
+    AutoUnlockHelperThreadState unlock(lock);
+    execute();
+  }
+
+
+  dispatchResolveAndDestroy(lock);
+}
+
+bool js::StartOffThreadPromiseHelperTask(JSContext* cx,
+                                         UniquePtr<PromiseHelperTask> task) {
+  if (!CanUseExtraThreads()) {
+    task.release()->executeAndResolveAndDestroy(cx);
+    return true;
+  }
+
+  if (!HelperThreadState().submitTask(task.get())) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  (void)task.release();
+  return true;
+}
+
+bool js::StartOffThreadPromiseHelperTask(PromiseHelperTask* task) {
+  MOZ_ASSERT(CanUseExtraThreads());
+
+  return HelperThreadState().submitTask(task);
+}
+
+
+bool GlobalHelperThreadState::canStartCompressionTask(
+    const AutoLockHelperThreadState& lock) {
+  return !compressionWorklist(lock).empty() &&
+         checkTaskThreadLimit(THREAD_TYPE_COMPRESS, maxCompressionThreads(),
+                              lock);
+}
+
+HelperThreadTask* GlobalHelperThreadState::maybeGetCompressionTask(
+    const AutoLockHelperThreadState& lock) {
+  if (!canStartCompressionTask(lock)) {
+    return nullptr;
+  }
+
+  auto& worklist = compressionWorklist(lock);
+  UniquePtr<SourceCompressionTask> task = std::move(worklist.back());
+  worklist.popBack();
+  return task.release();
+}
+
+bool GlobalHelperThreadState::submitTask(
+    UniquePtr<SourceCompressionTask> task,
+    const AutoLockHelperThreadState& locked) {
+  if (!compressionWorklist(locked).append(std::move(task))) {
+    return false;
+  }
+
+  dispatch(locked);
+  return true;
+}
+
+void GlobalHelperThreadState::createAndSubmitCompressionTasks(
+    ScheduleCompressionTask schedule, JSRuntime* rt) {
+  Vector<UniquePtr<SourceCompressionTask>, 8, SystemAllocPolicy> tasksToSubmit;
+
+  static constexpr size_t MaxBatchLength = 300'000;
+  SourceCompressionTask* currentBatch = nullptr;
+  size_t currentBatchLength = 0;
+
+  rt->pendingCompressions().eraseIf([&](const auto& entry) {
+    MOZ_ASSERT(entry.source()->hasUncompressedSource());
+
+    if (entry.shouldCancel()) {
+      return true;
+    }
+
+    if (schedule == ScheduleCompressionTask::NonShrinkingGC &&
+        rt->gc.majorGCCount() <= entry.majorGCNumber() + 3) {
+      return false;
+    }
+
+    size_t length = entry.source()->length();
+    if (currentBatch && currentBatchLength + length <= MaxBatchLength) {
+      if (!currentBatch->addEntry(entry.source())) {
+        return false;
+      }
+      currentBatchLength += length;
+      return true;
+    }
+
+    auto ownedTask = MakeUnique<SourceCompressionTask>(rt, entry.source());
+    SourceCompressionTask* task = ownedTask.get();
+    if (!ownedTask || !tasksToSubmit.append(std::move(ownedTask))) {
+      return false;
+    }
+    if (!currentBatch || length < currentBatchLength) {
+      currentBatch = task;
+      currentBatchLength = length;
+    }
+    return true;
+  });
+  if (rt->pendingCompressions().empty()) {
+    rt->pendingCompressions().clearAndFree();
+  }
+
+  if (tasksToSubmit.empty()) {
+    return;
+  }
+
+  AutoLockHelperThreadState lock;
+  for (auto& task : tasksToSubmit) {
+    (void)submitTask(std::move(task), lock);
+  }
+}
+
+void js::AttachFinishedCompressions(JSRuntime* runtime,
+                                    AutoLockHelperThreadState& lock) {
+  auto& finished = HelperThreadState().compressionFinishedList(lock);
+  for (size_t i = 0; i < finished.length(); i++) {
+    if (finished[i]->runtimeMatches(runtime)) {
+      UniquePtr<SourceCompressionTask> compressionTask(std::move(finished[i]));
+      HelperThreadState().remove(finished, &i);
+      compressionTask->complete();
+    }
+  }
+}
+
+void js::RunPendingSourceCompressions(JSRuntime* runtime) {
+  if (!CanUseExtraThreads()) {
+    return;
+  }
+
+  HelperThreadState().runPendingSourceCompressions(runtime);
+}
+
+void GlobalHelperThreadState::runPendingSourceCompressions(JSRuntime* runtime) {
+  createAndSubmitCompressionTasks(
+      GlobalHelperThreadState::ScheduleCompressionTask::API, runtime);
+
+  AutoLockHelperThreadState lock;
+  while (!compressionWorklist(lock).empty()) {
+    wait(lock);
+  }
+
+  waitForAllTasksLocked(lock);
+
+  AttachFinishedCompressions(runtime, lock);
+}
+
+void js::StartOffThreadCompressionsOnGC(JSRuntime* runtime,
+                                        bool isShrinkingGC) {
+  auto schedule =
+      isShrinkingGC
+          ? GlobalHelperThreadState::ScheduleCompressionTask::ShrinkingGC
+          : GlobalHelperThreadState::ScheduleCompressionTask::NonShrinkingGC;
+  HelperThreadState().createAndSubmitCompressionTasks(schedule, runtime);
+}
+
+template <typename T>
+static void ClearCompressionTaskList(T& list, JSRuntime* runtime) {
+  for (size_t i = 0; i < list.length(); i++) {
+    if (list[i]->runtimeMatches(runtime)) {
+      HelperThreadState().remove(list, &i);
+    }
+  }
+}
+
+void GlobalHelperThreadState::cancelOffThreadCompressions(
+    JSRuntime* runtime, AutoLockHelperThreadState& lock) {
+  runtime->pendingCompressions().clearAndFree();
+  ClearCompressionTaskList(compressionWorklist(lock), runtime);
+
+  while (true) {
+    bool inProgress = false;
+    for (auto* helper : helperTasks(lock)) {
+      if (!helper->is<SourceCompressionTask>()) {
+        continue;
+      }
+
+      if (helper->as<SourceCompressionTask>()->runtimeMatches(runtime)) {
+        inProgress = true;
+      }
+    }
+
+    if (!inProgress) {
+      break;
+    }
+
+    wait(lock);
+  }
+
+  ClearCompressionTaskList(compressionFinishedList(lock), runtime);
+}
+
+void js::CancelOffThreadCompressions(JSRuntime* runtime) {
+  if (!CanUseExtraThreads()) {
+    return;
+  }
+
+  AutoLockHelperThreadState lock;
+  HelperThreadState().cancelOffThreadCompressions(runtime, lock);
+}
+
+
+bool GlobalHelperThreadState::canStartGCParallelTask(
+    const AutoLockHelperThreadState& lock) {
+  return !gcParallelWorklist().isEmpty(lock) &&
+         checkTaskThreadLimit(THREAD_TYPE_GCPARALLEL, maxGCParallelThreads(),
+                              lock);
+}
+
+HelperThreadTask* GlobalHelperThreadState::maybeGetGCParallelTask(
+    const AutoLockHelperThreadState& lock) {
+  if (!canStartGCParallelTask(lock)) {
+    return nullptr;
+  }
+
+  return gcParallelWorklist().popFirst(lock);
+}
+
+bool GlobalHelperThreadState::submitTask(
+    GCParallelTask* task, const AutoLockHelperThreadState& locked) {
+  gcParallelWorklist().insertBack(task, locked);
+  dispatch(locked);
+  return true;
+}
+
+
+
+HelperThreadTask* GlobalHelperThreadState::maybeGetWasmTier1CompileTask(
+    const AutoLockHelperThreadState& lock) {
+  return maybeGetWasmCompile(lock, wasm::CompileState::EagerTier1);
+}
+
+bool GlobalHelperThreadState::canStartWasmTier1CompileTask(
+    const AutoLockHelperThreadState& lock) {
+  return canStartWasmCompile(lock, wasm::CompileState::EagerTier1);
+}
+
+
+HelperThreadTask* GlobalHelperThreadState::maybeGetWasmTier2CompileTask(
+    const AutoLockHelperThreadState& lock) {
+  return maybeGetWasmCompile(lock, wasm::CompileState::EagerTier2);
+}
+
+bool GlobalHelperThreadState::canStartWasmTier2CompileTask(
+    const AutoLockHelperThreadState& lock) {
+  return canStartWasmCompile(lock, wasm::CompileState::EagerTier2);
+}
+
+
+bool GlobalHelperThreadState::canStartWasmCompleteTier2GeneratorTask(
+    const AutoLockHelperThreadState& lock) {
+  return !wasmCompleteTier2GeneratorWorklist(lock).empty() &&
+         checkTaskThreadLimit(THREAD_TYPE_WASM_GENERATOR_COMPLETE_TIER2,
+                              maxWasmCompleteTier2GeneratorThreads(),
+                              true, lock);
+}
+
+HelperThreadTask*
+GlobalHelperThreadState::maybeGetWasmCompleteTier2GeneratorTask(
+    const AutoLockHelperThreadState& lock) {
+  if (!canStartWasmCompleteTier2GeneratorTask(lock)) {
+    return nullptr;
+  }
+
+  return wasmCompleteTier2GeneratorWorklist(lock).popCopy();
+}
+
+bool GlobalHelperThreadState::submitTask(
+    wasm::UniqueCompleteTier2GeneratorTask task) {
+  AutoLockHelperThreadState lock;
+
+  MOZ_ASSERT(isInitialized(lock));
+
+  if (!wasmCompleteTier2GeneratorWorklist(lock).append(task.get())) {
+    return false;
+  }
+  (void)task.release();
+
+  dispatch(lock);
+  return true;
+}
+
+void js::StartOffThreadWasmCompleteTier2Generator(
+    wasm::UniqueCompleteTier2GeneratorTask task) {
+  (void)HelperThreadState().submitTask(std::move(task));
+}
+
+void GlobalHelperThreadState::cancelOffThreadWasmCompleteTier2Generator(
+    AutoLockHelperThreadState& lock) {
+  {
+    wasm::CompleteTier2GeneratorTaskPtrVector& worklist =
+        wasmCompleteTier2GeneratorWorklist(lock);
+    for (size_t i = 0; i < worklist.length(); i++) {
+      wasm::CompleteTier2GeneratorTask* task = worklist[i];
+      remove(worklist, &i);
+      js_delete(task);
+    }
+  }
+
+  static_assert(GlobalHelperThreadState::MaxCompleteTier2GeneratorTasks == 1,
+                "code must be generalized");
+
+  for (auto* helper : helperTasks(lock)) {
+    if (helper->is<wasm::CompleteTier2GeneratorTask>()) {
+      helper->as<wasm::CompleteTier2GeneratorTask>()->cancel();
+
+      uint32_t oldFinishedCount = wasmCompleteTier2GeneratorsFinished(lock);
+      while (wasmCompleteTier2GeneratorsFinished(lock) == oldFinishedCount) {
+        wait(lock);
+      }
+
+      break;
+    }
+  }
+}
+
+static void CancelOffThreadWasmCompleteTier2GeneratorLocked(
+    AutoLockHelperThreadState& lock) {
+  if (!HelperThreadState().isInitialized(lock)) {
+    return;
+  }
+
+  HelperThreadState().cancelOffThreadWasmCompleteTier2Generator(lock);
+}
+
+void js::CancelOffThreadWasmCompleteTier2Generator() {
+  AutoLockHelperThreadState lock;
+  CancelOffThreadWasmCompleteTier2GeneratorLocked(lock);
+}
+
+
+bool GlobalHelperThreadState::canStartWasmPartialTier2CompileTask(
+    const AutoLockHelperThreadState& lock) {
+  size_t maxThreads = maxWasmPartialTier2CompileThreads();
+  if (maxThreads > threadCount) {
+    maxThreads = threadCount;
+  }
+  return !wasmPartialTier2CompileWorklist(lock).empty() &&
+         checkTaskThreadLimit(THREAD_TYPE_WASM_COMPILE_PARTIAL_TIER2,
+                              maxThreads, false, lock);
+}
+
+HelperThreadTask* GlobalHelperThreadState::maybeGetWasmPartialTier2CompileTask(
+    const AutoLockHelperThreadState& lock) {
+  if (!canStartWasmPartialTier2CompileTask(lock)) {
+    return nullptr;
+  }
+
+  wasm::PartialTier2CompileTaskPtrVector& worklist =
+      wasmPartialTier2CompileWorklist(lock);
+  MOZ_ASSERT(!worklist.empty());
+  HelperThreadTask* task = worklist[0];
+  worklist.erase(worklist.begin());
+  return task;
+}
+
+bool GlobalHelperThreadState::submitTask(
+    wasm::UniquePartialTier2CompileTask task) {
+  AutoLockHelperThreadState lock;
+
+  MOZ_ASSERT(isInitialized(lock));
+
+  wasm::PartialTier2CompileTaskPtrVector& workList =
+      wasmPartialTier2CompileWorklist(lock);
+
+  if (!workList.append(task.get())) {
+    return false;
+  }
+  (void)task.release();
+
+  dispatch(lock);
+  return true;
+}
+
+void js::StartOffThreadWasmPartialTier2Compile(
+    wasm::UniquePartialTier2CompileTask task) {
+  (void)HelperThreadState().submitTask(std::move(task));
+}
+
+void GlobalHelperThreadState::cancelOffThreadWasmPartialTier2Compile(
+    AutoLockHelperThreadState& lock) {
+  wasm::PartialTier2CompileTaskPtrVector& worklist =
+      wasmPartialTier2CompileWorklist(lock);
+  for (size_t i = 0; i < worklist.length(); i++) {
+    wasm::PartialTier2CompileTask* task = worklist[i];
+    remove(worklist, &i);
+    js_delete(task);
+  }
+
+  bool anyCancelled;
+  do {
+    anyCancelled = false;
+    for (auto* helper : helperTasks(lock)) {
+      if (!helper->is<wasm::PartialTier2CompileTask>()) {
+        continue;
+      }
+      wasm::PartialTier2CompileTask* pt2CompileTask =
+          helper->as<wasm::PartialTier2CompileTask>();
+      pt2CompileTask->cancel();
+      anyCancelled = true;
+    }
+    if (anyCancelled) {
+      wait(lock);
+    }
+  } while (anyCancelled);
+}
+
+static void CancelOffThreadWasmPartialTier2CompileLocked(
+    AutoLockHelperThreadState& lock) {
+  if (!HelperThreadState().isInitialized(lock)) {
+    return;
+  }
+
+  HelperThreadState().cancelOffThreadWasmPartialTier2Compile(lock);
+}
+
+void js::CancelOffThreadWasmPartialTier2Compile() {
+  AutoLockHelperThreadState lock;
+  CancelOffThreadWasmPartialTier2CompileLocked(lock);
+}
+
+
+bool GlobalHelperThreadState::canStartWasmCompile(
+    const AutoLockHelperThreadState& lock, wasm::CompileState state) {
+  if (wasmWorklist(lock, state).empty()) {
+    return false;
+  }
+
+
+  MOZ_RELEASE_ASSERT(cpuCount > 1);
+
+
+  bool completeTier2oversubscribed =
+      wasmCompleteTier2GeneratorWorklist(lock).length() > 20;
+
+
+  size_t physCoresAvailable = size_t(ceil(cpuCount / 3.0));
+
+  size_t threads;
+  ThreadType threadType;
+  if (state == wasm::CompileState::EagerTier2) {
+    if (completeTier2oversubscribed) {
+      threads = maxWasmCompilationThreads();
+    } else {
+      threads = physCoresAvailable;
+    }
+    threadType = THREAD_TYPE_WASM_COMPILE_TIER2;
+  } else {
+    if (completeTier2oversubscribed) {
+      threads = 0;
+    } else {
+      threads = maxWasmCompilationThreads();
+    }
+    threadType = THREAD_TYPE_WASM_COMPILE_TIER1;
+  }
+
+  return threads != 0 && checkTaskThreadLimit(threadType, threads, lock);
+}
+
+HelperThreadTask* GlobalHelperThreadState::maybeGetWasmCompile(
+    const AutoLockHelperThreadState& lock, wasm::CompileState state) {
+  if (!canStartWasmCompile(lock, state)) {
+    return nullptr;
+  }
+
+  return wasmWorklist(lock, state).popCopyFront();
+}
+
+size_t js::RemovePendingWasmCompileTasks(
+    const wasm::CompileTaskState& taskState, wasm::CompileState state,
+    const AutoLockHelperThreadState& lock) {
+  wasm::CompileTaskPtrFifo& worklist =
+      HelperThreadState().wasmWorklist(lock, state);
+  return worklist.eraseIf([&taskState](wasm::CompileTask* task) {
+    return &task->state == &taskState;
+  });
+}
+
+bool GlobalHelperThreadState::submitTask(wasm::CompileTask* task,
+                                         wasm::CompileState state) {
+  AutoLockHelperThreadState lock;
+  if (!wasmWorklist(lock, state).pushBack(task)) {
+    return false;
+  }
+
+  dispatch(lock);
+  return true;
+}
+
+bool js::StartOffThreadWasmCompile(wasm::CompileTask* task,
+                                   wasm::CompileState state) {
+  return HelperThreadState().submitTask(task, state);
+}

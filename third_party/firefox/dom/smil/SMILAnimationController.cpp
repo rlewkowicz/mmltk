@@ -1,0 +1,467 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SMILAnimationController.h"
+
+#include <algorithm>
+
+#include "SMILCSSProperty.h"
+#include "SMILCompositor.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/PresShellInlines.h"
+#include "mozilla/RestyleManager.h"
+#include "mozilla/SMILTimedElement.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/SVGAnimationElement.h"
+#include "nsCSSProps.h"
+#include "nsContentUtils.h"
+#include "nsRefreshDriver.h"
+
+using namespace mozilla::dom;
+
+namespace mozilla {
+
+
+
+SMILAnimationController::SMILAnimationController(Document* aDoc)
+    : mDocument(aDoc) {
+  MOZ_ASSERT(aDoc, "need a non-null document");
+
+  if (nsRefreshDriver* refreshDriver = GetRefreshDriver()) {
+    mStartTime = refreshDriver->MostRecentRefresh();
+  } else {
+    mStartTime = mozilla::TimeStamp::Now();
+  }
+  mCurrentSampleTime = mStartTime;
+
+  Begin();
+}
+
+SMILAnimationController::~SMILAnimationController() {
+  NS_ASSERTION(mAnimationElementTable.IsEmpty(),
+               "Animation controller shouldn't be tracking any animation"
+               " elements when it dies");
+}
+
+void SMILAnimationController::Disconnect() {
+  MOZ_ASSERT(mDocument, "disconnecting when we weren't connected...?");
+  MOZ_ASSERT(mRefCnt.get() == 1,
+             "Expecting to disconnect when doc is sole remaining owner");
+  NS_ASSERTION(IsPausedByType(PauseType::PageHide),
+               "Expecting to be paused for pagehide before disconnect");
+  mDocument = nullptr;  
+}
+
+
+void SMILAnimationController::Pause(PauseType aType) {
+  SMILTimeContainer::Pause(aType);
+  UpdateSampling();
+}
+
+void SMILAnimationController::Resume(PauseType aType) {
+  bool wasPaused = IsPaused();
+  mCurrentSampleTime = mozilla::TimeStamp::Now();
+
+  SMILTimeContainer::Resume(aType);
+
+  if (wasPaused && !IsPaused()) {
+    UpdateSampling();
+  }
+}
+
+SMILTime SMILAnimationController::GetParentTime() const {
+  return (SMILTime)(mCurrentSampleTime - mStartTime).ToMilliseconds();
+}
+
+void SMILAnimationController::WillRefresh(mozilla::TimeStamp aTime) {
+  if (!mIsSampling) {
+    return;
+  }
+  aTime = std::max(mCurrentSampleTime, aTime);
+
+
+  static const double SAMPLE_DUR_WEIGHTING = 0.2;
+  static const double SAMPLE_DEV_THRESHOLD = 200.0;
+
+  SMILTime elapsedTime =
+      (SMILTime)(aTime - mCurrentSampleTime).ToMilliseconds();
+  if (mAvgTimeBetweenSamples == 0) {
+    mAvgTimeBetweenSamples = elapsedTime;
+  } else {
+    if (elapsedTime > SAMPLE_DEV_THRESHOLD * mAvgTimeBetweenSamples) {
+      NS_WARNING(
+          "Detected really long delay between samples, continuing from "
+          "previous sample");
+      mParentOffset += elapsedTime - mAvgTimeBetweenSamples;
+    }
+    mAvgTimeBetweenSamples =
+        (SMILTime)(elapsedTime * SAMPLE_DUR_WEIGHTING +
+                   mAvgTimeBetweenSamples * (1.0 - SAMPLE_DUR_WEIGHTING));
+  }
+  mCurrentSampleTime = aTime;
+
+  Sample();
+  UpdateSampling();
+}
+
+
+void SMILAnimationController::RegisterAnimationElement(
+    SVGAnimationElement* aAnimationElement) {
+  const bool wasEmpty = mAnimationElementTable.IsEmpty();
+  mAnimationElementTable.PutEntry(aAnimationElement);
+  if (wasEmpty) {
+    UpdateSampling();
+  }
+}
+
+void SMILAnimationController::UnregisterAnimationElement(
+    SVGAnimationElement* aAnimationElement) {
+  mAnimationElementTable.RemoveEntry(aAnimationElement);
+  if (mAnimationElementTable.IsEmpty()) {
+    UpdateSampling();
+  }
+}
+
+
+void SMILAnimationController::OnPageShow() { Resume(PauseType::PageHide); }
+
+void SMILAnimationController::OnPageHide() { Pause(PauseType::PageHide); }
+
+
+void SMILAnimationController::Traverse(
+    nsCycleCollectionTraversalCallback* aCallback) {
+  if (mLastCompositorTable) {
+    for (SMILCompositor& compositor : *mLastCompositorTable) {
+      compositor.Traverse(aCallback);
+    }
+  }
+}
+
+void SMILAnimationController::Unlink() { mLastCompositorTable = nullptr; }
+
+
+bool SMILAnimationController::ShouldSample() const {
+  return !IsPaused() && !mAnimationElementTable.IsEmpty() &&
+         !mChildContainerTable.IsEmpty();
+}
+
+void SMILAnimationController::UpdateSampling() {
+  const bool shouldSample = ShouldSample();
+  if (!shouldSample) {
+    mIsSampling = false;
+    return;
+  }
+  mDocument->MaybeScheduleRenderingPhases(
+      {RenderingPhase::UpdateAnimationsAndSendEvents});
+  if (!mIsSampling) {
+    mIsSampling = true;
+    mCurrentSampleTime = mozilla::TimeStamp::Now();
+    Sample();  
+  }
+}
+
+
+void SMILAnimationController::DoSample() {
+  DoSample(true);  
+}
+
+void SMILAnimationController::DoSample(bool aSkipUnchangedContainers) {
+  if (!mDocument) {
+    NS_ERROR("Shouldn't be sampling after document has disconnected");
+    return;
+  }
+  if (mRunningSample) {
+    NS_ERROR("Shouldn't be recursively sampling");
+    return;
+  }
+
+  mResampleNeeded = false;
+
+  AutoRestore<bool> autoRestoreRunningSample(mRunningSample);
+  mRunningSample = true;
+
+  RewindElements();
+  DoMilestoneSamples();
+
+  TimeContainerHashtable activeContainers(mChildContainerTable.Count());
+  for (SMILTimeContainer* container : mChildContainerTable.Keys()) {
+    if (!container) {
+      continue;
+    }
+
+    if (!container->IsPausedByType(PauseType::Begin) &&
+        (container->NeedsSample() || !aSkipUnchangedContainers)) {
+      container->ClearMilestones();
+      container->Sample();
+      container->MarkSeekFinished();
+      activeContainers.PutEntry(container);
+    }
+  }
+
+
+  std::unique_ptr<SMILCompositorTable> currentCompositorTable(
+      new SMILCompositorTable(0));
+  nsTArray<RefPtr<SVGAnimationElement>> animElems(
+      mAnimationElementTable.Count());
+
+  for (SVGAnimationElement* animElem : mAnimationElementTable.Keys()) {
+    SampleTimedElement(animElem, &activeContainers);
+    AddAnimationToCompositorTable(animElem, currentCompositorTable.get());
+    animElems.AppendElement(animElem);
+  }
+  activeContainers.Clear();
+
+  if (mLastCompositorTable) {
+    for (SMILCompositor& compositor : *currentCompositorTable) {
+      SMILCompositor* lastCompositor =
+          mLastCompositorTable->GetEntry(compositor.GetKey());
+
+      if (lastCompositor) {
+        compositor.StealCachedBaseValue(lastCompositor);
+        if (!lastCompositor->HasSameNumberOfAnimationFunctionsAs(compositor)) {
+          compositor.ToggleForceCompositing();
+        }
+      }
+    }
+
+    for (const auto& key : currentCompositorTable->Keys()) {
+      mLastCompositorTable->RemoveEntry(key);
+    }
+
+    for (SMILCompositor& compositor : *mLastCompositorTable) {
+      compositor.ClearAnimationEffects();
+    }
+  }
+
+  if (currentCompositorTable->IsEmpty()) {
+    mLastCompositorTable = nullptr;
+    return;
+  }
+
+  bool mightHavePendingStyleUpdates = false;
+  for (auto& compositor : *currentCompositorTable) {
+    compositor.ComposeAttribute(mightHavePendingStyleUpdates);
+  }
+
+  mLastCompositorTable = std::move(currentCompositorTable);
+  mMightHavePendingStyleUpdates = mightHavePendingStyleUpdates;
+
+  NS_ASSERTION(!mResampleNeeded, "Resample dirty flag set during sample!");
+}
+
+void SMILAnimationController::RewindElements() {
+  const bool rewindNeeded = std::any_of(
+      mChildContainerTable.Keys().cbegin(), mChildContainerTable.Keys().cend(),
+      [](SMILTimeContainer* container) { return container->NeedsRewind(); });
+
+  if (!rewindNeeded) return;
+
+  for (SVGAnimationElement* animElem : mAnimationElementTable.Keys()) {
+    SMILTimeContainer* timeContainer = animElem->GetTimeContainer();
+    if (timeContainer && timeContainer->NeedsRewind()) {
+      animElem->TimedElement().Rewind();
+    }
+  }
+
+  for (SMILTimeContainer* container : mChildContainerTable.Keys()) {
+    container->ClearNeedsRewind();
+  }
+}
+
+void SMILAnimationController::DoMilestoneSamples() {
+
+  SMILTime sampleTime = std::numeric_limits<SMILTime>::min();
+
+  while (true) {
+    SMILMilestone nextMilestone(GetCurrentTimeAsSMILTime() + 1, true);
+    for (SMILTimeContainer* container : mChildContainerTable.Keys()) {
+      if (container->IsPausedByType(PauseType::Begin)) {
+        continue;
+      }
+      SMILMilestone thisMilestone;
+      bool didGetMilestone =
+          container->GetNextMilestoneInParentTime(thisMilestone);
+      if (didGetMilestone && thisMilestone < nextMilestone) {
+        nextMilestone = thisMilestone;
+      }
+    }
+
+    if (nextMilestone.mTime > GetCurrentTimeAsSMILTime()) {
+      break;
+    }
+
+    nsTArray<RefPtr<dom::SVGAnimationElement>> elements;
+    for (SMILTimeContainer* container : mChildContainerTable.Keys()) {
+      if (container->IsPausedByType(PauseType::Begin)) {
+        continue;
+      }
+      container->PopMilestoneElementsAtMilestone(nextMilestone, elements);
+    }
+
+    sampleTime = std::max(nextMilestone.mTime, sampleTime);
+
+    for (RefPtr<dom::SVGAnimationElement>& elem : elements) {
+      MOZ_ASSERT(elem, "nullptr animation element in list");
+      SMILTimeContainer* container = elem->GetTimeContainer();
+      if (!container)
+        continue;
+
+      SMILTimeValue containerTimeValue =
+          container->ParentToContainerTime(sampleTime);
+      if (!containerTimeValue.IsDefinite()) continue;
+
+      SMILTime containerTime =
+          std::max<SMILTime>(0, containerTimeValue.GetMillis());
+
+      if (nextMilestone.mIsEnd) {
+        elem->TimedElement().SampleEndAt(containerTime);
+      } else {
+        elem->TimedElement().SampleAt(containerTime);
+      }
+    }
+  }
+}
+
+void SMILAnimationController::SampleTimedElement(
+    SVGAnimationElement* aElement, TimeContainerHashtable* aActiveContainers) {
+  SMILTimeContainer* timeContainer = aElement->GetTimeContainer();
+  if (!timeContainer) return;
+
+  if (!aActiveContainers->GetEntry(timeContainer)) return;
+
+  SMILTime containerTime = timeContainer->GetCurrentTimeAsSMILTime();
+
+  MOZ_ASSERT(!timeContainer->IsSeeking(),
+             "Doing a regular sample but the time container is still seeking");
+  aElement->TimedElement().SampleAt(containerTime);
+}
+
+void SMILAnimationController::AddAnimationToCompositorTable(
+    SVGAnimationElement* aElement, SMILCompositorTable* aCompositorTable) {
+  SMILTargetIdentifier key;
+  if (!GetTargetIdentifierForAnimation(aElement, key))
+    return;
+
+  SMILAnimationFunction& func = aElement->AnimationFunction();
+
+  if (func.IsActiveOrFrozen()) {
+    SMILCompositor* result = aCompositorTable->PutEntry(key);
+    result->AddAnimationFunction(&func);
+
+  } else if (func.HasChanged()) {
+    SMILCompositor* result = aCompositorTable->PutEntry(key);
+    result->ToggleForceCompositing();
+
+    func.ClearHasChanged();
+  }
+}
+
+static inline bool IsTransformAttribute(const Element* aElement,
+                                        int32_t aNamespaceID,
+                                        const nsAtom* aAttributeName) {
+  if (aNamespaceID != kNameSpaceID_None) {
+    return false;
+  }
+  if (auto* svgElement = SVGElement::FromNode(aElement)) {
+    return svgElement->GetTransformListAttrName() == aAttributeName;
+  }
+  return false;
+}
+
+bool SMILAnimationController::GetTargetIdentifierForAnimation(
+    SVGAnimationElement* aAnimElem, SMILTargetIdentifier& aResult) {
+  Element* targetElem = aAnimElem->GetTargetElementContent();
+  if (!targetElem)
+    return false;
+
+  RefPtr<nsAtom> attributeName;
+  int32_t attributeNamespaceID;
+  if (!aAnimElem->GetTargetAttributeName(&attributeNamespaceID,
+                                         getter_AddRefs(attributeName)))
+    return false;
+
+  if (IsTransformAttribute(targetElem, attributeNamespaceID, attributeName) !=
+      aAnimElem->IsSVGElement(nsGkAtoms::animateTransform))
+    return false;
+
+  aResult.mElement = targetElem;
+  aResult.mAttributeName = attributeName;
+  aResult.mAttributeNamespaceID = attributeNamespaceID;
+
+  return true;
+}
+
+void SMILAnimationController::PreTraverse() { PreTraverseInSubtree(nullptr); }
+
+void SMILAnimationController::PreTraverseInSubtree(Element* aRoot) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!mMightHavePendingStyleUpdates) {
+    return;
+  }
+
+  nsPresContext* context = mDocument->GetPresContext();
+  if (!context) {
+    return;
+  }
+
+  for (SVGAnimationElement* animElement : mAnimationElementTable.Keys()) {
+    SMILTargetIdentifier key;
+    if (!GetTargetIdentifierForAnimation(animElement, key)) {
+      continue;
+    }
+
+    if (aRoot && !nsContentUtils::ContentIsFlattenedTreeDescendantOf(
+                     key.mElement, aRoot)) {
+      continue;
+    }
+
+    context->RestyleManager()->PostRestyleEventForAnimations(
+        key.mElement, PseudoStyleRequest::NotPseudo(),
+        RestyleHint::RESTYLE_SMIL);
+  }
+
+  if (!aRoot) {
+    mMightHavePendingStyleUpdates = false;
+  }
+}
+
+
+nsresult SMILAnimationController::AddChild(SMILTimeContainer& aChild) {
+  const bool wasEmpty = mChildContainerTable.IsEmpty();
+  TimeContainerPtrKey* key = mChildContainerTable.PutEntry(&aChild);
+  NS_ENSURE_TRUE(key, NS_ERROR_OUT_OF_MEMORY);
+  if (wasEmpty) {
+    UpdateSampling();
+  }
+  return NS_OK;
+}
+
+void SMILAnimationController::RemoveChild(SMILTimeContainer& aChild) {
+  mChildContainerTable.RemoveEntry(&aChild);
+  if (mChildContainerTable.IsEmpty()) {
+    UpdateSampling();
+  }
+}
+
+nsRefreshDriver* SMILAnimationController::GetRefreshDriver() {
+  if (!mDocument) {
+    NS_ERROR("Requesting refresh driver after document has disconnected!");
+    return nullptr;
+  }
+
+  nsPresContext* context = mDocument->GetPresContext();
+  return context ? context->RefreshDriver() : nullptr;
+}
+
+void SMILAnimationController::FlagDocumentNeedsFlush() {
+  if (PresShell* presShell = mDocument->GetPresShell()) {
+    presShell->SetNeedStyleFlush();
+  }
+}
+
+}  

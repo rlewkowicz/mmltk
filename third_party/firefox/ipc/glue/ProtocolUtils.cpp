@@ -1,0 +1,845 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "base/process_util.h"
+#include "base/task.h"
+
+#if defined(XP_UNIX)
+#  include <errno.h>
+#endif
+
+#include "mozilla/IntegerPrintfMacros.h"
+
+#include "mozilla/ipc/ProtocolMessageUtils.h"
+#include "mozilla/ipc/ProtocolUtils.h"
+
+#include "mozilla/ipc/MessageChannel.h"
+#include "mozilla/StaticMutex.h"
+#if defined(DEBUG) || 0
+#  include "mozilla/Tokenizer.h"
+#endif
+#include "nsPrintfCString.h"
+#include "nsReadableUtils.h"
+#include "prtime.h"
+
+
+
+
+using namespace IPC;
+
+using base::GetCurrentProcId;
+using base::ProcessHandle;
+using base::ProcessId;
+
+namespace mozilla {
+namespace ipc {
+
+EndpointProcInfo EndpointProcInfo::Current() {
+  return EndpointProcInfo{.mPid = GetCurrentProcId(),
+                          .mChildID = XRE_GetChildID()};
+}
+
+IPCResult IPCResult::FailImpl(NotNull<IProtocol*> actor, const char* where,
+                              const char* why) {
+  nsPrintfCString errorMsg("%s %s\n", where, why);
+  actor->GetIPCChannel()->Listener()->ProcessingError(
+      HasResultCodes::MsgProcessingError, errorMsg.get());
+
+#if defined(DEBUG) && !0
+  nsPrintfCString crashMsg(
+      "Use IPC_FAIL only in an "
+      "unrecoverable, unexpected state: %s",
+      errorMsg.get());
+  MOZ_CRASH_UNSAFE(crashMsg.get());
+#else
+  return IPCResult(false);
+#endif
+}
+
+IPCResult IPCResult::FailForTesting(NotNull<IProtocol*> actor,
+                                    const char* where, const char* why) {
+  return IPCResult(false);
+}
+
+#if defined(DEBUG) || 0
+bool LoggingEnabledFor(const char* aTopLevelProtocol, Side aSide,
+                       const char* aFilter) {
+  if (!aFilter) {
+    return false;
+  }
+  if (strcmp(aFilter, "1") == 0) {
+    return true;
+  }
+
+  const char kDelimiters[] = ", ";
+  Tokenizer tokens(aFilter, kDelimiters);
+  Tokenizer::Token t;
+  while (tokens.Next(t)) {
+    if (t.Type() == Tokenizer::TOKEN_WORD) {
+      auto filter = t.AsString();
+
+      if (filter == aTopLevelProtocol) {
+        return true;
+      }
+
+      if (aSide == ParentSide &&
+          StringEndsWith(filter, nsDependentCString("Parent")) &&
+          Substring(filter, 0, filter.Length() - 6) == aTopLevelProtocol) {
+        return true;
+      }
+
+      if (aSide == ChildSide &&
+          StringEndsWith(filter, nsDependentCString("Child")) &&
+          Substring(filter, 0, filter.Length() - 5) == aTopLevelProtocol) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+#endif
+
+void LogMessageForProtocol(const char* aTopLevelProtocol,
+                           base::ProcessId aOtherPid,
+                           const char* aContextDescription, uint32_t aMessageId,
+                           MessageDirection aDirection) {
+  nsPrintfCString logMessage(
+      "[time: %" PRId64 "][%" PRIPID "%s%" PRIPID "] [%s] %s %s\n", PR_Now(),
+      base::GetCurrentProcId(),
+      aDirection == MessageDirection::eReceiving ? "<-" : "->", aOtherPid,
+      aTopLevelProtocol, aContextDescription,
+      StringFromIPCMessageType(aMessageId));
+  fputs(logMessage.get(), stderr);
+}
+
+void ProtocolErrorBreakpoint(const char* aMsg) {
+  printf_stderr("IPDL protocol error: %s\n", aMsg);
+}
+
+void PickleFatalError(const char* aMsg, IProtocol* aActor) {
+  if (aActor) {
+    aActor->FatalError(aMsg);
+  } else {
+    FatalError(aMsg, false);
+  }
+}
+
+void FatalError(const char* aMsg, bool aIsParent) {
+  ProtocolErrorBreakpoint(aMsg);
+
+  nsAutoCString formattedMessage("IPDL error: \"");
+  formattedMessage.AppendASCII(aMsg);
+  if (aIsParent) {
+    formattedMessage.AppendLiteral("\". Intentionally crashing.");
+    NS_ERROR(formattedMessage.get());
+    MOZ_CRASH("IPC FatalError in the parent process!");
+  } else {
+    formattedMessage.AppendLiteral("\". abort()ing as a result.");
+    MOZ_CRASH_UNSAFE(formattedMessage.get());
+  }
+}
+
+void LogicError(const char* aMsg) { MOZ_CRASH_UNSAFE(aMsg); }
+
+void ActorIdReadError(const char* aActorDescription) {
+  MOZ_CRASH_UNSAFE_PRINTF("Error deserializing id for %s", aActorDescription);
+}
+
+void BadActorIdError(const char* aActorDescription) {
+  nsPrintfCString message("bad id for %s", aActorDescription);
+  ProtocolErrorBreakpoint(message.get());
+}
+
+void ActorLookupError(const char* aActorDescription) {
+  nsPrintfCString message("could not lookup id for %s", aActorDescription);
+  ProtocolErrorBreakpoint(message.get());
+}
+
+void MismatchedActorTypeError(const char* aActorDescription) {
+  nsPrintfCString message("actor that should be of type %s has different type",
+                          aActorDescription);
+  ProtocolErrorBreakpoint(message.get());
+}
+
+void UnionTypeReadError(const char* aUnionName) {
+  MOZ_CRASH_UNSAFE_PRINTF("error deserializing type of union %s", aUnionName);
+}
+
+void ArrayLengthReadError(const char* aElementName) {
+  MOZ_CRASH_UNSAFE_PRINTF("error deserializing length of %s[]", aElementName);
+}
+
+void SentinelReadError(const char* aClassName) {
+  MOZ_CRASH_UNSAFE_PRINTF("incorrect sentinel when reading %s", aClassName);
+}
+
+ActorLifecycleProxy::ActorLifecycleProxy(IProtocol* aActor)
+#if defined(MOZ_THREAD_SAFETY_OWNERSHIP_CHECKS_SUPPORTED)
+    : _mOwningThread(aActor->GetActorEventTarget()), mActor(aActor) {
+#else
+    : mActor(aActor) {
+#endif
+  MOZ_ASSERT(mActor);
+  MOZ_ASSERT(mActor->CanSend(),
+             "Cannot create LifecycleProxy for non-connected actor!");
+
+  mActor->ActorAlloc();
+}
+
+WeakActorLifecycleProxy* ActorLifecycleProxy::GetWeakProxy() {
+  if (!mWeakProxy) {
+    mWeakProxy = new WeakActorLifecycleProxy(this);
+  }
+  return mWeakProxy;
+}
+
+ActorLifecycleProxy::~ActorLifecycleProxy() {
+  if (mWeakProxy) {
+    mWeakProxy->mProxy = nullptr;
+    mWeakProxy = nullptr;
+  }
+
+  if (!mActor) {
+    return;
+  }
+
+  MOZ_ASSERT(mActor->mLinkStatus == LinkStatus::Destroyed,
+             "Deallocating non-destroyed actor!");
+  mActor->mLifecycleProxy = nullptr;
+  mActor->mLinkStatus = LinkStatus::Inactive;
+  mActor->ActorDealloc();
+  mActor = nullptr;
+}
+
+WeakActorLifecycleProxy::WeakActorLifecycleProxy(ActorLifecycleProxy* aProxy)
+    : mProxy(aProxy), mActorEventTarget(aProxy->Get()->GetActorEventTarget()) {
+  MOZ_ASSERT(mActorEventTarget->IsOnCurrentThread());
+}
+
+WeakActorLifecycleProxy::~WeakActorLifecycleProxy() {
+  MOZ_DIAGNOSTIC_ASSERT(!mProxy, "Destroyed before mProxy was cleared?");
+}
+
+IProtocol* WeakActorLifecycleProxy::Get() const {
+  MOZ_DIAGNOSTIC_ASSERT(mActorEventTarget->IsOnCurrentThread());
+  return mProxy ? mProxy->Get() : nullptr;
+}
+
+WeakActorLifecycleProxy* IProtocol::GetWeakLifecycleProxy() {
+  return mLifecycleProxy ? mLifecycleProxy->GetWeakProxy() : nullptr;
+}
+
+IProtocol::~IProtocol() {
+  if (mLifecycleProxy) {
+    MOZ_ASSERT(mLinkStatus != LinkStatus::Inactive);
+    NS_WARNING(
+        nsPrintfCString("Actor destructor for '%s%s' called before IPC "
+                        "lifecycle complete!\n"
+                        "References to this actor may unexpectedly dangle!",
+                        GetProtocolName(), StringFromIPCSide(GetSide()))
+            .get());
+
+    mLifecycleProxy->mActor = nullptr;
+    mLifecycleProxy = nullptr;
+  }
+}
+
+IProtocol* IProtocol::Lookup(ActorId aId) { return mToplevel->Lookup(aId); }
+
+Shmem IProtocol::CreateSharedMemory(size_t aSize, bool aUnsafe) {
+  return mToplevel->CreateSharedMemory(aSize, aUnsafe);
+}
+Shmem::Segment* IProtocol::LookupSharedMemory(Shmem::id_t aId) {
+  return mToplevel->LookupSharedMemory(aId);
+}
+bool IProtocol::IsTrackingSharedMemory(const Shmem::Segment* aSegment) {
+  return mToplevel->IsTrackingSharedMemory(aSegment);
+}
+bool IProtocol::DestroySharedMemory(Shmem& aShmem) {
+  return mToplevel->DestroySharedMemory(aShmem);
+}
+
+MessageChannel* IProtocol::GetIPCChannel() {
+  return mToplevel->GetIPCChannel();
+}
+const MessageChannel* IProtocol::GetIPCChannel() const {
+  return mToplevel->GetIPCChannel();
+}
+
+nsISerialEventTarget* IProtocol::GetActorEventTarget() {
+  return GetIPCChannel()->GetWorkerEventTarget();
+}
+
+void IProtocol::FatalError(const char* const aErrorMsg) {
+  HandleFatalError(aErrorMsg);
+}
+
+void IProtocol::HandleFatalError(const char* aErrorMsg) {
+  if (IProtocol* manager = Manager()) {
+    manager->HandleFatalError(aErrorMsg);
+    return;
+  }
+
+  mozilla::ipc::FatalError(aErrorMsg, mSide == ParentSide);
+  if (CanSend()) {
+    GetIPCChannel()->InduceConnectionError();
+  }
+}
+
+bool IProtocol::AllocShmem(size_t aSize, Shmem* aOutMem) {
+  if (!CanSend()) {
+    NS_WARNING(
+        "Shmem not allocated.  Cannot communicate with the other actor.");
+    return false;
+  }
+
+  *aOutMem = CreateSharedMemory(aSize, false);
+  return aOutMem->IsReadable();
+}
+
+bool IProtocol::AllocUnsafeShmem(size_t aSize, Shmem* aOutMem) {
+  if (!CanSend()) {
+    NS_WARNING(
+        "Shmem not allocated.  Cannot communicate with the other actor.");
+    return false;
+  }
+
+  *aOutMem = CreateSharedMemory(aSize, true);
+  return aOutMem->IsReadable();
+}
+
+bool IProtocol::DeallocShmem(Shmem& aMem) {
+  bool ok = DestroySharedMemory(aMem);
+#if defined(DEBUG)
+  if (!ok) {
+    if (mSide == ChildSide) {
+      FatalError("bad Shmem");
+    } else {
+      NS_WARNING("bad Shmem");
+    }
+    return false;
+  }
+#endif
+  aMem.forget();
+  return ok;
+}
+
+void IProtocol::SetManager(IRefCountedProtocol* aManager) {
+  MOZ_RELEASE_ASSERT(!mManager || mManager == aManager);
+  mManager = aManager;
+  mToplevel = aManager->mToplevel;
+}
+
+bool IProtocol::SetManagerAndRegister(IRefCountedProtocol* aManager,
+                                      ActorId aId) {
+  MOZ_RELEASE_ASSERT(mLinkStatus == LinkStatus::Inactive,
+                     "Actor must be inactive to SetManagerAndRegister");
+
+  bool success = true;
+
+  SetManager(aManager);
+
+  mId = aId == kNullActorId ? mToplevel->NextId() : aId;
+
+  RefPtr<ActorLifecycleProxy> proxy = ActorConnected();
+  MOZ_ASSERT(proxy->Get() == this);
+
+  mToplevel->mActorMap.WithEntryHandle(mId, [&](auto entry) {
+    if (aId == kNullActorId) {
+      MOZ_RELEASE_ASSERT(!entry, "Entry must not exist for new actor ID");
+    } else {
+      MOZ_RELEASE_ASSERT(entry && !entry.Data(),
+                         "Entry must be a reservation for reserved actor ID");
+    }
+    entry.InsertOrUpdate(proxy);
+  });
+
+  UntypedManagedContainer* container =
+      aManager->GetManagedActors(GetProtocolId());
+  if (container) {
+    container->Insert(this);
+  } else {
+    NS_WARNING("Manager does not manage actors with this ProtocolId");
+    success = false;
+  }
+
+  if (aManager && aManager->mLinkStatus != LinkStatus::Connected) {
+    mLinkStatus = LinkStatus::Doomed;
+    if (aManager->mLinkStatus != LinkStatus::Doomed) {
+      success = false;
+    }
+  }
+
+  if (!success) {
+    ActorDisconnected(FailedConstructor);
+    MOZ_ASSERT(mLinkStatus == LinkStatus::Destroyed);
+    return false;
+  }
+  return true;
+}
+
+void IProtocol::UnlinkManager() {
+  mToplevel = nullptr;
+  mManager = nullptr;
+}
+
+bool IProtocol::ChannelSend(UniquePtr<IPC::Message> aMsg,
+                            IPC::Message::seqno_t* aSeqno) {
+  if (CanSend()) {
+    GetIPCChannel()->Send(std::move(aMsg), aSeqno);
+    return true;
+  }
+
+  WarnMessageDiscarded(aMsg.get());
+  return false;
+}
+
+bool IProtocol::ChannelSend(UniquePtr<IPC::Message> aMsg,
+                            UniquePtr<IPC::Message>* aReply) {
+  if (CanSend()) {
+    return GetIPCChannel()->Send(std::move(aMsg), aReply);
+  }
+
+  WarnMessageDiscarded(aMsg.get());
+  return false;
+}
+
+#if defined(DEBUG)
+void IProtocol::WarnMessageDiscarded(IPC::Message* aMsg) {
+  NS_WARNING(nsPrintfCString("IPC message '%s' discarded: actor cannot send",
+                             aMsg->name())
+                 .get());
+}
+#endif
+
+uint32_t IProtocol::AllManagedActorsCount() const {
+  uint32_t total = 0;
+  for (ProtocolId id : ManagedProtocolIds()) {
+    total += GetManagedActors(id)->Count();
+  }
+  return total;
+}
+
+already_AddRefed<ActorLifecycleProxy> IProtocol::ActorConnected() {
+  if (mLinkStatus != LinkStatus::Inactive) {
+    return nullptr;
+  }
+
+
+  mLinkStatus = LinkStatus::Connected;
+
+  MOZ_ASSERT(!mLifecycleProxy, "double-connecting live actor");
+  RefPtr<ActorLifecycleProxy> proxy = new ActorLifecycleProxy(this);
+  mLifecycleProxy = proxy;
+  return proxy.forget();
+}
+
+void IProtocol::ActorDisconnected(ActorDestroyReason aWhy) {
+  MOZ_ASSERT(mLifecycleProxy, "destroying zombie actor");
+  if (mLinkStatus != LinkStatus::Connected &&
+      mLinkStatus != LinkStatus::Doomed) {
+    return;
+  }
+
+  DoomSubtree();
+
+  auto doActorDestroy = [toplevel = mToplevel, ipcChannel = GetIPCChannel()](
+                            IProtocol* actor, ActorDestroyReason why) {
+    MOZ_ASSERT(actor->mLinkStatus == LinkStatus::Doomed,
+               "Actor must be doomed when calling doActorDestroy");
+    MOZ_ASSERT(actor->AllManagedActorsCount() == 0,
+               "All managed actors must have been destroyed first");
+
+    actor->mLinkStatus = LinkStatus::Destroyed;
+
+
+    ActorId id = actor->mId;
+    if (IProtocol* manager = actor->Manager()) {
+      auto entry = toplevel->mActorMap.Lookup(id);
+      MOZ_DIAGNOSTIC_ASSERT(entry && *entry == actor->GetLifecycleProxy(),
+                            "ID must be present and reference this actor");
+      entry.Remove();
+      if (auto* container = manager->GetManagedActors(actor->GetProtocolId())) {
+        container->EnsureRemoved(actor);
+      }
+    }
+
+    actor->RejectPendingResponses(ResponseRejectReason::ActorDestroyed);
+    actor->ActorDestroy(why);
+  };
+
+  nsTArray<RefPtr<ActorLifecycleProxy>> proxyHolder;
+  proxyHolder.AppendElement(GetLifecycleProxy());
+
+  ActorDestroyReason subtreeWhy = aWhy;
+  if (aWhy == Deletion || aWhy == FailedConstructor) {
+    subtreeWhy = AncestorDeletion;
+  }
+  while (IProtocol* actor = PeekManagedActor()) {
+    while (IProtocol* inner = actor->PeekManagedActor()) {
+      actor = inner;
+    }
+
+    proxyHolder.AppendElement(actor->GetLifecycleProxy());
+    doActorDestroy(actor, subtreeWhy);
+  }
+
+  if (mLinkStatus == LinkStatus::Doomed) {
+    doActorDestroy(this, aWhy);
+  }
+}
+
+void IProtocol::DoomSubtree() {
+  if (mLinkStatus != LinkStatus::Connected) {
+    return;
+  }
+  for (ProtocolId id : ManagedProtocolIds()) {
+    for (IProtocol* actor : *GetManagedActors(id)) {
+      actor->DoomSubtree();
+    }
+  }
+  mLinkStatus = LinkStatus::Doomed;
+}
+
+IProtocol* IProtocol::PeekManagedActor() const {
+  for (ProtocolId id : ManagedProtocolIds()) {
+    const UntypedManagedContainer& container = *GetManagedActors(id);
+    if (!container.IsEmpty()) {
+      return *(container.end() - 1);
+    }
+  }
+  return nullptr;
+}
+
+IToplevelProtocol::IToplevelProtocol(const char* aName, ProtocolId aProtoId,
+                                     Side aSide)
+    : IRefCountedProtocol(aProtoId, aSide),
+      mOtherPid(base::kInvalidProcessId),
+      mLastLocalId(kNullActorId),
+      mChannel(aName, this) {
+  mToplevel = this;
+}
+
+void IToplevelProtocol::SetOtherEndpointProcInfo(
+    EndpointProcInfo aOtherProcInfo) {
+  mOtherPid = aOtherProcInfo.mPid;
+  mOtherChildID = aOtherProcInfo.mChildID;
+}
+
+bool IToplevelProtocol::Open(ScopedPort aPort, const nsID& aMessageChannelId,
+                             EndpointProcInfo aOtherProcInfo,
+                             nsISerialEventTarget* aEventTarget) {
+  SetOtherEndpointProcInfo(aOtherProcInfo);
+  return GetIPCChannel()->Open(std::move(aPort), mSide, aMessageChannelId,
+                               aEventTarget);
+}
+
+bool IToplevelProtocol::Open(IToplevelProtocol* aTarget,
+                             nsISerialEventTarget* aEventTarget,
+                             mozilla::ipc::Side aSide) {
+  SetOtherEndpointProcInfo(EndpointProcInfo::Current());
+  aTarget->SetOtherEndpointProcInfo(EndpointProcInfo::Current());
+  return GetIPCChannel()->Open(aTarget->GetIPCChannel(), aEventTarget, aSide);
+}
+
+bool IToplevelProtocol::OpenOnSameThread(IToplevelProtocol* aTarget,
+                                         Side aSide) {
+  SetOtherEndpointProcInfo(EndpointProcInfo::Current());
+  aTarget->SetOtherEndpointProcInfo(EndpointProcInfo::Current());
+  return GetIPCChannel()->OpenOnSameThread(aTarget->GetIPCChannel(), aSide);
+}
+
+void IToplevelProtocol::NotifyImpendingShutdown() {
+  if (CanSend()) {
+    GetIPCChannel()->NotifyImpendingShutdown();
+  }
+}
+
+void IToplevelProtocol::Close() { GetIPCChannel()->Close(); }
+
+void IToplevelProtocol::SetReplyTimeoutMs(int32_t aTimeoutMs) {
+  GetIPCChannel()->SetReplyTimeoutMs(aTimeoutMs);
+}
+
+bool IToplevelProtocol::IsOnCxxStack() const {
+  return GetIPCChannel()->IsOnCxxStack();
+}
+
+int64_t IToplevelProtocol::NextId() {
+  MOZ_RELEASE_ASSERT(mozilla::Abs(mLastLocalId) < MSG_ROUTING_CONTROL - 1,
+                     "actor id overflow");
+  return (GetSide() == ChildSide) ? --mLastLocalId : ++mLastLocalId;
+}
+
+IProtocol* IToplevelProtocol::Lookup(ActorId aId) {
+  if (auto entry = mActorMap.Lookup(aId); entry && entry.Data()) {
+    return entry.Data()->Get();
+  }
+  return nullptr;
+}
+
+bool IToplevelProtocol::TryReserve(ActorId aId) {
+  if (mozilla::Abs(aId) >= MSG_ROUTING_CONTROL ||
+      (GetSide() == ChildSide && aId <= kNullActorId) ||
+      (GetSide() == ParentSide && aId >= kNullActorId)) {
+    return false;
+  }
+
+  return mActorMap.WithEntryHandle(aId, [&](auto entry) {
+    if (entry) {
+      return false;
+    }
+    entry.Insert(nullptr);
+    return true;
+  });
+}
+
+void IToplevelProtocol::ClearReservation(ActorId aId) {
+  auto entry = mActorMap.Lookup(aId);
+  if (entry && !entry.Data()) {
+    entry.Remove();
+  }
+}
+
+Shmem IToplevelProtocol::CreateSharedMemory(size_t aSize, bool aUnsafe) {
+  auto shmemBuilder = Shmem::Builder(aSize);
+  if (!shmemBuilder) {
+    return {};
+  }
+  auto [createdMessage, shmem] =
+      shmemBuilder.Build(NextId(), aUnsafe, MSG_ROUTING_CONTROL);
+  if (!createdMessage) {
+    return {};
+  }
+  (void)GetIPCChannel()->Send(std::move(createdMessage));
+
+  MOZ_ASSERT(!mShmemMap.Contains(shmem.Id()),
+             "Don't insert with an existing ID");
+  mShmemMap.InsertOrUpdate(shmem.Id(), shmem.GetSegment());
+  return shmem;
+}
+
+Shmem::Segment* IToplevelProtocol::LookupSharedMemory(Shmem::id_t aId) {
+  auto entry = mShmemMap.Lookup(aId);
+  return entry ? entry.Data().get() : nullptr;
+}
+
+bool IToplevelProtocol::IsTrackingSharedMemory(const Shmem::Segment* segment) {
+  for (const auto& shmem : mShmemMap.Values()) {
+    if (segment == shmem) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool IToplevelProtocol::DestroySharedMemory(Shmem& shmem) {
+  Shmem::id_t aId = shmem.Id();
+  if (!LookupSharedMemory(aId)) {
+    return false;
+  }
+
+  UniquePtr<Message> descriptor = shmem.MkDestroyedMessage(MSG_ROUTING_CONTROL);
+
+  MOZ_ASSERT(mShmemMap.Contains(aId),
+             "Attempting to remove an ID not in the shmem map");
+  mShmemMap.Remove(aId);
+
+  MessageChannel* channel = GetIPCChannel();
+  if (!channel->CanSend()) {
+    return true;
+  }
+
+  return descriptor && channel->Send(std::move(descriptor));
+}
+
+void IToplevelProtocol::DeallocShmems() { mShmemMap.Clear(); }
+
+bool IToplevelProtocol::ShmemCreated(const Message& aMsg) {
+  Shmem::id_t id;
+  RefPtr<Shmem::Segment> segment(Shmem::OpenExisting(aMsg, &id, true));
+  if (!segment) {
+    return false;
+  }
+  MOZ_ASSERT(!mShmemMap.Contains(id), "Don't insert with an existing ID");
+  mShmemMap.InsertOrUpdate(id, std::move(segment));
+  return true;
+}
+
+bool IToplevelProtocol::ShmemDestroyed(const Message& aMsg) {
+  Shmem::id_t id;
+  MessageReader reader(aMsg);
+  if (!IPC::ReadParam(&reader, &id)) {
+    return false;
+  }
+  reader.EndRead();
+
+  mShmemMap.Remove(id);
+  return true;
+}
+
+IPDLResolverInner::IPDLResolverInner(UniquePtr<IPC::Message> aReply,
+                                     IProtocol* aActor)
+    : mReply(std::move(aReply)),
+      mWeakProxy(aActor->GetLifecycleProxy()->GetWeakProxy()) {}
+
+void IPDLResolverInner::ResolveOrReject(
+    bool aResolve, FunctionRef<void(IPC::Message*, IProtocol*)> aWrite) {
+  MOZ_ASSERT(mWeakProxy);
+  MOZ_ASSERT(mWeakProxy->ActorEventTarget()->IsOnCurrentThread());
+  MOZ_ASSERT(mReply);
+
+  UniquePtr<IPC::Message> reply = std::move(mReply);
+
+  IProtocol* actor = mWeakProxy->Get();
+  if (!actor) {
+    NS_WARNING(nsPrintfCString("Not resolving response '%s': actor is dead",
+                               reply->name())
+                   .get());
+    return;
+  }
+
+  IPC::MessageWriter writer(*reply, actor);
+  WriteParam(&writer, aResolve);
+  aWrite(reply.get(), actor);
+
+  actor->ChannelSend(std::move(reply));
+}
+
+void IPDLResolverInner::Destroy() {
+  if (mReply) {
+    NS_PROXY_DELETE_TO_EVENT_TARGET(IPDLResolverInner,
+                                    mWeakProxy->ActorEventTarget());
+  } else {
+    delete this;
+  }
+}
+
+IPDLResolverInner::~IPDLResolverInner() {
+  if (mReply) {
+    NS_WARNING(
+        nsPrintfCString(
+            "Rejecting reply '%s': resolver dropped without being called",
+            mReply->name())
+            .get());
+    ResolveOrReject(false, [](IPC::Message* aMessage, IProtocol* aActor) {
+      IPC::MessageWriter writer(*aMessage, aActor);
+      ResponseRejectReason reason = ResponseRejectReason::ResolverDestroyed;
+      WriteParam(&writer, reason);
+    });
+  }
+}
+
+bool IPDLAsyncReturnsCallbacks::EntryKey::operator==(
+    const EntryKey& aOther) const {
+  return mSeqno == aOther.mSeqno && mType == aOther.mType;
+}
+
+bool IPDLAsyncReturnsCallbacks::EntryKey::operator<(
+    const EntryKey& aOther) const {
+  return mSeqno < aOther.mSeqno ||
+         (mSeqno == aOther.mSeqno && mType < aOther.mType);
+}
+
+void IPDLAsyncReturnsCallbacks::AddCallback(IPC::Message::seqno_t aSeqno,
+                                            msgid_t aType, Callback aResolve,
+                                            RejectCallback aReject) {
+  Entry entry{{aSeqno, aType}, std::move(aResolve), std::move(aReject)};
+  MOZ_ASSERT(!mMap.ContainsSorted(entry));
+  mMap.InsertElementSorted(std::move(entry));
+}
+
+auto IPDLAsyncReturnsCallbacks::GotReply(IProtocol* aActor,
+                                         const IPC::Message& aMessage)
+    -> Result {
+  EntryKey key{aMessage.seqno(), aMessage.type()};
+  size_t index = mMap.BinaryIndexOf(key);
+  if (index == nsTArray<Entry>::NoIndex) {
+    return MsgProcessingError;
+  }
+
+  Entry entry = std::move(mMap[index]);
+  mMap.RemoveElementAt(index);
+  MOZ_ASSERT(entry == key);
+
+  IPC::MessageReader reader{aMessage, aActor};
+  bool resolve = false;
+  if (!IPC::ReadParam(&reader, &resolve)) {
+    entry.mReject(ResponseRejectReason::HandlerRejected);
+    return MsgValueError;
+  }
+
+  if (resolve) {
+    Result rv = entry.mResolve(&reader);
+    if (rv != MsgProcessed) {
+      entry.mReject(ResponseRejectReason::HandlerRejected);
+    }
+    return rv;
+  }
+
+  ResponseRejectReason reason;
+  if (!IPC::ReadParam(&reader, &reason)) {
+    entry.mReject(ResponseRejectReason::HandlerRejected);
+    return MsgValueError;
+  }
+  reader.EndRead();
+
+  entry.mReject(reason);
+  return MsgProcessed;
+}
+
+void IPDLAsyncReturnsCallbacks::RejectPendingResponses(
+    ResponseRejectReason aReason) {
+  nsTArray<Entry> pending = std::move(mMap);
+  for (auto& entry : pending) {
+    entry.mReject(aReason);
+  }
+}
+
+}  
+}  
+
+namespace IPC {
+
+void ParamTraits<mozilla::ipc::IProtocol*>::Write(MessageWriter* aWriter,
+                                                  const paramType& aParam) {
+  MOZ_RELEASE_ASSERT(aWriter->GetActor(),
+                     "Cannot serialize managed actors without an actor");
+
+  mozilla::ipc::ActorId id = mozilla::ipc::IProtocol::kNullActorId;
+  if (aParam) {
+    id = aParam->Id();
+    MOZ_RELEASE_ASSERT(id != mozilla::ipc::IProtocol::kNullActorId,
+                       "Actor has ID of 0?");
+    MOZ_RELEASE_ASSERT(aParam->CanSend(),
+                       "Actor must still be open when sending");
+    MOZ_RELEASE_ASSERT(
+        aWriter->GetActor()->GetIPCChannel() == aParam->GetIPCChannel(),
+        "Actor must be from the same tree as the actor it is being sent over");
+  }
+
+  IPC::WriteParam(aWriter, id);
+}
+
+bool ParamTraits<mozilla::ipc::IProtocol*>::Read(MessageReader* aReader,
+                                                 paramType* aResult) {
+  MOZ_RELEASE_ASSERT(aReader->GetActor(),
+                     "Cannot serialize managed actors without an actor");
+
+  mozilla::ipc::ActorId id;
+  if (!IPC::ReadParam(aReader, &id)) {
+    return false;
+  }
+
+  if (id == mozilla::ipc::IProtocol::kNullActorId) {
+    *aResult = nullptr;
+    return true;
+  }
+
+  *aResult = aReader->GetActor()->Lookup(id);
+  return *aResult != nullptr;
+}
+
+}  

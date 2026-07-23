@@ -1,0 +1,135 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "RefCountedInsideLambdaChecker.h"
+#include "CustomMatchers.h"
+
+RefCountedMap RefCountedClasses;
+
+void RefCountedInsideLambdaChecker::registerMatchers(MatchFinder *AstMatcher) {
+  AstMatcher->addMatcher(functionDecl(returns(recordType(hasDeclaration(
+                             cxxRecordDecl(isLambdaDecl()).bind("decl"))))),
+                         this);
+  AstMatcher->addMatcher(lambdaExpr().bind("lambdaExpr"), this);
+  AstMatcher->addMatcher(
+      classTemplateSpecializationDecl(
+          hasAnyTemplateArgument(refersToType(recordType(
+              hasDeclaration(cxxRecordDecl(isLambdaDecl()).bind("decl")))))),
+      this);
+}
+
+void RefCountedInsideLambdaChecker::emitDiagnostics(SourceLocation Loc,
+                                                    StringRef Name,
+                                                    QualType Type) {
+  diag(Loc,
+       "Refcounted variable '%0' of type %1 cannot be captured by a lambda",
+       DiagnosticIDs::Error)
+      << Name << Type;
+  diag(Loc, "Please consider using a smart pointer", DiagnosticIDs::Note);
+}
+
+static bool IsKnownLive(const VarDecl *Var) {
+  const Stmt *Init = Var->getInit();
+  if (!Init) {
+    return false;
+  }
+  if (auto *Call = dyn_cast<CallExpr>(Init)) {
+    const FunctionDecl *Callee = Call->getDirectCallee();
+    return Callee && Callee->getName() == "MOZ_KnownLive";
+  }
+  return false;
+}
+
+void RefCountedInsideLambdaChecker::check(
+    const MatchFinder::MatchResult &Result) {
+  static DenseSet<const CXXRecordDecl *> CheckedDecls;
+
+  const CXXRecordDecl *Lambda = Result.Nodes.getNodeAs<CXXRecordDecl>("decl");
+
+  if (const LambdaExpr *OuterLambda =
+          Result.Nodes.getNodeAs<LambdaExpr>("lambdaExpr")) {
+    const CXXMethodDecl *OpCall = OuterLambda->getCallOperator();
+    QualType ReturnTy = OpCall->getReturnType();
+    if (const CXXRecordDecl *Record = ReturnTy->getAsCXXRecordDecl()) {
+      Lambda = Record;
+    }
+  }
+
+  if (!Lambda || !Lambda->isLambda()) {
+    return;
+  }
+
+  if (CheckedDecls.count(Lambda)) {
+    return;
+  }
+  CheckedDecls.insert(Lambda);
+
+  bool StrongRefToThisCaptured = false;
+
+  for (const LambdaCapture &Capture : Lambda->captures()) {
+    if (Capture.getCaptureKind() == LCK_ByRef) {
+      return;
+    }
+
+    if (!StrongRefToThisCaptured && Capture.capturesVariable() &&
+        Capture.getCaptureKind() == LCK_ByCopy) {
+      const VarDecl *Var = dyn_cast<VarDecl>(Capture.getCapturedVar());
+      if (Var->hasInit()) {
+        const Stmt *Init = Var->getInit();
+
+        while (true) {
+          auto NewInit = IgnoreTrivials(Init);
+          if (auto ConstructExpr = dyn_cast<CXXConstructExpr>(NewInit)) {
+            if (ConstructExpr->getNumArgs() == 1) {
+              NewInit = ConstructExpr->getArg(0);
+            }
+          }
+          if (Init == NewInit) {
+            break;
+          }
+          Init = NewInit;
+        }
+
+        if (isa<CXXThisExpr>(Init)) {
+          StrongRefToThisCaptured = true;
+        }
+      }
+    }
+  }
+
+  for (const LambdaCapture &Capture : Lambda->captures()) {
+    if (Capture.capturesVariable()) {
+      const VarDecl *Var = dyn_cast<VarDecl>(Capture.getCapturedVar());
+      QualType Pointee = Var->getType()->getPointeeType();
+      if (!Pointee.isNull() && isClassRefCounted(Pointee) &&
+          !IsKnownLive(Var)) {
+        emitDiagnostics(Capture.getLocation(), Var->getName(), Pointee);
+        return;
+      }
+    }
+
+    bool ImplicitByRefDefaultedCapture =
+        Capture.isImplicit() && Lambda->getLambdaCaptureDefault() == LCD_ByRef;
+    if (Capture.capturesThis() && !ImplicitByRefDefaultedCapture &&
+        !StrongRefToThisCaptured) {
+      ThisVisitor V(*this);
+      bool NotAborted = V.TraverseDecl(
+          const_cast<CXXMethodDecl *>(Lambda->getLambdaCallOperator()));
+      if (!NotAborted) {
+        return;
+      }
+    }
+  }
+}
+
+bool RefCountedInsideLambdaChecker::ThisVisitor::VisitCXXThisExpr(
+    CXXThisExpr *This) {
+  QualType Pointee = This->getType()->getPointeeType();
+  if (!Pointee.isNull() && isClassRefCounted(Pointee)) {
+    Checker.emitDiagnostics(This->getBeginLoc(), "this", Pointee);
+    return false;
+  }
+
+  return true;
+}

@@ -1,0 +1,11104 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "frontend/BytecodeEmitter.h"
+
+#include "mozilla/Casting.h"    // mozilla::AssertedCast
+#include "mozilla/DebugOnly.h"  // mozilla::DebugOnly
+#include "mozilla/FloatingPoint.h"  // mozilla::NumberEqualsInt32, mozilla::NumberIsInt32
+#include "mozilla/HashTable.h"  // mozilla::HashSet
+#include "mozilla/Maybe.h"      // mozilla::{Maybe,Nothing,Some}
+#include "mozilla/Saturate.h"
+#include "mozilla/Variant.h"  // mozilla::AsVariant
+
+#include <algorithm>
+#include <iterator>
+#include <string.h>
+
+#include "jstypes.h"  // JS_BIT
+
+#include "frontend/AbstractScopePtr.h"           // ScopeIndex
+#include "frontend/BytecodeControlStructures.h"  // NestableControl, BreakableControl, LabelControl, LoopControl, TryFinallyControl
+#include "frontend/CallOrNewEmitter.h"           // CallOrNewEmitter
+#include "frontend/CForEmitter.h"                // CForEmitter
+#include "frontend/DecoratorEmitter.h"           // DecoratorEmitter
+#include "frontend/DefaultEmitter.h"             // DefaultEmitter
+#include "frontend/DoWhileEmitter.h"             // DoWhileEmitter
+#include "frontend/ElemOpEmitter.h"              // ElemOpEmitter
+#include "frontend/EmitterScope.h"               // EmitterScope
+#include "frontend/ExpressionStatementEmitter.h"  // ExpressionStatementEmitter
+#include "frontend/ForInEmitter.h"                // ForInEmitter
+#include "frontend/ForOfEmitter.h"                // ForOfEmitter
+#include "frontend/FunctionEmitter.h"  // FunctionEmitter, FunctionScriptEmitter, FunctionParamsEmitter
+#include "frontend/IfEmitter.h"     // IfEmitter, InternalIfEmitter, CondEmitter
+#include "frontend/LabelEmitter.h"  // LabelEmitter
+#include "frontend/LexicalScopeEmitter.h"  // LexicalScopeEmitter
+#include "frontend/ModuleSharedContext.h"  // ModuleSharedContext
+#include "frontend/NameAnalysisTypes.h"    // PrivateNameKind
+#include "frontend/NameFunctions.h"        // NameFunctions
+#include "frontend/NameOpEmitter.h"        // NameOpEmitter
+#include "frontend/ObjectEmitter.h"  // PropertyEmitter, ObjectEmitter, ClassEmitter
+#include "frontend/OptionalEmitter.h"  // OptionalEmitter
+#include "frontend/ParseContext.h"     // ParseContext::Scope
+#include "frontend/ParseNode.h"   // ParseNodeKind, ParseNode and subclasses
+#include "frontend/Parser.h"      // Parser
+#include "frontend/ParserAtom.h"  // ParserAtomsTable, ParserAtom
+#include "frontend/PrivateOpEmitter.h"  // PrivateOpEmitter
+#include "frontend/PropOpEmitter.h"     // PropOpEmitter
+#include "frontend/SourceNotes.h"       // SrcNote, SrcNoteType, SrcNoteWriter
+#include "frontend/SwitchEmitter.h"     // SwitchEmitter
+#include "frontend/TaggedParserAtomIndexHasher.h"  // TaggedParserAtomIndexHasher
+#include "frontend/TDZCheckCache.h"                // TDZCheckCache
+#include "frontend/TryEmitter.h"                   // TryEmitter
+#include "frontend/UsingEmitter.h"                 // UsingEmitter
+#include "frontend/WhileEmitter.h"                 // WhileEmitter
+#include "js/ColumnNumber.h"  // JS::LimitedColumnNumberOneOrigin, JS::ColumnNumberOffset
+#include "js/friend/ErrorMessages.h"  // JSMSG_*
+#include "js/friend/StackLimits.h"    // AutoCheckRecursionLimit
+#include "util/StringBuilder.h"       // StringBuilder
+#include "vm/BytecodeUtil.h"  // JOF_*, IsArgOp, IsLocalOp, SET_UINT24, SET_ICINDEX, BytecodeFallsThrough, BytecodeIsJumpTarget
+#include "vm/CompletionKind.h"          // CompletionKind
+#include "vm/ConstantCompareOperand.h"  // ConstantCompareOperand
+#include "vm/FunctionPrefixKind.h"      // FunctionPrefixKind
+#include "vm/GeneratorObject.h"         // AbstractGeneratorObject
+#include "vm/Opcodes.h"                 // JSOp, JSOpLength_*
+#include "vm/PropMap.h"          // SharedPropMap::MaxPropsForNonDictionary
+#include "vm/Scope.h"            // GetScopeDataTrailingNames
+#include "vm/SharedStencil.h"    // ScopeNote
+#include "vm/ThrowMsgKind.h"     // ThrowMsgKind
+#include "vm/TypeofEqOperand.h"  // TypeofEqOperand
+
+using namespace js;
+using namespace js::frontend;
+
+using mozilla::AssertedCast;
+using mozilla::AsVariant;
+using mozilla::DebugOnly;
+using mozilla::Maybe;
+using mozilla::Nothing;
+using mozilla::NumberEqualsInt32;
+using mozilla::NumberIsInt32;
+using mozilla::Some;
+
+static bool ParseNodeRequiresSpecialLineNumberNotes(ParseNode* pn) {
+
+  ParseNodeKind kind = pn->getKind();
+  return kind == ParseNodeKind::WhileStmt || kind == ParseNodeKind::ForStmt ||
+         kind == ParseNodeKind::Function;
+}
+
+static bool NeedsFieldInitializer(ParseNode* member, bool inStaticContext) {
+  return (member->is<StaticClassBlock>() && inStaticContext) ||
+         (member->is<ClassField>() &&
+          member->as<ClassField>().isStatic() == inStaticContext);
+}
+
+static bool NeedsAccessorInitializer(ParseNode* member, bool isStatic) {
+  if (isStatic) {
+    return false;
+  }
+  return member->is<ClassMethod>() &&
+         member->as<ClassMethod>().name().isKind(ParseNodeKind::PrivateName) &&
+         !member->as<ClassMethod>().isStatic() &&
+         member->as<ClassMethod>().accessorType() != AccessorType::None;
+}
+
+static bool ShouldSuppressBreakpointsAndSourceNotes(
+    SharedContext* sc, BytecodeEmitter::EmitterMode emitterMode) {
+  if (emitterMode == BytecodeEmitter::EmitterMode::SelfHosting) {
+    return true;
+  }
+
+  if (sc->isFunctionBox()) {
+    FunctionBox* funbox = sc->asFunctionBox();
+    return funbox->isSyntheticFunction() && funbox->isClassConstructor();
+  }
+
+  return false;
+}
+
+BytecodeEmitter::BytecodeEmitter(BytecodeEmitter* parent, FrontendContext* fc,
+                                 SharedContext* sc,
+                                 const ErrorReporter& errorReporter,
+                                 CompilationState& compilationState,
+                                 EmitterMode emitterMode)
+    : sc(sc),
+      fc(fc),
+      parent(parent),
+      bytecodeSection_(fc, sc->extent().lineno,
+                       JS::LimitedColumnNumberOneOrigin(sc->extent().column)),
+      perScriptData_(fc, compilationState),
+      errorReporter_(errorReporter),
+      compilationState(compilationState),
+      suppressBreakpointsAndSourceNotes(
+          ShouldSuppressBreakpointsAndSourceNotes(sc, emitterMode)),
+      emitterMode(emitterMode) {
+  MOZ_ASSERT_IF(parent, fc == parent->fc);
+}
+
+BytecodeEmitter::BytecodeEmitter(BytecodeEmitter* parent, SharedContext* sc)
+    : BytecodeEmitter(parent, parent->fc, sc, parent->errorReporter_,
+                      parent->compilationState, parent->emitterMode) {}
+
+BytecodeEmitter::BytecodeEmitter(FrontendContext* fc,
+                                 const EitherParser& parser, SharedContext* sc,
+                                 CompilationState& compilationState,
+                                 EmitterMode emitterMode)
+    : BytecodeEmitter(nullptr, fc, sc, parser.errorReporter(), compilationState,
+                      emitterMode) {
+  ep_.emplace(parser);
+}
+
+void BytecodeEmitter::initFromBodyPosition(TokenPos bodyPosition) {
+  setScriptStartOffsetIfUnset(bodyPosition.begin);
+  setFunctionBodyEndPos(bodyPosition.end);
+}
+
+bool BytecodeEmitter::init() {
+  if (!parent) {
+    if (!compilationState.prepareSharedDataStorage(fc)) {
+      return false;
+    }
+  }
+  return perScriptData_.init(fc);
+}
+
+bool BytecodeEmitter::init(TokenPos bodyPosition) {
+  initFromBodyPosition(bodyPosition);
+  return init();
+}
+
+template <typename T>
+T* BytecodeEmitter::findInnermostNestableControl() const {
+  return NestableControl::findNearest<T>(innermostNestableControl);
+}
+
+template <typename T, typename Predicate >
+T* BytecodeEmitter::findInnermostNestableControl(Predicate predicate) const {
+  return NestableControl::findNearest<T>(innermostNestableControl, predicate);
+}
+
+NameLocation BytecodeEmitter::lookupName(TaggedParserAtomIndex name) {
+  return innermostEmitterScope()->lookup(this, name);
+}
+
+void BytecodeEmitter::lookupPrivate(TaggedParserAtomIndex name,
+                                    NameLocation& loc,
+                                    Maybe<NameLocation>& brandLoc) {
+  innermostEmitterScope()->lookupPrivate(this, name, loc, brandLoc);
+}
+
+Maybe<NameLocation> BytecodeEmitter::locationOfNameBoundInScope(
+    TaggedParserAtomIndex name, EmitterScope* target) {
+  return innermostEmitterScope()->locationBoundInScope(name, target);
+}
+
+template <typename T>
+Maybe<NameLocation> BytecodeEmitter::locationOfNameBoundInScopeType(
+    TaggedParserAtomIndex name, EmitterScope* source) {
+  EmitterScope* aScope = source;
+  while (!aScope->scope(this).is<T>()) {
+    aScope = aScope->enclosingInFrame();
+  }
+  return source->locationBoundInScope(name, aScope);
+}
+
+bool BytecodeEmitter::markStepBreakpoint() {
+  if (skipBreakpointSrcNotes()) {
+    return true;
+  }
+
+  if (!newSrcNote(SrcNoteType::BreakpointStepSep)) {
+    return false;
+  }
+
+  bytecodeSection().updateSeparatorPosition();
+
+  return true;
+}
+
+bool BytecodeEmitter::markSimpleBreakpoint() {
+  if (skipBreakpointSrcNotes()) {
+    return true;
+  }
+
+  if (!bytecodeSection().isDuplicateLocation()) {
+    if (!newSrcNote(SrcNoteType::Breakpoint)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitCheck(JSOp op, ptrdiff_t delta,
+                                BytecodeOffset* offset) {
+  size_t oldLength = bytecodeSection().code().length();
+  *offset = BytecodeOffset(oldLength);
+
+  size_t newLength = oldLength + size_t(delta);
+  if (MOZ_UNLIKELY(newLength > MaxBytecodeLength)) {
+    ReportAllocationOverflow(fc);
+    return false;
+  }
+
+  if (!bytecodeSection().code().growByUninitialized(delta)) {
+    return false;
+  }
+
+  if (BytecodeOpHasIC(op)) {
+    static_assert(MaxBytecodeLength + 1  + ARGC_LIMIT <= UINT32_MAX,
+                  "numICEntries must not overflow");
+    bytecodeSection().incrementNumICEntries();
+  }
+
+  return true;
+}
+
+#ifdef DEBUG
+bool BytecodeEmitter::checkStrictOrSloppy(JSOp op) const {
+  if (IsCheckStrictOp(op) && !sc->strict()) {
+    return false;
+  }
+  if (IsCheckSloppyOp(op) && sc->strict()) {
+    return false;
+  }
+  return true;
+}
+#endif
+
+bool BytecodeEmitter::emit1(JSOp op) {
+  MOZ_ASSERT(checkStrictOrSloppy(op));
+  MOZ_ASSERT(GetOpLength(op) == 1);
+
+  BytecodeOffset offset;
+  if (!emitCheck(op, 1, &offset)) {
+    return false;
+  }
+
+  jsbytecode* code = bytecodeSection().code(offset);
+  code[0] = jsbytecode(op);
+  bytecodeSection().updateDepth(op, offset);
+  return true;
+}
+
+bool BytecodeEmitter::emit2(JSOp op, uint8_t op1) {
+  MOZ_ASSERT(checkStrictOrSloppy(op));
+  MOZ_ASSERT(GetOpLength(op) == 2);
+
+  BytecodeOffset offset;
+  if (!emitCheck(op, 2, &offset)) {
+    return false;
+  }
+
+  jsbytecode* code = bytecodeSection().code(offset);
+  code[0] = jsbytecode(op);
+  code[1] = jsbytecode(op1);
+  bytecodeSection().updateDepth(op, offset);
+  return true;
+}
+
+bool BytecodeEmitter::emit3(JSOp op, jsbytecode op1, jsbytecode op2) {
+  MOZ_ASSERT(checkStrictOrSloppy(op));
+  MOZ_ASSERT(GetOpLength(op) == 3);
+
+  MOZ_ASSERT(!IsArgOp(op));
+  MOZ_ASSERT(!IsLocalOp(op));
+
+  BytecodeOffset offset;
+  if (!emitCheck(op, 3, &offset)) {
+    return false;
+  }
+
+  jsbytecode* code = bytecodeSection().code(offset);
+  code[0] = jsbytecode(op);
+  code[1] = op1;
+  code[2] = op2;
+  bytecodeSection().updateDepth(op, offset);
+  return true;
+}
+
+bool BytecodeEmitter::emitN(JSOp op, size_t extra, BytecodeOffset* offset) {
+  MOZ_ASSERT(checkStrictOrSloppy(op));
+  ptrdiff_t length = 1 + ptrdiff_t(extra);
+
+  BytecodeOffset off;
+  if (!emitCheck(op, length, &off)) {
+    return false;
+  }
+
+  jsbytecode* code = bytecodeSection().code(off);
+  code[0] = jsbytecode(op);
+
+  if (CodeSpec(op).nuses >= 0) {
+    bytecodeSection().updateDepth(op, off);
+  }
+
+  if (offset) {
+    *offset = off;
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitJumpTargetOp(JSOp op, BytecodeOffset* off) {
+  MOZ_ASSERT(BytecodeIsJumpTarget(op));
+
+  uint32_t numEntries = bytecodeSection().numICEntries();
+
+  size_t n = GetOpLength(op) - 1;
+  MOZ_ASSERT(GetOpLength(op) >= 1 + ICINDEX_LEN);
+
+  if (!emitN(op, n, off)) {
+    return false;
+  }
+
+  SET_ICINDEX(bytecodeSection().code(*off), numEntries);
+  return true;
+}
+
+bool BytecodeEmitter::emitJumpTarget(JumpTarget* target) {
+  BytecodeOffset off = bytecodeSection().offset();
+
+  if (bytecodeSection().lastTargetOffset().valid() &&
+      off == bytecodeSection().lastTargetOffset() +
+                 BytecodeOffsetDiff(JSOpLength_JumpTarget)) {
+    target->offset = bytecodeSection().lastTargetOffset();
+    return true;
+  }
+
+  target->offset = off;
+  bytecodeSection().setLastTargetOffset(off);
+
+  BytecodeOffset opOff;
+  return emitJumpTargetOp(JSOp::JumpTarget, &opOff);
+}
+
+bool BytecodeEmitter::emitJumpNoFallthrough(JSOp op, JumpList* jump) {
+  BytecodeOffset offset;
+  if (!emitCheck(op, 5, &offset)) {
+    return false;
+  }
+
+  jsbytecode* code = bytecodeSection().code(offset);
+  code[0] = jsbytecode(op);
+  MOZ_ASSERT(!jump->offset.valid() ||
+             (0 <= jump->offset.value() && jump->offset < offset));
+  jump->push(bytecodeSection().code(BytecodeOffset(0)), offset);
+  bytecodeSection().updateDepth(op, offset);
+  return true;
+}
+
+bool BytecodeEmitter::emitJump(JSOp op, JumpList* jump) {
+  if (!emitJumpNoFallthrough(op, jump)) {
+    return false;
+  }
+  if (BytecodeFallsThrough(op)) {
+    JumpTarget fallthrough;
+    if (!emitJumpTarget(&fallthrough)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void BytecodeEmitter::patchJumpsToTarget(JumpList jump, JumpTarget target) {
+  MOZ_ASSERT(
+      !jump.offset.valid() ||
+      (0 <= jump.offset.value() && jump.offset <= bytecodeSection().offset()));
+  MOZ_ASSERT(0 <= target.offset.value() &&
+             target.offset <= bytecodeSection().offset());
+  MOZ_ASSERT_IF(
+      jump.offset.valid() &&
+          target.offset + BytecodeOffsetDiff(4) <= bytecodeSection().offset(),
+      BytecodeIsJumpTarget(JSOp(*bytecodeSection().code(target.offset))));
+  jump.patchAll(bytecodeSection().code(BytecodeOffset(0)), target);
+}
+
+bool BytecodeEmitter::emitJumpTargetAndPatch(JumpList jump) {
+  if (!jump.offset.valid()) {
+    return true;
+  }
+  JumpTarget target;
+  if (!emitJumpTarget(&target)) {
+    return false;
+  }
+  patchJumpsToTarget(jump, target);
+  return true;
+}
+
+bool BytecodeEmitter::emitCall(JSOp op, uint16_t argc,
+                               const Maybe<uint32_t>& sourceCoordOffset) {
+  if (sourceCoordOffset.isSome()) {
+    if (!updateSourceCoordNotes(*sourceCoordOffset)) {
+      return false;
+    }
+  }
+  return emit3(op, ARGC_LO(argc), ARGC_HI(argc));
+}
+
+bool BytecodeEmitter::emitCall(JSOp op, uint16_t argc, ParseNode* pn) {
+  return emitCall(op, argc, pn ? Some(pn->pn_pos.begin) : Nothing());
+}
+
+bool BytecodeEmitter::emitDupAt(unsigned slotFromTop, unsigned count) {
+  MOZ_ASSERT(slotFromTop < unsigned(bytecodeSection().stackDepth()));
+  MOZ_ASSERT(slotFromTop + 1 >= count);
+
+  if (slotFromTop == 0 && count == 1) {
+    return emit1(JSOp::Dup);
+  }
+
+  if (slotFromTop == 1 && count == 2) {
+    return emit1(JSOp::Dup2);
+  }
+
+  if (slotFromTop >= Bit(24)) {
+    reportError(nullptr, JSMSG_TOO_MANY_LOCALS);
+    return false;
+  }
+
+  for (unsigned i = 0; i < count; i++) {
+    BytecodeOffset off;
+    if (!emitN(JSOp::DupAt, 3, &off)) {
+      return false;
+    }
+
+    jsbytecode* pc = bytecodeSection().code(off);
+    SET_UINT24(pc, slotFromTop);
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitPopN(unsigned n) {
+  MOZ_ASSERT(n != 0);
+
+  if (n == 1) {
+    return emit1(JSOp::Pop);
+  }
+
+  if (n == 2) {
+    return emit1(JSOp::Pop) && emit1(JSOp::Pop);
+  }
+
+  return emitUint16Operand(JSOp::PopN, n);
+}
+
+bool BytecodeEmitter::emitPickN(uint8_t n) {
+  MOZ_ASSERT(n != 0);
+
+  if (n == 1) {
+    return emit1(JSOp::Swap);
+  }
+
+  return emit2(JSOp::Pick, n);
+}
+
+bool BytecodeEmitter::emitUnpickN(uint8_t n) {
+  MOZ_ASSERT(n != 0);
+
+  if (n == 1) {
+    return emit1(JSOp::Swap);
+  }
+
+  return emit2(JSOp::Unpick, n);
+}
+
+bool BytecodeEmitter::emitCheckIsObj(CheckIsObjectKind kind) {
+  return emit2(JSOp::CheckIsObj, uint8_t(kind));
+}
+
+bool BytecodeEmitter::emitBuiltinObject(BuiltinObjectKind kind) {
+  return emit2(JSOp::BuiltinObject, uint8_t(kind));
+}
+
+bool BytecodeEmitter::updateLineNumberNotes(uint32_t offset) {
+  if (skipLocationSrcNotes()) {
+    return true;
+  }
+
+  const ErrorReporter& er = errorReporter();
+  std::optional<bool> onThisLineStatus =
+      er.isOnThisLine(offset, bytecodeSection().currentLine());
+  if (!onThisLineStatus.has_value()) {
+    er.errorNoOffset(JSMSG_OUT_OF_MEMORY);
+    return false;
+  }
+
+  bool onThisLine = *onThisLineStatus;
+
+  if (!onThisLine) {
+    unsigned line = er.lineAt(offset);
+    unsigned delta = line - bytecodeSection().currentLine();
+
+    unsigned initialLine = sc->extent().lineno;
+    MOZ_ASSERT(line >= initialLine);
+
+    bytecodeSection().setCurrentLine(line, offset);
+    if (delta >= SrcNote::SetLine::lengthFor(line, initialLine)) {
+      if (!newSrcNote2(SrcNoteType::SetLine,
+                       SrcNote::SetLine::toOperand(line, initialLine))) {
+        return false;
+      }
+    } else {
+      do {
+        if (!newSrcNote(SrcNoteType::NewLine)) {
+          return false;
+        }
+      } while (--delta != 0);
+    }
+
+    bytecodeSection().updateSeparatorPositionIfPresent();
+  }
+  return true;
+}
+
+bool BytecodeEmitter::updateSourceCoordNotes(uint32_t offset) {
+  if (skipLocationSrcNotes()) {
+    return true;
+  }
+
+  if (!updateLineNumberNotes(offset)) {
+    return false;
+  }
+
+  JS::LimitedColumnNumberOneOrigin columnIndex =
+      errorReporter().columnAt(offset);
+
+  static_assert((0 - ptrdiff_t(JS::LimitedColumnNumberOneOrigin::Limit)) >=
+                SrcNote::ColSpan::MinColSpan);
+  static_assert((ptrdiff_t(JS::LimitedColumnNumberOneOrigin::Limit) - 0) <=
+                SrcNote::ColSpan::MaxColSpan);
+
+  JS::ColumnNumberOffset colspan = columnIndex - bytecodeSection().lastColumn();
+
+  if (colspan != JS::ColumnNumberOffset::zero()) {
+    if (lastLineOnlySrcNoteIndex != LastSrcNoteIsNotLineOnly) {
+      MOZ_ASSERT(bytecodeSection().lastColumn() ==
+                 JS::LimitedColumnNumberOneOrigin());
+
+      const SrcNotesVector& notes = bytecodeSection().notes();
+      SrcNoteType type = notes[lastLineOnlySrcNoteIndex].type();
+      if (type == SrcNoteType::NewLine) {
+        if (!convertLastNewLineToNewLineColumn(columnIndex)) {
+          return false;
+        }
+      } else {
+        MOZ_ASSERT(type == SrcNoteType::SetLine);
+        if (!convertLastSetLineToSetLineColumn(columnIndex)) {
+          return false;
+        }
+      }
+    } else {
+      if (!newSrcNote2(SrcNoteType::ColSpan,
+                       SrcNote::ColSpan::toOperand(colspan))) {
+        return false;
+      }
+    }
+    bytecodeSection().setLastColumn(columnIndex, offset);
+    bytecodeSection().updateSeparatorPositionIfPresent();
+  }
+  return true;
+}
+
+bool BytecodeEmitter::updateSourceCoordNotesIfNonLiteral(ParseNode* node) {
+  if (node->isLiteral()) {
+    return true;
+  }
+  return updateSourceCoordNotes(node->pn_pos.begin);
+}
+
+uint32_t BytecodeEmitter::getOffsetForLoop(ParseNode* nextpn) const {
+  if (nextpn->is<LexicalScopeNode>()) {
+    nextpn = nextpn->as<LexicalScopeNode>().scopeBody();
+  }
+  if (nextpn->isKind(ParseNodeKind::StatementList)) {
+    if (ParseNode* firstStatement = nextpn->as<ListNode>().head()) {
+      nextpn = firstStatement;
+    }
+  }
+
+  return nextpn->pn_pos.begin;
+}
+
+bool BytecodeEmitter::emitUint16Operand(JSOp op, uint32_t operand) {
+  MOZ_ASSERT(operand <= UINT16_MAX);
+  if (!emit3(op, UINT16_LO(operand), UINT16_HI(operand))) {
+    return false;
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitUint32Operand(JSOp op, uint32_t operand) {
+  BytecodeOffset off;
+  if (!emitN(op, 4, &off)) {
+    return false;
+  }
+  SET_UINT32(bytecodeSection().code(off), operand);
+  return true;
+}
+
+bool BytecodeEmitter::emitGoto(NestableControl* target, GotoKind kind) {
+  NonLocalExitControl nle(this, kind == GotoKind::Continue
+                                    ? NonLocalExitKind::Continue
+                                    : NonLocalExitKind::Break);
+  return nle.emitNonLocalJump(target);
+}
+
+AbstractScopePtr BytecodeEmitter::innermostScope() const {
+  return innermostEmitterScope()->scope(this);
+}
+
+ScopeIndex BytecodeEmitter::innermostScopeIndex() const {
+  return *innermostEmitterScope()->scopeIndex(this);
+}
+
+bool BytecodeEmitter::emitGCIndexOp(JSOp op, GCThingIndex index) {
+  MOZ_ASSERT(checkStrictOrSloppy(op));
+
+  constexpr size_t OpLength = 1 + GCTHING_INDEX_LEN;
+  MOZ_ASSERT(GetOpLength(op) == OpLength);
+
+  BytecodeOffset offset;
+  if (!emitCheck(op, OpLength, &offset)) {
+    return false;
+  }
+
+  jsbytecode* code = bytecodeSection().code(offset);
+  code[0] = jsbytecode(op);
+  SET_GCTHING_INDEX(code, index);
+  bytecodeSection().updateDepth(op, offset);
+  return true;
+}
+
+bool BytecodeEmitter::emitAtomOp(JSOp op, TaggedParserAtomIndex atom) {
+  MOZ_ASSERT(atom);
+
+  MOZ_ASSERT_IF(op == JSOp::GetName || op == JSOp::GetGName,
+                atom != TaggedParserAtomIndex::WellKnown::dot_generator_());
+
+  GCThingIndex index;
+  if (!makeAtomIndex(atom, ParserAtom::Atomize::Yes, &index)) {
+    return false;
+  }
+
+  return emitAtomOp(op, index);
+}
+
+bool BytecodeEmitter::emitAtomOp(JSOp op, GCThingIndex atomIndex) {
+  MOZ_ASSERT(JOF_OPTYPE(op) == JOF_ATOM);
+#ifdef DEBUG
+  auto atom = perScriptData().gcThingList().getAtom(atomIndex);
+  MOZ_ASSERT(compilationState.parserAtoms.isInstantiatedAsJSAtom(atom));
+#endif
+  return emitGCIndexOp(op, atomIndex);
+}
+
+bool BytecodeEmitter::emitStringOp(JSOp op, TaggedParserAtomIndex atom) {
+  MOZ_ASSERT(atom);
+  GCThingIndex index;
+  if (!makeAtomIndex(atom, ParserAtom::Atomize::No, &index)) {
+    return false;
+  }
+
+  return emitStringOp(op, index);
+}
+
+bool BytecodeEmitter::emitStringOp(JSOp op, GCThingIndex atomIndex) {
+  MOZ_ASSERT(JOF_OPTYPE(op) == JOF_STRING);
+  return emitGCIndexOp(op, atomIndex);
+}
+
+bool BytecodeEmitter::emitInternedScopeOp(GCThingIndex index, JSOp op) {
+  MOZ_ASSERT(JOF_OPTYPE(op) == JOF_SCOPE);
+  MOZ_ASSERT(index < perScriptData().gcThingList().length());
+  return emitGCIndexOp(op, index);
+}
+
+bool BytecodeEmitter::emitInternedObjectOp(GCThingIndex index, JSOp op) {
+  MOZ_ASSERT(JOF_OPTYPE(op) == JOF_OBJECT);
+  MOZ_ASSERT(index < perScriptData().gcThingList().length());
+  return emitGCIndexOp(op, index);
+}
+
+bool BytecodeEmitter::emitRegExp(GCThingIndex index) {
+  return emitGCIndexOp(JSOp::RegExp, index);
+}
+
+bool BytecodeEmitter::emitLocalOp(JSOp op, uint32_t slot) {
+  MOZ_ASSERT(JOF_OPTYPE(op) != JOF_ENVCOORD);
+  MOZ_ASSERT(IsLocalOp(op));
+
+  BytecodeOffset off;
+  if (!emitN(op, LOCALNO_LEN, &off)) {
+    return false;
+  }
+
+  SET_LOCALNO(bytecodeSection().code(off), slot);
+  return true;
+}
+
+bool BytecodeEmitter::emitArgOp(JSOp op, uint16_t slot) {
+  MOZ_ASSERT(IsArgOp(op));
+  BytecodeOffset off;
+  if (!emitN(op, ARGNO_LEN, &off)) {
+    return false;
+  }
+
+  SET_ARGNO(bytecodeSection().code(off), slot);
+  return true;
+}
+
+bool BytecodeEmitter::emitEnvCoordOp(JSOp op, EnvironmentCoordinate ec) {
+  MOZ_ASSERT(JOF_OPTYPE(op) == JOF_ENVCOORD ||
+             JOF_OPTYPE(op) == JOF_DEBUGCOORD);
+
+  constexpr size_t N = ENVCOORD_HOPS_LEN + ENVCOORD_SLOT_LEN;
+  MOZ_ASSERT(GetOpLength(op) == 1 + N);
+
+  BytecodeOffset off;
+  if (!emitN(op, N, &off)) {
+    return false;
+  }
+
+  jsbytecode* pc = bytecodeSection().code(off);
+  SET_ENVCOORD_HOPS(pc, ec.hops());
+  pc += ENVCOORD_HOPS_LEN;
+  SET_ENVCOORD_SLOT(pc, ec.slot());
+  pc += ENVCOORD_SLOT_LEN;
+  return true;
+}
+
+bool BytecodeEmitter::checkSideEffects(ParseNode* pn, bool* answer) const {
+  AutoCheckRecursionLimit recursion(fc);
+  if (!recursion.check(fc)) {
+    return false;
+  }
+
+restart:
+
+  switch (pn->getKind()) {
+    case ParseNodeKind::EmptyStmt:
+    case ParseNodeKind::TrueExpr:
+    case ParseNodeKind::FalseExpr:
+    case ParseNodeKind::NullExpr:
+    case ParseNodeKind::RawUndefinedExpr:
+    case ParseNodeKind::Elision:
+    case ParseNodeKind::Generator:
+      MOZ_ASSERT(pn->is<NullaryNode>());
+      *answer = false;
+      return true;
+
+    case ParseNodeKind::ObjectPropertyName:
+    case ParseNodeKind::PrivateName:  
+    case ParseNodeKind::StringExpr:
+    case ParseNodeKind::TemplateStringExpr:
+      MOZ_ASSERT(pn->is<NameNode>());
+      *answer = false;
+      return true;
+
+    case ParseNodeKind::RegExpExpr:
+      MOZ_ASSERT(pn->is<RegExpLiteral>());
+      *answer = false;
+      return true;
+
+    case ParseNodeKind::NumberExpr:
+      MOZ_ASSERT(pn->is<NumericLiteral>());
+      *answer = false;
+      return true;
+
+    case ParseNodeKind::BigIntExpr:
+      MOZ_ASSERT(pn->is<BigIntLiteral>());
+      *answer = false;
+      return true;
+
+    case ParseNodeKind::ThisExpr:
+      MOZ_ASSERT(pn->is<UnaryNode>());
+      *answer = sc->needsThisTDZChecks();
+      return true;
+
+    case ParseNodeKind::NewTargetExpr: {
+      MOZ_ASSERT(pn->is<NewTargetNode>());
+      *answer = false;
+      return true;
+    }
+
+    case ParseNodeKind::ImportMetaExpr: {
+      MOZ_ASSERT(pn->as<BinaryNode>().left()->isKind(ParseNodeKind::PosHolder));
+      MOZ_ASSERT(
+          pn->as<BinaryNode>().right()->isKind(ParseNodeKind::PosHolder));
+      *answer = false;
+      return true;
+    }
+
+    case ParseNodeKind::BreakStmt:
+      MOZ_ASSERT(pn->is<BreakStatement>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::ContinueStmt:
+      MOZ_ASSERT(pn->is<ContinueStatement>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::DebuggerStmt:
+      MOZ_ASSERT(pn->is<DebuggerStatement>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::OptionalDotExpr:
+    case ParseNodeKind::DotExpr:
+    case ParseNodeKind::ArgumentsLength:
+      MOZ_ASSERT(pn->is<BinaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::TypeOfExpr:
+    case ParseNodeKind::VoidExpr:
+    case ParseNodeKind::NotExpr:
+      return checkSideEffects(pn->as<UnaryNode>().kid(), answer);
+
+    case ParseNodeKind::ComputedName:
+      MOZ_ASSERT(pn->is<UnaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::TypeOfNameExpr:
+      MOZ_ASSERT(pn->is<UnaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::MutateProto:
+      return checkSideEffects(pn->as<UnaryNode>().kid(), answer);
+
+    case ParseNodeKind::PreIncrementExpr:
+    case ParseNodeKind::PostIncrementExpr:
+    case ParseNodeKind::PreDecrementExpr:
+    case ParseNodeKind::PostDecrementExpr:
+    case ParseNodeKind::ThrowStmt:
+      MOZ_ASSERT(pn->is<UnaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::BitNotExpr:
+    case ParseNodeKind::PosExpr:
+    case ParseNodeKind::NegExpr:
+      MOZ_ASSERT(pn->is<UnaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::Spread:
+      MOZ_ASSERT(pn->is<UnaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::InitialYield:
+    case ParseNodeKind::YieldStarExpr:
+    case ParseNodeKind::YieldExpr:
+    case ParseNodeKind::AwaitExpr:
+      MOZ_ASSERT(pn->is<UnaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::DeleteNameExpr:
+    case ParseNodeKind::DeletePropExpr:
+    case ParseNodeKind::DeleteElemExpr:
+    case ParseNodeKind::DeleteOptionalChainExpr:
+      MOZ_ASSERT(pn->is<UnaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::DeleteExpr: {
+      ParseNode* expr = pn->as<UnaryNode>().kid();
+      return checkSideEffects(expr, answer);
+    }
+
+    case ParseNodeKind::ExpressionStmt:
+      return checkSideEffects(pn->as<UnaryNode>().kid(), answer);
+
+    case ParseNodeKind::InitExpr:
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::AssignExpr:
+    case ParseNodeKind::AddAssignExpr:
+    case ParseNodeKind::SubAssignExpr:
+    case ParseNodeKind::CoalesceAssignExpr:
+    case ParseNodeKind::OrAssignExpr:
+    case ParseNodeKind::AndAssignExpr:
+    case ParseNodeKind::BitOrAssignExpr:
+    case ParseNodeKind::BitXorAssignExpr:
+    case ParseNodeKind::BitAndAssignExpr:
+    case ParseNodeKind::LshAssignExpr:
+    case ParseNodeKind::RshAssignExpr:
+    case ParseNodeKind::UrshAssignExpr:
+    case ParseNodeKind::MulAssignExpr:
+    case ParseNodeKind::DivAssignExpr:
+    case ParseNodeKind::ModAssignExpr:
+    case ParseNodeKind::PowAssignExpr:
+      MOZ_ASSERT(pn->is<AssignmentNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::SetThis:
+      MOZ_ASSERT(pn->is<BinaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::StatementList:
+    case ParseNodeKind::CoalesceExpr:
+    case ParseNodeKind::OrExpr:
+    case ParseNodeKind::AndExpr:
+    case ParseNodeKind::StrictEqExpr:
+    case ParseNodeKind::StrictNeExpr:
+    case ParseNodeKind::CommaExpr:
+      MOZ_ASSERT(!pn->as<ListNode>().empty());
+      [[fallthrough]];
+    case ParseNodeKind::ArrayExpr:
+    case ParseNodeKind::ObjectExpr:
+      for (ParseNode* item : pn->as<ListNode>().contents()) {
+        if (!checkSideEffects(item, answer)) {
+          return false;
+        }
+        if (*answer) {
+          return true;
+        }
+      }
+      return true;
+
+#ifdef ENABLE_DECORATORS
+    case ParseNodeKind::DecoratorList:
+      MOZ_CRASH("Decorators are not supported yet");
+#endif
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+    case ParseNodeKind::UsingDecl:
+    case ParseNodeKind::AwaitUsingDecl:
+      MOZ_CRASH("Using declarations are not supported yet");
+#endif
+
+    case ParseNodeKind::BitOrExpr:
+    case ParseNodeKind::BitXorExpr:
+    case ParseNodeKind::BitAndExpr:
+    case ParseNodeKind::EqExpr:
+    case ParseNodeKind::NeExpr:
+    case ParseNodeKind::LtExpr:
+    case ParseNodeKind::LeExpr:
+    case ParseNodeKind::GtExpr:
+    case ParseNodeKind::GeExpr:
+    case ParseNodeKind::InstanceOfExpr:
+    case ParseNodeKind::InExpr:
+    case ParseNodeKind::PrivateInExpr:
+    case ParseNodeKind::LshExpr:
+    case ParseNodeKind::RshExpr:
+    case ParseNodeKind::UrshExpr:
+    case ParseNodeKind::AddExpr:
+    case ParseNodeKind::SubExpr:
+    case ParseNodeKind::MulExpr:
+    case ParseNodeKind::DivExpr:
+    case ParseNodeKind::ModExpr:
+    case ParseNodeKind::PowExpr:
+      MOZ_ASSERT(pn->as<ListNode>().count() >= 2);
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::PropertyDefinition:
+    case ParseNodeKind::Case: {
+      BinaryNode* node = &pn->as<BinaryNode>();
+      if (!checkSideEffects(node->left(), answer)) {
+        return false;
+      }
+      if (*answer) {
+        return true;
+      }
+      return checkSideEffects(node->right(), answer);
+    }
+
+    case ParseNodeKind::ElemExpr:
+    case ParseNodeKind::OptionalElemExpr:
+      MOZ_ASSERT(pn->is<BinaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::PrivateMemberExpr:
+    case ParseNodeKind::OptionalPrivateMemberExpr:
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::ImportDecl:
+    case ParseNodeKind::ExportFromStmt:
+    case ParseNodeKind::ExportDefaultStmt:
+      MOZ_ASSERT(pn->is<BinaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::ExportStmt:
+      MOZ_ASSERT(pn->is<UnaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::CallImportExpr:
+    case ParseNodeKind::CallImportSpec:
+      MOZ_ASSERT(pn->is<BinaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::DoWhileStmt:
+    case ParseNodeKind::WhileStmt:
+    case ParseNodeKind::ForStmt:
+      MOZ_ASSERT(pn->is<BinaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::VarStmt:
+    case ParseNodeKind::ConstDecl:
+    case ParseNodeKind::LetDecl:
+      MOZ_ASSERT(pn->is<ListNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::IfStmt:
+    case ParseNodeKind::ConditionalExpr: {
+      TernaryNode* node = &pn->as<TernaryNode>();
+      if (!checkSideEffects(node->kid1(), answer)) {
+        return false;
+      }
+      if (*answer) {
+        return true;
+      }
+      if (!checkSideEffects(node->kid2(), answer)) {
+        return false;
+      }
+      if (*answer) {
+        return true;
+      }
+      if ((pn = node->kid3())) {
+        goto restart;
+      }
+      return true;
+    }
+
+    case ParseNodeKind::NewExpr:
+    case ParseNodeKind::CallExpr:
+    case ParseNodeKind::OptionalCallExpr:
+    case ParseNodeKind::TaggedTemplateExpr:
+    case ParseNodeKind::SuperCallExpr:
+      MOZ_ASSERT(pn->is<BinaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::Arguments:
+      MOZ_ASSERT(pn->is<ListNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::OptionalChain:
+      MOZ_ASSERT(pn->is<UnaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::ClassDecl:
+      MOZ_ASSERT(pn->is<ClassNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::WithStmt:
+      MOZ_ASSERT(pn->is<BinaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::ReturnStmt:
+      MOZ_ASSERT(pn->is<BinaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::Name:
+      MOZ_ASSERT(pn->is<NameNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::Shorthand:
+      MOZ_ASSERT(pn->is<BinaryNode>());
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::Function:
+      MOZ_ASSERT(pn->is<FunctionNode>());
+      *answer = false;
+      return true;
+
+    case ParseNodeKind::Module:
+      *answer = false;
+      return true;
+
+    case ParseNodeKind::TryStmt: {
+      TryNode* tryNode = &pn->as<TryNode>();
+      if (!checkSideEffects(tryNode->body(), answer)) {
+        return false;
+      }
+      if (*answer) {
+        return true;
+      }
+      if (LexicalScopeNode* catchScope = tryNode->catchScope()) {
+        if (!checkSideEffects(catchScope, answer)) {
+          return false;
+        }
+        if (*answer) {
+          return true;
+        }
+      }
+      if (ParseNode* finallyBlock = tryNode->finallyBlock()) {
+        if (!checkSideEffects(finallyBlock, answer)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    case ParseNodeKind::Catch: {
+      BinaryNode* catchClause = &pn->as<BinaryNode>();
+      if (ParseNode* name = catchClause->left()) {
+        if (!checkSideEffects(name, answer)) {
+          return false;
+        }
+        if (*answer) {
+          return true;
+        }
+      }
+      return checkSideEffects(catchClause->right(), answer);
+    }
+
+    case ParseNodeKind::SwitchStmt: {
+      SwitchStatement* switchStmt = &pn->as<SwitchStatement>();
+      if (!checkSideEffects(&switchStmt->discriminant(), answer)) {
+        return false;
+      }
+      return *answer ||
+             checkSideEffects(&switchStmt->lexicalForCaseList(), answer);
+    }
+
+    case ParseNodeKind::LabelStmt:
+      return checkSideEffects(pn->as<LabeledStatement>().statement(), answer);
+
+    case ParseNodeKind::LexicalScope:
+      return checkSideEffects(pn->as<LexicalScopeNode>().scopeBody(), answer);
+
+    case ParseNodeKind::TemplateStringListExpr: {
+      ListNode* list = &pn->as<ListNode>();
+      MOZ_ASSERT(!list->empty());
+      MOZ_ASSERT((list->count() % 2) == 1,
+                 "template strings must alternate template and substitution "
+                 "parts");
+      *answer = list->count() > 1;
+      return true;
+    }
+
+    case ParseNodeKind::ParamsBody:
+      *answer = true;
+      return true;
+
+    case ParseNodeKind::ForIn:                
+    case ParseNodeKind::ForOf:                
+    case ParseNodeKind::ForHead:              
+    case ParseNodeKind::DefaultConstructor:   
+    case ParseNodeKind::ClassBodyScope:       
+    case ParseNodeKind::ClassMethod:          
+    case ParseNodeKind::ClassField:           
+    case ParseNodeKind::ClassNames:           
+    case ParseNodeKind::StaticClassBlock:     
+    case ParseNodeKind::ClassMemberList:      
+    case ParseNodeKind::ImportSpecList:       
+    case ParseNodeKind::ImportSpec:           
+    case ParseNodeKind::ImportNamespaceSpec:  
+    case ParseNodeKind::ImportAttribute:      
+    case ParseNodeKind::ImportAttributeList:  
+    case ParseNodeKind::ImportModuleRequest:  
+    case ParseNodeKind::ExportBatchSpecStmt:  
+    case ParseNodeKind::ExportSpecList:       
+    case ParseNodeKind::ExportSpec:           
+    case ParseNodeKind::ExportNamespaceSpec:  
+    case ParseNodeKind::CallSiteObj:       
+    case ParseNodeKind::PosHolder:         
+    case ParseNodeKind::SuperBase:         
+    case ParseNodeKind::PropertyNameExpr:  
+      MOZ_CRASH("handled by parent nodes");
+
+    case ParseNodeKind::LastUnused:
+    case ParseNodeKind::Limit:
+      MOZ_CRASH("invalid node kind");
+  }
+
+  MOZ_CRASH(
+      "invalid, unenumerated ParseNodeKind value encountered in "
+      "BytecodeEmitter::checkSideEffects");
+}
+
+bool BytecodeEmitter::isInLoop() const {
+  return findInnermostNestableControl<LoopControl>();
+}
+
+bool BytecodeEmitter::checkSingletonContext() const {
+  MOZ_ASSERT_IF(sc->treatAsRunOnce(), sc->isTopLevelContext());
+  return sc->treatAsRunOnce() && !isInLoop();
+}
+
+bool BytecodeEmitter::needsImplicitThis() const {
+  if (sc->inWith()) {
+    return true;
+  }
+
+  for (EmitterScope* es = innermostEmitterScope(); es;
+       es = es->enclosingInFrame()) {
+    if (es->scope(this).kind() == ScopeKind::With) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+size_t BytecodeEmitter::countThisEnvironmentHops() const {
+  unsigned numHops = 0;
+
+  for (const auto* current = this; current; current = current->parent) {
+    for (EmitterScope* es = current->innermostEmitterScope(); es;
+         es = es->enclosingInFrame()) {
+      if (es->scope(current).is<FunctionScope>()) {
+        if (!es->scope(current).isArrow()) {
+          MOZ_ASSERT(es->scope(current).hasEnvironment());
+          return numHops;
+        }
+      }
+      if (es->scope(current).hasEnvironment()) {
+        numHops++;
+      }
+    }
+  }
+
+  MOZ_ASSERT(sc->allowSuperProperty());
+  numHops += compilationState.scopeContext.enclosingThisEnvironmentHops;
+  return numHops;
+}
+
+bool BytecodeEmitter::emitThisEnvironmentCallee() {
+
+  if (sc->isFunctionBox() && !sc->asFunctionBox()->isArrow()) {
+    return emit1(JSOp::Callee);
+  }
+
+  size_t numHops = countThisEnvironmentHops();
+
+  static_assert(
+      ENVCOORD_HOPS_LIMIT - 1 <= UINT16_MAX,
+      "JSOp::EnvCallee operand size should match ENVCOORD_HOPS_LIMIT");
+
+  MOZ_ASSERT(numHops < ENVCOORD_HOPS_LIMIT - 1);
+
+  return emitUint16Operand(JSOp::EnvCallee, numHops);
+}
+
+bool BytecodeEmitter::emitSuperBase() {
+  if (!emitThisEnvironmentCallee()) {
+    return false;
+  }
+
+  return emit1(JSOp::SuperBase);
+}
+
+void BytecodeEmitter::reportError(ParseNode* pn, unsigned errorNumber,
+                                  ...) const {
+  uint32_t offset = pn ? pn->pn_pos.begin : *scriptStartOffset;
+
+  va_list args;
+  va_start(args, errorNumber);
+
+  errorReporter().errorWithNotesAtVA(nullptr, AsVariant(offset), errorNumber,
+                                     &args);
+
+  va_end(args);
+}
+
+void BytecodeEmitter::reportError(uint32_t offset, unsigned errorNumber,
+                                  ...) const {
+  va_list args;
+  va_start(args, errorNumber);
+
+  errorReporter().errorWithNotesAtVA(nullptr, AsVariant(offset), errorNumber,
+                                     &args);
+
+  va_end(args);
+}
+
+bool BytecodeEmitter::addObjLiteralData(ObjLiteralWriter& writer,
+                                        GCThingIndex* outIndex) {
+  if (!writer.checkForDuplicatedNames(fc)) {
+    return false;
+  }
+
+  size_t len = writer.getCode().size();
+  auto* code = compilationState.alloc.newArrayUninitialized<uint8_t>(len);
+  if (!code) {
+    js::ReportOutOfMemory(fc);
+    return false;
+  }
+  memcpy(code, writer.getCode().data(), len);
+
+  ObjLiteralIndex objIndex(compilationState.objLiteralData.length());
+  if (uint32_t(objIndex) >= TaggedScriptThingIndex::IndexLimit) {
+    ReportAllocationOverflow(fc);
+    return false;
+  }
+  if (!compilationState.objLiteralData.emplaceBack(code, len, writer.getKind(),
+                                                   writer.getFlags(),
+                                                   writer.getPropertyCount())) {
+    js::ReportOutOfMemory(fc);
+    return false;
+  }
+
+  return perScriptData().gcThingList().append(objIndex, outIndex);
+}
+
+bool BytecodeEmitter::emitPrepareIteratorResult() {
+  constexpr JSOp op = JSOp::NewObject;
+
+  ObjLiteralWriter writer;
+  writer.beginShape(op);
+
+  writer.setPropNameNoDuplicateCheck(parserAtoms(),
+                                     TaggedParserAtomIndex::WellKnown::value());
+  if (!writer.propWithUndefinedValue(fc)) {
+    return false;
+  }
+  writer.setPropNameNoDuplicateCheck(parserAtoms(),
+                                     TaggedParserAtomIndex::WellKnown::done());
+  if (!writer.propWithUndefinedValue(fc)) {
+    return false;
+  }
+
+  GCThingIndex shape;
+  if (!addObjLiteralData(writer, &shape)) {
+    return false;
+  }
+
+  return emitGCIndexOp(op, shape);
+}
+
+bool BytecodeEmitter::emitFinishIteratorResult(bool done) {
+  if (!emitAtomOp(JSOp::InitProp, TaggedParserAtomIndex::WellKnown::value())) {
+    return false;
+  }
+  if (!emit1(done ? JSOp::True : JSOp::False)) {
+    return false;
+  }
+  if (!emitAtomOp(JSOp::InitProp, TaggedParserAtomIndex::WellKnown::done())) {
+    return false;
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitGetNameAtLocation(TaggedParserAtomIndex name,
+                                            const NameLocation& loc) {
+  NameOpEmitter noe(this, name, loc, NameOpEmitter::Kind::Get);
+  if (!noe.emitGet()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitGetName(NameNode* name) {
+  MOZ_ASSERT(name->isKind(ParseNodeKind::Name));
+
+  return emitGetName(name->name());
+}
+
+bool BytecodeEmitter::emitGetPrivateName(NameNode* name) {
+  MOZ_ASSERT(name->isKind(ParseNodeKind::PrivateName));
+  return emitGetPrivateName(name->name());
+}
+
+bool BytecodeEmitter::emitGetPrivateName(TaggedParserAtomIndex nameAtom) {
+  NameLocation location = lookupName(nameAtom);
+  MOZ_ASSERT(location.kind() == NameLocation::Kind::FrameSlot ||
+             location.kind() == NameLocation::Kind::EnvironmentCoordinate ||
+             location.kind() == NameLocation::Kind::Dynamic ||
+             location.kind() == NameLocation::Kind::Global);
+
+  return emitGetNameAtLocation(nameAtom, location);
+}
+
+bool BytecodeEmitter::emitTDZCheckIfNeeded(TaggedParserAtomIndex name,
+                                           const NameLocation& loc,
+                                           ValueIsOnStack isOnStack) {
+  MOZ_ASSERT(loc.hasKnownSlot());
+  MOZ_ASSERT(loc.isLexical() || loc.isPrivateMethod() || loc.isSynthetic());
+
+  if (parserAtoms().isPrivateName(name)) {
+    return true;
+  }
+
+  Maybe<MaybeCheckTDZ> check =
+      innermostTDZCheckCache->needsTDZCheck(this, name);
+  if (!check) {
+    return false;
+  }
+
+  if (*check == DontCheckTDZ) {
+    return true;
+  }
+
+  if (isOnStack == ValueIsOnStack::No) {
+    if (loc.kind() == NameLocation::Kind::FrameSlot) {
+      if (!emitLocalOp(JSOp::GetLocal, loc.frameSlot())) {
+        return false;
+      }
+    } else {
+      if (!emitEnvCoordOp(JSOp::GetAliasedVar, loc.environmentCoordinate())) {
+        return false;
+      }
+    }
+  }
+
+  if (loc.kind() == NameLocation::Kind::FrameSlot) {
+    if (!emitLocalOp(JSOp::CheckLexical, loc.frameSlot())) {
+      return false;
+    }
+  } else {
+    if (!emitEnvCoordOp(JSOp::CheckAliasedLexical,
+                        loc.environmentCoordinate())) {
+      return false;
+    }
+  }
+
+  if (isOnStack == ValueIsOnStack::No) {
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+  return innermostTDZCheckCache->noteTDZCheck(this, name, DontCheckTDZ);
+}
+
+bool BytecodeEmitter::emitPropLHS(PropertyAccess* prop) {
+  MOZ_ASSERT(!prop->isSuper());
+
+  ParseNode* expr = &prop->expression();
+
+  if (!expr->is<PropertyAccess>() || expr->as<PropertyAccess>().isSuper()) {
+    return emitTree(expr);
+  }
+
+  PropertyAccess* pndot = &expr->as<PropertyAccess>();
+  ParseNode* pnup = nullptr;
+  ParseNode* pndown;
+  for (;;) {
+    pndown = &pndot->expression();
+    pndot->setExpression(pnup);
+    if (!pndown->is<PropertyAccess>() ||
+        pndown->as<PropertyAccess>().isSuper()) {
+      break;
+    }
+    pnup = pndot;
+    pndot = &pndown->as<PropertyAccess>();
+  }
+
+  if (!emitTree(pndown)) {
+    return false;
+  }
+
+  while (true) {
+    if (!emitAtomOp(JSOp::GetProp, pndot->key().atom())) {
+      return false;
+    }
+
+    pnup = pndot->maybeExpression();
+    pndot->setExpression(pndown);
+    pndown = pndot;
+    if (!pnup) {
+      break;
+    }
+    pndot = &pnup->as<PropertyAccess>();
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitArgumentsLength() {
+  if (sc->isFunctionBox() &&
+      sc->asFunctionBox()->isEligibleForArgumentsLength() &&
+      !sc->asFunctionBox()->needsArgsObj()) {
+    return emit1(JSOp::ArgumentsLength);
+  }
+
+  PropOpEmitter poe(this, PropOpEmitter::Kind::Get,
+                    PropOpEmitter::ObjKind::Other);
+  if (!poe.prepareForObj()) {
+    return false;
+  }
+
+  NameOpEmitter noe(this, TaggedParserAtomIndex::WellKnown::arguments(),
+                    NameOpEmitter::Kind::Get);
+  if (!noe.emitGet()) {
+    return false;
+  }
+  return poe.emitGet(TaggedParserAtomIndex::WellKnown::length());
+}
+
+bool BytecodeEmitter::emitPropIncDec(UnaryNode* incDec, ValueUsage valueUsage) {
+  PropertyAccess* prop = &incDec->kid()->as<PropertyAccess>();
+  bool isSuper = prop->isSuper();
+  ParseNodeKind kind = incDec->getKind();
+  PropOpEmitter poe(
+      this,
+      kind == ParseNodeKind::PostIncrementExpr
+          ? PropOpEmitter::Kind::PostIncrement
+      : kind == ParseNodeKind::PreIncrementExpr
+          ? PropOpEmitter::Kind::PreIncrement
+      : kind == ParseNodeKind::PostDecrementExpr
+          ? PropOpEmitter::Kind::PostDecrement
+          : PropOpEmitter::Kind::PreDecrement,
+      isSuper ? PropOpEmitter::ObjKind::Super : PropOpEmitter::ObjKind::Other);
+  if (!poe.prepareForObj()) {
+    return false;
+  }
+  if (isSuper) {
+    UnaryNode* base = &prop->expression().as<UnaryNode>();
+    if (!emitGetThisForSuperBase(base)) {
+      return false;
+    }
+  } else {
+    if (!emitPropLHS(prop)) {
+      return false;
+    }
+  }
+  if (!poe.emitIncDec(prop->key().atom(), valueUsage)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitNameIncDec(UnaryNode* incDec, ValueUsage valueUsage) {
+  MOZ_ASSERT(incDec->kid()->isKind(ParseNodeKind::Name));
+
+  ParseNodeKind kind = incDec->getKind();
+  NameNode* name = &incDec->kid()->as<NameNode>();
+  NameOpEmitter noe(this, name->atom(),
+                    kind == ParseNodeKind::PostIncrementExpr
+                        ? NameOpEmitter::Kind::PostIncrement
+                    : kind == ParseNodeKind::PreIncrementExpr
+                        ? NameOpEmitter::Kind::PreIncrement
+                    : kind == ParseNodeKind::PostDecrementExpr
+                        ? NameOpEmitter::Kind::PostDecrement
+                        : NameOpEmitter::Kind::PreDecrement);
+  if (!noe.emitIncDec(valueUsage)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitElemObjAndKey(PropertyByValue* elem,
+                                        ElemOpEmitter& eoe) {
+  ParseNode* exprOrSuper = &elem->expression();
+  ParseNode* key = &elem->key();
+
+  if (!eoe.prepareForObj()) {
+    return false;
+  }
+
+  if (elem->isSuper()) {
+    auto* base = &exprOrSuper->as<UnaryNode>();
+    if (!emitGetThisForSuperBase(base)) {
+      return false;
+    }
+  } else {
+    if (!emitTree(exprOrSuper)) {
+      return false;
+    }
+  }
+
+  if (!eoe.prepareForKey()) {
+    return false;
+  }
+
+  if (!emitTree(key)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitElemOpBase(JSOp op) {
+  if (!emit1(op)) {
+    return false;
+  }
+
+  return true;
+}
+
+static ElemOpEmitter::Kind ConvertIncDecKind(ParseNodeKind kind) {
+  switch (kind) {
+    case ParseNodeKind::PostIncrementExpr:
+      return ElemOpEmitter::Kind::PostIncrement;
+    case ParseNodeKind::PreIncrementExpr:
+      return ElemOpEmitter::Kind::PreIncrement;
+    case ParseNodeKind::PostDecrementExpr:
+      return ElemOpEmitter::Kind::PostDecrement;
+    case ParseNodeKind::PreDecrementExpr:
+      return ElemOpEmitter::Kind::PreDecrement;
+    default:
+      MOZ_CRASH("unexpected inc/dec node kind");
+  }
+}
+
+static PrivateOpEmitter::Kind PrivateConvertIncDecKind(ParseNodeKind kind) {
+  switch (kind) {
+    case ParseNodeKind::PostIncrementExpr:
+      return PrivateOpEmitter::Kind::PostIncrement;
+    case ParseNodeKind::PreIncrementExpr:
+      return PrivateOpEmitter::Kind::PreIncrement;
+    case ParseNodeKind::PostDecrementExpr:
+      return PrivateOpEmitter::Kind::PostDecrement;
+    case ParseNodeKind::PreDecrementExpr:
+      return PrivateOpEmitter::Kind::PreDecrement;
+    default:
+      MOZ_CRASH("unexpected inc/dec node kind");
+  }
+}
+
+bool BytecodeEmitter::emitElemIncDec(UnaryNode* incDec, ValueUsage valueUsage) {
+  PropertyByValue* elemExpr = &incDec->kid()->as<PropertyByValue>();
+  bool isSuper = elemExpr->isSuper();
+  MOZ_ASSERT(!elemExpr->key().isKind(ParseNodeKind::PrivateName));
+  ParseNodeKind kind = incDec->getKind();
+  ElemOpEmitter eoe(
+      this, ConvertIncDecKind(kind),
+      isSuper ? ElemOpEmitter::ObjKind::Super : ElemOpEmitter::ObjKind::Other);
+  if (!emitElemObjAndKey(elemExpr, eoe)) {
+    return false;
+  }
+  if (!eoe.emitIncDec(valueUsage)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitCallIncDec(UnaryNode* incDec) {
+  MOZ_ASSERT(incDec->isKind(ParseNodeKind::PreIncrementExpr) ||
+             incDec->isKind(ParseNodeKind::PostIncrementExpr) ||
+             incDec->isKind(ParseNodeKind::PreDecrementExpr) ||
+             incDec->isKind(ParseNodeKind::PostDecrementExpr));
+
+  ParseNode* call = incDec->kid();
+  MOZ_ASSERT(call->isKind(ParseNodeKind::CallExpr));
+  if (!emitTree(call)) {
+    return false;
+  }
+
+  return emit2(JSOp::ThrowMsg, uint8_t(ThrowMsgKind::AssignToCall));
+}
+
+bool BytecodeEmitter::emitPrivateIncDec(UnaryNode* incDec,
+                                        ValueUsage valueUsage) {
+  PrivateMemberAccess* privateExpr = &incDec->kid()->as<PrivateMemberAccess>();
+  ParseNodeKind kind = incDec->getKind();
+  PrivateOpEmitter xoe(this, PrivateConvertIncDecKind(kind),
+                       privateExpr->privateName().name());
+  if (!emitTree(&privateExpr->expression())) {
+    return false;
+  }
+  if (!xoe.emitReference()) {
+    return false;
+  }
+  if (!xoe.emitIncDec(valueUsage)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitDouble(double d) {
+  BytecodeOffset offset;
+  if (!emitCheck(JSOp::Double, 9, &offset)) {
+    return false;
+  }
+
+  jsbytecode* code = bytecodeSection().code(offset);
+  code[0] = jsbytecode(JSOp::Double);
+  SET_INLINE_VALUE(code, DoubleValue(d));
+  bytecodeSection().updateDepth(JSOp::Double, offset);
+  return true;
+}
+
+bool BytecodeEmitter::emitNumberOp(double dval) {
+  int32_t ival;
+  if (NumberIsInt32(dval, &ival)) {
+    if (ival == 0) {
+      return emit1(JSOp::Zero);
+    }
+    if (ival == 1) {
+      return emit1(JSOp::One);
+    }
+    if ((int)(int8_t)ival == ival) {
+      return emit2(JSOp::Int8, uint8_t(int8_t(ival)));
+    }
+
+    uint32_t u = uint32_t(ival);
+    if (u < Bit(16)) {
+      if (!emitUint16Operand(JSOp::Uint16, u)) {
+        return false;
+      }
+    } else if (u < Bit(24)) {
+      BytecodeOffset off;
+      if (!emitN(JSOp::Uint24, 3, &off)) {
+        return false;
+      }
+      SET_UINT24(bytecodeSection().code(off), u);
+    } else {
+      BytecodeOffset off;
+      if (!emitN(JSOp::Int32, 4, &off)) {
+        return false;
+      }
+      SET_INT32(bytecodeSection().code(off), ival);
+    }
+    return true;
+  }
+
+  return emitDouble(dval);
+}
+
+MOZ_NEVER_INLINE bool BytecodeEmitter::emitSwitch(SwitchStatement* switchStmt) {
+  LexicalScopeNode& lexical = switchStmt->lexicalForCaseList();
+  MOZ_ASSERT(lexical.isKind(ParseNodeKind::LexicalScope));
+  ListNode* cases = &lexical.scopeBody()->as<ListNode>();
+  MOZ_ASSERT(cases->isKind(ParseNodeKind::StatementList));
+
+  SwitchEmitter se(this);
+  if (!se.emitDiscriminant(switchStmt->discriminant().pn_pos.begin)) {
+    return false;
+  }
+
+  if (!markStepBreakpoint()) {
+    return false;
+  }
+  if (!emitTree(&switchStmt->discriminant())) {
+    return false;
+  }
+
+
+  if (!lexical.isEmptyScope()) {
+    if (!se.emitLexical(lexical.scopeBindings())) {
+      return false;
+    }
+
+    if (cases->hasTopLevelFunctionDeclarations()) {
+      for (ParseNode* item : cases->contents()) {
+        CaseClause* caseClause = &item->as<CaseClause>();
+        ListNode* statements = caseClause->statementList();
+        if (statements->hasTopLevelFunctionDeclarations()) {
+          if (!emitHoistedFunctionsInList(statements)) {
+            return false;
+          }
+        }
+      }
+    }
+  } else {
+    MOZ_ASSERT(!cases->hasTopLevelFunctionDeclarations());
+  }
+
+  SwitchEmitter::TableGenerator tableGen(this);
+  uint32_t caseCount = cases->count() - (switchStmt->hasDefault() ? 1 : 0);
+  if (caseCount == 0) {
+    tableGen.finish(0);
+  } else {
+    for (ParseNode* item : cases->contents()) {
+      CaseClause* caseClause = &item->as<CaseClause>();
+      if (caseClause->isDefault()) {
+        continue;
+      }
+
+      ParseNode* caseValue = caseClause->caseExpression();
+
+      if (caseValue->getKind() != ParseNodeKind::NumberExpr) {
+        tableGen.setInvalid();
+        break;
+      }
+
+      int32_t i;
+      if (!NumberEqualsInt32(caseValue->as<NumericLiteral>().value(), &i)) {
+        tableGen.setInvalid();
+        break;
+      }
+
+      if (!tableGen.addNumber(i)) {
+        return false;
+      }
+    }
+
+    tableGen.finish(caseCount);
+  }
+
+  if (!se.validateCaseCount(caseCount)) {
+    return false;
+  }
+
+  bool isTableSwitch = tableGen.isValid();
+  if (isTableSwitch) {
+    if (!se.emitTable(tableGen)) {
+      return false;
+    }
+  } else {
+    if (!se.emitCond()) {
+      return false;
+    }
+
+    for (ParseNode* item : cases->contents()) {
+      CaseClause* caseClause = &item->as<CaseClause>();
+      if (caseClause->isDefault()) {
+        continue;
+      }
+
+      if (!se.prepareForCaseValue()) {
+        return false;
+      }
+
+      ParseNode* caseValue = caseClause->caseExpression();
+      if (!emitTree(
+              caseValue, ValueUsage::WantValue,
+              caseValue->isLiteral() ? SUPPRESS_LINENOTE : EMIT_LINENOTE)) {
+        return false;
+      }
+
+      if (!se.emitCaseJump()) {
+        return false;
+      }
+    }
+  }
+
+  for (ParseNode* item : cases->contents()) {
+    CaseClause* caseClause = &item->as<CaseClause>();
+    if (caseClause->isDefault()) {
+      if (!se.emitDefaultBody()) {
+        return false;
+      }
+    } else {
+      if (isTableSwitch) {
+        ParseNode* caseValue = caseClause->caseExpression();
+        MOZ_ASSERT(caseValue->isKind(ParseNodeKind::NumberExpr));
+
+        NumericLiteral* literal = &caseValue->as<NumericLiteral>();
+#ifdef DEBUG
+        int32_t v;
+        MOZ_ASSERT(mozilla::NumberEqualsInt32(literal->value(), &v));
+#endif
+        int32_t i = int32_t(literal->value());
+
+        if (!se.emitCaseBody(i, tableGen)) {
+          return false;
+        }
+      } else {
+        if (!se.emitCaseBody()) {
+          return false;
+        }
+      }
+    }
+
+    if (!emitTree(caseClause->statementList())) {
+      return false;
+    }
+  }
+
+  if (!se.emitEnd()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::allocateResumeIndex(BytecodeOffset offset,
+                                          uint32_t* resumeIndex) {
+  static constexpr uint32_t MaxResumeIndex = BitMask(24);
+
+  static_assert(
+      MaxResumeIndex < uint32_t(AbstractGeneratorObject::RESUME_INDEX_RUNNING),
+      "resumeIndex should not include magic AbstractGeneratorObject "
+      "resumeIndex values");
+  static_assert(
+      MaxResumeIndex <= INT32_MAX / sizeof(uintptr_t),
+      "resumeIndex * sizeof(uintptr_t) must fit in an int32. JIT code relies "
+      "on this when loading resume entries from BaselineScript");
+
+  *resumeIndex = bytecodeSection().resumeOffsetList().length();
+  if (*resumeIndex > MaxResumeIndex) {
+    reportError(nullptr, JSMSG_TOO_MANY_RESUME_INDEXES);
+    return false;
+  }
+
+  return bytecodeSection().resumeOffsetList().append(offset.value());
+}
+
+bool BytecodeEmitter::allocateResumeIndexRange(
+    mozilla::Span<BytecodeOffset> offsets, uint32_t* firstResumeIndex) {
+  *firstResumeIndex = 0;
+
+  for (size_t i = 0, len = offsets.size(); i < len; i++) {
+    uint32_t resumeIndex;
+    if (!allocateResumeIndex(offsets[i], &resumeIndex)) {
+      return false;
+    }
+    if (i == 0) {
+      *firstResumeIndex = resumeIndex;
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitYieldOp(JSOp op) {
+  MOZ_ASSERT(innermostEmitterScopeNoCheck()->frameSlotEnd() <=
+             ParseContext::Scope::FixedSlotLimit);
+
+  if (op == JSOp::FinalYieldRval) {
+    return emit1(JSOp::FinalYieldRval);
+  }
+
+  MOZ_ASSERT(op == JSOp::InitialYield || op == JSOp::Yield ||
+             op == JSOp::Await);
+
+  BytecodeOffset off;
+  if (!emitN(op, 3, &off)) {
+    return false;
+  }
+
+  MOZ_ASSERT_IF(op == JSOp::InitialYield, bytecodeSection().numYields() == 0);
+
+  if (op == JSOp::InitialYield || op == JSOp::Yield) {
+    bytecodeSection().addNumYields();
+  }
+
+  uint32_t resumeIndex;
+  if (!allocateResumeIndex(bytecodeSection().offset(), &resumeIndex)) {
+    return false;
+  }
+
+  MOZ_ASSERT_IF(
+      op == JSOp::InitialYield,
+      resumeIndex == AbstractGeneratorObject::RESUME_INDEX_INITIAL_YIELD);
+
+  SET_RESUMEINDEX(bytecodeSection().code(off), resumeIndex);
+
+  BytecodeOffset unusedOffset;
+  return emitJumpTargetOp(JSOp::AfterYield, &unusedOffset);
+}
+
+bool BytecodeEmitter::emitPushResumeKind(GeneratorResumeKind kind) {
+  return emit2(JSOp::ResumeKind, uint8_t(kind));
+}
+
+bool BytecodeEmitter::emitSetThis(BinaryNode* setThisNode) {
+
+  MOZ_ASSERT(setThisNode->isKind(ParseNodeKind::SetThis));
+  MOZ_ASSERT(setThisNode->left()->isKind(ParseNodeKind::Name));
+
+  auto name = setThisNode->left()->as<NameNode>().name();
+
+  NameLocation loc = lookupName(name);
+  NameLocation lexicalLoc;
+  if (loc.kind() == NameLocation::Kind::FrameSlot) {
+    lexicalLoc = NameLocation::FrameSlot(BindingKind::Let, loc.frameSlot());
+  } else if (loc.kind() == NameLocation::Kind::EnvironmentCoordinate) {
+    EnvironmentCoordinate coord = loc.environmentCoordinate();
+    uint16_t hops = AssertedCast<uint16_t>(coord.hops());
+    lexicalLoc = NameLocation::EnvironmentCoordinate(BindingKind::Let, hops,
+                                                     coord.slot());
+  } else {
+    MOZ_ASSERT(loc.kind() == NameLocation::Kind::Dynamic);
+    lexicalLoc = loc;
+  }
+
+  NameOpEmitter noe(this, name, lexicalLoc, NameOpEmitter::Kind::Initialize);
+  if (!noe.prepareForRhs()) {
+    return false;
+  }
+
+  if (!emitTree(setThisNode->right())) {
+    return false;
+  }
+
+  if (!emitGetName(name)) {
+    return false;
+  }
+  if (!emit1(JSOp::CheckThisReinit)) {
+    return false;
+  }
+  if (!emit1(JSOp::Pop)) {
+    return false;
+  }
+  if (!noe.emitAssignment()) {
+    return false;
+  }
+
+  if (!emitInitializeInstanceMembers(true)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::defineHoistedTopLevelFunctions(ParseNode* body) {
+  MOZ_ASSERT(inPrologue());
+  MOZ_ASSERT(sc->isGlobalContext() || (sc->isEvalContext() && !sc->strict()));
+  MOZ_ASSERT(body->is<LexicalScopeNode>() || body->is<ListNode>());
+
+  if (body->is<LexicalScopeNode>()) {
+    body = body->as<LexicalScopeNode>().scopeBody();
+    MOZ_ASSERT(body->is<ListNode>());
+  }
+
+  if (!body->as<ListNode>().hasTopLevelFunctionDeclarations()) {
+    return true;
+  }
+
+  return emitHoistedFunctionsInList(&body->as<ListNode>());
+}
+
+bool BytecodeEmitter::emitDeclarationInstantiation(ParseNode* body) {
+  if (sc->isModuleContext()) {
+    return true;
+  }
+
+  if (sc->isEvalContext() && sc->strict()) {
+    return true;
+  }
+
+  if (sc->isGlobalContext()) {
+    if (!sc->asGlobalContext()->bindings) {
+      return true;
+    }
+  } else {
+    MOZ_ASSERT(sc->isEvalContext());
+
+    if (!sc->asEvalContext()->bindings) {
+      return true;
+    }
+  }
+
+#if DEBUG
+  for (const auto& thing : perScriptData().gcThingList().objects()) {
+    MOZ_ASSERT(thing.isEmptyGlobalScope() || thing.isScope());
+  }
+#endif
+
+  if (!defineHoistedTopLevelFunctions(body)) {
+    return false;
+  }
+
+  MOZ_ASSERT(perScriptData().gcThingList().length() > 0);
+  GCThingIndex lastFun =
+      GCThingIndex(perScriptData().gcThingList().length() - 1);
+
+#if DEBUG
+  for (const auto& thing : perScriptData().gcThingList().objects()) {
+    MOZ_ASSERT(thing.isEmptyGlobalScope() || thing.isScope() ||
+               thing.isFunction());
+  }
+#endif
+
+  if (emitterMode == BytecodeEmitter::EmitterMode::Normal) {
+    if (!emitGCIndexOp(JSOp::GlobalOrEvalDeclInstantiation, lastFun)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitScript(ParseNode* body) {
+  setScriptStartOffsetIfUnset(body->pn_pos.begin);
+
+  MOZ_ASSERT(inPrologue());
+
+  TDZCheckCache tdzCache(this);
+  EmitterScope emitterScope(this);
+  Maybe<AsyncEmitter> topLevelAwait;
+  if (sc->isGlobalContext()) {
+    if (!emitterScope.enterGlobal(this, sc->asGlobalContext())) {
+      return false;
+    }
+  } else if (sc->isEvalContext()) {
+    if (!emitterScope.enterEval(this, sc->asEvalContext())) {
+      return false;
+    }
+  } else {
+    MOZ_ASSERT(sc->isModuleContext());
+    if (!emitterScope.enterModule(this, sc->asModuleContext())) {
+      return false;
+    }
+    if (sc->asModuleContext()->isAsync()) {
+      topLevelAwait.emplace(this);
+    }
+  }
+
+  setFunctionBodyEndPos(body->pn_pos.end);
+
+  bool isSloppyEval = sc->isEvalContext() && !sc->strict();
+  if (isSloppyEval && body->is<LexicalScopeNode>() &&
+      !body->as<LexicalScopeNode>().isEmptyScope()) {
+    EmitterScope lexicalEmitterScope(this);
+    LexicalScopeNode* scope = &body->as<LexicalScopeNode>();
+
+    if (!lexicalEmitterScope.enterLexical(this, ScopeKind::Lexical,
+                                          scope->scopeBindings())) {
+      return false;
+    }
+
+    if (!emitDeclarationInstantiation(scope->scopeBody())) {
+      return false;
+    }
+
+    switchToMain();
+
+    ParseNode* scopeBody = scope->scopeBody();
+    if (!emitLexicalScopeBody(scopeBody)) {
+      return false;
+    }
+
+    if (!updateSourceCoordNotes(scopeBody->pn_pos.end)) {
+      return false;
+    }
+
+    if (!lexicalEmitterScope.leave(this)) {
+      return false;
+    }
+  } else {
+    if (!emitDeclarationInstantiation(body)) {
+      return false;
+    }
+    if (topLevelAwait) {
+      if (!topLevelAwait->prepareForModule()) {
+        return false;
+      }
+    }
+
+    switchToMain();
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+    if (!emitterScope.prepareForModuleDisposableScopeBody(this)) {
+      return false;
+    }
+#endif
+
+    if (topLevelAwait) {
+      if (!topLevelAwait->prepareForBody()) {
+        return false;
+      }
+    }
+
+    if (!emitTree(body)) {
+      return false;
+    }
+
+    if (!updateSourceCoordNotes(body->pn_pos.end)) {
+      return false;
+    }
+  }
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  if (!emitterScope.emitModuleDisposableScopeBodyEnd(this)) {
+    return false;
+  }
+#endif
+
+  if (topLevelAwait) {
+    if (!topLevelAwait->emitEndModule()) {
+      return false;
+    }
+  }
+
+  if (!markSimpleBreakpoint()) {
+    return false;
+  }
+
+  if (!emitReturnRval()) {
+    return false;
+  }
+
+  if (!emitterScope.leave(this)) {
+    return false;
+  }
+
+  if (!NameFunctions(fc, parserAtoms(), body)) {
+    return false;
+  }
+
+  return intoScriptStencil(CompilationStencil::TopLevelIndex);
+}
+
+js::UniquePtr<ImmutableScriptData>
+BytecodeEmitter::createImmutableScriptData() {
+  uint32_t nslots;
+  if (!getNslots(&nslots)) {
+    return nullptr;
+  }
+
+  bool isFunction = sc->isFunctionBox();
+  uint16_t funLength = isFunction ? sc->asFunctionBox()->length() : 0;
+
+  mozilla::SaturateUint8 propertyCountEstimate = propertyAdditionEstimate;
+
+  if (isFunction && sc->asFunctionBox()->useMemberInitializers()) {
+    propertyCountEstimate +=
+        sc->asFunctionBox()->memberInitializers().numMemberInitializers;
+  }
+
+  return ImmutableScriptData::new_(
+      fc, mainOffset(), maxFixedSlots, nslots, bodyScopeIndex,
+      bytecodeSection().numICEntries(), isFunction, funLength,
+      propertyCountEstimate.value(), bytecodeSection().code(),
+      bytecodeSection().notes(), bytecodeSection().resumeOffsetList().span(),
+      bytecodeSection().scopeNoteList().span(),
+      bytecodeSection().tryNoteList().span());
+}
+
+#if defined(ENABLE_DECORATORS) || defined(ENABLE_EXPLICIT_RESOURCE_MANAGEMENT)
+bool BytecodeEmitter::emitCheckIsCallable() {
+  if (!emitAtomOp(JSOp::GetIntrinsic,
+                  TaggedParserAtomIndex::WellKnown::IsCallable())) {
+    return false;
+  }
+  if (!emit1(JSOp::Undefined)) {
+    return false;
+  }
+  if (!emitDupAt(2)) {
+    return false;
+  }
+  return emitCall(JSOp::Call, 1);
+}
+#endif
+
+bool BytecodeEmitter::getNslots(uint32_t* nslots) const {
+  uint64_t nslots64 =
+      maxFixedSlots + static_cast<uint64_t>(bytecodeSection().maxStackDepth());
+  if (nslots64 > UINT32_MAX) {
+    reportError(nullptr, JSMSG_NEED_DIET, "script");
+    return false;
+  }
+  *nslots = nslots64;
+  return true;
+}
+
+bool BytecodeEmitter::emitFunctionScript(FunctionNode* funNode) {
+  MOZ_ASSERT(inPrologue());
+  ParamsBodyNode* paramsBody = funNode->body();
+  FunctionBox* funbox = sc->asFunctionBox();
+
+  setScriptStartOffsetIfUnset(paramsBody->pn_pos.begin);
+
+
+  FunctionScriptEmitter fse(this, funbox, Some(paramsBody->pn_pos.begin),
+                            Some(paramsBody->pn_pos.end));
+  if (!fse.prepareForParameters()) {
+    return false;
+  }
+
+  if (!emitFunctionFormalParameters(paramsBody)) {
+    return false;
+  }
+
+  if (!fse.prepareForBody()) {
+    return false;
+  }
+
+  if (!emitTree(paramsBody->body())) {
+    return false;
+  }
+
+  if (!fse.emitEndBody()) {
+    return false;
+  }
+
+  if (funbox->index() == CompilationStencil::TopLevelIndex) {
+    if (!NameFunctions(fc, parserAtoms(), funNode)) {
+      return false;
+    }
+  }
+
+  return fse.intoStencil();
+}
+
+class js::frontend::DestructuringLHSRef {
+  struct None {
+    size_t numReferenceSlots() const { return 0; }
+  };
+
+  mozilla::Variant<None, NameOpEmitter, PropOpEmitter, ElemOpEmitter,
+                   PrivateOpEmitter>
+      emitter_ = AsVariant(None{});
+
+ public:
+  template <typename T>
+  void from(T&& emitter) {
+    emitter_.emplace<T>(std::forward<T>(emitter));
+  }
+
+  template <typename T>
+  T& emitter() {
+    return emitter_.as<T>();
+  }
+
+  size_t numReferenceSlots() const {
+    return emitter_.match([](auto& e) { return e.numReferenceSlots(); });
+  }
+};
+
+bool BytecodeEmitter::emitDestructuringLHSRef(ParseNode* target,
+                                              DestructuringFlavor flav,
+                                              DestructuringLHSRef& lref) {
+#ifdef DEBUG
+  int depth = bytecodeSection().stackDepth();
+#endif
+
+  switch (target->getKind()) {
+    case ParseNodeKind::ArrayExpr:
+    case ParseNodeKind::ObjectExpr:
+      break;
+
+    case ParseNodeKind::Name: {
+      auto* name = &target->as<NameNode>();
+      NameOpEmitter noe(this, name->atom(),
+                        flav == DestructuringFlavor::Assignment
+                            ? NameOpEmitter::Kind::SimpleAssignment
+                            : NameOpEmitter::Kind::Initialize);
+      if (!noe.prepareForRhs()) {
+        return false;
+      }
+
+      lref.from(std::move(noe));
+      return true;
+    }
+
+    case ParseNodeKind::ArgumentsLength:
+    case ParseNodeKind::DotExpr: {
+      PropertyAccess* prop = &target->as<PropertyAccess>();
+      bool isSuper = prop->isSuper();
+      PropOpEmitter poe(this, PropOpEmitter::Kind::SimpleAssignment,
+                        isSuper ? PropOpEmitter::ObjKind::Super
+                                : PropOpEmitter::ObjKind::Other);
+      if (!poe.prepareForObj()) {
+        return false;
+      }
+      if (isSuper) {
+        UnaryNode* base = &prop->expression().as<UnaryNode>();
+        if (!emitGetThisForSuperBase(base)) {
+          return false;
+        }
+      } else {
+        if (!emitTree(&prop->expression())) {
+          return false;
+        }
+      }
+      if (!poe.prepareForRhs()) {
+        return false;
+      }
+
+      lref.from(std::move(poe));
+      break;
+    }
+
+    case ParseNodeKind::ElemExpr: {
+      PropertyByValue* elem = &target->as<PropertyByValue>();
+      bool isSuper = elem->isSuper();
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
+      ElemOpEmitter eoe(this, ElemOpEmitter::Kind::SimpleAssignment,
+                        isSuper ? ElemOpEmitter::ObjKind::Super
+                                : ElemOpEmitter::ObjKind::Other);
+      if (!emitElemObjAndKey(elem, eoe)) {
+        return false;
+      }
+      if (!eoe.prepareForRhs()) {
+        return false;
+      }
+
+      lref.from(std::move(eoe));
+      break;
+    }
+
+    case ParseNodeKind::PrivateMemberExpr: {
+      PrivateMemberAccess* privateExpr = &target->as<PrivateMemberAccess>();
+      PrivateOpEmitter xoe(this, PrivateOpEmitter::Kind::SimpleAssignment,
+                           privateExpr->privateName().name());
+      if (!emitTree(&privateExpr->expression())) {
+        return false;
+      }
+      if (!xoe.emitReference()) {
+        return false;
+      }
+
+      lref.from(std::move(xoe));
+      break;
+    }
+
+    case ParseNodeKind::CallExpr:
+      MOZ_ASSERT_UNREACHABLE(
+          "Parser::reportIfNotValidSimpleAssignmentTarget "
+          "rejects function calls as assignment "
+          "targets in destructuring assignments");
+      break;
+
+    default:
+      MOZ_CRASH("emitDestructuringLHSRef: bad lhs kind");
+  }
+
+  MOZ_ASSERT(bytecodeSection().stackDepth() ==
+             depth + int(lref.numReferenceSlots()));
+
+  return true;
+}
+
+bool BytecodeEmitter::emitSetOrInitializeDestructuring(
+    ParseNode* target, DestructuringFlavor flav, DestructuringLHSRef& lref) {
+
+  switch (target->getKind()) {
+    case ParseNodeKind::ArrayExpr:
+    case ParseNodeKind::ObjectExpr:
+      if (!emitDestructuringOps(&target->as<ListNode>(), flav,
+                                SelfHostedIter::Deny)) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::Name: {
+      auto& noe = lref.emitter<NameOpEmitter>();
+
+      if (!noe.emitAssignment()) {
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::ArgumentsLength:
+    case ParseNodeKind::DotExpr: {
+      auto& poe = lref.emitter<PropOpEmitter>();
+      auto* prop = &target->as<PropertyAccess>();
+
+      if (!poe.emitAssignment(prop->key().atom())) {
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::ElemExpr: {
+      auto& eoe = lref.emitter<ElemOpEmitter>();
+
+      if (!eoe.emitAssignment()) {
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::PrivateMemberExpr: {
+      auto& xoe = lref.emitter<PrivateOpEmitter>();
+
+      if (!xoe.emitAssignment()) {
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::CallExpr:
+      MOZ_ASSERT_UNREACHABLE(
+          "Parser::reportIfNotValidSimpleAssignmentTarget "
+          "rejects function calls as assignment "
+          "targets in destructuring assignments");
+      break;
+
+    default:
+      MOZ_CRASH("emitSetOrInitializeDestructuring: bad lhs kind");
+  }
+
+  if (!emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  return true;
+}
+
+JSOp BytecodeEmitter::getIterCallOp(JSOp callOp,
+                                    SelfHostedIter selfHostedIter) const {
+  if (emitterMode == BytecodeEmitter::SelfHosting) {
+    MOZ_ASSERT(selfHostedIter != SelfHostedIter::Deny);
+
+    switch (callOp) {
+      case JSOp::Call:
+        return JSOp::CallContent;
+      case JSOp::CallIter:
+        return JSOp::CallContentIter;
+      default:
+        MOZ_CRASH("Unknown iterator call op");
+    }
+  }
+
+  return callOp;
+}
+
+bool BytecodeEmitter::emitIteratorNext(
+    const Maybe<uint32_t>& callSourceCoordOffset, IteratorKind iterKind,
+    SelfHostedIter selfHostedIter) {
+  MOZ_ASSERT(selfHostedIter != SelfHostedIter::Deny ||
+                 emitterMode != BytecodeEmitter::SelfHosting,
+             ".next() iteration is prohibited in self-hosted code because it"
+             "can run user-modifiable iteration code");
+
+  MOZ_ASSERT(bytecodeSection().stackDepth() >= 2);
+
+  if (!emitCall(getIterCallOp(JSOp::Call, selfHostedIter), 0,
+                callSourceCoordOffset)) {
+    return false;
+  }
+
+  if (iterKind == IteratorKind::Async) {
+    if (!emitAwaitInInnermostScope()) {
+      return false;
+    }
+  }
+
+  if (!emitCheckIsObj(CheckIsObjectKind::IteratorNext)) {
+    return false;
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitIteratorCloseInScope(EmitterScope& currentScope,
+                                               IteratorKind iterKind,
+                                               CompletionKind completionKind,
+                                               SelfHostedIter selfHostedIter) {
+  MOZ_ASSERT(selfHostedIter != SelfHostedIter::Deny ||
+                 emitterMode != BytecodeEmitter::SelfHosting,
+             ".close() on iterators is prohibited in self-hosted code because "
+             "it can run user-modifiable iteration code");
+
+  if (iterKind == IteratorKind::Sync) {
+    return emit2(JSOp::CloseIter, uint8_t(completionKind));
+  }
+
+
+
+  Maybe<TryEmitter> tryCatch;
+
+  if (completionKind == CompletionKind::Throw) {
+    tryCatch.emplace(this, TryEmitter::Kind::TryCatch,
+                     TryEmitter::ControlKind::NonSyntactic);
+
+    if (!tryCatch->emitTry()) {
+      return false;
+    }
+  }
+
+  if (!emit1(JSOp::Dup)) {
+    return false;
+  }
+
+
+  if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::return_())) {
+    return false;
+  }
+
+  InternalIfEmitter ifReturnMethodIsDefined(this);
+  if (!emit1(JSOp::IsNullOrUndefined)) {
+    return false;
+  }
+
+  if (!ifReturnMethodIsDefined.emitThenElse(
+          IfEmitter::ConditionKind::Negative)) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Swap)) {
+    return false;
+  }
+
+  if (!emitCall(getIterCallOp(JSOp::Call, selfHostedIter), 0)) {
+    return false;
+  }
+
+  if (iterKind == IteratorKind::Async) {
+    if (completionKind != CompletionKind::Throw) {
+      if (!emit1(JSOp::GetRval)) {
+        return false;
+      }
+      if (!emit1(JSOp::Swap)) {
+        return false;
+      }
+    }
+
+    if (!emitAwaitInScope(currentScope)) {
+      return false;
+    }
+
+    if (completionKind != CompletionKind::Throw) {
+      if (!emit1(JSOp::Swap)) {
+        return false;
+      }
+      if (!emit1(JSOp::SetRval)) {
+        return false;
+      }
+    }
+  }
+
+
+  if (completionKind != CompletionKind::Throw) {
+    if (!emitCheckIsObj(CheckIsObjectKind::IteratorReturn)) {
+      return false;
+    }
+  }
+
+  if (!ifReturnMethodIsDefined.emitElse()) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  if (!ifReturnMethodIsDefined.emitEnd()) {
+    return false;
+  }
+
+  if (completionKind == CompletionKind::Throw) {
+    if (!tryCatch->emitCatch()) {
+      return false;
+    }
+
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+
+    if (!tryCatch->emitEnd()) {
+      return false;
+    }
+  }
+
+
+  return emit1(JSOp::Pop);
+}
+
+template <typename InnerEmitter>
+bool BytecodeEmitter::wrapWithDestructuringTryNote(int32_t iterDepth,
+                                                   InnerEmitter emitter) {
+  MOZ_ASSERT(bytecodeSection().stackDepth() >= iterDepth);
+
+  if (!emit1(JSOp::TryDestructuring)) {
+    return false;
+  }
+
+  BytecodeOffset start = bytecodeSection().offset();
+  if (!emitter(this)) {
+    return false;
+  }
+  BytecodeOffset end = bytecodeSection().offset();
+  if (start != end) {
+    return addTryNote(TryNoteKind::Destructuring, iterDepth, start, end);
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitDefault(ParseNode* defaultExpr, ParseNode* pattern) {
+
+  DefaultEmitter de(this);
+  if (!de.prepareForDefault()) {
+    return false;
+  }
+  if (!emitInitializer(defaultExpr, pattern)) {
+    return false;
+  }
+  if (!de.emitEnd()) {
+    return false;
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitAnonymousFunctionWithName(
+    ParseNode* node, TaggedParserAtomIndex name) {
+  MOZ_ASSERT(node->isDirectRHSAnonFunction());
+
+  if (node->is<FunctionNode>()) {
+    setFunName(node->as<FunctionNode>().funbox(), name);
+
+    return emitTree(node);
+  }
+
+  MOZ_ASSERT(node->is<ClassNode>());
+
+  return emitClass(&node->as<ClassNode>(), ClassNameKind::InferredName, name);
+}
+
+bool BytecodeEmitter::emitAnonymousFunctionWithComputedName(
+    ParseNode* node, FunctionPrefixKind prefixKind) {
+  MOZ_ASSERT(node->isDirectRHSAnonFunction());
+
+  if (node->is<FunctionNode>()) {
+    if (!emitTree(node)) {
+      return false;
+    }
+    if (!emitDupAt(1)) {
+      return false;
+    }
+    if (!emit2(JSOp::SetFunName, uint8_t(prefixKind))) {
+      return false;
+    }
+    return true;
+  }
+
+  MOZ_ASSERT(node->is<ClassNode>());
+  MOZ_ASSERT(prefixKind == FunctionPrefixKind::None);
+
+  return emitClass(&node->as<ClassNode>(), ClassNameKind::ComputedName);
+}
+
+void BytecodeEmitter::setFunName(FunctionBox* funbox,
+                                 TaggedParserAtomIndex name) const {
+  if (funbox->hasInferredName()) {
+    MOZ_ASSERT(!funbox->emitBytecode);
+    MOZ_ASSERT(funbox->displayAtom() == name);
+  } else {
+    funbox->setInferredName(name);
+  }
+}
+
+bool BytecodeEmitter::emitInitializer(ParseNode* initializer,
+                                      ParseNode* pattern) {
+  if (initializer->isDirectRHSAnonFunction()) {
+    MOZ_ASSERT(!pattern->isInParens());
+    auto name = pattern->as<NameNode>().name();
+    if (!emitAnonymousFunctionWithName(initializer, name)) {
+      return false;
+    }
+  } else {
+    if (!emitTree(initializer)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitDestructuringOpsArray(ListNode* pattern,
+                                                DestructuringFlavor flav,
+                                                SelfHostedIter selfHostedIter) {
+  MOZ_ASSERT(pattern->isKind(ParseNodeKind::ArrayExpr));
+  MOZ_ASSERT(bytecodeSection().stackDepth() != 0);
+
+
+  bool isEligibleForArrayOptimizations = true;
+  for (ParseNode* member : pattern->contents()) {
+    switch (member->getKind()) {
+      case ParseNodeKind::Elision:
+        break;
+      case ParseNodeKind::Name: {
+        auto name = member->as<NameNode>().name();
+        NameLocation loc = lookupName(name);
+        if (loc.kind() != NameLocation::Kind::ArgumentSlot &&
+            loc.kind() != NameLocation::Kind::FrameSlot &&
+            loc.kind() != NameLocation::Kind::EnvironmentCoordinate) {
+          isEligibleForArrayOptimizations = false;
+        }
+        break;
+      }
+      default:
+        isEligibleForArrayOptimizations = false;
+        break;
+    }
+    if (!isEligibleForArrayOptimizations) {
+      break;
+    }
+  }
+
+  if (!emit1(JSOp::Dup)) {
+    return false;
+  }
+
+  Maybe<InternalIfEmitter> ifArrayOptimizable;
+
+  if (isEligibleForArrayOptimizations) {
+    ifArrayOptimizable.emplace(
+        this, BranchEmitterBase::LexicalKind::MayContainLexicalAccessInBranch);
+
+    if (!emit1(JSOp::Dup)) {
+      return false;
+    }
+
+    if (!emit1(JSOp::OptimizeGetIterator)) {
+      return false;
+    }
+
+    if (!ifArrayOptimizable->emitThenElse()) {
+      return false;
+    }
+
+    if (!emitAtomOp(JSOp::GetProp,
+                    TaggedParserAtomIndex::WellKnown::length())) {
+      return false;
+    }
+
+    if (!emit1(JSOp::Swap)) {
+      return false;
+    }
+
+    uint32_t idx = 0;
+    for (ParseNode* member : pattern->contents()) {
+      if (member->isKind(ParseNodeKind::Elision)) {
+        idx += 1;
+        continue;
+      }
+      MOZ_ASSERT(member->isKind(ParseNodeKind::Name));
+
+      if (!emit1(JSOp::Dup)) {
+        return false;
+      }
+
+      if (!emitNumberOp(idx)) {
+        return false;
+      }
+
+      if (!emit1(JSOp::Dup)) {
+        return false;
+      }
+
+      if (!emitDupAt(4)) {
+        return false;
+      }
+
+      if (!emit1(JSOp::Lt)) {
+        return false;
+      }
+
+      InternalIfEmitter isInDenseBounds(this);
+      if (!isInDenseBounds.emitThenElse()) {
+        return false;
+      }
+
+      if (!emit1(JSOp::GetElem)) {
+        return false;
+      }
+
+      if (!isInDenseBounds.emitElse()) {
+        return false;
+      }
+
+      if (!emitPopN(2)) {
+        return false;
+      }
+
+      if (!emit1(JSOp::Undefined)) {
+        return false;
+      }
+
+      if (!isInDenseBounds.emitEnd()) {
+        return false;
+      }
+
+      DestructuringLHSRef lref;
+      if (!emitDestructuringLHSRef(member, flav, lref)) {
+        return false;
+      }
+
+      if (!emitSetOrInitializeDestructuring(member, flav, lref)) {
+        return false;
+      }
+
+      idx += 1;
+    }
+
+    if (!emit1(JSOp::Swap)) {
+      return false;
+    }
+
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+
+    if (!ifArrayOptimizable->emitElse()) {
+      return false;
+    }
+  }
+
+  if (!emitIterator(selfHostedIter)) {
+    return false;
+  }
+
+  if (!pattern->head()) {
+    if (!emit1(JSOp::Swap)) {
+      return false;
+    }
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+
+    if (!emitIteratorCloseInInnermostScope(
+            IteratorKind::Sync, CompletionKind::Normal, selfHostedIter)) {
+      return false;
+    }
+
+    if (ifArrayOptimizable.isSome()) {
+      if (!ifArrayOptimizable->emitEnd()) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  if (!emit1(JSOp::False)) {
+    return false;
+  }
+
+  int32_t tryNoteDepth = bytecodeSection().stackDepth();
+
+  for (ParseNode* member : pattern->contents()) {
+    bool isFirst = member == pattern->head();
+    DebugOnly<bool> hasNext = !!member->pn_next;
+
+    ParseNode* subpattern;
+    if (member->isKind(ParseNodeKind::Spread)) {
+      subpattern = member->as<UnaryNode>().kid();
+
+      MOZ_ASSERT(!subpattern->isKind(ParseNodeKind::AssignExpr));
+    } else {
+      subpattern = member;
+    }
+
+    ParseNode* lhsPattern = subpattern;
+    ParseNode* pndefault = nullptr;
+    if (subpattern->isKind(ParseNodeKind::AssignExpr)) {
+      lhsPattern = subpattern->as<AssignmentNode>().left();
+      pndefault = subpattern->as<AssignmentNode>().right();
+    }
+
+    DestructuringLHSRef lref;
+    bool isElision = lhsPattern->isKind(ParseNodeKind::Elision);
+    if (!isElision) {
+      auto emitLHSRef = [lhsPattern, flav, &lref](BytecodeEmitter* bce) {
+        return bce->emitDestructuringLHSRef(lhsPattern, flav, lref);
+      };
+      if (!wrapWithDestructuringTryNote(tryNoteDepth, emitLHSRef)) {
+        return false;
+      }
+    }
+
+    size_t emitted = lref.numReferenceSlots();
+
+    if (emitted) {
+      if (!emitPickN(emitted)) {
+        return false;
+      }
+    }
+
+    if (isFirst) {
+      if (!emit1(JSOp::Pop)) {
+        return false;
+      }
+    }
+
+    if (member->isKind(ParseNodeKind::Spread)) {
+      InternalIfEmitter ifThenElse(this);
+      if (!isFirst) {
+
+        if (!ifThenElse.emitThenElse()) {
+          return false;
+        }
+
+        if (!emitUint32Operand(JSOp::NewArray, 0)) {
+          return false;
+        }
+        if (!ifThenElse.emitElse()) {
+          return false;
+        }
+      }
+
+      if (!emitDupAt(emitted + 1, 2)) {
+        return false;
+      }
+      if (!emitUint32Operand(JSOp::NewArray, 0)) {
+        return false;
+      }
+      if (!emitNumberOp(0)) {
+        return false;
+      }
+      if (!emitSpread(SelfHostedIter::Deny)) {
+        return false;
+      }
+      if (!emit1(JSOp::Pop)) {
+        return false;
+      }
+
+      if (!isFirst) {
+        if (!ifThenElse.emitEnd()) {
+          return false;
+        }
+        MOZ_ASSERT(ifThenElse.pushed() == 1);
+      }
+
+      if (!emit1(JSOp::True)) {
+        return false;
+      }
+      if (!emitUnpickN(emitted + 1)) {
+        return false;
+      }
+
+      auto emitAssignment = [lhsPattern, flav, &lref](BytecodeEmitter* bce) {
+        return bce->emitSetOrInitializeDestructuring(lhsPattern, flav, lref);
+      };
+      if (!wrapWithDestructuringTryNote(tryNoteDepth, emitAssignment)) {
+        return false;
+      }
+
+      MOZ_ASSERT(!hasNext);
+      break;
+    }
+
+    InternalIfEmitter ifAlreadyDone(this);
+    if (!isFirst) {
+
+      if (!ifAlreadyDone.emitThenElse()) {
+        return false;
+      }
+
+      if (!emit1(JSOp::Undefined)) {
+        return false;
+      }
+      if (!emit1(JSOp::NopDestructuring)) {
+        return false;
+      }
+
+      if (!emit1(JSOp::True)) {
+        return false;
+      }
+      if (!emitUnpickN(emitted + 1)) {
+        return false;
+      }
+
+      if (!ifAlreadyDone.emitElse()) {
+        return false;
+      }
+    }
+
+    if (!emitDupAt(emitted + 1, 2)) {
+      return false;
+    }
+    if (!emitIteratorNext(Some(pattern->pn_pos.begin), IteratorKind::Sync,
+                          selfHostedIter)) {
+      return false;
+    }
+    if (!emit1(JSOp::Dup)) {
+      return false;
+    }
+    if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::done())) {
+      return false;
+    }
+
+    if (!emit1(JSOp::Dup)) {
+      return false;
+    }
+    if (!emitUnpickN(emitted + 2)) {
+      return false;
+    }
+
+    InternalIfEmitter ifDone(this);
+    if (!ifDone.emitThenElse()) {
+      return false;
+    }
+
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+    if (!emit1(JSOp::Undefined)) {
+      return false;
+    }
+    if (!emit1(JSOp::NopDestructuring)) {
+      return false;
+    }
+
+    if (!ifDone.emitElse()) {
+      return false;
+    }
+
+    if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::value())) {
+      return false;
+    }
+
+    if (!ifDone.emitEnd()) {
+      return false;
+    }
+    MOZ_ASSERT(ifDone.pushed() == 0);
+
+    if (!isFirst) {
+      if (!ifAlreadyDone.emitEnd()) {
+        return false;
+      }
+      MOZ_ASSERT(ifAlreadyDone.pushed() == 2);
+    }
+
+    if (pndefault) {
+      auto emitDefault = [pndefault, lhsPattern](BytecodeEmitter* bce) {
+        return bce->emitDefault(pndefault, lhsPattern);
+      };
+
+      if (!wrapWithDestructuringTryNote(tryNoteDepth, emitDefault)) {
+        return false;
+      }
+    }
+
+    if (!isElision) {
+      auto emitAssignment = [lhsPattern, flav, &lref](BytecodeEmitter* bce) {
+        return bce->emitSetOrInitializeDestructuring(lhsPattern, flav, lref);
+      };
+
+      if (!wrapWithDestructuringTryNote(tryNoteDepth, emitAssignment)) {
+        return false;
+      }
+    } else {
+      if (!emit1(JSOp::Pop)) {
+        return false;
+      }
+    }
+  }
+
+
+  InternalIfEmitter ifDone(this);
+  if (!ifDone.emitThenElse()) {
+    return false;
+  }
+  if (!emitPopN(2)) {
+    return false;
+  }
+  if (!ifDone.emitElse()) {
+    return false;
+  }
+  if (!emit1(JSOp::Swap)) {
+    return false;
+  }
+  if (!emit1(JSOp::Pop)) {
+    return false;
+  }
+  if (!emitIteratorCloseInInnermostScope(
+          IteratorKind::Sync, CompletionKind::Normal, selfHostedIter)) {
+    return false;
+  }
+  if (!ifDone.emitEnd()) {
+    return false;
+  }
+
+  if (ifArrayOptimizable.isSome()) {
+    if (!ifArrayOptimizable->emitEnd()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitComputedPropertyName(UnaryNode* computedPropName) {
+  MOZ_ASSERT(computedPropName->isKind(ParseNodeKind::ComputedName));
+  return emitTree(computedPropName->kid()) && emit1(JSOp::ToPropertyKey);
+}
+
+bool BytecodeEmitter::emitDestructuringOpsObject(ListNode* pattern,
+                                                 DestructuringFlavor flav) {
+  MOZ_ASSERT(pattern->isKind(ParseNodeKind::ObjectExpr));
+
+  MOZ_ASSERT(bytecodeSection().stackDepth() > 0);
+
+  if (!emit1(JSOp::CheckObjCoercible)) {
+    return false;
+  }
+
+  const uint8_t estimatedRestSize = 4;
+
+  bool needsRestPropertyExcludedSet =
+      pattern->count() > 1 && pattern->last()->isKind(ParseNodeKind::Spread);
+  if (needsRestPropertyExcludedSet) {
+    if (!emitDestructuringObjRestExclusionSet(pattern, estimatedRestSize)) {
+      return false;
+    }
+
+    if (!emit1(JSOp::Swap)) {
+      return false;
+    }
+  }
+
+  for (ParseNode* member : pattern->contents()) {
+    ParseNode* subpattern;
+    bool hasKeyOnStack = false;
+    if (member->isKind(ParseNodeKind::MutateProto) ||
+        member->isKind(ParseNodeKind::Spread)) {
+      subpattern = member->as<UnaryNode>().kid();
+
+      MOZ_ASSERT_IF(member->isKind(ParseNodeKind::Spread),
+                    !subpattern->isKind(ParseNodeKind::AssignExpr));
+    } else {
+      MOZ_ASSERT(member->isKind(ParseNodeKind::PropertyDefinition) ||
+                 member->isKind(ParseNodeKind::Shorthand));
+      subpattern = member->as<BinaryNode>().right();
+
+      ParseNode* key = member->as<BinaryNode>().left();
+      if (key->isKind(ParseNodeKind::ComputedName)) {
+        if (!emitComputedPropertyName(&key->as<UnaryNode>())) {
+          return false;
+        }
+        hasKeyOnStack = true;
+      }
+    }
+
+    ParseNode* lhs = subpattern;
+    ParseNode* pndefault = nullptr;
+    if (subpattern->isKind(ParseNodeKind::AssignExpr)) {
+      lhs = subpattern->as<AssignmentNode>().left();
+      pndefault = subpattern->as<AssignmentNode>().right();
+    }
+
+    DestructuringLHSRef lref;
+    if (!emitDestructuringLHSRef(lhs, flav, lref)) {
+      return false;
+    }
+
+    size_t emitted = lref.numReferenceSlots();
+
+    if (!emitDupAt(emitted + hasKeyOnStack)) {
+      return false;
+    }
+
+    if (member->isKind(ParseNodeKind::Spread)) {
+      if (!updateSourceCoordNotes(member->pn_pos.begin)) {
+        return false;
+      }
+
+      if (!emit2(JSOp::NewInit, estimatedRestSize)) {
+        return false;
+      }
+      if (!emit1(JSOp::Dup)) {
+        return false;
+      }
+      if (!emit2(JSOp::Pick, 2)) {
+        return false;
+      }
+
+      if (needsRestPropertyExcludedSet) {
+        if (!emit2(JSOp::Pick, emitted + 4)) {
+          return false;
+        }
+      }
+
+      CopyOption option = needsRestPropertyExcludedSet ? CopyOption::Filtered
+                                                       : CopyOption::Unfiltered;
+      if (!emitCopyDataProperties(option)) {
+        return false;
+      }
+
+      if (!emitSetOrInitializeDestructuring(lhs, flav, lref)) {
+        return false;
+      }
+
+      MOZ_ASSERT(member == pattern->last(), "Rest property is always last");
+      break;
+    }
+
+    if (member->isKind(ParseNodeKind::MutateProto)) {
+      if (!emitAtomOp(JSOp::GetProp,
+                      TaggedParserAtomIndex::WellKnown::proto_())) {
+        return false;
+      }
+    } else {
+      MOZ_ASSERT(member->isKind(ParseNodeKind::PropertyDefinition) ||
+                 member->isKind(ParseNodeKind::Shorthand));
+
+      ParseNode* key = member->as<BinaryNode>().left();
+      if (key->isKind(ParseNodeKind::ObjectPropertyName) ||
+          key->isKind(ParseNodeKind::StringExpr)) {
+        if (!emitAtomOp(JSOp::GetProp, key->as<NameNode>().atom())) {
+          return false;
+        }
+      } else {
+        if (key->isKind(ParseNodeKind::NumberExpr)) {
+          if (!emitNumberOp(key->as<NumericLiteral>().value())) {
+            return false;
+          }
+        } else {
+          MOZ_ASSERT(key->isKind(ParseNodeKind::ComputedName));
+          MOZ_ASSERT(hasKeyOnStack);
+
+          if (!emit2(JSOp::Pick, emitted + 1)) {
+            return false;
+          }
+
+          if (needsRestPropertyExcludedSet) {
+            if (!emitDupAt(emitted + 3)) {
+              return false;
+            }
+            if (!emitDupAt(1)) {
+              return false;
+            }
+            if (!emit1(JSOp::Undefined)) {
+              return false;
+            }
+            if (!emit1(JSOp::InitElem)) {
+              return false;
+            }
+            if (!emit1(JSOp::Pop)) {
+              return false;
+            }
+          }
+        }
+
+        if (!emitElemOpBase(JSOp::GetElem)) {
+          return false;
+        }
+      }
+    }
+
+    if (pndefault) {
+      if (!emitDefault(pndefault, lhs)) {
+        return false;
+      }
+    }
+
+    if (!emitSetOrInitializeDestructuring(lhs, flav, lref)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool IsDestructuringRestExclusionSetObjLiteralCompatible(
+    ListNode* pattern) {
+  uint32_t propCount = 0;
+  for (ParseNode* member : pattern->contents()) {
+    if (member->isKind(ParseNodeKind::Spread)) {
+      MOZ_ASSERT(!member->pn_next, "unexpected trailing element after spread");
+      break;
+    }
+
+    propCount++;
+
+    if (member->isKind(ParseNodeKind::MutateProto)) {
+      continue;
+    }
+
+    ParseNode* key = member->as<BinaryNode>().left();
+    if (key->isKind(ParseNodeKind::ObjectPropertyName) ||
+        key->isKind(ParseNodeKind::StringExpr)) {
+      continue;
+    }
+
+    MOZ_ASSERT(key->isKind(ParseNodeKind::NumberExpr) ||
+               key->isKind(ParseNodeKind::BigIntExpr) ||
+               key->isKind(ParseNodeKind::ComputedName));
+    return false;
+  }
+
+  if (propCount > SharedPropMap::MaxPropsForNonDictionary) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitDestructuringObjRestExclusionSet(
+    ListNode* pattern, uint8_t estimatedRestSize) {
+  MOZ_ASSERT(pattern->isKind(ParseNodeKind::ObjectExpr));
+  MOZ_ASSERT(pattern->last()->isKind(ParseNodeKind::Spread));
+
+  if (IsDestructuringRestExclusionSetObjLiteralCompatible(pattern)) {
+    if (!emitDestructuringRestExclusionSetObjLiteral(pattern)) {
+      return false;
+    }
+  } else {
+    if (!emit2(JSOp::NewInit, estimatedRestSize)) {
+      return false;
+    }
+  }
+
+  for (ParseNode* member : pattern->contents()) {
+    if (member->isKind(ParseNodeKind::Spread)) {
+      MOZ_ASSERT(!member->pn_next, "unexpected trailing element after spread");
+      break;
+    }
+
+    TaggedParserAtomIndex pnatom;
+    if (member->isKind(ParseNodeKind::MutateProto)) {
+      pnatom = TaggedParserAtomIndex::WellKnown::proto_();
+    } else {
+      ParseNode* key = member->as<BinaryNode>().left();
+      if (key->isKind(ParseNodeKind::ObjectPropertyName) ||
+          key->isKind(ParseNodeKind::StringExpr)) {
+        pnatom = key->as<NameNode>().atom();
+      } else if (key->isKind(ParseNodeKind::NumberExpr)) {
+        if (!emitNumberOp(key->as<NumericLiteral>().value())) {
+          return false;
+        }
+      } else {
+        MOZ_ASSERT(key->isKind(ParseNodeKind::ComputedName));
+        continue;
+      }
+    }
+
+    if (!emit1(JSOp::Undefined)) {
+      return false;
+    }
+
+    if (!pnatom) {
+      if (!emit1(JSOp::InitElem)) {
+        return false;
+      }
+    } else {
+      if (!emitAtomOp(JSOp::InitProp, pnatom)) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitDestructuringOps(ListNode* pattern,
+                                           DestructuringFlavor flav,
+                                           SelfHostedIter selfHostedIter) {
+  if (pattern->isKind(ParseNodeKind::ArrayExpr)) {
+    return emitDestructuringOpsArray(pattern, flav, selfHostedIter);
+  }
+  return emitDestructuringOpsObject(pattern, flav);
+}
+
+bool BytecodeEmitter::emitTemplateString(ListNode* templateString) {
+  bool pushedString = false;
+
+  for (ParseNode* item : templateString->contents()) {
+    bool isString = (item->getKind() == ParseNodeKind::StringExpr ||
+                     item->getKind() == ParseNodeKind::TemplateStringExpr);
+
+    if (isString && item->as<NameNode>().atom() ==
+                        TaggedParserAtomIndex::WellKnown::empty()) {
+      continue;
+    }
+
+    if (!isString) {
+      if (!updateSourceCoordNotes(item->pn_pos.begin)) {
+        return false;
+      }
+    }
+
+    if (!emitTree(item)) {
+      return false;
+    }
+
+    if (!isString) {
+      if (!emit1(JSOp::ToString)) {
+        return false;
+      }
+    }
+
+    if (pushedString) {
+      if (!emit1(JSOp::Add)) {
+        return false;
+      }
+    } else {
+      pushedString = true;
+    }
+  }
+
+  if (!pushedString) {
+    if (!emitStringOp(JSOp::String,
+                      TaggedParserAtomIndex::WellKnown::empty())) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitDeclarationList(ListNode* declList) {
+  for (ParseNode* decl : declList->contents()) {
+    ParseNode* pattern;
+    ParseNode* initializer;
+    if (decl->isKind(ParseNodeKind::Name)) {
+      pattern = decl;
+      initializer = nullptr;
+    } else {
+      AssignmentNode* assignNode = &decl->as<AssignmentNode>();
+      pattern = assignNode->left();
+      initializer = assignNode->right();
+    }
+
+    if (pattern->isKind(ParseNodeKind::Name)) {
+      if (!emitSingleDeclaration(declList, &pattern->as<NameNode>(),
+                                 initializer)) {
+        return false;
+      }
+    } else {
+      MOZ_ASSERT(pattern->isKind(ParseNodeKind::ArrayExpr) ||
+                 pattern->isKind(ParseNodeKind::ObjectExpr));
+      MOZ_ASSERT(initializer != nullptr);
+
+      if (!updateSourceCoordNotes(initializer->pn_pos.begin)) {
+        return false;
+      }
+      if (!markStepBreakpoint()) {
+        return false;
+      }
+      if (!emitTree(initializer)) {
+        return false;
+      }
+
+      if (!emitDestructuringOps(&pattern->as<ListNode>(),
+                                DestructuringFlavor::Declaration,
+                                getSelfHostedIterFor(initializer))) {
+        return false;
+      }
+
+      if (!emit1(JSOp::Pop)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitSingleDeclaration(ListNode* declList, NameNode* decl,
+                                            ParseNode* initializer) {
+  MOZ_ASSERT(decl->isKind(ParseNodeKind::Name));
+
+  if (!initializer && declList->isKind(ParseNodeKind::VarStmt)) {
+    return true;
+  }
+
+  auto nameAtom = decl->name();
+  NameOpEmitter noe(this, nameAtom, NameOpEmitter::Kind::Initialize);
+  if (!noe.prepareForRhs()) {
+    return false;
+  }
+  if (!initializer) {
+    MOZ_ASSERT(declList->isKind(ParseNodeKind::LetDecl),
+               "var declarations without initializers handled above, "
+               "and const declarations must have initializers");
+    if (!emit1(JSOp::Undefined)) {
+      return false;
+    }
+  } else {
+    MOZ_ASSERT(initializer);
+
+    if (!updateSourceCoordNotes(initializer->pn_pos.begin)) {
+      return false;
+    }
+    if (!markStepBreakpoint()) {
+      return false;
+    }
+    if (!emitInitializer(initializer, decl)) {
+      return false;
+    }
+  }
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  if (declList->isKind(ParseNodeKind::UsingDecl)) {
+    if (!innermostEmitterScope()->prepareForDisposableAssignment(
+            UsingHint::Sync)) {
+      return false;
+    }
+  } else if (declList->isKind(ParseNodeKind::AwaitUsingDecl)) {
+    if (!innermostEmitterScope()->prepareForDisposableAssignment(
+            UsingHint::Async)) {
+      return false;
+    }
+  }
+#endif
+
+  if (!noe.emitAssignment()) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitAssignmentRhs(
+    ParseNode* rhs, TaggedParserAtomIndex anonFunctionName) {
+  if (rhs->isDirectRHSAnonFunction()) {
+    if (anonFunctionName) {
+      return emitAnonymousFunctionWithName(rhs, anonFunctionName);
+    }
+    return emitAnonymousFunctionWithComputedName(rhs, FunctionPrefixKind::None);
+  }
+  return emitTree(rhs);
+}
+
+bool BytecodeEmitter::emitAssignmentRhs(uint8_t offset) {
+  if (offset != 1) {
+    return emitPickN(offset - 1);
+  }
+
+  return true;
+}
+
+static inline JSOp CompoundAssignmentParseNodeKindToJSOp(ParseNodeKind pnk) {
+  switch (pnk) {
+    case ParseNodeKind::InitExpr:
+      return JSOp::Nop;
+    case ParseNodeKind::AssignExpr:
+      return JSOp::Nop;
+    case ParseNodeKind::AddAssignExpr:
+      return JSOp::Add;
+    case ParseNodeKind::SubAssignExpr:
+      return JSOp::Sub;
+    case ParseNodeKind::BitOrAssignExpr:
+      return JSOp::BitOr;
+    case ParseNodeKind::BitXorAssignExpr:
+      return JSOp::BitXor;
+    case ParseNodeKind::BitAndAssignExpr:
+      return JSOp::BitAnd;
+    case ParseNodeKind::LshAssignExpr:
+      return JSOp::Lsh;
+    case ParseNodeKind::RshAssignExpr:
+      return JSOp::Rsh;
+    case ParseNodeKind::UrshAssignExpr:
+      return JSOp::Ursh;
+    case ParseNodeKind::MulAssignExpr:
+      return JSOp::Mul;
+    case ParseNodeKind::DivAssignExpr:
+      return JSOp::Div;
+    case ParseNodeKind::ModAssignExpr:
+      return JSOp::Mod;
+    case ParseNodeKind::PowAssignExpr:
+      return JSOp::Pow;
+    case ParseNodeKind::CoalesceAssignExpr:
+    case ParseNodeKind::OrAssignExpr:
+    case ParseNodeKind::AndAssignExpr:
+      [[fallthrough]];
+    default:
+      MOZ_CRASH("unexpected compound assignment op");
+  }
+}
+
+bool BytecodeEmitter::emitAssignmentOrInit(ParseNodeKind kind, ParseNode* lhs,
+                                           ParseNode* rhs) {
+  JSOp compoundOp = CompoundAssignmentParseNodeKindToJSOp(kind);
+  bool isCompound = compoundOp != JSOp::Nop;
+  bool isInit = kind == ParseNodeKind::InitExpr;
+
+  if (isInit || kind == ParseNodeKind::AssignExpr) {
+    if (lhs->isKind(ParseNodeKind::DotExpr)) {
+      if (lhs->as<PropertyAccess>().expression().isKind(
+              ParseNodeKind::ThisExpr)) {
+        propertyAdditionEstimate++;
+      }
+    }
+  }
+
+  MOZ_ASSERT_IF(isInit, lhs->isKind(ParseNodeKind::DotExpr) ||
+                            lhs->isKind(ParseNodeKind::ElemExpr) ||
+                            lhs->isKind(ParseNodeKind::PrivateMemberExpr));
+
+  TaggedParserAtomIndex name;
+
+  Maybe<NameOpEmitter> noe;
+  Maybe<PropOpEmitter> poe;
+  Maybe<ElemOpEmitter> eoe;
+  Maybe<PrivateOpEmitter> xoe;
+
+  uint8_t offset = 1;
+
+  TaggedParserAtomIndex anonFunctionName;
+
+  switch (lhs->getKind()) {
+    case ParseNodeKind::Name: {
+      name = lhs->as<NameNode>().name();
+      anonFunctionName = name;
+      noe.emplace(this, name,
+                  isCompound ? NameOpEmitter::Kind::CompoundAssignment
+                             : NameOpEmitter::Kind::SimpleAssignment);
+      break;
+    }
+    case ParseNodeKind::ArgumentsLength:
+    case ParseNodeKind::DotExpr: {
+      PropertyAccess* prop = &lhs->as<PropertyAccess>();
+      bool isSuper = prop->isSuper();
+      poe.emplace(this,
+                  isCompound ? PropOpEmitter::Kind::CompoundAssignment
+                  : isInit   ? PropOpEmitter::Kind::PropInit
+                             : PropOpEmitter::Kind::SimpleAssignment,
+                  isSuper ? PropOpEmitter::ObjKind::Super
+                          : PropOpEmitter::ObjKind::Other);
+      if (!poe->prepareForObj()) {
+        return false;
+      }
+      anonFunctionName = prop->name();
+      if (isSuper) {
+        UnaryNode* base = &prop->expression().as<UnaryNode>();
+        if (!emitGetThisForSuperBase(base)) {
+          return false;
+        }
+        offset += 2;
+      } else {
+        if (!emitTree(&prop->expression())) {
+          return false;
+        }
+        offset += 1;
+      }
+      break;
+    }
+    case ParseNodeKind::ElemExpr: {
+      PropertyByValue* elem = &lhs->as<PropertyByValue>();
+      bool isSuper = elem->isSuper();
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
+      eoe.emplace(this,
+                  isCompound ? ElemOpEmitter::Kind::CompoundAssignment
+                  : isInit   ? ElemOpEmitter::Kind::PropInit
+                             : ElemOpEmitter::Kind::SimpleAssignment,
+                  isSuper ? ElemOpEmitter::ObjKind::Super
+                          : ElemOpEmitter::ObjKind::Other);
+      if (!emitElemObjAndKey(elem, *eoe)) {
+        return false;
+      }
+      if (isSuper) {
+        offset += 3;
+      } else {
+        offset += 2;
+      }
+      break;
+    }
+    case ParseNodeKind::PrivateMemberExpr: {
+      PrivateMemberAccess* privateExpr = &lhs->as<PrivateMemberAccess>();
+      xoe.emplace(this,
+                  isCompound ? PrivateOpEmitter::Kind::CompoundAssignment
+                  : isInit   ? PrivateOpEmitter::Kind::PropInit
+                             : PrivateOpEmitter::Kind::SimpleAssignment,
+                  privateExpr->privateName().name());
+      if (!emitTree(&privateExpr->expression())) {
+        return false;
+      }
+      if (!xoe->emitReference()) {
+        return false;
+      }
+      offset += xoe->numReferenceSlots();
+      break;
+    }
+    case ParseNodeKind::ArrayExpr:
+    case ParseNodeKind::ObjectExpr:
+      break;
+    case ParseNodeKind::CallExpr:
+      if (!emitTree(lhs)) {
+        return false;
+      }
+
+      if (!emit2(JSOp::ThrowMsg, uint8_t(ThrowMsgKind::AssignToCall))) {
+        return false;
+      }
+
+      if (!emit1(JSOp::Pop)) {
+        return false;
+      }
+      break;
+    default:
+      MOZ_ASSERT(0);
+  }
+
+  if (isCompound) {
+    MOZ_ASSERT(rhs);
+    switch (lhs->getKind()) {
+      case ParseNodeKind::ArgumentsLength:
+      case ParseNodeKind::DotExpr: {
+        PropertyAccess* prop = &lhs->as<PropertyAccess>();
+        if (!poe->emitGet(prop->key().atom())) {
+          return false;
+        }
+        break;
+      }
+      case ParseNodeKind::ElemExpr: {
+        if (!eoe->emitGet()) {
+          return false;
+        }
+        break;
+      }
+      case ParseNodeKind::PrivateMemberExpr: {
+        if (!xoe->emitGet()) {
+          return false;
+        }
+        break;
+      }
+      case ParseNodeKind::CallExpr:
+        if (!emit1(JSOp::Null)) {
+          return false;
+        }
+        break;
+      default:;
+    }
+  }
+
+  switch (lhs->getKind()) {
+    case ParseNodeKind::Name:
+      if (!noe->prepareForRhs()) {
+        return false;
+      }
+      offset += noe->emittedBindOp();
+      break;
+    case ParseNodeKind::ArgumentsLength:
+    case ParseNodeKind::DotExpr:
+      if (!poe->prepareForRhs()) {
+        return false;
+      }
+      break;
+    case ParseNodeKind::ElemExpr:
+      if (!eoe->prepareForRhs()) {
+        return false;
+      }
+      break;
+    case ParseNodeKind::PrivateMemberExpr:
+      break;
+    default:
+      break;
+  }
+
+  if (rhs) {
+    if (!emitAssignmentRhs(rhs, anonFunctionName)) {
+      return false;
+    }
+  } else {
+    if (!emitAssignmentRhs(offset)) {
+      return false;
+    }
+  }
+
+  if (isCompound) {
+    if (!emit1(compoundOp)) {
+      return false;
+    }
+    if (!emit1(JSOp::NopIsAssignOp)) {
+      return false;
+    }
+  }
+
+  switch (lhs->getKind()) {
+    case ParseNodeKind::Name: {
+      if (!noe->emitAssignment()) {
+        return false;
+      }
+      break;
+    }
+    case ParseNodeKind::ArgumentsLength:
+    case ParseNodeKind::DotExpr: {
+      PropertyAccess* prop = &lhs->as<PropertyAccess>();
+      if (!poe->emitAssignment(prop->key().atom())) {
+        return false;
+      }
+      break;
+    }
+    case ParseNodeKind::CallExpr:
+      break;
+    case ParseNodeKind::ElemExpr: {
+      if (!eoe->emitAssignment()) {
+        return false;
+      }
+      break;
+    }
+    case ParseNodeKind::PrivateMemberExpr:
+      if (!xoe->emitAssignment()) {
+        return false;
+      }
+      break;
+    case ParseNodeKind::ArrayExpr:
+    case ParseNodeKind::ObjectExpr: {
+      auto selfHostedIter =
+          rhs ? getSelfHostedIterFor(rhs) : SelfHostedIter::Deny;
+      if (!emitDestructuringOps(&lhs->as<ListNode>(),
+                                DestructuringFlavor::Assignment,
+                                selfHostedIter)) {
+        return false;
+      }
+      break;
+    }
+    default:
+      MOZ_ASSERT(0);
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitShortCircuitAssignment(AssignmentNode* node) {
+  TDZCheckCache tdzCache(this);
+
+  JSOp op;
+  switch (node->getKind()) {
+    case ParseNodeKind::CoalesceAssignExpr:
+      op = JSOp::Coalesce;
+      break;
+    case ParseNodeKind::OrAssignExpr:
+      op = JSOp::Or;
+      break;
+    case ParseNodeKind::AndAssignExpr:
+      op = JSOp::And;
+      break;
+    default:
+      MOZ_CRASH("Unexpected ParseNodeKind");
+  }
+
+  ParseNode* lhs = node->left();
+  ParseNode* rhs = node->right();
+
+  TaggedParserAtomIndex name;
+
+  Maybe<NameOpEmitter> noe;
+  Maybe<PropOpEmitter> poe;
+  Maybe<ElemOpEmitter> eoe;
+  Maybe<PrivateOpEmitter> xoe;
+
+  int32_t depth = bytecodeSection().stackDepth();
+
+  int32_t numPushed;
+
+  switch (lhs->getKind()) {
+    case ParseNodeKind::Name: {
+      name = lhs->as<NameNode>().name();
+      noe.emplace(this, name, NameOpEmitter::Kind::CompoundAssignment);
+
+      if (!noe->prepareForRhs()) {
+        return false;
+      }
+
+      numPushed = noe->emittedBindOp();
+      break;
+    }
+    case ParseNodeKind::ArgumentsLength:
+    case ParseNodeKind::DotExpr: {
+      PropertyAccess* prop = &lhs->as<PropertyAccess>();
+      bool isSuper = prop->isSuper();
+
+      poe.emplace(this, PropOpEmitter::Kind::CompoundAssignment,
+                  isSuper ? PropOpEmitter::ObjKind::Super
+                          : PropOpEmitter::ObjKind::Other);
+
+      if (!poe->prepareForObj()) {
+        return false;
+      }
+
+      if (isSuper) {
+        UnaryNode* base = &prop->expression().as<UnaryNode>();
+        if (!emitGetThisForSuperBase(base)) {
+          return false;
+        }
+      } else {
+        if (!emitTree(&prop->expression())) {
+          return false;
+        }
+      }
+
+      if (!poe->emitGet(prop->key().atom())) {
+        return false;
+      }
+
+      if (!poe->prepareForRhs()) {
+        return false;
+      }
+
+      numPushed = 1 + isSuper;
+      break;
+    }
+
+    case ParseNodeKind::ElemExpr: {
+      PropertyByValue* elem = &lhs->as<PropertyByValue>();
+      bool isSuper = elem->isSuper();
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
+      eoe.emplace(this, ElemOpEmitter::Kind::CompoundAssignment,
+                  isSuper ? ElemOpEmitter::ObjKind::Super
+                          : ElemOpEmitter::ObjKind::Other);
+
+      if (!emitElemObjAndKey(elem, *eoe)) {
+        return false;
+      }
+
+      if (!eoe->emitGet()) {
+        return false;
+      }
+
+      if (!eoe->prepareForRhs()) {
+        return false;
+      }
+
+      numPushed = 2 + isSuper;
+      break;
+    }
+
+    case ParseNodeKind::PrivateMemberExpr: {
+      PrivateMemberAccess* privateExpr = &lhs->as<PrivateMemberAccess>();
+      xoe.emplace(this, PrivateOpEmitter::Kind::CompoundAssignment,
+                  privateExpr->privateName().name());
+      if (!emitTree(&privateExpr->expression())) {
+        return false;
+      }
+      if (!xoe->emitReference()) {
+        return false;
+      }
+      if (!xoe->emitGet()) {
+        return false;
+      }
+      numPushed = xoe->numReferenceSlots();
+      break;
+    }
+
+    default:
+      MOZ_CRASH();
+  }
+
+  MOZ_ASSERT(bytecodeSection().stackDepth() == depth + numPushed + 1);
+
+  JumpList jump;
+  if (!emitJump(op, &jump)) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  if (!emitAssignmentRhs(rhs, name)) {
+    return false;
+  }
+
+  switch (lhs->getKind()) {
+    case ParseNodeKind::Name: {
+      if (!noe->emitAssignment()) {
+        return false;
+      }
+      break;
+    }
+    case ParseNodeKind::ArgumentsLength:
+    case ParseNodeKind::DotExpr: {
+      PropertyAccess* prop = &lhs->as<PropertyAccess>();
+
+      if (!poe->emitAssignment(prop->key().atom())) {
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::ElemExpr: {
+      if (!eoe->emitAssignment()) {
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::PrivateMemberExpr:
+      if (!xoe->emitAssignment()) {
+        return false;
+      }
+      break;
+
+    default:
+      MOZ_CRASH();
+  }
+
+  MOZ_ASSERT(bytecodeSection().stackDepth() == depth + 1);
+
+  if (numPushed > 0) {
+    JumpList jumpAroundPop;
+    if (!emitJump(JSOp::Goto, &jumpAroundPop)) {
+      return false;
+    }
+
+    if (!emitJumpTargetAndPatch(jump)) {
+      return false;
+    }
+
+    bytecodeSection().setStackDepth(depth + 1 + numPushed);
+
+    if (!emitUnpickN(numPushed)) {
+      return false;
+    }
+    if (!emitPopN(numPushed)) {
+      return false;
+    }
+
+    if (!emitJumpTargetAndPatch(jumpAroundPop)) {
+      return false;
+    }
+  } else {
+    if (!emitJumpTargetAndPatch(jump)) {
+      return false;
+    }
+  }
+
+  MOZ_ASSERT(bytecodeSection().stackDepth() == depth + 1);
+
+  return true;
+}
+
+bool BytecodeEmitter::emitCallSiteObjectArray(ObjLiteralWriter& writer,
+                                              ListNode* cookedOrRaw,
+                                              ParseNode* head, uint32_t count) {
+  DebugOnly<size_t> idx = 0;
+  for (ParseNode* pn : cookedOrRaw->contentsFrom(head)) {
+    MOZ_ASSERT(pn->isKind(ParseNodeKind::TemplateStringExpr) ||
+               pn->isKind(ParseNodeKind::RawUndefinedExpr));
+
+    if (!emitObjLiteralValue(writer, pn)) {
+      return false;
+    }
+    idx++;
+  }
+  MOZ_ASSERT(idx == count);
+
+  return true;
+}
+
+bool BytecodeEmitter::emitCallSiteObject(CallSiteNode* callSiteObj) {
+  constexpr JSOp op = JSOp::CallSiteObj;
+
+  ListNode* raw = callSiteObj->rawNodes();
+  MOZ_ASSERT(raw->isKind(ParseNodeKind::ArrayExpr));
+  ParseNode* head = callSiteObj->head()->pn_next;
+
+  uint32_t count = callSiteObj->count() - 1;
+  MOZ_ASSERT(count == raw->count());
+
+  ObjLiteralWriter writer;
+  writer.beginCallSiteObj(op);
+  writer.beginDenseArrayElements();
+
+  MOZ_RELEASE_ASSERT(count < UINT32_MAX / 2,
+                     "Number of elements for both arrays must fit in uint32_t");
+  if (!emitCallSiteObjectArray(writer, callSiteObj, head, count)) {
+    return false;
+  }
+  if (!emitCallSiteObjectArray(writer, raw, raw->head(), count)) {
+    return false;
+  }
+
+  GCThingIndex cookedIndex;
+  if (!addObjLiteralData(writer, &cookedIndex)) {
+    return false;
+  }
+
+  MOZ_ASSERT(sc->hasCallSiteObj());
+
+  return emitInternedObjectOp(cookedIndex, op);
+}
+
+bool BytecodeEmitter::emitCatch(BinaryNode* catchClause) {
+  MOZ_ASSERT(innermostNestableControl->is<TryFinallyControl>());
+
+  ParseNode* param = catchClause->left();
+  if (!param) {
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+  } else {
+    switch (param->getKind()) {
+      case ParseNodeKind::ArrayExpr:
+      case ParseNodeKind::ObjectExpr:
+        if (!emitDestructuringOps(&param->as<ListNode>(),
+                                  DestructuringFlavor::Declaration,
+                                  SelfHostedIter::Deny)) {
+          return false;
+        }
+        if (!emit1(JSOp::Pop)) {
+          return false;
+        }
+        break;
+
+      case ParseNodeKind::Name:
+        if (!emitLexicalInitialization(&param->as<NameNode>())) {
+          return false;
+        }
+        if (!emit1(JSOp::Pop)) {
+          return false;
+        }
+        break;
+
+      default:
+        MOZ_ASSERT(0);
+    }
+  }
+
+  return emitTree(catchClause->right());
+}
+
+MOZ_NEVER_INLINE bool BytecodeEmitter::emitTry(TryNode* tryNode) {
+  LexicalScopeNode* catchScope = tryNode->catchScope();
+  ParseNode* finallyNode = tryNode->finallyBlock();
+
+  TryEmitter::Kind kind;
+  if (catchScope) {
+    if (finallyNode) {
+      kind = TryEmitter::Kind::TryCatchFinally;
+    } else {
+      kind = TryEmitter::Kind::TryCatch;
+    }
+  } else {
+    MOZ_ASSERT(finallyNode);
+    kind = TryEmitter::Kind::TryFinally;
+  }
+  TryEmitter tryCatch(this, kind, TryEmitter::ControlKind::Syntactic);
+
+  if (!tryCatch.emitTry()) {
+    return false;
+  }
+
+  if (!emitTree(tryNode->body())) {
+    return false;
+  }
+
+  if (catchScope) {
+    if (!tryCatch.emitCatch()) {
+      return false;
+    }
+
+    if (!emitTree(catchScope)) {
+      return false;
+    }
+  }
+
+  if (finallyNode) {
+    if (!tryCatch.emitFinally(Some(finallyNode->pn_pos.begin))) {
+      return false;
+    }
+
+    if (!emitTree(finallyNode)) {
+      return false;
+    }
+  }
+
+  if (!tryCatch.emitEnd()) {
+    return false;
+  }
+
+  return true;
+}
+
+[[nodiscard]] bool BytecodeEmitter::emitJumpToFinally(JumpList* jump,
+                                                      uint32_t idx) {
+  if (!emitNumberOp(idx)) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Null)) {
+    return false;
+  }
+
+  if (!emit1(JSOp::False)) {
+    return false;
+  }
+
+  if (!emitJumpNoFallthrough(JSOp::Goto, jump)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitIf(TernaryNode* ifNode) {
+  IfEmitter ifThenElse(this);
+
+  if (!ifThenElse.emitIf(Some(ifNode->kid1()->pn_pos.begin))) {
+    return false;
+  }
+
+if_again:
+  ParseNode* testNode = ifNode->kid1();
+  auto conditionKind = IfEmitter::ConditionKind::Positive;
+  if (testNode->isKind(ParseNodeKind::NotExpr)) {
+    testNode = testNode->as<UnaryNode>().kid();
+    conditionKind = IfEmitter::ConditionKind::Negative;
+  }
+
+  if (!markStepBreakpoint()) {
+    return false;
+  }
+
+  if (!emitTree(testNode)) {
+    return false;
+  }
+
+  ParseNode* elseNode = ifNode->kid3();
+  if (elseNode) {
+    if (!ifThenElse.emitThenElse(conditionKind)) {
+      return false;
+    }
+  } else {
+    if (!ifThenElse.emitThen(conditionKind)) {
+      return false;
+    }
+  }
+
+  if (!emitTree(ifNode->kid2())) {
+    return false;
+  }
+
+  if (elseNode) {
+    if (elseNode->isKind(ParseNodeKind::IfStmt)) {
+      ifNode = &elseNode->as<TernaryNode>();
+
+      if (!ifThenElse.emitElseIf(Some(ifNode->kid1()->pn_pos.begin))) {
+        return false;
+      }
+
+      goto if_again;
+    }
+
+    if (!ifThenElse.emitElse()) {
+      return false;
+    }
+
+    if (!emitTree(elseNode)) {
+      return false;
+    }
+  }
+
+  if (!ifThenElse.emitEnd()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitHoistedFunctionsInList(ListNode* stmtList) {
+  MOZ_ASSERT(stmtList->hasTopLevelFunctionDeclarations());
+
+  if (stmtList->emittedTopLevelFunctionDeclarations()) {
+    return true;
+  }
+
+  stmtList->setEmittedTopLevelFunctionDeclarations();
+
+  for (ParseNode* stmt : stmtList->contents()) {
+    ParseNode* maybeFun = stmt;
+
+    if (!sc->strict()) {
+      while (maybeFun->isKind(ParseNodeKind::LabelStmt)) {
+        maybeFun = maybeFun->as<LabeledStatement>().statement();
+      }
+    }
+
+    if (maybeFun->is<FunctionNode>() &&
+        maybeFun->as<FunctionNode>().functionIsHoisted()) {
+      if (!emitTree(maybeFun)) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitLexicalScopeBody(
+    ParseNode* body, EmitLineNumberNote emitLineNote ) {
+  if (body->isKind(ParseNodeKind::StatementList) &&
+      body->as<ListNode>().hasTopLevelFunctionDeclarations()) {
+    if (!emitHoistedFunctionsInList(&body->as<ListNode>())) {
+      return false;
+    }
+  }
+
+  return emitTree(body, ValueUsage::WantValue, emitLineNote);
+}
+
+MOZ_NEVER_INLINE bool BytecodeEmitter::emitLexicalScope(
+    LexicalScopeNode* lexicalScope) {
+  LexicalScopeEmitter lse(this);
+
+  ParseNode* body = lexicalScope->scopeBody();
+  if (lexicalScope->isEmptyScope()) {
+    if (!lse.emitEmptyScope()) {
+      return false;
+    }
+
+    if (!emitLexicalScopeBody(body)) {
+      return false;
+    }
+
+    if (!lse.emitEnd()) {
+      return false;
+    }
+
+    return true;
+  }
+
+  if (!ParseNodeRequiresSpecialLineNumberNotes(body)) {
+    if (!updateSourceCoordNotes(lexicalScope->pn_pos.begin)) {
+      return false;
+    }
+  }
+
+  ScopeKind kind;
+  if (body->isKind(ParseNodeKind::Catch)) {
+    BinaryNode* catchNode = &body->as<BinaryNode>();
+    kind =
+        (!catchNode->left() || catchNode->left()->isKind(ParseNodeKind::Name))
+            ? ScopeKind::SimpleCatch
+            : ScopeKind::Catch;
+  } else {
+    kind = lexicalScope->kind();
+  }
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  BlockKind blockKind = BlockKind::Other;
+  if (body->isKind(ParseNodeKind::ForStmt) &&
+      body->as<ForNode>().head()->isKind(ParseNodeKind::ForOf)) {
+    MOZ_ASSERT(kind == ScopeKind::Lexical);
+    blockKind = BlockKind::ForOf;
+  }
+#endif
+
+  if (!lse.emitScope(kind, lexicalScope->scopeBindings()
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+                               ,
+                     blockKind
+#endif
+                     )) {
+    return false;
+  }
+
+  if (body->isKind(ParseNodeKind::ForStmt)) {
+    if (!emitFor(&body->as<ForNode>(), &lse.emitterScope())) {
+      return false;
+    }
+  } else {
+    if (!emitLexicalScopeBody(body, SUPPRESS_LINENOTE)) {
+      return false;
+    }
+  }
+
+  if (!lse.emitEnd()) {
+    return false;
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitWith(BinaryNode* withNode) {
+  if (!updateSourceCoordNotes(withNode->left()->pn_pos.begin)) {
+    return false;
+  }
+
+  if (!markStepBreakpoint()) {
+    return false;
+  }
+
+  if (!emitTree(withNode->left())) {
+    return false;
+  }
+
+  EmitterScope emitterScope(this);
+  if (!emitterScope.enterWith(this)) {
+    return false;
+  }
+
+  if (!emitTree(withNode->right())) {
+    return false;
+  }
+
+  return emitterScope.leave(this);
+}
+
+bool BytecodeEmitter::emitCopyDataProperties(CopyOption option) {
+  DebugOnly<int32_t> depth = bytecodeSection().stackDepth();
+
+  uint32_t argc;
+  if (option == CopyOption::Filtered) {
+    MOZ_ASSERT(depth > 2);
+    argc = 3;
+
+    if (!emitAtomOp(JSOp::GetIntrinsic,
+                    TaggedParserAtomIndex::WellKnown::CopyDataProperties())) {
+      return false;
+    }
+  } else {
+    MOZ_ASSERT(depth > 1);
+    argc = 2;
+
+    if (!emitAtomOp(
+            JSOp::GetIntrinsic,
+            TaggedParserAtomIndex::WellKnown::CopyDataPropertiesUnfiltered())) {
+      return false;
+    }
+  }
+
+  if (!emit1(JSOp::Undefined)) {
+    return false;
+  }
+  if (!emit2(JSOp::Pick, argc + 1)) {
+    return false;
+  }
+  if (!emit2(JSOp::Pick, argc + 1)) {
+    return false;
+  }
+  if (option == CopyOption::Filtered) {
+    if (!emit2(JSOp::Pick, argc + 1)) {
+      return false;
+    }
+  }
+  if (!emitCall(JSOp::CallIgnoresRv, argc)) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  MOZ_ASSERT(depth - int(argc) == bytecodeSection().stackDepth());
+  return true;
+}
+
+bool BytecodeEmitter::emitBigIntOp(BigIntLiteral* bigint) {
+  GCThingIndex index;
+  if (!perScriptData().gcThingList().append(bigint, &index)) {
+    return false;
+  }
+  return emitGCIndexOp(JSOp::BigInt, index);
+}
+
+bool BytecodeEmitter::emitIterable(ParseNode* value,
+                                   SelfHostedIter selfHostedIter,
+                                   IteratorKind iterKind) {
+  MOZ_ASSERT(getSelfHostedIterFor(value) == selfHostedIter);
+
+  if (!emitTree(value)) {
+    return false;
+  }
+
+  switch (selfHostedIter) {
+    case SelfHostedIter::Deny:
+    case SelfHostedIter::AllowContent:
+      return true;
+
+    case SelfHostedIter::AllowContentWith: {
+      ListNode* argsList = value->as<CallNode>().args();
+      MOZ_ASSERT_IF(iterKind == IteratorKind::Sync, argsList->count() == 2);
+      MOZ_ASSERT_IF(iterKind == IteratorKind::Async, argsList->count() == 3);
+
+      if (!emitTree(argsList->head()->pn_next)) {
+        return false;
+      }
+
+      if (iterKind == IteratorKind::Async) {
+        if (!emitTree(argsList->head()->pn_next->pn_next)) {
+          return false;
+        }
+      }
+
+      return true;
+    }
+
+    case SelfHostedIter::AllowContentWithNext: {
+      ListNode* argsList = value->as<CallNode>().args();
+      MOZ_ASSERT(argsList->count() == 2);
+
+      if (!emitTree(argsList->head()->pn_next)) {
+        return false;
+      }
+
+      if (!emit1(JSOp::Swap)) {
+        return false;
+      }
+
+      return true;
+    }
+  }
+
+  MOZ_CRASH("invalid self-hosted iteration kind");
+}
+
+bool BytecodeEmitter::emitIterator(SelfHostedIter selfHostedIter) {
+  MOZ_ASSERT(selfHostedIter != SelfHostedIter::Deny ||
+                 emitterMode != BytecodeEmitter::SelfHosting,
+             "[Symbol.iterator]() call is prohibited in self-hosted code "
+             "because it can run user-modifiable iteration code");
+
+  if (selfHostedIter == SelfHostedIter::AllowContentWithNext) {
+
+    return true;
+  }
+
+  if (selfHostedIter != SelfHostedIter::AllowContentWith) {
+
+    if (!emit1(JSOp::Dup)) {
+      return false;
+    }
+    if (!emit2(JSOp::Symbol, uint8_t(JS::SymbolCode::iterator))) {
+      return false;
+    }
+    if (!emitElemOpBase(JSOp::GetElem)) {
+      return false;
+    }
+  }
+
+  if (!emit1(JSOp::Swap)) {
+    return false;
+  }
+  if (!emitCall(getIterCallOp(JSOp::CallIter, selfHostedIter), 0)) {
+    return false;
+  }
+  if (!emitCheckIsObj(CheckIsObjectKind::GetIterator)) {
+    return false;
+  }
+  if (!emit1(JSOp::Dup)) {
+    return false;
+  }
+  if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::next())) {
+    return false;
+  }
+  if (!emit1(JSOp::Swap)) {
+    return false;
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitAsyncIterator(SelfHostedIter selfHostedIter) {
+  MOZ_ASSERT(selfHostedIter != SelfHostedIter::AllowContentWithNext);
+  MOZ_ASSERT(selfHostedIter != SelfHostedIter::Deny ||
+                 emitterMode != BytecodeEmitter::SelfHosting,
+             "[Symbol.asyncIterator]() call is prohibited in self-hosted code "
+             "because it can run user-modifiable iteration code");
+
+  if (selfHostedIter != SelfHostedIter::AllowContentWith) {
+
+    if (!emit1(JSOp::Dup)) {
+      return false;
+    }
+    if (!emit2(JSOp::Symbol, uint8_t(JS::SymbolCode::asyncIterator))) {
+      return false;
+    }
+    if (!emitElemOpBase(JSOp::GetElem)) {
+      return false;
+    }
+  } else {
+
+    if (!emitElemOpBase(JSOp::Swap)) {
+      return false;
+    }
+  }
+
+  InternalIfEmitter ifAsyncIterIsUndefined(this);
+  if (!emit1(JSOp::IsNullOrUndefined)) {
+    return false;
+  }
+  if (!ifAsyncIterIsUndefined.emitThenElse()) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  if (selfHostedIter != SelfHostedIter::AllowContentWith) {
+    if (!emit1(JSOp::Dup)) {
+      return false;
+    }
+    if (!emit2(JSOp::Symbol, uint8_t(JS::SymbolCode::iterator))) {
+      return false;
+    }
+    if (!emitElemOpBase(JSOp::GetElem)) {
+      return false;
+    }
+  } else {
+  }
+
+  if (!emit1(JSOp::Swap)) {
+    return false;
+  }
+  if (!emitCall(getIterCallOp(JSOp::CallIter, selfHostedIter), 0)) {
+    return false;
+  }
+  if (!emitCheckIsObj(CheckIsObjectKind::GetIterator)) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Dup)) {
+    return false;
+  }
+  if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::next())) {
+    return false;
+  }
+
+  if (!emit1(JSOp::ToAsyncIter)) {
+    return false;
+  }
+
+  if (!ifAsyncIterIsUndefined.emitElse()) {
+    return false;
+  }
+
+  if (selfHostedIter == SelfHostedIter::AllowContentWith) {
+    if (!emit1(JSOp::Swap)) {
+      return false;
+    }
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+  if (!emit1(JSOp::Swap)) {
+    return false;
+  }
+  if (!emitCall(getIterCallOp(JSOp::CallIter, selfHostedIter), 0)) {
+    return false;
+  }
+  if (!emitCheckIsObj(CheckIsObjectKind::GetAsyncIterator)) {
+    return false;
+  }
+
+  if (!ifAsyncIterIsUndefined.emitEnd()) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Dup)) {
+    return false;
+  }
+  if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::next())) {
+    return false;
+  }
+  if (!emit1(JSOp::Swap)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitSpread(SelfHostedIter selfHostedIter) {
+  LoopControl loopInfo(this, StatementKind::Spread);
+
+  if (!loopInfo.emitLoopHead(this, Nothing())) {
+    return false;
+  }
+
+  {
+#ifdef DEBUG
+    auto loopDepth = bytecodeSection().stackDepth();
+#endif
+
+
+    if (!emitDupAt(3, 2)) {
+      return false;
+    }
+    if (!emitIteratorNext(Nothing(), IteratorKind::Sync, selfHostedIter)) {
+      return false;
+    }
+    if (!emit1(JSOp::Dup)) {
+      return false;
+    }
+    if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::done())) {
+      return false;
+    }
+    if (!emitJump(JSOp::JumpIfTrue, &loopInfo.breaks)) {
+      return false;
+    }
+
+    if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::value())) {
+      return false;
+    }
+    if (!emit1(JSOp::InitElemInc)) {
+      return false;
+    }
+
+    if (!loopInfo.emitLoopEnd(this, JSOp::Goto, TryNoteKind::ForOf)) {
+      return false;
+    }
+
+    MOZ_ASSERT(bytecodeSection().stackDepth() == loopDepth);
+  }
+
+  bytecodeSection().setStackDepth(bytecodeSection().stackDepth() + 1);
+
+  MOZ_ASSERT(!loopInfo.continues.offset.valid());
+
+  if (!emit2(JSOp::Pick, 4)) {
+    return false;
+  }
+  if (!emit2(JSOp::Pick, 4)) {
+    return false;
+  }
+
+  return emitPopN(3);
+}
+
+bool BytecodeEmitter::emitInitializeForInOrOfTarget(TernaryNode* forHead) {
+  MOZ_ASSERT(forHead->isKind(ParseNodeKind::ForIn) ||
+             forHead->isKind(ParseNodeKind::ForOf));
+
+  MOZ_ASSERT(bytecodeSection().stackDepth() >= 1,
+             "must have a per-iteration value for initializing");
+
+  ParseNode* target = forHead->kid1();
+  MOZ_ASSERT(!forHead->kid2());
+
+  if (!target->is<DeclarationListNode>()) {
+    return emitAssignmentOrInit(ParseNodeKind::AssignExpr, target, nullptr);
+  }
+
+
+  auto* declarationList = &target->as<DeclarationListNode>();
+  if (!updateSourceCoordNotes(declarationList->pn_pos.begin)) {
+    return false;
+  }
+
+  target = declarationList->singleBinding();
+
+  NameNode* nameNode = nullptr;
+  if (target->isKind(ParseNodeKind::Name)) {
+    nameNode = &target->as<NameNode>();
+  } else if (target->isKind(ParseNodeKind::AssignExpr)) {
+    BinaryNode* assignNode = &target->as<BinaryNode>();
+    if (assignNode->left()->is<NameNode>()) {
+      nameNode = &assignNode->left()->as<NameNode>();
+    }
+  }
+
+  if (nameNode) {
+    auto nameAtom = nameNode->name();
+    NameOpEmitter noe(this, nameAtom, NameOpEmitter::Kind::Initialize);
+    if (!noe.prepareForRhs()) {
+      return false;
+    }
+    if (noe.emittedBindOp()) {
+      MOZ_ASSERT(bytecodeSection().stackDepth() >= 2);
+      if (!emit1(JSOp::Swap)) {
+        return false;
+      }
+    } else {
+      MOZ_ASSERT(bytecodeSection().stackDepth() >= 1);
+    }
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+    if (declarationList->isKind(ParseNodeKind::UsingDecl)) {
+      if (!innermostEmitterScope()->prepareForDisposableAssignment(
+              UsingHint::Sync)) {
+        return false;
+      }
+    } else if (declarationList->isKind(ParseNodeKind::AwaitUsingDecl)) {
+      if (!innermostEmitterScope()->prepareForDisposableAssignment(
+              UsingHint::Async)) {
+        return false;
+      }
+    }
+#endif
+
+    if (!noe.emitAssignment()) {
+      return false;
+    }
+
+    return true;
+  }
+
+  MOZ_ASSERT(
+      !target->isKind(ParseNodeKind::AssignExpr),
+      "for-in/of loop destructuring declarations can't have initializers");
+
+  MOZ_ASSERT(target->isKind(ParseNodeKind::ArrayExpr) ||
+             target->isKind(ParseNodeKind::ObjectExpr));
+  return emitDestructuringOps(&target->as<ListNode>(),
+                              DestructuringFlavor::Declaration,
+                              SelfHostedIter::Deny);
+}
+
+bool BytecodeEmitter::emitForOf(ForNode* forOfLoop,
+                                const EmitterScope* headLexicalEmitterScope) {
+  MOZ_ASSERT(forOfLoop->isKind(ParseNodeKind::ForStmt));
+
+  TernaryNode* forOfHead = forOfLoop->head();
+  MOZ_ASSERT(forOfHead->isKind(ParseNodeKind::ForOf));
+
+  unsigned iflags = forOfLoop->iflags();
+  IteratorKind iterKind =
+      (iflags & JSITER_FORAWAITOF) ? IteratorKind::Async : IteratorKind::Sync;
+  MOZ_ASSERT_IF(iterKind == IteratorKind::Async, sc->isSuspendableContext());
+  MOZ_ASSERT_IF(iterKind == IteratorKind::Async,
+                sc->asSuspendableContext()->isAsync());
+
+  ParseNode* forHeadExpr = forOfHead->kid3();
+
+  auto selfHostedIter = getSelfHostedIterFor(forHeadExpr);
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  ForOfEmitter::HeadUsingDeclarationKind headUsingDeclKind =
+      ForOfEmitter::HeadUsingDeclarationKind::None;
+  if (forOfHead->kid1()->isKind(ParseNodeKind::UsingDecl)) {
+    headUsingDeclKind = ForOfEmitter::HeadUsingDeclarationKind::Sync;
+  } else if (forOfHead->kid1()->isKind(ParseNodeKind::AwaitUsingDecl)) {
+    headUsingDeclKind = ForOfEmitter::HeadUsingDeclarationKind::Async;
+  }
+#endif
+
+  ForOfEmitter forOf(this, headLexicalEmitterScope, selfHostedIter, iterKind
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+                     ,
+                     headUsingDeclKind
+#endif
+  );
+
+  if (!forOf.emitIterated()) {
+    return false;
+  }
+
+  if (!updateSourceCoordNotes(forHeadExpr->pn_pos.begin)) {
+    return false;
+  }
+  if (!markStepBreakpoint()) {
+    return false;
+  }
+  if (!emitIterable(forHeadExpr, selfHostedIter, iterKind)) {
+    return false;
+  }
+
+  if (headLexicalEmitterScope) {
+    DebugOnly<ParseNode*> forOfTarget = forOfHead->kid1();
+    MOZ_ASSERT(forOfTarget->isKind(ParseNodeKind::LetDecl) ||
+               forOfTarget->isKind(ParseNodeKind::ConstDecl)
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+               || forOfTarget->isKind(ParseNodeKind::UsingDecl) ||
+               forOfTarget->isKind(ParseNodeKind::AwaitUsingDecl)
+#endif
+    );
+  }
+
+  if (!forOf.emitInitialize(forOfHead->pn_pos.begin)) {
+    return false;
+  }
+
+  if (!emitInitializeForInOrOfTarget(forOfHead)) {
+    return false;
+  }
+
+  if (!forOf.emitBody()) {
+    return false;
+  }
+
+  ParseNode* forBody = forOfLoop->body();
+  if (!emitTree(forBody)) {
+    return false;
+  }
+
+  if (!forOf.emitEnd(forHeadExpr->pn_pos.begin)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitForIn(ForNode* forInLoop,
+                                const EmitterScope* headLexicalEmitterScope) {
+  TernaryNode* forInHead = forInLoop->head();
+  MOZ_ASSERT(forInHead->isKind(ParseNodeKind::ForIn));
+
+  ForInEmitter forIn(this, headLexicalEmitterScope);
+
+  ParseNode* forInTarget = forInHead->kid1();
+  if (forInTarget->is<DeclarationListNode>()) {
+    auto* declarationList = &forInTarget->as<DeclarationListNode>();
+
+    ParseNode* decl = declarationList->singleBinding();
+    if (decl->isKind(ParseNodeKind::AssignExpr)) {
+      BinaryNode* assignNode = &decl->as<BinaryNode>();
+      if (assignNode->left()->is<NameNode>()) {
+        NameNode* nameNode = &assignNode->left()->as<NameNode>();
+        ParseNode* initializer = assignNode->right();
+        MOZ_ASSERT(
+            forInTarget->isKind(ParseNodeKind::VarStmt),
+            "for-in initializers are only permitted for |var| declarations");
+
+        if (!updateSourceCoordNotes(decl->pn_pos.begin)) {
+          return false;
+        }
+
+        auto nameAtom = nameNode->name();
+        NameOpEmitter noe(this, nameAtom, NameOpEmitter::Kind::Initialize);
+        if (!noe.prepareForRhs()) {
+          return false;
+        }
+        if (!emitInitializer(initializer, nameNode)) {
+          return false;
+        }
+        if (!noe.emitAssignment()) {
+          return false;
+        }
+
+        if (!emit1(JSOp::Pop)) {
+          return false;
+        }
+      }
+    }
+  }
+
+  if (!forIn.emitIterated()) {
+    return false;
+  }
+
+  ParseNode* expr = forInHead->kid3();
+
+  if (!updateSourceCoordNotes(expr->pn_pos.begin)) {
+    return false;
+  }
+  if (!markStepBreakpoint()) {
+    return false;
+  }
+  if (!emitTree(expr)) {
+    return false;
+  }
+
+  MOZ_ASSERT(forInLoop->iflags() == 0);
+
+  MOZ_ASSERT_IF(headLexicalEmitterScope,
+                forInTarget->isKind(ParseNodeKind::LetDecl) ||
+                    forInTarget->isKind(ParseNodeKind::ConstDecl));
+
+  if (!forIn.emitInitialize()) {
+    return false;
+  }
+
+  if (!emitInitializeForInOrOfTarget(forInHead)) {
+    return false;
+  }
+
+  if (!forIn.emitBody()) {
+    return false;
+  }
+
+  ParseNode* forBody = forInLoop->body();
+  if (!emitTree(forBody)) {
+    return false;
+  }
+
+  if (!forIn.emitEnd(forInHead->pn_pos.begin)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitCStyleFor(
+    ForNode* forNode, const EmitterScope* headLexicalEmitterScope) {
+  TernaryNode* forHead = forNode->head();
+  ParseNode* forBody = forNode->body();
+  ParseNode* init = forHead->kid1();
+  ParseNode* cond = forHead->kid2();
+  ParseNode* update = forHead->kid3();
+  bool isLet = init && init->isKind(ParseNodeKind::LetDecl);
+
+  CForEmitter cfor(this, isLet ? headLexicalEmitterScope : nullptr);
+
+  if (!cfor.emitInit(init ? Some(init->pn_pos.begin) : Nothing())) {
+    return false;
+  }
+
+  if (init) {
+    if (init->is<DeclarationListNode>()) {
+      MOZ_ASSERT(!init->as<DeclarationListNode>().empty());
+
+      if (!emitTree(init)) {
+        return false;
+      }
+    } else {
+      if (!updateSourceCoordNotes(init->pn_pos.begin)) {
+        return false;
+      }
+      if (!markStepBreakpoint()) {
+        return false;
+      }
+
+      if (!emitTree(init, ValueUsage::IgnoreValue)) {
+        return false;
+      }
+      if (!emit1(JSOp::Pop)) {
+        return false;
+      }
+    }
+  }
+
+  if (!cfor.emitCond(cond ? Some(cond->pn_pos.begin) : Nothing())) {
+    return false;
+  }
+
+  if (cond) {
+    if (!updateSourceCoordNotes(cond->pn_pos.begin)) {
+      return false;
+    }
+    if (!markStepBreakpoint()) {
+      return false;
+    }
+    if (!emitTree(cond)) {
+      return false;
+    }
+  }
+
+  if (!cfor.emitBody(cond ? CForEmitter::Cond::Present
+                          : CForEmitter::Cond::Missing)) {
+    return false;
+  }
+
+  if (!emitTree(forBody)) {
+    return false;
+  }
+
+  if (!cfor.emitUpdate(
+          update ? CForEmitter::Update::Present : CForEmitter::Update::Missing,
+          update ? Some(update->pn_pos.begin) : Nothing())) {
+    return false;
+  }
+
+  if (update) {
+    if (!updateSourceCoordNotes(update->pn_pos.begin)) {
+      return false;
+    }
+    if (!markStepBreakpoint()) {
+      return false;
+    }
+    if (!emitTree(update, ValueUsage::IgnoreValue)) {
+      return false;
+    }
+  }
+
+  if (!cfor.emitEnd(forNode->pn_pos.begin)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitFor(ForNode* forNode,
+                              const EmitterScope* headLexicalEmitterScope) {
+  if (forNode->head()->isKind(ParseNodeKind::ForHead)) {
+    return emitCStyleFor(forNode, headLexicalEmitterScope);
+  }
+
+  if (!updateLineNumberNotes(forNode->pn_pos.begin)) {
+    return false;
+  }
+
+  if (forNode->head()->isKind(ParseNodeKind::ForIn)) {
+    return emitForIn(forNode, headLexicalEmitterScope);
+  }
+
+  MOZ_ASSERT(forNode->head()->isKind(ParseNodeKind::ForOf));
+  return emitForOf(forNode, headLexicalEmitterScope);
+}
+
+MOZ_NEVER_INLINE bool BytecodeEmitter::emitFunction(
+    FunctionNode* funNode, bool needsProto ) {
+  FunctionBox* funbox = funNode->funbox();
+
+
+  FunctionEmitter fe(this, funbox, funNode->syntaxKind(),
+                     funNode->functionIsHoisted()
+                         ? FunctionEmitter::IsHoisted::Yes
+                         : FunctionEmitter::IsHoisted::No);
+
+  if (funbox->wasEmittedByEnclosingScript()) {
+    if (!fe.emitAgain()) {
+      return false;
+    }
+    MOZ_ASSERT(funNode->functionIsHoisted());
+  } else {
+    MOZ_ASSERT(funbox->isInterpreted());
+    if (!funbox->emitBytecode) {
+      return fe.emitLazy();
+    }
+
+    if (!fe.prepareForNonLazy()) {
+      return false;
+    }
+
+    BytecodeEmitter bce2(this, funbox);
+    if (!bce2.init(funNode->pn_pos)) {
+      return false;
+    }
+
+    if (!bce2.emitFunctionScript(funNode)) {
+      return false;
+    }
+
+    if (!fe.emitNonLazyEnd()) {
+      return false;
+    }
+  }
+
+  if (emitterMode == EmitterMode::SelfHosting) {
+    if (sc->isTopLevelContext()) {
+      MOZ_ASSERT(!funbox->isLambda());
+      MOZ_ASSERT(funbox->explicitName());
+      prevSelfHostedTopLevelFunction = funbox;
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitDo(BinaryNode* doNode) {
+  ParseNode* bodyNode = doNode->left();
+
+  DoWhileEmitter doWhile(this);
+  if (!doWhile.emitBody(doNode->pn_pos.begin, getOffsetForLoop(bodyNode))) {
+    return false;
+  }
+
+  if (!emitTree(bodyNode)) {
+    return false;
+  }
+
+  if (!doWhile.emitCond()) {
+    return false;
+  }
+
+  ParseNode* condNode = doNode->right();
+  if (!updateSourceCoordNotes(condNode->pn_pos.begin)) {
+    return false;
+  }
+  if (!markStepBreakpoint()) {
+    return false;
+  }
+  if (!emitTree(condNode)) {
+    return false;
+  }
+
+  if (!doWhile.emitEnd()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitWhile(BinaryNode* whileNode) {
+  ParseNode* bodyNode = whileNode->right();
+
+  WhileEmitter wh(this);
+
+  ParseNode* condNode = whileNode->left();
+  if (!wh.emitCond(whileNode->pn_pos.begin, getOffsetForLoop(condNode),
+                   whileNode->pn_pos.end)) {
+    return false;
+  }
+
+  if (!updateSourceCoordNotes(condNode->pn_pos.begin)) {
+    return false;
+  }
+  if (!markStepBreakpoint()) {
+    return false;
+  }
+  if (!emitTree(condNode)) {
+    return false;
+  }
+
+  if (!wh.emitBody()) {
+    return false;
+  }
+  if (!emitTree(bodyNode)) {
+    return false;
+  }
+
+  if (!wh.emitEnd()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitBreak(TaggedParserAtomIndex label) {
+  BreakableControl* target;
+  if (label) {
+    auto hasSameLabel = [label](LabelControl* labelControl) {
+      return labelControl->label() == label;
+    };
+    target = findInnermostNestableControl<LabelControl>(hasSameLabel);
+  } else {
+    auto isNotLabel = [](BreakableControl* control) {
+      return !control->is<LabelControl>();
+    };
+    target = findInnermostNestableControl<BreakableControl>(isNotLabel);
+  }
+
+  return emitGoto(target, GotoKind::Break);
+}
+
+bool BytecodeEmitter::emitContinue(TaggedParserAtomIndex label) {
+  LoopControl* target = nullptr;
+  if (label) {
+    NestableControl* control = innermostNestableControl;
+    while (!control->is<LabelControl>() ||
+           control->as<LabelControl>().label() != label) {
+      if (control->is<LoopControl>()) {
+        target = &control->as<LoopControl>();
+      }
+      control = control->enclosing();
+    }
+  } else {
+    target = findInnermostNestableControl<LoopControl>();
+  }
+  return emitGoto(target, GotoKind::Continue);
+}
+
+bool BytecodeEmitter::emitGetFunctionThis(NameNode* thisName) {
+  MOZ_ASSERT(sc->hasFunctionThisBinding());
+  MOZ_ASSERT(thisName->isName(TaggedParserAtomIndex::WellKnown::dot_this_()));
+
+  if (!updateLineNumberNotes(thisName->pn_pos.begin)) {
+    return false;
+  }
+
+  if (!emitGetName(TaggedParserAtomIndex::WellKnown::dot_this_())) {
+    return false;
+  }
+  if (sc->needsThisTDZChecks()) {
+    if (!emit1(JSOp::CheckThis)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitGetThisForSuperBase(UnaryNode* superBase) {
+  MOZ_ASSERT(superBase->isKind(ParseNodeKind::SuperBase));
+  NameNode* nameNode = &superBase->kid()->as<NameNode>();
+  return emitGetFunctionThis(nameNode);
+}
+
+bool BytecodeEmitter::emitThisLiteral(ThisLiteral* pn) {
+  if (ParseNode* kid = pn->kid()) {
+    NameNode* thisName = &kid->as<NameNode>();
+    return emitGetFunctionThis(thisName);
+  }
+
+  if (sc->thisBinding() == ThisBinding::Module) {
+    return emit1(JSOp::Undefined);
+  }
+
+  MOZ_ASSERT(sc->thisBinding() == ThisBinding::Global);
+
+  MOZ_ASSERT(outermostScope().hasNonSyntacticScopeOnChain() ==
+             sc->hasNonSyntacticScope());
+  if (sc->hasNonSyntacticScope()) {
+    return emit1(JSOp::NonSyntacticGlobalThis);
+  }
+
+  return emit1(JSOp::GlobalThis);
+}
+
+bool BytecodeEmitter::emitCheckDerivedClassConstructorReturn() {
+  MOZ_ASSERT(
+      lookupName(TaggedParserAtomIndex::WellKnown::dot_this_()).hasKnownSlot());
+  if (!emitGetName(TaggedParserAtomIndex::WellKnown::dot_this_())) {
+    return false;
+  }
+  if (!emit1(JSOp::CheckReturn)) {
+    return false;
+  }
+  if (!emit1(JSOp::SetRval)) {
+    return false;
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitNewTarget() {
+  MOZ_ASSERT(sc->allowNewTarget());
+
+  if (!emitGetName(TaggedParserAtomIndex::WellKnown::dot_newTarget_())) {
+    return false;
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitNewTarget(NewTargetNode* pn) {
+  MOZ_ASSERT(pn->newTargetName()->isName(
+      TaggedParserAtomIndex::WellKnown::dot_newTarget_()));
+
+  return emitNewTarget();
+}
+
+bool BytecodeEmitter::emitNewTarget(CallNode* pn) {
+  MOZ_ASSERT(pn->callOp() == JSOp::SuperCall ||
+             pn->callOp() == JSOp::SpreadSuperCall);
+
+  return emitNewTarget();
+}
+
+bool BytecodeEmitter::emitReturn(UnaryNode* returnNode) {
+  if (!updateSourceCoordNotes(returnNode->pn_pos.begin)) {
+    return false;
+  }
+
+  if (!markStepBreakpoint()) {
+    return false;
+  }
+
+  if (ParseNode* expr = returnNode->kid()) {
+    if (!emitTree(expr)) {
+      return false;
+    }
+
+    if (sc->asSuspendableContext()->isAsync() &&
+        sc->asSuspendableContext()->isGenerator()) {
+      if (!emitAwaitInInnermostScope()) {
+        return false;
+      }
+    }
+  } else {
+    if (!emit1(JSOp::Undefined)) {
+      return false;
+    }
+  }
+
+  if (!updateSourceCoordNotes(*functionBodyEndPos)) {
+    return false;
+  }
+
+  BytecodeOffset setRvalOffset = bytecodeSection().offset();
+  if (!emit1(JSOp::SetRval)) {
+    return false;
+  }
+
+  NonLocalExitControl nle(this, NonLocalExitKind::Return);
+  return nle.emitReturn(setRvalOffset);
+}
+
+bool BytecodeEmitter::finishReturn(BytecodeOffset setRvalOffset) {
+
+  bool isDerivedClassConstructor =
+      sc->isFunctionBox() && sc->asFunctionBox()->isDerivedClassConstructor();
+  bool needsFinalYield =
+      sc->isFunctionBox() && sc->asFunctionBox()->needsFinalYield();
+  bool isSimpleReturn =
+      setRvalOffset.valid() &&
+      setRvalOffset + BytecodeOffsetDiff(JSOpLength_SetRval) ==
+          bytecodeSection().offset();
+
+  if (isDerivedClassConstructor) {
+    MOZ_ASSERT(!needsFinalYield);
+    if (!emitJump(JSOp::Goto, &endOfDerivedClassConstructorBody)) {
+      return false;
+    }
+    return true;
+  }
+
+  if (needsFinalYield) {
+    if (!emitJump(JSOp::Goto, &finalYields)) {
+      return false;
+    }
+    return true;
+  }
+
+  if (isSimpleReturn) {
+    MOZ_ASSERT(JSOp(bytecodeSection().code()[setRvalOffset.value()]) ==
+               JSOp::SetRval);
+    bytecodeSection().code()[setRvalOffset.value()] = jsbytecode(JSOp::Return);
+    return true;
+  }
+
+  return emitReturnRval();
+}
+
+bool BytecodeEmitter::emitGetDotGeneratorInScope(EmitterScope& currentScope) {
+  if (!sc->isFunction() && sc->isModuleContext() &&
+      sc->asModuleContext()->isAsync()) {
+    NameLocation loc = *locationOfNameBoundInScopeType<ModuleScope>(
+        TaggedParserAtomIndex::WellKnown::dot_generator_(), &currentScope);
+    return emitGetNameAtLocation(
+        TaggedParserAtomIndex::WellKnown::dot_generator_(), loc);
+  }
+  NameLocation loc = *locationOfNameBoundInScopeType<FunctionScope>(
+      TaggedParserAtomIndex::WellKnown::dot_generator_(), &currentScope);
+  return emitGetNameAtLocation(
+      TaggedParserAtomIndex::WellKnown::dot_generator_(), loc);
+}
+
+bool BytecodeEmitter::emitInitialYield(UnaryNode* yieldNode) {
+  if (!emitTree(yieldNode->kid())) {
+    return false;
+  }
+
+  if (!emitYieldOp(JSOp::InitialYield)) {
+    return false;
+  }
+  if (!emit1(JSOp::CheckResumeKind)) {
+    return false;
+  }
+  if (!emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitYield(UnaryNode* yieldNode) {
+  MOZ_ASSERT(sc->isFunctionBox());
+  MOZ_ASSERT(sc->asFunctionBox()->isGenerator());
+  MOZ_ASSERT(yieldNode->isKind(ParseNodeKind::YieldExpr));
+
+  bool needsIteratorResult = sc->asFunctionBox()->needsIteratorResult();
+  if (needsIteratorResult) {
+    if (!emitPrepareIteratorResult()) {
+      return false;
+    }
+  }
+  if (ParseNode* expr = yieldNode->kid()) {
+    if (!emitTree(expr)) {
+      return false;
+    }
+  } else {
+    if (!emit1(JSOp::Undefined)) {
+      return false;
+    }
+  }
+
+  if (sc->asSuspendableContext()->isAsync()) {
+    MOZ_ASSERT(!needsIteratorResult);
+    if (!emitAwaitInInnermostScope()) {
+      return false;
+    }
+  }
+
+  if (needsIteratorResult) {
+    if (!emitFinishIteratorResult(false)) {
+      return false;
+    }
+  }
+
+  if (!emitGetDotGeneratorInInnermostScope()) {
+    return false;
+  }
+
+  if (!emitYieldOp(JSOp::Yield)) {
+    return false;
+  }
+
+  if (!emit1(JSOp::CheckResumeKind)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitAwaitInInnermostScope(UnaryNode* awaitNode) {
+  MOZ_ASSERT(sc->isSuspendableContext());
+  MOZ_ASSERT(awaitNode->isKind(ParseNodeKind::AwaitExpr));
+
+  if (!emitTree(awaitNode->kid())) {
+    return false;
+  }
+  return emitAwaitInInnermostScope();
+}
+
+bool BytecodeEmitter::emitAwaitInScope(EmitterScope& currentScope) {
+  if (!emit1(JSOp::CanSkipAwait)) {
+    return false;
+  }
+
+  if (!emit1(JSOp::MaybeExtractAwaitValue)) {
+    return false;
+  }
+
+  InternalIfEmitter ifCanSkip(this);
+  if (!ifCanSkip.emitThen(IfEmitter::ConditionKind::Negative)) {
+    return false;
+  }
+
+  if (sc->asSuspendableContext()->needsPromiseResult()) {
+    if (!emitGetDotGeneratorInScope(currentScope)) {
+      return false;
+    }
+    if (!emit1(JSOp::AsyncAwait)) {
+      return false;
+    }
+  }
+
+  if (!emitGetDotGeneratorInScope(currentScope)) {
+    return false;
+  }
+  if (!emitYieldOp(JSOp::Await)) {
+    return false;
+  }
+  if (!emit1(JSOp::CheckResumeKind)) {
+    return false;
+  }
+
+  if (!ifCanSkip.emitEnd()) {
+    return false;
+  }
+
+  MOZ_ASSERT(ifCanSkip.popped() == 0);
+
+  return true;
+}
+
+bool BytecodeEmitter::emitYieldStar(ParseNode* iter) {
+  MOZ_ASSERT(getSelfHostedIterFor(iter) == SelfHostedIter::Deny,
+             "yield* is prohibited in self-hosted code because it can run "
+             "user-modifiable iteration code");
+
+  MOZ_ASSERT(sc->isSuspendableContext());
+  MOZ_ASSERT(sc->asSuspendableContext()->isGenerator());
+
+  IteratorKind iterKind = sc->asSuspendableContext()->isAsync()
+                              ? IteratorKind::Async
+                              : IteratorKind::Sync;
+  bool needsIteratorResult = sc->asSuspendableContext()->needsIteratorResult();
+
+  if (!emitTree(iter)) {
+    return false;
+  }
+  if (iterKind == IteratorKind::Async) {
+    if (!emitAsyncIterator(SelfHostedIter::Deny)) {
+      return false;
+    }
+  } else {
+    if (!emitIterator(SelfHostedIter::Deny)) {
+      return false;
+    }
+  }
+
+  if (!emit1(JSOp::Undefined)) {
+    return false;
+  }
+  if (!emitPushResumeKind(GeneratorResumeKind::Next)) {
+    return false;
+  }
+
+  const int32_t startDepth = bytecodeSection().stackDepth();
+  MOZ_ASSERT(startDepth >= 4);
+
+  LoopControl loopInfo(this, StatementKind::YieldStar);
+  if (!loopInfo.emitLoopHead(this, Nothing())) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Dup)) {
+    return false;
+  }
+  if (!emitPushResumeKind(GeneratorResumeKind::Next)) {
+    return false;
+  }
+  if (!emit1(JSOp::StrictEq)) {
+    return false;
+  }
+
+  InternalIfEmitter ifKind(this);
+  if (!ifKind.emitThenElse()) {
+    return false;
+  }
+  {
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+
+    if (!emit2(JSOp::Unpick, 2)) {
+      return false;
+    }
+    if (!emit1(JSOp::Dup2)) {
+      return false;
+    }
+    if (!emit2(JSOp::Pick, 4)) {
+      return false;
+    }
+    if (!emitCall(JSOp::Call, 1, iter)) {
+      return false;
+    }
+
+    if (iterKind == IteratorKind::Async) {
+      if (!emitAwaitInInnermostScope()) {
+        return false;
+      }
+    }
+
+    if (!emitCheckIsObj(CheckIsObjectKind::IteratorNext)) {
+      return false;
+    }
+
+  }
+
+  if (!ifKind.emitElseIf(Nothing())) {
+    return false;
+  }
+  if (!emit1(JSOp::Dup)) {
+    return false;
+  }
+  if (!emitPushResumeKind(GeneratorResumeKind::Throw)) {
+    return false;
+  }
+  if (!emit1(JSOp::StrictEq)) {
+    return false;
+  }
+  if (!ifKind.emitThenElse()) {
+    return false;
+  }
+  {
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+    if (!emitDupAt(1)) {
+      return false;
+    }
+    if (!emit1(JSOp::Dup)) {
+      return false;
+    }
+    if (!emitAtomOp(JSOp::GetProp,
+                    TaggedParserAtomIndex::WellKnown::throw_())) {
+      return false;
+    }
+
+    InternalIfEmitter ifThrowMethodIsNotDefined(this);
+    if (!emit1(JSOp::IsNullOrUndefined)) {
+      return false;
+    }
+
+    if (!ifThrowMethodIsNotDefined.emitThenElse(
+            IfEmitter::ConditionKind::Negative)) {
+      return false;
+    }
+
+    if (!emit1(JSOp::Swap)) {
+      return false;
+    }
+    if (!emit2(JSOp::Pick, 2)) {
+      return false;
+    }
+    if (!emitCall(JSOp::Call, 1, iter)) {
+      return false;
+    }
+
+    if (iterKind == IteratorKind::Async) {
+      if (!emitAwaitInInnermostScope()) {
+        return false;
+      }
+    }
+
+    if (!emitCheckIsObj(CheckIsObjectKind::IteratorThrow)) {
+      return false;
+    }
+
+
+    if (!ifThrowMethodIsNotDefined.emitElse()) {
+      return false;
+    }
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+
+    if (!emitIteratorCloseInInnermostScope(iterKind, CompletionKind::Normal,
+                                           SelfHostedIter::Deny)) {
+      return false;
+    }
+    if (!emit2(JSOp::ThrowMsg, uint8_t(ThrowMsgKind::IteratorNoThrow))) {
+      return false;
+    }
+
+    if (!ifThrowMethodIsNotDefined.emitEnd()) {
+      return false;
+    }
+  }
+
+  if (!ifKind.emitElse()) {
+    return false;
+  }
+  {
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+
+
+    if (!emitDupAt(1)) {
+      return false;
+    }
+    if (!emit1(JSOp::Dup)) {
+      return false;
+    }
+    if (!emitAtomOp(JSOp::GetProp,
+                    TaggedParserAtomIndex::WellKnown::return_())) {
+      return false;
+    }
+
+    InternalIfEmitter ifReturnMethodIsDefined(this);
+    if (!emit1(JSOp::IsNullOrUndefined)) {
+      return false;
+    }
+
+    if (!ifReturnMethodIsDefined.emitThenElse(
+            IfEmitter::ConditionKind::Negative)) {
+      return false;
+    }
+    if (!emit1(JSOp::Swap)) {
+      return false;
+    }
+    if (!emit2(JSOp::Pick, 2)) {
+      return false;
+    }
+    if (needsIteratorResult) {
+      if (!emitAtomOp(JSOp::GetProp,
+                      TaggedParserAtomIndex::WellKnown::value())) {
+        return false;
+      }
+    }
+    if (!emitCall(JSOp::Call, 1)) {
+      return false;
+    }
+
+    if (iterKind == IteratorKind::Async) {
+      if (!emitAwaitInInnermostScope()) {
+        return false;
+      }
+    }
+
+    if (!emitCheckIsObj(CheckIsObjectKind::IteratorReturn)) {
+      return false;
+    }
+
+
+    InternalIfEmitter ifReturnDone(this);
+    if (!emit1(JSOp::Dup)) {
+      return false;
+    }
+    if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::done())) {
+      return false;
+    }
+    if (!ifReturnDone.emitThenElse()) {
+      return false;
+    }
+
+    if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::value())) {
+      return false;
+    }
+    if (needsIteratorResult) {
+      if (!emitPrepareIteratorResult()) {
+        return false;
+      }
+      if (!emit1(JSOp::Swap)) {
+        return false;
+      }
+      if (!emitFinishIteratorResult(true)) {
+        return false;
+      }
+    }
+
+    if (!ifReturnDone.emitElse()) {
+      return false;
+    }
+
+    if (!emitJump(JSOp::Goto, &loopInfo.continues)) {
+      return false;
+    }
+
+    if (!ifReturnDone.emitEnd()) {
+      return false;
+    }
+
+    if (!ifReturnMethodIsDefined.emitElse()) {
+      return false;
+    }
+    if (!emitPopN(2)) {
+      return false;
+    }
+    if (iterKind == IteratorKind::Async) {
+      if (!emitAwaitInInnermostScope()) {
+        return false;
+      }
+    }
+    if (!ifReturnMethodIsDefined.emitEnd()) {
+      return false;
+    }
+
+    if (!emitGetDotGeneratorInInnermostScope()) {
+      return false;
+    }
+    if (!emitPushResumeKind(GeneratorResumeKind::Return)) {
+      return false;
+    }
+    if (!emit1(JSOp::CheckResumeKind)) {
+      return false;
+    }
+  }
+
+  if (!ifKind.emitEnd()) {
+    return false;
+  }
+
+
+  if (!emit1(JSOp::Dup)) {
+    return false;
+  }
+  if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::done())) {
+    return false;
+  }
+  if (!emitJump(JSOp::JumpIfTrue, &loopInfo.breaks)) {
+    return false;
+  }
+
+  if (!loopInfo.emitContinueTarget(this)) {
+    return false;
+  }
+  if (iterKind == IteratorKind::Async) {
+    if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::value())) {
+      return false;
+    }
+  }
+  if (!emitGetDotGeneratorInInnermostScope()) {
+    return false;
+  }
+  if (!emitYieldOp(JSOp::Yield)) {
+    return false;
+  }
+  if (!emit1(JSOp::Swap)) {
+    return false;
+  }
+  if (!emit1(JSOp::Pop)) {
+    return false;
+  }
+  if (!loopInfo.emitLoopEnd(this, JSOp::Goto, TryNoteKind::Loop)) {
+    return false;
+  }
+
+  MOZ_ASSERT(bytecodeSection().stackDepth() == startDepth);
+  bytecodeSection().setStackDepth(startDepth - 1);
+
+
+  if (!emit2(JSOp::Unpick, 2)) {
+    return false;
+  }
+  if (!emitPopN(2)) {
+    return false;
+  }
+  if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::value())) {
+    return false;
+  }
+
+  MOZ_ASSERT(bytecodeSection().stackDepth() == startDepth - 3);
+
+  return true;
+}
+
+bool BytecodeEmitter::emitStatementList(ListNode* stmtList) {
+  for (ParseNode* stmt : stmtList->contents()) {
+    if (!emitTree(stmt)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitExpressionStatement(UnaryNode* exprStmt) {
+  MOZ_ASSERT(exprStmt->isKind(ParseNodeKind::ExpressionStmt));
+
+  bool wantval = false;
+  bool useful = false;
+  if (sc->isTopLevelContext()) {
+    useful = wantval = !sc->noScriptRval();
+  }
+
+  ParseNode* expr = exprStmt->kid();
+  if (!useful) {
+    if (!checkSideEffects(expr, &useful)) {
+      return false;
+    }
+
+    if (innermostNestableControl &&
+        innermostNestableControl->is<LabelControl>() &&
+        innermostNestableControl->as<LabelControl>().startOffset() >=
+            bytecodeSection().offset()) {
+      useful = true;
+    }
+  }
+
+  if (useful) {
+    ValueUsage valueUsage =
+        wantval ? ValueUsage::WantValue : ValueUsage::IgnoreValue;
+    ExpressionStatementEmitter ese(this, valueUsage);
+    if (!ese.prepareForExpr(exprStmt->pn_pos.begin)) {
+      return false;
+    }
+    if (!markStepBreakpoint()) {
+      return false;
+    }
+    if (!emitTree(expr, valueUsage)) {
+      return false;
+    }
+    if (!ese.emitEnd()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitDeleteName(UnaryNode* deleteNode) {
+  MOZ_ASSERT(deleteNode->isKind(ParseNodeKind::DeleteNameExpr));
+
+  NameNode* nameExpr = &deleteNode->kid()->as<NameNode>();
+  MOZ_ASSERT(nameExpr->isKind(ParseNodeKind::Name));
+
+  return emitAtomOp(JSOp::DelName, nameExpr->atom());
+}
+
+bool BytecodeEmitter::emitDeleteProperty(UnaryNode* deleteNode) {
+  MOZ_ASSERT(deleteNode->isKind(ParseNodeKind::DeletePropExpr));
+
+  PropertyAccess* propExpr = &deleteNode->kid()->as<PropertyAccess>();
+  PropOpEmitter poe(this, PropOpEmitter::Kind::Delete,
+                    propExpr->as<PropertyAccess>().isSuper()
+                        ? PropOpEmitter::ObjKind::Super
+                        : PropOpEmitter::ObjKind::Other);
+
+  if (!poe.prepareForObj()) {
+    return false;
+  }
+
+  if (propExpr->isSuper()) {
+    auto* base = &propExpr->expression().as<UnaryNode>();
+    if (!emitGetThisForSuperBase(base)) {
+      return false;
+    }
+  } else {
+    if (!emitPropLHS(propExpr)) {
+      return false;
+    }
+  }
+
+  if (!poe.emitDelete(propExpr->key().atom())) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitDeleteElement(UnaryNode* deleteNode) {
+  MOZ_ASSERT(deleteNode->isKind(ParseNodeKind::DeleteElemExpr));
+
+  auto* elemExpr = &deleteNode->kid()->as<PropertyByValue>();
+  bool isSuper = elemExpr->isSuper();
+  MOZ_ASSERT(!elemExpr->key().isKind(ParseNodeKind::PrivateName));
+  ElemOpEmitter eoe(
+      this, ElemOpEmitter::Kind::Delete,
+      isSuper ? ElemOpEmitter::ObjKind::Super : ElemOpEmitter::ObjKind::Other);
+
+  if (!emitElemObjAndKey(elemExpr, eoe)) {
+    return false;
+  }
+
+  if (!eoe.emitDelete()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitDeleteExpression(UnaryNode* deleteNode) {
+  MOZ_ASSERT(deleteNode->isKind(ParseNodeKind::DeleteExpr));
+
+  ParseNode* expression = deleteNode->kid();
+
+  bool useful = false;
+  if (!checkSideEffects(expression, &useful)) {
+    return false;
+  }
+
+  if (useful) {
+    if (!emitTree(expression)) {
+      return false;
+    }
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+  return emit1(JSOp::True);
+}
+
+bool BytecodeEmitter::emitDeleteOptionalChain(UnaryNode* deleteNode) {
+  MOZ_ASSERT(deleteNode->isKind(ParseNodeKind::DeleteOptionalChainExpr));
+
+  OptionalEmitter oe(this, bytecodeSection().stackDepth());
+
+  ParseNode* kid = deleteNode->kid();
+  switch (kid->getKind()) {
+    case ParseNodeKind::ElemExpr:
+    case ParseNodeKind::OptionalElemExpr: {
+      auto* elemExpr = &kid->as<PropertyByValueBase>();
+      if (!emitDeleteElementInOptChain(elemExpr, oe)) {
+        return false;
+      }
+
+      break;
+    }
+    case ParseNodeKind::ArgumentsLength:
+    case ParseNodeKind::DotExpr:
+    case ParseNodeKind::OptionalDotExpr: {
+      auto* propExpr = &kid->as<PropertyAccessBase>();
+      if (!emitDeletePropertyInOptChain(propExpr, oe)) {
+        return false;
+      }
+      break;
+    }
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unrecognized optional delete ParseNodeKind");
+  }
+
+  if (!oe.emitOptionalJumpTarget(JSOp::True)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitDeletePropertyInOptChain(PropertyAccessBase* propExpr,
+                                                   OptionalEmitter& oe) {
+  MOZ_ASSERT_IF(propExpr->is<PropertyAccess>(),
+                !propExpr->as<PropertyAccess>().isSuper());
+  PropOpEmitter poe(this, PropOpEmitter::Kind::Delete,
+                    PropOpEmitter::ObjKind::Other);
+
+  if (!poe.prepareForObj()) {
+    return false;
+  }
+  if (!emitOptionalTree(&propExpr->expression(), oe)) {
+    return false;
+  }
+  if (propExpr->isKind(ParseNodeKind::OptionalDotExpr)) {
+    if (!oe.emitJumpShortCircuit()) {
+      return false;
+    }
+  }
+
+  if (!poe.emitDelete(propExpr->key().atom())) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitDeleteElementInOptChain(PropertyByValueBase* elemExpr,
+                                                  OptionalEmitter& oe) {
+  MOZ_ASSERT_IF(elemExpr->is<PropertyByValue>(),
+                !elemExpr->as<PropertyByValue>().isSuper());
+  ElemOpEmitter eoe(this, ElemOpEmitter::Kind::Delete,
+                    ElemOpEmitter::ObjKind::Other);
+
+  if (!eoe.prepareForObj()) {
+    return false;
+  }
+
+  if (!emitOptionalTree(&elemExpr->expression(), oe)) {
+    return false;
+  }
+
+  if (elemExpr->isKind(ParseNodeKind::OptionalElemExpr)) {
+    if (!oe.emitJumpShortCircuit()) {
+      return false;
+    }
+  }
+
+  if (!eoe.prepareForKey()) {
+    return false;
+  }
+
+  if (!emitTree(&elemExpr->key())) {
+    return false;
+  }
+
+  if (!eoe.emitDelete()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitDebugCheckSelfHosted() {
+
+#ifdef DEBUG
+  if (!emit1(JSOp::DebugCheckSelfHosted)) {
+    return false;
+  }
+#endif
+
+  return true;
+}
+
+bool BytecodeEmitter::emitSelfHostedCallFunction(CallNode* callNode, JSOp op) {
+  NameNode* calleeNode = &callNode->callee()->as<NameNode>();
+  ListNode* argsList = callNode->args();
+
+  MOZ_ASSERT(argsList->count() >= 2);
+
+  MOZ_ASSERT(callNode->callOp() == JSOp::Call);
+
+  bool constructing =
+      calleeNode->name() ==
+      TaggedParserAtomIndex::WellKnown::constructContentFunction();
+  ParseNode* funNode = argsList->head();
+
+  if (!emitTree(funNode)) {
+    return false;
+  }
+
+#ifdef DEBUG
+  MOZ_ASSERT(op == JSOp::Call || op == JSOp::CallContent ||
+             op == JSOp::NewContent);
+  if (op == JSOp::Call) {
+    if (!emitDebugCheckSelfHosted()) {
+      return false;
+    }
+  }
+#endif
+
+  ParseNode* thisOrNewTarget = funNode->pn_next;
+  if (constructing) {
+    if (!emit1(JSOp::IsConstructing)) {
+      return false;
+    }
+  } else {
+    if (!emitTree(thisOrNewTarget)) {
+      return false;
+    }
+  }
+
+  for (ParseNode* argpn : argsList->contentsFrom(thisOrNewTarget->pn_next)) {
+    if (!emitTree(argpn)) {
+      return false;
+    }
+  }
+
+  if (constructing) {
+    if (!emitTree(thisOrNewTarget)) {
+      return false;
+    }
+  }
+
+  uint32_t argc = argsList->count() - 2;
+  if (!emitCall(op, argc)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitSelfHostedResumeGenerator(CallNode* callNode) {
+  ListNode* argsList = callNode->args();
+
+  MOZ_ASSERT(argsList->count() == 3);
+
+  ParseNode* genNode = argsList->head();
+  if (!emitTree(genNode)) {
+    return false;
+  }
+
+  ParseNode* valNode = genNode->pn_next;
+  if (!emitTree(valNode)) {
+    return false;
+  }
+
+  ParseNode* kindNode = valNode->pn_next;
+  MOZ_ASSERT(kindNode->isKind(ParseNodeKind::StringExpr));
+  GeneratorResumeKind kind =
+      ParserAtomToResumeKind(kindNode->as<NameNode>().atom());
+  MOZ_ASSERT(!kindNode->pn_next);
+
+  if (!emitPushResumeKind(kind)) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Resume)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitSelfHostedForceInterpreter() {
+  MOZ_ASSERT(bytecodeSection().code().empty());
+
+  if (!emit1(JSOp::ForceInterpreter)) {
+    return false;
+  }
+  if (!emit1(JSOp::Undefined)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitSelfHostedAllowContentIter(CallNode* callNode) {
+  ListNode* argsList = callNode->args();
+
+  MOZ_ASSERT(argsList->count() == 1);
+
+  return emitTree(argsList->head());
+}
+
+bool BytecodeEmitter::emitSelfHostedAllowContentIterWith(CallNode* callNode) {
+  ListNode* argsList = callNode->args();
+
+  MOZ_ASSERT(argsList->count() == 2 || argsList->count() == 3);
+
+  return emitTree(argsList->head());
+}
+
+bool BytecodeEmitter::emitSelfHostedAllowContentIterWithNext(
+    CallNode* callNode) {
+  ListNode* argsList = callNode->args();
+
+  MOZ_ASSERT(argsList->count() == 2);
+
+  return emitTree(argsList->head());
+}
+
+bool BytecodeEmitter::emitSelfHostedDefineDataProperty(CallNode* callNode) {
+  ListNode* argsList = callNode->args();
+
+  MOZ_ASSERT(argsList->count() == 3);
+
+  ParseNode* objNode = argsList->head();
+  if (!emitTree(objNode)) {
+    return false;
+  }
+
+  ParseNode* idNode = objNode->pn_next;
+  if (!emitTree(idNode)) {
+    return false;
+  }
+
+  ParseNode* valNode = idNode->pn_next;
+  if (!emitTree(valNode)) {
+    return false;
+  }
+
+  return emit1(JSOp::InitElem);
+}
+
+bool BytecodeEmitter::emitSelfHostedHasOwn(CallNode* callNode) {
+  ListNode* argsList = callNode->args();
+
+  MOZ_ASSERT(argsList->count() == 2);
+
+  ParseNode* idNode = argsList->head();
+  if (!emitTree(idNode)) {
+    return false;
+  }
+
+  ParseNode* objNode = idNode->pn_next;
+  if (!emitTree(objNode)) {
+    return false;
+  }
+
+  return emit1(JSOp::HasOwn);
+}
+
+bool BytecodeEmitter::emitSelfHostedGetPropertySuper(CallNode* callNode) {
+  ListNode* argsList = callNode->args();
+
+  MOZ_ASSERT(argsList->count() == 3);
+
+  ParseNode* objNode = argsList->head();
+  ParseNode* idNode = objNode->pn_next;
+  ParseNode* receiverNode = idNode->pn_next;
+
+  if (!emitTree(receiverNode)) {
+    return false;
+  }
+
+  if (!emitTree(idNode)) {
+    return false;
+  }
+
+  if (!emitTree(objNode)) {
+    return false;
+  }
+
+  return emitElemOpBase(JSOp::GetElemSuper);
+}
+
+bool BytecodeEmitter::emitSelfHostedToNumeric(CallNode* callNode) {
+  ListNode* argsList = callNode->args();
+
+  MOZ_ASSERT(argsList->count() == 1);
+
+  ParseNode* argNode = argsList->head();
+
+  if (!emitTree(argNode)) {
+    return false;
+  }
+
+  return emit1(JSOp::ToNumeric);
+}
+
+bool BytecodeEmitter::emitSelfHostedToString(CallNode* callNode) {
+  ListNode* argsList = callNode->args();
+
+  MOZ_ASSERT(argsList->count() == 1);
+
+  ParseNode* argNode = argsList->head();
+
+  if (!emitTree(argNode)) {
+    return false;
+  }
+
+  return emit1(JSOp::ToString);
+}
+
+bool BytecodeEmitter::emitSelfHostedIsNullOrUndefined(CallNode* callNode) {
+  ListNode* argsList = callNode->args();
+
+  MOZ_ASSERT(argsList->count() == 1);
+
+  ParseNode* argNode = argsList->head();
+
+  if (!emitTree(argNode)) {
+    return false;
+  }
+  if (!emit1(JSOp::IsNullOrUndefined)) {
+    return false;
+  }
+  if (!emit1(JSOp::Swap)) {
+    return false;
+  }
+  if (!emit1(JSOp::Pop)) {
+    return false;
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitSelfHostedIteratorClose(CallNode* callNode) {
+  ListNode* argsList = callNode->args();
+  MOZ_ASSERT(argsList->count() == 1);
+
+  ParseNode* argNode = argsList->head();
+  if (!emitTree(argNode)) {
+    return false;
+  }
+
+  if (!emit2(JSOp::CloseIter, uint8_t(CompletionKind::Normal))) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Undefined)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitSelfHostedGetBuiltinConstructorOrPrototype(
+    CallNode* callNode, bool isConstructor) {
+  ListNode* argsList = callNode->args();
+
+  MOZ_ASSERT(argsList->count() == 1);
+
+  ParseNode* argNode = argsList->head();
+
+  if (!argNode->isKind(ParseNodeKind::StringExpr)) {
+    reportError(callNode, JSMSG_UNEXPECTED_TYPE, "built-in name",
+                "not a string constant");
+    return false;
+  }
+
+  auto name = argNode->as<NameNode>().atom();
+
+  BuiltinObjectKind kind;
+  if (isConstructor) {
+    kind = BuiltinConstructorForName(name);
+  } else {
+    kind = BuiltinPrototypeForName(name);
+  }
+
+  if (kind == BuiltinObjectKind::None) {
+    reportError(callNode, JSMSG_UNEXPECTED_TYPE, "built-in name",
+                "not a valid built-in");
+    return false;
+  }
+
+  return emitBuiltinObject(kind);
+}
+
+bool BytecodeEmitter::emitSelfHostedGetBuiltinConstructor(CallNode* callNode) {
+  return emitSelfHostedGetBuiltinConstructorOrPrototype(
+      callNode,  true);
+}
+
+bool BytecodeEmitter::emitSelfHostedGetBuiltinPrototype(CallNode* callNode) {
+  return emitSelfHostedGetBuiltinConstructorOrPrototype(
+      callNode,  false);
+}
+
+JS::SymbolCode ParserAtomToSymbolCode(TaggedParserAtomIndex atom) {
+#define MATCH_WELL_KNOWN_SYMBOL(NAME)                     \
+  if (atom == TaggedParserAtomIndex::WellKnown::NAME()) { \
+    return JS::SymbolCode::NAME;                          \
+  }
+  JS_FOR_EACH_WELL_KNOWN_SYMBOL(MATCH_WELL_KNOWN_SYMBOL)
+#undef MATCH_WELL_KNOWN_SYMBOL
+
+  return JS::SymbolCode::Limit;
+}
+
+bool BytecodeEmitter::emitSelfHostedGetBuiltinSymbol(CallNode* callNode) {
+  ListNode* argsList = callNode->args();
+
+  MOZ_ASSERT(argsList->count() == 1);
+
+  ParseNode* argNode = argsList->head();
+
+  if (!argNode->isKind(ParseNodeKind::StringExpr)) {
+    reportError(callNode, JSMSG_UNEXPECTED_TYPE, "built-in name",
+                "not a string constant");
+    return false;
+  }
+
+  auto name = argNode->as<NameNode>().atom();
+
+  JS::SymbolCode code = ParserAtomToSymbolCode(name);
+  if (code == JS::SymbolCode::Limit) {
+    reportError(callNode, JSMSG_UNEXPECTED_TYPE, "built-in name",
+                "not a valid built-in");
+    return false;
+  }
+
+  return emit2(JSOp::Symbol, uint8_t(code));
+}
+
+bool BytecodeEmitter::emitSelfHostedArgumentsLength(CallNode* callNode) {
+  MOZ_ASSERT(!sc->asFunctionBox()->needsArgsObj());
+  sc->asFunctionBox()->setUsesArgumentsIntrinsics();
+
+  MOZ_ASSERT(callNode->args()->count() == 0);
+
+  return emit1(JSOp::ArgumentsLength);
+}
+
+bool BytecodeEmitter::emitSelfHostedGetArgument(CallNode* callNode) {
+  MOZ_ASSERT(!sc->asFunctionBox()->needsArgsObj());
+  sc->asFunctionBox()->setUsesArgumentsIntrinsics();
+
+  ListNode* argsList = callNode->args();
+  MOZ_ASSERT(argsList->count() == 1);
+
+  ParseNode* argNode = argsList->head();
+  if (!emitTree(argNode)) {
+    return false;
+  }
+
+  return emit1(JSOp::GetActualArg);
+}
+
+#ifdef DEBUG
+void BytecodeEmitter::assertSelfHostedExpectedTopLevel(ParseNode* node) {
+  MOZ_ASSERT(node->isKind(ParseNodeKind::Name),
+             "argument must be a function name");
+  TaggedParserAtomIndex targetName = node->as<NameNode>().name();
+
+  MOZ_ASSERT(prevSelfHostedTopLevelFunction);
+
+  MOZ_ASSERT(prevSelfHostedTopLevelFunction->explicitName() == targetName,
+             "selfhost decorator must immediately follow target function");
+}
+#endif
+
+bool BytecodeEmitter::emitSelfHostedSetIsInlinableLargeFunction(
+    CallNode* callNode) {
+#ifdef DEBUG
+  ListNode* argsList = callNode->args();
+
+  MOZ_ASSERT(argsList->count() == 1);
+
+  assertSelfHostedExpectedTopLevel(argsList->head());
+#endif
+
+  MOZ_ASSERT(prevSelfHostedTopLevelFunction->isInitialCompilation);
+  prevSelfHostedTopLevelFunction->setIsInlinableLargeFunction();
+
+  return emit1(JSOp::Undefined);
+}
+
+bool BytecodeEmitter::emitSelfHostedSetCanonicalName(CallNode* callNode) {
+  ListNode* argsList = callNode->args();
+
+  MOZ_ASSERT(argsList->count() == 2);
+
+#ifdef DEBUG
+  assertSelfHostedExpectedTopLevel(argsList->head());
+#endif
+
+  ParseNode* nameNode = argsList->last();
+  MOZ_ASSERT(nameNode->isKind(ParseNodeKind::StringExpr));
+  TaggedParserAtomIndex specName = nameNode->as<NameNode>().atom();
+  compilationState.parserAtoms.markUsedByStencil(specName,
+                                                 ParserAtom::Atomize::Yes);
+
+  prevSelfHostedTopLevelFunction->functionStencil().setSelfHostedCanonicalName(
+      specName);
+
+  return emit1(JSOp::Undefined);
+}
+
+#ifdef DEBUG
+void BytecodeEmitter::assertSelfHostedUnsafeGetReservedSlot(
+    ListNode* argsList) {
+  MOZ_ASSERT(argsList->count() == 2);
+
+  ParseNode* objNode = argsList->head();
+  ParseNode* slotNode = objNode->pn_next;
+
+  MOZ_ASSERT(slotNode->isKind(ParseNodeKind::NumberExpr),
+             "slot argument must be a constant");
+}
+
+void BytecodeEmitter::assertSelfHostedUnsafeSetReservedSlot(
+    ListNode* argsList) {
+  MOZ_ASSERT(argsList->count() == 3);
+
+  ParseNode* objNode = argsList->head();
+  ParseNode* slotNode = objNode->pn_next;
+
+  MOZ_ASSERT(slotNode->isKind(ParseNodeKind::NumberExpr),
+             "slot argument must be a constant");
+}
+#endif
+
+bool BytecodeEmitter::emitOptionalCalleeAndThis(ParseNode* callee,
+                                                CallNode* call,
+                                                CallOrNewEmitter& cone,
+                                                OptionalEmitter& oe) {
+  AutoCheckRecursionLimit recursion(fc);
+  if (!recursion.check(fc)) {
+    return false;
+  }
+
+  switch (ParseNodeKind kind = callee->getKind()) {
+    case ParseNodeKind::Name: {
+      auto name = callee->as<NameNode>().name();
+      if (!cone.emitNameCallee(name)) {
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::OptionalDotExpr: {
+      MOZ_ASSERT(emitterMode != BytecodeEmitter::SelfHosting);
+      OptionalPropertyAccess* prop = &callee->as<OptionalPropertyAccess>();
+      bool isSuper = false;
+
+      PropOpEmitter& poe = cone.prepareForPropCallee(isSuper);
+      if (!emitOptionalDotExpression(prop, poe, isSuper, oe)) {
+        return false;
+      }
+      break;
+    }
+    case ParseNodeKind::ArgumentsLength: {
+      MOZ_ASSERT(emitterMode != BytecodeEmitter::SelfHosting);
+      if (!cone.prepareForOtherCallee()) {
+        return false;
+      }
+      if (!emitArgumentsLength()) {
+        return false;
+      }
+      break;
+    }
+    case ParseNodeKind::DotExpr: {
+      MOZ_ASSERT(emitterMode != BytecodeEmitter::SelfHosting);
+      PropertyAccess* prop = &callee->as<PropertyAccess>();
+      bool isSuper = prop->isSuper();
+
+      PropOpEmitter& poe = cone.prepareForPropCallee(isSuper);
+      if (!emitOptionalDotExpression(prop, poe, isSuper, oe)) {
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::OptionalElemExpr: {
+      OptionalPropertyByValue* elem = &callee->as<OptionalPropertyByValue>();
+      bool isSuper = false;
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
+      ElemOpEmitter& eoe = cone.prepareForElemCallee(isSuper);
+      if (!emitOptionalElemExpression(elem, eoe, isSuper, oe)) {
+        return false;
+      }
+      break;
+    }
+    case ParseNodeKind::ElemExpr: {
+      PropertyByValue* elem = &callee->as<PropertyByValue>();
+      bool isSuper = elem->isSuper();
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
+      ElemOpEmitter& eoe = cone.prepareForElemCallee(isSuper);
+      if (!emitOptionalElemExpression(elem, eoe, isSuper, oe)) {
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::PrivateMemberExpr:
+    case ParseNodeKind::OptionalPrivateMemberExpr: {
+      PrivateMemberAccessBase* privateExpr =
+          &callee->as<PrivateMemberAccessBase>();
+      PrivateOpEmitter& xoe =
+          cone.prepareForPrivateCallee(privateExpr->privateName().name());
+      if (!emitOptionalPrivateExpression(privateExpr, xoe, oe)) {
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::Function:
+      if (!cone.prepareForFunctionCallee()) {
+        return false;
+      }
+      if (!emitOptionalTree(callee, oe)) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::OptionalChain: {
+      return emitCalleeAndThisForOptionalChain(&callee->as<UnaryNode>(), call,
+                                               cone);
+    }
+
+    default:
+      MOZ_RELEASE_ASSERT(kind != ParseNodeKind::SuperBase);
+
+      if (!cone.prepareForOtherCallee()) {
+        return false;
+      }
+      if (!emitOptionalTree(callee, oe)) {
+        return false;
+      }
+      break;
+  }
+
+  if (!cone.emitThis()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitCalleeAndThis(ParseNode* callee, CallNode* maybeCall,
+                                        CallOrNewEmitter& cone) {
+  MOZ_ASSERT_IF(maybeCall, maybeCall->callee() == callee);
+
+  switch (callee->getKind()) {
+    case ParseNodeKind::Name: {
+      auto name = callee->as<NameNode>().name();
+      if (!cone.emitNameCallee(name)) {
+        return false;
+      }
+      break;
+    }
+    case ParseNodeKind::ArgumentsLength: {
+      MOZ_ASSERT(emitterMode != BytecodeEmitter::SelfHosting);
+      if (!cone.prepareForOtherCallee()) {
+        return false;
+      }
+      if (!emitArgumentsLength()) {
+        return false;
+      }
+      break;
+    }
+    case ParseNodeKind::DotExpr: {
+      MOZ_ASSERT(emitterMode != BytecodeEmitter::SelfHosting);
+      PropertyAccess* prop = &callee->as<PropertyAccess>();
+      bool isSuper = prop->isSuper();
+
+      PropOpEmitter& poe = cone.prepareForPropCallee(isSuper);
+      if (!poe.prepareForObj()) {
+        return false;
+      }
+      if (isSuper) {
+        UnaryNode* base = &prop->expression().as<UnaryNode>();
+        if (!emitGetThisForSuperBase(base)) {
+          return false;
+        }
+      } else {
+        if (!emitPropLHS(prop)) {
+          return false;
+        }
+      }
+      if (!poe.emitGet(prop->key().atom())) {
+        return false;
+      }
+
+      break;
+    }
+    case ParseNodeKind::ElemExpr: {
+      MOZ_ASSERT(emitterMode != BytecodeEmitter::SelfHosting);
+      PropertyByValue* elem = &callee->as<PropertyByValue>();
+      bool isSuper = elem->isSuper();
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
+      ElemOpEmitter& eoe = cone.prepareForElemCallee(isSuper);
+      if (!emitElemObjAndKey(elem, eoe)) {
+        return false;
+      }
+      if (!eoe.emitGet()) {
+        return false;
+      }
+
+      break;
+    }
+    case ParseNodeKind::PrivateMemberExpr: {
+      MOZ_ASSERT(emitterMode != BytecodeEmitter::SelfHosting);
+      PrivateMemberAccessBase* privateExpr =
+          &callee->as<PrivateMemberAccessBase>();
+      PrivateOpEmitter& xoe =
+          cone.prepareForPrivateCallee(privateExpr->privateName().name());
+      if (!emitTree(&privateExpr->expression())) {
+        return false;
+      }
+      if (!xoe.emitReference()) {
+        return false;
+      }
+      if (!xoe.emitGetForCallOrNew()) {
+        return false;
+      }
+
+      break;
+    }
+    case ParseNodeKind::Function:
+      if (!cone.prepareForFunctionCallee()) {
+        return false;
+      }
+      if (!emitTree(callee)) {
+        return false;
+      }
+      break;
+    case ParseNodeKind::SuperBase:
+      MOZ_ASSERT(maybeCall);
+      MOZ_ASSERT(maybeCall->isKind(ParseNodeKind::SuperCallExpr));
+      MOZ_ASSERT(callee->isKind(ParseNodeKind::SuperBase));
+      if (!cone.emitSuperCallee()) {
+        return false;
+      }
+      break;
+    case ParseNodeKind::OptionalChain: {
+      MOZ_ASSERT(maybeCall);
+      return emitCalleeAndThisForOptionalChain(&callee->as<UnaryNode>(),
+                                               maybeCall, cone);
+    }
+    default:
+      if (!cone.prepareForOtherCallee()) {
+        return false;
+      }
+      if (!emitTree(callee)) {
+        return false;
+      }
+      break;
+  }
+
+  if (!cone.emitThis()) {
+    return false;
+  }
+
+  return true;
+}
+
+ParseNode* BytecodeEmitter::getCoordNode(ParseNode* callNode,
+                                         ParseNode* calleeNode, JSOp op,
+                                         ListNode* argsList) const {
+  ParseNode* coordNode = callNode;
+  if (op == JSOp::Call || op == JSOp::SpreadCall) {
+    coordNode = argsList;
+
+    switch (calleeNode->getKind()) {
+      case ParseNodeKind::ArgumentsLength:
+      case ParseNodeKind::DotExpr:
+        coordNode = &calleeNode->as<PropertyAccess>().key();
+        break;
+      case ParseNodeKind::Name: {
+        if (argsList->empty() ||
+            !bytecodeSection().atSeparator(calleeNode->pn_pos.begin)) {
+          coordNode = calleeNode;
+        }
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+  return coordNode;
+}
+
+bool BytecodeEmitter::emitArguments(ListNode* argsList, bool isCall,
+                                    bool isSpread, CallOrNewEmitter& cone) {
+  uint32_t argc = argsList->count();
+  if (argc >= ARGC_LIMIT) {
+    reportError(argsList,
+                isCall ? JSMSG_TOO_MANY_FUN_ARGS : JSMSG_TOO_MANY_CON_ARGS);
+    return false;
+  }
+  if (!isSpread) {
+    if (!cone.prepareForNonSpreadArguments()) {
+      return false;
+    }
+    for (ParseNode* arg : argsList->contents()) {
+      if (!updateSourceCoordNotesIfNonLiteral(arg)) {
+        return false;
+      }
+      if (!emitTree(arg)) {
+        return false;
+      }
+    }
+  } else if (cone.wantSpreadOperand()) {
+    auto* spreadNode = &argsList->head()->as<UnaryNode>();
+    if (!updateSourceCoordNotesIfNonLiteral(spreadNode->kid())) {
+      return false;
+    }
+    if (!emitTree(spreadNode->kid())) {
+      return false;
+    }
+
+    if (!cone.emitSpreadArgumentsTest()) {
+      return false;
+    }
+
+    if (cone.wantSpreadIteration()) {
+      if (!emitSpreadIntoArray(spreadNode)) {
+        return false;
+      }
+    }
+
+    if (!cone.emitSpreadArgumentsTestEnd()) {
+      return false;
+    }
+  } else {
+    if (!cone.prepareForSpreadArguments()) {
+      return false;
+    }
+    if (!emitArray(argsList)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitOptionalCall(CallNode* callNode, OptionalEmitter& oe,
+                                       ValueUsage valueUsage) {
+  ParseNode* calleeNode = callNode->callee();
+  ListNode* argsList = callNode->args();
+  bool isSpread = IsSpreadOp(callNode->callOp());
+  JSOp op = callNode->callOp();
+  uint32_t argc = argsList->count();
+  bool isOptimizableSpread = isSpread && argc == 1;
+
+  CallOrNewEmitter cone(this, op,
+                        isOptimizableSpread
+                            ? CallOrNewEmitter::ArgumentsKind::SingleSpread
+                            : CallOrNewEmitter::ArgumentsKind::Other,
+                        valueUsage);
+
+  ParseNode* coordNode = getCoordNode(callNode, calleeNode, op, argsList);
+
+  if (!emitOptionalCalleeAndThis(calleeNode, callNode, cone, oe)) {
+    return false;
+  }
+
+  if (callNode->isKind(ParseNodeKind::OptionalCallExpr)) {
+    if (!oe.emitJumpShortCircuitForCall()) {
+      return false;
+    }
+  }
+
+  if (!emitArguments(argsList,  true, isSpread, cone)) {
+    return false;
+  }
+
+  if (!cone.emitEnd(argc, coordNode->pn_pos.begin)) {
+    return false;
+  }
+
+  return true;
+}
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+bool BytecodeEmitter::emitSelfHostedDisposeResources(CallNode* callNode,
+                                                     DisposalKind kind) {
+  ListNode* argsList = callNode->args();
+  MOZ_ASSERT(argsList->count() == 2);
+
+  ParseNode* resourcesNode = argsList->head();
+  ParseNode* countNode = resourcesNode->pn_next;
+
+  DisposalEmitter de(this, bool(kind));
+
+  if (!emit1(JSOp::False)) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Undefined)) {
+    return false;
+  }
+
+  if (!de.prepareForDisposeCapability()) {
+    return false;
+  }
+
+  if (!emitTree(resourcesNode)) {
+    return false;
+  }
+
+  if (!emitTree(countNode)) {
+    return false;
+  }
+
+  if (!de.emitEnd(*innermostEmitterScope())) {
+    return false;
+  }
+
+
+  InternalIfEmitter ifThrow(this);
+
+  if (!ifThrow.emitThenElse()) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Throw)) {
+    return false;
+  }
+
+  if (!ifThrow.emitElse()) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  if (!ifThrow.emitEnd()) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Undefined)) {
+    return false;
+  }
+
+  return true;
+}
+#endif
+
+bool BytecodeEmitter::emitCallOrNew(CallNode* callNode, ValueUsage valueUsage) {
+  bool isCall = callNode->isKind(ParseNodeKind::CallExpr) ||
+                callNode->isKind(ParseNodeKind::TaggedTemplateExpr);
+  ParseNode* calleeNode = callNode->callee();
+  ListNode* argsList = callNode->args();
+  JSOp op = callNode->callOp();
+
+  if (calleeNode->isKind(ParseNodeKind::Name) &&
+      emitterMode == BytecodeEmitter::SelfHosting && op == JSOp::Call) {
+    auto calleeName = calleeNode->as<NameNode>().name();
+    if (calleeName == TaggedParserAtomIndex::WellKnown::callFunction()) {
+      return emitSelfHostedCallFunction(callNode, JSOp::Call);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::callContentFunction()) {
+      return emitSelfHostedCallFunction(callNode, JSOp::CallContent);
+    }
+    if (calleeName ==
+        TaggedParserAtomIndex::WellKnown::constructContentFunction()) {
+      return emitSelfHostedCallFunction(callNode, JSOp::NewContent);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::resumeGenerator()) {
+      return emitSelfHostedResumeGenerator(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::forceInterpreter()) {
+      return emitSelfHostedForceInterpreter();
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::allowContentIter()) {
+      return emitSelfHostedAllowContentIter(callNode);
+    }
+    if (calleeName ==
+        TaggedParserAtomIndex::WellKnown::allowContentIterWith()) {
+      return emitSelfHostedAllowContentIterWith(callNode);
+    }
+    if (calleeName ==
+        TaggedParserAtomIndex::WellKnown::allowContentIterWithNext()) {
+      return emitSelfHostedAllowContentIterWithNext(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::DefineDataProperty() &&
+        argsList->count() == 3) {
+      return emitSelfHostedDefineDataProperty(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::hasOwn()) {
+      return emitSelfHostedHasOwn(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::getPropertySuper()) {
+      return emitSelfHostedGetPropertySuper(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::ToNumeric()) {
+      return emitSelfHostedToNumeric(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::ToString()) {
+      return emitSelfHostedToString(callNode);
+    }
+    if (calleeName ==
+        TaggedParserAtomIndex::WellKnown::GetBuiltinConstructor()) {
+      return emitSelfHostedGetBuiltinConstructor(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::GetBuiltinPrototype()) {
+      return emitSelfHostedGetBuiltinPrototype(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::GetBuiltinSymbol()) {
+      return emitSelfHostedGetBuiltinSymbol(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::ArgumentsLength()) {
+      return emitSelfHostedArgumentsLength(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::GetArgument()) {
+      return emitSelfHostedGetArgument(callNode);
+    }
+    if (calleeName ==
+        TaggedParserAtomIndex::WellKnown::SetIsInlinableLargeFunction()) {
+      return emitSelfHostedSetIsInlinableLargeFunction(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::SetCanonicalName()) {
+      return emitSelfHostedSetCanonicalName(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::IsNullOrUndefined()) {
+      return emitSelfHostedIsNullOrUndefined(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::IteratorClose()) {
+      return emitSelfHostedIteratorClose(callNode);
+    }
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+    if (calleeName ==
+        TaggedParserAtomIndex::WellKnown::DisposeResourcesAsync()) {
+      return emitSelfHostedDisposeResources(callNode, DisposalKind::Async);
+    }
+    if (calleeName ==
+        TaggedParserAtomIndex::WellKnown::DisposeResourcesSync()) {
+      return emitSelfHostedDisposeResources(callNode, DisposalKind::Sync);
+    }
+#endif
+#ifdef DEBUG
+    if (calleeName ==
+            TaggedParserAtomIndex::WellKnown::UnsafeGetReservedSlot() ||
+        calleeName == TaggedParserAtomIndex::WellKnown::
+                          UnsafeGetObjectFromReservedSlot() ||
+        calleeName == TaggedParserAtomIndex::WellKnown::
+                          UnsafeGetInt32FromReservedSlot() ||
+        calleeName == TaggedParserAtomIndex::WellKnown::
+                          UnsafeGetStringFromReservedSlot()) {
+      assertSelfHostedUnsafeGetReservedSlot(argsList);
+    }
+    if (calleeName ==
+        TaggedParserAtomIndex::WellKnown::UnsafeSetReservedSlot()) {
+      assertSelfHostedUnsafeSetReservedSlot(argsList);
+    }
+#endif
+  }
+
+  uint32_t argc = argsList->count();
+  bool isSpread = IsSpreadOp(op);
+  bool isOptimizableSpread = isSpread && argc == 1;
+  bool isDefaultDerivedClassConstructor =
+      sc->isFunctionBox() && sc->asFunctionBox()->isDerivedClassConstructor() &&
+      sc->asFunctionBox()->isSyntheticFunction();
+  MOZ_ASSERT_IF(isDefaultDerivedClassConstructor, isOptimizableSpread);
+  CallOrNewEmitter cone(
+      this, op,
+      isOptimizableSpread
+          ? isDefaultDerivedClassConstructor
+                ? CallOrNewEmitter::ArgumentsKind::PassthroughRest
+                : CallOrNewEmitter::ArgumentsKind::SingleSpread
+          : CallOrNewEmitter::ArgumentsKind::Other,
+      valueUsage);
+
+  if (!emitCalleeAndThis(calleeNode, callNode, cone)) {
+    return false;
+  }
+  if (!emitArguments(argsList, isCall, isSpread, cone)) {
+    return false;
+  }
+
+  if (IsConstructOp(op)) {
+    if (op == JSOp::SuperCall || op == JSOp::SpreadSuperCall) {
+      if (!emitNewTarget(callNode)) {
+        return false;
+      }
+    } else {
+      uint32_t effectiveArgc = isSpread ? 1 : argc;
+      if (!emitDupAt(effectiveArgc + 1)) {
+        return false;
+      }
+    }
+  }
+
+  ParseNode* coordNode = getCoordNode(callNode, calleeNode, op, argsList);
+
+  if (!cone.emitEnd(argc, coordNode->pn_pos.begin)) {
+    return false;
+  }
+
+  return true;
+}
+
+static const JSOp ParseNodeKindToJSOp[] = {
+    JSOp::Coalesce, JSOp::Or,       JSOp::And, JSOp::BitOr,    JSOp::BitXor,
+    JSOp::BitAnd,   JSOp::StrictEq, JSOp::Eq,  JSOp::StrictNe, JSOp::Ne,
+    JSOp::Lt,       JSOp::Le,       JSOp::Gt,  JSOp::Ge,       JSOp::Instanceof,
+    JSOp::In,       JSOp::Nop,      JSOp::Lsh, JSOp::Rsh,      JSOp::Ursh,
+    JSOp::Add,      JSOp::Sub,      JSOp::Mul, JSOp::Div,      JSOp::Mod,
+    JSOp::Pow};
+
+static inline JSOp BinaryOpParseNodeKindToJSOp(ParseNodeKind pnk) {
+  MOZ_ASSERT(pnk >= ParseNodeKind::BinOpFirst);
+  MOZ_ASSERT(pnk <= ParseNodeKind::BinOpLast);
+  int parseNodeFirst = size_t(ParseNodeKind::BinOpFirst);
+#ifdef DEBUG
+  int jsopArraySize = std::size(ParseNodeKindToJSOp);
+  int parseNodeKindListSize =
+      size_t(ParseNodeKind::BinOpLast) - parseNodeFirst + 1;
+  MOZ_ASSERT(jsopArraySize == parseNodeKindListSize);
+  MOZ_ASSERT(ParseNodeKindToJSOp[size_t(pnk) - parseNodeFirst] != JSOp::Nop);
+#endif
+  return ParseNodeKindToJSOp[size_t(pnk) - parseNodeFirst];
+}
+
+bool BytecodeEmitter::emitRightAssociative(ListNode* node) {
+  MOZ_ASSERT(node->isKind(ParseNodeKind::PowExpr));
+
+  for (ParseNode* subexpr : node->contents()) {
+    if (!updateSourceCoordNotesIfNonLiteral(subexpr)) {
+      return false;
+    }
+    if (!emitTree(subexpr)) {
+      return false;
+    }
+  }
+  for (uint32_t i = 0; i < node->count() - 1; i++) {
+    if (!emit1(JSOp::Pow)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+Maybe<ConstantCompareOperand>
+BytecodeEmitter::parseNodeToConstantCompareOperand(ParseNode* constant) {
+  switch (constant->getKind()) {
+    case ParseNodeKind::NumberExpr: {
+      double d = constant->as<NumericLiteral>().value();
+      int32_t ival;
+      if (NumberEqualsInt32(d, &ival)) {
+        if (ConstantCompareOperand::CanEncodeInt32ValueAsOperand(ival)) {
+          return Some(ConstantCompareOperand(int8_t(ival)));
+        }
+      }
+      return Nothing();
+    }
+    case ParseNodeKind::TrueExpr:
+    case ParseNodeKind::FalseExpr:
+      return Some(
+          ConstantCompareOperand(constant->isKind(ParseNodeKind::TrueExpr)));
+    case ParseNodeKind::NullExpr:
+      return Some(
+          ConstantCompareOperand(ConstantCompareOperand::EncodedType::Null));
+    case ParseNodeKind::RawUndefinedExpr:
+      return Some(ConstantCompareOperand(
+          ConstantCompareOperand::EncodedType::Undefined));
+    case ParseNodeKind::Name: {
+      MOZ_ASSERT(constant->as<NameNode>().name() ==
+                 TaggedParserAtomIndex::WellKnown::undefined());
+      NameLocation loc = lookupName(constant->as<NameNode>().name());
+      switch (loc.kind()) {
+        case NameLocation::Kind::Global:
+          if (!sc->hasNonSyntacticScope()) {
+            return Some(ConstantCompareOperand(
+                ConstantCompareOperand::EncodedType::Undefined));
+          }
+          return Nothing();
+        case NameLocation::Kind::Intrinsic:
+          return Some(ConstantCompareOperand(
+              ConstantCompareOperand::EncodedType::Undefined));
+        default:
+          return Nothing();
+      }
+    }
+    default:
+      return Nothing();
+  }
+}
+
+bool BytecodeEmitter::tryEmitConstantEq(ListNode* node, JSOp op,
+                                        bool* emitted) {
+  if (node->count() != 2) {
+    *emitted = false;
+    return true;
+  }
+
+  JSOp constantOp;
+  switch (op) {
+    case JSOp::StrictEq:
+      constantOp = JSOp::StrictConstantEq;
+      break;
+    case JSOp::StrictNe:
+      constantOp = JSOp::StrictConstantNe;
+      break;
+    default:
+      *emitted = false;
+      return true;
+  }
+
+  ParseNode* left = node->head();
+  ParseNode* right = node->head()->pn_next;
+
+  ParseNode* expressionNode;
+  ParseNode* constantNode;
+  if (left->isConstant() || left->isUndefinedLiteral()) {
+    expressionNode = right;
+    constantNode = left;
+  } else if (right->isConstant() || right->isUndefinedLiteral()) {
+    expressionNode = left;
+    constantNode = right;
+  } else {
+    *emitted = false;
+    return true;
+  }
+
+  Maybe<ConstantCompareOperand> operand =
+      parseNodeToConstantCompareOperand(constantNode);
+  if (operand.isNothing()) {
+    *emitted = false;
+    return true;
+  }
+
+  if (!emitTree(expressionNode)) {
+    return false;
+  }
+
+  if (!emitUint16Operand(constantOp, operand->rawValue())) {
+    return false;
+  }
+
+  *emitted = true;
+  return true;
+}
+
+bool BytecodeEmitter::emitLeftAssociative(ListNode* node) {
+  JSOp op = BinaryOpParseNodeKindToJSOp(node->getKind());
+  bool constantEqEmitted = false;
+  if (!tryEmitConstantEq(node, op, &constantEqEmitted)) {
+    return false;
+  }
+  if (constantEqEmitted) {
+    return true;
+  }
+  if (!emitTree(node->head())) {
+    return false;
+  }
+  ParseNode* nextExpr = node->head()->pn_next;
+  do {
+    if (!updateSourceCoordNotesIfNonLiteral(nextExpr)) {
+      return false;
+    }
+    if (!emitTree(nextExpr)) {
+      return false;
+    }
+    if (!emit1(op)) {
+      return false;
+    }
+  } while ((nextExpr = nextExpr->pn_next));
+  return true;
+}
+
+bool BytecodeEmitter::emitPrivateInExpr(ListNode* node) {
+  MOZ_ASSERT(node->head()->isKind(ParseNodeKind::PrivateName));
+
+  NameNode& privateNameNode = node->head()->as<NameNode>();
+  TaggedParserAtomIndex privateName = privateNameNode.name();
+
+  PrivateOpEmitter xoe(this, PrivateOpEmitter::Kind::ErgonomicBrandCheck,
+                       privateName);
+
+  ParseNode* valueNode = node->head()->pn_next;
+  MOZ_ASSERT(valueNode->pn_next == nullptr);
+
+  if (!emitTree(valueNode)) {
+    return false;
+  }
+
+  if (!xoe.emitReference()) {
+    return false;
+  }
+
+  if (!xoe.emitBrandCheck()) {
+    return false;
+  }
+
+  if (!emitUnpickN(2)) {
+    return false;
+  }
+
+  if (!emitPopN(2)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitOptionalTree(
+    ParseNode* pn, OptionalEmitter& oe,
+    ValueUsage valueUsage ) {
+  AutoCheckRecursionLimit recursion(fc);
+  if (!recursion.check(fc)) {
+    return false;
+  }
+  ParseNodeKind kind = pn->getKind();
+  switch (kind) {
+    case ParseNodeKind::OptionalDotExpr: {
+      OptionalPropertyAccess* prop = &pn->as<OptionalPropertyAccess>();
+      bool isSuper = false;
+      PropOpEmitter poe(this, PropOpEmitter::Kind::Get,
+                        PropOpEmitter::ObjKind::Other);
+      if (!emitOptionalDotExpression(prop, poe, isSuper, oe)) {
+        return false;
+      }
+      break;
+    }
+    case ParseNodeKind::ArgumentsLength: {
+      if (!emitArgumentsLength()) {
+        return false;
+      }
+      break;
+    }
+    case ParseNodeKind::DotExpr: {
+      PropertyAccess* prop = &pn->as<PropertyAccess>();
+      bool isSuper = prop->isSuper();
+      PropOpEmitter poe(this, PropOpEmitter::Kind::Get,
+                        isSuper ? PropOpEmitter::ObjKind::Super
+                                : PropOpEmitter::ObjKind::Other);
+      if (!emitOptionalDotExpression(prop, poe, isSuper, oe)) {
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::OptionalElemExpr: {
+      OptionalPropertyByValue* elem = &pn->as<OptionalPropertyByValue>();
+      bool isSuper = false;
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
+      ElemOpEmitter eoe(this, ElemOpEmitter::Kind::Get,
+                        ElemOpEmitter::ObjKind::Other);
+
+      if (!emitOptionalElemExpression(elem, eoe, isSuper, oe)) {
+        return false;
+      }
+      break;
+    }
+    case ParseNodeKind::ElemExpr: {
+      PropertyByValue* elem = &pn->as<PropertyByValue>();
+      bool isSuper = elem->isSuper();
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
+      ElemOpEmitter eoe(this, ElemOpEmitter::Kind::Get,
+                        isSuper ? ElemOpEmitter::ObjKind::Super
+                                : ElemOpEmitter::ObjKind::Other);
+
+      if (!emitOptionalElemExpression(elem, eoe, isSuper, oe)) {
+        return false;
+      }
+      break;
+    }
+    case ParseNodeKind::PrivateMemberExpr:
+    case ParseNodeKind::OptionalPrivateMemberExpr: {
+      PrivateMemberAccessBase* privateExpr = &pn->as<PrivateMemberAccessBase>();
+      PrivateOpEmitter xoe(this, PrivateOpEmitter::Kind::Get,
+                           privateExpr->privateName().name());
+      if (!emitOptionalPrivateExpression(privateExpr, xoe, oe)) {
+        return false;
+      }
+      break;
+    }
+    case ParseNodeKind::CallExpr:
+    case ParseNodeKind::OptionalCallExpr:
+      if (!emitOptionalCall(&pn->as<CallNode>(), oe, valueUsage)) {
+        return false;
+      }
+      break;
+    default:
+#ifdef DEBUG
+      bool isPrimaryExpression =
+          kind == ParseNodeKind::ThisExpr || kind == ParseNodeKind::Name ||
+          kind == ParseNodeKind::PrivateName ||
+          kind == ParseNodeKind::NullExpr || kind == ParseNodeKind::TrueExpr ||
+          kind == ParseNodeKind::FalseExpr ||
+          kind == ParseNodeKind::NumberExpr ||
+          kind == ParseNodeKind::BigIntExpr ||
+          kind == ParseNodeKind::StringExpr ||
+          kind == ParseNodeKind::ArrayExpr ||
+          kind == ParseNodeKind::ObjectExpr ||
+          kind == ParseNodeKind::Function || kind == ParseNodeKind::ClassDecl ||
+          kind == ParseNodeKind::RegExpExpr ||
+          kind == ParseNodeKind::TemplateStringExpr ||
+          kind == ParseNodeKind::TemplateStringListExpr ||
+          kind == ParseNodeKind::RawUndefinedExpr || pn->isInParens();
+
+      bool isMemberExpression = isPrimaryExpression ||
+                                kind == ParseNodeKind::TaggedTemplateExpr ||
+                                kind == ParseNodeKind::NewExpr ||
+                                kind == ParseNodeKind::NewTargetExpr ||
+                                kind == ParseNodeKind::ImportMetaExpr;
+
+      bool isCallExpression = kind == ParseNodeKind::SetThis ||
+                              kind == ParseNodeKind::CallImportExpr;
+
+      MOZ_ASSERT(isMemberExpression || isCallExpression,
+                 "Unknown ParseNodeKind for OptionalChain");
+#endif
+      return emitTree(pn);
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitCalleeAndThisForOptionalChain(
+    UnaryNode* optionalChain, CallNode* callNode, CallOrNewEmitter& cone) {
+  ParseNode* calleeNode = optionalChain->kid();
+
+  OptionalEmitter oe(this, bytecodeSection().stackDepth());
+
+  if (!emitOptionalCalleeAndThis(calleeNode, callNode, cone, oe)) {
+    return false;
+  }
+
+  if (!oe.emitOptionalJumpTarget(JSOp::Undefined,
+                                 OptionalEmitter::Kind::Reference)) {
+    return false;
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitOptionalChain(UnaryNode* optionalChain,
+                                        ValueUsage valueUsage) {
+  ParseNode* expr = optionalChain->kid();
+
+  OptionalEmitter oe(this, bytecodeSection().stackDepth());
+
+  if (!emitOptionalTree(expr, oe, valueUsage)) {
+    return false;
+  }
+
+  if (!oe.emitOptionalJumpTarget(JSOp::Undefined)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitOptionalDotExpression(PropertyAccessBase* prop,
+                                                PropOpEmitter& poe,
+                                                bool isSuper,
+                                                OptionalEmitter& oe) {
+  if (!poe.prepareForObj()) {
+    return false;
+  }
+
+  if (isSuper) {
+    UnaryNode* base = &prop->expression().as<UnaryNode>();
+    if (!emitGetThisForSuperBase(base)) {
+      return false;
+    }
+  } else {
+    if (!emitOptionalTree(&prop->expression(), oe)) {
+      return false;
+    }
+  }
+
+  if (prop->isKind(ParseNodeKind::OptionalDotExpr)) {
+    MOZ_ASSERT(!isSuper);
+    if (!oe.emitJumpShortCircuit()) {
+      return false;
+    }
+  }
+
+  if (!poe.emitGet(prop->key().atom())) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitOptionalElemExpression(PropertyByValueBase* elem,
+                                                 ElemOpEmitter& eoe,
+                                                 bool isSuper,
+                                                 OptionalEmitter& oe) {
+  if (!eoe.prepareForObj()) {
+    return false;
+  }
+
+  if (isSuper) {
+    UnaryNode* base = &elem->expression().as<UnaryNode>();
+    if (!emitGetThisForSuperBase(base)) {
+      return false;
+    }
+  } else {
+    if (!emitOptionalTree(&elem->expression(), oe)) {
+      return false;
+    }
+  }
+
+  if (elem->isKind(ParseNodeKind::OptionalElemExpr)) {
+    MOZ_ASSERT(!isSuper);
+    if (!oe.emitJumpShortCircuit()) {
+      return false;
+    }
+  }
+
+  if (!eoe.prepareForKey()) {
+    return false;
+  }
+
+  if (!emitTree(&elem->key())) {
+    return false;
+  }
+
+  if (!eoe.emitGet()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitOptionalPrivateExpression(
+    PrivateMemberAccessBase* privateExpr, PrivateOpEmitter& xoe,
+    OptionalEmitter& oe) {
+  if (!emitOptionalTree(&privateExpr->expression(), oe)) {
+    return false;
+  }
+
+  if (privateExpr->isKind(ParseNodeKind::OptionalPrivateMemberExpr)) {
+    if (!oe.emitJumpShortCircuit()) {
+      return false;
+    }
+  }
+
+  if (!xoe.emitReference()) {
+    return false;
+  }
+  if (!xoe.emitGet()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitShortCircuit(ListNode* node, ValueUsage valueUsage) {
+  MOZ_ASSERT(node->isKind(ParseNodeKind::OrExpr) ||
+             node->isKind(ParseNodeKind::CoalesceExpr) ||
+             node->isKind(ParseNodeKind::AndExpr));
+
+
+  TDZCheckCache tdzCache(this);
+
+  JSOp op;
+  switch (node->getKind()) {
+    case ParseNodeKind::OrExpr:
+      op = JSOp::Or;
+      break;
+    case ParseNodeKind::CoalesceExpr:
+      op = JSOp::Coalesce;
+      break;
+    case ParseNodeKind::AndExpr:
+      op = JSOp::And;
+      break;
+    default:
+      MOZ_CRASH("Unexpected ParseNodeKind");
+  }
+
+  JumpList jump;
+
+  for (ParseNode* expr : node->contentsTo(node->last())) {
+    if (!emitTree(expr)) {
+      return false;
+    }
+    if (!emitJump(op, &jump)) {
+      return false;
+    }
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+  if (!emitTree(node->last(), valueUsage)) {
+    return false;
+  }
+
+  if (!emitJumpTargetAndPatch(jump)) {
+    return false;
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitSequenceExpr(ListNode* node, ValueUsage valueUsage) {
+  for (ParseNode* child : node->contentsTo(node->last())) {
+    if (!updateSourceCoordNotes(child->pn_pos.begin)) {
+      return false;
+    }
+    if (!emitTree(child, ValueUsage::IgnoreValue)) {
+      return false;
+    }
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+  ParseNode* child = node->last();
+  if (!updateSourceCoordNotes(child->pn_pos.begin)) {
+    return false;
+  }
+  if (!emitTree(child, valueUsage)) {
+    return false;
+  }
+  return true;
+}
+
+MOZ_NEVER_INLINE bool BytecodeEmitter::emitIncOrDec(UnaryNode* incDec,
+                                                    ValueUsage valueUsage) {
+  switch (incDec->kid()->getKind()) {
+    case ParseNodeKind::ArgumentsLength:
+    case ParseNodeKind::DotExpr:
+      return emitPropIncDec(incDec, valueUsage);
+    case ParseNodeKind::ElemExpr:
+      return emitElemIncDec(incDec, valueUsage);
+    case ParseNodeKind::PrivateMemberExpr:
+      return emitPrivateIncDec(incDec, valueUsage);
+    case ParseNodeKind::CallExpr:
+      return emitCallIncDec(incDec);
+    default:
+      return emitNameIncDec(incDec, valueUsage);
+  }
+}
+
+MOZ_NEVER_INLINE bool BytecodeEmitter::emitLabeledStatement(
+    const LabeledStatement* labeledStmt) {
+  auto name = labeledStmt->label();
+  LabelEmitter label(this);
+
+  label.emitLabel(name);
+
+  if (!emitTree(labeledStmt->statement())) {
+    return false;
+  }
+  if (!label.emitEnd()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitConditionalExpression(
+    ConditionalExpression& conditional, ValueUsage valueUsage) {
+  CondEmitter cond(this);
+  if (!cond.emitCond()) {
+    return false;
+  }
+
+  ParseNode* conditionNode = &conditional.condition();
+  auto conditionKind = IfEmitter::ConditionKind::Positive;
+  if (conditionNode->isKind(ParseNodeKind::NotExpr)) {
+    conditionNode = conditionNode->as<UnaryNode>().kid();
+    conditionKind = IfEmitter::ConditionKind::Negative;
+  }
+
+  if (!emitTree(conditionNode)) {
+    return false;
+  }
+
+  if (!cond.emitThenElse(conditionKind)) {
+    return false;
+  }
+
+  if (!emitTree(&conditional.thenExpression(), valueUsage)) {
+    return false;
+  }
+
+  if (!cond.emitElse()) {
+    return false;
+  }
+
+  if (!emitTree(&conditional.elseExpression(), valueUsage)) {
+    return false;
+  }
+
+  if (!cond.emitEnd()) {
+    return false;
+  }
+  MOZ_ASSERT(cond.pushed() == 1);
+
+  return true;
+}
+
+void BytecodeEmitter::isPropertyListObjLiteralCompatible(
+    ListNode* obj, bool* withValues, bool* withoutValues) const {
+  bool keysOK = true;
+  bool valuesOK = true;
+  uint32_t propCount = 0;
+
+  for (ParseNode* propdef : obj->contents()) {
+    if (!propdef->is<BinaryNode>()) {
+      keysOK = false;
+      break;
+    }
+    propCount++;
+
+    BinaryNode* prop = &propdef->as<BinaryNode>();
+    ParseNode* key = prop->left();
+    ParseNode* value = prop->right();
+
+    if (key->isKind(ParseNodeKind::ComputedName)) {
+      keysOK = false;
+      break;
+    }
+
+    MOZ_ASSERT(!key->isKind(ParseNodeKind::BigIntExpr));
+
+    if (key->isKind(ParseNodeKind::NumberExpr)) {
+      double numValue = key->as<NumericLiteral>().value();
+      int32_t i = 0;
+      if (!NumberIsInt32(numValue, &i)) {
+        keysOK = false;
+        break;
+      }
+      if (!ObjLiteralWriter::arrayIndexInRange(i)) {
+        keysOK = false;
+        break;
+      }
+    }
+
+    MOZ_ASSERT(key->isKind(ParseNodeKind::ObjectPropertyName) ||
+               key->isKind(ParseNodeKind::StringExpr) ||
+               key->isKind(ParseNodeKind::NumberExpr));
+
+    AccessorType accessorType =
+        prop->is<PropertyDefinition>()
+            ? prop->as<PropertyDefinition>().accessorType()
+            : AccessorType::None;
+    if (accessorType != AccessorType::None) {
+      keysOK = false;
+      break;
+    }
+
+    if (!isRHSObjLiteralCompatible(value)) {
+      valuesOK = false;
+    }
+  }
+
+  if (propCount > SharedPropMap::MaxPropsForNonDictionary) {
+    keysOK = false;
+  }
+
+  *withValues = keysOK && valuesOK;
+  *withoutValues = keysOK;
+}
+
+bool BytecodeEmitter::isArrayObjLiteralCompatible(ListNode* array) const {
+  for (ParseNode* elem : array->contents()) {
+    if (elem->isKind(ParseNodeKind::Spread)) {
+      return false;
+    }
+    if (!isRHSObjLiteralCompatible(elem)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitPropertyList(ListNode* obj, PropertyEmitter& pe,
+                                       PropListType type) {
+
+  size_t curFieldKeyIndex = 0;
+  size_t curStaticFieldKeyIndex = 0;
+  for (ParseNode* propdef : obj->contents()) {
+    if (propdef->is<ClassField>()) {
+      MOZ_ASSERT(type == ClassBody);
+      ClassField* field = &propdef->as<ClassField>();
+      if (field->name().getKind() == ParseNodeKind::ComputedName) {
+        auto fieldKeys =
+            field->isStatic()
+                ? TaggedParserAtomIndex::WellKnown::dot_staticFieldKeys_()
+                : TaggedParserAtomIndex::WellKnown::dot_fieldKeys_();
+        if (!emitGetName(fieldKeys)) {
+          return false;
+        }
+
+        ParseNode* nameExpr = field->name().as<UnaryNode>().kid();
+
+        if (!emitTree(nameExpr, ValueUsage::WantValue)) {
+          return false;
+        }
+
+        if (!emit1(JSOp::ToPropertyKey)) {
+          return false;
+        }
+
+        size_t fieldKeysIndex;
+        if (field->isStatic()) {
+          fieldKeysIndex = curStaticFieldKeyIndex++;
+        } else {
+          fieldKeysIndex = curFieldKeyIndex++;
+        }
+
+        if (!emitUint32Operand(JSOp::InitElemArray, fieldKeysIndex)) {
+          return false;
+        }
+
+        if (!emit1(JSOp::Pop)) {
+          return false;
+        }
+      }
+      continue;
+    }
+
+    if (propdef->isKind(ParseNodeKind::StaticClassBlock)) {
+      continue;
+    }
+
+    if (propdef->is<LexicalScopeNode>()) {
+      MOZ_ASSERT(
+          propdef->as<LexicalScopeNode>().scopeBody()->is<ClassMethod>());
+      continue;
+    }
+
+    if (propdef->isKind(ParseNodeKind::MutateProto)) {
+      MOZ_ASSERT(type == ObjectLiteral);
+      if (!pe.prepareForProtoValue(propdef->pn_pos.begin)) {
+        return false;
+      }
+      if (!emitTree(propdef->as<UnaryNode>().kid())) {
+        return false;
+      }
+      if (!pe.emitMutateProto()) {
+        return false;
+      }
+      continue;
+    }
+
+    if (propdef->isKind(ParseNodeKind::Spread)) {
+      MOZ_ASSERT(type == ObjectLiteral);
+      if (!pe.prepareForSpreadOperand(propdef->pn_pos.begin)) {
+        return false;
+      }
+      if (!emitTree(propdef->as<UnaryNode>().kid())) {
+        return false;
+      }
+      if (!pe.emitSpread()) {
+        return false;
+      }
+      continue;
+    }
+
+    BinaryNode* prop = &propdef->as<BinaryNode>();
+
+    ParseNode* key = prop->left();
+    AccessorType accessorType;
+    if (prop->is<ClassMethod>()) {
+      ClassMethod& method = prop->as<ClassMethod>();
+      accessorType = method.accessorType();
+
+      if (!method.isStatic() && key->isKind(ParseNodeKind::PrivateName) &&
+          accessorType != AccessorType::None) {
+        continue;
+      }
+    } else if (prop->is<PropertyDefinition>()) {
+      accessorType = prop->as<PropertyDefinition>().accessorType();
+    } else {
+      accessorType = AccessorType::None;
+    }
+
+    auto emitValue = [this, &key, &prop, accessorType, &pe]() {
+
+      ParseNode* propVal = prop->right();
+      if (propVal->isDirectRHSAnonFunction()) {
+        if (key->isKind(ParseNodeKind::ObjectPropertyName) ||
+            key->isKind(ParseNodeKind::PrivateName) ||
+            key->isKind(ParseNodeKind::StringExpr)) {
+          auto keyAtom = key->as<NameNode>().atom();
+          if (!emitAnonymousFunctionWithName(propVal, keyAtom)) {
+            return false;
+          }
+        } else if (key->isKind(ParseNodeKind::NumberExpr)) {
+          MOZ_ASSERT(accessorType == AccessorType::None);
+
+          auto keyAtom = key->as<NumericLiteral>().toAtom(fc, parserAtoms());
+          if (!keyAtom) {
+            return false;
+          }
+          if (!emitAnonymousFunctionWithName(propVal, keyAtom)) {
+            return false;
+          }
+        } else if (key->isKind(ParseNodeKind::ComputedName) &&
+                   (key->as<UnaryNode>().kid()->isKind(
+                        ParseNodeKind::NumberExpr) ||
+                    key->as<UnaryNode>().kid()->isKind(
+                        ParseNodeKind::StringExpr)) &&
+                   accessorType == AccessorType::None) {
+          ParseNode* keyKid = key->as<UnaryNode>().kid();
+          if (keyKid->isKind(ParseNodeKind::NumberExpr)) {
+            auto keyAtom =
+                keyKid->as<NumericLiteral>().toAtom(fc, parserAtoms());
+            if (!keyAtom) {
+              return false;
+            }
+            if (!emitAnonymousFunctionWithName(propVal, keyAtom)) {
+              return false;
+            }
+          } else {
+            MOZ_ASSERT(keyKid->isKind(ParseNodeKind::StringExpr));
+            auto keyAtom = keyKid->as<NameNode>().atom();
+            if (!emitAnonymousFunctionWithName(propVal, keyAtom)) {
+              return false;
+            }
+          }
+        } else {
+          MOZ_ASSERT(key->isKind(ParseNodeKind::ComputedName));
+
+          FunctionPrefixKind prefix =
+              accessorType == AccessorType::None     ? FunctionPrefixKind::None
+              : accessorType == AccessorType::Getter ? FunctionPrefixKind::Get
+                                                     : FunctionPrefixKind::Set;
+
+          if (!emitAnonymousFunctionWithComputedName(propVal, prefix)) {
+            return false;
+          }
+        }
+      } else {
+        if (!emitTree(propVal)) {
+          return false;
+        }
+      }
+
+      if (propVal->is<FunctionNode>() &&
+          propVal->as<FunctionNode>().funbox()->needsHomeObject()) {
+        if (!pe.emitInitHomeObject()) {
+          return false;
+        }
+      }
+
+#ifdef ENABLE_DECORATORS
+      if (prop->is<ClassMethod>()) {
+        ClassMethod& method = prop->as<ClassMethod>();
+        if (method.decorators() && !method.decorators()->empty()) {
+          DecoratorEmitter::Kind kind;
+          switch (method.accessorType()) {
+            case AccessorType::Getter:
+              kind = DecoratorEmitter::Getter;
+              break;
+            case AccessorType::Setter:
+              kind = DecoratorEmitter::Setter;
+              break;
+            case AccessorType::None:
+              kind = DecoratorEmitter::Method;
+              break;
+          }
+
+          if (!method.isStatic()) {
+            bool hasKeyOnStack = key->isKind(ParseNodeKind::NumberExpr) ||
+                                 key->isKind(ParseNodeKind::ComputedName);
+            if (!emitDupAt(hasKeyOnStack ? 4 : 3)) {
+              return false;
+            }
+          } else {
+            if (!emit1(JSOp::Undefined)) {
+              return false;
+            }
+          }
+
+          if (!emit1(JSOp::Swap)) {
+            return false;
+          }
+
+          DecoratorEmitter de(this);
+          if (!de.emitApplyDecoratorsToElementDefinition(
+                  kind, key, method.decorators(), method.isStatic())) {
+            return false;
+          }
+
+          if (!emit1(JSOp::Swap)) {
+            return false;
+          }
+
+          if (!emitPopN(1)) {
+            return false;
+          }
+        }
+      }
+#endif
+
+      return true;
+    };
+
+    PropertyEmitter::Kind kind =
+        (type == ClassBody && propdef->as<ClassMethod>().isStatic())
+            ? PropertyEmitter::Kind::Static
+            : PropertyEmitter::Kind::Prototype;
+    if (key->isKind(ParseNodeKind::ObjectPropertyName) ||
+        key->isKind(ParseNodeKind::StringExpr)) {
+
+      auto keyAtom = key->as<NameNode>().atom();
+
+      if (type == ClassBody &&
+          keyAtom == TaggedParserAtomIndex::WellKnown::constructor() &&
+          !propdef->as<ClassMethod>().isStatic()) {
+        continue;
+      }
+
+      if (!pe.prepareForPropValue(propdef->pn_pos.begin, kind)) {
+        return false;
+      }
+
+      if (!emitValue()) {
+        return false;
+      }
+
+      if (!pe.emitInit(accessorType, keyAtom)) {
+        return false;
+      }
+
+      continue;
+    }
+
+    if (key->isKind(ParseNodeKind::NumberExpr)) {
+      if (!pe.prepareForIndexPropKey(propdef->pn_pos.begin, kind)) {
+        return false;
+      }
+      if (!emitNumberOp(key->as<NumericLiteral>().value())) {
+        return false;
+      }
+      if (!pe.prepareForIndexPropValue()) {
+        return false;
+      }
+      if (!emitValue()) {
+        return false;
+      }
+
+      if (!pe.emitInitIndexOrComputed(accessorType)) {
+        return false;
+      }
+
+      continue;
+    }
+
+    if (key->isKind(ParseNodeKind::ComputedName)) {
+
+
+      if (!pe.prepareForComputedPropKey(propdef->pn_pos.begin, kind)) {
+        return false;
+      }
+      if (!emitTree(key->as<UnaryNode>().kid())) {
+        return false;
+      }
+      if (!pe.prepareForComputedPropValue()) {
+        return false;
+      }
+      if (!emitValue()) {
+        return false;
+      }
+
+      if (!pe.emitInitIndexOrComputed(accessorType)) {
+        return false;
+      }
+
+      continue;
+    }
+
+    MOZ_ASSERT(key->isKind(ParseNodeKind::PrivateName));
+    MOZ_ASSERT(type == ClassBody);
+
+    auto* privateName = &key->as<NameNode>();
+
+    if (kind == PropertyEmitter::Kind::Prototype) {
+      MOZ_ASSERT(accessorType == AccessorType::None);
+      if (!pe.prepareForPrivateMethod()) {
+        return false;
+      }
+      NameOpEmitter noe(this, privateName->atom(),
+                        NameOpEmitter::Kind::SimpleAssignment);
+
+      MOZ_ASSERT(noe.loc().kind() == NameLocation::Kind::FrameSlot ||
+                 noe.loc().kind() == NameLocation::Kind::EnvironmentCoordinate);
+
+      if (!noe.prepareForRhs()) {
+        return false;
+      }
+      if (!emitValue()) {
+        return false;
+      }
+      if (!noe.emitAssignment()) {
+        return false;
+      }
+      if (!emit1(JSOp::Pop)) {
+        return false;
+      }
+      if (!pe.skipInit()) {
+        return false;
+      }
+      continue;
+    }
+
+    MOZ_ASSERT(kind == PropertyEmitter::Kind::Static);
+
+
+    if (!pe.prepareForPrivateStaticMethod(propdef->pn_pos.begin)) {
+      return false;
+    }
+    if (!emitGetPrivateName(privateName)) {
+      return false;
+    }
+    if (!emitValue()) {
+      return false;
+    }
+
+    if (!pe.emitPrivateStaticMethod(accessorType)) {
+      return false;
+    }
+
+    if (privateName->privateNameKind() == PrivateNameKind::Setter) {
+      if (!emitDupAt(1)) {
+        return false;
+      }
+      if (!emitGetPrivateName(privateName)) {
+        return false;
+      }
+      if (!emitAtomOp(JSOp::GetIntrinsic,
+                      TaggedParserAtomIndex::WellKnown::NoPrivateGetter())) {
+        return false;
+      }
+      if (!emit1(JSOp::InitHiddenElemGetter)) {
+        return false;
+      }
+      if (!emit1(JSOp::Pop)) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitPropertyListObjLiteral(ListNode* obj, JSOp op,
+                                                 bool useObjLiteralValues) {
+  ObjLiteralWriter writer;
+
+#ifdef DEBUG
+  mozilla::Maybe<mozilla::HashSet<frontend::TaggedParserAtomIndex,
+                                  frontend::TaggedParserAtomIndexHasher>>
+      selfHostedPropNames;
+  if (emitterMode == BytecodeEmitter::SelfHosting) {
+    selfHostedPropNames.emplace();
+  }
+#endif
+
+  if (op == JSOp::Object) {
+    writer.beginObject(op);
+  } else {
+    MOZ_ASSERT(op == JSOp::NewObject);
+    writer.beginShape(op);
+  }
+
+  for (ParseNode* propdef : obj->contents()) {
+    BinaryNode* prop = &propdef->as<BinaryNode>();
+    ParseNode* key = prop->left();
+
+    if (key->is<NameNode>()) {
+      if (emitterMode == BytecodeEmitter::SelfHosting) {
+        auto propName = key->as<NameNode>().atom();
+#ifdef DEBUG
+        auto p = selfHostedPropNames->lookupForAdd(propName);
+        MOZ_ASSERT(!p);
+        if (!selfHostedPropNames->add(p, propName)) {
+          js::ReportOutOfMemory(fc);
+          return false;
+        }
+#endif
+        writer.setPropNameNoDuplicateCheck(parserAtoms(), propName);
+      } else {
+        if (!writer.setPropName(parserAtoms(), key->as<NameNode>().atom())) {
+          return false;
+        }
+      }
+    } else {
+      double numValue = key->as<NumericLiteral>().value();
+      int32_t i = 0;
+      DebugOnly<bool> numIsInt =
+          NumberIsInt32(numValue, &i);  
+      MOZ_ASSERT(numIsInt);
+      MOZ_ASSERT(
+          ObjLiteralWriter::arrayIndexInRange(i));  
+
+      if (!useObjLiteralValues) {
+        continue;
+      }
+
+      writer.setPropIndex(i);
+    }
+
+    if (useObjLiteralValues) {
+      MOZ_ASSERT(op == JSOp::Object);
+      ParseNode* value = prop->right();
+      if (!emitObjLiteralValue(writer, value)) {
+        return false;
+      }
+    } else {
+      if (!writer.propWithUndefinedValue(fc)) {
+        return false;
+      }
+    }
+  }
+
+  GCThingIndex index;
+  if (!addObjLiteralData(writer, &index)) {
+    return false;
+  }
+
+  MOZ_ASSERT_IF(op == JSOp::Object,
+                sc->isTopLevelContext() && sc->treatAsRunOnce());
+
+  if (!emitGCIndexOp(op, index)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitDestructuringRestExclusionSetObjLiteral(
+    ListNode* pattern) {
+  constexpr JSOp op = JSOp::NewObject;
+
+  ObjLiteralWriter writer;
+  writer.beginShape(op);
+
+  for (ParseNode* member : pattern->contents()) {
+    if (member->isKind(ParseNodeKind::Spread)) {
+      MOZ_ASSERT(!member->pn_next, "unexpected trailing element after spread");
+      break;
+    }
+
+    TaggedParserAtomIndex atom;
+    if (member->isKind(ParseNodeKind::MutateProto)) {
+      atom = TaggedParserAtomIndex::WellKnown::proto_();
+    } else {
+      ParseNode* key = member->as<BinaryNode>().left();
+      atom = key->as<NameNode>().atom();
+    }
+
+    if (!writer.setPropName(parserAtoms(), atom)) {
+      return false;
+    }
+
+    if (!writer.propWithUndefinedValue(fc)) {
+      return false;
+    }
+  }
+
+  GCThingIndex index;
+  if (!addObjLiteralData(writer, &index)) {
+    return false;
+  }
+
+  if (!emitGCIndexOp(op, index)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitObjLiteralArray(ListNode* array) {
+  MOZ_ASSERT(checkSingletonContext());
+
+  constexpr JSOp op = JSOp::Object;
+
+  ObjLiteralWriter writer;
+  writer.beginArray(op);
+
+  writer.beginDenseArrayElements();
+  for (ParseNode* elem : array->contents()) {
+    if (!emitObjLiteralValue(writer, elem)) {
+      return false;
+    }
+  }
+
+  GCThingIndex index;
+  if (!addObjLiteralData(writer, &index)) {
+    return false;
+  }
+
+  if (!emitGCIndexOp(op, index)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::isRHSObjLiteralCompatible(ParseNode* value) const {
+  return value->isKind(ParseNodeKind::NumberExpr) ||
+         value->isKind(ParseNodeKind::TrueExpr) ||
+         value->isKind(ParseNodeKind::FalseExpr) ||
+         value->isKind(ParseNodeKind::NullExpr) ||
+         value->isKind(ParseNodeKind::RawUndefinedExpr) ||
+         value->isKind(ParseNodeKind::StringExpr) ||
+         value->isKind(ParseNodeKind::TemplateStringExpr);
+}
+
+bool BytecodeEmitter::emitObjLiteralValue(ObjLiteralWriter& writer,
+                                          ParseNode* value) {
+  MOZ_ASSERT(isRHSObjLiteralCompatible(value));
+  if (value->isKind(ParseNodeKind::NumberExpr)) {
+    double numValue = value->as<NumericLiteral>().value();
+    int32_t i = 0;
+    js::Value v;
+    if (NumberIsInt32(numValue, &i)) {
+      v.setInt32(i);
+    } else {
+      v.setDouble(numValue);
+    }
+    if (!writer.propWithConstNumericValue(fc, v)) {
+      return false;
+    }
+  } else if (value->isKind(ParseNodeKind::TrueExpr)) {
+    if (!writer.propWithTrueValue(fc)) {
+      return false;
+    }
+  } else if (value->isKind(ParseNodeKind::FalseExpr)) {
+    if (!writer.propWithFalseValue(fc)) {
+      return false;
+    }
+  } else if (value->isKind(ParseNodeKind::NullExpr)) {
+    if (!writer.propWithNullValue(fc)) {
+      return false;
+    }
+  } else if (value->isKind(ParseNodeKind::RawUndefinedExpr)) {
+    if (!writer.propWithUndefinedValue(fc)) {
+      return false;
+    }
+  } else if (value->isKind(ParseNodeKind::StringExpr) ||
+             value->isKind(ParseNodeKind::TemplateStringExpr)) {
+    if (!writer.propWithAtomValue(fc, parserAtoms(),
+                                  value->as<NameNode>().atom())) {
+      return false;
+    }
+  } else {
+    MOZ_CRASH("Unexpected parse node");
+  }
+  return true;
+}
+
+static bool NeedsPrivateBrand(ParseNode* member) {
+  return member->is<ClassMethod>() &&
+         member->as<ClassMethod>().name().isKind(ParseNodeKind::PrivateName) &&
+         !member->as<ClassMethod>().isStatic();
+}
+
+#ifdef ENABLE_DECORATORS
+static bool HasDecorators(ParseNode* member) {
+  return member->is<ClassMethod>() && member->as<ClassMethod>().decorators();
+}
+#endif
+
+mozilla::Maybe<MemberInitializers> BytecodeEmitter::setupMemberInitializers(
+    ListNode* classMembers, FieldPlacement placement) const {
+  bool isStatic = placement == FieldPlacement::Static;
+
+  size_t numFields = 0;
+  size_t numPrivateInitializers = 0;
+  bool hasPrivateBrand = false;
+#ifdef ENABLE_DECORATORS
+  bool hasDecorators = false;
+#endif
+  for (ParseNode* member : classMembers->contents()) {
+    if (NeedsFieldInitializer(member, isStatic)) {
+      numFields++;
+    } else if (NeedsAccessorInitializer(member, isStatic)) {
+      numPrivateInitializers++;
+      hasPrivateBrand = true;
+    } else if (NeedsPrivateBrand(member)) {
+      hasPrivateBrand = true;
+    }
+#ifdef ENABLE_DECORATORS
+    if (!hasDecorators && HasDecorators(member)) {
+      hasDecorators = true;
+    }
+#endif
+  }
+
+  if (numFields + numPrivateInitializers >
+      MemberInitializers::MaxInitializers) {
+    return Nothing();
+  }
+  return Some(MemberInitializers(hasPrivateBrand,
+#ifdef ENABLE_DECORATORS
+                                 hasDecorators,
+#endif
+                                 numFields + numPrivateInitializers));
+}
+
+bool BytecodeEmitter::emitCreateFieldKeys(ListNode* obj,
+                                          FieldPlacement placement) {
+  bool isStatic = placement == FieldPlacement::Static;
+  auto isFieldWithComputedName = [isStatic](ParseNode* propdef) {
+    return propdef->is<ClassField>() &&
+           propdef->as<ClassField>().isStatic() == isStatic &&
+           propdef->as<ClassField>().name().getKind() ==
+               ParseNodeKind::ComputedName;
+  };
+
+  size_t numFieldKeys = std::count_if(
+      obj->contents().begin(), obj->contents().end(), isFieldWithComputedName);
+  if (numFieldKeys == 0) {
+    return true;
+  }
+
+  auto fieldKeys =
+      isStatic ? TaggedParserAtomIndex::WellKnown::dot_staticFieldKeys_()
+               : TaggedParserAtomIndex::WellKnown::dot_fieldKeys_();
+  NameOpEmitter noe(this, fieldKeys, NameOpEmitter::Kind::Initialize);
+  if (!noe.prepareForRhs()) {
+    return false;
+  }
+
+  if (!emitUint32Operand(JSOp::NewArray, numFieldKeys)) {
+    return false;
+  }
+
+  if (!noe.emitAssignment()) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  return true;
+}
+
+static bool HasInitializer(ParseNode* node, bool isStaticContext) {
+  return (node->is<ClassField>() &&
+          node->as<ClassField>().isStatic() == isStaticContext) ||
+         (isStaticContext && node->is<StaticClassBlock>());
+}
+
+static FunctionNode* GetInitializer(ParseNode* node, bool isStaticContext) {
+  MOZ_ASSERT(HasInitializer(node, isStaticContext));
+  MOZ_ASSERT_IF(!node->is<ClassField>(), isStaticContext);
+  return node->is<ClassField>() ? node->as<ClassField>().initializer()
+                                : node->as<StaticClassBlock>().function();
+}
+
+static bool IsPrivateInstanceAccessor(const ClassMethod* classMethod) {
+  return !classMethod->isStatic() &&
+         classMethod->name().isKind(ParseNodeKind::PrivateName) &&
+         classMethod->accessorType() != AccessorType::None;
+}
+
+bool BytecodeEmitter::emitCreateMemberInitializers(ClassEmitter& ce,
+                                                   ListNode* obj,
+                                                   FieldPlacement placement
+#ifdef ENABLE_DECORATORS
+                                                   ,
+                                                   bool hasHeritage
+#endif
+) {
+#ifdef ENABLE_DECORATORS
+  MOZ_ASSERT_IF(placement == FieldPlacement::Static, !hasHeritage);
+#endif
+  mozilla::Maybe<MemberInitializers> memberInitializers =
+      setupMemberInitializers(obj, placement);
+  if (!memberInitializers) {
+    ReportAllocationOverflow(fc);
+    return false;
+  }
+
+  size_t numInitializers = memberInitializers->numMemberInitializers;
+  if (numInitializers == 0) {
+    return true;
+  }
+
+  bool isStatic = placement == FieldPlacement::Static;
+  if (!ce.prepareForMemberInitializers(numInitializers, isStatic)) {
+    return false;
+  }
+
+  if (!isStatic) {
+    if (!emitPrivateMethodInitializers(ce, obj)) {
+      return false;
+    }
+  }
+
+  for (ParseNode* propdef : obj->contents()) {
+    if (!HasInitializer(propdef, isStatic)) {
+      continue;
+    }
+
+    FunctionNode* initializer = GetInitializer(propdef, isStatic);
+
+    if (!ce.prepareForMemberInitializer()) {
+      return false;
+    }
+    if (!emitTree(initializer)) {
+      return false;
+    }
+    if (initializer->funbox()->needsHomeObject()) {
+      MOZ_ASSERT(initializer->funbox()->allowSuperProperty());
+      if (!ce.emitMemberInitializerHomeObject(isStatic)) {
+        return false;
+      }
+    }
+    if (!ce.emitStoreMemberInitializer()) {
+      return false;
+    }
+  }
+
+#ifdef ENABLE_DECORATORS
+  if (!emitNumberOp(numInitializers)) {
+    return false;
+  }
+
+  for (ParseNode* propdef : obj->contents()) {
+    if (!propdef->is<ClassField>()) {
+      continue;
+    }
+    ClassField* field = &propdef->as<ClassField>();
+    if (field->isStatic() != isStatic) {
+      continue;
+    }
+    if (field->decorators() && !field->decorators()->empty()) {
+      DecoratorEmitter de(this);
+      if (!field->hasAccessor()) {
+        if (!emitDupAt((hasHeritage || isStatic) ? 4 : 3)) {
+          return false;
+        }
+        if (!de.emitApplyDecoratorsToFieldDefinition(
+                &field->name(), field->decorators(), field->isStatic())) {
+          return false;
+        }
+        if (!emit1(JSOp::Swap)) {
+          return false;
+        }
+        if (!emitPopN(1)) {
+          return false;
+        }
+      } else {
+        ClassMethod* accessorGetterNode = field->accessorGetterNode();
+        auto accessorGetterKeyAtom =
+            accessorGetterNode->left()->as<NameNode>().atom();
+        ClassMethod* accessorSetterNode = field->accessorSetterNode();
+        auto accessorSetterKeyAtom =
+            accessorSetterNode->left()->as<NameNode>().atom();
+        if (!IsPrivateInstanceAccessor(accessorGetterNode)) {
+          if (!emitTree(&accessorGetterNode->method())) {
+            return false;
+          }
+          if (!emitTree(&accessorSetterNode->method())) {
+            return false;
+          }
+        } else {
+          MOZ_ASSERT(IsPrivateInstanceAccessor(accessorSetterNode));
+          auto getAccessor = [this](
+                                 ClassMethod* classMethod,
+                                 TaggedParserAtomIndex& updatedAtom) -> bool {
+
+            TaggedParserAtomIndex name =
+                classMethod->name().as<NameNode>().atom();
+            AccessorType accessorType = classMethod->accessorType();
+            StringBuilder storedMethodName(fc);
+            if (!storedMethodName.append(parserAtoms(), name)) {
+              return false;
+            }
+            if (!storedMethodName.append(accessorType == AccessorType::Getter
+                                             ? ".getter"
+                                             : ".setter")) {
+              return false;
+            }
+            updatedAtom = storedMethodName.finishParserAtom(parserAtoms(), fc);
+            if (!updatedAtom) {
+              return false;
+            }
+
+            return emitGetName(updatedAtom);
+          };
+
+          if (!getAccessor(accessorGetterNode, accessorGetterKeyAtom)) {
+            return false;
+          };
+
+          if (!getAccessor(accessorSetterNode, accessorSetterKeyAtom)) {
+            return false;
+          };
+        }
+
+        if (!emitDupAt((hasHeritage || isStatic) ? 6 : 5)) {
+          return false;
+        }
+
+        if (!emitUnpickN(2)) {
+          return false;
+        }
+
+        if (!de.emitApplyDecoratorsToAccessorDefinition(
+                &field->name(), field->decorators(), field->isStatic())) {
+          return false;
+        }
+
+        if (!emitPickN(3)) {
+          return false;
+        }
+
+        if (!emitPopN(1)) {
+          return false;
+        }
+
+        if (!emitUnpickN(2)) {
+          return false;
+        }
+
+        if (!IsPrivateInstanceAccessor(accessorGetterNode)) {
+          if (!isStatic) {
+            if (!emitDupAt(hasHeritage ? 6 : 5)) {
+              return false;
+            }
+          } else {
+            if (!emitDupAt(6)) {
+              return false;
+            }
+            if (!emitDupAt(6)) {
+              return false;
+            }
+          }
+
+          PropertyEmitter::Kind kind = field->isStatic()
+                                           ? PropertyEmitter::Kind::Static
+                                           : PropertyEmitter::Kind::Prototype;
+          if (!accessorGetterNode->name().isKind(ParseNodeKind::PrivateName)) {
+            MOZ_ASSERT(
+                !accessorSetterNode->name().isKind(ParseNodeKind::PrivateName));
+
+            if (!ce.prepareForPropValue(propdef->pn_pos.begin, kind)) {
+              return false;
+            }
+            if (!emitPickN(isStatic ? 3 : 1)) {
+              return false;
+            }
+            if (!ce.emitInit(AccessorType::Setter, accessorSetterKeyAtom)) {
+              return false;
+            }
+
+            if (!ce.prepareForPropValue(propdef->pn_pos.begin, kind)) {
+              return false;
+            }
+            if (!emitPickN(isStatic ? 3 : 1)) {
+              return false;
+            }
+            if (!ce.emitInit(AccessorType::Getter, accessorGetterKeyAtom)) {
+              return false;
+            }
+          } else {
+            MOZ_ASSERT(isStatic);
+            if (!emitNewPrivateName(accessorSetterKeyAtom,
+                                    accessorSetterKeyAtom)) {
+              return false;
+            }
+            if (!ce.prepareForPrivateStaticMethod(propdef->pn_pos.begin)) {
+              return false;
+            }
+            if (!emitGetPrivateName(
+                    &accessorSetterNode->name().as<NameNode>())) {
+              return false;
+            }
+            if (!emitPickN(4)) {
+              return false;
+            }
+            if (!ce.emitPrivateStaticMethod(AccessorType::Setter)) {
+              return false;
+            }
+
+            if (!ce.prepareForPrivateStaticMethod(propdef->pn_pos.begin)) {
+              return false;
+            }
+            if (!emitGetPrivateName(
+                    &accessorGetterNode->name().as<NameNode>())) {
+              return false;
+            }
+            if (!emitPickN(4)) {
+              return false;
+            }
+            if (!ce.emitPrivateStaticMethod(AccessorType::Getter)) {
+              return false;
+            }
+          }
+
+          if (!isStatic) {
+            if (!emitPopN(1)) {
+              return false;
+            }
+          } else {
+            if (!emitPopN(2)) {
+              return false;
+            }
+          }
+        } else {
+          MOZ_ASSERT(IsPrivateInstanceAccessor(accessorSetterNode));
+
+          if (!emitLexicalInitialization(accessorSetterKeyAtom)) {
+            return false;
+          }
+
+          if (!emitPopN(1)) {
+            return false;
+          }
+
+          if (!emitLexicalInitialization(accessorGetterKeyAtom)) {
+            return false;
+          }
+
+          if (!emitPopN(1)) {
+            return false;
+          }
+        }
+      }
+      if (!emit1(JSOp::InitElemInc)) {
+        return false;
+      }
+    }
+  }
+
+  if (!emitPopN(1)) {
+    return false;
+  }
+#endif
+
+  if (!ce.emitMemberInitializersEnd()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitPrivateMethodInitializers(ClassEmitter& ce,
+                                                    ListNode* obj) {
+  for (ParseNode* propdef : obj->contents()) {
+    if (!propdef->is<ClassMethod>()) {
+      continue;
+    }
+    auto* classMethod = &propdef->as<ClassMethod>();
+
+    if (!IsPrivateInstanceAccessor(classMethod)) {
+      continue;
+    }
+
+    if (!ce.prepareForMemberInitializer()) {
+      return false;
+    }
+
+    TaggedParserAtomIndex name = classMethod->name().as<NameNode>().atom();
+    AccessorType accessorType = classMethod->accessorType();
+    StringBuilder storedMethodName(fc);
+    if (!storedMethodName.append(parserAtoms(), name)) {
+      return false;
+    }
+    if (!storedMethodName.append(
+            accessorType == AccessorType::Getter ? ".getter" : ".setter")) {
+      return false;
+    }
+    auto storedMethodAtom =
+        storedMethodName.finishParserAtom(parserAtoms(), fc);
+
+    if (!emitFunction(&classMethod->method())) {
+      return false;
+    }
+    if (classMethod->method().funbox()->needsHomeObject()) {
+      if (!ce.emitMemberInitializerHomeObject(false)) {
+        return false;
+      }
+    }
+    if (!emitLexicalInitialization(storedMethodAtom)) {
+      return false;
+    }
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+
+    if (!emitPrivateMethodInitializer(classMethod, storedMethodAtom)) {
+      return false;
+    }
+
+    if (!ce.emitStoreMemberInitializer()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitPrivateMethodInitializer(
+    ClassMethod* classMethod, TaggedParserAtomIndex storedMethodAtom) {
+  MOZ_ASSERT(IsPrivateInstanceAccessor(classMethod));
+
+  auto* name = &classMethod->name().as<NameNode>();
+
+  FunctionNode* funNode = classMethod->initializerIfPrivate();
+  MOZ_ASSERT(funNode);
+  FunctionBox* funbox = funNode->funbox();
+  FunctionEmitter fe(this, funbox, funNode->syntaxKind(),
+                     FunctionEmitter::IsHoisted::No);
+  if (!fe.prepareForNonLazy()) {
+    return false;
+  }
+
+  BytecodeEmitter bce2(this, funbox);
+  if (!bce2.init(funNode->pn_pos)) {
+    return false;
+  }
+  ParamsBodyNode* paramsBody = funNode->body();
+  FunctionScriptEmitter fse(&bce2, funbox, Nothing(), Nothing());
+  if (!fse.prepareForParameters()) {
+    return false;
+  }
+  if (!bce2.emitFunctionFormalParameters(paramsBody)) {
+    return false;
+  }
+  if (!fse.prepareForBody()) {
+    return false;
+  }
+
+  if (!bce2.emit1(JSOp::FunctionThis)) {
+    return false;
+  }
+  if (!bce2.emitGetPrivateName(name)) {
+    return false;
+  }
+  if (!bce2.emitGetName(storedMethodAtom)) {
+    return false;
+  }
+
+  switch (name->privateNameKind()) {
+    case PrivateNameKind::Setter:
+      if (!bce2.emit1(JSOp::InitHiddenElemSetter)) {
+        return false;
+      }
+      if (!bce2.emitGetPrivateName(name)) {
+        return false;
+      }
+      if (!bce2.emitAtomOp(
+              JSOp::GetIntrinsic,
+              TaggedParserAtomIndex::WellKnown::NoPrivateGetter())) {
+        return false;
+      }
+      if (!bce2.emit1(JSOp::InitHiddenElemGetter)) {
+        return false;
+      }
+      break;
+    case PrivateNameKind::Getter:
+    case PrivateNameKind::GetterSetter:
+      if (classMethod->accessorType() == AccessorType::Getter) {
+        if (!bce2.emit1(JSOp::InitHiddenElemGetter)) {
+          return false;
+        }
+      } else {
+        if (!bce2.emit1(JSOp::InitHiddenElemSetter)) {
+          return false;
+        }
+      }
+      break;
+    default:
+      MOZ_CRASH("Invalid op");
+  }
+
+  if (!bce2.emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  if (!fse.emitEndBody()) {
+    return false;
+  }
+  if (!fse.intoStencil()) {
+    return false;
+  }
+
+  if (!fe.emitNonLazyEnd()) {
+    return false;
+  }
+
+  return true;
+}
+
+const MemberInitializers& BytecodeEmitter::findMemberInitializersForCall()
+    const {
+  for (const auto* current = this; current; current = current->parent) {
+    if (current->sc->isFunctionBox()) {
+      FunctionBox* funbox = current->sc->asFunctionBox();
+
+      if (funbox->isArrow()) {
+        continue;
+      }
+
+      MOZ_RELEASE_ASSERT(funbox->isClassConstructor());
+
+      return funbox->useMemberInitializers() ? funbox->memberInitializers()
+                                             : MemberInitializers::Empty();
+    }
+  }
+
+  MOZ_RELEASE_ASSERT(compilationState.scopeContext.memberInitializers);
+  return *compilationState.scopeContext.memberInitializers;
+}
+
+bool BytecodeEmitter::emitInitializeInstanceMembers(
+    bool isDerivedClassConstructor) {
+  const MemberInitializers& memberInitializers =
+      findMemberInitializersForCall();
+  MOZ_ASSERT(memberInitializers.valid);
+
+  if (memberInitializers.hasPrivateBrand) {
+    if (!emitGetName(TaggedParserAtomIndex::WellKnown::dot_this_())) {
+      return false;
+    }
+    if (!emitGetName(TaggedParserAtomIndex::WellKnown::dot_privateBrand_())) {
+      return false;
+    }
+    if (isDerivedClassConstructor) {
+      if (!emitCheckPrivateField(ThrowCondition::ThrowHas,
+                                 ThrowMsgKind::PrivateBrandDoubleInit)) {
+        return false;
+      }
+      if (!emit1(JSOp::Pop)) {
+        return false;
+      }
+    }
+    if (!emit1(JSOp::Null)) {
+      return false;
+    }
+    if (!emit1(JSOp::InitHiddenElem)) {
+      return false;
+    }
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+  size_t numInitializers = memberInitializers.numMemberInitializers;
+  if (numInitializers > 0) {
+    if (!emitGetName(TaggedParserAtomIndex::WellKnown::dot_initializers_())) {
+      return false;
+    }
+
+    for (size_t index = 0; index < numInitializers; index++) {
+      if (index < numInitializers - 1) {
+        if (!emit1(JSOp::Dup)) {
+          return false;
+        }
+      }
+
+      if (!emitNumberOp(index)) {
+        return false;
+      }
+
+      if (!emit1(JSOp::GetElem)) {
+        return false;
+      }
+
+      if (!emitGetName(TaggedParserAtomIndex::WellKnown::dot_this_())) {
+        return false;
+      }
+
+      if (!emitCall(JSOp::CallIgnoresRv, 0)) {
+        return false;
+      }
+
+      if (!emit1(JSOp::Pop)) {
+        return false;
+      }
+    }
+#ifdef ENABLE_DECORATORS
+    if (memberInitializers.hasDecorators) {
+
+      if (!emitGetName(TaggedParserAtomIndex::WellKnown::dot_initializers_())) {
+        return false;
+      }
+
+      if (!emit1(JSOp::Dup)) {
+        return false;
+      }
+
+      if (!emitAtomOp(JSOp::GetProp,
+                      TaggedParserAtomIndex::WellKnown::length())) {
+        return false;
+      }
+
+      if (!emitNumberOp(static_cast<double>(numInitializers))) {
+        return false;
+      }
+
+      InternalWhileEmitter wh(this);
+      if (!wh.emitCond()) {
+        return false;
+      }
+
+      if (!emit1(JSOp::Dup)) {
+        return false;
+      }
+
+      if (!emitDupAt(2)) {
+        return false;
+      }
+
+      if (!emit1(JSOp::Lt)) {
+        return false;
+      }
+
+      if (!wh.emitBody()) {
+        return false;
+      }
+
+      if (!emitDupAt(2)) {
+        return false;
+      }
+
+      if (!emitDupAt(1)) {
+        return false;
+      }
+
+      if (!emit1(JSOp::GetElem)) {
+        return false;
+      }
+
+      if (!emitGetName(TaggedParserAtomIndex::WellKnown::dot_this_())) {
+        return false;
+      }
+
+      if (!emit1(JSOp::Swap)) {
+        return false;
+      }
+
+      DecoratorEmitter de(this);
+      if (!de.emitInitializeFieldOrAccessor()) {
+        return false;
+      }
+
+      if (!emit1(JSOp::Inc)) {
+        return false;
+      }
+
+      if (!wh.emitEnd()) {
+        return false;
+      }
+
+      if (!emitPopN(3)) {
+        return false;
+      }
+
+      if (!de.emitCallExtraInitializers(TaggedParserAtomIndex::WellKnown::
+                                            dot_instanceExtraInitializers_())) {
+        return false;
+      }
+    }
+#endif
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitInitializeStaticFields(ListNode* classMembers) {
+  auto isStaticField = [](ParseNode* propdef) {
+    return HasInitializer(propdef, true);
+  };
+  size_t numFields =
+      std::count_if(classMembers->contents().begin(),
+                    classMembers->contents().end(), isStaticField);
+
+  if (numFields == 0) {
+    return true;
+  }
+
+  if (!emitGetName(
+          TaggedParserAtomIndex::WellKnown::dot_staticInitializers_())) {
+    return false;
+  }
+
+  for (size_t fieldIndex = 0; fieldIndex < numFields; fieldIndex++) {
+    bool hasNext = fieldIndex < numFields - 1;
+    if (hasNext) {
+      if (!emit1(JSOp::Dup)) {
+        return false;
+      }
+    }
+
+    if (!emitNumberOp(fieldIndex)) {
+      return false;
+    }
+
+    if (!emit1(JSOp::GetElem)) {
+      return false;
+    }
+
+    if (!emitDupAt(1 + hasNext)) {
+      return false;
+    }
+
+    if (!emitCall(JSOp::CallIgnoresRv, 0)) {
+      return false;
+    }
+
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+#ifdef ENABLE_DECORATORS
+
+  if (!emitGetName(
+          TaggedParserAtomIndex::WellKnown::dot_staticInitializers_())) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Dup)) {
+    return false;
+  }
+
+  if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::length())) {
+    return false;
+  }
+
+  if (!emitNumberOp(static_cast<double>(numFields))) {
+    return false;
+  }
+
+  InternalWhileEmitter wh(this);
+  if (!wh.emitCond()) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Dup)) {
+    return false;
+  }
+
+  if (!emitDupAt(2)) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Lt)) {
+    return false;
+  }
+
+  if (!wh.emitBody()) {
+    return false;
+  }
+
+  if (!emitDupAt(2)) {
+    return false;
+  }
+
+  if (!emitDupAt(1)) {
+    return false;
+  }
+
+  if (!emit1(JSOp::GetElem)) {
+    return false;
+  }
+
+  if (!emitDupAt(4)) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Swap)) {
+    return false;
+  }
+
+  DecoratorEmitter de(this);
+  if (!de.emitInitializeFieldOrAccessor()) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Inc)) {
+    return false;
+  }
+
+  if (!wh.emitEnd()) {
+    return false;
+  }
+
+  if (!emitPopN(3)) {
+    return false;
+  }
+#endif
+
+  auto clearStaticFieldSlot = [&](TaggedParserAtomIndex name) {
+    NameOpEmitter noe(this, name, NameOpEmitter::Kind::SimpleAssignment);
+    if (!noe.prepareForRhs()) {
+      return false;
+    }
+
+    if (!emit1(JSOp::Undefined)) {
+      return false;
+    }
+
+    if (!noe.emitAssignment()) {
+      return false;
+    }
+
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+
+    return true;
+  };
+
+  if (!clearStaticFieldSlot(
+          TaggedParserAtomIndex::WellKnown::dot_staticInitializers_())) {
+    return false;
+  }
+
+  auto isStaticFieldWithComputedName = [](ParseNode* propdef) {
+    return propdef->is<ClassField>() && propdef->as<ClassField>().isStatic() &&
+           propdef->as<ClassField>().name().getKind() ==
+               ParseNodeKind::ComputedName;
+  };
+
+  if (std::any_of(classMembers->contents().begin(),
+                  classMembers->contents().end(),
+                  isStaticFieldWithComputedName)) {
+    if (!clearStaticFieldSlot(
+            TaggedParserAtomIndex::WellKnown::dot_staticFieldKeys_())) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+MOZ_NEVER_INLINE bool BytecodeEmitter::emitObject(ListNode* objNode) {
+
+  bool useObjLiteral = false;
+  bool useObjLiteralValues = false;
+  isPropertyListObjLiteralCompatible(objNode, &useObjLiteralValues,
+                                     &useObjLiteral);
+
+  ObjectEmitter oe(this);
+  if (useObjLiteral) {
+    bool singleton = checkSingletonContext() &&
+                     !objNode->hasNonConstInitializer() && objNode->head();
+    JSOp op;
+    if (singleton) {
+      op = JSOp::Object;
+    } else {
+      useObjLiteralValues = false;
+      op = JSOp::NewObject;
+    }
+
+    if (!emitPropertyListObjLiteral(objNode, op, useObjLiteralValues)) {
+      return false;
+    }
+    if (!oe.emitObjectWithTemplateOnStack()) {
+      return false;
+    }
+    if (!useObjLiteralValues) {
+      if (!emitPropertyList(objNode, oe, ObjectLiteral)) {
+        return false;
+      }
+    }
+  } else {
+    if (!oe.emitObject(objNode->count())) {
+      return false;
+    }
+    if (!emitPropertyList(objNode, oe, ObjectLiteral)) {
+      return false;
+    }
+  }
+
+  if (!oe.emitEnd()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitArrayLiteral(ListNode* array) {
+  if (checkSingletonContext() && !array->hasNonConstInitializer() &&
+      !array->empty() && isArrayObjLiteralCompatible(array)) {
+    return emitObjLiteralArray(array);
+  }
+
+  return emitArray(array);
+}
+
+bool BytecodeEmitter::emitArray(ListNode* array) {
+
+  uint32_t nspread = 0;
+  for (ParseNode* elem : array->contents()) {
+    if (elem->isKind(ParseNodeKind::Spread)) {
+      nspread++;
+    }
+  }
+
+  static_assert(NativeObject::MAX_DENSE_ELEMENTS_COUNT <= INT32_MAX,
+                "array literals' maximum length must not exceed limits "
+                "required by BaselineCompiler::emit_NewArray, "
+                "BaselineCompiler::emit_InitElemArray, "
+                "and DoSetElemFallback's handling of JSOp::InitElemArray");
+
+  uint32_t count = array->count();
+  MOZ_ASSERT(count >= nspread);
+  MOZ_ASSERT(count <= NativeObject::MAX_DENSE_ELEMENTS_COUNT,
+             "the parser must throw an error if the array exceeds maximum "
+             "length");
+
+  if (!emitUint32Operand(JSOp::NewArray, count - nspread)) {
+    return false;
+  }
+
+  uint32_t index = 0;
+  bool afterSpread = false;
+  for (ParseNode* elem : array->contents()) {
+    if (elem->isKind(ParseNodeKind::Spread)) {
+      if (!afterSpread) {
+        afterSpread = true;
+        if (!emitNumberOp(index)) {
+          return false;
+        }
+      }
+
+      ParseNode* expr = elem->as<UnaryNode>().kid();
+      SelfHostedIter selfHostedIter = getSelfHostedIterFor(expr);
+
+      if (!updateSourceCoordNotes(elem->pn_pos.begin)) {
+        return false;
+      }
+      if (!emitIterable(expr, selfHostedIter)) {
+        return false;
+      }
+      if (!emitIterator(selfHostedIter)) {
+        return false;
+      }
+      if (!emit2(JSOp::Pick, 3)) {
+        return false;
+      }
+      if (!emit2(JSOp::Pick, 3)) {
+        return false;
+      }
+      if (!emitSpread(selfHostedIter)) {
+        return false;
+      }
+    } else {
+      if (!updateSourceCoordNotesIfNonLiteral(elem)) {
+        return false;
+      }
+      if (elem->isKind(ParseNodeKind::Elision)) {
+        if (!emit1(JSOp::Hole)) {
+          return false;
+        }
+      } else {
+        if (!emitTree(elem, ValueUsage::WantValue)) {
+          return false;
+        }
+      }
+
+      if (afterSpread) {
+        if (!emit1(JSOp::InitElemInc)) {
+          return false;
+        }
+      } else {
+        if (!emitUint32Operand(JSOp::InitElemArray, index)) {
+          return false;
+        }
+      }
+    }
+
+    index++;
+  }
+  MOZ_ASSERT(index == count);
+  if (afterSpread) {
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitSpreadIntoArray(UnaryNode* elem) {
+  MOZ_ASSERT(elem->isKind(ParseNodeKind::Spread));
+
+  if (!updateSourceCoordNotes(elem->pn_pos.begin)) {
+    return false;
+  }
+
+  SelfHostedIter selfHostedIter = getSelfHostedIterFor(elem->kid());
+  MOZ_ASSERT(selfHostedIter == SelfHostedIter::Deny ||
+             selfHostedIter == SelfHostedIter::AllowContent);
+
+  if (!emitIterator(selfHostedIter)) {
+    return false;
+  }
+
+  if (!emitUint32Operand(JSOp::NewArray, 0)) {
+    return false;
+  }
+
+  if (!emitNumberOp(0)) {
+    return false;
+  }
+
+  if (!emitSpread(selfHostedIter)) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Pop)) {
+    return false;
+  }
+  return true;
+}
+
+static inline JSOp UnaryOpParseNodeKindToJSOp(ParseNodeKind pnk) {
+  switch (pnk) {
+    case ParseNodeKind::ThrowStmt:
+      return JSOp::Throw;
+    case ParseNodeKind::VoidExpr:
+      return JSOp::Void;
+    case ParseNodeKind::NotExpr:
+      return JSOp::Not;
+    case ParseNodeKind::BitNotExpr:
+      return JSOp::BitNot;
+    case ParseNodeKind::PosExpr:
+      return JSOp::Pos;
+    case ParseNodeKind::NegExpr:
+      return JSOp::Neg;
+    default:
+      MOZ_CRASH("unexpected unary op");
+  }
+}
+
+bool BytecodeEmitter::emitUnary(UnaryNode* unaryNode) {
+  if (!updateSourceCoordNotes(unaryNode->pn_pos.begin)) {
+    return false;
+  }
+
+  JSOp op = UnaryOpParseNodeKindToJSOp(unaryNode->getKind());
+  ValueUsage valueUsage =
+      op == JSOp::Void ? ValueUsage::IgnoreValue : ValueUsage::WantValue;
+  if (!emitTree(unaryNode->kid(), valueUsage)) {
+    return false;
+  }
+  return emit1(op);
+}
+
+bool BytecodeEmitter::emitTypeof(UnaryNode* typeofNode, JSOp op) {
+  MOZ_ASSERT(op == JSOp::Typeof || op == JSOp::TypeofExpr);
+
+  if (!updateSourceCoordNotes(typeofNode->pn_pos.begin)) {
+    return false;
+  }
+
+  if (!emitTree(typeofNode->kid())) {
+    return false;
+  }
+
+  return emit1(op);
+}
+
+bool BytecodeEmitter::tryEmitTypeofEq(ListNode* node, bool* emitted) {
+  MOZ_ASSERT(node->isKind(ParseNodeKind::StrictEqExpr) ||
+             node->isKind(ParseNodeKind::EqExpr) ||
+             node->isKind(ParseNodeKind::StrictNeExpr) ||
+             node->isKind(ParseNodeKind::NeExpr) ||
+             node->isKind(ParseNodeKind::LtExpr) ||
+             node->isKind(ParseNodeKind::GtExpr));
+
+  if (node->count() != 2) {
+    *emitted = false;
+    return true;
+  }
+
+  ParseNode* left = node->head();
+  ParseNode* right = left->pn_next;
+  MOZ_ASSERT(right);
+
+  UnaryNode* typeofNode;
+  NameNode* typenameNode;
+  JSOp op;
+  JSType type;
+
+  if (node->isKind(ParseNodeKind::LtExpr) ||
+      node->isKind(ParseNodeKind::GtExpr)) {
+    if (left->isKind(ParseNodeKind::TypeOfNameExpr) &&
+        right->isKind(ParseNodeKind::StringExpr)) {
+      typeofNode = &left->as<UnaryNode>();
+      typenameNode = &right->as<NameNode>();
+
+      if (node->isKind(ParseNodeKind::LtExpr)) {
+        op = JSOp::Ne;
+      } else {
+        op = JSOp::Eq;
+      }
+    } else if (left->isKind(ParseNodeKind::StringExpr) &&
+               right->isKind(ParseNodeKind::TypeOfNameExpr)) {
+      typeofNode = &right->as<UnaryNode>();
+      typenameNode = &left->as<NameNode>();
+
+      if (node->isKind(ParseNodeKind::LtExpr)) {
+        op = JSOp::Eq;
+      } else {
+        op = JSOp::Ne;
+      }
+    } else {
+      *emitted = false;
+      return true;
+    }
+
+    TaggedParserAtomIndex typeName = typenameNode->atom();
+    if (typeName.isLength1StaticParserString() &&
+        typeName.toLength1StaticParserString() ==
+            Length1StaticParserString('u')) {
+      type = JSTYPE_UNDEFINED;
+    } else {
+      *emitted = false;
+      return true;
+    }
+  } else {
+    if (node->isKind(ParseNodeKind::StrictEqExpr) ||
+        node->isKind(ParseNodeKind::EqExpr)) {
+      op = JSOp::Eq;
+    } else {
+      op = JSOp::Ne;
+    }
+
+    if (left->isKind(ParseNodeKind::TypeOfNameExpr) &&
+        right->isKind(ParseNodeKind::StringExpr)) {
+      typeofNode = &left->as<UnaryNode>();
+      typenameNode = &right->as<NameNode>();
+    } else if (right->isKind(ParseNodeKind::TypeOfNameExpr) &&
+               left->isKind(ParseNodeKind::StringExpr)) {
+      typeofNode = &right->as<UnaryNode>();
+      typenameNode = &left->as<NameNode>();
+    } else {
+      *emitted = false;
+      return true;
+    }
+
+    TaggedParserAtomIndex typeName = typenameNode->atom();
+    if (typeName == TaggedParserAtomIndex::WellKnown::undefined()) {
+      type = JSTYPE_UNDEFINED;
+    } else if (typeName == TaggedParserAtomIndex::WellKnown::object()) {
+      type = JSTYPE_OBJECT;
+    } else if (typeName == TaggedParserAtomIndex::WellKnown::function()) {
+      type = JSTYPE_FUNCTION;
+    } else if (typeName == TaggedParserAtomIndex::WellKnown::string()) {
+      type = JSTYPE_STRING;
+    } else if (typeName == TaggedParserAtomIndex::WellKnown::number()) {
+      type = JSTYPE_NUMBER;
+    } else if (typeName == TaggedParserAtomIndex::WellKnown::boolean()) {
+      type = JSTYPE_BOOLEAN;
+    } else if (typeName == TaggedParserAtomIndex::WellKnown::symbol()) {
+      type = JSTYPE_SYMBOL;
+    } else if (typeName == TaggedParserAtomIndex::WellKnown::bigint()) {
+      type = JSTYPE_BIGINT;
+    } else {
+      *emitted = false;
+      return true;
+    }
+  }
+
+  if (!updateSourceCoordNotes(typeofNode->pn_pos.begin)) {
+    return false;
+  }
+
+  if (!emitTree(typeofNode->kid())) {
+    return false;
+  }
+
+  if (!emit2(JSOp::TypeofEq, TypeofEqOperand(type, op).rawValue())) {
+    return false;
+  }
+
+  *emitted = true;
+  return true;
+}
+
+bool BytecodeEmitter::emitFunctionFormalParameters(ParamsBodyNode* paramsBody) {
+  FunctionBox* funbox = sc->asFunctionBox();
+
+  bool hasRest = funbox->hasRest();
+
+  FunctionParamsEmitter fpe(this, funbox);
+  for (ParseNode* arg : paramsBody->parameters()) {
+    ParseNode* bindingElement = arg;
+    ParseNode* initializer = nullptr;
+    if (arg->isKind(ParseNodeKind::AssignExpr)) {
+      bindingElement = arg->as<BinaryNode>().left();
+      initializer = arg->as<BinaryNode>().right();
+    }
+    bool hasInitializer = !!initializer;
+    bool isRest =
+        hasRest && arg->pn_next == *std::end(paramsBody->parameters());
+    bool isDestructuring = !bindingElement->isKind(ParseNodeKind::Name);
+
+    MOZ_ASSERT(bindingElement->isKind(ParseNodeKind::Name) ||
+               bindingElement->isKind(ParseNodeKind::ArrayExpr) ||
+               bindingElement->isKind(ParseNodeKind::ObjectExpr));
+
+    auto emitDefaultInitializer = [this, &initializer, &bindingElement]() {
+
+      if (!this->emitInitializer(initializer, bindingElement)) {
+        return false;
+      }
+      return true;
+    };
+
+    auto emitDestructuring = [this, &bindingElement]() {
+
+      if (!this->emitDestructuringOps(&bindingElement->as<ListNode>(),
+                                      DestructuringFlavor::Declaration,
+                                      SelfHostedIter::Deny)) {
+        return false;
+      }
+
+      return true;
+    };
+
+    if (isRest) {
+      if (isDestructuring) {
+        if (!fpe.prepareForDestructuringRest()) {
+          return false;
+        }
+        if (!emitDestructuring()) {
+          return false;
+        }
+        if (!fpe.emitDestructuringRestEnd()) {
+          return false;
+        }
+      } else {
+        auto paramName = bindingElement->as<NameNode>().name();
+        if (!fpe.emitRest(paramName)) {
+          return false;
+        }
+      }
+
+      continue;
+    }
+
+    if (isDestructuring) {
+      if (hasInitializer) {
+        if (!fpe.prepareForDestructuringDefaultInitializer()) {
+          return false;
+        }
+        if (!emitDefaultInitializer()) {
+          return false;
+        }
+        if (!fpe.prepareForDestructuringDefault()) {
+          return false;
+        }
+        if (!emitDestructuring()) {
+          return false;
+        }
+        if (!fpe.emitDestructuringDefaultEnd()) {
+          return false;
+        }
+      } else {
+        if (!fpe.prepareForDestructuring()) {
+          return false;
+        }
+        if (!emitDestructuring()) {
+          return false;
+        }
+        if (!fpe.emitDestructuringEnd()) {
+          return false;
+        }
+      }
+
+      continue;
+    }
+
+    if (hasInitializer) {
+      if (!fpe.prepareForDefault()) {
+        return false;
+      }
+      if (!emitDefaultInitializer()) {
+        return false;
+      }
+      auto paramName = bindingElement->as<NameNode>().name();
+      if (!fpe.emitDefaultEnd(paramName)) {
+        return false;
+      }
+
+      continue;
+    }
+
+    auto paramName = bindingElement->as<NameNode>().name();
+    if (!fpe.emitSimple(paramName)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitInitializeFunctionSpecialNames() {
+  FunctionBox* funbox = sc->asFunctionBox();
+
+
+  auto emitInitializeFunctionSpecialName =
+      [](BytecodeEmitter* bce, TaggedParserAtomIndex name, JSOp op) {
+        MOZ_ASSERT(bce->lookupName(name).hasKnownSlot());
+
+        NameOpEmitter noe(bce, name, NameOpEmitter::Kind::Initialize);
+        if (!noe.prepareForRhs()) {
+          return false;
+        }
+        if (!bce->emit1(op)) {
+          return false;
+        }
+        if (!noe.emitAssignment()) {
+          return false;
+        }
+        if (!bce->emit1(JSOp::Pop)) {
+          return false;
+        }
+
+        return true;
+      };
+
+  if (funbox->needsArgsObj()) {
+    MOZ_ASSERT(emitterMode != BytecodeEmitter::SelfHosting);
+    if (!emitInitializeFunctionSpecialName(
+            this, TaggedParserAtomIndex::WellKnown::arguments(),
+            JSOp::Arguments)) {
+      return false;
+    }
+  }
+
+  if (funbox->functionHasThisBinding()) {
+    if (!emitInitializeFunctionSpecialName(
+            this, TaggedParserAtomIndex::WellKnown::dot_this_(),
+            JSOp::FunctionThis)) {
+      return false;
+    }
+  }
+
+  if (funbox->functionHasNewTargetBinding()) {
+    if (!emitInitializeFunctionSpecialName(
+            this, TaggedParserAtomIndex::WellKnown::dot_newTarget_(),
+            JSOp::NewTarget)) {
+      return false;
+    }
+  }
+
+  if (funbox->needsPromiseResult()) {
+    if (!emitInitializeFunctionSpecialName(
+            this, TaggedParserAtomIndex::WellKnown::dot_generator_(),
+            JSOp::Generator)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitLexicalInitialization(NameNode* name) {
+  return emitLexicalInitialization(name->name());
+}
+
+bool BytecodeEmitter::emitLexicalInitialization(TaggedParserAtomIndex name) {
+  NameOpEmitter noe(this, name, NameOpEmitter::Kind::Initialize);
+  if (!noe.prepareForRhs()) {
+    return false;
+  }
+
+  MOZ_ASSERT(noe.loc().isLexical() || noe.loc().isSynthetic() ||
+             noe.loc().isPrivateMethod());
+  MOZ_ASSERT(!noe.emittedBindOp());
+
+  if (!noe.emitAssignment()) {
+    return false;
+  }
+
+  return true;
+}
+
+static MOZ_ALWAYS_INLINE ParseNode* FindConstructor(ListNode* classMethods) {
+  for (ParseNode* classElement : classMethods->contents()) {
+    ParseNode* unwrappedElement = classElement;
+    if (unwrappedElement->is<LexicalScopeNode>()) {
+      unwrappedElement = unwrappedElement->as<LexicalScopeNode>().scopeBody();
+    }
+    if (unwrappedElement->is<ClassMethod>()) {
+      ClassMethod& method = unwrappedElement->as<ClassMethod>();
+      ParseNode& methodName = method.name();
+      if (!method.isStatic() &&
+          (methodName.isKind(ParseNodeKind::ObjectPropertyName) ||
+           methodName.isKind(ParseNodeKind::StringExpr)) &&
+          methodName.as<NameNode>().atom() ==
+              TaggedParserAtomIndex::WellKnown::constructor()) {
+        return classElement;
+      }
+    }
+  }
+  return nullptr;
+}
+
+bool BytecodeEmitter::emitNewPrivateName(TaggedParserAtomIndex bindingName,
+                                         TaggedParserAtomIndex symbolName) {
+  if (!emitAtomOp(JSOp::NewPrivateName, symbolName)) {
+    return false;
+  }
+
+  if (!emitLexicalInitialization(bindingName)) {
+    return false;
+  }
+
+  if (!emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitNewPrivateNames(
+    TaggedParserAtomIndex privateBrandName, ListNode* classMembers) {
+  bool hasPrivateBrand = false;
+
+  for (ParseNode* classElement : classMembers->contents()) {
+    ParseNode* elementName;
+    if (classElement->is<ClassMethod>()) {
+      elementName = &classElement->as<ClassMethod>().name();
+    } else if (classElement->is<ClassField>()) {
+      elementName = &classElement->as<ClassField>().name();
+    } else {
+      continue;
+    }
+
+    if (!elementName->isKind(ParseNodeKind::PrivateName)) {
+      continue;
+    }
+
+    bool isOptimized = false;
+    if (classElement->is<ClassMethod>() &&
+        !classElement->as<ClassMethod>().isStatic()) {
+      hasPrivateBrand = true;
+      if (classElement->as<ClassMethod>().accessorType() ==
+          AccessorType::None) {
+        isOptimized = true;
+      }
+    }
+
+    if (!isOptimized) {
+      auto privateName = elementName->as<NameNode>().name();
+      if (!emitNewPrivateName(privateName, privateName)) {
+        return false;
+      }
+    }
+  }
+
+  if (hasPrivateBrand) {
+    if (!emitNewPrivateName(
+            TaggedParserAtomIndex::WellKnown::dot_privateBrand_(),
+            privateBrandName)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitClass(
+    ClassNode* classNode,
+    ClassNameKind nameKind ,
+    TaggedParserAtomIndex
+        nameForAnonymousClass ) {
+  MOZ_ASSERT((nameKind == ClassNameKind::InferredName) ==
+             bool(nameForAnonymousClass));
+
+  ParseNode* heritageExpression = classNode->heritage();
+  ListNode* classMembers = classNode->memberList();
+  ParseNode* constructor = FindConstructor(classMembers);
+
+
+  ClassEmitter ce(this);
+  TaggedParserAtomIndex innerName;
+  ClassEmitter::Kind kind = ClassEmitter::Kind::Expression;
+  if (ClassNames* names = classNode->names()) {
+    MOZ_ASSERT(nameKind == ClassNameKind::BindingName);
+    innerName = names->innerBinding()->name();
+    MOZ_ASSERT(innerName);
+
+    if (names->outerBinding()) {
+      MOZ_ASSERT(names->outerBinding()->name());
+      MOZ_ASSERT(names->outerBinding()->name() == innerName);
+      kind = ClassEmitter::Kind::Declaration;
+    }
+  }
+
+  if (LexicalScopeNode* scopeBindings = classNode->scopeBindings()) {
+    if (!ce.emitScope(scopeBindings->scopeBindings())) {
+      return false;
+    }
+  }
+
+  bool isDerived = !!heritageExpression;
+  if (isDerived) {
+    if (!updateSourceCoordNotes(classNode->pn_pos.begin)) {
+      return false;
+    }
+    if (!markStepBreakpoint()) {
+      return false;
+    }
+    if (!emitTree(heritageExpression)) {
+      return false;
+    }
+  }
+
+  if (ClassBodyScopeNode* bodyScopeBindings = classNode->bodyScopeBindings()) {
+    if (!ce.emitBodyScope(bodyScopeBindings->scopeBindings())) {
+      return false;
+    }
+
+    auto privateBrandName = innerName;
+    if (!innerName) {
+      privateBrandName = nameForAnonymousClass
+                             ? nameForAnonymousClass
+                             : TaggedParserAtomIndex::WellKnown::anonymous();
+    }
+    if (!emitNewPrivateNames(privateBrandName, classMembers)) {
+      return false;
+    }
+  }
+
+  bool hasNameOnStack = nameKind == ClassNameKind::ComputedName;
+  if (isDerived) {
+    if (!ce.emitDerivedClass(innerName, nameForAnonymousClass,
+                             hasNameOnStack)) {
+      return false;
+    }
+  } else {
+    int membersCount = 0;
+    for (ParseNode* node : classMembers->contents()) {
+      if (node->getKind() == ParseNodeKind::ClassField) {
+        membersCount++;
+      }
+    }
+    membersCount = (membersCount > 255) ? 255 : membersCount;
+    if (!ce.emitClass(innerName, nameForAnonymousClass, hasNameOnStack,
+                      uint8_t(membersCount))) {
+      return false;
+    }
+  }
+
+
+  Maybe<LexicalScopeEmitter> lse;
+  FunctionNode* ctor;
+#ifdef ENABLE_DECORATORS
+  bool extraInitializersPresent = false;
+#endif
+  if (constructor->is<LexicalScopeNode>()) {
+    LexicalScopeNode* constructorScope = &constructor->as<LexicalScopeNode>();
+
+    MOZ_ASSERT(!constructorScope->isEmptyScope());
+#ifdef ENABLE_DECORATORS
+    MOZ_ASSERT(constructorScope->scopeBindings()->length == 2);
+    MOZ_ASSERT(GetScopeDataTrailingNames(constructorScope->scopeBindings())[0]
+                   .name() ==
+               TaggedParserAtomIndex::WellKnown::dot_initializers_());
+    MOZ_ASSERT(
+        GetScopeDataTrailingNames(constructorScope->scopeBindings())[1]
+            .name() ==
+        TaggedParserAtomIndex::WellKnown::dot_instanceExtraInitializers_());
+
+    lse.emplace(this);
+    if (!lse->emitScope(ScopeKind::Lexical,
+                        constructorScope->scopeBindings())) {
+      return false;
+    }
+
+    if (!ce.prepareForExtraInitializers(TaggedParserAtomIndex::WellKnown::
+                                            dot_instanceExtraInitializers_())) {
+      return false;
+    }
+
+    if (classNode->addInitializerFunction()) {
+      DecoratorEmitter de(this);
+      if (!de.emitCreateAddInitializerFunction(
+              classNode->addInitializerFunction(),
+              TaggedParserAtomIndex::WellKnown::
+                  dot_instanceExtraInitializers_())) {
+        return false;
+      }
+
+      if (!emitUnpickN(isDerived ? 2 : 1)) {
+        return false;
+      }
+
+      extraInitializersPresent = true;
+    }
+#else
+    MOZ_ASSERT(constructorScope->scopeBindings()->length == 1);
+    MOZ_ASSERT(GetScopeDataTrailingNames(constructorScope->scopeBindings())[0]
+                   .name() ==
+               TaggedParserAtomIndex::WellKnown::dot_initializers_());
+#endif
+
+    auto needsInitializer = [](ParseNode* propdef) {
+      return NeedsFieldInitializer(propdef, false) ||
+             NeedsAccessorInitializer(propdef, false);
+    };
+
+    bool needsInitializers =
+        std::any_of(classMembers->contents().begin(),
+                    classMembers->contents().end(), needsInitializer);
+    if (needsInitializers) {
+#ifndef ENABLE_DECORATORS
+      lse.emplace(this);
+      if (!lse->emitScope(ScopeKind::Lexical,
+                          constructorScope->scopeBindings())) {
+        return false;
+      }
+#endif
+      if (!emitCreateMemberInitializers(ce, classMembers,
+                                        FieldPlacement::Instance
+#ifdef ENABLE_DECORATORS
+                                        ,
+                                        isDerived
+#endif
+                                        )) {
+        return false;
+      }
+    }
+
+    ctor = &constructorScope->scopeBody()->as<ClassMethod>().method();
+  } else {
+    MOZ_ASSERT(emitterMode == BytecodeEmitter::SelfHosting);
+    ctor = &constructor->as<ClassMethod>().method();
+  }
+
+  bool needsHomeObject = ctor->funbox()->needsHomeObject();
+  if (nameKind == ClassNameKind::InferredName) {
+    setFunName(ctor->funbox(), nameForAnonymousClass);
+  }
+  if (!emitFunction(ctor, isDerived)) {
+    return false;
+  }
+  if (lse.isSome()) {
+    if (!lse->emitEnd()) {
+      return false;
+    }
+    lse.reset();
+  }
+  if (!ce.emitInitConstructor(needsHomeObject)) {
+    return false;
+  }
+
+  if (!emitCreateFieldKeys(classMembers, FieldPlacement::Instance)) {
+    return false;
+  }
+
+#ifdef ENABLE_DECORATORS
+  if (!emit1(JSOp::Undefined)) {
+    return false;
+  }
+  if (!emitUnpickN(2)) {
+    return false;
+  }
+#endif
+
+  if (!emitCreateMemberInitializers(ce, classMembers, FieldPlacement::Static
+#ifdef ENABLE_DECORATORS
+                                    ,
+                                    false
+#endif
+                                    )) {
+    return false;
+  }
+
+#ifdef ENABLE_DECORATORS
+  if (!emitPickN(2)) {
+    return false;
+  }
+  if (!emitPopN(1)) {
+    return false;
+  }
+#endif
+
+  if (!emitCreateFieldKeys(classMembers, FieldPlacement::Static)) {
+    return false;
+  }
+
+  if (!emitPropertyList(classMembers, ce, ClassBody)) {
+    return false;
+  }
+
+#ifdef ENABLE_DECORATORS
+  if (extraInitializersPresent) {
+    if (!emitPickN(2)) {
+      return false;
+    }
+    if (!emitPopN(1)) {
+      return false;
+    }
+  }
+#endif
+
+  if (!ce.emitBinding()) {
+    return false;
+  }
+
+  if (!emitInitializeStaticFields(classMembers)) {
+    return false;
+  }
+
+#if ENABLE_DECORATORS
+  if (!ce.prepareForDecorators()) {
+    return false;
+  }
+  if (classNode->decorators() != nullptr) {
+    DecoratorEmitter de(this);
+    NameNode* className =
+        classNode->names() ? classNode->names()->innerBinding() : nullptr;
+    if (!de.emitApplyDecoratorsToClassDefinition(className,
+                                                 classNode->decorators())) {
+      return false;
+    }
+  }
+#endif
+
+  if (!ce.emitEnd(kind)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitExportDefault(BinaryNode* exportNode) {
+  MOZ_ASSERT(exportNode->isKind(ParseNodeKind::ExportDefaultStmt));
+
+  ParseNode* valueNode = exportNode->left();
+  if (valueNode->isDirectRHSAnonFunction()) {
+    MOZ_ASSERT(exportNode->right());
+
+    if (!emitAnonymousFunctionWithName(
+            valueNode, TaggedParserAtomIndex::WellKnown::default_())) {
+      return false;
+    }
+  } else {
+    if (!emitTree(valueNode)) {
+      return false;
+    }
+  }
+
+  if (ParseNode* binding = exportNode->right()) {
+    if (!emitLexicalInitialization(&binding->as<NameNode>())) {
+      return false;
+    }
+
+    if (!emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitTree(
+    ParseNode* pn, ValueUsage valueUsage ,
+    EmitLineNumberNote emitLineNote ) {
+  AutoCheckRecursionLimit recursion(fc);
+  if (!recursion.check(fc)) {
+    return false;
+  }
+
+  if (emitLineNote == EMIT_LINENOTE &&
+      !ParseNodeRequiresSpecialLineNumberNotes(pn)) {
+    if (!updateLineNumberNotes(pn->pn_pos.begin)) {
+      return false;
+    }
+  }
+
+  switch (pn->getKind()) {
+    case ParseNodeKind::Function:
+      if (!emitFunction(&pn->as<FunctionNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::ParamsBody:
+      MOZ_ASSERT_UNREACHABLE(
+          "ParamsBody should be handled in emitFunctionScript.");
+      break;
+
+    case ParseNodeKind::IfStmt:
+      if (!emitIf(&pn->as<TernaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::SwitchStmt:
+      if (!emitSwitch(&pn->as<SwitchStatement>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::WhileStmt:
+      if (!emitWhile(&pn->as<BinaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::DoWhileStmt:
+      if (!emitDo(&pn->as<BinaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::ForStmt:
+      if (!emitFor(&pn->as<ForNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::BreakStmt:
+      if (!updateSourceCoordNotes(pn->pn_pos.begin)) {
+        return false;
+      }
+      if (!markStepBreakpoint()) {
+        return false;
+      }
+
+      if (!emitBreak(pn->as<BreakStatement>().label())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::ContinueStmt:
+      if (!updateSourceCoordNotes(pn->pn_pos.begin)) {
+        return false;
+      }
+      if (!markStepBreakpoint()) {
+        return false;
+      }
+
+      if (!emitContinue(pn->as<ContinueStatement>().label())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::WithStmt:
+      if (!emitWith(&pn->as<BinaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::TryStmt:
+      if (!emitTry(&pn->as<TryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::Catch:
+      if (!emitCatch(&pn->as<BinaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::VarStmt:
+      if (!emitDeclarationList(&pn->as<ListNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::ReturnStmt:
+      if (!emitReturn(&pn->as<UnaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::YieldStarExpr:
+      if (!emitYieldStar(pn->as<UnaryNode>().kid())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::Generator:
+      if (!emit1(JSOp::Generator)) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::InitialYield:
+      if (!emitInitialYield(&pn->as<UnaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::YieldExpr:
+      if (!emitYield(&pn->as<UnaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::AwaitExpr:
+      if (!emitAwaitInInnermostScope(&pn->as<UnaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::StatementList:
+      if (!emitStatementList(&pn->as<ListNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::EmptyStmt:
+      break;
+
+    case ParseNodeKind::ExpressionStmt:
+      if (!emitExpressionStatement(&pn->as<UnaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::LabelStmt:
+      if (!emitLabeledStatement(&pn->as<LabeledStatement>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::CommaExpr:
+      if (!emitSequenceExpr(&pn->as<ListNode>(), valueUsage)) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::InitExpr:
+    case ParseNodeKind::AssignExpr:
+    case ParseNodeKind::AddAssignExpr:
+    case ParseNodeKind::SubAssignExpr:
+    case ParseNodeKind::BitOrAssignExpr:
+    case ParseNodeKind::BitXorAssignExpr:
+    case ParseNodeKind::BitAndAssignExpr:
+    case ParseNodeKind::LshAssignExpr:
+    case ParseNodeKind::RshAssignExpr:
+    case ParseNodeKind::UrshAssignExpr:
+    case ParseNodeKind::MulAssignExpr:
+    case ParseNodeKind::DivAssignExpr:
+    case ParseNodeKind::ModAssignExpr:
+    case ParseNodeKind::PowAssignExpr: {
+      BinaryNode* assignNode = &pn->as<BinaryNode>();
+      if (!emitAssignmentOrInit(assignNode->getKind(), assignNode->left(),
+                                assignNode->right())) {
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::CoalesceAssignExpr:
+    case ParseNodeKind::OrAssignExpr:
+    case ParseNodeKind::AndAssignExpr:
+      if (!emitShortCircuitAssignment(&pn->as<AssignmentNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::ConditionalExpr:
+      if (!emitConditionalExpression(pn->as<ConditionalExpression>(),
+                                     valueUsage)) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::OrExpr:
+    case ParseNodeKind::CoalesceExpr:
+    case ParseNodeKind::AndExpr:
+      if (!emitShortCircuit(&pn->as<ListNode>(), valueUsage)) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::StrictEqExpr:
+    case ParseNodeKind::EqExpr:
+    case ParseNodeKind::StrictNeExpr:
+    case ParseNodeKind::NeExpr:
+    case ParseNodeKind::LtExpr:
+    case ParseNodeKind::GtExpr: {
+      bool emitted;
+      if (!tryEmitTypeofEq(&pn->as<ListNode>(), &emitted)) {
+        return false;
+      }
+      if (emitted) {
+        return true;
+      }
+    }
+      [[fallthrough]];
+
+    case ParseNodeKind::AddExpr:
+    case ParseNodeKind::SubExpr:
+    case ParseNodeKind::BitOrExpr:
+    case ParseNodeKind::BitXorExpr:
+    case ParseNodeKind::BitAndExpr:
+    case ParseNodeKind::LeExpr:
+    case ParseNodeKind::GeExpr:
+    case ParseNodeKind::InExpr:
+    case ParseNodeKind::InstanceOfExpr:
+    case ParseNodeKind::LshExpr:
+    case ParseNodeKind::RshExpr:
+    case ParseNodeKind::UrshExpr:
+    case ParseNodeKind::MulExpr:
+    case ParseNodeKind::DivExpr:
+    case ParseNodeKind::ModExpr:
+      if (!emitLeftAssociative(&pn->as<ListNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::PrivateInExpr:
+      if (!emitPrivateInExpr(&pn->as<ListNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::PowExpr:
+      if (!emitRightAssociative(&pn->as<ListNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::TypeOfNameExpr:
+      if (!emitTypeof(&pn->as<UnaryNode>(), JSOp::Typeof)) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::TypeOfExpr:
+      if (!emitTypeof(&pn->as<UnaryNode>(), JSOp::TypeofExpr)) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::ThrowStmt:
+      if (!updateSourceCoordNotes(pn->pn_pos.begin)) {
+        return false;
+      }
+      if (!markStepBreakpoint()) {
+        return false;
+      }
+      [[fallthrough]];
+    case ParseNodeKind::VoidExpr:
+    case ParseNodeKind::NotExpr:
+    case ParseNodeKind::BitNotExpr:
+    case ParseNodeKind::PosExpr:
+    case ParseNodeKind::NegExpr:
+      if (!emitUnary(&pn->as<UnaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::PreIncrementExpr:
+    case ParseNodeKind::PreDecrementExpr:
+    case ParseNodeKind::PostIncrementExpr:
+    case ParseNodeKind::PostDecrementExpr:
+      if (!emitIncOrDec(&pn->as<UnaryNode>(), valueUsage)) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::DeleteNameExpr:
+      if (!emitDeleteName(&pn->as<UnaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::DeletePropExpr:
+      if (!emitDeleteProperty(&pn->as<UnaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::DeleteElemExpr:
+      if (!emitDeleteElement(&pn->as<UnaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::DeleteExpr:
+      if (!emitDeleteExpression(&pn->as<UnaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::DeleteOptionalChainExpr:
+      if (!emitDeleteOptionalChain(&pn->as<UnaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::OptionalChain:
+      if (!emitOptionalChain(&pn->as<UnaryNode>(), valueUsage)) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::DotExpr: {
+      PropertyAccess* prop = &pn->as<PropertyAccess>();
+      bool isSuper = prop->isSuper();
+      PropOpEmitter poe(this, PropOpEmitter::Kind::Get,
+                        isSuper ? PropOpEmitter::ObjKind::Super
+                                : PropOpEmitter::ObjKind::Other);
+      if (!poe.prepareForObj()) {
+        return false;
+      }
+      if (isSuper) {
+        UnaryNode* base = &prop->expression().as<UnaryNode>();
+        if (!emitGetThisForSuperBase(base)) {
+          return false;
+        }
+      } else {
+        if (!emitPropLHS(prop)) {
+          return false;
+        }
+      }
+      if (!poe.emitGet(prop->key().atom())) {
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::ArgumentsLength: {
+      if (!emitArgumentsLength()) {
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::ElemExpr: {
+      PropertyByValue* elem = &pn->as<PropertyByValue>();
+      bool isSuper = elem->isSuper();
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
+      ElemOpEmitter eoe(this, ElemOpEmitter::Kind::Get,
+                        isSuper ? ElemOpEmitter::ObjKind::Super
+                                : ElemOpEmitter::ObjKind::Other);
+      if (!emitElemObjAndKey(elem, eoe)) {
+        return false;
+      }
+      if (!eoe.emitGet()) {
+        return false;
+      }
+
+      break;
+    }
+
+    case ParseNodeKind::PrivateMemberExpr: {
+      PrivateMemberAccess* privateExpr = &pn->as<PrivateMemberAccess>();
+      PrivateOpEmitter xoe(this, PrivateOpEmitter::Kind::Get,
+                           privateExpr->privateName().name());
+      if (!emitTree(&privateExpr->expression())) {
+        return false;
+      }
+      if (!xoe.emitReference()) {
+        return false;
+      }
+      if (!xoe.emitGet()) {
+        return false;
+      }
+
+      break;
+    }
+
+    case ParseNodeKind::NewExpr:
+    case ParseNodeKind::TaggedTemplateExpr:
+    case ParseNodeKind::CallExpr:
+    case ParseNodeKind::SuperCallExpr:
+      if (!emitCallOrNew(&pn->as<CallNode>(), valueUsage)) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::LexicalScope:
+      if (!emitLexicalScope(&pn->as<LexicalScopeNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::ConstDecl:
+    case ParseNodeKind::LetDecl:
+      if (!emitDeclarationList(&pn->as<ListNode>())) {
+        return false;
+      }
+      break;
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+    case ParseNodeKind::AwaitUsingDecl:
+    case ParseNodeKind::UsingDecl:
+      if (!emitDeclarationList(&pn->as<ListNode>())) {
+        return false;
+      }
+      break;
+#endif
+
+    case ParseNodeKind::ImportDecl:
+      MOZ_ASSERT(sc->isModuleContext());
+      break;
+
+    case ParseNodeKind::ExportStmt: {
+      MOZ_ASSERT(sc->isModuleContext());
+      UnaryNode* node = &pn->as<UnaryNode>();
+      ParseNode* decl = node->kid();
+      if (decl->getKind() != ParseNodeKind::ExportSpecList) {
+        if (!emitTree(decl)) {
+          return false;
+        }
+      }
+      break;
+    }
+
+    case ParseNodeKind::ExportDefaultStmt:
+      MOZ_ASSERT(sc->isModuleContext());
+      if (!emitExportDefault(&pn->as<BinaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::ExportFromStmt:
+      MOZ_ASSERT(sc->isModuleContext());
+      break;
+
+    case ParseNodeKind::CallSiteObj:
+      if (!emitCallSiteObject(&pn->as<CallSiteNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::ArrayExpr:
+      if (!emitArrayLiteral(&pn->as<ListNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::ObjectExpr:
+      if (!emitObject(&pn->as<ListNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::Name:
+      if (!emitGetName(&pn->as<NameNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::PrivateName:
+      if (!emitGetPrivateName(&pn->as<NameNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::TemplateStringListExpr:
+      if (!emitTemplateString(&pn->as<ListNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::TemplateStringExpr:
+    case ParseNodeKind::StringExpr:
+      if (!emitStringOp(JSOp::String, pn->as<NameNode>().atom())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::NumberExpr:
+      if (!emitNumberOp(pn->as<NumericLiteral>().value())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::BigIntExpr:
+      if (!emitBigIntOp(&pn->as<BigIntLiteral>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::RegExpExpr: {
+      GCThingIndex index;
+      if (!perScriptData().gcThingList().append(&pn->as<RegExpLiteral>(),
+                                                &index)) {
+        return false;
+      }
+      if (!emitRegExp(index)) {
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::TrueExpr:
+      if (!emit1(JSOp::True)) {
+        return false;
+      }
+      break;
+    case ParseNodeKind::FalseExpr:
+      if (!emit1(JSOp::False)) {
+        return false;
+      }
+      break;
+    case ParseNodeKind::NullExpr:
+      if (!emit1(JSOp::Null)) {
+        return false;
+      }
+      break;
+    case ParseNodeKind::RawUndefinedExpr:
+      if (!emit1(JSOp::Undefined)) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::ThisExpr:
+      if (!emitThisLiteral(&pn->as<ThisLiteral>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::DebuggerStmt:
+      if (!updateSourceCoordNotes(pn->pn_pos.begin)) {
+        return false;
+      }
+      if (!markStepBreakpoint()) {
+        return false;
+      }
+      if (!emit1(JSOp::Debugger)) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::ClassDecl:
+      if (!emitClass(&pn->as<ClassNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::NewTargetExpr:
+      if (!emitNewTarget(&pn->as<NewTargetNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::ImportMetaExpr:
+      if (!emit1(JSOp::ImportMeta)) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::CallImportExpr: {
+      CallImportNode* callImport = &pn->as<CallImportNode>();
+      BinaryNode* spec = &callImport->right()->as<BinaryNode>();
+
+      if (!emitTree(spec->left())) {
+        return false;
+      }
+
+      if (!spec->right()->isKind(ParseNodeKind::PosHolder)) {
+        if (!emitTree(spec->right())) {
+          return false;
+        }
+      } else {
+        if (!emit1(JSOp::Undefined)) {
+          return false;
+        }
+      }
+
+      if (!emit2(JSOp::DynamicImport, uint8_t(callImport->phase()))) {
+        return false;
+      }
+
+      break;
+    }
+
+    case ParseNodeKind::SetThis:
+      if (!emitSetThis(&pn->as<BinaryNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::PropertyNameExpr:
+    case ParseNodeKind::PosHolder:
+      MOZ_FALLTHROUGH_ASSERT(
+          "Should never try to emit ParseNodeKind::PosHolder or ::Property");
+
+    default:
+      MOZ_ASSERT(0);
+  }
+
+  return true;
+}
+
+static bool AllocSrcNote(FrontendContext* fc, SrcNotesVector& notes,
+                         unsigned size, unsigned* index) {
+  size_t oldLength = notes.length();
+
+  if (MOZ_UNLIKELY(oldLength + size > MaxSrcNotesLength)) {
+    ReportAllocationOverflow(fc);
+    return false;
+  }
+
+  if (!notes.growByUninitialized(size)) {
+    return false;
+  }
+
+  *index = oldLength;
+  return true;
+}
+
+bool BytecodeEmitter::addTryNote(TryNoteKind kind, uint32_t stackDepth,
+                                 BytecodeOffset start, BytecodeOffset end) {
+  MOZ_ASSERT(!inPrologue());
+  return bytecodeSection().tryNoteList().append(kind, stackDepth, start, end);
+}
+
+bool BytecodeEmitter::newSrcNote(SrcNoteType type, unsigned* indexp) {
+  SrcNotesVector& notes = bytecodeSection().notes();
+  unsigned index;
+
+  BytecodeOffset offset = bytecodeSection().offset();
+  ptrdiff_t delta = (offset - bytecodeSection().lastNoteOffset()).value();
+  bytecodeSection().setLastNoteOffset(offset);
+
+  auto allocator = [&](unsigned size) -> SrcNote* {
+    if (!AllocSrcNote(fc, notes, size, &index)) {
+      return nullptr;
+    }
+    return &notes[index];
+  };
+
+  if (!SrcNoteWriter::writeNote(type, delta, allocator)) {
+    return false;
+  }
+
+  if (indexp) {
+    *indexp = index;
+  }
+
+  if (type == SrcNoteType::NewLine || type == SrcNoteType::SetLine) {
+    lastLineOnlySrcNoteIndex = index;
+  } else {
+    lastLineOnlySrcNoteIndex = LastSrcNoteIsNotLineOnly;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::newSrcNote2(SrcNoteType type, ptrdiff_t offset,
+                                  unsigned* indexp) {
+  unsigned index;
+  if (!newSrcNote(type, &index)) {
+    return false;
+  }
+  if (!newSrcNoteOperand(offset)) {
+    return false;
+  }
+  if (indexp) {
+    *indexp = index;
+  }
+  return true;
+}
+
+bool BytecodeEmitter::convertLastNewLineToNewLineColumn(
+    JS::LimitedColumnNumberOneOrigin column) {
+  SrcNotesVector& notes = bytecodeSection().notes();
+  MOZ_ASSERT(lastLineOnlySrcNoteIndex == notes.length() - 1);
+  SrcNote* sn = &notes[lastLineOnlySrcNoteIndex];
+  MOZ_ASSERT(sn->type() == SrcNoteType::NewLine);
+
+  SrcNoteWriter::convertNote(sn, SrcNoteType::NewLineColumn);
+  if (!newSrcNoteOperand(SrcNote::NewLineColumn::toOperand(column))) {
+    return false;
+  }
+
+  lastLineOnlySrcNoteIndex = LastSrcNoteIsNotLineOnly;
+  return true;
+}
+
+bool BytecodeEmitter::convertLastSetLineToSetLineColumn(
+    JS::LimitedColumnNumberOneOrigin column) {
+  SrcNotesVector& notes = bytecodeSection().notes();
+  MOZ_ASSERT(lastLineOnlySrcNoteIndex == notes.length() - 1 - 1 ||
+             lastLineOnlySrcNoteIndex == notes.length() - 1 - 4);
+  SrcNote* sn = &notes[lastLineOnlySrcNoteIndex];
+  MOZ_ASSERT(sn->type() == SrcNoteType::SetLine);
+
+  SrcNoteWriter::convertNote(sn, SrcNoteType::SetLineColumn);
+  if (!newSrcNoteOperand(SrcNote::SetLineColumn::columnToOperand(column))) {
+    return false;
+  }
+
+  lastLineOnlySrcNoteIndex = LastSrcNoteIsNotLineOnly;
+  return true;
+}
+
+bool BytecodeEmitter::newSrcNoteOperand(ptrdiff_t operand) {
+  if (!SrcNote::isRepresentableOperand(operand)) {
+    reportError(nullptr, JSMSG_NEED_DIET, "script");
+    return false;
+  }
+
+  SrcNotesVector& notes = bytecodeSection().notes();
+
+  auto allocator = [&](unsigned size) -> SrcNote* {
+    unsigned index;
+    if (!AllocSrcNote(fc, notes, size, &index)) {
+      return nullptr;
+    }
+    return &notes[index];
+  };
+
+  return SrcNoteWriter::writeOperand(operand, allocator);
+}
+
+bool BytecodeEmitter::intoScriptStencil(ScriptIndex scriptIndex) {
+  js::UniquePtr<ImmutableScriptData> immutableScriptData =
+      createImmutableScriptData();
+  if (!immutableScriptData) {
+    return false;
+  }
+
+  MOZ_ASSERT(outermostScope().hasNonSyntacticScopeOnChain() ==
+             sc->hasNonSyntacticScope());
+
+  auto& things = perScriptData().gcThingList().objects();
+  if (!compilationState.appendGCThings(fc, scriptIndex, things)) {
+    return false;
+  }
+
+  // Hand over the ImmutableScriptData instance generated by BCE.
+  auto* sharedData =
+      SharedImmutableScriptData::createWith(fc, std::move(immutableScriptData));
+  if (!sharedData) {
+    return false;
+  }
+
+  if (!compilationState.sharedData.addAndShare(fc, scriptIndex, sharedData)) {
+    return false;
+  }
+
+  ScriptStencil& script = compilationState.scriptData[scriptIndex];
+  script.setHasSharedData();
+
+  if (sc->isFunctionBox()) {
+    FunctionBox* funbox = sc->asFunctionBox();
+    MOZ_ASSERT(&script == &funbox->functionStencil());
+    funbox->copyUpdatedImmutableFlags();
+    MOZ_ASSERT(script.isFunction());
+  } else {
+    ScriptStencilExtra& scriptExtra = compilationState.scriptExtra[scriptIndex];
+    sc->copyScriptExtraFields(scriptExtra);
+  }
+
+  return true;
+}
+
+SelfHostedIter BytecodeEmitter::getSelfHostedIterFor(
+    ParseNode* parseNode) const {
+  if (emitterMode == BytecodeEmitter::SelfHosting &&
+      parseNode->isKind(ParseNodeKind::CallExpr)) {
+    auto* callee = parseNode->as<CallNode>().callee();
+    if (callee->isName(TaggedParserAtomIndex::WellKnown::allowContentIter())) {
+      return SelfHostedIter::AllowContent;
+    }
+    if (callee->isName(
+            TaggedParserAtomIndex::WellKnown::allowContentIterWith())) {
+      return SelfHostedIter::AllowContentWith;
+    }
+    if (callee->isName(
+            TaggedParserAtomIndex::WellKnown::allowContentIterWithNext())) {
+      return SelfHostedIter::AllowContentWithNext;
+    }
+  }
+
+  return SelfHostedIter::Deny;
+}
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+void BytecodeEmitter::dumpAtom(TaggedParserAtomIndex index) const {
+  parserAtoms().dump(index);
+}
+#endif

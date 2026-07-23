@@ -1,0 +1,47 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_lazyidlethread_h_
+#define mozilla_lazyidlethread_h_
+
+#ifndef MOZILLA_INTERNAL_API
+#  error "This header is only usable from within libxul (MOZILLA_INTERNAL_API)."
+#endif
+
+#include "mozilla/TaskQueue.h"
+#include "nsIObserver.h"
+#include "nsThreadPool.h"
+
+namespace mozilla {
+
+class LazyIdleThread final : public nsISerialEventTarget, public nsIObserver {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIEVENTTARGET_FULL
+  NS_DECL_NSIOBSERVER
+
+  enum ShutdownMethod { AutomaticShutdown = 0, ManualShutdown };
+
+  LazyIdleThread(uint32_t aIdleTimeoutMS, StaticString aName,
+                 ShutdownMethod aShutdownMethod = AutomaticShutdown);
+
+  void Shutdown();
+
+  nsresult SetListener(nsIThreadPoolListener* aListener);
+
+ private:
+  ~LazyIdleThread();
+
+  const nsCOMPtr<nsISerialEventTarget> mOwningEventTarget;
+
+  const RefPtr<nsThreadPool> mThreadPool;
+
+  const RefPtr<TaskQueue> mTaskQueue;
+
+  bool mShutdown = false;
+};
+
+}  
+
+#endif  // mozilla_lazyidlethread_h_

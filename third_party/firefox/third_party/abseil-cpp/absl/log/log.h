@@ -1,0 +1,99 @@
+// Copyright 2022 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
+
+#ifndef ABSL_LOG_LOG_H_
+#define ABSL_LOG_LOG_H_
+
+#include "absl/log/internal/log_impl.h"
+
+#define LOG(severity) ABSL_LOG_INTERNAL_LOG_IMPL(_##severity)
+
+#define PLOG(severity) ABSL_LOG_INTERNAL_PLOG_IMPL(_##severity)
+
+#define DLOG(severity) ABSL_LOG_INTERNAL_DLOG_IMPL(_##severity)
+
+#define VLOG(verbose_level) ABSL_LOG_INTERNAL_VLOG_IMPL(verbose_level)
+
+#define DVLOG(verbose_level) ABSL_LOG_INTERNAL_DVLOG_IMPL(verbose_level)
+
+#define LOG_IF(severity, condition) \
+  ABSL_LOG_INTERNAL_LOG_IF_IMPL(_##severity, condition)
+#define PLOG_IF(severity, condition) \
+  ABSL_LOG_INTERNAL_PLOG_IF_IMPL(_##severity, condition)
+#define DLOG_IF(severity, condition) \
+  ABSL_LOG_INTERNAL_DLOG_IF_IMPL(_##severity, condition)
+
+#define LOG_EVERY_N(severity, n) \
+  ABSL_LOG_INTERNAL_LOG_EVERY_N_IMPL(_##severity, n)
+#define LOG_FIRST_N(severity, n) \
+  ABSL_LOG_INTERNAL_LOG_FIRST_N_IMPL(_##severity, n)
+#define LOG_EVERY_POW_2(severity) \
+  ABSL_LOG_INTERNAL_LOG_EVERY_POW_2_IMPL(_##severity)
+#define LOG_EVERY_N_SEC(severity, n_seconds) \
+  ABSL_LOG_INTERNAL_LOG_EVERY_N_SEC_IMPL(_##severity, n_seconds)
+
+#define PLOG_EVERY_N(severity, n) \
+  ABSL_LOG_INTERNAL_PLOG_EVERY_N_IMPL(_##severity, n)
+#define PLOG_FIRST_N(severity, n) \
+  ABSL_LOG_INTERNAL_PLOG_FIRST_N_IMPL(_##severity, n)
+#define PLOG_EVERY_POW_2(severity) \
+  ABSL_LOG_INTERNAL_PLOG_EVERY_POW_2_IMPL(_##severity)
+#define PLOG_EVERY_N_SEC(severity, n_seconds) \
+  ABSL_LOG_INTERNAL_PLOG_EVERY_N_SEC_IMPL(_##severity, n_seconds)
+
+#define DLOG_EVERY_N(severity, n) \
+  ABSL_LOG_INTERNAL_DLOG_EVERY_N_IMPL(_##severity, n)
+#define DLOG_FIRST_N(severity, n) \
+  ABSL_LOG_INTERNAL_DLOG_FIRST_N_IMPL(_##severity, n)
+#define DLOG_EVERY_POW_2(severity) \
+  ABSL_LOG_INTERNAL_DLOG_EVERY_POW_2_IMPL(_##severity)
+#define DLOG_EVERY_N_SEC(severity, n_seconds) \
+  ABSL_LOG_INTERNAL_DLOG_EVERY_N_SEC_IMPL(_##severity, n_seconds)
+
+#define VLOG_EVERY_N(severity, n) \
+  ABSL_LOG_INTERNAL_VLOG_EVERY_N_IMPL(severity, n)
+#define VLOG_FIRST_N(severity, n) \
+  ABSL_LOG_INTERNAL_VLOG_FIRST_N_IMPL(severity, n)
+#define VLOG_EVERY_POW_2(severity) \
+  ABSL_LOG_INTERNAL_VLOG_EVERY_POW_2_IMPL(severity)
+#define VLOG_EVERY_N_SEC(severity, n_seconds) \
+  ABSL_LOG_INTERNAL_VLOG_EVERY_N_SEC_IMPL(severity, n_seconds)
+
+#define LOG_IF_EVERY_N(severity, condition, n) \
+  ABSL_LOG_INTERNAL_LOG_IF_EVERY_N_IMPL(_##severity, condition, n)
+#define LOG_IF_FIRST_N(severity, condition, n) \
+  ABSL_LOG_INTERNAL_LOG_IF_FIRST_N_IMPL(_##severity, condition, n)
+#define LOG_IF_EVERY_POW_2(severity, condition) \
+  ABSL_LOG_INTERNAL_LOG_IF_EVERY_POW_2_IMPL(_##severity, condition)
+#define LOG_IF_EVERY_N_SEC(severity, condition, n_seconds) \
+  ABSL_LOG_INTERNAL_LOG_IF_EVERY_N_SEC_IMPL(_##severity, condition, n_seconds)
+
+#define PLOG_IF_EVERY_N(severity, condition, n) \
+  ABSL_LOG_INTERNAL_PLOG_IF_EVERY_N_IMPL(_##severity, condition, n)
+#define PLOG_IF_FIRST_N(severity, condition, n) \
+  ABSL_LOG_INTERNAL_PLOG_IF_FIRST_N_IMPL(_##severity, condition, n)
+#define PLOG_IF_EVERY_POW_2(severity, condition) \
+  ABSL_LOG_INTERNAL_PLOG_IF_EVERY_POW_2_IMPL(_##severity, condition)
+#define PLOG_IF_EVERY_N_SEC(severity, condition, n_seconds) \
+  ABSL_LOG_INTERNAL_PLOG_IF_EVERY_N_SEC_IMPL(_##severity, condition, n_seconds)
+
+#define DLOG_IF_EVERY_N(severity, condition, n) \
+  ABSL_LOG_INTERNAL_DLOG_IF_EVERY_N_IMPL(_##severity, condition, n)
+#define DLOG_IF_FIRST_N(severity, condition, n) \
+  ABSL_LOG_INTERNAL_DLOG_IF_FIRST_N_IMPL(_##severity, condition, n)
+#define DLOG_IF_EVERY_POW_2(severity, condition) \
+  ABSL_LOG_INTERNAL_DLOG_IF_EVERY_POW_2_IMPL(_##severity, condition)
+#define DLOG_IF_EVERY_N_SEC(severity, condition, n_seconds) \
+  ABSL_LOG_INTERNAL_DLOG_IF_EVERY_N_SEC_IMPL(_##severity, condition, n_seconds)
+
+#endif  // ABSL_LOG_LOG_H_

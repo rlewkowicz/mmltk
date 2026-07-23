@@ -1,0 +1,86 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef DOM_SVG_SVGMATRIX_H_
+#define DOM_SVG_SVGMATRIX_H_
+
+#include "DOMSVGTransform.h"
+#include "gfxMatrix.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla::dom {
+
+struct DOMMatrix2DInit;
+
+class SVGMatrix final : public nsWrapperCache {
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(SVGMatrix)
+  NS_DECL_CYCLE_COLLECTION_NATIVE_WRAPPERCACHE_CLASS(SVGMatrix)
+
+  explicit SVGMatrix(DOMSVGTransform& aTransform) : mTransform(&aTransform) {}
+
+  SVGMatrix() = default;
+
+  explicit SVGMatrix(const gfxMatrix& aMatrix) : mMatrix(aMatrix) {}
+
+  DOMSVGTransform* GetParentObject() const;
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  float A() const { return static_cast<float>(GetMatrix()._11); }
+  void SetA(float aA, ErrorResult& aRv);
+  float B() const { return static_cast<float>(GetMatrix()._12); }
+  void SetB(float aB, ErrorResult& aRv);
+  float C() const { return static_cast<float>(GetMatrix()._21); }
+  void SetC(float aC, ErrorResult& aRv);
+  float D() const { return static_cast<float>(GetMatrix()._22); }
+  void SetD(float aD, ErrorResult& aRv);
+  float E() const { return static_cast<float>(GetMatrix()._31); }
+  void SetE(float aE, ErrorResult& aRv);
+  float F() const { return static_cast<float>(GetMatrix()._32); }
+  void SetF(float aF, ErrorResult& aRv);
+  already_AddRefed<SVGMatrix> Multiply(const DOMMatrix2DInit& aMatrix,
+                                       ErrorResult& aRv);
+  already_AddRefed<SVGMatrix> Inverse(ErrorResult& aRv);
+  already_AddRefed<SVGMatrix> Translate(float x, float y);
+  already_AddRefed<SVGMatrix> Scale(float scaleFactor);
+  already_AddRefed<SVGMatrix> ScaleNonUniform(float scaleFactorX,
+                                              float scaleFactorY);
+  already_AddRefed<SVGMatrix> Rotate(float angle);
+  already_AddRefed<SVGMatrix> RotateFromVector(float x, float y,
+                                               ErrorResult& aRv);
+  already_AddRefed<SVGMatrix> FlipX();
+  already_AddRefed<SVGMatrix> FlipY();
+  already_AddRefed<SVGMatrix> SkewX(float angle, ErrorResult& aRv);
+  already_AddRefed<SVGMatrix> SkewY(float angle, ErrorResult& aRv);
+
+ private:
+  ~SVGMatrix() = default;
+
+  const gfxMatrix& GetMatrix() const {
+    return mTransform ? mTransform->Transform().GetMatrix() : mMatrix;
+  }
+
+  void SetMatrix(const gfxMatrix& aMatrix) {
+    if (mTransform) {
+      mTransform->SetMatrix(aMatrix);
+    } else {
+      mMatrix = aMatrix;
+    }
+  }
+
+  bool IsAnimVal() const {
+    return mTransform ? mTransform->IsAnimVal() : false;
+  }
+
+  RefPtr<DOMSVGTransform> mTransform;
+
+  gfxMatrix mMatrix;
+};
+
+}  
+
+#endif  // DOM_SVG_SVGMATRIX_H_

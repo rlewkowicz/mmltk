@@ -1,0 +1,128 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_TiedFields_h
+#define mozilla_TiedFields_h
+
+#include <array>
+#include <cstddef>
+#include <tuple>
+
+namespace mozilla {
+
+template <class T>
+constexpr auto TiedFields(T& t) {
+  return t.MutTiedFields();
+}
+
+template <class T>
+constexpr auto TiedFields(const T& t) {
+  const auto mutFields = TiedFields(const_cast<T&>(t));
+  return std::apply([](const auto&... f) { return std::tie(f...); }, mutFields);
+}
+
+template <class>
+struct SizeofTupleArgs;
+
+template <class... Args>
+struct SizeofTupleArgs<std::tuple<Args...>>
+    : std::integral_constant<size_t, (... + sizeof(Args))> {};
+
+template <class T>
+constexpr bool AreAllBytesTiedFields() {
+  using fieldsT = decltype(TiedFields(std::declval<T>()));
+  const auto fields_size_sum = SizeofTupleArgs<fieldsT>::value;
+  const auto t_size = sizeof(T);
+  return fields_size_sum == t_size;
+}
+
+
+template <class StructT, size_t FieldId, size_t PrevFieldBeginOffset,
+          class PrevFieldT, size_t PrevFieldEndOffset, class FieldT,
+          size_t FieldAlignment = alignof(FieldT)>
+struct FieldDebugInfoT {
+  static constexpr bool IsTightlyPacked() {
+    return PrevFieldEndOffset % FieldAlignment == 0;
+  }
+};
+
+template <class StructT, class TupleOfFields, size_t FieldId>
+struct TightlyPackedFieldEndOffsetT {
+  template <size_t I>
+  using FieldTAt = std::remove_reference_t<
+      typename std::tuple_element<I, TupleOfFields>::type>;
+
+  static constexpr size_t Fn() {
+    constexpr auto num_fields = std::tuple_size_v<TupleOfFields>;
+    static_assert(FieldId < num_fields);
+
+    using PrevFieldT = FieldTAt<FieldId - 1>;
+    using FieldT = FieldTAt<FieldId>;
+    constexpr auto prev_field_end_offset =
+        TightlyPackedFieldEndOffsetT<StructT, TupleOfFields, FieldId - 1>::Fn();
+    constexpr auto prev_field_begin_offset =
+        prev_field_end_offset - sizeof(PrevFieldT);
+
+    using FieldDebugInfoT =
+        FieldDebugInfoT<StructT, FieldId, prev_field_begin_offset, PrevFieldT,
+                        prev_field_end_offset, FieldT>;
+    static_assert(FieldDebugInfoT::IsTightlyPacked(),
+                  "This field was not tightly packed. Is there padding between "
+                  "it and its predecessor?");
+
+    return prev_field_end_offset + sizeof(FieldT);
+  }
+};
+
+template <class StructT, class TupleOfFields>
+struct TightlyPackedFieldEndOffsetT<StructT, TupleOfFields, 0> {
+  static constexpr size_t Fn() {
+    using FieldT = typename std::tuple_element<0, TupleOfFields>::type;
+    return sizeof(FieldT);
+  }
+};
+template <class StructT, class TupleOfFields>
+struct TightlyPackedFieldEndOffsetT<StructT, TupleOfFields, size_t(-1)> {
+  static constexpr size_t Fn() {
+    static_assert(sizeof(StructT) == 0);
+    return 0;
+  }
+};
+
+template <class StructT>
+constexpr bool AssertTiedFieldsAreExhaustive() {
+  static_assert(AreAllBytesTiedFields<StructT>());
+
+  using TupleOfFields = decltype(TiedFields(std::declval<StructT&>()));
+  constexpr auto num_fields = std::tuple_size_v<TupleOfFields>;
+  constexpr auto end_offset_of_last_field =
+      TightlyPackedFieldEndOffsetT<StructT, TupleOfFields,
+                                   num_fields - 1>::Fn();
+  static_assert(
+      end_offset_of_last_field == sizeof(StructT),
+      "Incorrect field list in MutTiedFields()? (or not tightly-packed?)");
+  return true;  
+}
+
+template <class T, size_t N = 1>
+struct PaddingField {
+  static_assert(!std::is_array_v<T>, "Use PaddingField<T,N> not <T[N]>.");
+
+  std::array<T, N> ignored = {};
+
+  PaddingField() {}
+
+  friend constexpr bool operator==(const PaddingField&, const PaddingField&) {
+    return true;
+  }
+  friend constexpr bool operator<(const PaddingField&, const PaddingField&) {
+    return false;
+  }
+
+  auto MutTiedFields() { return std::tie(ignored); }
+};
+
+}  
+
+#endif  // mozilla_TiedFields_h

@@ -1,0 +1,51 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef CParserContext_h
+#define CParserContext_h
+
+#include "nsIParser.h"
+#include "nsIRequest.h"
+#include "nsScanner.h"
+#include "nsString.h"
+#include "nsCOMPtr.h"
+
+class nsITokenizer;
+
+
+enum eAutoDetectResult {
+  eUnknownDetect,
+  ePrimaryDetect,
+};
+
+enum nsDTDMode { eDTDMode_full_standards, eDTDMode_autodetect };
+
+class CParserContext {
+ public:
+  CParserContext(nsIURI* aURI, eParserCommands aCommand);
+  CParserContext(const nsAString& aBuffer, eParserCommands aCommand,
+                 bool aLastBuffer);
+
+  ~CParserContext();
+
+  void SetMimeType(const nsACString& aMimeType);
+
+  nsCOMPtr<nsIRequest>
+      mRequest;  
+  nsScanner mScanner;
+
+  nsCString mMimeType;
+  nsDTDMode mDTDMode;
+
+  eParserDocType mDocType;
+  eStreamState mStreamListenerState;
+  eAutoDetectResult mAutoDetectStatus = eUnknownDetect;
+  eParserCommands mParserCommand;
+
+  bool mMultipart;
+  bool mCopyUnused;
+};
+
+#endif  // CParserContext_h

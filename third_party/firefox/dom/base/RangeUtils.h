@@ -1,0 +1,99 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_RangeUtils_h
+#define mozilla_RangeUtils_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/RangeBoundary.h"
+#include "nsContentUtils.h"
+#include "nsIContent.h"
+#include "nsINode.h"
+
+namespace mozilla {
+
+namespace dom {
+class AbstractRange;
+
+struct ShadowDOMSelectionHelpers {
+  ShadowDOMSelectionHelpers() = delete;
+
+  static RawRangeBoundary StartRef(
+      const AbstractRange* aRange,
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary);
+
+  static nsINode* GetStartContainer(
+      const AbstractRange* aRange,
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary);
+
+  static uint32_t StartOffset(
+      const AbstractRange* aRange,
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary);
+
+  static RawRangeBoundary EndRef(
+      const AbstractRange* aRange,
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary);
+
+  static nsINode* GetEndContainer(
+      const AbstractRange* aRange,
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary);
+
+  static uint32_t EndOffset(
+      const AbstractRange* aRange,
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary);
+
+  static nsINode* GetParentNodeInSameSelection(
+      const nsINode& aNode,
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary);
+
+  static ShadowRoot* GetShadowRoot(
+      const nsINode* aNode,
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary);
+};
+}  
+
+class RangeUtils final {
+  using AbstractRange = dom::AbstractRange;
+
+ public:
+  static nsINode* ComputeRootNode(nsINode* aNode);
+
+  static bool IsValidOffset(uint32_t aOffset) { return aOffset <= INT32_MAX; }
+
+  static bool IsValidPoints(nsINode* aStartContainer, uint32_t aStartOffset,
+                            nsINode* aEndContainer, uint32_t aEndOffset) {
+    return IsValidPoints(RawRangeBoundary(aStartContainer, aStartOffset),
+                         RawRangeBoundary(aEndContainer, aEndOffset));
+  }
+  template <typename SPT, typename SRT, typename EPT, typename ERT>
+  static bool IsValidPoints(const RangeBoundaryBase<SPT, SRT>& aStartBoundary,
+                            const RangeBoundaryBase<EPT, ERT>& aEndBoundary);
+
+  template <TreeKind aKind = TreeKind::ShadowIncludingDOM,
+            typename = std::enable_if_t<aKind == TreeKind::ShadowIncludingDOM ||
+                                        aKind == TreeKind::FlatForSelection>>
+  static Maybe<bool> IsNodeContainedInRange(
+      const nsINode& aNode, const AbstractRange* aAbstractRange);
+
+  template <TreeKind aKind = TreeKind::ShadowIncludingDOM,
+            typename = std::enable_if_t<aKind == TreeKind::ShadowIncludingDOM ||
+                                        aKind == TreeKind::FlatForSelection>>
+  static nsresult CompareNodeToRange(const nsINode* aNode,
+                                     const AbstractRange* aAbstractRange,
+                                     bool* aNodeIsBeforeRange,
+                                     bool* aNodeIsAfterRange);
+
+  template <TreeKind aKind, typename SPT, typename SRT, typename EPT,
+            typename ERT,
+            typename = std::enable_if_t<aKind == TreeKind::ShadowIncludingDOM ||
+                                        aKind == TreeKind::FlatForSelection>>
+  static nsresult CompareNodeToRangeBoundaries(
+      const nsINode* aNode, const RangeBoundaryBase<SPT, SRT>& aStartBoundary,
+      const RangeBoundaryBase<EPT, ERT>& aEndBoundary, bool* aNodeIsBeforeRange,
+      bool* aNodeIsAfterRange);
+};
+
+}  
+
+#endif  // #ifndef mozilla_RangeUtils_h

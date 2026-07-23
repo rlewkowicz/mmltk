@@ -1,0 +1,1130 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+function $RegExpFlagsGetter() {
+  var R = this;
+  if (!IsObject(R)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, R === null ? "null" : typeof R);
+  }
+
+  var result = "";
+
+  if (R.hasIndices) {
+    result += "d";
+  }
+
+  if (R.global) {
+    result += "g";
+  }
+
+  if (R.ignoreCase) {
+    result += "i";
+  }
+
+  if (R.multiline) {
+    result += "m";
+  }
+
+  if (R.dotAll) {
+    result += "s";
+  }
+
+  if (R.unicode) {
+    result += "u";
+  }
+
+  if (R.unicodeSets) {
+    result += "v";
+  }
+
+  if (R.sticky) {
+    result += "y";
+  }
+
+  return result;
+}
+SetCanonicalName($RegExpFlagsGetter, "get flags");
+
+function $RegExpToString() {
+  var R = this;
+
+  if (!IsObject(R)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, R === null ? "null" : typeof R);
+  }
+
+  var pattern = ToString(R.source);
+
+  var flags = ToString(R.flags);
+
+  return "/" + pattern + "/" + flags;
+}
+SetCanonicalName($RegExpToString, "toString");
+
+function AdvanceStringIndex(S, index) {
+  assert(typeof S === "string", "Expected string as 1st argument");
+
+  assert(
+    index >= 0 && index <= MAX_NUMERIC_INDEX,
+    "Expected integer as 2nd argument"
+  );
+
+
+
+  var supplementary = (
+    index < S.length &&
+    callFunction(std_String_codePointAt, S, index) > 0xffff
+  );
+  return index + 1 + supplementary;
+}
+
+function RegExpMatch(string) {
+  var rx = this;
+
+  if (!IsObject(rx)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, rx === null ? "null" : typeof rx);
+  }
+
+  var S = ToString(string);
+
+  if (IsOptimizableRegExpObject(rx)) {
+    var flags = UnsafeGetInt32FromReservedSlot(rx, REGEXP_FLAGS_SLOT);
+    var global = !!(flags & REGEXP_GLOBAL_FLAG);
+
+    if (global) {
+      var fullUnicode = !!(flags & REGEXP_ANY_UNICODE_MASK);
+
+      return RegExpGlobalMatchOpt(rx, S, fullUnicode);
+    }
+
+    return RegExpBuiltinExec(rx, S);
+  }
+
+  return RegExpMatchSlowPath(rx, S);
+}
+
+function RegExpMatchSlowPath(rx, S) {
+  var flags = ToString(rx.flags);
+
+  if (!callFunction(std_String_includes, flags, "g")) {
+    return RegExpExec(rx, S);
+  }
+
+  var fullUnicode = callFunction(std_String_includes, flags, "u") || callFunction(std_String_includes, flags, "v");
+
+  rx.lastIndex = 0;
+
+  var A = [];
+
+  var n = 0;
+
+  while (true) {
+    var result = RegExpExec(rx, S);
+
+    if (result === null) {
+      return n === 0 ? null : A;
+    }
+
+    var matchStr = ToString(result[0]);
+
+    DefineDataProperty(A, n, matchStr);
+
+    if (matchStr === "") {
+      var lastIndex = ToLength(rx.lastIndex);
+      rx.lastIndex = fullUnicode
+        ? AdvanceStringIndex(S, lastIndex)
+        : lastIndex + 1;
+    }
+
+    n++;
+  }
+}
+
+function RegExpGlobalMatchOpt(rx, S, fullUnicode) {
+  var lastIndex = 0;
+  rx.lastIndex = 0;
+
+  var A = [];
+
+  var n = 0;
+
+  var lengthS = S.length;
+
+  while (true) {
+    var position = RegExpSearcher(rx, S, lastIndex);
+
+    if (position === -1) {
+      return n === 0 ? null : A;
+    }
+
+    lastIndex = RegExpSearcherLastLimit(S);
+
+    var matchStr = Substring(S, position, lastIndex - position);
+
+    DefineDataProperty(A, n, matchStr);
+
+    if (matchStr === "") {
+      lastIndex = fullUnicode
+        ? AdvanceStringIndex(S, lastIndex)
+        : lastIndex + 1;
+      if (lastIndex > lengthS) {
+        return A;
+      }
+    }
+
+    n++;
+  }
+}
+
+function RegExpReplace(string, replaceValue) {
+  var rx = this;
+
+  if (!IsObject(rx)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, rx === null ? "null" : typeof rx);
+  }
+
+  var S = ToString(string);
+
+  var lengthS = S.length;
+
+  var functionalReplace = IsCallable(replaceValue);
+
+  var firstDollarIndex = -1;
+  if (!functionalReplace) {
+    replaceValue = ToString(replaceValue);
+
+    if (replaceValue.length > 1) {
+      firstDollarIndex = GetFirstDollarIndex(replaceValue);
+    }
+  }
+
+  if (IsOptimizableRegExpObject(rx)) {
+    var flags = UnsafeGetInt32FromReservedSlot(rx, REGEXP_FLAGS_SLOT);
+
+    var global = !!(flags & REGEXP_GLOBAL_FLAG);
+
+    if (global) {
+      if (functionalReplace) {
+        if (lengthS > 5000) {
+          var elemBase = GetElemBaseForLambda(replaceValue);
+          if (IsObject(elemBase)) {
+            return RegExpGlobalReplaceOptElemBase(
+              rx,
+              S,
+              lengthS,
+              replaceValue,
+              flags,
+              elemBase
+            );
+          }
+        }
+        return RegExpGlobalReplaceOptFunc(rx, S, lengthS, replaceValue, flags);
+      }
+      if (firstDollarIndex !== -1) {
+        return RegExpGlobalReplaceOptSubst(
+          rx,
+          S,
+          lengthS,
+          replaceValue,
+          flags,
+          firstDollarIndex
+        );
+      }
+      return RegExpGlobalReplaceOptSimple(rx, S, lengthS, replaceValue, flags);
+    }
+
+    if (functionalReplace) {
+      return RegExpLocalReplaceOptFunc(rx, S, lengthS, replaceValue);
+    }
+    if (firstDollarIndex !== -1) {
+      return RegExpLocalReplaceOptSubst(
+        rx,
+        S,
+        lengthS,
+        replaceValue,
+        firstDollarIndex
+      );
+    }
+    return RegExpLocalReplaceOptSimple(rx, S, lengthS, replaceValue);
+  }
+
+  return RegExpReplaceSlowPath(
+    rx,
+    S,
+    lengthS,
+    replaceValue,
+    functionalReplace,
+    firstDollarIndex
+  );
+}
+
+function RegExpReplaceSlowPath(
+  rx,
+  S,
+  lengthS,
+  replaceValue,
+  functionalReplace,
+  firstDollarIndex
+) {
+  var flags = ToString(rx.flags);
+
+  var global = callFunction(std_String_includes, flags, "g");
+
+  var fullUnicode = false;
+  if (global) {
+    fullUnicode = callFunction(std_String_includes, flags, "u") || callFunction(std_String_includes, flags, "v");
+
+    rx.lastIndex = 0;
+  }
+
+  var results = new_List();
+  var nResults = 0;
+
+  while (true) {
+    var result = RegExpExec(rx, S);
+
+    if (result === null) {
+      break;
+    }
+
+    DefineDataProperty(results, nResults++, result);
+
+    if (!global) {
+      break;
+    }
+
+    var matchStr = ToString(result[0]);
+
+    if (matchStr === "") {
+      var lastIndex = ToLength(rx.lastIndex);
+      rx.lastIndex = fullUnicode
+        ? AdvanceStringIndex(S, lastIndex)
+        : lastIndex + 1;
+    }
+  }
+
+  var accumulatedResult = "";
+
+  var nextSourcePosition = 0;
+
+  for (var i = 0; i < nResults; i++) {
+    result = results[i];
+
+    var nCaptures = std_Math_max(ToLength(result.length) - 1, 0);
+
+    var matched = ToString(result[0]);
+
+    var matchLength = matched.length;
+
+    var position = std_Math_max(
+      std_Math_min(ToInteger(result.index), lengthS),
+      0
+    );
+
+    var replacement;
+    if (functionalReplace || firstDollarIndex !== -1) {
+      replacement = RegExpGetComplexReplacement(
+        result,
+        matched,
+        S,
+        position,
+        nCaptures,
+        replaceValue,
+        functionalReplace,
+        firstDollarIndex
+      );
+    } else {
+      for (var n = 1; n <= nCaptures; n++) {
+        var capN = result[n];
+
+        if (capN !== undefined) {
+          ToString(capN);
+        }
+      }
+
+      var namedCaptures = result.groups;
+      if (namedCaptures !== undefined) {
+        ToObject(namedCaptures);
+      }
+
+      replacement = replaceValue;
+    }
+
+    if (position >= nextSourcePosition) {
+      accumulatedResult +=
+        Substring(S, nextSourcePosition, position - nextSourcePosition) +
+        replacement;
+
+      nextSourcePosition = position + matchLength;
+    }
+  }
+
+  if (nextSourcePosition >= lengthS) {
+    return accumulatedResult;
+  }
+
+  return (
+    accumulatedResult +
+    Substring(S, nextSourcePosition, lengthS - nextSourcePosition)
+  );
+}
+
+function RegExpGetComplexReplacement(
+  result,
+  matched,
+  S,
+  position,
+  nCaptures,
+  replaceValue,
+  functionalReplace,
+  firstDollarIndex
+) {
+  var captures = new_List();
+  var capturesLength = 0;
+
+  DefineDataProperty(captures, capturesLength++, matched);
+
+  var storedCaptures = functionalReplace
+    ? nCaptures
+    : std_Math_min(nCaptures, REGEXP_MAX_SUBSTITUTION_CAPTURES);
+
+  for (var n = 1; n <= nCaptures; n++) {
+    var capN = result[n];
+
+    if (capN !== undefined) {
+      capN = ToString(capN);
+    }
+
+    if (n <= storedCaptures) {
+      DefineDataProperty(captures, capturesLength++, capN);
+    }
+  }
+
+  var namedCaptures = result.groups;
+
+  if (functionalReplace) {
+    if (namedCaptures === undefined) {
+      switch (nCaptures) {
+        case 0:
+          return ToString(
+            callContentFunction(
+              replaceValue,
+              undefined,
+              SPREAD(captures, 1),
+              position,
+              S
+            )
+          );
+        case 1:
+          return ToString(
+            callContentFunction(
+              replaceValue,
+              undefined,
+              SPREAD(captures, 2),
+              position,
+              S
+            )
+          );
+        case 2:
+          return ToString(
+            callContentFunction(
+              replaceValue,
+              undefined,
+              SPREAD(captures, 3),
+              position,
+              S
+            )
+          );
+        case 3:
+          return ToString(
+            callContentFunction(
+              replaceValue,
+              undefined,
+              SPREAD(captures, 4),
+              position,
+              S
+            )
+          );
+        case 4:
+          return ToString(
+            callContentFunction(
+              replaceValue,
+              undefined,
+              SPREAD(captures, 5),
+              position,
+              S
+            )
+          );
+      }
+    }
+
+    DefineDataProperty(captures, capturesLength++, position);
+    DefineDataProperty(captures, capturesLength++, S);
+    if (namedCaptures !== undefined) {
+      DefineDataProperty(captures, capturesLength++, namedCaptures);
+    }
+    return ToString(
+      callFunction(std_Function_apply, replaceValue, undefined, captures)
+    );
+  }
+
+  if (namedCaptures !== undefined) {
+    namedCaptures = ToObject(namedCaptures);
+  }
+  return RegExpGetSubstitution(
+    captures,
+    S,
+    position,
+    replaceValue,
+    firstDollarIndex,
+    namedCaptures
+  );
+}
+
+function RegExpGetFunctionalReplacement(result, S, position, replaceValue) {
+  assert(result.length >= 1, "RegExpMatcher doesn't return an empty array");
+  var nCaptures = result.length - 1;
+
+  var namedCaptures = result.groups;
+
+  if (namedCaptures === undefined) {
+    switch (nCaptures) {
+      case 0:
+        return ToString(
+          callContentFunction(
+            replaceValue,
+            undefined,
+            SPREAD(result, 1),
+            position,
+            S
+          )
+        );
+      case 1:
+        return ToString(
+          callContentFunction(
+            replaceValue,
+            undefined,
+            SPREAD(result, 2),
+            position,
+            S
+          )
+        );
+      case 2:
+        return ToString(
+          callContentFunction(
+            replaceValue,
+            undefined,
+            SPREAD(result, 3),
+            position,
+            S
+          )
+        );
+      case 3:
+        return ToString(
+          callContentFunction(
+            replaceValue,
+            undefined,
+            SPREAD(result, 4),
+            position,
+            S
+          )
+        );
+      case 4:
+        return ToString(
+          callContentFunction(
+            replaceValue,
+            undefined,
+            SPREAD(result, 5),
+            position,
+            S
+          )
+        );
+    }
+  }
+
+  var captures = new_List();
+  for (var n = 0; n <= nCaptures; n++) {
+    assert(
+      typeof result[n] === "string" || result[n] === undefined,
+      "RegExpMatcher returns only strings and undefined"
+    );
+    DefineDataProperty(captures, n, result[n]);
+  }
+
+  DefineDataProperty(captures, nCaptures + 1, position);
+  DefineDataProperty(captures, nCaptures + 2, S);
+
+  if (namedCaptures !== undefined) {
+    DefineDataProperty(captures, nCaptures + 3, namedCaptures);
+  }
+
+  return ToString(
+    callFunction(std_Function_apply, replaceValue, undefined, captures)
+  );
+}
+
+function RegExpGlobalReplaceOptSimple(rx, S, lengthS, replaceValue, flags) {
+  var fullUnicode = !!(flags & REGEXP_ANY_UNICODE_MASK);
+
+  var lastIndex = 0;
+  rx.lastIndex = 0;
+
+  var accumulatedResult = "";
+
+  var nextSourcePosition = 0;
+
+  while (true) {
+    var position = RegExpSearcher(rx, S, lastIndex);
+
+    if (position === -1) {
+      break;
+    }
+
+    lastIndex = RegExpSearcherLastLimit(S);
+
+    accumulatedResult +=
+      Substring(S, nextSourcePosition, position - nextSourcePosition) +
+      replaceValue;
+
+    nextSourcePosition = lastIndex;
+
+    if (lastIndex === position) {
+      lastIndex = fullUnicode
+        ? AdvanceStringIndex(S, lastIndex)
+        : lastIndex + 1;
+      if (lastIndex > lengthS) {
+        break;
+      }
+    }
+  }
+
+  if (nextSourcePosition >= lengthS) {
+    return accumulatedResult;
+  }
+
+  return (
+    accumulatedResult +
+    Substring(S, nextSourcePosition, lengthS - nextSourcePosition)
+  );
+}
+
+
+#define FUNC_NAME RegExpGlobalReplaceOptFunc
+#define FUNCTIONAL
+#include "RegExpGlobalReplaceOpt.h.js"
+#undef FUNCTIONAL
+#undef FUNC_NAME
+
+#define FUNC_NAME RegExpGlobalReplaceOptElemBase
+#define ELEMBASE
+#include "RegExpGlobalReplaceOpt.h.js"
+#undef ELEMBASE
+#undef FUNC_NAME
+
+#define FUNC_NAME RegExpGlobalReplaceOptSubst
+#define SUBSTITUTION
+#include "RegExpGlobalReplaceOpt.h.js"
+#undef SUBSTITUTION
+#undef FUNC_NAME
+
+#define FUNC_NAME RegExpLocalReplaceOptSimple
+#define SIMPLE
+#include "RegExpLocalReplaceOpt.h.js"
+#undef SIMPLE
+#undef FUNC_NAME
+
+#define FUNC_NAME RegExpLocalReplaceOptFunc
+#define FUNCTIONAL
+#include "RegExpLocalReplaceOpt.h.js"
+#undef FUNCTIONAL
+#undef FUNC_NAME
+
+#define FUNC_NAME RegExpLocalReplaceOptSubst
+#define SUBSTITUTION
+#include "RegExpLocalReplaceOpt.h.js"
+#undef SUBSTITUTION
+#undef FUNC_NAME
+
+function RegExpSearch(string) {
+  var rx = this;
+
+  if (!IsObject(rx)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, rx === null ? "null" : typeof rx);
+  }
+
+  var S = ToString(string);
+
+  var previousLastIndex = rx.lastIndex;
+
+  var lastIndexIsZero = SameValue(previousLastIndex, 0);
+  if (!lastIndexIsZero) {
+    rx.lastIndex = 0;
+  }
+
+  if (IsOptimizableRegExpObject(rx) && S.length < 0x7fff) {
+    var result = RegExpSearcher(rx, S, 0);
+
+
+    if (!lastIndexIsZero) {
+      rx.lastIndex = previousLastIndex;
+    } else {
+      var flags = UnsafeGetInt32FromReservedSlot(rx, REGEXP_FLAGS_SLOT);
+      if (flags & (REGEXP_GLOBAL_FLAG | REGEXP_STICKY_FLAG)) {
+        rx.lastIndex = previousLastIndex;
+      }
+    }
+
+    return result;
+  }
+
+  return RegExpSearchSlowPath(rx, S, previousLastIndex);
+}
+
+function RegExpSearchSlowPath(rx, S, previousLastIndex) {
+  var result = RegExpExec(rx, S);
+
+  var currentLastIndex = rx.lastIndex;
+
+  if (!SameValue(currentLastIndex, previousLastIndex)) {
+    rx.lastIndex = previousLastIndex;
+  }
+
+  if (result === null) {
+    return -1;
+  }
+
+  return result.index;
+}
+
+function RegExpSplit(string, limit) {
+  var rx = this;
+
+  if (!IsObject(rx)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, rx === null ? "null" : typeof rx);
+  }
+
+  var S = ToString(string);
+
+  var builtinCtor = GetBuiltinConstructor("RegExp");
+  var C = SpeciesConstructor(rx, builtinCtor);
+
+  var optimizable =
+    IsOptimizableRegExpObject(rx) &&
+    C === builtinCtor &&
+    (limit === undefined || typeof limit === "number");
+
+  var flags, unicodeMatching, splitter;
+  if (optimizable) {
+    flags = UnsafeGetInt32FromReservedSlot(rx, REGEXP_FLAGS_SLOT);
+    #ifdef NIGHTLY_BUILD
+    assert(!!(flags & REGEXP_LEGACY_FEATURES_ENABLED_FLAG),
+           "Legacy features must be enabled in optimized path");
+    #endif
+    unicodeMatching = !!(flags & REGEXP_ANY_UNICODE_MASK);
+
+    if (flags & REGEXP_STICKY_FLAG) {
+      var source = UnsafeGetStringFromReservedSlot(rx, REGEXP_SOURCE_SLOT);
+      var newFlags = flags & ~(REGEXP_STICKY_FLAG | REGEXP_LEGACY_FEATURES_ENABLED_FLAG);
+      splitter = RegExpConstructRaw(source, newFlags, true);
+    } else {
+      splitter = rx;
+    }
+  } else {
+    flags = ToString(rx.flags);
+
+    unicodeMatching = callFunction(std_String_includes, flags, "u") || callFunction(std_String_includes, flags, "v");
+
+    var newFlags;
+    if (callFunction(std_String_includes, flags, "y")) {
+      newFlags = flags;
+    } else {
+      newFlags = flags + "y";
+    }
+
+    splitter = constructContentFunction(C, C, rx, newFlags);
+  }
+
+  var A = [];
+
+  var lengthA = 0;
+
+  var lim;
+  if (limit === undefined) {
+    lim = MAX_UINT32;
+  } else {
+    lim = limit >>> 0;
+  }
+
+  var p = 0;
+
+  if (lim === 0) {
+    return A;
+  }
+
+  var size = S.length;
+
+  if (size === 0) {
+    if (optimizable) {
+      if (RegExpSearcher(splitter, S, 0) !== -1) {
+        return A;
+      }
+    } else {
+      if (RegExpExec(splitter, S) !== null) {
+        return A;
+      }
+    }
+
+    DefineDataProperty(A, 0, S);
+
+    return A;
+  }
+
+  var q = p;
+
+  var optimizableNoCaptures = optimizable && !RegExpHasCaptureGroups(splitter, S);
+
+  while (q < size) {
+    var e, z;
+    if (optimizableNoCaptures) {
+
+
+      q = RegExpSearcher(splitter, S, q);
+      if (q === -1 || q >= size) {
+        break;
+      }
+
+      e = RegExpSearcherLastLimit(S);
+      z = null;
+    } else if (optimizable) {
+
+      z = RegExpMatcher(splitter, S, q);
+
+      if (z === null) {
+        break;
+      }
+
+      q = z.index;
+      if (q >= size) {
+        break;
+      }
+
+      e = q + z[0].length;
+    } else {
+      splitter.lastIndex = q;
+
+      z = RegExpExec(splitter, S);
+
+      if (z === null) {
+        q = unicodeMatching ? AdvanceStringIndex(S, q) : q + 1;
+        continue;
+      }
+
+      e = ToLength(splitter.lastIndex);
+    }
+
+    if (e === p) {
+      q = unicodeMatching ? AdvanceStringIndex(S, q) : q + 1;
+      continue;
+    }
+
+    DefineDataProperty(A, lengthA, Substring(S, p, q - p));
+
+    lengthA++;
+
+    if (lengthA === lim) {
+      return A;
+    }
+
+    p = e;
+
+    if (z !== null) {
+      var numberOfCaptures = std_Math_max(ToLength(z.length) - 1, 0);
+
+      var i = 1;
+
+      while (i <= numberOfCaptures) {
+        DefineDataProperty(A, lengthA, z[i]);
+
+        i++;
+
+        lengthA++;
+
+        if (lengthA === lim) {
+          return A;
+        }
+      }
+    }
+
+    q = p;
+  }
+
+  if (p >= size) {
+    DefineDataProperty(A, lengthA, "");
+  } else {
+    DefineDataProperty(A, lengthA, Substring(S, p, size - p));
+  }
+
+  return A;
+}
+
+function RegExp_prototype_Exec(string) {
+  var R = this;
+  if (!IsObject(R) || !IsRegExpObject(R)) {
+    return callFunction(
+      CallRegExpMethodIfWrapped,
+      R,
+      string,
+      "RegExp_prototype_Exec"
+    );
+  }
+
+  var S = ToString(string);
+
+  return RegExpBuiltinExec(R, S);
+}
+
+function RegExpTest(string) {
+  var R = this;
+  if (!IsObject(R)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, R === null ? "null" : typeof R);
+  }
+
+  var S = ToString(string);
+
+  return RegExpExecForTest(R, S);
+}
+
+function $RegExpSpecies() {
+  return this;
+}
+SetCanonicalName($RegExpSpecies, "get [Symbol.species]");
+
+function RegExpMatchAll(string) {
+  var rx = this;
+
+  if (!IsObject(rx)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, rx === null ? "null" : typeof rx);
+  }
+
+  var str = ToString(string);
+
+  var builtinCtor = GetBuiltinConstructor("RegExp");
+  var C = SpeciesConstructor(rx, builtinCtor);
+
+  var source, flags, matcher, lastIndex;
+  if (IsOptimizableRegExpObject(rx) && C === builtinCtor) {
+    source = UnsafeGetStringFromReservedSlot(rx, REGEXP_SOURCE_SLOT);
+    flags = UnsafeGetInt32FromReservedSlot(rx, REGEXP_FLAGS_SLOT);
+    #ifdef NIGHTLY_BUILD
+    assert(!!(flags & REGEXP_LEGACY_FEATURES_ENABLED_FLAG),
+    "Legacy features must be enabled in optimized path");
+    #endif
+
+    matcher = rx;
+
+    lastIndex = ToLength(rx.lastIndex);
+
+  } else {
+    source = "";
+    flags = ToString(rx.flags);
+
+    matcher = constructContentFunction(C, C, rx, flags);
+
+    matcher.lastIndex = ToLength(rx.lastIndex);
+
+    flags =
+      (callFunction(std_String_includes, flags, "g") ? REGEXP_GLOBAL_FLAG : 0) |
+      (callFunction(std_String_includes, flags, "u") ? REGEXP_UNICODE_FLAG : 0) |
+      (callFunction(std_String_includes, flags, "v") ? REGEXP_UNICODESETS_FLAG : 0);
+    
+    lastIndex = REGEXP_STRING_ITERATOR_LASTINDEX_SLOW;
+  }
+
+  return CreateRegExpStringIterator(matcher, str, source, flags, lastIndex);
+}
+
+function CreateRegExpStringIterator(regexp, string, source, flags, lastIndex) {
+  assert(typeof string === "string", "|string| is a string value");
+
+  assert(typeof flags === "number", "|flags| is a number value");
+
+  assert(typeof source === "string", "|source| is a string value");
+  assert(typeof lastIndex === "number", "|lastIndex| is a number value");
+
+  var iterator = NewRegExpStringIterator();
+  UnsafeSetReservedSlot(iterator, REGEXP_STRING_ITERATOR_REGEXP_SLOT, regexp);
+  UnsafeSetReservedSlot(iterator, REGEXP_STRING_ITERATOR_STRING_SLOT, string);
+  UnsafeSetReservedSlot(iterator, REGEXP_STRING_ITERATOR_SOURCE_SLOT, source);
+  UnsafeSetReservedSlot(iterator, REGEXP_STRING_ITERATOR_FLAGS_SLOT, flags | 0);
+  UnsafeSetReservedSlot(
+    iterator,
+    REGEXP_STRING_ITERATOR_LASTINDEX_SLOT,
+    lastIndex
+  );
+
+  return iterator;
+}
+
+function RegExpStringIteratorNext() {
+  var obj = this;
+  if (!IsObject(obj) || (obj = GuardToRegExpStringIterator(obj)) === null) {
+    return callFunction(
+      CallRegExpStringIteratorMethodIfWrapped,
+      this,
+      "RegExpStringIteratorNext"
+    );
+  }
+
+  var result = { value: undefined, done: false };
+
+  var lastIndex = UnsafeGetReservedSlot(
+    obj,
+    REGEXP_STRING_ITERATOR_LASTINDEX_SLOT
+  );
+  if (lastIndex === REGEXP_STRING_ITERATOR_LASTINDEX_DONE) {
+    result.done = true;
+    return result;
+  }
+
+  var regexp = UnsafeGetObjectFromReservedSlot(
+    obj,
+    REGEXP_STRING_ITERATOR_REGEXP_SLOT
+  );
+
+  var string = UnsafeGetStringFromReservedSlot(
+    obj,
+    REGEXP_STRING_ITERATOR_STRING_SLOT
+  );
+
+  var flags = UnsafeGetInt32FromReservedSlot(
+    obj,
+    REGEXP_STRING_ITERATOR_FLAGS_SLOT
+  );
+  var global = !!(flags & REGEXP_GLOBAL_FLAG);
+  var fullUnicode = !!(flags & REGEXP_ANY_UNICODE_MASK);
+
+  if (lastIndex >= 0) {
+    assert(IsRegExpObject(regexp), "|regexp| is a RegExp object");
+
+    var source = UnsafeGetStringFromReservedSlot(
+      obj,
+      REGEXP_STRING_ITERATOR_SOURCE_SLOT
+    );
+    if (
+      IsRegExpPrototypeOptimizable() &&
+      UnsafeGetStringFromReservedSlot(regexp, REGEXP_SOURCE_SLOT) === source &&
+      UnsafeGetInt32FromReservedSlot(regexp, REGEXP_FLAGS_SLOT) === flags
+    ) {
+      var globalOrSticky = !!(
+        flags &
+        (REGEXP_GLOBAL_FLAG | REGEXP_STICKY_FLAG)
+      );
+      if (!globalOrSticky) {
+        lastIndex = 0;
+      }
+
+      var match =
+        lastIndex <= string.length
+          ? RegExpMatcher(regexp, string, lastIndex)
+          : null;
+
+      if (match === null) {
+        UnsafeSetReservedSlot(
+          obj,
+          REGEXP_STRING_ITERATOR_LASTINDEX_SLOT,
+          REGEXP_STRING_ITERATOR_LASTINDEX_DONE
+        );
+
+        result.done = true;
+        return result;
+      }
+
+      if (global) {
+        var matchLength = match[0].length;
+        lastIndex = match.index + matchLength;
+
+        if (matchLength === 0) {
+          lastIndex = fullUnicode
+            ? AdvanceStringIndex(string, lastIndex)
+            : lastIndex + 1;
+        }
+
+        UnsafeSetReservedSlot(
+          obj,
+          REGEXP_STRING_ITERATOR_LASTINDEX_SLOT,
+          lastIndex
+        );
+      } else {
+        UnsafeSetReservedSlot(
+          obj,
+          REGEXP_STRING_ITERATOR_LASTINDEX_SLOT,
+          REGEXP_STRING_ITERATOR_LASTINDEX_DONE
+        );
+      }
+
+      result.value = match;
+      return result;
+    }
+
+    var newFlags = flags & ~REGEXP_LEGACY_FEATURES_ENABLED_FLAG;
+    regexp = RegExpConstructRaw(source, newFlags, true);
+    regexp.lastIndex = lastIndex;
+    UnsafeSetReservedSlot(obj, REGEXP_STRING_ITERATOR_REGEXP_SLOT, regexp);
+
+    UnsafeSetReservedSlot(
+      obj,
+      REGEXP_STRING_ITERATOR_LASTINDEX_SLOT,
+      REGEXP_STRING_ITERATOR_LASTINDEX_SLOW
+    );
+  }
+
+  var match = RegExpExec(regexp, string);
+
+  if (match === null) {
+    UnsafeSetReservedSlot(
+      obj,
+      REGEXP_STRING_ITERATOR_LASTINDEX_SLOT,
+      REGEXP_STRING_ITERATOR_LASTINDEX_DONE
+    );
+
+    result.done = true;
+    return result;
+  }
+
+  if (global) {
+    var matchStr = ToString(match[0]);
+
+    if (matchStr.length === 0) {
+      var thisIndex = ToLength(regexp.lastIndex);
+
+      var nextIndex = fullUnicode
+        ? AdvanceStringIndex(string, thisIndex)
+        : thisIndex + 1;
+
+      regexp.lastIndex = nextIndex;
+    }
+  } else {
+    UnsafeSetReservedSlot(
+      obj,
+      REGEXP_STRING_ITERATOR_LASTINDEX_SLOT,
+      REGEXP_STRING_ITERATOR_LASTINDEX_DONE
+    );
+  }
+
+  result.value = match;
+  return result;
+}
+
+function IsRegExp(argument) {
+  if (!IsObject(argument)) {
+    return false;
+  }
+
+  var matcher = argument[GetBuiltinSymbol("match")];
+
+  if (matcher !== undefined) {
+    return !!matcher;
+  }
+
+  return IsPossiblyWrappedRegExpObject(argument);
+}

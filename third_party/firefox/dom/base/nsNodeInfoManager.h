@@ -1,0 +1,140 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsNodeInfoManager_h_
+#define nsNodeInfoManager_h_
+
+#include "mozilla/Attributes.h"  // for final
+#include "mozilla/MruCache.h"
+#include "mozilla/dom/DOMArena.h"
+#include "mozilla/dom/NodeInfo.h"
+#include "nsCOMPtr.h"                      // for member
+#include "nsCycleCollectionParticipant.h"  // for NS_DECL_CYCLE_*
+#include "nsStringFwd.h"
+#include "nsTHashMap.h"
+
+class nsAtom;
+class nsIPrincipal;
+class nsWindowSizes;
+template <class T>
+struct already_AddRefed;
+
+namespace mozilla::dom {
+class Document;
+}  
+
+class nsNodeInfoManager final {
+ private:
+  using NodeInfo = mozilla::dom::NodeInfo;
+  ~nsNodeInfoManager();
+
+ public:
+  explicit nsNodeInfoManager(mozilla::dom::Document* aDocument,
+                             nsIPrincipal* aPrincipal);
+
+  NS_DECL_CYCLE_COLLECTION_SKIPPABLE_NATIVE_CLASS(nsNodeInfoManager)
+
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(nsNodeInfoManager)
+
+  void DropDocumentReference();
+
+  already_AddRefed<NodeInfo> GetNodeInfo(nsAtom* aName, nsAtom* aPrefix,
+                                         int32_t aNamespaceID,
+                                         uint16_t aNodeType,
+                                         nsAtom* aExtraName = nullptr);
+  nsresult GetNodeInfo(const nsAString& aName, nsAtom* aPrefix,
+                       int32_t aNamespaceID, uint16_t aNodeType,
+                       NodeInfo** aNodeInfo);
+  nsresult GetNodeInfo(const nsAString& aName, nsAtom* aPrefix,
+                       const nsAString& aNamespaceURI, uint16_t aNodeType,
+                       NodeInfo** aNodeInfo);
+
+  already_AddRefed<NodeInfo> GetTextNodeInfo();
+
+  already_AddRefed<NodeInfo> GetCommentNodeInfo();
+
+  already_AddRefed<NodeInfo> GetDocumentNodeInfo();
+  already_AddRefed<NodeInfo> GetDocumentFragmentNodeInfo();
+
+  mozilla::dom::Document* GetDocument() const { return mDocument; }
+
+  nsIPrincipal* DocumentPrincipal() const {
+    NS_ASSERTION(mPrincipal, "How'd that happen?");
+    return mPrincipal;
+  }
+
+  void RemoveNodeInfo(NodeInfo* aNodeInfo);
+
+  bool SVGEnabled() {
+    return mSVGEnabled.valueOrFrom([this] { return InternalSVGEnabled(); });
+  }
+
+  bool MathMLEnabled() {
+    return mMathMLEnabled.valueOrFrom(
+        [this] { return InternalMathMLEnabled(); });
+  }
+
+  mozilla::dom::DOMArena* GetArenaAllocator() { return mArena; }
+  void SetArenaAllocator(mozilla::dom::DOMArena* aArena);
+
+  void* Allocate(size_t aSize);
+
+  void Free(void* aPtr) { free(aPtr); }
+
+  bool HasAllocated() { return mHasAllocated; }
+
+  void AddSizeOfIncludingThis(nsWindowSizes& aSizes) const;
+
+ protected:
+  friend class mozilla::dom::Document;
+  friend class nsXULPrototypeDocument;
+
+  void SetDocumentPrincipal(nsIPrincipal* aPrincipal);
+
+ private:
+  bool InternalSVGEnabled();
+  bool InternalMathMLEnabled();
+
+  class NodeInfoInnerKey : public nsPtrHashKey<NodeInfo::NodeInfoInner> {
+   public:
+    explicit NodeInfoInnerKey(KeyTypePointer aKey) : nsPtrHashKey(aKey) {}
+    NodeInfoInnerKey(NodeInfoInnerKey&&) = default;
+    ~NodeInfoInnerKey() = default;
+    bool KeyEquals(KeyTypePointer aKey) const { return *mKey == *aKey; }
+    static PLDHashNumber HashKey(KeyTypePointer aKey) { return aKey->Hash(); }
+  };
+
+  struct NodeInfoCache : public mozilla::MruCache<NodeInfo::NodeInfoInner,
+                                                  NodeInfo*, NodeInfoCache> {
+    static mozilla::HashNumber Hash(const NodeInfo::NodeInfoInner& aKey) {
+      return aKey.Hash();
+    }
+    static bool Match(const NodeInfo::NodeInfoInner& aKey,
+                      const NodeInfo* aVal) {
+      return (aKey.Hash() == aVal->mInner.Hash()) && (aKey == aVal->mInner);
+    }
+  };
+
+  nsTHashMap<NodeInfoInnerKey, NodeInfo*> mNodeInfoHash;
+  mozilla::dom::Document* MOZ_NON_OWNING_REF mDocument;  
+  uint32_t mNonDocumentNodeInfos = 0;
+
+  nsCOMPtr<nsIPrincipal> mPrincipal;         
+  nsCOMPtr<nsIPrincipal> mDefaultPrincipal;  
+
+  NodeInfo* MOZ_NON_OWNING_REF mTextNodeInfo = nullptr;
+  NodeInfo* MOZ_NON_OWNING_REF mCommentNodeInfo = nullptr;
+  NodeInfo* MOZ_NON_OWNING_REF mDocumentNodeInfo = nullptr;
+  NodeInfo* MOZ_NON_OWNING_REF mDocumentFragmentNodeInfo = nullptr;
+
+  NodeInfoCache mRecentlyUsedNodeInfos;
+  mozilla::Maybe<bool> mSVGEnabled;     
+  mozilla::Maybe<bool> mMathMLEnabled;  
+
+  RefPtr<mozilla::dom::DOMArena> mArena;
+  bool mHasAllocated = false;
+};
+
+#endif /* nsNodeInfoManager_h_ */

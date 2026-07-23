@@ -1,0 +1,111 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_DOMSVGNUMBER_H_
+#define DOM_SVG_DOMSVGNUMBER_H_
+
+#include "DOMSVGNumberList.h"
+#include "mozilla/RefPtr.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsTArray.h"
+#include "nsWrapperCache.h"
+
+#define MOZ_SVG_LIST_INDEX_BIT_COUNT 27  // supports > 134 million list items
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+class SVGElement;
+class SVGSVGElement;
+
+class DOMSVGNumber final : public nsWrapperCache {
+  template <class T>
+  friend class AutoChangeNumberListNotifier;
+
+  ~DOMSVGNumber() {
+    if (mList) {
+      mList->mItems[mListIndex] = nullptr;
+    }
+  }
+
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(DOMSVGNumber)
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_NATIVE_CLASS(DOMSVGNumber)
+
+  DOMSVGNumber(DOMSVGNumberList* aList, uint8_t aAttrEnum, uint32_t aListIndex,
+               bool aIsAnimValItem);
+
+  explicit DOMSVGNumber(SVGSVGElement* aParent);
+
+ private:
+  explicit DOMSVGNumber(nsISupports* aParent);
+
+ public:
+  already_AddRefed<DOMSVGNumber> Clone() {
+    RefPtr clone = new DOMSVGNumber(mParent);
+    clone->mValue = ToSVGNumber();
+    return clone.forget();
+  }
+
+  bool IsInList() const { return !!mList; }
+
+  bool IsAnimating() const { return mList && mList->IsAnimating(); }
+
+  bool HasOwner() const { return !!mList; }
+
+  void InsertingIntoList(DOMSVGNumberList* aList, uint8_t aAttrEnum,
+                         uint32_t aListIndex, bool aIsAnimValItem);
+
+  static uint32_t MaxListIndex() {
+    return (1U << MOZ_SVG_LIST_INDEX_BIT_COUNT) - 1;
+  }
+
+  void UpdateListIndex(uint32_t aListIndex) {
+    MOZ_RELEASE_ASSERT(aListIndex <= MaxListIndex());
+    mListIndex = aListIndex;
+  }
+
+  void RemovingFromList();
+
+  float ToSVGNumber();
+
+  nsISupports* GetParentObject() { return mParent; }
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  float Value();
+
+  void SetValue(float aValue, ErrorResult& aRv);
+
+ private:
+  dom::SVGElement* Element() { return mList->Element(); }
+
+  uint8_t AttrEnum() const { return mAttrEnum; }
+
+  float& InternalItem();
+
+#ifdef DEBUG
+  bool IndexIsValid();
+#endif
+
+  RefPtr<DOMSVGNumberList> mList;
+  nsCOMPtr<nsISupports> mParent;
+
+
+  uint32_t mListIndex : MOZ_SVG_LIST_INDEX_BIT_COUNT;
+  uint32_t mAttrEnum : 4;  
+  uint32_t mIsAnimValItem : 1;
+
+  float mValue;
+};
+
+}  
+}  
+
+#undef MOZ_SVG_LIST_INDEX_BIT_COUNT
+
+#endif  // DOM_SVG_DOMSVGNUMBER_H_

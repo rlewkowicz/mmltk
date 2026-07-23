@@ -1,0 +1,628 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include <stdint.h>
+static const char kCOMODO_Certification_AuthorityFingerprint[] =
+  "AG1751Vd2CAmRCxPGieoDomhmJy4ezREjtIZTBgZbV4=";
+
+static const char kCOMODO_ECC_Certification_AuthorityFingerprint[] =
+  "58qRu/uxh4gFezqAcERupSkRYBlBAvfcw7mEjGPLnNU=";
+
+static const char kCOMODO_RSA_Certification_AuthorityFingerprint[] =
+  "grX4Ta9HpZx6tSHkmCrvpApTQGo67CYDnvprLg5yRME=";
+
+static const char kComodo_AAA_Services_rootFingerprint[] =
+  "vRU+17BDT2iGsXvOi76E7TQMcTLXAqj0+jGPdW7L1vM=";
+
+static const char kDigiCert_Assured_ID_Root_CAFingerprint[] =
+  "I/Lt/z7ekCWanjD0Cvj5EqXls2lOaThEA0H2Bg4BT/o=";
+
+static const char kDigiCert_Assured_ID_Root_G2Fingerprint[] =
+  "8ca6Zwz8iOTfUpc8rkIPCgid1HQUT+WAbEIAZOFZEik=";
+
+static const char kDigiCert_Assured_ID_Root_G3Fingerprint[] =
+  "Fe7TOVlLME+M+Ee0dzcdjW/sYfTbKwGvWJ58U7Ncrkw=";
+
+static const char kDigiCert_Global_Root_CAFingerprint[] =
+  "r/mIkG3eEpVdm+u/ko/cwxzOMo1bk4TyHIlByibiA5E=";
+
+static const char kDigiCert_Global_Root_G2Fingerprint[] =
+  "i7WTqTvh0OioIruIfFR4kMPnBqrS2rdiVPl/s2uC/CY=";
+
+static const char kDigiCert_Global_Root_G3Fingerprint[] =
+  "uUwZgwDOxcBXrQcntwu+kYFpkiVkOaezL0WYEZ3anJc=";
+
+static const char kDigiCert_High_Assurance_EV_Root_CAFingerprint[] =
+  "WoiWRyIOVNa9ihaBciRSC7XHjliYS9VwUGOIud4PB18=";
+
+static const char kDigiCert_TLS_ECC_P384_Root_G5Fingerprint[] =
+  "oC+voZLIy4HLE0FVT5wFtxzKKokLDRKY1oNkfJYe+98=";
+
+static const char kDigiCert_TLS_RSA4096_Root_G5Fingerprint[] =
+  "ape1HIIZ6T5d7GS61YBs3rD4NVvkfnVwELcCRW4Bqv0=";
+
+static const char kDigiCert_Trusted_Root_G4Fingerprint[] =
+  "Wd8xe/qfTwq3ylFNd3IpaqLHZbh2ZNCLluVzmeNkcpw=";
+
+static const char kEnd_Entity_Test_CertFingerprint[] =
+  "VCIlmPM9NkgFQtrs4Oa5TeFcDu6MWRTKSNdePEhOgD8=";
+
+static const char kGOOGLE_PIN_AE1_GoogleTrustServicesFingerprint[] =
+  "IGnQeIPjbxiR+JteR7AkUXl7pV+19BT4x3o15saZBNE=";
+
+static const char kGOOGLE_PIN_WE1_GoogleTrustServicesFingerprint[] =
+  "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=";
+
+static const char kGOOGLE_PIN_WE2_GoogleTrustServicesFingerprint[] =
+  "vh78KSg1Ry4NaqGDV10w/cTb9VH3BQUZoCWNa93W/EY=";
+
+static const char kGOOGLE_PIN_WE3_GoogleTrustServicesFingerprint[] =
+  "daBIAnKdRIX3bqM85I6We7wBUh0DPycNFBMvYkXGX2Q=";
+
+static const char kGOOGLE_PIN_WE4_GoogleTrustServicesFingerprint[] =
+  "O5TQDB/wa4SkRjBrQL2Aq9CG317H9MDDgpTVcrpJDa4=";
+
+static const char kGOOGLE_PIN_WE5_GoogleTrustServicesFingerprint[] =
+  "8yZxLgpR8EbO8ANRrWKAzIzz9XdlSUgtYPkXKYUlGSY=";
+
+static const char kGOOGLE_PIN_WR1_GoogleTrustServicesFingerprint[] =
+  "yDu9og255NN5GEf+Bwa9rTrqFQ0EydZ0r1FCh9TdAW4=";
+
+static const char kGOOGLE_PIN_WR2_GoogleTrustServicesFingerprint[] =
+  "YPtHaftLw6/0vnc2BnNKGF54xiCA28WFcccjkA4ypCM=";
+
+static const char kGOOGLE_PIN_WR3_GoogleTrustServicesFingerprint[] =
+  "OdSlmQD9NWJh4EbcOHBxkhygPwNSwA9Q91eounfbcoE=";
+
+static const char kGOOGLE_PIN_WR4_GoogleTrustServicesFingerprint[] =
+  "hZe1OerqJ1Pnq6F4N0gVjjpHqm037Ndf4aLLVpZZdAE=";
+
+static const char kGOOGLE_PIN_WR5_GoogleTrustServicesFingerprint[] =
+  "/RoweMyX8j8/fAaaeAIwzhWXigZDrh/J2BBJaHrjX90=";
+
+static const char kGTS_Root_R1Fingerprint[] =
+  "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=";
+
+static const char kGTS_Root_R2Fingerprint[] =
+  "Vfd95BwDeSQo+NUYxVEEIlvkOlWY2SalKK1lPhzOx78=";
+
+static const char kGTS_Root_R3Fingerprint[] =
+  "QXnt2YHvdHR3tJYmQIr0Paosp6t/nggsEGD4QJZ3Q0g=";
+
+static const char kGTS_Root_R4Fingerprint[] =
+  "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=";
+
+static const char kGlobalSign_ECC_Root_CA___R4Fingerprint[] =
+  "CLOmM1/OXvSPjw5UOYbAf9GKOxImEp9hhku9W90fHMk=";
+
+static const char kGlobalSign_ECC_Root_CA___R5Fingerprint[] =
+  "fg6tdrtoGdwvVFEahDVPboswe53YIFjqbABPAdndpd8=";
+
+static const char kGlobalSign_Root_CAFingerprint[] =
+  "K87oWBWM9UZfyddvDfoxL+8lpNyoUB2ptGtn0fv6G2Q=";
+
+static const char kGlobalSign_Root_CA___R3Fingerprint[] =
+  "cGuxAXyFXFkWm61cF4HPWX8S0srS9j0aSqN0k4AP+4A=";
+
+static const char kGlobalSign_Root_CA___R6Fingerprint[] =
+  "aCdH+LpiG4fN07wpXtXKvOciocDANj0daLOJKNJ4fx4=";
+
+static const char kGo_Daddy_Class_2_CAFingerprint[] =
+  "VjLZe/p3W/PJnd6lL8JVNBCGQBZynFLdZSTIqcO0SJ8=";
+
+static const char kGo_Daddy_Root_Certificate_Authority___G2Fingerprint[] =
+  "Ko8tivDrEjiY90yGasP6ZpBU4jwXvHqVvQI0GS3GNdA=";
+
+static const char kGoogleBackup2048Fingerprint[] =
+  "IPMbDAjLVSGntGO3WP53X/zilCVndez5YJ2+vJvhJsA=";
+
+static const char kISRG_Root_X1Fingerprint[] =
+  "C5+lpZ7tcVwmwQIMcRtPbsQtWLABXhQzejna0wHFr8M=";
+
+static const char kStarfield_Class_2_CAFingerprint[] =
+  "FfFKxFycfaIz00eRZOgTf+Ne4POK6FgYPwhBDqgqxLQ=";
+
+static const char kStarfield_Root_Certificate_Authority___G2Fingerprint[] =
+  "gI1os/q0iEpflxrOfRBVDXqVoWN3Tz7Dav/7IT++THQ=";
+
+static const char kTestSPKIFingerprint[] =
+  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+static const char kUSERTrust_ECC_Certification_AuthorityFingerprint[] =
+  "ICGRfpgmOUXIWcQ/HXPLQTkFPEFPoDyjvH7ohhQpjzs=";
+
+static const char kUSERTrust_RSA_Certification_AuthorityFingerprint[] =
+  "x4QzPSC810K5/cMjb05Qm4k3Bw5zBn4lTdO/nEW/Td4=";
+
+struct StaticFingerprints {
+  size_t size;
+  const char* const* data;
+};
+
+static const char* const kPinset_google_root_pems_Data[] = {
+  kCOMODO_ECC_Certification_AuthorityFingerprint,
+  kDigiCert_Assured_ID_Root_G2Fingerprint,
+  kCOMODO_Certification_AuthorityFingerprint,
+  kGlobalSign_ECC_Root_CA___R4Fingerprint,
+  kDigiCert_Assured_ID_Root_G3Fingerprint,
+  kStarfield_Class_2_CAFingerprint,
+  kDigiCert_Assured_ID_Root_CAFingerprint,
+  kUSERTrust_ECC_Certification_AuthorityFingerprint,
+  kGlobalSign_Root_CAFingerprint,
+  kGo_Daddy_Root_Certificate_Authority___G2Fingerprint,
+  kGTS_Root_R3Fingerprint,
+  kGTS_Root_R2Fingerprint,
+  kGo_Daddy_Class_2_CAFingerprint,
+  kDigiCert_Trusted_Root_G4Fingerprint,
+  kDigiCert_High_Assurance_EV_Root_CAFingerprint,
+  kGlobalSign_Root_CA___R6Fingerprint,
+  kGlobalSign_Root_CA___R3Fingerprint,
+  kGlobalSign_ECC_Root_CA___R5Fingerprint,
+  kStarfield_Root_Certificate_Authority___G2Fingerprint,
+  kCOMODO_RSA_Certification_AuthorityFingerprint,
+  kGTS_Root_R1Fingerprint,
+  kDigiCert_Global_Root_G2Fingerprint,
+  kGTS_Root_R4Fingerprint,
+  kDigiCert_Global_Root_CAFingerprint,
+  kDigiCert_Global_Root_G3Fingerprint,
+  kComodo_AAA_Services_rootFingerprint,
+  kUSERTrust_RSA_Certification_AuthorityFingerprint,
+};
+static const StaticFingerprints kPinset_google_root_pems = {
+  sizeof(kPinset_google_root_pems_Data) / sizeof(const char*),
+  kPinset_google_root_pems_Data
+};
+
+static const char* const kPinset_mozilla_services_Data[] = {
+  kISRG_Root_X1Fingerprint,
+  kDigiCert_High_Assurance_EV_Root_CAFingerprint,
+  kDigiCert_TLS_RSA4096_Root_G5Fingerprint,
+  kDigiCert_Global_Root_G2Fingerprint,
+  kDigiCert_TLS_ECC_P384_Root_G5Fingerprint,
+  kDigiCert_Global_Root_CAFingerprint,
+};
+static const StaticFingerprints kPinset_mozilla_services = {
+  sizeof(kPinset_mozilla_services_Data) / sizeof(const char*),
+  kPinset_mozilla_services_Data
+};
+
+static const char* const kPinset_mozilla_test_Data[] = {
+  kEnd_Entity_Test_CertFingerprint,
+};
+static const StaticFingerprints kPinset_mozilla_test = {
+  sizeof(kPinset_mozilla_test_Data) / sizeof(const char*),
+  kPinset_mozilla_test_Data
+};
+
+static const char* const kPinset_test_Data[] = {
+  kTestSPKIFingerprint,
+};
+static const StaticFingerprints kPinset_test = {
+  sizeof(kPinset_test_Data) / sizeof(const char*),
+  kPinset_test_Data
+};
+
+static const char* const kPinset_google_Data[] = {
+  kGOOGLE_PIN_WR5_GoogleTrustServicesFingerprint,
+  kGOOGLE_PIN_WE5_GoogleTrustServicesFingerprint,
+  kGlobalSign_ECC_Root_CA___R4Fingerprint,
+  kGOOGLE_PIN_AE1_GoogleTrustServicesFingerprint,
+  kGoogleBackup2048Fingerprint,
+  kGOOGLE_PIN_WE4_GoogleTrustServicesFingerprint,
+  kGOOGLE_PIN_WR3_GoogleTrustServicesFingerprint,
+  kGTS_Root_R3Fingerprint,
+  kGTS_Root_R2Fingerprint,
+  kGOOGLE_PIN_WR2_GoogleTrustServicesFingerprint,
+  kGOOGLE_PIN_WE3_GoogleTrustServicesFingerprint,
+  kGOOGLE_PIN_WR4_GoogleTrustServicesFingerprint,
+  kGTS_Root_R1Fingerprint,
+  kGOOGLE_PIN_WE1_GoogleTrustServicesFingerprint,
+  kGTS_Root_R4Fingerprint,
+  kGOOGLE_PIN_WE2_GoogleTrustServicesFingerprint,
+  kGOOGLE_PIN_WR1_GoogleTrustServicesFingerprint,
+};
+static const StaticFingerprints kPinset_google = {
+  sizeof(kPinset_google_Data) / sizeof(const char*),
+  kPinset_google_Data
+};
+
+struct TransportSecurityPreload {
+  const char* mHost;
+  bool mIncludeSubdomains;
+  bool mTestMode;
+  bool mIsMoz;
+  int32_t mId;
+  const StaticFingerprints* pinset;
+};
+
+static const TransportSecurityPreload kPublicKeyPinningPreloadList[] = {
+  { "2mdn.net", true, false, false, -1, &kPinset_google_root_pems },
+  { "accounts.firefox.com", true, false, true, 4, &kPinset_mozilla_services },
+  { "accounts.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "addons.mozilla.net", true, false, true, 2, &kPinset_mozilla_services },
+  { "addons.mozilla.org", true, false, true, 1, &kPinset_mozilla_services },
+  { "admin.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "android.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "api.accounts.firefox.com", true, false, true, 5, &kPinset_mozilla_services },
+  { "apis.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "appengine.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "aus4.mozilla.org", true, true, true, 3, &kPinset_mozilla_services },
+  { "aus5.mozilla.org", true, true, true, 7, &kPinset_mozilla_services },
+  { "blogger.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "blogspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "bugs.chromium.org", true, false, false, -1, &kPinset_google_root_pems },
+  { "build.chromium.org", true, false, false, -1, &kPinset_google_root_pems },
+  { "calendar.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "cdn.ampproject.org", true, false, false, -1, &kPinset_google_root_pems },
+  { "cdn.mozilla.net", true, false, true, 16, &kPinset_mozilla_services },
+  { "cdn.mozilla.org", true, false, true, 17, &kPinset_mozilla_services },
+  { "checkout.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "chrome-devtools-frontend.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "chrome.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "chrome.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "chromereporting-pa.googleapis.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "chromiumbugs.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "chromiumcodereview.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "classroom.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "cloud.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "code.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "codereview.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "codereview.chromium.org", true, false, false, -1, &kPinset_google_root_pems },
+  { "contributor.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "corp.goog", true, false, false, -1, &kPinset_google_root_pems },
+  { "crash-reports-xpsp2.mozilla.com", false, false, true, 11, &kPinset_mozilla_services },
+  { "crash-reports.mozilla.com", false, false, true, 10, &kPinset_mozilla_services },
+  { "crash-stats.mozilla.org", false, false, true, 12, &kPinset_mozilla_services },
+  { "crbug.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "crosbug.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "crossmediapanel.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "crrev.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "datastudio.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "developer.android.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "dl.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "dns.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "docs.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "domains.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "doubleclick.net", true, false, false, -1, &kPinset_google_root_pems },
+  { "download.mozilla.org", false, false, true, 14, &kPinset_mozilla_services },
+  { "drive.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "encrypted.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "example.test", true, true, false, -1, &kPinset_test },
+  { "exclude-subdomains.pinning.example.com", false, false, false, -1, &kPinset_mozilla_test },
+  { "fi.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "firebaseio.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "firefox.com", true, true, true, 15, &kPinset_mozilla_services },
+  { "g.co", false, false, false, -1, &kPinset_google_root_pems },
+  { "g4w.co", true, false, false, -1, &kPinset_google_root_pems },
+  { "ggpht.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "glass.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "gmail.com", false, false, false, -1, &kPinset_google_root_pems },
+  { "goo.gl", true, false, false, -1, &kPinset_google_root_pems },
+  { "google", true, false, false, -1, &kPinset_google_root_pems },
+  { "google-analytics.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ac", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ad", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ae", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.af", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ag", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.al", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.am", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.as", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.at", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.az", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ba", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.be", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.bf", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.bg", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.bi", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.bj", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.bs", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.bt", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.by", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ca", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.cat", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.cc", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.cd", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.cf", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.cg", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ch", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ci", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.cl", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.cm", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.cn", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.ao", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.bw", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.ck", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.cr", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.hu", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.id", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.il", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.im", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.in", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.je", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.jp", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.ke", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.kr", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.ls", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.ma", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.mz", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.nz", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.th", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.tz", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.ug", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.uk", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.uz", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.ve", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.vi", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.za", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.zm", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.co.zw", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.af", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.ag", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.ai", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.ar", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.au", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.bd", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.bh", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.bn", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.bo", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.br", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.by", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.bz", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.cn", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.co", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.cu", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.cy", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.do", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.ec", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.eg", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.et", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.fj", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.ge", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.gh", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.gi", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.gr", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.gt", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.hk", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.iq", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.jm", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.jo", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.kh", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.kw", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.lb", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.ly", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.mm", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.mt", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.mx", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.my", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.na", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.nf", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.ng", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.ni", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.np", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.nr", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.om", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.pa", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.pe", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.pg", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.ph", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.pk", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.pl", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.pr", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.py", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.qa", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.ru", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.sa", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.sb", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.sg", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.sl", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.sv", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.tj", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.tn", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.tr", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.tw", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.ua", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.uy", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.vc", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.ve", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.com.vn", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.cv", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.cz", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.de", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.dj", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.dk", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.dm", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.dz", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ee", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.es", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.eus", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.fi", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.fm", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.fr", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ga", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ge", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.gg", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.gl", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.gm", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.gp", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.gr", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.gy", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.hk", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.hn", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.hr", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ht", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.hu", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ie", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.im", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.info", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.iq", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.is", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.it", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.it.ao", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.je", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.jo", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.jobs", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.jp", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.kg", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ki", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.kz", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.la", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.li", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.lk", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.lt", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.lu", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.lv", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.md", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.me", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.mg", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.mk", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ml", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.mn", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ms", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.mu", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.mv", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.mw", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ne", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ne.jp", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.net", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.nl", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.no", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.nr", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.nu", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.off.ai", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.pk", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.pl", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.pn", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ps", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.pt", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ro", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.rs", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ru", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.rw", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.sc", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.se", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.sh", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.si", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.sk", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.sm", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.sn", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.so", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.sr", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.st", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.td", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.tg", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.tk", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.tl", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.tm", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.tn", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.to", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.tt", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ua", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.us", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.uz", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.vg", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.vu", true, false, false, -1, &kPinset_google_root_pems },
+  { "google.ws", true, false, false, -1, &kPinset_google_root_pems },
+  { "googleadservices.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "googleapis.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "googlecode.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "googlecommerce.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "googlegroups.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "googlemail.com", false, false, false, -1, &kPinset_google_root_pems },
+  { "googleplex.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "googlesource.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "googlesyndication.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "googletagmanager.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "googletagservices.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "googleusercontent.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "googlevideo.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "googleweblight.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "goto.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "groups.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "gstatic.cn", true, false, false, -1, &kPinset_google_root_pems },
+  { "gstatic.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "gvt1.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "gvt2.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "gvt3.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "hangout", true, false, false, -1, &kPinset_google_root_pems },
+  { "hangouts.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "history.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "hostedtalkgadget.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "inbox.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "include-subdomains.pinning.example.com", true, false, false, -1, &kPinset_mozilla_test },
+  { "lens.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "login.corp.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "mail-settings.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "mail.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "market.android.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "meet.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "mfg-inspector.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "myaccount.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "myactivity.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "oauthaccountmanager.googleapis.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "partner.android.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "passwords.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "passwordsleakcheck-pa.googleapis.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "payments.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "pinning-test.badssl.com", true, false, false, -1, &kPinset_test },
+  { "pinningtest.appspot.com", true, false, false, -1, &kPinset_test },
+  { "pixel.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "play.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "plus.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "plus.sandbox.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "profiles.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "remotedesktop.corp.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "script.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "security.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "services.mozilla.com", true, false, true, 6, &kPinset_mozilla_services },
+  { "sites.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "spreadsheets.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "static.googleadsserving.cn", true, false, false, -1, &kPinset_google_root_pems },
+  { "stats.g.doubleclick.net", true, false, false, -1, &kPinset_google_root_pems },
+  { "sync.services.mozilla.com", true, false, true, 13, &kPinset_mozilla_services },
+  { "talk.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "talkgadget.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "telemetry.mozilla.org", true, true, true, 8, &kPinset_mozilla_services },
+  { "test-mode.pinning.example.com", true, true, false, -1, &kPinset_mozilla_test },
+  { "testpilot.firefox.com", false, false, true, 9, &kPinset_mozilla_services },
+  { "translate.googleapis.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "tunnel-staging.googlezip.net", true, false, false, -1, &kPinset_google_root_pems },
+  { "tunnel.googlezip.net", true, false, false, -1, &kPinset_google_root_pems },
+  { "ua5v.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "urchin.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "w-spotlight.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "wallet.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "webfilings-eu-mirror.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "webfilings-eu.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "webfilings-mirror-hrd.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "webfilings.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "wf-bigsky-master.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "wf-demo-eu.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "wf-demo-hrd.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "wf-dogfood-hrd.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "wf-pentest.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "wf-staging-hr.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "wf-training-hrd.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "wf-training-master.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "wf-trial-hrd.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "withgoogle.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "withyoutube.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "www.g.co", false, false, false, -1, &kPinset_google_root_pems },
+  { "www.gmail.com", false, false, false, -1, &kPinset_google_root_pems },
+  { "www.googlegroups.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "www.googlemail.com", false, false, false, -1, &kPinset_google_root_pems },
+  { "xbrlsuccess.appspot.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "xn--7xa.google.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "youtu.be", true, false, false, -1, &kPinset_google_root_pems },
+  { "youtube-nocookie.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "youtube.com", true, false, false, -1, &kPinset_google_root_pems },
+  { "ytimg.com", true, false, false, -1, &kPinset_google_root_pems },
+};
+
+
+static const int32_t kUnknownId = -1;
+
+static const PRTime kPreloadPKPinsExpirationTime = INT64_C(1792179853481000);

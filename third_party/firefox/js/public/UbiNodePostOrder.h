@@ -1,0 +1,137 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_UbiNodePostOrder_h
+#define js_UbiNodePostOrder_h
+
+#include <utility>
+
+#include "js/UbiNode.h"
+#include "js/Vector.h"
+
+namespace js {
+class SystemAllocPolicy;
+}
+
+namespace JS {
+class AutoCheckCannotGC;
+
+namespace ubi {
+
+struct PostOrder {
+ private:
+  struct OriginAndEdges {
+    Node origin;
+    EdgeVector edges;
+
+    OriginAndEdges(const Node& node, EdgeVector&& edges)
+        : origin(node), edges(std::move(edges)) {}
+
+    OriginAndEdges(const OriginAndEdges& rhs) = delete;
+    OriginAndEdges& operator=(const OriginAndEdges& rhs) = delete;
+
+    OriginAndEdges(OriginAndEdges&& rhs)
+        : origin(rhs.origin), edges(std::move(rhs.edges)) {
+      MOZ_ASSERT(&rhs != this, "self-move disallowed");
+    }
+
+    OriginAndEdges& operator=(OriginAndEdges&& rhs) {
+      this->~OriginAndEdges();
+      new (this) OriginAndEdges(std::move(rhs));
+      return *this;
+    }
+  };
+
+  using Stack = js::Vector<OriginAndEdges, 256, js::SystemAllocPolicy>;
+  using Set = js::HashSet<Node, js::DefaultHasher<Node>, js::SystemAllocPolicy>;
+
+  JSContext* cx;
+  Set seen;
+  Stack stack;
+#ifdef DEBUG
+  bool traversed;
+#endif
+
+ private:
+  [[nodiscard]] bool fillEdgesFromRange(EdgeVector& edges,
+                                        js::UniquePtr<EdgeRange>& range) {
+    MOZ_ASSERT(range);
+    for (; !range->empty(); range->popFront()) {
+      if (!edges.append(std::move(range->front()))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool pushForTraversing(const Node& node) {
+    EdgeVector edges;
+    auto range = node.edges(cx,  false);
+    return range && fillEdgesFromRange(edges, range) &&
+           stack.append(OriginAndEdges(node, std::move(edges)));
+  }
+
+ public:
+  PostOrder(JSContext* cx, AutoCheckCannotGC&)
+      : cx(cx),
+        seen(),
+        stack()
+#ifdef DEBUG
+        ,
+        traversed(false)
+#endif
+  {
+  }
+
+  [[nodiscard]] bool addStart(const Node& node) {
+    if (!seen.put(node)) {
+      return false;
+    }
+    return pushForTraversing(node);
+  }
+
+  template <typename NodeVisitor, typename EdgeVisitor>
+  [[nodiscard]] bool traverse(NodeVisitor onNode, EdgeVisitor onEdge) {
+#ifdef DEBUG
+    MOZ_ASSERT(!traversed, "Can only traverse() once!");
+    traversed = true;
+#endif
+
+    while (!stack.empty()) {
+      auto& origin = stack.back().origin;
+      auto& edges = stack.back().edges;
+
+      if (edges.empty()) {
+        if (!onNode(origin)) {
+          return false;
+        }
+        stack.popBack();
+        continue;
+      }
+
+      Edge edge = std::move(edges.back());
+      edges.popBack();
+
+      if (!onEdge(origin, edge)) {
+        return false;
+      }
+
+      auto ptr = seen.lookupForAdd(edge.referent);
+      if (ptr) {
+        continue;
+      }
+
+      if (!seen.add(ptr, edge.referent) || !pushForTraversing(edge.referent)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+};
+
+}  
+}  
+
+#endif  // js_UbiNodePostOrder_h

@@ -1,0 +1,368 @@
+// Copyright 2016 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "compiler/translator/tree_ops/SimplifyLoopConditions.h"
+
+#include "compiler/translator/StaticType.h"
+#include "compiler/translator/tree_util/IntermNodePatternMatcher.h"
+#include "compiler/translator/tree_util/IntermNode_util.h"
+#include "compiler/translator/tree_util/IntermTraverse.h"
+
+namespace sh
+{
+
+namespace
+{
+
+struct LoopInfo
+{
+    const TVariable *conditionVariable = nullptr;
+    TIntermTyped *condition            = nullptr;
+    TIntermTyped *expression           = nullptr;
+};
+
+class SimplifyLoopConditionsTraverser : public TLValueTrackingTraverser
+{
+  public:
+    SimplifyLoopConditionsTraverser(const IntermNodePatternMatcher *conditionsToSimplify,
+                                    TSymbolTable *symbolTable);
+
+    void traverseLoop(TIntermLoop *node) override;
+
+    bool visitUnary(Visit visit, TIntermUnary *node) override;
+    bool visitBinary(Visit visit, TIntermBinary *node) override;
+    bool visitAggregate(Visit visit, TIntermAggregate *node) override;
+    bool visitTernary(Visit visit, TIntermTernary *node) override;
+    bool visitDeclaration(Visit visit, TIntermDeclaration *node) override;
+    bool visitBranch(Visit visit, TIntermBranch *node) override;
+
+    bool foundLoopToChange() const { return mFoundLoopToChange; }
+
+  protected:
+    bool mFoundLoopToChange;
+    bool mInsideLoopInitConditionOrExpression;
+    const IntermNodePatternMatcher *mConditionsToSimplify;
+
+  private:
+    LoopInfo mLoop;
+};
+
+SimplifyLoopConditionsTraverser::SimplifyLoopConditionsTraverser(
+    const IntermNodePatternMatcher *conditionsToSimplify,
+    TSymbolTable *symbolTable)
+    : TLValueTrackingTraverser(true, false, false, symbolTable),
+      mFoundLoopToChange(false),
+      mInsideLoopInitConditionOrExpression(false),
+      mConditionsToSimplify(conditionsToSimplify)
+{}
+
+
+bool SimplifyLoopConditionsTraverser::visitUnary(Visit visit, TIntermUnary *node)
+{
+    if (!mInsideLoopInitConditionOrExpression)
+        return false;
+
+    if (mFoundLoopToChange)
+        return false;  
+
+    ASSERT(mConditionsToSimplify);
+    mFoundLoopToChange = mConditionsToSimplify->match(node);
+    return !mFoundLoopToChange;
+}
+
+bool SimplifyLoopConditionsTraverser::visitBinary(Visit visit, TIntermBinary *node)
+{
+    if (!mInsideLoopInitConditionOrExpression)
+        return false;
+
+    if (mFoundLoopToChange)
+        return false;  
+
+    ASSERT(mConditionsToSimplify);
+    mFoundLoopToChange =
+        mConditionsToSimplify->match(node, getParentNode(), isLValueRequiredHere());
+    return !mFoundLoopToChange;
+}
+
+bool SimplifyLoopConditionsTraverser::visitAggregate(Visit visit, TIntermAggregate *node)
+{
+    if (!mInsideLoopInitConditionOrExpression)
+        return false;
+
+    if (mFoundLoopToChange)
+        return false;  
+
+    ASSERT(mConditionsToSimplify);
+    mFoundLoopToChange = mConditionsToSimplify->match(node, getParentNode());
+    return !mFoundLoopToChange;
+}
+
+bool SimplifyLoopConditionsTraverser::visitTernary(Visit visit, TIntermTernary *node)
+{
+    if (!mInsideLoopInitConditionOrExpression)
+        return false;
+
+    if (mFoundLoopToChange)
+        return false;  
+
+    ASSERT(mConditionsToSimplify);
+    mFoundLoopToChange = mConditionsToSimplify->match(node);
+    return !mFoundLoopToChange;
+}
+
+bool SimplifyLoopConditionsTraverser::visitDeclaration(Visit visit, TIntermDeclaration *node)
+{
+    if (!mInsideLoopInitConditionOrExpression)
+        return false;
+
+    if (mFoundLoopToChange)
+        return false;  
+
+    ASSERT(mConditionsToSimplify);
+    mFoundLoopToChange = mConditionsToSimplify->match(node);
+    return !mFoundLoopToChange;
+}
+
+bool SimplifyLoopConditionsTraverser::visitBranch(Visit visit, TIntermBranch *node)
+{
+    if (node->getFlowOp() == EOpContinue && (mLoop.condition || mLoop.expression))
+    {
+        TIntermBlock *parent = getParentNode()->getAsBlock();
+        ASSERT(parent);
+        TIntermSequence seq;
+        if (mLoop.expression)
+        {
+            seq.push_back(mLoop.expression->deepCopy());
+        }
+        if (mLoop.condition)
+        {
+            ASSERT(mLoop.conditionVariable);
+            seq.push_back(
+                CreateTempAssignmentNode(mLoop.conditionVariable, mLoop.condition->deepCopy()));
+        }
+        seq.push_back(node);
+        mMultiReplacements.push_back(NodeReplaceWithMultipleEntry(parent, node, std::move(seq)));
+    }
+
+    return true;
+}
+
+static TIntermBlock *CreateFromBody(TIntermLoop *node, bool *bodyEndsInBranchOut)
+{
+    TIntermBlock *newBody  = new TIntermBlock();
+    TIntermBlock *nodeBody = node->getBody();
+    newBody->getSequence()->push_back(nodeBody);
+    *bodyEndsInBranchOut = EndsInBranch(nodeBody);
+    return newBody;
+}
+
+void SimplifyLoopConditionsTraverser::traverseLoop(TIntermLoop *node)
+{
+
+    ScopedNodeInTraversalPath addToPath(this, node);
+
+    mInsideLoopInitConditionOrExpression = true;
+    mFoundLoopToChange                   = !mConditionsToSimplify;
+
+    if (!mFoundLoopToChange && node->getInit())
+    {
+        node->getInit()->traverse(this);
+    }
+
+    if (!mFoundLoopToChange && node->getCondition())
+    {
+        node->getCondition()->traverse(this);
+    }
+
+    if (!mFoundLoopToChange && node->getExpression())
+    {
+        node->getExpression()->traverse(this);
+    }
+
+    mInsideLoopInitConditionOrExpression = false;
+
+    const LoopInfo prevLoop = mLoop;
+
+    if (mFoundLoopToChange)
+    {
+        const TType *boolType   = StaticType::Get<EbtBool, EbpUndefined, EvqTemporary, 1, 1>();
+        mLoop.conditionVariable = CreateTempVariable(mSymbolTable, boolType);
+        mLoop.condition         = node->getCondition();
+        mLoop.expression        = node->getExpression();
+
+        TLoopType loopType = node->getType();
+        if (loopType == ELoopWhile)
+        {
+            ASSERT(!mLoop.expression);
+
+            if (mLoop.condition->getAsSymbolNode())
+            {
+                mLoop.condition = nullptr;
+            }
+            else if (mLoop.condition->getAsConstantUnion())
+            {
+                TIntermDeclaration *tempInitDeclaration =
+                    CreateTempInitDeclarationNode(mLoop.conditionVariable, mLoop.condition);
+                insertStatementInParentBlock(tempInitDeclaration);
+
+                node->setCondition(CreateTempSymbolNode(mLoop.conditionVariable));
+
+                mLoop.condition = nullptr;
+            }
+            else
+            {
+                TIntermDeclaration *tempInitDeclaration =
+                    CreateTempInitDeclarationNode(mLoop.conditionVariable, mLoop.condition);
+                insertStatementInParentBlock(tempInitDeclaration);
+
+                bool bodyEndsInBranch;
+                TIntermBlock *newBody = CreateFromBody(node, &bodyEndsInBranch);
+                if (!bodyEndsInBranch)
+                {
+                    newBody->getSequence()->push_back(CreateTempAssignmentNode(
+                        mLoop.conditionVariable, mLoop.condition->deepCopy()));
+                }
+
+                node->setBody(newBody);
+                node->setCondition(CreateTempSymbolNode(mLoop.conditionVariable));
+            }
+        }
+        else if (loopType == ELoopDoWhile)
+        {
+            ASSERT(!mLoop.expression);
+
+            if (mLoop.condition->getAsSymbolNode())
+            {
+                mLoop.condition = nullptr;
+            }
+            else if (mLoop.condition->getAsConstantUnion())
+            {
+                TIntermDeclaration *tempInitDeclaration =
+                    CreateTempInitDeclarationNode(mLoop.conditionVariable, mLoop.condition);
+                insertStatementInParentBlock(tempInitDeclaration);
+
+                node->setCondition(CreateTempSymbolNode(mLoop.conditionVariable));
+
+                mLoop.condition = nullptr;
+            }
+            else
+            {
+                TIntermDeclaration *tempInitDeclaration =
+                    CreateTempDeclarationNode(mLoop.conditionVariable);
+                insertStatementInParentBlock(tempInitDeclaration);
+
+                bool bodyEndsInBranch;
+                TIntermBlock *newBody = CreateFromBody(node, &bodyEndsInBranch);
+                if (!bodyEndsInBranch)
+                {
+                    newBody->getSequence()->push_back(
+                        CreateTempAssignmentNode(mLoop.conditionVariable, mLoop.condition));
+                }
+
+                node->setBody(newBody);
+                node->setCondition(CreateTempSymbolNode(mLoop.conditionVariable));
+            }
+        }
+        else if (loopType == ELoopFor)
+        {
+            if (!mLoop.condition)
+            {
+                mLoop.condition = CreateBoolNode(true);
+            }
+
+            TIntermLoop *whileLoop;
+            TIntermBlock *loopScope            = new TIntermBlock();
+            TIntermSequence *loopScopeSequence = loopScope->getSequence();
+
+            if (node->getInit())
+            {
+                loopScopeSequence->push_back(node->getInit());
+            }
+
+            if (mLoop.condition->getAsSymbolNode())
+            {
+
+                bool bodyEndsInBranch;
+                TIntermBlock *whileLoopBody = CreateFromBody(node, &bodyEndsInBranch);
+                if (!bodyEndsInBranch && node->getExpression())
+                {
+                    whileLoopBody->getSequence()->push_back(node->getExpression());
+                }
+                whileLoop =
+                    new TIntermLoop(ELoopWhile, nullptr, mLoop.condition, nullptr, whileLoopBody);
+
+                mLoop.condition = nullptr;
+            }
+            else if (mLoop.condition->getAsConstantUnion())
+            {
+
+                loopScopeSequence->push_back(
+                    CreateTempInitDeclarationNode(mLoop.conditionVariable, mLoop.condition));
+                bool bodyEndsInBranch;
+                TIntermBlock *whileLoopBody = CreateFromBody(node, &bodyEndsInBranch);
+                if (!bodyEndsInBranch && node->getExpression())
+                {
+                    whileLoopBody->getSequence()->push_back(node->getExpression());
+                }
+                whileLoop = new TIntermLoop(ELoopWhile, nullptr,
+                                            CreateTempSymbolNode(mLoop.conditionVariable), nullptr,
+                                            whileLoopBody);
+
+                mLoop.condition = nullptr;
+            }
+            else
+            {
+
+                loopScopeSequence->push_back(
+                    CreateTempInitDeclarationNode(mLoop.conditionVariable, mLoop.condition));
+                bool bodyEndsInBranch;
+                TIntermBlock *whileLoopBody = CreateFromBody(node, &bodyEndsInBranch);
+                if (!bodyEndsInBranch && node->getExpression())
+                {
+                    whileLoopBody->getSequence()->push_back(node->getExpression());
+                }
+                if (!bodyEndsInBranch)
+                {
+                    whileLoopBody->getSequence()->push_back(CreateTempAssignmentNode(
+                        mLoop.conditionVariable, mLoop.condition->deepCopy()));
+                }
+                whileLoop = new TIntermLoop(ELoopWhile, nullptr,
+                                            CreateTempSymbolNode(mLoop.conditionVariable), nullptr,
+                                            whileLoopBody);
+            }
+
+            loopScope->getSequence()->push_back(whileLoop);
+            queueReplacement(loopScope, OriginalNode::IS_DROPPED);
+
+        }
+    }
+
+    mFoundLoopToChange = false;
+
+    node->getBody()->traverse(this);
+
+    mLoop = prevLoop;
+}
+
+}  
+
+bool SimplifyLoopConditions(TCompiler *compiler, TIntermNode *root, TSymbolTable *symbolTable)
+{
+    SimplifyLoopConditionsTraverser traverser(nullptr, symbolTable);
+    root->traverse(&traverser);
+    return traverser.updateTree(compiler, root);
+}
+
+bool SimplifyLoopConditions(TCompiler *compiler,
+                            TIntermNode *root,
+                            unsigned int conditionsToSimplifyMask,
+                            TSymbolTable *symbolTable)
+{
+    IntermNodePatternMatcher conditionsToSimplify(conditionsToSimplifyMask);
+    SimplifyLoopConditionsTraverser traverser(&conditionsToSimplify, symbolTable);
+    root->traverse(&traverser);
+    return traverser.updateTree(compiler, root);
+}
+
+}  

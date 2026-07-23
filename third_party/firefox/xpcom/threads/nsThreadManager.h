@@ -1,0 +1,119 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsThreadManager_h_
+#define nsThreadManager_h_
+
+#include "nsIThreadManager.h"
+#include "nsThread.h"
+#include "mozilla/ShutdownPhase.h"
+#include "mozilla/StaticString.h"
+
+class nsIRunnable;
+class nsIThread;
+
+namespace mozilla {
+class IdleTaskManager;
+class SynchronizedEventQueue;
+class TaskQueue;
+
+template <typename T>
+class NeverDestroyed;
+}  
+
+class BackgroundEventTarget;
+
+class nsThreadManager : public nsIThreadManager {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSITHREADMANAGER
+
+  static nsThreadManager& get();
+
+  nsresult Init();
+
+  void ShutdownNonMainThreads();
+
+  void ShutdownMainThread();
+
+  void ReleaseMainThread();
+
+  void RegisterCurrentThread(nsThread& aThread);
+
+  void UnregisterCurrentThread(nsThread& aThread);
+
+  nsThread* GetCurrentThread();
+
+  bool IsNSThread() const;
+
+  RefPtr<nsThread> CreateCurrentThread(mozilla::SynchronizedEventQueue* aQueue);
+
+  nsresult DispatchToBackgroundThread(
+      nsIRunnable* aEvent, nsIEventTarget::DispatchFlags aDispatchFlags);
+
+  already_AddRefed<mozilla::TaskQueue> CreateBackgroundTaskQueue(
+      mozilla::StaticString aName);
+
+  ~nsThreadManager();
+
+  void EnableMainThreadEventPrioritization();
+  void FlushInputEventPrioritization();
+  void SuspendInputEventPrioritization();
+  void ResumeInputEventPrioritization();
+
+  static bool MainThreadHasPendingHighPriorityEvents();
+
+  nsIThread* GetMainThreadWeak() { return mMainThread; }
+
+  mozilla::OffTheBooksMutex& ThreadListMutex() MOZ_RETURN_CAPABILITY(mMutex) {
+    return mMutex;
+  }
+
+  bool AllowNewXPCOMThreads() MOZ_EXCLUDES(mMutex);
+  bool AllowNewXPCOMThreadsLocked() MOZ_REQUIRES(mMutex) {
+    return mState == State::eActive;
+  }
+
+  mozilla::LinkedList<nsThread>& ThreadList() MOZ_REQUIRES(mMutex) {
+    return mThreadList;
+  }
+
+ private:
+  friend class mozilla::NeverDestroyed<nsThreadManager>;
+
+  nsThreadManager();
+
+  nsresult SpinEventLoopUntilInternal(
+      const nsACString& aVeryGoodReasonToDoThis,
+      nsINestedEventLoopCondition* aCondition,
+      mozilla::ShutdownPhase aShutdownPhaseToCheck);
+
+  static void ReleaseThread(void* aData);
+
+  enum class State : uint8_t {
+    eUninit,
+    eActive,
+    eShutdown,
+  };
+
+  unsigned mCurThreadIndex;  
+  RefPtr<nsThread> mMainThread;
+
+  mutable mozilla::OffTheBooksMutex mMutex;
+
+  State mState MOZ_GUARDED_BY(mMutex);
+
+  mozilla::LinkedList<nsThread> mThreadList MOZ_GUARDED_BY(mMutex);
+
+  RefPtr<BackgroundEventTarget> mBackgroundEventTarget MOZ_GUARDED_BY(mMutex);
+};
+
+#define NS_THREADMANAGER_CID                  \
+  { \
+   0x7a4204c6,                                \
+   0xe45a,                                    \
+   0x4c37,                                    \
+   {0x8e, 0xbb, 0x67, 0x09, 0xa2, 0x2c, 0x91, 0x7c}}
+
+#endif  // nsThreadManager_h_

@@ -1,0 +1,191 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ChildIterator_h
+#define ChildIterator_h
+
+#include <stdint.h>
+
+#include "nsIContent.h"
+
+namespace mozilla::dom {
+
+template <TreeKind>
+class ChildIteratorBase;
+
+using ChildIterator = ChildIteratorBase<TreeKind::DOM>;
+using FlattenedChildIteratorForSelection =
+    ChildIteratorBase<TreeKind::FlatForSelection>;
+using FlattenedChildIterator = ChildIteratorBase<TreeKind::Flat>;
+
+template <TreeKind aKind>
+class ChildIteratorBase {
+  static_assert(aKind != TreeKind::ShadowIncludingDOM,
+                "It's unclear what should do when the parent is a shadow host "
+                "in this TreeKind so that we don't support it");
+
+ public:
+  explicit ChildIteratorBase(const nsINode* aParentNode,
+                             bool aStartAtBeginning = true);
+
+  [[nodiscard]] nsIContent* GetNextChild();
+
+  bool Seek(const nsIContent* aChildToFind);
+
+  [[nodiscard]] nsIContent* Get() const { return mChild; }
+
+  [[nodiscard]] const nsINode* ParentNode() const {
+    return mOriginalParentNode;
+  }
+
+  [[nodiscard]] nsIContent* GetPreviousChild();
+
+  [[nodiscard]] nsIContent* GetFirstChild() {
+    mIsFirst = true;
+    mChild = nullptr;
+    mIndexInInserted = 0;
+    return GetNextChild();
+  }
+  [[nodiscard]] nsIContent* GetLastChild();
+
+  [[nodiscard]] bool ShadowDOMInvolved() const { return mShadowDOMInvolved; }
+
+  [[nodiscard]] static uint32_t GetLength(const nsINode* aParent);
+  [[nodiscard]] static Maybe<uint32_t> GetIndexOf(
+      const nsINode* aParent, const nsINode* aPossibleChild);
+  [[nodiscard]] static nsIContent* GetChildAt(const nsINode* aParent,
+                                              uint32_t aIndex);
+  [[nodiscard]] static nsIContent* GetFirstChild(const nsINode* aParent) {
+    return ChildIteratorBase(aParent).GetNextChild();
+  }
+  [[nodiscard]] static nsIContent* GetLastChild(const nsINode* aParent) {
+    return ChildIteratorBase(aParent, false).GetPreviousChild();
+  }
+
+  [[nodiscard]] static nsIContent* GetNextChild(const nsIContent* aChild) {
+    MOZ_ASSERT(aChild);
+    nsINode* const parentNode = GetParentNodeOf(*aChild);
+    if (!parentNode) {
+      return nullptr;
+    }
+    ChildIteratorBase iter(parentNode);
+    return iter.Seek(aChild) ? iter.GetNextChild() : nullptr;
+  }
+
+  [[nodiscard]] static nsIContent* GetPreviousChild(const nsIContent* aChild) {
+    MOZ_ASSERT(aChild);
+    nsINode* const parentNode = GetParentNodeOf(*aChild);
+    if (!parentNode) {
+      return nullptr;
+    }
+    ChildIteratorBase iter(parentNode);
+    return iter.Seek(aChild) ? iter.GetPreviousChild() : nullptr;
+  }
+
+  [[nodiscard]] static nsINode* GetParentNodeOf(const nsIContent& aChild);
+
+ protected:
+  const nsINode* mParentNode;
+
+  const HTMLSlotElement* mParentNodeAsSlot = nullptr;
+
+  const nsINode* mOriginalParentNode = nullptr;
+
+  nsIContent* mChild = nullptr;
+
+  bool mIsFirst = false;
+
+  uint32_t mIndexInInserted = 0u;
+
+  bool mShadowDOMInvolved = false;
+};
+
+class AllChildrenIterator : private FlattenedChildIterator {
+ public:
+  AllChildrenIterator(const nsIContent* aNode, uint32_t aFlags,
+                      bool aStartAtBeginning = true)
+      : FlattenedChildIterator(aNode, aStartAtBeginning),
+        mAnonKidsIdx(aStartAtBeginning ? UINT32_MAX : 0),
+        mFlags(aFlags),
+        mPhase(aStartAtBeginning ? Phase::AtBegin : Phase::AtEnd) {}
+
+#ifdef DEBUG
+  AllChildrenIterator(AllChildrenIterator&&) = default;
+
+  AllChildrenIterator& operator=(AllChildrenIterator&& aOther) {
+    this->~AllChildrenIterator();
+    new (this) AllChildrenIterator(std::move(aOther));
+    return *this;
+  }
+
+  ~AllChildrenIterator() { MOZ_ASSERT(!mMutationGuard.Mutated(0)); }
+#endif
+
+  nsIContent* Get() const;
+
+  const nsIContent* Parent() const { return ParentNode()->AsContent(); }
+
+  bool Seek(const nsIContent* aChildToFind);
+
+  nsIContent* GetNextChild();
+  nsIContent* GetPreviousChild();
+
+ private:
+  enum class Phase : uint8_t {
+    AtBegin,
+    AtBackdropKid,
+    AtMarkerKid,
+    AtCheckmarkKid,
+    AtBeforeKid,
+    AtFlatTreeKids,
+    AtAnonKids,
+    AtAfterKid,
+    AtPickerIconKid,
+    AtEnd
+  };
+
+  void AppendNativeAnonymousChildren();
+
+  nsTArray<nsIContent*> mAnonKids;
+  uint32_t mAnonKidsIdx;
+
+  uint32_t mFlags;
+  Phase mPhase;
+#ifdef DEBUG
+  nsMutationGuard mMutationGuard;
+#endif
+};
+
+class MOZ_NEEDS_MEMMOVABLE_MEMBERS StyleChildrenIterator
+    : private AllChildrenIterator {
+ public:
+  explicit StyleChildrenIterator(const nsIContent* aContent,
+                                 bool aStartAtBeginning = true)
+      : AllChildrenIterator(
+            aContent,
+            nsIContent::eAllChildren |
+                nsIContent::eSkipDocumentLevelNativeAnonymousContent,
+            aStartAtBeginning) {
+    MOZ_COUNT_CTOR(StyleChildrenIterator);
+  }
+
+  StyleChildrenIterator(StyleChildrenIterator&& aOther)
+      : AllChildrenIterator(std::move(aOther)) {
+    MOZ_COUNT_CTOR(StyleChildrenIterator);
+  }
+
+  StyleChildrenIterator& operator=(StyleChildrenIterator&& aOther) = default;
+
+  MOZ_COUNTED_DTOR(StyleChildrenIterator)
+
+  using AllChildrenIterator::GetNextChild;
+  using AllChildrenIterator::GetPreviousChild;
+  using AllChildrenIterator::Seek;
+
+  [[nodiscard]] static nsINode* GetParentNodeOf(const nsIContent& aChild);
+};
+
+}  
+
+#endif

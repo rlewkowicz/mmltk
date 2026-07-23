@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/MediaError.h"
+
+#include "js/Warnings.h"  // JS::WarnUTF8
+#include "jsapi.h"
+#include "mozilla/Utf8.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/HTMLMediaElement.h"
+#include "mozilla/dom/MediaErrorBinding.h"
+#include "nsContentUtils.h"
+#include "nsIScriptError.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(MediaError, mParent)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(MediaError)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(MediaError)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(MediaError)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+MediaError::MediaError(HTMLMediaElement* aParent, uint16_t aCode,
+                       const nsACString& aMessage)
+    : mParent(aParent), mCode(aCode), mMessage(aMessage) {}
+
+void MediaError::GetMessage(nsAString& aResult) const {
+  static constexpr nsLiteralCString whitelist[] = {
+      "404: Not Found"_ns
+  };
+
+  const bool shouldBlank = std::find(std::begin(whitelist), std::end(whitelist),
+                                     mMessage) == std::end(whitelist);
+
+  if (shouldBlank) {
+    nsAutoCString message =
+        nsLiteralCString(
+            "This error message will be blank when "
+            "privacy.resistFingerprinting = true."
+            "  If it is really necessary, please add it to the whitelist in"
+            " MediaError::GetMessage: ") +
+        mMessage;
+    Document* ownerDoc = mParent->OwnerDoc();
+    AutoJSAPI api;
+    if (!IsUtf8(message)) {
+      nsAutoCString utf8;
+      CopyLatin1toUTF8(message, utf8);
+      message = std::move(utf8);
+    }
+    if (api.Init(ownerDoc->GetScopeObject())) {
+      JS::WarnUTF8(api.cx(), "%s", message.get());
+    } else {
+      nsContentUtils::ReportToConsoleNonLocalized(
+          NS_ConvertUTF8toUTF16(message), nsIScriptError::warningFlag,
+          "MediaError"_ns, ownerDoc);
+    }
+
+    if (!nsContentUtils::IsCallerChrome() &&
+        ownerDoc->ShouldResistFingerprinting(RFPTarget::MediaError)) {
+      aResult.Truncate();
+      return;
+    }
+  }
+
+  CopyUTF8toUTF16(mMessage, aResult);
+}
+
+JSObject* MediaError::WrapObject(JSContext* aCx,
+                                 JS::Handle<JSObject*> aGivenProto) {
+  return MediaError_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+}  

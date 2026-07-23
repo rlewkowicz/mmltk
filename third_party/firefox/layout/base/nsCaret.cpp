@@ -1,0 +1,640 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsCaret.h"
+
+#include <algorithm>
+
+#include "SelectionMovementUtils.h"
+#include "gfxUtils.h"
+#include "mozilla/CaretAssociationHint.h"
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/StaticPrefs_bidi.h"
+#include "mozilla/dom/CharacterDataBuffer.h"
+#include "mozilla/dom/Selection.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/intl/BidiEmbeddingLevel.h"
+#include "nsBlockFrame.h"
+#include "nsCOMPtr.h"
+#include "nsContentUtils.h"
+#include "nsFontMetrics.h"
+#include "nsFrameSelection.h"
+#include "nsIBidiKeyboard.h"
+#include "nsIContent.h"
+#include "nsIFrame.h"
+#include "nsIFrameInlines.h"
+#include "nsISelectionController.h"
+#include "nsITimer.h"
+#include "nsLayoutUtils.h"
+#include "nsMenuPopupFrame.h"
+#include "nsPresContext.h"
+#include "nsTextFrame.h"
+#include "nsXULPopupManager.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using namespace mozilla::gfx;
+
+using BidiEmbeddingLevel = mozilla::intl::BidiEmbeddingLevel;
+
+static const int32_t kMinBidiIndicatorPixels = 2;
+
+nsCaret::nsCaret() = default;
+
+nsCaret::~nsCaret() { StopBlinking(); }
+
+nsresult nsCaret::Init(PresShell* aPresShell) {
+  NS_ENSURE_ARG(aPresShell);
+
+  RefPtr<Selection> selection =
+      aPresShell->GetSelection(nsISelectionController::SELECTION_NORMAL);
+  if (!selection) {
+    return NS_ERROR_FAILURE;
+  }
+
+  selection->AddSelectionListener(this);
+  mDomSelectionWeak = selection;
+  UpdateHiddenDuringSelection();
+  UpdateCaretPositionFromSelectionIfNeeded();
+
+  return NS_OK;
+}
+
+static bool DrawCJKCaret(nsIFrame* aFrame, int32_t aOffset) {
+  nsIContent* content = aFrame->GetContent();
+  const CharacterDataBuffer* characterDataBuffer =
+      content->GetCharacterDataBuffer();
+  if (!characterDataBuffer) {
+    return false;
+  }
+  if (aOffset < 0 ||
+      static_cast<uint32_t>(aOffset) >= characterDataBuffer->GetLength()) {
+    return false;
+  }
+  const char16_t ch =
+      characterDataBuffer->CharAt(AssertedCast<uint32_t>(aOffset));
+  return 0x2e80 <= ch && ch <= 0xd7ff;
+}
+
+nsCaret::Metrics nsCaret::ComputeMetrics(nsIFrame* aFrame, int32_t aOffset,
+                                         nscoord aCaretHeight) {
+  nscoord caretWidth =
+      (aCaretHeight *
+       LookAndFeel::GetFloat(LookAndFeel::FloatID::CaretAspectRatio, 0.0f)) +
+      nsPresContext::CSSPixelsToAppUnits(
+          LookAndFeel::GetInt(LookAndFeel::IntID::CaretWidth, 1));
+
+  if (DrawCJKCaret(aFrame, aOffset)) {
+    caretWidth += nsPresContext::CSSPixelsToAppUnits(1);
+  }
+  nscoord bidiIndicatorSize =
+      nsPresContext::CSSPixelsToAppUnits(kMinBidiIndicatorPixels);
+  bidiIndicatorSize = std::max(caretWidth, bidiIndicatorSize);
+
+  int32_t tpp = aFrame->PresContext()->AppUnitsPerDevPixel();
+  Metrics result;
+  result.mCaretWidth = NS_ROUND_BORDER_TO_PIXELS(caretWidth, tpp);
+  result.mBidiIndicatorSize = NS_ROUND_BORDER_TO_PIXELS(bidiIndicatorSize, tpp);
+  return result;
+}
+
+void nsCaret::Terminate() {
+
+  StopBlinking();
+  mBlinkTimer = nullptr;
+
+  if (mDomSelectionWeak) {
+    mDomSelectionWeak->RemoveSelectionListener(this);
+  }
+  mDomSelectionWeak = nullptr;
+  mCaretPosition = {};
+}
+
+NS_IMPL_ISUPPORTS(nsCaret, nsISelectionListener)
+
+Selection* nsCaret::GetSelection() { return mDomSelectionWeak; }
+
+void nsCaret::SetSelection(Selection* aDOMSel) {
+  MOZ_ASSERT(aDOMSel);
+  mDomSelectionWeak = aDOMSel;
+  UpdateHiddenDuringSelection();
+  UpdateCaretPositionFromSelectionIfNeeded();
+  ResetBlinking();
+  SchedulePaint();
+}
+
+void nsCaret::SetVisible(bool aVisible) {
+  const bool wasVisible = mVisible;
+  mVisible = aVisible;
+  if (mVisible != wasVisible) {
+    CaretVisibilityMaybeChanged();
+  }
+}
+
+bool nsCaret::IsVisible() const { return mVisible && !mHideCount; }
+
+void nsCaret::CaretVisibilityMaybeChanged() {
+  ResetBlinking();
+  SchedulePaint();
+  if (IsVisible()) {
+    UpdateCaretPositionFromSelectionIfNeeded();
+  }
+}
+
+void nsCaret::AddForceHide() {
+  MOZ_ASSERT(mHideCount < UINT32_MAX);
+  if (++mHideCount > 1) {
+    return;
+  }
+  CaretVisibilityMaybeChanged();
+}
+
+void nsCaret::RemoveForceHide() {
+  if (!mHideCount || --mHideCount) {
+    return;
+  }
+  CaretVisibilityMaybeChanged();
+}
+
+void nsCaret::SetCaretReadOnly(bool aReadOnly) {
+  mReadOnly = aReadOnly;
+  ResetBlinking();
+  SchedulePaint();
+}
+
+static nsPoint AdjustRectForClipping(const nsRect& aRect, nsIFrame* aFrame,
+                                     bool aVertical) {
+  nsRect rectRelativeToClip = aRect;
+  ScrollContainerFrame* sf = nullptr;
+  for (nsIFrame* current = aFrame; current; current = current->GetParent()) {
+    if ((sf = do_QueryFrame(current))) {
+      break;
+    }
+    if (current->IsTransformed()) {
+      break;
+    }
+    rectRelativeToClip += current->GetPosition();
+  }
+
+  if (!sf) {
+    return {};
+  }
+
+  nsRect clipRect = sf->GetScrollPortRect();
+  nsPoint offset;
+  if (aVertical) {
+    nscoord overflow = rectRelativeToClip.YMost() - clipRect.YMost();
+    if (overflow > 0) {
+      offset.y -= overflow;
+    } else {
+      overflow = rectRelativeToClip.y - clipRect.y;
+      if (overflow < 0) {
+        offset.y -= overflow;
+      }
+    }
+  } else {
+    nscoord overflow = rectRelativeToClip.XMost() - clipRect.XMost();
+    if (overflow > 0) {
+      offset.x -= overflow;
+    } else {
+      overflow = rectRelativeToClip.x - clipRect.x;
+      if (overflow < 0) {
+        offset.x -= overflow;
+      }
+    }
+  }
+  return offset;
+}
+
+nsRect nsCaret::GetGeometryForFrame(nsIFrame* aFrame, int32_t aFrameOffset,
+                                    nscoord* aBidiIndicatorSize) {
+  nsPoint framePos(0, 0);
+  nsRect rect;
+  nsresult rv = aFrame->GetPointFromOffset(aFrameOffset, &framePos);
+  if (NS_FAILED(rv)) {
+    if (aBidiIndicatorSize) {
+      *aBidiIndicatorSize = 0;
+    }
+    return rect;
+  }
+
+  nsIFrame* frame = aFrame->GetContentInsertionFrame();
+  if (!frame) {
+    frame = aFrame;
+  }
+  NS_ASSERTION(!frame->HasAnyStateBits(NS_FRAME_IN_REFLOW),
+               "We should not be in the middle of reflow");
+  WritingMode wm = aFrame->GetWritingMode();
+  RefPtr<nsFontMetrics> fm =
+      nsLayoutUtils::GetInflatedFontMetricsForFrame(aFrame);
+  const auto caretBlockAxisMetrics = frame->GetCaretBlockAxisMetrics(wm, *fm);
+  const bool vertical = wm.IsVertical();
+  Metrics caretMetrics =
+      ComputeMetrics(aFrame, aFrameOffset, caretBlockAxisMetrics.mExtent);
+
+  nscoord inlineOffset = 0;
+  if (nsTextFrame* textFrame = do_QueryFrame(aFrame)) {
+    if (gfxTextRun* textRun = textFrame->GetTextRun(nsTextFrame::eInflated)) {
+      const bool textRunDirIsReverseOfFrame =
+          wm.IsInlineReversed() != textRun->IsInlineReversed();
+      if (textRunDirIsReverseOfFrame != textRun->IsSidewaysLeft()) {
+        inlineOffset = wm.IsBidiLTR() ? -caretMetrics.mCaretWidth
+                                      : caretMetrics.mCaretWidth;
+      }
+    }
+  }
+
+  if (aFrame->StyleVisibility()->mDirection == StyleDirection::Rtl) {
+    if (vertical) {
+      inlineOffset -= caretMetrics.mCaretWidth;
+    } else {
+      inlineOffset -= caretMetrics.mCaretWidth;
+    }
+  }
+
+  if (vertical) {
+    framePos.x = caretBlockAxisMetrics.mOffset;
+    framePos.y += inlineOffset;
+  } else {
+    framePos.x += inlineOffset;
+    framePos.y = caretBlockAxisMetrics.mOffset;
+  }
+
+  rect = nsRect(framePos, vertical ? nsSize(caretBlockAxisMetrics.mExtent,
+                                            caretMetrics.mCaretWidth)
+                                   : nsSize(caretMetrics.mCaretWidth,
+                                            caretBlockAxisMetrics.mExtent));
+
+  rect.MoveBy(AdjustRectForClipping(rect, aFrame, vertical));
+  if (aBidiIndicatorSize) {
+    *aBidiIndicatorSize = caretMetrics.mBidiIndicatorSize;
+  }
+  return rect;
+}
+
+auto nsCaret::CaretPositionFor(const Selection* aSelection) -> CaretPosition {
+  if (!aSelection) {
+    return {};
+  }
+  const nsFrameSelection* frameSelection = aSelection->GetFrameSelection();
+  if (!frameSelection) {
+    return {};
+  }
+  nsINode* node = aSelection->GetFocusNode();
+  if (!node) {
+    return {};
+  }
+  return {
+      node,
+      int32_t(aSelection->FocusOffset()),
+      frameSelection->GetHint(),
+      frameSelection->GetCaretBidiLevel(),
+  };
+}
+
+CaretFrameData nsCaret::GetFrameAndOffset(const CaretPosition& aPosition) {
+  nsINode* focusNode = aPosition.mContent;
+  int32_t focusOffset = aPosition.mOffset;
+
+  if (!focusNode || !focusNode->IsContent()) {
+    return {};
+  }
+
+  nsIContent* contentNode = focusNode->AsContent();
+  return SelectionMovementUtils::GetCaretFrameForNodeOffset(
+      nullptr, contentNode, focusOffset, aPosition.mHint, aPosition.mBidiLevel,
+      ForceEditableRegion::No);
+}
+
+nsIFrame* nsCaret::GetGeometry(const Selection* aSelection, nsRect* aRect) {
+  auto data = GetFrameAndOffset(CaretPositionFor(aSelection));
+  if (data.mFrame) {
+    *aRect =
+        GetGeometryForFrame(data.mFrame, data.mOffsetInFrameContent, nullptr);
+  }
+  return data.mFrame;
+}
+
+[[nodiscard]] static nsIFrame* GetContainingBlockIfNeeded(nsIFrame* aFrame) {
+  for (auto* f = aFrame; f; f = f->GetContainingBlock()) {
+    if (f->Style()->GetPseudoType() ==
+        PseudoStyleType::MozTextControlEditingRoot) {
+      continue;
+    }
+    if (f != aFrame || f->IsBlockOutside() || f->IsBlockFrameOrSubclass()) {
+      return f == aFrame ? nullptr : f;
+    }
+  }
+  return nullptr;
+}
+
+void nsCaret::SchedulePaint() {
+  if (mLastPaintedFrame) {
+    mLastPaintedFrame->SchedulePaint();
+    mLastPaintedFrame = nullptr;
+  }
+  auto data = GetFrameAndOffset(mCaretPosition);
+  if (!data.mFrame) {
+    return;
+  }
+  nsIFrame* frame = data.mFrame;
+  if (nsIFrame* cb = GetContainingBlockIfNeeded(frame)) {
+    frame = cb;
+  }
+  frame->SchedulePaint();
+}
+
+void nsCaret::SetVisibilityDuringSelection(bool aVisibility) {
+  if (mShowDuringSelection == aVisibility) {
+    return;
+  }
+  mShowDuringSelection = aVisibility;
+  UpdateHiddenDuringSelection();
+  SchedulePaint();
+}
+
+void nsCaret::UpdateCaretPositionFromSelectionIfNeeded() {
+  if (mFixedCaretPosition) {
+    return;
+  }
+  CaretPosition newPos = CaretPositionFor(GetSelection());
+  if (newPos == mCaretPosition) {
+    return;
+  }
+  mCaretPosition = std::move(newPos);
+  SchedulePaint();
+}
+
+void nsCaret::SetCaretPosition(nsINode* aNode, int32_t aOffset) {
+  mFixedCaretPosition = !!aNode;
+  if (mFixedCaretPosition) {
+    mCaretPosition = {aNode, aOffset};
+    SchedulePaint();
+  } else {
+    UpdateCaretPositionFromSelectionIfNeeded();
+  }
+  ResetBlinking();
+}
+
+void nsCaret::CheckSelectionLanguageChange() {
+  if (!StaticPrefs::bidi_browser_ui()) {
+    return;
+  }
+
+  bool isKeyboardRTL = false;
+  nsIBidiKeyboard* bidiKeyboard = nsContentUtils::GetBidiKeyboard();
+  if (bidiKeyboard) {
+    bidiKeyboard->IsLangRTL(&isKeyboardRTL);
+  }
+  Selection* selection = GetSelection();
+  if (selection) {
+    selection->SelectionLanguageChange(isKeyboardRTL);
+  }
+}
+
+[[nodiscard]] static nsIFrame* MapToContainingBlock(nsIFrame* aFrame,
+                                                    nsRect* aCaretRect,
+                                                    nsRect* aHookRect) {
+  nsIFrame* containingBlock = GetContainingBlockIfNeeded(aFrame);
+  if (!containingBlock) {
+    return aFrame;
+  }
+
+  if (aCaretRect) {
+    *aCaretRect = nsLayoutUtils::TransformFrameRectToAncestor(
+        aFrame, *aCaretRect, containingBlock);
+  }
+  if (aHookRect) {
+    *aHookRect = nsLayoutUtils::TransformFrameRectToAncestor(aFrame, *aHookRect,
+                                                             containingBlock);
+  }
+  return containingBlock;
+}
+
+nsIFrame* nsCaret::GetPaintGeometry(nsRect* aCaretRect, nsRect* aHookRect,
+                                    nscolor* aCaretColor) {
+  MOZ_ASSERT(!!aCaretRect == !!aHookRect);
+
+  if (!IsVisible() || !mIsBlinkOn) {
+    return nullptr;
+  }
+
+  CheckSelectionLanguageChange();
+
+  auto data = GetFrameAndOffset(mCaretPosition);
+  MOZ_ASSERT(!!data.mFrame == !!data.mUnadjustedFrame);
+  if (!data.mFrame) {
+    return nullptr;
+  }
+
+  nsIFrame* frame = data.mFrame;
+  nsIFrame* unadjustedFrame = data.mUnadjustedFrame;
+  int32_t frameOffset(data.mOffsetInFrameContent);
+  if (unadjustedFrame->IsContentDisabled()) {
+    return nullptr;
+  }
+
+  if (frame->IsTextFrame()) {
+    auto [startOffset, endOffset] = frame->GetOffsets();
+    if (startOffset > frameOffset || endOffset < frameOffset) {
+      return nullptr;
+    }
+  }
+
+  if (aCaretColor) {
+    *aCaretColor = frame->GetCaretColorAt(frameOffset);
+  }
+
+  if (aCaretRect || aHookRect) {
+    ComputeCaretRects(frame, frameOffset, aCaretRect, aHookRect);
+  }
+  return MapToContainingBlock(frame, aCaretRect, aHookRect);
+}
+
+nsIFrame* nsCaret::GetPaintGeometry() {
+  return GetPaintGeometry(nullptr, nullptr);
+}
+
+nsIFrame* nsCaret::GetPaintGeometry(nsRect* aRect) {
+  nsRect caretRect;
+  nsRect hookRect;
+  nsIFrame* frame = GetPaintGeometry(&caretRect, &hookRect);
+  aRect->UnionRect(caretRect, hookRect);
+  return frame;
+}
+
+void nsCaret::PaintCaret(DrawTarget& aDrawTarget, nsIFrame* aForFrame,
+                         const nsPoint& aOffset) {
+  nsRect caretRect;
+  nsRect hookRect;
+  nscolor color;
+  nsIFrame* frame = GetPaintGeometry(&caretRect, &hookRect, &color);
+  MOZ_ASSERT(frame == aForFrame, "We're referring different frame");
+
+  if (!frame) {
+    return;
+  }
+
+  int32_t appUnitsPerDevPixel = frame->PresContext()->AppUnitsPerDevPixel();
+  Rect devPxCaretRect = NSRectToSnappedRect(caretRect + aOffset,
+                                            appUnitsPerDevPixel, aDrawTarget);
+  Rect devPxHookRect =
+      NSRectToSnappedRect(hookRect + aOffset, appUnitsPerDevPixel, aDrawTarget);
+
+  ColorPattern pattern(ToDeviceColor(color));
+  aDrawTarget.FillRect(devPxCaretRect, pattern);
+  if (!hookRect.IsEmpty()) {
+    aDrawTarget.FillRect(devPxHookRect, pattern);
+  }
+}
+
+NS_IMETHODIMP
+nsCaret::NotifySelectionChanged(Document*, Selection* aDomSel, int16_t aReason,
+                                int32_t aAmount) {
+  if (mDomSelectionWeak != aDomSel) {
+    return NS_OK;
+  }
+
+  UpdateHiddenDuringSelection();
+
+  if (IsVisible()) {
+    UpdateCaretPositionFromSelectionIfNeeded();
+    ResetBlinking();
+  }
+
+  return NS_OK;
+}
+
+void nsCaret::UpdateHiddenDuringSelection() {
+  const bool shouldShowCaret = mShowDuringSelection || !mDomSelectionWeak ||
+                               mDomSelectionWeak->IsCollapsed();
+  if (!shouldShowCaret == mHiddenDuringSelection) {
+    return;
+  }
+  if (shouldShowCaret) {
+    RemoveForceHide();
+  } else {
+    AddForceHide();
+  }
+  mHiddenDuringSelection = !shouldShowCaret;
+}
+
+void nsCaret::ResetBlinking() {
+  static const auto kBlinkTimerSlack = TimeDuration::FromMilliseconds(50);
+  const bool wasBlinkOn = mIsBlinkOn;
+  mIsBlinkOn = true;
+
+  if (mReadOnly || !IsVisible()) {
+    StopBlinking();
+    return;
+  }
+
+  const int32_t oldBlinkTime = mBlinkTime;
+  mBlinkTime = LookAndFeel::CaretBlinkTime();
+  if (mBlinkTime <= 0) {
+    StopBlinking();
+    return;
+  }
+
+  if (!wasBlinkOn) {
+    SchedulePaint();
+  }
+
+  mBlinkCount = LookAndFeel::CaretBlinkCount();
+
+  const auto now = TimeStamp::NowLoRes();
+  const bool mustResetTimer = mBlinkTime != oldBlinkTime ||
+                              mLastBlinkTimerReset.IsNull() ||
+                              (now - mLastBlinkTimerReset) > kBlinkTimerSlack;
+  if (!mustResetTimer) {
+    return;
+  }
+
+  if (!mBlinkTimer) {
+    mBlinkTimer = NS_NewTimer();
+  }
+  mLastBlinkTimerReset = now;
+  mBlinkTimer->InitWithNamedFuncCallback(CaretBlinkCallback, this, mBlinkTime,
+                                         nsITimer::TYPE_REPEATING_SLACK,
+                                         "CaretBlinkCallback"_ns);
+}
+
+void nsCaret::StopBlinking() {
+  if (mBlinkTimer) {
+    mBlinkTimer->Cancel();
+    mLastBlinkTimerReset = TimeStamp();
+  }
+}
+
+size_t nsCaret::SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+  size_t total = aMallocSizeOf(this);
+  if (mBlinkTimer) {
+    total += mBlinkTimer->SizeOfIncludingThis(aMallocSizeOf);
+  }
+  return total;
+}
+
+void nsCaret::ComputeCaretRects(nsIFrame* aFrame, int32_t aFrameOffset,
+                                nsRect* aCaretRect, nsRect* aHookRect) {
+  MOZ_ASSERT(aCaretRect && aHookRect);
+  NS_ASSERTION(aFrame, "Should have a frame here");
+
+  WritingMode wm = aFrame->GetWritingMode();
+  bool isVertical = wm.IsVertical();
+
+  nscoord bidiIndicatorSize;
+  *aCaretRect = GetGeometryForFrame(aFrame, aFrameOffset, &bidiIndicatorSize);
+
+  aHookRect->SetEmpty();
+  if (!StaticPrefs::bidi_browser_ui()) {
+    return;
+  }
+
+  bool isCaretRTL;
+  nsIBidiKeyboard* bidiKeyboard = nsContentUtils::GetBidiKeyboard();
+  if (bidiKeyboard && NS_SUCCEEDED(bidiKeyboard->IsLangRTL(&isCaretRTL))) {
+    if (isVertical) {
+      if (wm.IsSidewaysLR()) {
+        aHookRect->SetRect(aCaretRect->x + bidiIndicatorSize,
+                           aCaretRect->y + (!isCaretRTL ? bidiIndicatorSize * -1
+                                                        : aCaretRect->height),
+                           aCaretRect->height, bidiIndicatorSize);
+      } else {
+        aHookRect->SetRect(aCaretRect->XMost() - bidiIndicatorSize,
+                           aCaretRect->y + (isCaretRTL ? bidiIndicatorSize * -1
+                                                       : aCaretRect->height),
+                           aCaretRect->height, bidiIndicatorSize);
+      }
+    } else {
+      aHookRect->SetRect(aCaretRect->x + (isCaretRTL ? bidiIndicatorSize * -1
+                                                     : aCaretRect->width),
+                         aCaretRect->y + bidiIndicatorSize, bidiIndicatorSize,
+                         aCaretRect->width);
+    }
+  }
+}
+
+void nsCaret::CaretBlinkCallback(nsITimer* aTimer, void* aClosure) {
+  nsCaret* theCaret = static_cast<nsCaret*>(aClosure);
+  if (!theCaret) {
+    return;
+  }
+  theCaret->mLastBlinkTimerReset = TimeStamp();
+  theCaret->mIsBlinkOn = !theCaret->mIsBlinkOn;
+  theCaret->SchedulePaint();
+
+  if (theCaret->mBlinkCount == -1) {
+    return;
+  }
+
+  if (theCaret->mIsBlinkOn) {
+    if (--theCaret->mBlinkCount <= 0) {
+      theCaret->StopBlinking();
+    }
+  }
+}

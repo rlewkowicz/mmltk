@@ -1,0 +1,575 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+
+import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
+
+const lazy = {};
+
+XPCOMUtils.defineLazyServiceGetter(
+  lazy,
+  "IDNService",
+  "@mozilla.org/network/idn-service;1",
+  Ci.nsIIDNService
+);
+
+ChromeUtils.defineLazyGetter(lazy, "CatManListenerManager", () => {
+  const CatManListenerManager = {
+    cachedModules: {},
+    cachedListeners: {},
+    observe(_subject, _topic, categoryName) {
+      delete this.cachedListeners[categoryName];
+    },
+    getListeners(categoryName) {
+      if (Object.hasOwn(this.cachedListeners, categoryName)) {
+        return this.cachedListeners[categoryName];
+      }
+      let rv = Array.from(
+        Services.catMan.enumerateCategory(categoryName),
+        ({ data: entry, value }) => {
+          try {
+            let module = entry.replace(/#.*$/, "");
+            let [objName, method] = value.split(".");
+            let fn = (jsGlobal, ...args) => {
+              let obj;
+              if (module.endsWith(".js")) {
+                if (!jsGlobal) {
+                  throw new Error(
+                    `jsGlobal must be provided to load ${objName} from ${module}.`
+                  );
+                }
+                obj = jsGlobal[objName];
+                if (!obj) {
+                  throw new Error(
+                    `Could not access ${objName} from ${module}. ` +
+                      `Did you forget to define a lazy getter for ${objName} on the global?`
+                  );
+                }
+              } else {
+                if (!Object.hasOwn(this.cachedModules, module)) {
+                  this.cachedModules[module] =
+                    ChromeUtils.importESModule(module);
+                }
+                obj = this.cachedModules[module][objName];
+              }
+              if (!obj) {
+                throw new Error(
+                  `Could not access ${objName} in ${module}. Is it exported?`
+                );
+              }
+              if (typeof obj[method] != "function") {
+                throw new Error(
+                  `${objName}.${method} in ${module} is not a function.`
+                );
+              }
+              return obj[method](...args);
+            };
+            fn._descriptiveName = value;
+            return fn;
+          } catch (ex) {
+            console.error(
+              `Error processing category manifest for ${entry}: ${value}`,
+              ex
+            );
+            return null;
+          }
+        }
+      );
+      rv = rv.filter(l => !!l);
+      this.cachedListeners[categoryName] = rv;
+      return rv;
+    },
+  };
+  Services.obs.addObserver(
+    CatManListenerManager,
+    "xpcom-category-entry-removed"
+  );
+  Services.obs.addObserver(CatManListenerManager, "xpcom-category-entry-added");
+  Services.obs.addObserver(CatManListenerManager, "xpcom-category-cleared");
+  return CatManListenerManager;
+});
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  lazy,
+  "INVALID_SHAREABLE_SCHEMES",
+  "services.sync.engine.tabs.filteredSchemes",
+  "",
+  null,
+  val => {
+    return new Set(val.split("|"));
+  }
+);
+
+ChromeUtils.defineLazyGetter(lazy, "gLocalization", () => {
+  return new Localization(["toolkit/global/browser-utils.ftl"], true);
+});
+
+function stringPrefToSet(prefVal) {
+  return new Set(
+    prefVal
+      .toLowerCase()
+      .split(/\s*,\s*/g) 
+      .filter(v => !!v) 
+  );
+}
+
+export var BrowserUtils = {
+  principalWithMatchingOA(principal, existingPrincipal) {
+    if (principal.isSystemPrincipal) {
+      return principal;
+    }
+
+    if (existingPrincipal.originSuffix == principal.originSuffix) {
+      return principal;
+    }
+
+    let secMan = Services.scriptSecurityManager;
+    if (principal.isContentPrincipal) {
+      return secMan.principalWithOA(
+        principal,
+        existingPrincipal.originAttributes
+      );
+    }
+
+    if (principal.isNullPrincipal) {
+      return secMan.createNullPrincipal(existingPrincipal.originAttributes);
+    }
+    throw new Error(
+      "Can't change the originAttributes of an expanded principal!"
+    );
+  },
+
+  copyLink(url, title) {
+    this.copyLinks([{ url, title }]);
+  },
+
+  copyLinks(links) {
+    let htmlEscape = s =>
+      s
+        .replace(/&/g, "&amp;")
+        .replace(/>/g, "&gt;")
+        .replace(/</g, "&lt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&apos;");
+
+    let mozURLData = links
+      .map(({ url, title }) => `${url}\n${title}`)
+      .join("\n");
+    let htmlData = links
+      .map(({ url, title }) => `<A HREF="${url}">${htmlEscape(title)}</A>`)
+      .join("<BR>\n");
+    let textData = links.map(({ url }) => url).join("\n");
+
+    let xferable = Cc["@mozilla.org/widget/transferable;1"].createInstance(
+      Ci.nsITransferable
+    );
+    xferable.init(null);
+
+    for (let [type, data] of [
+      ["text/x-moz-url", mozURLData],
+      ["text/html", htmlData],
+      ["text/plain", textData],
+    ]) {
+      let str = Cc["@mozilla.org/supports-string;1"].createInstance(
+        Ci.nsISupportsString
+      );
+      str.data = data;
+      xferable.addDataFlavor(type);
+      xferable.setTransferData(type, str);
+    }
+
+    Services.clipboard.setData(
+      xferable,
+      null,
+      Ci.nsIClipboard.kGlobalClipboard
+    );
+  },
+
+  copyImageToClipboard(arrayBuffer) {
+    const imageTools = Cc["@mozilla.org/image/tools;1"].getService(
+      Ci.imgITools
+    );
+
+    const imgDecoded = imageTools.decodeImageFromArrayBuffer(
+      arrayBuffer,
+      "image/png"
+    );
+
+    const transferable = Cc[
+      "@mozilla.org/widget/transferable;1"
+    ].createInstance(Ci.nsITransferable);
+    transferable.init(null);
+    transferable.addDataFlavor("application/x-moz-nativeimage");
+    transferable.setTransferData("application/x-moz-nativeimage", imgDecoded);
+
+    Services.clipboard.setData(
+      transferable,
+      null,
+      Services.clipboard.kGlobalClipboard
+    );
+  },
+
+  mimeTypeIsTextBased(mimeType) {
+    return (
+      mimeType.startsWith("text/") ||
+      mimeType.endsWith("+xml") ||
+      mimeType.endsWith("+json") ||
+      mimeType == "application/x-javascript" ||
+      mimeType == "application/javascript" ||
+      mimeType == "application/json" ||
+      mimeType == "application/xml"
+    );
+  },
+
+  canFindInPage(location) {
+    return (
+      !location.startsWith("about:preferences") &&
+      !location.startsWith("about:settings") &&
+      !location.startsWith("about:logins") &&
+      !location.startsWith("about:firefoxview")
+    );
+  },
+
+  isFindbarVisible(docShell) {
+    const FINDER_SYS_MJS = "resource://gre/modules/Finder.sys.mjs";
+    return (
+      Cu.isESModuleLoaded(FINDER_SYS_MJS) &&
+      ChromeUtils.importESModule(FINDER_SYS_MJS).Finder.isFindbarVisible(
+        docShell
+      )
+    );
+  },
+
+  promiseObserved(topic, test = () => true) {
+    return new Promise(resolve => {
+      let observer = (subject, _topic, data) => {
+        if (test(subject, data)) {
+          Services.obs.removeObserver(observer, topic);
+          resolve({ subject, data });
+        }
+      };
+      Services.obs.addObserver(observer, topic);
+    });
+  },
+
+  formatURIStringForDisplay(uriString, options = {}) {
+    try {
+      return this.formatURIForDisplay(Services.io.newURI(uriString), options);
+    } catch (ex) {
+      return uriString;
+    }
+  },
+
+  formatURIForDisplay(uri, options = {}) {
+    let {
+      showInsecureHTTP = false,
+      showWWW = false,
+      onlyBaseDomain = false,
+      showFilenameForLocalURIs = false,
+    } = options;
+    if (uri && uri instanceof Ci.nsINestedURI && showFilenameForLocalURIs) {
+      return this.formatURIForDisplay(uri.innermostURI, options);
+    }
+    switch (uri.scheme) {
+      case "view-source": {
+        let innerURI = uri.spec.substring("view-source:".length);
+        return this.formatURIStringForDisplay(innerURI, options);
+      }
+      case "http":
+      case "https": {
+        let host = uri.displayHostPort;
+        let removeSubdomains =
+          !showInsecureHTTP &&
+          (onlyBaseDomain || (!showWWW && host.startsWith("www.")));
+        if (removeSubdomains) {
+          try {
+            host = lazy.IDNService.domainToDisplay(
+              Services.eTLD.getSchemelessSite(uri)
+            );
+          } catch (ex) {
+            console.error(ex);
+            host = uri.host;
+          }
+          if (uri.port != -1) {
+            host += ":" + uri.port;
+          }
+        }
+        if (showInsecureHTTP && uri.scheme == "http") {
+          return "http://" + host;
+        }
+        return host;
+      }
+      case "about":
+        return "about:" + uri.filePath;
+      case "blob":
+        try {
+          let url = URL.fromURI(uri);
+          if (url.origin && url.origin != "null") {
+            return this.formatURIStringForDisplay(url.origin, options);
+          }
+          // otherwise, fall through...
+        } catch (ex) {
+          console.error("Invalid blob URI passed to formatURIForDisplay: ", ex);
+        }
+      /* For blob URIs without an origin, fall through and use the data URI
+       * logic (shows just "(data)", localized). */
+      case "data":
+        return lazy.gLocalization.formatValueSync("browser-utils-url-data");
+      case "chrome":
+      case "resource":
+      case "moz-icon":
+      case "moz-src":
+      case "jar":
+      case "file":
+        if (!showFilenameForLocalURIs) {
+          if (uri.scheme == "file") {
+            return lazy.gLocalization.formatValueSync(
+              "browser-utils-file-scheme"
+            );
+          }
+          return lazy.gLocalization.formatValueSync(
+            "browser-utils-url-scheme",
+            { scheme: uri.scheme }
+          );
+        }
+      // Otherwise, fall through to show filename...
+      default:
+        try {
+          let url = uri.QueryInterface(Ci.nsIURL);
+          if (url.fileName) {
+            return url.fileName;
+          }
+          if (url.directory) {
+            let parts = url.directory.split("/");
+            let last;
+            while (!last && parts.length) {
+              last = parts.pop();
+            }
+            if (last) {
+              return last;
+            }
+          }
+        } catch (ex) {
+          console.error(ex);
+        }
+    }
+    return uri.spec;
+  },
+
+  getShareableURL(url) {
+    if (!url) {
+      return null;
+    }
+
+    if (url.spec.length > 65535) {
+      return null;
+    }
+    return lazy.INVALID_SHAREABLE_SCHEMES.has(url.scheme) ? null : url;
+  },
+
+  hrefAndLinkNodeForClickEvent(event) {
+    let content = event.view || event.composedTarget?.documentGlobal;
+    if (!content?.HTMLAnchorElement) {
+      return null;
+    }
+    function hrefAndLinkNodeForHTMLLink(aElement) {
+      if (
+        (content.HTMLAnchorElement.isInstance(aElement) && aElement.href) ||
+        (content.HTMLAreaElement.isInstance(aElement) && aElement.href) ||
+        content.HTMLLinkElement.isInstance(aElement)
+      ) {
+        let href = URL.parse(aElement.href)?.href ?? null;
+        if (href) {
+          return [href, aElement, aElement.ownerDocument.nodePrincipal];
+        }
+      }
+      return null;
+    }
+    function hrefAndLinkNodeForNonHTMLink(aElement) {
+      if (
+        aElement.localName == "a" ||
+        (content.MathMLElement.isInstance(aElement) &&
+          !Services.prefs.getBoolPref(
+            "mathml.href_link_on_non_anchor_element.disabled"
+          ))
+      ) {
+        let href =
+          aElement.getAttribute("href") ||
+          aElement.getAttributeNS("http://www.w3.org/1999/xlink", "href");
+        href =
+          URL.parse(href, aElement.ownerDocument.baseURIObject.spec)?.href ??
+          null;
+        if (href) {
+          return [href, null, aElement.ownerDocument.nodePrincipal];
+        }
+      }
+      return null;
+    }
+
+    let node = event.composedTarget;
+    while (node) {
+      if (node.nodeType == node.ELEMENT_NODE) {
+        let linkData =
+          hrefAndLinkNodeForHTMLLink(node) ||
+          hrefAndLinkNodeForNonHTMLink(node);
+        if (linkData) {
+          return linkData;
+        }
+      }
+      node = node.flattenedTreeParentNode;
+    }
+    return [null, null, null];
+  },
+
+  whereToOpenLink(e, ignoreButton, ignoreAlt) {
+    if (!e) {
+      return "current";
+    }
+
+    e = this.getRootEvent(e);
+
+    var shift = e.shiftKey;
+    var ctrl = e.ctrlKey;
+    var meta = e.metaKey;
+    var alt = e.altKey && !ignoreAlt;
+
+    let middle = !ignoreButton && e.button == 1;
+    let middleUsesTabs = Services.prefs.getBoolPref(
+      "browser.tabs.opentabfor.middleclick",
+      true
+    );
+    let middleUsesNewWindow = Services.prefs.getBoolPref(
+      "middlemouse.openNewWindow",
+      false
+    );
+
+
+
+    var metaKey = AppConstants.platform == "macosx" ? meta : ctrl;
+    if (metaKey || (middle && middleUsesTabs)) {
+      return shift ? "tabshifted" : "tab";
+    }
+
+    if (alt && Services.prefs.getBoolPref("browser.altClickSave", false)) {
+      return "save";
+    }
+
+    if (shift || (middle && !middleUsesTabs && middleUsesNewWindow)) {
+      return "window";
+    }
+
+    return "current";
+  },
+
+  willLoadInBackground(
+    where,
+    { inBackground = null, forceForeground = null } = {}
+  ) {
+    switch (where) {
+      case "tab":
+      case "tabshifted": {
+        let loadInBackground = inBackground;
+        if (loadInBackground == null) {
+          loadInBackground = forceForeground
+            ? false
+            : Services.prefs.getBoolPref("browser.tabs.loadInBackground");
+        }
+        return where == "tabshifted" ? !loadInBackground : loadInBackground;
+      }
+    }
+
+    return false;
+  },
+
+  getRootEvent(aEvent) {
+    if (!aEvent) {
+      return aEvent;
+    }
+    let tempEvent = aEvent;
+    while (tempEvent.sourceEvent) {
+      if (tempEvent.sourceEvent.button == 1) {
+        aEvent = tempEvent.sourceEvent;
+        break;
+      }
+      tempEvent = tempEvent.sourceEvent;
+    }
+    return aEvent;
+  },
+
+  callModulesFromCategory(
+    {
+      categoryName,
+      idleDispatch = false,
+      failureHandler = null,
+      jsGlobal = null,
+    },
+    ...args
+  ) {
+    let callSingleListener = async fn => {
+      try {
+        await fn(jsGlobal, ...args);
+      } catch (ex) {
+        console.error(
+          `Error in processing ${categoryName} for ${fn._descriptiveName}`
+        );
+        console.error(ex);
+        try {
+          await failureHandler?.(ex);
+        } catch (nestedEx) {
+          console.error(`Error in handling failure: ${nestedEx}`);
+          if (BrowserUtils._inAutomation) {
+            Cc["@mozilla.org/xpcom/debug;1"]
+              .getService(Ci.nsIDebug2)
+              .abort(
+                nestedEx.filename || nestedEx.fileName,
+                nestedEx.lineNumber
+              );
+          }
+        }
+      }
+    };
+
+    let allTasks = [];
+
+    for (let listener of lazy.CatManListenerManager.getListeners(
+      categoryName
+    )) {
+      if (idleDispatch) {
+        allTasks.push(
+          new Promise(resolve => {
+            ChromeUtils.idleDispatch(() => {
+              resolve(callSingleListener(listener));
+            });
+          })
+        );
+      } else {
+        allTasks.push(callSingleListener(listener));
+      }
+    }
+
+    return Promise.allSettled(allTasks);
+  },
+
+  sendToDeviceEmailsSupported() {
+    const userLocale = Services.locale.appLocaleAsBCP47.toLowerCase();
+    return this.emailSupportedLocales.has(userLocale);
+  },
+};
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  BrowserUtils,
+  "navigationRequireUserInteraction",
+  "browser.navigation.requireUserInteraction",
+  false
+);
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  BrowserUtils,
+  "emailSupportedLocales",
+  "browser.send_to_device_locales",
+  "de,en-GB,en-US,es-AR,es-CL,es-ES,es-MX,fr,id,pl,pt-BR,ru,zh-TW",
+  null,
+  stringPrefToSet
+);

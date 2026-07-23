@@ -1,0 +1,175 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_NurseryAwareHashMap_h
+#define gc_NurseryAwareHashMap_h
+
+#include "gc/Barrier.h"
+#include "gc/Tracer.h"
+#include "js/GCHashTable.h"
+#include "js/GCPolicyAPI.h"
+#include "js/GCVector.h"
+#include "js/Utility.h"
+
+namespace js {
+
+namespace detail {
+
+
+DEFINE_BARRIERED_PTR(UnsafeBareWeakHeapPtr, gc::BarrierOption_ReadBarrier);
+
+}  
+
+enum : bool { DuplicatesNotPossible, DuplicatesPossible };
+
+template <typename Key, typename Value, typename AllocPolicy = TempAllocPolicy,
+          bool AllowDuplicates = DuplicatesNotPossible>
+class NurseryAwareHashMap {
+  using MapKey = UnsafeBarePtr<Key>;
+  using MapValue = detail::UnsafeBareWeakHeapPtr<Value>;
+  using HashPolicy = DefaultHasher<MapKey>;
+  using MapType = GCRekeyableHashMap<MapKey, MapValue, HashPolicy, AllocPolicy>;
+  MapType map;
+
+  using KeyVector = GCVector<Key, 0, AllocPolicy>;
+  KeyVector nurseryEntries;
+
+ public:
+  using Lookup = typename MapType::Lookup;
+  using Ptr = typename MapType::Ptr;
+  using Iterator = typename MapType::Iterator;
+  using ModIterator = typename MapType::ModIterator;
+  using Entry = typename MapType::Entry;
+
+  explicit NurseryAwareHashMap(AllocPolicy a = AllocPolicy())
+      : map(a), nurseryEntries(std::move(a)) {}
+  explicit NurseryAwareHashMap(size_t length) : map(length) {}
+  NurseryAwareHashMap(AllocPolicy a, size_t length)
+      : map(a, length), nurseryEntries(std::move(a)) {}
+
+  bool empty() const { return map.empty(); }
+  Ptr lookup(const Lookup& l) const { return map.lookup(l); }
+  void remove(Ptr p) { map.remove(p); }
+  Iterator iter() const { return map.iter(); }
+  ModIterator modIter() { return map.modIter(); }
+  struct Enum : public MapType::Enum {
+    explicit Enum(NurseryAwareHashMap& namap) : MapType::Enum(namap.map) {}
+  };
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return map.shallowSizeOfExcludingThis(mallocSizeOf) +
+           nurseryEntries.sizeOfExcludingThis(mallocSizeOf);
+  }
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return mallocSizeOf(this) + sizeOfExcludingThis(mallocSizeOf);
+  }
+
+  [[nodiscard]] bool put(const Key& key, const Value& value) {
+    if ((!key->isTenured() || !value->isTenured()) &&
+        !nurseryEntries.append(key)) {
+      return false;
+    }
+
+    auto p = map.lookupForAdd(key);
+    if (p) {
+      p->value() = value;
+      return true;
+    }
+
+    return map.add(p, key, value);
+  }
+
+  void sweepAfterMinorGC(JSTracer* trc) {
+    nurseryEntries.mutableEraseIf([this, trc](Key& key) {
+      auto p = map.lookup(key);
+      if (!p) {
+        return true;
+      }
+
+      if (!JS::GCPolicy<MapValue>::traceWeak(trc, &p->value())) {
+        map.remove(p);
+        return true;
+      }
+
+      Key prior = key;
+      if (!TraceManuallyBarrieredWeakEdge(trc, &key,
+                                          "NurseryAwareHashMap key")) {
+        map.remove(p);
+        return true;
+      }
+
+      bool valueIsTenured = p->value().unbarrieredGet()->isTenured();
+
+      if constexpr (AllowDuplicates) {
+        if (key == prior) {
+        } else if (map.has(key)) {
+          map.remove(p);
+          return true;
+        } else {
+          map.rekeyAs(prior, key, key);
+        }
+      } else {
+        MOZ_ASSERT(key == prior || !map.has(key));
+        map.rekeyIfMoved(prior, key);
+      }
+
+      return key->isTenured() && valueIsTenured;
+    });
+
+    checkNurseryEntries();
+  }
+
+  void checkNurseryEntries() const {
+#ifdef DEBUG
+    AutoEnterOOMUnsafeRegion oomUnsafe;
+    HashSet<Key, DefaultHasher<Key>, SystemAllocPolicy> set;
+    for (const auto& key : nurseryEntries) {
+      if (!set.put(key)) {
+        oomUnsafe.crash("NurseryAwareHashMap::checkNurseryEntries");
+      }
+    }
+
+    for (auto i = map.iter(); !i.done(); i.next()) {
+      Key key = i.get().key().get();
+      MOZ_ASSERT(gc::IsCellPointerValid(key));
+      MOZ_ASSERT_IF(IsInsideNursery(key), set.has(key));
+
+      Value value = i.get().value().unbarrieredGet();
+      MOZ_ASSERT(gc::IsCellPointerValid(value));
+      MOZ_ASSERT_IF(IsInsideNursery(value), set.has(key));
+    }
+#endif
+  }
+
+  void traceWeak(JSTracer* trc) { map.traceWeak(trc); }
+
+  void clear() {
+    map.clear();
+    nurseryEntries.clear();
+  }
+
+  bool hasNurseryEntries() const { return !nurseryEntries.empty(); }
+};
+
+}  
+
+namespace JS {
+
+template <typename T>
+struct GCPolicy<js::detail::UnsafeBareWeakHeapPtr<T>>
+    : public GCPolicyBase<js::detail::UnsafeBareWeakHeapPtr<T>> {
+  static void trace(JSTracer* trc, js::detail::UnsafeBareWeakHeapPtr<T>* thingp,
+                    const char* name) {
+    js::TraceEdge(trc, thingp, name);
+  }
+  static bool traceWeak(JSTracer* trc,
+                        js::detail::UnsafeBareWeakHeapPtr<T>* thingp) {
+    return js::TraceWeakEdge(trc, thingp, "UnsafeBareWeakHeapPtr");
+  }
+};
+
+}  
+
+namespace mozilla {}  
+
+#endif  // gc_NurseryAwareHashMap_h

@@ -1,0 +1,382 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "NetworkLoadHandler.h"
+
+#include "CacheLoadHandler.h"  // CachePromiseHandler
+#include "js/loader/ModuleLoadRequest.h"
+#include "js/loader/ScriptLoadRequest.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/StaticPrefs_javascript.h"
+#include "mozilla/dom/BlobURLProtocolHandler.h"
+#include "mozilla/dom/InternalResponse.h"
+#include "mozilla/dom/Response.h"
+#include "mozilla/dom/ScriptLoader.h"
+#include "mozilla/dom/ServiceWorkerBinding.h"
+#include "mozilla/dom/ServiceWorkerManager.h"
+#include "mozilla/dom/WorkerScope.h"
+#include "mozilla/dom/workerinternals/ScriptLoader.h"  // WorkerScriptLoader
+#include "nsContentUtils.h"
+#include "nsIChannel.h"
+#include "nsIHttpChannel.h"
+#include "nsIHttpChannelInternal.h"
+#include "nsIPrincipal.h"
+#include "nsIScriptError.h"
+#include "nsNetUtil.h"
+
+using mozilla::ipc::PrincipalInfo;
+
+namespace mozilla {
+namespace dom {
+
+namespace workerinternals::loader {
+
+NS_IMPL_ISUPPORTS(NetworkLoadHandler, nsIStreamLoaderObserver,
+                  nsIRequestObserver)
+
+NetworkLoadHandler::NetworkLoadHandler(WorkerScriptLoader* aLoader,
+                                       ThreadSafeRequestHandle* aRequestHandle)
+    : mLoader(aLoader),
+      mWorkerRef(aLoader->mWorkerRef),
+      mRequestHandle(aRequestHandle) {
+  MOZ_ASSERT(mLoader);
+
+  mDecoder = MakeUnique<ScriptDecoder>(UTF_8_ENCODING,
+                                       ScriptDecoder::BOMHandling::Remove);
+}
+
+NS_IMETHODIMP
+NetworkLoadHandler::OnStreamComplete(nsIStreamLoader* aLoader,
+                                     nsISupports* aContext, nsresult aStatus,
+                                     uint32_t aStringLen,
+                                     const uint8_t* aString) {
+  if (mRequestHandle->IsEmpty()) {
+    return NS_OK;
+  }
+  nsresult rv = DataReceivedFromNetwork(aLoader, aStatus, aStringLen, aString);
+  return mRequestHandle->OnStreamComplete(rv);
+}
+
+nsresult NetworkLoadHandler::DataReceivedFromNetwork(nsIStreamLoader* aLoader,
+                                                     nsresult aStatus,
+                                                     uint32_t aStringLen,
+                                                     const uint8_t* aString) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(!mRequestHandle->IsEmpty());
+
+  if (aStringLen > GetWorkerScriptMaxSizeInBytes()) {
+    Document* parentDoc = mWorkerRef->Private()->GetDocument();
+    nsContentUtils::ReportToConsole(nsIScriptError::errorFlag, "DOM"_ns,
+                                    parentDoc, PropertiesFile::DOM_PROPERTIES,
+                                    "WorkerScriptTooLargeError");
+    return NS_ERROR_DOM_ABORT_ERR;
+  }
+
+  WorkerLoadContext* loadContext = mRequestHandle->GetContext();
+
+  if (!loadContext->mChannel) {
+    return NS_BINDING_ABORTED;
+  }
+
+#ifdef NIGHTLY_BUILD
+  if (StaticPrefs::javascript_options_experimental_wasm_esm_integration()) {
+    if (mRequestHandle->GetRequest()->IsModuleRequest()) {
+      nsAutoCString mimeType;
+      if (NS_SUCCEEDED(loadContext->mChannel->GetContentType(mimeType))) {
+        if (nsContentUtils::HasWasmMimeTypeEssence(
+                NS_ConvertUTF8toUTF16(mimeType))) {
+          mRequestHandle->GetRequest()
+              ->AsModuleRequest()
+              ->SetHasWasmMimeTypeEssence();
+          loadContext->mRequest->SetWasmBytes();
+          if (!loadContext->mRequest->WasmBytes().append(aString, aStringLen)) {
+            return NS_ERROR_OUT_OF_MEMORY;
+          }
+        }
+      }
+    }
+  }
+#endif
+
+  loadContext->mChannel = nullptr;
+
+  if (NS_FAILED(aStatus)) {
+    return aStatus;
+  }
+
+  if (mRequestHandle->IsCancelled()) {
+    return mRequestHandle->GetCancelResult();
+  }
+
+  NS_ASSERTION(aString, "This should never be null!");
+
+  nsCOMPtr<nsIRequest> request;
+  nsresult rv = aLoader->GetRequest(getter_AddRefs(request));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIChannel> channel = do_QueryInterface(request);
+  MOZ_ASSERT(channel);
+
+  nsIScriptSecurityManager* ssm = nsContentUtils::GetSecurityManager();
+  NS_ASSERTION(ssm, "Should never be null!");
+
+  nsCOMPtr<nsIPrincipal> channelPrincipal;
+  rv =
+      ssm->GetChannelResultPrincipal(channel, getter_AddRefs(channelPrincipal));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  nsIPrincipal* principal = mWorkerRef->Private()->GetPrincipal();
+  if (!principal) {
+    WorkerPrivate* parentWorker = mWorkerRef->Private()->GetParent();
+    MOZ_ASSERT(parentWorker, "Must have a parent!");
+    principal = parentWorker->GetPrincipal();
+  }
+
+#ifdef DEBUG
+  if (loadContext->IsTopLevel()) {
+    nsCOMPtr<nsIPrincipal> loadingPrincipal =
+        mWorkerRef->Private()->GetLoadingPrincipal();
+    MOZ_ASSERT(!loadingPrincipal || loadingPrincipal->GetIsNullPrincipal() ||
+               principal->GetIsNullPrincipal() ||
+               loadingPrincipal->Subsumes(principal));
+  }
+#endif
+
+  loadContext->mMutedErrorFlag.emplace(!loadContext->IsTopLevel() &&
+                                       !principal->Subsumes(channelPrincipal));
+
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(request);
+  nsAutoCString tCspHeaderValue, tCspROHeaderValue, tRPHeaderCValue;
+
+  if (httpChannel) {
+    bool requestSucceeded;
+    rv = httpChannel->GetRequestSucceeded(&requestSucceeded);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    if (!requestSucceeded) {
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+
+    (void)httpChannel->GetResponseHeader("content-security-policy"_ns,
+                                         tCspHeaderValue);
+
+    (void)httpChannel->GetResponseHeader(
+        "content-security-policy-report-only"_ns, tCspROHeaderValue);
+
+    (void)httpChannel->GetResponseHeader("referrer-policy"_ns, tRPHeaderCValue);
+
+    nsAutoCString sourceMapURL;
+    if (nsContentUtils::GetSourceMapURL(httpChannel, sourceMapURL)) {
+      loadContext->mRequest->SetSourceMapURL(
+          NS_ConvertUTF8toUTF16(sourceMapURL));
+    }
+  }
+
+  Document* parentDoc = mWorkerRef->Private()->GetDocument();
+
+  if (!loadContext->mRequest->IsWasmBytes()) {
+    loadContext->mRequest->SetTextSource(loadContext);
+
+    rv = mDecoder->DecodeRawData(loadContext->mRequest, aString, aStringLen,
+                                  true);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    if (!loadContext->mRequest->ScriptTextLength()) {
+      nsContentUtils::ReportToConsole(nsIScriptError::warningFlag, "DOM"_ns,
+                                      parentDoc, PropertiesFile::DOM_PROPERTIES,
+                                      "EmptyWorkerSourceWarning");
+    }
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  rv = channel->GetOriginalURI(getter_AddRefs(uri));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  loadContext->mRequest->SetBaseURLFromChannelAndOriginalURI(channel, uri);
+
+  nsCOMPtr<nsIURI> finalURI;
+  rv = NS_GetFinalChannelURI(channel, getter_AddRefs(finalURI));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (principal->IsSameOrigin(finalURI)) {
+    nsCString filename;
+    rv = finalURI->GetSpec(filename);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    if (!filename.IsEmpty()) {
+      loadContext->mRequest->mURL = filename;
+    }
+  }
+
+  bool isDynamic = loadContext->mRequest->IsModuleRequest() &&
+                   loadContext->mRequest->AsModuleRequest()->IsDynamicImport();
+  if (loadContext->IsTopLevel() && !isDynamic) {
+    mWorkerRef->Private()->SetBaseURI(finalURI);
+
+    if (httpChannel) {
+      nsCString reportingEndpoints;
+      if (NS_SUCCEEDED(httpChannel->GetResponseHeader("Reporting-Endpoints"_ns,
+                                                      reportingEndpoints))) {
+        mWorkerRef->Private()->SetReportingEndpointsHeader(reportingEndpoints);
+      }
+    }
+
+    mWorkerRef->Private()->InitChannelInfo(channel);
+
+    NS_ENSURE_TRUE(mWorkerRef->Private()->FinalChannelPrincipalIsValid(channel),
+                   NS_ERROR_FAILURE);
+
+    rv = mWorkerRef->Private()->SetPrincipalsAndCSPFromChannel(channel);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    nsCOMPtr<nsIContentSecurityPolicy> csp = mWorkerRef->Private()->GetCsp();
+    if (!csp) {
+      rv = mWorkerRef->Private()->SetCSPFromHeaderValues(tCspHeaderValue,
+                                                         tCspROHeaderValue);
+      NS_ENSURE_SUCCESS(rv, rv);
+    } else {
+      csp->EnsureEventTarget(mWorkerRef->Private()->MainThreadEventTarget());
+    }
+
+    mWorkerRef->Private()->UpdateReferrerInfoFromHeader(tRPHeaderCValue);
+
+    WorkerPrivate* parent = mWorkerRef->Private()->GetParent();
+    if (parent) {
+      mWorkerRef->Private()->SetXHRParamsAllowed(parent->XHRParamsAllowed());
+    }
+
+    nsCOMPtr<nsILoadInfo> chanLoadInfo = channel->LoadInfo();
+    if (chanLoadInfo) {
+      mLoader->SetController(chanLoadInfo->GetController());
+    }
+
+    if (IsBlobURI(mWorkerRef->Private()->GetBaseURI())) {
+      MOZ_DIAGNOSTIC_ASSERT(mLoader->GetController().isNothing());
+      mLoader->SetController(mWorkerRef->Private()->GetParentController());
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+NetworkLoadHandler::OnStartRequest(nsIRequest* aRequest) {
+  nsresult rv = PrepareForRequest(aRequest);
+
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aRequest->Cancel(rv);
+  }
+
+  return rv;
+}
+
+nsresult NetworkLoadHandler::PrepareForRequest(nsIRequest* aRequest) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(!mRequestHandle->IsEmpty());
+  WorkerLoadContext* loadContext = mRequestHandle->GetContext();
+
+  if (mRequestHandle->IsCancelled()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest);
+
+  if (mWorkerRef->Private()->IsServiceWorker()) {
+    nsAutoCString mimeType;
+    channel->GetContentType(mimeType);
+
+    auto mimeTypeUTF16 = NS_ConvertUTF8toUTF16(mimeType);
+    if (!nsContentUtils::IsJavascriptMIMEType(mimeTypeUTF16)) {
+      if (!((!loadContext->IsTopLevel() &&
+             loadContext->mRequest->IsModuleRequest() &&
+             loadContext->mRequest->AsModuleRequest()->mModuleType ==
+                 JS::ModuleType::JSON &&
+             nsContentUtils::IsJsonMimeType(mimeTypeUTF16))
+#ifdef NIGHTLY_BUILD
+            || (StaticPrefs::
+                    javascript_options_experimental_wasm_esm_integration() &&
+                nsContentUtils::HasWasmMimeTypeEssence(mimeTypeUTF16))
+#endif
+            || (JS::Prefs::experimental_import_text() &&
+                !loadContext->IsTopLevel() &&
+                loadContext->mRequest->IsModuleRequest() &&
+                loadContext->mRequest->AsModuleRequest()->mModuleType ==
+                    JS::ModuleType::Text))) {
+        const nsCString& scope = mWorkerRef->Private()
+                                     ->GetServiceWorkerRegistrationDescriptor()
+                                     .Scope();
+
+        ServiceWorkerManager::LocalizeAndReportToAllClients(
+            scope, "ServiceWorkerRegisterMimeTypeError2",
+            nsTArray<nsString>{
+                NS_ConvertUTF8toUTF16(scope), NS_ConvertUTF8toUTF16(mimeType),
+                NS_ConvertUTF8toUTF16(loadContext->mRequest->mURL)});
+
+        return NS_ERROR_DOM_NETWORK_ERR;
+      }
+    }
+  }
+
+  SafeRefPtr<mozilla::dom::InternalResponse> ir =
+      MakeSafeRefPtr<mozilla::dom::InternalResponse>(200, "OK"_ns);
+  ir->SetBody(loadContext->mCacheReadStream,
+              InternalResponse::UNKNOWN_BODY_SIZE);
+
+  loadContext->mCacheReadStream = nullptr;
+
+  ir->InitChannelInfo(channel);
+
+  nsIScriptSecurityManager* ssm = nsContentUtils::GetSecurityManager();
+  NS_ASSERTION(ssm, "Should never be null!");
+
+  nsCOMPtr<nsIPrincipal> channelPrincipal;
+  MOZ_TRY(ssm->GetChannelResultPrincipal(channel,
+                                         getter_AddRefs(channelPrincipal)));
+
+  UniquePtr<PrincipalInfo> principalInfo(new PrincipalInfo());
+  MOZ_TRY(PrincipalToPrincipalInfo(channelPrincipal, principalInfo.get()));
+
+  ir->SetPrincipalInfo(std::move(principalInfo));
+  ir->Headers()->FillResponseHeaders(channel);
+
+  RefPtr<CacheCreator> cacheCreator = mRequestHandle->GetCacheCreator();
+  if (NS_WARN_IF(!cacheCreator)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<mozilla::dom::Response> response = new mozilla::dom::Response(
+      cacheCreator->Global(), std::move(ir), nullptr);
+
+  mozilla::dom::RequestOrUTF8String request;
+
+  MOZ_ASSERT(!loadContext->mFullURL.IsEmpty());
+  request.SetAsUTF8String() = loadContext->mFullURL;
+
+  AutoJSAPI jsapi;
+  jsapi.Init();
+
+  ErrorResult error;
+  RefPtr<Promise> cachePromise =
+      cacheCreator->Cache_()->Put(jsapi.cx(), request, *response, error);
+  error.WouldReportJSException();
+  if (NS_WARN_IF(error.Failed())) {
+    return error.StealNSResult();
+  }
+
+  RefPtr<CachePromiseHandler> promiseHandler =
+      new CachePromiseHandler(mLoader, mRequestHandle);
+  cachePromise->AppendNativeHandler(promiseHandler);
+
+  loadContext->mCachePromise.swap(cachePromise);
+  loadContext->mCacheStatus = WorkerLoadContext::WritingToCache;
+
+  return NS_OK;
+}
+
+}  
+
+}  
+}  

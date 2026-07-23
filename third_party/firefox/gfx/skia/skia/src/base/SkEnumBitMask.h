@@ -1,0 +1,69 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkEnumBitMask_DEFINED)
+#define SkEnumBitMask_DEFINED
+
+#include "include/private/base/SkAttributes.h"
+
+#include <type_traits>
+
+template<typename E>
+class SkEnumBitMask {
+    using I = std::underlying_type_t<E>;
+public:
+    SK_ALWAYS_INLINE constexpr SkEnumBitMask() : SkEnumBitMask(I(0)) {}
+    SK_ALWAYS_INLINE constexpr SkEnumBitMask(E e) : SkEnumBitMask(static_cast<I>(e)) {}
+
+    SK_ALWAYS_INLINE constexpr explicit operator bool() const { return fValue; }
+    SK_ALWAYS_INLINE constexpr I value() const                { return fValue; }
+
+    SK_ALWAYS_INLINE constexpr bool operator==(SkEnumBitMask m) const { return fValue == m.fValue; }
+    SK_ALWAYS_INLINE constexpr bool operator!=(SkEnumBitMask m) const { return fValue != m.fValue; }
+
+    SK_ALWAYS_INLINE constexpr SkEnumBitMask operator|(SkEnumBitMask m) const {
+        return SkEnumBitMask(fValue | m.fValue);
+    }
+    SK_ALWAYS_INLINE constexpr SkEnumBitMask operator&(SkEnumBitMask m) const {
+        return SkEnumBitMask(fValue & m.fValue);
+    }
+    SK_ALWAYS_INLINE constexpr SkEnumBitMask operator^(SkEnumBitMask m) const {
+        return SkEnumBitMask(fValue ^ m.fValue);
+    }
+    SK_ALWAYS_INLINE constexpr SkEnumBitMask operator~() const { return SkEnumBitMask(~fValue); }
+
+    SK_ALWAYS_INLINE SkEnumBitMask& operator|=(SkEnumBitMask m) { return *this = *this | m; }
+    SK_ALWAYS_INLINE SkEnumBitMask& operator&=(SkEnumBitMask m) { return *this = *this & m; }
+    SK_ALWAYS_INLINE SkEnumBitMask& operator^=(SkEnumBitMask m) { return *this = *this ^ m; }
+
+private:
+    SK_ALWAYS_INLINE constexpr explicit SkEnumBitMask(I value) : fValue(value) {}
+
+    I fValue;
+};
+
+#define SK_MAKE_BITMASK_OPS(E)                                        \
+    [[maybe_unused]] constexpr SkEnumBitMask<E> operator|(E a, E b) { \
+        return SkEnumBitMask<E>(a) | b;                               \
+    }                                                                 \
+    [[maybe_unused]] constexpr SkEnumBitMask<E> operator&(E a, E b) { \
+        return SkEnumBitMask<E>(a) & b;                               \
+    }                                                                 \
+    [[maybe_unused]] constexpr SkEnumBitMask<E> operator^(E a, E b) { \
+        return SkEnumBitMask<E>(a) ^ b;                               \
+    }                                                                 \
+    [[maybe_unused]] constexpr SkEnumBitMask<E> operator~(E e) {      \
+        return ~SkEnumBitMask<E>(e);                                  \
+    }
+
+#define SK_DECL_BITMASK_OPS_FRIENDS(E)                 \
+    friend constexpr SkEnumBitMask<E> operator|(E, E); \
+    friend constexpr SkEnumBitMask<E> operator&(E, E); \
+    friend constexpr SkEnumBitMask<E> operator^(E, E); \
+    friend constexpr SkEnumBitMask<E> operator~(E);
+
+#endif

@@ -1,0 +1,21 @@
+
+[package]
+edition = "2018"
+name = "walkdir"
+version = "2.3.2"
+authors = ["Andrew Gallant <jamslam@gmail.com>"]
+exclude = ["/ci/*", "/.travis.yml", "/appveyor.yml"]
+description = "Recursively walk a directory."
+homepage = "https://github.com/BurntSushi/walkdir"
+documentation = "https://docs.rs/walkdir/"
+keywords = ["directory", "recursive", "walk", "iterator"]
+categories = ["filesystem"]
+license = "Unlicense/MIT"
+repository = "https://github.com/BurntSushi/walkdir"
+[dependencies.same-file]
+version = "1.0.1"
+[badges.appveyor]
+repository = "BurntSushi/walkdir"
+
+[badges.travis-ci]
+repository = "BurntSushi/walkdir"

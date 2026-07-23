@@ -1,0 +1,60 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#if !defined(mozilla_gfx_layers_TextureSourceProvider_h)
+#define mozilla_gfx_layers_TextureSourceProvider_h
+
+#include "nsISupportsImpl.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/layers/CompositorTypes.h"
+#include "nsTArray.h"
+
+struct ID3D11Device;
+
+namespace mozilla {
+namespace gfx {
+class DataSourceSurface;
+}  
+namespace gl {
+class GLContext;
+}  
+namespace layers {
+
+class TextureHost;
+class DataTextureSource;
+class Compositor;
+class CompositorOGL;
+
+class TextureSourceProvider {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(TextureSourceProvider)
+
+  virtual already_AddRefed<DataTextureSource> CreateDataTextureSource(
+      TextureFlags aFlags = TextureFlags::NO_FLAGS) = 0;
+
+  virtual TimeStamp GetLastCompositionEndTime() const = 0;
+
+  virtual void TryUnlockTextures() {}
+
+  virtual void Destroy();
+
+  virtual Compositor* AsCompositor() { return nullptr; }
+
+  virtual CompositorOGL* AsCompositorOGL() { return nullptr; }
+
+
+  virtual gl::GLContext* GetGLContext() const { return nullptr; }
+
+  virtual int32_t GetMaxTextureSize() const = 0;
+
+  virtual bool IsValid() const = 0;
+
+ protected:
+  virtual ~TextureSourceProvider();
+};
+
+}  
+}  
+
+#endif

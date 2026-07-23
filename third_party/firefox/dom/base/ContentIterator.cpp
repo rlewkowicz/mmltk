@@ -1,0 +1,1417 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ContentIterator.h"
+
+#include "mozilla/Assertions.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/RangeBoundary.h"
+#include "mozilla/RangeUtils.h"
+#include "mozilla/Result.h"
+#include "mozilla/dom/HTMLSlotElement.h"
+#include "mozilla/dom/ShadowRoot.h"
+#include "nsContentUtils.h"
+#include "nsElementTable.h"
+#include "nsIContent.h"
+#include "nsIContentInlines.h"
+#include "nsRange.h"
+
+namespace mozilla {
+
+using namespace dom;
+
+#define NS_INSTANTIATE_CONTENT_ITER_BASE_METHOD(aResultType, aMethodName, ...) \
+  template aResultType ContentIteratorBase<RefPtr<nsINode>>::aMethodName(      \
+      __VA_ARGS__);                                                            \
+  template aResultType ContentIteratorBase<nsINode*>::aMethodName(__VA_ARGS__)
+
+static bool ComparePostMode(const RawRangeBoundary& aStart,
+                            const RawRangeBoundary& aEnd, nsINode& aNode) {
+  nsINode* parent = aNode.GetParentNode();
+  if (!parent) {
+    return false;
+  }
+
+  nsIContent* content =
+      NS_WARN_IF(!aNode.IsContent()) ? nullptr : aNode.AsContent();
+
+  RawRangeBoundary afterNode(parent, content);
+  const auto isStartLessThanAfterNode = [&]() {
+    const Maybe<int32_t> startComparedToAfterNode =
+        nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(aStart,
+                                                                    afterNode);
+    return !NS_WARN_IF(!startComparedToAfterNode) &&
+           (*startComparedToAfterNode < 0);
+  };
+
+  const auto isAfterNodeLessOrEqualToEnd = [&]() {
+    const Maybe<int32_t> afterNodeComparedToEnd =
+        nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(afterNode,
+                                                                    aEnd);
+    return !NS_WARN_IF(!afterNodeComparedToEnd) &&
+           (*afterNodeComparedToEnd <= 0);
+  };
+
+  return isStartLessThanAfterNode() && isAfterNodeLessOrEqualToEnd();
+}
+
+static bool ComparePreMode(const RawRangeBoundary& aStart,
+                           const RawRangeBoundary& aEnd, nsINode& aNode) {
+  nsINode* parent = aNode.GetParentNode();
+  if (!parent) {
+    return false;
+  }
+
+  RawRangeBoundary beforeNode(parent, aNode.GetPreviousSibling());
+
+  const auto isStartLessOrEqualToBeforeNode = [&]() {
+    const Maybe<int32_t> startComparedToBeforeNode =
+        nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(aStart,
+                                                                    beforeNode);
+    return !NS_WARN_IF(!startComparedToBeforeNode) &&
+           (*startComparedToBeforeNode <= 0);
+  };
+
+  const auto isBeforeNodeLessThanEndNode = [&]() {
+    const Maybe<int32_t> beforeNodeComparedToEnd =
+        nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(beforeNode,
+                                                                    aEnd);
+    return !NS_WARN_IF(!beforeNodeComparedToEnd) &&
+           (*beforeNodeComparedToEnd < 0);
+  };
+
+  return isStartLessOrEqualToBeforeNode() && isBeforeNodeLessThanEndNode();
+}
+
+static bool NodeIsInTraversalRange(nsINode* aNode, bool aIsPreMode,
+                                   const RawRangeBoundary& aStart,
+                                   const RawRangeBoundary& aEnd) {
+  if (NS_WARN_IF(!aStart.IsSet()) || NS_WARN_IF(!aEnd.IsSet()) ||
+      NS_WARN_IF(!aNode)) {
+    return false;
+  }
+
+  if (aNode == aStart.GetContainer() || aNode == aEnd.GetContainer()) {
+    if (aNode->IsCharacterData()) {
+      return true;  
+    }
+    if (!aNode->HasChildren()) {
+      MOZ_ASSERT(
+          aNode != aStart.GetContainer() || aStart.IsStartOfContainer(),
+          "aStart.GetContainer() doesn't have children and not a data node, "
+          "aStart should be at the beginning of its container");
+      MOZ_ASSERT(
+          aNode != aEnd.GetContainer() || aEnd.IsStartOfContainer(),
+          "aEnd.GetContainer() doesn't have children and not a data node, "
+          "aEnd should be at the beginning of its container");
+      return true;
+    }
+  }
+
+  if (aIsPreMode) {
+    return ComparePreMode(aStart, aEnd, *aNode);
+  }
+
+  return ComparePostMode(aStart, aEnd, *aNode);
+}
+
+void ImplCycleCollectionTraverse(nsCycleCollectionTraversalCallback& aCallback,
+                                 PostContentIterator& aField, const char* aName,
+                                 uint32_t aFlags = 0) {
+  ImplCycleCollectionTraverse(
+      aCallback, static_cast<SafeContentIteratorBase&>(aField), aName, aFlags);
+}
+
+void ImplCycleCollectionUnlink(PostContentIterator& aField) {
+  ImplCycleCollectionUnlink(static_cast<SafeContentIteratorBase&>(aField));
+}
+
+void ImplCycleCollectionTraverse(nsCycleCollectionTraversalCallback& aCallback,
+                                 PreContentIterator& aField, const char* aName,
+                                 uint32_t aFlags = 0) {
+  ImplCycleCollectionTraverse(
+      aCallback, static_cast<SafeContentIteratorBase&>(aField), aName, aFlags);
+}
+
+void ImplCycleCollectionUnlink(PreContentIterator& aField) {
+  ImplCycleCollectionUnlink(static_cast<SafeContentIteratorBase&>(aField));
+}
+
+void ImplCycleCollectionTraverse(nsCycleCollectionTraversalCallback& aCallback,
+                                 ContentSubtreeIterator& aField,
+                                 const char* aName, uint32_t aFlags = 0) {
+  ImplCycleCollectionTraverse(aCallback, aField.mRange, aName, aFlags);
+  ImplCycleCollectionTraverse(
+      aCallback, static_cast<SafeContentIteratorBase&>(aField), aName, aFlags);
+}
+
+void ImplCycleCollectionUnlink(ContentSubtreeIterator& aField) {
+  ImplCycleCollectionUnlink(aField.mRange);
+  ImplCycleCollectionUnlink(static_cast<SafeContentIteratorBase&>(aField));
+}
+
+
+NS_INSTANTIATE_CONTENT_ITER_BASE_METHOD(, ContentIteratorBase, Order);
+
+template <typename NodeType>
+ContentIteratorBase<NodeType>::ContentIteratorBase(Order aOrder)
+    : mOrder(aOrder) {}
+
+template ContentIteratorBase<RefPtr<nsINode>>::~ContentIteratorBase();
+template ContentIteratorBase<nsINode*>::~ContentIteratorBase();
+
+template <typename NodeType>
+ContentIteratorBase<NodeType>::~ContentIteratorBase() {
+  MOZ_DIAGNOSTIC_ASSERT_IF(mMutationGuard.isSome(),
+                           !mMutationGuard->Mutated(0));
+}
+
+
+NS_INSTANTIATE_CONTENT_ITER_BASE_METHOD(nsresult, Init, nsINode*);
+
+template <typename NodeType>
+nsresult ContentIteratorBase<NodeType>::Init(nsINode* aRoot) {
+  if (NS_WARN_IF(!aRoot)) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  if (mOrder == Order::Pre) {
+    mFirst = aRoot;
+    mLast = ContentIteratorBase::GetDeepLastInclusiveDescendant<TreeKind::DOM>(
+        aRoot);
+    NS_WARNING_ASSERTION(mLast, "GetDeepLastInclusiveDescendant returned null");
+  } else {
+    mFirst =
+        ContentIteratorBase::GetDeepFirstInclusiveDescendant<TreeKind::DOM>(
+            aRoot);
+    NS_WARNING_ASSERTION(mFirst,
+                         "GetDeepFirstInclusiveDescendant returned null");
+    mLast = aRoot;
+  }
+
+  mClosestCommonInclusiveAncestor = aRoot;
+  mCurNode = mFirst;
+  return NS_OK;
+}
+
+NS_INSTANTIATE_CONTENT_ITER_BASE_METHOD(nsresult, Init, AbstractRange*);
+
+template <typename NodeType>
+nsresult ContentIteratorBase<NodeType>::Init(AbstractRange* aRange) {
+  if (NS_WARN_IF(!aRange)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (NS_WARN_IF(!aRange->IsPositioned())) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  return InitInternal(aRange->StartRef().AsRaw(), aRange->EndRef().AsRaw());
+}
+
+NS_INSTANTIATE_CONTENT_ITER_BASE_METHOD(nsresult, Init, nsINode*, uint32_t,
+                                        nsINode*, uint32_t);
+
+template <typename NodeType>
+nsresult ContentIteratorBase<NodeType>::Init(nsINode* aStartContainer,
+                                             uint32_t aStartOffset,
+                                             nsINode* aEndContainer,
+                                             uint32_t aEndOffset) {
+  if (NS_WARN_IF(!RangeUtils::IsValidPoints(aStartContainer, aStartOffset,
+                                            aEndContainer, aEndOffset))) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  return InitInternal(RawRangeBoundary(aStartContainer, aStartOffset),
+                      RawRangeBoundary(aEndContainer, aEndOffset));
+}
+
+NS_INSTANTIATE_CONTENT_ITER_BASE_METHOD(nsresult, Init, const RawRangeBoundary&,
+                                        const RawRangeBoundary&);
+
+template <typename NodeType>
+nsresult ContentIteratorBase<NodeType>::Init(const RawRangeBoundary& aStart,
+                                             const RawRangeBoundary& aEnd) {
+  if (NS_WARN_IF(!RangeUtils::IsValidPoints(aStart, aEnd))) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  return InitInternal(aStart, aEnd);
+}
+
+template <typename NodeType>
+nsresult ContentIteratorBase<NodeType>::InitWithoutValidatingPoints(
+    const RawRangeBoundary& aStart, const RawRangeBoundary& aEnd) {
+  MOZ_DIAGNOSTIC_ASSERT(RangeUtils::IsValidPoints(aStart, aEnd));
+  return InitInternal(aStart, aEnd);
+}
+
+template <typename NodeType>
+class MOZ_STACK_CLASS ContentIteratorBase<NodeType>::Initializer final {
+ public:
+  Initializer(ContentIteratorBase<NodeType>& aIterator,
+              const RawRangeBoundary& aStart, const RawRangeBoundary& aEnd)
+      : mIterator{aIterator},
+        mStart{aStart},
+        mEnd{aEnd},
+        mStartIsCharacterData{mStart.GetContainer()->IsCharacterData()} {
+    MOZ_ASSERT(mStart.IsSetAndValid());
+    MOZ_ASSERT(mEnd.IsSetAndValid());
+  }
+
+  nsresult Run();
+
+ private:
+  nsINode* DetermineFirstNode() const;
+
+  [[nodiscard]] Result<nsINode*, nsresult> DetermineLastNode() const;
+
+  bool IsCollapsedNonCharacterRange() const;
+  bool IsSingleNodeCharacterRange() const;
+
+  ContentIteratorBase& mIterator;
+  const RawRangeBoundary& mStart;
+  const RawRangeBoundary& mEnd;
+  const bool mStartIsCharacterData;
+};
+
+template <>
+nsresult ContentIteratorBase<RefPtr<nsINode>>::InitInternal(
+    const RawRangeBoundary& aStart, const RawRangeBoundary& aEnd) {
+  Initializer initializer{*this, aStart, aEnd};
+  return initializer.Run();
+}
+
+template <>
+nsresult ContentIteratorBase<nsINode*>::InitInternal(
+    const RawRangeBoundary& aStart, const RawRangeBoundary& aEnd) {
+  Initializer initializer{*this, aStart, aEnd};
+  nsresult rv = initializer.Run();
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  mMutationGuard.emplace();
+  mAssertNoGC.emplace();
+  return NS_OK;
+}
+
+template <typename NodeType>
+bool ContentIteratorBase<NodeType>::Initializer::IsCollapsedNonCharacterRange()
+    const {
+  return !mStartIsCharacterData && mStart == mEnd;
+}
+
+template <typename NodeType>
+bool ContentIteratorBase<NodeType>::Initializer::IsSingleNodeCharacterRange()
+    const {
+  return mStartIsCharacterData && mStart.GetContainer() == mEnd.GetContainer();
+}
+
+template <typename NodeType>
+nsresult ContentIteratorBase<NodeType>::Initializer::Run() {
+  mIterator.mClosestCommonInclusiveAncestor =
+      nsContentUtils::GetClosestCommonInclusiveAncestor(mStart.GetContainer(),
+                                                        mEnd.GetContainer());
+  if (NS_WARN_IF(!mIterator.mClosestCommonInclusiveAncestor)) {
+    return NS_ERROR_FAILURE;
+  }
+
+
+  if (IsCollapsedNonCharacterRange()) {
+    mIterator.SetEmpty();
+    return NS_OK;
+  }
+
+  if (IsSingleNodeCharacterRange()) {
+    mIterator.mFirst = mStart.GetContainer()->AsContent();
+    mIterator.mLast = mIterator.mFirst;
+    mIterator.mCurNode = mIterator.mFirst;
+
+    return NS_OK;
+  }
+
+  mIterator.mFirst = DetermineFirstNode();
+
+  if (Result<nsINode*, nsresult> lastNode = DetermineLastNode();
+      NS_WARN_IF(lastNode.isErr())) {
+    return lastNode.unwrapErr();
+  } else {
+    mIterator.mLast = lastNode.unwrap();
+  }
+
+  if (!mIterator.mFirst || !mIterator.mLast) {
+    mIterator.SetEmpty();
+  }
+
+  mIterator.mCurNode = mIterator.mFirst;
+
+  return NS_OK;
+}
+
+template <typename NodeType>
+nsINode* ContentIteratorBase<NodeType>::Initializer::DetermineFirstNode()
+    const {
+  nsIContent* cChild = nullptr;
+
+  if (!mStartIsCharacterData) {
+    cChild = mStart.GetChildAtOffset();
+  }
+
+  if (!cChild) {
+
+    if (mIterator.mOrder == Order::Pre) {
+
+      bool startIsContainer = true;
+      if (mStart.GetContainer()->IsHTMLElement()) {
+        nsAtom* name = mStart.GetContainer()->NodeInfo()->NameAtom();
+        startIsContainer =
+            nsHTMLElement::IsContainer(nsHTMLTags::AtomTagToId(name));
+      }
+      if (!mStartIsCharacterData &&
+          (startIsContainer || !mStart.IsStartOfContainer())) {
+        nsINode* const result =
+            ContentIteratorBase::GetNextSibling<TreeKind::DOM>(
+                mStart.GetContainer());
+        NS_WARNING_ASSERTION(result, "GetNextSibling returned null");
+
+        if (result &&
+            NS_WARN_IF(!NodeIsInTraversalRange(
+                result, mIterator.mOrder == Order::Pre, mStart, mEnd))) {
+          return nullptr;
+        }
+
+        return result;
+      }
+      return mStart.GetContainer()->AsContent();
+    }
+
+    if (NS_WARN_IF(!mStart.GetContainer()->IsContent())) {
+      return nullptr;
+    }
+    return mStart.GetContainer()->AsContent();
+  }
+
+  if (mIterator.mOrder == Order::Pre) {
+    return cChild;
+  }
+
+  nsINode* const result =
+      ContentIteratorBase::GetDeepFirstInclusiveDescendant<TreeKind::DOM>(
+          cChild);
+  NS_WARNING_ASSERTION(result, "GetDeepFirstInclusiveDescendant returned null");
+
+  if (result && !NodeIsInTraversalRange(result, mIterator.mOrder == Order::Pre,
+                                        mStart, mEnd)) {
+    return nullptr;
+  }
+
+  return result;
+}
+
+template <typename NodeType>
+Result<nsINode*, nsresult>
+ContentIteratorBase<NodeType>::Initializer::DetermineLastNode() const {
+  const bool endIsCharacterData = mEnd.GetContainer()->IsCharacterData();
+
+  if (endIsCharacterData || !mEnd.GetContainer()->HasChildren() ||
+      mEnd.IsStartOfContainer()) {
+    if (mIterator.mOrder == Order::Pre) {
+      if (NS_WARN_IF(!mEnd.GetContainer()->IsContent())) {
+        return nullptr;
+      }
+
+      bool endIsContainer = true;
+      if (mEnd.GetContainer()->IsHTMLElement()) {
+        nsAtom* name = mEnd.GetContainer()->NodeInfo()->NameAtom();
+        endIsContainer =
+            nsHTMLElement::IsContainer(nsHTMLTags::AtomTagToId(name));
+      }
+      if (!endIsCharacterData && !endIsContainer && mEnd.IsStartOfContainer()) {
+        nsINode* const result =
+            mIterator.PrevNode<TreeKind::DOM>(mEnd.GetContainer());
+        NS_WARNING_ASSERTION(result, "PrevNode returned null");
+        if (result && result != mIterator.mFirst &&
+            NS_WARN_IF(!NodeIsInTraversalRange(
+                result, mIterator.mOrder == Order::Pre,
+                RawRangeBoundary::StartOfParent(*mIterator.mFirst), mEnd))) {
+          return nullptr;
+        }
+
+        return result;
+      }
+
+      return mEnd.GetContainer()->AsContent();
+    }
+
+
+    if (!endIsCharacterData) {
+      nsINode* const result =
+          ContentIteratorBase::GetPrevSibling<TreeKind::DOM>(
+              mEnd.GetContainer());
+      NS_WARNING_ASSERTION(result, "GetPrevSibling returned null");
+
+      if (!NodeIsInTraversalRange(result, mIterator.mOrder == Order::Pre,
+                                  mStart, mEnd)) {
+        return nullptr;
+      }
+      return result;
+    }
+    return mEnd.GetContainer()->AsContent();
+  }
+
+  nsIContent* cChild = mEnd.Ref();
+
+  if (NS_WARN_IF(!cChild)) {
+    MOZ_ASSERT_UNREACHABLE("ContentIterator::ContentIterator");
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  if (mIterator.mOrder == Order::Pre) {
+    nsINode* const result =
+        ContentIteratorBase::GetDeepLastInclusiveDescendant<TreeKind::DOM>(
+            cChild);
+    NS_WARNING_ASSERTION(result,
+                         "GetDeepLastInclusiveDescendant returned null");
+
+    if (NS_WARN_IF(!NodeIsInTraversalRange(
+            result, mIterator.mOrder == Order::Pre, mStart, mEnd))) {
+      return nullptr;
+    }
+
+    return result;
+  }
+
+  return cChild;
+}
+
+NS_INSTANTIATE_CONTENT_ITER_BASE_METHOD(void, SetEmpty);
+
+template <typename NodeType>
+void ContentIteratorBase<NodeType>::SetEmpty() {
+  mCurNode = nullptr;
+  mFirst = nullptr;
+  mLast = nullptr;
+  mClosestCommonInclusiveAncestor = nullptr;
+}
+
+template <typename NodeType>
+template <TreeKind aKind>
+nsINode* ContentIteratorBase<NodeType>::GetDeepFirstInclusiveDescendant(
+    nsINode* aNode) {
+  if (NS_WARN_IF(!aNode)) {
+    return aNode;
+  }
+  nsIContent* const firstChild = aNode->GetFirstChild<aKind>();
+  if (!firstChild) {
+    return aNode;
+  }
+  return ContentIteratorBase::GetDeepFirstInclusiveDescendant<aKind>(
+      firstChild);
+}
+
+template <typename NodeType>
+template <TreeKind aKind>
+nsIContent* ContentIteratorBase<NodeType>::GetDeepFirstInclusiveDescendant(
+    nsIContent* aContent) {
+  if (NS_WARN_IF(!aContent)) {
+    return nullptr;
+  }
+
+  nsIContent* lastContent = aContent;
+  while (nsIContent* const firstChild = lastContent->GetFirstChild<aKind>()) {
+    lastContent = firstChild;
+  }
+  return lastContent;
+}
+
+template <typename NodeType>
+template <TreeKind aKind>
+nsINode* ContentIteratorBase<NodeType>::GetDeepLastInclusiveDescendant(
+    nsINode* aNode) {
+  if (NS_WARN_IF(!aNode)) {
+    return aNode;
+  }
+  nsIContent* const lastChild = aNode->GetLastChild<aKind>();
+  if (!lastChild) {
+    return aNode;
+  }
+  return ContentIteratorBase::GetDeepLastInclusiveDescendant<aKind>(lastChild);
+}
+
+template <typename NodeType>
+template <TreeKind aKind>
+nsIContent* ContentIteratorBase<NodeType>::GetDeepLastInclusiveDescendant(
+    nsIContent* aContent) {
+  if (NS_WARN_IF(!aContent)) {
+    return nullptr;
+  }
+
+  nsIContent* lastContent = aContent;
+  while (nsIContent* const lastChild = lastContent->GetLastChild<aKind>()) {
+    lastContent = lastChild;
+  }
+  return lastContent;
+}
+
+template <typename NodeType>
+template <TreeKind aKind>
+nsIContent* ContentIteratorBase<NodeType>::GetNextSibling(
+    nsINode* aNode, nsTArray<AncestorInfo>* aInclusiveAncestorsOfEndContainer) {
+  if (NS_WARN_IF(!aNode)) {
+    return nullptr;
+  }
+
+  if constexpr (ShouldHandleAssignedNodesOnSlot<aKind>()) {
+    if (aNode->IsContent()) {
+      while (HTMLSlotElement* slot =
+                 aNode->AsContent()->GetAssignedSlot<aKind>()) {
+        auto assigned = slot->AssignedNodes();
+        auto cur = assigned.IndexOf(aNode);
+        if (cur != assigned.npos && cur + 1 < assigned.Length()) {
+          return assigned[cur + 1]->AsContent();
+        }
+        aNode = slot;
+      }
+      if (nsIContent* const next =
+              ChildIteratorBase<aKind>::GetNextChild(aNode->AsContent())) {
+        return next;
+      }
+    }
+  } else {
+    if (nsIContent* const next = aNode->GetNextSibling()) {
+      return next;
+    }
+  }
+
+  nsINode* parent = ShadowDOMSelectionHelpers::GetParentNodeInSameSelection(
+      *aNode, aKind == TreeKind::DOM ? AllowRangeCrossShadowBoundary::No
+                                     : AllowRangeCrossShadowBoundary::Yes);
+  if (NS_WARN_IF(!parent)) {
+    return nullptr;
+  }
+
+  if constexpr (ShouldHandleAssignedNodesOnSlot<aKind>()) {
+    if (aInclusiveAncestorsOfEndContainer &&
+        parent->GetShadowRoot<aKind>() == aNode) {
+      const int32_t i = aInclusiveAncestorsOfEndContainer->IndexOf(
+          parent, 0, InclusiveAncestorComparator());
+
+      if (i != -1) {
+        MOZ_ASSERT(!aInclusiveAncestorsOfEndContainer->ElementAt(i)
+                        .mIsDescendantInShadowTree);
+        return parent->AsContent();
+      }
+    }
+  }
+
+  return ContentIteratorBase::GetNextSibling<aKind>(
+      parent, aInclusiveAncestorsOfEndContainer);
+}
+
+template <typename NodeType>
+template <TreeKind aKind>
+nsIContent* ContentIteratorBase<NodeType>::GetPrevSibling(nsINode* aNode) {
+  if (NS_WARN_IF(!aNode)) {
+    return nullptr;
+  }
+
+  if constexpr (ShouldHandleAssignedNodesOnSlot<aKind>()) {
+    if (aNode->IsContent()) {
+      while (HTMLSlotElement* slot =
+                 aNode->AsContent()->GetAssignedSlot<aKind>()) {
+        auto assigned = slot->AssignedNodes();
+        auto cur = assigned.IndexOf(aNode);
+        if (cur != assigned.npos && cur != 0) {
+          return assigned[cur - 1]->AsContent();
+        }
+        aNode = slot;
+      }
+      if (nsIContent* const prev =
+              ChildIteratorBase<aKind>::GetPreviousChild(aNode->AsContent())) {
+        return prev;
+      }
+    }
+  } else {
+    if (nsIContent* const prev = aNode->GetPreviousSibling()) {
+      return prev;
+    }
+  }
+
+  nsINode* parent = ShadowDOMSelectionHelpers::GetParentNodeInSameSelection(
+      *aNode, aKind == TreeKind::DOM ? AllowRangeCrossShadowBoundary::No
+                                     : AllowRangeCrossShadowBoundary::Yes);
+  if (NS_WARN_IF(!parent)) {
+    return nullptr;
+  }
+
+  return ContentIteratorBase::GetPrevSibling<aKind>(parent);
+}
+
+template <typename NodeType>
+template <TreeKind aKind>
+nsINode* ContentIteratorBase<NodeType>::NextNode(nsINode* aNode) {
+  nsINode* node = aNode;
+
+  if (mOrder == Order::Pre) {
+    if (nsIContent* const firstChild = node->GetFirstChild<aKind>()) {
+      return firstChild;
+    }
+
+    return ContentIteratorBase::GetNextSibling<aKind>(node);
+  }
+
+  nsINode* parent = node->GetParentNode<aKind>();
+  if (NS_WARN_IF(!parent)) {
+    MOZ_ASSERT(parent, "The node is the root node but not the last node");
+    mCurNode = nullptr;
+    return node;
+  }
+
+  if constexpr (aKind == TreeKind::DOM) {
+    if (nsIContent* const sibling = node->GetNextSibling()) {
+      return ContentIteratorBase::GetDeepFirstInclusiveDescendant<aKind>(
+          sibling);
+    }
+  } else if (node->IsContent()) {
+    if (nsIContent* const sibling =
+            ChildIteratorBase<aKind>::GetNextChild(node->AsContent())) {
+      return ContentIteratorBase::GetDeepFirstInclusiveDescendant<aKind>(
+          sibling);
+    }
+  }
+  return parent;
+}
+
+template <typename NodeType>
+template <TreeKind aKind>
+nsINode* ContentIteratorBase<NodeType>::PrevNode(nsINode* aNode) {
+  nsINode* node = aNode;
+
+  if (mOrder == Order::Pre) {
+    nsINode* parent = node->GetParentNode<aKind>();
+    if (NS_WARN_IF(!parent)) {
+      MOZ_ASSERT(parent, "The node is the root node but not the first node");
+      mCurNode = nullptr;
+      return aNode;
+    }
+    if constexpr (aKind == TreeKind::DOM) {
+      if (nsIContent* const sibling = node->GetPreviousSibling()) {
+        return ContentIteratorBase::GetDeepLastInclusiveDescendant<aKind>(
+            sibling);
+      }
+    } else if (node->IsContent()) {
+      if (nsIContent* const sibling =
+              ChildIteratorBase<aKind>::GetPreviousChild(node->AsContent())) {
+        return ContentIteratorBase::GetDeepLastInclusiveDescendant<aKind>(
+            sibling);
+      }
+    }
+    return parent;
+  }
+
+  if (nsIContent* const lastChild = node->GetLastChild<aKind>()) {
+    return lastChild;
+  }
+
+  return ContentIteratorBase::GetPrevSibling<aKind>(node);
+}
+
+
+NS_INSTANTIATE_CONTENT_ITER_BASE_METHOD(void, First);
+
+template <typename NodeType>
+void ContentIteratorBase<NodeType>::First() {
+  if (!mFirst) {
+    MOZ_ASSERT(IsDone());
+    mCurNode = nullptr;
+    return;
+  }
+
+  mozilla::DebugOnly<nsresult> rv = PositionAt(mFirst);
+  NS_ASSERTION(NS_SUCCEEDED(rv), "Failed to position iterator!");
+}
+
+NS_INSTANTIATE_CONTENT_ITER_BASE_METHOD(void, Last);
+
+template <typename NodeType>
+void ContentIteratorBase<NodeType>::Last() {
+  if (!mLast) {
+    MOZ_ASSERT(IsDone());
+    mCurNode = nullptr;
+    return;
+  }
+
+  mozilla::DebugOnly<nsresult> rv = PositionAt(mLast);
+  NS_ASSERTION(NS_SUCCEEDED(rv), "Failed to position iterator!");
+}
+
+NS_INSTANTIATE_CONTENT_ITER_BASE_METHOD(void, Next);
+
+template <typename NodeType>
+void ContentIteratorBase<NodeType>::Next() {
+  if (IsDone()) {
+    return;
+  }
+
+  if (mCurNode == mLast) {
+    mCurNode = nullptr;
+    return;
+  }
+
+  mCurNode = NextNode<TreeKind::DOM>(mCurNode);
+}
+
+NS_INSTANTIATE_CONTENT_ITER_BASE_METHOD(void, Prev);
+
+template <typename NodeType>
+void ContentIteratorBase<NodeType>::Prev() {
+  if (IsDone()) {
+    return;
+  }
+
+  if (mCurNode == mFirst) {
+    mCurNode = nullptr;
+    return;
+  }
+
+  mCurNode = PrevNode<TreeKind::DOM>(mCurNode);
+}
+
+NS_INSTANTIATE_CONTENT_ITER_BASE_METHOD(nsresult, PositionAt, nsINode*);
+
+template <typename NodeType>
+nsresult ContentIteratorBase<NodeType>::PositionAt(nsINode* aCurNode) {
+  if (NS_WARN_IF(!aCurNode)) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  if (mCurNode == aCurNode) {
+    return NS_OK;
+  }
+  mCurNode = aCurNode;
+
+
+  RawRangeBoundary first(mFirst, 0u);
+  RawRangeBoundary last(mLast, 0u);
+
+  if (mFirst && mLast) {
+    if (mOrder == Order::Pre) {
+      first = {mFirst->GetParentNode(), mFirst->GetPreviousSibling()};
+
+      if (!mLast->HasChildren()) {
+        last = {mLast->GetParentNode(), mLast->AsContent()};
+      }
+    } else {
+      if (mFirst->HasChildren()) {
+        first = {mFirst, mFirst->GetLastChild()};
+      } else {
+        first = {mFirst->GetParentNode(), mFirst->GetPreviousSibling()};
+      }
+
+      last = {mLast->GetParentNode(), mLast->AsContent()};
+    }
+  }
+
+  NS_WARNING_ASSERTION(first.IsSetAndValid(), "first is not valid");
+  NS_WARNING_ASSERTION(last.IsSetAndValid(), "last is not valid");
+
+  if (mFirst != mCurNode && mLast != mCurNode &&
+      (NS_WARN_IF(!first.IsSet()) || NS_WARN_IF(!last.IsSet()) ||
+       NS_WARN_IF(!NodeIsInTraversalRange(mCurNode, mOrder == Order::Pre, first,
+                                          last)))) {
+    mCurNode = nullptr;
+    return NS_ERROR_FAILURE;
+  }
+
+  return NS_OK;
+}
+
+
+nsresult ContentSubtreeIterator::Init(nsINode* aRoot) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+nsresult ContentSubtreeIterator::Init(AbstractRange* aRange) {
+  MOZ_ASSERT(aRange);
+
+  if (NS_WARN_IF(!aRange->IsPositioned())) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  mRange = aRange;
+
+  return InitWithRange();
+}
+
+nsresult ContentSubtreeIterator::Init(nsINode* aStartContainer,
+                                      uint32_t aStartOffset,
+                                      nsINode* aEndContainer,
+                                      uint32_t aEndOffset) {
+  return Init(RawRangeBoundary(aStartContainer, aStartOffset),
+              RawRangeBoundary(aEndContainer, aEndOffset));
+}
+
+nsresult ContentSubtreeIterator::Init(const RawRangeBoundary& aStartBoundary,
+                                      const RawRangeBoundary& aEndBoundary) {
+  RefPtr<nsRange> range =
+      nsRange::Create(aStartBoundary, aEndBoundary, IgnoreErrors());
+  if (NS_WARN_IF(!range) || NS_WARN_IF(!range->IsPositioned())) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (NS_WARN_IF(range->MayCrossShadowBoundaryStartRef() != aStartBoundary) ||
+      NS_WARN_IF(range->MayCrossShadowBoundaryEndRef() != aEndBoundary)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  mRange = std::move(range);
+
+  return InitWithRange();
+}
+
+nsresult ContentSubtreeIterator::InitWithAllowCrossShadowBoundary(
+    AbstractRange* aRange) {
+  MOZ_ASSERT(aRange);
+
+  if (NS_WARN_IF(!aRange->IsPositioned())) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (aRange->IsDynamicRange()) {
+    mRange = aRange->AsDynamicRange()->GetRangeInFlatTree();
+  } else {
+    mRange = aRange;
+  }
+
+  mAllowCrossShadowBoundary = AllowRangeCrossShadowBoundary::Yes;
+  return InitWithRange();
+}
+
+void ContentSubtreeIterator::CacheInclusiveAncestorsOfEndContainer() {
+  mInclusiveAncestorsOfEndContainer.Clear();
+  nsINode* const endContainer = ShadowDOMSelectionHelpers::GetEndContainer(
+      mRange, mAllowCrossShadowBoundary);
+  nsIContent* endNode =
+      endContainer->IsContent() ? endContainer->AsContent() : nullptr;
+
+  AncestorInfo info{endNode, false};
+  while (info.mAncestor) {
+    const nsINode* child = info.mAncestor;
+    mInclusiveAncestorsOfEndContainer.AppendElement(info);
+    nsINode* parent = ShadowDOMSelectionHelpers::GetParentNodeInSameSelection(
+        *child, mAllowCrossShadowBoundary);
+    if (!parent || !parent->IsContent()) {
+      break;
+    }
+
+    const bool isChildAShadowRootForSelection =
+        ShadowDOMSelectionHelpers::GetShadowRoot(
+            parent, mAllowCrossShadowBoundary) == child;
+
+    info.mAncestor = parent->AsContent();
+    info.mIsDescendantInShadowTree =
+        IterAllowCrossShadowBoundary() && isChildAShadowRootForSelection;
+  }
+}
+
+nsIContent* ContentSubtreeIterator::DetermineCandidateForFirstContent() const {
+  nsINode* startContainer = ShadowDOMSelectionHelpers::GetStartContainer(
+      mRange, mAllowCrossShadowBoundary);
+  nsIContent* firstCandidate = nullptr;
+  nsINode* node = nullptr;
+  if (IterAllowCrossShadowBoundary()
+          ? !startContainer->HasChildren<TreeKind::FlatForSelection>()
+          : !startContainer->HasChildren<TreeKind::DOM>()) {
+    node = startContainer;
+  } else {
+    nsIContent* child =
+        IterAllowCrossShadowBoundary()
+            ? mRange->GetMayCrossShadowBoundaryChildAtStartOffset()
+            : mRange->GetChildAtStartOffset();
+
+#ifdef DEBUG
+    const auto& startRef = IterAllowCrossShadowBoundary()
+                               ? mRange->MayCrossShadowBoundaryStartRef()
+                               : mRange->StartRef();
+    MOZ_ASSERT(startRef.IsSetAndValid());
+#endif
+    if (!child) {
+      node = startContainer;
+    } else {
+      firstCandidate = child;
+    }
+  }
+
+  if (!firstCandidate) {
+    firstCandidate =
+        IterAllowCrossShadowBoundary()
+            ? ContentIteratorBase::GetNextSibling<TreeKind::FlatForSelection>(
+                  node)
+            : ContentIteratorBase::GetNextSibling<TreeKind::DOM>(node);
+  }
+
+  if (firstCandidate) {
+    firstCandidate = IterAllowCrossShadowBoundary()
+                         ? ContentIteratorBase::GetDeepFirstInclusiveDescendant<
+                               TreeKind::FlatForSelection>(firstCandidate)
+                         : ContentIteratorBase::GetDeepFirstInclusiveDescendant<
+                               TreeKind::DOM>(firstCandidate);
+  }
+
+  return firstCandidate;
+}
+
+nsIContent* ContentSubtreeIterator::DetermineFirstContent() const {
+  nsIContent* firstCandidate = DetermineCandidateForFirstContent();
+  if (!firstCandidate) {
+    return nullptr;
+  }
+
+  const Maybe<bool> isNodeContainedInRange =
+      IterAllowCrossShadowBoundary()
+          ? RangeUtils::IsNodeContainedInRange<TreeKind::FlatForSelection>(
+                *firstCandidate, mRange)
+          : RangeUtils::IsNodeContainedInRange<TreeKind::ShadowIncludingDOM>(
+                *firstCandidate, mRange);
+  MOZ_ALWAYS_TRUE(isNodeContainedInRange);
+  if (!isNodeContainedInRange.value()) {
+    return nullptr;
+  }
+
+  return GetTopAncestorInRange(firstCandidate);
+}
+
+nsIContent* ContentSubtreeIterator::DetermineCandidateForLastContent() const {
+  nsIContent* lastCandidate{nullptr};
+  nsINode* endContainer = ShadowDOMSelectionHelpers::GetEndContainer(
+      mRange, mAllowCrossShadowBoundary);
+  int32_t offset =
+      ShadowDOMSelectionHelpers::EndOffset(mRange, mAllowCrossShadowBoundary);
+
+  const int32_t numChildren =
+      IterAllowCrossShadowBoundary()
+          ? endContainer->GetFlatTreeForSelectionChildCount()
+          : endContainer->GetChildCount();
+  nsINode* node = nullptr;
+  if (offset > numChildren) {
+    offset = numChildren;
+  }
+  if (!offset || !numChildren) {
+    node = endContainer;
+  } else {
+    lastCandidate = IterAllowCrossShadowBoundary()
+                        ? mRange->MayCrossShadowBoundaryEndRef().Ref()
+                        : mRange->EndRef().Ref();
+#ifdef DEBUG
+    const auto& endRef = IterAllowCrossShadowBoundary()
+                             ? mRange->MayCrossShadowBoundaryEndRef()
+                             : mRange->EndRef();
+    MOZ_ASSERT(endRef.IsSetAndValid());
+#endif
+    NS_ASSERTION(lastCandidate,
+                 "tree traversal trouble in ContentSubtreeIterator::Init");
+  }
+
+  if (!lastCandidate) {
+    lastCandidate =
+        IterAllowCrossShadowBoundary()
+            ? ContentIteratorBase::GetPrevSibling<TreeKind::FlatForSelection>(
+                  node)
+            : ContentIteratorBase::GetPrevSibling<TreeKind::DOM>(node);
+  }
+
+  if (lastCandidate) {
+    lastCandidate = IterAllowCrossShadowBoundary()
+                        ? ContentIteratorBase::GetDeepLastInclusiveDescendant<
+                              TreeKind::FlatForSelection>(lastCandidate)
+                        : ContentIteratorBase::GetDeepLastInclusiveDescendant<
+                              TreeKind::DOM>(lastCandidate);
+  }
+
+  return lastCandidate;
+}
+
+nsresult ContentSubtreeIterator::InitWithRange() {
+  MOZ_ASSERT(mRange);
+  MOZ_ASSERT(mRange->IsPositioned());
+
+  mClosestCommonInclusiveAncestor =
+      mRange->GetClosestCommonInclusiveAncestor(mAllowCrossShadowBoundary);
+
+  const RawRangeBoundary startRef =
+      ShadowDOMSelectionHelpers::StartRef(mRange, mAllowCrossShadowBoundary);
+  const RawRangeBoundary endRef =
+      ShadowDOMSelectionHelpers::EndRef(mRange, mAllowCrossShadowBoundary);
+  if (!mClosestCommonInclusiveAncestor) [[unlikely]] {
+    NS_WARNING(fmt::format("startRef:{}", startRef).c_str());
+    NS_WARNING(fmt::format("endRef:  {}", endRef).c_str());
+    MOZ_ASSERT_UNREACHABLE("mRange boundaries must be connected");
+    return NS_ERROR_FAILURE;
+  }
+  MOZ_ASSERT(startRef.IsSet());
+  MOZ_ASSERT(endRef.IsSet());
+
+  if (startRef.GetContainer() == endRef.GetContainer()) {
+    nsIContent* const child =
+        IterAllowCrossShadowBoundary()
+            ? startRef.GetContainer()->GetFlattenedTreeFirstChildForSelection()
+            : startRef.GetContainer()->GetFirstChild();
+
+    if (!child || startRef == endRef) {
+      SetEmpty();
+      return NS_OK;
+    }
+  }
+
+  CacheInclusiveAncestorsOfEndContainer();
+
+  mFirst = DetermineFirstContent();
+  if (!mFirst) {
+    SetEmpty();
+    return NS_OK;
+  }
+
+  mLast = DetermineLastContent();
+  if (!mLast) {
+    SetEmpty();
+    return NS_OK;
+  }
+
+  mCurNode = mFirst;
+
+  return NS_OK;
+}
+
+nsIContent* ContentSubtreeIterator::DetermineLastContent() const {
+  nsIContent* lastCandidate = DetermineCandidateForLastContent();
+  if (!lastCandidate) {
+    return nullptr;
+  }
+
+
+  const Maybe<bool> isNodeContainedInRange =
+      IterAllowCrossShadowBoundary()
+          ? RangeUtils::IsNodeContainedInRange<TreeKind::FlatForSelection>(
+                *lastCandidate, mRange)
+          : RangeUtils::IsNodeContainedInRange<TreeKind::ShadowIncludingDOM>(
+                *lastCandidate, mRange);
+  MOZ_ALWAYS_TRUE(isNodeContainedInRange);
+  if (!isNodeContainedInRange.value()) {
+    return nullptr;
+  }
+
+  return GetTopAncestorInRange(lastCandidate);
+}
+
+
+void ContentSubtreeIterator::First() { mCurNode = mFirst; }
+
+void ContentSubtreeIterator::Last() { mCurNode = mLast; }
+
+void ContentSubtreeIterator::Next() {
+  if (IsDone()) {
+    return;
+  }
+
+  if (mCurNode == mLast) {
+    mCurNode = nullptr;
+    return;
+  }
+
+  nsINode* nextNode =
+      IterAllowCrossShadowBoundary()
+          ? ContentIteratorBase::GetNextSibling<TreeKind::FlatForSelection>(
+                mCurNode, &mInclusiveAncestorsOfEndContainer)
+          : ContentIteratorBase::GetNextSibling<TreeKind::DOM>(
+                mCurNode, &mInclusiveAncestorsOfEndContainer);
+
+  NS_ASSERTION(nextNode, "No next sibling!?! This could mean deadlock!");
+
+  int32_t i = mInclusiveAncestorsOfEndContainer.IndexOf(
+      nextNode, 0, InclusiveAncestorComparator());
+
+  while (i != -1) {
+    ShadowRoot* root = ShadowDOMSelectionHelpers::GetShadowRoot(
+        nextNode, mAllowCrossShadowBoundary);
+    if (mInclusiveAncestorsOfEndContainer[i].mIsDescendantInShadowTree) {
+      MOZ_ASSERT(root);
+      nextNode = IterAllowCrossShadowBoundary()
+                     ? root->GetFlattenedTreeFirstChildForSelection()
+                     : root->GetFirstChild();
+    } else if (HTMLSlotElement* const slot =
+                   nextNode->GetAsHTMLSlotElementIfFilledForSelection();
+               slot && IterAllowCrossShadowBoundary()) {
+      nextNode = slot->AssignedNodes()[0];
+    } else {
+      if (root) {
+        mCurNode = nullptr;
+        return;
+      }
+      nextNode = IterAllowCrossShadowBoundary()
+                     ? nextNode->GetFlattenedTreeFirstChildForSelection()
+                     : nextNode->GetFirstChild();
+    }
+    NS_ASSERTION(nextNode, "Iterator error, expected a child node!");
+
+    i = mInclusiveAncestorsOfEndContainer.IndexOf(
+        nextNode, 0, InclusiveAncestorComparator());
+  }
+
+  mCurNode = nextNode;
+}
+
+void ContentSubtreeIterator::Prev() {
+  if (IsDone()) {
+    return;
+  }
+
+  if (mCurNode == mFirst) {
+    mCurNode = nullptr;
+    return;
+  }
+
+  nsINode* prevNode =
+      IterAllowCrossShadowBoundary()
+          ? ContentIteratorBase::GetDeepFirstInclusiveDescendant<
+                TreeKind::FlatForSelection>(mCurNode)
+          : ContentIteratorBase::GetDeepFirstInclusiveDescendant<TreeKind::DOM>(
+                mCurNode);
+
+  prevNode = IterAllowCrossShadowBoundary()
+                 ? PrevNode<TreeKind::FlatForSelection>(prevNode)
+                 : PrevNode<TreeKind::DOM>(prevNode);
+
+  prevNode =
+      IterAllowCrossShadowBoundary()
+          ? ContentIteratorBase::GetDeepLastInclusiveDescendant<
+                TreeKind::FlatForSelection>(prevNode)
+          : ContentIteratorBase::GetDeepLastInclusiveDescendant<TreeKind::DOM>(
+                prevNode);
+
+  mCurNode = GetTopAncestorInRange(prevNode);
+}
+
+nsresult ContentSubtreeIterator::PositionAt(nsINode* aCurNode) {
+  NS_ERROR("Not implemented!");
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+
+nsIContent* ContentSubtreeIterator::GetTopAncestorInRange(
+    nsINode* aNode) const {
+  if (!aNode || !ShadowDOMSelectionHelpers::GetParentNodeInSameSelection(
+                    *aNode, mAllowCrossShadowBoundary)) {
+    return nullptr;
+  }
+
+  nsIContent* content = aNode->AsContent();
+
+  Maybe<bool> isNodeContainedInRange =
+      IterAllowCrossShadowBoundary()
+          ? RangeUtils::IsNodeContainedInRange<TreeKind::FlatForSelection>(
+                *aNode, mRange)
+          : RangeUtils::IsNodeContainedInRange<TreeKind::ShadowIncludingDOM>(
+                *aNode, mRange);
+
+  NS_ASSERTION(isNodeContainedInRange && isNodeContainedInRange.value(),
+               "aNode isn't in mRange, or something else weird happened");
+  if (!isNodeContainedInRange || !isNodeContainedInRange.value()) {
+    return nullptr;
+  }
+
+  nsIContent* lastContentInShadowTree = nullptr;
+  while (content) {
+    nsINode* parent = ShadowDOMSelectionHelpers::GetParentNodeInSameSelection(
+        *content, mAllowCrossShadowBoundary);
+
+    if (!parent || !ShadowDOMSelectionHelpers::GetParentNodeInSameSelection(
+                       *parent, mAllowCrossShadowBoundary)) {
+      return content;
+    }
+
+    isNodeContainedInRange =
+        IterAllowCrossShadowBoundary()
+            ? RangeUtils::IsNodeContainedInRange<TreeKind::FlatForSelection>(
+                  *parent, mRange)
+            : RangeUtils::IsNodeContainedInRange<TreeKind::ShadowIncludingDOM>(
+                  *parent, mRange);
+
+    MOZ_ALWAYS_TRUE(isNodeContainedInRange);
+    if (!isNodeContainedInRange.value()) {
+      if (IterAllowCrossShadowBoundary() && content->IsShadowRoot()) {
+        MOZ_ASSERT(parent->GetShadowRoot() == content);
+        MOZ_ASSERT(lastContentInShadowTree);
+        return lastContentInShadowTree;
+      }
+      return content;
+    }
+
+    if (IterAllowCrossShadowBoundary() && parent->IsShadowRoot()) {
+      lastContentInShadowTree = content;
+    }
+
+    content = parent->AsContent();
+  }
+
+  MOZ_CRASH("This should only be possible if aNode was null");
+}
+
+nsresult RangeSubtreeIterator::Init(
+    AbstractRange* aRange,
+    dom::AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary) {
+  mIterState = eDone;
+  if (aRange->AreNormalRangeAndCrossShadowBoundaryRangeCollapsed()) {
+    return NS_OK;
+  }
+
+
+  if (!aRange->IsPositioned()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsINode* node = aRange->GetMayCrossShadowBoundaryStartContainer();
+  if (NS_WARN_IF(!node)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (node->IsCharacterData() ||
+      (node->IsElement() &&
+       aRange->MayCrossShadowBoundaryStartRef().IsEndOfContainer())) {
+    mStart = node;
+  }
+
+
+  node = aRange->GetMayCrossShadowBoundaryEndContainer();
+  if (NS_WARN_IF(!node)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (node->IsCharacterData() ||
+      (node->IsElement() &&
+       aRange->MayCrossShadowBoundaryEndRef().IsStartOfContainer())) {
+    mEnd = node;
+  }
+
+  if (mStart && mStart == mEnd) {
+
+    mEnd = nullptr;
+  } else {
+
+    mSubtreeIter.emplace();
+
+    nsresult res =
+        aAllowCrossShadowBoundary == dom::AllowRangeCrossShadowBoundary::Yes
+            ? mSubtreeIter->InitWithAllowCrossShadowBoundary(aRange)
+            : mSubtreeIter->Init(aRange);
+    if (NS_FAILED(res)) return res;
+
+    if (mSubtreeIter->IsDone()) {
+
+      mSubtreeIter.reset();
+    }
+  }
+
+
+  First();
+
+  return NS_OK;
+}
+
+already_AddRefed<nsINode> RangeSubtreeIterator::GetCurrentNode() {
+  nsCOMPtr<nsINode> node;
+
+  if (mIterState == eUseStart && mStart) {
+    node = mStart;
+  } else if (mIterState == eUseEnd && mEnd) {
+    node = mEnd;
+  } else if (mIterState == eUseIterator && mSubtreeIter) {
+    node = mSubtreeIter->GetCurrentNode();
+  }
+
+  return node.forget();
+}
+
+void RangeSubtreeIterator::First() {
+  if (mStart) {
+    mIterState = eUseStart;
+  } else if (mSubtreeIter) {
+    mSubtreeIter->First();
+
+    mIterState = eUseIterator;
+  } else if (mEnd) {
+    mIterState = eUseEnd;
+  } else {
+    mIterState = eDone;
+  }
+}
+
+void RangeSubtreeIterator::Last() {
+  if (mEnd) {
+    mIterState = eUseEnd;
+  } else if (mSubtreeIter) {
+    mSubtreeIter->Last();
+
+    mIterState = eUseIterator;
+  } else if (mStart) {
+    mIterState = eUseStart;
+  } else {
+    mIterState = eDone;
+  }
+}
+
+void RangeSubtreeIterator::Next() {
+  if (mIterState == eUseStart) {
+    if (mSubtreeIter) {
+      mSubtreeIter->First();
+
+      mIterState = eUseIterator;
+    } else if (mEnd) {
+      mIterState = eUseEnd;
+    } else {
+      mIterState = eDone;
+    }
+  } else if (mIterState == eUseIterator) {
+    mSubtreeIter->Next();
+
+    if (mSubtreeIter->IsDone()) {
+      if (mEnd) {
+        mIterState = eUseEnd;
+      } else {
+        mIterState = eDone;
+      }
+    }
+  } else {
+    mIterState = eDone;
+  }
+}
+
+void RangeSubtreeIterator::Prev() {
+  if (mIterState == eUseEnd) {
+    if (mSubtreeIter) {
+      mSubtreeIter->Last();
+
+      mIterState = eUseIterator;
+    } else if (mStart) {
+      mIterState = eUseStart;
+    } else {
+      mIterState = eDone;
+    }
+  } else if (mIterState == eUseIterator) {
+    mSubtreeIter->Prev();
+
+    if (mSubtreeIter->IsDone()) {
+      if (mStart) {
+        mIterState = eUseStart;
+      } else {
+        mIterState = eDone;
+      }
+    }
+  } else {
+    mIterState = eDone;
+  }
+}
+
+#undef NS_INSTANTIATE_CONTENT_ITER_BASE_METHOD
+
+}  

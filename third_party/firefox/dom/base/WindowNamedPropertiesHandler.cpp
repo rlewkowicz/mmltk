@@ -1,0 +1,230 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WindowNamedPropertiesHandler.h"
+
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/EventTargetBinding.h"
+#include "mozilla/dom/ProxyHandlerUtils.h"
+#include "mozilla/dom/WindowBinding.h"
+#include "mozilla/dom/WindowProxyHolder.h"
+#include "nsContentUtils.h"
+#include "nsGlobalWindowInner.h"
+#include "nsGlobalWindowOuter.h"
+#include "nsHTMLDocument.h"
+#include "nsJSUtils.h"
+#include "nsPIDOMWindowInlines.h"
+#include "xpcprivate.h"
+
+namespace mozilla::dom {
+
+static bool ShouldExposeChildWindow(const nsString& aNameBeingResolved,
+                                    BrowsingContext* aChild) {
+  Element* e = aChild->GetEmbedderElement();
+  if (e && e->IsInShadowTree()) {
+    return false;
+  }
+
+  nsPIDOMWindowOuter* child = aChild->GetDOMWindow();
+  nsCOMPtr<nsIScriptObjectPrincipal> sop = do_QueryInterface(child);
+  if (sop && nsContentUtils::SubjectPrincipal()->Equals(sop->GetPrincipal())) {
+    return true;
+  }
+
+  return e && e->AttrValueIs(kNameSpaceID_None, nsGkAtoms::name,
+                             aNameBeingResolved, eCaseMatters);
+}
+
+bool WindowNamedPropertiesHandler::getOwnPropDescriptor(
+    JSContext* aCx, JS::Handle<JSObject*> aProxy, JS::Handle<jsid> aId,
+    bool ,
+    JS::MutableHandle<Maybe<JS::PropertyDescriptor>> aDesc) const {
+  aDesc.reset();
+
+  if (aId.isSymbol()) {
+    if (aId.isWellKnownSymbol(JS::SymbolCode::toStringTag)) {
+      JS::Rooted<JSString*> toStringTagStr(
+          aCx, JS_NewStringCopyZ(aCx, "WindowProperties"));
+      if (!toStringTagStr) {
+        return false;
+      }
+
+      aDesc.set(Some(
+          JS::PropertyDescriptor::Data(JS::StringValue(toStringTagStr),
+                                       {JS::PropertyAttribute::Configurable})));
+      return true;
+    }
+
+    return true;
+  }
+
+  bool hasOnPrototype;
+  if (!HasPropertyOnPrototype(aCx, aProxy, aId, &hasOnPrototype)) {
+    return false;
+  }
+  if (hasOnPrototype) {
+    return true;
+  }
+
+  nsAutoJSString str;
+  if (!str.init(aCx, aId)) {
+    return false;
+  }
+
+  if (str.IsEmpty()) {
+    return true;
+  }
+
+  nsGlobalWindowInner* win = xpc::WindowGlobalOrNull(aProxy);
+  if (win->Length() > 0) {
+    RefPtr<BrowsingContext> child = win->GetChildWindow(str);
+    if (child && ShouldExposeChildWindow(str, child)) {
+      JS::Rooted<JS::Value> v(aCx);
+      if (!ToJSValue(aCx, WindowProxyHolder(std::move(child)), &v)) {
+        return false;
+      }
+      aDesc.set(mozilla::Some(
+          JS::PropertyDescriptor::Data(v, {JS::PropertyAttribute::Configurable,
+                                           JS::PropertyAttribute::Writable})));
+      return true;
+    }
+  }
+
+  Document* doc = win->GetExtantDoc();
+  if (!doc || !doc->IsHTMLOrXHTML()) {
+    return true;
+  }
+  nsHTMLDocument* document = doc->AsHTMLDocument();
+
+  JS::Rooted<JS::Value> v(aCx);
+  Element* element = document->GetElementById(str);
+  if (element) {
+    if (!ToJSValue(aCx, element, &v)) {
+      return false;
+    }
+    aDesc.set(mozilla::Some(
+        JS::PropertyDescriptor::Data(v, {JS::PropertyAttribute::Configurable,
+                                         JS::PropertyAttribute::Writable})));
+    return true;
+  }
+
+  ErrorResult rv;
+  bool found = document->ResolveNameForWindow(aCx, str, &v, rv);
+  if (rv.MaybeSetPendingException(aCx)) {
+    return false;
+  }
+
+  if (found) {
+    aDesc.set(mozilla::Some(
+        JS::PropertyDescriptor::Data(v, {JS::PropertyAttribute::Configurable,
+                                         JS::PropertyAttribute::Writable})));
+  }
+  return true;
+}
+
+bool WindowNamedPropertiesHandler::defineProperty(
+    JSContext* aCx, JS::Handle<JSObject*> aProxy, JS::Handle<jsid> aId,
+    JS::Handle<JS::PropertyDescriptor> aDesc,
+    JS::ObjectOpResult& result) const {
+  return result.failCantDefineWindowNamedProperty();
+}
+
+bool WindowNamedPropertiesHandler::ownPropNames(
+    JSContext* aCx, JS::Handle<JSObject*> aProxy, unsigned flags,
+    JS::MutableHandleVector<jsid> aProps) const {
+  if (!(flags & JSITER_HIDDEN)) {
+    return true;
+  }
+
+  if (!StaticPrefs::
+          dom_window_named_properties_object_legacy_own_property_keys()) {
+    JS::Rooted<jsid> toStringTagId(
+        aCx, JS::GetWellKnownSymbolKey(aCx, JS::SymbolCode::toStringTag));
+    return aProps.append(toStringTagId);
+  }
+
+  nsGlobalWindowInner* win = xpc::WindowGlobalOrNull(aProxy);
+  nsTArray<nsString> names;
+  nsGlobalWindowOuter* outer = win->GetOuterWindowInternal();
+  if (outer) {
+    if (BrowsingContext* bc = outer->GetBrowsingContext()) {
+      for (const auto& child : bc->Children()) {
+        const nsString& name = child->Name();
+        if (!name.IsEmpty() && !names.Contains(name)) {
+          if (ShouldExposeChildWindow(name, child)) {
+            names.AppendElement(name);
+          }
+        }
+      }
+    }
+  }
+  if (!AppendNamedPropertyIds(aCx, aProxy, names, false, aProps)) {
+    return false;
+  }
+
+  names.Clear();
+  Document* doc = win->GetExtantDoc();
+  if (!doc || !doc->IsHTMLOrXHTML()) {
+    JS::Rooted<jsid> toStringTagId(
+        aCx, JS::GetWellKnownSymbolKey(aCx, JS::SymbolCode::toStringTag));
+    return aProps.append(toStringTagId);
+  }
+
+  nsHTMLDocument* document = doc->AsHTMLDocument();
+  document->GetSupportedNamesForWindow(names);
+
+  JS::RootedVector<jsid> docProps(aCx);
+  if (!AppendNamedPropertyIds(aCx, aProxy, names, false, &docProps)) {
+    return false;
+  }
+
+  JS::Rooted<jsid> toStringTagId(
+      aCx, JS::GetWellKnownSymbolKey(aCx, JS::SymbolCode::toStringTag));
+  if (!docProps.append(toStringTagId)) {
+    return false;
+  }
+
+  return js::AppendUnique(aCx, aProps, docProps);
+}
+
+bool WindowNamedPropertiesHandler::delete_(JSContext* aCx,
+                                           JS::Handle<JSObject*> aProxy,
+                                           JS::Handle<jsid> aId,
+                                           JS::ObjectOpResult& aResult) const {
+  return aResult.failCantDeleteWindowNamedProperty();
+}
+
+static const DOMIfaceAndProtoJSClass WindowNamedPropertiesClass = {
+    PROXY_CLASS_DEF("WindowProperties", JSCLASS_IS_DOMIFACEANDPROTOJSCLASS |
+                                            JSCLASS_HAS_RESERVED_SLOTS(1)),
+    eNamedPropertiesObject,
+    prototypes::id::_ID_Count,
+    0,
+    &sEmptyNativePropertyHooks,
+    EventTarget_Binding::GetProtoObject};
+
+JSObject* WindowNamedPropertiesHandler::Create(JSContext* aCx,
+                                               JS::Handle<JSObject*> aProto) {
+  js::ProxyOptions options;
+  options.setClass(&WindowNamedPropertiesClass.mBase);
+
+  JS::Rooted<JSObject*> gsp(
+      aCx, js::NewProxyObject(aCx, WindowNamedPropertiesHandler::getInstance(),
+                              JS::NullHandleValue, aProto, options));
+  if (!gsp) {
+    return nullptr;
+  }
+
+  bool succeeded;
+  if (!JS_SetImmutablePrototype(aCx, gsp, &succeeded)) {
+    return nullptr;
+  }
+  MOZ_ASSERT(succeeded,
+             "errors making the [[Prototype]] of the named properties object "
+             "immutable should have been JSAPI failures, not !succeeded");
+
+  return gsp;
+}
+
+}  

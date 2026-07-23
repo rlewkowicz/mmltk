@@ -1,0 +1,244 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_cache_Manager_h
+#define mozilla_dom_cache_Manager_h
+
+#include "CacheCommon.h"
+#include "mozilla/dom/SafeRefPtr.h"
+#include "mozilla/dom/cache/Types.h"
+#include "mozilla/dom/quota/Client.h"
+#include "mozilla/dom/quota/StringifyUtils.h"
+#include "nsCOMPtr.h"
+#include "nsISupportsImpl.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+class nsIInputStream;
+class nsIThread;
+
+namespace mozilla {
+
+class ErrorResult;
+
+namespace dom {
+
+namespace quota {
+
+class ClientDirectoryLock;
+
+}  
+
+namespace cache {
+
+class CacheOpArgs;
+class CacheOpResult;
+class CacheRequestResponse;
+class Context;
+class ManagerId;
+struct SavedRequest;
+struct SavedResponse;
+class StreamList;
+
+class Manager final : public SafeRefCounted<Manager>, public Stringifyable {
+  using Client = quota::Client;
+  using ClientDirectoryLock = quota::ClientDirectoryLock;
+
+ public:
+  class Listener {
+   public:
+    void OnOpComplete(ErrorResult&& aRv, const CacheOpResult& aResult);
+
+    void OnOpComplete(ErrorResult&& aRv, const CacheOpResult& aResult,
+                      CacheId aOpenedCacheId);
+
+    void OnOpComplete(ErrorResult&& aRv, const CacheOpResult& aResult,
+                      const SavedResponse& aSavedResponse,
+                      StreamList& aStreamList);
+
+    void OnOpComplete(ErrorResult&& aRv, const CacheOpResult& aResult,
+                      const nsTArray<SavedResponse>& aSavedResponseList,
+                      StreamList& aStreamList);
+
+    void OnOpComplete(ErrorResult&& aRv, const CacheOpResult& aResult,
+                      const nsTArray<SavedRequest>& aSavedRequestList,
+                      StreamList& aStreamList);
+
+    struct StreamInfo {
+      const nsTArray<SavedResponse>& mSavedResponseList;
+      const nsTArray<SavedRequest>& mSavedRequestList;
+      StreamList& mStreamList;
+    };
+
+    virtual void OnOpComplete(ErrorResult&& aRv, const CacheOpResult& aResult,
+                              CacheId aOpenedCacheId,
+                              const Maybe<StreamInfo>& aStreamInfo) {}
+
+   protected:
+    ~Listener() = default;
+  };
+
+  enum State { Open, Closing };
+
+  static Result<SafeRefPtr<Manager>, nsresult> AcquireCreateIfNonExistent(
+      const SafeRefPtr<ManagerId>& aManagerId);
+
+  static void InitiateShutdown();
+
+  static bool IsShutdownAllComplete();
+
+  static nsCString GetShutdownStatus();
+
+  static void Abort(const Client::DirectoryLockIdTable& aDirectoryLockIds);
+
+  static void AbortAll();
+
+  void RemoveListener(Listener* aListener);
+
+  void RemoveContext(Context& aContext);
+
+  void NoteClosing();
+
+  State GetState() const;
+
+  void AddRefCacheId(CacheId aCacheId);
+  void ReleaseCacheId(CacheId aCacheId);
+  void AddRefBodyId(const nsID& aBodyId);
+  void ReleaseBodyId(const nsID& aBodyId);
+
+  const ManagerId& GetManagerId() const;
+
+  Maybe<ClientDirectoryLock&> MaybeDirectoryLockRef() const;
+
+  void AddStreamList(StreamList& aStreamList);
+  void RemoveStreamList(StreamList& aStreamList);
+
+  void ExecuteCacheOp(Listener* aListener, CacheId aCacheId,
+                      const CacheOpArgs& aOpArgs);
+  void ExecutePutAll(
+      Listener* aListener, CacheId aCacheId,
+      const nsTArray<CacheRequestResponse>& aPutList,
+      const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreamList,
+      const nsTArray<nsCOMPtr<nsIInputStream>>& aResponseStreamList);
+
+  void ExecuteStorageOp(Listener* aListener, Namespace aNamespace,
+                        const CacheOpArgs& aOpArgs);
+
+  void ExecuteOpenStream(Listener* aListener, InputStreamResolver&& aResolver,
+                         const nsID& aBodyId);
+
+  void NoteStreamOpenComplete(const nsID& aBodyId, ErrorResult&& aRv,
+                              nsCOMPtr<nsIInputStream>&& aBodyStream);
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  void RecordMayNotDeleteCSCP(
+      mozilla::ipc::ActorId aCacheStreamControlParentId);
+  void RecordHaveDeletedCSCP(mozilla::ipc::ActorId aCacheStreamControlParentId);
+#endif
+
+ private:
+  class Factory;
+  class BaseAction;
+  class DeleteOrphanedCacheAction;
+
+  class CacheMatchAction;
+  class CacheMatchAllAction;
+  class CachePutAllAction;
+  class CacheDeleteAction;
+  class CacheKeysAction;
+
+  class StorageMatchAction;
+  class StorageHasAction;
+  class StorageOpenAction;
+  class StorageDeleteAction;
+  class StorageKeysAction;
+
+  class OpenStreamAction;
+
+  using ListenerId = uint64_t;
+
+  void Init(Maybe<Manager&> aOldManager);
+  void Shutdown();
+
+  void Abort();
+
+  ListenerId SaveListener(Listener* aListener);
+  Listener* GetListener(ListenerId aListenerId) const;
+
+  bool SetCacheIdOrphanedIfRefed(CacheId aCacheId);
+  bool SetBodyIdOrphanedIfRefed(const nsID& aBodyId);
+  void NoteOrphanedBodyIdList(const nsTArray<nsID>& aDeletedBodyIdList);
+
+  void MaybeAllowContextToClose();
+
+  SafeRefPtr<ManagerId> mManagerId;
+  nsCOMPtr<nsIThread> mIOThread;
+
+  Context* MOZ_NON_OWNING_REF mContext;
+
+  struct ListenerEntry {
+    ListenerEntry() : mId(UINT64_MAX), mListener(nullptr) {}
+
+    ListenerEntry(ListenerId aId, Listener* aListener)
+        : mId(aId), mListener(aListener) {}
+
+    ListenerId mId;
+    Listener* mListener;
+  };
+
+  class ListenerEntryIdComparator {
+   public:
+    bool Equals(const ListenerEntry& aA, const ListenerId& aB) const {
+      return aA.mId == aB;
+    }
+  };
+
+  class ListenerEntryListenerComparator {
+   public:
+    bool Equals(const ListenerEntry& aA, const Listener* aB) const {
+      return aA.mListener == aB;
+    }
+  };
+
+  using ListenerList = nsTArray<ListenerEntry>;
+  ListenerList mListeners;
+  static ListenerId sNextListenerId;
+
+  nsTArray<NotNull<StreamList*>> mStreamLists;
+
+  bool mShuttingDown;
+  State mState;
+
+  struct CacheIdRefCounter {
+    CacheId mCacheId;
+    MozRefCountType mCount;
+    bool mOrphaned;
+  };
+  nsTArray<CacheIdRefCounter> mCacheIdRefs;
+
+  struct BodyIdRefCounter {
+    nsID mBodyId;
+    MozRefCountType mCount;
+    bool mOrphaned;
+  };
+  nsTArray<BodyIdRefCounter> mBodyIdRefs;
+
+  struct ConstructorGuard {};
+
+  void DoStringify(nsACString& aData) override;
+
+ public:
+  Manager(SafeRefPtr<ManagerId> aManagerId, nsIThread* aIOThread,
+          const ConstructorGuard&);
+  ~Manager();
+
+  NS_DECL_OWNINGTHREAD
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(cache::Manager)
+};
+
+}  
+}  
+}  
+
+#endif  // mozilla_dom_cache_Manager_h

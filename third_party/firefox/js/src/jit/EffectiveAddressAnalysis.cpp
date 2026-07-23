@@ -1,0 +1,143 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/EffectiveAddressAnalysis.h"
+
+#include "jit/IonAnalysis.h"
+#include "jit/MIR-wasm.h"
+#include "jit/MIR.h"
+#include "jit/MIRGenerator.h"
+#include "jit/MIRGraph.h"
+
+using namespace js;
+using namespace jit;
+
+
+
+
+static bool OffsetIsSmallEnough(int32_t imm) {
+#if defined(JS_CODEGEN_X86) || defined(JS_CODEGEN_X64)
+  return true;
+#elif defined(JS_CODEGEN_ARM64) || defined(JS_CODEGEN_ARM)
+  return imm >= -0xFFFF && imm <= 0xFFFF;
+#elif defined(JS_CODEGEN_RISCV64) || defined(JS_CODEGEN_LOONG64) || \
+    defined(JS_CODEGEN_MIPS64)
+  return imm >= -0xFFF && imm <= 0xFFF;
+#elif defined(JS_CODEGEN_WASM32) || defined(JS_CODEGEN_NONE)
+  return true;
+#else
+#  error "This needs to be filled in for your platform"
+#endif
+}
+
+static std::pair<MDefinition*, int32_t> IsShiftBy123(MDefinition* def) {
+  MOZ_ASSERT(def->type() == MIRType::Int32);
+  if (!def->isLsh()) {
+    return std::pair(nullptr, 0);
+  }
+  MLsh* lsh = def->toLsh();
+  if (lsh->isRecoveredOnBailout()) {
+    return std::pair(nullptr, 0);
+  }
+  MDefinition* shamt = lsh->rhs();
+  MOZ_ASSERT(shamt->type() == MIRType::Int32);
+  MConstant* con = shamt->maybeConstantValue();
+  if (!con || con->toInt32() < 1 || con->toInt32() > 3) {
+    return std::pair(nullptr, 0);
+  }
+  return std::pair(lsh->lhs(), con->toInt32());
+}
+
+static void TryMatchShiftAdd(TempAllocator& alloc, MAdd* root) {
+  MOZ_ASSERT(root->isAdd());
+  MOZ_ASSERT(root->type() == MIRType::Int32);
+  MOZ_ASSERT(root->hasUses());
+
+
+  MDefinition* base = nullptr;
+  MDefinition* index = nullptr;
+  int32_t shift = 0;
+
+  auto pair = IsShiftBy123(root->rhs());
+  MOZ_ASSERT((pair.first == nullptr) == (pair.second == 0));
+  if (pair.first) {
+    base = root->lhs();
+    index = pair.first;
+    shift = pair.second;
+  } else {
+    pair = IsShiftBy123(root->lhs());
+    MOZ_ASSERT((pair.first == nullptr) == (pair.second == 0));
+    if (pair.first) {
+      base = root->rhs();
+      index = pair.first;
+      shift = pair.second;
+    }
+  }
+
+  if (!base) {
+    return;
+  }
+  MOZ_ASSERT(shift >= 1 && shift <= 3);
+
+  if (root->isRecoveredOnBailout()) {
+    return;
+  }
+
+  Scale scale = ShiftToScale(shift);
+  MOZ_ASSERT(scale != TimesOne);
+
+  MInstruction* replacement = nullptr;
+  if (base->maybeConstantValue()) {
+    int32_t baseValue = base->maybeConstantValue()->toInt32();
+    if (baseValue == 0) {
+      return;
+    }
+    if (!OffsetIsSmallEnough(baseValue)) {
+      return;
+    }
+    replacement = MEffectiveAddress2::New(alloc, index, scale, baseValue);
+  } else {
+    replacement = MEffectiveAddress3::New(alloc, base, index, scale, 0);
+  }
+
+  root->replaceAllUsesWith(replacement);
+  root->block()->insertAfter(root, replacement);
+
+  if (JitSpewEnabled(JitSpew_EAA)) {
+    AutoJitSpewMessage msg(JitSpew_EAA, "  create: '");
+    DumpMIRDefinition(msg.printer(), replacement, false);
+    msg.append("'");
+  }
+}
+
+
+bool EffectiveAddressAnalysis::analyze() {
+  JitSpew(JitSpew_EAA, "Begin");
+
+  for (ReversePostorderIterator block(graph_.rpoBegin());
+       block != graph_.rpoEnd(); block++) {
+
+    MInstructionReverseIterator ri(block->rbegin());
+    while (ri != block->rend()) {
+      MInstruction* curr = *ri;
+      ri++;
+
+      if (MOZ_LIKELY(!curr->isAdd())) {
+        continue;
+      }
+      if (curr->type() != MIRType::Int32 || !curr->hasUses()) {
+        continue;
+      }
+
+      if (MOZ_UNLIKELY(!graph_.alloc().ensureBallast())) {
+        return false;
+      }
+
+      TryMatchShiftAdd(graph_.alloc(), curr->toAdd());
+    }
+  }
+
+  JitSpew(JitSpew_EAA, "End");
+  return true;
+}

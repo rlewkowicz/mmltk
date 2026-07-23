@@ -1,0 +1,1864 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "vm/JSFunction-inl.h"
+
+#include "mozilla/Maybe.h"
+
+#include "jsapi.h"
+#include "jstypes.h"
+
+#include "builtin/Array.h"
+#include "builtin/BigInt.h"
+#include "builtin/Object.h"
+#include "builtin/Symbol.h"
+#include "frontend/BytecodeCompiler.h"  // frontend::{CompileStandaloneFunction, CompileStandaloneGenerator, CompileStandaloneAsyncFunction, CompileStandaloneAsyncGenerator, DelazifyCanonicalScriptedFunction}
+#include "frontend/FrontendContext.h"  // AutoReportFrontendContext, ManualReportFrontendContext
+#include "frontend/Stencil.h"  // js::DumpFunctionFlagsItems
+#include "jit/InlinableNatives.h"
+#include "jit/Ion.h"
+#include "js/CallNonGenericMethod.h"
+#include "js/CompilationAndEvaluation.h"
+#include "js/CompileOptions.h"
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#include "js/friend/StackLimits.h"    // js::AutoCheckRecursionLimit
+#include "js/Printer.h"               // js::GenericPrinter
+#include "js/PropertySpec.h"
+#include "js/SourceText.h"
+#include "js/StableStringChars.h"
+#include "js/Wrapper.h"
+#include "util/StringBuilder.h"
+#include "util/Text.h"
+#include "vm/BooleanObject.h"
+#include "vm/BoundFunctionObject.h"
+#include "vm/Compartment.h"
+#include "vm/FunctionFlags.h"          // js::FunctionFlags
+#include "vm/GeneratorAndAsyncKind.h"  // js::GeneratorKind, js::FunctionAsyncKind
+#include "vm/GlobalObject.h"
+#include "vm/Interpreter.h"
+#include "vm/JSAtomUtils.h"  // ToAtom
+#include "vm/JSContext.h"
+#include "vm/JSObject.h"
+#include "vm/JSONPrinter.h"  // js::JSONPrinter
+#include "vm/JSScript.h"
+#include "vm/NumberObject.h"
+#include "vm/PlainObject.h"  // js::PlainObject
+#include "vm/SelfHosting.h"
+#include "vm/Shape.h"
+#include "vm/StringObject.h"
+#include "wasm/WasmCode.h"
+#include "wasm/WasmInstance.h"
+#include "vm/Interpreter-inl.h"
+#include "vm/JSScript-inl.h"
+
+using namespace js;
+
+using mozilla::Maybe;
+using mozilla::Some;
+
+using JS::AutoStableStringChars;
+using JS::CompileOptions;
+using JS::SourceText;
+
+static bool fun_enumerate(JSContext* cx, HandleObject obj) {
+  MOZ_ASSERT(obj->is<JSFunction>());
+
+  RootedId id(cx);
+  bool found;
+
+  if (obj->as<JSFunction>().needsPrototypeProperty()) {
+    id = NameToId(cx->names().prototype);
+    if (!HasOwnProperty(cx, obj, id, &found)) {
+      return false;
+    }
+  }
+
+  if (!obj->as<JSFunction>().hasResolvedLength()) {
+    id = NameToId(cx->names().length);
+    if (!HasOwnProperty(cx, obj, id, &found)) {
+      return false;
+    }
+  }
+
+  if (!obj->as<JSFunction>().hasResolvedName()) {
+    id = NameToId(cx->names().name);
+    if (!HasOwnProperty(cx, obj, id, &found)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool IsFunction(HandleValue v) {
+  return v.isObject() && v.toObject().is<JSFunction>();
+}
+
+static bool AdvanceToActiveCallLinear(JSContext* cx,
+                                      NonBuiltinScriptFrameIter& iter,
+                                      HandleFunction fun) {
+  MOZ_ASSERT(!fun->isBuiltin());
+
+  for (; !iter.done(); ++iter) {
+    if (!iter.isFunctionFrame()) {
+      continue;
+    }
+    if (iter.matchCallee(cx, fun)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void js::ThrowTypeErrorBehavior(JSContext* cx) {
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                            JSMSG_THROW_TYPE_ERROR);
+}
+
+static bool IsSloppyNormalFunction(JSFunction* fun) {
+  if (fun->kind() == FunctionFlags::NormalFunction) {
+    if (fun->isBuiltin()) {
+      return false;
+    }
+
+    if (fun->isGenerator() || fun->isAsync()) {
+      return false;
+    }
+
+    MOZ_ASSERT(fun->isInterpreted());
+    return !fun->strict();
+  }
+
+  return false;
+}
+
+static bool ArgumentsRestrictions(JSContext* cx, HandleFunction fun) {
+  if (!IsSloppyNormalFunction(fun)) {
+    ThrowTypeErrorBehavior(cx);
+    return false;
+  }
+
+  return true;
+}
+
+static bool ArgumentsGetterImpl(JSContext* cx, const CallArgs& args) {
+  MOZ_ASSERT(IsFunction(args.thisv()));
+
+  RootedFunction fun(cx, &args.thisv().toObject().as<JSFunction>());
+  if (!ArgumentsRestrictions(cx, fun)) {
+    return false;
+  }
+
+
+  NonBuiltinScriptFrameIter iter(cx);
+  if (!AdvanceToActiveCallLinear(cx, iter, fun)) {
+    args.rval().setNull();
+    return true;
+  }
+
+  Rooted<ArgumentsObject*> argsobj(cx,
+                                   ArgumentsObject::createUnexpected(cx, iter));
+  if (!argsobj) {
+    return false;
+  }
+
+#ifndef JS_CODEGEN_NONE
+  JSScript* script = iter.script();
+  jit::ForbidCompilation(cx, script);
+#endif
+
+  args.rval().setObject(*argsobj);
+  return true;
+}
+
+static bool ArgumentsGetter(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsFunction, ArgumentsGetterImpl>(cx, args);
+}
+
+static bool ArgumentsSetterImpl(JSContext* cx, const CallArgs& args) {
+  MOZ_ASSERT(IsFunction(args.thisv()));
+
+  RootedFunction fun(cx, &args.thisv().toObject().as<JSFunction>());
+  if (!ArgumentsRestrictions(cx, fun)) {
+    return false;
+  }
+
+  args.rval().setUndefined();
+  return true;
+}
+
+static bool ArgumentsSetter(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsFunction, ArgumentsSetterImpl>(cx, args);
+}
+
+static bool CallerRestrictions(JSContext* cx, HandleFunction fun) {
+  if (!IsSloppyNormalFunction(fun)) {
+    ThrowTypeErrorBehavior(cx);
+    return false;
+  }
+
+  return true;
+}
+
+static bool CallerGetterImpl(JSContext* cx, const CallArgs& args) {
+  MOZ_ASSERT(IsFunction(args.thisv()));
+
+  RootedFunction fun(cx, &args.thisv().toObject().as<JSFunction>());
+  if (!CallerRestrictions(cx, fun)) {
+    return false;
+  }
+
+  NonBuiltinScriptFrameIter iter(cx);
+  if (!AdvanceToActiveCallLinear(cx, iter, fun)) {
+    args.rval().setNull();
+    return true;
+  }
+
+  ++iter;
+  while (!iter.done() && iter.isEvalFrame()) {
+    ++iter;
+  }
+
+  if (iter.done() || !iter.isFunctionFrame()) {
+    args.rval().setNull();
+    return true;
+  }
+
+  RootedObject caller(cx, iter.callee(cx));
+  if (!cx->compartment()->wrap(cx, &caller)) {
+    return false;
+  }
+
+  {
+    JSObject* callerObj = CheckedUnwrapStatic(caller);
+    if (!callerObj) {
+      args.rval().setNull();
+      return true;
+    }
+
+    if (JS_IsDeadWrapper(callerObj)) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                JSMSG_DEAD_OBJECT);
+      return false;
+    }
+
+    JSFunction* callerFun = &callerObj->as<JSFunction>();
+    MOZ_ASSERT(!callerFun->isBuiltin(),
+               "non-builtin iterator returned a builtin?");
+
+    if (callerFun->strict() || callerFun->isAsync() ||
+        callerFun->isGenerator()) {
+      args.rval().setNull();
+      return true;
+    }
+  }
+
+  args.rval().setObject(*caller);
+  return true;
+}
+
+static bool CallerGetter(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsFunction, CallerGetterImpl>(cx, args);
+}
+
+static bool CallerSetterImpl(JSContext* cx, const CallArgs& args) {
+  MOZ_ASSERT(IsFunction(args.thisv()));
+
+
+  if (!CallerGetterImpl(cx, args)) {
+    return false;
+  }
+
+  args.rval().setUndefined();
+  return true;
+}
+
+static bool CallerSetter(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsFunction, CallerSetterImpl>(cx, args);
+}
+
+static const JSPropertySpec function_properties[] = {
+    JS_PSGS("arguments", ArgumentsGetter, ArgumentsSetter, 0),
+    JS_PSGS("caller", CallerGetter, CallerSetter, 0),
+    JS_PS_END,
+};
+
+static bool ResolveInterpretedFunctionPrototype(JSContext* cx,
+                                                HandleFunction fun,
+                                                HandleId id) {
+  MOZ_ASSERT(fun->isInterpreted());
+  MOZ_ASSERT(id == NameToId(cx->names().prototype));
+
+  MOZ_ASSERT(!IsInternalFunctionObject(*fun));
+
+  bool isGenerator = fun->isGenerator();
+  Rooted<GlobalObject*> global(cx, &fun->global());
+  RootedObject objProto(cx);
+  if (isGenerator && fun->isAsync()) {
+    objProto = GlobalObject::getOrCreateAsyncGeneratorPrototype(cx, global);
+  } else if (isGenerator) {
+    objProto = GlobalObject::getOrCreateGeneratorObjectPrototype(cx, global);
+  } else {
+    objProto = &global->getObjectPrototype();
+  }
+  if (!objProto) {
+    return false;
+  }
+
+  Rooted<PlainObject*> proto(
+      cx, NewPlainObjectWithProto(cx, objProto, {.newKind = TenuredObject}));
+  if (!proto) {
+    return false;
+  }
+
+  if (!isGenerator) {
+    RootedValue objVal(cx, ObjectValue(*fun));
+    if (!DefineDataProperty(cx, proto, cx->names().constructor, objVal, 0)) {
+      return false;
+    }
+  }
+
+  RootedValue protoVal(cx, ObjectValue(*proto));
+  return DefineDataProperty(cx, fun, id, protoVal,
+                            JSPROP_PERMANENT | JSPROP_RESOLVING);
+}
+
+bool JSFunction::needsPrototypeProperty() {
+  return !isBuiltin() && (isConstructor() || isGenerator());
+}
+
+bool JSFunction::hasNonConfigurablePrototypeDataProperty() {
+  if (!isBuiltin()) {
+    return needsPrototypeProperty();
+  }
+
+  if (isSelfHostedBuiltin()) {
+    if (!isConstructor()) {
+      return false;
+    }
+#ifdef DEBUG
+    PropertyName* prototypeName =
+        runtimeFromMainThread()->commonNames->prototype;
+    Maybe<PropertyInfo> prop = lookupPure(prototypeName);
+    MOZ_ASSERT(prop.isSome());
+    MOZ_ASSERT(prop->isDataProperty());
+    MOZ_ASSERT(!prop->configurable());
+#endif
+    return true;
+  }
+
+  if (!isConstructor()) {
+    return false;
+  }
+
+  PropertyName* prototypeName = runtimeFromMainThread()->commonNames->prototype;
+  Maybe<PropertyInfo> prop = lookupPure(prototypeName);
+  return prop.isSome() && prop->isDataProperty() && !prop->configurable();
+}
+
+uint32_t JSFunction::wasmFuncIndex() const {
+  MOZ_ASSERT(isWasm());
+  if (!isNativeWithJitEntry()) {
+    uintptr_t tagged = uintptr_t(nativeJitInfoOrInterpretedScript());
+    MOZ_ASSERT(tagged & 1);
+    return tagged >> 1;
+  }
+  return wasmInstance().code().funcIndexFromJitEntry(wasmJitEntry());
+}
+
+void JSFunction::initWasm(uint32_t funcIndex, wasm::Instance* instance,
+                          const wasm::SuperTypeVector* superTypeVector,
+                          void* uncheckedCallEntry) {
+  MOZ_ASSERT(isWasm());
+  MOZ_ASSERT(!isWasmWithJitEntry());
+  MOZ_ASSERT(!nativeJitInfoOrInterpretedScript());
+
+  uintptr_t tagged = (uintptr_t(funcIndex) << 1) | 1;
+  setNativeJitInfoOrInterpretedScript(reinterpret_cast<void*>(tagged));
+  setExtendedSlot(FunctionExtended::WASM_INSTANCE_SLOT,
+                  JS::PrivateValue(instance));
+  setExtendedSlot(FunctionExtended::WASM_STV_SLOT,
+                  JS::PrivateValue((void*)superTypeVector));
+  setExtendedSlot(FunctionExtended::WASM_FUNC_UNCHECKED_ENTRY_SLOT,
+                  JS::PrivateValue(uncheckedCallEntry));
+}
+
+void JSFunction::initWasmWithJitEntry(
+    void** entry, wasm::Instance* instance,
+    const wasm::SuperTypeVector* superTypeVector, void* uncheckedCallEntry) {
+  MOZ_ASSERT(*entry);
+  MOZ_ASSERT(isWasm());
+  MOZ_ASSERT(!isWasmWithJitEntry());
+
+  setFlags(flags().setNativeJitEntry());
+  setNativeJitInfoOrInterpretedScript(entry);
+
+  setExtendedSlot(FunctionExtended::WASM_INSTANCE_SLOT,
+                  JS::PrivateValue(instance));
+  setExtendedSlot(FunctionExtended::WASM_STV_SLOT,
+                  JS::PrivateValue((void*)superTypeVector));
+  setExtendedSlot(FunctionExtended::WASM_FUNC_UNCHECKED_ENTRY_SLOT,
+                  JS::PrivateValue(uncheckedCallEntry));
+
+  MOZ_ASSERT(isWasmWithJitEntry());
+}
+
+void* JSFunction::wasmUncheckedCallEntry() const {
+  MOZ_ASSERT(isWasm());
+  return getExtendedSlot(FunctionExtended::WASM_FUNC_UNCHECKED_ENTRY_SLOT)
+      .toPrivate();
+}
+
+void* JSFunction::wasmCheckedCallEntry() const {
+  uint8_t* codeRangeBase;
+  const wasm::CodeRange* codeRange;
+  wasmInstance().code().funcCodeRange(wasmFuncIndex(), &codeRange,
+                                      &codeRangeBase);
+  return codeRangeBase + codeRange->funcCheckedCallEntry();
+}
+
+static bool fun_mayResolve(const JSAtomState& names, jsid id, JSObject*) {
+  if (!id.isAtom()) {
+    return false;
+  }
+
+  JSAtom* atom = id.toAtom();
+  return atom == names.prototype || atom == names.length || atom == names.name;
+}
+
+bool JSFunction::getExplicitName(JSContext* cx,
+                                 JS::MutableHandle<JSAtom*> name) {
+  if (isAccessorWithLazyName()) {
+    JSAtom* accessorName = getAccessorNameForLazy(cx);
+    if (!accessorName) {
+      return false;
+    }
+
+    name.set(accessorName);
+    return true;
+  }
+
+  name.set(maybePartialExplicitName());
+  return true;
+}
+
+bool JSFunction::getDisplayAtom(JSContext* cx,
+                                JS::MutableHandle<JSAtom*> name) {
+  if (isAccessorWithLazyName()) {
+    JSAtom* accessorName = getAccessorNameForLazy(cx);
+    if (!accessorName) {
+      return false;
+    }
+
+    name.set(accessorName);
+    return true;
+  }
+
+  name.set(maybePartialDisplayAtom());
+  return true;
+}
+
+static JSAtom* NameToPrefixedFunctionName(JSContext* cx, JSString* nameStr,
+                                          FunctionPrefixKind prefixKind) {
+  MOZ_ASSERT(prefixKind != FunctionPrefixKind::None);
+
+  StringBuilder sb(cx);
+  if (prefixKind == FunctionPrefixKind::Get) {
+    if (!sb.append("get ")) {
+      return nullptr;
+    }
+  } else {
+    if (!sb.append("set ")) {
+      return nullptr;
+    }
+  }
+  if (!sb.append(nameStr)) {
+    return nullptr;
+  }
+  return sb.finishAtom();
+}
+
+static JSAtom* NameToFunctionName(JSContext* cx, HandleValue name,
+                                  FunctionPrefixKind prefixKind) {
+  MOZ_ASSERT(name.isString() || name.isNumeric());
+
+  if (prefixKind == FunctionPrefixKind::None) {
+    return ToAtom<CanGC>(cx, name);
+  }
+
+  JSString* nameStr = ToString(cx, name);
+  if (!nameStr) {
+    return nullptr;
+  }
+
+  return NameToPrefixedFunctionName(cx, nameStr, prefixKind);
+}
+
+JSAtom* JSFunction::getAccessorNameForLazy(JSContext* cx) {
+  MOZ_ASSERT(isAccessorWithLazyName());
+
+  JSAtom* name = NameToPrefixedFunctionName(
+      cx, rawAtom(),
+      isGetter() ? FunctionPrefixKind::Get : FunctionPrefixKind::Set);
+  if (!name) {
+    return nullptr;
+  }
+
+  setAtom(name);
+  setFlags(flags().clearLazyAccessorName());
+  return name;
+}
+
+static bool fun_resolve(JSContext* cx, HandleObject obj, HandleId id,
+                        bool* resolvedp) {
+  if (!id.isAtom()) {
+    return true;
+  }
+
+  RootedFunction fun(cx, &obj->as<JSFunction>());
+
+  if (id.isAtom(cx->names().prototype)) {
+    if (!fun->needsPrototypeProperty()) {
+      return true;
+    }
+
+    if (!ResolveInterpretedFunctionPrototype(cx, fun, id)) {
+      return false;
+    }
+
+    *resolvedp = true;
+    return true;
+  }
+
+  bool isLength = id.isAtom(cx->names().length);
+  if (isLength || id.isAtom(cx->names().name)) {
+    MOZ_ASSERT(!IsInternalFunctionObject(*obj));
+
+    RootedValue v(cx);
+
+    if (isLength) {
+      if (fun->hasResolvedLength()) {
+        return true;
+      }
+
+      uint16_t len = 0;
+      if (!JSFunction::getUnresolvedLength(cx, fun, &len)) {
+        return false;
+      }
+      v.setInt32(len);
+    } else {
+      if (fun->hasResolvedName()) {
+        return true;
+      }
+
+      JSAtom* name = fun->getUnresolvedName(cx);
+      if (!name) {
+        return false;
+      }
+      v.setString(name);
+    }
+
+    if (!NativeDefineDataProperty(cx, fun, id, v,
+                                  JSPROP_READONLY | JSPROP_RESOLVING)) {
+      return false;
+    }
+
+    if (isLength) {
+      fun->setResolvedLength();
+    } else {
+      fun->setResolvedName();
+    }
+
+    *resolvedp = true;
+    return true;
+  }
+
+  return true;
+}
+
+static bool fun_symbolHasInstance(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (args.length() < 1) {
+    args.rval().setBoolean(false);
+    return true;
+  }
+
+  HandleValue func = args.thisv();
+
+  if (!func.isObject()) {
+    args.rval().setBoolean(false);
+    return true;
+  }
+
+  RootedObject obj(cx, &func.toObject());
+
+  bool result;
+  if (!OrdinaryHasInstance(cx, obj, args[0], &result)) {
+    return false;
+  }
+
+  args.rval().setBoolean(result);
+  return true;
+}
+
+bool JS::OrdinaryHasInstance(JSContext* cx, HandleObject objArg, HandleValue v,
+                             bool* bp) {
+  AssertHeapIsIdle();
+  cx->check(objArg, v);
+
+  RootedObject obj(cx, objArg);
+
+  if (!obj->isCallable()) {
+    *bp = false;
+    return true;
+  }
+
+  if (obj->is<BoundFunctionObject>()) {
+    AutoCheckRecursionLimit recursion(cx);
+    if (!recursion.check(cx)) {
+      return false;
+    }
+    obj = obj->as<BoundFunctionObject>().getTarget();
+    return InstanceofOperator(cx, obj, v, bp);
+  }
+
+  if (!v.isObject()) {
+    *bp = false;
+    return true;
+  }
+
+  RootedValue pval(cx);
+  if (!GetProperty(cx, obj, obj, cx->names().prototype, &pval)) {
+    return false;
+  }
+
+  if (pval.isPrimitive()) {
+    RootedValue val(cx, ObjectValue(*obj));
+    ReportValueError(cx, JSMSG_BAD_PROTOTYPE, -1, val, nullptr);
+    return false;
+  }
+
+  RootedObject pobj(cx, &pval.toObject());
+  bool isPrototype;
+  if (!IsPrototypeOf(cx, pobj, &v.toObject(), &isPrototype)) {
+    return false;
+  }
+  *bp = isPrototype;
+  return true;
+}
+
+inline void JSFunction::trace(JSTracer* trc) {
+  MOZ_ASSERT(!getFixedSlot(NativeJitInfoOrInterpretedScriptSlot).isGCThing());
+  if (isInterpreted() && hasBaseScript()) {
+    if (BaseScript* script = baseScript()) {
+      TraceManuallyBarrieredEdge(trc, &script, "JSFunction script");
+      if (baseScript() != script) {
+        HeapSlot& slot = getFixedSlotRef(NativeJitInfoOrInterpretedScriptSlot);
+        slot.unbarrieredSet(JS::PrivateValue(script));
+      }
+    }
+  }
+  if (isWasm()) {
+    const Value& v = getExtendedSlot(FunctionExtended::WASM_INSTANCE_SLOT);
+    if (!v.isUndefined()) {
+      auto* instance = static_cast<wasm::Instance*>(v.toPrivate());
+      wasm::TraceInstanceEdge(trc, instance, "JSFunction instance");
+    }
+  }
+}
+
+static void fun_trace(JSTracer* trc, JSObject* obj) {
+  obj->as<JSFunction>().trace(trc);
+}
+
+static JSObject* CreateFunctionConstructor(JSContext* cx, JSProtoKey key) {
+  RootedObject functionProto(cx, &cx->global()->getPrototype(JSProto_Function));
+
+  return NewFunctionWithProto(
+      cx, Function, 1, FunctionFlags::NATIVE_CTOR, nullptr,
+      Handle<PropertyName*>(cx->names().Function), functionProto,
+      gc::AllocKind::FUNCTION, TenuredObject);
+}
+
+static bool FunctionPrototype(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  args.rval().setUndefined();
+  return true;
+}
+
+static JSObject* CreateFunctionPrototype(JSContext* cx, JSProtoKey key) {
+  RootedObject objectProto(cx, &cx->global()->getPrototype(JSProto_Object));
+
+  return NewFunctionWithProto(
+      cx, FunctionPrototype, 0, FunctionFlags::NATIVE_FUN, nullptr,
+      Handle<PropertyName*>(cx->names().empty_), objectProto,
+      gc::AllocKind::FUNCTION, TenuredObject);
+}
+
+JSString* js::FunctionToStringCache::lookup(BaseScript* script) const {
+  for (size_t i = 0; i < NumEntries; i++) {
+    if (entries_[i].script == script) {
+      return entries_[i].string;
+    }
+  }
+  return nullptr;
+}
+
+void js::FunctionToStringCache::put(BaseScript* script, JSString* string) {
+  for (size_t i = NumEntries - 1; i > 0; i--) {
+    entries_[i] = entries_[i - 1];
+  }
+
+  entries_[0].set(script, string);
+}
+
+JSString* js::FunctionToString(JSContext* cx, HandleFunction fun,
+                               bool isToSource) {
+  bool haveSource = fun->isInterpreted() && !fun->isSelfHostedBuiltin();
+
+  bool addParentheses =
+      haveSource && isToSource && (fun->isLambda() && !fun->isArrow());
+
+  if (haveSource) {
+    if (!ScriptSource::loadSource(cx, fun->baseScript()->scriptSource(),
+                                  &haveSource)) {
+      return nullptr;
+    }
+  }
+
+  if (!addParentheses && haveSource) {
+    FunctionToStringCache& cache = cx->zone()->functionToStringCache();
+    if (JSString* str = cache.lookup(fun->baseScript())) {
+      return str;
+    }
+
+    BaseScript* script = fun->baseScript();
+    size_t start = script->toStringStart();
+    size_t end = script->toStringEnd();
+    JSString* str =
+        (end - start <= ScriptSource::SourceDeflateLimit)
+            ? script->scriptSource()->substring(cx, start, end)
+            : script->scriptSource()->substringDontDeflate(cx, start, end);
+    if (!str) {
+      return nullptr;
+    }
+
+    cache.put(fun->baseScript(), str);
+    return str;
+  }
+
+  JSStringBuilder out(cx);
+  if (addParentheses) {
+    if (!out.append('(')) {
+      return nullptr;
+    }
+  }
+
+  if (haveSource) {
+    if (!fun->baseScript()->appendSourceDataForToString(cx, out)) {
+      return nullptr;
+    }
+  } else if (!isToSource) {
+
+    auto hasGetterOrSetterPrefix = [](JSAtom* name) {
+      auto hasGetterOrSetterPrefix = [](const auto* chars) {
+        return (chars[0] == 'g' || chars[0] == 's') && chars[1] == 'e' &&
+               chars[2] == 't' && chars[3] == ' ';
+      };
+
+      JS::AutoCheckCannotGC nogc;
+      return name->length() >= 4 &&
+             (name->hasLatin1Chars()
+                  ? hasGetterOrSetterPrefix(name->latin1Chars(nogc))
+                  : hasGetterOrSetterPrefix(name->twoByteChars(nogc)));
+    };
+
+    if (!out.append("function")) {
+      return nullptr;
+    }
+
+    if (fun->maybePartialExplicitName() &&
+        (fun->kind() == FunctionFlags::NormalFunction ||
+         (fun->isBuiltinNative() && (fun->kind() == FunctionFlags::Getter ||
+                                     fun->kind() == FunctionFlags::Setter)) ||
+         fun->kind() == FunctionFlags::Wasm ||
+         fun->kind() == FunctionFlags::ClassConstructor)) {
+      if (!out.append(' ')) {
+        return nullptr;
+      }
+
+      JSAtom* name = fun->maybePartialExplicitName();
+      size_t offset = hasGetterOrSetterPrefix(name) ? 4 : 0;
+      if (!out.appendSubstring(name, offset, name->length() - offset)) {
+        return nullptr;
+      }
+    }
+
+    if (!out.append("() {\n    [native code]\n}")) {
+      return nullptr;
+    }
+  } else {
+    if (fun->isAsync()) {
+      if (!out.append("async ")) {
+        return nullptr;
+      }
+    }
+
+    if (!fun->isArrow()) {
+      if (!out.append("function")) {
+        return nullptr;
+      }
+
+      if (fun->isGenerator()) {
+        if (!out.append('*')) {
+          return nullptr;
+        }
+      }
+    }
+
+    JS::Rooted<JSAtom*> name(cx);
+    if (!fun->getExplicitName(cx, &name)) {
+      return nullptr;
+    }
+
+    if (name) {
+      if (!out.append(' ')) {
+        return nullptr;
+      }
+      if (!out.append(name)) {
+        return nullptr;
+      }
+    }
+
+    if (!out.append("() {\n    [native code]\n}")) {
+      return nullptr;
+    }
+  }
+
+  if (addParentheses) {
+    if (!out.append(')')) {
+      return nullptr;
+    }
+  }
+
+  return out.finishString();
+}
+
+JSString* js::fun_toStringHelper(JSContext* cx, HandleObject obj,
+                                 bool isToSource) {
+  if (!obj->is<JSFunction>()) {
+    if (JSFunToStringOp op = obj->getOpsFunToString()) {
+      return op(cx, obj, isToSource);
+    }
+
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_INCOMPATIBLE_PROTO, "Function", "toString",
+                              "object");
+    return nullptr;
+  }
+
+  return FunctionToString(cx, obj.as<JSFunction>(), isToSource);
+}
+
+bool js::fun_toString(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  MOZ_ASSERT(IsFunctionObject(args.calleev()));
+
+  RootedObject obj(cx, ToObject(cx, args.thisv()));
+  if (!obj) {
+    return false;
+  }
+
+  JSString* str = fun_toStringHelper(cx, obj,  false);
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+static bool fun_toSource(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  MOZ_ASSERT(IsFunctionObject(args.calleev()));
+
+  RootedObject obj(cx, ToObject(cx, args.thisv()));
+  if (!obj) {
+    return false;
+  }
+
+  RootedString str(cx);
+  if (obj->isCallable()) {
+    str = fun_toStringHelper(cx, obj,  true);
+  } else {
+    str = ObjectToSource(cx, obj);
+  }
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+bool js::fun_call(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  HandleValue func = args.thisv();
+
+  if (!IsCallable(func)) {
+    ReportIncompatibleMethod(cx, args, &FunctionClass);
+    return false;
+  }
+
+  size_t argCount = args.length();
+  if (argCount > 0) {
+    argCount--;  
+  }
+
+  InvokeArgs iargs(cx);
+  if (!iargs.init(cx, argCount)) {
+    return false;
+  }
+
+  for (size_t i = 0; i < argCount; i++) {
+    iargs[i].set(args[i + 1]);
+  }
+
+  return Call(cx, func, args.get(0), iargs, args.rval(), CallReason::FunCall);
+}
+
+bool js::fun_apply(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  HandleValue fval = args.thisv();
+  if (!IsCallable(fval)) {
+    ReportIncompatibleMethod(cx, args, &FunctionClass);
+    return false;
+  }
+
+  if (args.length() < 2 || args[1].isNullOrUndefined()) {
+    return fun_call(cx, (args.length() > 0) ? 1 : 0, vp);
+  }
+
+  if (!args[1].isObject()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_BAD_APPLY_ARGS, "apply");
+    return false;
+  }
+
+  RootedObject aobj(cx, &args[1].toObject());
+  uint64_t length;
+  if (!GetLengthProperty(cx, aobj, &length)) {
+    return false;
+  }
+
+  InvokeArgs args2(cx);
+  if (!args2.init(cx, length)) {
+    return false;
+  }
+
+  MOZ_ASSERT(length <= ARGS_LENGTH_MAX);
+
+  if (!GetElements(cx, aobj, length, args2.array())) {
+    return false;
+  }
+
+  return Call(cx, fval, args[0], args2, args.rval(), CallReason::FunCall);
+}
+
+static const JSFunctionSpec function_methods[] = {
+    JS_FN("toSource", fun_toSource, 0, 0),
+    JS_FN("toString", fun_toString, 0, 0),
+    JS_FN("apply", fun_apply, 2, 0),
+    JS_FN("call", fun_call, 1, 0),
+    JS_INLINABLE_FN("bind", BoundFunctionObject::functionBind, 1, 0,
+                    FunctionBind),
+    JS_SYM_FN(hasInstance, fun_symbolHasInstance, 1,
+              JSPROP_READONLY | JSPROP_PERMANENT),
+    JS_FS_END,
+};
+
+static const JSClassOps JSFunctionClassOps = {
+    .enumerate = fun_enumerate,
+    .resolve = fun_resolve,
+    .mayResolve = fun_mayResolve,
+    .trace = fun_trace,
+};
+
+static const ClassSpec JSFunctionClassSpec = {
+    CreateFunctionConstructor, CreateFunctionPrototype, nullptr, nullptr,
+    function_methods,          function_properties,
+};
+
+const JSClass js::FunctionClass = {
+    "Function",
+    JSCLASS_HAS_CACHED_PROTO(JSProto_Function) |
+        JSCLASS_HAS_RESERVED_SLOTS(JSFunction::SlotCount),
+    &JSFunctionClassOps,
+    &JSFunctionClassSpec,
+};
+
+const JSClass js::ExtendedFunctionClass = {
+    "Function",
+    JSCLASS_HAS_CACHED_PROTO(JSProto_Function) |
+        JSCLASS_HAS_RESERVED_SLOTS(FunctionExtended::SlotCount),
+    &JSFunctionClassOps,
+    &JSFunctionClassSpec,
+};
+
+const JSClass* const js::FunctionClassPtr = &FunctionClass;
+const JSClass* const js::FunctionExtendedClassPtr = &ExtendedFunctionClass;
+
+bool JSFunction::isDerivedClassConstructor() const {
+  bool derived = hasBaseScript() && baseScript()->isDerivedClassConstructor();
+  MOZ_ASSERT_IF(derived, isClassConstructor());
+  return derived;
+}
+
+bool JSFunction::isSyntheticFunction() const {
+  bool synthetic = hasBaseScript() && baseScript()->isSyntheticFunction();
+  MOZ_ASSERT_IF(synthetic, isMethod());
+  return synthetic;
+}
+
+bool JSFunction::delazifyLazilyInterpretedFunction(JSContext* cx,
+                                                   HandleFunction fun) {
+  MOZ_ASSERT(fun->hasBaseScript());
+  MOZ_ASSERT(cx->compartment() == fun->compartment());
+
+  AutoRealm ar(cx, fun);
+
+  Rooted<BaseScript*> lazy(cx, fun->baseScript());
+  RootedFunction canonicalFun(cx, lazy->function());
+
+  if (fun != canonicalFun) {
+    JSScript* script = JSFunction::getOrCreateScript(cx, canonicalFun);
+    if (!script) {
+      return false;
+    }
+
+    MOZ_ASSERT(fun->hasBytecode());
+    return true;
+  }
+
+  AutoReportFrontendContext fc(cx);
+  if (!frontend::DelazifyCanonicalScriptedFunction(cx, &fc, fun)) {
+    MOZ_ASSERT(fun->baseScript() == lazy);
+    MOZ_ASSERT(lazy->isReadyForDelazification());
+    return false;
+  }
+
+  return true;
+}
+
+bool JSFunction::delazifySelfHostedLazyFunction(JSContext* cx,
+                                                js::HandleFunction fun) {
+  MOZ_ASSERT(cx->compartment() == fun->compartment());
+
+  AutoRealm ar(cx, fun);
+
+  MOZ_ASSERT(fun->isSelfHostedBuiltin());
+  Rooted<PropertyName*> funName(cx, GetClonedSelfHostedFunctionName(fun));
+  if (!funName) {
+    return false;
+  }
+  return cx->runtime()->delazifySelfHostedFunction(cx, funName, fun);
+}
+
+void JSFunction::maybeRelazify(JSRuntime* rt) {
+  MOZ_ASSERT(!isIncomplete(), "Cannot relazify incomplete functions");
+
+  Realm* realm = this->realm();
+  if (!rt->allowRelazificationForTesting) {
+    if (realm->compartment()->gcState.hasEnteredRealm) {
+      return;
+    }
+
+    MOZ_ASSERT(!realm->hasBeenEnteredIgnoringJit());
+  }
+
+  if (realm->isDebuggee()) {
+    return;
+  }
+
+  if (coverage::IsLCovEnabled()) {
+    return;
+  }
+
+  JSScript* script = nonLazyScript();
+  if (!script->allowRelazify()) {
+    return;
+  }
+  MOZ_ASSERT(script->isRelazifiable());
+
+  if (script->hasJitScript()) {
+    return;
+  }
+
+  if (isSelfHostedBuiltin()) {
+    gc::PreWriteBarrier(script);
+    initSelfHostedLazyScript(&rt->selfHostedLazyScript.ref());
+  } else {
+    script->relazify(rt);
+  }
+}
+
+js::GeneratorKind JSFunction::clonedSelfHostedGeneratorKind() const {
+  MOZ_ASSERT(hasSelfHostedLazyScript());
+
+  MOZ_RELEASE_ASSERT(isExtended());
+  PropertyName* name = GetClonedSelfHostedFunctionName(this);
+  return runtimeFromMainThread()->getSelfHostedFunctionGeneratorKind(name);
+}
+
+static bool CreateDynamicFunction(JSContext* cx, const CallArgs& args,
+                                  GeneratorKind generatorKind,
+                                  FunctionAsyncKind asyncKind) {
+  using namespace frontend;
+
+  bool isGenerator = generatorKind == GeneratorKind::Generator;
+  bool isAsync = asyncKind == FunctionAsyncKind::AsyncFunction;
+
+  RootedScript maybeScript(cx);
+  const char* filename;
+  uint32_t lineno;
+  bool mutedErrors;
+  uint32_t pcOffset;
+  DescribeScriptedCallerForCompilation(cx, &maybeScript, &filename, &lineno,
+                                       &pcOffset, &mutedErrors);
+
+  const char* introductionType = "Function";
+  if (isAsync) {
+    if (isGenerator) {
+      introductionType = "AsyncGenerator";
+    } else {
+      introductionType = "AsyncFunction";
+    }
+  } else if (isGenerator) {
+    introductionType = "GeneratorFunction";
+  }
+
+  const char* introducerFilename = filename;
+  if (maybeScript && maybeScript->scriptSource()->introducerFilename()) {
+    introducerFilename = maybeScript->scriptSource()->introducerFilename();
+  }
+
+  CompileOptions options(cx);
+  options.setMutedErrors(mutedErrors)
+      .setFileAndLine(filename, 1)
+      .setNoScriptRval(false)
+      .setIntroductionInfo(introducerFilename, introductionType, lineno,
+                           pcOffset)
+      .setDeferDebugMetadata();
+
+  JSStringBuilder sb(cx);
+
+  if (isAsync) {
+    if (!sb.append("async ")) {
+      return false;
+    }
+  }
+  if (!sb.append("function")) {
+    return false;
+  }
+  if (isGenerator) {
+    if (!sb.append('*')) {
+      return false;
+    }
+  }
+
+  if (!sb.append(" anonymous(")) {
+    return false;
+  }
+
+  JS::RootedVector<JSString*> parameterStrings(cx);
+  JS::RootedVector<Value> parameterArgs(cx);
+  if (args.length() > 1) {
+    RootedString str(cx);
+
+    unsigned n = args.length() - 1;
+    if (!parameterStrings.reserve(n) || !parameterArgs.reserve(n)) {
+      return false;
+    }
+
+    for (unsigned i = 0; i < n; i++) {
+      if (!parameterArgs.append(args[i])) {
+        return false;
+      }
+
+      str = ToString<CanGC>(cx, args[i]);
+      if (!str) {
+        return false;
+      }
+
+      if (!parameterStrings.append(str)) {
+        return false;
+      }
+
+      if (!sb.append(str)) {
+        return false;
+      }
+
+      if (i < args.length() - 2) {
+        if (!sb.append(',')) {
+          return false;
+        }
+      }
+    }
+  }
+
+  if (!sb.append('\n')) {
+    return false;
+  }
+
+  Maybe<uint32_t> parameterListEnd = Some(uint32_t(sb.length()));
+  static_assert(FunctionConstructorMedialSigils[0] == ')');
+
+  if (!sb.append(FunctionConstructorMedialSigils.data(),
+                 FunctionConstructorMedialSigils.length())) {
+    return false;
+  }
+
+  JS::RootedValue bodyArg(cx);
+  RootedString bodyString(cx);
+  if (args.length() > 0) {
+    bodyArg = args[args.length() - 1];
+    bodyString = ToString<CanGC>(cx, bodyArg);
+    if (!bodyString || !sb.append(bodyString)) {
+      return false;
+    }
+  }
+
+  if (!sb.append(FunctionConstructorFinalBrace.data(),
+                 FunctionConstructorFinalBrace.length())) {
+    return false;
+  }
+
+  if (!sb.ensureTwoByteChars()) {
+    return false;
+  }
+
+  RootedString functionText(cx, sb.finishString());
+  if (!functionText) {
+    return false;
+  }
+
+  bool canCompileStrings = cx->bypassCSPForDebugger;
+
+  if (!canCompileStrings &&
+      !cx->isRuntimeCodeGenEnabled(JS::RuntimeCode::JS, functionText,
+                                   JS::CompilationType::Function,
+                                   parameterStrings, bodyString, parameterArgs,
+                                   bodyArg, &canCompileStrings)) {
+    return false;
+  }
+  if (!canCompileStrings) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_CSP_BLOCKED_FUNCTION);
+    return false;
+  }
+
+  AutoStableStringChars linearChars(cx);
+  if (!linearChars.initTwoByte(cx, functionText)) {
+    return false;
+  }
+
+  SourceText<char16_t> srcBuf;
+  if (!srcBuf.initMaybeBorrowed(cx, linearChars)) {
+    return false;
+  }
+
+  FunctionSyntaxKind syntaxKind = FunctionSyntaxKind::Expression;
+
+  RootedFunction fun(cx);
+  JSProtoKey protoKey;
+  if (isAsync) {
+    if (isGenerator) {
+      fun = CompileStandaloneAsyncGenerator(cx, options, srcBuf,
+                                            parameterListEnd, syntaxKind);
+      protoKey = JSProto_AsyncGeneratorFunction;
+    } else {
+      fun = CompileStandaloneAsyncFunction(cx, options, srcBuf,
+                                           parameterListEnd, syntaxKind);
+      protoKey = JSProto_AsyncFunction;
+    }
+  } else {
+    if (isGenerator) {
+      fun = CompileStandaloneGenerator(cx, options, srcBuf, parameterListEnd,
+                                       syntaxKind);
+      protoKey = JSProto_GeneratorFunction;
+    } else {
+      fun = CompileStandaloneFunction(cx, options, srcBuf, parameterListEnd,
+                                      syntaxKind);
+      protoKey = JSProto_Function;
+    }
+  }
+  if (!fun) {
+    return false;
+  }
+
+  RootedValue undefValue(cx);
+  RootedScript funScript(cx, JS_GetFunctionScript(cx, fun));
+  JS::InstantiateOptions instantiateOptions(options);
+  if (funScript &&
+      !UpdateDebugMetadata(cx, funScript, instantiateOptions, undefValue,
+                           nullptr, maybeScript, maybeScript)) {
+    return false;
+  }
+
+  if (fun->isInterpreted()) {
+    fun->initEnvironment(&cx->global()->lexicalEnvironment());
+  }
+
+  RootedObject proto(cx);
+  if (!GetPrototypeFromBuiltinConstructor(cx, args, protoKey, &proto)) {
+    return false;
+  }
+
+  if (proto && !SetPrototype(cx, fun, proto)) {
+    return false;
+  }
+
+  args.rval().setObject(*fun);
+  return true;
+}
+
+bool js::Function(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CreateDynamicFunction(cx, args, GeneratorKind::NotGenerator,
+                               FunctionAsyncKind::SyncFunction);
+}
+
+bool js::Generator(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CreateDynamicFunction(cx, args, GeneratorKind::Generator,
+                               FunctionAsyncKind::SyncFunction);
+}
+
+bool js::AsyncFunctionConstructor(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CreateDynamicFunction(cx, args, GeneratorKind::NotGenerator,
+                               FunctionAsyncKind::AsyncFunction);
+}
+
+bool js::AsyncGeneratorConstructor(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CreateDynamicFunction(cx, args, GeneratorKind::Generator,
+                               FunctionAsyncKind::AsyncFunction);
+}
+
+bool JSFunction::isBuiltinFunctionConstructor() {
+  return maybeNative() == Function || maybeNative() == Generator;
+}
+
+bool JSFunction::needsExtraBodyVarEnvironment() const {
+  if (isNativeFun()) {
+    return false;
+  }
+
+  if (!nonLazyScript()->functionHasExtraBodyVarScope()) {
+    return false;
+  }
+
+  return nonLazyScript()->functionExtraBodyVarScope()->hasEnvironment();
+}
+
+bool JSFunction::needsNamedLambdaEnvironment() const {
+  if (!isNamedLambda()) {
+    return false;
+  }
+
+  LexicalScope* scope = nonLazyScript()->maybeNamedLambdaScope();
+  if (!scope) {
+    return false;
+  }
+
+  return scope->hasEnvironment();
+}
+
+bool JSFunction::needsCallObject() const {
+  if (isNativeFun()) {
+    return false;
+  }
+
+  MOZ_ASSERT(hasBytecode());
+
+  MOZ_ASSERT_IF(
+      baseScript()->funHasExtensibleScope() || isGenerator() || isAsync(),
+      nonLazyScript()->bodyScope()->hasEnvironment());
+
+  return nonLazyScript()->bodyScope()->hasEnvironment();
+}
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+void JSFunction::dumpOwnFields(js::JSONPrinter& json) const {
+  if (maybePartialDisplayAtom()) {
+    js::GenericPrinter& out =
+        json.beginStringProperty("maybePartialDisplayAtom");
+    maybePartialDisplayAtom()->dumpPropertyName(out);
+    json.endStringProperty();
+  }
+
+  if (hasBaseScript()) {
+    js::GenericPrinter& out = json.beginStringProperty("baseScript");
+    baseScript()->dumpStringContent(out);
+    json.endStringProperty();
+  }
+
+  json.property("nargs", nargs());
+
+  json.beginInlineListProperty("flags");
+  DumpFunctionFlagsItems(json, flags());
+  json.endInlineList();
+
+  if (isNativeFun()) {
+    json.formatProperty("native", "0x%p", native());
+    if (hasJitInfo()) {
+      json.formatProperty("jitInfo", "0x%p", jitInfo());
+    }
+  }
+}
+
+void JSFunction::dumpOwnStringContent(js::GenericPrinter& out) const {
+  if (maybePartialDisplayAtom() && maybePartialDisplayAtom()->length() > 0) {
+    maybePartialDisplayAtom()->dumpPropertyName(out);
+  } else {
+    out.put("(anonymous)");
+  }
+
+  if (hasBaseScript()) {
+    out.put(" (");
+    baseScript()->dumpStringContent(out);
+    out.put(")");
+  }
+}
+#endif
+
+#ifdef DEBUG
+static JSObject* SkipEnvironmentObjects(JSObject* env) {
+  if (!env) {
+    return nullptr;
+  }
+  while (env->is<EnvironmentObject>()) {
+    env = &env->as<EnvironmentObject>().enclosingEnvironment();
+  }
+  return env;
+}
+
+static bool NewFunctionEnvironmentIsWellFormed(JSContext* cx,
+                                               HandleObject env) {
+  JSObject* terminatingEnv = SkipEnvironmentObjects(env);
+  return !terminatingEnv || terminatingEnv == cx->global() ||
+         terminatingEnv->is<DebugEnvironmentProxy>();
+}
+#endif
+
+static inline const JSClass* FunctionClassForAllocKind(
+    gc::AllocKind allocKind) {
+  return (allocKind == gc::AllocKind::FUNCTION) ? FunctionClassPtr
+                                                : FunctionExtendedClassPtr;
+}
+
+static void AssertClassMatchesAllocKind(const JSClass* clasp,
+                                        gc::AllocKind kind) {
+#ifdef DEBUG
+  if (kind == gc::AllocKind::FUNCTION_EXTENDED) {
+    MOZ_ASSERT(clasp == FunctionExtendedClassPtr);
+  } else {
+    MOZ_ASSERT(kind == gc::AllocKind::FUNCTION);
+    MOZ_ASSERT(clasp == FunctionClassPtr);
+  }
+#endif
+}
+
+static SharedShape* GetFunctionShape(JSContext* cx, const JSClass* clasp,
+                                     JSObject* proto, gc::AllocKind allocKind) {
+  AssertClassMatchesAllocKind(clasp, allocKind);
+
+  size_t nfixed = GetGCKindSlots(allocKind);
+  return SharedShape::getInitialShape(
+      cx, clasp, cx->realm(), TaggedProto(proto), nfixed, ObjectFlags());
+}
+
+SharedShape* GlobalObject::createFunctionShapeWithDefaultProto(JSContext* cx,
+                                                               bool extended) {
+  GlobalObjectData& data = cx->global()->data();
+  GCPtr<SharedShape*>& shapeRef =
+      extended ? data.extendedFunctionShapeWithDefaultProto
+               : data.functionShapeWithDefaultProto;
+  MOZ_ASSERT(!shapeRef);
+
+  RootedObject proto(cx,
+                     GlobalObject::getOrCreatePrototype(cx, JSProto_Function));
+  if (!proto) {
+    return nullptr;
+  }
+
+  if (shapeRef) {
+    return shapeRef;
+  }
+
+  gc::AllocKind allocKind =
+      extended ? gc::AllocKind::FUNCTION_EXTENDED : gc::AllocKind::FUNCTION;
+  const JSClass* clasp = FunctionClassForAllocKind(allocKind);
+
+  SharedShape* shape = GetFunctionShape(cx, clasp, proto, allocKind);
+  if (!shape) {
+    return nullptr;
+  }
+
+  shapeRef.init(shape);
+  return shape;
+}
+
+JSFunction* js::NewFunctionWithProto(
+    JSContext* cx, Native native, unsigned nargs, FunctionFlags flags,
+    HandleObject enclosingEnv, Handle<JSAtom*> atom, HandleObject proto,
+    gc::AllocKind allocKind ,
+    NewObjectKind newKind ) {
+  MOZ_ASSERT(allocKind == gc::AllocKind::FUNCTION ||
+             allocKind == gc::AllocKind::FUNCTION_EXTENDED);
+  MOZ_ASSERT_IF(native, !enclosingEnv);
+  MOZ_ASSERT(NewFunctionEnvironmentIsWellFormed(cx, enclosingEnv));
+
+
+  const JSClass* clasp = FunctionClassForAllocKind(allocKind);
+
+  Rooted<SharedShape*> shape(cx);
+  if (!proto) {
+    bool extended = (allocKind == gc::AllocKind::FUNCTION_EXTENDED);
+    shape = GlobalObject::getFunctionShapeWithDefaultProto(cx, extended);
+  } else {
+    shape = GetFunctionShape(cx, clasp, proto, allocKind);
+  }
+  if (!shape) {
+    return nullptr;
+  }
+
+  gc::Heap heap = GetInitialHeap(newKind, clasp);
+  JSFunction* fun = JSFunction::create(cx, allocKind, heap, shape);
+  if (!fun) {
+    return nullptr;
+  }
+
+  if (allocKind == gc::AllocKind::FUNCTION_EXTENDED) {
+    flags.setIsExtended();
+  }
+
+  MOZ_ASSERT(!flags.hasSelfHostedLazyScript());
+  MOZ_ASSERT(!flags.isWasmWithJitEntry());
+
+  fun->setArgCount(uint16_t(nargs));
+  fun->setFlags(flags);
+  if (fun->isInterpreted()) {
+    fun->initScript(nullptr);
+    fun->initEnvironment(enclosingEnv);
+  } else {
+    MOZ_ASSERT(fun->isNativeFun());
+    fun->initNative(native, nullptr);
+  }
+  fun->initAtom(atom);
+
+#ifdef DEBUG
+  fun->assertFunctionKindIntegrity();
+#endif
+
+  return fun;
+}
+
+bool js::GetFunctionPrototype(JSContext* cx, js::GeneratorKind generatorKind,
+                              js::FunctionAsyncKind asyncKind,
+                              js::MutableHandleObject proto) {
+  if (generatorKind == js::GeneratorKind::NotGenerator) {
+    if (asyncKind == js::FunctionAsyncKind::SyncFunction) {
+      proto.set(nullptr);
+      return true;
+    }
+
+    proto.set(
+        GlobalObject::getOrCreateAsyncFunctionPrototype(cx, cx->global()));
+  } else {
+    if (asyncKind == js::FunctionAsyncKind::SyncFunction) {
+      proto.set(GlobalObject::getOrCreateGeneratorFunctionPrototype(
+          cx, cx->global()));
+    } else {
+      proto.set(GlobalObject::getOrCreateAsyncGenerator(cx, cx->global()));
+    }
+  }
+  return !!proto;
+}
+
+#ifdef DEBUG
+static bool CanReuseScriptForClone(JS::Realm* realm, HandleFunction fun,
+                                   HandleObject newEnclosingEnv) {
+  MOZ_ASSERT(fun->isInterpreted());
+
+  if (realm != fun->realm()) {
+    return false;
+  }
+
+  if (newEnclosingEnv->is<GlobalObject>()) {
+    return true;
+  }
+
+  if (IsSyntacticEnvironment(newEnclosingEnv)) {
+    return true;
+  }
+
+  BaseScript* script = fun->baseScript();
+  return script->hasNonSyntacticScope() ||
+         script->enclosingScope()->hasOnChain(ScopeKind::NonSyntactic);
+}
+#endif
+
+static inline JSFunction* NewFunctionClone(JSContext* cx, HandleFunction fun,
+                                           HandleObject proto,
+                                           gc::Heap heap = gc::Heap::Default,
+                                           gc::AllocSite* site = nullptr) {
+  MOZ_ASSERT(cx->realm() == fun->realm());
+  MOZ_ASSERT(proto);
+
+  const JSClass* clasp = fun->getClass();
+  gc::AllocKind allocKind = fun->getAllocKind();
+  AssertClassMatchesAllocKind(clasp, allocKind);
+
+  Rooted<SharedShape*> shape(cx);
+  if (fun->staticPrototype() == proto) {
+    shape = fun->sharedShape();
+    MOZ_ASSERT(shape->propMapLength() == 0);
+    MOZ_ASSERT(shape->objectFlags().isEmpty());
+    MOZ_ASSERT(shape->realm() == cx->realm());
+  } else {
+    shape = GetFunctionShape(cx, clasp, proto, allocKind);
+    if (!shape) {
+      return nullptr;
+    }
+  }
+
+  JSFunction* clone = JSFunction::create(cx, allocKind, heap, shape, site);
+  if (!clone) {
+    return nullptr;
+  }
+
+  MOZ_ASSERT(!fun->flags().hasResolvedLength());
+  MOZ_ASSERT(!fun->flags().hasResolvedName());
+
+  clone->setArgCount(fun->nargs());
+  clone->setFlags(fun->flags());
+
+  clone->initAtom(fun->maybePartialDisplayAtom());
+
+#ifdef DEBUG
+  clone->assertFunctionKindIntegrity();
+#endif
+
+  return clone;
+}
+
+JSFunction* js::CloneFunctionReuseScript(JSContext* cx, HandleFunction fun,
+                                         HandleObject enclosingEnv,
+                                         HandleObject proto, gc::Heap heap,
+                                         gc::AllocSite* site) {
+  MOZ_ASSERT(cx->realm() == fun->realm());
+  MOZ_ASSERT(NewFunctionEnvironmentIsWellFormed(cx, enclosingEnv));
+  MOZ_ASSERT(fun->isInterpreted());
+  MOZ_ASSERT(fun->hasBaseScript());
+  MOZ_ASSERT(CanReuseScriptForClone(cx->realm(), fun, enclosingEnv));
+
+  JSFunction* clone = NewFunctionClone(cx, fun, proto, heap, site);
+  if (!clone) {
+    return nullptr;
+  }
+
+  BaseScript* base = fun->baseScript();
+  clone->initScript(base);
+  clone->initEnvironment(enclosingEnv);
+
+#ifdef DEBUG
+  if (fun->isExtended()) {
+    for (unsigned i = 0; i < FunctionExtended::NUM_EXTENDED_SLOTS; i++) {
+      MOZ_ASSERT(fun->getExtendedSlot(i).isUndefined());
+      MOZ_ASSERT(clone->getExtendedSlot(i).isUndefined());
+    }
+  }
+#endif
+
+  return clone;
+}
+
+static JSAtom* SymbolToFunctionName(JSContext* cx, JS::Symbol* symbol,
+                                    FunctionPrefixKind prefixKind) {
+  JSAtom* desc = symbol->description();
+
+  if (!desc && prefixKind == FunctionPrefixKind::None) {
+    return cx->names().empty_;
+  }
+
+  StringBuilder sb(cx);
+  if (prefixKind == FunctionPrefixKind::Get) {
+    if (!sb.append("get ")) {
+      return nullptr;
+    }
+  } else if (prefixKind == FunctionPrefixKind::Set) {
+    if (!sb.append("set ")) {
+      return nullptr;
+    }
+  }
+
+  if (desc) {
+    if (symbol->isPrivateName()) {
+      if (!sb.append(desc)) {
+        return nullptr;
+      }
+    } else {
+      if (!sb.append('[') || !sb.append(desc) || !sb.append(']')) {
+        return nullptr;
+      }
+    }
+  }
+  return sb.finishAtom();
+}
+
+JSAtom* js::IdToFunctionName(
+    JSContext* cx, HandleId id,
+    FunctionPrefixKind prefixKind ) {
+  MOZ_ASSERT(id.isString() || id.isSymbol() || id.isInt());
+
+  if (id.isAtom() && prefixKind == FunctionPrefixKind::None) {
+    return id.toAtom();
+  }
+
+
+  if (id.isSymbol()) {
+    return SymbolToFunctionName(cx, id.toSymbol(), prefixKind);
+  }
+
+  RootedValue idv(cx, IdToValue(id));
+  return NameToFunctionName(cx, idv, prefixKind);
+}
+
+bool js::SetFunctionName(JSContext* cx, HandleFunction fun, HandleValue name,
+                         FunctionPrefixKind prefixKind) {
+  MOZ_ASSERT(name.isString() || name.isSymbol() || name.isNumeric());
+
+  MOZ_ASSERT(!fun->hasInferredName());
+
+  MOZ_ASSERT(!fun->containsPure(cx->names().name));
+  MOZ_ASSERT(!fun->hasResolvedName());
+
+  JSAtom* funName = name.isSymbol()
+                        ? SymbolToFunctionName(cx, name.toSymbol(), prefixKind)
+                        : NameToFunctionName(cx, name, prefixKind);
+  if (!funName) {
+    return false;
+  }
+
+  fun->setInferredName(funName);
+
+  return true;
+}
+
+JSFunction* js::DefineFunction(
+    JSContext* cx, HandleObject obj, HandleId id, Native native, unsigned nargs,
+    unsigned flags, gc::AllocKind allocKind ) {
+  Rooted<JSAtom*> atom(cx, IdToFunctionName(cx, id));
+  if (!atom) {
+    return nullptr;
+  }
+
+  MOZ_ASSERT(native);
+
+  RootedFunction fun(cx);
+  if (flags & JSFUN_CONSTRUCTOR) {
+    fun = NewNativeConstructor(cx, native, nargs, atom, allocKind);
+  } else {
+    fun = NewNativeFunction(cx, native, nargs, atom, allocKind);
+  }
+
+  if (!fun) {
+    return nullptr;
+  }
+
+  RootedValue funVal(cx, ObjectValue(*fun));
+  if (!DefineDataProperty(cx, obj, id, funVal, flags & ~JSFUN_FLAGS_MASK)) {
+    return nullptr;
+  }
+
+  return fun;
+}
+
+void js::ReportIncompatibleMethod(JSContext* cx, const CallArgs& args,
+                                  const JSClass* clasp) {
+  HandleValue thisv = args.thisv();
+
+#ifdef DEBUG
+  switch (thisv.type()) {
+    case ValueType::Object:
+      MOZ_ASSERT(thisv.toObject().getClass() != clasp ||
+                 !thisv.toObject().is<NativeObject>() ||
+                 !thisv.toObject().staticPrototype() ||
+                 thisv.toObject().staticPrototype()->getClass() != clasp);
+      break;
+    case ValueType::String:
+      MOZ_ASSERT(clasp != &StringObject::class_);
+      break;
+    case ValueType::Double:
+    case ValueType::Int32:
+      MOZ_ASSERT(clasp != &NumberObject::class_);
+      break;
+    case ValueType::Boolean:
+      MOZ_ASSERT(clasp != &BooleanObject::class_);
+      break;
+    case ValueType::Symbol:
+      MOZ_ASSERT(clasp != &SymbolObject::class_);
+      break;
+    case ValueType::BigInt:
+      MOZ_ASSERT(clasp != &BigIntObject::class_);
+      break;
+    case ValueType::Undefined:
+    case ValueType::Null:
+      break;
+    case ValueType::Magic:
+    case ValueType::PrivateGCThing:
+      MOZ_CRASH("unexpected type");
+  }
+#endif
+
+  if (JSFunction* fun = ReportIfNotFunction(cx, args.calleev())) {
+    UniqueChars funNameBytes;
+    if (const char* funName = GetFunctionNameBytes(cx, fun, &funNameBytes)) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_INCOMPATIBLE_PROTO, clasp->name, funName,
+                               InformalValueTypeName(thisv));
+    }
+  }
+}
+
+void js::ReportIncompatible(JSContext* cx, const CallArgs& args) {
+  if (JSFunction* fun = ReportIfNotFunction(cx, args.calleev())) {
+    UniqueChars funNameBytes;
+    if (const char* funName = GetFunctionNameBytes(cx, fun, &funNameBytes)) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_INCOMPATIBLE_METHOD, funName, "method",
+                               InformalValueTypeName(args.thisv()));
+    }
+  }
+}
+
+namespace JS {
+namespace detail {
+
+JS_PUBLIC_API void CheckIsValidConstructible(const Value& calleev) {
+  MOZ_ASSERT(calleev.toObject().isConstructor());
+}
+
+}  
+}  

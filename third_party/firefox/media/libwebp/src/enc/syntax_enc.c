@@ -1,0 +1,348 @@
+// Copyright 2011 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#include <assert.h>
+#include <stddef.h>
+
+#include "src/dec/common_dec.h"
+#include "src/webp/types.h"
+#include "src/enc/vp8i_enc.h"
+#include "src/utils/bit_writer_utils.h"
+#include "src/utils/utils.h"
+#include "src/webp/encode.h"
+#include "src/webp/format_constants.h"  // RIFF constants
+#include "src/webp/mux_types.h"         // ALPHA_FLAG
+
+
+static int IsVP8XNeeded(const VP8Encoder* const enc) {
+  return !!enc->has_alpha;  
+}
+
+static int PutPaddingByte(const WebPPicture* const pic) {
+  const uint8_t pad_byte[1] = { 0 };
+  return !!pic->writer(pad_byte, 1, pic);
+}
+
+
+static WebPEncodingError PutRIFFHeader(const VP8Encoder* const enc,
+                                       size_t riff_size) {
+  const WebPPicture* const pic = enc->pic;
+  uint8_t riff[RIFF_HEADER_SIZE] = {
+    'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'E', 'B', 'P'
+  };
+  assert(riff_size == (uint32_t)riff_size);
+  PutLE32(riff + TAG_SIZE, (uint32_t)riff_size);
+  if (!pic->writer(riff, sizeof(riff), pic)) {
+    return VP8_ENC_ERROR_BAD_WRITE;
+  }
+  return VP8_ENC_OK;
+}
+
+static WebPEncodingError PutVP8XHeader(const VP8Encoder* const enc) {
+  const WebPPicture* const pic = enc->pic;
+  uint8_t vp8x[CHUNK_HEADER_SIZE + VP8X_CHUNK_SIZE] = {
+    'V', 'P', '8', 'X'
+  };
+  uint32_t flags = 0;
+
+  assert(IsVP8XNeeded(enc));
+  assert(pic->width >= 1 && pic->height >= 1);
+  assert(pic->width <= MAX_CANVAS_SIZE && pic->height <= MAX_CANVAS_SIZE);
+
+  if (enc->has_alpha) {
+    flags |= ALPHA_FLAG;
+  }
+
+  PutLE32(vp8x + TAG_SIZE,              VP8X_CHUNK_SIZE);
+  PutLE32(vp8x + CHUNK_HEADER_SIZE,     flags);
+  PutLE24(vp8x + CHUNK_HEADER_SIZE + 4, pic->width - 1);
+  PutLE24(vp8x + CHUNK_HEADER_SIZE + 7, pic->height - 1);
+  if (!pic->writer(vp8x, sizeof(vp8x), pic)) {
+    return VP8_ENC_ERROR_BAD_WRITE;
+  }
+  return VP8_ENC_OK;
+}
+
+static WebPEncodingError PutAlphaChunk(const VP8Encoder* const enc) {
+  const WebPPicture* const pic = enc->pic;
+  uint8_t alpha_chunk_hdr[CHUNK_HEADER_SIZE] = {
+    'A', 'L', 'P', 'H'
+  };
+
+  assert(enc->has_alpha);
+
+  PutLE32(alpha_chunk_hdr + TAG_SIZE, enc->alpha_data_size);
+  if (!pic->writer(alpha_chunk_hdr, sizeof(alpha_chunk_hdr), pic)) {
+    return VP8_ENC_ERROR_BAD_WRITE;
+  }
+
+  if (!pic->writer(enc->alpha_data, enc->alpha_data_size, pic)) {
+    return VP8_ENC_ERROR_BAD_WRITE;
+  }
+
+  if ((enc->alpha_data_size & 1) && !PutPaddingByte(pic)) {
+    return VP8_ENC_ERROR_BAD_WRITE;
+  }
+  return VP8_ENC_OK;
+}
+
+static WebPEncodingError PutVP8Header(const WebPPicture* const pic,
+                                      size_t vp8_size) {
+  uint8_t vp8_chunk_hdr[CHUNK_HEADER_SIZE] = {
+    'V', 'P', '8', ' '
+  };
+  assert(vp8_size == (uint32_t)vp8_size);
+  PutLE32(vp8_chunk_hdr + TAG_SIZE, (uint32_t)vp8_size);
+  if (!pic->writer(vp8_chunk_hdr, sizeof(vp8_chunk_hdr), pic)) {
+    return VP8_ENC_ERROR_BAD_WRITE;
+  }
+  return VP8_ENC_OK;
+}
+
+static WebPEncodingError PutVP8FrameHeader(const WebPPicture* const pic,
+                                           int profile, size_t size0) {
+  uint8_t vp8_frm_hdr[VP8_FRAME_HEADER_SIZE];
+  uint32_t bits;
+
+  if (size0 >= VP8_MAX_PARTITION0_SIZE) {  
+    return VP8_ENC_ERROR_PARTITION0_OVERFLOW;
+  }
+
+  bits = 0                         
+       | (profile << 1)            
+       | (1 << 4)                  
+       | ((uint32_t)size0 << 5);   
+  vp8_frm_hdr[0] = (bits >>  0) & 0xff;
+  vp8_frm_hdr[1] = (bits >>  8) & 0xff;
+  vp8_frm_hdr[2] = (bits >> 16) & 0xff;
+  vp8_frm_hdr[3] = (VP8_SIGNATURE >> 16) & 0xff;
+  vp8_frm_hdr[4] = (VP8_SIGNATURE >>  8) & 0xff;
+  vp8_frm_hdr[5] = (VP8_SIGNATURE >>  0) & 0xff;
+  vp8_frm_hdr[6] = pic->width & 0xff;
+  vp8_frm_hdr[7] = pic->width >> 8;
+  vp8_frm_hdr[8] = pic->height & 0xff;
+  vp8_frm_hdr[9] = pic->height >> 8;
+
+  if (!pic->writer(vp8_frm_hdr, sizeof(vp8_frm_hdr), pic)) {
+    return VP8_ENC_ERROR_BAD_WRITE;
+  }
+  return VP8_ENC_OK;
+}
+
+static int PutWebPHeaders(const VP8Encoder* const enc, size_t size0,
+                          size_t vp8_size, size_t riff_size) {
+  WebPPicture* const pic = enc->pic;
+  WebPEncodingError err = VP8_ENC_OK;
+
+  err = PutRIFFHeader(enc, riff_size);
+  if (err != VP8_ENC_OK) goto Error;
+
+  if (IsVP8XNeeded(enc)) {
+    err = PutVP8XHeader(enc);
+    if (err != VP8_ENC_OK) goto Error;
+  }
+
+  if (enc->has_alpha) {
+    err = PutAlphaChunk(enc);
+    if (err != VP8_ENC_OK) goto Error;
+  }
+
+  err = PutVP8Header(pic, vp8_size);
+  if (err != VP8_ENC_OK) goto Error;
+
+  err = PutVP8FrameHeader(pic, enc->profile, size0);
+  if (err != VP8_ENC_OK) goto Error;
+
+  return 1;
+
+ Error:
+  return WebPEncodingSetError(pic, err);
+}
+
+static void PutSegmentHeader(VP8BitWriter* const bw,
+                             const VP8Encoder* const enc) {
+  const VP8EncSegmentHeader* const hdr = &enc->segment_hdr;
+  const VP8EncProba* const proba = &enc->proba;
+  if (VP8PutBitUniform(bw, (hdr->num_segments > 1))) {
+    const int update_data = 1;
+    int s;
+    VP8PutBitUniform(bw, hdr->update_map);
+    if (VP8PutBitUniform(bw, update_data)) {
+      VP8PutBitUniform(bw, 1);   
+      for (s = 0; s < NUM_MB_SEGMENTS; ++s) {
+        VP8PutSignedBits(bw, enc->dqm[s].quant, 7);
+      }
+      for (s = 0; s < NUM_MB_SEGMENTS; ++s) {
+        VP8PutSignedBits(bw, enc->dqm[s].fstrength, 6);
+      }
+    }
+    if (hdr->update_map) {
+      for (s = 0; s < 3; ++s) {
+        if (VP8PutBitUniform(bw, (proba->segments[s] != 255u))) {
+          VP8PutBits(bw, proba->segments[s], 8);
+        }
+      }
+    }
+  }
+}
+
+static void PutFilterHeader(VP8BitWriter* const bw,
+                            const VP8EncFilterHeader* const hdr) {
+  const int use_lf_delta = (hdr->i4x4_lf_delta != 0);
+  VP8PutBitUniform(bw, hdr->simple);
+  VP8PutBits(bw, hdr->level, 6);
+  VP8PutBits(bw, hdr->sharpness, 3);
+  if (VP8PutBitUniform(bw, use_lf_delta)) {
+    const int need_update = (hdr->i4x4_lf_delta != 0);
+    if (VP8PutBitUniform(bw, need_update)) {
+      VP8PutBits(bw, 0, 4);
+      VP8PutSignedBits(bw, hdr->i4x4_lf_delta, 6);
+      VP8PutBits(bw, 0, 3);    
+    }
+  }
+}
+
+static void PutQuant(VP8BitWriter* const bw,
+                     const VP8Encoder* const enc) {
+  VP8PutBits(bw, enc->base_quant, 7);
+  VP8PutSignedBits(bw, enc->dq_y1_dc, 4);
+  VP8PutSignedBits(bw, enc->dq_y2_dc, 4);
+  VP8PutSignedBits(bw, enc->dq_y2_ac, 4);
+  VP8PutSignedBits(bw, enc->dq_uv_dc, 4);
+  VP8PutSignedBits(bw, enc->dq_uv_ac, 4);
+}
+
+static int EmitPartitionsSize(const VP8Encoder* const enc,
+                              WebPPicture* const pic) {
+  uint8_t buf[3 * (MAX_NUM_PARTITIONS - 1)];
+  int p;
+  for (p = 0; p < enc->num_parts - 1; ++p) {
+    const size_t part_size = VP8BitWriterSize(enc->parts + p);
+    if (part_size >= VP8_MAX_PARTITION_SIZE) {
+      return WebPEncodingSetError(pic, VP8_ENC_ERROR_PARTITION_OVERFLOW);
+    }
+    buf[3 * p + 0] = (part_size >>  0) & 0xff;
+    buf[3 * p + 1] = (part_size >>  8) & 0xff;
+    buf[3 * p + 2] = (part_size >> 16) & 0xff;
+  }
+  if (p && !pic->writer(buf, 3 * p, pic)) {
+    return WebPEncodingSetError(pic, VP8_ENC_ERROR_BAD_WRITE);
+  }
+  return 1;
+}
+
+
+static int GeneratePartition0(VP8Encoder* const enc) {
+  VP8BitWriter* const bw = &enc->bw;
+  const int mb_size = enc->mb_w * enc->mb_h;
+  uint64_t pos1, pos2, pos3;
+
+  pos1 = VP8BitWriterPos(bw);
+  if (!VP8BitWriterInit(bw, mb_size * 7 / 8)) {        
+    return WebPEncodingSetError(enc->pic, VP8_ENC_ERROR_OUT_OF_MEMORY);
+  }
+  VP8PutBitUniform(bw, 0);   
+  VP8PutBitUniform(bw, 0);   
+
+  PutSegmentHeader(bw, enc);
+  PutFilterHeader(bw, &enc->filter_hdr);
+  VP8PutBits(bw, enc->num_parts == 8 ? 3 :
+                 enc->num_parts == 4 ? 2 :
+                 enc->num_parts == 2 ? 1 : 0, 2);
+  PutQuant(bw, enc);
+  VP8PutBitUniform(bw, 0);   
+  VP8WriteProbas(bw, &enc->proba);
+  pos2 = VP8BitWriterPos(bw);
+  VP8CodeIntraModes(enc);
+  VP8BitWriterFinish(bw);
+
+  pos3 = VP8BitWriterPos(bw);
+
+#if !defined(WEBP_DISABLE_STATS)
+  if (enc->pic->stats) {
+    enc->pic->stats->header_bytes[0] = (int)((pos2 - pos1 + 7) >> 3);
+    enc->pic->stats->header_bytes[1] = (int)((pos3 - pos2 + 7) >> 3);
+    enc->pic->stats->alpha_data_size = (int)enc->alpha_data_size;
+  }
+#else
+  (void)pos1;
+  (void)pos2;
+  (void)pos3;
+#endif
+  if (bw->error) {
+    return WebPEncodingSetError(enc->pic, VP8_ENC_ERROR_OUT_OF_MEMORY);
+  }
+  return 1;
+}
+
+void VP8EncFreeBitWriters(VP8Encoder* const enc) {
+  int p;
+  VP8BitWriterWipeOut(&enc->bw);
+  for (p = 0; p < enc->num_parts; ++p) {
+    VP8BitWriterWipeOut(enc->parts + p);
+  }
+}
+
+int VP8EncWrite(VP8Encoder* const enc) {
+  WebPPicture* const pic = enc->pic;
+  VP8BitWriter* const bw = &enc->bw;
+  const int task_percent = 19;
+  const int percent_per_part = task_percent / enc->num_parts;
+  const int final_percent = enc->percent + task_percent;
+  int ok = 0;
+  size_t vp8_size, pad, riff_size;
+  int p;
+
+  ok = GeneratePartition0(enc);
+  if (!ok) return 0;
+
+  vp8_size = VP8_FRAME_HEADER_SIZE +
+             VP8BitWriterSize(bw) +
+             3 * (enc->num_parts - 1);
+  for (p = 0; p < enc->num_parts; ++p) {
+    vp8_size += VP8BitWriterSize(enc->parts + p);
+  }
+  pad = vp8_size & 1;
+  vp8_size += pad;
+
+  riff_size = TAG_SIZE + CHUNK_HEADER_SIZE + vp8_size;
+  if (IsVP8XNeeded(enc)) {  
+    riff_size += CHUNK_HEADER_SIZE + VP8X_CHUNK_SIZE;
+  }
+  if (enc->has_alpha) {  
+    const uint32_t padded_alpha_size = enc->alpha_data_size +
+                                       (enc->alpha_data_size & 1);
+    riff_size += CHUNK_HEADER_SIZE + padded_alpha_size;
+  }
+  if (riff_size > 0xfffffffeU) {
+    return WebPEncodingSetError(pic, VP8_ENC_ERROR_FILE_TOO_BIG);
+  }
+
+  {
+    const uint8_t* const part0 = VP8BitWriterBuf(bw);
+    const size_t size0 = VP8BitWriterSize(bw);
+    ok = ok && PutWebPHeaders(enc, size0, vp8_size, riff_size)
+            && pic->writer(part0, size0, pic)
+            && EmitPartitionsSize(enc, pic);
+    VP8BitWriterWipeOut(bw);    
+  }
+
+  for (p = 0; p < enc->num_parts; ++p) {
+    const uint8_t* const buf = VP8BitWriterBuf(enc->parts + p);
+    const size_t size = VP8BitWriterSize(enc->parts + p);
+    if (size) ok = ok && pic->writer(buf, size, pic);
+    VP8BitWriterWipeOut(enc->parts + p);    
+    ok = ok && WebPReportProgress(pic, enc->percent + percent_per_part,
+                                  &enc->percent);
+  }
+
+  if (ok && pad) {
+    ok = PutPaddingByte(pic);
+  }
+
+  enc->coded_size = (int)(CHUNK_HEADER_SIZE + riff_size);
+  ok = ok && WebPReportProgress(pic, final_percent, &enc->percent);
+  if (!ok) WebPEncodingSetError(pic, VP8_ENC_ERROR_BAD_WRITE);
+  return ok;
+}
+

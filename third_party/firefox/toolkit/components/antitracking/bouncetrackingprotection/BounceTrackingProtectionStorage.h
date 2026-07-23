@@ -1,0 +1,211 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef mozilla_BounceTrackingProtectionStorage_h_
+#define mozilla_BounceTrackingProtectionStorage_h_
+
+#include "mozIStorageFunction.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/ThreadSafety.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/dom/FlippedOnce.h"
+#include "nsIAsyncShutdown.h"
+#include "nsIFile.h"
+#include "nsIObserver.h"
+#include "nsISupports.h"
+#include "nsTHashMap.h"
+#include "mozIStorageConnection.h"
+#include "mozilla/OriginAttributesHashKey.h"
+
+class nsIPrincipal;
+class mozIStorageConnection;
+namespace mozilla {
+
+class BounceTrackingStateGlobal;
+class BounceTrackingState;
+class OriginAttributes;
+
+extern LazyLogModule gBounceTrackingProtectionLog;
+
+class BounceTrackingProtectionStorage final : public nsIObserver,
+                                              public nsIAsyncShutdownBlocker,
+                                              public SupportsWeakPtr {
+  friend class BounceTrackingStateGlobal;
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSIASYNCSHUTDOWNBLOCKER
+
+ public:
+  BounceTrackingProtectionStorage()
+      : mMonitor("mozilla::BounceTrackingProtectionStorage::mMonitor"),
+        mPendingWrites(0) {};
+
+  [[nodiscard]] nsresult Init();
+
+  RefPtr<BounceTrackingStateGlobal> GetStateGlobal(
+      const OriginAttributes& aOriginAttributes);
+
+  RefPtr<BounceTrackingStateGlobal> GetStateGlobal(nsIPrincipal* aPrincipal);
+
+  RefPtr<BounceTrackingStateGlobal> GetOrCreateStateGlobal(
+      const OriginAttributes& aOriginAttributes);
+
+  RefPtr<BounceTrackingStateGlobal> GetOrCreateStateGlobal(
+      nsIPrincipal* aPrincipal);
+
+  RefPtr<BounceTrackingStateGlobal> GetOrCreateStateGlobal(
+      BounceTrackingState* aBounceTrackingState);
+
+  using StateGlobalMap =
+      nsTHashMap<OriginAttributesHashKey, RefPtr<BounceTrackingStateGlobal>>;
+  const StateGlobalMap& StateGlobalMapRef() { return mStateGlobal; }
+
+  enum class EntryType : uint8_t { BounceTracker = 0, UserActivation = 1 };
+
+  static const char* EntryTypeToString(EntryType aType) {
+    switch (aType) {
+      case EntryType::BounceTracker:
+        return "BounceTracker";
+      case EntryType::UserActivation:
+        return "UserActivation";
+    }
+    return "Unknown";
+  }
+
+  [[nodiscard]] nsresult ClearByType(
+      BounceTrackingProtectionStorage::EntryType aType);
+
+  [[nodiscard]] nsresult ClearBySiteHost(const nsACString& aSiteHost,
+                                         OriginAttributes* aOriginAttributes);
+
+  [[nodiscard]] nsresult ClearByTimeRange(PRTime aFrom, PRTime aTo);
+
+  [[nodiscard]] nsresult ClearByOriginAttributesPattern(
+      const OriginAttributesPattern& aOriginAttributesPattern,
+      const Maybe<nsCString>& aSiteHost = Nothing());
+
+  [[nodiscard]] nsresult Clear();
+
+ private:
+  [[nodiscard]] nsresult InitInternal();
+
+  ~BounceTrackingProtectionStorage() = default;
+
+  nsCOMPtr<nsISerialEventTarget> mBackgroundThread;  
+
+  RefPtr<mozIStorageConnection> mDatabaseConnection;  
+
+  [[nodiscard]] nsresult WaitForInitialization();
+
+  void Finalize();
+
+  already_AddRefed<nsIAsyncShutdownClient> GetAsyncShutdownBarrier() const;
+
+  [[nodiscard]] nsresult CreateDatabaseConnection(bool aShouldRetry = true);
+
+  [[nodiscard]] nsresult EnsureTable();
+
+  struct ImportEntry {
+    OriginAttributes mOriginAttributes;
+    nsCString mSiteHost;
+    EntryType mEntryType;
+    PRTime mTimeStamp;
+  };
+
+  [[nodiscard]] nsresult LoadMemoryStateFromDisk();
+
+  void IncrementPendingWrites();
+  void DecrementPendingWrites();
+
+  [[nodiscard]] static nsresult DeleteData(
+      mozIStorageConnection* aDatabaseConnection,
+      Maybe<OriginAttributes> aOriginAttributes, const nsACString& aSiteHost);
+
+  [[nodiscard]] static nsresult DeleteDataInTimeRange(
+      mozIStorageConnection* aDatabaseConnection,
+      Maybe<OriginAttributes> aOriginAttributes, PRTime aFrom,
+      Maybe<PRTime> aTo,
+      Maybe<BounceTrackingProtectionStorage::EntryType> aEntryType = Nothing{});
+
+  [[nodiscard]] nsresult DeleteDataByType(
+      mozIStorageConnection* aDatabaseConnection,
+      const Maybe<OriginAttributes>& aOriginAttributes,
+      BounceTrackingProtectionStorage::EntryType aEntryType);
+
+  [[nodiscard]] static nsresult DeleteDataByOriginAttributesPattern(
+      mozIStorageConnection* aDatabaseConnection,
+      const OriginAttributesPattern& aOriginAttributesPattern,
+      const Maybe<nsCString>& aSiteHost = Nothing());
+
+  [[nodiscard]] static nsresult ClearData(
+      mozIStorageConnection* aDatabaseConnection);
+
+  using PendingUpdate = ImportEntry;
+
+  [[nodiscard]] static nsresult UpsertDataBulk(
+      mozIStorageConnection* aDatabaseConnection,
+      const nsTArray<PendingUpdate>& aUpdates);
+
+  Monitor mMonitor;
+
+  FlippedOnce<false> mInitialized MOZ_GUARDED_BY(mMonitor);
+  FlippedOnce<false> mErrored MOZ_GUARDED_BY(mMonitor);
+  FlippedOnce<false> mShuttingDown MOZ_GUARDED_BY(mMonitor);
+  uint32_t mPendingWrites MOZ_GUARDED_BY(mMonitor);
+
+  nsTArray<PendingUpdate> mPendingUpdates;
+
+  nsCOMPtr<nsIFile> mDatabaseFile;
+
+  StateGlobalMap mStateGlobal{};
+
+
+  [[nodiscard]] nsresult UpdateDBEntry(
+      const OriginAttributes& aOriginAttributes, const nsACString& aSiteHost,
+      EntryType aEntryType, PRTime aTimeStamp);
+
+  [[nodiscard]] nsresult MaybeFlushPendingUpdates();
+
+  [[nodiscard]] nsresult FlushPendingUpdates();
+
+  [[nodiscard]] nsresult DeleteDBEntries(OriginAttributes* aOriginAttributes,
+                                         const nsACString& aSiteHost);
+
+  [[nodiscard]] nsresult DeleteDBEntriesInTimeRange(
+      OriginAttributes* aOriginAttributes, PRTime aFrom,
+      Maybe<PRTime> aTo = Nothing{}, Maybe<EntryType> aEntryType = Nothing{});
+
+  [[nodiscard]] nsresult DeleteDBEntriesByType(
+      OriginAttributes* aOriginAttributes,
+      BounceTrackingProtectionStorage::EntryType aEntryType);
+
+  [[nodiscard]] nsresult DeleteDBEntriesByOriginAttributesPattern(
+      const OriginAttributesPattern& aOriginAttributesPattern,
+      const Maybe<nsCString>& aSiteHost = Nothing());
+};
+
+class OriginAttrsPatternMatchOASuffixSQLFunction final
+    : public mozIStorageFunction {
+  NS_DECL_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  explicit OriginAttrsPatternMatchOASuffixSQLFunction(
+      OriginAttributesPattern const& aPattern)
+      : mPattern(aPattern) {}
+  OriginAttrsPatternMatchOASuffixSQLFunction() = delete;
+
+ private:
+  ~OriginAttrsPatternMatchOASuffixSQLFunction() = default;
+
+  OriginAttributesPattern mPattern;
+};
+
+inline const char* format_as(BounceTrackingProtectionStorage::EntryType aType) {
+  return BounceTrackingProtectionStorage::EntryTypeToString(aType);
+}
+
+}  
+
+#endif  // mozilla_BounceTrackingProtectionStorage_h_

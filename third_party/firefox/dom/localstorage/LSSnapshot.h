@@ -1,0 +1,153 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_localstorage_LSSnapshot_h
+#define mozilla_dom_localstorage_LSSnapshot_h
+
+#include <cstdint>
+
+#include "ErrorList.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
+#include "nsCOMPtr.h"
+#include "nsHashKeys.h"
+#include "nsIRunnable.h"
+#include "nsISupports.h"
+#include "nsStringFwd.h"
+#include "nsTArrayForwardDeclare.h"
+#include "nsTHashMap.h"
+#include "nsTHashSet.h"
+
+class nsITimer;
+
+namespace mozilla::dom {
+
+class LSDatabase;
+class LSNotifyInfo;
+class LSSnapshotChild;
+class LSSnapshotInitInfo;
+class LSWriteAndNotifyInfo;
+class SnapshotWriteOptimizer;
+
+template <typename>
+class Optional;
+
+class LSSnapshot final : public nsIRunnable {
+ public:
+  enum class LoadState {
+    Initial,
+    Partial,
+    AllOrderedKeys,
+    AllUnorderedItems,
+    AllOrderedItems,
+    EndGuard
+  };
+
+ private:
+  RefPtr<LSSnapshot> mSelfRef;
+
+  RefPtr<LSDatabase> mDatabase;
+
+  nsCOMPtr<nsITimer> mIdleTimer;
+
+  LSSnapshotChild* mActor;
+
+  nsTHashSet<nsString> mLoadedItems;
+  nsTHashSet<nsString> mUnknownItems;
+  nsTHashMap<nsStringHashKey, nsString> mValues;
+  UniquePtr<SnapshotWriteOptimizer> mWriteOptimizer;
+  UniquePtr<nsTArray<LSWriteAndNotifyInfo>> mWriteAndNotifyInfos;
+
+  uint32_t mInitLength;
+  uint32_t mLength;
+  int64_t mUsage;
+  int64_t mPeakUsage;
+
+  LoadState mLoadState;
+
+  bool mHasOtherProcessDatabases;
+  bool mHasOtherProcessObservers;
+  bool mExplicit;
+  bool mHasPendingStableStateCallback;
+  bool mHasPendingIdleTimerCallback;
+  bool mDirty;
+
+#ifdef DEBUG
+  bool mInitialized;
+  bool mSentFinish;
+#endif
+
+ public:
+  explicit LSSnapshot(LSDatabase* aDatabase);
+
+  void AssertIsOnOwningThread() const { NS_ASSERT_OWNINGTHREAD(LSSnapshot); }
+
+  void SetActor(LSSnapshotChild* aActor);
+
+  void ClearActor() {
+    AssertIsOnOwningThread();
+    MOZ_ASSERT(mActor);
+
+    mActor = nullptr;
+  }
+
+  bool Explicit() const { return mExplicit; }
+
+  nsresult Init(const nsAString& aKey, const LSSnapshotInitInfo& aInitInfo,
+                bool aExplicit);
+
+  nsresult GetLength(uint32_t* aResult);
+
+  nsresult GetKey(uint32_t aIndex, nsAString& aResult);
+
+  nsresult GetItem(const nsAString& aKey, nsAString& aResult);
+
+  nsresult GetKeys(nsTArray<nsString>& aKeys);
+
+  nsresult SetItem(const nsAString& aKey, const nsAString& aValue,
+                   LSNotifyInfo& aNotifyInfo);
+
+  nsresult RemoveItem(const nsAString& aKey, LSNotifyInfo& aNotifyInfo);
+
+  nsresult Clear(LSNotifyInfo& aNotifyInfo);
+
+  void MarkDirty();
+
+  nsresult ExplicitCheckpoint();
+
+  nsresult ExplicitEnd();
+
+  int64_t GetUsage() const;
+
+ private:
+  ~LSSnapshot();
+
+  void ScheduleStableStateCallback();
+
+  void MaybeScheduleStableStateCallback();
+
+  nsresult GetItemInternal(const nsAString& aKey,
+                           const Optional<nsString>& aValue,
+                           nsAString& aResult);
+
+  nsresult EnsureAllKeys();
+
+  nsresult UpdateUsage(int64_t aDelta);
+
+  nsresult Checkpoint(bool aSync = false);
+
+  nsresult Finish(bool aSync = false);
+
+  void CancelIdleTimer();
+
+  static void IdleTimerCallback(nsITimer* aTimer, void* aClosure);
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIRUNNABLE
+};
+
+}  
+
+#endif  // mozilla_dom_localstorage_LSSnapshot_h

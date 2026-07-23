@@ -1,0 +1,99 @@
+// Copyright 2020 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(COMPILER_TRANSLATOR_TREEUTIL_DRIVERUNIFORM_H_)
+#define COMPILER_TRANSLATOR_TREEUTIL_DRIVERUNIFORM_H_
+
+#include "common/angleutils.h"
+#include "compiler/translator/Types.h"
+
+namespace sh
+{
+
+class TCompiler;
+class TIntermBlock;
+class TIntermNode;
+class TSymbolTable;
+class TIntermTyped;
+class TIntermSwizzle;
+class TIntermBinary;
+
+enum class DriverUniformMode
+{
+    InterfaceBlock,
+
+    Structure
+};
+
+enum class DriverUniformFlip
+{
+    Fragment,
+    PreFragment,
+};
+
+constexpr ImmutableString kEmulatedDepthRangeParams = ImmutableString("ANGLEDepthRangeParams");
+constexpr ImmutableString kDriverUniformsBlockName  = ImmutableString("ANGLEUniformBlock");
+constexpr ImmutableString kDriverUniformsVarName    = ImmutableString("ANGLEUniforms");
+
+class DriverUniform
+{
+  public:
+    DriverUniform(DriverUniformMode mode)
+        : mMode(mode), mDriverUniforms(nullptr), mEmulatedDepthRangeType(nullptr)
+    {}
+    virtual ~DriverUniform() = default;
+
+    bool addComputeDriverUniformsToShader(TIntermBlock *root, TSymbolTable *symbolTable);
+    bool addGraphicsDriverUniformsToShader(TIntermBlock *root, TSymbolTable *symbolTable);
+
+    TIntermTyped *getAcbBufferOffsets() const;
+    TIntermTyped *getDepthRange() const;
+    TIntermTyped *getViewportZScale() const;
+    TIntermTyped *getHalfRenderArea() const;
+    TIntermTyped *getFlipXY(TSymbolTable *symbolTable, DriverUniformFlip stage) const;
+    TIntermTyped *getNegFlipXY(TSymbolTable *symbolTable, DriverUniformFlip stage) const;
+    TIntermTyped *getDither() const;
+    TIntermTyped *getSwapXY() const;
+    TIntermTyped *getAdvancedBlendEquation() const;
+    TIntermTyped *getNumSamples() const;
+    TIntermTyped *getClipDistancesEnabled() const;
+    TIntermTyped *getTransformDepth() const;
+    TIntermTyped *getAlphaToCoverage() const;
+    TIntermTyped *getLayeredFramebuffer() const;
+
+    virtual TIntermTyped *getViewport() const { return nullptr; }
+    virtual TIntermTyped *getXfbBufferOffsets() const { return nullptr; }
+    virtual TIntermTyped *getXfbVerticesPerInstance() const { return nullptr; }
+
+    const TVariable *getDriverUniformsVariable() const { return mDriverUniforms; }
+
+  protected:
+    TIntermTyped *createDriverUniformRef(const char *fieldName) const;
+    virtual TFieldList *createUniformFields(TSymbolTable *symbolTable);
+    const TType *createEmulatedDepthRangeType(TSymbolTable *symbolTable);
+
+    const DriverUniformMode mMode;
+    const TVariable *mDriverUniforms;
+    TType *mEmulatedDepthRangeType;
+};
+
+class DriverUniformExtended : public DriverUniform
+{
+  public:
+    DriverUniformExtended(DriverUniformMode mode) : DriverUniform(mode) {}
+    ~DriverUniformExtended() override {}
+
+    TIntermTyped *getXfbBufferOffsets() const override;
+    TIntermTyped *getXfbVerticesPerInstance() const override;
+
+  protected:
+    TFieldList *createUniformFields(TSymbolTable *symbolTable) override;
+};
+
+TIntermTyped *MakeSwapXMultiplier(TIntermTyped *swapped);
+TIntermTyped *MakeSwapYMultiplier(TIntermTyped *swapped);
+
+}  
+
+#endif

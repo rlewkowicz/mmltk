@@ -1,0 +1,47 @@
+/*
+ * Copyright 2023 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkImageGeneratorPriv_DEFINED)
+#define SkImageGeneratorPriv_DEFINED
+
+#include "include/core/SkRefCnt.h" // IWYU pragma: keep
+
+#include <memory>
+#include <optional>
+
+class SkColorSpace;
+class SkData;
+class SkImageGenerator;
+class SkMatrix;
+class SkPaint;
+class SkPicture;
+class SkSurfaceProps;
+enum SkAlphaType : int;
+namespace SkImages { enum class BitDepth; }
+struct SkISize;
+
+namespace SkImageGenerators {
+std::unique_ptr<SkImageGenerator> MakeFromPicture(const SkISize&,
+                                                  sk_sp<SkPicture>,
+                                                  const SkMatrix*,
+                                                  const SkPaint*,
+                                                  SkImages::BitDepth,
+                                                  sk_sp<SkColorSpace>,
+                                                  SkSurfaceProps props);
+
+std::unique_ptr<SkImageGenerator> MakeFromPicture(const SkISize&,
+                                                  sk_sp<SkPicture>,
+                                                  const SkMatrix*,
+                                                  const SkPaint*,
+                                                  SkImages::BitDepth,
+                                                  sk_sp<SkColorSpace>);
+
+std::unique_ptr<SkImageGenerator> MakeFromEncoded(sk_sp<const SkData>,
+                                                  std::optional<SkAlphaType> = std::nullopt);
+}
+
+#endif

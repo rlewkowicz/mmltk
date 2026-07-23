@@ -1,0 +1,123 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#ifndef CHUNK_H
+#define CHUNK_H
+
+#include "mozilla/Atomics.h"
+
+#include "mozjemalloc_types.h"
+
+#include "RadixTree.h"
+
+#include "mozilla/DoublyLinkedList.h"
+
+
+struct arena_t;
+
+enum ChunkType {
+  UNKNOWN_CHUNK,
+  ZEROED_CHUNK,    
+  ARENA_CHUNK,     
+  HUGE_CHUNK,      
+  RECYCLED_CHUNK,  
+};
+
+struct arena_chunk_map_t {
+  mozilla::DoublyLinkedListElement<arena_chunk_map_t> link;
+
+  size_t bits;
+
+#define CHUNK_MAP_BUSY ((size_t)0x100U)
+#define CHUNK_MAP_FRESH ((size_t)0x80U)
+#define CHUNK_MAP_MADVISED ((size_t)0x40U)
+#define CHUNK_MAP_DECOMMITTED ((size_t)0x20U)
+#define CHUNK_MAP_MADVISED_OR_DECOMMITTED \
+  (CHUNK_MAP_MADVISED | CHUNK_MAP_DECOMMITTED)
+#define CHUNK_MAP_FRESH_MADVISED_OR_DECOMMITTED \
+  (CHUNK_MAP_FRESH | CHUNK_MAP_MADVISED | CHUNK_MAP_DECOMMITTED)
+#define CHUNK_MAP_FRESH_MADVISED_DECOMMITTED_OR_BUSY              \
+  (CHUNK_MAP_FRESH | CHUNK_MAP_MADVISED | CHUNK_MAP_DECOMMITTED | \
+   CHUNK_MAP_BUSY)
+#define CHUNK_MAP_DIRTY ((size_t)0x08U)
+#define CHUNK_MAP_ZEROED ((size_t)0x04U)
+#define CHUNK_MAP_LARGE ((size_t)0x02U)
+#define CHUNK_MAP_ALLOCATED ((size_t)0x01U)
+};
+
+struct arena_chunk_t {
+  arena_t* mArena;
+
+  mozilla::DoublyLinkedListElement<arena_chunk_t> mChunksDirtyElement;
+
+#ifdef MALLOC_DOUBLE_PURGE
+  mozilla::DoublyLinkedListElement<arena_chunk_t> mChunksMadvisedElement;
+#endif
+
+  uint16_t mNumDirty = 0;
+
+  uint16_t mDirtyRunHint;
+
+  bool mIsPurging = false;
+  bool mDying = false;
+
+  arena_chunk_map_t mPageMap[];  
+
+  explicit arena_chunk_t(arena_t* aArena);
+
+  bool IsEmpty();
+};
+
+namespace mozilla {
+struct DirtyChunkListTrait {
+  static DoublyLinkedListElement<arena_chunk_t>& Get(arena_chunk_t* aThis) {
+    return aThis->mChunksDirtyElement;
+  }
+
+  static const DoublyLinkedListElement<arena_chunk_t>& Get(
+      const arena_chunk_t* aThis) {
+    return aThis->mChunksDirtyElement;
+  }
+
+  using SearchKey = arena_chunk_t*;
+};
+}  
+
+[[nodiscard]] bool pages_commit(void* aAddr, size_t aSize);
+
+void pages_decommit(void* aAddr, size_t aSize);
+
+void chunks_init();
+
+void* base_chunk_alloc(size_t aSize, size_t aAlignment);
+
+void base_chunk_dealloc(void* aChunk, size_t aSize, ChunkType aType);
+
+void* arena_chunk_alloc(chunk_allocator_t* aChunkAllocator, size_t aSize,
+                        size_t aAlignment);
+
+void arena_chunk_dealloc(chunk_allocator_t* aChunkAllocator, void* aChunk,
+                         size_t aSize);
+#ifdef MOZ_DEBUG
+void chunk_assert_zero(void* aPtr, size_t aSize);
+#endif
+
+extern mozilla::Atomic<size_t> gRecycledSize;
+
+extern AddressRadixTree<(sizeof(void*) << 3) - LOG2(kChunkSize)> gChunkRTree;
+
+extern chunk_allocator_t gSystemChunkAllocator;
+
+enum ShouldCommit {
+  ReserveOnly,
+
+  ReserveAndCommit,
+};
+
+void* pages_mmap_aligned(size_t size, size_t alignment,
+                         ShouldCommit should_commit);
+
+void pages_unmap(void* aAddr, size_t aSize);
+
+#endif /* ! CHUNK_H */

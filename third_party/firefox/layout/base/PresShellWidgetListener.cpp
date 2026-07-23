@@ -1,0 +1,259 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "PresShellWidgetListener.h"
+
+#include "WindowRenderer.h"
+#include "mozilla/BasicEvents.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/StartupTimeline.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/dom/BrowserParent.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/widget/Screen.h"
+#include "nsContentUtils.h"  // for nsAutoScriptBlocker
+#include "nsDeviceContext.h"
+#include "nsDocShell.h"
+#include "nsIFrame.h"
+#include "nsIWidget.h"
+#include "nsIWidgetListener.h"
+#include "nsLayoutUtils.h"
+#include "nsXULPopupManager.h"
+
+using namespace mozilla;
+using namespace mozilla::widget;
+
+static uint32_t gLastUserEventTime = 0;
+static void MaybeUpdateLastUserEventTime(WidgetGUIEvent* aEvent) {
+  WidgetMouseEvent* mouseEvent = aEvent->AsMouseEvent();
+  if ((mouseEvent &&
+       mouseEvent->mReason == WidgetMouseEvent::eReal &&
+       mouseEvent->mMessage != eMouseExitFromWidget &&
+       mouseEvent->mMessage != eMouseEnterIntoWidget) ||
+      aEvent->HasKeyEventMessage() || aEvent->HasIMEEventMessage()) {
+    gLastUserEventTime = PR_IntervalToMicroseconds(PR_IntervalNow());
+  }
+}
+
+uint32_t PresShellWidgetListener::GetLastUserEventTime() {
+  return gLastUserEventTime;
+}
+
+PresShellWidgetListener::PresShellWidgetListener(PresShell* aPs)
+    : mPresShell(aPs) {
+  MOZ_COUNT_CTOR(PresShellWidgetListener);
+}
+
+PresShellWidgetListener::~PresShellWidgetListener() {
+  MOZ_COUNT_DTOR(PresShellWidgetListener);
+
+  if (mPreviousWindow) {
+    mPreviousWindow->SetPreviouslyAttachedWidgetListener(nullptr);
+  }
+
+  DetachWidget();
+}
+
+void PresShellWidgetListener::DetachWidget() {
+  if (mWindow) {
+    mWindow->SetAttachedWidgetListener(nullptr);
+    mWindow = nullptr;
+  }
+}
+
+void PresShellWidgetListener::AttachToTopLevelWidget(nsIWidget* aWidget) {
+  MOZ_ASSERT(aWidget, "null widget ptr");
+  MOZ_ASSERT(!aWidget->GetWidgetListener() ||
+                 aWidget->GetWidgetListener()->GetAppWindow(),
+             "Expect a top level widget");
+
+  if (nsIWidgetListener* listener = aWidget->GetAttachedWidgetListener()) {
+    if (auto* old = listener->GetAsPresShellWidgetListener()) {
+      old->DetachFromTopLevelWidget();
+    }
+  }
+
+  mWindow = aWidget;
+
+  mWindow->SetAttachedWidgetListener(this);
+  if (mWindow->GetWindowType() != WindowType::Invisible) {
+    mWindow->AsyncEnableDragDrop(true);
+  }
+}
+
+void PresShellWidgetListener::DetachFromTopLevelWidget() {
+  MOZ_ASSERT(mWindow, "null mWindow for DetachFromTopLevelWidget!");
+
+  mWindow->SetAttachedWidgetListener(nullptr);
+  if (nsIWidgetListener* listener =
+          mWindow->GetPreviouslyAttachedWidgetListener()) {
+    if (auto* previousListener = listener->GetAsPresShellWidgetListener()) {
+      previousListener->mPreviousWindow = nullptr;
+    }
+  }
+
+  mWindow->SetPreviouslyAttachedWidgetListener(this);
+  mPreviousWindow = std::move(mWindow);
+  MOZ_ASSERT(!mWindow);
+}
+
+PresShell* PresShellWidgetListener::GetPresShell() { return mPresShell; }
+
+void PresShellWidgetListener::WindowResized(nsIWidget*,
+                                            const LayoutDeviceIntSize& aSize) {
+  RefPtr<PresShell> ps = GetPresShell();
+  if (!ps) {
+    return;
+  }
+
+  nsPresContext* pc = ps->GetPresContext();
+  if (!pc) {
+    return;
+  }
+
+  pc->DeviceContext()->CheckDPIChange();
+  int32_t p2a = pc->AppUnitsPerDevPixel();
+  if (auto* frame = ps->GetRootFrame()) {
+    frame->InvalidateFrame();
+  }
+  ps->SetLayoutViewportSize(LayoutDeviceIntSize::ToAppUnits(aSize, p2a),
+                             false);
+
+  if (nsXULPopupManager* pm = nsXULPopupManager::GetInstance()) {
+    pm->AdjustPopupsOnWindowChange(ps);
+  }
+}
+
+void PresShellWidgetListener::DynamicToolbarMaxHeightChanged(
+    ScreenIntCoord aHeight) {
+  MOZ_ASSERT(XRE_IsParentProcess(),
+             "Should be only called for the browser parent process");
+  CallOnAllRemoteChildren(
+      [aHeight](dom::BrowserParent* aBrowserParent) -> CallState {
+        aBrowserParent->DynamicToolbarMaxHeightChanged(aHeight);
+        return CallState::Continue;
+      });
+}
+
+void PresShellWidgetListener::DynamicToolbarOffsetChanged(
+    ScreenIntCoord aOffset) {
+  MOZ_ASSERT(XRE_IsParentProcess(),
+             "Should be only called for the browser parent process");
+  CallOnAllRemoteChildren(
+      [aOffset](dom::BrowserParent* aBrowserParent) -> CallState {
+        if (!aBrowserParent->GetDocShellIsActive()) {
+          return CallState::Continue;
+        }
+
+        aBrowserParent->DynamicToolbarOffsetChanged(aOffset);
+        return CallState::Stop;
+      });
+}
+
+void PresShellWidgetListener::KeyboardHeightChanged(ScreenIntCoord aHeight) {
+  MOZ_ASSERT(XRE_IsParentProcess(),
+             "Should be only called for the browser parent process");
+}
+
+void PresShellWidgetListener::AndroidPipModeChanged(bool aPipMode) {
+  MOZ_ASSERT(XRE_IsParentProcess(),
+             "Should be only called for the browser parent process");
+}
+
+void PresShellWidgetListener::PaintWindow(nsIWidget* aWidget) {
+  RefPtr ps = GetPresShell();
+  if (!ps) {
+    return;
+  }
+  RefPtr renderer = aWidget->GetWindowRenderer();
+  if (!renderer->NeedsWidgetInvalidation()) {
+    ps->PaintSynchronously();
+    renderer->FlushRendering(wr::RenderReasons::WIDGET);
+  } else {
+    ps->SyncPaintFallback(ps->GetRootFrame(), renderer);
+  }
+  mozilla::StartupTimeline::RecordOnce(mozilla::StartupTimeline::FIRST_PAINT);
+  ps->DidPaintWindow();
+}
+
+void PresShellWidgetListener::DidCompositeWindow(
+    mozilla::layers::TransactionId aTransactionId,
+    const TimeStamp& aCompositeStart, const TimeStamp& aCompositeEnd) {
+  PresShell* presShell = GetPresShell();
+  if (!presShell) {
+    return;
+  }
+
+  nsAutoScriptBlocker scriptBlocker;
+
+  nsPresContext* context = presShell->GetPresContext();
+  nsRootPresContext* rootContext = context->GetRootPresContext();
+  if (rootContext) {
+    rootContext->NotifyDidPaintForSubtree(aTransactionId, aCompositeEnd);
+  }
+
+  mozilla::StartupTimeline::RecordOnce(mozilla::StartupTimeline::FIRST_PAINT2,
+                                       aCompositeEnd);
+}
+
+nsEventStatus PresShellWidgetListener::HandleEvent(WidgetGUIEvent* aEvent) {
+  MOZ_ASSERT(aEvent->mWidget, "null widget ptr");
+
+  nsEventStatus result = nsEventStatus_eIgnore;
+  MaybeUpdateLastUserEventTime(aEvent);
+  if (RefPtr<PresShell> ps = GetPresShell()) {
+    if (nsIFrame* root = ps->GetRootFrame()) {
+      ps->HandleEvent(root, aEvent, false, &result);
+    }
+  }
+  return result;
+}
+
+void PresShellWidgetListener::SafeAreaInsetsChanged(
+    const LayoutDeviceIntMargin& aSafeAreaInsets) {
+  PresShell* presShell = GetPresShell();
+  if (!presShell) {
+    return;
+  }
+
+  LayoutDeviceIntMargin windowSafeAreaInsets;
+  const LayoutDeviceIntRect windowRect = mWindow->GetScreenBounds();
+  if (nsCOMPtr<nsIScreen> screen = mWindow->GetWidgetScreen()) {
+    windowSafeAreaInsets = nsContentUtils::GetWindowSafeAreaInsets(
+        screen, aSafeAreaInsets, windowRect);
+  }
+
+  presShell->GetPresContext()->SetSafeAreaInsets(windowSafeAreaInsets);
+
+  CallOnAllRemoteChildren(
+      [windowSafeAreaInsets](dom::BrowserParent* aBrowserParent) -> CallState {
+        (void)aBrowserParent->SendSafeAreaInsetsChanged(windowSafeAreaInsets);
+        return CallState::Continue;
+      });
+}
+
+bool PresShellWidgetListener::IsPrimaryFramePaintSuppressed() const {
+  return StaticPrefs::layout_show_previous_page() && mPresShell &&
+         mPresShell->IsPaintingSuppressed();
+}
+
+void PresShellWidgetListener::CallOnAllRemoteChildren(
+    const std::function<CallState(dom::BrowserParent*)>& aCallback) {
+  PresShell* presShell = GetPresShell();
+  if (!presShell) {
+    return;
+  }
+
+  dom::Document* document = presShell->GetDocument();
+  if (!document) {
+    return;
+  }
+
+  nsPIDOMWindowOuter* window = document->GetWindow();
+  if (!window) {
+    return;
+  }
+
+  nsContentUtils::CallOnAllRemoteChildren(window, aCallback);
+}

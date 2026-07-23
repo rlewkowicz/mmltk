@@ -1,0 +1,148 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef TX_TXSTYLESHEET_H
+#define TX_TXSTYLESHEET_H
+
+#include "nsISupportsImpl.h"
+#include "txExpandedNameMap.h"
+#include "txList.h"
+#include "txOutputFormat.h"
+#include "txXSLTPatterns.h"
+
+class txInstruction;
+class txTemplateItem;
+class txVariableItem;
+class txStripSpaceItem;
+class txAttributeSetItem;
+class txDecimalFormat;
+class txStripSpaceTest;
+class txXSLKey;
+
+class txStylesheet final {
+ public:
+  class ImportFrame;
+  class GlobalVariable;
+  friend class txStylesheetCompilerState;
+  friend class ImportFrame;
+
+  txStylesheet();
+  nsresult init();
+
+  NS_INLINE_DECL_REFCOUNTING(txStylesheet)
+
+  nsresult findTemplate(const txXPathNode& aNode, const txExpandedName& aMode,
+                        txIMatchContext* aContext, ImportFrame* aImportedBy,
+                        txInstruction** aTemplate, ImportFrame** aImportFrame);
+  txDecimalFormat* getDecimalFormat(const txExpandedName& aName);
+  txInstruction* getAttributeSet(const txExpandedName& aName);
+  txInstruction* getNamedTemplate(const txExpandedName& aName);
+  txOutputFormat* getOutputFormat();
+  GlobalVariable* getGlobalVariable(const txExpandedName& aName);
+  const txOwningExpandedNameMap<txXSLKey>& getKeyMap();
+  nsresult isStripSpaceAllowed(const txXPathNode& aNode,
+                               txIMatchContext* aContext, bool& aAllowed);
+
+  nsresult doneCompiling();
+
+  nsresult addKey(const txExpandedName& aName,
+                  mozilla::UniquePtr<txPattern> aMatch,
+                  mozilla::UniquePtr<Expr> aUse);
+
+  nsresult addDecimalFormat(const txExpandedName& aName,
+                            mozilla::UniquePtr<txDecimalFormat>&& aFormat);
+
+  struct MatchableTemplate {
+    txInstruction* mFirstInstruction;
+    mozilla::UniquePtr<txPattern> mMatch;
+    double mPriority;
+  };
+
+  class ImportFrame {
+   public:
+    ImportFrame() : mFirstNotImported(nullptr) {}
+    ~ImportFrame();
+
+    txList mToplevelItems;
+
+    txOwningExpandedNameMap<nsTArray<MatchableTemplate> > mMatchableTemplates;
+
+    ImportFrame* mFirstNotImported;
+  };
+
+  class GlobalVariable : public txObject {
+   public:
+    GlobalVariable(mozilla::UniquePtr<Expr>&& aExpr,
+                   mozilla::UniquePtr<txInstruction>&& aFirstInstruction,
+                   bool aIsParam);
+
+    mozilla::UniquePtr<Expr> mExpr;
+    mozilla::UniquePtr<txInstruction> mFirstInstruction;
+    bool mIsParam;
+  };
+
+ private:
+  ~txStylesheet();
+
+  nsresult addTemplate(txTemplateItem* aTemplate, ImportFrame* aImportFrame);
+  nsresult addGlobalVariable(txVariableItem* aVariable);
+  nsresult addFrames(txListIterator& aInsertIter);
+  nsresult addStripSpace(txStripSpaceItem* aStripSpaceItem,
+                         nsTArray<txStripSpaceTest*>& aFrameStripSpaceTests);
+  nsresult addAttributeSet(txAttributeSetItem* aAttributeSetItem);
+
+  txList mImportFrames;
+
+  txOutputFormat mOutputFormat;
+
+  txList mTemplateInstructions;
+
+  ImportFrame* mRootFrame;
+
+  txExpandedNameMap<txInstruction> mNamedTemplates;
+
+  txOwningExpandedNameMap<txDecimalFormat> mDecimalFormats;
+
+  txExpandedNameMap<txInstruction> mAttributeSets;
+
+  txOwningExpandedNameMap<GlobalVariable> mGlobalVariables;
+
+  txOwningExpandedNameMap<txXSLKey> mKeys;
+
+  nsTArray<mozilla::UniquePtr<txStripSpaceTest> > mStripSpaceTests;
+
+  mozilla::UniquePtr<txInstruction> mContainerTemplate;
+  mozilla::UniquePtr<txInstruction> mCharactersTemplate;
+  mozilla::UniquePtr<txInstruction> mEmptyTemplate;
+};
+
+class txStripSpaceTest {
+ public:
+  txStripSpaceTest(nsAtom* aPrefix, nsAtom* aLocalName, int32_t aNSID,
+                   bool stripSpace)
+      : mNameTest(aPrefix, aLocalName, aNSID, txXPathNodeType::ELEMENT_NODE),
+        mStrips(stripSpace) {}
+
+  nsresult matches(const txXPathNode& aNode, txIMatchContext* aContext,
+                   bool& aMatched) {
+    return mNameTest.matches(aNode, aContext, aMatched);
+  }
+
+  bool stripsSpace() { return mStrips; }
+
+  double getDefaultPriority() { return mNameTest.getDefaultPriority(); }
+
+ protected:
+  txNameTest mNameTest;
+  bool mStrips;
+};
+
+class txIGlobalParameter {
+ public:
+  MOZ_COUNTED_DEFAULT_CTOR(txIGlobalParameter)
+  MOZ_COUNTED_DTOR_VIRTUAL(txIGlobalParameter)
+  virtual nsresult getValue(txAExprResult** aValue) = 0;
+};
+
+#endif  // TX_TXSTYLESHEET_H

@@ -1,0 +1,161 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "StorageBaseStatementInternal.h"
+
+#include "nsProxyRelease.h"
+
+#include "mozStorageBindingParamsArray.h"
+#include "mozStorageStatementData.h"
+#include "mozStorageAsyncStatementExecution.h"
+
+namespace mozilla {
+namespace storage {
+
+
+class AsyncStatementFinalizer : public Runnable {
+ public:
+  AsyncStatementFinalizer(StorageBaseStatementInternal* aStatement,
+                          Connection* aConnection)
+      : Runnable("storage::AsyncStatementFinalizer"),
+        mStatement(aStatement),
+        mConnection(aConnection) {}
+
+  NS_IMETHOD Run() override {
+    if (mStatement->mAsyncStatement) {
+      sqlite3_finalize(mStatement->mAsyncStatement);
+      mStatement->mAsyncStatement = nullptr;
+    }
+
+    nsCOMPtr<nsIEventTarget> target(mConnection->eventTargetOpenedOn);
+    NS_ProxyRelease("AsyncStatementFinalizer::mStatement", target,
+                    mStatement.forget());
+    return NS_OK;
+  }
+
+ private:
+  RefPtr<StorageBaseStatementInternal> mStatement;
+  RefPtr<Connection> mConnection;
+};
+
+class LastDitchSqliteStatementFinalizer : public Runnable {
+ public:
+  LastDitchSqliteStatementFinalizer(RefPtr<Connection>& aConnection,
+                                    sqlite3_stmt* aStatement)
+      : Runnable("storage::LastDitchSqliteStatementFinalizer"),
+        mConnection(aConnection),
+        mAsyncStatement(aStatement) {
+    MOZ_ASSERT(aConnection, "You must provide a Connection");
+  }
+
+  NS_IMETHOD Run() override {
+    (void)::sqlite3_finalize(mAsyncStatement);
+    mAsyncStatement = nullptr;
+
+    nsCOMPtr<nsIEventTarget> target(mConnection->eventTargetOpenedOn);
+    (void)::NS_ProxyRelease("LastDitchSqliteStatementFinalizer::mConnection",
+                            target, mConnection.forget());
+    return NS_OK;
+  }
+
+ private:
+  RefPtr<Connection> mConnection;
+  sqlite3_stmt* mAsyncStatement;
+};
+
+
+StorageBaseStatementInternal::StorageBaseStatementInternal()
+    : mNativeConnection(nullptr), mAsyncStatement(nullptr) {}
+
+void StorageBaseStatementInternal::asyncFinalize() {
+  nsIEventTarget* target = mDBConnection->getAsyncExecutionTarget();
+  if (target) {
+    nsCOMPtr<nsIRunnable> event =
+        new AsyncStatementFinalizer(this, mDBConnection);
+
+    (void)target->Dispatch(event, NS_DISPATCH_NORMAL);
+  }
+}
+
+void StorageBaseStatementInternal::destructorAsyncFinalize() {
+  if (!mAsyncStatement) return;
+
+  if (IsOnCurrentSerialEventTarget(mDBConnection->eventTargetOpenedOn)) {
+    nsIEventTarget* target = mDBConnection->getAsyncExecutionTarget();
+    if (target) {
+      nsCOMPtr<nsIRunnable> event =
+          new LastDitchSqliteStatementFinalizer(mDBConnection, mAsyncStatement);
+      (void)target->Dispatch(event, NS_DISPATCH_NORMAL);
+    }
+  } else {
+    nsCOMPtr<nsIRunnable> event =
+        new LastDitchSqliteStatementFinalizer(mDBConnection, mAsyncStatement);
+    (void)event->Run();
+  }
+
+  mAsyncStatement = nullptr;
+}
+
+NS_IMETHODIMP
+StorageBaseStatementInternal::NewBindingParamsArray(
+    mozIStorageBindingParamsArray** _array) {
+  nsCOMPtr<mozIStorageBindingParamsArray> array = new BindingParamsArray(this);
+  NS_ENSURE_TRUE(array, NS_ERROR_OUT_OF_MEMORY);
+
+  array.forget(_array);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+StorageBaseStatementInternal::ExecuteAsync(
+    mozIStorageStatementCallback* aCallback,
+    mozIStoragePendingStatement** _stmt) {
+  nsTArray<StatementData> stmts(1);
+  StatementData data;
+  nsresult rv = getAsynchronousStatementData(data);
+  NS_ENSURE_SUCCESS(rv, rv);
+  stmts.AppendElement(data);
+
+  return AsyncExecuteStatements::execute(std::move(stmts), mDBConnection,
+                                         mNativeConnection, aCallback, _stmt);
+}
+
+template <typename T>
+void EscapeStringForLIKEInternal(const T& aValue,
+                                 const typename T::char_type aEscapeChar,
+                                 T& aResult) {
+  const typename T::char_type MATCH_ALL('%');
+  const typename T::char_type MATCH_ONE('_');
+
+  aResult.Truncate(0);
+
+  for (uint32_t i = 0; i < aValue.Length(); i++) {
+    if (aValue[i] == aEscapeChar || aValue[i] == MATCH_ALL ||
+        aValue[i] == MATCH_ONE) {
+      aResult += aEscapeChar;
+    }
+    aResult += aValue[i];
+  }
+}
+
+NS_IMETHODIMP
+StorageBaseStatementInternal::EscapeStringForLIKE(const nsAString& aValue,
+                                                  const char16_t aEscapeChar,
+                                                  nsAString& _escapedString) {
+  EscapeStringForLIKEInternal(aValue, aEscapeChar, _escapedString);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+StorageBaseStatementInternal::EscapeUTF8StringForLIKE(
+    const nsACString& aValue, const char aEscapeChar,
+    nsACString& _escapedString) {
+  EscapeStringForLIKEInternal(aValue, aEscapeChar, _escapedString);
+
+  return NS_OK;
+}
+
+}  
+}  

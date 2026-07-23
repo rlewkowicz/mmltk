@@ -1,0 +1,345 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/layers/CompositorManagerParent.h"
+#include "mozilla/gfx/GPUParent.h"
+#include "mozilla/gfx/CanvasManagerParent.h"
+#include "mozilla/webrender/RenderThread.h"
+#include "mozilla/ipc/Endpoint.h"
+#include "mozilla/layers/CompositorBridgeParent.h"
+#include "mozilla/layers/ContentCompositorBridgeParent.h"
+#include "mozilla/layers/CompositorThread.h"
+#include "mozilla/layers/RemoteTextureMap.h"
+#include "mozilla/layers/SharedSurfacesParent.h"
+#include "gfxPlatform.h"
+#include "VsyncSource.h"
+
+namespace mozilla {
+namespace layers {
+
+StaticMonitor CompositorManagerParent::sMonitor;
+StaticRefPtr<CompositorManagerParent> CompositorManagerParent::sInstance;
+MOZ_RUNINIT CompositorManagerParent::ManagerMap
+    CompositorManagerParent::sManagers;
+
+already_AddRefed<CompositorManagerParent>
+CompositorManagerParent::CreateSameProcess(uint32_t aNamespace) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  MOZ_ASSERT(NS_IsMainThread());
+  StaticMonitorAutoLock lock(sMonitor);
+
+  if (NS_WARN_IF(sInstance)) {
+    MOZ_ASSERT_UNREACHABLE("Already initialized");
+    return nullptr;
+  }
+
+  RefPtr<CompositorManagerParent> parent =
+      new CompositorManagerParent(dom::ContentParentId(), aNamespace);
+  parent->SetOtherEndpointProcInfo(ipc::EndpointProcInfo::Current());
+  return parent.forget();
+}
+
+bool CompositorManagerParent::Create(
+    Endpoint<PCompositorManagerParent>&& aEndpoint,
+    dom::ContentParentId aChildId, uint32_t aNamespace, bool aIsRoot) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  MOZ_ASSERT(aEndpoint.OtherPid() != base::GetCurrentProcId());
+
+  if (!CompositorThreadHolder::IsActive()) {
+    return false;
+  }
+
+  RefPtr<CompositorManagerParent> bridge =
+      new CompositorManagerParent(aChildId, aNamespace);
+
+  RefPtr<Runnable> runnable =
+      NewRunnableMethod<Endpoint<PCompositorManagerParent>&&, bool>(
+          "CompositorManagerParent::Bind", bridge,
+          &CompositorManagerParent::Bind, std::move(aEndpoint), aIsRoot);
+  CompositorThread()->Dispatch(runnable.forget());
+  return true;
+}
+
+already_AddRefed<CompositorBridgeParent>
+CompositorManagerParent::CreateSameProcessWidgetCompositorBridge(
+    CSSToLayoutDeviceScale aScale, const CompositorOptions& aOptions,
+    bool aUseExternalSurfaceSize, const gfx::IntSize& aSurfaceSize,
+    uint64_t aInnerWindowId) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  MOZ_ASSERT(NS_IsMainThread());
+
+
+  StaticMonitorAutoLock lock(sMonitor);
+  if (NS_WARN_IF(!sInstance)) {
+    return nullptr;
+  }
+
+  TimeDuration vsyncRate =
+      gfxPlatform::GetPlatform()->GetGlobalVsyncDispatcher()->GetVsyncRate();
+
+  RefPtr bridge = MakeRefPtr<CompositorBridgeParent>(
+      sInstance,  0, aScale, vsyncRate, aOptions,
+      aUseExternalSurfaceSize, aSurfaceSize, aInnerWindowId);
+
+  sInstance->mPendingCompositorBridges.AppendElement(bridge);
+  return bridge.forget();
+}
+
+CompositorManagerParent::CompositorManagerParent(
+    dom::ContentParentId aContentId, uint32_t aNamespace)
+    : mCompositorThreadHolder(CompositorThreadHolder::GetSingleton()),
+      mSharedSurfacesHolder(MakeRefPtr<SharedSurfacesHolder>(aNamespace)),
+      mContentId(aContentId),
+      mNamespace(aNamespace) {}
+
+CompositorManagerParent::~CompositorManagerParent() = default;
+
+void CompositorManagerParent::Bind(
+    Endpoint<PCompositorManagerParent>&& aEndpoint, bool aIsRoot) {
+  MOZ_ASSERT(CompositorThreadHolder::IsInCompositorThread());
+  if (NS_WARN_IF(!aEndpoint.Bind(this))) {
+    return;
+  }
+
+  BindComplete(aIsRoot);
+}
+
+void CompositorManagerParent::BindComplete(bool aIsRoot) {
+  MOZ_ASSERT(CompositorThreadHolder::IsInCompositorThread() ||
+             NS_IsMainThread());
+
+  StaticMonitorAutoLock lock(sMonitor);
+  if (aIsRoot) {
+    MOZ_ASSERT(!sInstance);
+    sInstance = this;
+  }
+
+  MOZ_RELEASE_ASSERT(sManagers.try_emplace(mNamespace, this).second);
+}
+
+void CompositorManagerParent::ActorDestroy(ActorDestroyReason aReason) {
+  GetCurrentSerialEventTarget()->Dispatch(
+      NewRunnableMethod("layers::CompositorManagerParent::DeferredDestroy",
+                        this, &CompositorManagerParent::DeferredDestroy));
+
+  if (mRemoteTextureTxnScheduler) {
+    mRemoteTextureTxnScheduler = nullptr;
+  }
+
+  StaticMonitorAutoLock lock(sMonitor);
+  if (sInstance == this) {
+    sInstance = nullptr;
+  }
+
+  MOZ_RELEASE_ASSERT(sManagers.erase(mNamespace) > 0);
+  sMonitor.NotifyAll();
+}
+
+void CompositorManagerParent::DeferredDestroy() {
+  mCompositorThreadHolder = nullptr;
+}
+
+void CompositorManagerParent::ShutdownInternal() {
+  nsTArray<RefPtr<CompositorManagerParent>> actors;
+
+  {
+    StaticMonitorAutoLock lock(sMonitor);
+    actors.SetCapacity(sManagers.size());
+    for (auto& i : sManagers) {
+      actors.AppendElement(i.second);
+    }
+  }
+
+  for (auto& actor : actors) {
+    actor->Close();
+  }
+}
+
+void CompositorManagerParent::Shutdown() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  CompositorThread()->Dispatch(NS_NewRunnableFunction(
+      "layers::CompositorManagerParent::Shutdown",
+      []() -> void { CompositorManagerParent::ShutdownInternal(); }));
+}
+
+ void CompositorManagerParent::WaitForSharedSurface(
+    const wr::ExternalImageId& aId) {
+  uint32_t extNamespace = static_cast<uint32_t>(wr::AsUint64(aId) >> 32);
+  uint32_t resourceId = static_cast<uint32_t>(wr::AsUint64(aId));
+
+  StaticMonitorAutoLock lock(sMonitor);
+
+  while (true) {
+    const auto i = sManagers.find(extNamespace);
+    if (NS_WARN_IF(i == sManagers.end())) {
+      break;
+    }
+
+    if (i->second->mLastSharedSurfaceResourceId >= resourceId) {
+      break;
+    }
+
+    lock.Wait();
+  }
+}
+
+already_AddRefed<PCompositorBridgeParent>
+CompositorManagerParent::AllocPCompositorBridgeParent(
+    const CompositorBridgeOptions& aOpt, const uint32_t& aNamespace) {
+  switch (aOpt.type()) {
+    case CompositorBridgeOptions::TContentCompositorOptions: {
+      RefPtr bridge =
+          MakeRefPtr<ContentCompositorBridgeParent>(this, aNamespace);
+      return bridge.forget();
+    }
+    case CompositorBridgeOptions::TWidgetCompositorOptions: {
+      gfx::GPUParent* gpu = gfx::GPUParent::GetSingleton();
+      if (NS_WARN_IF(!gpu || OtherPid() != gpu->OtherPid())) {
+        MOZ_ASSERT_UNREACHABLE("Child cannot create widget compositor!");
+        break;
+      }
+
+      const WidgetCompositorOptions& opt = aOpt.get_WidgetCompositorOptions();
+      RefPtr bridge = MakeRefPtr<CompositorBridgeParent>(
+          this, aNamespace, opt.scale(), opt.vsyncRate(), opt.options(),
+          opt.useExternalSurfaceSize(), opt.surfaceSize(), opt.innerWindowId());
+      return bridge.forget();
+    }
+    case CompositorBridgeOptions::TSameProcessWidgetCompositorOptions: {
+      if (NS_WARN_IF(OtherPid() != base::GetCurrentProcId())) {
+        MOZ_ASSERT_UNREACHABLE("Child cannot create same process compositor!");
+        break;
+      }
+
+      StaticMonitorAutoLock lock(sMonitor);
+      if (mPendingCompositorBridges.IsEmpty()) {
+        break;
+      }
+
+      RefPtr<CompositorBridgeParent> bridge = mPendingCompositorBridges[0];
+      bridge->SetNamespace(aNamespace);
+      mPendingCompositorBridges.RemoveElementAt(0);
+      return bridge.forget();
+    }
+    default:
+      break;
+  }
+
+  return nullptr;
+}
+
+ void CompositorManagerParent::AddSharedSurface(
+    const wr::ExternalImageId& aId, gfx::SourceSurfaceSharedData* aSurface) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  StaticMonitorAutoLock lock(sMonitor);
+  if (NS_WARN_IF(!sInstance)) {
+    return;
+  }
+
+  if (NS_WARN_IF(!sInstance->OwnsExternalImageId(aId))) {
+    MOZ_ASSERT_UNREACHABLE("Wrong namespace?");
+    return;
+  }
+
+  SharedSurfacesParent::AddSameProcess(aId, aSurface);
+
+  uint32_t resourceId = static_cast<uint32_t>(wr::AsUint64(aId));
+  MOZ_RELEASE_ASSERT(sInstance->mLastSharedSurfaceResourceId < resourceId);
+  sInstance->mLastSharedSurfaceResourceId = resourceId;
+  sMonitor.NotifyAll();
+}
+
+mozilla::ipc::IPCResult CompositorManagerParent::RecvAddSharedSurface(
+    const wr::ExternalImageId& aId, SurfaceDescriptorShared&& aDesc) {
+  if (NS_WARN_IF(!OwnsExternalImageId(aId))) {
+    MOZ_ASSERT_UNREACHABLE("Wrong namespace?");
+    return IPC_OK();
+  }
+
+  SharedSurfacesParent::Add(aId, std::move(aDesc), OtherPid());
+
+  StaticMonitorAutoLock lock(sMonitor);
+  uint32_t resourceId = static_cast<uint32_t>(wr::AsUint64(aId));
+  MOZ_RELEASE_ASSERT(mLastSharedSurfaceResourceId < resourceId);
+  mLastSharedSurfaceResourceId = resourceId;
+  sMonitor.NotifyAll();
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult CompositorManagerParent::RecvRemoveSharedSurface(
+    const wr::ExternalImageId& aId) {
+  if (NS_WARN_IF(!OwnsExternalImageId(aId))) {
+    MOZ_ASSERT_UNREACHABLE("Wrong namespace?");
+    return IPC_OK();
+  }
+
+  SharedSurfacesParent::Remove(aId);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult CompositorManagerParent::RecvReportSharedSurfacesMemory(
+    ReportSharedSurfacesMemoryResolver&& aResolver) {
+  SharedSurfacesMemoryReport report;
+  SharedSurfacesParent::AccumulateMemoryReport(mNamespace, report);
+  aResolver(std::move(report));
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult CompositorManagerParent::RecvNotifyMemoryPressure() {
+  nsTArray<PCompositorBridgeParent*> compositorBridges;
+  ManagedPCompositorBridgeParent(compositorBridges);
+  for (auto bridge : compositorBridges) {
+    static_cast<CompositorBridgeParentBase*>(bridge)->NotifyMemoryPressure();
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult CompositorManagerParent::RecvReportMemory(
+    ReportMemoryResolver&& aResolver) {
+  MOZ_ASSERT(CompositorThreadHolder::IsInCompositorThread());
+  MemoryReport aggregate;
+  PodZero(&aggregate);
+
+  nsTArray<PCompositorBridgeParent*> compositorBridges;
+  ManagedPCompositorBridgeParent(compositorBridges);
+  for (auto bridge : compositorBridges) {
+    static_cast<CompositorBridgeParentBase*>(bridge)->AccumulateMemoryReport(
+        &aggregate);
+  }
+
+  wr::RenderThread::AccumulateMemoryReport(aggregate)->Then(
+      CompositorThread(), __func__,
+      [resolver = std::move(aResolver)](MemoryReport aReport) {
+        resolver(aReport);
+      },
+      [](bool) {
+        MOZ_ASSERT_UNREACHABLE("MemoryReport promises are never rejected");
+      });
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult CompositorManagerParent::RecvInitCanvasManager(
+    Endpoint<PCanvasManagerParent>&& aEndpoint) {
+  gfx::CanvasManagerParent::Init(std::move(aEndpoint), mSharedSurfacesHolder,
+                                 mContentId);
+  mRemoteTextureTxnScheduler = RemoteTextureTxnScheduler::Create(this);
+  return IPC_OK();
+}
+
+void CompositorManagerParent::NotifyWebRenderError(wr::WebRenderError aError) {
+  MOZ_ASSERT(CompositorThreadHolder::IsInCompositorThread());
+
+  StaticMonitorAutoLock lock(sMonitor);
+  if (NS_WARN_IF(!sInstance)) {
+    return;
+  }
+  (void)sInstance->SendNotifyWebRenderError(aError);
+}
+
+}  
+}  

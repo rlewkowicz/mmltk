@@ -1,0 +1,85 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WebRenderCanvasRenderer.h"
+
+#include "GLContext.h"
+#include "GLScreenBuffer.h"
+#include "mozilla/layers/CompositorBridgeChild.h"
+#include "mozilla/StaticPrefs_webgl.h"
+#include "SharedSurfaceGL.h"
+#include "WebRenderBridgeChild.h"
+
+namespace mozilla {
+namespace layers {
+
+CompositableForwarder* WebRenderCanvasRenderer::GetForwarder() {
+  return mManager->WrBridge();
+}
+
+WebRenderCanvasRendererAsync::~WebRenderCanvasRendererAsync() {
+  if (mPipelineId.isSome()) {
+    mManager->RemovePipelineIdForCompositable(mPipelineId.ref());
+    mPipelineId.reset();
+  }
+}
+
+void WebRenderCanvasRendererAsync::Initialize(const CanvasRendererData& aData) {
+  WebRenderCanvasRenderer::Initialize(aData);
+
+  ClearCachedResources();
+}
+
+bool WebRenderCanvasRendererAsync::CreateCompositable() {
+  if (!mCanvasClient) {
+    auto compositableFlags = TextureFlags::NO_FLAGS;
+    if (!mData.mIsAlphaPremult) {
+      compositableFlags |= TextureFlags::NON_PREMULTIPLIED;
+    }
+    mCanvasClient = new CanvasClient(GetForwarder(), compositableFlags);
+    mCanvasClient->Connect();
+  }
+  return true;
+}
+
+void WebRenderCanvasRendererAsync::EnsurePipeline() {
+  MOZ_ASSERT(mCanvasClient);
+  if (!mCanvasClient) {
+    return;
+  }
+
+  if (mPipelineId) {
+    return;
+  }
+
+  mPipelineId = Some(
+      mManager->WrBridge()->GetCompositorBridgeChild()->GetNextPipelineId());
+  mManager->AddPipelineIdForCompositable(
+      mPipelineId.ref(), mCanvasClient->GetIPCHandle(),
+      CompositableHandleOwner::WebRenderBridge);
+}
+
+bool WebRenderCanvasRendererAsync::HasPipeline() {
+  return mPipelineId.isSome();
+}
+
+void WebRenderCanvasRendererAsync::ClearCachedResources() {
+  if (mPipelineId.isSome()) {
+    mManager->RemovePipelineIdForCompositable(mPipelineId.ref());
+    mPipelineId.reset();
+  }
+}
+
+void WebRenderCanvasRendererAsync::
+    UpdateCompositableClientForEmptyTransaction() {
+  bool wasDirty = IsDirty();
+  UpdateCompositableClient();
+  if (wasDirty && mPipelineId.isSome()) {
+    mManager->AddWebRenderParentCommand(
+        OpUpdatedAsyncImagePipeline(mPipelineId.ref()));
+  }
+}
+
+}  
+}  

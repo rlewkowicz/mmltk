@@ -1,0 +1,161 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/cache/PrincipalVerifier.h"
+
+#include "CacheCommon.h"
+#include "ErrorList.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/ProcessIsolation.h"
+#include "mozilla/dom/QMResult.h"
+#include "mozilla/dom/cache/ManagerId.h"
+#include "mozilla/dom/quota/ResultExtensions.h"
+#include "mozilla/ipc/BackgroundParent.h"
+#include "mozilla/ipc/BackgroundUtils.h"
+#include "mozilla/ipc/PBackgroundParent.h"
+#include "nsCOMPtr.h"
+#include "nsContentUtils.h"
+#include "nsIPrincipal.h"
+#include "nsNetUtil.h"
+
+namespace mozilla::dom::cache {
+
+using mozilla::ipc::AssertIsOnBackgroundThread;
+using mozilla::ipc::BackgroundParent;
+using mozilla::ipc::PBackgroundParent;
+using mozilla::ipc::PrincipalInfo;
+using mozilla::ipc::PrincipalInfoToPrincipal;
+
+already_AddRefed<PrincipalVerifier> PrincipalVerifier::CreateAndDispatch(
+    Listener& aListener, PBackgroundParent* aActor,
+    const PrincipalInfo& aPrincipalInfo) {
+  AssertIsOnBackgroundThread();
+
+  RefPtr<PrincipalVerifier> verifier =
+      new PrincipalVerifier(aListener, aActor, aPrincipalInfo);
+
+  MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(verifier));
+
+  return verifier.forget();
+}
+
+void PrincipalVerifier::AddListener(Listener& aListener) {
+  AssertIsOnBackgroundThread();
+  MOZ_ASSERT(!mListenerList.Contains(&aListener));
+  mListenerList.AppendElement(WrapNotNullUnchecked(&aListener));
+}
+
+void PrincipalVerifier::RemoveListener(Listener& aListener) {
+  AssertIsOnBackgroundThread();
+  MOZ_ALWAYS_TRUE(mListenerList.RemoveElement(&aListener));
+}
+
+PrincipalVerifier::PrincipalVerifier(Listener& aListener,
+                                     PBackgroundParent* aActor,
+                                     const PrincipalInfo& aPrincipalInfo)
+    : Runnable("dom::cache::PrincipalVerifier"),
+      mHandle(BackgroundParent::GetContentParentHandle(aActor)),
+      mPrincipalInfo(aPrincipalInfo),
+      mInitiatingEventTarget(GetCurrentSerialEventTarget()),
+      mResult(NS_OK) {
+  AssertIsOnBackgroundThread();
+  MOZ_DIAGNOSTIC_ASSERT(mInitiatingEventTarget);
+
+  AddListener(aListener);
+}
+
+PrincipalVerifier::~PrincipalVerifier() {
+
+  MOZ_DIAGNOSTIC_ASSERT(mListenerList.IsEmpty());
+}
+
+NS_IMETHODIMP
+PrincipalVerifier::Run() {
+
+  if (NS_IsMainThread()) {
+    VerifyOnMainThread();
+    return NS_OK;
+  }
+
+  CompleteOnInitiatingThread();
+  return NS_OK;
+}
+
+void PrincipalVerifier::VerifyOnMainThread() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  QM_TRY_INSPECT(
+      const auto& principal, PrincipalInfoToPrincipal(mPrincipalInfo), QM_VOID,
+      [this](const nsresult result) { DispatchToInitiatingThread(result); });
+
+  if (NS_WARN_IF(mHandle && !ValidatePrincipalCouldPotentiallyBeLoadedBy(
+                                principal, mHandle->GetRemoteType()))) {
+    DispatchToInitiatingThread(NS_ERROR_FAILURE);
+    return;
+  }
+
+  if (NS_WARN_IF(principal->GetIsNullPrincipal())) {
+    DispatchToInitiatingThread(NS_ERROR_FAILURE);
+    return;
+  }
+
+  if (NS_WARN_IF(mHandle && principal->IsSystemPrincipal())) {
+    DispatchToInitiatingThread(NS_ERROR_FAILURE);
+    return;
+  }
+
+#ifdef DEBUG
+  nsresult rv = NS_OK;
+  if (!principal->IsSystemPrincipal()) {
+    nsAutoCString origin;
+    rv = principal->GetOriginNoSuffix(origin);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      DispatchToInitiatingThread(rv);
+      return;
+    }
+    nsCOMPtr<nsIURI> uri;
+    rv = NS_NewURI(getter_AddRefs(uri), origin);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      DispatchToInitiatingThread(rv);
+      return;
+    }
+    rv = principal->CheckMayLoad(uri, false);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      DispatchToInitiatingThread(rv);
+      return;
+    }
+  }
+#endif
+
+  auto managerIdOrErr = ManagerId::Create(principal);
+  if (NS_WARN_IF(managerIdOrErr.isErr())) {
+    DispatchToInitiatingThread(managerIdOrErr.unwrapErr());
+    return;
+  }
+  mManagerId = managerIdOrErr.unwrap();
+
+  DispatchToInitiatingThread(NS_OK);
+}
+
+void PrincipalVerifier::CompleteOnInitiatingThread() {
+  AssertIsOnBackgroundThread();
+
+  for (const auto& listener : mListenerList.ForwardRange()) {
+    listener->OnPrincipalVerified(mResult, mManagerId);
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(mListenerList.IsEmpty());
+}
+
+void PrincipalVerifier::DispatchToInitiatingThread(nsresult aRv) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  mResult = aRv;
+
+  QM_WARNONLY_TRY(QM_TO_RESULT(
+      mInitiatingEventTarget->Dispatch(this, nsIThread::DISPATCH_NORMAL)));
+}
+
+}  

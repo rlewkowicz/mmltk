@@ -1,0 +1,669 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsReadableUtils.h"
+
+#include "nsContentAreaDragDrop.h"
+
+#include "nsString.h"
+
+#include "BrowserParent.h"
+#include "imgIContainer.h"
+#include "imgIRequest.h"
+#include "mozilla/TextControlElement.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/DataTransfer.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/HTMLAnchorElement.h"
+#include "mozilla/dom/HTMLAreaElement.h"
+#include "mozilla/dom/Selection.h"
+#include "nsComponentManagerUtils.h"
+#include "nsContentUtils.h"
+#include "nsCopySupport.h"
+#include "nsEscape.h"
+#include "nsFrameLoader.h"
+#include "nsFrameLoaderOwner.h"
+#include "nsIContent.h"
+#include "nsIContentInlines.h"
+#include "nsIContentPolicy.h"
+#include "nsICookieJarSettings.h"
+#include "nsIFile.h"
+#include "nsIFormControl.h"
+#include "nsIImageLoadingContent.h"
+#include "nsIMIMEInfo.h"
+#include "nsIMIMEService.h"
+#include "nsIPrincipal.h"
+#include "nsISelectionController.h"
+#include "nsISupportsPrimitives.h"
+#include "nsITransferable.h"
+#include "nsIURIMutator.h"
+#include "nsIURL.h"
+#include "nsIWebBrowserPersist.h"
+#include "nsNetUtil.h"
+#include "nsPIDOMWindow.h"
+#include "nsPIDOMWindowInlines.h"
+#include "nsQueryObject.h"
+#include "nsRange.h"
+#include "nsServiceManagerUtils.h"
+#include "nsUnicharUtils.h"
+#include "nsVariant.h"
+#include "nsXPCOM.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using mozilla::IgnoreErrors;
+
+class MOZ_STACK_CLASS DragDataProducer {
+ public:
+  DragDataProducer(nsPIDOMWindowOuter* aWindow, nsIContent* aTarget,
+                   nsIContent* aSelectionTargetNode, bool aIsAltKeyPressed);
+  nsresult Produce(DataTransfer* aDataTransfer, bool* aCanDrag,
+                   Selection** aSelection, nsIContent** aDragNode,
+                   nsIPolicyContainer** aPolicyContainer,
+                   nsICookieJarSettings** aCookieJarSettings);
+
+ private:
+  void AddString(DataTransfer* aDataTransfer, const nsAString& aFlavor,
+                 const nsAString& aData, nsIPrincipal* aPrincipal,
+                 bool aHidden = false);
+  nsresult AddStringsToDataTransfer(nsIContent* aDragNode,
+                                    DataTransfer* aDataTransfer);
+  nsresult GetImageData(imgIContainer* aImage, imgIRequest* aRequest);
+  static nsresult GetDraggableSelectionData(Selection* inSelection,
+                                            nsIContent* inRealTargetNode,
+                                            nsIContent** outImageOrLinkNode,
+                                            bool* outDragSelectedText);
+  [[nodiscard]] static nsresult GetAnchorURL(nsIContent* inNode,
+                                             nsAString& outURL);
+  static void CreateLinkText(const nsAString& inURL, const nsAString& inText,
+                             nsAString& outLinkText);
+
+  nsCOMPtr<nsPIDOMWindowOuter> mWindow;
+  nsCOMPtr<nsIContent> mTarget;
+  nsCOMPtr<nsIContent> mSelectionTargetNode;
+  bool mIsAltKeyPressed;
+
+  nsString mUrlString;
+  nsString mImageSourceString;
+  nsString mImageDestFileName;
+  nsString mTitleString;
+  nsString mHtmlString;
+  nsString mContextString;
+  nsString mInfoString;
+
+  bool mIsAnchor;
+  nsCOMPtr<imgIContainer> mImage;
+};
+
+nsresult nsContentAreaDragDrop::GetDragData(
+    nsPIDOMWindowOuter* aWindow, nsIContent* aTarget,
+    nsIContent* aSelectionTargetNode, bool aIsAltKeyPressed,
+    DataTransfer* aDataTransfer, bool* aCanDrag, Selection** aSelection,
+    nsIContent** aDragNode, nsIPolicyContainer** aPolicyContainer,
+    nsICookieJarSettings** aCookieJarSettings) {
+  NS_ENSURE_TRUE(aSelectionTargetNode, NS_ERROR_INVALID_ARG);
+
+  *aCanDrag = true;
+
+  DragDataProducer provider(aWindow, aTarget, aSelectionTargetNode,
+                            aIsAltKeyPressed);
+  return provider.Produce(aDataTransfer, aCanDrag, aSelection, aDragNode,
+                          aPolicyContainer, aCookieJarSettings);
+}
+
+NS_IMPL_ISUPPORTS(nsContentAreaDragDropDataProvider, nsIFlavorDataProvider)
+
+nsresult nsContentAreaDragDropDataProvider::SaveURIToFile(
+    nsIURI* inSourceURI, nsIPrincipal* inTriggeringPrincipal,
+    nsICookieJarSettings* inCookieJarSettings, nsIFile* inDestFile,
+    nsContentPolicyType inContentPolicyType, bool isPrivate) {
+  nsCOMPtr<nsIURL> sourceURL = do_QueryInterface(inSourceURI);
+  if (!sourceURL) {
+    return NS_ERROR_NO_INTERFACE;
+  }
+
+  nsresult rv = inDestFile->CreateUnique(nsIFile::NORMAL_FILE_TYPE, 0600);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIWebBrowserPersist> persist = do_CreateInstance(
+      "@mozilla.org/embedding/browser/nsWebBrowserPersist;1", &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  persist->SetPersistFlags(
+      nsIWebBrowserPersist::PERSIST_FLAGS_AUTODETECT_APPLY_CONVERSION |
+      nsIWebBrowserPersist::PERSIST_FLAGS_DISABLE_HTTPS_ONLY);
+
+  return persist->SaveURI(inSourceURI, inTriggeringPrincipal, 0, nullptr,
+                          inCookieJarSettings, nullptr, nullptr, inDestFile,
+                          inContentPolicyType, isPrivate);
+}
+
+NS_IMETHODIMP
+nsContentAreaDragDropDataProvider::GetFlavorData(nsITransferable* aTransferable,
+                                                 const char* aFlavor,
+                                                 nsISupports** aData) {
+  NS_ENSURE_ARG_POINTER(aData);
+  *aData = nullptr;
+
+  nsresult rv = NS_ERROR_NOT_IMPLEMENTED;
+
+  if (strcmp(aFlavor, kFilePromiseMime) == 0) {
+    NS_ENSURE_ARG(aTransferable);
+    nsCOMPtr<nsISupports> tmp;
+    rv = aTransferable->GetTransferData(kFilePromiseURLMime,
+                                        getter_AddRefs(tmp));
+    NS_ENSURE_SUCCESS(rv, rv);
+    nsCOMPtr<nsISupportsString> supportsString = do_QueryInterface(tmp);
+    if (!supportsString) return NS_ERROR_FAILURE;
+
+    nsAutoString sourceURLString;
+    supportsString->GetData(sourceURLString);
+    if (sourceURLString.IsEmpty()) return NS_ERROR_FAILURE;
+
+    nsCOMPtr<nsIURI> sourceURI;
+    rv = NS_NewURI(getter_AddRefs(sourceURI), sourceURLString);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = aTransferable->GetTransferData(kFilePromiseDestFilename,
+                                        getter_AddRefs(tmp));
+    NS_ENSURE_SUCCESS(rv, rv);
+    supportsString = do_QueryInterface(tmp);
+    if (!supportsString) return NS_ERROR_FAILURE;
+
+    nsAutoString targetFilename;
+    supportsString->GetData(targetFilename);
+    if (targetFilename.IsEmpty()) return NS_ERROR_FAILURE;
+
+
+    nsCOMPtr<nsISupports> dirPrimitive;
+    rv = aTransferable->GetTransferData(kFilePromiseDirectoryMime,
+                                        getter_AddRefs(dirPrimitive));
+    NS_ENSURE_SUCCESS(rv, rv);
+    nsCOMPtr<nsIFile> destDirectory = do_QueryInterface(dirPrimitive);
+    if (!destDirectory) return NS_ERROR_FAILURE;
+
+    nsCOMPtr<nsIFile> file;
+    rv = destDirectory->Clone(getter_AddRefs(file));
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    file->Append(targetFilename);
+
+    bool isPrivate = aTransferable->GetIsPrivateData();
+
+    nsCOMPtr<nsIPrincipal> principal = aTransferable->GetDataPrincipal();
+    nsContentPolicyType contentPolicyType =
+        aTransferable->GetContentPolicyType();
+    nsCOMPtr<nsICookieJarSettings> cookieJarSettings =
+        aTransferable->GetCookieJarSettings();
+    rv = SaveURIToFile(sourceURI, principal, cookieJarSettings, file,
+                       contentPolicyType, isPrivate);
+    if (NS_SUCCEEDED(rv)) {
+      CallQueryInterface(file, aData);
+    }
+  }
+
+  return rv;
+}
+
+DragDataProducer::DragDataProducer(nsPIDOMWindowOuter* aWindow,
+                                   nsIContent* aTarget,
+                                   nsIContent* aSelectionTargetNode,
+                                   bool aIsAltKeyPressed)
+    : mWindow(aWindow),
+      mTarget(aTarget),
+      mSelectionTargetNode(aSelectionTargetNode),
+      mIsAltKeyPressed(aIsAltKeyPressed),
+      mIsAnchor(false) {}
+
+static nsIContent* FindDragTarget(nsIContent* aContent) {
+  for (nsIContent* content = aContent; content;
+       content = content->GetFlattenedTreeParent()) {
+    if (nsContentUtils::ContentIsDraggable(content)) {
+      return content;
+    }
+  }
+  return nullptr;
+}
+
+nsresult DragDataProducer::GetAnchorURL(nsIContent* aContent, nsAString& aURL) {
+  aURL.Truncate();
+  auto* element = Element::FromNodeOrNull(aContent);
+  if (!element || !element->IsLink()) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIURI> linkURI = element->GetHrefURI();
+  if (!linkURI) {
+    return NS_OK;
+  }
+
+  nsAutoCString spec;
+  nsresult rv = linkURI->GetSpec(spec);
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsIScriptSecurityManager* secMan = nsContentUtils::GetSecurityManager();
+  rv = secMan->CheckLoadURIStrWithPrincipal(aContent->NodePrincipal(), spec, 0);
+  NS_ENSURE_SUCCESS(rv, rv);
+  CopyUTF8toUTF16(spec, aURL);
+  return NS_OK;
+}
+
+void DragDataProducer::CreateLinkText(const nsAString& inURL,
+                                      const nsAString& inText,
+                                      nsAString& outLinkText) {
+  nsAutoString linkText(u"<a href=\""_ns + inURL + u"\">"_ns + inText +
+                        u"</a>"_ns);
+
+  outLinkText = std::move(linkText);
+}
+
+nsresult DragDataProducer::GetImageData(imgIContainer* aImage,
+                                        imgIRequest* aRequest) {
+  MOZ_ASSERT(aImage);
+  MOZ_ASSERT(aRequest);
+
+  nsCOMPtr<nsIURI> imgUri = aRequest->GetURI();
+  if (!imgUri) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsAutoCString spec;
+  nsresult rv = imgUri->GetSpec(spec);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  CopyUTF8toUTF16(spec, mImageSourceString);
+
+  nsCString mimeType;
+  aRequest->GetMimeType(getter_Copies(mimeType));
+
+  nsAutoCString fileName;
+  aRequest->GetFileName(fileName);
+
+  nsCOMPtr<nsIMIMEService> mimeService = do_GetService("@mozilla.org/mime;1");
+  if (NS_WARN_IF(!mimeService)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  CopyUTF8toUTF16(fileName, mImageDestFileName);
+  mimeService->ValidateFileNameForSaving(mImageDestFileName, mimeType,
+                                         nsIMIMEService::VALIDATE_DEFAULT,
+                                         mImageDestFileName);
+
+  mImage = aImage;
+
+  return NS_OK;
+}
+
+nsresult DragDataProducer::Produce(DataTransfer* aDataTransfer, bool* aCanDrag,
+                                   Selection** aSelection,
+                                   nsIContent** aDragNode,
+                                   nsIPolicyContainer** aPolicyContainer,
+                                   nsICookieJarSettings** aCookieJarSettings) {
+  MOZ_ASSERT(aCanDrag && aSelection && aDataTransfer && aDragNode,
+             "null pointer passed to Produce");
+  NS_ASSERTION(mWindow, "window not set");
+  NS_ASSERTION(mSelectionTargetNode,
+               "selection target node should have been set");
+
+  *aDragNode = nullptr;
+
+  nsresult rv;
+  nsIContent* dragNode = nullptr;
+  *aSelection = nullptr;
+
+  RefPtr<Selection> selection;
+  nsIContent* editingElement = mSelectionTargetNode->IsEditable()
+                                   ? mSelectionTargetNode->GetEditingHost()
+                                   : nullptr;
+  RefPtr<TextControlElement> textControlElement =
+      TextControlElement::GetTextControlElementFromEditingHost(editingElement);
+  if (textControlElement) {
+    nsISelectionController* selcon =
+        textControlElement->GetSelectionController();
+    if (selcon) {
+      selection =
+          selcon->GetSelection(nsISelectionController::SELECTION_NORMAL);
+    }
+
+    if (!selection) return NS_OK;
+  } else {
+    selection = mWindow->GetSelection();
+    if (!selection) return NS_OK;
+
+    nsCOMPtr<nsIContent> findFormNode = mSelectionTargetNode;
+    nsIContent* findFormParent = findFormNode->GetParent();
+    while (findFormParent) {
+      const auto* form = nsIFormControl::FromNode(findFormParent);
+      if (form && !form->AllowDraggableChildren()) {
+        return NS_OK;
+      }
+      findFormParent = findFormParent->GetParent();
+    }
+  }
+
+  nsCOMPtr<nsIContent> nodeToSerialize;
+
+  BrowsingContext* bc = mWindow->GetBrowsingContext();
+  const bool isChromeShell = bc && bc->IsChrome();
+
+  if (isChromeShell && !editingElement) {
+    MOZ_ASSERT_UNREACHABLE("Shouldn't be generating drag data for chrome");
+    return NS_OK;
+  }
+
+  if (isChromeShell && textControlElement) {
+    if (!selection->ContainsNode(*mSelectionTargetNode, false, IgnoreErrors()))
+      return NS_OK;
+
+    selection.swap(*aSelection);
+  } else {
+
+    bool haveSelectedContent = false;
+
+
+    if (!mIsAltKeyPressed) {
+      if (const auto* form = nsIFormControl::FromNodeOrNull(mTarget)) {
+        if (form->IsConceptButton()) {
+          return NS_OK;
+        }
+        if (form->ControlType() != FormControlType::Object) {
+          *aCanDrag = false;
+          return NS_OK;
+        }
+      }
+    }
+
+    nsCOMPtr<nsIContent> parentLink;
+    nsCOMPtr<nsIContent> draggedNode = FindDragTarget(mTarget);
+
+    nsCOMPtr<nsIImageLoadingContent> image;
+
+    nsCOMPtr<nsIContent> selectedImageOrLinkNode;
+    GetDraggableSelectionData(selection, mSelectionTargetNode,
+                              getter_AddRefs(selectedImageOrLinkNode),
+                              &haveSelectedContent);
+
+    if (haveSelectedContent) {
+      selection.swap(*aSelection);
+    } else if (selectedImageOrLinkNode) {
+      image = do_QueryInterface(selectedImageOrLinkNode);
+    } else {
+      parentLink = nsContentUtils::GetClosestLinkInFlatTree(draggedNode);
+      if (parentLink && mIsAltKeyPressed) {
+        *aCanDrag = false;
+        return NS_OK;
+      }
+      image = do_QueryInterface(draggedNode);
+    }
+
+    {
+      nsCOMPtr<nsIContent> linkNode;
+      if (const auto* areaElem = HTMLAreaElement::FromNodeOrNull(draggedNode)) {
+        areaElem->GetAttr(nsGkAtoms::alt, mTitleString);
+        if (mTitleString.IsEmpty()) {
+          areaElem->GetAttr(nsGkAtoms::href, mTitleString);
+        }
+
+        nsresult rv = GetAnchorURL(draggedNode, mUrlString);
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        mIsAnchor = true;
+
+        mHtmlString.AssignLiteral("<a href=\"");
+        mHtmlString.Append(mUrlString);
+        mHtmlString.AppendLiteral("\">");
+        mHtmlString.Append(mTitleString);
+        mHtmlString.AppendLiteral("</a>");
+
+        dragNode = draggedNode;
+      } else if (image) {
+        nsCOMPtr<nsIURI> imageURI;
+        image->GetCurrentURI(getter_AddRefs(imageURI));
+        nsCOMPtr<Element> imageElement(do_QueryInterface(image));
+        if (imageURI) {
+          nsAutoCString spec;
+          rv = imageURI->GetSpec(spec);
+          NS_ENSURE_SUCCESS(rv, rv);
+          nsIScriptSecurityManager* secMan =
+              nsContentUtils::GetSecurityManager();
+          rv = secMan->CheckLoadURIStrWithPrincipal(
+              imageElement->NodePrincipal(), spec, 0);
+          NS_ENSURE_SUCCESS(rv, rv);
+          mIsAnchor = true;
+          CopyUTF8toUTF16(spec, mUrlString);
+        }
+
+        if (imageElement) {
+          imageElement->GetAttr(nsGkAtoms::alt, mTitleString);
+        }
+
+        if (mTitleString.IsEmpty()) {
+          mTitleString = mUrlString;
+        }
+
+        nsCOMPtr<imgIRequest> imgRequest;
+
+        nsCOMPtr<imgIContainer> img = nsContentUtils::GetImageFromContent(
+            image, getter_AddRefs(imgRequest));
+        if (imgRequest) {
+          rv = GetImageData(img, imgRequest);
+          NS_ENSURE_SUCCESS(rv, rv);
+        }
+
+        if (parentLink) {
+          linkNode = parentLink;
+          nodeToSerialize = linkNode;
+        } else {
+          nodeToSerialize = draggedNode;
+        }
+        dragNode = nodeToSerialize;
+      } else if (parentLink) {
+        linkNode = parentLink;
+        nodeToSerialize = linkNode;
+      } else if (!haveSelectedContent) {
+        return NS_OK;
+      }
+
+      if (linkNode) {
+        rv = GetAnchorURL(linkNode, mUrlString);
+        NS_ENSURE_SUCCESS(rv, rv);
+        mIsAnchor = true;
+        dragNode = linkNode;
+      }
+    }
+  }
+
+  if (nodeToSerialize || *aSelection) {
+    mHtmlString.Truncate();
+    mContextString.Truncate();
+    mInfoString.Truncate();
+    mTitleString.Truncate();
+
+    nsCOMPtr<Document> doc = mWindow->GetDoc();
+    NS_ENSURE_TRUE(doc, NS_ERROR_FAILURE);
+
+    nsCOMPtr<nsIPolicyContainer> policyContainer = doc->GetPolicyContainer();
+    if (policyContainer) {
+      policyContainer.forget(aPolicyContainer);
+    }
+
+    nsCOMPtr<nsICookieJarSettings> cookieJarSettings = doc->CookieJarSettings();
+    if (cookieJarSettings) {
+      NS_IF_ADDREF(*aCookieJarSettings = cookieJarSettings);
+    }
+
+    nsCOMPtr<nsITransferable> transferable;
+    if (*aSelection) {
+      rv = nsCopySupport::GetTransferableForSelection(
+          *aSelection, doc, getter_AddRefs(transferable));
+    } else {
+      rv = nsCopySupport::GetTransferableForNode(nodeToSerialize, doc,
+                                                 getter_AddRefs(transferable));
+    }
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    nsCOMPtr<nsISupports> supports;
+    nsCOMPtr<nsISupportsString> data;
+    rv = transferable->GetTransferData(kHTMLMime, getter_AddRefs(supports));
+    data = do_QueryInterface(supports);
+    if (NS_SUCCEEDED(rv)) {
+      data->GetData(mHtmlString);
+      mHtmlString.StripChar(L'\0');
+    }
+    rv = transferable->GetTransferData(kHTMLContext, getter_AddRefs(supports));
+    data = do_QueryInterface(supports);
+    if (NS_SUCCEEDED(rv)) {
+      data->GetData(mContextString);
+    }
+    rv = transferable->GetTransferData(kHTMLInfo, getter_AddRefs(supports));
+    data = do_QueryInterface(supports);
+    if (NS_SUCCEEDED(rv)) {
+      data->GetData(mInfoString);
+    }
+    rv = transferable->GetTransferData(kTextMime, getter_AddRefs(supports));
+    data = do_QueryInterface(supports);
+    NS_ENSURE_SUCCESS(rv, rv);  
+    data->GetData(mTitleString);
+    mTitleString.StripChar(L'\0');
+  }
+
+  if (mTitleString.IsEmpty()) {
+    mTitleString = mUrlString;
+  }
+
+  if (mHtmlString.IsEmpty() && !mUrlString.IsEmpty())
+    CreateLinkText(mUrlString, mTitleString, mHtmlString);
+
+  rv = AddStringsToDataTransfer(
+      dragNode ? dragNode : mSelectionTargetNode.get(), aDataTransfer);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  NS_IF_ADDREF(*aDragNode = dragNode);
+  return NS_OK;
+}
+
+void DragDataProducer::AddString(DataTransfer* aDataTransfer,
+                                 const nsAString& aFlavor,
+                                 const nsAString& aData,
+                                 nsIPrincipal* aPrincipal, bool aHidden) {
+  RefPtr<nsVariantCC> variant = new nsVariantCC();
+  variant->SetAsAString(aData);
+  aDataTransfer->SetDataWithPrincipal(aFlavor, variant, 0, aPrincipal, aHidden);
+}
+
+nsresult DragDataProducer::AddStringsToDataTransfer(
+    nsIContent* aDragNode, DataTransfer* aDataTransfer) {
+  NS_ASSERTION(aDragNode, "adding strings for null node");
+
+  nsIPrincipal* principal = aDragNode->NodePrincipal();
+
+  if (!mUrlString.IsEmpty() && mIsAnchor) {
+    nsAutoString dragData(mUrlString);
+    dragData.Append('\n');
+    nsAutoString title(mTitleString);
+    title.Trim("\r\n");
+    title.ReplaceChar(u"\r\n", ' ');
+    dragData += title;
+
+    AddString(aDataTransfer, NS_LITERAL_STRING_FROM_CSTRING(kURLMime), dragData,
+              principal);
+    AddString(aDataTransfer, NS_LITERAL_STRING_FROM_CSTRING(kURLDataMime),
+              mUrlString, principal);
+    AddString(aDataTransfer,
+              NS_LITERAL_STRING_FROM_CSTRING(kURLDescriptionMime), mTitleString,
+              principal);
+    AddString(aDataTransfer, u"text/uri-list"_ns, mUrlString, principal);
+  }
+
+  if (!mContextString.IsEmpty())
+    AddString(aDataTransfer, NS_LITERAL_STRING_FROM_CSTRING(kHTMLContext),
+              mContextString, principal);
+
+  if (!mInfoString.IsEmpty())
+    AddString(aDataTransfer, NS_LITERAL_STRING_FROM_CSTRING(kHTMLInfo),
+              mInfoString, principal);
+
+  if (!mHtmlString.IsEmpty())
+    AddString(aDataTransfer, NS_LITERAL_STRING_FROM_CSTRING(kHTMLMime),
+              mHtmlString, principal);
+
+  AddString(aDataTransfer, NS_LITERAL_STRING_FROM_CSTRING(kTextMime),
+            mIsAnchor ? mUrlString : mTitleString, principal);
+
+  if (mImage) {
+    RefPtr<nsVariantCC> variant = new nsVariantCC();
+    variant->SetAsISupports(mImage);
+    aDataTransfer->SetDataWithPrincipal(
+        NS_LITERAL_STRING_FROM_CSTRING(kNativeImageMime), variant, 0,
+        principal);
+
+
+    nsCOMPtr<nsIFlavorDataProvider> dataProvider =
+        new nsContentAreaDragDropDataProvider();
+    if (dataProvider) {
+      RefPtr<nsVariantCC> variant = new nsVariantCC();
+      variant->SetAsISupports(dataProvider);
+      aDataTransfer->SetDataWithPrincipal(
+          NS_LITERAL_STRING_FROM_CSTRING(kFilePromiseMime), variant, 0,
+          principal);
+    }
+
+    AddString(aDataTransfer,
+              NS_LITERAL_STRING_FROM_CSTRING(kFilePromiseURLMime),
+              mImageSourceString, principal);
+    AddString(aDataTransfer,
+              NS_LITERAL_STRING_FROM_CSTRING(kFilePromiseDestFilename),
+              mImageDestFileName, principal);
+
+    if (!mIsAnchor) {
+      AddString(aDataTransfer, NS_LITERAL_STRING_FROM_CSTRING(kURLDataMime),
+                mUrlString, principal);
+      AddString(aDataTransfer, u"text/uri-list"_ns, mUrlString, principal);
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult DragDataProducer::GetDraggableSelectionData(
+    Selection* inSelection, nsIContent* inRealTargetNode,
+    nsIContent** outImageOrLinkNode, bool* outDragSelectedText) {
+  NS_ENSURE_ARG(inSelection);
+  NS_ENSURE_ARG(inRealTargetNode);
+  NS_ENSURE_ARG_POINTER(outImageOrLinkNode);
+
+  *outImageOrLinkNode = nullptr;
+  *outDragSelectedText = false;
+
+  if (!inSelection->AreNormalAndCrossShadowBoundaryRangesCollapsed()) {
+    if (inSelection->ContainsNode(*inRealTargetNode, false, IgnoreErrors())) {
+      nsINode* selectionStart =
+          inSelection->GetMayCrossShadowBoundaryAnchorNode();
+      nsINode* selectionEnd = inSelection->GetMayCrossShadowBoundaryFocusNode();
+
+      if (selectionStart == selectionEnd) {
+        nsCOMPtr<nsIContent> selStartContent =
+            nsIContent::FromNodeOrNull(selectionStart);
+        if (selStartContent && selStartContent->HasChildNodes()) {
+          uint32_t anchorOffset = inSelection->AnchorOffset();
+          uint32_t focusOffset = inSelection->FocusOffset();
+          if (anchorOffset == focusOffset + 1 ||
+              focusOffset == anchorOffset + 1) {
+            uint32_t childOffset = std::min(anchorOffset, focusOffset);
+            nsIContent* childContent =
+                selStartContent->GetChildAt_Deprecated(childOffset);
+            if (nsContentUtils::IsDraggableImage(childContent)) {
+              NS_ADDREF(*outImageOrLinkNode = childContent);
+              return NS_OK;
+            }
+          }
+        }
+      }
+
+      *outDragSelectedText = true;
+    }
+  }
+
+  return NS_OK;
+}

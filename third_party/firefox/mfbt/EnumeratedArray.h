@@ -1,0 +1,66 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_EnumeratedArray_h
+#define mozilla_EnumeratedArray_h
+
+#include <utility>
+
+#include "mozilla/Array.h"
+#include "EnumTypeTraits.h"
+
+namespace mozilla {
+
+template <typename Enum, typename ValueType,
+          size_t Size = ContiguousEnumSize<Enum>::value>
+class EnumeratedArray {
+ private:
+  static_assert(UnderlyingValue(MinContiguousEnumValue<Enum>::value) == 0,
+                "All indexes would need to be corrected if min != 0");
+
+  using ArrayType = Array<ValueType, Size>;
+
+  ArrayType mArray;
+
+ public:
+  constexpr EnumeratedArray() = default;
+
+  template <typename... Args>
+  MOZ_IMPLICIT constexpr EnumeratedArray(Args&&... aArgs)
+      : mArray{std::forward<Args>(aArgs)...} {}
+
+  constexpr ValueType& operator[](Enum aIndex) {
+    return mArray[size_t(aIndex)];
+  }
+
+  constexpr const ValueType& operator[](Enum aIndex) const {
+    return mArray[size_t(aIndex)];
+  }
+
+  using iterator = typename ArrayType::iterator;
+  using const_iterator = typename ArrayType::const_iterator;
+  using reverse_iterator = typename ArrayType::reverse_iterator;
+  using const_reverse_iterator = typename ArrayType::const_reverse_iterator;
+
+  iterator begin() { return mArray.begin(); }
+  const_iterator begin() const { return mArray.begin(); }
+  const_iterator cbegin() const { return mArray.cbegin(); }
+  iterator end() { return mArray.end(); }
+  const_iterator end() const { return mArray.end(); }
+  const_iterator cend() const { return mArray.cend(); }
+
+  constexpr size_t size() const { return mArray.size(); }
+
+  reverse_iterator rbegin() { return mArray.rbegin(); }
+  const_reverse_iterator rbegin() const { return mArray.rbegin(); }
+  const_reverse_iterator crbegin() const { return mArray.crbegin(); }
+  reverse_iterator rend() { return mArray.rend(); }
+  const_reverse_iterator rend() const { return mArray.rend(); }
+  const_reverse_iterator crend() const { return mArray.crend(); }
+};
+
+}  
+
+#endif  // mozilla_EnumeratedArray_h

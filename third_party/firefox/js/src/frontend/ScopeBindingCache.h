@@ -1,0 +1,223 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_ScopeBindingCache_h
+#define frontend_ScopeBindingCache_h
+
+#include "mozilla/Assertions.h"  // mozilla::MakeCompilerAssumeUnreachableFakeValue
+#include "mozilla/Attributes.h"  // MOZ_STACK_CLASS
+#include "mozilla/HashTable.h"   // mozilla::HashMap
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "frontend/NameAnalysisTypes.h"  // NameLocation
+#include "frontend/ParserAtom.h"  // TaggedParserAtomIndex, ParserAtomsTable
+
+#include "js/Utility.h"  // AutoEnterOOMUnsafeRegion
+
+#include "vm/StringType.h"  // JSAtom
+
+namespace js {
+
+template <typename NameT>
+class AbstractBaseScopeData;
+
+namespace frontend {
+
+struct CompilationAtomCache;
+struct CompilationStencil;
+struct ScopeStencilRef;
+struct FakeStencilGlobalScope;
+struct CompilationStencilMerger;
+
+struct GenericAtom {
+  struct EmitterName {
+    FrontendContext* fc;
+    ParserAtomsTable& parserAtoms;
+    CompilationAtomCache& atomCache;
+    TaggedParserAtomIndex index;
+
+    EmitterName(FrontendContext* fc, ParserAtomsTable& parserAtoms,
+                CompilationAtomCache& atomCache, TaggedParserAtomIndex index)
+        : fc(fc),
+          parserAtoms(parserAtoms),
+          atomCache(atomCache),
+          index(index) {}
+  };
+
+  struct StencilName {
+    const CompilationStencil& stencil;
+    TaggedParserAtomIndex index;
+  };
+
+  using AnyName = mozilla::Variant<EmitterName, StencilName, JSAtom*>;
+
+  HashNumber hash;
+  AnyName ref;
+
+  GenericAtom(FrontendContext* fc, ParserAtomsTable& parserAtoms,
+              CompilationAtomCache& atomCache, TaggedParserAtomIndex index);
+
+  GenericAtom(const CompilationStencil& context, TaggedParserAtomIndex index);
+  GenericAtom(ScopeStencilRef& scope, TaggedParserAtomIndex index);
+  GenericAtom(const FakeStencilGlobalScope& scope, TaggedParserAtomIndex index)
+      : ref((JSAtom*)nullptr) {
+    MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE();
+  }
+
+  GenericAtom(const Scope*, JSAtom* ptr) : GenericAtom(ptr) {}
+  explicit GenericAtom(JSAtom* ptr) : ref(ptr) { hash = ptr->hash(); }
+
+  bool operator==(const GenericAtom& other) const;
+};
+
+template <typename NameT>
+struct BindingHasher;
+
+template <>
+struct BindingHasher<TaggedParserAtomIndex> {
+  using Key = TaggedParserAtomIndex;
+  struct Lookup {
+    const CompilationStencil& keyStencil;
+    GenericAtom other;
+
+    Lookup(ScopeStencilRef& scope_ref, const GenericAtom& other);
+    Lookup(const FakeStencilGlobalScope& scope_ref, const GenericAtom& other)
+        : keyStencil(mozilla::MakeCompilerAssumeUnreachableFakeValue<
+                     const CompilationStencil&>()),
+          other(other) {
+      MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE();
+    }
+  };
+
+  static HashNumber hash(const Lookup& aLookup) { return aLookup.other.hash; }
+
+  static bool match(const Key& aKey, const Lookup& aLookup) {
+    GenericAtom key(aLookup.keyStencil, aKey);
+    return key == aLookup.other;
+  }
+};
+
+template <>
+struct BindingHasher<JSAtom*> {
+  using Key = JSAtom*;
+  struct Lookup {
+    GenericAtom other;
+
+    template <typename Any>
+    Lookup(const Any&, const GenericAtom& other) : other(other) {}
+  };
+
+  static HashNumber hash(const Lookup& aLookup) { return aLookup.other.hash; }
+
+  static bool match(const Key& aKey, const Lookup& aLookup) {
+    GenericAtom key(aKey);
+    return key == aLookup.other;
+  }
+};
+
+template <typename NameT>
+struct BindingMap {
+  using Lookup = typename BindingHasher<NameT>::Lookup;
+  using Map =
+      HashMap<NameT, NameLocation, BindingHasher<NameT>, js::SystemAllocPolicy>;
+
+  Map hashMap;
+  mozilla::Maybe<NameLocation> catchAll;
+};
+
+template <typename NameT, typename ScopeT = NameT>
+using ScopeBindingMap =
+    HashMap<AbstractBaseScopeData<ScopeT>*, BindingMap<NameT>,
+            DefaultHasher<AbstractBaseScopeData<ScopeT>*>,
+            js::SystemAllocPolicy>;
+
+class ScopeBindingCache {
+ public:
+  using CacheGeneration = size_t;
+
+  virtual CacheGeneration getCurrentGeneration() const = 0;
+
+  virtual bool canCacheFor(Scope* ptr);
+  virtual bool canCacheFor(ScopeStencilRef ref);
+  virtual bool canCacheFor(const FakeStencilGlobalScope& ref);
+
+  virtual BindingMap<JSAtom*>* createCacheFor(Scope* ptr);
+  virtual BindingMap<TaggedParserAtomIndex>* createCacheFor(
+      ScopeStencilRef ref);
+  virtual BindingMap<TaggedParserAtomIndex>* createCacheFor(
+      const FakeStencilGlobalScope& ref);
+
+  virtual BindingMap<JSAtom*>* lookupScope(Scope* ptr, CacheGeneration gen);
+  virtual BindingMap<TaggedParserAtomIndex>* lookupScope(ScopeStencilRef ref,
+                                                         CacheGeneration gen);
+  virtual BindingMap<TaggedParserAtomIndex>* lookupScope(
+      const FakeStencilGlobalScope& ref, CacheGeneration gen);
+};
+
+class NoScopeBindingCache final : public ScopeBindingCache {
+ public:
+  CacheGeneration getCurrentGeneration() const override { return 1; };
+
+  bool canCacheFor(Scope* ptr) override;
+  bool canCacheFor(ScopeStencilRef ref) override;
+  bool canCacheFor(const FakeStencilGlobalScope& ref) override;
+};
+
+class MOZ_STACK_CLASS StencilScopeBindingCache final
+    : public ScopeBindingCache {
+  ScopeBindingMap<TaggedParserAtomIndex> scopeMap;
+#ifdef DEBUG
+  const InitialStencilAndDelazifications& stencils_;
+#endif
+
+ public:
+  explicit StencilScopeBindingCache(
+      const InitialStencilAndDelazifications& stencils)
+#ifdef DEBUG
+      : stencils_(stencils)
+#endif
+  {
+  }
+
+  CacheGeneration getCurrentGeneration() const override { return 1; }
+
+  bool canCacheFor(ScopeStencilRef ref) override;
+  bool canCacheFor(const FakeStencilGlobalScope& ref) override;
+
+  BindingMap<TaggedParserAtomIndex>* createCacheFor(
+      ScopeStencilRef ref) override;
+  BindingMap<TaggedParserAtomIndex>* createCacheFor(
+      const FakeStencilGlobalScope& ref) override;
+
+  BindingMap<TaggedParserAtomIndex>* lookupScope(ScopeStencilRef ref,
+                                                 CacheGeneration gen) override;
+  BindingMap<TaggedParserAtomIndex>* lookupScope(
+      const FakeStencilGlobalScope& ref, CacheGeneration gen) override;
+};
+
+class RuntimeScopeBindingCache final : public ScopeBindingCache {
+  ScopeBindingMap<JSAtom*, JSAtom> scopeMap;
+
+  size_t cacheGeneration = 1;
+
+ public:
+  CacheGeneration getCurrentGeneration() const override {
+    return cacheGeneration;
+  }
+
+  bool canCacheFor(Scope* ptr) override;
+  BindingMap<JSAtom*>* createCacheFor(Scope* ptr) override;
+  BindingMap<JSAtom*>* lookupScope(Scope* ptr, CacheGeneration gen) override;
+
+  void purge() {
+    cacheGeneration++;
+    scopeMap.clearAndCompact();
+  }
+};
+
+}  
+}  
+
+#endif  // frontend_ScopeBindingCache_h

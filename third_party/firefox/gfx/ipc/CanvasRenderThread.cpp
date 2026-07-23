@@ -1,0 +1,140 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "CanvasRenderThread.h"
+
+#include "mozilla/SharedThreadPool.h"
+#include "mozilla/StaticPrefs_gfx.h"
+#include "mozilla/gfx/CanvasManagerParent.h"
+#include "mozilla/gfx/gfxVars.h"
+#include "mozilla/layers/CanvasTranslator.h"
+#include "mozilla/layers/CompositorThread.h"
+#include "mozilla/webrender/RenderThread.h"
+#include "nsThread.h"
+#include "prsystem.h"
+
+bool NS_IsInCanvasThreadOrWorker() {
+  return mozilla::gfx::CanvasRenderThread::IsInCanvasRenderOrWorkerThread();
+}
+
+namespace mozilla::gfx {
+
+static StaticRefPtr<CanvasRenderThread> sCanvasRenderThread;
+#ifdef DEBUG
+static bool sCanvasRenderThreadEverStarted = false;
+#endif
+
+CanvasRenderThread::CanvasRenderThread(nsCOMPtr<nsIThread>&& aThread,
+                                       bool aCreatedThread)
+    : mMutex("CanvasRenderThread::mMutex"),
+      mThread(std::move(aThread)),
+      mCreatedThread(aCreatedThread) {}
+
+CanvasRenderThread::~CanvasRenderThread() = default;
+
+void CanvasRenderThread::Start() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!sCanvasRenderThread);
+
+#ifdef DEBUG
+  MOZ_ASSERT(!sCanvasRenderThreadEverStarted);
+  sCanvasRenderThreadEverStarted = true;
+#endif
+
+  nsCOMPtr<nsIThread> thread;
+  if (!gfxVars::SupportsThreadsafeGL()) {
+    thread = wr::RenderThread::GetRenderThread();
+    MOZ_ASSERT(thread);
+  } else if (!gfxVars::UseCanvasRenderThread()) {
+    thread = layers::CompositorThread();
+    MOZ_ASSERT(thread);
+  }
+
+  if (thread) {
+    sCanvasRenderThread =
+        new CanvasRenderThread(std::move(thread),  false);
+    return;
+  }
+
+  const uint32_t stackSize =
+      nsIThreadManager::DEFAULT_STACK_SIZE ? 4096 << 10 : 0;
+
+  nsresult rv = NS_NewNamedThread(
+      "CanvasRenderer", getter_AddRefs(thread),
+      NS_NewRunnableFunction(
+          "CanvasRender::Setup",
+          []() {
+            nsCOMPtr<nsIThread> thread = NS_GetCurrentThread();
+            nsThread* nsthread = static_cast<nsThread*>(thread.get());
+            nsthread->SetPriority(nsISupportsPriority::PRIORITY_HIGH);
+          }),
+      {.stackSize = stackSize});
+
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return;
+  }
+
+  sCanvasRenderThread =
+      new CanvasRenderThread(std::move(thread),  true);
+}
+
+void CanvasRenderThread::Shutdown() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!sCanvasRenderThread) {
+    MOZ_ASSERT(XRE_IsParentProcess());
+    return;
+  }
+
+  CanvasManagerParent::Shutdown();
+
+  layers::CanvasTranslator::Shutdown();
+
+  bool createdThread = sCanvasRenderThread->mCreatedThread;
+  nsCOMPtr<nsIThread> oldThread = sCanvasRenderThread->GetCanvasRenderThread();
+
+  NS_DispatchAndSpinEventLoopUntilComplete(
+      "CanvasRenderThread::Shutdown"_ns, oldThread,
+      NS_NewRunnableFunction("CanvasRenderThread::Shutdown", []() -> void {}));
+
+  sCanvasRenderThread = nullptr;
+
+  if (createdThread) {
+    oldThread->Shutdown();
+  }
+}
+
+bool CanvasRenderThread::IsInCanvasRenderThread() {
+  return sCanvasRenderThread &&
+         sCanvasRenderThread->mThread == NS_GetCurrentThread();
+}
+
+ bool CanvasRenderThread::IsInCanvasWorkerThread() {
+  return sCanvasRenderThread &&
+         sCanvasRenderThread->mThread == NS_GetCurrentThread();
+}
+
+ bool CanvasRenderThread::IsInCanvasRenderOrWorkerThread() {
+  return sCanvasRenderThread &&
+         sCanvasRenderThread->mThread == NS_GetCurrentThread();
+}
+
+already_AddRefed<nsIThread> CanvasRenderThread::GetCanvasRenderThread() {
+  nsCOMPtr<nsIThread> thread;
+  if (sCanvasRenderThread) {
+    thread = sCanvasRenderThread->mThread;
+  }
+  return thread.forget();
+}
+
+ void CanvasRenderThread::Dispatch(
+    already_AddRefed<nsIRunnable> aRunnable) {
+  if (!sCanvasRenderThread) {
+    MOZ_DIAGNOSTIC_CRASH("Dispatching after CanvasRenderThread shutdown!");
+    return;
+  }
+  sCanvasRenderThread->mThread->Dispatch(std::move(aRunnable));
+}
+
+}  

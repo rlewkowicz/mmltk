@@ -1,0 +1,24 @@
+DIST_INSTALL = False
+NoVisibilityFlags()
+HOST_SOURCES += ['nsinstall.c', 'pathsub.c']
+HostProgram('nsinstall_real')
+if CONFIG['CC_TYPE'] in ('clang', 'gcc') and CONFIG['MOZ_OPTIMIZE']:
+    CFLAGS += ['-O3']
+HOST_DEFINES['UNICODE'] = True
+HOST_DEFINES['_UNICODE'] = True
+include('stl-headers.mozbuild')
+if CONFIG['WRAP_STL_INCLUDES']:
+    stl_compiler = None
+    stl_compiler = 'gcc'
+    if stl_compiler:
+        template_file = '%s-stl-wrapper.template.h' % stl_compiler
+        output_dir = '/dist/stl_wrappers'
+        outputs = tuple(['stl.sentinel'] + ['%s/%s' % (output_dir, h) for h in stl_headers])
+        GeneratedFile(*outputs, script='make-stl-wrappers.py', entry_point='gen_wrappers', inputs=[template_file], flags=[TOPOBJDIR + output_dir, stl_compiler] + stl_headers)
+if CONFIG['WRAP_SYSTEM_INCLUDES']:
+    include('system-headers.mozbuild')
+    output_dir = '/dist/system_wrappers'
+    outputs = tuple(['system-header.sentinel'] + ['%s/%s' % (output_dir, h) for h in stl_headers + system_headers])
+    GeneratedFile(*outputs, script='make-system-wrappers.py', entry_point='gen_wrappers', flags=[TOPOBJDIR + output_dir] + stl_headers + system_headers)
+if CONFIG['COMPILE_ENVIRONMENT'] and CONFIG['CBINDGEN']:
+    GeneratedFile('cbindgen-metadata.json', script='/build/RunCbindgen.py', entry_point='generate_metadata', inputs=['!/.cargo/config.toml'])

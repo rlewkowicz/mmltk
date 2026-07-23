@@ -1,0 +1,317 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsFrameMessageManager_h_
+#define nsFrameMessageManager_h_
+
+#include <string.h>
+
+#include "ErrorList.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "js/experimental/JSStencil.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Services.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/TypedEnumBits.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/ipc/StructuredCloneData.h"
+#include "nsCOMPtr.h"
+#include "nsClassHashtable.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsHashKeys.h"
+#include "nsIMessageManager.h"
+#include "nsIObserver.h"
+#include "nsIObserverService.h"
+#include "nsISupports.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "nsTHashMap.h"
+#include "nsTObserverArray.h"
+#include "nscore.h"
+
+class nsFrameLoader;
+class nsIRunnable;
+
+namespace mozilla {
+
+class ErrorResult;
+
+namespace dom {
+
+class ChildProcessMessageManager;
+class ChromeMessageBroadcaster;
+class MessageBroadcaster;
+class MessageListener;
+class MessageListenerManager;
+class MessageManagerReporter;
+class ParentProcessMessageManager;
+class ProcessMessageManager;
+struct ReceiveMessageArgument;
+
+namespace ipc {
+
+class MessageManagerCallback;
+class WritableSharedMap;
+
+enum class MessageManagerFlags {
+  MM_NONE = 0,
+  MM_CHROME = 1,
+  MM_GLOBAL = 2,
+  MM_PROCESSMANAGER = 4,
+  MM_BROADCASTER = 8,
+  MM_OWNSCALLBACK = 16
+};
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(MessageManagerFlags);
+
+}  
+}  
+}  
+
+struct nsMessageListenerInfo {
+  bool operator==(const nsMessageListenerInfo& aOther) const {
+    return &aOther == this;
+  }
+
+  RefPtr<mozilla::dom::MessageListener> mListener;
+  bool mListenWhenClosed;
+};
+
+class nsFrameMessageManager : public nsIMessageSender {
+  friend class mozilla::dom::MessageManagerReporter;
+  using StructuredCloneData = mozilla::dom::ipc::StructuredCloneData;
+
+ protected:
+  using MessageManagerFlags = mozilla::dom::ipc::MessageManagerFlags;
+
+  nsFrameMessageManager(mozilla::dom::ipc::MessageManagerCallback* aCallback,
+                        MessageManagerFlags aFlags);
+
+  virtual ~nsFrameMessageManager();
+
+ public:
+  explicit nsFrameMessageManager(
+      mozilla::dom::ipc::MessageManagerCallback* aCallback)
+      : nsFrameMessageManager(aCallback, MessageManagerFlags::MM_NONE) {}
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(nsFrameMessageManager)
+
+  void MarkForCC();
+
+  void AddMessageListener(const nsAString& aMessageName,
+                          mozilla::dom::MessageListener& aListener,
+                          bool aListenWhenClosed, mozilla::ErrorResult& aError);
+  void RemoveMessageListener(const nsAString& aMessageName,
+                             mozilla::dom::MessageListener& aListener,
+                             mozilla::ErrorResult& aError);
+
+  void SendAsyncMessage(JSContext* aCx, const nsAString& aMessageName,
+                        JS::Handle<JS::Value> aObj,
+                        JS::Handle<JS::Value> aTransfers,
+                        mozilla::ErrorResult& aError) {
+    DispatchAsyncMessage(aCx, aMessageName, aObj, aTransfers, aError);
+  }
+  already_AddRefed<mozilla::dom::ProcessMessageManager>
+  GetProcessMessageManager(mozilla::ErrorResult& aError);
+  void GetRemoteType(nsACString& aRemoteType,
+                     mozilla::ErrorResult& aError) const;
+
+  void SendSyncMessage(JSContext* aCx, const nsAString& aMessageName,
+                       JS::Handle<JS::Value> aObj, nsTArray<JS::Value>& aResult,
+                       mozilla::ErrorResult& aError);
+
+  void GetInitialProcessData(JSContext* aCx,
+                             JS::MutableHandle<JS::Value> aInitialProcessData,
+                             mozilla::ErrorResult& aError);
+
+  mozilla::dom::ipc::WritableSharedMap* SharedData();
+
+  NS_DECL_NSIMESSAGESENDER
+
+  static mozilla::dom::ProcessMessageManager* NewProcessMessageManager(
+      bool aIsRemote);
+
+  void ReceiveMessage(
+      nsISupports* aTarget, nsFrameLoader* aTargetFrameLoader,
+      const nsAString& aMessage, bool aIsSync,
+      mozilla::NotNull<StructuredCloneData*> aCloneData,
+      nsTArray<mozilla::NotNull<RefPtr<StructuredCloneData>>>* aRetVal);
+
+  void Disconnect(bool aRemoveFromParent = true);
+  void Close();
+
+  void SetCallback(mozilla::dom::ipc::MessageManagerCallback* aCallback);
+
+  mozilla::dom::ipc::MessageManagerCallback* GetCallback() { return mCallback; }
+
+  nsresult DispatchAsyncMessageInternal(
+      JSContext* aCx, const nsAString& aMessage,
+      mozilla::NotNull<StructuredCloneData*> aData);
+  bool IsGlobal() { return mGlobal; }
+  bool IsBroadcaster() { return mIsBroadcaster; }
+  bool IsChrome() { return mChrome; }
+
+  static already_AddRefed<mozilla::dom::ChromeMessageBroadcaster>
+  GetGlobalMessageManager();
+  static mozilla::dom::ParentProcessMessageManager* GetParentProcessManager() {
+    return sParentProcessManager;
+  }
+  static mozilla::dom::ChildProcessMessageManager* GetChildProcessManager() {
+    return sChildProcessManager;
+  }
+  static void SetChildProcessManager(
+      mozilla::dom::ChildProcessMessageManager* aManager) {
+    sChildProcessManager = aManager;
+  }
+
+  static bool GetParamsForMessage(JSContext* aCx, const JS::Value& aValue,
+                                  const JS::Value& aTransfer,
+                                  mozilla::NotNull<StructuredCloneData*> aData);
+
+  void SetInitialProcessData(JS::Handle<JS::Value> aInitialData);
+
+  void LoadPendingScripts();
+
+ protected:
+  friend class MMListenerRemover;
+
+  virtual mozilla::dom::MessageBroadcaster* GetParentManager() {
+    return nullptr;
+  }
+  virtual void ClearParentManager(bool aRemove) {}
+
+  void DispatchAsyncMessage(JSContext* aCx, const nsAString& aMessageName,
+                            JS::Handle<JS::Value> aObj,
+                            JS::Handle<JS::Value> aTransfers,
+                            mozilla::ErrorResult& aError);
+
+  void LoadScript(const nsAString& aURL, bool aAllowDelayedLoad,
+                  bool aRunInGlobalScope, mozilla::ErrorResult& aError);
+  void RemoveDelayedScript(const nsAString& aURL);
+  void GetDelayedScripts(JSContext* aCx, nsTArray<nsTArray<JS::Value>>& aList,
+                         mozilla::ErrorResult& aError);
+
+  nsClassHashtable<nsStringHashKey,
+                   nsAutoTObserverArray<nsMessageListenerInfo, 1>>
+      mListeners;
+  nsTArray<RefPtr<mozilla::dom::MessageListenerManager>> mChildManagers;
+  bool mChrome;            
+  bool mGlobal;            
+  bool mIsProcessManager;  
+  bool mIsBroadcaster;     
+  bool mOwnsCallback;
+  bool mHandlingMessage;
+  bool mClosed;  
+  bool mDisconnected;
+  mozilla::dom::ipc::MessageManagerCallback* mCallback;
+  mozilla::UniquePtr<mozilla::dom::ipc::MessageManagerCallback> mOwnedCallback;
+  nsTArray<nsString> mPendingScripts;
+  nsTArray<bool> mPendingScriptsGlobalStates;
+  JS::Heap<JS::Value> mInitialProcessData;
+  RefPtr<mozilla::dom::ipc::WritableSharedMap> mSharedData;
+
+  void LoadPendingScripts(nsFrameMessageManager* aManager,
+                          nsFrameMessageManager* aChildMM);
+
+ public:
+  static mozilla::dom::ParentProcessMessageManager* sParentProcessManager;
+  static nsFrameMessageManager* sSameProcessParentManager;
+  static nsTArray<nsCOMPtr<nsIRunnable>>* sPendingSameProcessAsyncMessages;
+
+ private:
+  static mozilla::dom::ChildProcessMessageManager* sChildProcessManager;
+};
+
+class nsSameProcessAsyncMessageBase {
+ public:
+  using StructuredCloneData = mozilla::dom::ipc::StructuredCloneData;
+
+  nsSameProcessAsyncMessageBase() = default;
+  nsSameProcessAsyncMessageBase(const nsSameProcessAsyncMessageBase&) = delete;
+
+  nsresult Init(const nsAString& aMessage,
+                mozilla::NotNull<StructuredCloneData*> aData);
+
+  void ReceiveMessage(nsISupports* aTarget, nsFrameLoader* aTargetFrameLoader,
+                      nsFrameMessageManager* aManager);
+
+ private:
+  nsString mMessage;
+  RefPtr<StructuredCloneData> mData;
+#ifdef DEBUG
+  bool mCalledInit = false;
+#endif
+};
+
+class nsScriptCacheCleaner;
+
+struct nsMessageManagerScriptHolder {
+  explicit nsMessageManagerScriptHolder(JS::Stencil* aStencil)
+      : mStencil(aStencil) {
+    MOZ_COUNT_CTOR(nsMessageManagerScriptHolder);
+  }
+
+  MOZ_COUNTED_DTOR(nsMessageManagerScriptHolder)
+
+  RefPtr<JS::Stencil> mStencil;
+};
+
+class nsMessageManagerScriptExecutor {
+ public:
+  static void PurgeCache();
+  static void Shutdown();
+
+  void MarkScopesForCC();
+
+ protected:
+  friend class nsMessageManagerScriptCx;
+  nsMessageManagerScriptExecutor() {
+    MOZ_COUNT_CTOR(nsMessageManagerScriptExecutor);
+  }
+  MOZ_COUNTED_DTOR(nsMessageManagerScriptExecutor)
+
+  void DidCreateScriptLoader();
+  void LoadScriptInternal(JS::Handle<JSObject*> aMessageManager,
+                          const nsAString& aURL, bool aRunInUniqueScope);
+  already_AddRefed<JS::Stencil> TryCacheLoadAndCompileScript(
+      const nsAString& aURL, bool aRunInUniqueScope,
+      JS::Handle<JSObject*> aMessageManager);
+  bool Init();
+  void Trace(const TraceCallbacks& aCallbacks, void* aClosure);
+  void Unlink();
+  AutoTArray<JS::Heap<JSObject*>, 2> mAnonymousGlobalScopes;
+
+  virtual bool IsProcessScoped() const { return false; }
+
+  static nsTHashMap<nsStringHashKey, nsMessageManagerScriptHolder*>*
+      sCachedScripts;
+  static mozilla::StaticRefPtr<nsScriptCacheCleaner> sScriptCacheCleaner;
+};
+
+class nsScriptCacheCleaner final : public nsIObserver {
+  ~nsScriptCacheCleaner() = default;
+
+  NS_DECL_ISUPPORTS
+
+  nsScriptCacheCleaner() {
+    nsCOMPtr<nsIObserverService> obsSvc =
+        mozilla::services::GetObserverService();
+    if (obsSvc) {
+      obsSvc->AddObserver(this, "xpcom-shutdown", false);
+    }
+  }
+
+  NS_IMETHOD Observe(nsISupports* aSubject, const char* aTopic,
+                     const char16_t* aData) override {
+    if (strcmp("xpcom-shutdown", aTopic) == 0) {
+      nsMessageManagerScriptExecutor::Shutdown();
+    }
+    return NS_OK;
+  }
+};
+
+#endif

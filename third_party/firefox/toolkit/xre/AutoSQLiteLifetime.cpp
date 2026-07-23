@@ -1,0 +1,120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsDebug.h"
+#include "AutoSQLiteLifetime.h"
+#include "sqlite3.h"
+#include "mozilla/Atomics.h"
+
+#ifdef MOZ_MEMORY
+#  include "mozmemory.h"
+#  ifdef MOZ_DMD
+#    include "nsIMemoryReporter.h"
+#    include "DMD.h"
+
+namespace mozilla {
+namespace storage {
+extern mozilla::Atomic<size_t> gSqliteMemoryUsed;
+}
+}  
+
+using mozilla::storage::gSqliteMemoryUsed;
+
+#  endif
+
+namespace {
+
+
+#  ifdef MOZ_DMD
+
+
+MOZ_DEFINE_MALLOC_SIZE_OF_ON_ALLOC(SqliteMallocSizeOfOnAlloc)
+MOZ_DEFINE_MALLOC_SIZE_OF_ON_FREE(SqliteMallocSizeOfOnFree)
+
+#  endif
+
+static void* sqliteMemMalloc(int n) {
+  void* p = ::malloc(n);
+#  ifdef MOZ_DMD
+  gSqliteMemoryUsed += SqliteMallocSizeOfOnAlloc(p);
+#  endif
+  return p;
+}
+
+static void sqliteMemFree(void* p) {
+#  ifdef MOZ_DMD
+  gSqliteMemoryUsed -= SqliteMallocSizeOfOnFree(p);
+#  endif
+  ::free(p);
+}
+
+static void* sqliteMemRealloc(void* p, int n) {
+#  ifdef MOZ_DMD
+  gSqliteMemoryUsed -= SqliteMallocSizeOfOnFree(p);
+  void* pnew = ::realloc(p, n);
+  if (pnew) {
+    gSqliteMemoryUsed += SqliteMallocSizeOfOnAlloc(pnew);
+  } else {
+    gSqliteMemoryUsed += SqliteMallocSizeOfOnAlloc(p);
+  }
+  return pnew;
+#  else
+  return ::realloc(p, n);
+#  endif
+}
+
+static int sqliteMemSize(void* p) { return ::moz_malloc_usable_size(p); }
+
+static int sqliteMemRoundup(int n) {
+  n = malloc_good_size(n);
+
+  return n <= 8 ? 8 : n;
+}
+
+static int sqliteMemInit(void* p) { return 0; }
+
+static void sqliteMemShutdown(void* p) {}
+
+const sqlite3_mem_methods memMethods = {
+    &sqliteMemMalloc,  &sqliteMemFree, &sqliteMemRealloc,  &sqliteMemSize,
+    &sqliteMemRoundup, &sqliteMemInit, &sqliteMemShutdown, nullptr};
+
+}  
+
+#endif  // MOZ_MEMORY
+
+namespace mozilla {
+
+AutoSQLiteLifetime::AutoSQLiteLifetime() {
+  if (++AutoSQLiteLifetime::sSingletonEnforcer != 1) {
+    MOZ_CRASH("multiple instances of AutoSQLiteLifetime constructed!");
+  }
+
+  Init();
+}
+
+void AutoSQLiteLifetime::Init() {
+#ifdef MOZ_MEMORY
+  sResult = ::sqlite3_config(SQLITE_CONFIG_MALLOC, &memMethods);
+#else
+  sResult = SQLITE_OK;
+#endif
+
+  if (sResult == SQLITE_OK) {
+    ::sqlite3_config(SQLITE_CONFIG_PAGECACHE, NULL, 0, 0);
+
+    sResult = ::sqlite3_initialize();
+  }
+}
+
+AutoSQLiteLifetime::~AutoSQLiteLifetime() {
+  sResult = ::sqlite3_shutdown();
+  NS_WARNING_ASSERTION(sResult == SQLITE_OK,
+                       "sqlite3 did not shutdown cleanly.");
+}
+
+int AutoSQLiteLifetime::sSingletonEnforcer = 0;
+int AutoSQLiteLifetime::sResult = SQLITE_MISUSE;
+
+}  

@@ -1,0 +1,143 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ipc_Shmem_h
+#define mozilla_ipc_Shmem_h
+
+#include "base/basictypes.h"
+#include "base/process.h"
+#include "chrome/common/ipc_message_utils.h"
+
+#include "nsISupports.h"
+#include "nscore.h"
+#include "nsDebug.h"
+
+#include "mozilla/ipc/SharedMemoryMapping.h"
+#include "mozilla/Range.h"
+#include "mozilla/UniquePtr.h"
+
+
+namespace mozilla::ipc {
+
+class IProtocol;
+class IToplevelProtocol;
+
+class Shmem final {
+  friend struct IPC::ParamTraits<Shmem>;
+  friend class IProtocol;
+  friend class IToplevelProtocol;
+
+ public:
+  using id_t = int64_t;
+  class Segment final : public SharedMemoryMapping {
+    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(Segment);
+
+    explicit Segment(SharedMemoryMapping&& aMapping)
+        : SharedMemoryMapping(std::move(aMapping)) {}
+
+   private:
+    ~Segment() = default;
+  };
+
+  class Builder {
+   public:
+    explicit Builder(size_t aSize);
+
+    explicit operator bool() const { return mSegment && mSegment->IsValid(); }
+
+    std::tuple<UniquePtr<IPC::Message>, Shmem> Build(
+        id_t aId, bool aUnsafe, IPC::Message::routeid_t aRoutingId);
+
+   private:
+    size_t mSize;
+    MutableSharedMemoryHandle mHandle;
+    RefPtr<Segment> mSegment;
+  };
+
+  Shmem() : mSegment(nullptr), mData(nullptr), mSize(0), mId(0) {}
+  Shmem(const Shmem& aOther) = default;
+  ~Shmem() { forget(); }
+
+  Shmem& operator=(const Shmem& aRhs) = default;
+
+  bool operator==(const Shmem& aRhs) const { return mSegment == aRhs.mSegment; }
+
+  bool IsWritable() const { return mSegment != nullptr; }
+
+  bool IsReadable() const { return mSegment != nullptr; }
+
+  template <typename T>
+  T* get() const {
+    AssertInvariants();
+    AssertAligned<T>();
+
+    return reinterpret_cast<T*>(mData);
+  }
+
+  template <typename T>
+  size_t Size() const {
+    AssertInvariants();
+    AssertAligned<T>();
+
+    return mSize / sizeof(T);
+  }
+
+  template <typename T>
+  Range<T> Range() const {
+    return {get<T>(), Size<T>()};
+  }
+
+ private:
+
+  Shmem(RefPtr<Segment>&& aSegment, id_t aId, size_t aSize, bool aUnsafe);
+
+  id_t Id() const { return mId; }
+
+  Segment* GetSegment() const { return mSegment; }
+
+#ifndef DEBUG
+  void RevokeRights() {}
+#else
+  void RevokeRights();
+#endif
+
+  void forget() {
+    mSegment = nullptr;
+    mData = nullptr;
+    mSize = 0;
+    mId = 0;
+#ifdef DEBUG
+    mUnsafe = false;
+#endif
+  }
+
+  UniquePtr<IPC::Message> MkDestroyedMessage(IPC::Message::routeid_t routingId);
+
+  static already_AddRefed<Segment> OpenExisting(const IPC::Message& aDescriptor,
+                                                id_t* aId,
+                                                bool aProtect = false);
+
+  template <typename T>
+  void AssertAligned() const {
+    if (0 != (mSize % sizeof(T))) MOZ_CRASH("shmem is not T-aligned");
+  }
+
+#if !defined(DEBUG)
+  void AssertInvariants() const {}
+#else
+  void AssertInvariants() const;
+#endif
+
+  RefPtr<Segment> mSegment;
+  void* mData;
+  size_t mSize;
+  id_t mId;
+#ifdef DEBUG
+  bool mUnsafe = false;
+#endif
+};
+
+}  
+
+#endif  // ifndef mozilla_ipc_Shmem_h

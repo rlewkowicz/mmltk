@@ -1,0 +1,70 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_DOMSVGANIMATEDNUMBERLIST_H_
+#define DOM_SVG_DOMSVGANIMATEDNUMBERLIST_H_
+
+#include "SVGElement.h"
+#include "mozilla/RefPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla {
+
+class SVGAnimatedNumberList;
+class SVGNumberList;
+
+namespace dom {
+
+class DOMSVGNumberList;
+
+class DOMSVGAnimatedNumberList final : public nsWrapperCache {
+  friend class DOMSVGNumberList;
+
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(DOMSVGAnimatedNumberList)
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_NATIVE_CLASS(DOMSVGAnimatedNumberList)
+
+  static already_AddRefed<DOMSVGAnimatedNumberList> GetDOMWrapper(
+      SVGAnimatedNumberList* aList, dom::SVGElement* aElement,
+      uint8_t aAttrEnum);
+
+  static DOMSVGAnimatedNumberList* GetDOMWrapperIfExists(
+      SVGAnimatedNumberList* aList);
+
+  void InternalBaseValListWillChangeTo(const SVGNumberList& aNewValue);
+  void InternalAnimValListWillChangeTo(const SVGNumberList& aNewValue);
+
+  bool IsAnimating() const;
+
+  dom::SVGElement* GetParentObject() const { return mElement; }
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+  already_AddRefed<DOMSVGNumberList> BaseVal();
+  already_AddRefed<DOMSVGNumberList> AnimVal();
+
+ private:
+  DOMSVGAnimatedNumberList(dom::SVGElement* aElement, uint8_t aAttrEnum)
+      : mBaseVal(nullptr),
+        mAnimVal(nullptr),
+        mElement(aElement),
+        mAttrEnum(aAttrEnum) {}
+
+  ~DOMSVGAnimatedNumberList();
+
+  SVGAnimatedNumberList& InternalAList();
+  const SVGAnimatedNumberList& InternalAList() const;
+
+  DOMSVGNumberList* mBaseVal;
+  DOMSVGNumberList* mAnimVal;
+
+  RefPtr<dom::SVGElement> mElement;
+
+  uint8_t mAttrEnum;
+};
+
+}  
+}  
+
+#endif  // DOM_SVG_DOMSVGANIMATEDNUMBERLIST_H_

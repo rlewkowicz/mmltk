@@ -1,0 +1,126 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_MaybeCrossOriginObject_h
+#define mozilla_dom_MaybeCrossOriginObject_h
+
+
+#include "js/Class.h"
+#include "js/TypeDecls.h"
+#include "mozilla/Maybe.h"
+#include "nsStringFwd.h"
+
+namespace mozilla::dom {
+
+struct CrossOriginProperties {
+  const JSPropertySpec* mAttributes;
+  const JSFunctionSpec* mMethods;
+  const JSPropertySpec* mChromeOnlyAttributes;
+  const JSFunctionSpec* mChromeOnlyMethods;
+};
+
+class MaybeCrossOriginObjectMixins {
+ public:
+  static bool IsPlatformObjectSameOrigin(JSContext* cx, JSObject* obj);
+
+ protected:
+  bool CrossOriginGetOwnPropertyHelper(
+      JSContext* cx, JS::Handle<JSObject*> obj, JS::Handle<jsid> id,
+      JS::MutableHandle<Maybe<JS::PropertyDescriptor>> desc) const;
+
+  static bool CrossOriginPropertyFallback(
+      JSContext* cx, JS::Handle<JSObject*> obj, JS::Handle<jsid> id,
+      JS::MutableHandle<Maybe<JS::PropertyDescriptor>> desc);
+
+  static bool CrossOriginGet(JSContext* cx, JS::Handle<JSObject*> obj,
+                             JS::Handle<JS::Value> receiver,
+                             JS::Handle<jsid> id,
+                             JS::MutableHandle<JS::Value> vp);
+
+  static bool CrossOriginSet(JSContext* cx, JS::Handle<JSObject*> obj,
+                             JS::Handle<jsid> id, JS::Handle<JS::Value> v,
+                             JS::Handle<JS::Value> receiver,
+                             JS::ObjectOpResult& result);
+
+  static bool EnsureHolder(JSContext* cx, JS::Handle<JSObject*> obj,
+                           size_t slot, const CrossOriginProperties& properties,
+                           JS::MutableHandle<JSObject*> holder);
+
+  virtual bool EnsureHolder(JSContext* cx, JS::Handle<JSObject*> proxy,
+                            JS::MutableHandle<JSObject*> holder) const = 0;
+
+  static bool ReportCrossOriginDenial(JSContext* aCx, JS::Handle<jsid> aId,
+                                      const nsACString& aAccessType);
+};
+
+template <typename Base>
+class MaybeCrossOriginObject : public Base,
+                               public MaybeCrossOriginObjectMixins {
+ protected:
+  template <typename... Args>
+  constexpr MaybeCrossOriginObject(Args&&... aArgs)
+      : Base(std::forward<Args>(aArgs)...) {}
+
+  bool getPrototype(JSContext* cx, JS::Handle<JSObject*> proxy,
+                    JS::MutableHandle<JSObject*> protop) const final;
+
+  virtual JSObject* getSameOriginPrototype(JSContext* cx) const = 0;
+
+  bool setPrototype(JSContext* cx, JS::Handle<JSObject*> proxy,
+                    JS::Handle<JSObject*> proto,
+                    JS::ObjectOpResult& result) const final;
+
+  bool getPrototypeIfOrdinary(JSContext* cx, JS::Handle<JSObject*> proxy,
+                              bool* isOrdinary,
+                              JS::MutableHandle<JSObject*> protop) const final;
+
+  bool setImmutablePrototype(JSContext* cx, JS::Handle<JSObject*> proxy,
+                             bool* succeeded) const final;
+
+  bool isExtensible(JSContext* cx, JS::Handle<JSObject*> proxy,
+                    bool* extensible) const final;
+
+  bool preventExtensions(JSContext* cx, JS::Handle<JSObject*> proxy,
+                         JS::ObjectOpResult& result) const final;
+
+  bool getOwnPropertyDescriptor(
+      JSContext* cx, JS::Handle<JSObject*> proxy, JS::Handle<jsid> id,
+      JS::MutableHandle<Maybe<JS::PropertyDescriptor>> desc) const override = 0;
+
+  bool defineProperty(JSContext* cx, JS::Handle<JSObject*> proxy,
+                      JS::Handle<jsid> id,
+                      JS::Handle<JS::PropertyDescriptor> desc,
+                      JS::ObjectOpResult& result) const final;
+
+  using Base::defineProperty;
+
+  virtual bool definePropertySameOrigin(JSContext* cx,
+                                        JS::Handle<JSObject*> proxy,
+                                        JS::Handle<jsid> id,
+                                        JS::Handle<JS::PropertyDescriptor> desc,
+                                        JS::ObjectOpResult& result) const = 0;
+
+  bool get(JSContext* cx, JS::Handle<JSObject*> proxy,
+           JS::Handle<JS::Value> receiver, JS::Handle<jsid> id,
+           JS::MutableHandle<JS::Value> vp) const override = 0;
+
+  bool set(JSContext* cx, JS::Handle<JSObject*> proxy, JS::Handle<jsid> id,
+           JS::Handle<JS::Value> v, JS::Handle<JS::Value> receiver,
+           JS::ObjectOpResult& result) const override = 0;
+
+  bool delete_(JSContext* cx, JS::Handle<JSObject*> proxy, JS::Handle<jsid> id,
+               JS::ObjectOpResult& result) const override = 0;
+
+  bool enumerate(JSContext* cx, JS::Handle<JSObject*> proxy,
+                 JS::MutableHandleVector<jsid> props) const final;
+
+  virtual bool throwOnPrivateField() const override { return true; }
+
+  const char* className(JSContext* cx,
+                        JS::Handle<JSObject*> proxy) const override = 0;
+};
+
+}  
+
+#endif /* mozilla_dom_MaybeCrossOriginObject_h */

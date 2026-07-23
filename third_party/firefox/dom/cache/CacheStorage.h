@@ -1,0 +1,115 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_cache_CacheStorage_h
+#define mozilla_dom_cache_CacheStorage_h
+
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/cache/TypeUtils.h"
+#include "mozilla/dom/cache/Types.h"
+#include "nsCOMPtr.h"
+#include "nsISupportsImpl.h"
+#include "nsTArray.h"
+#include "nsWrapperCache.h"
+
+class nsIGlobalObject;
+
+namespace mozilla {
+
+class ErrorResult;
+
+namespace ipc {
+class PrincipalInfo;
+}  
+
+namespace dom {
+
+enum class CacheStorageNamespace : uint8_t;
+class Promise;
+class WorkerPrivate;
+
+namespace cache {
+
+class CacheStorageChild;
+class CacheWorkerRef;
+
+bool IsTrusted(const mozilla::ipc::PrincipalInfo& aPrincipalInfo,
+               bool aTestingPrefEnabled);
+
+class CacheStorage final : public nsISupports,
+                           public nsWrapperCache,
+                           public TypeUtils,
+                           public CacheStorageChildListener {
+  using PBackgroundChild = mozilla::ipc::PBackgroundChild;
+
+ public:
+  static already_AddRefed<CacheStorage> CreateOnMainThread(
+      Namespace aNamespace, nsIGlobalObject* aGlobal, nsIPrincipal* aPrincipal,
+      bool aForceTrustedOrigin, ErrorResult& aRv);
+
+  static already_AddRefed<CacheStorage> CreateOnWorker(
+      Namespace aNamespace, nsIGlobalObject* aGlobal,
+      WorkerPrivate* aWorkerPrivate, ErrorResult& aRv);
+
+  static bool DefineCachesForSandbox(JSContext* aCx,
+                                     JS::Handle<JSObject*> aGlobal);
+
+  static bool CachesEnabled(JSContext* aCx, JSObject*);
+
+  already_AddRefed<Promise> Match(JSContext* aCx,
+                                  const RequestOrUTF8String& aRequest,
+                                  const MultiCacheQueryOptions& aOptions,
+                                  ErrorResult& aRv);
+  already_AddRefed<Promise> Has(const nsAString& aKey, ErrorResult& aRv);
+  already_AddRefed<Promise> Open(const nsAString& aKey, ErrorResult& aRv);
+  already_AddRefed<Promise> Delete(const nsAString& aKey, ErrorResult& aRv);
+  already_AddRefed<Promise> Keys(ErrorResult& aRv);
+
+  static already_AddRefed<CacheStorage> Constructor(
+      const GlobalObject& aGlobal, CacheStorageNamespace aNamespace,
+      nsIPrincipal* aPrincipal, ErrorResult& aRv);
+
+  nsISupports* GetParentObject() const;
+  virtual JSObject* WrapObject(JSContext* aContext,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  void OnActorDestroy(CacheStorageChild* aActor) override;
+
+  virtual nsIGlobalObject* GetGlobalObject() const override;
+#ifdef DEBUG
+  virtual void AssertOwningThread() const override;
+#endif
+
+ private:
+  CacheStorage(Namespace aNamespace, nsIGlobalObject* aGlobal,
+               const mozilla::ipc::PrincipalInfo& aPrincipalInfo,
+               SafeRefPtr<CacheWorkerRef> aWorkerRef);
+  explicit CacheStorage(nsresult aFailureResult);
+  ~CacheStorage();
+
+  struct Entry;
+  void RunRequest(UniquePtr<Entry> aEntry);
+
+  OpenMode GetOpenMode() const;
+
+  bool HasStorageAccess() const;
+
+  const Namespace mNamespace;
+  nsCOMPtr<nsIGlobalObject> mGlobal;
+  const UniquePtr<mozilla::ipc::PrincipalInfo> mPrincipalInfo;
+
+  CacheStorageChild* mActor;
+
+  nsresult mStatus;
+
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(CacheStorage)
+};
+
+}  
+}  
+}  
+
+#endif  // mozilla_dom_cache_CacheStorage_h

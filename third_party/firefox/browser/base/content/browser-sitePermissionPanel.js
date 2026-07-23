@@ -1,0 +1,740 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+XPCOMUtils.defineLazyServiceGetter(
+  this,
+  "SiteCategory",
+  "@mozilla.org/site-category;1",
+  Ci.nsISiteCategory
+);
+
+var gPermissionPanel = {
+  _popupInitialized: false,
+  _initializePopup() {
+    if (!this._popupInitialized) {
+      let wrapper = document.getElementById("template-permission-popup");
+      wrapper.replaceWith(wrapper.content);
+      this._popupInitialized = true;
+      this._permissionPopup.addEventListener("popupshown", this);
+      this._permissionPopup.addEventListener("popuphidden", this);
+    }
+  },
+
+  hidePopup() {
+    if (this._popupInitialized) {
+      PanelMultiView.hidePopup(this._permissionPopup);
+    }
+  },
+
+  _popupAnchorNode: null,
+  _popupPosition: "bottomleft topleft",
+  setAnchor(anchorNode, popupPosition) {
+    this._popupAnchorNode = anchorNode;
+    this._popupPosition = popupPosition;
+  },
+
+  _browserOverride: null,
+  setBrowserOverride(browser) {
+    this._browserOverride = browser;
+  },
+  clearBrowserOverride() {
+    this._browserOverride = null;
+  },
+
+  get _activeBrowser() {
+    return this._browserOverride ?? gBrowser.selectedBrowser;
+  },
+  get browser() {
+    return this._activeBrowser;
+  },
+  get _popupAnchor() {
+    if (this._popupAnchorNode) {
+      return this._popupAnchorNode;
+    }
+    return this._identityPermissionBox;
+  },
+  get _identityPermissionBox() {
+    delete this._identityPermissionBox;
+    return (this._identityPermissionBox = document.getElementById(
+      "identity-permission-box"
+    ));
+  },
+  get _permissionGrantedIcon() {
+    delete this._permissionGrantedIcon;
+    return (this._permissionGrantedIcon = document.getElementById(
+      "permissions-granted-icon"
+    ));
+  },
+  get _permissionPopup() {
+    if (!this._popupInitialized) {
+      return null;
+    }
+    delete this._permissionPopup;
+    return (this._permissionPopup =
+      document.getElementById("permission-popup"));
+  },
+  get _permissionPopupMainView() {
+    delete this._permissionPopupPopupMainView;
+    return (this._permissionPopupPopupMainView = document.getElementById(
+      "permission-popup-mainView"
+    ));
+  },
+  get _permissionPopupMainViewHeaderLabel() {
+    delete this._permissionPopupMainViewHeaderLabel;
+    return (this._permissionPopupMainViewHeaderLabel = document.getElementById(
+      "permission-popup-mainView-panel-header-span"
+    ));
+  },
+  get _permissionList() {
+    delete this._permissionList;
+    return (this._permissionList = document.getElementById(
+      "permission-popup-permission-list"
+    ));
+  },
+  get _defaultPermissionAnchor() {
+    delete this._defaultPermissionAnchor;
+    return (this._defaultPermissionAnchor = document.getElementById(
+      "permission-popup-permission-list-default-anchor"
+    ));
+  },
+  get _permissionReloadHint() {
+    delete this._permissionReloadHint;
+    return (this._permissionReloadHint = document.getElementById(
+      "permission-popup-permission-reload-hint"
+    ));
+  },
+  get _permissionAnchors() {
+    delete this._permissionAnchors;
+    let permissionAnchors = {};
+    for (let anchor of document.getElementById("blocked-permissions-container")
+      .children) {
+      permissionAnchors[anchor.getAttribute("data-permission-id")] = anchor;
+    }
+    return (this._permissionAnchors = permissionAnchors);
+  },
+
+  _refreshPermissionPopup() {
+    let host = gIdentityHandler.getHostForDisplay(
+      this._browserOverride?.currentURI
+    );
+
+    this._permissionPopupMainViewHeaderLabel.textContent =
+      gNavigatorBundle.getFormattedString("permissions.header", [host]);
+
+    this.updateSitePermissions();
+  },
+
+  hidePermissionIcons() {
+    this._identityPermissionBox.removeAttribute("hasPermissions");
+  },
+
+  refreshPermissionIcons() {
+    let permissionAnchors = this._permissionAnchors;
+
+    for (let icon of Object.values(permissionAnchors)) {
+      icon.removeAttribute("showing");
+    }
+
+    let hasPermissions = false;
+
+    let permissions = SitePermissions.getAllForBrowser(
+      gBrowser.selectedBrowser
+    );
+    for (let permission of permissions) {
+      if (
+        permission.state == SitePermissions.UNKNOWN ||
+        permission.state == SitePermissions.PROMPT
+      ) {
+        continue;
+      }
+      hasPermissions = true;
+
+      if (
+        permission.state == SitePermissions.BLOCK ||
+        permission.state == SitePermissions.AUTOPLAY_BLOCKED_ALL
+      ) {
+        let icon = permissionAnchors[permission.id];
+        if (icon) {
+          icon.setAttribute("showing", "true");
+        }
+      }
+    }
+
+    if (
+      gBrowser.selectedBrowser.popupAndRedirectBlocker.getBlockedPopupCount() ||
+      gBrowser.selectedBrowser.popupAndRedirectBlocker.isRedirectBlocked()
+    ) {
+      let icon = permissionAnchors.popup;
+      icon.setAttribute("showing", "true");
+      hasPermissions = true;
+    }
+
+    this._identityPermissionBox.toggleAttribute(
+      "hasPermissions",
+      hasPermissions
+    );
+  },
+
+  openPopup(event) {
+    if (document.fullscreen) {
+      this._exitedEventReceived = false;
+      this._event = event;
+      Services.obs.addObserver(this, "fullscreen-painted");
+      window.addEventListener(
+        "MozDOMFullscreen:Exited",
+        () => {
+          this._exitedEventReceived = true;
+        },
+        { once: true }
+      );
+      document.exitFullscreen();
+      return;
+    }
+
+    this._initializePopup();
+
+    this._permissionReloadHint.hidden = true;
+
+    this._refreshPermissionPopup();
+
+    let openPanels = Array.from(document.querySelectorAll("panel[openpanel]"));
+    for (let panel of openPanels) {
+      PanelMultiView.hidePopup(panel);
+    }
+
+    PanelMultiView.openPopup(this._permissionPopup, this._popupAnchor, {
+      position: this._popupPosition,
+      triggerEvent: event,
+    }).catch(console.error);
+  },
+
+  handleIdentityButtonEvent(event) {
+    event.stopPropagation();
+
+    if (
+      (event.type == "click" && event.button != 0) ||
+      (event.type == "keypress" &&
+        event.charCode != KeyEvent.DOM_VK_SPACE &&
+        event.keyCode != KeyEvent.DOM_VK_RETURN)
+    ) {
+      return; 
+    }
+
+    if (
+      gURLBar.getAttribute("pageproxystate") != "valid" &&
+      !gURLBar.hasAttribute("persistsearchterms")
+    ) {
+      return;
+    }
+
+    this.openPopup(event);
+  },
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "popupshown":
+        if (event.target == this._permissionPopup) {
+          window.addEventListener("focus", this, true);
+        }
+        break;
+      case "popuphidden":
+        if (event.target == this._permissionPopup) {
+          window.removeEventListener("focus", this, true);
+        }
+        break;
+      case "focus":
+        {
+          let elem = document.activeElement;
+          let position = elem.compareDocumentPosition(this._permissionPopup);
+
+          if (
+            !(
+              position &
+              (Node.DOCUMENT_POSITION_CONTAINS |
+                Node.DOCUMENT_POSITION_CONTAINED_BY)
+            ) &&
+            !this._permissionPopup.hasAttribute("noautohide")
+          ) {
+            PanelMultiView.hidePopup(this._permissionPopup);
+          }
+        }
+        break;
+    }
+  },
+
+  observe(subject, topic) {
+    switch (topic) {
+      case "fullscreen-painted": {
+        if (subject != window || !this._exitedEventReceived) {
+          return;
+        }
+        Services.obs.removeObserver(this, "fullscreen-painted");
+        this.openPopup(this._event);
+        delete this._event;
+        break;
+      }
+    }
+  },
+
+  onLocationChange() {
+    if (this._popupInitialized && this._permissionPopup.state != "closed") {
+      this._permissionReloadHint.hidden = true;
+    }
+  },
+
+  updateSitePermissions() {
+    let permissionItemSelector = [
+      ".permission-popup-permission-item, .permission-popup-permission-item-container",
+    ];
+    this._permissionList
+      .querySelectorAll(permissionItemSelector)
+      .forEach(e => e.remove());
+    this._permissionLabelIndex = 0;
+
+    let permissions = SitePermissions.getAllPermissionDetailsForBrowser(
+      this.browser
+    );
+
+    let thirdPartyStorageSites = new Set(
+      permissions
+        .map(function (permission) {
+          let [id, key] = permission.id.split(
+            SitePermissions.PERM_KEY_DELIMITER
+          );
+          if (id == "3rdPartyFrameStorage") {
+            return key;
+          }
+          return null;
+        })
+        .filter(function (key) {
+          return key != null;
+        })
+    );
+    permissions = permissions.filter(function (permission) {
+      let [id, key] = permission.id.split(SitePermissions.PERM_KEY_DELIMITER);
+      if (id != "3rdPartyStorage") {
+        return true;
+      }
+      try {
+        let origin = Services.io.newURI(key);
+        let site = Services.eTLD.getSite(origin);
+        return !thirdPartyStorageSites.has(site);
+      } catch {
+        return false;
+      }
+    });
+
+    let totalBlockedPopups =
+      this.browser.popupAndRedirectBlocker.getBlockedPopupCount();
+    let isRedirectBlocked =
+      this.browser.popupAndRedirectBlocker.isRedirectBlocked();
+    let showBlockedIndicator = totalBlockedPopups || isRedirectBlocked;
+
+    let hasBlockedIndicator = false;
+    for (let permission of permissions) {
+      let [id, key] = permission.id.split(SitePermissions.PERM_KEY_DELIMITER);
+
+      if (id == "storage-access") {
+        continue;
+      }
+
+      let item;
+      let anchor =
+        this._permissionList.querySelector(`[anchorfor="${id}"]`) ||
+        this._defaultPermissionAnchor;
+
+      if (id == "open-protocol-handler") {
+        let permContainer = this._createProtocolHandlerPermissionItem(
+          permission,
+          key
+        );
+        if (permContainer) {
+          anchor.appendChild(permContainer);
+        }
+      } else {
+        item = this._createPermissionItem({
+          permission,
+          idNoSuffix: id,
+          isContainer: false,
+          nowrapLabel: id == "3rdPartyStorage" || id == "3rdPartyFrameStorage",
+        });
+
+        if (id == "3rdPartyFrameStorage") {
+          anchor = this._permissionList.querySelector(
+            `[anchorfor="3rdPartyStorage"]`
+          );
+        }
+
+        if (!item) {
+          continue;
+        }
+        anchor.appendChild(item);
+      }
+
+      if (id == "popup" && showBlockedIndicator) {
+        this._createBlockedPopupIndicator(
+          totalBlockedPopups,
+          isRedirectBlocked
+        );
+        hasBlockedIndicator = true;
+      }
+    }
+
+    if (showBlockedIndicator && !hasBlockedIndicator) {
+      let permission = {
+        id: "popup",
+        state: SitePermissions.getDefault("popup"),
+        scope: SitePermissions.SCOPE_PERSISTENT,
+      };
+      let item = this._createPermissionItem({ permission });
+      this._defaultPermissionAnchor.appendChild(item);
+      this._createBlockedPopupIndicator(totalBlockedPopups, isRedirectBlocked);
+    }
+  },
+
+  _createPermissionItem({
+    permission,
+    isContainer = false,
+    permClearButton = true,
+    showStateLabel = true,
+    idNoSuffix = permission.id,
+    nowrapLabel = false,
+    clearCallback = () => {},
+  }) {
+    let container = document.createXULElement("hbox");
+    container.classList.add(
+      "permission-popup-permission-item",
+      `permission-popup-permission-item-${idNoSuffix}`
+    );
+    container.setAttribute("align", "center");
+    container.setAttribute("role", "group");
+
+    let img = document.createXULElement("image");
+    img.classList.add("permission-popup-permission-icon", idNoSuffix + "-icon");
+    if (
+      permission.state == SitePermissions.BLOCK ||
+      permission.state == SitePermissions.AUTOPLAY_BLOCKED_ALL
+    ) {
+      img.classList.add("blocked-permission-icon");
+    }
+
+    let nameLabel = document.createXULElement("label");
+    nameLabel.setAttribute("flex", "1");
+    nameLabel.setAttribute("class", "permission-popup-permission-label");
+    let label = SitePermissions.getPermissionLabel(permission.id);
+    if (label === null) {
+      return null;
+    }
+    if (nowrapLabel) {
+      nameLabel.setAttribute("value", label);
+      nameLabel.setAttribute("tooltiptext", label);
+      nameLabel.setAttribute("crop", "end");
+    } else {
+      nameLabel.textContent = label;
+    }
+    let nameLabelId = `permission-popup-permission-label-${idNoSuffix}-${this
+      ._permissionLabelIndex++}`;
+    nameLabel.setAttribute("id", nameLabelId);
+
+    let isGlobalPermission =
+      permission.scope == SitePermissions.SCOPE_GLOBAL;
+
+    if (
+      (idNoSuffix == "popup" && !isGlobalPermission) ||
+      idNoSuffix == "autoplay-media"
+    ) {
+      let menulist = document.createXULElement("menulist");
+      let menupopup = document.createXULElement("menupopup");
+      let block = document.createXULElement("vbox");
+      block.setAttribute("id", "permission-popup-container");
+      block.setAttribute("class", "permission-popup-permission-item-container");
+      menulist.setAttribute("sizetopopup", "none");
+      menulist.setAttribute("id", "permission-popup-menulist");
+
+      if (
+        idNoSuffix == "popup" &&
+        Services.prefs.prefIsLocked("dom.disable_open_during_load")
+      ) {
+        menulist.setAttribute("disabled", "true");
+      }
+
+      for (let state of SitePermissions.getAvailableStates(idNoSuffix)) {
+        let menuitem = document.createXULElement("menuitem");
+        if (state == SitePermissions.getDefault(idNoSuffix)) {
+          menuitem.setAttribute("value", "0");
+        } else {
+          menuitem.setAttribute("value", state);
+        }
+
+        menuitem.setAttribute(
+          "label",
+          SitePermissions.getMultichoiceStateLabel(idNoSuffix, state)
+        );
+        menupopup.appendChild(menuitem);
+      }
+
+      menulist.appendChild(menupopup);
+
+      if (permission.state == SitePermissions.getDefault(idNoSuffix)) {
+        menulist.value = "0";
+      } else {
+        menulist.value = permission.state;
+      }
+
+      menulist.addEventListener("command", () => {
+        SitePermissions.setForPrincipal(
+          gBrowser.contentPrincipal,
+          permission.id,
+          menulist.selectedItem.value
+        );
+      });
+
+      container.appendChild(img);
+      container.appendChild(nameLabel);
+      container.appendChild(menulist);
+      container.setAttribute("aria-labelledby", nameLabelId);
+      block.appendChild(container);
+
+      return block;
+    }
+
+    container.appendChild(img);
+    container.appendChild(nameLabel);
+    let labelledBy = nameLabelId;
+
+    let stateLabel;
+    if (showStateLabel) {
+      stateLabel = this._createStateLabel(permission, idNoSuffix);
+      labelledBy += " " + stateLabel.id;
+    }
+
+    container.setAttribute("aria-labelledby", labelledBy);
+
+    if (isGlobalPermission) {
+      if (stateLabel) {
+        container.appendChild(stateLabel);
+      }
+      return container;
+    }
+
+    if (isContainer) {
+      let block = document.createXULElement("vbox");
+      block.setAttribute("id", "permission-popup-" + idNoSuffix + "-container");
+      block.setAttribute("class", "permission-popup-permission-item-container");
+
+      if (permClearButton) {
+        let button = this._createPermissionClearButton({
+          permission,
+          container: block,
+          idNoSuffix,
+          clearCallback,
+        });
+        if (stateLabel) {
+          button.appendChild(stateLabel);
+        }
+        container.appendChild(button);
+      }
+
+      block.appendChild(container);
+      return block;
+    }
+
+    if (permClearButton) {
+      let button = this._createPermissionClearButton({
+        permission,
+        container,
+        idNoSuffix,
+        clearCallback,
+      });
+      if (stateLabel) {
+        button.appendChild(stateLabel);
+      }
+      container.appendChild(button);
+    }
+
+    return container;
+  },
+
+  _createStateLabel(aPermission, idNoSuffix) {
+    let label = document.createXULElement("label");
+    label.setAttribute("class", "permission-popup-permission-state-label");
+    let labelId = `permission-popup-permission-state-label-${idNoSuffix}-${this
+      ._permissionLabelIndex++}`;
+    label.setAttribute("id", labelId);
+    let { state, scope } = aPermission;
+    label.textContent = SitePermissions.getCurrentStateLabel(
+      state,
+      idNoSuffix,
+      scope
+    );
+    return label;
+  },
+
+  _removePermPersistentAllow(principal, id) {
+    let perm = SitePermissions.getForPrincipal(principal, id);
+    if (
+      perm.state == SitePermissions.ALLOW &&
+      perm.scope == SitePermissions.SCOPE_PERSISTENT
+    ) {
+      SitePermissions.removeFromPrincipal(principal, id);
+    }
+  },
+
+  _createPermissionClearButton({
+    permission,
+    container,
+    idNoSuffix = permission.id,
+    clearCallback = () => {},
+  }) {
+    let button = document.createXULElement("button");
+    button.setAttribute("class", "permission-popup-permission-remove-button");
+    let tooltiptext = gNavigatorBundle.getString("permissions.remove.tooltip");
+    button.setAttribute("tooltiptext", tooltiptext);
+    button.addEventListener("command", () => {
+      let browser = this.browser;
+      let contentPrincipal = browser.contentPrincipal;
+      container.remove();
+      if (idNoSuffix == "3rdPartyFrameStorage") {
+        let [, matchSite] = permission.id.split(
+          SitePermissions.PERM_KEY_DELIMITER
+        );
+        let permissions = SitePermissions.getAllForBrowser(browser);
+        let removePermissions = permissions.filter(function (removePermission) {
+          let [id, key] = removePermission.id.split(
+            SitePermissions.PERM_KEY_DELIMITER
+          );
+          if (id != "3rdPartyStorage") {
+            return false;
+          }
+          try {
+            let origin = Services.io.newURI(key);
+            let site = Services.eTLD.getSite(origin);
+            return site == matchSite;
+          } catch {
+            return false;
+          }
+        });
+        for (let removePermission of removePermissions) {
+          SitePermissions.removeFromPrincipal(
+            contentPrincipal,
+            removePermission.id,
+            browser
+          );
+        }
+      }
+
+      SitePermissions.removeFromPrincipal(
+        contentPrincipal,
+        permission.id,
+        browser
+      );
+      this._permissionReloadHint.hidden = false;
+
+      clearCallback();
+    });
+
+    return button;
+  },
+
+  _createProtocolHandlerPermissionItem(permission, key) {
+    let container = document.getElementById(
+      "permission-popup-open-protocol-handler-container"
+    );
+    let initialCall;
+
+    if (!container) {
+      container = this._createPermissionItem({
+        permission,
+        isContainer: true,
+        permClearButton: false,
+        showStateLabel: false,
+        idNoSuffix: "open-protocol-handler",
+      });
+      initialCall = true;
+    }
+
+    let item = document.createXULElement("hbox");
+    item.setAttribute("class", "permission-popup-permission-item");
+    item.setAttribute("align", "center");
+
+    let text = document.createXULElement("label");
+    text.setAttribute("flex", "1");
+    text.setAttribute("class", "permission-popup-permission-label-subitem");
+
+    text.textContent = gNavigatorBundle.getFormattedString(
+      "openProtocolHandlerPermissionEntryLabel",
+      [key]
+    );
+
+    let stateLabel = this._createStateLabel(
+      permission,
+      "open-protocol-handler"
+    );
+
+    item.appendChild(text);
+
+    let button = this._createPermissionClearButton({
+      permission,
+      container: item,
+      clearCallback: () => {
+        if (container.childElementCount <= 1) {
+          container.remove();
+        }
+      },
+    });
+    button.appendChild(stateLabel);
+    item.appendChild(button);
+
+    container.appendChild(item);
+
+    return initialCall && container;
+  },
+
+  _createBlockedRedirectText() {
+    let text = document.createXULElement("label", { is: "text-link" });
+    text.setAttribute("class", "permission-popup-permission-label");
+    text.addEventListener("click", () => {
+      gBrowser.selectedBrowser.popupAndRedirectBlocker.unblockFirstRedirect();
+    });
+
+    document.l10n.setAttributes(text, "site-permissions-unblock-redirect");
+
+    return text;
+  },
+
+  _createBlockedPopupText(aTotalBlockedPopups) {
+    let text = document.createXULElement("label", { is: "text-link" });
+    text.setAttribute("class", "permission-popup-permission-label");
+    text.addEventListener("click", () => {
+      gBrowser.selectedBrowser.popupAndRedirectBlocker.unblockAllPopups();
+    });
+
+    document.l10n.setAttributes(text, "site-permissions-open-blocked-popups", {
+      count: aTotalBlockedPopups,
+    });
+
+    return text;
+  },
+
+  _createBlockedPopupIndicator(aTotalBlockedPopups, aIsRedirectBlocked) {
+    let indicator = document.createXULElement("hbox");
+    indicator.setAttribute("class", "permission-popup-permission-item");
+    indicator.setAttribute("align", "center");
+    indicator.setAttribute("id", "blocked-popup-indicator-item");
+
+    MozXULElement.insertFTLIfNeeded("browser/sitePermissions.ftl");
+
+    if (aIsRedirectBlocked) {
+      indicator.appendChild(this._createBlockedRedirectText());
+    }
+
+    if (aTotalBlockedPopups) {
+      indicator.appendChild(this._createBlockedPopupText(aTotalBlockedPopups));
+    }
+
+    document
+      .getElementById("permission-popup-container")
+      .appendChild(indicator);
+  },
+};

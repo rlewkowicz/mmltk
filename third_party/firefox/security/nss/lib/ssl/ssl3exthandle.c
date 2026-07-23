@@ -1,0 +1,1724 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nssrenam.h"
+#include "nss.h"
+#include "ssl.h"
+#include "sslproto.h"
+#include "sslimpl.h"
+#include "pk11pub.h"
+#include "blapit.h"
+#include "prinit.h"
+#include "selfencrypt.h"
+#include "ssl3ext.h"
+#include "ssl3exthandle.h"
+#include "tls13ech.h"
+#include "tls13exthandle.h" /* For tls13_ServerSendStatusRequestXtn. */
+
+PRBool
+ssl_ShouldSendSNIExtension(const sslSocket *ss, const char *url)
+{
+    PRNetAddr netAddr;
+
+    if (!url || !url[0]) {
+        return PR_FALSE;
+    }
+    if (PR_SUCCESS == PR_StringToNetAddr(url, &netAddr)) {
+        return PR_FALSE;
+    }
+
+    return PR_TRUE;
+}
+
+SECStatus
+ssl3_ClientFormatServerNameXtn(const sslSocket *ss, const char *url,
+                               unsigned int len, TLSExtensionData *xtnData,
+                               sslBuffer *buf)
+{
+    SECStatus rv;
+
+    rv = sslBuffer_AppendNumber(buf, len + 3, 2);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+    rv = sslBuffer_AppendNumber(buf, 0, 1);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+    rv = sslBuffer_AppendVariable(buf, (const PRUint8 *)url, len, 2);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_ClientSendServerNameXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                             sslBuffer *buf, PRBool *added)
+{
+    SECStatus rv;
+
+    const char *url = ss->url;
+
+    if (!ssl_ShouldSendSNIExtension(ss, url)) {
+        return SECSuccess;
+    }
+
+    const char *sniContents = ss->ssl3.hs.echHpkeCtx ? ss->ssl3.hs.echPublicName : url;
+    rv = ssl3_ClientFormatServerNameXtn(ss, sniContents, strlen(sniContents), xtnData, buf);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    *added = PR_TRUE;
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_HandleServerNameXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                         SECItem *data)
+{
+    SECItem *names = NULL;
+    PRUint32 listLenBytes = 0;
+    SECStatus rv;
+
+    if (!ss->sec.isServer) {
+        return SECSuccess; 
+    }
+
+    if (!ss->sniSocketConfig) {
+        return SECSuccess;
+    }
+
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &listLenBytes, 2, &data->data, &data->len);
+    if (rv != SECSuccess) {
+        goto loser; 
+    }
+    if (listLenBytes == 0 || listLenBytes != data->len) {
+        goto alert_loser;
+    }
+
+    while (data->len > 0) {
+        SECItem tmp;
+        PRUint32 type;
+
+        rv = ssl3_ExtConsumeHandshakeNumber(ss, &type, 1, &data->data, &data->len);
+        if (rv != SECSuccess) {
+            goto loser;
+        }
+
+        rv = ssl3_ExtConsumeHandshakeVariable(ss, &tmp, 2, &data->data, &data->len);
+        if (rv != SECSuccess) {
+            goto loser;
+        }
+
+        if (type == sni_nametype_hostname) {
+            if (names) {
+                goto alert_loser;
+            }
+
+            names = PORT_ZNewArray(SECItem, 1);
+            if (!names) {
+                goto loser;
+            }
+
+            if (SECITEM_CopyItem(NULL, &names[0], &tmp) != SECSuccess) {
+                goto loser;
+            }
+        }
+
+    }
+    if (names) {
+        ssl3_FreeSniNameArray(xtnData);
+        xtnData->sniNameArr = names;
+        xtnData->sniNameArrSize = 1;
+        ssl3_RecordExtensionNegotiated(ss, xtnData, ssl_server_name_xtn);
+    }
+    return SECSuccess;
+
+alert_loser:
+    ssl3_ExtDecodeError(ss);
+loser:
+    if (names) {
+        PORT_Free(names);
+    }
+    return SECFailure;
+}
+
+void
+ssl3_FreeSniNameArray(TLSExtensionData *xtnData)
+{
+    PRUint32 i;
+
+    if (!xtnData->sniNameArr) {
+        return;
+    }
+
+    for (i = 0; i < xtnData->sniNameArrSize; i++) {
+        SECITEM_FreeItem(&xtnData->sniNameArr[i], PR_FALSE);
+    }
+
+    PORT_Free(xtnData->sniNameArr);
+    xtnData->sniNameArr = NULL;
+    xtnData->sniNameArrSize = 0;
+}
+
+SECStatus
+ssl3_ClientSendSessionTicketXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                                sslBuffer *buf, PRBool *added)
+{
+    NewSessionTicket *session_ticket = NULL;
+    sslSessionID *sid = ss->sec.ci.sid;
+    SECStatus rv;
+
+    PORT_Assert(!ss->sec.isServer);
+
+    if ((sid->cached == in_client_cache || sid->cached == in_external_cache) &&
+        sid->version >= SSL_LIBRARY_VERSION_TLS_1_3) {
+        return SECSuccess;
+    }
+
+    if (!ss->opt.enableSessionTickets) {
+        return SECSuccess;
+    }
+
+    session_ticket = &sid->u.ssl3.locked.sessionTicket;
+    if (session_ticket->ticket.data &&
+        (xtnData->ticketTimestampVerified ||
+         ssl_TicketTimeValid(ss, session_ticket))) {
+
+        xtnData->ticketTimestampVerified = PR_FALSE;
+
+        rv = sslBuffer_Append(buf, session_ticket->ticket.data,
+                              session_ticket->ticket.len);
+        if (rv != SECSuccess) {
+            return SECFailure;
+        }
+
+        xtnData->sentSessionTicketInClientHello = PR_TRUE;
+    }
+
+    *added = PR_TRUE;
+    return SECSuccess;
+}
+
+PRBool
+ssl_AlpnTagAllowed(const sslSocket *ss, const SECItem *tag)
+{
+    const unsigned char *data = ss->opt.nextProtoNego.data;
+    unsigned int length = ss->opt.nextProtoNego.len;
+    unsigned int offset = 0;
+
+    if (!tag->len)
+        return PR_TRUE;
+
+    while (offset < length) {
+        unsigned int taglen = (unsigned int)data[offset];
+        if ((taglen == tag->len) &&
+            !PORT_Memcmp(data + offset + 1, tag->data, tag->len))
+            return PR_TRUE;
+        offset += 1 + taglen;
+    }
+
+    return PR_FALSE;
+}
+
+SECStatus
+ssl3_ValidateAppProtocol(const unsigned char *data, unsigned int length)
+{
+    unsigned int offset = 0;
+
+    while (offset < length) {
+        unsigned int newOffset = offset + 1 + (unsigned int)data[offset];
+        if (newOffset > length || data[offset] == 0) {
+            return SECFailure;
+        }
+        offset = newOffset;
+    }
+
+    return SECSuccess;
+}
+
+static SECStatus
+ssl3_SelectAppProtocol(const sslSocket *ss, TLSExtensionData *xtnData,
+                       PRUint16 extension, SECItem *data)
+{
+    SECStatus rv;
+    unsigned char resultBuffer[255];
+    SECItem result = { siBuffer, resultBuffer, 0 };
+
+    rv = ssl3_ValidateAppProtocol(data->data, data->len);
+    if (rv != SECSuccess) {
+        ssl3_ExtSendAlert(ss, alert_fatal, decode_error);
+        PORT_SetError(SSL_ERROR_NEXT_PROTOCOL_DATA_INVALID);
+        return SECFailure;
+    }
+
+    PORT_Assert(ss->nextProtoCallback);
+    PORT_Assert((ss->ssl3.hs.preliminaryInfo &
+                 ssl_preinfo_all & ~ssl_preinfo_cipher_suite & ~ssl_preinfo_ech) ==
+                (ssl_preinfo_all & ~ssl_preinfo_cipher_suite & ~ssl_preinfo_ech));
+    rv = ss->nextProtoCallback(ss->nextProtoArg, ss->fd, data->data, data->len,
+                               result.data, &result.len, sizeof(resultBuffer));
+    if (rv != SECSuccess) {
+        ssl3_ExtSendAlert(ss, alert_fatal, internal_error);
+        return SECFailure;
+    }
+
+    if (result.len > sizeof(resultBuffer)) {
+        PORT_SetError(SEC_ERROR_OUTPUT_LEN);
+        PORT_Assert(PR_FALSE);
+        return SECFailure;
+    }
+
+    SECITEM_FreeItem(&xtnData->nextProto, PR_FALSE);
+
+    if (result.len < 1 || !result.data) {
+        ssl3_ExtSendAlert(ss, alert_fatal, no_application_protocol);
+        PORT_SetError(SSL_ERROR_NEXT_PROTOCOL_NO_PROTOCOL);
+        return SECFailure;
+    }
+
+    xtnData->nextProtoState = SSL_NEXT_PROTO_NEGOTIATED;
+    ssl3_RecordExtensionNegotiated(ss, xtnData, extension);
+    return SECITEM_CopyItem(NULL, &xtnData->nextProto, &result);
+}
+
+SECStatus
+ssl3_ServerHandleAppProtoXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                             SECItem *data)
+{
+    PRUint32 count;
+    SECStatus rv;
+
+    if (ss->firstHsDone || data->len == 0) {
+        ssl3_ExtSendAlert(ss, alert_fatal, illegal_parameter);
+        PORT_SetError(SSL_ERROR_NEXT_PROTOCOL_DATA_INVALID);
+        return SECFailure;
+    }
+
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &count, 2, &data->data, &data->len);
+    if (rv != SECSuccess || count != data->len) {
+        ssl3_ExtDecodeError(ss);
+        return SECFailure;
+    }
+
+    if (!ss->nextProtoCallback) {
+        return SECSuccess;
+    }
+
+    rv = ssl3_SelectAppProtocol(ss, xtnData, ssl_app_layer_protocol_xtn, data);
+    if (rv != SECSuccess) {
+        return rv;
+    }
+
+    if (xtnData->nextProtoState == SSL_NEXT_PROTO_NEGOTIATED) {
+        rv = ssl3_RegisterExtensionSender(ss, xtnData,
+                                          ssl_app_layer_protocol_xtn,
+                                          ssl3_ServerSendAppProtoXtn);
+        if (rv != SECSuccess) {
+            ssl3_ExtSendAlert(ss, alert_fatal, internal_error);
+            PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+            return rv;
+        }
+    }
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_ClientHandleAppProtoXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                             SECItem *data)
+{
+    SECStatus rv;
+    PRUint32 list_len;
+    SECItem protocol_name;
+
+    if (ssl3_ExtensionNegotiated(ss, ssl_next_proto_nego_xtn)) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+
+    if (data->len < 4 || data->len > 2 + 1 + 255) {
+        ssl3_ExtSendAlert(ss, alert_fatal, decode_error);
+        PORT_SetError(SSL_ERROR_NEXT_PROTOCOL_DATA_INVALID);
+        return SECFailure;
+    }
+
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &list_len, 2, &data->data,
+                                        &data->len);
+    if (rv != SECSuccess || list_len != data->len) {
+        ssl3_ExtSendAlert(ss, alert_fatal, decode_error);
+        PORT_SetError(SSL_ERROR_NEXT_PROTOCOL_DATA_INVALID);
+        return SECFailure;
+    }
+
+    rv = ssl3_ExtConsumeHandshakeVariable(ss, &protocol_name, 1,
+                                          &data->data, &data->len);
+    if (rv != SECSuccess || data->len != 0) {
+        ssl3_ExtSendAlert(ss, alert_fatal, decode_error);
+        PORT_SetError(SSL_ERROR_NEXT_PROTOCOL_DATA_INVALID);
+        return SECFailure;
+    }
+
+    if (!ssl_AlpnTagAllowed(ss, &protocol_name)) {
+        ssl3_ExtSendAlert(ss, alert_fatal, illegal_parameter);
+        PORT_SetError(SSL_ERROR_NEXT_PROTOCOL_DATA_INVALID);
+        return SECFailure;
+    }
+
+    SECITEM_FreeItem(&xtnData->nextProto, PR_FALSE);
+    xtnData->nextProtoState = SSL_NEXT_PROTO_SELECTED;
+    ssl3_RecordExtensionNegotiated(ss, xtnData, ssl_app_layer_protocol_xtn);
+    return SECITEM_CopyItem(NULL, &xtnData->nextProto, &protocol_name);
+}
+
+SECStatus
+ssl3_ClientSendAppProtoXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                           sslBuffer *buf, PRBool *added)
+{
+    SECStatus rv;
+
+    PR_ASSERT(!ss->opt.nextProtoNego.len == !ss->opt.nextProtoNego.data);
+
+    if (!ss->opt.enableALPN || !ss->opt.nextProtoNego.len || ss->firstHsDone) {
+        return SECSuccess;
+    }
+    PRBool addGrease = ss->opt.enableGrease && ss->vrange.max >= SSL_LIBRARY_VERSION_TLS_1_3;
+
+    rv = sslBuffer_AppendNumber(buf, ss->opt.nextProtoNego.len + (addGrease ? 3 : 0), 2);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+    rv = sslBuffer_Append(buf, ss->opt.nextProtoNego.data, ss->opt.nextProtoNego.len);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+    if (addGrease) {
+        rv = sslBuffer_AppendNumber(buf, 2, 1);
+        if (rv != SECSuccess) {
+            return SECFailure;
+        }
+        rv = sslBuffer_AppendNumber(buf, ss->ssl3.hs.grease->idx[grease_alpn], 2);
+        if (rv != SECSuccess) {
+            return SECFailure;
+        }
+    }
+
+    *added = PR_TRUE;
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_ServerSendAppProtoXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                           sslBuffer *buf, PRBool *added)
+{
+    SECStatus rv;
+
+    PORT_Assert(ss->opt.enableALPN);
+    PORT_Assert(xtnData->nextProto.data);
+    PORT_Assert(xtnData->nextProto.len > 0);
+    PORT_Assert(xtnData->nextProtoState == SSL_NEXT_PROTO_NEGOTIATED);
+    PORT_Assert(!ss->firstHsDone);
+
+    rv = sslBuffer_AppendNumber(buf, xtnData->nextProto.len + 1, 2);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+    rv = sslBuffer_AppendVariable(buf, xtnData->nextProto.data,
+                                  xtnData->nextProto.len, 1);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    *added = PR_TRUE;
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_ServerHandleStatusRequestXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                                  SECItem *data)
+{
+    sslExtensionBuilderFunc sender;
+
+    PORT_Assert(ss->sec.isServer);
+
+    ssl3_RecordExtensionNegotiated(ss, xtnData, ssl_cert_status_xtn);
+
+    if (ss->version >= SSL_LIBRARY_VERSION_TLS_1_3) {
+        sender = tls13_ServerSendStatusRequestXtn;
+    } else {
+        sender = ssl3_ServerSendStatusRequestXtn;
+    }
+    return ssl3_RegisterExtensionSender(ss, xtnData, ssl_cert_status_xtn, sender);
+}
+
+SECStatus
+ssl3_ServerSendStatusRequestXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                                sslBuffer *buf, PRBool *added)
+{
+    const sslServerCert *serverCert = ss->sec.serverCert;
+
+    if (!serverCert->certStatusArray ||
+        !serverCert->certStatusArray->len) {
+        return SECSuccess;
+    }
+
+    *added = PR_TRUE;
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_ClientSendStatusRequestXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                                sslBuffer *buf, PRBool *added)
+{
+    SECStatus rv;
+
+    if (!ss->opt.enableOCSPStapling) {
+        return SECSuccess;
+    }
+
+    rv = sslBuffer_AppendNumber(buf, 1 , 1);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+    rv = sslBuffer_AppendNumber(buf, 0, 2);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+    rv = sslBuffer_AppendNumber(buf, 0, 2);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    *added = PR_TRUE;
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_ClientHandleStatusRequestXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                                  SECItem *data)
+{
+    if (ss->version >= SSL_LIBRARY_VERSION_TLS_1_3) {
+        SECStatus rv;
+        rv = ssl_ReadCertificateStatus(CONST_CAST(sslSocket, ss),
+                                       data->data, data->len);
+        if (rv != SECSuccess) {
+            return SECFailure; 
+        }
+    } else if (data->len != 0) {
+        ssl3_ExtSendAlert(ss, alert_fatal, illegal_parameter);
+        PORT_SetError(SSL_ERROR_RX_MALFORMED_SERVER_HELLO);
+        return SECFailure;
+    }
+
+    ssl3_RecordExtensionNegotiated(ss, xtnData, ssl_cert_status_xtn);
+    return SECSuccess;
+}
+
+#define TLS_EX_SESS_TICKET_VERSION (0x010a)
+
+SECStatus
+ssl3_EncodeSessionTicket(sslSocket *ss, const NewSessionTicket *ticket,
+                         const PRUint8 *appToken, unsigned int appTokenLen,
+                         PK11SymKey *secret, SECItem *ticket_data)
+{
+    SECStatus rv;
+    sslBuffer plaintext = SSL_BUFFER_EMPTY;
+    SECItem ticket_buf = { 0, NULL, 0 };
+    sslSessionID sid;
+    unsigned char wrapped_ms[SSL3_MASTER_SECRET_LENGTH];
+    SECItem ms_item = { 0, NULL, 0 };
+    PRTime now;
+    SECItem *srvName = NULL;
+    CK_MECHANISM_TYPE msWrapMech;
+    SECItem *alpnSelection = NULL;
+    PRUint32 ticketAgeBaseline;
+
+    SSL_TRC(3, ("%d: SSL3[%d]: send session_ticket handshake",
+                SSL_GETPID(), ss->fd));
+
+    PORT_Assert(ss->opt.noLocks || ssl_HaveXmitBufLock(ss));
+    PORT_Assert(ss->opt.noLocks || ssl_HaveSSL3HandshakeLock(ss));
+
+
+    PORT_Memset(&sid, 0, sizeof(sslSessionID));
+
+    PORT_Assert(secret);
+    rv = ssl3_CacheWrappedSecret(ss, &sid, secret);
+    if (rv == SECSuccess) {
+        if (sid.u.ssl3.keys.wrapped_master_secret_len > sizeof(wrapped_ms))
+            goto loser;
+        memcpy(wrapped_ms, sid.u.ssl3.keys.wrapped_master_secret,
+               sid.u.ssl3.keys.wrapped_master_secret_len);
+        ms_item.data = wrapped_ms;
+        ms_item.len = sid.u.ssl3.keys.wrapped_master_secret_len;
+        msWrapMech = sid.u.ssl3.masterWrapMech;
+    } else {
+        goto loser;
+    }
+    srvName = &ss->sec.ci.sid->u.ssl3.srvName;
+
+    rv = sslBuffer_AppendNumber(&plaintext, TLS_EX_SESS_TICKET_VERSION,
+                                sizeof(PRUint16));
+    if (rv != SECSuccess)
+        goto loser;
+
+    rv = sslBuffer_AppendNumber(&plaintext, ss->version,
+                                sizeof(SSL3ProtocolVersion));
+    if (rv != SECSuccess)
+        goto loser;
+
+    rv = sslBuffer_AppendNumber(&plaintext, ss->ssl3.hs.cipher_suite,
+                                sizeof(ssl3CipherSuite));
+    if (rv != SECSuccess)
+        goto loser;
+
+    rv = sslBuffer_AppendNumber(&plaintext, ss->sec.authType, 1);
+    if (rv != SECSuccess)
+        goto loser;
+    rv = sslBuffer_AppendNumber(&plaintext, ss->sec.authKeyBits, 4);
+    if (rv != SECSuccess)
+        goto loser;
+    rv = sslBuffer_AppendNumber(&plaintext, ss->sec.keaType, 1);
+    if (rv != SECSuccess)
+        goto loser;
+    rv = sslBuffer_AppendNumber(&plaintext, ss->sec.keaKeyBits, 4);
+    if (rv != SECSuccess)
+        goto loser;
+    if (ss->sec.keaGroup) {
+        rv = sslBuffer_AppendNumber(&plaintext, ss->sec.keaGroup->name, 4);
+        if (rv != SECSuccess)
+            goto loser;
+    } else {
+        rv = sslBuffer_AppendNumber(&plaintext, 0, 4);
+        if (rv != SECSuccess)
+            goto loser;
+    }
+    rv = sslBuffer_AppendNumber(&plaintext, ss->sec.signatureScheme, 4);
+    if (rv != SECSuccess)
+        goto loser;
+
+    PORT_Assert(SSL_CERT_IS(ss->sec.serverCert, ss->sec.authType));
+    if (SSL_CERT_IS_EC(ss->sec.serverCert)) {
+        const sslServerCert *cert = ss->sec.serverCert;
+        PORT_Assert(cert->namedCurve);
+        PORT_Assert(cert->namedCurve->name < 256);
+        rv = sslBuffer_AppendNumber(&plaintext, cert->namedCurve->name, 1);
+    } else {
+        rv = sslBuffer_AppendNumber(&plaintext, 0, 1);
+    }
+    if (rv != SECSuccess)
+        goto loser;
+
+    rv = sslBuffer_AppendNumber(&plaintext, msWrapMech, 4);
+    if (rv != SECSuccess)
+        goto loser;
+    rv = sslBuffer_AppendVariable(&plaintext, ms_item.data, ms_item.len, 2);
+    if (rv != SECSuccess)
+        goto loser;
+
+    if (ss->opt.requestCertificate && ss->sec.ci.sid->peerCert) {
+        rv = sslBuffer_AppendNumber(&plaintext, CLIENT_AUTH_CERTIFICATE, 1);
+        if (rv != SECSuccess)
+            goto loser;
+        rv = sslBuffer_AppendVariable(&plaintext,
+                                      ss->sec.ci.sid->peerCert->derCert.data,
+                                      ss->sec.ci.sid->peerCert->derCert.len, 2);
+        if (rv != SECSuccess)
+            goto loser;
+    } else {
+        rv = sslBuffer_AppendNumber(&plaintext, 0, 1);
+        if (rv != SECSuccess)
+            goto loser;
+    }
+
+    now = ssl_Time(ss);
+    PORT_Assert(sizeof(now) == 8);
+    rv = sslBuffer_AppendNumber(&plaintext, now, 8);
+    if (rv != SECSuccess)
+        goto loser;
+
+    rv = sslBuffer_AppendVariable(&plaintext, srvName->data, srvName->len, 2);
+    if (rv != SECSuccess)
+        goto loser;
+
+    rv = sslBuffer_AppendNumber(
+        &plaintext, ss->sec.ci.sid->u.ssl3.keys.extendedMasterSecretUsed, 1);
+    if (rv != SECSuccess)
+        goto loser;
+
+    rv = sslBuffer_AppendNumber(&plaintext, ticket->flags,
+                                sizeof(ticket->flags));
+    if (rv != SECSuccess)
+        goto loser;
+
+    PORT_Assert(ss->xtnData.nextProtoState == SSL_NEXT_PROTO_SELECTED ||
+                ss->xtnData.nextProtoState == SSL_NEXT_PROTO_NEGOTIATED ||
+                ss->xtnData.nextProto.len == 0);
+    alpnSelection = &ss->xtnData.nextProto;
+    PORT_Assert(alpnSelection->len < 256);
+    rv = sslBuffer_AppendVariable(&plaintext, alpnSelection->data,
+                                  alpnSelection->len, 1);
+    if (rv != SECSuccess)
+        goto loser;
+
+    rv = sslBuffer_AppendNumber(&plaintext, ss->opt.maxEarlyDataSize, 4);
+    if (rv != SECSuccess)
+        goto loser;
+
+    ticketAgeBaseline = ss->ssl3.hs.rttEstimate / PR_USEC_PER_MSEC;
+    ticketAgeBaseline -= ticket->ticket_age_add;
+    rv = sslBuffer_AppendNumber(&plaintext, ticketAgeBaseline, 4);
+    if (rv != SECSuccess)
+        goto loser;
+
+    rv = sslBuffer_AppendVariable(&plaintext, appToken, appTokenLen, 2);
+    if (rv != SECSuccess)
+        goto loser;
+
+    if (SSL_BUFFER_LEN(&plaintext) > 0xffff) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        goto loser;
+    }
+
+    ticket_buf.len = ssl_SelfEncryptGetProtectedSize(SSL_BUFFER_LEN(&plaintext));
+    PORT_Assert(ticket_buf.len > 0);
+    if (SECITEM_AllocItem(NULL, &ticket_buf, ticket_buf.len) == NULL) {
+        goto loser;
+    }
+
+    rv = ssl_SelfEncryptProtect(ss, SSL_BUFFER_BASE(&plaintext),
+                                SSL_BUFFER_LEN(&plaintext),
+                                ticket_buf.data, &ticket_buf.len, ticket_buf.len);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+
+    *ticket_data = ticket_buf;
+
+    sslBuffer_Clear(&plaintext);
+    return SECSuccess;
+
+loser:
+    sslBuffer_Clear(&plaintext);
+    if (ticket_buf.data) {
+        SECITEM_FreeItem(&ticket_buf, PR_FALSE);
+    }
+
+    return SECFailure;
+}
+
+SECStatus
+ssl3_ClientHandleSessionTicketXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                                  SECItem *data)
+{
+    PORT_Assert(ss->version < SSL_LIBRARY_VERSION_TLS_1_3);
+
+    if (data->len != 0) {
+        return SECSuccess; 
+    }
+
+    ssl3_RecordExtensionNegotiated(ss, xtnData, ssl_session_ticket_xtn);
+    return SECSuccess;
+}
+
+PR_STATIC_ASSERT((TLS_EX_SESS_TICKET_VERSION >> 8) == 1);
+
+static SECStatus
+ssl_ParseSessionTicket(sslSocket *ss, const SECItem *decryptedTicket,
+                       SessionTicket *parsedTicket)
+{
+    PRUint32 temp;
+    SECStatus rv;
+
+    PRUint8 *buffer = decryptedTicket->data;
+    unsigned int len = decryptedTicket->len;
+
+    PORT_Memset(parsedTicket, 0, sizeof(*parsedTicket));
+    parsedTicket->valid = PR_FALSE;
+
+    if (decryptedTicket->len == 0) {
+        return SECSuccess;
+    }
+
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 2, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+
+    if ((temp >> 8) != 1) {
+        PORT_SetError(SSL_ERROR_RX_MALFORMED_CLIENT_HELLO);
+        return SECFailure;
+    }
+    if (temp != TLS_EX_SESS_TICKET_VERSION) {
+        return SECSuccess;
+    }
+
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 2, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    parsedTicket->ssl_version = (SSL3ProtocolVersion)temp;
+    if (!ssl3_VersionIsSupported(ss->protocolVariant,
+                                 parsedTicket->ssl_version)) {
+        return SECSuccess;
+    }
+
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 2, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    parsedTicket->cipher_suite = (ssl3CipherSuite)temp;
+
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 1, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+
+    PORT_Assert(temp < ssl_auth_size);
+
+    parsedTicket->authType = (SSLAuthType)temp;
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 4, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    parsedTicket->authKeyBits = temp;
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 1, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    parsedTicket->keaType = (SSLKEAType)temp;
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 4, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    parsedTicket->keaKeyBits = temp;
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 4, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    parsedTicket->originalKeaGroup = temp;
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 4, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    parsedTicket->signatureScheme = (SSLSignatureScheme)temp;
+
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 1, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    if (parsedTicket->authType == ssl_auth_ecdsa ||
+        parsedTicket->authType == ssl_auth_ecdh_rsa ||
+        parsedTicket->authType == ssl_auth_ecdh_ecdsa) {
+        const sslNamedGroupDef *group =
+            ssl_LookupNamedGroup((SSLNamedGroup)temp);
+        if (!group || group->keaType != ssl_kea_ecdh) {
+            PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+            return SECFailure;
+        }
+        parsedTicket->namedCurve = group;
+    }
+
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 4, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    parsedTicket->msWrapMech = (CK_MECHANISM_TYPE)temp;
+
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 2, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    if (temp == 0 || temp > sizeof(parsedTicket->master_secret)) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    parsedTicket->ms_length = (PRUint16)temp;
+
+    rv = ssl3_ExtConsumeHandshake(ss, parsedTicket->master_secret,
+                                  parsedTicket->ms_length, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 1, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    parsedTicket->client_auth_type = (ClientAuthenticationType)temp;
+    switch (parsedTicket->client_auth_type) {
+        case CLIENT_AUTH_ANONYMOUS:
+            break;
+        case CLIENT_AUTH_CERTIFICATE:
+            rv = ssl3_ExtConsumeHandshakeVariable(ss, &parsedTicket->peer_cert, 2,
+                                                  &buffer, &len);
+            if (rv != SECSuccess) {
+                PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+                return SECFailure;
+            }
+            break;
+        default:
+            PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+            return SECFailure;
+    }
+
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 4, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+
+    parsedTicket->timestamp = (PRTime)((PRUint64)temp << 32);
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 4, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    parsedTicket->timestamp |= (PRTime)temp;
+
+    rv = ssl3_ExtConsumeHandshakeVariable(ss, &parsedTicket->srvName, 2,
+                                          &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 1, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    PORT_Assert(temp == PR_TRUE || temp == PR_FALSE);
+    parsedTicket->extendedMasterSecretUsed = temp ? PR_TRUE : PR_FALSE;
+
+    rv = ssl3_ExtConsumeHandshake(ss, &temp, 4, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    parsedTicket->flags = PR_ntohl(temp);
+
+    rv = ssl3_ExtConsumeHandshakeVariable(ss, &parsedTicket->alpnSelection, 1,
+                                          &buffer, &len);
+    PORT_Assert(parsedTicket->alpnSelection.len < 256);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 4, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    parsedTicket->maxEarlyData = temp;
+
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &temp, 4, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+    parsedTicket->ticketAgeBaseline = temp;
+
+    rv = ssl3_ExtConsumeHandshakeVariable(ss, &parsedTicket->applicationToken,
+                                          2, &buffer, &len);
+    if (rv != SECSuccess) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+
+    if (len != 0) {
+        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        return SECFailure;
+    }
+
+    parsedTicket->valid = PR_TRUE;
+    return SECSuccess;
+}
+
+static SECStatus
+ssl_CreateSIDFromTicket(sslSocket *ss, const SECItem *rawTicket,
+                        SessionTicket *parsedTicket, sslSessionID **out)
+{
+    sslSessionID *sid;
+    SECStatus rv;
+
+    sid = ssl3_NewSessionID(ss, PR_TRUE);
+    if (sid == NULL) {
+        return SECFailure;
+    }
+
+    sid->version = parsedTicket->ssl_version;
+    sid->creationTime = parsedTicket->timestamp;
+    sid->u.ssl3.cipherSuite = parsedTicket->cipher_suite;
+    sid->authType = parsedTicket->authType;
+    sid->authKeyBits = parsedTicket->authKeyBits;
+    sid->keaType = parsedTicket->keaType;
+    sid->keaKeyBits = parsedTicket->keaKeyBits;
+    sid->keaGroup = parsedTicket->originalKeaGroup;
+    sid->namedCurve = parsedTicket->namedCurve;
+    sid->sigScheme = parsedTicket->signatureScheme;
+
+    rv = SECITEM_CopyItem(NULL, &sid->u.ssl3.locked.sessionTicket.ticket,
+                          rawTicket);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+    sid->u.ssl3.locked.sessionTicket.flags = parsedTicket->flags;
+    sid->u.ssl3.locked.sessionTicket.max_early_data_size =
+        parsedTicket->maxEarlyData;
+
+    if (parsedTicket->ms_length >
+        sizeof(sid->u.ssl3.keys.wrapped_master_secret)) {
+        goto loser;
+    }
+    PORT_Memcpy(sid->u.ssl3.keys.wrapped_master_secret,
+                parsedTicket->master_secret, parsedTicket->ms_length);
+    sid->u.ssl3.keys.wrapped_master_secret_len = parsedTicket->ms_length;
+    sid->u.ssl3.masterWrapMech = parsedTicket->msWrapMech;
+    sid->u.ssl3.masterValid = PR_TRUE;
+    sid->u.ssl3.keys.resumable = PR_TRUE;
+    sid->u.ssl3.keys.extendedMasterSecretUsed = parsedTicket->extendedMasterSecretUsed;
+
+    if (parsedTicket->peer_cert.data != NULL) {
+        PORT_Assert(!sid->peerCert);
+        sid->peerCert = CERT_NewTempCertificate(ss->dbHandle,
+                                                &parsedTicket->peer_cert,
+                                                NULL, PR_FALSE, PR_TRUE);
+        if (!sid->peerCert) {
+            goto loser;
+        }
+    }
+
+    if (parsedTicket->srvName.data != NULL) {
+        SECITEM_FreeItem(&sid->u.ssl3.srvName, PR_FALSE);
+        rv = SECITEM_CopyItem(NULL, &sid->u.ssl3.srvName,
+                              &parsedTicket->srvName);
+        if (rv != SECSuccess) {
+            goto loser;
+        }
+    }
+    if (parsedTicket->alpnSelection.data != NULL) {
+        SECITEM_FreeItem(&sid->u.ssl3.alpnSelection, PR_FALSE);
+        rv = SECITEM_CopyItem(NULL, &sid->u.ssl3.alpnSelection,
+                              &parsedTicket->alpnSelection);
+        if (rv != SECSuccess) {
+            goto loser;
+        }
+    }
+
+    *out = sid;
+    return SECSuccess;
+
+loser:
+    ssl_FreeSID(sid);
+    return SECFailure;
+}
+
+SECStatus
+ssl3_ProcessSessionTicketCommon(sslSocket *ss, const SECItem *ticket,
+                                SECItem *appToken)
+{
+    SECItem decryptedTicket = { siBuffer, NULL, 0 };
+    SessionTicket parsedTicket;
+    sslSessionID *sid = NULL;
+    SECStatus rv;
+
+    if (ss->sec.ci.sid != NULL) {
+        ssl_UncacheSessionID(ss);
+        ssl_FreeSID(ss->sec.ci.sid);
+        ss->sec.ci.sid = NULL;
+    }
+
+    if (!SECITEM_AllocItem(NULL, &decryptedTicket, ticket->len)) {
+        return SECFailure;
+    }
+
+    rv = ssl_SelfEncryptUnprotect(ss, ticket->data, ticket->len,
+                                  decryptedTicket.data,
+                                  &decryptedTicket.len,
+                                  decryptedTicket.len);
+    if (rv != SECSuccess) {
+        if (ss->version >= SSL_LIBRARY_VERSION_TLS_1_3 ||
+            PORT_GetError() == SEC_ERROR_NOT_A_RECIPIENT) {
+            SECITEM_ZfreeItem(&decryptedTicket, PR_FALSE);
+            return SECSuccess;
+        }
+
+        SSL3_SendAlert(ss, alert_fatal, illegal_parameter);
+        goto loser;
+    }
+
+    rv = ssl_ParseSessionTicket(ss, &decryptedTicket, &parsedTicket);
+    if (rv != SECSuccess) {
+        SSL3Statistics *ssl3stats;
+
+        SSL_DBG(("%d: SSL[%d]: Session ticket parsing failed.",
+                 SSL_GETPID(), ss->fd));
+        ssl3stats = SSL_GetStatistics();
+        SSL_AtomicIncrementLong(&ssl3stats->hch_sid_ticket_parse_failures);
+        goto loser; 
+    }
+
+    PRTime end = parsedTicket.timestamp + (ssl_ticket_lifetime * PR_USEC_PER_SEC);
+    if (end > ssl_Time(ss)) {
+
+        rv = ssl_CreateSIDFromTicket(ss, ticket, &parsedTicket, &sid);
+        if (rv != SECSuccess) {
+            goto loser; 
+        }
+        if (appToken && parsedTicket.applicationToken.len) {
+            rv = SECITEM_CopyItem(NULL, appToken,
+                                  &parsedTicket.applicationToken);
+            if (rv != SECSuccess) {
+                goto loser; 
+            }
+        }
+
+        ss->statelessResume = PR_TRUE;
+        ss->sec.ci.sid = sid;
+
+        ss->xtnData.ticketAge = parsedTicket.ticketAgeBaseline;
+    }
+
+    SECITEM_ZfreeItem(&decryptedTicket, PR_FALSE);
+    PORT_Memset(&parsedTicket, 0, sizeof(parsedTicket));
+    return SECSuccess;
+
+loser:
+    if (sid) {
+        ssl_FreeSID(sid);
+    }
+    SECITEM_ZfreeItem(&decryptedTicket, PR_FALSE);
+    PORT_Memset(&parsedTicket, 0, sizeof(parsedTicket));
+    return SECFailure;
+}
+
+SECStatus
+ssl3_ServerHandleSessionTicketXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                                  SECItem *data)
+{
+    PORT_Assert(ss->version < SSL_LIBRARY_VERSION_TLS_1_3);
+
+    if (!ss->opt.enableSessionTickets) {
+        return SECSuccess;
+    }
+
+    if (ss->version >= SSL_LIBRARY_VERSION_TLS_1_3) {
+        return SECSuccess;
+    }
+
+    ssl3_RecordExtensionNegotiated(ss, xtnData, ssl_session_ticket_xtn);
+
+    if (data->len == 0) {
+        xtnData->emptySessionTicket = PR_TRUE;
+        return SECSuccess;
+    }
+
+    return ssl3_ProcessSessionTicketCommon(CONST_CAST(sslSocket, ss), data,
+                                           NULL);
+}
+
+SECStatus
+ssl3_SendRenegotiationInfoXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                              sslBuffer *buf, PRBool *added)
+{
+    PRInt32 len = 0;
+    SECStatus rv;
+
+    if (ss->ssl3.hs.sendingSCSV) {
+        return 0;
+    }
+    if (ss->firstHsDone) {
+        len = ss->sec.isServer ? ss->ssl3.hs.finishedBytes * 2
+                               : ss->ssl3.hs.finishedBytes;
+    }
+
+    rv = sslBuffer_AppendVariable(buf,
+                                  ss->ssl3.hs.finishedMsgs.data, len, 1);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    *added = PR_TRUE;
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_HandleRenegotiationInfoXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                                SECItem *data)
+{
+    SECStatus rv = SECSuccess;
+    PRUint32 len = 0;
+
+    PORT_Assert(ss->version < SSL_LIBRARY_VERSION_TLS_1_3);
+
+    if (ss->firstHsDone) {
+        len = ss->sec.isServer ? ss->ssl3.hs.finishedBytes
+                               : ss->ssl3.hs.finishedBytes * 2;
+    }
+    if (data->len != 1 + len || data->data[0] != len) {
+        ssl3_ExtDecodeError(ss);
+        return SECFailure;
+    }
+    if (len && NSS_SecureMemcmp(ss->ssl3.hs.finishedMsgs.data,
+                                data->data + 1, len)) {
+        ssl3_ExtSendAlert(ss, alert_fatal, handshake_failure);
+        PORT_SetError(SSL_ERROR_BAD_HANDSHAKE_HASH_VALUE);
+        return SECFailure;
+    }
+    CONST_CAST(sslSocket, ss)
+        ->peerRequestedProtection = 1;
+    ssl3_RecordExtensionNegotiated(ss, xtnData, ssl_renegotiation_info_xtn);
+    if (ss->sec.isServer) {
+        rv = ssl3_RegisterExtensionSender(ss, xtnData,
+                                          ssl_renegotiation_info_xtn,
+                                          ssl3_SendRenegotiationInfoXtn);
+    }
+    return rv;
+}
+
+SECStatus
+ssl3_ClientSendUseSRTPXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                          sslBuffer *buf, PRBool *added)
+{
+    unsigned int i;
+    SECStatus rv;
+
+    if (!IS_DTLS(ss) || !ss->ssl3.dtlsSRTPCipherCount) {
+        return SECSuccess; 
+    }
+
+    rv = sslBuffer_AppendNumber(buf, 2 * ss->ssl3.dtlsSRTPCipherCount, 2);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+    for (i = 0; i < ss->ssl3.dtlsSRTPCipherCount; i++) {
+        rv = sslBuffer_AppendNumber(buf, ss->ssl3.dtlsSRTPCiphers[i], 2);
+        if (rv != SECSuccess) {
+            return SECFailure;
+        }
+    }
+    rv = sslBuffer_AppendNumber(buf, 0, 1);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    *added = PR_TRUE;
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_ServerSendUseSRTPXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                          sslBuffer *buf, PRBool *added)
+{
+    SECStatus rv;
+
+    rv = sslBuffer_AppendNumber(buf, 2, 2);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+    rv = sslBuffer_AppendNumber(buf, xtnData->dtlsSRTPCipherSuite, 2);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+    rv = sslBuffer_AppendNumber(buf, 0, 1);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    *added = PR_TRUE;
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_ClientHandleUseSRTPXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                            SECItem *data)
+{
+    SECStatus rv;
+    SECItem ciphers = { siBuffer, NULL, 0 };
+    PRUint16 i;
+    PRUint16 cipher = 0;
+    PRBool found = PR_FALSE;
+    SECItem litem;
+
+    if (!data->data || !data->len) {
+        ssl3_ExtDecodeError(ss);
+        return SECFailure;
+    }
+
+    rv = ssl3_ExtConsumeHandshakeVariable(ss, &ciphers, 2,
+                                          &data->data, &data->len);
+    if (rv != SECSuccess) {
+        return SECFailure; 
+    }
+    if (ciphers.len != 2) {
+        ssl3_ExtDecodeError(ss);
+        return SECFailure;
+    }
+
+    cipher = (ciphers.data[0] << 8) | ciphers.data[1];
+
+    for (i = 0; i < ss->ssl3.dtlsSRTPCipherCount; i++) {
+        if (cipher == ss->ssl3.dtlsSRTPCiphers[i]) {
+            found = PR_TRUE;
+            break;
+        }
+    }
+
+    if (!found) {
+        ssl3_ExtSendAlert(ss, alert_fatal, illegal_parameter);
+        PORT_SetError(SSL_ERROR_RX_MALFORMED_SERVER_HELLO);
+        return SECFailure;
+    }
+
+    rv = ssl3_ExtConsumeHandshakeVariable(ss, &litem, 1,
+                                          &data->data, &data->len);
+    if (rv != SECSuccess) {
+        return SECFailure; 
+    }
+
+    if (litem.len != 0) {
+        ssl3_ExtSendAlert(ss, alert_fatal, illegal_parameter);
+        PORT_SetError(SSL_ERROR_RX_MALFORMED_SERVER_HELLO);
+        return SECFailure;
+    }
+
+    if (data->len != 0) {
+        ssl3_ExtDecodeError(ss);
+        return SECFailure;
+    }
+
+    ssl3_RecordExtensionNegotiated(ss, xtnData, ssl_use_srtp_xtn);
+    xtnData->dtlsSRTPCipherSuite = cipher;
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_ServerHandleUseSRTPXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                            SECItem *data)
+{
+    SECStatus rv;
+    SECItem ciphers = { siBuffer, NULL, 0 };
+    PRUint16 i;
+    unsigned int j;
+    PRUint16 cipher = 0;
+    PRBool found = PR_FALSE;
+    SECItem litem;
+
+    if (!IS_DTLS(ss) || !ss->ssl3.dtlsSRTPCipherCount) {
+        return SECSuccess;
+    }
+
+    if (!data->data || data->len < 5) {
+        ssl3_ExtDecodeError(ss);
+        return SECFailure;
+    }
+
+    rv = ssl3_ExtConsumeHandshakeVariable(ss, &ciphers, 2,
+                                          &data->data, &data->len);
+    if (rv != SECSuccess) {
+        return SECFailure; 
+    }
+    if (ciphers.len % 2) {
+        ssl3_ExtDecodeError(ss);
+        return SECFailure;
+    }
+
+    for (i = 0; !found && i < ss->ssl3.dtlsSRTPCipherCount; i++) {
+        for (j = 0; j + 1 < ciphers.len; j += 2) {
+            cipher = (ciphers.data[j] << 8) | ciphers.data[j + 1];
+            if (cipher == ss->ssl3.dtlsSRTPCiphers[i]) {
+                found = PR_TRUE;
+                break;
+            }
+        }
+    }
+
+    rv = ssl3_ExtConsumeHandshakeVariable(ss, &litem, 1, &data->data, &data->len);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    if (data->len != 0) {
+        ssl3_ExtDecodeError(ss); 
+        return SECFailure;
+    }
+
+    if (!found) {
+        return SECSuccess;
+    }
+
+    xtnData->dtlsSRTPCipherSuite = cipher;
+    ssl3_RecordExtensionNegotiated(ss, xtnData, ssl_use_srtp_xtn);
+
+    return ssl3_RegisterExtensionSender(ss, xtnData,
+                                        ssl_use_srtp_xtn,
+                                        ssl3_ServerSendUseSRTPXtn);
+}
+
+SECStatus
+ssl3_HandleSigAlgsXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                      SECItem *data)
+{
+    SECStatus rv;
+
+    if (ss->version < SSL_LIBRARY_VERSION_TLS_1_2) {
+        return SECSuccess;
+    }
+
+    if (xtnData->sigSchemes) {
+        PORT_Free(xtnData->sigSchemes);
+        xtnData->sigSchemes = NULL;
+    }
+    rv = ssl_ParseSignatureSchemes(ss, NULL,
+                                   &xtnData->sigSchemes,
+                                   &xtnData->numSigSchemes,
+                                   &data->data, &data->len);
+    if (rv != SECSuccess) {
+        ssl3_ExtSendAlert(ss, alert_fatal, decode_error);
+        PORT_SetError(SSL_ERROR_RX_MALFORMED_CLIENT_HELLO);
+        return SECFailure;
+    }
+    if (xtnData->numSigSchemes == 0) {
+        ssl3_ExtSendAlert(ss, alert_fatal, handshake_failure);
+        PORT_SetError(SSL_ERROR_UNSUPPORTED_SIGNATURE_ALGORITHM);
+        return SECFailure;
+    }
+    if (data->len != 0) {
+        ssl3_ExtSendAlert(ss, alert_fatal, decode_error);
+        PORT_SetError(SSL_ERROR_RX_MALFORMED_CLIENT_HELLO);
+        return SECFailure;
+    }
+
+    if (ss->sec.isServer) {
+        ssl3_RecordExtensionNegotiated(ss, xtnData, ssl_signature_algorithms_xtn);
+    }
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_SendSigAlgsXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                    sslBuffer *buf, PRBool *added)
+{
+    if (ss->vrange.max < SSL_LIBRARY_VERSION_TLS_1_2) {
+        return SECSuccess;
+    }
+
+    PRUint16 minVersion;
+    if (ss->sec.isServer) {
+        minVersion = ss->version; 
+    } else {
+        minVersion = ss->vrange.min; 
+    }
+
+    SECStatus rv = ssl3_EncodeSigAlgs(ss, minVersion, PR_TRUE ,
+                                      ss->opt.enableGrease, buf);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    *added = PR_TRUE;
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_SendExtendedMasterSecretXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                                 sslBuffer *buf, PRBool *added)
+{
+    if (!ss->opt.enableExtendedMS) {
+        return SECSuccess;
+    }
+
+    *added = PR_TRUE;
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_HandleExtendedMasterSecretXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                                   SECItem *data)
+{
+    PORT_Assert(ss->version < SSL_LIBRARY_VERSION_TLS_1_3);
+
+    if (ss->version < SSL_LIBRARY_VERSION_TLS_1_0) {
+        return SECSuccess;
+    }
+
+    if (!ss->opt.enableExtendedMS) {
+        return SECSuccess;
+    }
+
+    if (data->len != 0) {
+        SSL_TRC(30, ("%d: SSL3[%d]: Bogus extended master secret extension",
+                     SSL_GETPID(), ss->fd));
+        ssl3_ExtSendAlert(ss, alert_fatal, decode_error);
+        return SECFailure;
+    }
+
+    SSL_DBG(("%d: SSL[%d]: Negotiated extended master secret extension.",
+             SSL_GETPID(), ss->fd));
+
+    ssl3_RecordExtensionNegotiated(ss, xtnData, ssl_extended_master_secret_xtn);
+
+    if (ss->sec.isServer) {
+        return ssl3_RegisterExtensionSender(ss, xtnData,
+                                            ssl_extended_master_secret_xtn,
+                                            ssl_SendEmptyExtension);
+    }
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_ClientSendSignedCertTimestampXtn(const sslSocket *ss,
+                                      TLSExtensionData *xtnData,
+                                      sslBuffer *buf, PRBool *added)
+{
+    if (!ss->opt.enableSignedCertTimestamps) {
+        return SECSuccess;
+    }
+
+    *added = PR_TRUE;
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_ClientHandleSignedCertTimestampXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                                        SECItem *data)
+{
+    SECItem *scts = &xtnData->signedCertTimestamps;
+    PORT_Assert(!scts->data && !scts->len);
+
+    if (!data->len) {
+        return SECFailure;
+    }
+    *scts = *data;
+    ssl3_RecordExtensionNegotiated(ss, xtnData, ssl_signed_cert_timestamp_xtn);
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_ServerSendSignedCertTimestampXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                                      sslBuffer *buf, PRBool *added)
+{
+    const SECItem *scts = &ss->sec.serverCert->signedCertTimestamps;
+    SECStatus rv;
+
+    if (!scts->len) {
+        return SECSuccess;
+    }
+
+    rv = sslBuffer_Append(buf, scts->data, scts->len);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    *added = PR_TRUE;
+    return SECSuccess;
+}
+
+SECStatus
+ssl3_ServerHandleSignedCertTimestampXtn(const sslSocket *ss,
+                                        TLSExtensionData *xtnData,
+                                        SECItem *data)
+{
+    if (data->len != 0) {
+        ssl3_ExtSendAlert(ss, alert_fatal, decode_error);
+        PORT_SetError(SSL_ERROR_RX_MALFORMED_CLIENT_HELLO);
+        return SECFailure;
+    }
+
+    ssl3_RecordExtensionNegotiated(ss, xtnData, ssl_signed_cert_timestamp_xtn);
+    PORT_Assert(ss->sec.isServer);
+    return ssl3_RegisterExtensionSender(ss, xtnData,
+                                        ssl_signed_cert_timestamp_xtn,
+                                        ssl3_ServerSendSignedCertTimestampXtn);
+}
+
+SECStatus
+ssl3_HandleSupportedPointFormatsXtn(const sslSocket *ss,
+                                    TLSExtensionData *xtnData,
+                                    SECItem *data)
+{
+    int i;
+
+    PORT_Assert(ss->version < SSL_LIBRARY_VERSION_TLS_1_3);
+
+    if (data->len < 2 || data->len > 255 || !data->data ||
+        data->len != (unsigned int)data->data[0] + 1) {
+        ssl3_ExtDecodeError(ss);
+        return SECFailure;
+    }
+    for (i = data->len; --i > 0;) {
+        if (data->data[i] == 0) {
+            return ssl3_RegisterExtensionSender(
+                ss, xtnData, ssl_ec_point_formats_xtn,
+                &ssl3_SendSupportedPointFormatsXtn);
+        }
+    }
+
+    ssl3_ExtSendAlert(ss, alert_fatal, illegal_parameter);
+    PORT_SetError(SSL_ERROR_RX_MALFORMED_HANDSHAKE);
+
+    return SECFailure;
+}
+
+static SECStatus
+ssl_UpdateSupportedGroups(sslSocket *ss, SECItem *data)
+{
+    SECStatus rv;
+    PRUint32 list_len;
+    unsigned int i;
+    const sslNamedGroupDef *enabled[SSL_NAMED_GROUP_COUNT] = { 0 };
+    PORT_Assert(SSL_NAMED_GROUP_COUNT == PR_ARRAY_SIZE(enabled));
+
+    if (!data->data || data->len < 4) {
+        (void)ssl3_DecodeError(ss);
+        return SECFailure;
+    }
+
+    rv = ssl3_ConsumeHandshakeNumber(ss, &list_len, 2, &data->data, &data->len);
+    if (rv != SECSuccess || data->len != list_len || (data->len % 2) != 0) {
+        (void)ssl3_DecodeError(ss);
+        return SECFailure;
+    }
+
+    for (i = 0; i < SSL_NAMED_GROUP_COUNT; ++i) {
+        enabled[i] = ss->namedGroupPreferences[i];
+        ss->namedGroupPreferences[i] = NULL;
+    }
+
+    while (data->len) {
+        const sslNamedGroupDef *group;
+        PRUint32 curve_name;
+        rv = ssl3_ConsumeHandshakeNumber(ss, &curve_name, 2, &data->data,
+                                         &data->len);
+        if (rv != SECSuccess) {
+            return SECFailure; 
+        }
+        group = ssl_LookupNamedGroup(curve_name);
+        if (group) {
+            for (i = 0; i < SSL_NAMED_GROUP_COUNT; ++i) {
+                if (enabled[i] && group == enabled[i]) {
+                    ss->namedGroupPreferences[i] = enabled[i];
+                    break;
+                }
+            }
+        }
+
+        if ((curve_name & 0xff00) == 0x0100) {
+            ss->xtnData.peerSupportsFfdheGroups = PR_TRUE;
+        }
+    }
+
+    if (ss->version < SSL_LIBRARY_VERSION_TLS_1_3 &&
+        !ss->opt.requireDHENamedGroups && !ss->xtnData.peerSupportsFfdheGroups) {
+        for (i = 0; i < SSL_NAMED_GROUP_COUNT; ++i) {
+            if (enabled[i] && enabled[i]->keaType == ssl_kea_dh) {
+                ss->namedGroupPreferences[i] = enabled[i];
+            }
+        }
+    }
+
+    return SECSuccess;
+}
+
+SECStatus
+ssl_HandleSupportedGroupsXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                             SECItem *data)
+{
+    SECStatus rv;
+
+    rv = ssl_UpdateSupportedGroups(CONST_CAST(sslSocket, ss), data);
+    if (rv != SECSuccess)
+        return SECFailure;
+
+    if (ss->sec.isServer && ss->version >= SSL_LIBRARY_VERSION_TLS_1_3) {
+        rv = ssl3_RegisterExtensionSender(ss, xtnData, ssl_supported_groups_xtn,
+                                          &ssl_SendSupportedGroupsXtn);
+        if (rv != SECSuccess) {
+            return SECFailure; 
+        }
+    }
+
+    ssl3_RecordExtensionNegotiated(ss, xtnData, ssl_supported_groups_xtn);
+
+    return SECSuccess;
+}
+
+SECStatus
+ssl_HandleRecordSizeLimitXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                             SECItem *data)
+{
+    SECStatus rv;
+    PRUint32 limit;
+    PRUint32 maxLimit = (ss->version >= SSL_LIBRARY_VERSION_TLS_1_3)
+                            ? (MAX_FRAGMENT_LENGTH + 1)
+                            : MAX_FRAGMENT_LENGTH;
+
+    rv = ssl3_ExtConsumeHandshakeNumber(ss, &limit, 2, &data->data, &data->len);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+    if (data->len != 0 || limit < 64) {
+        ssl3_ExtSendAlert(ss, alert_fatal, decode_error);
+        PORT_SetError(SSL_ERROR_RX_MALFORMED_HANDSHAKE);
+        return SECFailure;
+    }
+
+    if (ss->sec.isServer) {
+        rv = ssl3_RegisterExtensionSender(ss, xtnData, ssl_record_size_limit_xtn,
+                                          &ssl_SendRecordSizeLimitXtn);
+        if (rv != SECSuccess) {
+            return SECFailure; 
+        }
+    } else if (limit > maxLimit) {
+        ssl3_ExtSendAlert(ss, alert_fatal, illegal_parameter);
+        PORT_SetError(SSL_ERROR_RX_MALFORMED_HANDSHAKE);
+        return SECFailure;
+    }
+
+    xtnData->recordSizeLimit = PR_MIN(maxLimit, limit);
+    ssl3_RecordExtensionNegotiated(ss, xtnData, ssl_record_size_limit_xtn);
+    return SECSuccess;
+}
+
+SECStatus
+ssl_SendRecordSizeLimitXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+                           sslBuffer *buf, PRBool *added)
+{
+    PRUint32 maxLimit;
+    if (ss->sec.isServer) {
+        maxLimit = (ss->version >= SSL_LIBRARY_VERSION_TLS_1_3)
+                       ? (MAX_FRAGMENT_LENGTH + 1)
+                       : MAX_FRAGMENT_LENGTH;
+    } else {
+        maxLimit = (ss->vrange.max >= SSL_LIBRARY_VERSION_TLS_1_3)
+                       ? (MAX_FRAGMENT_LENGTH + 1)
+                       : MAX_FRAGMENT_LENGTH;
+    }
+    PRUint32 limit = PR_MIN(ss->opt.recordSizeLimit, maxLimit);
+    SECStatus rv = sslBuffer_AppendNumber(buf, limit, 2);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    *added = PR_TRUE;
+    return SECSuccess;
+}

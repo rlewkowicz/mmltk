@@ -1,0 +1,90 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsMathMLmoFrame_h_
+#define nsMathMLmoFrame_h_
+
+#include "nsMathMLChar.h"
+#include "nsMathMLTokenFrame.h"
+
+namespace mozilla {
+class PresShell;
+}  
+
+
+class nsMathMLmoFrame final : public nsMathMLTokenFrame {
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(nsMathMLmoFrame)
+
+  friend nsIFrame* NS_NewMathMLmoFrame(mozilla::PresShell* aPresShell,
+                                       ComputedStyle* aStyle);
+
+  MathMLFrameType GetMathMLFrameType() override;
+
+  void DidSetComputedStyle(ComputedStyle* aOldStyle) override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  NS_IMETHOD
+  InheritAutomaticData(nsIFrame* aParent) override;
+
+  NS_IMETHOD
+  TransmitAutomaticData() override;
+
+  void SetInitialChildList(ChildListID aListID,
+                           nsFrameList&& aChildList) override;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  void Place(DrawTarget* aDrawTarget, const PlaceFlags& aFlags,
+             ReflowOutput& aDesiredSize) override;
+
+  void MarkIntrinsicISizesDirty() override;
+
+  void GetIntrinsicISizeMetrics(gfxContext* aRenderingContext,
+                                ReflowOutput& aDesiredSize) override;
+
+  nsresult AttributeChanged(int32_t aNameSpaceID, nsAtom* aAttribute,
+                            AttrModType aModType) override;
+
+  NS_IMETHOD
+  Stretch(DrawTarget* aDrawTarget, StretchDirection aStretchDirection,
+          nsBoundingMetrics& aContainerSize,
+          ReflowOutput& aDesiredStretchSize) override;
+
+  nsresult ChildListChanged() override {
+    ProcessTextData();
+    return nsMathMLContainerFrame::ChildListChanged();
+  }
+
+  nscoord ItalicCorrection() final;
+
+ protected:
+  explicit nsMathMLmoFrame(ComputedStyle* aStyle, nsPresContext* aPresContext)
+      : nsMathMLTokenFrame(aStyle, aPresContext, kClassID),
+        mMinSize(0),
+        mMaxSize(0) {}
+  virtual ~nsMathMLmoFrame();
+
+  nsMathMLChar
+      mMathMLChar;  
+  nsOperatorFlags mFlags;
+  float mMinSize;
+  float mMaxSize;
+
+  bool UseMathMLChar();
+
+  void ProcessTextData();
+
+  void ProcessOperatorData();
+
+  bool IsFrameInSelection(nsIFrame* aFrame);
+
+  nscoord FixInterFrameSpacing(ReflowOutput& aDesiredSize) final;
+};
+
+#endif /* nsMathMLmoFrame_h_ */

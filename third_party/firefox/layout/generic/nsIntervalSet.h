@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsIntervalSet_h_
+#define nsIntervalSet_h_
+
+#include "nsCoord.h"
+
+namespace mozilla {
+class PresShell;
+}  
+
+class nsIntervalSet {
+ public:
+  typedef nscoord coord_type;
+
+  explicit nsIntervalSet(mozilla::PresShell* aPresShell);
+  ~nsIntervalSet();
+
+  void IncludeInterval(coord_type aBegin, coord_type aEnd);
+
+  bool Intersects(coord_type aBegin, coord_type aEnd) const;
+
+  bool Contains(coord_type aBegin, coord_type aEnd) const;
+
+  bool IsEmpty() const { return !mList; }
+
+ private:
+  class Interval {
+   public:
+    Interval(coord_type aBegin, coord_type aEnd)
+        : mBegin(aBegin), mEnd(aEnd), mPrev(nullptr), mNext(nullptr) {}
+
+    coord_type mBegin;
+    coord_type mEnd;
+    Interval* mPrev;
+    Interval* mNext;
+  };
+
+  void* AllocateInterval();
+  void FreeInterval(Interval* aInterval);
+
+  Interval* mList;
+  mozilla::PresShell* mPresShell;
+};
+
+#endif  // !defined(nsIntervalSet_h_)

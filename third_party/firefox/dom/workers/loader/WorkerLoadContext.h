@@ -1,0 +1,143 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_workers_WorkerLoadContext_h_
+#define mozilla_dom_workers_WorkerLoadContext_h_
+
+#include "js/loader/LoadContextBase.h"
+#include "js/loader/ScriptKind.h"
+#include "js/loader/ScriptLoadRequest.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/dom/Promise.h"
+#include "nsIChannel.h"
+#include "nsIInputStream.h"
+#include "nsIRequest.h"
+
+class nsIReferrerInfo;
+class nsIURI;
+
+namespace mozilla::dom {
+
+class ClientInfo;
+class WorkerPrivate;
+
+namespace workerinternals::loader {
+class CacheCreator;
+class ScriptLoaderRunnable;
+class WorkerScriptLoader;
+}  
+
+
+class WorkerLoadContext : public JS::loader::LoadContextBase {
+ public:
+
+  enum Kind {
+    MainScript,
+    ImportScript,
+    StaticImport,
+    DynamicImport,
+    DebuggerScript
+  };
+
+  WorkerLoadContext(Kind aKind, const Maybe<ClientInfo>& aClientInfo,
+                    workerinternals::loader::WorkerScriptLoader* aScriptLoader,
+                    bool aOnlyExistingCachedResourcesAllowed);
+
+  bool IsTopLevel();
+
+  static Kind GetKind(bool isMainScript, bool isDebuggerScript) {
+    if (isDebuggerScript) {
+      return Kind::DebuggerScript;
+    }
+    if (isMainScript) {
+      return Kind::MainScript;
+    }
+    return Kind::ImportScript;
+  };
+
+  Maybe<bool> mMutedErrorFlag;
+  nsresult mLoadResult = NS_ERROR_NOT_INITIALIZED;
+  bool mLoadingFinished = false;
+  bool mIsTopLevel = true;
+  Kind mKind;
+  Maybe<ClientInfo> mClientInfo;
+  nsCOMPtr<nsIChannel> mChannel;
+  RefPtr<workerinternals::loader::WorkerScriptLoader> mScriptLoader;
+
+  nsCString mFullURL;
+
+  RefPtr<Promise> mCachePromise;
+
+  nsCOMPtr<nsIInputStream> mCacheReadStream;
+
+  enum CacheStatus {
+    Uncached,
+
+    WritingToCache,
+
+    ReadingFromCache,
+
+    Cached,
+
+    ToBeCached,
+
+    Cancel
+  };
+
+  CacheStatus mCacheStatus = Uncached;
+
+  bool mOnlyExistingCachedResourcesAllowed = false;
+
+  bool IsAwaitingPromise() const { return bool(mCachePromise); }
+};
+
+class ThreadSafeRequestHandle final {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ThreadSafeRequestHandle)
+
+  ThreadSafeRequestHandle(JS::loader::ScriptLoadRequest* aRequest,
+                          nsISerialEventTarget* aSyncTarget);
+
+  JS::loader::ScriptLoadRequest* GetRequest() const { return mRequest; }
+
+  WorkerLoadContext* GetContext();
+
+  bool IsEmpty() { return !mRequest; }
+
+  void SetRunnable(workerinternals::loader::ScriptLoaderRunnable* aRunnable);
+
+  nsresult OnStreamComplete(nsresult aStatus);
+
+  void LoadingFinished(nsresult aRv);
+
+  void MaybeExecuteFinishedScripts();
+
+  bool IsCancelled();
+
+  bool Finished() {
+    return GetContext()->mLoadingFinished && !GetContext()->IsAwaitingPromise();
+  }
+
+  nsresult GetCancelResult();
+
+  already_AddRefed<JS::loader::ScriptLoadRequest> ReleaseRequest();
+
+  already_AddRefed<workerinternals::loader::CacheCreator> GetCacheCreator();
+
+  bool mExecutionScheduled = false;
+
+ private:
+  ~ThreadSafeRequestHandle();
+
+  mozilla::Mutex mMutex{"ThreadSafeRequestHandle::mMutex"};
+  RefPtr<workerinternals::loader::ScriptLoaderRunnable> mRunnable
+      MOZ_GUARDED_BY(mMutex);
+
+  RefPtr<JS::loader::ScriptLoadRequest> mRequest;
+  nsCOMPtr<nsISerialEventTarget> mOwningEventTarget;
+};
+
+}  
+#endif /* mozilla_dom_workers_WorkerLoadContext_h_ */

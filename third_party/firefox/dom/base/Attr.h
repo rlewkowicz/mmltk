@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_Attr_h
+#define mozilla_dom_Attr_h
+
+#include "mozilla/Attributes.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsDOMAttributeMap.h"
+#include "nsINode.h"
+#include "nsString.h"
+#include "nsStubMutationObserver.h"
+
+namespace mozilla {
+class EventChainPreVisitor;
+namespace dom {
+
+class Document;
+
+class Attr final : public nsINode {
+  virtual ~Attr() = default;
+
+ public:
+  Attr(nsDOMAttributeMap* aAttrMap, already_AddRefed<dom::NodeInfo> aNodeInfo,
+       const nsAString& aValue);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_IMETHOD_(void) DeleteCycleCollectable(void) final;
+
+  NS_DECL_DOMARENA_DESTROY
+
+  NS_IMPL_FROMNODE_HELPER(Attr, IsAttr())
+
+  MOZ_CAN_RUN_SCRIPT void SetTextContent(const nsAString& aTextContent,
+                                         nsIPrincipal* aSubjectPrincipal,
+                                         mozilla::ErrorResult& aError) override;
+  virtual void GetTextContentInternal(nsAString& aTextContent,
+                                      OOMReporter& aError) override;
+  virtual void SetTextContentInternal(const nsAString& aTextContent,
+                                      nsIPrincipal* aSubjectPrincipal,
+                                      ErrorResult& aError,
+                                      MutationEffectOnScript) override;
+  MOZ_CAN_RUN_SCRIPT void SetNodeValue(const nsAString& aNodeValue,
+                                       mozilla::ErrorResult& aError) override;
+  virtual void GetNodeValueInternal(nsAString& aNodeValue) override;
+  virtual void SetNodeValueInternal(
+      const nsAString& aNodeValue, ErrorResult& aError,
+      MutationEffectOnScript aMutationEffectOnScript =
+          MutationEffectOnScript::DropTrustWorthiness) override;
+
+  void GetEventTargetParent(EventChainPreVisitor& aVisitor) override;
+
+  void ConstructUbiNode(void* storage) override;
+
+  nsDOMAttributeMap* GetMap() { return mAttrMap; }
+
+  void SetMap(nsDOMAttributeMap* aMap);
+
+  Element* GetElement() const;
+
+  nsresult SetOwnerDocument(Document* aDocument);
+
+  nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
+  nsIURI* GetBaseURI(bool aTryUseXHRDocBaseURI = false) const override;
+
+  static void Initialize();
+  static void Shutdown();
+
+  NS_DECL_CYCLE_COLLECTION_SKIPPABLE_WRAPPERCACHE_CLASS(Attr)
+
+  virtual JSObject* WrapNode(JSContext* aCx,
+                             JS::Handle<JSObject*> aGivenProto) override;
+
+  void GetName(nsAString& aName);
+  void GetValue(nsAString& aValue);
+
+  MOZ_CAN_RUN_SCRIPT void SetValue(const nsAString& aValue,
+                                   nsIPrincipal* aTriggeringPrincipal,
+                                   ErrorResult& aRv);
+  void SetValueInternal(const nsAString& aValue, ErrorResult& aRv);
+
+  bool Specified() const;
+
+
+  Element* GetOwnerElement();
+
+ protected:
+  virtual Element* GetNameSpaceElement() override { return GetElement(); }
+
+  static bool sInitialized;
+
+ private:
+  RefPtr<nsDOMAttributeMap> mAttrMap;
+  nsString mValue;
+};
+
+}  
+}  
+
+#endif /* mozilla_dom_Attr_h */

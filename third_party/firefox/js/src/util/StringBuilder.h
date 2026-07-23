@@ -1,0 +1,473 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef util_StringBuilder_h
+#define util_StringBuilder_h
+
+#include "mozilla/CheckedInt.h"
+#include "mozilla/MaybeOneOf.h"
+#include "mozilla/Utf8.h"
+
+#include "frontend/FrontendContext.h"
+#include "js/Vector.h"
+#include "vm/Runtime.h"
+#include "vm/StringType.h"
+
+namespace js {
+
+class FrontendContext;
+
+namespace frontend {
+class ParserAtomsTable;
+class TaggedParserAtomIndex;
+}  
+
+namespace detail {
+
+static constexpr size_t AggressiveLimit = 128 << 20;
+
+template <size_t EltSize>
+inline size_t GrowEltsAggressively(size_t aOldElts, size_t aIncr) {
+  mozilla::CheckedInt<size_t> required =
+      mozilla::CheckedInt<size_t>(aOldElts) + aIncr;
+  if (!(required * 2).isValid()) {
+    return 0;
+  }
+  required = mozilla::RoundUpPow2(required.value());
+  required *= 8;
+  if (!(required * EltSize).isValid() || required.value() > AggressiveLimit) {
+    return mozilla::detail::GrowEltsByDoubling<EltSize>(aOldElts, aIncr);
+  }
+  return required.value();
+};
+
+}  
+
+class StringBuilderAllocPolicy {
+  TempAllocPolicy impl_;
+  const arena_id_t& arenaId_;
+
+ public:
+  StringBuilderAllocPolicy(FrontendContext* fc, const arena_id_t& arenaId)
+      : impl_(fc), arenaId_(arenaId) {}
+
+  StringBuilderAllocPolicy(JSContext* cx, const arena_id_t& arenaId)
+      : impl_(cx), arenaId_(arenaId) {}
+
+  template <typename T>
+  T* maybe_pod_malloc(size_t numElems) {
+    return impl_.maybe_pod_arena_malloc<T>(arenaId_, numElems);
+  }
+  template <typename T>
+  T* maybe_pod_calloc(size_t numElems) {
+    return impl_.maybe_pod_arena_calloc<T>(arenaId_, numElems);
+  }
+  template <typename T>
+  T* maybe_pod_realloc(T* p, size_t oldSize, size_t newSize) {
+    return impl_.maybe_pod_arena_realloc<T>(arenaId_, p, oldSize, newSize);
+  }
+  template <typename T>
+  T* pod_malloc(size_t numElems) {
+    return impl_.pod_arena_malloc<T>(arenaId_, numElems);
+  }
+  template <typename T>
+  T* pod_calloc(size_t numElems) {
+    return impl_.pod_arena_calloc<T>(arenaId_, numElems);
+  }
+  template <typename T>
+  T* pod_realloc(T* p, size_t oldSize, size_t newSize) {
+    return impl_.pod_arena_realloc<T>(arenaId_, p, oldSize, newSize);
+  }
+  template <typename T>
+  void free_(T* p, size_t numElems = 0) {
+    impl_.free_(p, numElems);
+  }
+  void reportAllocOverflow() const { impl_.reportAllocOverflow(); }
+  bool checkSimulatedOOM() const { return impl_.checkSimulatedOOM(); }
+
+  template <size_t EltSize>
+  static size_t computeGrowth(size_t oldElts, size_t incr) {
+    if (oldElts + incr >= size_t(JSString::MAX_LENGTH)) {
+      return 0;
+    }
+    return detail::GrowEltsAggressively<EltSize>(oldElts, incr);
+  }
+};
+
+class StringBuilder {
+ protected:
+  template <typename CharT>
+  using BufferType =
+      Vector<CharT, 80 / sizeof(CharT), StringBuilderAllocPolicy>;
+
+  using Latin1CharBuffer = BufferType<Latin1Char>;
+  using TwoByteCharBuffer = BufferType<char16_t>;
+
+  JSContext* maybeCx_ = nullptr;
+
+  mozilla::MaybeOneOf<Latin1CharBuffer, TwoByteCharBuffer> cb;
+
+  size_t reservedExclHeader_ = 0;
+
+  uint8_t numHeaderChars_ = 0;
+
+  template <typename CharT>
+  static constexpr size_t numHeaderChars() {
+    static_assert(sizeof(mozilla::StringBuffer) % sizeof(CharT) == 0);
+    return sizeof(mozilla::StringBuffer) / sizeof(CharT);
+  }
+
+  template <typename CharT>
+  MOZ_ALWAYS_INLINE bool isCharType() const {
+    return cb.constructed<BufferType<CharT>>();
+  }
+
+  MOZ_ALWAYS_INLINE bool isLatin1() const { return isCharType<Latin1Char>(); }
+
+  MOZ_ALWAYS_INLINE bool isTwoByte() const { return isCharType<char16_t>(); }
+
+  template <typename CharT>
+  MOZ_ALWAYS_INLINE BufferType<CharT>& chars() {
+    MOZ_ASSERT(isCharType<CharT>());
+    return cb.ref<BufferType<CharT>>();
+  }
+
+  template <typename CharT>
+  MOZ_ALWAYS_INLINE const BufferType<CharT>& chars() const {
+    MOZ_ASSERT(isCharType<CharT>());
+    return cb.ref<BufferType<CharT>>();
+  }
+
+  MOZ_ALWAYS_INLINE TwoByteCharBuffer& twoByteChars() {
+    return chars<char16_t>();
+  }
+
+  MOZ_ALWAYS_INLINE const TwoByteCharBuffer& twoByteChars() const {
+    return chars<char16_t>();
+  }
+
+  MOZ_ALWAYS_INLINE Latin1CharBuffer& latin1Chars() {
+    return chars<Latin1Char>();
+  }
+
+  MOZ_ALWAYS_INLINE const Latin1CharBuffer& latin1Chars() const {
+    return chars<Latin1Char>();
+  }
+
+  [[nodiscard]] bool inflateChars();
+
+  template <typename CharT>
+  JSLinearString* finishStringInternal(JSContext* cx, gc::Heap heap);
+
+ public:
+  explicit StringBuilder(JSContext* cx,
+                         const arena_id_t& arenaId = js::MallocArena)
+      : maybeCx_(cx) {
+    MOZ_ASSERT(cx);
+    cb.construct<Latin1CharBuffer>(StringBuilderAllocPolicy{cx, arenaId});
+  }
+
+  explicit StringBuilder(FrontendContext* fc,
+                         const arena_id_t& arenaId = js::MallocArena) {
+    MOZ_ASSERT(fc);
+    cb.construct<Latin1CharBuffer>(StringBuilderAllocPolicy{fc, arenaId});
+  }
+
+  StringBuilder(const StringBuilder& other) = delete;
+  void operator=(const StringBuilder& other) = delete;
+
+  void clear() { shrinkTo(0); }
+
+  [[nodiscard]] bool reserve(size_t len) {
+    auto lenWithHeader = mozilla::CheckedInt<size_t>(len) + numHeaderChars_;
+    if (MOZ_UNLIKELY(!lenWithHeader.isValid() || len > JSString::MAX_LENGTH)) {
+      ReportAllocationOverflow(maybeCx_);
+      return false;
+    }
+    if (len > reservedExclHeader_) {
+      reservedExclHeader_ = len;
+    }
+    return isLatin1() ? latin1Chars().reserve(lenWithHeader.value())
+                      : twoByteChars().reserve(lenWithHeader.value());
+  }
+  [[nodiscard]] bool growByUninitialized(size_t incr) {
+    auto newLenWithHeader =
+        mozilla::CheckedInt<size_t>(length()) + numHeaderChars_ + incr;
+    if (MOZ_UNLIKELY(!newLenWithHeader.isValid())) {
+      ReportAllocationOverflow(maybeCx_);
+      return false;
+    }
+    return isLatin1() ? latin1Chars().growByUninitialized(incr)
+                      : twoByteChars().growByUninitialized(incr);
+  }
+  void shrinkTo(size_t newLength) {
+    newLength += numHeaderChars_;
+    if (isLatin1()) {
+      latin1Chars().shrinkTo(newLength);
+    } else {
+      twoByteChars().shrinkTo(newLength);
+    }
+  }
+  bool empty() const { return length() == 0; }
+  size_t length() const {
+    size_t len = isLatin1() ? latin1Chars().length() : twoByteChars().length();
+    MOZ_ASSERT(len >= numHeaderChars_);
+    return len - numHeaderChars_;
+  }
+  char16_t getChar(size_t idx) const {
+    idx += numHeaderChars_;
+    return isLatin1() ? latin1Chars()[idx] : twoByteChars()[idx];
+  }
+
+  [[nodiscard]] bool ensureTwoByteChars() {
+    return isTwoByte() || inflateChars();
+  }
+
+  [[nodiscard]] bool append(const char16_t c) {
+    if (isLatin1()) {
+      if (c <= JSString::MAX_LATIN1_CHAR) {
+        return latin1Chars().append(Latin1Char(c));
+      }
+      if (!inflateChars()) {
+        return false;
+      }
+    }
+    return twoByteChars().append(c);
+  }
+  [[nodiscard]] bool append(Latin1Char c) {
+    return isLatin1() ? latin1Chars().append(c) : twoByteChars().append(c);
+  }
+  [[nodiscard]] bool append(char c) { return append(Latin1Char(c)); }
+
+  [[nodiscard]] inline bool append(const char16_t* begin, const char16_t* end);
+
+  [[nodiscard]] bool append(const char16_t* chars, size_t len) {
+    return append(chars, chars + len);
+  }
+
+  [[nodiscard]] bool append(const Latin1Char* begin, const Latin1Char* end) {
+    return isLatin1() ? latin1Chars().append(begin, end)
+                      : twoByteChars().append(begin, end);
+  }
+  [[nodiscard]] bool append(const Latin1Char* chars, size_t len) {
+    return append(chars, chars + len);
+  }
+
+  [[nodiscard]] bool append(const mozilla::Utf8Unit* units, size_t len);
+
+  [[nodiscard]] bool append(const JS::ConstCharPtr chars, size_t len) {
+    return append(chars.get(), chars.get() + len);
+  }
+  [[nodiscard]] bool appendN(Latin1Char c, size_t n) {
+    return isLatin1() ? latin1Chars().appendN(c, n)
+                      : twoByteChars().appendN(c, n);
+  }
+
+  [[nodiscard]] inline bool append(JSString* str);
+  [[nodiscard]] inline bool append(const JSLinearString* str);
+  [[nodiscard]] inline bool appendSubstring(JSString* base, size_t off,
+                                            size_t len);
+  [[nodiscard]] inline bool appendSubstring(const JSLinearString* base,
+                                            size_t off, size_t len);
+  [[nodiscard]] bool append(const frontend::ParserAtomsTable& parserAtoms,
+                            frontend::TaggedParserAtomIndex atom);
+
+  [[nodiscard]] bool append(const char* chars, size_t len) {
+    return append(reinterpret_cast<const Latin1Char*>(chars), len);
+  }
+
+  template <size_t ArrayLength>
+  [[nodiscard]] bool append(const char (&array)[ArrayLength]) {
+    return append(array, ArrayLength - 1); 
+  }
+
+  void infallibleAppend(Latin1Char c) {
+    if (isLatin1()) {
+      latin1Chars().infallibleAppend(c);
+    } else {
+      twoByteChars().infallibleAppend(c);
+    }
+  }
+  void infallibleAppend(char c) { infallibleAppend(Latin1Char(c)); }
+  void infallibleAppend(const Latin1Char* chars, size_t len) {
+    if (isLatin1()) {
+      latin1Chars().infallibleAppend(chars, len);
+    } else {
+      twoByteChars().infallibleAppend(chars, len);
+    }
+  }
+  void infallibleAppend(const char* chars, size_t len) {
+    infallibleAppend(reinterpret_cast<const Latin1Char*>(chars), len);
+  }
+
+  void infallibleAppendSubstring(const JSLinearString* base, size_t off,
+                                 size_t len);
+
+  void infallibleAppend(const char16_t* chars, size_t len) {
+    twoByteChars().infallibleAppend(chars, len);
+  }
+  void infallibleAppend(char16_t c) { twoByteChars().infallibleAppend(c); }
+
+  bool isUnderlyingBufferLatin1() const { return isLatin1(); }
+
+  template <typename CharT>
+  CharT* begin() {
+    MOZ_ASSERT(chars<CharT>().length() >= numHeaderChars_);
+    return chars<CharT>().begin() + numHeaderChars_;
+  }
+
+  template <typename CharT>
+  CharT* end() {
+    return chars<CharT>().end();
+  }
+
+  template <typename CharT>
+  const CharT* begin() const {
+    MOZ_ASSERT(chars<CharT>().length() >= numHeaderChars_);
+    return chars<CharT>().begin() + numHeaderChars_;
+  }
+
+  template <typename CharT>
+  const CharT* end() const {
+    return chars<CharT>().end();
+  }
+
+  char16_t* rawTwoByteBegin() { return begin<char16_t>(); }
+  char16_t* rawTwoByteEnd() { return end<char16_t>(); }
+  const char16_t* rawTwoByteBegin() const { return begin<char16_t>(); }
+  const char16_t* rawTwoByteEnd() const { return end<char16_t>(); }
+
+  Latin1Char* rawLatin1Begin() { return begin<Latin1Char>(); }
+  Latin1Char* rawLatin1End() { return end<Latin1Char>(); }
+  const Latin1Char* rawLatin1Begin() const { return begin<Latin1Char>(); }
+  const Latin1Char* rawLatin1End() const { return end<Latin1Char>(); }
+
+  JSAtom* finishAtom();
+  frontend::TaggedParserAtomIndex finishParserAtom(
+      frontend::ParserAtomsTable& parserAtoms, FrontendContext* fc);
+
+  char16_t* stealChars();
+};
+
+class JSStringBuilder : public StringBuilder {
+ public:
+  explicit JSStringBuilder(JSContext* cx)
+      : StringBuilder(cx, js::StringBufferArena) {
+    numHeaderChars_ = numHeaderChars<Latin1Char>();
+    MOZ_ALWAYS_TRUE(latin1Chars().appendN('\0', numHeaderChars_));
+  }
+
+  JSLinearString* finishString(gc::Heap heap = gc::Heap::Default);
+};
+
+inline bool StringBuilder::append(const char16_t* begin, const char16_t* end) {
+  MOZ_ASSERT(begin <= end);
+  if (isLatin1()) {
+    while (true) {
+      if (begin >= end) {
+        return true;
+      }
+      if (*begin > JSString::MAX_LATIN1_CHAR) {
+        break;
+      }
+      if (!latin1Chars().append(*begin)) {
+        return false;
+      }
+      ++begin;
+    }
+    if (!inflateChars()) {
+      return false;
+    }
+  }
+  return twoByteChars().append(begin, end);
+}
+
+inline bool StringBuilder::append(const JSLinearString* str) {
+  JS::AutoCheckCannotGC nogc;
+  if (isLatin1()) {
+    if (str->hasLatin1Chars()) {
+      return latin1Chars().append(str->latin1Chars(nogc), str->length());
+    }
+    if (!inflateChars()) {
+      return false;
+    }
+  }
+  return str->hasLatin1Chars()
+             ? twoByteChars().append(str->latin1Chars(nogc), str->length())
+             : twoByteChars().append(str->twoByteChars(nogc), str->length());
+}
+
+inline void StringBuilder::infallibleAppendSubstring(const JSLinearString* base,
+                                                     size_t off, size_t len) {
+  MOZ_ASSERT(off + len <= base->length());
+  MOZ_ASSERT_IF(base->hasTwoByteChars(), isTwoByte());
+
+  JS::AutoCheckCannotGC nogc;
+  if (base->hasLatin1Chars()) {
+    infallibleAppend(base->latin1Chars(nogc) + off, len);
+  } else {
+    infallibleAppend(base->twoByteChars(nogc) + off, len);
+  }
+}
+
+inline bool StringBuilder::appendSubstring(const JSLinearString* base,
+                                           size_t off, size_t len) {
+  MOZ_ASSERT(off + len <= base->length());
+
+  JS::AutoCheckCannotGC nogc;
+  if (isLatin1()) {
+    if (base->hasLatin1Chars()) {
+      return latin1Chars().append(base->latin1Chars(nogc) + off, len);
+    }
+    if (!inflateChars()) {
+      return false;
+    }
+  }
+  return base->hasLatin1Chars()
+             ? twoByteChars().append(base->latin1Chars(nogc) + off, len)
+             : twoByteChars().append(base->twoByteChars(nogc) + off, len);
+}
+
+inline bool StringBuilder::appendSubstring(JSString* base, size_t off,
+                                           size_t len) {
+  MOZ_ASSERT(maybeCx_);
+
+  JSLinearString* linear = base->ensureLinear(maybeCx_);
+  if (!linear) {
+    return false;
+  }
+
+  return appendSubstring(linear, off, len);
+}
+
+inline bool StringBuilder::append(JSString* str) {
+  MOZ_ASSERT(maybeCx_);
+
+  JSLinearString* linear = str->ensureLinear(maybeCx_);
+  if (!linear) {
+    return false;
+  }
+
+  return append(linear);
+}
+
+extern bool ValueToStringBuilderSlow(JSContext* cx, const Value& v,
+                                     StringBuilder& sb);
+
+inline bool ValueToStringBuilder(JSContext* cx, const Value& v,
+                                 StringBuilder& sb) {
+  if (v.isString()) {
+    return sb.append(v.toString());
+  }
+
+  return ValueToStringBuilderSlow(cx, v, sb);
+}
+
+inline bool BooleanToStringBuilder(bool b, StringBuilder& sb) {
+  return b ? sb.append("true") : sb.append("false");
+}
+
+} 
+
+#endif /* util_StringBuilder_h */

@@ -1,0 +1,114 @@
+// Copyright 2020 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#ifndef ABSL_FLAGS_COMMANDLINEFLAG_H_
+#define ABSL_FLAGS_COMMANDLINEFLAG_H_
+
+#include <memory>
+#include <optional>
+#include <string>
+
+#include "absl/base/config.h"
+#include "absl/base/fast_type_id.h"
+#include "absl/base/nullability.h"
+#include "absl/flags/internal/commandlineflag.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/optional.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace flags_internal {
+class PrivateHandleAccessor;
+}  
+
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnon-virtual-dtor"
+#endif
+class CommandLineFlag {
+ public:
+  constexpr CommandLineFlag() = default;
+
+  CommandLineFlag(const CommandLineFlag&) = delete;
+  CommandLineFlag& operator=(const CommandLineFlag&) = delete;
+
+  template <typename T>
+  inline bool IsOfType() const {
+    return TypeId() == FastTypeId<T>();
+  }
+
+  template <typename T>
+  std::optional<T> TryGet() const {
+    if (IsRetired() || !IsOfType<T>()) {
+      return std::nullopt;
+    }
+
+    union U {
+      T value;
+      U() {}
+      ~U() { value.~T(); }
+    };
+    U u;
+
+    Read(&u.value);
+    if (IsRetired()) {
+      return std::nullopt;
+    }
+    return std::move(u.value);
+  }
+
+  virtual absl::string_view Name() const = 0;
+
+  virtual std::string Filename() const = 0;
+
+  virtual std::string Help() const = 0;
+
+  virtual bool IsRetired() const;
+
+  virtual std::string DefaultValue() const = 0;
+
+  virtual std::string CurrentValue() const = 0;
+
+  bool ParseFrom(absl::string_view value, std::string* absl_nonnull error);
+
+ protected:
+  ~CommandLineFlag() = default;
+
+ private:
+  friend class flags_internal::PrivateHandleAccessor;
+
+  virtual bool ParseFrom(absl::string_view value,
+                         flags_internal::FlagSettingMode set_mode,
+                         flags_internal::ValueSource source,
+                         std::string& error) = 0;
+
+  virtual flags_internal::FlagFastTypeId TypeId() const = 0;
+
+  virtual std::unique_ptr<flags_internal::FlagStateInterface> SaveState() = 0;
+
+  virtual void Read(void* absl_nonnull dst) const = 0;
+
+  virtual bool IsSpecifiedOnCommandLine() const = 0;
+
+  virtual bool ValidateInputValue(absl::string_view value) const = 0;
+
+  virtual void CheckDefaultValueParsingRoundtrip() const = 0;
+
+  virtual absl::string_view TypeName() const;
+};
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_FLAGS_COMMANDLINEFLAG_H_

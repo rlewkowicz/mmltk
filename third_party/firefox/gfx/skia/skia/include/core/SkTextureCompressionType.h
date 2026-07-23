@@ -1,0 +1,20 @@
+/*
+ * Copyright 2023 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkTextureCompressionType_DEFINED)
+#define SkTextureCompressionType_DEFINED
+enum class SkTextureCompressionType {
+    kNone,
+    kETC2_RGB8_UNORM,
+
+    kBC1_RGB8_UNORM,
+    kBC1_RGBA8_UNORM,
+    kLast = kBC1_RGBA8_UNORM,
+    kETC1_RGB8 = kETC2_RGB8_UNORM,
+};
+
+#endif

@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef EncodedFrame_h_
+#define EncodedFrame_h_
+
+#include "TimeUnits.h"
+#include "VideoUtils.h"
+#include "mozilla/media/MediaUtils.h"
+#include "nsISupportsImpl.h"
+
+namespace mozilla {
+
+class EncodedFrame final {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(EncodedFrame)
+ public:
+  enum FrameType {
+    VP8_I_FRAME,       
+    VP8_P_FRAME,       
+    OPUS_AUDIO_FRAME,  
+    UNKNOWN            
+  };
+  using ConstFrameData = const media::Refcountable<nsTArray<uint8_t>>;
+  using FrameData = media::Refcountable<nsTArray<uint8_t>>;
+  EncodedFrame(const media::TimeUnit& aTime, uint64_t aDuration,
+               uint64_t aDurationBase, FrameType aFrameType,
+               RefPtr<ConstFrameData> aData)
+      : mTime(aTime),
+        mDuration(aDuration),
+        mDurationBase(aDurationBase),
+        mFrameType(aFrameType),
+        mFrameData(std::move(aData)) {
+    MOZ_ASSERT(mFrameData);
+    MOZ_ASSERT_IF(mFrameType == VP8_I_FRAME, mDurationBase == PR_USEC_PER_SEC);
+    MOZ_ASSERT_IF(mFrameType == VP8_P_FRAME, mDurationBase == PR_USEC_PER_SEC);
+    MOZ_ASSERT_IF(mFrameType == OPUS_AUDIO_FRAME, mDurationBase == 48000);
+  }
+  const media::TimeUnit mTime;
+  const uint64_t mDuration;
+  const uint64_t mDurationBase;
+  const FrameType mFrameType;
+  const RefPtr<ConstFrameData> mFrameData;
+
+  media::TimeUnit GetEndTime() const {
+    return mTime + media::TimeUnit(mDuration, mDurationBase);
+  }
+
+ private:
+  ~EncodedFrame() = default;
+};
+
+}  
+
+#endif  // EncodedFrame_h_

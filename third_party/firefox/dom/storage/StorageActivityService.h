@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_StorageActivityService_h
+#define mozilla_dom_StorageActivityService_h
+
+#include "nsIObserver.h"
+#include "nsIStorageActivityService.h"
+#include "nsTHashMap.h"
+#include "nsWeakReference.h"
+
+namespace mozilla {
+
+namespace ipc {
+class PrincipalInfo;
+}  
+
+namespace dom {
+
+class StorageActivityService final : public nsIStorageActivityService,
+                                     public nsIObserver,
+                                     public nsSupportsWeakReference {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSISTORAGEACTIVITYSERVICE
+  NS_DECL_NSIOBSERVER
+
+  static void SendActivity(nsIPrincipal* aPrincipal);
+
+  static void SendActivity(const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+
+  static void SendActivity(const nsACString& aOrigin);
+
+  static already_AddRefed<StorageActivityService> GetOrCreate();
+
+ private:
+  StorageActivityService();
+  ~StorageActivityService();
+
+  void SendActivityInternal(nsIPrincipal* aPrincipal);
+
+  void SendActivityInternal(const nsACString& aOrigin);
+
+  void SendActivityToParent(nsIPrincipal* aPrincipal);
+
+  void CleanUp();
+
+  nsTHashMap<nsCStringHashKey, PRTime> mActivities;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_StorageActivityService_h

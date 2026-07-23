@@ -1,0 +1,823 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/FontFaceImpl.h"
+
+#include <algorithm>
+
+#include "gfxFontUtils.h"
+#include "gfxPlatformFontList.h"
+#include "mozilla/ServoCSSParser.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/FontFaceBinding.h"
+#include "mozilla/dom/FontFaceSetImpl.h"
+
+namespace mozilla::dom {
+
+
+class FontFaceBufferSource : public gfxFontFaceBufferSource {
+ public:
+  FontFaceBufferSource(uint8_t* aBuffer, uint32_t aLength)
+      : mBuffer(aBuffer), mLength(aLength) {}
+
+  void TakeBuffer(uint8_t*& aBuffer, uint32_t& aLength) override {
+    MOZ_ASSERT(mBuffer,
+               "only call TakeBuffer once on a given "
+               "FontFaceBufferSource object");
+    aBuffer = mBuffer;
+    aLength = mLength;
+    mBuffer = nullptr;
+    mLength = 0;
+  }
+
+ private:
+  ~FontFaceBufferSource() override {
+    if (mBuffer) {
+      free(mBuffer);
+    }
+  }
+
+  uint8_t* mBuffer;
+  uint32_t mLength;
+};
+
+
+FontFaceImpl::FontFaceImpl(FontFace* aOwner, FontFaceSetImpl* aFontFaceSet)
+    : mOwner(aOwner),
+      mStatus(FontFaceLoadStatus::Unloaded),
+      mSourceType(SourceType(0)),
+      mFontFaceSet(aFontFaceSet) {}
+
+FontFaceImpl::~FontFaceImpl() {
+  MOZ_ASSERT(!gfxFontUtils::IsInServoTraversal());
+
+  SetUserFontEntry(nullptr);
+}
+
+#ifdef DEBUG
+void FontFaceImpl::AssertIsOnOwningThread() const {
+  mFontFaceSet->AssertIsOnOwningThread();
+}
+#endif
+
+void FontFaceImpl::StopKeepingOwnerAlive() {
+  if (mKeepingOwnerAlive) {
+    mKeepingOwnerAlive = false;
+    MOZ_ASSERT(mOwner);
+    mOwner->Release();
+  }
+}
+
+void FontFaceImpl::Destroy() {
+  mInFontFaceSet = false;
+  SetUserFontEntry(nullptr);
+  StopKeepingOwnerAlive();
+  mOwner = nullptr;
+}
+
+static FontFaceLoadStatus LoadStateToStatus(
+    gfxUserFontEntry::UserFontLoadState aLoadState) {
+  switch (aLoadState) {
+    case gfxUserFontEntry::UserFontLoadState::STATUS_NOT_LOADED:
+      return FontFaceLoadStatus::Unloaded;
+    case gfxUserFontEntry::UserFontLoadState::STATUS_LOAD_PENDING:
+    case gfxUserFontEntry::UserFontLoadState::STATUS_LOADING:
+      return FontFaceLoadStatus::Loading;
+    case gfxUserFontEntry::UserFontLoadState::STATUS_LOADED:
+      return FontFaceLoadStatus::Loaded;
+    case gfxUserFontEntry::UserFontLoadState::STATUS_FAILED:
+      return FontFaceLoadStatus::Error;
+  }
+  MOZ_ASSERT_UNREACHABLE("invalid aLoadState value");
+  return FontFaceLoadStatus::Error;
+}
+
+already_AddRefed<FontFaceImpl> FontFaceImpl::CreateForRule(
+    FontFace* aOwner, FontFaceSetImpl* aFontFaceSet,
+    StyleLockedFontFaceRule* aRule) {
+  auto obj = MakeRefPtr<FontFaceImpl>(aOwner, aFontFaceSet);
+  obj->mRule = aRule;
+  obj->mSourceType = eSourceType_FontFaceRule;
+  obj->mInFontFaceSet = true;
+  return obj.forget();
+}
+
+void FontFaceImpl::InitializeSourceURL(const nsACString& aURL) {
+  MOZ_ASSERT(mOwner);
+  mSourceType = eSourceType_URLs;
+
+  IgnoredErrorResult rv;
+  SetDescriptor(FontFaceDescriptorId::Src, aURL, rv);
+  if (rv.Failed()) {
+    mOwner->MaybeReject(FontFaceLoadedRejectReason::Syntax,
+                        nsPrintfCString("Invalid source url %s",
+                                        PromiseFlatCString(aURL).get()));
+    SetStatus(FontFaceLoadStatus::Error);
+  }
+}
+
+void FontFaceImpl::InitializeSourceBuffer(uint8_t* aBuffer, uint32_t aLength) {
+  MOZ_ASSERT(mOwner);
+  MOZ_ASSERT(!mBufferSource);
+  mSourceType = FontFaceImpl::eSourceType_Buffer;
+
+  if (aBuffer) {
+    mBufferSource = new FontFaceBufferSource(aBuffer, aLength);
+  }
+
+  DoLoad();
+}
+
+void FontFaceImpl::GetFamily(nsACString& aResult) {
+  GetDesc(FontFaceDescriptorId::FontFamily, aResult);
+}
+
+void FontFaceImpl::SetFamily(const nsACString& aValue, ErrorResult& aRv) {
+  mFontFaceSet->FlushUserFontSet();
+  if (SetDescriptor(FontFaceDescriptorId::FontFamily, aValue, aRv)) {
+    DescriptorUpdated();
+  }
+}
+
+void FontFaceImpl::GetStyle(nsACString& aResult) {
+  GetDesc(FontFaceDescriptorId::FontStyle, aResult);
+}
+
+void FontFaceImpl::SetStyle(const nsACString& aValue, ErrorResult& aRv) {
+  if (SetDescriptor(FontFaceDescriptorId::FontStyle, aValue, aRv)) {
+    DescriptorUpdated();
+  }
+}
+
+void FontFaceImpl::GetWeight(nsACString& aResult) {
+  GetDesc(FontFaceDescriptorId::FontWeight, aResult);
+}
+
+void FontFaceImpl::SetWeight(const nsACString& aValue, ErrorResult& aRv) {
+  mFontFaceSet->FlushUserFontSet();
+  if (SetDescriptor(FontFaceDescriptorId::FontWeight, aValue, aRv)) {
+    DescriptorUpdated();
+  }
+}
+
+void FontFaceImpl::GetStretch(nsACString& aResult) {
+  GetDesc(FontFaceDescriptorId::FontStretch, aResult);
+}
+
+void FontFaceImpl::SetStretch(const nsACString& aValue, ErrorResult& aRv) {
+  mFontFaceSet->FlushUserFontSet();
+  if (SetDescriptor(FontFaceDescriptorId::FontStretch, aValue, aRv)) {
+    DescriptorUpdated();
+  }
+}
+
+void FontFaceImpl::GetUnicodeRange(nsACString& aResult) {
+  GetDesc(FontFaceDescriptorId::UnicodeRange, aResult);
+}
+
+void FontFaceImpl::SetUnicodeRange(const nsACString& aValue, ErrorResult& aRv) {
+  mFontFaceSet->FlushUserFontSet();
+  if (SetDescriptor(FontFaceDescriptorId::UnicodeRange, aValue, aRv)) {
+    DescriptorUpdated();
+  }
+}
+
+void FontFaceImpl::GetVariant(nsACString& aResult) {
+  aResult.AssignLiteral("normal");
+}
+
+void FontFaceImpl::SetVariant(const nsACString& aValue, ErrorResult& aRv) {
+}
+
+void FontFaceImpl::GetFeatureSettings(nsACString& aResult) {
+  GetDesc(FontFaceDescriptorId::FontFeatureSettings, aResult);
+}
+
+void FontFaceImpl::SetFeatureSettings(const nsACString& aValue,
+                                      ErrorResult& aRv) {
+  mFontFaceSet->FlushUserFontSet();
+  if (SetDescriptor(FontFaceDescriptorId::FontFeatureSettings, aValue, aRv)) {
+    DescriptorUpdated();
+  }
+}
+
+void FontFaceImpl::GetVariationSettings(nsACString& aResult) {
+  GetDesc(FontFaceDescriptorId::FontVariationSettings, aResult);
+}
+
+void FontFaceImpl::SetVariationSettings(const nsACString& aValue,
+                                        ErrorResult& aRv) {
+  mFontFaceSet->FlushUserFontSet();
+  if (SetDescriptor(FontFaceDescriptorId::FontVariationSettings, aValue, aRv)) {
+    DescriptorUpdated();
+  }
+}
+
+void FontFaceImpl::GetDisplay(nsACString& aResult) {
+  GetDesc(FontFaceDescriptorId::FontDisplay, aResult);
+}
+
+void FontFaceImpl::SetDisplay(const nsACString& aValue, ErrorResult& aRv) {
+  if (SetDescriptor(FontFaceDescriptorId::FontDisplay, aValue, aRv)) {
+    DescriptorUpdated();
+  }
+}
+
+void FontFaceImpl::GetAscentOverride(nsACString& aResult) {
+  GetDesc(FontFaceDescriptorId::AscentOverride, aResult);
+}
+
+void FontFaceImpl::SetAscentOverride(const nsACString& aValue,
+                                     ErrorResult& aRv) {
+  if (SetDescriptor(FontFaceDescriptorId::AscentOverride, aValue, aRv)) {
+    DescriptorUpdated();
+  }
+}
+
+void FontFaceImpl::GetDescentOverride(nsACString& aResult) {
+  GetDesc(FontFaceDescriptorId::DescentOverride, aResult);
+}
+
+void FontFaceImpl::SetDescentOverride(const nsACString& aValue,
+                                      ErrorResult& aRv) {
+  if (SetDescriptor(FontFaceDescriptorId::DescentOverride, aValue, aRv)) {
+    DescriptorUpdated();
+  }
+}
+
+void FontFaceImpl::GetLineGapOverride(nsACString& aResult) {
+  GetDesc(FontFaceDescriptorId::LineGapOverride, aResult);
+}
+
+void FontFaceImpl::SetLineGapOverride(const nsACString& aValue,
+                                      ErrorResult& aRv) {
+  if (SetDescriptor(FontFaceDescriptorId::LineGapOverride, aValue, aRv)) {
+    DescriptorUpdated();
+  }
+}
+
+void FontFaceImpl::GetSizeAdjust(nsACString& aResult) {
+  GetDesc(FontFaceDescriptorId::SizeAdjust, aResult);
+}
+
+void FontFaceImpl::SetSizeAdjust(const nsACString& aValue, ErrorResult& aRv) {
+  if (SetDescriptor(FontFaceDescriptorId::SizeAdjust, aValue, aRv)) {
+    DescriptorUpdated();
+  }
+}
+
+void FontFaceImpl::DescriptorUpdated() {
+  if (!mUserFontEntry) {
+    return;
+  }
+
+  gfxUserFontAttributes attr;
+  RefPtr<gfxUserFontEntry> newEntry;
+  if (GetAttributes(attr)) {
+    newEntry = mFontFaceSet->FindOrCreateUserFontEntryFromFontFace(
+        this, std::move(attr), StyleOrigin::Author);
+  }
+  SetUserFontEntry(newEntry);
+
+
+  if (mInFontFaceSet) {
+    mFontFaceSet->MarkUserFontSetDirty();
+  }
+  for (auto& set : mOtherFontFaceSets) {
+    set->MarkUserFontSetDirty();
+  }
+}
+
+FontFaceLoadStatus FontFaceImpl::Status() { return mStatus; }
+
+void FontFaceImpl::Load() {
+  mFontFaceSet->FlushUserFontSet();
+
+  if (mSourceType == eSourceType_Buffer ||
+      mStatus != FontFaceLoadStatus::Unloaded) {
+    return;
+  }
+
+  DoLoad();
+}
+
+gfxUserFontEntry* FontFaceImpl::CreateUserFontEntry() {
+  if (!mUserFontEntry) {
+    MOZ_ASSERT(!HasRule(),
+               "Rule backed FontFace objects should already have a user font "
+               "entry by the time Load() can be called on them");
+
+    gfxUserFontAttributes attr;
+    if (GetAttributes(attr)) {
+      RefPtr<gfxUserFontEntry> newEntry =
+          mFontFaceSet->FindOrCreateUserFontEntryFromFontFace(
+              this, std::move(attr), StyleOrigin::Author);
+      if (newEntry) {
+        SetUserFontEntry(newEntry);
+      }
+    }
+  }
+
+  return mUserFontEntry;
+}
+
+void FontFaceImpl::DoLoad() {
+  SetStatus(FontFaceLoadStatus::Loading);
+  if (!CreateUserFontEntry()) {
+    return;
+  }
+  mUserFontEntry->Load();
+}
+
+void FontFaceImpl::SetStatus(FontFaceLoadStatus aStatus) {
+  gfxFontUtils::AssertSafeThreadOrServoFontMetricsLocked();
+
+  if (mStatus == aStatus) {
+    return;
+  }
+
+  if (aStatus < mStatus) {
+    return;
+  }
+
+  mStatus = aStatus;
+
+  if (mInFontFaceSet) {
+    mFontFaceSet->OnFontFaceStatusChanged(this);
+  }
+
+  for (FontFaceSetImpl* otherSet : mOtherFontFaceSets) {
+    otherSet->OnFontFaceStatusChanged(this);
+  }
+
+  UpdateOwnerPromise();
+}
+
+void FontFaceImpl::UpdateOwnerPromise() {
+  mFontFaceSet->DispatchToOwningThread(
+      "FontFaceImpl::UpdateOwnerPromise",
+      [self = RefPtr{this}] { self->UpdateOwnerPromiseSync(); });
+}
+
+void FontFaceImpl::UpdateOwnerKeepAlive() {
+  AssertIsOnOwningThread();
+  if (!mOwner) {
+    MOZ_DIAGNOSTIC_ASSERT(!mKeepingOwnerAlive);
+    return;
+  }
+  const bool shouldKeepOwnerAlive =
+      mStatus == FontFaceLoadStatus::Loading && !!mOwner->GetParentObject();
+  if (shouldKeepOwnerAlive == mKeepingOwnerAlive) {
+    return;
+  }
+  mKeepingOwnerAlive = shouldKeepOwnerAlive;
+  if (shouldKeepOwnerAlive) {
+    mOwner->AddRef();
+  } else {
+    mOwner->Release();
+  }
+}
+
+void FontFaceImpl::UpdateOwnerPromiseSync() {
+  if (NS_WARN_IF(!mOwner)) {
+    MOZ_DIAGNOSTIC_ASSERT(!mKeepingOwnerAlive);
+    return;
+  }
+
+  RefPtr owner = mOwner;
+  UpdateOwnerKeepAlive();
+  if (mStatus == FontFaceLoadStatus::Loaded) {
+    owner->MaybeResolve();
+  } else if (mStatus == FontFaceLoadStatus::Error) {
+    if (mSourceType == eSourceType_Buffer) {
+      owner->MaybeReject(FontFaceLoadedRejectReason::Syntax,
+                         nsCString("Invalid source buffer"_ns));
+    } else {
+      owner->MaybeReject(FontFaceLoadedRejectReason::Network, nsCString());
+    }
+  }
+}
+
+bool FontFaceImpl::SetDescriptor(FontFaceDescriptorId aFontDesc,
+                                 const nsACString& aValue, ErrorResult& aRv) {
+  NS_ASSERTION(!HasRule(), "we don't handle rule backed FontFace objects yet");
+  if (HasRule()) {
+    return false;
+  }
+
+  RefPtr<URLExtraData> url = mFontFaceSet->GetURLExtraData();
+  if (NS_WARN_IF(!url)) {
+    aRv.ThrowInvalidStateError("Missing URLExtraData");
+    return false;
+  }
+
+  bool changed = false;
+  const bool valid = [&] {
+    if (Servo_FontFaceRule_SetDescriptor(GetData(), aFontDesc, &aValue, url,
+                                         &changed)) {
+      return true;
+    }
+    if (aFontDesc == FontFaceDescriptorId::FontFamily) {
+      nsAutoCString quoted;
+      nsStyleUtil::AppendQuotedCSSString(aValue, quoted, '"');
+      if (Servo_FontFaceRule_SetDescriptor(GetData(), aFontDesc, &quoted, url,
+                                           &changed)) {
+        return true;
+      }
+    }
+    aRv.ThrowSyntaxError(
+        nsPrintfCString("Invalid font descriptor %s: %s",
+                        nsCSSProps::GetStringValue(aFontDesc).get(),
+                        PromiseFlatCString(aValue).get()));
+    return false;
+  }();
+
+  if (!valid || !changed) {
+    return false;
+  }
+
+  if (aFontDesc == FontFaceDescriptorId::UnicodeRange) {
+    mUnicodeRangeDirty = true;
+  }
+
+  return true;
+}
+
+bool FontFaceImpl::SetDescriptors(const nsACString& aFamily,
+                                  const FontFaceDescriptors& aDescriptors) {
+  MOZ_ASSERT(!HasRule());
+  MOZ_ASSERT(!mDescriptors);
+
+  mDescriptors = Servo_FontFaceRule_CreateEmpty().Consume();
+
+  nsCString errorMessage;
+  auto setDesc = [&](FontFaceDescriptorId aDesc,
+                     const nsACString& aVal) -> bool {
+    IgnoredErrorResult rv;
+    SetDescriptor(aDesc, aVal, rv);
+    if (!rv.Failed()) {
+      return true;
+    }
+    errorMessage = nsPrintfCString("Invalid font descriptor %s: %s",
+                                   nsCSSProps::GetStringValue(aDesc).get(),
+                                   PromiseFlatCString(aVal).get());
+    return false;
+  };
+
+  if (!setDesc(FontFaceDescriptorId::FontFamily, aFamily) ||
+      !setDesc(FontFaceDescriptorId::FontStyle, aDescriptors.mStyle) ||
+      !setDesc(FontFaceDescriptorId::FontWeight, aDescriptors.mWeight) ||
+      !setDesc(FontFaceDescriptorId::FontStretch, aDescriptors.mStretch) ||
+      !setDesc(FontFaceDescriptorId::UnicodeRange,
+               aDescriptors.mUnicodeRange) ||
+      !setDesc(FontFaceDescriptorId::FontFeatureSettings,
+               aDescriptors.mFeatureSettings) ||
+      (StaticPrefs::layout_css_font_variations_enabled() &&
+       !setDesc(FontFaceDescriptorId::FontVariationSettings,
+                aDescriptors.mVariationSettings)) ||
+      !setDesc(FontFaceDescriptorId::FontDisplay, aDescriptors.mDisplay) ||
+      ((!setDesc(FontFaceDescriptorId::AscentOverride,
+                 aDescriptors.mAscentOverride) ||
+        !setDesc(FontFaceDescriptorId::DescentOverride,
+                 aDescriptors.mDescentOverride) ||
+        !setDesc(FontFaceDescriptorId::LineGapOverride,
+                 aDescriptors.mLineGapOverride))) ||
+      !setDesc(FontFaceDescriptorId::SizeAdjust, aDescriptors.mSizeAdjust)) {
+
+    mDescriptors = Servo_FontFaceRule_CreateEmpty().Consume();
+
+    if (mOwner) {
+      mOwner->MaybeReject(FontFaceLoadedRejectReason::Syntax,
+                          std::move(errorMessage));
+    }
+
+    SetStatus(FontFaceLoadStatus::Error);
+    return false;
+  }
+
+  return true;
+}
+
+void FontFaceImpl::GetDesc(FontFaceDescriptorId aDescID,
+                           nsACString& aResult) const {
+  aResult.Truncate();
+  Servo_FontFaceRule_GetDescriptorCssText(GetData(), aDescID, &aResult);
+
+  if (aResult.IsEmpty()) {
+    if (aDescID == FontFaceDescriptorId::UnicodeRange) {
+      aResult.AssignLiteral("U+0-10FFFF");
+    } else if (aDescID == FontFaceDescriptorId::FontDisplay) {
+      aResult.AssignLiteral("auto");
+    } else if (aDescID != FontFaceDescriptorId::FontFamily &&
+               aDescID != FontFaceDescriptorId::Src) {
+      aResult.AssignLiteral("normal");
+    }
+  }
+}
+
+void FontFaceImpl::SetUserFontEntry(gfxUserFontEntry* aEntry) {
+  AssertIsOnOwningThread();
+
+  if (mUserFontEntry == aEntry) {
+    return;
+  }
+
+  if (mUserFontEntry) {
+    mUserFontEntry->RemoveFontFace(this);
+  }
+
+  auto* entry = static_cast<Entry*>(aEntry);
+  if (entry) {
+    entry->AddFontFace(this);
+  }
+
+  mUserFontEntry = entry;
+
+  if (!mUserFontEntry) {
+    return;
+  }
+
+  MOZ_ASSERT(mUserFontEntry->HasUserFontSet(mFontFaceSet),
+             "user font entry must be associated with the same user font set "
+             "as the FontFace");
+
+  FontFaceLoadStatus newStatus = LoadStateToStatus(mUserFontEntry->LoadState());
+  if (newStatus > mStatus) {
+    SetStatus(newStatus);
+  }
+}
+
+bool FontFaceImpl::GetAttributes(gfxUserFontAttributes& aAttr) {
+  StyleLockedFontFaceRule* data = GetData();
+  if (!data) {
+    return false;
+  }
+  return GetAttributesFromRule(data, aAttr,
+                               Some(GetUnicodeRangeAsCharacterMap()));
+}
+
+static already_AddRefed<gfxCharacterMap> ComputeCharacterMap(
+    StyleLockedFontFaceRule* aData) {
+  size_t len;
+  const StyleUnicodeRange* rangesPtr =
+      Servo_FontFaceRule_GetUnicodeRanges(aData, &len);
+
+  Span<const StyleUnicodeRange> ranges(rangesPtr, len);
+  if (ranges.IsEmpty()) {
+    return nullptr;
+  }
+  if (ranges.Length() == 1 && ranges[0] == StyleUnicodeRange{0, 0x10ffff}) {
+    return nullptr;
+  }
+  auto charMap = MakeRefPtr<gfxCharacterMap>(256);
+  for (auto& range : ranges) {
+    charMap->SetRange(range.start, range.end);
+  }
+  charMap->Compact();
+  return gfxPlatformFontList::PlatformFontList()->FindCharMap(charMap);
+}
+
+bool FontFaceImpl::GetAttributesFromRule(
+    StyleLockedFontFaceRule* aData, gfxUserFontAttributes& aAttr,
+    const Maybe<gfxCharacterMap*>& aKnownCharMap) {
+  nsAtom* fontFamily = Servo_FontFaceRule_GetFamilyName(aData);
+  if (!fontFamily) {
+    return false;
+  }
+
+  aAttr.mFamilyName = nsAtomCString(fontFamily);
+
+  StyleComputedFontWeightRange weightRange;
+  if (Servo_FontFaceRule_GetFontWeight(aData, &weightRange)) {
+    aAttr.mRangeFlags &= ~gfxFontEntry::RangeFlags::eAutoWeight;
+    aAttr.mWeight = WeightRange(weightRange._0, weightRange._1);
+  }
+
+  StyleComputedFontStretchRange stretchRange;
+  if (Servo_FontFaceRule_GetFontStretch(aData, &stretchRange)) {
+    aAttr.mRangeFlags &= ~gfxFontEntry::RangeFlags::eAutoStretch;
+    aAttr.mStretch = StretchRange(stretchRange._0, stretchRange._1);
+  }
+
+  StyleComputedFontStyleRange styleRange;
+  if (Servo_FontFaceRule_GetFontStyle(aData, &styleRange)) {
+    aAttr.mRangeFlags &= ~gfxFontEntry::RangeFlags::eAutoSlantStyle;
+    aAttr.mStyle = SlantStyleRange(styleRange._0, styleRange._1);
+  }
+
+  StylePercentage ascent{0};
+  if (Servo_FontFaceRule_GetAscentOverride(aData, &ascent)) {
+    aAttr.mAscentOverride = ascent._0;
+  }
+
+  StylePercentage descent{0};
+  if (Servo_FontFaceRule_GetDescentOverride(aData, &descent)) {
+    aAttr.mDescentOverride = descent._0;
+  }
+
+  StylePercentage lineGap{0};
+  if (Servo_FontFaceRule_GetLineGapOverride(aData, &lineGap)) {
+    aAttr.mLineGapOverride = lineGap._0;
+  }
+
+  StylePercentage sizeAdjust;
+  if (Servo_FontFaceRule_GetSizeAdjust(aData, &sizeAdjust)) {
+    aAttr.mSizeAdjust = sizeAdjust._0;
+  }
+
+  StyleFontLanguageOverride langOverride;
+  if (Servo_FontFaceRule_GetFontLanguageOverride(aData, &langOverride)) {
+    aAttr.mLanguageOverride = langOverride._0;
+  }
+
+  Servo_FontFaceRule_GetFontDisplay(aData, &aAttr.mFontDisplay);
+  Servo_FontFaceRule_GetFeatureSettings(aData, &aAttr.mFeatureSettings);
+  Servo_FontFaceRule_GetVariationSettings(aData, &aAttr.mVariationSettings);
+  Servo_FontFaceRule_GetSources(aData, &aAttr.mSources);
+  if (aKnownCharMap) {
+    aAttr.mUnicodeRanges = aKnownCharMap.value();
+  } else {
+    aAttr.mUnicodeRanges = ComputeCharacterMap(aData);
+  }
+  return true;
+}
+
+nsAtom* FontFaceImpl::GetFamilyName() const {
+  return Servo_FontFaceRule_GetFamilyName(GetData());
+}
+
+void FontFaceImpl::DisconnectFromRule() {
+  MOZ_ASSERT(HasRule());
+
+  mDescriptors = Servo_FontFaceRule_Clone(mRule).Consume();
+  mRule = nullptr;
+  mInFontFaceSet = false;
+}
+
+bool FontFaceImpl::HasFontData() const {
+  return mSourceType == eSourceType_Buffer && mBufferSource;
+}
+
+already_AddRefed<gfxFontFaceBufferSource> FontFaceImpl::TakeBufferSource() {
+  MOZ_ASSERT(mBufferSource);
+  return mBufferSource.forget();
+}
+
+bool FontFaceImpl::IsInFontFaceSet(FontFaceSetImpl* aFontFaceSet) const {
+  if (mFontFaceSet == aFontFaceSet) {
+    return mInFontFaceSet;
+  }
+  return mOtherFontFaceSets.Contains(aFontFaceSet);
+}
+
+void FontFaceImpl::AddFontFaceSet(FontFaceSetImpl* aFontFaceSet) {
+  MOZ_ASSERT(!IsInFontFaceSet(aFontFaceSet));
+
+  auto doAddFontFaceSet = [&]() {
+    if (mFontFaceSet == aFontFaceSet) {
+      mInFontFaceSet = true;
+    } else {
+      mOtherFontFaceSets.AppendElement(aFontFaceSet);
+    }
+  };
+
+  if (mUserFontEntry) {
+    AutoWriteLock lock(mUserFontEntry->Lock());
+    doAddFontFaceSet();
+  } else {
+    doAddFontFaceSet();
+  }
+}
+
+void FontFaceImpl::RemoveFontFaceSet(FontFaceSetImpl* aFontFaceSet) {
+  MOZ_ASSERT(IsInFontFaceSet(aFontFaceSet));
+
+  auto doRemoveFontFaceSet = [&]() {
+    if (mFontFaceSet == aFontFaceSet) {
+      mInFontFaceSet = false;
+    } else {
+      mOtherFontFaceSets.RemoveElement(aFontFaceSet);
+    }
+  };
+
+  if (mUserFontEntry) {
+    AutoWriteLock lock(mUserFontEntry->Lock());
+    doRemoveFontFaceSet();
+    mUserFontEntry->CheckUserFontSetLocked();
+  } else {
+    doRemoveFontFaceSet();
+  }
+}
+
+gfxCharacterMap* FontFaceImpl::GetUnicodeRangeAsCharacterMap() {
+  if (!mUnicodeRangeDirty) {
+    return mUnicodeRange;
+  }
+  mUnicodeRange = ComputeCharacterMap(GetData());
+  mUnicodeRangeDirty = false;
+  return mUnicodeRange;
+}
+
+
+void FontFaceImpl::Entry::SetLoadState(UserFontLoadState aLoadState) {
+  gfxUserFontEntry::SetLoadState(aLoadState);
+  FontFaceLoadStatus status = LoadStateToStatus(aLoadState);
+
+  nsTArray<RefPtr<FontFaceImpl>> fontFaces;
+  {
+    AutoReadLock lock(mLock);
+    fontFaces.SetCapacity(mFontFaces.Length());
+    for (FontFaceImpl* f : mFontFaces) {
+      fontFaces.AppendElement(f);
+    }
+  }
+
+  for (FontFaceImpl* impl : fontFaces) {
+    auto* setImpl = impl->GetPrimaryFontFaceSet();
+    if (setImpl->IsOnOwningThread()) {
+      impl->SetStatus(status);
+    } else {
+      setImpl->DispatchToOwningThread(
+          "FontFaceImpl::Entry::SetLoadState",
+          [self = RefPtr{impl}, status] { self->SetStatus(status); });
+    }
+  }
+}
+
+void FontFaceImpl::Entry::GetUserFontSets(
+    nsTArray<RefPtr<gfxUserFontSet>>& aResult) {
+  AutoReadLock lock(mLock);
+
+  aResult.Clear();
+
+  if (mFontSet) {
+    aResult.AppendElement(mFontSet);
+  }
+
+  for (FontFaceImpl* f : mFontFaces) {
+    if (f->mInFontFaceSet) {
+      aResult.AppendElement(f->mFontFaceSet);
+    }
+    for (FontFaceSetImpl* s : f->mOtherFontFaceSets) {
+      aResult.AppendElement(s);
+    }
+  }
+
+  aResult.Sort();
+  auto it = std::unique(aResult.begin(), aResult.end());
+  aResult.TruncateLength(it - aResult.begin());
+}
+
+ already_AddRefed<gfxUserFontSet>
+FontFaceImpl::Entry::GetUserFontSet() const {
+  AutoReadLock lock(mLock);
+  if (mFontSet) {
+    return do_AddRef(mFontSet);
+  }
+  if (NS_IsMainThread() && mLoadingFontSet) {
+    return do_AddRef(mLoadingFontSet);
+  }
+  return nullptr;
+}
+
+void FontFaceImpl::Entry::CheckUserFontSetLocked() {
+  if (mFontSet) {
+    auto* set = static_cast<FontFaceSetImpl*>(mFontSet);
+    for (FontFaceImpl* f : mFontFaces) {
+      if (f->mFontFaceSet == set || f->mOtherFontFaceSets.Contains(set)) {
+        return;
+      }
+    }
+  }
+
+  if (!mFontFaces.IsEmpty()) {
+    mFontSet = mFontFaces.LastElement()->mFontFaceSet;
+  } else {
+    mFontSet = nullptr;
+  }
+}
+
+void FontFaceImpl::Entry::FindFontFaceOwners(nsTHashSet<FontFace*>& aOwners) {
+  AutoReadLock lock(mLock);
+  for (FontFaceImpl* f : mFontFaces) {
+    if (FontFace* owner = f->GetOwner()) {
+      aOwners.Insert(owner);
+    }
+  }
+}
+
+void FontFaceImpl::Entry::AddFontFace(FontFaceImpl* aFontFace) {
+  AutoWriteLock lock(mLock);
+  mFontFaces.AppendElement(aFontFace);
+  CheckUserFontSetLocked();
+}
+
+void FontFaceImpl::Entry::RemoveFontFace(FontFaceImpl* aFontFace) {
+  AutoWriteLock lock(mLock);
+  mFontFaces.RemoveElement(aFontFace);
+  CheckUserFontSetLocked();
+}
+
+}  

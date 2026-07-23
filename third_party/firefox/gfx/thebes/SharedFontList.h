@@ -1,0 +1,289 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef SharedFontList_h
+#define SharedFontList_h
+
+#include "gfxFontEntry.h"
+#include <atomic>
+
+class gfxCharacterMap;
+struct gfxFontStyle;
+struct GlobalFontMatch;
+
+namespace mozilla {
+namespace fontlist {
+
+class FontList;  
+
+struct Pointer {
+ private:
+  friend class FontList;
+  static const uint32_t kIndexBits = 12u;
+  static const uint32_t kBlockShift = 20u;
+  static_assert(kIndexBits + kBlockShift == 32u, "bad Pointer bit count");
+
+  static const uint32_t kNullValue = 0xffffffffu;
+  static const uint32_t kOffsetMask = (1u << kBlockShift) - 1;
+
+ public:
+  static Pointer Null() { return Pointer(); }
+
+  Pointer() : mBlockAndOffset(kNullValue) {}
+
+  Pointer(uint32_t aBlock, uint32_t aOffset)
+      : mBlockAndOffset((aBlock << kBlockShift) | aOffset) {
+    MOZ_RELEASE_ASSERT(aBlock < (1u << kIndexBits) &&
+                       aOffset < (1u << kBlockShift));
+  }
+
+  Pointer(const Pointer& aOther) {
+    mBlockAndOffset.store(aOther.mBlockAndOffset);
+  }
+
+  Pointer(Pointer&& aOther) { mBlockAndOffset.store(aOther.mBlockAndOffset); }
+
+  bool IsNull() const { return mBlockAndOffset == kNullValue; }
+
+  uint32_t Block() const { return mBlockAndOffset >> kBlockShift; }
+
+  uint32_t Offset() const { return mBlockAndOffset & kOffsetMask; }
+
+  void* ToPtr(FontList* aFontList, size_t aSize) const;
+
+  template <typename T>
+  T* ToPtr(FontList* aFontList) const {
+    return static_cast<T*>(ToPtr(aFontList, sizeof(T)));
+  }
+
+  template <typename T>
+  T* ToArray(FontList* aFontList, size_t aCount) const {
+    return static_cast<T*>(ToPtr(aFontList, sizeof(T) * aCount));
+  }
+
+  Pointer& operator=(const Pointer& aOther) {
+    mBlockAndOffset.store(aOther.mBlockAndOffset);
+    return *this;
+  }
+
+  Pointer& operator=(Pointer&& aOther) {
+    mBlockAndOffset.store(aOther.mBlockAndOffset);
+    return *this;
+  }
+
+  std::atomic<uint32_t> mBlockAndOffset;
+};
+
+struct String {
+  String() : mPointer(Pointer::Null()), mLength(0) {}
+
+  String(FontList* aList, const nsACString& aString)
+      : mPointer(Pointer::Null()) {
+    Assign(aString, aList);
+  }
+
+  const nsCString AsString(FontList* aList) const {
+    MOZ_ASSERT(!mPointer.IsNull());
+    return nsCString(mPointer.ToArray<const char>(aList, mLength), mLength);
+  }
+
+  void Assign(const nsACString& aString, FontList* aList);
+
+  const char* BeginReading(FontList* aList) const {
+    MOZ_ASSERT(!mPointer.IsNull());
+    auto* str = mPointer.ToArray<const char>(aList, mLength);
+    return str ? str : "";
+  }
+
+  uint32_t Length() const { return mLength; }
+
+  bool IsNull() const { return mPointer.IsNull(); }
+
+ private:
+  Pointer mPointer;
+  uint32_t mLength;
+};
+
+struct Face {
+  struct InitData {
+    nsCString mDescriptor;  
+    uint16_t mIndex;        
+#ifdef MOZ_WIDGET_GTK
+    uint16_t mSize;  
+#endif
+    bool mFixedPitch;                  
+    mozilla::WeightRange mWeight;      
+    mozilla::StretchRange mStretch;    
+    mozilla::SlantStyleRange mStyle;   
+    RefPtr<gfxCharacterMap> mCharMap;  
+  };
+
+  Face(FontList* aList, const InitData& aData)
+      : mDescriptor(aList, aData.mDescriptor),
+        mIndex(aData.mIndex),
+#ifdef MOZ_WIDGET_GTK
+        mSize(aData.mSize),
+#endif
+        mFixedPitch(aData.mFixedPitch),
+        mWeight(aData.mWeight),
+        mStretch(aData.mStretch),
+        mStyle(aData.mStyle),
+        mCharacterMap(Pointer::Null()) {
+  }
+
+  bool HasValidDescriptor() const {
+    return !mDescriptor.IsNull() && mIndex != uint16_t(-1);
+  }
+
+  void SetCharacterMap(FontList* aList, gfxCharacterMap* aCharMap,
+                       const Family* aFamily);
+
+  String mDescriptor;
+  uint16_t mIndex;
+#ifdef MOZ_WIDGET_GTK
+  uint16_t mSize;
+#endif
+  bool mFixedPitch;
+  mozilla::WeightRange mWeight;
+  mozilla::StretchRange mStretch;
+  mozilla::SlantStyleRange mStyle;
+  Pointer mCharacterMap;
+};
+
+struct Family {
+  static constexpr uint32_t kNoIndex = uint32_t(-1);
+
+  struct InitData {
+    InitData(const nsACString& aKey,      
+             const nsACString& aName,     
+             uint32_t aIndex = kNoIndex,  
+             FontVisibility aVisibility = FontVisibility::Unknown,
+             bool aBundled = false,       
+             bool aBadUnderline = false,  
+             bool aForceClassic = false,  
+             bool aAltLocale = false      
+             )
+        : mKey(aKey),
+          mName(aName),
+          mIndex(aIndex),
+          mVisibility(aVisibility),
+          mBundled(aBundled),
+          mBadUnderline(aBadUnderline),
+          mForceClassic(aForceClassic),
+          mAltLocale(aAltLocale) {}
+    bool operator<(const InitData& aRHS) const { return mKey < aRHS.mKey; }
+    bool operator==(const InitData& aRHS) const {
+      return mKey == aRHS.mKey && mName == aRHS.mName &&
+             mVisibility == aRHS.mVisibility && mBundled == aRHS.mBundled &&
+             mBadUnderline == aRHS.mBadUnderline;
+    }
+    nsCString mKey;
+    nsCString mName;
+    uint32_t mIndex;
+    FontVisibility mVisibility;
+    bool mBundled;
+    bool mBadUnderline;
+    bool mForceClassic;
+    bool mAltLocale;
+  };
+
+  enum {
+    kRegularFaceIndex = 0,
+    kBoldFaceIndex = 1,
+    kItalicFaceIndex = 2,
+    kBoldItalicFaceIndex = 3,
+    kBoldMask = 0x01,
+    kItalicMask = 0x02
+  };
+
+  Family(FontList* aList, const InitData& aData);
+
+  void AddFaces(FontList* aList, const nsTArray<Face::InitData>& aFaces);
+
+  void SetFacePtrs(FontList* aList, nsTArray<Pointer>& aFaces);
+
+  const String& Key() const { return mKey; }
+
+  const String& DisplayName() const { return mName; }
+
+  uint32_t Index() const { return mIndex; }
+  bool IsBundled() const { return mIsBundled; }
+
+  uint32_t NumFaces() const {
+    MOZ_ASSERT(IsInitialized());
+    return mFaceCount;
+  }
+
+  Pointer* Faces(FontList* aList) const {
+    MOZ_ASSERT(IsInitialized());
+    return mFaces.ToArray<Pointer>(aList, mFaceCount);
+  }
+
+  FontVisibility Visibility() const { return mVisibility; }
+  bool IsHidden() const { return Visibility() == FontVisibility::Hidden; }
+
+  bool IsBadUnderlineFamily() const { return mIsBadUnderlineFamily; }
+  bool IsForceClassic() const { return mIsForceClassic; }
+  bool IsSimple() const { return mIsSimple; }
+  bool IsAltLocaleFamily() const { return mIsAltLocale; }
+
+  bool IsInitialized() const { return !mFaces.IsNull(); }
+
+  bool IsFullyInitialized() const {
+    return IsInitialized() && !mCharacterMap.IsNull();
+  }
+
+  void FindAllFacesForStyle(FontList* aList, const gfxFontStyle& aStyle,
+                            nsTArray<Face*>& aFaceList,
+                            bool aIgnoreSizeTolerance = false) const;
+
+  Face* FindFaceForStyle(FontList* aList, const gfxFontStyle& aStyle,
+                         bool aIgnoreSizeTolerance = false) const;
+
+  void SearchAllFontsForChar(FontList* aList, GlobalFontMatch* aMatchData);
+
+  void SetupFamilyCharMap(FontList* aList);
+
+  mozilla::Maybe<std::pair<uint32_t, bool>> FindIndex(FontList* aList) const;
+
+ private:
+  bool FindAllFacesForStyleInternal(FontList* aList, const gfxFontStyle& aStyle,
+                                    nsTArray<Face*>& aFaceList) const;
+
+  std::atomic<uint32_t> mFaceCount;
+  String mKey;
+  String mName;
+  Pointer mCharacterMap;  
+  Pointer mFaces;         
+  uint32_t mIndex;        
+  FontVisibility mVisibility;
+  bool mIsSimple;  
+  bool mIsBundled : 1;
+  bool mIsBadUnderlineFamily : 1;
+  bool mIsForceClassic : 1;
+  bool mIsAltLocale : 1;
+};
+
+struct LocalFaceRec {
+  struct InitData {
+    nsCString mFamilyName;
+    nsCString mFaceDescriptor;
+    uint32_t mFaceIndex = uint32_t(-1);
+    InitData(const nsACString& aFamily, const nsACString& aFace)
+        : mFamilyName(aFamily), mFaceDescriptor(aFace) {}
+    InitData(const nsACString& aFamily, uint32_t aFaceIndex)
+        : mFamilyName(aFamily), mFaceIndex(aFaceIndex) {}
+    InitData() = default;
+  };
+  String mKey;
+  uint32_t mFamilyIndex;  
+  uint32_t mFaceIndex;    
+};
+
+}  
+}  
+
+#undef ERROR  // This is defined via Windows.h, but conflicts with some bindings
+
+#endif /* SharedFontList_h */

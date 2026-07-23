@@ -1,0 +1,175 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(jit_StructuredSpewer_h)
+#define jit_StructuredSpewer_h
+
+#if defined(JS_STRUCTURED_SPEW)
+
+#  include "mozilla/Attributes.h"
+#  include "mozilla/EnumeratedArray.h"
+#  include "mozilla/Maybe.h"
+#  include "mozilla/Sprintf.h"
+
+#  include "jstypes.h"
+#  include "js/Printer.h"
+#  include "vm/JSONPrinter.h"
+
+#    include <unistd.h>
+
+
+class JS_PUBLIC_API JSScript;
+
+namespace js {
+
+#  define STRUCTURED_CHANNEL_LIST(_) \
+    _(BaselineICStats)               \
+    _(CacheIRHealthReport)
+
+enum class SpewChannel {
+#  define STRUCTURED_CHANNEL(name) name,
+  STRUCTURED_CHANNEL_LIST(STRUCTURED_CHANNEL)
+#  undef STRUCTURED_CHANNEL
+      Count,
+  Disabled
+};
+
+class StructuredSpewFilter {
+  SpewChannel channel_ = SpewChannel::Disabled;
+
+ public:
+  bool isChannelSelected() const {
+    return !(channel_ == SpewChannel::Disabled);
+  }
+
+  bool enabled(SpewChannel x) const { return channel_ == x; }
+
+  bool enableChannel(SpewChannel x) {
+    MOZ_ASSERT(x != SpewChannel::Disabled);
+    if (!isChannelSelected()) {
+      channel_ = x;
+      return true;
+    }
+
+    return false;
+  }
+
+  void disableAllChannels() { channel_ = SpewChannel::Disabled; }
+};
+
+class StructuredSpewer {
+ public:
+  StructuredSpewer()
+      : outputInitializationAttempted_(false),
+        spewingEnabled_(0),
+        json_(mozilla::Nothing()),
+        selectedChannel_() {
+    if (getenv("SPEW")) {
+      parseSpewFlags(getenv("SPEW"));
+    }
+  }
+
+  ~StructuredSpewer() {
+    if (json_.isSome()) {
+      json_->endList();
+      output_.flush();
+      output_.finish();
+      json_.reset();
+    }
+  }
+
+  void enableSpewing() { spewingEnabled_++; }
+
+  void disableSpewing() {
+    MOZ_ASSERT(spewingEnabled_ > 0);
+    spewingEnabled_--;
+  }
+
+  bool enabled(JSScript* script);
+
+  static void spew(JSContext* cx, SpewChannel channel, const char* fmt, ...)
+      MOZ_FORMAT_PRINTF(3, 4);
+
+  bool enabled(JSContext* cx, const JSScript* script,
+               SpewChannel channel) const;
+
+ private:
+  bool outputInitializationAttempted_;
+
+  size_t spewingEnabled_;
+
+  Fprinter output_;
+  mozilla::Maybe<JSONPrinter> json_;
+
+  StructuredSpewFilter selectedChannel_;
+
+  using NameArray = mozilla::EnumeratedArray<SpewChannel, const char*,
+                                             size_t(SpewChannel::Count)>;
+  static NameArray const names_;
+
+  static const char* getName(SpewChannel channel) { return names_[channel]; }
+
+  bool ensureInitializationAttempted();
+
+  void tryToInitializeOutput(const char* path);
+
+  void parseSpewFlags(const char* flags);
+
+  bool enabled(SpewChannel channel) {
+    return (spewingEnabled_ > 0 && selectedChannel_.enabled(channel));
+  }
+
+  void startObject(JSContext* cx, const JSScript* script, SpewChannel channel);
+
+  friend class AutoSpewChannel;
+  friend class AutoStructuredSpewer;
+};
+
+class MOZ_RAII AutoStructuredSpewer {
+  mozilla::Maybe<JSONPrinter*> printer_;
+
+ public:
+  explicit AutoStructuredSpewer(JSContext* cx, SpewChannel channel,
+                                JSScript* script);
+
+  ~AutoStructuredSpewer() {
+    if (printer_.isSome()) {
+      printer_.ref()->endObject();
+    }
+  }
+
+  AutoStructuredSpewer(const AutoStructuredSpewer&) = delete;
+  void operator=(AutoStructuredSpewer&) = delete;
+
+  explicit operator bool() const { return printer_.isSome(); }
+
+  JSONPrinter* operator->() {
+    MOZ_ASSERT(printer_.isSome());
+    return printer_.ref();
+  }
+
+  JSONPrinter& operator*() {
+    MOZ_ASSERT(printer_.isSome());
+    return *printer_.ref();
+  }
+};
+
+class MOZ_RAII AutoSpewChannel {
+  JSContext* cx_;
+  bool wasChannelAutoSet = false;
+
+ public:
+  explicit AutoSpewChannel(JSContext* cx, SpewChannel channel,
+                           JSScript* script);
+
+  ~AutoSpewChannel();
+
+  AutoSpewChannel(const AutoSpewChannel&) = delete;
+  void operator=(AutoSpewChannel&) = delete;
+};
+
+}  
+
+#endif
+#endif

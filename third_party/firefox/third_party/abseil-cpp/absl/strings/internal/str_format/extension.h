@@ -1,0 +1,408 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#ifndef ABSL_STRINGS_INTERNAL_STR_FORMAT_EXTENSION_H_
+#define ABSL_STRINGS_INTERNAL_STR_FORMAT_EXTENSION_H_
+
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <ostream>
+#include <string>
+
+#include "absl/base/config.h"
+#include "absl/strings/internal/str_format/output.h"
+#include "absl/strings/string_view.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+enum class FormatConversionChar : uint8_t;
+enum class FormatConversionCharSet : uint64_t;
+enum class LengthMod : std::uint8_t { h, hh, l, ll, L, j, z, t, q, none };
+
+namespace str_format_internal {
+
+class FormatRawSinkImpl {
+ public:
+  template <typename T, decltype(str_format_internal::InvokeFlush(
+                            std::declval<T*>(), string_view()))* = nullptr>
+  FormatRawSinkImpl(T* raw)  // NOLINT
+      : sink_(raw), write_(&FormatRawSinkImpl::Flush<T>) {}
+
+  void Write(string_view s) { write_(sink_, s); }
+
+  template <typename T>
+  static FormatRawSinkImpl Extract(T s) {
+    return s.sink_;
+  }
+
+ private:
+  template <typename T>
+  static void Flush(void* r, string_view s) {
+    str_format_internal::InvokeFlush(static_cast<T*>(r), s);
+  }
+
+  void* sink_;
+  void (*write_)(void*, string_view);
+};
+
+class FormatSinkImpl {
+ public:
+  explicit FormatSinkImpl(FormatRawSinkImpl raw) : raw_(raw) {}
+
+  ~FormatSinkImpl() { Flush(); }
+
+  void Flush() {
+    raw_.Write(string_view(buf_, static_cast<size_t>(pos_ - buf_)));
+    pos_ = buf_;
+  }
+
+  void Append(size_t n, char c) {
+    if (n == 0) return;
+    size_ += n;
+    auto raw_append = [&](size_t count) {
+      memset(pos_, c, count);
+      pos_ += count;
+    };
+    while (n > Avail()) {
+      n -= Avail();
+      if (Avail() > 0) {
+        raw_append(Avail());
+      }
+      Flush();
+    }
+    raw_append(n);
+  }
+
+  void Append(string_view v) {
+    size_t n = v.size();
+    if (n == 0) return;
+    size_ += n;
+    if (n >= Avail()) {
+      Flush();
+      raw_.Write(v);
+      return;
+    }
+    memcpy(pos_, v.data(), n);
+    pos_ += n;
+  }
+
+  size_t size() const { return size_; }
+
+  bool PutPaddedString(string_view v, int width, int precision, bool left);
+
+  template <typename T>
+  T Wrap() {
+    return T(this);
+  }
+
+  template <typename T>
+  static FormatSinkImpl* Extract(T* s) {
+    return s->sink_;
+  }
+
+ private:
+  size_t Avail() const {
+    return static_cast<size_t>(buf_ + sizeof(buf_) - pos_);
+  }
+
+  FormatRawSinkImpl raw_;
+  size_t size_ = 0;
+  char* pos_ = buf_;
+  char buf_[1024];
+};
+
+enum class Flags : uint8_t {
+  kBasic = 0,
+  kLeft = 1 << 0,
+  kShowPos = 1 << 1,
+  kSignCol = 1 << 2,
+  kAlt = 1 << 3,
+  kZero = 1 << 4,
+  kNonBasic = 1 << 5,
+};
+
+constexpr Flags operator|(Flags a, Flags b) {
+  return static_cast<Flags>(static_cast<uint8_t>(a) | static_cast<uint8_t>(b));
+}
+
+constexpr bool FlagsContains(Flags haystack, Flags needle) {
+  return (static_cast<uint8_t>(haystack) & static_cast<uint8_t>(needle)) ==
+         static_cast<uint8_t>(needle);
+}
+
+std::string FlagsToString(Flags v);
+
+inline std::ostream& operator<<(std::ostream& os, Flags v) {
+  return os << FlagsToString(v);
+}
+
+// clang-format off
+#define ABSL_INTERNAL_CONVERSION_CHARS_EXPAND_(X_VAL, X_SEP) \
+   \
+  X_VAL(c) X_SEP X_VAL(s) X_SEP \
+   \
+  X_VAL(d) X_SEP X_VAL(i) X_SEP X_VAL(o) X_SEP \
+  X_VAL(u) X_SEP X_VAL(x) X_SEP X_VAL(X) X_SEP \
+   \
+  X_VAL(f) X_SEP X_VAL(F) X_SEP X_VAL(e) X_SEP X_VAL(E) X_SEP \
+  X_VAL(g) X_SEP X_VAL(G) X_SEP X_VAL(a) X_SEP X_VAL(A) X_SEP \
+   \
+  X_VAL(n) X_SEP X_VAL(p) X_SEP X_VAL(v)
+// clang-format on
+
+struct FormatConversionCharInternal {
+  FormatConversionCharInternal() = delete;
+
+ private:
+  // clang-format off
+  enum class Enum : uint8_t {
+    c, s,                    
+    d, i, o, u, x, X,        
+    f, F, e, E, g, G, a, A,  
+    n, p, v,                    
+    kNone
+  };
+  // clang-format on
+ public:
+#define ABSL_INTERNAL_X_VAL(id)              \
+  static constexpr FormatConversionChar id = \
+      static_cast<FormatConversionChar>(Enum::id);
+  ABSL_INTERNAL_CONVERSION_CHARS_EXPAND_(ABSL_INTERNAL_X_VAL, )
+#undef ABSL_INTERNAL_X_VAL
+  static constexpr FormatConversionChar kNone =
+      static_cast<FormatConversionChar>(Enum::kNone);
+};
+// clang-format on
+
+inline FormatConversionChar FormatConversionCharFromChar(char c) {
+  switch (c) {
+#define ABSL_INTERNAL_X_VAL(id) \
+  case #id[0]:                  \
+    return FormatConversionCharInternal::id;
+    ABSL_INTERNAL_CONVERSION_CHARS_EXPAND_(ABSL_INTERNAL_X_VAL, )
+#undef ABSL_INTERNAL_X_VAL
+  }
+  return FormatConversionCharInternal::kNone;
+}
+
+inline bool FormatConversionCharIsUpper(FormatConversionChar c) {
+  if (c == FormatConversionCharInternal::X ||
+      c == FormatConversionCharInternal::F ||
+      c == FormatConversionCharInternal::E ||
+      c == FormatConversionCharInternal::G ||
+      c == FormatConversionCharInternal::A) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+inline bool FormatConversionCharIsFloat(FormatConversionChar c) {
+  if (c == FormatConversionCharInternal::a ||
+      c == FormatConversionCharInternal::e ||
+      c == FormatConversionCharInternal::f ||
+      c == FormatConversionCharInternal::g ||
+      c == FormatConversionCharInternal::A ||
+      c == FormatConversionCharInternal::E ||
+      c == FormatConversionCharInternal::F ||
+      c == FormatConversionCharInternal::G) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+inline char FormatConversionCharToChar(FormatConversionChar c) {
+  if (c == FormatConversionCharInternal::kNone) {
+    return '\0';
+
+#define ABSL_INTERNAL_X_VAL(e)                       \
+  } else if (c == FormatConversionCharInternal::e) { \
+    return #e[0];
+#define ABSL_INTERNAL_X_SEP
+  ABSL_INTERNAL_CONVERSION_CHARS_EXPAND_(ABSL_INTERNAL_X_VAL,
+                                         ABSL_INTERNAL_X_SEP)
+  } else {
+    return '\0';
+  }
+
+#undef ABSL_INTERNAL_X_VAL
+#undef ABSL_INTERNAL_X_SEP
+}
+
+inline std::ostream& operator<<(std::ostream& os, FormatConversionChar v) {
+  char c = FormatConversionCharToChar(v);
+  if (!c) c = '?';
+  return os << c;
+}
+
+struct FormatConversionSpecImplFriend;
+
+class FormatConversionSpecImpl {
+ public:
+  bool is_basic() const { return flags_ == Flags::kBasic; }
+  bool has_left_flag() const { return FlagsContains(flags_, Flags::kLeft); }
+  bool has_show_pos_flag() const {
+    return FlagsContains(flags_, Flags::kShowPos);
+  }
+  bool has_sign_col_flag() const {
+    return FlagsContains(flags_, Flags::kSignCol);
+  }
+  bool has_alt_flag() const { return FlagsContains(flags_, Flags::kAlt); }
+  bool has_zero_flag() const { return FlagsContains(flags_, Flags::kZero); }
+
+  LengthMod length_mod() const { return length_mod_; }
+
+  FormatConversionChar conversion_char() const {
+    static_assert(offsetof(FormatConversionSpecImpl, conv_) == 0, "");
+    return conv_;
+  }
+
+  void set_conversion_char(FormatConversionChar c) { conv_ = c; }
+
+  int width() const { return width_; }
+  int precision() const { return precision_; }
+
+  template <typename T>
+  T Wrap() {
+    return T(*this);
+  }
+
+ private:
+  friend struct str_format_internal::FormatConversionSpecImplFriend;
+  FormatConversionChar conv_ = FormatConversionCharInternal::kNone;
+  Flags flags_;
+  LengthMod length_mod_ = LengthMod::none;
+  int width_;
+  int precision_;
+};
+
+struct FormatConversionSpecImplFriend final {
+  static void SetFlags(Flags f, FormatConversionSpecImpl* conv) {
+    conv->flags_ = f;
+  }
+  static void SetLengthMod(LengthMod l, FormatConversionSpecImpl* conv) {
+    conv->length_mod_ = l;
+  }
+  static void SetConversionChar(FormatConversionChar c,
+                                FormatConversionSpecImpl* conv) {
+    conv->conv_ = c;
+  }
+  static void SetWidth(int w, FormatConversionSpecImpl* conv) {
+    conv->width_ = w;
+  }
+  static void SetPrecision(int p, FormatConversionSpecImpl* conv) {
+    conv->precision_ = p;
+  }
+  static std::string FlagsToString(const FormatConversionSpecImpl& spec) {
+    return str_format_internal::FlagsToString(spec.flags_);
+  }
+};
+
+constexpr FormatConversionCharSet FormatConversionCharSetUnion(
+    FormatConversionCharSet a) {
+  return a;
+}
+
+template <typename... CharSet>
+constexpr FormatConversionCharSet FormatConversionCharSetUnion(
+    FormatConversionCharSet a, CharSet... rest) {
+  return static_cast<FormatConversionCharSet>(
+      static_cast<uint64_t>(a) |
+      static_cast<uint64_t>(FormatConversionCharSetUnion(rest...)));
+}
+
+constexpr uint64_t FormatConversionCharToConvInt(FormatConversionChar c) {
+  return uint64_t{1} << (1 + static_cast<uint8_t>(c));
+}
+
+constexpr uint64_t FormatConversionCharToConvInt(char conv) {
+  return
+#define ABSL_INTERNAL_CHAR_SET_CASE(c)                                 \
+  conv == #c[0]                                                        \
+      ? FormatConversionCharToConvInt(FormatConversionCharInternal::c) \
+      :
+      ABSL_INTERNAL_CONVERSION_CHARS_EXPAND_(ABSL_INTERNAL_CHAR_SET_CASE, )
+#undef ABSL_INTERNAL_CHAR_SET_CASE
+                  conv == '*'
+          ? 1
+          : 0;
+}
+
+constexpr FormatConversionCharSet FormatConversionCharToConvValue(char conv) {
+  return static_cast<FormatConversionCharSet>(
+      FormatConversionCharToConvInt(conv));
+}
+
+struct FormatConversionCharSetInternal {
+#define ABSL_INTERNAL_CHAR_SET_CASE(c)         \
+  static constexpr FormatConversionCharSet c = \
+      FormatConversionCharToConvValue(#c[0]);
+  ABSL_INTERNAL_CONVERSION_CHARS_EXPAND_(ABSL_INTERNAL_CHAR_SET_CASE, )
+#undef ABSL_INTERNAL_CHAR_SET_CASE
+
+  static constexpr FormatConversionCharSet kStar =
+      FormatConversionCharToConvValue('*');
+
+  static constexpr FormatConversionCharSet kIntegral =
+      FormatConversionCharSetUnion(d, i, u, o, x, X);
+  static constexpr FormatConversionCharSet kFloating =
+      FormatConversionCharSetUnion(a, e, f, g, A, E, F, G);
+  static constexpr FormatConversionCharSet kNumeric =
+      FormatConversionCharSetUnion(kIntegral, kFloating);
+  static constexpr FormatConversionCharSet kPointer = p;
+};
+
+constexpr FormatConversionCharSet operator|(FormatConversionCharSet a,
+                                            FormatConversionCharSet b) {
+  return FormatConversionCharSetUnion(a, b);
+}
+
+constexpr FormatConversionCharSet ToFormatConversionCharSet(char c) {
+  return static_cast<FormatConversionCharSet>(
+      FormatConversionCharToConvValue(c));
+}
+
+constexpr FormatConversionCharSet ToFormatConversionCharSet(
+    FormatConversionCharSet c) {
+  return c;
+}
+
+template <typename T>
+void ToFormatConversionCharSet(T) = delete;
+
+constexpr bool Contains(FormatConversionCharSet set, char c) {
+  return (static_cast<uint64_t>(set) &
+          static_cast<uint64_t>(FormatConversionCharToConvValue(c))) != 0;
+}
+
+constexpr bool Contains(FormatConversionCharSet set,
+                        FormatConversionCharSet c) {
+  return (static_cast<uint64_t>(set) & static_cast<uint64_t>(c)) ==
+         static_cast<uint64_t>(c);
+}
+
+constexpr bool Contains(FormatConversionCharSet set, FormatConversionChar c) {
+  return (static_cast<uint64_t>(set) & FormatConversionCharToConvInt(c)) != 0;
+}
+
+inline size_t Excess(size_t used, size_t capacity) {
+  return used < capacity ? capacity - used : 0;
+}
+
+}  
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_STRINGS_INTERNAL_STR_FORMAT_EXTENSION_H_

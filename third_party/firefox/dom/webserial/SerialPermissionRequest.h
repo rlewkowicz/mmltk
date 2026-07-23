@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_SerialPermissionRequest_h
+#define mozilla_dom_SerialPermissionRequest_h
+
+#include "mozilla/MozPromise.h"
+#include "mozilla/dom/SerialPortIPCTypes.h"
+#include "mozilla/dom/SerialTypes.h"
+#include "nsCOMPtr.h"
+#include "nsIContentPermissionPrompt.h"
+#include "nsITimer.h"
+
+class nsIPrincipal;
+
+namespace mozilla::dom {
+
+class Element;
+class WindowGlobalParent;
+
+using SerialChooserPromise =
+    MozPromise<IPCSerialPortInfo, RequestPortReason,  true>;
+
+class SerialPermissionRequest final : public nsIContentPermissionRequest {
+ public:
+  SerialPermissionRequest(WindowGlobalParent* aWindowGlobalParent,
+                          nsTArray<IPCSerialPortInfo>&& aPorts);
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSICONTENTPERMISSIONREQUEST
+
+  RefPtr<SerialChooserPromise> Run();
+
+ private:
+  ~SerialPermissionRequest();
+
+  nsIPrincipal* Principal() const;
+  bool IsSitePermAllow() const;
+  bool IsSitePermDeny() const;
+  bool ShouldShowAddonGate() const;
+  void CancelWithRandomizedDelay(RequestPortReason aReason);
+  nsresult DoPrompt();
+  void ResolveWithPort(const IPCSerialPortInfo& aPort);
+  void ResolveCancelled(RequestPortReason aReason);
+
+  RefPtr<WindowGlobalParent> mWindowGlobalParent;
+  nsTArray<IPCSerialPortInfo> mPorts;
+  MozPromiseHolder<SerialChooserPromise> mPromiseHolder;
+  nsCOMPtr<nsITimer> mCancelTimer;
+};
+
+}  
+
+#endif  // mozilla_dom_SerialPermissionRequest_h

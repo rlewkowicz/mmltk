@@ -1,0 +1,282 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MessagePump.h"
+
+#include "nsIThread.h"
+#include "nsITimer.h"
+#include "nsICancelableRunnable.h"
+
+#include "base/basictypes.h"
+#include "base/logging.h"
+#include "base/scoped_nsautorelease_pool.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/DebugOnly.h"
+#include "nsComponentManagerUtils.h"
+#include "nsDebug.h"
+#include "nsServiceManagerUtils.h"
+#include "nsString.h"
+#include "nsThreadUtils.h"
+#include "nsTimerImpl.h"
+#include "nsXULAppAPI.h"
+#include "prthread.h"
+
+using base::TimeTicks;
+using namespace mozilla::ipc;
+
+#ifdef DEBUG
+static MessagePump::Delegate* gFirstDelegate;
+#endif
+
+namespace mozilla {
+namespace ipc {
+
+class DoWorkRunnable final : public CancelableRunnable,
+                             public nsITimerCallback {
+ public:
+  explicit DoWorkRunnable(MessagePump* aPump)
+      : CancelableRunnable("ipc::DoWorkRunnable"), mPump(aPump) {
+    MOZ_ASSERT(aPump);
+  }
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIRUNNABLE
+  NS_DECL_NSITIMERCALLBACK
+  nsresult Cancel() override;
+
+ private:
+  ~DoWorkRunnable() = default;
+
+  MessagePump* mPump;
+};
+
+} 
+} 
+
+MessagePump::MessagePump(nsISerialEventTarget* aEventTarget)
+    : mEventTarget(aEventTarget) {
+  mDoWorkEvent = new DoWorkRunnable(this);
+}
+
+MessagePump::~MessagePump() = default;
+
+void MessagePump::Run(MessagePump::Delegate* aDelegate) {
+  MOZ_ASSERT(keep_running_);
+  MOZ_RELEASE_ASSERT(NS_IsMainThread(),
+                     "Use mozilla::ipc::MessagePumpForNonMainThreads instead!");
+  MOZ_RELEASE_ASSERT(!mEventTarget);
+
+  nsIThread* thisThread = NS_GetCurrentThread();
+  MOZ_ASSERT(thisThread);
+
+  mDelayedWorkTimer = NS_NewTimer();
+  MOZ_ASSERT(mDelayedWorkTimer);
+
+  base::ScopedNSAutoreleasePool autoReleasePool;
+
+  for (;;) {
+    autoReleasePool.Recycle();
+
+    bool did_work = NS_ProcessNextEvent(thisThread, false) ? true : false;
+    if (!keep_running_) break;
+
+
+    did_work |= aDelegate->DoDelayedWork(&delayed_work_time_);
+
+    if (did_work && delayed_work_time_.is_null()) mDelayedWorkTimer->Cancel();
+
+    if (!keep_running_) break;
+
+    if (did_work) continue;
+
+    did_work = aDelegate->DoIdleWork();
+    if (!keep_running_) break;
+
+    if (did_work) continue;
+
+    NS_ProcessNextEvent(thisThread, true);
+  }
+
+  mDelayedWorkTimer->Cancel();
+
+  keep_running_ = true;
+}
+
+void MessagePump::ScheduleWork() {
+  if (mEventTarget) {
+    mEventTarget->Dispatch(mDoWorkEvent, NS_DISPATCH_NORMAL);
+  } else {
+    NS_DispatchToMainThread(mDoWorkEvent);
+  }
+  event_.Signal();
+}
+
+void MessagePump::ScheduleWorkForNestedLoop() {
+}
+
+void MessagePump::ScheduleDelayedWork(const base::TimeTicks& aDelayedTime) {
+  MOZ_RELEASE_ASSERT((!mEventTarget && NS_IsMainThread()) ||
+                     mEventTarget->IsOnCurrentThread());
+
+  if (!mDelayedWorkTimer) {
+    mDelayedWorkTimer = NS_NewTimer();
+    if (!mDelayedWorkTimer) {
+      NS_WARNING("Delayed task might not run!");
+      delayed_work_time_ = aDelayedTime;
+      return;
+    }
+  }
+
+  if (!delayed_work_time_.is_null()) {
+    mDelayedWorkTimer->Cancel();
+  }
+
+  delayed_work_time_ = aDelayedTime;
+
+  base::TimeDelta delay;
+  if (aDelayedTime > base::TimeTicks::Now())
+    delay = aDelayedTime - base::TimeTicks::Now();
+
+  uint32_t delayMS = uint32_t(delay.InMilliseconds());
+  mDelayedWorkTimer->InitWithCallback(mDoWorkEvent, delayMS,
+                                      nsITimer::TYPE_ONE_SHOT);
+}
+
+nsISerialEventTarget* MessagePump::GetXPCOMThread() {
+  if (mEventTarget) {
+    return mEventTarget;
+  }
+
+  return GetMainThreadSerialEventTarget();
+}
+
+void MessagePump::DoDelayedWork(base::MessagePump::Delegate* aDelegate) {
+  aDelegate->DoDelayedWork(&delayed_work_time_);
+  if (!delayed_work_time_.is_null()) {
+    ScheduleDelayedWork(delayed_work_time_);
+  }
+}
+
+NS_IMPL_ISUPPORTS_INHERITED(DoWorkRunnable, CancelableRunnable,
+                            nsITimerCallback)
+
+NS_IMETHODIMP
+DoWorkRunnable::Run() {
+  MessageLoop* loop = MessageLoop::current();
+  MOZ_ASSERT(loop);
+
+  bool nestableTasksAllowed = loop->NestableTasksAllowed();
+
+  loop->SetNestableTasksAllowed(true);
+  loop->DoWork();
+  loop->SetNestableTasksAllowed(nestableTasksAllowed);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+DoWorkRunnable::Notify(nsITimer* aTimer) {
+  MessageLoop* loop = MessageLoop::current();
+  MOZ_ASSERT(loop);
+
+  bool nestableTasksAllowed = loop->NestableTasksAllowed();
+  loop->SetNestableTasksAllowed(true);
+  mPump->DoDelayedWork(loop);
+  loop->SetNestableTasksAllowed(nestableTasksAllowed);
+
+  return NS_OK;
+}
+
+nsresult DoWorkRunnable::Cancel() {
+  MOZ_ALWAYS_SUCCEEDS(Run());
+  return NS_OK;
+}
+
+void MessagePumpForChildProcess::Run(base::MessagePump::Delegate* aDelegate) {
+  if (mFirstRun) {
+    MOZ_ASSERT(aDelegate && !gFirstDelegate);
+#ifdef DEBUG
+    gFirstDelegate = aDelegate;
+#endif
+
+    mFirstRun = false;
+    if (NS_FAILED(XRE_RunAppShell())) {
+      NS_WARNING("Failed to run app shell?!");
+    }
+
+    MOZ_ASSERT(aDelegate && aDelegate == gFirstDelegate);
+#ifdef DEBUG
+    gFirstDelegate = nullptr;
+#endif
+
+    return;
+  }
+
+  MOZ_ASSERT(aDelegate && aDelegate == gFirstDelegate);
+
+  MessageLoop* loop = MessageLoop::current();
+  bool nestableTasksAllowed = loop->NestableTasksAllowed();
+  loop->SetNestableTasksAllowed(true);
+
+  while (aDelegate->DoWork());
+
+  loop->SetNestableTasksAllowed(nestableTasksAllowed);
+
+  mozilla::ipc::MessagePump::Run(aDelegate);
+}
+
+void MessagePumpForNonMainThreads::Run(base::MessagePump::Delegate* aDelegate) {
+  MOZ_ASSERT(keep_running_);
+  MOZ_RELEASE_ASSERT(!NS_IsMainThread(),
+                     "Use mozilla::ipc::MessagePump instead!");
+
+  nsIThread* thread = NS_GetCurrentThread();
+  MOZ_RELEASE_ASSERT(mEventTarget->IsOnCurrentThread());
+
+  mDelayedWorkTimer = NS_NewTimer(mEventTarget);
+  MOZ_ASSERT(mDelayedWorkTimer);
+
+  while (aDelegate->DoWork()) {
+  }
+
+  base::ScopedNSAutoreleasePool autoReleasePool;
+  for (;;) {
+    autoReleasePool.Recycle();
+
+    bool didWork = NS_ProcessNextEvent(thread, false) ? true : false;
+    if (!keep_running_) {
+      break;
+    }
+
+    didWork |= aDelegate->DoDelayedWork(&delayed_work_time_);
+
+    if (didWork && delayed_work_time_.is_null()) {
+      mDelayedWorkTimer->Cancel();
+    }
+
+    if (!keep_running_) {
+      break;
+    }
+
+    if (didWork) {
+      continue;
+    }
+
+    DebugOnly<bool> didIdleWork = aDelegate->DoIdleWork();
+    MOZ_ASSERT(!didIdleWork);
+    if (!keep_running_) {
+      break;
+    }
+
+    if (didWork) {
+      continue;
+    }
+
+    NS_ProcessNextEvent(thread, true);
+  }
+
+  mDelayedWorkTimer->Cancel();
+
+  keep_running_ = true;
+}

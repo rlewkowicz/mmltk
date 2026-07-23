@@ -1,0 +1,121 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GMPServiceChild_h_
+#define GMPServiceChild_h_
+
+#include "GMPService.h"
+#include "MediaResult.h"
+#include "base/process.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/dom/PContent.h"
+#include "mozilla/gmp/PGMPServiceChild.h"
+#include "mozilla/media/MediaUtils.h"
+#include "nsRefPtrHashtable.h"
+
+namespace mozilla::gmp {
+
+class GMPContentParent;
+class GMPContentParentCloseBlocker;
+class GMPServiceChild;
+
+class GeckoMediaPluginServiceChild : public GeckoMediaPluginService {
+  friend class GMPServiceChild;
+
+ public:
+  static already_AddRefed<GeckoMediaPluginServiceChild> GetSingleton();
+  nsresult Init() override;
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+  NS_IMETHOD HasPluginForAPI(const nsACString& aAPI,
+                             const nsTArray<nsCString>& aTags,
+                             bool* aRetVal) override;
+  NS_IMETHOD FindPluginDirectoryForAPI(const nsACString& aAPI,
+                                       const nsTArray<nsCString>& aTags,
+                                       nsIFile** aDirectory) override;
+  NS_IMETHOD GetNodeId(const nsAString& aOrigin,
+                       const nsAString& aTopLevelOrigin,
+                       const nsAString& aGMPName,
+                       UniquePtr<GetNodeIdCallback>&& aCallback) override;
+
+  NS_DECL_NSIOBSERVER
+
+  void SetServiceChild(RefPtr<GMPServiceChild>&& aServiceChild);
+
+  void RemoveGMPContentParent(GMPContentParent* aGMPContentParent);
+
+  static void UpdateGMPCapabilities(
+      nsTArray<mozilla::dom::GMPCapabilityData>&& aCapabilities);
+
+  void BeginShutdown();
+
+ protected:
+  void InitializePlugins(nsISerialEventTarget*) override {
+  }
+
+  RefPtr<GetGMPContentParentPromise> GetContentParent(
+      const NodeIdVariant& aNodeIdVariant, const nsACString& aAPI,
+      const nsTArray<nsCString>& aTags) override;
+
+ private:
+  friend class OpenPGMPServiceChild;
+
+  ~GeckoMediaPluginServiceChild() override;
+
+  typedef MozPromise<GMPServiceChild*, MediaResult,  true>
+      GetServiceChildPromise;
+  RefPtr<GetServiceChildPromise> GetServiceChild();
+
+  nsTArray<MozPromiseHolder<GetServiceChildPromise>> mGetServiceChildPromises;
+  RefPtr<GMPServiceChild> mServiceChild;
+
+
+
+
+  nsresult AddShutdownBlocker();
+  void RemoveShutdownBlocker();
+  void RemoveShutdownBlockerIfNeeded();
+
+  UniquePtr<media::ShutdownBlockingTicket> mShutdownBlocker;
+  uint32_t mPendingGetContentParents = 0;
+};
+
+class GMPServiceChild : public PGMPServiceChild {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(GMPServiceChild, final)
+
+  explicit GMPServiceChild(GeckoMediaPluginServiceChild* aService)
+      : mService(aService) {}
+
+  already_AddRefed<GMPContentParent> GetBridgedGMPContentParent(
+      ProcessId aOtherPid, ipc::Endpoint<PGMPContentParent>&& endpoint);
+
+  void RemoveGMPContentParent(GMPContentParent* aGMPContentParent);
+
+  bool HasAlreadyBridgedTo(base::ProcessId aPid) const;
+
+  void GetAndBlockAlreadyBridgedTo(
+      nsTArray<ProcessId>& aAlreadyBridgedTo,
+      nsTArray<RefPtr<GMPContentParentCloseBlocker>>& aBlockers);
+
+  static bool Create(Endpoint<PGMPServiceChild>&& aGMPService);
+
+  ipc::IPCResult RecvBeginShutdown() override;
+
+  bool HaveContentParents() const;
+
+  GeckoMediaPluginServiceChild* Service() const { return mService; }
+
+ private:
+  ~GMPServiceChild() = default;
+
+  nsRefPtrHashtable<nsUint64HashKey, GMPContentParent> mContentParents;
+
+  GeckoMediaPluginServiceChild* const mService;
+};
+
+}  
+
+#endif  // GMPServiceChild_h_

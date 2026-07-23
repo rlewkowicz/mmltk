@@ -1,0 +1,172 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_DEVICEINPUTTRACK_H_
+#define DOM_MEDIA_DEVICEINPUTTRACK_H_
+
+#include <thread>
+
+#include "AudioDriftCorrection.h"
+#include "AudioInputSource.h"
+#include "AudioSegment.h"
+#include "GraphDriver.h"
+#include "MediaTrackGraph.h"
+#include "mozilla/NotNull.h"
+
+namespace mozilla {
+
+class NativeInputTrack;
+class NonNativeInputTrack;
+
+class DeviceInputConsumerTrack : public ProcessedMediaTrack {
+ public:
+  explicit DeviceInputConsumerTrack(TrackRate aSampleRate);
+
+  void ConnectDeviceInput(CubebUtils::AudioDeviceID aId,
+                          AudioDataListener* aListener,
+                          const PrincipalHandle& aPrincipal);
+  void DisconnectDeviceInput();
+  Maybe<CubebUtils::AudioDeviceID> DeviceId() const;
+  NotNull<AudioDataListener*> GetAudioDataListener() const;
+  bool ConnectedToNativeDevice() const;
+  bool ConnectedToNonNativeDevice() const;
+
+  DeviceInputConsumerTrack* AsDeviceInputConsumerTrack() override {
+    return this;
+  }
+
+  DeviceInputTrack* GetDeviceInputTrackGraphThread() const;
+
+ protected:
+  void GetInputSourceData(AudioSegment& aOutput, GraphTime aFrom,
+                          GraphTime aTo) const;
+
+  RefPtr<MediaInputPort> mPort;
+  RefPtr<DeviceInputTrack> mDeviceInputTrack;
+  RefPtr<AudioDataListener> mListener;
+  Maybe<CubebUtils::AudioDeviceID> mDeviceId;
+};
+
+class DeviceInputTrack : public ProcessedMediaTrack {
+ public:
+  static NotNull<RefPtr<DeviceInputTrack>> OpenAudio(
+      MediaTrackGraph* aGraph, CubebUtils::AudioDeviceID aDeviceId,
+      const PrincipalHandle& aPrincipalHandle,
+      DeviceInputConsumerTrack* aConsumer);
+  static void CloseAudio(already_AddRefed<DeviceInputTrack> aTrack,
+                         DeviceInputConsumerTrack* aConsumer);
+
+  const nsTArray<RefPtr<DeviceInputConsumerTrack>>& GetConsumerTracks() const;
+
+  uint32_t MaxRequestedInputChannels() const;
+  bool HasVoiceInput() const;
+  [[nodiscard]] AudioInputProcessingParamsRequest
+  UpdateRequestedProcessingParams();
+  void NotifySetRequestedProcessingParams(
+      MediaTrackGraph* aGraph, int aGeneration,
+      cubeb_input_processing_params aRequestedParams);
+  void NotifySetRequestedProcessingParamsResult(
+      MediaTrackGraph* aGraph, int aGeneration,
+      const Result<cubeb_input_processing_params, int>& aResult);
+  void DeviceChanged(MediaTrackGraph* aGraph) const;
+
+  DeviceInputTrack* AsDeviceInputTrack() override { return this; }
+  virtual NativeInputTrack* AsNativeInputTrack() { return nullptr; }
+  virtual NonNativeInputTrack* AsNonNativeInputTrack() { return nullptr; }
+
+  const CubebUtils::AudioDeviceID mDeviceId;
+  const PrincipalHandle mPrincipalHandle;
+
+ protected:
+  DeviceInputTrack(TrackRate aSampleRate, CubebUtils::AudioDeviceID aDeviceId,
+                   const PrincipalHandle& aPrincipalHandle);
+  ~DeviceInputTrack() = default;
+
+ private:
+  void ReevaluateInputDevice();
+  void AddDataListener(AudioDataListener* aListener);
+  void RemoveDataListener(AudioDataListener* aListener);
+
+  nsTArray<RefPtr<DeviceInputConsumerTrack>> mConsumerTracks;
+
+  nsTArray<RefPtr<AudioDataListener>> mListeners;
+  AudioInputProcessingParamsRequest mProcessingParamsRequest;
+};
+
+class NativeInputTrack final : public DeviceInputTrack {
+ public:
+  NativeInputTrack(TrackRate aSampleRate, CubebUtils::AudioDeviceID aDeviceId,
+                   const PrincipalHandle& aPrincipalHandle);
+
+  void DestroyImpl() override;
+  void ProcessInput(GraphTime aFrom, GraphTime aTo, uint32_t aFlags) override;
+  uint32_t NumberOfChannels() const override;
+
+  void NotifyInputStopped(MediaTrackGraph* aGraph);
+  void NotifyInputData(MediaTrackGraph* aGraph, const AudioDataValue* aBuffer,
+                       size_t aFrames, TrackRate aRate, uint32_t aChannels,
+                       uint32_t aAlreadyBuffered);
+
+  NativeInputTrack* AsNativeInputTrack() override { return this; }
+
+ private:
+  ~NativeInputTrack() = default;
+
+  bool mIsBufferingAppended = false;
+  AudioSegment mPendingData;
+  uint32_t mInputChannels = 0;
+};
+
+class NonNativeInputTrack final : public DeviceInputTrack {
+ public:
+  NonNativeInputTrack(TrackRate aSampleRate,
+                      CubebUtils::AudioDeviceID aDeviceId,
+                      const PrincipalHandle& aPrincipalHandle);
+
+  void DestroyImpl() override;
+  void ProcessInput(GraphTime aFrom, GraphTime aTo, uint32_t aFlags) override;
+  uint32_t NumberOfChannels() const override;
+
+  NonNativeInputTrack* AsNonNativeInputTrack() override { return this; }
+
+  void StartAudio(RefPtr<AudioInputSource>&& aAudioInputSource);
+  void StopAudio();
+  AudioInputType DevicePreference() const;
+  void NotifyDeviceChanged(AudioInputSource::Id aSourceId);
+  void NotifyInputStopped(AudioInputSource::Id aSourceId);
+  AudioInputSource::Id GenerateSourceId();
+  void ReevaluateProcessingParams();
+
+ private:
+  ~NonNativeInputTrack() = default;
+
+  RefPtr<AudioInputSource> mAudioSource;
+  AudioInputSource::Id mSourceIdNumber;
+  int mRequestedProcessingParamsGeneration{};
+
+#ifdef DEBUG
+  bool HasGraphThreadChanged();
+  std::thread::id mGraphThreadId;
+#endif
+};
+
+class AudioInputSourceListener : public AudioInputSource::EventListener {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(AudioInputSourceListener, override);
+
+  explicit AudioInputSourceListener(NonNativeInputTrack* aOwner);
+
+  void AudioDeviceChanged(AudioInputSource::Id aSourceId) override;
+  void AudioStateCallback(
+      AudioInputSource::Id aSourceId,
+      AudioInputSource::EventListener::State aState) override;
+
+ private:
+  ~AudioInputSourceListener() = default;
+  const RefPtr<NonNativeInputTrack> mOwner;
+};
+
+}  
+
+#endif  // DOM_MEDIA_DEVICEINPUTTRACK_H_

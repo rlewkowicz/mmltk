@@ -1,0 +1,85 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_quota_EncryptingOutputStream_h
+#define mozilla_dom_quota_EncryptingOutputStream_h
+
+#include "EncryptedBlock.h"  // for EncryptedBlock
+
+#include <cstddef>
+#include <cstdint>
+
+#include "ErrorList.h"
+#include "mozilla/InitializedOnce.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/NotNull.h"
+#include "nsCOMPtr.h"
+#include "nsIOutputStream.h"
+#include "nsISupports.h"
+#include "nsTArray.h"
+#include "nscore.h"
+
+class nsIInputStream;
+class nsIRandomGenerator;
+
+namespace mozilla::dom::quota {
+class EncryptingOutputStreamBase : public nsIOutputStream {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+  NS_IMETHOD Write(const char* aBuf, uint32_t aCount, uint32_t* _retval) final;
+  NS_IMETHOD WriteFrom(nsIInputStream* aFromStream, uint32_t aCount,
+                       uint32_t* _retval) final;
+  NS_IMETHOD IsNonBlocking(bool* _retval) final;
+
+ protected:
+  EncryptingOutputStreamBase(nsCOMPtr<nsIOutputStream> aBaseStream,
+                             size_t aBlockSize);
+
+  virtual ~EncryptingOutputStreamBase() = default;
+
+  nsresult WriteAll(const char* aBuf, uint32_t aCount,
+                    uint32_t* aBytesWrittenOut);
+
+  InitializedOnce<const NotNull<nsCOMPtr<nsIOutputStream>>> mBaseStream;
+  const size_t mBlockSize;
+};
+
+template <typename CipherStrategy>
+class EncryptingOutputStream final : public EncryptingOutputStreamBase {
+ public:
+  explicit EncryptingOutputStream(nsCOMPtr<nsIOutputStream> aBaseStream,
+                                  size_t aBlockSize,
+                                  typename CipherStrategy::KeyType aKey);
+
+ private:
+  ~EncryptingOutputStream();
+
+  nsresult FlushToBaseStream();
+
+  bool EnsureBuffers();
+
+  CipherStrategy mCipherStrategy;
+
+  nsTArray<uint8_t> mBuffer;
+
+  nsCOMPtr<nsIRandomGenerator> mRandomGenerator;
+
+  size_t mNextByte = 0;
+
+  using EncryptedBlockType = EncryptedBlock<CipherStrategy::BlockPrefixLength,
+                                            CipherStrategy::BasicBlockSize>;
+  Maybe<EncryptedBlockType> mEncryptedBlock;
+
+ public:
+  NS_IMETHOD Close() override;
+  NS_IMETHOD Flush() override;
+  NS_IMETHOD StreamStatus() override;
+  NS_IMETHOD WriteSegments(nsReadSegmentFun aReader, void* aClosure,
+                           uint32_t aCount, uint32_t* _retval) override;
+};
+
+}  
+
+#endif

@@ -1,0 +1,309 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/********************************************************************************
+* Copyright (C) 2008-2016, International Business Machines Corporation and
+* others. All Rights Reserved.
+*******************************************************************************
+*
+* File DTITVFMT.H
+*
+*******************************************************************************
+*/
+
+#ifndef __DTITVFMT_H__
+#define __DTITVFMT_H__
+
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/ucal.h"
+#include "unicode/smpdtfmt.h"
+#include "unicode/dtintrv.h"
+#include "unicode/dtitvinf.h"
+#include "unicode/dtptngen.h"
+#include "unicode/formattedvalue.h"
+#include "unicode/udisplaycontext.h"
+
+U_NAMESPACE_BEGIN
+
+
+class FormattedDateIntervalData;
+class DateIntervalFormat;
+
+class U_I18N_API FormattedDateInterval : public UMemory, public FormattedValue {
+  public:
+    FormattedDateInterval() : fData(nullptr), fErrorCode(U_INVALID_STATE_ERROR) {}
+
+    FormattedDateInterval(FormattedDateInterval&& src) noexcept;
+
+    virtual ~FormattedDateInterval() override;
+
+    FormattedDateInterval(const FormattedDateInterval&) = delete;
+
+    FormattedDateInterval& operator=(const FormattedDateInterval&) = delete;
+
+    FormattedDateInterval& operator=(FormattedDateInterval&& src) noexcept;
+
+    UnicodeString toString(UErrorCode& status) const override;
+
+    UnicodeString toTempString(UErrorCode& status) const override;
+
+    Appendable &appendTo(Appendable& appendable, UErrorCode& status) const override;
+
+    UBool nextPosition(ConstrainedFieldPosition& cfpos, UErrorCode& status) const override;
+
+  private:
+    FormattedDateIntervalData *fData;
+    UErrorCode fErrorCode;
+    explicit FormattedDateInterval(FormattedDateIntervalData *results)
+        : fData(results), fErrorCode(U_ZERO_ERROR) {}
+    explicit FormattedDateInterval(UErrorCode errorCode)
+        : fData(nullptr), fErrorCode(errorCode) {}
+    friend class DateIntervalFormat;
+};
+
+
+class U_I18N_API_CLASS DateIntervalFormat : public Format {
+public:
+
+    U_I18N_API static DateIntervalFormat* createInstance(const UnicodeString& skeleton,
+                                                         UErrorCode& status);
+
+
+    U_I18N_API static DateIntervalFormat* createInstance(const UnicodeString& skeleton,
+                                                         const Locale& locale,
+                                                         UErrorCode& status);
+
+    U_I18N_API static DateIntervalFormat* createInstance(const UnicodeString& skeleton,
+                                                         const DateIntervalInfo& dtitvinf,
+                                                         UErrorCode& status);
+
+    U_I18N_API static DateIntervalFormat* createInstance(const UnicodeString& skeleton,
+                                                         const Locale& locale,
+                                                         const DateIntervalInfo& dtitvinf,
+                                                         UErrorCode& status);
+
+    U_I18N_API virtual ~DateIntervalFormat();
+
+    U_I18N_API virtual DateIntervalFormat* clone() const override;
+
+    U_I18N_API virtual bool operator==(const Format& other) const override;
+
+    U_I18N_API bool operator!=(const Format& other) const;
+
+    using Format::format;
+
+    U_I18N_API virtual UnicodeString& format(const Formattable& obj,
+                                             UnicodeString& appendTo,
+                                             FieldPosition& fieldPosition,
+                                             UErrorCode& status) const override;
+
+    U_I18N_API UnicodeString& format(const DateInterval* dtInterval,
+                                     UnicodeString& appendTo,
+                                     FieldPosition& fieldPosition,
+                                     UErrorCode& status) const;
+
+    U_I18N_API FormattedDateInterval formatToValue(const DateInterval& dtInterval,
+                                                   UErrorCode& status) const;
+
+    U_I18N_API UnicodeString& format(Calendar& fromCalendar,
+                                     Calendar& toCalendar,
+                                     UnicodeString& appendTo,
+                                     FieldPosition& fieldPosition,
+                                     UErrorCode& status) const;
+
+    U_I18N_API FormattedDateInterval formatToValue(Calendar& fromCalendar,
+                                                   Calendar& toCalendar,
+                                                   UErrorCode& status) const;
+
+    U_I18N_API virtual void parseObject(const UnicodeString& source,
+                                        Formattable& result,
+                                        ParsePosition& parse_pos) const override;
+
+    U_I18N_API const DateIntervalInfo* getDateIntervalInfo() const;
+
+    U_I18N_API void setDateIntervalInfo(const DateIntervalInfo& newIntervalPatterns, UErrorCode& status);
+
+    U_I18N_API const DateFormat* getDateFormat() const;
+
+    U_I18N_API virtual const TimeZone& getTimeZone() const;
+
+    U_I18N_API virtual void adoptTimeZone(TimeZone* zoneToAdopt);
+
+    U_I18N_API virtual void setTimeZone(const TimeZone& zone);
+
+    U_I18N_API virtual void adoptCalendar(Calendar *calendarToAdopt);
+
+    U_I18N_API virtual void setContext(UDisplayContext value, UErrorCode& status);
+
+    U_I18N_API virtual UDisplayContext getContext(UDisplayContextType type, UErrorCode& status) const;
+
+    U_I18N_API static UClassID getStaticClassID();
+
+    U_I18N_API virtual UClassID getDynamicClassID() const override;
+
+protected:
+
+    DateIntervalFormat(const DateIntervalFormat&);
+
+    DateIntervalFormat& operator=(const DateIntervalFormat&);
+
+private:
+
+    struct PatternInfo {
+        UnicodeString firstPart;
+        UnicodeString secondPart;
+        UBool         laterDateFirst;
+    };
+
+
+    DateIntervalFormat();
+
+    DateIntervalFormat(const Locale& locale, DateIntervalInfo* dtItvInfo,
+                       const UnicodeString* skeleton, UErrorCode& status);
+
+
+    U_I18N_API static DateIntervalFormat* create(const Locale& locale,
+                                                 DateIntervalInfo* dtitvinf,
+                                                 const UnicodeString* skeleton,
+                                                 UErrorCode& status);
+
+
+    void fallbackFormatRange(
+        Calendar& fromCalendar,
+        Calendar& toCalendar,
+        UnicodeString& appendTo,
+        int8_t& firstIndex,
+        FieldPositionHandler& fphandler,
+        UErrorCode& status) const;
+
+    UnicodeString& fallbackFormat(Calendar& fromCalendar,
+                                  Calendar& toCalendar,
+                                  UBool fromToOnSameDay,
+                                  UnicodeString& appendTo,
+                                  int8_t& firstIndex,
+                                  FieldPositionHandler& fphandler,
+                                  UErrorCode& status) const;
+
+
+
+    void initializePattern(UErrorCode& status);
+
+
+
+    void setFallbackPattern(UCalendarDateFields field,
+                            const UnicodeString& skeleton,
+                            UErrorCode& status);
+    
+
+
+    UnicodeString normalizeHourMetacharacters(const UnicodeString& skeleton) const;
+
+
+
+    U_I18N_API static void getDateTimeSkeleton(const UnicodeString& skeleton,
+                                               UnicodeString& date,
+                                               UnicodeString& normalizedDate,
+                                               UnicodeString& time,
+                                               UnicodeString& normalizedTime);
+
+    UBool setSeparateDateTimePtn(const UnicodeString& dateSkeleton,
+                                 const UnicodeString& timeSkeleton);
+
+
+
+
+    UBool setIntervalPattern(UCalendarDateFields field,
+                             const UnicodeString* skeleton,
+                             const UnicodeString* bestSkeleton,
+                             int8_t differenceInfo,
+                             UnicodeString* extendedSkeleton = nullptr,
+                             UnicodeString* extendedBestSkeleton = nullptr);
+
+    U_I18N_API static void adjustFieldWidth(const UnicodeString& inputSkeleton,
+                                            const UnicodeString& bestMatchSkeleton,
+                                            const UnicodeString& bestMatchIntervalPattern,
+                                            int8_t differenceInfo,
+                                            UBool suppressDayPeriodField,
+                                            UnicodeString& adjustedIntervalPattern);
+
+    U_I18N_API static void findReplaceInPattern(UnicodeString& targetString,
+                                                const UnicodeString& strToReplace,
+                                                const UnicodeString& strToReplaceWith);
+
+    void concatSingleDate2TimeInterval(UnicodeString& format,
+                                       const UnicodeString& datePattern,
+                                       UCalendarDateFields field,
+                                       UErrorCode& status);
+
+    U_I18N_API static UBool fieldExistsInSkeleton(UCalendarDateFields field,
+                                                  const UnicodeString& skeleton);
+
+    U_I18N_API static int32_t splitPatternInto2Part(const UnicodeString& intervalPattern);
+
+    void setIntervalPattern(UCalendarDateFields field,
+                            const UnicodeString& intervalPattern);
+
+
+    void setIntervalPattern(UCalendarDateFields field,
+                            const UnicodeString& intervalPattern,
+                            UBool laterDateFirst);
+
+
+    void setPatternInfo(UCalendarDateFields field,
+                        const UnicodeString* firstPart,
+                        const UnicodeString* secondPart,
+                        UBool laterDateFirst);
+
+    UnicodeString& formatImpl(Calendar& fromCalendar,
+                              Calendar& toCalendar,
+                              UnicodeString& appendTo,
+                              int8_t& firstIndex,
+                              FieldPositionHandler& fphandler,
+                              UErrorCode& status) const ;
+
+    UnicodeString& formatIntervalImpl(const DateInterval& dtInterval,
+                              UnicodeString& appendTo,
+                              int8_t& firstIndex,
+                              FieldPositionHandler& fphandler,
+                              UErrorCode& status) const;
+
+
+    static const char16_t fgCalendarFieldToPatternLetter[];
+
+
+    DateIntervalInfo*     fInfo;
+
+    SimpleDateFormat*     fDateFormat;
+
+    Calendar* fFromCalendar;
+    Calendar* fToCalendar;
+
+    Locale fLocale;
+
+    UnicodeString fSkeleton;
+    PatternInfo fIntervalPatterns[DateIntervalInfo::kIPI_MAX_INDEX];
+
+    UnicodeString* fDatePattern;
+    UnicodeString* fTimePattern;
+    UnicodeString* fDateTimeFormat;
+
+    UDisplayContext fCapitalizationContext;
+};
+
+inline bool
+DateIntervalFormat::operator!=(const Format& other) const  {
+    return !operator==(other);
+}
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // _DTITVFMT_H__

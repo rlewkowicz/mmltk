@@ -1,0 +1,118 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_BarProps_h
+#define mozilla_dom_BarProps_h
+
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsPIDOMWindow.h"
+#include "nsWrapperCache.h"
+
+class nsGlobalWindowInner;
+class nsIWebBrowserChrome;
+
+namespace mozilla {
+
+class ErrorResult;
+
+namespace dom {
+
+class BarProp : public nsISupports, public nsWrapperCache {
+ public:
+  explicit BarProp(nsGlobalWindowInner* aWindow);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(BarProp)
+
+  nsPIDOMWindowInner* GetParentObject() const;
+
+  JSObject* WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto) final;
+
+  virtual bool GetVisible(CallerType aCallerType, ErrorResult& aRv) = 0;
+  virtual void SetVisible(bool aVisible, CallerType aCallerType,
+                          ErrorResult& aRv) = 0;
+
+ protected:
+  virtual ~BarProp();
+
+  bool GetVisibleByIsPopup();
+  bool GetVisibleByFlag(uint32_t aChromeFlag, CallerType aCallerType,
+                        ErrorResult& aRv);
+  void SetVisibleByFlag(bool aVisible, uint32_t aChromeFlag,
+                        CallerType aCallerType, ErrorResult& aRv);
+
+  already_AddRefed<nsIWebBrowserChrome> GetBrowserChrome();
+
+  BrowsingContext* GetBrowsingContext();
+
+  RefPtr<nsGlobalWindowInner> mDOMWindow;
+};
+
+class MenubarProp final : public BarProp {
+ public:
+  explicit MenubarProp(nsGlobalWindowInner* aWindow);
+  virtual ~MenubarProp();
+
+  bool GetVisible(CallerType aCallerType, ErrorResult& aRv) override;
+  void SetVisible(bool aVisible, CallerType aCallerType,
+                  ErrorResult& aRv) override;
+};
+
+class ToolbarProp final : public BarProp {
+ public:
+  explicit ToolbarProp(nsGlobalWindowInner* aWindow);
+  virtual ~ToolbarProp();
+
+  bool GetVisible(CallerType aCallerType, ErrorResult& aRv) override;
+  void SetVisible(bool aVisible, CallerType aCallerType,
+                  ErrorResult& aRv) override;
+};
+
+class LocationbarProp final : public BarProp {
+ public:
+  explicit LocationbarProp(nsGlobalWindowInner* aWindow);
+  virtual ~LocationbarProp();
+
+  bool GetVisible(CallerType aCallerType, ErrorResult& aRv) override;
+  void SetVisible(bool aVisible, CallerType aCallerType,
+                  ErrorResult& aRv) override;
+};
+
+class PersonalbarProp final : public BarProp {
+ public:
+  explicit PersonalbarProp(nsGlobalWindowInner* aWindow);
+  virtual ~PersonalbarProp();
+
+  bool GetVisible(CallerType aCallerType, ErrorResult& aRv) override;
+  void SetVisible(bool aVisible, CallerType aCallerType,
+                  ErrorResult& aRv) override;
+};
+
+class StatusbarProp final : public BarProp {
+ public:
+  explicit StatusbarProp(nsGlobalWindowInner* aWindow);
+  virtual ~StatusbarProp();
+
+  bool GetVisible(CallerType aCallerType, ErrorResult& aRv) override;
+  void SetVisible(bool aVisible, CallerType aCallerType,
+                  ErrorResult& aRv) override;
+};
+
+class ScrollbarsProp final : public BarProp {
+ public:
+  explicit ScrollbarsProp(nsGlobalWindowInner* aWindow);
+  virtual ~ScrollbarsProp();
+
+  bool GetVisible(CallerType aCallerType, ErrorResult& aRv) override;
+  void SetVisible(bool aVisible, CallerType aCallerType,
+                  ErrorResult& aRv) override;
+};
+
+}  
+}  
+
+#endif /* mozilla_dom_BarProps_h */

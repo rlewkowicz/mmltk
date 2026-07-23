@@ -1,0 +1,36 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkColorPalette_DEFINED)
+#define SkColorPalette_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkTypes.h"
+
+class SkColorPalette : public SkRefCnt {
+public:
+    SkColorPalette(const SkPMColor colors[], int count);
+    ~SkColorPalette() override;
+
+    int count() const { return fCount; }
+
+    SkPMColor operator[](int index) const {
+        SkASSERT(fColors != nullptr && (unsigned)index < (unsigned)fCount);
+        return fColors[index];
+    }
+
+    const SkPMColor* readColors() const { return fColors; }
+
+private:
+    SkPMColor*  fColors;
+    int         fCount;
+
+    using INHERITED = SkRefCnt;
+};
+
+#endif

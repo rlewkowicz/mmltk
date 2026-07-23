@@ -1,0 +1,496 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Decoder.h"
+
+#include "DecodePool.h"
+#include "IDecodingTask.h"
+#include "ISurfaceProvider.h"
+#include "gfxPlatform.h"
+#include "mozilla/StaticPrefs_gfx.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/gfx/Point.h"
+#include "nsComponentManagerUtils.h"
+#include "nsProxyRelease.h"
+#include "nsServiceManagerUtils.h"
+
+using mozilla::gfx::IntPoint;
+using mozilla::gfx::IntRect;
+using mozilla::gfx::IntSize;
+using mozilla::gfx::SurfaceFormat;
+using namespace mozilla::gfx::CICP;
+
+namespace mozilla {
+namespace image {
+
+Decoder::Decoder(RasterImage* aImage)
+    : mInProfile(nullptr),
+      mTransform(nullptr),
+      mImageData(nullptr),
+      mImageDataLength(0),
+      mCMSMode(gfxPlatform::GetCMSMode()),
+      mImage(aImage),
+      mFrameRecycler(nullptr),
+      mProgress(NoProgress),
+      mFrameCount(0),
+      mLoopLength(FrameTimeout::Zero()),
+      mDecoderFlags(DefaultDecoderFlags()),
+      mSurfaceFlags(DefaultSurfaceFlags()),
+      mInitialized(false),
+      mMetadataDecode(false),
+      mHaveExplicitOutputSize(false),
+      mInFrame(false),
+      mFinishedNewFrame(false),
+      mHasFrameToTake(false),
+      mReachedTerminalState(false),
+      mDecodeDone(false),
+      mError(false),
+      mShouldReportError(false),
+      mFinalizeFrames(true) {}
+
+Decoder::~Decoder() {
+  MOZ_ASSERT(mProgress == NoProgress || !mImage,
+             "Destroying Decoder without taking all its progress changes");
+  MOZ_ASSERT(mInvalidRect.IsEmpty() || !mImage,
+             "Destroying Decoder without taking all its invalidations");
+  mInitialized = false;
+
+  if (mInProfile) {
+    if (mTransform) {
+      qcms_transform_release(mTransform);
+    }
+    qcms_profile_release(mInProfile);
+  }
+
+  if (mImage && !NS_IsMainThread()) {
+    SurfaceCache::ReleaseImageOnMainThread(mImage.forget());
+  }
+}
+
+void Decoder::SetSurfaceFlags(SurfaceFlags aSurfaceFlags) {
+  MOZ_ASSERT(!mInitialized);
+  MOZ_ASSERT(!(mSurfaceFlags & SurfaceFlags::NO_COLORSPACE_CONVERSION) ||
+             !(mSurfaceFlags & SurfaceFlags::TO_SRGB_COLORSPACE));
+  mSurfaceFlags = aSurfaceFlags;
+  if (mSurfaceFlags & SurfaceFlags::NO_COLORSPACE_CONVERSION) {
+    mCMSMode = CMSMode::Off;
+  }
+  if (mSurfaceFlags & SurfaceFlags::TO_SRGB_COLORSPACE) {
+    mCMSMode = CMSMode::All;
+  }
+}
+
+qcms_profile* Decoder::GetCMSOutputProfile() const {
+  if (mSurfaceFlags & SurfaceFlags::TO_SRGB_COLORSPACE) {
+    return gfxPlatform::GetCMSsRGBProfile();
+  }
+  return gfxPlatform::GetCMSOutputProfile();
+}
+
+qcms_transform* Decoder::GetCMSsRGBTransform(SurfaceFormat aFormat) const {
+  if (mSurfaceFlags & SurfaceFlags::TO_SRGB_COLORSPACE) {
+    return nullptr;
+  }
+  if (qcms_profile_is_sRGB(gfxPlatform::GetCMSOutputProfile())) {
+    return nullptr;
+  }
+
+  switch (aFormat) {
+    case SurfaceFormat::B8G8R8A8:
+    case SurfaceFormat::B8G8R8X8:
+      return gfxPlatform::GetCMSBGRATransform();
+    case SurfaceFormat::R8G8B8A8:
+    case SurfaceFormat::R8G8B8X8:
+      return gfxPlatform::GetCMSRGBATransform();
+    case SurfaceFormat::R8G8B8:
+      return gfxPlatform::GetCMSRGBTransform();
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unsupported surface format!");
+      return nullptr;
+  }
+}
+
+
+nsresult Decoder::Init() {
+  MOZ_ASSERT(!mInitialized, "Can't re-initialize a decoder!");
+
+  MOZ_ASSERT(mIterator);
+
+  MOZ_ASSERT_IF(mMetadataDecode, !mHaveExplicitOutputSize);
+
+  MOZ_ASSERT_IF(mImage, IsMetadataDecode());
+
+  MOZ_ASSERT_IF(WantsFrameCount(), IsMetadataDecode());
+
+  nsresult rv = InitInternal();
+
+  mInitialized = true;
+
+  return rv;
+}
+
+LexerResult Decoder::Decode(IResumable* aOnResume ) {
+  MOZ_ASSERT(mInitialized, "Should be initialized here");
+  MOZ_ASSERT(mIterator, "Should have a SourceBufferIterator");
+
+  if (GetDecodeDone()) {
+    return LexerResult(HasError() ? TerminalState::FAILURE
+                                  : TerminalState::SUCCESS);
+  }
+
+  LexerResult lexerResult(TerminalState::FAILURE);
+  {
+    lexerResult = DoDecode(*mIterator, aOnResume);
+  };
+
+  if (lexerResult.is<Yield>()) {
+    return lexerResult;
+  }
+
+  MOZ_ASSERT(lexerResult.is<TerminalState>());
+  mReachedTerminalState = true;
+
+  if (lexerResult.as<TerminalState>() == TerminalState::FAILURE) {
+    PostError();
+  }
+
+  CompleteDecode();
+
+  return LexerResult(HasError() ? TerminalState::FAILURE
+                                : TerminalState::SUCCESS);
+}
+
+LexerResult Decoder::TerminateFailure() {
+  PostError();
+
+  if (!mReachedTerminalState) {
+    mReachedTerminalState = true;
+    CompleteDecode();
+  }
+
+  return LexerResult(TerminalState::FAILURE);
+}
+
+bool Decoder::ShouldSyncDecode(size_t aByteLimit) {
+  MOZ_ASSERT(aByteLimit > 0);
+  MOZ_ASSERT(mIterator, "Should have a SourceBufferIterator");
+
+  return mIterator->RemainingBytesIsNoMoreThan(aByteLimit);
+}
+
+void Decoder::CompleteDecode() {
+  nsresult rv = BeforeFinishInternal();
+  if (NS_FAILED(rv)) {
+    PostError();
+  }
+
+  rv = HasError() ? FinishWithErrorInternal() : FinishInternal();
+  if (NS_FAILED(rv)) {
+    PostError();
+  }
+
+  if (IsMetadataDecode()) {
+    if (!HasSize()) {
+      PostError();
+    }
+    return;
+  }
+
+  if (mInFrame) {
+    PostHasTransparency();
+    PostFrameStop();
+  }
+
+  if (mDecodeDone) {
+    MOZ_ASSERT(HasError() || mCurrentFrame, "Should have an error or a frame");
+  } else {
+    mShouldReportError = true;
+
+    if (GetCompleteFrameCount() > 0) {
+      PostHasTransparency();
+      PostDecodeDone();
+    } else {
+      mProgress |= FLAG_DECODE_COMPLETE | FLAG_HAS_ERROR;
+    }
+  }
+}
+
+void Decoder::SetOutputSize(const OrientedIntSize& aSize) {
+  mOutputSize = Some(aSize);
+  mHaveExplicitOutputSize = true;
+}
+
+Maybe<OrientedIntSize> Decoder::ExplicitOutputSize() const {
+  MOZ_ASSERT_IF(mHaveExplicitOutputSize, mOutputSize);
+  return mHaveExplicitOutputSize ? mOutputSize : Nothing();
+}
+
+Maybe<uint32_t> Decoder::TakeCompleteFrameCount() {
+  const bool finishedNewFrame = mFinishedNewFrame;
+  mFinishedNewFrame = false;
+  return finishedNewFrame ? Some(GetCompleteFrameCount()) : Nothing();
+}
+
+DecoderFinalStatus Decoder::FinalStatus() const {
+  return DecoderFinalStatus(IsMetadataDecode(), GetDecodeDone(), HasError(),
+                            ShouldReportError());
+}
+
+nsresult Decoder::AllocateFrame(const gfx::IntSize& aOutputSize,
+                                gfx::SurfaceFormat aFormat,
+                                const Maybe<AnimationParams>& aAnimParams) {
+  mCurrentFrame = AllocateFrameInternal(aOutputSize, aFormat, aAnimParams,
+                                        std::move(mCurrentFrame));
+
+  if (mCurrentFrame) {
+    mHasFrameToTake = true;
+
+    mImageData = mCurrentFrame.Data();
+
+    MOZ_ASSERT_IF(aAnimParams, aAnimParams->mFrameNum + 1 == mFrameCount);
+
+    MOZ_ASSERT_IF(mFrameCount > 1, HasAnimation());
+
+    MOZ_ASSERT(!mInFrame, "Starting new frame but not done with old one!");
+    mInFrame = true;
+  } else {
+    mImageData = nullptr;
+    mImageDataLength = 0;
+  }
+
+  return mCurrentFrame ? NS_OK : NS_ERROR_FAILURE;
+}
+
+RawAccessFrameRef Decoder::AllocateFrameInternal(
+    const gfx::IntSize& aOutputSize, SurfaceFormat aFormat,
+    const Maybe<AnimationParams>& aAnimParams,
+    RawAccessFrameRef&& aPreviousFrame) {
+  if (HasError()) {
+    return RawAccessFrameRef();
+  }
+
+  uint32_t frameNum = aAnimParams ? aAnimParams->mFrameNum : 0;
+  if (frameNum != mFrameCount) {
+    MOZ_ASSERT_UNREACHABLE("Allocating frames out of order");
+    return RawAccessFrameRef();
+  }
+
+  if (aOutputSize.width <= 0 || aOutputSize.height <= 0) {
+    NS_WARNING("Trying to add frame with zero or negative size");
+    return RawAccessFrameRef();
+  }
+
+  if (frameNum > 0) {
+    if (aPreviousFrame->GetDisposalMethod() !=
+        DisposalMethod::RESTORE_PREVIOUS) {
+      mRestoreFrame = std::move(aPreviousFrame);
+      mRestoreDirtyRect.SetBox(0, 0, 0, 0);
+    } else {
+      mRestoreDirtyRect = aPreviousFrame->GetBoundedBlendRect();
+    }
+  }
+
+  RawAccessFrameRef ref;
+
+  if (mFrameRecycler) {
+    MOZ_ASSERT(aAnimParams);
+
+    ref = mFrameRecycler->RecycleFrame(mRecycleRect);
+    if (ref) {
+      bool blocked = ref.get() == mRestoreFrame.get();
+      if (!blocked) {
+        blocked = NS_FAILED(
+            ref->InitForDecoderRecycle(aAnimParams.ref(), &mImageDataLength));
+      }
+
+      if (blocked) {
+        ref.reset();
+      }
+    }
+  }
+
+  if (!ref) {
+    mRecycleRect = IntRect(IntPoint(0, 0), aOutputSize);
+
+    bool nonPremult = bool(mSurfaceFlags & SurfaceFlags::NO_PREMULTIPLY_ALPHA);
+    auto frame = MakeNotNull<RefPtr<imgFrame>>();
+    if (NS_FAILED(frame->InitForDecoder(aOutputSize, aFormat, nonPremult,
+                                        aAnimParams, bool(mFrameRecycler),
+                                        &mImageDataLength))) {
+      NS_WARNING("imgFrame::Init should succeed");
+      return RawAccessFrameRef();
+    }
+
+    ref = frame->RawAccessRef(gfx::DataSourceSurface::READ_WRITE);
+    if (!ref) {
+      frame->Abort();
+      return RawAccessFrameRef();
+    }
+  }
+
+  mFrameCount++;
+
+  return ref;
+}
+
+
+nsresult Decoder::InitInternal() { return NS_OK; }
+nsresult Decoder::BeforeFinishInternal() { return NS_OK; }
+nsresult Decoder::FinishInternal() { return NS_OK; }
+
+nsresult Decoder::FinishWithErrorInternal() {
+  MOZ_ASSERT(!mInFrame);
+  return NS_OK;
+}
+
+
+void Decoder::PostSize(int32_t aWidth, int32_t aHeight,
+                       Orientation aOrientation, Resolution aResolution) {
+  MOZ_ASSERT(aWidth >= 0, "Width can't be negative!");
+  MOZ_ASSERT(aHeight >= 0, "Height can't be negative!");
+
+  mImageMetadata.SetSize(aWidth, aHeight, aOrientation, aResolution);
+
+  if (!IsExpectedSize()) {
+    PostError();
+    return;
+  }
+
+  if (!mOutputSize) {
+    mOutputSize = Some(mImageMetadata.GetSize());
+  }
+
+  MOZ_ASSERT(mOutputSize->width <= mImageMetadata.GetSize().width &&
+                 mOutputSize->height <= mImageMetadata.GetSize().height,
+             "Output size will result in upscaling");
+
+  mProgress |= FLAG_SIZE_AVAILABLE;
+}
+
+void Decoder::PostHasTransparency() { mProgress |= FLAG_HAS_TRANSPARENCY; }
+
+void Decoder::PostIsAnimated(FrameTimeout aFirstFrameTimeout) {
+  mProgress |= FLAG_IS_ANIMATED;
+  mImageMetadata.SetHasAnimation();
+  mImageMetadata.SetFirstFrameTimeout(aFirstFrameTimeout);
+}
+
+void Decoder::PostFrameCount(uint32_t aFrameCount) {
+  mImageMetadata.SetFrameCount(aFrameCount);
+}
+
+void Decoder::PostFrameStop(Opacity aFrameOpacity) {
+  MOZ_ASSERT(!IsMetadataDecode(), "Stopping frame during metadata decode");
+  MOZ_ASSERT(mInFrame, "Stopping frame when we didn't start one");
+  MOZ_ASSERT(mCurrentFrame, "Stopping frame when we don't have one");
+
+  mInFrame = false;
+  mFinishedNewFrame = true;
+
+  mCurrentFrame->Finish(
+      aFrameOpacity, mFinalizeFrames,
+       mImageMetadata.HasOrientation() &&
+          mImageMetadata.GetOrientation().SwapsWidthAndHeight());
+
+  mProgress |= FLAG_FRAME_COMPLETE;
+
+  mLoopLength += mCurrentFrame->GetTimeout();
+
+  if (mFrameCount == 1) {
+    if (!ShouldSendPartialInvalidations()) {
+      mInvalidRect.UnionRect(mInvalidRect,
+                             OrientedIntRect(OrientedIntPoint(), Size()));
+    }
+
+    switch (mCurrentFrame->GetDisposalMethod()) {
+      default:
+        MOZ_FALLTHROUGH_ASSERT("Unexpected DisposalMethod");
+      case DisposalMethod::CLEAR:
+      case DisposalMethod::CLEAR_ALL:
+      case DisposalMethod::RESTORE_PREVIOUS:
+        mFirstFrameRefreshArea = IntRect(IntPoint(), Size().ToUnknownSize());
+        break;
+      case DisposalMethod::KEEP:
+      case DisposalMethod::NOT_SPECIFIED:
+        break;
+    }
+  } else {
+    mFirstFrameRefreshArea.UnionRect(mFirstFrameRefreshArea,
+                                     mCurrentFrame->GetBoundedBlendRect());
+  }
+}
+
+void Decoder::PostInvalidation(const OrientedIntRect& aRect,
+                               const Maybe<OrientedIntRect>& aRectAtOutputSize
+                               ) {
+  MOZ_ASSERT(mInFrame, "Can't invalidate when not mid-frame!");
+  MOZ_ASSERT(mCurrentFrame, "Can't invalidate when not mid-frame!");
+
+  if (ShouldSendPartialInvalidations() && mFrameCount == 1) {
+    mInvalidRect.UnionRect(mInvalidRect, aRect);
+    mCurrentFrame->ImageUpdated(
+        aRectAtOutputSize.valueOr(aRect).ToUnknownRect());
+  }
+}
+
+void Decoder::PostLoopCount(int32_t aLoopCount) {
+  mImageMetadata.SetLoopCount(aLoopCount);
+}
+
+void Decoder::PostDecodeDone() {
+  MOZ_ASSERT(!IsMetadataDecode(), "Done with decoding in metadata decode");
+  MOZ_ASSERT(!mInFrame, "Can't be done decoding if we're mid-frame!");
+  MOZ_ASSERT(!mDecodeDone, "Decode already done!");
+  mDecodeDone = true;
+
+  if (!IsFirstFrameDecode()) {
+    mImageMetadata.SetLoopLength(mLoopLength);
+    mImageMetadata.SetFirstFrameRefreshArea(mFirstFrameRefreshArea);
+  }
+
+  mProgress |= FLAG_DECODE_COMPLETE;
+}
+
+void Decoder::PostError() {
+  mError = true;
+
+  if (mInFrame) {
+    MOZ_ASSERT(mCurrentFrame);
+    MOZ_ASSERT(mFrameCount > 0);
+    mCurrentFrame->Abort();
+    mInFrame = false;
+    --mFrameCount;
+    mHasFrameToTake = false;
+  }
+}
+
+uint8_t Decoder::ChooseTransferCharacteristics(uint8_t aTC) {
+  const bool rec709GammaAsSrgb =
+      StaticPrefs::gfx_color_management_rec709_gamma_as_srgb();
+  const bool rec2020GammaAsRec709 =
+      StaticPrefs::gfx_color_management_rec2020_gamma_as_rec709();
+  switch (aTC) {
+    case TransferCharacteristics::TC_BT709:
+    case TransferCharacteristics::TC_BT601:
+      if (rec709GammaAsSrgb) {
+        return TransferCharacteristics::TC_SRGB;
+      }
+      break;
+    case TransferCharacteristics::TC_BT2020_10BIT:
+    case TransferCharacteristics::TC_BT2020_12BIT:
+      if (rec2020GammaAsRec709) {
+        if (rec709GammaAsSrgb) {
+          return TransferCharacteristics::TC_SRGB;
+        }
+        return TransferCharacteristics::TC_BT709;
+      }
+      break;
+    default:
+      break;
+  }
+  return aTC;
+}
+
+}  
+}  

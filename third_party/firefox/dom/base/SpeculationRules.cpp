@@ -1,0 +1,120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/SpeculationRules.h"
+
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/PrefetchCandidates.h"
+#include "mozilla/dom/ReferrerPolicyBinding.h"
+#include "mozilla/dom/SpeculationRuleSet.h"
+#include "mozilla/dom/speculationrules_ffi_generated.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIScriptElement.h"
+#include "nsIURI.h"
+
+namespace mozilla::dom {
+
+#define STATIC_ASSERT_REFERRER_POLICY_EQ(cpp_, rust_) \
+  static_assert(                                      \
+      ReferrerPolicy::cpp_ ==                         \
+      static_cast<ReferrerPolicy>(SpeculationRulesReferrerPolicy::rust_))
+
+STATIC_ASSERT_REFERRER_POLICY_EQ(_empty, Empty);
+STATIC_ASSERT_REFERRER_POLICY_EQ(No_referrer, NoReferrer);
+STATIC_ASSERT_REFERRER_POLICY_EQ(No_referrer_when_downgrade,
+                                 NoReferrerWhenDowngrade);
+STATIC_ASSERT_REFERRER_POLICY_EQ(Origin, Origin);
+STATIC_ASSERT_REFERRER_POLICY_EQ(Origin_when_cross_origin,
+                                 OriginWhenCrossOrigin);
+STATIC_ASSERT_REFERRER_POLICY_EQ(Unsafe_url, UnsafeUrl);
+STATIC_ASSERT_REFERRER_POLICY_EQ(Same_origin, SameOrigin);
+STATIC_ASSERT_REFERRER_POLICY_EQ(Strict_origin, StrictOrigin);
+STATIC_ASSERT_REFERRER_POLICY_EQ(Strict_origin_when_cross_origin,
+                                 StrictOriginWhenCrossOrigin);
+
+#undef STATIC_ASSERT_REFERRER_POLICY_EQ
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(SpeculationRules)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(SpeculationRules)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDocument)
+  for (const auto& entry : tmp->mRuleSetsFromScript) {
+    NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(cb, "mRuleSetsFromScript key");
+    cb.NoteXPCOMChild(entry.GetKey());
+  }
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(SpeculationRules)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocument)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mRuleSetsFromScript)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+SpeculationRules::SpeculationRules(Document* aDocument)
+    : mDocument(aDocument) {}
+
+void SpeculationRules::RegisterFromScript(
+    nsIScriptElement* aScriptElement, UniquePtr<SpeculationRuleSet> aRuleSet) {
+  mRuleSetsFromScript.InsertOrUpdate(aScriptElement, std::move(aRuleSet));
+  ConsiderLoads();
+}
+
+void SpeculationRules::Unregister(nsIScriptElement* aScriptElement) {
+  mRuleSetsFromScript.Remove(aScriptElement);
+  ConsiderLoads();
+}
+
+namespace {
+
+class ConsiderSpeculativeLoadsMicrotask final
+    : public mozilla::MicroTaskRunnable {
+ public:
+  explicit ConsiderSpeculativeLoadsMicrotask(
+      SpeculationRules* aSpeculationRules)
+      : mSpeculationRules(aSpeculationRules) {}
+
+  void Run(AutoSlowOperation& ) override {
+    mSpeculationRules->InnerConsiderLoads();
+  }
+
+ private:
+  RefPtr<SpeculationRules> mSpeculationRules;
+};
+
+}  
+
+void SpeculationRules::ConsiderLoads() {
+  if (!mDocument->IsTopLevelContentDocument() ||
+      mConsiderSpeculativeLoadsMicrotaskQueued) {
+    return;
+  }
+  if (CycleCollectedJSContext* context = CycleCollectedJSContext::Get()) {
+    mConsiderSpeculativeLoadsMicrotaskQueued = true;
+    RefPtr mt = MakeRefPtr<ConsiderSpeculativeLoadsMicrotask>(this);
+    context->DispatchToMicroTask(mt.forget());
+  }
+}
+
+void SpeculationRules::InnerConsiderLoads() {
+  mConsiderSpeculativeLoadsMicrotaskQueued = false;
+
+  if (!mDocument || !mDocument->IsFullyActive()) {
+    return;
+  }
+
+  UniquePtr<PrefetchCandidates> prefetchCandidates =
+      PrefetchCandidates::Create();
+  for (auto& entry : mRuleSetsFromScript) {
+    entry.GetData()->ConsiderLoads(prefetchCandidates.get());
+  }
+
+
+  prefetchCandidates->Group();
+
+  for ([[maybe_unused]] PrefetchCandidate& candidate :
+       prefetchCandidates->AsArray()) {
+  }
+}
+
+}  

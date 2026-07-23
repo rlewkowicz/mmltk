@@ -1,0 +1,860 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsMathMLmoFrame.h"
+
+#include <algorithm>
+
+#include "gfxContext.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/StaticPrefs_mathml.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/MathMLElement.h"
+#include "nsCSSValue.h"
+#include "nsContentUtils.h"
+#include "nsFrameSelection.h"
+#include "nsGkAtoms.h"
+#include "nsLayoutUtils.h"
+#include "nsPresContext.h"
+
+using namespace mozilla;
+
+
+nsIFrame* NS_NewMathMLmoFrame(PresShell* aPresShell, ComputedStyle* aStyle) {
+  return new (aPresShell) nsMathMLmoFrame(aStyle, aPresShell->GetPresContext());
+}
+
+NS_IMPL_FRAMEARENA_HELPERS(nsMathMLmoFrame)
+
+nsMathMLmoFrame::~nsMathMLmoFrame() = default;
+
+static const char16_t kApplyFunction = char16_t(0x2061);
+static const char16_t kInvisibleTimes = char16_t(0x2062);
+static const char16_t kInvisibleSeparator = char16_t(0x2063);
+static const char16_t kInvisiblePlus = char16_t(0x2064);
+
+MathMLFrameType nsMathMLmoFrame::GetMathMLFrameType() {
+  return mFlags.Booleans().contains(OperatorBoolean::Invisible)
+             ? MathMLFrameType::OperatorInvisible
+             : MathMLFrameType::OperatorOrdinary;
+}
+
+bool nsMathMLmoFrame::IsFrameInSelection(nsIFrame* aFrame) {
+  NS_ASSERTION(aFrame, "null arg");
+  if (!aFrame || !aFrame->IsSelected()) {
+    return false;
+  }
+
+  const nsFrameSelection* frameSelection = aFrame->GetConstFrameSelection();
+  UniquePtr<SelectionDetails> details = frameSelection->LookUpSelection(
+      aFrame->GetContent(), 0, 1,
+      aFrame->ShouldPaintNormalSelection()
+          ? nsFrameSelection::IgnoreNormalSelection::No
+          : nsFrameSelection::IgnoreNormalSelection::Yes);
+
+  return details != nullptr;
+}
+
+bool nsMathMLmoFrame::UseMathMLChar() {
+  return (mFlags.Form() != OperatorForm::Unknown &&
+          mFlags.Booleans().contains(OperatorBoolean::Mutable)) ||
+         mFlags.Booleans().contains(OperatorBoolean::ForcesMathMLChar);
+}
+
+void nsMathMLmoFrame::BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                                       const nsDisplayListSet& aLists) {
+  bool useMathMLChar = UseMathMLChar();
+
+  if (!useMathMLChar) {
+    nsMathMLTokenFrame::BuildDisplayList(aBuilder, aLists);
+  } else {
+    DisplayBorderBackgroundOutline(aBuilder, aLists);
+
+    bool isSelected = false;
+    nsRect selectedRect;
+    nsIFrame* firstChild = mFrames.FirstChild();
+    if (IsFrameInSelection(firstChild)) {
+      mMathMLChar.GetRect(selectedRect);
+      selectedRect.Inflate(nsPresContext::CSSPixelsToAppUnits(1));
+      isSelected = true;
+    }
+    mMathMLChar.Display(aBuilder, this, aLists, 0,
+                        isSelected ? &selectedRect : nullptr);
+  }
+}
+
+void nsMathMLmoFrame::ProcessTextData() {
+  mFlags.Clear();
+
+  nsAutoString data;
+  nsContentUtils::GetNodeTextContent(mContent, false, data);
+
+  data.CompressWhitespace();
+  int32_t length = data.Length();
+  char16_t ch = (length == 0) ? char16_t('\0') : data[0];
+
+  if ((length == 1) && (ch == kApplyFunction || ch == kInvisibleSeparator ||
+                        ch == kInvisiblePlus || ch == kInvisibleTimes)) {
+    mFlags.Booleans() += OperatorBoolean::Invisible;
+  }
+
+  if (mFrames.GetLength() != 1) {
+    data.Truncate();  
+    mMathMLChar.SetData(data);
+    mMathMLChar.SetComputedStyle(Style());
+    return;
+  }
+
+  if (1 == length && ch == '-') {
+    ch = 0x2212;
+    data = ch;
+    mFlags.Booleans() += OperatorBoolean::ForcesMathMLChar;
+  }
+
+
+  OperatorBooleans allFlags;
+  for (const auto& form :
+       {OperatorForm::Infix, OperatorForm::Postfix, OperatorForm::Prefix}) {
+    nsOperatorFlags flags;
+    float dummy;
+    if (nsMathMLOperators::LookupOperator(data, form, &flags, &dummy, &dummy)) {
+      allFlags += flags.Booleans();
+    }
+  }
+
+  mFlags.Booleans() +=
+      allFlags &
+      OperatorBooleans({OperatorBoolean::Accent, OperatorBoolean::MovableLimits,
+                        OperatorBoolean::LargeOperator});
+
+  mMathMLChar.SetData(data);
+
+  mEmbellishData.direction = mMathMLChar.GetStretchDirection();
+
+  bool isMutable = allFlags.contains(OperatorBoolean::LargeOperator) ||
+                   (mEmbellishData.direction != StretchDirection::Unsupported);
+  if (isMutable) {
+    mFlags.Booleans() += OperatorBoolean::Mutable;
+  }
+
+  mMathMLChar.SetComputedStyle(Style());
+}
+
+void nsMathMLmoFrame::ProcessOperatorData() {
+  auto form = mFlags.Form();
+  nsAutoString value;
+  float fontSizeInflation = nsLayoutUtils::FontSizeInflationFor(this);
+
+  mFlags.SetForm(OperatorForm::Unknown);
+  mFlags.SetDirection(OperatorDirection::Unknown);
+  mFlags.Booleans() &=
+      {OperatorBoolean::Mutable,          OperatorBoolean::Accent,
+       OperatorBoolean::MovableLimits,    OperatorBoolean::Invisible,
+       OperatorBoolean::ForcesMathMLChar, OperatorBoolean::LargeOperator};
+
+  if (!mEmbellishData.coreFrame) {
+    form = OperatorForm::Infix;
+
+    mEmbellishData.flags.clear();
+    mEmbellishData.coreFrame = nullptr;
+    mEmbellishData.leadingSpace = 0;
+    mEmbellishData.trailingSpace = 0;
+    if (mMathMLChar.Length() != 1) {
+      mEmbellishData.direction = StretchDirection::Unsupported;
+    }
+
+    if (!mFrames.FirstChild()) {
+      return;
+    }
+
+    mEmbellishData.flags += MathMLEmbellishFlag::EmbellishedOperator;
+    mEmbellishData.coreFrame = this;
+
+
+
+    if (mFlags.Booleans().contains(OperatorBoolean::Accent)) {
+      mEmbellishData.flags += MathMLEmbellishFlag::Accent;
+    }
+    if (mFlags.Booleans().contains(OperatorBoolean::MovableLimits)) {
+      mEmbellishData.flags += MathMLEmbellishFlag::MovableLimits;
+    }
+    if (mFlags.Booleans().contains(OperatorBoolean::LargeOperator)) {
+      mEmbellishData.flags += MathMLEmbellishFlag::LargeOp;
+    }
+
+    if (mContent->AsElement()->GetAttr(nsGkAtoms::accent, value)) {
+      [&]() {
+        AutoTArray<nsString, 2> params;
+        auto parentName = GetParent()->GetContent()->NodeInfo()->NameAtom();
+        if (parentName == nsGkAtoms::mover) {
+          params.AppendElement(u"accent");
+          params.AppendElement(u"mover");
+        } else if (parentName == nsGkAtoms::munder) {
+          params.AppendElement(u"accentunder");
+          params.AppendElement(u"munder");
+        } else if (parentName == nsGkAtoms::munderover) {
+          params.AppendElement(u"accent/accentunder");
+          params.AppendElement(u"munderover");
+        } else {
+          return;
+        }
+        PresContext()->Document()->WarnOnceAndReportAbout(
+            dom::DeprecatedOperations::eMathML_DeprecatedMoExplicitAccent,
+            false, params);
+      }();
+      if (value.LowerCaseEqualsLiteral("true")) {
+        mEmbellishData.flags += MathMLEmbellishFlag::Accent;
+      } else if (value.LowerCaseEqualsLiteral("false")) {
+        mEmbellishData.flags -= MathMLEmbellishFlag::Accent;
+      }
+    }
+
+    mContent->AsElement()->GetAttr(nsGkAtoms::movablelimits, value);
+    if (value.LowerCaseEqualsLiteral("true")) {
+      mEmbellishData.flags += MathMLEmbellishFlag::MovableLimits;
+    } else if (value.LowerCaseEqualsLiteral("false")) {
+      mEmbellishData.flags -= MathMLEmbellishFlag::MovableLimits;
+    }
+
+    mFlags.SetForm(form);
+    return;
+  }
+
+  if (form != OperatorForm::Unknown) {
+    nsIFrame* embellishAncestor = this;
+    nsEmbellishData embellishData;
+    nsIFrame* parentAncestor = this;
+    do {
+      embellishAncestor = parentAncestor;
+      parentAncestor = embellishAncestor->GetParent();
+      GetEmbellishDataFrom(parentAncestor, embellishData);
+    } while (embellishData.coreFrame == this);
+
+    if (embellishAncestor != this) {
+      mFlags.Booleans() += OperatorBoolean::HasEmbellishAncestor;
+    } else {
+      mFlags.Booleans() -= OperatorBoolean::HasEmbellishAncestor;
+    }
+
+
+    nsIFrame* nextSibling = embellishAncestor->GetNextSibling();
+    nsIFrame* prevSibling = embellishAncestor->GetPrevSibling();
+
+    nsIMathMLFrame* mathAncestor = do_QueryFrame(parentAncestor);
+    bool zeroSpacing = false;
+    if (mathAncestor) {
+      zeroSpacing = !mathAncestor->IsMrowLike();
+    } else {
+      nsMathMLmathBlockFrame* blockFrame = do_QueryFrame(parentAncestor);
+      if (blockFrame) {
+        zeroSpacing = !blockFrame->IsMrowLike();
+      }
+    }
+    if (zeroSpacing) {
+      mFlags.Booleans() += OperatorBoolean::EmbellishIsIsolated;
+    } else {
+      mFlags.Booleans() -= OperatorBoolean::EmbellishIsIsolated;
+    }
+
+    form = OperatorForm::Infix;
+    mContent->AsElement()->GetAttr(nsGkAtoms::form, value);
+    if (!value.IsEmpty()) {
+      if (value.EqualsLiteral("prefix")) {
+        form = OperatorForm::Prefix;
+      } else if (value.EqualsLiteral("postfix")) {
+        form = OperatorForm::Postfix;
+      }
+    } else {
+      if (!prevSibling && nextSibling) {
+        form = OperatorForm::Prefix;
+      } else if (prevSibling && !nextSibling) {
+        form = OperatorForm::Postfix;
+      }
+    }
+    mFlags.SetForm(form);
+
+    float lspace = 5.0f / 18.0f;
+    float rspace = 5.0f / 18.0f;
+    nsAutoString data;
+    mMathMLChar.GetData(data);
+    nsOperatorFlags flags;
+    if (nsMathMLOperators::LookupOperatorWithFallback(data, form, &flags,
+                                                      &lspace, &rspace)) {
+      mFlags.SetForm(flags.Form());
+      mFlags.SetDirection(flags.Direction());
+      mFlags.Booleans() +=
+          flags.Booleans();  
+    }
+
+    if (!mFlags.Booleans().contains(OperatorBoolean::EmbellishIsIsolated) &&
+        (lspace || rspace)) {
+      nscoord em;
+      RefPtr<nsFontMetrics> fm =
+          nsLayoutUtils::GetFontMetricsForFrame(this, fontSizeInflation);
+      GetEmHeight(fm, em);
+
+      mEmbellishData.leadingSpace = NSToCoordRound(lspace * em);
+      mEmbellishData.trailingSpace = NSToCoordRound(rspace * em);
+
+      if (!StaticPrefs::
+              mathml_adjust_default_lspace_rspace_for_positive_scriptlevel_disabled() &&
+          StyleFont()->mMathDepth > 0 &&
+          !mFlags.Booleans().contains(OperatorBoolean::HasEmbellishAncestor)) {
+        mEmbellishData.leadingSpace /= 2;
+        mEmbellishData.trailingSpace /= 2;
+      }
+    }
+  }
+
+
+  nscoord leadingSpace = mEmbellishData.leadingSpace;
+  mContent->AsElement()->GetAttr(nsGkAtoms::lspace, value);
+  if (!value.IsEmpty()) {
+    nsCSSValue cssValue;
+    if (dom::MathMLElement::ParseNumericValue(value, cssValue,
+                                              mContent->OwnerDoc())) {
+      if ((eCSSUnit_Number == cssValue.GetUnit()) &&
+          !cssValue.GetFloatValue()) {
+        leadingSpace = 0;
+      } else if (cssValue.IsLengthUnit()) {
+        leadingSpace = CalcLength(cssValue, fontSizeInflation, this);
+      }
+      mFlags.Booleans() += OperatorBoolean::HasLSpaceAttribute;
+    }
+  }
+
+  nscoord trailingSpace = mEmbellishData.trailingSpace;
+  mContent->AsElement()->GetAttr(nsGkAtoms::rspace, value);
+  if (!value.IsEmpty()) {
+    nsCSSValue cssValue;
+    if (dom::MathMLElement::ParseNumericValue(value, cssValue,
+                                              mContent->OwnerDoc())) {
+      if ((eCSSUnit_Number == cssValue.GetUnit()) &&
+          !cssValue.GetFloatValue()) {
+        trailingSpace = 0;
+      } else if (cssValue.IsLengthUnit()) {
+        trailingSpace = CalcLength(cssValue, fontSizeInflation, this);
+      }
+      mFlags.Booleans() += OperatorBoolean::HasRSpaceAttribute;
+    }
+  }
+
+  if (leadingSpace || trailingSpace) {
+    nscoord onePixel = nsPresContext::CSSPixelsToAppUnits(1);
+    if (leadingSpace && leadingSpace < onePixel) {
+      leadingSpace = onePixel;
+    }
+    if (trailingSpace && trailingSpace < onePixel) {
+      trailingSpace = onePixel;
+    }
+  }
+
+  mEmbellishData.leadingSpace = leadingSpace;
+  mEmbellishData.trailingSpace = trailingSpace;
+
+
+
+  mContent->AsElement()->GetAttr(nsGkAtoms::stretchy, value);
+  if (value.LowerCaseEqualsLiteral("false")) {
+    mFlags.Booleans() -= OperatorBoolean::Stretchy;
+  } else if (value.LowerCaseEqualsLiteral("true")) {
+    mFlags.Booleans() += OperatorBoolean::Stretchy;
+  }
+  if (mFlags.Booleans().contains(OperatorBoolean::Fence)) {
+    mContent->AsElement()->GetAttr(nsGkAtoms::fence, value);
+    if (value.LowerCaseEqualsLiteral("false")) {
+      mFlags.Booleans() -= OperatorBoolean::Fence;
+    } else {
+      mEmbellishData.flags += MathMLEmbellishFlag::Fence;
+    }
+  }
+  mContent->AsElement()->GetAttr(nsGkAtoms::largeop, value);
+  if (value.LowerCaseEqualsLiteral("false")) {
+    mFlags.Booleans() -= OperatorBoolean::LargeOperator;
+    mEmbellishData.flags -= MathMLEmbellishFlag::LargeOp;
+  } else if (value.LowerCaseEqualsLiteral("true")) {
+    mFlags.Booleans() += OperatorBoolean::LargeOperator;
+    mEmbellishData.flags += MathMLEmbellishFlag::LargeOp;
+  }
+  if (mFlags.Booleans().contains(OperatorBoolean::Separator)) {
+    mContent->AsElement()->GetAttr(nsGkAtoms::separator, value);
+    if (value.LowerCaseEqualsLiteral("false")) {
+      mFlags.Booleans() -= OperatorBoolean::Separator;
+    } else {
+      mEmbellishData.flags += MathMLEmbellishFlag::Separator;
+    }
+  }
+  mContent->AsElement()->GetAttr(nsGkAtoms::symmetric, value);
+  if (value.LowerCaseEqualsLiteral("false")) {
+    mFlags.Booleans() -= OperatorBoolean::Symmetric;
+  } else if (value.LowerCaseEqualsLiteral("true")) {
+    mFlags.Booleans() += OperatorBoolean::Symmetric;
+  }
+
+  mMinSize = 0;
+  mContent->AsElement()->GetAttr(nsGkAtoms::minsize, value);
+  if (!value.IsEmpty()) {
+    nsCSSValue cssValue;
+    if (dom::MathMLElement::ParseNumericValue(value, cssValue,
+                                              mContent->OwnerDoc())) {
+      nsCSSUnit unit = cssValue.GetUnit();
+      if (eCSSUnit_Number == unit) {
+        mMinSize = cssValue.GetFloatValue();
+      } else if (eCSSUnit_Percent == unit) {
+        mMinSize = cssValue.GetPercentValue();
+      } else if (eCSSUnit_Null != unit) {
+        mMinSize = float(CalcLength(cssValue, fontSizeInflation, this));
+        mFlags.Booleans() += OperatorBoolean::MinSizeIsAbsolute;
+      }
+    }
+  }
+
+  mMaxSize = kMathMLOperatorSizeInfinity;
+  mContent->AsElement()->GetAttr(nsGkAtoms::maxsize, value);
+  if (!value.IsEmpty()) {
+    nsCSSValue cssValue;
+    if (dom::MathMLElement::ParseNumericValue(value, cssValue,
+                                              mContent->OwnerDoc())) {
+      nsCSSUnit unit = cssValue.GetUnit();
+      if (eCSSUnit_Number == unit) {
+        mMaxSize = cssValue.GetFloatValue();
+      } else if (eCSSUnit_Percent == unit) {
+        mMaxSize = cssValue.GetPercentValue();
+      } else if (eCSSUnit_Null != unit) {
+        mMaxSize = float(CalcLength(cssValue, fontSizeInflation, this));
+        mFlags.Booleans() += OperatorBoolean::MaxSizeIsAbsolute;
+      }
+    }
+  }
+}
+
+static MathMLStretchFlags GetStretchFlags(nsOperatorFlags aFlags,
+                                          nsPresentationData aPresentationData,
+                                          bool aIsVertical,
+                                          const nsStyleFont* aStyleFont) {
+  MathMLStretchFlags stretchFlags;
+  if (aFlags.Booleans().contains(OperatorBoolean::Mutable)) {
+    if (aStyleFont->mMathStyle == StyleMathStyle::Normal &&
+        aFlags.Booleans().contains(OperatorBoolean::LargeOperator)) {
+      stretchFlags =
+          MathMLStretchFlag::LargeOperator;  
+      if (aFlags.Booleans().contains(OperatorBoolean::Stretchy)) {
+        stretchFlags += MathMLStretchFlag::Nearer;
+        stretchFlags += MathMLStretchFlag::Larger;
+      }
+    } else if (aFlags.Booleans().contains(OperatorBoolean::Stretchy)) {
+      if (aIsVertical) {
+        stretchFlags = MathMLStretchFlag::Nearer;
+      } else {
+        stretchFlags = MathMLStretchFlag::Normal;
+      }
+    }
+  }
+  return stretchFlags;
+}
+
+NS_IMETHODIMP
+nsMathMLmoFrame::Stretch(DrawTarget* aDrawTarget,
+                         StretchDirection aStretchDirection,
+                         nsBoundingMetrics& aContainerSize,
+                         ReflowOutput& aDesiredStretchSize) {
+  if (mPresentationData.flags.contains(MathMLPresentationFlag::StretchDone)) {
+    NS_WARNING("it is wrong to fire stretch more than once on a frame");
+    return NS_OK;
+  }
+  mPresentationData.flags += MathMLPresentationFlag::StretchDone;
+
+  nsIFrame* firstChild = mFrames.FirstChild();
+
+  float fontSizeInflation = nsLayoutUtils::FontSizeInflationFor(this);
+  RefPtr<nsFontMetrics> fm =
+      nsLayoutUtils::GetFontMetricsForFrame(this, fontSizeInflation);
+  nscoord axisHeight, height;
+  GetAxisHeight(aDrawTarget, fm, axisHeight);
+
+  bool useMathMLChar = UseMathMLChar();
+
+  nsBoundingMetrics charSize;
+  nsBoundingMetrics container = aDesiredStretchSize.mBoundingMetrics;
+  bool isVertical = false;
+
+  if (((aStretchDirection == StretchDirection::Vertical) ||
+       (aStretchDirection == StretchDirection::Default)) &&
+      (mEmbellishData.direction == StretchDirection::Vertical)) {
+    isVertical = true;
+  }
+
+  auto stretchFlags =
+      GetStretchFlags(mFlags, mPresentationData, isVertical, StyleFont());
+
+  if (useMathMLChar) {
+    nsBoundingMetrics initialSize = aDesiredStretchSize.mBoundingMetrics;
+
+    if (!stretchFlags.isEmpty()) {
+      container = aContainerSize;
+
+
+      if (isVertical &&
+          mFlags.Booleans().contains(OperatorBoolean::Symmetric)) {
+        nscoord delta = std::max(container.ascent - axisHeight,
+                                 container.descent + axisHeight);
+        container.ascent = delta + axisHeight;
+        container.descent = delta - axisHeight;
+
+        delta = std::max(initialSize.ascent - axisHeight,
+                         initialSize.descent + axisHeight);
+        initialSize.ascent = delta + axisHeight;
+        initialSize.descent = delta - axisHeight;
+      }
+
+
+      if (mMaxSize != kMathMLOperatorSizeInfinity && mMaxSize > 0.0f) {
+        if (mFlags.Booleans().contains(OperatorBoolean::MaxSizeIsAbsolute)) {
+          float aspect =
+              mMaxSize / float(initialSize.ascent + initialSize.descent);
+          container.ascent =
+              std::min(container.ascent, nscoord(initialSize.ascent * aspect));
+          container.descent = std::min(container.descent,
+                                       nscoord(initialSize.descent * aspect));
+          container.width = std::min(container.width, (nscoord)mMaxSize);
+        } else {  
+          container.ascent = std::min(container.ascent,
+                                      nscoord(initialSize.ascent * mMaxSize));
+          container.descent = std::min(container.descent,
+                                       nscoord(initialSize.descent * mMaxSize));
+          container.width =
+              std::min(container.width, nscoord(initialSize.width * mMaxSize));
+        }
+
+        if (isVertical &&
+            !mFlags.Booleans().contains(OperatorBoolean::Symmetric)) {
+          height = container.ascent + container.descent;
+          container.descent = aContainerSize.descent;
+          container.ascent = height - container.descent;
+        }
+      }
+
+      if (mMinSize > 0.0f) {
+        if (aStretchDirection != StretchDirection::Default &&
+            aStretchDirection != mEmbellishData.direction) {
+          aStretchDirection = StretchDirection::Default;
+          container = initialSize;
+        }
+        if (mFlags.Booleans().contains(OperatorBoolean::MinSizeIsAbsolute)) {
+          float aspect =
+              mMinSize / float(initialSize.ascent + initialSize.descent);
+          container.ascent =
+              std::max(container.ascent, nscoord(initialSize.ascent * aspect));
+          container.descent = std::max(container.descent,
+                                       nscoord(initialSize.descent * aspect));
+          container.width = std::max(container.width, (nscoord)mMinSize);
+        } else {  
+          container.ascent = std::max(container.ascent,
+                                      nscoord(initialSize.ascent * mMinSize));
+          container.descent = std::max(container.descent,
+                                       nscoord(initialSize.descent * mMinSize));
+          container.width =
+              std::max(container.width, nscoord(initialSize.width * mMinSize));
+        }
+
+        if (isVertical &&
+            !mFlags.Booleans().contains(OperatorBoolean::Symmetric)) {
+          height = container.ascent + container.descent;
+          container.descent = aContainerSize.descent;
+          container.ascent = height - container.descent;
+        }
+      }
+    }
+
+    nsresult res = mMathMLChar.Stretch(
+        this, aDrawTarget, fontSizeInflation, aStretchDirection, container,
+        charSize, stretchFlags, GetWritingMode().IsBidiRTL());
+    if (NS_FAILED(res)) {
+      mFlags.SetForm(OperatorForm::Unknown);
+      useMathMLChar = false;
+    }
+  }
+
+  PlaceFlags flags(PlaceFlag::IgnoreBorderPadding,
+                   PlaceFlag::DoNotAdjustForWidthAndHeight);
+  Place(aDrawTarget, flags, aDesiredStretchSize);
+
+  if (useMathMLChar) {
+    mBoundingMetrics = charSize;
+
+    if (mMathMLChar.GetStretchDirection() != StretchDirection::Unsupported) {
+      bool largeopOnly =
+          stretchFlags.contains(MathMLStretchFlag::LargeOperator) &&
+          (stretchFlags & kMathMLStretchVariableSet).isEmpty();
+
+      if (isVertical) {
+
+        height = mBoundingMetrics.ascent + mBoundingMetrics.descent;
+        if (mFlags.Booleans().contains(OperatorBoolean::Symmetric)) {
+          mBoundingMetrics.descent = height / 2 - axisHeight;
+        } else if (!largeopOnly) {
+          mBoundingMetrics.descent =
+              height / 2 + (container.ascent + container.descent) / 2 -
+              container.ascent;
+        }  
+        mBoundingMetrics.ascent = height - mBoundingMetrics.descent;
+      }
+    }
+  }
+
+
+  bool isAccent = mEmbellishData.flags.contains(MathMLEmbellishFlag::Accent);
+  if (isAccent) {
+    nsEmbellishData parentData;
+    GetEmbellishDataFrom(GetParent(), parentData);
+    isAccent = (parentData.flags.contains(MathMLEmbellishFlag::AccentOver) ||
+                parentData.flags.contains(MathMLEmbellishFlag::AccentUnder)) &&
+               parentData.coreFrame != this;
+  }
+  if (isAccent && firstChild) {
+    nscoord dy =
+        aDesiredStretchSize.BlockStartAscent() - (mBoundingMetrics.ascent);
+    aDesiredStretchSize.SetBlockStartAscent(mBoundingMetrics.ascent);
+    aDesiredStretchSize.Height() =
+        aDesiredStretchSize.BlockStartAscent() + mBoundingMetrics.descent;
+
+    firstChild->SetPosition(firstChild->GetPosition() - nsPoint(0, dy));
+  } else if (useMathMLChar) {
+    nscoord ascent = fm->MaxAscent();
+    nscoord descent = fm->MaxDescent();
+    aDesiredStretchSize.SetBlockStartAscent(
+        std::max(mBoundingMetrics.ascent, ascent));
+    aDesiredStretchSize.Height() = aDesiredStretchSize.BlockStartAscent() +
+                                   std::max(mBoundingMetrics.descent, descent);
+  }
+  aDesiredStretchSize.Width() = mBoundingMetrics.width;
+  aDesiredStretchSize.mBoundingMetrics = mBoundingMetrics;
+  mReference.x = 0;
+  mReference.y = aDesiredStretchSize.BlockStartAscent();
+  if (useMathMLChar) {
+    nscoord dy =
+        aDesiredStretchSize.BlockStartAscent() - mBoundingMetrics.ascent;
+    mMathMLChar.SetRect(
+        nsRect(0, dy, charSize.width, charSize.ascent + charSize.descent));
+  }
+
+
+  nscoord leadingSpace = 0, trailingSpace = 0;
+  if (!StaticPrefs::
+          mathml_lspace_rspace_for_child_spacing_during_mrow_layout_enabled() &&
+      !mFlags.Booleans().contains(OperatorBoolean::HasEmbellishAncestor)) {
+    if (!isAccent ||
+        mFlags.Booleans().contains(OperatorBoolean::HasLSpaceAttribute)) {
+      leadingSpace = mEmbellishData.leadingSpace;
+    }
+    if (!isAccent ||
+        mFlags.Booleans().contains(OperatorBoolean::HasRSpaceAttribute)) {
+      trailingSpace = mEmbellishData.trailingSpace;
+    }
+  }
+
+  flags = PlaceFlags();
+  auto sizes = GetWidthAndHeightForPlaceAdjustment(flags);
+  auto borderPadding = GetBorderPaddingForPlace(flags);
+  if (leadingSpace || trailingSpace || !borderPadding.IsAllZero() ||
+      sizes.width || sizes.height) {
+    mBoundingMetrics.width += leadingSpace + trailingSpace;
+    aDesiredStretchSize.Width() = mBoundingMetrics.width;
+    aDesiredStretchSize.mBoundingMetrics.width = mBoundingMetrics.width;
+
+    nscoord dx = GetWritingMode().IsBidiRTL() ? trailingSpace : leadingSpace;
+    mBoundingMetrics.leftBearing += dx;
+    mBoundingMetrics.rightBearing += dx;
+    aDesiredStretchSize.mBoundingMetrics.leftBearing += dx;
+    aDesiredStretchSize.mBoundingMetrics.rightBearing += dx;
+
+    dx += ApplyAdjustmentForWidthAndHeight(flags, sizes, aDesiredStretchSize,
+                                           mBoundingMetrics);
+
+    InflateReflowAndBoundingMetrics(borderPadding, aDesiredStretchSize,
+                                    mBoundingMetrics);
+    dx += borderPadding.left;
+    nscoord dy = borderPadding.top;
+
+    if (dx || dy) {
+
+      if (useMathMLChar) {
+        nsRect rect;
+        mMathMLChar.GetRect(rect);
+        mMathMLChar.SetRect(
+            nsRect(rect.x + dx, rect.y + dy, rect.width, rect.height));
+      } else {
+        nsIFrame* childFrame = firstChild;
+        while (childFrame) {
+          childFrame->SetPosition(childFrame->GetPosition() + nsPoint(dx, dy));
+          childFrame = childFrame->GetNextSibling();
+        }
+      }
+    }
+  }
+
+  ClearSavedChildMetrics();
+  GatherAndStoreOverflow(&aDesiredStretchSize);
+
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsMathMLmoFrame::InheritAutomaticData(nsIFrame* aParent) {
+  StretchDirection direction = mEmbellishData.direction;
+  nsMathMLTokenFrame::InheritAutomaticData(aParent);
+  ProcessTextData();
+  mEmbellishData.direction = direction;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsMathMLmoFrame::TransmitAutomaticData() {
+  mEmbellishData.coreFrame = nullptr;
+  ProcessOperatorData();
+  return NS_OK;
+}
+
+void nsMathMLmoFrame::SetInitialChildList(ChildListID aListID,
+                                          nsFrameList&& aChildList) {
+  nsMathMLTokenFrame::SetInitialChildList(aListID, std::move(aChildList));
+  ProcessTextData();
+}
+
+void nsMathMLmoFrame::Reflow(nsPresContext* aPresContext,
+                             ReflowOutput& aDesiredSize,
+                             const ReflowInput& aReflowInput,
+                             nsReflowStatus& aStatus) {
+  MOZ_ASSERT(aStatus.IsEmpty(), "Caller should pass a fresh reflow status!");
+
+  ProcessOperatorData();
+
+  nsMathMLTokenFrame::Reflow(aPresContext, aDesiredSize, aReflowInput, aStatus);
+}
+
+void nsMathMLmoFrame::Place(DrawTarget* aDrawTarget, const PlaceFlags& aFlags,
+                            ReflowOutput& aDesiredSize) {
+  nsMathMLTokenFrame::Place(aDrawTarget, aFlags, aDesiredSize);
+
+
+  if (aFlags.contains(PlaceFlag::MeasureOnly) &&
+      StyleFont()->mMathStyle == StyleMathStyle::Normal &&
+      mFlags.Booleans().contains(OperatorBoolean::LargeOperator) &&
+      UseMathMLChar()) {
+    nsBoundingMetrics newMetrics;
+    nsresult rv = mMathMLChar.Stretch(
+        this, aDrawTarget, nsLayoutUtils::FontSizeInflationFor(this),
+        StretchDirection::Vertical, aDesiredSize.mBoundingMetrics, newMetrics,
+        MathMLStretchFlag::LargeOperator, GetWritingMode().IsBidiRTL());
+
+    if (NS_FAILED(rv)) {
+      return;
+    }
+
+    aDesiredSize.mBoundingMetrics = newMetrics;
+    aDesiredSize.SetBlockStartAscent(
+        std::max(mBoundingMetrics.ascent, newMetrics.ascent));
+    aDesiredSize.Height() =
+        aDesiredSize.BlockStartAscent() +
+        std::max(mBoundingMetrics.descent, newMetrics.descent);
+    aDesiredSize.Width() = newMetrics.width;
+    mBoundingMetrics = newMetrics;
+  }
+}
+
+void nsMathMLmoFrame::MarkIntrinsicISizesDirty() {
+
+  ProcessTextData();
+
+  nsIFrame* target = this;
+  nsEmbellishData embellishData;
+  do {
+    target = target->GetParent();
+    GetEmbellishDataFrom(target, embellishData);
+  } while (embellishData.coreFrame == this);
+
+  RebuildAutomaticDataForChildren(target);
+
+  nsMathMLContainerFrame::MarkIntrinsicISizesDirty();
+}
+
+void nsMathMLmoFrame::GetIntrinsicISizeMetrics(gfxContext* aRenderingContext,
+                                               ReflowOutput& aDesiredSize) {
+  ProcessOperatorData();
+  if (UseMathMLChar()) {
+    auto stretchFlags =
+        GetStretchFlags(mFlags, mPresentationData, true, StyleFont());
+    aDesiredSize.Width() = mMathMLChar.GetMaxWidth(
+        this, aRenderingContext->GetDrawTarget(),
+        nsLayoutUtils::FontSizeInflationFor(this), stretchFlags);
+    aDesiredSize.Width() += IntrinsicISizeOffsets().BorderPadding();
+  } else {
+    nsMathMLTokenFrame::GetIntrinsicISizeMetrics(aRenderingContext,
+                                                 aDesiredSize);
+  }
+
+  nscoord leadingSpace = 0, trailingSpace = 0;
+  if (!StaticPrefs::
+          mathml_lspace_rspace_for_child_spacing_during_mrow_layout_enabled()) {
+    leadingSpace = mEmbellishData.leadingSpace;
+    trailingSpace = mEmbellishData.trailingSpace;
+  }
+  bool isRTL = GetWritingMode().IsBidiRTL();
+  aDesiredSize.Width() += leadingSpace + trailingSpace;
+  aDesiredSize.mBoundingMetrics.width = aDesiredSize.Width();
+  if (isRTL) {
+    aDesiredSize.mBoundingMetrics.leftBearing += trailingSpace;
+    aDesiredSize.mBoundingMetrics.rightBearing += trailingSpace;
+  } else {
+    aDesiredSize.mBoundingMetrics.leftBearing += leadingSpace;
+    aDesiredSize.mBoundingMetrics.rightBearing += leadingSpace;
+  }
+}
+
+nsresult nsMathMLmoFrame::AttributeChanged(int32_t aNameSpaceID,
+                                           nsAtom* aAttribute,
+                                           AttrModType aModType) {
+  if (aAttribute == nsGkAtoms::accent || aAttribute == nsGkAtoms::form ||
+      aAttribute == nsGkAtoms::largeop || aAttribute == nsGkAtoms::maxsize ||
+      aAttribute == nsGkAtoms::minsize ||
+      aAttribute == nsGkAtoms::movablelimits ||
+      aAttribute == nsGkAtoms::rspace || aAttribute == nsGkAtoms::stretchy ||
+      aAttribute == nsGkAtoms::symmetric || aAttribute == nsGkAtoms::lspace) {
+    nsIFrame* target = this;
+    nsEmbellishData embellishData;
+    do {
+      target = target->GetParent();
+      GetEmbellishDataFrom(target, embellishData);
+    } while (embellishData.coreFrame == this);
+
+    return ReLayoutChildren(target);
+  }
+
+  return nsMathMLTokenFrame::AttributeChanged(aNameSpaceID, aAttribute,
+                                              aModType);
+}
+
+void nsMathMLmoFrame::DidSetComputedStyle(ComputedStyle* aOldStyle) {
+  nsMathMLTokenFrame::DidSetComputedStyle(aOldStyle);
+  mMathMLChar.SetComputedStyle(Style());
+}
+
+nscoord nsMathMLmoFrame::ItalicCorrection() {
+  return UseMathMLChar() ? mMathMLChar.ItalicCorrection() : 0;
+}
+
+nscoord nsMathMLmoFrame::FixInterFrameSpacing(ReflowOutput& aDesiredSize) {
+  nscoord gap = nsMathMLContainerFrame::FixInterFrameSpacing(aDesiredSize);
+  if (!gap) {
+    return 0;
+  }
+
+  nsRect rect;
+  mMathMLChar.GetRect(rect);
+  rect.MoveBy(gap, 0);
+  mMathMLChar.SetRect(rect);
+
+  return gap;
+}

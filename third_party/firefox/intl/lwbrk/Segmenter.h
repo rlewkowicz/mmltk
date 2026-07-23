@@ -1,0 +1,162 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef intl_components_Segmenter_h_
+#define intl_components_Segmenter_h_
+
+#include "mozilla/intl/ICUError.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Result.h"
+#include "mozilla/Span.h"
+#include "mozilla/UniquePtr.h"
+
+namespace icu4x::capi {
+struct LineSegmenter;
+struct LineBreakIteratorUtf16;
+struct WordSegmenter;
+struct WordBreakIteratorUtf16;
+struct GraphemeClusterSegmenter;
+struct GraphemeClusterBreakIteratorUtf16;
+struct SentenceSegmenter;
+struct SentenceBreakIteratorUtf16;
+}  
+
+namespace mozilla::intl {
+
+enum class SegmenterGranularity : uint8_t {
+  Grapheme,
+  Word,
+  Sentence,
+  Line,
+};
+
+struct SegmenterOptions final {
+  SegmenterGranularity mGranularity = SegmenterGranularity::Grapheme;
+};
+
+class SegmentIteratorUtf16 {
+ public:
+  virtual ~SegmentIteratorUtf16() = default;
+
+  SegmentIteratorUtf16(SegmentIteratorUtf16&&) = delete;
+  SegmentIteratorUtf16& operator=(SegmentIteratorUtf16&&) = delete;
+  SegmentIteratorUtf16(const SegmentIteratorUtf16&) = delete;
+  SegmentIteratorUtf16& operator=(const SegmentIteratorUtf16&) = delete;
+
+  virtual Maybe<uint32_t> Next() = 0;
+
+  virtual Maybe<uint32_t> Seek(uint32_t aPos);
+
+ protected:
+  explicit SegmentIteratorUtf16(Span<const char16_t> aText);
+
+  Span<const char16_t> mText;
+
+  uint32_t mPos = 0;
+};
+
+enum class WordBreakRule : uint8_t {
+  Normal = 0,
+  BreakAll,
+  KeepAll,
+};
+
+enum class LineBreakRule : uint8_t {
+  Auto = 0,
+  Loose,
+  Normal,
+  Strict,
+  Anywhere,
+};
+
+struct LineBreakOptions final {
+  WordBreakRule mWordBreakRule = WordBreakRule::Normal;
+  LineBreakRule mLineBreakRule = LineBreakRule::Auto;
+  bool mScriptIsChineseOrJapanese = false;
+};
+
+class LineBreakIteratorUtf16 final : public SegmentIteratorUtf16 {
+ public:
+  explicit LineBreakIteratorUtf16(Span<const char16_t> aText,
+                                  const LineBreakOptions& aOptions = {});
+  ~LineBreakIteratorUtf16() override;
+
+  Maybe<uint32_t> Next() override;
+  Maybe<uint32_t> Seek(uint32_t aPos) override;
+
+ private:
+  LineBreakOptions mOptions;
+
+  icu4x::capi::LineSegmenter* mSegmenter = nullptr;
+  icu4x::capi::LineBreakIteratorUtf16* mIterator = nullptr;
+};
+
+class WordBreakIteratorUtf16 final : public SegmentIteratorUtf16 {
+ public:
+  explicit WordBreakIteratorUtf16(Span<const char16_t> aText);
+  ~WordBreakIteratorUtf16() override;
+
+  void Reset(Span<const char16_t> aText);
+  Maybe<uint32_t> Next() override;
+  Maybe<uint32_t> Seek(uint32_t aPos) override;
+
+ private:
+  icu4x::capi::WordSegmenter* mSegmenter = nullptr;
+  icu4x::capi::WordBreakIteratorUtf16* mIterator = nullptr;
+};
+
+class GraphemeClusterBreakIteratorUtf16 final : public SegmentIteratorUtf16 {
+ public:
+  explicit GraphemeClusterBreakIteratorUtf16(Span<const char16_t> aText);
+  ~GraphemeClusterBreakIteratorUtf16() override;
+
+  Maybe<uint32_t> Next() override;
+  Maybe<uint32_t> Seek(uint32_t aPos) override;
+
+ private:
+  static icu4x::capi::GraphemeClusterSegmenter* sSegmenter;
+  icu4x::capi::GraphemeClusterBreakIteratorUtf16* mIterator = nullptr;
+};
+
+class GraphemeClusterBreakReverseIteratorUtf16 final
+    : public SegmentIteratorUtf16 {
+ public:
+  explicit GraphemeClusterBreakReverseIteratorUtf16(Span<const char16_t> aText);
+
+  Maybe<uint32_t> Next() override;
+  Maybe<uint32_t> Seek(uint32_t aPos) override;
+};
+
+class SentenceBreakIteratorUtf16 final : public SegmentIteratorUtf16 {
+ public:
+  explicit SentenceBreakIteratorUtf16(Span<const char16_t> aText);
+  ~SentenceBreakIteratorUtf16() override;
+
+  Maybe<uint32_t> Next() override;
+  Maybe<uint32_t> Seek(uint32_t aPos) override;
+
+ private:
+  icu4x::capi::SentenceSegmenter* mSegmenter = nullptr;
+  icu4x::capi::SentenceBreakIteratorUtf16* mIterator = nullptr;
+};
+
+class Segmenter final {
+ public:
+  static Result<UniquePtr<Segmenter>, ICUError> TryCreate(
+      Span<const char> aLocale, const SegmenterOptions& aOptions);
+
+  explicit Segmenter(Span<const char> aLocale, const SegmenterOptions& aOptions)
+      : mOptions(aOptions) {}
+
+  UniquePtr<SegmentIteratorUtf16> Segment(Span<const char16_t> aText) const;
+
+
+ private:
+  SegmenterOptions mOptions;
+};
+
+}  
+
+#endif

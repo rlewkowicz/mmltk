@@ -1,0 +1,59 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_${HEADER}_h
+#define mozilla_${HEADER}_h
+
+#if defined(__cpp_exceptions) && __cpp_exceptions
+#  error "STL code can only be used with -fno-exceptions"
+#endif
+
+#pragma GCC system_header
+
+#if defined(DEBUG) && !defined(_GLIBCXX_DEBUG)
+#endif
+
+#ifndef moz_dont_include_mozalloc_for_cstdlib
+#  define moz_dont_include_mozalloc_for_cstdlib
+#endif
+
+#ifndef moz_dont_include_mozalloc_for_cmath
+#  define moz_dont_include_mozalloc_for_cmath
+#endif
+
+#ifndef moz_dont_include_mozalloc_for_type_traits
+#  define moz_dont_include_mozalloc_for_type_traits
+#endif
+
+#ifndef moz_dont_include_mozalloc_for_limits
+#  define moz_dont_include_mozalloc_for_limits
+#endif
+
+#ifndef moz_dont_include_mozalloc_for_iosfwd
+#  define moz_dont_include_mozalloc_for_iosfwd
+#endif
+
+#if !defined(MOZ_INCLUDE_MOZALLOC_H) && \
+    !defined(moz_dont_include_mozalloc_for_${HEADER})
+#  define MOZ_INCLUDE_MOZALLOC_H
+#  define MOZ_INCLUDE_MOZALLOC_H_FROM_${HEADER}
+#endif
+
+#pragma GCC visibility push(default)
+#include_next <${HEADER}>
+#pragma GCC visibility pop
+
+#ifdef MOZ_INCLUDE_MOZALLOC_H_FROM_${HEADER}
+#  if !defined(NS_NO_XPCOM) && !defined(MOZ_NO_MOZALLOC)
+#    include "mozilla/mozalloc.h"
+#  else
+#    error "STL code can only be used with infallible ::operator new()"
+#  endif
+#endif
+
+#ifndef mozilla_throw_gcc_h
+#  include "mozilla/throw_gcc.h"
+#endif
+
+#endif  // if mozilla_${HEADER}_h

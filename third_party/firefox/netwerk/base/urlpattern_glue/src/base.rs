@@ -1,0 +1,112 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+use nsstring::nsCString;
+use std::ffi::c_void;
+
+#[derive(Debug, Clone)]
+#[repr(C)]
+pub struct MaybeString {
+    pub string: nsCString,
+    pub valid: bool,
+}
+
+impl MaybeString {
+    pub fn new(s: &nsCString) -> Self {
+        Self {
+            string: s.clone(),
+            valid: true,
+        }
+    }
+    pub fn none() -> Self {
+        Self {
+            string: nsCString::new(),
+            valid: false,
+        }
+    }
+}
+
+#[repr(transparent)]
+pub struct UrlPatternGlue(pub *mut c_void);
+
+#[repr(transparent)]
+pub struct UrlPatternComponentPtr(pub *mut c_void);
+
+#[repr(transparent)]
+pub struct UrlPatternMatcherPtr(pub *mut c_void);
+
+#[repr(transparent)]
+pub struct RegExpObjWrapper(pub *mut c_void);
+
+#[derive(Debug, Clone)]
+#[repr(C)]
+pub struct UrlPatternInit {
+    pub protocol: MaybeString,
+    pub username: MaybeString,
+    pub password: MaybeString,
+    pub hostname: MaybeString,
+    pub port: MaybeString,
+    pub pathname: MaybeString,
+    pub search: MaybeString,
+    pub hash: MaybeString,
+    pub base_url: MaybeString,
+}
+
+impl UrlPatternInit {
+    pub fn none() -> Self {
+        Self {
+            protocol: MaybeString::none(),
+            username: MaybeString::none(),
+            password: MaybeString::none(),
+            hostname: MaybeString::none(),
+            port: MaybeString::none(),
+            pathname: MaybeString::none(),
+            search: MaybeString::none(),
+            hash: MaybeString::none(),
+            base_url: MaybeString::none(),
+        }
+    }
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct UrlPatternMatchInput {
+    pub protocol: nsCString,
+    pub username: nsCString,
+    pub password: nsCString,
+    pub hostname: nsCString,
+    pub port: nsCString,
+    pub pathname: nsCString,
+    pub search: nsCString,
+    pub hash: nsCString,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub enum UrlPatternStringOrInitType {
+    String,
+    Init,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct UrlPatternInput {
+    pub string_or_init_type: UrlPatternStringOrInitType,
+    pub str: nsCString,
+    pub init: UrlPatternInit,
+    pub base: MaybeString,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct UrlPatternMatchInputAndInputs {
+    pub input: UrlPatternMatchInput,
+    pub inputs: UrlPatternInput,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct UrlPatternOptions {
+    pub ignore_case: bool,
+}

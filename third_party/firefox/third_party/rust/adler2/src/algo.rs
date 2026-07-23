@@ -1,0 +1,105 @@
+use crate::Adler32;
+use std::ops::{AddAssign, MulAssign, RemAssign};
+
+impl Adler32 {
+    pub(crate) fn compute(&mut self, bytes: &[u8]) {
+
+        const MOD: u32 = 65521;
+        const CHUNK_SIZE: usize = 5552 * 4;
+
+        let mut a = u32::from(self.a);
+        let mut b = u32::from(self.b);
+        let mut a_vec = U32X4([0; 4]);
+        let mut b_vec = a_vec;
+
+        let (bytes, remainder) = bytes.split_at(bytes.len() - bytes.len() % 4);
+
+        let chunk_iter = bytes.chunks_exact(CHUNK_SIZE);
+        let remainder_chunk = chunk_iter.remainder();
+        for chunk in chunk_iter {
+            for byte_vec in chunk.chunks_exact(4) {
+                let val = U32X4::from(byte_vec);
+                a_vec += val;
+                b_vec += a_vec;
+            }
+
+            b += CHUNK_SIZE as u32 * a;
+            a_vec %= MOD;
+            b_vec %= MOD;
+            b %= MOD;
+        }
+        for byte_vec in remainder_chunk.chunks_exact(4) {
+            let val = U32X4::from(byte_vec);
+            a_vec += val;
+            b_vec += a_vec;
+        }
+        b += remainder_chunk.len() as u32 * a;
+        a_vec %= MOD;
+        b_vec %= MOD;
+        b %= MOD;
+
+        b_vec *= 4;
+        b_vec.0[1] += MOD - a_vec.0[1];
+        b_vec.0[2] += (MOD - a_vec.0[2]) * 2;
+        b_vec.0[3] += (MOD - a_vec.0[3]) * 3;
+        for &av in a_vec.0.iter() {
+            a += av;
+        }
+        for &bv in b_vec.0.iter() {
+            b += bv;
+        }
+
+        for &byte in remainder.iter() {
+            a += u32::from(byte);
+            b += a;
+        }
+
+        self.a = (a % MOD) as u16;
+        self.b = (b % MOD) as u16;
+    }
+}
+
+#[derive(Copy, Clone)]
+struct U32X4([u32; 4]);
+
+impl U32X4 {
+    #[inline]
+    fn from(bytes: &[u8]) -> Self {
+        U32X4([
+            u32::from(bytes[0]),
+            u32::from(bytes[1]),
+            u32::from(bytes[2]),
+            u32::from(bytes[3]),
+        ])
+    }
+}
+
+impl AddAssign<Self> for U32X4 {
+    #[inline]
+    fn add_assign(&mut self, other: Self) {
+        self.0[0] += other.0[0];
+        self.0[1] += other.0[1];
+        self.0[2] += other.0[2];
+        self.0[3] += other.0[3];
+    }
+}
+
+impl RemAssign<u32> for U32X4 {
+    #[inline]
+    fn rem_assign(&mut self, quotient: u32) {
+        self.0[0] %= quotient;
+        self.0[1] %= quotient;
+        self.0[2] %= quotient;
+        self.0[3] %= quotient;
+    }
+}
+
+impl MulAssign<u32> for U32X4 {
+    #[inline]
+    fn mul_assign(&mut self, rhs: u32) {
+        self.0[0] *= rhs;
+        self.0[1] *= rhs;
+        self.0[2] *= rhs;
+        self.0[3] *= rhs;
+    }
+}

@@ -1,0 +1,37 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_indexeddb_flippedonce_h_
+#define mozilla_dom_indexeddb_flippedonce_h_
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+
+namespace mozilla {
+
+template <bool Initial>
+class FlippedOnce {
+ public:
+  FlippedOnce(const FlippedOnce&) = delete;
+  FlippedOnce& operator=(const FlippedOnce&) = delete;
+  FlippedOnce(FlippedOnce&&) = default;
+  FlippedOnce& operator=(FlippedOnce&&) = default;
+
+  constexpr FlippedOnce() = default;
+
+  MOZ_IMPLICIT constexpr operator bool() const { return mValue; };
+
+  constexpr void Flip() {
+    MOZ_ASSERT(mValue == Initial);
+    EnsureFlipped();
+  }
+
+  constexpr void EnsureFlipped() { mValue = !Initial; }
+
+ private:
+  bool mValue = Initial;
+};
+}  
+
+#endif

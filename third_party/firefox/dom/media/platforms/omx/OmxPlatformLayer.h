@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(OmxPlatformLayer_h_)
+#  define OmxPlatformLayer_h_
+
+#  include "OMX_Core.h"
+#  include "OMX_Types.h"
+#  include "OMX_Video.h"
+#  include "OmxPromiseLayer.h"
+#  include "nsStringFwd.h"
+
+namespace mozilla {
+
+class TaskQueue;
+class TrackInfo;
+
+class OmxPlatformLayer {
+ public:
+  typedef OmxPromiseLayer::BUFFERLIST BUFFERLIST;
+  typedef OmxPromiseLayer::BufferData BufferData;
+
+  virtual OMX_ERRORTYPE InitOmxToStateLoaded(const TrackInfo* aInfo) = 0;
+
+  OMX_ERRORTYPE Config();
+
+  virtual OMX_ERRORTYPE EmptyThisBuffer(BufferData* aData) = 0;
+
+  virtual OMX_ERRORTYPE FillThisBuffer(BufferData* aData) = 0;
+
+  virtual OMX_ERRORTYPE SendCommand(OMX_COMMANDTYPE aCmd, OMX_U32 aParam1,
+                                    OMX_PTR aCmdData) = 0;
+
+  virtual nsresult AllocateOmxBuffer(OMX_DIRTYPE aType,
+                                     BUFFERLIST* aBufferList) = 0;
+
+  virtual nsresult ReleaseOmxBuffer(OMX_DIRTYPE aType,
+                                    BUFFERLIST* aBufferList) = 0;
+
+  virtual OMX_ERRORTYPE GetState(OMX_STATETYPE* aType) = 0;
+
+  virtual OMX_ERRORTYPE GetParameter(OMX_INDEXTYPE aParamIndex,
+                                     OMX_PTR aComponentParameterStructure,
+                                     OMX_U32 aComponentParameterSize) = 0;
+
+  virtual OMX_ERRORTYPE SetParameter(OMX_INDEXTYPE nIndex,
+                                     OMX_PTR aComponentParameterStructure,
+                                     OMX_U32 aComponentParameterSize) = 0;
+
+  virtual nsresult Shutdown() = 0;
+
+  virtual ~OmxPlatformLayer() = default;
+
+  OMX_U32 InputPortIndex() { return mStartPortNumber; }
+
+  OMX_U32 OutputPortIndex() { return mStartPortNumber + 1; }
+
+  void GetPortIndices(nsTArray<uint32_t>& aPortIndex) {
+    aPortIndex.AppendElement(InputPortIndex());
+    aPortIndex.AppendElement(OutputPortIndex());
+  }
+
+  virtual OMX_VIDEO_CODINGTYPE CompressionFormat();
+
+  static bool SupportsMimeType(const nsACString& aMimeType);
+
+  static OmxPlatformLayer* Create(OmxDataDecoder* aDataDecoder,
+                                  OmxPromiseLayer* aPromiseLayer,
+                                  TaskQueue* aTaskQueue,
+                                  layers::ImageContainer* aImageContainer);
+
+ protected:
+  OmxPlatformLayer() : mInfo(nullptr), mStartPortNumber(0) {}
+
+  const TrackInfo* mInfo;
+  OMX_U32 mStartPortNumber;
+};
+
+}  
+
+#endif  // OmxPlatformLayer_h_

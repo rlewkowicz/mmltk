@@ -1,0 +1,203 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SourceSurfaceWebgl.h"
+
+#include "DrawTargetWebglInternal.h"
+#include "WebGLBuffer.h"
+#include "mozilla/gfx/Swizzle.h"
+
+namespace mozilla::gfx {
+
+SourceSurfaceWebgl::SourceSurfaceWebgl(DrawTargetWebgl* aDT)
+    : mFormat(aDT->GetFormat()),
+      mSize(aDT->GetSize()),
+      mDT(aDT),
+      mSharedContext(aDT->mSharedContext) {}
+
+SourceSurfaceWebgl::SourceSurfaceWebgl(
+    const RefPtr<SharedContextWebgl>& aSharedContext)
+    : mSharedContext(aSharedContext) {}
+
+SourceSurfaceWebgl::~SourceSurfaceWebgl() {
+  if (mHandle) {
+    mHandle->ClearSurface();
+  }
+  if (mReadBuffer) {
+    if (RefPtr<SharedContextWebgl> sharedContext = {mSharedContext}) {
+      sharedContext->RemoveSnapshotPBO(this, mReadBuffer.forget());
+    }
+    mReadBuffer = nullptr;
+  }
+}
+
+inline bool SourceSurfaceWebgl::EnsureData(bool aForce, uint8_t* aData,
+                                           int32_t aStride) {
+  if (mData) {
+    if (aData) {
+      DataSourceSurface::ScopedMap map(mData, MapType::READ);
+      if (!map.IsMapped()) {
+        return false;
+      }
+      SwizzleData(map.GetData(), map.GetStride(), mFormat, aData, aStride,
+                  mFormat, mSize);
+    }
+    return true;
+  }
+
+  if (mReadBuffer) {
+    if (RefPtr<SharedContextWebgl> sharedContext = {mSharedContext}) {
+      mData = sharedContext->ReadSnapshotFromPBO(mReadBuffer, mFormat, mSize,
+                                                 aData, aStride);
+      mOwnsData = !mData || !aData;
+      sharedContext->RemoveSnapshotPBO(this, mReadBuffer.forget());
+    }
+    mReadBuffer = nullptr;
+    return !!mData;
+  }
+
+  if (RefPtr<DrawTargetWebgl> dt = {mDT}) {
+    if (!aForce) {
+      mReadBuffer = dt->ReadSnapshotIntoPBO(this);
+    }
+    if (!mReadBuffer) {
+      mData = dt->ReadSnapshot(aData, aStride);
+      mOwnsData = !mData || !aData;
+    }
+  } else if (mHandle) {
+    if (RefPtr<SharedContextWebgl> sharedContext = {mSharedContext}) {
+      if (!aForce) {
+        mReadBuffer = sharedContext->ReadSnapshotIntoPBO(this, mHandle);
+      }
+      if (!mReadBuffer) {
+        mData = sharedContext->ReadSnapshot(mHandle, aData, aStride);
+        mOwnsData = !mData || !aData;
+      }
+    }
+  }
+  return mData || mReadBuffer;
+}
+
+bool SourceSurfaceWebgl::ReadDataInto(uint8_t* aData, int32_t aStride) {
+  return EnsureData(true, aData, aStride);
+}
+
+bool SourceSurfaceWebgl::ForceReadFromPBO() {
+  if (mReadBuffer && EnsureData()) {
+    MOZ_ASSERT(!mReadBuffer);
+    return true;
+  }
+  return false;
+}
+
+uint8_t* SourceSurfaceWebgl::GetData() {
+  if (!EnsureData()) {
+    return nullptr;
+  }
+  if (!mOwnsData) {
+    mData = Factory::CopyDataSourceSurface(mData);
+    mOwnsData = true;
+  }
+  return mData ? mData->GetData() : nullptr;
+}
+
+int32_t SourceSurfaceWebgl::Stride() {
+  if (!EnsureData()) {
+    return 0;
+  }
+  return mData->Stride();
+}
+
+bool SourceSurfaceWebgl::Map(MapType aType, MappedSurface* aMappedSurface) {
+  if (!EnsureData()) {
+    return false;
+  }
+  if (!mOwnsData && aType != MapType::READ) {
+    mData = Factory::CopyDataSourceSurface(mData);
+    mOwnsData = true;
+  }
+  return mData && mData->Map(aType, aMappedSurface);
+}
+
+void SourceSurfaceWebgl::Unmap() {
+  if (mData) {
+    mData->Unmap();
+  }
+}
+
+void SourceSurfaceWebgl::DrawTargetWillChange(bool aNeedHandle) {
+  RefPtr<DrawTargetWebgl> dt(mDT);
+  if (!dt) {
+    MOZ_ASSERT_UNREACHABLE("No DrawTargetWebgl for SourceSurfaceWebgl");
+    return;
+  }
+  if ((aNeedHandle || (!mData && !mReadBuffer)) && !mHandle) {
+    mHandle = dt->CopySnapshot();
+    if (mHandle) {
+      mHandle->SetSurface(this);
+    } else {
+      EnsureData(false);
+    }
+  }
+  mDT = nullptr;
+}
+
+void SourceSurfaceWebgl::GiveTexture(RefPtr<TextureHandle> aHandle) {
+  MOZ_ASSERT(mDT);
+  MOZ_ASSERT(!mHandle);
+  mHandle = aHandle.forget();
+  mHandle->SetSurface(this);
+  mDT = nullptr;
+}
+
+void SourceSurfaceWebgl::SetHandle(TextureHandle* aHandle) {
+  MOZ_ASSERT(!mHandle);
+  mFormat = aHandle->GetFormat();
+  mSize = aHandle->GetSize();
+  mHandle = aHandle;
+  mHandle->SetSurface(this);
+}
+
+void SourceSurfaceWebgl::OnUnlinkTexture(SharedContextWebgl* aContext,
+                                         TextureHandle* aHandle, bool aForce) {
+  if (mHandle != aHandle) {
+    return;
+  }
+  if (!mData && !mReadBuffer) {
+    if (!aForce) {
+      mReadBuffer = aContext->ReadSnapshotIntoPBO(this, mHandle);
+    }
+    if (!mReadBuffer) {
+      mData = aContext->ReadSnapshot(mHandle);
+      mOwnsData = true;
+    }
+  }
+  mHandle = nullptr;
+}
+
+already_AddRefed<SourceSurface> SourceSurfaceWebgl::ExtractSubrect(
+    const IntRect& aRect) {
+  if (aRect.IsEmpty() || !GetRect().Contains(aRect)) {
+    return nullptr;
+  }
+  RefPtr<TextureHandle> subHandle;
+  RefPtr<SharedContextWebgl> sharedContext;
+  if (RefPtr<DrawTargetWebgl> dt = {mDT}) {
+    subHandle = dt->CopySnapshot(aRect);
+    sharedContext = dt->mSharedContext;
+  } else if (mHandle) {
+    sharedContext = mSharedContext;
+    if (sharedContext) {
+      subHandle = sharedContext->CopySnapshot(aRect, mHandle);
+    }
+  }
+  if (subHandle && sharedContext) {
+    RefPtr<SourceSurfaceWebgl> surface = new SourceSurfaceWebgl(sharedContext);
+    surface->SetHandle(subHandle);
+    return surface.forget();
+  }
+  return nullptr;
+}
+
+}  

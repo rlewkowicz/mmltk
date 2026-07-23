@@ -1,0 +1,284 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "CanRunScriptChecker.h"
+#include "CustomMatchers.h"
+#include "clang/Lex/Lexer.h"
+
+void CanRunScriptChecker::registerMatchers(MatchFinder *AstMatcher) {
+  auto Refcounted = qualType(hasDeclaration(cxxRecordDecl(isRefCounted())));
+  auto StackSmartPtr = ignoreTrivials(declRefExpr(to(varDecl(
+      hasAutomaticStorageDuration(), hasType(isSmartPtrToRefCounted())))));
+  auto ConstMemberOfThisSmartPtr =
+      memberExpr(hasType(isSmartPtrToRefCounted()), hasType(isConstQualified()),
+                 hasObjectExpression(cxxThisExpr()));
+  auto KnownLiveSmartPtr = anyOf(
+      StackSmartPtr, ConstMemberOfThisSmartPtr,
+      ignoreTrivials(cxxConstructExpr(hasType(isSmartPtrToRefCounted()))));
+
+  auto MozKnownLiveCall =
+      ignoreTrivials(callExpr(callee(functionDecl(hasName("MOZ_KnownLive")))));
+
+  auto KnownLiveParam = anyOf(
+      cxxThisExpr(),
+      declRefExpr(to(parmVarDecl())));
+
+  auto KnownLiveMemberOfParam =
+      memberExpr(hasKnownLiveAnnotation(),
+                 hasObjectExpression(anyOf(
+                     ignoreTrivials(KnownLiveParam),
+                     declRefExpr(to(varDecl(hasAutomaticStorageDuration()))))));
+
+  auto KnownLiveBaseExceptRef = anyOf(
+      KnownLiveSmartPtr,
+      MozKnownLiveCall,
+      KnownLiveParam,
+      KnownLiveMemberOfParam,
+      declRefExpr(to(varDecl(isConstexpr()))));
+
+  auto RefToKnownLivePtr = ignoreTrivials(declRefExpr(to(varDecl(
+      hasAutomaticStorageDuration(), hasType(referenceType()),
+      hasInitializer(anyOf(
+          KnownLiveSmartPtr, KnownLiveParam, KnownLiveMemberOfParam,
+          conditionalOperator(
+              hasFalseExpression(ignoreTrivials(anyOf(
+                  KnownLiveSmartPtr, KnownLiveParam, KnownLiveMemberOfParam,
+                  declRefExpr(to(varDecl(isConstexpr()))),
+                  cxxOperatorCallExpr(
+                      hasOverloadedOperatorName("*"),
+                      hasAnyArgument(
+                          anyOf(KnownLiveBaseExceptRef,
+                                ignoreTrivials(KnownLiveMemberOfParam))),
+                      argumentCountIs(1)),
+                  unaryOperator(unaryDereferenceOperator(),
+                                hasUnaryOperand(
+                                    ignoreTrivials(KnownLiveBaseExceptRef)))))),
+              hasTrueExpression(ignoreTrivials(anyOf(
+                  KnownLiveSmartPtr, KnownLiveParam, KnownLiveMemberOfParam,
+                  declRefExpr(to(varDecl(isConstexpr()))),
+                  cxxOperatorCallExpr(
+                      hasOverloadedOperatorName("*"),
+                      hasAnyArgument(
+                          anyOf(KnownLiveBaseExceptRef,
+                                ignoreTrivials(KnownLiveMemberOfParam))),
+                      argumentCountIs(1)),
+                  unaryOperator(unaryDereferenceOperator(),
+                                hasUnaryOperand(ignoreTrivials(
+                                    KnownLiveBaseExceptRef)))))))))))));
+
+  auto KnownLiveBase =
+      anyOf(KnownLiveBaseExceptRef,
+            RefToKnownLivePtr);
+
+  auto KnownLiveSimple = anyOf(
+      KnownLiveBase,
+      cxxMemberCallExpr(
+          on(anyOf(allOf(hasType(isSmartPtrToRefCounted()), KnownLiveBase),
+                   KnownLiveMemberOfParam))),
+      cxxOperatorCallExpr(
+          hasAnyOverloadedOperatorName("*", "->"),
+          hasAnyArgument(
+              anyOf(KnownLiveBase, ignoreTrivials(KnownLiveMemberOfParam))),
+          argumentCountIs(1)),
+      unaryOperator(
+          unaryDereferenceOperator(),
+          hasUnaryOperand(
+              ignoreTrivials(KnownLiveBase))),
+      unaryOperator(hasOperatorName("&"),
+                    hasUnaryOperand(allOf(anyOf(hasType(references(Refcounted)),
+                                                hasType(Refcounted)),
+                                          ignoreTrivials(KnownLiveBase)))));
+
+  auto KnownLive = anyOf(
+      KnownLiveSimple,
+      conditionalOperator(hasFalseExpression(ignoreTrivials(KnownLiveSimple)),
+                          hasTrueExpression(ignoreTrivials(KnownLiveSimple)))
+  );
+
+  auto InvalidArg = ignoreTrivialsConditional(
+      anyOf(hasType(Refcounted), hasType(pointsTo(Refcounted)),
+            hasType(references(Refcounted)), hasType(isSmartPtrToRefCounted())),
+      expr(
+          unless(KnownLive),
+          unless(cxxDefaultArgExpr(isNullDefaultArg())),
+          unless(cxxNullPtrLiteralExpr()), expr().bind("invalidArg")));
+
+  auto OptionalInvalidExplicitArg = optionally(
+      hasAnyArgument(InvalidArg));
+
+  AstMatcher->addMatcher(
+      expr(
+          anyOf(
+              cxxMemberCallExpr(
+                  OptionalInvalidExplicitArg,
+                  optionally(on(InvalidArg)), expr().bind("callExpr")),
+              callExpr(
+                  OptionalInvalidExplicitArg, expr().bind("callExpr")),
+              cxxConstructExpr(
+                  OptionalInvalidExplicitArg, expr().bind("constructExpr"))),
+
+              optionally(forFunction(functionDecl().bind("nonCanRunScriptParentFunction"))),
+
+              isFirstParty()
+              ),
+      this);
+}
+
+void CanRunScriptChecker::onStartOfTranslationUnit() {
+  IsFuncSetBuilt = false;
+  CanRunScriptFuncs.clear();
+}
+
+namespace {
+class FuncSetCallback : public MatchFinder::MatchCallback {
+public:
+  FuncSetCallback(CanRunScriptChecker &Checker,
+                  std::unordered_set<const FunctionDecl *> &FuncSet)
+      : CanRunScriptFuncs(FuncSet), Checker(Checker) {}
+
+  void run(const MatchFinder::MatchResult &Result) override;
+
+private:
+  void checkOverriddenMethods(const CXXMethodDecl *Method);
+
+  std::unordered_set<const FunctionDecl *> &CanRunScriptFuncs;
+  CanRunScriptChecker &Checker;
+};
+
+void FuncSetCallback::run(const MatchFinder::MatchResult &Result) {
+  const FunctionDecl *Func;
+  if (auto *Lambda = Result.Nodes.getNodeAs<LambdaExpr>("lambda")) {
+    Func = Lambda->getCallOperator();
+    if (!Func || !hasCustomAttribute<moz_can_run_script>(Func))
+      return;
+  } else {
+    Func = Result.Nodes.getNodeAs<FunctionDecl>("canRunScriptFunction");
+
+    const char *ErrorAttrInDefinition =
+        "MOZ_CAN_RUN_SCRIPT must be put in front "
+        "of the declaration, not the definition";
+    const char *NoteAttrInDefinition = "The first declaration exists here";
+    if (!Func->isFirstDecl() &&
+        !hasCustomAttribute<moz_can_run_script_for_definition>(Func)) {
+      const FunctionDecl *FirstDecl = Func->getFirstDecl();
+      if (!hasCustomAttribute<moz_can_run_script>(FirstDecl)) {
+        Checker.diag(Func->getLocation(), ErrorAttrInDefinition,
+                     DiagnosticIDs::Error);
+        Checker.diag(FirstDecl->getLocation(), NoteAttrInDefinition,
+                     DiagnosticIDs::Note);
+      }
+    }
+  }
+
+  CanRunScriptFuncs.insert(Func);
+
+  if (auto *Method = dyn_cast<CXXMethodDecl>(Func)) {
+    checkOverriddenMethods(Method);
+  }
+}
+
+void FuncSetCallback::checkOverriddenMethods(const CXXMethodDecl *Method) {
+  for (auto OverriddenMethod : Method->overridden_methods()) {
+    if (!hasCustomAttribute<moz_can_run_script>(OverriddenMethod)) {
+      const char *ErrorNonCanRunScriptOverridden =
+          "functions marked as MOZ_CAN_RUN_SCRIPT cannot override functions "
+          "that are not marked MOZ_CAN_RUN_SCRIPT";
+      const char *NoteNonCanRunScriptOverridden =
+          "overridden function declared here";
+
+      Checker.diag(Method->getLocation(), ErrorNonCanRunScriptOverridden,
+                   DiagnosticIDs::Error);
+      Checker.diag(OverriddenMethod->getLocation(),
+                   NoteNonCanRunScriptOverridden, DiagnosticIDs::Note);
+    }
+  }
+}
+} 
+
+void CanRunScriptChecker::buildFuncSet(ASTContext *Context) {
+  MatchFinder Finder;
+  FuncSetCallback Callback(*this, CanRunScriptFuncs);
+  Finder.addMatcher(
+      functionDecl(hasCanRunScriptAnnotation()).bind("canRunScriptFunction"),
+      &Callback);
+  Finder.addMatcher(lambdaExpr().bind("lambda"), &Callback);
+  Finder.matchAST(*Context);
+}
+
+void CanRunScriptChecker::check(const MatchFinder::MatchResult &Result) {
+
+  if (!IsFuncSetBuilt) {
+    buildFuncSet(Result.Context);
+    IsFuncSetBuilt = true;
+  }
+
+  const char *ErrorInvalidArg =
+      "arguments must all be strong refs or caller's parameters when calling a "
+      "function marked as MOZ_CAN_RUN_SCRIPT (including the implicit object "
+      "argument).  '%0' is neither.";
+
+  const char *ErrorNonCanRunScriptParent =
+      "functions marked as MOZ_CAN_RUN_SCRIPT can only be called from "
+      "functions also marked as MOZ_CAN_RUN_SCRIPT";
+  const char *NoteNonCanRunScriptParent = "caller function declared here";
+
+  const Expr *InvalidArg;
+  if (const CXXDefaultArgExpr *defaultArg =
+          Result.Nodes.getNodeAs<CXXDefaultArgExpr>("invalidArg")) {
+    InvalidArg = defaultArg->getExpr();
+  } else {
+    InvalidArg = Result.Nodes.getNodeAs<Expr>("invalidArg");
+  }
+
+  const CallExpr *Call = Result.Nodes.getNodeAs<CallExpr>("callExpr");
+  if (Call && (!Call->getDirectCallee() ||
+               !CanRunScriptFuncs.count(Call->getDirectCallee()))) {
+    Call = nullptr;
+  }
+
+  const CXXConstructExpr *Construct =
+      Result.Nodes.getNodeAs<CXXConstructExpr>("constructExpr");
+
+  if (Construct && (!Construct->getConstructor() ||
+                    !CanRunScriptFuncs.count(Construct->getConstructor()))) {
+    Construct = nullptr;
+  }
+
+  const FunctionDecl *ParentFunction =
+      Result.Nodes.getNodeAs<FunctionDecl>("nonCanRunScriptParentFunction");
+  if (ParentFunction &&
+      (CanRunScriptFuncs.count(ParentFunction) ||
+       hasCustomAttribute<moz_can_run_script_boundary>(ParentFunction))) {
+    ParentFunction = nullptr;
+  }
+
+  SourceRange CallRange;
+  if (Call) {
+    CallRange = Call->getSourceRange();
+  } else if (Construct) {
+    CallRange = Construct->getSourceRange();
+  } else {
+    return;
+  }
+
+  if (InvalidArg) {
+    const StringRef invalidArgText = Lexer::getSourceText(
+        CharSourceRange::getTokenRange(InvalidArg->getSourceRange()),
+        Result.Context->getSourceManager(), Result.Context->getLangOpts());
+    diag(InvalidArg->getExprLoc(), ErrorInvalidArg, DiagnosticIDs::Error)
+        << InvalidArg->getSourceRange() << invalidArgText;
+  }
+
+  if (ParentFunction) {
+    assert(!hasCustomAttribute<moz_can_run_script>(ParentFunction) &&
+           "Matcher missed something");
+
+    diag(CallRange.getBegin(), ErrorNonCanRunScriptParent, DiagnosticIDs::Error)
+        << CallRange;
+
+    diag(ParentFunction->getCanonicalDecl()->getLocation(),
+         NoteNonCanRunScriptParent, DiagnosticIDs::Note);
+  }
+}

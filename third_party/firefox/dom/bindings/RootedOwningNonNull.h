@@ -1,0 +1,39 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_RootedOwningNonNull_h_
+#define mozilla_RootedOwningNonNull_h_
+
+#include "js/GCPolicyAPI.h"
+#include "js/TypeDecls.h"
+#include "mozilla/OwningNonNull.h"
+
+namespace JS {
+template <typename T>
+struct GCPolicy<mozilla::OwningNonNull<T>> {
+  typedef mozilla::OwningNonNull<T> SmartPtrType;
+
+  static SmartPtrType initial() { return SmartPtrType(); }
+
+  static void trace(JSTracer* trc, SmartPtrType* tp, const char* name) {
+    if ((*tp).isInitialized()) {
+      (*tp)->Trace(trc);
+    }
+  }
+
+  static bool isValid(const SmartPtrType& v) {
+    return !v.isInitialized() || GCPolicy<T>::isValid(v);
+  }
+};
+}  
+
+namespace js {
+template <typename T, typename Wrapper>
+struct WrappedPtrOperations<mozilla::OwningNonNull<T>, Wrapper> {
+  operator T&() const { return static_cast<const Wrapper*>(this)->get(); }
+};
+}  
+
+#endif /* mozilla_RootedOwningNonNull_h_ */

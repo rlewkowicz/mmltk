@@ -1,0 +1,221 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_Geolocation_h
+#define mozilla_dom_Geolocation_h
+
+#undef CreateEvent
+
+#include "GeolocationCoordinates.h"
+#include "GeolocationPosition.h"
+#include "GeolocationSystem.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/CallbackObject.h"
+#include "mozilla/dom/GeolocationBinding.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIDOMGeoPosition.h"
+#include "nsIDOMGeoPositionCallback.h"
+#include "nsIDOMGeoPositionErrorCallback.h"
+#include "nsIGeolocationProvider.h"
+#include "nsIObserver.h"
+#include "nsITimer.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsTArray.h"
+#include "nsWrapperCache.h"
+
+class nsGeolocationService;
+class nsGeolocationRequest;
+
+namespace mozilla::dom {
+class Geolocation;
+using GeoPositionCallback =
+    CallbackObjectHolder<PositionCallback, nsIDOMGeoPositionCallback>;
+using GeoPositionErrorCallback =
+    CallbackObjectHolder<PositionErrorCallback, nsIDOMGeoPositionErrorCallback>;
+namespace geolocation {
+enum class LocationOSPermission;
+}
+}  
+
+struct CachedPositionAndAccuracy {
+  nsCOMPtr<nsIDOMGeoPosition> position;
+  bool isHighAccuracy;
+};
+
+class nsGeolocationService final : public nsIGeolocationUpdate,
+                                   public nsIObserver {
+ public:
+  static already_AddRefed<nsGeolocationService> GetGeolocationService(
+      mozilla::dom::BrowsingContext* browsingContext = nullptr);
+  static mozilla::StaticRefPtr<nsGeolocationService> sService;
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIGEOLOCATIONUPDATE
+  NS_DECL_NSIOBSERVER
+
+  nsGeolocationService() = default;
+
+  nsresult Init();
+
+  void AddLocator(mozilla::dom::Geolocation* aLocator);
+  void RemoveLocator(mozilla::dom::Geolocation* aLocator);
+
+  void MoveLocators(nsGeolocationService* aService);
+
+  void SetCachedPosition(nsIDOMGeoPosition* aPosition);
+  CachedPositionAndAccuracy GetCachedPosition();
+
+  MOZ_CAN_RUN_SCRIPT nsresult StartDevice();
+
+  void StopDevice();
+
+  void SetDisconnectTimer();
+
+  void UpdateAccuracy(bool aForceHigh = false);
+  bool HighAccuracyRequested();
+
+ private:
+  ~nsGeolocationService();
+
+  nsCOMPtr<nsITimer> mDisconnectTimer;
+
+  nsCOMPtr<nsIGeolocationProvider> mProvider;
+
+  nsTArray<mozilla::WeakPtr<mozilla::dom::Geolocation>> mGeolocators;
+
+  CachedPositionAndAccuracy mLastPosition;
+
+  bool mHigherAccuracy = false;
+
+  mozilla::Maybe<bool> mStarting;
+};
+
+namespace mozilla::dom {
+
+class Geolocation final : public nsIGeolocationUpdate,
+                          public nsWrapperCache,
+                          public SupportsWeakPtr {
+  friend class ::nsGeolocationService;
+
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(Geolocation)
+
+  NS_DECL_NSIGEOLOCATIONUPDATE
+
+  Geolocation();
+
+  nsresult Init(nsPIDOMWindowInner* aContentDom = nullptr);
+
+  nsPIDOMWindowInner* GetParentObject() const;
+  virtual JSObject* WrapObject(JSContext* aCtx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  MOZ_CAN_RUN_SCRIPT
+  int32_t WatchPosition(PositionCallback& aCallback,
+                        PositionErrorCallback* aErrorCallback,
+                        const PositionOptions& aOptions, CallerType aCallerType,
+                        ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT
+  void GetCurrentPosition(PositionCallback& aCallback,
+                          PositionErrorCallback* aErrorCallback,
+                          const PositionOptions& aOptions,
+                          CallerType aCallerType, ErrorResult& aRv);
+  void ClearWatch(int32_t aWatchId);
+
+  MOZ_CAN_RUN_SCRIPT
+  int32_t WatchPosition(nsIDOMGeoPositionCallback* aCallback,
+                        nsIDOMGeoPositionErrorCallback* aErrorCallback,
+                        UniquePtr<PositionOptions>&& aOptions);
+
+  bool HasActiveCallbacks();
+
+  void NotifyAllowedRequest(nsGeolocationRequest* aRequest);
+
+  void RemoveRequest(nsGeolocationRequest* request);
+
+  bool ClearPendingRequest(nsGeolocationRequest* aRequest);
+
+  void Shutdown();
+
+  mozilla::dom::BrowsingContext* GetBrowsingContext() {
+    return mBrowsingContext;
+  }
+
+  nsIPrincipal* GetPrincipal() { return mPrincipal; }
+
+  nsIWeakReference* GetOwner() { return mOwner; }
+
+  bool WindowOwnerStillExists();
+
+  bool HighAccuracyRequested();
+
+  static already_AddRefed<Geolocation> NonWindowSingleton();
+
+  static geolocation::SystemGeolocationPermissionBehavior
+  GetLocationOSPermission();
+
+  static MOZ_CAN_RUN_SCRIPT void ReallowWithSystemPermissionOrCancel(
+      BrowsingContext* aBrowsingContext,
+      geolocation::ParentRequestResolver&& aResolver);
+
+ private:
+  ~Geolocation();
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult GetCurrentPosition(GeoPositionCallback aCallback,
+                              GeoPositionErrorCallback aErrorCallback,
+                              UniquePtr<PositionOptions>&& aOptions,
+                              CallerType aCallerType);
+
+  MOZ_CAN_RUN_SCRIPT
+  int32_t WatchPosition(GeoPositionCallback aCallback,
+                        GeoPositionErrorCallback aErrorCallback,
+                        UniquePtr<PositionOptions>&& aOptions,
+                        CallerType aCallerType, ErrorResult& aRv);
+
+  static bool RegisterRequestWithPrompt(nsGeolocationRequest* request);
+
+  bool IsAlreadyCleared(nsGeolocationRequest* aRequest);
+
+  bool ShouldBlockInsecureRequests() const;
+
+  bool IsFullyActiveOrChrome();
+
+  static void RequestIfPermitted(nsGeolocationRequest* request);
+
+  void SetService(nsGeolocationService* aService) { mService = aService; }
+
+
+  nsTArray<RefPtr<nsGeolocationRequest>> mPendingCallbacks;
+  nsTArray<RefPtr<nsGeolocationRequest>> mWatchingCallbacks;
+
+  nsWeakPtr mOwner;
+
+  nsCOMPtr<nsIPrincipal> mPrincipal;
+  RefPtr<mozilla::dom::BrowsingContext> mBrowsingContext;
+
+  enum class ProtocolType : uint8_t { OTHER, HTTP, HTTPS };
+
+  ProtocolType mProtocolType;
+
+  RefPtr<nsGeolocationService> mService;
+  RefPtr<nsGeolocationService> mServiceOverride;
+
+  uint32_t mLastWatchId;
+
+  nsTArray<RefPtr<nsGeolocationRequest>> mPendingRequests;
+
+  nsTArray<int32_t> mClearedWatchIDs;
+
+  static mozilla::StaticRefPtr<Geolocation> sNonWindowSingleton;
+};
+
+}  
+
+#endif /* mozilla_dom_Geolocation_h */

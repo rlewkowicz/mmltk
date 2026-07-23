@@ -1,0 +1,209 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ ********************************************************************
+ * COPYRIGHT:
+ * Copyright (c) 1996-2015, International Business Machines Corporation and
+ * others. All Rights Reserved.
+ ********************************************************************
+ */
+
+#ifndef NORMLZR_H
+#define NORMLZR_H
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+ 
+#if !UCONFIG_NO_NORMALIZATION
+
+#include "unicode/chariter.h"
+#include "unicode/normalizer2.h"
+#include "unicode/unistr.h"
+#include "unicode/unorm.h"
+#include "unicode/uobject.h"
+
+U_NAMESPACE_BEGIN
+class U_COMMON_API Normalizer : public UObject {
+public:
+#ifndef U_HIDE_DEPRECATED_API
+  enum {
+      DONE=0xffff
+  };
+
+
+  Normalizer(const UnicodeString& str, UNormalizationMode mode);
+
+  Normalizer(ConstChar16Ptr str, int32_t length, UNormalizationMode mode);
+
+  Normalizer(const CharacterIterator& iter, UNormalizationMode mode);
+#endif  /* U_HIDE_DEPRECATED_API */
+
+#ifndef U_FORCE_HIDE_DEPRECATED_API
+  Normalizer(const Normalizer& copy);
+
+  virtual ~Normalizer();
+#endif  // U_FORCE_HIDE_DEPRECATED_API
+
+
+#ifndef U_HIDE_DEPRECATED_API
+  static void U_EXPORT2 normalize(const UnicodeString& source,
+                        UNormalizationMode mode, int32_t options,
+                        UnicodeString& result,
+                        UErrorCode &status);
+
+  static void U_EXPORT2 compose(const UnicodeString& source,
+                      UBool compat, int32_t options,
+                      UnicodeString& result,
+                      UErrorCode &status);
+
+  static void U_EXPORT2 decompose(const UnicodeString& source,
+                        UBool compat, int32_t options,
+                        UnicodeString& result,
+                        UErrorCode &status);
+
+  static inline UNormalizationCheckResult
+  quickCheck(const UnicodeString &source, UNormalizationMode mode, UErrorCode &status);
+
+  static UNormalizationCheckResult
+  quickCheck(const UnicodeString &source, UNormalizationMode mode, int32_t options, UErrorCode &status);
+
+  static inline UBool
+  isNormalized(const UnicodeString &src, UNormalizationMode mode, UErrorCode &errorCode);
+
+  static UBool
+  isNormalized(const UnicodeString &src, UNormalizationMode mode, int32_t options, UErrorCode &errorCode);
+
+  static UnicodeString &
+  U_EXPORT2 concatenate(const UnicodeString &left, const UnicodeString &right,
+              UnicodeString &result,
+              UNormalizationMode mode, int32_t options,
+              UErrorCode &errorCode);
+#endif  /* U_HIDE_DEPRECATED_API */
+
+  static inline int32_t
+  compare(const UnicodeString &s1, const UnicodeString &s2,
+          uint32_t options,
+          UErrorCode &errorCode);
+
+#ifndef U_HIDE_DEPRECATED_API
+
+  UChar32 current();
+
+  UChar32 first();
+
+  UChar32 last();
+
+  UChar32 next();
+
+  UChar32 previous();
+
+  void                 setIndexOnly(int32_t index);
+
+  void reset();
+
+  int32_t getIndex() const;
+
+  int32_t startIndex() const;
+
+  int32_t endIndex() const;
+
+  bool         operator==(const Normalizer& that) const;
+
+  inline bool         operator!=(const Normalizer& that) const;
+
+  Normalizer*        clone() const;
+
+  int32_t hashCode() const;
+
+
+  void setMode(UNormalizationMode newMode);
+
+  UNormalizationMode getUMode() const;
+
+  void setOption(int32_t option,
+         UBool value);
+
+  UBool getOption(int32_t option) const;
+
+  void setText(const UnicodeString& newText,
+           UErrorCode &status);
+
+  void setText(const CharacterIterator& newText,
+           UErrorCode &status);
+
+  void setText(ConstChar16Ptr newText,
+                    int32_t length,
+            UErrorCode &status);
+  void            getText(UnicodeString&  result);
+
+  static UClassID U_EXPORT2 getStaticClassID();
+#endif  /* U_HIDE_DEPRECATED_API */
+
+#ifndef U_FORCE_HIDE_DEPRECATED_API
+  virtual UClassID getDynamicClassID() const override;
+#endif  // U_FORCE_HIDE_DEPRECATED_API
+
+private:
+
+  Normalizer() = delete; 
+  Normalizer &operator=(const Normalizer &that) = delete; 
+
+  UBool nextNormalize();
+  UBool previousNormalize();
+
+  void    init();
+  void clearBuffer();
+
+
+  FilteredNormalizer2*fFilteredNorm2;  
+  const Normalizer2  *fNorm2;  
+  UNormalizationMode  fUMode;  
+  int32_t             fOptions;
+
+  CharacterIterator  *text;
+
+  int32_t         currentIndex, nextIndex;
+
+  UnicodeString       buffer;
+  int32_t         bufferPos;
+};
+
+
+#ifndef U_HIDE_DEPRECATED_API
+inline bool
+Normalizer::operator!= (const Normalizer& other) const
+{ return ! operator==(other); }
+
+inline UNormalizationCheckResult
+Normalizer::quickCheck(const UnicodeString& source,
+                       UNormalizationMode mode,
+                       UErrorCode &status) {
+    return quickCheck(source, mode, 0, status);
+}
+
+inline UBool
+Normalizer::isNormalized(const UnicodeString& source,
+                         UNormalizationMode mode,
+                         UErrorCode &status) {
+    return isNormalized(source, mode, 0, status);
+}
+#endif  /* U_HIDE_DEPRECATED_API */
+
+inline int32_t
+Normalizer::compare(const UnicodeString &s1, const UnicodeString &s2,
+                    uint32_t options,
+                    UErrorCode &errorCode) {
+  return unorm_compare(toUCharPtr(s1.getBuffer()), s1.length(),
+                       toUCharPtr(s2.getBuffer()), s2.length(),
+                       options,
+                       &errorCode);
+}
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_NORMALIZATION */
+
+#endif // NORMLZR_H
+
+#endif /* U_SHOW_CPLUSPLUS_API */

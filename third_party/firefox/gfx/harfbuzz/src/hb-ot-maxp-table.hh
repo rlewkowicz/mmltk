@@ -1,0 +1,145 @@
+/*
+ * Copyright © 2011,2012  Google, Inc.
+ *
+ *  This is part of HarfBuzz, a text shaping library.
+ *
+ * Permission is hereby granted, without written agreement and without
+ * license or royalty fees, to use, copy, modify, and distribute this
+ * software and its documentation for any purpose, provided that the
+ * above copyright notice and the following two paragraphs appear in
+ * all copies of this software.
+ *
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE TO ANY PARTY FOR
+ * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES
+ * ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN
+ * IF THE COPYRIGHT HOLDER HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ *
+ * THE COPYRIGHT HOLDER SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING,
+ * BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+ * FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ * ON AN "AS IS" BASIS, AND THE COPYRIGHT HOLDER HAS NO OBLIGATION TO
+ * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ *
+ * Google Author(s): Behdad Esfahbod
+ */
+
+#ifndef HB_OT_MAXP_TABLE_HH
+#define HB_OT_MAXP_TABLE_HH
+
+#include "hb-open-type.hh"
+
+namespace OT {
+
+
+
+#define HB_OT_TAG_maxp HB_TAG('m','a','x','p')
+
+struct maxpV1Tail
+{
+  bool sanitize (hb_sanitize_context_t *c) const
+  {
+    TRACE_SANITIZE (this);
+    return_trace (c->check_struct (this));
+  }
+
+  HBUINT16 maxPoints;		  
+  HBUINT16 maxContours;		  
+  HBUINT16 maxCompositePoints;	  
+  HBUINT16 maxCompositeContours;  
+  HBUINT16 maxZones;		  
+  HBUINT16 maxTwilightPoints;	  
+  HBUINT16 maxStorage;		  
+  HBUINT16 maxFunctionDefs;	  
+  HBUINT16 maxInstructionDefs;	  
+  HBUINT16 maxStackElements;	  
+  HBUINT16 maxSizeOfInstructions; 
+  HBUINT16 maxComponentElements;  
+  HBUINT16 maxComponentDepth;	  
+ public:
+  DEFINE_SIZE_STATIC (26);
+};
+
+
+struct maxp
+{
+  static constexpr hb_tag_t tableTag = HB_OT_TAG_maxp;
+
+  unsigned int get_num_glyphs () const { return numGlyphs; }
+
+  void set_num_glyphs (unsigned int count)
+  {
+    numGlyphs = count;
+  }
+
+  bool sanitize (hb_sanitize_context_t *c) const
+  {
+    TRACE_SANITIZE (this);
+    if (unlikely (!c->check_struct (this)))
+      return_trace (false);
+    hb_barrier ();
+    if (version.major == 1)
+    {
+      const maxpV1Tail &v1 = StructAfter<maxpV1Tail> (*this);
+      return_trace (v1.sanitize (c));
+    }
+    return_trace (likely (version.major == 0 && version.minor == 0x5000u));
+  }
+
+  bool subset (hb_subset_context_t *c) const
+  {
+    TRACE_SUBSET (this);
+    maxp *maxp_prime = c->serializer->embed (this);
+    if (unlikely (!maxp_prime)) return_trace (false);
+
+    maxp_prime->numGlyphs = hb_min (c->plan->num_output_glyphs (), 0xFFFFu);
+    if (maxp_prime->version.major == 1)
+    {
+      hb_barrier ();
+      const maxpV1Tail *src_v1 = &StructAfter<maxpV1Tail> (*this);
+      maxpV1Tail *dest_v1 = c->serializer->embed<maxpV1Tail> (src_v1);
+      if (unlikely (!dest_v1)) return_trace (false);
+
+      if (c->plan->flags & HB_SUBSET_FLAGS_NO_HINTING)
+	drop_hint_fields (dest_v1);
+
+      if (c->plan->normalized_coords)
+        instancing_update_fields (c->plan->head_maxp_info, dest_v1);
+    }
+
+    return_trace (true);
+  }
+
+  void instancing_update_fields (head_maxp_info_t& maxp_info, maxpV1Tail* dest_v1) const
+  {
+    dest_v1->maxPoints = maxp_info.maxPoints;
+    dest_v1->maxContours = maxp_info.maxContours;
+    dest_v1->maxCompositePoints = maxp_info.maxCompositePoints;
+    dest_v1->maxCompositeContours = maxp_info.maxCompositeContours;
+    dest_v1->maxComponentElements = maxp_info.maxComponentElements;
+    dest_v1->maxComponentDepth = maxp_info.maxComponentDepth;
+  }
+
+  static void drop_hint_fields (maxpV1Tail* dest_v1)
+  {
+    dest_v1->maxZones = 1;
+    dest_v1->maxTwilightPoints = 0;
+    dest_v1->maxStorage = 0;
+    dest_v1->maxFunctionDefs = 0;
+    dest_v1->maxInstructionDefs = 0;
+    dest_v1->maxStackElements = 0;
+    dest_v1->maxSizeOfInstructions = 0;
+  }
+
+  protected:
+  FixedVersion<>version;
+  HBUINT16	numGlyphs;
+  public:
+  DEFINE_SIZE_STATIC (6);
+};
+
+
+} 
+
+
+#endif /* HB_OT_MAXP_TABLE_HH */

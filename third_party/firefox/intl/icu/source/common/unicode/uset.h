@@ -1,0 +1,663 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+*
+*   Copyright (C) 2002-2014, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+*******************************************************************************
+*   file name:  uset.h
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+*   created on: 2002mar07
+*   created by: Markus W. Scherer
+*
+*   C version of UnicodeSet.
+*/
+
+
+
+#ifndef __USET_H__
+#define __USET_H__
+
+#include "unicode/utypes.h"
+#include "unicode/uchar.h"
+
+#if U_SHOW_CPLUSPLUS_API || U_SHOW_CPLUSPLUS_HEADER_API
+#include <string>
+#include <string_view>
+#include "unicode/char16ptr.h"
+#include "unicode/localpointer.h"
+#include "unicode/utf16.h"
+#endif
+
+#ifndef USET_DEFINED
+
+#ifndef U_IN_DOXYGEN
+#define USET_DEFINED
+#endif
+typedef struct USet USet;
+#endif
+
+enum {
+    USET_IGNORE_SPACE = 1,
+
+    /**
+     * Enable case insensitive matching.  E.g., "[ab]" with this flag
+     * will match 'a', 'A', 'b', and 'B'.  "[^ab]" with this flag will
+     * match all except 'a', 'A', 'b', and 'B'. This performs a full
+     * closure over case mappings, e.g. 'ſ' (U+017F long s) for 's'.
+     *
+     * The resulting set is a superset of the input for the code points but
+     * not for the strings.
+     * It performs a case mapping closure of the code points and adds
+     * full case folding strings for the code points, and reduces strings of
+     * the original set to their full case folding equivalents.
+     *
+     * This is designed for case-insensitive matches, for example
+     * in regular expressions. The full code point case closure allows checking of
+     * an input character directly against the closure set.
+     * Strings are matched by comparing the case-folded form from the closure
+     * set with an incremental case folding of the string in question.
+     *
+     * The closure set will also contain single code points if the original
+     * set contained case-equivalent strings (like U+00DF for "ss" or "Ss" etc.).
+     * This is not necessary (that is, redundant) for the above matching method
+     * but results in the same closure sets regardless of whether the original
+     * set contained the code point or a string.
+     *
+     * @stable ICU 2.4
+     */
+    USET_CASE_INSENSITIVE = 2,
+
+    /**
+     * Adds all case mappings for each element in the set.
+     * This adds the full lower-, title-, and uppercase mappings as well as the full case folding
+     * of each existing element in the set.
+     *
+     * Unlike the “case insensitive” options, this does not perform a closure.
+     * For example, it does not add 'ſ' (U+017F long s) for 's',
+     * 'K' (U+212A Kelvin sign) for 'k', or replace set strings by their case-folded versions.
+     *
+     * @stable ICU 3.2
+     */
+    USET_ADD_CASE_MAPPINGS = 4,
+
+    USET_SIMPLE_CASE_INSENSITIVE = 6
+};
+
+typedef enum USetSpanCondition {
+    USET_SPAN_NOT_CONTAINED = 0,
+    USET_SPAN_CONTAINED = 1,
+    USET_SPAN_SIMPLE = 2,
+#ifndef U_HIDE_DEPRECATED_API
+    USET_SPAN_CONDITION_COUNT
+#endif  // U_HIDE_DEPRECATED_API
+} USetSpanCondition;
+
+enum {
+    USET_SERIALIZED_STATIC_ARRAY_CAPACITY=8
+};
+
+typedef struct USerializedSet {
+    const uint16_t *array;
+    int32_t bmpLength;
+    int32_t length;
+    uint16_t staticArray[USET_SERIALIZED_STATIC_ARRAY_CAPACITY];
+} USerializedSet;
+
+
+U_CAPI USet* U_EXPORT2
+uset_openEmpty(void);
+
+U_CAPI USet* U_EXPORT2
+uset_open(UChar32 start, UChar32 end);
+
+U_CAPI USet* U_EXPORT2
+uset_openPattern(const UChar* pattern, int32_t patternLength,
+                 UErrorCode* ec);
+
+U_CAPI USet* U_EXPORT2
+uset_openPatternOptions(const UChar* pattern, int32_t patternLength,
+                 uint32_t options,
+                 UErrorCode* ec);
+
+U_CAPI void U_EXPORT2
+uset_close(USet* set);
+
+#if U_SHOW_CPLUSPLUS_API
+
+U_NAMESPACE_BEGIN
+
+U_DEFINE_LOCAL_OPEN_POINTER(LocalUSetPointer, USet, uset_close);
+
+U_NAMESPACE_END
+
+#endif
+
+U_CAPI USet * U_EXPORT2
+uset_clone(const USet *set);
+
+U_CAPI UBool U_EXPORT2
+uset_isFrozen(const USet *set);
+
+U_CAPI void U_EXPORT2
+uset_freeze(USet *set);
+
+U_CAPI USet * U_EXPORT2
+uset_cloneAsThawed(const USet *set);
+
+U_CAPI void U_EXPORT2
+uset_set(USet* set,
+         UChar32 start, UChar32 end);
+
+U_CAPI int32_t U_EXPORT2 
+uset_applyPattern(USet *set,
+                  const UChar *pattern, int32_t patternLength,
+                  uint32_t options,
+                  UErrorCode *status);
+
+U_CAPI void U_EXPORT2
+uset_applyIntPropertyValue(USet* set,
+                           UProperty prop, int32_t value, UErrorCode* ec);
+
+U_CAPI void U_EXPORT2
+uset_applyPropertyAlias(USet* set,
+                        const UChar *prop, int32_t propLength,
+                        const UChar *value, int32_t valueLength,
+                        UErrorCode* ec);
+
+U_CAPI UBool U_EXPORT2
+uset_resemblesPattern(const UChar *pattern, int32_t patternLength,
+                      int32_t pos);
+
+U_CAPI int32_t U_EXPORT2
+uset_toPattern(const USet* set,
+               UChar* result, int32_t resultCapacity,
+               UBool escapeUnprintable,
+               UErrorCode* ec);
+
+U_CAPI void U_EXPORT2
+uset_add(USet* set, UChar32 c);
+
+U_CAPI void U_EXPORT2
+uset_addAll(USet* set, const USet *additionalSet);
+
+U_CAPI void U_EXPORT2
+uset_addRange(USet* set, UChar32 start, UChar32 end);
+
+U_CAPI void U_EXPORT2
+uset_addString(USet* set, const UChar* str, int32_t strLen);
+
+U_CAPI void U_EXPORT2
+uset_addAllCodePoints(USet* set, const UChar *str, int32_t strLen);
+
+U_CAPI void U_EXPORT2
+uset_remove(USet* set, UChar32 c);
+
+U_CAPI void U_EXPORT2
+uset_removeRange(USet* set, UChar32 start, UChar32 end);
+
+U_CAPI void U_EXPORT2
+uset_removeString(USet* set, const UChar* str, int32_t strLen);
+
+U_CAPI void U_EXPORT2
+uset_removeAllCodePoints(USet *set, const UChar *str, int32_t length);
+
+U_CAPI void U_EXPORT2
+uset_removeAll(USet* set, const USet* removeSet);
+
+U_CAPI void U_EXPORT2
+uset_retain(USet* set, UChar32 start, UChar32 end);
+
+U_CAPI void U_EXPORT2
+uset_retainString(USet *set, const UChar *str, int32_t length);
+
+U_CAPI void U_EXPORT2
+uset_retainAllCodePoints(USet *set, const UChar *str, int32_t length);
+
+U_CAPI void U_EXPORT2
+uset_retainAll(USet* set, const USet* retain);
+
+U_CAPI void U_EXPORT2
+uset_compact(USet* set);
+
+U_CAPI void U_EXPORT2
+uset_complement(USet* set);
+
+U_CAPI void U_EXPORT2
+uset_complementRange(USet *set, UChar32 start, UChar32 end);
+
+U_CAPI void U_EXPORT2
+uset_complementString(USet *set, const UChar *str, int32_t length);
+
+U_CAPI void U_EXPORT2
+uset_complementAllCodePoints(USet *set, const UChar *str, int32_t length);
+
+U_CAPI void U_EXPORT2
+uset_complementAll(USet* set, const USet* complement);
+
+U_CAPI void U_EXPORT2
+uset_clear(USet* set);
+
+U_CAPI void U_EXPORT2
+uset_closeOver(USet* set, int32_t attributes);
+
+U_CAPI void U_EXPORT2
+uset_removeAllStrings(USet* set);
+
+U_CAPI UBool U_EXPORT2
+uset_isEmpty(const USet* set);
+
+U_CAPI UBool U_EXPORT2
+uset_hasStrings(const USet *set);
+
+U_CAPI UBool U_EXPORT2
+uset_contains(const USet* set, UChar32 c);
+
+U_CAPI UBool U_EXPORT2
+uset_containsRange(const USet* set, UChar32 start, UChar32 end);
+
+U_CAPI UBool U_EXPORT2
+uset_containsString(const USet* set, const UChar* str, int32_t strLen);
+
+U_CAPI int32_t U_EXPORT2
+uset_indexOf(const USet* set, UChar32 c);
+
+U_CAPI UChar32 U_EXPORT2
+uset_charAt(const USet* set, int32_t charIndex);
+
+U_CAPI int32_t U_EXPORT2
+uset_size(const USet* set);
+
+U_CAPI int32_t U_EXPORT2
+uset_getRangeCount(const USet *set);
+
+U_CAPI int32_t U_EXPORT2
+uset_getStringCount(const USet *set);
+
+U_CAPI const UChar* U_EXPORT2
+uset_getString(const USet *set, int32_t index, int32_t *pLength);
+
+U_CAPI int32_t U_EXPORT2
+uset_getItemCount(const USet* set);
+
+U_CAPI int32_t U_EXPORT2
+uset_getItem(const USet* set, int32_t itemIndex,
+             UChar32* start, UChar32* end,
+             UChar* str, int32_t strCapacity,
+             UErrorCode* ec);
+
+U_CAPI UBool U_EXPORT2
+uset_containsAll(const USet* set1, const USet* set2);
+
+U_CAPI UBool U_EXPORT2
+uset_containsAllCodePoints(const USet* set, const UChar *str, int32_t strLen);
+
+U_CAPI UBool U_EXPORT2
+uset_containsNone(const USet* set1, const USet* set2);
+
+U_CAPI UBool U_EXPORT2
+uset_containsSome(const USet* set1, const USet* set2);
+
+U_CAPI int32_t U_EXPORT2
+uset_span(const USet *set, const UChar *s, int32_t length, USetSpanCondition spanCondition);
+
+U_CAPI int32_t U_EXPORT2
+uset_spanBack(const USet *set, const UChar *s, int32_t length, USetSpanCondition spanCondition);
+
+U_CAPI int32_t U_EXPORT2
+uset_spanUTF8(const USet *set, const char *s, int32_t length, USetSpanCondition spanCondition);
+
+U_CAPI int32_t U_EXPORT2
+uset_spanBackUTF8(const USet *set, const char *s, int32_t length, USetSpanCondition spanCondition);
+
+U_CAPI UBool U_EXPORT2
+uset_equals(const USet* set1, const USet* set2);
+
+
+U_CAPI int32_t U_EXPORT2
+uset_serialize(const USet* set, uint16_t* dest, int32_t destCapacity, UErrorCode* pErrorCode);
+
+U_CAPI UBool U_EXPORT2
+uset_getSerializedSet(USerializedSet* fillSet, const uint16_t* src, int32_t srcLength);
+
+U_CAPI void U_EXPORT2
+uset_setSerializedToOne(USerializedSet* fillSet, UChar32 c);
+
+U_CAPI UBool U_EXPORT2
+uset_serializedContains(const USerializedSet* set, UChar32 c);
+
+U_CAPI int32_t U_EXPORT2
+uset_getSerializedRangeCount(const USerializedSet* set);
+
+U_CAPI UBool U_EXPORT2
+uset_getSerializedRange(const USerializedSet* set, int32_t rangeIndex,
+                        UChar32* pStart, UChar32* pEnd);
+
+#if U_SHOW_CPLUSPLUS_API || U_SHOW_CPLUSPLUS_HEADER_API
+
+namespace U_HEADER_ONLY_NAMESPACE {
+
+
+class USetCodePointIterator {
+public:
+    USetCodePointIterator(const USetCodePointIterator &other) = default;
+
+    bool operator==(const USetCodePointIterator &other) const {
+        return uset == other.uset && c == other.c;
+    }
+
+    bool operator!=(const USetCodePointIterator &other) const { return !operator==(other); }
+
+    UChar32 operator*() const { return c; }
+
+    USetCodePointIterator &operator++() {
+        if (c < end) {
+            ++c;
+        } else if (rangeIndex < rangeCount) {
+            UErrorCode errorCode = U_ZERO_ERROR;
+            int32_t result = uset_getItem(uset, rangeIndex, &c, &end, nullptr, 0, &errorCode);
+            if (U_SUCCESS(errorCode) && result == 0) {
+                ++rangeIndex;
+            } else {
+                c = end = U_SENTINEL;
+            }
+        } else {
+            c = end = U_SENTINEL;
+        }
+        return *this;
+    }
+
+    USetCodePointIterator operator++(int) {
+        USetCodePointIterator result(*this);
+        operator++();
+        return result;
+    }
+
+private:
+    friend class USetCodePoints;
+
+    USetCodePointIterator(const USet *pUset, int32_t nRangeIndex, int32_t nRangeCount)
+            : uset(pUset), rangeIndex(nRangeIndex), rangeCount(nRangeCount),
+                c(U_SENTINEL), end(U_SENTINEL) {
+        operator++();
+    }
+
+    const USet *uset;
+    int32_t rangeIndex;
+    int32_t rangeCount;
+    UChar32 c, end;
+};
+
+class USetCodePoints {
+public:
+    USetCodePoints(const USet *pUset) : uset(pUset), rangeCount(uset_getRangeCount(pUset)) {}
+
+    USetCodePoints(const USetCodePoints &other) = default;
+
+    USetCodePointIterator begin() const {
+        return USetCodePointIterator(uset, 0, rangeCount);
+    }
+
+    USetCodePointIterator end() const {
+        return USetCodePointIterator(uset, rangeCount, rangeCount);
+    }
+
+private:
+    const USet *uset;
+    int32_t rangeCount;
+};
+
+struct CodePointRange {
+    struct iterator {
+        iterator(UChar32 aC) : c(aC) {}
+
+        bool operator==(const iterator &other) const { return c == other.c; }
+        bool operator!=(const iterator &other) const { return !operator==(other); }
+
+        UChar32 operator*() const { return c; }
+
+        iterator &operator++() {
+            ++c;
+            return *this;
+        }
+
+        iterator operator++(int) {
+            return c++;
+        }
+
+        UChar32 c;
+    };
+
+    CodePointRange(UChar32 start, UChar32 end) : rangeStart(start), rangeEnd(end) {}
+    CodePointRange(const CodePointRange &other) = default;
+    size_t size() const { return (rangeEnd + 1) - rangeStart; }
+    iterator begin() const { return rangeStart; }
+    iterator end() const { return rangeEnd + 1; }
+
+    UChar32 rangeStart;
+    UChar32 rangeEnd;
+};
+
+class USetRangeIterator {
+public:
+    USetRangeIterator(const USetRangeIterator &other) = default;
+
+    bool operator==(const USetRangeIterator &other) const {
+        return uset == other.uset && rangeIndex == other.rangeIndex;
+    }
+
+    bool operator!=(const USetRangeIterator &other) const { return !operator==(other); }
+
+    CodePointRange operator*() const {
+        if (rangeIndex < rangeCount) {
+            UChar32 start, end;
+            UErrorCode errorCode = U_ZERO_ERROR;
+            int32_t result = uset_getItem(uset, rangeIndex, &start, &end, nullptr, 0, &errorCode);
+            if (U_SUCCESS(errorCode) && result == 0) {
+                return CodePointRange(start, end);
+            }
+        }
+        return CodePointRange(U_SENTINEL, U_SENTINEL);
+    }
+
+    USetRangeIterator &operator++() {
+        ++rangeIndex;
+        return *this;
+    }
+
+    USetRangeIterator operator++(int) {
+        USetRangeIterator result(*this);
+        ++rangeIndex;
+        return result;
+    }
+
+private:
+    friend class USetRanges;
+
+    USetRangeIterator(const USet *pUset, int32_t nRangeIndex, int32_t nRangeCount)
+            : uset(pUset), rangeIndex(nRangeIndex), rangeCount(nRangeCount) {}
+
+    const USet *uset;
+    int32_t rangeIndex;
+    int32_t rangeCount;
+};
+
+class USetRanges {
+public:
+    USetRanges(const USet *pUset) : uset(pUset), rangeCount(uset_getRangeCount(pUset)) {}
+
+    USetRanges(const USetRanges &other) = default;
+
+    USetRangeIterator begin() const {
+        return USetRangeIterator(uset, 0, rangeCount);
+    }
+
+    USetRangeIterator end() const {
+        return USetRangeIterator(uset, rangeCount, rangeCount);
+    }
+
+private:
+    const USet *uset;
+    int32_t rangeCount;
+};
+
+class USetStringIterator {
+public:
+    USetStringIterator(const USetStringIterator &other) = default;
+
+    bool operator==(const USetStringIterator &other) const {
+        return uset == other.uset && index == other.index;
+    }
+
+    bool operator!=(const USetStringIterator &other) const { return !operator==(other); }
+
+    std::u16string_view operator*() const {
+        if (index < count) {
+            int32_t length;
+            const UChar *uchars = uset_getString(uset, index, &length);
+            return {uprv_char16PtrFromUChar(uchars), static_cast<size_t>(length)};
+        }
+        return {};
+    }
+
+    USetStringIterator &operator++() {
+        ++index;
+        return *this;
+    }
+
+    USetStringIterator operator++(int) {
+        USetStringIterator result(*this);
+        ++index;
+        return result;
+    }
+
+private:
+    friend class USetStrings;
+
+    USetStringIterator(const USet *pUset, int32_t nIndex, int32_t nCount)
+            : uset(pUset), index(nIndex), count(nCount) {}
+
+    const USet *uset;
+    int32_t index;
+    int32_t count;
+};
+
+class USetStrings {
+public:
+    USetStrings(const USet *pUset) : uset(pUset), count(uset_getStringCount(pUset)) {}
+
+    USetStrings(const USetStrings &other) = default;
+
+    USetStringIterator begin() const {
+        return USetStringIterator(uset, 0, count);
+    }
+
+    USetStringIterator end() const {
+        return USetStringIterator(uset, count, count);
+    }
+
+private:
+    const USet *uset;
+    int32_t count;
+};
+
+#ifndef U_HIDE_DRAFT_API
+class USetElementIterator {
+public:
+    USetElementIterator(const USetElementIterator &other) = default;
+
+    bool operator==(const USetElementIterator &other) const {
+        return uset == other.uset && c == other.c && index == other.index;
+    }
+
+    bool operator!=(const USetElementIterator &other) const { return !operator==(other); }
+
+    std::u16string operator*() const {
+        if (c >= 0) {
+            return c <= 0xffff ?
+                std::u16string({static_cast<char16_t>(c)}) :
+                std::u16string({U16_LEAD(c), U16_TRAIL(c)});
+        } else if (index < totalCount) {
+            int32_t length;
+            const UChar *uchars = uset_getString(uset, index - rangeCount, &length);
+            return {uprv_char16PtrFromUChar(uchars), static_cast<size_t>(length)};
+        } else {
+            return {};
+        }
+    }
+
+    USetElementIterator &operator++() {
+        if (c < end) {
+            ++c;
+        } else if (index < rangeCount) {
+            UErrorCode errorCode = U_ZERO_ERROR;
+            int32_t result = uset_getItem(uset, index, &c, &end, nullptr, 0, &errorCode);
+            if (U_SUCCESS(errorCode) && result == 0) {
+                ++index;
+            } else {
+                c = end = U_SENTINEL;
+            }
+        } else if (c >= 0) {
+            c = end = U_SENTINEL;
+        } else {
+            ++index;
+        }
+        return *this;
+    }
+
+    USetElementIterator operator++(int) {
+        USetElementIterator result(*this);
+        operator++();
+        return result;
+    }
+
+private:
+    friend class USetElements;
+
+    USetElementIterator(const USet *pUset, int32_t nIndex, int32_t nRangeCount, int32_t nTotalCount)
+            : uset(pUset), index(nIndex), rangeCount(nRangeCount), totalCount(nTotalCount),
+                c(U_SENTINEL), end(U_SENTINEL) {
+        if (index < rangeCount) {
+            operator++();
+        }
+    }
+
+    const USet *uset;
+    int32_t index;
+    int32_t rangeCount;
+    int32_t totalCount;
+    UChar32 c, end;
+};
+
+class USetElements {
+public:
+    USetElements(const USet *pUset)
+        : uset(pUset), rangeCount(uset_getRangeCount(pUset)),
+            stringCount(uset_getStringCount(pUset)) {}
+
+    USetElements(const USetElements &other) = default;
+
+    USetElementIterator begin() const {
+        return USetElementIterator(uset, 0, rangeCount, rangeCount + stringCount);
+    }
+
+    USetElementIterator end() const {
+        return USetElementIterator(uset, rangeCount + stringCount, rangeCount, rangeCount + stringCount);
+    }
+
+private:
+    const USet *uset;
+    int32_t rangeCount, stringCount;
+};
+
+#endif  // U_HIDE_DRAFT_API
+
+}  
+
+#endif  // U_SHOW_CPLUSPLUS_API || U_SHOW_CPLUSPLUS_HEADER_API
+
+#endif  // __USET_H__

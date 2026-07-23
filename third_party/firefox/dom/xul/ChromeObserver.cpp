@@ -1,0 +1,114 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#include "ChromeObserver.h"
+
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/Element.h"
+#include "nsContentUtils.h"
+#include "nsIBaseWindow.h"
+#include "nsIFrame.h"
+#include "nsIMutationObserver.h"
+#include "nsIWidget.h"
+#include "nsPresContext.h"
+#include "nsXULElement.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_ISUPPORTS(ChromeObserver, nsIMutationObserver)
+
+ChromeObserver::ChromeObserver(Document* aDocument)
+    : nsStubMutationObserver(), mDocument(aDocument) {}
+
+void ChromeObserver::Init() {
+  mDocument->AddMutationObserver(this);
+  Element* rootElement = mDocument->GetRootElement();
+  if (!rootElement) {
+    return;
+  }
+  nsAutoScriptBlocker scriptBlocker;
+  uint32_t attributeCount = rootElement->GetAttrCount();
+  for (uint32_t i = 0; i < attributeCount; i++) {
+    BorrowedAttrInfo info = rootElement->GetAttrInfoAt(i);
+    const nsAttrName* name = info.mName;
+    if (name->LocalName() == nsGkAtoms::customtitlebar) {
+      continue;
+    }
+    AttributeChanged(rootElement, name->NamespaceID(), name->LocalName(),
+                     AttrModType::Addition, nullptr);
+  }
+}
+
+nsIWidget* ChromeObserver::GetWindowWidget() {
+  if (mDocument && mDocument->IsRootDisplayDocument()) {
+    nsCOMPtr<nsISupports> container = mDocument->GetContainer();
+    if (nsCOMPtr<nsIBaseWindow> baseWindow = do_QueryInterface(container)) {
+      nsCOMPtr<nsIWidget> mainWidget = baseWindow->GetMainWidget();
+      return mainWidget;
+    }
+  }
+  return nullptr;
+}
+
+void ChromeObserver::SetHideTitlebarSeparator(bool aState) {
+  nsIWidget* mainWidget = GetWindowWidget();
+  if (mainWidget) {
+    mainWidget->SetHideTitlebarSeparator(aState);
+  }
+}
+
+void ChromeObserver::AttributeChanged(dom::Element* aElement,
+                                      int32_t aNamespaceID, nsAtom* aName,
+                                      AttrModType aModType,
+                                      const nsAttrValue* aOldValue) {
+  if (!mDocument || aElement != mDocument->GetRootElement()) {
+    return;
+  }
+
+  if (IsAdditionOrRemoval(aModType)) {
+    const bool added = aModType == AttrModType::Addition;
+    if (aName == nsGkAtoms::hidechrome) {
+      HideWindowChrome(added);
+    } else if (aName == nsGkAtoms::customtitlebar) {
+      SetCustomTitlebar(added);
+    } else if (aName == nsGkAtoms::hidetitlebarseparator) {
+      SetHideTitlebarSeparator(added);
+    } else if (aName == nsGkAtoms::windowsmica) {
+      SetMica(added);
+    }
+  }
+  if (aName == nsGkAtoms::localedir) {
+    mDocument->ResetDocumentDirection();
+  }
+  if (aName == nsGkAtoms::title && aModType != AttrModType::Removal) {
+    mDocument->NotifyPossibleTitleChange(false);
+  }
+}
+
+void ChromeObserver::NodeWillBeDestroyed(nsINode* aNode) {
+  mDocument = nullptr;
+}
+
+void ChromeObserver::SetMica(bool aEnable) {
+  if (nsIWidget* mainWidget = GetWindowWidget()) {
+    mainWidget->SetMicaBackdrop(aEnable);
+  }
+}
+
+void ChromeObserver::SetCustomTitlebar(bool aCustomTitlebar) {
+  if (nsIWidget* mainWidget = GetWindowWidget()) {
+    nsContentUtils::AddScriptRunner(NewRunnableMethod<bool>(
+        "SetCustomTitlebar", mainWidget, &nsIWidget::SetCustomTitlebar,
+        aCustomTitlebar));
+  }
+}
+
+void ChromeObserver::HideWindowChrome(bool aShouldHide) {
+  if (nsCOMPtr<nsIWidget> mainWidget = GetWindowWidget()) {
+    mainWidget->HideWindowChrome(aShouldHide);
+  }
+}
+
+}  

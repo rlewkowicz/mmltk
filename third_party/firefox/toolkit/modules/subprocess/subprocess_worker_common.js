@@ -1,0 +1,207 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+"use strict";
+
+
+
+function debug(message) {
+  self.postMessage({ msg: "debug", message });
+}
+
+class BasePipe {
+  constructor() {
+    this.closing = false;
+    this.closed = false;
+
+    this.closedPromise = new Promise(resolve => {
+      this.resolveClosed = resolve;
+    });
+
+    this.pending = [];
+  }
+
+  shiftPending() {
+    let result = this.pending.shift();
+
+    if (this.closing && !this.pending.length) {
+      this.close();
+    }
+
+    return result;
+  }
+}
+
+let nextProcessId = 0;
+
+class BaseProcess {
+  constructor(options) {
+    this.id = nextProcessId++;
+
+    this.exitCode = null;
+
+    this.exitPromise = new Promise(resolve => {
+      this.resolveExit = resolve;
+    });
+    this.exitPromise.then(() => {
+      this.pipes[0].close(true);
+    });
+
+    this.pid = null;
+    this.pipes = [];
+
+    this.spawn(options);
+  }
+
+  awaitFinished() {
+    return Promise.all([
+      this.exitPromise,
+      ...this.pipes.map(pipe => pipe.closedPromise),
+    ]);
+  }
+}
+
+let requests = {
+  init(details) {
+    io.init(details);
+
+    return { data: {} };
+  },
+
+  shutdown() {
+    io.shutdown();
+
+    return { data: {} };
+  },
+
+  close(pipeId, force = false) {
+    let pipe = io.getPipe(pipeId);
+
+    return pipe.close(force).then(() => ({ data: {} }));
+  },
+
+  spawn(options) {
+    let process = new Process(options);
+    let processId = process.id;
+
+    io.addProcess(process);
+
+    let fds = process.pipes.map(pipe => pipe.id);
+
+    return { data: { processId, fds, pid: process.pid } };
+  },
+
+  connectRunning(options) {
+    let process = new ManagedProcess(options);
+    let processId = process.id;
+
+    io.addProcess(process);
+
+    return { data: { processId, fds: process.pipes.map(pipe => pipe.id) } };
+  },
+
+  kill(processId, force = false) {
+    let process = io.getProcess(processId);
+
+    process.kill(force ? 9 : 15);
+
+    return { data: {} };
+  },
+
+  wait(processId) {
+    let process = io.getProcess(processId);
+
+    process.wait();
+
+    process.awaitFinished().then(() => {
+      io.cleanupProcess(process);
+    });
+
+    return process.exitPromise.then(exitCode => {
+      return { data: { exitCode } };
+    });
+  },
+
+  read(pipeId, count) {
+    let pipe = io.getPipe(pipeId);
+
+    return pipe.read(count).then(buffer => {
+      return { data: { buffer } };
+    });
+  },
+
+  write(pipeId, buffer) {
+    let pipe = io.getPipe(pipeId);
+
+    return pipe.write(buffer).then(bytesWritten => {
+      return { data: { bytesWritten } };
+    });
+  },
+
+  getIsPolling() {
+    return { data: io.polling };
+  },
+
+  getOpenFiles() {
+    return { data: new Set(io.pipes.keys()) };
+  },
+
+  getProcesses() {
+    let data = new Map(
+      Array.from(io.processes.values())
+        .filter(proc => proc.exitCode == null)
+        .map(proc => [proc.id, proc.pid])
+    );
+    return { data };
+  },
+
+  waitForNoProcesses() {
+    return Promise.all(
+      Array.from(io.processes.values(), proc => proc.awaitFinished())
+    );
+  },
+
+  getFds(processId) {
+    let process = io.getProcess(processId);
+    let pipes = process.pipes.map(p => parseInt(p.fd.toString(), 10));
+    return {
+      data: [pipes[0], pipes[1], pipes[2]],
+    };
+  },
+};
+
+onmessage = event => {
+  io.messageCount--;
+
+  let { msg, msgId, args } = event.data;
+
+  new Promise(resolve => {
+    resolve(requests[msg](...args));
+  })
+    .then(result => {
+      let response = {
+        msg: "success",
+        msgId,
+        data: result.data,
+      };
+
+      self.postMessage(response, result.transfer || []);
+    })
+    .catch(error => {
+      self.postMessage({
+        msg: "failure",
+        msgId,
+        error,
+        errorCode: error.errorCode,
+      });
+    })
+    .catch(error => {
+      console.error(error);
+
+      self.postMessage({
+        msg: "failure",
+        msgId,
+        error: {},
+      });
+    });
+};

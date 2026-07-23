@@ -1,0 +1,46 @@
+#ifndef OT_GLYF_GLYPHHEADER_HH
+#define OT_GLYF_GLYPHHEADER_HH
+
+
+#include "../../hb-open-type.hh"
+
+
+namespace OT {
+namespace glyf_impl {
+
+
+struct GlyphHeader
+{
+  bool has_data () const { return numberOfContours; }
+
+  template <typename accelerator_t>
+  bool get_extents_without_var_scaled (hb_font_t *font, const accelerator_t &glyf_accelerator,
+				       hb_codepoint_t gid, hb_glyph_extents_t *extents) const
+  {
+    int lsb = hb_min (xMin, xMax);
+    (void) glyf_accelerator.hmtx->get_leading_bearing_without_var_unscaled (gid, &lsb);
+    extents->x_bearing = lsb;
+    extents->y_bearing = hb_max (yMin, yMax);
+    extents->width     = hb_max (xMin, xMax) - hb_min (xMin, xMax);
+    extents->height    = hb_min (yMin, yMax) - hb_max (yMin, yMax);
+
+    font->scale_glyph_extents (extents);
+
+    return true;
+  }
+
+  HBINT16	numberOfContours;
+  FWORD	xMin;	
+  FWORD	yMin;	
+  FWORD	xMax;	
+  FWORD	yMax;	
+  public:
+  DEFINE_SIZE_STATIC (10);
+};
+
+
+} 
+} 
+
+
+#endif /* OT_GLYF_GLYPHHEADER_HH */

@@ -1,0 +1,603 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsTableFrame_h_
+#define nsTableFrame_h_
+
+#include "TableArea.h"
+#include "celldata.h"
+#include "nsCellMap.h"
+#include "nsContainerFrame.h"
+#include "nsDisplayList.h"
+#include "nscore.h"
+
+struct BCPaintBorderAction;
+class nsTableCellFrame;
+class nsTableCellMap;
+class nsTableColFrame;
+class nsTableRowGroupFrame;
+class nsTableRowFrame;
+class nsTableColGroupFrame;
+class nsITableLayoutStrategy;
+
+namespace mozilla {
+class LogicalMargin;
+class PresShell;
+class WritingMode;
+struct TableBCData;
+struct TableReflowInput;
+
+namespace layers {
+class StackingContextHelper;
+}
+
+enum class TableReflowMode : uint8_t {
+  Measuring,
+
+  Final,
+};
+
+class nsDisplayTableItem : public nsPaintedDisplayItem {
+ public:
+  nsDisplayTableItem(nsDisplayListBuilder* aBuilder, nsIFrame* aFrame)
+      : nsPaintedDisplayItem(aBuilder, aFrame) {}
+
+  nsRect GetBounds(nsDisplayListBuilder* aBuilder, bool* aSnap) const override;
+};
+
+class nsDisplayTableBackgroundSet {
+ public:
+  nsDisplayList* ColGroupBackgrounds() { return &mColGroupBackgrounds; }
+
+  nsDisplayList* ColBackgrounds() { return &mColBackgrounds; }
+
+  nsDisplayTableBackgroundSet(nsDisplayListBuilder* aBuilder, nsIFrame* aTable);
+
+  ~nsDisplayTableBackgroundSet() {
+    mozilla::DebugOnly<nsDisplayTableBackgroundSet*> result =
+        mBuilder->SetTableBackgroundSet(mPrevTableBackgroundSet);
+    MOZ_ASSERT(result == this);
+  }
+
+  void MoveTo(const nsDisplayListSet& aDestination) {
+    aDestination.BorderBackground()->AppendToTop(ColGroupBackgrounds());
+    aDestination.BorderBackground()->AppendToTop(ColBackgrounds());
+  }
+
+  void AddColumn(nsTableColFrame* aFrame) { mColumns.AppendElement(aFrame); }
+
+  nsTableColFrame* GetColForIndex(int32_t aIndex) { return mColumns[aIndex]; }
+
+  const nsPoint& TableToReferenceFrame() { return mToReferenceFrame; }
+
+  const nsRect& GetDirtyRect() { return mDirtyRect; }
+
+  const DisplayItemClipChain* GetTableClipChain() {
+    return mCombinedTableClipChain;
+  }
+
+  const ActiveScrolledRoot* GetTableASR() { return mTableASR; }
+
+ private:
+  void* operator new(size_t sz) noexcept(true);
+
+ protected:
+  nsDisplayListBuilder* mBuilder;
+  nsDisplayTableBackgroundSet* mPrevTableBackgroundSet;
+
+  nsDisplayList mColGroupBackgrounds;
+  nsDisplayList mColBackgrounds;
+
+  nsTArray<nsTableColFrame*> mColumns;
+  nsPoint mToReferenceFrame;
+  nsRect mDirtyRect;
+
+  const DisplayItemClipChain* mCombinedTableClipChain;
+  const ActiveScrolledRoot* mTableASR;
+};
+
+}  
+
+
+enum nsTableColType {
+  eColContent = 0,            
+  eColAnonymousCol = 1,       
+  eColAnonymousColGroup = 2,  
+  eColAnonymousCell = 3       
+};
+
+class nsTableFrame : public nsContainerFrame {
+  typedef mozilla::image::ImgDrawResult ImgDrawResult;
+  typedef mozilla::WritingMode WritingMode;
+  typedef mozilla::LogicalMargin LogicalMargin;
+
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(nsTableFrame)
+
+  using TablePartsArray = nsTArray<nsContainerFrame*>;
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(PositionedTablePartsProperty,
+                                      TablePartsArray)
+
+  friend class nsTableWrapperFrame;
+
+  using RowGroupArray = AutoTArray<nsTableRowGroupFrame*, 8>;
+  using ColGroupArray = AutoTArray<nsTableColGroupFrame*, 2>;
+  struct Groups {
+    RowGroupArray mRowGroups;
+    ColGroupArray mColGroups;
+    nsTableRowGroupFrame* mHead = nullptr;
+    nsTableRowGroupFrame* mFoot = nullptr;
+  };
+
+  friend nsTableFrame* NS_NewTableFrame(mozilla::PresShell* aPresShell,
+                                        ComputedStyle* aStyle);
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+
+  static bool AncestorsHaveStyleBSize(const ReflowInput& aParentReflowInput);
+
+  static void CheckRequestSpecialBSizeReflow(const ReflowInput& aReflowInput);
+
+  static void RequestSpecialBSizeReflow(const ReflowInput& aReflowInput);
+
+  static bool PageBreakAfter(nsIFrame* aSourceFrame, nsIFrame* aNextFrame);
+
+  static void PositionedTablePartMaybeChanged(
+      nsContainerFrame*, mozilla::ComputedStyle* aOldStyle);
+
+  static void MaybeUnregisterPositionedTablePart(nsContainerFrame* aFrame);
+
+  void RowOrColSpanChanged(nsTableCellFrame* aCellFrame);
+
+  void Destroy(DestroyContext&) override;
+
+  void DidSetComputedStyle(ComputedStyle* aOldComputedStyle) override;
+
+  void SetInitialChildList(ChildListID aListID,
+                           nsFrameList&& aChildList) override;
+  void AppendFrames(ChildListID aListID, nsFrameList&& aFrameList) override;
+  void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                    const nsLineList::iterator* aPrevFrameLine,
+                    nsFrameList&& aFrameList) override;
+  void RemoveFrame(DestroyContext&, ChildListID, nsIFrame*) override;
+
+  nsMargin GetUsedBorder() const override;
+  nsMargin GetUsedPadding() const override;
+  nsMargin GetUsedMargin() const override;
+
+  static nsTableFrame* GetTableFrame(nsIFrame* aSourceFrame);
+
+  static nsIFrame* GetFrameAtOrBefore(nsIFrame* aParentFrame,
+                                      nsIFrame* aPriorChildFrame,
+                                      mozilla::LayoutFrameType aChildType);
+  bool IsAutoBSize(mozilla::WritingMode aWM);
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  int32_t GetRealColEnd() const;
+
+  LogicalMargin GetOuterBCBorder(const WritingMode aWM) const;
+
+  void GetCollapsedBorderPadding(
+      mozilla::Maybe<mozilla::LogicalMargin>& aBorder,
+      mozilla::Maybe<mozilla::LogicalMargin>& aPadding) const;
+
+  friend class nsDelayedCalcBCBorders;
+
+  void AddBCDamageArea(const mozilla::TableArea& aValue);
+  bool BCRecalcNeeded(ComputedStyle* aOldComputedStyle,
+                      ComputedStyle* aNewComputedStyle);
+  void PaintBCBorders(DrawTarget& aDrawTarget, const nsRect& aDirtyRect);
+  void CreateWebRenderCommandsForBCBorders(
+      mozilla::wr::DisplayListBuilder& aBuilder,
+      const mozilla::layers::StackingContextHelper& aSc,
+      const nsRect& aVisibleRect, const nsPoint& aOffsetToReferenceFrame);
+
+  void MarkIntrinsicISizesDirty() override;
+  nscoord IntrinsicISize(const mozilla::IntrinsicSizeInput& aInput,
+                         mozilla::IntrinsicISizeType aType) override;
+  IntrinsicSizeOffsetData IntrinsicISizeOffsets(
+      nscoord aPercentageBasis = NS_UNCONSTRAINEDSIZE) override;
+
+  SizeComputationResult ComputeSize(
+      const SizeComputationInput& aSizingInput, mozilla::WritingMode aWM,
+      const mozilla::LogicalSize& aCBSize, nscoord aAvailableISize,
+      const mozilla::LogicalSize& aMargin,
+      const mozilla::LogicalSize& aBorderPadding,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      mozilla::ComputeSizeFlags aFlags) override;
+
+  mozilla::LogicalSize ComputeAutoSize(
+      const SizeComputationInput& aSizingInput, mozilla::WritingMode aWM,
+      const mozilla::LogicalSize& aCBSize, nscoord aAvailableISize,
+      const mozilla::LogicalSize& aMargin,
+      const mozilla::LogicalSize& aBorderPadding,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      mozilla::ComputeSizeFlags aFlags) override;
+
+  nscoord TableShrinkISizeToFit(gfxContext* aRenderingContext,
+                                nscoord aWidthInCB);
+
+  // clang-format off
+  // clang-format on
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  void ReflowTable(ReflowOutput& aDesiredSize, const ReflowInput& aReflowInput,
+                   const LogicalMargin& aBorderPadding,
+                   mozilla::TableReflowMode aReflowMode, Groups& aGroups,
+                   nsIFrame*& aLastChildReflowed, nsReflowStatus& aStatus);
+
+  ComputedStyle* GetParentComputedStyle(
+      nsIFrame** aProviderFrame) const override;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+  nscoord GetColumnISizeFromFirstInFlow(int32_t aColIndex);
+
+  virtual nscoord GetColSpacing(int32_t aColIndex);
+
+  virtual nscoord GetColSpacing(int32_t aStartColIndex, int32_t aEndColIndex);
+
+  virtual nscoord GetRowSpacing(int32_t aRowIndex);
+
+  virtual nscoord GetRowSpacing(int32_t aStartRowIndex, int32_t aEndRowIndex);
+
+ private:
+  nscoord GetColSpacing();
+  nscoord GetRowSpacing();
+
+ public:
+  Maybe<nscoord> GetNaturalBaselineBOffset(
+      mozilla::WritingMode aWM, BaselineSharingGroup aBaselineGroup,
+      BaselineExportContext) const override;
+
+  int32_t GetEffectiveRowSpan(int32_t aStartRowIndex,
+                              const nsTableCellFrame& aCell) const;
+  int32_t GetEffectiveRowSpan(const nsTableCellFrame& aCell,
+                              nsCellMap* aCellMap = nullptr);
+
+  int32_t GetEffectiveColSpan(const nsTableCellFrame& aCell,
+                              nsCellMap* aCellMap = nullptr) const;
+
+  bool HasMoreThanOneCell(int32_t aRowIndex) const;
+
+  nsTableColFrame* GetColFrame(int32_t aColIndex) const;
+
+  void InsertCol(nsTableColFrame& aColFrame, int32_t aColIndex);
+
+  nsTableColGroupFrame* CreateSyntheticColGroupFrame();
+
+  int32_t DestroyAnonymousColFrames(int32_t aNumFrames);
+
+  void AppendAnonymousColFrames(int32_t aNumColsToAdd);
+
+  void AppendAnonymousColFrames(nsTableColGroupFrame* aColGroupFrame,
+                                int32_t aNumColsToAdd, nsTableColType aColType,
+                                bool aAddToTable);
+
+  void MatchCellMapToColCache(nsTableCellMap* aCellMap);
+
+  void DidResizeColumns();
+
+  void AppendCell(nsTableCellFrame& aCellFrame, int32_t aRowIndex);
+
+  void InsertCells(nsTArray<nsTableCellFrame*>& aCellFrames, int32_t aRowIndex,
+                   int32_t aColIndexBefore);
+
+  void RemoveCell(nsTableCellFrame* aCellFrame, int32_t aRowIndex);
+
+  void AppendRows(nsTableRowGroupFrame* aRowGroupFrame, int32_t aRowIndex,
+                  nsTArray<nsTableRowFrame*>& aRowFrames);
+
+  int32_t InsertRows(nsTableRowGroupFrame* aRowGroupFrame,
+                     nsTArray<nsTableRowFrame*>& aFrames, int32_t aRowIndex,
+                     bool aConsiderSpans);
+
+  void RemoveRows(nsTableRowFrame& aFirstRowFrame, int32_t aNumRowsToRemove,
+                  bool aConsiderSpans);
+
+  void InsertRowGroups(const nsFrameList::Slice& aNewFrames);
+  void InsertColGroups(int32_t aStartColIndex,
+                       const nsFrameList::Slice& aNewFrames);
+
+  void RemoveCol(int32_t aColIndex, bool aRemoveFromCache,
+                 bool aRemoveFromCellMap);
+
+  bool ColumnHasCellSpacingBefore(int32_t aColIndex) const;
+
+  bool HasPctCol() const;
+  void SetHasPctCol(bool aValue);
+
+  bool HasCellSpanningPctCol() const;
+  void SetHasCellSpanningPctCol(bool aValue);
+
+  static void InvalidateTableFrame(nsIFrame* aFrame, const nsRect& aOrigRect,
+                                   const nsRect& aOrigInkOverflow,
+                                   bool aIsFirstReflow);
+
+  bool ComputeCustomOverflow(mozilla::OverflowAreas& aOverflowAreas) override;
+
+  void AppendDirectlyOwnedAnonBoxes(nsTArray<OwnedAnonBox>& aResult) override;
+
+ protected:
+  static void UpdateStyleOfOwnedAnonBoxesForTableWrapper(
+      nsIFrame* aOwningFrame, nsIFrame* aWrapperFrame,
+      mozilla::ServoRestyleState& aRestyleState);
+
+  explicit nsTableFrame(ComputedStyle* aStyle, nsPresContext* aPresContext,
+                        ClassID aID = kClassID);
+
+  virtual ~nsTableFrame();
+
+  void InitChildReflowInput(ReflowInput& aReflowInput);
+
+  LogicalSides GetLogicalSkipSides() const override;
+
+  void IterateBCBorders(BCPaintBorderAction& aAction, const nsRect& aDirtyRect);
+
+ public:
+  bool IsRowInserted() const;
+  void SetRowInserted(bool aValue);
+
+ protected:
+  nscoord SetupHeaderFooterChild(const mozilla::TableReflowInput& aReflowInput,
+                                 nsTableRowGroupFrame* aFrame);
+
+  void ReflowChildren(mozilla::TableReflowInput& aReflowInput,
+                      nsReflowStatus& aStatus, Groups& aGroups,
+                      nsIFrame*& aLastChildReflowed,
+                      mozilla::OverflowAreas& aOverflowAreas);
+
+  void ReflowColGroups(gfxContext* aRenderingContext);
+
+  nscoord GetCollapsedISize(const WritingMode aWM,
+                            const LogicalMargin& aBorderPadding);
+
+  void AdjustForCollapsingRowsCols(
+      ReflowOutput& aDesiredSize, const WritingMode aWM,
+      const nsTArray<nsTableRowGroupFrame*>& aRowGroups,
+      const LogicalMargin& aBorderPadding);
+
+  void FixupPositionedTableParts(nsPresContext* aPresContext,
+                                 ReflowOutput& aDesiredSize,
+                                 const ReflowInput& aReflowInput);
+
+  nsITableLayoutStrategy* LayoutStrategy() const {
+    return static_cast<nsTableFrame*>(FirstInFlow())
+        ->mTableLayoutStrategy.get();
+  }
+
+  void HomogenousInsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                              nsFrameList& aFrameList);
+
+ private:
+  void ProcessRowInserted(nscoord aNewHeight);
+
+ protected:
+  nscoord CalcBorderBoxBSize(const ReflowInput& aReflowInput,
+                             const LogicalMargin& aBorderPadding,
+                             nscoord aIntrinsicBorderBoxBSize);
+
+  nscoord CalcDesiredBSize(const ReflowInput& aReflowInput,
+                           const LogicalMargin& aBorderPadding,
+                           const nsReflowStatus& aStatus);
+
+  void DistributeBSizeToRows(const ReflowInput& aReflowInput, nscoord aAmount);
+
+  void PlaceChild(mozilla::TableReflowInput& aReflowInput, nsIFrame* aKidFrame,
+                  const ReflowInput& aKidReflowInput,
+                  const mozilla::LogicalPoint& aKidPosition,
+                  const nsSize& aContainerSize, ReflowOutput& aKidDesiredSize,
+                  const nsRect& aOriginalKidRect,
+                  const nsRect& aOriginalKidInkOverflow);
+  void PlaceRepeatedFooter(mozilla::TableReflowInput& aReflowInput,
+                           nsTableRowGroupFrame* aTfoot, nscoord aFooterBSize);
+
+  void PushChildrenToOverflow(const RowGroupArray& aRowGroups,
+                              size_t aPushFrom);
+
+ public:
+  Groups OrderedGroups() const;
+  RowGroupArray OrderedRowGroups() const { return OrderedGroups().mRowGroups; }
+
+  bool RowIsSpannedInto(int32_t aRowIndex, int32_t aNumEffCols);
+
+  bool RowHasSpanningCells(int32_t aRowIndex, int32_t aNumEffCols);
+
+ public:
+  bool IsBorderCollapse() const;
+
+  bool NeedToCalcBCBorders() const;
+  void SetNeedToCalcBCBorders(bool aValue);
+
+  bool NeedToCollapse() const;
+  void SetNeedToCollapse(bool aValue);
+
+  bool NeedToCalcHasBCBorders() const;
+  void SetNeedToCalcHasBCBorders(bool aValue);
+
+  void CalcHasBCBorders();
+  bool HasBCBorders();
+  void SetHasBCBorders(bool aValue);
+
+  void SetGeometryDirty() { mBits.mGeometryDirty = true; }
+  void ClearGeometryDirty() { mBits.mGeometryDirty = false; }
+  bool IsGeometryDirty() const { return mBits.mGeometryDirty; }
+
+  nsTableCellMap* GetCellMap() const;
+
+  void AdjustRowIndices(int32_t aRowIndex, int32_t aAdjustment);
+
+  void ResetRowIndices(const nsFrameList::Slice& aRowGroupsToExclude);
+
+  nsTArray<nsTableColFrame*>& GetColCache();
+
+  mozilla::TableBCData* GetTableBCData() const;
+
+ protected:
+  void SetBorderCollapse(bool aValue);
+
+  void SetFullBCDamageArea();
+  void CalcBCBorders();
+
+  void ExpandBCDamageArea(mozilla::TableArea& aRect) const;
+
+  void SetColumnDimensions(nscoord aHeight, WritingMode aWM,
+                           const LogicalMargin& aBorderPadding,
+                           const nsSize& aContainerSize);
+
+  int32_t CollectRows(nsIFrame* aFrame,
+                      nsTArray<nsTableRowFrame*>& aCollection);
+
+ public: 
+  int32_t GetStartRowIndex(const nsTableRowGroupFrame* aRowGroupFrame) const;
+
+  int32_t GetRowCount() const { return GetCellMap()->GetRowCount(); }
+
+  int32_t GetEffectiveColCount() const;
+
+  int32_t GetColCount() const { return GetCellMap()->GetColCount(); }
+
+  int32_t GetIndexOfLastRealCol();
+
+  bool IsAutoLayout();
+
+ public:
+
+  void AddDeletedRowIndex(int32_t aDeletedRowStoredIndex);
+
+  int32_t GetAdjustmentForStoredIndex(int32_t aStoredIndex);
+
+  bool IsDeletedRowIndexRangesEmpty() const {
+    return mDeletedRowIndexRanges.empty();
+  }
+
+  bool IsDestroying() const { return mBits.mIsDestroying; }
+
+  nsTableColGroupFrame* GetSyntheticColGroup() const {
+    return mSyntheticColGroup;
+  }
+
+ public:
+#ifdef DEBUG
+  void Dump(bool aDumpRows, bool aDumpCols, bool aDumpCellMap);
+  void VerifyColFrames();
+#endif
+
+ protected:
+  void DoRemoveFrame(DestroyContext&, ChildListID, nsIFrame*);
+#ifdef DEBUG
+  void DumpRowGroup(nsIFrame* aChildFrame);
+#endif
+  AutoTArray<nsTableColFrame*, 8> mColFrames;
+  nsTableColGroupFrame* mSyntheticColGroup = nullptr;
+
+  struct TableBits {
+    uint32_t mHasPctCol : 1;        
+    uint32_t mCellSpansPctCol : 1;  
+    uint32_t mIsBorderCollapse : 1;  
+    uint32_t mRowInserted : 1;
+    uint32_t mNeedToCalcBCBorders : 1;
+    uint32_t mGeometryDirty : 1;
+    uint32_t mNeedToCollapse : 1;  
+    uint32_t mResizedColumns : 1;  
+    uint32_t mNeedToCalcHasBCBorders : 1;
+    uint32_t mHasBCBorders : 1;
+    uint32_t mIsDestroying : 1;  
+  } mBits;
+
+  std::map<int32_t, int32_t> mDeletedRowIndexRanges;  
+  mozilla::UniquePtr<nsTableCellMap> mCellMap;  
+  mozilla::UniquePtr<nsITableLayoutStrategy> mTableLayoutStrategy;
+};
+
+inline bool nsTableFrame::HasPctCol() const { return (bool)mBits.mHasPctCol; }
+
+inline void nsTableFrame::SetHasPctCol(bool aValue) {
+  mBits.mHasPctCol = (unsigned)aValue;
+}
+
+inline bool nsTableFrame::HasCellSpanningPctCol() const {
+  return (bool)mBits.mCellSpansPctCol;
+}
+
+inline void nsTableFrame::SetHasCellSpanningPctCol(bool aValue) {
+  mBits.mCellSpansPctCol = (unsigned)aValue;
+}
+
+inline bool nsTableFrame::IsRowInserted() const {
+  return (bool)mBits.mRowInserted;
+}
+
+inline void nsTableFrame::SetRowInserted(bool aValue) {
+  mBits.mRowInserted = (unsigned)aValue;
+}
+
+inline void nsTableFrame::SetNeedToCollapse(bool aValue) {
+  static_cast<nsTableFrame*>(FirstInFlow())->mBits.mNeedToCollapse =
+      (unsigned)aValue;
+}
+
+inline bool nsTableFrame::NeedToCollapse() const {
+  return (bool)static_cast<nsTableFrame*>(FirstInFlow())->mBits.mNeedToCollapse;
+}
+
+inline nsTArray<nsTableColFrame*>& nsTableFrame::GetColCache() {
+  return mColFrames;
+}
+
+inline bool nsTableFrame::IsBorderCollapse() const {
+  return (bool)mBits.mIsBorderCollapse;
+}
+
+inline void nsTableFrame::SetBorderCollapse(bool aValue) {
+  mBits.mIsBorderCollapse = aValue;
+}
+
+inline bool nsTableFrame::NeedToCalcBCBorders() const {
+  return (bool)mBits.mNeedToCalcBCBorders;
+}
+
+inline void nsTableFrame::SetNeedToCalcBCBorders(bool aValue) {
+  mBits.mNeedToCalcBCBorders = (unsigned)aValue;
+}
+
+inline bool nsTableFrame::NeedToCalcHasBCBorders() const {
+  return (bool)mBits.mNeedToCalcHasBCBorders;
+}
+
+inline void nsTableFrame::SetNeedToCalcHasBCBorders(bool aValue) {
+  mBits.mNeedToCalcHasBCBorders = (unsigned)aValue;
+}
+
+inline bool nsTableFrame::HasBCBorders() {
+  if (NeedToCalcHasBCBorders()) {
+    CalcHasBCBorders();
+    SetNeedToCalcHasBCBorders(false);
+  }
+  return (bool)mBits.mHasBCBorders;
+}
+
+inline void nsTableFrame::SetHasBCBorders(bool aValue) {
+  mBits.mHasBCBorders = (unsigned)aValue;
+}
+
+#define ABORT0()                                       \
+  {                                                    \
+    NS_ASSERTION(false, "CellIterator program error"); \
+    return;                                            \
+  }
+
+#define ABORT1(aReturn)                                \
+  {                                                    \
+    NS_ASSERTION(false, "CellIterator program error"); \
+    return aReturn;                                    \
+  }
+
+#endif

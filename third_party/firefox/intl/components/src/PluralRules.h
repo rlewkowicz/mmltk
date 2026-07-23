@@ -1,0 +1,128 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef intl_components_PluralRules_h_
+#define intl_components_PluralRules_h_
+
+#include <string_view>
+#include <utility>
+
+#include "mozilla/intl/ICUError.h"
+#include "mozilla/intl/NumberFormat.h"
+#include "mozilla/intl/NumberRangeFormat.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Result.h"
+#include "mozilla/Span.h"
+
+#include "unicode/utypes.h"
+
+namespace mozilla::intl {
+
+class PluralRules final {
+ public:
+  enum class Keyword : uint8_t {
+    Few,
+    Many,
+    One,
+    Other,
+    Two,
+    Zero,
+  };
+
+  enum class Type : uint8_t {
+    Cardinal,
+    Ordinal,
+  };
+
+  PluralRules(const PluralRules&) = delete;
+  PluralRules& operator=(const PluralRules&) = delete;
+
+  static Result<UniquePtr<PluralRules>, ICUError> TryCreate(
+      std::string_view aLocale, const PluralRulesOptions& aOptions);
+
+  Result<PluralRules::Keyword, ICUError> Select(double aNumber) const;
+
+  Result<PluralRules::Keyword, ICUError> Select(std::string_view aNumber) const;
+
+  Result<PluralRules::Keyword, ICUError> SelectRange(double aStart,
+                                                     double aEnd) const;
+
+  Result<PluralRules::Keyword, ICUError> SelectRange(
+      std::string_view aStart, std::string_view aEnd) const;
+
+  Result<EnumSet<PluralRules::Keyword>, ICUError> Categories() const;
+
+  ~PluralRules();
+
+ private:
+  static const size_t MAX_KEYWORD_LENGTH = 5;
+
+  UPluralRules* mPluralRules = nullptr;
+  UniquePtr<NumberFormat> mNumberFormat;
+  UniquePtr<NumberRangeFormat> mNumberRangeFormat;
+
+  PluralRules(UPluralRules*&, UniquePtr<NumberFormat>&&,
+              UniquePtr<NumberRangeFormat>&&);
+
+  static PluralRules::Keyword KeywordFromUtf16(Span<const char16_t> aKeyword);
+
+  static PluralRules::Keyword KeywordFromAscii(Span<const char> aKeyword);
+};
+
+struct MOZ_STACK_CLASS PluralRulesOptions {
+  NumberFormatOptions ToNumberFormatOptions() const {
+    return NumberFormatOptions{
+        .mFractionDigits = mFractionDigits,
+        .mMinIntegerDigits = mMinIntegerDigits,
+        .mSignificantDigits = mSignificantDigits,
+        .mStripTrailingZero = mStripTrailingZero,
+        .mNotation = mNotation,
+        .mRoundingIncrement = mRoundingIncrement,
+        .mRoundingMode = mRoundingMode,
+        .mRoundingPriority = mRoundingPriority,
+    };
+  }
+  NumberRangeFormatOptions ToNumberRangeFormatOptions() const {
+    return NumberRangeFormatOptions{
+        {
+            .mFractionDigits = mFractionDigits,
+            .mMinIntegerDigits = mMinIntegerDigits,
+            .mSignificantDigits = mSignificantDigits,
+            .mStripTrailingZero = mStripTrailingZero,
+            .mNotation = mNotation,
+            .mRoundingIncrement = mRoundingIncrement,
+            .mRoundingMode = mRoundingMode,
+            .mRoundingPriority = mRoundingPriority,
+        },
+        NumberRangeFormatOptions::RangeCollapse::None,
+        NumberRangeFormatOptions::RangeIdentityFallback::Range,
+    };
+  }
+
+  PluralRules::Type mPluralType = PluralRules::Type::Cardinal;
+
+  Maybe<uint32_t> mMinIntegerDigits;
+
+  Maybe<std::pair<uint32_t, uint32_t>> mFractionDigits;
+
+  Maybe<std::pair<uint32_t, uint32_t>> mSignificantDigits;
+
+  bool mStripTrailingZero = false;
+
+  using Notation = NumberFormatOptions::Notation;
+  Notation mNotation = Notation::Standard;
+
+  uint32_t mRoundingIncrement = 1;
+
+  using RoundingMode = NumberFormatOptions::RoundingMode;
+  RoundingMode mRoundingMode = RoundingMode::HalfExpand;
+
+  using RoundingPriority = NumberFormatOptions::RoundingPriority;
+  RoundingPriority mRoundingPriority = RoundingPriority::Auto;
+};
+
+}  
+
+#endif

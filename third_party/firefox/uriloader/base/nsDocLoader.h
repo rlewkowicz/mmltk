@@ -1,0 +1,271 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsDocLoader_h_
+#define nsDocLoader_h_
+
+#include "nsIDocumentLoader.h"
+#include "nsIWebProgress.h"
+#include "nsIWebProgressListener.h"
+#include "nsIRequestObserver.h"
+#include "nsWeakReference.h"
+#include "nsILoadGroup.h"
+#include "nsCOMArray.h"
+#include "nsTObserverArray.h"
+#include "nsString.h"
+#include "nsIChannel.h"
+#include "nsIProgressEventSink.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsIChannelEventSink.h"
+#include "nsISupportsPriority.h"
+#include "nsCOMPtr.h"
+#include "PLDHashTable.h"
+#include "nsCycleCollectionParticipant.h"
+
+#include "mozilla/LinkedList.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/intl/Localization.h"
+
+namespace mozilla {
+namespace dom {
+class BrowsingContext;
+}  
+}  
+
+
+#define NS_THIS_DOCLOADER_IMPL_CID            \
+  { \
+   0xb4ec8387,                                \
+   0x98aa,                                    \
+   0x4c08,                                    \
+   {0x93, 0xb6, 0x6d, 0x23, 0x06, 0x9c, 0x06, 0xf2}}
+
+class nsDocLoader : public nsIDocumentLoader,
+                    public nsIRequestObserver,
+                    public nsSupportsWeakReference,
+                    public nsIProgressEventSink,
+                    public nsIWebProgress,
+                    public nsIInterfaceRequestor,
+                    public nsIChannelEventSink,
+                    public nsISupportsPriority {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_THIS_DOCLOADER_IMPL_CID)
+
+  nsDocLoader() : nsDocLoader(false) {}
+
+  [[nodiscard]] virtual nsresult Init();
+  [[nodiscard]] nsresult InitWithBrowsingContext(
+      mozilla::dom::BrowsingContext* aBrowsingContext);
+
+  static already_AddRefed<nsDocLoader> GetAsDocLoader(nsISupports* aSupports);
+  static nsISupports* GetAsSupports(nsDocLoader* aDocLoader) {
+    return static_cast<nsIDocumentLoader*>(aDocLoader);
+  }
+
+  [[nodiscard]] static nsresult AddDocLoaderAsChildOfRoot(
+      nsDocLoader* aDocLoader);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsDocLoader, nsIDocumentLoader)
+
+  NS_DECL_NSIDOCUMENTLOADER
+
+  NS_DECL_NSIPROGRESSEVENTSINK
+
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSIWEBPROGRESS
+
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSICHANNELEVENTSINK
+  NS_DECL_NSISUPPORTSPRIORITY;  // semicolon for clang-format bug 1629756
+
+
+  [[nodiscard]] nsresult RemoveChildLoader(nsDocLoader* aChild);
+
+  [[nodiscard]] nsresult AddChildLoader(nsDocLoader* aChild);
+  nsDocLoader* GetParent() const { return mParent; }
+
+  struct nsListenerInfo {
+    nsListenerInfo(nsIWeakReference* aListener, unsigned long aNotifyMask)
+        : mWeakListener(aListener), mNotifyMask(aNotifyMask) {}
+
+    nsWeakPtr mWeakListener;
+
+    unsigned long mNotifyMask;
+  };
+
+  void OnSecurityChange(nsISupports* aContext, uint32_t aState);
+
+  void SetDocumentOpenedButNotLoaded() { mDocumentOpenedButNotLoaded = true; }
+
+  uint32_t ChildCount() const { return mChildList.Length(); }
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void OOPChildrenLoadingIsEmpty() {
+    DocLoaderIsEmpty(true);
+  }
+
+  static nsresult FormatStatusMessage(
+      nsresult aStatus, const nsAString& aHost, nsAString& aRetVal,
+      mozilla::StaticRefPtr<mozilla::intl::Localization>& aL10n);
+
+  void FireOnLocationChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+                            nsIURI* aUri, uint32_t aFlags);
+
+ protected:
+  explicit nsDocLoader(bool aNotifyAboutBackgroundRequests);
+  virtual ~nsDocLoader();
+
+  [[nodiscard]] virtual nsresult SetDocLoaderParent(nsDocLoader* aLoader);
+
+  bool IsBusy();
+
+  void SetBackgroundLoadIframe();
+
+  void Destroy();
+  virtual void DestroyChildren();
+
+  nsIDocumentLoader* ChildAt(int32_t i) {
+    return mChildList.SafeElementAt(i, nullptr);
+  }
+
+  void FireOnProgressChange(nsDocLoader* aLoadInitiator, nsIRequest* request,
+                            int64_t aProgress, int64_t aProgressMax,
+                            int64_t aProgressDelta, int64_t aTotalProgress,
+                            int64_t aMaxTotalProgress);
+
+  typedef AutoTArray<RefPtr<nsDocLoader>, 8> WebProgressList;
+  void GatherAncestorWebProgresses(WebProgressList& aList);
+
+  void FireOnStateChange(nsIWebProgress* aProgress, nsIRequest* request,
+                         int32_t aStateFlags, nsresult aStatus);
+
+  void DoFireOnStateChange(nsIWebProgress* const aProgress,
+                           nsIRequest* const request, int32_t& aStateFlags,
+                           const nsresult aStatus);
+
+  void FireOnStatusChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+                          nsresult aStatus, const char16_t* aMessage);
+
+  [[nodiscard]] bool RefreshAttempted(nsIWebProgress* aWebProgress,
+                                      nsIURI* aURI, uint32_t aDelay,
+                                      bool aSameURI);
+
+  virtual void OnRedirectStateChange(nsIChannel* aOldChannel,
+                                     nsIChannel* aNewChannel,
+                                     uint32_t aRedirectFlags,
+                                     uint32_t aStateFlags) {}
+
+  void doStartDocumentLoad();
+  void doStartURLLoad(nsIRequest* request, int32_t aExtraFlags);
+  void doStopURLLoad(nsIRequest* request, nsresult aStatus);
+  void doStopDocumentLoad(nsIRequest* request, nsresult aStatus);
+
+  void NotifyDoneWithOnload(nsDocLoader* aParent);
+
+  [[nodiscard]] bool ChildEnteringOnload(nsIDocumentLoader* aChild) {
+    return mChildrenInOnload.AppendObject(aChild);
+  }
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void ChildDoneWithOnload(
+      nsIDocumentLoader* aChild) {
+    mChildrenInOnload.RemoveObject(aChild);
+    DocLoaderIsEmpty(true);
+  }
+
+  MOZ_CAN_RUN_SCRIPT void DocLoaderIsEmpty(
+      bool aFlushLayout,
+      const mozilla::Maybe<nsresult>& aOverrideStatus = mozilla::Nothing());
+
+ protected:
+  struct nsStatusInfo : public mozilla::LinkedListElement<nsStatusInfo> {
+    nsString mStatusMessage;
+    nsresult mStatusCode;
+    nsIRequest* const mRequest;
+
+    explicit nsStatusInfo(nsIRequest* aRequest)
+        : mStatusCode(NS_ERROR_NOT_INITIALIZED), mRequest(aRequest) {
+      MOZ_COUNT_CTOR(nsStatusInfo);
+    }
+    MOZ_COUNTED_DTOR(nsStatusInfo)
+  };
+
+  struct nsRequestInfo {
+    explicit nsRequestInfo()
+        : mCurrentProgress(0),
+          mMaxProgress(0),
+          mUploading(false),
+          mLastStatus(nullptr) {}
+
+    int64_t mCurrentProgress;
+    int64_t mMaxProgress;
+    bool mUploading;
+
+    mozilla::UniquePtr<nsStatusInfo> mLastStatus;
+  };
+
+
+  nsCOMPtr<nsIRequest> mDocumentRequest;  
+
+  nsDocLoader* mParent;  
+
+  typedef nsAutoTObserverArray<nsListenerInfo, 8> ListenerArray;
+  ListenerArray mListenerInfoList;
+
+  nsCOMPtr<nsILoadGroup> mLoadGroup;
+  nsTObserverArray<nsDocLoader*> mChildList;
+
+  int32_t mProgressStateFlags;
+
+  int64_t mCurrentSelfProgress;
+  int64_t mMaxSelfProgress;
+
+  int64_t mCurrentTotalProgress;
+  int64_t mMaxTotalProgress;
+
+  nsTHashMap<nsIRequest*, nsRequestInfo> mRequestInfoHash;
+  int64_t mCompletedTotalProgress;
+
+  mozilla::LinkedList<nsStatusInfo> mStatusInfoList;
+
+  bool mIsLoadingDocument;
+
+  bool mIsRestoringDocument;
+
+  bool mDontFlushLayout;
+
+  bool mIsFlushingLayout;
+
+ private:
+  bool mDocumentOpenedButNotLoaded;
+
+  bool mIsLoadingJavascriptURI = false;
+
+  bool mNotifyAboutBackgroundRequests;
+
+  nsCOMArray<nsIDocumentLoader> mChildrenInOnload;
+
+  int64_t GetMaxTotalProgress();
+
+  nsresult AddRequestInfo(nsIRequest* aRequest);
+  void RemoveRequestInfo(nsIRequest* aRequest);
+  nsRequestInfo* GetRequestInfo(nsIRequest* aRequest) const;
+  void ClearRequestInfoHash();
+  int64_t CalculateMaxProgress();
+
+  void ClearInternalProgress();
+
+  bool IsBlockingLoadEvent() const {
+    return mIsLoadingDocument || mDocumentOpenedButNotLoaded ||
+           mIsLoadingJavascriptURI;
+  }
+
+  static mozilla::Maybe<nsLiteralCString> StatusCodeToL10nId(nsresult aStatus);
+};
+
+static inline nsISupports* ToSupports(nsDocLoader* aDocLoader) {
+  return static_cast<nsIDocumentLoader*>(aDocLoader);
+}
+
+#endif /* nsDocLoader_h_ */

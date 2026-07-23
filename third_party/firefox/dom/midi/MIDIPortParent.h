@@ -1,0 +1,37 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_MIDIPortParent_h
+#define mozilla_dom_MIDIPortParent_h
+
+#include "mozilla/dom/MIDIPortBinding.h"
+#include "mozilla/dom/MIDIPortInterface.h"
+#include "mozilla/dom/PMIDIPortParent.h"
+
+namespace mozilla::dom {
+
+class MIDIPortParent final : public PMIDIPortParent, public MIDIPortInterface {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MIDIPortParent, override);
+  void ActorDestroy(ActorDestroyReason) override;
+  mozilla::ipc::IPCResult RecvSend(nsTArray<MIDIMessage>&& aMsg);
+  mozilla::ipc::IPCResult RecvOpen();
+  mozilla::ipc::IPCResult RecvClose();
+  mozilla::ipc::IPCResult RecvClear();
+  mozilla::ipc::IPCResult RecvShutdown();
+  MOZ_IMPLICIT MIDIPortParent(const MIDIPortInfo& aPortInfo,
+                              const bool aSysexEnabled);
+  bool SendUpdateStatus(const MIDIPortDeviceState& aDeviceState,
+                        const MIDIPortConnectionState& aConnectionState);
+  uint32_t GetInternalId() const { return mInternalId; }
+
+ protected:
+  ~MIDIPortParent() = default;
+  nsTArray<MIDIMessage> mMessageQueue;
+  const uint32_t mInternalId;
+};
+
+}  
+
+#endif

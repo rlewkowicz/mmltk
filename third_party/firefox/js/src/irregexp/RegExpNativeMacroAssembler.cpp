@@ -1,0 +1,1202 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+// Copyright 2020 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "irregexp/imported/regexp-macro-assembler-arch.h"
+#include "irregexp/imported/regexp-stack.h"
+#include "irregexp/imported/special-case.h"
+#include "jit/Linker.h"
+#include "jit/PerfSpewer.h"
+#include "vm/MatchPairs.h"
+#include "vm/Realm.h"
+#if defined(MOZ_VTUNE)
+#  include "vtune/VTuneWrapper.h"
+#endif
+
+#include "jit/ABIFunctionList-inl.h"
+#include "jit/MacroAssembler-inl.h"
+
+namespace v8 {
+namespace internal {
+namespace regexp {
+
+using js::MatchPairs;
+using js::jit::AbsoluteAddress;
+using js::jit::Address;
+using js::jit::AllocatableGeneralRegisterSet;
+using js::jit::Assembler;
+using js::jit::BaseIndex;
+using js::jit::CodeLocationLabel;
+using js::jit::GeneralRegisterBackwardIterator;
+using js::jit::GeneralRegisterForwardIterator;
+using js::jit::GeneralRegisterSet;
+using js::jit::Imm32;
+using js::jit::ImmPtr;
+using js::jit::ImmWord;
+using js::jit::JitCode;
+using js::jit::Linker;
+using js::jit::LiveGeneralRegisterSet;
+using js::jit::Register;
+using js::jit::Registers;
+using js::jit::StackMacroAssembler;
+
+SMRegExpMacroAssembler::SMRegExpMacroAssembler(JSContext* cx,
+                                               StackMacroAssembler& masm,
+                                               Zone* zone, Mode mode,
+                                               uint32_t num_capture_registers)
+    : NativeRegExpMacroAssembler(cx->isolate.ref(), zone, mode),
+      cx_(cx),
+      masm_(masm),
+      mode_(mode),
+      num_registers_(num_capture_registers),
+      num_capture_registers_(num_capture_registers) {
+  MOZ_ASSERT(num_capture_registers_ % 2 == 0);
+
+  AllocatableGeneralRegisterSet regs(GeneralRegisterSet::All());
+
+  input_end_pointer_ = regs.takeAny();
+  current_character_ = regs.takeAny();
+  current_position_ = regs.takeAny();
+  backtrack_stack_pointer_ = regs.takeAny();
+  temp0_ = regs.takeAny();
+  temp1_ = regs.takeAny();
+  if (!regs.empty()) {
+    temp2_ = regs.takeAny();
+  }
+  savedRegisters_ = js::jit::SavedNonVolatileRegisters(regs);
+
+  masm_.jump(&entry_label_);  
+  masm_.bind(&start_label_);  
+}
+
+int SMRegExpMacroAssembler::stack_limit_slack_slot_count() {
+  return Stack::kStackLimitSlackSlotCount;
+}
+
+void SMRegExpMacroAssembler::AdvanceCurrentPosition(int by) {
+  if (by != 0) {
+    masm_.addPtr(Imm32(by * char_size()), current_position_);
+  }
+}
+
+void SMRegExpMacroAssembler::AdvanceRegister(int reg, int by) {
+  MOZ_ASSERT(reg >= 0 && reg < num_registers_);
+  if (by != 0) {
+    masm_.addPtr(Imm32(by), register_location(reg));
+  }
+}
+
+void SMRegExpMacroAssembler::Backtrack() {
+#if defined(DEBUG)
+  js::jit::Label bailOut;
+  masm_.branch32(Assembler::NotEqual,
+                 AbsoluteAddress(&cx_->isolate->shouldSimulateInterrupt_),
+                 Imm32(0), &bailOut);
+#endif
+  js::jit::Label noInterrupt;
+  masm_.branchTest32(
+      Assembler::Zero, AbsoluteAddress(cx_->addressOfInterruptBits()),
+      Imm32(uint32_t(js::InterruptReason::CallbackUrgent)), &noInterrupt);
+#if defined(DEBUG)
+  masm_.bind(&bailOut);
+#endif
+  masm_.movePtr(ImmWord(int32_t(js::RegExpRunStatus::Error)), temp0_);
+  masm_.jump(&exit_label_);
+  masm_.bind(&noInterrupt);
+
+  Pop(temp0_);
+  PushBacktrackCodeOffsetPatch(masm_.movWithPatch(ImmPtr(nullptr), temp1_));
+  masm_.addPtr(temp1_, temp0_);
+  masm_.jump(temp0_);
+}
+
+void SMRegExpMacroAssembler::Bind(Label* label) {
+  masm_.bind(label->inner());
+  if (label->patchOffset_.bound()) {
+    AddLabelPatch(label->patchOffset_, label->pos());
+  }
+}
+
+void SMRegExpMacroAssembler::CheckAtStartImpl(int cp_offset, Label* on_cond,
+                                              Assembler::Condition cond) {
+  Address addr(current_position_, cp_offset * char_size());
+  masm_.computeEffectiveAddress(addr, temp0_);
+
+  masm_.branchPtr(cond, inputStart(), temp0_, LabelOrBacktrack(on_cond));
+}
+
+void SMRegExpMacroAssembler::CheckAtStart(int cp_offset, Label* on_at_start) {
+  CheckAtStartImpl(cp_offset, on_at_start, Assembler::Equal);
+}
+
+void SMRegExpMacroAssembler::CheckNotAtStart(int cp_offset,
+                                             Label* on_not_at_start) {
+  CheckAtStartImpl(cp_offset, on_not_at_start, Assembler::NotEqual);
+}
+
+void SMRegExpMacroAssembler::CheckCharacterImpl(Imm32 c, Label* on_cond,
+                                                Assembler::Condition cond) {
+  masm_.branch32(cond, current_character_, c, LabelOrBacktrack(on_cond));
+}
+
+void SMRegExpMacroAssembler::CheckCharacter(uint32_t c, Label* on_equal) {
+  CheckCharacterImpl(Imm32(c), on_equal, Assembler::Equal);
+}
+
+void SMRegExpMacroAssembler::CheckNotCharacter(uint32_t c,
+                                               Label* on_not_equal) {
+  CheckCharacterImpl(Imm32(c), on_not_equal, Assembler::NotEqual);
+}
+
+void SMRegExpMacroAssembler::CheckCharacterGT(base::uc16 limit,
+                                              Label* on_greater) {
+  CheckCharacterImpl(Imm32(limit), on_greater, Assembler::GreaterThan);
+}
+
+void SMRegExpMacroAssembler::CheckCharacterLT(base::uc16 limit,
+                                              Label* on_less) {
+  CheckCharacterImpl(Imm32(limit), on_less, Assembler::LessThan);
+}
+
+void SMRegExpMacroAssembler::CheckCharacterAfterAndImpl(uint32_t c,
+                                                        uint32_t mask,
+                                                        Label* on_cond,
+                                                        bool is_not) {
+  if (c == 0) {
+    Assembler::Condition cond = is_not ? Assembler::NonZero : Assembler::Zero;
+    masm_.branchTest32(cond, current_character_, Imm32(mask),
+                       LabelOrBacktrack(on_cond));
+  } else {
+    Assembler::Condition cond = is_not ? Assembler::NotEqual : Assembler::Equal;
+    masm_.move32(Imm32(mask), temp0_);
+    masm_.and32(current_character_, temp0_);
+    masm_.branch32(cond, temp0_, Imm32(c), LabelOrBacktrack(on_cond));
+  }
+}
+
+void SMRegExpMacroAssembler::CheckCharacterAfterAnd(uint32_t c, uint32_t mask,
+                                                    Label* on_equal) {
+  CheckCharacterAfterAndImpl(c, mask, on_equal, false);
+}
+
+void SMRegExpMacroAssembler::CheckNotCharacterAfterAnd(uint32_t c,
+                                                       uint32_t mask,
+                                                       Label* on_not_equal) {
+  CheckCharacterAfterAndImpl(c, mask, on_not_equal, true);
+}
+
+void SMRegExpMacroAssembler::CheckNotCharacterAfterMinusAnd(
+    base::uc16 c, base::uc16 minus, base::uc16 mask, Label* on_not_equal) {
+  masm_.computeEffectiveAddress(Address(current_character_, -minus), temp0_);
+  if (c == 0) {
+    masm_.branchTest32(Assembler::NonZero, temp0_, Imm32(mask),
+                       LabelOrBacktrack(on_not_equal));
+  } else {
+    masm_.and32(Imm32(mask), temp0_);
+    masm_.branch32(Assembler::NotEqual, temp0_, Imm32(c),
+                   LabelOrBacktrack(on_not_equal));
+  }
+}
+
+void SMRegExpMacroAssembler::CheckFixedLengthLoop(Label* on_equal) {
+  js::jit::Label fallthrough;
+  masm_.load32SignExtendToPtr(Address(backtrack_stack_pointer_, 0), temp0_);
+  masm_.branchPtr(Assembler::NotEqual, temp0_, current_position_, &fallthrough);
+  masm_.addPtr(Imm32(sizeof(int32_t)), backtrack_stack_pointer_);  
+  JumpOrBacktrack(on_equal);
+  masm_.bind(&fallthrough);
+}
+
+void SMRegExpMacroAssembler::CheckCharacterInRangeImpl(
+    base::uc16 from, base::uc16 to, Label* on_cond, Assembler::Condition cond) {
+  masm_.computeEffectiveAddress(Address(current_character_, -from), temp0_);
+  masm_.branch32(cond, temp0_, Imm32(to - from), LabelOrBacktrack(on_cond));
+}
+
+void SMRegExpMacroAssembler::CheckCharacterInRange(base::uc16 from,
+                                                   base::uc16 to,
+                                                   Label* on_in_range) {
+  CheckCharacterInRangeImpl(from, to, on_in_range, Assembler::BelowOrEqual);
+}
+
+void SMRegExpMacroAssembler::CheckCharacterNotInRange(base::uc16 from,
+                                                      base::uc16 to,
+                                                      Label* on_not_in_range) {
+  CheckCharacterInRangeImpl(from, to, on_not_in_range, Assembler::Above);
+}
+
+bool SMRegExpMacroAssembler::IsCharacterInRangeArray(uint32_t c,
+                                                     ByteArrayData* ranges) {
+  js::AutoUnsafeCallWithABI unsafe;
+  MOZ_ASSERT(ranges->length() % sizeof(uint16_t) == 0);
+  uint32_t length = ranges->length() / sizeof(uint16_t);
+  MOZ_ASSERT(length > 0);
+
+  if (c < ranges->getTyped<uint16_t>(0)) {
+    return false;
+  }
+  if (c >= ranges->getTyped<uint16_t>(length - 1)) {
+    return (length % 2) != 0;
+  }
+
+  uint32_t lower = 0;
+  uint32_t upper = length;
+  uint32_t mid = 0;
+  do {
+    mid = lower + (upper - lower) / 2;
+    const base::uc16 elem = ranges->getTyped<uint16_t>(mid);
+    if (c < elem) {
+      upper = mid;
+    } else if (c > elem) {
+      lower = mid + 1;
+    } else {
+      break;
+    }
+  } while (lower < upper);
+  uint32_t rangeIndex = c < ranges->getTyped<uint16_t>(mid) ? mid - 1 : mid;
+
+  return rangeIndex % 2 == 0;
+}
+
+void SMRegExpMacroAssembler::CallIsCharacterInRangeArray(
+    const ZoneList<CharacterRange>* ranges) {
+  Handle<ByteArray> rangeArray = GetOrAddRangeArray(ranges);
+  masm_.movePtr(ImmPtr(rangeArray->inner()), temp0_);
+
+  LiveGeneralRegisterSet volatileRegs(GeneralRegisterSet::Volatile());
+  volatileRegs.takeUnchecked(temp0_);
+  volatileRegs.takeUnchecked(temp1_);
+  if (temp2_ != js::jit::InvalidReg) {
+    volatileRegs.takeUnchecked(temp2_);
+  }
+  masm_.PushRegsInMask(volatileRegs);
+
+  using Fn = bool (*)(uint32_t, ByteArrayData*);
+  masm_.setupUnalignedABICall(temp1_);
+  masm_.passABIArg(current_character_);
+  masm_.passABIArg(temp0_);
+
+  masm_.callWithABI<Fn, ::js::irregexp::IsCharacterInRangeArray>();
+  masm_.storeCallBoolResult(temp1_);
+  masm_.PopRegsInMask(volatileRegs);
+
+  PseudoHandle<ByteArrayData> rawRangeArray =
+      rangeArray->maybeTakeOwnership(isolate());
+  if (rawRangeArray) {
+    AddTable(std::move(rawRangeArray));
+  }
+}
+
+bool SMRegExpMacroAssembler::CheckCharacterInRangeArray(
+    const ZoneList<CharacterRange>* ranges, Label* on_in_range) {
+  CallIsCharacterInRangeArray(ranges);
+  masm_.branchTest32(Assembler::NonZero, temp1_, temp1_,
+                     LabelOrBacktrack(on_in_range));
+  return true;
+}
+
+bool SMRegExpMacroAssembler::CheckCharacterNotInRangeArray(
+    const ZoneList<CharacterRange>* ranges, Label* on_not_in_range) {
+  CallIsCharacterInRangeArray(ranges);
+  masm_.branchTest32(Assembler::Zero, temp1_, temp1_,
+                     LabelOrBacktrack(on_not_in_range));
+  return true;
+}
+
+void SMRegExpMacroAssembler::CheckBitInTable(Handle<ByteArray> table,
+                                             Label* on_bit_set) {
+  PseudoHandle<ByteArrayData> rawTable = table->takeOwnership(isolate());
+
+  masm_.movePtr(ImmPtr(rawTable->data()), temp0_);
+
+  masm_.move32(Imm32(kTableMask), temp1_);
+  masm_.and32(current_character_, temp1_);
+
+  masm_.load8ZeroExtend(BaseIndex(temp0_, temp1_, js::jit::TimesOne), temp0_);
+  masm_.branchTest32(Assembler::NonZero, temp0_, temp0_,
+                     LabelOrBacktrack(on_bit_set));
+
+  AddTable(std::move(rawTable));
+}
+
+void SMRegExpMacroAssembler::SkipUntilBitInTable(
+    int cp_offset, Handle<ByteArray> table, Handle<ByteArray> nibble_table,
+    int advance_by, Label* on_match, Label* on_no_match) {
+  PseudoHandle<ByteArrayData> rawTable = table->takeOwnership(isolate());
+
+  MOZ_ASSERT(!SkipUntilBitInTableUseSimd(advance_by));
+
+  Register tableReg = temp0_;
+  masm_.movePtr(ImmPtr(rawTable->data()), tableReg);
+
+  js::jit::Label scalarRepeat;
+  masm_.bind(&scalarRepeat);
+  CheckPosition(cp_offset, on_no_match);
+  LoadCurrentCharacterUnchecked(cp_offset, 1);
+
+  Register index = current_character_;
+  if (mode_ != LATIN1 || kTableMask != String::kMaxOneByteCharCode) {
+    index = temp1_;
+    masm_.and32(Imm32(kTableMask), current_character_, index);
+  }
+
+  masm_.load8ZeroExtend(BaseIndex(tableReg, index, js::jit::TimesOne), index);
+  masm_.branchTest32(Assembler::NonZero, index, index,
+                     LabelOrBacktrack(on_match));
+  AdvanceCurrentPosition(advance_by);
+  masm_.jump(&scalarRepeat);
+
+  AddTable(std::move(rawTable));
+}
+
+bool SMRegExpMacroAssembler::SkipUntilBitInTableUseSimd(int advance_by) {
+  bool simdEnabled = false;
+  return simdEnabled && advance_by * char_size() == 1;
+}
+
+void SMRegExpMacroAssembler::CheckNotBackReferenceImpl(int start_reg,
+                                                       bool read_backward,
+                                                       bool unicode,
+                                                       Label* on_no_match,
+                                                       bool ignore_case) {
+  js::jit::Label fallthrough;
+
+  masm_.loadPtr(register_location(start_reg),  
+                current_character_);
+  masm_.loadPtr(register_location(start_reg + 1), temp0_);  
+  masm_.subPtr(current_character_, temp0_);                 
+
+  masm_.branchPtr(Assembler::Equal, temp0_, ImmWord(0), &fallthrough);
+
+  if (read_backward) {
+    masm_.loadPtr(inputStart(), temp1_);
+    masm_.addPtr(temp0_, temp1_);
+    masm_.branchPtr(Assembler::GreaterThan, temp1_, current_position_,
+                    LabelOrBacktrack(on_no_match));
+  } else {
+    masm_.movePtr(current_position_, temp1_);
+    masm_.addPtr(temp0_, temp1_);
+    masm_.branchPtr(Assembler::GreaterThan, temp1_, ImmWord(0),
+                    LabelOrBacktrack(on_no_match));
+  }
+
+  if (mode_ == UC16 && ignore_case) {
+
+    LiveGeneralRegisterSet volatileRegs(GeneralRegisterSet::Volatile());
+    volatileRegs.addUnchecked(current_position_);
+    volatileRegs.takeUnchecked(temp1_);
+    if (temp2_ != js::jit::InvalidReg) {
+      volatileRegs.takeUnchecked(temp2_);
+    }
+    volatileRegs.takeUnchecked(current_character_);
+    masm_.PushRegsInMask(volatileRegs);
+
+
+    masm_.addPtr(input_end_pointer_, current_character_);
+
+    masm_.addPtr(input_end_pointer_, current_position_);
+    if (read_backward) {
+      masm_.subPtr(temp0_, current_position_);
+    }
+
+    using Fn = uint32_t (*)(const char16_t*, const char16_t*, size_t);
+    masm_.setupUnalignedABICall(temp1_);
+    masm_.passABIArg(current_character_);
+    masm_.passABIArg(current_position_);
+    masm_.passABIArg(temp0_);
+
+    if (unicode) {
+      masm_.callWithABI<Fn, ::js::irregexp::CaseInsensitiveCompareUnicode>();
+    } else {
+      masm_.callWithABI<Fn, ::js::irregexp::CaseInsensitiveCompareNonUnicode>();
+    }
+    masm_.storeCallInt32Result(temp1_);
+    masm_.PopRegsInMask(volatileRegs);
+    masm_.branchTest32(Assembler::Zero, temp1_, temp1_,
+                       LabelOrBacktrack(on_no_match));
+
+    if (read_backward) {
+      masm_.subPtr(temp0_, current_position_);
+    } else {
+      masm_.addPtr(temp0_, current_position_);
+    }
+
+    masm_.bind(&fallthrough);
+    return;
+  }
+
+  masm_.push(current_position_);
+
+  masm_.addPtr(input_end_pointer_, current_character_);
+
+  masm_.addPtr(input_end_pointer_, current_position_);
+  if (read_backward) {
+    masm_.subPtr(temp0_, current_position_);
+  }
+
+  masm_.addPtr(current_position_, temp0_);
+
+  Register nextCaptureChar = temp1_;
+  Register nextMatchChar = temp2_;
+
+  if (temp2_ == js::jit::InvalidReg) {
+    masm_.push(backtrack_stack_pointer_);
+    nextMatchChar = backtrack_stack_pointer_;
+  }
+
+  js::jit::Label success;
+  js::jit::Label fail;
+  js::jit::Label loop;
+  masm_.bind(&loop);
+
+  if (mode_ == LATIN1) {
+    masm_.load8ZeroExtend(Address(current_character_, 0), nextCaptureChar);
+    masm_.load8ZeroExtend(Address(current_position_, 0), nextMatchChar);
+  } else {
+    masm_.load16ZeroExtend(Address(current_character_, 0), nextCaptureChar);
+    masm_.load16ZeroExtend(Address(current_position_, 0), nextMatchChar);
+  }
+
+  if (ignore_case) {
+    MOZ_ASSERT(mode_ == LATIN1);
+    js::jit::Label loop_increment;
+    masm_.branch32(Assembler::Equal, nextCaptureChar, nextMatchChar,
+                   &loop_increment);
+
+    js::jit::Label convert_match;
+    masm_.or32(Imm32(0x20), nextCaptureChar);
+
+    masm_.computeEffectiveAddress(Address(nextCaptureChar, -'a'),
+                                  nextMatchChar);
+    masm_.branch32(Assembler::BelowOrEqual, nextMatchChar, Imm32('z' - 'a'),
+                   &convert_match);
+    masm_.sub32(Imm32(224 - 'a'), nextMatchChar);
+    masm_.branch32(Assembler::Above, nextMatchChar, Imm32(254 - 224), &fail);
+    masm_.branch32(Assembler::Equal, nextMatchChar, Imm32(247 - 224), &fail);
+
+    masm_.bind(&convert_match);
+    masm_.load8ZeroExtend(Address(current_position_, 0), nextMatchChar);
+    masm_.or32(Imm32(0x20), nextMatchChar);
+    masm_.branch32(Assembler::NotEqual, nextCaptureChar, nextMatchChar, &fail);
+
+    masm_.bind(&loop_increment);
+  } else {
+    masm_.branch32(Assembler::NotEqual, nextCaptureChar, nextMatchChar, &fail);
+  }
+
+  masm_.addPtr(Imm32(char_size()), current_character_);
+  masm_.addPtr(Imm32(char_size()), current_position_);
+
+  masm_.branchPtr(Assembler::Below, current_position_, temp0_, &loop);
+  masm_.jump(&success);
+
+  masm_.bind(&fail);
+  if (temp2_ == js::jit::InvalidReg) {
+    masm_.pop(backtrack_stack_pointer_);
+  }
+  masm_.pop(current_position_);
+  JumpOrBacktrack(on_no_match);
+
+  masm_.bind(&success);
+
+  if (temp2_ == js::jit::InvalidReg) {
+    masm_.pop(backtrack_stack_pointer_);
+  }
+  masm_.addToStackPtr(Imm32(sizeof(uintptr_t)));
+
+  masm_.subPtr(input_end_pointer_, current_position_);
+  if (read_backward) {
+    masm_.addPtr(register_location(start_reg), current_position_);
+    masm_.subPtr(register_location(start_reg + 1), current_position_);
+  }
+
+  masm_.bind(&fallthrough);
+}
+
+void SMRegExpMacroAssembler::CheckNotBackReference(int start_reg,
+                                                   bool read_backward,
+                                                   Label* on_no_match) {
+  CheckNotBackReferenceImpl(start_reg, read_backward,  false,
+                            on_no_match,  false);
+}
+
+void SMRegExpMacroAssembler::CheckNotBackReferenceIgnoreCase(
+    int start_reg, bool read_backward, bool unicode, Label* on_no_match) {
+  CheckNotBackReferenceImpl(start_reg, read_backward, unicode, on_no_match,
+                             true);
+}
+
+void SMRegExpMacroAssembler::CheckPosition(int cp_offset,
+                                           Label* on_outside_input) {
+  if (cp_offset >= 0) {
+    masm_.branchPtr(Assembler::GreaterThanOrEqual, current_position_,
+                    ImmWord(-cp_offset * char_size()),
+                    LabelOrBacktrack(on_outside_input));
+  } else {
+    masm_.computeEffectiveAddress(
+        Address(current_position_, cp_offset * char_size()), temp0_);
+
+    masm_.branchPtr(Assembler::GreaterThan, inputStart(), temp0_,
+                    LabelOrBacktrack(on_outside_input));
+  }
+}
+
+void SMRegExpMacroAssembler::CheckSpecialClassRanges(StandardCharacterSet type,
+                                                     Label* on_no_match) {
+  MOZ_ASSERT(CanOptimizeSpecialClassRanges(type));
+  js::jit::Label* no_match = LabelOrBacktrack(on_no_match);
+
+  switch (type) {
+    case StandardCharacterSet::kWhitespace: {
+      MOZ_ASSERT(mode_ == LATIN1);
+      js::jit::Label success;
+
+      masm_.branch32(Assembler::Equal, current_character_, Imm32(' '),
+                     &success);
+
+      masm_.computeEffectiveAddress(Address(current_character_, -'\t'), temp0_);
+      masm_.branch32(Assembler::BelowOrEqual, temp0_, Imm32('\r' - '\t'),
+                     &success);
+
+      masm_.branch32(Assembler::NotEqual, temp0_, Imm32(0x00a0 - '\t'),
+                     no_match);
+
+      masm_.bind(&success);
+      break;
+    }
+    case StandardCharacterSet::kNotWhitespace:
+      MOZ_CRASH("unreachable");
+    case StandardCharacterSet::kDigit:
+      masm_.computeEffectiveAddress(Address(current_character_, -'0'), temp0_);
+      masm_.branch32(Assembler::Above, temp0_, Imm32('9' - '0'), no_match);
+      break;
+    case StandardCharacterSet::kNotDigit:
+      masm_.computeEffectiveAddress(Address(current_character_, -'0'), temp0_);
+      masm_.branch32(Assembler::BelowOrEqual, temp0_, Imm32('9' - '0'),
+                     no_match);
+      break;
+    case StandardCharacterSet::kNotLineTerminator:
+
+      masm_.xor32(Imm32(0x01), current_character_, temp0_);
+      masm_.sub32(Imm32(0x0b), temp0_);
+      masm_.branch32(Assembler::BelowOrEqual, temp0_, Imm32(0x0c - 0x0b),
+                     no_match);
+
+      if (mode_ == UC16) {
+        masm_.sub32(Imm32(0x2028 - 0x0b), temp0_);
+        masm_.branch32(Assembler::BelowOrEqual, temp0_, Imm32(0x2029 - 0x2028),
+                       no_match);
+      }
+      break;
+    case StandardCharacterSet::kWord:
+      if (mode_ != LATIN1) {
+        masm_.branch32(Assembler::Above, current_character_, Imm32('z'),
+                       no_match);
+      }
+      static_assert(arraysize(word_character_map_) > unibrow::Latin1::kMaxChar);
+      masm_.movePtr(ImmPtr(&word_character_map_), temp0_);
+      masm_.load8ZeroExtend(
+          BaseIndex(temp0_, current_character_, js::jit::TimesOne), temp0_);
+      masm_.branchTest32(Assembler::Zero, temp0_, temp0_, no_match);
+      break;
+    case StandardCharacterSet::kNotWord: {
+      js::jit::Label done;
+      if (mode_ != LATIN1) {
+        masm_.branch32(Assembler::Above, current_character_, Imm32('z'), &done);
+      }
+      static_assert(arraysize(word_character_map_) > unibrow::Latin1::kMaxChar);
+      masm_.movePtr(ImmPtr(&word_character_map_), temp0_);
+      masm_.load8ZeroExtend(
+          BaseIndex(temp0_, current_character_, js::jit::TimesOne), temp0_);
+      masm_.branchTest32(Assembler::NonZero, temp0_, temp0_, no_match);
+      if (mode_ != LATIN1) {
+        masm_.bind(&done);
+      }
+      break;
+    }
+    case StandardCharacterSet::kEverything:
+      break;
+    case StandardCharacterSet::kLineTerminator:
+      masm_.xor32(Imm32(0x01), current_character_, temp0_);
+      masm_.sub32(Imm32(0x0b), temp0_);
+      if (mode_ == LATIN1) {
+        masm_.branch32(Assembler::Above, temp0_, Imm32(0x0c - 0x0b), no_match);
+      } else {
+        MOZ_ASSERT(mode_ == UC16);
+        js::jit::Label done;
+        masm_.branch32(Assembler::BelowOrEqual, temp0_, Imm32(0x0c - 0x0b),
+                       &done);
+
+        masm_.sub32(Imm32(0x2028 - 0x0b), temp0_);
+        masm_.branch32(Assembler::Above, temp0_, Imm32(0x2029 - 0x2028),
+                       no_match);
+        masm_.bind(&done);
+      }
+      break;
+  }
+}
+
+void SMRegExpMacroAssembler::Fail() {
+  masm_.movePtr(ImmWord(int32_t(js::RegExpRunStatus::Success_NotFound)),
+                temp0_);
+  masm_.jump(&exit_label_);
+}
+
+void SMRegExpMacroAssembler::GoTo(Label* to) {
+  masm_.jump(LabelOrBacktrack(to));
+}
+
+void SMRegExpMacroAssembler::IfRegisterGE(int reg, int comparand,
+                                          Label* if_ge) {
+  masm_.branchPtr(Assembler::GreaterThanOrEqual, register_location(reg),
+                  ImmWord(comparand), LabelOrBacktrack(if_ge));
+}
+
+void SMRegExpMacroAssembler::IfRegisterLT(int reg, int comparand,
+                                          Label* if_lt) {
+  masm_.branchPtr(Assembler::LessThan, register_location(reg),
+                  ImmWord(comparand), LabelOrBacktrack(if_lt));
+}
+
+void SMRegExpMacroAssembler::IfRegisterEqPos(int reg, Label* if_eq) {
+  masm_.branchPtr(Assembler::Equal, register_location(reg), current_position_,
+                  LabelOrBacktrack(if_eq));
+}
+
+void SMRegExpMacroAssembler::LoadCurrentCharacterImpl(int cp_offset,
+                                                      Label* on_end_of_input,
+                                                      bool check_bounds,
+                                                      int characters,
+                                                      int eats_at_least) {
+  MOZ_ASSERT(eats_at_least >= characters);
+  MOZ_ASSERT(cp_offset < (1 << 30));  
+
+  if (check_bounds) {
+    if (cp_offset >= 0) {
+      CheckPosition(cp_offset + eats_at_least - 1, on_end_of_input);
+    } else {
+      CheckPosition(cp_offset, on_end_of_input);
+    }
+  }
+  LoadCurrentCharacterUnchecked(cp_offset, characters);
+}
+
+void SMRegExpMacroAssembler::LoadCurrentCharacterUnchecked(int cp_offset,
+                                                           int characters) {
+  BaseIndex address(input_end_pointer_, current_position_, js::jit::TimesOne,
+                    cp_offset * char_size());
+  if (mode_ == LATIN1) {
+    if (characters == 4) {
+      masm_.load32(address, current_character_);
+    } else if (characters == 2) {
+      masm_.load16ZeroExtend(address, current_character_);
+    } else {
+      MOZ_ASSERT(characters == 1);
+      masm_.load8ZeroExtend(address, current_character_);
+    }
+  } else {
+    MOZ_ASSERT(mode_ == UC16);
+    if (characters == 2) {
+      masm_.load32(address, current_character_);
+    } else {
+      MOZ_ASSERT(characters == 1);
+      masm_.load16ZeroExtend(address, current_character_);
+    }
+  }
+}
+
+void SMRegExpMacroAssembler::PopCurrentPosition() { Pop(current_position_); }
+
+void SMRegExpMacroAssembler::PopRegister(int register_index) {
+  Pop(temp0_);
+  masm_.storePtr(temp0_, register_location(register_index));
+}
+
+void SMRegExpMacroAssembler::PushBacktrack(Label* label) {
+  MOZ_ASSERT(!label->is_bound());
+  MOZ_ASSERT(!label->patchOffset_.bound());
+  label->patchOffset_ = masm_.movWithPatch(ImmPtr(nullptr), temp0_);
+  MOZ_ASSERT(label->patchOffset_.bound());
+
+  Push(temp0_);
+
+  CheckBacktrackStackLimit();
+}
+
+void SMRegExpMacroAssembler::PushCurrentPosition() { Push(current_position_); }
+
+void SMRegExpMacroAssembler::PushRegister(int register_index,
+                                          StackCheckFlag check_stack_limit) {
+  masm_.loadPtr(register_location(register_index), temp0_);
+  Push(temp0_);
+  if (check_stack_limit == StackCheckFlag::kCheckStackLimit) {
+    CheckBacktrackStackLimit();
+  }
+}
+
+void SMRegExpMacroAssembler::ReadCurrentPositionFromRegister(int reg) {
+  masm_.loadPtr(register_location(reg), current_position_);
+}
+
+void SMRegExpMacroAssembler::WriteCurrentPositionToRegister(int reg,
+                                                            int cp_offset) {
+  if (cp_offset == 0) {
+    masm_.storePtr(current_position_, register_location(reg));
+  } else {
+    Address addr(current_position_, cp_offset * char_size());
+    masm_.computeEffectiveAddress(addr, temp0_);
+    masm_.storePtr(temp0_, register_location(reg));
+  }
+}
+
+void SMRegExpMacroAssembler::ReadStackPointerFromRegister(int reg) {
+  masm_.loadPtr(register_location(reg), backtrack_stack_pointer_);
+  masm_.addPtr(backtrackStackBase(), backtrack_stack_pointer_);
+}
+void SMRegExpMacroAssembler::WriteStackPointerToRegister(int reg) {
+  masm_.movePtr(backtrack_stack_pointer_, temp0_);
+  masm_.subPtr(backtrackStackBase(), temp0_);
+  masm_.storePtr(temp0_, register_location(reg));
+}
+
+void SMRegExpMacroAssembler::SetCurrentPositionFromEnd(int by) {
+  js::jit::Label after_position;
+  masm_.branchPtr(Assembler::GreaterThanOrEqual, current_position_,
+                  ImmWord(-by * char_size()), &after_position);
+  masm_.movePtr(ImmWord(-by * char_size()), current_position_);
+
+  LoadCurrentCharacterUnchecked(-1, 1);
+  masm_.bind(&after_position);
+}
+
+void SMRegExpMacroAssembler::SetRegister(int register_index, int to) {
+  MOZ_ASSERT(register_index >= num_capture_registers_);
+  masm_.storePtr(ImmWord(to), register_location(register_index));
+}
+
+bool SMRegExpMacroAssembler::Succeed() {
+  masm_.jump(&success_label_);
+  return global();
+}
+
+void SMRegExpMacroAssembler::ClearRegisters(int reg_from, int reg_to) {
+  MOZ_ASSERT(reg_from <= reg_to);
+  masm_.loadPtr(inputStart(), temp0_);
+  masm_.subPtr(Imm32(char_size()), temp0_);
+  for (int reg = reg_from; reg <= reg_to; reg++) {
+    masm_.storePtr(temp0_, register_location(reg));
+  }
+}
+
+void SMRegExpMacroAssembler::Push(Register source) {
+  MOZ_ASSERT(source != backtrack_stack_pointer_);
+
+  masm_.subPtr(Imm32(sizeof(int32_t)), backtrack_stack_pointer_);
+  masm_.store32(source, Address(backtrack_stack_pointer_, 0));
+}
+
+void SMRegExpMacroAssembler::Pop(Register target) {
+  MOZ_ASSERT(target != backtrack_stack_pointer_);
+
+  masm_.load32SignExtendToPtr(Address(backtrack_stack_pointer_, 0), target);
+  masm_.addPtr(Imm32(sizeof(int32_t)), backtrack_stack_pointer_);
+}
+
+void SMRegExpMacroAssembler::JumpOrBacktrack(Label* to) {
+  if (to) {
+    masm_.jump(to->inner());
+  } else {
+    Backtrack();
+  }
+}
+
+void SMRegExpMacroAssembler::CheckBacktrackStackLimit() {
+  js::jit::Label no_stack_overflow;
+  masm_.branchPtr(
+      Assembler::Below,
+      AbsoluteAddress(isolate()->regexp_stack()->limit_address_address()),
+      backtrack_stack_pointer_, &no_stack_overflow);
+
+  masm_.call(&stack_overflow_label_);
+
+  masm_.branchTest32(Assembler::Zero, temp0_, temp0_,
+                     &exit_with_exception_label_);
+
+  masm_.bind(&no_stack_overflow);
+}
+
+static Handle<HeapObject> DummyCode() {
+  return Handle<HeapObject>::fromHandleValue(JS::UndefinedHandleValue);
+}
+
+Handle<HeapObject> SMRegExpMacroAssembler::GetCode(Handle<RegExpData> data,
+                                                   Flags flags) {
+  if (!cx_->zone()->ensureJitZoneExists(cx_)) {
+    return DummyCode();
+  }
+
+  masm_.bind(&entry_label_);
+
+  createStackFrame();
+  initFrameAndRegs();
+
+  masm_.jump(&start_label_);
+
+  successHandler();
+  exitHandler();
+  backtrackHandler();
+  stackOverflowHandler();
+
+  Linker linker(masm_);
+  JitCode* code = linker.newCode(cx_, js::jit::CodeKind::RegExp);
+  if (!code) {
+    return DummyCode();
+  }
+
+  for (LabelPatch& lp : labelPatches_) {
+    Assembler::PatchDataWithValueCheck(CodeLocationLabel(code, lp.patchOffset_),
+                                       ImmPtr((void*)lp.labelOffset_),
+                                       ImmPtr(nullptr));
+  }
+
+  for (js::jit::CodeOffset& offset : backtrackCodeOffsetPatches_) {
+    Assembler::PatchDataWithValueCheck(CodeLocationLabel(code, offset),
+                                       ImmPtr(code->raw()), ImmPtr(nullptr));
+  }
+
+  CollectPerfSpewerJitCodeProfile(code, "RegExp");
+
+#if defined(MOZ_VTUNE)
+  js::vtune::MarkStub(code, "RegExp");
+#endif
+
+  return Handle<HeapObject>(JS::PrivateGCThingValue(code), isolate());
+}
+
+void SMRegExpMacroAssembler::createStackFrame() {
+#if defined(JS_CODEGEN_ARM64)
+  MOZ_ASSERT(js::jit::PseudoStackPointer64.Is(masm_.GetStackPointer64()));
+  masm_.Str(js::jit::PseudoStackPointer64,
+            vixl::MemOperand(js::jit::sp, -16, vixl::PreIndex));
+
+  masm_.initPseudoStackPtr();
+#endif
+
+  masm_.Push(js::jit::FramePointer);
+  masm_.moveStackPtrTo(js::jit::FramePointer);
+
+  for (GeneralRegisterForwardIterator iter(savedRegisters_); iter.more();
+       ++iter) {
+    masm_.Push(*iter);
+  }
+
+#if defined(JS_CODEGEN_X86)
+  Address ioDataAddr(js::jit::FramePointer, 2 * sizeof(void*));
+  masm_.loadPtr(ioDataAddr, temp0_);
+#else
+  if (js::jit::IntArgReg0 != temp0_) {
+    masm_.movePtr(js::jit::IntArgReg0, temp0_);
+  }
+#endif
+
+  size_t frameBytes = sizeof(FrameData) + num_registers_ * sizeof(void*);
+  frameSize_ = js::jit::StackDecrementForCall(js::jit::ABIStackAlignment,
+                                              masm_.framePushed(), frameBytes);
+  masm_.reserveStack(frameSize_);
+  masm_.checkStackAlignment();
+
+  js::jit::Label stack_ok;
+  AbsoluteAddress limit_addr(cx_->addressOfJitStackLimitNoInterrupt());
+  masm_.branchStackPtrRhs(Assembler::Below, limit_addr, &stack_ok);
+
+  masm_.movePtr(ImmWord(int32_t(js::RegExpRunStatus::Error)), temp0_);
+  masm_.jump(&exit_label_);
+
+  masm_.bind(&stack_ok);
+}
+
+void SMRegExpMacroAssembler::initFrameAndRegs() {
+  Register ioDataReg = temp0_;
+
+  Register matchesReg = temp1_;
+  masm_.loadPtr(Address(ioDataReg, offsetof(InputOutputData, matches)),
+                matchesReg);
+
+  Register extraTemp = backtrack_stack_pointer_;
+
+  masm_.loadPtr(Address(matchesReg, MatchPairs::offsetOfPairs()), extraTemp);
+  masm_.storePtr(extraTemp, matches());
+  masm_.load32(Address(matchesReg, MatchPairs::offsetOfPairCount()), extraTemp);
+  masm_.store32(extraTemp, numMatches());
+
+#if defined(DEBUG)
+  js::jit::Label enoughRegisters;
+  masm_.branchPtr(Assembler::Equal, extraTemp, ImmWord(1), &enoughRegisters);
+  masm_.branchPtr(Assembler::GreaterThanOrEqual, extraTemp,
+                  ImmWord(num_capture_registers_ / 2), &enoughRegisters);
+  masm_.assumeUnreachable("Not enough output pairs for RegExp");
+  masm_.bind(&enoughRegisters);
+#endif
+
+  masm_.loadPtr(Address(ioDataReg, offsetof(InputOutputData, inputStart)),
+                current_position_);
+
+  masm_.loadPtr(Address(ioDataReg, offsetof(InputOutputData, inputEnd)),
+                input_end_pointer_);
+
+  masm_.subPtr(input_end_pointer_, current_position_);
+
+  masm_.storePtr(current_position_, inputStart());
+
+  Register startIndexReg = temp1_;
+  masm_.loadPtr(Address(ioDataReg, offsetof(InputOutputData, startIndex)),
+                startIndexReg);
+  masm_.computeEffectiveAddress(
+      BaseIndex(current_position_, startIndexReg, factor()), current_position_);
+
+  js::jit::Label start_regexp;
+  js::jit::Label load_previous_character;
+  masm_.branchPtr(Assembler::NotEqual, startIndexReg, ImmWord(0),
+                  &load_previous_character);
+  masm_.movePtr(ImmWord('\n'), current_character_);
+  masm_.jump(&start_regexp);
+
+  masm_.bind(&load_previous_character);
+  LoadCurrentCharacterUnchecked(-1, 1);
+  masm_.bind(&start_regexp);
+
+  MOZ_ASSERT(num_capture_registers_ > 0);
+  Register inputStartMinusOneReg = temp0_;
+  masm_.loadPtr(inputStart(), inputStartMinusOneReg);
+  masm_.subPtr(Imm32(char_size()), inputStartMinusOneReg);
+  if (num_capture_registers_ > 8) {
+    masm_.movePtr(ImmWord(register_offset(0)), temp1_);
+    js::jit::Label init_loop;
+    masm_.bind(&init_loop);
+    masm_.storePtr(inputStartMinusOneReg, BaseIndex(masm_.getStackPointer(),
+                                                    temp1_, js::jit::TimesOne));
+    masm_.addPtr(ImmWord(sizeof(void*)), temp1_);
+    masm_.branchPtr(Assembler::LessThanOrEqual, temp1_,
+                    ImmWord(register_offset(num_capture_registers_ - 1)),
+                    &init_loop);
+  } else {
+    for (int i = 0; i < num_capture_registers_; i++) {
+      masm_.storePtr(inputStartMinusOneReg, register_location(i));
+    }
+  }
+
+  masm_.loadPtr(AbsoluteAddress(ExternalReference::TopOfRegexpStack(isolate())),
+                backtrack_stack_pointer_);
+  masm_.storePtr(backtrack_stack_pointer_, backtrackStackBase());
+}
+
+void SMRegExpMacroAssembler::successHandler() {
+  if (!success_label_.used()) {
+    return;
+  }
+  masm_.bind(&success_label_);
+
+  Register matchesReg = temp1_;
+  masm_.loadPtr(matches(), matchesReg);
+
+  Register extraTemp = backtrack_stack_pointer_;
+
+  Register inputStartReg = extraTemp;
+  masm_.loadPtr(inputStart(), inputStartReg);
+
+  auto copyRegister = [&](int reg) {
+    masm_.loadPtr(register_location(reg), temp0_);
+    masm_.subPtr(inputStartReg, temp0_);
+    if (mode_ == UC16) {
+      masm_.rshiftPtrArithmetic(Imm32(1), temp0_);
+    }
+    masm_.store32(temp0_, Address(matchesReg, reg * sizeof(int32_t)));
+  };
+
+  MOZ_ASSERT(num_capture_registers_ >= 2);
+  copyRegister(0);
+  copyRegister(1);
+
+  if (num_capture_registers_ > 2) {
+    js::jit::Label earlyExitForTest;
+    masm_.branch32(Assembler::Equal, numMatches(), Imm32(1), &earlyExitForTest);
+
+    for (int i = 2; i < num_capture_registers_; i++) {
+      copyRegister(i);
+    }
+
+    masm_.bind(&earlyExitForTest);
+  }
+
+  masm_.movePtr(ImmWord(int32_t(js::RegExpRunStatus::Success)), temp0_);
+}
+
+void SMRegExpMacroAssembler::exitHandler() {
+  masm_.bind(&exit_label_);
+
+  if (temp0_ != js::jit::ReturnReg) {
+    masm_.movePtr(temp0_, js::jit::ReturnReg);
+  }
+
+  masm_.freeStack(frameSize_);
+
+  for (GeneralRegisterBackwardIterator iter(savedRegisters_); iter.more();
+       ++iter) {
+    masm_.Pop(*iter);
+  }
+
+  masm_.Pop(js::jit::FramePointer);
+
+#if defined(JS_CODEGEN_ARM64)
+
+  masm_.Mov(js::jit::sp, js::jit::PseudoStackPointer64);
+
+  masm_.Ldr(js::jit::PseudoStackPointer64,
+            vixl::MemOperand(js::jit::sp, 16, vixl::PostIndex));
+
+  masm_.Ret(vixl::lr);
+#else
+  masm_.abiret();
+#endif
+
+  if (exit_with_exception_label_.used()) {
+    masm_.bind(&exit_with_exception_label_);
+
+    masm_.movePtr(ImmWord(int32_t(js::RegExpRunStatus::Error)), temp0_);
+    masm_.jump(&exit_label_);
+  }
+}
+
+void SMRegExpMacroAssembler::backtrackHandler() {
+  if (!backtrack_label_.used()) {
+    return;
+  }
+  masm_.bind(&backtrack_label_);
+  Backtrack();
+}
+
+void SMRegExpMacroAssembler::stackOverflowHandler() {
+  if (!stack_overflow_label_.used()) {
+    return;
+  }
+
+  js::jit::AutoCreatedBy acb(masm_,
+                             "SMRegExpMacroAssembler::stackOverflowHandler");
+
+  masm_.bind(&stack_overflow_label_);
+
+  masm_.movePtr(ImmPtr(isolate()->regexp_stack()), temp1_);
+
+  LiveGeneralRegisterSet volatileRegs(GeneralRegisterSet::Volatile());
+
+#if defined(JS_USE_LINK_REGISTER)
+  masm_.pushReturnAddress();
+#endif
+
+  size_t frameOffset = sizeof(void*);
+
+  volatileRegs.takeUnchecked(temp0_);
+  volatileRegs.takeUnchecked(temp1_);
+  masm_.PushRegsInMask(volatileRegs);
+
+  using Fn = bool (*)(Stack* regexp_stack);
+  masm_.setupUnalignedABICall(temp0_);
+  masm_.passABIArg(temp1_);
+  masm_.callWithABI<Fn, ::js::irregexp::GrowBacktrackStack>();
+  masm_.storeCallBoolResult(temp0_);
+
+  masm_.PopRegsInMask(volatileRegs);
+
+  js::jit::Label overflow_return;
+  masm_.branchTest32(Assembler::Zero, temp0_, temp0_, &overflow_return);
+
+  Address bsbAddress(masm_.getStackPointer(),
+                     offsetof(FrameData, backtrackStackBase) + frameOffset);
+  masm_.subPtr(bsbAddress, backtrack_stack_pointer_);
+
+  masm_.loadPtr(AbsoluteAddress(ExternalReference::TopOfRegexpStack(isolate())),
+                temp1_);
+  masm_.storePtr(temp1_, bsbAddress);
+  masm_.addPtr(temp1_, backtrack_stack_pointer_);
+
+  masm_.bind(&overflow_return);
+  masm_.ret();
+}
+
+RegExpMacroAssembler::IrregexpImplementation
+SMRegExpMacroAssembler::Implementation() {
+  return kBytecodeImplementation;
+}
+
+uint32_t SMRegExpMacroAssembler::CaseInsensitiveCompareNonUnicode(
+    const char16_t* substring1, const char16_t* substring2, size_t byteLength) {
+  js::AutoUnsafeCallWithABI unsafe;
+
+  MOZ_ASSERT(byteLength % sizeof(char16_t) == 0);
+  size_t length = byteLength / sizeof(char16_t);
+
+  for (size_t i = 0; i < length; i++) {
+    char16_t c1 = substring1[i];
+    char16_t c2 = substring2[i];
+    if (c1 != c2) {
+#if defined(JS_HAS_INTL_API)
+      c1 = CaseFolding::Canonicalize(c1);
+      c2 = CaseFolding::Canonicalize(c2);
+#else
+      c1 = js::unicode::FoldCase(c1);
+      c2 = js::unicode::FoldCase(c2);
+#endif
+      if (c1 != c2) {
+        return 0;
+      }
+    }
+  }
+
+  return 1;
+}
+
+uint32_t SMRegExpMacroAssembler::CaseInsensitiveCompareUnicode(
+    const char16_t* substring1, const char16_t* substring2, size_t byteLength) {
+  js::AutoUnsafeCallWithABI unsafe;
+
+  MOZ_ASSERT(byteLength % sizeof(char16_t) == 0);
+  size_t length = byteLength / sizeof(char16_t);
+
+  for (size_t i = 0; i < length; i++) {
+    char16_t c1 = substring1[i];
+    char16_t c2 = substring2[i];
+    if (c1 != c2) {
+      c1 = js::unicode::FoldCase(c1);
+      c2 = js::unicode::FoldCase(c2);
+      if (c1 != c2) {
+        return 0;
+      }
+    }
+  }
+
+  return 1;
+}
+
+bool SMRegExpMacroAssembler::GrowBacktrackStack(Stack* regexp_stack) {
+  js::AutoUnsafeCallWithABI unsafe;
+  size_t size = regexp_stack->memory_size();
+  return !!regexp_stack->EnsureCapacity(size * 2);
+}
+
+bool SMRegExpMacroAssembler::CanReadUnaligned() const {
+#if defined(JS_CODEGEN_ARM)
+  return !js::jit::ARMFlags::HasAlignmentFault();
+#elif defined(JS_CODEGEN_MIPS64)
+  return false;
+#else
+  return true;
+#endif
+}
+
+}  
+}  
+}  

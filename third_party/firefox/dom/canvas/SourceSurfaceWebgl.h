@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_SOURCESURFACEWEBGL_H_
+#define MOZILLA_GFX_SOURCESURFACEWEBGL_H_
+
+#include "mozilla/WeakPtr.h"
+#include "mozilla/gfx/2D.h"
+
+namespace mozilla {
+class WebGLBuffer;
+}  
+
+namespace mozilla::gfx {
+
+class DrawTargetWebgl;
+class SharedContextWebgl;
+class TextureHandle;
+
+class SourceSurfaceWebgl : public DataSourceSurface {
+ public:
+  MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(SourceSurfaceWebgl, override)
+
+  explicit SourceSurfaceWebgl(DrawTargetWebgl* aDT);
+  virtual ~SourceSurfaceWebgl();
+
+  SurfaceType GetType() const override { return SurfaceType::WEBGL; }
+  IntSize GetSize() const override { return mSize; }
+  SurfaceFormat GetFormat() const override { return mFormat; }
+
+  uint8_t* GetData() override;
+  int32_t Stride() override;
+
+  bool Map(MapType aType, MappedSurface* aMappedSurface) override;
+  void Unmap() override;
+
+  bool HasReadData() const { return !!mData; }
+
+  already_AddRefed<SourceSurface> ExtractSubrect(const IntRect& aRect) override;
+
+  bool ReadDataInto(uint8_t* aData, int32_t aStride) override;
+
+ private:
+  friend class DrawTargetWebgl;
+  friend class SharedContextWebgl;
+
+  explicit SourceSurfaceWebgl(const RefPtr<SharedContextWebgl>& aSharedContext);
+
+  bool EnsureData(bool aForce = true, uint8_t* aData = nullptr,
+                  int32_t aStride = 0);
+  bool ForceReadFromPBO();
+
+  void DrawTargetWillChange(bool aNeedHandle);
+
+  void GiveTexture(RefPtr<TextureHandle> aHandle);
+
+  void SetHandle(TextureHandle* aHandle);
+
+  void OnUnlinkTexture(SharedContextWebgl* aContext, TextureHandle* aHandle,
+                       bool aForce);
+
+  DrawTargetWebgl* GetTarget() const { return mDT.get(); }
+
+  SurfaceFormat mFormat = SurfaceFormat::UNKNOWN;
+  IntSize mSize;
+  RefPtr<WebGLBuffer> mReadBuffer;
+  RefPtr<DataSourceSurface> mData;
+  bool mOwnsData = true;
+  WeakPtr<DrawTargetWebgl> mDT;
+  WeakPtr<SharedContextWebgl> mSharedContext;
+  RefPtr<TextureHandle> mHandle;
+};
+
+}  
+
+#endif /* MOZILLA_GFX_SOURCESURFACEWEBGL_H_ */

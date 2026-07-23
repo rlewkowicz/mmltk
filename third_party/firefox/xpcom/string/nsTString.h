@@ -1,0 +1,355 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+// IWYU pragma: private, include "nsString.h"
+
+#if !defined(nsTString_h)
+#define nsTString_h
+
+#include "nsTSubstring.h"
+
+template <typename T>
+class MOZ_GSL_OWNER nsTString : public nsTSubstring<T> {
+ public:
+  typedef nsTString<T> self_type;
+
+  using repr_type = mozilla::detail::nsTStringRepr<T>;
+
+#if defined(__clang__)
+  using typename nsTSubstring<T>::substring_type;
+#else
+  typedef typename nsTSubstring<T>::substring_type substring_type;
+#endif
+
+  typedef typename substring_type::fallible_t fallible_t;
+
+  typedef typename substring_type::char_type char_type;
+  typedef typename substring_type::char_traits char_traits;
+  typedef
+      typename substring_type::incompatible_char_type incompatible_char_type;
+
+  typedef typename substring_type::substring_tuple_type substring_tuple_type;
+
+  typedef typename substring_type::const_iterator const_iterator;
+  typedef typename substring_type::iterator iterator;
+
+  typedef typename substring_type::comparator_type comparator_type;
+
+  typedef typename substring_type::const_char_iterator const_char_iterator;
+
+  typedef typename substring_type::string_view string_view;
+
+  typedef typename substring_type::index_type index_type;
+  typedef typename substring_type::size_type size_type;
+
+  typedef typename substring_type::DataFlags DataFlags;
+  typedef typename substring_type::ClassFlags ClassFlags;
+
+ public:
+
+  constexpr nsTString() : substring_type(ClassFlags::NULL_TERMINATED) {}
+
+  explicit nsTString(const char_type* aData, size_type aLength = size_type(-1))
+      : substring_type(ClassFlags::NULL_TERMINATED) {
+    this->Assign(aData, aLength);
+  }
+
+  explicit nsTString(mozilla::Span<const char_type> aData)
+      : nsTString(aData.Elements(), aData.Length()) {}
+
+#if defined(MOZ_USE_CHAR16_WRAPPER)
+  template <typename Q = T, typename EnableIfChar16 = mozilla::Char16OnlyT<Q>>
+  explicit nsTString(char16ptr_t aStr, size_type aLength = size_type(-1))
+      : substring_type(ClassFlags::NULL_TERMINATED) {
+    this->Assign(static_cast<const char16_t*>(aStr), aLength);
+  }
+#endif
+
+  nsTString(const self_type& aStr)
+      : substring_type(ClassFlags::NULL_TERMINATED) {
+    this->Assign(aStr);
+  }
+
+  nsTString(self_type&& aStr) : substring_type(ClassFlags::NULL_TERMINATED) {
+    this->Assign(std::move(aStr));
+  }
+
+  MOZ_IMPLICIT nsTString(const substring_tuple_type& aTuple)
+      : substring_type(ClassFlags::NULL_TERMINATED) {
+    this->Assign(aTuple);
+  }
+
+  explicit nsTString(const substring_type& aReadable)
+      : substring_type(ClassFlags::NULL_TERMINATED) {
+    this->Assign(aReadable);
+  }
+
+  explicit nsTString(substring_type&& aReadable)
+      : substring_type(ClassFlags::NULL_TERMINATED) {
+    this->Assign(std::move(aReadable));
+  }
+
+  self_type& operator=(char_type aChar) {
+    this->Assign(aChar);
+    return *this;
+  }
+  self_type& operator=(const char_type* aData) {
+    this->Assign(aData);
+    return *this;
+  }
+  self_type& operator=(const self_type& aStr) {
+    this->Assign(aStr);
+    return *this;
+  }
+  self_type& operator=(self_type&& aStr) {
+    this->Assign(std::move(aStr));
+    return *this;
+  }
+#if defined(MOZ_USE_CHAR16_WRAPPER)
+  template <typename Q = T, typename EnableIfChar16 = mozilla::Char16OnlyT<Q>>
+  self_type& operator=(const char16ptr_t aStr) {
+    this->Assign(static_cast<const char16_t*>(aStr));
+    return *this;
+  }
+#endif
+  self_type& operator=(const substring_type& aStr) {
+    this->Assign(aStr);
+    return *this;
+  }
+  self_type& operator=(substring_type&& aStr) {
+    this->Assign(std::move(aStr));
+    return *this;
+  }
+  self_type& operator=(const substring_tuple_type& aTuple) {
+    this->Assign(aTuple);
+    return *this;
+  }
+
+
+  template <typename U, typename Dummy>
+  struct raw_type {
+    typedef const U* type;
+  };
+#if defined(MOZ_USE_CHAR16_WRAPPER)
+  template <typename Dummy>
+  struct raw_type<char16_t, Dummy> {
+    typedef char16ptr_t type;
+  };
+#endif
+
+  MOZ_NO_DANGLING_ON_TEMPORARIES typename raw_type<T, int>::type get() const {
+    return this->mData;
+  }
+
+
+
+  char_type CharAt(index_type aIndex) const {
+    MOZ_ASSERT(aIndex <= this->Length(), "index exceeds allowable range");
+    return this->mData[aIndex];
+  }
+
+  char_type operator[](index_type aIndex) const { return CharAt(aIndex); }
+
+  bool SetCharAt(char16_t aChar, index_type aIndex);
+
+  void Rebind(const char_type* aData, size_type aLength);
+
+  void AssertValidDependentString() {
+    MOZ_ASSERT(this->mData, "nsTDependentString must wrap a non-NULL buffer");
+    MOZ_ASSERT(this->mData[substring_type::mLength] == 0,
+               "nsTDependentString must wrap only null-terminated strings. "
+               "You are probably looking for nsTDependentSubstring.");
+  }
+
+ protected:
+  nsTString(char_type* aData, size_type aLength, DataFlags aDataFlags,
+            ClassFlags aClassFlags)
+      : substring_type(aData, aLength, aDataFlags,
+                       aClassFlags | ClassFlags::NULL_TERMINATED) {}
+
+  friend const nsTString<char>& VoidCString();
+  friend const nsTString<char16_t>& VoidString();
+
+  explicit nsTString(DataFlags aDataFlags)
+      : substring_type(char_traits::sEmptyBuffer, 0,
+                       aDataFlags | DataFlags::TERMINATED,
+                       ClassFlags::NULL_TERMINATED) {}
+};
+
+extern template class nsTString<char>;
+extern template class nsTString<char16_t>;
+
+template <typename Char>
+struct fmt::formatter<nsTString<Char>, Char>
+    : fmt::formatter<nsTSubstring<Char>, Char> {};
+
+template <typename T, size_t N>
+class MOZ_NON_MEMMOVABLE MOZ_GSL_OWNER nsTAutoStringN : public nsTString<T> {
+ public:
+  typedef nsTAutoStringN<T, N> self_type;
+
+  typedef nsTString<T> base_string_type;
+  typedef typename base_string_type::string_type string_type;
+  typedef typename base_string_type::char_type char_type;
+  typedef typename base_string_type::char_traits char_traits;
+  typedef typename base_string_type::substring_type substring_type;
+  typedef typename base_string_type::size_type size_type;
+  typedef typename base_string_type::substring_tuple_type substring_tuple_type;
+
+  typedef typename base_string_type::DataFlags DataFlags;
+  typedef typename base_string_type::ClassFlags ClassFlags;
+  typedef typename base_string_type::LengthStorage LengthStorage;
+
+ public:
+
+  nsTAutoStringN()
+      : string_type(mStorage, 0, DataFlags::TERMINATED | DataFlags::INLINE,
+                    ClassFlags::INLINE),
+        mInlineCapacity(N - 1) {
+    mStorage[0] = char_type(0);
+  }
+
+  explicit nsTAutoStringN(char_type aChar) : self_type() {
+    this->Assign(aChar);
+  }
+
+  explicit nsTAutoStringN(const char_type* aData,
+                          size_type aLength = size_type(-1))
+      : self_type() {
+    this->Assign(aData, aLength);
+  }
+
+#if defined(MOZ_USE_CHAR16_WRAPPER)
+  template <typename Q = T, typename EnableIfChar16 = mozilla::Char16OnlyT<Q>>
+  explicit nsTAutoStringN(char16ptr_t aData, size_type aLength = size_type(-1))
+      : self_type(static_cast<const char16_t*>(aData), aLength) {}
+#endif
+
+  nsTAutoStringN(const self_type& aStr) : self_type() { this->Assign(aStr); }
+
+  nsTAutoStringN(self_type&& aStr) : self_type() {
+    this->Assign(std::move(aStr));
+  }
+
+  explicit nsTAutoStringN(const substring_type& aStr) : self_type() {
+    this->Assign(aStr);
+  }
+
+  explicit nsTAutoStringN(substring_type&& aStr) : self_type() {
+    this->Assign(std::move(aStr));
+  }
+
+  MOZ_IMPLICIT nsTAutoStringN(const substring_tuple_type& aTuple)
+      : self_type() {
+    this->Assign(aTuple);
+  }
+
+  self_type& operator=(char_type aChar) {
+    this->Assign(aChar);
+    return *this;
+  }
+  self_type& operator=(const char_type* aData) {
+    this->Assign(aData);
+    return *this;
+  }
+#if defined(MOZ_USE_CHAR16_WRAPPER)
+  template <typename Q = T, typename EnableIfChar16 = mozilla::Char16OnlyT<Q>>
+  self_type& operator=(char16ptr_t aStr) {
+    this->Assign(aStr);
+    return *this;
+  }
+#endif
+  self_type& operator=(const self_type& aStr) {
+    this->Assign(aStr);
+    return *this;
+  }
+  self_type& operator=(self_type&& aStr) {
+    this->Assign(std::move(aStr));
+    return *this;
+  }
+  self_type& operator=(const substring_type& aStr) {
+    this->Assign(aStr);
+    return *this;
+  }
+  self_type& operator=(substring_type&& aStr) {
+    this->Assign(std::move(aStr));
+    return *this;
+  }
+  self_type& operator=(const substring_tuple_type& aTuple) {
+    this->Assign(aTuple);
+    return *this;
+  }
+
+  static const size_t kStorageSize = N;
+
+ protected:
+  friend class nsTSubstring<T>;
+
+  const LengthStorage mInlineCapacity;
+
+ private:
+  char_type mStorage[N];
+};
+
+extern template class nsTAutoStringN<char, 64>;
+extern template class nsTAutoStringN<char16_t, 64>;
+
+template <typename Char, size_t N>
+struct fmt::formatter<nsTAutoStringN<Char, N>, Char>
+    : fmt::formatter<nsTString<Char>, Char> {};
+
+template <class E>
+class nsTArrayElementTraits;
+template <typename T>
+class nsTArrayElementTraits<nsTAutoString<T>> {
+ public:
+  template <class A>
+  struct Dont_Instantiate_nsTArray_of;
+  template <class A>
+  struct Instead_Use_nsTArray_of;
+
+  static Dont_Instantiate_nsTArray_of<nsTAutoString<T>>* Construct(
+      Instead_Use_nsTArray_of<nsTString<T>>* aE) {
+    return 0;
+  }
+  template <class A>
+  static Dont_Instantiate_nsTArray_of<nsTAutoString<T>>* Construct(
+      Instead_Use_nsTArray_of<nsTString<T>>* aE, const A& aArg) {
+    return 0;
+  }
+  template <class... Args>
+  static Dont_Instantiate_nsTArray_of<nsTAutoString<T>>* Construct(
+      Instead_Use_nsTArray_of<nsTString<T>>* aE, Args&&... aArgs) {
+    return 0;
+  }
+  static Dont_Instantiate_nsTArray_of<nsTAutoString<T>>* Destruct(
+      Instead_Use_nsTArray_of<nsTString<T>>* aE) {
+    return 0;
+  }
+};
+
+template <typename T>
+class MOZ_STACK_CLASS nsTGetterCopies {
+ public:
+  typedef T char_type;
+
+  explicit nsTGetterCopies(nsTSubstring<T>& aStr)
+      : mString(aStr), mData(nullptr) {}
+
+  ~nsTGetterCopies() {
+    mString.Adopt(mData);  
+  }
+
+  operator char_type**() { return &mData; }
+
+ private:
+  nsTSubstring<T>& mString;
+  char_type* mData;
+};
+
+template <typename T>
+inline nsTGetterCopies<T> getter_Copies(nsTSubstring<T>& aString) {
+  return nsTGetterCopies<T>(aString);
+}
+
+#endif

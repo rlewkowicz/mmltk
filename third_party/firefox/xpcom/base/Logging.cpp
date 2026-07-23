@@ -1,0 +1,740 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/Logging.h"
+
+#include "base/process_util.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/FileUtils.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/Printf.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Sprintf.h"
+#include "mozilla/UniquePtrExtensions.h"
+#include "MainThreadUtils.h"
+#include "nsClassHashtable.h"
+#include "nsDebug.h"
+#include "nsDebugImpl.h"
+#include "nsPrintfCString.h"
+#include "NSPRLogModulesParser.h"
+#include "nsXULAppAPI.h"
+#include "LogCommandLineHandler.h"
+#include "fmt/format.h"
+
+#include "prenv.h"
+#  include <sys/stat.h>  // for umask()
+#  include <sys/types.h>
+#  include <unistd.h>
+
+const uint32_t kInitialModuleCount = 1024;
+const uint32_t kRotateFilesNumber = 4;
+
+namespace mozilla {
+
+namespace detail {
+
+void log_print(const LogModule* aModule, LogLevel aLevel, const char* aFmt,
+               ...) {
+  va_list ap;
+  va_start(ap, aFmt);
+  aModule->Printv(aLevel, aFmt, ap);
+  va_end(ap);
+}
+
+void log_print(const LogModule* aModule, LogLevel aLevel, TimeStamp* aStart,
+               const char* aFmt, ...) {
+  va_list ap;
+  va_start(ap, aFmt);
+  aModule->Printv(aLevel, aStart, aFmt, ap);
+  va_end(ap);
+}
+
+}  
+
+static const char* ToLogStr(LogLevel aLevel) {
+  switch (aLevel) {
+    case LogLevel::Error:
+      return "E";
+    case LogLevel::Warning:
+      return "W";
+    case LogLevel::Info:
+      return "I";
+    case LogLevel::Debug:
+      return "D";
+    case LogLevel::Verbose:
+      return "V";
+    case LogLevel::Disabled:
+    default:
+      MOZ_CRASH("Invalid log level.");
+      return "";
+  }
+}
+
+namespace detail {
+
+class LogFile {
+  FILE* mFile;
+  uint32_t mFileNum;
+
+ public:
+  LogFile(FILE* aFile, uint32_t aFileNum)
+      : mFile(aFile), mFileNum(aFileNum), mNextToRelease(nullptr) {}
+
+  ~LogFile() {
+    fclose(mFile);
+    delete mNextToRelease;
+  }
+
+  FILE* File() const { return mFile; }
+  uint32_t Num() const { return mFileNum; }
+
+  LogFile* mNextToRelease;
+};
+
+static const char* ExpandLogFileName(const char* aFilename,
+                                     char (&buffer)[2048]) {
+  MOZ_ASSERT(aFilename);
+  static const char kPIDToken[] = MOZ_LOG_PID_TOKEN;
+  static const char kMOZLOGExt[] = MOZ_LOG_FILE_EXTENSION;
+
+  bool hasMozLogExtension = StringEndsWith(nsDependentCString(aFilename),
+                                           nsLiteralCString(kMOZLOGExt));
+
+  const char* pidTokenPtr = strstr(aFilename, kPIDToken);
+  if (pidTokenPtr &&
+      SprintfLiteral(buffer, "%.*s%s%" PRIPID "%s%s",
+                     static_cast<int>(pidTokenPtr - aFilename), aFilename,
+                     XRE_IsParentProcess() ? "-main." : "-child.",
+                     base::GetCurrentProcId(), pidTokenPtr + strlen(kPIDToken),
+                     hasMozLogExtension ? "" : kMOZLOGExt) > 0) {
+    return buffer;
+  }
+
+  if (!hasMozLogExtension &&
+      SprintfLiteral(buffer, "%s%s", aFilename, kMOZLOGExt) > 0) {
+    return buffer;
+  }
+
+  return aFilename;
+}
+
+bool LimitFileToLessThanSize(const char* aFilename, uint32_t aSize,
+                             uint16_t aLongLineSize = 16384) {
+  char tempFilename[2048];
+  SprintfLiteral(tempFilename, "%s.tempXXXXXX", aFilename);
+
+  bool failedToWrite = false;
+
+  {  
+    ScopedCloseFile file(fopen(aFilename, "rb"));
+    if (!file) {
+      return false;
+    }
+
+    if (fseek(file.get(), 0, SEEK_END)) {
+      return false;
+    }
+
+    uint64_t fileSize = static_cast<uint64_t>(ftell(file.get()));
+
+    if (fileSize <= aSize) {
+      return true;
+    }
+
+    uint64_t minBytesToDrop = fileSize - aSize;
+    uint64_t numBytesDropped = 0;
+
+    if (fseek(file.get(), 0, SEEK_SET)) {
+      return false;
+    }
+
+    ScopedCloseFile temp;
+
+#if defined(XP_UNIX)
+
+    // coverity[SECURE_TEMP : FALSE]
+    int fd = mkstemp(tempFilename);
+    if (fd == -1) {
+      NS_WARNING("mkstemp failed!");
+      return false;
+    }
+    temp.reset(fdopen(fd, "ab"));
+#else
+#  error Do not know how to open named temporary file
+#endif
+
+    if (!temp) {
+      NS_WARNING(nsPrintfCString("could not open named temporary file %s",
+                                 tempFilename)
+                     .get());
+      return false;
+    }
+
+    UniquePtr<char[]> line = MakeUnique<char[]>(aLongLineSize + 1);
+    while (fgets(line.get(), aLongLineSize + 1, file.get())) {
+      if (numBytesDropped >= minBytesToDrop) {
+        if (fputs(line.get(), temp.get()) < 0) {
+          NS_WARNING(
+              nsPrintfCString("fputs failed: ferror %d\n", ferror(temp.get()))
+                  .get());
+          failedToWrite = true;
+          break;
+        }
+      } else {
+        numBytesDropped += strlen(line.get());
+      }
+    }
+  }
+
+  if (failedToWrite) {
+    remove(tempFilename);
+    return false;
+  }
+
+#if defined(XP_UNIX)
+  if (rename(tempFilename, aFilename)) {
+    NS_WARNING(
+        nsPrintfCString("rename failed: %s (%d)\n", strerror(errno), errno)
+            .get());
+    return false;
+  }
+#else
+#  error Do not know how to atomically replace file
+#endif
+
+  return true;
+}
+
+}  
+
+namespace {
+void empty_va(va_list* va, ...) {
+  va_start(*va, va);
+  va_end(*va);
+}
+
+}  
+
+class LogModuleManager {
+ public:
+  LogModuleManager()
+      : mModulesLock("logmodules"),
+        mModules(kInitialModuleCount),
+#if defined(DEBUG)
+        mLoggingModuleRegistered(0),
+#endif
+        mPrintEntryCount(0),
+        mOutFile(nullptr),
+        mToReleaseFile(nullptr),
+        mOutFileNum(0),
+        mOutFilePath(strdup("")),
+        mMainThread(PR_GetCurrentThread()),
+        mSetFromEnv(false),
+        mAddTimestamp(false),
+        mLogJSStack(false),
+        mIsRaw(false),
+        mIsSync(false),
+        mRotate(0),
+        mInitialized(false) {
+  }
+
+  ~LogModuleManager() {
+    detail::LogFile* logFile = mOutFile.exchange(nullptr);
+    delete logFile;
+  }
+
+  void Init(int argc, char* argv[]) {
+    MOZ_DIAGNOSTIC_ASSERT(!mInitialized);
+    mInitialized = true;
+
+    LoggingHandleCommandLineArgs(argc, static_cast<char const* const*>(argv),
+                                 [](nsACString const& env) {
+
+                                   PR_SetEnv(ToNewCString(env));
+                                 });
+
+    bool shouldAppend = false;
+    bool addTimestamp = false;
+    bool isSync = false;
+    bool isRaw = false;
+    bool logJSStacks = false;
+    int32_t rotate = 0;
+    int32_t maxSize = 0;
+    bool prependHeader = false;
+    const char* modules = PR_GetEnv("MOZ_LOG");
+    if (!modules || !modules[0]) {
+      modules = PR_GetEnv("MOZ_LOG_MODULES");
+      if (modules) {
+        NS_WARNING(
+            "MOZ_LOG_MODULES is deprecated."
+            "\nPlease use MOZ_LOG instead.");
+      }
+    }
+    if (!modules || !modules[0]) {
+      modules = PR_GetEnv("NSPR_LOG_MODULES");
+      if (modules) {
+        NS_WARNING(
+            "NSPR_LOG_MODULES is deprecated."
+            "\nPlease use MOZ_LOG instead.");
+      }
+    }
+
+    NSPRLogModulesParser(
+        modules,
+        [this, &shouldAppend, &addTimestamp, &isSync, &isRaw, &rotate, &maxSize,
+         &prependHeader, &logJSStacks](
+            const char* aName, LogLevel aLevel, int32_t aValue) mutable {
+          if (strcmp(aName, "append") == 0) {
+            shouldAppend = true;
+          } else if (strcmp(aName, "timestamp") == 0) {
+            addTimestamp = true;
+          } else if (strcmp(aName, "sync") == 0) {
+            isSync = true;
+          } else if (strcmp(aName, "raw") == 0) {
+            isRaw = true;
+          } else if (strcmp(aName, "rotate") == 0) {
+            rotate = (aValue << 20) / kRotateFilesNumber;
+          } else if (strcmp(aName, "maxsize") == 0) {
+            maxSize = aValue << 20;
+          } else if (strcmp(aName, "prependheader") == 0) {
+            prependHeader = true;
+          } else if (strcmp(aName, "jsstacks") == 0) {
+            logJSStacks = true;
+          } else {
+            this->CreateOrGetModule(aName)->SetLevel(aLevel);
+          }
+        });
+
+    mAddTimestamp = addTimestamp || rotate > 0;
+    mIsSync = isSync;
+    mIsRaw = isRaw;
+    mRotate = rotate;
+    mLogJSStack = logJSStacks;
+
+    if (rotate > 0 && shouldAppend) {
+      NS_WARNING("MOZ_LOG: when you rotate the log, you cannot use append!");
+    }
+
+    if (rotate > 0 && maxSize > 0) {
+      NS_WARNING(
+          "MOZ_LOG: when you rotate the log, you cannot use maxsize! (ignoring "
+          "maxsize)");
+      maxSize = 0;
+    }
+
+    if (maxSize > 0 && !shouldAppend) {
+      NS_WARNING(
+          "MOZ_LOG: when you limit the log to maxsize, you must use append! "
+          "(ignorning maxsize)");
+      maxSize = 0;
+    }
+
+    if (rotate > 0 && prependHeader) {
+      NS_WARNING(
+          "MOZ_LOG: when you rotate the log, you cannot use prependheader!");
+      prependHeader = false;
+    }
+
+    const char* logFile = PR_GetEnv("MOZ_LOG_FILE");
+    if (!logFile || !logFile[0]) {
+      logFile = PR_GetEnv("NSPR_LOG_FILE");
+    }
+
+    if (logFile && logFile[0]) {
+      char buf[2048];
+      logFile = detail::ExpandLogFileName(logFile, buf);
+      mOutFilePath.reset(strdup(logFile));
+
+      if (mRotate > 0) {
+        remove(mOutFilePath.get());
+        for (uint32_t i = 0; i < kRotateFilesNumber; ++i) {
+          RemoveFile(i);
+        }
+      }
+
+      mOutFile = OpenFile(shouldAppend, mOutFileNum, maxSize);
+      mSetFromEnv = true;
+    }
+
+    if (prependHeader && XRE_IsParentProcess()) {
+      va_list va;
+      empty_va(&va);
+      Print("Logger", LogLevel::Info, nullptr, "\n***\n\n", "Opening log\n",
+            va);
+    }
+  }
+
+  void SetLogFile(const char* aFilename) {
+    if (mSetFromEnv) {
+      NS_WARNING(
+          "LogModuleManager::SetLogFile - Log file was set from the "
+          "MOZ_LOG_FILE environment variable.");
+      return;
+    }
+
+    const char* filename = aFilename ? aFilename : "";
+    char buf[2048];
+    filename = detail::ExpandLogFileName(filename, buf);
+
+    MOZ_ASSERT(mRotate == 0,
+               "We don't allow rotate for runtime logfile changes");
+    mOutFilePath.reset(strdup(filename));
+
+    detail::LogFile* newFile = OpenFile(false, 0);
+    detail::LogFile* oldFile = mOutFile.exchange(newFile);
+
+    DebugOnly<detail::LogFile*> prevFile = mToReleaseFile.exchange(oldFile);
+    MOZ_ASSERT(!prevFile, "Should be null because rotation is not allowed");
+
+    if (oldFile) {
+      va_list va;
+      empty_va(&va);
+      Print("Logger", LogLevel::Info, "Flushing old log files\n", va);
+    }
+  }
+
+  uint32_t GetLogFile(char* aBuffer, size_t aLength) {
+    uint32_t len = strlen(mOutFilePath.get());
+    if (len + 1 > aLength) {
+      return 0;
+    }
+    snprintf(aBuffer, aLength, "%s", mOutFilePath.get());
+    return len;
+  }
+
+  void SetIsSync(bool aIsSync) { mIsSync = aIsSync; }
+
+  bool GetLogJSStacks() { return mLogJSStack; }
+
+  void SetAddTimestamp(bool aAddTimestamp) { mAddTimestamp = aAddTimestamp; }
+
+  detail::LogFile* OpenFile(bool aShouldAppend, uint32_t aFileNum,
+                            uint32_t aMaxSize = 0) {
+    FILE* file;
+
+    if (mRotate > 0) {
+      char buf[2048];
+      SprintfLiteral(buf, "%s.%d", mOutFilePath.get(), aFileNum);
+
+      file = fopen(buf, "w");
+    } else if (aShouldAppend && aMaxSize > 0) {
+      detail::LimitFileToLessThanSize(mOutFilePath.get(), aMaxSize >> 1);
+      file = fopen(mOutFilePath.get(), "a");
+    } else {
+      file = fopen(mOutFilePath.get(), aShouldAppend ? "a" : "w");
+    }
+
+    if (!file) {
+      return nullptr;
+    }
+
+    return new detail::LogFile(file, aFileNum);
+  }
+
+  void RemoveFile(uint32_t aFileNum) {
+    char buf[2048];
+    SprintfLiteral(buf, "%s.%d", mOutFilePath.get(), aFileNum);
+    remove(buf);
+  }
+
+  LogModule* CreateOrGetModule(const char* aName) {
+    OffTheBooksMutexAutoLock guard(mModulesLock);
+    return mModules
+        .LookupOrInsertWith(
+            aName,
+            [&] {
+#if defined(DEBUG)
+              if (++mLoggingModuleRegistered > kInitialModuleCount) {
+                NS_WARNING(
+                    "kInitialModuleCount too low, consider increasing its "
+                    "value");
+              }
+#endif
+              return UniquePtr<LogModule>(
+                  new LogModule{aName, LogLevel::Disabled});
+            })
+        .get();
+  }
+
+  void Print(const char* aName, LogLevel aLevel, const char* aFmt,
+             va_list aArgs) MOZ_FORMAT_PRINTF(4, 0) {
+    Print(aName, aLevel, nullptr, "", aFmt, aArgs);
+  }
+  void PrintFmt(const char* aName, LogLevel aLevel, fmt::string_view aFmt,
+                fmt::format_args aArgs) {
+    PrintFmt(aName, aLevel, nullptr, "", aFmt, aArgs);
+  }
+
+  void PrintFmt(const char* aName, LogLevel aLevel, const TimeStamp* aStart,
+                const char* aPrepend, fmt::string_view aFmt,
+                fmt::format_args aArgs) {
+    const size_t kBuffSize = 1024;
+    char buff[kBuffSize];
+
+    char* buffToWrite = buff;
+    UniquePtr<char[]> allocatedBuff;
+    size_t charsWritten;
+
+    auto [out, size] = fmt::vformat_to_n(buff, kBuffSize - 1, aFmt, aArgs);
+    *out = '\0';
+    charsWritten = size;
+
+    if (charsWritten >= kBuffSize) {
+      allocatedBuff = MakeUnique<char[]>(charsWritten + 1);  
+      auto [out, size] =
+          fmt::vformat_to_n(allocatedBuff.get(), charsWritten, aFmt, aArgs);
+      MOZ_ASSERT(size == charsWritten);
+      *out = '\0';
+      buffToWrite = allocatedBuff.get();
+    }
+    ++charsWritten;  
+    ActuallyLog(aName, aLevel, aStart, aPrepend, buffToWrite, charsWritten);
+  }
+
+  void Print(const char* aName, LogLevel aLevel, const TimeStamp* aStart,
+             const char* aPrepend, const char* aFmt, va_list aArgs)
+      MOZ_FORMAT_PRINTF(6, 0) {
+    const size_t kBuffSize = 1024;
+    char buff[kBuffSize];
+
+    char* buffToWrite = buff;
+    SmprintfPointer allocatedBuff;
+
+    va_list argsCopy;
+    va_copy(argsCopy, aArgs);
+    int charsWritten = VsprintfLiteral(buff, aFmt, argsCopy);
+    va_end(argsCopy);
+
+    if (charsWritten < 0) {
+      MOZ_ASSERT(false, "Probably incorrect format string in LOG?");
+      strncpy(buff, aFmt, kBuffSize - 1);
+      buff[kBuffSize - 1] = '\0';
+      charsWritten = strlen(buff);
+    } else if (static_cast<size_t>(charsWritten) >= kBuffSize - 1) {
+      allocatedBuff = mozilla::Vsmprintf(aFmt, aArgs);
+      buffToWrite = allocatedBuff.get();
+      charsWritten = strlen(buffToWrite);
+    }
+    ActuallyLog(aName, aLevel, aStart, aPrepend, buffToWrite, charsWritten);
+  }
+
+  void ActuallyLog(const char* aName, LogLevel aLevel, const TimeStamp* aStart,
+                   const char* aPrepend, const char* aLogMessage,
+                   size_t aLogMessageSize) {
+    long pid = static_cast<long>(base::GetCurrentProcId());
+    const char* newline = "";
+    if (aLogMessageSize == 0 || aLogMessage[aLogMessageSize - 1] != '\n') {
+      newline = "\n";
+    }
+
+    FILE* out = stderr;
+
+    ++mPrintEntryCount;
+
+    detail::LogFile* outFile = mOutFile;
+    if (outFile) {
+      out = outFile->File();
+    }
+
+    PRThread* currentThread = PR_GetCurrentThread();
+    const char* currentThreadName = (mMainThread == currentThread)
+                                        ? "Main Thread"
+                                        : PR_GetThreadName(currentThread);
+
+    char noNameThread[40];
+    if (!currentThreadName) {
+      SprintfLiteral(noNameThread, "Unnamed thread %p", currentThread);
+      currentThreadName = noNameThread;
+    }
+
+    if (!mAddTimestamp && !aStart) {
+      if (!mIsRaw) {
+        fprintf_stderr(out, "%s[%s %ld: %s]: %s/%s %s%s", aPrepend,
+                       nsDebugImpl::GetMultiprocessMode(), pid,
+                       currentThreadName, ToLogStr(aLevel), aName, aLogMessage,
+                       newline);
+      } else {
+        fprintf_stderr(out, "%s%s%s", aPrepend, aLogMessage, newline);
+      }
+    } else {
+      if (aStart) {
+        PRTime prnow = PR_Now();
+        TimeStamp tmnow = TimeStamp::Now();
+        TimeDuration duration = tmnow - *aStart;
+        PRTime prstart = prnow - duration.ToMicroseconds();
+
+        PRExplodedTime now;
+        PRExplodedTime start;
+        PR_ExplodeTime(prnow, PR_GMTParameters, &now);
+        PR_ExplodeTime(prstart, PR_GMTParameters, &start);
+        fprintf_stderr(
+            out,
+            "%s%04d-%02d-%02d %02d:%02d:%02d.%06d -> %02d:%02d:%02d.%06d UTC "
+            "(%.1gms)- [%s %ld: %s]: %s/%s %s%s",
+            aPrepend, now.tm_year, now.tm_month + 1, start.tm_mday,
+            start.tm_hour, start.tm_min, start.tm_sec, start.tm_usec,
+            now.tm_hour, now.tm_min, now.tm_sec, now.tm_usec,
+            duration.ToMilliseconds(), nsDebugImpl::GetMultiprocessMode(), pid,
+            currentThreadName, ToLogStr(aLevel), aName, aLogMessage, newline);
+      } else {
+        PRExplodedTime now;
+        PR_ExplodeTime(PR_Now(), PR_GMTParameters, &now);
+        fprintf_stderr(out,
+                       "%s%04d-%02d-%02d %02d:%02d:%02d.%06d UTC - [%s %ld: "
+                       "%s]: %s/%s %s%s",
+                       aPrepend, now.tm_year, now.tm_month + 1, now.tm_mday,
+                       now.tm_hour, now.tm_min, now.tm_sec, now.tm_usec,
+                       nsDebugImpl::GetMultiprocessMode(), pid,
+                       currentThreadName, ToLogStr(aLevel), aName, aLogMessage,
+                       newline);
+      }
+    }
+
+    if (mIsSync) {
+      fflush(out);
+    }
+
+    if (mRotate > 0 && outFile) {
+      int32_t fileSize = ftell(out);
+      if (fileSize > mRotate) {
+        uint32_t fileNum = outFile->Num();
+
+        uint32_t nextFileNum = fileNum + 1;
+        if (nextFileNum >= kRotateFilesNumber) {
+          nextFileNum = 0;
+        }
+
+        if (mOutFileNum.compareExchange(fileNum, nextFileNum)) {
+          outFile->mNextToRelease = mToReleaseFile;
+          mToReleaseFile = outFile;
+
+          mOutFile = OpenFile(false, nextFileNum);
+        }
+      }
+    }
+
+    if (--mPrintEntryCount == 0 && mToReleaseFile) {
+      detail::LogFile* release = mToReleaseFile.exchange(nullptr);
+      delete release;
+    }
+  }
+
+  void DisableModules() {
+    OffTheBooksMutexAutoLock guard(mModulesLock);
+    for (auto& m : mModules) {
+      (*(m.GetModifiableData()))->SetLevel(LogLevel::Disabled);
+    }
+  }
+
+ private:
+  OffTheBooksMutex mModulesLock;
+  nsClassHashtable<nsCharPtrHashKey, LogModule> mModules;
+
+#if defined(DEBUG)
+  Atomic<uint32_t, ReleaseAcquire> mLoggingModuleRegistered;
+#endif
+  Atomic<uint32_t, ReleaseAcquire> mPrintEntryCount;
+  Atomic<detail::LogFile*, ReleaseAcquire> mOutFile;
+  Atomic<detail::LogFile*, Relaxed> mToReleaseFile;
+  Atomic<uint32_t, Relaxed> mOutFileNum;
+  UniqueFreePtr<char[]> mOutFilePath;
+
+  PRThread* mMainThread;
+  bool mSetFromEnv;
+  Atomic<bool, Relaxed> mAddTimestamp;
+  Atomic<bool, Relaxed> mLogJSStack;
+  Atomic<bool, Relaxed> mIsRaw;
+  Atomic<bool, Relaxed> mIsSync;
+  int32_t mRotate;
+  bool mInitialized;
+};
+
+StaticAutoPtr<LogModuleManager> sLogModuleManager;
+
+LogModule* LogModule::Get(const char* aName) {
+  MOZ_ASSERT(sLogModuleManager != nullptr);
+  return sLogModuleManager->CreateOrGetModule(aName);
+}
+
+void LogModule::SetLogFile(const char* aFilename) {
+  MOZ_ASSERT(sLogModuleManager);
+  sLogModuleManager->SetLogFile(aFilename);
+}
+
+uint32_t LogModule::GetLogFile(char* aBuffer, size_t aLength) {
+  MOZ_ASSERT(sLogModuleManager);
+  return sLogModuleManager->GetLogFile(aBuffer, aLength);
+}
+
+void LogModule::SetAddTimestamp(bool aAddTimestamp) {
+  sLogModuleManager->SetAddTimestamp(aAddTimestamp);
+}
+
+void LogModule::SetIsSync(bool aIsSync) {
+  sLogModuleManager->SetIsSync(aIsSync);
+}
+
+bool LogModule::GetLogJSStacks() { return sLogModuleManager->GetLogJSStacks(); }
+
+extern "C" void set_rust_log_level(const char* name, uint8_t level);
+
+void LogModule::SetLevel(LogLevel level) {
+  mLevel = level;
+
+  if (strstr(mName, "::")) {
+    set_rust_log_level(mName, static_cast<uint8_t>(level));
+  }
+
+}
+
+void LogModule::Init(int argc, char* argv[]) {
+  MOZ_DIAGNOSTIC_ASSERT(NS_IsMainThread());
+
+  if (sLogModuleManager) {
+    return;
+  }
+
+
+  auto mgr = new LogModuleManager();
+  mgr->Init(argc, argv);
+  sLogModuleManager = mgr;
+}
+
+void LogModule::Printv(LogLevel aLevel, const char* aFmt, va_list aArgs) const {
+  MOZ_ASSERT(sLogModuleManager != nullptr);
+
+  sLogModuleManager->Print(Name(), aLevel, aFmt, aArgs);
+}
+
+void LogModule::Printv(LogLevel aLevel, const TimeStamp* aStart,
+                       const char* aFmt, va_list aArgs) const {
+  MOZ_ASSERT(sLogModuleManager != nullptr);
+
+  sLogModuleManager->Print(Name(), aLevel, aStart, "", aFmt, aArgs);
+}
+
+void LogModule::PrintvFmt(LogLevel aLevel, fmt::string_view aFmt,
+                          fmt::format_args aArgs) const {
+  MOZ_ASSERT(sLogModuleManager != nullptr);
+
+  sLogModuleManager->PrintFmt(Name(), aLevel, aFmt, aArgs);
+}
+
+}  
+
+extern "C" {
+
+void ExternMozLog(const char* aModule, mozilla::LogLevel aLevel,
+                  const char* aMsg) {
+  MOZ_ASSERT(mozilla::sLogModuleManager != nullptr);
+
+  mozilla::LogModule* m =
+      mozilla::sLogModuleManager->CreateOrGetModule(aModule);
+  if (MOZ_LOG_TEST(m, aLevel)) {
+    mozilla::detail::log_print(m, aLevel, "%s", aMsg);
+  }
+}
+
+}  

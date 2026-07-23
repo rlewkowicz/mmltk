@@ -1,0 +1,75 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_BindContext_h_
+#define mozilla_dom_BindContext_h_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/ShadowRoot.h"
+#include "nsINode.h"
+
+namespace mozilla::dom {
+
+class Document;
+
+struct MOZ_STACK_CLASS BindContext final {
+  Document& OwnerDoc() const { return mDoc; }
+
+  bool InComposedDoc() const { return mInComposedDoc; }
+
+  bool InUncomposedDoc() const { return mInUncomposedDoc; }
+
+  Document* GetComposedDoc() const { return mInComposedDoc ? &mDoc : nullptr; }
+
+  Document* GetUncomposedDoc() const {
+    return mInUncomposedDoc ? &mDoc : nullptr;
+  }
+
+  bool SubtreeRootChanges() const { return mSubtreeRootChanges; }
+
+  bool AllowsAutoFocus() const;
+
+  explicit BindContext(nsINode& aParent)
+      : mDoc(*aParent.OwnerDoc()),
+        mInComposedDoc(aParent.IsInComposedDoc()),
+        mInUncomposedDoc(aParent.IsInUncomposedDoc()),
+        mSubtreeRootChanges(true) {}
+
+  explicit BindContext(ShadowRoot& aShadowRoot)
+      : mDoc(*aShadowRoot.OwnerDoc()),
+        mInComposedDoc(aShadowRoot.IsInComposedDoc()),
+        mInUncomposedDoc(false),
+        mSubtreeRootChanges(false) {}
+
+  enum ForNativeAnonymous { ForNativeAnonymous };
+  BindContext(Element& aParentElement, enum ForNativeAnonymous)
+      : mDoc(*aParentElement.OwnerDoc()),
+        mInComposedDoc(aParentElement.IsInComposedDoc()),
+        mInUncomposedDoc(aParentElement.IsInUncomposedDoc()),
+        mSubtreeRootChanges(true) {
+    MOZ_ASSERT(mInComposedDoc, "Binding NAC in a disconnected subtree?");
+  }
+
+  void SetIsMove(bool aIsMove) { mIsMove = aIsMove; }
+
+  bool IsMove() const { return mIsMove; }
+
+ private:
+  bool IsSameOriginAsTop() const;
+
+  Document& mDoc;
+
+  bool mIsMove = false;
+
+  const bool mInComposedDoc;
+  const bool mInUncomposedDoc;
+
+  const bool mSubtreeRootChanges;
+};
+
+}  
+
+#endif

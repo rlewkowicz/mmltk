@@ -1,0 +1,153 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/core/SkSpan.h"
+#include "include/core/SkTypes.h"
+#include "src/core/SkTHash.h"
+#include "src/sksl/SkSLAnalysis.h"
+#include "src/sksl/SkSLModule.h"
+#include "src/sksl/SkSLProgramSettings.h"
+#include "src/sksl/analysis/SkSLProgramUsage.h"
+#include "src/sksl/ir/SkSLBinaryExpression.h"
+#include "src/sksl/ir/SkSLExpression.h"
+#include "src/sksl/ir/SkSLExpressionStatement.h"
+#include "src/sksl/ir/SkSLFunctionDefinition.h"
+#include "src/sksl/ir/SkSLNop.h"
+#include "src/sksl/ir/SkSLProgram.h"
+#include "src/sksl/ir/SkSLProgramElement.h"
+#include "src/sksl/ir/SkSLStatement.h"
+#include "src/sksl/ir/SkSLVarDeclarations.h"
+#include "src/sksl/ir/SkSLVariable.h"
+#include "src/sksl/ir/SkSLVariableReference.h"
+#include "src/sksl/transform/SkSLProgramWriter.h"
+#include "src/sksl/transform/SkSLTransform.h"
+
+#include <memory>
+#include <utility>
+#include <vector>
+
+using namespace skia_private;
+
+namespace SkSL {
+
+class Context;
+
+static bool eliminate_dead_local_variables(const Context& context,
+                                           SkSpan<std::unique_ptr<ProgramElement>> elements,
+                                           ProgramUsage* usage) {
+    class DeadLocalVariableEliminator : public ProgramWriter {
+    public:
+        DeadLocalVariableEliminator(const Context& context, ProgramUsage* usage)
+                : fContext(context)
+                , fUsage(usage) {}
+
+        using ProgramWriter::visitProgramElement;
+
+        bool visitExpressionPtr(std::unique_ptr<Expression>& expr) override {
+            if (expr->is<BinaryExpression>()) {
+                BinaryExpression& binary = expr->as<BinaryExpression>();
+                if (VariableReference* assignedVar = binary.isAssignmentIntoVariable()) {
+                    if (fDeadVariables.contains(assignedVar->variable())) {
+                        fUsage->remove(expr.get());
+                        expr = std::move(binary.right());
+                        fUsage->add(expr.get());
+
+                        fAssignmentWasEliminated = true;
+
+                        return this->visitExpressionPtr(expr);
+                    }
+                }
+            }
+            if (expr->is<VariableReference>()) {
+                SkASSERT(!fDeadVariables.contains(expr->as<VariableReference>().variable()));
+            }
+            return INHERITED::visitExpressionPtr(expr);
+        }
+
+        bool visitStatementPtr(std::unique_ptr<Statement>& stmt) override {
+            if (stmt->is<VarDeclaration>()) {
+                VarDeclaration& varDecl = stmt->as<VarDeclaration>();
+                const Variable* var = varDecl.var();
+                ProgramUsage::VariableCounts* counts = fUsage->fVariableCounts.find(var);
+                SkASSERT(counts);
+                SkASSERT(counts->fVarExists);
+                if (CanEliminate(var, *counts)) {
+                    fDeadVariables.add(var);
+                    if (var->initialValue()) {
+                        fUsage->remove(stmt.get());
+                        stmt = ExpressionStatement::Make(fContext, std::move(varDecl.value()));
+                        fUsage->add(stmt.get());
+                    } else {
+                        fUsage->remove(stmt.get());
+                        stmt = Nop::Make();
+                    }
+                    fMadeChanges = true;
+
+                    return this->visitStatementPtr(stmt);
+                }
+            }
+
+            bool result = INHERITED::visitStatementPtr(stmt);
+
+            if (fAssignmentWasEliminated) {
+                fAssignmentWasEliminated = false;
+                if (stmt->is<ExpressionStatement>()) {
+                    ExpressionStatement& exprStmt = stmt->as<ExpressionStatement>();
+                    if (!Analysis::HasSideEffects(*exprStmt.expression())) {
+                        fUsage->remove(&exprStmt);
+                        stmt = Nop::Make();
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        static bool CanEliminate(const Variable* var, const ProgramUsage::VariableCounts& counts) {
+            return counts.fVarExists && !counts.fRead && var->storage() == VariableStorage::kLocal;
+        }
+
+        bool fMadeChanges = false;
+        const Context& fContext;
+        ProgramUsage* fUsage;
+        THashSet<const Variable*> fDeadVariables;
+        bool fAssignmentWasEliminated = false;
+
+        using INHERITED = ProgramWriter;
+    };
+
+    DeadLocalVariableEliminator visitor{context, usage};
+
+    for (auto& [var, counts] : usage->fVariableCounts) {
+        if (DeadLocalVariableEliminator::CanEliminate(var, counts)) {
+            for (std::unique_ptr<ProgramElement>& pe : elements) {
+                if (pe->is<FunctionDefinition>()) {
+                    visitor.visitProgramElement(*pe);
+                }
+            }
+            break;
+        }
+    }
+
+    return visitor.fMadeChanges;
+}
+
+bool Transform::EliminateDeadLocalVariables(const Context& context,
+                                            Module& module,
+                                            ProgramUsage* usage) {
+    return eliminate_dead_local_variables(context, SkSpan(module.fElements), usage);
+}
+
+bool Transform::EliminateDeadLocalVariables(Program& program) {
+    return program.fConfig->fSettings.fRemoveDeadVariables
+                   ? eliminate_dead_local_variables(*program.fContext,
+                                                    SkSpan(program.fOwnedElements),
+                                                    program.fUsage.get())
+                   : false;
+}
+
+}  

@@ -1,0 +1,26 @@
+
+[package]
+edition = "2018"
+name = "array-init"
+version = "2.1.0"
+authors = [
+    "Manish Goregaokar <manishsmail@gmail.com>",
+    "Michal 'vorner' Vaner <vorner@vorner.cz>",
+]
+exclude = [".travis.yml"]
+description = "Safe wrapper for initializing fixed-size arrays"
+documentation = "https://docs.rs/crate/array-init"
+keywords = [
+    "abstraction",
+    "initialization",
+    "no_std",
+]
+categories = [
+    "data-structures",
+    "no-std",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Manishearth/array-init/"
+
+[package.metadata]
+msrv = "1.51"

@@ -1,0 +1,138 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const browser = window.docShell.chromeEventHandler;
+const { document: gDoc, XPCOMUtils } = browser.documentGlobal;
+
+ChromeUtils.defineESModuleGetters(this, {
+  AboutWelcomeParent: "resource:///actors/AboutWelcomeParent.sys.mjs",
+});
+
+const CONFIG = window.arguments[0];
+
+function addStylesheet(href) {
+  const link = document.head.appendChild(document.createElement("link"));
+  link.rel = "stylesheet";
+  link.href = href;
+}
+
+function disableEscClose() {
+  addEventListener("keydown", event => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  });
+}
+
+function renderMultistage(ready) {
+  const AWParent = new AboutWelcomeParent();
+  const receive = name => data =>
+    AWParent.onContentMessage(`AWPage:${name}`, data, browser);
+
+  window.AWGetFeatureConfig = () => CONFIG;
+  window.AWGetSelectedTheme = receive("GET_SELECTED_THEME");
+  window.AWGetInstalledAddons = receive("GET_INSTALLED_ADDONS");
+  window.AWSelectTheme = data => receive("SELECT_THEME")(data?.toUpperCase());
+  const telemetryMessageHandler = receive("TELEMETRY_EVENT");
+  window.AWSendEventTelemetry = data => {
+    if (CONFIG?.metrics === "block") {
+      return null;
+    }
+    if (CONFIG?.write_in_microsurvey) {
+      if (!data.event_context) {
+        data.event_context = {};
+      }
+      data.event_context.write_in_microsurvey = true;
+      if (
+        CONFIG?.feedbackData &&
+        data.event === "CLICK_BUTTON" &&
+        data.event_context.source === "primary_button"
+      ) {
+        const { chatWithoutPageContent, ...feedbackDataToSend } =
+          CONFIG.feedbackData;
+        if (
+          chatWithoutPageContent &&
+          data.event_context.contentToggleState === false
+        ) {
+          feedbackDataToSend.chat = chatWithoutPageContent;
+        }
+        data.event_context.smart_window_user_feedback_data = feedbackDataToSend;
+      }
+    }
+    return telemetryMessageHandler(data);
+  };
+  window.AWSendToDeviceEmailsSupported = receive(
+    "SEND_TO_DEVICE_EMAILS_SUPPORTED"
+  );
+  window.AWAddScreenImpression = receive("ADD_SCREEN_IMPRESSION");
+  window.AWSendToParent = (name, data) => receive(name)(data);
+  window.AWFinish = () => {
+    window.close();
+  };
+  window.AWWaitForMigrationClose = receive("WAIT_FOR_MIGRATION_CLOSE");
+  window.AWWaitForNimbus = receive("WAIT_FOR_NIMBUS");
+  window.AWEvaluateScreenTargeting = receive("EVALUATE_SCREEN_TARGETING");
+  window.AWEvaluateAttributeTargeting = receive("EVALUATE_ATTRIBUTE_TARGETING");
+  window.AWPredictRemoteType = ({ url }) => {
+    return ChromeUtils.predictRemoteTypeForURI(url, { window });
+  };
+
+  addStylesheet("chrome://browser/content/aboutwelcome/aboutwelcome.css");
+
+  document.body.classList.add("onboardingContainer");
+  document.body.id = "multi-stage-message-root";
+  document.body.dataset.page = "spotlight";
+
+  const box = browser.closest(".dialogBox");
+  const dialog = box.closest("dialog");
+  box.classList.add("spotlightBox");
+  dialog?.classList.add("spotlight");
+  box.setAttribute("sizeto", "available");
+  box.setAttribute("fixedsize", "false");
+  addEventListener("pagehide", () => {
+    box.classList.remove("spotlightBox");
+    dialog?.classList.remove("spotlight");
+    box.removeAttribute("sizeto");
+  });
+
+  if (CONFIG?.disableEscClose) {
+    disableEscClose();
+
+    const preventEscape = event => {
+      if (
+        event.key === "Escape" &&
+        (dialog?.contains(event.target) || box.contains(event.target))
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+    browser.documentGlobal.addEventListener("keydown", preventEscape, {
+      capture: true,
+      mozSystemGroup: true,
+    });
+
+    addEventListener("pagehide", () => {
+      browser.documentGlobal.removeEventListener("keydown", preventEscape, {
+        capture: true,
+        mozSystemGroup: true,
+      });
+    });
+  }
+
+  document.head.appendChild(document.createElement("script")).src =
+    "chrome://browser/content/aboutwelcome/aboutwelcome.bundle.js";
+  ready();
+}
+
+document.mozSubdialogReady = new Promise(resolve =>
+  document.addEventListener(
+    "DOMContentLoaded",
+    () => renderMultistage(resolve),
+    {
+      once: true,
+    }
+  )
+);

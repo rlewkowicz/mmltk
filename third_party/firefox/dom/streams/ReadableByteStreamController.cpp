@@ -1,0 +1,1681 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include <algorithm>  // std::min
+
+#include "ReadIntoRequest.h"
+#include "ReadableByteStreamControllerAbstract.h"
+#include "ReadableStreamAbstract.h"
+#include "js/ArrayBuffer.h"
+#include "js/ErrorReport.h"
+#include "js/Exception.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "js/ValueArray.h"
+#include "js/experimental/TypedData.h"
+#include "js/friend/ErrorMessages.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/HoldDropJSObjects.h"
+#include "mozilla/dom/ByteStreamHelpers.h"
+#include "mozilla/dom/Promise-inl.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/ReadableByteStreamControllerBinding.h"
+#include "mozilla/dom/ReadableStreamBYOBReader.h"
+#include "mozilla/dom/ReadableStreamBYOBRequest.h"
+#include "mozilla/dom/ReadableStreamControllerBase.h"
+#include "mozilla/dom/ReadableStreamDefaultController.h"
+#include "mozilla/dom/ReadableStreamDefaultReader.h"
+#include "mozilla/dom/ReadableStreamGenericReader.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/ToJSValue.h"
+#include "mozilla/dom/UnderlyingSourceCallbackHelpers.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIGlobalObject.h"
+#include "nsISupports.h"
+
+namespace mozilla::dom {
+
+using namespace streams_abstract;
+
+struct ReadableByteStreamQueueEntry
+    : LinkedListElement<RefPtr<ReadableByteStreamQueueEntry>> {
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(
+      ReadableByteStreamQueueEntry)
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_NATIVE_CLASS(
+      ReadableByteStreamQueueEntry)
+
+  ReadableByteStreamQueueEntry(JS::Handle<JSObject*> aBuffer,
+                               size_t aByteOffset, size_t aByteLength)
+      : mBuffer(aBuffer), mByteOffset(aByteOffset), mByteLength(aByteLength) {
+    mozilla::HoldJSObjects(this);
+  }
+
+  JSObject* Buffer() const { return mBuffer; }
+  void SetBuffer(JS::Handle<JSObject*> aBuffer) { mBuffer = aBuffer; }
+
+  size_t ByteOffset() const { return mByteOffset; }
+  void SetByteOffset(size_t aByteOffset) { mByteOffset = aByteOffset; }
+
+  size_t ByteLength() const { return mByteLength; }
+  void SetByteLength(size_t aByteLength) { mByteLength = aByteLength; }
+
+ private:
+  JS::Heap<JSObject*> mBuffer;
+
+  size_t mByteOffset = 0;
+
+  size_t mByteLength = 0;
+
+  ~ReadableByteStreamQueueEntry() { mozilla::DropJSObjects(this); }
+};
+
+NS_IMPL_CYCLE_COLLECTION_WITH_JS_MEMBERS(ReadableByteStreamQueueEntry, (),
+                                         (mBuffer));
+
+struct PullIntoDescriptor final
+    : LinkedListElement<RefPtr<PullIntoDescriptor>> {
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(PullIntoDescriptor)
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_NATIVE_CLASS(PullIntoDescriptor)
+
+  enum Constructor {
+    DataView,
+#define DEFINE_TYPED_CONSTRUCTOR_ENUM_NAMES(ExternalT, NativeT, Name) Name,
+    JS_FOR_EACH_TYPED_ARRAY(DEFINE_TYPED_CONSTRUCTOR_ENUM_NAMES)
+#undef DEFINE_TYPED_CONSTRUCTOR_ENUM_NAMES
+  };
+
+  static Constructor constructorFromScalar(JS::Scalar::Type type) {
+    switch (type) {
+#define REMAP_PULL_INTO_DESCRIPTOR_TYPE(ExternalT, NativeT, Name) \
+  case JS::Scalar::Name:                                          \
+    return Constructor::Name;
+      JS_FOR_EACH_TYPED_ARRAY(REMAP_PULL_INTO_DESCRIPTOR_TYPE)
+#undef REMAP
+
+      case JS::Scalar::Int64:
+      case JS::Scalar::Simd128:
+      case JS::Scalar::MaxTypedArrayViewType:
+        break;
+    }
+    MOZ_CRASH("Unexpected Scalar::Type");
+  }
+
+  PullIntoDescriptor(JS::Handle<JSObject*> aBuffer, uint64_t aBufferByteLength,
+                     uint64_t aByteOffset, uint64_t aByteLength,
+                     uint64_t aBytesFilled, uint64_t aMinimumFill,
+                     uint64_t aElementSize, Constructor aViewConstructor,
+                     ReaderType aReaderType)
+      : mBuffer(aBuffer),
+        mBufferByteLength(aBufferByteLength),
+        mByteOffset(aByteOffset),
+        mByteLength(aByteLength),
+        mBytesFilled(aBytesFilled),
+        mMinimumFill(aMinimumFill),
+        mElementSize(aElementSize),
+        mViewConstructor(aViewConstructor),
+        mReaderType(aReaderType) {
+    mozilla::HoldJSObjects(this);
+  }
+
+  JSObject* Buffer() const { return mBuffer; }
+  void SetBuffer(JS::Handle<JSObject*> aBuffer) { mBuffer = aBuffer; }
+
+  uint64_t BufferByteLength() const { return mBufferByteLength; }
+  void SetBufferByteLength(const uint64_t aBufferByteLength) {
+    mBufferByteLength = aBufferByteLength;
+  }
+
+  uint64_t ByteOffset() const { return mByteOffset; }
+  void SetByteOffset(const uint64_t aByteOffset) { mByteOffset = aByteOffset; }
+
+  uint64_t ByteLength() const { return mByteLength; }
+  void SetByteLength(const uint64_t aByteLength) { mByteLength = aByteLength; }
+
+  uint64_t BytesFilled() const { return mBytesFilled; }
+  void SetBytesFilled(const uint64_t aBytesFilled) {
+    mBytesFilled = aBytesFilled;
+  }
+
+  uint64_t MinimumFill() const { return mMinimumFill; }
+
+  uint64_t ElementSize() const { return mElementSize; }
+  void SetElementSize(const uint64_t aElementSize) {
+    mElementSize = aElementSize;
+  }
+
+  Constructor ViewConstructor() const { return mViewConstructor; }
+
+  ReaderType GetReaderType() const { return mReaderType; }
+  void SetReaderType(const ReaderType aReaderType) {
+    mReaderType = aReaderType;
+  }
+
+ private:
+  JS::Heap<JSObject*> mBuffer;
+  uint64_t mBufferByteLength = 0;
+  uint64_t mByteOffset = 0;
+  uint64_t mByteLength = 0;
+  uint64_t mBytesFilled = 0;
+  uint64_t mMinimumFill = 0;
+  uint64_t mElementSize = 0;
+  Constructor mViewConstructor;
+  ReaderType mReaderType;
+
+  ~PullIntoDescriptor() { mozilla::DropJSObjects(this); }
+};
+
+NS_IMPL_CYCLE_COLLECTION_WITH_JS_MEMBERS(PullIntoDescriptor, (), (mBuffer));
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(ReadableByteStreamController)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(ReadableByteStreamController,
+                                                ReadableStreamControllerBase)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mByobRequest, mQueue, mPendingPullIntos)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(ReadableByteStreamController,
+                                                  ReadableStreamControllerBase)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mByobRequest, mQueue, mPendingPullIntos)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN_INHERITED(ReadableByteStreamController,
+                                               ReadableStreamControllerBase)
+  NS_IMPL_CYCLE_COLLECTION_TRACE_PRESERVED_WRAPPER
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+NS_IMPL_ADDREF_INHERITED(ReadableByteStreamController,
+                         ReadableStreamControllerBase)
+NS_IMPL_RELEASE_INHERITED(ReadableByteStreamController,
+                          ReadableStreamControllerBase)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ReadableByteStreamController)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+NS_INTERFACE_MAP_END_INHERITING(ReadableStreamControllerBase)
+
+ReadableByteStreamController::ReadableByteStreamController(
+    nsIGlobalObject* aGlobal)
+    : ReadableStreamControllerBase(aGlobal) {}
+
+ReadableByteStreamController::~ReadableByteStreamController() = default;
+
+void ReadableByteStreamController::ClearQueue() { mQueue.clear(); }
+
+void ReadableByteStreamController::ClearPendingPullIntos() {
+  mPendingPullIntos.clear();
+}
+
+namespace streams_abstract {
+already_AddRefed<ReadableStreamBYOBRequest>
+ReadableByteStreamControllerGetBYOBRequest(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    ErrorResult& aRv) {
+  if (!aController->GetByobRequest() &&
+      !aController->PendingPullIntos().isEmpty()) {
+    PullIntoDescriptor* firstDescriptor =
+        aController->PendingPullIntos().getFirst();
+
+    aRv.MightThrowJSException();
+    JS::Rooted<JSObject*> buffer(aCx, firstDescriptor->Buffer());
+    JS::Rooted<JSObject*> view(
+        aCx, JS_NewUint8ArrayWithBuffer(
+                 aCx, buffer,
+                 firstDescriptor->ByteOffset() + firstDescriptor->BytesFilled(),
+                 int64_t(firstDescriptor->ByteLength() -
+                         firstDescriptor->BytesFilled())));
+    if (!view) {
+      aRv.StealExceptionFromJSContext(aCx);
+      return nullptr;
+    }
+
+    RefPtr<ReadableStreamBYOBRequest> byobRequest =
+        new ReadableStreamBYOBRequest(aController->GetParentObject());
+
+    byobRequest->SetController(aController);
+
+    byobRequest->SetView(view);
+
+    aController->SetByobRequest(byobRequest);
+  }
+
+  RefPtr<ReadableStreamBYOBRequest> request(aController->GetByobRequest());
+  return request.forget();
+}
+}  
+
+already_AddRefed<ReadableStreamBYOBRequest>
+ReadableByteStreamController::GetByobRequest(JSContext* aCx, ErrorResult& aRv) {
+  return ReadableByteStreamControllerGetBYOBRequest(aCx, this, aRv);
+}
+
+Nullable<double> ReadableByteStreamControllerGetDesiredSize(
+    const ReadableByteStreamController* aController) {
+  ReadableStream::ReaderState state = aController->Stream()->State();
+
+  if (state == ReadableStream::ReaderState::Errored) {
+    return nullptr;
+  }
+
+  if (state == ReadableStream::ReaderState::Closed) {
+    return 0.0;
+  }
+
+  return aController->StrategyHWM() - aController->QueueTotalSize();
+}
+
+Nullable<double> ReadableByteStreamController::GetDesiredSize() const {
+  return ReadableByteStreamControllerGetDesiredSize(this);
+}
+
+JSObject* ReadableByteStreamController::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return ReadableByteStreamController_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+namespace streams_abstract {
+
+static void ReadableByteStreamControllerInvalidateBYOBRequest(
+    ReadableByteStreamController* aController) {
+  if (!aController->GetByobRequest()) {
+    return;
+  }
+
+  aController->GetByobRequest()->SetController(nullptr);
+
+  aController->GetByobRequest()->SetView(nullptr);
+
+  aController->SetByobRequest(nullptr);
+}
+
+void ReadableByteStreamControllerClearPendingPullIntos(
+    ReadableByteStreamController* aController) {
+  ReadableByteStreamControllerInvalidateBYOBRequest(aController);
+
+  aController->ClearPendingPullIntos();
+}
+
+void ResetQueue(ReadableByteStreamController* aContainer) {
+  aContainer->ClearQueue();
+
+  aContainer->SetQueueTotalSize(0);
+}
+
+void ReadableByteStreamControllerClearAlgorithms(
+    ReadableByteStreamController* aController) {
+  aController->ClearAlgorithms();
+}
+
+void ReadableByteStreamControllerError(
+    ReadableByteStreamController* aController, JS::Handle<JS::Value> aValue,
+    ErrorResult& aRv) {
+  ReadableStream* stream = aController->Stream();
+
+  if (stream->State() != ReadableStream::ReaderState::Readable) {
+    return;
+  }
+
+  ReadableByteStreamControllerClearPendingPullIntos(aController);
+
+  ResetQueue(aController);
+
+  ReadableByteStreamControllerClearAlgorithms(aController);
+
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(aController->GetParentObject())) {
+    return;
+  }
+  ReadableStreamError(jsapi.cx(), stream, aValue, aRv);
+}
+
+void ReadableByteStreamControllerClose(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    ErrorResult& aRv) {
+  RefPtr<ReadableStream> stream = aController->Stream();
+
+  if (aController->CloseRequested() ||
+      stream->State() != ReadableStream::ReaderState::Readable) {
+    return;
+  }
+
+  if (aController->QueueTotalSize() > 0) {
+    aController->SetCloseRequested(true);
+    return;
+  }
+
+  if (!aController->PendingPullIntos().isEmpty()) {
+    PullIntoDescriptor* firstPendingPullInto =
+        aController->PendingPullIntos().getFirst();
+
+    if ((firstPendingPullInto->BytesFilled() %
+         firstPendingPullInto->ElementSize()) != 0) {
+      ErrorResult rv;
+      rv.ThrowTypeError("Leftover Bytes");
+
+      JS::Rooted<JS::Value> exception(aCx);
+      MOZ_ALWAYS_TRUE(ToJSValue(aCx, std::move(rv), &exception));
+
+      ReadableByteStreamControllerError(aController, exception, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+
+      aRv.MightThrowJSException();
+      aRv.ThrowJSException(aCx, exception);
+      return;
+    }
+  }
+
+  ReadableByteStreamControllerClearAlgorithms(aController);
+
+  ReadableStreamClose(aCx, stream, aRv);
+}
+
+}  
+
+void ReadableByteStreamController::Close(JSContext* aCx, ErrorResult& aRv) {
+  if (mCloseRequested) {
+    aRv.ThrowTypeError("Close already requested");
+    return;
+  }
+
+  if (Stream()->State() != ReadableStream::ReaderState::Readable) {
+    aRv.ThrowTypeError("Closing un-readable stream controller");
+    return;
+  }
+
+  ReadableByteStreamControllerClose(aCx, this, aRv);
+}
+
+namespace streams_abstract {
+
+void ReadableByteStreamControllerEnqueueChunkToQueue(
+    ReadableByteStreamController* aController,
+    JS::Handle<JSObject*> aTransferredBuffer, size_t aByteOffset,
+    size_t aByteLength) {
+  RefPtr<ReadableByteStreamQueueEntry> queueEntry =
+      new ReadableByteStreamQueueEntry(aTransferredBuffer, aByteOffset,
+                                       aByteLength);
+  aController->Queue().insertBack(queueEntry);
+
+  aController->AddToQueueTotalSize(double(aByteLength));
+}
+
+void ReadableByteStreamControllerEnqueueClonedChunkToQueue(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    JS::Handle<JSObject*> aBuffer, size_t aByteOffset, size_t aByteLength,
+    ErrorResult& aRv) {
+  aRv.MightThrowJSException();
+  JS::Rooted<JSObject*> cloneResult(
+      aCx, JS::ArrayBufferClone(aCx, aBuffer, aByteOffset, aByteLength));
+
+  if (!cloneResult) {
+    JS::Rooted<JS::Value> exception(aCx);
+    if (!JS_GetPendingException(aCx, &exception)) {
+      aRv.StealExceptionFromJSContext(aCx);
+      return;
+    }
+    JS_ClearPendingException(aCx);
+
+    ReadableByteStreamControllerError(aController, exception, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+
+    aRv.ThrowJSException(aCx, exception);
+    return;
+  }
+
+  ReadableByteStreamControllerEnqueueChunkToQueue(aController, cloneResult, 0,
+                                                  aByteLength);
+}
+
+already_AddRefed<PullIntoDescriptor>
+ReadableByteStreamControllerShiftPendingPullInto(
+    ReadableByteStreamController* aController);
+
+void ReadableByteStreamControllerEnqueueDetachedPullIntoToQueue(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    PullIntoDescriptor* aPullIntoDescriptor, ErrorResult& aRv) {
+  MOZ_ASSERT(aPullIntoDescriptor->GetReaderType() == ReaderType::None);
+
+  if (aPullIntoDescriptor->BytesFilled() > 0) {
+    JS::Rooted<JSObject*> buffer(aCx, aPullIntoDescriptor->Buffer());
+    ReadableByteStreamControllerEnqueueClonedChunkToQueue(
+        aCx, aController, buffer, aPullIntoDescriptor->ByteOffset(),
+        aPullIntoDescriptor->BytesFilled(), aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+
+  RefPtr<PullIntoDescriptor> discarded =
+      ReadableByteStreamControllerShiftPendingPullInto(aController);
+  (void)discarded;
+}
+
+static size_t ReadableStreamGetNumReadIntoRequests(ReadableStream* aStream) {
+  MOZ_ASSERT(ReadableStreamHasBYOBReader(aStream));
+
+  return aStream->GetReader()->AsBYOB()->ReadIntoRequests().length();
+}
+
+bool ReadableByteStreamControllerShouldCallPull(
+    ReadableByteStreamController* aController) {
+  ReadableStream* stream = aController->Stream();
+
+  if (stream->State() != ReadableStream::ReaderState::Readable) {
+    return false;
+  }
+
+  if (aController->CloseRequested()) {
+    return false;
+  }
+
+  if (!aController->Started()) {
+    return false;
+  }
+
+  if (ReadableStreamHasDefaultReader(stream) &&
+      ReadableStreamGetNumReadRequests(stream) > 0) {
+    return true;
+  }
+
+  if (ReadableStreamHasBYOBReader(stream) &&
+      ReadableStreamGetNumReadIntoRequests(stream) > 0) {
+    return true;
+  }
+
+  Nullable<double> desiredSize =
+      ReadableByteStreamControllerGetDesiredSize(aController);
+
+  MOZ_ASSERT(!desiredSize.IsNull());
+
+  return desiredSize.Value() > 0;
+}
+
+void ReadableByteStreamControllerCallPullIfNeeded(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    ErrorResult& aRv) {
+  bool shouldPull = ReadableByteStreamControllerShouldCallPull(aController);
+
+  if (!shouldPull) {
+    return;
+  }
+
+  if (aController->Pulling()) {
+    aController->SetPullAgain(true);
+    return;
+  }
+
+  MOZ_ASSERT(!aController->PullAgain());
+
+  aController->SetPulling(true);
+
+  RefPtr<ReadableStreamControllerBase> controller(aController);
+  RefPtr<UnderlyingSourceAlgorithmsBase> algorithms =
+      aController->GetAlgorithms();
+  RefPtr<Promise> pullPromise = algorithms->PullCallback(aCx, *controller, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  pullPromise->AddCallbacksWithCycleCollectedArgs(
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         ReadableByteStreamController* aController)
+          MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+            aController->SetPulling(false);
+            if (aController->PullAgain()) {
+              aController->SetPullAgain(false);
+
+              ReadableByteStreamControllerCallPullIfNeeded(
+                  aCx, MOZ_KnownLive(aController), aRv);
+            }
+          },
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         ReadableByteStreamController* aController) {
+        ReadableByteStreamControllerError(aController, aValue, aRv);
+      },
+      RefPtr(aController));
+}
+
+bool ReadableByteStreamControllerFillPullIntoDescriptorFromQueue(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    PullIntoDescriptor* aPullIntoDescriptor, ErrorResult& aRv);
+
+JSObject* ReadableByteStreamControllerConvertPullIntoDescriptor(
+    JSContext* aCx, PullIntoDescriptor* pullIntoDescriptor, ErrorResult& aRv);
+
+MOZ_CAN_RUN_SCRIPT
+void ReadableStreamFulfillReadIntoRequest(JSContext* aCx,
+                                          ReadableStream* aStream,
+                                          JS::Handle<JS::Value> aChunk,
+                                          bool done, ErrorResult& aRv) {
+  MOZ_ASSERT(ReadableStreamHasBYOBReader(aStream));
+
+  ReadableStreamBYOBReader* reader = aStream->GetReader()->AsBYOB();
+
+  MOZ_ASSERT(!reader->ReadIntoRequests().isEmpty());
+
+  RefPtr<ReadIntoRequest> readIntoRequest =
+      reader->ReadIntoRequests().popFirst();
+
+  if (done) {
+    readIntoRequest->CloseSteps(aCx, aChunk, aRv);
+    return;
+  }
+
+  readIntoRequest->ChunkSteps(aCx, aChunk, aRv);
+}
+
+MOZ_CAN_RUN_SCRIPT
+void ReadableByteStreamControllerCommitPullIntoDescriptor(
+    JSContext* aCx, ReadableStream* aStream,
+    PullIntoDescriptor* pullIntoDescriptor, ErrorResult& aRv) {
+  MOZ_ASSERT(aStream->State() != ReadableStream::ReaderState::Errored);
+
+  MOZ_ASSERT(pullIntoDescriptor->GetReaderType() != ReaderType::None);
+
+  bool done = false;
+
+  if (aStream->State() == ReadableStream::ReaderState::Closed) {
+    MOZ_ASSERT((pullIntoDescriptor->BytesFilled() %
+                pullIntoDescriptor->ElementSize()) == 0);
+
+    done = true;
+  }
+
+  JS::Rooted<JSObject*> filledView(
+      aCx, ReadableByteStreamControllerConvertPullIntoDescriptor(
+               aCx, pullIntoDescriptor, aRv));
+  if (aRv.Failed()) {
+    return;
+  }
+  JS::Rooted<JS::Value> filledViewValue(aCx, JS::ObjectValue(*filledView));
+
+  if (pullIntoDescriptor->GetReaderType() == ReaderType::Default) {
+    ReadableStreamFulfillReadRequest(aCx, aStream, filledViewValue, done, aRv);
+    return;
+  }
+
+  MOZ_ASSERT(pullIntoDescriptor->GetReaderType() == ReaderType::BYOB);
+
+  ReadableStreamFulfillReadIntoRequest(aCx, aStream, filledViewValue, done,
+                                       aRv);
+}
+
+MOZ_CAN_RUN_SCRIPT
+void ReadableByteStreamControllerProcessPullIntoDescriptorsUsingQueue(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    nsTArray<RefPtr<PullIntoDescriptor>>& aFilledPullIntos, ErrorResult& aRv) {
+  MOZ_ASSERT(!aController->CloseRequested());
+
+  MOZ_ASSERT(aFilledPullIntos.IsEmpty());
+
+  while (!aController->PendingPullIntos().isEmpty()) {
+    if (aController->QueueTotalSize() == 0) {
+      break;
+    }
+
+    RefPtr<PullIntoDescriptor> pullIntoDescriptor =
+        aController->PendingPullIntos().getFirst();
+
+    bool ready = ReadableByteStreamControllerFillPullIntoDescriptorFromQueue(
+        aCx, aController, pullIntoDescriptor, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+
+    if (ready) {
+      RefPtr<PullIntoDescriptor> discardedPullIntoDescriptor =
+          ReadableByteStreamControllerShiftPendingPullInto(aController);
+
+      aFilledPullIntos.AppendElement(pullIntoDescriptor);
+    }
+  }
+
+}
+
+MOZ_CAN_RUN_SCRIPT
+void ReadableByteStreamControllerHandleQueueDrain(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    ErrorResult& aRv);
+
+MOZ_CAN_RUN_SCRIPT void ReadableByteStreamControllerFillReadRequestFromQueue(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    ReadRequest* aReadRequest, ErrorResult& aRv) {
+  MOZ_ASSERT(aController->QueueTotalSize() > 0);
+  MOZ_ASSERT(aController->Queue().length() > 0);
+
+  RefPtr<ReadableByteStreamQueueEntry> entry = aController->Queue().popFirst();
+
+  MOZ_ASSERT(entry);
+
+  aController->SetQueueTotalSize(aController->QueueTotalSize() -
+                                 double(entry->ByteLength()));
+
+  ReadableByteStreamControllerHandleQueueDrain(aCx, aController, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  aRv.MightThrowJSException();
+  JS::Rooted<JSObject*> buffer(aCx, entry->Buffer());
+  JS::Rooted<JSObject*> view(
+      aCx, JS_NewUint8ArrayWithBuffer(aCx, buffer, entry->ByteOffset(),
+                                      int64_t(entry->ByteLength())));
+  if (!view) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return;
+  }
+
+  JS::Rooted<JS::Value> viewValue(aCx, JS::ObjectValue(*view));
+  aReadRequest->ChunkSteps(aCx, viewValue, aRv);
+}
+
+MOZ_CAN_RUN_SCRIPT void
+ReadableByteStreamControllerProcessReadRequestsUsingQueue(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    ErrorResult& aRv) {
+  RefPtr<ReadableStreamDefaultReader> reader =
+      aController->Stream()->GetDefaultReader();
+
+  while (!reader->ReadRequests().isEmpty()) {
+    if (aController->QueueTotalSize() == 0) {
+      return;
+    }
+
+    RefPtr<ReadRequest> readRequest = reader->ReadRequests().popFirst();
+
+    ReadableByteStreamControllerFillReadRequestFromQueue(aCx, aController,
+                                                         readRequest, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+}
+
+void ReadableByteStreamControllerEnqueue(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    JS::Handle<JSObject*> aChunk, ErrorResult& aRv) {
+  aRv.MightThrowJSException();
+
+  RefPtr<ReadableStream> stream = aController->Stream();
+
+  if (aController->CloseRequested() ||
+      stream->State() != ReadableStream::ReaderState::Readable) {
+    return;
+  }
+
+  bool isShared;
+  JS::Rooted<JSObject*> buffer(
+      aCx, JS_GetArrayBufferViewBuffer(aCx, aChunk, &isShared));
+  if (!buffer) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return;
+  }
+
+  size_t byteOffset = JS_GetArrayBufferViewByteOffset(aChunk);
+
+  size_t byteLength = JS_GetArrayBufferViewByteLength(aChunk);
+
+  if (JS::IsDetachedArrayBufferObject(buffer)) {
+    aRv.ThrowTypeError("Detached Array Buffer");
+    return;
+  }
+
+  JS::Rooted<JSObject*> transferredBuffer(aCx,
+                                          TransferArrayBuffer(aCx, buffer));
+  if (!transferredBuffer) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return;
+  }
+
+  if (!aController->PendingPullIntos().isEmpty()) {
+    RefPtr<PullIntoDescriptor> firstPendingPullInto =
+        aController->PendingPullIntos().getFirst();
+
+    JS::Rooted<JSObject*> pendingBuffer(aCx, firstPendingPullInto->Buffer());
+    if (JS::IsDetachedArrayBufferObject(pendingBuffer)) {
+      aRv.ThrowTypeError("Pending PullInto has detached buffer");
+      return;
+    }
+
+    ReadableByteStreamControllerInvalidateBYOBRequest(aController);
+
+    pendingBuffer = TransferArrayBuffer(aCx, pendingBuffer);
+    if (!pendingBuffer) {
+      aRv.StealExceptionFromJSContext(aCx);
+      return;
+    }
+    firstPendingPullInto->SetBuffer(pendingBuffer);
+
+    if (firstPendingPullInto->GetReaderType() == ReaderType::None) {
+      ReadableByteStreamControllerEnqueueDetachedPullIntoToQueue(
+          aCx, aController, firstPendingPullInto, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+    }
+  }
+
+  if (ReadableStreamHasDefaultReader(stream)) {
+    ReadableByteStreamControllerProcessReadRequestsUsingQueue(aCx, aController,
+                                                              aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+
+    if (ReadableStreamGetNumReadRequests(stream) == 0) {
+      MOZ_ASSERT(aController->PendingPullIntos().isEmpty());
+
+      ReadableByteStreamControllerEnqueueChunkToQueue(
+          aController, transferredBuffer, byteOffset, byteLength);
+
+    } else {
+      MOZ_ASSERT(aController->Queue().isEmpty());
+
+      if (!aController->PendingPullIntos().isEmpty()) {
+        MOZ_ASSERT(
+            aController->PendingPullIntos().getFirst()->GetReaderType() ==
+            ReaderType::Default);
+
+        RefPtr<PullIntoDescriptor> pullIntoDescriptor =
+            ReadableByteStreamControllerShiftPendingPullInto(aController);
+        (void)pullIntoDescriptor;
+      }
+
+      JS::Rooted<JSObject*> transferredView(
+          aCx, JS_NewUint8ArrayWithBuffer(aCx, transferredBuffer, byteOffset,
+                                          int64_t(byteLength)));
+      if (!transferredView) {
+        aRv.StealExceptionFromJSContext(aCx);
+        return;
+      }
+
+      JS::Rooted<JS::Value> transferredViewValue(
+          aCx, JS::ObjectValue(*transferredView));
+      ReadableStreamFulfillReadRequest(aCx, stream, transferredViewValue, false,
+                                       aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+    }
+
+  } else if (ReadableStreamHasBYOBReader(stream)) {
+    ReadableByteStreamControllerEnqueueChunkToQueue(
+        aController, transferredBuffer, byteOffset, byteLength);
+
+    nsTArray<RefPtr<PullIntoDescriptor>> filledPullIntos;
+    ReadableByteStreamControllerProcessPullIntoDescriptorsUsingQueue(
+        aCx, aController, filledPullIntos, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+
+    for (auto& filledPullInto : filledPullIntos) {
+      ReadableByteStreamControllerCommitPullIntoDescriptor(
+          aCx, stream, MOZ_KnownLive(filledPullInto), aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+    }
+
+  } else {
+    MOZ_ASSERT(!IsReadableStreamLocked(stream));
+
+    ReadableByteStreamControllerEnqueueChunkToQueue(
+        aController, transferredBuffer, byteOffset, byteLength);
+  }
+
+  ReadableByteStreamControllerCallPullIfNeeded(aCx, aController, aRv);
+}
+
+}  
+
+void ReadableByteStreamController::Enqueue(JSContext* aCx,
+                                           const ArrayBufferView& aChunk,
+                                           ErrorResult& aRv) {
+  JS::Rooted<JSObject*> chunk(aCx, aChunk.Obj());
+  if (JS_GetArrayBufferViewByteLength(chunk) == 0) {
+    aRv.ThrowTypeError("Zero Length View");
+    return;
+  }
+
+  bool isShared;
+  JS::Rooted<JSObject*> viewedArrayBuffer(
+      aCx, JS_GetArrayBufferViewBuffer(aCx, chunk, &isShared));
+  if (!viewedArrayBuffer) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return;
+  }
+
+  if (JS::GetArrayBufferByteLength(viewedArrayBuffer) == 0) {
+    aRv.ThrowTypeError("Zero Length Buffer");
+    return;
+  }
+
+  if (CloseRequested()) {
+    aRv.ThrowTypeError("close requested");
+    return;
+  }
+
+  if (Stream()->State() != ReadableStream::ReaderState::Readable) {
+    aRv.ThrowTypeError("Not Readable");
+    return;
+  }
+
+  ReadableByteStreamControllerEnqueue(aCx, this, chunk, aRv);
+}
+
+void ReadableByteStreamController::Error(JSContext* aCx,
+                                         JS::Handle<JS::Value> aErrorValue,
+                                         ErrorResult& aRv) {
+  ReadableByteStreamControllerError(this, aErrorValue, aRv);
+}
+
+already_AddRefed<Promise> ReadableByteStreamController::CancelSteps(
+    JSContext* aCx, JS::Handle<JS::Value> aReason, ErrorResult& aRv) {
+  ReadableByteStreamControllerClearPendingPullIntos(this);
+
+  ResetQueue(this);
+
+  Optional<JS::Handle<JS::Value>> reason(aCx, aReason);
+  RefPtr<UnderlyingSourceAlgorithmsBase> algorithms = mAlgorithms;
+  RefPtr<Promise> result = algorithms->CancelCallback(aCx, reason, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+  ReadableByteStreamControllerClearAlgorithms(this);
+
+  return result.forget();
+}
+
+namespace streams_abstract {
+void ReadableByteStreamControllerHandleQueueDrain(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    ErrorResult& aRv) {
+  MOZ_ASSERT(aController->Stream()->State() ==
+             ReadableStream::ReaderState::Readable);
+
+  if (aController->QueueTotalSize() == 0 && aController->CloseRequested()) {
+    ReadableByteStreamControllerClearAlgorithms(aController);
+
+    RefPtr<ReadableStream> stream = aController->Stream();
+    ReadableStreamClose(aCx, stream, aRv);
+    return;
+  }
+
+  ReadableByteStreamControllerCallPullIfNeeded(aCx, aController, aRv);
+}
+}  
+
+void ReadableByteStreamController::PullSteps(JSContext* aCx,
+                                             ReadRequest* aReadRequest,
+                                             ErrorResult& aRv) {
+  ReadableStream* stream = Stream();
+
+  MOZ_ASSERT(ReadableStreamHasDefaultReader(stream));
+
+  if (QueueTotalSize() > 0) {
+    MOZ_ASSERT(ReadableStreamGetNumReadRequests(stream) == 0);
+
+    ReadableByteStreamControllerFillReadRequestFromQueue(aCx, this,
+                                                         aReadRequest, aRv);
+
+    return;
+  }
+
+  Maybe<uint64_t> autoAllocateChunkSize = AutoAllocateChunkSize();
+
+  if (autoAllocateChunkSize) {
+    aRv.MightThrowJSException();
+    JS::Rooted<JSObject*> buffer(
+        aCx, JS::NewArrayBuffer(aCx, *autoAllocateChunkSize));
+
+    if (!buffer) {
+      JS::Rooted<JS::Value> bufferError(aCx);
+      if (!JS_GetPendingException(aCx, &bufferError)) {
+        aRv.StealExceptionFromJSContext(aCx);
+        return;
+      }
+
+      JS_ClearPendingException(aCx);
+
+      aReadRequest->ErrorSteps(aCx, bufferError, aRv);
+
+      return;
+    }
+
+    RefPtr<PullIntoDescriptor> pullIntoDescriptor = new PullIntoDescriptor(
+        buffer,  *autoAllocateChunkSize,
+         0,  *autoAllocateChunkSize,
+         0,  1,  1,
+        PullIntoDescriptor::Constructor::Uint8, ReaderType::Default);
+
+    PendingPullIntos().insertBack(pullIntoDescriptor);
+  }
+
+  ReadableStreamAddReadRequest(stream, aReadRequest);
+
+  ReadableByteStreamControllerCallPullIfNeeded(aCx, this, aRv);
+}
+
+void ReadableByteStreamController::ReleaseSteps() {
+  if (!PendingPullIntos().isEmpty()) {
+    RefPtr<PullIntoDescriptor> firstPendingPullInto =
+        PendingPullIntos().popFirst();
+
+    firstPendingPullInto->SetReaderType(ReaderType::None);
+
+    PendingPullIntos().clear();
+    PendingPullIntos().insertBack(firstPendingPullInto);
+  }
+}
+
+namespace streams_abstract {
+
+already_AddRefed<PullIntoDescriptor>
+ReadableByteStreamControllerShiftPendingPullInto(
+    ReadableByteStreamController* aController) {
+  MOZ_ASSERT(!aController->GetByobRequest());
+
+  RefPtr<PullIntoDescriptor> descriptor =
+      aController->PendingPullIntos().popFirst();
+
+  return descriptor.forget();
+}
+
+JSObject* ConstructFromPullIntoConstructor(
+    JSContext* aCx, PullIntoDescriptor::Constructor constructor,
+    JS::Handle<JSObject*> buffer, size_t byteOffset, size_t length) {
+  switch (constructor) {
+    case PullIntoDescriptor::Constructor::DataView:
+      return JS_NewDataView(aCx, buffer, byteOffset, length);
+      break;
+
+#define CONSTRUCT_TYPED_ARRAY_TYPE(ExternalT, NativeT, Name)      \
+  case PullIntoDescriptor::Constructor::Name:                     \
+    return JS_New##Name##ArrayWithBuffer(aCx, buffer, byteOffset, \
+                                         int64_t(length));        \
+    break;
+
+      JS_FOR_EACH_TYPED_ARRAY(CONSTRUCT_TYPED_ARRAY_TYPE)
+
+#undef CONSTRUCT_TYPED_ARRAY_TYPE
+
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unknown PullIntoDescriptor::Constructor");
+      return nullptr;
+  }
+}
+
+JSObject* ReadableByteStreamControllerConvertPullIntoDescriptor(
+    JSContext* aCx, PullIntoDescriptor* pullIntoDescriptor, ErrorResult& aRv) {
+  uint64_t bytesFilled = pullIntoDescriptor->BytesFilled();
+
+  uint64_t elementSize = pullIntoDescriptor->ElementSize();
+
+  MOZ_ASSERT(bytesFilled <= pullIntoDescriptor->ByteLength());
+
+  MOZ_ASSERT(bytesFilled % elementSize == 0);
+
+  aRv.MightThrowJSException();
+  JS::Rooted<JSObject*> srcBuffer(aCx, pullIntoDescriptor->Buffer());
+  JS::Rooted<JSObject*> buffer(aCx, TransferArrayBuffer(aCx, srcBuffer));
+  if (!buffer) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return nullptr;
+  }
+
+  JS::Rooted<JSObject*> res(
+      aCx, ConstructFromPullIntoConstructor(
+               aCx, pullIntoDescriptor->ViewConstructor(), buffer,
+               pullIntoDescriptor->ByteOffset(), bytesFilled / elementSize));
+  if (!res) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return nullptr;
+  }
+  return res;
+}
+
+MOZ_CAN_RUN_SCRIPT
+static void ReadableByteStreamControllerRespondInClosedState(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    RefPtr<PullIntoDescriptor>& aFirstDescriptor, ErrorResult& aRv) {
+  MOZ_ASSERT(
+      (aFirstDescriptor->BytesFilled() % aFirstDescriptor->ElementSize()) == 0);
+
+  if (aFirstDescriptor->GetReaderType() == ReaderType::None) {
+    RefPtr<PullIntoDescriptor> discarded =
+        ReadableByteStreamControllerShiftPendingPullInto(aController);
+    (void)discarded;
+  }
+
+  RefPtr<ReadableStream> stream = aController->Stream();
+
+  if (ReadableStreamHasBYOBReader(stream)) {
+    nsTArray<RefPtr<PullIntoDescriptor>> filledPullIntos;
+
+    while (filledPullIntos.Length() <
+           ReadableStreamGetNumReadIntoRequests(stream)) {
+      RefPtr<PullIntoDescriptor> pullIntoDescriptor =
+          ReadableByteStreamControllerShiftPendingPullInto(aController);
+
+      filledPullIntos.AppendElement(pullIntoDescriptor);
+    }
+
+    for (auto& filledPullInto : filledPullIntos) {
+      ReadableByteStreamControllerCommitPullIntoDescriptor(
+          aCx, stream, MOZ_KnownLive(filledPullInto), aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+    }
+  }
+}
+
+void ReadableByteStreamControllerFillHeadPullIntoDescriptor(
+    ReadableByteStreamController* aController, size_t aSize,
+    PullIntoDescriptor* aPullIntoDescriptor) {
+  MOZ_ASSERT(aController->PendingPullIntos().isEmpty() ||
+             aController->PendingPullIntos().getFirst() == aPullIntoDescriptor);
+
+  MOZ_ASSERT(!aController->GetByobRequest());
+
+  aPullIntoDescriptor->SetBytesFilled(aPullIntoDescriptor->BytesFilled() +
+                                      aSize);
+}
+
+MOZ_CAN_RUN_SCRIPT
+static void ReadableByteStreamControllerRespondInReadableState(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    uint64_t aBytesWritten, PullIntoDescriptor* aPullIntoDescriptor,
+    ErrorResult& aRv) {
+  MOZ_ASSERT(aPullIntoDescriptor->BytesFilled() + aBytesWritten <=
+             aPullIntoDescriptor->ByteLength());
+
+  ReadableByteStreamControllerFillHeadPullIntoDescriptor(
+      aController, aBytesWritten, aPullIntoDescriptor);
+
+  if (aPullIntoDescriptor->GetReaderType() == ReaderType::None) {
+    ReadableByteStreamControllerEnqueueDetachedPullIntoToQueue(
+        aCx, aController, aPullIntoDescriptor, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+
+    nsTArray<RefPtr<PullIntoDescriptor>> filledPullIntos;
+    ReadableByteStreamControllerProcessPullIntoDescriptorsUsingQueue(
+        aCx, aController, filledPullIntos, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+
+    RefPtr<ReadableStream> stream(aController->Stream());
+
+    for (auto& filledPullInto : filledPullIntos) {
+      ReadableByteStreamControllerCommitPullIntoDescriptor(
+          aCx, stream, MOZ_KnownLive(filledPullInto), aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+    }
+
+    return;
+  }
+
+  if (aPullIntoDescriptor->BytesFilled() < aPullIntoDescriptor->MinimumFill()) {
+    return;
+  }
+
+  RefPtr<PullIntoDescriptor> pullIntoDescriptor =
+      ReadableByteStreamControllerShiftPendingPullInto(aController);
+  (void)pullIntoDescriptor;
+
+  size_t remainderSize =
+      aPullIntoDescriptor->BytesFilled() % aPullIntoDescriptor->ElementSize();
+
+  if (remainderSize > 0) {
+    size_t end =
+        aPullIntoDescriptor->ByteOffset() + aPullIntoDescriptor->BytesFilled();
+
+    JS::Rooted<JSObject*> pullIntoBuffer(aCx, aPullIntoDescriptor->Buffer());
+    ReadableByteStreamControllerEnqueueClonedChunkToQueue(
+        aCx, aController, pullIntoBuffer, end - remainderSize, remainderSize,
+        aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+
+  aPullIntoDescriptor->SetBytesFilled(aPullIntoDescriptor->BytesFilled() -
+                                      remainderSize);
+
+  nsTArray<RefPtr<PullIntoDescriptor>> filledPullIntos;
+  ReadableByteStreamControllerProcessPullIntoDescriptorsUsingQueue(
+      aCx, aController, filledPullIntos, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  RefPtr<ReadableStream> stream(aController->Stream());
+  ReadableByteStreamControllerCommitPullIntoDescriptor(
+      aCx, stream, aPullIntoDescriptor, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  for (auto& filledPullInto : filledPullIntos) {
+    ReadableByteStreamControllerCommitPullIntoDescriptor(
+        aCx, stream, MOZ_KnownLive(filledPullInto), aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+}
+
+void ReadableByteStreamControllerRespondInternal(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    uint64_t aBytesWritten, ErrorResult& aRv) {
+  RefPtr<PullIntoDescriptor> firstDescriptor =
+      aController->PendingPullIntos().getFirst();
+
+  JS::Rooted<JSObject*> buffer(aCx, firstDescriptor->Buffer());
+#ifdef DEBUG
+  bool canTransferBuffer = CanTransferArrayBuffer(aCx, buffer, aRv);
+  MOZ_ASSERT(!aRv.Failed());
+  MOZ_ASSERT(canTransferBuffer);
+#endif
+
+  ReadableByteStreamControllerInvalidateBYOBRequest(aController);
+
+  auto state = aController->Stream()->State();
+
+  if (state == ReadableStream::ReaderState::Closed) {
+    MOZ_ASSERT(aBytesWritten == 0);
+
+    ReadableByteStreamControllerRespondInClosedState(aCx, aController,
+                                                     firstDescriptor, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  } else {
+    MOZ_ASSERT(state == ReadableStream::ReaderState::Readable);
+
+    MOZ_ASSERT(aBytesWritten > 0);
+
+    ReadableByteStreamControllerRespondInReadableState(
+        aCx, aController, aBytesWritten, firstDescriptor, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+  ReadableByteStreamControllerCallPullIfNeeded(aCx, aController, aRv);
+}
+
+void ReadableByteStreamControllerRespond(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    uint64_t aBytesWritten, ErrorResult& aRv) {
+  MOZ_ASSERT(!aController->PendingPullIntos().isEmpty());
+
+  PullIntoDescriptor* firstDescriptor =
+      aController->PendingPullIntos().getFirst();
+
+  auto state = aController->Stream()->State();
+
+  if (state == ReadableStream::ReaderState::Closed) {
+    if (aBytesWritten != 0) {
+      aRv.ThrowTypeError("bytesWritten not zero on closed stream");
+      return;
+    }
+  } else {
+    MOZ_ASSERT(state == ReadableStream::ReaderState::Readable);
+
+    if (aBytesWritten == 0) {
+      aRv.ThrowTypeError("bytesWritten 0");
+      return;
+    }
+
+    if (firstDescriptor->BytesFilled() + aBytesWritten >
+        firstDescriptor->ByteLength()) {
+      aRv.ThrowRangeError("bytesFilled + bytesWritten > byteLength");
+      return;
+    }
+  }
+
+  aRv.MightThrowJSException();
+  JS::Rooted<JSObject*> buffer(aCx, firstDescriptor->Buffer());
+  JS::Rooted<JSObject*> transferredBuffer(aCx,
+                                          TransferArrayBuffer(aCx, buffer));
+  if (!transferredBuffer) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return;
+  }
+  firstDescriptor->SetBuffer(transferredBuffer);
+
+  ReadableByteStreamControllerRespondInternal(aCx, aController, aBytesWritten,
+                                              aRv);
+}
+
+void ReadableByteStreamControllerRespondWithNewView(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    JS::Handle<JSObject*> aView, ErrorResult& aRv) {
+  aRv.MightThrowJSException();
+
+  MOZ_ASSERT(!aController->PendingPullIntos().isEmpty());
+
+  bool isSharedMemory;
+  JS::Rooted<JSObject*> viewedArrayBuffer(
+      aCx, JS_GetArrayBufferViewBuffer(aCx, aView, &isSharedMemory));
+  if (!viewedArrayBuffer) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return;
+  }
+  MOZ_ASSERT(!JS::IsDetachedArrayBufferObject(viewedArrayBuffer));
+
+  RefPtr<PullIntoDescriptor> firstDescriptor =
+      aController->PendingPullIntos().getFirst();
+
+  ReadableStream::ReaderState state = aController->Stream()->State();
+
+  if (state == ReadableStream::ReaderState::Closed) {
+    if (JS_GetArrayBufferViewByteLength(aView) != 0) {
+      aRv.ThrowTypeError("View has non-zero length in closed stream");
+      return;
+    }
+  } else {
+    MOZ_ASSERT(state == ReadableStream::ReaderState::Readable);
+
+    if (JS_GetArrayBufferViewByteLength(aView) == 0) {
+      aRv.ThrowTypeError("View has zero length in readable stream");
+      return;
+    }
+  }
+
+  if (firstDescriptor->ByteOffset() + firstDescriptor->BytesFilled() !=
+      JS_GetArrayBufferViewByteOffset(aView)) {
+    aRv.ThrowRangeError("Invalid Offset");
+    return;
+  }
+
+  if (firstDescriptor->BufferByteLength() !=
+      JS::GetArrayBufferByteLength(viewedArrayBuffer)) {
+    aRv.ThrowRangeError("Mismatched buffer byte lengths");
+    return;
+  }
+
+  if (firstDescriptor->BytesFilled() + JS_GetArrayBufferViewByteLength(aView) >
+      firstDescriptor->ByteLength()) {
+    aRv.ThrowRangeError("Too many bytes");
+    return;
+  }
+
+  size_t viewByteLength = JS_GetArrayBufferViewByteLength(aView);
+
+  JS::Rooted<JSObject*> transferedBuffer(
+      aCx, TransferArrayBuffer(aCx, viewedArrayBuffer));
+  if (!transferedBuffer) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return;
+  }
+  firstDescriptor->SetBuffer(transferedBuffer);
+
+  ReadableByteStreamControllerRespondInternal(aCx, aController, viewByteLength,
+                                              aRv);
+}
+
+#ifdef DEBUG
+bool CanCopyDataBlockBytes(JS::Handle<JSObject*> aToBuffer, size_t aToIndex,
+                           JS::Handle<JSObject*> aFromBuffer, size_t aFromIndex,
+                           size_t aCount) {
+  MOZ_ASSERT(JS::IsArrayBufferObject(aToBuffer));
+
+  MOZ_ASSERT(JS::IsArrayBufferObject(aFromBuffer));
+
+  if (aToBuffer == aFromBuffer) {
+    return false;
+  }
+
+  if (JS::IsDetachedArrayBufferObject(aToBuffer)) {
+    return false;
+  }
+
+  if (JS::IsDetachedArrayBufferObject(aFromBuffer)) {
+    return false;
+  }
+
+  if (aToIndex + aCount > JS::GetArrayBufferByteLength(aToBuffer)) {
+    return false;
+  }
+  if (aToIndex + aCount < aToIndex) {
+    return false;
+  }
+
+  if (aFromIndex + aCount > JS::GetArrayBufferByteLength(aFromBuffer)) {
+    return false;
+  }
+  if (aFromIndex + aCount < aFromIndex) {
+    return false;
+  }
+
+  return true;
+}
+#endif
+
+bool ReadableByteStreamControllerFillPullIntoDescriptorFromQueue(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    PullIntoDescriptor* aPullIntoDescriptor, ErrorResult& aRv) {
+  size_t maxBytesToCopy =
+      std::min(static_cast<size_t>(aController->QueueTotalSize()),
+               static_cast<size_t>((aPullIntoDescriptor->ByteLength() -
+                                    aPullIntoDescriptor->BytesFilled())));
+
+  size_t maxBytesFilled = aPullIntoDescriptor->BytesFilled() + maxBytesToCopy;
+
+  size_t totalBytesToCopyRemaining = maxBytesToCopy;
+
+  bool ready = false;
+
+  MOZ_ASSERT(!JS::IsDetachedArrayBufferObject(aPullIntoDescriptor->Buffer()));
+
+  MOZ_ASSERT(aPullIntoDescriptor->BytesFilled() <
+             aPullIntoDescriptor->MinimumFill());
+
+  size_t remainderBytes = maxBytesFilled % aPullIntoDescriptor->ElementSize();
+
+  size_t maxAlignedBytes = maxBytesFilled - remainderBytes;
+
+  if (maxAlignedBytes >= aPullIntoDescriptor->MinimumFill()) {
+    totalBytesToCopyRemaining =
+        maxAlignedBytes - aPullIntoDescriptor->BytesFilled();
+    ready = true;
+  }
+
+  LinkedList<RefPtr<ReadableByteStreamQueueEntry>>& queue =
+      aController->Queue();
+
+  while (totalBytesToCopyRemaining > 0) {
+    ReadableByteStreamQueueEntry* headOfQueue = queue.getFirst();
+
+    size_t bytesToCopy =
+        std::min(totalBytesToCopyRemaining, headOfQueue->ByteLength());
+
+    size_t destStart =
+        aPullIntoDescriptor->ByteOffset() + aPullIntoDescriptor->BytesFilled();
+
+    JS::Rooted<JSObject*> descriptorBuffer(aCx, aPullIntoDescriptor->Buffer());
+
+    JS::Rooted<JSObject*> queueBuffer(aCx, headOfQueue->Buffer());
+
+    size_t queueByteOffset = headOfQueue->ByteOffset();
+
+    MOZ_ASSERT(CanCopyDataBlockBytes(descriptorBuffer, destStart, queueBuffer,
+                                     queueByteOffset, bytesToCopy));
+
+    if (!JS::ArrayBufferCopyData(aCx, descriptorBuffer, destStart, queueBuffer,
+                                 queueByteOffset, bytesToCopy)) {
+      aRv.StealExceptionFromJSContext(aCx);
+      return false;
+    }
+
+    if (headOfQueue->ByteLength() == bytesToCopy) {
+      queue.popFirst();
+    } else {
+
+      headOfQueue->SetByteOffset(headOfQueue->ByteOffset() + bytesToCopy);
+      headOfQueue->SetByteLength(headOfQueue->ByteLength() - bytesToCopy);
+    }
+
+    aController->SetQueueTotalSize(aController->QueueTotalSize() -
+                                   (double)bytesToCopy);
+
+    ReadableByteStreamControllerFillHeadPullIntoDescriptor(
+        aController, bytesToCopy, aPullIntoDescriptor);
+
+    totalBytesToCopyRemaining = totalBytesToCopyRemaining - bytesToCopy;
+  }
+
+  if (!ready) {
+    MOZ_ASSERT(aController->QueueTotalSize() == 0);
+
+    MOZ_ASSERT(aPullIntoDescriptor->BytesFilled() > 0);
+
+    MOZ_ASSERT(aPullIntoDescriptor->BytesFilled() <
+               aPullIntoDescriptor->MinimumFill());
+  }
+
+  return ready;
+}
+
+void ReadableByteStreamControllerPullInto(
+    JSContext* aCx, ReadableByteStreamController* aController,
+    JS::Handle<JSObject*> aView, uint64_t aMin,
+    ReadIntoRequest* aReadIntoRequest, ErrorResult& aRv) {
+  aRv.MightThrowJSException();
+
+  ReadableStream* stream = aController->Stream();
+
+  size_t elementSize = 1;
+
+  PullIntoDescriptor::Constructor ctor =
+      PullIntoDescriptor::Constructor::DataView;
+
+  if (JS_IsTypedArrayObject(aView)) {
+    JS::Scalar::Type type = JS_GetArrayBufferViewType(aView);
+    elementSize = JS::Scalar::byteSize(type);
+
+    ctor = PullIntoDescriptor::constructorFromScalar(type);
+  }
+
+  uint64_t minimumFill = aMin * elementSize;
+
+  MOZ_ASSERT(minimumFill <= JS_GetArrayBufferViewByteLength(aView));
+
+  MOZ_ASSERT((minimumFill % elementSize) == 0);
+
+  size_t byteOffset = JS_GetArrayBufferViewByteOffset(aView);
+
+  size_t byteLength = JS_GetArrayBufferViewByteLength(aView);
+
+  bool isShared;
+  JS::Rooted<JSObject*> viewedArrayBuffer(
+      aCx, JS_GetArrayBufferViewBuffer(aCx, aView, &isShared));
+  if (!viewedArrayBuffer) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return;
+  }
+  JS::Rooted<JSObject*> bufferResult(
+      aCx, TransferArrayBuffer(aCx, viewedArrayBuffer));
+
+  if (!bufferResult) {
+    JS::Rooted<JS::Value> pendingException(aCx);
+    if (!JS_GetPendingException(aCx, &pendingException)) {
+      aRv.StealExceptionFromJSContext(aCx);
+      return;
+    }
+
+    JS_ClearPendingException(aCx);
+
+    aReadIntoRequest->ErrorSteps(aCx, pendingException, aRv);
+
+    return;
+  }
+
+  JS::Rooted<JSObject*> buffer(aCx, bufferResult);
+
+  RefPtr<PullIntoDescriptor> pullIntoDescriptor = new PullIntoDescriptor(
+      buffer, JS::GetArrayBufferByteLength(buffer), byteOffset, byteLength, 0,
+      minimumFill, elementSize, ctor, ReaderType::BYOB);
+
+  if (!aController->PendingPullIntos().isEmpty()) {
+    aController->PendingPullIntos().insertBack(pullIntoDescriptor);
+
+    ReadableStreamAddReadIntoRequest(stream, aReadIntoRequest);
+
+    return;
+  }
+
+  if (stream->State() == ReadableStream::ReaderState::Closed) {
+    JS::Rooted<JSObject*> pullIntoBuffer(aCx, pullIntoDescriptor->Buffer());
+    JS::Rooted<JSObject*> emptyView(
+        aCx,
+        ConstructFromPullIntoConstructor(aCx, ctor, pullIntoBuffer,
+                                         pullIntoDescriptor->ByteOffset(), 0));
+    if (!emptyView) {
+      aRv.StealExceptionFromJSContext(aCx);
+      return;
+    }
+
+    JS::Rooted<JS::Value> emptyViewValue(aCx, JS::ObjectValue(*emptyView));
+    aReadIntoRequest->CloseSteps(aCx, emptyViewValue, aRv);
+
+    return;
+  }
+
+  if (aController->QueueTotalSize() > 0) {
+    bool ready = ReadableByteStreamControllerFillPullIntoDescriptorFromQueue(
+        aCx, aController, pullIntoDescriptor, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+    if (ready) {
+      JS::Rooted<JSObject*> filledView(
+          aCx, ReadableByteStreamControllerConvertPullIntoDescriptor(
+                   aCx, pullIntoDescriptor, aRv));
+      if (aRv.Failed()) {
+        return;
+      }
+      ReadableByteStreamControllerHandleQueueDrain(aCx, aController, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+      JS::Rooted<JS::Value> filledViewValue(aCx, JS::ObjectValue(*filledView));
+      aReadIntoRequest->ChunkSteps(aCx, filledViewValue, aRv);
+      return;
+    }
+
+    if (aController->CloseRequested()) {
+      ErrorResult typeError;
+      typeError.ThrowTypeError("Close Requested True during Pull Into");
+
+      JS::Rooted<JS::Value> e(aCx);
+      MOZ_RELEASE_ASSERT(ToJSValue(aCx, std::move(typeError), &e));
+
+      ReadableByteStreamControllerError(aController, e, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+
+      aReadIntoRequest->ErrorSteps(aCx, e, aRv);
+
+      return;
+    }
+  }
+
+  aController->PendingPullIntos().insertBack(pullIntoDescriptor);
+
+  ReadableStreamAddReadIntoRequest(stream, aReadIntoRequest);
+
+  ReadableByteStreamControllerCallPullIfNeeded(aCx, aController, aRv);
+}
+
+void SetUpReadableByteStreamController(
+    JSContext* aCx, ReadableStream* aStream,
+    ReadableByteStreamController* aController,
+    UnderlyingSourceAlgorithmsBase* aAlgorithms, double aHighWaterMark,
+    Maybe<uint64_t> aAutoAllocateChunkSize, ErrorResult& aRv) {
+  MOZ_ASSERT(!aStream->Controller());
+
+
+  aController->SetStream(aStream);
+
+  aController->SetPullAgain(false);
+  aController->SetPulling(false);
+
+  aController->SetByobRequest(nullptr);
+
+  ResetQueue(aController);
+
+  aController->SetCloseRequested(false);
+  aController->SetStarted(false);
+
+  aController->SetStrategyHWM(aHighWaterMark);
+
+  aController->SetAlgorithms(*aAlgorithms);
+
+  aController->SetAutoAllocateChunkSize(aAutoAllocateChunkSize);
+
+  aController->PendingPullIntos().clear();
+
+  aStream->SetController(*aController);
+
+  JS::Rooted<JS::Value> startResult(aCx, JS::UndefinedValue());
+  RefPtr<ReadableStreamControllerBase> controller = aController;
+  aAlgorithms->StartCallback(aCx, *controller, &startResult, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  RefPtr<Promise> startPromise =
+      Promise::CreateInfallible(aStream->GetParentObject());
+  startPromise->MaybeResolve(startResult);
+
+  startPromise->AddCallbacksWithCycleCollectedArgs(
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         ReadableByteStreamController* aController)
+          MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+            MOZ_ASSERT(aController);
+
+            aController->SetStarted(true);
+
+            aController->SetPulling(false);
+
+            aController->SetPullAgain(false);
+
+            ReadableByteStreamControllerCallPullIfNeeded(
+                aCx, MOZ_KnownLive(aController), aRv);
+          },
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         ReadableByteStreamController* aController) {
+        ReadableByteStreamControllerError(aController, aValue, aRv);
+      },
+      RefPtr(aController));
+}
+
+void SetUpReadableByteStreamControllerFromUnderlyingSource(
+    JSContext* aCx, ReadableStream* aStream,
+    JS::Handle<JSObject*> aUnderlyingSource,
+    UnderlyingSource& aUnderlyingSourceDict, double aHighWaterMark,
+    ErrorResult& aRv) {
+  auto controller =
+      MakeRefPtr<ReadableByteStreamController>(aStream->GetParentObject());
+
+  auto algorithms = MakeRefPtr<UnderlyingSourceAlgorithms>(
+      aStream->GetParentObject(), aUnderlyingSource, aUnderlyingSourceDict);
+
+  Maybe<uint64_t> autoAllocateChunkSize = mozilla::Nothing();
+  if (aUnderlyingSourceDict.mAutoAllocateChunkSize.WasPassed()) {
+    uint64_t value = aUnderlyingSourceDict.mAutoAllocateChunkSize.Value();
+    if (value == 0) {
+      aRv.ThrowTypeError("autoAllocateChunkSize can not be zero.");
+      return;
+    }
+
+    if constexpr (sizeof(size_t) == sizeof(uint32_t)) {
+      if (value > uint64_t(UINT32_MAX)) {
+        aRv.ThrowRangeError("autoAllocateChunkSize too large");
+        return;
+      }
+    }
+
+    autoAllocateChunkSize = mozilla::Some(value);
+  }
+
+  SetUpReadableByteStreamController(aCx, aStream, controller, algorithms,
+                                    aHighWaterMark, autoAllocateChunkSize, aRv);
+}
+
+}  
+
+}  

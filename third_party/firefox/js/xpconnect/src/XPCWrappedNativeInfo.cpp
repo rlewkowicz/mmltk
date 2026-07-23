@@ -1,0 +1,640 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "xpcprivate.h"
+#include "XPCMaps.h"
+#include "js/Wrapper.h"
+
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/SourceLocation.h"
+#include "nsIScriptError.h"
+#include "nsPrintfCString.h"
+#include "nsPointerHashKeys.h"
+
+using namespace JS;
+using namespace mozilla;
+
+
+
+bool XPCNativeMember::GetCallInfo(JSObject* funobj,
+                                  RefPtr<XPCNativeInterface>* pInterface,
+                                  XPCNativeMember** pMember) {
+  funobj = js::UncheckedUnwrap(funobj);
+  Value memberVal =
+      js::GetFunctionNativeReserved(funobj, XPC_FUNCTION_NATIVE_MEMBER_SLOT);
+
+  *pMember = static_cast<XPCNativeMember*>(memberVal.toPrivate());
+  *pInterface = (*pMember)->GetInterface();
+
+  return true;
+}
+
+bool XPCNativeMember::NewFunctionObject(XPCCallContext& ccx,
+                                        XPCNativeInterface* iface,
+                                        HandleObject parent, Value* pval) {
+  MOZ_ASSERT(!IsConstant(),
+             "Only call this if you're sure this is not a constant!");
+
+  return Resolve(ccx, iface, parent, pval);
+}
+
+bool XPCNativeMember::Resolve(XPCCallContext& ccx, XPCNativeInterface* iface,
+                              HandleObject parent, Value* vp) {
+  MOZ_ASSERT(iface == GetInterface());
+  if (IsConstant()) {
+    RootedValue resultVal(ccx);
+    nsCString name;
+    if (NS_FAILED(iface->GetInterfaceInfo()->GetConstant(mIndex, &resultVal,
+                                                         getter_Copies(name))))
+      return false;
+
+    *vp = resultVal;
+
+    return true;
+  }
+
+
+  int argc;
+  JSNative callback;
+
+  if (IsMethod()) {
+    const nsXPTMethodInfo* info;
+    if (NS_FAILED(iface->GetInterfaceInfo()->GetMethodInfo(mIndex, &info))) {
+      return false;
+    }
+
+    argc = (int)info->ParamCount();
+    if (info->HasRetval()) {
+      argc--;
+    }
+
+    callback = XPC_WN_CallMethod;
+  } else {
+    argc = 0;
+    callback = XPC_WN_GetterSetter;
+  }
+
+  jsid name = GetName();
+  JS_MarkCrossZoneId(ccx, name);
+
+  JSFunction* fun;
+  if (name.isString()) {
+    fun = js::NewFunctionByIdWithReserved(ccx, callback, argc, 0, name);
+  } else {
+    fun = js::NewFunctionWithReserved(ccx, callback, argc, 0, nullptr);
+  }
+  if (!fun) {
+    return false;
+  }
+
+  JSObject* funobj = JS_GetFunctionObject(fun);
+  if (!funobj) {
+    return false;
+  }
+
+  js::SetFunctionNativeReserved(funobj, XPC_FUNCTION_NATIVE_MEMBER_SLOT,
+                                PrivateValue(this));
+  js::SetFunctionNativeReserved(funobj, XPC_FUNCTION_PARENT_OBJECT_SLOT,
+                                ObjectValue(*parent));
+
+  vp->setObject(*funobj);
+
+  return true;
+}
+
+
+XPCNativeInterface::~XPCNativeInterface() {
+  XPCJSRuntime::Get()->GetIID2NativeInterfaceMap()->Remove(this);
+}
+
+already_AddRefed<XPCNativeInterface> XPCNativeInterface::GetNewOrUsed(
+    JSContext* cx, const nsIID* iid) {
+  RefPtr<XPCNativeInterface> iface;
+  XPCJSRuntime* rt = XPCJSRuntime::Get();
+
+  IID2NativeInterfaceMap* map = rt->GetIID2NativeInterfaceMap();
+  if (!map) {
+    return nullptr;
+  }
+
+  iface = map->Find(*iid);
+
+  if (iface) {
+    return iface.forget();
+  }
+
+  const nsXPTInterfaceInfo* info = nsXPTInterfaceInfo::ByIID(*iid);
+  if (!info) {
+    return nullptr;
+  }
+
+  return NewInstance(cx, map, info);
+}
+
+already_AddRefed<XPCNativeInterface> XPCNativeInterface::GetNewOrUsed(
+    JSContext* cx, const nsXPTInterfaceInfo* info) {
+  RefPtr<XPCNativeInterface> iface;
+
+  XPCJSRuntime* rt = XPCJSRuntime::Get();
+
+  IID2NativeInterfaceMap* map = rt->GetIID2NativeInterfaceMap();
+  if (!map) {
+    return nullptr;
+  }
+
+  iface = map->Find(info->IID());
+
+  if (iface) {
+    return iface.forget();
+  }
+
+  return NewInstance(cx, map, info);
+}
+
+already_AddRefed<XPCNativeInterface> XPCNativeInterface::GetNewOrUsed(
+    JSContext* cx, const char* name) {
+  const nsXPTInterfaceInfo* info = nsXPTInterfaceInfo::ByName(name);
+  return info ? GetNewOrUsed(cx, info) : nullptr;
+}
+
+already_AddRefed<XPCNativeInterface> XPCNativeInterface::GetISupports(
+    JSContext* cx) {
+  return GetNewOrUsed(cx, &NS_GET_IID(nsISupports));
+}
+
+already_AddRefed<XPCNativeInterface> XPCNativeInterface::NewInstance(
+    JSContext* cx, IID2NativeInterfaceMap* aMap,
+    const nsXPTInterfaceInfo* aInfo) {
+
+  if (aInfo->IsMainProcessScriptableOnly() && !XRE_IsParentProcess()) {
+    nsCOMPtr<nsIConsoleService> console(
+        do_GetService(NS_CONSOLESERVICE_CONTRACTID));
+    if (console) {
+      const char* intfNameChars = aInfo->Name();
+      nsPrintfCString errorMsg("Use of %s in content process is deprecated.",
+                               intfNameChars);
+
+      auto location = JSCallingLocation::Get(cx);
+      nsCOMPtr<nsIScriptError> error(
+          do_CreateInstance(NS_SCRIPTERROR_CONTRACTID));
+      error->Init(NS_ConvertUTF8toUTF16(errorMsg), location.FileName(),
+                  location.mLine, location.mColumn, nsIScriptError::warningFlag,
+                  "chrome javascript"_ns, false ,
+                  true );
+      console->LogMessage(error);
+    }
+  }
+
+  JS::AutoCheckCannotGC nogc;
+
+  const uint16_t methodCount = aInfo->MethodCount();
+  const uint16_t constCount = aInfo->ConstantCount();
+  const uint16_t totalCount = methodCount + constCount;
+
+  using MemberVector =
+      mozilla::Vector<XPCNativeMember, 16, InfallibleAllocPolicy>;
+  MemberVector members;
+  MOZ_ALWAYS_TRUE(members.reserve(totalCount));
+
+
+  for (unsigned int i = 0; i < methodCount; i++) {
+    const nsXPTMethodInfo& info = aInfo->Method(i);
+
+    if (i == 1 || i == 2) {
+      continue;
+    }
+
+    if (!info.IsReflectable()) {
+      continue;
+    }
+
+    jsid name;
+    if (!info.GetId(cx, name)) {
+      NS_ERROR("bad method name");
+      return nullptr;
+    }
+
+    if (info.IsSetter()) {
+      MOZ_ASSERT(!members.empty(), "bad setter");
+      XPCNativeMember* cur = &members.back();
+      MOZ_ASSERT(cur->GetName() == name, "bad setter");
+      MOZ_ASSERT(cur->IsReadOnlyAttribute(), "bad setter");
+      MOZ_ASSERT(cur->GetIndex() == i - 1, "bad setter");
+      cur->SetWritableAttribute();
+    } else {
+      size_t indexInInterface = members.length();
+      if (indexInInterface == XPCNativeMember::GetMaxIndexInInterface()) {
+        NS_WARNING("Too many members in interface");
+        return nullptr;
+      }
+      XPCNativeMember cur;
+      cur.SetName(name);
+      if (info.IsGetter()) {
+        cur.SetReadOnlyAttribute(i);
+      } else {
+        cur.SetMethod(i);
+      }
+      cur.SetIndexInInterface(indexInInterface);
+      members.infallibleAppend(cur);
+    }
+  }
+
+  for (unsigned int i = 0; i < constCount; i++) {
+    RootedValue constant(cx);
+    nsCString namestr;
+    if (NS_FAILED(aInfo->GetConstant(i, &constant, getter_Copies(namestr)))) {
+      return nullptr;
+    }
+
+    RootedString str(cx, JS_AtomizeString(cx, namestr.get()));
+    if (!str) {
+      NS_ERROR("bad constant name");
+      return nullptr;
+    }
+    jsid name = PropertyKey::NonIntAtom(str);
+
+    size_t indexInInterface = members.length();
+    if (indexInInterface == XPCNativeMember::GetMaxIndexInInterface()) {
+      NS_WARNING("Too many members in interface");
+      return nullptr;
+    }
+    XPCNativeMember cur;
+    cur.SetName(name);
+    cur.SetConstant(i);
+    cur.SetIndexInInterface(indexInInterface);
+    members.infallibleAppend(cur);
+  }
+
+  const char* bytes = aInfo->Name();
+  if (!bytes) {
+    return nullptr;
+  }
+  RootedString str(cx, JS_AtomizeString(cx, bytes));
+  if (!str) {
+    return nullptr;
+  }
+
+  RootedId interfaceName(cx, PropertyKey::NonIntAtom(str));
+
+  size_t size = sizeof(XPCNativeInterface);
+  if (members.length() > 1) {
+    size += (members.length() - 1) * sizeof(XPCNativeMember);
+  }
+  void* place = new char[size];
+  if (!place) {
+    return nullptr;
+  }
+
+  RefPtr<XPCNativeInterface> obj =
+      new (place) XPCNativeInterface(aInfo, interfaceName);
+
+  obj->mMemberCount = members.length();
+  if (!members.empty()) {
+    memcpy(obj->mMembers, members.begin(),
+           members.length() * sizeof(XPCNativeMember));
+  }
+
+  if (!aMap->AddNew(obj)) {
+    NS_ERROR("failed to add our interface!");
+    return nullptr;
+  }
+
+  return obj.forget();
+}
+
+void XPCNativeInterface::DestroyInstance(XPCNativeInterface* inst) {
+  inst->~XPCNativeInterface();
+  delete[] (char*)inst;
+}
+
+size_t XPCNativeInterface::SizeOfIncludingThis(MallocSizeOf mallocSizeOf) {
+  return mallocSizeOf(this);
+}
+
+void XPCNativeInterface::Trace(JSTracer* trc) {
+  JS::TraceRoot(trc, &mName, "XPCNativeInterface::mName");
+
+  for (size_t i = 0; i < mMemberCount; i++) {
+    JS::PropertyKey key = mMembers[i].GetName();
+    JS::TraceRoot(trc, &key, "XPCNativeInterface::mMembers");
+    MOZ_ASSERT(mMembers[i].GetName() == key);
+  }
+}
+
+void IID2NativeInterfaceMap::Trace(JSTracer* trc) {
+  for (auto iter = mMap.iter(); !iter.done(); iter.next()) {
+    XPCNativeInterface* iface = iter.get().value();
+    iface->Trace(trc);
+  }
+}
+
+void XPCNativeInterface::DebugDump(int16_t depth) {
+#ifdef DEBUG
+  XPC_LOG_ALWAYS(("XPCNativeInterface @ %p", this));
+  XPC_LOG_INDENT();
+  XPC_LOG_ALWAYS(("name is %s", GetNameString()));
+  XPC_LOG_ALWAYS(("mInfo @ %p", mInfo));
+  XPC_LOG_OUTDENT();
+#endif
+}
+
+
+HashNumber XPCNativeSetKey::Hash() const {
+  HashNumber h = 0;
+
+  if (mBaseSet) {
+    XPCNativeInterface** current = mBaseSet->GetInterfaceArray();
+    uint16_t count = mBaseSet->GetInterfaceCount();
+    for (uint16_t i = 0; i < count; i++) {
+      h = AddToHash(h, *(current++));
+    }
+  } else {
+    RefPtr<XPCNativeInterface> isupp = XPCNativeInterface::GetISupports(mCx);
+    h = AddToHash(h, isupp.get());
+
+    if (isupp == mAddition) {
+      return h;
+    }
+  }
+
+  if (mAddition) {
+    h = AddToHash(h, mAddition.get());
+  }
+
+  return h;
+}
+
+
+XPCNativeSet::~XPCNativeSet() {
+
+  XPCJSRuntime::Get()->GetNativeSetMap()->Remove(this);
+
+  for (int i = 0; i < mInterfaceCount; i++) {
+    NS_RELEASE(mInterfaces[i]);
+  }
+}
+
+already_AddRefed<XPCNativeSet> XPCNativeSet::GetNewOrUsed(JSContext* cx,
+                                                          const nsIID* iid) {
+  RefPtr<XPCNativeInterface> iface = XPCNativeInterface::GetNewOrUsed(cx, iid);
+  if (!iface) {
+    return nullptr;
+  }
+
+  XPCNativeSetKey key(cx, iface);
+
+  XPCJSRuntime* xpcrt = XPCJSRuntime::Get();
+  NativeSetMap* map = xpcrt->GetNativeSetMap();
+  if (!map) {
+    return nullptr;
+  }
+
+  RefPtr<XPCNativeSet> set = map->Find(&key);
+
+  if (set) {
+    return set.forget();
+  }
+
+  set = NewInstance(cx, {std::move(iface)});
+  if (!set) {
+    return nullptr;
+  }
+
+  if (!map->AddNew(&key, set)) {
+    NS_ERROR("failed to add our set!");
+    set = nullptr;
+  }
+
+  return set.forget();
+}
+
+already_AddRefed<XPCNativeSet> XPCNativeSet::GetNewOrUsed(
+    JSContext* cx, nsIClassInfo* classInfo) {
+  XPCJSRuntime* xpcrt = XPCJSRuntime::Get();
+  ClassInfo2NativeSetMap* map = xpcrt->GetClassInfo2NativeSetMap();
+  if (!map) {
+    return nullptr;
+  }
+
+  RefPtr<XPCNativeSet> set = map->Find(classInfo);
+
+  if (set) {
+    return set.forget();
+  }
+
+  AutoTArray<nsIID, 4> iids;
+  if (NS_FAILED(classInfo->GetInterfaces(iids))) {
+
+    iids.Clear();
+  }
+
+  nsTArray<RefPtr<XPCNativeInterface>> interfaces(iids.Length());
+  for (auto& iid : iids) {
+    RefPtr<XPCNativeInterface> iface =
+        XPCNativeInterface::GetNewOrUsed(cx, &iid);
+    if (iface) {
+      interfaces.AppendElement(iface.forget());
+    }
+  }
+
+  if (interfaces.Length() > 0) {
+    set = NewInstance(cx, std::move(interfaces));
+    if (set) {
+      NativeSetMap* map2 = xpcrt->GetNativeSetMap();
+      if (!map2) {
+        return set.forget();
+      }
+
+      XPCNativeSetKey key(set);
+      XPCNativeSet* set2 = map2->Add(&key, set);
+      if (!set2) {
+        NS_ERROR("failed to add our set");
+        return nullptr;
+      }
+
+      if (set2 != set) {
+        set = set2;
+      }
+    }
+  } else {
+    set = GetNewOrUsed(cx, &NS_GET_IID(nsISupports));
+  }
+
+  if (set) {
+#ifdef DEBUG
+    XPCNativeSet* set2 =
+#endif
+        map->Add(classInfo, set);
+    MOZ_ASSERT(set2, "failed to add our set!");
+    MOZ_ASSERT(set2 == set, "hashtables inconsistent!");
+  }
+
+  return set.forget();
+}
+
+void XPCNativeSet::ClearCacheEntryForClassInfo(nsIClassInfo* classInfo) {
+  XPCJSRuntime* xpcrt = nsXPConnect::GetRuntimeInstance();
+  ClassInfo2NativeSetMap* map = xpcrt->GetClassInfo2NativeSetMap();
+  if (map) {
+    map->Remove(classInfo);
+  }
+}
+
+already_AddRefed<XPCNativeSet> XPCNativeSet::GetNewOrUsed(
+    JSContext* cx, XPCNativeSetKey* key) {
+  NativeSetMap* map = XPCJSRuntime::Get()->GetNativeSetMap();
+  if (!map) {
+    return nullptr;
+  }
+
+  RefPtr<XPCNativeSet> set = map->Find(key);
+
+  if (set) {
+    return set.forget();
+  }
+
+  if (key->GetBaseSet()) {
+    set = NewInstanceMutate(key);
+  } else {
+    set = NewInstance(cx, {key->GetAddition()});
+  }
+
+  if (!set) {
+    return nullptr;
+  }
+
+  if (!map->AddNew(key, set)) {
+    NS_ERROR("failed to add our set!");
+    set = nullptr;
+  }
+
+  return set.forget();
+}
+
+already_AddRefed<XPCNativeSet> XPCNativeSet::GetNewOrUsed(
+    JSContext* cx, XPCNativeSet* firstSet, XPCNativeSet* secondSet,
+    bool preserveFirstSetOrder) {
+  uint32_t uniqueCount = firstSet->mInterfaceCount;
+  for (uint32_t i = 0; i < secondSet->mInterfaceCount; ++i) {
+    if (!firstSet->HasInterface(secondSet->mInterfaces[i])) {
+      uniqueCount++;
+    }
+  }
+
+  if (uniqueCount == firstSet->mInterfaceCount) {
+    return RefPtr<XPCNativeSet>(firstSet).forget();
+  }
+
+  if (!preserveFirstSetOrder && uniqueCount == secondSet->mInterfaceCount) {
+    return RefPtr<XPCNativeSet>(secondSet).forget();
+  }
+
+  RefPtr<XPCNativeSet> currentSet = firstSet;
+  for (uint32_t i = 0; i < secondSet->mInterfaceCount; ++i) {
+    XPCNativeInterface* iface = secondSet->mInterfaces[i];
+    if (!currentSet->HasInterface(iface)) {
+      XPCNativeSetKey key(currentSet, iface);
+      currentSet = XPCNativeSet::GetNewOrUsed(cx, &key);
+      if (!currentSet) {
+        return nullptr;
+      }
+    }
+  }
+
+  MOZ_ASSERT(currentSet->mInterfaceCount == uniqueCount);
+  return currentSet.forget();
+}
+
+already_AddRefed<XPCNativeSet> XPCNativeSet::NewInstance(
+    JSContext* cx, nsTArray<RefPtr<XPCNativeInterface>>&& array) {
+  if (array.Length() == 0) {
+    return nullptr;
+  }
+
+
+  RefPtr<XPCNativeInterface> isup = XPCNativeInterface::GetISupports(cx);
+  uint16_t slots = array.Length() + 1;
+
+  for (auto key = array.begin(); key != array.end(); key++) {
+    if (*key == isup) {
+      slots--;
+    }
+  }
+
+  int size = sizeof(XPCNativeSet);
+  if (slots > 1) {
+    size += (slots - 1) * sizeof(XPCNativeInterface*);
+  }
+  void* place = new char[size];
+  RefPtr<XPCNativeSet> obj = new (place) XPCNativeSet();
+
+  XPCNativeInterface** outp = (XPCNativeInterface**)&obj->mInterfaces;
+
+  NS_ADDREF(*(outp++) = isup);
+
+  for (auto key = array.begin(); key != array.end(); key++) {
+    RefPtr<XPCNativeInterface> cur = std::move(*key);
+    if (isup == cur) {
+      continue;
+    }
+    *(outp++) = cur.forget().take();
+  }
+  obj->mInterfaceCount = slots;
+
+  return obj.forget();
+}
+
+already_AddRefed<XPCNativeSet> XPCNativeSet::NewInstanceMutate(
+    XPCNativeSetKey* key) {
+  XPCNativeSet* otherSet = key->GetBaseSet();
+  XPCNativeInterface* newInterface = key->GetAddition();
+
+  MOZ_ASSERT(otherSet);
+
+  if (!newInterface) {
+    return nullptr;
+  }
+
+  int size = sizeof(XPCNativeSet);
+  size += otherSet->mInterfaceCount * sizeof(XPCNativeInterface*);
+  void* place = new char[size];
+  RefPtr<XPCNativeSet> obj = new (place) XPCNativeSet();
+
+  obj->mInterfaceCount = otherSet->mInterfaceCount + 1;
+
+  XPCNativeInterface** src = otherSet->mInterfaces;
+  XPCNativeInterface** dest = obj->mInterfaces;
+  for (uint16_t i = 0; i < otherSet->mInterfaceCount; i++) {
+    NS_ADDREF(*dest++ = *src++);
+  }
+  NS_ADDREF(*dest++ = newInterface);
+
+  return obj.forget();
+}
+
+void XPCNativeSet::DestroyInstance(XPCNativeSet* inst) {
+  inst->~XPCNativeSet();
+  delete[] (char*)inst;
+}
+
+size_t XPCNativeSet::SizeOfIncludingThis(MallocSizeOf mallocSizeOf) {
+  return mallocSizeOf(this);
+}
+
+void XPCNativeSet::DebugDump(int16_t depth) {
+#ifdef DEBUG
+  depth--;
+  XPC_LOG_ALWAYS(("XPCNativeSet @ %p", this));
+  XPC_LOG_INDENT();
+
+  XPC_LOG_ALWAYS(("mInterfaceCount of %d", mInterfaceCount));
+  if (depth) {
+    for (uint16_t i = 0; i < mInterfaceCount; i++) {
+      mInterfaces[i]->DebugDump(depth);
+    }
+  }
+  XPC_LOG_OUTDENT();
+#endif
+}

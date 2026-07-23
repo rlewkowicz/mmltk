@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_PLATFORMS_AGNOSTIC_BYTESTREAMS_ANNEX_B_H_
+#define DOM_MEDIA_PLATFORMS_AGNOSTIC_BYTESTREAMS_ANNEX_B_H_
+
+#include "ErrorList.h"
+#include "H264.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Result.h"
+
+template <class>
+class nsTArray;
+
+namespace mozilla {
+class BufferReader;
+class MediaRawData;
+class MediaByteBuffer;
+
+class AnnexB {
+ public:
+  struct NALEntry {
+    NALEntry(int64_t aOffset, int64_t aSize) : mOffset(aOffset), mSize(aSize) {
+      MOZ_ASSERT(mOffset >= 0);
+      MOZ_ASSERT(mSize >= 0);
+    }
+    int64_t mOffset;
+    int64_t mSize;
+  };
+  static mozilla::Result<mozilla::Ok, nsresult> ConvertAVCCSampleToAnnexB(
+      mozilla::MediaRawData* aSample, bool aAddSPS = true);
+  static mozilla::Result<mozilla::Ok, nsresult> ConvertHVCCSampleToAnnexB(
+      mozilla::MediaRawData* aSample, bool aAddSPS = true);
+
+  static RefPtr<MediaByteBuffer> ExtractExtraData(
+      const Span<const uint8_t>& aSpan);
+  static RefPtr<MediaByteBuffer> ExtractExtraDataForAVCC(
+      const Span<const uint8_t>& aSpan);
+  static bool ConvertSampleToAVCC(
+      mozilla::MediaRawData* aSample,
+      const RefPtr<mozilla::MediaByteBuffer>& aAVCCHeader = nullptr);
+  static Result<mozilla::Ok, nsresult> ConvertSampleToHVCC(
+      mozilla::MediaRawData* aSample);
+
+  static mozilla::Result<mozilla::Ok, nsresult> ConvertAVCCTo4BytesAVCC(
+      mozilla::MediaRawData* aSample);
+  static mozilla::Result<mozilla::Ok, nsresult> ConvertHVCCTo4BytesHVCC(
+      mozilla::MediaRawData* aSample);
+
+  static already_AddRefed<mozilla::MediaByteBuffer>
+  ConvertAVCCExtraDataToAnnexB(const mozilla::MediaByteBuffer* aExtraData,
+                               size_t* aLength = nullptr);
+  static already_AddRefed<mozilla::MediaByteBuffer>
+  ConvertHVCCExtraDataToAnnexB(const mozilla::MediaByteBuffer* aExtraData);
+
+  static bool IsAVCC(const mozilla::MediaRawData* aSample);
+  static bool IsHVCC(const mozilla::MediaRawData* aSample);
+  static bool IsAnnexB(const Span<const uint8_t>& aSpan);
+
+  static void ParseNALEntries(const Span<const uint8_t>& aSpan,
+                              nsTArray<AnnexB::NALEntry>& aEntries);
+
+  static bool FindAllNalTypes(const Span<const uint8_t>& aSpan,
+                              const nsTArray<NAL_TYPES>& aTypes);
+
+  static size_t FindNalType(const Span<const uint8_t>& aSpan,
+                            const nsTArray<AnnexB::NALEntry>& aNalEntries,
+                            NAL_TYPES aType, size_t aStartIndex);
+
+ private:
+  static mozilla::Result<mozilla::Ok, nsresult> ConvertSPSOrPPS(
+      mozilla::BufferReader& aReader, uint8_t aCount,
+      mozilla::MediaByteBuffer* aAnnexB);
+
+  static mozilla::Result<mozilla::Ok, nsresult> ConvertNALUTo4BytesNALU(
+      mozilla::MediaRawData* aSample, uint8_t aNALUSize);
+};
+
+}  
+
+#endif  // DOM_MEDIA_PLATFORMS_AGNOSTIC_BYTESTREAMS_ANNEX_B_H_

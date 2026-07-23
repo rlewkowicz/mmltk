@@ -1,0 +1,243 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ImageFactory.h"
+
+#include <algorithm>
+
+#include "Image.h"
+#include "MultipartImage.h"
+#include "RasterImage.h"
+#include "VectorImage.h"
+#include "mozilla/MediaFragmentURIParser.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/StaticPrefs_image.h"
+#include "nsContentUtils.h"
+#include "nsIChannel.h"
+#include "nsIFile.h"
+#include "nsIFileChannel.h"
+#include "nsIObserverService.h"
+#include "nsIRequest.h"
+#include "nsMimeTypes.h"
+
+namespace mozilla {
+namespace image {
+
+void ImageFactory::Initialize() {}
+
+static uint32_t ComputeImageFlags(nsIURI* uri, const nsCString& aMimeType,
+                                  bool isMultiPart) {
+  bool isDiscardable = StaticPrefs::image_mem_discardable();
+  bool doDecodeImmediately = StaticPrefs::image_decode_immediately_enabled();
+
+  if (uri->SchemeIs("chrome")) {
+    isDiscardable = false;
+  }
+
+  if (uri->SchemeIs("resource")) {
+    isDiscardable = false;
+  }
+
+  if (isMultiPart) {
+    isDiscardable = false;
+  }
+
+  uint32_t imageFlags = Image::INIT_FLAG_NONE;
+  if (isDiscardable) {
+    imageFlags |= Image::INIT_FLAG_DISCARDABLE;
+  }
+  if (doDecodeImmediately) {
+    imageFlags |= Image::INIT_FLAG_DECODE_IMMEDIATELY;
+  }
+  if (isMultiPart) {
+    imageFlags |= Image::INIT_FLAG_TRANSIENT;
+  }
+
+  if (uri->SchemeIs("data")) {
+    imageFlags |= Image::INIT_FLAG_SYNC_LOAD;
+  }
+
+  return imageFlags;
+}
+
+#ifdef DEBUG
+static void NotifyImageLoading(nsIURI* aURI) {
+  if (!NS_IsMainThread()) {
+    nsCOMPtr<nsIURI> uri(aURI);
+    nsCOMPtr<nsIRunnable> ev = NS_NewRunnableFunction(
+        "NotifyImageLoading", [uri]() -> void { NotifyImageLoading(uri); });
+    NS_DispatchToMainThread(ev.forget());
+    return;
+  }
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  NS_WARNING_ASSERTION(obs, "Can't get an observer service handle");
+  if (obs) {
+    nsAutoCString spec;
+    aURI->GetSpec(spec);
+    obs->NotifyObservers(nullptr, "image-loading",
+                         NS_ConvertUTF8toUTF16(spec).get());
+  }
+}
+#endif
+
+already_AddRefed<Image> ImageFactory::CreateImage(
+    nsIRequest* aRequest, ProgressTracker* aProgressTracker,
+    const nsCString& aMimeType, nsIURI* aURI, bool aIsMultiPart,
+    uint64_t aInnerWindowId) {
+  uint32_t imageFlags = ComputeImageFlags(aURI, aMimeType, aIsMultiPart);
+
+#ifdef DEBUG
+  if (aURI->SchemeIs("resource") || aURI->SchemeIs("chrome")) {
+    NotifyImageLoading(aURI);
+  }
+#endif
+
+  if (aMimeType.EqualsLiteral(IMAGE_SVG_XML)) {
+    return CreateVectorImage(aRequest, aProgressTracker, aMimeType, aURI,
+                             imageFlags, aInnerWindowId);
+  } else {
+    return CreateRasterImage(aRequest, aProgressTracker, aMimeType, aURI,
+                             imageFlags, aInnerWindowId);
+  }
+}
+
+template <typename T>
+static already_AddRefed<Image> BadImage(const char* aMessage,
+                                        RefPtr<T>& aImage) {
+  aImage->SetHasError();
+  return aImage.forget();
+}
+
+already_AddRefed<Image> ImageFactory::CreateAnonymousImage(
+    const nsCString& aMimeType, uint32_t aSizeHint ) {
+  nsresult rv;
+
+  RefPtr<RasterImage> newImage = new RasterImage();
+
+  RefPtr<ProgressTracker> newTracker = new ProgressTracker();
+  newTracker->SetImage(newImage);
+  newImage->SetProgressTracker(newTracker);
+
+  rv = newImage->Init(aMimeType.get(), Image::INIT_FLAG_SYNC_LOAD);
+  if (NS_FAILED(rv)) {
+    return BadImage("RasterImage::Init failed", newImage);
+  }
+
+  rv = newImage->SetSourceSizeHint(aSizeHint);
+  if (NS_FAILED(rv)) {
+    return BadImage("RasterImage::SetSourceSizeHint failed", newImage);
+  }
+
+  return newImage.forget();
+}
+
+already_AddRefed<MultipartImage> ImageFactory::CreateMultipartImage(
+    Image* aFirstPart, ProgressTracker* aProgressTracker) {
+  MOZ_ASSERT(aFirstPart);
+  MOZ_ASSERT(aProgressTracker);
+
+  RefPtr<MultipartImage> newImage = new MultipartImage(aFirstPart);
+  aProgressTracker->SetImage(newImage);
+  newImage->SetProgressTracker(aProgressTracker);
+
+  newImage->Init();
+
+  return newImage.forget();
+}
+
+int32_t SaturateToInt32(int64_t val) {
+  if (val > INT_MAX) {
+    return INT_MAX;
+  }
+  if (val < INT_MIN) {
+    return INT_MIN;
+  }
+
+  return static_cast<int32_t>(val);
+}
+
+uint32_t GetContentSize(nsIRequest* aRequest) {
+  nsCOMPtr<nsIChannel> channel(do_QueryInterface(aRequest));
+  if (channel) {
+    int64_t size;
+    nsresult rv = channel->GetContentLength(&size);
+    if (NS_SUCCEEDED(rv)) {
+      return std::max(SaturateToInt32(size), 0);
+    }
+  }
+
+  nsCOMPtr<nsIFileChannel> fileChannel(do_QueryInterface(aRequest));
+  if (fileChannel) {
+    nsCOMPtr<nsIFile> file;
+    nsresult rv = fileChannel->GetFile(getter_AddRefs(file));
+    if (NS_SUCCEEDED(rv)) {
+      int64_t filesize;
+      rv = file->GetFileSize(&filesize);
+      if (NS_SUCCEEDED(rv)) {
+        return std::max(SaturateToInt32(filesize), 0);
+      }
+    }
+  }
+
+  return 0;
+}
+
+already_AddRefed<Image> ImageFactory::CreateRasterImage(
+    nsIRequest* aRequest, ProgressTracker* aProgressTracker,
+    const nsCString& aMimeType, nsIURI* aURI, uint32_t aImageFlags,
+    uint64_t aInnerWindowId) {
+  MOZ_ASSERT(aProgressTracker);
+
+  nsresult rv;
+
+  RefPtr<RasterImage> newImage = new RasterImage(aURI);
+  aProgressTracker->SetImage(newImage);
+  newImage->SetProgressTracker(aProgressTracker);
+
+  rv = newImage->Init(aMimeType.get(), aImageFlags);
+  if (NS_FAILED(rv)) {
+    return BadImage("RasterImage::Init failed", newImage);
+  }
+
+  newImage->SetInnerWindowID(aInnerWindowId);
+
+  rv = newImage->SetSourceSizeHint(GetContentSize(aRequest));
+  if (NS_FAILED(rv)) {
+    return BadImage("RasterImage::SetSourceSizeHint failed", newImage);
+  }
+
+  return newImage.forget();
+}
+
+already_AddRefed<Image> ImageFactory::CreateVectorImage(
+    nsIRequest* aRequest, ProgressTracker* aProgressTracker,
+    const nsCString& aMimeType, nsIURI* aURI, uint32_t aImageFlags,
+    uint64_t aInnerWindowId) {
+  MOZ_ASSERT(aProgressTracker);
+
+  nsresult rv;
+
+  RefPtr<VectorImage> newImage = new VectorImage(aURI);
+  aProgressTracker->SetImage(newImage);
+  newImage->SetProgressTracker(aProgressTracker);
+
+  rv = newImage->Init(aMimeType.get(), aImageFlags);
+  if (NS_FAILED(rv)) {
+    return BadImage("VectorImage::Init failed", newImage);
+  }
+
+  newImage->SetInnerWindowID(aInnerWindowId);
+
+  rv = newImage->OnStartRequest(aRequest);
+  if (NS_FAILED(rv)) {
+    return BadImage("VectorImage::OnStartRequest failed", newImage);
+  }
+
+  return newImage.forget();
+}
+
+}  
+}  

@@ -1,0 +1,86 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef TRANSFRMX_EXPRRESULT_H
+#define TRANSFRMX_EXPRRESULT_H
+
+#include "nsString.h"
+#include "txCore.h"
+#include "txResultRecycler.h"
+
+
+class txAExprResult {
+ public:
+  friend class txResultRecycler;
+
+  enum ResultType {
+    NODESET = 0,
+    BOOLEAN,
+    NUMBER,
+    STRING,
+    RESULT_TREE_FRAGMENT
+  };
+
+  explicit txAExprResult(txResultRecycler* aRecycler) : mRecycler(aRecycler) {}
+  virtual ~txAExprResult() = default;
+
+  void AddRef() {
+    ++mRefCnt;
+    NS_LOG_ADDREF(this, mRefCnt, "txAExprResult", sizeof(*this));
+  }
+
+  void Release();  
+
+  virtual short getResultType() = 0;
+
+  virtual void stringValue(nsString& aResult) = 0;
+
+  virtual const nsString* stringValuePointer() = 0;
+
+  virtual bool booleanValue() = 0;
+
+  virtual double numberValue() = 0;
+
+ private:
+  nsAutoRefCnt mRefCnt;
+  RefPtr<txResultRecycler> mRecycler;
+};
+
+#define TX_DECL_EXPRRESULT                               \
+  virtual short getResultType() override;                \
+  virtual void stringValue(nsString& aString) override;  \
+  virtual const nsString* stringValuePointer() override; \
+  virtual bool booleanValue() override;                  \
+  virtual double numberValue() override;
+
+class BooleanResult : public txAExprResult {
+ public:
+  explicit BooleanResult(bool aValue);
+
+  TX_DECL_EXPRRESULT
+
+ private:
+  bool value;
+};
+
+class NumberResult : public txAExprResult {
+ public:
+  NumberResult(double aValue, txResultRecycler* aRecycler);
+
+  TX_DECL_EXPRRESULT
+
+  double value;
+};
+
+class StringResult : public txAExprResult {
+ public:
+  explicit StringResult(txResultRecycler* aRecycler);
+  StringResult(const nsAString& aValue, txResultRecycler* aRecycler);
+
+  TX_DECL_EXPRRESULT
+
+  nsString mValue;
+};
+
+#endif

@@ -1,0 +1,67 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_IHistory_h_
+#define mozilla_IHistory_h_
+
+#include "nsISupports.h"
+#include "nsURIHashKey.h"
+#include "nsTHashSet.h"
+#include "nsTObserverArray.h"
+
+class nsIURI;
+class nsIWidget;
+
+namespace mozilla {
+
+namespace dom {
+class ContentParent;
+class Document;
+class Link;
+}  
+
+#define IHISTORY_IID \
+  {0x0057c9d3, 0xb98e, 0x4933, {0xbd, 0xc5, 0x02, 0x75, 0xd0, 0x67, 0x05, 0xe1}}
+
+class IHistory : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(IHISTORY_IID)
+
+  using ContentParentSet = nsTHashSet<RefPtr<dom::ContentParent>>;
+
+  virtual void RegisterVisitedCallback(nsIURI* aURI, dom::Link* aLink) = 0;
+
+  virtual void ScheduleVisitedQuery(nsIURI* aURI, dom::ContentParent*) = 0;
+
+  virtual void UnregisterVisitedCallback(nsIURI* aURI, dom::Link* aLink) = 0;
+
+  enum class VisitedStatus : uint8_t {
+    Unknown,
+    Visited,
+    Unvisited,
+  };
+
+  virtual void NotifyVisited(nsIURI*, VisitedStatus,
+                             const ContentParentSet* = nullptr) = 0;
+
+  enum VisitFlags {
+    TOP_LEVEL = 1 << 0,
+    REDIRECT_PERMANENT = 1 << 1,
+    REDIRECT_TEMPORARY = 1 << 2,
+    REDIRECT_SOURCE = 1 << 3,
+    UNRECOVERABLE_ERROR = 1 << 4,
+    REDIRECT_SOURCE_PERMANENT = 1 << 5,
+    REDIRECT_SOURCE_UPGRADED = 1 << 6,
+    SOURCE_IS_POST_RESPONSE = 1 << 7
+  };
+
+  NS_IMETHOD VisitURI(nsIWidget* aWidget, nsIURI* aURI, nsIURI* aLastVisitedURI,
+                      uint32_t aFlags, uint64_t aBrowserId) = 0;
+
+  NS_IMETHOD SetURITitle(nsIURI* aURI, const nsAString& aTitle) = 0;
+};
+
+}  
+
+#endif  // mozilla_IHistory_h_

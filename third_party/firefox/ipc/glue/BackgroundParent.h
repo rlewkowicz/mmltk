@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ipc_backgroundparent_h_
+#define mozilla_ipc_backgroundparent_h_
+
+#include "base/process.h"
+#include "mozilla/dom/ContentParent.h"
+#include "nsStringFwd.h"
+#include "nsTArrayForwardDeclare.h"
+
+#ifdef DEBUG
+#  include "nsXULAppAPI.h"
+#endif
+
+template <class>
+struct already_AddRefed;
+
+namespace mozilla {
+
+namespace net {
+
+class SocketProcessBridgeParent;
+class SocketProcessParent;
+
+}  
+
+namespace dom {
+
+class BlobImpl;
+class ContentParent;
+
+}  
+
+namespace ipc {
+
+class BackgroundStarterParent;
+class PBackgroundParent;
+class PBackgroundStarterParent;
+
+template <class PFooSide>
+class Endpoint;
+
+class BackgroundParent final {
+  friend class mozilla::ipc::BackgroundStarterParent;
+  friend class mozilla::dom::ContentParent;
+  friend class mozilla::net::SocketProcessBridgeParent;
+  friend class mozilla::net::SocketProcessParent;
+
+  using ProcessId = base::ProcessId;
+  using BlobImpl = mozilla::dom::BlobImpl;
+  using ContentParent = mozilla::dom::ContentParent;
+  using ThreadsafeContentParentHandle =
+      mozilla::dom::ThreadsafeContentParentHandle;
+
+ public:
+  static already_AddRefed<nsISerialEventTarget> GetBackgroundThread();
+
+  static bool IsOtherProcessActor(PBackgroundParent* aBackgroundActor);
+
+  static ThreadsafeContentParentHandle* GetContentParentHandle(
+      PBackgroundParent* aBackgroundActor);
+
+  static uint64_t GetChildID(PBackgroundParent* aBackgroundActor);
+
+  static nsCString GetRemoteType(PBackgroundParent* aBackgroundActor);
+
+  static bool ValidatePrincipal(
+      PBackgroundParent* aBackgroundActor, nsIPrincipal* aPrincipal,
+      const EnumSet<dom::ValidatePrincipalOptions>& aOptions = {});
+  static bool ValidatePrincipalInfo(
+      PBackgroundParent* aBackgroundActor, const PrincipalInfo& aPrincipalInfo,
+      const EnumSet<dom::ValidatePrincipalOptions>& aOptions = {});
+
+  static void KillHardAsync(PBackgroundParent* aBackgroundActor,
+                            const nsACString& aReason);
+
+ private:
+  static bool AllocStarter(ContentParent* aContent,
+                           Endpoint<PBackgroundStarterParent>&& aEndpoint);
+
+  static bool AllocStarter(Endpoint<PBackgroundStarterParent>&& aEndpoint);
+};
+
+bool IsOnBackgroundThread();
+
+#ifdef DEBUG
+
+void AssertIsOnBackgroundThread();
+
+#else
+
+inline void AssertIsOnBackgroundThread() {}
+
+#endif  // DEBUG
+
+inline void AssertIsInMainProcess() { MOZ_ASSERT(XRE_IsParentProcess()); }
+
+}  
+}  
+
+#endif  // mozilla_ipc_backgroundparent_h_

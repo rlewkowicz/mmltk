@@ -1,0 +1,144 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_SVGIMAGECONTEXT_H_
+#define LAYOUT_SVG_SVGIMAGECONTEXT_H_
+
+#include "Units.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/SVGContextPaint.h"
+#include "mozilla/SVGPreserveAspectRatio.h"
+
+class nsIFrame;
+class nsISVGPaintContext;
+
+namespace mozilla {
+
+enum class ColorScheme : uint8_t;
+class ComputedStyle;
+
+class SVGImageContext {
+ public:
+  SVGImageContext() = default;
+
+  explicit SVGImageContext(
+      const Maybe<CSSIntSize>& aViewportSize,
+      const Maybe<SVGPreserveAspectRatio>& aPreserveAspectRatio = Nothing(),
+      const Maybe<ColorScheme>& aColorScheme = Nothing())
+      : mViewportSize(aViewportSize),
+        mPreserveAspectRatio(aPreserveAspectRatio),
+        mColorScheme(aColorScheme) {}
+
+  static void MaybeStoreContextPaint(SVGImageContext& aContext,
+                                     nsIFrame* aFromFrame,
+                                     imgIContainer* aImgContainer);
+
+  static void MaybeStoreContextPaint(SVGImageContext& aContext,
+                                     const nsPresContext&, const ComputedStyle&,
+                                     imgIContainer*);
+
+  static void MaybeStoreContextPaint(SVGImageContext& aContext,
+                                     nsISVGPaintContext* aPaintContext,
+                                     imgIContainer* aImgContainer);
+
+  const Maybe<CSSIntSize>& GetViewportSize() const { return mViewportSize; }
+
+  void SetViewportSize(const Maybe<CSSIntSize>& aSize) {
+    mViewportSize = aSize;
+  }
+
+  const Maybe<ColorScheme>& GetColorScheme() const { return mColorScheme; }
+
+  void SetColorScheme(const Maybe<ColorScheme>& aScheme) {
+    mColorScheme = aScheme;
+  }
+
+  const Maybe<SVGPreserveAspectRatio>& GetPreserveAspectRatio() const {
+    return mPreserveAspectRatio;
+  }
+
+  void SetPreserveAspectRatio(const Maybe<SVGPreserveAspectRatio>& aPAR) {
+    mPreserveAspectRatio = aPAR;
+  }
+
+  const StyleLinkParameters& GetLinkParameters() const {
+    return mLinkParameters;
+  }
+
+  void SetLinkParameters(const StyleLinkParameters& aLinkParameters) {
+    mLinkParameters = aLinkParameters;
+  }
+
+  const SVGContextPaint* GetContextPaint() const { return mContextPaint.get(); }
+
+  void SetContextPaint(Maybe<nscolor> aFill, Maybe<nscolor> aStroke) {
+    mContextPaint = MakeRefPtr<SVGContextPaint>(aFill, aStroke);
+  }
+
+  void ClearContextPaint() { mContextPaint = nullptr; }
+
+  bool operator==(const SVGImageContext& aOther) const {
+    bool contextPaintIsEqual =
+        (mContextPaint == aOther.mContextPaint) ||
+        (mContextPaint && aOther.mContextPaint &&
+         *mContextPaint == *aOther.mContextPaint);
+
+    return contextPaintIsEqual && mViewportSize == aOther.mViewportSize &&
+           mPreserveAspectRatio == aOther.mPreserveAspectRatio &&
+           mColorScheme == aOther.mColorScheme &&
+           mLinkParameters == aOther.mLinkParameters;
+  }
+
+  bool operator!=(const SVGImageContext&) const = default;
+
+  PLDHashNumber Hash() const {
+    PLDHashNumber hash = 0;
+    if (mContextPaint) {
+      hash = HashGeneric(hash, mContextPaint->Hash());
+    }
+    return HashGeneric(hash, mViewportSize.map(HashSize).valueOr(0),
+                       mPreserveAspectRatio.map(HashPAR).valueOr(0),
+                       mColorScheme.map(HashColorScheme).valueOr(0),
+                       HashLinkParameters(mLinkParameters));
+  }
+
+ private:
+  static PLDHashNumber HashSize(const CSSIntSize& aSize) {
+    return HashGeneric(aSize.width, aSize.height);
+  }
+  static PLDHashNumber HashPAR(const SVGPreserveAspectRatio& aPAR) {
+    return aPAR.Hash();
+  }
+  static PLDHashNumber HashColorScheme(ColorScheme aScheme) {
+    return HashGeneric(uint8_t(aScheme));
+  }
+  static PLDHashNumber HashLinkParam(const StyleLinkParam& aLinkParam) {
+    PLDHashNumber valueHash = 0;
+    if (aLinkParam.value.IsSpecified()) {
+      const auto& value = aLinkParam.value.AsSpecified().AsString();
+      valueHash = HashBytes(value.BeginReading(), value.Length());
+    }
+
+    return HashGeneric(aLinkParam.name.AsAtom()->hash(), valueHash);
+  }
+
+  static PLDHashNumber HashLinkParameters(
+      const StyleLinkParameters& aLinkParameters) {
+    PLDHashNumber hash = 0;
+    for (const auto& p : aLinkParameters._0.AsSpan()) {
+      hash = HashGeneric(hash, HashLinkParam(p));
+    }
+    return hash;
+  }
+
+  RefPtr<SVGContextPaint> mContextPaint;
+  Maybe<CSSIntSize> mViewportSize;
+  Maybe<SVGPreserveAspectRatio> mPreserveAspectRatio;
+  Maybe<ColorScheme> mColorScheme;
+  StyleLinkParameters mLinkParameters;
+};
+
+}  
+
+#endif  // LAYOUT_SVG_SVGIMAGECONTEXT_H_

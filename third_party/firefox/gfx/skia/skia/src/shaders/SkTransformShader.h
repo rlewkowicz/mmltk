@@ -1,0 +1,43 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+#if !defined(SkTextCoordShader_DEFINED)
+#define SkTextCoordShader_DEFINED
+
+#include "include/core/SkScalar.h"
+#include "include/private/base/SkAssert.h"
+#include "src/shaders/SkShaderBase.h"
+
+class SkMatrix;
+struct SkStageRec;
+
+class SkTransformShader : public SkShaderBase {
+public:
+    explicit SkTransformShader(const SkShaderBase& shader, bool allowPerspective);
+
+    bool appendStages(const SkStageRec& rec, const SkShaders::MatrixRec&) const override;
+
+    bool update(const SkMatrix& matrix);
+
+    ShaderType type() const override { return ShaderType::kTransform; }
+
+    Factory getFactory() const override {
+        SkDEBUGFAIL("SkTransformShader shouldn't be serialized.");
+        return {};
+    }
+    const char* getTypeName() const override {
+        SkDEBUGFAIL("SkTransformShader shouldn't be serialized.");
+        return nullptr;
+    }
+
+    bool isOpaque() const override { return fShader.isOpaque(); }
+
+private:
+    const SkShaderBase& fShader;
+    SkScalar fMatrixStorage[9];  
+    bool fAllowPerspective;
+};
+#endif

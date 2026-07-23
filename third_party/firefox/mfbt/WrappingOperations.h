@@ -1,0 +1,122 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_WrappingOperations_h
+#define mozilla_WrappingOperations_h
+
+#include "mozilla/Attributes.h"
+
+#include <limits.h>
+#include <type_traits>
+
+namespace mozilla {
+
+namespace detail {
+
+template <typename UnsignedType>
+struct WrapToSignedHelper {
+  static_assert(std::is_unsigned_v<UnsignedType>,
+                "WrapToSigned must be passed an unsigned type");
+
+  using SignedType = std::make_signed_t<UnsignedType>;
+
+  static constexpr SignedType MaxValue =
+      (UnsignedType(1) << (CHAR_BIT * sizeof(SignedType) - 1)) - 1;
+  static constexpr SignedType MinValue = -MaxValue - 1;
+
+  static constexpr UnsignedType MinValueUnsigned =
+      static_cast<UnsignedType>(MinValue);
+  static constexpr UnsignedType MaxValueUnsigned =
+      static_cast<UnsignedType>(MaxValue);
+
+  MOZ_NO_SANITIZE_UNSIGNED_OVERFLOW
+  MOZ_NO_SANITIZE_SIGNED_OVERFLOW static constexpr SignedType compute(
+      UnsignedType aValue) {
+    return (aValue <= MaxValueUnsigned)
+               ? static_cast<SignedType>(aValue)
+               : static_cast<SignedType>(aValue - MinValueUnsigned) + MinValue;
+  }
+};
+
+}  
+
+template <typename UnsignedType>
+constexpr typename detail::WrapToSignedHelper<UnsignedType>::SignedType
+WrapToSigned(UnsignedType aValue) {
+  return detail::WrapToSignedHelper<UnsignedType>::compute(aValue);
+}
+
+namespace detail {
+
+template <typename T>
+constexpr T ToResult(std::make_unsigned_t<T> aUnsigned) {
+  return std::is_signed_v<T> ? WrapToSigned(aUnsigned) : aUnsigned;
+}
+
+template <typename T>
+struct WrappingAddHelper {
+ private:
+  using UnsignedT = std::make_unsigned_t<T>;
+
+ public:
+  MOZ_NO_SANITIZE_UNSIGNED_OVERFLOW
+  static constexpr T compute(T aX, T aY) {
+    return ToResult<T>(static_cast<UnsignedT>(aX) + static_cast<UnsignedT>(aY));
+  }
+};
+
+}  
+
+template <typename T>
+constexpr T WrappingAdd(T aX, T aY) {
+  return detail::WrappingAddHelper<T>::compute(aX, aY);
+}
+
+namespace detail {
+
+template <typename T>
+struct WrappingSubtractHelper {
+ private:
+  using UnsignedT = std::make_unsigned_t<T>;
+
+ public:
+  MOZ_NO_SANITIZE_UNSIGNED_OVERFLOW
+  static constexpr T compute(T aX, T aY) {
+    return ToResult<T>(static_cast<UnsignedT>(aX) - static_cast<UnsignedT>(aY));
+  }
+};
+
+}  
+
+template <typename T>
+constexpr T WrappingSubtract(T aX, T aY) {
+  return detail::WrappingSubtractHelper<T>::compute(aX, aY);
+}
+
+namespace detail {
+
+template <typename T>
+struct WrappingMultiplyHelper {
+ private:
+  using UnsignedT = std::make_unsigned_t<T>;
+
+ public:
+  MOZ_NO_SANITIZE_UNSIGNED_OVERFLOW
+  static constexpr T compute(T aX, T aY) {
+    return ToResult<T>(static_cast<UnsignedT>(1U * static_cast<UnsignedT>(aX) *
+                                              static_cast<UnsignedT>(aY)));
+  }
+};
+
+}  
+
+template <typename T>
+constexpr T WrappingMultiply(T aX, T aY) {
+  return detail::WrappingMultiplyHelper<T>::compute(aX, aY);
+}
+
+} 
+
+#endif /* mozilla_WrappingOperations_h */

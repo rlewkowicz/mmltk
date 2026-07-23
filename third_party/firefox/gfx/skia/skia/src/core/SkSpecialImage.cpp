@@ -1,0 +1,161 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file
+ */
+
+#include "src/core/SkSpecialImage.h"
+
+#include "include/core/SkBitmap.h"
+#include "include/core/SkCanvas.h"
+#include "include/core/SkImage.h"
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkShader.h"
+#include "include/private/base/SkAssert.h"
+#include "src/core/SkNextID.h"
+#include "src/image/SkImage_Base.h"
+#include "src/shaders/SkImageShader.h"
+
+SkSpecialImage::SkSpecialImage(const SkIRect& subset,
+                               uint32_t uniqueID,
+                               const SkColorInfo& colorInfo,
+                               const SkSurfaceProps& props)
+    : fSubset(subset)
+    , fUniqueID(kNeedNewImageUniqueID_SpecialImage == uniqueID ? SkNextID::ImageID() : uniqueID)
+    , fColorInfo(colorInfo)
+    , fProps(props) {
+}
+
+void SkSpecialImage::draw(SkCanvas* canvas,
+                          SkScalar x, SkScalar y,
+                          const SkSamplingOptions& sampling,
+                          const SkPaint* paint, bool strict) const {
+    SkRect dst = SkRect::MakeXYWH(x, y, this->subset().width(), this->subset().height());
+
+    canvas->drawImageRect(this->asImage(), SkRect::Make(this->subset()), dst,
+                          sampling, paint, strict ? SkCanvas::kStrict_SrcRectConstraint
+                                                  : SkCanvas::kFast_SrcRectConstraint);
+}
+
+sk_sp<SkShader> SkSpecialImage::asShader(SkTileMode tileMode,
+                                         const SkSamplingOptions& sampling,
+                                         const SkMatrix& lm,
+                                         bool strict) const {
+    SkMatrix subsetOrigin = SkMatrix::Translate(-this->subset().topLeft());
+    subsetOrigin.postConcat(lm);
+
+    if (strict) {
+        const SkRect subset = SkRect::Make(this->subset());
+
+        return SkImageShader::MakeSubset(
+                this->asImage(), subset, tileMode, tileMode, sampling, &subsetOrigin);
+    } else {
+        return this->asImage()->makeShader(tileMode, tileMode, sampling, subsetOrigin);
+    }
+}
+
+class SkSpecialImage_Raster final : public SkSpecialImage {
+public:
+    SkSpecialImage_Raster(const SkIRect& subset, const SkBitmap& bm, const SkSurfaceProps& props)
+            : SkSpecialImage(subset, bm.getGenerationID(), bm.info().colorInfo(), props)
+            , fBitmap(bm) {
+        SkASSERT(bm.pixelRef());
+        SkASSERT(fBitmap.getPixels());
+    }
+
+    bool getROPixels(SkBitmap* bm) const {
+        return fBitmap.extractSubset(bm, this->subset());
+    }
+
+    SkISize backingStoreDimensions() const override { return fBitmap.dimensions(); }
+
+    size_t getSize() const override { return fBitmap.computeByteSize(); }
+
+    sk_sp<SkImage> asImage() const override { return fBitmap.asImage(); }
+
+    sk_sp<SkSpecialImage> onMakeBackingStoreSubset(const SkIRect& subset) const override {
+        return SkSpecialImages::MakeFromRaster(subset, fBitmap, this->props());
+    }
+
+    sk_sp<SkShader> asShader(SkTileMode tileMode,
+                             const SkSamplingOptions& sampling,
+                             const SkMatrix& lm,
+                             bool strict) const override {
+        if (strict) {
+            SkBitmap subsetBM;
+            if (!this->getROPixels(&subsetBM)) {
+                return nullptr;
+            }
+            return subsetBM.makeShader(tileMode, tileMode, sampling, lm);
+        } else {
+            SkMatrix subsetOrigin = SkMatrix::Translate(-this->subset().topLeft());
+            subsetOrigin.postConcat(lm);
+            return fBitmap.makeShader(tileMode, tileMode, sampling, subsetOrigin);
+        }
+    }
+
+private:
+    SkBitmap fBitmap;
+};
+
+namespace SkSpecialImages {
+
+sk_sp<SkSpecialImage> MakeFromRaster(const SkIRect& subset,
+                                     const SkBitmap& bm,
+                                     const SkSurfaceProps& props) {
+    SkASSERT(bm.bounds().contains(subset));
+
+    if (!bm.pixelRef()) {
+        return nullptr;
+    }
+    return sk_make_sp<SkSpecialImage_Raster>(subset, bm, props);
+}
+
+sk_sp<SkSpecialImage> CopyFromRaster(const SkIRect& subset,
+                                     const SkBitmap& bm,
+                                     const SkSurfaceProps& props) {
+    SkASSERT(bm.bounds().contains(subset));
+
+    if (!bm.pixelRef()) {
+        return nullptr;
+    }
+    SkBitmap tmp;
+    SkImageInfo info = bm.info().makeDimensions(subset.size());
+    if (!tmp.tryAllocPixels(info)) {
+        return nullptr;
+    }
+    if (!bm.readPixels(tmp.info(), tmp.getPixels(), tmp.rowBytes(), subset.x(), subset.y())) {
+        return nullptr;
+    }
+    return sk_make_sp<SkSpecialImage_Raster>(
+            SkIRect::MakeWH(subset.width(), subset.height()), tmp, props);
+}
+
+sk_sp<SkSpecialImage> MakeFromRaster(const SkIRect& subset,
+                                     sk_sp<SkImage> image,
+                                     const SkSurfaceProps& props) {
+    if (!image || subset.isEmpty()) {
+        return nullptr;
+    }
+
+    SkASSERT(image->bounds().contains(subset));
+    SkASSERT(!image->isTextureBacked());
+
+    SkBitmap bm;
+    if (as_IB(image)->getROPixels(nullptr, &bm)) {
+        return MakeFromRaster(subset, bm, props);
+    }
+    return nullptr;
+}
+
+bool AsBitmap(const SkSpecialImage* img, SkBitmap* result) {
+    if (!img || img->isGaneshBacked() || img->isGraphiteBacked()) {
+        return false;
+    }
+    auto rasterImg = static_cast<const SkSpecialImage_Raster*>(img);
+    return rasterImg->getROPixels(result);
+}
+
+}  

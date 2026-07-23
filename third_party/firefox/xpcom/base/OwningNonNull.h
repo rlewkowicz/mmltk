@@ -1,0 +1,174 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_OwningNonNull_h
+#define mozilla_OwningNonNull_h
+
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionNoteChild.h"
+
+namespace mozilla {
+
+template <class T>
+class MOZ_IS_SMARTPTR_TO_REFCOUNTED OwningNonNull {
+ public:
+  using element_type = T;
+
+  OwningNonNull() = default;
+
+  MOZ_IMPLICIT OwningNonNull(T& aValue) { init(&aValue); }
+
+  template <class U>
+  MOZ_IMPLICIT OwningNonNull(already_AddRefed<U>&& aValue) {
+    init(aValue);
+  }
+
+  template <class U>
+  MOZ_IMPLICIT OwningNonNull(RefPtr<U>&& aValue) {
+    init(std::move(aValue));
+  }
+
+  template <class U>
+  MOZ_IMPLICIT OwningNonNull(const OwningNonNull<U>& aValue) {
+    init(aValue);
+  }
+
+  operator T&() const { return ref(); }
+
+  operator T*() const { return get(); }
+
+  explicit operator bool() const = delete;
+
+  T* operator->() const { return get(); }
+
+  T& operator*() const { return ref(); }
+
+  OwningNonNull<T>& operator=(T* aValue) {
+    init(aValue);
+    return *this;
+  }
+
+  OwningNonNull<T>& operator=(T& aValue) {
+    init(&aValue);
+    return *this;
+  }
+
+  template <class U>
+  OwningNonNull<T>& operator=(already_AddRefed<U>&& aValue) {
+    init(aValue);
+    return *this;
+  }
+
+  template <class U>
+  OwningNonNull<T>& operator=(RefPtr<U>&& aValue) {
+    init(std::move(aValue));
+    return *this;
+  }
+
+  template <class U>
+  OwningNonNull<T>& operator=(const OwningNonNull<U>& aValue) {
+    init(aValue);
+    return *this;
+  }
+
+  void operator=(decltype(nullptr)) = delete;
+
+  T& ref() const {
+    MOZ_ASSERT(mInited);
+    MOZ_ASSERT(mPtr, "OwningNonNull<T> was set to null");
+    return *mPtr;
+  }
+
+  T* get() const {
+    MOZ_ASSERT(mInited);
+    MOZ_ASSERT(mPtr, "OwningNonNull<T> was set to null");
+    return mPtr;
+  }
+
+  template <typename U>
+  void swap(U& aOther) {
+    mPtr.swap(aOther);
+#ifdef DEBUG
+    mInited = mPtr;
+#endif
+  }
+
+  bool isInitialized() const {
+    MOZ_ASSERT(!!mPtr == mInited, "mInited out of sync with mPtr?");
+    return mPtr;
+  }
+
+ private:
+  void unlinkForCC() {
+#ifdef DEBUG
+    mInited = false;
+#endif
+    mPtr = nullptr;
+  }
+
+  template <typename U>
+  friend void ImplCycleCollectionUnlink(OwningNonNull<U>& aField);
+
+ protected:
+  template <typename U>
+  void init(U&& aValue) {
+    mPtr = std::move(aValue);
+    MOZ_ASSERT(mPtr);
+#ifdef DEBUG
+    mInited = true;
+#endif
+  }
+
+  RefPtr<T> mPtr;
+#ifdef DEBUG
+  bool mInited = false;
+#endif
+};
+
+template <typename T>
+inline void ImplCycleCollectionUnlink(OwningNonNull<T>& aField) {
+  aField.unlinkForCC();
+}
+
+template <typename T>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback, OwningNonNull<T>& aField,
+    const char* aName, uint32_t aFlags = 0) {
+  CycleCollectionNoteChild(aCallback, aField.get(), aName, aFlags);
+}
+
+template <class T>
+std::ostream& operator<<(std::ostream& aOut, const OwningNonNull<T>& aObj) {
+  return mozilla::DebugValue(aOut, aObj.get());
+}
+
+}  
+
+template <typename T>
+struct fmt::formatter<mozilla::OwningNonNull<T>> : fmt::ostream_formatter {};
+
+template <class T>
+template <class U>
+nsCOMPtr<T>::nsCOMPtr(const mozilla::OwningNonNull<U>& aOther)
+    : nsCOMPtr(aOther.get()) {}
+
+template <class T>
+template <class U>
+nsCOMPtr<T>& nsCOMPtr<T>::operator=(const mozilla::OwningNonNull<U>& aOther) {
+  return operator=(aOther.get());
+}
+
+template <class T>
+template <class U>
+RefPtr<T>::RefPtr(const mozilla::OwningNonNull<U>& aOther)
+    : RefPtr(aOther.get()) {}
+
+template <class T>
+template <class U>
+RefPtr<T>& RefPtr<T>::operator=(const mozilla::OwningNonNull<U>& aOther) {
+  return operator=(aOther.get());
+}
+
+#endif  // mozilla_OwningNonNull_h

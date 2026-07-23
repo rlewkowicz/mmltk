@@ -1,0 +1,398 @@
+/*
+ * Copyright 2019 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkRuntimeEffect_DEFINED)
+#define SkRuntimeEffect_DEFINED
+
+#include "include/core/SkBlender.h"  // IWYU pragma: keep
+#include "include/core/SkColorFilter.h"  // IWYU pragma: keep
+#include "include/core/SkData.h"
+#include "include/core/SkFlattenable.h"
+#include "include/core/SkMatrix.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkShader.h"
+#include "include/core/SkSpan.h"
+#include "include/core/SkString.h"
+#include "include/core/SkTypes.h"
+#include "include/private/SkSLSampleUsage.h"
+#include "include/private/base/SkOnce.h"
+#include "include/private/base/SkTemplates.h"
+#include "include/private/base/SkTo.h"
+#include "include/private/base/SkTypeTraits.h"
+#include "include/sksl/SkSLDebugTrace.h"
+#include "include/sksl/SkSLVersion.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+struct SkIPoint;
+
+namespace SkSL {
+class DebugTracePriv;
+class FunctionDefinition;
+struct Program;
+enum class ProgramKind : int8_t;
+struct ProgramSettings;
+}  
+
+namespace SkSL::RP {
+class Program;
+}
+
+class SK_API SkRuntimeEffect : public SkRefCnt {
+public:
+    struct SK_API Uniform {
+        enum class Type {
+            kFloat,
+            kFloat2,
+            kFloat3,
+            kFloat4,
+            kFloat2x2,
+            kFloat3x3,
+            kFloat4x4,
+            kInt,
+            kInt2,
+            kInt3,
+            kInt4,
+        };
+
+        enum Flags {
+            kArray_Flag = 0x1,
+
+            kColor_Flag = 0x2,
+
+            kVertex_Flag = 0x4,
+
+            kFragment_Flag = 0x8,
+
+            kHalfPrecision_Flag = 0x10,
+        };
+
+        std::string_view name;
+        size_t           offset;
+        Type             type;
+        int              count;
+        uint32_t         flags;
+
+        bool isArray() const { return SkToBool(this->flags & kArray_Flag); }
+        bool isColor() const { return SkToBool(this->flags & kColor_Flag); }
+        size_t sizeInBytes() const;
+    };
+
+    enum class ChildType {
+        kShader,
+        kColorFilter,
+        kBlender,
+    };
+
+    struct Child {
+        std::string_view name;
+        ChildType        type;
+        int              index;
+    };
+
+    class Options {
+    public:
+        bool forceUnoptimized = false;
+        std::string_view fName;
+
+    private:
+        friend class SkRuntimeEffect;
+        friend class SkRuntimeEffectPriv;
+
+        bool allowPrivateAccess = false;
+        uint32_t fStableKey = 0;
+
+        SkSL::Version maxVersionAllowed = SkSL::Version::k100;
+    };
+
+    struct Result {
+        sk_sp<SkRuntimeEffect> effect;
+        SkString errorText;
+    };
+
+
+
+    static Result MakeForColorFilter(SkString sksl, const Options&);
+    static Result MakeForColorFilter(SkString sksl) {
+        return MakeForColorFilter(std::move(sksl), Options{});
+    }
+
+    static Result MakeForShader(SkString sksl, const Options&);
+    static Result MakeForShader(SkString sksl) {
+        return MakeForShader(std::move(sksl), Options{});
+    }
+
+    static Result MakeForBlender(SkString sksl, const Options&);
+    static Result MakeForBlender(SkString sksl) {
+        return MakeForBlender(std::move(sksl), Options{});
+    }
+
+    class SK_API ChildPtr {
+    public:
+        ChildPtr() = default;
+        ChildPtr(sk_sp<SkShader> s) : fChild(std::move(s)) {}
+        ChildPtr(sk_sp<SkColorFilter> cf) : fChild(std::move(cf)) {}
+        ChildPtr(sk_sp<SkBlender> b) : fChild(std::move(b)) {}
+
+        ChildPtr(sk_sp<SkFlattenable> f);
+
+        std::optional<ChildType> type() const;
+
+        SkShader* shader() const;
+        SkColorFilter* colorFilter() const;
+        SkBlender* blender() const;
+        SkFlattenable* flattenable() const { return fChild.get(); }
+
+        using sk_is_trivially_relocatable = std::true_type;
+
+    private:
+        sk_sp<SkFlattenable> fChild;
+
+        static_assert(::sk_is_trivially_relocatable<decltype(fChild)>::value);
+    };
+
+    sk_sp<SkShader> makeShader(sk_sp<const SkData> uniforms,
+                               sk_sp<SkShader> children[],
+                               size_t childCount,
+                               const SkMatrix* localMatrix = nullptr) const;
+    sk_sp<SkShader> makeShader(sk_sp<const SkData> uniforms,
+                               SkSpan<const ChildPtr> children,
+                               const SkMatrix* localMatrix = nullptr) const;
+
+    sk_sp<SkColorFilter> makeColorFilter(sk_sp<const SkData> uniforms) const;
+    sk_sp<SkColorFilter> makeColorFilter(sk_sp<const SkData> uniforms,
+                                         sk_sp<SkColorFilter> children[],
+                                         size_t childCount) const;
+    sk_sp<SkColorFilter> makeColorFilter(sk_sp<const SkData> uniforms,
+                                         SkSpan<const ChildPtr> children) const;
+
+    sk_sp<SkBlender> makeBlender(sk_sp<const SkData> uniforms,
+                                 SkSpan<const ChildPtr> children = {}) const;
+
+    struct TracedShader {
+        sk_sp<SkShader> shader;
+        sk_sp<SkSL::DebugTrace> debugTrace;
+    };
+    static TracedShader MakeTraced(sk_sp<SkShader> shader, const SkIPoint& traceCoord);
+
+    const std::string& source() const;
+
+    size_t uniformSize() const;
+
+    SkSpan<const Uniform> uniforms() const { return SkSpan(fUniforms); }
+    SkSpan<const Child> children() const { return SkSpan(fChildren); }
+
+    const Uniform* findUniform(std::string_view name) const;
+
+    const Child* findChild(std::string_view name) const;
+
+    bool allowShader()        const { return (fFlags & kAllowShader_Flag);        }
+    bool allowColorFilter()   const { return (fFlags & kAllowColorFilter_Flag);   }
+    bool allowBlender()       const { return (fFlags & kAllowBlender_Flag);       }
+
+    static void RegisterFlattenables();
+    ~SkRuntimeEffect() override;
+
+private:
+    enum Flags {
+        kUsesSampleCoords_Flag    = 0x001,
+        kAllowColorFilter_Flag    = 0x002,
+        kAllowShader_Flag         = 0x004,
+        kAllowBlender_Flag        = 0x008,
+        kSamplesOutsideMain_Flag  = 0x010,
+        kUsesColorTransform_Flag  = 0x020,
+        kAlwaysOpaque_Flag        = 0x040,
+        kAlphaUnchanged_Flag      = 0x080,
+        kDisableOptimization_Flag = 0x100,
+    };
+
+    SkRuntimeEffect(std::unique_ptr<SkSL::Program> baseProgram,
+                    const Options& options,
+                    const SkSL::FunctionDefinition& main,
+                    std::vector<Uniform>&& uniforms,
+                    std::vector<Child>&& children,
+                    std::vector<SkSL::SampleUsage>&& sampleUsages,
+                    uint32_t flags);
+
+    sk_sp<SkRuntimeEffect> makeUnoptimizedClone();
+
+    static Result MakeFromSource(SkString sksl, const Options& options, SkSL::ProgramKind kind);
+
+    static Result MakeInternal(std::unique_ptr<SkSL::Program> program,
+                               const Options& options,
+                               SkSL::ProgramKind kind);
+
+    static SkSL::ProgramSettings MakeSettings(const Options& options);
+
+    uint32_t hash() const { return fHash; }
+    bool usesSampleCoords()   const { return (fFlags & kUsesSampleCoords_Flag);   }
+    bool samplesOutsideMain() const { return (fFlags & kSamplesOutsideMain_Flag); }
+    bool usesColorTransform() const { return (fFlags & kUsesColorTransform_Flag); }
+    bool alwaysOpaque()       const { return (fFlags & kAlwaysOpaque_Flag);       }
+    bool isAlphaUnchanged()   const { return (fFlags & kAlphaUnchanged_Flag);     }
+
+    const SkSL::RP::Program* getRPProgram(SkSL::DebugTracePriv* debugTrace) const;
+
+    friend class GrSkSLFP;              
+    friend class SkRuntimeShader;       
+    friend class SkRuntimeBlender;      
+    friend class SkRuntimeColorFilter;  
+
+    friend class SkRuntimeEffectPriv;
+
+    uint32_t fHash;
+    uint32_t fStableKey = 0;
+    SkString fName;
+
+    std::unique_ptr<const SkSL::Program> fBaseProgram;
+    std::unique_ptr<const SkSL::RP::Program> fRPProgram;
+    mutable SkOnce fCompileRPProgramOnce;
+    const SkSL::FunctionDefinition& fMain;
+    std::vector<Uniform> fUniforms;
+    std::vector<Child> fChildren;
+    std::vector<SkSL::SampleUsage> fSampleUsages;
+
+    uint32_t fFlags;  
+};
+
+class SK_API SkRuntimeEffectBuilder {
+public:
+    explicit SkRuntimeEffectBuilder(sk_sp<SkRuntimeEffect> effect)
+            : fEffect(std::move(effect))
+            , fUniforms(SkData::MakeZeroInitialized(fEffect->uniformSize()))
+            , fChildren(fEffect->children().size()) {}
+    explicit SkRuntimeEffectBuilder(sk_sp<SkRuntimeEffect> effect, sk_sp<SkData> uniforms)
+            : fEffect(std::move(effect))
+            , fUniforms(std::move(uniforms))
+            , fChildren(fEffect->children().size()) {}
+
+    SkRuntimeEffectBuilder(const SkRuntimeEffectBuilder&) = default;
+
+    struct BuilderUniform {
+        template <typename T>
+        std::enable_if_t<std::is_trivially_copyable<T>::value, BuilderUniform&> operator=(
+                const T& val) {
+            if (!fVar) {
+                SkDEBUGFAIL("Assigning to missing variable");
+            } else if (sizeof(val) != fVar->sizeInBytes()) {
+                SkDEBUGFAIL("Incorrect value size");
+            } else {
+                memcpy(SkTAddOffset<void>(fOwner->writableUniformData(), fVar->offset),
+                       &val, sizeof(val));
+            }
+            return *this;
+        }
+
+        BuilderUniform& operator=(const SkMatrix& val) {
+            if (!fVar) {
+                SkDEBUGFAIL("Assigning to missing variable");
+            } else if (fVar->sizeInBytes() != 9 * sizeof(float)) {
+                SkDEBUGFAIL("Incorrect value size");
+            } else {
+                float* data = SkTAddOffset<float>(fOwner->writableUniformData(),
+                                                  (ptrdiff_t)fVar->offset);
+                data[0] = val.get(0); data[1] = val.get(3); data[2] = val.get(6);
+                data[3] = val.get(1); data[4] = val.get(4); data[5] = val.get(7);
+                data[6] = val.get(2); data[7] = val.get(5); data[8] = val.get(8);
+            }
+            return *this;
+        }
+
+        template <typename T>
+        bool set(const T val[], const int count) {
+            static_assert(std::is_trivially_copyable<T>::value, "Value must be trivial copyable");
+            if (!fVar) {
+                SkDEBUGFAIL("Assigning to missing variable");
+                return false;
+            } else if (sizeof(T) * count != fVar->sizeInBytes()) {
+                SkDEBUGFAIL("Incorrect value size");
+                return false;
+            } else {
+                memcpy(SkTAddOffset<void>(fOwner->writableUniformData(), fVar->offset),
+                       val, sizeof(T) * count);
+            }
+            return true;
+        }
+
+        SkRuntimeEffectBuilder*         fOwner;
+        const SkRuntimeEffect::Uniform* fVar;    
+    };
+
+    struct BuilderChild {
+        template <typename T> BuilderChild& operator=(sk_sp<T> val) {
+            if (!fChild) {
+                SkDEBUGFAIL("Assigning to missing child");
+            } else {
+                fOwner->fChildren[(size_t)fChild->index] =
+                        SkRuntimeEffect::ChildPtr(std::move(val));
+            }
+            return *this;
+        }
+
+        BuilderChild& operator=(std::nullptr_t) {
+            if (!fChild) {
+                SkDEBUGFAIL("Assigning to missing child");
+            } else {
+                fOwner->fChildren[(size_t)fChild->index] = SkRuntimeEffect::ChildPtr{};
+            }
+            return *this;
+        }
+
+        SkRuntimeEffectBuilder*       fOwner;
+        const SkRuntimeEffect::Child* fChild;  
+    };
+
+    const SkRuntimeEffect* effect() const { return fEffect.get(); }
+
+    BuilderUniform uniform(std::string_view name) { return { this, fEffect->findUniform(name) }; }
+    BuilderChild child(std::string_view name) { return { this, fEffect->findChild(name) }; }
+
+    sk_sp<const SkData> uniforms() const { return fUniforms; }
+    SkSpan<const SkRuntimeEffect::ChildPtr> children() const { return fChildren; }
+
+    sk_sp<SkShader> makeShader(const SkMatrix* localMatrix = nullptr) const;
+    sk_sp<SkColorFilter> makeColorFilter() const;
+    sk_sp<SkBlender> makeBlender() const;
+
+    ~SkRuntimeEffectBuilder() = default;
+
+protected:
+    SkRuntimeEffectBuilder() = delete;
+
+    SkRuntimeEffectBuilder(SkRuntimeEffectBuilder&&) = default;
+
+    SkRuntimeEffectBuilder& operator=(SkRuntimeEffectBuilder&&) = delete;
+    SkRuntimeEffectBuilder& operator=(const SkRuntimeEffectBuilder&) = delete;
+
+private:
+    void* writableUniformData() {
+        if (!fUniforms->unique()) {
+            fUniforms = SkData::MakeWithCopy(fUniforms->data(), fUniforms->size());
+        }
+        return fUniforms->writable_data();
+    }
+
+    sk_sp<SkRuntimeEffect>                 fEffect;
+    sk_sp<SkData>                          fUniforms;
+    std::vector<SkRuntimeEffect::ChildPtr> fChildren;
+
+    friend class SkRuntimeImageFilter;
+};
+
+using SkRuntimeShaderBuilder = SkRuntimeEffectBuilder;
+using SkRuntimeColorFilterBuilder = SkRuntimeEffectBuilder;
+using SkRuntimeBlendBuilder = SkRuntimeEffectBuilder;
+
+#endif

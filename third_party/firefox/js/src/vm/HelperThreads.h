@@ -1,0 +1,244 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef vm_HelperThreads_h
+#define vm_HelperThreads_h
+
+#include "mozilla/Variant.h"
+
+#include "js/AllocPolicy.h"
+#include "js/HelperThreadAPI.h"
+#include "js/shadow/Zone.h"
+#include "js/UniquePtr.h"
+#include "js/Vector.h"
+#include "threading/LockGuard.h"
+#include "threading/Mutex.h"
+#include "wasm/WasmConstants.h"
+
+namespace mozilla {
+union Utf8Unit;
+}
+
+namespace JS {
+class JS_PUBLIC_API ReadOnlyCompileOptions;
+class JS_PUBLIC_API ReadOnlyDecodeOptions;
+class Zone;
+
+template <typename UnitT>
+class SourceText;
+}  
+
+namespace js {
+
+class AutoLockHelperThreadState;
+struct PromiseHelperTask;
+
+namespace frontend {
+struct InitialStencilAndDelazifications;
+}
+
+namespace gc {
+class GCRuntime;
+}
+
+namespace jit {
+class BaselineCompileTask;
+class IonCompileTask;
+class IonFreeTask;
+class JitRuntime;
+using IonFreeCompileTasks = Vector<IonCompileTask*, 8, SystemAllocPolicy>;
+}  
+
+namespace wasm {
+struct CompileTask;
+struct CompileTaskState;
+struct CompleteTier2GeneratorTask;
+using UniqueCompleteTier2GeneratorTask = UniquePtr<CompleteTier2GeneratorTask>;
+struct PartialTier2CompileTask;
+using UniquePartialTier2CompileTask = UniquePtr<PartialTier2CompileTask>;
+}  
+
+extern Mutex gHelperThreadLock MOZ_UNANNOTATED;
+
+class AutoHelperTaskQueue {
+ public:
+  ~AutoHelperTaskQueue() { dispatchQueuedTasks(); }
+  bool hasQueuedTasks() const { return !tasksToDispatch.empty(); }
+  void queueTaskToDispatch(JS::HelperThreadTask* task) const;
+  void dispatchQueuedTasks();
+
+ private:
+  mutable Vector<JS::HelperThreadTask*, 1, SystemAllocPolicy> tasksToDispatch;
+};
+
+class MOZ_RAII AutoLockHelperThreadState
+    : public AutoHelperTaskQueue,  
+      public LockGuard<Mutex> {
+ public:
+  AutoLockHelperThreadState() : LockGuard<Mutex>(gHelperThreadLock) {}
+  AutoLockHelperThreadState(const AutoLockHelperThreadState&) = delete;
+
+ private:
+  friend class UnlockGuard<AutoLockHelperThreadState>;
+  void unlock() {
+    LockGuard<Mutex>::unlock();
+    dispatchQueuedTasks();
+  }
+
+  friend class GlobalHelperThreadState;
+};
+
+using AutoUnlockHelperThreadState = UnlockGuard<AutoLockHelperThreadState>;
+
+bool CreateHelperThreadsState();
+
+void DestroyHelperThreadsState();
+
+bool EnsureHelperThreadsInitialized();
+
+size_t GetHelperThreadCount();
+size_t GetHelperThreadCPUCount();
+size_t GetMaxWasmCompilationThreads();
+
+bool SetFakeCPUCount(size_t count);
+
+bool StartOffThreadWasmCompile(wasm::CompileTask* task,
+                               wasm::CompileState state);
+
+size_t RemovePendingWasmCompileTasks(const wasm::CompileTaskState& taskState,
+                                     wasm::CompileState state,
+                                     const AutoLockHelperThreadState& lock);
+
+void StartOffThreadWasmCompleteTier2Generator(
+    wasm::UniqueCompleteTier2GeneratorTask task);
+
+void StartOffThreadWasmPartialTier2Compile(
+    wasm::UniquePartialTier2CompileTask task);
+
+void CancelOffThreadWasmCompleteTier2Generator();
+
+void CancelOffThreadWasmPartialTier2Compile();
+
+bool StartOffThreadPromiseHelperTask(JSContext* cx,
+                                     UniquePtr<PromiseHelperTask> task);
+
+bool StartOffThreadPromiseHelperTask(PromiseHelperTask* task);
+
+bool StartOffThreadBaselineCompile(jit::BaselineCompileTask* task,
+                                   const AutoLockHelperThreadState& lock);
+
+void FinishOffThreadBaselineCompile(jit::BaselineCompileTask* task,
+                                    const AutoLockHelperThreadState& lock);
+
+bool StartOffThreadIonCompile(jit::IonCompileTask* task,
+                              const AutoLockHelperThreadState& lock);
+
+void FinishOffThreadIonCompile(jit::IonCompileTask* task,
+                               const AutoLockHelperThreadState& lock);
+
+class MOZ_RAII AutoStartIonFreeTask {
+  jit::JitRuntime* jitRuntime_;
+
+  bool force_;
+
+ public:
+  explicit AutoStartIonFreeTask(jit::JitRuntime* jitRuntime, bool force = false)
+      : jitRuntime_(jitRuntime), force_(force) {}
+  ~AutoStartIonFreeTask();
+
+  [[nodiscard]] bool addIonCompileToFreeTaskBatch(jit::IonCompileTask* task);
+};
+
+struct ZonesInState {
+  JSRuntime* runtime;
+  JS::shadow::Zone::GCState state;
+};
+
+using CompilationSelector =
+    mozilla::Variant<JSScript*, JS::Zone*, ZonesInState, JSRuntime*>;
+
+void CancelOffThreadIonCompile(const CompilationSelector& selector);
+
+inline void CancelOffThreadIonCompile(JSScript* script) {
+  CancelOffThreadIonCompile(CompilationSelector(script));
+}
+
+inline void CancelOffThreadIonCompile(JS::Zone* zone) {
+  CancelOffThreadIonCompile(CompilationSelector(zone));
+}
+
+inline void CancelOffThreadIonCompile(JSRuntime* runtime,
+                                      JS::shadow::Zone::GCState state) {
+  CancelOffThreadIonCompile(CompilationSelector(ZonesInState{runtime, state}));
+}
+
+inline void CancelOffThreadIonCompile(JSRuntime* runtime) {
+  CancelOffThreadIonCompile(CompilationSelector(runtime));
+}
+
+#ifdef DEBUG
+bool HasOffThreadIonCompile(JS::Zone* zone);
+#endif
+
+void CancelOffThreadBaselineCompile(const CompilationSelector& selector);
+
+inline void CancelOffThreadBaselineCompile(JSScript* script) {
+  CancelOffThreadBaselineCompile(CompilationSelector(script));
+}
+
+inline void CancelOffThreadBaselineCompile(JS::Zone* zone) {
+  CancelOffThreadBaselineCompile(CompilationSelector(zone));
+}
+
+inline void CancelOffThreadBaselineCompile(JSRuntime* runtime,
+                                           JS::shadow::Zone::GCState state) {
+  CancelOffThreadBaselineCompile(
+      CompilationSelector(ZonesInState{runtime, state}));
+}
+
+inline void CancelOffThreadBaselineCompile(JSRuntime* runtime) {
+  CancelOffThreadBaselineCompile(CompilationSelector(runtime));
+}
+
+inline void CancelOffThreadCompile(JSRuntime* runtime,
+                                   JS::shadow::Zone::GCState state) {
+  CancelOffThreadBaselineCompile(
+      CompilationSelector(ZonesInState{runtime, state}));
+  CancelOffThreadIonCompile(CompilationSelector(ZonesInState{runtime, state}));
+}
+
+inline void CancelOffThreadCompile(JSRuntime* runtime) {
+  CancelOffThreadBaselineCompile(runtime);
+  CancelOffThreadIonCompile(runtime);
+}
+
+void CancelOffThreadDelazify(JSRuntime* runtime);
+
+void WaitForAllDelazifyTasks(JSRuntime* rt);
+
+void StartOffThreadDelazification(
+    JSContext* maybeCx, const JS::ReadOnlyCompileOptions& options,
+    frontend::InitialStencilAndDelazifications* stencils);
+
+void WaitForAllHelperThreads();
+void WaitForAllHelperThreads(AutoLockHelperThreadState& lock);
+
+void StartOffThreadCompressionsOnGC(JSRuntime* rt, bool isShrinkingGC);
+
+void CancelOffThreadCompressions(JSRuntime* runtime);
+
+void AttachFinishedCompressions(JSRuntime* runtime,
+                                AutoLockHelperThreadState& lock);
+
+void RunPendingSourceCompressions(JSRuntime* runtime);
+
+bool IsOffThreadSourceCompressionEnabled();
+
+void AttachFinishedBaselineCompilations(JSContext* cx,
+                                        AutoLockHelperThreadState& lock);
+
+}  
+
+#endif /* vm_HelperThreads_h */

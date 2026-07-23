@@ -1,0 +1,611 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkTHash_DEFINED)
+#define SkTHash_DEFINED
+
+#include "include/core/SkTypes.h"
+#include "src/base/SkMathPriv.h"
+#include "src/core/SkChecksum.h"
+
+#include <initializer_list>
+#include <memory>
+#include <new>
+#include <type_traits>
+#include <utility>
+
+namespace skia_private {
+
+
+template <typename T, typename K, typename Traits = T>
+class THashTable {
+public:
+    THashTable()  = default;
+    ~THashTable() = default;
+
+    THashTable(const THashTable&  that) { *this = that; }
+    THashTable(      THashTable&& that) { *this = std::move(that); }
+
+    THashTable& operator=(const THashTable& that) {
+        if (this != &that) {
+            fCount     = that.fCount;
+            fCapacity  = that.fCapacity;
+            fSlots.reset(new Slot[that.fCapacity]);
+            for (int i = 0; i < fCapacity; i++) {
+                fSlots[i] = that.fSlots[i];
+            }
+        }
+        return *this;
+    }
+
+    THashTable& operator=(THashTable&& that) {
+        if (this != &that) {
+            fCount    = that.fCount;
+            fCapacity = that.fCapacity;
+            fSlots    = std::move(that.fSlots);
+
+            that.fCount = that.fCapacity = 0;
+        }
+        return *this;
+    }
+
+    void reset() { *this = THashTable(); }
+
+    int count() const { return fCount; }
+
+    int capacity() const { return fCapacity; }
+
+    size_t approxBytesUsed() const { return fCapacity * sizeof(Slot); }
+
+    void swap(THashTable& that) {
+        std::swap(fCount, that.fCount);
+        std::swap(fCapacity, that.fCapacity);
+        std::swap(fSlots, that.fSlots);
+    }
+
+    void swap(THashTable&& that) {
+        *this = std::move(that);
+    }
+
+
+
+    T* set(T val) {
+        bool shouldGrow = false;
+        if constexpr (HasShouldGrow<Traits>::value) {
+            shouldGrow = Traits::ShouldGrow(fCount, fCapacity);
+        } else {
+            shouldGrow = (4 * fCount >= 3 * fCapacity);
+        }
+        if (shouldGrow) {
+            this->resize(fCapacity > 0 ? fCapacity * 2 : 4);
+        }
+        return this->uncheckedSet(std::move(val));
+    }
+
+    T* find(const K& key) const {
+        uint32_t hash = Hash(key);
+        int index = hash & (fCapacity-1);
+        for (int n = 0; n < fCapacity; n++) {
+            Slot& s = fSlots[index];
+            if (s.empty()) {
+                return nullptr;
+            }
+            if (hash == s.fHash && key == Traits::GetKey(*s)) {
+                return &*s;
+            }
+            index = this->next(index);
+        }
+        SkASSERT(fCapacity == fCount);
+        return nullptr;
+    }
+
+    T findOrNull(const K& key) const {
+        if (T* p = this->find(key)) {
+            return *p;
+        }
+        return nullptr;
+    }
+
+    bool removeIfExists(const K& key) {
+        uint32_t hash = Hash(key);
+        int index = hash & (fCapacity-1);
+        for (int n = 0; n < fCapacity; n++) {
+            Slot& s = fSlots[index];
+            if (s.empty()) {
+                return false;
+            }
+            if (hash == s.fHash && key == Traits::GetKey(*s)) {
+                this->removeSlot(index);
+                if (fCapacity > 4) {
+                    bool shouldShrink = false;
+                    if constexpr (HasShouldShrink<Traits>::value) {
+                        shouldShrink = Traits::ShouldShrink(fCount, fCapacity);
+                    } else {
+                        shouldShrink = (4 * fCount <= fCapacity);
+                    }
+                    if (shouldShrink) {
+                        this->resize(fCapacity / 2);
+                    }
+                }
+                return true;
+            }
+            index = this->next(index);
+        }
+        SkASSERT(fCapacity == fCount);
+        return false;
+    }
+
+    void remove(const K& key) {
+        SkAssertResult(this->removeIfExists(key));
+    }
+
+    void resize(int capacity) {
+        SkASSERT(capacity >= fCount);
+        SkASSERT((capacity & (capacity - 1)) == 0);
+
+        int oldCapacity = fCapacity;
+        SkDEBUGCODE(int oldCount = fCount);
+
+        fCount = 0;
+        fCapacity = capacity;
+        std::unique_ptr<Slot[]> oldSlots = std::move(fSlots);
+        fSlots.reset(new Slot[capacity]);
+
+        for (int i = 0; i < oldCapacity; i++) {
+            Slot& s = oldSlots[i];
+            if (s.has_value()) {
+                this->uncheckedSet(*std::move(s));
+            }
+        }
+        SkASSERT(fCount == oldCount);
+    }
+
+    void reserve(int n) {
+        int newCapacity = SkNextPow2(n);
+
+        bool shouldGrow = false;
+        if constexpr (HasShouldGrow<Traits>::value) {
+            shouldGrow = Traits::ShouldGrow(n, newCapacity);
+        } else {
+            shouldGrow = (n * 4 > newCapacity * 3);
+        }
+        if (shouldGrow) {
+            newCapacity *= 2;
+        }
+
+        if (newCapacity > fCapacity) {
+            this->resize(newCapacity);
+        }
+    }
+
+    template <typename Fn>  
+    void foreach(Fn&& fn) {
+        for (int i = 0; i < fCapacity; i++) {
+            if (fSlots[i].has_value()) {
+                fn(&*fSlots[i]);
+            }
+        }
+    }
+
+    template <typename Fn>  
+    void foreach(Fn&& fn) const {
+        for (int i = 0; i < fCapacity; i++) {
+            if (fSlots[i].has_value()) {
+                fn(*fSlots[i]);
+            }
+        }
+    }
+
+    template <typename SlotVal>
+    class Iter {
+    public:
+        using TTable = THashTable<T, K, Traits>;
+
+        Iter(const TTable* table, int slot) : fTable(table), fSlot(slot) {}
+
+        static Iter MakeBegin(const TTable* table) {
+            return Iter{table, table->firstPopulatedSlot()};
+        }
+
+        static Iter MakeEnd(const TTable* table) {
+            return Iter{table, table->capacity()};
+        }
+
+        const SlotVal& operator*() const {
+            return *fTable->slot(fSlot);
+        }
+
+        const SlotVal* operator->() const {
+            return fTable->slot(fSlot);
+        }
+
+        bool operator==(const Iter& that) const {
+            SkASSERT(fTable == that.fTable);
+            return fSlot == that.fSlot;
+        }
+
+        bool operator!=(const Iter& that) const {
+            return !(*this == that);
+        }
+
+        Iter& operator++() {
+            fSlot = fTable->nextPopulatedSlot(fSlot);
+            return *this;
+        }
+
+        Iter operator++(int) {
+            Iter old = *this;
+            this->operator++();
+            return old;
+        }
+
+    protected:
+        const TTable* fTable;
+        int fSlot;
+    };
+
+private:
+    template <typename U, typename = void> struct HasShouldGrow : std::false_type {};
+    template <typename U, typename = void> struct HasShouldShrink : std::false_type {};
+
+    template <typename U>
+    struct HasShouldGrow<
+            U,
+            std::void_t<decltype(U::ShouldGrow(std::declval<int>(), std::declval<int>()))>>
+            : std::true_type {
+        static_assert(HasShouldShrink<U>::value,
+                      "The traits class must also provide ShouldShrink() method.");
+    };
+
+    template <typename U>
+    struct HasShouldShrink<
+            U,
+            std::void_t<decltype(U::ShouldShrink(std::declval<int>(), std::declval<int>()))>>
+            : std::true_type {
+        static_assert(HasShouldGrow<U>::value,
+                      "The traits class must also provide ShouldGrow() method.");
+    };
+
+    int firstPopulatedSlot() const {
+        for (int i = 0; i < fCapacity; i++) {
+            if (fSlots[i].has_value()) {
+                return i;
+            }
+        }
+        return fCapacity;
+    }
+
+    int nextPopulatedSlot(int currentSlot) const {
+        for (int i = currentSlot + 1; i < fCapacity; i++) {
+            if (fSlots[i].has_value()) {
+                return i;
+            }
+        }
+        return fCapacity;
+    }
+
+    const T* slot(int i) const {
+        SkASSERT(fSlots[i].has_value());
+        return &*fSlots[i];
+    }
+
+    T* uncheckedSet(T&& val) {
+        const K& key = Traits::GetKey(val);
+        SkASSERT(key == key);
+        uint32_t hash = Hash(key);
+        int index = hash & (fCapacity-1);
+        for (int n = 0; n < fCapacity; n++) {
+            Slot& s = fSlots[index];
+            if (s.empty()) {
+                s.emplace(std::move(val), hash);
+                fCount++;
+                return &*s;
+            }
+            if (hash == s.fHash && key == Traits::GetKey(*s)) {
+                s.emplace(std::move(val), hash);
+                return &*s;
+            }
+
+            index = this->next(index);
+        }
+        SkASSERT(false);
+        return nullptr;
+    }
+
+    void removeSlot(int index) {
+        fCount--;
+
+        for (;;) {
+            Slot& emptySlot = fSlots[index];
+            int emptyIndex = index;
+            int originalIndex;
+            do {
+                index = this->next(index);
+                Slot& s = fSlots[index];
+                if (s.empty()) {
+                    emptySlot.reset();
+                    return;
+                }
+                originalIndex = s.fHash & (fCapacity - 1);
+            } while ((index <= originalIndex && originalIndex < emptyIndex)
+                     || (originalIndex < emptyIndex && emptyIndex < index)
+                     || (emptyIndex < index && index <= originalIndex));
+            Slot& moveFrom = fSlots[index];
+            emptySlot = std::move(moveFrom);
+        }
+    }
+
+    int next(int index) const {
+        index--;
+        if (index < 0) { index += fCapacity; }
+        return index;
+    }
+
+    static uint32_t Hash(const K& key) {
+        uint32_t hash = Traits::Hash(key) & 0xffffffff;
+        return hash ? hash : 1;  
+    }
+
+    class Slot {
+    public:
+        Slot() = default;
+        ~Slot() { this->reset(); }
+
+        Slot(const Slot& that) { *this = that; }
+        Slot& operator=(const Slot& that) {
+            if (this == &that) {
+                return *this;
+            }
+            if (fHash) {
+                if (that.fHash) {
+                    fVal.fStorage = that.fVal.fStorage;
+                    fHash = that.fHash;
+                } else {
+                    this->reset();
+                }
+            } else {
+                if (that.fHash) {
+                    new (&fVal.fStorage) T(that.fVal.fStorage);
+                    fHash = that.fHash;
+                } else {
+                }
+            }
+            return *this;
+        }
+
+        Slot(Slot&& that) { *this = std::move(that); }
+        Slot& operator=(Slot&& that) {
+            if (this == &that) {
+                return *this;
+            }
+            if (fHash) {
+                if (that.fHash) {
+                    fVal.fStorage = std::move(that.fVal.fStorage);
+                    fHash = that.fHash;
+                } else {
+                    this->reset();
+                }
+            } else {
+                if (that.fHash) {
+                    new (&fVal.fStorage) T(std::move(that.fVal.fStorage));
+                    fHash = that.fHash;
+                } else {
+                }
+            }
+            return *this;
+        }
+
+        T& operator*() & { return fVal.fStorage; }
+        const T& operator*() const& { return fVal.fStorage; }
+        T&& operator*() && { return std::move(fVal.fStorage); }
+        const T&& operator*() const&& { return std::move(fVal.fStorage); }
+
+        Slot& emplace(T&& v, uint32_t h) {
+            this->reset();
+            new (&fVal.fStorage) T(std::move(v));
+            fHash = h;
+            return *this;
+        }
+
+        bool has_value() const { return fHash != 0; }
+        explicit operator bool() const { return this->has_value(); }
+        bool empty() const { return !this->has_value(); }
+
+        void reset() {
+            if (fHash) {
+                fVal.fStorage.~T();
+                fHash = 0;
+            }
+        }
+
+        uint32_t fHash = 0;
+
+    private:
+        union Storage {
+            T fStorage;
+            Storage() {}
+            ~Storage() {}
+        } fVal;
+    };
+
+    int fCount    = 0,
+        fCapacity = 0;
+    std::unique_ptr<Slot[]> fSlots;
+};
+
+template <typename K, typename V, typename HashK = SkGoodHash>
+class THashMap {
+public:
+    THashMap() = default;
+
+    THashMap(THashMap<K, V, HashK>&& that) = default;
+    THashMap(const THashMap<K, V, HashK>& that) = default;
+
+    THashMap<K, V, HashK>& operator=(THashMap<K, V, HashK>&& that) = default;
+    THashMap<K, V, HashK>& operator=(const THashMap<K, V, HashK>& that) = default;
+
+    struct Pair : public std::pair<K, V> {
+        using std::pair<K, V>::pair;
+        static const K& GetKey(const Pair& p) { return p.first; }
+        static auto Hash(const K& key) { return HashK()(key); }
+    };
+
+    THashMap(std::initializer_list<Pair> pairs) {
+        int capacity = pairs.size() >= 4 ? SkNextPow2(pairs.size() * 4 / 3)
+                                         : 4;
+        fTable.resize(capacity);
+        for (const Pair& p : pairs) {
+            fTable.set(p);
+        }
+    }
+
+    void reset() { fTable.reset(); }
+
+    int count() const { return fTable.count(); }
+
+    bool empty() const { return fTable.count() == 0; }
+
+    size_t approxBytesUsed() const { return fTable.approxBytesUsed(); }
+
+    void reserve(int n) { fTable.reserve(n); }
+
+    void swap(THashMap& that) { fTable.swap(that.fTable); }
+    void swap(THashMap&& that) { fTable.swap(std::move(that.fTable)); }
+
+
+    V* set(K key, V val) {
+        Pair* out = fTable.set({std::move(key), std::move(val)});
+        return &out->second;
+    }
+
+    V* find(const K& key) const {
+        if (Pair* p = fTable.find(key)) {
+            return &p->second;
+        }
+        return nullptr;
+    }
+
+    V& operator[](const K& key) {
+        if (V* val = this->find(key)) {
+            return *val;
+        }
+        return *this->set(key, V{});
+    }
+
+    void remove(const K& key) {
+        fTable.remove(key);
+    }
+
+    bool removeIfExists(const K& key) {
+        return fTable.removeIfExists(key);
+    }
+
+    template <typename Fn,  
+              std::enable_if_t<std::is_invocable_v<Fn, K, V*>>* = nullptr>
+    void foreach(Fn&& fn) {
+        fTable.foreach([&fn](Pair* p) { fn(p->first, &p->second); });
+    }
+
+    template <typename Fn,  
+              std::enable_if_t<std::is_invocable_v<Fn, K, V>>* = nullptr>
+    void foreach(Fn&& fn) const {
+        fTable.foreach([&fn](const Pair& p) { fn(p.first, p.second); });
+    }
+
+    template <typename Fn,  
+              std::enable_if_t<std::is_invocable_v<Fn, Pair>>* = nullptr>
+    void foreach(Fn&& fn) const {
+        fTable.foreach([&fn](const Pair& p) { fn(p); });
+    }
+
+    using Iter = typename THashTable<Pair, K>::template Iter<std::pair<K, V>>;
+
+    Iter begin() const {
+        return Iter::MakeBegin(&fTable);
+    }
+
+    Iter end() const {
+        return Iter::MakeEnd(&fTable);
+    }
+
+private:
+    THashTable<Pair, K> fTable;
+};
+
+template <typename T, typename HashT = SkGoodHash>
+class THashSet {
+public:
+    THashSet() = default;
+
+    THashSet(THashSet<T, HashT>&& that) = default;
+    THashSet(const THashSet<T, HashT>& that) = default;
+
+    THashSet<T, HashT>& operator=(THashSet<T, HashT>&& that) = default;
+    THashSet<T, HashT>& operator=(const THashSet<T, HashT>& that) = default;
+
+    THashSet(std::initializer_list<T> vals) {
+        int capacity = vals.size() >= 4 ? SkNextPow2(vals.size() * 4 / 3)
+                                        : 4;
+        fTable.resize(capacity);
+        for (const T& val : vals) {
+            fTable.set(val);
+        }
+    }
+
+    void reset() { fTable.reset(); }
+
+    int count() const { return fTable.count(); }
+
+    bool empty() const { return fTable.count() == 0; }
+
+    size_t approxBytesUsed() const { return fTable.approxBytesUsed(); }
+
+    void reserve(int n) { fTable.reserve(n); }
+
+    void swap(THashSet& that) { fTable.swap(that.fTable); }
+    void swap(THashSet&& that) { fTable.swap(std::move(that.fTable)); }
+
+    void add(T item) { fTable.set(std::move(item)); }
+
+    bool contains(const T& item) const { return SkToBool(this->find(item)); }
+
+    const T* find(const T& item) const { return fTable.find(item); }
+
+    void remove(const T& item) {
+        SkASSERT(this->contains(item));
+        fTable.remove(item);
+    }
+
+    template <typename Fn>  
+    void foreach (Fn&& fn) const {
+        fTable.foreach(fn);
+    }
+
+private:
+    struct Traits {
+        static const T& GetKey(const T& item) { return item; }
+        static auto Hash(const T& item) { return HashT()(item); }
+    };
+
+public:
+    using Iter = typename THashTable<T, T, Traits>::template Iter<T>;
+
+    Iter begin() const {
+        return Iter::MakeBegin(&fTable);
+    }
+
+    Iter end() const {
+        return Iter::MakeEnd(&fTable);
+    }
+
+private:
+    THashTable<T, T, Traits> fTable;
+};
+
+}  
+
+#endif

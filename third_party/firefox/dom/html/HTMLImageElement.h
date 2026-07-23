@@ -1,0 +1,309 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_HTMLImageElement_h
+#define mozilla_dom_HTMLImageElement_h
+
+#include "Units.h"
+#include "mozilla/Attributes.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsGenericHTMLElement.h"
+#include "nsImageLoadingContent.h"
+
+namespace mozilla {
+class EventChainPreVisitor;
+namespace dom {
+
+class ResponsiveImageSelector;
+class HTMLImageElement final : public nsGenericHTMLElement,
+                               public nsImageLoadingContent {
+  friend class HTMLSourceElement;
+  friend class HTMLPictureElement;
+
+ public:
+  explicit HTMLImageElement(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo);
+
+  static already_AddRefed<HTMLImageElement> Image(
+      const GlobalObject& aGlobal, const Optional<uint32_t>& aWidth,
+      const Optional<uint32_t>& aHeight, ErrorResult& aError);
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(HTMLImageElement,
+                                           nsGenericHTMLElement)
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_ADDSIZEOFEXCLUDINGTHIS
+
+  bool Draggable() const override;
+
+  void MaybeRecomputeAutoSizes(bool aQueueImageTask);
+
+  ResponsiveImageSelector* GetResponsiveImageSelector() const {
+    return mResponsiveSelector.get();
+  }
+
+  bool IsInteractiveHTMLContent() const override;
+
+  void AsyncEventRunning(AsyncEventDispatcher* aEvent) override;
+
+  NS_IMPL_FROMNODE_HTML_WITH_TAG(HTMLImageElement, img)
+
+  CORSMode GetCORSMode() override;
+
+  bool ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                      const nsAString& aValue,
+                      nsIPrincipal* aMaybeScriptedPrincipal,
+                      nsAttrValue& aResult) override;
+  nsChangeHint GetAttributeChangeHint(const nsAtom* aAttribute,
+                                      AttrModType aModType) const override;
+  NS_IMETHOD_(bool) IsAttributeMapped(const nsAtom* aAttribute) const override;
+  nsMapRuleToAttributesFunc GetAttributeMappingFunction() const override;
+
+  void GetEventTargetParent(EventChainPreVisitor& aVisitor) override;
+  nsINode* GetScopeChainParent() const override;
+
+  bool IsHTMLFocusable(IsFocusableFlags, bool* aIsFocusable,
+                       int32_t* aTabIndex) override;
+
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+  void UnbindFromTree(UnbindContext&) override;
+
+  nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
+
+  void NodeInfoChanged(Document* aOldDoc) override;
+  nsresult CopyInnerTo(HTMLImageElement* aDest);
+
+  bool IsMap() { return GetBoolAttr(nsGkAtoms::ismap); }
+  void SetIsMap(bool aIsMap, ErrorResult& aError) {
+    SetHTMLBoolAttr(nsGkAtoms::ismap, aIsMap, aError);
+  }
+  MOZ_CAN_RUN_SCRIPT uint32_t Width();
+  void SetWidth(uint32_t aWidth, ErrorResult& aError) {
+    SetUnsignedIntAttr(nsGkAtoms::width, aWidth, 0, aError);
+  }
+  MOZ_CAN_RUN_SCRIPT uint32_t Height();
+  void SetHeight(uint32_t aHeight, ErrorResult& aError) {
+    SetUnsignedIntAttr(nsGkAtoms::height, aHeight, 0, aError);
+  }
+
+  uint32_t NaturalHeight() { return NaturalSize().height; }
+  uint32_t NaturalWidth() { return NaturalSize().width; }
+
+  bool Complete();
+  uint32_t Hspace() {
+    return GetDimensionAttrAsUnsignedInt(nsGkAtoms::hspace, 0);
+  }
+  void SetHspace(uint32_t aHspace, ErrorResult& aError) {
+    SetUnsignedIntAttr(nsGkAtoms::hspace, aHspace, 0, aError);
+  }
+  uint32_t Vspace() {
+    return GetDimensionAttrAsUnsignedInt(nsGkAtoms::vspace, 0);
+  }
+  void SetVspace(uint32_t aVspace, ErrorResult& aError) {
+    SetUnsignedIntAttr(nsGkAtoms::vspace, aVspace, 0, aError);
+  }
+
+  void GetAlt(nsAString& aAlt) { GetHTMLAttr(nsGkAtoms::alt, aAlt); }
+  void SetAlt(const nsAString& aAlt, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::alt, aAlt, aError);
+  }
+  void GetSrc(nsAString& aSrc) { GetURIAttr(nsGkAtoms::src, nullptr, aSrc); }
+  void SetSrc(const nsAString& aSrc, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::src, aSrc, aError);
+  }
+  void SetSrc(const nsAString& aSrc, nsIPrincipal* aTriggeringPrincipal,
+              ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::src, aSrc, aTriggeringPrincipal, aError);
+  }
+  void GetSrcset(nsAString& aSrcset) {
+    GetHTMLAttr(nsGkAtoms::srcset, aSrcset);
+  }
+  void SetSrcset(const nsAString& aSrcset, nsIPrincipal* aTriggeringPrincipal,
+                 ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::srcset, aSrcset, aTriggeringPrincipal, aError);
+  }
+  void GetCrossOrigin(nsAString& aResult) {
+    GetEnumAttr(nsGkAtoms::crossorigin, nullptr, aResult);
+  }
+  void SetCrossOrigin(const nsAString& aCrossOrigin, ErrorResult& aError) {
+    SetOrRemoveNullableStringAttr(nsGkAtoms::crossorigin, aCrossOrigin, aError);
+  }
+  void GetUseMap(nsAString& aUseMap) {
+    GetHTMLAttr(nsGkAtoms::usemap, aUseMap);
+  }
+  void SetUseMap(const nsAString& aUseMap, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::usemap, aUseMap, aError);
+  }
+  void GetName(nsAString& aName) { GetHTMLAttr(nsGkAtoms::name, aName); }
+  void SetName(const nsAString& aName, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::name, aName, aError);
+  }
+  void GetAlign(nsAString& aAlign) { GetHTMLAttr(nsGkAtoms::align, aAlign); }
+  void SetAlign(const nsAString& aAlign, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::align, aAlign, aError);
+  }
+  void GetLongDesc(nsAString& aLongDesc) {
+    GetURIAttr(nsGkAtoms::longdesc, nullptr, aLongDesc);
+  }
+  void SetLongDesc(const nsAString& aLongDesc, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::longdesc, aLongDesc, aError);
+  }
+  void GetSizes(nsAString& aSizes) { GetHTMLAttr(nsGkAtoms::sizes, aSizes); }
+  void SetSizes(const nsAString& aSizes, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::sizes, aSizes, aError);
+  }
+  void GetCurrentSrc(nsAString& aValue);
+  void GetBorder(nsAString& aBorder) {
+    GetHTMLAttr(nsGkAtoms::border, aBorder);
+  }
+  void SetBorder(const nsAString& aBorder, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::border, aBorder, aError);
+  }
+  void SetReferrerPolicy(const nsAString& aReferrer, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::referrerpolicy, aReferrer, aError);
+  }
+  void GetReferrerPolicy(nsAString& aReferrer) {
+    GetEnumAttr(nsGkAtoms::referrerpolicy, "", aReferrer);
+  }
+  void SetDecoding(const nsAString& aDecoding, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::decoding, aDecoding, aError);
+  }
+  void GetDecoding(nsAString& aValue);
+
+  void SetLoading(const nsAString& aLoading, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::loading, aLoading, aError);
+  }
+
+  bool IsAwaitingLoadOrLazyLoading() const {
+    return mLazyLoading || mPendingImageLoadTask;
+  }
+
+  bool IsLazyLoading() const { return mLazyLoading; }
+
+  already_AddRefed<Promise> Decode(ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT int32_t X();
+  MOZ_CAN_RUN_SCRIPT int32_t Y();
+  void GetLowsrc(nsAString& aLowsrc) {
+    GetURIAttr(nsGkAtoms::lowsrc, nullptr, aLowsrc);
+  }
+  void SetLowsrc(const nsAString& aLowsrc, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::lowsrc, aLowsrc, aError);
+  }
+
+  HTMLFormElement* GetFormInternal() const { return mForm; }
+  void SetForm(HTMLFormElement* aForm);
+  void ClearForm(bool aRemoveFromForm);
+
+  void DestroyContent() override;
+
+  void MediaFeatureValuesChanged();
+
+  static bool SelectSourceForTagWithAttrs(
+      Document* aDocument, bool aIsSourceTag, const nsAString& aSrcAttr,
+      const nsAString& aSrcsetAttr, const nsAString& aSizesAttr,
+      const nsAString& aTypeAttr, const nsAString& aMediaAttr,
+      nsAString& aResult);
+
+  enum class StartLoad : bool { No, Yes };
+  void StopLazyLoading(StartLoad);
+
+  const StyleLockedDeclarationBlock* GetMappedAttributesFromSource() const;
+
+  FetchPriority GetFetchPriorityForImage() const override;
+
+  bool AllowsAutoSizes() const;
+
+ protected:
+  virtual ~HTMLImageElement();
+
+  void UpdateSourceSyncAndQueueImageTask(
+      bool aAlwaysLoad, bool aNotify,
+      const HTMLSourceElement* aSkippedSource = nullptr);
+
+  bool HaveSrcsetOrInPicture() const;
+
+  bool SelectedSourceMatchesLast(nsIURI* aSelectedSource);
+
+  void LoadSelectedImage(bool aAlwaysLoad, bool aStopLazyLoading) override;
+
+  static bool SupportedPictureSourceType(const nsAString& aType);
+
+  void PictureSourceSrcsetChanged(nsIContent* aSourceNode,
+                                  const nsAString& aNewValue, bool aNotify);
+  void PictureSourceSizesChanged(nsIContent* aSourceNode,
+                                 const nsAString& aNewValue, bool aNotify);
+  void PictureSourceMediaOrTypeChanged(nsIContent* aSourceNode, bool aNotify);
+
+  void PictureSourceDimensionChanged(HTMLSourceElement* aSourceNode,
+                                     bool aNotify);
+
+  void PictureSourceAdded(bool aNotify,
+                          HTMLSourceElement* aSourceNode = nullptr);
+  void PictureSourceRemoved(bool aNotify,
+                            HTMLSourceElement* aSourceNode = nullptr);
+
+  bool UpdateResponsiveSource(
+      const HTMLSourceElement* aSkippedSource = nullptr);
+
+
+  already_AddRefed<ResponsiveImageSelector> TryCreateResponsiveSelector(
+      Element* aSourceElement);
+
+  MOZ_CAN_RUN_SCRIPT CSSIntPoint GetXY();
+  JSObject* WrapNode(JSContext*, JS::Handle<JSObject*> aGivenProto) override;
+  void UpdateFormOwner();
+
+  void BeforeSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                     const nsAttrValue* aValue, bool aNotify) override;
+
+  void AfterSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                    const nsAttrValue* aValue, const nsAttrValue* aOldValue,
+                    nsIPrincipal* aMaybeScriptedPrincipal,
+                    bool aNotify) override;
+  void OnAttrSetButNotChanged(int32_t aNamespaceID, nsAtom* aName,
+                              const nsAttrValueOrString& aValue,
+                              bool aNotify) override;
+
+  nsIContent* AsContent() override { return this; }
+
+  RefPtr<ResponsiveImageSelector> mResponsiveSelector;
+
+  HTMLFormElement* mForm = nullptr;
+
+ private:
+  bool SourceElementMatches(Element* aSourceElement);
+
+  void UpdateAutoSizeObserver();
+
+  static void MapAttributesIntoRule(MappedDeclarationsBuilder&);
+  void AfterMaybeChangeAttr(int32_t aNamespaceID, nsAtom* aName,
+                            const nsAttrValueOrString& aValue,
+                            const nsAttrValue* aOldValue,
+                            nsIPrincipal* aMaybeScriptedPrincipal,
+                            bool aNotify);
+
+  void SetLazyLoading();
+
+  bool IsInPicture() const {
+    return GetParentElement() &&
+           GetParentElement()->IsHTMLElement(nsGkAtoms::picture);
+  }
+
+  void InvalidateAttributeMapping();
+
+  void SetResponsiveSelector(RefPtr<ResponsiveImageSelector>&& aSource);
+  void SetDensity(double aDensity);
+
+  nsCOMPtr<nsIURI> mSrcURI;
+  nsCOMPtr<nsIPrincipal> mSrcTriggeringPrincipal;
+  nsCOMPtr<nsIPrincipal> mSrcsetTriggeringPrincipal;
+
+  nsCOMPtr<nsIURI> mLastSelectedSource;
+  double mCurrentDensity = 1.0;
+};
+
+}  
+}  
+
+#endif /* mozilla_dom_HTMLImageElement_h */

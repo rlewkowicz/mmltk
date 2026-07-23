@@ -1,0 +1,133 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef AudioSink_h_
+#define AudioSink_h_
+
+#include "AudibilityMonitor.h"
+#include "AudioStream.h"
+#include "MediaEventSource.h"
+#include "MediaInfo.h"
+#include "MediaQueue.h"
+#include "MediaSink.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/RefPtr.h"
+#include "nsISupportsImpl.h"
+
+namespace mozilla {
+
+class AudioConverter;
+
+class AudioSink : private AudioStream::DataSource {
+ public:
+  enum class InitializationType {
+    INITIAL,
+    UNMUTING
+  };
+  struct PlaybackParams {
+    PlaybackParams(double aVolume, double aPlaybackRate, bool aPreservesPitch)
+        : mVolume(aVolume),
+          mPlaybackRate(aPlaybackRate),
+          mPreservesPitch(aPreservesPitch) {}
+    double mVolume;
+    double mPlaybackRate;
+    bool mPreservesPitch;
+  };
+
+  AudioSink(AbstractThread* aThread, MediaQueue<AudioData>& aAudioQueue,
+            const AudioInfo& aInfo, bool aShouldResistFingerprinting);
+
+  ~AudioSink();
+
+  nsresult InitializeAudioStream(const RefPtr<AudioDeviceInfo>& aAudioDevice,
+                                 InitializationType aInitializationType);
+
+  RefPtr<MediaSink::EndedPromise> Start(const PlaybackParams& aParams,
+                                        const media::TimeUnit& aStartTime);
+
+  media::TimeUnit GetPosition();
+  media::TimeUnit GetEndTime() const;
+
+  bool HasUnplayedFrames();
+
+  media::TimeUnit UnplayedDuration() const;
+
+  void ShutDown();
+
+  void SetVolume(double aVolume);
+  void SetStreamName(const nsAString& aStreamName);
+  void SetPlaybackRate(double aPlaybackRate);
+  void SetPreservesPitch(bool aPreservesPitch);
+  void SetPlaying(bool aPlaying);
+
+  MediaEventSource<bool>& AudibleEvent() { return mAudibleEvent; }
+
+  void GetDebugInfo(dom::MediaSinkDebugInfo& aInfo);
+
+  bool AudioStreamCallbackStarted() {
+    return mAudioStream && mAudioStream->CallbackStarted();
+  }
+
+  void UpdateStartTime(const media::TimeUnit& aStartTime) {
+    mStartTime = aStartTime;
+  }
+
+ private:
+  uint32_t PopFrames(AudioDataValue* aBuffer, uint32_t aFrames,
+                     bool aAudioThreadChanged) override;
+  bool Ended() const override;
+
+  void ReenqueueUnplayedAudioDataIfNeeded();
+
+  void CheckIsAudible(const Span<AudioDataValue>& aInterleaved,
+                      size_t aChannel);
+
+  RefPtr<AudioStream> mAudioStream;
+
+  media::TimeUnit mStartTime;
+
+  media::TimeUnit mLastGoodPosition;
+
+  bool mPlaying;
+
+  Atomic<int64_t> mWritten;
+
+  Atomic<bool> mErrored;
+
+  const RefPtr<AbstractThread> mOwnerThread;
+
+  void OnAudioPopped();
+  void OnAudioPushed(const RefPtr<AudioData>& aSample);
+  void NotifyAudioNeeded();
+  uint32_t DrainConverter(uint32_t aMaxFrames = UINT32_MAX);
+  already_AddRefed<AudioData> CreateAudioFromBuffer(
+      AlignedAudioBuffer&& aBuffer, AudioData* aReference);
+  uint32_t PushProcessedAudio(AudioData* aData);
+  uint32_t AudioQueuedInRingBufferMS() const;
+  uint32_t SampleToFrame(uint32_t aSamples) const;
+  UniquePtr<AudioConverter> mConverter;
+  UniquePtr<SPSCQueue<AudioDataValue>> mProcessedSPSCQueue;
+  MediaEventListener mAudioQueueListener;
+  MediaEventListener mAudioQueueFinishListener;
+  MediaEventListener mProcessedQueueListener;
+  int64_t mFramesParsed;
+  Maybe<RefPtr<AudioData>> mLastProcessedPacket;
+  media::TimeUnit mLastEndTime;
+  uint32_t mOutputRate;
+  uint32_t mOutputChannels;
+  AudibilityMonitor mAudibilityMonitor;
+  bool mIsAudioDataAudible;
+  MediaEventProducer<bool> mAudibleEvent;
+  MediaEventProducer<void> mAudioPopped;
+
+  Atomic<bool> mProcessedQueueFinished;
+  MediaQueue<AudioData>& mAudioQueue;
+  const float mProcessedQueueThresholdMS;
+};
+
+}  
+
+#endif  // AudioSink_h_

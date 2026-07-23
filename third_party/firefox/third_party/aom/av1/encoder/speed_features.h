@@ -1,0 +1,1210 @@
+/*
+ * Copyright (c) 2016, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ */
+
+#if !defined(AOM_AV1_ENCODER_SPEED_FEATURES_H_)
+#define AOM_AV1_ENCODER_SPEED_FEATURES_H_
+
+#include "av1/common/enums.h"
+#include "av1/encoder/enc_enums.h"
+#include "av1/encoder/mcomp.h"
+#include "av1/encoder/encodemb.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+/*! @file */
+
+/*!\cond */
+#define MAX_MESH_STEP 4
+
+typedef struct MESH_PATTERN {
+  int range;
+  int interval;
+} MESH_PATTERN;
+
+enum {
+  GM_FULL_SEARCH,
+  GM_REDUCED_REF_SEARCH_SKIP_L2_L3,
+  GM_REDUCED_REF_SEARCH_SKIP_L2_L3_ARF2,
+
+  GM_SEARCH_CLOSEST_REFS_ONLY,
+
+  GM_DISABLE_SEARCH
+} UENUM1BYTE(GM_SEARCH_TYPE);
+
+enum {
+  DIST_WTD_COMP_ENABLED,
+  DIST_WTD_COMP_SKIP_MV_SEARCH,
+  DIST_WTD_COMP_DISABLED,
+} UENUM1BYTE(DIST_WTD_COMP_FLAG);
+
+enum {
+  INTRA_ALL = (1 << DC_PRED) | (1 << V_PRED) | (1 << H_PRED) | (1 << D45_PRED) |
+              (1 << D135_PRED) | (1 << D113_PRED) | (1 << D157_PRED) |
+              (1 << D203_PRED) | (1 << D67_PRED) | (1 << SMOOTH_PRED) |
+              (1 << SMOOTH_V_PRED) | (1 << SMOOTH_H_PRED) | (1 << PAETH_PRED),
+  UV_INTRA_ALL =
+      (1 << UV_DC_PRED) | (1 << UV_V_PRED) | (1 << UV_H_PRED) |
+      (1 << UV_D45_PRED) | (1 << UV_D135_PRED) | (1 << UV_D113_PRED) |
+      (1 << UV_D157_PRED) | (1 << UV_D203_PRED) | (1 << UV_D67_PRED) |
+      (1 << UV_SMOOTH_PRED) | (1 << UV_SMOOTH_V_PRED) |
+      (1 << UV_SMOOTH_H_PRED) | (1 << UV_PAETH_PRED) | (1 << UV_CFL_PRED),
+  UV_INTRA_DC = (1 << UV_DC_PRED),
+  UV_INTRA_DC_CFL = (1 << UV_DC_PRED) | (1 << UV_CFL_PRED),
+  UV_INTRA_DC_TM = (1 << UV_DC_PRED) | (1 << UV_PAETH_PRED),
+  UV_INTRA_DC_PAETH_CFL =
+      (1 << UV_DC_PRED) | (1 << UV_PAETH_PRED) | (1 << UV_CFL_PRED),
+  UV_INTRA_DC_H_V = (1 << UV_DC_PRED) | (1 << UV_V_PRED) | (1 << UV_H_PRED),
+  UV_INTRA_DC_H_V_CFL = (1 << UV_DC_PRED) | (1 << UV_V_PRED) |
+                        (1 << UV_H_PRED) | (1 << UV_CFL_PRED),
+  UV_INTRA_DC_PAETH_H_V = (1 << UV_DC_PRED) | (1 << UV_PAETH_PRED) |
+                          (1 << UV_V_PRED) | (1 << UV_H_PRED),
+  UV_INTRA_DC_PAETH_H_V_CFL = (1 << UV_DC_PRED) | (1 << UV_PAETH_PRED) |
+                              (1 << UV_V_PRED) | (1 << UV_H_PRED) |
+                              (1 << UV_CFL_PRED),
+  INTRA_DC = (1 << DC_PRED),
+  INTRA_DC_TM = (1 << DC_PRED) | (1 << PAETH_PRED),
+  INTRA_DC_H_V = (1 << DC_PRED) | (1 << V_PRED) | (1 << H_PRED),
+  INTRA_DC_H_V_SMOOTH =
+      (1 << DC_PRED) | (1 << V_PRED) | (1 << H_PRED) | (1 << SMOOTH_PRED),
+  INTRA_DC_PAETH_H_V =
+      (1 << DC_PRED) | (1 << PAETH_PRED) | (1 << V_PRED) | (1 << H_PRED)
+};
+
+enum {
+  INTER_ALL = (1 << NEARESTMV) | (1 << NEARMV) | (1 << GLOBALMV) |
+              (1 << NEWMV) | (1 << NEAREST_NEARESTMV) | (1 << NEAR_NEARMV) |
+              (1 << NEW_NEWMV) | (1 << NEAREST_NEWMV) | (1 << NEAR_NEWMV) |
+              (1 << NEW_NEARMV) | (1 << NEW_NEARESTMV) | (1 << GLOBAL_GLOBALMV),
+  INTER_NEAREST_NEAR_ZERO = (1 << NEARESTMV) | (1 << NEARMV) | (1 << GLOBALMV) |
+                            (1 << NEAREST_NEARESTMV) | (1 << GLOBAL_GLOBALMV) |
+                            (1 << NEAREST_NEWMV) | (1 << NEW_NEARESTMV) |
+                            (1 << NEW_NEARMV) | (1 << NEAR_NEWMV) |
+                            (1 << NEAR_NEARMV),
+  INTER_SINGLE_ALL =
+      (1 << NEARESTMV) | (1 << NEARMV) | (1 << GLOBALMV) | (1 << NEWMV),
+};
+
+enum {
+  DISABLE_ALL_INTER_SPLIT = (1 << THR_COMP_GA) | (1 << THR_COMP_LA) |
+                            (1 << THR_ALTR) | (1 << THR_GOLD) | (1 << THR_LAST),
+
+  DISABLE_ALL_SPLIT = (1 << THR_INTRA) | DISABLE_ALL_INTER_SPLIT,
+
+  DISABLE_COMPOUND_SPLIT = (1 << THR_COMP_GA) | (1 << THR_COMP_LA),
+
+  LAST_AND_INTRA_SPLIT_ONLY = (1 << THR_COMP_GA) | (1 << THR_COMP_LA) |
+                              (1 << THR_ALTR) | (1 << THR_GOLD)
+};
+
+enum {
+  TXFM_CODING_SF = 1,
+  INTER_PRED_SF = 2,
+  INTRA_PRED_SF = 4,
+  PARTITION_SF = 8,
+  LOOP_FILTER_SF = 16,
+  RD_SKIP_SF = 32,
+  RESERVE_2_SF = 64,
+  RESERVE_3_SF = 128,
+} UENUM1BYTE(DEV_SPEED_FEATURES);
+
+enum {
+  DISALLOW_RECODE = 0,
+  ALLOW_RECODE_KFARFGF = 1,
+  ALLOW_RECODE = 2,
+} UENUM1BYTE(RECODE_LOOP_TYPE);
+
+enum {
+  SUBPEL_TREE = 0,
+  SUBPEL_TREE_PRUNED = 1,       
+  SUBPEL_TREE_PRUNED_MORE = 2,  
+  SUBPEL_SEARCH_METHODS
+} UENUM1BYTE(SUBPEL_SEARCH_METHOD);
+
+enum {
+  LPF_PICK_FROM_FULL_IMAGE,
+  LPF_PICK_FROM_FULL_IMAGE_NON_DUAL,
+  LPF_PICK_FROM_SUBIMAGE,
+  LPF_PICK_FROM_Q,
+  LPF_PICK_MINIMAL_LPF
+} UENUM1BYTE(LPF_PICK_METHOD);
+/*!\endcond */
+
+/*!\enum CDEF_PICK_METHOD
+ * \brief This enumeration defines a variety of CDEF pick methods
+ */
+typedef enum {
+  CDEF_FULL_SEARCH,      
+  CDEF_FAST_SEARCH_LVL1, 
+  CDEF_FAST_SEARCH_LVL2, 
+  CDEF_FAST_SEARCH_LVL3, 
+  CDEF_FAST_SEARCH_LVL4, 
+  CDEF_FAST_SEARCH_LVL5, 
+  CDEF_PICK_FROM_Q,      
+  CDEF_PICK_METHODS
+} CDEF_PICK_METHOD;
+
+/*!\cond */
+enum {
+  FLAG_EARLY_TERMINATE = 1 << 0,
+
+  FLAG_SKIP_COMP_BESTINTRA = 1 << 1,
+
+  FLAG_SKIP_INTRA_BESTINTER = 1 << 3,
+
+  FLAG_SKIP_INTRA_DIRMISMATCH = 1 << 4,
+
+  FLAG_SKIP_INTRA_LOWVAR = 1 << 5,
+} UENUM1BYTE(MODE_SEARCH_SKIP_LOGIC);
+
+enum {
+  TX_TYPE_PRUNE_0 = 0,
+  TX_TYPE_PRUNE_1 = 1,
+  TX_TYPE_PRUNE_2 = 2,
+  TX_TYPE_PRUNE_3 = 3,
+  TX_TYPE_PRUNE_4 = 4,
+  TX_TYPE_PRUNE_5 = 5,
+} UENUM1BYTE(TX_TYPE_PRUNE_MODE);
+
+enum {
+  NO_DETECTION = 0,
+
+  FAST_DETECTION_MAXQ = 1,
+} UENUM1BYTE(OVERSHOOT_DETECTION_CBR);
+
+enum {
+  MULTI_WINNER_MODE_OFF = 0,
+
+  MULTI_WINNER_MODE_FAST = 1,
+
+  MULTI_WINNER_MODE_DEFAULT = 2,
+
+  MULTI_WINNER_MODE_LEVELS,
+} UENUM1BYTE(MULTI_WINNER_MODE_TYPE);
+
+enum {
+  PRUNE_NEARMV_OFF = 0,     
+  PRUNE_NEARMV_LEVEL1 = 1,  
+  PRUNE_NEARMV_LEVEL2 = 2,  
+  PRUNE_NEARMV_LEVEL3 = 3,  
+  PRUNE_NEARMV_MAX = PRUNE_NEARMV_LEVEL3,
+} UENUM1BYTE(PRUNE_NEARMV_LEVEL);
+
+enum {
+  TX_SEARCH_DEFAULT = 0,
+  TX_SEARCH_MOTION_MODE,
+  TX_SEARCH_COMP_TYPE_MODE,
+  TX_SEARCH_CASES
+} UENUM1BYTE(TX_SEARCH_CASE);
+
+typedef struct {
+  TX_TYPE_PRUNE_MODE prune_2d_txfm_mode;
+
+  int fast_intra_tx_type_search;
+
+  int fast_inter_tx_type_prob_thresh;
+
+  int use_reduced_intra_txset;
+
+  int use_skip_flag_prediction;
+
+  int ml_tx_split_thresh;
+
+  int skip_tx_search;
+
+  int prune_tx_type_using_stats;
+  int prune_tx_type_est_rd;
+
+  int winner_mode_tx_type_pruning;
+} TX_TYPE_SEARCH;
+
+enum {
+  SEARCH_PARTITION,
+
+  FIXED_PARTITION,
+
+  VAR_BASED_PARTITION,
+
+#if CONFIG_RT_ML_PARTITIONING
+  ML_BASED_PARTITION
+#endif
+} UENUM1BYTE(PARTITION_SEARCH_TYPE);
+
+enum {
+  NOT_IN_USE,
+  DIRECT_PRED,
+  RELAXED_PRED,
+  ADAPT_PRED
+} UENUM1BYTE(MAX_PART_PRED_MODE);
+
+enum {
+  LAST_MV_DATA,
+  CURRENT_Q,
+  QTR_ONLY,
+} UENUM1BYTE(MV_PREC_LOGIC);
+
+enum {
+  SUPERRES_AUTO_ALL,   
+  SUPERRES_AUTO_DUAL,  
+  SUPERRES_AUTO_SOLO,  
+} UENUM1BYTE(SUPERRES_AUTO_SEARCH_TYPE);
+/*!\endcond */
+
+/*!\enum INTERNAL_COST_UPDATE_TYPE
+ * \brief This enum decides internally how often to update the entropy costs
+ *
+ * INTERNAL_COST_UPD_TYPE is similar to \ref COST_UPDATE_TYPE but has slightly
+ * more flexibility in update frequency. This enum is separate from \ref
+ * COST_UPDATE_TYPE because although \ref COST_UPDATE_TYPE is not exposed, its
+ * values are public so it cannot be modified without breaking public API.
+ * Due to the use of AOMMIN() in populate_unified_cost_update_freq() to
+ * compute the unified cost update frequencies (out of COST_UPDATE_TYPE and
+ * INTERNAL_COST_UPDATE_TYPE), the values of this enum type must be listed in
+ * the order of increasing frequencies.
+ *
+ * \warning  In case of any updates/modifications to the enum COST_UPDATE_TYPE,
+ * update the enum INTERNAL_COST_UPDATE_TYPE as well.
+ */
+typedef enum {
+  INTERNAL_COST_UPD_OFF,       /*!< Turn off cost updates. */
+  INTERNAL_COST_UPD_TILE,      /*!< Update every tile. */
+  INTERNAL_COST_UPD_SBROW_SET, /*!< Update every row_set of height 256 pixs. */
+  INTERNAL_COST_UPD_SBROW,     /*!< Update every sb rows inside a tile. */
+  INTERNAL_COST_UPD_SB,        /*!< Update every sb. */
+} INTERNAL_COST_UPDATE_TYPE;
+
+/*!\enum SIMPLE_MOTION_SEARCH_PRUNE_LEVEL
+ * \brief This enumeration defines a variety of simple motion search based
+ * partition prune levels
+ */
+typedef enum {
+  NO_PRUNING = -1,
+  SIMPLE_AGG_LVL0,     /*!< Simple prune aggressiveness level 0. speed = 0 */
+  SIMPLE_AGG_LVL1,     /*!< Simple prune aggressiveness level 1. speed = 1 */
+  SIMPLE_AGG_LVL2,     /*!< Simple prune aggressiveness level 2. speed = 2 */
+  SIMPLE_AGG_LVL3,     /*!< Simple prune aggressiveness level 3. speed >= 3 */
+  SIMPLE_AGG_LVL4,     /*!< Simple prune aggressiveness level 4. speed >= 4 */
+  SIMPLE_AGG_LVL5,     /*!< Simple prune aggressiveness level 5. speed >= 5 */
+  QIDX_BASED_AGG_LVL1, /*!< Qindex based prune aggressiveness level, aggressive
+                          level maps to simple agg level 1 or 2 based on qindex.
+                        */
+  TOTAL_SIMPLE_AGG_LVLS = QIDX_BASED_AGG_LVL1, /*!< Total number of simple prune
+                                                  aggressiveness levels. */
+  TOTAL_QINDEX_BASED_AGG_LVLS =
+      QIDX_BASED_AGG_LVL1 -
+      SIMPLE_AGG_LVL5, /*!< Total number of qindex based simple prune
+                          aggressiveness levels. */
+  TOTAL_AGG_LVLS = TOTAL_SIMPLE_AGG_LVLS +
+                   TOTAL_QINDEX_BASED_AGG_LVLS, /*!< Total number of levels. */
+} SIMPLE_MOTION_SEARCH_PRUNE_LEVEL;
+
+/*!\enum PRUNE_MESH_SEARCH_LEVEL
+ * \brief This enumeration defines a variety of mesh search prune levels.
+ */
+typedef enum {
+  PRUNE_MESH_SEARCH_DISABLED = 0, /*!< Prune mesh search level 0. */
+  PRUNE_MESH_SEARCH_LVL_1 = 1,    /*!< Prune mesh search level 1. */
+  PRUNE_MESH_SEARCH_LVL_2 = 2,    /*!< Prune mesh search level 2. */
+} PRUNE_MESH_SEARCH_LEVEL;
+
+/*!\enum INTER_SEARCH_EARLY_TERM_IDX
+ * \brief This enumeration defines inter search early termination index in
+ * non-rd path based on sse value.
+ */
+typedef enum {
+  EARLY_TERM_DISABLED =
+      0, /*!< Early terminate inter mode search based on sse disabled. */
+  EARLY_TERM_IDX_1 =
+      1, /*!< Early terminate inter mode search based on sse, index 1. */
+  EARLY_TERM_IDX_2 =
+      2, /*!< Early terminate inter mode search based on sse, index 2. */
+  EARLY_TERM_IDX_3 =
+      3, /*!< Early terminate inter mode search based on sse, index 3. */
+  EARLY_TERM_IDX_4 =
+      4, /*!< Early terminate inter mode search based on sse, index 4. */
+  EARLY_TERM_INDICES, /*!< Total number of early terminate indices */
+} INTER_SEARCH_EARLY_TERM_IDX;
+
+/*!
+ * \brief Sequence/frame level speed vs quality features
+ */
+typedef struct HIGH_LEVEL_SPEED_FEATURES {
+  /*! Frame level coding parameter update. */
+  int frame_parameter_update;
+
+  /*!
+   * Cases and frame types for which the recode loop is enabled.
+   */
+  RECODE_LOOP_TYPE recode_loop;
+
+  /*!
+   * Controls the tolerance vs target rate used in deciding whether to
+   * recode a frame. It has no meaning if recode is disabled.
+   */
+  int recode_tolerance;
+
+  /*!
+   * Determine how motion vector precision is chosen. The possibilities are:
+   * LAST_MV_DATA: use the mv data from the last coded frame
+   * CURRENT_Q: use the current q as a threshold
+   * QTR_ONLY: use quarter pel precision only.
+   */
+  MV_PREC_LOGIC high_precision_mv_usage;
+
+  /*!
+   * Always set to 0. If on it enables 0 cost background transmission
+   * (except for the initial transmission of the segmentation). The feature is
+   * disabled because the addition of very large block sizes make the
+   * backgrounds very to cheap to encode, and the segmentation we have
+   * adds overhead.
+   */
+  int static_segmentation;
+
+  /*!
+   * Superres-auto mode search type:
+   */
+  SUPERRES_AUTO_SEARCH_TYPE superres_auto_search_type;
+
+  /*!
+   * Enable/disable extra screen content test by encoding key frame twice.
+   */
+  int disable_extra_sc_testing;
+
+  /*!
+   * Enable/disable second_alt_ref temporal filtering.
+   */
+  int second_alt_ref_filtering;
+
+  /*!
+   * The number of frames to be used during temporal filtering of an ARF frame
+   * is adjusted based on noise level of the current frame. The sf has three
+   * levels to decide number of frames to be considered for filtering:
+   * 0       : Use default number of frames
+   * 1 and 2 : Reduce the number of frames based on noise level with varied
+   * aggressiveness
+   */
+  int adjust_num_frames_for_arf_filtering;
+
+  /*!
+   * Decide the bit estimation approach used in qindex decision.
+   * 0: estimate bits based on a constant value;
+   * 1: estimate bits more accurately based on the frame complexity.
+   */
+  int accurate_bit_estimate;
+
+  /*!
+   * Decide the approach for weight calculation during temporal filtering.
+   * 0: Calculate weight using exp()
+   * 1: Calculate weight using a lookup table that approximates exp().
+   */
+  int weight_calc_level_in_tf;
+
+  /*!
+   * Decide whether to perform motion estimation at split block (i.e. 16x16)
+   * level or not.
+   * 0: Always allow motion estimation.
+   * 1: Conditionally allow motion estimation based on 4x4 sub-blocks variance.
+   */
+  int allow_sub_blk_me_in_tf;
+
+  /*!
+   * Decide whether to disable temporal mv prediction.
+   * 0: Do not disable
+   * 1: Conditionally disable
+   * 2: Always disable
+   */
+  int ref_frame_mvs_lvl;
+
+  /*!
+   *  Decide whether to enable screen detection mode 2 fast detection.
+   *  0: Regular detection
+   *  1: Fast detection
+   */
+  int screen_detection_mode2_fast_detection;
+
+  /*!
+   *  Decide whether to enable weighted chroma distortion.
+   *  0: Disable
+   *  1: Enable
+   */
+  int weighted_chroma_distortion;
+} HIGH_LEVEL_SPEED_FEATURES;
+
+/*!
+ * Speed features for the first pass.
+ */
+typedef struct FIRST_PASS_SPEED_FEATURES {
+  /*!
+   * \brief Reduces the mv search window.
+   * By default, the initial search window is around
+   * MIN(MIN(dims), MAX_FULL_PEL_VAL) = MIN(MIN(dims), 1023).
+   * Each step reduction decrease the window size by about a factor of 2.
+   */
+  int reduce_mv_step_param;
+
+  /*!
+   * \brief Skips the motion search when the zero mv has small sse.
+   */
+  int skip_motion_search_threshold;
+
+  /*!
+   * \brief Skips reconstruction by using source buffers for prediction
+   */
+  int disable_recon;
+
+  /*!
+   * \brief Skips the motion search centered on 0,0 mv.
+   */
+  int skip_zeromv_motion_search;
+} FIRST_PASS_SPEED_FEATURES;
+
+/*!\cond */
+typedef struct TPL_SPEED_FEATURES {
+  int gop_length_decision_method;
+  int prune_intra_modes;
+  int reduce_first_step_size;
+  int skip_alike_starting_mv;
+
+  SUBPEL_FORCE_STOP subpel_force_stop;
+
+  SEARCH_METHODS search_method;
+
+  int prune_starting_mv;
+
+  int prune_ref_frames_in_tpl;
+
+  int allow_compound_pred;
+
+  int use_y_only_rate_distortion;
+
+  int use_sad_for_mode_decision;
+
+  int reduce_num_frames;
+} TPL_SPEED_FEATURES;
+
+typedef struct GLOBAL_MOTION_SPEED_FEATURES {
+  GM_SEARCH_TYPE gm_search_type;
+
+  int prune_ref_frame_for_gm_search;
+
+  int prune_zero_mv_with_sse;
+
+  int disable_gm_search_based_on_stats;
+
+  int downsample_level;
+
+  int num_refinement_steps;
+
+  int gm_erroradv_tr_level;
+} GLOBAL_MOTION_SPEED_FEATURES;
+
+typedef struct PARTITION_SPEED_FEATURES {
+  PARTITION_SEARCH_TYPE partition_search_type;
+
+  BLOCK_SIZE fixed_partition_size;
+
+  int prune_ext_partition_types_search_level;
+
+  int prune_part4_search;
+
+  int ml_prune_partition;
+
+  int ml_early_term_after_part_split_level;
+
+  int less_rectangular_check_level;
+
+  BLOCK_SIZE use_square_partition_only_threshold;
+
+  MAX_PART_PRED_MODE auto_max_partition_based_on_simple_motion;
+
+  BLOCK_SIZE default_min_partition_size;
+  BLOCK_SIZE default_max_partition_size;
+
+  int adjust_var_based_rd_partitioning;
+
+  int64_t partition_search_breakout_dist_thr;
+  int partition_search_breakout_rate_thr;
+
+  float ml_partition_search_breakout_thresh[PARTITION_BLOCK_SIZES];
+
+  int ml_partition_search_breakout_model_index;
+
+  int ml_4_partition_search_level_index;
+
+  int simple_motion_search_prune_agg;
+
+  int simple_motion_search_prune_rect;
+
+  int simple_motion_search_split;
+
+  int simple_motion_search_early_term_none;
+
+  int simple_motion_search_reduce_search_steps;
+
+  BLOCK_SIZE max_intra_bsize;
+
+  int intra_cnn_based_part_prune_level;
+
+  BLOCK_SIZE ext_partition_eval_thresh;
+
+  int ext_part_eval_based_on_cur_best;
+
+  int rect_partition_eval_thresh;
+
+  int prune_ext_part_using_split_info;
+
+  int prune_rectangular_split_based_on_qidx;
+
+  bool prune_rect_part_using_4x4_var_deviation;
+
+  bool prune_rect_part_using_none_pred_mode;
+
+  int early_term_after_none_split;
+
+  int ml_predict_breakout_level;
+
+  int prune_sub_8x8_partition_level;
+
+  int simple_motion_search_rect_split;
+
+  int reuse_prev_rd_results_for_part_ab;
+
+  int reuse_best_prediction_for_part_ab;
+
+  int use_best_rd_for_pruning;
+
+  int skip_non_sq_part_based_on_none;
+
+  int disable_8x8_part_based_on_qidx;
+
+  bool prune_h_or_v_4part_using_sms_info;
+
+  int split_partition_penalty_level;
+} PARTITION_SPEED_FEATURES;
+
+typedef struct MV_SPEED_FEATURES {
+  SEARCH_METHODS search_method;
+
+  int use_bsize_dependent_search_method;
+
+  int auto_mv_step_size;
+
+  SUBPEL_SEARCH_METHOD subpel_search_method;
+
+  int subpel_iters_per_step;
+
+  SUBPEL_FORCE_STOP subpel_force_stop;
+
+  SUBPEL_FORCE_STOP simple_motion_subpel_force_stop;
+
+  SUBPEL_SEARCH_TYPE use_accurate_subpel_search;
+
+  int exhaustive_searches_thresh;
+
+  MESH_PATTERN mesh_patterns[MAX_MESH_STEP];
+
+  MESH_PATTERN intrabc_mesh_patterns[MAX_MESH_STEP];
+
+  int reduce_search_range;
+
+  PRUNE_MESH_SEARCH_LEVEL prune_mesh_search;
+
+  int use_fullpel_costlist;
+
+  int obmc_full_pixel_search_level;
+
+  int full_pixel_search_level;
+
+  int use_intrabc;
+
+  int prune_intrabc_candidate_block_hash_search;
+
+  int intrabc_search_level;
+
+  int hash_max_8x8_intrabc_blocks;
+
+  int use_downsampled_sad;
+
+  int disable_extensive_joint_motion_search;
+
+  int disable_second_mv;
+
+  int skip_fullpel_search_using_startmv_refmv;
+
+  WARP_SEARCH_METHOD warp_search_method;
+
+  int warp_search_iters;
+} MV_SPEED_FEATURES;
+
+typedef struct INTER_MODE_SPEED_FEATURES {
+  int inter_mode_rd_model_estimation;
+
+  int txfm_rd_gate_level[TX_SEARCH_CASES];
+
+  int reduce_inter_modes;
+
+  int adaptive_rd_thresh;
+
+  int prune_inter_modes_if_skippable;
+
+  int selective_ref_frame;
+
+  int prune_ref_frame_for_rect_partitions;
+
+  int alt_ref_search_fp;
+
+  int prune_single_ref;
+
+  int prune_comp_ref_frames;
+
+  int skip_newmv_in_drl;
+
+  int skip_repeated_ref_mv;
+
+  int perform_best_rd_based_gating_for_chroma;
+
+  int reuse_inter_intra_mode;
+
+  int prune_comp_type_by_model_rd;
+
+  int prune_comp_type_by_comp_avg;
+
+  int prune_comp_search_by_single_result;
+
+  int prune_mode_search_simple_translation;
+
+  int prune_compound_using_single_ref;
+
+  int prune_ext_comp_using_neighbors;
+
+  int skip_ext_comp_nearmv_mode;
+
+  int prune_comp_using_best_single_mode_ref;
+
+  int prune_nearest_near_mv_using_refmv_weight;
+
+  int prune_ref_mv_idx_search;
+
+  int disable_onesided_comp;
+
+  int prune_obmc_prob_thresh;
+
+  int prune_warped_prob_thresh;
+
+  unsigned int disable_interintra_wedge_var_thresh;
+
+  unsigned int disable_interinter_wedge_var_thresh;
+
+  int fast_interintra_wedge_search;
+
+  int fast_wedge_sign_estimate;
+
+  int disable_interinter_wedge_newmv_search;
+
+  DIST_WTD_COMP_FLAG use_dist_wtd_comp_flag;
+
+  INTERNAL_COST_UPDATE_TYPE mv_cost_upd_level;
+
+  INTERNAL_COST_UPDATE_TYPE coeff_cost_upd_level;
+
+  INTERNAL_COST_UPDATE_TYPE mode_cost_upd_level;
+
+  int prune_inter_modes_based_on_tpl;
+
+  PRUNE_NEARMV_LEVEL prune_nearmv_using_neighbors;
+
+  int model_based_post_interp_filter_breakout;
+
+  int reuse_compound_type_decision;
+
+  int disable_masked_comp;
+
+  int enable_fast_compound_mode_search;
+
+  int reuse_mask_search_results;
+
+  int enable_fast_wedge_mask_search;
+
+  int inter_mode_txfm_breakout;
+
+  int limit_inter_mode_cands;
+
+  int limit_txfm_eval_per_mode;
+
+  int extra_prune_warped;
+
+  int skip_arf_compound;
+
+  float bias_warp_mode_rd_scale_pct;
+
+  float bias_obmc_mode_rd_scale_pct;
+
+  int skip_cmp_using_top_cmp_avg_est_rd_lvl;
+
+  int skip_interinter_wedge_search_based_on_mse;
+
+  int enable_comp_wedge_search_using_model_rd;
+} INTER_MODE_SPEED_FEATURES;
+
+typedef struct INTERP_FILTER_SPEED_FEATURES {
+  int use_fast_interpolation_filter_search;
+
+  int disable_dual_filter;
+
+  int use_interp_filter;
+
+  int skip_sharp_interp_filter_search;
+
+  int cb_pred_filter_search;
+
+  int adaptive_interp_filter_search;
+
+  int skip_interp_filter_search;
+
+  int use_more_sharp_interp;
+
+  int skip_model_rd_uv;
+} INTERP_FILTER_SPEED_FEATURES;
+
+typedef struct INTRA_MODE_SPEED_FEATURES {
+  int intra_y_mode_mask[TX_SIZES];
+  int intra_uv_mode_mask[TX_SIZES];
+
+  int skip_intra_in_interframe;
+
+  int intra_pruning_with_hog;
+
+  int chroma_intra_pruning_with_hog;
+
+  int disable_smooth_intra;
+
+  bool prune_smooth_intra_mode_for_chroma;
+
+  int prune_filter_intra_level;
+
+  int prune_palette_search_level;
+
+  int prune_luma_palette_size_search_level;
+
+  int prune_chroma_modes_using_luma_winner;
+
+  INTERNAL_COST_UPDATE_TYPE dv_cost_upd_level;
+
+  int cfl_search_range;
+
+  int top_intra_model_count_allowed;
+
+  int adapt_top_model_rd_count_using_neighbors;
+
+  int prune_luma_odd_delta_angles_in_intra;
+
+  int early_term_chroma_palette_size_search;
+
+  int skip_filter_intra_in_inter_frames;
+} INTRA_MODE_SPEED_FEATURES;
+
+typedef struct TX_SPEED_FEATURES {
+  int inter_tx_size_search_init_depth_sqr;
+  int inter_tx_size_search_init_depth_rect;
+  int intra_tx_size_search_init_depth_sqr;
+  int intra_tx_size_search_init_depth_rect;
+
+  int tx_size_search_lgr_block;
+
+  TX_TYPE_SEARCH tx_type_search;
+
+  int txb_split_cap;
+
+  int adaptive_txb_search_level;
+
+  int model_based_prune_tx_search_level;
+
+  int refine_fast_tx_search_results;
+
+  int prune_tx_size_level;
+
+  bool prune_intra_tx_depths_using_nn;
+
+  bool use_rd_based_breakout_for_intra_tx_search;
+
+  int prune_inter_tx_split_rd_eval_lvl;
+
+  int use_chroma_trellis_rd_mult;
+} TX_SPEED_FEATURES;
+
+typedef struct RD_CALC_SPEED_FEATURES {
+  int simple_model_rd_from_var;
+
+  int tx_domain_dist_level;
+
+  int tx_domain_dist_thres_level;
+
+  TRELLIS_OPT_TYPE optimize_coefficients;
+
+  int use_mb_rd_hash;
+
+  int perform_coeff_opt;
+} RD_CALC_SPEED_FEATURES;
+
+typedef struct WINNER_MODE_SPEED_FEATURES {
+  int enable_winner_mode_for_coeff_opt;
+
+  int enable_winner_mode_for_tx_size_srch;
+
+  int tx_size_search_level;
+
+  int enable_winner_mode_for_use_tx_domain_dist;
+
+  MULTI_WINNER_MODE_TYPE multi_winner_mode_type;
+
+  int motion_mode_for_winner_cand;
+
+  int dc_blk_pred_level;
+
+  int winner_mode_ifs;
+
+  int prune_winner_mode_eval_level;
+} WINNER_MODE_SPEED_FEATURES;
+
+typedef struct LOOP_FILTER_SPEED_FEATURES {
+  LPF_PICK_METHOD lpf_pick;
+
+  int use_coarse_filter_level_search;
+
+  int adaptive_luma_loop_filter_skip;
+
+  int skip_loop_filter_using_filt_error;
+
+  CDEF_PICK_METHOD cdef_pick_method;
+
+  bool zero_low_cdef_strengths;
+
+  int adaptive_cdef_mode;
+
+  int dual_sgr_penalty_level;
+
+  int switchable_lr_with_bias_level;
+
+  int enable_sgr_ep_pruning;
+
+  int disable_loop_restoration_chroma;
+
+  int disable_loop_restoration_luma;
+
+  int min_lr_unit_size;
+  int max_lr_unit_size;
+
+  int prune_wiener_based_on_src_var;
+
+  int prune_sgr_based_on_wiener;
+
+  int reduce_wiener_window_size;
+
+  bool disable_wiener_filter;
+
+  bool disable_sgr_filter;
+
+  bool disable_wiener_coeff_refine_search;
+
+  int use_downsampled_wiener_stats;
+} LOOP_FILTER_SPEED_FEATURES;
+
+typedef struct REAL_TIME_SPEED_FEATURES {
+  int check_intra_pred_nonrd;
+
+  int skip_intra_pred;
+
+  int estimate_motion_for_var_based_partition;
+
+  int nonrd_check_partition_merge_mode;
+
+  int nonrd_check_partition_split;
+
+  unsigned int mode_search_skip_flags;
+
+  int nonrd_prune_ref_frame_search;
+
+  int use_nonrd_pick_mode;
+
+  int discount_color_cost;
+
+  int use_nonrd_altref_frame;
+
+  int use_comp_ref_nonrd;
+
+  int ref_frame_comp_nonrd[3];
+
+  int use_real_time_ref_set;
+
+  int short_circuit_low_temp_var;
+
+  int reuse_inter_pred_nonrd;
+
+  int num_inter_modes_for_tx_search;
+
+  int use_nonrd_filter_search;
+
+  int use_simple_rd_model;
+
+  int hybrid_intra_pickmode;
+
+  int prune_palette_search_nonrd;
+
+  int source_metrics_sb_nonrd;
+
+  OVERSHOOT_DETECTION_CBR overshoot_detection_cbr;
+
+  int check_scene_detection;
+
+  int rc_adjust_keyframe;
+
+  int rc_compute_spatial_var_sc_kf;
+
+  int prefer_large_partition_blocks;
+
+  int use_temporal_noise_estimate;
+
+  int fullpel_search_step_param;
+
+  int intra_y_mode_bsize_mask_nrd[BLOCK_SIZES];
+
+  bool prune_hv_pred_modes_using_src_sad;
+
+  int nonrd_aggressive_skip;
+
+  int skip_cdef_sb;
+
+  int selective_cdf_update;
+  int rt_use_intrabc;
+
+  int force_only_last_ref;
+
+  int force_large_partition_blocks_intra;
+
+  int use_fast_fixed_part;
+
+  int increase_source_sad_thresh;
+
+  int skip_tx_no_split_var_based_partition;
+
+  int skip_newmv_mode_based_on_sse;
+
+  int gf_length_lvl;
+
+  int prune_inter_modes_with_golden_ref;
+
+  int prune_inter_modes_wrt_gf_arf_based_on_sad;
+
+  int prune_inter_modes_using_temp_var;
+
+  int reduce_mv_pel_precision_highmotion;
+
+  int reduce_mv_pel_precision_lowcomplex;
+
+  BLOCK_SIZE prune_intra_mode_based_on_mv_range;
+  int var_part_split_threshold_shift;
+
+  int var_part_based_on_qidx;
+
+  int gf_refresh_based_on_qp;
+
+  int use_rtc_tf;
+
+  int use_idtx_nonrd;
+
+  int prune_idtx_nonrd;
+
+  int dct_only_palette_nonrd;
+
+  int skip_lf_screen;
+
+  int thresh_active_maps_skip_lf_cdef;
+
+  int part_early_exit_zeromv;
+
+  INTER_SEARCH_EARLY_TERM_IDX sse_early_term_inter_search;
+
+  int sad_based_adp_altref_lag;
+
+  int partition_direct_merging;
+
+  int tx_size_level_based_on_qstep;
+
+  bool vbp_prune_16x16_split_using_min_max_sub_blk_var;
+
+  int screen_content_cdef_filter_qindex_thresh;
+
+  bool prune_compoundmode_with_singlecompound_var;
+
+  bool frame_level_mode_cost_update;
+
+  bool prune_h_pred_using_best_mode_so_far;
+
+  bool enable_intra_mode_pruning_using_neighbors;
+
+  bool prune_intra_mode_using_best_sad_so_far;
+
+  bool check_only_zero_zeromv_on_large_blocks;
+
+  bool disable_cdf_update_non_reference_frame;
+
+  bool prune_compoundmode_with_singlemode_var;
+
+  bool skip_compound_based_on_var;
+
+  int set_zeromv_skip_based_on_source_sad;
+
+  bool use_adaptive_subpel_search;
+
+  bool enable_ref_short_signaling;
+
+  bool check_globalmv_on_single_ref;
+
+  bool increase_color_thresh_palette;
+
+  int higher_thresh_scene_detection;
+
+  int skip_newmv_flat_blocks_screen;
+
+  int skip_encoding_non_reference_slide_change;
+
+  int rc_faster_convergence_static;
+
+  int skip_newmv_mode_sad_screen;
+} REAL_TIME_SPEED_FEATURES;
+
+/*!\endcond */
+
+/*!
+ * \brief Top level speed vs quality trade off data struture.
+ */
+typedef struct SPEED_FEATURES {
+  /*!
+   * Sequence/frame level speed features:
+   */
+  HIGH_LEVEL_SPEED_FEATURES hl_sf;
+
+  /*!
+   * Speed features for the first pass.
+   */
+  FIRST_PASS_SPEED_FEATURES fp_sf;
+
+  /*!
+   * Speed features related to how tpl's searches are done.
+   */
+  TPL_SPEED_FEATURES tpl_sf;
+
+  /*!
+   * Global motion speed features:
+   */
+  GLOBAL_MOTION_SPEED_FEATURES gm_sf;
+
+  /*!
+   * Partition search speed features:
+   */
+  PARTITION_SPEED_FEATURES part_sf;
+
+  /*!
+   * Motion search speed features:
+   */
+  MV_SPEED_FEATURES mv_sf;
+
+  /*!
+   * Inter mode search speed features:
+   */
+  INTER_MODE_SPEED_FEATURES inter_sf;
+
+  /*!
+   * Interpolation filter search speed features:
+   */
+  INTERP_FILTER_SPEED_FEATURES interp_sf;
+
+  /*!
+   * Intra mode search speed features:
+   */
+  INTRA_MODE_SPEED_FEATURES intra_sf;
+
+  /*!
+   * Transform size/type search speed features:
+   */
+  TX_SPEED_FEATURES tx_sf;
+
+  /*!
+   * RD calculation speed features:
+   */
+  RD_CALC_SPEED_FEATURES rd_sf;
+
+  /*!
+   * Two-pass mode evaluation features:
+   */
+  WINNER_MODE_SPEED_FEATURES winner_mode_sf;
+
+  /*!
+   * In-loop filter speed features:
+   */
+  LOOP_FILTER_SPEED_FEATURES lpf_sf;
+
+  /*!
+   * Real-time mode speed features:
+   */
+  REAL_TIME_SPEED_FEATURES rt_sf;
+} SPEED_FEATURES;
+/*!\cond */
+
+struct AV1_COMP;
+
+/*!\endcond */
+/*!\brief Frame size independent speed vs quality trade off flags
+ *
+ *\ingroup speed_features
+ *
+ * \param[in]    cpi     Top - level encoder instance structure
+ * \param[in]    speed   Speed setting passed in from the command  line
+ *
+ * \remark No return value but configures the various speed trade off flags
+ *         based on the passed in speed setting. (Higher speed gives lower
+ *         quality)
+ */
+void av1_set_speed_features_framesize_independent(struct AV1_COMP *cpi,
+                                                  int speed);
+
+/*!\brief Frame size dependent speed vs quality trade off flags
+ *
+ *\ingroup speed_features
+ *
+ * \param[in]    cpi     Top - level encoder instance structure
+ * \param[in]    speed   Speed setting passed in from the command  line
+ *
+ * \remark No return value but configures the various speed trade off flags
+ *         based on the passed in speed setting and frame size. (Higher speed
+ *         corresponds to lower quality)
+ */
+void av1_set_speed_features_framesize_dependent(struct AV1_COMP *cpi,
+                                                int speed);
+/*!\brief Q index dependent speed vs quality trade off flags
+ *
+ *\ingroup speed_features
+ *
+ * \param[in]    cpi     Top - level encoder instance structure
+ * \param[in]    speed   Speed setting passed in from the command  line
+ *
+ * \remark No return value but configures the various speed trade off flags
+ *         based on the passed in speed setting and current frame's Q index.
+ *         (Higher speed corresponds to lower quality)
+ */
+void av1_set_speed_features_qindex_dependent(struct AV1_COMP *cpi, int speed);
+
+#if defined(__cplusplus)
+}  
+#endif
+
+#endif

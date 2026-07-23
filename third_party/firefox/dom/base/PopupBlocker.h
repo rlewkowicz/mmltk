@@ -1,0 +1,100 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_PopupBlocker_h
+#define mozilla_dom_PopupBlocker_h
+
+#include <stdint.h>
+
+#include "mozilla/TimeStamp.h"
+
+class AutoPopupStatePusherInternal;
+class nsIPrincipal;
+
+namespace mozilla {
+class WidgetEvent;
+namespace dom {
+class Event;
+
+class PopupBlocker final {
+ public:
+  enum PopupControlState {
+    openAllowed = 0,  
+    openControlled,   
+    openBlocked,      
+    openAbused,       
+    openOverridden    
+  };
+
+  static PopupControlState PushPopupControlState(PopupControlState aState,
+                                                 bool aForce);
+
+  static void PopPopupControlState(PopupControlState aState);
+
+  static PopupControlState GetPopupControlState();
+
+  static void PopupStatePusherCreated();
+  static void PopupStatePusherDestroyed();
+
+  static uint32_t GetPopupPermission(nsIPrincipal* aPrincipal);
+
+  static PopupBlocker::PopupControlState GetEventPopupControlState(
+      WidgetEvent* aEvent, Event* aDOMEvent = nullptr);
+
+  static bool ConsumeTimerTokenForExternalProtocolIframe();
+
+  static TimeStamp WhenLastExternalProtocolIframeAllowed();
+
+  static void ResetLastExternalProtocolIframeAllowed();
+
+  static void RegisterOpenPopupSpam();
+  static void UnregisterOpenPopupSpam();
+  static uint32_t GetOpenPopupSpamCount();
+
+  static void Initialize();
+  static void Shutdown();
+};
+
+}  
+}  
+
+#ifdef MOZILLA_INTERNAL_API
+#  define AUTO_POPUP_STATE_PUSHER AutoPopupStatePusherInternal
+#else
+#  define AUTO_POPUP_STATE_PUSHER AutoPopupStatePusherExternal
+#endif
+
+class MOZ_RAII AUTO_POPUP_STATE_PUSHER final {
+ public:
+#ifdef MOZILLA_INTERNAL_API
+  explicit AUTO_POPUP_STATE_PUSHER(
+      mozilla::dom::PopupBlocker::PopupControlState aState,
+      bool aForce = false);
+  ~AUTO_POPUP_STATE_PUSHER();
+#else
+  AUTO_POPUP_STATE_PUSHER(nsPIDOMWindowOuter* aWindow,
+                          mozilla::dom::PopupBlocker::PopupControlState aState)
+      : mWindow(aWindow), mOldState(openAbused) {
+    if (aWindow) {
+      mOldState = PopupBlocker::PushPopupControlState(aState, false);
+    }
+  }
+
+  ~AUTO_POPUP_STATE_PUSHER() {
+    if (mWindow) {
+      PopupBlocker::PopPopupControlState(mOldState);
+    }
+  }
+#endif
+
+ protected:
+#ifndef MOZILLA_INTERNAL_API
+  nsCOMPtr<nsPIDOMWindowOuter> mWindow;
+#endif
+  mozilla::dom::PopupBlocker::PopupControlState mOldState;
+};
+
+#define AutoPopupStatePusher AUTO_POPUP_STATE_PUSHER
+
+#endif  // mozilla_PopupBlocker_h

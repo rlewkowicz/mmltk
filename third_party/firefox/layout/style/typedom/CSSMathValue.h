@@ -1,0 +1,118 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_STYLE_TYPEDOM_CSSMATHVALUE_H_
+#define LAYOUT_STYLE_TYPEDOM_CSSMATHVALUE_H_
+
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/CSSMathClampBindingFwd.h"
+#include "mozilla/dom/CSSMathInvertBindingFwd.h"
+#include "mozilla/dom/CSSMathMaxBindingFwd.h"
+#include "mozilla/dom/CSSMathMinBindingFwd.h"
+#include "mozilla/dom/CSSMathNegateBindingFwd.h"
+#include "mozilla/dom/CSSMathProductBindingFwd.h"
+#include "mozilla/dom/CSSMathSumBindingFwd.h"
+#include "mozilla/dom/CSSNumericValue.h"
+#include "nsStringFwd.h"
+
+template <class T>
+class nsCOMPtr;
+class nsISupports;
+
+namespace mozilla {
+
+struct CSSPropertyId;
+template <typename T>
+class MovingNotNull;
+struct StyleMathValue;
+
+namespace dom {
+
+enum class CSSMathOperator : uint8_t;
+
+class CSSMathValue : public CSSNumericValue {
+ public:
+  enum class MathValueType {
+    MathSum,
+    MathProduct,
+    MathNegate,
+    MathInvert,
+    MathMin,
+    MathMax,
+    MathClamp,
+  };
+
+  CSSMathValue(nsCOMPtr<nsISupports> aParent, MathValueType aMathValueType);
+
+  CSSMathValue(nsCOMPtr<nsISupports> aParent,
+               MovingNotNull<UniquePtr<StyleNumericType>> aNumericType,
+               MathValueType aMathValueType);
+
+  static RefPtr<CSSMathValue> Create(nsCOMPtr<nsISupports> aParent,
+                                     const StyleMathValue& aMathValue);
+
+
+  CSSMathOperator Operator() const;
+
+
+  MathValueType GetMathValueType() const { return mMathValueType; }
+
+  bool IsCSSMathSum() const;
+
+  const CSSMathSum& GetAsCSSMathSum() const;
+
+  CSSMathSum& GetAsCSSMathSum();
+
+  bool IsCSSMathProduct() const;
+
+  const CSSMathProduct& GetAsCSSMathProduct() const;
+
+  CSSMathProduct& GetAsCSSMathProduct();
+
+  bool IsCSSMathNegate() const;
+
+  const CSSMathNegate& GetAsCSSMathNegate() const;
+
+  CSSMathNegate& GetAsCSSMathNegate();
+
+  bool IsCSSMathInvert() const;
+
+  const CSSMathInvert& GetAsCSSMathInvert() const;
+
+  CSSMathInvert& GetAsCSSMathInvert();
+
+  bool IsCSSMathMin() const;
+
+  const CSSMathMin& GetAsCSSMathMin() const;
+
+  CSSMathMin& GetAsCSSMathMin();
+
+  bool IsCSSMathMax() const;
+
+  const CSSMathMax& GetAsCSSMathMax() const;
+
+  CSSMathMax& GetAsCSSMathMax();
+
+  bool IsCSSMathClamp() const;
+
+  const CSSMathClamp& GetAsCSSMathClamp() const;
+
+  CSSMathClamp& GetAsCSSMathClamp();
+
+  void ToCssTextWithProperty(const CSSPropertyId& aPropertyId,
+                             const SerializationContext& aContext,
+                             nsACString& aDest) const;
+
+  StyleMathValue ToStyleMathValue() const;
+
+ protected:
+  virtual ~CSSMathValue() = default;
+
+  const MathValueType mMathValueType;
+};
+
+}  
+}  
+
+#endif  // LAYOUT_STYLE_TYPEDOM_CSSMATHVALUE_H_

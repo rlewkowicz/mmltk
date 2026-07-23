@@ -1,0 +1,540 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_JitScript_h
+#define jit_JitScript_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/HashFunctions.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "jstypes.h"
+#include "NamespaceImports.h"
+
+#include "ds/LifoAlloc.h"
+#include "gc/Barrier.h"
+#include "jit/BaselineIC.h"
+#include "js/TypeDecls.h"
+#include "js/UniquePtr.h"
+#include "js/Vector.h"
+#include "util/TrailingArray.h"
+#include "vm/EnvironmentObject.h"
+
+class JS_PUBLIC_API JSScript;
+class JS_PUBLIC_API JSTracer;
+struct JS_PUBLIC_API JSContext;
+
+namespace JS {
+class Zone;
+}
+
+namespace js {
+
+class SystemAllocPolicy;
+
+namespace gc {
+class AllocSite;
+}
+
+namespace jit {
+
+class BaselineScript;
+class ICStubSpace;
+class InliningRoot;
+class IonScript;
+class JitScript;
+class JitZone;
+
+static constexpr uintptr_t DisabledScript = 0x1;
+static constexpr uintptr_t QueuedScript = 0x3;
+static constexpr uintptr_t CompilingScript = 0x5;
+
+static constexpr uint32_t SpecialScriptBit = 0x1;
+static_assert((DisabledScript & SpecialScriptBit) != 0);
+static_assert((QueuedScript & SpecialScriptBit) != 0);
+static_assert((CompilingScript & SpecialScriptBit) != 0);
+
+static BaselineScript* const BaselineDisabledScriptPtr =
+    reinterpret_cast<BaselineScript*>(DisabledScript);
+static BaselineScript* const BaselineQueuedScriptPtr =
+    reinterpret_cast<BaselineScript*>(QueuedScript);
+static BaselineScript* const BaselineCompilingScriptPtr =
+    reinterpret_cast<BaselineScript*>(CompilingScript);
+
+static IonScript* const IonDisabledScriptPtr =
+    reinterpret_cast<IonScript*>(DisabledScript);
+static IonScript* const IonCompilingScriptPtr =
+    reinterpret_cast<IonScript*>(CompilingScript);
+
+
+class alignas(uintptr_t) ICScript final : public TrailingArray<ICScript> {
+ public:
+  ICScript(uint32_t warmUpCount, Offset fallbackStubsOffset, Offset endOffset,
+           uint32_t depth, uint32_t bytecodeSize,
+           InliningRoot* inliningRoot = nullptr)
+      : inliningRoot_(inliningRoot),
+        warmUpCount_(warmUpCount),
+        ionThreshold_(JitOptions.normalIonWarmUpThreshold),
+        fallbackStubsOffset_(fallbackStubsOffset),
+        endOffset_(endOffset),
+        depth_(depth),
+        bytecodeSize_(bytecodeSize) {}
+
+  ~ICScript();
+
+  bool isInlined() const { return depth_ > 0; }
+
+  void initICEntries(JSContext* cx, JSScript* script);
+
+  ICEntry& icEntry(size_t index) {
+    MOZ_ASSERT(index < numICEntries());
+    return icEntries()[index];
+  }
+
+  ICFallbackStub* fallbackStub(size_t index) {
+    MOZ_ASSERT(index < numICEntries());
+    return fallbackStubs() + index;
+  }
+
+  ICEntry* icEntryForStub(const ICFallbackStub* stub) {
+    size_t index = stub - fallbackStubs();
+    MOZ_ASSERT(index < numICEntries());
+    return &icEntry(index);
+  }
+  ICFallbackStub* fallbackStubForICEntry(const ICEntry* entry) {
+    size_t index = entry - icEntries();
+    MOZ_ASSERT(index < numICEntries());
+    return fallbackStub(index);
+  }
+
+  InliningRoot* inliningRoot() const { return inliningRoot_; }
+  uint32_t depth() const { return depth_; }
+
+  uint32_t bytecodeSize() const { return bytecodeSize_; }
+
+  void resetWarmUpCount(uint32_t count) { warmUpCount_ = count; }
+
+  static constexpr size_t offsetOfFirstStub(uint32_t entryIndex) {
+    return sizeof(ICScript) + entryIndex * sizeof(ICEntry) +
+           ICEntry::offsetOfFirstStub();
+  }
+
+  static constexpr Offset offsetOfWarmUpCount() {
+    return offsetof(ICScript, warmUpCount_);
+  }
+  static constexpr Offset offsetOfIonThreshold() {
+    return offsetof(ICScript, ionThreshold_);
+  }
+  static constexpr Offset offsetOfDepth() { return offsetof(ICScript, depth_); }
+
+  static constexpr Offset offsetOfICEntries() { return sizeof(ICScript); }
+  uint32_t numICEntries() const {
+    return numElements<ICEntry>(icEntriesOffset(), fallbackStubsOffset());
+  }
+
+  static constexpr Offset offsetOfEnvAllocSite() {
+    return offsetof(ICScript, envAllocSite_);
+  }
+
+  ICEntry* interpreterICEntryFromPCOffset(uint32_t pcOffset);
+
+  ICEntry& icEntryFromPCOffset(uint32_t pcOffset);
+
+  [[nodiscard]] bool addInlinedChild(JSContext* cx,
+                                     js::UniquePtr<ICScript> child,
+                                     uint32_t pcOffset);
+  ICScript* findInlinedChild(uint32_t pcOffset);
+  void removeInlinedChild(uint32_t pcOffset);
+  bool hasInlinedChild(uint32_t pcOffset);
+
+  void purgeStubs(Zone* zone, ICStubSpace& newStubSpace);
+
+  void purgeInactiveICScripts();
+
+  bool active() const { return active_; }
+  void setActive() { active_ = true; }
+  void resetActive() { active_ = false; }
+
+  gc::AllocSite* getOrCreateAllocSite(JSScript* outerScript, uint32_t pcOffset,
+                                      const gc::AutoMarkingLock& lock);
+
+  void ensureEnvAllocSite(JSScript* outerScript,
+                          const gc::AutoMarkingLock& lock);
+
+  gc::AllocSite* maybeEnvAllocSite() const { return envAllocSite_; }
+
+  void prepareForDestruction(Zone* zone);
+
+  void trace(JSTracer* trc);
+  bool traceWeak(JSTracer* trc);
+
+  gc::MarkingLock& markingLock() { return markingLock_; }
+
+#ifdef DEBUG
+  mozilla::HashNumber hash(JSContext* cx);
+#endif
+
+ private:
+  class CallSite {
+   public:
+    CallSite(ICScript* callee, uint32_t pcOffset)
+        : callee_(callee), pcOffset_(pcOffset) {}
+    ICScript* callee_;
+    uint32_t pcOffset_;
+  };
+
+  InliningRoot* inliningRoot_ = nullptr;
+
+  js::UniquePtr<Vector<CallSite>> inlinedChildren_;
+
+  static constexpr size_t AllocSiteChunkSize = 256;
+  LifoAlloc allocSitesSpace_{AllocSiteChunkSize, js::BackgroundMallocArena};
+  Vector<gc::AllocSite*, 0, SystemAllocPolicy> allocSites_;
+
+  gc::AllocSite* envAllocSite_ = nullptr;
+
+  mozilla::Atomic<uint32_t, mozilla::Relaxed> warmUpCount_ = {};
+
+  uint32_t ionThreshold_;
+
+  Offset fallbackStubsOffset_;
+
+  Offset endOffset_;
+
+  uint32_t depth_;
+
+  uint32_t bytecodeSize_;
+
+  gc::MarkingLock markingLock_;
+
+  bool active_ = false;
+
+  Offset icEntriesOffset() const { return offsetOfICEntries(); }
+  Offset fallbackStubsOffset() const { return fallbackStubsOffset_; }
+  Offset endOffset() const { return endOffset_; }
+
+ public:
+  ICEntry* icEntries() { return offsetToPointer<ICEntry>(icEntriesOffset()); }
+
+ private:
+  ICFallbackStub* fallbackStubs() {
+    return offsetToPointer<ICFallbackStub>(fallbackStubsOffset());
+  }
+
+  JitScript* outerJitScript();
+
+  friend class JitScript;
+};
+
+class alignas(uintptr_t) JitScript final
+    : public mozilla::LinkedListElement<JitScript>,
+      public TrailingArray<JitScript> {
+  friend class ::JSScript;
+
+  const char* profileString_ = nullptr;
+
+  GCPtr<JSScript*> owningScript_;
+
+  GCStructPtr<BaselineScript*> baselineScript_;
+
+  GCStructPtr<IonScript*> ionScript_;
+
+  GCPtr<EnvironmentObject*> templateEnv_;
+
+  Offset endOffset_ = 0;
+
+  mozilla::Maybe<bool> usesEnvironmentChain_;
+
+  struct Flags {
+    bool hadIonOSR : 1;
+    bool ranBytecodeAnalysis : 1;
+    bool initializedTemplateEnv : 1;
+  };
+  Flags flags_ = {};  
+
+  js::UniquePtr<InliningRoot> inliningRoot_;
+
+#ifdef DEBUG
+  mozilla::Maybe<mozilla::HashNumber> failedICHash_;
+
+  bool hasPurgedStubs_ = false;
+#endif
+
+  uint32_t warmUpCountAtLastICStub_ = 0;
+
+  ICScript icScript_;
+
+  Offset endOffset() const { return endOffset_; }
+
+ public:
+  JitScript(JSScript* script, Offset fallbackStubsOffset, Offset endOffset,
+            const char* profileString);
+
+  ~JitScript();
+
+  JSScript* owningScript() const { return owningScript_; }
+
+  [[nodiscard]] bool ensureHasCachedBaselineJitData(JSContext* cx,
+                                                    HandleScript script);
+  [[nodiscard]] bool ensureHasCachedIonData(JSContext* cx, HandleScript script);
+
+  void setHadIonOSR() { flags_.hadIonOSR = true; }
+  bool hadIonOSR() const { return flags_.hadIonOSR; }
+
+  void setRanBytecodeAnalysis() { flags_.ranBytecodeAnalysis = true; }
+  bool ranBytecodeAnalysis() const { return flags_.ranBytecodeAnalysis; }
+
+  uint32_t numICEntries() const { return icScript_.numICEntries(); }
+
+#ifdef DEBUG
+  bool hasActiveICScript() const;
+#endif
+  void resetAllActiveFlags();
+
+  void ensureProfileString(JSContext* cx, JSScript* script);
+  void ensureProfilerScriptSource(JSContext* cx, JSScript* script);
+
+  const char* profileString() const {
+    MOZ_ASSERT(profileString_);
+    return profileString_;
+  }
+
+  static void Destroy(Zone* zone, JitScript* script);
+
+  static constexpr Offset offsetOfICEntries() { return sizeof(JitScript); }
+
+  static constexpr size_t offsetOfBaselineScript() {
+    return offsetof(JitScript, baselineScript_);
+  }
+  static constexpr size_t offsetOfIonScript() {
+    return offsetof(JitScript, ionScript_);
+  }
+  static constexpr size_t offsetOfICScript() {
+    return offsetof(JitScript, icScript_);
+  }
+  static constexpr size_t offsetOfWarmUpCount() {
+    return offsetOfICScript() + ICScript::offsetOfWarmUpCount();
+  }
+
+  uint32_t warmUpCount() const { return icScript_.warmUpCount_; }
+  void incWarmUpCount() { icScript_.warmUpCount_++; }
+  void resetWarmUpCount(uint32_t count);
+
+  void setIonThreshold(uint32_t count) { icScript_.ionThreshold_ = count; }
+
+  void prepareForDestruction(Zone* zone);
+
+  void addSizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf, size_t* data,
+                              size_t* allocSites) const;
+
+  ICEntry& icEntry(size_t index) { return icScript_.icEntry(index); }
+
+  ICFallbackStub* fallbackStub(size_t index) {
+    return icScript_.fallbackStub(index);
+  }
+
+  ICEntry* icEntryForStub(const ICFallbackStub* stub) {
+    return icScript_.icEntryForStub(stub);
+  }
+  ICFallbackStub* fallbackStubForICEntry(const ICEntry* entry) {
+    return icScript_.fallbackStubForICEntry(entry);
+  }
+
+  void trace(JSTracer* trc);
+  void traceWeak(JSTracer* trc);
+  void purgeStubs(JSScript* script, ICStubSpace& newStubSpace);
+
+  void purgeInactiveICScripts();
+
+  ICEntry& icEntryFromPCOffset(uint32_t pcOffset) {
+    return icScript_.icEntryFromPCOffset(pcOffset);
+  };
+
+  size_t allocBytes() const { return endOffset(); }
+
+  EnvironmentObject* templateEnvironment() const {
+    MOZ_ASSERT(flags_.initializedTemplateEnv);
+    return templateEnv_;
+  }
+
+  std::pair<CallObject*, NamedLambdaObject*> functionEnvironmentTemplates(
+      JSFunction* fun) const;
+
+  bool usesEnvironmentChain() const { return *usesEnvironmentChain_; }
+
+  bool resetAllocSites(bool resetNurserySites, bool resetPretenuredSites);
+  bool hasPretenuredAllocSites();
+
+  void updateLastICStubCounter() { warmUpCountAtLastICStub_ = warmUpCount(); }
+  uint32_t warmUpCountAtLastICStub() const { return warmUpCountAtLastICStub_; }
+
+  bool hasEnvAllocSite() const { return icScript_.envAllocSite_; }
+
+ private:
+  void setBaselineScriptImpl(JSScript* script, BaselineScript* baselineScript);
+  void setBaselineScriptImpl(JS::GCContext* gcx, JSScript* script,
+                             BaselineScript* baselineScript);
+  void maybeRemoveFromCompileQueue(JSScript* script) {
+    if (isBaselineQueued()) {
+      script->realm()->removeFromCompileQueue(script);
+    }
+  }
+
+  static bool IsBaselineScript(BaselineScript* baselineScript) {
+    return baselineScript && baselineScript != BaselineDisabledScriptPtr &&
+           baselineScript != BaselineQueuedScriptPtr &&
+           baselineScript != BaselineCompilingScriptPtr;
+  }
+
+ public:
+  bool hasBaselineScript() const {
+    bool res = IsBaselineScript(baselineScript_);
+    MOZ_ASSERT_IF(!res, !hasIonScript());
+    return res;
+  }
+  BaselineScript* baselineScript() const {
+    MOZ_ASSERT(hasBaselineScript());
+    return baselineScript_;
+  }
+  void setBaselineScript(JSScript* script, BaselineScript* baselineScript) {
+    MOZ_ASSERT(!hasBaselineScript());
+    maybeRemoveFromCompileQueue(script);
+    setBaselineScriptImpl(script, baselineScript);
+    MOZ_ASSERT(hasBaselineScript());
+  }
+  [[nodiscard]] BaselineScript* clearBaselineScript(JS::GCContext* gcx,
+                                                    JSScript* script) {
+    BaselineScript* baseline = baselineScript();
+    setBaselineScriptImpl(gcx, script, nullptr);
+    return baseline;
+  }
+  bool isBaselineQueued() const {
+    return baselineScript_ == BaselineQueuedScriptPtr;
+  }
+  void clearIsBaselineQueued(JSScript* script) {
+    MOZ_ASSERT(isBaselineQueued());
+    setBaselineScriptImpl(script, nullptr);
+  }
+  bool isBaselineCompiling() const {
+    return baselineScript_ == BaselineCompilingScriptPtr;
+  }
+  void setIsBaselineCompiling(JSScript* script) {
+    MOZ_ASSERT(baselineScript_ == nullptr);
+    maybeRemoveFromCompileQueue(script);
+    setBaselineScriptImpl(script, BaselineCompilingScriptPtr);
+  }
+  void clearIsBaselineCompiling(JSScript* script) {
+    MOZ_ASSERT(isBaselineCompiling());
+    setBaselineScriptImpl(script, nullptr);
+  }
+
+ private:
+  void setIonScriptImpl(JS::GCContext* gcx, JSScript* script,
+                        IonScript* ionScript);
+  void setIonScriptImpl(JSScript* script, IonScript* ionScript);
+
+  template <typename F>
+  void forEachICScript(const F& f);
+  template <typename F>
+  void forEachICScript(const F& f) const;
+
+  static bool IsIonScript(IonScript* ionScript) {
+    return ionScript && ionScript != IonDisabledScriptPtr &&
+           ionScript != IonCompilingScriptPtr;
+  }
+
+ public:
+  bool hasIonScript() const {
+    bool res = IsIonScript(ionScript_);
+    MOZ_ASSERT_IF(res, baselineScript_);
+    return res;
+  }
+  IonScript* ionScript() const {
+    MOZ_ASSERT(hasIonScript());
+    return ionScript_;
+  }
+  void setIonScript(JSScript* script, IonScript* ionScript) {
+    MOZ_ASSERT(!hasIonScript());
+    setIonScriptImpl(script, ionScript);
+    MOZ_ASSERT(hasIonScript());
+  }
+  [[nodiscard]] IonScript* clearIonScript(JS::GCContext* gcx,
+                                          JSScript* script) {
+    IonScript* ion = ionScript();
+    setIonScriptImpl(gcx, script, nullptr);
+    return ion;
+  }
+
+  bool isIonCompilingOffThread() const {
+    return ionScript_ == IonCompilingScriptPtr;
+  }
+  void setIsIonCompilingOffThread(JSScript* script) {
+    MOZ_ASSERT(ionScript_ == nullptr);
+    setIonScriptImpl(script, IonCompilingScriptPtr);
+  }
+  void clearIsIonCompilingOffThread(JSScript* script) {
+    MOZ_ASSERT(isIonCompilingOffThread());
+    setIonScriptImpl(script, nullptr);
+  }
+  ICScript* icScript() { return &icScript_; }
+
+  bool hasInliningRoot() const { return !!inliningRoot_; }
+  InliningRoot* inliningRoot() const { return inliningRoot_.get(); }
+  InliningRoot* getOrCreateInliningRoot(JSContext* cx, JSScript* script);
+
+  inline void notePurgedStubs() {
+#ifdef DEBUG
+    failedICHash_.reset();
+    hasPurgedStubs_ = true;
+#endif
+  }
+
+#ifdef DEBUG
+  bool hasPurgedStubs() const { return hasPurgedStubs_; }
+  bool hasFailedICHash() const { return failedICHash_.isSome(); }
+  mozilla::HashNumber getFailedICHash() { return failedICHash_.extract(); }
+  void setFailedICHash(mozilla::HashNumber hash) {
+    MOZ_ASSERT(failedICHash_.isNothing());
+    if (!hasPurgedStubs_) {
+      failedICHash_.emplace(hash);
+    }
+  }
+#endif
+
+  inline void clearFailedICHash() {
+#ifdef DEBUG
+    failedICHash_.reset();
+#endif
+  }
+};
+
+class MOZ_RAII AutoKeepJitScripts {
+  jit::JitZone* zone_;
+  bool prev_;
+
+ public:
+  explicit inline AutoKeepJitScripts(JSContext* cx);
+  inline ~AutoKeepJitScripts();
+
+  AutoKeepJitScripts(const AutoKeepJitScripts&) = delete;
+  void operator=(const AutoKeepJitScripts&) = delete;
+};
+
+void MarkActiveICScriptsAndCopyStubs(Zone* zone, ICStubSpace& newStubSpace);
+
+#ifdef JS_STRUCTURED_SPEW
+void JitSpewBaselineICStats(JSScript* script, const char* dumpReason);
+#endif
+
+}  
+}  
+
+#endif /* jit_JitScript_h */

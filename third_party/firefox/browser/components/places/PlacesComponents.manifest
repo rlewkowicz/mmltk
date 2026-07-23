@@ -1,0 +1,1 @@
+category browser-first-window-ready moz-src:///browser/components/places/PlacesBrowserStartup.sys.mjs PlacesBrowserStartup.onFirstWindowReady

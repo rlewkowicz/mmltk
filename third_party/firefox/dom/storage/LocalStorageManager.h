@@ -1,0 +1,115 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_StorageManager_h
+#define mozilla_dom_StorageManager_h
+
+#include "LocalStorage.h"
+#include "LocalStorageCache.h"
+#include "StorageObserver.h"
+#include "mozilla/dom/Storage.h"
+#include "nsClassHashtable.h"
+#include "nsHashKeys.h"
+#include "nsIDOMStorageManager.h"
+#include "nsILocalStorageManager.h"
+#include "nsTHashMap.h"
+#include "nsTHashtable.h"
+
+namespace mozilla {
+
+class OriginAttributesPattern;
+
+namespace dom {
+
+class LocalStorageManager final : public nsIDOMStorageManager,
+                                  public nsILocalStorageManager,
+                                  public StorageObserverSink {
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIDOMSTORAGEMANAGER
+  NS_DECL_NSILOCALSTORAGEMANAGER
+
+ public:
+  LocalStorageManager();
+
+  static uint32_t GetOriginQuota();
+
+  static uint32_t GetSiteQuota();
+
+  LocalStorageCache* GetCache(const nsACString& aOriginSuffix,
+                              const nsACString& aOriginNoSuffix);
+
+  already_AddRefed<StorageUsage> GetOriginUsage(
+      const nsACString& aOriginNoSuffix, uint32_t aPrivateBrowsingId);
+
+  static nsAutoCString CreateOrigin(const nsACString& aOriginSuffix,
+                                    const nsACString& aOriginNoSuffix);
+
+ private:
+  ~LocalStorageManager();
+
+  nsresult Observe(const char* aTopic,
+                   const nsAString& aOriginAttributesPattern,
+                   const nsACString& aOriginScope) override;
+
+  class LocalStorageCacheHashKey : public nsCStringHashKey {
+   public:
+    explicit LocalStorageCacheHashKey(const nsACString* aKey)
+        : nsCStringHashKey(aKey), mCache(new LocalStorageCache(aKey)) {}
+
+    LocalStorageCacheHashKey(LocalStorageCacheHashKey&& aOther)
+        : nsCStringHashKey(std::move(aOther)),
+          mCache(std::move(aOther.mCache)),
+          mCacheRef(std::move(aOther.mCacheRef)) {
+      NS_ERROR("Shouldn't be called");
+    }
+
+    LocalStorageCache* cache() { return mCache; }
+    void HardRef() { mCacheRef = mCache; }
+
+   private:
+    LocalStorageCache* mCache;
+    RefPtr<LocalStorageCache> mCacheRef;
+  };
+
+  already_AddRefed<LocalStorageCache> PutCache(
+      const nsACString& aOriginSuffix, const nsACString& aOriginNoSuffix,
+      const nsACString& aQuotaKey, nsIPrincipal* aPrincipal);
+
+  enum class CreateMode {
+    UseIfExistsNeverCreate,
+    CreateAlways,
+    CreateIfShouldPreload
+  };
+
+  nsresult GetStorageInternal(CreateMode aCreate, mozIDOMWindow* aWindow,
+                              nsIPrincipal* aPrincipal,
+                              nsIPrincipal* aStoragePrincipal,
+                              const nsAString& aDocumentURI, bool aPrivate,
+                              Storage** aRetval);
+
+  using CacheOriginHashtable = nsTHashtable<LocalStorageCacheHashKey>;
+  nsClassHashtable<nsCStringHashKey, CacheOriginHashtable> mCaches;
+
+  void ClearCaches(uint32_t aUnloadFlags,
+                   const OriginAttributesPattern& aPattern,
+                   const nsACString& aKeyPrefix);
+
+  static LocalStorageManager* Self();
+
+  static LocalStorageManager* Ensure();
+
+ private:
+  nsTHashMap<nsCString, RefPtr<StorageUsage> > mUsages;
+
+  friend class LocalStorageCache;
+  friend class StorageDBChild;
+  virtual void DropCache(LocalStorageCache* aCache);
+
+  static LocalStorageManager* sSelf;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_StorageManager_h

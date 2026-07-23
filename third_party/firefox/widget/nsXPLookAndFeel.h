@@ -1,0 +1,89 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _nsXPLookAndFeel
+#define _nsXPLookAndFeel
+
+#include "mozilla/Maybe.h"
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/widget/LookAndFeelTypes.h"
+#include "nsTArray.h"
+
+class nsLookAndFeel;
+
+class nsXPLookAndFeel : public mozilla::LookAndFeel {
+  friend class mozilla::LookAndFeel;
+
+ public:
+  using FullLookAndFeel = mozilla::widget::FullLookAndFeel;
+  using LookAndFeelFont = mozilla::widget::LookAndFeelFont;
+
+  virtual ~nsXPLookAndFeel();
+
+  static nsXPLookAndFeel* GetInstance();
+  static void Shutdown();
+
+  static const char* GetColorPrefName(ColorID);
+
+  virtual nsresult NativeGetInt(IntID aID, int32_t& aResult) = 0;
+  virtual nsresult NativeGetFloat(FloatID aID, float& aResult) = 0;
+  virtual nsresult NativeGetColor(ColorID, ColorScheme, nscolor& aResult) = 0;
+  virtual bool NativeGetFont(FontID aID, nsString& aName,
+                             gfxFontStyle& aStyle) = 0;
+
+  virtual void RefreshImpl();
+
+  virtual char16_t GetPasswordCharacterImpl() { return char16_t('*'); }
+
+  virtual bool GetEchoPasswordImpl() { return false; }
+
+  virtual uint32_t GetPasswordMaskDelayImpl() { return 600; }
+
+  virtual bool GetDefaultDrawInTitlebar() { return true; }
+
+  virtual TitlebarAction GetTitlebarAction(TitlebarEvent aEvent) {
+    return TitlebarAction::None;
+  }
+
+  static bool LookAndFeelFontToStyle(const LookAndFeelFont&, nsString& aName,
+                                     gfxFontStyle&);
+  static LookAndFeelFont StyleToLookAndFeelFont(const nsAString& aName,
+                                                const gfxFontStyle&);
+
+  virtual void SetDataImpl(FullLookAndFeel&& aTables) {}
+
+  virtual void NativeInit() = 0;
+
+  virtual void GetThemeInfo(nsACString&) {}
+
+  virtual nsresult GetKeyboardLayoutImpl(nsACString& aLayout) {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+ protected:
+  nsXPLookAndFeel() = default;
+
+  void Init();
+
+  static nscolor GetStandinForNativeColor(ColorID, ColorScheme);
+  static void FillStores(nsXPLookAndFeel* aInstance);
+
+  nsresult GetColorValue(ColorID, ColorScheme, UseStandins, nscolor& aResult);
+  nsresult GetIntValue(IntID aID, int32_t& aResult);
+  nsresult GetFloatValue(FloatID aID, float& aResult);
+  bool GetFontValue(FontID aID, nsString& aName, gfxFontStyle& aStyle);
+  LookAndFeelFont GetFontValue(FontID aID);
+
+  static mozilla::Maybe<nscolor> GenericDarkColor(ColorID);
+  mozilla::Maybe<nscolor> GetUncachedColor(ColorID, ColorScheme, UseStandins);
+
+  static void OnPrefChanged(const char* aPref, void* aClosure);
+
+  static bool sInitialized;
+
+  static nsXPLookAndFeel* sInstance;
+  static bool sShutdown;
+};
+
+#endif

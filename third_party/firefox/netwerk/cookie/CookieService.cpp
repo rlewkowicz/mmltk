@@ -1,0 +1,1704 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "CookieCommons.h"
+#include "CookieDummyStorage.h"
+#include "CookieLogging.h"
+#include "CookieParser.h"
+#include "CookieService.h"
+#include "CookieValidation.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/Components.h"
+#include "mozilla/ConsoleReportCollector.h"
+#include "mozilla/ContentBlockingNotifier.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/nsMixedContentBlocker.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/Promise-inl.h"
+#include "mozilla/net/CookieJarSettings.h"
+#include "mozilla/net/CookiePersistentStorage.h"
+#include "mozilla/net/CookiePrivateStorage.h"
+#include "mozilla/net/CookieService.h"
+#include "mozilla/net/CookieServiceChild.h"
+#include "mozilla/net/HttpBaseChannel.h"
+#include "mozilla/net/NeckoCommon.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/StoragePrincipalHelper.h"
+#include "mozIThirdPartyUtil.h"
+#include "nsICookiePermission.h"
+#include "nsIConsoleReportCollector.h"
+#include "nsIEffectiveTLDService.h"
+#include "nsIScriptError.h"
+#include "nsIScriptSecurityManager.h"
+#include "nsIURI.h"
+#include "nsIWebProgressListener.h"
+#include "nsNetUtil.h"
+#include "ThirdPartyUtil.h"
+#include "xpcpublic.h"
+
+using namespace mozilla::dom;
+
+namespace {
+
+uint32_t MakeCookieBehavior(uint32_t aCookieBehavior) {
+  bool isFirstPartyIsolated = OriginAttributes::IsFirstPartyEnabled();
+
+  if (isFirstPartyIsolated &&
+      aCookieBehavior == nsICookieService::BEHAVIOR_PARTITION_FOREIGN) {
+    return nsICookieService::BEHAVIOR_REJECT_TRACKER;
+  }
+  return aCookieBehavior;
+}
+
+void MigrateCookieLifetimePrefs() {
+  if (mozilla::Preferences::GetInt("network.cookie.lifetimePolicy") != 2) {
+    return;
+  }
+  if (!mozilla::Preferences::GetBool("privacy.sanitize.sanitizeOnShutdown")) {
+    mozilla::Preferences::SetBool("privacy.sanitize.sanitizeOnShutdown", true);
+    mozilla::Preferences::SetBool("privacy.clearOnShutdown.history", false);
+    mozilla::Preferences::SetBool("privacy.clearOnShutdown.formdata", false);
+    mozilla::Preferences::SetBool("privacy.clearOnShutdown.downloads", false);
+    mozilla::Preferences::SetBool("privacy.clearOnShutdown.sessions", false);
+    mozilla::Preferences::SetBool("privacy.clearOnShutdown.siteSettings",
+                                  false);
+
+    mozilla::Preferences::SetBool(
+        "privacy.clearOnShutdown_v2.browsingHistoryAndDownloads", false);
+    mozilla::Preferences::SetBool("privacy.clearOnShutdown_v2.siteSettings",
+                                  false);
+  }
+  mozilla::Preferences::SetBool("privacy.clearOnShutdown.cookies", true);
+  mozilla::Preferences::SetBool("privacy.clearOnShutdown.cache", true);
+  mozilla::Preferences::SetBool("privacy.clearOnShutdown.offlineApps", true);
+
+  mozilla::Preferences::SetBool("privacy.clearOnShutdown_v2.cookiesAndStorage",
+                                true);
+  mozilla::Preferences::SetBool("privacy.clearOnShutdown_v2.cache", true);
+  mozilla::Preferences::ClearUser("network.cookie.lifetimePolicy");
+}
+
+}  
+
+uint32_t nsICookieManager::GetCookieBehavior(bool aIsPrivate) {
+  if (aIsPrivate) {
+    if (mozilla::Preferences::HasUserValue(
+            "network.cookie.cookieBehavior.pbmode")) {
+      return MakeCookieBehavior(
+          mozilla::StaticPrefs::network_cookie_cookieBehavior_pbmode());
+    }
+
+    if (mozilla::Preferences::HasUserValue("network.cookie.cookieBehavior")) {
+      return MakeCookieBehavior(
+          mozilla::StaticPrefs::network_cookie_cookieBehavior());
+    }
+
+    return MakeCookieBehavior(
+        mozilla::StaticPrefs::network_cookie_cookieBehavior_pbmode());
+  }
+  return MakeCookieBehavior(
+      mozilla::StaticPrefs::network_cookie_cookieBehavior());
+}
+
+namespace mozilla {
+namespace net {
+
+
+static StaticRefPtr<CookieService> gCookieService;
+
+namespace {
+
+bool ProcessSameSiteCookieForForeignRequest(nsIChannel* aChannel,
+                                            Cookie* aCookie,
+                                            bool aIsSafeTopLevelNav,
+                                            bool aHadCrossSiteRedirects,
+                                            bool aLaxByDefault) {
+  if (aCookie->SameSite() == nsICookie::SAMESITE_STRICT) {
+    return false;
+  }
+
+  if (aCookie->SameSite() == nsICookie::SAMESITE_NONE ||
+      (!aLaxByDefault && aCookie->SameSite() == nsICookie::SAMESITE_UNSET)) {
+    return true;
+  }
+
+  if (aLaxByDefault && aCookie->SameSite() == nsICookie::SAMESITE_UNSET &&
+      aHadCrossSiteRedirects &&
+      StaticPrefs::
+          network_cookie_sameSite_laxByDefault_allowBoomerangRedirect()) {
+    return true;
+  }
+
+  int64_t currentTimeInUsec = PR_Now();
+
+  if (aLaxByDefault && aCookie->SameSite() == nsICookie::SAMESITE_UNSET &&
+      StaticPrefs::network_cookie_sameSite_laxPlusPOST_timeout() > 0 &&
+      currentTimeInUsec - aCookie->UpdateTimeInUSec() <=
+          (StaticPrefs::network_cookie_sameSite_laxPlusPOST_timeout() *
+           PR_USEC_PER_SEC) &&
+      !NS_IsSafeMethodNav(aChannel)) {
+    return true;
+  }
+
+  MOZ_ASSERT(
+      (aLaxByDefault && aCookie->SameSite() == nsICookie::SAMESITE_UNSET) ||
+      aCookie->SameSite() == nsICookie::SAMESITE_LAX);
+  return aIsSafeTopLevelNav;
+}
+
+}  
+
+
+already_AddRefed<nsICookieService> CookieService::GetXPCOMSingleton() {
+  if (IsNeckoChild()) {
+    return CookieServiceChild::GetSingleton();
+  }
+
+  return GetSingleton();
+}
+
+already_AddRefed<CookieService> CookieService::GetSingleton() {
+  NS_ASSERTION(!IsNeckoChild(), "not a parent process");
+
+  if (gCookieService) {
+    return do_AddRef(gCookieService);
+  }
+
+  gCookieService = new CookieService();
+  if (gCookieService) {
+    if (NS_SUCCEEDED(gCookieService->Init())) {
+      ClearOnShutdown(&gCookieService);
+    } else {
+      gCookieService = nullptr;
+    }
+  }
+
+  return do_AddRef(gCookieService);
+}
+
+
+NS_IMPL_ISUPPORTS(CookieService, nsICookieService, nsICookieManager,
+                  nsIObserver, nsISupportsWeakReference, nsIMemoryReporter)
+
+CookieService::CookieService() = default;
+
+nsresult CookieService::Init() {
+  nsresult rv;
+  mTLDService = mozilla::components::EffectiveTLD::Service(&rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mThirdPartyUtil = mozilla::components::ThirdPartyUtil::Service();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  InitCookieStorages();
+
+  MigrateCookieLifetimePrefs();
+
+  RegisterWeakMemoryReporter(this);
+
+  nsCOMPtr<nsIObserverService> os = services::GetObserverService();
+  NS_ENSURE_STATE(os);
+  os->AddObserver(this, "last-pb-context-exited", true);
+  os->AddObserver(this, "browser-delayed-startup-finished", true);
+
+  RunOnShutdown(
+      [self = RefPtr{this}] { self->RetirePersistentStorageForShutdown(); },
+      ShutdownPhase::AppShutdown);
+
+  return NS_OK;
+}
+
+void CookieService::InitCookieStorages() {
+  NS_ASSERTION(!mPersistentStorage, "already have a default CookieStorage");
+  NS_ASSERTION(!mPrivateStorage, "already have a private CookieStorage");
+
+  if (MOZ_UNLIKELY(AppShutdown::IsInOrBeyond(ShutdownPhase::AppShutdown))) {
+    mPersistentStorage = new CookieDummyStorage();
+  } else if (MOZ_UNLIKELY(StaticPrefs::network_cookie_noPersistentStorage())) {
+    mPersistentStorage = CookiePrivateStorage::Create();
+  } else {
+    mPersistentStorage = CookiePersistentStorage::Create();
+  }
+
+  mPrivateStorage = CookiePrivateStorage::Create();
+}
+
+void CookieService::RetirePersistentStorageForShutdown() {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (mPersistentStorage) {
+    mRetiredStorage = std::move(mPersistentStorage);
+    mPersistentStorage = new CookieDummyStorage();
+  }
+}
+
+void CookieService::CloseCookieStorages() {
+  if (!mPersistentStorage) {
+    return;
+  }
+
+  RefPtr<CookieStorage> privateStorage;
+  privateStorage.swap(mPrivateStorage);
+
+  RefPtr<CookieStorage> persistentStorage;
+  persistentStorage.swap(mPersistentStorage);
+
+  RefPtr<CookieStorage> retiredStorage;
+  retiredStorage.swap(mRetiredStorage);
+
+  privateStorage->Close();
+  persistentStorage->Close();
+  if (retiredStorage) {
+    retiredStorage->Close();
+  }
+}
+
+CookieService::~CookieService() {
+  CloseCookieStorages();
+
+  UnregisterWeakMemoryReporter(this);
+
+  gCookieService = nullptr;
+}
+
+NS_IMETHODIMP
+CookieService::Observe(nsISupports* , const char* aTopic,
+                       const char16_t* ) {
+  if (!strcmp(aTopic, "browser-delayed-startup-finished")) {
+    mThirdPartyCookieBlockingExceptions.Initialize();
+
+    RunOnShutdown([self = RefPtr{this}] {
+      self->mThirdPartyCookieBlockingExceptions.Shutdown();
+    });
+  } else if (!strcmp(aTopic, "last-pb-context-exited")) {
+    OriginAttributesPattern pattern;
+    pattern.mPrivateBrowsingId.Construct(1);
+    RemoveCookiesWithOriginAttributes(pattern, ""_ns);
+    mPrivateStorage = CookiePrivateStorage::Create();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::TestCloseCookieDB() {
+  if (!false) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  CloseCookieStorages();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::TestOpenCookieDB() {
+  MOZ_ASSERT(!mPersistentStorage, "shouldn't have a default CookieStorage");
+  MOZ_ASSERT(!mPrivateStorage, "shouldn't have a private CookieStorage");
+  InitCookieStorages();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::GetCookieBehavior(bool aIsPrivate, uint32_t* aCookieBehavior) {
+  NS_ENSURE_ARG_POINTER(aCookieBehavior);
+  *aCookieBehavior = nsICookieManager::GetCookieBehavior(aIsPrivate);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::GetCookieStringFromHttp(nsIURI* aHostURI, nsIChannel* aChannel,
+                                       nsACString& aCookieString) {
+  NS_ENSURE_ARG(aHostURI);
+  NS_ENSURE_ARG(aChannel);
+
+  aCookieString.Truncate();
+
+  if (!CookieCommons::IsSchemeSupported(aHostURI)) {
+    return NS_OK;
+  }
+
+  uint32_t rejectedReason = 0;
+  ThirdPartyAnalysisResult result = mThirdPartyUtil->AnalyzeChannel(
+      aChannel, false, aHostURI, nullptr, &rejectedReason);
+
+  bool isSafeTopLevelNav = CookieCommons::IsSafeTopLevelNav(aChannel);
+  bool hadCrossSiteRedirects = false;
+  bool isSameSiteForeign = CookieCommons::IsSameSiteForeign(
+      aChannel, aHostURI, &hadCrossSiteRedirects);
+
+  OriginAttributes storageOriginAttributes;
+  StoragePrincipalHelper::GetOriginAttributes(
+      aChannel, storageOriginAttributes,
+      StoragePrincipalHelper::eStorageAccessPrincipal);
+
+  nsTArray<OriginAttributes> originAttributesList;
+  originAttributesList.AppendElement(storageOriginAttributes);
+
+  nsCOMPtr<nsICookieJarSettings> cookieJarSettings =
+      CookieCommons::GetCookieJarSettings(aChannel);
+  bool isCHIPS = StaticPrefs::network_cookie_CHIPS_enabled() &&
+                 !cookieJarSettings->GetBlockingAllContexts();
+  bool isUnpartitioned =
+      !result.contains(ThirdPartyAnalysis::IsForeign) ||
+      result.contains(ThirdPartyAnalysis::IsStorageAccessPermissionGranted);
+  if (isCHIPS && isUnpartitioned) {
+    MOZ_ASSERT(storageOriginAttributes.mPartitionKey.IsEmpty());
+    OriginAttributes partitionedOriginAttributes;
+    StoragePrincipalHelper::GetOriginAttributes(
+        aChannel, partitionedOriginAttributes,
+        StoragePrincipalHelper::ePartitionedPrincipal);
+    if (!partitionedOriginAttributes.mPartitionKey.IsEmpty()) {
+      originAttributesList.AppendElement(partitionedOriginAttributes);
+    }
+  }
+
+  AutoTArray<RefPtr<Cookie>, 8> foundCookieList;
+  GetCookiesForURI(
+      aHostURI, aChannel, result.contains(ThirdPartyAnalysis::IsForeign),
+      result.contains(ThirdPartyAnalysis::IsThirdPartyTrackingResource),
+      result.contains(ThirdPartyAnalysis::IsThirdPartySocialTrackingResource),
+      result.contains(ThirdPartyAnalysis::IsStorageAccessPermissionGranted),
+      rejectedReason, isSafeTopLevelNav, isSameSiteForeign,
+      hadCrossSiteRedirects, true, false, originAttributesList,
+      foundCookieList);
+
+  CookieCommons::ComposeCookieString(foundCookieList, aCookieString);
+
+  if (!aCookieString.IsEmpty()) {
+    COOKIE_LOGSUCCESS(GET_COOKIE, aHostURI, aCookieString, nullptr, false);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::SetCookieStringFromHttp(nsIURI* aHostURI,
+                                       const nsACString& aCookieHeader,
+                                       nsIChannel* aChannel) {
+  NS_ENSURE_ARG(aHostURI);
+  NS_ENSURE_ARG(aChannel);
+
+  if (!IsInitialized()) {
+    return NS_OK;
+  }
+
+  if (!CookieCommons::IsSchemeSupported(aHostURI)) {
+    return NS_OK;
+  }
+
+  uint32_t rejectedReason = 0;
+  ThirdPartyAnalysisResult result = mThirdPartyUtil->AnalyzeChannel(
+      aChannel, false, aHostURI, nullptr, &rejectedReason);
+
+  OriginAttributes storagePrincipalOriginAttributes;
+  StoragePrincipalHelper::GetOriginAttributes(
+      aChannel, storagePrincipalOriginAttributes,
+      StoragePrincipalHelper::eStorageAccessPrincipal);
+
+  bool requireHostMatch;
+  nsAutoCString baseDomain;
+  nsresult rv = CookieCommons::GetBaseDomain(mTLDService, aHostURI, baseDomain,
+                                             requireHostMatch);
+  if (NS_FAILED(rv)) {
+    COOKIE_LOGFAILURE(SET_COOKIE, aHostURI, aCookieHeader,
+                      "couldn't get base domain from URI");
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsICookieJarSettings> cookieJarSettings =
+      CookieCommons::GetCookieJarSettings(aChannel);
+
+  nsAutoCString hostFromURI;
+  nsContentUtils::GetHostOrIPv6WithBrackets(aHostURI, hostFromURI);
+
+  nsAutoCString baseDomainFromURI;
+  rv = CookieCommons::GetBaseDomainFromHost(mTLDService, hostFromURI,
+                                            baseDomainFromURI);
+  NS_ENSURE_SUCCESS(rv, NS_OK);
+
+  CookieStorage* storage = PickStorage(storagePrincipalOriginAttributes);
+
+  uint32_t priorCookieCount = storage->CountCookiesFromHost(
+      baseDomainFromURI, storagePrincipalOriginAttributes.mPrivateBrowsingId);
+
+  nsCOMPtr<nsIConsoleReportCollector> crc = do_QueryInterface(aChannel);
+
+  CookieStatus cookieStatus = CheckPrefs(
+      crc, cookieJarSettings, aHostURI,
+      result.contains(ThirdPartyAnalysis::IsForeign),
+      result.contains(ThirdPartyAnalysis::IsThirdPartyTrackingResource),
+      result.contains(ThirdPartyAnalysis::IsThirdPartySocialTrackingResource),
+      result.contains(ThirdPartyAnalysis::IsStorageAccessPermissionGranted),
+      aCookieHeader, priorCookieCount, storagePrincipalOriginAttributes,
+      &rejectedReason);
+
+  MOZ_ASSERT_IF(
+      rejectedReason &&
+          rejectedReason !=
+              nsIWebProgressListener::STATE_COOKIES_PARTITIONED_TRACKER,
+      cookieStatus == STATUS_REJECTED);
+
+  switch (cookieStatus) {
+    case STATUS_REJECTED:
+      CookieCommons::NotifyRejected(aHostURI, aChannel, rejectedReason,
+                                    OPERATION_WRITE);
+      return NS_OK;  
+    case STATUS_REJECTED_WITH_ERROR:
+      CookieCommons::NotifyRejected(aHostURI, aChannel, rejectedReason,
+                                    OPERATION_WRITE);
+      return NS_OK;
+    case STATUS_ACCEPTED:  
+    case STATUS_ACCEPT_SESSION:
+      NotifyAccepted(aChannel);
+
+      if (rejectedReason ==
+          nsIWebProgressListener::STATE_COOKIES_PARTITIONED_TRACKER) {
+        ContentBlockingNotifier::OnDecision(
+            aChannel, ContentBlockingNotifier::BlockingDecision::eBlock,
+            rejectedReason);
+      }
+      break;
+    default:
+      break;
+  }
+
+  nsCOMPtr<nsIURI> channelURI;
+  NS_GetFinalChannelURI(aChannel, getter_AddRefs(channelURI));
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  bool isForeign = false;
+  mThirdPartyUtil->IsThirdPartyChannel(aChannel, aHostURI, &isForeign);
+
+  if (StaticPrefs::network_cookie_sameSite_crossSiteIframeSetCheck() &&
+      !isForeign && loadInfo->GetExternalContentPolicyType() ==
+                        ExtContentPolicy::TYPE_SUBDOCUMENT) {
+    bool triggeringPrincipalIsThirdParty = false;
+    BasePrincipal::Cast(loadInfo->TriggeringPrincipal())
+        ->IsThirdPartyURI(channelURI, &triggeringPrincipalIsThirdParty);
+    isForeign |= triggeringPrincipalIsThirdParty;
+  }
+
+  bool mustBePartitioned =
+      isForeign &&
+      cookieJarSettings->GetCookieBehavior() ==
+          nsICookieService::BEHAVIOR_PARTITION_FOREIGN &&
+      !result.contains(ThirdPartyAnalysis::IsStorageAccessPermissionGranted);
+
+  nsCString cookieHeader(aCookieHeader);
+
+  OriginAttributes partitionedPrincipalOriginAttributes;
+  bool isPartitionedPrincipal =
+      !storagePrincipalOriginAttributes.mPartitionKey.IsEmpty();
+  bool isCHIPS = StaticPrefs::network_cookie_CHIPS_enabled() &&
+                 !cookieJarSettings->GetBlockingAllContexts();
+  if (isCHIPS && !isPartitionedPrincipal) {
+    StoragePrincipalHelper::GetOriginAttributes(
+        aChannel, partitionedPrincipalOriginAttributes,
+        StoragePrincipalHelper::ePartitionedPrincipal);
+  }
+
+  nsAutoCString dateHeader;
+  CookieCommons::GetServerDateHeader(aChannel, dateHeader);
+
+  int64_t currentTimeInUsec =
+      CookieCommons::GetCurrentTimeInUSecFromChannel(aChannel);
+
+  CookieParser cookieParser(crc, aHostURI);
+
+  cookieParser.Parse(baseDomain, requireHostMatch, cookieStatus, cookieHeader,
+                     dateHeader, true, isForeign, mustBePartitioned,
+                     storagePrincipalOriginAttributes.IsPrivateBrowsing(),
+                     loadInfo->GetIsOn3PCBExceptionList(), currentTimeInUsec);
+
+  if (!cookieParser.ContainsCookie()) {
+    return NS_OK;
+  }
+
+  if (!CookieCommons::CheckCookiePermission(aChannel,
+                                            cookieParser.CookieData())) {
+    COOKIE_LOGFAILURE(SET_COOKIE, aHostURI, aCookieHeader,
+                      "cookie rejected by permission manager");
+    CookieCommons::NotifyRejected(
+        aHostURI, aChannel,
+        nsIWebProgressListener::STATE_COOKIES_BLOCKED_BY_PERMISSION,
+        OPERATION_WRITE);
+    cookieParser.RejectCookie(CookieParser::RejectedByPermissionManager);
+    return NS_OK;
+  }
+
+  bool needPartitioned = isCHIPS && cookieParser.CookieData().isPartitioned() &&
+                         !isPartitionedPrincipal;
+  OriginAttributes& cookieOriginAttributes =
+      needPartitioned ? partitionedPrincipalOriginAttributes
+                      : storagePrincipalOriginAttributes;
+  MOZ_ASSERT_IF(needPartitioned,
+                !partitionedPrincipalOriginAttributes.mPartitionKey.IsEmpty());
+
+  RefPtr<Cookie> cookie =
+      Cookie::Create(cookieParser.CookieData(), cookieOriginAttributes);
+  MOZ_ASSERT(cookie);
+
+  cookie->SetLastAccessedInUSec(currentTimeInUsec);
+  cookie->SetCreationTimeInUSec(
+      Cookie::GenerateUniqueCreationTimeInUSec(currentTimeInUsec));
+  cookie->SetUpdateTimeInUSec(cookie->CreationTimeInUSec());
+
+  RefPtr<BrowsingContext> bc = loadInfo->GetTargetBrowsingContext();
+
+  storage->AddCookie(&cookieParser, baseDomain, cookieOriginAttributes, cookie,
+                     currentTimeInUsec, aHostURI, aCookieHeader, true,
+                     isForeign, bc);
+
+  return NS_OK;
+}
+
+void CookieService::NotifyAccepted(nsIChannel* aChannel) {
+  ContentBlockingNotifier::OnDecision(
+      aChannel, ContentBlockingNotifier::BlockingDecision::eAllow, 0);
+}
+
+
+NS_IMETHODIMP
+CookieService::RunInTransaction(nsICookieTransactionCallback* aCallback) {
+  NS_ENSURE_ARG(aCallback);
+
+  if (!IsInitialized()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  mPersistentStorage->EnsureInitialized();
+  return mPersistentStorage->RunInTransaction(aCallback);
+}
+
+
+NS_IMETHODIMP
+CookieService::RemoveAll() {
+  if (!IsInitialized()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  mPersistentStorage->EnsureInitialized();
+  mPersistentStorage->RemoveAll();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::GetCookies(nsTArray<RefPtr<nsICookie>>& aCookies) {
+  if (!IsInitialized()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  mPersistentStorage->EnsureInitialized();
+
+  mPersistentStorage->GetCookies(aCookies);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::GetSessionCookies(nsTArray<RefPtr<nsICookie>>& aCookies) {
+  if (!IsInitialized()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  mPersistentStorage->EnsureInitialized();
+
+  mPersistentStorage->GetSessionCookies(aCookies);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::Add(const nsACString& aHost, const nsACString& aPath,
+                   const nsACString& aName, const nsACString& aValue,
+                   bool aIsSecure, bool aIsHttpOnly, bool aIsSession,
+                   int64_t aExpiry, JS::Handle<JS::Value> aOriginAttributes,
+                   int32_t aSameSite, nsICookie::schemeType aSchemeMap,
+                   bool aIsPartitioned, JSContext* aCx,
+                   nsICookieValidation** aValidation) {
+  NS_ENSURE_ARG_POINTER(aCx);
+  NS_ENSURE_ARG_POINTER(aValidation);
+
+  OriginAttributes attrs;
+
+  if (!aOriginAttributes.isObject() || !attrs.Init(aCx, aOriginAttributes)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  nsCOMPtr<nsICookieValidation> validation;
+  nsresult rv = AddInternal(nullptr, aHost, aPath, aName, aValue, aIsSecure,
+                            aIsHttpOnly, aIsSession, aExpiry, &attrs, aSameSite,
+                            aSchemeMap, aIsPartitioned,  true,
+                            nullptr, getter_AddRefs(validation));
+  if (rv != NS_ERROR_ILLEGAL_VALUE || !validation ||
+      CookieValidation::Cast(validation)->Result() ==
+          nsICookieValidation::eOK) {
+    validation.forget(aValidation);
+    return rv;
+  }
+
+  validation.forget(aValidation);
+  return NS_OK;
+}
+
+NS_IMETHODIMP_(nsresult)
+CookieService::AddNative(nsIURI* aCookieURI, const nsACString& aHost,
+                         const nsACString& aPath, const nsACString& aName,
+                         const nsACString& aValue, bool aIsSecure,
+                         bool aIsHttpOnly, bool aIsSession, int64_t aExpiry,
+                         OriginAttributes* aOriginAttributes, int32_t aSameSite,
+                         nsICookie::schemeType aSchemeMap, bool aIsPartitioned,
+                         bool aFromHttp, const nsID* aOperationID,
+                         nsICookieValidation** aValidation) {
+  return AddInternal(aCookieURI, aHost, aPath, aName, aValue, aIsSecure,
+                     aIsHttpOnly, aIsSession, aExpiry, aOriginAttributes,
+                     aSameSite, aSchemeMap, aIsPartitioned, aFromHttp,
+                     aOperationID, aValidation);
+}
+
+nsresult CookieService::AddInternal(
+    nsIURI* aCookieURI, const nsACString& aHost, const nsACString& aPath,
+    const nsACString& aName, const nsACString& aValue, bool aIsSecure,
+    bool aIsHttpOnly, bool aIsSession, int64_t aExpiry,
+    OriginAttributes* aOriginAttributes, int32_t aSameSite,
+    nsICookie::schemeType aSchemeMap, bool aIsPartitioned, bool aFromHttp,
+    const nsID* aOperationID, nsICookieValidation** aValidation) {
+  NS_ENSURE_ARG_POINTER(aValidation);
+
+  if (NS_WARN_IF(!aOriginAttributes)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (!IsInitialized()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  nsAutoCString host(aHost);
+  nsresult rv = NormalizeHost(host);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString baseDomain;
+  rv = CookieCommons::GetBaseDomainFromHost(mTLDService, host, baseDomain);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  int64_t currentTimeInUsec = PR_Now();
+  int64_t uniqueCreationTimeInUSec =
+      Cookie::GenerateUniqueCreationTimeInUSec(currentTimeInUsec);
+
+  CookieStruct cookieData(nsCString(aName), nsCString(aValue), host,
+                          nsCString(aPath), aExpiry, currentTimeInUsec,
+                          uniqueCreationTimeInUSec, uniqueCreationTimeInUSec,
+                          aIsHttpOnly, aIsSession, aIsSecure, aIsPartitioned,
+                          aSameSite, aSchemeMap);
+
+  RefPtr<CookieValidation> cv = CookieValidation::Validate(cookieData);
+
+  if (cv->Result() != nsICookieValidation::eOK) {
+    cv.forget(aValidation);
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
+
+  RefPtr<Cookie> cookie = Cookie::Create(cookieData, *aOriginAttributes);
+  MOZ_ASSERT(cookie);
+
+  CookieStorage* storage = PickStorage(*aOriginAttributes);
+  storage->AddCookie(nullptr, baseDomain, *aOriginAttributes, cookie,
+                     currentTimeInUsec, aCookieURI, VoidCString(), aFromHttp,
+                     !aOriginAttributes->mPartitionKey.IsEmpty(), nullptr,
+                     aOperationID);
+
+  cv.forget(aValidation);
+  return NS_OK;
+}
+
+nsresult CookieService::Remove(const nsACString& aHost,
+                               const OriginAttributes& aAttrs,
+                               const nsACString& aName, const nsACString& aPath,
+                               bool aFromHttp, const nsID* aOperationID) {
+  nsAutoCString host(aHost);
+  nsresult rv = NormalizeHost(host);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString baseDomain;
+  if (!host.IsEmpty()) {
+    rv = CookieCommons::GetBaseDomainFromHost(mTLDService, host, baseDomain);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  if (!IsInitialized()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  CookieStorage* storage = PickStorage(aAttrs);
+  storage->RemoveCookie(baseDomain, aAttrs, host, PromiseFlatCString(aName),
+                        PromiseFlatCString(aPath), aFromHttp, aOperationID);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::Remove(const nsACString& aHost, const nsACString& aName,
+                      const nsACString& aPath,
+                      JS::Handle<JS::Value> aOriginAttributes, JSContext* aCx) {
+  OriginAttributes attrs;
+
+  if (!aOriginAttributes.isObject() || !attrs.Init(aCx, aOriginAttributes)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  return RemoveNative(aHost, aName, aPath, &attrs,  true,
+                      nullptr);
+}
+
+NS_IMETHODIMP_(nsresult)
+CookieService::RemoveNative(const nsACString& aHost, const nsACString& aName,
+                            const nsACString& aPath,
+                            OriginAttributes* aOriginAttributes, bool aFromHttp,
+                            const nsID* aOperationID) {
+  if (NS_WARN_IF(!aOriginAttributes)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsresult rv =
+      Remove(aHost, *aOriginAttributes, aName, aPath, aFromHttp, aOperationID);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  return NS_OK;
+}
+
+void CookieService::GetCookiesForURI(
+    nsIURI* aHostURI, nsIChannel* aChannel, bool aIsForeign,
+    bool aIsThirdPartyTrackingResource,
+    bool aIsThirdPartySocialTrackingResource,
+    bool aStorageAccessPermissionGranted, uint32_t aRejectedReason,
+    bool aIsSafeTopLevelNav, bool aIsSameSiteForeign,
+    bool aHadCrossSiteRedirects, bool aHttpBound,
+    bool aAllowSecureCookiesToInsecureOrigin,
+    const nsTArray<OriginAttributes>& aOriginAttrsList,
+    nsTArray<RefPtr<Cookie>>& aCookieList) {
+  NS_ASSERTION(aHostURI, "null host!");
+
+  if (!CookieCommons::IsSchemeSupported(aHostURI)) {
+    return;
+  }
+
+  if (!IsInitialized()) {
+    return;
+  }
+
+  nsCOMPtr<nsICookieJarSettings> cookieJarSettings =
+      CookieCommons::GetCookieJarSettings(aChannel);
+
+  nsCOMPtr<nsIConsoleReportCollector> crc = do_QueryInterface(aChannel);
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel ? aChannel->LoadInfo() : nullptr;
+  const bool on3pcdException = loadInfo && loadInfo->GetIsOn3PCBExceptionList();
+
+  bool hasBothPartitionedAndUnpartitioned = false;
+  if (aOriginAttrsList.Length() > 1) {
+    bool hasUnpartitioned = false;
+    bool hasPartitioned = false;
+    for (const auto& a : aOriginAttrsList) {
+      if (a.mPartitionKey.IsEmpty()) {
+        hasUnpartitioned = true;
+      } else {
+        hasPartitioned = true;
+      }
+    }
+    hasBothPartitionedAndUnpartitioned = hasUnpartitioned && hasPartitioned;
+  }
+
+  for (const auto& attrs : aOriginAttrsList) {
+    CookieStorage* storage = PickStorage(attrs);
+
+    bool requireHostMatch;
+    nsAutoCString baseDomain;
+    nsAutoCString hostFromURI;
+    nsAutoCString pathFromURI;
+    nsresult rv = CookieCommons::GetBaseDomain(mTLDService, aHostURI,
+                                               baseDomain, requireHostMatch);
+    if (NS_SUCCEEDED(rv)) {
+      rv = nsContentUtils::GetHostOrIPv6WithBrackets(aHostURI, hostFromURI);
+    }
+    if (NS_SUCCEEDED(rv)) {
+      rv = aHostURI->GetFilePath(pathFromURI);
+    }
+    if (NS_FAILED(rv)) {
+      COOKIE_LOGFAILURE(GET_COOKIE, aHostURI, VoidCString(),
+                        "invalid host/path from URI");
+      return;
+    }
+
+    nsAutoCString normalizedHostFromURI(hostFromURI);
+    rv = NormalizeHost(normalizedHostFromURI);
+    NS_ENSURE_SUCCESS_VOID(rv);
+
+    nsAutoCString baseDomainFromURI;
+    rv = CookieCommons::GetBaseDomainFromHost(
+        mTLDService, normalizedHostFromURI, baseDomainFromURI);
+    NS_ENSURE_SUCCESS_VOID(rv);
+
+    uint32_t rejectedReason = aRejectedReason;
+    uint32_t priorCookieCount = storage->CountCookiesFromHost(
+        baseDomainFromURI, attrs.mPrivateBrowsingId);
+
+    CookieStatus cookieStatus = CheckPrefs(
+        crc, cookieJarSettings, aHostURI, aIsForeign,
+        aIsThirdPartyTrackingResource, aIsThirdPartySocialTrackingResource,
+        aStorageAccessPermissionGranted, VoidCString(), priorCookieCount, attrs,
+        &rejectedReason);
+
+    MOZ_ASSERT_IF(
+        rejectedReason &&
+            rejectedReason !=
+                nsIWebProgressListener::STATE_COOKIES_PARTITIONED_TRACKER,
+        cookieStatus == STATUS_REJECTED);
+
+    switch (cookieStatus) {
+      case STATUS_REJECTED:
+        if (priorCookieCount) {
+          CookieCommons::NotifyRejected(aHostURI, aChannel, rejectedReason,
+                                        OPERATION_READ);
+        }
+        return;
+      default:
+        break;
+    }
+
+
+    bool potentiallyTrustworthy =
+        nsMixedContentBlocker::IsPotentiallyTrustworthyOrigin(aHostURI);
+
+    int64_t currentTimeInUsec = PR_Now();
+    int64_t currentTimeInMSec = currentTimeInUsec / PR_USEC_PER_MSEC;
+    bool stale = false;
+
+    nsTArray<RefPtr<Cookie>> cookies;
+    storage->GetCookiesFromHost(baseDomain, attrs, cookies);
+    if (cookies.IsEmpty()) {
+      continue;
+    }
+
+    bool laxByDefault =
+        StaticPrefs::network_cookie_sameSite_laxByDefault() &&
+        !nsContentUtils::IsURIInPrefList(
+            aHostURI, "network.cookie.sameSite.laxByDefault.disabledHosts");
+
+    for (Cookie* cookie : cookies) {
+      if (!CookieCommons::DomainMatches(cookie, hostFromURI)) {
+        continue;
+      }
+
+      if (cookie->IsSecure() && !potentiallyTrustworthy &&
+          !aAllowSecureCookiesToInsecureOrigin) {
+        continue;
+      }
+
+      if (cookie->IsHttpOnly() && !aHttpBound) {
+        continue;
+      }
+
+      if (!CookieCommons::PathMatches(cookie, pathFromURI)) {
+        continue;
+      }
+
+      if (cookie->ExpiryInMSec() <= currentTimeInMSec) {
+        continue;
+      }
+
+      if (!StaticPrefs::network_cookie_CHIPS_affectsTCP() &&
+          hasBothPartitionedAndUnpartitioned &&
+          !attrs.mPartitionKey.IsEmpty() && !cookie->RawIsPartitioned()) {
+        continue;
+      }
+
+      if (aIsForeign && cookieJarSettings->GetPartitionForeign() &&
+          (StaticPrefs::network_cookie_cookieBehavior_optInPartitioning() ||
+           (attrs.IsPrivateBrowsing() &&
+            StaticPrefs::
+                network_cookie_cookieBehavior_optInPartitioning_pbmode())) &&
+          !(cookie->IsPartitioned() && cookie->RawIsPartitioned()) &&
+          !aStorageAccessPermissionGranted && !on3pcdException) {
+        continue;
+      }
+
+      if (aHttpBound && aIsSameSiteForeign) {
+        bool blockCookie = !ProcessSameSiteCookieForForeignRequest(
+            aChannel, cookie, aIsSafeTopLevelNav, aHadCrossSiteRedirects,
+            laxByDefault);
+
+        if (blockCookie) {
+          if (aHadCrossSiteRedirects) {
+            CookieLogging::LogMessageToConsole(
+                crc, aHostURI, nsIScriptError::warningFlag,
+                CONSOLE_REJECTION_CATEGORY, "CookieBlockedCrossSiteRedirect"_ns,
+                AutoTArray<nsString, 1>{
+                    NS_ConvertUTF8toUTF16(cookie->Name()),
+                });
+          }
+          continue;
+        }
+      }
+
+      aCookieList.AppendElement(cookie);
+      if (cookie->IsStale()) {
+        stale = true;
+      }
+    }
+
+    if (aCookieList.IsEmpty()) {
+      continue;
+    }
+
+    if (stale) {
+      storage->StaleCookies(aCookieList, currentTimeInUsec);
+    }
+  }
+
+  if (aCookieList.IsEmpty()) {
+    return;
+  }
+
+  NotifyAccepted(aChannel);
+
+  aCookieList.Sort(CompareCookiesForSending());
+}
+
+
+nsresult CookieService::NormalizeHost(nsCString& aHost) {
+  nsAutoCString host;
+  if (!CookieCommons::IsIPv6BaseDomain(aHost)) {
+    nsresult rv = NS_DomainToASCII(aHost, host);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    aHost = host;
+  }
+
+  return NS_OK;
+}
+
+CookieStatus CookieService::CheckPrefs(
+    nsIConsoleReportCollector* aCRC, nsICookieJarSettings* aCookieJarSettings,
+    nsIURI* aHostURI, bool aIsForeign, bool aIsThirdPartyTrackingResource,
+    bool aIsThirdPartySocialTrackingResource,
+    bool aStorageAccessPermissionGranted, const nsACString& aCookieHeader,
+    const int aNumOfCookies, const OriginAttributes& aOriginAttrs,
+    uint32_t* aRejectedReason) {
+  nsresult rv;
+
+  MOZ_ASSERT(aRejectedReason);
+
+  *aRejectedReason = 0;
+
+  if (!CookieCommons::IsSchemeSupported(aHostURI)) {
+    COOKIE_LOGFAILURE(!aCookieHeader.IsVoid(), aHostURI, aCookieHeader,
+                      "non http/https sites cannot read cookies");
+    return STATUS_REJECTED_WITH_ERROR;
+  }
+
+  nsCOMPtr<nsIPrincipal> principal =
+      BasePrincipal::CreateContentPrincipal(aHostURI, aOriginAttrs);
+
+  if (!principal) {
+    COOKIE_LOGFAILURE(!aCookieHeader.IsVoid(), aHostURI, aCookieHeader,
+                      "non-content principals cannot get/set cookies");
+    return STATUS_REJECTED_WITH_ERROR;
+  }
+
+  uint32_t cookiePermission = nsICookiePermission::ACCESS_DEFAULT;
+  rv = aCookieJarSettings->CookiePermission(principal, &cookiePermission);
+  if (NS_SUCCEEDED(rv)) {
+    switch (cookiePermission) {
+      case nsICookiePermission::ACCESS_DENY:
+        COOKIE_LOGFAILURE(!aCookieHeader.IsVoid(), aHostURI, aCookieHeader,
+                          "cookies are blocked for this site");
+        CookieLogging::LogMessageToConsole(
+            aCRC, aHostURI, nsIScriptError::warningFlag,
+            CONSOLE_REJECTION_CATEGORY, "CookieRejectedByPermissionManager"_ns,
+            AutoTArray<nsString, 1>{
+                NS_ConvertUTF8toUTF16(aCookieHeader),
+            });
+
+        *aRejectedReason =
+            nsIWebProgressListener::STATE_COOKIES_BLOCKED_BY_PERMISSION;
+        return STATUS_REJECTED;
+
+      case nsICookiePermission::ACCESS_ALLOW:
+        return STATUS_ACCEPTED;
+      default:
+        break;
+    }
+  }
+
+  if (aIsForeign && aIsThirdPartyTrackingResource &&
+      !aStorageAccessPermissionGranted &&
+      aCookieJarSettings->GetRejectThirdPartyContexts()) {
+    if (aCookieJarSettings->GetPartitionForeign()) {
+      MOZ_ASSERT(!aOriginAttrs.mPartitionKey.IsEmpty(),
+                 "We must have a StoragePrincipal here!");
+      *aRejectedReason =
+          nsIWebProgressListener::STATE_COOKIES_PARTITIONED_TRACKER;
+      return STATUS_ACCEPTED;
+    }
+
+    COOKIE_LOGFAILURE(!aCookieHeader.IsVoid(), aHostURI, aCookieHeader,
+                      "cookies are disabled in trackers");
+    if (aIsThirdPartySocialTrackingResource) {
+      *aRejectedReason =
+          nsIWebProgressListener::STATE_COOKIES_BLOCKED_SOCIALTRACKER;
+    } else {
+      *aRejectedReason = nsIWebProgressListener::STATE_COOKIES_BLOCKED_TRACKER;
+    }
+    return STATUS_REJECTED;
+  }
+
+  if (aCookieJarSettings->GetCookieBehavior() ==
+          nsICookieService::BEHAVIOR_REJECT &&
+      !aStorageAccessPermissionGranted) {
+    COOKIE_LOGFAILURE(!aCookieHeader.IsVoid(), aHostURI, aCookieHeader,
+                      "cookies are disabled");
+    *aRejectedReason = nsIWebProgressListener::STATE_COOKIES_BLOCKED_ALL;
+    return STATUS_REJECTED;
+  }
+
+  if (aIsForeign) {
+    if (aCookieJarSettings->GetCookieBehavior() ==
+            nsICookieService::BEHAVIOR_REJECT_FOREIGN &&
+        !aStorageAccessPermissionGranted) {
+      COOKIE_LOGFAILURE(!aCookieHeader.IsVoid(), aHostURI, aCookieHeader,
+                        "context is third party");
+      CookieLogging::LogMessageToConsole(
+          aCRC, aHostURI, nsIScriptError::warningFlag,
+          CONSOLE_REJECTION_CATEGORY, "CookieRejectedThirdParty"_ns,
+          AutoTArray<nsString, 1>{
+              NS_ConvertUTF8toUTF16(aCookieHeader),
+          });
+      *aRejectedReason = nsIWebProgressListener::STATE_COOKIES_BLOCKED_FOREIGN;
+      return STATUS_REJECTED;
+    }
+
+    if (aCookieJarSettings->GetLimitForeignContexts() &&
+        !aStorageAccessPermissionGranted && aNumOfCookies == 0) {
+      COOKIE_LOGFAILURE(!aCookieHeader.IsVoid(), aHostURI, aCookieHeader,
+                        "context is third party");
+      CookieLogging::LogMessageToConsole(
+          aCRC, aHostURI, nsIScriptError::warningFlag,
+          CONSOLE_REJECTION_CATEGORY, "CookieRejectedThirdParty"_ns,
+          AutoTArray<nsString, 1>{
+              NS_ConvertUTF8toUTF16(aCookieHeader),
+          });
+      *aRejectedReason = nsIWebProgressListener::STATE_COOKIES_BLOCKED_FOREIGN;
+      return STATUS_REJECTED;
+    }
+  }
+
+  return STATUS_ACCEPTED;
+}
+
+
+NS_IMETHODIMP
+CookieService::CookieExists(const nsACString& aHost, const nsACString& aPath,
+                            const nsACString& aName,
+                            JS::Handle<JS::Value> aOriginAttributes,
+                            JSContext* aCx, bool* aFoundCookie) {
+  NS_ENSURE_ARG_POINTER(aCx);
+  NS_ENSURE_ARG_POINTER(aFoundCookie);
+
+  OriginAttributes attrs;
+  if (!aOriginAttributes.isObject() || !attrs.Init(aCx, aOriginAttributes)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  return CookieExistsNative(aHost, aPath, aName, &attrs, aFoundCookie);
+}
+
+NS_IMETHODIMP_(nsresult)
+CookieService::CookieExistsNative(const nsACString& aHost,
+                                  const nsACString& aPath,
+                                  const nsACString& aName,
+                                  OriginAttributes* aOriginAttributes,
+                                  bool* aFoundCookie) {
+  nsCOMPtr<nsICookie> cookie;
+  nsresult rv = GetCookieNative(aHost, aPath, aName, aOriginAttributes,
+                                getter_AddRefs(cookie));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  *aFoundCookie = cookie != nullptr;
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP_(nsresult)
+CookieService::GetCookieNative(const nsACString& aHost, const nsACString& aPath,
+                               const nsACString& aName,
+                               OriginAttributes* aOriginAttributes,
+                               nsICookie** aCookie) {
+  NS_ENSURE_ARG_POINTER(aOriginAttributes);
+  NS_ENSURE_ARG_POINTER(aCookie);
+
+  if (!IsInitialized()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  nsAutoCString baseDomain;
+  nsresult rv =
+      CookieCommons::GetBaseDomainFromHost(mTLDService, aHost, baseDomain);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  CookieStorage* storage = PickStorage(*aOriginAttributes);
+
+  RefPtr<Cookie> cookie =
+      storage->FindCookie(baseDomain, *aOriginAttributes, aHost, aName, aPath);
+  cookie.forget(aCookie);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::CountCookiesFromHost(const nsACString& aHost,
+                                    uint32_t* aCountFromHost) {
+  nsAutoCString host(aHost);
+  nsresult rv = NormalizeHost(host);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString baseDomain;
+  rv = CookieCommons::GetBaseDomainFromHost(mTLDService, host, baseDomain);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (!IsInitialized()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  mPersistentStorage->EnsureInitialized();
+
+  *aCountFromHost = mPersistentStorage->CountCookiesFromHost(baseDomain, 0);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::HasCookiesForSite(const nsACString& aHost,
+                                 const nsAString& aPattern, bool* aResult) {
+  NS_ENSURE_ARG_POINTER(aResult);
+  *aResult = false;
+
+  OriginAttributesPattern pattern;
+  if (!pattern.Init(aPattern)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  nsAutoCString host(aHost);
+  nsresult rv = NormalizeHost(host);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString baseDomain;
+  rv = CookieCommons::GetBaseDomainFromHost(mTLDService, host, baseDomain);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (!IsInitialized()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  CookieStorage* storage = PickStorage(pattern);
+  storage->EnsureInitialized();
+
+  *aResult = storage->HasCookiesForSite(baseDomain, pattern);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::GetCookiesFromHost(const nsACString& aHost,
+                                  JS::Handle<JS::Value> aOriginAttributes,
+                                  bool aSorted, JSContext* aCx,
+                                  nsTArray<RefPtr<nsICookie>>& aResult) {
+  OriginAttributes attrs;
+  if (!aOriginAttributes.isObject() || !attrs.Init(aCx, aOriginAttributes)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  return GetCookiesFromHostNative(aHost, &attrs, aSorted, aResult);
+}
+
+NS_IMETHODIMP
+CookieService::GetCookiesFromHostNative(const nsACString& aHost,
+                                        OriginAttributes* aAttrs, bool aSorted,
+                                        nsTArray<RefPtr<nsICookie>>& aResult) {
+  nsAutoCString host(aHost);
+  nsresult rv = NormalizeHost(host);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString baseDomain;
+  rv = CookieCommons::GetBaseDomainFromHost(mTLDService, host, baseDomain);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (!IsInitialized()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  CookieStorage* storage = PickStorage(*aAttrs);
+
+  nsTArray<RefPtr<Cookie>> cookies;
+  storage->GetCookiesFromHost(baseDomain, *aAttrs, cookies);
+
+  if (cookies.IsEmpty()) {
+    return NS_OK;
+  }
+
+  aResult.SetCapacity(cookies.Length());
+  for (Cookie* cookie : cookies) {
+    aResult.AppendElement(cookie);
+  }
+
+  if (aSorted) {
+    aResult.Sort(CompareCookiesForSending());
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::GetCookiesWithOriginAttributes(
+    const nsAString& aPattern, const nsACString& aHost, const bool aSorted,
+    nsTArray<RefPtr<nsICookie>>& aResult) {
+  OriginAttributesPattern pattern;
+  if (!pattern.Init(aPattern)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  nsAutoCString host(aHost);
+  nsresult rv = NormalizeHost(host);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString baseDomain;
+  rv = CookieCommons::GetBaseDomainFromHost(mTLDService, host, baseDomain);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return GetCookiesWithOriginAttributes(pattern, baseDomain, aSorted, aResult);
+}
+
+nsresult CookieService::GetCookiesWithOriginAttributes(
+    const OriginAttributesPattern& aPattern, const nsCString& aBaseDomain,
+    bool aSorted, nsTArray<RefPtr<nsICookie>>& aResult) {
+  CookieStorage* storage = PickStorage(aPattern);
+  storage->GetCookiesWithOriginAttributes(aPattern, aBaseDomain, aSorted,
+                                          aResult);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::RemoveCookiesWithOriginAttributes(const nsAString& aPattern,
+                                                 const nsACString& aHost) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  OriginAttributesPattern pattern;
+  if (!pattern.Init(aPattern)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  nsAutoCString host(aHost);
+  nsresult rv = NormalizeHost(host);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString baseDomain;
+  rv = CookieCommons::GetBaseDomainFromHost(mTLDService, host, baseDomain);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return RemoveCookiesWithOriginAttributes(pattern, baseDomain);
+}
+
+nsresult CookieService::RemoveCookiesWithOriginAttributes(
+    const OriginAttributesPattern& aPattern, const nsCString& aBaseDomain) {
+  if (!IsInitialized()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  CookieStorage* storage = PickStorage(aPattern);
+  storage->RemoveCookiesWithOriginAttributes(aPattern, aBaseDomain);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::RemoveCookiesFromExactHost(const nsACString& aHost,
+                                          const nsAString& aPattern) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  OriginAttributesPattern pattern;
+  if (!pattern.Init(aPattern)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  return RemoveCookiesFromExactHost(aHost, pattern);
+}
+
+nsresult CookieService::RemoveCookiesFromExactHost(
+    const nsACString& aHost, const OriginAttributesPattern& aPattern) {
+  nsAutoCString host(aHost);
+  nsresult rv = NormalizeHost(host);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString baseDomain;
+  rv = CookieCommons::GetBaseDomainFromHost(mTLDService, host, baseDomain);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (!IsInitialized()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  CookieStorage* storage = PickStorage(aPattern);
+  storage->RemoveCookiesFromExactHost(aHost, baseDomain, aPattern);
+
+  return NS_OK;
+}
+
+namespace {
+
+class RemoveAllSinceRunnable : public Runnable {
+ public:
+  using CookieArray = nsTArray<RefPtr<nsICookie>>;
+  RemoveAllSinceRunnable(Promise* aPromise, CookieService* aSelf,
+                         CookieArray&& aCookieArray, int64_t aSinceWhen)
+      : Runnable("RemoveAllSinceRunnable"),
+        mPromise(aPromise),
+        mSelf(aSelf),
+        mList(std::move(aCookieArray)),
+        mIndex(0),
+        mSinceWhen(aSinceWhen) {}
+
+  NS_IMETHODIMP Run() override {
+    RemoveSome();
+
+    if (mIndex < mList.Length()) {
+      return NS_DispatchToCurrentThread(this);
+    }
+    mPromise->MaybeResolveWithUndefined();
+
+    return NS_OK;
+  }
+
+ private:
+  void RemoveSome() {
+    for (CookieArray::size_type iter = 0;
+         iter < kYieldPeriod && mIndex < mList.Length(); ++mIndex, ++iter) {
+      auto* cookie = static_cast<Cookie*>(mList[mIndex].get());
+      if (cookie->CreationTimeInUSec() > mSinceWhen &&
+          NS_FAILED(mSelf->Remove(cookie->Host(), cookie->OriginAttributesRef(),
+                                  cookie->Name(), cookie->Path(),
+                                   true, nullptr))) {
+        continue;
+      }
+    }
+  }
+
+ private:
+  RefPtr<Promise> mPromise;
+  RefPtr<CookieService> mSelf;
+  CookieArray mList;
+  CookieArray::size_type mIndex;
+  int64_t mSinceWhen;
+  static const CookieArray::size_type kYieldPeriod = 10;
+};
+
+}  
+
+NS_IMETHODIMP
+CookieService::RemoveAllSince(int64_t aSinceWhen, JSContext* aCx,
+                              Promise** aRetVal) {
+  nsIGlobalObject* globalObject = xpc::CurrentNativeGlobal(aCx);
+  if (NS_WARN_IF(!globalObject)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  ErrorResult result;
+  RefPtr<Promise> promise = Promise::Create(globalObject, result);
+  if (NS_WARN_IF(result.Failed())) {
+    return result.StealNSResult();
+  }
+
+  mPersistentStorage->EnsureInitialized();
+
+  nsTArray<RefPtr<nsICookie>> cookieList;
+
+  mPersistentStorage->GetAll(cookieList);
+
+  RefPtr<RemoveAllSinceRunnable> runMe = new RemoveAllSinceRunnable(
+      promise, this, std::move(cookieList), aSinceWhen);
+
+  promise.forget(aRetVal);
+
+  return runMe->Run();
+}
+
+namespace {
+
+class CompareCookiesCreationTime {
+ public:
+  static bool Equals(const nsICookie* aCookie1, const nsICookie* aCookie2) {
+    return static_cast<const Cookie*>(aCookie1)->CreationTimeInUSec() ==
+           static_cast<const Cookie*>(aCookie2)->CreationTimeInUSec();
+  }
+
+  static bool LessThan(const nsICookie* aCookie1, const nsICookie* aCookie2) {
+    return static_cast<const Cookie*>(aCookie1)->CreationTimeInUSec() <
+           static_cast<const Cookie*>(aCookie2)->CreationTimeInUSec();
+  }
+};
+
+}  
+
+NS_IMETHODIMP
+CookieService::GetCookiesSince(int64_t aSinceWhen,
+                               nsTArray<RefPtr<nsICookie>>& aResult) {
+  if (!IsInitialized()) {
+    return NS_OK;
+  }
+
+  mPersistentStorage->EnsureInitialized();
+
+  nsTArray<RefPtr<nsICookie>> cookieList;
+  mPersistentStorage->GetAll(cookieList);
+
+  for (RefPtr<nsICookie>& cookie : cookieList) {
+    if (static_cast<Cookie*>(cookie.get())->CreationTimeInUSec() >=
+        aSinceWhen) {
+      aResult.AppendElement(cookie);
+    }
+  }
+
+  aResult.Sort(CompareCookiesCreationTime());
+  return NS_OK;
+}
+
+size_t CookieService::SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+  size_t n = aMallocSizeOf(this);
+
+  if (mPersistentStorage) {
+    n += mPersistentStorage->SizeOfIncludingThis(aMallocSizeOf);
+  }
+  if (mPrivateStorage) {
+    n += mPrivateStorage->SizeOfIncludingThis(aMallocSizeOf);
+  }
+
+  return n;
+}
+
+MOZ_DEFINE_MALLOC_SIZE_OF(CookieServiceMallocSizeOf)
+
+NS_IMETHODIMP
+CookieService::CollectReports(nsIHandleReportCallback* aHandleReport,
+                              nsISupports* aData, bool ) {
+  MOZ_COLLECT_REPORT("explicit/cookie-service", KIND_HEAP, UNITS_BYTES,
+                     SizeOfIncludingThis(CookieServiceMallocSizeOf),
+                     "Memory used by the cookie service.");
+
+  return NS_OK;
+}
+
+bool CookieService::IsInitialized() const {
+  if (!mPersistentStorage) {
+    NS_WARNING("No CookieStorage! Profile already close?");
+    return false;
+  }
+
+  MOZ_ASSERT(mPrivateStorage);
+  return true;
+}
+
+CookieStorage* CookieService::PickStorage(const OriginAttributes& aAttrs) {
+  MOZ_ASSERT(IsInitialized());
+
+  if (aAttrs.IsPrivateBrowsing()) {
+    return mPrivateStorage;
+  }
+
+  mPersistentStorage->EnsureInitialized();
+  return mPersistentStorage;
+}
+
+CookieStorage* CookieService::PickStorage(
+    const OriginAttributesPattern& aAttrs) {
+  MOZ_ASSERT(IsInitialized());
+
+  if (aAttrs.mPrivateBrowsingId.WasPassed() &&
+      aAttrs.mPrivateBrowsingId.Value() > 0) {
+    return mPrivateStorage;
+  }
+
+  mPersistentStorage->EnsureInitialized();
+  return mPersistentStorage;
+}
+
+nsICookieValidation::ValidationError CookieService::SetCookiesFromIPC(
+    const nsACString& aBaseDomain, const OriginAttributes& aAttrs,
+    nsIURI* aHostURI, bool aIsThirdParty,
+    const nsTArray<CookieStruct>& aCookies, BrowsingContext* aBrowsingContext) {
+  if (!IsInitialized()) {
+    return nsICookieValidation::eOK;
+  }
+
+  CookieStorage* storage = PickStorage(aAttrs);
+  int64_t currentTimeInUsec = PR_Now();
+
+  for (const CookieStruct& cookieData : aCookies) {
+    RefPtr<CookieValidation> validation = CookieValidation::ValidateForHost(
+        cookieData, aHostURI, aBaseDomain, false, false);
+    MOZ_ASSERT(validation);
+
+    if (validation->Result() != nsICookieValidation::eOK) {
+      return validation->Result();
+    }
+
+    RefPtr<Cookie> cookie = Cookie::Create(cookieData, aAttrs);
+    if (!cookie) {
+      continue;
+    }
+
+    cookie->SetLastAccessedInUSec(currentTimeInUsec);
+    cookie->SetCreationTimeInUSec(
+        Cookie::GenerateUniqueCreationTimeInUSec(currentTimeInUsec));
+    cookie->SetUpdateTimeInUSec(cookie->CreationTimeInUSec());
+
+    storage->AddCookie(nullptr, aBaseDomain, aAttrs, cookie, currentTimeInUsec,
+                       aHostURI, ""_ns, false, aIsThirdParty, aBrowsingContext);
+  }
+
+  return nsICookieValidation::eOK;
+}
+
+void CookieService::GetCookiesFromHost(
+    const nsACString& aBaseDomain, const OriginAttributes& aOriginAttributes,
+    nsTArray<RefPtr<Cookie>>& aCookies) {
+  if (!IsInitialized()) {
+    return;
+  }
+
+  CookieStorage* storage = PickStorage(aOriginAttributes);
+  storage->GetCookiesFromHost(aBaseDomain, aOriginAttributes, aCookies);
+}
+
+void CookieService::StaleCookies(const nsTArray<RefPtr<Cookie>>& aCookies,
+                                 int64_t aCurrentTimeInUsec) {
+  if (!IsInitialized()) {
+    return;
+  }
+
+  if (aCookies.IsEmpty()) {
+    return;
+  }
+
+  OriginAttributes originAttributes = aCookies[0]->OriginAttributesRef();
+#ifdef MOZ_DEBUG
+  for (Cookie* cookie : aCookies) {
+    MOZ_ASSERT(originAttributes == cookie->OriginAttributesRef());
+  }
+#endif
+
+  CookieStorage* storage = PickStorage(originAttributes);
+  storage->StaleCookies(aCookies, aCurrentTimeInUsec);
+}
+
+bool CookieService::HasExistingCookies(
+    const nsACString& aBaseDomain, const OriginAttributes& aOriginAttributes) {
+  if (!IsInitialized()) {
+    return false;
+  }
+
+  CookieStorage* storage = PickStorage(aOriginAttributes);
+  return !!storage->CountCookiesFromHost(aBaseDomain,
+                                         aOriginAttributes.mPrivateBrowsingId);
+}
+
+void CookieService::AddCookieFromDocument(
+    CookieParser& aCookieParser, const nsACString& aBaseDomain,
+    const OriginAttributes& aOriginAttributes, Cookie& aCookie,
+    int64_t aCurrentTimeInUsec, nsIURI* aDocumentURI, bool aThirdParty,
+    Document* aDocument) {
+  MOZ_ASSERT(aDocumentURI);
+  MOZ_ASSERT(aDocument);
+
+  if (!IsInitialized()) {
+    return;
+  }
+
+  nsAutoCString cookieString;
+  aCookieParser.GetCookieString(cookieString);
+
+  PickStorage(aOriginAttributes)
+      ->AddCookie(&aCookieParser, aBaseDomain, aOriginAttributes, &aCookie,
+                  aCurrentTimeInUsec, aDocumentURI, cookieString, false,
+                  aThirdParty, aDocument->GetBrowsingContext());
+}
+
+void CookieService::Update3PCBExceptionInfo(nsIChannel* aChannel) {
+  MOZ_ASSERT(aChannel);
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  RefPtr<CookieService> csSingleton = CookieService::GetSingleton();
+
+  if (loadInfo->GetExternalContentPolicyType() ==
+      ExtContentPolicy::TYPE_DOCUMENT) {
+    return;
+  }
+
+  if (!csSingleton->mThirdPartyCookieBlockingExceptions.IsInitialized()) {
+    return;
+  }
+
+  if (loadInfo->TriggeringPrincipal()->IsSystemPrincipal()) {
+    return;
+  }
+
+  bool isInExceptionList =
+      csSingleton->mThirdPartyCookieBlockingExceptions.CheckExceptionForChannel(
+          aChannel);
+
+  (void)loadInfo->SetIsOn3PCBExceptionList(isInExceptionList);
+}
+
+NS_IMETHODIMP
+CookieService::AddThirdPartyCookieBlockingExceptions(
+    const nsTArray<RefPtr<nsIThirdPartyCookieExceptionEntry>>& aExceptions) {
+  for (const auto& ex : aExceptions) {
+    nsAutoCString exception;
+    MOZ_ALWAYS_SUCCEEDS(ex->Serialize(exception));
+    mThirdPartyCookieBlockingExceptions.Insert(exception);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::RemoveThirdPartyCookieBlockingExceptions(
+    const nsTArray<RefPtr<nsIThirdPartyCookieExceptionEntry>>& aExceptions) {
+  for (const auto& ex : aExceptions) {
+    nsAutoCString exception;
+    MOZ_ALWAYS_SUCCEEDS(ex->Serialize(exception));
+    mThirdPartyCookieBlockingExceptions.Remove(exception);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::TestGet3PCBExceptions(nsTArray<nsCString>& aExceptions) {
+  aExceptions.Clear();
+
+  mThirdPartyCookieBlockingExceptions.GetExceptions(aExceptions);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CookieService::MaybeCapExpiry(int64_t aExpiryInMSec, int64_t* aResult) {
+  NS_ENSURE_ARG_POINTER(aResult);
+  *aResult =
+      CookieCommons::MaybeCapExpiry(PR_Now() / PR_USEC_PER_MSEC, aExpiryInMSec);
+  return NS_OK;
+}
+
+}  
+}  

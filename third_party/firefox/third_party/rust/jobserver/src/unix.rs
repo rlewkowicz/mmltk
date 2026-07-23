@@ -1,0 +1,471 @@
+use libc::c_int;
+
+use crate::FromEnvErrorInner;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::mem;
+use std::mem::MaybeUninit;
+use std::os::unix::prelude::*;
+use std::path::Path;
+use std::process::Command;
+use std::ptr;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Once,
+};
+use std::thread::{self, Builder, JoinHandle};
+use std::time::Duration;
+
+#[derive(Debug)]
+/// This preserves the `--jobserver-auth` type at creation time,
+/// so auth type will be passed down to and inherit from sub-Make processes correctly.
+///
+/// See <https://github.com/rust-lang/jobserver-rs/issues/99> for details.
+enum ClientCreationArg {
+    Fds { read: c_int, write: c_int },
+    Fifo(Box<Path>),
+}
+
+#[derive(Debug)]
+pub struct Client {
+    read: File,
+    write: File,
+    creation_arg: ClientCreationArg,
+    /// It is set to `None` if the pipe is shared with other processes, so it
+    /// cannot support non-blocking mode.
+    ///
+    /// If it is set to `Some`, then it can only go from
+    /// `Some(false)` -> `Some(true)` but not the other way around,
+    /// since that could cause a race condition.
+    is_non_blocking: Option<AtomicBool>,
+}
+
+#[derive(Debug)]
+pub struct Acquired {
+    byte: u8,
+}
+
+impl Client {
+    pub fn new(mut limit: usize) -> io::Result<Client> {
+        let client = unsafe { Client::mk()? };
+
+        const BUFFER: [u8; 128] = [b'|'; 128];
+
+        let mut write = &client.write;
+
+        set_nonblocking(write.as_raw_fd(), true)?;
+
+        while limit > 0 {
+            let n = limit.min(BUFFER.len());
+
+            write.write_all(&BUFFER[..n])?;
+            limit -= n;
+        }
+
+        set_nonblocking(write.as_raw_fd(), false)?;
+
+        Ok(client)
+    }
+
+    unsafe fn mk() -> io::Result<Client> {
+        let mut pipes = [0; 2];
+
+{
+            static PIPE2_AVAILABLE: AtomicBool = AtomicBool::new(true);
+            if PIPE2_AVAILABLE.load(Ordering::SeqCst) {
+                match libc::syscall(libc::SYS_pipe2, pipes.as_mut_ptr(), libc::O_CLOEXEC) {
+                    -1 => {
+                        let err = io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::ENOSYS) {
+                            PIPE2_AVAILABLE.store(false, Ordering::SeqCst);
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                    _ => return Ok(Client::from_fds(pipes[0], pipes[1])),
+                }
+            }
+        }
+
+        cvt(libc::pipe(pipes.as_mut_ptr()))?;
+        drop(set_cloexec(pipes[0], true));
+        drop(set_cloexec(pipes[1], true));
+        Ok(Client::from_fds(pipes[0], pipes[1]))
+    }
+
+    pub(crate) unsafe fn open(s: &str, check_pipe: bool) -> Result<Client, FromEnvErrorInner> {
+        if let Some(client) = Self::from_fifo(s)? {
+            return Ok(client);
+        }
+        if let Some(client) = Self::from_pipe(s, check_pipe)? {
+            return Ok(client);
+        }
+        Err(FromEnvErrorInner::CannotParse(format!(
+            "expected `fifo:PATH` or `R,W`, found `{s}`"
+        )))
+    }
+
+    /// `--jobserver-auth=fifo:PATH`
+    fn from_fifo(s: &str) -> Result<Option<Client>, FromEnvErrorInner> {
+        let mut parts = s.splitn(2, ':');
+        if parts.next().unwrap() != "fifo" {
+            return Ok(None);
+        }
+        let path_str = parts.next().ok_or_else(|| {
+            FromEnvErrorInner::CannotParse("expected a path after `fifo:`".to_string())
+        })?;
+        let path = Path::new(path_str);
+
+        let open_file = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|err| FromEnvErrorInner::CannotOpenPath(path_str.to_string(), err))
+        };
+
+        Ok(Some(Client {
+            read: open_file()?,
+            write: open_file()?,
+            creation_arg: ClientCreationArg::Fifo(path.into()),
+            is_non_blocking: Some(AtomicBool::new(false)),
+        }))
+    }
+
+    /// `--jobserver-auth=R,W`
+    unsafe fn from_pipe(s: &str, check_pipe: bool) -> Result<Option<Client>, FromEnvErrorInner> {
+        let mut parts = s.splitn(2, ',');
+        let read = parts.next().unwrap();
+        let write = match parts.next() {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        let read = read
+            .parse()
+            .map_err(|e| FromEnvErrorInner::CannotParse(format!("cannot parse `read` fd: {e}")))?;
+        let write = write
+            .parse()
+            .map_err(|e| FromEnvErrorInner::CannotParse(format!("cannot parse `write` fd: {e}")))?;
+
+        if read < 0 {
+            return Err(FromEnvErrorInner::NegativeFd(read));
+        }
+        if write < 0 {
+            return Err(FromEnvErrorInner::NegativeFd(write));
+        }
+
+        let creation_arg = ClientCreationArg::Fds { read, write };
+
+        match (fd_check(read, check_pipe), fd_check(write, check_pipe)) {
+            (read_err @ Err(FromEnvErrorInner::NotAPipe(..)), _) => read_err?,
+            (_, write_err @ Err(FromEnvErrorInner::NotAPipe(..))) => write_err?,
+            (read_err, write_err) => {
+                read_err?;
+                write_err?;
+
+if let (Ok(read), Ok(write)) = (
+                    File::open(format!("/dev/fd/{}", read)),
+                    OpenOptions::new()
+                        .write(true)
+                        .open(format!("/dev/fd/{}", write)),
+                ) {
+                    return Ok(Some(Client {
+                        read,
+                        write,
+                        creation_arg,
+                        is_non_blocking: Some(AtomicBool::new(false)),
+                    }));
+                }
+            }
+        }
+
+        Ok(Some(Client {
+            read: clone_fd_and_set_cloexec(read)?,
+            write: clone_fd_and_set_cloexec(write)?,
+            creation_arg,
+            is_non_blocking: None,
+        }))
+    }
+
+    unsafe fn from_fds(read: c_int, write: c_int) -> Client {
+        Client {
+            read: File::from_raw_fd(read),
+            write: File::from_raw_fd(write),
+            creation_arg: ClientCreationArg::Fds { read, write },
+            is_non_blocking: None,
+        }
+    }
+
+    pub fn acquire(&self) -> io::Result<Acquired> {
+        loop {
+            if let Some(token) = self.acquire_allow_interrupts()? {
+                return Ok(token);
+            }
+        }
+    }
+
+    /// Block waiting for a token, returning `None` if we're interrupted with
+    /// EINTR.
+    fn acquire_allow_interrupts(&self) -> io::Result<Option<Acquired>> {
+        unsafe {
+            let mut fd: libc::pollfd = mem::zeroed();
+            let mut read = &self.read;
+            fd.fd = read.as_raw_fd();
+            fd.events = libc::POLLIN;
+            loop {
+                let mut buf = [0];
+                match read.read(&mut buf) {
+                    Ok(1) => return Ok(Some(Acquired { byte: buf[0] })),
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "early EOF on jobserver pipe",
+                        ));
+                    }
+                    Err(e) => match e.kind() {
+                        io::ErrorKind::WouldBlock => { /* fall through to polling */ }
+                        io::ErrorKind::Interrupted => return Ok(None),
+                        _ => return Err(e),
+                    },
+                }
+
+                loop {
+                    fd.revents = 0;
+                    if libc::poll(&mut fd, 1, -1) == -1 {
+                        let e = io::Error::last_os_error();
+                        return match e.kind() {
+                            io::ErrorKind::Interrupted => Ok(None),
+                            _ => Err(e),
+                        };
+                    }
+                    if fd.revents != 0 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn try_acquire(&self) -> io::Result<Option<Acquired>> {
+        let mut buf = [0];
+        let mut fifo = &self.read;
+
+        if let Some(is_non_blocking) = self.is_non_blocking.as_ref() {
+            if !is_non_blocking.load(Ordering::Relaxed) {
+                set_nonblocking(fifo.as_raw_fd(), true)?;
+                is_non_blocking.store(true, Ordering::Relaxed);
+            }
+        } else {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+
+        loop {
+            match fifo.read(&mut buf) {
+                Ok(1) => break Ok(Some(Acquired { byte: buf[0] })),
+                Ok(_) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "early EOF on jobserver pipe",
+                    ))
+                }
+
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break Ok(None),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+
+                Err(err) => break Err(err),
+            }
+        }
+    }
+
+    pub fn release(&self, data: Option<&Acquired>) -> io::Result<()> {
+        let byte = data.map(|d| d.byte).unwrap_or(b'+');
+        match (&self.write).write(&[byte])? {
+            1 => Ok(()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "failed to write token back to jobserver",
+            )),
+        }
+    }
+
+    pub fn string_arg(&self) -> String {
+        match &self.creation_arg {
+            ClientCreationArg::Fifo(path) => format!("fifo:{}", path.display()),
+            ClientCreationArg::Fds { read, write } => format!("{},{}", read, write),
+        }
+    }
+
+    pub fn available(&self) -> io::Result<usize> {
+        let mut len = MaybeUninit::<c_int>::uninit();
+        cvt(unsafe { libc::ioctl(self.read.as_raw_fd(), libc::FIONREAD, len.as_mut_ptr()) })?;
+        Ok(unsafe { len.assume_init() } as usize)
+    }
+
+    pub fn configure(&self, cmd: &mut Command) {
+        if matches!(self.creation_arg, ClientCreationArg::Fifo { .. }) {
+            return;
+        }
+        let read = self.read.as_raw_fd();
+        let write = self.write.as_raw_fd();
+        unsafe {
+            cmd.pre_exec(move || {
+                set_cloexec(read, false)?;
+                set_cloexec(write, false)?;
+                Ok(())
+            });
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Helper {
+    thread: JoinHandle<()>,
+    state: Arc<super::HelperState>,
+}
+
+pub(crate) fn spawn_helper(
+    client: crate::Client,
+    state: Arc<super::HelperState>,
+    mut f: Box<dyn FnMut(io::Result<crate::Acquired>) + Send>,
+) -> io::Result<Helper> {
+    static USR1_INIT: Once = Once::new();
+    let mut err = None;
+    USR1_INIT.call_once(|| unsafe {
+        let mut new: libc::sigaction = mem::zeroed();
+        new.sa_sigaction = sigusr1_handler as usize;
+        new.sa_flags = libc::SA_SIGINFO as _;
+        if libc::sigaction(libc::SIGUSR1, &new, ptr::null_mut()) != 0 {
+            err = Some(io::Error::last_os_error());
+        }
+    });
+
+    if let Some(e) = err.take() {
+        return Err(e);
+    }
+
+    let state2 = state.clone();
+    let thread = Builder::new().spawn(move || {
+        state2.for_each_request(|helper| loop {
+            match client.inner.acquire_allow_interrupts() {
+                Ok(Some(data)) => {
+                    break f(Ok(crate::Acquired {
+                        client: client.inner.clone(),
+                        data,
+                        disabled: false,
+                    }));
+                }
+                Err(e) => break f(Err(e)),
+                Ok(None) if helper.lock().producer_done => break,
+                Ok(None) => {}
+            }
+        });
+    })?;
+
+    Ok(Helper { thread, state })
+}
+
+impl Helper {
+    pub fn join(self) {
+        let dur = Duration::from_millis(10);
+        let mut state = self.state.lock();
+        debug_assert!(state.producer_done);
+
+        for _ in 0..100 {
+            if state.consumer_done {
+                break;
+            }
+            unsafe {
+                libc::pthread_kill(self.thread.as_pthread_t() as _, libc::SIGUSR1);
+            }
+            state = self
+                .state
+                .cvar
+                .wait_timeout(state, dur)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+            thread::yield_now(); 
+        }
+
+        if state.consumer_done {
+            drop(self.thread.join());
+        }
+    }
+}
+
+unsafe fn fcntl_check(fd: c_int) -> Result<(), FromEnvErrorInner> {
+    match libc::fcntl(fd, libc::F_GETFD) {
+        -1 => Err(FromEnvErrorInner::CannotOpenFd(
+            fd,
+            io::Error::last_os_error(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+unsafe fn fd_check(fd: c_int, check_pipe: bool) -> Result<(), FromEnvErrorInner> {
+    if check_pipe {
+        let mut stat = mem::zeroed();
+        if libc::fstat(fd, &mut stat) == -1 {
+            let last_os_error = io::Error::last_os_error();
+            fcntl_check(fd)?;
+            Err(FromEnvErrorInner::NotAPipe(fd, Some(last_os_error)))
+        } else {
+            #[allow(unused_assignments)]
+            let mut s_ififo = stat.st_mode;
+            s_ififo = libc::S_IFIFO as _;
+            if stat.st_mode & s_ififo == s_ififo {
+                return Ok(());
+            }
+            Err(FromEnvErrorInner::NotAPipe(fd, None))
+        }
+    } else {
+        fcntl_check(fd)
+    }
+}
+
+fn clone_fd_and_set_cloexec(fd: c_int) -> Result<File, FromEnvErrorInner> {
+    unsafe { BorrowedFd::borrow_raw(fd) }
+        .try_clone_to_owned()
+        .map(File::from)
+        .map_err(|err| FromEnvErrorInner::CannotOpenFd(fd, err))
+}
+
+fn set_cloexec(fd: c_int, set: bool) -> io::Result<()> {
+    unsafe {
+        let previous = cvt(libc::fcntl(fd, libc::F_GETFD))?;
+        let new = if set {
+            previous | libc::FD_CLOEXEC
+        } else {
+            previous & !libc::FD_CLOEXEC
+        };
+        if new != previous {
+            cvt(libc::fcntl(fd, libc::F_SETFD, new))?;
+        }
+        Ok(())
+    }
+}
+
+fn set_nonblocking(fd: c_int, set: bool) -> io::Result<()> {
+    let status_flag = if set { libc::O_NONBLOCK } else { 0 };
+
+    unsafe {
+        cvt(libc::fcntl(fd, libc::F_SETFL, status_flag))?;
+    }
+
+    Ok(())
+}
+
+fn cvt(t: c_int) -> io::Result<c_int> {
+    if t == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(t)
+    }
+}
+
+extern "C" fn sigusr1_handler(
+    _signum: c_int,
+    _info: *mut libc::siginfo_t,
+    _ptr: *mut libc::c_void,
+) {
+}

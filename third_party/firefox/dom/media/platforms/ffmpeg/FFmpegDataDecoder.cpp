@@ -1,0 +1,440 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include <string.h>
+
+#include "libavcodec/avcodec.h"
+#include "libavutil/dict.h"
+#ifdef __GNUC__
+#  include <unistd.h>
+#endif
+
+#include "FFmpegDataDecoder.h"
+#include "FFmpegLibs.h"
+#include "FFmpegLog.h"
+#include "FFmpegUtils.h"
+#include "VideoUtils.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "mozilla/TaskQueue.h"
+#include "prsystem.h"
+
+namespace mozilla {
+
+StaticMutex FFmpegDataDecoder<LIBAV_VER>::sMutex;
+
+FFmpegDataDecoder<LIBAV_VER>::FFmpegDataDecoder(const FFmpegLibWrapper* aLib,
+                                                AVCodecID aCodecID)
+    : mLib(aLib),
+      mCodecContext(nullptr),
+      mCodecParser(nullptr),
+      mFrame(nullptr),
+      mExtraData(nullptr),
+      mCodecID(aCodecID),
+      mVideoCodec(IsVideoCodec(aCodecID)),
+      mTaskQueue(TaskQueue::Create(
+          GetMediaThreadPool(MediaThreadType::PLATFORM_DECODER),
+          "FFmpegDataDecoder")),
+      mLastInputDts(media::TimeUnit::FromNegativeInfinity()) {
+  MOZ_ASSERT(aLib);
+  MOZ_COUNT_CTOR(FFmpegDataDecoder);
+}
+
+FFmpegDataDecoder<LIBAV_VER>::~FFmpegDataDecoder() {
+  MOZ_COUNT_DTOR(FFmpegDataDecoder);
+  if (mCodecParser) {
+    mLib->av_parser_close(mCodecParser);
+    mCodecParser = nullptr;
+  }
+}
+
+MediaResult FFmpegDataDecoder<LIBAV_VER>::AssignCodecContextExtraData(
+    const MediaByteBuffer* aBuffer) {
+  MOZ_ASSERT(mCodecContext);
+  MOZ_ASSERT(aBuffer);
+
+  CheckedInt<int> extradataSize(aBuffer->Length());
+  if (!extradataSize.isValid()) {
+    return MediaResult(
+        NS_ERROR_DOM_MEDIA_OVERFLOW_ERR,
+        RESULT_DETAIL("ffmpeg extradata size %zu exceeds INT_MAX",
+                      aBuffer->Length()));
+  }
+  const uint32_t padding_size =
+#if LIBAVCODEC_VERSION_MAJOR >= 58
+      AV_INPUT_BUFFER_PADDING_SIZE;
+#else
+      FF_INPUT_BUFFER_PADDING_SIZE;
+#endif
+  mCodecContext->extradata =
+      static_cast<uint8_t*>(mLib->av_mallocz(aBuffer->Length() + padding_size));
+  if (!mCodecContext->extradata) {
+    return MediaResult(NS_ERROR_OUT_OF_MEMORY,
+                       RESULT_DETAIL("Couldn't init ffmpeg extradata"));
+  }
+  mCodecContext->extradata_size = extradataSize.value();
+  memcpy(mCodecContext->extradata, aBuffer->Elements(), aBuffer->Length());
+  return NS_OK;
+}
+
+MediaResult FFmpegDataDecoder<LIBAV_VER>::AllocateExtraData() {
+  if (mExtraData) {
+    return AssignCodecContextExtraData(mExtraData);
+  }
+  mCodecContext->extradata_size = 0;
+  return NS_OK;
+}
+
+MediaResult FFmpegDataDecoder<LIBAV_VER>::InitSWDecoder(
+    AVDictionary** aOptions) {
+  FFMPEG_LOG("Initialising FFmpeg decoder");
+
+  AVCodec* codec = FindSoftwareAVCodec(mLib, mCodecID);
+  if (!codec) {
+    FFMPEG_LOG("  couldn't find ffmpeg decoder for codec id {}",
+               static_cast<int>(mCodecID));
+    return MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
+                       RESULT_DETAIL("unable to find codec"));
+  }
+
+  return InitDecoder(codec, aOptions);
+}
+
+MediaResult FFmpegDataDecoder<LIBAV_VER>::InitDecoder(AVCodec* aCodec,
+                                                      AVDictionary** aOptions) {
+  FFMPEG_LOG("  codec {} : {}", aCodec->name, aCodec->long_name);
+
+  StaticMutexAutoLock mon(sMutex);
+
+  if (!(mCodecContext = mLib->avcodec_alloc_context3(aCodec))) {
+    FFMPEG_LOG("  couldn't allocate ffmpeg context for codec {}", aCodec->name);
+    return MediaResult(NS_ERROR_OUT_OF_MEMORY,
+                       RESULT_DETAIL("Couldn't init ffmpeg context"));
+  }
+
+  if (NeedParser()) {
+    MOZ_ASSERT(mCodecParser == nullptr);
+    mCodecParser = mLib->av_parser_init(mCodecID);
+    if (mCodecParser) {
+      mCodecParser->flags |= ParserFlags();
+    }
+  }
+  mCodecContext->opaque = this;
+
+  InitCodecContext();
+#if LIBAVCODEC_VERSION_MAJOR >= 58
+  if (mCodecContext->codec_type == AVMEDIA_TYPE_VIDEO) {
+    mCodecContext->max_pixels = MAX_VIDEO_WIDTH * MAX_VIDEO_HEIGHT;
+  }
+#endif
+  MediaResult ret = AllocateExtraData();
+  if (NS_FAILED(ret)) {
+    FFMPEG_LOG("  couldn't allocate ffmpeg extra data for codec {}",
+               aCodec->name);
+    ReleaseCodecContext();
+    return ret;
+  }
+
+#if LIBAVCODEC_VERSION_MAJOR < 57
+  if (aCodec->capabilities & CODEC_CAP_DR1) {
+    mCodecContext->flags |= CODEC_FLAG_EMU_EDGE;
+  }
+#endif
+
+  if (mLib->avcodec_open2(mCodecContext, aCodec, aOptions) < 0) {
+    ReleaseCodecContext();
+    FFMPEG_LOG("  Couldn't open avcodec for {}", aCodec->name);
+    return MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
+                       RESULT_DETAIL("Couldn't open avcodec"));
+  }
+
+  FFMPEG_LOG("  FFmpeg decoder init successful.");
+  return NS_OK;
+}
+
+void FFmpegDataDecoder<LIBAV_VER>::ReleaseCodecContext() {
+  if (!mCodecContext) {
+    return;
+  }
+#if LIBAVCODEC_VERSION_MAJOR < 57
+  mLib->avcodec_close(mCodecContext);
+  if (mCodecContext->extradata) {
+    mLib->av_freep(&mCodecContext->extradata);
+  }
+  mLib->av_freep(&mCodecContext);
+#else
+  mLib->avcodec_free_context(&mCodecContext);
+#endif
+}
+
+RefPtr<ShutdownPromise> FFmpegDataDecoder<LIBAV_VER>::Shutdown() {
+  RefPtr<FFmpegDataDecoder<LIBAV_VER>> self = this;
+  return InvokeAsync(mTaskQueue, __func__, [self]() {
+    self->ProcessShutdown();
+    return self->mTaskQueue->BeginShutdown();
+  });
+}
+
+RefPtr<MediaDataDecoder::DecodePromise> FFmpegDataDecoder<LIBAV_VER>::Decode(
+    MediaRawData* aSample) {
+  return InvokeAsync<MediaRawData*>(mTaskQueue, this, __func__,
+                                    &FFmpegDataDecoder::ProcessDecode, aSample);
+}
+
+RefPtr<MediaDataDecoder::DecodePromise>
+FFmpegDataDecoder<LIBAV_VER>::ProcessDecode(MediaRawData* aSample) {
+  MOZ_ASSERT(mTaskQueue->IsOnCurrentThread());
+  PROCESS_DECODE_LOG(aSample);
+  bool gotFrame = false;
+  DecodedData results;
+  MediaResult rv = DoDecode(aSample, &gotFrame, results);
+  if (NS_FAILED(rv)) {
+    return DecodePromise::CreateAndReject(rv, __func__);
+  }
+  return DecodePromise::CreateAndResolve(std::move(results), __func__);
+}
+
+MediaResult FFmpegDataDecoder<LIBAV_VER>::DoDecode(
+    MediaRawData* aSample, bool* aGotFrame,
+    MediaDataDecoder::DecodedData& aResults) {
+  MOZ_ASSERT(mTaskQueue->IsOnCurrentThread());
+
+  uint8_t* inputData = const_cast<uint8_t*>(aSample->Data());
+  int inputSize = AssertedCast<int>(aSample->Size());
+
+  mLastInputDts = aSample->mTimecode;
+
+  if (inputData && mCodecParser) {  
+    if (aGotFrame) {
+      *aGotFrame = false;
+    }
+    while (inputSize) {
+      uint8_t* data = inputData;
+      int size = inputSize;
+      int len = mLib->av_parser_parse2(
+          mCodecParser, mCodecContext, &data, &size, inputData, inputSize,
+          aSample->mTime.ToMicroseconds(), aSample->mTimecode.ToMicroseconds(),
+          aSample->mOffset);
+      if (len > inputSize) {
+        return NS_ERROR_DOM_MEDIA_DECODE_ERR;
+      }
+      if (size) {
+        bool gotFrame = false;
+        MediaResult rv = DoDecode(aSample, data, size, &gotFrame, aResults);
+        if (NS_FAILED(rv)) {
+          return rv;
+        }
+        if (gotFrame && aGotFrame) {
+          *aGotFrame = true;
+        }
+      }
+      inputData += len;
+      inputSize -= len;
+    }
+    return NS_OK;
+  }
+  return DoDecode(aSample, inputData, inputSize, aGotFrame, aResults);
+}
+
+RefPtr<MediaDataDecoder::FlushPromise> FFmpegDataDecoder<LIBAV_VER>::Flush() {
+  return InvokeAsync(mTaskQueue, this, __func__,
+                     &FFmpegDataDecoder<LIBAV_VER>::ProcessFlush);
+}
+
+RefPtr<MediaDataDecoder::DecodePromise> FFmpegDataDecoder<LIBAV_VER>::Drain() {
+  return InvokeAsync(mTaskQueue, this, __func__,
+                     &FFmpegDataDecoder<LIBAV_VER>::ProcessDrain);
+}
+
+RefPtr<MediaDataDecoder::DecodePromise>
+FFmpegDataDecoder<LIBAV_VER>::ProcessDrain() {
+  MOZ_ASSERT(mTaskQueue->IsOnCurrentThread());
+  FFMPEG_LOG("FFmpegDataDecoder: draining buffers");
+  RefPtr<MediaRawData> empty(new MediaRawData());
+  empty->mTimecode = mLastInputDts;
+  bool gotFrame = false;
+  DecodedData results;
+  RefPtr<MediaDataDecoder::DecodePromise> p = mDrainPromise.Ensure(__func__);
+  do {
+    MediaResult r = DoDecode(empty, &gotFrame, results);
+    if (NS_FAILED(r)) {
+      if (r.Code() == NS_ERROR_DOM_MEDIA_END_OF_STREAM) {
+        break;
+      }
+      if (r.Code() == NS_ERROR_NOT_AVAILABLE) {
+        if (results.IsEmpty()) {
+          return p;
+        }
+        break;
+      }
+      mDrainPromise.Reject(r, __func__);
+      return p;
+    }
+  } while (gotFrame);
+  mDrainPromise.Resolve(std::move(results), __func__);
+  return p;
+}
+
+RefPtr<MediaDataDecoder::FlushPromise>
+FFmpegDataDecoder<LIBAV_VER>::ProcessFlush() {
+  MOZ_ASSERT(mTaskQueue->IsOnCurrentThread());
+  if (mCodecContext) {
+    FFMPEG_LOG("FFmpegDataDecoder: flushing buffers");
+    ReleaseFrame();
+    mLib->avcodec_flush_buffers(mCodecContext);
+  }
+  if (mCodecParser) {
+    FFMPEG_LOG("FFmpegDataDecoder: reinitializing parser");
+    mLib->av_parser_close(mCodecParser);
+    mCodecParser = mLib->av_parser_init(mCodecID);
+  }
+  return FlushPromise::CreateAndResolve(true, __func__);
+}
+
+void FFmpegDataDecoder<LIBAV_VER>::ProcessShutdown() {
+  MOZ_ASSERT(mTaskQueue->IsOnCurrentThread());
+  StaticMutexAutoLock mon(sMutex);
+
+  if (mCodecContext) {
+    FFMPEG_LOG("FFmpegDataDecoder: shutdown");
+    ReleaseFrame();
+    ReleaseCodecContext();
+  }
+}
+
+AVFrame* FFmpegDataDecoder<LIBAV_VER>::PrepareFrame() {
+  MOZ_ASSERT(mTaskQueue->IsOnCurrentThread());
+#if LIBAVCODEC_VERSION_MAJOR >= 55
+  if (mFrame) {
+    mLib->av_frame_unref(mFrame);
+  } else {
+    mFrame = mLib->av_frame_alloc();
+  }
+#elif LIBAVCODEC_VERSION_MAJOR == 54
+  if (mFrame) {
+    mLib->avcodec_get_frame_defaults(mFrame);
+  } else {
+    mFrame = mLib->avcodec_alloc_frame();
+  }
+#else
+  mLib->av_freep(&mFrame);
+  mFrame = mLib->avcodec_alloc_frame();
+#endif
+  return mFrame;
+}
+
+void FFmpegDataDecoder<LIBAV_VER>::ReleaseFrame() {
+#if LIBAVCODEC_VERSION_MAJOR >= 55
+  mLib->av_frame_free(&mFrame);
+#elif LIBAVCODEC_VERSION_MAJOR == 54
+  mLib->avcodec_free_frame(&mFrame);
+#else
+  mLib->av_freep(&mFrame);
+#endif
+}
+
+ AVCodec* FFmpegDataDecoder<LIBAV_VER>::FindSoftwareAVCodec(
+    const FFmpegLibWrapper* aLib, AVCodecID aCodec) {
+  MOZ_ASSERT(aLib);
+
+#if LIBAVCODEC_VERSION_MAJOR >= 58
+  AVCodec* fallbackCodec = nullptr;
+  void* opaque = nullptr;
+  while (AVCodec* codec = aLib->av_codec_iterate(&opaque)) {
+    if (codec->id != aCodec || !aLib->av_codec_is_decoder(codec)) {
+      continue;
+    }
+
+    if (codec->capabilities & AV_CODEC_CAP_HARDWARE) {
+      continue;
+    }
+
+    if (strcmp(codec->name, "libopenh264") == 0) {
+      if (!StaticPrefs::media_ffmpeg_allow_openh264()) {
+        FFMPEGV_LOG("libopenh264 available but disabled by pref");
+      } else if (!fallbackCodec) {
+        fallbackCodec = codec;
+      }
+      continue;
+    }
+
+    if (codec->capabilities & AV_CODEC_CAP_EXPERIMENTAL) {
+      if (!fallbackCodec) {
+        fallbackCodec = codec;
+      }
+      continue;
+    }
+
+    FFMPEGV_LOG("Using preferred software codec {}", codec->name);
+    return codec;
+  }
+
+  if (fallbackCodec) {
+    FFMPEGV_LOG("Using fallback software codec {}", fallbackCodec->name);
+  }
+  return fallbackCodec;
+#else
+  AVCodec* codec = aLib->avcodec_find_decoder(aCodec);
+  if (codec) {
+    if (strcmp(codec->name, "libopenh264") == 0 &&
+        !StaticPrefs::media_ffmpeg_allow_openh264()) {
+      FFMPEGV_LOG("libopenh264 selected but disabled by pref");
+      return nullptr;
+    }
+
+    FFMPEGV_LOG("Using preferred software codec {}", codec->name);
+  }
+  return codec;
+#endif
+}
+
+#ifdef MOZ_USE_HWDECODE
+ AVCodec* FFmpegDataDecoder<LIBAV_VER>::FindHardwareAVCodec(
+    const FFmpegLibWrapper* aLib, AVCodecID aCodec,
+    AVHWDeviceType aDeviceType) {
+  AVCodec* fallbackCodec = nullptr;
+  void* opaque = nullptr;
+  const bool ignoreDeviceType = aDeviceType == AV_HWDEVICE_TYPE_NONE;
+  while (AVCodec* codec = aLib->av_codec_iterate(&opaque)) {
+    if (codec->id != aCodec || !aLib->av_codec_is_decoder(codec)) {
+      continue;
+    }
+
+    bool hasHwConfig =
+        codec->capabilities & AV_CODEC_CAP_HARDWARE && ignoreDeviceType;
+    if (!hasHwConfig) {
+      for (int i = 0; const AVCodecHWConfig* config =
+                          aLib->avcodec_get_hw_config(codec, i);
+           ++i) {
+        if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
+            (ignoreDeviceType || config->device_type == aDeviceType)) {
+          hasHwConfig = true;
+          break;
+        }
+      }
+    }
+
+    if (!hasHwConfig) {
+      continue;
+    }
+
+    if (codec->capabilities & AV_CODEC_CAP_EXPERIMENTAL) {
+      if (!fallbackCodec) {
+        fallbackCodec = codec;
+      }
+      continue;
+    }
+
+    FFMPEGV_LOG("Using preferred hardware codec {}", codec->name);
+    return codec;
+  }
+
+  if (fallbackCodec) {
+    FFMPEGV_LOG("Using fallback hardware codec {}", fallbackCodec->name);
+  }
+  return nullptr;
+}
+#endif
+
+}  

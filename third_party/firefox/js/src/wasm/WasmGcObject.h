@@ -1,0 +1,439 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(wasm_WasmGcObject_h)
+#define wasm_WasmGcObject_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/Maybe.h"
+
+#include "gc/GCProbes.h"
+#include "gc/Pretenuring.h"
+#include "gc/ZoneAllocator.h"  // AddCellMemory
+#include "vm/JSContext.h"
+#include "vm/JSObject.h"
+#include "vm/Probes.h"
+#include "wasm/WasmInstanceData.h"
+#include "wasm/WasmMemory.h"
+#include "wasm/WasmTypeDef.h"
+#include "wasm/WasmValType.h"
+
+namespace js {
+
+
+class WasmGcObject : public JSObject {
+ protected:
+  const wasm::SuperTypeVector* superTypeVector_;
+
+  static const ObjectOps objectOps_;
+
+  [[nodiscard]] static bool obj_lookupProperty(JSContext* cx, HandleObject obj,
+                                               HandleId id,
+                                               MutableHandleObject objp,
+                                               PropertyResult* propp);
+
+  [[nodiscard]] static bool obj_defineProperty(JSContext* cx, HandleObject obj,
+                                               HandleId id,
+                                               Handle<PropertyDescriptor> desc,
+                                               ObjectOpResult& result);
+
+  [[nodiscard]] static bool obj_hasProperty(JSContext* cx, HandleObject obj,
+                                            HandleId id, bool* foundp);
+
+  [[nodiscard]] static bool obj_getProperty(JSContext* cx, HandleObject obj,
+                                            HandleValue receiver, HandleId id,
+                                            MutableHandleValue vp);
+
+  [[nodiscard]] static bool obj_setProperty(JSContext* cx, HandleObject obj,
+                                            HandleId id, HandleValue v,
+                                            HandleValue receiver,
+                                            ObjectOpResult& result);
+
+  [[nodiscard]] static bool obj_getOwnPropertyDescriptor(
+      JSContext* cx, HandleObject obj, HandleId id,
+      MutableHandle<mozilla::Maybe<PropertyDescriptor>> desc);
+
+  [[nodiscard]] static bool obj_deleteProperty(JSContext* cx, HandleObject obj,
+                                               HandleId id,
+                                               ObjectOpResult& result);
+
+  class PropOffset {
+    uint32_t u32_;
+
+   public:
+    PropOffset() : u32_(0) {}
+    uint32_t get() const { return u32_; }
+    void set(uint32_t u32) { u32_ = u32; }
+  };
+
+  [[nodiscard]] static bool lookUpProperty(JSContext* cx,
+                                           Handle<WasmGcObject*> obj, jsid id,
+                                           PropOffset* offset,
+                                           wasm::StorageType* type);
+
+ public:
+  [[nodiscard]] static bool loadValue(JSContext* cx, Handle<WasmGcObject*> obj,
+                                      jsid id, MutableHandleValue vp);
+
+  const wasm::SuperTypeVector& superTypeVector() const {
+    return *superTypeVector_;
+  }
+
+  static constexpr size_t offsetOfSuperTypeVector() {
+    return offsetof(WasmGcObject, superTypeVector_);
+  }
+
+  const wasm::TypeDef& typeDef() const { return *superTypeVector().typeDef(); }
+  wasm::TypeDefKind kind() const { return superTypeVector().typeDef()->kind(); }
+
+  [[nodiscard]] bool isRuntimeSubtypeOf(
+      const wasm::TypeDef* parentTypeDef) const;
+
+  [[nodiscard]] static bool obj_newEnumerate(JSContext* cx, HandleObject obj,
+                                             MutableHandleIdVector properties,
+                                             bool enumerableOnly);
+};
+
+
+
+
+#undef WASM_ARRAY_OBJECT_NEEDS_PADDING
+#  define WASM_ARRAY_OBJECT_NEEDS_PADDING 1
+
+class WasmArrayObject : public WasmGcObject,
+                        public TrailingArray<WasmArrayObject> {
+ public:
+  static const JSClass class_;
+
+  static constexpr uint32_t ArrayDataAlignment = 8;
+
+
+  struct OOLDataHeader {
+#if !defined(JS_64BIT)
+    uintptr_t padding = 0;
+#endif
+    uintptr_t word = OOLDataHeader_Magic;
+  };
+  static_assert(sizeof(OOLDataHeader) == 8);
+
+  static constexpr uintptr_t OOLDataHeader_Magic = 0x351ULL;
+
+
+
+#if defined(WASM_ARRAY_OBJECT_NEEDS_PADDING)
+  uint32_t padding_;
+#endif
+  uint32_t numElements_;
+  uint8_t* data_;
+
+
+
+  template <typename T>
+  T* inlineArrayData() {
+    return offsetToPointer<T>(sizeof(WasmArrayObject));
+  }
+
+  template <typename T>
+  inline T get(uint32_t i) const {
+    MOZ_ASSERT(i < numElements_);
+    MOZ_ASSERT(sizeof(T) == typeDef().arrayType().elementType().size());
+    return ((T*)data_)[i];
+  }
+
+  static inline gc::AllocKind allocKindForOOL();
+  static inline gc::AllocKind allocKindForIL(uint32_t arrayDataBytes);
+  inline gc::AllocKind allocKind() const;
+
+  static constexpr mozilla::CheckedUint32 calcArrayDataBytesChecked(
+      uint32_t elemSize, uint32_t numElements) {
+    static_assert(sizeof(WasmArrayObject) % gc::CellAlignBytes == 0);
+    mozilla::CheckedUint32 arrayDataBytes = elemSize;
+    arrayDataBytes *= numElements;
+    arrayDataBytes += gc::CellAlignBytes;
+    arrayDataBytes -= 1;
+    arrayDataBytes +=
+        gc::CellAlignBytes - (arrayDataBytes % gc::CellAlignBytes);
+    arrayDataBytes -= gc::CellAlignBytes;
+    MOZ_ASSERT_IF(arrayDataBytes.isValid(),
+                  arrayDataBytes.value() % gc::CellAlignBytes == 0);
+    MOZ_ASSERT_IF(numElements == 0,
+                  arrayDataBytes.isValid() && arrayDataBytes.value() == 0);
+    return arrayDataBytes;
+  }
+  static uint32_t calcArrayDataBytesUnchecked(uint32_t elemSize,
+                                              uint32_t numElements) {
+    mozilla::CheckedUint32 arrayDataBytes =
+        calcArrayDataBytesChecked(elemSize, numElements);
+    MOZ_ASSERT(arrayDataBytes.isValid());
+    return arrayDataBytes.value();
+  }
+  static inline constexpr uint32_t maxInlineElementsForElemSize(
+      uint32_t elemSize);
+
+  size_t sizeOfExcludingThis() const;
+
+  template <bool ZeroFields>
+  static MOZ_ALWAYS_INLINE WasmArrayObject* createArrayOOL(
+      JSContext* cx, wasm::TypeDefInstanceData* typeDefData,
+      js::gc::AllocSite* allocSite, js::gc::Heap initialHeap,
+      uint32_t numElements, uint32_t arrayDataBytes);
+
+  template <bool ZeroFields>
+  static MOZ_ALWAYS_INLINE WasmArrayObject* createArrayIL(
+      JSContext* cx, wasm::TypeDefInstanceData* typeDefData,
+      js::gc::AllocSite* allocSite, js::gc::Heap initialHeap,
+      uint32_t numElements, uint32_t arrayDataBytes);
+
+  template <bool ZeroFields>
+  static MOZ_ALWAYS_INLINE WasmArrayObject* createArray(
+      JSContext* cx, wasm::TypeDefInstanceData* typeDefData,
+      js::gc::AllocSite* allocSite, js::gc::Heap initialHeap,
+      uint32_t numElements);
+
+  static constexpr size_t offsetOfNumElements() {
+    return offsetof(WasmArrayObject, numElements_);
+  }
+  static constexpr size_t offsetOfData() {
+    return offsetof(WasmArrayObject, data_);
+  }
+  static constexpr size_t offsetOfInlineArrayData() {
+    static_assert((sizeof(WasmArrayObject) % ArrayDataAlignment) == 0);
+    return sizeof(WasmArrayObject);
+  }
+
+  static void obj_trace(JSTracer* trc, JSObject* object);
+  static void obj_finalize(JS::GCContext* gcx, JSObject* object);
+  static size_t obj_moved(JSObject* objNew, JSObject* objOld);
+
+  void storeVal(const wasm::Val& val, uint32_t itemIndex);
+  void fillVal(const wasm::Val& val, uint32_t itemIndex, uint32_t len);
+
+#if defined(DEBUG)
+  static bool IsValidlyAlignedDataPointer(const void* v) {
+    return (uintptr_t(v) & (ArrayDataAlignment - 1)) == 0;
+  }
+#endif
+  static inline OOLDataHeader* oolDataHeaderFromDataPointer(
+      const uint8_t* data) {
+    MOZ_ASSERT(data);
+    MOZ_ASSERT(IsValidlyAlignedDataPointer(data));
+    OOLDataHeader* header = (OOLDataHeader*)data;
+    header--;
+    MOZ_ASSERT((header->word & 1) == 1);
+    return header;
+  }
+  static inline uint8_t* oolDataHeaderToDataPointer(OOLDataHeader* header) {
+    MOZ_ASSERT(header);
+    MOZ_ASSERT(IsValidlyAlignedDataPointer(header));
+    MOZ_ASSERT((header->word & 1) == 1);
+    header++;
+    return (uint8_t*)header;
+  }
+  inline OOLDataHeader* oolDataHeader() const {
+    MOZ_ASSERT(!isDataInline());
+    return WasmArrayObject::oolDataHeaderFromDataPointer(data_);
+  }
+
+  static inline bool isDataInline(uint8_t* data) {
+    MOZ_ASSERT(data);
+    MOZ_ASSERT(IsValidlyAlignedDataPointer(data));
+    const OOLDataHeader* header = (OOLDataHeader*)data;
+    header--;
+    uintptr_t headerWord = header->word;
+    return (headerWord & 1) == 0;
+  }
+  bool isDataInline() const { return WasmArrayObject::isDataInline(data_); }
+
+  static WasmArrayObject* fromInlineDataPointer(uint8_t* data) {
+    MOZ_ASSERT(isDataInline(data));
+    WasmArrayObject* arrayObj =
+        (WasmArrayObject*)(data - WasmArrayObject::offsetOfInlineArrayData());
+    MOZ_ASSERT(WasmArrayObject::addressOfInlineArrayData(arrayObj) == data);
+    return arrayObj;
+  }
+
+  static uint8_t* addressOfInlineArrayData(WasmArrayObject* base) {
+    return base->offsetToPointer<uint8_t>(offsetOfInlineArrayData());
+  }
+};
+
+
+static_assert(WasmArrayObject::ArrayDataAlignment == 8);
+
+static_assert((sizeof(WasmArrayObject::OOLDataHeader) %
+               WasmArrayObject::ArrayDataAlignment) == 0);
+
+static_assert((sizeof(WasmArrayObject) % WasmArrayObject::ArrayDataAlignment) ==
+              0);
+
+#if defined(JS_64BIT)
+static_assert(sizeof(WasmArrayObject) == 32);
+#else
+static_assert(sizeof(WasmArrayObject) == 24);
+#endif
+
+static_assert((offsetof(WasmArrayObject, data_) +
+               sizeof(WasmArrayObject::data_)) == sizeof(WasmArrayObject));
+
+static_assert((offsetof(WasmArrayObject::OOLDataHeader, word) +
+               sizeof(WasmArrayObject::OOLDataHeader::word)) ==
+              sizeof(WasmArrayObject::OOLDataHeader));
+
+static_assert((offsetof(WasmArrayObject, data_) % sizeof(void*)) == 0);
+
+static_assert((WasmArrayObject::OOLDataHeader_Magic & 1) == 1);
+
+static_assert(WasmArrayObject::OOLDataHeader_Magic < 4096);
+
+static_assert(uint64_t(wasm::MaxArrayPayloadBytes) + 64 < uint64_t(UINT32_MAX));
+
+static_assert(gc::CellAlignBytes >= WasmArrayObject::ArrayDataAlignment);
+
+#define STATIC_ASSERT_WASMARRAYELEMENTS_NUMELEMENTS_IS_U32 \
+  static_assert(sizeof(js::WasmArrayObject::numElements_) == sizeof(uint32_t))
+
+
+
+class WasmStructObject : public WasmGcObject,
+                         public TrailingArray<WasmStructObject> {
+ public:
+  static const JSClass classInline_;
+  static const JSClass classOutline_;
+
+  static const JSClass* classFromOOLness(bool needsOOLstorage) {
+    return needsOOLstorage ? &classOutline_ : &classInline_;
+  }
+
+  size_t sizeOfExcludingThis() const;
+
+  template <bool ZeroFields>
+  static MOZ_ALWAYS_INLINE WasmStructObject* createStructIL(
+      JSContext* cx, wasm::TypeDefInstanceData* typeDefData,
+      gc::AllocSite* allocSite, js::gc::Heap initialHeap);
+
+  template <bool ZeroFields>
+  static MOZ_ALWAYS_INLINE WasmStructObject* createStructOOL(
+      JSContext* cx, wasm::TypeDefInstanceData* typeDefData,
+      gc::AllocSite* allocSite, js::gc::Heap initialHeap);
+
+  uint8_t* fieldIndexToAddress(uint32_t fieldIndex);
+
+  bool hasOOLPointer() const;
+  uint8_t** addressOfOOLPointer() const;
+  uint8_t* getOOLPointer() const;
+  void setOOLPointer(uint8_t* newOOLpointer);
+
+  uint8_t** addressOfOOLPointer(
+      const wasm::TypeDefInstanceData* typeDefData) const;
+  void setOOLPointer(const wasm::TypeDefInstanceData* typeDefData,
+                     uint8_t* newOOLpointer);
+
+  bool getField(JSContext* cx, uint32_t index, MutableHandle<Value> val);
+
+  static void obj_trace(JSTracer* trc, JSObject* object);
+  static size_t obj_moved(JSObject* objNew, JSObject* objOld);
+
+  void storeVal(const wasm::Val& val, uint32_t fieldIndex);
+};
+
+static_assert(sizeof(WasmStructObject) == 16);
+
+static_assert((sizeof(WasmStructObject) % 8) == 0);
+
+const size_t WasmStructObject_MaxInlineBytes =
+    ((JSObject::MAX_BYTE_SIZE - sizeof(WasmStructObject)) / 8) * 8;
+
+static_assert((WasmStructObject_MaxInlineBytes % 8) == 0);
+
+static_assert(wasm::WasmStructObject_Size_ASSUMED == sizeof(WasmStructObject));
+static_assert(wasm::WasmStructObject_MaxInlineBytes_ASSUMED ==
+              WasmStructObject_MaxInlineBytes);
+
+const size_t WasmArrayObject_MaxInlineBytes =
+    ((JSObject::MAX_BYTE_SIZE - sizeof(WasmArrayObject)) / 16) * 16;
+
+static_assert((WasmArrayObject_MaxInlineBytes % 16) == 0);
+
+inline constexpr uint32_t WasmArrayObject::maxInlineElementsForElemSize(
+    uint32_t elemSize) {
+  MOZ_RELEASE_ASSERT(elemSize > 0);
+  uint32_t result = WasmArrayObject_MaxInlineBytes;
+  static_assert(WasmArrayObject_MaxInlineBytes % gc::CellAlignBytes == 0);
+  result /= elemSize;
+
+  MOZ_RELEASE_ASSERT(calcArrayDataBytesChecked(elemSize, result).isValid());
+  return result;
+}
+
+inline bool WasmStructObject::hasOOLPointer() const {
+  const wasm::SuperTypeVector* stv = superTypeVector_;
+  const wasm::TypeDef* typeDef = stv->typeDef();
+  MOZ_ASSERT(typeDef->superTypeVector() == stv);
+  const wasm::StructType& structType = typeDef->structType();
+  uint32_t offset = structType.oolPointerOffset_;
+  return offset != wasm::StructType::InvalidOffset;
+}
+
+inline uint8_t** WasmStructObject::addressOfOOLPointer() const {
+  const wasm::SuperTypeVector* stv = superTypeVector_;
+  const wasm::TypeDef* typeDef = stv->typeDef();
+  MOZ_ASSERT(typeDef->superTypeVector() == stv);
+  const wasm::StructType& structType = typeDef->structType();
+  uint32_t offset = structType.oolPointerOffset_;
+  MOZ_RELEASE_ASSERT(offset != wasm::StructType::InvalidOffset);
+  return (uint8_t**)((uint8_t*)this + offset);
+}
+
+inline uint8_t* WasmStructObject::getOOLPointer() const {
+  return *addressOfOOLPointer();
+}
+
+inline void WasmStructObject::setOOLPointer(uint8_t* newOOLpointer) {
+  *addressOfOOLPointer() = newOOLpointer;
+}
+
+inline uint8_t** WasmStructObject::addressOfOOLPointer(
+    const wasm::TypeDefInstanceData* typeDefData) const {
+  uint32_t offset = typeDefData->cached.strukt.oolPointerOffset;
+  MOZ_RELEASE_ASSERT(offset != wasm::StructType::InvalidOffset);
+  uint8_t** addr = (uint8_t**)((uint8_t*)this + offset);
+  MOZ_ASSERT(addr == addressOfOOLPointer());
+  return addr;
+}
+
+inline void WasmStructObject::setOOLPointer(
+    const wasm::TypeDefInstanceData* typeDefData, uint8_t* newOOLpointer) {
+  *addressOfOOLPointer(typeDefData) = newOOLpointer;
+}
+
+static_assert(WasmStructObject_MaxInlineBytes <= wasm::NullPtrGuardSize);
+static_assert(sizeof(WasmArrayObject) <= wasm::NullPtrGuardSize);
+
+}  
+
+
+namespace js {
+
+inline bool IsWasmGcObjectClass(const JSClass* class_) {
+  return class_ == &WasmArrayObject::class_ ||
+         class_ == &WasmStructObject::classInline_ ||
+         class_ == &WasmStructObject::classOutline_;
+}
+
+}  
+
+template <>
+inline bool JSObject::is<js::WasmGcObject>() const {
+  return js::IsWasmGcObjectClass(getClass());
+}
+
+template <>
+inline bool JSObject::is<js::WasmStructObject>() const {
+  const JSClass* class_ = getClass();
+  return class_ == &js::WasmStructObject::classInline_ ||
+         class_ == &js::WasmStructObject::classOutline_;
+}
+
+#endif

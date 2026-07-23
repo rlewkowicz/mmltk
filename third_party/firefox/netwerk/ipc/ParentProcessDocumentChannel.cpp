@@ -1,0 +1,272 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ParentProcessDocumentChannel.h"
+
+#include "mozilla/net/ParentChannelWrapper.h"
+#include "nsCRT.h"
+#include "nsDocShell.h"
+#include "nsIObserverService.h"
+#include "nsIXULRuntime.h"
+#include "nsHttpHandler.h"
+#include "nsDocShellLoadState.h"
+
+extern mozilla::LazyLogModule gDocumentChannelLog;
+#define LOG(fmt) MOZ_LOG(gDocumentChannelLog, mozilla::LogLevel::Verbose, fmt)
+
+namespace mozilla {
+namespace net {
+
+using RedirectToRealChannelPromise =
+    typename PDocumentChannelParent::RedirectToRealChannelPromise;
+
+NS_IMPL_ISUPPORTS_INHERITED(ParentProcessDocumentChannel, DocumentChannel,
+                            nsIAsyncVerifyRedirectCallback, nsIObserver)
+
+ParentProcessDocumentChannel::ParentProcessDocumentChannel(
+    nsDocShellLoadState* aLoadState, class LoadInfo* aLoadInfo,
+    nsLoadFlags aLoadFlags, uint32_t aCacheKey, bool aUriModified,
+    bool aIsEmbeddingBlockedError)
+    : DocumentChannel(aLoadState, aLoadInfo, aLoadFlags, aCacheKey,
+                      aUriModified, aIsEmbeddingBlockedError) {
+  LOG(("ParentProcessDocumentChannel ctor [this=%p]", this));
+}
+
+ParentProcessDocumentChannel::~ParentProcessDocumentChannel() {
+  LOG(("ParentProcessDocumentChannel dtor [this=%p]", this));
+}
+
+RefPtr<RedirectToRealChannelPromise>
+ParentProcessDocumentChannel::RedirectToRealChannel(
+    uint32_t aRedirectFlags, uint32_t aLoadFlags,
+    const nsTArray<EarlyHintConnectArgs>& aEarlyHints) {
+  LOG(("ParentProcessDocumentChannel RedirectToRealChannel [this=%p]", this));
+  nsCOMPtr<nsIChannel> channel = mDocumentLoadListener->GetChannel();
+  channel->SetLoadFlags(aLoadFlags);
+  channel->SetNotificationCallbacks(mCallbacks);
+
+  if (mLoadGroup) {
+    channel->SetLoadGroup(mLoadGroup);
+  }
+
+  if (XRE_IsE10sParentProcess()) {
+    nsCOMPtr<nsIURI> uri;
+    MOZ_ALWAYS_SUCCEEDS(NS_GetFinalChannelURI(channel, getter_AddRefs(uri)));
+    if (!nsDocShell::CanLoadInParentProcess(uri)) {
+      nsAutoCString msg;
+      uri->GetSpec(msg);
+      msg.Insert(
+          "Attempt to load a non-authorised load in the parent process: ", 0);
+      NS_ASSERTION(false, msg.get());
+      return RedirectToRealChannelPromise::CreateAndResolve(
+          NS_ERROR_CONTENT_BLOCKED, __func__);
+    }
+  }
+  if (mDocumentLoadListener->IsDocumentLoad() && GetDocShell() &&
+      mDocumentLoadListener->GetLoadingSessionHistoryInfo()) {
+    GetDocShell()->SetLoadingSessionHistoryInfo(
+        *mDocumentLoadListener->GetLoadingSessionHistoryInfo());
+  }
+
+  RefPtr<RedirectToRealChannelPromise> p = mPromise.Ensure(__func__);
+  mPromise.UseDirectTaskDispatch(__func__);
+
+  nsresult rv =
+      gHttpHandler->AsyncOnChannelRedirect(this, channel, aRedirectFlags);
+  if (NS_FAILED(rv)) {
+    LOG(
+        ("ParentProcessDocumentChannel RedirectToRealChannel "
+         "AsyncOnChannelRedirect failed [this=%p "
+         "aRv=%d]",
+         this, int(rv)));
+    OnRedirectVerifyCallback(rv);
+  }
+
+  return p;
+}
+
+NS_IMETHODIMP
+ParentProcessDocumentChannel::OnRedirectVerifyCallback(nsresult aResult) {
+  LOG(
+      ("ParentProcessDocumentChannel OnRedirectVerifyCallback [this=%p "
+       "aResult=%d]",
+       this, int(aResult)));
+
+  MOZ_ASSERT(mDocumentLoadListener);
+
+  if (NS_FAILED(aResult)) {
+    Cancel(aResult);
+  } else if (mCanceled) {
+    aResult = NS_ERROR_ABORT;
+  } else {
+    const nsCOMPtr<nsIChannel> channel = mDocumentLoadListener->GetChannel();
+    mLoadGroup->AddRequest(channel, nullptr);
+    if (mCanceled) {
+      aResult = NS_ERROR_ABORT;
+    } else {
+      mLoadGroup->RemoveRequest(this, nullptr, NS_BINDING_REDIRECTED);
+      RefPtr<ParentChannelWrapper> wrapper =
+          new ParentChannelWrapper(channel, mListener);
+
+      wrapper->Register(mDocumentLoadListener->GetRedirectChannelId(), 0);
+    }
+  }
+
+  mPromise.Resolve(aResult, __func__);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP ParentProcessDocumentChannel::AsyncOpen(
+    nsIStreamListener* aListener) {
+  LOG(("ParentProcessDocumentChannel AsyncOpen [this=%p]", this));
+  auto docShell = RefPtr<nsDocShell>(GetDocShell());
+  MOZ_ASSERT(docShell);
+
+  bool isDocumentLoad = mLoadInfo->GetExternalContentPolicyType() !=
+                        ExtContentPolicy::TYPE_OBJECT;
+
+  mDocumentLoadListener = MakeRefPtr<DocumentLoadListener>(
+      docShell->GetBrowsingContext()->Canonical(), isDocumentLoad);
+  LOG(("Created PPDocumentChannel with listener=%p",
+       mDocumentLoadListener.get()));
+
+  nsCOMPtr<nsIObserverService> observerService =
+      mozilla::services::GetObserverService();
+  if (observerService) {
+    MOZ_ALWAYS_SUCCEEDS(observerService->AddObserver(
+        this, NS_HTTP_ON_MODIFY_REQUEST_TOPIC, false));
+  }
+
+  gHttpHandler->OnOpeningDocumentRequest(this);
+
+  if (isDocumentLoad) {
+    (void)GetDocShell()->GetBrowsingContext()->SetCurrentLoadIdentifier(
+        Some(mLoadState->GetLoadIdentifier()));
+  }
+
+  nsresult rv = NS_OK;
+  Maybe<dom::ClientInfo> initialClientInfo = mInitialClientInfo;
+
+  RefPtr<DocumentLoadListener::OpenPromise> promise;
+  if (isDocumentLoad) {
+    promise = mDocumentLoadListener->OpenDocument(
+        mLoadState, mLoadFlags, mCacheKey, Some(mChannelId), TimeStamp::Now(),
+        mTiming, std::move(initialClientInfo), mUriModified,
+        Some(mIsEmbeddingBlockedError), nullptr , &rv);
+  } else {
+    promise = mDocumentLoadListener->OpenObject(
+        mLoadState, mCacheKey, Some(mChannelId), TimeStamp::Now(), mTiming,
+        std::move(initialClientInfo), InnerWindowIDForExtantDoc(docShell),
+        mLoadFlags, mLoadInfo->InternalContentPolicyType(),
+        dom::UserActivation::IsHandlingUserInput(), nullptr ,
+        nullptr , &rv);
+  }
+
+  if (NS_FAILED(rv)) {
+    MOZ_ASSERT(!promise);
+    mDocumentLoadListener = nullptr;
+    RemoveObserver();
+    return rv;
+  }
+
+  mListener = aListener;
+  if (mLoadGroup) {
+    mLoadGroup->AddRequest(this, nullptr);
+  }
+
+  RefPtr<ParentProcessDocumentChannel> self = this;
+  promise->Then(
+      GetCurrentSerialEventTarget(), __func__,
+      [self](DocumentLoadListener::OpenPromiseSucceededType&& aResolveValue) {
+        self->mDocumentLoadListener->CancelEarlyHintPreloads();
+        nsTArray<EarlyHintConnectArgs> earlyHints;
+
+        RefPtr<RedirectToRealChannelPromise> p =
+            self->RedirectToRealChannel(
+                    aResolveValue.mRedirectFlags, aResolveValue.mLoadFlags,
+                    earlyHints)
+                ->Then(
+                    GetCurrentSerialEventTarget(), __func__,
+                    [self](RedirectToRealChannelPromise::ResolveOrRejectValue&&
+                               aValue) -> RefPtr<RedirectToRealChannelPromise> {
+                      MOZ_ASSERT(aValue.IsResolve());
+                      nsresult rv = aValue.ResolveValue();
+                      if (NS_FAILED(rv)) {
+                        self->DisconnectChildListeners(rv, rv);
+                      }
+                      self->mLoadGroup = nullptr;
+                      self->mListener = nullptr;
+                      self->mCallbacks = nullptr;
+                      self->RemoveObserver();
+                      auto p =
+                          MakeRefPtr<RedirectToRealChannelPromise::Private>(
+                              __func__);
+                      p->UseDirectTaskDispatch(__func__);
+                      p->ResolveOrReject(std::move(aValue), __func__);
+                      return p;
+                    });
+        p->ChainTo(aResolveValue.mPromise.forget(), __func__);
+      },
+      [self](DocumentLoadListener::OpenPromiseFailedType&& aRejectValue) {
+        if (!aRejectValue.mContinueNavigating) {
+          self->DisconnectChildListeners(aRejectValue.mStatus,
+                                         aRejectValue.mLoadGroupStatus);
+        }
+        self->RemoveObserver();
+      });
+  return NS_OK;
+}
+
+NS_IMETHODIMP ParentProcessDocumentChannel::Cancel(nsresult aStatus) {
+  return CancelWithReason(aStatus, "ParentProcessDocumentChannel::Cancel"_ns);
+}
+
+NS_IMETHODIMP ParentProcessDocumentChannel::CancelWithReason(
+    nsresult aStatusCode, const nsACString& aReason) {
+  LOG(("ParentProcessDocumentChannel CancelWithReason [this=%p]", this));
+  if (mCanceled) {
+    return NS_OK;
+  }
+
+  mCanceled = true;
+  mDocumentLoadListener->Cancel(aStatusCode, aReason);
+
+  return NS_OK;
+}
+
+void ParentProcessDocumentChannel::RemoveObserver() {
+  if (nsCOMPtr<nsIObserverService> observerService =
+          mozilla::services::GetObserverService()) {
+    observerService->RemoveObserver(this, NS_HTTP_ON_MODIFY_REQUEST_TOPIC);
+  }
+}
+
+
+NS_IMETHODIMP
+ParentProcessDocumentChannel::Observe(nsISupports* aSubject, const char* aTopic,
+                                      const char16_t* aData) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mRequestObserversCalled) {
+    return NS_OK;
+  }
+  nsCOMPtr<nsIChannel> channel = do_QueryInterface(aSubject);
+  if (!channel || mDocumentLoadListener->GetChannel() != channel) {
+    return NS_OK;
+  }
+  LOG(("DocumentChannelParent Observe [this=%p aChannel=%p]", this,
+       channel.get()));
+  if (!nsCRT::strcmp(aTopic, NS_HTTP_ON_MODIFY_REQUEST_TOPIC)) {
+    mRequestObserversCalled = true;
+    gHttpHandler->OnModifyDocumentRequest(this);
+  }
+
+  return NS_OK;
+}
+
+}  
+}  
+
+#undef LOG

@@ -1,0 +1,534 @@
+/*
+ * Copyright 2016 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_instance_h
+#define wasm_instance_h
+
+#include "mozilla/Atomics.h"
+#include "mozilla/Maybe.h"
+
+#include "gc/Barrier.h"
+#include "js/shadow/Zone.h"  // for BarrierState
+#include "js/Stack.h"        // JS::NativeStackLimit
+#include "js/TypeDecls.h"
+#include "vm/SharedMem.h"
+#include "wasm/WasmExprType.h"  // for ResultType
+#include "wasm/WasmLog.h"       // for PrintCallback
+#include "wasm/WasmModuleTypes.h"
+#include "wasm/WasmShareable.h"  // for SeenSet
+#include "wasm/WasmTypeDecls.h"
+#include "wasm/WasmValue.h"
+
+namespace js {
+
+class SharedArrayRawBuffer;
+class WasmBreakpointSite;
+
+class WasmGcObject;
+class WasmStructObject;
+class WasmArrayObject;
+
+struct AllocationMetadataBuilder;
+
+namespace gc {
+class StoreBuffer;
+}  
+
+namespace wasm {
+
+struct CodeTailMetadata;
+struct FuncDefInstanceData;
+class FuncImport;
+struct FuncImportInstanceData;
+struct FuncExportInstanceData;
+struct MemoryDesc;
+struct MemoryInstanceData;
+class GlobalDesc;
+struct Handlers;
+struct TableDesc;
+struct TableInstanceData;
+struct TagDesc;
+struct TagInstanceData;
+struct TypeDefInstanceData;
+struct CallRefMetrics;
+class WasmFrameIter;
+
+class alignas(16) Instance {
+
+  uint8_t* memory0Base_;
+
+  uintptr_t memory0BoundsCheckLimit_;
+
+  void* debugStub_;
+
+  JS::Realm* realm_;
+
+  JSContext* cx_;
+
+  GCPtr<AnyRef> pendingException_;
+  GCPtr<AnyRef> pendingExceptionTag_;
+
+  mozilla::Atomic<uint32_t, mozilla::Relaxed> interrupt_;
+
+  const JS::shadow::Zone::BarrierState* addressOfNeedsMarkingBarrier_;
+
+  js::gc::AllocSite* allocSites_;
+
+ public:
+  static constexpr size_t offsetOfLastCommonJitField() {
+    return offsetof(Instance, allocSites_);
+  }
+
+  static constexpr size_t N_BASELINE_SCRATCH_WORDS = 8;
+
+  static constexpr size_t sizeofBaselineScratchWords() {
+    return sizeof(baselineScratchWords_);
+  }
+  static constexpr size_t offsetofBaselineScratchWords() {
+    return offsetof(Instance, baselineScratchWords_);
+  }
+
+ private:
+  void** jumpTable_;
+
+  uintptr_t baselineScratchWords_[N_BASELINE_SCRATCH_WORDS];
+
+  const JSClass* valueBoxClass_;
+
+  void* jsJitExceptionHandler_;
+
+  void* preBarrierCode_;
+
+  gc::StoreBuffer* storeBuffer_;
+
+  WeakHeapPtr<WasmInstanceObject*> object_;
+
+  const SharedCode code_;
+
+  const SharedTableVector tables_;
+
+  DataSegmentVector passiveDataSegments_;
+
+  InstanceElemSegmentVector passiveElemSegments_;
+
+  const UniqueDebugState maybeDebug_;
+
+  uint32_t* debugFilter_;
+
+  CallRefMetrics* callRefMetrics_;
+
+  uint32_t maxInitializedGlobalsIndexPlus1_;
+
+  void* allocatedBase_;
+
+  const void* addressOfNurseryPosition_;
+#ifdef JS_GC_ZEAL
+  const void* addressOfGCZealModeBits_;
+#endif
+  const js::AllocationMetadataBuilder* allocationMetadataBuilder_;
+
+  const void* addressOfLastBufferedWholeCell_;
+
+  void* requestTierUpStub_ = nullptr;
+
+  void* updateCallRefMetricsStub_ = nullptr;
+
+  alignas(16) char data_;
+
+  FuncDefInstanceData* funcDefInstanceData(uint32_t funcIndex) const;
+  TypeDefInstanceData* typeDefInstanceData(uint32_t typeIndex) const;
+  const void* addressOfGlobalCell(const GlobalDesc& globalDesc) const;
+  FuncImportInstanceData& funcImportInstanceData(uint32_t funcIndex);
+  FuncExportInstanceData& funcExportInstanceData(uint32_t funcExportIndex);
+  MemoryInstanceData& memoryInstanceData(uint32_t memoryIndex) const;
+  TableInstanceData& tableInstanceData(uint32_t tableIndex) const;
+  TagInstanceData& tagInstanceData(uint32_t tagIndex) const;
+
+  friend class js::WasmInstanceObject;
+  void tracePrivate(JSTracer* trc);
+
+  bool callImport(JSContext* cx, uint32_t funcImportIndex, unsigned argc,
+                  uint64_t* argv);
+
+  Instance(JSContext* cx, Handle<WasmInstanceObject*> object,
+           const SharedCode& code, SharedTableVector&& tables,
+           UniqueDebugState maybeDebug);
+  ~Instance();
+
+ public:
+  static Instance* create(JSContext* cx, Handle<WasmInstanceObject*> object,
+                          const SharedCode& code, uint32_t instanceDataLength,
+                          SharedTableVector&& tables,
+                          UniqueDebugState maybeDebug);
+  static void destroy(Instance* instance);
+
+  bool init(JSContext* cx, const JSObjectVector& funcImports,
+            const ValVector& globalImportValues,
+            Handle<WasmMemoryObjectVector> memories,
+            const WasmGlobalObjectVector& globalObjs,
+            const WasmTagObjectVector& tagObjs,
+            const DataSegmentVector& dataSegments,
+            const ModuleElemSegmentVector& elemSegments);
+
+  uintptr_t traceFrame(JSTracer* trc, const wasm::WasmFrameIter& wfi,
+                       uint8_t* nextPC,
+                       uintptr_t highestByteVisitedInPrevFrame);
+  void updateFrameForMovingGC(const wasm::WasmFrameIter& wfi, uint8_t* nextPC,
+                              Nursery& nursery);
+
+  static constexpr size_t offsetOfMemory0Base() {
+    return offsetof(Instance, memory0Base_);
+  }
+  static constexpr size_t offsetOfMemory0BoundsCheckLimit() {
+    return offsetof(Instance, memory0BoundsCheckLimit_);
+  }
+  static constexpr size_t offsetOfDebugStub() {
+    return offsetof(Instance, debugStub_);
+  }
+  static constexpr size_t offsetOfRequestTierUpStub() {
+    return offsetof(Instance, requestTierUpStub_);
+  }
+  static constexpr size_t offsetOfUpdateCallRefMetricsStub() {
+    return offsetof(Instance, updateCallRefMetricsStub_);
+  }
+
+  static constexpr size_t offsetOfRealm() { return offsetof(Instance, realm_); }
+  static constexpr size_t offsetOfCx() { return offsetof(Instance, cx_); }
+  static constexpr size_t offsetOfValueBoxClass() {
+    return offsetof(Instance, valueBoxClass_);
+  }
+  static constexpr size_t offsetOfPendingException() {
+    return offsetof(Instance, pendingException_);
+  }
+  static constexpr size_t offsetOfPendingExceptionTag() {
+    return offsetof(Instance, pendingExceptionTag_);
+  }
+  static constexpr size_t offsetOfInterrupt() {
+    return offsetof(Instance, interrupt_);
+  }
+  static constexpr size_t offsetOfAllocSites() {
+    return offsetof(Instance, allocSites_);
+  }
+  static constexpr size_t offsetOfAllocationMetadataBuilder() {
+    return offsetof(Instance, allocationMetadataBuilder_);
+  }
+  static constexpr size_t offsetOfAddressOfLastBufferedWholeCell() {
+    return offsetof(Instance, addressOfLastBufferedWholeCell_);
+  }
+  static constexpr size_t offsetOfAddressOfNeedsMarkingBarrier() {
+    return offsetof(Instance, addressOfNeedsMarkingBarrier_);
+  }
+  static constexpr size_t offsetOfJumpTable() {
+    return offsetof(Instance, jumpTable_);
+  }
+  static constexpr size_t offsetOfBaselineScratchWords() {
+    return offsetof(Instance, baselineScratchWords_);
+  }
+  static constexpr size_t sizeOfBaselineScratchWords() {
+    return sizeof(baselineScratchWords_);
+  }
+  static constexpr size_t offsetOfJSJitExceptionHandler() {
+    return offsetof(Instance, jsJitExceptionHandler_);
+  }
+  static constexpr size_t offsetOfPreBarrierCode() {
+    return offsetof(Instance, preBarrierCode_);
+  }
+  static constexpr size_t offsetOfDebugFilter() {
+    return offsetof(Instance, debugFilter_);
+  }
+  static constexpr size_t offsetOfCallRefMetrics() {
+    return offsetof(Instance, callRefMetrics_);
+  }
+  static constexpr size_t offsetOfData() { return offsetof(Instance, data_); }
+  static constexpr size_t offsetInData(size_t offset) {
+    return offsetOfData() + offset;
+  }
+  static constexpr size_t offsetOfAddressOfNurseryPosition() {
+    return offsetof(Instance, addressOfNurseryPosition_);
+  }
+#ifdef JS_GC_ZEAL
+  static constexpr size_t offsetOfAddressOfGCZealModeBits() {
+    return offsetof(Instance, addressOfGCZealModeBits_);
+  }
+#endif
+
+  JSContext* cx() const { return cx_; }
+  void* debugStub() const { return debugStub_; }
+  void setDebugStub(void* newStub) { debugStub_ = newStub; }
+  void setRequestTierUpStub(void* newStub) { requestTierUpStub_ = newStub; }
+  void setUpdateCallRefMetricsStub(void* newStub) {
+    updateCallRefMetricsStub_ = newStub;
+  }
+  JS::Realm* realm() const { return realm_; }
+  bool debugEnabled() const { return !!maybeDebug_; }
+  DebugState& debug() { return *maybeDebug_; }
+  uint8_t* data() const { return (uint8_t*)&data_; }
+  const SharedTableVector& tables() const { return tables_; }
+  SharedMem<uint8_t*> memoryBase(uint32_t memoryIndex) const;
+  WasmMemoryObject* memory(uint32_t memoryIndex) const;
+  size_t memoryMappedSize(uint32_t memoryIndex) const;
+  SharedArrayRawBuffer* sharedMemoryBuffer(
+      uint32_t memoryIndex) const;  
+  bool memoryAccessInGuardRegion(const uint8_t* addr, unsigned numBytes) const;
+  bool memoryAccessInMappedRegion(const uint8_t* addr, uint32_t* memoryIndex,
+                                  uint64_t* offset) const;
+
+
+  void setInterrupt();
+  bool isInterrupted() const;
+  void resetInterrupt();
+
+  void setAllocationMetadataBuilder(
+      const js::AllocationMetadataBuilder* allocationMetadataBuilder) {
+    allocationMetadataBuilder_ = allocationMetadataBuilder;
+  }
+
+  int32_t computeInitialHotnessCounter(uint32_t funcIndex,
+                                       size_t codeSectionSize);
+  void resetHotnessCounter(uint32_t funcIndex);
+  int32_t readHotnessCounter(uint32_t funcIndex) const;
+  void submitCallRefHints(uint32_t funcIndex);
+
+  bool debugFilter(uint32_t funcIndex) const;
+  void setDebugFilter(uint32_t funcIndex, bool value);
+
+  const Code& code() const { return *code_; }
+  inline const CodeMetadata& codeMeta() const;
+  inline const CodeTailMetadata& codeTailMeta() const;
+
+
+  WasmInstanceObject* object() const;
+  WasmInstanceObject* objectUnbarriered() const;
+
+
+  [[nodiscard]] bool getExportedFunction(JSContext* cx, uint32_t funcIndex,
+                                         MutableHandleFunction result);
+
+
+  [[nodiscard]] bool callExport(JSContext* cx, uint32_t funcIndex,
+                                const CallArgs& args,
+                                CoercionLevel level = CoercionLevel::Spec);
+
+
+  void setPendingException(Handle<WasmExceptionObject*> exn);
+
+
+  void constantGlobalGet(uint32_t globalIndex, MutableHandleVal result);
+  WasmStructObject* constantStructNewDefault(JSContext* cx, uint32_t typeIndex);
+  WasmArrayObject* constantArrayNewDefault(JSContext* cx, uint32_t typeIndex,
+                                           uint32_t numElements);
+
+
+  JSAtom* getFuncDisplayAtom(JSContext* cx, uint32_t funcIndex) const;
+  void ensureProfilingLabels(bool profilingEnabled) const;
+
+
+  void onMovingGrowMemory(const WasmMemoryObject* memory);
+  void onMovingGrowTable(const Table* table);
+
+  bool initSegments(JSContext* cx, const DataSegmentVector& dataSegments,
+                    const ModuleElemSegmentVector& elemSegments);
+
+  [[nodiscard]] bool initElems(JSContext* cx, uint32_t tableIndex,
+                               const ModuleElemSegment& seg,
+                               uint32_t dstOffset);
+
+  template <typename F>
+  [[nodiscard]] bool iterElemsFunctions(const ModuleElemSegment& seg,
+                                        const F& onFunc);
+
+  template <typename F>
+  [[nodiscard]] bool iterElemsAnyrefs(JSContext* cx,
+                                      const ModuleElemSegment& seg,
+                                      const F& onAnyRef);
+
+
+  JSString* createDisplayURL(JSContext* cx);
+  WasmBreakpointSite* getOrCreateBreakpointSite(JSContext* cx, uint32_t offset);
+  void destroyBreakpointSite(JS::GCContext* gcx, uint32_t offset);
+
+
+  void addSizeOfMisc(mozilla::MallocSizeOf mallocSizeOf,
+                     SeenSet<CodeMetadata>* seenCodeMeta,
+                     SeenSet<Code>* seenCode, SeenSet<Table>* seenTables,
+                     size_t* code, size_t* data) const;
+
+
+  void disassembleExport(JSContext* cx, uint32_t funcIndex, Tier tier,
+                         PrintCallback printString) const;
+
+ public:
+  static int32_t callImport_general(Instance*, int32_t, int32_t, uint64_t*);
+  static uint32_t memoryGrow_m32(Instance* instance, uint32_t delta,
+                                 uint32_t memoryIndex);
+  static uint64_t memoryGrow_m64(Instance* instance, uint64_t delta,
+                                 uint32_t memoryIndex);
+  static uint32_t memorySize_m32(Instance* instance, uint32_t memoryIndex);
+  static uint64_t memorySize_m64(Instance* instance, uint32_t memoryIndex);
+  static int32_t memCopy_m32(Instance* instance, uint32_t dstByteOffset,
+                             uint32_t srcByteOffset, uint32_t len,
+                             uint8_t* memBase);
+  static int32_t memCopyShared_m32(Instance* instance, uint32_t dstByteOffset,
+                                   uint32_t srcByteOffset, uint32_t len,
+                                   uint8_t* memBase);
+  static int32_t memCopy_m64(Instance* instance, uint64_t dstByteOffset,
+                             uint64_t srcByteOffset, uint64_t len,
+                             uint8_t* memBase);
+  static int32_t memCopyShared_m64(Instance* instance, uint64_t dstByteOffset,
+                                   uint64_t srcByteOffset, uint64_t len,
+                                   uint8_t* memBase);
+  static int32_t memCopy_any(Instance* instance, uint64_t dstByteOffset,
+                             uint64_t srcByteOffset, uint64_t len,
+                             uint32_t dstMemIndex, uint32_t srcMemIndex);
+
+  static int32_t memFill_m32(Instance* instance, uint32_t byteOffset,
+                             uint32_t value, uint32_t len, uint8_t* memBase);
+  static int32_t memFillShared_m32(Instance* instance, uint32_t byteOffset,
+                                   uint32_t value, uint32_t len,
+                                   uint8_t* memBase);
+  static int32_t memFill_m64(Instance* instance, uint64_t byteOffset,
+                             uint32_t value, uint64_t len, uint8_t* memBase);
+  static int32_t memFillShared_m64(Instance* instance, uint64_t byteOffset,
+                                   uint32_t value, uint64_t len,
+                                   uint8_t* memBase);
+  static int32_t memInit_m32(Instance* instance, uint32_t dstOffset,
+                             uint32_t srcOffset, uint32_t len,
+                             uint32_t segIndex, uint32_t memIndex);
+  static int32_t memInit_m64(Instance* instance, uint64_t dstOffset,
+                             uint32_t srcOffset, uint32_t len,
+                             uint32_t segIndex, uint32_t memIndex);
+  static int32_t dataDrop(Instance* instance, uint32_t segIndex);
+  static int32_t tableCopy(Instance* instance, uint32_t dstOffset,
+                           uint32_t srcOffset, uint32_t len,
+                           uint32_t dstTableIndex, uint32_t srcTableIndex);
+  static int32_t tableFill(Instance* instance, uint32_t start, void* value,
+                           uint32_t len, uint32_t tableIndex);
+  static int32_t memDiscard_m32(Instance* instance, uint32_t byteOffset,
+                                uint32_t byteLen, uint8_t* memBase);
+  static int32_t memDiscardShared_m32(Instance* instance, uint32_t byteOffset,
+                                      uint32_t byteLen, uint8_t* memBase);
+  static int32_t memDiscard_m64(Instance* instance, uint64_t byteOffset,
+                                uint64_t byteLen, uint8_t* memBase);
+  static int32_t memDiscardShared_m64(Instance* instance, uint64_t byteOffset,
+                                      uint64_t byteLen, uint8_t* memBase);
+  static void* tableGet(Instance* instance, uint32_t address,
+                        uint32_t tableIndex);
+  static uint32_t tableGrow(Instance* instance, void* initValue, uint32_t delta,
+                            uint32_t tableIndex);
+  static int32_t tableSet(Instance* instance, uint32_t address, void* value,
+                          uint32_t tableIndex);
+  static uint32_t tableSize(Instance* instance, uint32_t tableIndex);
+  static int32_t tableInit(Instance* instance, uint32_t dstOffset,
+                           uint32_t srcOffset, uint32_t len, uint32_t segIndex,
+                           uint32_t tableIndex);
+  static int32_t elemDrop(Instance* instance, uint32_t segIndex);
+  static int32_t wait_i32_m32(Instance* instance, uint32_t byteOffset,
+                              int32_t value, int64_t timeout,
+                              uint32_t memoryIndex);
+  static int32_t wait_i32_m64(Instance* instance, uint64_t byteOffset,
+                              int32_t value, int64_t timeout,
+                              uint32_t memoryIndex);
+  static int32_t wait_i64_m32(Instance* instance, uint32_t byteOffset,
+                              int64_t value, int64_t timeout,
+                              uint32_t memoryIndex);
+  static int32_t wait_i64_m64(Instance* instance, uint64_t byteOffset,
+                              int64_t value, int64_t timeout,
+                              uint32_t memoryIndex);
+  static int32_t wake_m32(Instance* instance, uint32_t byteOffset,
+                          int32_t count, uint32_t memoryIndex);
+  static int32_t wake_m64(Instance* instance, uint64_t byteOffset,
+                          int32_t count, uint32_t memoryIndex);
+  static void* refFunc(Instance* instance, uint32_t funcIndex);
+  static void postBarrierEdge(Instance* instance, AnyRef* location);
+  static void postBarrierEdgePrecise(Instance* instance, AnyRef* location,
+                                     void* prev);
+  static void postBarrierWholeCell(Instance* instance, gc::Cell* object);
+  static void* exceptionNew(Instance* instance, void* exceptionArg);
+  static int32_t throwException(Instance* instance, void* exceptionArg);
+  template <bool ZeroFields>
+  static void* structNewIL(Instance* instance, uint32_t typeDefIndex,
+                           gc::AllocSite* allocSite);
+  template <bool ZeroFields>
+  static void* structNewOOL(Instance* instance, uint32_t typeDefIndex,
+                            gc::AllocSite* allocSite);
+  template <bool ZeroFields>
+  static void* arrayNew(Instance* instance, uint32_t numElements,
+                        uint32_t typeDefIndex, gc::AllocSite* allocSite);
+  static void* arrayNewData(Instance* instance, uint32_t segByteOffset,
+                            uint32_t numElements, uint32_t typeDefIndex,
+                            gc::AllocSite* allocSite, uint32_t segIndex);
+  static void* arrayNewElem(Instance* instance, uint32_t srcOffset,
+                            uint32_t numElements, uint32_t typeDefIndex,
+                            gc::AllocSite* allocSite, uint32_t segIndex);
+  static int32_t arrayInitData(Instance* instance, void* array, uint32_t index,
+                               uint32_t segByteOffset, uint32_t numElements,
+                               uint32_t segIndex);
+  static int32_t arrayInitElem(Instance* instance, void* array, uint32_t index,
+                               uint32_t segOffset, uint32_t numElements,
+                               uint32_t typeDefIndex, uint32_t segIndex);
+  static int32_t arrayCopy(Instance* instance, void* dstArray,
+                           uint32_t dstIndex, void* srcArray, uint32_t srcIndex,
+                           uint32_t numElements, uint32_t elementSize);
+#ifdef ENABLE_WASM_JSPI
+  static void* contNew(Instance* instance, void* funcRef);
+  static void* contNewEmpty(Instance* instance);
+  static void contUnwind(Instance* instance, wasm::Handlers* handlers);
+#endif
+  static int32_t refTest(Instance* instance, void* refPtr,
+                         const wasm::TypeDef* typeDef);
+  static int32_t intrI8VecMul(Instance* instance, uint32_t dest, uint32_t src1,
+                              uint32_t src2, uint32_t len, uint8_t* memBase);
+
+  static int32_t stringTest(Instance* instance, void* stringArg);
+  static void* stringCast(Instance* instance, void* stringArg);
+  static void* stringFromCharCodeArray(Instance* instance, void* arrayArg,
+                                       uint32_t arrayStart, uint32_t arrayEnd);
+  static int32_t stringIntoCharCodeArray(Instance* instance, void* stringArg,
+                                         void* arrayArg, uint32_t arrayStart);
+  static void* stringFromCharCode(Instance* instance, uint32_t charCode);
+  static void* stringFromCodePoint(Instance* instance, uint32_t codePoint);
+  static int32_t stringCharCodeAt(Instance* instance, void* stringArg,
+                                  uint32_t index);
+  static int32_t stringCodePointAt(Instance* instance, void* stringArg,
+                                   uint32_t index);
+  static int32_t stringLength(Instance* instance, void* stringArg);
+  static void* stringConcat(Instance* instance, void* firstStringArg,
+                            void* secondStringArg);
+  static void* stringSubstring(Instance* instance, void* stringArg,
+                               uint32_t startIndex, uint32_t endIndex);
+  static int32_t stringEquals(Instance* instance, void* firstStringArg,
+                              void* secondStringArg);
+  static int32_t stringCompare(Instance* instance, void* firstStringArg,
+                               void* secondStringArg);
+  static void addSubI128(Instance* instance, uint32_t isAdd);
+  static void mulI64Wide(Instance* instance, uint32_t isSigned);
+};
+
+bool ResultsToJSValue(JSContext* cx, ResultType type, void* registerResultLoc,
+                      mozilla::Maybe<char*> stackResultsLoc,
+                      MutableHandleValue rval,
+                      CoercionLevel level = CoercionLevel::Spec);
+
+void ReportTrapError(JSContext* cx, unsigned errorNumber);
+
+void MarkPendingExceptionAsTrap(JSContext* cx);
+
+void TraceInstanceEdge(JSTracer* trc, Instance* instance, const char* name);
+
+}  
+}  
+
+#endif  // wasm_instance_h

@@ -1,0 +1,26 @@
+
+[package]
+name = "dns-parser"
+version = "0.8.0"
+authors = ["Paul Colomiets <paul@colomiets.name>"]
+description = "    Pure-rust DNS protocol parser library. This does not support network, only\n    raw protocol parser.\n"
+homepage = "https://github.com/tailhook/dns-parser"
+documentation = "https://docs.rs/dns-parser"
+keywords = ["dns", "domain", "name", "parser"]
+categories = ["parser-implementations"]
+license = "MIT/Apache-2.0"
+[dependencies.byteorder]
+version = "1"
+
+[dependencies.quick-error]
+version = "1.0.0"
+
+[dependencies.serde]
+version = "1.0"
+optional = true
+
+[dependencies.serde_derive]
+version = "1.0"
+optional = true
+[features]
+with-serde = ["serde", "serde_derive"]

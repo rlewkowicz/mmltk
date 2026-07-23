@@ -1,0 +1,73 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "AutoscrollAnimation.h"
+
+#include <algorithm>  // for std::max()
+#include <cmath>      // for sqrtf()
+
+#include "AsyncPanZoomController.h"
+#include "APZCTreeManager.h"
+#include "FrameMetrics.h"
+#include "mozilla/StaticPrefs_general.h"
+
+namespace mozilla {
+namespace layers {
+
+static float Accelerate(ScreenCoord curr, ScreenCoord start) {
+  static const float baseSpeed = 12.0f;
+  int multiplier =
+      std::max(1, int(StaticPrefs::general_autoscroll_speed_multiplier()));
+  float speed = std::max(1.0f, baseSpeed * 100 / multiplier);
+  float val = (curr - start) / speed;
+  if (val > 1) {
+    return val * sqrtf(val) - 1;
+  }
+  if (val < -1) {
+    return val * sqrtf(-val) + 1;
+  }
+  return 0;
+}
+
+AutoscrollAnimation::AutoscrollAnimation(AsyncPanZoomController& aApzc,
+                                         const ScreenPoint& aAnchorLocation)
+    : mApzc(aApzc), mAnchorLocation(aAnchorLocation) {}
+
+bool AutoscrollAnimation::DoSample(FrameMetrics& aFrameMetrics,
+                                   const TimeDuration& aDelta) {
+  APZCTreeManager* treeManager = mApzc.GetApzcTreeManager();
+  if (!treeManager) {
+    return false;
+  }
+
+  ScreenPoint mouseLocation = treeManager->GetCurrentMousePosition();
+
+
+  static const TimeDuration maxTimeDelta = TimeDuration::FromMilliseconds(100);
+  TimeDuration timeDelta = TimeDuration::Min(aDelta, maxTimeDelta);
+
+  float timeCompensation = timeDelta.ToMilliseconds() / 20;
+
+  CSSPoint scrollDelta{
+      Accelerate(mouseLocation.x, mAnchorLocation.x) * timeCompensation,
+      Accelerate(mouseLocation.y, mAnchorLocation.y) * timeCompensation};
+
+  mApzc.ScrollByAndClamp(scrollDelta);
+
+  return true;
+}
+
+void AutoscrollAnimation::Cancel(CancelAnimationFlags aFlags) {
+  if (aFlags & TriggeredExternally) {
+    return;
+  }
+
+  if (RefPtr<GeckoContentController> controller =
+          mApzc.GetGeckoContentController()) {
+    controller->CancelAutoscroll(mApzc.GetGuid());
+  }
+}
+
+}  
+}  

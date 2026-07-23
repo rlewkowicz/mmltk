@@ -1,0 +1,83 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_JSAtomUtils_h
+#define vm_JSAtomUtils_h
+
+#include "mozilla/HashFunctions.h"
+#include "mozilla/Maybe.h"
+
+#include "NamespaceImports.h"
+
+#include "gc/MaybeRooted.h"
+#include "js/TypeDecls.h"
+#include "js/Utility.h"
+#include "vm/StringType.h"
+
+namespace js {
+
+class AtomSet;
+
+extern UniqueChars AtomToPrintableString(JSContext* cx, JSAtom* atom);
+
+class PropertyName;
+
+} 
+
+namespace js {
+
+void TraceAtoms(JSTracer* trc);
+
+extern JSAtom* Atomize(
+    JSContext* cx, const char* bytes, size_t length,
+    const mozilla::Maybe<uint32_t>& indexValue = mozilla::Nothing());
+
+extern JSAtom* AtomizeWithoutActiveZone(JSContext* cx, const char* bytes,
+                                        size_t length);
+
+template <typename CharT>
+extern JSAtom* AtomizeChars(JSContext* cx, const CharT* chars, size_t length);
+
+
+template <typename CharT>
+extern JSAtom* AtomizeCharsNonStaticValidLength(JSContext* cx,
+                                                mozilla::HashNumber hash,
+                                                const CharT* chars,
+                                                size_t length);
+
+extern JSAtom* PermanentlyAtomizeCharsNonStaticValidLength(
+    JSContext* cx, AtomSet& atomSet, mozilla::HashNumber hash,
+    const Latin1Char* chars, size_t length);
+
+extern JSAtom* AtomizeUTF8Chars(JSContext* cx, const char* utf8Chars,
+                                size_t utf8ByteLength);
+
+extern JSAtom* AtomizeStringSlow(JSContext* cx, JSString* str);
+
+MOZ_ALWAYS_INLINE JSAtom* AtomizeString(JSContext* cx, JSString* str) {
+  if (str->isAtom()) {
+    return &str->asAtom();
+  }
+  return AtomizeStringSlow(cx, str);
+}
+
+template <AllowGC allowGC>
+extern JSAtom* ToAtom(JSContext* cx,
+                      typename MaybeRooted<JS::Value, allowGC>::HandleType v);
+
+extern bool PinAtom(JSContext* cx, JSAtom* atom);
+
+extern JS::Handle<PropertyName*> ClassName(JSProtoKey key, JSContext* cx);
+
+#ifdef DEBUG
+
+bool AtomIsMarked(JS::Zone* zone, JSAtom* atom);
+bool AtomIsMarked(JS::Zone* zone, jsid id);
+bool AtomIsMarked(JS::Zone* zone, const JS::Value& value);
+
+#endif  // DEBUG
+
+} 
+
+#endif /* vm_JSAtomUtils_h */

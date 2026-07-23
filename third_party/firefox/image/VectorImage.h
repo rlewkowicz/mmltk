@@ -1,0 +1,118 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_VectorImage_h
+#define mozilla_image_VectorImage_h
+
+#include "Image.h"
+#include "mozilla/gfx/Point.h"
+#include "nsIStreamListener.h"
+
+class nsIRequest;
+class gfxDrawable;
+
+namespace mozilla {
+struct MediaFeatureChange;
+
+namespace image {
+
+class SourceSurfaceBlobImage;
+struct SVGDrawingParameters;
+class SVGDocumentWrapper;
+class SVGRootRenderingObserver;
+class SVGLoadEventListener;
+class SVGParseCompleteListener;
+
+class VectorImage final : public ImageResource, public nsIStreamListener {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_IMGICONTAINER
+
+
+  virtual size_t SizeOfSourceWithComputedFallback(
+      SizeOfState& aState) const override;
+
+  virtual nsresult OnImageDataAvailable(nsIRequest* aRequest,
+                                        nsIInputStream* aInStr,
+                                        uint64_t aSourceOffset,
+                                        uint32_t aCount) override;
+  virtual nsresult OnImageDataComplete(nsIRequest* aRequest, nsresult aResult,
+                                       bool aLastPart) override;
+
+  virtual void OnSurfaceDiscarded(const SurfaceKey& aSurfaceKey) override;
+
+  void InvalidateObserversOnNextRefreshDriverTick();
+
+  void OnSVGDocumentParsed();
+
+  void OnSVGDocumentLoaded();
+  void OnSVGDocumentError();
+
+ protected:
+  explicit VectorImage(nsIURI* aURI = nullptr);
+  virtual ~VectorImage();
+
+  virtual nsresult StartAnimation() override;
+  virtual nsresult StopAnimation() override;
+  virtual bool ShouldAnimate() override;
+
+ private:
+  friend class SourceSurfaceBlobImage;
+
+  std::tuple<RefPtr<gfx::SourceSurface>, gfx::IntSize> LookupCachedSurface(
+      const gfx::IntSize& aSize, const SVGImageContext& aSVGContext,
+      uint32_t aFlags);
+
+  bool MaybeRestrictSVGContext(SVGImageContext& aSVGContext, uint32_t aFlags);
+
+  already_AddRefed<gfxDrawable> CreateSVGDrawable(
+      const SVGDrawingParameters& aParams);
+
+  already_AddRefed<gfx::SourceSurface> CreateSurface(
+      const SVGDrawingParameters& aParams, gfxDrawable* aSVGDrawable,
+      bool& aWillCache);
+
+  void SendFrameComplete(bool aDidCache, uint32_t aFlags);
+
+  void Show(gfxDrawable* aDrawable, const SVGDrawingParameters& aParams);
+
+  nsresult Init(const char* aMimeType, uint32_t aFlags);
+
+  void RecoverFromLossOfSurfaces();
+
+  void CancelAllListeners();
+  void SendInvalidationNotifications();
+
+  RefPtr<SVGDocumentWrapper> mSVGDocumentWrapper;
+  RefPtr<SVGRootRenderingObserver> mRenderingObserver;
+  RefPtr<SVGLoadEventListener> mLoadEventListener;
+  RefPtr<SVGParseCompleteListener> mParseCompleteListener;
+
+  uint32_t mLockCount;
+
+  Maybe<Progress> mLoadProgress;
+
+  bool mIsInitialized;           
+  bool mDiscardable;             
+  bool mIsFullyLoaded;           
+  bool mHaveAnimations;          
+  bool mHasPendingInvalidation;  
+
+  friend class ImageFactory;
+};
+
+inline NS_IMETHODIMP VectorImage::GetAnimationMode(uint16_t* aAnimationMode) {
+  return GetAnimationModeInternal(aAnimationMode);
+}
+
+inline NS_IMETHODIMP VectorImage::SetAnimationMode(uint16_t aAnimationMode) {
+  return SetAnimationModeInternal(aAnimationMode);
+}
+
+}  
+}  
+
+#endif  // mozilla_image_VectorImage_h

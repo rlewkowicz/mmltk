@@ -1,0 +1,39 @@
+
+[package]
+edition = "2018"
+name = "arraystring"
+version = "0.3.0"
+authors = ["Paulo Cabral Sanz <paulosanz@poli.ufrj.br>"]
+description = "Fixed capacity stack based generic string"
+keywords = ["string", "generic", "array", "stack", "no_std"]
+categories = ["data-structures"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/paulocsanz/arraystring"
+[package.metadata.docs.rs]
+features = ["logs", "serde-traits", "std", "diesel-traits"]
+rustdoc-args = ["--cfg", "docs_rs_workaraound"]
+
+[lib]
+name = "arraystring"
+crate_type = ["lib"]
+
+[dependencies.diesel]
+version = "1"
+optional = true
+
+[dependencies.log]
+version = "0.4"
+optional = true
+
+[dependencies.serde]
+version = "1"
+optional = true
+
+[dependencies.typenum]
+version = "1"
+[features]
+default = ["std"]
+diesel-traits = ["diesel"]
+logs = ["log"]
+serde-traits = ["serde"]
+std = []

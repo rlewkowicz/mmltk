@@ -1,0 +1,197 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef SSLTokensCache_h_
+#define SSLTokensCache_h_
+
+#include "CertVerifier.h"  // For EVStatus
+#include "mozilla/Maybe.h"
+#include "mozilla/Span.h"
+#include "mozilla/StaticMutex.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/OriginAttributes.h"
+#include "mozilla/TimeStamp.h"
+#include "nsClassHashtable.h"
+#include "nsIFile.h"
+#include "nsIMemoryReporter.h"
+#include "nsIAsyncShutdown.h"
+#include "nsIObserver.h"
+#include "nsISerialEventTarget.h"
+#include "nsISupportsImpl.h"
+#include "nsITransportSecurityInfo.h"
+#include "nsTArray.h"
+#include "nsTHashMap.h"
+#include "nsXULAppAPI.h"
+
+class CommonSocketControl;
+struct SslTokensPersistedRecord;
+
+namespace mozilla {
+namespace ipc {
+class ByteBuf;
+}
+}  
+
+namespace mozilla {
+namespace net {
+
+struct SessionCacheInfo {
+  SessionCacheInfo Clone() const;
+
+  psm::EVStatus mEVStatus = psm::EVStatus::NotEV;
+  uint16_t mCertificateTransparencyStatus =
+      nsITransportSecurityInfo::CERTIFICATE_TRANSPARENCY_NOT_APPLICABLE;
+  nsTArray<uint8_t> mServerCertBytes;
+  Maybe<nsTArray<nsTArray<uint8_t>>> mSucceededCertChainBytes;
+  Maybe<bool> mIsBuiltCertChainRootBuiltInRoot;
+  nsITransportSecurityInfo::OverridableErrorCategory mOverridableErrorCategory;
+  Maybe<nsTArray<nsTArray<uint8_t>>> mHandshakeCertificatesBytes;
+};
+
+class SSLTokensCache : public nsIMemoryReporter,
+                       public nsIObserver,
+                       public nsIAsyncShutdownBlocker {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIMEMORYREPORTER
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSIASYNCSHUTDOWNBLOCKER
+
+  friend class ExpirationComparator;
+
+  static nsresult Init();
+  static nsresult Shutdown();
+
+  static nsresult Put(const nsACString& aKey, const uint8_t* aToken,
+                      uint32_t aTokenLen, CommonSocketControl* aSocketControl);
+  static nsresult Put(const nsACString& aKey, const uint8_t* aToken,
+                      uint32_t aTokenLen, CommonSocketControl* aSocketControl,
+                      PRTime aExpirationTime);
+  static nsresult Get(const nsACString& aKey, nsTArray<uint8_t>& aToken,
+                      SessionCacheInfo& aResult, uint64_t* aTokenId = nullptr);
+  static nsresult Remove(const nsACString& aKey, uint64_t aId);
+  static nsresult RemoveAll(const nsACString& aKey);
+  static void Clear();
+  static void RemoveByHostAndOAPattern(
+      const nsACString& aHost, const mozilla::OriginAttributesPattern& aPattern)
+      MOZ_EXCLUDES(sLock);
+  static void RemoveBySiteAndOAPattern(
+      const nsACString& aSite, const mozilla::OriginAttributesPattern& aPattern)
+      MOZ_EXCLUDES(sLock);
+
+  static nsTArray<uint8_t> SerializeForIPC();
+
+  static void DeserializeFromIPC(mozilla::Span<const uint8_t> aData);
+  static void DeserializeFromIPCAsync(mozilla::ipc::ByteBuf&& aBuf);
+
+
+ private:
+  class TokenCacheRecord;  
+
+  SSLTokensCache();
+  virtual ~SSLTokensCache();
+
+  nsresult RemoveLocked(const nsACString& aKey, uint64_t aId)
+      MOZ_REQUIRES(sLock);
+  nsresult RemoveAllLocked(const nsACString& aKey) MOZ_REQUIRES(sLock);
+  UniquePtr<TokenCacheRecord> GetRecordLocked(const nsACString& aKey,
+                                              uint64_t* aTokenId)
+      MOZ_REQUIRES(sLock);
+
+  void EvictIfNecessary() MOZ_REQUIRES(sLock);
+  void LogStats() MOZ_REQUIRES(sLock);
+  void ClearCacheLocked() MOZ_REQUIRES(sLock);
+  static bool ShouldPersistKey(const nsACString& aKey,
+                               uint8_t aOverridableError);
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const
+      MOZ_REQUIRES(sLock);
+
+  static mozilla::StaticRefPtr<SSLTokensCache> gInstance MOZ_GUARDED_BY(sLock);
+  static StaticMutex sLock;
+  static uint64_t sRecordId MOZ_GUARDED_BY(sLock);
+
+  uint32_t mCacheSize MOZ_GUARDED_BY(sLock){0};
+
+  bool mWriteObserversRegistered MOZ_GUARDED_BY(sLock){false};
+  nsCOMPtr<nsIFile> mBackingFile MOZ_GUARDED_BY(sLock);
+  nsCOMPtr<nsISerialEventTarget> mWriteTaskQueue MOZ_GUARDED_BY(sLock);
+  bool mLoadComplete MOZ_GUARDED_BY(sLock){false};
+  TimeStamp mLoadStartTime MOZ_GUARDED_BY(sLock);
+  uint32_t mLoadGeneration MOZ_GUARDED_BY(sLock){0};
+  void DoWrite(bool aSynchronous) MOZ_EXCLUDES(sLock);
+  void RegisterShutdownBlocker() MOZ_EXCLUDES(sLock);
+  void RemoveShutdownBlocker() MOZ_EXCLUDES(sLock);
+  nsCOMPtr<nsIAsyncShutdownClient> mShutdownBarrier MOZ_GUARDED_BY(sLock);
+  static nsCString SetupPersistenceLocked(uint32_t& aLoadGen)
+      MOZ_REQUIRES(sLock);
+  static void DispatchLoad(nsCString aPath, uint32_t aLoadGen);
+  static void OnLoadCompleteNotify(uint32_t aCount);
+  static bool PutFromPersisted(const SslTokensPersistedRecord* aRec,
+                               uint32_t aExpectedGen);
+
+  struct LoadCtx {
+    uint32_t loadGen;
+    uint32_t count = 0;
+  };
+  static void LoadCallback(void* aCtx, const SslTokensPersistedRecord* aRec);
+  static nsDependentCSubstring BasePartFromKey(const nsACString& aKey);
+  static nsDependentCSubstring HostFromBasePart(
+      const nsDependentCSubstring& aBasePart);
+  static OriginAttributes OAFromPeerId(const nsACString& aPeerId);
+  static void RemoveByMatchAndOAPattern(
+      const nsACString& aValue, const nsACString& aSeparatedValue,
+      const mozilla::OriginAttributesPattern& aPattern) MOZ_EXCLUDES(sLock);
+
+  nsTArray<SslTokensPersistedRecord> CollectSnapshotLocked() const
+      MOZ_REQUIRES(sLock);
+  static nsTArray<uint8_t> SerializeSnapshotLocked() MOZ_REQUIRES(sLock);
+  template <typename Pred>
+  void RemoveMatchingLocked(Pred&& aPredicate) MOZ_REQUIRES(sLock);
+  static void PutFromPersistedCallback(void*,
+                                       const SslTokensPersistedRecord* aRec);
+
+  class TokenCacheRecord {
+   public:
+    ~TokenCacheRecord();
+
+    uint32_t Size() const;
+
+    nsCString mKey;
+    PRTime mExpirationTime = 0;
+    nsTArray<uint8_t> mCompressedPayload;
+    uint8_t mOverridableError = 0;
+    uint64_t mId = 0;
+  };
+
+  class TokenCacheEntry {
+   public:
+    uint32_t Size() const;
+    void AddRecord(UniquePtr<TokenCacheRecord>&& aRecord,
+                   nsTArray<TokenCacheRecord*>& aExpirationArray);
+    const UniquePtr<TokenCacheRecord>& Get();
+    UniquePtr<TokenCacheRecord> RemoveWithId(uint64_t aId);
+    uint32_t RecordCount() const { return mRecords.Length(); }
+    const nsTArray<UniquePtr<TokenCacheRecord>>& Records() const {
+      return mRecords;
+    }
+
+   private:
+    nsTArray<UniquePtr<TokenCacheRecord>> mRecords;
+  };
+
+  void OnRecordDestroyed(TokenCacheRecord* aRec) MOZ_REQUIRES(sLock);
+  uint64_t InsertRecordLocked(UniquePtr<TokenCacheRecord> aRec)
+      MOZ_REQUIRES(sLock);
+
+  nsClassHashtable<nsCStringHashKey, TokenCacheEntry> mTokenCacheRecords
+      MOZ_GUARDED_BY(sLock);
+  nsTArray<TokenCacheRecord*> mExpirationArray MOZ_GUARDED_BY(sLock);
+};
+
+}  
+}  
+
+#endif  // SSLTokensCache_h_

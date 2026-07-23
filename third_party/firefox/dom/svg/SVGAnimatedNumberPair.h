@@ -1,0 +1,119 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGANIMATEDNUMBERPAIR_H_
+#define DOM_SVG_SVGANIMATEDNUMBERPAIR_H_
+
+#include <memory>
+
+#include "DOMSVGAnimatedNumber.h"
+#include "mozilla/EnumeratedArray.h"
+#include "mozilla/SMILAttr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsError.h"
+#include "nsMathUtils.h"
+
+namespace mozilla {
+
+class SMILValue;
+
+namespace dom {
+class SVGAnimationElement;
+class SVGElement;
+}  
+
+enum class SVGAnimatedNumberPairWhichOne { First, Second };
+
+template <>
+struct MaxContiguousEnumValue<SVGAnimatedNumberPairWhichOne> {
+  static constexpr auto value = SVGAnimatedNumberPairWhichOne::Second;
+};
+
+class SVGAnimatedNumberPair {
+ public:
+  friend class AutoChangeNumberPairNotifier;
+  using SVGElement = dom::SVGElement;
+
+  using WhichOneOfPair = SVGAnimatedNumberPairWhichOne;
+  using PairValues = EnumeratedArray<WhichOneOfPair, float>;
+
+  void Init(uint8_t aAttrEnum = 0xff, float aValue = 0) {
+    mAnimVal = mBaseVal = PairValues(aValue, aValue);
+    mAttrEnum = aAttrEnum;
+    mIsAnimated = false;
+    mIsBaseSet = false;
+  }
+
+  nsresult SetBaseValueString(const nsAString& aValue, SVGElement* aSVGElement);
+  void GetBaseValueString(nsAString& aValue) const;
+
+  void SetBaseValue(float aValue, WhichOneOfPair aWhichOneOfPair,
+                    SVGElement* aSVGElement);
+  void SetBaseValues(float aValue1, float aValue2, SVGElement* aSVGElement);
+  float GetBaseValue(WhichOneOfPair aWhichOneOfPair) const {
+    return mBaseVal[aWhichOneOfPair];
+  }
+  void SetAnimValue(const float aValue[2], SVGElement* aSVGElement);
+  float GetAnimValue(WhichOneOfPair aWhichOneOfPair) const {
+    return mAnimVal[aWhichOneOfPair];
+  }
+
+  bool IsExplicitlySet() const { return mIsAnimated || mIsBaseSet; }
+
+  already_AddRefed<dom::DOMSVGAnimatedNumber> ToDOMAnimatedNumber(
+      WhichOneOfPair aWhichOneOfPair, SVGElement* aSVGElement);
+  std::unique_ptr<SMILAttr> ToSMILAttr(SVGElement* aSVGElement);
+
+ private:
+  PairValues mAnimVal;
+  PairValues mBaseVal;
+  uint8_t mAttrEnum;  
+  bool mIsAnimated;
+  bool mIsBaseSet;
+
+ public:
+  struct DOMAnimatedNumber final : public dom::DOMSVGAnimatedNumber {
+    DOMAnimatedNumber(SVGAnimatedNumberPair* aVal,
+                      WhichOneOfPair aWhichOneOfPair, SVGElement* aSVGElement)
+        : dom::DOMSVGAnimatedNumber(aSVGElement),
+          mVal(aVal),
+          mWhichOneOfPair(aWhichOneOfPair) {}
+    virtual ~DOMAnimatedNumber();
+
+    SVGAnimatedNumberPair* mVal;     
+    WhichOneOfPair mWhichOneOfPair;  
+
+    float BaseVal() override { return mVal->GetBaseValue(mWhichOneOfPair); }
+    void SetBaseVal(float aValue) override {
+      MOZ_ASSERT(std::isfinite(aValue));
+      mVal->SetBaseValue(aValue, mWhichOneOfPair, mSVGElement);
+    }
+
+    float AnimVal() override {
+      mSVGElement->FlushAnimations();
+      return mVal->GetAnimValue(mWhichOneOfPair);
+    }
+  };
+
+  struct SMILNumberPair : public SMILAttr {
+   public:
+    SMILNumberPair(SVGAnimatedNumberPair* aVal, SVGElement* aSVGElement)
+        : mVal(aVal), mSVGElement(aSVGElement) {}
+
+    SVGAnimatedNumberPair* mVal;
+    SVGElement* mSVGElement;
+
+    nsresult ValueFromString(const nsAString& aStr,
+                             const dom::SVGAnimationElement* aSrcElement,
+                             SMILValue& aValue,
+                             bool& aPreventCachingOfSandwich) const override;
+    SMILValue GetBaseValue() const override;
+    void ClearAnimValue() override;
+    nsresult SetAnimValue(const SMILValue& aValue) override;
+  };
+};
+
+}  
+
+#endif  // DOM_SVG_SVGANIMATEDNUMBERPAIR_H_

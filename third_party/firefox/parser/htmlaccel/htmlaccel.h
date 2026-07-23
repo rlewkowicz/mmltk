@@ -1,0 +1,223 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_htmlaccel_htmlaccel_h
+#define mozilla_htmlaccel_htmlaccel_h
+
+#include <string.h>
+#include <stdint.h>
+
+#include "mozilla/Attributes.h"
+
+
+#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#  error "A little-endian target is required."
+#endif
+#if !(defined(__aarch64__) || defined(__SSSE3__))
+#  error "Must be targeting SSSE3 or above (notably AVX+BMI), or aarch64."
+#endif
+
+#if !(defined(__GNUC__) || defined(__clang__))
+#  error "A compiler that supports GCC-style portable SIMD is required."
+#endif
+
+
+#if defined(__aarch64__)
+
+#  include <arm_neon.h>
+
+#else  // x86/x86_64
+
+#  include <tmmintrin.h>
+// Using syntax that clang-tidy doesn't like to match GCC guidance.
+typedef uint8_t uint8x16_t __attribute__((vector_size(16)));
+
+#endif
+
+namespace mozilla::htmlaccel {
+
+namespace detail {
+
+#if defined(__aarch64__)
+const uint8x16_t INVERTED_ADVANCES = {16, 15, 14, 13, 12, 11, 10, 9,
+                                      8,  7,  6,  5,  4,  3,  2,  1};
+const uint8x16_t ALL_ONES = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+
+MOZ_ALWAYS_INLINE_EVEN_DEBUG uint8x16_t TableLookup(uint8x16_t aTable,
+                                                    uint8x16_t aNibbles) {
+  return vqtbl1q_u8(aTable, aNibbles);
+}
+
+#else  // x86/x86_64
+
+MOZ_ALWAYS_INLINE_EVEN_DEBUG uint8x16_t TableLookup(uint8x16_t aTable,
+                                                    uint8x16_t aNibbles) {
+  return reinterpret_cast<uint8x16_t>(_mm_shuffle_epi8(aTable, aNibbles));
+}
+
+#endif
+
+const uint8x16_t ALL_ZEROS = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+const uint8x16_t NIBBLE_MASK = {0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF,
+                                0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF};
+const uint8x16_t SURROGATE_MASK = {0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                   0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8,
+                                   0xF8, 0xF8, 0xF8, 0xF8};
+const uint8x16_t SURROGATE_MATCH = {0xD8, 0xD8, 0xD8, 0xD8, 0xD8, 0xD8,
+                                    0xD8, 0xD8, 0xD8, 0xD8, 0xD8, 0xD8,
+                                    0xD8, 0xD8, 0xD8, 0xD8};
+const uint8x16_t HYPHENS = {'-', '-', '-', '-', '-', '-', '-', '-',
+                            '-', '-', '-', '-', '-', '-', '-', '-'};
+const uint8x16_t RSQBS = {']', ']', ']', ']', ']', ']', ']', ']',
+                          ']', ']', ']', ']', ']', ']', ']', ']'};
+
+
+const uint8x16_t ZERO_LT_AMP_CR = {0, 2, 1, 1, 1,   1,    '&', 1,
+                                   1, 1, 1, 1, '<', '\r', 1,   1};
+const uint8x16_t ZERO_LT_AMP_CR_LF = {0, 2, 1,    1, 1,   1,    '&', 1,
+                                      1, 1, '\n', 1, '<', '\r', 1,   1};
+const uint8x16_t LT_GT_AMP_NBSP = {0xA0, 2, 1, 1, 1,   1, '&', 1,
+                                   1,    1, 1, 1, '<', 1, '>', 1};
+const uint8x16_t LT_GT_AMP_NBSP_QUOT = {0xA0, 2, '"', 1, 1,   1, '&', 1,
+                                        1,    1, 1,   1, '<', 1, '>', 1};
+const uint8x16_t ZERO_LT_CR = {0, 2, 1, 1, 1,   1,    1, 1,
+                               1, 1, 1, 1, '<', '\r', 1, 1};
+const uint8x16_t ZERO_LT_CR_LF = {0, 2, 1,    1, 1,   1,    1, 1,
+                                  1, 1, '\n', 1, '<', '\r', 1, 1};
+const uint8x16_t ZERO_APOS_AMP_CR = {0, 2, 1, 1, 1, 1,    '&', '\'',
+                                     1, 1, 1, 1, 1, '\r', 1,   1};
+const uint8x16_t ZERO_APOS_AMP_CR_LF = {0, 2, 1,    1, 1, 1,    '&', '\'',
+                                        1, 1, '\n', 1, 1, '\r', 1,   1};
+const uint8x16_t ZERO_QUOT_AMP_CR = {0, 2, '"', 1, 1, 1,    '&', 1,
+                                     1, 1, 1,   1, 1, '\r', 1,   1};
+const uint8x16_t ZERO_QUOT_AMP_CR_LF = {0, 2, '"',  1, 1, 1,    '&', 1,
+                                        1, 1, '\n', 1, 1, '\r', 1,   1};
+const uint8x16_t ZERO_CR = {0, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, '\r', 1, 1};
+const uint8x16_t ZERO_CR_LF = {0, 2, 1,    1, 1, 1,    1, 1,
+                               1, 1, '\n', 1, 1, '\r', 1, 1};
+
+MOZ_ALWAYS_INLINE_EVEN_DEBUG uint8x16_t
+StrideToMask(const char16_t* aArr , uint8x16_t aTable,
+             bool aAllowSurrogates = true, bool aAllowHyphen = true,
+             bool aAllowRightSquareBracket = true) {
+  uint8x16_t first;
+  uint8x16_t second;
+  memcpy(&first, aArr, 16);
+  memcpy(&second, aArr + 8, 16);
+  uint8x16_t low_halves = __builtin_shufflevector(
+      first, second, 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+  uint8x16_t high_halves = __builtin_shufflevector(
+      first, second, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
+  uint8x16_t high_half_matches = high_halves == ALL_ZEROS;
+  uint8x16_t low_half_matches =
+      low_halves == TableLookup(aTable, low_halves & NIBBLE_MASK);
+  if (!aAllowHyphen) {  
+    low_half_matches |= low_halves == HYPHENS;
+  }
+  if (!aAllowRightSquareBracket) {  
+    low_half_matches |= low_halves == RSQBS;
+  }
+  uint8x16_t ret = low_half_matches & high_half_matches;
+  if (!aAllowSurrogates) {  
+    ret |= (high_halves & SURROGATE_MASK) == SURROGATE_MATCH;
+  }
+  return ret;
+}
+
+MOZ_ALWAYS_INLINE_EVEN_DEBUG uint8x16_t
+StrideToMask(const char* aArr , uint8x16_t aTable,
+             bool aAllowSurrogates = true, bool aAllowHyphen = true,
+             bool aAllowRightSquareBracket = true) {
+  uint8x16_t stride;
+  memcpy(&stride, aArr, 16);
+  return stride == TableLookup(aTable, stride & NIBBLE_MASK);
+}
+
+template <typename CharT>
+MOZ_ALWAYS_INLINE_EVEN_DEBUG size_t
+AccelerateTextNode(const CharT* aInput, const CharT* aEnd, uint8x16_t aTable,
+                   bool aAllowSurrogates = true, bool aAllowHyphen = true,
+                   bool aAllowRightSquareBracket = true) {
+  const CharT* current = aInput;
+  while (aEnd - current >= 16) {
+    uint8x16_t mask = StrideToMask(current, aTable, aAllowSurrogates,
+                                   aAllowHyphen, aAllowRightSquareBracket);
+#if defined(__aarch64__)
+    uint8_t max = vmaxvq_u8(mask & INVERTED_ADVANCES);
+    if (max != 0) {
+      return size_t((current - aInput) + 16 - max);
+    }
+#else  // x86/x86_64
+    int int_mask = _mm_movemask_epi8(mask);
+    if (int_mask != 0) {
+      return size_t((current - aInput) + __builtin_ctz(int_mask));
+    }
+#endif
+    current += 16;
+  }
+  return size_t(current - aInput);
+}
+
+template <typename CharT>
+MOZ_ALWAYS_INLINE_EVEN_DEBUG uint32_t CountEscaped(const CharT* aInput,
+                                                   const CharT* aEnd,
+                                                   bool aCountDoubleQuote) {
+  uint32_t numEncodedChars = 0;
+  const CharT* current = aInput;
+  while (aEnd - current >= 16) {
+    uint8x16_t mask = StrideToMask(
+        current, aCountDoubleQuote ? LT_GT_AMP_NBSP_QUOT : LT_GT_AMP_NBSP);
+#if defined(__aarch64__)
+    numEncodedChars += vaddvq_u8(mask & ALL_ONES);
+#else  // x86_64
+    numEncodedChars += __builtin_popcount(_mm_movemask_epi8(mask));
+#endif
+    current += 16;
+  }
+  while (current != aEnd) {
+    CharT c = *current;
+    if ((aCountDoubleQuote && c == CharT('"')) || c == CharT('&') ||
+        c == CharT('<') || c == CharT('>') || c == CharT(0xA0)) {
+      ++numEncodedChars;
+    }
+    ++current;
+  }
+  return numEncodedChars;
+}
+
+MOZ_ALWAYS_INLINE_EVEN_DEBUG bool ContainsMarkup(const char16_t* aInput,
+                                                 const char16_t* aEnd) {
+  const char16_t* current = aInput;
+  while (aEnd - current >= 16) {
+    uint8x16_t mask = StrideToMask(current, ZERO_LT_AMP_CR);
+#if defined(__aarch64__)
+    uint8_t max = vmaxvq_u8(mask);
+    if (max != 0) {
+      return true;
+    }
+#else  // x86/x86_64
+    int int_mask = _mm_movemask_epi8(mask);
+    if (int_mask != 0) {
+      return true;
+    }
+#endif
+    current += 16;
+  }
+  while (current != aEnd) {
+    char16_t c = *current;
+    if (c == char16_t('<') || c == char16_t('&') || c == char16_t('\r') ||
+        c == char16_t('\0')) {
+      return true;
+    }
+    ++current;
+  }
+  return false;
+}
+
+}  
+
+
+}  
+
+#endif  // mozilla_htmlaccel_htmlaccel_h

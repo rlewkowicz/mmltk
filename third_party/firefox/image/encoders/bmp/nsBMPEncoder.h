@@ -1,0 +1,123 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_encoders_bmp_nsBMPEncoder_h
+#define mozilla_image_encoders_bmp_nsBMPEncoder_h
+
+#include "imgIEncoder.h"
+#include "mozilla/ReentrantMonitor.h"
+#include "mozilla/UniquePtr.h"
+#include "nsCOMPtr.h"
+
+#define NS_BMPENCODER_CID                     \
+  { \
+   0x13a5320c,                                \
+   0x4c91,                                    \
+   0x4fa4,                                    \
+   {0xbd, 0x16, 0xb0, 0x81, 0xa3, 0Xba, 0x8c, 0x0b}}
+
+namespace mozilla {
+namespace image {
+namespace bmp {
+
+struct FileHeader {
+  char signature[2];    
+  uint32_t filesize;    
+  int32_t reserved;     
+  uint32_t dataoffset;  
+};
+
+struct XYZ {
+  int32_t x, y, z;
+};
+
+struct XYZTriple {
+  XYZ r, g, b;
+};
+
+struct V5InfoHeader {
+  uint32_t bihsize;           
+  int32_t width;              
+  int32_t height;             
+  uint16_t planes;            
+  uint16_t bpp;               
+  uint32_t compression;       
+  uint32_t image_size;        
+  uint32_t xppm;              
+  uint32_t yppm;              
+  uint32_t colors;            
+  uint32_t important_colors;  
+  uint32_t red_mask;     
+  uint32_t green_mask;   
+  uint32_t blue_mask;    
+  uint32_t alpha_mask;   
+  uint32_t color_space;  
+  XYZTriple white_point;  
+  uint32_t gamma_red;     
+  uint32_t gamma_green;   
+  uint32_t gamma_blue;    
+  uint32_t intent;        
+  uint32_t profile_offset;  
+  uint32_t profile_size;    
+  uint32_t reserved;        
+
+  static const uint32_t COLOR_SPACE_LCS_SRGB = 0x73524742;
+};
+
+}  
+}  
+}  
+
+
+class nsBMPEncoder final : public imgIEncoder {
+  typedef mozilla::ReentrantMonitor ReentrantMonitor;
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_IMGIENCODER
+  NS_DECL_NSIINPUTSTREAM
+  NS_DECL_NSIASYNCINPUTSTREAM
+
+  nsBMPEncoder();
+
+ protected:
+  ~nsBMPEncoder();
+
+  enum Version { VERSION_3 = 3, VERSION_5 = 5 };
+
+  nsresult ParseOptions(const nsAString& aOptions, Version& aVersionOut,
+                        uint16_t& aBppOut);
+  void ConvertHostARGBRow(const uint8_t* aSrc,
+                          const mozilla::UniquePtr<uint8_t[]>& aDest,
+                          uint32_t aPixelWidth);
+  void NotifyListener();
+
+  nsresult InitFileHeader(Version aVersion, uint16_t aBPP, uint32_t aWidth,
+                          uint32_t aHeight);
+  nsresult InitInfoHeader(Version aVersion, uint16_t aBPP, uint32_t aWidth,
+                          uint32_t aHeight);
+
+  void EncodeFileHeader();
+  void EncodeInfoHeader();
+  void EncodeImageDataRow24(const uint8_t* aData);
+  void EncodeImageDataRow32(const uint8_t* aData);
+  inline int32_t GetCurrentImageBufferOffset() {
+    return static_cast<int32_t>(mImageBufferCurr - mImageBufferStart);
+  }
+
+  mozilla::image::bmp::FileHeader mBMPFileHeader;
+  mozilla::image::bmp::V5InfoHeader mBMPInfoHeader;
+
+  uint8_t* mImageBufferStart;
+  uint8_t* mImageBufferCurr;
+  uint32_t mImageBufferSize;
+  uint32_t mImageBufferReadPoint;
+  bool mFinished;
+
+  nsCOMPtr<nsIInputStreamCallback> mCallback;
+  nsCOMPtr<nsIEventTarget> mCallbackTarget;
+  uint32_t mNotifyThreshold;
+};
+
+#endif  // mozilla_image_encoders_bmp_nsBMPEncoder_h

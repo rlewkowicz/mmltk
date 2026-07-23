@@ -1,0 +1,124 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsIAppStartup.h"
+#include "nsIFile.h"
+#include "nsIStringBundle.h"
+#include "nsIToolkitProfile.h"
+#include "nsIWindowWatcher.h"
+
+#include "ProfileReset.h"
+
+#include "nsDirectoryServiceDefs.h"
+#include "nsDirectoryServiceUtils.h"
+#include "nsPIDOMWindow.h"
+#include "nsString.h"
+#include "mozilla/Components.h"
+#include "mozilla/XREAppData.h"
+
+#include "mozilla/SpinEventLoopUntil.h"
+
+using namespace mozilla;
+
+extern const XREAppData* gAppData;
+
+static const char kProfileProperties[] =
+    "chrome://mozapps/locale/profile/profileSelection.properties";
+
+nsresult ProfileResetCleanup(nsToolkitProfileService* aService,
+                             nsIToolkitProfile* aOldProfile) {
+  nsresult rv;
+  nsCOMPtr<nsIFile> profileDir;
+  rv = aOldProfile->GetRootDir(getter_AddRefs(profileDir));
+  if (NS_FAILED(rv)) return rv;
+
+  nsCOMPtr<nsIFile> profileLocalDir;
+  rv = aOldProfile->GetLocalDir(getter_AddRefs(profileLocalDir));
+  if (NS_FAILED(rv)) return rv;
+
+  nsCOMPtr<nsIStringBundleService> sbs =
+      mozilla::components::StringBundle::Service();
+  if (!sbs) return NS_ERROR_FAILURE;
+
+  nsCOMPtr<nsIStringBundle> sb;
+  (void)sbs->CreateBundle(kProfileProperties, getter_AddRefs(sb));
+  if (!sb) return NS_ERROR_FAILURE;
+
+  NS_ConvertUTF8toUTF16 appName(gAppData->name);
+  AutoTArray<nsString, 2> params = {appName, appName};
+
+  nsAutoString resetBackupDirectoryName;
+
+  static const char* kResetBackupDirectory = "resetBackupDirectory";
+  rv = sb->FormatStringFromName(kResetBackupDirectory, params,
+                                resetBackupDirectoryName);
+  if (NS_FAILED(rv)) return rv;
+
+  nsCOMPtr<nsIFile> backupDest, containerDest, profileDest;
+  rv = NS_GetSpecialDirectory(NS_OS_DESKTOP_DIR, getter_AddRefs(backupDest));
+  if (NS_FAILED(rv)) {
+    rv = NS_GetSpecialDirectory(NS_OS_HOME_DIR, getter_AddRefs(backupDest));
+    if (NS_FAILED(rv)) return rv;
+  }
+
+  backupDest->Clone(getter_AddRefs(containerDest));
+  containerDest->Append(resetBackupDirectoryName);
+  rv = containerDest->Create(nsIFile::DIRECTORY_TYPE, 0700);
+  if (rv == NS_ERROR_FILE_ALREADY_EXISTS) {
+    bool containerIsDir;
+    rv = containerDest->IsDirectory(&containerIsDir);
+    if (NS_FAILED(rv) || !containerIsDir) {
+      return rv;
+    }
+  } else if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  nsAutoString leafName;
+  rv = profileDir->GetLeafName(leafName);
+  if (NS_FAILED(rv)) return rv;
+
+  containerDest->Clone(getter_AddRefs(profileDest));
+  profileDest->Append(leafName);
+  rv = profileDest->CreateUnique(nsIFile::DIRECTORY_TYPE, 0700);
+  if (NS_FAILED(rv)) return rv;
+
+  rv = profileDest->GetLeafName(leafName);
+  if (NS_FAILED(rv)) return rv;
+
+  rv = profileDest->Remove(false);
+  if (NS_FAILED(rv)) return rv;
+
+  nsCOMPtr<nsIWindowWatcher> windowWatcher(
+      do_GetService(NS_WINDOWWATCHER_CONTRACTID));
+  if (!windowWatcher) return NS_ERROR_FAILURE;
+
+  nsCOMPtr<nsIAppStartup> appStartup(components::AppStartup::Service());
+  if (!appStartup) return NS_ERROR_FAILURE;
+
+  nsCOMPtr<mozIDOMWindowProxy> progressWindow;
+  rv = windowWatcher->OpenWindow(nullptr, nsDependentCString(kResetProgressURL),
+                                 "_blank"_ns, "centerscreen,chrome,titlebar"_ns,
+                                 nullptr, getter_AddRefs(progressWindow));
+  if (NS_FAILED(rv)) return rv;
+
+  nsCOMPtr<nsIThread> cleanupThread;
+  rv = NS_NewNamedThread("ResetCleanup", getter_AddRefs(cleanupThread));
+  if (NS_SUCCEEDED(rv)) {
+    nsCOMPtr<nsIRunnable> runnable = new ProfileResetCleanupAsyncTask(
+        profileDir, profileLocalDir, containerDest, leafName);
+    cleanupThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL);
+
+    SpinEventLoopUntil("xre:ProfileResetCreateBackup"_ns,
+                       [&]() { return gProfileResetCleanupCompleted; });
+  } else {
+    gProfileResetCleanupCompleted = true;
+    NS_WARNING("Cleanup thread creation failed");
+    return rv;
+  }
+  auto* piWindow = nsPIDOMWindowOuter::From(progressWindow);
+  piWindow->Close();
+
+  return aService->ApplyResetProfile(aOldProfile);
+}

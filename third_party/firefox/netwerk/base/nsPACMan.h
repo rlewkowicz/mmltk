@@ -1,0 +1,188 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsPACMan_h_
+#define nsPACMan_h_
+
+#include "mozilla/Atomics.h"
+#include "mozilla/DataMutex.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/Logging.h"
+#include "mozilla/net/NeckoTargetHolder.h"
+#include "mozilla/TimeStamp.h"
+#include "nsCOMPtr.h"
+#include "nsIChannelEventSink.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIStreamLoader.h"
+#include "nsThreadUtils.h"
+#include "nsIURI.h"
+#include "nsString.h"
+#include "ProxyAutoConfig.h"
+
+class nsISystemProxySettings;
+class nsIDHCPClient;
+class nsIThread;
+
+namespace mozilla {
+namespace net {
+
+class nsPACMan;
+class WaitForThreadShutdown;
+
+class NS_NO_VTABLE nsPACManCallback : public nsISupports {
+ public:
+  virtual void OnQueryComplete(nsresult status, const nsACString& pacString,
+                               const nsACString& newPACURL) = 0;
+};
+
+class PendingPACQuery final : public Runnable,
+                              public LinkedListElement<PendingPACQuery> {
+ public:
+  PendingPACQuery(nsPACMan* pacMan, nsIURI* uri, nsPACManCallback* callback,
+                  uint32_t flags, bool mainThreadResponse);
+
+  void Complete(nsresult status, const nsACString& pacString);
+  void UseAlternatePACFile(const nsACString& pacURL);
+
+  nsCString mSpec;
+  nsCString mScheme;
+  nsCString mHost;
+  int32_t mPort;
+  uint32_t mFlags;
+
+  NS_IMETHOD Run(void) override; 
+
+ private:
+  nsPACMan* mPACMan;  
+
+ private:
+  RefPtr<nsPACManCallback> mCallback;
+  bool mOnMainThreadOnly;
+};
+
+
+class nsPACMan final : public nsIStreamLoaderObserver,
+                       public nsIInterfaceRequestor,
+                       public nsIChannelEventSink,
+                       public NeckoTargetHolder {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+  explicit nsPACMan(nsISerialEventTarget* mainThreadEventTarget);
+
+  void Shutdown();
+
+  nsresult AsyncGetProxyForURI(nsIURI* uri, nsPACManCallback* callback,
+                               uint32_t flags, bool mainThreadResponse);
+
+  nsresult LoadPACFromURI(const nsACString& aSpec);
+
+  bool IsLoading() {
+    auto loader = mLoader.Lock();
+    return loader.ref() != nullptr;
+  }
+
+  bool IsPACURI(const nsACString& spec) {
+    return mPACURISpec.Equals(spec) || mPACURIRedirectSpec.Equals(spec) ||
+           mNormalPACURISpec.Equals(spec);
+  }
+
+  bool IsPACURI(nsIURI* uri) {
+    if (mPACURISpec.IsEmpty() && mPACURIRedirectSpec.IsEmpty()) {
+      return false;
+    }
+
+    nsAutoCString tmp;
+    nsresult rv = uri->GetSpec(tmp);
+    if (NS_FAILED(rv)) {
+      return false;
+    }
+
+    return IsPACURI(tmp);
+  }
+
+  bool IsUsingWPAD() { return mAutoDetect; }
+
+  nsresult Init(nsISystemProxySettings*);
+  static nsPACMan* sInstance;
+
+  void ProcessPendingQ();
+  void CancelPendingQ(nsresult, bool aShutdown);
+
+  void SetWPADOverDHCPEnabled(bool aValue) { mWPADOverDHCPEnabled = aValue; }
+
+ private:
+  NS_DECL_NSISTREAMLOADEROBSERVER
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSICHANNELEVENTSINK
+
+  friend class PendingPACQuery;
+  friend class PACLoadComplete;
+  friend class ConfigureWPADComplete;
+  friend class ExecutePACThreadAction;
+  friend class WaitForThreadShutdown;
+  friend class TestPACMan;
+
+  ~nsPACMan();
+
+  void CancelExistingLoad();
+
+  void StartLoading();
+
+  void ContinueLoadingAfterPACUriKnown();
+
+  nsresult LoadPACFromURI(const nsACString& aSpec, bool aResetLoadFailureCount);
+
+  void MaybeReloadPAC();
+
+  void OnLoadFailure();
+
+  nsresult PostQuery(PendingPACQuery* query);
+
+  void AssignPACURISpec(const nsACString& aSpec);
+
+  void PostProcessPendingQ();
+  void PostCancelPendingQ(nsresult, bool aShutdown = false);
+  bool ProcessPending();
+  nsresult GetPACFromDHCP(nsACString& aSpec);
+  nsresult ConfigureWPAD(nsACString& aSpec);
+
+ private:
+  nsresult DispatchToPAC(already_AddRefed<nsIRunnable> aEvent,
+                         bool aSync = false);
+
+  UniquePtr<ProxyAutoConfigBase> mPAC;
+  nsCOMPtr<nsIThread> mPACThread;
+  nsCOMPtr<nsISystemProxySettings> mSystemProxySettings;
+
+  nsCOMPtr<nsIDHCPClient> mDHCPClient;
+  mozilla::Monitor mMonitor{"mDHCPMonitor"};
+  nsCString mPACStringFromDHCP MOZ_GUARDED_BY(mMonitor);
+
+  LinkedList<PendingPACQuery> mPendingQ; 
+
+  nsCString mPACURISpec;
+  nsCString mPACURIRedirectSpec;
+  nsCString mNormalPACURISpec;
+
+  DataMutex<nsCOMPtr<nsIStreamLoader>> mLoader;
+  bool mLoadPending;
+  Atomic<bool, Relaxed> mShutdown;
+  TimeStamp mScheduledReload;
+  Atomic<uint32_t, Relaxed> mLoadFailureCount;
+
+  bool mInProgress;
+  bool mIncludePath;
+  bool mAutoDetect;
+  bool mWPADOverDHCPEnabled;
+  int32_t mProxyConfigType;
+};
+
+extern LazyLogModule gProxyLog;
+
+}  
+}  
+
+#endif  // nsPACMan_h_

@@ -1,0 +1,16 @@
+
+[package]
+name = "core_maths"
+version = "0.1.0"
+authors = ["Robert Bastian <me@robertbastian.dev"]
+description = "Extension trait for full float functionality in `#[no_std]` backed by `libm`."
+categories = [
+    "no-std",
+    "mathematics",
+    "api-bindings",
+]
+license = "MIT"
+repository = "https://github.com/robertbastian/core_maths"
+
+[dependencies.libm]
+version = "0.2"

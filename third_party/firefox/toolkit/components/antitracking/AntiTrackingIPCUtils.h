@@ -1,0 +1,52 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_antitrackingipcutils_h
+#define mozilla_antitrackingipcutils_h
+
+#include "ipc/EnumSerializer.h"
+
+#include "mozilla/ContentBlockingNotifier.h"
+#include "mozilla/StorageAccessAPIHelper.h"
+
+#include "nsILoadInfo.h"
+
+namespace IPC {
+
+template <>
+struct ParamTraits<
+    mozilla::ContentBlockingNotifier::StorageAccessPermissionGrantedReason>
+    : public ContiguousEnumSerializerInclusive<
+          mozilla::ContentBlockingNotifier::
+              StorageAccessPermissionGrantedReason,
+          mozilla::ContentBlockingNotifier::
+              StorageAccessPermissionGrantedReason::eStorageAccessAPI,
+          mozilla::ContentBlockingNotifier::
+              StorageAccessPermissionGrantedReason::
+                  ePrivilegeStorageAccessForOriginAPI> {};
+
+template <>
+struct ParamTraits<mozilla::ContentBlockingNotifier::BlockingDecision>
+    : public ContiguousEnumSerializerInclusive<
+          mozilla::ContentBlockingNotifier::BlockingDecision,
+          mozilla::ContentBlockingNotifier::BlockingDecision::eBlock,
+          mozilla::ContentBlockingNotifier::BlockingDecision::eAllow> {};
+
+template <>
+struct ParamTraits<mozilla::StorageAccessAPIHelper::StorageAccessPromptChoices>
+    : public ContiguousEnumSerializerInclusive<
+          mozilla::StorageAccessAPIHelper::StorageAccessPromptChoices,
+          mozilla::StorageAccessAPIHelper::StorageAccessPromptChoices::eAllow,
+          mozilla::StorageAccessAPIHelper::StorageAccessPromptChoices::
+              eAllowAutoGrant> {};
+
+template <>
+struct ParamTraits<nsILoadInfo::StoragePermissionState>
+    : public ContiguousEnumSerializerInclusive<
+          nsILoadInfo::StoragePermissionState,
+          nsILoadInfo::StoragePermissionState::NoStoragePermission,
+          nsILoadInfo::StoragePermissionState::InactiveStoragePermission> {};
+}  
+
+#endif  // mozilla_antitrackingipcutils_h

@@ -1,0 +1,114 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef _js_vm_Logging_h_
+#define _js_vm_Logging_h_
+
+#include "mozilla/Assertions.h"
+#include "mozilla/LoggingCore.h"
+
+#include "jit/JitSpewChannelList.h"
+#include "js/experimental/LoggingInterface.h"
+
+struct JSContext;
+
+namespace js {
+
+using mozilla::LogLevel;
+
+class LogModule {
+ public:
+  explicit constexpr LogModule(const char* name, const char* help)
+      : name(name), help(help) {
+    MOZ_ASSERT(name);
+    MOZ_ASSERT(help);
+  }
+
+  inline bool shouldLog(mozilla::LogLevel level) const {
+    if (!isSetup()) {
+      return false;
+    }
+
+    return *levelPtr >= level;
+  }
+
+  [[nodiscard]] static bool initializeAll(const JS::LoggingInterface iface);
+
+ public:
+  mutable JS::LoggingInterface interface{};
+
+  mutable JS::OpaqueLogger logger{};
+
+  const char* name{};
+
+  const char* help{};
+
+ private:
+  inline bool isSetup() const { return interface.isComplete() && logger; }
+
+  bool initialize(const JS::LoggingInterface iface) const {
+    interface = iface;
+    MOZ_ASSERT(iface.isComplete());
+    logger = iface.getLoggerByName(name);
+    if (!logger) {
+      return false;
+    }
+
+    levelPtr = &iface.getLevelRef(logger);
+    return true;
+  }
+
+  mutable mozilla::AtomicLogLevel* levelPtr{};
+};
+
+#define FOR_EACH_JS_LOG_MODULE(_)                          \
+  _(debug, "A predefined log module for casual debugging") \
+  _(wasmPerf, "Wasm performance statistics")               \
+  _(wasmApi, "Wasm JS-API tracing")                        \
+  _(fuseInvalidation, "Invalidation triggered by a fuse")  \
+  _(thenable, "Thenable on standard proto")                \
+  _(startup, "Engine startup logging")                     \
+  _(teleporting, "Shape Teleporting")                      \
+  _(selfHosted, "Self-hosted script logging")              \
+  _(gc, "The garbage collector")                           \
+  _(mtq, "MicroTask queue")                                \
+  JITSPEW_CHANNEL_LIST(_) 
+
+#define DECLARE_MODULE(X, HELP) inline constexpr LogModule X##Module(#X, HELP);
+
+FOR_EACH_JS_LOG_MODULE(DECLARE_MODULE);
+
+#undef DECLARE_MODULE
+
+#define JS_LOGGING 1
+
+#ifdef JS_LOGGING
+#  define JS_SHOULD_LOG(name, log_level) \
+    name##Module.shouldLog(LogLevel::log_level)
+
+#  define JS_LOG(name, log_level, ...)                                     \
+    do {                                                                   \
+      if (name##Module.shouldLog(LogLevel::log_level)) {                   \
+        name##Module.interface.logPrint(name##Module.logger,               \
+                                        LogLevel::log_level, __VA_ARGS__); \
+      }                                                                    \
+    } while (0);
+#  define JS_LOG_FMT(name, log_level, fmt, ...)                            \
+    do {                                                                   \
+      if (name##Module.shouldLog(LogLevel::log_level)) {                   \
+        name##Module.interface.logPrintFmt(                                \
+            name##Module.logger, LogLevel::log_level, fmt, ##__VA_ARGS__); \
+      }                                                                    \
+    } while (0);
+#else
+#  define JS_LOG(module, log_level, ...)
+#  define JS_LOG_FMT(module, log_level, fmt, ...)
+#endif
+
+#undef JS_LOGGING
+
+}  
+
+#endif /* _js_vm_Logging_h_ */

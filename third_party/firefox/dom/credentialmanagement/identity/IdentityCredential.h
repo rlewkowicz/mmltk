@@ -1,0 +1,51 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_IdentityCredential_h
+#define mozilla_dom_IdentityCredential_h
+
+#include "mozilla/IdentityCredentialStorageService.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/dom/CanonicalBrowsingContext.h"
+#include "mozilla/dom/Credential.h"
+#include "mozilla/dom/PWebIdentity.h"
+#include "nsICredentialChosenCallback.h"
+
+namespace mozilla::dom {
+
+class IdentityCredential final : public Credential {
+  friend class mozilla::IdentityCredentialStorageService;
+  friend class WindowGlobalChild;
+
+ protected:
+  ~IdentityCredential() override;
+
+ public:
+  explicit IdentityCredential(nsPIDOMWindowInner* aParent,
+                              const IPCIdentityCredential& aOther);
+
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  void CopyValuesFrom(const IPCIdentityCredential& aOther);
+
+  IPCIdentityCredential MakeIPCIdentityCredential() const;
+
+  static already_AddRefed<Promise> Disconnect(
+      const GlobalObject& aGlobal,
+      const IdentityCredentialDisconnectOptions& aOptions, ErrorResult& aRv);
+  void GetToken(nsACString& aToken) const;
+  void SetToken(const nsACString& aToken);
+  void GetConfigURL(nsACString& aConfigURL) const;
+  void SetConfigURL(const nsACString& aConfigURL);
+  bool IsAutoSelected() const;
+
+ private:
+  nsCString mToken;
+  nsCString mConfigURL;
+  bool mIsAutoSelected;
+};
+}  
+
+#endif  // mozilla_dom_IdentityCredential_h

@@ -1,0 +1,691 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+
+#include "unicode/edits.h"
+#include "unicode/unistr.h"
+#include "unicode/utypes.h"
+#include "cmemory.h"
+#include "uassert.h"
+#include "util.h"
+
+U_NAMESPACE_BEGIN
+
+namespace {
+
+const int32_t MAX_UNCHANGED_LENGTH = 0x1000;
+const int32_t MAX_UNCHANGED = MAX_UNCHANGED_LENGTH - 1;
+
+const int32_t MAX_SHORT_CHANGE_OLD_LENGTH = 6;
+const int32_t MAX_SHORT_CHANGE_NEW_LENGTH = 7;
+const int32_t SHORT_CHANGE_NUM_MASK = 0x1ff;
+const int32_t MAX_SHORT_CHANGE = 0x6fff;
+
+const int32_t LENGTH_IN_1TRAIL = 61;
+const int32_t LENGTH_IN_2TRAIL = 62;
+
+}  
+
+void Edits::releaseArray() noexcept {
+    if (array != stackArray) {
+        uprv_free(array);
+    }
+}
+
+Edits &Edits::copyArray(const Edits &other) {
+    if (U_FAILURE(errorCode_)) {
+        length = delta = numChanges = 0;
+        return *this;
+    }
+    if (length > capacity) {
+        uint16_t* newArray = static_cast<uint16_t*>(uprv_malloc(static_cast<size_t>(length) * 2));
+        if (newArray == nullptr) {
+            length = delta = numChanges = 0;
+            errorCode_ = U_MEMORY_ALLOCATION_ERROR;
+            return *this;
+        }
+        releaseArray();
+        array = newArray;
+        capacity = length;
+    }
+    if (length > 0) {
+        uprv_memcpy(array, other.array, (size_t)length * 2);
+    }
+    return *this;
+}
+
+Edits &Edits::moveArray(Edits &src) noexcept {
+    if (U_FAILURE(errorCode_)) {
+        length = delta = numChanges = 0;
+        return *this;
+    }
+    releaseArray();
+    if (length > STACK_CAPACITY) {
+        array = src.array;
+        capacity = src.capacity;
+        src.array = src.stackArray;
+        src.capacity = STACK_CAPACITY;
+        src.reset();
+        return *this;
+    }
+    array = stackArray;
+    capacity = STACK_CAPACITY;
+    if (length > 0) {
+        uprv_memcpy(array, src.array, (size_t)length * 2);
+    }
+    return *this;
+}
+
+Edits &Edits::operator=(const Edits &other) {
+    if (this == &other) { return *this; }  
+    length = other.length;
+    delta = other.delta;
+    numChanges = other.numChanges;
+    errorCode_ = other.errorCode_;
+    return copyArray(other);
+}
+
+Edits &Edits::operator=(Edits &&src) noexcept {
+    length = src.length;
+    delta = src.delta;
+    numChanges = src.numChanges;
+    errorCode_ = src.errorCode_;
+    return moveArray(src);
+}
+
+Edits::~Edits() {
+    releaseArray();
+}
+
+void Edits::reset() noexcept {
+    length = delta = numChanges = 0;
+    errorCode_ = U_ZERO_ERROR;
+}
+
+void Edits::addUnchanged(int32_t unchangedLength) {
+    if(U_FAILURE(errorCode_) || unchangedLength == 0) { return; }
+    if(unchangedLength < 0) {
+        errorCode_ = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+    int32_t last = lastUnit();
+    if(last < MAX_UNCHANGED) {
+        int32_t remaining = MAX_UNCHANGED - last;
+        if (remaining >= unchangedLength) {
+            setLastUnit(last + unchangedLength);
+            return;
+        }
+        setLastUnit(MAX_UNCHANGED);
+        unchangedLength -= remaining;
+    }
+    while(unchangedLength >= MAX_UNCHANGED_LENGTH) {
+        append(MAX_UNCHANGED);
+        unchangedLength -= MAX_UNCHANGED_LENGTH;
+    }
+    if(unchangedLength > 0) {
+        append(unchangedLength - 1);
+    }
+}
+
+void Edits::addReplace(int32_t oldLength, int32_t newLength) {
+    if(U_FAILURE(errorCode_)) { return; }
+    if(oldLength < 0 || newLength < 0) {
+        errorCode_ = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+    if (oldLength == 0 && newLength == 0) {
+        return;
+    }
+    ++numChanges;
+    int32_t newDelta = newLength - oldLength;
+    if (newDelta != 0) {
+        if ((newDelta > 0 && delta >= 0 && newDelta > (INT32_MAX - delta)) ||
+                (newDelta < 0 && delta < 0 && newDelta < (INT32_MIN - delta))) {
+            errorCode_ = U_INDEX_OUTOFBOUNDS_ERROR;
+            return;
+        }
+        delta += newDelta;
+    }
+
+    if(0 < oldLength && oldLength <= MAX_SHORT_CHANGE_OLD_LENGTH &&
+            newLength <= MAX_SHORT_CHANGE_NEW_LENGTH) {
+        int32_t u = (oldLength << 12) | (newLength << 9);
+        int32_t last = lastUnit();
+        if(MAX_UNCHANGED < last && last < MAX_SHORT_CHANGE &&
+                (last & ~SHORT_CHANGE_NUM_MASK) == u &&
+                (last & SHORT_CHANGE_NUM_MASK) < SHORT_CHANGE_NUM_MASK) {
+            setLastUnit(last + 1);
+            return;
+        }
+        append(u);
+        return;
+    }
+
+    int32_t head = 0x7000;
+    if (oldLength < LENGTH_IN_1TRAIL && newLength < LENGTH_IN_1TRAIL) {
+        head |= oldLength << 6;
+        head |= newLength;
+        append(head);
+    } else if ((capacity - length) >= 5 || growArray()) {
+        int32_t limit = length + 1;
+        if(oldLength < LENGTH_IN_1TRAIL) {
+            head |= oldLength << 6;
+        } else if(oldLength <= 0x7fff) {
+            head |= LENGTH_IN_1TRAIL << 6;
+            array[limit++] = static_cast<uint16_t>(0x8000 | oldLength);
+        } else {
+            head |= (LENGTH_IN_2TRAIL + (oldLength >> 30)) << 6;
+            array[limit++] = static_cast<uint16_t>(0x8000 | (oldLength >> 15));
+            array[limit++] = static_cast<uint16_t>(0x8000 | oldLength);
+        }
+        if(newLength < LENGTH_IN_1TRAIL) {
+            head |= newLength;
+        } else if(newLength <= 0x7fff) {
+            head |= LENGTH_IN_1TRAIL;
+            array[limit++] = static_cast<uint16_t>(0x8000 | newLength);
+        } else {
+            head |= LENGTH_IN_2TRAIL + (newLength >> 30);
+            array[limit++] = static_cast<uint16_t>(0x8000 | (newLength >> 15));
+            array[limit++] = static_cast<uint16_t>(0x8000 | newLength);
+        }
+        array[length] = static_cast<uint16_t>(head);
+        length = limit;
+    }
+}
+
+void Edits::append(int32_t r) {
+    if(length < capacity || growArray()) {
+        array[length++] = static_cast<uint16_t>(r);
+    }
+}
+
+UBool Edits::growArray() {
+    int32_t newCapacity;
+    if (array == stackArray) {
+        newCapacity = 2000;
+    } else if (capacity == INT32_MAX) {
+        errorCode_ = U_INDEX_OUTOFBOUNDS_ERROR;
+        return false;
+    } else if (capacity >= (INT32_MAX / 2)) {
+        newCapacity = INT32_MAX;
+    } else {
+        newCapacity = 2 * capacity;
+    }
+    if ((newCapacity - capacity) < 5) {
+        errorCode_ = U_INDEX_OUTOFBOUNDS_ERROR;
+        return false;
+    }
+    uint16_t* newArray = static_cast<uint16_t*>(uprv_malloc(static_cast<size_t>(newCapacity) * 2));
+    if (newArray == nullptr) {
+        errorCode_ = U_MEMORY_ALLOCATION_ERROR;
+        return false;
+    }
+    uprv_memcpy(newArray, array, (size_t)length * 2);
+    releaseArray();
+    array = newArray;
+    capacity = newCapacity;
+    return true;
+}
+
+UBool Edits::copyErrorTo(UErrorCode &outErrorCode) const {
+    if (U_FAILURE(outErrorCode)) { return true; }
+    if (U_SUCCESS(errorCode_)) { return false; }
+    outErrorCode = errorCode_;
+    return true;
+}
+
+Edits &Edits::mergeAndAppend(const Edits &ab, const Edits &bc, UErrorCode &errorCode) {
+    if (copyErrorTo(errorCode)) { return *this; }
+    Iterator abIter = ab.getFineIterator();
+    Iterator bcIter = bc.getFineIterator();
+    UBool abHasNext = true, bcHasNext = true;
+    int32_t aLength = 0, ab_bLength = 0, bc_bLength = 0, cLength = 0;
+    int32_t pending_aLength = 0, pending_cLength = 0;
+    for (;;) {
+        if (bc_bLength == 0) {
+            if (bcHasNext && (bcHasNext = bcIter.next(errorCode)) != 0) {
+                bc_bLength = bcIter.oldLength();
+                cLength = bcIter.newLength();
+                if (bc_bLength == 0) {
+                    if (ab_bLength == 0 || !abIter.hasChange()) {
+                        addReplace(pending_aLength, pending_cLength + cLength);
+                        pending_aLength = pending_cLength = 0;
+                    } else {
+                        pending_cLength += cLength;
+                    }
+                    continue;
+                }
+            }
+        }
+        if (ab_bLength == 0) {
+            if (abHasNext && (abHasNext = abIter.next(errorCode)) != 0) {
+                aLength = abIter.oldLength();
+                ab_bLength = abIter.newLength();
+                if (ab_bLength == 0) {
+                    if (bc_bLength == bcIter.oldLength() || !bcIter.hasChange()) {
+                        addReplace(pending_aLength + aLength, pending_cLength);
+                        pending_aLength = pending_cLength = 0;
+                    } else {
+                        pending_aLength += aLength;
+                    }
+                    continue;
+                }
+            } else if (bc_bLength == 0) {
+                break;
+            } else {
+                if (!copyErrorTo(errorCode)) {
+                    errorCode = U_ILLEGAL_ARGUMENT_ERROR;
+                }
+                return *this;
+            }
+        }
+        if (bc_bLength == 0) {
+            if (!copyErrorTo(errorCode)) {
+                errorCode = U_ILLEGAL_ARGUMENT_ERROR;
+            }
+            return *this;
+        }
+
+
+        if (!abIter.hasChange() && !bcIter.hasChange()) {
+            if (pending_aLength != 0 || pending_cLength != 0) {
+                addReplace(pending_aLength, pending_cLength);
+                pending_aLength = pending_cLength = 0;
+            }
+            int32_t unchangedLength = aLength <= cLength ? aLength : cLength;
+            addUnchanged(unchangedLength);
+            ab_bLength = aLength -= unchangedLength;
+            bc_bLength = cLength -= unchangedLength;
+            continue;
+        }
+        if (!abIter.hasChange() && bcIter.hasChange()) {
+            if (ab_bLength >= bc_bLength) {
+                addReplace(pending_aLength + bc_bLength, pending_cLength + cLength);
+                pending_aLength = pending_cLength = 0;
+                aLength = ab_bLength -= bc_bLength;
+                bc_bLength = 0;
+                continue;
+            }
+        } else if (abIter.hasChange() && !bcIter.hasChange()) {
+            if (ab_bLength <= bc_bLength) {
+                addReplace(pending_aLength + aLength, pending_cLength + ab_bLength);
+                pending_aLength = pending_cLength = 0;
+                cLength = bc_bLength -= ab_bLength;
+                ab_bLength = 0;
+                continue;
+            }
+        } else {  
+            if (ab_bLength == bc_bLength) {
+                addReplace(pending_aLength + aLength, pending_cLength + cLength);
+                pending_aLength = pending_cLength = 0;
+                ab_bLength = bc_bLength = 0;
+                continue;
+            }
+        }
+        pending_aLength += aLength;
+        pending_cLength += cLength;
+        if (ab_bLength < bc_bLength) {
+            bc_bLength -= ab_bLength;
+            cLength = ab_bLength = 0;
+        } else {  
+            ab_bLength -= bc_bLength;
+            aLength = bc_bLength = 0;
+        }
+    }
+    if (pending_aLength != 0 || pending_cLength != 0) {
+        addReplace(pending_aLength, pending_cLength);
+    }
+    copyErrorTo(errorCode);
+    return *this;
+}
+
+Edits::Iterator::Iterator(const uint16_t *a, int32_t len, UBool oc, UBool crs) :
+        array(a), index(0), length(len), remaining(0),
+        onlyChanges_(oc), coarse(crs),
+        dir(0), changed(false), oldLength_(0), newLength_(0),
+        srcIndex(0), replIndex(0), destIndex(0) {}
+
+int32_t Edits::Iterator::readLength(int32_t head) {
+    if (head < LENGTH_IN_1TRAIL) {
+        return head;
+    } else if (head < LENGTH_IN_2TRAIL) {
+        U_ASSERT(index < length);
+        U_ASSERT(array[index] >= 0x8000);
+        return array[index++] & 0x7fff;
+    } else {
+        U_ASSERT((index + 2) <= length);
+        U_ASSERT(array[index] >= 0x8000);
+        U_ASSERT(array[index + 1] >= 0x8000);
+        int32_t len = ((head & 1) << 30) |
+                (static_cast<int32_t>(array[index] & 0x7fff) << 15) |
+                (array[index + 1] & 0x7fff);
+        index += 2;
+        return len;
+    }
+}
+
+void Edits::Iterator::updateNextIndexes() {
+    srcIndex += oldLength_;
+    if (changed) {
+        replIndex += newLength_;
+    }
+    destIndex += newLength_;
+}
+
+void Edits::Iterator::updatePreviousIndexes() {
+    srcIndex -= oldLength_;
+    if (changed) {
+        replIndex -= newLength_;
+    }
+    destIndex -= newLength_;
+}
+
+UBool Edits::Iterator::noNext() {
+    dir = 0;
+    changed = false;
+    oldLength_ = newLength_ = 0;
+    return false;
+}
+
+UBool Edits::Iterator::next(UBool onlyChanges, UErrorCode &errorCode) {
+    if (U_FAILURE(errorCode)) { return false; }
+    if (dir > 0) {
+        updateNextIndexes();
+    } else {
+        if (dir < 0) {
+            if (remaining > 0) {
+                ++index;  
+                dir = 1;
+                return true;
+            }
+        }
+        dir = 1;
+    }
+    if (remaining >= 1) {
+        if (remaining > 1) {
+            --remaining;
+            return true;
+        }
+        remaining = 0;
+    }
+    if (index >= length) {
+        return noNext();
+    }
+    int32_t u = array[index++];
+    if (u <= MAX_UNCHANGED) {
+        changed = false;
+        oldLength_ = u + 1;
+        while (index < length && (u = array[index]) <= MAX_UNCHANGED) {
+            ++index;
+            oldLength_ += u + 1;
+        }
+        newLength_ = oldLength_;
+        if (onlyChanges) {
+            updateNextIndexes();
+            if (index >= length) {
+                return noNext();
+            }
+            ++index;
+        } else {
+            return true;
+        }
+    }
+    changed = true;
+    if (u <= MAX_SHORT_CHANGE) {
+        int32_t oldLen = u >> 12;
+        int32_t newLen = (u >> 9) & MAX_SHORT_CHANGE_NEW_LENGTH;
+        int32_t num = (u & SHORT_CHANGE_NUM_MASK) + 1;
+        if (coarse) {
+            oldLength_ = num * oldLen;
+            newLength_ = num * newLen;
+        } else {
+            oldLength_ = oldLen;
+            newLength_ = newLen;
+            if (num > 1) {
+                remaining = num;  
+            }
+            return true;
+        }
+    } else {
+        U_ASSERT(u <= 0x7fff);
+        oldLength_ = readLength((u >> 6) & 0x3f);
+        newLength_ = readLength(u & 0x3f);
+        if (!coarse) {
+            return true;
+        }
+    }
+    while (index < length && (u = array[index]) > MAX_UNCHANGED) {
+        ++index;
+        if (u <= MAX_SHORT_CHANGE) {
+            int32_t num = (u & SHORT_CHANGE_NUM_MASK) + 1;
+            oldLength_ += (u >> 12) * num;
+            newLength_ += ((u >> 9) & MAX_SHORT_CHANGE_NEW_LENGTH) * num;
+        } else {
+            U_ASSERT(u <= 0x7fff);
+            oldLength_ += readLength((u >> 6) & 0x3f);
+            newLength_ += readLength(u & 0x3f);
+        }
+    }
+    return true;
+}
+
+UBool Edits::Iterator::previous(UErrorCode &errorCode) {
+    if (U_FAILURE(errorCode)) { return false; }
+    if (dir >= 0) {
+        if (dir > 0) {
+            if (remaining > 0) {
+                --index;  
+                dir = -1;
+                return true;
+            }
+            updateNextIndexes();
+        }
+        dir = -1;
+    }
+    if (remaining > 0) {
+        int32_t u = array[index];
+        U_ASSERT(MAX_UNCHANGED < u && u <= MAX_SHORT_CHANGE);
+        if (remaining <= (u & SHORT_CHANGE_NUM_MASK)) {
+            ++remaining;
+            updatePreviousIndexes();
+            return true;
+        }
+        remaining = 0;
+    }
+    if (index <= 0) {
+        return noNext();
+    }
+    int32_t u = array[--index];
+    if (u <= MAX_UNCHANGED) {
+        changed = false;
+        oldLength_ = u + 1;
+        while (index > 0 && (u = array[index - 1]) <= MAX_UNCHANGED) {
+            --index;
+            oldLength_ += u + 1;
+        }
+        newLength_ = oldLength_;
+        updatePreviousIndexes();
+        return true;
+    }
+    changed = true;
+    if (u <= MAX_SHORT_CHANGE) {
+        int32_t oldLen = u >> 12;
+        int32_t newLen = (u >> 9) & MAX_SHORT_CHANGE_NEW_LENGTH;
+        int32_t num = (u & SHORT_CHANGE_NUM_MASK) + 1;
+        if (coarse) {
+            oldLength_ = num * oldLen;
+            newLength_ = num * newLen;
+        } else {
+            oldLength_ = oldLen;
+            newLength_ = newLen;
+            if (num > 1) {
+                remaining = 1;  
+            }
+            updatePreviousIndexes();
+            return true;
+        }
+    } else {
+        if (u <= 0x7fff) {
+            oldLength_ = readLength((u >> 6) & 0x3f);
+            newLength_ = readLength(u & 0x3f);
+        } else {
+            U_ASSERT(index > 0);
+            while ((u = array[--index]) > 0x7fff) {}
+            U_ASSERT(u > MAX_SHORT_CHANGE);
+            int32_t headIndex = index++;
+            oldLength_ = readLength((u >> 6) & 0x3f);
+            newLength_ = readLength(u & 0x3f);
+            index = headIndex;
+        }
+        if (!coarse) {
+            updatePreviousIndexes();
+            return true;
+        }
+    }
+    while (index > 0 && (u = array[index - 1]) > MAX_UNCHANGED) {
+        --index;
+        if (u <= MAX_SHORT_CHANGE) {
+            int32_t num = (u & SHORT_CHANGE_NUM_MASK) + 1;
+            oldLength_ += (u >> 12) * num;
+            newLength_ += ((u >> 9) & MAX_SHORT_CHANGE_NEW_LENGTH) * num;
+        } else if (u <= 0x7fff) {
+            int32_t headIndex = index++;
+            oldLength_ += readLength((u >> 6) & 0x3f);
+            newLength_ += readLength(u & 0x3f);
+            index = headIndex;
+        }
+    }
+    updatePreviousIndexes();
+    return true;
+}
+
+int32_t Edits::Iterator::findIndex(int32_t i, UBool findSource, UErrorCode &errorCode) {
+    if (U_FAILURE(errorCode) || i < 0) { return -1; }
+    int32_t spanStart, spanLength;
+    if (findSource) {  
+        spanStart = srcIndex;
+        spanLength = oldLength_;
+    } else {  
+        spanStart = destIndex;
+        spanLength = newLength_;
+    }
+    if (i < spanStart) {
+        if (i >= (spanStart / 2)) {
+            for (;;) {
+                UBool hasPrevious = previous(errorCode);
+                U_ASSERT(hasPrevious);  
+                (void)hasPrevious;  
+                spanStart = findSource ? srcIndex : destIndex;
+                if (i >= spanStart) {
+                    return 0;
+                }
+                if (remaining > 0) {
+                    spanLength = findSource ? oldLength_ : newLength_;
+                    int32_t u = array[index];
+                    U_ASSERT(MAX_UNCHANGED < u && u <= MAX_SHORT_CHANGE);
+                    int32_t num = (u & SHORT_CHANGE_NUM_MASK) + 1 - remaining;
+                    int32_t len = num * spanLength;
+                    if (i >= (spanStart - len)) {
+                        int32_t n = ((spanStart - i - 1) / spanLength) + 1;
+                        srcIndex -= n * oldLength_;
+                        replIndex -= n * newLength_;
+                        destIndex -= n * newLength_;
+                        remaining += n;
+                        return 0;
+                    }
+                    srcIndex -= num * oldLength_;
+                    replIndex -= num * newLength_;
+                    destIndex -= num * newLength_;
+                    remaining = 0;
+                }
+            }
+        }
+        dir = 0;
+        index = remaining = oldLength_ = newLength_ = srcIndex = replIndex = destIndex = 0;
+    } else if (i < (spanStart + spanLength)) {
+        return 0;
+    }
+    while (next(false, errorCode)) {
+        if (findSource) {
+            spanStart = srcIndex;
+            spanLength = oldLength_;
+        } else {
+            spanStart = destIndex;
+            spanLength = newLength_;
+        }
+        if (i < (spanStart + spanLength)) {
+            return 0;
+        }
+        if (remaining > 1) {
+            int32_t len = remaining * spanLength;
+            if (i < (spanStart + len)) {
+                int32_t n = (i - spanStart) / spanLength;  
+                srcIndex += n * oldLength_;
+                replIndex += n * newLength_;
+                destIndex += n * newLength_;
+                remaining -= n;
+                return 0;
+            }
+            oldLength_ *= remaining;
+            newLength_ *= remaining;
+            remaining = 0;
+        }
+    }
+    return 1;
+}
+
+int32_t Edits::Iterator::destinationIndexFromSourceIndex(int32_t i, UErrorCode &errorCode) {
+    int32_t where = findIndex(i, true, errorCode);
+    if (where < 0) {
+        return 0;
+    }
+    if (where > 0 || i == srcIndex) {
+        return destIndex;
+    }
+    if (changed) {
+        return destIndex + newLength_;
+    } else {
+        return destIndex + (i - srcIndex);
+    }
+}
+
+int32_t Edits::Iterator::sourceIndexFromDestinationIndex(int32_t i, UErrorCode &errorCode) {
+    int32_t where = findIndex(i, false, errorCode);
+    if (where < 0) {
+        return 0;
+    }
+    if (where > 0 || i == destIndex) {
+        return srcIndex;
+    }
+    if (changed) {
+        return srcIndex + oldLength_;
+    } else {
+        return srcIndex + (i - destIndex);
+    }
+}
+
+UnicodeString& Edits::Iterator::toString(UnicodeString& sb) const {
+    sb.append(u"{ src[", -1);
+    ICU_Utility::appendNumber(sb, srcIndex);
+    sb.append(u"..", -1);
+    ICU_Utility::appendNumber(sb, srcIndex + oldLength_);
+    if (changed) {
+        sb.append(u"] ⇝ dest[", -1);
+    } else {
+        sb.append(u"] ≡ dest[", -1);
+    }
+    ICU_Utility::appendNumber(sb, destIndex);
+    sb.append(u"..", -1);
+    ICU_Utility::appendNumber(sb, destIndex + newLength_);
+    if (changed) {
+        sb.append(u"], repl[", -1);
+        ICU_Utility::appendNumber(sb, replIndex);
+        sb.append(u"..", -1);
+        ICU_Utility::appendNumber(sb, replIndex + newLength_);
+        sb.append(u"] }", -1);
+    } else {
+        sb.append(u"] (no-change) }", -1);
+    }
+    return sb;
+}
+
+U_NAMESPACE_END

@@ -1,0 +1,352 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_SVGTEXTFRAME_H_
+#define LAYOUT_SVG_SVGTEXTFRAME_H_
+
+#include "gfxMatrix.h"
+#include "gfxRect.h"
+#include "gfxTextRun.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/EnumeratedArray.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/PresShellForwards.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/SVGContainerFrame.h"
+#include "nsStubMutationObserver.h"
+#include "nsTextFrame.h"
+
+class nsIContent;
+class gfxContext;
+
+namespace mozilla {
+
+class CharIterator;
+class DisplaySVGText;
+class SVGContextPaint;
+class SVGTextFrame;
+class TextFrameIterator;
+class TextNodeCorrespondenceRecorder;
+struct TextRenderedRun;
+class TextRenderedRunIterator;
+
+namespace dom {
+class DOMSVGPoint;
+class SVGRect;
+class SVGGeometryElement;
+class SVGTextContentElement;
+}  
+}  
+
+nsIFrame* NS_NewSVGTextFrame(mozilla::PresShell* aPresShell,
+                             mozilla::ComputedStyle* aStyle);
+
+namespace mozilla {
+
+enum class SVGTextFrameWhichCachedRange {
+  Before,
+  After,
+};
+
+template <>
+struct MaxContiguousEnumValue<SVGTextFrameWhichCachedRange> {
+  static constexpr auto value = SVGTextFrameWhichCachedRange::After;
+};
+
+struct CharPosition {
+  CharPosition()
+      : mAngle(0),
+        mHidden(false),
+        mUnaddressable(false),
+        mClusterOrLigatureGroupMiddle(false),
+        mRunBoundary(false),
+        mStartOfChunk(false) {}
+
+  CharPosition(gfxPoint aPosition, double aAngle)
+      : mPosition(aPosition),
+        mAngle(aAngle),
+        mHidden(false),
+        mUnaddressable(false),
+        mClusterOrLigatureGroupMiddle(false),
+        mRunBoundary(false),
+        mStartOfChunk(false) {}
+
+  static CharPosition Unspecified(bool aUnaddressable) {
+    CharPosition cp(UnspecifiedPoint(), UnspecifiedAngle());
+    cp.mUnaddressable = aUnaddressable;
+    return cp;
+  }
+
+  bool IsAngleSpecified() const { return mAngle != UnspecifiedAngle(); }
+
+  bool IsXSpecified() const { return mPosition.x != UnspecifiedCoord(); }
+
+  bool IsYSpecified() const { return mPosition.y != UnspecifiedCoord(); }
+
+  gfxPoint mPosition;
+  double mAngle;
+
+  bool mHidden;
+
+  bool mUnaddressable;
+
+  bool mClusterOrLigatureGroupMiddle;
+
+  bool mRunBoundary;
+
+  bool mStartOfChunk;
+
+ private:
+  static gfxFloat UnspecifiedCoord() {
+    return std::numeric_limits<gfxFloat>::infinity();
+  }
+
+  static double UnspecifiedAngle() {
+    return std::numeric_limits<double>::infinity();
+  }
+
+  static gfxPoint UnspecifiedPoint() {
+    return gfxPoint(UnspecifiedCoord(), UnspecifiedCoord());
+  }
+};
+
+class SVGTextFrame final : public SVGDisplayContainerFrame {
+  friend nsIFrame* ::NS_NewSVGTextFrame(mozilla::PresShell* aPresShell,
+                                        ComputedStyle* aStyle);
+
+  friend class CharIterator;
+  friend class DisplaySVGText;
+  friend class GlyphMetricsUpdater;
+  friend class MutationObserver;
+  friend class TextFrameIterator;
+  friend class TextNodeCorrespondenceRecorder;
+  friend struct TextRenderedRun;
+  friend class TextRenderedRunIterator;
+
+  using Range = gfxTextRun::Range;
+  using DrawTarget = gfx::DrawTarget;
+  using Path = gfx::Path;
+  using Point = gfx::Point;
+  using Rect = gfx::Rect;
+
+ protected:
+  explicit SVGTextFrame(ComputedStyle* aStyle, nsPresContext* aPresContext)
+      : SVGDisplayContainerFrame(aStyle, aPresContext, kClassID) {
+    AddStateBits(NS_FRAME_SVG_LAYOUT | NS_FRAME_IS_SVG_TEXT |
+                 NS_STATE_SVG_TEXT_CORRESPONDENCE_DIRTY |
+                 NS_STATE_SVG_POSITIONING_DIRTY);
+  }
+
+  ~SVGTextFrame() = default;
+
+ public:
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(SVGTextFrame)
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+
+  void DidSetComputedStyle(ComputedStyle* aOldComputedStyle) override;
+
+  nsresult AttributeChanged(int32_t aNamespaceID, nsAtom* aAttribute,
+                            AttrModType aModType) override;
+
+  nsContainerFrame* GetContentInsertionFrame() override {
+    return PrincipalChildList().FirstChild()->GetContentInsertionFrame();
+  }
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override {
+    return MakeFrameName(u"SVGText"_ns, aResult);
+  }
+#endif
+
+  void FindCloserFrameForSelection(
+      const nsPoint& aPoint, FrameWithDistance* aCurrentBestFrame) override;
+
+  void NotifySVGChanged(ChangeFlags aFlags) override;
+  void PaintSVG(gfxContext& aContext, const gfxMatrix& aTransform,
+                imgDrawingParams& aImgParams) override;
+  nsIFrame* GetFrameForPoint(const gfxPoint& aPoint) override;
+  void ReflowSVG() override;
+  SVGBBox GetBBoxContribution(const Matrix& aToBBoxUserspace,
+                              SVGBBoxFlags aFlags) override;
+
+  uint32_t GetNumberOfChars(dom::SVGTextContentElement* aElement);
+  float GetComputedTextLength(dom::SVGTextContentElement* aElement);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void SelectSubString(
+      dom::SVGTextContentElement* aElement, uint32_t charnum, uint32_t nchars,
+      ErrorResult& aRv);
+  bool RequiresSlowFallbackForSubStringLength();
+  float GetSubStringLengthFastPath(dom::SVGTextContentElement* aElement,
+                                   uint32_t charnum, uint32_t nchars,
+                                   ErrorResult& aRv);
+  float GetSubStringLengthSlowFallback(dom::SVGTextContentElement* aElement,
+                                       uint32_t charnum, uint32_t nchars,
+                                       ErrorResult& aRv);
+
+  int32_t GetCharNumAtPosition(dom::SVGTextContentElement* aElement,
+                               const gfx::Point& aPoint);
+
+  already_AddRefed<dom::DOMSVGPoint> GetStartPositionOfChar(
+      dom::SVGTextContentElement* aElement, uint32_t aCharNum,
+      ErrorResult& aRv);
+  already_AddRefed<dom::DOMSVGPoint> GetEndPositionOfChar(
+      dom::SVGTextContentElement* aElement, uint32_t aCharNum,
+      ErrorResult& aRv);
+  already_AddRefed<dom::SVGRect> GetExtentOfChar(
+      dom::SVGTextContentElement* aElement, uint32_t aCharNum,
+      ErrorResult& aRv);
+  float GetRotationOfChar(dom::SVGTextContentElement* aElement,
+                          uint32_t aCharNum, ErrorResult& aRv);
+
+
+  void HandleAttributeChangeInDescendant(dom::Element* aElement,
+                                         int32_t aNameSpaceID,
+                                         nsAtom* aAttribute);
+
+  void ScheduleReflowSVG();
+
+  void ReflowSVGNonDisplayText();
+
+  void ScheduleReflowSVGNonDisplayText(IntrinsicDirty aReason);
+
+  bool UpdateFontSizeScaleFactor();
+
+  double GetFontSizeScaleFactor() const;
+
+  Point TransformFramePointToTextChild(const Point& aPoint,
+                                       const nsIFrame* aChildFrame);
+
+  gfxRect TransformFrameRectFromTextChild(const nsRect& aRect,
+                                          const nsIFrame* aChildFrame);
+
+  Rect TransformFrameRectFromTextChild(const Rect& aRect,
+                                       const nsIFrame* aChildFrame);
+
+  Point TransformFramePointFromTextChild(const Point& aPoint,
+                                         const nsIFrame* aChildFrame);
+
+  void AppendDirectlyOwnedAnonBoxes(nsTArray<OwnedAnonBox>& aResult) override;
+
+ private:
+  class MutationObserver final : public nsStubMutationObserver {
+   public:
+    explicit MutationObserver(SVGTextFrame* aFrame) : mFrame(aFrame) {
+      MOZ_ASSERT(mFrame, "MutationObserver needs a non-null frame");
+      mFrame->GetContent()->AddMutationObserver(this);
+      SetEnabledCallbacks(kCharacterDataChanged | kAttributeChanged |
+                          kContentAppended | kContentInserted |
+                          kContentWillBeRemoved);
+    }
+
+    NS_DECL_ISUPPORTS
+
+    NS_DECL_NSIMUTATIONOBSERVER_CONTENTAPPENDED
+    NS_DECL_NSIMUTATIONOBSERVER_CONTENTINSERTED
+    NS_DECL_NSIMUTATIONOBSERVER_CONTENTREMOVED
+    NS_DECL_NSIMUTATIONOBSERVER_CHARACTERDATACHANGED
+    NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTECHANGED
+
+   private:
+    ~MutationObserver() { mFrame->GetContent()->RemoveMutationObserver(this); }
+
+    SVGTextFrame* const mFrame;
+  };
+
+  void MaybeResolveBidiForAnonymousBlockChild();
+
+  void MaybeReflowAnonymousBlockChild();
+
+  void DoReflow();
+
+  void NotifyGlyphMetricsChange(bool aUpdateTextCorrespondence);
+
+  void UpdateGlyphPositioning();
+
+  void DoGlyphPositioning();
+
+  int32_t ConvertTextElementCharIndexToAddressableIndex(
+      int32_t aIndex, dom::SVGTextContentElement* aElement);
+
+  bool ResolvePositionsForNode(nsIContent* aContent, uint32_t& aIndex,
+                               bool aInTextPath, bool& aForceStartOfChunk,
+                               nsTArray<gfxPoint>& aDeltas);
+
+  bool ResolvePositions(nsTArray<gfxPoint>& aDeltas, bool aRunPerGlyph);
+
+  void DetermineCharPositions(nsTArray<nsPoint>& aPositions);
+
+  void AdjustChunksForLineBreaks();
+
+  void AdjustPositionsForClusters();
+
+  void DoAnchoring();
+
+  void DoTextPathLayout();
+
+  bool ShouldRenderAsPath(nsTextFrame* aFrame, SVGContextPaint* aContextPaint,
+                          bool& aShouldPaintSVGGlyphs);
+
+  already_AddRefed<Path> GetTextPath(nsIFrame* aTextPathFrame);
+  gfxFloat GetOffsetScale(nsIFrame* aTextPathFrame);
+  gfxFloat GetStartOffset(nsIFrame* aTextPathFrame);
+
+  RefPtr<MutationObserver> mMutationObserver;
+
+  nsTArray<CharPosition> mPositions;
+
+  uint32_t mTrailingUndisplayedCharacters = 0;
+
+  float mFontSizeScaleFactor = 1.0f;
+
+  float mLastContextScale = 1.0f;
+
+  float mLengthAdjustScaleFactor = 1.0f;
+
+ public:
+  struct CachedMeasuredRange {
+    CachedMeasuredRange() : mAdvance(0) {}
+    Range mRange;
+    nscoord mAdvance;
+  };
+
+  void SetCurrentFrameForCaching(const nsTextFrame* aFrame) {
+    if (mFrameForCachedRanges != aFrame) {
+      std::fill(mCachedRanges.begin(), mCachedRanges.end(),
+                CachedMeasuredRange());
+      mFrameForCachedRanges = aFrame;
+    }
+  }
+
+  using WhichRange = SVGTextFrameWhichCachedRange;
+
+  CachedMeasuredRange& CachedRange(WhichRange aWhichRange) {
+    return mCachedRanges[aWhichRange];
+  }
+
+  nsTextFrame::PropertyProvider& PropertyProviderFor(nsTextFrame* aFrame) {
+    if (!mCachedProvider || aFrame != mCachedProvider->GetFrame()) {
+      mCachedProvider.reset();
+      mCachedProvider.emplace(aFrame,
+                              aFrame->EnsureTextRun(nsTextFrame::eInflated));
+    }
+    return mCachedProvider.ref();
+  }
+
+  void ForgetCachedProvider() { mCachedProvider.reset(); }
+
+ private:
+  const nsTextFrame* mFrameForCachedRanges = nullptr;
+  EnumeratedArray<WhichRange, CachedMeasuredRange> mCachedRanges;
+
+  Maybe<nsTextFrame::PropertyProvider> mCachedProvider;
+};
+
+}  
+
+#endif  // LAYOUT_SVG_SVGTEXTFRAME_H_

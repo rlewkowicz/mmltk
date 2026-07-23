@@ -1,0 +1,147 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ServiceWorkerInterceptController.h"
+
+#include "ServiceWorkerManager.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_privacy.h"
+#include "mozilla/StorageAccess.h"
+#include "mozilla/StoragePrincipalHelper.h"
+#include "mozilla/dom/CanonicalBrowsingContext.h"
+#include "mozilla/dom/InternalRequest.h"
+#include "mozilla/net/HttpBaseChannel.h"
+#include "nsCOMPtr.h"
+#include "nsContentUtils.h"
+#include "nsIChannel.h"
+#include "nsICookieJarSettings.h"
+#include "nsIPrincipal.h"
+#include "nsQueryObject.h"
+
+namespace mozilla::dom {
+
+namespace {
+bool IsWithinObjectOrEmbed(const nsCOMPtr<nsILoadInfo>& loadInfo) {
+  RefPtr<BrowsingContext> browsingContext;
+  loadInfo->GetTargetBrowsingContext(getter_AddRefs(browsingContext));
+
+  for (BrowsingContext* cur = browsingContext.get(); cur;
+       cur = cur->GetParent()) {
+    if (cur->IsEmbedderTypeObjectOrEmbed()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+}  
+
+NS_IMPL_ISUPPORTS(ServiceWorkerInterceptController,
+                  nsINetworkInterceptController)
+
+NS_IMETHODIMP
+ServiceWorkerInterceptController::ShouldPrepareForIntercept(
+    nsIURI* aURI, nsIChannel* aChannel, bool* aShouldIntercept) {
+  *aShouldIntercept = false;
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+
+  if (IsWithinObjectOrEmbed(loadInfo)) {
+    return NS_OK;
+  }
+
+  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+
+  if (!nsContentUtils::IsNonSubresourceRequest(aChannel)) {
+    const Maybe<ServiceWorkerDescriptor>& controller =
+        loadInfo->GetController();
+
+    if (!controller.isSome()) {
+      return NS_OK;
+    }
+
+    *aShouldIntercept = controller.ref().HandlesFetch();
+
+    if (!*aShouldIntercept && swm) {
+      nsCOMPtr<nsIPrincipal> principal =
+          controller.ref().GetPrincipal().unwrap();
+      RefPtr<ServiceWorkerRegistrationInfo> registration =
+          swm->GetRegistration(principal, controller.ref().Scope());
+      if (NS_WARN_IF(!registration)) {
+        return NS_OK;
+      }
+      registration->MaybeScheduleTimeCheckAndUpdate();
+    }
+
+    RequestMode requestMode =
+        InternalRequest::MapChannelToRequestMode(aChannel);
+
+    RefPtr<net::HttpBaseChannel> httpChannel = do_QueryObject(aChannel);
+    if (requestMode == RequestMode::No_cors && loadInfo->GetIsMediaRequest() &&
+        httpChannel &&
+        httpChannel->GetRequestHead()->HasHeader(net::nsHttp::Range)) {
+      bool mayLoad = nsContentUtils::CheckMayLoad(
+          loadInfo->GetLoadingPrincipal(), aChannel,
+           false);
+      if (!mayLoad) {
+        *aShouldIntercept = false;
+      }
+    }
+
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIPrincipal> principal;
+  nsresult rv = StoragePrincipalHelper::GetPrincipal(
+      aChannel,
+      StaticPrefs::privacy_partition_serviceWorkers()
+          ? StoragePrincipalHelper::eForeignPartitionedPrincipal
+          : StoragePrincipalHelper::eRegularPrincipal,
+      getter_AddRefs(principal));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (!swm || !swm->IsAvailable(principal, aURI, aChannel)) {
+    return NS_OK;
+  }
+
+  if (!nsContentUtils::ComputeIsSecureContext(aChannel)) {
+    return NS_OK;
+  }
+
+  auto storageAccess = StorageAllowedForChannel(aChannel);
+  nsCOMPtr<nsICookieJarSettings> cookieJarSettings;
+  loadInfo->GetCookieJarSettings(getter_AddRefs(cookieJarSettings));
+
+  *aShouldIntercept =
+      storageAccess == StorageAccess::eAllow ||
+      (storageAccess == StorageAccess::ePrivateBrowsing &&
+       StaticPrefs::dom_serviceWorkers_privateBrowsing_enabled()) ||
+      (ShouldPartitionStorage(storageAccess) &&
+       StaticPrefs::privacy_partition_serviceWorkers() &&
+       StoragePartitioningEnabled(storageAccess, cookieJarSettings) &&
+       (!principal->GetIsInPrivateBrowsing() ||
+        StaticPrefs::dom_serviceWorkers_privateBrowsing_enabled()));
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+ServiceWorkerInterceptController::ChannelIntercepted(
+    nsIInterceptedChannel* aChannel) {
+
+  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+  if (!swm) {
+    return NS_ERROR_FAILURE;
+  }
+
+  ErrorResult error;
+  swm->DispatchFetchEvent(aChannel, error);
+  if (NS_WARN_IF(error.Failed())) {
+    return error.StealNSResult();
+  }
+
+  return NS_OK;
+}
+
+}  

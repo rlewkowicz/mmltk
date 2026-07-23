@@ -1,0 +1,482 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsMenuPopupFrame_h_
+#define nsMenuPopupFrame_h_
+
+#include "Units.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/StaticPrefs_ui.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/gfx/Types.h"
+#include "nsAtom.h"
+#include "nsBlockFrame.h"
+#include "nsCOMPtr.h"
+#include "nsExpirationState.h"
+#include "nsIDOMEventListener.h"
+#include "nsIWidgetListener.h"
+#include "nsXULPopupManager.h"
+
+class nsIWidget;
+
+namespace mozilla {
+class PresShell;
+enum class WindowShadow : uint8_t;
+namespace dom {
+class KeyboardEvent;
+class XULButtonElement;
+class XULPopupElement;
+}  
+namespace widget {
+enum class PopupLevel : uint8_t;
+}
+}  
+
+enum ConsumeOutsideClicksResult {
+  ConsumeOutsideClicks_ParentOnly =
+      0,                          
+  ConsumeOutsideClicks_True = 1,  
+  ConsumeOutsideClicks_Never = 2  
+};
+
+enum class FlipStyle {
+  None = 0,
+  Outside = 1,
+  Inside = 2,
+};
+
+enum class FlipType {
+  Default = 0,
+  None = 1,   
+  Both = 2,   
+  Slide = 3,  
+};
+
+enum class IsNativeMenu : bool { No, Yes };
+
+enum class MenuPopupAnchorType : uint8_t {
+  Node = 0,   
+  Point = 1,  
+  Rect = 2,   
+};
+
+#define POPUPALIGNMENT_NONE 0
+#define POPUPALIGNMENT_TOPLEFT 1
+#define POPUPALIGNMENT_TOPRIGHT -1
+#define POPUPALIGNMENT_BOTTOMLEFT 2
+#define POPUPALIGNMENT_BOTTOMRIGHT -2
+
+#define POPUPALIGNMENT_LEFTCENTER 16
+#define POPUPALIGNMENT_RIGHTCENTER -16
+#define POPUPALIGNMENT_TOPCENTER 17
+#define POPUPALIGNMENT_BOTTOMCENTER 18
+
+#define POPUPPOSITION_UNKNOWN -1
+#define POPUPPOSITION_BEFORESTART 0
+#define POPUPPOSITION_BEFOREEND 1
+#define POPUPPOSITION_AFTERSTART 2
+#define POPUPPOSITION_AFTEREND 3
+#define POPUPPOSITION_STARTBEFORE 4
+#define POPUPPOSITION_ENDBEFORE 5
+#define POPUPPOSITION_STARTAFTER 6
+#define POPUPPOSITION_ENDAFTER 7
+#define POPUPPOSITION_OVERLAP 8
+#define POPUPPOSITION_AFTERPOINTER 9
+#define POPUPPOSITION_SELECTION 10
+
+#define POPUPPOSITION_HFLIP(v) (v ^ 1)
+#define POPUPPOSITION_VFLIP(v) (v ^ 2)
+
+nsIFrame* NS_NewMenuPopupFrame(mozilla::PresShell* aPresShell,
+                               mozilla::ComputedStyle* aStyle);
+
+class nsMenuPopupFrame;
+
+class nsXULPopupShownEvent final : public mozilla::Runnable,
+                                   public nsIDOMEventListener {
+ public:
+  nsXULPopupShownEvent(nsIContent* aPopup, nsPresContext* aPresContext)
+      : mozilla::Runnable("nsXULPopupShownEvent"),
+        mPopup(aPopup),
+        mPresContext(aPresContext) {}
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIRUNNABLE
+  NS_DECL_NSIDOMEVENTLISTENER
+
+  void CancelListener();
+
+ protected:
+  virtual ~nsXULPopupShownEvent() = default;
+
+ private:
+  const nsCOMPtr<nsIContent> mPopup;
+  const RefPtr<nsPresContext> mPresContext;
+};
+
+class nsMenuPopupFrame final : public nsBlockFrame, public nsIWidgetListener {
+  using PopupLevel = mozilla::widget::PopupLevel;
+  using PopupType = mozilla::widget::PopupType;
+
+ public:
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsMenuPopupFrame)
+
+  explicit nsMenuPopupFrame(ComputedStyle* aStyle, nsPresContext* aPresContext);
+  ~nsMenuPopupFrame();
+
+  nsPopupState PopupState() const { return mPopupState; }
+  void SetPopupState(nsPopupState);
+
+  ConsumeOutsideClicksResult ConsumeOutsideClicks();
+
+  mozilla::dom::XULPopupElement& PopupElement() const;
+
+  nscoord IntrinsicISize(const mozilla::IntrinsicSizeInput& aInput,
+                         mozilla::IntrinsicISizeType aType) override;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  nsIWidget* GetWidget() const;
+  already_AddRefed<nsIWidget> ComputeParentWidget() const;
+
+  enum class WidgetStyle : uint8_t {
+    ColorScheme,
+    InputRegion,
+    Opacity,
+    Shadow,
+    Transform,
+    MicaBackdrop,
+  };
+  using WidgetStyleFlags = mozilla::EnumSet<WidgetStyle>;
+  static constexpr WidgetStyleFlags AllWidgetStyleFlags() {
+    return {WidgetStyle::ColorScheme, WidgetStyle::InputRegion,
+            WidgetStyle::Opacity,     WidgetStyle::Shadow,
+            WidgetStyle::Transform,   WidgetStyle::MicaBackdrop};
+  }
+  void PropagateStyleToWidget(WidgetStyleFlags = AllWidgetStyleFlags()) const;
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+
+  nsresult AttributeChanged(int32_t aNameSpaceID, nsAtom* aAttribute,
+                            AttrModType aModType) override;
+
+  mozilla::PresShell* GetPresShell() override { return PresShell(); }
+  nsMenuPopupFrame* GetAsMenuPopupFrame() override { return this; }
+  void WindowMoved(nsIWidget*, const mozilla::LayoutDeviceIntPoint&,
+                   ByMoveToRect) override;
+  void WindowResized(nsIWidget*, const mozilla::LayoutDeviceIntSize&) override;
+  bool RequestWindowClose(nsIWidget*) override;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsEventStatus HandleEvent(mozilla::WidgetGUIEvent* aEvent) override;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void PaintWindow(nsIWidget* aWidget) override;
+  void DidCompositeWindow(mozilla::layers::TransactionId aTransactionId,
+                          const mozilla::TimeStamp& aCompositeStart,
+                          const mozilla::TimeStamp& aCompositeEnd) override;
+  bool ShouldNotBeVisible() override { return !IsOpen(); }
+  using nsIFrame::HandleEvent;  
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void Destroy(DestroyContext&) override;
+
+  bool HasRemoteContent() const;
+
+  bool IsDragPopup() const;
+
+  bool ShouldHaveWidgetWhenHidden() const;
+
+  bool ShouldExpandToInflowParentOrAnchor() const;
+
+  bool IsNoAutoHide() const;
+
+  PopupLevel GetPopupLevel() const { return GetPopupLevel(IsNoAutoHide()); }
+
+  void PrepareWidget(bool aForceRecreate = false);
+
+  MOZ_CAN_RUN_SCRIPT void EnsureActiveMenuListItemIsVisible();
+
+  void CreateWidget();
+  void DestroyWidget();
+  mozilla::WindowShadow GetShadowStyle() const;
+
+  void DidSetComputedStyle(ComputedStyle* aOldStyle) override;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void LayoutPopup(nsPresContext*, ReflowOutput&, const ReflowInput&,
+                   nsReflowStatus&);
+
+  void SetPopupPosition(bool aIsMove);
+
+  MOZ_CAN_RUN_SCRIPT void HandleEnterKeyPress(mozilla::WidgetEvent&);
+
+  mozilla::dom::XULButtonElement* FindMenuWithShortcut(
+      mozilla::dom::KeyboardEvent& aKeyEvent, bool& aDoAction);
+
+  mozilla::dom::XULButtonElement* GetCurrentMenuItem() const;
+  nsIFrame* GetCurrentMenuItemFrame() const;
+
+  PopupType GetPopupType() const { return mPopupType; }
+  bool IsContextMenu() const { return mIsContextMenu; }
+
+  bool IsOpen() const {
+    return mPopupState == ePopupOpening || mPopupState == ePopupVisible ||
+           mPopupState == ePopupShown;
+  }
+  bool IsVisible() const {
+    return mPopupState == ePopupVisible || mPopupState == ePopupShown;
+  }
+  bool IsVisibleOrShowing() const {
+    return IsOpen() || mPopupState == ePopupPositioning ||
+           mPopupState == ePopupShowing;
+  }
+  bool IsVisibleOrHiding() const {
+    return IsVisible() || mPopupState == ePopupHiding;
+  }
+  bool IsNativeMenu() const { return mIsNativeMenu; }
+  bool CanSkipLayout() const;
+  bool IsMouseTransparent() const;
+
+  bool IsMenuList() const;
+
+  bool IsDragSource() const { return mIsDragSource; }
+  void SetIsDragSource(bool aIsDragSource) { mIsDragSource = aIsDragSource; }
+
+  bool PendingWidgetMoveResize() const { return mPendingWidgetMoveResize; }
+  void ClearPendingWidgetMoveResize() { mPendingWidgetMoveResize = false; }
+  void SchedulePendingWidgetMoveResize();
+
+  static nsIContent* GetTriggerContent(nsMenuPopupFrame* aMenuPopupFrame);
+  void ClearTriggerContent() { mTriggerContent = nullptr; }
+  void ClearTriggerContentIncludingDocument();
+
+  bool IsInContentShell() const { return mInContentShell; }
+
+  void InitializePopup(nsIContent* aAnchorContent, nsIContent* aTriggerContent,
+                       const nsAString& aPosition, int32_t aXPos, int32_t aYPos,
+                       MenuPopupAnchorType aAnchorType,
+                       bool aAttributesOverride,
+                       enum IsNativeMenu aIsNativeMenu);
+
+  void InitializePopupAtRect(nsIContent* aTriggerContent,
+                             const nsAString& aPosition, const nsIntRect& aRect,
+                             bool aAttributesOverride,
+                             enum IsNativeMenu aIsNativeMenu);
+
+  void InitializePopupAtScreen(nsIContent* aTriggerContent, int32_t aXPos,
+                               int32_t aYPos, bool aIsContextMenu,
+                               enum IsNativeMenu aIsNativeMenu);
+
+  void ShowPopup(bool aIsContextMenu);
+  MOZ_CAN_RUN_SCRIPT void HidePopup(bool aDeselectMenu, nsPopupState aNewState,
+                                    bool aFromFrameDestruction = false);
+
+  void ClearIncrementalString() { mIncrementalString.Truncate(); }
+  static bool IsWithinIncrementalTime(mozilla::TimeStamp time) {
+    return !sLastKeyTime.IsNull() &&
+           ((time - sLastKeyTime).ToMilliseconds() <=
+            mozilla::StaticPrefs::ui_menu_incremental_search_timeout());
+  }
+
+#ifdef DEBUG_FRAME_DUMP
+  virtual nsresult GetFrameName(nsAString& aResult) const override {
+    return MakeFrameName(u"MenuPopup"_ns, aResult);
+  }
+#endif
+
+  MOZ_CAN_RUN_SCRIPT void ChangeByPage(bool aIsUp);
+
+  void MoveTo(const mozilla::CSSPoint& aPos, bool aUpdateAttrs,
+              bool aByMoveToRect = false);
+
+  void MoveToAnchor(nsIContent* aAnchorContent, const nsAString& aPosition,
+                    int32_t aXPos, int32_t aYPos, bool aAttributesOverride);
+
+  mozilla::ScrollContainerFrame* GetScrollContainerFrame() const;
+
+  void SetOverrideConstraintRect(const mozilla::CSSIntRect& aRect) {
+    mOverrideConstraintRect = mozilla::CSSIntRect::ToAppUnits(aRect);
+  }
+
+  bool IsConstrainedByLayout() const { return mConstrainedByLayout; }
+
+  struct Rects {
+    nsRect mAnchorRect;
+    nsRect mUntransformedAnchorRect;
+    nsRect mUsedRect;
+    nscoord mAlignmentOffset = 0;
+    bool mHFlip = false;
+    bool mVFlip = false;
+    bool mConstrainedByLayout = false;
+    nsPoint mViewPoint;
+  };
+
+  Rects GetRects(const nsSize& aPrefSize) const;
+  Maybe<nsRect> GetConstraintRect(const nsRect& aAnchorRect,
+                                  const nsRect& aRootScreenRect,
+                                  PopupLevel) const;
+  void PerformMove(const Rects&);
+
+  bool IsAnchored() const { return mAnchorType != MenuPopupAnchorType::Point; }
+
+  nsIContent* GetAnchor() const { return mAnchorContent; }
+  void ClearAnchorContent() { mAnchorContent = nullptr; }
+
+  mozilla::CSSIntRect GetScreenAnchorRect() const {
+    return mozilla::CSSRect::FromAppUnitsRounded(mScreenRect);
+  }
+
+  mozilla::LayoutDeviceIntRect CalcWidgetBounds() const;
+
+  int8_t GetAlignmentPosition() const;
+
+  nscoord GetAlignmentOffset() const { return mAlignmentOffset; }
+
+  bool ClearPopupShownDispatcher() {
+    if (mPopupShownDispatcher) {
+      mPopupShownDispatcher->CancelListener();
+      mPopupShownDispatcher = nullptr;
+      return true;
+    }
+
+    return false;
+  }
+
+  void ShowWithPositionedEvent() { mPopupState = ePopupPositioning; }
+
+  void CheckForAnchorChange(nsRect& aRect);
+
+  void WillDispatchPopupPositioned() { mPendingPositionedEvent = false; }
+
+ protected:
+  PopupLevel GetPopupLevel(bool aIsNoAutoHide) const;
+
+  void InitPositionFromAnchorAlign(const nsAString& aAnchor,
+                                   const nsAString& aAlign);
+
+  nsPoint AdjustPositionForAnchorAlign(nsRect& aAnchorRect,
+                                       const nsSize& aPrefSize,
+                                       FlipStyle& aHFlip,
+                                       FlipStyle& aVFlip) const;
+
+  nsIFrame* GetSelectedItemForAlignment() const;
+
+  nscoord FlipOrResize(nscoord& aScreenPoint, nscoord aSize,
+                       nscoord aScreenBegin, nscoord aScreenEnd,
+                       nscoord aAnchorBegin, nscoord aAnchorEnd,
+                       nscoord aMarginBegin, nscoord aMarginEnd,
+                       FlipStyle aFlip, bool aIsOnEnd, bool* aFlipSide) const;
+
+  nscoord SlideOrResize(nscoord& aScreenPoint, nscoord aSize,
+                        nscoord aScreenBegin, nscoord aScreenEnd,
+                        nscoord* aOffset) const;
+
+  nsRect ComputeAnchorRect(nsPresContext* aRootPresContext,
+                           nsIFrame* aAnchorFrame) const;
+
+  void MoveToAttributePosition();
+
+  nsIFrame* GetAnchorFrame() const;
+
+ public:
+  bool IsDirectionRTL() const;
+
+  bool ShouldFollowAnchor() const;
+
+  bool ShouldFollowAnchor(nsRect& aRect);
+
+  nsIWidget* GetParentMenuWidget();
+
+  nsMargin GetMargin() const;
+
+  const nsRect& GetUntransformedAnchorRect() const {
+    return mUntransformedAnchorRect;
+  }
+  int8_t GetUntransformedPopupAlignment() const {
+    return mUntransformedPopupAlignment;
+  }
+  int8_t GetUntransformedPopupAnchor() const {
+    return mUntransformedPopupAnchor;
+  }
+
+  int8_t GetPopupAlignment() const { return mPopupAlignment; }
+  int8_t GetPopupAnchor() const { return mPopupAnchor; }
+  FlipType GetFlipType() const { return mFlip; }
+
+  uint64_t GetAPZFocusSequenceNumber() const { return mAPZFocusSequenceNumber; }
+
+  void UpdateAPZFocusSequenceNumber(uint64_t aNewNumber) {
+    mAPZFocusSequenceNumber = aNewNumber;
+  }
+
+  void DestroyWidgetIfNeeded();
+  nsExpirationState* GetExpirationState() { return &mExpirationState; }
+
+ protected:
+  nsString mIncrementalString;  
+
+  nsCOMPtr<nsIContent> mAnchorContent;
+
+  nsCOMPtr<nsIContent> mTriggerContent;
+
+  RefPtr<nsIWidget> mWidget;
+
+  RefPtr<nsXULPopupShownEvent> mPopupShownDispatcher;
+
+  nsRect mUsedScreenRect;
+
+  nsSize mPrefSize{-1, -1};
+
+  nsPoint mExtraMargin;
+
+  nsRect mScreenRect;
+  nsRect mUntransformedAnchorRect;
+
+  nscoord mAlignmentOffset = 0;
+
+  uint64_t mAPZFocusSequenceNumber = 0;
+
+  PopupType mPopupType = PopupType::Panel;  
+  nsPopupState mPopupState = ePopupClosed;  
+
+  int8_t mUntransformedPopupAlignment = POPUPALIGNMENT_NONE;
+  int8_t mUntransformedPopupAnchor = POPUPALIGNMENT_NONE;
+  int8_t mPopupAlignment = POPUPALIGNMENT_NONE;
+  int8_t mPopupAnchor = POPUPALIGNMENT_NONE;
+  int8_t mPosition = POPUPPOSITION_UNKNOWN;
+
+  FlipType mFlip = FlipType::Default;  
+
+  bool mPositionedByMoveToRect = false;
+  bool mIsOpenChanged = false;
+  bool mIsContextMenu = false;
+  bool mIsTopLevelContextMenu = false;
+  bool mInContentShell = true;
+
+  bool mHFlip = false;
+  bool mVFlip = false;
+  bool mConstrainedByLayout = false;
+
+  bool mIsNativeMenu = false;
+
+  bool mPendingPositionedEvent = false;
+
+  bool mIsDragSource = false;
+
+  bool mPendingWidgetMoveResize = false;
+
+  mutable nscoord mPositionedOffset = 0;
+
+  MenuPopupAnchorType mAnchorType = MenuPopupAnchorType::Node;
+
+  nsRect mOverrideConstraintRect;
+
+  nsExpirationState mExpirationState;
+  static mozilla::TimeStamp sLastKeyTime;
+};  
+
+#endif

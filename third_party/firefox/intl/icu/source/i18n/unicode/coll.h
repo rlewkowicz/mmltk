@@ -1,0 +1,365 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+*   Copyright (C) 1996-2016, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+******************************************************************************
+*/
+
+
+
+#ifndef COLL_H
+#define COLL_H
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#if !UCONFIG_NO_COLLATION
+
+#include <functional>
+#include <string_view>
+#include <type_traits>
+
+#include "unicode/char16ptr.h"
+#include "unicode/uobject.h"
+#include "unicode/ucol.h"
+#include "unicode/unorm.h"
+#include "unicode/locid.h"
+#include "unicode/uniset.h"
+#include "unicode/umisc.h"
+#include "unicode/unistr.h"
+#include "unicode/uiter.h"
+#include "unicode/stringpiece.h"
+
+U_NAMESPACE_BEGIN
+
+class StringEnumeration;
+
+#if !UCONFIG_NO_SERVICE
+class CollatorFactory;
+#endif
+
+class CollationKey;
+
+
+class U_I18N_API Collator : public UObject {
+public:
+
+
+    enum ECollationStrength
+    {
+        PRIMARY    = UCOL_PRIMARY,  
+        SECONDARY  = UCOL_SECONDARY,  
+        TERTIARY   = UCOL_TERTIARY,  
+        QUATERNARY = UCOL_QUATERNARY,  
+        IDENTICAL  = UCOL_IDENTICAL  
+    };
+
+
+#ifndef U_FORCE_HIDE_DEPRECATED_API
+    enum EComparisonResult
+    {
+        LESS = UCOL_LESS,  
+        EQUAL = UCOL_EQUAL,  
+        GREATER = UCOL_GREATER  
+    };
+#endif  // U_FORCE_HIDE_DEPRECATED_API
+
+
+    virtual ~Collator();
+
+
+    virtual bool operator==(const Collator& other) const;
+
+    virtual bool operator!=(const Collator& other) const;
+
+    virtual Collator* clone() const = 0;
+
+    static Collator* U_EXPORT2 createInstance(UErrorCode&  err);
+
+    static Collator* U_EXPORT2 createInstance(const Locale& loc, UErrorCode& err);
+
+#ifndef U_FORCE_HIDE_DEPRECATED_API
+    virtual EComparisonResult compare(const UnicodeString& source,
+                                      const UnicodeString& target) const;
+#endif  // U_FORCE_HIDE_DEPRECATED_API
+
+    virtual UCollationResult compare(const UnicodeString& source,
+                                      const UnicodeString& target,
+                                      UErrorCode &status) const = 0;
+
+#ifndef U_FORCE_HIDE_DEPRECATED_API
+    virtual EComparisonResult compare(const UnicodeString& source,
+                                      const UnicodeString& target,
+                                      int32_t length) const;
+#endif  // U_FORCE_HIDE_DEPRECATED_API
+
+    virtual UCollationResult compare(const UnicodeString& source,
+                                      const UnicodeString& target,
+                                      int32_t length,
+                                      UErrorCode &status) const = 0;
+
+#ifndef U_FORCE_HIDE_DEPRECATED_API
+    virtual EComparisonResult compare(const char16_t* source, int32_t sourceLength,
+                                      const char16_t* target, int32_t targetLength)
+                                      const;
+#endif  // U_FORCE_HIDE_DEPRECATED_API
+
+    virtual UCollationResult compare(const char16_t* source, int32_t sourceLength,
+                                      const char16_t* target, int32_t targetLength,
+                                      UErrorCode &status) const = 0;
+
+    virtual UCollationResult compare(UCharIterator &sIter,
+                                     UCharIterator &tIter,
+                                     UErrorCode &status) const;
+
+    virtual UCollationResult compareUTF8(const StringPiece &source,
+                                         const StringPiece &target,
+                                         UErrorCode &status) const;
+
+    virtual CollationKey& getCollationKey(const UnicodeString&  source,
+                                          CollationKey& key,
+                                          UErrorCode& status) const = 0;
+
+    virtual CollationKey& getCollationKey(const char16_t*source,
+                                          int32_t sourceLength,
+                                          CollationKey& key,
+                                          UErrorCode& status) const = 0;
+    virtual int32_t hashCode() const = 0;
+
+#ifndef U_FORCE_HIDE_DEPRECATED_API
+    virtual Locale getLocale(ULocDataLocaleType type, UErrorCode& status) const = 0;
+#endif  // U_FORCE_HIDE_DEPRECATED_API
+
+    UBool greater(const UnicodeString& source, const UnicodeString& target)
+                  const;
+
+    UBool greaterOrEqual(const UnicodeString& source,
+                         const UnicodeString& target) const;
+
+    UBool equals(const UnicodeString& source, const UnicodeString& target) const;
+
+    inline auto equal_to() const { return Predicate<std::equal_to, UCOL_EQUAL>(*this); }
+
+    inline auto greater() const { return Predicate<std::equal_to, UCOL_GREATER>(*this); }
+
+    inline auto less() const { return Predicate<std::equal_to, UCOL_LESS>(*this); }
+
+    inline auto not_equal_to() const { return Predicate<std::not_equal_to, UCOL_EQUAL>(*this); }
+
+    inline auto greater_equal() const { return Predicate<std::not_equal_to, UCOL_LESS>(*this); }
+
+    inline auto less_equal() const { return Predicate<std::not_equal_to, UCOL_GREATER>(*this); }
+
+#ifndef U_FORCE_HIDE_DEPRECATED_API
+    virtual ECollationStrength getStrength() const;
+
+    virtual void setStrength(ECollationStrength newStrength);
+#endif  // U_FORCE_HIDE_DEPRECATED_API
+
+     virtual int32_t getReorderCodes(int32_t *dest,
+                                     int32_t destCapacity,
+                                     UErrorCode& status) const;
+
+     virtual void setReorderCodes(const int32_t* reorderCodes,
+                                  int32_t reorderCodesLength,
+                                  UErrorCode& status) ;
+
+    static int32_t U_EXPORT2 getEquivalentReorderCodes(int32_t reorderCode,
+                                int32_t* dest,
+                                int32_t destCapacity,
+                                UErrorCode& status);
+
+    static UnicodeString& U_EXPORT2 getDisplayName(const Locale& objectLocale,
+                                         const Locale& displayLocale,
+                                         UnicodeString& name);
+
+    static UnicodeString& U_EXPORT2 getDisplayName(const Locale& objectLocale,
+                                         UnicodeString& name);
+
+    static const Locale* U_EXPORT2 getAvailableLocales(int32_t& count);
+
+    static StringEnumeration* U_EXPORT2 getAvailableLocales();
+
+    static StringEnumeration* U_EXPORT2 getKeywords(UErrorCode& status);
+
+    static StringEnumeration* U_EXPORT2 getKeywordValues(const char *keyword, UErrorCode& status);
+
+    static StringEnumeration* U_EXPORT2 getKeywordValuesForLocale(const char* keyword, const Locale& locale,
+                                                                    UBool commonlyUsed, UErrorCode& status);
+
+    static Locale U_EXPORT2 getFunctionalEquivalent(const char* keyword, const Locale& locale,
+                                          UBool& isAvailable, UErrorCode& status);
+
+#if !UCONFIG_NO_SERVICE
+    static URegistryKey U_EXPORT2 registerInstance(Collator* toAdopt, const Locale& locale, UErrorCode& status);
+
+    static URegistryKey U_EXPORT2 registerFactory(CollatorFactory* toAdopt, UErrorCode& status);
+
+    static UBool U_EXPORT2 unregister(URegistryKey key, UErrorCode& status);
+#endif /* UCONFIG_NO_SERVICE */
+
+    virtual void getVersion(UVersionInfo info) const = 0;
+
+    virtual UClassID getDynamicClassID() const override = 0;
+
+    virtual void setAttribute(UColAttribute attr, UColAttributeValue value,
+                              UErrorCode &status) = 0;
+
+    virtual UColAttributeValue getAttribute(UColAttribute attr,
+                                            UErrorCode &status) const = 0;
+
+    virtual Collator &setMaxVariable(UColReorderCode group, UErrorCode &errorCode);
+
+    virtual UColReorderCode getMaxVariable() const;
+
+#ifndef U_FORCE_HIDE_DEPRECATED_API
+    virtual uint32_t setVariableTop(const char16_t *varTop, int32_t len, UErrorCode &status) = 0;
+
+    virtual uint32_t setVariableTop(const UnicodeString &varTop, UErrorCode &status) = 0;
+
+    virtual void setVariableTop(uint32_t varTop, UErrorCode &status) = 0;
+#endif  // U_FORCE_HIDE_DEPRECATED_API
+
+    virtual uint32_t getVariableTop(UErrorCode &status) const = 0;
+
+    virtual UnicodeSet *getTailoredSet(UErrorCode &status) const;
+
+#ifndef U_FORCE_HIDE_DEPRECATED_API
+    virtual Collator* safeClone() const;
+#endif  // U_FORCE_HIDE_DEPRECATED_API
+
+    virtual int32_t getSortKey(const UnicodeString& source,
+                              uint8_t* result,
+                              int32_t resultLength) const = 0;
+
+    virtual int32_t getSortKey(const char16_t*source, int32_t sourceLength,
+                               uint8_t*result, int32_t resultLength) const = 0;
+
+    static int32_t U_EXPORT2 getBound(const uint8_t       *source,
+            int32_t             sourceLength,
+            UColBoundMode       boundType,
+            uint32_t            noOfLevels,
+            uint8_t             *result,
+            int32_t             resultLength,
+            UErrorCode          &status);
+
+
+protected:
+
+
+    Collator();
+
+#ifndef U_HIDE_DEPRECATED_API
+    Collator(UCollationStrength collationStrength,
+             UNormalizationMode decompositionMode);
+#endif  /* U_HIDE_DEPRECATED_API */
+
+    Collator(const Collator& other);
+
+public:
+    virtual void setLocales(const Locale& requestedLocale, const Locale& validLocale, const Locale& actualLocale);
+
+    virtual int32_t internalGetShortDefinitionString(const char *locale,
+                                                     char *buffer,
+                                                     int32_t capacity,
+                                                     UErrorCode &status) const;
+
+    virtual UCollationResult internalCompareUTF8(
+            const char *left, int32_t leftLength,
+            const char *right, int32_t rightLength,
+            UErrorCode &errorCode) const;
+
+    virtual int32_t
+    internalNextSortKeyPart(
+            UCharIterator *iter, uint32_t state[2],
+            uint8_t *dest, int32_t count, UErrorCode &errorCode) const;
+
+#ifndef U_HIDE_INTERNAL_API
+    static inline Collator *fromUCollator(UCollator *uc) {
+        return reinterpret_cast<Collator *>(uc);
+    }
+    static inline const Collator *fromUCollator(const UCollator *uc) {
+        return reinterpret_cast<const Collator *>(uc);
+    }
+    inline UCollator *toUCollator() {
+        return reinterpret_cast<UCollator *>(this);
+    }
+    inline const UCollator *toUCollator() const {
+        return reinterpret_cast<const UCollator *>(this);
+    }
+#endif  // U_HIDE_INTERNAL_API
+
+private:
+    Collator& operator=(const Collator& other) = delete;
+
+    friend class CFactory;
+    friend class SimpleCFactory;
+    friend class ICUCollatorFactory;
+    friend class ICUCollatorService;
+    static Collator* makeInstance(const Locale& desiredLocale,
+                                  UErrorCode& status);
+
+    template <template <typename...> typename Compare, UCollationResult result>
+    class Predicate {
+      public:
+        explicit Predicate(const Collator& parent) : collator(parent) {}
+
+        template <
+            typename T, typename U,
+            typename = std::enable_if_t<ConvertibleToU16StringView<T> && ConvertibleToU16StringView<U>>>
+        bool operator()(const T& lhs, const U& rhs) const {
+            UErrorCode status = U_ZERO_ERROR;
+            return compare(
+                collator.compare(
+                    UnicodeString::readOnlyAlias(lhs),
+                    UnicodeString::readOnlyAlias(rhs),
+                    status),
+                result);
+        }
+
+        bool operator()(std::string_view lhs, std::string_view rhs) const {
+            UErrorCode status = U_ZERO_ERROR;
+            return compare(collator.compareUTF8(lhs, rhs, status), result);
+        }
+
+#if defined(__cpp_char8_t)
+        bool operator()(std::u8string_view lhs, std::u8string_view rhs) const {
+            UErrorCode status = U_ZERO_ERROR;
+            return compare(collator.compareUTF8(lhs, rhs, status), result);
+        }
+#endif
+
+      private:
+        const Collator& collator;
+        static constexpr Compare<UCollationResult> compare{};
+    };
+};
+
+#if !UCONFIG_NO_SERVICE
+class U_I18N_API CollatorFactory : public UObject {
+public:
+
+    virtual ~CollatorFactory();
+
+    virtual UBool visible() const;
+
+    virtual Collator* createCollator(const Locale& loc) = 0;
+
+    virtual  UnicodeString& getDisplayName(const Locale& objectLocale,
+                                           const Locale& displayLocale,
+                                           UnicodeString& result);
+
+    virtual const UnicodeString * getSupportedIDs(int32_t &count, UErrorCode& status) = 0;
+};
+#endif /* UCONFIG_NO_SERVICE */
+
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_COLLATION */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif

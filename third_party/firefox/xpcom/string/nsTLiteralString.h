@@ -1,0 +1,89 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsTLiteralString_h
+#define nsTLiteralString_h
+
+#include "nsTStringRepr.h"
+#include "mozilla/StaticString.h"
+
+template <typename T>
+class nsTLiteralString : public mozilla::detail::nsTStringRepr<T> {
+ public:
+  typedef nsTLiteralString<T> self_type;
+
+#ifdef __clang__
+  using typename mozilla::detail::nsTStringRepr<T>::base_string_type;
+#else
+  typedef typename mozilla::detail::nsTStringRepr<T>::base_string_type
+      base_string_type;
+#endif
+
+  typedef typename base_string_type::char_type char_type;
+  typedef typename base_string_type::size_type size_type;
+  typedef typename base_string_type::DataFlags DataFlags;
+  typedef typename base_string_type::ClassFlags ClassFlags;
+
+ public:
+
+  template <size_type N>
+  explicit constexpr nsTLiteralString(const char_type (&aStr)[N])
+      : nsTLiteralString(aStr, N - 1) {}
+
+  nsTLiteralString(const nsTLiteralString&) = default;
+
+  const nsTString<T>& AsString() const MOZ_LIFETIME_BOUND {
+    return *reinterpret_cast<const nsTString<T>*>(this);
+  }
+
+  operator const nsTString<T>&() const MOZ_LIFETIME_BOUND { return AsString(); }
+
+  template <typename N, typename Dummy>
+  struct raw_type {
+    typedef N* type;
+  };
+
+#ifdef MOZ_USE_CHAR16_WRAPPER
+  template <typename Dummy>
+  struct raw_type<char16_t, Dummy> {
+    typedef char16ptr_t type;
+  };
+#endif
+
+  constexpr const typename raw_type<T, int>::type get() const {
+    return this->mData;
+  }
+
+#if defined(__clang__)
+ private:
+  friend constexpr auto operator""_ns(const char* aStr, std::size_t aLen);
+  friend constexpr auto operator""_ns(const char16_t* aStr, std::size_t aLen);
+#else
+ public:
+#endif
+  constexpr nsTLiteralString(const char_type* aStr, size_t aLen)
+      : base_string_type(const_cast<char_type*>(aStr), aLen,
+                         DataFlags::TERMINATED | DataFlags::LITERAL,
+                         ClassFlags::NULL_TERMINATED) {}
+
+ public:
+  template <size_type N>
+  nsTLiteralString(char_type (&aStr)[N]) = delete;
+
+  nsTLiteralString& operator=(const nsTLiteralString&) = delete;
+};
+
+extern template class nsTLiteralString<char>;
+extern template class nsTLiteralString<char16_t>;
+
+template <typename Char>
+struct fmt::formatter<nsTLiteralString<Char>, Char>
+    : fmt::formatter<mozilla::detail::nsTStringRepr<Char>, Char> {};
+
+namespace mozilla {
+constexpr MOZ_IMPLICIT StaticString::StaticString(nsLiteralCString const& str)
+    : mStr(str.get()) {}
+}  
+
+#endif

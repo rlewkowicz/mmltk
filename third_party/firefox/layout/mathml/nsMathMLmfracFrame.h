@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsMathMLmfracFrame_h_
+#define nsMathMLmfracFrame_h_
+
+#include "nsMathMLContainerFrame.h"
+
+namespace mozilla {
+class PresShell;
+}  
+
+
+
+class nsMathMLmfracFrame final : public nsMathMLContainerFrame {
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(nsMathMLmfracFrame)
+
+  friend nsIFrame* NS_NewMathMLmfracFrame(mozilla::PresShell* aPresShell,
+                                          ComputedStyle* aStyle);
+
+  MathMLFrameType GetMathMLFrameType() override;
+
+  void Place(DrawTarget* aDrawTarget, const PlaceFlags& aFlags,
+             ReflowOutput& aDesiredSize) override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  nsresult AttributeChanged(int32_t aNameSpaceID, nsAtom* aAttribute,
+                            AttrModType aModType) override;
+
+  NS_IMETHOD
+  TransmitAutomaticData() override;
+
+  nscoord FixInterFrameSpacing(ReflowOutput& aDesiredSize) override;
+
+  nscoord CalcLineThickness(nsString& aThicknessAttribute, nscoord onePixel,
+                            nscoord aDefaultRuleThickness,
+                            float aFontSizeInflation);
+
+  uint8_t ScriptIncrement(nsIFrame* aFrame) override;
+
+ protected:
+  explicit nsMathMLmfracFrame(ComputedStyle* aStyle,
+                              nsPresContext* aPresContext)
+      : nsMathMLContainerFrame(aStyle, aPresContext, kClassID),
+        mSlashChar(nullptr),
+        mLineThickness(0) {}
+  virtual ~nsMathMLmfracFrame();
+
+  bool IsMathContentBoxHorizontallyCentered() const final { return true; }
+
+  void DisplaySlash(nsDisplayListBuilder* aBuilder, const nsRect& aRect,
+                    nscoord aThickness, const nsDisplayListSet& aLists);
+
+  nsRect mLineRect;
+  nsMathMLChar* mSlashChar;
+  nscoord mLineThickness;
+};
+
+#endif /* nsMathMLmfracFrame_h_ */

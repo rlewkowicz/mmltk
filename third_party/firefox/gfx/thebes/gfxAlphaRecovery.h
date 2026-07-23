@@ -1,0 +1,37 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFXALPHARECOVERY_H_
+#define GFXALPHARECOVERY_H_
+
+#include "gfxTypes.h"
+#include "mozilla/gfx/Rect.h"
+
+class gfxImageSurface;
+
+class gfxAlphaRecovery {
+ public:
+  static uint32_t GoodAlignmentLog2() { return 4;  }
+
+  static bool RecoverAlpha(gfxImageSurface* blackSurface,
+                           const gfxImageSurface* whiteSurface);
+
+  template <class Arch>
+  static bool RecoverAlphaGeneric(gfxImageSurface* blackSurface,
+                                  const gfxImageSurface* whiteSurface);
+
+
+  static inline uint32_t RecoverPixel(uint32_t black, uint32_t white) {
+    const uint32_t GREEN_MASK = 0x0000FF00;
+    const uint32_t ALPHA_MASK = 0xFF000000;
+
+    uint32_t diff = (white & GREEN_MASK) - (black & GREEN_MASK);
+    uint32_t limit = diff & ALPHA_MASK;
+    uint32_t alpha = (ALPHA_MASK - (diff << 16)) | limit;
+
+    return alpha | (black & ~ALPHA_MASK);
+  }
+};
+
+#endif /* GFXALPHARECOVERY_H_ */

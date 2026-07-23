@@ -1,0 +1,112 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "BlobURLChannel.h"
+
+
+#include "mozilla/dom/BlobImpl.h"
+#include "mozilla/dom/BlobURL.h"
+#include "mozilla/dom/BlobURLInputStream.h"
+#include "mozilla/dom/ContentChild.h"
+#include "nsQueryObject.h"
+
+using namespace mozilla::dom;
+
+NS_IMPL_ISUPPORTS_INHERITED(BlobURLChannel, nsBaseChannel, BlobURLChannel)
+
+BlobURLChannel::BlobURLChannel(nsIURI* aURI, nsILoadInfo* aLoadInfo)
+    : mContentStreamOpened(false) {
+  SetURI(aURI);
+  SetOriginalURI(aURI);
+  SetLoadInfo(aLoadInfo);
+
+  if (aLoadInfo && aLoadInfo->GetLoadingSandboxed()) {
+    SetOwner(nullptr);
+  }
+}
+
+BlobURLChannel::~BlobURLChannel() = default;
+
+nsresult BlobURLChannel::SetRequestContentRangeHeader(
+    const nsACString& aContentRangeHeader) {
+  NS_ENSURE_FALSE(mContentStreamOpened, NS_ERROR_ALREADY_INITIALIZED);
+  NS_ENSURE_FALSE(mRequestContentRange, NS_ERROR_ALREADY_INITIALIZED);
+
+  mRequestContentRange =
+      nsContentUtils::ParseSingleRangeRequest(aContentRangeHeader, true);
+  if (!mRequestContentRange) {
+    return NS_ERROR_NET_PARTIAL_TRANSFER;
+  }
+  return NS_OK;
+}
+
+nsresult BlobURLChannel::SetResponseContentRange(
+    net::ContentRange* aContentRange) {
+  NS_ENSURE_ARG(aContentRange);
+  NS_ENSURE_FALSE(mResponseContentRange, NS_ERROR_ALREADY_INITIALIZED);
+  mResponseContentRange = aContentRange;
+  return NS_OK;
+}
+
+nsresult BlobURLChannel::GetBackingBlob(BlobImpl** aBlobImpl) {
+  NS_ENSURE_ARG(aBlobImpl);
+  NS_ENSURE_TRUE(mBlobImpl, NS_ERROR_NOT_AVAILABLE);
+  *aBlobImpl = do_AddRef(mBlobImpl).take();
+  return NS_OK;
+}
+
+nsresult BlobURLChannel::SetBackingBlob(BlobImpl* aBlobImpl) {
+  NS_ENSURE_ARG(aBlobImpl);
+  NS_ENSURE_FALSE(mBlobImpl, NS_ERROR_ALREADY_INITIALIZED);
+  mBlobImpl = aBlobImpl;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+BlobURLChannel::SetContentType(const nsACString& aContentType) {
+  if (aContentType.IsEmpty()) {
+    mContentType.Truncate();
+    return NS_OK;
+  }
+
+  return nsBaseChannel::SetContentType(aContentType);
+}
+
+nsresult BlobURLChannel::OpenContentStream(bool aAsync,
+                                           nsIInputStream** aResult,
+                                           nsIChannel** aChannel) {
+  if (mContentStreamOpened) {
+    return NS_ERROR_ALREADY_OPENED;
+  }
+
+  mContentStreamOpened = true;
+
+  nsCOMPtr<nsIURI> uri;
+  nsresult rv = GetURI(getter_AddRefs(uri));
+  NS_ENSURE_SUCCESS(rv, NS_ERROR_MALFORMED_URI);
+
+  RefPtr<BlobURL> blobURL = do_QueryObject(uri);
+
+  if (NS_WARN_IF(NS_FAILED(rv)) || NS_WARN_IF(!blobURL)) {
+    return NS_ERROR_MALFORMED_URI;
+  }
+
+  if (blobURL->Revoked()) {
+    return NS_ERROR_MALFORMED_URI;
+  }
+
+  ContentChild::MaybeBecomeUntrusted();
+
+  nsCOMPtr<nsIInputStream> inputStream =
+      BlobURLInputStream::Create(this, blobURL);
+  if (NS_WARN_IF(!inputStream)) {
+    return NS_ERROR_MALFORMED_URI;
+  }
+
+  EnableSynthesizedProgressEvents(true);
+
+  inputStream.forget(aResult);
+
+  return NS_OK;
+}

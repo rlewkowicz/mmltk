@@ -1,0 +1,121 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef dom_src_geolocation_IPC_serialiser
+#define dom_src_geolocation_IPC_serialiser
+
+#include "ipc/IPCMessageUtils.h"
+#include "mozilla/dom/GeolocationPosition.h"
+#include "nsIDOMGeoPosition.h"
+
+namespace IPC {
+
+template <>
+struct ParamTraits<nsIDOMGeoPositionCoords*> {
+  static void Write(MessageWriter* aWriter, nsIDOMGeoPositionCoords* aParam) {
+    bool isNull = !aParam;
+    WriteParam(aWriter, isNull);
+    if (isNull) return;
+
+    double coordData;
+
+    aParam->GetLatitude(&coordData);
+    WriteParam(aWriter, coordData);
+
+    aParam->GetLongitude(&coordData);
+    WriteParam(aWriter, coordData);
+
+    aParam->GetAltitude(&coordData);
+    WriteParam(aWriter, coordData);
+
+    aParam->GetAccuracy(&coordData);
+    WriteParam(aWriter, coordData);
+
+    aParam->GetAltitudeAccuracy(&coordData);
+    WriteParam(aWriter, coordData);
+
+    aParam->GetHeading(&coordData);
+    WriteParam(aWriter, coordData);
+
+    aParam->GetSpeed(&coordData);
+    WriteParam(aWriter, coordData);
+  }
+
+  static bool Read(MessageReader* aReader,
+                   RefPtr<nsIDOMGeoPositionCoords>* aResult) {
+    bool isNull;
+    if (!ReadParam(aReader, &isNull)) return false;
+
+    if (isNull) {
+      *aResult = nullptr;
+      return true;
+    }
+
+    double latitude;
+    double longitude;
+    double altitude;
+    double accuracy;
+    double altitudeAccuracy;
+    double heading;
+    double speed;
+
+    if (!(ReadParam(aReader, &latitude) && ReadParam(aReader, &longitude) &&
+          ReadParam(aReader, &altitude) && ReadParam(aReader, &accuracy) &&
+          ReadParam(aReader, &altitudeAccuracy) &&
+          ReadParam(aReader, &heading) && ReadParam(aReader, &speed)))
+      return false;
+
+    *aResult = new nsGeoPositionCoords(latitude,         
+                                       longitude,        
+                                       altitude,         
+                                       accuracy,         
+                                       altitudeAccuracy, 
+                                       heading,          
+                                       speed             
+    );
+    return true;
+  }
+};
+
+template <>
+struct ParamTraits<nsIDOMGeoPosition*> {
+  static void Write(MessageWriter* aWriter, nsIDOMGeoPosition* aParam) {
+    bool isNull = !aParam;
+    WriteParam(aWriter, isNull);
+    if (isNull) return;
+
+    EpochTimeStamp timeStamp;
+    aParam->GetTimestamp(&timeStamp);
+    WriteParam(aWriter, timeStamp);
+
+    nsCOMPtr<nsIDOMGeoPositionCoords> coords;
+    aParam->GetCoords(getter_AddRefs(coords));
+    WriteParam(aWriter, coords);
+  }
+
+  static bool Read(MessageReader* aReader, RefPtr<nsIDOMGeoPosition>* aResult) {
+    bool isNull;
+    if (!ReadParam(aReader, &isNull)) return false;
+
+    if (isNull) {
+      *aResult = nullptr;
+      return true;
+    }
+
+    EpochTimeStamp timeStamp;
+    RefPtr<nsIDOMGeoPositionCoords> coords;
+
+    if (!ReadParam(aReader, &timeStamp) || !ReadParam(aReader, &coords)) {
+      return false;
+    }
+
+    *aResult = new nsGeoPosition(coords, timeStamp);
+
+    return true;
+  };
+};
+
+}  
+
+#endif

@@ -1,0 +1,375 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_RestyleManager_h
+#define mozilla_RestyleManager_h
+
+#include "mozilla/Atomics.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/OverflowChangedTracker.h"
+#include "mozilla/ServoElementSnapshot.h"
+#include "mozilla/ServoElementSnapshotTable.h"
+#include "nsChangeHint.h"
+#include "nsPresContext.h"
+#include "nsPresContextInlines.h"  // XXX Shouldn't be included by header though
+#include "nsStringFwd.h"
+#include "nsTHashSet.h"
+
+class nsAttrValue;
+class nsAtom;
+class nsIFrame;
+class nsStyleChangeList;
+class nsStyleChangeList;
+
+enum class AttrModType : uint8_t;  
+
+namespace mozilla {
+
+class ServoStyleSet;
+
+namespace dom {
+class Document;
+class Element;
+}  
+
+class ServoRestyleState {
+ public:
+  ServoRestyleState(
+      ServoStyleSet& aStyleSet, nsStyleChangeList& aChangeList,
+      nsTArray<nsIFrame*>& aPendingWrapperRestyles,
+      nsTArray<RefPtr<dom::Element>>& aPendingScrollAnchorSuppressions)
+      : mStyleSet(aStyleSet),
+        mChangeList(aChangeList),
+        mPendingWrapperRestyles(aPendingWrapperRestyles),
+        mPendingScrollAnchorSuppressions(aPendingScrollAnchorSuppressions),
+        mPendingWrapperRestyleOffset(aPendingWrapperRestyles.Length()),
+        mChangesHandled(nsChangeHint(0))
+#ifdef DEBUG
+        ,
+        mAssertWrapperRestyleLength(false)
+#endif  // DEBUG
+  {
+  }
+
+  enum class CanUseHandledHints : bool { No = false, Yes };
+
+  ServoRestyleState(const nsIFrame& aOwner, ServoRestyleState& aParentState,
+                    nsChangeHint aHintForThisFrame,
+                    CanUseHandledHints aCanUseHandledHints,
+                    bool aAssertWrapperRestyleLength = true)
+      : mStyleSet(aParentState.mStyleSet),
+        mChangeList(aParentState.mChangeList),
+        mPendingWrapperRestyles(aParentState.mPendingWrapperRestyles),
+        mPendingScrollAnchorSuppressions(
+            aParentState.mPendingScrollAnchorSuppressions),
+        mPendingWrapperRestyleOffset(
+            aParentState.mPendingWrapperRestyles.Length()),
+        mChangesHandled(bool(aCanUseHandledHints)
+                            ? aParentState.mChangesHandled | aHintForThisFrame
+                            : aHintForThisFrame)
+#ifdef DEBUG
+        ,
+        mOwner(&aOwner),
+        mAssertWrapperRestyleLength(aAssertWrapperRestyleLength)
+#endif
+  {
+    if (bool(aCanUseHandledHints)) {
+      AssertOwner(aParentState);
+    }
+  }
+
+  ~ServoRestyleState() {
+    MOZ_ASSERT(
+        !mAssertWrapperRestyleLength ||
+            mPendingWrapperRestyles.Length() == mPendingWrapperRestyleOffset,
+        "Someone forgot to call ProcessWrapperRestyles!");
+  }
+
+  nsStyleChangeList& ChangeList() { return mChangeList; }
+  ServoStyleSet& StyleSet() { return mStyleSet; }
+
+#ifdef DEBUG
+  void AssertOwner(const ServoRestyleState& aParentState) const;
+  nsChangeHint ChangesHandledFor(const nsIFrame*) const;
+#else
+  void AssertOwner(const ServoRestyleState&) const {}
+  nsChangeHint ChangesHandledFor(const nsIFrame*) const {
+    return mChangesHandled;
+  }
+#endif
+
+  void AddPendingWrapperRestyle(nsIFrame* aWrapperFrame);
+
+  void ProcessWrapperRestyles(nsIFrame* aParentFrame);
+
+  static nsIFrame* TableAwareParentFor(const nsIFrame* aChild);
+
+  void AddPendingScrollAnchorSuppression(dom::Element* aElement) {
+    mPendingScrollAnchorSuppressions.AppendElement(aElement);
+  }
+
+ private:
+  size_t ProcessMaybeNestedWrapperRestyle(nsIFrame* aParent, size_t aIndex);
+
+  ServoStyleSet& mStyleSet;
+  nsStyleChangeList& mChangeList;
+
+  nsTArray<nsIFrame*>& mPendingWrapperRestyles;
+
+  nsTArray<RefPtr<dom::Element>>& mPendingScrollAnchorSuppressions;
+
+  size_t mPendingWrapperRestyleOffset;
+
+  const nsChangeHint mChangesHandled;
+
+#ifdef DEBUG
+  const nsIFrame* mOwner{nullptr};
+#endif
+
+#ifdef DEBUG
+  const bool mAssertWrapperRestyleLength;
+#endif  // DEBUG
+};
+
+enum class ServoPostTraversalFlags : uint32_t;
+
+class RestyleManager {
+  friend class dom::Document;
+  friend class ServoStyleSet;
+
+ public:
+  typedef ServoElementSnapshotTable SnapshotTable;
+  typedef mozilla::dom::Element Element;
+
+  uint64_t GetRestyleGeneration() const { return mRestyleGeneration; }
+  uint64_t GetUndisplayedRestyleGeneration() const {
+    return mUndisplayedRestyleGeneration;
+  }
+
+  void Disconnect() { mPresContext = nullptr; }
+
+  ~RestyleManager() {
+    MOZ_ASSERT(!mAnimationsWithDestroyedFrame,
+               "leaving dangling pointers from AnimationsWithDestroyedFrame");
+    MOZ_ASSERT(!mReentrantChanges);
+  }
+
+#ifdef DEBUG
+  static nsCString ChangeHintToString(nsChangeHint aHint);
+
+  void DebugVerifyStyleTree(nsIFrame* aFrame);
+#endif
+
+  void FlushOverflowChangedTracker() { mOverflowChangedTracker.Flush(); }
+
+  void NotifyDestroyingFrame(nsIFrame* aFrame) {
+    mOverflowChangedTracker.RemoveFrame(aFrame);
+    if (mDestroyedFrames) {
+      mDestroyedFrames->Insert(aFrame);
+    }
+  }
+
+  void ProcessRestyledFrames(nsStyleChangeList& aChangeList);
+
+  bool IsInStyleRefresh() const { return mInStyleRefresh; }
+
+  class MOZ_STACK_CLASS AnimationsWithDestroyedFrame final {
+   public:
+    explicit AnimationsWithDestroyedFrame(RestyleManager* aRestyleManager);
+
+    void Put(nsIContent* aContent, ComputedStyle* aComputedStyle);
+    void StopAnimationsForElementsWithoutFrames();
+
+   private:
+    void StopAnimationsWithoutFrame(nsTArray<RefPtr<Element>>& aArray,
+                                    const PseudoStyleRequest& aPseudoRequest);
+
+    RestyleManager* mRestyleManager;
+    AutoRestore<AnimationsWithDestroyedFrame*> mRestorePointer;
+
+    nsTArray<std::pair<RefPtr<Element>, PseudoStyleType>> mContents;
+  };
+
+  AnimationsWithDestroyedFrame* GetAnimationsWithDestroyedFrame() {
+    return mAnimationsWithDestroyedFrame;
+  }
+
+  void ContentInserted(nsIContent* aChild);
+  void ContentAppended(nsIContent* aFirstNewContent);
+
+  void ContentWillBeRemoved(nsIContent* aOldChild);
+
+  void RestyleForInsertOrChange(nsIContent* aChild);
+
+  void CharacterDataChanged(nsIContent*, const CharacterDataChangeInfo&);
+
+  void PostRestyleEvent(dom::Element*, RestyleHint,
+                        nsChangeHint aMinChangeHint);
+
+  void PostRestyleEventForAnimations(dom::Element*, const PseudoStyleRequest&,
+                                     RestyleHint);
+
+  void NextRestyleIsForCSSRuleChanges() { mRestyleForCSSRuleChanges = true; }
+
+  void RebuildAllStyleData(nsChangeHint aExtraHint, RestyleHint);
+
+  void ProcessPendingRestyles();
+  void ProcessAllPendingAttributeAndStateInvalidations();
+
+  void ElementStateChanged(Element*, dom::ElementState);
+
+  void CustomStatesWillChange(Element&);
+  void CustomStateChanged(Element&, nsAtom* aState);
+  void MaybeRestyleForNthOfCustomState(ServoStyleSet&, Element&,
+                                       nsAtom* aState);
+
+  void MaybeRestyleForNthOfState(ServoStyleSet& aStyleSet, dom::Element* aChild,
+                                 dom::ElementState aChangedBits);
+
+  void AttributeWillChange(Element* aElement, int32_t aNameSpaceID,
+                           nsAtom* aAttribute, AttrModType aModType);
+  void ClassAttributeWillBeChangedBySMIL(dom::Element* aElement);
+  void AttributeChanged(dom::Element* aElement, int32_t aNameSpaceID,
+                        nsAtom* aAttribute, AttrModType aModType,
+                        const nsAttrValue* aOldValue);
+
+  void MaybeRecascadeForAttrFunction(Element* aElement, nsAtom* aAttribute);
+
+  void RestyleSiblingsForNthOf(dom::Element* aChild,
+                               NodeSelectorFlags aParentFlags);
+
+  void MaybeRestyleForNthOfAttribute(dom::Element* aChild, int32_t aNameSpaceID,
+                                     nsAtom* aAttribute,
+                                     const nsAttrValue* aOldValue);
+
+  void MaybeRestyleForRelativeSelectorAttribute(dom::Element* aElement,
+                                                int32_t aNameSpaceID,
+                                                nsAtom* aAttribute,
+                                                const nsAttrValue* aOldValue);
+  void MaybeRestyleForRelativeSelectorState(ServoStyleSet& aStyleSet,
+                                            dom::Element* aElement,
+                                            dom::ElementState aChangedBits);
+
+  void ReparentComputedStyleForFirstLine(nsIFrame*);
+
+  void UpdateOnlyAnimationStyles();
+
+  uint64_t GetAnimationGeneration() const { return mAnimationGeneration; }
+
+  static uint64_t GetAnimationGenerationForFrame(nsIFrame* aStyleFrame);
+
+  void IncrementAnimationGeneration() { ++mAnimationGeneration; }
+
+  void NoteHighlightPseudoStyleInvalidated() {
+    mNeedsPseudoElementSelectionsRepaint = true;
+  }
+
+  static void AddLayerChangesForAnimation(
+      nsIFrame* aStyleFrame, nsIFrame* aPrimaryFrame, Element* aElement,
+      nsChangeHint aHintForThisFrame, nsStyleChangeList& aChangeListToProcess);
+
+  enum class IncludeRoot {
+    Yes,
+    No,
+  };
+
+  static void ClearServoDataFromSubtree(Element*,
+                                        IncludeRoot = IncludeRoot::Yes);
+
+  static void ClearRestyleStateFromSubtree(Element* aElement);
+
+  explicit RestyleManager(nsPresContext* aPresContext);
+
+ protected:
+  void ReparentFrameDescendants(nsIFrame* aFrame, nsIFrame* aProviderChild,
+                                ServoStyleSet& aStyleSet);
+
+  bool ProcessPostTraversal(Element* aElement, ServoRestyleState& aRestyleState,
+                            ServoPostTraversalFlags aFlags);
+
+  struct TextPostTraversalState;
+  bool ProcessPostTraversalForText(nsIContent* aTextNode,
+                                   TextPostTraversalState& aState,
+                                   ServoRestyleState& aRestyleState,
+                                   ServoPostTraversalFlags aFlags);
+
+  ServoStyleSet* StyleSet() const { return PresContext()->StyleSet(); }
+
+  void RestyleWholeContainer(nsINode* aContainer, NodeSelectorFlags);
+  void RestylePreviousSiblings(nsIContent* aStartingSibling);
+  void RestyleSiblingsStartingWith(nsIContent* aStartingSibling);
+  void RecascadeForTreeCountingFunctions(nsINode* aContainer);
+  void RestyleForEmptyChange(Element* aContainer);
+  void MaybeRestyleForEdgeChildChange(nsINode* aContainer,
+                                      nsIContent* aChangedChild);
+
+  bool IsDisconnected() const { return !mPresContext; }
+
+  void IncrementRestyleGeneration() {
+    if (++mRestyleGeneration == 0) {
+      ++mRestyleGeneration;
+    }
+    IncrementUndisplayedRestyleGeneration();
+  }
+
+  void IncrementUndisplayedRestyleGeneration() {
+    if (++mUndisplayedRestyleGeneration == 0) {
+      ++mUndisplayedRestyleGeneration;
+    }
+  }
+
+  nsPresContext* PresContext() const {
+    MOZ_ASSERT(mPresContext);
+    return mPresContext;
+  }
+
+ private:
+  nsPresContext* mPresContext;  
+  uint64_t mRestyleGeneration;
+  uint64_t mUndisplayedRestyleGeneration;
+
+  mozilla::UniquePtr<nsTHashSet<const nsIFrame*>> mDestroyedFrames;
+
+  nsTHashSet<RefPtr<nsINode>> mRestyledAsWholeContainer;
+
+ protected:
+  bool mInStyleRefresh;
+
+  uint64_t mAnimationGeneration;
+
+  OverflowChangedTracker mOverflowChangedTracker;
+
+  AnimationsWithDestroyedFrame* mAnimationsWithDestroyedFrame = nullptr;
+
+  const SnapshotTable& Snapshots() const { return mSnapshots; }
+  void ClearSnapshots();
+  ServoElementSnapshot& SnapshotFor(Element&);
+  void TakeSnapshotForAttributeChange(Element&, int32_t aNameSpaceID,
+                                      nsAtom* aAttribute);
+
+  void DoProcessPendingRestyles(ServoTraversalFlags aFlags);
+
+  void DoReparentComputedStyleForFirstLine(nsIFrame*, ServoStyleSet&);
+
+  struct ReentrantChange {
+    nsCOMPtr<nsIContent> mContent;
+    nsChangeHint mHint;
+  };
+  typedef AutoTArray<ReentrantChange, 10> ReentrantChangeList;
+
+  ReentrantChangeList* mReentrantChanges = nullptr;
+
+  bool mHaveNonAnimationRestyles = false;
+
+  bool mRestyleForCSSRuleChanges = false;
+
+  Atomic<bool, MemoryOrdering::Relaxed> mNeedsPseudoElementSelectionsRepaint{
+      false};
+
+  SnapshotTable mSnapshots;
+};
+
+}  
+
+#endif

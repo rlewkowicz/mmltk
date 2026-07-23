@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+
+(function (exports) {
+  "use strict";
+
+  if (exports.require) {
+    return;
+  }
+
+  let require = (function () {
+    let modules = new Map();
+
+    Object.defineProperty(Error.prototype, "moduleStack", {
+      get() {
+        return this.stack;
+      },
+    });
+    Object.defineProperty(Error.prototype, "moduleName", {
+      get() {
+        let match = this.stack.match(/\@(.*):.*:/);
+        if (match) {
+          return match[1];
+        }
+        return "(unknown module)";
+      },
+    });
+
+    return function require(baseURL, path) {
+      if (typeof path != "string") {
+        throw new TypeError(
+          "The argument to require() must be a string got " + path
+        );
+      }
+
+      if ((path.startsWith("./") || path.startsWith("../")) && baseURL) {
+        path = new URL(path, baseURL).href;
+      }
+
+      if (!path.includes("://")) {
+        throw new TypeError(
+          "The argument to require() must be a string uri, got " + path
+        );
+      }
+      let uri;
+      if (path.lastIndexOf(".") <= path.lastIndexOf("/")) {
+        uri = path + ".js";
+      } else {
+        uri = path;
+      }
+
+      let exports = Object.create(null);
+
+      let module = {
+        id: path,
+        uri,
+        exports,
+      };
+
+      if (modules.has(uri)) {
+        return modules.get(uri).exports;
+      }
+      modules.set(uri, module);
+
+      try {
+        let xhr = new XMLHttpRequest();
+        xhr.open("GET", uri, false);
+        xhr.responseType = "text";
+        xhr.send();
+
+        let source = xhr.responseText;
+        if (source == "") {
+          throw new Error("Could not find module " + path);
+        }
+        let code = new Function(
+          "exports",
+          "require",
+          "module",
+          `eval(arguments[3] + "\\n//# sourceURL=" + arguments[4] + "\\n")`
+        );
+        code(exports, require.bind(null, path), module, source, uri);
+      } catch (ex) {
+        modules.delete(uri);
+        throw ex;
+      }
+
+      Object.freeze(module.exports);
+      Object.freeze(module);
+      return module.exports;
+    };
+  })();
+
+  Object.freeze(require);
+
+  Object.defineProperty(exports, "require", {
+    value: require.bind(null, null),
+    enumerable: true,
+    configurable: false,
+  });
+})(this);

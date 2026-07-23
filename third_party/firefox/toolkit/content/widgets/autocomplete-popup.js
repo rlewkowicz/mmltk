@@ -1,0 +1,560 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+"use strict";
+
+{
+  const lazy = {};
+
+  ChromeUtils.defineESModuleGetters(lazy, {
+    AutoCompleteParent: "resource://gre/actors/AutoCompleteParent.sys.mjs",
+  });
+
+  if (!customElements.get("autocomplete-row-item")) {
+    customElements.setElementCreationCallback("autocomplete-row-item", () => {
+      ChromeUtils.importESModule(
+        "chrome://global/content/autocomplete-row-item/autocomplete-row-item.mjs",
+        { global: "current" }
+      );
+    });
+  }
+
+  const MozPopupElement = MozElements.MozElementMixin(XULPopupElement);
+  MozElements.MozAutocompleteRichlistboxPopup = class MozAutocompleteRichlistboxPopup extends (
+    MozPopupElement
+  ) {
+    constructor() {
+      super();
+
+      this.attachShadow({ mode: "open" });
+
+      {
+        let slot = document.createElement("slot");
+        slot.part = "content";
+        this.shadowRoot.appendChild(slot);
+      }
+
+      this.mInput = null;
+      this.mPopupOpen = false;
+      this._currentIndex = 0;
+      this._disabledItemClicked = false;
+
+      this.setListeners();
+    }
+
+    initialize() {
+      this.setAttribute("ignorekeys", "true");
+      this.setAttribute("level", "top");
+      this.setAttribute("consumeoutsideclicks", "never");
+
+      this.textContent = "";
+      this.appendChild(this.constructor.fragment);
+
+      this.defaultMaxRows = 6;
+
+      this._normalMaxRows = -1;
+      this._previousSelectedIndex = -1;
+      this.mLastMoveTime = Date.now();
+      this.mousedOverIndex = -1;
+      this._richlistbox = this.querySelector(".autocomplete-richlistbox");
+
+      if (!this.listEvents) {
+        this.listEvents = {
+          handleEvent: event => {
+            if (!this.parentNode) {
+              return;
+            }
+
+            switch (event.type) {
+              case "mousedown":
+                this._disabledItemClicked =
+                  !!event.target.closest("richlistitem")?.disabled;
+                break;
+              case "mouseup":
+                if (
+                  event.target.closest("richlistbox,richlistitem").localName ==
+                    "richlistitem" &&
+                  !this._disabledItemClicked
+                ) {
+                  this.onPopupClick(event);
+                }
+                this._disabledItemClicked = false;
+                break;
+              case "mousemove": {
+                if (Date.now() - this.mLastMoveTime <= 30) {
+                  return;
+                }
+
+                let item = event.target.closest("richlistbox,richlistitem");
+
+                if (item.localName == "richlistbox") {
+                  return;
+                }
+
+                let index = this.richlistbox.getIndexOfItem(item);
+
+                this.mousedOverIndex = index;
+
+                if (item.selectedByMouseOver) {
+                  this._setSelectedIndex(index, true);
+                }
+
+                this.mLastMoveTime = Date.now();
+                break;
+              }
+            }
+          },
+        };
+      }
+      this.richlistbox.addEventListener("mousedown", this.listEvents);
+      this.richlistbox.addEventListener("mouseup", this.listEvents);
+      this.richlistbox.addEventListener("mousemove", this.listEvents);
+    }
+
+    get richlistbox() {
+      if (!this._richlistbox) {
+        this.initialize();
+      }
+      return this._richlistbox;
+    }
+
+    static get markup() {
+      return `
+      <richlistbox class="autocomplete-richlistbox"/>
+    `;
+    }
+
+    get input() {
+      return this.mInput;
+    }
+
+    get overrideValue() {
+      return null;
+    }
+
+    get popupOpen() {
+      return this.mPopupOpen;
+    }
+
+    get maxRows() {
+      return (this.mInput && this.mInput.maxRows) || this.defaultMaxRows;
+    }
+
+    set selectedIndex(val) {
+      this._setSelectedIndex(val, false);
+    }
+
+    _setSelectedIndex(val, pointer) {
+      const changed = val != this.richlistbox.selectedIndex;
+      if (changed) {
+        this._previousSelectedIndex = this.richlistbox.selectedIndex;
+      }
+
+      this.richlistbox.toggleAttribute("pointerselected", pointer);
+
+      this.richlistbox.selectedIndex = val;
+
+      const prevSelectedItem = this.richlistbox.children[
+        this._previousSelectedIndex
+      ]?.querySelector("autocomplete-row-item");
+      const selectedItem = this.richlistbox.children[val]?.querySelector(
+        "autocomplete-row-item"
+      );
+
+      if (prevSelectedItem) {
+        prevSelectedItem.selected = false;
+      }
+
+      if (selectedItem) {
+        selectedItem.selected = true;
+      }
+
+      if (changed && (selectedItem || prevSelectedItem)) {
+        lazy.AutoCompleteParent.getCurrentActor()?.previewAutoCompleteEntry();
+      }
+
+      if (this.mPopupOpen && this.maxResults > this.maxRows) {
+        this.richlistbox.ensureElementIsVisible(
+          this.richlistbox.selectedItem || this.richlistbox.firstElementChild
+        );
+      }
+    }
+
+    get selectedIndex() {
+      return this.richlistbox.selectedIndex;
+    }
+
+    get maxResults() {
+      if (this.getAttribute("nomaxresults") == "true") {
+        return Infinity;
+      }
+      return 20;
+    }
+
+    get matchCount() {
+      return Math.min(this.mInput.controller.matchCount, this.maxResults);
+    }
+
+    get overflowPadding() {
+      return Number(this.getAttribute("overflowpadding"));
+    }
+
+    set view(val) {}
+
+    get view() {
+      return this.mInput.controller;
+    }
+
+    closePopup() {
+      if (this.mPopupOpen) {
+        this.hidePopup();
+        this.style.removeProperty("--panel-width");
+      }
+    }
+
+    getNextIndex(aReverse, aAmount, aIndex, aMaxRow) {
+      if (aMaxRow < 0) {
+        return -1;
+      }
+
+      do {
+        var newIdx = aIndex + (aReverse ? -1 : 1) * aAmount;
+        if (
+          (aReverse && aIndex == -1) ||
+          (newIdx > aMaxRow && aIndex != aMaxRow)
+        ) {
+          newIdx = aMaxRow;
+        } else if ((!aReverse && aIndex == -1) || (newIdx < 0 && aIndex != 0)) {
+          newIdx = 0;
+        }
+
+        if (
+          (newIdx < 0 && aIndex == 0) ||
+          (newIdx > aMaxRow && aIndex == aMaxRow)
+        ) {
+          aIndex = -1;
+        } else {
+          aIndex = newIdx;
+        }
+
+        if (aIndex == -1) {
+          return -1;
+        }
+      } while (
+        !this.richlistbox.canUserSelect(this.richlistbox.getItemAtIndex(aIndex))
+      );
+
+      return aIndex;
+    }
+
+    onPopupClick(aEvent) {
+      this.input.controller.handleEnter(true, aEvent);
+    }
+
+    onSearchBegin() {
+      this.mousedOverIndex = -1;
+
+      if (typeof this._onSearchBegin == "function") {
+        this._onSearchBegin();
+      }
+    }
+
+    openAutocompletePopup(aInput, aElement) {
+      this._openAutocompletePopup(aInput, aElement);
+    }
+
+    _openAutocompletePopup(aInput, aElement) {
+      if (!this._richlistbox) {
+        this.initialize();
+      }
+
+      if (!this.mPopupOpen) {
+        aInput.popup.hidden = false;
+
+        this.mInput = aInput;
+        this.selectedIndex = -1;
+
+        this._invalidate();
+
+        this.openPopup(aElement, "after_start", 0, 0, false, false);
+      }
+    }
+
+    invalidate(reason) {
+      if (!this.mPopupOpen) {
+        return;
+      }
+
+      this._invalidate(reason);
+    }
+
+    _invalidate() {
+      this.richlistbox.collapsed = this.matchCount == 0;
+
+      if (this._adjustHeightRAFToken) {
+        cancelAnimationFrame(this._adjustHeightRAFToken);
+        this._adjustHeightRAFToken = null;
+      }
+
+      if (this.mPopupOpen) {
+        this._adjustHeightOnPopupShown = false;
+        this._adjustHeightRAFToken = requestAnimationFrame(() =>
+          this.adjustHeight()
+        );
+      } else {
+        this._adjustHeightOnPopupShown = true;
+      }
+
+      this._currentIndex = 0;
+      if (this._appendResultTimeout) {
+        clearTimeout(this._appendResultTimeout);
+      }
+
+      if (
+        !this.richlistbox.classList.contains("autocomplete-row-item-container")
+      ) {
+        this.richlistbox.replaceChildren();
+      }
+
+      this.richlistbox.classList.add("autocomplete-row-item-container");
+      this._appendAutocompleteResults();
+    }
+
+    _collapseUnusedItems() {
+      let existingItemsCount = this.richlistbox.children.length;
+      for (let i = this.matchCount; i < existingItemsCount; ++i) {
+        this.richlistbox.children[i].collapsed = true;
+      }
+    }
+
+    adjustHeight() {
+      let rows = this.richlistbox.children;
+      let numRows = Math.min(this.matchCount, this.maxRows, rows.length);
+
+      let height = 0;
+      if (numRows) {
+        let firstRowRect = rows[0].getBoundingClientRect();
+        if (this._rlbPadding == undefined) {
+          let style = window.getComputedStyle(this.richlistbox);
+          let paddingTop = parseFloat(style.paddingTop) || 0;
+          let paddingBottom = parseFloat(style.paddingBottom) || 0;
+          this._rlbPadding = paddingTop + paddingBottom;
+        }
+
+        let lastRowMarginBottom = 0;
+        let firstRowMarginTop = 0;
+        for (let i = 0; i < numRows; i++) {
+          let child = rows[i];
+          if (child.classList.contains("forceHandleUnderflow")) {
+            child.handleOverUnderflow();
+          }
+
+          const styles = getComputedStyle(child);
+
+          if (i == 0) {
+            firstRowMarginTop = parseFloat(styles.marginTop);
+          }
+
+          if (i == numRows - 1) {
+            lastRowMarginBottom = parseFloat(styles.marginBottom);
+          }
+        }
+
+        let lastRowRect = rows[numRows - 1].getBoundingClientRect();
+        height =
+          lastRowRect.bottom -
+          firstRowRect.top +
+          this._rlbPadding +
+          firstRowMarginTop +
+          lastRowMarginBottom;
+      }
+
+      this._collapseUnusedItems();
+
+      this.richlistbox.style.maxHeight = Math.ceil(height) + "px";
+    }
+
+    _createAutocompleteRowItem() {
+      const item = document.createXULElement("richlistitem");
+      item.className = "autocomplete-row-item";
+      item.selectedByMouseOver = true;
+      item.appendChild(document.createElement("autocomplete-row-item"));
+      return item;
+    }
+
+    async _localizeRowLabel(row, { id, args }) {
+      MozXULElement.insertFTLIfNeeded("toolkit/main-window/autocomplete.ftl");
+      const value = await document.l10n.formatValue(id, args);
+      const parsed = new DOMParser().parseFromString(value, "text/html");
+      const line1 = parsed.querySelector('[data-l10n-name="line1"]');
+      const line2 = parsed.querySelector('[data-l10n-name="line2"]');
+      row.label = (line1 ?? parsed.body).textContent;
+      row.description = line2?.textContent ?? null;
+    }
+
+    _appendAutocompleteResults() {
+      const controller = this.mInput.controller;
+      const matchCount = this.matchCount;
+
+      for (let i = 0; i < this.maxRows; i++) {
+        if (this._currentIndex >= matchCount) {
+          break;
+        }
+
+        let style = controller.getStyleAt(this._currentIndex);
+        let value =
+          style && style.includes("autofill")
+            ? controller.getFinalCompleteValueAt(this._currentIndex)
+            : controller.getValueAt(this._currentIndex);
+        let label = controller.getLabelAt(this._currentIndex);
+        let comment = controller.getCommentAt(this._currentIndex);
+        let image = controller.getImageAt(this._currentIndex);
+
+        let parsedComment = null;
+        try {
+          parsedComment = comment?.length ? JSON.parse(comment) : null;
+        } catch {}
+
+        if (!this.richlistbox.children[this._currentIndex]) {
+          this.richlistbox.appendChild(this._createAutocompleteRowItem());
+        }
+
+        const item = this.richlistbox.children[this._currentIndex];
+        const row = item.querySelector("autocomplete-row-item");
+
+        if (row) {
+          if (parsedComment?.l10n) {
+            this._localizeRowLabel(row, parsedComment.l10n);
+          } else {
+            row.label = label;
+            row.description = parsedComment?.secondary ?? null;
+          }
+          row.icon = parsedComment?.icon ?? image;
+          row.value = value;
+          const secondaryAction = parsedComment?.secondaryAction;
+          row.actions = {
+            primary: () => {},
+            secondary: secondaryAction
+              ? {
+                  type: secondaryAction.type,
+                  action: () =>
+                    lazy.AutoCompleteParent.getCurrentActor()?.selectAutoCompleteEntry(
+                      true
+                    ),
+                }
+              : null,
+          };
+        }
+
+        item.setAttribute("dir", this.style.direction);
+        item.setAttribute("originaltype", style);
+        item.toggleAttribute(
+          "footer",
+          ["action", "loginsFooter"].includes(style)
+        );
+
+        if (parsedComment?.ariaLabel) {
+          item.setAttribute("aria-label", parsedComment.ariaLabel);
+        } else {
+          item.removeAttribute("aria-label");
+        }
+
+        if (parsedComment?.type) {
+          item.setAttribute("type", parsedComment.type);
+        } else {
+          item.removeAttribute("type");
+        }
+        item.collapsed = false;
+
+        this._currentIndex++;
+      }
+
+      if (this._currentIndex < matchCount) {
+        this._appendResultTimeout = setTimeout(
+          () => this._appendAutocompleteResults(),
+          0
+        );
+      }
+    }
+
+    selectBy(aReverse, aPage) {
+      try {
+        var amount = aPage ? 5 : 1;
+
+        this.selectedIndex = this.getNextIndex(
+          aReverse,
+          amount,
+          this.selectedIndex,
+          this.matchCount - 1
+        );
+        if (this.selectedIndex == -1) {
+          this.input._focus();
+        }
+      } catch (ex) {
+      }
+    }
+
+    disconnectedCallback() {
+      if (this.listEvents) {
+        this.richlistbox.removeEventListener("mousedown", this.listEvents);
+        this.richlistbox.removeEventListener("mouseup", this.listEvents);
+        this.richlistbox.removeEventListener("mousemove", this.listEvents);
+        delete this.listEvents;
+      }
+    }
+
+    setListeners() {
+      this.addEventListener("popupshowing", () => {
+
+        if (this._normalMaxRows < 0 && this.mInput) {
+          this._normalMaxRows = this.mInput.maxRows;
+        }
+
+        this.mPopupOpen = true;
+      });
+
+      this.addEventListener("popupshown", () => {
+        if (this._adjustHeightOnPopupShown) {
+          this._adjustHeightOnPopupShown = false;
+          this.adjustHeight();
+        }
+      });
+
+      this.addEventListener("popuphiding", () => {
+        var isListActive = true;
+        if (this.selectedIndex == -1) {
+          isListActive = false;
+        }
+        this.input.controller.stopSearch();
+
+        this.mPopupOpen = false;
+
+
+        if (this.mInput && this._normalMaxRows > 0) {
+          this.mInput.maxRows = this._normalMaxRows;
+        }
+        this._normalMaxRows = -1;
+
+        if (isListActive && this.mInput) {
+          this.mInput.mIgnoreFocus = true;
+          this.mInput._focus();
+          this.mInput.mIgnoreFocus = false;
+        }
+      });
+    }
+  };
+
+  MozPopupElement.implementCustomInterface(
+    MozElements.MozAutocompleteRichlistboxPopup,
+    [Ci.nsIAutoCompletePopup]
+  );
+
+  customElements.define(
+    "autocomplete-richlistbox-popup",
+    MozElements.MozAutocompleteRichlistboxPopup,
+    {
+      extends: "panel",
+    }
+  );
+}

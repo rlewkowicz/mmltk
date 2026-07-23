@@ -1,0 +1,96 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_image_SVGDocumentWrapper_h
+#define mozilla_image_SVGDocumentWrapper_h
+
+#include "nsCOMPtr.h"
+#include "nsIDocumentViewer.h"
+#include "nsIObserver.h"
+#include "nsIStreamListener.h"
+#include "nsSize.h"
+#include "nsWeakReference.h"
+
+class nsIRequest;
+class nsILoadGroup;
+class nsIFrame;
+
+namespace mozilla {
+class PresShell;
+namespace dom {
+class SVGSVGElement;
+class SVGDocument;
+}  
+
+namespace image {
+class AutoRestoreSVGState;
+
+class SVGDocumentWrapper final : public nsIStreamListener,
+                                 public nsIObserver,
+                                 public nsSupportsWeakReference {
+ public:
+  SVGDocumentWrapper();
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSIOBSERVER
+
+  enum Dimension { eWidth, eHeight };
+
+  mozilla::dom::SVGDocument* GetDocument() const;
+
+  mozilla::dom::SVGSVGElement* GetSVGRootElement() const;
+
+  nsIFrame* GetRootLayoutFrame() const;
+
+  mozilla::PresShell* GetPresShell() const { return mViewer->GetPresShell(); }
+
+  void UpdateViewportBounds(const nsIntSize& aViewportSize);
+
+  void FlushImageTransformInvalidation();
+
+  bool IsAnimated() const;
+
+  bool ShouldIgnoreInvalidation() const { return mIgnoreInvalidation; }
+
+  bool IsDrawing() const { return mIsDrawing; }
+
+  void StartAnimation();
+  void StopAnimation();
+  void ResetAnimation();
+  float GetCurrentTimeAsFloat() const;
+  void SetCurrentTime(float aTime);
+  void TickRefreshDriver();
+
+  void FlushLayout();
+
+ private:
+  friend class AutoRestoreSVGState;
+
+  ~SVGDocumentWrapper();
+
+  nsresult SetupViewer(nsIRequest* aRequest, nsIDocumentViewer** aViewer,
+                       nsILoadGroup** aLoadGroup);
+  void DestroyViewer();
+  void RegisterForXPCOMShutdown();
+  void UnregisterForXPCOMShutdown();
+
+  nsCOMPtr<nsIDocumentViewer> mViewer;
+  nsCOMPtr<nsILoadGroup> mLoadGroup;
+  nsCOMPtr<nsIStreamListener> mListener;
+  bool mIgnoreInvalidation;
+  bool mRegisteredForXPCOMShutdown;
+  bool mIsDrawing;
+};
+
+}  
+}  
+
+inline nsISupports* ToSupports(mozilla::image::SVGDocumentWrapper* p) {
+  return NS_ISUPPORTS_CAST(nsSupportsWeakReference*, p);
+}
+
+#endif  // mozilla_image_SVGDocumentWrapper_h

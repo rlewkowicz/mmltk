@@ -1,0 +1,183 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_NativeLayer_h
+#define mozilla_layers_NativeLayer_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/Range.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/gfx/Types.h"
+#include "mozilla/layers/ScreenshotGrabber.h"
+
+#include "GLTypes.h"
+#include "nsISupportsImpl.h"
+#include "nsRegion.h"
+
+namespace mozilla {
+
+namespace gl {
+class GLContext;
+class MozFramebuffer;
+}  
+
+namespace wr {
+class RenderTextureHost;
+}
+
+namespace layers {
+
+class GpuFence;
+class NativeLayer;
+class NativeLayerWayland;
+class NativeLayerRootWayland;
+class NativeLayerRootSnapshotter;
+class NativeLayerWayland;
+class SurfacePoolHandle;
+
+class NativeLayerRoot {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(NativeLayerRoot)
+
+  virtual NativeLayerRootWayland* AsNativeLayerRootWayland() { return nullptr; }
+
+  virtual already_AddRefed<NativeLayer> CreateLayer(
+      const gfx::IntSize& aSize, bool aIsOpaque,
+      SurfacePoolHandle* aSurfacePoolHandle) = 0;
+  virtual already_AddRefed<NativeLayer> CreateLayerForExternalTexture(
+      bool aIsOpaque) = 0;
+  virtual already_AddRefed<NativeLayer> CreateLayerForColor(
+      gfx::DeviceColor aColor) {
+    return nullptr;
+  }
+
+  virtual void LayerDestroyed(NativeLayer* aLayer) {}
+
+  virtual void AppendLayer(NativeLayer* aLayer) = 0;
+  virtual void RemoveLayer(NativeLayer* aLayer) = 0;
+  virtual void SetLayers(const nsTArray<RefPtr<NativeLayer>>& aLayers) = 0;
+
+  virtual void PrepareForCommit() {}
+
+  virtual bool CommitToScreen() = 0;
+
+  virtual void WaitUntilCommitToScreenHasBeenProcessed() {}
+
+  virtual UniquePtr<NativeLayerRootSnapshotter> CreateSnapshotter() {
+    return nullptr;
+  }
+
+ protected:
+  virtual ~NativeLayerRoot() = default;
+};
+
+class NativeLayerRootSnapshotter : public frame_capture::Window {
+ public:
+  virtual ~NativeLayerRootSnapshotter() = default;
+
+  virtual bool ReadbackPixels(const gfx::IntSize& aReadbackSize,
+                              gfx::SurfaceFormat aReadbackFormat,
+                              const Range<uint8_t>& aReadbackBuffer) = 0;
+};
+
+class NativeLayer {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(NativeLayer)
+
+  virtual NativeLayerWayland* AsNativeLayerWayland() { return nullptr; }
+
+  virtual gfx::IntSize GetSize() = 0;
+  virtual bool IsOpaque() = 0;
+
+  virtual void SetPosition(const gfx::IntPoint& aPosition) = 0;
+  virtual gfx::IntPoint GetPosition() = 0;
+
+  virtual void SetTransform(const gfx::Matrix4x4& aTransform) = 0;
+  virtual gfx::Matrix4x4 GetTransform() = 0;
+
+  virtual gfx::IntRect GetRect() = 0;
+
+  virtual void SetClipRect(const Maybe<gfx::IntRect>& aClipRect) = 0;
+  virtual Maybe<gfx::IntRect> ClipRect() = 0;
+
+  virtual void SetRoundedClipRect(const Maybe<gfx::RoundedRect>& aClip) = 0;
+  virtual Maybe<gfx::RoundedRect> RoundedClipRect() = 0;
+
+  virtual gfx::IntRect CurrentSurfaceDisplayRect() = 0;
+
+  virtual void SetSurfaceIsFlipped(bool aIsFlipped) = 0;
+  virtual bool SurfaceIsFlipped() = 0;
+
+  virtual void SetSamplingFilter(gfx::SamplingFilter aSamplingFilter) = 0;
+  virtual gfx::SamplingFilter SamplingFilter() {
+    return gfx::SamplingFilter::POINT;
+  };
+
+  virtual RefPtr<gfx::DrawTarget> NextSurfaceAsDrawTarget(
+      const gfx::IntRect& aDisplayRect, const gfx::IntRegion& aUpdateRegion,
+      gfx::BackendType aBackendType) = 0;
+
+  virtual Maybe<GLuint> NextSurfaceAsFramebuffer(
+      const gfx::IntRect& aDisplayRect, const gfx::IntRegion& aUpdateRegion,
+      bool aNeedsDepth) = 0;
+
+  virtual void NotifySurfaceReady() = 0;
+
+  virtual void DiscardBackbuffers() = 0;
+
+  virtual void AttachExternalImage(wr::RenderTextureHost* aExternalImage) = 0;
+
+  virtual GpuFence* GetGpuFence() = 0;
+
+ protected:
+  virtual ~NativeLayer() = default;
+};
+
+
+class RenderSourceNLRS : public frame_capture::RenderSource {
+ public:
+  explicit RenderSourceNLRS(UniquePtr<gl::MozFramebuffer>&& aFramebuffer);
+  auto& FB() { return *mFramebuffer; }
+
+ protected:
+  UniquePtr<gl::MozFramebuffer> mFramebuffer;
+};
+
+class DownscaleTargetNLRS : public frame_capture::DownscaleTarget {
+ public:
+  DownscaleTargetNLRS(gl::GLContext* aGL,
+                      UniquePtr<gl::MozFramebuffer>&& aFramebuffer);
+  already_AddRefed<frame_capture::RenderSource> AsRenderSource()
+      override {
+    return do_AddRef(mRenderSource);
+  };
+  bool DownscaleFrom(frame_capture::RenderSource* aSource,
+                     const gfx::IntRect& aSourceRect,
+                     const gfx::IntRect& aDestRect) override;
+
+ protected:
+  RefPtr<gl::GLContext> mGL;
+  RefPtr<RenderSourceNLRS> mRenderSource;
+};
+
+class AsyncReadbackBufferNLRS
+    : public frame_capture::AsyncReadbackBuffer {
+ public:
+  AsyncReadbackBufferNLRS(gl::GLContext* aGL, const gfx::IntSize& aSize,
+                          GLuint aBufferHandle, bool aYFlip);
+  void CopyFrom(frame_capture::RenderSource* aSource) override;
+  bool MapAndCopyInto(gfx::DataSourceSurface* aSurface,
+                      const gfx::IntSize& aReadSize) override;
+
+ protected:
+  virtual ~AsyncReadbackBufferNLRS();
+  RefPtr<gl::GLContext> mGL;
+  GLuint mBufferHandle = 0;
+  bool mYFlip;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_NativeLayer_h

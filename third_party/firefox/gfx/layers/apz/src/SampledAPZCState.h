@@ -1,0 +1,60 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_SampledAPZCState_h
+#define mozilla_layers_SampledAPZCState_h
+
+#include "FrameMetrics.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/ScrollGeneration.h"
+#include "mozilla/layers/CompositorScrollUpdate.h"
+
+namespace mozilla {
+namespace layers {
+
+class SampledAPZCState {
+ public:
+  SampledAPZCState();
+  explicit SampledAPZCState(const FrameMetrics& aMetrics);
+  SampledAPZCState(const FrameMetrics& aMetrics,
+                   Maybe<CompositionPayload>&& aPayload,
+                   APZScrollGeneration aGeneration,
+                   std::vector<CompositorScrollUpdate>&& aUpdates);
+
+  bool operator==(const SampledAPZCState& aOther) const;
+  bool operator!=(const SampledAPZCState& aOther) const;
+
+  CSSRect GetLayoutViewport() const { return mLayoutViewport; }
+  CSSPoint GetVisualScrollOffset() const { return mVisualScrollOffset; }
+  CSSToParentLayerScale GetZoom() const { return mZoom; }
+  Maybe<CompositionPayload> TakeScrollPayload();
+  const APZScrollGeneration& Generation() const { return mGeneration; }
+  const std::vector<CompositorScrollUpdate> Updates() const { return mUpdates; }
+
+  void UpdateScrollProperties(const FrameMetrics& aMetrics);
+  void UpdateScrollPropertiesWithRelativeDelta(const FrameMetrics& aMetrics,
+                                               const CSSPoint& aRelativeDelta);
+
+  void UpdateZoomProperties(const FrameMetrics& aMetrics);
+
+  void ClampVisualScrollOffset(const FrameMetrics& aMetrics);
+
+  void ZoomBy(float aScale);
+
+ private:
+  CSSRect mLayoutViewport;
+  CSSPoint mVisualScrollOffset;
+  CSSToParentLayerScale mZoom;
+  Maybe<CompositionPayload> mScrollPayload;
+  APZScrollGeneration mGeneration;
+  std::vector<CompositorScrollUpdate> mUpdates;
+
+  void RemoveFractionalAsyncDelta();
+  void KeepLayoutViewportEnclosingVisualViewport(const FrameMetrics& aMetrics);
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_SampledAPZCState_h

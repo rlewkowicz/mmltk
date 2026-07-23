@@ -1,0 +1,318 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef TIME_UNITS_H
+#define TIME_UNITS_H
+
+#include <limits>
+#include <type_traits>
+
+#include "Intervals.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/FloatingPoint.h"
+#include "mozilla/IntegerPrintfMacros.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/TimeStamp.h"
+#include "nsPrintfCString.h"
+
+namespace mozilla::media {
+class TimeIntervals;
+}  
+template <>
+struct nsTArray_RelocationStrategy<mozilla::media::TimeIntervals> {
+  using Type =
+      nsTArray_RelocateUsingMoveConstructor<mozilla::media::TimeIntervals>;
+};
+
+namespace mozilla {
+
+static const int64_t MSECS_PER_S = 1000;
+
+static const int64_t USECS_PER_S = 1000000;
+
+static const int64_t NSECS_PER_S = 1000000000;
+
+namespace media {
+
+#ifndef PROCESS_DECODE_LOG
+#  define PROCESS_DECODE_LOG(sample)                                           \
+    MOZ_LOG_FMT(sPDMLog, mozilla::LogLevel::Verbose,                           \
+                "ProcessDecode: mDuration={}µs ; mTime={}µs ; mTimecode={}µs", \
+                (sample)->mDuration.ToMicroseconds(),                          \
+                (sample)->mTime.ToMicroseconds(),                              \
+                (sample)->mTimecode.ToMicroseconds())
+#endif  // PROCESS_DECODE_LOG
+
+class TimeUnit final {
+ public:
+  constexpr TimeUnit(CheckedInt64 aTicks, int64_t aBase)
+      : mTicks(aTicks), mBase(aBase) {
+    MOZ_RELEASE_ASSERT(mBase > 0);
+    MOZ_DIAGNOSTIC_ASSERT(mBase <= UINT32_MAX);
+  }
+
+  explicit constexpr TimeUnit(CheckedInt64 aTicks)
+      : mTicks(aTicks), mBase(USECS_PER_S) {}
+
+  static constexpr int64_t MaxTicks() {
+    return std::numeric_limits<int64_t>::max() - 1;
+  }
+
+  static TimeUnit FromSeconds(double aValue, int64_t aBase = USECS_PER_S);
+  static TimeUnit FromSecondsWithBaseOf(double aSeconds,
+                                        const TimeUnit& aOtherForBase) {
+    return FromSeconds(aSeconds, aOtherForBase.mBase);
+  }
+
+  static constexpr TimeUnit FromMicroseconds(int64_t aValue) {
+    return TimeUnit(aValue, USECS_PER_S);
+  }
+  static TimeUnit FromHns(int64_t aValue, int64_t aBase) {
+    return TimeUnit::FromNanoseconds(aValue * 100).ToBase<RoundPolicy>(aBase);
+  }
+  static constexpr TimeUnit FromNanoseconds(int64_t aValue) {
+    return TimeUnit(aValue, NSECS_PER_S);
+  }
+  static TimeUnit FromInfinity();
+  static TimeUnit FromNegativeInfinity();
+  static TimeUnit FromTimeDuration(const TimeDuration& aDuration);
+  static constexpr TimeUnit Zero(int64_t aBase = USECS_PER_S) {
+    return TimeUnit(0, aBase);
+  }
+  static constexpr TimeUnit Zero(const TimeUnit& aOther) {
+    return TimeUnit(0, aOther.mBase);
+  }
+  static TimeUnit Invalid();
+  int64_t ToMilliseconds() const;
+  int64_t ToMicroseconds() const;
+  int64_t ToNanoseconds() const;
+  int64_t ToTicksAtRate(int64_t aRate) const;
+  bool IsBase(int64_t aBase) const;
+  double ToSeconds() const;
+  nsCString ToString() const;
+  TimeDuration ToTimeDuration() const;
+  bool IsInfinite() const;
+  bool IsPositive() const;
+  bool IsPositiveOrZero() const;
+  bool IsZero() const;
+  bool IsNegative() const;
+
+  bool EqualsAtLowestResolution(const TimeUnit& aOther) const;
+  bool operator==(const TimeUnit& aOther) const;
+  bool operator!=(const TimeUnit& aOther) const;
+  bool operator>=(const TimeUnit& aOther) const;
+  bool operator>(const TimeUnit& aOther) const;
+  bool operator<=(const TimeUnit& aOther) const;
+  bool operator<(const TimeUnit& aOther) const;
+  TimeUnit operator%(const TimeUnit& aOther) const;
+  TimeUnit operator+(const TimeUnit& aOther) const;
+  TimeUnit operator-(const TimeUnit& aOther) const;
+  TimeUnit& operator+=(const TimeUnit& aOther);
+  TimeUnit& operator-=(const TimeUnit& aOther);
+  template <typename T>
+  TimeUnit operator*(T aVal) const {
+    static_assert(std::is_integral_v<T>, "Must be an integral type");
+    return TimeUnit(mTicks * aVal, mBase);
+  }
+  TimeUnit MultDouble(double aVal) const;
+  friend TimeUnit operator/(const TimeUnit& aUnit, int64_t aVal) {
+    MOZ_DIAGNOSTIC_ASSERT(0 <= aVal && aVal <= UINT32_MAX);
+    return TimeUnit(aUnit.mTicks / aVal, aUnit.mBase);
+  }
+  friend TimeUnit operator%(const TimeUnit& aUnit, int64_t aVal) {
+    MOZ_DIAGNOSTIC_ASSERT(0 <= aVal && aVal <= UINT32_MAX);
+    return TimeUnit(aUnit.mTicks % aVal, aUnit.mBase);
+  }
+
+  struct TruncatePolicy {
+    template <typename T>
+    static T policy(T& aValue) {
+      return static_cast<T>(aValue);
+    }
+  };
+
+  struct FloorPolicy {
+    template <typename T>
+    static T policy(T& aValue) {
+      return std::floor(aValue);
+    }
+  };
+
+  struct RoundPolicy {
+    template <typename T>
+    static T policy(T& aValue) {
+      return std::round(aValue);
+    }
+  };
+
+  struct CeilingPolicy {
+    template <typename T>
+    static T policy(T& aValue) {
+      return std::ceil(aValue);
+    }
+  };
+
+  template <class RoundingPolicy = TruncatePolicy>
+  TimeUnit ToBase(int64_t aTargetBase) const {
+    double dummy = 0.0;
+    return ToBase<RoundingPolicy>(aTargetBase, dummy);
+  }
+
+  template <class RoundingPolicy = TruncatePolicy>
+  TimeUnit ToBase(const TimeUnit& aTimeUnit) const {
+    double dummy = 0.0;
+    return ToBase<RoundingPolicy>(aTimeUnit, dummy);
+  }
+
+  template <class RoundingPolicy = TruncatePolicy>
+  TimeUnit ToBase(const TimeUnit& aTimeUnit, double& aOutError) const {
+    int64_t targetBase = aTimeUnit.mBase;
+    return ToBase<RoundingPolicy>(targetBase, aOutError);
+  }
+
+  template <class RoundingPolicy = TruncatePolicy>
+  TimeUnit ToBase(int64_t aTargetBase, double& aOutError) const {
+    aOutError = 0.0;
+    if (mTicks.value() == INT64_MAX || mTicks.value() == INT64_MIN) {
+      return TimeUnit(mTicks, aTargetBase);
+    }
+    CheckedInt<int64_t> ticks = mTicks * aTargetBase;
+    if (ticks.isValid()) {
+      imaxdiv_t rv = imaxdiv(ticks.value(), mBase);
+      if (!rv.rem) {
+        return TimeUnit(rv.quot, aTargetBase);
+      }
+    }
+    double approx = static_cast<double>(mTicks.value()) *
+                    static_cast<double>(aTargetBase) /
+                    static_cast<double>(mBase);
+    if (approx < static_cast<double>(INT64_MIN) ||
+        approx > static_cast<double>(INT64_MAX)) {
+      aOutError = 1.0;
+      return TimeUnit::Invalid();
+    }
+    double rounded = RoundingPolicy::policy(approx);
+    double integer;
+    aOutError = modf(approx, &integer);
+    return TimeUnit(mozilla::AssertedCast<int64_t>(rounded), aTargetBase);
+  }
+
+  bool IsValid() const;
+
+  constexpr TimeUnit() = default;
+
+  TimeUnit(const TimeUnit&) = default;
+
+  TimeUnit& operator=(const TimeUnit&) = default;
+
+  bool IsPosInf() const;
+  bool IsNegInf() const;
+
+  friend IPC::ParamTraits<mozilla::media::TimeUnit>;
+
+#ifndef VISIBLE_TIMEUNIT_INTERNALS
+ private:
+#endif
+  int64_t ToCommonUnit(int64_t aRatio) const;
+  TimeUnit Reduced() const;
+
+  CheckedInt64 mTicks{0};
+  int64_t mBase{USECS_PER_S};
+};
+
+using NullableTimeUnit = Maybe<TimeUnit>;
+
+using TimeInterval = Interval<TimeUnit>;
+
+class TimeIntervals : public IntervalSet<TimeUnit> {
+ public:
+  using BaseType = IntervalSet<TimeUnit>;
+  using InnerType = TimeUnit;
+
+
+  MOZ_IMPLICIT TimeIntervals(const BaseType& aOther) : BaseType(aOther) {}
+  MOZ_IMPLICIT TimeIntervals(BaseType&& aOther) : BaseType(std::move(aOther)) {}
+  explicit TimeIntervals(const BaseType::ElemType& aOther) : BaseType(aOther) {}
+  explicit TimeIntervals(BaseType::ElemType&& aOther)
+      : BaseType(std::move(aOther)) {}
+
+  static TimeIntervals Invalid() {
+    return TimeIntervals(TimeInterval(TimeUnit::FromNegativeInfinity(),
+                                      TimeUnit::FromNegativeInfinity()));
+  }
+  bool IsInvalid() const {
+    return Length() == 1 && Start(0).IsNegInf() && End(0).IsNegInf();
+  }
+
+  TimeIntervals ToBase(const TimeUnit& aBase) const {
+    TimeIntervals output;
+    for (const auto& interval : mIntervals) {
+      TimeInterval convertedInterval{interval.mStart.ToBase(aBase),
+                                     interval.mEnd.ToBase(aBase),
+                                     interval.mFuzz.ToBase(aBase)};
+      output += convertedInterval;
+    }
+    return output;
+  }
+
+  TimeIntervals ToMicrosecondResolution() const {
+    TimeIntervals output;
+
+    for (const auto& interval : mIntervals) {
+      TimeInterval reducedPrecision{interval.mStart.ToBase(USECS_PER_S),
+                                    interval.mEnd.ToBase(USECS_PER_S),
+                                    interval.mFuzz.ToBase(USECS_PER_S)};
+      output += reducedPrecision;
+    }
+    return output;
+  }
+
+  nsCString ToString() const {
+    nsCString dump;
+    for (const auto& interval : mIntervals) {
+      dump += nsPrintfCString("[%s],", interval.ToString().get());
+    }
+    return dump;
+  }
+
+  TimeIntervals() = default;
+};
+
+using TimeRange = Interval<double>;
+
+class TimeRanges : public IntervalSet<double> {
+ public:
+  using BaseType = IntervalSet<double>;
+  using InnerType = double;
+  using nld = std::numeric_limits<double>;
+
+
+  MOZ_IMPLICIT TimeRanges(const BaseType& aOther) : BaseType(aOther) {}
+  MOZ_IMPLICIT TimeRanges(BaseType&& aOther) : BaseType(std::move(aOther)) {}
+  explicit TimeRanges(const BaseType::ElemType& aOther) : BaseType(aOther) {}
+  explicit TimeRanges(BaseType::ElemType&& aOther)
+      : BaseType(std::move(aOther)) {}
+
+  static TimeRanges Invalid() {
+    return TimeRanges(TimeRange(-nld::infinity(), nld::infinity()));
+  }
+  bool IsInvalid() const {
+    return Length() == 1 && Start(0) == -nld::infinity() &&
+           End(0) == nld::infinity();
+  }
+  explicit TimeRanges(const TimeIntervals& aIntervals) {
+    for (const auto& interval : aIntervals) {
+      Add(TimeRange(interval.mStart.ToSeconds(), interval.mEnd.ToSeconds()));
+    }
+  }
+
+  TimeRanges ToMicrosecondResolution() const;
+
+  TimeRanges() = default;
+};
+
+}  
+}  
+
+#endif  // TIME_UNITS_H

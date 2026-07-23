@@ -1,0 +1,192 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_RematerializedFrame_h
+#define jit_RematerializedFrame_h
+
+#include "mozilla/Assertions.h"
+
+#include <algorithm>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "jstypes.h"
+
+#include "jit/JitFrames.h"
+#include "jit/ScriptFromCalleeToken.h"
+#include "js/GCVector.h"
+#include "js/TypeDecls.h"
+#include "js/UniquePtr.h"
+#include "js/Value.h"
+#include "vm/JSFunction.h"
+#include "vm/JSScript.h"
+#include "vm/Stack.h"
+
+class JS_PUBLIC_API JSTracer;
+
+namespace js {
+
+class ArgumentsObject;
+class CallObject;
+
+namespace jit {
+
+class InlineFrameIterator;
+struct MaybeReadFallback;
+
+class RematerializedFrame {
+  bool prevUpToDate_;
+
+  bool isDebuggee_;
+
+  bool hasInitialEnv_;
+
+  bool isConstructing_;
+
+  bool hasCachedSavedFrame_;
+
+  uint8_t* top_;
+
+  jsbytecode* pc_;
+
+  size_t frameNo_;
+  unsigned numActualArgs_;
+
+  JSScript* script_;
+  JSObject* envChain_;
+  JSFunction* callee_;
+  ArgumentsObject* argsObj_;
+
+  Value returnValue_;
+  Value thisArgument_;
+  Value slots_[1];
+
+  RematerializedFrame(JSContext* cx, uint8_t* top, unsigned numActualArgs,
+                      InlineFrameIterator& iter, MaybeReadFallback& fallback);
+
+ public:
+  static RematerializedFrame* New(JSContext* cx, uint8_t* top,
+                                  InlineFrameIterator& iter,
+                                  MaybeReadFallback& fallback);
+
+  using RematerializedFrameVector = GCVector<UniquePtr<RematerializedFrame>>;
+
+  [[nodiscard]] static bool RematerializeInlineFrames(
+      JSContext* cx, uint8_t* top, InlineFrameIterator& iter,
+      MaybeReadFallback& fallback, RematerializedFrameVector& frames);
+
+  bool prevUpToDate() const { return prevUpToDate_; }
+  void setPrevUpToDate() { prevUpToDate_ = true; }
+  void unsetPrevUpToDate() { prevUpToDate_ = false; }
+
+  bool isDebuggee() const { return isDebuggee_; }
+  void setIsDebuggee() { isDebuggee_ = true; }
+  inline void unsetIsDebuggee();
+
+  uint8_t* top() const { return top_; }
+  JSScript* outerScript() const {
+    JitFrameLayout* jsFrame = (JitFrameLayout*)top_;
+    return ScriptFromCalleeToken(jsFrame->calleeToken());
+  }
+  jsbytecode* pc() const { return pc_; }
+  size_t frameNo() const { return frameNo_; }
+  bool inlined() const { return frameNo_ > 0; }
+
+  JSObject* environmentChain() const { return envChain_; }
+
+  template <typename SpecificEnvironment>
+  void pushOnEnvironmentChain(SpecificEnvironment& env) {
+    MOZ_ASSERT(*environmentChain() == env.enclosingEnvironment());
+    envChain_ = &env;
+    if (IsFrameInitialEnvironment(this, env)) {
+      hasInitialEnv_ = true;
+    }
+  }
+
+  template <typename SpecificEnvironment>
+  void popOffEnvironmentChain() {
+    MOZ_ASSERT(envChain_->is<SpecificEnvironment>());
+    envChain_ = &envChain_->as<SpecificEnvironment>().enclosingEnvironment();
+  }
+
+  [[nodiscard]] bool initFunctionEnvironmentObjects(JSContext* cx);
+  [[nodiscard]] bool pushVarEnvironment(JSContext* cx, Handle<Scope*> scope);
+
+  bool hasInitialEnvironment() const { return hasInitialEnv_; }
+  CallObject& callObj() const;
+
+  bool hasArgsObj() const { return !!argsObj_; }
+  ArgumentsObject& argsObj() const {
+    MOZ_ASSERT(hasArgsObj());
+    MOZ_ASSERT(script()->needsArgsObj());
+    return *argsObj_;
+  }
+
+  bool isFunctionFrame() const { return script_->isFunction(); }
+  bool isGlobalFrame() const { return script_->isGlobalCode(); }
+  bool isModuleFrame() const { return script_->isModule(); }
+
+  JSScript* script() const { return script_; }
+  JSFunction* callee() const {
+    MOZ_ASSERT(isFunctionFrame());
+    MOZ_ASSERT(callee_);
+    return callee_;
+  }
+  Value calleev() const { return ObjectValue(*callee()); }
+  Value& thisArgument() { return thisArgument_; }
+
+  bool isConstructing() const { return isConstructing_; }
+
+  bool hasCachedSavedFrame() const { return hasCachedSavedFrame_; }
+
+  void setHasCachedSavedFrame() { hasCachedSavedFrame_ = true; }
+
+  void clearHasCachedSavedFrame() { hasCachedSavedFrame_ = false; }
+
+  unsigned numFormalArgs() const {
+    return isFunctionFrame() ? callee()->nargs() : 0;
+  }
+  unsigned numActualArgs() const { return numActualArgs_; }
+  unsigned numArgSlots() const {
+    return (std::max)(numFormalArgs(), numActualArgs());
+  }
+
+  Value* argv() { return slots_; }
+  Value* locals() { return slots_ + numArgSlots(); }
+
+  Value& unaliasedLocal(unsigned i) {
+    MOZ_ASSERT(i < script()->nfixed());
+    return locals()[i];
+  }
+  Value& unaliasedFormal(unsigned i,
+                         MaybeCheckAliasing checkAliasing = CHECK_ALIASING) {
+    MOZ_ASSERT(i < numFormalArgs());
+    MOZ_ASSERT_IF(checkAliasing, !script()->argsObjAliasesFormals() &&
+                                     !script()->formalIsAliased(i));
+    return argv()[i];
+  }
+  Value& unaliasedActual(unsigned i,
+                         MaybeCheckAliasing checkAliasing = CHECK_ALIASING) {
+    MOZ_ASSERT(i < numActualArgs());
+    MOZ_ASSERT_IF(checkAliasing, !script()->argsObjAliasesFormals());
+    MOZ_ASSERT_IF(checkAliasing && i < numFormalArgs(),
+                  !script()->formalIsAliased(i));
+    return argv()[i];
+  }
+
+  void setReturnValue(const Value& value) { returnValue_ = value; }
+
+  Value& returnValue() {
+    MOZ_ASSERT(!script()->noScriptRval());
+    return returnValue_;
+  }
+
+  void trace(JSTracer* trc);
+  void dump();
+};
+
+}  
+}  
+
+#endif  // jit_RematerializedFrame_h

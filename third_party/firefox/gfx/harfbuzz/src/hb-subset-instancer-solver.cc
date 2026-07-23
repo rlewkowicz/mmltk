@@ -1,0 +1,281 @@
+/*
+ * Copyright © 2023  Behdad Esfahbod
+ *
+ *  This is part of HarfBuzz, a text shaping library.
+ *
+ * Permission is hereby granted, without written agreement and without
+ * license or royalty fees, to use, copy, modify, and distribute this
+ * software and its documentation for any purpose, provided that the
+ * above copyright notice and the following two paragraphs appear in
+ * all copies of this software.
+ *
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE TO ANY PARTY FOR
+ * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES
+ * ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN
+ * IF THE COPYRIGHT HOLDER HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ *
+ * THE COPYRIGHT HOLDER SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING,
+ * BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+ * FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ * ON AN "AS IS" BASIS, AND THE COPYRIGHT HOLDER HAS NO OBLIGATION TO
+ * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ */
+
+#include "hb-subset-instancer-solver.hh"
+
+
+constexpr static double EPSILON = 1.0 / (1 << 14);
+constexpr static double MAX_F2DOT14 = double (0x7FFF) / (1 << 14);
+
+static inline Triple _reverse_negate(const Triple &v)
+{ return {-v.maximum, -v.middle, -v.minimum}; }
+
+
+static inline double supportScalar (double coord, const Triple &tent)
+{
+  double start = tent.minimum, peak = tent.middle, end = tent.maximum;
+
+  if (unlikely (start > peak || peak > end))
+    return 1.;
+  if (unlikely (start < 0 && end > 0 && peak != 0))
+    return 1.;
+
+  if (peak == 0 || coord == peak)
+    return 1.;
+
+  if (coord <= start || end <= coord)
+    return 0.;
+
+  if (coord < peak)
+    return (coord - start) / (peak - start);
+  else
+    return  (end - coord) / (end - peak);
+}
+
+static inline void
+_solve (Triple tent, Triple axisLimit, rebase_tent_result_t &out, bool negative = false)
+{
+  out.reset();
+  double axisMin = axisLimit.minimum;
+  double axisDef = axisLimit.middle;
+  double axisMax = axisLimit.maximum;
+  double lower = tent.minimum;
+  double peak  = tent.middle;
+  double upper = tent.maximum;
+
+  if (axisDef > peak)
+  {
+    _solve (_reverse_negate (tent), _reverse_negate (axisLimit), out, !negative);
+
+    for (auto &p : out)
+      p = hb_pair (p.first, _reverse_negate (p.second));
+
+    return;
+  }
+
+  if (axisMax <= lower && axisMax < peak)
+      return;  
+
+  if (axisMax < peak)
+  {
+    double mult = supportScalar (axisMax, tent);
+    tent = Triple{lower, axisMax, axisMax};
+
+    _solve (tent, axisLimit, out);
+
+    for (auto &p : out)
+      p = hb_pair (p.first * mult, p.second);
+
+    return;
+  }
+
+
+  double gain = supportScalar (axisDef, tent);
+  out.push(hb_pair (gain, Triple{}));
+
+
+  double outGain = supportScalar (axisMax, tent);
+
+  if (gain >= outGain)
+  {
+
+    double crossing = peak + (1 - gain) * (upper - peak);
+
+    Triple loc{hb_max (lower, axisDef), peak, crossing};
+    double scalar = 1.0;
+
+    out.push (hb_pair (scalar - gain, loc));
+
+    if (upper >= axisMax)
+    {
+      Triple loc {crossing, axisMax, axisMax};
+      double scalar = outGain;
+
+      out.push (hb_pair (scalar - gain, loc));
+    }
+
+    else
+    {
+      if (upper == axisDef)
+	upper += EPSILON;
+
+      Triple loc1 {crossing, upper, axisMax};
+      double scalar1 = 0.0;
+
+      Triple loc2 {upper, axisMax, axisMax};
+      double scalar2 = 0.0;
+
+      out.push (hb_pair (scalar1 - gain, loc1));
+      out.push (hb_pair (scalar2 - gain, loc2));
+    }
+  }
+
+  else
+  {
+    if (axisMax == peak)
+	upper = peak;
+
+    double newUpper = peak + (1 - gain) * (upper - peak);
+    assert (axisMax <= newUpper);  
+
+    if (false && (newUpper <= axisDef + (axisMax - axisDef) * 2))
+    {
+      upper = newUpper;
+      if (!negative && axisDef + (axisMax - axisDef) * MAX_F2DOT14 < upper)
+      {
+	upper = axisDef + (axisMax - axisDef) * MAX_F2DOT14;
+	assert (peak < upper);
+      }
+
+      Triple loc {hb_max (axisDef, lower), peak, upper};
+      double scalar = 1.0;
+
+      out.push (hb_pair (scalar - gain, loc));
+    }
+
+    else
+    {
+      Triple loc1 {hb_max (axisDef, lower), peak, axisMax};
+      double scalar1 = 1.0;
+
+      Triple loc2 {peak, axisMax, axisMax};
+      double scalar2 = outGain;
+
+      out.push (hb_pair (scalar1 - gain, loc1));
+      if (peak < axisMax)
+	out.push (hb_pair (scalar2 - gain, loc2));
+    }
+  }
+
+  if (lower <= axisMin)
+  {
+    Triple loc {axisMin, axisMin, axisDef};
+    double scalar = supportScalar (axisMin, tent);
+
+    out.push (hb_pair (scalar - gain, loc));
+  }
+
+  else
+  {
+    if (lower == axisDef)
+      lower -= EPSILON;
+
+    Triple loc1 {axisMin, lower, axisDef};
+    double scalar1 = 0.0;
+
+    Triple loc2 {axisMin, axisMin, lower};
+    double scalar2 = 0.0;
+
+    out.push (hb_pair (scalar1 - gain, loc1));
+    out.push (hb_pair (scalar2 - gain, loc2));
+  }
+}
+
+static inline TripleDistances _reverse_triple_distances (const TripleDistances &v)
+{ return TripleDistances (v.positive, v.negative); }
+
+double renormalizeValue (double v, const Triple &triple,
+                         const TripleDistances &triple_distances, bool extrapolate)
+{
+  double lower = triple.minimum, def = triple.middle, upper = triple.maximum;
+  if (unlikely (!(lower <= def && def <= upper)))
+    return hb_clamp (v, -1.0, +1.0);
+
+  if (!extrapolate)
+    v = hb_clamp (v, lower, upper);
+
+  if (v == def)
+    return 0.0;
+
+  if (def < 0.0)
+    return -renormalizeValue (-v, _reverse_negate (triple),
+                              _reverse_triple_distances (triple_distances), extrapolate);
+
+  if (v > def)
+  {
+    double positive_range = upper - def;
+    if (unlikely (!positive_range))
+      return +1.0;
+    return (v - def) / positive_range;
+  }
+
+  if (lower >= 0.0)
+  {
+    double negative_range = def - lower;
+    if (unlikely (!negative_range))
+      return -1.0;
+    return (v - def) / negative_range;
+  }
+
+  double total_distance = triple_distances.negative * (-lower) + triple_distances.positive * def;
+  if (unlikely (!total_distance))
+    return 0.0;
+
+  double v_distance;
+  if (v >= 0.0)
+    v_distance = (def - v) * triple_distances.positive;
+  else
+    v_distance = (-v) * triple_distances.negative + triple_distances.positive * def;
+
+  return (-v_distance) /total_distance;
+}
+
+void
+rebase_tent (Triple tent, Triple axisLimit, TripleDistances axis_triple_distances,
+	     rebase_tent_result_t &out,
+	     rebase_tent_result_t &scratch)
+{
+  if (unlikely (!(-1.0 <= axisLimit.minimum &&
+                  axisLimit.minimum <= axisLimit.middle &&
+                  axisLimit.middle <= axisLimit.maximum &&
+                  axisLimit.maximum <= +1.0) ||
+                !(-2.0 <= tent.minimum &&
+                  tent.minimum <= tent.middle &&
+                  tent.middle <= tent.maximum &&
+                  tent.maximum <= +2.0) ||
+                tent.middle == 0.0))
+  {
+    out.reset ();
+    return;
+  }
+
+  rebase_tent_result_t &sols = scratch;
+  _solve (tent, axisLimit, sols);
+
+  auto n = [&axisLimit, &axis_triple_distances] (double v) { return renormalizeValue (v, axisLimit, axis_triple_distances); };
+
+  out.reset();
+  for (auto &p : sols)
+  {
+    if (!p.first) continue;
+    if (p.second == Triple{})
+    {
+      out.push (p);
+      continue;
+    }
+    Triple t = p.second;
+    out.push (hb_pair (p.first,
+		       Triple{n (t.minimum), n (t.middle), n (t.maximum)}));
+  }
+}

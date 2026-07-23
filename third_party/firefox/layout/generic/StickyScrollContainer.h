@@ -1,0 +1,72 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef StickyScrollContainer_h
+#define StickyScrollContainer_h
+
+#include "mozilla/DepthOrderedFrameList.h"
+#include "nsPoint.h"
+#include "nsRectAbsolute.h"
+#include "nsTArray.h"
+
+struct nsRect;
+class nsIFrame;
+
+namespace mozilla {
+
+class ScrollContainerFrame;
+
+class StickyScrollContainer final {
+ public:
+  static StickyScrollContainer* GetOrCreateForFrame(nsIFrame*);
+
+  void AddFrame(nsIFrame* aFrame) { mFrames.Add(aFrame); }
+  void RemoveFrame(nsIFrame* aFrame) { mFrames.Remove(aFrame); }
+
+  ScrollContainerFrame* ScrollContainer() const {
+    return mScrollContainerFrame;
+  }
+
+  static void ComputeStickyOffsets(nsIFrame* aFrame);
+
+  nsPoint ComputePosition(nsIFrame* aFrame) const;
+
+  void GetScrollRanges(nsIFrame* aFrame, nsRectAbsolute* aOuter,
+                       nsRectAbsolute* aInner) const;
+
+  void PositionContinuations(nsIFrame* aFrame);
+
+  void UpdatePositions(nsPoint aScrollPosition, nsIFrame* aSubtreeRoot);
+
+  void ScrollPositionDidChange(const nsPoint&);
+
+  ~StickyScrollContainer();
+
+  const DepthOrderedFrameList& GetFrames() const { return mFrames; }
+
+  bool IsStuckInYDirection(nsIFrame* aFrame) const;
+
+  void MarkFramesForReflow();
+
+  void SetShouldFlatten(bool aShouldFlatten) {
+    mShouldFlatten = aShouldFlatten;
+  }
+  bool ShouldFlattenAway() const { return mShouldFlatten; }
+
+  explicit StickyScrollContainer(ScrollContainerFrame* aScrollContainerFrame);
+
+ private:
+  void ComputeStickyLimits(nsIFrame* aFrame, nsRect* aStick,
+                           nsRect* aContain) const;
+
+  ScrollContainerFrame* const mScrollContainerFrame;
+  DepthOrderedFrameList mFrames;
+  nsPoint mScrollPosition;
+  bool mShouldFlatten = false;
+};
+
+}  
+
+#endif /* StickyScrollContainer_h */

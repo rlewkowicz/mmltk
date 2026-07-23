@@ -1,0 +1,1325 @@
+/*
+ * Copyright 2024 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/core/SkBlurEngine.h"
+
+#include "include/core/SkAlphaType.h"
+#include "include/core/SkBitmap.h"
+#include "include/core/SkBlendMode.h"
+#include "include/core/SkClipOp.h"
+#include "include/core/SkColor.h"
+#include "include/core/SkColorSpace.h" // IWYU pragma: keep
+#include "include/core/SkColorType.h"
+#include "include/core/SkImageInfo.h"
+#include "include/core/SkM44.h"
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPaint.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkSamplingOptions.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkSurfaceProps.h"
+#include "include/core/SkTileMode.h"
+#include "include/effects/SkRuntimeEffect.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkFeatures.h"
+#include "include/private/base/SkMalloc.h"
+#include "include/private/base/SkMath.h"
+#include "include/private/base/SkTo.h"
+#include "src/base/SkArenaAlloc.h"
+#include "src/base/SkVx.h"
+#include "src/core/SkBitmapDevice.h"
+#include "src/core/SkDevice.h"
+#include "src/core/SkKnownRuntimeEffects.h"
+#include "src/core/SkSpecialImage.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <utility>
+
+
+#if SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_SSE1
+    #include <xmmintrin.h>
+    #define SK_PREFETCH(ptr) _mm_prefetch(reinterpret_cast<const char*>(ptr), _MM_HINT_T0)
+#elif defined(__GNUC__)
+    #define SK_PREFETCH(ptr) __builtin_prefetch(ptr)
+#else
+    #define SK_PREFETCH(ptr)
+#endif
+
+
+namespace {
+
+class Pass {
+public:
+    explicit Pass(int border) : fBorder(border) {}
+    virtual ~Pass() = default;
+
+    template <typename T>
+    void blur(int srcLeft, int srcRight, int dstRight,
+              const T* src, int srcStride,
+              T* dst, int dstStride) {
+        this->startBlur();
+
+        auto srcStart = srcLeft - fBorder,
+                srcEnd   = srcRight - fBorder,
+                dstEnd   = dstRight,
+                srcIdx   = srcStart,
+                dstIdx   = 0;
+
+        const T* srcCursor = src;
+        T* dstCursor = dst;
+
+        if (dstIdx < srcIdx) {
+            int commonEnd = std::min(srcIdx, dstEnd);
+            while (dstIdx < commonEnd) {
+                *dstCursor = 0;
+                dstCursor += dstStride;
+                SK_PREFETCH(dstCursor);
+                dstIdx++;
+            }
+        } else if (srcIdx < dstIdx) {
+            if (int commonEnd = std::min(dstIdx, srcEnd); srcIdx < commonEnd) {
+                int n = commonEnd - srcIdx;
+                this->blurSegment(n, srcCursor, srcStride, nullptr, 0);
+                srcIdx += n;
+                srcCursor += n * srcStride;
+            }
+            if (srcIdx < dstIdx) {
+                int n = dstIdx - srcIdx;
+                this->blurSegment(n, nullptr, 0, nullptr, 0);
+                srcIdx += n;
+            }
+        }
+
+        if (int commonEnd = std::min(dstEnd, srcEnd); dstIdx < commonEnd) {
+            SkASSERT(srcIdx == dstIdx);
+
+            int n = commonEnd - dstIdx;
+            this->blurSegment(n, srcCursor, srcStride, dstCursor, dstStride);
+            srcCursor += n * srcStride;
+            dstCursor += n * dstStride;
+            dstIdx += n;
+            srcIdx += n;
+        }
+
+        if (dstIdx < dstEnd) {
+            int n = dstEnd - dstIdx;
+            this->blurSegment(n, nullptr, 0, dstCursor, dstStride);
+        }
+    }
+
+protected:
+    virtual void startBlur() = 0;
+    virtual void blurSegment(
+            int n, const void* src, int srcStride, void* dst, int dstStride) = 0;
+
+private:
+    const int fBorder;
+};
+
+class PassMaker {
+public:
+    explicit PassMaker(int window, float sigma) : fWindow{window},
+                                                  fSigma{sigma} {}
+    virtual ~PassMaker() = default;
+    virtual Pass* makePass(void* buffer, SkArenaAlloc* alloc) const = 0;
+    virtual size_t bufferSizeBytes() const = 0;
+    int window() const {return fWindow;}
+    float sigma() const {return fSigma;}
+
+private:
+    const int fWindow;
+    const float fSigma;
+};
+
+template <typename T>
+static sk_sp<SkSpecialImage> eval_blur_passes(PassMaker* makerX, PassMaker* makerY,
+                                              SkBitmap src, const SkIRect& originalSrcBounds,
+                                              const SkIRect& originalDstBounds,
+                                              SkArenaAlloc* alloc) {
+    static constexpr int N = sizeof(T) / sizeof(uint8_t);
+    static_assert(N*sizeof(uint8_t) == sizeof(T), "N must be the the size of T in bytes.");
+
+    SkIRect srcBounds = originalSrcBounds;
+    SkIRect dstBounds = originalDstBounds;
+    if (makerX->window() > 1) {
+        dstBounds.outset(0, SkBlurEngine::SigmaToRadius(makerY->sigma()));
+    }
+
+    SkBitmap dst;
+    const SkIPoint dstOrigin = dstBounds.topLeft();
+    if (!dst.tryAllocPixels(src.info().makeWH(dstBounds.width(), dstBounds.height()))) {
+        return nullptr;
+    }
+    dst.eraseColor(SK_ColorTRANSPARENT);
+
+    auto buffer = alloc->makeBytesAlignedTo(std::max(makerX->bufferSizeBytes(),
+                                            makerY->bufferSizeBytes()),
+                                            alignof(skvx::Vec<N, uint32_t>));
+
+
+    int loopStart  = std::max(srcBounds.left(),  dstBounds.left());
+    int loopEnd    = std::min(srcBounds.right(), dstBounds.right());
+    int dstYOffset = 0;
+
+    if (makerX->window() > 1) {
+        loopStart = std::max(srcBounds.top(),    dstBounds.top());
+        loopEnd   = std::min(srcBounds.bottom(), dstBounds.bottom());
+
+        auto srcAddr = reinterpret_cast<T*>(src.getAddr(0, loopStart - srcBounds.top()));
+        auto dstAddr = reinterpret_cast<T*>(dst.getAddr(0, loopStart - dstBounds.top()));
+
+        Pass* pass = makerX->makePass(buffer, alloc);
+        for (int y = loopStart; y < loopEnd; ++y) {
+            pass->blur<T>(srcBounds.left()  - dstBounds.left(),
+                          srcBounds.right() - dstBounds.left(),
+                          dstBounds.width(),
+                          srcAddr, 1,
+                          dstAddr, 1);
+            srcAddr += src.rowBytesAsPixels();
+            dstAddr += dst.rowBytesAsPixels();
+        }
+
+        src = dst;
+        loopStart = originalDstBounds.left();
+        loopEnd   = originalDstBounds.right();
+        dstYOffset = originalDstBounds.top() - dstBounds.top();
+
+        srcBounds = dstBounds;
+        dstBounds = originalDstBounds;
+    }
+
+    if (makerY->window() > 1) {
+        auto srcAddr = reinterpret_cast<T*>(src.getAddr(loopStart - srcBounds.left(), 0));
+        auto dstAddr = reinterpret_cast<T*>(dst.getAddr(loopStart - dstBounds.left(), dstYOffset));
+
+        Pass* pass = makerY->makePass(buffer, alloc);
+        for (int x = loopStart; x < loopEnd; ++x) {
+            pass->blur<T>(srcBounds.top()    - dstBounds.top(),
+                          srcBounds.bottom() - dstBounds.top(),
+                          dstBounds.height(),
+                          srcAddr, src.rowBytesAsPixels(),
+                          dstAddr, dst.rowBytesAsPixels());
+            srcAddr += 1;
+            dstAddr += 1;
+        }
+    }
+
+#if defined(SK_AVOID_SLOW_RASTER_PIPELINE_BLURS)
+    if (makerX->window() == 1 && makerY->window() == 1) {
+        dst.writePixels(src.pixmap(),
+                        srcBounds.left() - dstBounds.left(),
+                        srcBounds.top()  - dstBounds.top());
+    }
+#endif
+
+    dstBounds = originalDstBounds.makeOffset(-dstOrigin); 
+    return SkSpecialImages::MakeFromRaster(dstBounds, dst, SkSurfaceProps{});
+}
+
+template <typename T>
+class GaussianPass final : public Pass {
+public:
+    static constexpr int N = sizeof(T) / sizeof(uint8_t);
+    static_assert(N*sizeof(uint8_t) == sizeof(T), "N must be the the size of T in bytes.");
+
+    static constexpr float kMaxSigma = 2.f;
+
+    static PassMaker* MakeMaker(float sigma, SkArenaAlloc* alloc) {
+        if (sigma >= kMaxSigma) { return nullptr; }
+
+        class Maker : public PassMaker {
+        public:
+            explicit Maker(float sigma)
+                : PassMaker{2 * SkBlurEngine::SigmaToRadius(sigma) + 1, sigma} {}
+            Pass* makePass(void* buffer, SkArenaAlloc* alloc) const override {
+                return GaussianPass::Make(this->sigma(), buffer, alloc);
+            }
+            size_t bufferSizeBytes() const override {
+                return this->window() * (sizeof(skvx::Vec<N, float>) + sizeof(float));
+
+            }
+        };
+
+        return alloc->make<Maker>(sigma);
+    }
+
+    static GaussianPass* Make(float sigma, void* buffers, SkArenaAlloc* alloc) {
+        int radius = SkBlurEngine::SigmaToRadius(sigma);
+        size_t kernelWidth = 2*radius + 1;
+
+        skvx::Vec<N, float>* srcBuffer = static_cast<skvx::Vec<N, float>*>(buffers);
+
+        float* kernelValues = reinterpret_cast<float*>(srcBuffer + kernelWidth);
+        SkShaderBlurAlgorithm::Compute1DBlurKernel(sigma, radius, {kernelValues, kernelWidth});
+
+        return alloc->make<GaussianPass>(radius, kernelValues, srcBuffer);
+    }
+
+
+    GaussianPass(int radius, float* kernel, skvx::Vec<N, float>* srcBuffer)
+        : Pass(radius),
+          fWindow(2 * radius + 1),
+          fKernel(kernel),
+          fSrcBuffer(srcBuffer),
+          fSrcBufferBase(0) {}
+
+private:
+    void startBlur() override {
+        sk_bzero(fSrcBuffer, fWindow * sizeof(skvx::Vec<N, float>));
+        fSrcBufferBase = 0;
+    }
+
+    void blurSegment(int n, const void* src, int srcStride, void* dst, int dstStride) override {
+        const T* srcPtr = reinterpret_cast<const T*>(src);
+        T* dstPtr = reinterpret_cast<T*>(dst);
+
+        int base = fSrcBufferBase;
+
+        auto convolve = [this](int srcBase) {
+            skvx::Vec<N, float> sum = 0.f;
+            for (int i = 0; i < fWindow; ++i) {
+                int s = (i + srcBase) % fWindow;
+                sum += fSrcBuffer[s] * fKernel[i];
+            }
+            return skvx::cast<uint8_t>(skvx::pin(sum * 255.f + 0.5f,
+                                                 skvx::Vec<N, float>(0.f),
+                                                 skvx::Vec<N, float>(255.f)));
+        };
+
+        while (n-- > 0) {
+            skvx::Vec<N, float> leadingEdge = srcPtr
+                ? skvx::cast<float>(skvx::Vec<N, uint8_t>::Load(srcPtr)) * (1 / 255.0f)
+                : skvx::Vec<N, float>(0.f);
+
+            fSrcBuffer[(base + fWindow - 1) % fWindow] = leadingEdge;
+
+            if (dstPtr) {
+                convolve(base).store(dstPtr);
+                dstPtr += dstStride;
+            }
+
+            if (srcPtr) {
+                srcPtr += srcStride;
+            }
+            base = (base + 1) % fWindow;
+        }
+
+        fSrcBufferBase = base;
+    }
+
+    const int fWindow;
+    float* fKernel;
+    skvx::Vec<N, float>* fSrcBuffer;
+    int fSrcBufferBase;
+};
+
+
+class ThreeBoxApproxPass final : public Pass {
+public:
+    static PassMaker* MakeMaker(float sigma, SkArenaAlloc* alloc) {
+        SkASSERT(0 <= sigma);
+        int window = SkBlurEngine::BoxBlurWindow(sigma);
+        if (255 <= window) {
+            return nullptr;
+        }
+
+        class Maker : public PassMaker {
+        public:
+            explicit Maker(int window, float sigma) : PassMaker{window, sigma} {}
+            Pass* makePass(void* buffer, SkArenaAlloc* alloc) const override {
+                return ThreeBoxApproxPass::Make(this->window(), buffer, alloc);
+            }
+
+            size_t bufferSizeBytes() const override {
+                int window = this->window();
+                size_t onePassSize = window - 1;
+                size_t bufferCount = (window & 1) == 1 ? 3 * onePassSize : 3 * onePassSize + 1;
+                return bufferCount * sizeof(skvx::Vec<4, uint32_t>);
+            }
+        };
+
+        return alloc->make<Maker>(window, sigma);
+    }
+
+    static ThreeBoxApproxPass* Make(int window, void* buffers, SkArenaAlloc* alloc) {
+        int passSize = window - 1;
+        skvx::Vec<4, uint32_t>* buffer0 = static_cast<skvx::Vec<4, uint32_t>*>(buffers);
+        skvx::Vec<4, uint32_t>* buffer1 = buffer0 + passSize;
+        skvx::Vec<4, uint32_t>* buffer2 = buffer1 + passSize;
+        skvx::Vec<4, uint32_t>* buffersEnd = buffer2 + ((window & 1) ? passSize : passSize + 1);
+
+        int border = (window & 1) == 1 ? 3 * ((window - 1) / 2) : 3 * (window / 2) - 1;
+
+        int window2 = window * window;
+        int window3 = window2 * window;
+        int divisor = (window & 1) == 1 ? window3 : window3 + window2;
+        return alloc->make<ThreeBoxApproxPass>(buffer0, buffer1, buffer2,
+                                               buffersEnd, border, divisor);
+    }
+
+    ThreeBoxApproxPass(skvx::Vec<4, uint32_t>* buffer0,
+              skvx::Vec<4, uint32_t>* buffer1,
+              skvx::Vec<4, uint32_t>* buffer2,
+              skvx::Vec<4, uint32_t>* buffersEnd,
+              int border,
+              int divisor)
+        : Pass{border}
+        , fBuffer0{buffer0}
+        , fBuffer1{buffer1}
+        , fBuffer2{buffer2}
+        , fBuffersEnd{buffersEnd}
+        , fDivider(divisor) {}
+
+private:
+    void startBlur() override {
+        skvx::Vec<4, uint32_t> zero = {0u, 0u, 0u, 0u};
+        zero.store(fSum0);
+        zero.store(fSum1);
+        auto half = fDivider.half();
+        skvx::Vec<4, uint32_t>{half, half, half, half}.store(fSum2);
+        sk_bzero(fBuffer0, (fBuffersEnd - fBuffer0) * sizeof(skvx::Vec<4, uint32_t>));
+
+        fBuffer0Cursor = fBuffer0;
+        fBuffer1Cursor = fBuffer1;
+        fBuffer2Cursor = fBuffer2;
+    }
+
+    void blurSegment(
+            int n, const void* src, int srcStride, void* dst, int dstStride) override {
+        const uint32_t* src32 = reinterpret_cast<const uint32_t*>(src);
+        uint32_t* dst32 = reinterpret_cast<uint32_t*>(dst);
+#if SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+        skvx::Vec<4, uint32_t>* buffer0Cursor = fBuffer0Cursor;
+        skvx::Vec<4, uint32_t>* buffer1Cursor = fBuffer1Cursor;
+        skvx::Vec<4, uint32_t>* buffer2Cursor = fBuffer2Cursor;
+        v4u32 sum0 = __lsx_vld(fSum0, 0); 
+        v4u32 sum1 = __lsx_vld(fSum1, 0);
+        v4u32 sum2 = __lsx_vld(fSum2, 0);
+
+        auto processValue = [&](v4u32& vLeadingEdge){
+          sum0 += vLeadingEdge;
+          sum1 += sum0;
+          sum2 += sum1;
+
+          v4u32 divisorFactor = __lsx_vreplgr2vr_w(fDivider.divisorFactor());
+          v4u32 blurred = __lsx_vmuh_w(divisorFactor, sum2);
+
+          v4u32 buffer2Value = __lsx_vld(buffer2Cursor, 0); 
+          sum2 -= buffer2Value;
+          __lsx_vst(sum1, (void *)buffer2Cursor, 0);
+          buffer2Cursor = (buffer2Cursor + 1) < fBuffersEnd ? buffer2Cursor + 1 : fBuffer2;
+          v4u32 buffer1Value = __lsx_vld(buffer1Cursor, 0);
+          sum1 -= buffer1Value;
+          __lsx_vst(sum0, (void *)buffer1Cursor, 0);
+          buffer1Cursor = (buffer1Cursor + 1) < fBuffer2 ? buffer1Cursor + 1 : fBuffer1;
+          v4u32 buffer0Value = __lsx_vld(buffer0Cursor, 0);
+          sum0 -= buffer0Value;
+          __lsx_vst(vLeadingEdge, (void *)buffer0Cursor, 0);
+          buffer0Cursor = (buffer0Cursor + 1) < fBuffer1 ? buffer0Cursor + 1 : fBuffer0;
+
+          v16u8 shuf = {0x0,0x4,0x8,0xc,0x0};
+          v16u8 ret = __lsx_vshuf_b(blurred, blurred, shuf);
+          return ret;
+        };
+
+        v4u32 zero = __lsx_vldi(0x0);
+        if (!src32 && !dst32) {
+            while (n --> 0) {
+                (void)processValue(zero);
+            }
+        } else if (src32 && !dst32) {
+            while (n --> 0) {
+                v4u32 edge = __lsx_vinsgr2vr_w(zero, *src32, 0);
+                edge = __lsx_vilvl_b(zero, edge);
+                edge = __lsx_vilvl_h(zero, edge);
+                (void)processValue(edge);
+                src32 += srcStride;
+            }
+        } else if (!src32 && dst32) {
+            while (n --> 0) {
+                v4u32 ret = processValue(zero);
+                __lsx_vstelm_w(ret, dst32, 0, 0); 
+                dst32 += dstStride;
+            }
+        } else if (src32 && dst32) {
+            while (n --> 0) {
+                v4u32 edge = __lsx_vinsgr2vr_w(zero, *src32, 0);
+                edge = __lsx_vilvl_b(zero, edge);
+                edge = __lsx_vilvl_h(zero, edge);
+                v4u32 ret = processValue(edge);
+                __lsx_vstelm_w(ret, dst32, 0, 0);
+                src32 += srcStride;
+                dst32 += dstStride;
+            }
+        }
+
+        fBuffer0Cursor = buffer0Cursor;
+        fBuffer1Cursor = buffer1Cursor;
+        fBuffer2Cursor = buffer2Cursor;
+
+        __lsx_vst(sum0, fSum0, 0);
+        __lsx_vst(sum1, fSum1, 0);
+        __lsx_vst(sum2, fSum2, 0);
+#else
+        skvx::Vec<4, uint32_t>* buffer0Cursor = fBuffer0Cursor;
+        skvx::Vec<4, uint32_t>* buffer1Cursor = fBuffer1Cursor;
+        skvx::Vec<4, uint32_t>* buffer2Cursor = fBuffer2Cursor;
+        skvx::Vec<4, uint32_t> sum0 = skvx::Vec<4, uint32_t>::Load(fSum0);
+        skvx::Vec<4, uint32_t> sum1 = skvx::Vec<4, uint32_t>::Load(fSum1);
+        skvx::Vec<4, uint32_t> sum2 = skvx::Vec<4, uint32_t>::Load(fSum2);
+
+        auto processValue = [&](const skvx::Vec<4, uint32_t>& leadingEdge) {
+            sum0 += leadingEdge;
+            sum1 += sum0;
+            sum2 += sum1;
+
+            skvx::Vec<4, uint32_t> blurred = fDivider.divide(sum2);
+
+            sum2 -= *buffer2Cursor;
+            *buffer2Cursor = sum1;
+            buffer2Cursor = (buffer2Cursor + 1) < fBuffersEnd ? buffer2Cursor + 1 : fBuffer2;
+            sum1 -= *buffer1Cursor;
+            *buffer1Cursor = sum0;
+            buffer1Cursor = (buffer1Cursor + 1) < fBuffer2 ? buffer1Cursor + 1 : fBuffer1;
+            sum0 -= *buffer0Cursor;
+            *buffer0Cursor = leadingEdge;
+            buffer0Cursor = (buffer0Cursor + 1) < fBuffer1 ? buffer0Cursor + 1 : fBuffer0;
+
+            return skvx::cast<uint8_t>(blurred);
+        };
+
+        auto loadEdge = [&](const uint32_t* srcCursor) {
+            return skvx::cast<uint32_t>(skvx::Vec<4, uint8_t>::Load(srcCursor));
+        };
+
+        if (!src32 && !dst32) {
+            while (n --> 0) {
+                (void)processValue(0);
+            }
+        } else if (src32 && !dst32) {
+            while (n --> 0) {
+                (void)processValue(loadEdge(src32));
+                src32 += srcStride;
+            }
+        } else if (!src32 && dst32) {
+            while (n --> 0) {
+                processValue(0u).store(dst32);
+                dst32 += dstStride;
+            }
+        } else if (src32 && dst32) {
+            while (n --> 0) {
+                processValue(loadEdge(src32)).store(dst32);
+                src32 += srcStride;
+                dst32 += dstStride;
+            }
+        }
+
+        fBuffer0Cursor = buffer0Cursor;
+        fBuffer1Cursor = buffer1Cursor;
+        fBuffer2Cursor = buffer2Cursor;
+
+        sum0.store(fSum0);
+        sum1.store(fSum1);
+        sum2.store(fSum2);
+#endif
+    }
+
+    skvx::Vec<4, uint32_t>* const fBuffer0;
+    skvx::Vec<4, uint32_t>* const fBuffer1;
+    skvx::Vec<4, uint32_t>* const fBuffer2;
+    skvx::Vec<4, uint32_t>* const fBuffersEnd;
+    const skvx::ScaledDividerU32 fDivider;
+
+    char fSum0[sizeof(skvx::Vec<4, uint32_t>)];
+    char fSum1[sizeof(skvx::Vec<4, uint32_t>)];
+    char fSum2[sizeof(skvx::Vec<4, uint32_t>)];
+    skvx::Vec<4, uint32_t>* fBuffer0Cursor;
+    skvx::Vec<4, uint32_t>* fBuffer1Cursor;
+    skvx::Vec<4, uint32_t>* fBuffer2Cursor;
+};
+
+class TentPass final : public Pass {
+public:
+    static PassMaker* MakeMaker(float sigma, SkArenaAlloc* alloc) {
+        SkASSERT(0 <= sigma);
+        int gaussianWindow = SkBlurEngine::BoxBlurWindow(sigma);
+        int tentWindow = 3 * gaussianWindow / 2;
+        if (tentWindow >= 4104) {
+            return nullptr;
+        }
+
+        class Maker : public PassMaker {
+        public:
+            explicit Maker(int window, float sigma) : PassMaker{window, sigma} {}
+            Pass* makePass(void* buffer, SkArenaAlloc* alloc) const override {
+                return TentPass::Make(this->window(), buffer, alloc);
+            }
+
+            size_t bufferSizeBytes() const override {
+                size_t onePassSize = this->window() - 1;
+                size_t bufferCount = 2 * onePassSize;
+                return bufferCount * sizeof(skvx::Vec<4, uint32_t>);
+            }
+        };
+
+        return alloc->make<Maker>(tentWindow, sigma);
+    }
+
+    static TentPass* Make(int window, void* buffers, SkArenaAlloc* alloc) {
+        if (window > 4104) {
+            return nullptr;
+        }
+
+        int passSize = window - 1;
+        skvx::Vec<4, uint32_t>* buffer0 = static_cast<skvx::Vec<4, uint32_t>*>(buffers);
+        skvx::Vec<4, uint32_t>* buffer1 = buffer0 + passSize;
+        skvx::Vec<4, uint32_t>* buffersEnd = buffer1 + passSize;
+
+        int border = window - 1;
+
+        int divisor = window * window;
+        return alloc->make<TentPass>(buffer0, buffer1, buffersEnd, border, divisor);
+    }
+
+    TentPass(skvx::Vec<4, uint32_t>* buffer0,
+             skvx::Vec<4, uint32_t>* buffer1,
+             skvx::Vec<4, uint32_t>* buffersEnd,
+             int border,
+             int divisor)
+         : Pass{border}
+         , fBuffer0{buffer0}
+         , fBuffer1{buffer1}
+         , fBuffersEnd{buffersEnd}
+         , fDivider(divisor) {}
+
+private:
+    void startBlur() override {
+        skvx::Vec<4, uint32_t>{0u, 0u, 0u, 0u}.store(fSum0);
+        auto half = fDivider.half();
+        skvx::Vec<4, uint32_t>{half, half, half, half}.store(fSum1);
+        sk_bzero(fBuffer0, (fBuffersEnd - fBuffer0) * sizeof(skvx::Vec<4, uint32_t>));
+
+        fBuffer0Cursor = fBuffer0;
+        fBuffer1Cursor = fBuffer1;
+    }
+
+    void blurSegment(
+            int n, const void* src, int srcStride, void* dst, int dstStride) override {
+        const uint32_t* src32 = reinterpret_cast<const uint32_t*>(src);
+        uint32_t* dst32 = reinterpret_cast<uint32_t*>(dst);
+        skvx::Vec<4, uint32_t>* buffer0Cursor = fBuffer0Cursor;
+        skvx::Vec<4, uint32_t>* buffer1Cursor = fBuffer1Cursor;
+        skvx::Vec<4, uint32_t> sum0 = skvx::Vec<4, uint32_t>::Load(fSum0);
+        skvx::Vec<4, uint32_t> sum1 = skvx::Vec<4, uint32_t>::Load(fSum1);
+
+        auto processValue = [&](const skvx::Vec<4, uint32_t>& leadingEdge) {
+            sum0 += leadingEdge;
+            sum1 += sum0;
+
+            skvx::Vec<4, uint32_t> blurred = fDivider.divide(sum1);
+
+            sum1 -= *buffer1Cursor;
+            *buffer1Cursor = sum0;
+            buffer1Cursor = (buffer1Cursor + 1) < fBuffersEnd ? buffer1Cursor + 1 : fBuffer1;
+            sum0 -= *buffer0Cursor;
+            *buffer0Cursor = leadingEdge;
+            buffer0Cursor = (buffer0Cursor + 1) < fBuffer1 ? buffer0Cursor + 1 : fBuffer0;
+
+            return skvx::cast<uint8_t>(blurred);
+        };
+
+        auto loadEdge = [&](const uint32_t* srcCursor) {
+            return skvx::cast<uint32_t>(skvx::Vec<4, uint8_t>::Load(srcCursor));
+        };
+
+        if (!src32 && !dst32) {
+            while (n --> 0) {
+                (void)processValue(0);
+            }
+        } else if (src32 && !dst32) {
+            while (n --> 0) {
+                (void)processValue(loadEdge(src32));
+                src32 += srcStride;
+            }
+        } else if (!src32 && dst32) {
+            while (n --> 0) {
+                processValue(0u).store(dst32);
+                dst32 += dstStride;
+            }
+        } else if (src32 && dst32) {
+            while (n --> 0) {
+                processValue(loadEdge(src32)).store(dst32);
+                src32 += srcStride;
+                dst32 += dstStride;
+            }
+        }
+
+        fBuffer0Cursor = buffer0Cursor;
+        fBuffer1Cursor = buffer1Cursor;
+        sum0.store(fSum0);
+        sum1.store(fSum1);
+    }
+
+    skvx::Vec<4, uint32_t>* const fBuffer0;
+    skvx::Vec<4, uint32_t>* const fBuffer1;
+    skvx::Vec<4, uint32_t>* const fBuffersEnd;
+    const skvx::ScaledDividerU32 fDivider;
+
+    char fSum0[sizeof(skvx::Vec<4, uint32_t>)];
+    char fSum1[sizeof(skvx::Vec<4, uint32_t>)];
+    skvx::Vec<4, uint32_t>* fBuffer0Cursor;
+    skvx::Vec<4, uint32_t>* fBuffer1Cursor;
+};
+
+class A8Pass final : public Pass {
+public:
+    static PassMaker* MakeMaker(float sigma, SkArenaAlloc* alloc) {
+        SkASSERT(0 <= sigma);
+        int possibleWindow = static_cast<int>(floor(sigma * 3 * sqrt(2 * SK_DoublePI) / 4 + 0.5));
+        int window = std::max(1, possibleWindow);
+
+        class Maker : public PassMaker {
+        public:
+            explicit Maker(int window, float sigma) : PassMaker{window, sigma} {}
+            Pass* makePass(void* buffer, SkArenaAlloc* alloc) const override {
+                return A8Pass::Make(this->window(), buffer, alloc);
+            }
+
+            size_t bufferSizeBytes() const override {
+                int window = this->window();
+                size_t pass0Size = window - 1;
+                size_t pass1Size = window - 1;
+                size_t pass2Size = (window & 1) == 1 ? window - 1 : window;
+                return (pass0Size + pass1Size + pass2Size) * sizeof(uint32_t);
+            }
+        };
+
+        return alloc->make<Maker>(window, sigma);
+    }
+
+    static A8Pass* Make(int window, void* buffers, SkArenaAlloc* alloc) {
+        size_t pass0Size = window - 1;
+        size_t pass1Size = window - 1;
+        size_t pass2Size = (window & 1) == 1 ? window - 1 : window;
+        uint32_t* buffer0, *buffer0End, *buffer1, *buffer1End, *buffer2, *buffer2End;
+        buffer0 = static_cast<uint32_t*>(buffers);
+        buffer0End = buffer1 = buffer0 + pass0Size;
+        buffer1End = buffer2 = buffer1 + pass1Size;
+        buffer2End = buffer2 + pass2Size;
+
+        int border = (window & 1) == 1 ? 3 * ((window - 1) / 2) : 3 * (window / 2) - 1;
+
+        auto window2 = window * window;
+        auto window3 = window2 * window;
+        auto divisor = (window & 1) == 1 ? window3 : window3 + window2;
+
+        uint64_t weight = static_cast<uint64_t>(round(1.0 / divisor * (1ull << 32)));
+
+        return alloc->make<A8Pass>(weight, buffer0, buffer0End, buffer1, buffer1End,
+                                   buffer2, buffer2End, border);
+    }
+
+    A8Pass(uint64_t weight,
+           uint32_t* buffer0, uint32_t* buffer0End,
+           uint32_t* buffer1, uint32_t* buffer1End,
+           uint32_t* buffer2, uint32_t* buffer2End,
+           int border)
+        : Pass{border}
+        , fWeight(weight)
+        , fBuffer0{buffer0}
+        , fBuffer0End{buffer0End}
+        , fBuffer1{buffer1}
+        , fBuffer1End{buffer1End}
+        , fBuffer2{buffer2}
+        , fBuffer2End{buffer2End} {}
+
+private:
+    void startBlur() override {
+        fSum0 = 0;
+        fSum1 = 0;
+        fSum2 = 0;
+
+        sk_bzero(fBuffer0, (fBuffer2End - fBuffer0) * sizeof(*fBuffer0));
+
+        fBuffer0Cursor = fBuffer0;
+        fBuffer1Cursor = fBuffer1;
+        fBuffer2Cursor = fBuffer2;
+    }
+
+    void blurSegment(
+      int n, const void* src, int srcStride, void* dst, int dstStride) override {
+      const uint8_t* src8 = reinterpret_cast<const uint8_t*>(src);
+      uint8_t* dst8 = reinterpret_cast<uint8_t*>(dst);
+      if (n <= 0) {
+          return;
+      }
+
+      auto buffer0Cursor = fBuffer0Cursor;
+      auto buffer1Cursor = fBuffer1Cursor;
+      auto buffer2Cursor = fBuffer2Cursor;
+      uint32_t sum0 = fSum0;
+      uint32_t sum1 = fSum1;
+      uint32_t sum2 = fSum2;
+
+      auto processValue = [&](const uint32_t leadingEdge) {
+          sum0 += leadingEdge; sum1 += sum0; sum2 += sum1;
+
+          const uint8_t blurred = this->finalScale(sum2);
+
+          sum2 -= *buffer2Cursor; *buffer2Cursor = sum1;
+          buffer2Cursor = (buffer2Cursor + 1) < fBuffer2End ? buffer2Cursor + 1 : fBuffer2;
+          sum1 -= *buffer1Cursor; *buffer1Cursor = sum0;
+          buffer1Cursor = (buffer1Cursor + 1) < fBuffer1End ? buffer1Cursor + 1 : fBuffer1;
+          sum0 -= *buffer0Cursor; *buffer0Cursor = leadingEdge;
+          buffer0Cursor = (buffer0Cursor + 1) < fBuffer0End ? buffer0Cursor + 1 : fBuffer0;
+
+          return blurred;
+      };
+
+      if (!src8 && !dst8) {
+        while (n --> 0) {
+            (void)processValue(0);
+        }
+      } else if (src8 && !dst8) {
+          while (n --> 0) {
+              (void)processValue(*src8);
+              src8 += srcStride;
+          }
+      } else if (!src8 && dst8) {
+          while (n --> 0) {
+              *dst8 = processValue(0);
+              dst8 += dstStride;
+          }
+      } else if (src8 && dst8) {
+          while (n --> 0) {
+              *dst8 = processValue(*src8);
+              src8 += srcStride;
+              dst8 += dstStride;
+          }
+      }
+
+      fBuffer0Cursor = buffer0Cursor;
+      fBuffer1Cursor = buffer1Cursor;
+      fBuffer2Cursor = buffer2Cursor;
+      fSum0 = sum0;
+      fSum1 = sum1;
+      fSum2 = sum2;
+  }
+
+    inline static constexpr uint64_t kHalf = static_cast<uint64_t>(1) << 31;
+
+    uint8_t finalScale(uint32_t sum) const {
+        return SkTo<uint8_t>((fWeight * sum + kHalf) >> 32);
+    }
+
+    uint64_t  fWeight;
+    uint32_t* fBuffer0;
+    uint32_t* fBuffer0End;
+    uint32_t* fBuffer1;
+    uint32_t* fBuffer1End;
+    uint32_t* fBuffer2;
+    uint32_t* fBuffer2End;
+
+    uint32_t* fBuffer0Cursor;
+    uint32_t* fBuffer1Cursor;
+    uint32_t* fBuffer2Cursor;
+    uint32_t fSum0;
+    uint32_t fSum1;
+    uint32_t fSum2;
+};
+
+class RasterA8BlurAlgorithm : public SkBlurEngine::Algorithm {
+public:
+    float maxSigma() const override {
+        static constexpr float kMaxSigma = 135.f;
+        SkASSERT(SkBlurEngine::BoxBlurWindow(kMaxSigma) <= 255);
+        return kMaxSigma;
+    }
+
+    bool supportsOnlyDecalTiling() const override { return true; }
+
+    sk_sp<SkSpecialImage> blur(SkSize sigma,
+                               sk_sp<SkSpecialImage> input,
+                               const SkIRect& originalSrcBounds,
+                               SkTileMode tileMode,
+                               const SkIRect& originalDstBounds) const override {
+        SkASSERT(tileMode == SkTileMode::kDecal);
+        SkASSERT(SkIRect::MakeSize(input->dimensions()).contains(originalSrcBounds));
+
+        SkBitmap src;
+        if (!SkSpecialImages::AsBitmap(input.get(), &src)) {
+            return nullptr; 
+        }
+        SkASSERT(src.colorType() == kAlpha_8_SkColorType);
+
+        SkSTArenaAlloc<1024> alloc;
+        auto makeMaker = [&](float sigma) -> PassMaker* {
+            SkASSERT(0 <= sigma && sigma <= 135); 
+            if (PassMaker* maker = GaussianPass<uint8_t>::MakeMaker(sigma, &alloc)) {
+                return maker;
+            }
+            if (PassMaker* maker = A8Pass::MakeMaker(sigma, &alloc)) {
+                return maker;
+            }
+            SK_ABORT("Sigma is out of range.");
+        };
+
+        PassMaker* makerX = makeMaker(sigma.width());
+        PassMaker* makerY = makeMaker(sigma.height());
+
+        return eval_blur_passes<uint8_t>(makerX, makerY, src, originalSrcBounds,
+                                         originalDstBounds, &alloc);
+    }
+};
+
+class Raster8888BlurAlgorithm : public SkBlurEngine::Algorithm {
+public:
+    float maxSigma() const override {
+        static constexpr float kMaxSigma = 135.f;
+        SkASSERT(SkBlurEngine::BoxBlurWindow(kMaxSigma) <= 255); 
+        return kMaxSigma;
+    }
+
+    bool supportsOnlyDecalTiling() const override { return true; }
+
+    sk_sp<SkSpecialImage> blur(SkSize sigma,
+                               sk_sp<SkSpecialImage> input,
+                               const SkIRect& originalSrcBounds,
+                               SkTileMode tileMode,
+                               const SkIRect& originalDstBounds) const override {
+        SkASSERT(tileMode == SkTileMode::kDecal);
+
+        SkASSERT(SkIRect::MakeSize(input->dimensions()).contains(originalSrcBounds));
+
+        SkBitmap src;
+        if (!SkSpecialImages::AsBitmap(input.get(), &src)) {
+            return nullptr; 
+        }
+        SkASSERT(src.colorType() == kRGBA_8888_SkColorType ||
+                 src.colorType() == kBGRA_8888_SkColorType);
+
+        SkSTArenaAlloc<1024> alloc;
+        auto makeMaker = [&](float sigma) -> PassMaker* {
+            SkASSERT(0 <= sigma && sigma <= 2183); 
+#if !defined(SK_AVOID_SLOW_RASTER_PIPELINE_BLURS)
+            if (PassMaker* maker = GaussianPass<uint32_t>::MakeMaker(sigma, &alloc)) {
+                return maker;
+            }
+#endif
+            if (PassMaker* maker = ThreeBoxApproxPass::MakeMaker(sigma, &alloc)) {
+                return maker;
+            }
+            if (PassMaker* maker = TentPass::MakeMaker(sigma, &alloc)) {
+                return maker;
+            }
+            SK_ABORT("Sigma is out of range.");
+      };
+
+        PassMaker* makerX = makeMaker(sigma.width());
+        PassMaker* makerY = makeMaker(sigma.height());
+
+        return eval_blur_passes<uint32_t>(makerX, makerY, src, originalSrcBounds,
+                                          originalDstBounds, &alloc);
+    }
+
+};
+
+class RasterShaderBlurAlgorithm : public SkShaderBlurAlgorithm {
+public:
+    sk_sp<SkDevice> makeDevice(const SkImageInfo& imageInfo) const override {
+        return SkBitmapDevice::Create(imageInfo, SkSurfaceProps{});
+    }
+};
+
+class RasterBlurEngine : public SkBlurEngine {
+public:
+    const Algorithm* findAlgorithm(SkSize sigma,  SkColorType colorType) const override {
+        const bool rgba8Blur = colorType == kRGBA_8888_SkColorType ||
+                               colorType == kBGRA_8888_SkColorType;
+        const bool a8Blur = colorType == kAlpha_8_SkColorType;
+
+        if (a8Blur) {
+            return &fA8BlurAlgorithm;
+        } else if (rgba8Blur) {
+            return &fRGBA8BlurAlgorithm;
+        } else {
+            return &fShaderBlurAlgorithm;
+        }
+    }
+
+private:
+    RasterShaderBlurAlgorithm fShaderBlurAlgorithm;
+    Raster8888BlurAlgorithm fRGBA8BlurAlgorithm;
+    RasterA8BlurAlgorithm fA8BlurAlgorithm;
+};
+
+} 
+
+const SkBlurEngine* SkBlurEngine::GetRasterBlurEngine() {
+    static const RasterBlurEngine kInstance;
+    return &kInstance;
+}
+
+
+void SkShaderBlurAlgorithm::Compute2DBlurKernel(SkSize sigma,
+                                                SkISize radius,
+                                                SkSpan<float> kernel) {
+    SkASSERT(SkBlurEngine::SigmaToRadius(sigma.width()) == radius.width() &&
+             SkBlurEngine::SigmaToRadius(sigma.height()) == radius.height());
+
+    const int width = KernelWidth(radius.width());
+    const int height = KernelWidth(radius.height());
+    const size_t kernelSize = SkTo<size_t>(sk_64_mul(width, height));
+    SkASSERT(kernelSize <= kernel.size());
+
+    const float twoSigmaSqrdX = 2.0f * sigma.width() * sigma.width();
+    const float twoSigmaSqrdY = 2.0f * sigma.height() * sigma.height();
+    SkASSERT((radius.width() == 0 || !SkScalarNearlyZero(twoSigmaSqrdX)) &&
+             (radius.height() == 0 || !SkScalarNearlyZero(twoSigmaSqrdY)));
+
+    const float sigmaXDenom = radius.width() > 0 ? 1.0f / twoSigmaSqrdX : 1.f;
+    const float sigmaYDenom = radius.height() > 0 ? 1.0f / twoSigmaSqrdY : 1.f;
+
+    float sum = 0.0f;
+    for (int x = 0; x < width; x++) {
+        float xTerm = static_cast<float>(x - radius.width());
+        xTerm = xTerm * xTerm * sigmaXDenom;
+        for (int y = 0; y < height; y++) {
+            float yTerm = static_cast<float>(y - radius.height());
+            float xyTerm = std::exp(-(xTerm + yTerm * yTerm * sigmaYDenom));
+            kernel[y * width + x] = xyTerm;
+            sum += xyTerm;
+        }
+    }
+    float scale = 1.0f / sum;
+    for (size_t i = 0; i < kernelSize; ++i) {
+        kernel[i] *= scale;
+    }
+    memset(kernel.data() + kernelSize, 0, sizeof(float)*(kernel.size() - kernelSize));
+}
+
+void SkShaderBlurAlgorithm::Compute2DBlurKernel(SkSize sigma,
+                                                SkISize radii,
+                                                std::array<SkV4, kMaxSamples/4>& kernel) {
+    static_assert(sizeof(kernel) == sizeof(std::array<float, kMaxSamples>));
+    static_assert(alignof(float) == alignof(SkV4));
+    float* data = kernel[0].ptr();
+    Compute2DBlurKernel(sigma, radii, SkSpan<float>(data, kMaxSamples));
+}
+
+void SkShaderBlurAlgorithm::Compute2DBlurOffsets(SkISize radius,
+                                                 std::array<SkV4, kMaxSamples/2>& offsets) {
+    const int kernelArea = KernelWidth(radius.width()) * KernelWidth(radius.height());
+    SkASSERT(kernelArea <= kMaxSamples);
+
+    SkSpan<float> offsetView{offsets[0].ptr(), kMaxSamples*2};
+
+    int i = 0;
+    for (int y = -radius.height(); y <= radius.height(); ++y) {
+        for (int x = -radius.width(); x <= radius.width(); ++x) {
+            offsetView[2*i]   = x;
+            offsetView[2*i+1] = y;
+            ++i;
+        }
+    }
+    SkASSERT(i == kernelArea);
+    const int lastValidOffset = 2*(kernelArea - 1);
+    for (; i < kMaxSamples; ++i) {
+        offsetView[2*i]   = offsetView[lastValidOffset];
+        offsetView[2*i+1] = offsetView[lastValidOffset+1];
+    }
+}
+
+void SkShaderBlurAlgorithm::Compute1DBlurLinearKernel(
+        float sigma,
+        int radius,
+        std::array<SkV4, kMaxSamples/2>& offsetsAndKernel) {
+    SkASSERT(sigma <= kMaxLinearSigma);
+    SkASSERT(radius == SkBlurEngine::SigmaToRadius(sigma));
+    SkASSERT(LinearKernelWidth(radius) <= kMaxSamples);
+
+    auto get_new_weight = [](float* new_w, float* offset, float wi, float wj) {
+        *new_w = wi + wj;
+        *offset = wj / (wi + wj);
+    };
+
+    static constexpr int kMaxKernelWidth = KernelWidth(kMaxSamples - 1);
+    SkASSERT(KernelWidth(radius) <= kMaxKernelWidth);
+    std::array<float, kMaxKernelWidth> fullKernel;
+    Compute1DBlurKernel(sigma, radius, SkSpan<float>{fullKernel.data(), (size_t)KernelWidth(radius)});
+
+    std::array<float, kMaxSamples> kernel;
+    std::array<float, kMaxSamples> offsets;
+    int halfSize = LinearKernelWidth(radius);
+    int halfRadius = halfSize / 2;
+    int lowIndex = halfRadius - 1;
+
+
+    int index = radius;
+    if (radius & 1) {
+        get_new_weight(&kernel[halfRadius],
+                       &offsets[halfRadius],
+                       fullKernel[index] * 0.5f,
+                       fullKernel[index + 1]);
+        kernel[lowIndex] = kernel[halfRadius];
+        offsets[lowIndex] = -offsets[halfRadius];
+        index++;
+        lowIndex--;
+    } else {
+        kernel[halfRadius] = fullKernel[index];
+        offsets[halfRadius] = 0.0f;
+    }
+    index++;
+
+    for (int i = halfRadius + 1; i < halfSize; index += 2, i++, lowIndex--) {
+        get_new_weight(&kernel[i], &offsets[i], fullKernel[index], fullKernel[index + 1]);
+        offsets[i] += static_cast<float>(index - radius);
+
+        kernel[lowIndex] = kernel[i];
+        offsets[lowIndex] = -offsets[i];
+    }
+
+    memset(kernel.data() + halfSize, 0, sizeof(float)*(kMaxSamples - halfSize));
+    for (int i = halfSize; i < kMaxSamples; ++i) {
+        offsets[i] = offsets[halfSize - 1];
+    }
+
+    for (int i = 0; i < kMaxSamples / 2; ++i) {
+        offsetsAndKernel[i] = SkV4{offsets[2*i], kernel[2*i], offsets[2*i+1], kernel[2*i+1]};
+    }
+}
+
+static SkKnownRuntimeEffects::StableKey to_stablekey(int kernelWidth, uint32_t baseKey) {
+    SkASSERT(kernelWidth >= 2 && kernelWidth <= SkShaderBlurAlgorithm::kMaxSamples);
+    switch(kernelWidth) {
+        case 2:  [[fallthrough]];
+        case 3:  [[fallthrough]];
+        case 4:  return static_cast<SkKnownRuntimeEffects::StableKey>(baseKey);
+        case 5:  [[fallthrough]];
+        case 6:  [[fallthrough]];
+        case 7:  [[fallthrough]];
+        case 8:  return static_cast<SkKnownRuntimeEffects::StableKey>(baseKey+1);
+        case 9:  [[fallthrough]];
+        case 10: [[fallthrough]];
+        case 11: [[fallthrough]];
+        case 12: return static_cast<SkKnownRuntimeEffects::StableKey>(baseKey+2);
+        case 13: [[fallthrough]];
+        case 14: [[fallthrough]];
+        case 15: [[fallthrough]];
+        case 16: return static_cast<SkKnownRuntimeEffects::StableKey>(baseKey+3);
+        case 17: [[fallthrough]];
+        case 18: [[fallthrough]];
+        case 19: [[fallthrough]];
+        case 20: return static_cast<SkKnownRuntimeEffects::StableKey>(baseKey+4);
+        case 21: [[fallthrough]];
+        case 22: [[fallthrough]];
+        case 23: [[fallthrough]];
+        case 24: [[fallthrough]];
+        case 25: [[fallthrough]];
+        case 26: [[fallthrough]];
+        case 27: [[fallthrough]];
+        case 28: return static_cast<SkKnownRuntimeEffects::StableKey>(baseKey+5);
+        default:
+            SkUNREACHABLE;
+    }
+}
+
+const SkRuntimeEffect* SkShaderBlurAlgorithm::GetLinearBlur1DEffect(int radius) {
+    return GetKnownRuntimeEffect(
+            to_stablekey(LinearKernelWidth(radius),
+                         static_cast<uint32_t>(SkKnownRuntimeEffects::StableKey::k1DBlurBase)));
+}
+
+const SkRuntimeEffect* SkShaderBlurAlgorithm::GetBlur2DEffect(const SkISize& radii) {
+    int kernelArea = KernelWidth(radii.width()) * KernelWidth(radii.height());
+    return GetKnownRuntimeEffect(
+            to_stablekey(kernelArea,
+                         static_cast<uint32_t>(SkKnownRuntimeEffects::StableKey::k2DBlurBase)));
+}
+
+sk_sp<SkSpecialImage> SkShaderBlurAlgorithm::renderBlur(SkRuntimeShaderBuilder* blurEffectBuilder,
+                                                        SkFilterMode filter,
+                                                        SkISize radii,
+                                                        sk_sp<SkSpecialImage> input,
+                                                        const SkIRect& srcRect,
+                                                        SkTileMode tileMode,
+                                                        const SkIRect& dstRect) const {
+    SkImageInfo outII = SkImageInfo::Make({dstRect.width(), dstRect.height()},
+                                          input->colorType(),
+                                          kPremul_SkAlphaType,
+                                          input->colorInfo().refColorSpace());
+    sk_sp<SkDevice> device = this->makeDevice(outII);
+    if (!device) {
+        return nullptr;
+    }
+
+    SkIRect subset = SkIRect::MakeSize(dstRect.size());
+    device->clipRect(SkRect::Make(subset), SkClipOp::kIntersect, false);
+    device->setLocalToDevice(SkM44::Translate(-dstRect.left(), -dstRect.top()));
+
+    SkPaint paint;
+    paint.setBlendMode(SkBlendMode::kSrc);
+
+    SkIRect safeSrcRect = srcRect.makeInset(radii.width(), radii.height());
+    SkIRect fastDstRect = dstRect;
+
+    if (srcRect != SkIRect::MakeSize(input->backingStoreDimensions())) {
+        if (fastDstRect.intersect(safeSrcRect)) {
+            if (fastDstRect != dstRect && fastDstRect.width() * fastDstRect.height() < 128 * 128) {
+                fastDstRect.setEmpty();
+            }
+        } else {
+            fastDstRect.setEmpty();
+        }
+    }
+
+    if (!fastDstRect.isEmpty()) {
+        SkIRect untiledSrcRect = srcRect.makeInset(1, 1);
+        SkTileMode fastTileMode = untiledSrcRect.contains(fastDstRect) ? SkTileMode::kClamp
+                                                                       : tileMode;
+        blurEffectBuilder->child("child") = input->asShader(
+                fastTileMode, filter, SkMatrix::I(), false);
+        paint.setShader(blurEffectBuilder->makeShader());
+        device->drawRect(SkRect::Make(fastDstRect), paint);
+    }
+
+    if (fastDstRect != dstRect) {
+        blurEffectBuilder->child("child") = input->makeSubset(srcRect)->asShader(
+                tileMode, filter, SkMatrix::Translate(srcRect.left(), srcRect.top()));
+        paint.setShader(blurEffectBuilder->makeShader());
+    }
+
+    if (fastDstRect.isEmpty()) {
+        device->drawRect(SkRect::Make(dstRect), paint);
+    } else if (fastDstRect != dstRect) {
+        auto drawBorder = [&](const SkIRect& r) {
+            if (!r.isEmpty()) {
+                device->drawRect(SkRect::Make(r), paint);
+            }
+        };
+
+        drawBorder({dstRect.left(),      dstRect.top(),
+                    fastDstRect.left(),  dstRect.bottom()});   
+        drawBorder({fastDstRect.right(), dstRect.top(),
+                    dstRect.right(),     dstRect.bottom()});   
+        drawBorder({fastDstRect.left(),  dstRect.top(),
+                    fastDstRect.right(), fastDstRect.top()});  
+        drawBorder({fastDstRect.left(),  fastDstRect.bottom(),
+                    fastDstRect.right(), dstRect.bottom()});   
+    }
+
+    return device->snapSpecial(subset);
+}
+
+sk_sp<SkSpecialImage> SkShaderBlurAlgorithm::evalBlur2D(SkSize sigma,
+                                                        SkISize radii,
+                                                        sk_sp<SkSpecialImage> input,
+                                                        const SkIRect& srcRect,
+                                                        SkTileMode tileMode,
+                                                        const SkIRect& dstRect) const {
+    std::array<SkV4, kMaxSamples/4> kernel;
+    std::array<SkV4, kMaxSamples/2> offsets;
+    Compute2DBlurKernel(sigma, radii, kernel);
+    Compute2DBlurOffsets(radii, offsets);
+
+    SkRuntimeShaderBuilder builder{sk_ref_sp(GetBlur2DEffect(radii))};
+    builder.uniform("kernel") = kernel;
+    builder.uniform("offsets") = offsets;
+    return this->renderBlur(&builder, SkFilterMode::kNearest, radii,
+                            std::move(input), srcRect, tileMode, dstRect);
+}
+
+sk_sp<SkSpecialImage> SkShaderBlurAlgorithm::evalBlur1D(float sigma,
+                                                        int radius,
+                                                        SkV2 dir,
+                                                        sk_sp<SkSpecialImage> input,
+                                                        SkIRect srcRect,
+                                                        SkTileMode tileMode,
+                                                        SkIRect dstRect) const {
+    std::array<SkV4, kMaxSamples/2> offsetsAndKernel;
+    Compute1DBlurLinearKernel(sigma, radius, offsetsAndKernel);
+
+    SkRuntimeShaderBuilder builder{sk_ref_sp(GetLinearBlur1DEffect(radius))};
+    builder.uniform("offsetsAndKernel") = offsetsAndKernel;
+    builder.uniform("dir") = dir;
+    SkISize radii{dir.x ? radius : 0, dir.y ? radius : 0};
+    return this->renderBlur(&builder, SkFilterMode::kLinear, radii,
+                            std::move(input), srcRect, tileMode, dstRect);
+}
+
+sk_sp<SkSpecialImage> SkShaderBlurAlgorithm::blur(SkSize sigma,
+                                                  sk_sp<SkSpecialImage> src,
+                                                  const SkIRect& srcRect,
+                                                  SkTileMode tileMode,
+                                                  const SkIRect& dstRect) const {
+    SkASSERT(sigma.width() <= kMaxLinearSigma &&  sigma.height() <= kMaxLinearSigma);
+
+    int radiusX = SkBlurEngine::SigmaToRadius(sigma.width());
+    int radiusY = SkBlurEngine::SigmaToRadius(sigma.height());
+    const int kernelArea = KernelWidth(radiusX) * KernelWidth(radiusY);
+    if (kernelArea <= kMaxSamples && radiusX > 0 && radiusY > 0) {
+        return this->evalBlur2D(sigma,
+                                {radiusX, radiusY},
+                                std::move(src),
+                                srcRect,
+                                tileMode,
+                                dstRect);
+    } else {
+        SkIRect intermediateSrcRect = srcRect;
+        SkIRect intermediateDstRect = dstRect;
+        if (radiusX > 0) {
+            if (radiusY > 0) {
+                if (tileMode == SkTileMode::kRepeat || tileMode == SkTileMode::kMirror) {
+                    const int period = srcRect.height() * (tileMode == SkTileMode::kMirror ? 2 : 1);
+                    if (std::abs(dstRect.fTop - srcRect.fTop) % period != 0 ||
+                        dstRect.height() != srcRect.height()) {
+                        intermediateDstRect.outset(0, radiusY);
+                    }
+                } else {
+                    intermediateDstRect.outset(0, radiusY);
+                    intermediateDstRect.fTop = std::max(intermediateDstRect.fTop, srcRect.fTop);
+                    intermediateDstRect.fBottom =
+                            std::min(intermediateDstRect.fBottom, srcRect.fBottom);
+                    if (intermediateDstRect.fTop >= intermediateDstRect.fBottom) {
+                        return nullptr;
+                    }
+                }
+            }
+
+            src = this->evalBlur1D(sigma.width(),
+                                   radiusX,
+                                   {1.f, 0.f},
+                                   std::move(src),
+                                   srcRect,
+                                   tileMode,
+                                   intermediateDstRect);
+            if (!src) {
+                return nullptr;
+            }
+            intermediateSrcRect = SkIRect::MakeWH(src->width(), src->height());
+            intermediateDstRect = dstRect.makeOffset(-intermediateDstRect.left(),
+                                                     -intermediateDstRect.top());
+        }
+
+        if (radiusY > 0) {
+            src = this->evalBlur1D(sigma.height(),
+                                   radiusY,
+                                   {0.f, 1.f},
+                                   std::move(src),
+                                   intermediateSrcRect,
+                                   tileMode,
+                                   intermediateDstRect);
+        }
+
+        return src;
+    }
+}

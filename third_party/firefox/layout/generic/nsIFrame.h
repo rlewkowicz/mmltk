@@ -1,0 +1,3101 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#if !defined(nsIFrame_h_)
+#define nsIFrame_h_
+
+#if !defined(MOZILLA_INTERNAL_API)
+#error This header/class should only be used within Mozilla code. It should not be used by extensions.
+#endif
+
+#  define MAX_REFLOW_DEPTH 1026
+
+
+#include <stdio.h>
+
+#include <algorithm>
+
+#include "FrameProperties.h"
+#include "LayoutConstants.h"
+#include "Visibility.h"
+#include "mozilla/AspectRatio.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Baseline.h"
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/LayoutStructs.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/ReflowOutput.h"
+#include "mozilla/RelativeTo.h"
+#include "mozilla/Result.h"
+#include "mozilla/SmallPointerArray.h"
+#include "mozilla/ToString.h"
+#include "mozilla/WritingModes.h"
+#include "mozilla/dom/RustTypes.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/gfx/CompositorHitTestInfo.h"
+#include "mozilla/gfx/MatrixFwd.h"
+#include "mozilla/intl/BidiEmbeddingLevel.h"
+#include "mozilla/intl/UnicodeProperties.h"
+#include "nsChangeHint.h"
+#include "nsDirection.h"
+#include "nsDisplayItemTypes.h"
+#include "nsFrameList.h"
+#include "nsFrameState.h"
+#include "nsIContent.h"
+#include "nsITheme.h"
+#include "nsPresContext.h"
+#include "nsQueryFrame.h"
+#include "nsStyleStruct.h"
+#include "nsStyleStructList.h"
+#include "nsTHashSet.h"
+
+#if defined(ACCESSIBILITY)
+#  include "mozilla/a11y/AccTypes.h"
+#endif
+
+
+class nsAtom;
+class nsView;
+class nsFrameSelection;
+class nsIWidget;
+class nsISelectionController;
+class nsILineIterator;
+class nsTextControlFrame;
+class gfxSkipChars;
+class gfxSkipCharsIterator;
+class gfxContext;
+class nsLineLink;
+template <typename Link, bool>
+class GenericLineListIterator;
+using LineListIterator = GenericLineListIterator<nsLineLink, false>;
+class nsContainerFrame;
+class nsPlaceholderFrame;
+class nsStyleChangeList;
+class nsViewManager;
+class nsWindowSizes;
+
+enum class AttrModType : uint8_t;  
+
+struct CharacterDataChangeInfo;
+
+namespace mozilla {
+
+enum class CaretAssociationHint;
+enum class IsFocusableFlags : uint8_t;
+enum class PeekOffsetOption : uint16_t;
+enum class PseudoStyleType : uint8_t;
+enum class TableSelectionMode : uint32_t;
+
+class AbsoluteContainingBlock;
+class AnchorPosReferenceData;
+struct LastSuccessfulPositionData;
+class EffectSet;
+class LazyLogModule;
+class nsDisplayItem;
+class nsDisplayList;
+class nsDisplayListBuilder;
+class nsDisplayListSet;
+class PresShell;
+struct ReflowInput;
+class ScrollContainerFrame;
+class ServoRestyleState;
+class WidgetGUIEvent;
+class WidgetMouseEvent;
+
+void DeleteAnchorPosReferenceData(AnchorPosReferenceData*);
+void DeleteLastSuccessfulPositionData(LastSuccessfulPositionData*);
+
+struct PeekOffsetStruct;
+
+namespace layers {
+class Layer;
+class LayerManager;
+}  
+
+namespace layout {
+class ScrollAnchorContainer;
+}  
+
+}  
+
+
+#define INFINITE_ISIZE_COORD nscoord(NS_MAXSIZE - (1000000 * 60))
+
+
+namespace mozilla {
+
+enum class LayoutFrameType : uint8_t {
+#define FRAME_TYPE(ty_, ...) ty_,
+#include "mozilla/FrameTypeList.h"
+#undef FRAME_TYPE
+};
+
+struct RubyMetrics {
+  nscoord mAscent = 0;
+  nscoord mDescent = 0;
+
+  void CombineWith(const RubyMetrics& aOther) {
+    mAscent = std::max(mAscent, aOther.mAscent);
+    mDescent = std::max(mDescent, aOther.mDescent);
+  }
+};
+
+}  
+
+enum nsSelectionAmount {
+  eSelectCharacter = 0,  
+  eSelectCluster = 1,    
+  eSelectWord = 2,
+  eSelectWordNoSpace = 3,  
+  eSelectLine = 4,         
+
+  eSelectBeginLine = 5,
+  eSelectEndLine = 6,
+  eSelectNoAmount = 7,  
+  eSelectParagraph = 8  
+};
+
+class nsReflowStatus final {
+ public:
+  nsReflowStatus()
+      : mFloatClearType(mozilla::UsedClear::None),
+        mInlineBreak(InlineBreak::None),
+        mCompletion(Completion::FullyComplete),
+        mNextInFlowNeedsReflow(false),
+        mFirstLetterComplete(false) {}
+
+  void Reset() {
+    mFloatClearType = mozilla::UsedClear::None;
+    mInlineBreak = InlineBreak::None;
+    mCompletion = Completion::FullyComplete;
+    mNextInFlowNeedsReflow = false;
+    mFirstLetterComplete = false;
+  }
+
+  bool IsEmpty() const {
+    return (IsFullyComplete() && !IsInlineBreak() && !mNextInFlowNeedsReflow &&
+            !mFirstLetterComplete);
+  }
+
+  enum class Completion : uint8_t {
+    FullyComplete,
+    OverflowIncomplete,
+    Incomplete,
+  };
+
+  bool IsIncomplete() const { return mCompletion == Completion::Incomplete; }
+  bool IsOverflowIncomplete() const {
+    return mCompletion == Completion::OverflowIncomplete;
+  }
+  bool IsFullyComplete() const {
+    return mCompletion == Completion::FullyComplete;
+  }
+  bool IsComplete() const { return !IsIncomplete(); }
+
+  void SetIncomplete() { mCompletion = Completion::Incomplete; }
+  void SetOverflowIncomplete() { mCompletion = Completion::OverflowIncomplete; }
+
+  bool NextInFlowNeedsReflow() const { return mNextInFlowNeedsReflow; }
+  void SetNextInFlowNeedsReflow() { mNextInFlowNeedsReflow = true; }
+
+  void MergeCompletionStatusFrom(const nsReflowStatus& aStatus) {
+    if (mCompletion < aStatus.mCompletion) {
+      mCompletion = aStatus.mCompletion;
+    }
+
+    static_assert(
+        Completion::Incomplete > Completion::OverflowIncomplete &&
+            Completion::OverflowIncomplete > Completion::FullyComplete,
+        "mCompletion merging won't work without this!");
+
+    mNextInFlowNeedsReflow |= aStatus.mNextInFlowNeedsReflow;
+  }
+
+  enum class InlineBreak : uint8_t {
+    None,
+    Before,
+    After,
+  };
+
+  bool IsInlineBreak() const { return mInlineBreak != InlineBreak::None; }
+  bool IsInlineBreakBefore() const {
+    return mInlineBreak == InlineBreak::Before;
+  }
+  bool IsInlineBreakAfter() const { return mInlineBreak == InlineBreak::After; }
+  mozilla::UsedClear FloatClearType() const { return mFloatClearType; }
+
+  void SetInlineLineBreakBeforeAndReset() {
+    Reset();
+    mFloatClearType = mozilla::UsedClear::None;
+    mInlineBreak = InlineBreak::Before;
+  }
+
+  void SetInlineLineBreakAfter(
+      mozilla::UsedClear aClearType = mozilla::UsedClear::None) {
+    mFloatClearType = aClearType;
+    mInlineBreak = InlineBreak::After;
+  }
+
+  bool FirstLetterComplete() const { return mFirstLetterComplete; }
+  void SetFirstLetterComplete() { mFirstLetterComplete = true; }
+
+ private:
+  mozilla::UsedClear mFloatClearType;
+  InlineBreak mInlineBreak;
+  Completion mCompletion;
+  bool mNextInFlowNeedsReflow : 1;
+  bool mFirstLetterComplete : 1;
+};
+
+std::ostream& operator<<(std::ostream& aStream, const nsReflowStatus& aStatus);
+
+namespace mozilla {
+
+enum class AlignmentContext {
+  Inline,
+  Table,
+  Flexbox,
+  Grid,
+};
+
+struct IntrinsicSize {
+  Maybe<nscoord> width;
+  Maybe<nscoord> height;
+
+  IntrinsicSize() = default;
+
+  IntrinsicSize(nscoord aWidth, nscoord aHeight)
+      : width(Some(aWidth)), height(Some(aHeight)) {}
+
+  explicit IntrinsicSize(const nsSize& aSize)
+      : IntrinsicSize(aSize.Width(), aSize.Height()) {}
+
+  Maybe<nsSize> ToSize() const {
+    return width && height ? Some(nsSize(*width, *height)) : Nothing();
+  }
+
+  Maybe<nscoord>& ISize(WritingMode aWM) {
+    return aWM.IsVertical() ? height : width;
+  }
+  const Maybe<nscoord>& ISize(WritingMode aWM) const {
+    return aWM.IsVertical() ? height : width;
+  }
+
+  Maybe<nscoord>& BSize(WritingMode aWM) {
+    return aWM.IsVertical() ? width : height;
+  }
+  const Maybe<nscoord>& BSize(WritingMode aWM) const {
+    return aWM.IsVertical() ? width : height;
+  }
+
+  void Zoom(const StyleZoom& aZoom) {
+    if (width) {
+      *width = aZoom.ZoomCoord(*width);
+    }
+    if (height) {
+      *height = aZoom.ZoomCoord(*height);
+    }
+  }
+
+  bool operator==(const IntrinsicSize&) const = default;
+  bool operator!=(const IntrinsicSize&) const = default;
+};
+
+constexpr mozilla::intl::BidiEmbeddingLevel kBidiLevelNone(0xff);
+
+struct FrameBidiData {
+  mozilla::intl::BidiEmbeddingLevel baseLevel;
+  mozilla::intl::BidiEmbeddingLevel embeddingLevel;
+  mozilla::intl::BidiEmbeddingLevel precedingControl;
+};
+
+struct MOZ_STACK_CLASS IntrinsicSizeInput final {
+  gfxContext* const mContext;
+
+  Maybe<LogicalSize> mContainingBlockSize;
+
+  Maybe<LogicalSize> mPercentageBasisForChildren;
+
+  bool HasSomePercentageBasisForChildren() const {
+    return mPercentageBasisForChildren &&
+           !mPercentageBasisForChildren->IsAllValues(NS_UNCONSTRAINEDSIZE);
+  }
+
+  IntrinsicSizeInput(gfxContext* aContext,
+                     const Maybe<LogicalSize>& aContainingBlockSize,
+                     const Maybe<LogicalSize>& aPercentageBasisForChildren)
+      : mContext(aContext),
+        mContainingBlockSize(aContainingBlockSize),
+        mPercentageBasisForChildren(aPercentageBasisForChildren) {
+    MOZ_ASSERT(mContext);
+  }
+
+  IntrinsicSizeInput(const IntrinsicSizeInput& aParentInput,
+                     mozilla::WritingMode aToWM, mozilla::WritingMode aFromWM)
+      : IntrinsicSizeInput(
+            aParentInput.mContext, Nothing(),
+            aParentInput.mPercentageBasisForChildren.map([&](const auto& aPB) {
+              return aPB.ConvertTo(aToWM, aFromWM);
+            })) {}
+};
+
+}  
+
+template <typename T>
+static void DeleteValue(T* aPropertyValue) {
+  delete aPropertyValue;
+}
+
+template <typename T>
+static void ReleaseValue(T* aPropertyValue) {
+  aPropertyValue->Release();
+}
+
+
+#define NS_FRAME_TRACE_CALLS 0x1
+#define NS_FRAME_TRACE_PUSH_PULL 0x2
+#define NS_FRAME_TRACE_CHILD_REFLOW 0x4
+#define NS_FRAME_TRACE_NEW_FRAMES 0x8
+
+#define NS_FRAME_LOG_TEST(_lm, _bit) \
+  (int(((mozilla::LogModule*)(_lm))->Level()) & (_bit))
+
+#if defined(DEBUG)
+#  define NS_FRAME_LOG(_bit, _args)                           \
+    PR_BEGIN_MACRO                                            \
+    if (NS_FRAME_LOG_TEST(nsIFrame::sFrameLogModule, _bit)) { \
+      printf_stderr _args;                                    \
+    }                                                         \
+    PR_END_MACRO
+#else
+#  define NS_FRAME_LOG(_bit, _args)
+#endif
+
+#if defined(DEBUG)
+#  define NS_FRAME_TRACE_IN(_method) Trace(_method, true)
+
+#  define NS_FRAME_TRACE_OUT(_method) Trace(_method, false)
+
+#  define NS_FRAME_TRACE(_bit, _args)                         \
+    PR_BEGIN_MACRO                                            \
+    if (NS_FRAME_LOG_TEST(nsIFrame::sFrameLogModule, _bit)) { \
+      TraceMsg _args;                                         \
+    }                                                         \
+    PR_END_MACRO
+
+#  define NS_FRAME_TRACE_REFLOW_IN(_method) Trace(_method, true)
+
+#  define NS_FRAME_TRACE_REFLOW_OUT(_method, _status) \
+    Trace(_method, false, _status)
+
+#else
+#  define NS_FRAME_TRACE(_bits, _args)
+#  define NS_FRAME_TRACE_IN(_method)
+#  define NS_FRAME_TRACE_OUT(_method)
+#  define NS_FRAME_TRACE_REFLOW_IN(_method)
+#  define NS_FRAME_TRACE_REFLOW_OUT(_method, _status)
+#endif
+
+
+
+#define NS_DECL_FRAMEARENA_HELPERS(class)                                      \
+  NS_DECL_QUERYFRAME_TARGET(class)                                             \
+  static constexpr nsIFrame::ClassID kClassID = nsIFrame::ClassID::class##_id; \
+  void* operator new(size_t, mozilla::PresShell*) MOZ_MUST_OVERRIDE;           \
+  nsQueryFrame::FrameIID GetFrameId() const override MOZ_MUST_OVERRIDE {       \
+    return nsQueryFrame::class##_id;                                           \
+  }
+
+#define NS_IMPL_FRAMEARENA_HELPERS(class)                              \
+  void* class ::operator new(size_t sz, mozilla::PresShell * aShell) { \
+    return aShell->AllocateFrame(nsQueryFrame::class##_id, sz);        \
+  }
+
+#define NS_DECL_ABSTRACT_FRAME(class)                                         \
+  void* operator new(size_t, mozilla::PresShell*) MOZ_MUST_OVERRIDE = delete; \
+  nsQueryFrame::FrameIID GetFrameId() const override MOZ_MUST_OVERRIDE = 0;
+
+
+namespace mozilla {
+
+struct MOZ_RAII FrameDestroyContext {
+  explicit FrameDestroyContext(PresShell* aPs) : mPresShell(aPs) {}
+
+  void AddAnonymousContent(already_AddRefed<nsIContent> aContent) {
+    if (RefPtr<nsIContent> content = aContent) {
+      mAnonymousContent.AppendElement(std::move(content));
+    }
+  }
+
+  ~FrameDestroyContext();
+
+ private:
+  PresShell* const mPresShell;
+  AutoTArray<RefPtr<nsIContent>, 100> mAnonymousContent;
+};
+
+enum class LayoutFrameClassFlags : uint32_t {
+  None = 0,
+  Leaf = 1 << 0,
+  LeafDynamic = 1 << 1,
+  MathML = 1 << 2,
+  SVG = 1 << 3,
+  SVGContainer = 1 << 4,
+  BidiInlineContainer = 1 << 5,
+  Replaced = 1 << 6,
+  ReplacedSizing = 1 << 7,
+  LineParticipant = 1 << 8,
+  TablePart = 1 << 9,
+  CanContainOverflowContainers = 1 << 10,
+  SupportsCSSTransforms = 1 << 11,
+  SupportsContainLayoutAndPaint = 1 << 12,
+  SupportsAspectRatio = 1 << 13,
+  BlockFormattingContext = 1 << 14,
+  SVGRenderingObserverContainer = 1 << 15,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(LayoutFrameClassFlags)
+
+}  
+
+class nsIFrame : public nsQueryFrame {
+ public:
+  using AlignmentContext = mozilla::AlignmentContext;
+  using BaselineSharingGroup = mozilla::BaselineSharingGroup;
+  using BaselineExportContext = mozilla::BaselineExportContext;
+  using BreakType = mozilla::BreakType;
+  template <typename T>
+  using Maybe = mozilla::Maybe<T>;
+  template <typename T, typename E>
+  using Result = mozilla::Result<T, E>;
+  using Nothing = mozilla::Nothing;
+  using OnNonvisible = mozilla::OnNonvisible;
+  using ReflowInput = mozilla::ReflowInput;
+  using SizeComputationInput = mozilla::SizeComputationInput;
+  using ReflowOutput = mozilla::ReflowOutput;
+  using Visibility = mozilla::Visibility;
+  using ContentRelevancy = mozilla::ContentRelevancy;
+
+  using nsDisplayItem = mozilla::nsDisplayItem;
+  using nsDisplayList = mozilla::nsDisplayList;
+  using nsDisplayListSet = mozilla::nsDisplayListSet;
+  using nsDisplayListBuilder = mozilla::nsDisplayListBuilder;
+
+  typedef mozilla::ComputedStyle ComputedStyle;
+  typedef mozilla::FrameProperties FrameProperties;
+  typedef mozilla::layers::LayerManager LayerManager;
+  typedef mozilla::gfx::DrawTarget DrawTarget;
+  typedef mozilla::gfx::Matrix Matrix;
+  typedef mozilla::gfx::Matrix4x4 Matrix4x4;
+  typedef mozilla::gfx::Matrix4x4Flagged Matrix4x4Flagged;
+  typedef mozilla::Sides Sides;
+  typedef mozilla::LogicalSides LogicalSides;
+  typedef mozilla::SmallPointerArray<nsDisplayItem> DisplayItemArray;
+
+  typedef nsQueryFrame::ClassID ClassID;
+
+  using ClassFlags = mozilla::LayoutFrameClassFlags;
+
+ protected:
+  using ChildList = mozilla::FrameChildList;
+  using ChildListID = mozilla::FrameChildListID;
+  using ChildListIDs = mozilla::FrameChildListIDs;
+
+ public:
+  NS_DECL_QUERYFRAME
+  NS_DECL_QUERYFRAME_TARGET(nsIFrame)
+
+  nsIFrame(ComputedStyle* aStyle, nsPresContext* aPresContext, ClassID aID)
+      : mContent(nullptr),
+        mComputedStyle(aStyle),
+        mPresContext(aPresContext),
+        mParent(nullptr),
+        mNextSibling(nullptr),
+        mPrevSibling(nullptr),
+        mState(NS_FRAME_FIRST_REFLOW | NS_FRAME_IS_DIRTY),
+        mWritingMode(aStyle),
+        mClass(aID),
+        mMayHaveRoundedCorners(false),
+        mHasImageRequest(false),
+        mHasFirstLetterChild(false),
+        mParentIsWrapperAnonBox(false),
+        mIsWrapperBoxNeedingRestyle(false),
+        mReflowRequestedForCharDataChange(false),
+        mForceDescendIntoIfVisible(false),
+        mBuiltDisplayList(false),
+        mFrameIsModified(false),
+        mHasModifiedDescendants(false),
+        mHasOverrideDirtyRegion(false),
+#if defined(DEBUG)
+        mWasVisitedByAutoFrameConstructionPageName(false),
+#endif
+        mIsPrimaryFrame(false),
+        mMayHaveTransformAnimation(false),
+        mMayHaveOpacityAnimation(false),
+        mAllDescendantsAreInvisible(false),
+        mHasBSizeChange(false),
+        mHasPaddingChange(false),
+        mInScrollAnchorChain(false),
+        mHasColumnSpanSiblings(false),
+        mDescendantMayDependOnItsStaticPosition(false) {
+    MOZ_ASSERT(mComputedStyle);
+    MOZ_ASSERT(mPresContext);
+    mozilla::PodZero(&mOverflow);
+    MOZ_COUNT_CTOR(nsIFrame);
+  }
+  explicit nsIFrame(ComputedStyle* aStyle, nsPresContext* aPresContext)
+      : nsIFrame(aStyle, aPresContext, ClassID::nsIFrame_id) {}
+
+  nsPresContext* PresContext() const { return mPresContext; }
+
+  mozilla::PresShell* PresShell() const { return PresContext()->PresShell(); }
+
+  virtual nsQueryFrame::FrameIID GetFrameId() const MOZ_MUST_OVERRIDE {
+    return kFrameIID;
+  }
+
+  virtual void Init(nsIContent* aContent, nsContainerFrame* aParent,
+                    nsIFrame* aPrevInFlow);
+
+  void* operator new(size_t, mozilla::PresShell*) MOZ_MUST_OVERRIDE;
+
+  using DestroyContext = mozilla::FrameDestroyContext;
+
+  enum FrameSearchResult {
+    FOUND = 0x00,
+    CONTINUE = 0x1,
+    CONTINUE_EMPTY = 0x2 | CONTINUE,
+    CONTINUE_UNSELECTABLE = 0x4 | CONTINUE,
+  };
+
+  struct MOZ_STACK_CLASS PeekOffsetCharacterOptions {
+    bool mRespectClusters;
+    bool mIgnoreUserStyleAll;
+
+    PeekOffsetCharacterOptions()
+        : mRespectClusters(true), mIgnoreUserStyleAll(false) {}
+  };
+
+  virtual void Destroy(DestroyContext&);
+
+ protected:
+  virtual bool IsFrameSelected() const;
+
+  template <class Source>
+  friend class do_QueryFrameHelper;  
+  friend class nsBlockFrame;         
+
+  virtual ~nsIFrame();
+
+  void operator delete(void* aPtr, size_t sz);
+
+ private:
+  void* operator new(size_t sz) noexcept(true);
+
+  bool HasCSSAnimations();
+
+  bool HasCSSTransitions();
+
+ public:
+  [[nodiscard]] nsIContent* GetContent() const { return mContent; }
+
+  [[nodiscard]] bool ContentIsRootOfNativeAnonymousSubtree() const {
+    return mContent && mContent->IsRootOfNativeAnonymousSubtree();
+  }
+
+  [[nodiscard]] inline bool ContentIsEditable() const;
+
+  nsIContent* GetClosestNativeAnonymousSubtreeRoot() const {
+    return mContent ? mContent->GetClosestNativeAnonymousSubtreeRoot()
+                    : nullptr;
+  }
+
+  virtual nsContainerFrame* GetContentInsertionFrame() { return nullptr; }
+
+  virtual bool DrainSelfOverflowList() { return false; }
+
+  virtual mozilla::ScrollContainerFrame* GetScrollTargetFrame() const {
+    return nullptr;
+  }
+
+  virtual std::pair<int32_t, int32_t> GetOffsets() const;
+
+  virtual void AdjustOffsetsForBidi(int32_t aStart, int32_t aEnd) {}
+
+  ComputedStyle* Style() const { return mComputedStyle; }
+
+  void AssertNewStyleIsSane(ComputedStyle&)
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+      ;
+#else
+  {
+  }
+#endif
+
+  void SetComputedStyle(ComputedStyle* aStyle) {
+    if (aStyle != mComputedStyle) {
+      AssertNewStyleIsSane(*aStyle);
+      RefPtr<ComputedStyle> oldComputedStyle = std::move(mComputedStyle);
+      mComputedStyle = aStyle;
+      DidSetComputedStyle(oldComputedStyle);
+    }
+  }
+
+  RefPtr<ComputedStyle> SetComputedStyleWithoutNotification(
+      RefPtr<ComputedStyle> aStyle) {
+    return std::exchange(mComputedStyle, std::move(aStyle));
+  }
+
+ protected:
+  virtual void DidSetComputedStyle(ComputedStyle* aOldComputedStyle);
+
+ public:
+#define FRAME_STYLE_ACCESSORS(name_)                                 \
+  const nsStyle##name_* Style##name_() const MOZ_NONNULL_RETURN {    \
+    NS_ASSERTION(mComputedStyle, "No style found!");                 \
+    return mComputedStyle->Style##name_();                           \
+  }                                                                  \
+  const nsStyle##name_* Style##name_##WithOptionalParam(             \
+      const nsStyle##name_* aStyleStruct) const MOZ_NONNULL_RETURN { \
+    if (aStyleStruct) {                                              \
+      MOZ_ASSERT(aStyleStruct == Style##name_());                    \
+      return aStyleStruct;                                           \
+    }                                                                \
+    return Style##name_();                                           \
+  }
+  FOR_EACH_STYLE_STRUCT(FRAME_STYLE_ACCESSORS, FRAME_STYLE_ACCESSORS)
+#undef FRAME_STYLE_ACCESSORS
+
+  template <typename T, typename S>
+  nscolor GetVisitedDependentColor(T S::* aField) {
+    return mComputedStyle->GetVisitedDependentColor(aField);
+  }
+
+  already_AddRefed<ComputedStyle> ComputeSelectionStyle(
+      int16_t aSelectionStatus) const;
+
+  already_AddRefed<ComputedStyle> ComputeHighlightSelectionStyle(
+      nsAtom* aHighlightName);
+
+  already_AddRefed<ComputedStyle> ComputeTargetTextStyle() const;
+
+  nsContainerFrame* GetParent() const { return mParent; }
+
+  bool CanBeDynamicReflowRoot() const;
+
+  nsTextControlFrame* GetContainingTextControlFrame() const;
+  bool IsInsideTextControl() const { return !!GetContainingTextControlFrame(); }
+
+  inline nsContainerFrame* GetInFlowParent() const;
+
+  inline nsIFrame* GetClosestFlattenedTreeAncestorPrimaryFrame() const;
+
+  inline nsPlaceholderFrame* GetPlaceholderFrame() const {
+    MOZ_ASSERT(HasAnyStateBits(NS_FRAME_OUT_OF_FLOW));
+    return GetProperty(PlaceholderFrameProperty());
+  }
+
+  void SetParent(nsContainerFrame* aParent);
+
+  mozilla::WritingMode GetWritingMode() const { return mWritingMode; }
+
+  mozilla::WritingMode WritingModeForLine(mozilla::WritingMode aSelfWM,
+                                          nsIFrame* aSubFrame) const;
+
+  nsRect GetRect() const { return mRect; }
+  nsPoint GetPosition() const { return mRect.TopLeft(); }
+  nsSize GetSize() const { return mRect.Size(); }
+  nsRect GetRectRelativeToSelf() const {
+    return nsRect(nsPoint(0, 0), mRect.Size());
+  }
+
+  nsRect GetPaddingRect() const;
+  nsRect GetPaddingRectRelativeToSelf() const;
+  nsRect GetContentRect() const;
+  nsRect GetContentRectRelativeToSelf() const;
+  nsRect GetMarginRect() const;
+  nsRect GetMarginRectRelativeToSelf() const;
+
+  mozilla::LogicalRect GetLogicalRect(const nsSize& aContainerSize) const {
+    return GetLogicalRect(GetWritingMode(), aContainerSize);
+  }
+  mozilla::LogicalPoint GetLogicalPosition(const nsSize& aContainerSize) const {
+    return GetLogicalPosition(GetWritingMode(), aContainerSize);
+  }
+  mozilla::LogicalSize GetLogicalSize() const {
+    return GetLogicalSize(GetWritingMode());
+  }
+  mozilla::LogicalRect GetLogicalRect(mozilla::WritingMode aWritingMode,
+                                      const nsSize& aContainerSize) const {
+    return mozilla::LogicalRect(aWritingMode, GetRect(), aContainerSize);
+  }
+  mozilla::LogicalPoint GetLogicalPosition(mozilla::WritingMode aWritingMode,
+                                           const nsSize& aContainerSize) const {
+    return GetLogicalRect(aWritingMode, aContainerSize).Origin(aWritingMode);
+  }
+  mozilla::LogicalSize GetLogicalSize(mozilla::WritingMode aWritingMode) const {
+    return mozilla::LogicalSize(aWritingMode, GetSize());
+  }
+  nscoord IStart(const nsSize& aContainerSize) const {
+    return IStart(GetWritingMode(), aContainerSize);
+  }
+  nscoord IStart(mozilla::WritingMode aWritingMode,
+                 const nsSize& aContainerSize) const {
+    return GetLogicalPosition(aWritingMode, aContainerSize).I(aWritingMode);
+  }
+  nscoord BStart(const nsSize& aContainerSize) const {
+    return BStart(GetWritingMode(), aContainerSize);
+  }
+  nscoord BStart(mozilla::WritingMode aWritingMode,
+                 const nsSize& aContainerSize) const {
+    return GetLogicalPosition(aWritingMode, aContainerSize).B(aWritingMode);
+  }
+  nscoord ISize() const { return ISize(GetWritingMode()); }
+  nscoord ISize(mozilla::WritingMode aWritingMode) const {
+    return GetLogicalSize(aWritingMode).ISize(aWritingMode);
+  }
+  nscoord BSize() const { return BSize(GetWritingMode()); }
+  nscoord BSize(mozilla::WritingMode aWritingMode) const {
+    return GetLogicalSize(aWritingMode).BSize(aWritingMode);
+  }
+  mozilla::LogicalSize ContentSize() const {
+    return ContentSize(GetWritingMode());
+  }
+
+  mozilla::LogicalSize ContentSize(mozilla::WritingMode aWritingMode) const {
+    return SizeReducedBy(aWritingMode,
+                         GetLogicalUsedBorderAndPadding(GetWritingMode()));
+  }
+
+  mozilla::LogicalSize PaddingSize(mozilla::WritingMode aWritingMode) const {
+    return SizeReducedBy(aWritingMode, GetLogicalUsedBorder(GetWritingMode()));
+  }
+  nscoord ContentISize(mozilla::WritingMode aWritingMode) const {
+    return ContentSize(aWritingMode).ISize(aWritingMode);
+  }
+  nscoord ContentBSize(mozilla::WritingMode aWritingMode) const {
+    return ContentSize(aWritingMode).BSize(aWritingMode);
+  }
+
+  void SetRect(const nsRect& aRect, bool aRebuildDisplayItems = true) {
+    if (aRect == mRect) {
+      return;
+    }
+    if (mOverflow.mType != OverflowStorageType::Large &&
+        mOverflow.mType != OverflowStorageType::None) {
+      mozilla::OverflowAreas overflow = GetOverflowAreas();
+      mRect = aRect;
+      SetOverflowAreas(overflow);
+    } else {
+      mRect = aRect;
+    }
+    if (aRebuildDisplayItems) {
+      MarkNeedsDisplayItemRebuild();
+    }
+  }
+  void SetRect(const mozilla::LogicalRect& aRect,
+               const nsSize& aContainerSize) {
+    SetRect(GetWritingMode(), aRect, aContainerSize);
+  }
+  void SetRect(mozilla::WritingMode aWritingMode,
+               const mozilla::LogicalRect& aRect,
+               const nsSize& aContainerSize) {
+    SetRect(aRect.GetPhysicalRect(aWritingMode, aContainerSize));
+  }
+
+  void SetSize(const mozilla::LogicalSize& aSize) {
+    SetSize(GetWritingMode(), aSize);
+  }
+  void SetSize(mozilla::WritingMode aWritingMode,
+               const mozilla::LogicalSize& aSize) {
+    if (aWritingMode.IsPhysicalRTL()) {
+      nscoord oldWidth = mRect.Width();
+      SetSize(aSize.GetPhysicalSize(aWritingMode));
+      mRect.x -= mRect.Width() - oldWidth;
+    } else {
+      SetSize(aSize.GetPhysicalSize(aWritingMode));
+    }
+  }
+
+  void SetSize(const nsSize& aSize, bool aRebuildDisplayItems = true) {
+    SetRect(nsRect(mRect.TopLeft(), aSize), aRebuildDisplayItems);
+  }
+
+  void SetPosition(const nsPoint& aPt);
+  void SetPosition(mozilla::WritingMode aWritingMode,
+                   const mozilla::LogicalPoint& aPt,
+                   const nsSize& aContainerSize) {
+    SetPosition(
+        aPt.GetPhysicalPoint(aWritingMode, aContainerSize - mRect.Size()));
+  }
+
+  void MovePositionBy(const nsPoint& aTranslation);
+
+  void MovePositionBy(mozilla::WritingMode aWritingMode,
+                      const mozilla::LogicalPoint& aTranslation) {
+    const nsSize nullContainerSize;
+    MovePositionBy(
+        aTranslation.GetPhysicalPoint(aWritingMode, nullContainerSize));
+  }
+
+  nsRect GetNormalRect() const;
+  mozilla::LogicalRect GetLogicalNormalRect(
+      mozilla::WritingMode aWritingMode, const nsSize& aContainerSize) const {
+    return mozilla::LogicalRect(aWritingMode, GetNormalRect(), aContainerSize);
+  }
+
+  nsRect GetBoundingClientRect();
+
+  inline nsPoint GetNormalPosition(bool* aHasProperty = nullptr) const;
+  inline mozilla::LogicalPoint GetLogicalNormalPosition(
+      mozilla::WritingMode aWritingMode, const nsSize& aContainerSize) const;
+
+  virtual nsPoint GetPositionOfChildIgnoringScrolling(const nsIFrame* aChild) {
+    return aChild->GetPosition();
+  }
+
+  nsPoint GetPositionIgnoringScrolling() const;
+
+#define NS_DECLARE_FRAME_PROPERTY_WITH_DTOR(prop, type, dtor)              \
+  static const mozilla::FramePropertyDescriptor<type>* prop() {            \
+         \
+    static const auto descriptor =                                         \
+        mozilla::FramePropertyDescriptor<type>::NewWithDestructor<dtor>(); \
+    return &descriptor;                                                    \
+  }
+
+#define NS_DECLARE_FRAME_PROPERTY_WITH_FRAME_IN_DTOR(prop, type, dtor) \
+  static const mozilla::FramePropertyDescriptor<type>* prop() {        \
+     \
+    static const auto descriptor = mozilla::FramePropertyDescriptor<   \
+        type>::NewWithDestructorWithFrame<dtor>();                     \
+    return &descriptor;                                                \
+  }
+
+#define NS_DECLARE_FRAME_PROPERTY_WITHOUT_DTOR(prop, type)              \
+  static const mozilla::FramePropertyDescriptor<type>* prop() {         \
+      \
+    static const auto descriptor =                                      \
+        mozilla::FramePropertyDescriptor<type>::NewWithoutDestructor(); \
+    return &descriptor;                                                 \
+  }
+
+#define NS_DECLARE_FRAME_PROPERTY_DELETABLE(prop, type) \
+  NS_DECLARE_FRAME_PROPERTY_WITH_DTOR(prop, type, DeleteValue)
+
+#define NS_DECLARE_FRAME_PROPERTY_RELEASABLE(prop, type) \
+  NS_DECLARE_FRAME_PROPERTY_WITH_DTOR(prop, type, ReleaseValue)
+
+#define NS_DECLARE_FRAME_PROPERTY_WITH_DTOR_NEVER_CALLED(prop, type) \
+  static void AssertOnDestroyingProperty##prop(type*) {              \
+    MOZ_ASSERT_UNREACHABLE(                                          \
+        "Frame property " #prop                                      \
+        " should never be destroyed by the FrameProperties class");  \
+  }                                                                  \
+  NS_DECLARE_FRAME_PROPERTY_WITH_DTOR(prop, type,                    \
+                                      AssertOnDestroyingProperty##prop)
+
+#define NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(prop, type) \
+  NS_DECLARE_FRAME_PROPERTY_WITHOUT_DTOR(prop, mozilla::SmallValueHolder<type>)
+
+  NS_DECLARE_FRAME_PROPERTY_WITHOUT_DTOR(IBSplitSibling, nsContainerFrame)
+  NS_DECLARE_FRAME_PROPERTY_WITHOUT_DTOR(IBSplitPrevSibling, nsContainerFrame)
+
+  NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(NormalPositionProperty, nsPoint)
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(ComputedOffsetProperty, nsMargin)
+
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(OutlineInnerRectProperty, nsRect)
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(PreEffectsBBoxProperty, nsRect)
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(PreTransformOverflowAreasProperty,
+                                      mozilla::OverflowAreas)
+
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(OverflowAreasProperty,
+                                      mozilla::OverflowAreas)
+
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(InitialOverflowProperty,
+                                      mozilla::OverflowAreas)
+
+#if defined(DEBUG)
+  NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(DebugInitialOverflowPropertyApplied,
+                                        bool)
+#endif
+
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(UsedMarginProperty, nsMargin)
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(UsedPaddingProperty, nsMargin)
+  NS_DECLARE_FRAME_PROPERTY_WITH_DTOR(AnchorPosReferences,
+                                      mozilla::AnchorPosReferenceData,
+                                      mozilla::DeleteAnchorPosReferenceData);
+
+  NS_DECLARE_FRAME_PROPERTY_WITH_DTOR(
+      LastSuccessfulPositionFallback, mozilla::LastSuccessfulPositionData,
+      mozilla::DeleteLastSuccessfulPositionData);
+
+  mozilla::PhysicalAxes GetAnchorPosCompensatingForScroll() const;
+
+  struct PageValues {
+    RefPtr<const nsAtom> mStartPageValue = nullptr;
+    RefPtr<const nsAtom> mEndPageValue = nullptr;
+  };
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(PageValuesProperty, PageValues)
+
+  const nsAtom* GetStartPageValue() const {
+    if (const PageValues* const values =
+            FirstInFlow()->GetProperty(PageValuesProperty())) {
+      return values->mStartPageValue;
+    }
+    return nullptr;
+  }
+
+  const nsAtom* GetEndPageValue() const {
+    if (const PageValues* const values =
+            FirstInFlow()->GetProperty(PageValuesProperty())) {
+      return values->mEndPageValue;
+    }
+    return nullptr;
+  }
+
+  const nsAtom* GetStylePageName() const {
+    const mozilla::StylePageName& pageName = StylePage()->mPage;
+    if (pageName.IsPageName()) {
+      return pageName.AsPageName().AsAtom();
+    }
+    MOZ_ASSERT(pageName.IsAuto(), "Impossible page name");
+    return nullptr;
+  }
+
+  bool HasUnreflowedContainerQueryAncestor() const;
+
+  bool ShouldBreakBefore(const BreakType aBreakType) const;
+
+  bool ShouldBreakAfter(const BreakType aBreakType) const;
+
+ private:
+  bool ShouldBreakBetween(const nsStyleDisplay* aDisplay,
+                          const mozilla::StyleBreakBetween aBreakBetween,
+                          const BreakType aBreakType) const;
+
+  mozilla::LogicalSize SizeReducedBy(mozilla::WritingMode aWritingMode,
+                                     mozilla::LogicalMargin aMargin) const {
+    mozilla::WritingMode wm = GetWritingMode();
+    const auto m = aMargin.ApplySkipSides(GetLogicalSkipSides())
+                       .ConvertTo(aWritingMode, wm);
+    const auto size = GetLogicalSize(aWritingMode);
+    return mozilla::LogicalSize(
+        aWritingMode,
+        std::max(0, size.ISize(aWritingMode) - m.IStartEnd(aWritingMode)),
+        std::max(0, size.BSize(aWritingMode) - m.BStartEnd(aWritingMode)));
+  }
+
+  NS_DECLARE_FRAME_PROPERTY_RELEASABLE(AutoPageValueProperty, nsAtom)
+
+ public:
+  const nsAtom* GetAutoPageValue() const {
+    if (const nsAtom* const atom = GetProperty(AutoPageValueProperty())) {
+      return atom;
+    }
+    return nsGkAtoms::_empty;
+  }
+  void SetAutoPageValue(const nsAtom* aAtom) {
+    MOZ_ASSERT(aAtom, "Atom must not be null");
+    nsAtom* const atom = const_cast<nsAtom*>(aAtom);
+    if (atom != nsGkAtoms::_empty) {
+      SetProperty(AutoPageValueProperty(), do_AddRef(atom).take());
+    }
+  }
+
+  NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(LineBaselineOffset, nscoord)
+
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(InvalidationRect, nsRect)
+
+  NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(RefusedAsyncAnimationProperty, bool)
+
+  NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(FragStretchBSizeProperty, nscoord)
+
+  NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(BClampMarginBoxMinSizeProperty, nscoord)
+
+  NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(IBaselinePadProperty, nscoord)
+  NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(BBaselinePadProperty, nscoord)
+
+  NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(BidiDataProperty,
+                                        mozilla::FrameBidiData)
+
+  NS_DECLARE_FRAME_PROPERTY_WITHOUT_DTOR(PlaceholderFrameProperty,
+                                         nsPlaceholderFrame)
+
+  NS_DECLARE_FRAME_PROPERTY_RELEASABLE(OffsetPathCache, mozilla::gfx::Path)
+
+  mozilla::FrameBidiData GetBidiData() const {
+    bool exists;
+    mozilla::FrameBidiData bidiData = GetProperty(BidiDataProperty(), &exists);
+    if (!exists) {
+      bidiData.precedingControl = mozilla::kBidiLevelNone;
+    }
+    return bidiData;
+  }
+
+  mozilla::intl::BidiEmbeddingLevel GetBaseLevel() const {
+    return GetBidiData().baseLevel;
+  }
+
+  mozilla::intl::BidiEmbeddingLevel GetEmbeddingLevel() const {
+    return GetBidiData().embeddingLevel;
+  }
+
+  virtual nsMargin GetUsedMargin() const;
+  virtual mozilla::LogicalMargin GetLogicalUsedMargin(
+      mozilla::WritingMode aWritingMode) const {
+    return mozilla::LogicalMargin(aWritingMode, GetUsedMargin());
+  }
+
+  virtual nsMargin GetUsedBorder() const;
+  virtual mozilla::LogicalMargin GetLogicalUsedBorder(
+      mozilla::WritingMode aWritingMode) const {
+    return mozilla::LogicalMargin(aWritingMode, GetUsedBorder());
+  }
+
+  virtual nsMargin GetUsedPadding() const;
+  virtual mozilla::LogicalMargin GetLogicalUsedPadding(
+      mozilla::WritingMode aWritingMode) const {
+    return mozilla::LogicalMargin(aWritingMode, GetUsedPadding());
+  }
+
+  nsMargin GetUsedBorderAndPadding() const {
+    return GetUsedBorder() + GetUsedPadding();
+  }
+  mozilla::LogicalMargin GetLogicalUsedBorderAndPadding(
+      mozilla::WritingMode aWritingMode) const {
+    return mozilla::LogicalMargin(aWritingMode, GetUsedBorderAndPadding());
+  }
+
+  virtual nsRect VisualBorderRectRelativeToSelf() const {
+    return nsRect(0, 0, mRect.Width(), mRect.Height());
+  }
+
+  static bool ComputeBorderRadii(const mozilla::BorderRadius&,
+                                 const mozilla::CornerShapeRect&,
+                                 const nsSize& aFrameSize,
+                                 const nsSize& aBorderArea, Sides aSkipSides,
+                                 nsRectCornerRadii&);
+
+  virtual bool GetBorderRadii(const nsSize& aFrameSize,
+                              const nsSize& aBorderArea, Sides aSkipSides,
+                              nsRectCornerRadii&) const;
+  bool GetBorderRadii(nsRectCornerRadii&) const;
+  bool GetMarginBoxBorderRadii(nsRectCornerRadii&) const;
+  bool GetPaddingBoxBorderRadii(nsRectCornerRadii&) const;
+  bool GetContentBoxBorderRadii(nsRectCornerRadii&) const;
+  bool GetShapeBoxBorderRadii(nsRectCornerRadii&) const;
+
+  nscoord OneEmInAppUnits() const;
+
+  virtual mozilla::RubyMetrics RubyMetrics(float aRubyMetricsFactor) const;
+
+  nscoord GetLogicalBaseline(mozilla::WritingMode aWM) const;
+  nscoord GetLogicalBaseline(mozilla::WritingMode aWM,
+                             BaselineSharingGroup aBaselineGroup,
+                             BaselineExportContext aExportContext) const;
+
+  virtual Maybe<nscoord> GetNaturalBaselineBOffset(
+      mozilla::WritingMode aWM, BaselineSharingGroup aBaselineGroup,
+      BaselineExportContext aExportContext) const {
+    return Nothing{};
+  }
+
+  struct CaretBlockAxisMetrics {
+    nscoord mOffset = 0;
+    nscoord mExtent = 0;
+  };
+  CaretBlockAxisMetrics GetCaretBlockAxisMetrics(mozilla::WritingMode,
+                                                 const nsFontMetrics&) const;
+  const nsAtom* ComputePageValue(const nsAtom* aAutoValue = nullptr) const
+      MOZ_NONNULL_RETURN;
+
+
+  bool TrackingVisibility() const {
+    return HasAnyStateBits(NS_FRAME_VISIBILITY_IS_TRACKED);
+  }
+
+  Visibility GetVisibility() const;
+
+  void UpdateVisibilitySynchronously();
+
+  NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(VisibilityStateProperty, uint32_t);
+
+ protected:
+  virtual nscoord GetCaretBaseline() const {
+    return GetLogicalBaseline(GetWritingMode());
+  }
+
+  nscoord GetFontMetricsDerivedCaretBaseline() const;
+
+  void EnableVisibilityTracking();
+
+  void DisableVisibilityTracking();
+
+  virtual void OnVisibilityChange(
+      Visibility aNewVisibility,
+      const Maybe<OnNonvisible>& aNonvisibleAction = Nothing());
+
+  virtual nscoord SynthesizeFallbackBaseline(
+      mozilla::WritingMode aWM, BaselineSharingGroup aBaselineGroup) const;
+
+ public:
+  virtual BaselineSharingGroup GetDefaultBaselineSharingGroup() const {
+    return BaselineSharingGroup::First;
+  }
+
+
+  void DecApproximateVisibleCount(
+      const Maybe<OnNonvisible>& aNonvisibleAction = Nothing());
+  void IncApproximateVisibleCount();
+
+  virtual const nsFrameList& GetChildList(ChildListID aListID) const;
+  const nsFrameList& PrincipalChildList() const {
+    return GetChildList(mozilla::FrameChildListID::Principal);
+  }
+
+  virtual void GetChildLists(nsTArray<ChildList>* aLists) const;
+
+  AutoTArray<ChildList, 4> ChildLists() const {
+    AutoTArray<ChildList, 4> childLists;
+    GetChildLists(&childLists);
+    return childLists;
+  }
+
+  AutoTArray<ChildList, 4> CrossDocChildLists();
+
+  nsIFrame* GetNextSibling() const { return mNextSibling; }
+  void SetNextSibling(nsIFrame* aNextSibling) {
+    NS_ASSERTION(this != aNextSibling,
+                 "Creating a circular frame list, this is very bad.");
+    if (mNextSibling && mNextSibling->GetPrevSibling() == this) {
+      mNextSibling->mPrevSibling = nullptr;
+    }
+    mNextSibling = aNextSibling;
+    if (mNextSibling) {
+      mNextSibling->mPrevSibling = this;
+    }
+  }
+
+  nsIFrame* GetPrevSibling() const { return mPrevSibling; }
+
+  virtual void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                                const nsDisplayListSet& aLists) {}
+  void DisplayCaret(nsDisplayListBuilder* aBuilder, nsDisplayList* aList);
+
+  virtual nscolor GetCaretColorAt(int32_t aOffset);
+
+  bool IsThemed(nsITheme::Transparency* aTransparencyState = nullptr) const {
+    return IsThemed(StyleDisplay(), aTransparencyState);
+  }
+  bool IsThemed(const nsStyleDisplay* aDisp,
+                nsITheme::Transparency* aTransparencyState = nullptr) const {
+    if (!aDisp->HasNativeAppearance()) {
+      return false;
+    }
+    nsIFrame* mutable_this = const_cast<nsIFrame*>(this);
+    nsPresContext* pc = PresContext();
+    nsITheme* theme = pc->Theme();
+    if (!theme->ThemeSupportsWidget(pc, mutable_this,
+                                    aDisp->EffectiveAppearance())) {
+      return false;
+    }
+    if (aTransparencyState) {
+      *aTransparencyState = theme->GetWidgetTransparency(
+          mutable_this, aDisp->EffectiveAppearance());
+    }
+    return true;
+  }
+
+  void BuildDisplayListForStackingContext(
+      nsDisplayListBuilder* aBuilder, nsDisplayList* aList,
+      bool* aCreatedContainerItem = nullptr);
+
+  enum class DisplayChildFlag {
+    ForcePseudoStackingContext,
+    ForceStackingContext,
+    Inline,
+  };
+  using DisplayChildFlags = mozilla::EnumSet<DisplayChildFlag>;
+
+  void BuildDisplayListForChild(nsDisplayListBuilder* aBuilder,
+                                nsIFrame* aChild,
+                                const nsDisplayListSet& aLists,
+                                DisplayChildFlags aFlags = {});
+
+  void BuildDisplayListForSimpleChild(nsDisplayListBuilder* aBuilder,
+                                      nsIFrame* aChild,
+                                      const nsDisplayListSet& aLists);
+
+  static DisplayChildFlags DisplayFlagsForFlexOrGridItem() {
+    return DisplayChildFlags{DisplayChildFlag::ForcePseudoStackingContext};
+  }
+
+  bool RefusedAsyncAnimation() const {
+    return GetProperty(RefusedAsyncAnimationProperty());
+  }
+
+  bool IsTransformed() const;
+
+  bool IsCSSTransformed() const;
+
+  bool HasAnimationOfTransform() const;
+
+  bool HasAnimationOfOpacity(mozilla::EffectSet* = nullptr) const;
+
+  bool HasOpacity(const nsStyleDisplay* aStyleDisplay,
+                  const nsStyleEffects* aStyleEffects,
+                  mozilla::EffectSet* aEffectSet = nullptr) const {
+    return HasOpacityInternal(1.0f, aStyleDisplay, aStyleEffects, aEffectSet);
+  }
+  bool HasVisualOpacity(const nsStyleDisplay* aStyleDisplay,
+                        const nsStyleEffects* aStyleEffects,
+                        mozilla::EffectSet* aEffectSet = nullptr) const {
+    return HasOpacityInternal(0.99f, aStyleDisplay, aStyleEffects, aEffectSet);
+  }
+
+  using ComputeTransformFunction = Matrix4x4 (*)(const nsIFrame*,
+                                                 float aAppUnitsPerPixel);
+  virtual ComputeTransformFunction GetTransformGetter() const {
+    return nullptr;
+  }
+
+  bool GetParentSVGTransforms(Matrix* aFromParentTransforms = nullptr) const {
+    if (!HasAnyStateBits(NS_FRAME_SVG_LAYOUT)) {
+      return false;
+    }
+    return DoGetParentSVGTransforms(aFromParentTransforms);
+  }
+  virtual bool DoGetParentSVGTransforms(Matrix* = nullptr) const;
+
+  bool Extend3DContext(
+      const nsStyleDisplay* aStyleDisplay, const nsStyleEffects* aStyleEffects,
+      mozilla::EffectSet* aEffectSetForOpacity = nullptr) const;
+  bool Extend3DContext(
+      mozilla::EffectSet* aEffectSetForOpacity = nullptr) const {
+    return Extend3DContext(StyleDisplay(), StyleEffects(),
+                           aEffectSetForOpacity);
+  }
+
+  bool Combines3DTransformWithAncestors() const;
+
+  bool In3DContextAndBackfaceIsHidden() const;
+
+  bool IsPreserve3DLeaf(const nsStyleDisplay* aStyleDisplay,
+                        mozilla::EffectSet* aEffectSet = nullptr) const {
+    return Combines3DTransformWithAncestors() &&
+           !Extend3DContext(aStyleDisplay, StyleEffects(), aEffectSet);
+  }
+  bool IsPreserve3DLeaf(mozilla::EffectSet* aEffectSet = nullptr) const {
+    return IsPreserve3DLeaf(StyleDisplay(), aEffectSet);
+  }
+
+  bool HasPerspective() const;
+
+  bool ChildrenHavePerspective(const nsStyleDisplay* aStyleDisplay) const;
+  bool ChildrenHavePerspective() const {
+    return ChildrenHavePerspective(StyleDisplay());
+  }
+
+  void ComputePreserve3DChildrenOverflow(
+      mozilla::OverflowAreas& aOverflowAreas);
+
+  bool RecomputePerspectiveChildrenOverflow(const nsIFrame* aStartFrame);
+
+  bool ZIndexApplies() const;
+
+  Maybe<int32_t> ZIndex() const;
+
+  bool IsScrollAnchor(
+      mozilla::layout::ScrollAnchorContainer** aOutContainer = nullptr);
+
+  bool IsInScrollAnchorChain() const;
+  void SetInScrollAnchorChain(bool aInChain);
+
+  uint32_t GetDepthInFrameTree() const;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  virtual nsresult HandleEvent(nsPresContext* aPresContext,
+                               mozilla::WidgetGUIEvent* aEvent,
+                               nsEventStatus* aEventStatus);
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  SelectByTypeAtPoint(const nsPoint& aPoint, nsSelectionAmount aBeginAmountType,
+                      nsSelectionAmount aEndAmountType, uint32_t aSelectFlags);
+
+  MOZ_CAN_RUN_SCRIPT nsresult PeekBackwardAndForwardForSelection(
+      nsSelectionAmount aAmountBack, nsSelectionAmount aAmountForward,
+      int32_t aStartPos, bool aJumpLines, uint32_t aSelectFlags);
+
+  enum { SELECT_ACCUMULATE = 0x01 };
+
+ protected:
+  void FireDOMEvent(const nsAString& aDOMEventName,
+                    nsIContent* aContent = nullptr);
+
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHOD
+  HandlePress(nsPresContext* aPresContext, mozilla::WidgetGUIEvent* aEvent,
+              nsEventStatus* aEventStatus);
+
+  MOZ_CAN_RUN_SCRIPT nsresult MoveCaretToEventPoint(
+      nsPresContext* aPresContext, mozilla::WidgetMouseEvent* aMouseEvent,
+      nsEventStatus* aEventStatus);
+
+  [[nodiscard]] bool MovingCaretToEventPointAllowedIfSecondaryButtonEvent(
+      const nsFrameSelection& aFrameSelection,
+      mozilla::WidgetMouseEvent& aSecondaryButtonEvent,
+      const nsIContent& aContentAtEventPoint,
+      int32_t aOffsetAtEventPoint) const;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHOD HandleMultiplePress(
+      nsPresContext* aPresContext, mozilla::WidgetGUIEvent* aEvent,
+      nsEventStatus* aEventStatus, bool aControlHeld);
+
+  MOZ_CAN_RUN_SCRIPT
+  NS_IMETHOD HandleDrag(nsPresContext* aPresContext,
+                        mozilla::WidgetGUIEvent* aEvent,
+                        nsEventStatus* aEventStatus);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHOD
+  HandleRelease(nsPresContext* aPresContext, mozilla::WidgetGUIEvent* aEvent,
+                nsEventStatus* aEventStatus);
+
+  nsresult GetDataForTableSelection(const nsFrameSelection* aFrameSelection,
+                                    mozilla::PresShell* aPresShell,
+                                    mozilla::WidgetMouseEvent* aMouseEvent,
+                                    nsIContent** aParentContent,
+                                    int32_t* aContentOffset,
+                                    mozilla::TableSelectionMode* aTarget);
+
+  enum class ForSelectionStart : bool {
+    No,
+    Yes,
+  };
+  bool ShouldHandleSelectionMovementEvents(
+      ForSelectionStart aType = ForSelectionStart::No);
+
+  static mozilla::StyleUserSelect UsedUserSelect(const nsIFrame* aFrame,
+                                                 ForSelectionStart aType);
+  static Maybe<mozilla::StyleUserSelect> UsedUserSelectRecurse(
+      const nsIFrame* aFrame, ForSelectionStart aType);
+
+ public:
+  virtual nsIContent* GetExplicitEventTargetContent(
+      const mozilla::WidgetEvent* = nullptr) const;
+
+  nsIContent* GetExplicitEventTargetContent(
+      const mozilla::WidgetEvent& aEvent) const {
+    return GetExplicitEventTargetContent(&aEvent);
+  }
+
+  nsIContent* GetEventTargetContent(
+      const mozilla::WidgetEvent* = nullptr) const;
+
+  nsIContent* GetEventTargetContent(const mozilla::WidgetEvent& aEvent) const {
+    return GetEventTargetContent(&aEvent);
+  }
+
+  struct MOZ_STACK_CLASS ContentOffsets {
+    ContentOffsets() = default;
+    bool IsNull() { return !content; }
+    int32_t StartOffset() { return std::min(offset, secondaryOffset); }
+    int32_t EndOffset() { return std::max(offset, secondaryOffset); }
+
+    nsCOMPtr<nsIContent> content;
+    int32_t offset = 0;
+    int32_t secondaryOffset = 0;
+    mozilla::CaretAssociationHint associate{0};  
+  };
+  enum {
+    IGNORE_SELECTION_STYLE = 1 << 0,
+    SKIP_HIDDEN = 1 << 1,
+    IGNORE_NATIVE_ANONYMOUS_SUBTREE = 1 << 2,
+    INCLUDE_REPLACED = 1 << 3,
+  };
+  ContentOffsets GetContentOffsetsFromPoint(const nsPoint& aPoint,
+                                            uint32_t aFlags = 0);
+
+  virtual ContentOffsets GetContentOffsetsFromPointExternal(
+      const nsPoint& aPoint, uint32_t aFlags = 0) {
+    return GetContentOffsetsFromPoint(aPoint, aFlags);
+  }
+
+  virtual ContentOffsets CalcContentOffsetsFromFramePoint(
+      const nsPoint& aPoint);
+
+  [[nodiscard]] bool AssociateImage(const mozilla::StyleImage&);
+
+  void DisassociateImage(const mozilla::StyleImage&);
+
+  const mozilla::ComputedStyle* UsedStyleForImages() const;
+  mozilla::StyleImageRendering UsedImageRendering() const {
+    return UsedStyleForImages()->StyleVisibility()->mImageRendering;
+  }
+  mozilla::StyleImageDecoding UsedImageDecoding() const {
+    return UsedStyleForImages()->StyleVisibility()->mImageDecoding;
+  }
+  mozilla::StyleTouchAction UsedTouchAction() const;
+
+  enum class AllowCustomCursorImage {
+    No,
+    Yes,
+  };
+
+  struct MOZ_STACK_CLASS Cursor {
+    mozilla::StyleCursorKind mCursor = mozilla::StyleCursorKind::Auto;
+    AllowCustomCursorImage mAllowCustomCursor = AllowCustomCursorImage::Yes;
+    RefPtr<mozilla::ComputedStyle> mStyle;
+  };
+
+  virtual Cursor GetCursor(const nsPoint&);
+
+  virtual nsresult GetPointFromOffset(int32_t inOffset, nsPoint* outPoint);
+
+  virtual nsresult GetCharacterRectsInRange(int32_t aInOffset, int32_t aLength,
+                                            nsTArray<nsRect>& aRects);
+
+  virtual nsresult GetChildFrameContainingOffset(
+      int32_t inContentOffset,
+      bool inHint,  
+      int32_t* outFrameContentOffset, nsIFrame** outChildFrame);
+
+  nsFrameState GetStateBits() const { return mState; }
+
+  void AddStateBits(nsFrameState aBits) { mState |= aBits; }
+  void RemoveStateBits(nsFrameState aBits) { mState &= ~aBits; }
+  void AddOrRemoveStateBits(nsFrameState aBits, bool aVal) {
+    aVal ? AddStateBits(aBits) : RemoveStateBits(aBits);
+  }
+
+  bool HasAllStateBits(nsFrameState aBits) const {
+    return (mState & aBits) == aBits;
+  }
+
+  bool HasAnyStateBits(nsFrameState aBits) const { return mState & aBits; }
+
+ protected:
+  virtual void InitPrimaryFrame();
+
+ private:
+  void HandlePrimaryFrameStyleChange(ComputedStyle* aOldStyle);
+
+ public:
+  bool IsPrimaryFrame() const { return mIsPrimaryFrame; }
+
+  void SetIsPrimaryFrame(bool aIsPrimary) {
+    if (mIsPrimaryFrame == aIsPrimary) {
+      return;
+    }
+    mIsPrimaryFrame = aIsPrimary;
+    if (aIsPrimary) {
+      InitPrimaryFrame();
+    }
+  }
+
+  bool ShouldPropagateRepaintsToRoot() const;
+
+  bool IsRenderedLegend() const;
+
+  virtual nsresult CharacterDataChanged(const CharacterDataChangeInfo&);
+
+  virtual nsresult AttributeChanged(int32_t aNameSpaceID, nsAtom* aAttribute,
+                                    AttrModType aModType);
+
+  virtual void ElementStateChanged(mozilla::dom::ElementState aStates);
+
+  virtual nsIFrame* GetPrevContinuation() const;
+  virtual void SetPrevContinuation(nsIFrame*);
+  virtual nsIFrame* GetNextContinuation() const;
+  virtual void SetNextContinuation(nsIFrame*);
+  virtual nsIFrame* FirstContinuation() const {
+    return const_cast<nsIFrame*>(this);
+  }
+  virtual nsIFrame* LastContinuation() const {
+    return const_cast<nsIFrame*>(this);
+  }
+
+  nsIFrame* GetTailContinuation();
+
+  virtual nsIFrame* GetPrevInFlow() const;
+  virtual void SetPrevInFlow(nsIFrame*);
+
+  virtual nsIFrame* GetNextInFlow() const;
+  virtual void SetNextInFlow(nsIFrame*);
+
+  virtual nsIFrame* FirstInFlow() const { return const_cast<nsIFrame*>(this); }
+
+  virtual nsIFrame* LastInFlow() const { return const_cast<nsIFrame*>(this); }
+
+  nsIFrame* FindLineContainer() const;
+
+  virtual void MarkIntrinsicISizesDirty();
+
+  void MarkSubtreeDirty();
+
+  void MarkPrincipalChildrenDirty();
+
+  nscoord GetMinISize(const mozilla::IntrinsicSizeInput& aInput) {
+    return IntrinsicISize(aInput, mozilla::IntrinsicISizeType::MinISize);
+  }
+
+  nscoord GetPrefISize(const mozilla::IntrinsicSizeInput& aInput) {
+    return IntrinsicISize(aInput, mozilla::IntrinsicISizeType::PrefISize);
+  }
+
+  virtual nscoord IntrinsicISize(const mozilla::IntrinsicSizeInput& aInput,
+                                 mozilla::IntrinsicISizeType aType) {
+    return 0;
+  }
+
+  struct InlineIntrinsicISizeData {
+    const LineListIterator* mLine = nullptr;
+
+   private:
+    nsIFrame* mLineContainer = nullptr;
+
+   public:
+    void SetLineContainer(nsIFrame* aLineContainer) {
+      mLineContainer = aLineContainer;
+    }
+    nsIFrame* LineContainer() const { return mLineContainer; }
+
+    nscoord mPrevLines = 0;
+
+    nscoord mCurrentLine = 0;
+
+    nscoord mTrailingWhitespace = 0;
+
+    bool mSkipWhitespace = true;
+
+    class FloatInfo final {
+     public:
+      FloatInfo(const nsIFrame* aFrame, nscoord aISize)
+          : mFrame(aFrame), mISize(aISize) {}
+      const nsIFrame* Frame() const { return mFrame; }
+      nscoord ISize() const { return mISize; }
+
+     private:
+      const nsIFrame* mFrame;
+      nscoord mISize;
+    };
+
+    nsTArray<FloatInfo> mFloats;
+  };
+
+  struct InlineMinISizeData : public InlineIntrinsicISizeData {
+    void DefaultAddInlineMinISize(nsIFrame* aFrame, nscoord aISize,
+                                  bool aAllowBreak = true);
+
+    void ForceBreak();
+
+    void OptionallyBreak(nscoord aHyphenWidth = 0);
+
+    bool mAtStartOfLine = true;
+  };
+
+  struct InlinePrefISizeData : public InlineIntrinsicISizeData {
+    void ForceBreak(mozilla::UsedClear aClearType = mozilla::UsedClear::Both);
+
+    void DefaultAddInlinePrefISize(nscoord aISize);
+
+    bool mLineIsEmpty = true;
+  };
+
+  virtual void AddInlineMinISize(const mozilla::IntrinsicSizeInput& aInput,
+                                 InlineMinISizeData* aData);
+
+  virtual void AddInlinePrefISize(const mozilla::IntrinsicSizeInput& aInput,
+                                  InlinePrefISizeData* aData);
+
+  struct IntrinsicSizeOffsetData {
+    nscoord padding = 0;
+    nscoord border = 0;
+    nscoord margin = 0;
+    nscoord BorderPadding() const { return border + padding; };
+    nscoord MarginBorderPadding() const { return margin + border + padding; }
+  };
+
+  virtual IntrinsicSizeOffsetData IntrinsicISizeOffsets(
+      nscoord aPercentageBasis = NS_UNCONSTRAINEDSIZE);
+
+  IntrinsicSizeOffsetData IntrinsicBSizeOffsets(
+      nscoord aPercentageBasis = NS_UNCONSTRAINEDSIZE);
+
+  virtual mozilla::IntrinsicSize GetIntrinsicSize();
+
+  mozilla::AspectRatio GetAspectRatio() const;
+
+  virtual mozilla::AspectRatio GetIntrinsicRatio() const;
+
+  enum class AspectRatioUsage : uint8_t {
+    None,
+    ToComputeISize,
+    ToComputeBSize,
+  };
+  struct SizeComputationResult {
+    mozilla::LogicalSize mLogicalSize;
+    AspectRatioUsage mAspectRatioUsage = AspectRatioUsage::None;
+  };
+  virtual SizeComputationResult ComputeSize(
+      const SizeComputationInput& aSizingInput, mozilla::WritingMode aWM,
+      const mozilla::LogicalSize& aCBSize, nscoord aAvailableISize,
+      const mozilla::LogicalSize& aMargin,
+      const mozilla::LogicalSize& aBorderPadding,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      mozilla::ComputeSizeFlags aFlags);
+
+  static nscoord ComputeBSizeValueAsPercentageBasis(
+      const mozilla::StyleSize& aStyleBSize,
+      const mozilla::StyleSize& aStyleMinBSize,
+      const mozilla::StyleMaxSize& aStyleMaxBSize, nscoord aCBBSize,
+      nscoord aContentEdgeToBoxSizingBSize);
+
+ protected:
+  virtual mozilla::LogicalSize ComputeAutoSize(
+      const SizeComputationInput& aSizingInput, mozilla::WritingMode aWM,
+      const mozilla::LogicalSize& aCBSize, nscoord aAvailableISize,
+      const mozilla::LogicalSize& aMargin,
+      const mozilla::LogicalSize& aBorderPadding,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      mozilla::ComputeSizeFlags aFlags);
+
+  mozilla::LogicalSize ComputeAbsolutePosAutoSize(
+      const SizeComputationInput& aSizingInput, mozilla::WritingMode aWM,
+      const mozilla::LogicalSize& aCBSize, nscoord aAvailableISize,
+      const mozilla::LogicalSize& aMargin,
+      const mozilla::LogicalSize& aBorderPadding,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      const mozilla::ComputeSizeFlags& aFlags);
+
+  bool IsAbsolutelyPositionedWithDefiniteContainingBlock() const;
+
+  nscoord ShrinkISizeToFit(const mozilla::IntrinsicSizeInput& aInput,
+                           nscoord aISizeInCB,
+                           mozilla::ComputeSizeFlags aFlags);
+
+  nscoord IntrinsicISizeFromInline(const mozilla::IntrinsicSizeInput& aInput,
+                                   mozilla::IntrinsicISizeType aType);
+
+ public:
+  virtual nsRect ComputeTightBounds(DrawTarget* aDrawTarget) const;
+
+  virtual nsresult GetPrefWidthTightBounds(gfxContext* aContext, nscoord* aX,
+                                           nscoord* aXMost);
+
+  virtual void Reflow(nsPresContext* aPresContext, ReflowOutput& aReflowOutput,
+                      const ReflowInput& aReflowInput, nsReflowStatus& aStatus);
+
+  enum class ReflowChildFlags : uint32_t {
+    Default = 0,
+
+    NoMoveFrame = (1 << 0),
+
+    NoDeleteNextInFlowChild = 1 << 1,
+
+    ApplyRelativePositioning = 1 << 2,
+  };
+
+  virtual void DidReflow(nsPresContext* aPresContext,
+                         const ReflowInput* aReflowInput);
+
+  bool UpdateOverflow();
+
+  virtual bool ComputeCustomOverflow(mozilla::OverflowAreas& aOverflowAreas);
+
+  virtual void UnionChildOverflow(mozilla::OverflowAreas& aOverflowAreas,
+                                  bool aAsIfScrolled = false);
+  bool ComputeOverflowClipRectRelativeToSelf(
+      const mozilla::PhysicalAxes aClipAxes, nsRect& aOutRect,
+      nsRectCornerRadii& aOutRadii) const;
+
+  nsMargin OverflowClipMargin(mozilla::PhysicalAxes aClipAxes,
+                              bool aAllowNegative = true) const;
+
+  mozilla::PhysicalAxes ShouldApplyOverflowClipping(
+      const nsStyleDisplay* aDisp) const;
+
+  bool IsSuppressedScrollableBlockForPrint() const;
+
+  virtual bool CanContinueTextRun() const;
+
+  struct RenderedText {
+    nsAutoString mString;
+    uint32_t mOffsetWithinNodeRenderedText;
+    int32_t mOffsetWithinNodeText;
+    RenderedText()
+        : mOffsetWithinNodeRenderedText(0), mOffsetWithinNodeText(0) {}
+  };
+  enum class TextOffsetType {
+    OffsetsInContentText,
+    OffsetsInRenderedText,
+  };
+  enum class TrailingWhitespace {
+    Trim,
+    DontTrim,
+  };
+  virtual RenderedText GetRenderedText(
+      uint32_t aStartOffset = 0, uint32_t aEndOffset = UINT32_MAX,
+      TextOffsetType aOffsetType = TextOffsetType::OffsetsInContentText,
+      TrailingWhitespace aTrimTrailingWhitespace = TrailingWhitespace::Trim) {
+    return RenderedText();
+  }
+
+  virtual bool HasAnyNoncollapsedCharacters() { return false; }
+
+  virtual bool OnlySystemGroupDispatch(mozilla::EventMessage aMessage) const {
+    return false;
+  }
+
+  template <typename SizeOrMaxSize>
+  static inline bool IsIntrinsicKeyword(const SizeOrMaxSize& aSize) {
+    return aSize.IsMaxContent() || aSize.IsMinContent() ||
+           aSize.IsFitContent() || aSize.IsFitContentFunction();
+  }
+
+  bool HasIntrinsicKeywordForBSize() const {
+    const auto bSize = StylePosition()->BSize(
+        GetWritingMode(), AnchorPosResolutionParams::From(this));
+    return IsIntrinsicKeyword(*bSize);
+  }
+
+ public:
+  nsIWidget* GetOwnWidget() const;
+
+  nsPoint GetOffsetTo(const nsIFrame* aOther) const;
+
+  nsPoint GetOffsetToRootFrame() const;
+
+  nsPoint GetOffsetToIgnoringScrolling(const nsIFrame* aOther) const;
+
+  nsPoint GetOffsetToCrossDoc(const nsIFrame* aOther) const;
+
+  nsPoint GetOffsetToCrossDoc(const nsIFrame* aOther, const int32_t aAPD) const;
+
+  mozilla::CSSIntRect GetScreenRect() const;
+
+  nsRect GetScreenRectInAppUnits() const;
+
+  nsIWidget* GetNearestWidget() const;
+
+  bool IsSubgrid() const;
+
+  nsIWidget* GetNearestWidget(nsPoint& aOffset) const;
+
+  bool IsContentDisabled() const;
+
+  enum class IncludeContentVisibility {
+    Auto,
+    Hidden,
+  };
+
+  constexpr static mozilla::EnumSet<IncludeContentVisibility>
+  IncludeAllContentVisibility() {
+    return {IncludeContentVisibility::Auto, IncludeContentVisibility::Hidden};
+  }
+
+  bool IsContentRelevant() const;
+
+  bool HidesContent(const mozilla::EnumSet<IncludeContentVisibility>& =
+                        IncludeAllContentVisibility()) const;
+
+  bool HidesContentForLayout() const;
+
+  nsIFrame* GetClosestContentVisibilityAncestor(
+      const mozilla::EnumSet<IncludeContentVisibility>& =
+          IncludeAllContentVisibility()) const;
+
+  bool IsHiddenByContentVisibilityOnAnyAncestor(
+      const mozilla::EnumSet<IncludeContentVisibility>& =
+          IncludeAllContentVisibility()) const;
+
+  bool IsHiddenUntilFoundOrClosedDetails() const;
+
+  bool IsHiddenByContentVisibilityOfInFlowParentForLayout() const;
+
+  bool HasSelectionInSubtree();
+
+  bool UpdateIsRelevantContent(const ContentRelevancy& aRelevancyToUpdate);
+
+  mozilla::LayoutFrameType Type() const {
+    MOZ_ASSERT(uint8_t(mClass) < std::size(sLayoutFrameTypes));
+    return sLayoutFrameTypes[uint8_t(mClass)];
+  }
+
+  ClassID GetClassID() const { return mClass; }
+
+  ClassFlags GetClassFlags() const {
+    MOZ_ASSERT(uint8_t(mClass) < std::size(sLayoutFrameClassFlags));
+    return sLayoutFrameClassFlags[uint8_t(mClass)];
+  }
+
+  bool HasAnyClassFlag(ClassFlags aFlag) const {
+    return bool(GetClassFlags() & aFlag);
+  }
+
+  bool IsLeaf() const {
+    auto bits = GetClassFlags();
+    if (MOZ_UNLIKELY(bits & ClassFlags::LeafDynamic)) {
+      return IsLeafDynamic();
+    }
+    return bool(bits & ClassFlags::Leaf);
+  }
+  virtual bool IsLeafDynamic() const { return false; }
+
+#define CLASS_FLAG_METHOD(name_, flag_) \
+  bool name_() const { return HasAnyClassFlag(ClassFlags::flag_); }
+#define CLASS_FLAG_METHOD0(name_) CLASS_FLAG_METHOD(name_, name_)
+
+  CLASS_FLAG_METHOD(IsMathMLFrame, MathML);
+  CLASS_FLAG_METHOD(IsSVGFrame, SVG);
+  CLASS_FLAG_METHOD(IsSVGContainerFrame, SVGContainer);
+  CLASS_FLAG_METHOD(IsBidiInlineContainer, BidiInlineContainer);
+  CLASS_FLAG_METHOD(IsLineParticipant, LineParticipant);
+  CLASS_FLAG_METHOD(HasReplacedSizing, ReplacedSizing);
+  CLASS_FLAG_METHOD(IsTablePart, TablePart);
+  CLASS_FLAG_METHOD0(CanContainOverflowContainers)
+  CLASS_FLAG_METHOD0(SupportsCSSTransforms);
+  CLASS_FLAG_METHOD0(SupportsContainLayoutAndPaint)
+  CLASS_FLAG_METHOD0(SupportsAspectRatio)
+  CLASS_FLAG_METHOD(IsSVGRenderingObserverContainer,
+                    SVGRenderingObserverContainer);
+
+#undef CLASS_FLAG_METHOD
+#undef CLASS_FLAG_METHOD0
+
+#if defined(__GNUC__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wtype-limits"
+#endif
+#if defined(__clang__)
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wunknown-pragmas"
+#  pragma clang diagnostic ignored "-Wtautological-unsigned-zero-compare"
+#endif
+
+#define FRAME_TYPE(name_, first_class_, last_class_)                 \
+  bool Is##name_##Frame() const {                                    \
+    return uint8_t(mClass) >= uint8_t(ClassID::first_class_##_id) && \
+           uint8_t(mClass) <= uint8_t(ClassID::last_class_##_id);    \
+  }
+#include "mozilla/FrameTypeList.h"
+#undef FRAME_TYPE
+
+#if defined(__GNUC__)
+#  pragma GCC diagnostic pop
+#endif
+#if defined(__clang__)
+#  pragma clang diagnostic pop
+#endif
+
+  bool IsReplaced() const;
+  bool IsAtomicInline() const;
+
+  enum {
+    IN_CSS_UNITS = 1 << 0,
+    STOP_AT_STACKING_CONTEXT_AND_DISPLAY_PORT = 1 << 1
+  };
+  Matrix4x4Flagged GetTransformMatrix(mozilla::ViewportType aViewportType,
+                                      mozilla::RelativeTo aStopAtAncestor,
+                                      nsIFrame** aOutAncestor,
+                                      uint32_t aFlags = 0) const;
+
+  bool IsPercentageResolvedAgainstZero(
+      const mozilla::StyleSize& aStyleSize,
+      const mozilla::StyleMaxSize& aStyleMaxSize) const;
+
+  enum class SizeProperty { Size, MinSize, MaxSize };
+  bool IsPercentageResolvedAgainstZero(const mozilla::LengthPercentage& aSize,
+                                       SizeProperty aProperty) const;
+
+  bool IsBlockWrapper() const;
+
+  bool IsBlockFrameOrSubclass() const;
+
+  bool IsInlineFrameOrSubclass() const;
+
+  bool IsImageFrameOrSubclass() const;
+
+  bool IsScrollContainerOrSubclass() const;
+
+  enum {
+    SKIP_SCROLLED_FRAME = 0x01
+  };
+  nsIFrame* GetContainingBlock(uint32_t aFlags,
+                               const nsStyleDisplay* aStyleDisplay) const;
+  nsIFrame* GetContainingBlock(uint32_t aFlags = 0) const {
+    return GetContainingBlock(aFlags, StyleDisplay());
+  }
+
+  bool IsBlockContainer() const;
+
+  virtual bool IsFloatContainingBlock() const { return false; }
+
+  virtual void InvalidateFrame(uint32_t aDisplayItemKey = 0,
+                               bool aRebuildDisplayItems = true);
+
+  virtual void InvalidateFrameWithRect(const nsRect& aRect,
+                                       uint32_t aDisplayItemKey = 0,
+                                       bool aRebuildDisplayItems = true);
+
+  void InvalidateFrameSubtree(bool aRebuildDisplayItems = true);
+
+  virtual void InvalidateFrameForRemoval() {}
+
+  bool IsInvalid(nsRect& aRect);
+
+  bool HasInvalidFrameInSubtree() {
+    return HasAnyStateBits(NS_FRAME_NEEDS_PAINT |
+                           NS_FRAME_DESCENDANT_NEEDS_PAINT);
+  }
+
+  void ClearInvalidationStateBits();
+
+  enum PaintType { PAINT_DEFAULT = 0, PAINT_COMPOSITE_ONLY };
+  void SchedulePaint(PaintType aType = PAINT_DEFAULT,
+                     bool aFrameChanged = true);
+
+  void SchedulePaintWithoutInvalidatingObservers(
+      PaintType aType = PAINT_DEFAULT);
+
+  enum { UPDATE_IS_ASYNC = 1 << 0 };
+  void InvalidateLayer(DisplayItemType aDisplayItemKey,
+                       const nsIntRect* aDamageRect = nullptr,
+                       const nsRect* aFrameDamageRect = nullptr,
+                       uint32_t aFlags = 0);
+
+  void MarkNeedsDisplayItemRebuild();
+
+  nsRect InkOverflowRect() const {
+    return GetOverflowRect(mozilla::OverflowType::Ink);
+  }
+
+  nsRect ScrollableOverflowRect() const {
+    return GetOverflowRect(mozilla::OverflowType::Scrollable);
+  }
+
+  mozilla::OverflowAreas GetOverflowAreas() const;
+
+  mozilla::OverflowAreas GetOverflowAreasRelativeToSelf() const;
+
+  mozilla::OverflowAreas GetOverflowAreasRelativeToParent() const;
+
+  mozilla::OverflowAreas GetActualAndNormalOverflowAreasRelativeToParent()
+      const;
+
+  nsRect ScrollableOverflowRectRelativeToParent() const;
+
+  nsRect ScrollableOverflowRectRelativeToSelf() const;
+
+  nsRect InkOverflowRectRelativeToSelf() const;
+
+  nsRect InkOverflowRectRelativeToParent() const;
+
+  nsRect PreEffectsInkOverflowRect() const;
+
+  bool FinishAndStoreOverflow(mozilla::OverflowAreas& aOverflowAreas,
+                              nsSize aNewSize,
+                              const nsStyleDisplay* aStyleDisplay = nullptr);
+
+  bool FinishAndStoreOverflow(ReflowOutput* aMetrics,
+                              const nsStyleDisplay* aStyleDisplay = nullptr) {
+    return FinishAndStoreOverflow(aMetrics->mOverflowAreas,
+                                  nsSize(aMetrics->Width(), aMetrics->Height()),
+                                  aStyleDisplay);
+  }
+
+  bool HasOverflowAreas() const {
+    return mOverflow.mType != OverflowStorageType::None;
+  }
+
+  bool ClearOverflowRects();
+
+  Sides GetSkipSides() const;
+  virtual LogicalSides GetLogicalSkipSides() const {
+    return LogicalSides(mWritingMode);
+  }
+
+  bool IsSelected() const {
+    return (GetContent() && GetContent()->IsMaybeSelected()) ? IsFrameSelected()
+                                                             : false;
+  }
+
+  void SelectionStateChanged() {
+    MOZ_ASSERT(!IsTextFrame());
+    InvalidateFrameSubtree();  
+  }
+
+  [[nodiscard]] bool IsSelectable(
+      mozilla::StyleUserSelect* aSelectStyle = nullptr) const;
+
+  [[nodiscard]] bool ShouldPaintNormalSelection() const;
+
+  bool ShouldHaveLineIfEmpty() const;
+
+  nsISelectionController* GetSelectionController() const;
+
+  int16_t GetDisplaySelection() const;
+
+  already_AddRefed<nsFrameSelection> GetFrameSelection();
+
+  const nsFrameSelection* GetConstFrameSelection() const;
+
+  virtual nsresult PeekOffset(mozilla::PeekOffsetStruct* aPos);
+
+ private:
+  nsresult PeekOffsetForCharacter(mozilla::PeekOffsetStruct* aPos,
+                                  int32_t aOffset);
+  nsresult PeekOffsetForWord(mozilla::PeekOffsetStruct* aPos, int32_t aOffset);
+  nsresult PeekOffsetForLine(mozilla::PeekOffsetStruct* aPos);
+  nsresult PeekOffsetForLineEdge(mozilla::PeekOffsetStruct* aPos);
+
+  nsresult PeekOffsetForParagraph(mozilla::PeekOffsetStruct* aPos);
+
+ public:
+  static void GetLastLeaf(nsIFrame** aFrame);
+  static void GetFirstLeaf(nsIFrame** aFrame);
+
+  struct SelectablePeekReport {
+    nsIFrame* mFrame = nullptr;
+    int32_t mOffset = 0;
+    bool mJumpedLine = false;
+    bool mJumpedHardBreak = false;
+    bool mFoundPlaceholder = false;
+    bool mMovedOverNonSelectableText = false;
+    bool mHasSelectableFrame = false;
+    bool mIgnoredBrFrame = false;
+
+    FrameSearchResult PeekOffsetNoAmount(bool aForward) {
+      return mFrame->PeekOffsetNoAmount(aForward, &mOffset);
+    }
+    FrameSearchResult PeekOffsetCharacter(bool aForward,
+                                          PeekOffsetCharacterOptions aOptions) {
+      return mFrame->PeekOffsetCharacter(aForward, &mOffset, aOptions);
+    };
+
+    void TransferTo(mozilla::PeekOffsetStruct& aPos) const;
+    bool Failed() { return !mFrame; }
+
+    explicit SelectablePeekReport(nsIFrame* aFrame = nullptr,
+                                  int32_t aOffset = 0)
+        : mFrame(aFrame), mOffset(aOffset) {}
+    MOZ_IMPLICIT SelectablePeekReport(
+        const mozilla::GenericErrorResult<nsresult>&& aErr);
+  };
+
+  SelectablePeekReport GetFrameFromDirection(
+      nsDirection aDirection,
+      const mozilla::EnumSet<mozilla::PeekOffsetOption>& aOptions,
+      const mozilla::dom::Element* aAncestorLimiter);
+  SelectablePeekReport GetFrameFromDirection(
+      const mozilla::PeekOffsetStruct& aPos);
+
+  std::pair<nsIFrame*, nsIFrame*> GetContainingBlockForLine(
+      bool aLockScroll) const;
+
+ private:
+  Result<bool, nsresult> IsVisuallyAtLineEdge(nsILineIterator* aLineIterator,
+                                              int32_t aLine,
+                                              nsDirection aDirection);
+  Result<bool, nsresult> IsLogicallyAtLineEdge(nsILineIterator* aLineIterator,
+                                               int32_t aLine,
+                                               nsDirection aDirection);
+
+ public:
+  virtual void ChildIsDirty(nsIFrame* aChild);
+
+#if defined(ACCESSIBILITY)
+  virtual mozilla::a11y::AccType AccessibleType();
+#endif
+
+  virtual ComputedStyle* GetParentComputedStyle(
+      nsIFrame** aProviderFrame) const {
+    return DoGetParentComputedStyle(aProviderFrame);
+  }
+
+  ComputedStyle* DoGetParentComputedStyle(nsIFrame** aProviderFrame) const;
+
+  static nsIFrame* CorrectStyleParentFrame(
+      nsIFrame* aProspectiveParent, mozilla::PseudoStyleType aChildPseudo);
+
+  void UpdateStyleOfOwnedAnonBoxes(mozilla::ServoRestyleState& aRestyleState) {
+    if (HasAnyStateBits(NS_FRAME_OWNS_ANON_BOXES)) {
+      DoUpdateStyleOfOwnedAnonBoxes(aRestyleState);
+    }
+  }
+
+  mozilla::ContainSizeAxes GetContainSizeAxes() const {
+    return StyleDisplay()->GetContainSizeAxes(*this);
+  }
+
+  mozilla::IntrinsicSize FinishIntrinsicSize(
+      const mozilla::ContainSizeAxes& aAxes,
+      const mozilla::IntrinsicSize& aUncontainedSize) const {
+    auto result = aAxes.ContainIntrinsicSize(aUncontainedSize, *this);
+    result.Zoom(Style()->EffectiveZoom());
+    return result;
+  }
+
+  Maybe<nscoord> ContainIntrinsicBSize(nscoord aNoneValue = 0) const {
+    return GetContainSizeAxes().ContainIntrinsicBSize(*this, aNoneValue);
+  }
+
+  Maybe<nscoord> ContainIntrinsicISize(nscoord aNoneValue = 0) const {
+    return GetContainSizeAxes().ContainIntrinsicISize(*this, aNoneValue);
+  }
+
+ protected:
+  void DoUpdateStyleOfOwnedAnonBoxes(mozilla::ServoRestyleState& aRestyleState);
+
+  void UpdateStyleOfChildAnonBox(nsIFrame* aChildFrame,
+                                 mozilla::ServoRestyleState& aRestyleState);
+
+  friend class mozilla::ServoRestyleState;
+
+ public:
+  static nsChangeHint UpdateStyleOfOwnedChildFrame(
+      nsIFrame* aChildFrame, ComputedStyle* aNewComputedStyle,
+      mozilla::ServoRestyleState& aRestyleState,
+      const Maybe<ComputedStyle*>& aContinuationComputedStyle = Nothing());
+
+  struct OwnedAnonBox {
+    typedef void (*UpdateStyleFn)(nsIFrame* aOwningFrame, nsIFrame* aAnonBox,
+                                  mozilla::ServoRestyleState& aRestyleState);
+
+    explicit OwnedAnonBox(nsIFrame* aAnonBoxFrame,
+                          UpdateStyleFn aUpdateStyleFn = nullptr)
+        : mAnonBoxFrame(aAnonBoxFrame), mUpdateStyleFn(aUpdateStyleFn) {}
+
+    nsIFrame* mAnonBoxFrame;
+    UpdateStyleFn mUpdateStyleFn;
+  };
+
+  void AppendOwnedAnonBoxes(nsTArray<OwnedAnonBox>& aResult) {
+    if (HasAnyStateBits(NS_FRAME_OWNS_ANON_BOXES)) {
+      if (IsInlineFrame()) {
+        return;
+      }
+      DoAppendOwnedAnonBoxes(aResult);
+    }
+  }
+
+ protected:
+  void DoAppendOwnedAnonBoxes(nsTArray<OwnedAnonBox>& aResult);
+
+ public:
+  virtual void AppendDirectlyOwnedAnonBoxes(nsTArray<OwnedAnonBox>& aResult);
+
+  bool IsVisibleForPainting() const;
+  bool IsVisibleOrCollapsedForPainting() const;
+
+  bool IsStackingContext(const nsStyleDisplay*, const nsStyleEffects*);
+  bool IsStackingContext();
+
+  struct ShouldPaintBackground {
+    bool mColor = false;
+    bool mImage = false;
+  };
+  ShouldPaintBackground ComputeShouldPaintBackground() const;
+
+  virtual bool IsEmpty();
+  virtual bool CachedIsEmpty();
+  virtual bool IsSelfEmpty();
+
+  bool IsGeneratedContentFrame() const {
+    return HasAnyStateBits(NS_FRAME_GENERATED_CONTENT);
+  }
+
+  bool IsPseudoFrame(const nsIContent* aParentContent) {
+    return mContent == aParentContent;
+  }
+
+  template <typename T>
+  FrameProperties::PropertyType<T> GetProperty(
+      FrameProperties::Descriptor<T> aProperty,
+      bool* aFoundResult = nullptr) const {
+    return mProperties.Get(aProperty, aFoundResult);
+  }
+
+  template <typename T>
+  bool HasProperty(FrameProperties::Descriptor<T> aProperty) const {
+    return mProperties.Has(aProperty);
+  }
+
+  template <typename T>
+  void SetProperty(FrameProperties::Descriptor<T> aProperty,
+                   FrameProperties::PropertyType<T> aValue) {
+    if constexpr (std::is_same_v<T, nsFrameList>) {
+      MOZ_ASSERT(aValue, "Shouldn't set nullptr to a nsFrameList property!");
+      MOZ_ASSERT(!HasProperty(aProperty),
+                 "Shouldn't update an existing nsFrameList property!");
+    }
+    mProperties.Set(aProperty, aValue, this);
+  }
+
+  template <typename T>
+  void AddProperty(FrameProperties::Descriptor<T> aProperty,
+                   FrameProperties::PropertyType<T> aValue) {
+    mProperties.Add(aProperty, aValue);
+  }
+
+  template <typename T>
+  [[nodiscard]] FrameProperties::PropertyType<T> TakeProperty(
+      FrameProperties::Descriptor<T> aProperty, bool* aFoundResult = nullptr) {
+    return mProperties.Take(aProperty, aFoundResult);
+  }
+
+  template <typename T>
+  bool RemoveProperty(FrameProperties::Descriptor<T> aProperty) {
+    return mProperties.Remove(aProperty, this);
+  }
+
+  template <typename T, typename... Params>
+  T* GetOrCreateReleasableProperty(FrameProperties::Descriptor<T> aProperty,
+                                   Params&&... aParams) {
+    bool found;
+    using DataType = std::remove_pointer_t<FrameProperties::PropertyType<T>>;
+    DataType* prop = GetProperty(aProperty, &found);
+    if (found) {
+      MOZ_ASSERT(prop, "this property should only store non-null values");
+      return prop;
+    }
+    prop = new DataType{aParams...};
+    NS_ADDREF(prop);
+    AddProperty(aProperty, prop);
+    return prop;
+  }
+
+  template <typename T, typename... Params>
+  FrameProperties::PropertyType<T> SetOrUpdateDeletableProperty(
+      FrameProperties::Descriptor<T> aProperty, Params&&... aParams) {
+    bool found;
+    using DataType = std::remove_pointer_t<FrameProperties::PropertyType<T>>;
+    DataType* storedValue = GetProperty(aProperty, &found);
+    if (!found) {
+      storedValue = new DataType{aParams...};
+      AddProperty(aProperty, storedValue);
+    } else {
+      *storedValue = DataType{aParams...};
+    }
+    return storedValue;
+  }
+
+  template <typename T>
+  FrameProperties::PropertyType<T> GetOrCreateDeletableProperty(
+      FrameProperties::Descriptor<T> aProperty) {
+    bool found;
+    using DataType = std::remove_pointer_t<FrameProperties::PropertyType<T>>;
+    DataType* storedValue = GetProperty(aProperty, &found);
+    if (!found) {
+      storedValue = new DataType{};
+      AddProperty(aProperty, storedValue);
+    }
+    return storedValue;
+  }
+
+  void RemoveAllProperties() { mProperties.RemoveAll(this); }
+
+  virtual void AddSizeOfExcludingThisForTree(nsWindowSizes& aWindowSizes) const;
+
+  virtual bool SupportsVisibilityHidden() { return true; }
+
+  Maybe<nsRect> GetClipPropClipRect(const nsStyleDisplay* aDisp,
+                                    const nsStyleEffects* aEffects,
+                                    const nsSize& aSize) const;
+
+  bool ForcesStackingContextForViewTransition() const;
+
+  [[nodiscard]] Focusable IsFocusable(
+      mozilla::IsFocusableFlags = mozilla::IsFocusableFlags(0));
+
+ protected:
+  bool IsFocusableDueToScrollFrame();
+
+  bool DoesClipChildrenInBothAxes() const;
+
+ private:
+  nscoord ComputeISizeValueFromAspectRatio(
+      mozilla::WritingMode aWM, const mozilla::LogicalSize& aCBSize,
+      const mozilla::LogicalSize& aContentEdgeToBoxSizing,
+      const mozilla::LengthPercentage& aBSize,
+      const mozilla::AspectRatio& aAspectRatio) const;
+
+ public:
+  virtual bool HasSignificantTerminalNewline() const;
+
+  struct CaretPosition {
+    CaretPosition();
+    ~CaretPosition();
+
+    nsCOMPtr<nsIContent> mResultContent;
+    int32_t mContentOffset;
+  };
+
+  CaretPosition GetExtremeCaretPosition(bool aStart);
+
+  virtual bool CanProvideLineIterator() const { return false; }
+
+  virtual nsILineIterator* GetLineIterator() { return nullptr; }
+
+  virtual void PullOverflowsFromPrevInFlow() {}
+
+  bool IsAbsoluteContainer() const {
+    return !!(mState & NS_FRAME_HAS_ABSPOS_CHILDREN);
+  }
+  bool HasAbsolutelyPositionedChildren() const;
+  mozilla::AbsoluteContainingBlock* GetAbsoluteContainingBlock() const;
+  void MarkAsAbsoluteContainingBlock();
+  void MarkAsNotAbsoluteContainingBlock();
+
+  bool CheckAndClearPaintedState();
+
+  bool CheckAndClearDisplayListState();
+
+  enum { VISIBILITY_CROSS_CHROME_CONTENT_BOUNDARY = 0x01 };
+  bool IsVisibleConsideringAncestors(uint32_t aFlags = 0) const;
+
+  struct FrameWithDistance {
+    nsIFrame* mFrame;
+    nscoord mXDistance;
+    nscoord mYDistance;
+  };
+
+  virtual void FindCloserFrameForSelection(
+      const nsPoint& aPoint, FrameWithDistance* aCurrentBestFrame);
+
+  inline bool IsFlexItem() const;
+  inline bool IsGridItem() const;
+  inline bool IsFlexOrGridItem() const;
+  inline bool IsFlexOrGridContainer() const;
+
+  inline bool IsLegacyWebkitBox() const;
+
+  inline bool IsMasonry(mozilla::WritingMode aWM,
+                        mozilla::LogicalAxis aAxis) const;
+
+  inline bool IsTableCaption() const;
+
+  inline bool IsBlockOutside() const;
+  inline bool IsInlineOutside() const;
+  inline mozilla::StyleDisplay GetDisplay() const;
+  inline bool IsFloating() const;
+  inline bool IsAbsPosContainingBlock() const;
+  inline bool IsFixedPosContainingBlock() const;
+  inline bool IsRelativelyOrStickyPositioned() const;
+  inline bool HasAnchorPosName() const;
+
+  inline bool IsRelativelyPositioned() const;
+  inline bool IsStickyPositioned() const;
+
+  inline bool IsAbsolutelyPositioned(
+      const nsStyleDisplay* aStyleDisplay = nullptr) const;
+  inline bool IsTrueOverflowContainer() const;
+
+  inline bool IsColumnSpan() const;
+
+  inline bool IsColumnSpanInMulticolSubtree() const;
+
+  inline bool HasAnchorPosReference() const;
+
+  mozilla::StyleDominantBaseline DominantBaseline() const;
+
+  mozilla::StyleAlignmentBaseline AlignmentBaseline() const;
+
+  static void AddInPopupStateBitToDescendants(nsIFrame* aFrame);
+  static void RemoveInPopupStateBitFromDescendants(nsIFrame* aFrame);
+
+  bool FrameIsNonFirstInIBSplit() const {
+    return HasAnyStateBits(NS_FRAME_PART_OF_IBSPLIT) &&
+           FirstContinuation()->GetProperty(nsIFrame::IBSplitPrevSibling());
+  }
+
+  bool FrameIsNonLastInIBSplit() const {
+    return HasAnyStateBits(NS_FRAME_PART_OF_IBSPLIT) &&
+           FirstContinuation()->GetProperty(nsIFrame::IBSplitSibling());
+  }
+
+  bool IsContainerForFontSizeInflation() const {
+    return HasAnyStateBits(NS_FRAME_FONT_INFLATION_CONTAINER);
+  }
+
+  bool IsSubtreeDirty() const {
+    return HasAnyStateBits(NS_FRAME_IS_DIRTY | NS_FRAME_HAS_DIRTY_CHILDREN);
+  }
+
+  bool IsInSVGTextSubtree() const {
+    return HasAnyStateBits(NS_FRAME_IS_SVG_TEXT);
+  }
+
+  bool FrameMaintainsOverflow() const {
+    return !HasAllStateBits(NS_FRAME_SVG_LAYOUT | NS_FRAME_IS_NONDISPLAY) &&
+           !(IsSVGOuterSVGFrame() && HasAnyStateBits(NS_FRAME_IS_NONDISPLAY));
+  }
+
+  bool BackfaceIsHidden(const nsStyleDisplay* aStyleDisplay) const {
+    MOZ_ASSERT(aStyleDisplay == StyleDisplay());
+    return aStyleDisplay->BackfaceIsHidden();
+  }
+  bool BackfaceIsHidden() const { return StyleDisplay()->BackfaceIsHidden(); }
+
+  bool IsScrolledOutOfView() const;
+
+  Matrix ComputeWidgetTransform() const;
+
+  bool HasImageRequest() const { return mHasImageRequest; }
+
+  void SetHasImageRequest(bool aHasRequest) { mHasImageRequest = aHasRequest; }
+
+  bool HasFirstLetterChild() const { return mHasFirstLetterChild; }
+
+  bool ParentIsWrapperAnonBox() const { return mParentIsWrapperAnonBox; }
+  void SetParentIsWrapperAnonBox() { mParentIsWrapperAnonBox = true; }
+
+  bool IsWrapperAnonBoxNeedingRestyle() const {
+    return mIsWrapperBoxNeedingRestyle;
+  }
+  void SetIsWrapperAnonBoxNeedingRestyle(bool aNeedsRestyle) {
+    mIsWrapperBoxNeedingRestyle = aNeedsRestyle;
+  }
+
+  bool MayHaveTransformAnimation() const { return mMayHaveTransformAnimation; }
+  void SetMayHaveTransformAnimation() {
+    AddStateBits(NS_FRAME_MAY_BE_TRANSFORMED);
+    mMayHaveTransformAnimation = true;
+  }
+  bool MayHaveOpacityAnimation() const { return mMayHaveOpacityAnimation; }
+  void SetMayHaveOpacityAnimation() { mMayHaveOpacityAnimation = true; }
+
+  bool IsVisibleOrMayHaveVisibleDescendants() const {
+    return !mAllDescendantsAreInvisible || StyleVisibility()->IsVisible();
+  }
+  void UpdateVisibleDescendantsState();
+
+  virtual bool RenumberFrameAndDescendants(int32_t* aOrdinal, int32_t aDepth,
+                                           int32_t aIncrement,
+                                           bool aForCounting) {
+    return false;
+  }
+
+  enum class ExtremumLength {
+    MinContent,
+    MaxContent,
+    MozAvailable,
+    Stretch,
+    FitContent,
+    FitContentFunction,
+  };
+
+  template <typename SizeOrMaxSize>
+  static Maybe<ExtremumLength> ToExtremumLength(const SizeOrMaxSize& aSize) {
+    switch (aSize.tag) {
+      case SizeOrMaxSize::Tag::MinContent:
+        return mozilla::Some(ExtremumLength::MinContent);
+      case SizeOrMaxSize::Tag::MaxContent:
+        return mozilla::Some(ExtremumLength::MaxContent);
+      case SizeOrMaxSize::Tag::MozAvailable:
+        return mozilla::Some(ExtremumLength::MozAvailable);
+      case SizeOrMaxSize::Tag::WebkitFillAvailable:
+      case SizeOrMaxSize::Tag::Stretch:
+        return mozilla::Some(ExtremumLength::Stretch);
+      case SizeOrMaxSize::Tag::FitContent:
+        return mozilla::Some(ExtremumLength::FitContent);
+      case SizeOrMaxSize::Tag::FitContentFunction:
+        return mozilla::Some(ExtremumLength::FitContentFunction);
+      default:
+        return mozilla::Nothing();
+    }
+  }
+
+  struct ISizeComputationResult {
+    nscoord mISize = 0;
+    AspectRatioUsage mAspectRatioUsage = AspectRatioUsage::None;
+  };
+  ISizeComputationResult ComputeISizeValue(
+      gfxContext* aRenderingContext, const mozilla::WritingMode aWM,
+      const mozilla::LogicalSize& aCBSize,
+      const mozilla::LogicalSize& aContentEdgeToBoxSizing,
+      nscoord aBoxSizingToMarginEdge, ExtremumLength aSize,
+      Maybe<nscoord> aAvailableISizeOverride,
+      const mozilla::StyleSize& aStyleBSize,
+      const mozilla::AspectRatio& aAspectRatio,
+      mozilla::ComputeSizeFlags aFlags);
+
+  nscoord ComputeISizeValue(const mozilla::WritingMode aWM,
+                            const mozilla::LogicalSize& aCBSize,
+                            const mozilla::LogicalSize& aContentEdgeToBoxSizing,
+                            const mozilla::LengthPercentage& aSize) const;
+
+  template <typename SizeOrMaxSize>
+  ISizeComputationResult ComputeISizeValue(
+      gfxContext* aRenderingContext, const mozilla::WritingMode aWM,
+      const mozilla::LogicalSize& aCBSize,
+      const mozilla::LogicalSize& aContentEdgeToBoxSizing,
+      nscoord aBoxSizingToMarginEdge, const SizeOrMaxSize& aSize,
+      const mozilla::StyleSize& aStyleBSize,
+      const mozilla::AspectRatio& aAspectRatio,
+      mozilla::ComputeSizeFlags aFlags = {}) {
+    if (aSize.IsLengthPercentage()) {
+      return {ComputeISizeValue(aWM, aCBSize, aContentEdgeToBoxSizing,
+                                aSize.AsLengthPercentage())};
+    }
+    auto length = ToExtremumLength(aSize);
+    MOZ_ASSERT(length, "This doesn't handle none / auto");
+    Maybe<nscoord> availbleISizeOverride;
+    if (aSize.IsFitContentFunction()) {
+      availbleISizeOverride.emplace(
+          aSize.AsFitContentFunction().Resolve(aCBSize.ISize(aWM)));
+    }
+    return ComputeISizeValue(
+        aRenderingContext, aWM, aCBSize, aContentEdgeToBoxSizing,
+        aBoxSizingToMarginEdge, length.valueOr(ExtremumLength::MinContent),
+        availbleISizeOverride, aStyleBSize, aAspectRatio, aFlags);
+  }
+
+  DisplayItemArray& DisplayItems() { return mDisplayItems; }
+  const DisplayItemArray& DisplayItems() const { return mDisplayItems; }
+
+  void AddDisplayItem(nsDisplayItem* aItem);
+  bool RemoveDisplayItem(nsDisplayItem* aItem);
+  void RemoveDisplayItemDataForDeletion();
+  bool HasDisplayItems();
+  bool HasDisplayItem(nsDisplayItem* aItem);
+  bool HasDisplayItem(uint32_t aKey);
+
+  static void PrintDisplayList(nsDisplayListBuilder* aBuilder,
+                               const nsDisplayList& aList, uint32_t aIndent = 0,
+                               bool aDumpHtml = false);
+  static void PrintDisplayList(nsDisplayListBuilder* aBuilder,
+                               const nsDisplayList& aList,
+                               std::stringstream& aStream,
+                               bool aDumpHtml = false);
+  static void PrintDisplayItem(nsDisplayListBuilder* aBuilder,
+                               nsDisplayItem* aItem, std::stringstream& aStream,
+                               uint32_t aIndent = 0, bool aDumpSublist = false,
+                               bool aDumpHtml = false);
+#if defined(MOZ_DUMP_PAINTING)
+  static void PrintDisplayListSet(nsDisplayListBuilder* aBuilder,
+                                  const nsDisplayListSet& aSet,
+                                  std::stringstream& aStream,
+                                  bool aDumpHtml = false);
+#endif
+
+  bool DisplayBackgroundUnconditional(nsDisplayListBuilder* aBuilder,
+                                      const nsDisplayListSet& aLists);
+  void DisplayBorderBackgroundOutline(nsDisplayListBuilder* aBuilder,
+                                      const nsDisplayListSet& aLists);
+  void DisplayOutlineUnconditional(nsDisplayListBuilder* aBuilder,
+                                   const nsDisplayListSet& aLists);
+  void DisplayOutline(nsDisplayListBuilder* aBuilder,
+                      const nsDisplayListSet& aLists);
+
+  void DisplayInsetBoxShadowUnconditional(nsDisplayListBuilder* aBuilder,
+                                          nsDisplayList* aList);
+
+  void DisplayInsetBoxShadow(nsDisplayListBuilder* aBuilder,
+                             nsDisplayList* aList);
+
+  void DisplayOutsetBoxShadowUnconditional(nsDisplayListBuilder* aBuilder,
+                                           nsDisplayList* aList);
+
+  void DisplayOutsetBoxShadow(nsDisplayListBuilder* aBuilder,
+                              nsDisplayList* aList);
+
+  bool ForceDescendIntoIfVisible() const { return mForceDescendIntoIfVisible; }
+  void SetForceDescendIntoIfVisible(bool aForce) {
+    mForceDescendIntoIfVisible = aForce;
+  }
+
+  bool BuiltDisplayList() const { return mBuiltDisplayList; }
+  void SetBuiltDisplayList(const bool aBuilt) { mBuiltDisplayList = aBuilt; }
+
+  bool IsFrameModified() const { return mFrameIsModified; }
+  void SetFrameIsModified(const bool aFrameIsModified) {
+    mFrameIsModified = aFrameIsModified;
+  }
+
+  bool HasModifiedDescendants() const { return mHasModifiedDescendants; }
+  void SetHasModifiedDescendants(const bool aHasModifiedDescendants) {
+    mHasModifiedDescendants = aHasModifiedDescendants;
+  }
+
+  bool HasOverrideDirtyRegion() const { return mHasOverrideDirtyRegion; }
+  void SetHasOverrideDirtyRegion(const bool aHasDirtyRegion) {
+    mHasOverrideDirtyRegion = aHasDirtyRegion;
+  }
+
+  bool HasBSizeChange() const { return mHasBSizeChange; }
+  void SetHasBSizeChange(const bool aHasBSizeChange) {
+    mHasBSizeChange = aHasBSizeChange;
+  }
+
+  bool HasPaddingChange() const { return mHasPaddingChange; }
+  void SetHasPaddingChange(const bool aHasPaddingChange) {
+    mHasPaddingChange = aHasPaddingChange;
+  }
+
+  bool HasColumnSpanSiblings() const { return mHasColumnSpanSiblings; }
+  void SetHasColumnSpanSiblings(bool aHasColumnSpanSiblings) {
+    mHasColumnSpanSiblings = aHasColumnSpanSiblings;
+  }
+
+  bool DescendantMayDependOnItsStaticPosition() const {
+    return mDescendantMayDependOnItsStaticPosition;
+  }
+  void SetDescendantMayDependOnItsStaticPosition(bool aValue) {
+    mDescendantMayDependOnItsStaticPosition = aValue;
+  }
+
+  nsRect GetCompositorHitTestArea(nsDisplayListBuilder* aBuilder);
+
+  mozilla::gfx::CompositorHitTestInfo GetCompositorHitTestInfo(
+      nsDisplayListBuilder* aBuilder);
+
+  mozilla::gfx::CompositorHitTestInfo
+  GetCompositorHitTestInfoWithoutPointerEvents(nsDisplayListBuilder* aBuilder);
+
+  inline void PropagateWritingModeToSelfAndAncestors(mozilla::WritingMode aWM);
+
+  void HandleLastRememberedSize();
+
+ protected:
+  nsRect mRect;
+  nsCOMPtr<nsIContent> mContent;
+  RefPtr<ComputedStyle> mComputedStyle;
+
+ private:
+  nsPresContext* const mPresContext;
+  nsContainerFrame* mParent;
+  nsIFrame* mNextSibling;  
+  nsIFrame* mPrevSibling;  
+
+  DisplayItemArray mDisplayItems;
+
+  void MarkAbsoluteFramesForDisplayList(nsDisplayListBuilder* aBuilder);
+
+ protected:
+  void MarkInReflow() {
+#if defined(DEBUG_dbaron_off)
+    NS_ASSERTION(!(mState & NS_FRAME_IN_REFLOW), "frame is already in reflow");
+#endif
+    AddStateBits(NS_FRAME_IN_REFLOW);
+  }
+
+ private:
+  nsFrameState mState;
+
+ protected:
+  FrameProperties mProperties;
+
+  struct InkOverflowDeltas {
+    static constexpr uint8_t kMax = 0xfe;
+
+    uint8_t mLeft;
+    uint8_t mTop;
+    uint8_t mRight;
+    uint8_t mBottom;
+    bool operator==(const InkOverflowDeltas& aOther) const = default;
+    bool operator!=(const InkOverflowDeltas& aOther) const = default;
+  };
+  enum class OverflowStorageType : uint32_t {
+    None = 0x00000000u,
+
+    Large = 0x000000ffu,
+  };
+  union {
+    OverflowStorageType mType;
+    InkOverflowDeltas mInkOverflowDeltas;
+  } mOverflow;
+
+  mozilla::WritingMode mWritingMode;
+
+  const ClassID mClass;  
+
+  bool mMayHaveRoundedCorners : 1;
+
+  bool mHasImageRequest : 1;
+
+  bool mHasFirstLetterChild : 1;
+
+  bool mParentIsWrapperAnonBox : 1;
+
+  bool mIsWrapperBoxNeedingRestyle : 1;
+
+  bool mReflowRequestedForCharDataChange : 1;
+
+  bool mForceDescendIntoIfVisible : 1;
+
+  bool mBuiltDisplayList : 1;
+
+  bool mFrameIsModified : 1;
+
+  bool mHasModifiedDescendants : 1;
+
+  bool mHasOverrideDirtyRegion : 1;
+
+#if defined(DEBUG)
+ public:
+  bool mWasVisitedByAutoFrameConstructionPageName : 1;
+#endif
+
+ private:
+  bool mIsPrimaryFrame : 1;
+
+  bool mMayHaveTransformAnimation : 1;
+  bool mMayHaveOpacityAnimation : 1;
+
+  bool mAllDescendantsAreInvisible : 1;
+
+  bool mHasBSizeChange : 1;
+
+  bool mHasPaddingChange : 1;
+
+  bool mInScrollAnchorChain : 1;
+
+  bool mHasColumnSpanSiblings : 1;
+
+  bool mDescendantMayDependOnItsStaticPosition : 1;
+
+ protected:
+  virtual FrameSearchResult PeekOffsetNoAmount(bool aForward, int32_t* aOffset);
+
+  virtual FrameSearchResult PeekOffsetCharacter(
+      bool aForward, int32_t* aOffset,
+      PeekOffsetCharacterOptions aOptions = PeekOffsetCharacterOptions());
+  static_assert(sizeof(PeekOffsetCharacterOptions) <= sizeof(intptr_t),
+                "aOptions should be changed to const reference");
+
+  struct PeekWordState {
+    using Script = mozilla::intl::Script;
+    bool mAtStart = true;
+    bool mSawBeforeType = false;
+    bool mSawInlineCharacter = false;
+    bool mLastCharWasPunctuation = false;
+    bool mLastCharWasWhitespace = false;
+    bool mSeenNonPunctuationSinceWhitespace = false;
+    Script mLastScript = Script::INVALID;
+    nsAutoString mContext;
+
+    PeekWordState() = default;
+    void SetSawBeforeType() { mSawBeforeType = true; }
+    void SetSawInlineCharacter() { mSawInlineCharacter = true; }
+    void Update(bool aAfterPunctuation, bool aAfterWhitespace,
+                Script aScript = Script::INVALID) {
+      mLastCharWasPunctuation = aAfterPunctuation;
+      mLastCharWasWhitespace = aAfterWhitespace;
+      if (aAfterWhitespace) {
+        mSeenNonPunctuationSinceWhitespace = false;
+      } else if (!aAfterPunctuation) {
+        mSeenNonPunctuationSinceWhitespace = true;
+      }
+      if (aScript != Script::INHERITED) {
+        mLastScript = aScript;
+      }
+      mAtStart = false;
+    }
+  };
+
+  virtual FrameSearchResult PeekOffsetWord(
+      bool aForward, bool aWordSelectEatSpace, bool aIsKeyboardSelect,
+      int32_t* aOffset, PeekWordState* aState, bool aTrimSpaces);
+
+ protected:
+  static bool BreakWordBetweenPunctuation(const PeekWordState* aState,
+                                          bool aForward, bool aPunctAfter,
+                                          bool aWhitespaceAfter,
+                                          bool aIsKeyboardSelect);
+
+ private:
+  nsRect GetOverflowRect(mozilla::OverflowType aType) const;
+
+  mozilla::OverflowAreas* GetOverflowAreasProperty() const {
+    MOZ_ASSERT(mOverflow.mType == OverflowStorageType::Large);
+    mozilla::OverflowAreas* overflow = GetProperty(OverflowAreasProperty());
+    MOZ_ASSERT(overflow);
+    return overflow;
+  }
+
+  nsRect InkOverflowFromDeltas() const {
+    MOZ_ASSERT(mOverflow.mType != OverflowStorageType::Large,
+               "should not be called when overflow is in a property");
+    return nsRect(-(int32_t)mOverflow.mInkOverflowDeltas.mLeft,
+                  -(int32_t)mOverflow.mInkOverflowDeltas.mTop,
+                  mRect.Width() + mOverflow.mInkOverflowDeltas.mRight +
+                      mOverflow.mInkOverflowDeltas.mLeft,
+                  mRect.Height() + mOverflow.mInkOverflowDeltas.mBottom +
+                      mOverflow.mInkOverflowDeltas.mTop);
+  }
+
+  bool SetOverflowAreas(const mozilla::OverflowAreas& aOverflowAreas);
+
+  bool HasOpacityInternal(float aThreshold, const nsStyleDisplay* aStyleDisplay,
+                          const nsStyleEffects* aStyleEffects,
+                          mozilla::EffectSet* aEffectSet = nullptr) const;
+
+  static constexpr size_t kFrameClassCount =
+#define FRAME_ID(...) 1 +
+#define ABSTRACT_FRAME_ID(...)
+#include "mozilla/FrameIdList.h"
+#undef FRAME_ID
+#undef ABSTRACT_FRAME_ID
+      0;
+
+  static const mozilla::LayoutFrameType sLayoutFrameTypes[kFrameClassCount];
+  static const ClassFlags sLayoutFrameClassFlags[kFrameClassCount];
+
+#if defined(DEBUG_FRAME_DUMP)
+ public:
+  static void IndentBy(FILE* out, int32_t aIndent) {
+    while (--aIndent >= 0) {
+      fputs("  ", out);
+    }
+  }
+  void ListTag(FILE* out) const { fputs(ListTag().get(), out); }
+  nsAutoCString ListTag(bool aListOnlyDeterministic = false) const;
+
+  enum class ListFlag {
+    TraverseSubdocumentFrames,
+    DisplayInCSSPixels,
+    OnlyListDeterministicInfo
+  };
+  using ListFlags = mozilla::EnumSet<ListFlag>;
+
+  template <typename T>
+  static std::string ConvertToString(const T& aValue, ListFlags aFlags) {
+    return aFlags.contains(ListFlag::DisplayInCSSPixels)
+               ? mozilla::ToString(mozilla::CSSPixel::FromAppUnits(aValue))
+               : mozilla::ToString(aValue);
+  }
+  static std::string ConvertToString(const mozilla::LogicalRect& aRect,
+                                     const mozilla::WritingMode aWM,
+                                     ListFlags aFlags);
+  static std::string ConvertToString(const mozilla::LogicalSize& aSize,
+                                     const mozilla::WritingMode aWM,
+                                     ListFlags aFlags);
+
+  template <typename T>
+  static void ListPtr(nsACString& aTo, const ListFlags& aFlags, const T* aPtr,
+                      const char* aPrefix = "=") {
+    ListPtr(aTo, aFlags.contains(ListFlag::OnlyListDeterministicInfo), aPtr,
+            aPrefix);
+  }
+
+  template <typename T>
+  static void ListPtr(nsACString& aTo, bool aSkip, const T* aPtr,
+                      const char* aPrefix = "=") {
+    if (aSkip) {
+      return;
+    }
+    aTo += nsPrintfCString("%s%p", aPrefix, static_cast<const void*>(aPtr));
+  }
+
+  void ListGeneric(nsACString& aTo, const char* aPrefix = "",
+                   ListFlags aFlags = ListFlags()) const;
+  virtual void List(FILE* out = stderr, const char* aPrefix = "",
+                    ListFlags aFlags = ListFlags()) const;
+
+  void ListTextRuns(FILE* out = stderr) const;
+  virtual void ListTextRuns(FILE* out, nsTHashSet<const void*>& aSeen) const;
+
+  virtual void ListWithMatchedRules(FILE* out = stderr,
+                                    const char* aPrefix = "") const;
+  void ListMatchedRules(FILE* out, const char* aPrefix) const;
+
+  void DumpFrameTree() const;
+  void DumpFrameTree(bool aListOnlyDeterministic) const;
+  void DumpFrameTreeInCSSPixels() const;
+  void DumpFrameTreeInCSSPixels(bool aListOnlyDeterministic) const;
+
+  void DumpFrameTreeLimited() const;
+  void DumpFrameTreeLimitedInCSSPixels() const;
+
+  virtual nsresult GetFrameName(nsAString& aResult) const;
+  nsresult MakeFrameName(const nsAString& aType, nsAString& aResult) const;
+  static mozilla::Maybe<uint32_t> ContentIndexInContainer(
+      const nsIFrame* aFrame);
+#endif
+
+#if defined(DEBUG)
+  void Trace(const char* aMethod, bool aEnter);
+  void Trace(const char* aMethod, bool aEnter, const nsReflowStatus& aStatus);
+  void TraceMsg(const char* aFormatString, ...) MOZ_FORMAT_PRINTF(2, 3);
+
+  static void VerifyDirtyBitSet(const nsFrameList& aFrameList);
+
+  static mozilla::LazyLogModule sFrameLogModule;
+#endif
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(nsIFrame::ReflowChildFlags)
+
+
+class WeakFrame;
+class MOZ_NONHEAP_CLASS AutoWeakFrame {
+ public:
+  explicit constexpr AutoWeakFrame() : mPrev(nullptr), mFrame(nullptr) {}
+
+  AutoWeakFrame(const AutoWeakFrame& aOther) : mPrev(nullptr), mFrame(nullptr) {
+    Init(aOther.GetFrame());
+  }
+
+  MOZ_IMPLICIT AutoWeakFrame(const WeakFrame& aOther);
+
+  MOZ_IMPLICIT AutoWeakFrame(nsIFrame* aFrame)
+      : mPrev(nullptr), mFrame(nullptr) {
+    Init(aFrame);
+  }
+
+  AutoWeakFrame& operator=(AutoWeakFrame& aOther) {
+    Init(aOther.GetFrame());
+    return *this;
+  }
+
+  AutoWeakFrame& operator=(nsIFrame* aFrame) {
+    Init(aFrame);
+    return *this;
+  }
+
+  nsIFrame* operator->() { return mFrame; }
+
+  operator nsIFrame*() { return mFrame; }
+
+  void Clear(mozilla::PresShell* aPresShell);
+
+  bool IsAlive() const { return !!mFrame; }
+
+  nsIFrame* GetFrame() const { return mFrame; }
+
+  AutoWeakFrame* GetPreviousWeakFrame() { return mPrev; }
+
+  void SetPreviousWeakFrame(AutoWeakFrame* aPrev) { mPrev = aPrev; }
+
+  ~AutoWeakFrame();
+
+  void* operator new(size_t) = delete;
+  void* operator new[](size_t) = delete;
+  void operator delete(void*) = delete;
+  void operator delete[](void*) = delete;
+
+ private:
+  void Init(nsIFrame* aFrame);
+
+  AutoWeakFrame* mPrev;
+  nsIFrame* mFrame;
+};
+
+inline do_QueryFrameHelper<nsIFrame> do_QueryFrame(AutoWeakFrame& s) {
+  return do_QueryFrameHelper<nsIFrame>(s.GetFrame());
+}
+
+class MOZ_HEAP_CLASS WeakFrame {
+ public:
+  WeakFrame() : mFrame(nullptr) {}
+
+  WeakFrame(const WeakFrame& aOther) : mFrame(nullptr) {
+    Init(aOther.GetFrame());
+  }
+
+  MOZ_IMPLICIT WeakFrame(const AutoWeakFrame& aOther) : mFrame(nullptr) {
+    Init(aOther.GetFrame());
+  }
+
+  MOZ_IMPLICIT WeakFrame(nsIFrame* aFrame) : mFrame(nullptr) { Init(aFrame); }
+
+  ~WeakFrame() {
+    Clear(mFrame ? mFrame->PresContext()->GetPresShell() : nullptr);
+  }
+
+  WeakFrame& operator=(WeakFrame& aOther) {
+    Init(aOther.GetFrame());
+    return *this;
+  }
+
+  WeakFrame& operator=(nsIFrame* aFrame) {
+    Init(aFrame);
+    return *this;
+  }
+
+  nsIFrame* operator->() { return mFrame; }
+  operator nsIFrame*() { return mFrame; }
+
+  bool operator==(nsIFrame* const aOther) const { return mFrame == aOther; }
+
+  void Clear(mozilla::PresShell* aPresShell);
+
+  bool IsAlive() const { return !!mFrame; }
+  nsIFrame* GetFrame() const { return mFrame; }
+
+ private:
+  void Init(nsIFrame* aFrame);
+
+  nsIFrame* mFrame;
+};
+
+inline do_QueryFrameHelper<nsIFrame> do_QueryFrame(WeakFrame& s) {
+  return do_QueryFrameHelper<nsIFrame>(s.GetFrame());
+}
+
+inline bool nsFrameList::ContinueRemoveFrame(nsIFrame* aFrame) {
+  MOZ_ASSERT(!aFrame->GetPrevSibling() || !aFrame->GetNextSibling(),
+             "Forgot to call StartRemoveFrame?");
+  if (aFrame == mLastChild) {
+    MOZ_ASSERT(!aFrame->GetNextSibling(), "broken frame list");
+    nsIFrame* prevSibling = aFrame->GetPrevSibling();
+    if (!prevSibling) {
+      MOZ_ASSERT(aFrame == mFirstChild, "broken frame list");
+      mFirstChild = mLastChild = nullptr;
+      return true;
+    }
+    MOZ_ASSERT(prevSibling->GetNextSibling() == aFrame, "Broken frame linkage");
+    prevSibling->SetNextSibling(nullptr);
+    mLastChild = prevSibling;
+    return true;
+  }
+  if (aFrame == mFirstChild) {
+    MOZ_ASSERT(!aFrame->GetPrevSibling(), "broken frame list");
+    mFirstChild = aFrame->GetNextSibling();
+    aFrame->SetNextSibling(nullptr);
+    MOZ_ASSERT(mFirstChild, "broken frame list");
+    return true;
+  }
+  return false;
+}
+
+inline bool nsFrameList::StartRemoveFrame(nsIFrame* aFrame) {
+  if (aFrame->GetPrevSibling() && aFrame->GetNextSibling()) {
+    UnhookFrameFromSiblings(aFrame);
+    return true;
+  }
+  return ContinueRemoveFrame(aFrame);
+}
+
+
+inline nsIFrame* nsFrameList::ForwardFrameTraversal::Next(nsIFrame* aFrame) {
+  MOZ_ASSERT(aFrame);
+  return aFrame->GetNextSibling();
+}
+inline nsIFrame* nsFrameList::ForwardFrameTraversal::Prev(nsIFrame* aFrame) {
+  MOZ_ASSERT(aFrame);
+  return aFrame->GetPrevSibling();
+}
+
+inline nsIFrame* nsFrameList::BackwardFrameTraversal::Next(nsIFrame* aFrame) {
+  MOZ_ASSERT(aFrame);
+  return aFrame->GetPrevSibling();
+}
+inline nsIFrame* nsFrameList::BackwardFrameTraversal::Prev(nsIFrame* aFrame) {
+  MOZ_ASSERT(aFrame);
+  return aFrame->GetNextSibling();
+}
+
+inline AnchorPosResolutionParams AnchorPosResolutionParams::From(
+    const nsIFrame* aFrame,
+    mozilla::AnchorPosResolutionCache* aAnchorPosResolutionCache) {
+  return {aFrame, aFrame->StyleDisplay()->mPosition, aAnchorPosResolutionCache,
+          AutoResolutionOverrideParams{aFrame, aAnchorPosResolutionCache}};
+}
+
+#endif

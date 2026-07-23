@@ -1,0 +1,407 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "AbortSignal.h"
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/AbortSignalBinding.h"
+#include "mozilla/dom/DOMException.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/EventBinding.h"
+#include "mozilla/dom/TimeoutHandler.h"
+#include "mozilla/dom/TimeoutManager.h"
+#include "mozilla/dom/ToJSValue.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsGlobalWindowInner.h"
+#include "nsPIDOMWindow.h"
+
+namespace mozilla::dom {
+
+
+AbortSignalImpl::AbortSignalImpl(SignalAborted aAborted,
+                                 JS::Handle<JS::Value> aReason)
+    : mReason(aReason), mAborted(aAborted) {
+  MOZ_ASSERT_IF(!mReason.isUndefined(), Aborted());
+}
+
+bool AbortSignalImpl::Aborted() const { return mAborted == SignalAborted::Yes; }
+
+void AbortSignalImpl::GetReason(JSContext* aCx,
+                                JS::MutableHandle<JS::Value> aReason) {
+  if (!Aborted()) {
+    return;
+  }
+  MaybeAssignAbortError(aCx);
+  aReason.set(mReason);
+  if (NS_WARN_IF(!JS_WrapValue(aCx, aReason))) {
+    aReason.setUndefined();
+    JS_ClearPendingException(aCx);
+  }
+}
+
+JS::Value AbortSignalImpl::RawReason() const { return mReason.get(); }
+
+void AbortSignalImpl::SignalAbort(JS::Handle<JS::Value> aReason) {
+  if (Aborted()) {
+    return;
+  }
+
+  SetAborted(aReason);
+
+  SignalAbortWithDependents();
+}
+
+void AbortSignalImpl::SignalAbortWithDependents() {
+  RunAbortSteps();
+}
+
+void AbortSignalImpl::RunAbortSteps() {
+  for (RefPtr<AbortFollower> follower : mFollowers.ForwardRange()) {
+    MOZ_ASSERT(follower->mFollowingSignal == this);
+    follower->RunAbortAlgorithm();
+  }
+
+  UnlinkFollowers();
+}
+
+void AbortSignalImpl::SetAborted(JS::Handle<JS::Value> aReason) {
+  mAborted = SignalAborted::Yes;
+  mReason = aReason;
+}
+
+void AbortSignalImpl::Traverse(AbortSignalImpl* aSignal,
+                               nsCycleCollectionTraversalCallback& cb) {
+  ImplCycleCollectionTraverse(cb, aSignal->mFollowers, "mFollowers", 0);
+}
+
+void AbortSignalImpl::Unlink(AbortSignalImpl* aSignal) {
+  aSignal->mReason.setUndefined();
+  aSignal->UnlinkFollowers();
+  aSignal->DetachWeakPtr();
+}
+
+void AbortSignalImpl::MaybeAssignAbortError(JSContext* aCx) {
+  MOZ_ASSERT(Aborted());
+  if (!mReason.isUndefined()) {
+    return;
+  }
+
+  JS::Rooted<JS::Value> exception(aCx);
+  RefPtr<DOMException> dom = DOMException::Create(NS_ERROR_DOM_ABORT_ERR);
+
+  if (NS_WARN_IF(!ToJSValue(aCx, dom, &exception))) {
+    return;
+  }
+
+  mReason.set(exception);
+}
+
+void AbortSignalImpl::UnlinkFollowers() {
+  for (RefPtr<AbortFollower>& follower : mFollowers.ForwardRange()) {
+    follower->mFollowingSignal = nullptr;
+  }
+  mFollowers.Clear();
+}
+
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(AbortSignal)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(AbortSignal,
+                                                  DOMEventTargetHelper)
+  AbortSignalImpl::Traverse(static_cast<AbortSignalImpl*>(tmp), cb);
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDependentSignals)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(AbortSignal,
+                                                DOMEventTargetHelper)
+  AbortSignalImpl::Unlink(static_cast<AbortSignalImpl*>(tmp));
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDependentSignals)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(AbortSignal)
+NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
+
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN_INHERITED(AbortSignal,
+                                               DOMEventTargetHelper)
+  NS_IMPL_CYCLE_COLLECTION_TRACE_JS_MEMBER_CALLBACK(mReason)
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+NS_IMPL_ADDREF_INHERITED(AbortSignal, DOMEventTargetHelper)
+NS_IMPL_RELEASE_INHERITED(AbortSignal, DOMEventTargetHelper)
+
+already_AddRefed<AbortSignal> AbortSignal::Create(
+    nsIGlobalObject* aGlobalObject, SignalAborted aAborted,
+    JS::Handle<JS::Value> aReason) {
+  RefPtr<AbortSignal> signal =
+      new AbortSignal(aGlobalObject, aAborted, aReason);
+  signal->Init();
+  return signal.forget();
+}
+
+void AbortSignal::Init() {
+  mozilla::HoldJSObjects(this);
+}
+
+AbortSignal::AbortSignal(nsIGlobalObject* aGlobalObject, SignalAborted aAborted,
+                         JS::Handle<JS::Value> aReason)
+    : DOMEventTargetHelper(aGlobalObject),
+      AbortSignalImpl(aAborted, aReason),
+      mDependent(false) {}
+
+JSObject* AbortSignal::WrapObject(JSContext* aCx,
+                                  JS::Handle<JSObject*> aGivenProto) {
+  return AbortSignal_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+already_AddRefed<AbortSignal> AbortSignal::Abort(
+    GlobalObject& aGlobal, JS::Handle<JS::Value> aReason) {
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+
+  RefPtr<AbortSignal> abortSignal =
+      AbortSignal::Create(global, SignalAborted::Yes, aReason);
+  return abortSignal.forget();
+}
+
+class AbortSignalTimeoutHandler final : public TimeoutHandler {
+ public:
+  AbortSignalTimeoutHandler(JSContext* aCx, AbortSignal* aSignal)
+      : TimeoutHandler(aCx), mSignal(aSignal) {}
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS(AbortSignalTimeoutHandler)
+
+  MOZ_CAN_RUN_SCRIPT bool Call(const char* ) override {
+    AutoJSAPI jsapi;
+    if (NS_WARN_IF(!jsapi.Init(mSignal->GetParentObject()))) {
+      return true;
+    }
+
+    JS::Rooted<JS::Value> exception(jsapi.cx());
+    RefPtr<DOMException> dom = DOMException::Create(NS_ERROR_DOM_TIMEOUT_ERR);
+    if (NS_WARN_IF(!ToJSValue(jsapi.cx(), dom, &exception))) {
+      return true;
+    }
+
+    mSignal->SignalAbort(exception);
+    return true;
+  }
+
+ private:
+  ~AbortSignalTimeoutHandler() override = default;
+
+  RefPtr<AbortSignal> mSignal;
+};
+
+NS_IMPL_CYCLE_COLLECTION(AbortSignalTimeoutHandler, mSignal)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(AbortSignalTimeoutHandler)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(AbortSignalTimeoutHandler)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(AbortSignalTimeoutHandler)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+static void SetTimeoutForGlobal(GlobalObject& aGlobal, TimeoutHandler& aHandler,
+                                int32_t timeout, ErrorResult& aRv) {
+  if (NS_IsMainThread()) {
+    nsCOMPtr<nsPIDOMWindowInner> innerWindow =
+        do_QueryInterface(aGlobal.GetAsSupports());
+    if (!innerWindow) {
+      aRv.ThrowInvalidStateError("Could not find window.");
+      return;
+    }
+
+    int32_t handle;
+    nsresult rv =
+        nsGlobalWindowInner::Cast(innerWindow)
+            ->GetTimeoutManager()
+            ->SetTimeout(&aHandler, timeout,  false,
+                         Timeout::Reason::eAbortSignalTimeout, &handle);
+    if (NS_FAILED(rv)) {
+      aRv.Throw(rv);
+      return;
+    }
+  } else {
+    WorkerPrivate* workerPrivate =
+        GetWorkerPrivateFromContext(aGlobal.Context());
+    workerPrivate->SetTimeout(aGlobal.Context(), &aHandler, timeout,
+                               false,
+                              Timeout::Reason::eAbortSignalTimeout, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+}
+
+already_AddRefed<AbortSignal> AbortSignal::Timeout(GlobalObject& aGlobal,
+                                                   uint64_t aMilliseconds,
+                                                   ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+
+  RefPtr<AbortSignal> signal =
+      AbortSignal::Create(global, SignalAborted::No, JS::UndefinedHandleValue);
+
+  RefPtr<TimeoutHandler> handler =
+      new AbortSignalTimeoutHandler(aGlobal.Context(), signal);
+
+  int32_t timeout =
+      aMilliseconds > uint64_t(std::numeric_limits<int32_t>::max())
+          ? std::numeric_limits<int32_t>::max()
+          : static_cast<int32_t>(aMilliseconds);
+
+  SetTimeoutForGlobal(aGlobal, *handler, timeout, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  return signal.forget();
+}
+
+already_AddRefed<AbortSignal> AbortSignal::Any(
+    GlobalObject& aGlobal,
+    const Sequence<OwningNonNull<AbortSignal>>& aSignals) {
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+  return Any(global, aSignals, [](nsIGlobalObject* aGlobal) {
+    return AbortSignal::Create(aGlobal, SignalAborted::No,
+                               JS::UndefinedHandleValue);
+  });
+}
+
+already_AddRefed<AbortSignal> AbortSignal::Any(
+    nsIGlobalObject* aGlobal,
+    const Span<const OwningNonNull<AbortSignal>>& aSignals,
+    FunctionRef<already_AddRefed<AbortSignal>(nsIGlobalObject* aGlobal)>
+        aCreateResultSignal) {
+  RefPtr<AbortSignal> resultSignal = aCreateResultSignal(aGlobal);
+
+  if (!aSignals.IsEmpty()) {
+    AutoJSAPI jsapi;
+    if (!jsapi.Init(aGlobal)) {
+      return nullptr;
+    }
+    JSContext* cx = jsapi.cx();
+
+    for (const auto& signal : aSignals) {
+      if (signal->Aborted()) {
+        JS::Rooted<JS::Value> reason(cx);
+        signal->GetReason(cx, &reason);
+        resultSignal->SetAborted(reason);
+        return resultSignal.forget();
+      }
+    }
+  }
+
+  resultSignal->mDependent = true;
+
+  for (const auto& signal : aSignals) {
+    if (!signal->Dependent()) {
+      resultSignal->MakeDependentOn(signal);
+    } else {
+      for (const auto& sourceSignal : signal->mSourceSignals) {
+        if (!sourceSignal) {
+          continue;
+        }
+        MOZ_ASSERT(!sourceSignal->Aborted() && !sourceSignal->Dependent());
+        resultSignal->MakeDependentOn(sourceSignal);
+      }
+    }
+  }
+
+  return resultSignal.forget();
+}
+
+void AbortSignal::MakeDependentOn(AbortSignal* aSignal) {
+  MOZ_ASSERT(mDependent);
+  MOZ_ASSERT(aSignal);
+  if (!mSourceSignals.Contains(aSignal)) {
+    mSourceSignals.AppendElement(aSignal);
+  }
+  if (!aSignal->mDependentSignals.Contains(this)) {
+    aSignal->mDependentSignals.AppendElement(this);
+  }
+}
+
+void AbortSignal::ThrowIfAborted(JSContext* aCx, ErrorResult& aRv) {
+  aRv.MightThrowJSException();
+
+  if (Aborted()) {
+    JS::Rooted<JS::Value> reason(aCx);
+    GetReason(aCx, &reason);
+    aRv.ThrowJSException(aCx, reason);
+  }
+}
+
+void AbortSignal::SignalAbortWithDependents() {
+  nsTArray<RefPtr<AbortSignal>> dependentSignalsToAbort;
+
+  nsTArray<RefPtr<AbortSignal>> dependentSignals = std::move(mDependentSignals);
+
+  if (!dependentSignals.IsEmpty()) {
+    AutoJSAPI jsapi;
+    if (!jsapi.Init(GetParentObject())) {
+      return;
+    }
+    JSContext* cx = jsapi.cx();
+    JS::Rooted<JS::Value> reason(cx);
+    GetReason(cx, &reason);
+
+    for (const auto& dependentSignal : dependentSignals) {
+      MOZ_ASSERT(dependentSignal->mSourceSignals.Contains(this));
+      if (!dependentSignal->Aborted()) {
+        dependentSignal->SetAborted(reason);
+        dependentSignalsToAbort.AppendElement(dependentSignal);
+      }
+    }
+  }
+
+  RunAbortSteps();
+
+  for (const auto& dependentSignal : dependentSignalsToAbort) {
+    dependentSignal->RunAbortSteps();
+  }
+}
+
+void AbortSignal::RunAbortSteps() {
+  AbortSignalImpl::RunAbortSteps();
+
+  EventInit init;
+  init.mBubbles = false;
+  init.mCancelable = false;
+
+  RefPtr<Event> event = Event::Constructor(this, u"abort"_ns, init);
+  event->SetTrusted(true);
+
+  DispatchEvent(*event);
+}
+
+bool AbortSignal::Dependent() const { return mDependent; }
+
+AbortSignal::~AbortSignal() { mozilla::DropJSObjects(this); }
+
+
+AbortFollower::~AbortFollower() { Unfollow(); }
+
+void AbortFollower::Follow(AbortSignalImpl* aSignal) {
+  if (aSignal->Aborted()) {
+    return;
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(aSignal);
+
+  Unfollow();
+
+  mFollowingSignal = aSignal;
+  MOZ_ASSERT(!aSignal->mFollowers.Contains(this));
+  aSignal->mFollowers.AppendElement(this);
+}
+
+void AbortFollower::Unfollow() {
+  if (mFollowingSignal) {
+    mFollowingSignal->mFollowers.RemoveElement(this);
+    mFollowingSignal = nullptr;
+  }
+}
+
+bool AbortFollower::IsFollowing() const { return !!mFollowingSignal; }
+
+}  

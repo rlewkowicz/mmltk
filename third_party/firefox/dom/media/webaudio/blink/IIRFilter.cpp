@@ -1,0 +1,141 @@
+// Copyright 2016 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "IIRFilter.h"
+
+#include <mozilla/Assertions.h>
+
+#include <complex>
+
+#include "DenormalDisabler.h"
+#include "fdlibm.h"
+
+namespace blink {
+
+const int kBufferLength = 32;
+static_assert(kBufferLength >= IIRFilter::kMaxOrder + 1,
+              "Internal IIR buffer length must be greater than maximum IIR "
+              "Filter order.");
+
+IIRFilter::IIRFilter(const AudioDoubleArray* feedforwardCoef,
+                     const AudioDoubleArray* feedbackCoef)
+    : m_bufferIndex(0),
+      m_feedback(feedbackCoef),
+      m_feedforward(feedforwardCoef) {
+  m_xBuffer.SetLength(kBufferLength);
+  m_yBuffer.SetLength(kBufferLength);
+  reset();
+}
+
+IIRFilter::~IIRFilter() = default;
+
+void IIRFilter::reset() {
+  memset(m_xBuffer.Elements(), 0, m_xBuffer.Length() * sizeof(double));
+  memset(m_yBuffer.Elements(), 0, m_yBuffer.Length() * sizeof(double));
+}
+
+static std::complex<double> evaluatePolynomial(const double* coef,
+                                               std::complex<double> z,
+                                               int order) {
+  std::complex<double> result = 0;
+
+  for (int k = order; k >= 0; --k)
+    result = result * z + std::complex<double>(coef[k]);
+
+  return result;
+}
+
+void IIRFilter::process(const float* sourceP, float* destP,
+                        size_t framesToProcess) {
+
+  const double* feedback = m_feedback->Elements();
+  const double* feedforward = m_feedforward->Elements();
+
+  MOZ_ASSERT(feedback);
+  MOZ_ASSERT(feedforward);
+
+  MOZ_ASSERT(feedback[0] == 1);
+
+  int feedbackLength = m_feedback->Length();
+  int feedforwardLength = m_feedforward->Length();
+  int minLength = std::min(feedbackLength, feedforwardLength);
+
+  double* xBuffer = m_xBuffer.Elements();
+  double* yBuffer = m_yBuffer.Elements();
+
+  for (size_t n = 0; n < framesToProcess; ++n) {
+    double yn = feedforward[0] * sourceP[n];
+
+    for (int k = 1; k < minLength; ++k) {
+      int n = (m_bufferIndex - k) & (kBufferLength - 1);
+      yn += feedforward[k] * xBuffer[n];
+      yn -= feedback[k] * yBuffer[n];
+    }
+
+    for (int k = minLength; k < feedforwardLength; ++k)
+      yn += feedforward[k] * xBuffer[(m_bufferIndex - k) & (kBufferLength - 1)];
+
+    for (int k = minLength; k < feedbackLength; ++k)
+      yn -= feedback[k] * yBuffer[(m_bufferIndex - k) & (kBufferLength - 1)];
+
+    m_xBuffer[m_bufferIndex] = sourceP[n];
+    m_yBuffer[m_bufferIndex] = yn;
+
+    m_bufferIndex = (m_bufferIndex + 1) & (kBufferLength - 1);
+
+    destP[n] = WebCore::DenormalDisabler::flushDenormalFloatToZero(yn);
+    MOZ_ASSERT(destP[n] == 0.0 || std::fabs(destP[n]) > FLT_MIN ||
+                   std::isnan(destP[n]),
+               "output should not be subnormal, but can be NaN");
+  }
+}
+
+void IIRFilter::getFrequencyResponse(int nFrequencies, const float* frequency,
+                                     float* magResponse, float* phaseResponse) {
+
+  for (int k = 0; k < nFrequencies; ++k) {
+    double omega = -M_PI * frequency[k];
+    std::complex<double> zRecip =
+        std::complex<double>(fdlibm_cos(omega), fdlibm_sin(omega));
+
+    std::complex<double> numerator = evaluatePolynomial(
+        m_feedforward->Elements(), zRecip, m_feedforward->Length() - 1);
+    std::complex<double> denominator = evaluatePolynomial(
+        m_feedback->Elements(), zRecip, m_feedback->Length() - 1);
+    double n = norm(denominator);
+    double r = (real(numerator) * real(denominator) +
+                imag(numerator) * imag(denominator)) /
+               n;
+    double i = (imag(numerator) * real(denominator) -
+                real(numerator) * imag(denominator)) /
+               n;
+    std::complex<double> response = std::complex<double>(r, i);
+
+    magResponse[k] =
+        static_cast<float>(fdlibm_hypot(real(response), imag(response)));
+    phaseResponse[k] =
+        static_cast<float>(fdlibm_atan2(imag(response), real(response)));
+  }
+}
+
+bool IIRFilter::buffersAreZero() {
+  double* xBuffer = m_xBuffer.Elements();
+  double* yBuffer = m_yBuffer.Elements();
+
+  for (size_t k = 0; k < m_feedforward->Length(); ++k) {
+    if (xBuffer[(m_bufferIndex - k) & (kBufferLength - 1)] != 0.0) {
+      return false;
+    }
+  }
+
+  for (size_t k = 0; k < m_feedback->Length(); ++k) {
+    if (fabs(yBuffer[(m_bufferIndex - k) & (kBufferLength - 1)]) >= FLT_MIN) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+}  

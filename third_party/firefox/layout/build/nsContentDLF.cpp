@@ -1,0 +1,290 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include "nsContentDLF.h"
+
+#include "DecoderTraits.h"
+#include "imgLoader.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/LoadURIOptionsBinding.h"
+#include "nsCOMPtr.h"
+#include "nsCRT.h"
+#include "nsCharsetSource.h"
+#include "nsContentUtils.h"
+#include "nsDocShell.h"
+#include "nsGenericHTMLElement.h"
+#include "nsGkAtoms.h"
+#include "nsIDocumentLoaderFactory.h"
+#include "nsIDocumentViewer.h"
+#include "nsIViewSourceChannel.h"
+#include "nsMimeTypes.h"
+#include "nsNetUtil.h"
+#include "nsNodeInfoManager.h"
+#include "nsString.h"
+
+
+#undef NOISY_REGISTRY
+
+using namespace mozilla;
+using mozilla::dom::Document;
+using mozilla::dom::ForceMediaDocument;
+
+already_AddRefed<nsIDocumentViewer> NS_NewDocumentViewer();
+
+static const char* const gHTMLTypes[] = {TEXT_HTML, VIEWSOURCE_CONTENT_TYPE,
+                                         APPLICATION_XHTML_XML,
+                                         APPLICATION_WAPXHTML_XML, nullptr};
+
+static const char* const gXMLTypes[] = {
+    TEXT_XML, APPLICATION_XML, APPLICATION_MATHML_XML, APPLICATION_RDF_XML,
+    TEXT_RDF, nullptr};
+
+static const char* const gSVGTypes[] = {IMAGE_SVG_XML, nullptr};
+
+static bool IsTypeInList(const nsACString& aType, const char* const aList[]) {
+  int32_t typeIndex;
+  for (typeIndex = 0; aList[typeIndex]; ++typeIndex) {
+    if (aType.Equals(aList[typeIndex])) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+nsresult NS_NewContentDocumentLoaderFactory(
+    nsIDocumentLoaderFactory** aResult) {
+  MOZ_ASSERT(aResult, "null OUT ptr");
+  if (!aResult) {
+    return NS_ERROR_NULL_POINTER;
+  }
+  auto it = MakeRefPtr<nsContentDLF>();
+  it.forget(aResult);
+  return NS_OK;
+}
+
+nsContentDLF::nsContentDLF() = default;
+
+nsContentDLF::~nsContentDLF() = default;
+
+NS_IMPL_ISUPPORTS(nsContentDLF, nsIDocumentLoaderFactory)
+
+enum class CreateDocumentKind { HTML, XML, SVG, Video, Image, None };
+
+static CreateDocumentKind GetCreateDocumentKind(nsACString& aContentType) {
+  if (IsTypeInList(aContentType, gHTMLTypes) ||
+      nsContentUtils::IsPlainTextType(aContentType)) {
+    return CreateDocumentKind::HTML;
+  }
+
+  if (IsTypeInList(aContentType, gXMLTypes)) {
+    return CreateDocumentKind::XML;
+  }
+
+  if (IsTypeInList(aContentType, gSVGTypes)) {
+    return CreateDocumentKind::SVG;
+  }
+
+  if (mozilla::DecoderTraits::ShouldHandleMediaType(
+          aContentType,
+           nullptr)) {
+    return CreateDocumentKind::Video;
+  }
+
+  if (imgLoader::SupportImageWithMimeType(aContentType)) {
+    return CreateDocumentKind::Image;
+  }
+
+  return CreateDocumentKind::None;
+}
+
+static nsresult CreateDocument(const char* aCommand, nsIChannel* aChannel,
+                               nsILoadGroup* aLoadGroup,
+                               nsIDocShell* aContainer,
+                               CreateDocumentKind aKind,
+                               nsIStreamListener** aDocListener,
+                               nsIDocumentViewer** aDocumentViewer) {
+  RefPtr<Document> doc;
+  nsresult rv;
+  switch (aKind) {
+    case CreateDocumentKind::HTML:
+      rv = NS_NewHTMLDocument(getter_AddRefs(doc), nullptr, nullptr);
+      break;
+    case CreateDocumentKind::XML:
+      rv = NS_NewXMLDocument(getter_AddRefs(doc), nullptr, nullptr);
+      break;
+    case CreateDocumentKind::SVG:
+      rv = NS_NewSVGDocument(getter_AddRefs(doc), nullptr, nullptr);
+      break;
+    case CreateDocumentKind::Video:
+      rv = NS_NewVideoDocument(getter_AddRefs(doc), nullptr, nullptr);
+      break;
+    case CreateDocumentKind::Image:
+      rv = NS_NewImageDocument(getter_AddRefs(doc), nullptr, nullptr);
+      break;
+    case CreateDocumentKind::None:
+      MOZ_ASSERT_UNREACHABLE("Invalid kind.");
+      rv = NS_ERROR_FAILURE;
+      break;
+  }
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIDocumentViewer> viewer = NS_NewDocumentViewer();
+
+  doc->SetContainer(static_cast<nsDocShell*>(aContainer));
+  doc->SetAllowDeclarativeShadowRoots(true);
+
+  rv = doc->StartDocumentLoad(aCommand, aChannel, aLoadGroup, aContainer,
+                              aDocListener, true);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  viewer->LoadStart(doc);
+
+  if (aKind != CreateDocumentKind::Image) {
+    viewer->GetDocument()->MakeBrowsingContextNonSynthetic();
+  }
+
+  viewer.forget(aDocumentViewer);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsContentDLF::CreateInstance(const char* aCommand, nsIChannel* aChannel,
+                             nsILoadGroup* aLoadGroup,
+                             const nsACString& aContentType,
+                             nsIDocShell* aContainer, nsISupports* aExtraInfo,
+                             nsIStreamListener** aDocListener,
+                             nsIDocumentViewer** aDocViewer) {
+  nsAutoCString contentType(aContentType);
+
+  nsCOMPtr<nsIViewSourceChannel> viewSourceChannel =
+      do_QueryInterface(aChannel);
+  if (viewSourceChannel) {
+    aCommand = "view-source";
+
+    nsAutoCString type;
+    (void)viewSourceChannel->GetOriginalContentType(type);
+    bool knownType = (!type.EqualsLiteral(VIEWSOURCE_CONTENT_TYPE) &&
+                      IsTypeInList(type, gHTMLTypes)) ||
+                     nsContentUtils::IsPlainTextType(type) ||
+                     IsTypeInList(type, gXMLTypes) ||
+                     IsTypeInList(type, gSVGTypes);
+
+    if (knownType) {
+      viewSourceChannel->SetContentType(type);
+    } else if (imgLoader::SupportImageWithMimeType(type)) {
+      contentType = type;
+    } else {
+      viewSourceChannel->SetContentType(nsLiteralCString(TEXT_PLAIN));
+    }
+  } else if (aContentType.EqualsLiteral(VIEWSOURCE_CONTENT_TYPE)) {
+    aChannel->SetContentType(nsLiteralCString(TEXT_PLAIN));
+    contentType = TEXT_PLAIN;
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  CreateDocumentKind kind = CreateDocumentKind::None;
+  if ((!aCommand || strcmp(aCommand, "external-resource") != 0) &&
+      loadInfo->GetForceMediaDocument() != ForceMediaDocument::None) {
+    switch (loadInfo->GetForceMediaDocument()) {
+      case dom::ForceMediaDocument::Video:
+        kind = CreateDocumentKind::Video;
+        break;
+      case dom::ForceMediaDocument::Image:
+        kind = CreateDocumentKind::Image;
+        break;
+      case dom::ForceMediaDocument::None:
+        MOZ_ASSERT_UNREACHABLE("Can't be None");
+        break;
+    }
+  } else {
+    kind = GetCreateDocumentKind(contentType);
+  }
+
+  if (kind == CreateDocumentKind::None) {
+    return NS_ERROR_FAILURE;
+  }
+
+  return CreateDocument(aCommand, aChannel, aLoadGroup, aContainer, kind,
+                        aDocListener, aDocViewer);
+}
+
+NS_IMETHODIMP
+nsContentDLF::CreateInstanceForDocument(nsISupports* aContainer,
+                                        Document* aDocument,
+                                        const char* aCommand,
+                                        nsIDocumentViewer** aDocumentViewer) {
+  MOZ_ASSERT(aDocument);
+
+  nsCOMPtr<nsIDocumentViewer> viewer = NS_NewDocumentViewer();
+
+  viewer->LoadStart(aDocument);
+  viewer.forget(aDocumentViewer);
+  return NS_OK;
+}
+
+already_AddRefed<Document> nsContentDLF::CreateBlankDocument(
+    nsILoadGroup* aLoadGroup, nsIPrincipal* aPrincipal,
+    nsIPrincipal* aPartitionedPrincipal, nsDocShell* aContainer) {
+  RefPtr<Document> blankDoc;
+  (void)NS_NewHTMLDocument(getter_AddRefs(blankDoc), nullptr, nullptr);
+
+  if (!blankDoc) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  NS_NewURI(getter_AddRefs(uri), "about:blank"_ns);
+  if (!uri) {
+    return nullptr;
+  }
+  blankDoc->ResetToURI(uri, aLoadGroup, aPrincipal, aPartitionedPrincipal);
+  blankDoc->SetContainer(aContainer);
+
+  blankDoc->SetAllowDeclarativeShadowRoots(true);
+
+  nsNodeInfoManager* nim = blankDoc->NodeInfoManager();
+
+  RefPtr<mozilla::dom::NodeInfo> htmlNodeInfo;
+
+  htmlNodeInfo = nim->GetNodeInfo(nsGkAtoms::html, nullptr, kNameSpaceID_XHTML,
+                                  nsINode::ELEMENT_NODE);
+  nsCOMPtr<nsIContent> htmlElement =
+      NS_NewHTMLHtmlElement(htmlNodeInfo.forget());
+
+  htmlNodeInfo = nim->GetNodeInfo(nsGkAtoms::head, nullptr, kNameSpaceID_XHTML,
+                                  nsINode::ELEMENT_NODE);
+  nsCOMPtr<nsIContent> headElement =
+      NS_NewHTMLHeadElement(htmlNodeInfo.forget());
+
+  htmlNodeInfo = nim->GetNodeInfo(nsGkAtoms::body, nullptr, kNameSpaceID_XHTML,
+                                  nsINode::ELEMENT_NODE);
+  nsCOMPtr<nsIContent> bodyElement =
+      NS_NewHTMLBodyElement(htmlNodeInfo.forget());
+
+  NS_ASSERTION(blankDoc->GetChildCount() == 0, "Shouldn't have children");
+  if (!htmlElement || !headElement || !bodyElement) {
+    return nullptr;
+  }
+
+  mozilla::IgnoredErrorResult rv;
+  blankDoc->AppendChildTo(htmlElement, false, rv);
+  if (rv.Failed()) {
+    return nullptr;
+  }
+
+  htmlElement->AppendChildTo(headElement, false, rv);
+  if (rv.Failed()) {
+    return nullptr;
+  }
+
+  htmlElement->AppendChildTo(bodyElement, false, rv);
+  if (rv.Failed()) {
+    return nullptr;
+  }
+
+  blankDoc->SetDocumentCharacterSetSource(kCharsetFromDocTypeDefault);
+  blankDoc->SetDocumentCharacterSet(UTF_8_ENCODING);
+  return blankDoc.forget();
+}

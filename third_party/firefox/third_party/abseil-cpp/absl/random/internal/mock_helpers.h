@@ -1,0 +1,82 @@
+// Copyright 2019 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_RANDOM_INTERNAL_MOCK_HELPERS_H_
+#define ABSL_RANDOM_INTERNAL_MOCK_HELPERS_H_
+
+#include <optional>
+#include <utility>
+
+#include "absl/base/config.h"
+#include "absl/base/fast_type_id.h"
+#include "absl/random/mocking_access.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace random_internal {
+
+struct NoOpValidator {
+  template <typename ResultT, typename... Args>
+  static void Validate(ResultT, Args&&...) {}
+};
+
+class MockHelpers {
+  using IdType = ::absl::FastTypeIdType;
+  using RandomMockingAccess = ::absl::RandomMockingAccess;
+
+  template <typename KeyT>
+  struct KeySignature;
+
+  template <typename ResultT, typename DiscriminatorT, typename ArgTupleT>
+  struct KeySignature<ResultT(DiscriminatorT, ArgTupleT)> {
+    using result_type = ResultT;
+    using discriminator_type = DiscriminatorT;
+    using arg_tuple_type = ArgTupleT;
+  };
+
+ public:
+  template <typename KeyT, typename URBG, typename... Args>
+  static auto MaybeInvokeMock(URBG* urbg, Args&&... args)
+      -> std::optional<typename KeySignature<KeyT>::result_type> {
+    if constexpr (RandomMockingAccess::HasInvokeMock<URBG>::value) {
+      typename KeySignature<KeyT>::arg_tuple_type arg_tuple(
+          std::forward<Args>(args)...);
+      typename KeySignature<KeyT>::result_type result;
+      if (RandomMockingAccess::InvokeMock(urbg, FastTypeId<KeyT>(), &arg_tuple,
+                                          &result)) {
+        return result;
+      }
+    }
+    return std::nullopt;
+  }
+
+  template <typename KeyT, typename ValidatorT, typename MockURBG>
+  static auto MockFor(MockURBG& m, ValidatorT)
+      -> decltype(m.template RegisterMock<
+                  typename KeySignature<KeyT>::result_type,
+                  typename KeySignature<KeyT>::arg_tuple_type>(
+          m, std::declval<IdType>(), ValidatorT())) {
+    return m.template RegisterMock<typename KeySignature<KeyT>::result_type,
+                                   typename KeySignature<KeyT>::arg_tuple_type>(
+        m, ::absl::FastTypeId<KeyT>(), ValidatorT());
+  }
+
+  template <typename KeyT, typename MockURBG>
+  static decltype(auto) MockFor(MockURBG& m) {
+    return MockFor<KeyT>(m, NoOpValidator());
+  }
+};
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_RANDOM_INTERNAL_MOCK_HELPERS_H_

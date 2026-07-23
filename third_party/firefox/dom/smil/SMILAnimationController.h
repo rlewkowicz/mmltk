@@ -1,0 +1,135 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SMIL_SMILANIMATIONCONTROLLER_H_
+#define DOM_SMIL_SMILANIMATIONCONTROLLER_H_
+
+#include <memory>
+
+#include "mozilla/SMILCompositorTable.h"
+#include "mozilla/SMILMilestone.h"
+#include "mozilla/SMILTimeContainer.h"
+#include "nsCOMPtr.h"
+#include "nsHashKeys.h"
+#include "nsTArray.h"
+#include "nsTHashtable.h"
+
+class nsRefreshDriver;
+
+namespace mozilla {
+struct SMILTargetIdentifier;
+namespace dom {
+class Element;
+class SVGAnimationElement;
+}  
+
+class SMILAnimationController final : public SMILTimeContainer {
+ public:
+  explicit SMILAnimationController(mozilla::dom::Document* aDoc);
+
+  NS_INLINE_DECL_REFCOUNTING(SMILAnimationController)
+
+  void Disconnect();
+
+  void Pause(PauseType aType) override;
+  void Resume(PauseType aType) override;
+  SMILTime GetParentTime() const override;
+
+  nsRefreshDriver* GetRefreshDriver();
+  void WillRefresh(mozilla::TimeStamp aTime);
+
+  void RegisterAnimationElement(
+      mozilla::dom::SVGAnimationElement* aAnimationElement);
+  void UnregisterAnimationElement(
+      mozilla::dom::SVGAnimationElement* aAnimationElement);
+
+  void Resample() { DoSample(false); }
+
+  void SetResampleNeeded() {
+    if (!mRunningSample && !mResampleNeeded) {
+      FlagDocumentNeedsFlush();
+      mResampleNeeded = true;
+    }
+  }
+
+  void FlushResampleRequests() {
+    if (!mResampleNeeded) return;
+
+    Resample();
+  }
+
+  void OnPageShow();
+  void OnPageHide();
+
+  void Traverse(nsCycleCollectionTraversalCallback* aCallback);
+  void Unlink();
+
+  bool HasRegisteredAnimations() const {
+    return mAnimationElementTable.Count() != 0;
+  }
+
+  bool MightHavePendingStyleUpdates() const {
+    return mMightHavePendingStyleUpdates;
+  }
+
+  void PreTraverse();
+  void PreTraverseInSubtree(mozilla::dom::Element* aRoot);
+
+ protected:
+  ~SMILAnimationController();
+
+  using TimeContainerPtrKey = nsPtrHashKey<SMILTimeContainer>;
+  using TimeContainerHashtable = nsTHashtable<TimeContainerPtrKey>;
+  using AnimationElementPtrKey = nsPtrHashKey<dom::SVGAnimationElement>;
+  using AnimationElementHashtable = nsTHashtable<AnimationElementPtrKey>;
+
+  void UpdateSampling();
+  bool ShouldSample() const;
+
+  void DoSample() override;
+  void DoSample(bool aSkipUnchangedContainers);
+
+  void RewindElements();
+
+  void DoMilestoneSamples();
+
+  static void SampleTimedElement(mozilla::dom::SVGAnimationElement* aElement,
+                                 TimeContainerHashtable* aActiveContainers);
+
+  static void AddAnimationToCompositorTable(
+      mozilla::dom::SVGAnimationElement* aElement,
+      SMILCompositorTable* aCompositorTable);
+
+  static bool GetTargetIdentifierForAnimation(
+      mozilla::dom::SVGAnimationElement* aAnimElem,
+      SMILTargetIdentifier& aResult);
+
+  nsresult AddChild(SMILTimeContainer& aChild) override;
+  void RemoveChild(SMILTimeContainer& aChild) override;
+
+  void FlagDocumentNeedsFlush();
+
+
+  AnimationElementHashtable mAnimationElementTable;
+  TimeContainerHashtable mChildContainerTable;
+  mozilla::TimeStamp mCurrentSampleTime;
+  mozilla::TimeStamp mStartTime;
+
+  SMILTime mAvgTimeBetweenSamples = 0;
+
+  mozilla::dom::Document* mDocument;
+
+  std::unique_ptr<SMILCompositorTable> mLastCompositorTable;
+
+  bool mResampleNeeded = false;
+  bool mRunningSample = false;
+
+  bool mMightHavePendingStyleUpdates = false;
+
+  bool mIsSampling = false;
+};
+
+}  
+
+#endif  // DOM_SMIL_SMILANIMATIONCONTROLLER_H_

@@ -1,0 +1,98 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(mozilla_dom_workers_sharedworker_h_)
+#define mozilla_dom_workers_sharedworker_h_
+
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/WorkerCommon.h"
+
+
+class nsPIDOMWindowInner;
+
+namespace mozilla {
+class EventChainPreVisitor;
+
+namespace dom {
+class Event;
+class MessagePort;
+
+class StringOrWorkerOptions;
+struct WorkerOptions;
+
+class SharedWorkerChild;
+class TrustedScriptURLOrUSVString;
+
+class SharedWorker final : public DOMEventTargetHelper {
+  using ErrorResult = mozilla::ErrorResult;
+  using GlobalObject = mozilla::dom::GlobalObject;
+
+  RefPtr<nsPIDOMWindowInner> mWindow;
+  RefPtr<SharedWorkerChild> mActor;
+  RefPtr<MessagePort> mMessagePort;
+  nsTArray<RefPtr<Event>> mFrozenEvents;
+  bool mFrozen;
+
+ public:
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY static already_AddRefed<SharedWorker> Constructor(
+      const GlobalObject& aGlobal,
+      const TrustedScriptURLOrUSVString& aScriptURL,
+      const StringOrWorkerOptions& aOptions, ErrorResult& aRv);
+
+  MessagePort* Port();
+
+  bool IsFrozen() const { return mFrozen; }
+
+  void QueueEvent(Event* aEvent);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(SharedWorker, DOMEventTargetHelper)
+
+  IMPL_EVENT_HANDLER(error)
+
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  void GetEventTargetParent(EventChainPreVisitor& aVisitor) override;
+
+  void DisconnectFromOwner() override;
+
+  void ErrorPropagation(nsresult aError);
+
+
+  void Close();
+
+  void Suspend();
+
+  void Resume();
+
+  void Freeze();
+
+  void Thaw();
+
+  void UpdateLanguageOverride(const nsACString& aLanguageOverride,
+                              const nsTArray<nsString>& aLanguages);
+
+  void UpdateTimezoneOverride(const nsAString& aTimezoneOverride);
+
+ private:
+  MOZ_CAN_RUN_SCRIPT static already_AddRefed<SharedWorker> Constructor(
+      const GlobalObject& aGlobal,
+      const TrustedScriptURLOrUSVString& aScriptURL,
+      const WorkerOptions& aOptions, ErrorResult& aRv);
+
+  SharedWorker(nsPIDOMWindowInner* aWindow, SharedWorkerChild* aActor,
+               MessagePort* aMessagePort);
+
+  ~SharedWorker();
+
+  void PostMessage(JSContext* aCx, JS::Handle<JS::Value> aMessage,
+                   const Sequence<JSObject*>& aTransferable, ErrorResult& aRv);
+};
+
+}  
+}  
+
+#endif

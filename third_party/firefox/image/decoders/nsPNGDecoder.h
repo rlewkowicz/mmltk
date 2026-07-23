@@ -1,0 +1,128 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_decoders_nsPNGDecoder_h
+#define mozilla_image_decoders_nsPNGDecoder_h
+
+#include "Decoder.h"
+#include "StreamingLexer.h"
+#include "SurfacePipe.h"
+#include "mozilla/gfx/Swizzle.h"
+#include "png.h"
+
+namespace mozilla {
+namespace image {
+class RasterImage;
+
+class nsPNGDecoder : public Decoder {
+ public:
+  virtual ~nsPNGDecoder();
+
+  bool IsValidICOResource() const override;
+
+  DecoderType GetType() const override { return DecoderType::PNG; }
+
+ protected:
+  nsresult InitInternal() override;
+  nsresult FinishInternal() override;
+  LexerResult DoDecode(SourceBufferIterator& aIterator,
+                       IResumable* aOnResume) override;
+
+ private:
+  friend class DecoderFactory;
+
+  explicit nsPNGDecoder(RasterImage* aImage);
+
+  struct FrameInfo {
+    UnorientedIntRect mFrameRect;
+    bool mIsInterlaced;
+  };
+
+  nsresult CreateFrame(const FrameInfo& aFrameInfo);
+  void EndImageFrame();
+
+  uint32_t ReadColorProfile(png_structp png_ptr, png_infop info_ptr,
+                            int color_type, bool* sRGBTag);
+
+  bool HasAlphaChannel() const { return mChannels == 2 || mChannels == 4; }
+
+  enum class TransparencyType { eNone, eAlpha, eFrameRect };
+
+  TransparencyType GetTransparencyType(const UnorientedIntRect& aFrameRect);
+  void PostHasTransparencyIfNeeded(TransparencyType aTransparencyType);
+
+  void PostInvalidationIfNeeded();
+
+  void WriteRow(uint8_t* aRow);
+
+  void DoTerminate(png_structp aPNGStruct, TerminalState aState);
+  void DoYield(png_structp aPNGStruct);
+
+  enum class State { PNG_DATA, FINISHED_PNG_DATA };
+
+  LexerTransition<State> ReadPNGData(const char* aData, size_t aLength);
+  LexerTransition<State> FinishedPNGData();
+
+  StreamingLexer<State> mLexer;
+
+  LexerTransition<State> mNextTransition;
+
+  Maybe<FrameInfo> mNextFrameInfo;
+
+  size_t mLastChunkLength;
+
+ public:
+  png_structp mPNG;
+  png_infop mInfo;
+  UnorientedIntRect mFrameRect;
+  uint8_t* mCMSLine;
+  uint8_t* interlacebuf;
+  gfx::SurfaceFormat mFormat;
+
+  uint8_t mChannels;
+  uint8_t mPass;
+  bool mFrameIsHidden;
+  bool mDisablePremultipliedAlpha;
+  bool mGotInfoCallback;
+  bool mUsePipeTransform;
+  bool mErrorIsRecoverable;
+
+  struct AnimFrameInfo {
+    AnimFrameInfo();
+#ifdef PNG_APNG_SUPPORTED
+    AnimFrameInfo(png_structp aPNG, png_infop aInfo);
+#endif
+
+    DisposalMethod mDispose;
+    BlendMethod mBlend;
+    int32_t mTimeout;
+  };
+
+  AnimFrameInfo mAnimInfo;
+
+  SurfacePipe mPipe;  
+
+  uint32_t mNumFrames;
+
+  static void PNGAPI info_callback(png_structp png_ptr, png_infop info_ptr);
+  static void PNGAPI row_callback(png_structp png_ptr, png_bytep new_row,
+                                  png_uint_32 row_num, int pass);
+#ifdef PNG_APNG_SUPPORTED
+  static void PNGAPI frame_info_callback(png_structp png_ptr,
+                                         png_uint_32 frame_num);
+#endif
+  static void PNGAPI end_callback(png_structp png_ptr, png_infop info_ptr);
+  static void PNGAPI error_callback(png_structp png_ptr,
+                                    png_const_charp error_msg);
+  static void PNGAPI warning_callback(png_structp png_ptr,
+                                      png_const_charp warning_msg);
+
+  static const uint8_t pngSignatureBytes[];
+};
+
+}  
+}  
+
+#endif  // mozilla_image_decoders_nsPNGDecoder_h

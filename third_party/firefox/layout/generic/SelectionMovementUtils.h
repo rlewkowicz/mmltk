@@ -1,0 +1,131 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_SelectionMovementUtils_h
+#define mozilla_SelectionMovementUtils_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/RangeBoundary.h"
+#include "mozilla/Result.h"
+#include "mozilla/intl/BidiEmbeddingLevel.h"
+#include "nsIFrame.h"
+
+struct nsPrevNextBidiLevels;
+
+namespace mozilla {
+
+class PresShell;
+enum class PeekOffsetOption : uint16_t;
+
+namespace intl {
+class BidiEmbeddingLevel;
+}
+
+struct MOZ_STACK_CLASS FrameAndOffset {
+  [[nodiscard]] nsIContent* GetFrameContent() const {
+    return mFrame ? mFrame->GetContent() : nullptr;
+  }
+
+  operator nsIFrame*() const { return mFrame; }
+
+  explicit operator bool() const { return !!mFrame; }
+  [[nodiscard]] bool operator!() const { return !mFrame; }
+
+  nsIFrame* operator->() const {
+    MOZ_ASSERT(mFrame);
+    return mFrame;
+  }
+
+  nsIFrame* mFrame = nullptr;
+  uint32_t mOffsetInFrameContent = 0;
+};
+
+struct MOZ_STACK_CLASS PrimaryFrameData : public FrameAndOffset {
+  CaretAssociationHint mHint{0};  
+};
+
+struct MOZ_STACK_CLASS CaretFrameData : public PrimaryFrameData {
+  nsIFrame* mUnadjustedFrame = nullptr;
+};
+
+enum class ForceEditableRegion : bool { No, Yes };
+
+class SelectionMovementUtils final {
+ public:
+  using PeekOffsetOptions = EnumSet<PeekOffsetOption>;
+
+  template <typename ParentType, typename RefType>
+  static Result<RangeBoundaryBase<ParentType, RefType>, nsresult>
+  MoveRangeBoundaryToSomewhere(
+      const RangeBoundaryBase<ParentType, RefType>& aRangeBoundary,
+      nsDirection aDirection, CaretAssociationHint aHint,
+      intl::BidiEmbeddingLevel aCaretBidiLevel, nsSelectionAmount aAmount,
+      PeekOffsetOptions aOptions,
+      const dom::Element* aAncestorLimiter = nullptr);
+
+  static FrameAndOffset GetFrameForNodeOffset(const nsIContent* aNode,
+                                              uint32_t aOffset,
+                                              CaretAssociationHint aHint);
+
+  [[nodiscard]] static RawRangeBoundary GetFirstVisiblePointAtLeaf(
+      const dom::AbstractRange& aRange);
+
+  [[nodiscard]] static RawRangeBoundary GetLastVisiblePointAtLeaf(
+      const dom::AbstractRange& aRange);
+
+  static nsPrevNextBidiLevels GetPrevNextBidiLevels(
+      nsIContent* aNode, uint32_t aContentOffset, CaretAssociationHint aHint,
+      bool aJumpLines, const dom::Element* aAncestorLimiter);
+
+  static Result<PeekOffsetStruct, nsresult> PeekOffsetForCaretMove(
+      nsIContent* aContent, uint32_t aOffset, nsDirection aDirection,
+      CaretAssociationHint aHint, intl::BidiEmbeddingLevel aCaretBidiLevel,
+      const nsSelectionAmount aAmount, const nsPoint& aDesiredCaretPos,
+      PeekOffsetOptions aOptions, const dom::Element* aAncestorLimiter);
+
+  static Result<bool, nsresult> IsIntraLineCaretMove(
+      nsSelectionAmount aAmount) {
+    switch (aAmount) {
+      case eSelectCharacter:
+      case eSelectCluster:
+      case eSelectWord:
+      case eSelectWordNoSpace:
+      case eSelectBeginLine:
+      case eSelectEndLine:
+      case eSelectParagraph:
+        return true;
+      case eSelectLine:
+        return false;
+      default:
+        return Err(NS_ERROR_FAILURE);
+    }
+  }
+
+  static CaretFrameData GetCaretFrameForNodeOffset(
+      const nsFrameSelection* aFrameSelection, nsIContent* aContentNode,
+      uint32_t aOffset, CaretAssociationHint aFrameHint,
+      intl::BidiEmbeddingLevel aBidiLevel,
+      ForceEditableRegion aForceEditableRegion);
+
+  static bool AdjustFrameForLineStart(nsIFrame*& aFrame,
+                                      uint32_t& aFrameOffset);
+
+  static PrimaryFrameData GetPrimaryFrameForCaret(
+      nsIContent* aContent, uint32_t aOffset, bool aVisual,
+      CaretAssociationHint aHint, intl::BidiEmbeddingLevel aCaretBidiLevel);
+
+ private:
+  static Result<nsIFrame*, nsresult> GetFrameFromLevel(
+      nsIFrame* aFrameIn, nsDirection aDirection,
+      intl::BidiEmbeddingLevel aBidiLevel);
+
+  static PrimaryFrameData GetPrimaryOrCaretFrameForNodeOffset(
+      nsIContent* aContent, uint32_t aOffset, bool aVisual,
+      CaretAssociationHint aHint, intl::BidiEmbeddingLevel aCaretBidiLevel);
+};
+
+}  
+
+#endif  // #ifndef mozilla_SelectionMovementUtils_h

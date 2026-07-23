@@ -1,0 +1,92 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_storage_SQLiteMutex_h_
+#define mozilla_storage_SQLiteMutex_h_
+
+#include "mozilla/BlockingResourceBase.h"
+#include "sqlite3.h"
+
+namespace mozilla {
+namespace storage {
+
+class SQLiteMutex : private BlockingResourceBase {
+ public:
+  explicit SQLiteMutex(const char* aName)
+      : BlockingResourceBase(aName, eMutex), mMutex(nullptr) {}
+
+  void initWithMutex(sqlite3_mutex* aMutex) {
+    MOZ_ASSERT(aMutex, "You must pass in a valid mutex!");
+    MOZ_ASSERT(!mMutex, "A mutex has already been set for this!");
+    mMutex = aMutex;
+  }
+
+  void destroy() { mMutex = NULL; }
+
+  void lock() {
+    MOZ_ASSERT(mMutex, "No mutex associated with this wrapper!");
+#if defined(DEBUG)
+    CheckAcquire();
+#endif
+
+    ::sqlite3_mutex_enter(mMutex);
+
+#if defined(DEBUG)
+    Acquire();  
+#endif
+  }
+
+  void unlock() {
+    MOZ_ASSERT(mMutex, "No mutex associated with this wrapper!");
+#if defined(DEBUG)
+    Release();  
+#endif
+
+    ::sqlite3_mutex_leave(mMutex);
+  }
+
+  void assertCurrentThreadOwns() {
+    MOZ_ASSERT(mMutex, "No mutex associated with this wrapper!");
+    MOZ_ASSERT(::sqlite3_mutex_held(mMutex),
+               "Mutex is not held, but we expect it to be!");
+  }
+
+  void assertNotCurrentThreadOwns() {
+    MOZ_ASSERT(mMutex, "No mutex associated with this wrapper!");
+    MOZ_ASSERT(::sqlite3_mutex_notheld(mMutex),
+               "Mutex is held, but we expect it to not be!");
+  }
+
+ private:
+  sqlite3_mutex* mMutex;
+};
+
+class MOZ_STACK_CLASS SQLiteMutexAutoLock {
+ public:
+  explicit SQLiteMutexAutoLock(SQLiteMutex& aMutex) : mMutex(aMutex) {
+    mMutex.lock();
+  }
+
+  ~SQLiteMutexAutoLock() { mMutex.unlock(); }
+
+ private:
+  SQLiteMutex& mMutex;
+};
+
+class MOZ_STACK_CLASS SQLiteMutexAutoUnlock {
+ public:
+  explicit SQLiteMutexAutoUnlock(SQLiteMutex& aMutex) : mMutex(aMutex) {
+    mMutex.unlock();
+  }
+
+  ~SQLiteMutexAutoUnlock() { mMutex.lock(); }
+
+ private:
+  SQLiteMutex& mMutex;
+};
+
+}  
+}  
+
+#endif  // mozilla_storage_SQLiteMutex_h_

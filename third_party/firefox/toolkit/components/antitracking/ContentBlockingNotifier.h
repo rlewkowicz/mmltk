@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_contentblockingnotifier_h
+#define mozilla_contentblockingnotifier_h
+
+#include "nsStringFwd.h"
+#include "mozilla/Maybe.h"
+#include "nsRFPService.h"
+
+#define ANTITRACKING_CONSOLE_CATEGORY "Content Blocking"_ns
+
+class nsIChannel;
+class nsPIDOMWindowInner;
+class nsPIDOMWindowOuter;
+
+namespace mozilla {
+namespace dom {
+class BrowsingContext;
+}  
+
+class ContentBlockingNotifier final {
+ public:
+  enum class BlockingDecision {
+    eBlock,
+    eAllow,
+  };
+  enum StorageAccessPermissionGrantedReason {
+    eStorageAccessAPI,
+    eOpenerAfterUserInteraction,
+    eOpener,
+    ePrivilegeStorageAccessForOriginAPI,
+  };
+
+  static void OnDecision(nsIChannel* aChannel, BlockingDecision aDecision,
+                         uint32_t aRejectedReason);
+
+  static void OnDecision(nsPIDOMWindowInner* aWindow,
+                         BlockingDecision aDecision, uint32_t aRejectedReason);
+
+  static void OnDecision(dom::BrowsingContext* aBrowsingContext,
+                         BlockingDecision aDecision, uint32_t aRejectedReason);
+
+  static void OnEvent(nsIChannel* aChannel, uint32_t aRejectedReason,
+                      bool aBlocked = true);
+
+  static void OnEvent(
+      nsIChannel* aChannel, bool aBlocked, uint32_t aRejectedReason,
+      const nsACString& aTrackingOrigin,
+      const ::mozilla::Maybe<StorageAccessPermissionGrantedReason>& aReason =
+          Nothing(),
+      const Maybe<CanvasFingerprintingEvent>& aCanvasFingerprintingEvent =
+          Nothing());
+
+  static void ReportUnblockingToConsole(
+      dom::BrowsingContext* aBrowsingContext, const nsAString& aTrackingOrigin,
+      StorageAccessPermissionGrantedReason aReason);
+};
+
+}  
+
+#endif  // mozilla_contentblockingnotifier_h

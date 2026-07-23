@@ -1,0 +1,51 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_AnimationParams_h
+#define mozilla_image_AnimationParams_h
+
+#include <stdint.h>
+
+#include "FrameTimeout.h"
+#include "mozilla/gfx/Rect.h"
+
+namespace mozilla {
+namespace image {
+
+enum class BlendMethod : int8_t {
+  SOURCE,
+
+  OVER
+};
+
+enum class DisposalMethod : int8_t {
+  CLEAR_ALL = -1,   
+  NOT_SPECIFIED,    
+  KEEP,             
+  CLEAR,            
+  RESTORE_PREVIOUS  
+};
+
+struct AnimationParams {
+  AnimationParams(const gfx::IntRect& aBlendRect, const FrameTimeout& aTimeout,
+                  uint32_t aFrameNum, BlendMethod aBlendMethod,
+                  DisposalMethod aDisposalMethod)
+      : mBlendRect(aBlendRect),
+        mTimeout(aTimeout),
+        mFrameNum(aFrameNum),
+        mBlendMethod(aBlendMethod),
+        mDisposalMethod(aDisposalMethod) {}
+
+  gfx::IntRect mBlendRect;
+  FrameTimeout mTimeout;
+  uint32_t mFrameNum;
+  BlendMethod mBlendMethod;
+  DisposalMethod mDisposalMethod;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_AnimationParams_h

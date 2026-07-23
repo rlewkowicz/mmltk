@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_DoWhileEmitter_h
+#define frontend_DoWhileEmitter_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+
+#include <stdint.h>
+
+#include "frontend/BytecodeControlStructures.h"
+
+namespace js {
+namespace frontend {
+
+struct BytecodeEmitter;
+
+class MOZ_STACK_CLASS DoWhileEmitter {
+  BytecodeEmitter* bce_;
+
+  mozilla::Maybe<LoopControl> loopInfo_;
+
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    Body,
+
+    Cond,
+
+    End
+  };
+  State state_ = State::Start;
+#endif
+
+ public:
+  explicit DoWhileEmitter(BytecodeEmitter* bce);
+
+  [[nodiscard]] bool emitBody(uint32_t doPos, uint32_t bodyPos);
+  [[nodiscard]] bool emitCond();
+  [[nodiscard]] bool emitEnd();
+};
+
+} 
+} 
+
+#endif /* frontend_DoWhileEmitter_h */

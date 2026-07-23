@@ -1,0 +1,66 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_MemoryFunctions_h
+#define js_MemoryFunctions_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+
+#include <stddef.h>  // size_t
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+struct JS_PUBLIC_API JSContext;
+class JS_PUBLIC_API JSObject;
+struct JS_PUBLIC_API JSRuntime;
+
+extern JS_PUBLIC_API void* JS_malloc(JSContext* cx, size_t nbytes);
+
+extern JS_PUBLIC_API void* JS_realloc(JSContext* cx, void* p, size_t oldBytes,
+                                      size_t newBytes);
+
+extern JS_PUBLIC_API void JS_free(JSContext* cx, void* p);
+
+extern JS_PUBLIC_API void* JS_string_malloc(JSContext* cx, size_t nbytes);
+
+extern JS_PUBLIC_API void* JS_string_realloc(JSContext* cx, void* p,
+                                             size_t oldBytes, size_t newBytes);
+
+extern JS_PUBLIC_API void JS_string_free(JSContext* cx, void* p);
+
+namespace JS {
+
+#define JS_FOR_EACH_PUBLIC_MEMORY_USE(_) \
+  _(XPCWrappedNative)                    \
+  _(DOMBinding)                          \
+  _(CTypeFFIType)                        \
+  _(CTypeFFITypeElements)                \
+  _(CTypeFunctionInfo)                   \
+  _(CTypeFieldInfo)                      \
+  _(CDataBufferPtr)                      \
+  _(CDataBuffer)                         \
+  _(CClosureInfo)                        \
+  _(CTypesInt64)                         \
+  _(Embedding1)                          \
+  _(Embedding2)                          \
+  _(Embedding3)                          \
+  _(Embedding4)                          \
+  _(Embedding5)
+
+enum class MemoryUse : uint8_t {
+#define DEFINE_MEMORY_USE(Name) Name,
+  JS_FOR_EACH_PUBLIC_MEMORY_USE(DEFINE_MEMORY_USE)
+#undef DEFINE_MEMORY_USE
+};
+
+extern JS_PUBLIC_API void AddAssociatedMemory(JSObject* obj, size_t nbytes,
+                                              MemoryUse use);
+
+extern JS_PUBLIC_API void RemoveAssociatedMemory(JSObject* obj, size_t nbytes,
+                                                 MemoryUse use);
+
+}  
+
+#endif /* js_MemoryFunctions_h */

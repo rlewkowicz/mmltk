@@ -1,0 +1,311 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsDragService.h"
+#include "mozilla/ScopeExit.h"
+#include "nsDragServiceGtk.h"
+#include "nsWindow.h"
+#include "WidgetUtilsGtk.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/StaticPrefs_widget.h"
+
+using namespace mozilla;
+using namespace mozilla::widget;
+
+#ifdef MOZ_LOGGING
+extern mozilla::LazyLogModule gWidgetDragLog;
+#  define LOGDRAGSERVICE(str, ...)                                             \
+    MOZ_LOG(                                                                   \
+        gWidgetDragLog, mozilla::LogLevel::Debug,                              \
+        ("[D %d]%s %*s" str, nsDragSession::GetLoopDepth(),                    \
+         GetDebugTag().get(),                                                  \
+         nsDragSession::GetLoopDepth() > 1 ? nsDragSession::GetLoopDepth() * 2 \
+                                           : 0,                                \
+         "", ##__VA_ARGS__))
+#  define LOGDRAGSERVICESTATIC(str, ...) \
+    MOZ_LOG(gWidgetDragLog, mozilla::LogLevel::Debug, (str, ##__VA_ARGS__))
+#else
+#  define LOGDRAGSERVICE(...)
+#endif
+
+ClipboardTargets nsDragSessionGtk::DragTaskGtk::GetTargets() {
+  return ClipboardTargets(gdk_drag_context_list_targets(mDragContext));
+}
+
+nsDragSessionGtk::nsDragSessionGtk() {
+  mRecentTask = MakeUnique<DragTaskGtk>();
+}
+
+NS_IMETHODIMP
+nsDragSessionGtk::UpdateDragEffect() {
+  LOGDRAGSERVICE(
+      "nsDragSessionGtk::UpdateDragEffect() from e10s child process");
+  if (mTargetDragContextForRemote) {
+    ReplyToDragMotion(mTargetDragContextForRemote, mRecentTask->mTime);
+    mTargetDragContextForRemote = nullptr;
+  }
+  return NS_OK;
+}
+
+void nsDragSessionGtk::UpdateDragAction() {
+  DragTaskGtk* task = static_cast<DragTaskGtk*>(mRecentTask.get());
+  if (task->mDragContext) {
+    UpdateDragAction(task->mDragContext);
+  }
+}
+
+void nsDragSessionGtk::ReplyToDragMotion() {
+  DragTaskGtk* task = static_cast<DragTaskGtk*>(mRecentTask.get());
+  if (task->mDragContext) {
+    ReplyToDragMotion(task->mDragContext, task->mTime);
+  }
+}
+
+void nsDragSessionGtk::ReplyToDragMotion(GdkDragContext* aDragContext,
+                                         guint aTime) {
+  LOGDRAGSERVICE("nsDragSessionGtk::ReplyToDragMotion(%p) can drop %d",
+                 aDragContext, mCanDrop);
+
+
+
+
+
+  GdkDragAction action = GetDragActionGtk();
+
+  if (widget::GdkIsWaylandDisplay() && action == GDK_ACTION_COPY) {
+    LOGDRAGSERVICE("  Wayland: switch copy to move");
+    action = GDK_ACTION_MOVE;
+  }
+
+  gdk_drag_status(aDragContext, action, aTime);
+}
+
+void nsDragSessionGtk::UpdateDragAction(GdkDragContext* aDragContext) {
+  LOGDRAGSERVICE("nsDragSession::UpdateDragAction(%p)", aDragContext);
+
+  GdkDragAction gdkAction = GDK_ACTION_DEFAULT;
+  if (aDragContext) {
+    gdkAction = gdk_drag_context_get_actions(aDragContext);
+    LOGDRAGSERVICE("  gdk_drag_context_get_actions() returns 0x%X", gdkAction);
+
+
+    if (widget::GdkIsWaylandDisplay()) {
+      GdkDragAction gdkActionSelected =
+          gdk_drag_context_get_selected_action(aDragContext);
+      LOGDRAGSERVICE("  gdk_drag_context_get_selected_action() returns 0x%X",
+                     gdkActionSelected);
+      if (gdkActionSelected) {
+        gdkAction = gdkActionSelected;
+      }
+    }
+  }
+
+  SetDragActionGtk(gdkAction);
+}
+
+
+gboolean nsDragSessionGtk::ScheduleMotionEvent(
+    nsWindow* aWindow, GdkDragContext* aDragContext,
+    LayoutDeviceIntPoint aWindowPoint, guint aTime) {
+  if (aDragContext && mNextScheduledTask &&
+      mNextScheduledTask->mType == eDragTaskMotion) {
+    NS_WARNING("Drag Motion message received before previous reply was sent");
+  }
+
+  UniquePtr<DragTaskGtk> task = MakeUnique<DragTaskGtk>(
+      eDragTaskMotion, aDragContext, aWindow, aWindowPoint, aTime);
+  return Schedule(std::move(task));
+}
+
+gboolean nsDragSessionGtk::ScheduleDropEvent(nsWindow* aWindow,
+                                             GdkDragContext* aDragContext,
+                                             LayoutDeviceIntPoint aWindowPoint,
+                                             guint aTime) {
+  UniquePtr<DragTaskGtk> task = MakeUnique<DragTaskGtk>(
+      eDragTaskDrop, aDragContext, aWindow, aWindowPoint, aTime);
+  if (!Schedule(std::move(task))) {
+    NS_WARNING("Additional drag drop ignored");
+    return FALSE;
+  }
+
+  SetDragEndPoint(aWindowPoint.x, aWindowPoint.y);
+
+  return TRUE;
+}
+
+void nsDragSessionGtk::ScheduleLeaveEvent() {
+  UniquePtr<DragTaskGtk> task = MakeUnique<DragTaskGtk>(eDragTaskLeave);
+  if (!Schedule(std::move(task))) {
+    NS_WARNING("Drag leave after drop");
+  }
+}
+
+void nsDragSessionGtk::DragDataReceived(GtkWidget* aWidget,
+                                        GdkDragContext* aContext, gint aX,
+                                        gint aY,
+                                        GtkSelectionData* aSelectionData,
+                                        guint aInfo, guint32 aTime) {
+  MOZ_ASSERT(mWaitingForDragDataContext);
+
+  GdkAtom target = gtk_selection_data_get_target(aSelectionData);
+  LOGDRAGSERVICE("nsDragSession::DragDataReceived(%p) MIME %s ", aContext,
+                 GUniquePtr<gchar>(gdk_atom_name(target)).get());
+
+  if (mWaitingForDragDataContext != aContext) {
+    LOGDRAGSERVICE("  quit - wrong drag context!");
+    return;
+  }
+
+  mWaitingForDragDataContext = nullptr;
+
+  RefPtr<DragData> dragData;
+
+  auto saveData = MakeScopeExit([&] {
+    if (dragData && !dragData->IsDataValid()) {
+      dragData = nullptr;
+    }
+
+    if (!dragData) {
+      LOGDRAGSERVICE("  failed to get data, MIME %s",
+                     GUniquePtr<gchar>(gdk_atom_name(target)).get());
+    }
+
+    mCachedDragData.InsertOrUpdate(target, dragData);
+  });
+
+  if (target == sPortalFileAtom || target == sPortalFileTransferAtom) {
+    const guchar* data = gtk_selection_data_get_data(aSelectionData);
+    if (!data || data[0] == '\0') {
+      LOGDRAGSERVICE(
+          "nsDragSession::DragDataReceived() failed to get file portal data "
+          "(%s)",
+          GUniquePtr<gchar>(gdk_atom_name(target)).get());
+      return;
+    }
+
+    nsCOMPtr<nsIURI> sourceURI;
+    nsresult rv =
+        NS_NewURI(getter_AddRefs(sourceURI), (const gchar*)data, nullptr);
+    if (NS_SUCCEEDED(rv)) {
+      LOGDRAGSERVICE(
+          "  DragDataReceived(): got valid uri for MIME %s - this is bug "
+          "in GTK - expected numeric value for portal, got %s\n",
+          GUniquePtr<gchar>(gdk_atom_name(target)).get(), data);
+      return;
+    }
+    GUniquePtr<char*> uriList(gtk_selection_data_get_uris(aSelectionData));
+    dragData = MakeRefPtr<DragData>(target, std::move(uriList));
+    LOGDRAGSERVICE("  DragDataReceived(): FILE PORTAL data, MIME %s",
+                   GUniquePtr<gchar>(gdk_atom_name(target)).get());
+  } else if (target == sTextUriListTypeAtom) {
+    GUniquePtr<char*> uriList(gtk_selection_data_get_uris(aSelectionData));
+    dragData = MakeRefPtr<DragData>(target, std::move(uriList));
+    LOGDRAGSERVICE("  DragDataReceived(): URI data, MIME %s",
+                   GUniquePtr<gchar>(gdk_atom_name(target)).get());
+  } else {
+    const char* data = reinterpret_cast<const char*>(
+        gtk_selection_data_get_data(aSelectionData));
+    int len = gtk_selection_data_get_length(aSelectionData);
+    if (len < 0 || !data) {
+      LOGDRAGSERVICE(" DragDataReceived() failed");
+      return;
+    }
+    dragData = MakeRefPtr<DragData>(target, data, len);
+    LOGDRAGSERVICE("  DragDataReceived(): plain data, MIME %s len = %d",
+                   GUniquePtr<gchar>(gdk_atom_name(target)).get(), len);
+  }
+#if MOZ_LOGGING
+  if (dragData) {
+    dragData->Print();
+  }
+#endif
+}
+
+bool nsDragSessionGtk::GetDragDataImpl(GdkAtom aRequestedFlavor) {
+  DragTaskGtk* task = static_cast<DragTaskGtk*>(mRecentTask.get());
+  if (!task->mWindow) {
+    LOGDRAGSERVICE(
+        "nsDragSessionGtk::GetDragDataImpl() failed, missing Window!");
+    return false;
+  }
+  GtkWidget* widget = task->mWindow->GetGtkWidget();
+  if (!widget) {
+    LOGDRAGSERVICE(
+        "nsDragSessionGtk::GetDragDataImpl() failed, missing GtkWidget!");
+    return false;
+  }
+
+  if (mWaitingForDragDataContext == task->mDragContext) {
+    LOGDRAGSERVICE("  %s failed to get as we're already waiting to data",
+                   GUniquePtr<gchar>(gdk_atom_name(aRequestedFlavor)).get());
+    return false;
+  }
+  mWaitingForDragDataContext = task->mDragContext;
+
+  gtk_drag_get_data(widget, mWaitingForDragDataContext, aRequestedFlavor,
+                    task->mTime);
+
+  LOGDRAGSERVICE("  about to start inner iteration");
+  gtk_main_iteration();
+
+  PRTime entryTime = PR_Now();
+  int32_t timeout = StaticPrefs::widget_gtk_clipboard_timeout_ms() * 1000;
+  while (mWaitingForDragDataContext && mDoingDrag) {
+    LOGDRAGSERVICE("  doing iteration");
+    if (PR_Now() - entryTime > timeout) {
+      LOGDRAGSERVICE("  failed to get D&D data in time!\n");
+      break;
+    }
+    gtk_main_iteration();
+  }
+
+  if (mWaitingForDragDataContext) {
+    LOGDRAGSERVICE("  failed to get all data");
+  }
+
+  return !mWaitingForDragDataContext;
+}
+
+bool nsDragSessionGtk::IsTargetContextList(void) {
+  DragTaskGtk* task = static_cast<DragTaskGtk*>(mRecentTask.get());
+  if (task->mDragContext &&
+      gtk_drag_get_source_widget(task->mDragContext) == nullptr) {
+    return false;
+  }
+
+  return IsDragFlavorAvailable(sMimeListTypeAtom);
+}
+
+bool nsDragSessionGtk::IsDragFlavorAvailable(GdkAtom aRequestedFlavor) {
+  if (!mCachedDragFlavors) {
+    mCachedDragFlavors =
+        static_cast<DragTaskGtk*>(mRecentTask.get())->GetTargets();
+  }
+  return mCachedDragFlavors.Contains(aRequestedFlavor);
+}
+
+void nsDragSessionGtk::EndDragSessionImplBackend() {
+  mTargetDragContextForRemote = nullptr;
+}
+
+void nsDragSessionGtk::SetRemoteContext() {
+  DragTaskGtk* task = static_cast<DragTaskGtk*>(mRecentTask.get());
+  mTargetDragContextForRemote = task->mDragContext;
+}
+
+void nsDragSessionGtk::DropFinish(bool aSucceed) {
+  DragTaskGtk* task = static_cast<DragTaskGtk*>(mRecentTask.get());
+  if (task->mDragContext) {
+    LOGDRAGSERVICE("  drag finished (gtk_drag_finish)");
+    gtk_drag_finish(task->mDragContext, aSucceed,
+                     FALSE, task->mTime);
+  }
+}
+
+nsWindow* nsDragSessionGtk::GetMostRecentDestWindow() {
+  return mNextScheduledTask
+             ? static_cast<DragTaskGtk*>(mNextScheduledTask.get())->mWindow
+             : static_cast<DragTaskGtk*>(mRecentTask.get())->mWindow;
+}

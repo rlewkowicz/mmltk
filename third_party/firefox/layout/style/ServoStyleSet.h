@@ -1,0 +1,472 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ServoStyleSet_h
+#define mozilla_ServoStyleSet_h
+
+#include "MainThreadUtils.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/AnonymousContentKey.h"
+#include "mozilla/AtomArray.h"
+#include "mozilla/EnumeratedArray.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/PostTraversalTask.h"
+#include "mozilla/PseudoStyleRequest.h"
+#include "mozilla/PseudoStyleType.h"
+#include "mozilla/ServoBindingTypes.h"
+#include "mozilla/ServoUtils.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/RustTypes.h"
+#include "nsAtom.h"
+#include "nsChangeHint.h"
+#include "nsCoord.h"
+#include "nsIMemoryReporter.h"
+#include "nsSize.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+enum class MediaFeatureChangeReason : uint8_t;
+enum class StyleAnimationComposition : uint8_t;
+enum class StylePageSizeOrientation : uint8_t;
+enum class StyleRuleChangeKind : uint32_t;
+enum class StyleRelativeSelectorNthEdgeInvalidateFor : uint8_t;
+enum class StyleContainerAttributeDependencyKind;
+union StylePositionTryFallbacksItem;
+struct StyleRuleChange;
+struct StyleCascadeLevel;
+
+class ErrorResult;
+
+template <typename Integer, typename Number, typename LinearStops>
+struct StyleTimingFunction;
+struct StylePagePseudoClassFlags;
+struct StylePiecewiseLinearFunction;
+using StyleComputedTimingFunction =
+    StyleTimingFunction<int32_t, float, StylePiecewiseLinearFunction>;
+
+namespace css {
+class Rule;
+}  
+namespace dom {
+class CSSImportRule;
+class Element;
+class ShadowRoot;
+struct PropertyDefinition;
+}  
+namespace gfx {
+class FontPaletteValueSet;
+}  
+class StyleSheet;
+struct Keyframe;
+class ServoElementSnapshotTable;
+class ComputedStyle;
+class ServoStyleRuleMap;
+class StyleSheet;
+}  
+class gfxFontFeatureValueSet;
+class nsIContent;
+
+class nsPresContext;
+class nsWindowSizes;
+struct TreeMatchContext;
+
+namespace mozilla {
+
+enum class StylistState : uint8_t {
+  NotDirty = 0,
+
+  StyleSheetsDirty = 1 << 0,
+
+  ShadowDOMStyleSheetsDirty = 1 << 1,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(StylistState)
+
+enum class StyleOrigin : uint8_t;
+
+enum class OriginFlags : uint8_t {
+  UserAgent = 0x01,
+  User = 0x02,
+  Author = 0x04,
+  All = 0x07,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(OriginFlags)
+
+class ServoStyleSet {
+  friend class RestyleManager;
+  using SnapshotTable = ServoElementSnapshotTable;
+  using Origin = StyleOrigin;
+
+  static constexpr Origin kOrigins[] = {
+      Origin(static_cast<uint8_t>(OriginFlags::UserAgent)),
+      Origin(static_cast<uint8_t>(OriginFlags::User)),
+      Origin(static_cast<uint8_t>(OriginFlags::Author)),
+  };
+
+ public:
+  static bool IsInServoTraversal() { return mozilla::IsInServoTraversal(); }
+
+#ifdef DEBUG
+  static bool IsCurrentThreadInServoTraversal();
+#endif
+
+  static ServoStyleSet* Current() { return sInServoTraversal; }
+
+  explicit ServoStyleSet(dom::Document&);
+  ~ServoStyleSet();
+
+  void ShellDetachedFromDocument();
+
+  void RuleAdded(StyleSheet&, css::Rule&);
+  void RuleRemoved(StyleSheet&, css::Rule&);
+  void RuleChanged(StyleSheet&, css::Rule*, const StyleRuleChange&);
+  void SheetCloned(StyleSheet&);
+  void ImportRuleLoaded(StyleSheet&);
+
+  void InvalidateStyleForDocumentStateChanges(
+      dom::DocumentState aStatesChanged);
+
+  void RecordShadowStyleChange(dom::ShadowRoot&);
+
+  bool StyleSheetsHaveChanged() const { return StylistNeedsUpdate(); }
+
+  RestyleHint MediumFeaturesChanged(MediaFeatureChangeReason);
+
+  inline nscoord EvaluateSourceSizeList(
+      const StyleSourceSizeList* aSourceSizeList) const;
+
+  void AddSizeOfIncludingThis(nsWindowSizes& aSizes) const;
+  const StylePerDocumentStyleData* RawData() const { return mRawData.get(); }
+
+  bool GetAuthorStyleDisabled() const { return mAuthorStyleDisabled; }
+
+  bool UsesFontMetrics() const;
+
+  bool UsesRootFontMetrics() const;
+
+  void SetAuthorStyleDisabled(bool aStyleDisabled);
+
+  already_AddRefed<ComputedStyle> ResolveStyleForText(
+      nsIContent* aTextNode, ComputedStyle* aParentStyle);
+
+  already_AddRefed<ComputedStyle> ResolveStyleForFirstLetterContinuation(
+      ComputedStyle* aParentStyle);
+
+  already_AddRefed<ComputedStyle> ResolveStyleForPlaceholder();
+
+  static bool GeneratedContentPseudoExists(const ComputedStyle& aParentStyle,
+                                           const ComputedStyle& aPseudoStyle);
+
+  enum class IsProbe {
+    No,
+    Yes,
+  };
+
+  already_AddRefed<ComputedStyle> ResolvePseudoElementStyle(
+      const dom::Element& aOriginatingElement, PseudoStyleType,
+      nsAtom* aFunctionalPseudoParameter, ComputedStyle* aParentStyle,
+      IsProbe = IsProbe::No);
+
+  already_AddRefed<ComputedStyle> ProbePseudoElementStyle(
+      const dom::Element& aOriginatingElement, PseudoStyleType aType,
+      nsAtom* aFunctionalPseudoParameter, ComputedStyle* aParentStyle) {
+    return ResolvePseudoElementStyle(aOriginatingElement, aType,
+                                     aFunctionalPseudoParameter, aParentStyle,
+                                     IsProbe::Yes);
+  }
+
+  already_AddRefed<ComputedStyle> ResolveStyleLazily(
+      const dom::Element&, const PseudoStyleRequest& aPseudoRequest = {},
+      StyleRuleInclusion = StyleRuleInclusion::All);
+
+  already_AddRefed<ComputedStyle> ResolveInheritingAnonymousBoxStyle(
+      PseudoStyleType, ComputedStyle* aParentStyle);
+
+  already_AddRefed<ComputedStyle> ResolveNonInheritingAnonymousBoxStyle(
+      PseudoStyleType aType);
+
+  already_AddRefed<ComputedStyle> ResolvePageContentStyle(
+      const nsAtom* aPageName, const StylePagePseudoClassFlags& aPseudo);
+
+  already_AddRefed<ComputedStyle> ResolveXULTreePseudoStyle(
+      dom::Element* aParentElement, PseudoStyleType aType,
+      ComputedStyle* aParentStyle, const AtomArray& aInputWord);
+
+  already_AddRefed<ComputedStyle> ResolvePositionTry(
+      StyleCascadeLevel aScope, dom::Element& aElement,
+      const ComputedStyle& aStyle, const StylePositionTryFallbacksItem&);
+
+  size_t SheetCount(Origin) const;
+  StyleSheet* SheetAt(Origin, size_t aIndex) const;
+
+  struct PageSizeAndOrientation {
+    Maybe<StylePageSizeOrientation> orientation;
+    Maybe<nsSize> size;
+  };
+  PageSizeAndOrientation GetDefaultPageSizeAndOrientation();
+
+  void AppendAllNonDocumentAuthorSheets(nsTArray<StyleSheet*>& aArray) const;
+
+  void AppendStyleSheet(StyleSheet&);
+  void InsertStyleSheetBefore(StyleSheet&, StyleSheet& aReferenceSheet);
+  void RemoveStyleSheet(StyleSheet&);
+  void AddDocStyleSheet(StyleSheet&);
+
+  bool StyleDocument(ServoTraversalFlags aFlags);
+
+  void StyleNewSubtree(dom::Element* aRoot);
+
+  void UpdateStylistIfNeeded() {
+    if (StylistNeedsUpdate()) {
+      UpdateStylist();
+    }
+  }
+
+  void MaybeGCRuleTree();
+
+  static bool MayTraverseFrom(const dom::Element* aElement);
+
+#ifdef DEBUG
+  void AssertTreeIsClean();
+#else
+  void AssertTreeIsClean() {}
+#endif
+
+  void ClearCachedStyleData();
+
+  void CompatibilityModeChanged();
+
+  template <typename T>
+  void EnumerateStyleSheets(T aCb) {
+    for (auto origin : kOrigins) {
+      for (size_t i = 0, count = SheetCount(origin); i < count; ++i) {
+        aCb(*SheetAt(origin, i));
+      }
+    }
+  }
+
+  static inline already_AddRefed<ComputedStyle> ResolveServoStyle(
+      const dom::Element&);
+
+  bool GetKeyframesForName(const dom::Element&, const ComputedStyle&,
+                           nsAtom* aName,
+                           const StyleComputedTimingFunction& aTimingFunction,
+                           const StyleAnimationComposition aComposition,
+                           nsTArray<Keyframe>& aKeyframes);
+
+  nsTArray<ComputedKeyframeValues> GetComputedKeyframeValuesFor(
+      const nsTArray<Keyframe>& aKeyframes, dom::Element* aElement,
+      const PseudoStyleRequest& aPseudoRequest, const ComputedStyle* aStyle);
+
+  void GetAnimationValues(
+      StyleLockedDeclarationBlock* aDeclarations, dom::Element* aElement,
+      const mozilla::ComputedStyle* aStyle,
+      nsTArray<RefPtr<StyleAnimationValue>>& aAnimationValues);
+
+  void AppendFontFaceRules(nsTArray<nsFontFaceRuleContainer>& aArray);
+
+  already_AddRefed<StyleViewTransitionRule> GetLastViewTransitionRule();
+
+  const StyleLockedCounterStyleRule* CounterStyleRuleForName(nsAtom* aName);
+
+  already_AddRefed<gfxFontFeatureValueSet> BuildFontFeatureValueSet();
+
+  already_AddRefed<gfx::FontPaletteValueSet> BuildFontPaletteValueSet();
+
+  already_AddRefed<ComputedStyle> GetBaseContextForElement(
+      dom::Element* aElement, const ComputedStyle* aStyle);
+
+  already_AddRefed<ComputedStyle> ResolveForDeclarations(
+      const ComputedStyle* aParentOrNull,
+      const StyleLockedDeclarationBlock* aDeclarations);
+
+  already_AddRefed<StyleAnimationValue> ComputeAnimationValue(
+      dom::Element* aElement, StyleLockedDeclarationBlock* aDeclaration,
+      const mozilla::ComputedStyle* aStyle);
+
+  void AppendTask(PostTraversalTask aTask) {
+    MOZ_ASSERT(IsInServoTraversal());
+
+    AssertIsMainThreadOrServoFontMetricsLocked();
+
+    mPostTraversalTasks.AppendElement(std::move(aTask));
+  }
+
+  bool EnsureUniqueInnerOnCSSSheets();
+
+  ServoStyleRuleMap* StyleRuleMap();
+
+  bool MightHaveAttributeDependency(const dom::Element&,
+                                    nsAtom* aAttribute) const;
+
+  StyleContainerAttributeDependencyKind MightHaveAttributeDependencyInContainer(
+      const dom::Element&, nsAtom* aAttribute) const;
+
+  bool MightHaveNthOfAttributeDependency(const dom::Element&,
+                                         nsAtom* aAttribute) const;
+
+  bool MightHaveNthOfClassDependency(const dom::Element&);
+
+  bool MightHaveNthOfIDDependency(const dom::Element&, nsAtom* aOldID,
+                                  nsAtom* aNewID) const;
+
+  void MaybeInvalidateRelativeSelectorIDDependency(
+      const dom::Element&, nsAtom* aOldID, nsAtom* aNewID,
+      const ServoElementSnapshotTable& aSnapshots);
+
+  void MaybeInvalidateRelativeSelectorClassDependency(
+      const dom::Element&, const ServoElementSnapshotTable& aSnapshots);
+
+  void MaybeInvalidateRelativeSelectorCustomStateDependency(
+      const dom::Element&, nsAtom* state,
+      const ServoElementSnapshotTable& aSnapshots);
+
+  void MaybeInvalidateRelativeSelectorAttributeDependency(
+      const dom::Element&, nsAtom* aAttribute,
+      const ServoElementSnapshotTable& aSnapshots);
+
+  void MaybeInvalidateRelativeSelectorStateDependency(
+      const dom::Element&, dom::ElementState,
+      const ServoElementSnapshotTable& aSnapshots);
+
+  void MaybeInvalidateRelativeSelectorForEmptyDependency(const dom::Element&);
+
+  void MaybeInvalidateRelativeSelectorForNthEdgeDependency(
+      const dom::Element&, StyleRelativeSelectorNthEdgeInvalidateFor);
+
+  void MaybeInvalidateRelativeSelectorForNthDependencyFromSibling(
+      const dom::Element*, bool aForceRestyleSiblings);
+
+  void MaybeInvalidateForElementInsertion(const dom::Element&);
+
+  void MaybeInvalidateForElementAppend(const nsIContent&);
+
+  void MaybeInvalidateForElementRemove(const dom::Element& aElement);
+
+  bool HasStateDependency(const dom::Element&, dom::ElementState) const;
+
+  bool HasNthOfStateDependency(const dom::Element&, dom::ElementState) const;
+
+  bool HasNthOfCustomStateDependency(const dom::Element&, nsAtom*) const;
+
+  void RestyleSiblingsForNthOf(const dom::Element&, uint32_t) const;
+
+  bool HasDocumentStateDependency(dom::DocumentState) const;
+
+  already_AddRefed<ComputedStyle> ReparentComputedStyle(
+      ComputedStyle* aComputedStyle, ComputedStyle* aNewParent,
+      ComputedStyle* aNewLayoutParent, dom::Element* aElement);
+
+  enum class OnlyDynamic : bool { No, Yes };
+  void InvalidateForViewportUnits(OnlyDynamic);
+
+ private:
+  friend class AutoSetInServoTraversal;
+  friend class AutoPrepareTraversal;
+  friend class PostTraversalTask;
+
+  bool ShouldTraverseInParallel() const;
+
+  void RuleChangedInternal(StyleSheet&, css::Rule&, const StyleRuleChange&);
+
+  void ForceDirtyAllShadowStyles();
+
+  const SnapshotTable& Snapshots();
+
+  void ClearNonInheritingComputedStyles();
+
+  void PreTraverse(ServoTraversalFlags aFlags, dom::Element* aRoot = nullptr);
+
+  void PreTraverseSync();
+
+  void MarkOriginsDirty(OriginFlags aChangedOrigins);
+
+  void SetStylistStyleSheetsDirty();
+
+  void SetStylistShadowDOMStyleSheetsDirty();
+
+  bool StylistNeedsUpdate() const {
+    return mStylistState != StylistState::NotDirty;
+  }
+
+  void UpdateStylist();
+
+  void RunPostTraversalTasks();
+
+  void PrependSheetOfType(Origin, StyleSheet*);
+  void AppendSheetOfType(Origin, StyleSheet*);
+  void InsertSheetOfType(Origin, StyleSheet*, StyleSheet* aBeforeSheet);
+  void RemoveSheetOfType(Origin, StyleSheet*);
+
+  const nsPresContext* GetPresContext() const {
+    return const_cast<ServoStyleSet*>(this)->GetPresContext();
+  }
+
+  nsPresContext* GetPresContext();
+
+  dom::Document* mDocument;
+  UniquePtr<StylePerDocumentStyleData> mRawData;
+
+  UniquePtr<ServoStyleRuleMap> mStyleRuleMap;
+  uint64_t mUserFontSetUpdateGeneration = 0;
+
+  nsTArray<PostTraversalTask> mPostTraversalTasks;
+
+  EnumeratedArray<NonInheritingAnonBox, RefPtr<ComputedStyle>,
+                  size_t(NonInheritingAnonBox::_Count)>
+      mNonInheritingComputedStyles;
+
+ public:
+  void PutCachedAnonymousContentStyles(
+      AnonymousContentKey aKey, nsTArray<RefPtr<ComputedStyle>>&& aStyles) {
+    auto index = static_cast<size_t>(aKey);
+
+    MOZ_ASSERT(mCachedAnonymousContentStyles.Length() + aStyles.Length() < 256,
+               "(index, length) pairs must be bigger");
+    MOZ_ASSERT(mCachedAnonymousContentStyleIndexes[index].length == 0,
+               "shouldn't need to overwrite existing cached styles");
+    MOZ_ASSERT(!aStyles.IsEmpty(), "should have some styles to cache");
+
+    mCachedAnonymousContentStyleIndexes[index] = {
+        (uint8_t)mCachedAnonymousContentStyles.Length(),
+        (uint8_t)aStyles.Length()};
+    mCachedAnonymousContentStyles.AppendElements(std::move(aStyles));
+  }
+
+  void GetCachedAnonymousContentStyles(
+      AnonymousContentKey aKey, nsTArray<RefPtr<ComputedStyle>>& aStyles) {
+    auto index = static_cast<size_t>(aKey);
+    auto loc = mCachedAnonymousContentStyleIndexes[index];
+    aStyles.AppendElements(mCachedAnonymousContentStyles.Elements() + loc.index,
+                           loc.length);
+  }
+
+  void RegisterProperty(const dom::PropertyDefinition&, ErrorResult&);
+
+ private:
+  struct Location {
+    uint8_t index, length;
+  };
+  Array<Location, 1 << sizeof(AnonymousContentKey) * 8>
+      mCachedAnonymousContentStyleIndexes;
+
+  nsTArray<RefPtr<ComputedStyle>> mCachedAnonymousContentStyles;
+
+  StylistState mStylistState = StylistState::NotDirty;
+  bool mAuthorStyleDisabled = false;
+  bool mNeedsRestyleAfterEnsureUniqueInner = false;
+};
+
+class UACacheReporter final : public nsIMemoryReporter {
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIMEMORYREPORTER
+
+ private:
+  ~UACacheReporter() = default;
+};
+
+}  
+
+#endif  // mozilla_ServoStyleSet_h

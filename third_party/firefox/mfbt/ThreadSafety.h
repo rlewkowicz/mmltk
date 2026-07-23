@@ -1,0 +1,85 @@
+// Copyright (c) 2013 The WebRTC project authors. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+// that can be found in the LICENSE file in the root of the source
+
+#if !defined(mozilla_ThreadSafety_h)
+#define mozilla_ThreadSafety_h
+
+#if defined(__clang__) && (__clang_major__ >= 11) && !defined(SWIG)
+#  define MOZ_THREAD_ANNOTATION_ATTRIBUTE__(x) __attribute__((x))
+#  define MOZ_PUSH_IGNORE_THREAD_SAFETY \
+    _Pragma("GCC diagnostic push")      \
+        _Pragma("GCC diagnostic ignored \"-Wthread-safety\"")
+#  define MOZ_POP_THREAD_SAFETY _Pragma("GCC diagnostic pop")
+
+#else
+#  define MOZ_THREAD_ANNOTATION_ATTRIBUTE__(x)  // no-op
+#  define MOZ_PUSH_IGNORE_THREAD_SAFETY
+#  define MOZ_POP_THREAD_SAFETY
+#endif
+
+#define MOZ_GUARDED_BY(x) MOZ_THREAD_ANNOTATION_ATTRIBUTE__(guarded_by(x))
+#define MOZ_GUARDED_VAR MOZ_THREAD_ANNOTATION_ATTRIBUTE__(guarded_var)
+
+#define MOZ_PT_GUARDED_BY(x) MOZ_THREAD_ANNOTATION_ATTRIBUTE__(pt_guarded_by(x))
+#define MOZ_PT_GUARDED_VAR MOZ_THREAD_ANNOTATION_ATTRIBUTE__(pt_guarded_var)
+
+#define MOZ_ACQUIRED_AFTER(...) \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(acquired_after(__VA_ARGS__))
+#define MOZ_ACQUIRED_BEFORE(...) \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(acquired_before(__VA_ARGS__))
+
+
+#define MOZ_REQUIRES(...) \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(exclusive_locks_required(__VA_ARGS__))
+
+#define MOZ_REQUIRES_SHARED(...) \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(shared_locks_required(__VA_ARGS__))
+
+#define MOZ_EXCLUDES(x) MOZ_THREAD_ANNOTATION_ATTRIBUTE__(locks_excluded(x))
+
+#define MOZ_RETURN_CAPABILITY(x) \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(lock_returned(x))
+
+#define MOZ_CAPABILITY(x) MOZ_THREAD_ANNOTATION_ATTRIBUTE__(capability(x))
+
+#define MOZ_SCOPED_CAPABILITY MOZ_THREAD_ANNOTATION_ATTRIBUTE__(scoped_lockable)
+
+#define MOZ_CAPABILITY_ACQUIRE(...) \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(exclusive_lock_function(__VA_ARGS__))
+
+#define MOZ_EXCLUSIVE_RELEASE(...) \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(release_capability(__VA_ARGS__))
+
+#define MOZ_ACQUIRE_SHARED(...) \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(shared_lock_function(__VA_ARGS__))
+
+#define MOZ_TRY_ACQUIRE(...) \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(exclusive_trylock_function(__VA_ARGS__))
+
+#define MOZ_SHARED_TRYLOCK_FUNCTION(...) \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(shared_trylock_function(__VA_ARGS__))
+
+#define MOZ_CAPABILITY_RELEASE(...) \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(unlock_function(__VA_ARGS__))
+
+#define MOZ_NO_THREAD_SAFETY_ANALYSIS \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(no_thread_safety_analysis)
+
+#define MOZ_ASSERT_CAPABILITY(x) \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(assert_capability(x))
+
+#define MOZ_ASSERT_SHARED_CAPABILITY(x) \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(assert_shared_capability(x))
+
+#define MOZ_RELEASE_SHARED(...) \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(release_shared_capability(__VA_ARGS__))
+
+#define MOZ_RELEASE_GENERIC(...) \
+  MOZ_THREAD_ANNOTATION_ATTRIBUTE__(release_generic_capability(__VA_ARGS__))
+
+
+#define MOZ_SCOPED_UNLOCK_RELEASE(...) MOZ_EXCLUSIVE_RELEASE(__VA_ARGS__)
+#define MOZ_SCOPED_UNLOCK_REACQUIRE(...) MOZ_EXCLUSIVE_RELEASE(__VA_ARGS__)
+
+#endif

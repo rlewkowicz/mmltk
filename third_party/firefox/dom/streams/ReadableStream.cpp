@@ -1,0 +1,1199 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ReadIntoRequest.h"
+#include "ReadableByteStreamControllerAbstract.h"
+#include "ReadableStreamAbstract.h"
+#include "ReadableStreamBYOBReaderAbstract.h"
+#include "ReadableStreamDefaultControllerAbstract.h"
+#include "ReadableStreamDefaultReaderAbstract.h"
+#include "ReadableStreamPipeTo.h"
+#include "ReadableStreamTee.h"
+#include "StreamUtils.h"
+#include "TeeState.h"
+#include "WritableStreamAbstract.h"
+#include "js/Array.h"
+#include "js/Exception.h"
+#include "js/Iterator.h"
+#include "js/PropertyAndElement.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/HoldDropJSObjects.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/BindingCallContext.h"
+#include "mozilla/dom/ByteStreamHelpers.h"
+#include "mozilla/dom/Promise-inl.h"
+#include "mozilla/dom/QueueWithSizes.h"
+#include "mozilla/dom/QueuingStrategyBinding.h"
+#include "mozilla/dom/ReadRequest.h"
+#include "mozilla/dom/ReadableStreamBYOBRequest.h"
+#include "mozilla/dom/ReadableStreamBinding.h"
+#include "mozilla/dom/ReadableStreamControllerBase.h"
+#include "mozilla/dom/RootedDictionary.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/UnderlyingSourceBinding.h"
+#include "mozilla/dom/UnderlyingSourceCallbackHelpers.h"
+#include "mozilla/dom/WritableStreamDefaultWriter.h"
+#include "nsCOMPtr.h"
+#include "nsIGlobalObject.h"
+#include "nsISupports.h"
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    mozilla::Variant<mozilla::Nothing,
+                     RefPtr<mozilla::dom::ReadableStreamDefaultReader>>&
+        aReader,
+    const char* aName, uint32_t aFlags = 0) {
+  if (aReader.is<RefPtr<mozilla::dom::ReadableStreamDefaultReader>>()) {
+    ImplCycleCollectionTraverse(
+        aCallback,
+        aReader.as<RefPtr<mozilla::dom::ReadableStreamDefaultReader>>(), aName,
+        aFlags);
+  }
+}
+
+inline void ImplCycleCollectionUnlink(
+    mozilla::Variant<mozilla::Nothing,
+                     RefPtr<mozilla::dom::ReadableStreamDefaultReader>>&
+        aReader) {
+  aReader = AsVariant(mozilla::Nothing());
+}
+
+namespace mozilla::dom {
+
+using namespace streams_abstract;
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_WITH_JS_MEMBERS(
+    ReadableStream, (mGlobal, mController, mReader), (mStoredError))
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(ReadableStream)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(ReadableStream)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ReadableStream)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+ReadableStream::ReadableStream(nsIGlobalObject* aGlobal,
+                               HoldDropJSObjectsCaller aHoldDropCaller)
+    : mGlobal(aGlobal), mReader(nullptr), mHoldDropCaller(aHoldDropCaller) {
+  if (mHoldDropCaller == HoldDropJSObjectsCaller::Implicit) {
+    mozilla::HoldJSObjects(this);
+  }
+}
+
+ReadableStream::ReadableStream(const GlobalObject& aGlobal,
+                               HoldDropJSObjectsCaller aHoldDropCaller)
+    : mGlobal(do_QueryInterface(aGlobal.GetAsSupports())),
+      mReader(nullptr),
+      mHoldDropCaller(aHoldDropCaller) {
+  if (mHoldDropCaller == HoldDropJSObjectsCaller::Implicit) {
+    mozilla::HoldJSObjects(this);
+  }
+}
+
+ReadableStream::~ReadableStream() {
+  if (mHoldDropCaller == HoldDropJSObjectsCaller::Implicit) {
+    mozilla::DropJSObjects(this);
+  }
+}
+
+JSObject* ReadableStream::WrapObject(JSContext* aCx,
+                                     JS::Handle<JSObject*> aGivenProto) {
+  return ReadableStream_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void ReadableStream::GetStoredError(JSContext* aCx,
+                                    JS::MutableHandle<JS::Value> aStoredError,
+                                    ErrorResult& aRv) const {
+  aStoredError.set(mStoredError);
+  if (!JS_WrapValue(aCx, aStoredError)) {
+    aStoredError.setUndefined();
+    aRv.StealExceptionFromJSContext(aCx);
+  }
+}
+
+ReadableStreamDefaultReader* ReadableStream::GetDefaultReader() {
+  return mReader->AsDefault();
+}
+
+void ReadableStream::SetReader(ReadableStreamGenericReader* aReader) {
+  mReader = aReader;
+}
+
+namespace streams_abstract {
+
+bool ReadableStreamHasBYOBReader(ReadableStream* aStream) {
+  ReadableStreamGenericReader* reader = aStream->GetReader();
+
+  if (!reader) {
+    return false;
+  }
+
+  return reader->IsBYOB();
+}
+
+bool ReadableStreamHasDefaultReader(ReadableStream* aStream) {
+  ReadableStreamGenericReader* reader = aStream->GetReader();
+
+  if (!reader) {
+    return false;
+  }
+
+  return reader->IsDefault();
+}
+
+}  
+
+already_AddRefed<ReadableStream> ReadableStream::Constructor(
+    const GlobalObject& aGlobal,
+    const Optional<JS::Handle<JSObject*>>& aUnderlyingSource,
+    const QueuingStrategy& aStrategy, ErrorResult& aRv) {
+  JS::Rooted<JSObject*> underlyingSourceObj(
+      aGlobal.Context(),
+      aUnderlyingSource.WasPassed() ? aUnderlyingSource.Value() : nullptr);
+
+  RootedDictionary<UnderlyingSource> underlyingSourceDict(aGlobal.Context());
+  if (underlyingSourceObj) {
+    JS::Rooted<JS::Value> objValue(aGlobal.Context(),
+                                   JS::ObjectValue(*underlyingSourceObj));
+    dom::BindingCallContext callCx(aGlobal.Context(),
+                                   "ReadableStream.constructor");
+    aRv.MightThrowJSException();
+    if (!underlyingSourceDict.Init(callCx, objValue)) {
+      aRv.StealExceptionFromJSContext(aGlobal.Context());
+      return nullptr;
+    }
+  }
+
+  RefPtr<ReadableStream> readableStream =
+      new ReadableStream(aGlobal, HoldDropJSObjectsCaller::Implicit);
+
+  if (underlyingSourceDict.mType.WasPassed()) {
+    MOZ_ASSERT(underlyingSourceDict.mType.Value() == ReadableStreamType::Bytes);
+
+    if (aStrategy.mSize.WasPassed()) {
+      aRv.ThrowRangeError("Implementation preserved member 'size'");
+      return nullptr;
+    }
+
+    double highWaterMark = ExtractHighWaterMark(aStrategy, 0, aRv);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+
+    SetUpReadableByteStreamControllerFromUnderlyingSource(
+        aGlobal.Context(), readableStream, underlyingSourceObj,
+        underlyingSourceDict, highWaterMark, aRv);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+
+    return readableStream.forget();
+  }
+
+  RefPtr<QueuingStrategySize> sizeAlgorithm =
+      aStrategy.mSize.WasPassed() ? &aStrategy.mSize.Value() : nullptr;
+
+  double highWaterMark = ExtractHighWaterMark(aStrategy, 1, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  SetupReadableStreamDefaultControllerFromUnderlyingSource(
+      aGlobal.Context(), readableStream, underlyingSourceObj,
+      underlyingSourceDict, highWaterMark, sizeAlgorithm, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  return readableStream.forget();
+}
+
+class ReadableStreamFromAlgorithms final
+    : public UnderlyingSourceAlgorithmsWrapper {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_INHERITED(
+      ReadableStreamFromAlgorithms, UnderlyingSourceAlgorithmsWrapper)
+
+  ReadableStreamFromAlgorithms(nsIGlobalObject* aGlobal,
+                               JS::Handle<JSObject*> aIteratorRecord)
+      : mGlobal(aGlobal), mIteratorRecordMaybeCrossRealm(aIteratorRecord) {
+    mozilla::HoldJSObjects(this);
+  };
+
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<Promise> PullCallbackImpl(
+      JSContext* aCx, ReadableStreamControllerBase& aController,
+      ErrorResult& aRv) override {
+    aRv.MightThrowJSException();
+
+    JS::Rooted<JSObject*> iteratorRecord(aCx, mIteratorRecordMaybeCrossRealm);
+    JSAutoRealm ar(aCx, iteratorRecord);
+
+    JS::Rooted<JS::Value> nextResult(aCx);
+    if (!JS::IteratorNext(aCx, iteratorRecord, &nextResult)) {
+      aRv.StealExceptionFromJSContext(aCx);
+      return nullptr;
+    }
+
+    RefPtr<Promise> nextPromise = Promise::CreateInfallible(mGlobal);
+    nextPromise->MaybeResolve(nextResult);
+
+    auto result = nextPromise->ThenWithCycleCollectedArgs(
+        [](JSContext* aCx, JS::Handle<JS::Value> aIterResult, ErrorResult& aRv,
+           const RefPtr<ReadableStreamDefaultController>& aController)
+            MOZ_CAN_RUN_SCRIPT_FOR_DEFINITION -> already_AddRefed<Promise> {
+              aRv.MightThrowJSException();
+
+              if (!aIterResult.isObject()) {
+                aRv.ThrowTypeError("next() returned a non-object value");
+                return nullptr;
+              }
+
+              JS::Rooted<JSObject*> iterResult(aCx, &aIterResult.toObject());
+
+              bool done = false;
+              if (!JS::IteratorComplete(aCx, iterResult, &done)) {
+                aRv.StealExceptionFromJSContext(aCx);
+                return nullptr;
+              }
+
+              if (done) {
+                ReadableStreamDefaultControllerClose(aCx, aController, aRv);
+              } else {
+                JS::Rooted<JS::Value> value(aCx);
+                if (!JS::IteratorValue(aCx, iterResult, &value)) {
+                  aRv.StealExceptionFromJSContext(aCx);
+                  return nullptr;
+                }
+
+                ReadableStreamDefaultControllerEnqueue(aCx, aController, value,
+                                                       aRv);
+              }
+
+              return nullptr;
+            },
+        RefPtr(aController.AsDefault()));
+    if (result.isErr()) {
+      aRv.Throw(result.unwrapErr());
+      return nullptr;
+    }
+    return result.unwrap().forget();
+  };
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<Promise> CancelCallbackImpl(
+      JSContext* aCx, const Optional<JS::Handle<JS::Value>>& aReason,
+      ErrorResult& aRv) override {
+    aRv.MightThrowJSException();
+
+    JS::Rooted<JSObject*> iteratorRecord(aCx, mIteratorRecordMaybeCrossRealm);
+    JSAutoRealm ar(aCx, iteratorRecord);
+
+    JS::Rooted<JS::Value> iterator(aCx);
+    if (!JS::GetIteratorRecordIterator(aCx, iteratorRecord, &iterator)) {
+      aRv.StealExceptionFromJSContext(aCx);
+      return nullptr;
+    }
+
+    JS::Rooted<JS::Value> returnMethod(aCx);
+    if (!JS::GetReturnMethod(aCx, iterator, &returnMethod)) {
+      aRv.StealExceptionFromJSContext(aCx);
+      return nullptr;
+    }
+
+    if (returnMethod.isUndefined()) {
+      return Promise::CreateResolvedWithUndefined(mGlobal, aRv);
+    }
+
+    JS::Rooted<JS::Value> reason(aCx, aReason.Value());
+    if (!JS_WrapValue(aCx, &reason)) {
+      JS_ClearPendingException(aCx);
+      aRv.Throw(NS_ERROR_UNEXPECTED);
+      return nullptr;
+    }
+
+    JS::Rooted<JS::Value> returnResult(aCx);
+    if (!JS::Call(aCx, iterator, returnMethod, JS::HandleValueArray(reason),
+                  &returnResult)) {
+      aRv.StealExceptionFromJSContext(aCx);
+      return nullptr;
+    }
+
+    RefPtr<Promise> returnPromise = Promise::CreateInfallible(mGlobal);
+    returnPromise->MaybeResolve(returnResult);
+
+    auto result = returnPromise->ThenWithCycleCollectedArgs(
+        [](JSContext* aCx, JS::Handle<JS::Value> aIterResult, ErrorResult& aRv)
+            MOZ_CAN_RUN_SCRIPT_FOR_DEFINITION -> already_AddRefed<Promise> {
+              if (!aIterResult.isObject()) {
+                aRv.ThrowTypeError("return() returned a non-object value");
+                return nullptr;
+              }
+
+              return nullptr;
+            });
+    if (result.isErr()) {
+      aRv.Throw(result.unwrapErr());
+      return nullptr;
+    }
+    return result.unwrap().forget();
+  };
+
+ protected:
+  ~ReadableStreamFromAlgorithms() override { mozilla::DropJSObjects(this); };
+
+ private:
+  nsCOMPtr<nsIGlobalObject> mGlobal;
+  JS::Heap<JSObject*> mIteratorRecordMaybeCrossRealm;
+};
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED_WITH_JS_MEMBERS(
+    ReadableStreamFromAlgorithms, UnderlyingSourceAlgorithmsWrapper, (mGlobal),
+    (mIteratorRecordMaybeCrossRealm))
+NS_IMPL_ADDREF_INHERITED(ReadableStreamFromAlgorithms,
+                         UnderlyingSourceAlgorithmsWrapper)
+NS_IMPL_RELEASE_INHERITED(ReadableStreamFromAlgorithms,
+                          UnderlyingSourceAlgorithmsWrapper)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ReadableStreamFromAlgorithms)
+NS_INTERFACE_MAP_END_INHERITING(UnderlyingSourceAlgorithmsWrapper)
+
+static already_AddRefed<ReadableStream> MOZ_CAN_RUN_SCRIPT
+ReadableStreamFromIterable(JSContext* aCx, nsIGlobalObject* aGlobal,
+                           JS::Handle<JS::Value> aAsyncIterable,
+                           ErrorResult& aRv) {
+  aRv.MightThrowJSException();
+
+  JS::Rooted<JSObject*> iteratorRecord(
+      aCx, JS::GetIteratorObject(aCx, aAsyncIterable, true));
+  if (!iteratorRecord) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return nullptr;
+  }
+
+  auto algorithms =
+      MakeRefPtr<ReadableStreamFromAlgorithms>(aGlobal, iteratorRecord);
+
+  return ReadableStream::CreateAbstract(aCx, aGlobal, algorithms,
+                                        mozilla::Some(0.0), nullptr, aRv);
+}
+
+already_AddRefed<ReadableStream> ReadableStream::From(
+    const GlobalObject& aGlobal, JS::Handle<JS::Value> aAsyncIterable,
+    ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+  return ReadableStreamFromIterable(aGlobal.Context(), global, aAsyncIterable,
+                                    aRv);
+}
+
+bool ReadableStream::Locked() const {
+  return mReader;
+}
+
+namespace streams_abstract {
+static void InitializeReadableStream(ReadableStream* aStream) {
+  aStream->SetState(ReadableStream::ReaderState::Readable);
+
+  aStream->SetReader(nullptr);
+  aStream->SetStoredError(JS::UndefinedHandleValue);
+
+  aStream->SetDisturbed(false);
+}
+}  
+
+MOZ_CAN_RUN_SCRIPT
+already_AddRefed<ReadableStream> ReadableStream::CreateAbstract(
+    JSContext* aCx, nsIGlobalObject* aGlobal,
+    UnderlyingSourceAlgorithmsBase* aAlgorithms,
+    mozilla::Maybe<double> aHighWaterMark, QueuingStrategySize* aSizeAlgorithm,
+    ErrorResult& aRv) {
+  double highWaterMark = aHighWaterMark.valueOr(1.0);
+
+  MOZ_ASSERT(IsNonNegativeNumber(highWaterMark));
+  RefPtr<ReadableStream> stream =
+      new ReadableStream(aGlobal, HoldDropJSObjectsCaller::Implicit);
+
+  InitializeReadableStream(stream);
+
+  RefPtr<ReadableStreamDefaultController> controller =
+      new ReadableStreamDefaultController(aGlobal);
+
+  SetUpReadableStreamDefaultController(aCx, stream, controller, aAlgorithms,
+                                       highWaterMark, aSizeAlgorithm, aRv);
+
+  return stream.forget();
+}
+
+namespace streams_abstract {
+void ReadableStreamClose(JSContext* aCx, ReadableStream* aStream,
+                         ErrorResult& aRv) {
+  MOZ_ASSERT(aStream->State() == ReadableStream::ReaderState::Readable);
+
+  aStream->SetState(ReadableStream::ReaderState::Closed);
+
+  ReadableStreamGenericReader* reader = aStream->GetReader();
+
+  if (!reader) {
+    return;
+  }
+
+  reader->ClosedPromise()->MaybeResolveWithUndefined();
+
+  if (reader->IsDefault()) {
+    LinkedList<RefPtr<ReadRequest>> readRequests =
+        std::move(reader->AsDefault()->ReadRequests());
+
+    reader->AsDefault()->ReadRequests().clear();
+
+    while (RefPtr<ReadRequest> readRequest = readRequests.popFirst()) {
+      readRequest->CloseSteps(aCx, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+    }
+  }
+}
+
+already_AddRefed<Promise> ReadableStreamCancel(JSContext* aCx,
+                                               ReadableStream* aStream,
+                                               JS::Handle<JS::Value> aError,
+                                               ErrorResult& aRv) {
+  aStream->SetDisturbed(true);
+
+  if (aStream->State() == ReadableStream::ReaderState::Closed) {
+    RefPtr<Promise> promise =
+        Promise::CreateInfallible(aStream->GetParentObject());
+    promise->MaybeResolveWithUndefined();
+    return promise.forget();
+  }
+
+  if (aStream->State() == ReadableStream::ReaderState::Errored) {
+    JS::Rooted<JS::Value> storedError(aCx);
+    aStream->GetStoredError(aCx, &storedError, aRv);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+
+    return Promise::CreateRejected(aStream->GetParentObject(), storedError,
+                                   aRv);
+  }
+
+  ReadableStreamClose(aCx, aStream, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  ReadableStreamGenericReader* reader = aStream->GetReader();
+
+  if (reader && reader->IsBYOB()) {
+    LinkedList<RefPtr<ReadIntoRequest>> readIntoRequests =
+        std::move(reader->AsBYOB()->ReadIntoRequests());
+
+    reader->AsBYOB()->ReadIntoRequests().clear();
+
+    while (RefPtr<ReadIntoRequest> readIntoRequest =
+               readIntoRequests.popFirst()) {
+      readIntoRequest->CloseSteps(aCx, JS::UndefinedHandleValue, aRv);
+      if (aRv.Failed()) {
+        return nullptr;
+      }
+    }
+  }
+
+  RefPtr<ReadableStreamControllerBase> controller(aStream->Controller());
+  RefPtr<Promise> sourceCancelPromise =
+      controller->CancelSteps(aCx, aError, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise =
+      Promise::CreateInfallible(sourceCancelPromise->GetParentObject());
+
+  Result<RefPtr<Promise>, nsresult> returnResult =
+      sourceCancelPromise->ThenWithCycleCollectedArgs(
+          [](JSContext*, JS::Handle<JS::Value>, ErrorResult&,
+             RefPtr<Promise> newPromise) {
+            newPromise->MaybeResolveWithUndefined();
+            return newPromise.forget();
+          },
+          promise);
+
+  if (returnResult.isErr()) {
+    aRv.Throw(returnResult.unwrapErr());
+    return nullptr;
+  }
+
+  return returnResult.unwrap().forget();
+}
+
+}  
+
+already_AddRefed<Promise> ReadableStream::Cancel(JSContext* aCx,
+                                                 JS::Handle<JS::Value> aReason,
+                                                 ErrorResult& aRv) {
+  if (Locked()) {
+    aRv.ThrowTypeError("Cannot cancel a stream locked by a reader.");
+    return nullptr;
+  }
+
+  RefPtr<ReadableStream> thisRefPtr = this;
+  return ReadableStreamCancel(aCx, thisRefPtr, aReason, aRv);
+}
+
+namespace streams_abstract {
+already_AddRefed<ReadableStreamDefaultReader>
+AcquireReadableStreamDefaultReader(ReadableStream* aStream, ErrorResult& aRv) {
+  RefPtr<ReadableStreamDefaultReader> reader =
+      new ReadableStreamDefaultReader(aStream->GetParentObject());
+
+  SetUpReadableStreamDefaultReader(reader, aStream, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  return reader.forget();
+}
+}  
+
+void ReadableStream::GetReader(const ReadableStreamGetReaderOptions& aOptions,
+                               OwningReadableStreamReader& resultReader,
+                               ErrorResult& aRv) {
+  if (!aOptions.mMode.WasPassed()) {
+    RefPtr<ReadableStreamDefaultReader> defaultReader =
+        AcquireReadableStreamDefaultReader(this, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+    resultReader.SetAsReadableStreamDefaultReader() = defaultReader;
+    return;
+  }
+
+  MOZ_ASSERT(aOptions.mMode.Value() == ReadableStreamReaderMode::Byob);
+
+  RefPtr<ReadableStreamBYOBReader> byobReader =
+      AcquireReadableStreamBYOBReader(this, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+  resultReader.SetAsReadableStreamBYOBReader() = byobReader;
+}
+
+namespace streams_abstract {
+bool IsReadableStreamLocked(ReadableStream* aStream) {
+  return aStream->Locked();
+}
+}  
+
+MOZ_CAN_RUN_SCRIPT already_AddRefed<ReadableStream> ReadableStream::PipeThrough(
+    const ReadableWritablePair& aTransform, const StreamPipeOptions& aOptions,
+    ErrorResult& aRv) {
+  if (IsReadableStreamLocked(this)) {
+    aRv.ThrowTypeError("Cannot pipe from a locked stream.");
+    return nullptr;
+  }
+
+  if (IsWritableStreamLocked(aTransform.mWritable)) {
+    aRv.ThrowTypeError("Cannot pipe to a locked stream.");
+    return nullptr;
+  }
+
+  RefPtr<AbortSignal> signal =
+      aOptions.mSignal.WasPassed() ? &aOptions.mSignal.Value() : nullptr;
+
+  RefPtr<WritableStream> writable = aTransform.mWritable;
+  RefPtr<Promise> promise = ReadableStreamPipeTo(
+      this, writable, aOptions.mPreventClose, aOptions.mPreventAbort,
+      aOptions.mPreventCancel, signal, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  MOZ_ALWAYS_TRUE(promise->SetAnyPromiseIsHandled());
+
+  return do_AddRef(aTransform.mReadable.get());
+};
+
+namespace streams_abstract {
+
+double ReadableStreamGetNumReadRequests(ReadableStream* aStream) {
+  MOZ_ASSERT(ReadableStreamHasDefaultReader(aStream));
+
+  return double(aStream->GetDefaultReader()->ReadRequests().length());
+}
+
+void ReadableStreamError(JSContext* aCx, ReadableStream* aStream,
+                         JS::Handle<JS::Value> aValue, ErrorResult& aRv) {
+  MOZ_ASSERT(aStream->State() == ReadableStream::ReaderState::Readable);
+
+  aStream->SetState(ReadableStream::ReaderState::Errored);
+
+  aStream->SetStoredError(aValue);
+
+  ReadableStreamGenericReader* reader = aStream->GetReader();
+
+  if (!reader) {
+    return;
+  }
+
+  reader->ClosedPromise()->MaybeReject(aValue);
+
+  reader->ClosedPromise()->SetSettledPromiseIsHandled();
+
+  if (reader->IsDefault()) {
+    RefPtr<ReadableStreamDefaultReader> defaultReader = reader->AsDefault();
+    ReadableStreamDefaultReaderErrorReadRequests(aCx, defaultReader, aValue,
+                                                 aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  } else {
+    MOZ_ASSERT(reader->IsBYOB());
+
+    RefPtr<ReadableStreamBYOBReader> byobReader = reader->AsBYOB();
+    ReadableStreamBYOBReaderErrorReadIntoRequests(aCx, byobReader, aValue, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+}
+
+void ReadableStreamFulfillReadRequest(JSContext* aCx, ReadableStream* aStream,
+                                      JS::Handle<JS::Value> aChunk, bool aDone,
+                                      ErrorResult& aRv) {
+  MOZ_ASSERT(ReadableStreamHasDefaultReader(aStream));
+
+  ReadableStreamDefaultReader* reader = aStream->GetDefaultReader();
+
+  MOZ_ASSERT(!reader->ReadRequests().isEmpty());
+
+  RefPtr<ReadRequest> readRequest = reader->ReadRequests().popFirst();
+
+  if (aDone) {
+    readRequest->CloseSteps(aCx, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+
+  readRequest->ChunkSteps(aCx, aChunk, aRv);
+}
+
+void ReadableStreamAddReadRequest(ReadableStream* aStream,
+                                  ReadRequest* aReadRequest) {
+  MOZ_ASSERT(aStream->GetReader()->IsDefault());
+  MOZ_ASSERT(aStream->State() == ReadableStream::ReaderState::Readable);
+  aStream->GetDefaultReader()->ReadRequests().insertBack(aReadRequest);
+}
+
+}  
+
+MOZ_CAN_RUN_SCRIPT already_AddRefed<Promise>
+ReadableStreamDefaultTeeSourceAlgorithms::CancelCallback(
+    JSContext* aCx, const Optional<JS::Handle<JS::Value>>& aReason,
+    ErrorResult& aRv) {
+  mTeeState->SetCanceled(mBranch, true);
+
+  mTeeState->SetReason(mBranch, aReason.Value());
+
+
+  if (mTeeState->Canceled(OtherTeeBranch(mBranch))) {
+
+    JS::Rooted<JSObject*> compositeReason(aCx, JS::NewArrayObject(aCx, 2));
+    if (!compositeReason) {
+      aRv.StealExceptionFromJSContext(aCx);
+      return nullptr;
+    }
+
+    JS::Rooted<JS::Value> reason1(aCx);
+    mTeeState->GetReason1(aCx, &reason1, aRv);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+    if (!JS_SetElement(aCx, compositeReason, 0, reason1)) {
+      aRv.StealExceptionFromJSContext(aCx);
+      return nullptr;
+    }
+
+    JS::Rooted<JS::Value> reason2(aCx);
+    mTeeState->GetReason2(aCx, &reason2, aRv);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+    if (!JS_SetElement(aCx, compositeReason, 1, reason2)) {
+      aRv.StealExceptionFromJSContext(aCx);
+      return nullptr;
+    }
+
+    JS::Rooted<JS::Value> compositeReasonValue(
+        aCx, JS::ObjectValue(*compositeReason));
+    RefPtr<ReadableStream> stream(mTeeState->GetStream());
+    RefPtr<Promise> cancelResult =
+        ReadableStreamCancel(aCx, stream, compositeReasonValue, aRv);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+
+    mTeeState->CancelPromise()->MaybeResolve(cancelResult);
+  }
+
+  return do_AddRef(mTeeState->CancelPromise());
+}
+
+MOZ_CAN_RUN_SCRIPT
+static void ReadableStreamDefaultTee(JSContext* aCx, ReadableStream* aStream,
+                                     bool aCloneForBranch2,
+                                     nsTArray<RefPtr<ReadableStream>>& aResult,
+                                     ErrorResult& aRv) {
+
+  RefPtr<TeeState> teeState = TeeState::Create(aStream, aCloneForBranch2, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  auto branch1Algorithms = MakeRefPtr<ReadableStreamDefaultTeeSourceAlgorithms>(
+      teeState, TeeBranch::Branch1);
+  auto branch2Algorithms = MakeRefPtr<ReadableStreamDefaultTeeSourceAlgorithms>(
+      teeState, TeeBranch::Branch2);
+
+  nsCOMPtr<nsIGlobalObject> global(
+      do_AddRef(teeState->GetStream()->GetParentObject()));
+  teeState->SetBranch1(ReadableStream::CreateAbstract(
+      aCx, global, branch1Algorithms, mozilla::Nothing(), nullptr, aRv));
+  if (aRv.Failed()) {
+    return;
+  }
+
+  teeState->SetBranch2(ReadableStream::CreateAbstract(
+      aCx, global, branch2Algorithms, mozilla::Nothing(), nullptr, aRv));
+  if (aRv.Failed()) {
+    return;
+  }
+
+  teeState->GetReader()->ClosedPromise()->AddCallbacksWithCycleCollectedArgs(
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         TeeState* aTeeState) {},
+      [](JSContext* aCx, JS::Handle<JS::Value> aReason, ErrorResult& aRv,
+         TeeState* aTeeState) {
+        ReadableStreamDefaultControllerError(
+            aCx, aTeeState->Branch1()->DefaultController(), aReason, aRv);
+        if (aRv.Failed()) {
+          return;
+        }
+
+        ReadableStreamDefaultControllerError(
+            aCx, aTeeState->Branch2()->DefaultController(), aReason, aRv);
+        if (aRv.Failed()) {
+          return;
+        }
+
+        if (!aTeeState->Canceled1() || !aTeeState->Canceled2()) {
+          aTeeState->CancelPromise()->MaybeResolveWithUndefined();
+        }
+      },
+      RefPtr(teeState));
+
+  aResult.AppendElement(teeState->Branch1());
+  aResult.AppendElement(teeState->Branch2());
+}
+
+already_AddRefed<Promise> ReadableStream::PipeTo(
+    WritableStream& aDestination, const StreamPipeOptions& aOptions,
+    ErrorResult& aRv) {
+  if (IsReadableStreamLocked(this)) {
+    aRv.ThrowTypeError("Cannot pipe from a locked stream.");
+    return nullptr;
+  }
+
+  if (IsWritableStreamLocked(&aDestination)) {
+    aRv.ThrowTypeError("Cannot pipe to a locked stream.");
+    return nullptr;
+  }
+
+  RefPtr<AbortSignal> signal =
+      aOptions.mSignal.WasPassed() ? &aOptions.mSignal.Value() : nullptr;
+
+  return ReadableStreamPipeTo(this, &aDestination, aOptions.mPreventClose,
+                              aOptions.mPreventAbort, aOptions.mPreventCancel,
+                              signal, aRv);
+}
+
+MOZ_CAN_RUN_SCRIPT
+static void ReadableStreamTee(JSContext* aCx, ReadableStream* aStream,
+                              bool aCloneForBranch2,
+                              nsTArray<RefPtr<ReadableStream>>& aResult,
+                              ErrorResult& aRv) {
+  if (aStream->Controller()->IsByte()) {
+    ReadableByteStreamTee(aCx, aStream, aResult, aRv);
+    return;
+  }
+  ReadableStreamDefaultTee(aCx, aStream, aCloneForBranch2, aResult, aRv);
+}
+
+void ReadableStream::Tee(JSContext* aCx,
+                         nsTArray<RefPtr<ReadableStream>>& aResult,
+                         ErrorResult& aRv) {
+  ReadableStreamTee(aCx, this, false, aResult, aRv);
+}
+
+void ReadableStream::IteratorData::Traverse(
+    nsCycleCollectionTraversalCallback& cb) {
+  ReadableStream::IteratorData* tmp = this;
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mReader);
+}
+void ReadableStream::IteratorData::Unlink() {
+  ReadableStream::IteratorData* tmp = this;
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mReader);
+}
+
+void ReadableStream::InitAsyncIteratorData(
+    IteratorData& aData, Iterator::IteratorType aType,
+    const ReadableStreamIteratorOptions& aOptions, ErrorResult& aRv) {
+  RefPtr<ReadableStreamDefaultReader> reader =
+      AcquireReadableStreamDefaultReader(this, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  aData.mReader = reader;
+
+  aData.mPreventCancel = aOptions.mPreventCancel;
+}
+
+struct IteratorReadRequest : public ReadRequest {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(IteratorReadRequest, ReadRequest)
+
+  RefPtr<Promise> mPromise;
+  RefPtr<ReadableStreamDefaultReader> mReader;
+
+  explicit IteratorReadRequest(Promise* aPromise,
+                               ReadableStreamDefaultReader* aReader)
+      : mPromise(aPromise), mReader(aReader) {}
+
+  void ChunkSteps(JSContext* aCx, JS::Handle<JS::Value> aChunk,
+                  ErrorResult& aRv) override {
+    mPromise->MaybeResolve(aChunk);
+  }
+
+  void CloseSteps(JSContext* aCx, ErrorResult& aRv) override {
+    ReadableStreamDefaultReaderRelease(aCx, mReader, aRv);
+    if (aRv.Failed()) {
+      mPromise->MaybeRejectWithUndefined();
+      return;
+    }
+
+    iterator_utils::ResolvePromiseForFinished(mPromise);
+  }
+
+  void ErrorSteps(JSContext* aCx, JS::Handle<JS::Value> aError,
+                  ErrorResult& aRv) override {
+    ReadableStreamDefaultReaderRelease(aCx, mReader, aRv);
+    if (aRv.Failed()) {
+      mPromise->MaybeRejectWithUndefined();
+      return;
+    }
+
+    mPromise->MaybeReject(aError);
+  }
+
+ protected:
+  virtual ~IteratorReadRequest() = default;
+};
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(IteratorReadRequest, ReadRequest, mPromise,
+                                   mReader)
+
+NS_IMPL_ADDREF_INHERITED(IteratorReadRequest, ReadRequest)
+NS_IMPL_RELEASE_INHERITED(IteratorReadRequest, ReadRequest)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(IteratorReadRequest)
+NS_INTERFACE_MAP_END_INHERITING(ReadRequest)
+
+already_AddRefed<Promise> ReadableStream::GetNextIterationResult(
+    Iterator* aIterator, ErrorResult& aRv) {
+  RefPtr<ReadableStreamDefaultReader> reader = aIterator->Data().mReader;
+
+  MOZ_ASSERT(reader->GetStream());
+
+  RefPtr<Promise> promise = Promise::CreateInfallible(GetParentObject());
+
+  RefPtr<ReadRequest> request = new IteratorReadRequest(promise, reader);
+
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(mGlobal)) {
+    aRv.ThrowUnknownError("Internal error");
+    return nullptr;
+  }
+
+  ReadableStreamDefaultReaderRead(jsapi.cx(), reader, request, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  return promise.forget();
+}
+
+already_AddRefed<Promise> ReadableStream::IteratorReturn(
+    JSContext* aCx, Iterator* aIterator, JS::Handle<JS::Value> aValue,
+    ErrorResult& aRv) {
+  RefPtr<ReadableStreamDefaultReader> reader = aIterator->Data().mReader;
+
+  MOZ_ASSERT(reader->GetStream());
+
+  MOZ_ASSERT(reader->ReadRequests().isEmpty());
+
+  if (!aIterator->Data().mPreventCancel) {
+    RefPtr<ReadableStream> stream(reader->GetStream());
+    RefPtr<Promise> result = ReadableStreamCancel(aCx, stream, aValue, aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return nullptr;
+    }
+
+    MOZ_DIAGNOSTIC_ASSERT(
+        reader->GetStream(),
+        "We shouldn't have a null stream here (bug 1821169).");
+    if (!reader->GetStream()) {
+      aRv.Throw(NS_ERROR_FAILURE);
+      return nullptr;
+    }
+
+    ReadableStreamDefaultReaderRelease(aCx, reader, aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return nullptr;
+    }
+
+    return result.forget();
+  }
+
+  ReadableStreamDefaultReaderRelease(aCx, reader, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  return Promise::CreateResolvedWithUndefined(GetParentObject(), aRv);
+}
+
+namespace streams_abstract {
+void ReadableStreamAddReadIntoRequest(ReadableStream* aStream,
+                                      ReadIntoRequest* aReadIntoRequest) {
+  MOZ_ASSERT(aStream->GetReader()->IsBYOB());
+
+  MOZ_ASSERT(aStream->State() == ReadableStream::ReaderState::Readable ||
+             aStream->State() == ReadableStream::ReaderState::Closed);
+
+  aStream->GetReader()->AsBYOB()->ReadIntoRequests().insertBack(
+      aReadIntoRequest);
+}
+}  
+
+already_AddRefed<ReadableStream> ReadableStream::CreateByteAbstract(
+    JSContext* aCx, nsIGlobalObject* aGlobal,
+    UnderlyingSourceAlgorithmsBase* aAlgorithms, ErrorResult& aRv) {
+  RefPtr<ReadableStream> stream =
+      new ReadableStream(aGlobal, HoldDropJSObjectsCaller::Implicit);
+
+  InitializeReadableStream(stream);
+
+  RefPtr<ReadableByteStreamController> controller =
+      new ReadableByteStreamController(aGlobal);
+
+  SetUpReadableByteStreamController(aCx, stream, controller, aAlgorithms, 0,
+                                    mozilla::Nothing(), aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  return stream.forget();
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY already_AddRefed<ReadableStream>
+ReadableStream::CreateNative(JSContext* aCx, nsIGlobalObject* aGlobal,
+                             UnderlyingSourceAlgorithmsWrapper& aAlgorithms,
+                             mozilla::Maybe<double> aHighWaterMark,
+                             QueuingStrategySize* aSizeAlgorithm,
+                             ErrorResult& aRv) {
+  double highWaterMark = aHighWaterMark.valueOr(1);
+  MOZ_ASSERT(IsNonNegativeNumber(highWaterMark));
+
+
+
+  RefPtr<ReadableStream> stream =
+      new ReadableStream(aGlobal, HoldDropJSObjectsCaller::Implicit);
+
+  auto controller = MakeRefPtr<ReadableStreamDefaultController>(aGlobal);
+
+  SetUpReadableStreamDefaultController(aCx, stream, controller, &aAlgorithms,
+                                       highWaterMark, aSizeAlgorithm, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+  return stream.forget();
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY void ReadableStream::SetUpByteNative(
+    JSContext* aCx, UnderlyingSourceAlgorithmsWrapper& aAlgorithms,
+    mozilla::Maybe<double> aHighWaterMark, ErrorResult& aRv) {
+  double highWaterMark = aHighWaterMark.valueOr(0);
+  MOZ_ASSERT(IsNonNegativeNumber(highWaterMark));
+
+
+
+  auto controller = MakeRefPtr<ReadableByteStreamController>(GetParentObject());
+
+  SetUpReadableByteStreamController(aCx, this, controller, &aAlgorithms,
+                                    highWaterMark, Nothing(), aRv);
+}
+
+already_AddRefed<ReadableStream> ReadableStream::CreateByteNative(
+    JSContext* aCx, nsIGlobalObject* aGlobal,
+    UnderlyingSourceAlgorithmsWrapper& aAlgorithms,
+    mozilla::Maybe<double> aHighWaterMark, ErrorResult& aRv) {
+  RefPtr<ReadableStream> stream =
+      new ReadableStream(aGlobal, HoldDropJSObjectsCaller::Implicit);
+  stream->SetUpByteNative(aCx, aAlgorithms, aHighWaterMark, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+  return stream.forget();
+}
+
+void ReadableStream::CloseNative(JSContext* aCx, ErrorResult& aRv) {
+  MOZ_ASSERT_IF(mController->GetAlgorithms(),
+                mController->GetAlgorithms()->IsNative());
+  if (mController->IsByte()) {
+    RefPtr<ReadableByteStreamController> controller = mController->AsByte();
+
+    ReadableByteStreamControllerClose(aCx, controller, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+
+    if (!controller->PendingPullIntos().isEmpty()) {
+      ReadableByteStreamControllerRespond(aCx, controller, 0, aRv);
+    }
+    return;
+  }
+
+  RefPtr<ReadableStreamDefaultController> controller = mController->AsDefault();
+  ReadableStreamDefaultControllerClose(aCx, controller, aRv);
+}
+
+void ReadableStream::ErrorNative(JSContext* aCx, JS::Handle<JS::Value> aError,
+                                 ErrorResult& aRv) {
+  if (mController->IsByte()) {
+    ReadableByteStreamControllerError(mController->AsByte(), aError, aRv);
+    return;
+  }
+  ReadableStreamDefaultControllerError(aCx, mController->AsDefault(), aError,
+                                       aRv);
+}
+
+static void CurrentBYOBRequestView(JSContext* aCx,
+                                   ReadableByteStreamController& aController,
+                                   JS::MutableHandle<JSObject*> aRetVal,
+                                   ErrorResult& aRv) {
+
+  RefPtr<ReadableStreamBYOBRequest> byobRequest =
+      ReadableByteStreamControllerGetBYOBRequest(aCx, &aController, aRv);
+  if (!byobRequest) {
+    aRetVal.set(nullptr);
+    return;
+  }
+  byobRequest->GetView(aCx, aRetVal);
+}
+
+static bool HasSameBufferView(JSContext* aCx, JS::Handle<JSObject*> aX,
+                              JS::Handle<JSObject*> aY, ErrorResult& aRv) {
+  bool isShared;
+  JS::Rooted<JSObject*> viewedBufferX(
+      aCx, JS_GetArrayBufferViewBuffer(aCx, aX, &isShared));
+  if (!viewedBufferX) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return false;
+  }
+
+  JS::Rooted<JSObject*> viewedBufferY(
+      aCx, JS_GetArrayBufferViewBuffer(aCx, aY, &isShared));
+  if (!viewedBufferY) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return false;
+  }
+
+  return viewedBufferX == viewedBufferY;
+}
+
+void ReadableStream::EnqueueNative(JSContext* aCx, JS::Handle<JS::Value> aChunk,
+                                   ErrorResult& aRv) {
+  MOZ_ASSERT(mController->GetAlgorithms()->IsNative());
+
+  if (mController->IsDefault()) {
+    RefPtr<ReadableStreamDefaultController> controller =
+        mController->AsDefault();
+    ReadableStreamDefaultControllerEnqueue(aCx, controller, aChunk, aRv);
+    return;
+  }
+
+  MOZ_ASSERT(mController->IsByte());
+  RefPtr<ReadableByteStreamController> controller = mController->AsByte();
+
+  MOZ_ASSERT(aChunk.isObject() &&
+             JS_IsArrayBufferViewObject(&aChunk.toObject()));
+  JS::Rooted<JSObject*> chunk(aCx, &aChunk.toObject());
+
+  JS::Rooted<JSObject*> byobView(aCx);
+  CurrentBYOBRequestView(aCx, *controller, &byobView, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  if (byobView && HasSameBufferView(aCx, chunk, byobView, aRv)) {
+    MOZ_ASSERT(JS_GetArrayBufferViewByteOffset(chunk) ==
+               JS_GetArrayBufferViewByteOffset(byobView));
+    MOZ_ASSERT(JS_GetArrayBufferViewByteLength(chunk) <=
+               JS_GetArrayBufferViewByteLength(byobView));
+    ReadableByteStreamControllerRespond(
+        aCx, controller, JS_GetArrayBufferViewByteLength(chunk), aRv);
+    return;
+  }
+
+  if (aRv.Failed()) {
+    return;
+  }
+
+  ReadableByteStreamControllerEnqueue(aCx, controller, chunk, aRv);
+}
+
+void ReadableStream::GetCurrentBYOBRequestView(
+    JSContext* aCx, JS::MutableHandle<JSObject*> aView, ErrorResult& aRv) {
+  aView.set(nullptr);
+
+  MOZ_ASSERT(mController->IsByte());
+
+  RefPtr<ReadableStreamBYOBRequest> byobRequest =
+      mController->AsByte()->GetByobRequest(aCx, aRv);
+
+  if (!byobRequest || aRv.Failed()) {
+    return;
+  }
+
+  byobRequest->GetView(aCx, aView);
+}
+
+already_AddRefed<mozilla::dom::ReadableStreamDefaultReader>
+ReadableStream::GetReader(ErrorResult& aRv) {
+  return AcquireReadableStreamDefaultReader(this, aRv);
+}
+
+already_AddRefed<Promise> ReadableStream::CancelNative(
+    JSContext* aCx, JS::Handle<JS::Value> aReason, ErrorResult& aRv) {
+  return ReadableStreamCancel(aCx, this, aReason, aRv);
+}
+
+}  

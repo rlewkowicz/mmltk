@@ -1,0 +1,218 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+@namespace url(http://www.w3.org/1998/Math/MathML);
+
+* {
+  writing-mode: horizontal-tb !important;
+  font-size: math;
+}
+
+
+math {
+  direction: ltr;
+  unicode-bidi: embed;
+  display: inline;
+  font-size: inherit;
+  font-style: normal;
+  font-weight: normal;
+  text-indent: 0;
+  font-family: serif;
+  line-height: normal;
+  word-spacing: normal;
+  letter-spacing: normal;
+  text-rendering: optimizeLegibility;
+  -moz-float-edge: margin-box;
+  math-shift: normal;
+  math-style: compact;
+  math-depth: 0;
+  @media -moz-pref("mathml.font_family_math.enabled") {
+    font-family: math;
+  }
+}
+math[display="block" i] {
+  display: block;
+  text-align: -moz-center;
+  math-style: normal;
+}
+math[display="inline" i] {
+  display: inline;
+  math-style: compact;
+}
+
+:any-link {
+  text-decoration: none !important;
+}
+
+
+
+mfrac {
+  padding-inline: 1px;
+}
+
+
+merror {
+  border: 1px solid red;
+  background-color: lightyellow;
+}
+
+
+mtable {
+  display: inline-table;
+  border-collapse: separate;
+  border-spacing: 0;
+  text-indent: 0;
+}
+mtable[frame="none"] {
+  border: none;
+}
+mtable[frame="solid"] {
+  border: solid thin;
+}
+mtable[frame="dashed"] {
+  border: dashed thin;
+}
+
+mtr,
+mlabeledtr {
+  display: table-row;
+  vertical-align: baseline;
+}
+
+mtd {
+  display: table-cell;
+  vertical-align: inherit;
+  text-align: -moz-center;
+  white-space: nowrap;
+}
+
+:not(mtable) > mtr,
+:not(mtable) > mlabeledtr,
+:not(mtr, mlabeledtr) > mtd {
+  display: none !important;
+}
+
+mlabeledtr > mtd:first-child {
+  display: none;
+}
+
+mtd {
+  padding-right: 0.4em; 
+  padding-left: 0.4em; 
+  padding-bottom: 0.5ex; 
+  padding-top: 0.5ex; 
+}
+mtr:first-child > mtd {
+  padding-top: 0;
+}
+mtr:last-child > mtd {
+  padding-bottom: 0;
+}
+mtd:first-child {
+  padding-inline-start: 0;
+}
+mtd:last-child {
+  padding-inline-end: 0;
+}
+mtable[frame="solid"] > mtr:first-child > mtd,
+mtable[frame="dashed"] > mtr:first-child > mtd {
+  padding-top: 0.5ex; 
+}
+mtable[frame="solid"] > mtr:last-child > mtd,
+mtable[frame="dashed"] > mtr:last-child > mtd {
+  padding-bottom: 0.5ex; 
+}
+mtable[frame="solid"] > mtr > mtd:first-child,
+mtable[frame="dashed"] > mtr > mtd:first-child {
+  padding-inline-start: 0.4em; 
+}
+mtable[frame="solid"] > mtr > mtd:last-child,
+mtable[frame="dashed"] > mtr > mtd:last-child {
+  padding-inline-end: 0.4em; 
+}
+
+mtable[rowspacing] > mtr > mtd,
+mtable[columnspacing] > mtr > mtd,
+mtable[framespacing] > mtr > mtd {
+  padding: 0;
+}
+
+*|*::-moz-mathml-anonymous-block {
+  display: inline-block !important;
+  position: static !important;
+  text-indent: 0;
+}
+
+
+
+:-moz-math-increment-script-level {
+  math-depth: add(1);
+}
+
+mfrac > * {
+  math-depth: auto-add;
+  math-style: compact;
+}
+
+mroot > :not(:first-child) {
+  math-depth: add(2);
+  math-style: compact;
+}
+
+msub > :not(:first-child),
+msup > :not(:first-child),
+msubsup > :not(:first-child),
+mmultiscripts > :not(:first-child) {
+  math-depth: add(1);
+  math-style: compact;
+}
+
+munder > :not(:first-child),
+mover > :not(:first-child),
+munderover > :not(:first-child) {
+  math-style: compact;
+}
+
+mfrac > :nth-child(2) {
+  math-shift: compact;
+}
+
+mroot,
+msqrt {
+  math-shift: compact;
+}
+
+msub > :nth-child(2),
+msubsup > :nth-child(2),
+mmultiscripts > :nth-child(even),
+mmultiscripts > mprescripts ~ :nth-child(odd),
+mover[accent="true" i] > :first-child,
+munderover[accent="true" i] > :first-child {
+  math-shift: compact;
+}
+
+mmultiscripts > mprescripts ~ :nth-child(even) {
+  math-shift: inherit;
+}
+
+mtable {
+  math-style: compact;
+}
+
+
+mphantom {
+  visibility: hidden;
+}
+
+maction > :not(:first-child),
+semantics > :not(:first-child) {
+  display: none;
+}
+
+@media -moz-pref("mathml.legacy_mathvariant_attribute.disabled") {
+  mi {
+    text-transform: math-auto;
+  }
+}

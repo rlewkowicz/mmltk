@@ -1,0 +1,569 @@
+// Copyright (C) 2016 and later: Unicode, Inc. and others.
+// License & terms of use: http://www.unicode.org/copyright.html
+
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_BREAK_ITERATION
+
+#include "unicode/ubrk.h"
+#include "unicode/rbbi.h"
+
+#include "rbbi_cache.h"
+
+#include "brkeng.h"
+#include "cmemory.h"
+#include "rbbidata.h"
+#include "rbbirb.h"
+#include "uassert.h"
+#include "uvectr32.h"
+
+U_NAMESPACE_BEGIN
+
+
+RuleBasedBreakIterator::DictionaryCache::DictionaryCache(RuleBasedBreakIterator *bi, UErrorCode &status) :
+        fBI(bi), fBreaks(status), fPositionInCache(-1),
+        fStart(0), fLimit(0), fFirstRuleStatusIndex(0), fOtherRuleStatusIndex(0) {
+}
+
+RuleBasedBreakIterator::DictionaryCache::~DictionaryCache() {
+}
+
+void RuleBasedBreakIterator::DictionaryCache::reset() {
+    fPositionInCache = -1;
+    fStart = 0;
+    fLimit = 0;
+    fFirstRuleStatusIndex = 0;
+    fOtherRuleStatusIndex = 0;
+    fBreaks.removeAllElements();
+}
+
+UBool RuleBasedBreakIterator::DictionaryCache::following(int32_t fromPos, int32_t *result, int32_t *statusIndex) {
+    if (fromPos >= fLimit || fromPos < fStart) {
+        fPositionInCache = -1;
+        return false;
+    }
+
+
+    int32_t r = 0;
+    if (fPositionInCache >= 0 && fPositionInCache < fBreaks.size() && fBreaks.elementAti(fPositionInCache) == fromPos) {
+        ++fPositionInCache;
+        if (fPositionInCache >= fBreaks.size()) {
+            fPositionInCache = -1;
+            return false;
+        }
+        r = fBreaks.elementAti(fPositionInCache);
+        U_ASSERT(r > fromPos);
+        *result = r;
+        *statusIndex = fOtherRuleStatusIndex;
+        return true;
+    }
+
+
+    for (fPositionInCache = 0; fPositionInCache < fBreaks.size(); ++fPositionInCache) {
+        r= fBreaks.elementAti(fPositionInCache);
+        if (r > fromPos) {
+            *result = r;
+            *statusIndex = fOtherRuleStatusIndex;
+            return true;
+        }
+    }
+    UPRV_UNREACHABLE_EXIT;
+}
+
+
+UBool RuleBasedBreakIterator::DictionaryCache::preceding(int32_t fromPos, int32_t *result, int32_t *statusIndex) {
+    if (fromPos <= fStart || fromPos > fLimit) {
+        fPositionInCache = -1;
+        return false;
+    }
+
+    if (fromPos == fLimit) {
+        fPositionInCache = fBreaks.size() - 1;
+        if (fPositionInCache >= 0) {
+            U_ASSERT(fBreaks.elementAti(fPositionInCache) == fromPos);
+        }
+    }
+
+    int32_t r;
+    if (fPositionInCache > 0 && fPositionInCache < fBreaks.size() && fBreaks.elementAti(fPositionInCache) == fromPos) {
+        --fPositionInCache;
+        r = fBreaks.elementAti(fPositionInCache);
+        U_ASSERT(r < fromPos);
+        *result = r;
+        *statusIndex = ( r== fStart) ? fFirstRuleStatusIndex : fOtherRuleStatusIndex;
+        return true;
+    }
+
+    if (fPositionInCache == 0) {
+        fPositionInCache = -1;
+        return false;
+    }
+
+    for (fPositionInCache = fBreaks.size()-1; fPositionInCache >= 0; --fPositionInCache) {
+        r = fBreaks.elementAti(fPositionInCache);
+        if (r < fromPos) {
+            *result = r;
+            *statusIndex = ( r == fStart) ? fFirstRuleStatusIndex : fOtherRuleStatusIndex;
+            return true;
+        }
+    }
+    UPRV_UNREACHABLE_EXIT;
+}
+
+void RuleBasedBreakIterator::DictionaryCache::populateDictionary(int32_t startPos, int32_t endPos,
+                                       int32_t firstRuleStatus, int32_t otherRuleStatus) {
+    if ((endPos - startPos) <= 1) {
+        return;
+    }
+
+    reset();
+    fFirstRuleStatusIndex = firstRuleStatus;
+    fOtherRuleStatusIndex = otherRuleStatus;
+
+    int32_t rangeStart = startPos;
+    int32_t rangeEnd = endPos;
+
+    uint16_t    category;
+    int32_t     current;
+    UErrorCode  status = U_ZERO_ERROR;
+    int32_t     foundBreakCount = 0;
+    UText      *text = &fBI->fText;
+
+
+    utext_setNativeIndex(text, rangeStart);
+    UChar32     c = utext_current32(text);
+    category = ucptrie_get(fBI->fData->fTrie, c);
+    uint32_t dictStart = fBI->fData->fForwardTable->fDictCategoriesStart;
+
+    while(U_SUCCESS(status)) {
+        while ((current = static_cast<int32_t>(UTEXT_GETNATIVEINDEX(text))) < rangeEnd
+                && (category < dictStart)) {
+            utext_next32(text);           
+            c = utext_current32(text);
+            category = ucptrie_get(fBI->fData->fTrie, c);
+        }
+        if (current >= rangeEnd) {
+            break;
+        }
+
+        const LanguageBreakEngine *lbe = fBI->getLanguageBreakEngine(
+            c, fBI->getLocaleID(ULOC_REQUESTED_LOCALE, status));
+
+        if (lbe != nullptr) {
+            foundBreakCount += lbe->findBreaks(text, current, rangeEnd, fBreaks, fBI->fIsPhraseBreaking, status);
+        }
+
+        c = utext_current32(text);
+        category = ucptrie_get(fBI->fData->fTrie, c);
+    }
+
+
+    if (foundBreakCount > 0) {
+        U_ASSERT(foundBreakCount == fBreaks.size());
+        if (startPos < fBreaks.elementAti(0)) {
+            fBreaks.insertElementAt(startPos, 0, status);
+        }
+        if (endPos > fBreaks.peeki()) {
+            fBreaks.push(endPos, status);
+        }
+        fPositionInCache = 0;
+        fStart = fBreaks.elementAti(0);
+        fLimit = fBreaks.peeki();
+    } else {
+    }
+}
+
+
+
+RuleBasedBreakIterator::BreakCache::BreakCache(RuleBasedBreakIterator *bi, UErrorCode &status) :
+        fBI(bi), fSideBuffer(status) {
+    reset();
+}
+
+
+RuleBasedBreakIterator::BreakCache::~BreakCache() {
+}
+
+
+void RuleBasedBreakIterator::BreakCache::reset(int32_t pos, int32_t ruleStatus) {
+    fStartBufIdx = 0;
+    fEndBufIdx = 0;
+    fTextIdx = pos;
+    fBufIdx = 0;
+    fBoundaries[0] = pos;
+    fStatuses[0] = static_cast<uint16_t>(ruleStatus);
+}
+
+
+int32_t  RuleBasedBreakIterator::BreakCache::current() {
+    fBI->fPosition = fTextIdx;
+    fBI->fRuleStatusIndex = fStatuses[fBufIdx];
+    fBI->fDone = false;
+    return fTextIdx;
+}
+
+
+void RuleBasedBreakIterator::BreakCache::following(int32_t startPos, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (startPos == fTextIdx || seek(startPos) || populateNear(startPos, status)) {
+        fBI->fDone = false;
+        next();
+    }
+}
+
+
+void RuleBasedBreakIterator::BreakCache::preceding(int32_t startPos, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (startPos == fTextIdx || seek(startPos) || populateNear(startPos, status)) {
+        if (startPos == fTextIdx) {
+            previous(status);
+        } else {
+            U_ASSERT(startPos > fTextIdx);
+            current();
+        }
+    }
+}
+
+
+void RuleBasedBreakIterator::BreakCache::nextOL() {
+    fBI->fDone = !populateFollowing();
+    fBI->fPosition = fTextIdx;
+    fBI->fRuleStatusIndex = fStatuses[fBufIdx];
+}
+
+
+void RuleBasedBreakIterator::BreakCache::previous(UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    int32_t initialBufIdx = fBufIdx;
+    if (fBufIdx == fStartBufIdx) {
+        populatePreceding(status);
+    } else {
+        fBufIdx = modChunkSize(fBufIdx - 1);
+        fTextIdx = fBoundaries[fBufIdx];
+    }
+    fBI->fDone = (fBufIdx == initialBufIdx);
+    fBI->fPosition = fTextIdx;
+    fBI->fRuleStatusIndex = fStatuses[fBufIdx];
+}
+
+
+UBool RuleBasedBreakIterator::BreakCache::seek(int32_t pos) {
+    if (pos < fBoundaries[fStartBufIdx] || pos > fBoundaries[fEndBufIdx]) {
+        return false;
+    }
+    if (pos == fBoundaries[fStartBufIdx]) {
+        fBufIdx = fStartBufIdx;
+        fTextIdx = fBoundaries[fBufIdx];
+        return true;
+    }
+    if (pos == fBoundaries[fEndBufIdx]) {
+        fBufIdx = fEndBufIdx;
+        fTextIdx = fBoundaries[fBufIdx];
+        return true;
+    }
+
+    int32_t min = fStartBufIdx;
+    int32_t max = fEndBufIdx;
+    while (min != max) {
+        int32_t probe = (min + max + (min>max ? CACHE_SIZE : 0)) / 2;
+        probe = modChunkSize(probe);
+        if (fBoundaries[probe] > pos) {
+            max = probe;
+        } else {
+            min = modChunkSize(probe + 1);
+        }
+    }
+    U_ASSERT(fBoundaries[max] > pos);
+    fBufIdx = modChunkSize(max - 1);
+    fTextIdx = fBoundaries[fBufIdx];
+    U_ASSERT(fTextIdx <= pos);
+    return true;
+}
+
+
+UBool RuleBasedBreakIterator::BreakCache::populateNear(int32_t position, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return false;
+    }
+    U_ASSERT(position < fBoundaries[fStartBufIdx] || position > fBoundaries[fEndBufIdx]);
+
+
+
+    static constexpr int32_t CACHE_NEAR = 15;
+
+    int32_t aBoundary = -1;
+    int32_t ruleStatusIndex = 0;
+    bool retainCache = false;
+    if ((position > fBoundaries[fStartBufIdx] - CACHE_NEAR) && position < (fBoundaries[fEndBufIdx] + CACHE_NEAR)) {
+        retainCache = true;
+    } else if (position <= CACHE_NEAR) {
+        retainCache = false;
+        aBoundary = 0;
+    } else {
+        int32_t backupPos = fBI->handleSafePrevious(position);
+
+        if (fBoundaries[fEndBufIdx] < position && fBoundaries[fEndBufIdx] >= (backupPos - CACHE_NEAR)) {
+            retainCache = true;
+        } else if (backupPos < CACHE_NEAR) {
+            aBoundary = 0;
+            retainCache = (fBoundaries[fStartBufIdx] <= (position + CACHE_NEAR));
+        } else {
+            retainCache = false;
+            fBI->fPosition = backupPos;
+            aBoundary = fBI->handleNext();
+            if (aBoundary != UBRK_DONE && aBoundary <= backupPos + 4) {
+                utext_setNativeIndex(&fBI->fText, aBoundary);
+                if (backupPos == utext_getPreviousNativeIndex(&fBI->fText)) {
+                    aBoundary = fBI->handleNext();   
+                }
+            }
+            if (aBoundary == UBRK_DONE) {
+                aBoundary = utext_nativeLength(&fBI->fText);
+            }
+            ruleStatusIndex = fBI->fRuleStatusIndex;
+        }
+    }
+
+    if (!retainCache) {
+        U_ASSERT(aBoundary != -1);
+        reset(aBoundary, ruleStatusIndex);        
+    }
+
+
+    if (fBoundaries[fEndBufIdx] < position) {
+        while (fBoundaries[fEndBufIdx] < position) {
+            if (!populateFollowing()) {
+                UPRV_UNREACHABLE_EXIT;
+            }
+        }
+        fBufIdx = fEndBufIdx;                      
+        fTextIdx = fBoundaries[fBufIdx];           
+        while (fTextIdx > position) {              
+            previous(status);
+        }
+        return true;
+    }
+
+    if (fBoundaries[fStartBufIdx] > position) {
+        while (fBoundaries[fStartBufIdx] > position) {
+            populatePreceding(status);
+        }
+        fBufIdx = fStartBufIdx;                    
+        fTextIdx = fBoundaries[fBufIdx];           
+        while (fTextIdx < position) {              
+            next();
+        }
+        if (fTextIdx > position) {
+            previous(status);
+        }
+        return true;
+    }
+
+    U_ASSERT(fTextIdx == position);
+    return true;
+}
+
+
+
+UBool RuleBasedBreakIterator::BreakCache::populateFollowing() {
+    int32_t fromPosition = fBoundaries[fEndBufIdx];
+    int32_t fromRuleStatusIdx = fStatuses[fEndBufIdx];
+    int32_t pos = 0;
+    int32_t ruleStatusIdx = 0;
+
+    if (fBI->fDictionaryCache->following(fromPosition, &pos, &ruleStatusIdx)) {
+        addFollowing(pos, ruleStatusIdx, UpdateCachePosition);
+        return true;
+    }
+
+    fBI->fPosition = fromPosition;
+    pos = fBI->handleNext();
+    if (pos == UBRK_DONE) {
+        return false;
+    }
+
+    ruleStatusIdx = fBI->fRuleStatusIndex;
+    if (fBI->fDictionaryCharCount > 0) {
+        fBI->fDictionaryCache->populateDictionary(fromPosition, pos, fromRuleStatusIdx, ruleStatusIdx);
+        if (fBI->fDictionaryCache->following(fromPosition, &pos, &ruleStatusIdx)) {
+            addFollowing(pos, ruleStatusIdx, UpdateCachePosition);
+            return true;
+        }
+    }
+
+    addFollowing(pos, ruleStatusIdx, UpdateCachePosition);
+
+    for (int count=0; count<6; ++count) {
+        pos = fBI->handleNext();
+        if (pos == UBRK_DONE || fBI->fDictionaryCharCount > 0) {
+            break;
+        }
+        addFollowing(pos, fBI->fRuleStatusIndex, RetainCachePosition);
+    }
+
+    return true;
+}
+
+
+UBool RuleBasedBreakIterator::BreakCache::populatePreceding(UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return false;
+    }
+
+    int32_t fromPosition = fBoundaries[fStartBufIdx];
+    if (fromPosition == 0) {
+        return false;
+    }
+
+    int32_t position = 0;
+    int32_t positionStatusIdx = 0;
+
+    if (fBI->fDictionaryCache->preceding(fromPosition, &position, &positionStatusIdx)) {
+        addPreceding(position, positionStatusIdx, UpdateCachePosition);
+        return true;
+    }
+
+    int32_t backupPosition = fromPosition;
+
+    do {
+        backupPosition = backupPosition - 30;
+        if (backupPosition <= 0) {
+            backupPosition = 0;
+        } else {
+            backupPosition = fBI->handleSafePrevious(backupPosition);
+        }
+        if (backupPosition == UBRK_DONE || backupPosition == 0) {
+            position = 0;
+            positionStatusIdx = 0;
+        } else {
+            fBI->fPosition = backupPosition;
+            position = fBI->handleNext();
+            if (position <= backupPosition + 4) {
+                utext_setNativeIndex(&fBI->fText, position);
+                if (backupPosition == utext_getPreviousNativeIndex(&fBI->fText)) {
+                    position = fBI->handleNext();   
+                }
+            }
+            positionStatusIdx = fBI->fRuleStatusIndex;
+        }
+    } while (position >= fromPosition);
+
+
+    fSideBuffer.removeAllElements();
+    fSideBuffer.addElement(position, status);
+    fSideBuffer.addElement(positionStatusIdx, status);
+
+    do {
+        int32_t prevPosition = fBI->fPosition = position;
+        int32_t prevStatusIdx = positionStatusIdx;
+        position = fBI->handleNext();
+        positionStatusIdx = fBI->fRuleStatusIndex;
+        if (position == UBRK_DONE) {
+            break;
+        }
+
+        UBool segmentHandledByDictionary = false;
+        if (fBI->fDictionaryCharCount != 0) {
+            int32_t dictSegEndPosition = position;
+            fBI->fDictionaryCache->populateDictionary(prevPosition, dictSegEndPosition, prevStatusIdx, positionStatusIdx);
+            while (fBI->fDictionaryCache->following(prevPosition, &position, &positionStatusIdx)) {
+                segmentHandledByDictionary = true;
+                U_ASSERT(position > prevPosition);
+                if (position >= fromPosition) {
+                    break;
+                }
+                U_ASSERT(position <= dictSegEndPosition);
+                fSideBuffer.addElement(position, status);
+                fSideBuffer.addElement(positionStatusIdx, status);
+                prevPosition = position;
+            }
+            U_ASSERT(position==dictSegEndPosition || position>=fromPosition);
+        }
+
+        if (!segmentHandledByDictionary && position < fromPosition) {
+            fSideBuffer.addElement(position, status);
+            fSideBuffer.addElement(positionStatusIdx, status);
+        }
+    } while (position < fromPosition);
+
+    UBool success = false;
+    if (!fSideBuffer.isEmpty()) {
+        positionStatusIdx = fSideBuffer.popi();
+        position = fSideBuffer.popi();
+        addPreceding(position, positionStatusIdx, UpdateCachePosition);
+        success = true;
+    }
+
+    while (!fSideBuffer.isEmpty()) {
+        positionStatusIdx = fSideBuffer.popi();
+        position = fSideBuffer.popi();
+        if (!addPreceding(position, positionStatusIdx, RetainCachePosition)) {
+            break;
+        }
+    }
+
+    return success;
+}
+
+
+void RuleBasedBreakIterator::BreakCache::addFollowing(int32_t position, int32_t ruleStatusIdx, UpdatePositionValues update) {
+    U_ASSERT(position > fBoundaries[fEndBufIdx]);
+    U_ASSERT(ruleStatusIdx <= UINT16_MAX);
+    int32_t nextIdx = modChunkSize(fEndBufIdx + 1);
+    if (nextIdx == fStartBufIdx) {
+        fStartBufIdx = modChunkSize(fStartBufIdx + 6);    
+    }
+    fBoundaries[nextIdx] = position;
+    fStatuses[nextIdx] = static_cast<uint16_t>(ruleStatusIdx);
+    fEndBufIdx = nextIdx;
+    if (update == UpdateCachePosition) {
+        fBufIdx = nextIdx;
+        fTextIdx = position;
+    } else {
+        U_ASSERT(nextIdx != fBufIdx);
+    }
+}
+
+bool RuleBasedBreakIterator::BreakCache::addPreceding(int32_t position, int32_t ruleStatusIdx, UpdatePositionValues update) {
+    U_ASSERT(position < fBoundaries[fStartBufIdx]);
+    U_ASSERT(ruleStatusIdx <= UINT16_MAX);
+    int32_t nextIdx = modChunkSize(fStartBufIdx - 1);
+    if (nextIdx == fEndBufIdx) {
+        if (fBufIdx == fEndBufIdx && update == RetainCachePosition) {
+            return false;
+        }
+        fEndBufIdx = modChunkSize(fEndBufIdx - 1);
+    }
+    fBoundaries[nextIdx] = position;
+    fStatuses[nextIdx] = static_cast<uint16_t>(ruleStatusIdx);
+    fStartBufIdx = nextIdx;
+    if (update == UpdateCachePosition) {
+        fBufIdx = nextIdx;
+        fTextIdx = position;
+    }
+    return true;
+}
+
+
+void RuleBasedBreakIterator::BreakCache::dumpCache() {
+#ifdef RBBI_DEBUG
+    RBBIDebugPrintf("fTextIdx:%d   fBufIdx:%d\n", fTextIdx, fBufIdx);
+    for (int32_t i=fStartBufIdx; ; i=modChunkSize(i+1)) {
+        RBBIDebugPrintf("%d  %d\n", i, fBoundaries[i]);
+        if (i == fEndBufIdx) {
+            break;
+        }
+    }
+#endif
+}
+
+U_NAMESPACE_END
+
+#endif // #if !UCONFIG_NO_BREAK_ITERATION

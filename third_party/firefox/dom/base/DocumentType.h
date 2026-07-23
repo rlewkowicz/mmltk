@@ -1,0 +1,60 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef DocumentType_h
+#define DocumentType_h
+
+#include "mozilla/dom/CharacterData.h"
+#include "nsCOMPtr.h"
+#include "nsIContent.h"
+#include "nsString.h"
+
+namespace mozilla::dom {
+
+
+class DocumentType final : public CharacterData {
+ public:
+  DocumentType(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,
+               const nsAString& aPublicId, const nsAString& aSystemId,
+               const nsAString& aInternalSubset);
+
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(DocumentType, CharacterData)
+
+  void GetNodeValueInternal(nsAString& aNodeValue) override {
+    SetDOMStringToNull(aNodeValue);
+  }
+  void SetNodeValueInternal(const nsAString& aNodeValue,
+                            mozilla::ErrorResult& aError,
+                            MutationEffectOnScript) override {}
+
+  virtual const CharacterDataBuffer* GetCharacterDataBuffer() const override;
+
+  virtual already_AddRefed<CharacterData> CloneDataNode(
+      mozilla::dom::NodeInfo* aNodeInfo, bool aCloneText) const override;
+
+  void GetName(nsAString& aName) const;
+  void GetPublicId(nsAString& aPublicId) const;
+  void GetSystemId(nsAString& aSystemId) const;
+  void GetInternalSubset(nsAString& aInternalSubset) const;
+
+ protected:
+  virtual ~DocumentType();
+
+  virtual JSObject* WrapNode(JSContext* cx,
+                             JS::Handle<JSObject*> aGivenProto) override;
+
+  nsString mPublicId;
+  nsString mSystemId;
+  nsString mInternalSubset;
+};
+
+}  
+
+already_AddRefed<mozilla::dom::DocumentType> NS_NewDOMDocumentType(
+    nsNodeInfoManager* aNodeInfoManager, nsAtom* aName,
+    const nsAString& aPublicId, const nsAString& aSystemId,
+    const nsAString& aInternalSubset);
+
+#endif  // DocumentType_h

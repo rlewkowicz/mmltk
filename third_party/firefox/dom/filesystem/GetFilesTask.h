@@ -1,0 +1,79 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_GetFilesTask_h
+#define mozilla_dom_GetFilesTask_h
+
+#include "mozilla/dom/Directory.h"
+#include "mozilla/dom/FileSystemTaskBase.h"
+#include "mozilla/dom/GetFilesHelper.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+class BlobImpl;
+class FileSystemGetFilesParams;
+
+class GetFilesTaskChild final : public FileSystemTaskChildBase {
+ public:
+  static already_AddRefed<GetFilesTaskChild> Create(FileSystemBase* aFileSystem,
+                                                    Directory* aDirectory,
+                                                    nsIFile* aTargetPath,
+                                                    bool aRecursiveFlag,
+                                                    ErrorResult& aRv);
+
+  virtual ~GetFilesTaskChild();
+
+  already_AddRefed<Promise> GetPromise();
+
+ private:
+  GetFilesTaskChild(nsIGlobalObject* aGlobalObject, FileSystemBase* aFileSystem,
+                    Directory* aDirectory, nsIFile* aTargetPath,
+                    bool aRecursiveFlag);
+
+  virtual FileSystemParams GetRequestParams(const nsString& aSerializedDOMPath,
+                                            ErrorResult& aRv) const override;
+
+  virtual void SetSuccessRequestResult(const FileSystemResponseValue& aValue,
+                                       ErrorResult& aRv) override;
+
+  virtual void HandlerCallback() override;
+
+  RefPtr<Promise> mPromise;
+  RefPtr<Directory> mDirectory;
+  nsCOMPtr<nsIFile> mTargetPath;
+  bool mRecursiveFlag;
+
+  FallibleTArray<RefPtr<File>> mTargetData;
+};
+
+class GetFilesTaskParent final : public FileSystemTaskParentBase,
+                                 public GetFilesHelperBase {
+ public:
+  static already_AddRefed<GetFilesTaskParent> Create(
+      FileSystemBase* aFileSystem, const FileSystemGetFilesParams& aParam,
+      FileSystemRequestParent* aParent, ErrorResult& aRv);
+
+  nsresult GetTargetPath(nsAString& aPath) const override;
+
+ private:
+  GetFilesTaskParent(FileSystemBase* aFileSystem,
+                     const FileSystemGetFilesParams& aParam,
+                     FileSystemRequestParent* aParent);
+
+  virtual FileSystemResponseValue GetSuccessRequestResult(
+      ErrorResult& aRv) const override;
+
+  virtual nsresult IOWork() override;
+
+  nsString mDirectoryDOMPath;
+  nsCOMPtr<nsIFile> mTargetPath;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_GetFilesTask_h

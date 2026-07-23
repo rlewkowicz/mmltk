@@ -1,0 +1,397 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+// IWYU pragma: private, include "nsString.h"
+
+#ifndef nsReadableUtils_h_
+#define nsReadableUtils_h_
+
+
+#include "mozilla/Assertions.h"
+#include "nsAString.h"
+#include "mozilla/TextUtils.h"
+
+#include "nsTArrayForwardDeclare.h"
+
+extern "C" {
+bool nsstring_fallible_append_utf8_impl(nsAString* aThis, const char* aOther,
+                                        size_t aOtherLen, size_t aOldLen);
+
+bool nsstring_fallible_append_latin1_impl(nsAString* aThis, const char* aOther,
+                                          size_t aOtherLen, size_t aOldLen,
+                                          bool aAllowShrinking);
+
+bool nscstring_fallible_append_utf16_to_utf8_impl(nsACString* aThis,
+                                                  const char16_t*,
+                                                  size_t aOtherLen,
+                                                  size_t aOldLen);
+
+bool nscstring_fallible_append_utf16_to_latin1_lossy_impl(nsACString* aThis,
+                                                          const char16_t*,
+                                                          size_t aOtherLen,
+                                                          size_t aOldLen,
+                                                          bool aAllowShrinking);
+
+bool nscstring_fallible_append_utf8_to_latin1_lossy_check(
+    nsACString* aThis, const nsACString* aOther, size_t aOldLen);
+
+bool nscstring_fallible_append_latin1_to_utf8_check(nsACString* aThis,
+                                                    const nsACString* aOther,
+                                                    size_t aOldLen);
+}
+
+inline size_t Distance(const nsReadingIterator<char16_t>& aStart,
+                       const nsReadingIterator<char16_t>& aEnd) {
+  MOZ_ASSERT(aStart.get() <= aEnd.get());
+  return static_cast<size_t>(aEnd.get() - aStart.get());
+}
+
+inline size_t Distance(const nsReadingIterator<char>& aStart,
+                       const nsReadingIterator<char>& aEnd) {
+  MOZ_ASSERT(aStart.get() <= aEnd.get());
+  return static_cast<size_t>(aEnd.get() - aStart.get());
+}
+
+
+
+[[nodiscard]] inline bool CopyUTF8toUTF16(mozilla::Span<const char> aSource,
+                                          nsAString& aDest,
+                                          const mozilla::fallible_t&) {
+  return nsstring_fallible_append_utf8_impl(&aDest, aSource.Elements(),
+                                            aSource.Length(), 0);
+}
+
+inline void CopyUTF8toUTF16(mozilla::Span<const char> aSource,
+                            nsAString& aDest) {
+  if (MOZ_UNLIKELY(!CopyUTF8toUTF16(aSource, aDest, mozilla::fallible))) {
+    aDest.AllocFailed(aSource.Length());
+  }
+}
+
+[[nodiscard]] inline bool AppendUTF8toUTF16(mozilla::Span<const char> aSource,
+                                            nsAString& aDest,
+                                            const mozilla::fallible_t&) {
+  return nsstring_fallible_append_utf8_impl(&aDest, aSource.Elements(),
+                                            aSource.Length(), aDest.Length());
+}
+
+inline void AppendUTF8toUTF16(mozilla::Span<const char> aSource,
+                              nsAString& aDest) {
+  if (MOZ_UNLIKELY(!AppendUTF8toUTF16(aSource, aDest, mozilla::fallible))) {
+    aDest.AllocFailed(aDest.Length() + aSource.Length());
+  }
+}
+
+
+[[nodiscard]] inline bool CopyASCIItoUTF16(mozilla::Span<const char> aSource,
+                                           nsAString& aDest,
+                                           const mozilla::fallible_t&) {
+  return nsstring_fallible_append_latin1_impl(&aDest, aSource.Elements(),
+                                              aSource.Length(), 0, true);
+}
+
+inline void CopyASCIItoUTF16(mozilla::Span<const char> aSource,
+                             nsAString& aDest) {
+  if (MOZ_UNLIKELY(!CopyASCIItoUTF16(aSource, aDest, mozilla::fallible))) {
+    aDest.AllocFailed(aSource.Length());
+  }
+}
+
+[[nodiscard]] inline bool AppendASCIItoUTF16(mozilla::Span<const char> aSource,
+                                             nsAString& aDest,
+                                             const mozilla::fallible_t&) {
+  return nsstring_fallible_append_latin1_impl(
+      &aDest, aSource.Elements(), aSource.Length(), aDest.Length(), false);
+}
+
+inline void AppendASCIItoUTF16(mozilla::Span<const char> aSource,
+                               nsAString& aDest) {
+  if (MOZ_UNLIKELY(!AppendASCIItoUTF16(aSource, aDest, mozilla::fallible))) {
+    aDest.AllocFailed(aDest.Length() + aSource.Length());
+  }
+}
+
+
+[[nodiscard]] inline bool CopyUTF16toUTF8(mozilla::Span<const char16_t> aSource,
+                                          nsACString& aDest,
+                                          const mozilla::fallible_t&) {
+  return nscstring_fallible_append_utf16_to_utf8_impl(
+      &aDest, aSource.Elements(), aSource.Length(), 0);
+}
+
+inline void CopyUTF16toUTF8(mozilla::Span<const char16_t> aSource,
+                            nsACString& aDest) {
+  if (MOZ_UNLIKELY(!CopyUTF16toUTF8(aSource, aDest, mozilla::fallible))) {
+    aDest.AllocFailed(aSource.Length());
+  }
+}
+
+[[nodiscard]] inline bool AppendUTF16toUTF8(
+    mozilla::Span<const char16_t> aSource, nsACString& aDest,
+    const mozilla::fallible_t&) {
+  return nscstring_fallible_append_utf16_to_utf8_impl(
+      &aDest, aSource.Elements(), aSource.Length(), aDest.Length());
+}
+
+inline void AppendUTF16toUTF8(mozilla::Span<const char16_t> aSource,
+                              nsACString& aDest) {
+  if (MOZ_UNLIKELY(!AppendUTF16toUTF8(aSource, aDest, mozilla::fallible))) {
+    aDest.AllocFailed(aDest.Length() + aSource.Length());
+  }
+}
+
+
+[[nodiscard]] inline bool LossyCopyUTF16toASCII(
+    mozilla::Span<const char16_t> aSource, nsACString& aDest,
+    const mozilla::fallible_t&) {
+  return nscstring_fallible_append_utf16_to_latin1_lossy_impl(
+      &aDest, aSource.Elements(), aSource.Length(), 0, true);
+}
+
+inline void LossyCopyUTF16toASCII(mozilla::Span<const char16_t> aSource,
+                                  nsACString& aDest) {
+  if (MOZ_UNLIKELY(!LossyCopyUTF16toASCII(aSource, aDest, mozilla::fallible))) {
+    aDest.AllocFailed(aSource.Length());
+  }
+}
+
+[[nodiscard]] inline bool LossyAppendUTF16toASCII(
+    mozilla::Span<const char16_t> aSource, nsACString& aDest,
+    const mozilla::fallible_t&) {
+  return nscstring_fallible_append_utf16_to_latin1_lossy_impl(
+      &aDest, aSource.Elements(), aSource.Length(), aDest.Length(), false);
+}
+
+inline void LossyAppendUTF16toASCII(mozilla::Span<const char16_t> aSource,
+                                    nsACString& aDest) {
+  if (MOZ_UNLIKELY(
+          !LossyAppendUTF16toASCII(aSource, aDest, mozilla::fallible))) {
+    aDest.AllocFailed(aDest.Length() + aSource.Length());
+  }
+}
+
+
+[[nodiscard]] inline bool CopyLatin1toUTF8(const nsACString& aSource,
+                                           nsACString& aDest,
+                                           const mozilla::fallible_t&) {
+  return nscstring_fallible_append_latin1_to_utf8_check(&aDest, &aSource, 0);
+}
+
+inline void CopyLatin1toUTF8(const nsACString& aSource, nsACString& aDest) {
+  if (MOZ_UNLIKELY(!CopyLatin1toUTF8(aSource, aDest, mozilla::fallible))) {
+    aDest.AllocFailed(aSource.Length());
+  }
+}
+
+[[nodiscard]] inline bool AppendLatin1toUTF8(const nsACString& aSource,
+                                             nsACString& aDest,
+                                             const mozilla::fallible_t&) {
+  return nscstring_fallible_append_latin1_to_utf8_check(&aDest, &aSource,
+                                                        aDest.Length());
+}
+
+inline void AppendLatin1toUTF8(const nsACString& aSource, nsACString& aDest) {
+  if (MOZ_UNLIKELY(!AppendLatin1toUTF8(aSource, aDest, mozilla::fallible))) {
+    aDest.AllocFailed(aDest.Length() + aSource.Length());
+  }
+}
+
+
+[[nodiscard]] inline bool LossyCopyUTF8toLatin1(const nsACString& aSource,
+                                                nsACString& aDest,
+                                                const mozilla::fallible_t&) {
+  return nscstring_fallible_append_utf8_to_latin1_lossy_check(&aDest, &aSource,
+                                                              0);
+}
+
+inline void LossyCopyUTF8toLatin1(const nsACString& aSource,
+                                  nsACString& aDest) {
+  if (MOZ_UNLIKELY(!LossyCopyUTF8toLatin1(aSource, aDest, mozilla::fallible))) {
+    aDest.AllocFailed(aSource.Length());
+  }
+}
+
+[[nodiscard]] inline bool LossyAppendUTF8toLatin1(const nsACString& aSource,
+                                                  nsACString& aDest,
+                                                  const mozilla::fallible_t&) {
+  return nscstring_fallible_append_utf8_to_latin1_lossy_check(&aDest, &aSource,
+                                                              aDest.Length());
+}
+
+inline void LossyAppendUTF8toLatin1(const nsACString& aSource,
+                                    nsACString& aDest) {
+  if (MOZ_UNLIKELY(
+          !LossyAppendUTF8toLatin1(aSource, aDest, mozilla::fallible))) {
+    aDest.AllocFailed(aDest.Length() + aSource.Length());
+  }
+}
+
+char* ToNewCString(const nsAString& aSource);
+
+char* ToNewCString(const nsAString& aSource,
+                   const mozilla::fallible_t& aFallible);
+
+char* ToNewCString(const nsACString& aSource);
+
+char* ToNewCString(const nsACString& aSource,
+                   const mozilla::fallible_t& aFallible);
+
+char* ToNewUTF8String(const nsAString& aSource, uint32_t* aUTF8Count = nullptr);
+
+char* ToNewUTF8String(const nsAString& aSource, uint32_t* aUTF8Count,
+                      const mozilla::fallible_t& aFallible);
+
+char16_t* ToNewUnicode(const nsAString& aSource);
+
+char16_t* ToNewUnicode(const nsAString& aSource,
+                       const mozilla::fallible_t& aFallible);
+
+char16_t* ToNewUnicode(const nsACString& aSource);
+
+char16_t* ToNewUnicode(const nsACString& aSource,
+                       const mozilla::fallible_t& aFallible);
+
+char16_t* UTF8ToNewUnicode(const nsACString& aSource,
+                           uint32_t* aUTF16Count = nullptr);
+
+char16_t* UTF8ToNewUnicode(const nsACString& aSource, uint32_t* aUTF16Count,
+                           const mozilla::fallible_t& aFallible);
+
+char16_t* CopyUnicodeTo(const nsAString& aSource, uint32_t aSrcOffset,
+                        char16_t* aDest, uint32_t aLength);
+
+[[nodiscard]] inline bool EnsureUTF16Validity(nsAString& aString) {
+  size_t upTo = mozilla::Utf16ValidUpTo(aString);
+  size_t len = aString.Length();
+  if (upTo == len) {
+    return true;
+  }
+  char16_t* ptr = aString.BeginWriting(mozilla::fallible);
+  if (!ptr) {
+    return false;
+  }
+  auto span = mozilla::Span(ptr, len);
+  span[upTo] = 0xFFFD;
+  mozilla::EnsureUtf16ValiditySpan(span.From(upTo + 1));
+  return true;
+}
+
+void ParseString(const nsACString& aSource, char aDelimiter,
+                 nsTArray<nsCString>& aArray);
+
+namespace mozilla::detail {
+
+constexpr auto kStringJoinAppendDefault =
+    [](auto& aResult, const auto& aValue) { aResult.Append(aValue); };
+
+}  
+
+template <
+    typename CharType, typename InputRange,
+    typename Func = const decltype(mozilla::detail::kStringJoinAppendDefault)&>
+void StringJoinAppend(
+    nsTSubstring<CharType>& aOutput,
+    const nsTLiteralString<CharType>& aSeparator, const InputRange& aInputRange,
+    Func&& aFunc = mozilla::detail::kStringJoinAppendDefault) {
+  bool first = true;
+  for (const auto& item : aInputRange) {
+    if (first) {
+      first = false;
+    } else {
+      aOutput.Append(aSeparator);
+    }
+
+    aFunc(aOutput, item);
+  }
+}
+
+template <
+    typename CharType, typename InputRange,
+    typename Func = const decltype(mozilla::detail::kStringJoinAppendDefault)&>
+auto StringJoin(const nsTLiteralString<CharType>& aSeparator,
+                const InputRange& aInputRange,
+                Func&& aFunc = mozilla::detail::kStringJoinAppendDefault) {
+  nsTAutoString<CharType> res;
+  StringJoinAppend(res, aSeparator, aInputRange, std::forward<Func>(aFunc));
+  return res;
+}
+
+void ToUpperCase(nsACString&);
+
+void ToLowerCase(nsACString&);
+
+void ToUpperCase(nsACString&);
+
+void ToLowerCase(nsACString&);
+
+void ToUpperCase(const nsACString& aSource, nsACString& aDest);
+
+void ToLowerCase(const nsACString& aSource, nsACString& aDest);
+
+
+bool FindInReadable(const nsAString& aPattern, nsAString::const_iterator&,
+                    nsAString::const_iterator&,
+                    nsStringComparator = nsTDefaultStringComparator);
+bool FindInReadable(const nsACString& aPattern, nsACString::const_iterator&,
+                    nsACString::const_iterator&,
+                    nsCStringComparator = nsTDefaultStringComparator);
+
+inline bool FindInReadable(
+    const nsAString& aPattern, const nsAString& aSource,
+    nsStringComparator aCompare = nsTDefaultStringComparator) {
+  nsAString::const_iterator start, end;
+  aSource.BeginReading(start);
+  aSource.EndReading(end);
+  return FindInReadable(aPattern, start, end, aCompare);
+}
+
+inline bool FindInReadable(
+    const nsACString& aPattern, const nsACString& aSource,
+    nsCStringComparator aCompare = nsTDefaultStringComparator) {
+  nsACString::const_iterator start, end;
+  aSource.BeginReading(start);
+  aSource.EndReading(end);
+  return FindInReadable(aPattern, start, end, aCompare);
+}
+
+bool CaseInsensitiveFindInReadable(const nsACString& aPattern,
+                                   nsACString::const_iterator&,
+                                   nsACString::const_iterator&);
+
+bool RFindInReadable(const nsAString& aPattern, nsAString::const_iterator&,
+                     nsAString::const_iterator&,
+                     nsStringComparator = nsTDefaultStringComparator);
+bool RFindInReadable(const nsACString& aPattern, nsACString::const_iterator&,
+                     nsACString::const_iterator&,
+                     nsCStringComparator = nsTDefaultStringComparator);
+
+bool FindCharInReadable(char16_t aChar, nsAString::const_iterator& aSearchStart,
+                        const nsAString::const_iterator& aSearchEnd);
+bool FindCharInReadable(char aChar, nsACString::const_iterator& aSearchStart,
+                        const nsACString::const_iterator& aSearchEnd);
+
+bool StringBeginsWith(const nsAString& aSource, const nsAString& aSubstring);
+bool StringBeginsWith(const nsAString& aSource, const nsAString& aSubstring,
+                      nsStringComparator);
+bool StringBeginsWith(const nsACString& aSource, const nsACString& aSubstring);
+bool StringBeginsWith(const nsACString& aSource, const nsACString& aSubstring,
+                      nsCStringComparator);
+bool StringEndsWith(const nsAString& aSource, const nsAString& aSubstring);
+bool StringEndsWith(const nsAString& aSource, const nsAString& aSubstring,
+                    nsStringComparator);
+bool StringEndsWith(const nsACString& aSource, const nsACString& aSubstring);
+bool StringEndsWith(const nsACString& aSource, const nsACString& aSubstring,
+                    nsCStringComparator);
+
+const nsString& EmptyString();
+const nsCString& EmptyCString();
+
+const nsString& VoidString();
+const nsCString& VoidCString();
+
+int32_t CompareUTF8toUTF16(const nsACString& aUTF8String,
+                           const nsAString& aUTF16String);
+
+void AppendUCS4ToUTF16(const uint32_t aSource, nsAString& aDest);
+
+#endif  // !defined(nsReadableUtils_h_)

@@ -1,0 +1,27 @@
+
+[package]
+edition = "2021"
+rust-version = "1.63"
+name = "jobserver"
+version = "0.1.33"
+authors = ["Alex Crichton <alex@alexcrichton.com>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = """
+An implementation of the GNU Make jobserver for Rust.
+"""
+homepage = "https://github.com/rust-lang/jobserver-rs"
+documentation = "https://docs.rs/jobserver"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-lang/jobserver-rs"
+
+[lib]
+name = "jobserver"
+path = "src/lib.rs"
+
+[target."cfg(unix)".dependencies.libc]
+version = "0.2.171"

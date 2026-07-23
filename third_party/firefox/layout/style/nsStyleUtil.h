@@ -1,0 +1,99 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsStyleUtil_h_
+#define nsStyleUtil_h_
+
+#include "NonCustomCSSPropertyId.h"
+#include "nsCRT.h"
+#include "nsColor.h"
+#include "nsCoord.h"
+#include "nsGkAtoms.h"
+#include "nsStringFwd.h"
+#include "nsTArrayForwardDeclare.h"
+
+class nsCSSValue;
+class nsIContent;
+class nsIPrincipal;
+class nsIURI;
+struct nsCSSKTableEntry;
+struct nsCSSValueList;
+struct nsStylePosition;
+
+namespace mozilla {
+namespace dom {
+class Document;
+class Element;
+}  
+}  
+
+class nsStyleUtil {
+ public:
+  static bool DashMatchCompare(const nsAString& aAttributeValue,
+                               const nsAString& aSelectorValue,
+                               const nsStringComparator& aComparator);
+
+  static bool LangTagCompare(const nsACString& aAttributeValue,
+                             const nsACString& aSelectorValue);
+
+  static bool ValueIncludes(const nsAString& aValueList,
+                            const nsAString& aValue,
+                            const nsStringComparator& aComparator);
+
+  static void AppendQuotedCSSString(const nsACString& aString,
+                                    nsACString& aResult, char aQuoteChar = '"');
+
+  static void AppendEscapedCSSIdent(const nsAString& aIdent,
+                                    nsAString& aResult);
+
+ public:
+  static void AppendCSSNumber(float aNumber, nsAString& aResult) {
+    aResult.AppendFloat(aNumber);
+  }
+
+  static uint8_t FloatToColorComponent(float aAlpha) {
+    NS_ASSERTION(0.0 <= aAlpha && aAlpha <= 1.0, "out of range");
+    return static_cast<uint8_t>(NSToIntRound(aAlpha * 255));
+  }
+
+  static float ColorComponentToFloat(uint8_t aAlpha);
+
+  static void GetSerializedColorValue(nscolor aColor,
+                                      nsAString& aSerializedColor);
+
+  static bool IsSignificantChild(nsIContent* aChild,
+                                 bool aWhitespaceIsSignificant);
+
+  static bool ThreadSafeIsSignificantChild(const nsIContent* aChild,
+                                           bool aWhitespaceIsSignificant);
+  static bool ObjectPropsMightCauseOverflow(const nsStylePosition* aStylePos);
+
+  static bool CSPAllowsInlineStyle(mozilla::dom::Element* aContent,
+                                   mozilla::dom::Document* aDocument,
+                                   nsIPrincipal* aTriggeringPrincipal,
+                                   uint32_t aLineNumber, uint32_t aColumnNumber,
+                                   const nsAString& aStyleText, nsresult* aRv);
+
+  template <size_t N>
+  static bool MatchesLanguagePrefix(const char16_t* aLang, size_t aLen,
+                                    const char16_t (&aPrefix)[N]) {
+    return !NS_strncmp(aLang, aPrefix, N - 1) &&
+           (aLen == N - 1 || aLang[N - 1] == '-');
+  }
+
+  template <size_t N>
+  static bool MatchesLanguagePrefix(const nsAtom* aLang,
+                                    const char16_t (&aPrefix)[N]) {
+    MOZ_ASSERT(aLang);
+    return MatchesLanguagePrefix(aLang->GetUTF16String(), aLang->GetLength(),
+                                 aPrefix);
+  }
+
+  template <size_t N>
+  static bool MatchesLanguagePrefix(const nsAString& aLang,
+                                    const char16_t (&aPrefix)[N]) {
+    return MatchesLanguagePrefix(aLang.Data(), aLang.Length(), aPrefix);
+  }
+};
+
+#endif /* nsStyleUtil_h_ */

@@ -1,0 +1,164 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_WebCryptoTask_h
+#define mozilla_dom_WebCryptoTask_h
+
+#include "ScopedNSSTypes.h"
+#include "mozilla/dom/CryptoKey.h"
+#include "mozilla/dom/DOMException.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/SubtleCryptoBinding.h"
+#include "nsIGlobalObject.h"
+
+namespace mozilla::dom {
+
+class ThreadSafeWorkerRef;
+
+typedef ArrayBufferViewOrArrayBuffer CryptoOperationData;
+typedef ArrayBufferViewOrArrayBuffer KeyData;
+
+
+#define MAYBE_EARLY_FAIL(rv) \
+  if (NS_FAILED(rv)) {       \
+    FailWithError(rv);       \
+    return;                  \
+  }
+
+class WebCryptoTask : public CancelableRunnable {
+ public:
+  virtual void DispatchWithPromise(Promise* aResultPromise);
+
+ protected:
+  static already_AddRefed<WebCryptoTask> CreateEncryptDecryptTask(
+      JSContext* aCx, const ObjectOrString& aAlgorithm, CryptoKey& aKey,
+      const CryptoOperationData& aData, bool aEncrypt);
+
+  static already_AddRefed<WebCryptoTask> CreateSignVerifyTask(
+      JSContext* aCx, const ObjectOrString& aAlgorithm, CryptoKey& aKey,
+      const CryptoOperationData& aSignature, const CryptoOperationData& aData,
+      bool aSign);
+
+ public:
+  static already_AddRefed<WebCryptoTask> CreateEncryptTask(
+      JSContext* aCx, const ObjectOrString& aAlgorithm, CryptoKey& aKey,
+      const CryptoOperationData& aData) {
+    return CreateEncryptDecryptTask(aCx, aAlgorithm, aKey, aData, true);
+  }
+
+  static already_AddRefed<WebCryptoTask> CreateDecryptTask(
+      JSContext* aCx, const ObjectOrString& aAlgorithm, CryptoKey& aKey,
+      const CryptoOperationData& aData) {
+    return CreateEncryptDecryptTask(aCx, aAlgorithm, aKey, aData, false);
+  }
+
+  static already_AddRefed<WebCryptoTask> CreateSignTask(
+      JSContext* aCx, const ObjectOrString& aAlgorithm, CryptoKey& aKey,
+      const CryptoOperationData& aData) {
+    CryptoOperationData dummy;
+    (void)dummy.SetAsArrayBuffer(aCx);
+    return CreateSignVerifyTask(aCx, aAlgorithm, aKey, dummy, aData, true);
+  }
+
+  static already_AddRefed<WebCryptoTask> CreateVerifyTask(
+      JSContext* aCx, const ObjectOrString& aAlgorithm, CryptoKey& aKey,
+      const CryptoOperationData& aSignature, const CryptoOperationData& aData) {
+    return CreateSignVerifyTask(aCx, aAlgorithm, aKey, aSignature, aData,
+                                false);
+  }
+
+  static already_AddRefed<WebCryptoTask> CreateDigestTask(
+      JSContext* aCx, const ObjectOrString& aAlgorithm,
+      const CryptoOperationData& aData);
+
+  static already_AddRefed<WebCryptoTask> CreateImportKeyTask(
+      nsIGlobalObject* aGlobal, JSContext* aCx, const nsAString& aFormat,
+      JS::Handle<JSObject*> aKeyData, const ObjectOrString& aAlgorithm,
+      bool aExtractable, const Sequence<nsString>& aKeyUsages);
+  static already_AddRefed<WebCryptoTask> CreateExportKeyTask(
+      const nsAString& aFormat, CryptoKey& aKey);
+  static already_AddRefed<WebCryptoTask> CreateGenerateKeyTask(
+      nsIGlobalObject* aGlobal, JSContext* aCx,
+      const ObjectOrString& aAlgorithm, bool aExtractable,
+      const Sequence<nsString>& aKeyUsages);
+
+  static already_AddRefed<WebCryptoTask> CreateDeriveKeyTask(
+      nsIGlobalObject* aGlobal, JSContext* aCx,
+      const ObjectOrString& aAlgorithm, CryptoKey& aBaseKey,
+      const ObjectOrString& aDerivedKeyType, bool extractable,
+      const Sequence<nsString>& aKeyUsages);
+  static already_AddRefed<WebCryptoTask> CreateDeriveBitsTask(
+      JSContext* aCx, const ObjectOrString& aAlgorithm, CryptoKey& aKey,
+      const Nullable<uint32_t>& aLength);
+
+  static already_AddRefed<WebCryptoTask> CreateWrapKeyTask(
+      JSContext* aCx, const nsAString& aFormat, CryptoKey& aKey,
+      CryptoKey& aWrappingKey, const ObjectOrString& aWrapAlgorithm);
+  static already_AddRefed<WebCryptoTask> CreateUnwrapKeyTask(
+      nsIGlobalObject* aGlobal, JSContext* aCx, const nsAString& aFormat,
+      const ArrayBufferViewOrArrayBuffer& aWrappedKey,
+      CryptoKey& aUnwrappingKey, const ObjectOrString& aUnwrapAlgorithm,
+      const ObjectOrString& aUnwrappedKeyAlgorithm, bool aExtractable,
+      const Sequence<nsString>& aKeyUsages);
+
+ protected:
+  RefPtr<Promise> mResultPromise;
+  nsresult mEarlyRv;
+  bool mEarlyComplete;
+
+  WebCryptoTask();
+  virtual ~WebCryptoTask();
+
+  bool IsOnOriginalThread() {
+    return !mOriginalEventTarget || mOriginalEventTarget->IsOnCurrentThread();
+  }
+
+  virtual nsresult BeforeCrypto() { return NS_OK; }
+  virtual nsresult DoCrypto() { return NS_OK; }
+  virtual nsresult AfterCrypto() { return NS_OK; }
+  virtual void Resolve() {}
+  virtual void Cleanup() {}
+
+  void FailWithError(nsresult aRv);
+
+  nsresult CalculateResult();
+
+  void CallCallback(nsresult rv);
+
+ private:
+  NS_IMETHOD Run() final;
+  nsresult Cancel() final;
+
+  nsCOMPtr<nsISerialEventTarget> mOriginalEventTarget;
+  RefPtr<ThreadSafeWorkerRef> mWorkerRef;
+  nsresult mRv;
+};
+
+class GenerateAsymmetricKeyTask : public WebCryptoTask {
+ public:
+  GenerateAsymmetricKeyTask(nsIGlobalObject* aGlobal, JSContext* aCx,
+                            const ObjectOrString& aAlgorithm, bool aExtractable,
+                            const Sequence<nsString>& aKeyUsages);
+
+ protected:
+  UniquePLArenaPool mArena;
+  UniquePtr<CryptoKeyPair> mKeyPair;
+  nsString mAlgName;
+  CK_MECHANISM_TYPE mMechanism;
+  PK11RSAGenParams mRsaParams;
+  SECKEYDHParams mDhParams;
+  nsString mNamedCurve;
+
+  virtual nsresult DoCrypto() override;
+  virtual void Resolve() override;
+  virtual void Cleanup() override;
+
+ private:
+  UniqueSECKEYPublicKey mPublicKey;
+  UniqueSECKEYPrivateKey mPrivateKey;
+};
+
+}  
+
+#endif  // mozilla_dom_WebCryptoTask_h

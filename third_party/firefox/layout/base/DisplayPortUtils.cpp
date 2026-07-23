@@ -1,0 +1,1155 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DisplayPortUtils.h"
+
+#include <ostream>
+
+#include "AnchorPositioningUtils.h"
+#include "FrameMetrics.h"
+#include "RetainedDisplayListBuilder.h"
+#include "StickyScrollContainer.h"
+#include "WindowRenderer.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/StaticPrefs_layers.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/dom/BrowserChild.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/gfx/Point.h"
+#include "mozilla/layers/APZPublicUtils.h"
+#include "mozilla/layers/CompositorBridgeChild.h"
+#include "mozilla/layers/LayersMessageUtils.h"
+#include "mozilla/layers/PAPZ.h"
+#include "nsIFrameInlines.h"
+#include "nsLayoutUtils.h"
+#include "nsPlaceholderFrame.h"
+#include "nsRefreshDriver.h"
+#include "nsSubDocumentFrame.h"
+
+namespace mozilla {
+
+using gfx::IntSize;
+
+using layers::FrameMetrics;
+using layers::ScrollableLayerGuid;
+using NonZeroScrollRangeOnly = ScrollContainerFrame::NonZeroScrollRangeOnly;
+
+typedef ScrollableLayerGuid::ViewID ViewID;
+
+static LazyLogModule sDisplayportLog("apz.displayport");
+
+DisplayPortMargins DisplayPortMargins::FromAPZ(const ScreenMargin& aMargins,
+                                               const CSSPoint& aVisualOffset,
+                                               const CSSPoint& aLayoutOffset) {
+  return DisplayPortMargins{aMargins, aVisualOffset, aLayoutOffset};
+}
+
+DisplayPortMargins DisplayPortMargins::ForScrollContainerFrame(
+    ScrollContainerFrame* aScrollContainerFrame, const ScreenMargin& aMargins) {
+  CSSPoint visualOffset;
+  CSSPoint layoutOffset;
+  if (aScrollContainerFrame) {
+    PresShell* presShell = aScrollContainerFrame->PresShell();
+    layoutOffset =
+        CSSPoint::FromAppUnits(aScrollContainerFrame->GetScrollPosition());
+    if (aScrollContainerFrame->IsRootScrollFrameOfDocument()) {
+      visualOffset =
+          CSSPoint::FromAppUnits(presShell->GetVisualViewportOffset());
+
+    } else {
+      visualOffset = layoutOffset;
+    }
+  }
+  return DisplayPortMargins{aMargins, visualOffset, layoutOffset};
+}
+
+DisplayPortMargins DisplayPortMargins::ForContent(
+    nsIContent* aContent, const ScreenMargin& aMargins) {
+  return ForScrollContainerFrame(
+      aContent ? nsLayoutUtils::FindScrollContainerFrameFor(aContent) : nullptr,
+      aMargins);
+}
+
+ScreenMargin DisplayPortMargins::GetRelativeToLayoutViewport(
+    ContentGeometryType aGeometryType,
+    ScrollContainerFrame* aScrollContainerFrame,
+    const CSSToScreenScale2D& aDisplayportScale) const {
+  CSSPoint scrollDeltaCss =
+      ComputeAsyncTranslation(aGeometryType, aScrollContainerFrame);
+  ScreenPoint scrollDelta = scrollDeltaCss * aDisplayportScale;
+  ScreenMargin margins = mMargins;
+  margins.left -= scrollDelta.x;
+  margins.right += scrollDelta.x;
+  margins.top -= scrollDelta.y;
+  margins.bottom += scrollDelta.y;
+  return margins;
+}
+
+std::ostream& operator<<(std::ostream& aOs,
+                         const DisplayPortMargins& aMargins) {
+  if (aMargins.mVisualOffset == CSSPoint() &&
+      aMargins.mLayoutOffset == CSSPoint()) {
+    aOs << aMargins.mMargins;
+  } else {
+    aOs << "{" << aMargins.mMargins << "," << aMargins.mVisualOffset << ","
+        << aMargins.mLayoutOffset << "}";
+  }
+  return aOs;
+}
+
+CSSPoint DisplayPortMargins::ComputeAsyncTranslation(
+    ContentGeometryType aGeometryType,
+    ScrollContainerFrame* aScrollContainerFrame) const {
+  if (aGeometryType == ContentGeometryType::Scrolled) {
+    return mVisualOffset - mLayoutOffset;
+  }
+
+  if (!aScrollContainerFrame) {
+    return CSSPoint();
+  }
+  MOZ_ASSERT(aScrollContainerFrame->IsRootScrollFrameOfDocument());
+  if (!aScrollContainerFrame->PresShell()->IsVisualViewportSizeSet()) {
+    return CSSPoint();
+  }
+  const CSSRect visualViewport{
+      mVisualOffset,
+      CSSSize::FromAppUnits(
+          aScrollContainerFrame->PresShell()->GetVisualViewportSize())};
+  const CSSRect scrollableRect = CSSRect::FromAppUnits(
+      nsLayoutUtils::CalculateExpandedScrollableRect(aScrollContainerFrame));
+  CSSRect asyncLayoutViewport{
+      mLayoutOffset,
+      CSSSize::FromAppUnits(aScrollContainerFrame->GetScrollPortRect().Size())};
+  FrameMetrics::KeepLayoutViewportEnclosingVisualViewport(
+      visualViewport, scrollableRect,  asyncLayoutViewport);
+  return mVisualOffset - asyncLayoutViewport.TopLeft();
+}
+
+static nsRect GetDisplayPortFromRectData(nsIContent* aContent,
+                                         DisplayPortPropertyData* aRectData) {
+  return aRectData->mRect;
+}
+
+static nsRect GetDisplayPortFromMarginsData(
+    nsIContent* aContent, DisplayPortMarginsPropertyData* aMarginsData,
+    const DisplayPortOptions& aOptions) {
+
+  nsRect base;
+  if (nsRect* baseData = static_cast<nsRect*>(
+          aContent->GetProperty(nsGkAtoms::DisplayPortBase))) {
+    base = *baseData;
+  } else {
+  }
+
+  nsIFrame* frame = nsLayoutUtils::GetScrollContainerFrameFromContent(aContent);
+  if (!frame) {
+    NS_WARNING(
+        "Attempting to get a displayport from a content with no primary "
+        "frame!");
+    return base;
+  }
+
+  bool isRoot = false;
+  if (aContent->OwnerDoc()->GetRootElement() == aContent) {
+    isRoot = true;
+  }
+
+  ScrollContainerFrame* scrollContainerFrame = frame->GetScrollTargetFrame();
+  nsPoint scrollPos;
+  if (scrollContainerFrame) {
+    scrollPos = scrollContainerFrame->GetScrollPosition();
+  }
+
+  nsPresContext* presContext = frame->PresContext();
+  int32_t auPerDevPixel = presContext->AppUnitsPerDevPixel();
+
+  LayoutDeviceToScreenScale2D res =
+      LayoutDeviceToParentLayerScale(
+          presContext->PresShell()->GetCumulativeResolution()) *
+      nsLayoutUtils::GetTransformToAncestorScaleCrossProcessForFrameMetrics(
+          frame);
+
+  nsRect expandedScrollableRect =
+      nsLayoutUtils::CalculateExpandedScrollableRect(frame);
+
+  if (res == LayoutDeviceToScreenScale2D(0, 0)) {
+    return base.MoveInsideAndClamp(expandedScrollableRect - scrollPos);
+  }
+
+  LayoutDeviceToScreenScale2D parentRes = res;
+  if (isRoot) {
+    float localRes = presContext->PresShell()->GetResolution();
+    parentRes.xScale /= localRes;
+    parentRes.yScale /= localRes;
+  }
+  ScreenRect screenRect =
+      LayoutDeviceRect::FromAppUnits(base, auPerDevPixel) * parentRes;
+
+  ScreenSize alignment;
+
+  PresShell* presShell = presContext->PresShell();
+  MOZ_ASSERT(presShell);
+
+  ScreenMargin margins = aMarginsData->mMargins.GetRelativeToLayoutViewport(
+      aOptions.mGeometryType, scrollContainerFrame,
+      presContext->CSSToDevPixelScale() * res);
+
+  if (presShell->IsDisplayportSuppressed() ||
+      aContent->GetProperty(nsGkAtoms::MinimalDisplayPort)) {
+    alignment = ScreenSize(1, 1);
+  } else {
+    gfx::Size multiplier =
+        layers::apz::GetDisplayportAlignmentMultiplier(screenRect.Size());
+    alignment = ScreenSize(128 * multiplier.width, 128 * multiplier.height);
+  }
+
+  if (alignment.width == 0) {
+    alignment.width = 128;
+  }
+  if (alignment.height == 0) {
+    alignment.height = 128;
+  }
+
+  screenRect.Inflate(margins);
+
+  ScreenPoint scrollPosScreen =
+      LayoutDevicePoint::FromAppUnits(scrollPos, auPerDevPixel) * res;
+
+  screenRect += scrollPosScreen;
+  float x = alignment.width * floor(screenRect.x / alignment.width);
+  float y = alignment.height * floor(screenRect.y / alignment.height);
+  float w = alignment.width * ceil(screenRect.width / alignment.width + 1);
+  float h = alignment.height * ceil(screenRect.height / alignment.height + 1);
+  screenRect = ScreenRect(x, y, w, h);
+  screenRect -= scrollPosScreen;
+
+  nsRect result = LayoutDeviceRect::ToAppUnits(screenRect / res, auPerDevPixel);
+
+  result = result.MoveInsideAndClamp(expandedScrollableRect - scrollPos);
+
+  return result;
+}
+
+static bool GetDisplayPortData(
+    nsIContent* aContent, DisplayPortPropertyData** aOutRectData,
+    DisplayPortMarginsPropertyData** aOutMarginsData) {
+  MOZ_ASSERT(aOutRectData && aOutMarginsData);
+
+  *aOutRectData = static_cast<DisplayPortPropertyData*>(
+      aContent->GetProperty(nsGkAtoms::DisplayPort));
+  *aOutMarginsData = static_cast<DisplayPortMarginsPropertyData*>(
+      aContent->GetProperty(nsGkAtoms::DisplayPortMargins));
+
+  if (!*aOutRectData && !*aOutMarginsData) {
+    return false;
+  }
+
+  if (*aOutRectData && *aOutMarginsData) {
+    if ((*aOutRectData)->mPriority > (*aOutMarginsData)->mPriority) {
+      *aOutMarginsData = nullptr;
+    } else {
+      *aOutRectData = nullptr;
+    }
+  }
+
+  NS_ASSERTION((*aOutRectData == nullptr) != (*aOutMarginsData == nullptr),
+               "Only one of aOutRectData or aOutMarginsData should be set!");
+
+  return true;
+}
+
+static bool GetWasDisplayPortPainted(nsIContent* aContent) {
+  DisplayPortPropertyData* rectData = nullptr;
+  DisplayPortMarginsPropertyData* marginsData = nullptr;
+
+  if (!GetDisplayPortData(aContent, &rectData, &marginsData)) {
+    return false;
+  }
+
+  return rectData ? rectData->mPainted : marginsData->mPainted;
+}
+
+bool DisplayPortUtils::IsMissingDisplayPortBaseRect(nsIContent* aContent) {
+  DisplayPortPropertyData* rectData = nullptr;
+  DisplayPortMarginsPropertyData* marginsData = nullptr;
+
+  if (GetDisplayPortData(aContent, &rectData, &marginsData) && marginsData) {
+    return !aContent->GetProperty(nsGkAtoms::DisplayPortBase);
+  }
+
+  return false;
+}
+
+static void TranslateFromScrollPortToScrollContainerFrame(nsIContent* aContent,
+                                                          nsRect* aRect) {
+  MOZ_ASSERT(aRect);
+  if (ScrollContainerFrame* scrollContainerFrame =
+          nsLayoutUtils::FindScrollContainerFrameFor(aContent)) {
+    *aRect += scrollContainerFrame->GetScrollPortRect().TopLeft();
+  }
+}
+
+static bool GetDisplayPortImpl(nsIContent* aContent, nsRect* aResult,
+                               const DisplayPortOptions& aOptions) {
+  DisplayPortPropertyData* rectData = nullptr;
+  DisplayPortMarginsPropertyData* marginsData = nullptr;
+
+  if (!GetDisplayPortData(aContent, &rectData, &marginsData)) {
+    return false;
+  }
+
+  nsIFrame* frame = aContent->GetPrimaryFrame();
+  if (frame && !frame->PresShell()->AsyncPanZoomEnabled()) {
+    return false;
+  }
+
+  if (!aResult) {
+    return true;
+  }
+
+  bool isDisplayportSuppressed = false;
+
+  if (frame) {
+    nsPresContext* presContext = frame->PresContext();
+    MOZ_ASSERT(presContext);
+    PresShell* presShell = presContext->PresShell();
+    MOZ_ASSERT(presShell);
+    isDisplayportSuppressed = presShell->IsDisplayportSuppressed();
+  }
+
+  nsRect result;
+  if (rectData) {
+    result = GetDisplayPortFromRectData(aContent, rectData);
+  } else if (isDisplayportSuppressed ||
+             nsLayoutUtils::ShouldDisableApzForElement(aContent) ||
+             aContent->GetProperty(nsGkAtoms::MinimalDisplayPort)) {
+
+    DisplayPortMarginsPropertyData noMargins = *marginsData;
+    noMargins.mMargins.mMargins = ScreenMargin();
+    result = GetDisplayPortFromMarginsData(aContent, &noMargins, aOptions);
+  } else {
+    result = GetDisplayPortFromMarginsData(aContent, marginsData, aOptions);
+  }
+
+  if (aOptions.mRelativeTo == DisplayportRelativeTo::ScrollFrame) {
+    TranslateFromScrollPortToScrollContainerFrame(aContent, &result);
+  }
+
+  *aResult = result;
+  return true;
+}
+
+bool DisplayPortUtils::GetDisplayPort(nsIContent* aContent, nsRect* aResult,
+                                      const DisplayPortOptions& aOptions) {
+  return GetDisplayPortImpl(aContent, aResult, aOptions);
+}
+
+bool DisplayPortUtils::HasDisplayPort(nsIContent* aContent) {
+  return GetDisplayPort(aContent, nullptr);
+}
+
+bool DisplayPortUtils::HasPaintedDisplayPort(nsIContent* aContent) {
+  DisplayPortPropertyData* rectData = nullptr;
+  DisplayPortMarginsPropertyData* marginsData = nullptr;
+  GetDisplayPortData(aContent, &rectData, &marginsData);
+  if (rectData) {
+    return rectData->mPainted;
+  }
+  if (marginsData) {
+    return marginsData->mPainted;
+  }
+  return false;
+}
+
+void DisplayPortUtils::MarkDisplayPortAsPainted(nsIContent* aContent) {
+  DisplayPortPropertyData* rectData = nullptr;
+  DisplayPortMarginsPropertyData* marginsData = nullptr;
+  GetDisplayPortData(aContent, &rectData, &marginsData);
+  MOZ_ASSERT(rectData || marginsData,
+             "MarkDisplayPortAsPainted should only be called for an element "
+             "with a displayport");
+  if (rectData) {
+    rectData->mPainted = true;
+  }
+  if (marginsData) {
+    marginsData->mPainted = true;
+  }
+}
+
+bool DisplayPortUtils::HasNonMinimalDisplayPort(nsIContent* aContent) {
+  return !aContent->GetProperty(nsGkAtoms::MinimalDisplayPort) &&
+         HasDisplayPort(aContent);
+}
+
+bool DisplayPortUtils::HasNonMinimalNonZeroDisplayPort(nsIContent* aContent) {
+  if (aContent->GetProperty(nsGkAtoms::MinimalDisplayPort)) {
+    return false;
+  }
+
+  DisplayPortPropertyData* rectData = nullptr;
+  DisplayPortMarginsPropertyData* marginsData = nullptr;
+  if (!GetDisplayPortData(aContent, &rectData, &marginsData)) {
+    return false;
+  }
+
+  if (!marginsData) {
+    return true;
+  }
+
+  if (marginsData->mMargins.mMargins != ScreenMargin()) {
+    return true;
+  }
+
+  return false;
+}
+
+bool DisplayPortUtils::GetDisplayPortForVisibilityTesting(nsIContent* aContent,
+                                                          nsRect* aResult) {
+  MOZ_ASSERT(aResult);
+  return GetDisplayPortImpl(
+      aContent, aResult,
+      DisplayPortOptions().With(DisplayportRelativeTo::ScrollFrame));
+}
+
+void DisplayPortUtils::InvalidateForDisplayPortChange(
+    nsIContent* aContent, bool aHadDisplayPort, const nsRect& aOldDisplayPort,
+    const nsRect& aNewDisplayPort, RepaintMode aRepaintMode) {
+  if (aRepaintMode != RepaintMode::Repaint) {
+    return;
+  }
+
+  bool changed =
+      !aHadDisplayPort || !aOldDisplayPort.IsEqualEdges(aNewDisplayPort);
+
+  nsIFrame* frame = nsLayoutUtils::FindScrollContainerFrameFor(aContent);
+  if (changed && frame) {
+    frame->SchedulePaint();
+
+    if (!nsLayoutUtils::AreRetainedDisplayListsEnabled()) {
+      return;
+    }
+
+    if (StaticPrefs::layout_display_list_retain_sc()) {
+      return;
+    }
+
+    auto* builder = nsLayoutUtils::GetRetainedDisplayListBuilder(frame);
+    if (!builder) {
+      return;
+    }
+
+    bool found;
+    nsRect* rect = frame->GetProperty(
+        nsDisplayListBuilder::DisplayListBuildingDisplayPortRect(), &found);
+
+    if (!found) {
+      rect = new nsRect();
+      frame->AddProperty(
+          nsDisplayListBuilder::DisplayListBuildingDisplayPortRect(), rect);
+      frame->SetHasOverrideDirtyRegion(true);
+
+      DL_LOGV("Adding display port building rect for frame %p\n", frame);
+      RetainedDisplayListData* data = builder->Data();
+      data->Flags(frame) += RetainedDisplayListData::FrameFlag::HasProps;
+    } else {
+      MOZ_ASSERT(rect, "this property should only store non-null values");
+    }
+
+    if (aHadDisplayPort) {
+      nsRegion newRegion(aNewDisplayPort);
+      newRegion.SubOut(aOldDisplayPort);
+      rect->UnionRect(*rect, newRegion.GetBounds());
+    } else {
+      rect->UnionRect(*rect, aNewDisplayPort);
+    }
+  }
+}
+
+bool DisplayPortUtils::SetDisplayPortMargins(
+    nsIContent* aContent, PresShell* aPresShell,
+    const DisplayPortMargins& aMargins,
+    ClearMinimalDisplayPortProperty aClearMinimalDisplayPortProperty,
+    uint32_t aPriority, RepaintMode aRepaintMode) {
+  MOZ_ASSERT(aContent);
+  MOZ_ASSERT(aContent->GetComposedDoc() == aPresShell->GetDocument());
+
+  DisplayPortMarginsPropertyData* currentData =
+      static_cast<DisplayPortMarginsPropertyData*>(
+          aContent->GetProperty(nsGkAtoms::DisplayPortMargins));
+  if (currentData && currentData->mPriority > aPriority) {
+    return false;
+  }
+
+  if (currentData && currentData->mMargins.mVisualOffset != CSSPoint() &&
+      aMargins.mVisualOffset == CSSPoint()) {
+    MOZ_LOG(sDisplayportLog, LogLevel::Warning,
+            ("Dropping visual offset %s",
+             ToString(currentData->mMargins.mVisualOffset).c_str()));
+  }
+
+  nsIFrame* scrollFrame =
+      nsLayoutUtils::GetScrollContainerFrameFromContent(aContent);
+
+  nsRect oldDisplayPort;
+  bool hadDisplayPort = false;
+  bool wasPainted = GetWasDisplayPortPainted(aContent);
+  if (scrollFrame) {
+    hadDisplayPort = GetDisplayPort(aContent, &oldDisplayPort);
+  }
+
+  aContent->SetProperty(
+      nsGkAtoms::DisplayPortMargins,
+      new DisplayPortMarginsPropertyData(aMargins, aPriority, wasPainted),
+      nsINode::DeleteProperty<DisplayPortMarginsPropertyData>);
+
+  if (aClearMinimalDisplayPortProperty ==
+      ClearMinimalDisplayPortProperty::Yes) {
+    if (MOZ_LOG_TEST(sDisplayportLog, LogLevel::Debug) &&
+        aContent->GetProperty(nsGkAtoms::MinimalDisplayPort)) {
+      mozilla::layers::ScrollableLayerGuid::ViewID viewID =
+          mozilla::layers::ScrollableLayerGuid::NULL_SCROLL_ID;
+      nsLayoutUtils::FindIDFor(aContent, &viewID);
+      MOZ_LOG(sDisplayportLog, LogLevel::Debug,
+              ("SetDisplayPortMargins removing MinimalDisplayPort prop on "
+               "scrollId=%" PRIu64 "\n",
+               viewID));
+    }
+    aContent->RemoveProperty(nsGkAtoms::MinimalDisplayPort);
+  }
+
+  ScrollContainerFrame* scrollContainerFrame =
+      scrollFrame ? scrollFrame->GetScrollTargetFrame() : nullptr;
+  if (!scrollContainerFrame) {
+    return true;
+  }
+
+  nsRect newDisplayPort;
+  DebugOnly<bool> hasDisplayPort = GetDisplayPort(aContent, &newDisplayPort);
+  MOZ_ASSERT(hasDisplayPort);
+
+  if (MOZ_LOG_TEST(sDisplayportLog, LogLevel::Debug)) {
+    mozilla::layers::ScrollableLayerGuid::ViewID viewID =
+        mozilla::layers::ScrollableLayerGuid::NULL_SCROLL_ID;
+    nsLayoutUtils::FindIDFor(aContent, &viewID);
+    if (!hadDisplayPort) {
+      MOZ_LOG(sDisplayportLog, LogLevel::Debug,
+              ("SetDisplayPortMargins %s on scrollId=%" PRIu64 ", newDp=%s\n",
+               ToString(aMargins).c_str(), viewID,
+               ToString(newDisplayPort).c_str()));
+    } else {
+      MOZ_LOG(sDisplayportLog, LogLevel::Verbose,
+              ("SetDisplayPortMargins %s on scrollId=%" PRIu64 ", newDp=%s\n",
+               ToString(aMargins).c_str(), viewID,
+               ToString(newDisplayPort).c_str()));
+    }
+  }
+
+  InvalidateForDisplayPortChange(aContent, hadDisplayPort, oldDisplayPort,
+                                 newDisplayPort, aRepaintMode);
+
+  scrollContainerFrame->TriggerDisplayPortExpiration();
+
+  hadDisplayPort = scrollContainerFrame
+                       ->GetDisplayPortAtLastApproximateFrameVisibilityUpdate(
+                           &oldDisplayPort);
+
+  bool needVisibilityUpdate = !hadDisplayPort;
+  if (!needVisibilityUpdate) {
+    if ((newDisplayPort.width > 2 * oldDisplayPort.width) ||
+        (oldDisplayPort.width > 2 * newDisplayPort.width) ||
+        (newDisplayPort.height > 2 * oldDisplayPort.height) ||
+        (oldDisplayPort.height > 2 * newDisplayPort.height)) {
+      needVisibilityUpdate = true;
+    }
+  }
+  if (!needVisibilityUpdate) {
+    if (nsRect* baseData = static_cast<nsRect*>(
+            aContent->GetProperty(nsGkAtoms::DisplayPortBase))) {
+      nsRect base = *baseData;
+      if ((std::abs(newDisplayPort.X() - oldDisplayPort.X()) > base.width) ||
+          (std::abs(newDisplayPort.XMost() - oldDisplayPort.XMost()) >
+           base.width) ||
+          (std::abs(newDisplayPort.Y() - oldDisplayPort.Y()) > base.height) ||
+          (std::abs(newDisplayPort.YMost() - oldDisplayPort.YMost()) >
+           base.height)) {
+        needVisibilityUpdate = true;
+      }
+    }
+  }
+  if (needVisibilityUpdate) {
+    aPresShell->ScheduleApproximateFrameVisibilityUpdateNow();
+  }
+
+  return true;
+}
+
+void DisplayPortUtils::SetDisplayPortBase(nsIContent* aContent,
+                                          const nsRect& aBase) {
+  if (MOZ_LOG_TEST(sDisplayportLog, LogLevel::Verbose)) {
+    ViewID viewId = nsLayoutUtils::FindOrCreateIDFor(aContent);
+    MOZ_LOG(sDisplayportLog, LogLevel::Verbose,
+            ("Setting base rect %s for scrollId=%" PRIu64 "\n",
+             ToString(aBase).c_str(), viewId));
+  }
+  if (nsRect* baseData = static_cast<nsRect*>(
+          aContent->GetProperty(nsGkAtoms::DisplayPortBase))) {
+    *baseData = aBase;
+    return;
+  }
+
+  aContent->SetProperty(nsGkAtoms::DisplayPortBase, new nsRect(aBase),
+                        nsINode::DeleteProperty<nsRect>);
+}
+
+void DisplayPortUtils::SetDisplayPortBaseIfNotSet(nsIContent* aContent,
+                                                  const nsRect& aBase) {
+  if (aContent->GetProperty(nsGkAtoms::DisplayPortBase)) {
+    return;
+  }
+  if (MOZ_LOG_TEST(sDisplayportLog, LogLevel::Verbose)) {
+    ViewID viewId = nsLayoutUtils::FindOrCreateIDFor(aContent);
+    MOZ_LOG(sDisplayportLog, LogLevel::Verbose,
+            ("Setting base rect %s for scrollId=%" PRIu64 "\n",
+             ToString(aBase).c_str(), viewId));
+  }
+
+  aContent->SetProperty(nsGkAtoms::DisplayPortBase, new nsRect(aBase),
+                        nsINode::DeleteProperty<nsRect>);
+}
+
+void DisplayPortUtils::RemoveDisplayPort(nsIContent* aContent) {
+  aContent->RemoveProperty(nsGkAtoms::DisplayPort);
+  aContent->RemoveProperty(nsGkAtoms::DisplayPortMargins);
+}
+
+void DisplayPortUtils::SetMinimalDisplayPortDuringPainting(
+    nsIContent* aContent, PresShell* aPresShell) {
+  aContent->SetProperty(nsGkAtoms::MinimalDisplayPort,
+                        reinterpret_cast<void*>(true));
+
+  DisplayPortUtils::SetDisplayPortMargins(
+      aContent, aPresShell, DisplayPortMargins::Empty(aContent),
+      DisplayPortUtils::ClearMinimalDisplayPortProperty::No, 0,
+      DisplayPortUtils::RepaintMode::DoNotRepaint);
+}
+
+bool DisplayPortUtils::ViewportHasDisplayPort(nsPresContext* aPresContext) {
+  nsIFrame* rootScrollContainerFrame =
+      aPresContext->PresShell()->GetRootScrollContainerFrame();
+  return rootScrollContainerFrame &&
+         HasDisplayPort(rootScrollContainerFrame->GetContent());
+}
+
+bool DisplayPortUtils::IsFixedPosFrameInDisplayPort(const nsIFrame* aFrame) {
+  nsIFrame* parent = aFrame->GetParent();
+  if (!parent || parent->GetParent() ||
+      aFrame->StyleDisplay()->mPosition != StylePositionProperty::Fixed) {
+    return false;
+  }
+  return ViewportHasDisplayPort(aFrame->PresContext());
+}
+
+bool DisplayPortUtils::FrameHasDisplayPort(nsIFrame* aFrame,
+                                           const nsIFrame* aScrolledFrame) {
+  if (!aFrame->GetContent() || !HasDisplayPort(aFrame->GetContent())) {
+    return false;
+  }
+  ScrollContainerFrame* sf = do_QueryFrame(aFrame);
+  if (sf) {
+    if (aScrolledFrame && aScrolledFrame != sf->GetScrolledFrame()) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+bool DisplayPortUtils::CalculateAndSetDisplayPortMargins(
+    ScrollContainerFrame* aScrollContainerFrame, RepaintMode aRepaintMode) {
+  nsIContent* content = aScrollContainerFrame->GetContent();
+  MOZ_ASSERT(content);
+
+  FrameMetrics metrics =
+      nsLayoutUtils::CalculateBasicFrameMetrics(aScrollContainerFrame);
+  ScreenMargin displayportMargins = layers::apz::CalculatePendingDisplayPort(
+      metrics, ParentLayerPoint(0.0f, 0.0f));
+  PresShell* presShell = aScrollContainerFrame->PresShell();
+
+  DisplayPortMargins margins = DisplayPortMargins::ForScrollContainerFrame(
+      aScrollContainerFrame, displayportMargins);
+
+  return SetDisplayPortMargins(content, presShell, margins,
+                               ClearMinimalDisplayPortProperty::Yes, 0,
+                               aRepaintMode);
+}
+
+bool DisplayPortUtils::MaybeCreateDisplayPort(
+    nsDisplayListBuilder* aBuilder, ScrollContainerFrame* aScrollContainerFrame,
+    RepaintMode aRepaintMode) {
+  MOZ_ASSERT(aBuilder->IsPaintingToWindow());
+
+  nsIContent* content = aScrollContainerFrame->GetContent();
+  if (!content) {
+    return false;
+  }
+
+  MOZ_ASSERT(nsLayoutUtils::AsyncPanZoomEnabled(aScrollContainerFrame));
+  if (!aBuilder->HaveScrollableDisplayPort() &&
+      aScrollContainerFrame->WantAsyncScroll(NonZeroScrollRangeOnly::Yes)) {
+    bool haveDisplayPort = HasNonMinimalNonZeroDisplayPort(content);
+    if (!haveDisplayPort) {
+      ViewID viewId = nsLayoutUtils::FindOrCreateIDFor(content);
+      MOZ_LOG(
+          sDisplayportLog, LogLevel::Debug,
+          ("Setting DP on first-encountered scrollId=%" PRIu64 "\n", viewId));
+
+      CalculateAndSetDisplayPortMargins(aScrollContainerFrame, aRepaintMode);
+      SetZeroMarginDisplayPortOnAsyncScrollableAncestors(aScrollContainerFrame);
+#ifdef DEBUG
+      haveDisplayPort = HasNonMinimalDisplayPort(content);
+      MOZ_ASSERT(haveDisplayPort,
+                 "should have a displayport after having just set it");
+#endif
+    }
+
+    aBuilder->SetHaveScrollableDisplayPort();
+    return true;
+  }
+  return false;
+}
+
+void DisplayPortUtils::SetZeroMarginDisplayPortOnAsyncScrollableAncestors(
+    nsIFrame* aFrame) {
+  nsIFrame* frame = aFrame;
+  while (frame) {
+    frame = OneStepInAsyncScrollableAncestorChain(frame);
+    if (!frame) {
+      break;
+    }
+    ScrollContainerFrame* scrollAncestor =
+        nsLayoutUtils::GetAsyncScrollableAncestorFrame(frame);
+    if (!scrollAncestor) {
+      break;
+    }
+    frame = scrollAncestor;
+    MOZ_ASSERT(scrollAncestor->WantAsyncScroll() ||
+               frame->PresShell()->GetRootScrollContainerFrame() == frame);
+    if (nsLayoutUtils::AsyncPanZoomEnabled(frame) &&
+        !HasDisplayPort(frame->GetContent())) {
+      SetDisplayPortMargins(frame->GetContent(), frame->PresShell(),
+                            DisplayPortMargins::Empty(frame->GetContent()),
+                            ClearMinimalDisplayPortProperty::No, 0,
+                            RepaintMode::Repaint);
+    }
+  }
+}
+
+bool DisplayPortUtils::MaybeCreateDisplayPortInFirstScrollFrameEncountered(
+    nsIFrame* aFrame, nsDisplayListBuilder* aBuilder) {
+  if (XRE_IsParentProcess() && aFrame->GetContent() &&
+      aFrame->GetContent()->GetID() == nsGkAtoms::tabbrowser_arrowscrollbox) {
+    return false;
+  }
+  if (aFrame->IsScrollContainerOrSubclass()) {
+    auto* sf = static_cast<ScrollContainerFrame*>(aFrame);
+    if (MaybeCreateDisplayPort(aBuilder, sf, RepaintMode::Repaint)) {
+      sf->SetIsFirstScrollableFrameSequenceNumber(
+          Some(nsDisplayListBuilder::GetPaintSequenceNumber()));
+      return true;
+    }
+  } else if (aFrame->IsPlaceholderFrame()) {
+    nsPlaceholderFrame* placeholder = static_cast<nsPlaceholderFrame*>(aFrame);
+    nsIFrame* oof = placeholder->GetOutOfFlowFrame();
+    if (oof && !nsLayoutUtils::IsPopup(oof) &&
+        MaybeCreateDisplayPortInFirstScrollFrameEncountered(oof, aBuilder)) {
+      return true;
+    }
+  } else if (aFrame->IsSubDocumentFrame()) {
+    PresShell* presShell = static_cast<nsSubDocumentFrame*>(aFrame)
+                               ->GetSubdocumentPresShellForPainting(0);
+    if (nsIFrame* root = presShell ? presShell->GetRootFrame() : nullptr) {
+      if (MaybeCreateDisplayPortInFirstScrollFrameEncountered(root, aBuilder)) {
+        return true;
+      }
+    }
+  }
+  if (XRE_IsParentProcess() &&
+      aFrame->StyleUIReset()->mMozSubtreeHiddenOnlyVisually) {
+    return false;
+  }
+  for (nsIFrame* child : aFrame->PrincipalChildList()) {
+    if (MaybeCreateDisplayPortInFirstScrollFrameEncountered(child, aBuilder)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void DisplayPortUtils::ExpireDisplayPortOnAsyncScrollableAncestor(
+    nsIFrame* aFrame) {
+  nsIFrame* frame = aFrame;
+  while (frame) {
+    frame = OneStepInAsyncScrollableAncestorChain(frame);
+    if (!frame) {
+      break;
+    }
+    ScrollContainerFrame* scrollAncestor =
+        nsLayoutUtils::GetAsyncScrollableAncestorFrame(frame);
+    if (!scrollAncestor) {
+      break;
+    }
+    frame = scrollAncestor;
+    MOZ_ASSERT(frame);
+    if (!frame) {
+      break;
+    }
+    MOZ_ASSERT(scrollAncestor->WantAsyncScroll() ||
+               frame->PresShell()->GetRootScrollContainerFrame() == frame);
+    if (HasDisplayPort(frame->GetContent())) {
+      scrollAncestor->TriggerDisplayPortExpiration();
+      break;
+    }
+  }
+}
+
+Maybe<nsRect> DisplayPortUtils::GetRootDisplayportBase(PresShell* aPresShell) {
+  DebugOnly<nsPresContext*> pc = aPresShell->GetPresContext();
+  MOZ_ASSERT(pc, "this function should be called after PresShell::Init");
+  MOZ_ASSERT(pc->IsRootContentDocumentCrossProcess() ||
+             !pc->GetParentPresContext());
+
+  dom::BrowserChild* browserChild = dom::BrowserChild::GetFrom(aPresShell);
+  if (browserChild && !browserChild->IsTopLevel()) {
+    return browserChild->GetVisibleRect();
+  }
+
+  nsIFrame* frame = aPresShell->GetRootScrollContainerFrame();
+  if (!frame) {
+    frame = aPresShell->GetRootFrame();
+  }
+
+  nsRect baseRect;
+  if (frame) {
+    baseRect = GetDisplayportBase(frame);
+  } else {
+    baseRect = nsRect(nsPoint(0, 0),
+                      aPresShell->GetPresContext()->GetVisibleArea().Size());
+  }
+
+  return Some(baseRect);
+}
+
+nsRect DisplayPortUtils::GetDisplayportBase(nsIFrame* aFrame) {
+  MOZ_ASSERT(aFrame);
+
+  return nsRect(nsPoint(),
+                nsLayoutUtils::CalculateCompositionSizeForFrame(aFrame));
+}
+
+bool DisplayPortUtils::WillUseEmptyDisplayPortMargins(nsIContent* aContent) {
+  MOZ_ASSERT(HasDisplayPort(aContent));
+  nsIFrame* frame = aContent->GetPrimaryFrame();
+  if (!frame) {
+    return false;
+  }
+
+  return aContent->GetProperty(nsGkAtoms::MinimalDisplayPort) ||
+         frame->PresShell()->IsDisplayportSuppressed() ||
+         nsLayoutUtils::ShouldDisableApzForElement(aContent);
+}
+
+nsIFrame* DisplayPortUtils::OneStepInAsyncScrollableAncestorChain(
+    nsIFrame* aFrame) {
+  if (aFrame->IsMenuPopupFrame()) {
+    return nullptr;
+  }
+  nsIFrame* anchor = nullptr;
+  while ((anchor = AnchorPositioningUtils::GetAnchorThatFrameScrollsWith(
+              aFrame,  nullptr))) {
+    aFrame = anchor;
+  }
+  if (aFrame->StyleDisplay()->mPosition == StylePositionProperty::Fixed &&
+      nsLayoutUtils::IsReallyFixedPos(aFrame)) {
+    if (nsIFrame* root = aFrame->PresShell()->GetRootScrollContainerFrame()) {
+      return root;
+    }
+  }
+  return nsLayoutUtils::GetCrossDocParentFrameInProcess(aFrame);
+}
+
+FrameAndASRKind DisplayPortUtils::GetASRAncestorFrame(
+    FrameAndASRKind aFrameAndASRKind, nsDisplayListBuilder* aBuilder) {
+  MOZ_ASSERT(aBuilder->IsPaintingToWindow());
+
+  for (nsIFrame* f = aFrameAndASRKind.mFrame; f;
+       f = nsLayoutUtils::GetCrossDocParentFrameInProcess(f)) {
+    if (f->IsMenuPopupFrame()) {
+      break;
+    }
+
+    if (f != aFrameAndASRKind.mFrame ||
+        aFrameAndASRKind.mASRKind == ActiveScrolledRoot::ASRKind::Scroll) {
+      if (ScrollContainerFrame* scrollContainerFrame = do_QueryFrame(f)) {
+        if (scrollContainerFrame->IsMaybeAsynchronouslyScrolled()) {
+          return {f, ActiveScrolledRoot::ASRKind::Scroll};
+        }
+      }
+    }
+
+    nsIFrame* anchor = nullptr;
+    while ((anchor = AnchorPositioningUtils::GetAnchorThatFrameScrollsWith(
+                f, aBuilder))) {
+      f = anchor;
+    }
+
+    if (f->StyleDisplay()->mPosition == StylePositionProperty::Sticky) {
+      auto* ssc = StickyScrollContainer::GetOrCreateForFrame(f);
+      if (ssc && ssc->ScrollContainer()->IsMaybeAsynchronouslyScrolled()) {
+        return {f->FirstContinuation(), ActiveScrolledRoot::ASRKind::Sticky};
+      }
+    }
+  }
+  return FrameAndASRKind::default_value();
+}
+
+FrameAndASRKind DisplayPortUtils::OneStepInASRChain(
+    FrameAndASRKind aFrameAndASRKind, nsDisplayListBuilder* aBuilder,
+    nsIFrame* aLimitAncestor ) {
+  MOZ_ASSERT(aBuilder->IsPaintingToWindow());
+  if (aFrameAndASRKind.mFrame->IsMenuPopupFrame()) {
+    return FrameAndASRKind::default_value();
+  }
+  if (aFrameAndASRKind.mASRKind == ActiveScrolledRoot::ASRKind::Scroll) {
+    nsIFrame* frame = aFrameAndASRKind.mFrame;
+    nsIFrame* anchor = nullptr;
+    while ((anchor = AnchorPositioningUtils::GetAnchorThatFrameScrollsWith(
+                frame, aBuilder))) {
+      MOZ_ASSERT_IF(
+          aLimitAncestor,
+          nsLayoutUtils::IsProperAncestorFrameConsideringContinuations(
+              aLimitAncestor, anchor));
+      frame = anchor;
+    }
+    return {frame, ActiveScrolledRoot::ASRKind::Sticky};
+  }
+  nsIFrame* parent =
+      nsLayoutUtils::GetCrossDocParentFrameInProcess(aFrameAndASRKind.mFrame);
+  if (aLimitAncestor && parent &&
+      (parent == aLimitAncestor ||
+       parent->FirstContinuation() == aLimitAncestor->FirstContinuation())) {
+    return FrameAndASRKind::default_value();
+  }
+  return {parent, ActiveScrolledRoot::ASRKind::Scroll};
+}
+
+static bool ActivatePotentialScrollASR(nsIFrame* aFrame,
+                                       nsDisplayListBuilder* aBuilder) {
+  ScrollContainerFrame* scrollContainerFrame = do_QueryFrame(aFrame);
+  if (!scrollContainerFrame) {
+    return false;
+  }
+  return scrollContainerFrame->DecideScrollableLayerEnsureDisplayport(aBuilder);
+}
+
+static bool ActivatePotentialStickyASR(nsIFrame* aFrame,
+                                       nsDisplayListBuilder* aBuilder) {
+  if (aFrame->StyleDisplay()->mPosition != StylePositionProperty::Sticky) {
+    return false;
+  }
+  auto* ssc = StickyScrollContainer::GetOrCreateForFrame(aFrame);
+  if (!ssc) {
+    return false;
+  }
+  return ssc->ScrollContainer()->DecideScrollableLayerEnsureDisplayport(
+      aBuilder);
+}
+
+const ActiveScrolledRoot* DisplayPortUtils::ActivateDisplayportOnASRAncestors(
+    nsIFrame* aAnchor, nsIFrame* aLimitAncestor,
+    const ActiveScrolledRoot* aASRofLimitAncestor,
+    nsDisplayListBuilder* aBuilder) {
+  MOZ_ASSERT(ScrollContainerFrame::ShouldActivateAllScrollFrames(
+      aBuilder, aLimitAncestor));
+
+  MOZ_ASSERT(
+      (aASRofLimitAncestor ? FrameAndASRKind{aASRofLimitAncestor->mFrame,
+                                             aASRofLimitAncestor->mKind}
+                           : FrameAndASRKind::default_value()) ==
+      GetASRAncestorFrame({aLimitAncestor, ActiveScrolledRoot::ASRKind::Scroll},
+                          aBuilder));
+
+  MOZ_ASSERT(nsLayoutUtils::IsProperAncestorFrameConsideringContinuations(
+      aLimitAncestor, aAnchor));
+
+  AutoTArray<FrameAndASRKind, 4> ASRframes;
+
+  FrameAndASRKind frameAndASRKind{aAnchor, ActiveScrolledRoot::ASRKind::Scroll};
+  frameAndASRKind =
+      OneStepInASRChain(frameAndASRKind, aBuilder, aLimitAncestor);
+  while (frameAndASRKind.mFrame && frameAndASRKind.mFrame != aLimitAncestor &&
+         (!aLimitAncestor || frameAndASRKind.mFrame->FirstContinuation() !=
+                                 aLimitAncestor->FirstContinuation())) {
+
+
+
+    switch (frameAndASRKind.mASRKind) {
+      case ActiveScrolledRoot::ASRKind::Scroll:
+        if (ActivatePotentialScrollASR(frameAndASRKind.mFrame, aBuilder)) {
+          ASRframes.EmplaceBack(frameAndASRKind);
+        }
+        break;
+
+      case ActiveScrolledRoot::ASRKind::Sticky:
+        if (ActivatePotentialStickyASR(frameAndASRKind.mFrame, aBuilder)) {
+          ASRframes.EmplaceBack(frameAndASRKind);
+        }
+        break;
+    }
+
+    frameAndASRKind =
+        OneStepInASRChain(frameAndASRKind, aBuilder, aLimitAncestor);
+  }
+
+  const ActiveScrolledRoot* asr = aASRofLimitAncestor;
+
+  for (auto asrFrame : Reversed(ASRframes)) {
+    MOZ_ASSERT(nsLayoutUtils::IsProperAncestorFrameConsideringContinuations(
+        aLimitAncestor, asrFrame.mFrame));
+
+    MOZ_ASSERT(
+        (asr ? FrameAndASRKind{asr->mFrame, asr->mKind}
+             : FrameAndASRKind::default_value()) ==
+        GetASRAncestorFrame(OneStepInASRChain(asrFrame, aBuilder), aBuilder));
+
+    asr = (asrFrame.mASRKind == ActiveScrolledRoot::ASRKind::Scroll)
+              ? aBuilder->GetOrCreateActiveScrolledRoot(
+                    asr, static_cast<ScrollContainerFrame*>(
+                             do_QueryFrame(asrFrame.mFrame)))
+              : aBuilder->GetOrCreateActiveScrolledRootForSticky(
+                    asr, asrFrame.mFrame);
+  }
+  return asr;
+}
+
+static bool CheckAxes(ScrollContainerFrame* aScrollFrame, PhysicalAxes aAxes) {
+  if (aAxes == kPhysicalAxesBoth) {
+    return true;
+  }
+  nsRect range = aScrollFrame->GetScrollRangeForUserInputEvents();
+  if (aAxes.contains(PhysicalAxis::Vertical)) {
+    MOZ_ASSERT(!aAxes.contains(PhysicalAxis::Horizontal));
+    if (range.width > 0) {
+      return false;
+    }
+  }
+  if (aAxes.contains(PhysicalAxis::Horizontal)) {
+    MOZ_ASSERT(!aAxes.contains(PhysicalAxis::Vertical));
+    if (range.height > 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool CheckForScrollFrameAndAxes(nsIFrame* aFrame, PhysicalAxes aAxes,
+                                       bool* aOutSawPotentialASR) {
+  ScrollContainerFrame* scrollContainerFrame = do_QueryFrame(aFrame);
+  if (!scrollContainerFrame) {
+    return true;
+  }
+  *aOutSawPotentialASR = true;
+  return CheckAxes(scrollContainerFrame, aAxes);
+}
+
+static bool CheckForStickyAndAxes(nsIFrame* aFrame, PhysicalAxes aAxes,
+                                  bool* aOutSawPotentialASR) {
+  if (aFrame->StyleDisplay()->mPosition != StylePositionProperty::Sticky) {
+    return true;
+  }
+  auto* ssc = StickyScrollContainer::GetOrCreateForFrame(aFrame);
+  if (!ssc) {
+    return true;
+  }
+  *aOutSawPotentialASR = true;
+  return CheckAxes(ssc->ScrollContainer(), aAxes);
+}
+
+static bool ShouldAsyncScrollWithAnchorNotCached(nsIFrame* aFrame,
+                                                 nsIFrame* aAnchor,
+                                                 nsDisplayListBuilder* aBuilder,
+                                                 PhysicalAxes aAxes,
+                                                 bool* aReportToDoc) {
+  if (aFrame->IsMenuPopupFrame()) {
+    *aReportToDoc = false;
+    return false;
+  }
+  *aReportToDoc = true;
+  nsIFrame* limitAncestor = aFrame->GetParent();
+  MOZ_ASSERT(limitAncestor);
+  nsIFrame* frame = aAnchor;
+  bool firstIteration = true;
+  bool sawPotentialASR = false;
+  while (frame && !frame->IsMenuPopupFrame() && frame != limitAncestor &&
+         (frame->FirstContinuation() != limitAncestor->FirstContinuation())) {
+
+    if (!firstIteration &&
+        !CheckForScrollFrameAndAxes(frame, aAxes, &sawPotentialASR)) {
+      return false;
+    }
+
+    if (sawPotentialASR && !firstIteration && frame->IsTransformed()) {
+      return false;
+    }
+
+    nsIFrame* anchor = nullptr;
+    while ((anchor = AnchorPositioningUtils::GetAnchorThatFrameScrollsWith(
+                frame, aBuilder))) {
+      MOZ_ASSERT(nsLayoutUtils::IsProperAncestorFrameConsideringContinuations(
+          limitAncestor, anchor));
+      frame = anchor;
+    }
+
+    if (!CheckForStickyAndAxes(frame, aAxes, &sawPotentialASR)) {
+      return false;
+    }
+
+    frame = nsLayoutUtils::GetCrossDocParentFrameInProcess(frame);
+    firstIteration = false;
+  }
+  return true;
+}
+
+bool DisplayPortUtils::ShouldAsyncScrollWithAnchor(
+    nsIFrame* aFrame, nsIFrame* aAnchor, nsDisplayListBuilder* aBuilder,
+    PhysicalAxes aAxes) {
+  MOZ_ASSERT(aAnchor ==
+             AnchorPositioningUtils::GetAnchorThatFrameScrollsWith(
+                 aFrame,  nullptr,  true));
+  MOZ_ASSERT(aFrame->IsAbsolutelyPositioned());
+  MOZ_ASSERT(aBuilder->IsPaintingToWindow());
+  MOZ_ASSERT(!aAxes.isEmpty());
+
+  if (auto entry = aBuilder->AsyncScrollsWithAnchorHashmap().Lookup(aFrame)) {
+    return *entry;
+  }
+  bool reportToDoc = false;
+  bool shouldAsyncScrollWithAnchor = ShouldAsyncScrollWithAnchorNotCached(
+      aFrame, aAnchor, aBuilder, aAxes, &reportToDoc);
+  {
+    bool& entry =
+        aBuilder->AsyncScrollsWithAnchorHashmap().LookupOrInsert(aFrame);
+    entry = shouldAsyncScrollWithAnchor;
+  }
+  if (reportToDoc) {
+    auto* pc = aFrame->PresContext();
+    pc->Document()->ReportHasScrollLinkedEffect(
+        pc->RefreshDriver()->MostRecentRefresh(),
+        dom::Document::ReportToConsole::No);
+  }
+
+  return shouldAsyncScrollWithAnchor;
+}
+
+}  

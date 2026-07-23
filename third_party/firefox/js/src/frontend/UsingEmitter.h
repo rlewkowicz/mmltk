@@ -1,0 +1,145 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_UsingEmitter_h
+#define frontend_UsingEmitter_h
+
+#include "mozilla/Attributes.h"
+
+#include "frontend/TryEmitter.h"
+#include "js/UniquePtr.h"
+#include "vm/UsingHint.h"
+
+namespace js::frontend {
+
+struct BytecodeEmitter;
+class EmitterScope;
+
+enum class BlockKind : uint8_t {
+  ForOf,
+
+  Other
+};
+
+class MOZ_STACK_CLASS DisposalEmitter {
+ private:
+  BytecodeEmitter* bce_;
+  bool hasAsyncDisposables_;
+
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    DisposeCapability,
+
+    End
+  };
+  State state_ = State::Start;
+#endif
+
+  [[nodiscard]] bool emitResourcePropertyAccess(TaggedParserAtomIndex prop,
+                                                unsigned resourcesFromTop = 1);
+
+ public:
+  DisposalEmitter(BytecodeEmitter* bce, bool hasAsyncDisposables)
+      : bce_(bce), hasAsyncDisposables_(hasAsyncDisposables) {}
+
+  [[nodiscard]] bool prepareForDisposeCapability();
+
+  [[nodiscard]] bool emitEnd(EmitterScope& es);
+};
+
+class MOZ_STACK_CLASS UsingEmitter {
+ private:
+  js::UniquePtr<TryEmitter> tryEmitter_;
+
+  bool hasAwaitUsing_ = false;
+
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    DisposableScopeBody,
+
+    End
+  };
+  State state_ = State::Start;
+#endif
+
+  [[nodiscard]] bool emitGetDisposeMethod(UsingHint hint);
+
+  [[nodiscard]] bool emitCreateDisposableResource(UsingHint hint);
+
+  [[nodiscard]] bool emitTakeDisposeCapability();
+
+ protected:
+  BytecodeEmitter* bce_;
+
+  [[nodiscard]] bool emitThrowIfException();
+
+  [[nodiscard]] bool emitDisposeResourcesForEnvironment(EmitterScope& es);
+
+ public:
+  explicit UsingEmitter(BytecodeEmitter* bce);
+
+  bool hasAwaitUsing() const { return hasAwaitUsing_; }
+
+  void setHasAwaitUsing(bool hasAwaitUsing) { hasAwaitUsing_ = hasAwaitUsing; }
+
+  [[nodiscard]] bool prepareForDisposableScopeBody(BlockKind blockKind);
+
+  [[nodiscard]] bool prepareForAssignment(UsingHint hint);
+
+  [[nodiscard]] bool emitEnd();
+};
+
+class MOZ_STACK_CLASS ForOfDisposalEmitter : protected UsingEmitter {
+ private:
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    Iteration,
+  };
+  State state_ = State::Start;
+#endif
+ public:
+  explicit ForOfDisposalEmitter(BytecodeEmitter* bce, bool hasAwaitUsing)
+      : UsingEmitter(bce) {
+    setHasAwaitUsing(hasAwaitUsing);
+  }
+
+  [[nodiscard]] bool prepareForForOfLoopIteration();
+
+  [[nodiscard]] bool prepareForForOfIteratorClose();
+};
+
+class MOZ_STACK_CLASS NonLocalIteratorCloseUsingEmitter
+    : protected UsingEmitter {
+ private:
+  js::UniquePtr<TryEmitter> tryClosingIterator_;
+
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    IteratorClose,
+
+    End
+  };
+  State state_ = State::Start;
+#endif
+
+ public:
+  explicit NonLocalIteratorCloseUsingEmitter(BytecodeEmitter* bce)
+      : UsingEmitter(bce) {}
+
+  [[nodiscard]] bool prepareForIteratorClose(EmitterScope& es);
+
+  [[nodiscard]] bool emitEnd();
+};
+
+}  
+
+#endif  // frontend_UsingEmitter_h

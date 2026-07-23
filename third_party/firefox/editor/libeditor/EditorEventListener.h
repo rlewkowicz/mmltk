@@ -1,0 +1,111 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(EditorEventListener_h)
+#define EditorEventListener_h
+
+#include "EditorForwards.h"
+
+#include "mozilla/Attributes.h"
+#include "mozilla/EventForwards.h"
+#include "nsCOMPtr.h"
+#include "nsError.h"
+#include "nsIDOMEventListener.h"
+#include "nsISupportsImpl.h"
+#include "nscore.h"
+
+class nsCaret;
+class nsIContent;
+class nsPresContext;
+
+#if defined(KeyPress)
+#  undef KeyPress
+#endif
+
+
+namespace mozilla {
+class PresShell;
+namespace dom {
+class DragEvent;
+class MouseEvent;
+}  
+
+class EditorEventListener : public nsIDOMEventListener {
+ public:
+  EditorEventListener();
+
+  virtual nsresult Connect(EditorBase* aEditorBase);
+
+  virtual void Disconnect();
+
+  [[nodiscard]] bool DetachedFromEditor() const;
+
+  NS_DECL_ISUPPORTS
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD HandleEvent(dom::Event* aEvent) override;
+
+  MOZ_CAN_RUN_SCRIPT bool WillHandleMouseButtonEvent(
+      WidgetMouseEvent& aMouseEvent);
+
+ protected:
+  virtual ~EditorEventListener();
+
+  nsresult InstallToEditor();
+  void UninstallFromEditor();
+
+#if defined(HANDLE_NATIVE_TEXT_DIRECTION_SWITCH)
+  nsresult KeyDown(const WidgetKeyboardEvent* aKeyboardEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult KeyUp(const WidgetKeyboardEvent* aKeyboardEvent);
+#endif
+  MOZ_CAN_RUN_SCRIPT nsresult KeyPress(WidgetKeyboardEvent* aKeyboardEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult
+  HandleChangeComposition(WidgetCompositionEvent* aCompositionEvent);
+  nsresult HandleStartComposition(WidgetCompositionEvent* aCompositionEvent);
+  MOZ_CAN_RUN_SCRIPT void HandleEndComposition(
+      WidgetCompositionEvent* aCompositionEvent);
+  MOZ_CAN_RUN_SCRIPT virtual nsresult MouseDown(dom::MouseEvent* aMouseEvent);
+  MOZ_CAN_RUN_SCRIPT virtual nsresult MouseUp(dom::MouseEvent* aMouseEvent) {
+    return NS_OK;
+  }
+  MOZ_CAN_RUN_SCRIPT virtual nsresult PointerClick(
+      WidgetMouseEvent* aPointerClick);
+  MOZ_CAN_RUN_SCRIPT nsresult DragOverOrDrop(dom::DragEvent* aDragEvent);
+  nsresult DragLeave(dom::DragEvent* aDragEvent);
+
+  MOZ_CAN_RUN_SCRIPT void DidFocus(const InternalFocusEvent& aFocusEvent);
+
+  void RefuseToDropAndHideCaret(dom::DragEvent* aDragEvent);
+  bool DragEventHasSupportingData(dom::DragEvent* aDragEvent) const;
+  MOZ_CAN_RUN_SCRIPT bool CanInsertAtDropPosition(dom::DragEvent* aDragEvent);
+  void InitializeDragDropCaret();
+  void CleanupDragDropCaret();
+  PresShell* GetPresShell() const;
+  nsPresContext* GetPresContext() const;
+
+  MOZ_CAN_RUN_SCRIPT bool NotifyIMEOfMouseButtonEvent(
+      WidgetMouseEvent& aMouseEvent);
+
+  bool EditorHasFocus();
+  bool IsFileControlTextBox();
+  bool ShouldHandleNativeKeyBindings(WidgetKeyboardEvent* aKeyboardEvent);
+
+  bool DetachedFromEditorOrDefaultPrevented(WidgetEvent* aEvent) const;
+
+  [[nodiscard]] bool EnsureCommitComposition();
+
+  EditorBase* mEditorBase;  
+  RefPtr<nsCaret> mCaret;
+  bool mCommitText;
+  bool mInTransaction;
+  bool mMouseDownOrUpConsumedByIME;
+#if defined(HANDLE_NATIVE_TEXT_DIRECTION_SWITCH)
+  bool mHaveBidiKeyboards;
+  bool mShouldSwitchTextDirection;
+  bool mSwitchToRTL;
+#endif
+};
+
+}  
+
+#endif

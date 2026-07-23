@@ -1,0 +1,36 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+
+#ifndef __UCPMAP_H__
+#define __UCPMAP_H__
+
+#include "unicode/utypes.h"
+
+U_CDECL_BEGIN
+
+
+typedef struct UCPMap UCPMap;
+
+enum UCPMapRangeOption {
+    UCPMAP_RANGE_NORMAL,
+    UCPMAP_RANGE_FIXED_LEAD_SURROGATES,
+    UCPMAP_RANGE_FIXED_ALL_SURROGATES
+};
+#ifndef U_IN_DOXYGEN
+typedef enum UCPMapRangeOption UCPMapRangeOption;
+#endif
+
+U_CAPI uint32_t U_EXPORT2
+ucpmap_get(const UCPMap *map, UChar32 c);
+
+typedef uint32_t U_CALLCONV
+UCPMapValueFilter(const void *context, uint32_t value);
+
+U_CAPI UChar32 U_EXPORT2
+ucpmap_getRange(const UCPMap *map, UChar32 start,
+                UCPMapRangeOption option, uint32_t surrogateValue,
+                UCPMapValueFilter *filter, const void *context, uint32_t *pValue);
+
+U_CDECL_END
+
+#endif

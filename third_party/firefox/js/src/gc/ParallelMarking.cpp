@@ -1,0 +1,348 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "gc/ParallelMarking.h"
+
+#include "gc/GCInternals.h"
+#include "gc/GCLock.h"
+#include "vm/GeckoProfiler.h"
+#include "vm/HelperThreadState.h"
+#include "vm/Runtime.h"
+
+#include "gc/WeakMap-inl.h"
+
+using namespace js;
+using namespace js::gc;
+
+using mozilla::TimeDuration;
+using mozilla::TimeStamp;
+
+using JS::SliceBudget;
+
+class AutoAddTimeDuration {
+  TimeStamp start_;
+  TimeDuration& result_;
+
+ public:
+  explicit AutoAddTimeDuration(TimeDuration& result)
+      : start_(TimeStamp::Now()), result_(result) {}
+  TimeStamp start() const { return start_; }
+  ~AutoAddTimeDuration() { result_ += TimeSince(start_); }
+};
+
+bool ParallelMarker::mark(GCRuntime* gc, const SliceBudget& sliceBudget) {
+  if (!markOneColor(gc, MarkColor::Black, sliceBudget) ||
+      !markOneColor(gc, MarkColor::Gray, sliceBudget)) {
+    return false;
+  }
+
+  if (gc->hasDelayedMarking()) {
+    gc->markAllDelayedChildren(ReportMarkTime);
+  }
+
+  return true;
+}
+
+bool ParallelMarker::markOneColor(GCRuntime* gc, MarkColor color,
+                                  const SliceBudget& sliceBudget) {
+  ParallelMarker pm(gc, color);
+  return pm.mark(sliceBudget);
+}
+
+ParallelMarker::ParallelMarker(GCRuntime* gc, MarkColor color)
+    : gc(gc), color(color) {
+  MOZ_ASSERT(workerCount() <= gc->getMaxParallelThreads());
+}
+
+size_t ParallelMarker::workerCount() const { return gc->markers.length(); }
+
+bool ParallelMarker::mark(const SliceBudget& sliceBudget) {
+
+  if (!gc->hasDeferredWeakMaps(color) && !anyMarkerHasEntries()) {
+    return true;
+  }
+
+  gcstats::AutoPhase ap(gc->stats(), gcstats::PhaseKind::PARALLEL_MARK);
+
+  MOZ_ASSERT(workerCount() <= MaxParallelWorkers);
+
+  for (size_t i = 0; i < workerCount(); i++) {
+    GCMarker* marker = gc->markers[i].get();
+    tasks[i].emplace(this, marker, color, i, sliceBudget);
+
+    if (!marker->hasEntriesForCurrentColor() && gc->marker().canDonateWork()) {
+      GCMarker::moveSomeWork(marker, &gc->marker(), false);
+    }
+  }
+
+  AutoLockHelperThreadState lock;
+
+  MOZ_ASSERT(!hasActiveTasks(lock));
+  for (size_t i = 0; i < workerCount(); i++) {
+    ParallelMarkTask& task = *tasks[i];
+    if (task.hasWork()) {
+      setTaskActive(&task, lock);
+    }
+  }
+
+  for (size_t i = 1; i < workerCount(); i++) {
+    gc->startTask(*tasks[i], lock);
+  }
+  tasks[0]->runFromMainThread(lock);
+  tasks[0]->recordDuration();  
+  for (size_t i = 1; i < workerCount(); i++) {
+    gc->joinTask(*tasks[i], lock);
+  }
+
+  MOZ_ASSERT(!hasWaitingTasks());
+  MOZ_ASSERT(!hasActiveTasks(lock));
+
+  return !gc->hasDeferredWeakMaps(color) && !anyMarkerHasEntries();
+}
+
+bool ParallelMarker::anyMarkerHasEntries() const {
+  for (const auto& marker : gc->markers) {
+    if (marker->hasEntries(color)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+ParallelMarkTask::ParallelMarkTask(ParallelMarker* pm, GCMarker* marker,
+                                   MarkColor color, uint32_t id,
+                                   const SliceBudget& budget)
+    : GCParallelTask(pm->gc, gcstats::PhaseKind::PARALLEL_MARK, GCUse::Marking),
+      pm(pm),
+      marker(marker),
+      color(*marker, color),
+      budget(budget),
+      id(id) {
+  marker->enterParallelMarkingMode();
+}
+
+ParallelMarkTask::~ParallelMarkTask() {
+  MOZ_ASSERT(!isWaiting.refNoCheck());
+  marker->leaveParallelMarkingMode();
+}
+
+bool ParallelMarkTask::hasWork() const {
+  return marker->hasEntriesForCurrentColor();
+}
+
+void ParallelMarkTask::recordDuration() {
+  gc->stats().recordParallelPhase(gcstats::PhaseKind::PARALLEL_MARK_MARK,
+                                  markTime.ref());
+  gc->stats().recordParallelPhase(gcstats::PhaseKind::PARALLEL_MARK_WAIT,
+                                  waitTime.ref());
+  TimeDuration other = duration() - markTime.ref() - waitTime.ref();
+  if (other < TimeDuration::Zero()) {
+    other = TimeDuration::Zero();
+  }
+  gc->stats().recordParallelPhase(gcstats::PhaseKind::PARALLEL_MARK_OTHER,
+                                  other);
+}
+
+void ParallelMarkTask::run(AutoLockHelperThreadState& lock) {
+  AutoUpdateMarkStackRanges updateRanges(*marker);
+
+  for (;;) {
+    if (hasWork()) {
+      if (!tryMarking(lock)) {
+        break;
+      }
+    } else if (pm->hasActiveTasks(lock)) {
+      if (!requestWork(lock)) {
+        break;  
+      }
+    } else if (gc->hasDeferredWeakMaps(pm->color)) {
+      markDeferredWeakmaps(lock);
+    } else {
+      break;
+    }
+  }
+
+  resumeWaitingTasks(lock);
+  MOZ_ASSERT(!isWaiting);
+}
+
+bool ParallelMarkTask::tryMarking(AutoLockHelperThreadState& lock) {
+  MOZ_ASSERT(hasWork());
+  MOZ_ASSERT(marker->isParallelMarking());
+
+  bool finished;
+  {
+    AutoUnlockHelperThreadState unlock(lock);
+
+    AutoAddTimeDuration time(markTime.ref());
+    finished = marker->markCurrentColorInParallel(this, budget);
+  }
+
+  MOZ_ASSERT_IF(finished, !hasWork());
+  pm->setTaskInactive(this, lock);
+
+  return finished;
+}
+
+void ParallelMarkTask::markDeferredWeakmaps(AutoLockHelperThreadState& lock) {
+  MOZ_ASSERT(!pm->hasActiveTasks(lock));
+
+  WeakMapList deferred(std::move(gc->deferredMapsList(pm->color)));
+
+#ifdef DEBUG
+  pm->markingDeferredWeakmaps = true;
+#endif
+  {
+    AutoUnlockHelperThreadState unlock(lock);
+    marker->markDeferredWeakMapChildren(deferred);
+  }
+#ifdef DEBUG
+  pm->markingDeferredWeakmaps = false;
+#endif
+
+  MOZ_ASSERT(deferred.isEmpty());
+
+  if (hasWork()) {
+    pm->setTaskActive(this, lock);
+  }
+}
+
+bool ParallelMarkTask::requestWork(AutoLockHelperThreadState& lock) {
+  MOZ_ASSERT(!hasWork());
+  MOZ_ASSERT(pm->hasActiveTasks(lock));
+
+  budget.forceCheck();
+  if (budget.isOverBudget()) {
+    return false;  
+  }
+
+  waitUntilResumed(lock);
+
+  return true;
+}
+
+void ParallelMarkTask::resumeWaitingTasks(AutoLockHelperThreadState& lock) {
+  while (pm->hasWaitingTasks()) {
+    auto* task = pm->takeWaitingTask();
+    task->resumeOnFinish(lock);
+  }
+}
+
+void ParallelMarkTask::waitUntilResumed(AutoLockHelperThreadState& lock) {
+  AutoAddTimeDuration time(waitTime.ref());
+
+  pm->addTaskToWaitingList(this, lock);
+
+  MOZ_ASSERT(!isWaiting);
+  isWaiting = true;
+
+  do {
+    MOZ_ASSERT(pm->hasActiveTasks(lock) || pm->isMarkingDeferredWeakmaps(lock));
+    resumed.wait(lock);
+  } while (isWaiting);
+
+  MOZ_ASSERT(!pm->isTaskInWaitingList(this, lock));
+
+}
+
+void ParallelMarkTask::resume() {
+  {
+    AutoLockHelperThreadState lock;
+    MOZ_ASSERT(isWaiting);
+
+    isWaiting = false;
+
+    if (hasWork()) {
+      pm->setTaskActive(this, lock);
+    }
+  }
+
+  resumed.notify_all();
+}
+
+void ParallelMarkTask::resumeOnFinish(const AutoLockHelperThreadState& lock) {
+  MOZ_ASSERT(isWaiting);
+  MOZ_ASSERT(!hasWork());
+
+  isWaiting = false;
+  resumed.notify_all();
+}
+
+void ParallelMarker::addTaskToWaitingList(
+    ParallelMarkTask* task, const AutoLockHelperThreadState& lock) {
+  MOZ_ASSERT(!task->hasWork());
+  MOZ_ASSERT(hasActiveTasks(lock));
+  MOZ_ASSERT(!isTaskInWaitingList(task, lock));
+
+  uint32_t id = task->id;
+  MOZ_ASSERT(id < workerCount());
+  MOZ_ASSERT(!waitingTasks[id]);
+  waitingTasks[id] = true;
+}
+
+#ifdef DEBUG
+bool ParallelMarker::isTaskInWaitingList(
+    const ParallelMarkTask* task, const AutoLockHelperThreadState& lock) const {
+  uint32_t id = task->id;
+  MOZ_ASSERT(id < workerCount());
+  return waitingTasks[id];
+}
+#endif
+
+ParallelMarkTask* ParallelMarker::takeWaitingTask() {
+  MOZ_ASSERT(hasWaitingTasks());
+  uint32_t id = waitingTasks.FindFirst();
+  MOZ_ASSERT(id < workerCount());
+
+  MOZ_ASSERT(waitingTasks[id]);
+  waitingTasks[id] = false;
+  return &*tasks[id];
+}
+
+void ParallelMarker::setTaskActive(ParallelMarkTask* task,
+                                   const AutoLockHelperThreadState& lock) {
+  MOZ_ASSERT(task->hasWork());
+
+  uint32_t id = task->id;
+  MOZ_ASSERT(id < workerCount());
+  MOZ_ASSERT(!activeTasks.ref()[id]);
+  activeTasks.ref()[id] = true;
+}
+
+void ParallelMarker::setTaskInactive(ParallelMarkTask* task,
+                                     const AutoLockHelperThreadState& lock) {
+  MOZ_ASSERT(hasActiveTasks(lock));
+
+  uint32_t id = task->id;
+  MOZ_ASSERT(id < workerCount());
+  MOZ_ASSERT(activeTasks.ref()[id]);
+  activeTasks.ref()[id] = false;
+}
+
+void ParallelMarkTask::donateWork() { pm->donateWorkFrom(marker); }
+
+void ParallelMarker::donateWorkFrom(GCMarker* src) {
+  if (!gHelperThreadLock.tryLock()) {
+    return;
+  }
+
+  if (!hasWaitingTasks()) {
+    gHelperThreadLock.unlock();
+    return;
+  }
+
+  ParallelMarkTask* waitingTask = takeWaitingTask();
+
+  MOZ_ASSERT(waitingTask->isWaiting);
+
+  gHelperThreadLock.unlock();
+
+  MOZ_ASSERT(!waitingTask->hasWork());
+  GCMarker::moveSomeWork(waitingTask->marker, src, true);
+
+  gc->stats().count(gcstats::COUNT_PARALLEL_MARK_INTERRUPTIONS);
+
+  waitingTask->resume();
+}

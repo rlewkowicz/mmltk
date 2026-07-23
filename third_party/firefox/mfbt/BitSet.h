@@ -1,0 +1,310 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_BitSet_h
+#define mozilla_BitSet_h
+
+#include "fmt/format.h"
+#include "mozilla/Array.h"
+#include "mozilla/MathAlgorithms.h"
+#include "mozilla/Span.h"
+
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+
+namespace mozilla {
+
+enum MemoryOrdering : uint8_t;
+template <typename T, MemoryOrdering Order, typename Enable>
+class Atomic;
+
+namespace detail {
+
+template <typename T>
+struct UnwrapMaybeAtomic {
+  using Type = T;
+};
+template <typename T, MemoryOrdering Order, typename Enable>
+struct UnwrapMaybeAtomic<mozilla::Atomic<T, Order, Enable>> {
+  using Type = T;
+};
+
+}  
+
+template <size_t N, typename StorageType = size_t>
+class BitSet {
+ public:
+  using Word = typename detail::UnwrapMaybeAtomic<StorageType>::Type;
+  static_assert(sizeof(Word) == sizeof(StorageType));
+  static_assert(
+      std::is_unsigned_v<Word>,
+      "StorageType must be an unsigned integral type, or equivalent Atomic");
+  static_assert(N != 0);
+
+ private:
+  static constexpr size_t kBitsPerWord = 8 * sizeof(Word);
+  static constexpr size_t kNumWords = (N + kBitsPerWord - 1) / kBitsPerWord;
+  static constexpr size_t kPaddingBits = (kNumWords * kBitsPerWord) - N;
+  static constexpr Word kPaddingMask = Word(-1) >> kPaddingBits;
+
+  Array<StorageType, kNumWords> mStorage;
+
+  constexpr void ResetPaddingBits() {
+    if constexpr (kPaddingBits != 0) {
+      mStorage[kNumWords - 1] &= kPaddingMask;
+    }
+  }
+
+ public:
+  class Reference {
+   public:
+    Reference(BitSet<N, StorageType>& aBitSet, size_t aPos)
+        : mBitSet(aBitSet), mPos(aPos) {}
+
+    Reference& operator=(bool aValue) {
+      auto bit = Word(1) << (mPos % kBitsPerWord);
+      auto& word = mBitSet.mStorage[mPos / kBitsPerWord];
+      if (aValue) {
+        word |= bit;
+      } else {
+        word &= ~bit;
+      }
+      return *this;
+    }
+
+    MOZ_IMPLICIT operator bool() const { return mBitSet.test(mPos); }
+
+   private:
+    BitSet<N, StorageType>& mBitSet;
+    size_t mPos;
+  };
+
+  constexpr BitSet() : mStorage() {}
+
+  BitSet(const BitSet& aOther) { *this = aOther; }
+
+  BitSet& operator=(const BitSet& aOther) {
+    for (size_t i = 0; i < std::size(mStorage); i++) {
+      mStorage[i] = Word(aOther.mStorage[i]);
+    }
+    return *this;
+  }
+
+  explicit BitSet(Span<StorageType, kNumWords> aStorage) {
+    for (size_t i = 0; i < std::size(mStorage); i++) {
+      mStorage[i] = Word(aStorage[i]);
+    }
+  }
+
+  static constexpr size_t size() { return N; }
+
+  constexpr bool test(size_t aPos) const {
+    MOZ_ASSERT(aPos < N);
+    return mStorage[aPos / kBitsPerWord] & (Word(1) << (aPos % kBitsPerWord));
+  }
+
+  constexpr bool IsEmpty() const {
+    for (const StorageType& word : mStorage) {
+      if (word) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  explicit constexpr operator bool() { return !IsEmpty(); }
+
+  constexpr bool operator[](size_t aPos) const { return test(aPos); }
+
+  Reference operator[](size_t aPos) {
+    MOZ_ASSERT(aPos < N);
+    return {*this, aPos};
+  }
+
+  BitSet operator|(const BitSet<N, StorageType>& aOther) {
+    BitSet result = *this;
+    result |= aOther;
+    return result;
+  }
+
+  BitSet& operator|=(const BitSet<N, StorageType>& aOther) {
+    for (size_t i = 0; i < std::size(mStorage); i++) {
+      mStorage[i] |= aOther.mStorage[i];
+    }
+    return *this;
+  }
+
+  BitSet operator~() const {
+    BitSet result = *this;
+    result.Flip();
+    return result;
+  }
+
+  BitSet& operator&=(const BitSet<N, StorageType>& aOther) {
+    for (size_t i = 0; i < std::size(mStorage); i++) {
+      mStorage[i] &= aOther.mStorage[i];
+    }
+    return *this;
+  }
+
+  BitSet operator&(const BitSet<N, StorageType>& aOther) const {
+    BitSet result = *this;
+    result &= aOther;
+    return result;
+  }
+
+  bool operator==(const BitSet<N, StorageType>& aOther) const {
+    return mStorage == aOther.mStorage;
+  }
+  bool operator!=(const BitSet<N, StorageType>& aOther) const {
+    return !(*this == aOther);
+  }
+
+  size_t Count() const {
+    size_t count = 0;
+
+    for (const Word word : mStorage) {
+      count += std::popcount(word);
+    }
+
+    return count;
+  }
+
+  void ResetAll() {
+    for (StorageType& word : mStorage) {
+      word = Word(0);
+    }
+  }
+
+  void SetAll() {
+    for (StorageType& word : mStorage) {
+      word = ~Word(0);
+    }
+    ResetPaddingBits();
+  }
+
+  void Flip() {
+    for (StorageType& word : mStorage) {
+      word = ~word;
+    }
+
+    ResetPaddingBits();
+  }
+
+  size_t FindFirst() const { return FindNext(0); }
+
+  size_t FindNext(size_t aFromPos) const {
+    MOZ_ASSERT(aFromPos < N);
+    size_t wordIndex = aFromPos / kBitsPerWord;
+    size_t bitIndex = aFromPos % kBitsPerWord;
+
+    Word word = mStorage[wordIndex];
+    word &= (Word(-1) << bitIndex);
+    while (word == 0) {
+      wordIndex++;
+      if (wordIndex == kNumWords) {
+        return SIZE_MAX;
+      }
+      word = mStorage[wordIndex];
+    }
+
+    size_t pos = std::countr_zero(word);
+    return wordIndex * kBitsPerWord + pos;
+  }
+
+  size_t FindLast() const { return FindPrev(size() - 1); }
+
+  size_t FindPrev(size_t aFromPos) const {
+    MOZ_ASSERT(aFromPos < N);
+    size_t wordIndex = aFromPos / kBitsPerWord;
+    size_t bitIndex = aFromPos % kBitsPerWord;
+
+    Word word = mStorage[wordIndex];
+    word &= Word(-1) >> (kBitsPerWord - 1 - bitIndex);
+    while (word == 0) {
+      if (wordIndex == 0) {
+        return SIZE_MAX;
+      }
+      wordIndex--;
+      word = mStorage[wordIndex];
+    }
+
+    uint_fast8_t pos = FindMostSignificantBit(word);
+    return wordIndex * kBitsPerWord + pos;
+  }
+
+  Span<StorageType> Storage() { return mStorage; }
+
+  Span<const StorageType> Storage() const { return mStorage; }
+};
+
+}  
+
+template <size_t N, typename StorageType>
+struct fmt::formatter<mozilla::BitSet<N, StorageType>> {
+  fmt::formatter<size_t> mElemFormatter;
+
+  constexpr auto parse(fmt::format_parse_context& aCtx) {
+    return mElemFormatter.parse(aCtx);
+  }
+
+  template <typename FmtContext>
+  constexpr auto format(const mozilla::BitSet<N, StorageType>& aBitset,
+                        FmtContext& aCtx) const {
+    size_t p = 0;
+    auto out = aCtx.out();
+    *out++ = '{';
+
+    size_t currentRangeStart = SIZE_MAX;
+    size_t currentRangeEnd = 0;
+    bool first = true;
+    while (true) {
+      if (p < N) {
+        p = aBitset.FindNext(p);
+      } else {
+        p = SIZE_MAX;
+      }
+
+      if (currentRangeStart == SIZE_MAX) {
+        if (p == SIZE_MAX) {
+          break;  
+        }
+        currentRangeStart = currentRangeEnd = p;
+      } else if (p > currentRangeEnd + 1) {
+
+        if (!first) {
+          *out++ = ',';
+        }
+        first = false;
+
+        aCtx.advance_to(out);
+        out = mElemFormatter.format(currentRangeStart, aCtx);
+        size_t rangeSize = currentRangeEnd - currentRangeStart + 1;
+        if (rangeSize > 1) {
+          *out++ = (rangeSize == 2) ? ',' : '-';
+          aCtx.advance_to(out);
+          out = mElemFormatter.format(currentRangeEnd, aCtx);
+        }
+
+        if (p == SIZE_MAX) {
+          break;  
+        }
+
+        currentRangeStart = currentRangeEnd = p;
+      } else {
+        currentRangeEnd++;
+        MOZ_ASSERT(currentRangeEnd == p);
+      }
+
+      p++;
+    }
+
+    *out++ = '}';
+    return out;
+  }
+};
+
+#endif  // mozilla_BitSet_h

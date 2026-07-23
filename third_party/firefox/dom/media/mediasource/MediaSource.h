@@ -1,0 +1,154 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_MediaSource_h_
+#define mozilla_dom_MediaSource_h_
+
+#include "MediaSourceDecoder.h"
+#include "TimeUnits.h"
+#include "js/RootingAPI.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/dom/MediaSourceBinding.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionNoteChild.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsID.h"
+#include "nsISupports.h"
+#include "nscore.h"
+
+struct JSContext;
+class JSObject;
+class nsPIDOMWindowInner;
+
+namespace mozilla {
+
+class AbstractThread;
+class ErrorResult;
+template <typename T>
+class AsyncEventRunner;
+class MediaResult;
+
+namespace dom {
+class MediaSource;
+}  
+DDLoggedTypeName(dom::MediaSource);
+
+namespace dom {
+
+class GlobalObject;
+class SourceBuffer;
+class SourceBufferList;
+template <typename T>
+class Optional;
+
+#define MOZILLA_DOM_MEDIASOURCE_IMPLEMENTATION_IID \
+  {0x3839d699, 0x22c5, 0x439f, {0x94, 0xca, 0x0e, 0x0b, 0x26, 0xf9, 0xca, 0xbf}}
+
+class MediaSource final : public DOMEventTargetHelper,
+                          public DecoderDoctorLifeLogger<MediaSource> {
+ public:
+  static already_AddRefed<MediaSource> Constructor(const GlobalObject& aGlobal,
+                                                   ErrorResult& aRv);
+
+  SourceBufferList* SourceBuffers();
+  SourceBufferList* ActiveSourceBuffers();
+  MediaSourceReadyState ReadyState();
+
+  double Duration();
+  void SetDuration(double aDuration, ErrorResult& aRv);
+
+  already_AddRefed<SourceBuffer> AddSourceBuffer(const nsAString& aType,
+                                                 ErrorResult& aRv);
+  void RemoveSourceBuffer(SourceBuffer& aSourceBuffer, ErrorResult& aRv);
+
+  void EndOfStream(const Optional<MediaSourceEndOfStreamError>& aError,
+                   ErrorResult& aRv);
+  void EndOfStream(const MediaResult& aError);
+
+  void SetLiveSeekableRange(double aStart, double aEnd, ErrorResult& aRv);
+  void ClearLiveSeekableRange(ErrorResult& aRv);
+
+  static bool IsTypeSupported(const GlobalObject&, const nsAString& aType);
+  static void IsTypeSupported(const nsAString& aType,
+                              DecoderDoctorDiagnostics* aDiagnostics,
+                              ErrorResult& aRv,
+                              Maybe<bool> aShouldResistFingerprinting);
+
+  IMPL_EVENT_HANDLER(sourceopen);
+  IMPL_EVENT_HANDLER(sourceended);
+  IMPL_EVENT_HANDLER(sourceclose);
+
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(MediaSource, DOMEventTargetHelper)
+  NS_INLINE_DECL_STATIC_IID(MOZILLA_DOM_MEDIASOURCE_IMPLEMENTATION_IID)
+
+  nsPIDOMWindowInner* GetParentObject() const;
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  bool Attach(MediaSourceDecoder* aDecoder);
+  void Detach();
+
+  void SetReadyState(MediaSourceReadyState aState);
+
+  MediaSourceDecoder* GetDecoder() { return mDecoder; }
+
+  nsIPrincipal* GetPrincipal() { return mPrincipal; }
+
+  already_AddRefed<Promise> MozDebugReaderData(ErrorResult& aRv);
+
+  bool HasLiveSeekableRange() const { return mLiveSeekableRange.isSome(); }
+  media::TimeRanges LiveSeekableRange() const {
+    return mLiveSeekableRange.value();
+  }
+
+  AbstractThread* AbstractMainThread() const { return mAbstractMainThread; }
+
+  void CompletePendingTransactions();
+
+ private:
+  friend class mozilla::dom::SourceBuffer;
+
+  ~MediaSource();
+
+  explicit MediaSource(nsPIDOMWindowInner* aWindow);
+
+  friend class AsyncEventRunner<MediaSource>;
+  void DispatchSimpleEvent(const char* aName);
+  void QueueAsyncSimpleEvent(const char* aName);
+
+  void DurationChangeOnEndOfStream();
+  void DurationChange(double aNewDuration, ErrorResult& aRv);
+
+  void SetDuration(const media::TimeUnit& aDuration);
+
+  typedef MozPromise<bool, MediaResult,  true>
+      ActiveCompletionPromise;
+  RefPtr<ActiveCompletionPromise> SourceBufferIsActive(
+      SourceBuffer* aSourceBuffer);
+
+  RefPtr<SourceBufferList> mSourceBuffers;
+  RefPtr<SourceBufferList> mActiveSourceBuffers;
+
+  RefPtr<MediaSourceDecoder> mDecoder;
+  RefPtr<HTMLMediaElement> mMediaElement;
+
+  RefPtr<nsIPrincipal> mPrincipal;
+
+  const RefPtr<AbstractThread> mAbstractMainThread;
+
+  MediaSourceReadyState mReadyState;
+
+  Maybe<media::TimeRanges> mLiveSeekableRange;
+  nsTArray<MozPromiseHolder<ActiveCompletionPromise>> mCompletionPromises;
+};
+
+}  
+
+}  
+
+#endif /* mozilla_dom_MediaSource_h_ */

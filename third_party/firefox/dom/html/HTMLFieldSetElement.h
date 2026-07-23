@@ -1,0 +1,111 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_HTMLFieldSetElement_h
+#define mozilla_dom_HTMLFieldSetElement_h
+
+#include "mozilla/dom/ConstraintValidation.h"
+#include "mozilla/dom/ValidityState.h"
+#include "nsGenericHTMLElement.h"
+
+namespace mozilla {
+class ErrorResult;
+class EventChainPreVisitor;
+namespace dom {
+class FormData;
+
+class HTMLFieldSetElement final : public nsGenericHTMLFormControlElement,
+                                  public ConstraintValidation {
+ public:
+  using ConstraintValidation::GetValidationMessage;
+  using ConstraintValidation::SetCustomValidity;
+
+  explicit HTMLFieldSetElement(
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo);
+
+  NS_IMPL_FROMNODE_HTML_WITH_TAG(HTMLFieldSetElement, fieldset)
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+  nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
+
+  void GetEventTargetParent(EventChainPreVisitor& aVisitor) override;
+  void AfterSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                    const nsAttrValue* aValue, const nsAttrValue* aOldValue,
+                    nsIPrincipal* aSubjectPrincipal, bool aNotify) override;
+
+  void InsertChildBefore(
+      nsIContent* aChild, nsIContent* aBeforeThis, bool aNotify,
+      ErrorResult& aRv, nsINode* aOldParent = nullptr,
+      MutationEffectOnScript aMutationEffectOnScript =
+          MutationEffectOnScript::DropTrustWorthiness) override;
+  void RemoveChildNode(
+      nsIContent* aKid, bool aNotify, const BatchRemovalState* aState,
+      nsINode* aNewParent = nullptr,
+      MutationEffectOnScript aMutationEffectOnScript =
+          MutationEffectOnScript::DropTrustWorthiness) override;
+
+  bool IsDisabledForEvents(WidgetEvent* aEvent) override;
+
+  NS_IMETHOD Reset() override;
+  NS_IMETHOD SubmitNamesValues(FormData* aFormData) override { return NS_OK; }
+
+  const nsIContent* GetFirstLegend() const { return mFirstLegend; }
+
+  void AddElement(nsGenericHTMLFormElement* aElement);
+
+  void RemoveElement(nsGenericHTMLFormElement* aElement);
+
+  void UpdateDisabledState(bool aNotify) override;
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(HTMLFieldSetElement,
+                                           nsGenericHTMLFormControlElement)
+
+  bool Disabled() const { return GetBoolAttr(nsGkAtoms::disabled); }
+  void SetDisabled(bool aValue, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::disabled, aValue, aRv);
+  }
+
+  void GetName(nsAString& aValue) { GetHTMLAttr(nsGkAtoms::name, aValue); }
+
+  void SetName(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::name, aValue, aRv);
+  }
+
+  void GetType(nsAString& aType) const;
+
+  HTMLCollection* Elements();
+
+
+
+
+
+
+  void UpdateValidity(bool aElementValidityState);
+
+ protected:
+  virtual ~HTMLFieldSetElement();
+
+  JSObject* WrapNode(JSContext* aCx,
+                     JS::Handle<JSObject*> aGivenProto) override;
+
+ private:
+  void NotifyElementsForFirstLegendChange(bool aNotify);
+
+  static bool MatchListedElements(Element* aElement, int32_t aNamespaceID,
+                                  nsAtom* aAtom, void* aData);
+
+  RefPtr<ContentList> mElements;
+
+  nsTArray<nsGenericHTMLFormElement*> mDependentElements;
+
+  RefPtr<nsIContent> mFirstLegend;
+
+  int32_t mInvalidElementsCount;
+};
+
+}  
+}  
+
+#endif /* mozilla_dom_HTMLFieldSetElement_h */

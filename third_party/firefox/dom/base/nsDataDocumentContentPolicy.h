@@ -1,0 +1,26 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsDataDocumentContentPolicy_h_
+#define nsDataDocumentContentPolicy_h_
+
+#define NS_DATADOCUMENTCONTENTPOLICY_CID \
+  {0x1147d32c, 0x215b, 0x4014, {0xb1, 0x80, 0x07, 0xfe, 0x7a, 0xed, 0xf9, 0x15}}
+#define NS_DATADOCUMENTCONTENTPOLICY_CONTRACTID \
+  "@mozilla.org/data-document-content-policy;1"
+
+#include "nsIContentPolicy.h"
+
+class nsDataDocumentContentPolicy final : public nsIContentPolicy {
+  ~nsDataDocumentContentPolicy() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSICONTENTPOLICY
+
+  nsDataDocumentContentPolicy() = default;
+};
+
+#endif /* nsDataDocumentContentPolicy_h_ */

@@ -1,0 +1,268 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsHtml5TreeOpExecutor_h
+#define nsHtml5TreeOpExecutor_h
+
+#include "nsAtom.h"
+#include "nsTraceRefcnt.h"
+#include "nsHtml5TreeOperation.h"
+#include "nsHtml5SpeculativeLoad.h"
+#include "nsTArray.h"
+#include "nsContentSink.h"
+#include "nsNodeInfoManager.h"
+#include "nsHtml5DocumentMode.h"
+#include "nsIScriptElement.h"
+#include "nsIParser.h"
+#include "nsAHtml5TreeOpSink.h"
+#include "nsHtml5TreeOpStage.h"
+#include "nsIURI.h"
+#include "nsTHashSet.h"
+#include "nsHashKeys.h"
+#include "mozilla/LinkedList.h"
+#include "nsHtml5DocumentBuilder.h"
+#include "nsCharsetSource.h"
+
+class nsHtml5Parser;
+class nsHtml5StreamParser;
+class nsIContent;
+namespace mozilla {
+namespace dom {
+class Document;
+}
+}  
+
+class nsHtml5TreeOpExecutor final
+    : public nsHtml5DocumentBuilder,
+      public nsIContentSink,
+      public nsAHtml5TreeOpSink,
+      public mozilla::LinkedListElement<nsHtml5TreeOpExecutor> {
+  friend class nsHtml5FlushLoopGuard;
+  typedef mozilla::dom::ReferrerPolicy ReferrerPolicy;
+  using Encoding = mozilla::Encoding;
+  template <typename T>
+  using NotNull = mozilla::NotNull<T>;
+
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+
+ private:
+#ifdef DEBUG
+  static uint32_t sAppendBatchMaxSize;
+  static uint32_t sAppendBatchSlotsExamined;
+  static uint32_t sAppendBatchExaminations;
+  static uint32_t sLongestTimeOffTheEventLoop;
+  static uint32_t sTimesFlushLoopInterrupted;
+#endif
+
+  bool mSuppressEOF;
+
+  bool mReadingFromStage;
+  nsTArray<nsHtml5TreeOperation> mOpQueue;
+  nsHtml5StreamParser* mStreamParser;
+
+  nsTHashSet<nsCString> mPreloadedURLs;
+
+  nsCOMPtr<nsIURI> mSpeculationBaseURI;
+
+  nsCOMPtr<nsIURI> mViewSourceBaseURI;
+
+  bool mStarted;
+
+  nsHtml5TreeOpStage mStage;
+
+  bool mRunFlushLoopOnStack;
+
+  bool mCallContinueInterruptedParsingIfEnabled;
+
+  bool mAlreadyComplainedAboutCharset;
+
+  bool mAlreadyComplainedAboutDeepTree;
+
+ public:
+  nsHtml5TreeOpExecutor();
+
+  static void InitializeStatics();
+
+ protected:
+  virtual ~nsHtml5TreeOpExecutor();
+
+ public:
+
+  NS_IMETHOD WillParse() override;
+
+  NS_IMETHOD WillBuildModel() override;
+
+  NS_IMETHOD DidBuildModel(bool aTerminated) override;
+
+  NS_IMETHOD WillInterrupt() override;
+
+  void WillResume() override;
+
+  virtual nsIContentSink* AsExecutor() override { return this; }
+
+  virtual void InitialTranslationCompleted() override;
+
+  NS_IMETHOD SetParser(nsParserBase* aParser) override;
+
+  virtual void FlushPendingNotifications(mozilla::FlushType aType) override;
+
+  virtual void SetDocumentCharset(NotNull<const Encoding*> aEncoding) override {
+    MOZ_ASSERT_UNREACHABLE("No one should call this.");
+  }
+
+  virtual nsISupports* GetTarget() override;
+
+  virtual void ContinueInterruptedParsingAsync() override;
+
+  bool IsScriptExecuting() override { return IsScriptExecutingImpl(); }
+
+  void ContinueParsingDocumentAfterCurrentScript() override {
+    ContinueParsingDocumentAfterCurrentScriptImpl();
+  }
+
+
+  void SetStreamParser(nsHtml5StreamParser* aStreamParser) {
+    mStreamParser = aStreamParser;
+  }
+
+  void InitializeDocWriteParserState(nsAHtml5TreeBuilderState* aState,
+                                     int32_t aLine);
+
+  bool IsScriptEnabled();
+
+  virtual nsresult MarkAsBroken(nsresult aReason) override;
+
+  void StartLayout(bool* aInterrupted);
+
+  void PauseDocUpdate(bool* aInterrupted);
+
+  void FlushSpeculativeLoads();
+
+  void RunFlushLoop();
+
+  nsresult FlushDocumentWrite();
+
+  void CommitToInternalEncoding();
+
+  [[nodiscard]] bool TakeOpsFromStage();
+
+  void MaybeSuspend();
+
+  void Start();
+
+  void SetDocumentCharsetAndSource(NotNull<const Encoding*> aEncoding,
+                                   nsCharsetSource aCharsetSource);
+
+  void UpdateCharsetSource(nsCharsetSource aCharsetSource);
+
+  void NeedsCharsetSwitchTo(NotNull<const Encoding*> aEncoding, int32_t aSource,
+                            uint32_t aLineNumber);
+
+  void MaybeComplainAboutCharset(const char* aMsgId, bool aError,
+                                 uint32_t aLineNumber);
+
+  void ComplainAboutBogusProtocolCharset(mozilla::dom::Document* aDoc,
+                                         bool aUnrecognized);
+
+  void MaybeComplainAboutDeepTree(uint32_t aLineNumber);
+
+  bool HasStarted() { return mStarted; }
+
+  bool IsFlushing() { return mFlushState >= eInFlush; }
+
+#ifdef DEBUG
+  bool IsInFlushLoop() { return mRunFlushLoopOnStack; }
+#endif
+
+  void RunScript(nsIContent* aScriptElement, bool aMayDocumentWriteOrBlock);
+
+  [[nodiscard]] virtual bool MoveOpsFrom(
+      nsTArray<nsHtml5TreeOperation>& aOpQueue) override;
+
+  void ClearOpQueue();
+
+  void RemoveFromStartOfOpQueue(size_t aNumberOfOpsToRemove);
+
+  inline size_t OpQueueLength() { return mOpQueue.Length(); }
+
+  nsHtml5TreeOpStage* GetStage() { return &mStage; }
+
+  void StartReadingFromStage() { mReadingFromStage = true; }
+
+  void StreamEnded();
+
+#ifdef DEBUG
+  void AssertStageEmpty() { mStage.AssertEmpty(); }
+#endif
+
+  nsIURI* GetViewSourceBaseURI();
+
+  void PreloadScript(const nsAString& aURL, const nsAString& aCharset,
+                     const nsAString& aType, const nsAString& aCrossOrigin,
+                     const nsAString& aMedia, const nsAString& aNonce,
+                     const nsAString& aFetchPriority,
+                     const nsAString& aIntegrity,
+                     ReferrerPolicy aReferrerPolicy, bool aScriptFromHead,
+                     bool aAsync, bool aDefer, bool aLinkPreload);
+
+  void PreloadStyle(const nsAString& aURL, const nsAString& aCharset,
+                    const nsAString& aCrossOrigin, const nsAString& aMedia,
+                    const nsAString& aReferrerPolicy, const nsAString& aNonce,
+                    const nsAString& aIntegrity, bool aLinkPreload,
+                    const nsAString& aFetchPriority);
+
+  void PreloadImage(const nsAString& aURL, const nsAString& aCrossOrigin,
+                    const nsAString& aMedia, const nsAString& aSrcset,
+                    const nsAString& aSizes,
+                    const nsAString& aImageReferrerPolicy, bool aLinkPreload,
+                    const nsAString& aFetchPriority, const nsAString& aType);
+
+  void PreloadOpenPicture();
+
+  void PreloadEndPicture();
+
+  void PreloadPictureSource(const nsAString& aSrcset, const nsAString& aSizes,
+                            const nsAString& aType, const nsAString& aMedia);
+
+  void PreloadFont(const nsAString& aURL, const nsAString& aCrossOrigin,
+                   const nsAString& aMedia, const nsAString& aReferrerPolicy,
+                   const nsAString& aFetchPriority);
+
+  void PreloadFetch(const nsAString& aURL, const nsAString& aCrossOrigin,
+                    const nsAString& aMedia, const nsAString& aReferrerPolicy,
+                    const nsAString& aFetchPriority);
+
+  void SetSpeculationBase(const nsAString& aURL);
+
+  void UpdateReferrerInfoFromMeta(const nsAString& aMetaReferrer);
+
+  void AddSpeculationCSP(const nsAString& aCSP);
+
+  void AddBase(const nsAString& aURL);
+
+ private:
+  nsHtml5Parser* GetParser();
+
+  bool IsExternalViewSource();
+
+  already_AddRefed<nsIURI> ConvertIfNotPreloadedYet(const nsAString& aURL);
+
+  already_AddRefed<nsIURI> ConvertIfNotPreloadedYetAndMediaApplies(
+      const nsAString& aURL, const nsAString& aMedia);
+
+  bool MediaApplies(const nsAString& aMedia);
+
+  nsIURI* BaseURIForPreload();
+
+  bool ShouldPreloadURI(nsIURI* aURI);
+
+  bool ImageTypeSupports(const nsAString& aType);
+
+  ReferrerPolicy GetPreloadReferrerPolicy(const nsAString& aReferrerPolicy);
+
+  ReferrerPolicy GetPreloadReferrerPolicy(ReferrerPolicy aReferrerPolicy);
+};
+
+#endif  // nsHtml5TreeOpExecutor_h

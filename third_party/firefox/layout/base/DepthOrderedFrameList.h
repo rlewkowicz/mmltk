@@ -1,0 +1,70 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_DepthOrderedFrameList_h
+#define mozilla_DepthOrderedFrameList_h
+
+#include "mozilla/HashTable.h"
+#include "mozilla/ReverseIterator.h"
+#include "nsTArray.h"
+
+class nsIFrame;
+
+namespace mozilla {
+
+class DepthOrderedFrameList {
+ public:
+  void Add(nsIFrame* aFrame);
+
+  void Remove(nsIFrame* aFrame) {
+    mFrames.remove(aFrame);
+    mSortedFrames.ClearAndRetainStorage();
+  }
+
+  nsIFrame* PopShallowestRoot();
+
+  void Clear() {
+    mFrames.clear();
+    mSortedFrames.Clear();
+  }
+
+  bool Contains(nsIFrame* aFrame) const { return mFrames.has(aFrame); }
+
+  bool IsEmpty() const { return mFrames.empty(); }
+
+  bool FrameIsAncestorOfAnyElement(nsIFrame* aFrame) const;
+
+  auto IterFromShallowest() const {
+    EnsureSortedList();
+    return Reversed(mSortedFrames);
+  }
+
+ private:
+  HashMap<nsIFrame*, uint32_t> mFrames;
+
+  struct FrameAndDepth {
+    nsIFrame* mFrame;
+    uint32_t mDepth;
+
+    operator nsIFrame*() const { return mFrame; }
+
+    bool operator<(const FrameAndDepth& aOther) const {
+      return mDepth > aOther.mDepth;
+    }
+  };
+
+  mutable nsTArray<FrameAndDepth> mSortedFrames;
+
+  void EnsureSortedList() const {
+    if (mSortedFrames.IsEmpty() && !mFrames.empty()) {
+      BuildSortedList();
+    }
+  }
+
+  void BuildSortedList() const;
+};
+
+}  
+
+#endif

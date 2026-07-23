@@ -1,0 +1,152 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsDOMCSSDeclaration_h_
+#define nsDOMCSSDeclaration_h_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/URLExtraData.h"
+#include "nsAttrValue.h"
+#include "nsCOMPtr.h"
+#include "nsCompatibility.h"
+#include "nsICSSDeclaration.h"
+#include "nsCSSProps.h"
+
+class nsIPrincipal;
+struct JSContext;
+class JSObject;
+enum class AttrModType : uint8_t;  
+
+namespace mozilla {
+struct CSSPropertyId;
+enum class StyleCssRuleType : uint8_t;
+struct StyleLockedDeclarationBlock;
+struct DeclarationBlockMutationClosure;
+namespace css {
+class Loader;
+class Rule;
+}  
+namespace dom {
+class Document;
+class Element;
+}  
+
+struct MutationClosureData {
+  MutationClosureData() = default;
+
+  mozilla::dom::Element* mElement = nullptr;
+  Maybe<nsAttrValue> mOldValue;
+  AttrModType mModType{0};  
+  bool mWasCalled = false;
+  bool mShouldBeCalled = false;
+};
+
+}  
+
+class nsDOMCSSDeclaration : public nsICSSDeclaration {
+ public:
+  using Block = mozilla::StyleLockedDeclarationBlock;
+  static already_AddRefed<Block> EnsureBlockMutable(Block*);
+
+  NS_IMETHOD QueryInterface(REFNSIID aIID, void** aInstancePtr) override;
+
+  NS_IMETHOD_(MozExternalRefCountType) AddRef() override = 0;
+  NS_IMETHOD_(MozExternalRefCountType) Release() override = 0;
+
+  virtual void GetPropertyValue(const NonCustomCSSPropertyId aPropId,
+                                nsACString& aValue);
+
+  virtual void SetPropertyValue(const NonCustomCSSPropertyId aPropId,
+                                const nsACString& aValue,
+                                nsIPrincipal* aSubjectPrincipal,
+                                mozilla::ErrorResult& aRv);
+
+  virtual void SetPropertyTypedValue(const mozilla::CSSPropertyId& aPropId,
+                                     const nsACString& aValue,
+                                     mozilla::ErrorResult& aRv);
+
+  void GetCssText(nsACString& aCssText) override;
+  void SetCssText(const nsACString& aCssText, nsIPrincipal* aSubjectPrincipal,
+                  mozilla::ErrorResult& aRv) override;
+  void GetPropertyValue(const nsACString& propertyName,
+                        nsACString& _retval) override;
+  bool HasLonghandProperty(const nsACString& propertyName) override;
+  void RemoveProperty(const nsACString& propertyName, nsACString& _retval,
+                      mozilla::ErrorResult& aRv) override;
+  void GetPropertyPriority(const nsACString& propertyName,
+                           nsACString& aPriority) override;
+  void SetProperty(const nsACString& propertyName, const nsACString& value,
+                   const nsACString& priority, nsIPrincipal* aSubjectPrincipal,
+                   mozilla::ErrorResult& aRv) override;
+  using nsICSSDeclaration::SetProperty;
+  uint32_t Length() override;
+
+  virtual void IndexedGetter(uint32_t aIndex, bool& aFound,
+                             nsACString& aPropName) override;
+
+  JSObject* WrapObject(JSContext*, JS::Handle<JSObject*> aGivenProto) override;
+
+  struct MOZ_STACK_CLASS ParsingEnvironment {
+    RefPtr<mozilla::URLExtraData> mUrlExtraData;
+    nsCompatibility mCompatMode = eCompatibility_FullStandards;
+    mozilla::css::Loader* mLoader = nullptr;
+    mozilla::StyleCssRuleType mRuleType{1 };
+  };
+
+ protected:
+  enum class Operation {
+    Read,
+
+    Modify,
+
+    RemoveProperty,
+  };
+
+  virtual Block* GetOrCreateCSSDeclaration(Operation aOperation,
+                                           Block** aCreated) = 0;
+
+  virtual nsresult SetCSSDeclaration(
+      Block* aDecl, mozilla::MutationClosureData* aClosureData) = 0;
+  virtual mozilla::dom::Document* DocToUpdate() { return nullptr; }
+
+  virtual ParsingEnvironment GetParsingEnvironment(
+      nsIPrincipal* aSubjectPrincipal = nullptr) const = 0;
+
+  static ParsingEnvironment GetParsingEnvironmentForRule(
+      const mozilla::css::Rule* aRule, mozilla::StyleCssRuleType);
+
+  nsresult ParsePropertyValue(const NonCustomCSSPropertyId aPropId,
+                              const nsACString& aPropValue, bool aIsImportant,
+                              nsIPrincipal* aSubjectPrincipal);
+
+  nsresult ParseCustomPropertyValue(const nsACString& aPropertyName,
+                                    const nsACString& aPropValue,
+                                    bool aIsImportant,
+                                    nsIPrincipal* aSubjectPrincipal);
+
+  nsresult SetPropertyTypedValue(const mozilla::CSSPropertyId& aPropId,
+                                 const nsACString& aPropValue);
+
+  void RemovePropertyInternal(NonCustomCSSPropertyId aPropId,
+                              mozilla::ErrorResult& aRv);
+  void RemovePropertyInternal(const nsACString& aPropert,
+                              mozilla::ErrorResult& aRv);
+
+  virtual void GetPropertyChangeClosure(
+      mozilla::DeclarationBlockMutationClosure* aClosure,
+      mozilla::MutationClosureData* aClosureData) {}
+
+ protected:
+  virtual ~nsDOMCSSDeclaration();
+
+ private:
+  template <typename ServoFunc>
+  inline nsresult ModifyDeclaration(nsIPrincipal* aSubjectPrincipal,
+                                    mozilla::MutationClosureData* aClosureData,
+                                    ServoFunc aServoFunc);
+};
+
+#endif  // nsDOMCSSDeclaration_h_

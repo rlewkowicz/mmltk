@@ -1,0 +1,203 @@
+// Copyright 2018 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_CONTAINER_NODE_HASH_SET_H_
+#define ABSL_CONTAINER_NODE_HASH_SET_H_
+
+#include <cstddef>
+#include <memory>
+#include <type_traits>
+
+#include "absl/algorithm/container.h"
+#include "absl/base/attributes.h"
+#include "absl/container/hash_container_defaults.h"
+#include "absl/container/internal/container_memory.h"
+#include "absl/container/internal/node_slot_policy.h"
+#include "absl/container/internal/raw_hash_set.h"  // IWYU pragma: export
+#include "absl/memory/memory.h"
+#include "absl/meta/type_traits.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace container_internal {
+template <typename T>
+struct NodeHashSetPolicy;
+}  
+
+template <
+    class T,
+    class Hash = typename container_internal::NodeHashSetPolicy<T>::DefaultHash,
+    class Eq = typename container_internal::NodeHashSetPolicy<T>::DefaultEq,
+    class Alloc =
+        typename container_internal::NodeHashSetPolicy<T>::DefaultAlloc>
+class ABSL_ATTRIBUTE_OWNER node_hash_set
+    : public absl::container_internal::InstantiateRawHashSet<
+          absl::container_internal::NodeHashSetPolicy<T>, Hash, Eq,
+          Alloc>::type {
+  using Base = typename node_hash_set::raw_hash_set;
+
+ public:
+  node_hash_set() {}
+  using Base::Base;
+
+  using Base::begin;
+
+  using Base::cbegin;
+
+  using Base::cend;
+
+  using Base::end;
+
+  using Base::capacity;
+
+  using Base::empty;
+
+  using Base::max_size;
+
+  using Base::size;
+
+  using Base::clear;
+
+  using Base::erase;
+
+  using Base::insert;
+
+  using Base::emplace;
+
+  using Base::emplace_hint;
+
+  using Base::extract;
+
+  using Base::merge;
+
+  using Base::swap;
+
+  using Base::rehash;
+
+  using Base::reserve;
+
+  using Base::contains;
+
+  using Base::count;
+
+  using Base::equal_range;
+
+  using Base::find;
+
+  using Base::bucket_count;
+
+  using Base::load_factor;
+
+  using Base::max_load_factor;
+
+  using Base::get_allocator;
+
+  using Base::hash_function;
+
+  using Base::key_eq;
+};
+
+template <typename T, typename H, typename E, typename A, typename Predicate>
+typename node_hash_set<T, H, E, A>::size_type erase_if(
+    node_hash_set<T, H, E, A>& c, Predicate pred) {
+  return container_internal::EraseIf(pred, &c);
+}
+
+template <typename T, typename H, typename E, typename A>
+void swap(node_hash_set<T, H, E, A>& x,
+          node_hash_set<T, H, E, A>& y) noexcept(noexcept(x.swap(y))) {
+  return x.swap(y);
+}
+
+namespace container_internal {
+
+template <typename T, typename H, typename E, typename A, typename Function>
+std::decay_t<Function> c_for_each_fast(const node_hash_set<T, H, E, A>& c,
+                                       Function&& f) {
+  container_internal::ForEach(f, &c);
+  return f;
+}
+template <typename T, typename H, typename E, typename A, typename Function>
+std::decay_t<Function> c_for_each_fast(node_hash_set<T, H, E, A>& c,
+                                       Function&& f) {
+  container_internal::ForEach(f, &c);
+  return f;
+}
+template <typename T, typename H, typename E, typename A, typename Function>
+std::decay_t<Function> c_for_each_fast(node_hash_set<T, H, E, A>&& c,
+                                       Function&& f) {
+  container_internal::ForEach(f, &c);
+  return f;
+}
+
+}  
+
+namespace container_internal {
+
+template <class T>
+struct NodeHashSetPolicy
+    : absl::container_internal::node_slot_policy<T&, NodeHashSetPolicy<T>> {
+  using key_type = T;
+  using init_type = T;
+  using constant_iterators = std::true_type;
+
+  using DefaultHash = DefaultHashContainerHash<T>;
+  using DefaultEq = DefaultHashContainerEq<T>;
+  using DefaultAlloc = std::allocator<T>;
+
+  template <class Allocator, class... Args>
+  static T* new_element(Allocator* alloc, Args&&... args) {
+    using ValueAlloc =
+        typename std::allocator_traits<Allocator>::template rebind_alloc<T>;
+    ValueAlloc value_alloc(*alloc);
+    T* res = std::allocator_traits<ValueAlloc>::allocate(value_alloc, 1);
+    std::allocator_traits<ValueAlloc>::construct(value_alloc, res,
+                                                 std::forward<Args>(args)...);
+    return res;
+  }
+
+  template <class Allocator>
+  static void delete_element(Allocator* alloc, T* elem) {
+    using ValueAlloc =
+        typename std::allocator_traits<Allocator>::template rebind_alloc<T>;
+    ValueAlloc value_alloc(*alloc);
+    std::allocator_traits<ValueAlloc>::destroy(value_alloc, elem);
+    std::allocator_traits<ValueAlloc>::deallocate(value_alloc, elem, 1);
+  }
+
+  template <class F, class... Args>
+  static decltype(absl::container_internal::DecomposeValue(
+      std::declval<F>(), std::declval<Args>()...))
+  apply(F&& f, Args&&... args) {
+    return absl::container_internal::DecomposeValue(
+        std::forward<F>(f), std::forward<Args>(args)...);
+  }
+
+  static size_t element_space_used(const T*) { return sizeof(T); }
+
+  template <class Hash, bool kIsDefault>
+  static constexpr HashSlotFn get_hash_slot_fn() {
+    return &TypeErasedDerefAndApplyToSlotFn<Hash, T, kIsDefault>;
+  }
+};
+}  
+
+namespace container_algorithm_internal {
+
+template <class Key, class Hash, class KeyEqual, class Allocator>
+struct IsUnorderedContainer<absl::node_hash_set<Key, Hash, KeyEqual, Allocator>>
+    : std::true_type {};
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_CONTAINER_NODE_HASH_SET_H_

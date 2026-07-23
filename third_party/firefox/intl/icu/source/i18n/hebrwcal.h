@@ -1,0 +1,122 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+* Copyright (C) 2003-2013, International Business Machines Corporation
+* and others. All Rights Reserved.
+******************************************************************************
+*
+* File HEBRWCAL.H
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   05/13/2003  srl          copied from gregocal.h
+*   11/26/2003  srl          copied from buddhcal.h
+******************************************************************************
+*/
+
+#ifndef HEBRWCAL_H
+#define HEBRWCAL_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/calendar.h"
+#include "unicode/gregocal.h"
+
+U_NAMESPACE_BEGIN
+
+class U_I18N_API HebrewCalendar : public Calendar {
+public:
+  enum Month {
+      TISHRI,
+      HESHVAN,
+      KISLEV,
+
+      TEVET,
+
+      SHEVAT,
+
+      ADAR_1,
+
+      ADAR,
+
+      NISAN,
+
+      IYAR,
+
+      SIVAN,
+
+      TAMUZ,
+
+      AV,
+
+      ELUL
+    };
+
+    HebrewCalendar(const Locale& aLocale, UErrorCode& success);
+
+
+    virtual ~HebrewCalendar();
+
+    HebrewCalendar(const HebrewCalendar& source);
+
+    virtual HebrewCalendar* clone() const override;
+    
+public:
+    virtual UClassID getDynamicClassID() const override;
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual const char * getType() const override;
+
+
+ public:
+    virtual void add(UCalendarDateFields field, int32_t amount, UErrorCode& status) override;
+    virtual void add(EDateFields field, int32_t amount, UErrorCode& status) override;
+
+
+    virtual void roll(UCalendarDateFields field, int32_t amount, UErrorCode& status) override;
+
+    virtual void roll(EDateFields field, int32_t amount, UErrorCode& status) override;
+
+    static UBool isLeapYear(int32_t year) ;
+
+ protected:
+    int32_t getRelatedYearDifference() const override;
+
+    virtual int32_t handleGetLimit(UCalendarDateFields field, ELimitType limitType) const override;
+
+    virtual int32_t handleGetMonthLength(int32_t extendedYear, int32_t month, UErrorCode& status) const override;
+
+    virtual int32_t handleGetYearLength(int32_t eyear, UErrorCode& status) const override;
+
+    virtual void handleComputeFields(int32_t julianDay, UErrorCode &status) override;
+    virtual int32_t handleGetExtendedYear(UErrorCode& status) override;
+    virtual int64_t handleComputeMonthStart(int32_t eyear, int32_t month,
+                                                   UBool useMonth, UErrorCode& status) const override;
+
+
+    virtual void validateField(UCalendarDateFields field, UErrorCode &status) override;
+
+ protected:
+  DECLARE_OVERRIDE_SYSTEM_DEFAULT_CENTURY
+
+ public:
+  virtual bool inTemporalLeapYear(UErrorCode& status) const override;
+
+  virtual const char* getTemporalMonthCode(UErrorCode& status) const override;
+
+  virtual void setTemporalMonthCode(const char* code, UErrorCode& status ) override;
+
+ protected:
+   virtual int32_t internalGetMonth(UErrorCode& status) const override;
+};
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif 
+

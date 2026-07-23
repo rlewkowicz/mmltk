@@ -1,0 +1,44 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+#ifndef ISO8601CAL_H
+#define ISO8601CAL_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/calendar.h"
+#include "unicode/gregocal.h"
+#include "unicode/timezone.h"
+
+U_NAMESPACE_BEGIN
+
+class ISO8601Calendar : public GregorianCalendar {
+ public:
+
+  ISO8601Calendar(const Locale& aLocale, UErrorCode &success);
+
+  ISO8601Calendar(const ISO8601Calendar& other) = default;
+
+  virtual ~ISO8601Calendar();
+
+  virtual ISO8601Calendar* clone() const override;
+
+ public: 
+  virtual UClassID getDynamicClassID() const override;
+
+  U_I18N_API static UClassID U_EXPORT2 getStaticClassID();
+
+  virtual const char * getType() const override;
+
+ protected:
+  virtual bool isEra0CountingBackward() const override { return false; }
+
+ private:
+ 
+  ISO8601Calendar(); 
+};
+
+U_NAMESPACE_END
+
+#endif
+#endif

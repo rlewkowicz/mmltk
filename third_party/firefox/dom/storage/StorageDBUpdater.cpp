@@ -1,0 +1,455 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "LocalStorageManager.h"
+#include "StorageUtils.h"
+#include "mozIStorageBindingParams.h"
+#include "mozIStorageConnection.h"
+#include "mozIStorageFunction.h"
+#include "mozIStorageValueArray.h"
+#include "mozStorageHelper.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/StorageOriginAttributes.h"
+#include "mozilla/Tokenizer.h"
+#include "nsVariant.h"
+
+#define CURRENT_SCHEMA_VERSION 2
+
+namespace mozilla::dom {
+
+using namespace StorageUtils;
+
+namespace {
+
+class nsReverseStringSQLFunction final : public mozIStorageFunction {
+  ~nsReverseStringSQLFunction() = default;
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+};
+
+NS_IMPL_ISUPPORTS(nsReverseStringSQLFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+nsReverseStringSQLFunction::OnFunctionCall(
+    mozIStorageValueArray* aFunctionArguments, nsIVariant** aResult) {
+  nsresult rv;
+
+  nsAutoCString stringToReverse;
+  rv = aFunctionArguments->GetUTF8String(0, stringToReverse);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString result;
+  ReverseString(stringToReverse, result);
+
+  RefPtr<nsVariant> outVar(new nsVariant());
+  rv = outVar->SetAsAUTF8String(result);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  outVar.forget(aResult);
+  return NS_OK;
+}
+
+
+class ExtractOriginData : protected mozilla::Tokenizer {
+ public:
+  ExtractOriginData(const nsACString& scope, nsACString& suffix,
+                    nsACString& origin)
+      : mozilla::Tokenizer(scope) {
+    using mozilla::OriginAttributes;
+
+    suffix.Truncate();
+    origin.Assign(scope);
+
+    uint32_t appId;
+    if (!ReadInteger(&appId)) {
+      return;
+    }
+
+    if (!CheckChar(':')) {
+      return;
+    }
+
+    nsDependentCSubstring isolatedBrowserFlag;
+    if (!ReadWord(isolatedBrowserFlag)) {
+      return;
+    }
+
+    bool inIsolatedMozBrowser = isolatedBrowserFlag == "t";
+    bool notInIsolatedBrowser = isolatedBrowserFlag == "f";
+    if (!inIsolatedMozBrowser && !notInIsolatedBrowser) {
+      return;
+    }
+
+    if (!CheckChar(':')) {
+      return;
+    }
+
+
+    Record();
+    if (CheckChar('^')) {
+      Token t;
+      while (Next(t)) {
+        if (t.Equals(Token::Char(':'))) {
+          Claim(suffix);
+          break;
+        }
+      }
+    } else {
+      StorageOriginAttributes originAttributes(inIsolatedMozBrowser);
+      originAttributes.CreateSuffix(suffix);
+    }
+
+    origin.Assign(Substring(mCursor, mEnd));
+  }
+};
+
+class GetOriginParticular final : public mozIStorageFunction {
+ public:
+  enum EParticular { ORIGIN_ATTRIBUTES_SUFFIX, ORIGIN_KEY };
+
+  explicit GetOriginParticular(EParticular aParticular)
+      : mParticular(aParticular) {}
+
+  GetOriginParticular() = delete;
+
+ private:
+  ~GetOriginParticular() = default;
+
+  EParticular mParticular;
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+};
+
+NS_IMPL_ISUPPORTS(GetOriginParticular, mozIStorageFunction)
+
+NS_IMETHODIMP
+GetOriginParticular::OnFunctionCall(mozIStorageValueArray* aFunctionArguments,
+                                    nsIVariant** aResult) {
+  nsresult rv;
+
+  nsAutoCString scope;
+  rv = aFunctionArguments->GetUTF8String(0, scope);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString suffix, origin;
+  ExtractOriginData extractor(scope, suffix, origin);
+
+  nsCOMPtr<nsIWritableVariant> outVar(new nsVariant());
+
+  switch (mParticular) {
+    case EParticular::ORIGIN_ATTRIBUTES_SUFFIX:
+      rv = outVar->SetAsAUTF8String(suffix);
+      break;
+    case EParticular::ORIGIN_KEY:
+      rv = outVar->SetAsAUTF8String(origin);
+      break;
+  }
+
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  outVar.forget(aResult);
+  return NS_OK;
+}
+
+class StripOriginAddonId final : public mozIStorageFunction {
+ public:
+  explicit StripOriginAddonId() = default;
+
+ private:
+  ~StripOriginAddonId() = default;
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+};
+
+NS_IMPL_ISUPPORTS(StripOriginAddonId, mozIStorageFunction)
+
+NS_IMETHODIMP
+StripOriginAddonId::OnFunctionCall(mozIStorageValueArray* aFunctionArguments,
+                                   nsIVariant** aResult) {
+  nsresult rv;
+
+  nsAutoCString suffix;
+  rv = aFunctionArguments->GetUTF8String(0, suffix);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  OriginAttributes oa;
+  bool ok = oa.PopulateFromSuffix(suffix);
+  NS_ENSURE_TRUE(ok, NS_ERROR_FAILURE);
+
+  nsAutoCString newSuffix;
+  oa.CreateSuffix(newSuffix);
+
+  nsCOMPtr<nsIWritableVariant> outVar = new nsVariant();
+  rv = outVar->SetAsAUTF8String(newSuffix);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  outVar.forget(aResult);
+  return NS_OK;
+}
+
+nsresult CreateSchema1Tables(mozIStorageConnection* aWorkerConnection) {
+  nsresult rv;
+
+  rv = aWorkerConnection->ExecuteSimpleSQL(nsLiteralCString(
+      "CREATE TABLE IF NOT EXISTS webappsstore2 ("
+      "originAttributes TEXT, "
+      "originKey TEXT, "
+      "scope TEXT, "  
+      "key TEXT, "
+      "value TEXT)"));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = aWorkerConnection->ExecuteSimpleSQL(
+      nsLiteralCString("CREATE UNIQUE INDEX IF NOT EXISTS origin_key_index"
+                       " ON webappsstore2(originAttributes, originKey, key)"));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult TablesExist(mozIStorageConnection* aWorkerConnection,
+                     bool* aWebappsstore2Exists, bool* aWebappsstoreExists,
+                     bool* aMoz_webappsstoreExists) {
+  nsresult rv =
+      aWorkerConnection->TableExists("webappsstore2"_ns, aWebappsstore2Exists);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = aWorkerConnection->TableExists("webappsstore"_ns, aWebappsstoreExists);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = aWorkerConnection->TableExists("moz_webappsstore"_ns,
+                                      aMoz_webappsstoreExists);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult CreateCurrentSchemaOnEmptyTableInternal(
+    mozIStorageConnection* aWorkerConnection) {
+  nsresult rv = CreateSchema1Tables(aWorkerConnection);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = aWorkerConnection->SetSchemaVersion(CURRENT_SCHEMA_VERSION);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+}  
+
+namespace StorageDBUpdater {
+
+nsresult CreateCurrentSchema(mozIStorageConnection* aConnection) {
+  mozStorageTransaction transaction(aConnection, false);
+
+  nsresult rv = transaction.Start();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  {
+    int32_t schemaVer;
+    nsresult rv = aConnection->GetSchemaVersion(&schemaVer);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    MOZ_DIAGNOSTIC_ASSERT(0 == schemaVer);
+
+    bool webappsstore2Exists, webappsstoreExists, moz_webappsstoreExists;
+    rv = TablesExist(aConnection, &webappsstore2Exists, &webappsstoreExists,
+                     &moz_webappsstoreExists);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    MOZ_DIAGNOSTIC_ASSERT(!webappsstore2Exists && !webappsstoreExists &&
+                          !moz_webappsstoreExists);
+  }
+#endif
+
+  rv = CreateCurrentSchemaOnEmptyTableInternal(aConnection);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = transaction.Commit();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult Update(mozIStorageConnection* aWorkerConnection) {
+  mozStorageTransaction transaction(aWorkerConnection, false);
+
+  nsresult rv = transaction.Start();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  bool doVacuum = false;
+
+  int32_t schemaVer;
+  rv = aWorkerConnection->GetSchemaVersion(&schemaVer);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (schemaVer >= 1) {
+    bool schema0IndexExists;
+    rv = aWorkerConnection->IndexExists("scope_key_index"_ns,
+                                        &schema0IndexExists);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    if (schema0IndexExists) {
+      schemaVer = 0;
+    }
+  }
+
+  switch (schemaVer) {
+    case 0: {
+      bool webappsstore2Exists, webappsstoreExists, moz_webappsstoreExists;
+      rv = TablesExist(aWorkerConnection, &webappsstore2Exists,
+                       &webappsstoreExists, &moz_webappsstoreExists);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      if (!webappsstore2Exists && !webappsstoreExists &&
+          !moz_webappsstoreExists) {
+
+
+        rv = CreateCurrentSchemaOnEmptyTableInternal(aWorkerConnection);
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        break;
+      }
+
+      doVacuum = true;
+
+      rv = aWorkerConnection->ExecuteSimpleSQL(
+          nsLiteralCString("CREATE TABLE IF NOT EXISTS webappsstore2 ("
+                           "scope TEXT, "
+                           "key TEXT, "
+                           "value TEXT, "
+                           "secure INTEGER, "
+                           "owner TEXT)"));
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      rv = aWorkerConnection->ExecuteSimpleSQL(
+          nsLiteralCString("CREATE UNIQUE INDEX IF NOT EXISTS scope_key_index"
+                           " ON webappsstore2(scope, key)"));
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      nsCOMPtr<mozIStorageFunction> function1(new nsReverseStringSQLFunction());
+      NS_ENSURE_TRUE(function1, NS_ERROR_OUT_OF_MEMORY);
+
+      rv = aWorkerConnection->CreateFunction("REVERSESTRING"_ns, 1, function1);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      if (webappsstoreExists) {
+        rv = aWorkerConnection->ExecuteSimpleSQL(nsLiteralCString(
+            "INSERT OR IGNORE INTO "
+            "webappsstore2(scope, key, value, secure, owner) "
+            "SELECT REVERSESTRING(domain) || '.:', key, value, secure, owner "
+            "FROM webappsstore"));
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        rv = aWorkerConnection->ExecuteSimpleSQL("DROP TABLE webappsstore"_ns);
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+      if (moz_webappsstoreExists) {
+        rv = aWorkerConnection->ExecuteSimpleSQL(nsLiteralCString(
+            "INSERT OR IGNORE INTO "
+            "webappsstore2(scope, key, value, secure, owner) "
+            "SELECT REVERSESTRING(domain) || '.:', key, value, secure, domain "
+            "FROM moz_webappsstore"));
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        rv = aWorkerConnection->ExecuteSimpleSQL(
+            "DROP TABLE moz_webappsstore"_ns);
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+      aWorkerConnection->RemoveFunction("REVERSESTRING"_ns);
+
+      rv = aWorkerConnection->ExecuteSimpleSQL(nsLiteralCString(
+          "DROP INDEX IF EXISTS webappsstore2.origin_key_index"));
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      rv = aWorkerConnection->ExecuteSimpleSQL(nsLiteralCString(
+          "DROP INDEX IF EXISTS webappsstore2.scope_key_index"));
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      rv = aWorkerConnection->ExecuteSimpleSQL(nsLiteralCString(
+          "ALTER TABLE webappsstore2 RENAME TO webappsstore2_old"));
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      nsCOMPtr<mozIStorageFunction> oaSuffixFunc(new GetOriginParticular(
+          GetOriginParticular::ORIGIN_ATTRIBUTES_SUFFIX));
+      rv = aWorkerConnection->CreateFunction("GET_ORIGIN_SUFFIX"_ns, 1,
+                                             oaSuffixFunc);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      nsCOMPtr<mozIStorageFunction> originKeyFunc(
+          new GetOriginParticular(GetOriginParticular::ORIGIN_KEY));
+      rv = aWorkerConnection->CreateFunction("GET_ORIGIN_KEY"_ns, 1,
+                                             originKeyFunc);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      rv = CreateSchema1Tables(aWorkerConnection);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      rv = aWorkerConnection->ExecuteSimpleSQL(nsLiteralCString(
+          "INSERT OR IGNORE INTO "
+          "webappsstore2 (originAttributes, originKey, scope, key, value) "
+          "SELECT GET_ORIGIN_SUFFIX(scope), GET_ORIGIN_KEY(scope), scope, key, "
+          "value "
+          "FROM webappsstore2_old"));
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      rv = aWorkerConnection->ExecuteSimpleSQL(
+          "DROP TABLE webappsstore2_old"_ns);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      aWorkerConnection->RemoveFunction("GET_ORIGIN_SUFFIX"_ns);
+      aWorkerConnection->RemoveFunction("GET_ORIGIN_KEY"_ns);
+
+      rv = aWorkerConnection->SetSchemaVersion(1);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      [[fallthrough]];
+    }
+    case 1: {
+      nsCOMPtr<mozIStorageFunction> oaStripAddonId(new StripOriginAddonId());
+      rv = aWorkerConnection->CreateFunction("STRIP_ADDON_ID"_ns, 1,
+                                             oaStripAddonId);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      rv = aWorkerConnection->ExecuteSimpleSQL(nsLiteralCString(
+          "UPDATE webappsstore2 "
+          "SET originAttributes = STRIP_ADDON_ID(originAttributes) "
+          "WHERE originAttributes LIKE '^%'"));
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      aWorkerConnection->RemoveFunction("STRIP_ADDON_ID"_ns);
+
+      rv = aWorkerConnection->SetSchemaVersion(2);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      [[fallthrough]];
+    }
+    case CURRENT_SCHEMA_VERSION:
+      rv = CreateSchema1Tables(aWorkerConnection);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      break;
+
+    default:
+      MOZ_ASSERT(false);
+      break;
+  }  
+
+  rv = transaction.Commit();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (doVacuum) {
+    rv = aWorkerConnection->ExecuteSimpleSQL("VACUUM"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  return NS_OK;
+}
+
+}  
+}  

@@ -1,0 +1,101 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*****************************************************************************************
+* Copyright (C) 2010-2012,2015 International Business Machines
+* Corporation and others. All Rights Reserved.
+*****************************************************************************************
+*/
+
+#ifndef UDATEINTERVALFORMAT_H
+#define UDATEINTERVALFORMAT_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/ucal.h"
+#include "unicode/umisc.h"
+#include "unicode/uformattedvalue.h"
+#include "unicode/udisplaycontext.h"
+
+#if U_SHOW_CPLUSPLUS_API
+#include "unicode/localpointer.h"
+#endif   // U_SHOW_CPLUSPLUS_API
+
+
+struct UDateIntervalFormat;
+typedef struct UDateIntervalFormat UDateIntervalFormat;  
+
+struct UFormattedDateInterval;
+typedef struct UFormattedDateInterval UFormattedDateInterval;
+
+U_CAPI UDateIntervalFormat* U_EXPORT2
+udtitvfmt_open(const char*  locale,
+              const UChar* skeleton,
+              int32_t      skeletonLength,
+              const UChar* tzID,
+              int32_t      tzIDLength,
+              UErrorCode*  status);
+
+U_CAPI void U_EXPORT2
+udtitvfmt_close(UDateIntervalFormat *formatter);
+
+U_CAPI UFormattedDateInterval* U_EXPORT2
+udtitvfmt_openResult(UErrorCode* ec);
+
+U_CAPI const UFormattedValue* U_EXPORT2
+udtitvfmt_resultAsValue(const UFormattedDateInterval* uresult, UErrorCode* ec);
+
+U_CAPI void U_EXPORT2
+udtitvfmt_closeResult(UFormattedDateInterval* uresult);
+
+
+#if U_SHOW_CPLUSPLUS_API
+
+U_NAMESPACE_BEGIN
+
+U_DEFINE_LOCAL_OPEN_POINTER(LocalUDateIntervalFormatPointer, UDateIntervalFormat, udtitvfmt_close);
+
+U_DEFINE_LOCAL_OPEN_POINTER(LocalUFormattedDateIntervalPointer, UFormattedDateInterval, udtitvfmt_closeResult);
+
+U_NAMESPACE_END
+
+#endif
+
+
+U_CAPI int32_t U_EXPORT2
+udtitvfmt_format(const UDateIntervalFormat* formatter,
+                UDate           fromDate,
+                UDate           toDate,
+                UChar*          result,
+                int32_t         resultCapacity,
+                UFieldPosition* position,
+                UErrorCode*     status);
+
+
+U_CAPI void U_EXPORT2
+udtitvfmt_formatToResult(
+                const UDateIntervalFormat* formatter,
+                UDate           fromDate,
+                UDate           toDate,
+                UFormattedDateInterval* result,
+                UErrorCode*     status);
+
+
+U_CAPI void U_EXPORT2
+udtitvfmt_formatCalendarToResult(
+                const UDateIntervalFormat* formatter,
+                UCalendar*      fromCalendar,
+                UCalendar*      toCalendar,
+                UFormattedDateInterval* result,
+                UErrorCode*     status);
+
+U_CAPI void U_EXPORT2
+udtitvfmt_setContext(UDateIntervalFormat* formatter, UDisplayContext value, UErrorCode* status);
+
+U_CAPI UDisplayContext U_EXPORT2
+udtitvfmt_getContext(const UDateIntervalFormat* formatter, UDisplayContextType type, UErrorCode* status);
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif

@@ -1,0 +1,282 @@
+// Copyright 2018 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_CONTAINER_BTREE_SET_H_
+#define ABSL_CONTAINER_BTREE_SET_H_
+
+#include <functional>
+#include <memory>
+#include <type_traits>
+#include <utility>
+
+#include "absl/base/attributes.h"
+#include "absl/container/internal/btree.h"  // IWYU pragma: export
+#include "absl/container/internal/btree_container.h"  // IWYU pragma: export
+#include "absl/container/internal/common.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+namespace container_internal {
+
+template <typename Key>
+struct set_slot_policy;
+
+template <typename Key, typename...Params>
+struct set_params_impl;
+
+template <typename Key>
+struct btree_set_defaults {
+  using Compare = std::less<Key>;
+  using Alloc = std::allocator<Key>;
+  using TargetNodeSize = std::integral_constant<int, 256>;
+  using IsMulti = std::false_type;
+};
+
+template <typename Key, typename Compare, typename Alloc, int TargetNodeSize,
+          bool IsMulti>
+using set_params = typename ApplyWithoutDefaultSuffix<
+    set_params_impl,
+    TypeList<void, typename btree_set_defaults<Key>::Compare,
+             typename btree_set_defaults<Key>::Alloc,
+             typename btree_set_defaults<Key>::TargetNodeSize,
+             typename btree_set_defaults<Key>::IsMulti>,
+    TypeList<Key, Compare, Alloc, std::integral_constant<int, TargetNodeSize>,
+             std::integral_constant<bool, IsMulti>>>::type;
+
+}  
+
+template <typename Key, typename Compare = std::less<Key>,
+          typename Alloc = std::allocator<Key>>
+class ABSL_ATTRIBUTE_OWNER btree_set
+    : public container_internal::btree_set_container<
+          container_internal::btree<container_internal::set_params<
+              Key, Compare, Alloc, 256,
+              false>>> {
+  using Base = typename btree_set::btree_set_container;
+
+ public:
+  btree_set() {}
+  using Base::Base;
+
+  using Base::begin;
+
+  using Base::cbegin;
+
+  using Base::end;
+
+  using Base::cend;
+
+  using Base::empty;
+
+  using Base::max_size;
+
+  using Base::size;
+
+  using Base::clear;
+
+  using Base::erase;
+
+  using Base::insert;
+
+  using Base::emplace;
+
+  using Base::emplace_hint;
+
+  using Base::extract;
+
+  using Base::extract_and_get_next;
+
+  using Base::merge;
+
+  using Base::swap;
+
+  using Base::contains;
+
+  using Base::count;
+
+  using Base::equal_range;
+
+  using Base::find;
+
+  using Base::lower_bound;
+
+  using Base::upper_bound;
+
+  using Base::get_allocator;
+
+  using Base::key_comp;
+
+  using Base::value_comp;
+};
+
+template <typename K, typename C, typename A>
+void swap(btree_set<K, C, A> &x, btree_set<K, C, A> &y) {
+  return x.swap(y);
+}
+
+template <typename K, typename C, typename A, typename Pred>
+typename btree_set<K, C, A>::size_type erase_if(btree_set<K, C, A> &set,
+                                                Pred pred) {
+  return container_internal::btree_access::erase_if(set, std::move(pred));
+}
+
+template <typename Key, typename Compare = std::less<Key>,
+          typename Alloc = std::allocator<Key>>
+class ABSL_ATTRIBUTE_OWNER btree_multiset
+    : public container_internal::btree_multiset_container<
+          container_internal::btree<container_internal::set_params<
+              Key, Compare, Alloc, 256,
+              true>>> {
+  using Base = typename btree_multiset::btree_multiset_container;
+
+ public:
+  btree_multiset() {}
+  using Base::Base;
+
+  using Base::begin;
+
+  using Base::cbegin;
+
+  using Base::end;
+
+  using Base::cend;
+
+  using Base::empty;
+
+  using Base::max_size;
+
+  using Base::size;
+
+  using Base::clear;
+
+  using Base::erase;
+
+  using Base::insert;
+
+  using Base::emplace;
+
+  using Base::emplace_hint;
+
+  using Base::extract;
+
+  using Base::extract_and_get_next;
+
+  using Base::merge;
+
+  using Base::swap;
+
+  using Base::contains;
+
+  using Base::count;
+
+  using Base::equal_range;
+
+  using Base::find;
+
+  using Base::lower_bound;
+
+  using Base::upper_bound;
+
+  using Base::get_allocator;
+
+  using Base::key_comp;
+
+  using Base::value_comp;
+};
+
+template <typename K, typename C, typename A>
+void swap(btree_multiset<K, C, A> &x, btree_multiset<K, C, A> &y) {
+  return x.swap(y);
+}
+
+template <typename K, typename C, typename A, typename Pred>
+typename btree_multiset<K, C, A>::size_type erase_if(
+   btree_multiset<K, C, A> & set, Pred pred) {
+  return container_internal::btree_access::erase_if(set, std::move(pred));
+}
+
+namespace container_internal {
+
+template <typename Key>
+struct set_slot_policy {
+  using slot_type = Key;
+  using value_type = Key;
+  using mutable_value_type = Key;
+
+  static value_type &element(slot_type *slot) { return *slot; }
+  static const value_type &element(const slot_type *slot) { return *slot; }
+
+  template <typename Alloc, class... Args>
+  static void construct(Alloc *alloc, slot_type *slot, Args &&...args) {
+    std::allocator_traits<Alloc>::construct(*alloc, slot,
+                                            std::forward<Args>(args)...);
+  }
+
+  template <typename Alloc>
+  static void construct(Alloc *alloc, slot_type *slot, slot_type *other) {
+    std::allocator_traits<Alloc>::construct(*alloc, slot, std::move(*other));
+  }
+
+  template <typename Alloc>
+  static void construct(Alloc *alloc, slot_type *slot, const slot_type *other) {
+    std::allocator_traits<Alloc>::construct(*alloc, slot, *other);
+  }
+
+  template <typename Alloc>
+  static void destroy(Alloc *alloc, slot_type *slot) {
+    std::allocator_traits<Alloc>::destroy(*alloc, slot);
+  }
+};
+
+template <typename Key, typename... Params>
+struct set_params_impl
+    : common_params<
+          Key,
+          GetFromListOr<typename btree_set_defaults<Key>::Compare, 0,
+                        Params...>,
+          GetFromListOr<typename btree_set_defaults<Key>::Alloc, 1, Params...>,
+          GetFromListOr<typename btree_set_defaults<Key>::TargetNodeSize, 2,
+                        Params...>::value,
+          GetFromListOr<typename btree_set_defaults<Key>::IsMulti, 3,
+                        Params...>::value,
+          false, set_slot_policy<Key>> {
+  using value_type = Key;
+  using slot_type = typename set_params_impl::common_params::slot_type;
+
+  static_assert(
+      std::is_same_v<
+          set_params<
+              Key,
+              GetFromListOr<typename btree_set_defaults<Key>::Compare, 0,
+                            Params...>,
+              GetFromListOr<typename btree_set_defaults<Key>::Alloc, 1,
+                            Params...>,
+              GetFromListOr<typename btree_set_defaults<Key>::TargetNodeSize, 2,
+                            Params...>::value,
+              GetFromListOr<typename btree_set_defaults<Key>::IsMulti, 3,
+                            Params...>::value>,
+          set_params_impl>);
+
+  template <typename V>
+  static const V &key(const V &value) {
+    return value;
+  }
+  static const Key &key(const slot_type *slot) { return *slot; }
+  static const Key &key(slot_type *slot) { return *slot; }
+};
+
+}  
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_CONTAINER_BTREE_SET_H_

@@ -1,0 +1,260 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "gfxFontInfoLoader.h"
+#include "mozilla/gfx/Logging.h"
+#include "mozilla/AppShutdown.h"
+#include "nsCRT.h"
+#include "nsIObserverService.h"
+#include "nsThreadUtils.h"  // for nsRunnable
+#include "gfxPlatformFontList.h"
+
+
+using namespace mozilla;
+using services::GetObserverService;
+
+#define LOG_FONTINIT(args) \
+  MOZ_LOG(gfxPlatform::GetLog(eGfxLog_fontinit), LogLevel::Debug, args)
+#define LOG_FONTINIT_ENABLED() \
+  MOZ_LOG_TEST(gfxPlatform::GetLog(eGfxLog_fontinit), LogLevel::Debug)
+
+void FontInfoData::Load() {
+  TimeStamp start = TimeStamp::Now();
+
+  uint32_t i, n = mFontFamiliesToLoad.Length();
+  mLoadStats.families = n;
+  for (i = 0; i < n && !mCanceled; i++) {
+    MOZ_SEH_TRY { LoadFontFamilyData(mFontFamiliesToLoad[i]); }
+    MOZ_SEH_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+      gfxCriticalError() << "Exception occurred reading font data for "
+                         << mFontFamiliesToLoad[i].get();
+    }
+  }
+
+  mLoadTime = TimeStamp::Now() - start;
+}
+
+class FontInfoLoadCompleteEvent : public Runnable {
+  virtual ~FontInfoLoadCompleteEvent() = default;
+
+ public:
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(FontInfoLoadCompleteEvent, Runnable)
+
+  explicit FontInfoLoadCompleteEvent(FontInfoData* aFontInfo)
+      : mozilla::Runnable("FontInfoLoadCompleteEvent"), mFontInfo(aFontInfo) {}
+
+  NS_IMETHOD Run() override;
+
+ private:
+  RefPtr<FontInfoData> mFontInfo;
+};
+
+class AsyncFontInfoLoader : public Runnable {
+  virtual ~AsyncFontInfoLoader() = default;
+
+ public:
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(AsyncFontInfoLoader, Runnable)
+
+  explicit AsyncFontInfoLoader(FontInfoData* aFontInfo)
+      : mozilla::Runnable("AsyncFontInfoLoader"), mFontInfo(aFontInfo) {
+    mCompleteEvent = new FontInfoLoadCompleteEvent(aFontInfo);
+  }
+
+  NS_IMETHOD Run() override;
+
+ private:
+  RefPtr<FontInfoData> mFontInfo;
+  RefPtr<FontInfoLoadCompleteEvent> mCompleteEvent;
+};
+
+nsresult FontInfoLoadCompleteEvent::Run() {
+  gfxFontInfoLoader* loader =
+      static_cast<gfxFontInfoLoader*>(gfxPlatformFontList::PlatformFontList());
+
+  loader->FinalizeLoader(mFontInfo);
+
+  return NS_OK;
+}
+
+nsresult AsyncFontInfoLoader::Run() {
+  mFontInfo->Load();
+
+  NS_DispatchToMainThread(mCompleteEvent);
+
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(gfxFontInfoLoader::ShutdownObserver, nsIObserver)
+
+NS_IMETHODIMP
+gfxFontInfoLoader::ShutdownObserver::Observe(nsISupports* aSubject,
+                                             const char* aTopic,
+                                             const char16_t* someData) {
+  if (!nsCRT::strcmp(aTopic, "quit-application") ||
+      !nsCRT::strcmp(aTopic, "xpcom-shutdown")) {
+    mLoader->CancelLoader();
+  } else {
+    MOZ_ASSERT_UNREACHABLE("unexpected notification topic");
+  }
+  return NS_OK;
+}
+
+void gfxFontInfoLoader::StartLoader(uint32_t aDelay) {
+  if (aDelay == 0 && (mState == stateTimerOff || mState == stateAsyncLoad)) {
+    return;
+  }
+
+  if (NS_WARN_IF(AppShutdown::IsInOrBeyond(ShutdownPhase::AppShutdown))) {
+    MOZ_ASSERT(!aDelay, "Delayed gfxFontInfoLoader startup after AppShutdown?");
+    return;
+  }
+
+  if (mState != stateInitial && mState != stateTimerOff &&
+      mState != stateTimerOnDelay) {
+    CancelLoader();
+  }
+
+  if (!mFontInfo) {
+    mFontInfo = CreateFontInfoData();
+    if (!mFontInfo) {
+      mState = stateTimerOff;
+      return;
+    }
+  }
+
+  AddShutdownObserver();
+
+  if (aDelay) {
+    if (mTimer) {
+      return;
+    }
+    mTimer = NS_NewTimer();
+    mTimer->InitWithNamedFuncCallback(DelayedStartCallback, this, aDelay,
+                                      nsITimer::TYPE_ONE_SHOT,
+                                      "gfxFontInfoLoader::StartLoader"_ns);
+    mState = stateTimerOnDelay;
+    return;
+  }
+
+
+  if (mTimer) {
+    mTimer->Cancel();
+    mTimer = nullptr;
+  }
+
+  InitLoader();
+
+  nsresult rv = NS_NewNamedThread("Font Loader",
+                                  getter_AddRefs(mFontLoaderThread), nullptr);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return;
+  }
+
+  PRThread* prThread;
+  if (NS_SUCCEEDED(mFontLoaderThread->GetPRThread(&prThread))) {
+    PR_SetThreadPriority(prThread, PR_PRIORITY_LOW);
+  }
+
+  mState = stateAsyncLoad;
+
+  nsCOMPtr<nsIRunnable> loadEvent = new AsyncFontInfoLoader(mFontInfo);
+
+  mFontLoaderThread->Dispatch(loadEvent.forget(), NS_DISPATCH_NORMAL);
+
+  if (LOG_FONTINIT_ENABLED()) {
+    LOG_FONTINIT(
+        ("(fontinit) fontloader started (fontinfo: %p)\n", mFontInfo.get()));
+  }
+}
+
+class FinalizeLoaderRunnable : public Runnable {
+  virtual ~FinalizeLoaderRunnable() = default;
+
+ public:
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(FinalizeLoaderRunnable, Runnable)
+
+  explicit FinalizeLoaderRunnable(gfxFontInfoLoader* aLoader)
+      : mozilla::Runnable("FinalizeLoaderRunnable"), mLoader(aLoader) {}
+
+  NS_IMETHOD Run() override {
+    nsresult rv;
+    if (mLoader->LoadFontInfo()) {
+      mLoader->CancelLoader();
+      rv = NS_OK;
+    } else {
+      nsCOMPtr<nsIRunnable> runnable = this;
+      rv = NS_DispatchToCurrentThreadQueue(
+          runnable.forget(), PR_INTERVAL_NO_TIMEOUT, EventQueuePriority::Idle);
+    }
+    return rv;
+  }
+
+ private:
+  gfxFontInfoLoader* mLoader;
+};
+
+void gfxFontInfoLoader::FinalizeLoader(FontInfoData* aFontInfo) {
+  if (mState != stateAsyncLoad || mFontInfo != aFontInfo) {
+    return;
+  }
+
+  mLoadTime = mFontInfo->mLoadTime;
+
+  MOZ_ASSERT(NS_IsMainThread());
+  nsCOMPtr<nsIRunnable> runnable = new FinalizeLoaderRunnable(this);
+  if (NS_FAILED(NS_DispatchToCurrentThreadQueue(runnable.forget(),
+                                                PR_INTERVAL_NO_TIMEOUT,
+                                                EventQueuePriority::Idle))) {
+    NS_WARNING("Failed to finalize async font info");
+  }
+}
+
+void gfxFontInfoLoader::CancelLoader() {
+  if (mState == stateInitial) {
+    return;
+  }
+  mState = stateTimerOff;
+  if (mTimer) {
+    mTimer->Cancel();
+    mTimer = nullptr;
+  }
+  if (mFontInfo)  
+    mFontInfo->mCanceled = true;
+  if (mFontLoaderThread) {
+    NS_DispatchToMainThread(NS_NewRunnableFunction(
+        __func__,
+        [thread = std::move(mFontLoaderThread)]() { thread->Shutdown(); }));
+  }
+  RemoveShutdownObserver();
+  CleanupLoader();
+}
+
+gfxFontInfoLoader::~gfxFontInfoLoader() {
+  RemoveShutdownObserver();
+  MOZ_COUNT_DTOR(gfxFontInfoLoader);
+}
+
+void gfxFontInfoLoader::AddShutdownObserver() {
+  if (mObserver) {
+    return;
+  }
+
+  nsCOMPtr<nsIObserverService> obs = GetObserverService();
+  if (obs) {
+    mObserver = new ShutdownObserver(this);
+    obs->AddObserver(mObserver, "quit-application", false);
+    obs->AddObserver(mObserver, "xpcom-shutdown", false);
+  }
+}
+
+void gfxFontInfoLoader::RemoveShutdownObserver() {
+  if (mObserver) {
+    nsCOMPtr<nsIObserverService> obs = GetObserverService();
+    if (obs) {
+      obs->RemoveObserver(mObserver, "quit-application");
+      obs->RemoveObserver(mObserver, "xpcom-shutdown");
+      mObserver = nullptr;
+    }
+  }
+}

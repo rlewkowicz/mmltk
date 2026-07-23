@@ -1,0 +1,86 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+
+#ifndef __UNIQUECHARSTR_H__
+#define __UNIQUECHARSTR_H__
+
+#include "charstr.h"
+#include "uassert.h"
+#include "uhash.h"
+#include "cmemory.h"
+
+U_NAMESPACE_BEGIN
+
+class UniqueCharStrings {
+public:
+    UniqueCharStrings(UErrorCode &errorCode) : strings(nullptr) {
+        uhash_init(&map, uhash_hashUChars, uhash_compareUChars, uhash_compareLong, &errorCode);
+        if (U_FAILURE(errorCode)) { return; }
+        strings = new CharString();
+        if (strings == nullptr) {
+            errorCode = U_MEMORY_ALLOCATION_ERROR;
+        }
+    }
+    ~UniqueCharStrings() {
+        uhash_close(&map);
+        delete strings;
+    }
+
+    CharString *orphanCharStrings() {
+        CharString *result = strings;
+        strings = nullptr;
+        return result;
+    }
+
+    int32_t add(const char16_t*p, UErrorCode &errorCode) {
+        if (U_FAILURE(errorCode)) { return -1; }
+        if (isFrozen) {
+            errorCode = U_NO_WRITE_PERMISSION;
+            return -1;
+        }
+        int32_t oldIndex = uhash_geti(&map, p);
+        if (oldIndex != 0) {  
+            return oldIndex;
+        }
+        strings->append(0, errorCode);
+        int32_t newIndex = strings->length();
+        strings->appendInvariantChars(p, u_strlen(p), errorCode);
+        uhash_puti(&map, const_cast<char16_t *>(p), newIndex, &errorCode);
+        return newIndex;
+    }
+
+    int32_t addByValue(UnicodeString s, UErrorCode &errorCode) {
+        if (U_FAILURE(errorCode)) { return -1; }
+        if (isFrozen) {
+            errorCode = U_NO_WRITE_PERMISSION;
+            return -1;
+        }
+        int32_t oldIndex = uhash_geti(&map, s.getTerminatedBuffer());
+        if (oldIndex != 0) {  
+            return oldIndex;
+        }
+        UnicodeString *key = keyStore.create(s);
+        if (key == nullptr) {
+            errorCode = U_MEMORY_ALLOCATION_ERROR;
+            return -1;
+        }
+        return add(key->getTerminatedBuffer(), errorCode);
+    }
+
+    void freeze() { isFrozen = true; }
+
+    const char *get(int32_t i) const {
+        U_ASSERT(isFrozen);
+        return isFrozen && i > 0 ? strings->data() + i : nullptr;
+    }
+
+private:
+    UHashtable map;
+    CharString *strings;
+    MemoryPool<UnicodeString> keyStore;
+    bool isFrozen = false;
+};
+
+U_NAMESPACE_END
+
+#endif  // __UNIQUECHARSTR_H__

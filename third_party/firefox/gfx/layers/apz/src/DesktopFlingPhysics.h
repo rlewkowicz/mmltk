@@ -1,0 +1,52 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_DesktopFlingPhysics_h_
+#define mozilla_layers_DesktopFlingPhysics_h_
+
+#include "AsyncPanZoomController.h"
+#include "Units.h"
+#include "mozilla/StaticPrefs_apz.h"
+
+namespace mozilla {
+namespace layers {
+
+class DesktopFlingPhysics {
+ public:
+  void Init(const ParentLayerPoint& aStartingVelocity,
+            float aPLPPI ) {
+    mVelocity = aStartingVelocity;
+  }
+  void Sample(const TimeDuration& aDelta, ParentLayerPoint* aOutVelocity,
+              ParentLayerPoint* aOutOffset) {
+    float friction = StaticPrefs::apz_fling_friction();
+    float threshold = StaticPrefs::apz_fling_stopped_threshold();
+
+    mVelocity = ParentLayerPoint(
+        ApplyFrictionOrCancel(mVelocity.x, aDelta, friction, threshold),
+        ApplyFrictionOrCancel(mVelocity.y, aDelta, friction, threshold));
+
+    *aOutVelocity = mVelocity;
+    *aOutOffset = mVelocity * aDelta.ToMilliseconds();
+  }
+
+ private:
+  static float ApplyFrictionOrCancel(float aVelocity,
+                                     const TimeDuration& aDelta,
+                                     float aFriction, float aThreshold) {
+    if (fabsf(aVelocity) <= aThreshold) {
+      return 0.0f;
+    }
+
+    aVelocity *= pow(1.0f - aFriction, float(aDelta.ToMilliseconds()));
+    return aVelocity;
+  }
+
+  ParentLayerPoint mVelocity;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_DesktopFlingPhysics_h_

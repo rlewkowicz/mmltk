@@ -1,0 +1,117 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_ElemOpEmitter_h
+#define frontend_ElemOpEmitter_h
+
+#include "mozilla/Attributes.h"
+
+#include <stddef.h>
+
+namespace js {
+namespace frontend {
+
+struct BytecodeEmitter;
+enum class ValueUsage;
+
+class MOZ_STACK_CLASS ElemOpEmitter {
+ public:
+  enum class Kind {
+    Get,
+    Call,
+    Delete,
+    PostIncrement,
+    PreIncrement,
+    PostDecrement,
+    PreDecrement,
+    SimpleAssignment,
+    PropInit,
+    CompoundAssignment
+  };
+  enum class ObjKind { Super, Other };
+
+ private:
+  BytecodeEmitter* bce_;
+
+  Kind kind_;
+  ObjKind objKind_;
+
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    Obj,
+
+    Key,
+
+    Get,
+
+    Delete,
+
+    IncDec,
+
+    Rhs,
+
+    Assignment,
+  };
+  State state_ = State::Start;
+#endif
+
+ public:
+  ElemOpEmitter(BytecodeEmitter* bce, Kind kind, ObjKind objKind);
+
+ private:
+  [[nodiscard]] bool isCall() const { return kind_ == Kind::Call; }
+
+  [[nodiscard]] bool isSimpleAssignment() const {
+    return kind_ == Kind::SimpleAssignment;
+  }
+
+  [[nodiscard]] bool isPropInit() const { return kind_ == Kind::PropInit; }
+
+  [[nodiscard]] bool isDelete() const { return kind_ == Kind::Delete; }
+
+  [[nodiscard]] bool isCompoundAssignment() const {
+    return kind_ == Kind::CompoundAssignment;
+  }
+
+  [[nodiscard]] bool isIncDec() const {
+    return isPostIncDec() || isPreIncDec();
+  }
+
+  [[nodiscard]] bool isPostIncDec() const {
+    return kind_ == Kind::PostIncrement || kind_ == Kind::PostDecrement;
+  }
+
+  [[nodiscard]] bool isPreIncDec() const {
+    return kind_ == Kind::PreIncrement || kind_ == Kind::PreDecrement;
+  }
+
+  [[nodiscard]] bool isInc() const {
+    return kind_ == Kind::PostIncrement || kind_ == Kind::PreIncrement;
+  }
+
+  [[nodiscard]] bool isSuper() const { return objKind_ == ObjKind::Super; }
+
+ public:
+  [[nodiscard]] bool prepareForObj();
+  [[nodiscard]] bool prepareForKey();
+
+  [[nodiscard]] bool emitGet();
+
+  [[nodiscard]] bool prepareForRhs();
+
+  [[nodiscard]] bool emitDelete();
+
+  [[nodiscard]] bool emitAssignment();
+
+  [[nodiscard]] bool emitIncDec(ValueUsage valueUsage);
+
+  size_t numReferenceSlots() const { return 2 + isSuper(); }
+};
+
+} 
+}  
+
+#endif /* frontend_ElemOpEmitter_h */

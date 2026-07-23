@@ -1,0 +1,264 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozStorageSQLFunctions.h"
+#include "nsTArray.h"
+#include "nsUnicharUtils.h"
+#include <algorithm>
+#include "sqlite3.h"
+
+namespace mozilla {
+namespace storage {
+
+
+namespace {
+
+int likeCompare(nsAString::const_iterator aPatternItr,
+                nsAString::const_iterator aPatternEnd,
+                nsAString::const_iterator aStringItr,
+                nsAString::const_iterator aStringEnd, char16_t aEscapeChar) {
+  const char16_t MATCH_ALL('%');
+  const char16_t MATCH_ONE('_');
+
+  bool lastWasEscape = false;
+  while (aPatternItr != aPatternEnd) {
+    if (!lastWasEscape && *aPatternItr == MATCH_ALL) {
+      while (aPatternItr != aPatternEnd &&
+             (*aPatternItr == MATCH_ALL || *aPatternItr == MATCH_ONE)) {
+        if (*aPatternItr == MATCH_ONE) {
+          if (aStringItr == aStringEnd) return 0;
+          aStringItr++;
+        }
+        aPatternItr++;
+      }
+
+      if (aPatternItr == aPatternEnd) return 1;
+
+      while (aStringItr != aStringEnd) {
+        if (likeCompare(aPatternItr, aPatternEnd, aStringItr, aStringEnd,
+                        aEscapeChar)) {
+          return 1;
+        }
+        aStringItr++;
+      }
+
+      return 0;
+    }
+    if (!lastWasEscape && *aPatternItr == MATCH_ONE) {
+      if (aStringItr == aStringEnd) {
+        return 0;
+      }
+      aStringItr++;
+      lastWasEscape = false;
+    } else if (!lastWasEscape && *aPatternItr == aEscapeChar) {
+      lastWasEscape = true;
+    } else {
+      if (aStringItr == aStringEnd ||
+          ::ToUpperCase(*aStringItr) != ::ToUpperCase(*aPatternItr)) {
+        return 0;
+      }
+      aStringItr++;
+      lastWasEscape = false;
+    }
+
+    aPatternItr++;
+  }
+
+  return aStringItr == aStringEnd;
+}
+
+int levenshteinDistance(const nsAString& aStringS, const nsAString& aStringT,
+                        int* _result) {
+  *_result = -1;
+
+  const uint32_t sLen = aStringS.Length();
+  const uint32_t tLen = aStringT.Length();
+
+  if (sLen == 0) {
+    *_result = tLen;
+    return SQLITE_OK;
+  }
+  if (tLen == 0) {
+    *_result = sLen;
+    return SQLITE_OK;
+  }
+
+
+  AutoTArray<int, nsAutoString::kStorageSize> row1;
+  AutoTArray<int, nsAutoString::kStorageSize> row2;
+
+  int* prevRow = row1.AppendElements(sLen + 1);
+  int* currRow = row2.AppendElements(sLen + 1);
+
+  for (uint32_t i = 0; i <= sLen; i++) prevRow[i] = i;
+
+  const char16_t* s = aStringS.BeginReading();
+  const char16_t* t = aStringT.BeginReading();
+
+  for (uint32_t ti = 1; ti <= tLen; ti++) {
+    currRow[0] = ti;
+
+    const char16_t tch = t[ti - 1];
+
+    for (uint32_t si = 1; si <= sLen; si++) {
+      const char16_t sch = s[si - 1];
+      int cost = (sch == tch) ? 0 : 1;
+
+      int aPrime = prevRow[si - 1] + cost;
+      int bPrime = prevRow[si] + 1;
+      int cPrime = currRow[si - 1] + 1;
+      currRow[si] = std::min(aPrime, std::min(bPrime, cPrime));
+    }
+
+    int* oldPrevRow = prevRow;
+    prevRow = currRow;
+    currRow = oldPrevRow;
+  }
+
+  *_result = prevRow[sLen];
+  return SQLITE_OK;
+}
+
+struct Functions {
+  const char* zName;
+  int nArg;
+  int enc;
+  void* pContext;
+  void (*xFunc)(::sqlite3_context*, int, sqlite3_value**);
+};
+
+}  
+
+
+int registerFunctions(sqlite3* aDB) {
+  Functions functions[] = {
+      {"lower", 1, SQLITE_UTF16, nullptr, caseFunction},
+      {"lower", 1, SQLITE_UTF8, nullptr, caseFunction},
+      {"upper", 1, SQLITE_UTF16, (void*)1, caseFunction},
+      {"upper", 1, SQLITE_UTF8, (void*)1, caseFunction},
+
+      {"like", 2, SQLITE_UTF16, nullptr, likeFunction},
+      {"like", 2, SQLITE_UTF8, nullptr, likeFunction},
+      {"like", 3, SQLITE_UTF16, nullptr, likeFunction},
+      {"like", 3, SQLITE_UTF8, nullptr, likeFunction},
+
+      {"levenshteinDistance", 2, SQLITE_UTF16, nullptr,
+       levenshteinDistanceFunction},
+      {"levenshteinDistance", 2, SQLITE_UTF8, nullptr,
+       levenshteinDistanceFunction},
+
+      {"utf16Length", 1, SQLITE_UTF16, nullptr, utf16LengthFunction},
+      {"utf16Length", 1, SQLITE_UTF8, nullptr, utf16LengthFunction},
+  };
+
+  int rv = SQLITE_OK;
+  for (size_t i = 0; SQLITE_OK == rv && i < std::size(functions); ++i) {
+    struct Functions* p = &functions[i];
+    rv = ::sqlite3_create_function(aDB, p->zName, p->nArg, p->enc, p->pContext,
+                                   p->xFunc, nullptr, nullptr);
+  }
+
+  return rv;
+}
+
+
+void caseFunction(sqlite3_context* aCtx, int aArgc, sqlite3_value** aArgv) {
+  NS_ASSERTION(1 == aArgc, "Invalid number of arguments!");
+
+  const char16_t* value =
+      static_cast<const char16_t*>(::sqlite3_value_text16(aArgv[0]));
+  nsAutoString data(value,
+                    ::sqlite3_value_bytes16(aArgv[0]) / sizeof(char16_t));
+  bool toUpper = ::sqlite3_user_data(aCtx) ? true : false;
+
+  if (toUpper)
+    ::ToUpperCase(data);
+  else
+    ::ToLowerCase(data);
+
+  ::sqlite3_result_text16(aCtx, data.get(), data.Length() * sizeof(char16_t),
+                          SQLITE_TRANSIENT);
+}
+
+void likeFunction(sqlite3_context* aCtx, int aArgc, sqlite3_value** aArgv) {
+  NS_ASSERTION(2 == aArgc || 3 == aArgc, "Invalid number of arguments!");
+
+  if (::sqlite3_value_bytes(aArgv[0]) >
+      ::sqlite3_limit(::sqlite3_context_db_handle(aCtx),
+                      SQLITE_LIMIT_LIKE_PATTERN_LENGTH, -1)) {
+    ::sqlite3_result_error(aCtx, "LIKE or GLOB pattern too complex",
+                           SQLITE_TOOBIG);
+    return;
+  }
+
+  if (!::sqlite3_value_text16(aArgv[0]) || !::sqlite3_value_text16(aArgv[1]))
+    return;
+
+  const char16_t* a =
+      static_cast<const char16_t*>(::sqlite3_value_text16(aArgv[1]));
+  int aLen = ::sqlite3_value_bytes16(aArgv[1]) / sizeof(char16_t);
+  nsDependentString A(a, aLen);
+
+  const char16_t* b =
+      static_cast<const char16_t*>(::sqlite3_value_text16(aArgv[0]));
+  int bLen = ::sqlite3_value_bytes16(aArgv[0]) / sizeof(char16_t);
+  nsDependentString B(b, bLen);
+  NS_ASSERTION(!B.IsEmpty(), "LIKE string must not be null!");
+
+  char16_t E = 0;
+  if (3 == aArgc)
+    E = static_cast<const char16_t*>(::sqlite3_value_text16(aArgv[2]))[0];
+
+  nsAString::const_iterator itrString, endString;
+  A.BeginReading(itrString);
+  A.EndReading(endString);
+  nsAString::const_iterator itrPattern, endPattern;
+  B.BeginReading(itrPattern);
+  B.EndReading(endPattern);
+  ::sqlite3_result_int(
+      aCtx, likeCompare(itrPattern, endPattern, itrString, endString, E));
+}
+
+void levenshteinDistanceFunction(sqlite3_context* aCtx, int aArgc,
+                                 sqlite3_value** aArgv) {
+  NS_ASSERTION(2 == aArgc, "Invalid number of arguments!");
+
+  if (::sqlite3_value_type(aArgv[0]) == SQLITE_NULL ||
+      ::sqlite3_value_type(aArgv[1]) == SQLITE_NULL) {
+    ::sqlite3_result_null(aCtx);
+    return;
+  }
+
+  const char16_t* a =
+      static_cast<const char16_t*>(::sqlite3_value_text16(aArgv[0]));
+  int aLen = ::sqlite3_value_bytes16(aArgv[0]) / sizeof(char16_t);
+
+  const char16_t* b =
+      static_cast<const char16_t*>(::sqlite3_value_text16(aArgv[1]));
+  int bLen = ::sqlite3_value_bytes16(aArgv[1]) / sizeof(char16_t);
+
+  int distance = -1;
+  const nsDependentString A(a, aLen);
+  const nsDependentString B(b, bLen);
+  int status = levenshteinDistance(A, B, &distance);
+  if (status == SQLITE_OK) {
+    ::sqlite3_result_int(aCtx, distance);
+  } else if (status == SQLITE_NOMEM) {
+    ::sqlite3_result_error_nomem(aCtx);
+  } else {
+    ::sqlite3_result_error(aCtx, "User function returned error code", -1);
+  }
+}
+
+void utf16LengthFunction(sqlite3_context* aCtx, int aArgc,
+                         sqlite3_value** aArgv) {
+  NS_ASSERTION(1 == aArgc, "Invalid number of arguments!");
+
+  int len = ::sqlite3_value_bytes16(aArgv[0]) / sizeof(char16_t);
+
+  ::sqlite3_result_int(aCtx, len);
+}
+
+}  
+}  

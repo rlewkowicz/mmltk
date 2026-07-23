@@ -1,0 +1,120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_SVG_GLYPHS_WRAPPER_H
+#define GFX_SVG_GLYPHS_WRAPPER_H
+
+#include "gfxFontUtils.h"
+#include "mozilla/gfx/2D.h"
+#include "nsString.h"
+#include "nsClassHashtable.h"
+#include "nsBaseHashtable.h"
+#include "nsHashKeys.h"
+#include "gfxPattern.h"
+#include "mozilla/gfx/UserData.h"
+#include "mozilla/SVGContextPaint.h"
+#include "nsRefreshObservers.h"
+
+class nsIDocumentViewer;
+class gfxSVGGlyphs;
+
+namespace mozilla {
+class PresShell;
+class SVGContextPaint;
+namespace dom {
+class Document;
+class Element;
+}  
+}  
+
+class gfxSVGGlyphsDocument final : public nsAPostRefreshObserver {
+  typedef mozilla::dom::Element Element;
+
+ public:
+  gfxSVGGlyphsDocument(const uint8_t* aBuffer, uint32_t aBufLen,
+                       gfxSVGGlyphs* aSVGGlyphs);
+
+  Element* GetGlyphElement(uint32_t aGlyphId);
+
+  ~gfxSVGGlyphsDocument();
+
+  void DidRefresh() override;
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+ private:
+  nsresult ParseDocument(const uint8_t* aBuffer, uint32_t aBufLen);
+
+  nsresult SetupPresentation();
+
+  void FindGlyphElements(Element* aElement);
+
+  void InsertGlyphId(Element* aGlyphElement);
+
+  gfxSVGGlyphs* mOwner;
+  RefPtr<mozilla::dom::Document> mDocument;
+  nsCOMPtr<nsIDocumentViewer> mViewer;
+  RefPtr<mozilla::PresShell> mPresShell;
+
+  nsBaseHashtable<nsUint32HashKey, Element*, Element*> mGlyphIdMap;
+};
+
+class gfxSVGGlyphs {
+ private:
+  typedef mozilla::dom::Element Element;
+
+ public:
+  gfxSVGGlyphs(hb_blob_t* aSVGTable, gfxFontEntry* aFontEntry);
+
+  ~gfxSVGGlyphs();
+
+  void DidRefresh();
+
+  gfxSVGGlyphsDocument* FindOrCreateGlyphsDocument(uint32_t aGlyphId);
+
+  bool HasSVGGlyph(uint32_t aGlyphId);
+
+  void RenderGlyph(gfxContext* aContext, uint32_t aGlyphId,
+                   mozilla::SVGContextPaint* aContextPaint,
+                   mozilla::image::imgDrawingParams& aImgParams);
+
+  bool GetGlyphExtents(uint32_t aGlyphId, const gfxMatrix& aSVGToAppSpace,
+                       gfxRect* aResult);
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+  gfxFontEntry* FontEntry() const { return mFontEntry; }
+
+ private:
+  Element* GetGlyphElement(uint32_t aGlyphId);
+
+  nsClassHashtable<nsUint32HashKey, gfxSVGGlyphsDocument> mGlyphDocs;
+  nsBaseHashtable<nsUint32HashKey, Element*, Element*> mGlyphIdMap;
+
+  hb_blob_t* mSVGData;
+
+  gfxFontEntry* MOZ_NON_OWNING_REF mFontEntry;
+
+  const struct Header {
+    mozilla::AutoSwap_PRUint16 mVersion;
+    mozilla::AutoSwap_PRUint32 mDocIndexOffset;
+    mozilla::AutoSwap_PRUint32 mColorPalettesOffset;
+  }* mHeader;
+
+  struct IndexEntry {
+    mozilla::AutoSwap_PRUint16 mStartGlyph;
+    mozilla::AutoSwap_PRUint16 mEndGlyph;
+    mozilla::AutoSwap_PRUint32 mDocOffset;
+    mozilla::AutoSwap_PRUint32 mDocLength;
+  };
+
+  const struct DocIndex {
+    mozilla::AutoSwap_PRUint16 mNumEntries;
+    IndexEntry mEntries[1]; 
+  }* mDocIndex;
+
+  static int CompareIndexEntries(const void* _a, const void* _b);
+};
+
+#endif

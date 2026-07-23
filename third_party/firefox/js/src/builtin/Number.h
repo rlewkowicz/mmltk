@@ -1,0 +1,337 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_Number_h
+#define builtin_Number_h
+
+#include "mozilla/FloatingPoint.h"
+#include "mozilla/Range.h"
+#include "mozilla/Utf8.h"
+
+#include <limits>
+
+#include "NamespaceImports.h"
+
+#include "js/Conversions.h"
+#include "js/friend/ErrorMessages.h"  // JSMSG_*
+
+#include "vm/StringType.h"
+
+namespace js {
+
+namespace frontend {
+class ParserAtomsTable;
+class TaggedParserAtomIndex;
+}  
+
+class GlobalObject;
+class StringBuilder;
+
+[[nodiscard]] extern bool InitRuntimeNumberState(JSRuntime* rt);
+
+extern void FinishRuntimeNumberState(JSRuntime* rt);
+
+template <AllowGC allowGC>
+extern JSString* NumberToString(JSContext* cx, double d);
+
+extern JSString* NumberToStringPure(JSContext* cx, double d);
+
+extern JSAtom* NumberToAtom(JSContext* cx, double d);
+
+frontend::TaggedParserAtomIndex NumberToParserAtom(
+    FrontendContext* fc, frontend::ParserAtomsTable& parserAtoms, double d);
+
+template <AllowGC allowGC>
+extern JSLinearString* Int32ToString(JSContext* cx, int32_t i);
+
+template <AllowGC allowGC>
+extern JSLinearString* Int32ToStringWithHeap(JSContext* cx, int32_t i,
+                                             gc::Heap heap);
+
+extern JSLinearString* Int32ToStringPure(JSContext* cx, int32_t i);
+
+template <AllowGC allowGC>
+extern JSLinearString* Int32ToStringWithBase(JSContext* cx, int32_t i,
+                                             int32_t base, bool lowerCase);
+
+extern JSAtom* Int32ToAtom(JSContext* cx, int32_t si);
+
+frontend::TaggedParserAtomIndex Int32ToParserAtom(
+    FrontendContext* fc, frontend::ParserAtomsTable& parserAtoms, int32_t si);
+
+extern bool IsInteger(double d);
+
+[[nodiscard]] extern bool NumberValueToStringBuilder(const Value& v,
+                                                     StringBuilder& sb);
+
+extern JSLinearString* IndexToString(JSContext* cx, uint32_t index);
+
+struct ToCStringBuf {
+  char sbuf[JS::MaximumNumberToStringLength] = {};
+};
+
+struct Int32ToCStringBuf {
+  static constexpr size_t MaximumInt32ToStringLength =
+      std::numeric_limits<int32_t>::digits10 +
+      1 +  
+      1 +  
+      1    
+      ;
+
+  char sbuf[MaximumInt32ToStringLength] = {};
+};
+
+extern char* NumberToCString(ToCStringBuf* cbuf, double d,
+                             size_t* length = nullptr);
+
+extern char* Int32ToCString(Int32ToCStringBuf* cbuf, int32_t value,
+                            size_t* length = nullptr);
+
+extern char* Uint32ToCString(Int32ToCStringBuf* cbuf, uint32_t value,
+                             size_t* length = nullptr);
+
+extern char* Uint32ToHexCString(Int32ToCStringBuf* cbuf, uint32_t value,
+                                size_t* length = nullptr);
+
+constexpr double DOUBLE_INTEGRAL_PRECISION_LIMIT = uint64_t(1) << 53;
+
+constexpr double DOUBLE_DECIMAL_IN_SHORTEST_LOW = 1.0e-6;
+
+constexpr double DOUBLE_DECIMAL_IN_SHORTEST_HIGH = 1.0e21;
+
+template <typename CharT>
+extern double ParseDecimalNumber(const mozilla::Range<const CharT> chars);
+
+enum class IntegerSeparatorHandling : bool { None, SkipUnderscore };
+
+template <typename CharT>
+[[nodiscard]] extern bool GetPrefixInteger(
+    const CharT* start, const CharT* end, int base,
+    IntegerSeparatorHandling separatorHandling, const CharT** endp, double* dp);
+
+inline const char16_t* ToRawChars(const char16_t* units) { return units; }
+
+inline const unsigned char* ToRawChars(const unsigned char* units) {
+  return units;
+}
+
+inline const unsigned char* ToRawChars(const mozilla::Utf8Unit* units) {
+  return mozilla::Utf8AsUnsignedChars(units);
+}
+
+template <typename CharT>
+[[nodiscard]] extern bool GetFullInteger(
+    const CharT* start, const CharT* end, int base,
+    IntegerSeparatorHandling separatorHandling, double* dp) {
+  decltype(ToRawChars(start)) realEnd;
+  if (GetPrefixInteger(ToRawChars(start), ToRawChars(end), base,
+                       separatorHandling, &realEnd, dp)) {
+    MOZ_ASSERT(end == static_cast<const void*>(realEnd));
+    return true;
+  }
+  return false;
+}
+
+template <typename CharT>
+[[nodiscard]] extern bool GetDecimalInteger(const CharT* start,
+                                            const CharT* end, double* dp);
+
+template <typename CharT>
+[[nodiscard]] extern bool GetDecimal(const CharT* start, const CharT* end,
+                                     double* dp);
+
+template <typename CharT>
+double CharsToNumber(const CharT* chars, size_t length);
+
+[[nodiscard]] extern bool StringToNumber(JSContext* cx, JSString* str,
+                                         double* result);
+
+[[nodiscard]] extern bool StringToNumberPure(JSContext* cx, JSString* str,
+                                             double* result);
+
+extern double LinearStringToNumber(const JSLinearString* str);
+
+extern double OffThreadAtomToNumber(const JSOffThreadAtom* str);
+
+extern bool NumberParseInt(JSContext* cx, JS::HandleString str, int32_t radix,
+                           JS::MutableHandleValue result);
+
+[[nodiscard]] MOZ_ALWAYS_INLINE bool ToNumber(JSContext* cx,
+                                              JS::MutableHandleValue vp) {
+  if (vp.isNumber()) {
+    return true;
+  }
+  double d;
+  extern JS_PUBLIC_API bool ToNumberSlow(JSContext * cx, HandleValue v,
+                                         double* dp);
+  if (!ToNumberSlow(cx, vp, &d)) {
+    return false;
+  }
+
+  vp.setNumber(d);
+  return true;
+}
+
+bool ToNumericSlow(JSContext* cx, JS::MutableHandleValue vp);
+
+[[nodiscard]] MOZ_ALWAYS_INLINE bool ToNumeric(JSContext* cx,
+                                               JS::MutableHandleValue vp) {
+  if (vp.isNumeric()) {
+    return true;
+  }
+  return ToNumericSlow(cx, vp);
+}
+
+bool ToInt32OrBigIntSlow(JSContext* cx, JS::MutableHandleValue vp);
+
+[[nodiscard]] MOZ_ALWAYS_INLINE bool ToInt32OrBigInt(
+    JSContext* cx, JS::MutableHandleValue vp) {
+  if (vp.isInt32()) {
+    return true;
+  }
+  return ToInt32OrBigIntSlow(cx, vp);
+}
+
+} 
+
+template <typename CharT>
+[[nodiscard]] extern double js_strtod(const CharT* begin, const CharT* end,
+                                      const CharT** dEnd);
+
+namespace js {
+
+template <typename CharT>
+[[nodiscard]] extern double FullStringToDouble(const CharT* begin,
+                                               const CharT* end) {
+  decltype(ToRawChars(begin)) realEnd;
+  double d = js_strtod(ToRawChars(begin), ToRawChars(end), &realEnd);
+  MOZ_ASSERT(end == static_cast<const void*>(realEnd));
+  return d;
+}
+
+[[nodiscard]] extern bool num_valueOf(JSContext* cx, unsigned argc, Value* vp);
+
+static inline bool IsNumberIndex(const Value& v) {
+  if (v.isInt32() && v.toInt32() >= 0) {
+    return true;
+  }
+
+  int64_t i;
+  if (v.isDouble() && mozilla::NumberEqualsInt64(v.toDouble(), &i) && i >= 0 &&
+      i <= MAX_ARRAY_INDEX) {
+    return true;
+  }
+
+  return false;
+}
+
+static MOZ_ALWAYS_INLINE bool IsDefinitelyIndex(const Value& v,
+                                                uint32_t* indexp) {
+  if (v.isInt32() && v.toInt32() >= 0) {
+    *indexp = v.toInt32();
+    return true;
+  }
+
+  int32_t i;
+  if (v.isDouble() && mozilla::NumberEqualsInt32(v.toDouble(), &i) && i >= 0) {
+    *indexp = uint32_t(i);
+    return true;
+  }
+
+  if (v.isString() && v.toString()->hasIndexValue()) {
+    *indexp = v.toString()->getIndexValue();
+    return true;
+  }
+
+  return false;
+}
+
+[[nodiscard]] static inline bool ToInteger(JSContext* cx, HandleValue v,
+                                           double* dp) {
+  if (v.isInt32()) {
+    *dp = v.toInt32();
+    return true;
+  }
+  if (v.isDouble()) {
+    *dp = v.toDouble();
+  } else if (v.isString() && v.toString()->hasIndexValue()) {
+    *dp = v.toString()->getIndexValue();
+    return true;
+  } else {
+    extern JS_PUBLIC_API bool ToNumberSlow(JSContext * cx, HandleValue v,
+                                           double* dp);
+    if (!ToNumberSlow(cx, v, dp)) {
+      return false;
+    }
+  }
+  *dp = JS::ToInteger(*dp);
+  return true;
+}
+
+[[nodiscard]] extern bool ToIndexSlow(JSContext* cx, JS::HandleValue v,
+                                      const unsigned errorNumber,
+                                      uint64_t* index);
+
+[[nodiscard]] static inline bool ToIndex(JSContext* cx, JS::HandleValue v,
+                                         const unsigned errorNumber,
+                                         uint64_t* index) {
+  if (v.isInt32()) {
+    int32_t i = v.toInt32();
+    if (i >= 0) {
+      *index = uint64_t(i);
+      return true;
+    }
+  }
+  return ToIndexSlow(cx, v, errorNumber, index);
+}
+
+[[nodiscard]] static inline bool ToIndex(JSContext* cx, JS::HandleValue v,
+                                         uint64_t* index) {
+  return ToIndex(cx, v, JSMSG_BAD_INDEX, index);
+}
+
+template <typename ArrayLength>
+[[nodiscard]] extern bool ToIntegerIndexSlow(JSContext* cx, Handle<Value> value,
+                                             ArrayLength length,
+                                             ArrayLength* result);
+
+template <typename ArrayLength>
+[[nodiscard]] static inline bool ToIntegerIndex(JSContext* cx,
+                                                Handle<Value> value,
+                                                ArrayLength length,
+                                                ArrayLength* result) {
+  static_assert(std::is_unsigned_v<ArrayLength>);
+
+  if (value.isInt32()) {
+    int32_t relative = value.toInt32();
+
+    if (relative >= 0) {
+      *result = std::min(ArrayLength(relative), length);
+    } else if (mozilla::Abs(relative) <= length) {
+      *result = length - mozilla::Abs(relative);
+    } else {
+      *result = 0;
+    }
+    return true;
+  }
+
+  return ToIntegerIndexSlow(cx, value, length, result);
+}
+
+static inline size_t ToIntegerIndex(intptr_t index, size_t length) {
+  static_assert(std::is_same_v<size_t, uintptr_t>,
+                "expect size_t being equal to uintptr_t");
+
+  if (index >= 0) {
+    return std::min(size_t(index), length);
+  }
+  if (mozilla::Abs(index) <= length) {
+    return length - mozilla::Abs(index);
+  }
+  return 0;
+}
+
+} 
+
+#endif /* builtin_Number_h */

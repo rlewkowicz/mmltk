@@ -1,0 +1,189 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_FunctionEmitter_h
+#define frontend_FunctionEmitter_h
+
+#include "mozilla/Attributes.h"  // MOZ_STACK_CLASS
+
+#include <stdint.h>  // uint16_t, uint32_t
+
+#include "frontend/AsyncEmitter.h"        // AsyncEmitter
+#include "frontend/DefaultEmitter.h"      // DefaultEmitter
+#include "frontend/EmitterScope.h"        // EmitterScope
+#include "frontend/FunctionSyntaxKind.h"  // FunctionSyntaxKind
+#include "frontend/ParserAtom.h"          // TaggedParserAtomIndex
+#include "frontend/TDZCheckCache.h"       // TDZCheckCache
+
+namespace js {
+
+class GCThingIndex;
+
+namespace frontend {
+
+struct BytecodeEmitter;
+class FunctionBox;
+
+class MOZ_STACK_CLASS FunctionEmitter {
+ public:
+  enum class IsHoisted { No, Yes };
+
+ private:
+  BytecodeEmitter* bce_;
+
+  FunctionBox* funbox_;
+
+  TaggedParserAtomIndex name_;
+
+  FunctionSyntaxKind syntaxKind_;
+  IsHoisted isHoisted_;
+
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    NonLazy,
+
+    End
+  };
+  State state_ = State::Start;
+#endif
+
+ public:
+  FunctionEmitter(BytecodeEmitter* bce, FunctionBox* funbox,
+                  FunctionSyntaxKind syntaxKind, IsHoisted isHoisted);
+
+  [[nodiscard]] bool prepareForNonLazy();
+  [[nodiscard]] bool emitNonLazyEnd();
+
+  [[nodiscard]] bool emitLazy();
+
+  [[nodiscard]] bool emitAgain();
+
+ private:
+  [[nodiscard]] bool emitFunction();
+
+  [[nodiscard]] bool emitNonHoisted(GCThingIndex index);
+  [[nodiscard]] bool emitHoisted(GCThingIndex index);
+  [[nodiscard]] bool emitTopLevelFunction(GCThingIndex index);
+};
+
+class MOZ_STACK_CLASS FunctionScriptEmitter {
+ private:
+  BytecodeEmitter* bce_;
+
+  FunctionBox* funbox_;
+
+  mozilla::Maybe<EmitterScope> namedLambdaEmitterScope_;
+
+  mozilla::Maybe<EmitterScope> functionEmitterScope_;
+
+  mozilla::Maybe<EmitterScope> extraBodyVarEmitterScope_;
+
+  mozilla::Maybe<TDZCheckCache> tdzCache_;
+
+  mozilla::Maybe<AsyncEmitter> asyncEmitter_;
+
+  mozilla::Maybe<uint32_t> paramStart_;
+  mozilla::Maybe<uint32_t> bodyEnd_;
+
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    Parameters,
+
+    Body,
+
+    EndBody,
+
+    End
+  };
+  State state_ = State::Start;
+#endif
+
+ public:
+  FunctionScriptEmitter(BytecodeEmitter* bce, FunctionBox* funbox,
+                        const mozilla::Maybe<uint32_t>& paramStart,
+                        const mozilla::Maybe<uint32_t>& bodyEnd)
+      : bce_(bce),
+        funbox_(funbox),
+        paramStart_(paramStart),
+        bodyEnd_(bodyEnd) {}
+
+  [[nodiscard]] bool prepareForParameters();
+  [[nodiscard]] bool prepareForBody();
+  [[nodiscard]] bool emitEndBody();
+
+  [[nodiscard]] bool intoStencil();
+
+ private:
+  [[nodiscard]] bool emitExtraBodyVarScope();
+  [[nodiscard]] bool emitInitializeClosedOverArgumentBindings();
+};
+
+class MOZ_STACK_CLASS FunctionParamsEmitter {
+ private:
+  BytecodeEmitter* bce_;
+
+  FunctionBox* funbox_;
+
+  EmitterScope* functionEmitterScope_;
+
+  uint16_t argSlot_ = 0;
+
+  mozilla::Maybe<DefaultEmitter> default_;
+
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    Default,
+
+    Destructuring,
+
+    DestructuringDefaultInitializer,
+
+    DestructuringDefault,
+
+    DestructuringRest,
+
+    End,
+  };
+  State state_ = State::Start;
+#endif
+
+ public:
+  FunctionParamsEmitter(BytecodeEmitter* bce, FunctionBox* funbox);
+
+  [[nodiscard]] bool emitSimple(TaggedParserAtomIndex paramName);
+
+  [[nodiscard]] bool prepareForDefault();
+  [[nodiscard]] bool emitDefaultEnd(TaggedParserAtomIndex paramName);
+
+  [[nodiscard]] bool prepareForDestructuring();
+  [[nodiscard]] bool emitDestructuringEnd();
+
+  [[nodiscard]] bool prepareForDestructuringDefaultInitializer();
+  [[nodiscard]] bool prepareForDestructuringDefault();
+  [[nodiscard]] bool emitDestructuringDefaultEnd();
+
+  [[nodiscard]] bool emitRest(TaggedParserAtomIndex paramName);
+
+  [[nodiscard]] bool prepareForDestructuringRest();
+  [[nodiscard]] bool emitDestructuringRestEnd();
+
+ private:
+  [[nodiscard]] bool prepareForInitializer();
+  [[nodiscard]] bool emitInitializerEnd();
+
+  [[nodiscard]] bool emitRestArray();
+
+  [[nodiscard]] bool emitAssignment(TaggedParserAtomIndex paramName);
+};
+
+} 
+} 
+
+#endif /* frontend_FunctionEmitter_h */

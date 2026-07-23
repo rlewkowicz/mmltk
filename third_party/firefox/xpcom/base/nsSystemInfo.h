@@ -1,0 +1,99 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(NSSYSTEMINFO_H_)
+#define NSSYSTEMINFO_H_
+
+#include "nsHashPropertyBag.h"
+#include "nsISystemInfo.h"
+#include "mozilla/MozPromise.h"
+
+
+
+class nsISerialEventTarget;
+
+struct FolderDiskInfo {
+  nsCString model;
+  nsCString revision;
+  bool isSSD;
+};
+
+struct DiskInfo {
+  FolderDiskInfo binary;
+  FolderDiskInfo profile;
+  FolderDiskInfo system;
+};
+
+struct OSInfo {
+  uint32_t installYear;
+  bool hasSuperfetch;
+  bool hasPrefetch;
+};
+
+struct ProcessInfo {
+  bool isWow64 = false;
+  bool isWowARM64 = false;
+  bool isWindowsSMode = false;
+  int32_t cpuCount = 0;
+  int32_t cpuCores = 0;
+  int32_t cpuPCount = 0;
+  int32_t cpuMCount = 0;
+  int32_t cpuECount = 0;
+  nsCString cpuVendor;
+  nsCString cpuName;
+  int32_t cpuFamily = 0;
+  int32_t cpuModel = 0;
+  int32_t cpuStepping = 0;
+  int32_t l2cacheKB = 0;
+  int32_t l3cacheKB = 0;
+  int32_t cpuSpeed = 0;
+};
+
+typedef mozilla::MozPromise<DiskInfo, nsresult,  false>
+    DiskInfoPromise;
+
+typedef mozilla::MozPromise<nsAutoString, nsresult,  false>
+    CountryCodePromise;
+
+typedef mozilla::MozPromise<OSInfo, nsresult,  false>
+    OSInfoPromise;
+
+typedef mozilla::MozPromise<ProcessInfo, nsresult,  false>
+    ProcessInfoPromise;
+
+nsresult CollectProcessInfo(ProcessInfo& info);
+
+class nsSystemInfo final : public nsISystemInfo, public nsHashPropertyBag {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSISYSTEMINFO
+
+  nsSystemInfo();
+
+  nsresult Init();
+
+  static uint32_t gUserUmask;
+
+
+ protected:
+  void SetInt32Property(const nsAString& aPropertyName, const int32_t aValue);
+  void SetUint32Property(const nsAString& aPropertyName, const uint32_t aValue);
+  void SetUint64Property(const nsAString& aPropertyName, const uint64_t aValue);
+
+ private:
+  ~nsSystemInfo();
+
+  RefPtr<DiskInfoPromise> mDiskInfoPromise;
+  RefPtr<CountryCodePromise> mCountryCodePromise;
+  RefPtr<OSInfoPromise> mOSInfoPromise;
+  RefPtr<ProcessInfoPromise> mProcessInfoPromise;
+  RefPtr<nsISerialEventTarget> mBackgroundET;
+  RefPtr<nsISerialEventTarget> GetBackgroundTarget();
+};
+
+#define NS_SYSTEMINFO_CONTRACTID "@mozilla.org/system-info;1"
+#define NS_SYSTEMINFO_CID \
+  {0xd962398a, 0x99e5, 0x49b2, {0x85, 0x7a, 0xc1, 0x59, 0x04, 0x9c, 0x7f, 0x6c}}
+
+#endif

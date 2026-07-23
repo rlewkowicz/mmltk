@@ -1,0 +1,261 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_DRIFTCONTROL_DYNAMICRESAMPLER_H_
+#define DOM_MEDIA_DRIFTCONTROL_DYNAMICRESAMPLER_H_
+
+#include <speex/speex_resampler.h>
+
+#include "AudioRingBuffer.h"
+#include "AudioSegment.h"
+#include "TimeUnits.h"
+#include "WavDumper.h"
+
+namespace mozilla {
+
+const uint32_t STEREO = 2;
+
+class DynamicResampler final {
+ public:
+  DynamicResampler(uint32_t aInRate, uint32_t aOutRate,
+                   uint32_t aInputPreBufferFrameCount = 0);
+  ~DynamicResampler();
+
+  void SetSampleFormat(AudioSampleFormat aFormat);
+  uint32_t GetInRate() const { return mInRate; }
+  uint32_t GetChannels() const { return mChannels; }
+
+  void AppendInput(Span<const float* const> aInBuffer, uint32_t aInFrames);
+  void AppendInput(Span<const int16_t* const> aInBuffer, uint32_t aInFrames);
+  void AppendInputSilence(const uint32_t aInFrames);
+  uint32_t InFramesBufferSize() const;
+  uint32_t InFramesBuffered(uint32_t aChannelIndex) const;
+
+  void EnsurePreBuffer(media::TimeUnit aDuration);
+
+  void SetInputPreBufferFrameCount(uint32_t aInputPreBufferFrameCount);
+
+  bool Resample(float* aOutBuffer, uint32_t aOutFrames, uint32_t aChannelIndex);
+  bool Resample(int16_t* aOutBuffer, uint32_t aOutFrames,
+                uint32_t aChannelIndex);
+
+  void UpdateResampler(uint32_t aInRate, uint32_t aChannels);
+
+ private:
+  template <typename T>
+  void AppendInputInternal(Span<const T* const>& aInBuffer,
+                           uint32_t aInFrames) {
+    MOZ_ASSERT(aInBuffer.Length() == (uint32_t)mChannels);
+    for (uint32_t i = 0; i < mChannels; ++i) {
+      PushInFrames(aInBuffer[i], aInFrames, i);
+    }
+  }
+
+  void ResampleInternal(const float* aInBuffer, uint32_t* aInFrames,
+                        float* aOutBuffer, uint32_t* aOutFrames,
+                        uint32_t aChannelIndex);
+  void ResampleInternal(const int16_t* aInBuffer, uint32_t* aInFrames,
+                        int16_t* aOutBuffer, uint32_t* aOutFrames,
+                        uint32_t aChannelIndex);
+
+  template <typename T>
+  bool ResampleInternal(T* aOutBuffer, uint32_t aOutFrames,
+                        uint32_t aChannelIndex) {
+    MOZ_ASSERT(mInRate);
+    MOZ_ASSERT(mOutRate);
+    MOZ_ASSERT(mChannels);
+    MOZ_ASSERT(aChannelIndex < mChannels);
+    MOZ_ASSERT(aChannelIndex < mInternalInBuffer.Length());
+    MOZ_ASSERT(aOutFrames);
+
+    uint32_t outFramesNeeded = aOutFrames;
+    T* nextOutFrame = aOutBuffer;
+    if (mInRate == mOutRate) {
+      if (!mResamplerIsBypassed) {
+        uint32_t latency = speex_resampler_get_input_latency(mResampler);
+        mInternalInBuffer[aChannelIndex].ReadNoCopy(
+            [&](const Span<const T>& aInBuffer) -> uint32_t {
+              uint32_t outFramesResampled = std::min(outFramesNeeded, latency);
+              uint32_t inFrames = aInBuffer.Length();
+              ResampleInternal(aInBuffer.Elements(), &inFrames, nextOutFrame,
+                               &outFramesResampled, aChannelIndex);
+              nextOutFrame += outFramesResampled;
+              outFramesNeeded -= outFramesResampled;
+              if (outFramesResampled == latency) {
+                mResamplerIsBypassed = true;
+                MOZ_ASSERT(inFrames >= latency);
+                return inFrames - latency;
+              }
+              return inFrames;
+            });
+      }
+      bool underrun = false;
+      if (uint32_t buffered = mInternalInBuffer[aChannelIndex].AvailableRead();
+          buffered < outFramesNeeded) {
+        underrun = true;
+        mIsPreBufferSet = false;
+        mInternalInBuffer[aChannelIndex].WriteSilence(outFramesNeeded -
+                                                      buffered);
+      }
+      DebugOnly<uint32_t> numFramesRead = mInternalInBuffer[aChannelIndex].Read(
+          Span(nextOutFrame, outFramesNeeded));
+      MOZ_ASSERT(numFramesRead == outFramesNeeded);
+      mInputTail[aChannelIndex].StoreTail<T>(aOutBuffer, aOutFrames);
+      if (aChannelIndex == 0 && !mIsWarmingUp) {
+        mInputStreamFile.Write(nextOutFrame, outFramesNeeded);
+        mOutputStreamFile.Write(nextOutFrame, outFramesNeeded);
+      }
+      return underrun;
+    }
+
+    auto resample = [&](const T* aInBuffer, uint32_t aInLength) -> uint32_t {
+      uint32_t outFramesResampled = outFramesNeeded;
+      uint32_t inFrames = aInLength;
+      ResampleInternal(aInBuffer, &inFrames, nextOutFrame, &outFramesResampled,
+                       aChannelIndex);
+      nextOutFrame += outFramesResampled;
+      outFramesNeeded -= outFramesResampled;
+      mInputTail[aChannelIndex].StoreTail<T>(aInBuffer, inFrames);
+      return inFrames;
+    };
+
+    MOZ_ASSERT(!mResamplerIsBypassed);
+    mInternalInBuffer[aChannelIndex].ReadNoCopy(
+        [&](const Span<const T>& aInBuffer) -> uint32_t {
+          if (!outFramesNeeded) {
+            return 0;
+          }
+          return resample(aInBuffer.Elements(), aInBuffer.Length());
+        });
+
+    if (outFramesNeeded == 0) {
+      return false;
+    }
+
+    while (outFramesNeeded > 0) {
+      MOZ_ASSERT(mInternalInBuffer[aChannelIndex].AvailableRead() == 0);
+      uint32_t totalInFramesNeeded =
+          ((CheckedUint32(outFramesNeeded) * mInRate + mOutRate - 1) / mOutRate)
+              .value();
+      resample(nullptr, totalInFramesNeeded);
+    }
+    mIsPreBufferSet = false;
+    return true;
+  }
+
+  template <typename T>
+  void PushInFrames(const T* aInBuffer, const uint32_t aInFrames,
+                    uint32_t aChannelIndex) {
+    MOZ_ASSERT(aInBuffer);
+    MOZ_ASSERT(aInFrames);
+    MOZ_ASSERT(mChannels);
+    MOZ_ASSERT(aChannelIndex < mChannels);
+    MOZ_ASSERT(aChannelIndex < mInternalInBuffer.Length());
+    EnsureInputBufferSizeInFrames(
+        mInternalInBuffer[aChannelIndex].AvailableRead() + aInFrames);
+    mInternalInBuffer[aChannelIndex].Write(Span(aInBuffer, aInFrames));
+  }
+
+  void WarmUpResampler(bool aSkipLatency);
+
+  bool EnsureInputBufferSizeInFrames(uint32_t aSizeInFrames) {
+    uint32_t sampleSize = 0;
+    if (mSampleFormat == AUDIO_FORMAT_FLOAT32) {
+      sampleSize = sizeof(float);
+    } else if (mSampleFormat == AUDIO_FORMAT_S16) {
+      sampleSize = sizeof(short);
+    }
+
+    if (sampleSize == 0) {
+      return true;
+    }
+
+    uint32_t sizeInFrames = InFramesBufferSize();
+    if (aSizeInFrames <= sizeInFrames) {
+      return true;  
+    }
+
+    const uint32_t cap = 5 * mInRate;
+    if (sizeInFrames >= cap) {
+      return false;
+    }
+
+    sizeInFrames *= 2;
+
+    if (aSizeInFrames > sizeInFrames) {
+      sizeInFrames = aSizeInFrames + mInRate / 20;
+    }
+
+    sizeInFrames = std::max(sizeInFrames, mInputPreBufferFrameCount * 2);
+
+    sizeInFrames = std::min(cap, sizeInFrames);
+
+    bool success = true;
+    for (auto& b : mInternalInBuffer) {
+      success = success && b.EnsureLengthBytes(sampleSize * sizeInFrames);
+    }
+
+    if (success) {
+      return true;
+    }
+
+    NS_WARNING(nsPrintfCString("Failed to allocate a buffer of %u bytes (%u "
+                               "frames). Expect glitches.",
+                               sampleSize * sizeInFrames, sizeInFrames)
+                   .get());
+    return false;
+  }
+
+ public:
+  const uint32_t mOutRate;
+
+ private:
+  bool mIsPreBufferSet = false;
+  bool mIsWarmingUp = false;
+  bool mResamplerIsBypassed = true;
+  uint32_t mInputPreBufferFrameCount;
+  uint32_t mChannels = 0;
+  uint32_t mInRate;
+
+  AutoTArray<AudioRingBuffer, STEREO> mInternalInBuffer;
+
+  SpeexResamplerState* mResampler = nullptr;
+  AudioSampleFormat mSampleFormat = AUDIO_FORMAT_SILENCE;
+
+  class TailBuffer {
+   public:
+    template <typename T>
+    T* Buffer() {
+      return reinterpret_cast<T*>(mBuffer);
+    }
+    template <typename T>
+    void StoreTail(const Span<const T>& aInBuffer) {
+      StoreTail(aInBuffer.data(), aInBuffer.size());
+    }
+    template <typename T>
+    void StoreTail(const T* aInBuffer, uint32_t aInFrames) {
+      const T* inBuffer = aInBuffer;
+      mSize = std::min(aInFrames, MAXSIZE);
+      if (inBuffer) {
+        PodCopy(Buffer<T>(), inBuffer + aInFrames - mSize, mSize);
+      } else {
+        std::fill_n(Buffer<T>(), mSize, static_cast<T>(0));
+      }
+    }
+    uint32_t Length() { return mSize; }
+    static constexpr uint32_t MAXSIZE = 20;
+
+   private:
+    float mBuffer[MAXSIZE] = {};
+    uint32_t mSize = 0;
+  };
+  AutoTArray<TailBuffer, STEREO> mInputTail;
+
+  WavDumper mInputStreamFile;
+  WavDumper mOutputStreamFile;
+};
+
+}  
+
+#endif  // DOM_MEDIA_DRIFTCONTROL_DYNAMICRESAMPLER_H_

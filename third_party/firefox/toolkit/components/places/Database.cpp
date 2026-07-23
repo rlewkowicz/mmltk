@@ -1,0 +1,2127 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/DebugOnly.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/SpinEventLoopUntil.h"
+#include "mozilla/StaticPrefs_places.h"
+
+#include "Database.h"
+
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsIFile.h"
+
+#include "nsLocalFile.h"
+#include "nsNavBookmarks.h"
+#include "nsNavHistory.h"
+#include "nsPlacesTables.h"
+#include "nsPlacesIndexes.h"
+#include "nsPlacesTriggers.h"
+#include "nsPlacesMacros.h"
+#include "nsVariant.h"
+#include "SQLFunctions.h"
+#include "ScopedNSSTypes.h"
+#include "Helpers.h"
+#include "nsFaviconService.h"
+#include "ConcurrentConnection.h"
+
+#include "nsAppDirectoryServiceDefs.h"
+#include "nsDirectoryServiceUtils.h"
+#include "prenv.h"
+#include "prsystem.h"
+#include "nsPrintfCString.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/Services.h"
+#include "mozIStorageService.h"
+#include "prtime.h"
+
+#include "nsXULAppAPI.h"
+
+#define RECENT_BACKUP_TIME_MICROSEC (int64_t)86400 * PR_USEC_PER_SEC  // 24H
+
+#define PREF_FORCE_DATABASE_REPLACEMENT \
+  "places.database.replaceDatabaseOnStartup"
+
+#define PREF_DATABASE_CLONEONCORRUPTION "places.database.cloneOnCorruption"
+
+#define PREF_DATABASE_FAVICONS_LASTCORRUPTION \
+  "places.database.lastFaviconsCorruptionInDaysFromEpoch"
+#define PREF_DATABASE_PLACES_LASTCORRUPTION \
+  "places.database.lastPlacesCorruptionInDaysFromEpoch"
+
+#define PREF_GROWTH_INCREMENT_KIB "places.database.growthIncrementKiB"
+
+#define PREF_DISABLE_DURABILITY "places.database.disableDurability"
+
+#define PREF_PREVIEWS_ENABLED "places.previews.enabled"
+
+#define ENV_ALLOW_CORRUPTION \
+  "ALLOW_PLACES_DATABASE_TO_LOSE_DATA_AND_BECOME_CORRUPT"
+
+#define DATABASE_MAX_WAL_BYTES 2048000
+
+#define DATABASE_JOURNAL_OVERHEAD_BYTES 2048000
+
+#define BYTES_PER_KIBIBYTE 1024
+
+#define LAST_USED_ANNO "bookmarkPropertiesDialog/folderLastUsed"_ns
+#define LAST_USED_FOLDERS_META_KEY "places/bookmarks/edit/lastusedfolder"_ns
+
+#define MOBILE_ROOT_TITLE "mobile"
+
+#define USEC_PER_DAY 86400000000LL
+
+using namespace mozilla;
+
+namespace mozilla::places {
+
+namespace {
+
+
+nsString getCorruptFilename(const nsString& aDbFilename) {
+  return aDbFilename + u".corrupt"_ns;
+}
+nsString getRecoverFilename(const nsString& aDbFilename) {
+  return aDbFilename + u".recover"_ns;
+}
+
+bool isRecentCorruptFile(const nsCOMPtr<nsIFile>& aCorruptFile) {
+  MOZ_ASSERT(NS_IsMainThread());
+  bool fileExists = false;
+  if (NS_FAILED(aCorruptFile->Exists(&fileExists)) || !fileExists) {
+    return false;
+  }
+  PRTime lastMod = 0;
+  return NS_SUCCEEDED(aCorruptFile->GetLastModifiedTime(&lastMod)) &&
+         lastMod > 0 && (PR_Now() - lastMod) <= RECENT_BACKUP_TIME_MICROSEC;
+}
+
+void RemoveFileSwallowsErrors(const nsCOMPtr<nsIFile>& aFile,
+                              const nsString& aSuffix = u""_ns) {
+  nsCOMPtr<nsIFile> file;
+  MOZ_ALWAYS_SUCCEEDS(aFile->Clone(getter_AddRefs(file)));
+  if (!aSuffix.IsEmpty()) {
+    nsAutoString newFileName;
+    file->GetLeafName(newFileName);
+    newFileName.Append(aSuffix);
+    MOZ_ALWAYS_SUCCEEDS(file->SetLeafName(newFileName));
+  }
+  DebugOnly<nsresult> rv = file->Remove(false);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv), "Failed to remove file.");
+}
+
+enum JournalMode SetJournalMode(nsCOMPtr<mozIStorageConnection>& aDBConn,
+                                enum JournalMode aJournalMode) {
+  MOZ_ASSERT(NS_IsMainThread());
+  nsAutoCString journalMode;
+  switch (aJournalMode) {
+    default:
+      MOZ_FALLTHROUGH_ASSERT("Trying to set an unknown journal mode.");
+    case JOURNAL_DELETE:
+      journalMode.AssignLiteral("delete");
+      break;
+    case JOURNAL_TRUNCATE:
+      journalMode.AssignLiteral("truncate");
+      break;
+    case JOURNAL_MEMORY:
+      journalMode.AssignLiteral("memory");
+      break;
+    case JOURNAL_WAL:
+      journalMode.AssignLiteral("wal");
+      break;
+  }
+
+  nsCOMPtr<mozIStorageStatement> statement;
+  nsAutoCString query(MOZ_STORAGE_UNIQUIFY_QUERY_STR "PRAGMA journal_mode = ");
+  query.Append(journalMode);
+  aDBConn->CreateStatement(query, getter_AddRefs(statement));
+  NS_ENSURE_TRUE(statement, JOURNAL_DELETE);
+
+  bool hasResult = false;
+  if (NS_SUCCEEDED(statement->ExecuteStep(&hasResult)) && hasResult &&
+      NS_SUCCEEDED(statement->GetUTF8String(0, journalMode))) {
+    if (journalMode.EqualsLiteral("delete")) {
+      return JOURNAL_DELETE;
+    }
+    if (journalMode.EqualsLiteral("truncate")) {
+      return JOURNAL_TRUNCATE;
+    }
+    if (journalMode.EqualsLiteral("memory")) {
+      return JOURNAL_MEMORY;
+    }
+    if (journalMode.EqualsLiteral("wal")) {
+      return JOURNAL_WAL;
+    }
+    MOZ_ASSERT(false, "Got an unknown journal mode.");
+  }
+
+  return JOURNAL_DELETE;
+}
+
+nsresult CreateRoot(nsCOMPtr<mozIStorageConnection>& aDBConn,
+                    const nsCString& aRootName, const nsCString& aGuid,
+                    const nsCString& titleString, const int32_t position,
+                    int64_t& newId) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  static PRTime timestamp = 0;
+  if (!timestamp) timestamp = RoundedPRNow();
+
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = aDBConn->CreateStatement(
+      nsLiteralCString(
+          "INSERT INTO moz_bookmarks "
+          "(type, position, title, dateAdded, lastModified, guid, parent) "
+          "VALUES (:item_type, :item_position, :item_title,"
+          ":date_added, :last_modified, :guid, "
+          "IFNULL((SELECT id FROM moz_bookmarks WHERE parent = 0), 0))"),
+      getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) return rv;
+
+  rv = stmt->BindInt32ByName("item_type"_ns,
+                             nsINavBookmarksService::TYPE_FOLDER);
+  if (NS_FAILED(rv)) return rv;
+  rv = stmt->BindInt32ByName("item_position"_ns, position);
+  if (NS_FAILED(rv)) return rv;
+  rv = stmt->BindUTF8StringByName("item_title"_ns, titleString);
+  if (NS_FAILED(rv)) return rv;
+  rv = stmt->BindInt64ByName("date_added"_ns, timestamp);
+  if (NS_FAILED(rv)) return rv;
+  rv = stmt->BindInt64ByName("last_modified"_ns, timestamp);
+  if (NS_FAILED(rv)) return rv;
+  rv = stmt->BindUTF8StringByName("guid"_ns, aGuid);
+  if (NS_FAILED(rv)) return rv;
+  rv = stmt->Execute();
+  if (NS_FAILED(rv)) return rv;
+
+  newId = nsNavBookmarks::sLastInsertedItemId;
+  return NS_OK;
+}
+
+nsresult SetupDurability(nsCOMPtr<mozIStorageConnection>& aDBConn,
+                         int32_t aDBPageSize) {
+  nsresult rv;
+  if (PR_GetEnv(ENV_ALLOW_CORRUPTION) &&
+      Preferences::GetBool(PREF_DISABLE_DURABILITY, false)) {
+    SetJournalMode(aDBConn, JOURNAL_MEMORY);
+    rv = aDBConn->ExecuteSimpleSQL("PRAGMA synchronous = OFF"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+  } else {
+    if (JOURNAL_WAL == SetJournalMode(aDBConn, JOURNAL_WAL)) {
+      int32_t checkpointPages =
+          static_cast<int32_t>(DATABASE_MAX_WAL_BYTES / aDBPageSize);
+      nsAutoCString checkpointPragma("PRAGMA wal_autocheckpoint = ");
+      checkpointPragma.AppendInt(checkpointPages);
+      rv = aDBConn->ExecuteSimpleSQL(checkpointPragma);
+      NS_ENSURE_SUCCESS(rv, rv);
+    } else {
+      (void)SetJournalMode(aDBConn, JOURNAL_TRUNCATE);
+
+      rv = aDBConn->ExecuteSimpleSQL("PRAGMA synchronous = FULL"_ns);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+  }
+
+  nsAutoCString journalSizePragma("PRAGMA journal_size_limit = ");
+  journalSizePragma.AppendInt(DATABASE_MAX_WAL_BYTES +
+                              DATABASE_JOURNAL_OVERHEAD_BYTES);
+  (void)aDBConn->ExecuteSimpleSQL(journalSizePragma);
+
+  int32_t growthIncrementKiB =
+      Preferences::GetInt(PREF_GROWTH_INCREMENT_KIB, 5 * BYTES_PER_KIBIBYTE);
+  if (growthIncrementKiB > 0) {
+    (void)aDBConn->SetGrowthIncrement(growthIncrementKiB * BYTES_PER_KIBIBYTE,
+                                      ""_ns);
+  }
+  return NS_OK;
+}
+
+nsresult AttachDatabase(nsCOMPtr<mozIStorageConnection>& aDBConn,
+                        const nsACString& aPath, const nsACString& aName) {
+  nsresult rv;
+  nsCString path;
+  path = aPath;
+
+  nsCOMPtr<mozIStorageStatement> stmt;
+  rv = aDBConn->CreateStatement("ATTACH DATABASE :path AS "_ns + aName,
+                                getter_AddRefs(stmt));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = stmt->BindUTF8StringByName("path"_ns, path);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = stmt->Execute();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString journalSizePragma("PRAGMA favicons.journal_size_limit = ");
+  journalSizePragma.AppendInt(DATABASE_MAX_WAL_BYTES +
+                              DATABASE_JOURNAL_OVERHEAD_BYTES);
+  (void)aDBConn->ExecuteSimpleSQL(journalSizePragma);
+
+  return NS_OK;
+}
+
+PRTime GetNow() {
+  nsNavHistory* history = nsNavHistory::GetHistoryService();
+  PRTime now;
+  if (history) {
+    now = history->GetNow();
+  } else {
+    now = PR_Now();
+  }
+  return now;
+}
+
+}  
+
+
+PLACES_FACTORY_SINGLETON_IMPLEMENTATION(Database, gDatabase)
+
+NS_IMPL_ISUPPORTS(Database, nsIObserver, nsISupportsWeakReference)
+
+Database::Database()
+    : mMainThreadStatements(mMainConn),
+      mMainThreadAsyncStatements(mMainConn),
+      mAsyncThreadStatements(mMainConn),
+      mDBPageSize(0),
+      mDatabaseStatus(nsINavHistoryService::DATABASE_STATUS_OK),
+      mClosed(false),
+      mClientsShutdown(new ClientsShutdownBlocker()),
+      mConnectionShutdown(new ConnectionShutdownBlocker(this)),
+      mMaxUrlLength(0),
+      mCacheObservers(TOPIC_PLACES_INIT_COMPLETE),
+      mRootId(-1),
+      mMenuRootId(-1),
+      mTagsRootId(-1),
+      mUnfiledRootId(-1),
+      mToolbarRootId(-1),
+      mMobileRootId(-1) {
+  MOZ_ASSERT(!XRE_IsContentProcess(),
+             "Cannot instantiate Places in the content process");
+  MOZ_ASSERT(!gDatabase);
+  gDatabase = this;
+}
+
+already_AddRefed<nsIAsyncShutdownClient>
+Database::GetProfileChangeTeardownPhase() {
+  nsCOMPtr<nsIAsyncShutdownService> asyncShutdownSvc =
+      services::GetAsyncShutdownService();
+  MOZ_ASSERT(asyncShutdownSvc);
+  if (NS_WARN_IF(!asyncShutdownSvc)) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIAsyncShutdownClient> shutdownPhase;
+  DebugOnly<nsresult> rv =
+      asyncShutdownSvc->GetProfileChangeTeardown(getter_AddRefs(shutdownPhase));
+  MOZ_ASSERT(NS_SUCCEEDED(rv));
+  return shutdownPhase.forget();
+}
+
+already_AddRefed<nsIAsyncShutdownClient>
+Database::GetProfileBeforeChangePhase() {
+  nsCOMPtr<nsIAsyncShutdownService> asyncShutdownSvc =
+      services::GetAsyncShutdownService();
+  MOZ_ASSERT(asyncShutdownSvc);
+  if (NS_WARN_IF(!asyncShutdownSvc)) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIAsyncShutdownClient> shutdownPhase;
+  DebugOnly<nsresult> rv =
+      asyncShutdownSvc->GetProfileBeforeChange(getter_AddRefs(shutdownPhase));
+  MOZ_ASSERT(NS_SUCCEEDED(rv));
+  return shutdownPhase.forget();
+}
+
+Database::~Database() = default;
+
+already_AddRefed<mozIStorageAsyncStatement> Database::GetAsyncStatement(
+    const nsACString& aQuery) {
+  if (PlacesShutdownBlocker::sIsStarted || NS_FAILED(EnsureConnection())) {
+    return nullptr;
+  }
+
+  MOZ_ASSERT(NS_IsMainThread());
+  return mMainThreadAsyncStatements.GetCachedStatement(aQuery);
+}
+
+already_AddRefed<mozIStorageStatement> Database::GetStatement(
+    const nsACString& aQuery) {
+  if (PlacesShutdownBlocker::sIsStarted) {
+    return nullptr;
+  }
+  if (NS_IsMainThread()) {
+    if (NS_FAILED(EnsureConnection())) {
+      return nullptr;
+    }
+    return mMainThreadStatements.GetCachedStatement(aQuery);
+  }
+  MOZ_ASSERT(mMainConn);
+  return mAsyncThreadStatements.GetCachedStatement(aQuery);
+}
+
+already_AddRefed<nsIAsyncShutdownClient> Database::GetClientsShutdown() {
+  if (mClientsShutdown) return mClientsShutdown->GetClient();
+  return nullptr;
+}
+
+already_AddRefed<nsIAsyncShutdownClient> Database::GetConnectionShutdown() {
+  if (mConnectionShutdown) return mConnectionShutdown->GetClient();
+  return nullptr;
+}
+
+already_AddRefed<Database> Database::GetDatabase() {
+  if (PlacesShutdownBlocker::sIsStarted) {
+    return nullptr;
+  }
+  return GetSingleton();
+}
+
+nsresult Database::Init() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+
+  {
+    nsCOMPtr<nsIAsyncShutdownClient> shutdownPhase =
+        GetProfileChangeTeardownPhase();
+    MOZ_ASSERT(shutdownPhase);
+    if (shutdownPhase) {
+      nsresult rv = shutdownPhase->AddBlocker(
+          static_cast<nsIAsyncShutdownBlocker*>(mClientsShutdown.get()),
+          NS_LITERAL_STRING_FROM_CSTRING(__FILE__), __LINE__, u""_ns);
+      if (NS_FAILED(rv)) {
+        PlacesShutdownBlocker::sIsStarted = true;
+        NS_WARNING("Cannot add shutdown blocker for profile-change-teardown");
+      }
+    }
+  }
+
+  {
+    nsCOMPtr<nsIAsyncShutdownClient> shutdownPhase =
+        GetProfileBeforeChangePhase();
+    MOZ_ASSERT(shutdownPhase);
+    if (shutdownPhase) {
+      nsresult rv = shutdownPhase->AddBlocker(
+          static_cast<nsIAsyncShutdownBlocker*>(mConnectionShutdown.get()),
+          NS_LITERAL_STRING_FROM_CSTRING(__FILE__), __LINE__, u""_ns);
+      if (NS_FAILED(rv)) {
+        PlacesShutdownBlocker::sIsStarted = true;
+        NS_WARNING("Cannot add shutdown blocker for profile-before-change");
+      }
+    }
+  }
+
+  nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
+  if (os) {
+    (void)os->AddObserver(this, TOPIC_PROFILE_CHANGE_TEARDOWN, true);
+  }
+  return NS_OK;
+}
+
+nsresult Database::EnsureConnection() {
+  if (mMainConn ||
+      mDatabaseStatus == nsINavHistoryService::DATABASE_STATUS_LOCKED) {
+    return NS_OK;
+  }
+  if (PlacesShutdownBlocker::sIsStarted) {
+    return NS_ERROR_FAILURE;
+  }
+
+  MOZ_ASSERT(NS_IsMainThread(),
+             "Database initialization must happen on the main-thread");
+
+  {
+    bool initSucceeded = false;
+    auto notify = MakeScopeExit([&]() {
+      if (!initSucceeded) {
+        mMainConn = nullptr;
+        mDatabaseStatus = nsINavHistoryService::DATABASE_STATUS_LOCKED;
+      }
+      NS_DispatchToMainThread(
+          NewRunnableMethod("places::Database::EnsureConnection()", this,
+                            &Database::NotifyConnectionInitalized));
+    });
+
+    nsCOMPtr<mozIStorageService> storage =
+        do_GetService(MOZ_STORAGE_SERVICE_CONTRACTID);
+    NS_ENSURE_STATE(storage);
+
+    nsCOMPtr<nsIFile> profileDir;
+    nsresult rv = NS_GetSpecialDirectory(NS_APP_USER_PROFILE_50_DIR,
+                                         getter_AddRefs(profileDir));
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    nsCOMPtr<nsIFile> databaseFile;
+    rv = profileDir->Clone(getter_AddRefs(databaseFile));
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = databaseFile->Append(DATABASE_FILENAME);
+    NS_ENSURE_SUCCESS(rv, rv);
+    bool databaseExisted = false;
+    rv = databaseFile->Exists(&databaseExisted);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    nsAutoString corruptDbName;
+    if (NS_SUCCEEDED(Preferences::GetString(PREF_FORCE_DATABASE_REPLACEMENT,
+                                            corruptDbName)) &&
+        !corruptDbName.IsEmpty()) {
+      (void)Preferences::ClearUser(PREF_FORCE_DATABASE_REPLACEMENT);
+
+      nsCOMPtr<nsIFile> fileToBeReplaced;
+      bool fileExists = false;
+      if (NS_SUCCEEDED(profileDir->Clone(getter_AddRefs(fileToBeReplaced))) &&
+          NS_SUCCEEDED(fileToBeReplaced->Exists(&fileExists)) && fileExists) {
+        rv = BackupAndReplaceDatabaseFile(storage, corruptDbName, true, false);
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+    }
+
+    rv = storage->OpenUnsharedDatabase(databaseFile,
+                                       mozIStorageService::CONNECTION_DEFAULT,
+                                       getter_AddRefs(mMainConn));
+    if (rv == NS_ERROR_STORAGE_IOERR) {
+      ConcurrentConnection::MaybeInterrupt();
+      rv = storage->OpenUnsharedDatabase(databaseFile,
+                                         mozIStorageService::CONNECTION_DEFAULT,
+                                         getter_AddRefs(mMainConn));
+    }
+    if (NS_SUCCEEDED(rv) && !databaseExisted) {
+      mDatabaseStatus = nsINavHistoryService::DATABASE_STATUS_CREATE;
+    } else if (rv == NS_ERROR_FILE_CORRUPTED) {
+      CheckedInt<int32_t> daysSinceEpoch = GetNow() / USEC_PER_DAY;
+      if (daysSinceEpoch.isValid()) {
+        Preferences::SetInt(PREF_DATABASE_PLACES_LASTCORRUPTION,
+                            daysSinceEpoch.value());
+      }
+      rv = BackupAndReplaceDatabaseFile(storage, DATABASE_FILENAME, true, true);
+    }
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    bool databaseMigrated = false;
+    rv = SetupDatabaseConnection(storage);
+    bool shouldTryToCloneDb = true;
+    if (NS_SUCCEEDED(rv)) {
+      rv = InitSchema(&databaseMigrated);
+      if (NS_FAILED(rv)) {
+        shouldTryToCloneDb = false;
+        if (rv == NS_ERROR_STORAGE_BUSY || rv == NS_ERROR_FILE_IS_LOCKED ||
+            rv == NS_ERROR_FILE_NO_DEVICE_SPACE ||
+            rv == NS_ERROR_OUT_OF_MEMORY) {
+          rv = InitSchema(&databaseMigrated);
+          if (NS_FAILED(rv)) {
+            rv = NS_ERROR_FILE_IS_LOCKED;
+          }
+        } else {
+          rv = NS_ERROR_FILE_CORRUPTED;
+        }
+      }
+    }
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      if (rv != NS_ERROR_FILE_IS_LOCKED) {
+        mDatabaseStatus = nsINavHistoryService::DATABASE_STATUS_CORRUPT;
+      }
+      if (rv == NS_ERROR_FILE_CORRUPTED) {
+        CheckedInt<int32_t> daysSinceEpoch = GetNow() / USEC_PER_DAY;
+        if (daysSinceEpoch.isValid()) {
+          Preferences::SetInt(PREF_DATABASE_PLACES_LASTCORRUPTION,
+                              daysSinceEpoch.value());
+          Preferences::SetInt(PREF_DATABASE_FAVICONS_LASTCORRUPTION,
+                              daysSinceEpoch.value());
+        }
+
+        rv = BackupAndReplaceDatabaseFile(storage, DATABASE_FAVICONS_FILENAME,
+                                          false, false);
+        NS_ENSURE_SUCCESS(rv, rv);
+        rv = BackupAndReplaceDatabaseFile(storage, DATABASE_FILENAME,
+                                          shouldTryToCloneDb, true);
+        NS_ENSURE_SUCCESS(rv, rv);
+        rv = SetupDatabaseConnection(storage);
+        NS_ENSURE_SUCCESS(rv, rv);
+        rv = InitSchema(&databaseMigrated);
+      }
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+
+    if (databaseMigrated) {
+      mDatabaseStatus = nsINavHistoryService::DATABASE_STATUS_UPGRADED;
+    }
+
+
+    rv = InitTempEntities();
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = CheckRoots();
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    initSucceeded = true;
+  }
+  return NS_OK;
+}
+
+nsresult Database::NotifyConnectionInitalized() {
+  MOZ_ASSERT(NS_IsMainThread());
+  nsCOMArray<nsIObserver> entries;
+  mCacheObservers.GetEntries(entries);
+  for (int32_t idx = 0; idx < entries.Count(); ++idx) {
+    MOZ_ALWAYS_SUCCEEDS(
+        entries[idx]->Observe(nullptr, TOPIC_PLACES_INIT_COMPLETE, nullptr));
+  }
+  nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+  if (obs) {
+    MOZ_ALWAYS_SUCCEEDS(
+        obs->NotifyObservers(nullptr, TOPIC_PLACES_INIT_COMPLETE, nullptr));
+  }
+  return NS_OK;
+}
+
+nsresult Database::EnsureFaviconsDatabaseAttached(
+    const nsCOMPtr<mozIStorageService>& aStorage) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  nsCOMPtr<nsIFile> databaseFile;
+  NS_GetSpecialDirectory(NS_APP_USER_PROFILE_50_DIR,
+                         getter_AddRefs(databaseFile));
+  NS_ENSURE_STATE(databaseFile);
+  nsresult rv = databaseFile->Append(DATABASE_FAVICONS_FILENAME);
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsString iconsPath;
+  rv = databaseFile->GetPath(iconsPath);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  bool fileExists = false;
+  if (NS_SUCCEEDED(databaseFile->Exists(&fileExists)) && fileExists) {
+    return AttachDatabase(mMainConn, NS_ConvertUTF16toUTF8(iconsPath),
+                          DATABASE_FAVICONS_SCHEMANAME);
+  }
+
+  nsCOMPtr<mozIStorageConnection> conn;
+  rv = aStorage->OpenUnsharedDatabase(databaseFile,
+                                      mozIStorageService::CONNECTION_DEFAULT,
+                                      getter_AddRefs(conn));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  {
+    auto cleanup = MakeScopeExit([&]() {
+      MOZ_ALWAYS_TRUE(NS_SUCCEEDED(conn->Close()));
+    });
+
+    rv = conn->ExecuteSimpleSQL("PRAGMA auto_vacuum = INCREMENTAL"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+#if !defined(HAVE_64BIT_BUILD)
+    rv = conn->ExecuteSimpleSQL("PRAGMA temp_store = MEMORY"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+#endif
+
+    int32_t defaultPageSize;
+    rv = conn->GetDefaultPageSize(&defaultPageSize);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = SetupDurability(conn, defaultPageSize);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    mozStorageTransaction transaction(conn, false);
+    (void)NS_WARN_IF(NS_FAILED(transaction.Start()));
+    rv = conn->ExecuteSimpleSQL(CREATE_MOZ_ICONS);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = conn->ExecuteSimpleSQL(CREATE_IDX_MOZ_ICONS_ICONURLHASH);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = conn->ExecuteSimpleSQL(CREATE_MOZ_PAGES_W_ICONS);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = conn->ExecuteSimpleSQL(CREATE_IDX_MOZ_PAGES_W_ICONS_ICONURLHASH);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = conn->ExecuteSimpleSQL(CREATE_MOZ_ICONS_TO_PAGES);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = transaction.Commit();
+    NS_ENSURE_SUCCESS(rv, rv);
+
+  }
+
+  rv = AttachDatabase(mMainConn, NS_ConvertUTF16toUTF8(iconsPath),
+                      DATABASE_FAVICONS_SCHEMANAME);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult Database::BackupAndReplaceDatabaseFile(
+    nsCOMPtr<mozIStorageService>& aStorage, const nsString& aDbFilename,
+    bool aTryToClone, bool aReopenConnection) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (aDbFilename.Equals(DATABASE_FILENAME)) {
+    mDatabaseStatus = nsINavHistoryService::DATABASE_STATUS_CORRUPT;
+  } else {
+    aTryToClone = false;
+  }
+
+  nsCOMPtr<nsIFile> profDir;
+  nsresult rv = NS_GetSpecialDirectory(NS_APP_USER_PROFILE_50_DIR,
+                                       getter_AddRefs(profDir));
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsCOMPtr<nsIFile> databaseFile;
+  rv = profDir->Clone(getter_AddRefs(databaseFile));
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = databaseFile->Append(aDbFilename);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIFile> corruptFile;
+  rv = profDir->Clone(getter_AddRefs(corruptFile));
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsString corruptFilename = getCorruptFilename(aDbFilename);
+  rv = corruptFile->Append(corruptFilename);
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (!isRecentCorruptFile(corruptFile)) {
+    nsCOMPtr<nsIFile> corruptFile;
+    rv = profDir->Clone(getter_AddRefs(corruptFile));
+    NS_ENSURE_SUCCESS(rv, rv);
+    nsString corruptFilename = getCorruptFilename(aDbFilename);
+    rv = corruptFile->Append(corruptFilename);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = corruptFile->Remove(false);
+    if (NS_FAILED(rv) && rv != NS_ERROR_FILE_NOT_FOUND) {
+      return rv;
+    }
+
+    nsCOMPtr<nsIFile> backup;
+    (void)BackupDatabaseFile(databaseFile, corruptFilename, profDir,
+                             getter_AddRefs(backup));
+  }
+
+  {
+    bool needsRetry = true;
+    auto guard = MakeScopeExit([&]() {
+      if (needsRetry) {
+        Preferences::SetString(PREF_FORCE_DATABASE_REPLACEMENT, aDbFilename);
+      }
+    });
+
+    if (mMainConn) {
+      rv = mMainConn->SpinningSynchronousClose();
+      NS_ENSURE_SUCCESS(rv, rv);
+      mMainConn = nullptr;
+    }
+
+    rv = databaseFile->Remove(false);
+    if (NS_FAILED(rv) && rv != NS_ERROR_FILE_NOT_FOUND) {
+      return rv;
+    }
+    needsRetry = false;
+
+    if (aTryToClone &&
+        Preferences::GetBool(PREF_DATABASE_CLONEONCORRUPTION, true)) {
+      rv = TryToCloneTablesFromCorruptDatabase(aStorage, databaseFile);
+      if (NS_SUCCEEDED(rv)) {
+        mDatabaseStatus = nsINavHistoryService::DATABASE_STATUS_OK;
+      }
+    }
+
+    if (aReopenConnection) {
+      rv = aStorage->OpenUnsharedDatabase(
+          databaseFile, mozIStorageService::CONNECTION_DEFAULT,
+          getter_AddRefs(mMainConn));
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult Database::TryToCloneTablesFromCorruptDatabase(
+    const nsCOMPtr<mozIStorageService>& aStorage,
+    const nsCOMPtr<nsIFile>& aDatabaseFile) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  nsAutoString filename;
+  nsresult rv = aDatabaseFile->GetLeafName(filename);
+
+  nsCOMPtr<nsIFile> corruptFile;
+  rv = aDatabaseFile->Clone(getter_AddRefs(corruptFile));
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = corruptFile->SetLeafName(getCorruptFilename(filename));
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsAutoString path;
+  rv = corruptFile->GetPath(path);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIFile> recoverFile;
+  rv = aDatabaseFile->Clone(getter_AddRefs(recoverFile));
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = recoverFile->SetLeafName(getRecoverFilename(filename));
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = recoverFile->Remove(false);
+  if (NS_FAILED(rv) && rv != NS_ERROR_FILE_NOT_FOUND) {
+    return rv;
+  }
+
+  nsCOMPtr<mozIStorageConnection> conn;
+  auto guard = MakeScopeExit([&]() {
+    if (conn) {
+      (void)conn->Close();
+    }
+    RemoveFileSwallowsErrors(recoverFile);
+  });
+
+  rv = aStorage->OpenUnsharedDatabase(recoverFile,
+                                      mozIStorageService::CONNECTION_DEFAULT,
+                                      getter_AddRefs(conn));
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = AttachDatabase(conn, NS_ConvertUTF16toUTF8(path), "corrupt"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mozStorageTransaction transaction(conn, false);
+
+  (void)NS_WARN_IF(NS_FAILED(transaction.Start()));
+
+  nsCOMPtr<mozIStorageStatement> stmt;
+  (void)conn->CreateStatement("PRAGMA corrupt.user_version"_ns,
+                              getter_AddRefs(stmt));
+  NS_ENSURE_TRUE(stmt, NS_ERROR_OUT_OF_MEMORY);
+  bool hasResult;
+  rv = stmt->ExecuteStep(&hasResult);
+  NS_ENSURE_SUCCESS(rv, rv);
+  int32_t schemaVersion = stmt->AsInt32(0);
+  rv = conn->SetSchemaVersion(schemaVersion);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = conn->CreateStatement(
+      nsLiteralCString(
+          "SELECT name, sql FROM corrupt.sqlite_master "
+          "WHERE type = 'table' AND name BETWEEN 'moz_' AND 'moza'"),
+      getter_AddRefs(stmt));
+  NS_ENSURE_SUCCESS(rv, rv);
+  while (NS_SUCCEEDED(stmt->ExecuteStep(&hasResult)) && hasResult) {
+    nsAutoCString name;
+    rv = stmt->GetUTF8String(0, name);
+    NS_ENSURE_SUCCESS(rv, rv);
+    nsAutoCString query;
+    rv = stmt->GetUTF8String(1, query);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = conn->ExecuteSimpleSQL(query);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = conn->ExecuteSimpleSQL("INSERT INTO main."_ns + name +
+                                " SELECT * FROM corrupt."_ns + name);
+    if (NS_FAILED(rv)) {
+      rv = conn->ExecuteSimpleSQL("INSERT INTO main."_ns + name +
+                                  " SELECT * FROM corrupt."_ns + name +
+                                  " ORDER BY rowid DESC"_ns);
+    }
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  rv = conn->CreateStatement(
+      nsLiteralCString(
+          "SELECT sql FROM corrupt.sqlite_master "
+          "WHERE type <> 'table' AND name BETWEEN 'moz_' AND 'moza'"),
+      getter_AddRefs(stmt));
+  NS_ENSURE_SUCCESS(rv, rv);
+  hasResult = false;
+  while (NS_SUCCEEDED(stmt->ExecuteStep(&hasResult)) && hasResult) {
+    nsAutoCString query;
+    rv = stmt->GetUTF8String(0, query);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = conn->ExecuteSimpleSQL(query);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  rv = stmt->Finalize();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = transaction.Commit();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  MOZ_ALWAYS_SUCCEEDS(conn->Close());
+  conn = nullptr;
+  rv = recoverFile->RenameTo(nullptr, filename);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  RemoveFileSwallowsErrors(corruptFile);
+  RemoveFileSwallowsErrors(corruptFile, u"-wal"_ns);
+  RemoveFileSwallowsErrors(corruptFile, u"-shm"_ns);
+
+  guard.release();
+  return NS_OK;
+}
+
+nsresult Database::SetupDatabaseConnection(
+    nsCOMPtr<mozIStorageService>& aStorage) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  nsresult rv = mMainConn->SetDefaultTransactionType(
+      mozIStorageConnection::TRANSACTION_IMMEDIATE);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+
+  {
+    nsCOMPtr<mozIStorageStatement> statement;
+    rv = mMainConn->CreateStatement(
+        nsLiteralCString(MOZ_STORAGE_UNIQUIFY_QUERY_STR "PRAGMA page_size"),
+        getter_AddRefs(statement));
+    NS_ENSURE_SUCCESS(rv, rv);
+    bool hasResult = false;
+    rv = statement->ExecuteStep(&hasResult);
+    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_TRUE(hasResult, NS_ERROR_FILE_CORRUPTED);
+    rv = statement->GetInt32(0, &mDBPageSize);
+    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_TRUE(mDBPageSize > 0, NS_ERROR_FILE_CORRUPTED);
+  }
+
+#if !defined(HAVE_64BIT_BUILD)
+  rv = mMainConn->ExecuteSimpleSQL(nsLiteralCString(
+      MOZ_STORAGE_UNIQUIFY_QUERY_STR "PRAGMA temp_store = MEMORY"));
+  NS_ENSURE_SUCCESS(rv, rv);
+#endif
+
+  rv = SetupDurability(mMainConn, mDBPageSize);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString busyTimeoutPragma("PRAGMA busy_timeout = ");
+  busyTimeoutPragma.AppendInt(DATABASE_BUSY_TIMEOUT_MS);
+  (void)mMainConn->ExecuteSimpleSQL(busyTimeoutPragma);
+
+  rv = mMainConn->ExecuteSimpleSQL(nsLiteralCString(
+      MOZ_STORAGE_UNIQUIFY_QUERY_STR "PRAGMA foreign_keys = ON"));
+  NS_ENSURE_SUCCESS(rv, rv);
+#ifdef DEBUG
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    mMainConn->CreateStatement("PRAGMA foreign_keys"_ns, getter_AddRefs(stmt));
+    bool hasResult = false;
+    if (stmt && NS_SUCCEEDED(stmt->ExecuteStep(&hasResult)) && hasResult) {
+      int32_t fkState = stmt->AsInt32(0);
+      MOZ_ASSERT(fkState, "Foreign keys should be enabled");
+    }
+  }
+#endif
+
+
+  rv = EnsureFaviconsDatabaseAttached(aStorage);
+  if (NS_FAILED(rv)) {
+    if (rv != NS_ERROR_FILE_CORRUPTED) {
+      rv = EnsureFaviconsDatabaseAttached(aStorage);
+      NS_ENSURE_SUCCESS(rv, rv);
+    } else {
+      CheckedInt<int32_t> daysSinceEpoch = GetNow() / USEC_PER_DAY;
+      if (daysSinceEpoch.isValid()) {
+        Preferences::SetInt(PREF_DATABASE_FAVICONS_LASTCORRUPTION,
+                            daysSinceEpoch.value());
+      }
+
+      nsCOMPtr<nsIFile> iconsFile;
+      rv = NS_GetSpecialDirectory(NS_APP_USER_PROFILE_50_DIR,
+                                  getter_AddRefs(iconsFile));
+      NS_ENSURE_SUCCESS(rv, rv);
+      rv = iconsFile->Append(DATABASE_FAVICONS_FILENAME);
+      NS_ENSURE_SUCCESS(rv, rv);
+      rv = iconsFile->Remove(false);
+      if (NS_FAILED(rv) && rv != NS_ERROR_FILE_NOT_FOUND) {
+        return rv;
+      }
+      rv = EnsureFaviconsDatabaseAttached(aStorage);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+  }
+
+  rv = mMainConn->ExecuteSimpleSQL(CREATE_ICONS_AFTERINSERT_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = InitFunctions(mMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult Database::InitSchema(bool* aDatabaseMigrated) {
+  MOZ_ASSERT(NS_IsMainThread());
+  *aDatabaseMigrated = false;
+
+  int32_t currentSchemaVersion;
+  nsresult rv = mMainConn->GetSchemaVersion(&currentSchemaVersion);
+  NS_ENSURE_SUCCESS(rv, rv);
+  bool databaseInitialized = currentSchemaVersion > 0;
+
+  if (databaseInitialized &&
+      currentSchemaVersion == nsINavHistoryService::DATABASE_SCHEMA_VERSION) {
+    return NS_OK;
+  }
+
+  mozStorageTransaction transaction(mMainConn, false);
+
+  (void)NS_WARN_IF(NS_FAILED(transaction.Start()));
+
+  if (databaseInitialized) {
+
+    if (currentSchemaVersion < nsINavHistoryService::DATABASE_SCHEMA_VERSION) {
+      *aDatabaseMigrated = true;
+
+      if (currentSchemaVersion < 52) {
+        return NS_ERROR_FILE_CORRUPTED;
+      }
+
+
+      if (currentSchemaVersion < 53) {
+        rv = MigrateV53Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+      if (currentSchemaVersion < 54) {
+        rv = MigrateV54Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+      if (currentSchemaVersion < 55) {
+        rv = MigrateV55Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+      if (currentSchemaVersion < 56) {
+        rv = MigrateV56Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+      if (currentSchemaVersion < 57) {
+        rv = MigrateV57Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+
+
+
+
+      if (currentSchemaVersion < 60) {
+        rv = MigrateV60Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+      if (currentSchemaVersion < 61) {
+        rv = MigrateV61Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+
+
+
+
+
+
+
+
+      if (currentSchemaVersion < 67) {
+        rv = MigrateV67Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+
+      if (currentSchemaVersion < 69) {
+        rv = MigrateV69Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+      if (currentSchemaVersion < 70) {
+        rv = MigrateV70Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+      if (currentSchemaVersion < 71) {
+        rv = MigrateV71Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+      if (currentSchemaVersion < 72) {
+        rv = MigrateV72Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+      if (currentSchemaVersion < 73) {
+        rv = MigrateV73Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+      if (currentSchemaVersion < 74) {
+        rv = MigrateV74Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+      if (currentSchemaVersion < 75) {
+        rv = MigrateV75Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+
+      if (currentSchemaVersion < 77) {
+        rv = MigrateV77Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+      if (currentSchemaVersion < 78) {
+        rv = MigrateV78Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+      if (currentSchemaVersion < 79) {
+        rv = MigrateV79Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+      if (currentSchemaVersion < 80) {
+        rv = MigrateV80Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+      if (currentSchemaVersion < 81) {
+        rv = MigrateV81Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+      if (currentSchemaVersion < 82) {
+        rv = MigrateV82Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+      if (currentSchemaVersion < 83) {
+        rv = MigrateV83Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+      if (currentSchemaVersion < 85) {
+        rv = MigrateV85Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+
+      if (currentSchemaVersion < 86) {
+        rv = MigrateV86Up();
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+    }
+  } else {
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_ORIGINS);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_PLACES);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_PLACES_URL_HASH);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_PLACES_REVHOST);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_PLACES_VISITCOUNT);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_PLACES_FRECENCY);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_PLACES_LASTVISITDATE);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_PLACES_GUID);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_PLACES_ORIGIN_ID);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_PLACES_ALT_FRECENCY);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_HISTORYVISITS);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_HISTORYVISITS_PLACEDATE);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_HISTORYVISITS_FROMVISIT);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_HISTORYVISITS_VISITDATE);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_INPUTHISTORY);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_BOOKMARKS);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_BOOKMARKS_PLACETYPE);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_BOOKMARKS_PARENTPOSITION);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv =
+        mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_BOOKMARKS_PLACELASTMODIFIED);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_BOOKMARKS_DATEADDED);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_BOOKMARKS_GUID);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_KEYWORDS);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_KEYWORDS_PLACEPOSTDATA);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_ANNO_ATTRIBUTES);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_ANNOS);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_ANNOS_PLACEATTRIBUTE);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_ITEMS_ANNOS);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_ITEMSANNOS_PLACEATTRIBUTE);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_META);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_PLACES_METADATA);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(
+        CREATE_IDX_MOZ_PLACES_METADATA_PLACECREATED);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_PLACES_METADATA_REFERRER);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_PLACES_METADATA_SEARCH_QUERIES);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_PREVIEWS_TOMBSTONES);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_NEWTAB_STORY_CLICK);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_NEWTAB_STORY_IMPRESSION);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(
+        CREATE_IDX_MOZ_NEWTAB_STORY_CLICK_TIMESTAMP);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv =
+        mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_NEWTAB_IMPRESSION_TIMESTAMP);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_NEWTAB_SHORTCUTS_INTERACTION);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_NEWTAB_SHORTCUTS_TIMESTAMP);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_NEWTAB_SHORTCUTS_PLACEID);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+  }
+
+  rv = mMainConn->SetSchemaVersion(
+      nsINavHistoryService::DATABASE_SCHEMA_VERSION);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = transaction.Commit();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+
+  return NS_OK;
+}
+
+nsresult Database::CheckRoots() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mDatabaseStatus == nsINavHistoryService::DATABASE_STATUS_CREATE) {
+    return EnsureBookmarkRoots(0,  false);
+  }
+
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->CreateStatement(
+      nsLiteralCString("SELECT guid, id, position, parent FROM moz_bookmarks "
+                       "WHERE guid IN ( "
+                       "'" ROOT_GUID "', '" MENU_ROOT_GUID
+                       "', '" TOOLBAR_ROOT_GUID "', "
+                       "'" TAGS_ROOT_GUID "', '" UNFILED_ROOT_GUID
+                       "', '" MOBILE_ROOT_GUID "' )"),
+      getter_AddRefs(stmt));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  bool hasResult;
+  nsAutoCString guid;
+  int32_t maxPosition = 0;
+  bool shouldReparentRoots = false;
+  while (NS_SUCCEEDED(stmt->ExecuteStep(&hasResult)) && hasResult) {
+    rv = stmt->GetUTF8String(0, guid);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    int64_t parentId = stmt->AsInt64(3);
+
+    if (guid.EqualsLiteral(ROOT_GUID)) {
+      mRootId = stmt->AsInt64(1);
+      shouldReparentRoots |= parentId != 0;
+    } else {
+      maxPosition = std::max(stmt->AsInt32(2), maxPosition);
+
+      if (guid.EqualsLiteral(MENU_ROOT_GUID)) {
+        mMenuRootId = stmt->AsInt64(1);
+      } else if (guid.EqualsLiteral(TOOLBAR_ROOT_GUID)) {
+        mToolbarRootId = stmt->AsInt64(1);
+      } else if (guid.EqualsLiteral(TAGS_ROOT_GUID)) {
+        mTagsRootId = stmt->AsInt64(1);
+      } else if (guid.EqualsLiteral(UNFILED_ROOT_GUID)) {
+        mUnfiledRootId = stmt->AsInt64(1);
+      } else if (guid.EqualsLiteral(MOBILE_ROOT_GUID)) {
+        mMobileRootId = stmt->AsInt64(1);
+      }
+      shouldReparentRoots |= parentId != mRootId;
+    }
+  }
+
+  rv = EnsureBookmarkRoots(maxPosition + 1, shouldReparentRoots);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult Database::EnsureBookmarkRoots(const int32_t startPosition,
+                                       bool shouldReparentRoots) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  nsresult rv;
+
+  if (mRootId < 1) {
+    rv = CreateRoot(mMainConn, "places"_ns, "root________"_ns, ""_ns, 0,
+                    mRootId);
+
+    if (NS_FAILED(rv)) return rv;
+  }
+
+  int32_t position = startPosition;
+
+  if (mMenuRootId < 1) {
+    rv = CreateRoot(mMainConn, "menu"_ns, "menu________"_ns, "menu"_ns,
+                    position, mMenuRootId);
+    if (NS_FAILED(rv)) return rv;
+    position++;
+  }
+
+  if (mToolbarRootId < 1) {
+    rv = CreateRoot(mMainConn, "toolbar"_ns, "toolbar_____"_ns, "toolbar"_ns,
+                    position, mToolbarRootId);
+    if (NS_FAILED(rv)) return rv;
+    position++;
+  }
+
+  if (mTagsRootId < 1) {
+    rv = CreateRoot(mMainConn, "tags"_ns, "tags________"_ns, "tags"_ns,
+                    position, mTagsRootId);
+    if (NS_FAILED(rv)) return rv;
+    position++;
+  }
+
+  if (mUnfiledRootId < 1) {
+    rv = CreateRoot(mMainConn, "unfiled"_ns, "unfiled_____"_ns, "unfiled"_ns,
+                    position, mUnfiledRootId);
+    if (NS_FAILED(rv)) return rv;
+    position++;
+  }
+
+  if (mMobileRootId < 1) {
+    int64_t mobileRootId = CreateMobileRoot();
+    if (mobileRootId <= 0) return NS_ERROR_FAILURE;
+    mMobileRootId = mobileRootId;
+  }
+
+  if (!shouldReparentRoots) {
+    return NS_OK;
+  }
+
+  rv = mMainConn->ExecuteSimpleSQL(nsLiteralCString(
+      "CREATE TEMP TRIGGER moz_ensure_bookmark_roots_trigger "
+      "AFTER UPDATE OF parent ON moz_bookmarks FOR EACH ROW "
+      "WHEN OLD.parent <> NEW.parent "
+      "BEGIN "
+      "UPDATE moz_bookmarks SET "
+      "position = position - 1 "
+      "WHERE parent = OLD.parent AND position >= OLD.position; "
+
+      "UPDATE moz_bookmarks SET "
+      "position = IFNULL((SELECT MAX(position) + 1 FROM moz_bookmarks "
+      "WHERE parent = NEW.parent AND "
+      "id <> NEW.id), 0)"
+      "WHERE id = NEW.id; "
+      "END"));
+  if (NS_FAILED(rv)) return rv;
+  auto guard = MakeScopeExit([&]() {
+    (void)mMainConn->ExecuteSimpleSQL(
+        "DROP TRIGGER moz_ensure_bookmark_roots_trigger"_ns);
+  });
+
+  nsCOMPtr<mozIStorageStatement> reparentStmt;
+  rv = mMainConn->CreateStatement(
+      nsLiteralCString(
+          "UPDATE moz_bookmarks SET "
+          "parent = CASE id WHEN :root_id THEN 0 ELSE :root_id END "
+          "WHERE id IN (:root_id, :menu_root_id, :toolbar_root_id, "
+          ":tags_root_id, "
+          ":unfiled_root_id, :mobile_root_id)"),
+      getter_AddRefs(reparentStmt));
+  if (NS_FAILED(rv)) return rv;
+
+  rv = reparentStmt->BindInt64ByName("root_id"_ns, mRootId);
+  if (NS_FAILED(rv)) return rv;
+  rv = reparentStmt->BindInt64ByName("menu_root_id"_ns, mMenuRootId);
+  if (NS_FAILED(rv)) return rv;
+  rv = reparentStmt->BindInt64ByName("toolbar_root_id"_ns, mToolbarRootId);
+  if (NS_FAILED(rv)) return rv;
+  rv = reparentStmt->BindInt64ByName("tags_root_id"_ns, mTagsRootId);
+  if (NS_FAILED(rv)) return rv;
+  rv = reparentStmt->BindInt64ByName("unfiled_root_id"_ns, mUnfiledRootId);
+  if (NS_FAILED(rv)) return rv;
+  rv = reparentStmt->BindInt64ByName("mobile_root_id"_ns, mMobileRootId);
+  if (NS_FAILED(rv)) return rv;
+
+  rv = reparentStmt->Execute();
+  if (NS_FAILED(rv)) return rv;
+
+  return NS_OK;
+}
+
+nsresult Database::InitFunctions(mozIStorageConnection* aMainConn) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  nsresult rv = GetUnreversedHostFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = MatchAutoCompleteFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = CalculateFrecencyFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = GenerateGUIDFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = IsValidGUIDFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = FixupURLFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = StoreLastInsertedIdFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = HashFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = GetQueryParamFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = GetPrefixFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = GetHostAndPortFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = StripPrefixAndUserinfoFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = InvalidateDaysOfHistoryFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = SHA256HexFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = SetShouldStartFrecencyRecalculationFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = TargetFolderGuidFunction::create(aMainConn);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (StaticPrefs::places_frecency_pages_alternative_featureGate_AtStartup()) {
+    rv = CalculateAltFrecencyFunction::create(aMainConn);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  return NS_OK;
+}
+
+nsresult Database::InitTempEntities() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  nsresult rv =
+      mMainConn->ExecuteSimpleSQL(CREATE_HISTORYVISITS_AFTERINSERT_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(CREATE_HISTORYVISITS_AFTERDELETE_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = mMainConn->ExecuteSimpleSQL(CREATE_PLACES_AFTERINSERT_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(CREATE_UPDATEORIGINSDELETE_TEMP);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      CREATE_UPDATEORIGINSDELETE_AFTERDELETE_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (Preferences::GetBool(PREF_PREVIEWS_ENABLED, false)) {
+    rv = mMainConn->ExecuteSimpleSQL(
+        CREATE_PLACES_AFTERDELETE_WPREVIEWS_TRIGGER);
+    NS_ENSURE_SUCCESS(rv, rv);
+  } else {
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_PLACES_AFTERDELETE_TRIGGER);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  rv = mMainConn->ExecuteSimpleSQL(CREATE_PLACES_AFTERUPDATE_FRECENCY_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      CREATE_PLACES_AFTERUPDATE_RECALC_FRECENCY_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      CREATE_ORIGINS_AFTERUPDATE_RECALC_FRECENCY_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(CREATE_ORIGINS_AFTERUPDATE_FRECENCY_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = mMainConn->ExecuteSimpleSQL(
+      CREATE_BOOKMARKS_FOREIGNCOUNT_AFTERDELETE_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      CREATE_BOOKMARKS_FOREIGNCOUNT_AFTERINSERT_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      CREATE_BOOKMARKS_FOREIGNCOUNT_AFTERUPDATE_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = mMainConn->ExecuteSimpleSQL(
+      CREATE_KEYWORDS_FOREIGNCOUNT_AFTERDELETE_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      CREATE_KEYWORDS_FOREIGNCOUNT_AFTERINSERT_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      CREATE_KEYWORDS_FOREIGNCOUNT_AFTERUPDATE_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(CREATE_PLACES_METADATA_AFTERDELETE_TRIGGER);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  bool useAlternative =
+      StaticPrefs::places_frecency_pages_alternative_featureGate_AtStartup();
+  int32_t viewTimeMs =
+      (useAlternative
+           ? StaticPrefs::
+                     places_frecency_pages_alternative_interactions_viewTimeSeconds_AtStartup() *
+                 1000
+           : StaticPrefs::
+                     places_frecency_pages_interactions_viewTimeSeconds_AtStartup() *
+                 1000);
+  int32_t viewTimeIfManyKeypressesMs =
+      (useAlternative
+           ? StaticPrefs::
+                     places_frecency_pages_alternative_interactions_viewTimeIfManyKeypressesSeconds_AtStartup() *
+                 1000
+           : StaticPrefs::
+                     places_frecency_pages_interactions_viewTimeIfManyKeypressesSeconds_AtStartup() *
+                 1000);
+  int32_t manyKeypresses =
+      (useAlternative
+           ? StaticPrefs::
+                 places_frecency_pages_alternative_interactions_manyKeypresses_AtStartup()
+           : StaticPrefs::
+                 places_frecency_pages_interactions_manyKeypresses_AtStartup());
+  rv = mMainConn->ExecuteSimpleSQL(CREATE_PLACES_METADATA_AFTERINSERT_TRIGGER(
+      viewTimeMs, viewTimeIfManyKeypressesMs, manyKeypresses));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = mMainConn->ExecuteSimpleSQL(CREATE_PLACES_METADATA_AFTERUPDATE_TRIGGER(
+      viewTimeMs, viewTimeIfManyKeypressesMs, manyKeypresses));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult Database::MigrateV53Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->CreateStatement("SELECT 1 FROM moz_items_annos"_ns,
+                                           getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    return NS_OK;
+  }
+
+  rv = mMainConn->CreateStatement("DELETE FROM moz_items_annos"_ns,
+                                  getter_AddRefs(stmt));
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->Execute();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = mMainConn->ExecuteSimpleSQL(nsLiteralCString(
+      "DELETE FROM moz_anno_attributes WHERE id IN ( "
+      "  SELECT id FROM moz_anno_attributes "
+      "  EXCEPT "
+      "  SELECT DISTINCT anno_attribute_id FROM moz_annos "
+      "  EXCEPT "
+      "  SELECT DISTINCT anno_attribute_id FROM moz_items_annos "
+      ")"));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult Database::MigrateV54Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->CreateStatement(
+      "SELECT expire_ms FROM moz_icons_to_pages"_ns, getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    rv = mMainConn->ExecuteSimpleSQL(
+        "ALTER TABLE moz_icons_to_pages "
+        "ADD COLUMN expire_ms INTEGER NOT NULL DEFAULT 0 "_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  rv = mMainConn->ExecuteSimpleSQL(
+      "UPDATE moz_icons_to_pages "
+      "SET expire_ms = strftime('%s','now','localtime','start "
+      "of day','utc') * 1000 "
+      "WHERE expire_ms = 0 "_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult Database::MigrateV55Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->CreateStatement(
+      "SELECT id FROM moz_places_metadata"_ns, getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_PLACES_METADATA);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_PLACES_METADATA_SEARCH_QUERIES);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  return NS_OK;
+}
+
+nsresult Database::MigrateV56Up() {
+  return mMainConn->ExecuteSimpleSQL(
+      CREATE_IDX_MOZ_PLACES_METADATA_PLACECREATED);
+}
+
+nsresult Database::MigrateV57Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->CreateStatement(
+      "SELECT scrolling_time FROM moz_places_metadata"_ns,
+      getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    rv = mMainConn->ExecuteSimpleSQL(
+        "ALTER TABLE moz_places_metadata "
+        "ADD COLUMN scrolling_time INTEGER NOT NULL DEFAULT 0 "_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  rv = mMainConn->CreateStatement(
+      "SELECT scrolling_distance FROM moz_places_metadata"_ns,
+      getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    rv = mMainConn->ExecuteSimpleSQL(
+        "ALTER TABLE moz_places_metadata "
+        "ADD COLUMN scrolling_distance INTEGER NOT NULL DEFAULT 0 "_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return NS_OK;
+}
+
+nsresult Database::MigrateV60Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->CreateStatement(
+      "SELECT site_name FROM moz_places"_ns, getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    rv = mMainConn->ExecuteSimpleSQL(
+        "ALTER TABLE moz_places ADD COLUMN site_name TEXT"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return NS_OK;
+}
+
+nsresult Database::MigrateV61Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->CreateStatement(
+      "SELECT hash FROM moz_previews_tombstones"_ns, getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_PREVIEWS_TOMBSTONES);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return NS_OK;
+}
+
+nsresult Database::MigrateV67Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->ExecuteSimpleSQL(
+      "INSERT INTO moz_inputhistory "
+      "SELECT place_id, LOWER(input), use_count FROM moz_inputhistory "
+      "  WHERE LOWER(input) <> input "
+      "ON CONFLICT DO "
+      "  UPDATE SET use_count = MAX(use_count, EXCLUDED.use_count)"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      "DELETE FROM moz_inputhistory WHERE LOWER(input) <> input"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult Database::MigrateV69Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->CreateStatement(
+      "SELECT source FROM moz_historyvisits"_ns, getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    rv = mMainConn->ExecuteSimpleSQL(
+        "ALTER TABLE moz_historyvisits "
+        "ADD COLUMN source INTEGER DEFAULT 0 NOT NULL"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(
+        "ALTER TABLE moz_historyvisits "
+        "ADD COLUMN triggeringPlaceId INTEGER"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  return NS_OK;
+}
+
+nsresult Database::MigrateV70Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->CreateStatement(
+      "SELECT recalc_frecency FROM moz_places LIMIT 1 "_ns,
+      getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    rv = mMainConn->ExecuteSimpleSQL(
+        "ALTER TABLE moz_places "
+        "ADD COLUMN recalc_frecency INTEGER NOT NULL DEFAULT 0 "_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+
+  rv = mMainConn->ExecuteSimpleSQL(
+      "UPDATE moz_origins "
+      "SET frecency = frecency + abs_frecency "
+      "FROM (SELECT origin_id, ABS(frecency) AS abs_frecency FROM moz_places "
+      "WHERE frecency < -1) AS places "
+      "WHERE moz_origins.id = places.origin_id"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      "INSERT OR REPLACE INTO moz_meta(key, value) VALUES "
+      "('origin_frecency_count', "
+      "(SELECT COUNT(*) FROM moz_origins WHERE frecency > 0) "
+      "), "
+      "('origin_frecency_sum', "
+      "(SELECT TOTAL(frecency) FROM moz_origins WHERE frecency > 0) "
+      "), "
+      "('origin_frecency_sum_of_squares', "
+      "(SELECT TOTAL(frecency * frecency) FROM moz_origins WHERE frecency > 0) "
+      ") "_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = mMainConn->ExecuteSimpleSQL(
+      "UPDATE moz_places "
+      "SET recalc_frecency = 1, "
+      "    frecency = CASE WHEN frecency = -1 THEN -1 ELSE ABS(frecency) END "
+      "WHERE frecency < 0 "_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult Database::MigrateV71Up() {
+  mMainConn->ExecuteSimpleSQL(
+      "UPDATE moz_places "
+      "SET foreign_count = foreign_count - 1 "
+      "WHERE id in (SELECT place_id FROM moz_places_metadata_snapshots)"_ns);
+  mMainConn->ExecuteSimpleSQL(
+      "UPDATE moz_places "
+      "SET foreign_count = foreign_count - 1 "
+      "WHERE id in (SELECT place_id FROM moz_session_to_places)"_ns);
+
+  nsresult rv = mMainConn->ExecuteSimpleSQL(
+      "DROP INDEX IF EXISTS moz_places_metadata_snapshots_pinnedindex"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      "DROP INDEX IF EXISTS moz_places_metadata_snapshots_extra_typeindex"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      "DROP TABLE IF EXISTS moz_places_metadata_groups_to_snapshots"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      "DROP TABLE IF EXISTS moz_places_metadata_snapshots_groups"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      "DROP TABLE IF EXISTS moz_places_metadata_snapshots_extra"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      "DROP TABLE IF EXISTS moz_places_metadata_snapshots"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      "DROP TABLE IF EXISTS moz_session_to_places"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      "DROP TABLE IF EXISTS moz_session_metadata"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult Database::MigrateV72Up() {
+  nsresult rv = mMainConn->ExecuteSimpleSQL(
+      "UPDATE moz_places "
+      "SET recalc_frecency = 1 "
+      "WHERE foreign_count > 0 AND visit_count = 0"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  return NS_OK;
+}
+
+nsresult Database::MigrateV73Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->CreateStatement(
+      "SELECT recalc_frecency FROM moz_origins"_ns, getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    rv = mMainConn->ExecuteSimpleSQL(
+        "ALTER TABLE moz_origins "
+        "ADD COLUMN recalc_frecency INTEGER NOT NULL DEFAULT 0"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(
+        "ALTER TABLE moz_origins "
+        "ADD COLUMN alt_frecency INTEGER"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(
+        "ALTER TABLE moz_origins "
+        "ADD COLUMN recalc_alt_frecency INTEGER NOT NULL DEFAULT 0"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return NS_OK;
+}
+
+nsresult Database::MigrateV74Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->CreateStatement(
+      "SELECT alt_frecency FROM moz_places"_ns, getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    rv = mMainConn->ExecuteSimpleSQL(
+        "ALTER TABLE moz_places "
+        "ADD COLUMN alt_frecency INTEGER"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(
+        "ALTER TABLE moz_places "
+        "ADD COLUMN recalc_alt_frecency INTEGER NOT NULL DEFAULT 0"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_PLACES_ALT_FRECENCY);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return NS_OK;
+}
+
+nsresult Database::MigrateV75Up() {
+  return NS_OK;
+}
+
+nsresult Database::MigrateV77Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->ExecuteSimpleSQL(
+      "UPDATE moz_origins SET recalc_frecency = 1"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  return NS_OK;
+}
+
+nsresult Database::MigrateV78Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->CreateStatement("SELECT flags FROM moz_icons"_ns,
+                                           getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    rv = mMainConn->ExecuteSimpleSQL(
+        "ALTER TABLE moz_icons "
+        "ADD COLUMN flags INTEGER NOT NULL DEFAULT 0"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return NS_OK;
+}
+
+nsresult Database::MigrateV79Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->CreateStatement(
+      "SELECT feature FROM moz_newtab_story_click"_ns, getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    nsresult rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_NEWTAB_STORY_CLICK);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_NEWTAB_STORY_IMPRESSION);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return NS_OK;
+}
+
+nsresult Database::MigrateV80Up() {
+  nsresult rv =
+      mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_NEWTAB_STORY_CLICK_TIMESTAMP);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_NEWTAB_IMPRESSION_TIMESTAMP);
+  NS_ENSURE_SUCCESS(rv, rv);
+  return NS_OK;
+}
+
+nsresult Database::MigrateV81Up() {
+  nsresult rv = mMainConn->ExecuteSimpleSQL(
+      "DROP INDEX IF EXISTS moz_newtab_story_click_idx_newtab_click_timestamp"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mMainConn->ExecuteSimpleSQL(
+      "DROP INDEX IF EXISTS moz_newtab_story_click_idx_newtab_impression_timestamp"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  return NS_OK;
+}
+
+nsresult Database::MigrateV82Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  nsresult rv = mMainConn->CreateStatement(
+      "SELECT id FROM moz_newtab_shortcuts_interaction"_ns,
+      getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_MOZ_NEWTAB_SHORTCUTS_INTERACTION);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_NEWTAB_SHORTCUTS_TIMESTAMP);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = mMainConn->ExecuteSimpleSQL(CREATE_IDX_MOZ_NEWTAB_SHORTCUTS_PLACEID);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return NS_OK;
+}
+
+nsresult Database::MigrateV83Up() {
+  nsresult rv = mMainConn->ExecuteSimpleSQL(
+      "UPDATE moz_places SET recalc_frecency = 1 WHERE frecency > 0"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  return NS_OK;
+}
+
+nsresult Database::MigrateV85Up() {
+  nsresult rv = mMainConn->ExecuteSimpleSQL(
+      "UPDATE moz_origins "
+      "SET recalc_frecency = 1 "
+      "WHERE frecency > 1"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  return NS_OK;
+}
+
+nsresult Database::MigrateV86Up() {
+  nsCOMPtr<mozIStorageStatement> stmt;
+
+  nsresult rv = mMainConn->CreateStatement(
+      "SELECT block_until_ms FROM moz_origins"_ns, getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    rv = mMainConn->ExecuteSimpleSQL(
+        "ALTER TABLE moz_origins "
+        "ADD COLUMN block_until_ms INTEGER"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  rv = mMainConn->CreateStatement(
+      "SELECT block_pages_until_ms FROM moz_origins"_ns, getter_AddRefs(stmt));
+  if (NS_FAILED(rv)) {
+    rv = mMainConn->ExecuteSimpleSQL(
+        "ALTER TABLE moz_origins "
+        "ADD COLUMN block_pages_until_ms INTEGER"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return NS_OK;
+}
+
+int64_t Database::CreateMobileRoot() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  nsCOMPtr<mozIStorageStatement> createStmt;
+  nsresult rv = mMainConn->CreateStatement(
+      nsLiteralCString(
+          "INSERT OR IGNORE INTO moz_bookmarks "
+          "(type, title, dateAdded, lastModified, guid, position, parent) "
+          "SELECT :item_type, :item_title, :timestamp, :timestamp, :guid, "
+          "IFNULL((SELECT MAX(position) + 1 FROM moz_bookmarks p WHERE "
+          "p.parent = b.id), 0), b.id "
+          "FROM moz_bookmarks b WHERE b.parent = 0"),
+      getter_AddRefs(createStmt));
+  if (NS_FAILED(rv)) return -1;
+
+  rv = createStmt->BindInt32ByName("item_type"_ns,
+                                   nsINavBookmarksService::TYPE_FOLDER);
+  if (NS_FAILED(rv)) return -1;
+  rv = createStmt->BindUTF8StringByName("item_title"_ns,
+                                        nsLiteralCString(MOBILE_ROOT_TITLE));
+  if (NS_FAILED(rv)) return -1;
+  rv = createStmt->BindInt64ByName("timestamp"_ns, RoundedPRNow());
+  if (NS_FAILED(rv)) return -1;
+  rv = createStmt->BindUTF8StringByName("guid"_ns,
+                                        nsLiteralCString(MOBILE_ROOT_GUID));
+  if (NS_FAILED(rv)) return -1;
+
+  rv = createStmt->Execute();
+  if (NS_FAILED(rv)) return -1;
+
+  nsCOMPtr<mozIStorageStatement> findIdStmt;
+  rv = mMainConn->CreateStatement(
+      "SELECT id FROM moz_bookmarks WHERE guid = :guid"_ns,
+      getter_AddRefs(findIdStmt));
+  if (NS_FAILED(rv)) return -1;
+
+  rv = findIdStmt->BindUTF8StringByName("guid"_ns,
+                                        nsLiteralCString(MOBILE_ROOT_GUID));
+  if (NS_FAILED(rv)) return -1;
+
+  bool hasResult = false;
+  rv = findIdStmt->ExecuteStep(&hasResult);
+  if (NS_FAILED(rv) || !hasResult) return -1;
+
+  int64_t rootId;
+  rv = findIdStmt->GetInt64(0, &rootId);
+  if (NS_FAILED(rv)) return -1;
+
+  return rootId;
+}
+
+void Database::Shutdown() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!mClosed);
+
+  mClientsShutdown = nullptr;
+  nsCOMPtr<mozIStorageCompletionCallback> connectionShutdown =
+      std::move(mConnectionShutdown);
+
+  if (!mMainConn) {
+    mClosed = true;
+    (void)connectionShutdown->Complete(NS_OK, nullptr);
+    return;
+  }
+
+#ifdef DEBUG
+  {
+    bool hasResult;
+    nsCOMPtr<mozIStorageStatement> stmt;
+
+    nsresult rv =
+        mMainConn->CreateStatement(nsLiteralCString("SELECT 1 "
+                                                    "FROM moz_places "
+                                                    "WHERE guid IS NULL "),
+                                   getter_AddRefs(stmt));
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    rv = stmt->ExecuteStep(&hasResult);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    MOZ_ASSERT(!hasResult, "Found a page without a GUID!");
+    rv = mMainConn->CreateStatement(nsLiteralCString("SELECT 1 "
+                                                     "FROM moz_bookmarks "
+                                                     "WHERE guid IS NULL "),
+                                    getter_AddRefs(stmt));
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    rv = stmt->ExecuteStep(&hasResult);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    MOZ_ASSERT(!hasResult, "Found a bookmark without a GUID!");
+
+    rv = mMainConn->CreateStatement(
+        nsLiteralCString(
+            "SELECT 1 "
+            "FROM moz_bookmarks "
+            "WHERE dateAdded % 1000 > 0 OR lastModified % 1000 > 0 LIMIT 1"),
+        getter_AddRefs(stmt));
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    rv = stmt->ExecuteStep(&hasResult);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    MOZ_ASSERT(!hasResult, "Found unrounded dates!");
+
+    rv = mMainConn->CreateStatement(
+        "SELECT 1 FROM moz_places WHERE url_hash = 0"_ns, getter_AddRefs(stmt));
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    rv = stmt->ExecuteStep(&hasResult);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    MOZ_ASSERT(!hasResult, "Found a place without a hash!");
+
+    rv = mMainConn->CreateStatement(
+        nsLiteralCString(
+            "SELECT 1 FROM moz_places GROUP BY url HAVING count(*) > 1 "),
+        getter_AddRefs(stmt));
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    rv = stmt->ExecuteStep(&hasResult);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    MOZ_ASSERT(!hasResult, "Found a duplicate url!");
+
+    rv = mMainConn->CreateStatement(
+        "SELECT 1 FROM moz_places WHERE url ISNULL "_ns, getter_AddRefs(stmt));
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    rv = stmt->ExecuteStep(&hasResult);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    MOZ_ASSERT(!hasResult, "Found a NULL url!");
+  }
+#endif
+
+  mMainThreadStatements.FinalizeStatements();
+  mMainThreadAsyncStatements.FinalizeStatements();
+
+  RefPtr<FinalizeStatementCacheProxy<mozIStorageStatement>> event =
+      new FinalizeStatementCacheProxy<mozIStorageStatement>(
+          mAsyncThreadStatements, NS_ISUPPORTS_CAST(nsIObserver*, this));
+  DispatchToAsyncThread(event);
+
+  mClosed = true;
+
+  nsCOMPtr<mozIStoragePendingStatement> ps;
+  MOZ_ALWAYS_SUCCEEDS(mMainConn->ExecuteSimpleSQLAsync(
+      "PRAGMA optimize(0x12)"_ns, nullptr, getter_AddRefs(ps)));
+
+  if (NS_FAILED(mMainConn->AsyncClose(connectionShutdown))) {
+    (void)connectionShutdown->Complete(NS_ERROR_UNEXPECTED, nullptr);
+  }
+  mMainConn = nullptr;
+}
+
+
+NS_IMETHODIMP
+Database::Observe(nsISupports* aSubject, const char* aTopic,
+                  const char16_t* aData) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (strcmp(aTopic, TOPIC_PROFILE_CHANGE_TEARDOWN) == 0) {
+    if (PlacesShutdownBlocker::sIsStarted) {
+      return NS_OK;
+    }
+
+    nsCOMPtr<nsIObserverService> os = services::GetObserverService();
+    NS_ENSURE_STATE(os);
+
+    nsCOMPtr<nsISimpleEnumerator> e;
+    if (NS_SUCCEEDED(os->EnumerateObservers(TOPIC_PLACES_INIT_COMPLETE,
+                                            getter_AddRefs(e))) &&
+        e) {
+      bool hasMore = false;
+      while (NS_SUCCEEDED(e->HasMoreElements(&hasMore)) && hasMore) {
+        nsCOMPtr<nsISupports> supports;
+        if (NS_SUCCEEDED(e->GetNext(getter_AddRefs(supports)))) {
+          nsCOMPtr<nsIObserver> observer = do_QueryInterface(supports);
+          (void)observer->Observe(observer, TOPIC_PLACES_INIT_COMPLETE,
+                                  nullptr);
+        }
+      }
+    }
+
+    (void)os->NotifyObservers(nullptr, TOPIC_PLACES_SHUTDOWN, nullptr);
+  } else if (strcmp(aTopic, TOPIC_SIMULATE_PLACES_SHUTDOWN) == 0) {
+
+    if (PlacesShutdownBlocker::sIsStarted) {
+      return NS_OK;
+    }
+
+    {
+      nsCOMPtr<nsIAsyncShutdownClient> shutdownPhase =
+          GetProfileChangeTeardownPhase();
+      if (shutdownPhase) {
+        shutdownPhase->RemoveBlocker(mClientsShutdown.get());
+      }
+      (void)mClientsShutdown->BlockShutdown(nullptr);
+    }
+
+    SpinEventLoopUntil("places:Database::Observe(SIMULATE_PLACES_SHUTDOWN)"_ns,
+                       [&]() {
+                         return mClientsShutdown->State() ==
+                                PlacesShutdownBlocker::States::RECEIVED_DONE;
+                       });
+
+    {
+      nsCOMPtr<nsIAsyncShutdownClient> shutdownPhase =
+          GetProfileBeforeChangePhase();
+      if (shutdownPhase) {
+        shutdownPhase->RemoveBlocker(mConnectionShutdown.get());
+      }
+      (void)mConnectionShutdown->BlockShutdown(nullptr);
+    }
+  }
+  return NS_OK;
+}
+
+}  

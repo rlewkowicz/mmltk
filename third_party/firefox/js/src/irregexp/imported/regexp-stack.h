@@ -1,0 +1,146 @@
+// Copyright 2009 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(V8_REGEXP_REGEXP_STACK_H_)
+#define V8_REGEXP_REGEXP_STACK_H_
+
+#include "irregexp/RegExpShim.h"
+
+namespace v8 {
+namespace internal {
+namespace regexp {
+
+class Stack;
+
+class V8_NODISCARD StackScope final {
+ public:
+
+  explicit StackScope(Isolate* isolate);
+  ~StackScope();  
+  StackScope(const StackScope&) = delete;
+  StackScope& operator=(const StackScope&) = delete;
+
+  Stack* stack() const { return regexp_stack_; }
+
+ private:
+  Stack* const regexp_stack_;
+  const ptrdiff_t old_sp_top_delta_;
+};
+
+class Stack final {
+ public:
+  Stack(const Stack&) = delete;
+  Stack& operator=(const Stack&) = delete;
+
+  static Stack* New();
+  static void Delete(Stack* instance);
+
+#if defined(V8_TARGET_ARCH_PPC64) || defined(V8_TARGET_ARCH_S390X)
+  static constexpr int kSlotSize = kSystemPointerSize;
+#else
+  static constexpr int kSlotSize = kInt32Size;
+#endif
+  static constexpr int kStackLimitSlackSlotCount = 32;
+  static constexpr int kStackLimitSlackSize =
+      kStackLimitSlackSlotCount * kSlotSize;
+
+  Address begin() const {
+    return reinterpret_cast<Address>(thread_local_.memory_);
+  }
+  Address end() const {
+    DCHECK_NE(0, thread_local_.memory_size_);
+    DCHECK_EQ(thread_local_.memory_top_,
+              thread_local_.memory_ + thread_local_.memory_size_);
+    return reinterpret_cast<Address>(thread_local_.memory_top_);
+  }
+  Address memory_top() const { return end(); }
+
+  Address stack_pointer() const {
+    return reinterpret_cast<Address>(thread_local_.stack_pointer_);
+  }
+
+  size_t memory_size() const { return thread_local_.memory_size_; }
+
+  Address* limit_address_address() { return &thread_local_.limit_; }
+
+  V8_EXPORT_PRIVATE Address EnsureCapacity(size_t size);
+
+  static constexpr int ArchiveSpacePerThread() {
+    return static_cast<int>(kThreadLocalSize);
+  }
+  char* ArchiveStack(char* to);
+  char* RestoreStack(char* from);
+  void FreeThreadResources() { thread_local_.ResetToStaticStack(this); }
+
+  static constexpr size_t kMaximumStackSize = 64 * MB;
+
+  Stack();
+  ~Stack();
+
+ private:
+  static const Address kMemoryTop =
+      static_cast<Address>(static_cast<uintptr_t>(-1));
+
+  static constexpr size_t kStaticStackSize = 1 * KB;
+  static_assert(kStaticStackSize >= 2 * kStackLimitSlackSize);
+  static_assert(kStaticStackSize <= kMaximumStackSize);
+  uint8_t static_stack_[kStaticStackSize] = {0};
+
+  static constexpr size_t kMinimumDynamicStackSize = 2 * KB;
+  static_assert(kMinimumDynamicStackSize == 2 * kStaticStackSize);
+
+  struct ThreadLocal {
+    explicit ThreadLocal(Stack* regexp_stack) {
+      ResetToStaticStack(regexp_stack);
+    }
+
+    uint8_t* memory_ = nullptr;
+    uint8_t* memory_top_ = nullptr;
+    size_t memory_size_ = 0;
+    uint8_t* stack_pointer_ = nullptr;
+    Address limit_ = kNullAddress;
+    bool owns_memory_ = false;  
+
+    void ResetToStaticStack(Stack* regexp_stack);
+    void ResetToStaticStackIfEmpty(Stack* regexp_stack) {
+      if (stack_pointer_ == memory_top_) ResetToStaticStack(regexp_stack);
+    }
+    void FreeAndInvalidate();
+
+    static uint8_t* NewDynamicStack(size_t size);
+    void DeleteDynamicStack();
+  };
+  static constexpr size_t kThreadLocalSize = sizeof(ThreadLocal);
+
+  Address memory_top_address_address() {
+    return reinterpret_cast<Address>(&thread_local_.memory_top_);
+  }
+
+  Address stack_pointer_address() {
+    return reinterpret_cast<Address>(&thread_local_.stack_pointer_);
+  }
+
+  ptrdiff_t sp_top_delta() const {
+    ptrdiff_t result =
+        reinterpret_cast<intptr_t>(thread_local_.stack_pointer_) -
+        reinterpret_cast<intptr_t>(thread_local_.memory_top_);
+    DCHECK_LE(result, 0);
+    return result;
+  }
+
+  void ResetIfEmpty() { thread_local_.ResetToStaticStackIfEmpty(this); }
+
+  bool IsValid() const { return thread_local_.memory_ != nullptr; }
+
+  ThreadLocal thread_local_;
+
+  friend class internal::ExternalReference;
+  friend class StackScope;
+};
+
+}  
+}  
+}  
+
+#endif

@@ -1,0 +1,129 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+* Copyright (C) 1997-2005, International Business Machines Corporation and others. All Rights Reserved.
+*******************************************************************************
+*
+* File PARSEPOS.H
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   07/09/97    helena      Converted from java.
+*   07/17/98    stephen     Added errorIndex support.
+*   05/11/99    stephen     Cleaned up.
+*******************************************************************************
+*/
+
+#ifndef PARSEPOS_H
+#define PARSEPOS_H
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/uobject.h"
+
+ 
+U_NAMESPACE_BEGIN
+
+
+class U_COMMON_API ParsePosition : public UObject {
+public:
+    ParsePosition()
+        : UObject(),
+        index(0),
+        errorIndex(-1)
+      {}
+
+    ParsePosition(int32_t newIndex)
+        : UObject(),
+        index(newIndex),
+        errorIndex(-1)
+      {}
+
+    ParsePosition(const ParsePosition& copy)
+        : UObject(copy),
+        index(copy.index),
+        errorIndex(copy.errorIndex)
+      {}
+
+    virtual ~ParsePosition();
+
+    inline ParsePosition&      operator=(const ParsePosition& copy);
+
+    inline bool               operator==(const ParsePosition& that) const;
+
+    inline bool               operator!=(const ParsePosition& that) const;
+
+    ParsePosition *clone() const;
+
+    inline int32_t getIndex() const;
+
+    inline void setIndex(int32_t index);
+
+    inline void setErrorIndex(int32_t ei);
+
+    inline int32_t getErrorIndex() const;
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual UClassID getDynamicClassID() const override;
+
+private:
+    int32_t index;
+
+    int32_t errorIndex;
+
+};
+
+inline ParsePosition&
+ParsePosition::operator=(const ParsePosition& copy)
+{
+  index = copy.index;
+  errorIndex = copy.errorIndex;
+  return *this;
+}
+
+inline bool
+ParsePosition::operator==(const ParsePosition& copy) const
+{
+  if(index != copy.index || errorIndex != copy.errorIndex)
+  return false;
+  else
+  return true;
+}
+
+inline bool
+ParsePosition::operator!=(const ParsePosition& copy) const
+{
+  return !operator==(copy);
+}
+
+inline int32_t
+ParsePosition::getIndex() const
+{
+  return index;
+}
+
+inline void
+ParsePosition::setIndex(int32_t offset)
+{
+  this->index = offset;
+}
+
+inline int32_t
+ParsePosition::getErrorIndex() const
+{
+  return errorIndex;
+}
+
+inline void
+ParsePosition::setErrorIndex(int32_t ei)
+{
+  this->errorIndex = ei;
+}
+U_NAMESPACE_END
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif

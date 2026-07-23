@@ -1,0 +1,210 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_CharacterData_h
+#define mozilla_dom_CharacterData_h
+
+#include "CharacterDataBuffer.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsError.h"
+#include "nsIContent.h"
+#include "nsIMutationObserver.h"
+
+namespace mozilla::dom {
+class Element;
+class HTMLSlotElement;
+}  
+
+#define CHARACTER_DATA_FLAG_BIT(n_) \
+  NODE_FLAG_BIT(NODE_TYPE_SPECIFIC_BITS_OFFSET + (n_))
+
+enum {
+  NS_CREATE_FRAME_IF_NON_WHITESPACE = CHARACTER_DATA_FLAG_BIT(0),
+
+  NS_REFRAME_IF_WHITESPACE = CHARACTER_DATA_FLAG_BIT(1),
+
+  NS_CACHED_TEXT_IS_ONLY_WHITESPACE = CHARACTER_DATA_FLAG_BIT(2),
+
+  NS_TEXT_IS_ONLY_WHITESPACE = CHARACTER_DATA_FLAG_BIT(3),
+
+  NS_HAS_NEWLINE_PROPERTY = CHARACTER_DATA_FLAG_BIT(4),
+
+  NS_HAS_FLOWLENGTH_PROPERTY = CHARACTER_DATA_FLAG_BIT(5),
+
+  NS_MAYBE_MODIFIED_FREQUENTLY = CHARACTER_DATA_FLAG_BIT(6),
+
+  NS_MAYBE_MASKED = CHARACTER_DATA_FLAG_BIT(7),
+
+  NS_MAY_SET_DIR_AUTO = CHARACTER_DATA_FLAG_BIT(8),
+};
+
+ASSERT_NODE_FLAGS_SPACE(NODE_TYPE_SPECIFIC_BITS_OFFSET + 8);
+
+#undef CHARACTER_DATA_FLAG_BIT
+
+namespace mozilla::dom {
+
+class CharacterData : public nsIContent {
+ public:
+  NS_IMETHOD QueryInterface(REFNSIID aIID, void** aInstancePtr) override;
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(CharacterData, nsIContent);
+
+  NS_DECL_ADDSIZEOFEXCLUDINGTHIS
+
+  explicit CharacterData(already_AddRefed<dom::NodeInfo> aNodeInfo);
+
+  void MarkAsMaybeModifiedFrequently() {
+    SetFlags(NS_MAYBE_MODIFIED_FREQUENTLY);
+  }
+  void MarkAsMaybeMasked() { SetFlags(NS_MAYBE_MASKED); }
+
+  void SetMaySetDirAuto() { SetFlags(NS_MAY_SET_DIR_AUTO); }
+  bool MaySetDirAuto() const { return HasFlag(NS_MAY_SET_DIR_AUTO); }
+  void ClearMaySetDirAuto() { UnsetFlags(NS_MAY_SET_DIR_AUTO); }
+
+  NS_IMPL_FROMNODE_HELPER(CharacterData, IsCharacterData())
+
+  void GetNodeValueInternal(nsAString& aNodeValue) override;
+  void SetNodeValueInternal(
+      const nsAString& aNodeValue, ErrorResult& aError,
+      MutationEffectOnScript aMutationEffectOnScript) override;
+
+  void GetTextContentInternal(nsAString& aTextContent, OOMReporter&) final {
+    GetNodeValue(aTextContent);
+  }
+
+  void SetTextContentInternal(
+      const nsAString& aTextContent, nsIPrincipal* aSubjectPrincipal,
+      ErrorResult& aError,
+      MutationEffectOnScript aMutationEffectOnScript) final;
+
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+
+  void UnbindFromTree(UnbindContext&) override;
+
+  const CharacterDataBuffer* GetCharacterDataBuffer() const override {
+    return &mBuffer;
+  }
+  uint32_t TextLength() const final { return TextDataLength(); }
+
+  const CharacterDataBuffer& DataBuffer() const { return mBuffer; }
+  uint32_t TextDataLength() const { return mBuffer.GetLength(); }
+
+  nsresult SetText(const char16_t* aBuffer, uint32_t aLength, bool aNotify);
+  nsresult SetText(const nsAString& aStr, bool aNotify) {
+    return SetText(aStr.BeginReading(), aStr.Length(), aNotify);
+  }
+
+  nsresult AppendText(const char16_t* aBuffer, uint32_t aLength, bool aNotify);
+
+  bool TextIsOnlyWhitespace() final;
+  bool ThreadSafeTextIsOnlyWhitespace() const final;
+
+  bool TextStartsWithOnlyWhitespace(uint32_t aOffset) const;
+
+  bool TextEndsWithOnlyWhitespace(uint32_t aOffset) const;
+
+  void AppendTextTo(nsAString& aResult) const { mBuffer.AppendTo(aResult); }
+
+  [[nodiscard]] bool AppendTextTo(nsAString& aResult,
+                                  const fallible_t& aFallible) const {
+    return mBuffer.AppendTo(aResult, aFallible);
+  }
+
+  void SaveSubtreeState() final {}
+
+#ifdef MOZ_DOM_LIST
+  void ToCString(nsAString& aBuf, int32_t aOffset, int32_t aLen) const;
+
+  void List(FILE* out, int32_t aIndent) const override {}
+
+  void DumpContent(FILE* out, int32_t aIndent, bool aDumpAll) const override {}
+#endif
+
+  nsresult Clone(dom::NodeInfo* aNodeInfo, nsINode** aResult) const override {
+    RefPtr<CharacterData> result = CloneDataNode(aNodeInfo, true);
+    result.forget(aResult);
+
+    if (!*aResult) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    return NS_OK;
+  }
+
+  void GetData(nsAString& aData) const;
+  void SetData(const nsAString& aData, ErrorResult& rv) {
+    SetDataInternal(aData, MutationEffectOnScript::DropTrustWorthiness, rv);
+  }
+  virtual void SetDataInternal(const nsAString& aData,
+                               MutationEffectOnScript aMutationEffectOnScript,
+                               ErrorResult& rv);
+  void SubstringData(uint32_t aStart, uint32_t aCount, nsAString& aReturn,
+                     ErrorResult& rv);
+  void AppendData(const nsAString& aData, ErrorResult& rv) {
+    AppendDataInternal(aData, MutationEffectOnScript::DropTrustWorthiness, rv);
+  }
+  void AppendDataInternal(const nsAString& aData,
+                          MutationEffectOnScript aMutationEffectOnScript,
+                          ErrorResult& rv);
+  void InsertData(uint32_t aOffset, const nsAString& aData, ErrorResult& rv) {
+    InsertDataInternal(aOffset, aData,
+                       MutationEffectOnScript::DropTrustWorthiness, rv);
+  }
+  void InsertDataInternal(uint32_t aOffset, const nsAString& aData,
+                          MutationEffectOnScript aMutationEffectOnScript,
+                          ErrorResult& rv);
+  void DeleteData(uint32_t aOffset, uint32_t aCount, ErrorResult& rv) {
+    DeleteDataInternal(aOffset, aCount,
+                       MutationEffectOnScript::DropTrustWorthiness, rv);
+  }
+  void DeleteDataInternal(uint32_t aOffset, uint32_t aCount,
+                          MutationEffectOnScript aMutationEffectOnScript,
+                          ErrorResult& rv);
+  void ReplaceData(uint32_t aOffset, uint32_t aCount, const nsAString& aData,
+                   ErrorResult& rv) {
+    ReplaceDataInternal(aOffset, aCount, aData,
+                        MutationEffectOnScript::DropTrustWorthiness, rv);
+  }
+  void ReplaceDataInternal(uint32_t aOffset, uint32_t aCount,
+                           const nsAString& aData,
+                           MutationEffectOnScript aMutationEffectOnScript,
+                           ErrorResult& rv);
+
+
+  NS_DECL_CYCLE_COLLECTION_SKIPPABLE_WRAPPERCACHE_CLASS_INHERITED(CharacterData,
+                                                                  nsIContent)
+
+  [[nodiscard]] bool TextEquals(const CharacterData* aOther) const {
+    return mBuffer.BufferEquals(aOther->mBuffer);
+  }
+
+ protected:
+  virtual ~CharacterData();
+
+  Element* GetNameSpaceElement() final;
+
+  nsresult SetTextInternal(
+      uint32_t aOffset, uint32_t aCount, const char16_t* aBuffer,
+      uint32_t aLength, bool aNotify,
+      MutationEffectOnScript aMutationEffectOnScript =
+          MutationEffectOnScript::DropTrustWorthiness,
+      CharacterDataChangeInfo::Details* aDetails = nullptr);
+
+  virtual already_AddRefed<CharacterData> CloneDataNode(
+      dom::NodeInfo* aNodeInfo, bool aCloneText) const = 0;
+
+  CharacterDataBuffer mBuffer;
+
+ private:
+  already_AddRefed<nsAtom> GetCurrentValueAtom();
+
+  bool CheckTextIsOnlyWhitespace(uint32_t aStartOffset,
+                                 uint32_t aEndOffset) const;
+};
+
+}  
+
+#endif /* mozilla_dom_CharacterData_h */

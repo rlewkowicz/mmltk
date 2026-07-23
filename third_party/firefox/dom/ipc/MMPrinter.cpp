@@ -1,0 +1,80 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MMPrinter.h"
+
+#include "Logging.h"
+#include "jsapi.h"
+#include "mozilla/Bootstrap.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/RandomNum.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/ipc/StructuredCloneData.h"
+#include "nsFrameMessageManager.h"
+#include "nsJSUtils.h"
+#include "prenv.h"
+
+namespace mozilla::dom {
+
+LazyLogModule MMPrinter::sMMLog("MessageManager");
+
+
+Maybe<uint64_t> MMPrinter::PrintHeader(char const* aLocation,
+                                       const nsAString& aMsg) {
+  NS_ConvertUTF16toUTF8 charMsg(aMsg);
+
+  char* mmSkipLog = PR_GetEnv("MOZ_LOG_MESSAGEMANAGER_SKIP");
+
+  if (mmSkipLog && strstr(mmSkipLog, charMsg.get())) {
+    return Nothing();
+  }
+
+  uint64_t aMsgId = RandomUint64OrDie();
+
+  MOZ_LOG(MMPrinter::sMMLog, LogLevel::Debug,
+          ("%" PRIu64 " %s Message: %s in process type: %s", aMsgId, aLocation,
+           charMsg.get(), XRE_GetProcessTypeString()));
+
+  return Some(aMsgId);
+}
+
+void MMPrinter::PrintData(uint64_t aMsgId, ipc::StructuredCloneData* aData) {
+  if (!MOZ_LOG_TEST(sMMLog, LogLevel::Verbose)) {
+    return;
+  }
+
+  if (!aData) {
+    MOZ_LOG(MMPrinter::sMMLog, LogLevel::Verbose,
+            ("%" PRIu64 " (No Data)", aMsgId));
+    return;
+  }
+
+  if (aData->SupportsTransferring()) {
+    MOZ_LOG(MMPrinter::sMMLog, LogLevel::Verbose,
+            ("%" PRIu64 " (Supports Transferring)", aMsgId));
+    return;
+  }
+
+  AutoJSAPI jsapi;
+  MOZ_ALWAYS_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+  JSContext* cx = jsapi.cx();
+
+  IgnoredErrorResult rv;
+  JS::Rooted<JS::Value> scdContent(cx);
+  aData->Read(cx, &scdContent, rv);
+  if (rv.Failed()) {
+    MOZ_LOG(MMPrinter::sMMLog, LogLevel::Verbose,
+            ("%" PRIu64 " (Read Failed)", aMsgId));
+    return;
+  }
+
+  JS::Rooted<JSString*> unevalObj(cx, JS_ValueToSource(cx, scdContent));
+  nsAutoJSString srcString;
+  if (!srcString.init(cx, unevalObj)) return;
+
+  MOZ_LOG(MMPrinter::sMMLog, LogLevel::Verbose,
+          ("%" PRIu64 " %s", aMsgId, NS_ConvertUTF16toUTF8(srcString).get()));
+}
+
+}  

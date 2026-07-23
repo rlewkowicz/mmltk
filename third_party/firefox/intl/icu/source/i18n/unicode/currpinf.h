@@ -1,0 +1,110 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ *******************************************************************************
+ * Copyright (C) 2009-2015, International Business Machines Corporation and    *
+ * others. All Rights Reserved.                                                *
+ *******************************************************************************
+ */
+#ifndef CURRPINF_H
+#define CURRPINF_H
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/unistr.h"
+
+U_NAMESPACE_BEGIN
+
+class Locale;
+class PluralRules;
+class Hashtable;
+
+class  U_I18N_API CurrencyPluralInfo : public UObject {
+public:
+
+    CurrencyPluralInfo(UErrorCode& status);
+
+    CurrencyPluralInfo(const Locale& locale, UErrorCode& status); 
+
+    CurrencyPluralInfo(const CurrencyPluralInfo& info);
+
+
+    CurrencyPluralInfo& operator=(const CurrencyPluralInfo& info);
+
+
+    virtual ~CurrencyPluralInfo();
+
+
+    bool operator==(const CurrencyPluralInfo& info) const;
+
+
+    bool operator!=(const CurrencyPluralInfo& info) const;
+
+
+    CurrencyPluralInfo* clone() const;
+
+
+    const PluralRules* getPluralRules() const;
+
+    UnicodeString& getCurrencyPluralPattern(const UnicodeString& pluralCount,
+                                            UnicodeString& result) const; 
+
+    const Locale& getLocale() const;
+
+    void setPluralRules(const UnicodeString& ruleDescription,
+                        UErrorCode& status);
+
+    void setCurrencyPluralPattern(const UnicodeString& pluralCount, 
+                                  const UnicodeString& pattern,
+                                  UErrorCode& status);
+
+    void setLocale(const Locale& loc, UErrorCode& status);
+
+    virtual UClassID getDynamicClassID() const override;
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+private:
+    friend class DecimalFormat;
+    friend class DecimalFormatImpl;
+
+    void initialize(const Locale& loc, UErrorCode& status);
+   
+    void setupCurrencyPluralPattern(const Locale& loc, UErrorCode& status);
+
+    void deleteHash(Hashtable* hTable);
+
+
+    Hashtable* initHash(UErrorCode& status);
+
+
+
+    void copyHash(const Hashtable* source, Hashtable* target, UErrorCode& status);
+
+    Hashtable* fPluralCountToCurrencyUnitPattern;
+
+    PluralRules* fPluralRules;
+
+    Locale* fLocale;
+
+private:
+    UErrorCode fInternalStatus;
+};
+
+
+inline bool
+CurrencyPluralInfo::operator!=(const CurrencyPluralInfo& info) const {
+    return !operator==(info);
+}  
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // _CURRPINFO

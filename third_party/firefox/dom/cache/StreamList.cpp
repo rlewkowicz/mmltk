@@ -1,0 +1,187 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/cache/StreamList.h"
+
+#include <algorithm>
+
+#include "mozilla/dom/cache/CacheStreamControlParent.h"
+#include "mozilla/dom/cache/Context.h"
+#include "mozilla/dom/cache/Manager.h"
+#include "nsIInputStream.h"
+
+namespace mozilla::dom::cache {
+
+namespace {
+
+auto MatchById(const nsID& aId) {
+  return [aId](const auto& entry) { return entry.mId == aId; };
+}
+
+}  
+
+StreamList::StreamList(SafeRefPtr<Manager> aManager,
+                       SafeRefPtr<Context> aContext)
+    : mManager(std::move(aManager)),
+      mContext(std::move(aContext)),
+      mCacheId(INVALID_CACHE_ID),
+      mStreamControl(nullptr),
+      mActivated(false) {
+  MOZ_DIAGNOSTIC_ASSERT(mManager);
+}
+
+Manager& StreamList::GetManager() const {
+  MOZ_DIAGNOSTIC_ASSERT(mManager);
+  return *mManager;
+}
+
+bool StreamList::ShouldOpenStreamFor(const nsID& aId) const {
+  NS_ASSERT_OWNINGTHREAD(StreamList);
+
+  return std::any_of(mList.cbegin(), mList.cend(), MatchById(aId));
+}
+
+void StreamList::SetStreamControl(CacheStreamControlParent* aStreamControl) {
+  NS_ASSERT_OWNINGTHREAD(StreamList);
+  MOZ_DIAGNOSTIC_ASSERT(aStreamControl);
+
+  if (mStreamControl) {
+    MOZ_DIAGNOSTIC_ASSERT(aStreamControl == mStreamControl);
+    return;
+  }
+
+  mStreamControl = aStreamControl;
+  mStreamControl->SetStreamList(SafeRefPtrFromThis());
+}
+
+void StreamList::RemoveStreamControl(CacheStreamControlParent* aStreamControl) {
+  NS_ASSERT_OWNINGTHREAD(StreamList);
+  MOZ_DIAGNOSTIC_ASSERT(mStreamControl);
+  MOZ_DIAGNOSTIC_ASSERT(mStreamControl == aStreamControl);
+  mStreamControl = nullptr;
+}
+
+void StreamList::Activate(CacheId aCacheId) {
+  NS_ASSERT_OWNINGTHREAD(StreamList);
+  MOZ_DIAGNOSTIC_ASSERT(!mActivated);
+  MOZ_DIAGNOSTIC_ASSERT(mCacheId == INVALID_CACHE_ID);
+  mActivated = true;
+  mCacheId = aCacheId;
+
+  mContext->AddActivity(*this);
+
+  mManager->AddRefCacheId(mCacheId);
+  mManager->AddStreamList(*this);
+
+  for (uint32_t i = 0; i < mList.Length(); ++i) {
+    mManager->AddRefBodyId(mList[i].mId);
+  }
+}
+
+void StreamList::Add(const nsID& aId, nsCOMPtr<nsIInputStream>&& aStream) {
+  MOZ_DIAGNOSTIC_ASSERT(!mStreamControl);
+
+  MOZ_ASSERT(
+      std::find_if(mList.begin(), mList.end(), MatchById(aId)) == mList.end());
+
+  mList.EmplaceBack(aId, std::move(aStream));
+}
+
+already_AddRefed<nsIInputStream> StreamList::Extract(const nsID& aId) {
+  NS_ASSERT_OWNINGTHREAD(StreamList);
+
+  const auto it = std::find_if(mList.begin(), mList.end(), MatchById(aId));
+
+
+  return it != mList.end() ? it->mStream.forget() : nullptr;
+}
+
+void StreamList::NoteClosed(const nsID& aId) {
+  NS_ASSERT_OWNINGTHREAD(StreamList);
+
+  const auto it = std::find_if(mList.begin(), mList.end(), MatchById(aId));
+  if (it != mList.end()) {
+    MOZ_ASSERT(!it->mStream, "We expect to find mStream already extracted.");
+    mList.RemoveElementAt(it);
+    mManager->ReleaseBodyId(aId);
+  }
+
+  if (mList.IsEmpty() && mStreamControl) {
+    mStreamControl->Shutdown();
+  }
+}
+
+void StreamList::NoteClosedAll() {
+  NS_ASSERT_OWNINGTHREAD(StreamList);
+  for (uint32_t i = 0; i < mList.Length(); ++i) {
+    mManager->ReleaseBodyId(mList[i].mId);
+  }
+  mList.Clear();
+
+  if (mStreamControl) {
+    mStreamControl->Shutdown();
+  }
+}
+
+void StreamList::CloseAll() {
+  NS_ASSERT_OWNINGTHREAD(StreamList);
+  SafeRefPtr<StreamList> kungFuDeathGrip = SafeRefPtrFromThis();
+
+  if (mStreamControl && mStreamControl->CanSend()) {
+    mStreamControl->CloseAll();
+  } else {
+    if (NS_WARN_IF(mStreamControl)) {
+      mStreamControl->LostIPCCleanup(SafeRefPtrFromThis());
+      mStreamControl = nullptr;
+    } else {
+      NoteClosedAll();
+    }
+  }
+}
+
+void StreamList::Cancel() {
+  NS_ASSERT_OWNINGTHREAD(StreamList);
+  CloseAll();
+}
+
+bool StreamList::MatchesCacheId(CacheId aCacheId) const {
+  NS_ASSERT_OWNINGTHREAD(StreamList);
+  return aCacheId == mCacheId;
+}
+
+void StreamList::DoStringify(nsACString& aData) {
+  aData.Append("StreamList "_ns + kStringifyStartInstance +
+               "List:"_ns +
+               IntToCString(static_cast<uint64_t>(mList.Length())) +
+               kStringifyDelimiter +
+               "Activated:"_ns + IntToCString(mActivated) + ")"_ns +
+               kStringifyDelimiter +
+               "Manager:"_ns + IntToCString(static_cast<bool>(mManager)));
+  if (mManager) {
+    aData.Append(" "_ns);
+    mManager->Stringify(aData);
+  }
+  aData.Append(kStringifyDelimiter +
+               "Context:"_ns + IntToCString(static_cast<bool>(mContext)));
+  if (mContext) {
+    aData.Append(" "_ns);
+    mContext->Stringify(aData);
+  }
+  aData.Append(kStringifyEndInstance);
+}
+
+StreamList::~StreamList() {
+  NS_ASSERT_OWNINGTHREAD(StreamList);
+  MOZ_DIAGNOSTIC_ASSERT(!mStreamControl);
+  if (mActivated) {
+    mContext->RemoveActivity(*this);
+    mManager->RemoveStreamList(*this);
+    for (uint32_t i = 0; i < mList.Length(); ++i) {
+      mManager->ReleaseBodyId(mList[i].mId);
+    }
+    mManager->ReleaseCacheId(mCacheId);
+  }
+}
+
+}  

@@ -1,0 +1,290 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/AliasAnalysis.h"
+
+#include "jit/JitSpewer.h"
+#include "jit/MIR-wasm.h"
+#include "jit/MIR.h"
+#include "jit/MIRGenerator.h"
+#include "jit/MIRGraph.h"
+
+#include "js/Printer.h"
+
+using namespace js;
+using namespace js::jit;
+
+namespace js {
+namespace jit {
+
+class LoopAliasInfo : public TempObject {
+ private:
+  LoopAliasInfo* outer_;
+  MBasicBlock* loopHeader_;
+  MInstructionVector invariantLoads_;
+
+ public:
+  LoopAliasInfo(TempAllocator& alloc, LoopAliasInfo* outer,
+                MBasicBlock* loopHeader)
+      : outer_(outer), loopHeader_(loopHeader), invariantLoads_(alloc) {}
+
+  MBasicBlock* loopHeader() const { return loopHeader_; }
+  LoopAliasInfo* outer() const { return outer_; }
+  bool addInvariantLoad(MInstruction* ins) {
+    return invariantLoads_.append(ins);
+  }
+  const MInstructionVector& invariantLoads() const { return invariantLoads_; }
+  MInstruction* firstInstruction() const { return *loopHeader_->begin(); }
+};
+
+}  
+}  
+
+void AliasAnalysis::spewDependencyList() {
+#ifdef JS_JITSPEW
+  if (JitSpewEnabled(JitSpew_AliasSummaries)) {
+    JitSpew(JitSpew_AliasSummaries, "Dependency list for other passes:");
+
+    for (ReversePostorderIterator block(graph_.rpoBegin());
+         block != graph_.rpoEnd(); block++) {
+      for (MInstructionIterator def(block->begin()),
+           end(block->begin(block->lastIns()));
+           def != end; ++def) {
+        if (!def->dependency()) {
+          continue;
+        }
+        if (!def->getAliasSet().isLoad()) {
+          continue;
+        }
+
+        AutoJitSpewMessage msg(JitSpew_AliasSummaries, " ");
+        MDefinition::PrintOpcodeName(msg.printer(), def->op());
+        msg.append("%u marked depending on ", def->id());
+        MDefinition::PrintOpcodeName(msg.printer(), def->dependency()->op());
+        msg.append("%u", def->dependency()->id());
+      }
+    }
+  }
+#endif
+}
+
+static inline bool BlockMightReach(MBasicBlock* src, MBasicBlock* dest) {
+  while (src->id() <= dest->id()) {
+    if (src == dest) {
+      return true;
+    }
+    switch (src->numSuccessors()) {
+      case 0:
+        return false;
+      case 1: {
+        MBasicBlock* successor = src->getSuccessor(0);
+        if (successor->id() <= src->id()) {
+          return true;  
+        }
+        src = successor;
+        break;
+      }
+      default:
+        return true;
+    }
+  }
+  return false;
+}
+
+static void IonSpewDependency(MInstruction* load, MInstruction* store,
+                              const char* verb, const char* reason) {
+#ifdef JS_JITSPEW
+  if (!JitSpewEnabled(JitSpew_Alias)) {
+    return;
+  }
+
+  AutoJitSpewMessage msg(JitSpew_Alias, "  Load ");
+  load->printName(msg.printer());
+  msg.append(" %s on store ", verb);
+  store->printName(msg.printer());
+  msg.append(" (%s)", reason);
+#endif
+}
+
+static void IonSpewAliasInfo(const char* pre, MInstruction* ins,
+                             const char* post) {
+#ifdef JS_JITSPEW
+  if (!JitSpewEnabled(JitSpew_Alias)) {
+    return;
+  }
+
+  AutoJitSpewMessage msg(JitSpew_Alias, "  %s ", pre);
+  ins->printName(msg.printer());
+  msg.append(" %s", post);
+#endif
+}
+
+bool AliasAnalysis::analyze() {
+  JitSpew(JitSpew_Alias, "Begin");
+  Vector<MInstructionVector, AliasSet::NumCategories, JitAllocPolicy> stores(
+      alloc());
+
+  MInstruction* firstIns = *graph_.entryBlock()->begin();
+  for (unsigned i = 0; i < AliasSet::NumCategories; i++) {
+    MInstructionVector defs(alloc());
+    if (!defs.append(firstIns)) {
+      return false;
+    }
+    if (!stores.append(std::move(defs))) {
+      return false;
+    }
+  }
+
+  uint32_t newId = 0;
+
+  for (ReversePostorderIterator block(graph_.rpoBegin());
+       block != graph_.rpoEnd(); block++) {
+    if (mir->shouldCancel("Alias Analysis (main loop)")) {
+      return false;
+    }
+
+    if (block->isLoopHeader()) {
+      JitSpew(JitSpew_Alias, "Processing loop header %u", block->id());
+      loop_ = new (alloc().fallible()) LoopAliasInfo(alloc(), loop_, *block);
+      if (!loop_) {
+        return false;
+      }
+    }
+
+    for (MPhiIterator def(block->phisBegin()), end(block->phisEnd());
+         def != end; ++def) {
+      def->setId(newId++);
+    }
+
+    {
+      MOZ_ASSERT(block->hasAnyIns());
+      MOZ_ASSERT(block->hasLastIns());
+#ifdef DEBUG
+      MControlInstruction* lastIns = block->lastIns();
+      bool isWasmCallOrResume =
+          lastIns->isWasmCallCatchable() || lastIns->isWasmReturnCall();
+#  ifdef ENABLE_WASM_JSPI
+      if (lastIns->isWasmResume()) {
+        isWasmCallOrResume = true;
+      }
+#  endif
+      MOZ_ASSERT_IF(!isWasmCallOrResume, lastIns->getAliasSet().isNone());
+#endif
+    }
+
+    for (MInstructionIterator def(block->begin()), end(block->end());
+         def != end; ++def) {
+      def->setId(newId++);
+
+      AliasSet set = def->getAliasSet();
+      if (set.isNone()) {
+        continue;
+      }
+
+      if (def->canRecoverOnBailout()) {
+        continue;
+      }
+
+      if (set.isStore()) {
+        for (AliasSetIterator iter(set); iter; iter++) {
+          if (!stores[*iter].append(*def)) {
+            return false;
+          }
+        }
+
+#ifdef JS_JITSPEW
+        if (JitSpewEnabled(JitSpew_Alias)) {
+          AutoJitSpewMessage msg(JitSpew_Alias, "Processing store ");
+          def->printName(msg.printer());
+          msg.append(" (flags %x)", set.flags());
+        }
+#endif
+      } else {
+        MInstruction* lastStore = firstIns;
+
+        for (AliasSetIterator iter(set); iter; iter++) {
+          MInstructionVector& aliasedStores = stores[*iter];
+          for (int i = aliasedStores.length() - 1; i >= 0; i--) {
+            MInstruction* store = aliasedStores[i];
+            if (def->mightAlias(store) != MDefinition::AliasType::NoAlias &&
+                BlockMightReach(store->block(), *block)) {
+              if (lastStore->id() < store->id()) {
+                lastStore = store;
+              }
+              break;
+            }
+          }
+        }
+
+        def->setDependency(lastStore);
+        IonSpewDependency(*def, lastStore, "depends", "");
+
+        if (loop_ && lastStore->id() < loop_->firstInstruction()->id()) {
+          if (!loop_->addInvariantLoad(*def)) {
+            return false;
+          }
+        }
+      }
+    }
+
+    if (block->isLoopBackedge()) {
+      MOZ_ASSERT(loop_->loopHeader() == block->loopHeaderOfBackedge());
+      JitSpew(JitSpew_Alias, "Processing loop backedge %u (header %u)",
+              block->id(), loop_->loopHeader()->id());
+      LoopAliasInfo* outerLoop = loop_->outer();
+      MInstruction* firstLoopIns = *loop_->loopHeader()->begin();
+
+      const MInstructionVector& invariant = loop_->invariantLoads();
+
+      for (unsigned i = 0; i < invariant.length(); i++) {
+        MInstruction* ins = invariant[i];
+        AliasSet set = ins->getAliasSet();
+        MOZ_ASSERT(set.isLoad());
+
+        bool hasAlias = false;
+        for (AliasSetIterator iter(set); iter; iter++) {
+          MInstructionVector& aliasedStores = stores[*iter];
+          for (int i = aliasedStores.length() - 1;; i--) {
+            MInstruction* store = aliasedStores[i];
+            if (store->id() < firstLoopIns->id()) {
+              break;
+            }
+            if (ins->mightAlias(store) != MDefinition::AliasType::NoAlias) {
+              hasAlias = true;
+              IonSpewDependency(ins, store, "aliases", "store in loop body");
+              break;
+            }
+          }
+          if (hasAlias) {
+            break;
+          }
+        }
+
+        if (hasAlias) {
+          MControlInstruction* controlIns = loop_->loopHeader()->lastIns();
+          IonSpewDependency(ins, controlIns, "depends",
+                            "due to stores in loop body");
+          ins->setDependency(controlIns);
+        } else {
+          IonSpewAliasInfo("Load", ins,
+                           "does not depend on any stores in this loop");
+
+          if (outerLoop &&
+              ins->dependency()->id() < outerLoop->firstInstruction()->id()) {
+            IonSpewAliasInfo("Load", ins, "may be invariant in outer loop");
+            if (!outerLoop->addInvariantLoad(ins)) {
+              return false;
+            }
+          }
+        }
+      }
+      loop_ = loop_->outer();
+    }
+  }
+
+  spewDependencyList();
+
+  MOZ_ASSERT(loop_ == nullptr);
+  return true;
+}

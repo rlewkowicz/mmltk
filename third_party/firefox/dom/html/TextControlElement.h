@@ -1,0 +1,151 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_TextControlElement_h
+#define mozilla_TextControlElement_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/dom/FromParser.h"
+#include "mozilla/dom/NodeInfo.h"
+#include "nsGenericHTMLElement.h"
+
+class nsIContent;
+class nsISelectionController;
+class nsFrameSelection;
+class nsTextControlFrame;
+
+namespace mozilla {
+
+class ErrorResult;
+class TextControlState;
+class TextEditor;
+
+class TextControlElement : public nsGenericHTMLFormControlElementWithState {
+ public:
+  TextControlElement(already_AddRefed<dom::NodeInfo> aNodeInfo,
+                     dom::FromParser aFromParser, FormControlType aType)
+      : nsGenericHTMLFormControlElementWithState(std::move(aNodeInfo),
+                                                 aFromParser, aType) {};
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(
+      TextControlElement, nsGenericHTMLFormControlElementWithState)
+
+  bool IsTextControlElement() const final { return true; }
+
+  bool IsSingleLineTextControlOrTextArea() const {
+    return IsSingleLineTextControl() || IsTextArea();
+  }
+
+  bool IsSingleLineTextControl() const {
+    return nsGenericHTMLFormControlElement::IsSingleLineTextControl(false);
+  }
+
+  NS_IMPL_FROMNODE_HELPER(TextControlElement, IsTextControlElement())
+
+  virtual void SetValueChanged(bool) = 0;
+
+  MOZ_CAN_RUN_SCRIPT void WillFocus(const WidgetEvent&);
+
+  MOZ_CAN_RUN_SCRIPT void WillBlur(const WidgetEvent&);
+
+  bool IsTextArea() const { return mType == FormControlType::Textarea; }
+
+  bool IsPasswordTextControl() const {
+    return mType == FormControlType::InputPassword;
+  }
+
+  virtual Maybe<int32_t> GetCols() = 0;
+  int32_t GetColsOrDefault() { return GetCols().valueOr(DEFAULT_COLS); }
+
+  virtual int32_t GetWrapCols() = 0;
+
+  virtual int32_t GetRows() = 0;
+
+  virtual void GetDefaultValueFromContent(nsAString& aValue,
+                                          bool aForDisplay) = 0;
+
+  virtual bool ValueChanged() const = 0;
+
+  virtual int32_t UsedMaxLength() const = 0;
+
+  virtual void GetTextEditorValue(nsAString& aValue) const = 0;
+
+  MOZ_CAN_RUN_SCRIPT virtual TextEditor* GetTextEditor() = 0;
+  virtual TextEditor* GetExtantTextEditor() const = 0;
+
+  virtual nsISelectionController* GetSelectionController() = 0;
+
+  virtual nsFrameSelection* GetIndependentFrameSelection() const = 0;
+
+  virtual TextControlState* GetTextControlState() const = 0;
+
+  void SetPreviewValue(const nsAString& aValue);
+
+  void GetPreviewValue(nsAString& aValue);
+
+  virtual void SetAutofillState(const nsAString& aState) = 0;
+
+  virtual void GetAutofillState(nsAString& aState) = 0;
+
+  enum class ValueChangeKind {
+    Internal,
+    Script,
+    UserInteraction,
+  };
+
+  virtual void OnValueChanged(ValueChangeKind, bool aNewValueEmpty,
+                              const nsAString* aKnownNewValue) = 0;
+
+  void OnValueChanged(ValueChangeKind aKind, const nsAString& aNewValue) {
+    return OnValueChanged(aKind, aNewValue.IsEmpty(), &aNewValue);
+  }
+
+  virtual void GetValueFromSetRangeText(nsAString& aValue) = 0;
+  MOZ_CAN_RUN_SCRIPT virtual nsresult SetValueFromSetRangeText(
+      const nsAString& aValue) = 0;
+
+  inline static constexpr int32_t DEFAULT_COLS = 20;
+  inline static constexpr int32_t DEFAULT_ROWS = 1;
+  inline static constexpr int32_t DEFAULT_ROWS_TEXTAREA = 2;
+  inline static constexpr int32_t DEFAULT_UNDO_CAP = 1000;
+
+  virtual bool HasCachedSelection() = 0;
+
+  static already_AddRefed<TextControlElement>
+  GetTextControlElementFromEditingHost(nsIContent* aHost);
+
+  Element* GetTextEditorRoot() const;
+  Element* GetTextEditorPlaceholder() const;
+  Element* GetTextEditorPreview() const;
+  Element* GetTextEditorButton() const;
+  already_AddRefed<Element> CreateButton() const;
+  static bool IsButtonPseudoElement(PseudoStyleType);
+
+  void UpdateValueDisplay(bool aNotify);
+
+  enum class ScrollAncestors : bool { No, Yes };
+  void ScrollSelectionIntoViewAsync(ScrollAncestors = ScrollAncestors::No);
+
+ protected:
+  MOZ_CAN_RUN_SCRIPT void SelectAll();
+  MOZ_CAN_RUN_SCRIPT void ShowSelection();
+  bool NeedToInitializeEditorForEvent(EventChainPreVisitor&) const;
+
+  void SetupShadowTree(dom::ShadowRoot&, bool aNotify);
+  Element* FindShadowPseudo(PseudoStyleType) const;
+  void UpdatePlaceholder(const nsAttrValue* aOldValue,
+                         const nsAttrValue* aNewValue);
+  void UpdateTextEditorShadowTree();
+
+  virtual ~TextControlElement() = default;
+
+  enum class FocusTristate { eUnfocusable, eInactiveWindow, eActiveWindow };
+
+  FocusTristate FocusState();
+};
+
+}  
+
+#endif  // mozilla_TextControlElement_h

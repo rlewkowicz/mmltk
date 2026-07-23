@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_IMAGECOMPOSITE_H
+#define MOZILLA_GFX_IMAGECOMPOSITE_H
+
+#include "CompositableHost.h"  // for CompositableTextureHostRef
+#include "mozilla/gfx/2D.h"
+#include "mozilla/TimeStamp.h"  // for TimeStamp
+#include "nsTArray.h"
+
+namespace mozilla {
+namespace layers {
+
+class ImageComposite {
+ public:
+  static const float BIAS_TIME_MS;
+
+  explicit ImageComposite();
+  virtual ~ImageComposite();
+
+  int32_t GetFrameID() {
+    const TimedImage* img = ChooseImage();
+    return img ? img->mFrameID : -1;
+  }
+
+  int32_t GetProducerID() {
+    const TimedImage* img = ChooseImage();
+    return img ? img->mProducerID : -1;
+  }
+
+  int32_t GetLastFrameID() const { return mLastFrameID; }
+  int32_t GetLastProducerID() const { return mLastProducerID; }
+  uint32_t GetDroppedFramesAndReset() {
+    uint32_t dropped = mDroppedFrames;
+    mDroppedFrames = 0;
+    return dropped;
+  }
+
+  enum Bias {
+    BIAS_NONE,
+    BIAS_NEGATIVE,
+    BIAS_POSITIVE,
+  };
+
+ protected:
+  virtual TimeStamp GetCompositionTime() const = 0;
+  virtual CompositionOpportunityId GetCompositionOpportunityId() const = 0;
+  virtual void AppendImageCompositeNotification(
+      const ImageCompositeNotificationInfo& aInfo) const = 0;
+
+  struct TimedImage {
+    CompositableTextureHostRef mTextureHost;
+    TimeStamp mTimeStamp;
+    gfx::IntRect mPictureRect;
+    int32_t mFrameID;
+    int32_t mProducerID;
+  };
+
+  const TimedImage* ChooseImage();
+  int ChooseImageIndex();
+  const TimedImage* GetImage(size_t aIndex) const;
+  size_t ImagesCount() const { return mImages.Length(); }
+  const nsTArray<TimedImage>& Images() const { return mImages; }
+
+  void RemoveImagesWithTextureHost(TextureHost* aTexture);
+  void ClearImages();
+  void SetImages(nsTArray<TimedImage>&& aNewImages);
+
+ protected:
+  void OnFinishRendering(int aImageIndex, const TimedImage* aImage,
+                         base::ProcessId aProcessId,
+                         const CompositableHandle& aHandle);
+
+  int32_t mLastFrameID = -1;
+  int32_t mLastProducerID = -1;
+
+ private:
+  nsTArray<TimedImage> mImages;
+  TimeStamp GetBiasedTime(const TimeStamp& aInput) const;
+
+  void CountSkippedFrames(const TimedImage* aImage);
+
+  bool UpdateCompositedFrame(int aImageIndex,
+                             bool aWasVisibleAtPreviousComposition);
+
+  void UpdateBias(size_t aImageIndex, bool aFrameUpdated);
+
+  Bias mBias = BIAS_NONE;
+
+  int32_t mSkippedFramesSinceLastComposite = 0;
+
+  uint32_t mDroppedFrames = 0;
+
+  CompositionOpportunityId mLastChooseImageIndexComposition;
+  CompositionOpportunityId mLastFrameUpdateComposition;
+};
+
+}  
+}  
+
+#endif  // MOZILLA_GFX_IMAGECOMPOSITE_H

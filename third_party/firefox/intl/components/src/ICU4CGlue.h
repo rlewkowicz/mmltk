@@ -1,0 +1,609 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef intl_components_ICUUtils_h
+#define intl_components_ICUUtils_h
+
+#include "unicode/uenum.h"
+#include "unicode/utypes.h"
+#include "mozilla/Buffer.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/Likely.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Result.h"
+#include "mozilla/Span.h"
+#include "mozilla/Utf8.h"
+#include "mozilla/Vector.h"
+#include "mozilla/intl/ICUError.h"
+
+#ifndef JS_STANDALONE
+#  include "nsTArray.h"
+#endif
+
+#include <cstring>
+#include <iterator>
+#include <stddef.h>
+#include <stdint.h>
+#include <string>
+#include <string_view>
+
+struct UFormattedValue;
+namespace mozilla::intl {
+
+template <typename CharType>
+static inline CharType* AssertNullTerminatedString(Span<CharType> aSpan) {
+  MOZ_ASSERT(*(aSpan.data() + aSpan.size()) == '\0');
+
+  MOZ_ASSERT(std::char_traits<std::remove_const_t<CharType>>::length(
+                 aSpan.data()) == aSpan.size());
+
+  return aSpan.data();
+}
+
+static inline const char* AssertNullTerminatedString(std::string_view aView) {
+  MOZ_ASSERT(*(aView.data() + aView.size()) == '\0');
+
+  MOZ_ASSERT(std::strlen(aView.data()) == aView.size());
+
+  return aView.data();
+}
+
+static inline const char* IcuLocale(const char* aLocale) {
+  const char* locale = aLocale;
+  if (!std::strcmp(locale, "und")) {
+    locale = "";  
+  }
+  return locale;
+}
+
+static inline const char* IcuLocale(Span<const char> aLocale) {
+  return IcuLocale(AssertNullTerminatedString(aLocale));
+}
+
+static inline const char* IcuLocale(const Buffer<char>& aLocale) {
+  return IcuLocale(Span(aLocale.begin(), aLocale.Length() - 1));
+}
+
+using ICUResult = Result<Ok, ICUError>;
+
+ICUError ToICUError(UErrorCode status);
+
+ICUResult ToICUResult(UErrorCode status);
+
+static inline bool ICUSuccessForStringSpan(UErrorCode status) {
+  return U_SUCCESS(status) || status == U_STRING_NOT_TERMINATED_WARNING;
+}
+
+template <typename T>
+class ICUPointer {
+ public:
+  explicit ICUPointer(T* aPointer) : mPointer(aPointer) {}
+
+  ICUPointer(ICUPointer&& other) noexcept = default;
+  ICUPointer& operator=(ICUPointer&& other) noexcept = default;
+
+  ICUPointer& operator=(T* aPointer) noexcept {
+    mPointer = aPointer;
+    return *this;
+  };
+
+  const T* GetConst() const { return const_cast<const T*>(mPointer); }
+  T* GetMut() { return mPointer; }
+
+  explicit operator bool() const { return !!mPointer; }
+
+ private:
+  T* mPointer;
+};
+
+template <typename ICUStringFunction, typename Buffer>
+static ICUResult FillBufferWithICUCall(Buffer& buffer,
+                                       const ICUStringFunction& strFn) {
+  static_assert(std::is_same_v<typename Buffer::CharType, char16_t> ||
+                std::is_same_v<typename Buffer::CharType, char> ||
+                std::is_same_v<typename Buffer::CharType, uint8_t>);
+
+  UErrorCode status = U_ZERO_ERROR;
+  int32_t length = strFn(buffer.data(), buffer.capacity(), &status);
+  if (status == U_BUFFER_OVERFLOW_ERROR) {
+    MOZ_ASSERT(length >= 0);
+
+    if (!buffer.reserve(length)) {
+      return Err(ICUError::OutOfMemory);
+    }
+
+    status = U_ZERO_ERROR;
+    mozilla::DebugOnly<int32_t> length2 = strFn(buffer.data(), length, &status);
+    MOZ_ASSERT(length == length2);
+  }
+  if (!ICUSuccessForStringSpan(status)) {
+    return Err(ToICUError(status));
+  }
+
+  buffer.written(length);
+
+  return Ok{};
+}
+
+template <typename T, size_t N>
+class VectorToBufferAdaptor {
+  mozilla::Vector<T, N>& vector;
+
+ public:
+  using CharType = T;
+
+  explicit VectorToBufferAdaptor(mozilla::Vector<T, N>& vector)
+      : vector(vector) {}
+
+  T* data() { return vector.begin(); }
+
+  size_t capacity() const { return vector.capacity(); }
+
+  bool reserve(size_t length) { return vector.reserve(length); }
+
+  void written(size_t length) {
+    mozilla::DebugOnly<bool> result = vector.resizeUninitialized(length);
+    MOZ_ASSERT(result);
+  }
+};
+
+template <typename ICUStringFunction, size_t InlineSize, typename CharType>
+static ICUResult FillBufferWithICUCall(Vector<CharType, InlineSize>& vector,
+                                       const ICUStringFunction& strFn) {
+  VectorToBufferAdaptor buffer(vector);
+  return FillBufferWithICUCall(buffer, strFn);
+}
+
+#ifndef JS_STANDALONE
+template <typename T>
+class nsTArrayToBufferAdapter {
+ public:
+  using CharType = T;
+
+  nsTArrayToBufferAdapter(const nsTArrayToBufferAdapter&) = delete;
+  nsTArrayToBufferAdapter& operator=(const nsTArrayToBufferAdapter&) = delete;
+
+  explicit nsTArrayToBufferAdapter(nsTArray<CharType>& aArray)
+      : mArray(aArray) {}
+
+  [[nodiscard]] bool reserve(size_t size) {
+    return mArray.SetCapacity(size, fallible);
+  }
+
+  CharType* data() { return mArray.Elements(); }
+
+  size_t length() const { return mArray.Length(); }
+
+  size_t capacity() const { return mArray.Capacity(); }
+
+  void written(size_t amount) {
+    MOZ_ASSERT(amount <= mArray.Capacity());
+    mArray.SetLengthAndRetainStorage(amount);
+  }
+
+ private:
+  nsTArray<CharType>& mArray;
+};
+
+template <typename T, size_t N>
+class AutoTArrayToBufferAdapter : public nsTArrayToBufferAdapter<T> {
+  using nsTArrayToBufferAdapter<T>::nsTArrayToBufferAdapter;
+};
+
+template <typename ICUStringFunction, typename CharType>
+static ICUResult FillBufferWithICUCall(nsTArray<CharType>& array,
+                                       const ICUStringFunction& strFn) {
+  nsTArrayToBufferAdapter<CharType> buffer(array);
+  return FillBufferWithICUCall(buffer, strFn);
+}
+
+template <typename ICUStringFunction, typename CharType, size_t N>
+static ICUResult FillBufferWithICUCall(AutoTArray<CharType, N>& array,
+                                       const ICUStringFunction& strFn) {
+  AutoTArrayToBufferAdapter<CharType, N> buffer(array);
+  return FillBufferWithICUCall(buffer, strFn);
+}
+#endif
+
+template <typename Buffer>
+[[nodiscard]] bool FillBuffer(Span<const char16_t> utf16Span,
+                              Buffer& targetBuffer) {
+  static_assert(std::is_same_v<typename Buffer::CharType, char> ||
+                std::is_same_v<typename Buffer::CharType, unsigned char> ||
+                std::is_same_v<typename Buffer::CharType, char16_t>);
+
+  if constexpr (std::is_same_v<typename Buffer::CharType, char> ||
+                std::is_same_v<typename Buffer::CharType, unsigned char>) {
+    auto targetSize = CheckedInt<size_t>(utf16Span.Length()) * 3;
+    if (MOZ_UNLIKELY(!targetSize.isValid() ||
+                     !targetBuffer.reserve(targetSize.value()))) {
+      return false;
+    }
+
+    size_t amount = ConvertUtf16toUtf8(
+        utf16Span, Span(reinterpret_cast<char*>(targetBuffer.data()),
+                        targetBuffer.capacity()));
+
+    targetBuffer.written(amount);
+  }
+  if constexpr (std::is_same_v<typename Buffer::CharType, char16_t>) {
+    size_t amount = utf16Span.Length();
+    if (!targetBuffer.reserve(amount)) {
+      return false;
+    }
+    for (size_t i = 0; i < amount; i++) {
+      targetBuffer.data()[i] = utf16Span[i];
+    }
+    targetBuffer.written(amount);
+  }
+
+  return true;
+}
+
+template <typename Buffer>
+[[nodiscard]] bool FillBuffer(Span<const char> utf8Span, Buffer& targetBuffer) {
+  static_assert(std::is_same_v<typename Buffer::CharType, char> ||
+                std::is_same_v<typename Buffer::CharType, unsigned char> ||
+                std::is_same_v<typename Buffer::CharType, char16_t>);
+
+  if constexpr (std::is_same_v<typename Buffer::CharType, char> ||
+                std::is_same_v<typename Buffer::CharType, unsigned char>) {
+    size_t amount = utf8Span.Length();
+    if (!targetBuffer.reserve(amount)) {
+      return false;
+    }
+    for (size_t i = 0; i < amount; i++) {
+      targetBuffer.data()[i] =
+          static_cast<typename Buffer::CharType>(utf8Span[i]);
+    }
+    targetBuffer.written(amount);
+  }
+  if constexpr (std::is_same_v<typename Buffer::CharType, char16_t>) {
+    if (!targetBuffer.reserve(utf8Span.Length() + 1)) {
+      return false;
+    }
+
+    size_t amount = ConvertUtf8toUtf16(
+        utf8Span, Span(targetBuffer.data(), targetBuffer.capacity()));
+
+    targetBuffer.written(amount);
+  }
+
+  return true;
+}
+
+template <size_t StackSize>
+[[nodiscard]] static bool FillUTF16Vector(
+    Span<const char> utf8Span,
+    mozilla::Vector<char16_t, StackSize>& utf16TargetVec) {
+  if (!utf16TargetVec.reserve(utf8Span.Length() + 1)) {
+    return false;
+  }
+
+  size_t length = ConvertUtf8toUtf16(
+      utf8Span, Span(utf16TargetVec.begin(), utf16TargetVec.capacity()));
+
+  MOZ_ASSERT(length < utf16TargetVec.capacity());
+  utf16TargetVec.begin()[length] = '\0';
+
+  return utf16TargetVec.resizeUninitialized(length);
+}
+
+template <typename CharType, typename T, T(Mapper)(const CharType*, int32_t)>
+class Enumeration {
+ public:
+  class Iterator;
+  friend class Iterator;
+
+  Enumeration(Enumeration&& other) noexcept
+      : mUEnumeration(other.mUEnumeration) {
+    other.mUEnumeration = nullptr;
+  }
+
+  Enumeration& operator=(Enumeration&& other) noexcept {
+    if (this == &other) {
+      return *this;
+    }
+    if (mUEnumeration) {
+      uenum_close(mUEnumeration);
+    }
+    mUEnumeration = other.mUEnumeration;
+    other.mUEnumeration = nullptr;
+    return *this;
+  }
+
+  class Iterator {
+    Enumeration& mEnumeration;
+    Maybe<int32_t> mIteration = Nothing{};
+    const CharType* mNext = nullptr;
+    int32_t mNextLength = 0;
+
+   public:
+    using value_type = const CharType*;
+    using reference = T;
+    using iterator_category = std::input_iterator_tag;
+
+    explicit Iterator(Enumeration& aEnumeration, bool aIsBegin)
+        : mEnumeration(aEnumeration) {
+      if (aIsBegin) {
+        AdvanceUEnum();
+      }
+    }
+
+    Iterator& operator++() {
+      AdvanceUEnum();
+      return *this;
+    }
+
+    Iterator operator++(int) {
+      Iterator retval = *this;
+      ++(*this);
+      return retval;
+    }
+
+    bool operator==(Iterator other) const {
+      return mIteration == other.mIteration;
+    }
+
+    bool operator!=(Iterator other) const { return !(*this == other); }
+
+    T operator*() const {
+      return Mapper(mNext, mNextLength);
+    }
+
+   private:
+    void AdvanceUEnum() {
+      if (mIteration.isNothing()) {
+        mIteration = Some(-1);
+      }
+      UErrorCode status = U_ZERO_ERROR;
+      if constexpr (std::is_same_v<CharType, char16_t>) {
+        mNext = uenum_unext(mEnumeration.mUEnumeration, &mNextLength, &status);
+      } else {
+        static_assert(std::is_same_v<CharType, char>,
+                      "Only char16_t and char are supported by "
+                      "mozilla::intl::Enumeration.");
+        mNext = uenum_next(mEnumeration.mUEnumeration, &mNextLength, &status);
+      }
+      if (U_FAILURE(status)) {
+        mNext = nullptr;
+      }
+
+      if (mNext) {
+        (*mIteration)++;
+      } else {
+        mIteration = Nothing{};
+      }
+    }
+  };
+
+  Iterator begin() { return Iterator(*this, true); }
+  Iterator end() { return Iterator(*this, false); }
+
+  explicit Enumeration(UEnumeration* aUEnumeration)
+      : mUEnumeration(aUEnumeration) {}
+
+  ~Enumeration() {
+    if (mUEnumeration) {
+      uenum_close(mUEnumeration);
+    }
+  }
+
+ private:
+  UEnumeration* mUEnumeration = nullptr;
+};
+
+template <typename CharType>
+Result<Span<const CharType>, InternalError> SpanMapper(const CharType* string,
+                                                       int32_t length) {
+  if (string == nullptr) {
+    return Err(InternalError{});
+  }
+  MOZ_ASSERT(length >= 0);
+  return Span<const CharType>(string, static_cast<size_t>(length));
+}
+
+template <typename CharType>
+using SpanResult = Result<Span<const CharType>, InternalError>;
+
+template <typename CharType>
+using SpanEnumeration = Enumeration<CharType, SpanResult<CharType>, SpanMapper>;
+
+template <int32_t(CountAvailable)(), const char*(GetAvailable)(int32_t)>
+class AvailableLocalesEnumeration final {
+  int32_t mLocalesCount = 0;
+
+ public:
+  AvailableLocalesEnumeration() { mLocalesCount = CountAvailable(); }
+
+  class Iterator {
+   public:
+    using iterator_category = std::input_iterator_tag;
+    using value_type = mozilla::Span<const char>;
+    using difference_type = ptrdiff_t;
+    using pointer = value_type*;
+    using reference = value_type&;
+
+   private:
+    int32_t mLocalesPos = 0;
+
+   public:
+    explicit Iterator(int32_t aLocalesPos) : mLocalesPos(aLocalesPos) {}
+
+    Iterator& operator++() {
+      mLocalesPos++;
+      return *this;
+    }
+
+    Iterator operator++(int) {
+      Iterator result = *this;
+      ++(*this);
+      return result;
+    }
+
+    bool operator==(const Iterator& aOther) const {
+      return mLocalesPos == aOther.mLocalesPos;
+    }
+
+    bool operator!=(const Iterator& aOther) const { return !(*this == aOther); }
+
+    value_type operator*() const {
+      return mozilla::MakeStringSpan(GetAvailable(mLocalesPos));
+    }
+  };
+
+  int32_t Count() const { return mLocalesCount; }
+
+
+  Iterator begin() const { return Iterator(0); }
+
+  Iterator end() const { return Iterator(mLocalesCount); }
+};
+
+template <class T, uintptr_t(Len)(T*),
+          const char*(Item)(T*, uintptr_t, uintptr_t*), T*(New)(),
+          void(Free)(T*)>
+class ICU4XEnumeration final {
+  T* mDelegate = nullptr;
+  uintptr_t mLen = 0;
+
+ public:
+  ICU4XEnumeration() {
+    mDelegate = New();
+    mLen = Len(mDelegate);
+  }
+  ~ICU4XEnumeration() {
+    if (mDelegate) {
+      Free(mDelegate);
+      mDelegate = nullptr;
+    }
+  }
+  ICU4XEnumeration(const ICU4XEnumeration&) = delete;
+  ICU4XEnumeration& operator=(const ICU4XEnumeration&) = delete;
+  ICU4XEnumeration(ICU4XEnumeration&& aOther)
+      : mDelegate(aOther.mDelegate), mLen(aOther.mLen) {
+    aOther.mDelegate = nullptr;
+  }
+  ICU4XEnumeration& operator=(ICU4XEnumeration&& aOther) = delete;
+
+  class Iterator {
+   public:
+    using iterator_category = std::input_iterator_tag;
+    using value_type = mozilla::Span<const char>;
+    using difference_type = ptrdiff_t;
+    using pointer = value_type*;
+    using reference = value_type&;
+
+   private:
+    uintptr_t mPos = 0;
+    T* mDelegate = nullptr;
+
+   public:
+    explicit Iterator(uintptr_t aPos, T* aDelegate)
+        : mPos(aPos), mDelegate(aDelegate) {}
+
+    Iterator& operator++() {
+      mPos++;
+      return *this;
+    }
+
+    Iterator operator++(int) {
+      Iterator result = *this;
+      ++(*this);
+      return result;
+    }
+
+    bool operator==(const Iterator& aOther) const {
+      return mPos == aOther.mPos && mDelegate == aOther.mDelegate;
+    }
+
+    bool operator!=(const Iterator& aOther) const { return !(*this == aOther); }
+
+    value_type operator*() const {
+      uintptr_t len;
+      const char* ptr = Item(mDelegate, mPos, &len);
+      return mozilla::Span<const char>{ptr, len};
+    }
+  };
+
+  uintptr_t Count() const { return mLen; }
+
+
+  Iterator begin() const { return Iterator(0, mDelegate); }
+
+  Iterator end() const { return Iterator(mLen, mDelegate); }
+};
+
+class FormattedResult {
+ protected:
+  static Result<Span<const char16_t>, ICUError> ToSpanImpl(
+      const UFormattedValue* value);
+};
+
+template <typename T, T*(Open)(UErrorCode*),
+          const UFormattedValue*(GetValue)(const T*, UErrorCode*),
+          void(Close)(T*)>
+class MOZ_RAII AutoFormattedResult : FormattedResult {
+ public:
+  AutoFormattedResult() {
+    mFormatted = Open(&mError);
+    if (U_FAILURE(mError)) {
+      mFormatted = nullptr;
+    }
+  }
+  ~AutoFormattedResult() {
+    if (mFormatted) {
+      Close(mFormatted);
+    }
+  }
+
+  AutoFormattedResult(const AutoFormattedResult& other) = delete;
+  AutoFormattedResult& operator=(const AutoFormattedResult& other) = delete;
+
+  AutoFormattedResult(AutoFormattedResult&& other) = delete;
+  AutoFormattedResult& operator=(AutoFormattedResult&& other) = delete;
+
+  bool IsValid() const { return !!mFormatted; }
+
+  ICUError GetError() const { return ToICUError(mError); }
+
+  Result<Span<const char16_t>, ICUError> ToSpan() const {
+    if (!IsValid()) {
+      return Err(GetError());
+    }
+
+    const UFormattedValue* value = Value();
+    if (!value) {
+      return Err(ICUError::InternalError);
+    }
+
+    return ToSpanImpl(value);
+  }
+
+ private:
+  friend class DateIntervalFormat;
+  friend class ListFormat;
+  T* GetFormatted() const { return mFormatted; }
+
+  const UFormattedValue* Value() const {
+    if (!IsValid()) {
+      return nullptr;
+    }
+
+    UErrorCode status = U_ZERO_ERROR;
+    const UFormattedValue* value = GetValue(mFormatted, &status);
+    if (U_FAILURE(status)) {
+      return nullptr;
+    }
+
+    return value;
+  };
+
+  T* mFormatted = nullptr;
+  UErrorCode mError = U_ZERO_ERROR;
+};
+}  
+
+#endif /* intl_components_ICUUtils_h */

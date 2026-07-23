@@ -1,0 +1,260 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+********************************************************************************
+*   Copyright (C) 1997-2014, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+********************************************************************************
+*
+* File FMTABLE.H
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   02/29/97    aliu        Creation.
+********************************************************************************
+*/
+#ifndef FMTABLE_H
+#define FMTABLE_H
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/unistr.h"
+#include "unicode/stringpiece.h"
+#include "unicode/uformattable.h"
+
+U_NAMESPACE_BEGIN
+
+class FixedString;
+
+namespace number::impl {
+class DecimalQuantity;
+}
+
+class U_I18N_API Formattable : public UObject {
+public:
+    enum ISDATE { kIsDate };
+
+    Formattable(); 
+
+    Formattable(UDate d, ISDATE flag);
+
+    Formattable(double d);
+
+    Formattable(int32_t l);
+
+    Formattable(int64_t ll);
+
+#if !UCONFIG_NO_CONVERSION
+    Formattable(const char* strToCopy);
+#endif
+
+    Formattable(StringPiece number, UErrorCode &status);
+
+    Formattable(const UnicodeString& strToCopy);
+
+    Formattable(UnicodeString* strToAdopt);
+
+    Formattable(const Formattable* arrayToCopy, int32_t count);
+
+    Formattable(UObject* objectToAdopt);
+
+    Formattable(const Formattable&);
+
+    Formattable&    operator=(const Formattable &rhs);
+
+    bool           operator==(const Formattable &other) const;
+
+    bool           operator!=(const Formattable& other) const
+      { return !operator==(other); }
+
+    virtual         ~Formattable();
+
+    Formattable *clone() const;
+
+    enum Type {
+        kDate,
+
+        kDouble,
+
+        kLong,
+
+        kString,
+
+        kArray,
+
+        kInt64,
+
+        kObject
+   };
+
+    Type getType() const;
+
+    UBool           isNumeric() const;
+
+    double getDouble() const { return fValue.fDouble; }
+
+    double          getDouble(UErrorCode& status) const;
+
+    int32_t getLong() const { return static_cast<int32_t>(fValue.fInt64); }
+
+    int32_t         getLong(UErrorCode& status) const;
+
+    int64_t getInt64() const { return fValue.fInt64; }
+
+    int64_t         getInt64(UErrorCode& status) const;
+
+    UDate           getDate() const { return fValue.fDate; }
+
+     UDate          getDate(UErrorCode& status) const;
+
+    UnicodeString&  getString(UnicodeString& result) const
+      { result=*fValue.fString; return result; }
+
+    UnicodeString&  getString(UnicodeString& result, UErrorCode& status) const;
+
+    inline const UnicodeString& getString() const;
+
+    const UnicodeString& getString(UErrorCode& status) const;
+
+    inline UnicodeString& getString();
+
+    UnicodeString& getString(UErrorCode& status);
+
+    const Formattable* getArray(int32_t& count) const
+      { count=fValue.fArrayAndCount.fCount; return fValue.fArrayAndCount.fArray; }
+
+    const Formattable* getArray(int32_t& count, UErrorCode& status) const;
+
+    Formattable&    operator[](int32_t index) { return fValue.fArrayAndCount.fArray[index]; }
+
+    const UObject*  getObject() const;
+
+    StringPiece getDecimalNumber(UErrorCode &status);
+
+    void            setDouble(double d);
+
+    void            setLong(int32_t l);
+
+    void            setInt64(int64_t ll);
+
+    void            setDate(UDate d);
+
+    void            setString(const UnicodeString& stringToCopy);
+
+    void            setArray(const Formattable* array, int32_t count);
+
+    void            adoptString(UnicodeString* stringToAdopt);
+
+    void            adoptArray(Formattable* array, int32_t count);
+
+    void            adoptObject(UObject* objectToAdopt);
+
+    void             setDecimalNumber(StringPiece numberString,
+                                      UErrorCode &status);
+
+    virtual UClassID getDynamicClassID() const override;
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    static inline Formattable *fromUFormattable(UFormattable *fmt);
+
+    static inline const Formattable *fromUFormattable(const UFormattable *fmt);
+
+    inline UFormattable *toUFormattable();
+
+    inline const UFormattable *toUFormattable() const;
+
+#ifndef U_HIDE_DEPRECATED_API
+    inline int32_t getLong(UErrorCode* status) const;
+#endif  /* U_HIDE_DEPRECATED_API */
+
+#ifndef U_HIDE_INTERNAL_API
+    number::impl::DecimalQuantity *getDecimalQuantity() const { return fDecimalQuantity;}
+
+    void populateDecimalQuantity(number::impl::DecimalQuantity& output, UErrorCode& status) const;
+
+    void adoptDecimalQuantity(number::impl::DecimalQuantity *dq);
+
+    FixedString *internalGetFixedString(UErrorCode &status);
+
+#endif  /* U_HIDE_INTERNAL_API */
+
+private:
+    void dispose();
+
+    void            init();
+
+    UnicodeString* getBogus() const;
+
+    union {
+        UObject*        fObject;
+        UnicodeString*  fString;
+        double          fDouble;
+        int64_t         fInt64;
+        UDate           fDate;
+        struct {
+          Formattable*  fArray;
+          int32_t       fCount;
+        }               fArrayAndCount;
+    } fValue;
+
+    FixedString* fDecimalStr;
+
+    number::impl::DecimalQuantity *fDecimalQuantity;
+
+    Type                fType;
+    UnicodeString       fBogus; 
+};
+
+inline UDate Formattable::getDate(UErrorCode& status) const {
+    if (fType != kDate) {
+        if (U_SUCCESS(status)) {
+            status = U_INVALID_FORMAT_ERROR;
+        }
+        return 0;
+    }
+    return fValue.fDate;
+}
+
+inline const UnicodeString& Formattable::getString() const {
+    return *fValue.fString;
+}
+
+inline UnicodeString& Formattable::getString() {
+    return *fValue.fString;
+}
+
+#ifndef U_HIDE_DEPRECATED_API
+inline int32_t Formattable::getLong(UErrorCode* status) const {
+    return getLong(*status);
+}
+#endif  /* U_HIDE_DEPRECATED_API */
+
+inline UFormattable* Formattable::toUFormattable() {
+  return reinterpret_cast<UFormattable*>(this);
+}
+
+inline const UFormattable* Formattable::toUFormattable() const {
+  return reinterpret_cast<const UFormattable*>(this);
+}
+
+inline Formattable* Formattable::fromUFormattable(UFormattable *fmt) {
+  return reinterpret_cast<Formattable *>(fmt);
+}
+
+inline const Formattable* Formattable::fromUFormattable(const UFormattable *fmt) {
+  return reinterpret_cast<const Formattable *>(fmt);
+}
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif //_FMTABLE

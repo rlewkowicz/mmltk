@@ -1,0 +1,42 @@
+
+[package]
+edition = "2021"
+name = "unic-langid"
+version = "0.9.6"
+authors = ["Zibi Braniecki <gandalf@mozilla.com>"]
+build = false
+include = [
+    "src/**/*",
+    "benches/*.rs",
+    "tests/*.rs",
+    "Cargo.toml",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "README.md",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "API for managing Unicode Language Identifiers"
+categories = ["internationalization"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zbraniecki/unic-locale"
+
+[features]
+default = []
+likelysubtags = ["unic-langid-impl/likelysubtags"]
+macros = ["unic-langid-macros"]
+serde = ["unic-langid-impl/serde"]
+
+[lib]
+name = "unic_langid"
+path = "src/lib.rs"
+
+[dependencies.unic-langid-impl]
+version = "0.9.6"
+
+[dependencies.unic-langid-macros]
+version = "0.9.6"
+optional = true

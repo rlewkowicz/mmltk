@@ -1,0 +1,90 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_SourceBufferList_h_
+#define mozilla_dom_SourceBufferList_h_
+
+#include "SourceBuffer.h"
+#include "js/RootingAPI.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "nsCycleCollectionNoteChild.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsISupports.h"
+#include "nsTArray.h"
+
+struct JSContext;
+class JSObject;
+
+namespace mozilla {
+
+template <typename T>
+class AsyncEventRunner;
+
+namespace dom {
+
+class MediaSource;
+
+class SourceBufferList final : public DOMEventTargetHelper {
+ public:
+  SourceBuffer* IndexedGetter(uint32_t aIndex, bool& aFound);
+
+  uint32_t Length();
+
+  IMPL_EVENT_HANDLER(addsourcebuffer);
+  IMPL_EVENT_HANDLER(removesourcebuffer);
+
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(SourceBufferList,
+                                           DOMEventTargetHelper)
+
+  explicit SourceBufferList(MediaSource* aMediaSource);
+
+  MediaSource* GetParentObject() const;
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  void Append(SourceBuffer* aSourceBuffer);
+
+  void Remove(SourceBuffer* aSourceBuffer);
+
+  bool Contains(SourceBuffer* aSourceBuffer);
+
+  void Clear();
+
+  bool IsEmpty();
+
+  bool AnyUpdating();
+
+  void RangeRemoval(double aStart, double aEnd);
+
+  void SetEnded(const Optional<MediaSourceEndOfStreamError>& aError);
+
+  media::TimeUnit GetHighestBufferedEndTime();
+
+  void AppendSimple(SourceBuffer* aSourceBuffer);
+
+  void ClearSimple();
+
+  media::TimeUnit HighestStartTime();
+  media::TimeUnit HighestEndTime();
+
+ private:
+  ~SourceBufferList();
+
+  friend class AsyncEventRunner<SourceBufferList>;
+  void DispatchSimpleEvent(const char* aName);
+  void QueueAsyncSimpleEvent(const char* aName);
+
+  RefPtr<MediaSource> mMediaSource;
+  nsTArray<RefPtr<SourceBuffer> > mSourceBuffers;
+  const RefPtr<AbstractThread> mAbstractMainThread;
+};
+
+}  
+
+}  
+
+#endif /* mozilla_dom_SourceBufferList_h_ */

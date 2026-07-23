@@ -1,0 +1,179 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_UsedNameTracker_h
+#define frontend_UsedNameTracker_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Maybe.h"
+
+#include <stdint.h>
+
+#include "frontend/ParserAtom.h"                   // TaggedParserAtomIndex
+#include "frontend/TaggedParserAtomIndexHasher.h"  // TaggedParserAtomIndexHasher
+#include "frontend/Token.h"
+#include "js/AllocPolicy.h"
+#include "js/HashTable.h"
+#include "js/Vector.h"
+
+namespace js {
+namespace frontend {
+
+// relatively simple piece of code. (clang-format is disabled due to the width
+
+// clang-format off
+
+// clang-format on
+
+struct UnboundPrivateName {
+  TaggedParserAtomIndex atom;
+  TokenPos position;
+
+  UnboundPrivateName(TaggedParserAtomIndex atom, TokenPos position)
+      : atom(atom), position(position) {}
+};
+
+class UsedNameTracker {
+ public:
+  struct Use {
+    uint32_t scriptId;
+    uint32_t scopeId;
+  };
+
+  class UsedNameInfo {
+    friend class UsedNameTracker;
+
+    Vector<Use, 6> uses_;
+
+    void resetToScope(uint32_t scriptId, uint32_t scopeId);
+
+    NameVisibility visibility_ = NameVisibility::Public;
+
+    mozilla::Maybe<TokenPos> firstUsePos_;
+
+   public:
+    explicit UsedNameInfo(FrontendContext* fc, NameVisibility visibility,
+                          mozilla::Maybe<TokenPos> position)
+        : uses_(fc), visibility_(visibility), firstUsePos_(position) {}
+
+    UsedNameInfo(UsedNameInfo&& other) = default;
+
+    bool noteUsedInScope(uint32_t scriptId, uint32_t scopeId) {
+      if (uses_.empty() || uses_.back().scopeId < scopeId) {
+        return uses_.append(Use{scriptId, scopeId});
+      }
+      return true;
+    }
+
+    void noteBoundInScope(uint32_t scriptId, uint32_t scopeId,
+                          bool* closedOver) {
+      *closedOver = false;
+      while (!uses_.empty()) {
+        Use& innermost = uses_.back();
+        if (innermost.scopeId < scopeId) {
+          break;
+        }
+        if (innermost.scriptId > scriptId) {
+          *closedOver = true;
+        }
+        uses_.popBack();
+      }
+    }
+
+    bool isUsedInScript(uint32_t scriptId) const {
+      return !uses_.empty() && uses_.back().scriptId >= scriptId;
+    }
+
+    bool isClosedOver(uint32_t scriptId) const {
+      return !uses_.empty() && uses_.back().scriptId > scriptId;
+    }
+
+    bool isPublic() { return visibility_ == NameVisibility::Public; }
+
+    bool empty() const { return uses_.empty(); }
+
+    mozilla::Maybe<TokenPos> pos() { return firstUsePos_; }
+
+    void maybeUpdatePos(mozilla::Maybe<TokenPos> p) {
+      MOZ_ASSERT_IF(!isPublic(), p.isSome());
+
+      if (empty() && !isPublic()) {
+        firstUsePos_ = std::move(p);
+      }
+    }
+  };
+
+  using UsedNameMap =
+      HashMap<TaggedParserAtomIndex, UsedNameInfo, TaggedParserAtomIndexHasher>;
+
+ private:
+  UsedNameMap map_;
+
+  uint32_t scriptCounter_;
+
+  uint32_t scopeCounter_;
+
+  bool hasPrivateNames_;
+
+ public:
+  explicit UsedNameTracker(FrontendContext* fc)
+      : map_(fc),
+        scriptCounter_(0),
+        scopeCounter_(0),
+        hasPrivateNames_(false) {}
+
+  uint32_t nextScriptId() {
+    MOZ_ASSERT(scriptCounter_ != UINT32_MAX,
+               "ParseContext::Scope::init should have prevented wraparound");
+    return scriptCounter_++;
+  }
+
+  uint32_t nextScopeId() {
+    MOZ_ASSERT(scopeCounter_ != UINT32_MAX);
+    return scopeCounter_++;
+  }
+
+  UsedNameMap::Ptr lookup(TaggedParserAtomIndex name) const {
+    return map_.lookup(name);
+  }
+
+  [[nodiscard]] bool noteUse(
+      FrontendContext* fc, TaggedParserAtomIndex name,
+      NameVisibility visibility, uint32_t scriptId, uint32_t scopeId,
+      mozilla::Maybe<TokenPos> tokenPosition = mozilla::Nothing());
+
+  [[nodiscard]] bool hasUnboundPrivateNames(
+      FrontendContext* fc,
+      mozilla::Maybe<UnboundPrivateName>& maybeUnboundName);
+
+  [[nodiscard]] bool getUnboundPrivateNames(
+      Vector<UnboundPrivateName, 8>& unboundPrivateNames);
+
+  struct RewindToken {
+   private:
+    friend class UsedNameTracker;
+    uint32_t scriptId;
+    uint32_t scopeId;
+  };
+
+  RewindToken getRewindToken() const {
+    RewindToken token;
+    token.scriptId = scriptCounter_;
+    token.scopeId = scopeCounter_;
+    return token;
+  }
+
+  void rewind(RewindToken token);
+
+  const UsedNameMap& map() const { return map_; }
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  void dump(ParserAtomsTable& table);
+#endif
+};
+
+}  
+}  
+
+#endif

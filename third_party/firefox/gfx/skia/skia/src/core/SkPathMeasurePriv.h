@@ -1,0 +1,34 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPathMeasurePriv_DEFINED)
+#define SkPathMeasurePriv_DEFINED
+
+#include "include/core/SkPath.h"
+#include "include/core/SkPoint.h"
+#include "src/core/SkGeometry.h"
+
+enum SkSegType {
+    kLine_SegType,
+    kQuad_SegType,
+    kCubic_SegType,
+    kConic_SegType,
+};
+
+
+void SkPathMeasure_segTo(const SkPoint pts[], unsigned segType,
+                   SkScalar startT, SkScalar stopT, SkPath* dst);
+
+
+class SkPathMeasure;
+
+class SkPathMeasurePriv {
+public:
+    static size_t CountSegments(const SkPathMeasure&);
+};
+
+#endif

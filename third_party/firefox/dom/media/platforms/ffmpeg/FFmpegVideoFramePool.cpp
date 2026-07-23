@@ -1,0 +1,602 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "FFmpegVideoFramePool.h"
+
+#include "FFmpegLog.h"
+#include "PlatformDecoderModule.h"
+#include "libavutil/pixfmt.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "mozilla/gfx/gfxVars.h"
+#include "mozilla/widget/DMABufDevice.h"
+#include "mozilla/widget/va_drmcommon.h"
+
+#ifdef DRM_FORMAT_MOD_INVALID
+#  undef DRM_FORMAT_MOD_INVALID
+#endif
+#include <libdrm/drm_fourcc.h>
+
+#ifdef MOZ_LOGGING
+#  undef DMABUF_LOG
+extern mozilla::LazyLogModule gDmabufLog;
+#  define DMABUF_LOG(str, ...) \
+    MOZ_LOG_FMT(gDmabufLog, mozilla::LogLevel::Debug, str, ##__VA_ARGS__)
+#else
+#  define DMABUF_LOG(args)
+#endif /* MOZ_LOGGING */
+
+#define SURFACE_COPY_THRESHOLD (1.0f / 4.0f)
+
+constexpr static VASurfaceID sInvalidFFMPEGSurfaceID = -1;
+
+namespace mozilla {
+
+RefPtr<layers::Image> VideoFrameSurface<LIBAV_VER>::GetAsImage() {
+  return new layers::DMABUFSurfaceImage(mSurface);
+}
+
+VideoFrameSurface<LIBAV_VER>::VideoFrameSurface(DMABufSurface* aSurface,
+                                                VASurfaceID aFFMPEGSurfaceID)
+    : mSurface(aSurface),
+      mLib(nullptr),
+      mAVHWFrameContext(nullptr),
+      mHWAVBuffer(nullptr),
+      mFFMPEGSurfaceID(aFFMPEGSurfaceID),
+      mHoldByFFmpeg(false) {
+  MOZ_ASSERT(mSurface);
+  MOZ_RELEASE_ASSERT(mSurface->GetAsDMABufSurfaceYUV());
+  mSurface->GlobalRefCountCreate();
+  DMABUF_LOG("VideoFrameSurface: creating surface UID {} FFmpeg ID {:x}",
+             mSurface->GetUID(), aFFMPEGSurfaceID);
+}
+
+VideoFrameSurface<LIBAV_VER>::~VideoFrameSurface() {
+  DMABUF_LOG("~VideoFrameSurface: deleting dmabuf surface UID {}",
+             mSurface->GetUID());
+  mSurface->GlobalRefCountDelete();
+  if (mHoldByFFmpeg) {
+    ReleaseVAAPIData( false);
+  }
+}
+
+void VideoFrameSurface<LIBAV_VER>::DisableRecycle() {
+  MOZ_DIAGNOSTIC_ASSERT(mFFMPEGSurfaceID == sInvalidFFMPEGSurfaceID,
+                        "VideoFrameSurface::DisableRecycle(): can't disable "
+                        "recycle for FFmpeg surfaces!");
+  mSurface->DisableRecycle();
+}
+
+void VideoFrameSurface<LIBAV_VER>::LockVAAPIData(
+    AVCodecContext* aAVCodecContext, AVFrame* aAVFrame,
+    const FFmpegLibWrapper* aLib) {
+  mLib = aLib;
+  mHoldByFFmpeg = true;
+
+  if (aAVCodecContext->hw_frames_ctx) {
+    mAVHWFrameContext = aLib->av_buffer_ref(aAVCodecContext->hw_frames_ctx);
+    mHWAVBuffer = aLib->av_buffer_ref(aAVFrame->buf[0]);
+    DMABUF_LOG(
+        "VideoFrameSurface: VAAPI locking dmabuf surface UID {} FFMPEG ID "
+        "0x{:x} "
+        "mAVHWFrameContext {} mHWAVBuffer {}",
+        mSurface->GetUID(), mFFMPEGSurfaceID, fmt::ptr(mAVHWFrameContext),
+        fmt::ptr(mHWAVBuffer));
+  } else {
+    mAVHWFrameContext = nullptr;
+    mHWAVBuffer = aLib->av_buffer_ref(aAVFrame->buf[0]);
+    DMABUF_LOG(
+        "VideoFrameSurface: V4L2 locking dmabuf surface UID {} FFMPEG ID "
+        "0x{:x} "
+        "mHWAVBuffer {}",
+        mSurface->GetUID(), mFFMPEGSurfaceID, fmt::ptr(mHWAVBuffer));
+  }
+}
+
+void VideoFrameSurface<LIBAV_VER>::ReleaseVAAPIData(bool aForFrameRecycle) {
+  DMABUF_LOG(
+      "VideoFrameSurface: Releasing dmabuf surface UID {} FFMPEG ID 0x{:x} "
+      "aForFrameRecycle {} mLib {} mAVHWFrameContext {} mHWAVBuffer {}",
+      mSurface->GetUID(), mFFMPEGSurfaceID, aForFrameRecycle, fmt::ptr(mLib),
+      fmt::ptr(mAVHWFrameContext), fmt::ptr(mHWAVBuffer));
+  if (mLib) {
+    mLib->av_buffer_unref(&mHWAVBuffer);
+    if (mAVHWFrameContext) {
+      mLib->av_buffer_unref(&mAVHWFrameContext);
+    }
+    mLib = nullptr;
+  }
+
+  mHoldByFFmpeg = false;
+  mVulkanCopySlotIndex = -1;
+
+  if (aForFrameRecycle) {
+    mSurface->ReleaseSurface();
+  }
+
+  if (aForFrameRecycle && IsUsedByRenderer()) {
+    NS_WARNING("Reusing live dmabuf surface, visual glitches ahead");
+  }
+}
+
+VideoFramePool<LIBAV_VER>::VideoFramePool(int aFFMPEGPoolSize)
+    : mSurfaceLock("VideoFramePoolSurfaceLock"),
+      mMaxFFMPEGPoolSize(aFFMPEGPoolSize) {
+  DMABUF_LOG("VideoFramePool::VideoFramePool() pool size {}",
+             mMaxFFMPEGPoolSize);
+}
+
+VideoFramePool<LIBAV_VER>::~VideoFramePool() {
+  DMABUF_LOG("VideoFramePool::~VideoFramePool()");
+  MutexAutoLock lock(mSurfaceLock);
+  mDMABufSurfaces.Clear();
+}
+
+bool VideoFramePool<LIBAV_VER>::IsVulkanFrameSlotInUseByRenderer(
+    int32_t aSlotIndex) {
+  if (aSlotIndex < 0) {
+    return false;
+  }
+  MutexAutoLock lock(mSurfaceLock);
+  for (const auto& surface : mDMABufSurfaces) {
+    if (surface->mVulkanCopySlotIndex == aSlotIndex) {
+      return surface->IsUsedByRenderer();
+    }
+  }
+  return false;
+}
+
+void VideoFramePool<LIBAV_VER>::ReleaseUnusedVAAPIFrames() {
+  MutexAutoLock lock(mSurfaceLock);
+  for (const auto& surface : mDMABufSurfaces) {
+    if (!surface->mHoldByFFmpeg && surface->IsUsedByRenderer()) {
+      DMABUF_LOG("Copied and used surface UID {}",
+                 surface->GetDMABufSurface()->GetUID());
+    }
+    if (surface->mHoldByFFmpeg && !surface->IsUsedByRenderer()) {
+      surface->ReleaseVAAPIData();
+    }
+  }
+}
+
+void VideoFramePool<LIBAV_VER>::FlushFFmpegFrames() {
+  MutexAutoLock lock(mSurfaceLock);
+  for (const auto& surface : mDMABufSurfaces) {
+    surface->mFFMPEGSurfaceID = sInvalidFFMPEGSurfaceID;
+  }
+}
+
+RefPtr<VideoFrameSurface<LIBAV_VER>>
+VideoFramePool<LIBAV_VER>::GetFFmpegVideoFrameSurfaceLocked(
+    const MutexAutoLock& aProofOfLock, VASurfaceID aFFMPEGSurfaceID) {
+  MOZ_DIAGNOSTIC_ASSERT(
+      aFFMPEGSurfaceID != sInvalidFFMPEGSurfaceID,
+      "GetFFmpegVideoFrameSurfaceLocked(): expects valid aFFMPEGSurfaceID");
+
+  for (auto& surface : mDMABufSurfaces) {
+    if (surface->mFFMPEGSurfaceID == aFFMPEGSurfaceID) {
+      if (surface->IsUsedByRenderer()) {
+        surface->mFFMPEGSurfaceID = sInvalidFFMPEGSurfaceID;
+        return nullptr;
+      }
+      return surface;
+    }
+  }
+  return nullptr;
+}
+
+RefPtr<VideoFrameSurface<LIBAV_VER>>
+VideoFramePool<LIBAV_VER>::GetFreeVideoFrameSurfaceLocked(
+    const MutexAutoLock& aProofOfLock) {
+  for (auto& surface : mDMABufSurfaces) {
+    if (surface->mFFMPEGSurfaceID != sInvalidFFMPEGSurfaceID) {
+      continue;
+    }
+    if (surface->mHoldByFFmpeg) {
+      continue;
+    }
+    if (surface->IsUsedByRenderer()) {
+      continue;
+    }
+    surface->ReleaseVAAPIData();
+    return surface;
+  }
+  return nullptr;
+}
+
+bool VideoFramePool<LIBAV_VER>::ShouldCopySurface() {
+  int surfacesUsed = 0;
+  int surfacesUsedFFmpeg = 0;
+  for (const auto& surface : mDMABufSurfaces) {
+    if (surface->IsUsedByRenderer()) {
+      surfacesUsed++;
+      if (surface->IsFFMPEGSurface()) {
+        DMABUF_LOG("Used HW surface UID {} FFMPEG ID 0x{:x}\n",
+                   surface->mSurface->GetUID(), surface->mFFMPEGSurfaceID);
+        surfacesUsedFFmpeg++;
+      }
+    } else {
+      if (surface->IsFFMPEGSurface()) {
+        DMABUF_LOG("Free HW surface UID {} FFMPEG ID 0x{:x}\n",
+                   surface->mSurface->GetUID(), surface->mFFMPEGSurfaceID);
+      }
+    }
+  }
+
+  float freeRatio =
+      mMaxFFMPEGPoolSize
+          ? 1.0f - (surfacesUsedFFmpeg / (float)mMaxFFMPEGPoolSize)
+          : 1.0;
+  DMABUF_LOG(
+      "Surface pool size {} used copied {} used ffmpeg {} (max {}) free ratio "
+      "{}",
+      static_cast<int>(mDMABufSurfaces.Length()),
+      surfacesUsed - surfacesUsedFFmpeg, surfacesUsedFFmpeg, mMaxFFMPEGPoolSize,
+      freeRatio);
+  if (!gfx::gfxVars::HwDecodedVideoZeroCopy()) {
+    return true;
+  }
+  return freeRatio < SURFACE_COPY_THRESHOLD;
+}
+
+RefPtr<VideoFrameSurface<LIBAV_VER>>
+VideoFramePool<LIBAV_VER>::GetTargetVideoFrameSurfaceLocked(
+    const MutexAutoLock& aProofOfLock, VASurfaceID aFFmpegSurfaceID,
+    bool aRecycleSurface) {
+  RefPtr<DMABufSurfaceYUV> surface;
+  RefPtr<VideoFrameSurface<LIBAV_VER>> videoSurface;
+
+  if (!aRecycleSurface) {
+    videoSurface = GetFreeVideoFrameSurfaceLocked(aProofOfLock);
+  } else {
+    MOZ_DIAGNOSTIC_ASSERT(aFFmpegSurfaceID != sInvalidFFMPEGSurfaceID,
+                          "Wrong FFMPEGSurfaceID to recycle!");
+    videoSurface =
+        GetFFmpegVideoFrameSurfaceLocked(aProofOfLock, aFFmpegSurfaceID);
+  }
+
+  if (!videoSurface) {
+    surface = new DMABufSurfaceYUV();
+    videoSurface = new VideoFrameSurface<LIBAV_VER>(
+        surface, aRecycleSurface ? aFFmpegSurfaceID : sInvalidFFMPEGSurfaceID);
+    mDMABufSurfaces.AppendElement(videoSurface);
+    DMABUF_LOG("Added new DMABufSurface UID {}", surface->GetUID());
+  } else {
+    surface = videoSurface->GetDMABufSurface();
+    DMABUF_LOG("Matched DMABufSurface UID {}", surface->GetUID());
+  }
+
+  return videoSurface;
+}
+
+RefPtr<VideoFrameSurface<LIBAV_VER>>
+VideoFramePool<LIBAV_VER>::GetVideoFrameSurface(
+    VADRMPRIMESurfaceDescriptor& aVaDesc, int aWidth, int aHeight,
+    AVCodecContext* aAVCodecContext, AVFrame* aAVFrame,
+    const FFmpegLibWrapper* aLib) {
+  if (aVaDesc.fourcc != VA_FOURCC_NV12 && aVaDesc.fourcc != VA_FOURCC_YV12 &&
+      aVaDesc.fourcc != VA_FOURCC_P010 && aVaDesc.fourcc != VA_FOURCC_P016) {
+    DMABUF_LOG("Unsupported VA-API surface format {}", aVaDesc.fourcc);
+    return nullptr;
+  }
+
+  MutexAutoLock lock(mSurfaceLock);
+
+  bool copySurface = mTextureCopyWorks && ShouldCopySurface();
+
+  VASurfaceID ffmpegSurfaceID = (uintptr_t)aAVFrame->data[3];
+  MOZ_DIAGNOSTIC_ASSERT(ffmpegSurfaceID != sInvalidFFMPEGSurfaceID,
+                        "Exported invalid FFmpeg surface ID");
+  DMABUF_LOG("Got VA-API DMABufSurface FFMPEG ID 0x{:x}", ffmpegSurfaceID);
+
+  RefPtr<VideoFrameSurface<LIBAV_VER>> videoSurface =
+      GetTargetVideoFrameSurfaceLocked(lock, ffmpegSurfaceID,
+                                        !copySurface);
+  RefPtr<DMABufSurfaceYUV> surface = videoSurface->GetDMABufSurface();
+
+  if (!surface->UpdateYUVData(aVaDesc, aWidth, aHeight, copySurface)) {
+    if (!copySurface) {
+      return nullptr;
+    }
+
+    DMABUF_LOG("  DMABuf texture copy is broken");
+    copySurface = mTextureCopyWorks = false;
+
+    videoSurface = GetTargetVideoFrameSurfaceLocked(lock, ffmpegSurfaceID,
+                                                     true);
+    surface = videoSurface->GetDMABufSurface();
+    if (!surface->UpdateYUVData(aVaDesc, aWidth, aHeight,
+                                 false)) {
+      return nullptr;
+    }
+  }
+
+  if (MOZ_UNLIKELY(!mTextureCreationWorks)) {
+    mTextureCreationWorks = Some(surface->VerifyTextureCreation());
+    if (!*mTextureCreationWorks) {
+      DMABUF_LOG("  failed to create texture over DMABuf memory!");
+      return nullptr;
+    }
+  }
+
+  if (copySurface) {
+    videoSurface->DisableRecycle();
+  } else {
+    videoSurface->LockVAAPIData(aAVCodecContext, aAVFrame, aLib);
+  }
+
+  return videoSurface;
+}
+
+static gfx::SurfaceFormat GetSurfaceFormat(enum AVPixelFormat aPixFmt) {
+  switch (aPixFmt) {
+    case AV_PIX_FMT_YUV420P10LE:
+      return gfx::SurfaceFormat::YUV420P10;
+    case AV_PIX_FMT_YUV420P:
+      return gfx::SurfaceFormat::YUV420;
+    default:
+      return gfx::SurfaceFormat::UNKNOWN;
+  }
+}
+
+RefPtr<VideoFrameSurface<LIBAV_VER>>
+VideoFramePool<LIBAV_VER>::GetVideoFrameSurface(
+    const layers::PlanarYCbCrData& aData, AVCodecContext* aAVCodecContext) {
+  static gfx::SurfaceFormat format = GetSurfaceFormat(aAVCodecContext->pix_fmt);
+  if (format == gfx::SurfaceFormat::UNKNOWN) {
+    DMABUF_LOG("Unsupported FFmpeg DMABuf format {:x}",
+               static_cast<int>(aAVCodecContext->pix_fmt));
+    return nullptr;
+  }
+
+  MutexAutoLock lock(mSurfaceLock);
+
+  RefPtr<VideoFrameSurface<LIBAV_VER>> videoSurface =
+      GetTargetVideoFrameSurfaceLocked(lock, sInvalidFFMPEGSurfaceID,
+                                        false);
+  RefPtr<DMABufSurfaceYUV> surface = videoSurface->GetDMABufSurface();
+
+  DMABUF_LOG("Using SW DMABufSurface UID {}", surface->GetUID());
+
+  if (!surface->UpdateYUVData(aData, format)) {
+    DMABUF_LOG("  failed to convert YUV data to DMABuf memory!");
+    return nullptr;
+  }
+
+  if (MOZ_UNLIKELY(!mTextureCreationWorks)) {
+    mTextureCreationWorks = Some(surface->VerifyTextureCreation());
+    if (!*mTextureCreationWorks) {
+      DMABUF_LOG("  failed to create texture over DMABuf memory!");
+      return nullptr;
+    }
+  }
+
+  videoSurface->DisableRecycle();
+  return videoSurface;
+}
+
+static Maybe<VADRMPRIMESurfaceDescriptor> FFmpegDescToVA(
+    AVDRMFrameDescriptor& aDesc, AVFrame* aAVFrame) {
+  VADRMPRIMESurfaceDescriptor vaDesc{};
+
+  if (aAVFrame->format != AV_PIX_FMT_DRM_PRIME) {
+    if (aAVFrame->hw_frames_ctx) {
+      AVHWDeviceType hwdeviceType =
+          ((AVHWDeviceContext*)((AVHWFramesContext*)
+                                    aAVFrame->hw_frames_ctx->data)
+               ->device_ref->data)
+              ->type;
+      DMABUF_LOG("Got non-DRM-PRIME frame from FFmpeg AVHWDeviceType {}",
+                 static_cast<int>(hwdeviceType));
+    }
+    return Nothing();
+  }
+
+  if (aAVFrame->crop_top != 0 || aAVFrame->crop_left != 0) {
+    DMABUF_LOG("Top and left-side cropping are not supported");
+    return Nothing();
+  }
+
+  vaDesc.width = aAVFrame->width;
+  vaDesc.height = aAVFrame->height - aAVFrame->crop_bottom;
+
+  unsigned int uncrop_width = aDesc.layers[0].planes[0].pitch;
+  unsigned int uncrop_height = aAVFrame->height;
+
+  const unsigned int yPitch = uncrop_width;
+  unsigned int uvPitch = yPitch;
+#if defined(MOZ_ENABLE_VULKAN_VIDEO) && LIBAVCODEC_VERSION_MAJOR >= 59
+  if (aAVFrame->hw_frames_ctx) {
+    AVHWDeviceType hwdeviceType =
+        ((AVHWDeviceContext*)((AVHWFramesContext*)aAVFrame->hw_frames_ctx->data)
+             ->device_ref->data)
+            ->type;
+    if ((hwdeviceType == AV_HWDEVICE_TYPE_VULKAN) &&
+        (aDesc.layers[0].nb_planes >= 2) &&
+        (aDesc.layers[0].planes[1].pitch > 0)) {
+      uvPitch = static_cast<unsigned int>(aDesc.layers[0].planes[1].pitch);
+    }
+  }
+#endif
+
+  unsigned int offset = aDesc.layers[0].planes[0].offset;
+
+  if (aDesc.layers[0].format == DRM_FORMAT_YUV420) {
+    vaDesc.fourcc = VA_FOURCC_I420;
+
+    MOZ_ASSERT(aDesc.nb_objects == 1);
+    MOZ_ASSERT(aDesc.nb_layers == 1);
+
+    vaDesc.num_objects = 1;
+    vaDesc.objects[0].drm_format_modifier = aDesc.objects[0].format_modifier;
+    vaDesc.objects[0].size = aDesc.objects[0].size;
+    vaDesc.objects[0].fd = aDesc.objects[0].fd;
+
+    vaDesc.num_layers = 3;
+    for (int i = 0; i < 3; i++) {
+      vaDesc.layers[i].drm_format = DRM_FORMAT_R8;
+      vaDesc.layers[i].num_planes = 1;
+      vaDesc.layers[i].object_index[0] = 0;
+    }
+    vaDesc.layers[0].offset[0] = offset;
+    vaDesc.layers[0].pitch[0] = uncrop_width;
+    vaDesc.layers[1].offset[0] = offset + uncrop_width * uncrop_height;
+    vaDesc.layers[1].pitch[0] = uncrop_width / 2;
+    vaDesc.layers[2].offset[0] = offset + uncrop_width * uncrop_height * 5 / 4;
+    vaDesc.layers[2].pitch[0] = uncrop_width / 2;
+  } else if (aDesc.layers[0].format == DRM_FORMAT_NV12 &&
+             aDesc.nb_layers == 1) {
+    vaDesc.fourcc = VA_FOURCC_NV12;
+
+    MOZ_ASSERT(aDesc.nb_objects == 1);
+    MOZ_ASSERT(aDesc.nb_layers == 1);
+
+    vaDesc.num_objects = 1;
+    vaDesc.objects[0].drm_format_modifier = aDesc.objects[0].format_modifier;
+    vaDesc.objects[0].size = aDesc.objects[0].size;
+    vaDesc.objects[0].fd = aDesc.objects[0].fd;
+
+    vaDesc.num_layers = 2;
+    for (int i = 0; i < 2; i++) {
+      vaDesc.layers[i].num_planes = 1;
+      vaDesc.layers[i].object_index[0] = 0;
+    }
+    vaDesc.layers[0].pitch[0] = yPitch;
+    vaDesc.layers[1].pitch[0] = uvPitch;
+    vaDesc.layers[0].drm_format = DRM_FORMAT_R8;  
+    vaDesc.layers[0].offset[0] = offset;
+    vaDesc.layers[1].drm_format = DRM_FORMAT_GR88;  
+    vaDesc.layers[1].offset[0] = aDesc.layers[0].nb_planes >= 2
+                                     ? aDesc.layers[0].planes[1].offset
+                                     : offset + yPitch * uncrop_height;
+  } else if (aDesc.layers[0].format == DRM_FORMAT_P010 &&
+             aDesc.nb_layers == 1) {
+    vaDesc.fourcc = VA_FOURCC_P010;
+
+    MOZ_ASSERT(aDesc.nb_objects == 1);
+    MOZ_ASSERT(aDesc.nb_layers == 1);
+
+    vaDesc.num_objects = 1;
+    vaDesc.objects[0].drm_format_modifier = aDesc.objects[0].format_modifier;
+    vaDesc.objects[0].size = aDesc.objects[0].size;
+    vaDesc.objects[0].fd = aDesc.objects[0].fd;
+
+    vaDesc.num_layers = 2;
+    for (int i = 0; i < 2; i++) {
+      vaDesc.layers[i].num_planes = 1;
+      vaDesc.layers[i].object_index[0] = 0;
+    }
+    vaDesc.layers[0].pitch[0] = yPitch;
+    vaDesc.layers[1].pitch[0] = uvPitch;
+    vaDesc.layers[0].drm_format = DRM_FORMAT_R16;  
+    vaDesc.layers[0].offset[0] = offset;
+    vaDesc.layers[1].drm_format = DRM_FORMAT_GR1616;  
+    vaDesc.layers[1].offset[0] = aDesc.layers[0].nb_planes >= 2
+                                     ? aDesc.layers[0].planes[1].offset
+                                     : offset + yPitch * uncrop_height;
+  } else if (aDesc.nb_layers == 2 && aDesc.layers[0].format == DRM_FORMAT_R8 &&
+             aDesc.layers[1].format == DRM_FORMAT_GR88 &&
+             aDesc.nb_objects == 1) {
+    vaDesc.fourcc = VA_FOURCC_NV12;
+    vaDesc.num_objects = 1;
+    vaDesc.objects[0].drm_format_modifier = aDesc.objects[0].format_modifier;
+    vaDesc.objects[0].size = aDesc.objects[0].size;
+    vaDesc.objects[0].fd = aDesc.objects[0].fd;
+    vaDesc.num_layers = 2;
+    for (int i = 0; i < 2; i++) {
+      vaDesc.layers[i].num_planes = 1;
+      vaDesc.layers[i].object_index[0] = 0;
+      vaDesc.layers[i].drm_format = aDesc.layers[i].format;
+      vaDesc.layers[i].pitch[0] = aDesc.layers[i].planes[0].pitch;
+      vaDesc.layers[i].offset[0] = aDesc.layers[i].planes[0].offset;
+    }
+  } else if (aDesc.nb_layers == 2 && aDesc.layers[0].format == DRM_FORMAT_R16 &&
+             aDesc.layers[1].format == DRM_FORMAT_GR1616 &&
+             aDesc.nb_objects == 1) {
+    vaDesc.fourcc = VA_FOURCC_P010;
+    vaDesc.num_objects = 1;
+    vaDesc.objects[0].drm_format_modifier = aDesc.objects[0].format_modifier;
+    vaDesc.objects[0].size = aDesc.objects[0].size;
+    vaDesc.objects[0].fd = aDesc.objects[0].fd;
+    vaDesc.num_layers = 2;
+    for (int i = 0; i < 2; i++) {
+      vaDesc.layers[i].num_planes = 1;
+      vaDesc.layers[i].object_index[0] = 0;
+      vaDesc.layers[i].drm_format = aDesc.layers[i].format;
+      vaDesc.layers[i].pitch[0] = aDesc.layers[i].planes[0].pitch;
+      vaDesc.layers[i].offset[0] = aDesc.layers[i].planes[0].offset;
+    }
+  } else {
+    DMABUF_LOG("Don't know how to deal with FOURCC 0x{:x}",
+               aDesc.layers[0].format);
+    return Nothing();
+  }
+
+  return Some(vaDesc);
+}
+
+RefPtr<VideoFrameSurface<LIBAV_VER>>
+VideoFramePool<LIBAV_VER>::GetVideoFrameSurface(AVDRMFrameDescriptor& aDesc,
+                                                int aWidth, int aHeight,
+                                                AVCodecContext* aAVCodecContext,
+                                                AVFrame* aAVFrame,
+                                                const FFmpegLibWrapper* aLib) {
+  MOZ_ASSERT(aDesc.nb_layers > 0);
+
+  auto layerDesc = FFmpegDescToVA(aDesc, aAVFrame);
+  if (layerDesc.isNothing()) {
+    return nullptr;
+  }
+
+  int crop_width = (int)layerDesc->width;
+  int crop_height = (int)layerDesc->height;
+
+  MutexAutoLock lock(mSurfaceLock);
+
+  RefPtr<VideoFrameSurface<LIBAV_VER>> videoSurface =
+      GetTargetVideoFrameSurfaceLocked(lock, sInvalidFFMPEGSurfaceID,
+                                        false);
+  RefPtr<DMABufSurfaceYUV> surface = videoSurface->GetDMABufSurface();
+
+  if (aAVFrame->hw_frames_ctx) {
+    AVHWDeviceType hwdeviceType =
+        ((AVHWDeviceContext*)((AVHWFramesContext*)aAVFrame->hw_frames_ctx->data)
+             ->device_ref->data)
+            ->type;
+    DMABUF_LOG("Using {} DMABufSurface UID {}",
+               aLib->av_hwdevice_get_type_name(hwdeviceType),
+               surface->GetUID());
+  }
+
+  bool copySurface = mTextureCopyWorks && ShouldCopySurface();
+  if (!surface->UpdateYUVData(layerDesc.value(), crop_width, crop_height,
+                              copySurface)) {
+    if (!copySurface) {
+      return nullptr;
+    }
+    DMABUF_LOG("  DMABuf texture copy is broken");
+    copySurface = mTextureCopyWorks = false;
+    if (!surface->UpdateYUVData(layerDesc.value(), crop_width, crop_height,
+                                copySurface)) {
+      return nullptr;
+    }
+  }
+
+  if (MOZ_UNLIKELY(!mTextureCreationWorks)) {
+    mTextureCreationWorks = Some(surface->VerifyTextureCreation());
+    if (!*mTextureCreationWorks) {
+      DMABUF_LOG("  failed to create texture over DMABuf memory!");
+      return nullptr;
+    }
+  }
+
+  videoSurface->DisableRecycle();
+
+  if (!copySurface) {
+    videoSurface->LockVAAPIData(aAVCodecContext, aAVFrame, aLib);
+  }
+
+  return videoSurface;
+}
+
+}  

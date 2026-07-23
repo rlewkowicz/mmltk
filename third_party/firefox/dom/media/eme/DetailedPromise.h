@@ -1,0 +1,87 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DetailedPromise_h_
+#define DetailedPromise_h_
+
+#include "EMEUtils.h"
+#include "mozilla/dom/Promise.h"
+
+namespace mozilla::dom {
+
+class DetailedPromise : public Promise {
+ public:
+  static already_AddRefed<DetailedPromise> Create(nsIGlobalObject* aGlobal,
+                                                  ErrorResult& aRv,
+                                                  const nsACString& aName);
+
+  template <typename T>
+  void MaybeResolve(T&& aArg) {
+    EME_LOG("{} promise resolved", mName.get());
+    Promise::MaybeResolve(std::forward<T>(aArg));
+  }
+
+  void MaybeReject(nsresult aArg) = delete;
+  void MaybeReject(nsresult aArg, const nsACString& aReason);
+
+  void MaybeReject(ErrorResult&& aArg) = delete;
+  void MaybeReject(ErrorResult&& aArg, const nsACString& aReason);
+
+#define DOMEXCEPTION(name, err)                                   \
+  inline void MaybeRejectWith##name(const nsACString& aMessage) { \
+    LogRejectionReason(static_cast<uint32_t>(err), aMessage);     \
+    Promise::MaybeRejectWith##name(aMessage);                     \
+  }                                                               \
+  template <int N>                                                \
+  void MaybeRejectWith##name(const char (&aMessage)[N]) {         \
+    MaybeRejectWith##name(nsLiteralCString(aMessage));            \
+  }
+
+#include "mozilla/dom/DOMExceptionNames.inc"
+
+#undef DOMEXCEPTION
+
+  template <ErrNum errorNumber, typename... Ts>
+  void MaybeRejectWithTypeError(Ts&&... aMessageArgs) = delete;
+
+  inline void MaybeRejectWithTypeError(const nsACString& aMessage) {
+    ErrorResult res;
+    res.ThrowTypeError(aMessage);
+    MaybeReject(std::move(res), aMessage);
+  }
+
+  template <int N>
+  void MaybeRejectWithTypeError(const char (&aMessage)[N]) {
+    MaybeRejectWithTypeError(nsLiteralCString(aMessage));
+  }
+
+  template <ErrNum errorNumber, typename... Ts>
+  void MaybeRejectWithRangeError(Ts&&... aMessageArgs) = delete;
+
+  inline void MaybeRejectWithRangeError(const nsACString& aMessage) {
+    ErrorResult res;
+    res.ThrowRangeError(aMessage);
+    MaybeReject(std::move(res), aMessage);
+  }
+
+  template <int N>
+  void MaybeRejectWithRangeError(const char (&aMessage)[N]) {
+    MaybeRejectWithRangeError(nsLiteralCString(aMessage));
+  }
+
+ private:
+  explicit DetailedPromise(nsIGlobalObject* aGlobal, const nsACString& aName);
+
+  virtual ~DetailedPromise();
+
+  enum eStatus { kSucceeded, kFailed };
+  void LogRejectionReason(uint32_t aErrorCode, const nsACString& aReason);
+
+  nsCString mName;
+  TimeStamp mStartTime;
+};
+
+}  
+
+#endif  // DetailedPromise_h_

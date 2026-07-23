@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SMIL_SMILKEYSPLINE_H_
+#define DOM_SMIL_SMILKEYSPLINE_H_
+
+#include <cstdint>
+
+namespace mozilla {
+
+class SMILKeySpline {
+ public:
+  constexpr SMILKeySpline() : mX1(0), mY1(0), mX2(0), mY2(0) {
+    \
+  }
+
+    SMILKeySpline(double aX1, double aY1, double aX2, double aY2)
+        : mX1(0), mY1(0), mX2(0), mY2(0) {
+      Init(aX1, aY1, aX2, aY2);
+    }
+
+    double X1() const { return mX1; }
+    double Y1() const { return mY1; }
+    double X2() const { return mX2; }
+    double Y2() const { return mY2; }
+
+    void Init(double aX1, double aY1, double aX2, double aY2);
+
+    double GetSplineValue(double aX) const;
+
+    void GetSplineDerivativeValues(double aX, double& aDX, double& aDY) const;
+
+    bool operator==(const SMILKeySpline& aOther) const {
+      return mX1 == aOther.mX1 && mY1 == aOther.mY1 && mX2 == aOther.mX2 &&
+             mY2 == aOther.mY2;
+    }
+    bool operator!=(const SMILKeySpline& aOther) const {
+      return !(*this == aOther);
+    }
+    int32_t Compare(const SMILKeySpline& aRhs) const {
+      if (mX1 != aRhs.mX1) return mX1 < aRhs.mX1 ? -1 : 1;
+      if (mY1 != aRhs.mY1) return mY1 < aRhs.mY1 ? -1 : 1;
+      if (mX2 != aRhs.mX2) return mX2 < aRhs.mX2 ? -1 : 1;
+      if (mY2 != aRhs.mY2) return mY2 < aRhs.mY2 ? -1 : 1;
+      return 0;
+    }
+
+   private:
+    void CalcSampleValues();
+
+    static double CalcBezier(double aT, double aA1, double aA2);
+
+    static double GetSlope(double aT, double aA1, double aA2);
+
+    double GetTForX(double aX) const;
+
+    double NewtonRaphsonIterate(double aX, double aGuessT) const;
+
+    double BinarySubdivide(double aX, double aA, double aB) const;
+
+    static double A(double aA1, double aA2) {
+      return 1.0 - 3.0 * aA2 + 3.0 * aA1;
+    }
+
+    static double B(double aA1, double aA2) { return 3.0 * aA2 - 6.0 * aA1; }
+
+    static double C(double aA1) { return 3.0 * aA1; }
+
+    double mX1;
+    double mY1;
+    double mX2;
+    double mY2;
+
+    static constexpr uint32_t kSplineTableSize = 11;
+    double mSampleValues[kSplineTableSize] = {};
+
+    static constexpr double kSampleStepSize =
+        1.0 / double(kSplineTableSize - 1);
+};
+
+}  
+
+#endif  // DOM_SMIL_SMILKEYSPLINE_H_

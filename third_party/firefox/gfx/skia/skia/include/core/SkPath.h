@@ -1,0 +1,470 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPath_DEFINED)
+#define SkPath_DEFINED
+
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPathIter.h"
+#include "include/core/SkPathTypes.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkSpan.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkDebug.h"
+#include "include/private/base/SkTo.h"
+#include "include/private/base/SkTypeTraits.h"
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <tuple>
+
+class SkData;
+class SkRRect;
+class SkWStream;
+enum class SkPathConvexity;
+enum class SkResolveConvexity;
+struct SkPathRaw;
+struct SkPathOvalInfo;
+struct SkPathRRectInfo;
+
+#define SK_LEGACY_PATH_ACCESSORS
+
+class SkPathData;
+
+class SK_API SkPath {
+public:
+    static SkPath Raw(SkSpan<const SkPoint> pts,
+                      SkSpan<const SkPathVerb> verbs,
+                      SkSpan<const SkScalar> conics,
+                      SkPathFillType, bool isVolatile = false);
+
+    static SkPath Rect(const SkRect&, SkPathFillType, SkPathDirection = SkPathDirection::kDefault,
+                       unsigned startIndex = 0);
+    static SkPath Rect(const SkRect& r, SkPathDirection direction = SkPathDirection::kDefault,
+                       unsigned startIndex = 0) {
+        return Rect(r, SkPathFillType::kDefault, direction, startIndex);
+    }
+    static SkPath Oval(const SkRect&, SkPathDirection = SkPathDirection::kDefault);
+    static SkPath Oval(const SkRect&, SkPathDirection, unsigned startIndex);
+    static SkPath Circle(SkScalar center_x, SkScalar center_y, SkScalar radius,
+                         SkPathDirection dir = SkPathDirection::kCW);
+    static SkPath RRect(const SkRRect&, SkPathDirection dir = SkPathDirection::kDefault);
+    static SkPath RRect(const SkRRect&, SkPathDirection, unsigned startIndex);
+    static SkPath RRect(const SkRect& bounds, SkScalar rx, SkScalar ry,
+                        SkPathDirection dir = SkPathDirection::kDefault);
+
+    static SkPath Polygon(SkSpan<const SkPoint> pts, bool isClosed,
+                          SkPathFillType fillType = SkPathFillType::kDefault,
+                          bool isVolatile = false);
+
+    static SkPath Line(SkPoint a, SkPoint b) {
+        return Polygon({{a, b}}, false);
+    }
+
+    static SkPath Make(SkSpan<const SkPoint> pts,
+                       SkSpan<const uint8_t> verbs,
+                       SkSpan<const SkScalar> conics,
+                       SkPathFillType fillType,
+                       bool isVolatile = false) {
+        return Raw(pts, {reinterpret_cast<const SkPathVerb*>(verbs.data()), verbs.size()},
+                   conics, fillType, isVolatile);
+    }
+
+    explicit SkPath(SkPathFillType);
+
+    SkPath() : SkPath(SkPathFillType::kDefault) {}
+
+    SkPath(const SkPath&);
+    SkPath(SkPath&&);
+
+    ~SkPath();
+
+    SkPath snapshot() const {
+        return *this;
+    }
+
+    SkPath& operator=(const SkPath&);
+    SkPath& operator=(SkPath&&);
+
+    friend SK_API bool operator==(const SkPath& a, const SkPath& b);
+
+    friend bool operator!=(const SkPath& a, const SkPath& b) {
+        return !(a == b);
+    }
+
+
+    bool isInterpolatable(const SkPath& compare) const;
+
+    SkPath makeInterpolate(const SkPath& ending, SkScalar weight) const;
+
+    bool interpolate(const SkPath& ending, SkScalar weight, SkPath* out) const;
+
+    SkPathFillType getFillType() const { return (SkPathFillType)fFillType; }
+
+    SkPath makeFillType(SkPathFillType newFillType) const;
+
+    bool isInverseFillType() const { return SkPathFillType_IsInverse(this->getFillType()); }
+
+    SkPath makeToggleInverseFillType() const;
+
+    bool isConvex() const;
+
+    bool isOval(SkRect* bounds) const;
+
+    bool isRRect(SkRRect* rrect) const;
+
+    bool isEmpty() const;
+
+    bool isLastContourClosed() const;
+
+    bool isFinite() const;
+
+    bool isVolatile() const {
+        return SkToBool(fIsVolatile);
+    }
+
+    SkPath makeIsVolatile(bool isVolatile) const;
+
+    static bool IsLineDegenerate(const SkPoint& p1, const SkPoint& p2, bool exact);
+
+    static bool IsQuadDegenerate(const SkPoint& p1, const SkPoint& p2,
+                                 const SkPoint& p3, bool exact);
+
+    static bool IsCubicDegenerate(const SkPoint& p1, const SkPoint& p2,
+                                  const SkPoint& p3, const SkPoint& p4, bool exact);
+
+    bool isLine(SkPoint line[2]) const;
+
+    SkSpan<const SkPoint> points() const;
+
+    SkSpan<const SkPathVerb> verbs() const;
+
+    SkSpan<const float> conicWeights() const;
+
+    int countPoints() const { return SkToInt(this->points().size()); }
+    int countVerbs() const { return SkToInt(this->verbs().size()); }
+
+    std::optional<SkPoint> getLastPt() const;
+
+#if defined(SK_LEGACY_PATH_ACCESSORS)
+    SkPoint getPoint(int index) const;
+
+    size_t getPoints(SkSpan<SkPoint> points) const;
+
+    size_t getVerbs(SkSpan<uint8_t> verbs) const;
+
+    bool getLastPt(SkPoint* lastPt) const {
+        if (auto lp = this->getLastPt()) {
+            if (lastPt) {
+                *lastPt = *lp;
+            }
+            return true;
+        }
+        if (lastPt) {
+            *lastPt = {0, 0};
+        }
+        return false;
+    }
+#endif
+
+    size_t approximateBytesUsed() const;
+
+    const SkRect& getBounds() const;
+
+    void updateBoundsCache() const {
+        this->getBounds();
+    }
+
+    SkRect computeTightBounds() const;
+
+    bool conservativelyContainsRect(const SkRect& rect) const;
+
+    static int ConvertConicToQuads(const SkPoint& p0, const SkPoint& p1, const SkPoint& p2,
+                                   SkScalar w, SkPoint pts[], int pow2);
+
+    bool isRect(SkRect* rect, bool* isClosed = nullptr, SkPathDirection* direction = nullptr) const;
+
+    enum AddPathMode {
+        kAppend_AddPathMode,
+        kExtend_AddPathMode,
+    };
+
+    std::optional<SkPath> tryMakeTransform(const SkMatrix& matrix) const;
+
+    std::optional<SkPath> tryMakeOffset(float dx, float dy) const {
+        return this->tryMakeTransform(SkMatrix::Translate(dx, dy));
+    }
+
+    std::optional<SkPath> tryMakeScale(float sx, float sy) const {
+        return this->tryMakeTransform(SkMatrix::Scale(sx, sy));
+    }
+
+    SkPath makeTransform(const SkMatrix& matrix) const;
+
+    SkPath makeOffset(SkScalar dx, SkScalar dy) const {
+        return this->makeTransform(SkMatrix::Translate(dx, dy));
+    }
+
+    SkPath makeScale(SkScalar sx, SkScalar sy) const {
+        return this->makeTransform(SkMatrix::Scale(sx, sy));
+    }
+
+    enum SegmentMask {
+        kLine_SegmentMask  = kLine_SkPathSegmentMask,
+        kQuad_SegmentMask  = kQuad_SkPathSegmentMask,
+        kConic_SegmentMask = kConic_SkPathSegmentMask,
+        kCubic_SegmentMask = kCubic_SkPathSegmentMask,
+    };
+
+    uint32_t getSegmentMasks() const;
+
+    enum Verb {
+        kMove_Verb  = static_cast<int>(SkPathVerb::kMove),
+        kLine_Verb  = static_cast<int>(SkPathVerb::kLine),
+        kQuad_Verb  = static_cast<int>(SkPathVerb::kQuad),
+        kConic_Verb = static_cast<int>(SkPathVerb::kConic),
+        kCubic_Verb = static_cast<int>(SkPathVerb::kCubic),
+        kClose_Verb = static_cast<int>(SkPathVerb::kClose),
+        kDone_Verb  = kClose_Verb + 1
+    };
+
+    SkPath& setIsVolatile(bool isVolatile) {
+        fIsVolatile = isVolatile;
+        return *this;
+    }
+
+    void swap(SkPath& other);
+
+    void setFillType(SkPathFillType ft) {
+        fFillType = ft;
+    }
+
+    void toggleInverseFillType() {
+        fFillType = SkPathFillType_ToggleInverse(fFillType);
+    }
+
+    SkPath& reset();
+
+    SkPathIter iter() const;
+
+    struct IterRec {
+        SkPathVerb            fVerb;
+        SkSpan<const SkPoint> fPoints;
+        float                 fConicWeight;
+
+        float conicWeight() const {
+            SkASSERT(fVerb == SkPathVerb::kConic);
+            return fConicWeight;
+        }
+    };
+
+    class SK_API Iter {
+    public:
+
+        Iter();
+
+        Iter(const SkPath& path, bool forceClose);
+
+        void setPath(const SkPath& path, bool forceClose);
+
+        Verb next(SkPoint pts[4]);
+
+        std::optional<IterRec> next();
+
+        SkScalar conicWeight() const { return *fConicWeights; }
+
+        /** Returns true if last kLine_Verb returned by next() was generated
+            by kClose_Verb. When true, the end point returned by next() is
+            also the start point of contour.
+
+            If next() has not been called, or next() did not return kLine_Verb,
+            result is undefined.
+
+            @return  true if last kLine_Verb was generated by kClose_Verb
+        */
+        bool isCloseLine() const { return SkToBool(fCloseLine); }
+
+        bool isClosedContour() const;
+
+    private:
+        const SkPoint*          fPts;
+        const SkPathVerb*       fVerbs;
+        const SkPathVerb*       fVerbStop;
+        const SkScalar*         fConicWeights;
+        SkPoint                 fMoveTo;
+        SkPoint                 fLastPt;
+        std::array<SkPoint, 4>  fStorage;
+        bool                    fForceClose;
+        bool                    fNeedClose;
+        bool                    fCloseLine;
+
+        SkPathVerb autoClose(SkPoint pts[2]);
+    };
+
+private:
+    std::optional<SkPathOvalInfo> getOvalInfo() const;
+    std::optional<SkPathRRectInfo> getRRectInfo() const;
+    std::optional<SkPathRaw> raw(SkResolveConvexity) const;
+
+    class RangeIter {
+    public:
+        RangeIter() = default;
+        RangeIter(const SkPathVerb* verbs, const SkPoint* points, const SkScalar* weights)
+                : fVerb(verbs), fPoints(points), fWeights(weights) {
+            SkDEBUGCODE(fInitialPoints = fPoints;)
+        }
+        bool operator!=(const RangeIter& that) const {
+            return fVerb != that.fVerb;
+        }
+        bool operator==(const RangeIter& that) const {
+            return fVerb == that.fVerb;
+        }
+        RangeIter& operator++() {
+            auto verb = *fVerb++;
+            fPoints += pts_advance_after_verb(verb);
+            if (verb == SkPathVerb::kConic) {
+                ++fWeights;
+            }
+            return *this;
+        }
+        RangeIter operator++(int) {
+            RangeIter copy = *this;
+            this->operator++();
+            return copy;
+        }
+        SkPathVerb peekVerb() const {
+            return *fVerb;
+        }
+        std::tuple<SkPathVerb, const SkPoint*, const SkScalar*> operator*() const {
+            SkPathVerb verb = this->peekVerb();
+            int backset = pts_backset_for_verb(verb);
+            SkASSERT(fPoints + backset >= fInitialPoints);
+            return {verb, fPoints + backset, fWeights};
+        }
+    private:
+        constexpr static int pts_advance_after_verb(SkPathVerb verb) {
+            switch (verb) {
+                case SkPathVerb::kMove: return 1;
+                case SkPathVerb::kLine: return 1;
+                case SkPathVerb::kQuad: return 2;
+                case SkPathVerb::kConic: return 2;
+                case SkPathVerb::kCubic: return 3;
+                case SkPathVerb::kClose: return 0;
+            }
+            SkUNREACHABLE;
+        }
+        constexpr static int pts_backset_for_verb(SkPathVerb verb) {
+            switch (verb) {
+                case SkPathVerb::kMove: return 0;
+                case SkPathVerb::kLine: return -1;
+                case SkPathVerb::kQuad: return -1;
+                case SkPathVerb::kConic: return -1;
+                case SkPathVerb::kCubic: return -1;
+                case SkPathVerb::kClose: return -1;
+            }
+            SkUNREACHABLE;
+        }
+        const SkPathVerb* fVerb = nullptr;
+        const SkPoint* fPoints = nullptr;
+        const SkScalar* fWeights = nullptr;
+        SkDEBUGCODE(const SkPoint* fInitialPoints = nullptr;)
+    };
+public:
+
+    class SK_API RawIter {
+    public:
+
+        RawIter() {}
+
+        RawIter(const SkPath& path) {
+            setPath(path);
+        }
+
+        void setPath(const SkPath&);
+
+        Verb next(SkPoint[4]);
+
+        std::optional<IterRec> next();
+
+        Verb peek() const {
+            return (fIter != fEnd) ? static_cast<Verb>(std::get<0>(*fIter)) : kDone_Verb;
+        }
+
+        SkScalar conicWeight() const {
+            return fConicWeight;
+        }
+
+    private:
+        RangeIter fIter;
+        RangeIter fEnd;
+        SkScalar fConicWeight = 0;
+        friend class SkPath;
+
+    };
+
+    bool contains(SkPoint point) const;
+
+    bool contains(SkScalar x, SkScalar y) const {
+        return this->contains({x, y});
+    }
+
+    void dump(SkWStream* stream, bool dumpAsHex) const;
+
+    void dump() const { this->dump(nullptr, false); }
+    void dumpHex() const { this->dump(nullptr, true); }
+
+    size_t writeToMemory(void* buffer) const;
+
+    sk_sp<SkData> serialize() const;
+
+    static std::optional<SkPath> ReadFromMemory(const void* buffer, size_t length,
+                                                size_t* bytesRead = nullptr);
+
+    uint32_t getGenerationID() const;
+
+    bool isValid() const;
+
+    using sk_is_trivially_relocatable = std::true_type;
+
+private:
+    static SkPath MakeNullCheck(sk_sp<SkPathData>, SkPathFillType, bool isVolatile);
+    static SkPathData* PeekErrorSingleton();
+
+    SkPath(sk_sp<SkPathData>, SkPathFillType, bool isVolatile);
+
+    sk_sp<SkPathData> fPathData;
+    SkPathFillType    fFillType;
+    bool              fIsVolatile;
+
+    size_t writeToMemoryAsRRect(void* buffer) const;
+
+    friend class Iter;
+    friend class SkPathPriv;
+    friend class SkPathStroker;
+
+    SkPathConvexity computeConvexity() const;
+
+    bool isValidImpl() const;
+#if defined(SK_DEBUG)
+    void validate() const;
+#endif
+
+    SkPathConvexity getConvexity() const;
+
+    SkPathConvexity getConvexityOrUnknown() const;
+
+    void setConvexity(SkPathConvexity) const;
+
+    friend class SkPathBuilder;
+};
+
+#endif

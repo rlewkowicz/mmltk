@@ -1,0 +1,297 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*****************************************************************************
+* Copyright (C) 2014-2016, International Business Machines Corporation and
+* others.
+* All Rights Reserved.
+*****************************************************************************
+*
+* File RELDATEFMT.H
+*****************************************************************************
+*/
+
+#ifndef __RELDATEFMT_H
+#define __RELDATEFMT_H
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/uobject.h"
+#include "unicode/udisplaycontext.h"
+#include "unicode/ureldatefmt.h"
+#include "unicode/locid.h"
+#include "unicode/formattedvalue.h"
+
+
+#if !UCONFIG_NO_FORMATTING
+
+typedef enum UDateRelativeUnit {
+
+    UDAT_RELATIVE_SECONDS,
+
+    UDAT_RELATIVE_MINUTES,
+
+    UDAT_RELATIVE_HOURS,
+
+    UDAT_RELATIVE_DAYS,
+
+    UDAT_RELATIVE_WEEKS,
+
+    UDAT_RELATIVE_MONTHS,
+
+    UDAT_RELATIVE_YEARS,
+
+#ifndef U_HIDE_DEPRECATED_API
+    UDAT_RELATIVE_UNIT_COUNT
+#endif  // U_HIDE_DEPRECATED_API
+} UDateRelativeUnit;
+
+typedef enum UDateAbsoluteUnit {
+
+    UDAT_ABSOLUTE_SUNDAY,
+
+    UDAT_ABSOLUTE_MONDAY,
+
+    UDAT_ABSOLUTE_TUESDAY,
+
+    UDAT_ABSOLUTE_WEDNESDAY,
+
+    UDAT_ABSOLUTE_THURSDAY,
+
+    UDAT_ABSOLUTE_FRIDAY,
+
+    UDAT_ABSOLUTE_SATURDAY,
+
+    UDAT_ABSOLUTE_DAY,
+
+    UDAT_ABSOLUTE_WEEK,
+
+    UDAT_ABSOLUTE_MONTH,
+
+    UDAT_ABSOLUTE_YEAR,
+
+    UDAT_ABSOLUTE_NOW,
+
+    UDAT_ABSOLUTE_QUARTER,
+
+    UDAT_ABSOLUTE_HOUR,
+
+    UDAT_ABSOLUTE_MINUTE,
+
+#ifndef U_HIDE_DEPRECATED_API
+    UDAT_ABSOLUTE_UNIT_COUNT = UDAT_ABSOLUTE_NOW + 4
+#endif  // U_HIDE_DEPRECATED_API
+} UDateAbsoluteUnit;
+
+typedef enum UDateDirection {
+
+    UDAT_DIRECTION_LAST_2,
+
+    UDAT_DIRECTION_LAST,
+
+    UDAT_DIRECTION_THIS,
+
+    UDAT_DIRECTION_NEXT,
+
+    UDAT_DIRECTION_NEXT_2,
+
+    UDAT_DIRECTION_PLAIN,
+
+#ifndef U_HIDE_DEPRECATED_API
+    UDAT_DIRECTION_COUNT
+#endif  // U_HIDE_DEPRECATED_API
+} UDateDirection;
+
+U_NAMESPACE_BEGIN
+
+class BreakIterator;
+class RelativeDateTimeCacheData;
+class SharedNumberFormat;
+class SharedPluralRules;
+class SharedBreakIterator;
+class NumberFormat;
+class UnicodeString;
+class FormattedRelativeDateTime;
+class FormattedRelativeDateTimeData;
+
+class U_I18N_API FormattedRelativeDateTime : public UMemory, public FormattedValue {
+  public:
+    FormattedRelativeDateTime() : fData(nullptr), fErrorCode(U_INVALID_STATE_ERROR) {}
+
+    FormattedRelativeDateTime(FormattedRelativeDateTime&& src) noexcept;
+
+    virtual ~FormattedRelativeDateTime() override;
+
+    FormattedRelativeDateTime(const FormattedRelativeDateTime&) = delete;
+
+    FormattedRelativeDateTime& operator=(const FormattedRelativeDateTime&) = delete;
+
+    FormattedRelativeDateTime& operator=(FormattedRelativeDateTime&& src) noexcept;
+
+    UnicodeString toString(UErrorCode& status) const override;
+
+    UnicodeString toTempString(UErrorCode& status) const override;
+
+    Appendable &appendTo(Appendable& appendable, UErrorCode& status) const override;
+
+    UBool nextPosition(ConstrainedFieldPosition& cfpos, UErrorCode& status) const override;
+
+  private:
+    FormattedRelativeDateTimeData *fData;
+    UErrorCode fErrorCode;
+    explicit FormattedRelativeDateTime(FormattedRelativeDateTimeData *results)
+        : fData(results), fErrorCode(U_ZERO_ERROR) {}
+    explicit FormattedRelativeDateTime(UErrorCode errorCode)
+        : fData(nullptr), fErrorCode(errorCode) {}
+    friend class RelativeDateTimeFormatter;
+};
+
+class U_I18N_API_CLASS RelativeDateTimeFormatter : public UObject {
+public:
+
+    U_I18N_API RelativeDateTimeFormatter(UErrorCode& status);
+
+    U_I18N_API RelativeDateTimeFormatter(const Locale& locale, UErrorCode& status);
+
+    U_I18N_API RelativeDateTimeFormatter(
+        const Locale& locale, NumberFormat *nfToAdopt, UErrorCode& status);
+
+    U_I18N_API RelativeDateTimeFormatter(
+            const Locale& locale,
+            NumberFormat *nfToAdopt,
+            UDateRelativeDateTimeFormatterStyle style,
+            UDisplayContext capitalizationContext,
+            UErrorCode& status);
+
+    U_I18N_API RelativeDateTimeFormatter(const RelativeDateTimeFormatter& other);
+
+    U_I18N_API RelativeDateTimeFormatter& operator=(
+            const RelativeDateTimeFormatter& other);
+
+    U_I18N_API virtual ~RelativeDateTimeFormatter();
+
+    U_I18N_API UnicodeString& format(
+            double quantity,
+            UDateDirection direction,
+            UDateRelativeUnit unit,
+            UnicodeString& appendTo,
+            UErrorCode& status) const;
+
+    U_I18N_API FormattedRelativeDateTime formatToValue(
+            double quantity,
+            UDateDirection direction,
+            UDateRelativeUnit unit,
+            UErrorCode& status) const;
+
+    U_I18N_API UnicodeString& format(
+            UDateDirection direction,
+            UDateAbsoluteUnit unit,
+            UnicodeString& appendTo,
+            UErrorCode& status) const;
+
+    U_I18N_API FormattedRelativeDateTime formatToValue(
+            UDateDirection direction,
+            UDateAbsoluteUnit unit,
+            UErrorCode& status) const;
+
+    U_I18N_API UnicodeString& formatNumeric(
+            double offset,
+            URelativeDateTimeUnit unit,
+            UnicodeString& appendTo,
+            UErrorCode& status) const;
+
+    U_I18N_API FormattedRelativeDateTime formatNumericToValue(
+            double offset,
+            URelativeDateTimeUnit unit,
+            UErrorCode& status) const;
+
+    U_I18N_API UnicodeString& format(
+            double offset,
+            URelativeDateTimeUnit unit,
+            UnicodeString& appendTo,
+            UErrorCode& status) const;
+
+    U_I18N_API FormattedRelativeDateTime formatToValue(
+            double offset,
+            URelativeDateTimeUnit unit,
+            UErrorCode& status) const;
+
+    U_I18N_API UnicodeString& combineDateAndTime(
+            const UnicodeString& relativeDateString,
+            const UnicodeString& timeString,
+            UnicodeString& appendTo,
+            UErrorCode& status) const;
+
+    U_I18N_API const NumberFormat& getNumberFormat() const;
+
+    U_I18N_API UDisplayContext getCapitalizationContext() const;
+
+    U_I18N_API UDateRelativeDateTimeFormatterStyle getFormatStyle() const;
+
+private:
+    const RelativeDateTimeCacheData* fCache;
+    const SharedNumberFormat *fNumberFormat;
+    const SharedPluralRules *fPluralRules;
+    UDateRelativeDateTimeFormatterStyle fStyle;
+    UDisplayContext fContext;
+#if !UCONFIG_NO_BREAK_ITERATION
+    const SharedBreakIterator *fOptBreakIterator;
+#else
+    std::nullptr_t fOptBreakIterator = nullptr;
+#endif // !UCONFIG_NO_BREAK_ITERATION
+    Locale fLocale;
+    void init(
+            NumberFormat *nfToAdopt,
+#if !UCONFIG_NO_BREAK_ITERATION
+            BreakIterator *brkIter,
+#else
+            std::nullptr_t,
+#endif // !UCONFIG_NO_BREAK_ITERATION
+            UErrorCode &status);
+    UnicodeString& adjustForContext(UnicodeString &) const;
+    UBool checkNoAdjustForContext(UErrorCode& status) const;
+
+    template<typename F, typename... Args>
+    UnicodeString& doFormat(
+            F callback,
+            UnicodeString& appendTo,
+            UErrorCode& status,
+            Args... args) const;
+
+    template<typename F, typename... Args>
+    FormattedRelativeDateTime doFormatToValue(
+            F callback,
+            UErrorCode& status,
+            Args... args) const;
+
+    void formatImpl(
+            double quantity,
+            UDateDirection direction,
+            UDateRelativeUnit unit,
+            FormattedRelativeDateTimeData& output,
+            UErrorCode& status) const;
+    void formatAbsoluteImpl(
+            UDateDirection direction,
+            UDateAbsoluteUnit unit,
+            FormattedRelativeDateTimeData& output,
+            UErrorCode& status) const;
+    void formatNumericImpl(
+            double offset,
+            URelativeDateTimeUnit unit,
+            FormattedRelativeDateTimeData& output,
+            UErrorCode& status) const;
+    void formatRelativeImpl(
+            double offset,
+            URelativeDateTimeUnit unit,
+            FormattedRelativeDateTimeData& output,
+            UErrorCode& status) const;
+};
+
+U_NAMESPACE_END
+
+#endif /* !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif /* __RELDATEFMT_H */

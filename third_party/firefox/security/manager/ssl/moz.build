@@ -1,0 +1,203 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+DIRS += ["abridged_certs", "qwac_trust_anchors"]
+
+
+XPIDL_SOURCES += [
+    "nsICertificateDialogs.idl",
+    "nsICertOverrideService.idl",
+    "nsICertStorage.idl",
+    "nsICertTree.idl",
+    "nsIClientAuthDialogService.idl",
+    "nsIClientAuthRememberService.idl",
+    "nsICryptoHash.idl",
+    "nsIDataStorage.idl",
+    "nsIFIPSUtils.idl",
+    "nsINSSComponent.idl",
+    "nsINSSErrorsService.idl",
+    "nsINSSVersion.idl",
+    "nsIPKCS11Module.idl",
+    "nsIPKCS11ModuleDB.idl",
+    "nsIPKCS11Slot.idl",
+    "nsIPKCS11Token.idl",
+    "nsIPublicKeyPinningService.idl",
+    "nsISiteIntegrityService.idl",
+    "nsISiteSecurityService.idl",
+    "nsITLSSocketControl.idl",
+    "nsITransportSecurityInfo.idl",
+    "nsIX509Cert.idl",
+    "nsIX509CertDB.idl",
+    "nsIX509CertValidity.idl",
+]
+
+
+XPIDL_MODULE = "pipnss"
+
+XPCOM_MANIFESTS += [
+    "components.conf",
+]
+
+EXTRA_JS_MODULES.psm += [
+    "ClientAuthDialogService.sys.mjs",
+    "DER.sys.mjs",
+    "QWACs.sys.mjs",
+    "RemoteSecuritySettings.sys.mjs",
+    "X509.sys.mjs",
+]
+
+EXPORTS += [
+    "CommonSocketControl.h",
+    "CryptoTask.h",
+    "EnterpriseRoots.h",
+    "nsClientAuthRemember.h",
+    "nsNSSCallbacks.h",
+    "nsNSSCertificate.h",
+    "nsNSSComponent.h",
+    "nsRandomGenerator.h",
+    "nsSecureBrowserUI.h",
+    "nsSecurityHeaderParser.h",
+    "NSSErrorsService.h",
+    "nsSSLSocketProvider.h",
+    "nsTLSSocketProvider.h",
+    "ScopedNSSTypes.h",
+    "SharedCertVerifier.h",
+    "SSLServerCertVerification.h",
+    "TransportSecurityInfo.h",
+]
+
+EXPORTS.mozilla += [
+    "crypto_hash/crypto_hash_sha2.h",
+    "PublicSSL.h",
+]
+
+EXPORTS.mozilla.psm += [
+    "EnabledSignatureSchemes.h",
+    "IPCClientCertsChild.h",
+    "IPCClientCertsParent.h",
+    "PSMIPCUtils.h",
+    "SelectTLSClientAuthCertChild.h",
+    "SelectTLSClientAuthCertParent.h",
+    "TransportSecurityInfo.h",
+    "VerifySSLServerCertChild.h",
+    "VerifySSLServerCertParent.h",
+]
+
+UNIFIED_SOURCES += [
+    "AppTrustDomain.cpp",
+    "CertStorageMemoryReporting.cpp",
+    "CommonSocketControl.cpp",
+    "CryptoTask.cpp",
+    "DataStorageManager.cpp",
+    "EnterpriseRoots.cpp",
+    "FIPSUtils.cpp",
+    "IPCClientCertsChild.cpp",
+    "IPCClientCertsParent.cpp",
+    "md4.c",
+    "nsCertOverrideService.cpp",
+    "nsCertTree.cpp",
+    "nsNSSCallbacks.cpp",
+    "nsNSSCertHelper.cpp",
+    "nsNSSCertificate.cpp",
+    "nsNSSCertificateDB.cpp",
+    "nsNSSCertTrust.cpp",
+    "nsNSSComponent.cpp",
+    "nsNSSIOLayer.cpp",
+    "nsNSSModule.cpp",
+    "nsNSSVersion.cpp",
+    "nsNTLMAuthModule.cpp",
+    "nsPKCS12Blob.cpp",
+    "nsRandomGenerator.cpp",
+    "nsSecureBrowserUI.cpp",
+    "nsSecurityHeaderParser.cpp",
+    "NSSErrorsService.cpp",
+    "nsSiteSecurityService.cpp",
+    "nsSSLSocketProvider.cpp",
+    "NSSSocketControl.cpp",
+    "nsTLSSocketProvider.cpp",
+    "PKCS11Module.cpp",
+    "PKCS11ModuleDB.cpp",
+    "PKCS11Slot.cpp",
+    "PKCS11Token.cpp",
+    "PublicKeyPinningService.cpp",
+    "QWACs.cpp",
+    "QWACTrustDomain.cpp",
+    "SiteIntegrityService.cpp",
+    "SSLServerCertVerification.cpp",
+    "TLSClientAuthCertSelection.cpp",
+    "TransportSecurityInfo.cpp",
+    "VerifySSLServerCertChild.cpp",
+    "VerifySSLServerCertParent.cpp",
+    "X509CertValidity.cpp",
+]
+
+UNIFIED_SOURCES += [
+    "nsClientAuthRemember.cpp",
+]
+
+
+IPDL_SOURCES += [
+    "PIPCClientCerts.ipdl",
+    "PSelectTLSClientAuthCert.ipdl",
+    "PSMIPCTypes.ipdlh",
+    "PVerifySSLServerCert.ipdl",
+]
+
+# Required by OSClientCerts, IPCClientCerts and CredentialManagerSecret.
+
+if CONFIG["NIGHTLY_BUILD"] and not CONFIG["MOZ_NO_SMART_CARDS"]:
+    EXPORTS.mozilla.psm += [
+        "PKCS11ModuleChild.h",
+        "PKCS11ModuleParent.h",
+    ]
+
+    UNIFIED_SOURCES += [
+        "PKCS11ModuleChild.cpp",
+        "PKCS11ModuleParent.cpp",
+    ]
+
+    IPDL_SOURCES += [
+        "PPKCS11Module.ipdl",
+    ]
+
+FINAL_LIBRARY = "xul"
+
+LOCAL_INCLUDES += [
+    "!/dist/public/nss",
+    "/dom/base",
+    "/dom/crypto",
+    "/netwerk/base",
+    "/security/certverifier",
+    "/third_party/rust/cose-c/include",
+    "/xpcom/base",
+    "/xpcom/build",
+]
+
+GeneratedFile(
+    "nsSTSPreloadListGenerated.inc",
+    script="../../../xpcom/ds/tools/make_dafsa.py",
+    inputs=["nsSTSPreloadList.inc"],
+)
+
+DEFINES["SSL_DISABLE_DEPRECATED_CIPHER_SUITE_NAMES"] = "True"
+DEFINES["NSS_ENABLE_ECC"] = "True"
+if CONFIG["MOZ_SYSTEM_NSS"]:
+    DEFINES["MOZ_SYSTEM_NSS"] = True
+
+# mozpkix is linked statically from the in-tree sources independent of whether
+# system NSS is used or not.
+USE_LIBS += ["mozpkix"]
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+COMPILE_FLAGS["WARNINGS_CXXFLAGS"] += [
+    "-Wextra",
+    # -Wextra enables this warning, but it's too noisy to be useful.
+    "-Wno-missing-field-initializers",
+]
+
+# Gecko headers aren't warning-free enough for us to enable these warnings.
+CXXFLAGS += [
+    "-Wno-unused-parameter",
+]

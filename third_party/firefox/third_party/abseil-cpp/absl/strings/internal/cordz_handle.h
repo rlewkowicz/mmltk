@@ -1,0 +1,61 @@
+// Copyright 2019 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_STRINGS_INTERNAL_CORDZ_HANDLE_H_
+#define ABSL_STRINGS_INTERNAL_CORDZ_HANDLE_H_
+
+#include <atomic>
+#include <vector>
+
+#include "absl/base/config.h"
+#include "absl/base/internal/raw_logging.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace cord_internal {
+
+class ABSL_DLL CordzHandle {
+ public:
+  CordzHandle() : CordzHandle(false) {}
+
+  bool is_snapshot() const { return is_snapshot_; }
+
+  bool SafeToDelete() const;
+
+  static void Delete(CordzHandle* handle);
+
+  static std::vector<const CordzHandle*> DiagnosticsGetDeleteQueue();
+
+  bool DiagnosticsHandleIsSafeToInspect(const CordzHandle* handle) const;
+
+  std::vector<const CordzHandle*> DiagnosticsGetSafeToInspectDeletedHandles();
+
+ protected:
+  explicit CordzHandle(bool is_snapshot);
+  virtual ~CordzHandle();
+
+ private:
+  const bool is_snapshot_;
+
+  CordzHandle* dq_prev_  = nullptr;
+  CordzHandle* dq_next_ = nullptr;
+};
+
+class CordzSnapshot : public CordzHandle {
+ public:
+  CordzSnapshot() : CordzHandle(true) {}
+};
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_STRINGS_INTERNAL_CORDZ_HANDLE_H_

@@ -1,0 +1,421 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "CacheIOThread.h"
+#include "CacheFileIOManager.h"
+#include "CacheLog.h"
+#include "CacheObserver.h"
+#include "nsIRunnable.h"
+#include "nsISupportsImpl.h"
+#include "nsPrintfCString.h"
+#include "nsThread.h"
+#include "nsThreadManager.h"
+#include "nsThreadUtils.h"
+#include "mozilla/EventQueue.h"
+#include "mozilla/IOInterposer.h"
+#include "mozilla/ThreadEventQueue.h"
+
+
+namespace mozilla::net {
+
+namespace detail {
+
+class NativeThreadHandle {
+
+ public:
+  NativeThreadHandle() = default;
+  ~NativeThreadHandle() = default;
+
+  void InitThread();
+  void CancelBlockingIO(Monitor& aMonitor);
+};
+
+
+
+void NativeThreadHandle::InitThread() {}
+void NativeThreadHandle::CancelBlockingIO(Monitor&) {}
+
+
+}  
+
+CacheIOThread* CacheIOThread::sSelf = nullptr;
+
+NS_IMPL_ISUPPORTS(CacheIOThread, nsIThreadObserver)
+
+CacheIOThread::CacheIOThread() {
+  for (auto& item : mQueueLength) {
+    item = 0;
+  }
+
+  sSelf = this;
+}
+
+CacheIOThread::~CacheIOThread() {
+  {
+    MonitorAutoLock lock(mMonitor);
+    MOZ_RELEASE_ASSERT(mShutdown);
+  }
+
+  if (mXPCOMThread) {
+    nsIThread* thread = mXPCOMThread;
+    thread->Release();
+  }
+
+  sSelf = nullptr;
+#if defined(DEBUG)
+  for (auto& event : mEventQueue) {
+    MOZ_ASSERT(!event.Length());
+  }
+#endif
+}
+
+nsresult CacheIOThread::Init() {
+  {
+    MonitorAutoLock lock(mMonitor);
+    mNativeThreadHandle = MakeUnique<detail::NativeThreadHandle>();
+  }
+
+  RefPtr<CacheIOThread> self = this;
+  mThread =
+      PR_CreateThread(PR_USER_THREAD, ThreadFunc, this, PR_PRIORITY_NORMAL,
+                      PR_GLOBAL_THREAD, PR_JOINABLE_THREAD, 256 * 1024);
+  if (!mThread) {
+    MonitorAutoLock lock(mMonitor);
+    mShutdown = true;
+    return NS_ERROR_FAILURE;
+  }
+
+  self.forget().leak();
+
+  return NS_OK;
+}
+
+nsresult CacheIOThread::Dispatch(nsIRunnable* aRunnable, uint32_t aLevel) {
+  return Dispatch(do_AddRef(aRunnable), aLevel);
+}
+
+nsresult CacheIOThread::Dispatch(already_AddRefed<nsIRunnable> aRunnable,
+                                 uint32_t aLevel) {
+  NS_ENSURE_ARG(aLevel < LAST_LEVEL);
+
+  nsCOMPtr<nsIRunnable> runnable(aRunnable);
+
+  MOZ_ASSERT(runnable);
+
+  MonitorAutoLock lock(mMonitor);
+
+  if (mShutdown && (PR_GetCurrentThread() != mThread)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  return DispatchInternal(runnable.forget(), aLevel);
+}
+
+nsresult CacheIOThread::DispatchAfterPendingOpens(nsIRunnable* aRunnable) {
+  MOZ_ASSERT(aRunnable);
+
+  MonitorAutoLock lock(mMonitor);
+
+  if (mShutdown && (PR_GetCurrentThread() != mThread)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  mQueueLength[OPEN_PRIORITY] += mEventQueue[OPEN].Length();
+  mQueueLength[OPEN] -= mEventQueue[OPEN].Length();
+  mEventQueue[OPEN_PRIORITY].AppendElements(mEventQueue[OPEN]);
+  mEventQueue[OPEN].Clear();
+
+  return DispatchInternal(do_AddRef(aRunnable), OPEN_PRIORITY);
+}
+
+nsresult CacheIOThread::DispatchInternal(
+    already_AddRefed<nsIRunnable> aRunnable, uint32_t aLevel) {
+  nsCOMPtr<nsIRunnable> runnable(aRunnable);
+
+  LogRunnable::LogDispatch(runnable.get());
+
+  if (NS_WARN_IF(!runnable)) return NS_ERROR_NULL_POINTER;
+
+  mMonitor.AssertCurrentThreadOwns();
+
+  ++mQueueLength[aLevel];
+  mEventQueue[aLevel].AppendElement(runnable.forget());
+  if (mLowestLevelWaiting > aLevel) mLowestLevelWaiting = aLevel;
+
+  mMonitor.NotifyAll();
+
+  return NS_OK;
+}
+
+bool CacheIOThread::IsCurrentThread() {
+  return mThread == PR_GetCurrentThread();
+}
+
+uint32_t CacheIOThread::QueueSize(bool highPriority) {
+  MonitorAutoLock lock(mMonitor);
+  if (highPriority) {
+    return mQueueLength[OPEN_PRIORITY] + mQueueLength[READ_PRIORITY];
+  }
+
+  return mQueueLength[OPEN_PRIORITY] + mQueueLength[READ_PRIORITY] +
+         mQueueLength[MANAGEMENT] + mQueueLength[OPEN] + mQueueLength[READ];
+}
+
+bool CacheIOThread::YieldInternal() {
+  if (!IsCurrentThread()) {
+    NS_WARNING(
+        "Trying to yield to priority events on non-cache2 I/O thread? "
+        "You probably do something wrong.");
+    return false;
+  }
+
+  if (mCurrentlyExecutingLevel == XPCOM_LEVEL) {
+    return false;
+  }
+
+  if (!EventsPending(mCurrentlyExecutingLevel)) return false;
+
+  mRerunCurrentEvent = true;
+  return true;
+}
+
+void CacheIOThread::Shutdown() {
+  if (!mThread) {
+    return;
+  }
+
+  {
+    MonitorAutoLock lock(mMonitor);
+    mShutdown = true;
+    mMonitor.NotifyAll();
+  }
+
+  PR_JoinThread(mThread);
+  mThread = nullptr;
+}
+
+void CacheIOThread::CancelBlockingIO() {
+  if (!mNativeThreadHandle) {
+    return;
+  }
+
+  if (!mIOCancelableEvents) {
+    LOG(("CacheIOThread::CancelBlockingIO, no blocking operation to cancel"));
+    return;
+  }
+
+  mNativeThreadHandle->CancelBlockingIO(mMonitor);
+}
+
+already_AddRefed<nsIEventTarget> CacheIOThread::Target() {
+  nsCOMPtr<nsIEventTarget> target;
+
+  target = mXPCOMThread;
+  if (!target && mThread) {
+    MonitorAutoLock lock(mMonitor);
+    while (!mXPCOMThread) {
+      lock.Wait();
+    }
+
+    target = mXPCOMThread;
+  }
+
+  return target.forget();
+}
+
+void CacheIOThread::ThreadFunc(void* aClosure) {
+  NS_SetCurrentThreadName("Cache2 I/O");
+
+  mozilla::IOInterposer::RegisterCurrentThread();
+  RefPtr<CacheIOThread> thread =
+      dont_AddRef(static_cast<CacheIOThread*>(aClosure));
+  thread->ThreadFunc();
+  mozilla::IOInterposer::UnregisterCurrentThread();
+}
+
+void CacheIOThread::ThreadFunc() {
+  nsCOMPtr<nsIThreadInternal> threadInternal;
+
+  {
+    MonitorAutoLock lock(mMonitor);
+
+    MOZ_ASSERT(mNativeThreadHandle);
+    mNativeThreadHandle->InitThread();
+
+    auto queue =
+        MakeRefPtr<ThreadEventQueue>(MakeUnique<mozilla::EventQueue>());
+    nsCOMPtr<nsIThread> xpcomThread =
+        nsThreadManager::get().CreateCurrentThread(queue);
+
+    threadInternal = do_QueryInterface(xpcomThread);
+    if (threadInternal) threadInternal->SetObserver(this);
+
+    mXPCOMThread = xpcomThread.forget().take();
+    nsCOMPtr<nsIThread> thread = NS_GetCurrentThread();
+
+    lock.NotifyAll();
+
+    do {
+    loopStart:
+      mLowestLevelWaiting = LAST_LEVEL;
+
+      while (mHasXPCOMEvents) {
+        mHasXPCOMEvents = false;
+        mCurrentlyExecutingLevel = XPCOM_LEVEL;
+
+        MonitorAutoUnlock unlock(mMonitor);
+
+        bool processedEvent;
+        nsresult rv;
+        do {
+          rv = thread->ProcessNextEvent(false, &processedEvent);
+
+          ++mEventCounter;
+          MOZ_ASSERT(mNativeThreadHandle);
+        } while (NS_SUCCEEDED(rv) && processedEvent);
+      }
+
+      uint32_t level;
+      for (level = 0; level < LAST_LEVEL; ++level) {
+        if (!mEventQueue[level].Length()) {
+          continue;
+        }
+
+        LoopOneLevel(level);
+
+        goto loopStart;
+      }
+
+      if (EventsPending()) {
+        continue;
+      }
+
+      if (mShutdown) {
+        break;
+      }
+
+      lock.Wait();
+
+    } while (true);
+
+    MOZ_ASSERT(!EventsPending());
+
+#if defined(DEBUG)
+    mInsideLoop = false;
+#endif
+  }  
+
+  if (threadInternal) {
+    threadInternal->SetObserver(nullptr);
+  }
+
+}
+
+void CacheIOThread::LoopOneLevel(uint32_t aLevel) {
+  mMonitor.AssertCurrentThreadOwns();
+  EventQueue events = std::move(mEventQueue[aLevel]);
+  EventQueue::size_type length = events.Length();
+
+  mCurrentlyExecutingLevel = aLevel;
+
+  bool returnEvents = false;
+
+  EventQueue::size_type index;
+  {
+    MonitorAutoUnlock unlock(mMonitor);
+
+    for (index = 0; index < length; ++index) {
+      if (EventsPending(aLevel)) {
+        returnEvents = true;
+        break;
+      }
+
+      mRerunCurrentEvent = false;
+
+      LogRunnable::Run log(events[index].get());
+
+      events[index]->Run();
+
+      MOZ_ASSERT(mNativeThreadHandle);
+
+      if (mRerunCurrentEvent) {
+        log.WillRunAgain();
+        returnEvents = true;
+        break;
+      }
+
+      ++mEventCounter;
+      --mQueueLength[aLevel];
+
+      events[index] = nullptr;
+    }
+  }
+
+  if (returnEvents) {
+
+    events.RemoveElementsAt(0, index);
+    events.AppendElements(std::move(mEventQueue[aLevel]));
+    mEventQueue[aLevel] = std::move(events);
+  }
+}
+
+bool CacheIOThread::EventsPending(uint32_t aLastLevel) {
+  return mLowestLevelWaiting < aLastLevel || mHasXPCOMEvents;
+}
+
+NS_IMETHODIMP CacheIOThread::OnDispatchedEvent() {
+  MonitorAutoLock lock(mMonitor);
+  mHasXPCOMEvents = true;
+  MOZ_ASSERT(mInsideLoop);
+  lock.Notify();
+  return NS_OK;
+}
+
+NS_IMETHODIMP CacheIOThread::OnProcessNextEvent(nsIThreadInternal* thread,
+                                                bool mayWait) {
+  return NS_OK;
+}
+
+NS_IMETHODIMP CacheIOThread::AfterProcessNextEvent(nsIThreadInternal* thread,
+                                                   bool eventWasProcessed) {
+  return NS_OK;
+}
+
+
+size_t CacheIOThread::SizeOfExcludingThis(
+    mozilla::MallocSizeOf mallocSizeOf) const {
+  MonitorAutoLock lock(const_cast<CacheIOThread*>(this)->mMonitor);
+
+  size_t n = 0;
+  for (const auto& event : mEventQueue) {
+    n += event.ShallowSizeOfExcludingThis(mallocSizeOf);
+  }
+
+  return n;
+}
+
+size_t CacheIOThread::SizeOfIncludingThis(
+    mozilla::MallocSizeOf mallocSizeOf) const {
+  return mallocSizeOf(this) + SizeOfExcludingThis(mallocSizeOf);
+}
+
+CacheIOThread::Cancelable::Cancelable(bool aCancelable)
+    : mCancelable(aCancelable) {
+  MOZ_ASSERT(CacheIOThread::sSelf);
+  MOZ_ASSERT(CacheIOThread::sSelf->IsCurrentThread());
+
+  if (mCancelable) {
+    ++CacheIOThread::sSelf->mIOCancelableEvents;
+  }
+}
+
+CacheIOThread::Cancelable::~Cancelable() {
+  MOZ_ASSERT(CacheIOThread::sSelf);
+
+  if (mCancelable) {
+    --CacheIOThread::sSelf->mIOCancelableEvents;
+  }
+}
+
+}  

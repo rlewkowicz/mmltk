@@ -1,0 +1,239 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/css/StreamLoader.h"
+
+#include "mozilla/Encoding.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/StyleSheet.h"
+#include "mozilla/TaskQueue.h"
+#include "mozilla/dom/CacheExpirationTime.h"
+#include "nsContentUtils.h"
+#include "nsIAsyncVerifyRedirectCallback.h"
+#include "nsIChannel.h"
+#include "nsIInputStream.h"
+#include "nsIStreamTransportService.h"
+#include "nsIThreadRetargetableRequest.h"
+#include "nsNetCID.h"
+#include "nsNetUtil.h"
+#include "nsProxyRelease.h"
+#include "nsServiceManagerUtils.h"
+
+namespace mozilla::css {
+
+StreamLoader::StreamLoader(SheetLoadData& aSheetLoadData)
+    : mSheetLoadData(&aSheetLoadData),
+      mStatus(NS_OK),
+      mMainThreadSheetLoadData(new nsMainThreadPtrHolder<SheetLoadData>(
+          "StreamLoader::SheetLoadData", mSheetLoadData, false)) {}
+
+StreamLoader::~StreamLoader() {
+#ifdef NIGHTLY_BUILD
+  MOZ_RELEASE_ASSERT(mOnStopProcessingDone || mChannelOpenFailed);
+#endif
+}
+
+NS_IMPL_ISUPPORTS(StreamLoader, nsIStreamListener,
+                  nsIThreadRetargetableStreamListener, nsIChannelEventSink,
+                  nsIInterfaceRequestor)
+
+NS_IMETHODIMP
+StreamLoader::OnStartRequest(nsIRequest* aRequest) {
+  MOZ_ASSERT(aRequest);
+  mRequest = aRequest;
+  RefPtr<SheetLoadData> sheetLoadData = mSheetLoadData;
+  sheetLoadData->OnStartRequest(aRequest);
+
+  if (nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest)) {
+    int64_t length;
+    nsresult rv = channel->GetContentLength(&length);
+    if (NS_SUCCEEDED(rv) && length > 0) {
+      CheckedInt<nsACString::size_type> checkedLength(length);
+      if (!checkedLength.isValid()) {
+        return (mStatus = NS_ERROR_OUT_OF_MEMORY);
+      }
+      if (!mBytes.SetCapacity(checkedLength.value(), fallible)) {
+        return (mStatus = NS_ERROR_OUT_OF_MEMORY);
+      }
+    }
+  }
+  if (nsCOMPtr<nsIThreadRetargetableRequest> rr = do_QueryInterface(aRequest)) {
+    nsCOMPtr<nsIEventTarget> sts =
+        do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID);
+    RefPtr queue =
+        TaskQueue::Create(sts.forget(), "css::StreamLoader Delivery Queue");
+    rr->RetargetDeliveryTo(queue);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+StreamLoader::CheckListenerChain() { return NS_OK; }
+
+NS_IMETHODIMP
+StreamLoader::OnStopRequest(nsIRequest* aRequest, nsresult aStatus) {
+  MOZ_ASSERT_IF(!StaticPrefs::network_send_OnDataFinished_cssLoader(),
+                !mOnStopProcessingDone);
+  mRequest = nullptr;
+
+  nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest);
+
+
+  if (NS_IsMainThread()) {
+    channel->SetNotificationCallbacks(nullptr);
+
+    mSheetLoadData->mNetworkMetadata =
+        new SubResourceNetworkMetadataHolder(aRequest);
+
+    mSheetLoadData->mSheet->UnblockParsePromise();
+  } else {
+    if (mSheetLoadData->mRecordErrors) {
+      return NS_OK;
+    }
+  }
+
+  auto HandleErrorInMainThread = [&] {
+    MOZ_ASSERT(mStatus != NS_OK_PARSE_SHEET);
+    MOZ_ASSERT(NS_IsMainThread());
+    mSheetLoadData->mLoader->SheetComplete(*mSheetLoadData, mStatus);
+  };
+
+  if (mOnStopProcessingDone) {
+    MOZ_ASSERT(NS_IsMainThread());
+    if (mStatus != NS_OK_PARSE_SHEET) {
+      HandleErrorInMainThread();
+    }
+    return NS_OK;
+  }
+
+  mOnStopProcessingDone = true;
+
+  nsCString utf8String;
+  {
+    nsresult status = NS_FAILED(mStatus) ? mStatus : aStatus;
+    mStatus = mSheetLoadData->VerifySheetReadyToParse(status, mBOMBytes, mBytes,
+                                                      channel);
+    if (mStatus != NS_OK_PARSE_SHEET) {
+      if (NS_IsMainThread()) {
+        HandleErrorInMainThread();
+      }
+      return mStatus;
+    }
+
+
+    if (mEncodingFromBOM.isNothing()) {
+      HandleBOM();
+      MOZ_ASSERT(mEncodingFromBOM.isSome());
+    }
+    nsCString bytes = std::move(mBytes);
+    const Encoding* encoding = mEncodingFromBOM.value();
+    if (!encoding) {
+      encoding = mSheetLoadData->DetermineNonBOMEncoding(bytes, channel);
+    }
+    mSheetLoadData->mEncoding = encoding;
+
+    size_t validated = 0;
+    if (encoding == UTF_8_ENCODING) {
+      validated = Encoding::UTF8ValidUpTo(bytes);
+    }
+
+    if (validated == bytes.Length()) {
+      utf8String = std::move(bytes);
+    } else {
+      MOZ_TRY(encoding->DecodeWithoutBOMHandling(bytes, utf8String, validated));
+    }
+  }  
+
+  mSheetLoadData->mLoader->ParseSheet(utf8String, mMainThreadSheetLoadData,
+                                      Loader::AllowAsyncParse::Yes);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+StreamLoader::OnDataAvailable(nsIRequest*, nsIInputStream* aInputStream,
+                              uint64_t, uint32_t aCount) {
+  if (NS_FAILED(mStatus)) {
+    return mStatus;
+  }
+  uint32_t dummy;
+  return aInputStream->ReadSegments(WriteSegmentFun, this, aCount, &dummy);
+}
+
+void StreamLoader::HandleBOM() {
+  MOZ_ASSERT(mEncodingFromBOM.isNothing());
+  MOZ_ASSERT(mBytes.IsEmpty());
+
+  auto [encoding, bomLength] = Encoding::ForBOM(mBOMBytes);
+  mEncodingFromBOM.emplace(encoding);  
+
+  mBytes.Append(Substring(mBOMBytes, bomLength));
+  mBOMBytes.Truncate(bomLength);
+}
+
+NS_IMETHODIMP
+StreamLoader::OnDataFinished(nsresult aResult) {
+  nsCOMPtr<nsIRequest> request = mRequest.forget();
+  if (StaticPrefs::network_send_OnDataFinished_cssLoader()) {
+    return OnStopRequest(request, aResult);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+StreamLoader::GetInterface(const nsIID& aIID, void** aResult) {
+  if (aIID.Equals(NS_GET_IID(nsIChannelEventSink))) {
+    return QueryInterface(aIID, aResult);
+  }
+
+  return NS_NOINTERFACE;
+}
+
+nsresult StreamLoader::AsyncOnChannelRedirect(
+    nsIChannel* aOld, nsIChannel* aNew, uint32_t aFlags,
+    nsIAsyncVerifyRedirectCallback* aCallback) {
+  mSheetLoadData->SetMinimumExpirationTime(
+      nsContentUtils::GetSubresourceCacheExpirationTime(aOld,
+                                                        mSheetLoadData->mURI));
+
+  aCallback->OnRedirectVerifyCallback(NS_OK);
+
+  return NS_OK;
+}
+
+nsresult StreamLoader::WriteSegmentFun(nsIInputStream*, void* aClosure,
+                                       const char* aSegment, uint32_t,
+                                       uint32_t aCount, uint32_t* aWriteCount) {
+  *aWriteCount = 0;
+  StreamLoader* self = static_cast<StreamLoader*>(aClosure);
+  if (NS_FAILED(self->mStatus)) {
+    return self->mStatus;
+  }
+
+  if (self->mEncodingFromBOM.isNothing()) {
+    size_t bytesToCopy = std::min<size_t>(3 - self->mBOMBytes.Length(), aCount);
+    self->mBOMBytes.Append(aSegment, bytesToCopy);
+    aSegment += bytesToCopy;
+    *aWriteCount += bytesToCopy;
+    aCount -= bytesToCopy;
+
+    if (self->mBOMBytes.Length() == 3) {
+      self->HandleBOM();
+    } else {
+      return NS_OK;
+    }
+  }
+
+  if (!self->mBytes.Append(aSegment, aCount, fallible)) {
+    self->mBytes.Truncate();
+    return (self->mStatus = NS_ERROR_OUT_OF_MEMORY);
+  }
+
+  *aWriteCount += aCount;
+  return NS_OK;
+}
+
+}  

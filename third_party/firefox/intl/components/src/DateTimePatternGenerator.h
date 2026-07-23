@@ -1,0 +1,110 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef intl_components_DateTimePatternGenerator_h_
+#define intl_components_DateTimePatternGenerator_h_
+
+#include "unicode/udatpg.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/Result.h"
+#include "mozilla/Span.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/intl/ICU4CGlue.h"
+#include "mozilla/intl/ICUError.h"
+
+namespace mozilla::intl {
+
+class DisplayNames;
+
+class DateTimePatternGenerator final {
+ public:
+  explicit DateTimePatternGenerator(UDateTimePatternGenerator* aGenerator)
+      : mGenerator(aGenerator) {
+    MOZ_ASSERT(aGenerator);
+  };
+
+  DateTimePatternGenerator(DateTimePatternGenerator&& other) noexcept;
+
+  DateTimePatternGenerator& operator=(
+      DateTimePatternGenerator&& other) noexcept;
+
+  DateTimePatternGenerator(const DateTimePatternGenerator&) = delete;
+  DateTimePatternGenerator& operator=(const DateTimePatternGenerator&) = delete;
+
+  ~DateTimePatternGenerator();
+
+  static Result<UniquePtr<DateTimePatternGenerator>, ICUError> TryCreate(
+      const char* aLocale);
+
+  enum class PatternMatchOption {
+    HourField,
+
+    MinuteField,
+
+    SecondField,
+  };
+
+  template <typename B>
+  ICUResult GetBestPattern(Span<const char16_t> aSkeleton, B& aBuffer,
+                           EnumSet<PatternMatchOption> options = {}) {
+    return FillBufferWithICUCall(
+        aBuffer, [&](UChar* target, int32_t length, UErrorCode* status) {
+          return udatpg_getBestPatternWithOptions(
+              mGenerator.GetMut(), aSkeleton.data(),
+              static_cast<int32_t>(aSkeleton.Length()),
+              toUDateTimePatternMatchOptions(options), target, length, status);
+        });
+  }
+
+  template <typename B>
+  static ICUResult GetSkeleton(Span<const char16_t> aPattern, B& aBuffer) {
+    return FillBufferWithICUCall(
+        aBuffer, [&](UChar* target, int32_t length, UErrorCode* status) {
+          return udatpg_getSkeleton(nullptr, aPattern.data(),
+                                    static_cast<int32_t>(aPattern.Length()),
+                                    target, length, status);
+        });
+  }
+
+  Span<const char16_t> GetPlaceholderPattern() const {
+    int32_t length;
+    const char16_t* combined =
+        udatpg_getDateTimeFormat(mGenerator.GetConst(), &length);
+    return Span{combined, static_cast<size_t>(length)};
+  }
+
+ private:
+  friend class DisplayNames;
+
+  UDateTimePatternGenerator* GetUDateTimePatternGenerator() {
+    return mGenerator.GetMut();
+  }
+
+  ICUPointer<UDateTimePatternGenerator> mGenerator =
+      ICUPointer<UDateTimePatternGenerator>(nullptr);
+
+  static UDateTimePatternMatchOptions toUDateTimePatternMatchOptions(
+      EnumSet<PatternMatchOption> options) {
+    struct OptionMap {
+      PatternMatchOption from;
+      UDateTimePatternMatchOptions to;
+    } static constexpr map[] = {
+        {PatternMatchOption::HourField, UDATPG_MATCH_HOUR_FIELD_LENGTH},
+#ifndef U_HIDE_INTERNAL_API
+        {PatternMatchOption::MinuteField, UDATPG_MATCH_MINUTE_FIELD_LENGTH},
+        {PatternMatchOption::SecondField, UDATPG_MATCH_SECOND_FIELD_LENGTH},
+#endif
+    };
+
+    UDateTimePatternMatchOptions result = UDATPG_MATCH_NO_OPTIONS;
+    for (const auto& entry : map) {
+      if (options.contains(entry.from)) {
+        result = UDateTimePatternMatchOptions(result | entry.to);
+      }
+    }
+    return result;
+  }
+};
+
+}  
+#endif

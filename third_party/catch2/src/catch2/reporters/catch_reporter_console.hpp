@@ -1,0 +1,57 @@
+
+
+#ifndef CATCH_REPORTER_CONSOLE_HPP_INCLUDED
+#define CATCH_REPORTER_CONSOLE_HPP_INCLUDED
+
+#include <catch2/reporters/catch_reporter_streaming_base.hpp>
+#include <catch2/internal/catch_unique_ptr.hpp>
+
+namespace Catch {
+class TablePrinter;
+
+class ConsoleReporter final : public StreamingReporterBase {
+    Detail::unique_ptr<TablePrinter> m_tablePrinter;
+
+   public:
+    ConsoleReporter(ReporterConfig&& config);
+    ~ConsoleReporter() override;
+    static std::string getDescription();
+
+    void noMatchingTestCases(StringRef unmatchedSpec) override;
+    void reportInvalidTestSpec(StringRef arg) override;
+
+    void assertionEnded(AssertionStats const& _assertionStats) override;
+
+    void sectionStarting(SectionInfo const& _sectionInfo) override;
+    void sectionEnded(SectionStats const& _sectionStats) override;
+
+    void benchmarkPreparing(StringRef name) override;
+    void benchmarkStarting(BenchmarkInfo const& info) override;
+    void benchmarkEnded(BenchmarkStats<> const& stats) override;
+    void benchmarkFailed(StringRef error) override;
+
+    void testCaseEnded(TestCaseStats const& _testCaseStats) override;
+    void testRunEnded(TestRunStats const& _testRunStats) override;
+    void testRunStarting(TestRunInfo const& _testRunInfo) override;
+
+   private:
+    void lazyPrint();
+
+    void lazyPrintWithoutClosingBenchmarkTable();
+    void lazyPrintRunInfo();
+    void printTestCaseAndSectionHeader();
+
+    void printClosedHeader(std::string const& _name);
+    void printOpenHeader(std::string const& _name);
+
+    void printHeaderString(std::string const& _string, std::size_t indent = 0);
+
+    void printTotalsDivider(Totals const& totals);
+
+    bool m_headerPrinted = false;
+    bool m_testRunInfoPrinted = false;
+};
+
+}  
+
+#endif  // CATCH_REPORTER_CONSOLE_HPP_INCLUDED

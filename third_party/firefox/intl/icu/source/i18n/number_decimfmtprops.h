@@ -1,0 +1,123 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __NUMBER_DECIMFMTPROPS_H__
+#define __NUMBER_DECIMFMTPROPS_H__
+
+#include "unicode/unistr.h"
+#include <cstdint>
+#include "unicode/plurrule.h"
+#include "unicode/currpinf.h"
+#include "unicode/unum.h"
+#include "unicode/localpointer.h"
+#include "number_types.h"
+
+U_NAMESPACE_BEGIN
+
+#if U_PF_WINDOWS <= U_PLATFORM && U_PLATFORM <= U_PF_CYGWIN
+template class U_I18N_API LocalPointerBase<CurrencyPluralInfo>;
+template class U_I18N_API LocalPointer<CurrencyPluralInfo>;
+#endif
+
+namespace number::impl {
+
+class U_I18N_API CurrencyPluralInfoWrapper {
+public:
+    LocalPointer<CurrencyPluralInfo> fPtr;
+
+    CurrencyPluralInfoWrapper() = default;
+
+    CurrencyPluralInfoWrapper(const CurrencyPluralInfoWrapper& other) {
+        if (!other.fPtr.isNull()) {
+            fPtr.adoptInstead(new CurrencyPluralInfo(*other.fPtr));
+        }
+    }
+
+    CurrencyPluralInfoWrapper& operator=(const CurrencyPluralInfoWrapper& other) {
+        if (this != &other &&  
+                !other.fPtr.isNull()) {
+            fPtr.adoptInstead(new CurrencyPluralInfo(*other.fPtr));
+        }
+        return *this;
+    }
+};
+
+enum ParseMode {
+            PARSE_MODE_LENIENT,
+
+            PARSE_MODE_STRICT,
+};
+
+struct U_I18N_API DecimalFormatProperties : public UMemory {
+
+  public:
+    NullableValue<UNumberCompactStyle> compactStyle;
+    NullableValue<CurrencyUnit> currency;
+    CurrencyPluralInfoWrapper currencyPluralInfo;
+    NullableValue<UCurrencyUsage> currencyUsage;
+    bool decimalPatternMatchRequired;
+    bool decimalSeparatorAlwaysShown;
+    bool exponentSignAlwaysShown;
+    bool currencyAsDecimal;
+    bool formatFailIfMoreThanMaxDigits; 
+    int32_t formatWidth;
+    int32_t groupingSize;
+    bool groupingUsed;
+    int32_t magnitudeMultiplier; 
+    int32_t maximumFractionDigits;
+    int32_t maximumIntegerDigits;
+    int32_t maximumSignificantDigits;
+    int32_t minimumExponentDigits;
+    int32_t minimumFractionDigits;
+    int32_t minimumGroupingDigits;
+    int32_t minimumIntegerDigits;
+    int32_t minimumSignificantDigits;
+    int32_t multiplier;
+    int32_t multiplierScale; 
+    UnicodeString negativePrefix;
+    UnicodeString negativePrefixPattern;
+    UnicodeString negativeSuffix;
+    UnicodeString negativeSuffixPattern;
+    NullableValue<PadPosition> padPosition;
+    UnicodeString padString;
+    bool parseCaseSensitive;
+    bool parseIntegerOnly;
+    NullableValue<ParseMode> parseMode;
+    bool parseNoExponent;
+    bool parseToBigDecimal; 
+    UNumberFormatAttributeValue parseAllInput; 
+    UnicodeString positivePrefix;
+    UnicodeString positivePrefixPattern;
+    UnicodeString positiveSuffix;
+    UnicodeString positiveSuffixPattern;
+    double roundingIncrement;
+    NullableValue<RoundingMode> roundingMode;
+    int32_t secondaryGroupingSize;
+    bool signAlwaysShown;
+
+    DecimalFormatProperties();
+
+    inline bool operator==(const DecimalFormatProperties& other) const {
+        return _equals(other, false);
+    }
+
+    void clear();
+
+    bool equalsDefaultExceptFastFormat() const;
+
+    static const DecimalFormatProperties& getDefault();
+
+  private:
+    bool _equals(const DecimalFormatProperties& other, bool ignoreForFastFormat) const;
+};
+
+} 
+
+U_NAMESPACE_END
+
+
+#endif //__NUMBER_DECIMFMTPROPS_H__
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

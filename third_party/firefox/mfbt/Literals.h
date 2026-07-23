@@ -1,0 +1,31 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_Literals_h
+#define mozilla_Literals_h
+
+#include <cstddef>
+
+constexpr size_t operator""_KiB(unsigned long long int aNum) {
+  return size_t(aNum) * 1024;
+}
+
+constexpr size_t operator""_KiB(long double aNum) {
+  return size_t(aNum * 1024);
+}
+
+constexpr size_t operator""_MiB(unsigned long long int aNum) {
+  return size_t(aNum) * 1024_KiB;
+}
+
+constexpr size_t operator""_MiB(long double aNum) {
+  return size_t(aNum * 1024_KiB);
+}
+
+constexpr double operator""_percent(long double aPercent) {
+  return double(aPercent) / 100;
+}
+
+#endif /* ! mozilla_Literals_h */

@@ -1,0 +1,177 @@
+//! Channel that delivers a message at a certain moment in time.
+//!
+//! Messages cannot be sent into this kind of channel; they are materialized on demand.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Instant;
+
+use crate::context::Context;
+use crate::err::{RecvTimeoutError, TryRecvError};
+use crate::select::{Operation, SelectHandle, Token};
+use crate::utils;
+
+/// Result of a receive operation.
+pub(crate) type AtToken = Option<Instant>;
+
+/// Channel that delivers a message at a certain moment in time
+pub(crate) struct Channel {
+    /// The instant at which the message will be delivered.
+    delivery_time: Instant,
+
+    /// `true` if the message has been received.
+    received: AtomicBool,
+}
+
+impl Channel {
+    /// Creates a channel that delivers a message at a certain instant in time.
+    #[inline]
+    pub(crate) fn new_deadline(when: Instant) -> Self {
+        Channel {
+            delivery_time: when,
+            received: AtomicBool::new(false),
+        }
+    }
+
+    /// Attempts to receive a message without blocking.
+    #[inline]
+    pub(crate) fn try_recv(&self) -> Result<Instant, TryRecvError> {
+        if self.received.load(Ordering::Relaxed) {
+            return Err(TryRecvError::Empty);
+        }
+
+        if Instant::now() < self.delivery_time {
+            return Err(TryRecvError::Empty);
+        }
+
+        if !self.received.swap(true, Ordering::SeqCst) {
+            Ok(self.delivery_time)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+
+    /// Receives a message from the channel.
+    #[inline]
+    pub(crate) fn recv(&self, deadline: Option<Instant>) -> Result<Instant, RecvTimeoutError> {
+        if self.received.load(Ordering::Relaxed) {
+            utils::sleep_until(deadline);
+            return Err(RecvTimeoutError::Timeout);
+        }
+
+        loop {
+            let now = Instant::now();
+
+            let deadline = match deadline {
+                _ if now >= self.delivery_time => break,
+                Some(d) if now >= d => return Err(RecvTimeoutError::Timeout),
+
+                Some(d) if d < self.delivery_time => d,
+                _ => self.delivery_time,
+            };
+
+            thread::sleep(deadline - now);
+        }
+
+        if !self.received.swap(true, Ordering::SeqCst) {
+            Ok(self.delivery_time)
+        } else {
+            utils::sleep_until(None);
+            unreachable!()
+        }
+    }
+
+    /// Reads a message from the channel.
+    #[inline]
+    pub(crate) unsafe fn read(&self, token: &mut Token) -> Result<Instant, ()> {
+        token.at.ok_or(())
+    }
+
+    /// Returns `true` if the channel is empty.
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        if self.received.load(Ordering::Relaxed) {
+            return true;
+        }
+
+        if Instant::now() < self.delivery_time {
+            return true;
+        }
+
+        self.received.load(Ordering::SeqCst)
+    }
+
+    /// Returns `true` if the channel is full.
+    #[inline]
+    pub(crate) fn is_full(&self) -> bool {
+        !self.is_empty()
+    }
+
+    /// Returns the number of messages in the channel.
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        if self.is_empty() {
+            0
+        } else {
+            1
+        }
+    }
+
+    /// Returns the capacity of the channel.
+    #[inline]
+    pub(crate) fn capacity(&self) -> Option<usize> {
+        Some(1)
+    }
+}
+
+impl SelectHandle for Channel {
+    #[inline]
+    fn try_select(&self, token: &mut Token) -> bool {
+        match self.try_recv() {
+            Ok(msg) => {
+                token.at = Some(msg);
+                true
+            }
+            Err(TryRecvError::Disconnected) => {
+                token.at = None;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+        }
+    }
+
+    #[inline]
+    fn deadline(&self) -> Option<Instant> {
+        if self.received.load(Ordering::Relaxed) {
+            None
+        } else {
+            Some(self.delivery_time)
+        }
+    }
+
+    #[inline]
+    fn register(&self, _oper: Operation, _cx: &Context) -> bool {
+        self.is_ready()
+    }
+
+    #[inline]
+    fn unregister(&self, _oper: Operation) {}
+
+    #[inline]
+    fn accept(&self, token: &mut Token, _cx: &Context) -> bool {
+        self.try_select(token)
+    }
+
+    #[inline]
+    fn is_ready(&self) -> bool {
+        !self.is_empty()
+    }
+
+    #[inline]
+    fn watch(&self, _oper: Operation, _cx: &Context) -> bool {
+        self.is_ready()
+    }
+
+    #[inline]
+    fn unwatch(&self, _oper: Operation) {}
+}

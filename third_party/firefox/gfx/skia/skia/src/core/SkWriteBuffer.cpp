@@ -1,0 +1,273 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/core/SkWriteBuffer.h"
+
+#include "include/core/SkAlphaType.h"
+#include "include/core/SkData.h"
+#include "include/core/SkFlattenable.h"
+#include "include/core/SkImage.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkPoint3.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkTypeface.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkTFitsIn.h"
+#include "include/private/base/SkTo.h"
+#include "src/core/SkMatrixPriv.h"
+#include "src/core/SkMipmap.h"
+#include "src/core/SkPaintPriv.h"
+#include "src/core/SkPtrRecorder.h"
+#include "src/image/SkImage_Base.h"
+
+#include <cstring>
+#include <utility>
+
+class SkMatrix;
+class SkPaint;
+class SkRegion;
+
+
+SkBinaryWriteBuffer::SkBinaryWriteBuffer(const SkSerialProcs& p)
+        : SkWriteBuffer(p), fFactorySet(nullptr), fTFSet(nullptr) {}
+
+SkBinaryWriteBuffer::SkBinaryWriteBuffer(void* storage, size_t storageSize, const SkSerialProcs& p)
+        : SkWriteBuffer(p), fFactorySet(nullptr), fTFSet(nullptr), fWriter(storage, storageSize) {}
+
+SkBinaryWriteBuffer::~SkBinaryWriteBuffer() {}
+
+bool SkBinaryWriteBuffer::usingInitialStorage() const {
+    return fWriter.usingInitialStorage();
+}
+
+void SkBinaryWriteBuffer::writeByteArray(const void* data, size_t size) {
+    fWriter.write32(SkToU32(size));
+    fWriter.writePad(data, size);
+}
+
+void SkBinaryWriteBuffer::writeBool(bool value) {
+    fWriter.writeBool(value);
+}
+
+void SkBinaryWriteBuffer::writeScalar(SkScalar value) {
+    fWriter.writeScalar(value);
+}
+
+void SkBinaryWriteBuffer::writeScalarArray(SkSpan<const SkScalar> values) {
+    fWriter.write32(SkToInt(values.size()));
+    fWriter.write(values.data(), values.size_bytes());
+}
+
+void SkBinaryWriteBuffer::writeInt(int32_t value) {
+    fWriter.write32(value);
+}
+
+void SkBinaryWriteBuffer::writeIntArray(SkSpan<const int32_t> values) {
+    fWriter.write32(SkToInt(values.size()));
+    fWriter.write(values.data(), values.size_bytes());
+}
+
+void SkBinaryWriteBuffer::writeUInt(uint32_t value) {
+    fWriter.write32(value);
+}
+
+void SkBinaryWriteBuffer::writeString(std::string_view value) {
+    fWriter.writeString(value.data(), value.size());
+}
+
+void SkBinaryWriteBuffer::writeColor(SkColor color) {
+    fWriter.write32(color);
+}
+
+void SkBinaryWriteBuffer::writeColorArray(SkSpan<const SkColor> values) {
+    fWriter.write32(SkToInt(values.size()));
+    fWriter.write(values.data(), values.size_bytes());
+}
+
+void SkBinaryWriteBuffer::writeColor4f(const SkColor4f& color) {
+    fWriter.write(&color, sizeof(SkColor4f));
+}
+
+void SkBinaryWriteBuffer::writeColor4fArray(SkSpan<const SkColor4f> values) {
+    fWriter.write32(SkToInt(values.size()));
+    fWriter.write(values.data(), values.size_bytes());
+}
+
+void SkBinaryWriteBuffer::writePoint(const SkPoint& point) {
+    fWriter.writeScalar(point.fX);
+    fWriter.writeScalar(point.fY);
+}
+
+void SkBinaryWriteBuffer::writePoint3(const SkPoint3& point) {
+    this->writePad32(&point, sizeof(SkPoint3));
+}
+
+void SkBinaryWriteBuffer::writePointArray(SkSpan<const SkPoint> values) {
+    fWriter.write32(SkToInt(values.size()));
+    fWriter.write(values.data(), values.size_bytes());
+}
+
+void SkBinaryWriteBuffer::write(const SkM44& matrix) {
+    fWriter.write(SkMatrixPriv::M44ColMajor(matrix), sizeof(float) * 16);
+}
+
+void SkBinaryWriteBuffer::writeMatrix(const SkMatrix& matrix) {
+    fWriter.writeMatrix(matrix);
+}
+
+void SkBinaryWriteBuffer::writeIRect(const SkIRect& rect) {
+    fWriter.write(&rect, sizeof(SkIRect));
+}
+
+void SkBinaryWriteBuffer::writeRect(const SkRect& rect) {
+    fWriter.writeRect(rect);
+}
+
+void SkBinaryWriteBuffer::writeRegion(const SkRegion& region) {
+    fWriter.writeRegion(region);
+}
+
+void SkBinaryWriteBuffer::writeSampling(const SkSamplingOptions& sampling) {
+    fWriter.writeSampling(sampling);
+}
+
+void SkBinaryWriteBuffer::writePath(const SkPath& path) {
+    fWriter.writePath(path);
+}
+
+size_t SkBinaryWriteBuffer::writeStream(SkStream* stream, size_t length) {
+    fWriter.write32(SkToU32(length));
+    size_t bytesWritten = fWriter.readFromStream(stream, length);
+    if (bytesWritten < length) {
+        fWriter.reservePad(length - bytesWritten);
+    }
+    return bytesWritten;
+}
+
+bool SkBinaryWriteBuffer::writeToStream(SkWStream* stream) const {
+    return fWriter.writeToStream(stream);
+}
+
+static sk_sp<const SkData> serialize_image(const SkImage* image, SkSerialProcs procs) {
+    sk_sp<const SkData> data;
+    if (procs.fImageProc) {
+        data = procs.fImageProc(const_cast<SkImage*>(image), procs.fImageCtx);
+    }
+    if (data) {
+        return data;
+    }
+    data = image->refEncodedData();
+    if (data) {
+        return data;
+    }
+    return nullptr;
+}
+
+static sk_sp<SkData> serialize_mipmap(const SkMipmap* mipmap, SkSerialProcs procs) {
+    const int count = mipmap->countLevels();
+
+    SkBinaryWriteBuffer buffer({});
+    buffer.write32(count);
+    for (int i = 0; i < count; ++i) {
+        SkMipmap::Level level;
+        if (mipmap->getLevel(i, &level)) {
+            sk_sp<SkImage> levelImage = SkImages::RasterFromPixmap(level.fPixmap, nullptr, nullptr);
+            sk_sp<const SkData> levelData = serialize_image(levelImage.get(), procs);
+            buffer.writeDataAsByteArray(levelData.get());
+        } else {
+            return nullptr;
+        }
+    }
+    return buffer.snapshotAsData();
+}
+
+void SkBinaryWriteBuffer::writeImage(const SkImage* image) {
+    uint32_t flags = 0;
+    const SkMipmap* mips = as_IB(image)->onPeekMips();
+    if (mips) {
+        flags |= SkWriteBufferImageFlags::kHasMipmap;
+    }
+    if (image->alphaType() == kUnpremul_SkAlphaType) {
+        flags |= SkWriteBufferImageFlags::kUnpremul;
+    }
+
+    this->write32(flags);
+
+    sk_sp<const SkData> data = serialize_image(image, fProcs);
+    SkASSERT(data);
+    this->writeDataAsByteArray(data.get());
+
+    if (flags & SkWriteBufferImageFlags::kHasMipmap) {
+        sk_sp<SkData> mipData = serialize_mipmap(mips, fProcs);
+        this->writeDataAsByteArray(mipData.get());
+    }
+}
+
+void SkBinaryWriteBuffer::writeTypeface(SkTypeface* obj) {
+
+    if (obj == nullptr) {
+        fWriter.write32(0);
+    } else if (fProcs.fTypefaceProc) {
+        auto data = fProcs.fTypefaceProc(obj, fProcs.fTypefaceCtx);
+        if (data) {
+            size_t size = data->size();
+            if (!SkTFitsIn<int32_t>(size)) {
+                size = 0;               
+            }
+            int32_t ssize = SkToS32(size);
+            fWriter.write32(-ssize);    
+            if (size) {
+                this->writePad32(data->data(), size);
+            }
+            return;
+        }
+        // no data means fall through for std behavior
+    }
+    fWriter.write32(fTFSet ? fTFSet->add(obj) : 0);
+}
+
+void SkBinaryWriteBuffer::writePaint(const SkPaint& paint) {
+    SkPaintPriv::Flatten(paint, *this);
+}
+
+void SkBinaryWriteBuffer::setFactoryRecorder(sk_sp<SkFactorySet> rec) {
+    fFactorySet = std::move(rec);
+}
+
+void SkBinaryWriteBuffer::setTypefaceRecorder(sk_sp<SkRefCntSet> rec) {
+    fTFSet = std::move(rec);
+}
+
+void SkBinaryWriteBuffer::writeFlattenable(const SkFlattenable* flattenable) {
+    if (nullptr == flattenable) {
+        this->write32(0);
+        return;
+    }
+
+
+    if (SkFlattenable::Factory factory = flattenable->getFactory(); factory && fFactorySet) {
+        this->write32(fFactorySet->add(factory));
+    } else {
+        const char* name = flattenable->getTypeName();
+        SkASSERT(name);
+        SkASSERT(0 != strcmp("", name));
+
+        if (uint32_t* indexPtr = fFlattenableDict.find(name)) {
+            SkASSERT(0 == *indexPtr >> 24);
+            this->write32(*indexPtr << 8);
+        } else {
+            this->writeString(name);
+            fFlattenableDict.set(name, fFlattenableDict.count() + 1);
+        }
+    }
+
+    (void)fWriter.reserve(sizeof(uint32_t));
+    size_t offset = fWriter.bytesWritten();
+    flattenable->flatten(*this);
+    size_t objSize = fWriter.bytesWritten() - offset;
+    fWriter.overwriteTAt(offset - sizeof(uint32_t), SkToU32(objSize));
+}

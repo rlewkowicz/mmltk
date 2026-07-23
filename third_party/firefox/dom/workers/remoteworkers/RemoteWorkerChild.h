@@ -1,0 +1,155 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_RemoteWorkerChild_h
+#define mozilla_dom_RemoteWorkerChild_h
+
+#include "mozilla/DataMutex.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/ThreadBound.h"
+#include "mozilla/dom/PRemoteWorkerChild.h"
+#include "mozilla/dom/PRemoteWorkerNonLifeCycleOpControllerChild.h"
+#include "mozilla/dom/RemoteWorkerOp.h"
+#include "mozilla/dom/ServiceWorkerOpArgs.h"
+#include "mozilla/dom/SharedWorkerOpArgs.h"
+#include "nsCOMPtr.h"
+#include "nsISupportsImpl.h"
+#include "nsTArray.h"
+
+class nsISerialEventTarget;
+class nsIConsoleReportCollector;
+
+namespace mozilla::dom {
+
+using remoteworker::RemoteWorkerState;
+
+class ErrorValue;
+class FetchEventOpProxyChild;
+class RemoteWorkerData;
+class RemoteWorkerServiceKeepAlive;
+class ServiceWorkerOp;
+class SharedWorkerOp;
+class UniqueMessagePortId;
+class WeakWorkerRef;
+class WorkerErrorReport;
+class WorkerPrivate;
+
+class RemoteWorkerChild final : public PRemoteWorkerChild {
+  friend class FetchEventOpProxyChild;
+  friend class PRemoteWorkerChild;
+  friend class ServiceWorkerOp;
+  friend class SharedWorkerOp;
+
+  ~RemoteWorkerChild();
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(RemoteWorkerChild, final)
+
+  explicit RemoteWorkerChild(const RemoteWorkerData& aData);
+
+  void ExecWorker(
+      const RemoteWorkerData& aData,
+      mozilla::ipc::Endpoint<PRemoteWorkerNonLifeCycleOpControllerChild>&&
+          aChildEp);
+
+  void ErrorPropagationOnMainThread(const WorkerErrorReport* aReport,
+                                    bool aIsErrorEvent);
+
+  void CSPViolationPropagationOnMainThread(const nsAString& aJSON,
+                                           const nsAString& aReportGroupName);
+
+  void NotifyLock(bool aCreated);
+
+  void NotifyWebTransport(bool aCreated);
+
+  void FlushReportsOnMainThread(nsIConsoleReportCollector* aReporter);
+
+  RefPtr<GenericNonExclusivePromise> GetTerminationPromise();
+
+  RefPtr<GenericPromise> MaybeSendSetServiceWorkerSkipWaitingFlag();
+
+  const nsTArray<uint64_t>& WindowIDs() const { return mWindowIDs; }
+
+  void SetIsThawing(const bool aIsThawing) { mIsThawing = aIsThawing; }
+  bool IsThawing() const { return mIsThawing; }
+  void PendRemoteWorkerOp(RefPtr<RemoteWorkerOp> aOp);
+  void RunAllPendingOpsOnMainThread();
+
+ private:
+  class InitializeWorkerRunnable;
+
+  DataMutex<RemoteWorkerState> mState;
+
+  const RefPtr<RemoteWorkerServiceKeepAlive> mServiceKeepAlive;
+
+  void ActorDestroy(ActorDestroyReason) override;
+
+  mozilla::ipc::IPCResult RecvExecOp(SharedWorkerOpArgs&& aOpArgs);
+
+  mozilla::ipc::IPCResult RecvExecServiceWorkerOp(
+      ServiceWorkerOpArgs&& aArgs, ExecServiceWorkerOpResolver&& aResolve);
+
+  already_AddRefed<PFetchEventOpProxyChild> AllocPFetchEventOpProxyChild(
+      const ParentToChildServiceWorkerFetchEventOpArgs& aArgs);
+
+  mozilla::ipc::IPCResult RecvPFetchEventOpProxyConstructor(
+      PFetchEventOpProxyChild* aActor,
+      const ParentToChildServiceWorkerFetchEventOpArgs& aArgs) override;
+
+  nsresult ExecWorkerOnMainThread(
+      RemoteWorkerData&& aData,
+      mozilla::ipc::Endpoint<PRemoteWorkerNonLifeCycleOpControllerChild>&&
+          aChildEp);
+
+  void ExceptionalErrorTransitionDuringExecWorker();
+
+  void RequestWorkerCancellation();
+
+  void InitializeOnWorker();
+
+  void CreationSucceededOnAnyThread();
+
+  void CreationFailedOnAnyThread();
+
+  void CreationSucceededOrFailedOnAnyThread(bool aDidCreationSucceed);
+
+  void CloseWorkerOnMainThread();
+
+  void ErrorPropagation(const ErrorValue& aValue);
+
+  void ErrorPropagationDispatch(nsresult aError);
+
+  void OnWorkerCancellationTransitionStateFromPendingOrRunningToCanceled();
+  void TransitionStateFromPendingToCanceled(RemoteWorkerState& aState);
+  void TransitionStateFromCanceledToKilled();
+
+  void TransitionStateToRunning();
+
+  void TransitionStateToTerminated();
+
+  void TransitionStateToTerminated(RemoteWorkerState& aState);
+
+  void CancelAllPendingOps(RemoteWorkerState& aState);
+
+  void MaybeStartOp(RefPtr<RemoteWorkerOp>&& aOp);
+
+  const bool mIsServiceWorker;
+
+  nsTArray<uint64_t> mWindowIDs;
+
+  struct LauncherBoundData {
+    MozPromiseHolder<GenericNonExclusivePromise> mTerminationPromise;
+    bool mDidSendCreated = false;
+  };
+
+  ThreadBound<LauncherBoundData> mLauncherData;
+
+  Atomic<bool> mIsThawing{false};
+  DataMutex<nsTArray<RefPtr<RemoteWorkerOp>>> mPendingOps;
+};
+
+}  
+
+#endif  // mozilla_dom_RemoteWorkerChild_h

@@ -1,0 +1,148 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsCaret_h_
+#define nsCaret_h_
+
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/SelectionMovementUtils.h"
+#include "nsCoord.h"
+#include "nsIFrame.h"
+#include "nsISelectionListener.h"
+#include "nsPoint.h"
+#include "nsRect.h"
+
+class nsFrameSelection;
+class nsIContent;
+class nsIFrame;
+class nsINode;
+class nsITimer;
+
+namespace mozilla {
+class PresShell;
+enum class CaretAssociationHint;
+namespace gfx {
+class DrawTarget;
+}  
+}  
+
+class nsCaret final : public nsISelectionListener {
+  typedef mozilla::gfx::DrawTarget DrawTarget;
+
+ public:
+  nsCaret();
+
+ protected:
+  virtual ~nsCaret();
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  using CaretAssociationHint = mozilla::CaretAssociationHint;
+
+  nsresult Init(mozilla::PresShell*);
+  void Terminate();
+
+  void SetSelection(mozilla::dom::Selection*);
+  mozilla::dom::Selection* GetSelection();
+
+  void SetVisible(bool aVisible);
+  bool IsVisible() const;
+
+  void AddForceHide();
+  void RemoveForceHide();
+  void SetCaretReadOnly(bool aReadOnly);
+  void SetVisibilityDuringSelection(bool aVisibility);
+
+  void SetCaretPosition(nsINode* aNode, int32_t aOffset);
+
+  void SchedulePaint();
+
+  nsIFrame* GetLastPaintedFrame() { return mLastPaintedFrame; }
+  void SetLastPaintedFrame(nsIFrame* aFrame) { mLastPaintedFrame = aFrame; }
+
+  nsIFrame* GetPaintGeometry();
+  nsIFrame* GetPaintGeometry(nsRect* aRect);
+
+  nsIFrame* GetPaintGeometry(nsRect* aCaretRect, nsRect* aHookRect,
+                             nscolor* aCaretColor = nullptr);
+  nsIFrame* GetGeometry(nsRect* aRect) {
+    return GetGeometry(GetSelection(), aRect);
+  }
+
+  void PaintCaret(DrawTarget& aDrawTarget, nsIFrame* aForFrame,
+                  const nsPoint& aOffset);
+
+  NS_DECL_NSISELECTIONLISTENER
+
+  struct CaretPosition {
+    nsCOMPtr<nsINode> mContent;
+    int32_t mOffset = 0;
+    CaretAssociationHint mHint{0};
+    mozilla::intl::BidiEmbeddingLevel mBidiLevel;
+
+    bool operator==(const CaretPosition& aOther) const = default;
+
+    explicit operator bool() const { return !!mContent; }
+  };
+
+  static CaretPosition CaretPositionFor(const mozilla::dom::Selection*);
+
+  static nsIFrame* GetGeometry(const mozilla::dom::Selection* aSelection,
+                               nsRect* aRect);
+
+  static nsRect GetGeometryForFrame(nsIFrame* aFrame, int32_t aFrameOffset,
+                                    nscoord* aBidiIndicatorSize);
+
+  static mozilla::CaretFrameData GetFrameAndOffset(
+      const CaretPosition& aPosition);
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+ protected:
+  static void CaretBlinkCallback(nsITimer* aTimer, void* aClosure);
+
+  void CheckSelectionLanguageChange();
+  void CaretVisibilityMaybeChanged();
+
+  void ResetBlinking();
+  void StopBlinking();
+
+  struct Metrics {
+    nscoord mBidiIndicatorSize;  
+    nscoord mCaretWidth;         
+  };
+  static Metrics ComputeMetrics(nsIFrame* aFrame, int32_t aOffset,
+                                nscoord aCaretHeight);
+  void ComputeCaretRects(nsIFrame* aFrame, int32_t aFrameOffset,
+                         nsRect* aCaretRect, nsRect* aHookRect);
+
+  void UpdateCaretPositionFromSelectionIfNeeded();
+  void UpdateHiddenDuringSelection();
+
+  mozilla::WeakPtr<mozilla::dom::Selection> mDomSelectionWeak;
+
+  nsCOMPtr<nsITimer> mBlinkTimer;
+  mozilla::TimeStamp mLastBlinkTimerReset;
+
+  CaretPosition mCaretPosition;
+
+  WeakFrame mLastPaintedFrame;
+
+  int32_t mBlinkCount = -1;
+  int32_t mBlinkTime = -1;
+  uint32_t mHideCount = 0;
+
+  bool mIsBlinkOn = false;
+  bool mVisible = false;
+  bool mReadOnly = false;
+  bool mShowDuringSelection = false;
+
+  bool mFixedCaretPosition = false;
+
+  bool mHiddenDuringSelection = false;
+};
+
+#endif  // nsCaret_h_

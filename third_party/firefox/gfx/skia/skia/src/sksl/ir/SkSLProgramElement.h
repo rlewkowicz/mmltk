@@ -1,0 +1,36 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_PROGRAMELEMENT)
+#define SKSL_PROGRAMELEMENT
+
+#include "src/sksl/ir/SkSLIRNode.h"
+
+#include <memory>
+
+namespace SkSL {
+
+class ProgramElement : public IRNode {
+public:
+    using Kind = ProgramElementKind;
+
+    ProgramElement(Position pos, Kind kind)
+        : INHERITED(pos, (int) kind) {
+        SkASSERT(kind >= Kind::kFirst && kind <= Kind::kLast);
+    }
+
+    Kind kind() const {
+        return (Kind) fKind;
+    }
+
+private:
+    using INHERITED = IRNode;
+};
+
+}  
+
+#endif

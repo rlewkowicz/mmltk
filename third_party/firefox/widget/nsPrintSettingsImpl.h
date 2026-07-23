@@ -1,0 +1,108 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(nsPrintSettingsImpl_h_)
+#define nsPrintSettingsImpl_h_
+
+#include "nsIPrintSettings.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsMargin.h"
+#include "nsPaper.h"
+#include "nsProxyRelease.h"
+#include "nsString.h"
+
+#define NUM_HEAD_FOOT 3
+
+
+class nsPrintSettings;
+
+namespace mozilla {
+
+struct PrintSettingsInitializer {
+  nsString mPrinter;
+  PaperInfo mPaperInfo;
+  int16_t mPaperSizeUnit = nsIPrintSettings::kPaperSizeInches;
+  bool mPrintInColor = true;
+  int mResolution = 0;
+  int mSheetOrientation = nsIPrintSettings::kPortraitOrientation;
+  int mNumCopies = 1;
+  int mDuplex = nsIPrintSettings::kDuplexNone;
+
+  nsMainThreadPtrHandle<nsPrintSettings> mPrintSettings;
+
+};
+
+}  
+
+class nsPrintSettings : public nsIPrintSettings {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIPRINTSETTINGS
+  using PrintSettingsInitializer = mozilla::PrintSettingsInitializer;
+
+  nsPrintSettings();
+  nsPrintSettings(const nsPrintSettings& aPS);
+
+  virtual void InitWithInitializer(const PrintSettingsInitializer& aSettings);
+
+  nsPrintSettings& operator=(const nsPrintSettings& rhs);
+
+  void SetDefaultFileName();
+
+ protected:
+  virtual ~nsPrintSettings();
+
+  virtual nsresult _Clone(nsIPrintSettings** _retval);
+  virtual nsresult _Assign(nsIPrintSettings* aPS);
+
+  nsWeakPtr mSession;  
+
+  nsIntMargin mMargin;
+  nsIntMargin mEdge;
+  nsIntMargin mUnwriteableMargin;
+
+  nsTArray<int32_t> mPageRanges;
+
+  double mScaling = 1.0;
+  bool mPrintBGColors = false;
+  bool mPrintBGImages = false;
+
+  bool mPrintSilent = false;
+  bool mShrinkToFit = true;
+  bool mShowMarginGuides = false;
+  bool mHonorPageRuleMargins = true;
+  bool mUsePageRuleSizeAsPaperSize = false;
+  bool mIgnoreUnwriteableMargins = false;
+  bool mPrintSelectionOnly = false;
+
+  int32_t mPrintPageDelay = 50;  
+
+  nsString mTitle;
+  nsString mURL;
+  nsString mHeaderStrs[NUM_HEAD_FOOT];
+  nsString mFooterStrs[NUM_HEAD_FOOT];
+
+  nsString mPaperId;
+  double mPaperWidth = 8.5;
+  double mPaperHeight = 11.0;
+  int16_t mPaperSizeUnit = kPaperSizeInches;
+
+  bool mPrintReversed = false;
+  bool mPrintInColor = true;
+  int32_t mOrientation = kPortraitOrientation;
+  int32_t mResolution = 0;
+  int32_t mDuplex = kDuplexNone;
+  int32_t mNumCopies = 1;
+  int32_t mNumPagesPerSheet = 1;
+  int16_t mOutputFormat = kOutputFormatNative;
+  OutputDestinationType mOutputDestination = kOutputDestinationPrinter;
+  nsString mPrinter;
+  nsString mToFileName;
+  nsCOMPtr<nsIOutputStream> mOutputStream;
+  bool mIsInitedFromPrinter = false;
+  bool mIsInitedFromPrefs = false;
+};
+
+#endif

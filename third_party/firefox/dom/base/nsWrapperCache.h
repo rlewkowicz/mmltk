@@ -1,0 +1,480 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsWrapperCache_h_
+#define nsWrapperCache_h_
+
+#include <type_traits>
+
+#include "js/HeapAPI.h"
+#include "js/RootingAPI.h"
+#include "js/TracingAPI.h"
+#include "js/TypeDecls.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/RustCell.h"
+#include "mozilla/ServoUtils.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsISupports.h"
+#include "nsISupportsUtils.h"
+
+namespace mozilla::dom::binding_detail {
+class CastableToWrapperCacheHelper;
+}  
+
+#define NS_WRAPPERCACHE_IID \
+  {0x6f3179a1, 0x36f7, 0x4a5c, {0x8c, 0xf1, 0xad, 0xc8, 0x7c, 0xde, 0x3e, 0x87}}
+
+#ifdef HAVE_64BIT_BUILD
+static_assert(sizeof(void*) == 8, "These architectures should be 64-bit");
+#  define BOOL_FLAGS_ON_WRAPPER_CACHE
+#else
+static_assert(sizeof(void*) == 4, "Only support 32-bit and 64-bit");
+#endif
+
+
+class JS_HAZ_ROOTED nsWrapperCache {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_WRAPPERCACHE_IID)
+
+  nsWrapperCache() = default;
+  ~nsWrapperCache() {
+    MOZ_ASSERT(!PreservingWrapper() || js::RuntimeIsBeingDestroyed(),
+               "Destroying cache with a preserved wrapper!");
+  }
+
+  JSObject* GetWrapper() const;
+
+  JSObject* GetWrapperPreserveColor() const;
+
+  JSObject* GetWrapperMaybeDead() const { return mWrapper; }
+
+#ifdef DEBUG
+ private:
+  static bool HasJSObjectMovedOp(JSObject* aWrapper);
+
+  static void AssertUpdatedWrapperZone(const JSObject* aNewObject,
+                                       const JSObject* aOldObject);
+
+ public:
+#endif
+
+  void SetWrapper(JSObject* aWrapper) {
+    MOZ_ASSERT(!PreservingWrapper(), "Clearing a preserved wrapper!");
+    MOZ_ASSERT(aWrapper, "Use ClearWrapper!");
+    MOZ_ASSERT(HasJSObjectMovedOp(aWrapper),
+               "Object has not provided the hook to update the wrapper if it "
+               "is moved");
+
+    SetWrapperJSObject(aWrapper);
+  }
+
+  void ClearWrapper() {
+    MOZ_ASSERT(!PreservingWrapper() || js::RuntimeIsBeingDestroyed(),
+               "Clearing a preserved wrapper!");
+    SetWrapperJSObject(nullptr);
+  }
+
+  void ClearWrapper(JSObject* obj) {
+    if (obj == mWrapper) {
+      ClearWrapper();
+    }
+  }
+
+  void ClearWrapperOnWrapFailure();
+
+  void UpdateWrapper(JSObject* aNewObject, const JSObject* aOldObject) {
+#ifdef DEBUG
+    AssertUpdatedWrapperZone(aNewObject, aOldObject);
+#endif
+    if (mWrapper) {
+      MOZ_ASSERT(mWrapper == aOldObject);
+      mWrapper = aNewObject;
+      if (PreservingWrapper() && !JS::ObjectIsTenured(mWrapper)) {
+        JS::HeapObjectPostWriteBarrier(&mWrapper, nullptr, mWrapper);
+      }
+    }
+  }
+
+  bool PreservingWrapper() const {
+    return HasWrapperFlag(WRAPPER_BIT_PRESERVED);
+  }
+
+  virtual JSObject* WrapObject(JSContext* cx,
+                               JS::Handle<JSObject*> aGivenProto) = 0;
+
+  bool HasKnownLiveWrapper() const;
+
+  bool HasKnownLiveWrapperAndDoesNotNeedTracing(nsISupports* aThis);
+
+  bool HasNothingToTrace(nsISupports* aThis);
+
+  void MarkWrapperLive();
+
+  void SetPreservingWrapper(bool aPreserve) {
+    if (aPreserve) {
+      SetWrapperFlags(WRAPPER_BIT_PRESERVED);
+    } else {
+      UnsetWrapperFlags(WRAPPER_BIT_PRESERVED);
+    }
+  }
+
+  void TraceWrapper(const TraceCallbacks& aCallbacks, void* aClosure) {
+    if (PreservingWrapper() && mWrapper) {
+      aCallbacks.Trace(this, "Preserved wrapper", aClosure);
+    }
+  }
+
+
+  using FlagsType = uint32_t;
+
+  FlagsType GetFlags() const {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT(!mozilla::IsInServoTraversal());
+    return mFlags.Get() & ~kWrapperFlagsMask;
+  }
+
+  bool HasFlag(FlagsType aFlag) const {
+    MOZ_ASSERT((aFlag & kWrapperFlagsMask) == 0, "Bad flag mask");
+    return __atomic_load_n(mFlags.AsPtr(), __ATOMIC_RELAXED) & aFlag;
+  }
+
+  bool HasAnyOfFlags(FlagsType aFlags) const { return HasFlag(aFlags); }
+
+  bool HasAllFlags(FlagsType aFlags) const {
+    MOZ_ASSERT((aFlags & kWrapperFlagsMask) == 0, "Bad flag mask");
+    return (__atomic_load_n(mFlags.AsPtr(), __ATOMIC_RELAXED) & aFlags) ==
+           aFlags;
+  }
+
+  void SetFlags(FlagsType aFlagsToSet) {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT((aFlagsToSet & kWrapperFlagsMask) == 0, "Bad flag mask");
+    mFlags.Set(mFlags.Get() | aFlagsToSet);
+  }
+
+  void UnsetFlags(FlagsType aFlagsToUnset) {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT((aFlagsToUnset & kWrapperFlagsMask) == 0, "Bad flag mask");
+    mFlags.Set(mFlags.Get() & ~aFlagsToUnset);
+  }
+
+  void PreserveWrapper(nsISupports* aScriptObjectHolder) {
+    if (PreservingWrapper()) {
+      return;
+    }
+
+    nsISupports* ccISupports;
+    aScriptObjectHolder->QueryInterface(NS_GET_IID(nsCycleCollectionISupports),
+                                        reinterpret_cast<void**>(&ccISupports));
+    MOZ_ASSERT(ccISupports);
+
+    nsXPCOMCycleCollectionParticipant* participant;
+    CallQueryInterface(ccISupports, &participant);
+    PreserveWrapper(ccISupports, participant);
+  }
+
+  void PreserveWrapper(void* aScriptObjectHolder,
+                       nsScriptObjectTracer* aTracer) {
+    if (PreservingWrapper()) {
+      return;
+    }
+
+    JSObject* wrapper = GetWrapper();  
+    HoldJSObjects(aScriptObjectHolder, aTracer, JS::GetObjectZone(wrapper));
+    SetPreservingWrapper(true);
+#ifdef DEBUG
+    CheckCCWrapperTraversal(aScriptObjectHolder, aTracer);
+#endif
+  }
+
+  void ReleaseWrapper(void* aScriptObjectHolder);
+
+  void ReleaseWrapperWithoutDrop();
+
+  void TraceWrapper(JSTracer* aTrc, const char* name) {
+    if (mWrapper) {
+      js::UnsafeTraceManuallyBarrieredEdge(aTrc, &mWrapper, name);
+    }
+  }
+
+ protected:
+  void PoisonWrapper() {
+    if (mWrapper) {
+      mWrapper = reinterpret_cast<JSObject*>(1);
+    }
+  }
+
+ private:
+  void SetWrapperJSObject(JSObject* aWrapper);
+
+  void ReleaseWrapperAndMaybeDropHolder(void* aScriptObjectHolderToDrop);
+
+  FlagsType GetWrapperFlags() const { return mFlags.Get() & kWrapperFlagsMask; }
+
+  bool HasWrapperFlag(FlagsType aFlag) const {
+    MOZ_ASSERT((aFlag & ~kWrapperFlagsMask) == 0, "Bad wrapper flag bits");
+    return !!(mFlags.Get() & aFlag);
+  }
+
+  void SetWrapperFlags(FlagsType aFlagsToSet) {
+    MOZ_ASSERT((aFlagsToSet & ~kWrapperFlagsMask) == 0,
+               "Bad wrapper flag bits");
+    mFlags.Set(mFlags.Get() | aFlagsToSet);
+  }
+
+  void UnsetWrapperFlags(FlagsType aFlagsToUnset) {
+    MOZ_ASSERT((aFlagsToUnset & ~kWrapperFlagsMask) == 0,
+               "Bad wrapper flag bits");
+    mFlags.Set(mFlags.Get() & ~aFlagsToUnset);
+  }
+
+  void HoldJSObjects(void* aScriptObjectHolder, nsScriptObjectTracer* aTracer,
+                     JS::Zone* aZone);
+
+#ifdef DEBUG
+ public:
+  void CheckCCWrapperTraversal(void* aScriptObjectHolder,
+                               nsScriptObjectTracer* aTracer);
+#endif  // DEBUG
+
+ private:
+  friend class mozilla::dom::binding_detail::CastableToWrapperCacheHelper;
+
+  enum { WRAPPER_BIT_PRESERVED = 1 << 0 };
+
+  enum { kWrapperFlagsMask = WRAPPER_BIT_PRESERVED };
+
+  JSObject* mWrapper = nullptr;
+
+  mozilla::RustCell<FlagsType> mFlags{0};
+
+ protected:
+#ifdef BOOL_FLAGS_ON_WRAPPER_CACHE
+  uint32_t mBoolFlags = 0;
+#endif
+};
+
+enum { WRAPPER_CACHE_FLAGS_BITS_USED = 1 };
+
+#define NS_WRAPPERCACHE_INTERFACE_TABLE_ENTRY           \
+  if (aIID.Equals(NS_GET_IID(nsWrapperCache))) {        \
+    *aInstancePtr = static_cast<nsWrapperCache*>(this); \
+    return NS_OK;                                       \
+  }
+
+#define NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY \
+  NS_WRAPPERCACHE_INTERFACE_TABLE_ENTRY     \
+  else
+
+
+#define NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS_AMBIGUOUS(_class, _base)   \
+  class NS_CYCLE_COLLECTION_INNERCLASS                                         \
+      : public nsXPCOMCycleCollectionParticipant {                             \
+   public:                                                                     \
+    constexpr explicit NS_CYCLE_COLLECTION_INNERCLASS(Flags aFlags = 0)        \
+        : nsXPCOMCycleCollectionParticipant(aFlags |                           \
+                                            FlagMaybeSingleZoneJSHolder) {}    \
+                                                                               \
+   private:                                                                    \
+    NS_DECL_CYCLE_COLLECTION_CLASS_BODY(_class, _base)                         \
+    NS_IMETHOD_(void)                                                          \
+    Trace(void* p, const TraceCallbacks& cb, void* closure) override;          \
+    NS_IMETHOD_(void)                                                          \
+    TraceWrapper(void* aPtr, const TraceCallbacks& aCb, void* aClosure) final; \
+    NS_IMPL_GET_XPCOM_CYCLE_COLLECTION_PARTICIPANT(_class)                     \
+  };                                                                           \
+  NS_CHECK_FOR_RIGHT_PARTICIPANT_IMPL(_class)                                  \
+  static NS_CYCLE_COLLECTION_INNERCLASS NS_CYCLE_COLLECTION_INNERNAME;         \
+  NOT_INHERITED_CANT_OVERRIDE
+
+#define NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(_class) \
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS_AMBIGUOUS(_class, _class)
+
+#define NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS_INHERITED(_class,          \
+                                                              _base_class)     \
+  class NS_CYCLE_COLLECTION_INNERCLASS                                         \
+      : public NS_CYCLE_COLLECTION_CLASSNAME(_base_class) {                    \
+   public:                                                                     \
+    constexpr explicit NS_CYCLE_COLLECTION_INNERCLASS(Flags aFlags)            \
+        : NS_CYCLE_COLLECTION_CLASSNAME(_base_class)(                          \
+              aFlags | FlagMaybeSingleZoneJSHolder) {}                         \
+                                                                               \
+   private:                                                                    \
+    NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_BODY(_class, _base_class)         \
+    NS_IMETHOD_(void)                                                          \
+    Trace(void* p, const TraceCallbacks& cb, void* closure) override;          \
+    NS_IMETHOD_(void)                                                          \
+    TraceWrapper(void* aPtr, const TraceCallbacks& aCb, void* aClosure) final; \
+    NS_IMPL_GET_XPCOM_CYCLE_COLLECTION_PARTICIPANT(_class)                     \
+  };                                                                           \
+  NS_CHECK_FOR_RIGHT_PARTICIPANT_IMPL_INHERITED(_class)                        \
+  static NS_CYCLE_COLLECTION_INNERCLASS NS_CYCLE_COLLECTION_INNERNAME;
+
+#define NS_DECL_CYCLE_COLLECTION_SKIPPABLE_WRAPPERCACHE_CLASS_AMBIGUOUS(       \
+    _class, _base)                                                             \
+  class NS_CYCLE_COLLECTION_INNERCLASS                                         \
+      : public nsXPCOMCycleCollectionParticipant {                             \
+   public:                                                                     \
+    constexpr explicit NS_CYCLE_COLLECTION_INNERCLASS(Flags aFlags)            \
+        : nsXPCOMCycleCollectionParticipant(aFlags | FlagMightSkip |           \
+                                            FlagMaybeSingleZoneJSHolder) {}    \
+                                                                               \
+   private:                                                                    \
+    NS_DECL_CYCLE_COLLECTION_CLASS_BODY(_class, _base)                         \
+    NS_IMETHOD_(void)                                                          \
+    Trace(void* p, const TraceCallbacks& cb, void* closure) override;          \
+    NS_IMETHOD_(void)                                                          \
+    TraceWrapper(void* aPtr, const TraceCallbacks& aCb, void* aClosure) final; \
+    NS_IMETHOD_(bool) CanSkipReal(void* p, bool aRemovingAllowed) override;    \
+    NS_IMETHOD_(bool) CanSkipInCCReal(void* p) override;                       \
+    NS_IMETHOD_(bool) CanSkipThisReal(void* p) override;                       \
+    NS_IMPL_GET_XPCOM_CYCLE_COLLECTION_PARTICIPANT(_class)                     \
+  };                                                                           \
+  NS_CHECK_FOR_RIGHT_PARTICIPANT_IMPL(_class)                                  \
+  static NS_CYCLE_COLLECTION_INNERCLASS NS_CYCLE_COLLECTION_INNERNAME;         \
+  NOT_INHERITED_CANT_OVERRIDE
+
+#define NS_DECL_CYCLE_COLLECTION_SKIPPABLE_WRAPPERCACHE_CLASS(_class)     \
+  NS_DECL_CYCLE_COLLECTION_SKIPPABLE_WRAPPERCACHE_CLASS_AMBIGUOUS(_class, \
+                                                                  _class)
+
+#define NS_DECL_CYCLE_COLLECTION_SKIPPABLE_WRAPPERCACHE_CLASS_INHERITED(       \
+    _class, _base_class)                                                       \
+  class NS_CYCLE_COLLECTION_INNERCLASS                                         \
+      : public NS_CYCLE_COLLECTION_CLASSNAME(_base_class) {                    \
+   public:                                                                     \
+    constexpr explicit NS_CYCLE_COLLECTION_INNERCLASS(Flags aFlags = 0)        \
+        : NS_CYCLE_COLLECTION_CLASSNAME(_base_class)(                          \
+              aFlags | FlagMightSkip | FlagMaybeSingleZoneJSHolder) {}         \
+                                                                               \
+   private:                                                                    \
+    NS_DECL_CYCLE_COLLECTION_CLASS_BODY(_class, _base_class)                   \
+    NS_IMETHOD_(void)                                                          \
+    Trace(void* p, const TraceCallbacks& cb, void* closure) override;          \
+    NS_IMETHOD_(void)                                                          \
+    TraceWrapper(void* aPtr, const TraceCallbacks& aCb, void* aClosure) final; \
+    NS_IMETHOD_(bool) CanSkipReal(void* p, bool aRemovingAllowed) override;    \
+    NS_IMETHOD_(bool) CanSkipInCCReal(void* p) override;                       \
+    NS_IMETHOD_(bool) CanSkipThisReal(void* p) override;                       \
+    NS_IMPL_GET_XPCOM_CYCLE_COLLECTION_PARTICIPANT(_class)                     \
+  };                                                                           \
+  NS_CHECK_FOR_RIGHT_PARTICIPANT_IMPL_INHERITED(_class)                        \
+  static NS_CYCLE_COLLECTION_INNERCLASS NS_CYCLE_COLLECTION_INNERNAME;
+
+#define NS_DECL_CYCLE_COLLECTION_NATIVE_WRAPPERCACHE_CLASS(_class)             \
+  void DeleteCycleCollectable(void) { delete this; }                           \
+  class NS_CYCLE_COLLECTION_INNERCLASS : public nsScriptObjectTracer {         \
+   public:                                                                     \
+    constexpr explicit NS_CYCLE_COLLECTION_INNERCLASS(Flags aFlags = 0)        \
+        : nsScriptObjectTracer(aFlags | FlagMaybeSingleZoneJSHolder) {}        \
+                                                                               \
+   private:                                                                    \
+    NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS_BODY(_class)                         \
+    NS_IMETHOD_(void)                                                          \
+    Trace(void* p, const TraceCallbacks& cb, void* closure) override;          \
+    NS_IMETHOD_(void)                                                          \
+    TraceWrapper(void* aPtr, const TraceCallbacks& aCb, void* aClosure) final; \
+    static constexpr nsScriptObjectTracer* GetParticipant() {                  \
+      return &_class::NS_CYCLE_COLLECTION_INNERNAME;                           \
+    }                                                                          \
+  };                                                                           \
+  static NS_CYCLE_COLLECTION_INNERCLASS NS_CYCLE_COLLECTION_INNERNAME;
+
+#define NS_IMPL_CYCLE_COLLECTION_TRACE_PRESERVED_WRAPPER \
+  tmp->TraceWrapper(aCallbacks, aClosure);
+
+#define NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER \
+  tmp->ReleaseWrapper(p);
+
+#define NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(_class)        \
+  static_assert(std::is_base_of_v<nsWrapperCache, _class>,         \
+                "Class should inherit nsWrapperCache");            \
+  NS_IMPL_CYCLE_COLLECTION_SINGLE_ZONE_SCRIPT_HOLDER_CLASS(_class) \
+  NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN(_class)                     \
+    TraceWrapper(p, aCallbacks, aClosure);                         \
+  NS_IMPL_CYCLE_COLLECTION_TRACE_END                               \
+  void NS_CYCLE_COLLECTION_CLASSNAME(_class)::TraceWrapper(        \
+      void* p, const TraceCallbacks& aCallbacks, void* aClosure) { \
+    _class* tmp = DowncastCCParticipant<_class>(p);                \
+    NS_IMPL_CYCLE_COLLECTION_TRACE_PRESERVED_WRAPPER               \
+  }
+
+#define NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_0(_class) \
+  NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(_class)   \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(_class)         \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER   \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_END                   \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(_class)       \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+#define NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(_class, ...) \
+  NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(_class)      \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(_class)            \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(__VA_ARGS__)           \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER      \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_END                      \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(_class)          \
+    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(__VA_ARGS__)         \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+#define NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_WEAK(_class, ...) \
+  NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(_class)           \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(_class)                 \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(__VA_ARGS__)                \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER           \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_REFERENCE              \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_END                           \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(_class)               \
+    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(__VA_ARGS__)              \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+#define NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_WEAK_PTR(_class, ...) \
+  NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(_class)               \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(_class)                     \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(__VA_ARGS__)                    \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER               \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_PTR                        \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_END                               \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(_class)                   \
+    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(__VA_ARGS__)                  \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+#define NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_INHERITED(_class, _base, ...)   \
+  static_assert(!std::is_base_of_v<nsWrapperCache, _base>,                    \
+                "Base class should not inherit nsWrapperCache");              \
+  NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(_class)                         \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(_class, _base)              \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(__VA_ARGS__)                              \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER                         \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_END                                         \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(_class, _base)            \
+         \
+                                        \
+    MOZ_ASSERT(!_base::NS_CYCLE_COLLECTION_INNERNAME.IsSingleZoneJSHolder()); \
+    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(__VA_ARGS__)                            \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+#define NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_WITH_JS_MEMBERS(              \
+    class_, native_members_, js_members_)                                   \
+  static_assert(std::is_base_of_v<nsWrapperCache, class_>,                  \
+                "Class should inherit nsWrapperCache");                     \
+  NS_IMPL_CYCLE_COLLECTION_CLASS(class_)                                    \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(class_)                             \
+    using ::ImplCycleCollectionUnlink;                                      \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(                                        \
+        MOZ_FOR_EACH_EXPAND_HELPER native_members_)                         \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(MOZ_FOR_EACH_EXPAND_HELPER js_members_) \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER                       \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_END                                       \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(class_)                           \
+    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(                                      \
+        MOZ_FOR_EACH_EXPAND_HELPER native_members_)                         \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END                                     \
+  NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN(class_)                              \
+    NS_IMPL_CYCLE_COLLECTION_TRACE_JS_MEMBERS(                              \
+        MOZ_FOR_EACH_EXPAND_HELPER js_members_)                             \
+    NS_IMPL_CYCLE_COLLECTION_TRACE_PRESERVED_WRAPPER                        \
+  NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+#endif /* nsWrapperCache_h_ */

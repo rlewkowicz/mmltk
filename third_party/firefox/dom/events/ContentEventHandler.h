@@ -1,0 +1,407 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ContentEventHandler_h_
+#define mozilla_ContentEventHandler_h_
+
+#include "js/GCAPI.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/RangeBoundary.h"
+#include "mozilla/dom/Selection.h"
+#include "mozilla/dom/Text.h"
+#include "nsCOMPtr.h"
+#include "nsIFrame.h"
+#include "nsINode.h"
+
+class nsPresContext;
+class nsRange;
+
+struct nsRect;
+
+namespace mozilla {
+
+namespace dom {
+class Element;
+}  
+
+
+class MOZ_STACK_CLASS ContentEventHandler {
+ private:
+  template <typename NodeType, typename RangeBoundaryType>
+  class MOZ_STACK_CLASS SimpleRangeBase final {
+   public:
+    SimpleRangeBase();
+    SimpleRangeBase(SimpleRangeBase<NodeType, RangeBoundaryType>&&) noexcept;
+    template <typename OtherNodeType, typename OtherRangeBoundaryType>
+    explicit SimpleRangeBase(
+        const SimpleRangeBase<OtherNodeType, OtherRangeBoundaryType>& aOther);
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+    ~SimpleRangeBase();
+#endif
+
+    void Clear() {
+      mRoot = nullptr;
+      mStart = RangeBoundaryType{};
+      mEnd = RangeBoundaryType{};
+    }
+
+    bool IsPositioned() const { return mStart.IsSet() && mEnd.IsSet(); }
+    bool Collapsed() const { return mStart == mEnd && IsPositioned(); }
+    nsINode* GetStartContainer() const { return mStart.GetContainer(); }
+    nsINode* GetEndContainer() const { return mEnd.GetContainer(); }
+    uint32_t StartOffset() const {
+      return *mStart.Offset(
+          RangeBoundaryType::OffsetFilter::kValidOrInvalidOffsets);
+    }
+    uint32_t EndOffset() const {
+      return *mEnd.Offset(
+          RangeBoundaryType::OffsetFilter::kValidOrInvalidOffsets);
+    }
+    nsIContent* StartRef() const { return mStart.Ref(); }
+    nsIContent* EndRef() const { return mEnd.Ref(); }
+
+    const RangeBoundaryType& Start() const { return mStart; }
+    const RangeBoundaryType& End() const { return mEnd; }
+
+    nsINode* GetRoot() const { return mRoot; }
+
+    nsresult CollapseTo(const RawRangeBoundary& aBoundary) {
+      return SetStartAndEnd(aBoundary, aBoundary);
+    }
+    nsresult SetStart(const RawRangeBoundary& aStart);
+    nsresult SetEnd(const RawRangeBoundary& aEnd);
+
+    nsresult SetStart(nsINode* aStartContainer, uint32_t aStartOffset) {
+      return SetStart(RawRangeBoundary(aStartContainer, aStartOffset));
+    }
+    nsresult SetEnd(nsINode* aEndContainer, uint32_t aEndOffset) {
+      return SetEnd(RawRangeBoundary(aEndContainer, aEndOffset));
+    }
+
+    nsresult SetEndAfter(nsIContent* aEndContainer);
+    void SetStartAndEnd(const nsRange* aRange);
+    nsresult SetStartAndEnd(const RawRangeBoundary& aStart,
+                            const RawRangeBoundary& aEnd);
+
+    nsresult SelectNodeContents(const nsINode* aNodeToSelectContents);
+
+   private:
+    inline void AssertStartIsBeforeOrEqualToEnd();
+
+    NodeType mRoot;
+
+    RangeBoundaryType mStart;
+    RangeBoundaryType mEnd;
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+    nsMutationGuard mMutationGuard;
+    Maybe<JS::AutoAssertNoGC> mAssertNoGC;
+#endif
+  };
+
+  using SimpleRange = SimpleRangeBase<RefPtr<nsINode>, RangeBoundary>;
+  using UnsafeSimpleRange = SimpleRangeBase<nsINode*, RawRangeBoundary>;
+
+ public:
+  using Element = dom::Element;
+  using Selection = dom::Selection;
+
+  explicit ContentEventHandler(nsPresContext* aPresContext);
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  HandleQueryContentEvent(WidgetQueryContentEvent* aEvent);
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  OnQuerySelectedText(WidgetQueryContentEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult
+  OnQueryTextContent(WidgetQueryContentEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult OnQueryCaretRect(WidgetQueryContentEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult OnQueryTextRect(WidgetQueryContentEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult
+  OnQueryTextRectArray(WidgetQueryContentEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult
+  OnQueryEditorRect(WidgetQueryContentEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult
+  OnQueryContentState(WidgetQueryContentEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult
+  OnQuerySelectionAsTransferable(WidgetQueryContentEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult
+  OnQueryCharacterAtPoint(WidgetQueryContentEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult
+  OnQueryDOMWidgetHittest(WidgetQueryContentEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult
+  OnQueryDropTargetHittest(WidgetQueryContentEvent* aEvent);
+
+  MOZ_CAN_RUN_SCRIPT nsresult OnSelectionEvent(WidgetSelectionEvent* aEvent);
+
+ protected:
+  RefPtr<dom::Document> mDocument;
+  RefPtr<Selection> mSelection;
+  SimpleRange mFirstSelectedSimpleRange;
+  RefPtr<Element> mRootElement;
+
+  dom::EditContext* GetEditContext() const {
+    MOZ_ASSERT(mRootElement);
+    if (MOZ_LIKELY(!mRootElement->HasFlag(ELEMENT_HAS_EDIT_CONTEXT))) {
+      return nullptr;
+    }
+    auto* htmlElement = nsGenericHTMLElement::FromNode(mRootElement);
+    MOZ_ASSERT(htmlElement);
+    dom::EditContext* editContext = htmlElement->GetEditContext();
+    MOZ_ASSERT(editContext);
+    return editContext;
+  }
+
+  MOZ_CAN_RUN_SCRIPT nsresult Init(WidgetQueryContentEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult Init(WidgetSelectionEvent* aEvent);
+
+  nsresult InitBasic(bool aRequireFlush = true);
+  MOZ_CAN_RUN_SCRIPT nsresult
+  InitCommon(EventMessage aEventMessage,
+             SelectionType aSelectionType = SelectionType::eNormal,
+             bool aRequireFlush = true);
+  MOZ_CAN_RUN_SCRIPT Result<nsRange*, nsresult> InitRootContent(
+      const Selection& aNormalSelection);
+
+ public:
+
+  struct MOZ_STACK_CLASS RawNodePosition : public RawRangeBoundary {
+    bool mAfterOpenTag = true;
+
+    RawNodePosition() = default;
+    MOZ_IMPLICIT RawNodePosition(const RawNodePosition& aOther)
+        : RawRangeBoundary(aOther),
+          mAfterOpenTag(aOther.mAfterOpenTag)
+    {}
+
+    static RawNodePosition BeforeFirstContentOf(const nsINode& aContainer) {
+      return RawNodePosition(const_cast<nsINode*>(&aContainer), 0u);
+    }
+
+    static RawNodePosition After(const nsIContent& aContent) {
+      RawNodePosition it(aContent.GetParentNode(),
+                         const_cast<nsIContent*>(&aContent));
+      it.mAfterOpenTag = false;
+      return it;
+    }
+
+    static RawNodePosition AtEndOf(const nsINode& aContainer) {
+      return RawNodePosition(const_cast<nsINode*>(&aContainer),
+                             aContainer.IsText()
+                                 ? aContainer.AsText()->TextDataLength()
+                                 : aContainer.GetChildCount());
+    }
+
+    static RawNodePosition Before(const nsIContent& aContent) {
+      return RawNodePosition(aContent.GetParentNode(),
+                             aContent.GetPreviousSibling());
+    }
+
+    RawNodePosition(nsINode* aContainer, uint32_t aOffset)
+        : RawRangeBoundary(aContainer, aOffset) {}
+
+    RawNodePosition(nsINode* aContainer, nsIContent* aRef)
+        : RawRangeBoundary(aContainer, aRef) {}
+
+    explicit RawNodePosition(const nsIFrame::ContentOffsets& aContentOffsets)
+        : RawRangeBoundary(aContentOffsets.content, aContentOffsets.offset) {}
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+    ~RawNodePosition() { MOZ_DIAGNOSTIC_ASSERT(!mMutationGuard.Mutated(0)); }
+#endif  // #ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+
+   public:
+    const RawNodePosition& operator=(const RawNodePosition& aOther) {
+      if (this != &aOther) {
+        RawRangeBoundary::operator=(aOther);
+        mAfterOpenTag = aOther.mAfterOpenTag;
+      }
+      return *this;
+    }
+
+    bool operator==(const RawNodePosition& aOther) const {
+      return RawRangeBoundary::operator==(aOther) &&
+             mAfterOpenTag == aOther.mAfterOpenTag;
+    }
+
+    bool IsBeforeOpenTag() const {
+      return IsSet() && GetContainer()->IsElement() && !Ref() && !mAfterOpenTag;
+    }
+    bool IsImmediatelyAfterOpenTag() const {
+      return IsSet() && GetContainer()->IsElement() && !Ref() && mAfterOpenTag;
+    }
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+   private:
+    nsMutationGuard mMutationGuard;
+    JS::AutoAssertNoGC mAssertNoGC;
+#endif  // #ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  };
+
+  static Result<uint32_t, nsresult> GetFlatTextLengthInRange(
+      const RawNodePosition& aStartPosition,
+      const RawNodePosition& aEndPosition, const Element* aRootElement);
+
+  static uint32_t GetNativeTextLength(const dom::Text& aTextNode,
+                                      uint32_t aStartOffset,
+                                      uint32_t aEndOffset);
+  static uint32_t GetNativeTextLength(const dom::Text& aTextNode,
+                                      uint32_t aMaxLength = UINT32_MAX);
+
+  static uint32_t GetNativeTextLength(const nsAString& aText);
+
+  MOZ_CAN_RUN_SCRIPT
+  already_AddRefed<nsRange> GetRangeFromFlatTextOffset(
+      WidgetContentCommandEvent* aEvent, uint32_t aOffset, uint32_t aLength);
+
+  nsresult GenerateFlatTextContent(const nsRange* aRange, nsString& aString);
+
+ protected:
+  static uint32_t GetTextLength(const dom::Text& aTextNode,
+                                uint32_t aMaxLength = UINT32_MAX);
+  static uint32_t GetTextLengthInRange(const dom::Text& aTextNode,
+                                       uint32_t aXPStartOffset,
+                                       uint32_t aXPEndOffset);
+  nsresult GenerateFlatTextContent(const Element* aElement, nsString& aString);
+  template <typename NodeType, typename RangeBoundaryType>
+  nsresult GenerateFlatTextContent(
+      const SimpleRangeBase<NodeType, RangeBoundaryType>& aSimpleRange,
+      nsString& aString);
+  template <typename SimpleRangeType>
+  Result<uint32_t, nsresult> GetStartOffset(
+      const SimpleRangeType& aSimpleRange) const;
+  static bool ShouldBreakLineBefore(const nsIContent& aContent,
+                                    const Element* aRootElement);
+  constexpr static uint32_t kBRLength = 1;
+  nsIContent* GetFocusedContent();
+  nsresult QueryContentRect(nsIContent* aContent,
+                            WidgetQueryContentEvent* aEvent);
+
+  template <typename RangeType, typename TextNodeType>
+  struct MOZ_STACK_CLASS DOMRangeAndAdjustedOffsetInFlattenedTextBase {
+    bool RangeStartsFromLastTextNode() const {
+      return mLastTextNode && mRange.GetStartContainer() == mLastTextNode;
+    }
+    bool RangeStartsFromEndOfContainer() const {
+      return mRange.GetStartContainer() &&
+             mRange.GetStartContainer()->Length() == mRange.StartOffset();
+    }
+    bool RangeStartsFromContent() const {
+      return mRange.GetStartContainer() &&
+             mRange.GetStartContainer()->IsContent();
+    }
+
+    RangeType mRange;
+    uint32_t mAdjustedOffset = 0;
+    TextNodeType mLastTextNode = nullptr;
+  };
+  using DOMRangeAndAdjustedOffsetInFlattenedText =
+      DOMRangeAndAdjustedOffsetInFlattenedTextBase<SimpleRange,
+                                                   RefPtr<dom::Text>>;
+  using UnsafeDOMRangeAndAdjustedOffsetInFlattenedText =
+      DOMRangeAndAdjustedOffsetInFlattenedTextBase<UnsafeSimpleRange,
+                                                   dom::Text*>;
+
+  template <typename RangeType, typename TextNodeType>
+  Result<DOMRangeAndAdjustedOffsetInFlattenedTextBase<RangeType, TextNodeType>,
+         nsresult>
+  ConvertFlatTextOffsetToDOMRangeBase(uint32_t aOffset, uint32_t aLength,
+                                      bool aExpandToClusterBoundaries);
+  MOZ_ALWAYS_INLINE Result<DOMRangeAndAdjustedOffsetInFlattenedText, nsresult>
+  ConvertFlatTextOffsetToDOMRange(uint32_t aOffset, uint32_t aLength,
+                                  bool aExpandToClusterBoundaries) {
+    return ConvertFlatTextOffsetToDOMRangeBase<SimpleRange, RefPtr<dom::Text>>(
+        aOffset, aLength, aExpandToClusterBoundaries);
+  }
+  MOZ_ALWAYS_INLINE
+  Result<UnsafeDOMRangeAndAdjustedOffsetInFlattenedText, nsresult>
+  ConvertFlatTextOffsetToUnsafeDOMRange(uint32_t aOffset, uint32_t aLength,
+                                        bool aExpandToClusterBoundaries) {
+    return ConvertFlatTextOffsetToDOMRangeBase<UnsafeSimpleRange, dom::Text*>(
+        aOffset, aLength, aExpandToClusterBoundaries);
+  }
+
+  nsresult AdjustCollapsedRangeMaybeIntoTextNode(SimpleRange& aSimpleRange);
+  nsresult ConvertToRootRelativeOffset(nsIFrame* aFrame, nsRect& aRect);
+  nsresult ExpandToClusterBoundary(dom::Text& aTextNode, bool aForward,
+                                   uint32_t* aXPOffset) const;
+
+  using FontRangeArray = nsTArray<mozilla::FontRange>;
+  static void AppendFontRanges(FontRangeArray& aFontRanges,
+                               const dom::Text& aTextNode, uint32_t aBaseOffset,
+                               uint32_t aXPStartOffset, uint32_t aXPEndOffset);
+  nsresult GenerateFlatFontRanges(const UnsafeSimpleRange& aSimpleRange,
+                                  FontRangeArray& aFontRanges,
+                                  uint32_t& aLength);
+  nsresult QueryTextRectByRange(const SimpleRange& aSimpleRange,
+                                LayoutDeviceIntRect& aRect,
+                                WritingMode& aWritingMode);
+
+  struct MOZ_STACK_CLASS FrameAndNodeOffset final {
+    nsIFrame* mFrame;
+    int32_t mOffsetInNode;
+
+    FrameAndNodeOffset() : mFrame(nullptr), mOffsetInNode(-1) {}
+
+    FrameAndNodeOffset(nsIFrame* aFrame, int32_t aStartOffsetInNode)
+        : mFrame(aFrame), mOffsetInNode(aStartOffsetInNode) {}
+
+    nsIFrame* operator->() { return mFrame; }
+    const nsIFrame* operator->() const { return mFrame; }
+    operator nsIFrame*() { return mFrame; }
+    operator const nsIFrame*() const { return mFrame; }
+    bool IsValid() const { return mFrame && mOffsetInNode >= 0; }
+  };
+  template <typename NodeType, typename RangeBoundaryType>
+  FrameAndNodeOffset GetFirstFrameInRangeForTextRect(
+      const SimpleRangeBase<NodeType, RangeBoundaryType>& aSimpleRange);
+
+  template <typename NodeType, typename RangeBoundaryType>
+  FrameAndNodeOffset GetLastFrameInRangeForTextRect(
+      const SimpleRangeBase<NodeType, RangeBoundaryType>& aSimpleRange);
+
+  struct MOZ_STACK_CLASS FrameRelativeRect final {
+    nsRect mRect;
+    nsIFrame* mBaseFrame;
+
+    FrameRelativeRect() : mBaseFrame(nullptr) {}
+
+    explicit FrameRelativeRect(nsIFrame* aBaseFrame) : mBaseFrame(aBaseFrame) {}
+
+    FrameRelativeRect(const nsRect& aRect, nsIFrame* aBaseFrame)
+        : mRect(aRect), mBaseFrame(aBaseFrame) {}
+
+    bool IsValid() const { return mBaseFrame != nullptr; }
+
+    nsRect RectRelativeTo(nsIFrame* aBaseFrame) const;
+  };
+
+  FrameRelativeRect GetLineBreakerRectBefore(nsIFrame* aFrame);
+
+  FrameRelativeRect GuessLineBreakerRectAfter(const dom::Text& aTextNode);
+
+  FrameRelativeRect GuessFirstCaretRectIn(nsIFrame* aFrame);
+
+  void EnsureNonEmptyRect(nsRect& aRect) const;
+  void EnsureNonEmptyRect(LayoutDeviceIntRect& aRect) const;
+
+  static LayoutDeviceIntRect GetCaretRectBefore(
+      const LayoutDeviceIntRect& aCharRect, const WritingMode& aWritingMode);
+  static LayoutDeviceIntRect GetCaretRectAfter(
+      const LayoutDeviceIntRect& aCharRect, const WritingMode& aWritingMode);
+  static nsRect GetCaretRectBefore(const nsRect& aCharRect,
+                                   const WritingMode& aWritingMode);
+  static nsRect GetCaretRectAfter(nsPresContext& aPresContext,
+                                  const nsRect& aCharRect,
+                                  const WritingMode& aWritingMode);
+
+  nsresult QueryHittestImpl(WidgetQueryContentEvent* aEvent, bool aFlushLayout,
+                            bool aPerformRetargeting,
+                            Element** aContentUnderMouse);
+};
+
+}  
+
+#endif  // mozilla_ContentEventHandler_h_

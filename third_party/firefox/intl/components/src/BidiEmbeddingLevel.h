@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef intl_components_BidiEmbeddingLevel_h_
+#define intl_components_BidiEmbeddingLevel_h_
+
+#include <cstdint>
+
+namespace mozilla::intl {
+
+enum class BidiDirection : uint8_t {
+  LTR = 0,
+  RTL = 1,
+};
+
+class BidiEmbeddingLevel {
+ public:
+  constexpr explicit BidiEmbeddingLevel(uint8_t aValue) : mValue(aValue) {}
+  constexpr explicit BidiEmbeddingLevel(int aValue)
+      : mValue(static_cast<uint8_t>(aValue)) {}
+
+  BidiEmbeddingLevel() = default;
+
+  BidiEmbeddingLevel(const BidiEmbeddingLevel& other) = default;
+  BidiEmbeddingLevel& operator=(const BidiEmbeddingLevel& other) = default;
+
+  BidiDirection Direction();
+
+  static BidiEmbeddingLevel LTR();
+
+  static BidiEmbeddingLevel RTL();
+
+  static BidiEmbeddingLevel DefaultLTR();
+
+  static BidiEmbeddingLevel DefaultRTL();
+
+  bool IsDefaultLTR() const;
+  bool IsDefaultRTL() const;
+  bool IsLTR() const;
+  bool IsRTL() const;
+  bool IsSameDirection(BidiEmbeddingLevel aOther) const;
+
+  uint8_t Value() const;
+
+  operator uint8_t() const { return mValue; }
+
+ private:
+  uint8_t mValue = 0;
+
+  static constexpr uint8_t kDefaultLTR = 0xfe;
+  static constexpr uint8_t kDefaultRTL = 0xff;
+};
+
+}  
+#endif

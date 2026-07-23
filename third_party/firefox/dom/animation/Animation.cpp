@@ -1,0 +1,1831 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Animation.h"
+
+#include "AnimationUtils.h"
+#include "mozAutoDocUpdate.h"
+#include "mozilla/AnimationEventDispatcher.h"
+#include "mozilla/AnimationTarget.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/DeclarationBlock.h"
+#include "mozilla/Likely.h"
+#include "mozilla/Maybe.h"  // For Maybe
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/dom/AnimationBinding.h"
+#include "mozilla/dom/CSSNumericValueBinding.h"
+#include "mozilla/dom/CSSTransition.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/DocumentTimeline.h"
+#include "mozilla/dom/MutationObservers.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/ScrollTimeline.h"  // For PROGRESS_TIMELINE_DURATION_MILLISEC
+#include "nsAnimationManager.h"          // For CSSAnimation
+#include "nsComputedDOMStyle.h"
+#include "nsDOMCSSAttrDeclaration.h"  // For nsDOMCSSAttributeDeclaration
+#include "nsDOMMutationObserver.h"    // For nsAutoAnimationMutationBatch
+#include "nsIFrame.h"
+#include "nsThreadUtils.h"  // For nsRunnableMethod and nsRevocableEventPtr
+#include "nsTransitionManager.h"  // For CSSTransition
+
+namespace mozilla::dom {
+
+uint64_t Animation::sNextAnimationIndex = 0;
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(Animation, DOMEventTargetHelper, mTimeline,
+                                   mEffect, mReady, mFinished)
+
+NS_IMPL_ADDREF_INHERITED(Animation, DOMEventTargetHelper)
+NS_IMPL_RELEASE_INHERITED(Animation, DOMEventTargetHelper)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Animation)
+NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
+
+JSObject* Animation::WrapObject(JSContext* aCx,
+                                JS::Handle<JSObject*> aGivenProto) {
+  return dom::Animation_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+
+namespace {
+class MOZ_RAII AutoMutationBatchForAnimation {
+ public:
+  explicit AutoMutationBatchForAnimation(const Animation& aAnimation) {
+    NonOwningAnimationTarget target = aAnimation.GetTargetForAnimation();
+    if (!target) {
+      return;
+    }
+
+    mAutoBatch.emplace(target.mElement->OwnerDoc());
+  }
+
+ private:
+  Maybe<nsAutoAnimationMutationBatch> mAutoBatch;
+};
+}  
+
+
+Animation::Animation(nsIGlobalObject* aGlobal)
+    : DOMEventTargetHelper(aGlobal),
+      mAnimationIndex(sNextAnimationIndex++),
+      mRTPCallerType(aGlobal->GetRTPCallerType()) {}
+
+Animation::~Animation() = default;
+
+already_AddRefed<Animation> Animation::ClonePausedAnimation(
+    nsIGlobalObject* aGlobal, const Animation& aOther, AnimationEffect& aEffect,
+    AnimationTimeline& aTimeline) {
+  if (aOther.UsingScrollTimeline()) {
+    return nullptr;
+  }
+
+  RefPtr<Animation> animation = new Animation(aGlobal);
+
+  animation->mTimeline = &aTimeline;
+
+  animation->mPlaybackRate = aOther.mPlaybackRate;
+
+  const Nullable<TimeDuration> currentTime = aOther.GetCurrentTimeAsDuration();
+  if (!aOther.GetTimeline()) {
+    if (!currentTime.IsNull()) {
+      animation->SilentlySetCurrentTime(currentTime.Value());
+    }
+    animation->mPreviousCurrentTime = animation->GetCurrentTimeAsDuration();
+  } else {
+    animation->mHoldTime = currentTime;
+    if (!currentTime.IsNull()) {
+      const Nullable<TimeDuration> timelineTime =
+          aTimeline.GetCurrentTimeAsDuration();
+      MOZ_ASSERT(!timelineTime.IsNull(), "Timeline not yet set");
+      animation->mPreviousCurrentTime = timelineTime;
+    }
+  }
+
+  animation->mEffect = &aEffect;
+  animation->mEffect->SetAnimation(animation);
+
+  animation->mPendingState = PendingState::PausePending;
+
+  animation->mIsRelevant = aOther.mIsRelevant;
+
+  animation->PostUpdate();
+  animation->mTimeline->NotifyAnimationUpdated(*animation);
+  return animation.forget();
+}
+
+NonOwningAnimationTarget Animation::GetTargetForAnimation() const {
+  AnimationEffect* effect = GetEffect();
+  NonOwningAnimationTarget target;
+  if (!effect || !effect->AsKeyframeEffect()) {
+    return target;
+  }
+  return effect->AsKeyframeEffect()->GetAnimationTarget();
+}
+
+already_AddRefed<Animation> Animation::Constructor(
+    const GlobalObject& aGlobal, AnimationEffect* aEffect,
+    const Optional<AnimationTimeline*>& aTimeline, ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+
+  AnimationTimeline* timeline;
+  Document* document =
+      AnimationUtils::GetCurrentRealmDocument(aGlobal.Context());
+
+  if (aTimeline.WasPassed()) {
+    timeline = aTimeline.Value();
+  } else {
+    if (!document) {
+      aRv.Throw(NS_ERROR_FAILURE);
+      return nullptr;
+    }
+    timeline = document->Timeline();
+  }
+
+  RefPtr<Animation> animation = new Animation(global);
+  animation->SetTimelineNoUpdate(timeline, nullptr, FromJS::Yes);
+  animation->SetEffectNoUpdate(aEffect);
+
+  return animation.forget();
+}
+
+void Animation::SetId(const nsAString& aId) {
+  if (mId == aId) {
+    return;
+  }
+  mId = aId;
+  MutationObservers::NotifyAnimationChanged(this);
+}
+
+void Animation::SetEffect(AnimationEffect* aEffect) {
+  SetEffectNoUpdate(aEffect);
+  PostUpdate();
+}
+
+void Animation::SetEffectNoUpdate(AnimationEffect* aEffect) {
+  RefPtr<Animation> kungFuDeathGrip(this);
+
+  if (mEffect == aEffect) {
+    return;
+  }
+
+  AutoMutationBatchForAnimation mb(*this);
+  bool wasRelevant = mIsRelevant;
+
+  if (mEffect) {
+    if (mIsRelevant) {
+      MutationObservers::NotifyAnimationRemoved(this);
+    }
+
+    RefPtr<AnimationEffect> oldEffect = mEffect;
+    mEffect = nullptr;
+    if (IsPartialPrerendered()) {
+      if (KeyframeEffect* oldKeyframeEffect = oldEffect->AsKeyframeEffect()) {
+        oldKeyframeEffect->ResetPartialPrerendered();
+      }
+    }
+    oldEffect->SetAnimation(nullptr);
+
+    UpdateRelevance();
+  }
+
+  if (aEffect) {
+    RefPtr<AnimationEffect> newEffect = aEffect;
+    Animation* prevAnim = aEffect->GetAnimation();
+    if (prevAnim) {
+      prevAnim->SetEffect(nullptr);
+    }
+
+    mEffect = newEffect;
+    mEffect->SetAnimation(this);
+
+    if (wasRelevant && mIsRelevant) {
+      MutationObservers::NotifyAnimationChanged(this);
+    }
+  }
+
+  MaybeScheduleReplacementCheck();
+
+  UpdateTiming(SeekFlag::NoSeek, SyncNotifyFlag::Async);
+}
+
+static TimeStamp EnsurePaintIsScheduled(Document& aDoc) {
+  PresShell* presShell = aDoc.GetPresShell();
+  if (!presShell) {
+    return {};
+  }
+  nsIFrame* rootFrame = presShell->GetRootFrame();
+  if (!rootFrame) {
+    return {};
+  }
+  rootFrame->SchedulePaintWithoutInvalidatingObservers();
+  auto* rd = rootFrame->PresContext()->RefreshDriver();
+  if (!rd->IsInRefresh()) {
+    return {};
+  }
+  return rd->MostRecentRefresh();
+}
+
+void Animation::RemovedNamedTimelineReferenceFromJS(const nsAtom* aName) {
+  if (!AsCSSAnimation()) {
+    MOZ_ASSERT_UNREACHABLE("How?");
+    return;
+  }
+  auto* animationManager = [&]() -> nsAnimationManager* {
+    auto* doc = GetRenderedDocument();
+    if (!doc) {
+      return nullptr;
+    }
+    auto* presContext = doc->GetPresContext();
+    if (!presContext) {
+      return nullptr;
+    }
+    return presContext->AnimationManager();
+  }();
+  if (!animationManager) {
+    return;
+  }
+  animationManager->RemoveNamedTimelineAnimation(aName, AsCSSAnimation());
+}
+
+void Animation::SetTimelineFromJS(AnimationTimeline* aTimeline) {
+  TimelineWillSetFromJS();
+  const auto prevTimelineName = GetTimelineName();
+  SetTimeline(aTimeline, nullptr, FromJS::Yes);
+  if (prevTimelineName) {
+    RemovedNamedTimelineReferenceFromJS(prevTimelineName);
+  }
+}
+
+bool Animation::SetTimeline(AnimationTimeline* aTimeline,
+                            const nsAtom* aTimelineName, FromJS aFromJS) {
+  const auto updated = SetTimelineNoUpdate(aTimeline, aTimelineName, aFromJS);
+  PostUpdate();
+  return updated;
+}
+
+bool Animation::SetTimelineNoUpdate(AnimationTimeline* aTimeline,
+                                    const nsAtom* aTimelineName,
+                                    FromJS aFromJS) {
+  if (aFromJS == FromJS::No && TimelineOverridenByJS()) {
+    return false;
+  }
+  if (mTimeline == aTimeline) {
+    if (mTimelineName != aTimelineName) {
+      mTimelineName = aTimelineName;
+    }
+    return false;
+  }
+
+  const AnimationPlayState previousPlayState = PlayState();
+  const Nullable<TimeDuration> previousCurrentTime = GetCurrentTimeAsDuration();
+
+  Nullable<double> previousProgress;
+  if (!previousCurrentTime.IsNull()) {
+    const TimeDuration endTime = TimeDuration(EffectEnd());
+    previousProgress.SetValue(endTime.IsZero()
+                                  ? 0.0
+                                  : previousCurrentTime.Value().ToSeconds() /
+                                        endTime.ToSeconds());
+  }
+
+  StickyTimeDuration activeTime =
+      mEffect ? mEffect->GetComputedTiming().mActiveTime : StickyTimeDuration();
+
+  const bool fromFiniteTimeline =
+      mTimeline && !mTimeline->IsMonotonicallyIncreasing();
+  const bool toFiniteTimeline =
+      aTimeline && !aTimeline->IsMonotonicallyIncreasing();
+
+  RefPtr<AnimationTimeline> oldTimeline = mTimeline;
+  if (oldTimeline) {
+    oldTimeline->RemoveAnimation(this);
+  }
+  mTimeline = aTimeline;
+  mTimelineName = aTimelineName;
+  if (mEffect) {
+    mEffect->UpdateNormalizedTiming();
+    MaybeUpdateKeyframeComputedOffsets();
+  }
+
+  if (toFiniteTimeline) {
+    ApplyPendingPlaybackRate();
+    mAutoAlignStartTime = true;
+    mStartTime.SetNull();
+    mHoldTime.SetNull();
+
+    switch (previousPlayState) {
+      case AnimationPlayState::Running:
+      case AnimationPlayState::Finished:
+        PlayNoUpdate(IgnoredErrorResult(), LimitBehavior::AutoRewind);
+        break;
+      case AnimationPlayState::Paused:
+        if (!previousCurrentTime.IsNull()) {
+          mHoldTime.SetValue(
+              TimeDuration(EffectEnd().MultDouble(previousProgress.Value())));
+        }
+        break;
+      case AnimationPlayState::Idle:
+        break;
+    }
+  } else if (fromFiniteTimeline) {
+    mAutoAlignStartTime = false;
+    if (!previousProgress.IsNull()) {
+      SetCurrentTimeNoUpdate(
+          TimeDuration(EffectEnd().MultDouble(previousProgress.Value())));
+    }
+  }
+  if (!mStartTime.IsNull()) {
+    mHoldTime.SetNull();
+  }
+
+  if (!aTimeline) {
+    MaybeQueueCancelEvent(activeTime);
+  }
+
+  UpdateTiming(SeekFlag::NoSeek, SyncNotifyFlag::Async);
+
+  return true;
+}
+
+void Animation::SetTimelineRange(AnimationRange&& aRange) {
+  SetTimelineRangeNoUpdate(std::move(aRange));
+  PostUpdate();
+}
+
+void Animation::SetTimelineRangeNoUpdate(AnimationRange&& aRange) {
+  if (mTimelineRange == aRange) {
+    return;
+  }
+
+  mTimelineRange = std::move(aRange);
+
+  if (mEffect) {
+    mEffect->UpdateNormalizedTiming();
+    MaybeUpdateKeyframeComputedOffsets();
+  }
+}
+
+void Animation::SetStartTime(const Nullable<TimeDuration>& aNewStartTime) {
+  if (!Pending() && aNewStartTime == mStartTime) {
+    return;
+  }
+
+  AutoMutationBatchForAnimation mb(*this);
+
+  Nullable<TimeDuration> timelineTime;
+  if (mTimeline) {
+    timelineTime = mTimeline->GetCurrentTimeAsDuration();
+  }
+  if (timelineTime.IsNull() && !aNewStartTime.IsNull()) {
+    mHoldTime.SetNull();
+  }
+
+  Nullable<TimeDuration> previousCurrentTime = GetCurrentTimeAsDuration();
+
+  ApplyPendingPlaybackRate();
+  mStartTime = aNewStartTime;
+
+  mAutoAlignStartTime = false;
+
+  if (!aNewStartTime.IsNull()) {
+    if (PlaybackRateInternal() != 0.0) {
+      mHoldTime.SetNull();
+    }
+  } else {
+    mHoldTime = previousCurrentTime;
+  }
+
+  CancelPendingTasks();
+  MaybeResolvePromiseWithThis(mReady);
+
+  UpdateTiming(SeekFlag::DidSeek, SyncNotifyFlag::Async);
+  if (IsRelevant()) {
+    MutationObservers::NotifyAnimationChanged(this);
+  }
+  PostUpdate();
+}
+
+Nullable<TimeDuration> Animation::GetCurrentTimeForHoldTime(
+    const Nullable<TimeDuration>& aHoldTime) const {
+  Nullable<TimeDuration> result;
+  if (!aHoldTime.IsNull()) {
+    result = aHoldTime;
+    return result;
+  }
+
+  if (mTimeline && !mStartTime.IsNull()) {
+    Nullable<TimeDuration> timelineTime = mTimeline->GetCurrentTimeAsDuration();
+    if (!timelineTime.IsNull()) {
+      result = CurrentTimeFromTimelineTime(
+          timelineTime.Value(), mStartTime.Value(), PlaybackRateInternal());
+    }
+  }
+  return result;
+}
+
+void Animation::SetCurrentTime(const TimeDuration& aSeekTime) {
+  if (mPendingState != PendingState::PausePending &&
+      Nullable<TimeDuration>(aSeekTime) == GetCurrentTimeAsDuration()) {
+    return;
+  }
+
+  AutoMutationBatchForAnimation mb(*this);
+
+  SetCurrentTimeNoUpdate(aSeekTime);
+
+  if (IsRelevant()) {
+    MutationObservers::NotifyAnimationChanged(this);
+  }
+  PostUpdate();
+}
+
+void Animation::SetCurrentTimeNoUpdate(const TimeDuration& aSeekTime) {
+  SilentlySetCurrentTime(aSeekTime);
+
+  if (mPendingState == PendingState::PausePending) {
+    mHoldTime.SetValue(aSeekTime);
+
+    ApplyPendingPlaybackRate();
+    mStartTime.SetNull();
+
+    MaybeResolvePromiseWithThis(mReady);
+    CancelPendingTasks();
+  }
+
+  UpdateTiming(SeekFlag::DidSeek, SyncNotifyFlag::Async);
+}
+
+Nullable<double> Animation::GetOverallProgress() const {
+  Nullable<double> result;
+  if (!mEffect) {
+    return result;
+  }
+  const Nullable<TimeDuration> currentTime = GetCurrentTimeAsDuration();
+  if (currentTime.IsNull()) {
+    return result;
+  }
+
+  const StickyTimeDuration endTime = EffectEnd();
+  if (endTime.IsZero()) {
+    if (currentTime.Value() < TimeDuration()) {
+      result.SetValue(0.0);
+    } else {
+      result.SetValue(1.0);
+    }
+    return result;
+  }
+
+  if (endTime == StickyTimeDuration::Forever()) {
+    result.SetValue(0.0);
+    return result;
+  }
+
+  auto overallProgress =
+      std::min(std::max(currentTime.Value() / endTime, 0.0), 1.0);
+  result.SetValue(overallProgress);
+  return result;
+}
+
+void Animation::SetPlaybackRate(double aPlaybackRate) {
+  mPendingPlaybackRate.reset();
+
+  if (aPlaybackRate == mPlaybackRate) {
+    return;
+  }
+
+  AutoMutationBatchForAnimation mb(*this);
+
+  Nullable<TimeDuration> previousTime = GetCurrentTimeAsDuration();
+  mPlaybackRate = aPlaybackRate;
+  if (!HasFiniteTimeline() && !previousTime.IsNull()) {
+    SetCurrentTime(previousTime.Value());
+  }
+
+  UpdateTiming(SeekFlag::DidSeek, SyncNotifyFlag::Async);
+  if (IsRelevant()) {
+    MutationObservers::NotifyAnimationChanged(this);
+  }
+  PostUpdate();
+}
+
+void Animation::UpdatePlaybackRate(double aPlaybackRate) {
+  if (mPendingPlaybackRate && mPendingPlaybackRate.value() == aPlaybackRate) {
+    return;
+  }
+
+  AnimationPlayState playState = PlayState();
+
+  mPendingPlaybackRate = Some(aPlaybackRate);
+
+  if (Pending()) {
+    UpdateEffect(PostRestyleMode::Never);
+    return;
+  }
+
+  AutoMutationBatchForAnimation mb(*this);
+
+  if (playState == AnimationPlayState::Idle ||
+      playState == AnimationPlayState::Paused ||
+      GetCurrentTimeAsDuration().IsNull()) {
+    ApplyPendingPlaybackRate();
+
+    UpdateEffect(PostRestyleMode::Never);
+    if (IsRelevant()) {
+      MutationObservers::NotifyAnimationChanged(this);
+    }
+  } else if (playState == AnimationPlayState::Finished) {
+    MOZ_ASSERT(mTimeline && !mTimeline->GetCurrentTimeAsDuration().IsNull(),
+               "If we have no active timeline, we should be idle or paused");
+    if (aPlaybackRate != 0) {
+      MOZ_ASSERT(!GetUnconstrainedCurrentTime().IsNull(),
+                 "Unconstrained current time should be resolved");
+      TimeDuration unconstrainedCurrentTime =
+          GetUnconstrainedCurrentTime().Value();
+      TimeDuration timelineTime = mTimeline->GetCurrentTimeAsDuration().Value();
+      mStartTime = StartTimeFromTimelineTime(
+          timelineTime, unconstrainedCurrentTime, aPlaybackRate);
+    } else {
+      mStartTime = mTimeline->GetCurrentTimeAsDuration();
+    }
+
+    ApplyPendingPlaybackRate();
+
+    UpdateTiming(SeekFlag::NoSeek, SyncNotifyFlag::Async);
+    if (IsRelevant()) {
+      MutationObservers::NotifyAnimationChanged(this);
+    }
+    PostUpdate();
+  } else {
+    ErrorResult rv;
+    Play(rv, LimitBehavior::Continue);
+    MOZ_ASSERT(!rv.Failed(),
+               "We should only fail to play when using auto-rewind behavior");
+  }
+}
+
+AnimationPlayState Animation::PlayState() const {
+  Nullable<TimeDuration> currentTime = GetCurrentTimeAsDuration();
+  if (currentTime.IsNull() && mStartTime.IsNull() && !Pending()) {
+    return AnimationPlayState::Idle;
+  }
+
+  if (mPendingState == PendingState::PausePending ||
+      (mStartTime.IsNull() && !Pending())) {
+    return AnimationPlayState::Paused;
+  }
+
+  double playbackRate = CurrentOrPendingPlaybackRate();
+  if (!currentTime.IsNull() &&
+      ((playbackRate > 0.0 && currentTime.Value() >= EffectEnd()) ||
+       (playbackRate < 0.0 && currentTime.Value() <= TimeDuration()))) {
+    return AnimationPlayState::Finished;
+  }
+
+  return AnimationPlayState::Running;
+}
+
+Promise* Animation::GetReady(ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = GetRelevantGlobal();
+  if (!mReady && global) {
+    mReady = Promise::Create(global, aRv);  
+  }
+  if (!mReady) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+  if (!Pending()) {
+    MaybeResolvePromiseWithThis(mReady);
+  }
+  return mReady;
+}
+
+void Animation::MaybeResolvePromiseWithThis(Promise* aPromise) {
+  if (!aPromise) {
+    return;
+  }
+  if (!nsContentUtils::IsSafeToRunScript()) [[unlikely]] {
+    nsContentUtils::AddScriptRunner(NewRunnableMethod<RefPtr<Promise>>(
+        "MaybeResolvePromiseWithThis", this,
+        &Animation::MaybeResolvePromiseWithThis, aPromise));
+    return;
+  }
+  RefPtr promise = aPromise;
+  promise->MaybeResolve(this);
+}
+
+Promise* Animation::GetFinished(ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = GetRelevantGlobal();
+  if (!mFinished && global) {
+    mFinished = Promise::Create(global, aRv);  
+  }
+  if (!mFinished) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+  if (mFinishedIsResolved) {
+    MaybeResolveFinishedPromise();
+  }
+  return mFinished;
+}
+
+void Animation::Cancel(PostRestyleMode aPostRestyle) {
+  bool newlyIdle = false;
+
+  if (PlayState() != AnimationPlayState::Idle) {
+    newlyIdle = true;
+
+    ResetPendingTasks();
+
+    if (mFinished) {
+      mFinished->MaybeReject(NS_ERROR_DOM_ABORT_ERR);
+      MOZ_ALWAYS_TRUE(mFinished->SetAnyPromiseIsHandled());
+    }
+    ResetFinishedPromise();
+
+    QueuePlaybackEvent(nsGkAtoms::oncancel,
+                       GetTimelineCurrentTimeAsTimeStamp());
+  }
+
+  StickyTimeDuration activeTime =
+      mEffect ? mEffect->GetComputedTiming().mActiveTime : StickyTimeDuration();
+
+  mHoldTime.SetNull();
+  mStartTime.SetNull();
+
+  UpdateEffect(aPostRestyle);
+
+  if (mTimeline) {
+    mTimeline->RemoveAnimation(this);
+  }
+  MaybeQueueCancelEvent(activeTime);
+
+  if (newlyIdle && aPostRestyle == PostRestyleMode::IfNeeded) {
+    PostUpdate();
+  }
+}
+
+void Animation::Finish(ErrorResult& aRv) {
+  double effectivePlaybackRate = CurrentOrPendingPlaybackRate();
+
+  if (effectivePlaybackRate == 0) {
+    return aRv.ThrowInvalidStateError(
+        "Can't finish animation with zero playback rate");
+  }
+  if (effectivePlaybackRate > 0 && EffectEnd() == TimeDuration::Forever()) {
+    return aRv.ThrowInvalidStateError("Can't finish infinite animation");
+  }
+
+  AutoMutationBatchForAnimation mb(*this);
+
+  ApplyPendingPlaybackRate();
+
+  TimeDuration limit =
+      PlaybackRateInternal() > 0 ? TimeDuration(EffectEnd()) : TimeDuration();
+  bool didChange = GetCurrentTimeAsDuration() != Nullable<TimeDuration>(limit);
+  SilentlySetCurrentTime(limit);
+
+  if (mStartTime.IsNull() && mTimeline &&
+      !mTimeline->GetCurrentTimeAsDuration().IsNull()) {
+    mStartTime =
+        StartTimeFromTimelineTime(mTimeline->GetCurrentTimeAsDuration().Value(),
+                                  limit, PlaybackRateInternal());
+    didChange = true;
+  }
+
+  if (!mStartTime.IsNull() && (mPendingState == PendingState::PlayPending ||
+                               mPendingState == PendingState::PausePending)) {
+    if (mPendingState == PendingState::PausePending) {
+      mHoldTime.SetNull();
+    }
+    CancelPendingTasks();
+    didChange = true;
+    MaybeResolvePromiseWithThis(mReady);
+  }
+  UpdateTiming(SeekFlag::DidSeek, SyncNotifyFlag::Sync);
+  if (didChange && IsRelevant()) {
+    MutationObservers::NotifyAnimationChanged(this);
+  }
+  PostUpdate();
+}
+
+void Animation::Play(ErrorResult& aRv, LimitBehavior aLimitBehavior) {
+  PlayNoUpdate(aRv, aLimitBehavior);
+  PostUpdate();
+}
+
+void Animation::Reverse(ErrorResult& aRv) {
+  if (!mTimeline) {
+    return aRv.ThrowInvalidStateError(
+        "Can't reverse an animation with no associated timeline");
+  }
+  if (mTimeline->GetCurrentTimeAsDuration().IsNull()) {
+    return aRv.ThrowInvalidStateError(
+        "Can't reverse an animation associated with an inactive timeline");
+  }
+
+  double effectivePlaybackRate = mPendingPlaybackRate.valueOr(mPlaybackRate);
+
+  if (effectivePlaybackRate == 0.0) {
+    return;
+  }
+
+  Maybe<double> originalPendingPlaybackRate = mPendingPlaybackRate;
+
+  mPendingPlaybackRate = Some(-effectivePlaybackRate);
+
+  Play(aRv, LimitBehavior::AutoRewind);
+
+  if (aRv.Failed()) {
+    mPendingPlaybackRate = std::move(originalPendingPlaybackRate);
+  }
+
+}
+
+void Animation::Persist() {
+  if (mReplaceState == AnimationReplaceState::Persisted) {
+    return;
+  }
+
+  bool wasRemoved = mReplaceState == AnimationReplaceState::Removed;
+
+  mReplaceState = AnimationReplaceState::Persisted;
+
+  if (wasRemoved) {
+    UpdateEffect(PostRestyleMode::IfNeeded);
+    PostUpdate();
+  }
+}
+
+DocGroup* Animation::GetDocGroup() {
+  Document* doc = GetRenderedDocument();
+  return doc ? doc->GetDocGroup() : nullptr;
+}
+
+void Animation::CommitStyles(ErrorResult& aRv) {
+  if (!mEffect) {
+    return;
+  }
+
+  RefPtr<KeyframeEffect> keyframeEffect = mEffect->AsKeyframeEffect();
+  if (!keyframeEffect) {
+    return;
+  }
+
+  NonOwningAnimationTarget target = keyframeEffect->GetAnimationTarget();
+  if (!target) {
+    return;
+  }
+
+  if (!target.mPseudoRequest.IsNotPseudo()) {
+    return aRv.ThrowNoModificationAllowedError(
+        "Can't commit styles of a pseudo-element");
+  }
+
+  RefPtr<nsStyledElement> styledElement =
+      nsStyledElement::FromNodeOrNull(target.mElement);
+  if (!styledElement) {
+    return aRv.ThrowNoModificationAllowedError(
+        "Target is not capable of having a style attribute");
+  }
+
+  RefPtr<Document> doc = target.mElement->GetComposedDoc();
+
+  if (doc) {
+    doc->FlushPendingNotifications(FlushType::Frames);
+  }
+  if (!target.mElement->IsRendered()) {
+    return aRv.ThrowInvalidStateError("Target is not rendered");
+  }
+  nsPresContext* presContext =
+      nsContentUtils::GetContextForContent(target.mElement);
+  if (!presContext) {
+    return aRv.ThrowInvalidStateError("Target is not rendered");
+  }
+
+  UniquePtr<StyleAnimationValueMap> animationValues(
+      Servo_AnimationValueMap_Create());
+  if (!presContext->EffectCompositor()->ComposeServoAnimationRuleForEffect(
+          *keyframeEffect, CascadeLevel(), animationValues.get(),
+          StaticPrefs::dom_animations_commit_styles_endpoint_inclusive()
+              ? EndpointBehavior::Inclusive
+              : EndpointBehavior::Exclusive)) {
+    NS_WARNING("Failed to compose animation style to commit");
+    return;
+  }
+
+  mozAutoDocUpdate autoUpdate(target.mElement->OwnerDoc(), true);
+
+  RefPtr<StyleLockedDeclarationBlock> declarationBlock;
+  if (auto* existing = target.mElement->GetInlineStyleDeclaration()) {
+    declarationBlock = nsDOMCSSDeclaration::EnsureBlockMutable(existing);
+  } else {
+    declarationBlock = Servo_DeclarationBlock_CreateEmpty().Consume();
+  }
+
+  MutationClosureData closureData;
+  closureData.mShouldBeCalled = true;
+  closureData.mElement = target.mElement;
+  DeclarationBlockMutationClosure beforeChangeClosure = {
+      nsDOMCSSAttributeDeclaration::MutationClosureFunction,
+      &closureData,
+  };
+
+  bool changed = false;
+  const AnimatedPropertyIDSet& properties = keyframeEffect->GetPropertySet();
+  for (const CSSPropertyId& property : properties) {
+    RefPtr<StyleAnimationValue> computedValue =
+        Servo_AnimationValueMap_GetValue(animationValues.get(), &property)
+            .Consume();
+    if (computedValue) {
+      changed |= Servo_DeclarationBlock_SetPropertyToAnimationValue(
+          declarationBlock.get(), computedValue, beforeChangeClosure);
+    }
+  }
+
+  if (!changed) {
+    MOZ_ASSERT(!closureData.mWasCalled);
+    return;
+  }
+
+  MOZ_ASSERT(closureData.mWasCalled);
+  target.mElement->SetInlineStyleDeclaration(*declarationBlock, closureData);
+}
+
+
+void Animation::GetStartTime(Nullable<OwningCSSNumberish>& aRetVal) const {
+  AnimationUtils::DurationToCSSNumberish(
+      GetStartTime(), AcceptsPercentageBasedTime(), mRTPCallerType,
+      GetParentObject(), aRetVal);
+}
+
+void Animation::SetStartTime(const Nullable<CSSNumberish>& aStartTime,
+                             ErrorResult& aRv) {
+  if (aStartTime.IsNull()) {
+    SetStartTime(Nullable<TimeDuration>());
+    return;
+  }
+
+  const bool progressBased = AcceptsPercentageBasedTime();
+
+  if (!AnimationUtils::ValidateCSSNumberishTime(aStartTime.Value(),
+                                                progressBased, aRv)) {
+    return;
+  }
+
+  Nullable<TimeDuration> time =
+      AnimationUtils::CSSNumberishToDuration(aStartTime.Value(), progressBased);
+  MOZ_ASSERT(!time.IsNull());
+  SetStartTime(time);
+}
+
+bool Animation::AcceptsPercentageBasedTime() const {
+  return StaticPrefs::layout_css_typed_om_enabled() && HasFiniteTimeline();
+}
+
+void Animation::GetCurrentTime(Nullable<OwningCSSNumberish>& aRetVal) const {
+  AnimationUtils::DurationToCSSNumberish(
+      GetCurrentTimeAsDuration(), AcceptsPercentageBasedTime(), mRTPCallerType,
+      GetParentObject(), aRetVal);
+}
+
+void Animation::SetCurrentTime(const Nullable<CSSNumberish>& aCurrentTime,
+                               ErrorResult& aRv) {
+  if (aCurrentTime.IsNull()) {
+    if (!GetCurrentTimeAsDuration().IsNull()) {
+      aRv.ThrowTypeError(
+          "Current time is resolved but trying to set it to an unresolved "
+          "time");
+    }
+    return;
+  }
+
+  const bool progressBased = AcceptsPercentageBasedTime();
+
+  if (!AnimationUtils::ValidateCSSNumberishTime(aCurrentTime.Value(),
+                                                progressBased, aRv)) {
+    return;
+  }
+
+  Nullable<TimeDuration> seekTime = AnimationUtils::CSSNumberishToDuration(
+      aCurrentTime.Value(), progressBased);
+  MOZ_ASSERT(!seekTime.IsNull());
+  SetCurrentTime(seekTime.Value());
+}
+
+
+void Animation::Tick(AnimationTimeline::TickState& aTickState) {
+  MakeReadyAndMaybeTrigger();
+  UpdateTiming(SeekFlag::NoSeek, SyncNotifyFlag::Sync);
+
+  bool isReplaceable = IsReplaceable();
+  if (isReplaceable && !mWasReplaceableAtLastTick) {
+    ScheduleReplacementCheck();
+  }
+  mWasReplaceableAtLastTick = isReplaceable;
+
+  if (!mEffect) {
+    return;
+  }
+
+  KeyframeEffect* keyframeEffect = mEffect->AsKeyframeEffect();
+  if (keyframeEffect && !keyframeEffect->Properties().IsEmpty() &&
+      !mFinishedAtLastComposeStyle &&
+      PlayState() == AnimationPlayState::Finished) {
+    PostUpdate();
+  }
+}
+
+bool Animation::MakeReadyAndMaybeTrigger() {
+  AutoAlignStartTime();
+  if (!Pending()) {
+    return false;
+  }
+  if (mPendingReadyTime.IsNull() && !HasFiniteTimeline()) {
+    if (MOZ_LIKELY(mTimeline)) {
+      mPendingReadyTime = mTimeline->GetCurrentTimeAsTimeStamp();
+    }
+    return false;
+  }
+  return TryTriggerNow();
+}
+
+bool Animation::TryTriggerNow() {
+  if (!Pending()) {
+    return true;
+  }
+  if (NS_WARN_IF(!mTimeline)) {
+    return false;
+  }
+
+  if (mTimeline->IsInactiveTimeline()) {
+    return false;
+  }
+
+  auto currentTime = (mPendingReadyTime.IsNull() || HasFiniteTimeline())
+                         ? mTimeline->GetCurrentTimeAsDuration()
+                         : mTimeline->ToTimelineTime(mPendingReadyTime);
+  mPendingReadyTime = {};
+  if (currentTime.IsNull()) {
+    (void)NS_WARN_IF(!HasFiniteTimeline());
+    return false;
+  }
+  FinishPendingAt(currentTime.Value());
+  return true;
+}
+
+double Animation::CurrentOrPendingPlaybackRate() const {
+  if (mPendingPlaybackRate.isSome()) {
+    return *mPendingPlaybackRate * AnimationsPlayBackRateMultiplier();
+  }
+
+  return PlaybackRateInternal();
+}
+
+TimeStamp Animation::AnimationTimeToTimeStamp(
+    const StickyTimeDuration& aTime) const {
+  TimeStamp result;
+
+  if (!mTimeline) {
+    return result;
+  }
+
+  if (aTime == TimeDuration::Forever() || PlaybackRateInternal() == 0.0 ||
+      mStartTime.IsNull()) {
+    return result;
+  }
+
+  TimeDuration timelineTime =
+      TimeDuration(aTime).MultDouble(1.0 / PlaybackRateInternal()) +
+      mStartTime.Value();
+
+  result = mTimeline->ToTimeStamp(timelineTime);
+  return result;
+}
+
+TimeStamp Animation::ElapsedTimeToTimeStamp(
+    const StickyTimeDuration& aElapsedTime) const {
+  TimeDuration delay =
+      mEffect ? mEffect->NormalizedTiming().Delay() : TimeDuration();
+  return AnimationTimeToTimeStamp(aElapsedTime + delay);
+}
+
+void Animation::SilentlySetCurrentTime(const TimeDuration& aSeekTime) {
+
+  if (!mHoldTime.IsNull() || mStartTime.IsNull() || !mTimeline ||
+      mTimeline->GetCurrentTimeAsDuration().IsNull() ||
+      PlaybackRateInternal() == 0.0) {
+    mHoldTime.SetValue(aSeekTime);
+  } else {
+    mStartTime =
+        StartTimeFromTimelineTime(mTimeline->GetCurrentTimeAsDuration().Value(),
+                                  aSeekTime, PlaybackRateInternal());
+  }
+
+  if (!mTimeline || mTimeline->GetCurrentTimeAsDuration().IsNull()) {
+    mStartTime.SetNull();
+  }
+
+  mPreviousCurrentTime.SetNull();
+  mAutoAlignStartTime = false;
+}
+
+bool Animation::ShouldBeSynchronizedWithMainThread(
+    const nsCSSPropertyIDSet& aPropertySet, const nsIFrame* aFrame,
+    AnimationPerformanceWarning::Type& aPerformanceWarning) const {
+  if (!IsPlaying()) {
+    return false;
+  }
+
+  if (!aPropertySet.Intersects(nsCSSPropertyIDSet::TransformLikeProperties())) {
+    return false;
+  }
+
+  KeyframeEffect* keyframeEffect =
+      mEffect ? mEffect->AsKeyframeEffect() : nullptr;
+  if (!keyframeEffect) {
+    return false;
+  }
+
+  return keyframeEffect->ShouldBlockAsyncTransformAnimations(
+      aFrame, aPropertySet, aPerformanceWarning);
+}
+
+void Animation::UpdateRelevance() {
+  bool wasRelevant = mIsRelevant;
+  mIsRelevant = mReplaceState != AnimationReplaceState::Removed &&
+                (HasCurrentEffect() || IsInEffect());
+
+  if (wasRelevant && !mIsRelevant) {
+    MutationObservers::NotifyAnimationRemoved(this);
+  } else if (!wasRelevant && mIsRelevant) {
+    UpdateHiddenByContentVisibility();
+    MutationObservers::NotifyAnimationAdded(this);
+  }
+}
+
+template <class T>
+bool IsMarkupAnimation(T* aAnimation) {
+  return aAnimation && aAnimation->IsTiedToMarkup();
+}
+
+bool Animation::IsReplaceable() const {
+  if (IsMarkupAnimation(AsCSSAnimation()) ||
+      IsMarkupAnimation(AsCSSTransition())) {
+    return false;
+  }
+
+  if (PlayState() != AnimationPlayState::Finished) {
+    return false;
+  }
+
+  if (ReplaceState() == AnimationReplaceState::Removed) {
+    return false;
+  }
+
+  if (!GetTimeline() || !GetTimeline()->TracksWallclockTime()) {
+    return false;
+  }
+
+  if (!GetEffect()) {
+    return false;
+  }
+
+  MOZ_ASSERT(GetEffect()->AsKeyframeEffect(),
+             "Effect should be a keyframe effect");
+
+  if (GetEffect()->GetComputedTiming().mProgress.IsNull()) {
+    return false;
+  }
+
+  if (!GetEffect()->AsKeyframeEffect()->GetAnimationTarget()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool Animation::IsRemovable() const {
+  return ReplaceState() == AnimationReplaceState::Active && IsReplaceable();
+}
+
+void Animation::ScheduleReplacementCheck() {
+  MOZ_ASSERT(
+      IsReplaceable(),
+      "Should only schedule a replacement check for a replaceable animation");
+
+  MOZ_ASSERT(GetEffect());
+  MOZ_ASSERT(GetEffect()->AsKeyframeEffect());
+
+  NonOwningAnimationTarget target =
+      GetEffect()->AsKeyframeEffect()->GetAnimationTarget();
+
+  MOZ_ASSERT(target);
+
+  nsPresContext* presContext =
+      nsContentUtils::GetContextForContent(target.mElement);
+  if (presContext) {
+    presContext->EffectCompositor()->NoteElementForReducing(target);
+  }
+}
+
+void Animation::MaybeScheduleReplacementCheck() {
+  if (!IsReplaceable()) {
+    return;
+  }
+
+  ScheduleReplacementCheck();
+}
+
+void Animation::Remove() {
+  MOZ_ASSERT(IsRemovable(),
+             "Should not be trying to remove an effect that is not removable");
+
+  mReplaceState = AnimationReplaceState::Removed;
+
+  UpdateEffect(PostRestyleMode::IfNeeded);
+  PostUpdate();
+
+  QueuePlaybackEvent(nsGkAtoms::onremove, GetTimelineCurrentTimeAsTimeStamp());
+}
+
+int32_t Animation::CompareCompositeOrder(
+    const Maybe<EventContext>& aContext, const Animation& aOther,
+    const Maybe<EventContext>& aOtherContext,
+    nsContentUtils::NodeIndexCache& aCache) const {
+  if (&aOther == this) {
+    return 0;
+  }
+
+  {
+    auto asCSSTransitionForSorting =
+        [](const Animation& anim,
+           const Maybe<EventContext>& aContext) -> const CSSTransition* {
+      const CSSTransition* transition = anim.AsCSSTransition();
+      return transition && (aContext || transition->IsTiedToMarkup())
+                 ? transition
+                 : nullptr;
+    };
+    const auto* const thisTransition =
+        asCSSTransitionForSorting(*this, aContext);
+    const auto* const otherTransition =
+        asCSSTransitionForSorting(aOther, aOtherContext);
+    if (thisTransition && otherTransition) {
+      return thisTransition->CompareCompositeOrder(aContext, *otherTransition,
+                                                   aOtherContext, aCache);
+    }
+    if (thisTransition || otherTransition) {
+      return thisTransition ? -1 : 1;
+    }
+  }
+
+  {
+    auto asCSSAnimationForSorting =
+        [](const Animation& anim) -> const CSSAnimation* {
+      const CSSAnimation* animation = anim.AsCSSAnimation();
+      return animation && animation->IsTiedToMarkup() ? animation : nullptr;
+    };
+    auto thisAnimation = asCSSAnimationForSorting(*this);
+    auto otherAnimation = asCSSAnimationForSorting(aOther);
+    if (thisAnimation && otherAnimation) {
+      return thisAnimation->CompareCompositeOrder(*otherAnimation, aCache);
+    }
+    if (thisAnimation || otherAnimation) {
+      return thisAnimation ? -1 : 1;
+    }
+  }
+
+  MOZ_ASSERT(mAnimationIndex != aOther.mAnimationIndex,
+             "Animation indices should be unique");
+
+  return mAnimationIndex > aOther.mAnimationIndex ? 1 : -1;
+}
+
+void Animation::WillComposeStyle() {
+  mFinishedAtLastComposeStyle = (PlayState() == AnimationPlayState::Finished);
+
+  MOZ_ASSERT(mEffect);
+
+  KeyframeEffect* keyframeEffect = mEffect->AsKeyframeEffect();
+  if (keyframeEffect) {
+    keyframeEffect->WillComposeStyle();
+  }
+}
+
+void Animation::ComposeStyle(
+    StyleAnimationValueMap& aComposeResult,
+    const InvertibleAnimatedPropertyIDSet& aPropertiesToSkip,
+    EndpointBehavior aEndpointBehavior) {
+  if (!mEffect) {
+    return;
+  }
+
+  const bool pending = Pending();
+  {
+    AutoRestore<Nullable<TimeDuration>> restoreHoldTime(mHoldTime);
+    if (pending && mHoldTime.IsNull() && !mStartTime.IsNull()) {
+      Nullable<TimeDuration> timeToUse;
+      if (mTimeline && mTimeline->TracksWallclockTime()) {
+        timeToUse = mTimeline->ToTimelineTime(TimeStamp::Now());
+      }
+      if (!timeToUse.IsNull()) {
+        mHoldTime = CurrentTimeFromTimelineTime(
+            timeToUse.Value(), mStartTime.Value(), PlaybackRateInternal());
+      }
+    }
+
+    KeyframeEffect* keyframeEffect = mEffect->AsKeyframeEffect();
+    if (keyframeEffect) {
+      keyframeEffect->ComposeStyle(aComposeResult, aPropertiesToSkip,
+                                   aEndpointBehavior);
+    }
+  }
+
+  MOZ_ASSERT(
+      pending == Pending(),
+      "Pending state should not change during the course of compositing");
+}
+
+void Animation::NotifyEffectTimingUpdated() {
+  MOZ_ASSERT(mEffect,
+             "We should only update effect timing when we have a target "
+             "effect");
+  UpdateTiming(Animation::SeekFlag::NoSeek, Animation::SyncNotifyFlag::Async);
+}
+
+void Animation::NotifyEffectPropertiesUpdated() {
+  MOZ_ASSERT(mEffect,
+             "We should only update effect properties when we have a target "
+             "effect");
+
+  MaybeScheduleReplacementCheck();
+}
+
+void Animation::NotifyEffectTargetUpdated() {
+  MOZ_ASSERT(mEffect,
+             "We should only update the effect target when we have a target "
+             "effect");
+
+  MaybeScheduleReplacementCheck();
+}
+
+void Animation::PlayNoUpdate(ErrorResult& aRv, LimitBehavior aLimitBehavior) {
+  AutoMutationBatchForAnimation mb(*this);
+
+  const bool abortedPause = mPendingState == PendingState::PausePending;
+  bool hasPendingReadyPromise = false;
+  const bool hasFiniteTimeline = HasFiniteTimeline();
+  const Nullable<TimeDuration> prevCurrentTime = GetCurrentTimeAsDuration();
+  const bool enableSeek =
+      (aLimitBehavior == LimitBehavior::AutoRewind) && !hasFiniteTimeline;
+
+  const double effectivePlaybackRate = CurrentOrPendingPlaybackRate();
+  const StickyTimeDuration associatedEffectEnd = EffectEnd();
+  if (effectivePlaybackRate > 0.0 && enableSeek &&
+      (prevCurrentTime.IsNull() || prevCurrentTime.Value() < TimeDuration() ||
+       prevCurrentTime.Value() >= associatedEffectEnd)) {
+    mHoldTime = TimeDuration();
+  } else if (effectivePlaybackRate < 0.0 && enableSeek &&
+             (prevCurrentTime.IsNull() ||
+              prevCurrentTime.Value() <= TimeDuration() ||
+              prevCurrentTime.Value() > associatedEffectEnd)) {
+    if (associatedEffectEnd == TimeDuration::Forever()) {
+      return aRv.ThrowInvalidStateError(
+          "Can't rewind animation with infinite effect end");
+    }
+    mHoldTime.SetValue(TimeDuration(associatedEffectEnd));
+  } else if (effectivePlaybackRate == 0.0 && prevCurrentTime.IsNull()) {
+    mHoldTime = TimeDuration();
+  }
+
+  if (hasFiniteTimeline && prevCurrentTime.IsNull()) {
+    mAutoAlignStartTime = true;
+  }
+
+  if (!hasFiniteTimeline && prevCurrentTime.IsNull() && mHoldTime.IsNull()) {
+    mHoldTime = TimeDuration();
+  }
+
+  const bool hasInactiveTimeline = mTimeline && mTimeline->IsInactiveTimeline();
+  if (hasInactiveTimeline && mHoldTime.IsNull()) {
+    mHoldTime = TimeDuration();
+  }
+
+  if (!mHoldTime.IsNull()) {
+    mStartTime.SetNull();
+  }
+
+  if (mPendingState != PendingState::NotPending) {
+    CancelPendingTasks();
+    hasPendingReadyPromise = true;
+  }
+
+  auto pendingAutoAlignedStartTime = mAutoAlignStartTime && mStartTime.IsNull();
+  if (mHoldTime.IsNull() && !abortedPause && !mPendingPlaybackRate &&
+      !pendingAutoAlignedStartTime) {
+    return;
+  }
+
+  if (!hasPendingReadyPromise) {
+    mReady = nullptr;
+  }
+
+  mPendingState = PendingState::PlayPending;
+  mPendingReadyTime = {};
+  if (Document* doc = GetRenderedDocument()) {
+    mPendingReadyTime = EnsurePaintIsScheduled(*doc);
+  }
+
+  UpdateTiming(SeekFlag::NoSeek, SyncNotifyFlag::Async);
+  if (IsRelevant()) {
+    MutationObservers::NotifyAnimationChanged(this);
+  }
+}
+
+void Animation::Pause(ErrorResult& aRv) {
+  if (IsPausedOrPausing()) {
+    return;
+  }
+
+  AutoMutationBatchForAnimation mb(*this);
+
+  const bool hasFiniteTimeline = HasFiniteTimeline();
+
+  if (GetCurrentTimeAsDuration().IsNull()) {
+    if (!hasFiniteTimeline) {
+      if (PlaybackRateInternal() >= 0.0) {
+        mHoldTime.SetValue(TimeDuration());
+      } else {
+        if (EffectEnd() == TimeDuration::Forever()) {
+          return aRv.ThrowInvalidStateError(
+              "Can't seek to infinite effect end");
+        }
+        mHoldTime.SetValue(TimeDuration(EffectEnd()));
+      }
+    } else {
+      mAutoAlignStartTime = true;
+    }
+  }
+
+  bool hasPendingReadyPromise = false;
+
+  if (mPendingState == PendingState::PlayPending) {
+    CancelPendingTasks();
+    hasPendingReadyPromise = true;
+  }
+
+  if (!hasPendingReadyPromise) {
+    mReady = nullptr;
+  }
+
+  mPendingState = PendingState::PausePending;
+  mPendingReadyTime = {};
+  if (Document* doc = GetRenderedDocument()) {
+    mPendingReadyTime = EnsurePaintIsScheduled(*doc);
+  }
+
+  UpdateTiming(SeekFlag::NoSeek, SyncNotifyFlag::Async);
+  if (IsRelevant()) {
+    MutationObservers::NotifyAnimationChanged(this);
+  }
+
+  PostUpdate();
+}
+
+void Animation::ResumeAt(const TimeDuration& aReadyTime) {
+  MOZ_ASSERT(mPendingState == PendingState::PlayPending,
+             "Expected to resume a play-pending animation");
+  MOZ_ASSERT(!mHoldTime.IsNull() || !mStartTime.IsNull(),
+             "An animation in the play-pending state should have either a"
+             " resolved hold time or resolved start time");
+
+  AutoMutationBatchForAnimation mb(*this);
+  bool hadPendingPlaybackRate = mPendingPlaybackRate.isSome();
+
+  if (!mHoldTime.IsNull()) {
+    ApplyPendingPlaybackRate();
+    mStartTime = StartTimeFromTimelineTime(aReadyTime, mHoldTime.Value(),
+                                           PlaybackRateInternal());
+    if (PlaybackRateInternal() != 0) {
+      mHoldTime.SetNull();
+    }
+  } else if (!mStartTime.IsNull() && mPendingPlaybackRate) {
+    TimeDuration currentTimeToMatch = CurrentTimeFromTimelineTime(
+        aReadyTime, mStartTime.Value(), PlaybackRateInternal());
+    ApplyPendingPlaybackRate();
+    mStartTime = StartTimeFromTimelineTime(aReadyTime, currentTimeToMatch,
+                                           PlaybackRateInternal());
+    if (PlaybackRateInternal() == 0) {
+      mHoldTime.SetValue(currentTimeToMatch);
+    }
+  }
+
+  mPendingState = PendingState::NotPending;
+
+  UpdateTiming(SeekFlag::NoSeek, SyncNotifyFlag::Sync);
+
+  if (hadPendingPlaybackRate && IsRelevant()) {
+    MutationObservers::NotifyAnimationChanged(this);
+  }
+
+  MaybeResolvePromiseWithThis(mReady);
+}
+
+void Animation::PauseAt(const TimeDuration& aReadyTime) {
+  MOZ_ASSERT(mPendingState == PendingState::PausePending,
+             "Expected to pause a pause-pending animation");
+
+  if (!mStartTime.IsNull() && mHoldTime.IsNull()) {
+    mHoldTime = CurrentTimeFromTimelineTime(aReadyTime, mStartTime.Value(),
+                                            PlaybackRateInternal());
+  }
+  ApplyPendingPlaybackRate();
+  mStartTime.SetNull();
+  mPendingState = PendingState::NotPending;
+
+  UpdateTiming(SeekFlag::NoSeek, SyncNotifyFlag::Async);
+
+  MaybeResolvePromiseWithThis(mReady);
+}
+
+void Animation::UpdateTiming(SeekFlag aSeekFlag,
+                             SyncNotifyFlag aSyncNotifyFlag) {
+  UpdateFinishedState(aSeekFlag, aSyncNotifyFlag);
+  UpdateEffect(PostRestyleMode::IfNeeded);
+
+  if (mTimeline) {
+    mTimeline->NotifyAnimationUpdated(*this);
+  }
+}
+
+void Animation::UpdateFinishedState(SeekFlag aSeekFlag,
+                                    SyncNotifyFlag aSyncNotifyFlag) {
+  Nullable<TimeDuration> unconstrainedCurrentTime =
+      aSeekFlag == SeekFlag::NoSeek ? GetUnconstrainedCurrentTime()
+                                    : GetCurrentTimeAsDuration();
+  TimeDuration effectEnd = TimeDuration(EffectEnd());
+
+  if (!unconstrainedCurrentTime.IsNull() && !mStartTime.IsNull() &&
+      mPendingState == PendingState::NotPending) {
+    if (PlaybackRateInternal() > 0.0 &&
+        unconstrainedCurrentTime.Value() >= effectEnd) {
+      if (aSeekFlag == SeekFlag::DidSeek) {
+        mHoldTime = unconstrainedCurrentTime;
+      } else if (!mPreviousCurrentTime.IsNull()) {
+        mHoldTime.SetValue(std::max(mPreviousCurrentTime.Value(), effectEnd));
+      } else {
+        mHoldTime.SetValue(effectEnd);
+      }
+    } else if (PlaybackRateInternal() < 0.0 &&
+               unconstrainedCurrentTime.Value() <= TimeDuration()) {
+      if (aSeekFlag == SeekFlag::DidSeek) {
+        mHoldTime = unconstrainedCurrentTime;
+      } else if (!mPreviousCurrentTime.IsNull()) {
+        mHoldTime.SetValue(
+            std::min(mPreviousCurrentTime.Value(), TimeDuration()));
+      } else {
+        mHoldTime.SetValue(TimeDuration());
+      }
+    } else if (PlaybackRateInternal() != 0.0 && mTimeline &&
+               !mTimeline->GetCurrentTimeAsDuration().IsNull()) {
+      if (aSeekFlag == SeekFlag::DidSeek && !mHoldTime.IsNull()) {
+        mStartTime = StartTimeFromTimelineTime(
+            mTimeline->GetCurrentTimeAsDuration().Value(), mHoldTime.Value(),
+            PlaybackRateInternal());
+      }
+      mHoldTime.SetNull();
+    }
+  }
+
+  mPreviousCurrentTime = GetCurrentTimeAsDuration();
+
+  bool currentFinishedState = PlayState() == AnimationPlayState::Finished;
+  if (currentFinishedState && !mFinishedIsResolved) {
+    DoFinishNotification(aSyncNotifyFlag);
+  } else if (!currentFinishedState && mFinishedIsResolved) {
+    ResetFinishedPromise();
+  }
+}
+
+void Animation::UpdateEffect(PostRestyleMode aPostRestyle) {
+  if (mEffect) {
+    UpdateRelevance();
+
+    KeyframeEffect* keyframeEffect = mEffect->AsKeyframeEffect();
+    if (keyframeEffect) {
+      keyframeEffect->NotifyAnimationTimingUpdated(aPostRestyle);
+    }
+  }
+}
+
+void Animation::FlushUnanimatedStyle() const {
+  if (Document* doc = GetRenderedDocument()) {
+    doc->FlushPendingNotifications(
+        ChangesToFlush(FlushType::Style,  false,
+                        false));
+  }
+}
+
+void Animation::PostUpdate() {
+  if (!mEffect) {
+    return;
+  }
+
+  KeyframeEffect* keyframeEffect = mEffect->AsKeyframeEffect();
+  if (!keyframeEffect) {
+    return;
+  }
+  keyframeEffect->RequestRestyle(EffectCompositor::RestyleType::Layer);
+}
+
+void Animation::CancelPendingTasks() {
+  mPendingState = PendingState::NotPending;
+}
+
+void Animation::ResetPendingTasks() {
+  if (!Pending()) {
+    return;
+  }
+
+  CancelPendingTasks();
+  ApplyPendingPlaybackRate();
+
+  if (mReady) {
+    mReady->MaybeReject(NS_ERROR_DOM_ABORT_ERR);
+    MOZ_ALWAYS_TRUE(mReady->SetAnyPromiseIsHandled());
+    mReady = nullptr;
+  }
+}
+
+ Animation::ProgressTimelinePosition
+Animation::AtProgressTimelineBoundary(
+    const Nullable<TimeDuration>& aTimelineDuration,
+    const Nullable<TimeDuration>& aCurrentTime,
+    const TimeDuration& aEffectStartTime, const double aPlaybackRate) {
+  if (aTimelineDuration.IsNull() || aTimelineDuration.Value().IsZero() ||
+      aPlaybackRate == 0.0) {
+    return ProgressTimelinePosition::NotBoundary;
+  }
+
+  const TimeDuration& effectiveStartTime = aEffectStartTime;
+
+  const TimeDuration effectiveTimelineTime =
+      (aCurrentTime.IsNull()
+           ? TimeDuration()
+           : aCurrentTime.Value().MultDouble(1.0 / aPlaybackRate)) +
+      effectiveStartTime;
+
+  return effectiveTimelineTime.IsZero() ||
+                 (AnimationUtils::IsWithinAnimationTimeTolerance(
+                     effectiveTimelineTime, aTimelineDuration.Value()))
+             ? ProgressTimelinePosition::Boundary
+             : ProgressTimelinePosition::NotBoundary;
+}
+
+void Animation::UpdateNormalizedTimingForTimelineDataChange() {
+  if (!mEffect) {
+    return;
+  }
+
+  mEffect->UpdateNormalizedTiming();
+}
+
+void Animation::MaybeUpdateKeyframeComputedOffsets() {
+  if (!mEffect || !mEffect->AsKeyframeEffect()) {
+    return;
+  }
+
+  mEffect->AsKeyframeEffect()->MaybeUpdateKeyframeComputedOffsets(
+      mTimeline, mTimelineRange);
+}
+
+StickyTimeDuration Animation::EffectEnd() const {
+  if (!mEffect) {
+    return StickyTimeDuration();
+  }
+
+  return mEffect->NormalizedTiming().EndTime();
+}
+
+Document* Animation::GetRenderedDocument() const {
+  if (!mEffect || !mEffect->AsKeyframeEffect()) {
+    return nullptr;
+  }
+
+  return mEffect->AsKeyframeEffect()->GetRenderedDocument();
+}
+
+Document* Animation::GetTimelineDocument() const {
+  return mTimeline ? mTimeline->GetDocument() : nullptr;
+}
+
+class AsyncFinishNotification : public MicroTaskRunnable {
+ public:
+  explicit AsyncFinishNotification(Animation* aAnimation)
+      : mAnimation(aAnimation) {}
+
+  virtual void Run(AutoSlowOperation& aAso) override {
+    mAnimation->DoFinishNotificationImmediately(this);
+    mAnimation = nullptr;
+  }
+
+  virtual bool Suppressed() override {
+    nsIGlobalObject* global = mAnimation->GetRelevantGlobal();
+    return global && global->IsInSyncOperation();
+  }
+
+ private:
+  RefPtr<Animation> mAnimation;
+};
+
+void Animation::DoFinishNotification(SyncNotifyFlag aSyncNotifyFlag) {
+  CycleCollectedJSContext* context = CycleCollectedJSContext::Get();
+
+  if (aSyncNotifyFlag == SyncNotifyFlag::Sync) {
+    DoFinishNotificationImmediately();
+  } else if (!mFinishNotificationTask) {
+    RefPtr<MicroTaskRunnable> runnable = new AsyncFinishNotification(this);
+    context->DispatchToMicroTask(do_AddRef(runnable));
+    mFinishNotificationTask = std::move(runnable);
+  }
+}
+
+void Animation::ResetFinishedPromise() {
+  mFinishedIsResolved = false;
+  mFinished = nullptr;
+}
+
+void Animation::MaybeResolveFinishedPromise() {
+  mFinishedIsResolved = true;
+  MaybeResolvePromiseWithThis(mFinished);
+}
+
+void Animation::DoFinishNotificationImmediately(MicroTaskRunnable* aAsync) {
+  if (aAsync && aAsync != mFinishNotificationTask) {
+    return;
+  }
+
+  mFinishNotificationTask = nullptr;
+
+  if (PlayState() != AnimationPlayState::Finished) {
+    return;
+  }
+
+  MaybeResolveFinishedPromise();
+
+  QueuePlaybackEvent(nsGkAtoms::onfinish,
+                     AnimationTimeToTimeStamp(EffectEnd()));
+}
+
+void Animation::QueuePlaybackEvent(nsAtom* aOnEvent,
+                                   TimeStamp&& aScheduledEventTime) {
+  Document* doc = GetTimelineDocument();
+  if (!doc) {
+    return;
+  }
+
+  nsPresContext* presContext = doc->GetPresContext();
+  if (!presContext) {
+    return;
+  }
+
+  Nullable<double> currentTime;
+  if (aOnEvent == nsGkAtoms::onfinish || aOnEvent == nsGkAtoms::onremove) {
+    currentTime = AnimationUtils::TimeDurationToDouble(
+        GetCurrentTimeAsDuration(), mRTPCallerType);
+  }
+
+  Nullable<double> timelineTime;
+  if (mTimeline) {
+    timelineTime = mTimeline->GetCurrentTimeAsDouble();
+  }
+
+  presContext->AnimationEventDispatcher()->QueueEvent(
+      AnimationEventInfo(aOnEvent, currentTime, timelineTime,
+                         std::move(aScheduledEventTime), this));
+}
+
+bool Animation::IsRunningOnCompositor() const {
+  return mEffect && mEffect->AsKeyframeEffect() &&
+         mEffect->AsKeyframeEffect()->IsRunningOnCompositor();
+}
+
+bool Animation::HasCurrentEffect() const {
+  return GetEffect() && GetEffect()->IsCurrent();
+}
+
+bool Animation::IsInEffect() const {
+  return GetEffect() && GetEffect()->IsInEffect();
+}
+
+void Animation::SetHiddenByContentVisibility(bool hidden) {
+  if (mHiddenByContentVisibility == hidden) {
+    return;
+  }
+
+  mHiddenByContentVisibility = hidden;
+
+  if (!GetTimeline()) {
+    return;
+  }
+
+  GetTimeline()->NotifyAnimationContentVisibilityChanged(this, !hidden);
+}
+
+void Animation::UpdateHiddenByContentVisibility() {
+  if (!AsCSSAnimation() && !AsCSSTransition()) {
+    return;
+  }
+  NonOwningAnimationTarget target = GetTargetForAnimation();
+  if (!target) {
+    return;
+  }
+  bool hasOwningElement = IsMarkupAnimation(AsCSSAnimation()) ||
+                          IsMarkupAnimation(AsCSSTransition());
+  if (auto* frame = target.mElement->GetPrimaryFrame()) {
+    SetHiddenByContentVisibility(
+        hasOwningElement && frame->IsHiddenByContentVisibilityOnAnyAncestor());
+  }
+}
+
+void Animation::AutoAlignStartTime() {
+  if (!mAutoAlignStartTime) {
+    return;
+  }
+
+  if (!mTimeline || mTimeline->GetCurrentTimeAsDuration().IsNull()) {
+    return;
+  }
+
+  MOZ_ASSERT(!mTimeline->IsMonotonicallyIncreasing(),
+             "We shouldn't come here for monotonically increasing timeline");
+  if (mTimeline->IsMonotonicallyIncreasing()) {
+    return;
+  }
+
+  const AnimationPlayState playState = PlayState();
+  if (playState == AnimationPlayState::Idle) {
+    return;
+  }
+
+  if (playState == AnimationPlayState::Paused && !mHoldTime.IsNull()) {
+    return;
+  }
+
+  MOZ_ASSERT(mTimeline->IsScrollTimeline(),
+             "Only the finite timeline sets this flag.");
+  const auto [startOffset, endOffset] =
+      mTimeline->AsScrollTimeline()->IntervalForAttachmentRange(mTimelineRange);
+
+  const double effectivePlaybackRate = CurrentOrPendingPlaybackRate();
+  mStartTime.SetValue(TimeDuration::FromMilliseconds(
+      (effectivePlaybackRate >= 0.0 ? startOffset : endOffset) *
+      PROGRESS_TIMELINE_DURATION_MILLISEC));
+
+  mHoldTime.SetNull();
+}
+
+StickyTimeDuration Animation::IntervalStartTime(
+    const StickyTimeDuration& aActiveDuration) const {
+  MOZ_ASSERT(AsCSSTransition() || AsCSSAnimation(),
+             "Should be called for CSS animations or transitions");
+  static constexpr StickyTimeDuration zeroDuration = StickyTimeDuration();
+  return std::max(
+      std::min(StickyTimeDuration(-mEffect->NormalizedTiming().Delay()),
+               aActiveDuration),
+      zeroDuration);
+}
+
+StickyTimeDuration Animation::IntervalEndTime(
+    const StickyTimeDuration& aActiveDuration) const {
+  MOZ_ASSERT(AsCSSTransition() || AsCSSAnimation(),
+             "Should be called for CSS animations or transitions");
+
+  static constexpr StickyTimeDuration zeroDuration = StickyTimeDuration();
+  const StickyTimeDuration& effectEnd = EffectEnd();
+
+  if (MOZ_UNLIKELY(effectEnd == TimeDuration::Forever() &&
+                   effectEnd == mEffect->NormalizedTiming().Delay())) {
+    return zeroDuration;
+  }
+
+  return std::max(std::min(effectEnd - mEffect->NormalizedTiming().Delay(),
+                           aActiveDuration),
+                  zeroDuration);
+}
+
+double Animation::AnimationsPlayBackRateMultiplier() const {
+  if (mEffect && mEffect->AsKeyframeEffect()) {
+    return mEffect->AsKeyframeEffect()->AnimationsPlayBackRateMultiplier();
+  }
+  return 1.0;
+}
+
+double Animation::PlaybackRateInternal() const {
+  return mPlaybackRate * AnimationsPlayBackRateMultiplier();
+}
+
+}  

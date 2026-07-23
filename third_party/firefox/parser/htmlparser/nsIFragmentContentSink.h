@@ -1,0 +1,38 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsIFragmentContentSink_h_
+#define nsIFragmentContentSink_h_
+
+#include "nsISupports.h"
+
+namespace mozilla {
+namespace dom {
+class Document;
+class DocumentFragment;
+}  
+}  
+
+#define NS_I_FRAGMENT_CONTENT_SINK_IID \
+  {0x1a8ce30b, 0x63fc, 0x441a, {0xa3, 0xaa, 0xf7, 0x16, 0xc0, 0xfe, 0x96, 0x69}}
+
+class nsIFragmentContentSink : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_I_FRAGMENT_CONTENT_SINK_IID)
+  NS_IMETHOD FinishFragmentParsing(mozilla::dom::DocumentFragment** aFragment) =
+      0;
+
+  NS_IMETHOD SetTargetDocument(mozilla::dom::Document*) = 0;
+
+  NS_IMETHOD WillBuildContent() = 0;
+
+  NS_IMETHOD DidBuildContent() = 0;
+
+  NS_IMETHOD IgnoreFirstContainer() = 0;
+
+  NS_IMETHOD SetPreventScriptExecution(bool aPreventScriptExecution) = 0;
+};
+
+nsresult NS_NewXMLFragmentContentSink(nsIFragmentContentSink** aResult);
+
+#endif

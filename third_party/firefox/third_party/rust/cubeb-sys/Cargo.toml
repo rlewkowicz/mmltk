@@ -1,0 +1,26 @@
+
+[package]
+name = "cubeb-sys"
+version = "0.34.1"
+authors = ["Dan Glastonbury <dglastonbury@mozilla.com>"]
+build = "build.rs"
+links = "cubeb"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Native bindings to the cubeb library"
+license = "ISC"
+repository = "https://github.com/mozilla/cubeb-rs"
+resolver = "2"
+
+[badges.circle-ci]
+repository = "mozilla/cubeb-rs"
+
+[features]
+gecko-in-tree = []
+
+[lib]
+name = "cubeb_sys"
+path = "src/lib.rs"

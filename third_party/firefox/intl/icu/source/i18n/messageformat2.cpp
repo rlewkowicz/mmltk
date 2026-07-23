@@ -1,0 +1,596 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_NORMALIZATION
+
+#if !UCONFIG_NO_FORMATTING
+
+#if !UCONFIG_NO_MF2
+
+#include "unicode/messageformat2_arguments.h"
+#include "unicode/messageformat2_data_model.h"
+#include "unicode/messageformat2_formattable.h"
+#include "unicode/messageformat2.h"
+#include "unicode/normalizer2.h"
+#include "unicode/unistr.h"
+#include "messageformat2_allocation.h"
+#include "messageformat2_checker.h"
+#include "messageformat2_evaluation.h"
+#include "messageformat2_function_registry_internal.h"
+#include "messageformat2_macros.h"
+
+
+U_NAMESPACE_BEGIN
+
+namespace message2 {
+
+using namespace data_model;
+
+
+static Formattable evalLiteral(const Literal& lit) {
+    return Formattable(lit.unquoted());
+}
+
+[[nodiscard]] FormattedPlaceholder MessageFormatter::evalArgument(const UnicodeString& fallback,
+                                                                  const VariableName& var,
+                                                                  MessageContext& context,
+                                                                  UErrorCode& errorCode) const {
+    if (U_SUCCESS(errorCode)) {
+        const Formattable* val = context.getGlobal(var, errorCode);
+        if (U_SUCCESS(errorCode)) {
+            UnicodeString fallbackToUse = fallback;
+            if (fallbackToUse.isEmpty()) {
+                fallbackToUse += DOLLAR;
+                fallbackToUse += var;
+            }
+            return (FormattedPlaceholder(*val, fallbackToUse));
+        }
+    }
+    return {};
+}
+
+static UnicodeString reserialize(const UnicodeString& s) {
+    UnicodeString result(PIPE);
+    for (int32_t i = 0; i < s.length(); i++) {
+        switch(s[i]) {
+        case BACKSLASH:
+        case PIPE:
+        case LEFT_CURLY_BRACE:
+        case RIGHT_CURLY_BRACE: {
+            result += BACKSLASH;
+            break;
+        }
+        default:
+            break;
+        }
+        result += s[i];
+    }
+    result += PIPE;
+    return result;
+}
+
+[[nodiscard]] FormattedPlaceholder MessageFormatter::formatLiteral(const UnicodeString& fallback,
+                                                                   const Literal& lit) const {
+    UnicodeString fallbackToUse = fallback.isEmpty() ? reserialize(lit.unquoted()) : fallback;
+    return FormattedPlaceholder(evalLiteral(lit), fallbackToUse);
+}
+
+[[nodiscard]] InternalValue* MessageFormatter::formatOperand(const UnicodeString& fallback,
+                                                             const Environment& env,
+                                                             const Operand& rand,
+                                                             MessageContext& context,
+                                                             UErrorCode &status) const {
+    if (U_FAILURE(status)) {
+        return {};
+    }
+
+    if (rand.isNull()) {
+        return create<InternalValue>(InternalValue(FormattedPlaceholder()), status);
+    }
+    if (rand.isVariable()) {
+        const VariableName& var = rand.asVariable();
+
+        const VariableName normalized = StandardFunctions::normalizeNFC(var);
+
+        if (env.has(normalized)) {
+          const Closure& rhs = env.lookup(normalized);
+          UnicodeString newFallback(DOLLAR);
+          newFallback += var;
+          return formatExpression(newFallback, rhs.getEnv(), rhs.getExpr(), context, status);
+        }
+        FormattedPlaceholder result = evalArgument(fallback, normalized, context, status);
+        if (status == U_ILLEGAL_ARGUMENT_ERROR) {
+            status = U_ZERO_ERROR;
+            context.getErrors().setUnresolvedVariable(var, status);
+            UnicodeString str(DOLLAR);
+            str += var;
+            return create<InternalValue>(InternalValue(FormattedPlaceholder(str)), status);
+        }
+        return create<InternalValue>(InternalValue(std::move(result)), status);
+    } else {
+        U_ASSERT(rand.isLiteral());
+        return create<InternalValue>(InternalValue(formatLiteral(fallback, rand.asLiteral())), status);
+    }
+}
+
+FunctionOptions MessageFormatter::resolveOptions(const Environment& env, const OptionMap& options, MessageContext& context, UErrorCode& status) const {
+    LocalPointer<UVector> optionsVector(createUVector(status));
+    if (U_FAILURE(status)) {
+        return {};
+    }
+    LocalPointer<ResolvedFunctionOption> resolvedOpt;
+    for (int i = 0; i < options.size(); i++) {
+        const Option& opt = options.getOption(i, status);
+        if (U_FAILURE(status)) {
+            return {};
+        }
+        const UnicodeString& k = opt.getName();
+        const Operand& v = opt.getValue();
+
+        LocalPointer<InternalValue> rhsVal(formatOperand({}, env, v, context, status));
+        if (U_FAILURE(status)) {
+            return {};
+        }
+        FormattedPlaceholder optValue = rhsVal->forceFormatting(context.getErrors(), status);
+        resolvedOpt.adoptInstead(create<ResolvedFunctionOption>
+                                 (ResolvedFunctionOption(k,
+                                                         optValue.asFormattable(),
+                                                         v.isLiteral()),
+                                  status));
+        if (U_FAILURE(status)) {
+            return {};
+        }
+        optionsVector->adoptElement(resolvedOpt.orphan(), status);
+    }
+    return FunctionOptions(std::move(*optionsVector), status);
+}
+
+[[nodiscard]] InternalValue* MessageFormatter::evalFunctionCall(FormattedPlaceholder&& argument,
+                                                                MessageContext& context,
+                                                                UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+    U_ASSERT(!argument.isFallback() && !argument.isNullOperand());
+
+    const Formattable& toFormat = argument.asFormattable();
+    switch (toFormat.getType()) {
+    case UFMT_OBJECT: {
+        const FormattableObject* obj = toFormat.getObject(status);
+        U_ASSERT(U_SUCCESS(status));
+        U_ASSERT(obj != nullptr);
+        const UnicodeString& type = obj->tag();
+        FunctionName functionName;
+        if (!getDefaultFormatterNameByType(type, functionName)) {
+            break;
+        }
+        return evalFunctionCall(functionName,
+                                create<InternalValue>(std::move(argument), status),
+                                FunctionOptions(),
+                                context,
+                                status);
+    }
+    default: {
+        break;
+    }
+    }
+    return create<InternalValue>(std::move(argument), status);
+}
+
+[[nodiscard]] InternalValue* MessageFormatter::evalFunctionCall(const FunctionName& functionName,
+                                                                InternalValue* arg_,
+                                                                FunctionOptions&& options,
+                                                                MessageContext& context,
+                                                                UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return {};
+    }
+
+    LocalPointer<InternalValue> arg(arg_);
+
+    LocalPointer<Formatter> formatterImpl(nullptr);
+    LocalPointer<Selector> selectorImpl(nullptr);
+    if (isFormatter(functionName)) {
+        formatterImpl.adoptInstead(getFormatter(functionName, status));
+        U_ASSERT(U_SUCCESS(status));
+    }
+    if (isSelector(functionName)) {
+        selectorImpl.adoptInstead(getSelector(context, functionName, status));
+        U_ASSERT(U_SUCCESS(status));
+    }
+    if (formatterImpl == nullptr && selectorImpl == nullptr) {
+        context.getErrors().setUnknownFunction(functionName, status);
+
+        if (arg->hasNullOperand()) {
+            UnicodeString fallback(COLON);
+            fallback += functionName;
+            return new InternalValue(FormattedPlaceholder(fallback));
+        } else {
+            return new InternalValue(FormattedPlaceholder(arg->getFallback()));
+        }
+    }
+    return new InternalValue(arg.orphan(),
+                             std::move(options),
+                             functionName,
+                             formatterImpl.isValid() ? formatterImpl.orphan() : nullptr,
+                             selectorImpl.isValid() ? selectorImpl.orphan() : nullptr);
+}
+
+[[nodiscard]] InternalValue* MessageFormatter::formatExpression(const UnicodeString& fallback,
+                                                                const Environment& globalEnv,
+                                                                const Expression& expr,
+                                                                MessageContext& context,
+                                                                UErrorCode &status) const {
+    if (U_FAILURE(status)) {
+        return {};
+    }
+
+    const Operand& rand = expr.getOperand();
+    LocalPointer<InternalValue> randVal(formatOperand(fallback, globalEnv, rand, context, status));
+
+    FormattedPlaceholder maybeRand = randVal->takeArgument(status);
+
+    if (!expr.isFunctionCall() && U_SUCCESS(status)) {
+         if (maybeRand.isFallback()) {
+            return randVal.orphan();
+        }
+        return evalFunctionCall(std::move(maybeRand), context, status);
+    } else if (expr.isFunctionCall()) {
+        status = U_ZERO_ERROR;
+        const Operator* rator = expr.getOperator(status);
+        U_ASSERT(U_SUCCESS(status));
+        const FunctionName& functionName = rator->getFunctionName();
+        const OptionMap& options = rator->getOptionsInternal();
+        FunctionOptions resolvedOptions = resolveOptions(globalEnv, options, context, status);
+
+        return evalFunctionCall(functionName,
+                                randVal.orphan(),
+                                std::move(resolvedOptions),
+                                context,
+                                status);
+    } else {
+        status = U_ZERO_ERROR;
+        return randVal.orphan();
+    }
+}
+
+void MessageFormatter::formatPattern(MessageContext& context, const Environment& globalEnv, const Pattern& pat, UErrorCode &status, UnicodeString& result) const {
+    CHECK_ERROR(status);
+
+    for (int32_t i = 0; i < pat.numParts(); i++) {
+        const PatternPart& part = pat.getPart(i);
+        if (part.isText()) {
+            result += part.asText();
+        } else if (part.isMarkup()) {
+        } else {
+              LocalPointer<InternalValue> partVal(
+                  formatExpression({}, globalEnv, part.contents(), context, status));
+              FormattedPlaceholder partResult = partVal->forceFormatting(context.getErrors(),
+                                                                         status);
+              result += partResult.formatToString(locale, status);
+              if (status == U_MF_FORMATTING_ERROR) {
+                  status = U_ZERO_ERROR;
+                  context.getErrors().setFormattingError(status);
+              }
+        }
+    }
+}
+
+
+void MessageFormatter::resolveSelectors(MessageContext& context, const Environment& env, UErrorCode &status, UVector& res) const {
+    CHECK_ERROR(status);
+    U_ASSERT(!dataModel.hasPattern());
+
+    const VariableName* selectors = dataModel.getSelectorsInternal();
+    for (int32_t i = 0; i < dataModel.numSelectors(); i++) {
+        LocalPointer<InternalValue> rv(formatOperand({}, env, Operand(selectors[i]), context, status));
+        if (rv->canSelect()) {
+        } else {
+            DynamicErrors& err = context.getErrors();
+            err.setSelectorError(rv->getFunctionName(), status);
+            rv.adoptInstead(new InternalValue(FormattedPlaceholder(rv->getFallback())));
+            if (!rv.isValid()) {
+                status = U_MEMORY_ALLOCATION_ERROR;
+                return;
+            }
+        }
+        res.adoptElement(rv.orphan(), status);
+    }
+}
+
+void MessageFormatter::matchSelectorKeys(const UVector& keys,
+                                         MessageContext& context,
+					 InternalValue* rv, 
+					 UVector& keysOut,
+					 UErrorCode& status) const {
+    CHECK_ERROR(status);
+
+    if (U_FAILURE(status)) {
+        status = U_ZERO_ERROR;
+        return;
+    }
+
+    UErrorCode savedStatus = status;
+
+    int32_t keysLen = keys.size();
+    UnicodeString* keysArr = new UnicodeString[keysLen];
+    if (keysArr == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    for (int32_t i = 0; i < keysLen; i++) {
+        const UnicodeString* k = static_cast<UnicodeString*>(keys[i]);
+        U_ASSERT(k != nullptr);
+        keysArr[i] = *k;
+    }
+    LocalArray<UnicodeString> adoptedKeys(keysArr);
+
+    UnicodeString* prefsArr = new UnicodeString[keysLen];
+    if (prefsArr == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    LocalArray<UnicodeString> adoptedPrefs(prefsArr);
+    int32_t prefsLen = 0;
+
+    FunctionName name = rv->getFunctionName();
+    rv->forceSelection(context.getErrors(),
+                       adoptedKeys.getAlias(), keysLen,
+                       adoptedPrefs.getAlias(), prefsLen,
+                       status);
+
+    if (savedStatus != status) {
+        if (U_FAILURE(status)) {
+            status = U_ZERO_ERROR;
+            context.getErrors().setSelectorError(name, status);
+        } else {
+            status = savedStatus;
+        }
+    }
+
+    CHECK_ERROR(status);
+
+    keysOut.removeAllElements();
+    for (int32_t i = 0; i < prefsLen; i++) {
+        UnicodeString* k = message2::create<UnicodeString>(std::move(prefsArr[i]), status);
+        if (k == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return;
+        }
+        keysOut.adoptElement(k, status);
+        CHECK_ERROR(status);
+    }
+}
+
+void MessageFormatter::resolvePreferences(MessageContext& context, UVector& res, UVector& pref, UErrorCode &status) const {
+    CHECK_ERROR(status);
+
+    UnicodeString ks;
+    LocalPointer<UnicodeString> ksP;
+    int32_t numVariants = dataModel.numVariants();
+    const Variant* variants = dataModel.getVariantsInternal();
+    for (int32_t i = 0; i < res.size(); i++) {
+        LocalPointer<UVector> keys(createUVector(status));
+        CHECK_ERROR(status);
+        for (int32_t variantNum = 0; variantNum < numVariants; variantNum++) {
+            const SelectorKeys& selectorKeys = variants[variantNum].getKeys();
+
+            const Key* var = selectorKeys.getKeysInternal();
+            U_ASSERT(i < selectorKeys.len); 
+            const Key& key = var[i];
+            if (!key.isWildcard()) {
+                ks = StandardFunctions::normalizeNFC(key.asLiteral().unquoted());
+                ksP.adoptInstead(create<UnicodeString>(std::move(ks), status));
+                CHECK_ERROR(status);
+                keys->adoptElement(ksP.orphan(), status);
+            }
+        }
+        U_ASSERT(i < res.size());
+        InternalValue* rv = static_cast<InternalValue*>(res[i]);
+        LocalPointer<UVector> matches(createUVector(status));
+        matchSelectorKeys(*keys, context, std::move(rv), *matches, status);
+        pref.adoptElement(matches.orphan(), status);
+    }
+}
+
+static int32_t vectorFind(const UVector& v, const UnicodeString& k) {
+    for (int32_t i = 0; i < v.size(); i++) {
+        if (*static_cast<UnicodeString*>(v[i]) == k) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static UBool vectorContains(const UVector& v, const UnicodeString& k) {
+    return (vectorFind(v, k) != -1);
+}
+
+void MessageFormatter::filterVariants(const UVector& pref, UVector& vars, UErrorCode& status) const {
+    const Variant* variants = dataModel.getVariantsInternal();
+
+    for (int32_t j = 0; j < dataModel.numVariants(); j++) {
+        const SelectorKeys& selectorKeys = variants[j].getKeys();
+        const Pattern& p = variants[j].getPattern();
+
+        const Key* var = selectorKeys.getKeysInternal();
+        bool noMatch = false;
+        for (int32_t i = 0; i < pref.size(); i++) {
+            U_ASSERT(i < selectorKeys.len);
+            const Key& key = var[i];
+            if (key.isWildcard()) {
+                continue;
+            }
+            UnicodeString ks = StandardFunctions::normalizeNFC(key.asLiteral().unquoted());
+            const UVector& matches = *(static_cast<UVector*>(pref[i])); 
+            if (vectorContains(matches, ks)) {
+                continue;
+            }
+            noMatch = true;
+            break;
+        }
+        if (!noMatch) {
+	    PrioritizedVariant* tuple = create<PrioritizedVariant>(PrioritizedVariant(-1, selectorKeys, p), status);
+            CHECK_ERROR(status);
+            vars.adoptElement(tuple, status);
+        }
+    }
+}
+
+void MessageFormatter::sortVariants(const UVector& pref, UVector& vars, UErrorCode& status) const {
+    CHECK_ERROR(status);
+
+
+    int32_t len = pref.size();
+    int32_t i = len - 1;
+    while (i >= 0) {
+        U_ASSERT(pref[i] != nullptr);
+	const UVector& matches = *(static_cast<UVector*>(pref[i])); 
+        int32_t minpref = matches.size();
+        for (int32_t j = 0; j < vars.size(); j++) {
+            U_ASSERT(vars[j] != nullptr);
+            PrioritizedVariant& tuple = *(static_cast<PrioritizedVariant*>(vars[j]));
+            int32_t matchpref = minpref;
+            const Key* tupleVariantKeys = tuple.keys.getKeysInternal();
+            U_ASSERT(i < tuple.keys.len); 
+            const Key& key = tupleVariantKeys[i];
+            if (!key.isWildcard()) {
+                UnicodeString ks = StandardFunctions::normalizeNFC(key.asLiteral().unquoted());
+                matchpref = vectorFind(matches, ks);
+                U_ASSERT(matchpref >= 0);
+            }
+            tuple.priority = matchpref;
+        }
+        vars.sort(comparePrioritizedVariants, status);
+        CHECK_ERROR(status);
+        i--;
+    }
+}
+
+void MessageFormatter::formatSelectors(MessageContext& context, const Environment& env, UErrorCode &status, UnicodeString& result) const {
+    CHECK_ERROR(status);
+
+
+    LocalPointer<UVector> res(createUVector(status));
+    CHECK_ERROR(status);
+    resolveSelectors(context, env, status, *res);
+
+    LocalPointer<UVector> pref(createUVector(status));
+    CHECK_ERROR(status);
+    resolvePreferences(context, *res, *pref, status);
+
+    LocalPointer<UVector> vars(createUVector(status));
+    CHECK_ERROR(status);
+    filterVariants(*pref, *vars, status);
+
+    sortVariants(*pref, *vars, status);
+
+    CHECK_ERROR(status);
+
+    U_ASSERT(vars->size() > 0); 
+    const PrioritizedVariant& var = *(static_cast<PrioritizedVariant*>(vars->elementAt(0)));
+    const Pattern& pat = var.pat;
+
+    formatPattern(context, env, pat, status, result);
+}
+
+UnicodeString MessageFormatter::formatToString(const MessageArguments& arguments, UErrorCode &status) {
+    EMPTY_ON_ERROR(status);
+
+    MessageContext context(arguments, *errors, status);
+    UnicodeString result;
+
+    if (!(errors->hasSyntaxError() || errors->hasDataModelError())) {
+        Environment* env(Environment::create(status));
+        checkDeclarations(context, env, status);
+        LocalPointer<Environment> globalEnv(env);
+
+        if (dataModel.hasPattern()) {
+            formatPattern(context, *globalEnv, dataModel.getPattern(), status, result);
+        } else {
+            const DynamicErrors& err = context.getErrors();
+            if (err.hasSyntaxError() || err.hasDataModelError()) {
+                result += REPLACEMENT;
+            } else {
+                formatSelectors(context, *globalEnv, status, result);
+            }
+        }
+    }
+
+    if (signalErrors) {
+        context.checkErrors(status);
+    }
+    if (U_FAILURE(status)) {
+        result.remove();
+    }
+    return result;
+}
+
+
+void MessageFormatter::check(MessageContext& context, const Environment& localEnv, const OptionMap& options, UErrorCode& status) const {
+    for (int32_t i = 0; i < options.size(); i++) {
+        const Option& opt = options.getOption(i, status);
+        CHECK_ERROR(status);
+        check(context, localEnv, opt.getValue(), status);
+    }
+}
+
+void MessageFormatter::check(MessageContext& context, const Environment& localEnv, const Operand& rand, UErrorCode& status) const {
+    if (rand.isLiteral() || rand.isNull()) {
+        return;
+    }
+
+    const VariableName& var = rand.asVariable();
+    UnicodeString normalized = StandardFunctions::normalizeNFC(var);
+
+    if (localEnv.has(normalized)) {
+        return;
+    }
+    context.getGlobal(normalized, status);
+    if (status == U_ILLEGAL_ARGUMENT_ERROR) {
+        status = U_ZERO_ERROR;
+        context.getErrors().setUnresolvedVariable(var, status);
+    }
+    return;
+}
+
+void MessageFormatter::check(MessageContext& context, const Environment& localEnv, const Expression& expr, UErrorCode& status) const {
+    if (expr.isFunctionCall()) {
+        const Operator* rator = expr.getOperator(status);
+        U_ASSERT(U_SUCCESS(status));
+        const Operand& rand = expr.getOperand();
+        check(context, localEnv, rand, status);
+        check(context, localEnv, rator->getOptionsInternal(), status);
+    }
+}
+
+void MessageFormatter::checkDeclarations(MessageContext& context, Environment*& env, UErrorCode &status) const {
+    CHECK_ERROR(status);
+
+    const Binding* decls = getDataModel().getLocalVariablesInternal();
+    U_ASSERT(env != nullptr && (decls != nullptr || getDataModel().bindingsLen == 0));
+
+    for (int32_t i = 0; i < getDataModel().bindingsLen; i++) {
+        const Binding& decl = decls[i];
+        const Expression& rhs = decl.getValue();
+        check(context, *env, rhs, status);
+
+
+        env = Environment::create(StandardFunctions::normalizeNFC(decl.getVariable()),
+                                  Closure(rhs, *env),
+                                  env,
+                                  status);
+        CHECK_ERROR(status);
+    }
+}
+} 
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_MF2 */
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* #if !UCONFIG_NO_NORMALIZATION */

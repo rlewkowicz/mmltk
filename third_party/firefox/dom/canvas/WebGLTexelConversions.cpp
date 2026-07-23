@@ -1,0 +1,423 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WebGLTexelConversions.h"
+
+#include "GLBlitHelper.h"
+#include "WebGLContext.h"
+
+namespace mozilla {
+
+using namespace WebGLTexelConversions;
+
+namespace {
+
+class WebGLImageConverter {
+  const size_t mWidth, mHeight;
+  const void* const mSrcStart;
+  void* const mDstStart;
+  const ptrdiff_t mSrcStride, mDstStride;
+  bool mAlreadyRun;
+  bool mSuccess;
+
+  template <WebGLTexelFormat Format>
+  static size_t NumElementsPerTexelForFormat() {
+    switch (Format) {
+      case WebGLTexelFormat::A8:
+      case WebGLTexelFormat::A16F:
+      case WebGLTexelFormat::A32F:
+      case WebGLTexelFormat::R8:
+      case WebGLTexelFormat::R16F:
+      case WebGLTexelFormat::R32F:
+      case WebGLTexelFormat::RGB565:
+      case WebGLTexelFormat::RGB11F11F10F:
+      case WebGLTexelFormat::RGBA4444:
+      case WebGLTexelFormat::RGBA5551:
+        return 1;
+      case WebGLTexelFormat::RA8:
+      case WebGLTexelFormat::RA16F:
+      case WebGLTexelFormat::RA32F:
+      case WebGLTexelFormat::RG8:
+      case WebGLTexelFormat::RG16F:
+      case WebGLTexelFormat::RG32F:
+        return 2;
+      case WebGLTexelFormat::RGB8:
+      case WebGLTexelFormat::RGB16F:
+      case WebGLTexelFormat::RGB32F:
+        return 3;
+      case WebGLTexelFormat::RGBA8:
+      case WebGLTexelFormat::RGBA16F:
+      case WebGLTexelFormat::RGBA32F:
+      case WebGLTexelFormat::BGRX8:
+      case WebGLTexelFormat::BGRA8:
+        return 4;
+      default:
+        MOZ_ASSERT(false, "Unknown texel format. Coding mistake?");
+        return 0;
+    }
+  }
+
+  template <WebGLTexelFormat SrcFormat, WebGLTexelFormat DstFormat,
+            WebGLTexelPremultiplicationOp PremultiplicationOp,
+            dom::PredefinedColorSpace SrcColorSpace,
+            dom::PredefinedColorSpace DstColorSpace>
+  void run() {
+
+    bool sameColorSpace = (SrcColorSpace == DstColorSpace);
+
+    if (SrcFormat == DstFormat &&
+        PremultiplicationOp == WebGLTexelPremultiplicationOp::None &&
+        sameColorSpace) {
+      return;
+    }
+
+    const bool CanSrcFormatComeFromDOMElementOrImageData =
+        SrcFormat == WebGLTexelFormat::BGRA8 ||
+        SrcFormat == WebGLTexelFormat::BGRX8 ||
+        SrcFormat == WebGLTexelFormat::A8 ||
+        SrcFormat == WebGLTexelFormat::RGB565 ||
+        SrcFormat == WebGLTexelFormat::RGBA8;
+    if (!CanSrcFormatComeFromDOMElementOrImageData && SrcFormat != DstFormat) {
+      return;
+    }
+
+    if (!CanSrcFormatComeFromDOMElementOrImageData &&
+        PremultiplicationOp == WebGLTexelPremultiplicationOp::Unpremultiply) {
+      return;
+    }
+
+    if (!HasAlpha(SrcFormat) || !HasColor(SrcFormat) || !HasColor(DstFormat)) {
+      if (PremultiplicationOp != WebGLTexelPremultiplicationOp::None) {
+        return;
+      }
+    }
+
+
+    MOZ_ASSERT(!mAlreadyRun, "converter should be run only once!");
+    mAlreadyRun = true;
+
+
+    using SrcType = typename DataTypeForFormat<SrcFormat>::Type;
+    using DstType = typename DataTypeForFormat<DstFormat>::Type;
+
+    const WebGLTexelFormat IntermediateSrcFormat =
+        IntermediateFormat<SrcFormat>::Value;
+    const WebGLTexelFormat IntermediateDstFormat =
+        IntermediateFormat<DstFormat>::Value;
+    using IntermediateSrcType =
+        typename DataTypeForFormat<IntermediateSrcFormat>::Type;
+    using IntermediateDstType =
+        typename DataTypeForFormat<IntermediateDstFormat>::Type;
+
+    const size_t NumElementsPerSrcTexel =
+        NumElementsPerTexelForFormat<SrcFormat>();
+    const size_t NumElementsPerDstTexel =
+        NumElementsPerTexelForFormat<DstFormat>();
+    const size_t MaxElementsPerTexel = 4;
+    MOZ_ASSERT(NumElementsPerSrcTexel <= MaxElementsPerTexel,
+               "unhandled format");
+    MOZ_ASSERT(NumElementsPerDstTexel <= MaxElementsPerTexel,
+               "unhandled format");
+
+    MOZ_ASSERT(
+        mSrcStride % sizeof(SrcType) == 0 && mDstStride % sizeof(DstType) == 0,
+        "Unsupported: texture stride is not a multiple of sizeof(type)");
+    const ptrdiff_t srcStrideInElements =
+        mSrcStride / static_cast<ptrdiff_t>(sizeof(SrcType));
+    const ptrdiff_t dstStrideInElements =
+        mDstStride / static_cast<ptrdiff_t>(sizeof(DstType));
+    MOZ_ASSERT(bool(srcStrideInElements < 0) == bool(mSrcStride < 0));
+    MOZ_ASSERT(bool(dstStrideInElements < 0) == bool(mDstStride < 0));
+
+    const SrcType* srcRowStart = static_cast<const SrcType*>(mSrcStart);
+    DstType* dstRowStart = static_cast<DstType*>(mDstStart);
+
+    static auto inColorSpace2 = gfx::ToColorSpace2(SrcColorSpace);
+    static auto outColorSpace2 = gfx::ToColorSpace2(DstColorSpace);
+    static auto inTransferFunction = gfx::TransferFunction::SRGB;
+    static auto outTransferFunction = gfx::TransferFunction::SRGB;
+
+    auto inColorProfile =
+        gl::GLBlitHelper::ToColorProfileDesc(inColorSpace2, inTransferFunction);
+    auto outColorProfile = gl::GLBlitHelper::ToColorProfileDesc(
+        outColorSpace2, outTransferFunction);
+
+    const auto conversion = color::ColorProfileConversionDesc::From({
+        .src = *inColorProfile,
+        .dst = *outColorProfile,
+    });
+
+    for (size_t i = 0; i < mHeight; ++i) {
+      const SrcType* srcRowEnd = srcRowStart + mWidth * NumElementsPerSrcTexel;
+      const SrcType* srcPtr = srcRowStart;
+      DstType* dstPtr = dstRowStart;
+      while (srcPtr != srcRowEnd) {
+        IntermediateSrcType unpackedSrc[MaxElementsPerTexel];
+        IntermediateDstType unpackedDst[MaxElementsPerTexel];
+
+        unpack<SrcFormat>(srcPtr, unpackedSrc);
+
+        if (!sameColorSpace) {
+          float srcAsFloat[MaxElementsPerTexel];
+          convertType(unpackedSrc, srcAsFloat);
+          auto inTexelVec =
+              color::vec3({srcAsFloat[0], srcAsFloat[1], srcAsFloat[2]});
+          auto outTexelVec = conversion.DstFromSrc(inTexelVec);
+          srcAsFloat[0] = outTexelVec[0];
+          srcAsFloat[1] = outTexelVec[1];
+          srcAsFloat[2] = outTexelVec[2];
+          convertType(srcAsFloat, unpackedSrc);
+        }
+
+        convertType(unpackedSrc, unpackedDst);
+        pack<DstFormat, PremultiplicationOp>(unpackedDst, dstPtr);
+
+        srcPtr += NumElementsPerSrcTexel;
+        dstPtr += NumElementsPerDstTexel;
+      }
+      srcRowStart += srcStrideInElements;
+      dstRowStart += dstStrideInElements;
+    }
+
+    mSuccess = true;
+  }
+
+  template <WebGLTexelFormat SrcFormat, WebGLTexelFormat DstFormat,
+            WebGLTexelPremultiplicationOp PremultiplicationOp,
+            dom::PredefinedColorSpace SrcColorSpace>
+  void run(dom::PredefinedColorSpace dstColorSpace) {
+#define WEBGLIMAGECONVERTER_CASE_DSTCOLORSPACE(DstColorSpace)            \
+  case DstColorSpace:                                                    \
+    return run<SrcFormat, DstFormat, PremultiplicationOp, SrcColorSpace, \
+               DstColorSpace>();
+
+    switch (dstColorSpace) {
+      WEBGLIMAGECONVERTER_CASE_DSTCOLORSPACE(dom::PredefinedColorSpace::Srgb)
+      WEBGLIMAGECONVERTER_CASE_DSTCOLORSPACE(
+          dom::PredefinedColorSpace::Display_p3)
+      default:
+        MOZ_ASSERT(false, "unhandled case. Coding mistake?");
+    }
+
+#undef WEBGLIMAGECONVERTER_CASE_DSTCOLORSPACE
+  }
+
+  template <WebGLTexelFormat SrcFormat, WebGLTexelFormat DstFormat,
+            WebGLTexelPremultiplicationOp PremultiplicationOp>
+  void run(dom::PredefinedColorSpace srcColorSpace,
+           dom::PredefinedColorSpace dstColorSpace) {
+#define WEBGLIMAGECONVERTER_CASE_SRCCOLORSPACE(SrcColorSpace)             \
+  case SrcColorSpace:                                                     \
+    return run<SrcFormat, DstFormat, PremultiplicationOp, SrcColorSpace>( \
+        dstColorSpace);
+
+    switch (srcColorSpace) {
+      WEBGLIMAGECONVERTER_CASE_SRCCOLORSPACE(dom::PredefinedColorSpace::Srgb)
+      WEBGLIMAGECONVERTER_CASE_SRCCOLORSPACE(
+          dom::PredefinedColorSpace::Display_p3)
+      default:
+        MOZ_ASSERT(false, "unhandled case. Coding mistake?");
+    }
+
+#undef WEBGLIMAGECONVERTER_CASE_SRCCOLORSPACE
+  }
+
+  template <WebGLTexelFormat SrcFormat, WebGLTexelFormat DstFormat>
+  void run(WebGLTexelPremultiplicationOp premultiplicationOp,
+           dom::PredefinedColorSpace srcColorSpace,
+           dom::PredefinedColorSpace dstColorSpace) {
+#define WEBGLIMAGECONVERTER_CASE_PREMULTIPLICATIONOP(PremultiplicationOp) \
+  case PremultiplicationOp:                                               \
+    return run<SrcFormat, DstFormat, PremultiplicationOp>(srcColorSpace,  \
+                                                          dstColorSpace);
+
+    switch (premultiplicationOp) {
+      WEBGLIMAGECONVERTER_CASE_PREMULTIPLICATIONOP(
+          WebGLTexelPremultiplicationOp::None)
+      WEBGLIMAGECONVERTER_CASE_PREMULTIPLICATIONOP(
+          WebGLTexelPremultiplicationOp::Premultiply)
+      WEBGLIMAGECONVERTER_CASE_PREMULTIPLICATIONOP(
+          WebGLTexelPremultiplicationOp::Unpremultiply)
+      default:
+        MOZ_ASSERT(false, "unhandled case. Coding mistake?");
+    }
+
+#undef WEBGLIMAGECONVERTER_CASE_PREMULTIPLICATIONOP
+  }
+
+  template <WebGLTexelFormat SrcFormat>
+  void run(WebGLTexelFormat dstFormat,
+           WebGLTexelPremultiplicationOp premultiplicationOp,
+           dom::PredefinedColorSpace srcColorSpace,
+           dom::PredefinedColorSpace dstColorSpace) {
+#define WEBGLIMAGECONVERTER_CASE_DSTFORMAT(DstFormat)                    \
+  case DstFormat:                                                        \
+    return run<SrcFormat, DstFormat>(premultiplicationOp, srcColorSpace, \
+                                     dstColorSpace);
+
+    switch (dstFormat) {
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::A8)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::A16F)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::A32F)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::R8)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::R16F)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::R32F)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RA8)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RA16F)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RA32F)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RG8)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RG16F)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RG32F)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RGB8)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RGB565)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RGB11F11F10F)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RGB16F)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RGB32F)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RGBA8)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RGBA5551)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RGBA4444)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RGBA16F)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RGBA32F)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::RGBX8)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::BGRX8)
+      WEBGLIMAGECONVERTER_CASE_DSTFORMAT(WebGLTexelFormat::BGRA8)
+
+      default:
+        MOZ_ASSERT(false, "unhandled case. Coding mistake?");
+    }
+
+#undef WEBGLIMAGECONVERTER_CASE_DSTFORMAT
+  }
+
+ public:
+  void run(WebGLTexelFormat srcFormat, WebGLTexelFormat dstFormat,
+           WebGLTexelPremultiplicationOp premultiplicationOp,
+           dom::PredefinedColorSpace srcColorSpace,
+           dom::PredefinedColorSpace dstColorSpace) {
+#define WEBGLIMAGECONVERTER_CASE_SRCFORMAT(SrcFormat)                    \
+  case SrcFormat:                                                        \
+    return run<SrcFormat>(dstFormat, premultiplicationOp, srcColorSpace, \
+                          dstColorSpace);
+
+    switch (srcFormat) {
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::A8)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::A16F)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::A32F)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::R8)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::R16F)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::R32F)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RA8)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RA16F)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RA32F)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RG8)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RG16F)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RG32F)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RGB8)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RGB565)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RGB11F11F10F)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RGB16F)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RGB32F)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RGBA8)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RGBA5551)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RGBA4444)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RGBA16F)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RGBA32F)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::RGBX8)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::BGRX8)
+      WEBGLIMAGECONVERTER_CASE_SRCFORMAT(WebGLTexelFormat::BGRA8)
+
+      default:
+        MOZ_ASSERT(false, "unhandled case. Coding mistake?");
+    }
+
+#undef WEBGLIMAGECONVERTER_CASE_SRCFORMAT
+  }
+
+  WebGLImageConverter(size_t width, size_t height, const void* srcStart,
+                      void* dstStart, ptrdiff_t srcStride, ptrdiff_t dstStride)
+      : mWidth(width),
+        mHeight(height),
+        mSrcStart(srcStart),
+        mDstStart(dstStart),
+        mSrcStride(srcStride),
+        mDstStride(dstStride),
+        mAlreadyRun(false),
+        mSuccess(false) {}
+
+  bool Success() const { return mSuccess; }
+};
+
+}  
+
+bool ConvertImage(size_t width, size_t height, const void* srcBegin,
+                  size_t srcStride, gl::OriginPos srcOrigin,
+                  WebGLTexelFormat srcFormat, bool srcPremultiplied,
+                  void* dstBegin, size_t dstStride, gl::OriginPos dstOrigin,
+                  WebGLTexelFormat dstFormat, bool dstPremultiplied,
+                  dom::PredefinedColorSpace srcColorSpace,
+                  dom::PredefinedColorSpace dstColorSpace,
+                  bool* const out_wasTrivial) {
+  *out_wasTrivial = true;
+
+  if (srcFormat == WebGLTexelFormat::FormatNotSupportingAnyConversion ||
+      dstFormat == WebGLTexelFormat::FormatNotSupportingAnyConversion) {
+    return false;
+  }
+
+  if (!width || !height) return true;
+
+  const bool shouldYFlip = (srcOrigin != dstOrigin);
+
+  const bool canSkipPremult =
+      (!HasAlpha(srcFormat) || !HasColor(srcFormat) || !HasColor(dstFormat));
+
+  WebGLTexelPremultiplicationOp premultOp;
+  if (canSkipPremult) {
+    premultOp = WebGLTexelPremultiplicationOp::None;
+  } else if (!srcPremultiplied && dstPremultiplied) {
+    premultOp = WebGLTexelPremultiplicationOp::Premultiply;
+  } else if (srcPremultiplied && !dstPremultiplied) {
+    premultOp = WebGLTexelPremultiplicationOp::Unpremultiply;
+  } else {
+    premultOp = WebGLTexelPremultiplicationOp::None;
+  }
+
+  const uint8_t* srcItr = (const uint8_t*)srcBegin;
+  const uint8_t* const srcEnd = srcItr + srcStride * height;
+  uint8_t* dstItr = (uint8_t*)dstBegin;
+  ptrdiff_t dstItrStride = dstStride;
+  if (shouldYFlip) {
+    dstItr = dstItr + dstStride * (height - 1);
+    dstItrStride = -dstItrStride;
+  }
+
+  bool sameColorSpace = (srcColorSpace == dstColorSpace);
+
+  if (srcFormat == dstFormat &&
+      premultOp == WebGLTexelPremultiplicationOp::None && sameColorSpace) {
+
+    const auto bytesPerPixel = TexelBytesForFormat(srcFormat);
+    const size_t bytesPerRow = bytesPerPixel * width;
+
+    while (srcItr != srcEnd) {
+      memcpy(dstItr, srcItr, bytesPerRow);
+      srcItr += srcStride;
+      dstItr += dstItrStride;
+    }
+    return true;
+  }
+
+  *out_wasTrivial = false;
+
+  WebGLImageConverter converter(width, height, srcItr, dstItr, srcStride,
+                                dstItrStride);
+  converter.run(srcFormat, dstFormat, premultOp, srcColorSpace, dstColorSpace);
+  if (!converter.Success()) {
+    MOZ_CRASH("programming mistake in WebGL texture conversions");
+  }
+
+  return true;
+}
+
+}  

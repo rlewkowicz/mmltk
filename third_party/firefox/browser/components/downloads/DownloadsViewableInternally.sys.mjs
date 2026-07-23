@@ -1,0 +1,273 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
+
+const lazy = {};
+
+XPCOMUtils.defineLazyServiceGetter(
+  lazy,
+  "HandlerService",
+  "@mozilla.org/uriloader/handler-service;1",
+  Ci.nsIHandlerService
+);
+XPCOMUtils.defineLazyServiceGetter(
+  lazy,
+  "MIMEService",
+  "@mozilla.org/mime;1",
+  Ci.nsIMIMEService
+);
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  Integration: "resource://gre/modules/Integration.sys.mjs",
+});
+
+const PREF_BRANCH = "browser.download.viewableInternally.";
+export const PREF_ENABLED_TYPES = PREF_BRANCH + "enabledTypes";
+export const PREF_BRANCH_WAS_REGISTERED = PREF_BRANCH + "typeWasRegistered.";
+
+export const PREF_BRANCH_PREVIOUS_ACTION =
+  PREF_BRANCH + "previousHandler.preferredAction.";
+
+export const PREF_BRANCH_PREVIOUS_ASK =
+  PREF_BRANCH + "previousHandler.alwaysAskBeforeHandling.";
+
+export let DownloadsViewableInternally = {
+  register() {
+    XPCOMUtils.defineLazyPreferenceGetter(
+      this,
+      "_enabledTypes",
+      PREF_ENABLED_TYPES,
+      "",
+      () => this._updateAllHandlers(),
+      pref => {
+        let itemStr = pref.trim();
+        return itemStr ? itemStr.split(",").map(s => s.trim()) : [];
+      }
+    );
+
+    for (let handlerType of this._downloadTypesViewableInternally) {
+      if (handlerType.initAvailable) {
+        handlerType.initAvailable();
+      }
+    }
+
+    this._updateAllHandlers();
+
+    lazy.Integration.downloads.register(() => ({
+      shouldViewDownloadInternally:
+        this._shouldViewDownloadInternally.bind(this),
+    }));
+  },
+
+  _downloadTypesViewableInternally: [
+    {
+      extension: "xml",
+      mimeTypes: ["text/xml", "application/xml"],
+      available: true,
+      managedElsewhere: true,
+    },
+    {
+      extension: "svg",
+      mimeTypes: ["image/svg+xml"],
+
+      initAvailable() {
+        XPCOMUtils.defineLazyPreferenceGetter(
+          this,
+          "available",
+          "svg.disabled",
+          true,
+          () => DownloadsViewableInternally._updateHandler(this),
+          disabledPref => !disabledPref
+        );
+      },
+      managedElsewhere: true,
+    },
+    {
+      extension: "webp",
+      mimeTypes: ["image/webp"],
+      available: true,
+      managedElsewhere: false,
+    },
+    {
+      extension: "avif",
+      mimeTypes: ["image/avif"],
+      available: true,
+      managedElsewhere: false,
+    },
+    {
+      extension: "jxl",
+      mimeTypes: ["image/jxl"],
+      initAvailable() {
+        XPCOMUtils.defineLazyPreferenceGetter(
+          this,
+          "available",
+          "image.jxl.enabled",
+          false,
+          () => DownloadsViewableInternally._updateHandler(this)
+        );
+      },
+    },
+    ...(AppConstants.MOZ_MINIMAL_BROWSER
+      ? []
+      : [
+          {
+            extension: "pdf",
+            mimeTypes: ["application/pdf"],
+            available: true,
+            managedElsewhere: true,
+          },
+        ]),
+  ],
+
+  _shouldViewDownloadInternally(aMimeType, aExtension) {
+    if (!aMimeType) {
+      return false;
+    }
+
+    return this._downloadTypesViewableInternally.some(handlerType => {
+      if (
+        !handlerType.managedElsewhere &&
+        !this._enabledTypes.includes(handlerType.extension)
+      ) {
+        return false;
+      }
+
+      return (
+        (handlerType.mimeTypes.includes(aMimeType) ||
+          handlerType.extension == aExtension?.toLowerCase()) &&
+        handlerType.available
+      );
+    });
+  },
+
+  _makeFakeHandler(aMimeType, aExtension) {
+    return {
+      QueryInterface: ChromeUtils.generateQI(["nsIMIMEInfo"]),
+      getFileExtensions() {
+        return [aExtension];
+      },
+      possibleApplicationHandlers: Cc["@mozilla.org/array;1"].createInstance(
+        Ci.nsIMutableArray
+      ),
+      extensionExists(ext) {
+        return ext == aExtension;
+      },
+      alwaysAskBeforeHandling: false,
+      preferredAction: Ci.nsIHandlerInfo.handleInternally,
+      type: aMimeType,
+    };
+  },
+
+  _saveSettings(handlerInfo, handlerType) {
+    Services.prefs.setIntPref(
+      PREF_BRANCH_PREVIOUS_ACTION + handlerType.extension,
+      handlerInfo.preferredAction
+    );
+    Services.prefs.setBoolPref(
+      PREF_BRANCH_PREVIOUS_ASK + handlerType.extension,
+      handlerInfo.alwaysAskBeforeHandling
+    );
+  },
+
+  _restoreSettings(handlerInfo, handlerType) {
+    const prevActionPref = PREF_BRANCH_PREVIOUS_ACTION + handlerType.extension;
+    if (Services.prefs.prefHasUserValue(prevActionPref)) {
+      handlerInfo.alwaysAskBeforeHandling = Services.prefs.getBoolPref(
+        PREF_BRANCH_PREVIOUS_ASK + handlerType.extension
+      );
+      handlerInfo.preferredAction = Services.prefs.getIntPref(prevActionPref);
+      lazy.HandlerService.store(handlerInfo);
+    } else {
+      lazy.HandlerService.remove(handlerInfo);
+    }
+  },
+
+  _clearSavedSettings(extension) {
+    Services.prefs.clearUserPref(PREF_BRANCH_PREVIOUS_ACTION + extension);
+    Services.prefs.clearUserPref(PREF_BRANCH_PREVIOUS_ASK + extension);
+  },
+
+  _updateAllHandlers() {
+    for (const handlerType of this._downloadTypesViewableInternally) {
+      if (!handlerType.managedElsewhere) {
+        this._updateHandler(handlerType);
+      }
+    }
+  },
+
+  _updateHandler(handlerType) {
+    const wasRegistered = Services.prefs.getBoolPref(
+      PREF_BRANCH_WAS_REGISTERED + handlerType.extension,
+      false
+    );
+
+    const toBeRegistered =
+      this._enabledTypes.includes(handlerType.extension) &&
+      handlerType.available;
+
+    if (toBeRegistered && !wasRegistered) {
+      this._becomeHandler(handlerType);
+    } else if (!toBeRegistered && wasRegistered) {
+      this._unbecomeHandler(handlerType);
+    }
+  },
+
+  _becomeHandler(handlerType) {
+    let fakeHandlerInfo = this._makeFakeHandler(
+      handlerType.mimeTypes[0],
+      handlerType.extension
+    );
+    if (!lazy.HandlerService.exists(fakeHandlerInfo)) {
+      lazy.HandlerService.store(fakeHandlerInfo);
+    } else {
+      const handlerInfo = lazy.MIMEService.getFromTypeAndExtension(
+        handlerType.mimeTypes[0],
+        handlerType.extension
+      );
+
+      if (handlerInfo.preferredAction != Ci.nsIHandlerInfo.handleInternally) {
+        this._saveSettings(handlerInfo, handlerType);
+      } else {
+        this._clearSavedSettings(handlerType.extension);
+      }
+
+      if (
+        handlerInfo.preferredAction != Ci.nsIHandlerInfo.useHelperApp &&
+        handlerInfo.preferredAction != Ci.nsIHandlerInfo.useSystemDefault
+      ) {
+        handlerInfo.preferredAction = Ci.nsIHandlerInfo.handleInternally;
+        handlerInfo.alwaysAskBeforeHandling = false;
+
+        lazy.HandlerService.store(handlerInfo);
+      }
+    }
+
+    Services.prefs.setBoolPref(
+      PREF_BRANCH_WAS_REGISTERED + handlerType.extension,
+      true
+    );
+  },
+
+  _unbecomeHandler(handlerType) {
+    let handlerInfo;
+    try {
+      handlerInfo = lazy.MIMEService.getFromTypeAndExtension(
+        handlerType.mimeTypes[0],
+        handlerType.extension
+      );
+    } catch (ex) {
+    }
+    if (handlerInfo?.preferredAction == Ci.nsIHandlerInfo.handleInternally) {
+      this._restoreSettings(handlerInfo, handlerType);
+    }
+
+    this._clearSavedSettings(handlerType.extension);
+    Services.prefs.clearUserPref(
+      PREF_BRANCH_WAS_REGISTERED + handlerType.extension
+    );
+  },
+};

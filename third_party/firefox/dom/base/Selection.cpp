@@ -1,0 +1,4181 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "Selection.h"
+
+#include <algorithm>
+
+#include "ErrorList.h"
+#include "LayoutConstants.h"
+#include "mozilla/AccessibleCaretEventHub.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/AutoCopyListener.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/CaretAssociationHint.h"
+#include "mozilla/ContentIterator.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/HTMLEditor.h"
+#include "mozilla/IntegerRange.h"
+#include "mozilla/Logging.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/RangeBoundary.h"
+#include "mozilla/RangeUtils.h"
+#include "mozilla/SelectionMovementUtils.h"
+#include "mozilla/StackWalk.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/ToString.h"
+#include "mozilla/Try.h"
+#include "mozilla/dom/CharacterDataBuffer.h"
+#include "mozilla/dom/ChildIterator.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/SelectionBinding.h"
+#include "mozilla/dom/ShadowRoot.h"
+#include "mozilla/dom/StaticRange.h"
+#include "mozilla/dom/TreeIterator.h"
+#include "mozilla/intl/Bidi.h"
+#include "mozilla/intl/BidiEmbeddingLevel.h"
+#include "nsBidiPresUtils.h"
+#include "nsCCUncollectableMarker.h"
+#include "nsCOMPtr.h"
+#include "nsCaret.h"
+#include "nsContentUtils.h"
+#include "nsCopySupport.h"
+#include "nsDebug.h"
+#include "nsDeviceContext.h"
+#include "nsDirection.h"
+#include "nsError.h"
+#include "nsFmtString.h"
+#include "nsFocusManager.h"
+#include "nsFrameSelection.h"
+#include "nsGkAtoms.h"
+#include "nsIContent.h"
+#include "nsIContentInlines.h"
+#include "nsIDocumentEncoder.h"
+#include "nsIFrameInlines.h"
+#include "nsINamed.h"
+#include "nsISelectionController.h"  //for the enums
+#include "nsISelectionListener.h"
+#include "nsITableCellLayout.h"
+#include "nsITimer.h"
+#include "nsLayoutUtils.h"
+#include "nsPIDOMWindow.h"
+#include "nsPresContext.h"
+#include "nsRange.h"
+#include "nsRefreshDriver.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nsTableCellFrame.h"
+#include "nsTableWrapperFrame.h"
+#include "nsTextFrame.h"
+#include "nsThreadUtils.h"
+
+#ifdef ACCESSIBILITY
+#  include "nsAccessibilityService.h"
+#endif
+
+namespace mozilla {
+static LazyLogModule sSelectionLog("Selection");
+LazyLogModule sSelectionAPILog("SelectionAPI");
+
+std::string format_as(SelectionType aType) {
+  constexpr const char* sNames[] = {
+      "eInvalid",
+      "eNone",
+      "eNormal",
+      "unused",
+      "eIMERawClause",
+      "eIMESelectedRawClause",
+      "eIMEConvertedClause",
+      "eIMESelectedClause",
+      "eAccessibility",
+      "eFind",
+      "eURLSecondary",
+      "eURLStrikeout",
+      "eTargetText",
+      "eHighlight",
+  };
+  static_assert(static_cast<std::underlying_type_t<SelectionType>>(
+                    SelectionType::eInvalid) == -1);
+  static_assert(static_cast<std::underlying_type_t<SelectionType>>(
+                    SelectionType::eHighlight) -
+                    static_cast<std::underlying_type_t<SelectionType>>(
+                        SelectionType::eInvalid) ==
+                std::size(sNames) - 1);
+  const size_t index =
+      static_cast<std::underlying_type_t<SelectionType>>(aType) + 1;
+  return index >= std::size(sNames) ? "<invalid value>" : sNames[index];
+}
+
+std::ostream& operator<<(std::ostream& aStream, SelectionType aType) {
+  return aStream << format_as(aType);
+}
+
+MOZ_ALWAYS_INLINE bool NeedsToLogSelectionAPI(dom::Selection& aSelection) {
+  return aSelection.Type() == SelectionType::eNormal &&
+         MOZ_LOG_TEST(sSelectionAPILog, LogLevel::Info);
+}
+
+void LogStackForSelectionAPI() {
+  if (!MOZ_LOG_TEST(sSelectionAPILog, LogLevel::Debug)) {
+    return;
+  }
+  static nsAutoCString* sBufPtr = nullptr;
+  MOZ_ASSERT(!sBufPtr);
+  nsAutoCString buf;
+  sBufPtr = &buf;
+  auto writer = [](const char* aBuf) { sBufPtr->Append(aBuf); };
+  const LogLevel logLevel = MOZ_LOG_TEST(sSelectionAPILog, LogLevel::Verbose)
+                                ? LogLevel::Verbose
+                                : LogLevel::Debug;
+  MozWalkTheStackWithWriter(writer, CallerPC(),
+                            logLevel == LogLevel::Verbose
+                                ? 0u 
+                                : 8u );
+  MOZ_LOG_FMT(sSelectionAPILog, logLevel, "\n{}", buf.get());
+  sBufPtr = nullptr;
+}
+
+static void LogSelectionAPI(const dom::Selection* aSelection,
+                            const char* aFuncName) {
+  MOZ_LOG_FMT(sSelectionAPILog, LogLevel::Info, "{} Selection::{}()",
+              static_cast<const void*>(aSelection), aFuncName);
+}
+
+static void LogSelectionAPI(const dom::Selection* aSelection,
+                            const char* aFuncName, const char* aArgName,
+                            const nsINode* aNode) {
+  MOZ_LOG_FMT(sSelectionAPILog, LogLevel::Info, "{} Selection::{}({}={})",
+              static_cast<const void*>(aSelection), aFuncName, aArgName,
+              RefPtr{aNode});
+}
+
+static void LogSelectionAPI(const dom::Selection* aSelection,
+                            const char* aFuncName, const char* aArgName,
+                            const dom::AbstractRange& aRange) {
+  MOZ_LOG_FMT(sSelectionAPILog, LogLevel::Info, "{} Selection::{}({}={})",
+              static_cast<const void*>(aSelection), aFuncName, aArgName,
+              ToString(aRange));
+}
+
+static void LogSelectionAPI(const dom::Selection* aSelection,
+                            const char* aFuncName, const char* aArgName1,
+                            const nsINode* aNode, const char* aArgName2,
+                            uint32_t aOffset) {
+  MOZ_LOG_FMT(sSelectionAPILog, LogLevel::Info,
+              "{} Selection::{}({}={}, {}={})",
+              static_cast<const void*>(aSelection), aFuncName, aArgName1,
+              RefPtr{aNode}, aArgName2, aOffset);
+}
+
+static void LogSelectionAPI(const dom::Selection* aSelection,
+                            const char* aFuncName, const char* aArgName,
+                            const RawRangeBoundary& aBoundary) {
+  MOZ_LOG_FMT(sSelectionAPILog, LogLevel::Info, "{} Selection::{}({}={})",
+              static_cast<const void*>(aSelection), aFuncName, aArgName,
+              aBoundary);
+}
+
+static void LogSelectionAPI(const dom::Selection* aSelection,
+                            const char* aFuncName, const char* aArgName1,
+                            const nsAString& aStr1, const char* aArgName2,
+                            const nsAString& aStr2, const char* aArgName3,
+                            const nsAString& aStr3) {
+  MOZ_LOG_FMT(
+      sSelectionAPILog, LogLevel::Info, "{} Selection::{}({}={}, {}={}, {}={})",
+      static_cast<const void*>(aSelection), aFuncName, aArgName1,
+      NS_ConvertUTF16toUTF8(aStr1), aArgName2, NS_ConvertUTF16toUTF8(aStr2),
+      aArgName3, NS_ConvertUTF16toUTF8(aStr3));
+}
+
+static void LogSelectionAPI(const dom::Selection* aSelection,
+                            const char* aFuncName, const char* aNodeArgName1,
+                            const nsINode& aNode1, const char* aOffsetArgName1,
+                            uint32_t aOffset1, const char* aNodeArgName2,
+                            const nsINode& aNode2, const char* aOffsetArgName2,
+                            uint32_t aOffset2) {
+  if (&aNode1 == &aNode2 && aOffset1 == aOffset2) {
+    MOZ_LOG_FMT(sSelectionAPILog, LogLevel::Info,
+                "{} Selection::{}({}={}={}, {}={}={})",
+                static_cast<const void*>(aSelection), aFuncName, aNodeArgName1,
+                aNodeArgName2, aNode1, aOffsetArgName1, aOffsetArgName2,
+                aOffset1);
+  } else {
+    MOZ_LOG_FMT(sSelectionAPILog, LogLevel::Info,
+                "{} Selection::{}({}={}, {}={}, {}={}, {}={})",
+                static_cast<const void*>(aSelection), aFuncName, aNodeArgName1,
+                aNode1, aOffsetArgName1, aOffset1, aNodeArgName2, aNode2,
+                aOffsetArgName2, aOffset2);
+  }
+}
+
+static void LogSelectionAPI(const dom::Selection* aSelection,
+                            const char* aFuncName, const char* aNodeArgName1,
+                            const nsINode& aNode1, const char* aOffsetArgName1,
+                            uint32_t aOffset1, const char* aNodeArgName2,
+                            const nsINode& aNode2, const char* aOffsetArgName2,
+                            uint32_t aOffset2, const char* aDirArgName,
+                            nsDirection aDirection, const char* aReasonArgName,
+                            int16_t aReason) {
+  if (&aNode1 == &aNode2 && aOffset1 == aOffset2) {
+    MOZ_LOG_FMT(sSelectionAPILog, LogLevel::Info,
+                "{} Selection::{}({}={}={}, {}={}={}, {}={}, {}={})",
+                static_cast<const void*>(aSelection), aFuncName, aNodeArgName1,
+                aNodeArgName2, aNode1, aOffsetArgName1, aOffsetArgName2,
+                aOffset1, aDirArgName, aDirection, aReasonArgName, aReason);
+  } else {
+    MOZ_LOG_FMT(sSelectionAPILog, LogLevel::Info,
+                "{} Selection::{}({}={}, {}={}, {}={}, {}={}, {}={}, {}={})",
+                static_cast<const void*>(aSelection), aFuncName, aNodeArgName1,
+                aNode1, aOffsetArgName1, aOffset1, aNodeArgName2, aNode2,
+                aOffsetArgName2, aOffset2, aDirArgName, aDirection,
+                aReasonArgName, aReason);
+  }
+}
+
+static void LogSelectionAPI(const dom::Selection* aSelection,
+                            const char* aFuncName, const char* aArgName1,
+                            const RawRangeBoundary& aBoundary1,
+                            const char* aArgName2,
+                            const RawRangeBoundary& aBoundary2) {
+  if (aBoundary1 == aBoundary2) {
+    MOZ_LOG_FMT(sSelectionAPILog, LogLevel::Info, "{} Selection::{}({}={}={})",
+                static_cast<const void*>(aSelection), aFuncName, aArgName1,
+                aArgName2, aBoundary1);
+  } else {
+    MOZ_LOG_FMT(sSelectionAPILog, LogLevel::Info,
+                "{} Selection::{}({}={}, {}={})",
+                static_cast<const void*>(aSelection), aFuncName, aArgName1,
+                aBoundary1, aArgName2, aBoundary2);
+  }
+}
+}  
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+
+#ifdef PRINT_RANGE
+static void printRange(nsRange* aDomRange);
+#  define DEBUG_OUT_RANGE(x) printRange(x)
+#else
+#  define DEBUG_OUT_RANGE(x)
+#endif  // PRINT_RANGE
+
+uint64_t SelectionChangeGuard::sGeneration = 0;
+
+static constexpr nsLiteralCString kNoDocumentTypeNodeError =
+    "DocumentType nodes are not supported"_ns;
+static constexpr nsLiteralCString kNoRangeExistsError =
+    "No selection range exists"_ns;
+static constexpr nsLiteralCString kIndexSizeError =
+    "The offset is out of range."_ns;
+
+namespace mozilla {
+
+
+nsCString SelectionChangeReasonsToCString(int16_t aReasons) {
+  nsCString reasons;
+  if (!aReasons) {
+    reasons.AssignLiteral("NO_REASON");
+    return reasons;
+  }
+  auto EnsureSeparator = [](nsCString& aString) -> void {
+    if (!aString.IsEmpty()) {
+      aString.AppendLiteral(" | ");
+    }
+  };
+  struct ReasonData {
+    int16_t mReason;
+    const char* mReasonStr;
+
+    ReasonData(int16_t aReason, const char* aReasonStr)
+        : mReason(aReason), mReasonStr(aReasonStr) {}
+  };
+  for (const ReasonData& reason :
+       {ReasonData(nsISelectionListener::DRAG_REASON, "DRAG_REASON"),
+        ReasonData(nsISelectionListener::MOUSEDOWN_REASON, "MOUSEDOWN_REASON"),
+        ReasonData(nsISelectionListener::MOUSEUP_REASON, "MOUSEUP_REASON"),
+        ReasonData(nsISelectionListener::KEYPRESS_REASON, "KEYPRESS_REASON"),
+        ReasonData(nsISelectionListener::SELECTALL_REASON, "SELECTALL_REASON"),
+        ReasonData(nsISelectionListener::COLLAPSETOSTART_REASON,
+                   "COLLAPSETOSTART_REASON"),
+        ReasonData(nsISelectionListener::COLLAPSETOEND_REASON,
+                   "COLLAPSETOEND_REASON"),
+        ReasonData(nsISelectionListener::IME_REASON, "IME_REASON"),
+        ReasonData(nsISelectionListener::JS_REASON, "JS_REASON")}) {
+    if (aReasons & reason.mReason) {
+      EnsureSeparator(reasons);
+      reasons.Append(reason.mReasonStr);
+    }
+  }
+  return reasons;
+}
+
+}  
+
+SelectionNodeCache::SelectionNodeCache(PresShell& aOwningPresShell)
+    : mOwningPresShell(aOwningPresShell) {
+  MOZ_ASSERT(!mOwningPresShell.mSelectionNodeCache);
+  mOwningPresShell.mSelectionNodeCache = this;
+}
+
+SelectionNodeCache::~SelectionNodeCache() {
+  mOwningPresShell.mSelectionNodeCache = nullptr;
+}
+
+bool SelectionNodeCache::MaybeCollectNodesAndCheckIfFullySelectedInAnyOf(
+    const nsINode* aNode, const nsTArray<Selection*>& aSelections) {
+  for (const auto* sel : aSelections) {
+    if (MaybeCollectNodesAndCheckIfFullySelected(aNode, sel)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const nsTHashSet<const nsINode*>& SelectionNodeCache::MaybeCollect(
+    const Selection* aSelection) {
+  MOZ_ASSERT(aSelection);
+  return mSelectedNodes.LookupOrInsertWith(aSelection, [sel = RefPtr(
+                                                            aSelection)] {
+    nsTHashSet<const nsINode*> fullySelectedNodes;
+    for (size_t rangeIndex = 0; rangeIndex < sel->RangeCount(); ++rangeIndex) {
+      AbstractRange* range = sel->GetAbstractRangeAt(rangeIndex);
+      MOZ_ASSERT(range);
+      if (range->AreNormalRangeAndCrossShadowBoundaryRangeCollapsed()) {
+        continue;
+      }
+      if (range->IsStaticRange() && !range->AsStaticRange()->IsValid()) {
+        continue;
+      }
+      const RangeBoundary& startRef = range->MayCrossShadowBoundaryStartRef();
+      const RangeBoundary& endRef = range->MayCrossShadowBoundaryEndRef();
+
+      const nsINode* startContainer =
+          startRef.IsStartOfContainer() ? nullptr : startRef.GetContainer();
+      const nsINode* endContainer =
+          endRef.IsEndOfContainer() ? nullptr : endRef.GetContainer();
+
+      auto AddNodeIfFullySelected = [&](const nsINode* aNode) {
+        if (!aNode) {
+          return;
+        }
+        if (aNode == startContainer || aNode == endContainer) {
+          return;
+        }
+        fullySelectedNodes.Insert(aNode);
+      };
+
+      ContentSubtreeIterator subtreeIter;
+      nsresult rv = subtreeIter.InitWithAllowCrossShadowBoundary(range);
+      if (NS_FAILED(rv)) {
+        continue;
+      }
+
+      for (; !subtreeIter.IsDone(); subtreeIter.Next()) {
+        MOZ_DIAGNOSTIC_ASSERT(subtreeIter.GetCurrentNode());
+        if (subtreeIter.GetCurrentNode()->IsContent()) {
+          TreeIterator<FlattenedChildIteratorForSelection> iter(
+              *(subtreeIter.GetCurrentNode()->AsContent()));
+          for (; iter.GetCurrent(); iter.GetNext()) {
+            AddNodeIfFullySelected(iter.GetCurrent());
+          }
+        }
+      }
+    }
+    return fullySelectedNodes;
+  });
+}
+
+
+
+struct CachedOffsetForFrame {
+  CachedOffsetForFrame()
+      : mCachedFrameOffset(0, 0)  
+        ,
+        mLastCaretFrame(nullptr),
+        mLastContentOffset(0),
+        mCanCacheFrameOffset(false) {}
+
+  nsPoint mCachedFrameOffset;  
+  nsIFrame* mLastCaretFrame;   
+  int32_t mLastContentOffset;  
+  bool mCanCacheFrameOffset;   
+};
+
+class AutoScroller final : public nsITimerCallback, public nsINamed {
+ public:
+  NS_DECL_ISUPPORTS
+
+  explicit AutoScroller(nsFrameSelection* aFrameSelection)
+      : mFrameSelection(aFrameSelection),
+        mPresContext(nullptr),
+        mPoint(0, 0),
+        mDelayInMs(30),
+        mFurtherScrollingAllowed(FurtherScrollingAllowed::kYes) {
+    MOZ_ASSERT(mFrameSelection);
+  }
+
+  MOZ_CAN_RUN_SCRIPT nsresult DoAutoScroll(nsIFrame* aFrame, nsPoint aPoint);
+
+ private:
+  nsresult ScheduleNextDoAutoScroll(nsPresContext* aPresContext,
+                                    nsPoint& aPoint) {
+    if (NS_WARN_IF(mFurtherScrollingAllowed == FurtherScrollingAllowed::kNo)) {
+      return NS_ERROR_FAILURE;
+    }
+
+    mPoint = aPoint;
+
+    mPresContext = aPresContext;
+
+    mContent = PresShell::GetCapturingContent();
+
+    if (!mTimer) {
+      mTimer = NS_NewTimer(GetMainThreadSerialEventTarget());
+      if (!mTimer) {
+        return NS_ERROR_OUT_OF_MEMORY;
+      }
+    }
+
+    return mTimer->InitWithCallback(this, mDelayInMs, nsITimer::TYPE_ONE_SHOT);
+  }
+
+ public:
+  enum class FurtherScrollingAllowed { kYes, kNo };
+
+  void Stop(const FurtherScrollingAllowed aFurtherScrollingAllowed) {
+    MOZ_ASSERT((aFurtherScrollingAllowed == FurtherScrollingAllowed::kNo) ||
+               (mFurtherScrollingAllowed == FurtherScrollingAllowed::kYes));
+
+    if (mTimer) {
+      mTimer->Cancel();
+      mTimer = nullptr;
+    }
+
+    mContent = nullptr;
+    mFurtherScrollingAllowed = aFurtherScrollingAllowed;
+  }
+
+  void SetDelay(uint32_t aDelayInMs) { mDelayInMs = aDelayInMs; }
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHOD Notify(nsITimer* timer) override {
+    if (mPresContext) {
+      AutoWeakFrame frame =
+          mContent ? mPresContext->GetPrimaryFrameFor(mContent) : nullptr;
+      if (!frame) {
+        return NS_OK;
+      }
+      mContent = nullptr;
+
+      nsPoint pt = mPoint - frame->GetOffsetTo(
+                                mPresContext->PresShell()->GetRootFrame());
+      RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+      frameSelection->HandleDrag(frame, pt);
+      if (!frame.IsAlive()) {
+        return NS_OK;
+      }
+
+      NS_ASSERTION(frame->PresContext() == mPresContext, "document mismatch?");
+      DoAutoScroll(frame, pt);
+    }
+    return NS_OK;
+  }
+
+  NS_IMETHOD GetName(nsACString& aName) override {
+    aName.AssignLiteral("AutoScroller");
+    return NS_OK;
+  }
+
+ protected:
+  virtual ~AutoScroller() {
+    if (mTimer) {
+      mTimer->Cancel();
+    }
+  }
+
+ private:
+  nsFrameSelection* const mFrameSelection;
+  nsPresContext* mPresContext;
+  nsPoint mPoint;
+  nsCOMPtr<nsITimer> mTimer;
+  nsCOMPtr<nsIContent> mContent;
+  uint32_t mDelayInMs;
+  FurtherScrollingAllowed mFurtherScrollingAllowed;
+};
+
+NS_IMPL_ISUPPORTS(AutoScroller, nsITimerCallback, nsINamed)
+
+#ifdef PRINT_RANGE
+void printRange(nsRange* aDomRange) {
+  if (!aDomRange) {
+    printf("NULL Range\n");
+  }
+  nsINode* startNode = aDomRange->GetStartContainer();
+  nsINode* endNode = aDomRange->GetEndContainer();
+  int32_t startOffset = aDomRange->StartOffset();
+  int32_t endOffset = aDomRange->EndOffset();
+
+  printf("range: 0x%lx\t start: 0x%lx %ld, \t end: 0x%lx,%ld\n",
+         (unsigned long)aDomRange, (unsigned long)startNode, (long)startOffset,
+         (unsigned long)endNode, (long)endOffset);
+}
+#endif /* PRINT_RANGE */
+
+void Selection::Stringify(nsAString& aResult, CallerType aCallerType,
+                          FlushFrames aFlushFrames) {
+  if (aFlushFrames == FlushFrames::Yes) {
+    RefPtr<PresShell> presShell =
+        mFrameSelection ? mFrameSelection->GetPresShell() : nullptr;
+    if (!presShell) {
+      aResult.Truncate();
+      return;
+    }
+    presShell->FlushPendingNotifications(FlushType::Frames);
+  }
+
+  IgnoredErrorResult rv;
+  uint32_t flags = nsIDocumentEncoder::SkipInvisibleContent;
+  if (StaticPrefs::dom_selection_mimic_chrome_tostring_enabled() &&
+      Type() == SelectionType::eNormal &&
+      aCallerType == CallerType::NonSystem) {
+    if (mFrameSelection &&
+        !mFrameSelection->GetIndependentSelectionRootElement()) {
+      flags |= nsIDocumentEncoder::MimicChromeToStringBehaviour;
+    }
+  }
+
+  ToStringWithFormat(u"text/plain"_ns, flags, 0, aResult, rv);
+  if (rv.Failed()) {
+    aResult.Truncate();
+  }
+}
+
+void Selection::ToStringWithFormat(const nsAString& aFormatType,
+                                   uint32_t aFlags, int32_t aWrapCol,
+                                   nsAString& aReturn, ErrorResult& aRv) {
+  nsCOMPtr<nsIDocumentEncoder> encoder =
+      do_createDocumentEncoder(NS_ConvertUTF16toUTF8(aFormatType).get());
+  if (!encoder) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+
+  PresShell* presShell = GetPresShell();
+  if (!presShell) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+
+  Document* doc = presShell->GetDocument();
+
+  aFlags |= nsIDocumentEncoder::OutputSelectionOnly;
+  nsAutoString readstring;
+  readstring.Assign(aFormatType);
+  nsresult rv = encoder->Init(doc, readstring, aFlags);
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+    return;
+  }
+
+  Selection* selectionToEncode = this;
+
+  if (aFlags & nsIDocumentEncoder::MimicChromeToStringBehaviour) {
+    if (const nsFrameSelection* sel =
+            presShell->GetLastSelectionForToString()) {
+      MOZ_ASSERT(StaticPrefs::dom_selection_mimic_chrome_tostring_enabled());
+      selectionToEncode = &sel->NormalSelection();
+    }
+  }
+
+  encoder->SetSelection(selectionToEncode);
+  if (aWrapCol != 0) encoder->SetWrapColumn(aWrapCol);
+
+  rv = encoder->EncodeToString(aReturn);
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+  }
+}
+
+nsresult Selection::SetInterlinePosition(InterlinePosition aInterlinePosition) {
+  MOZ_ASSERT(mSelectionType == SelectionType::eNormal);
+  MOZ_ASSERT(aInterlinePosition != InterlinePosition::Undefined);
+
+  if (!mFrameSelection) {
+    return NS_ERROR_NOT_INITIALIZED;  
+  }
+
+  mFrameSelection->SetHint(aInterlinePosition ==
+                                   InterlinePosition::StartOfNextLine
+                               ? CaretAssociationHint::After
+                               : CaretAssociationHint::Before);
+  return NS_OK;
+}
+
+Selection::InterlinePosition Selection::GetInterlinePosition() const {
+  MOZ_ASSERT(mSelectionType == SelectionType::eNormal);
+
+  if (!mFrameSelection) {
+    return InterlinePosition::Undefined;
+  }
+  return mFrameSelection->GetHint() == CaretAssociationHint::After
+             ? InterlinePosition::StartOfNextLine
+             : InterlinePosition::EndOfLine;
+}
+
+void Selection::SetInterlinePositionJS(bool aHintRight, ErrorResult& aRv) {
+  MOZ_ASSERT(mSelectionType == SelectionType::eNormal);
+
+  aRv = SetInterlinePosition(aHintRight ? InterlinePosition::StartOfNextLine
+                                        : InterlinePosition::EndOfLine);
+}
+
+bool Selection::GetInterlinePositionJS(ErrorResult& aRv) const {
+  const InterlinePosition interlinePosition = GetInterlinePosition();
+  if (interlinePosition == InterlinePosition::Undefined) {
+    aRv.Throw(NS_ERROR_NOT_INITIALIZED);  
+    return false;
+  }
+  return interlinePosition == InterlinePosition::StartOfNextLine;
+}
+
+static bool IsEditorNode(const nsINode* aNode) {
+  if (!aNode) {
+    return false;
+  }
+
+  if (aNode->IsEditable()) {
+    return true;
+  }
+
+  auto* element = Element::FromNode(aNode);
+  return element && element->State().HasState(ElementState::READWRITE);
+}
+
+bool Selection::IsEditorSelection() const {
+  return IsEditorNode(GetFocusNode());
+}
+
+Nullable<int16_t> Selection::GetCaretBidiLevel(
+    mozilla::ErrorResult& aRv) const {
+  MOZ_ASSERT(mSelectionType == SelectionType::eNormal);
+
+  if (!mFrameSelection) {
+    aRv.Throw(NS_ERROR_NOT_INITIALIZED);
+    return Nullable<int16_t>();
+  }
+  mozilla::intl::BidiEmbeddingLevel caretBidiLevel =
+      static_cast<mozilla::intl::BidiEmbeddingLevel>(
+          mFrameSelection->GetCaretBidiLevel());
+  return (caretBidiLevel & BIDI_LEVEL_UNDEFINED)
+             ? Nullable<int16_t>()
+             : Nullable<int16_t>(caretBidiLevel);
+}
+
+void Selection::SetCaretBidiLevel(const Nullable<int16_t>& aCaretBidiLevel,
+                                  mozilla::ErrorResult& aRv) {
+  MOZ_ASSERT(mSelectionType == SelectionType::eNormal);
+
+  if (!mFrameSelection) {
+    aRv.Throw(NS_ERROR_NOT_INITIALIZED);
+    return;
+  }
+  if (aCaretBidiLevel.IsNull()) {
+    mFrameSelection->UndefineCaretBidiLevel();
+  } else {
+    mFrameSelection->SetCaretBidiLevelAndMaybeSchedulePaint(
+        mozilla::intl::BidiEmbeddingLevel(aCaretBidiLevel.Value()));
+  }
+}
+
+static nsresult GetTableSelectionMode(const nsRange& aRange,
+                                      TableSelectionMode* aTableSelectionType) {
+  if (!aTableSelectionType) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  *aTableSelectionType = TableSelectionMode::None;
+
+  nsINode* startNode = aRange.GetStartContainer();
+  if (!startNode) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsINode* endNode = aRange.GetEndContainer();
+  if (!endNode) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (startNode != endNode) {
+    return NS_OK;
+  }
+
+  nsIContent* child = aRange.GetChildAtStartOffset();
+
+  if (!child || child->GetNextSibling() != aRange.GetChildAtEndOffset()) {
+    return NS_OK;
+  }
+
+  if (!startNode->IsHTMLElement()) {
+    return NS_OK;
+  }
+
+  if (startNode->IsHTMLElement(nsGkAtoms::tr)) {
+    *aTableSelectionType = TableSelectionMode::Cell;
+  } else  
+  {
+    if (child->IsHTMLElement(nsGkAtoms::table)) {
+      *aTableSelectionType = TableSelectionMode::Table;
+    } else if (child->IsHTMLElement(nsGkAtoms::tr)) {
+      *aTableSelectionType = TableSelectionMode::Row;
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult Selection::MaybeAddTableCellRange(nsRange& aRange,
+                                           Maybe<size_t>* aOutIndex) {
+  if (!aOutIndex) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  MOZ_ASSERT(aOutIndex->isNothing());
+
+  if (!mFrameSelection) {
+    return NS_OK;
+  }
+
+  TableSelectionMode tableMode;
+  nsresult result = GetTableSelectionMode(aRange, &tableMode);
+  if (NS_FAILED(result)) return result;
+
+  if (tableMode != TableSelectionMode::Cell) {
+    mFrameSelection->mTableSelection.mMode = tableMode;
+    return NS_OK;
+  }
+
+  if (mFrameSelection->mTableSelection.mMode == TableSelectionMode::None) {
+    mFrameSelection->mTableSelection.mMode = tableMode;
+  }
+
+  return AddRangesForSelectableNodes(&aRange, aOutIndex,
+                                     DispatchSelectstartEvent::Maybe);
+}
+
+Selection::Selection(SelectionType aSelectionType,
+                     nsFrameSelection* aFrameSelection)
+    : mFrameSelection(aFrameSelection),
+      mCachedOffsetForFrame(nullptr),
+      mDirection(eDirNext),
+      mSelectionType(aSelectionType),
+      mCustomColors(nullptr),
+      mSelectionChangeBlockerCount(0),
+      mUserInitiated(false),
+      mCalledByJS(false),
+      mNotifyAutoCopy(false) {}
+
+Selection::~Selection() { Disconnect(); }
+
+void Selection::Disconnect() {
+  RemoveAnchorFocusRange();
+
+  mStyledRanges.UnregisterSelection();
+
+  if (mAutoScroller) {
+    mAutoScroller->Stop(AutoScroller::FurtherScrollingAllowed::kNo);
+    mAutoScroller = nullptr;
+  }
+
+  mScrollEvent.Revoke();
+
+  if (mCachedOffsetForFrame) {
+    delete mCachedOffsetForFrame;
+    mCachedOffsetForFrame = nullptr;
+  }
+}
+
+Document* Selection::GetParentObject() const {
+  PresShell* presShell = GetPresShell();
+  return presShell ? presShell->GetDocument() : nullptr;
+}
+
+DocGroup* Selection::GetDocGroup() const {
+  PresShell* presShell = GetPresShell();
+  if (!presShell) {
+    return nullptr;
+  }
+  Document* doc = presShell->GetDocument();
+  return doc ? doc->GetDocGroup() : nullptr;
+}
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(Selection)
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(Selection)
+  tmp->mNotifyAutoCopy = false;
+  if (tmp->mAccessibleCaretEventHub) {
+    tmp->StopNotifyingAccessibleCaretEventHub();
+  }
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mSelectionChangeEventDispatcher)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mSelectionListeners)
+  MOZ_KnownLive(tmp)->RemoveAllRangesInternal(IgnoreErrors(), IsUnlinking::Yes);
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mFrameSelection)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mHighlightData.mHighlight)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_PTR
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_REFERENCE
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(Selection)
+  {
+    uint32_t i, count = tmp->mStyledRanges.mInvalidStaticRanges.Length();
+    for (i = 0; i < count; ++i) {
+      NS_IMPL_CYCLE_COLLECTION_TRAVERSE(
+          mStyledRanges.mInvalidStaticRanges[i].mRange);
+    }
+  }
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mStyledRanges.mRanges)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mAnchorFocusRange)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mFrameSelection)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mHighlightData.mHighlight)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mSelectionChangeEventDispatcher)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mSelectionListeners)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Selection)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupportsWeakReference)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(Selection)
+NS_IMPL_CYCLE_COLLECTING_RELEASE_WITH_LAST_RELEASE(Selection, Disconnect())
+
+const RangeBoundary& Selection::AnchorRef(
+    AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary) const {
+  if (!mAnchorFocusRange) {
+    static RangeBoundary sEmpty;
+    return sEmpty;
+  }
+
+  if (GetDirection() == eDirNext) {
+    return aAllowCrossShadowBoundary == AllowRangeCrossShadowBoundary::Yes
+               ? mAnchorFocusRange->MayCrossShadowBoundaryStartRef()
+               : mAnchorFocusRange->StartRef();
+  }
+
+  return aAllowCrossShadowBoundary == AllowRangeCrossShadowBoundary::Yes
+             ? mAnchorFocusRange->MayCrossShadowBoundaryEndRef()
+             : mAnchorFocusRange->EndRef();
+}
+
+const RangeBoundary& Selection::FocusRef(
+    AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary) const {
+  if (!mAnchorFocusRange) {
+    static RangeBoundary sEmpty;
+    return sEmpty;
+  }
+
+  if (GetDirection() == eDirNext) {
+    return aAllowCrossShadowBoundary == AllowRangeCrossShadowBoundary::Yes
+               ? mAnchorFocusRange->MayCrossShadowBoundaryEndRef()
+               : mAnchorFocusRange->EndRef();
+  }
+  return aAllowCrossShadowBoundary == AllowRangeCrossShadowBoundary::Yes
+             ? mAnchorFocusRange->MayCrossShadowBoundaryStartRef()
+             : mAnchorFocusRange->StartRef();
+}
+
+void Selection::SetAnchorFocusRange(size_t aIndex) {
+  if (aIndex >= mStyledRanges.Length()) {
+    return;
+  }
+  MOZ_ASSERT(mSelectionType != SelectionType::eHighlight);
+  AbstractRange* anchorFocusRange = mStyledRanges.GetAbstractRangeAt(aIndex);
+  mAnchorFocusRange = anchorFocusRange->AsDynamicRange();
+}
+
+template <TreeKind aKind, typename PT, typename RT,
+          typename = std::enable_if_t<aKind == TreeKind::ShadowIncludingDOM ||
+                                      aKind == TreeKind::FlatForSelection>>
+static int32_t CompareToRangeStart(
+    const RangeBoundaryBase<PT, RT>& aCompareBoundary, RangeBoundaryFor aFor,
+    const AbstractRange& aRange, nsContentUtils::NodeIndexCache* aCache) {
+  MOZ_ASSERT(aCompareBoundary.IsSet());
+  const RangeBoundary& startRef = aRange.MayCrossShadowBoundaryStartRef();
+  MOZ_ASSERT(startRef.IsSet());
+  if (aCompareBoundary.GetComposedDoc() != startRef.GetComposedDoc() ||
+      !startRef.IsSetAndInComposedDoc()) {
+    NS_WARNING(
+        "`CompareToRangeStart` couldn't compare nodes, pretending some order.");
+    return 1;
+  }
+  if constexpr (aKind == TreeKind::ShadowIncludingDOM) {
+    const Maybe<int32_t> order =
+        nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+            aCompareBoundary.AsConstRaw().AsRangeBoundaryInDOMTree(),
+            startRef.AsConstRaw().AsRangeBoundaryInDOMTree(), aCache);
+    NS_WARNING_ASSERTION(
+        order.isSome(),
+        fmt::format("\naCompareBoundary={}\n"
+                    "  .AsRangeBoundaryInDOMTree()={}\n"
+                    "startRef={}\n"
+                    "  .AsRangeBoundaryInDOM()={}\n",
+                    aCompareBoundary,
+                    aCompareBoundary.AsConstRaw().AsRangeBoundaryInDOMTree(),
+                    startRef, startRef.AsConstRaw().AsRangeBoundaryInDOMTree())
+            .c_str());
+    return order.valueOr(1);
+  } else {
+    const auto rangeBoundaryFor =
+        aRange.AreNormalRangeAndCrossShadowBoundaryRangeCollapsed()
+            ? RangeBoundaryFor::Collapsed
+            : RangeBoundaryFor::Start;
+    const Maybe<int32_t> order =
+        nsContentUtils::ComparePoints<TreeKind::FlatForSelection>(
+            aCompareBoundary.AsRangeBoundaryInFlatTreeOrNonFlattenedNode(aFor),
+            startRef.AsRangeBoundaryInFlatTreeOrNonFlattenedNode(
+                rangeBoundaryFor),
+            aCache);
+    NS_WARNING_ASSERTION(
+        order.isSome(),
+        fmt::format(
+            "\naCompareBoundary={}\n"
+            "  .AsRangeBoundaryInFlatTreeOrNonFlattenedNode({})={}\n"
+            "startRef={}\n"
+            "  .AsRangeBoundaryInFlatTreeOrNonFlattenedNode({})={}\n",
+            aCompareBoundary, aFor,
+            aCompareBoundary.AsConstRaw()
+                .AsRangeBoundaryInFlatTreeOrNonFlattenedNode(aFor),
+            startRef, rangeBoundaryFor,
+            startRef.AsConstRaw().AsRangeBoundaryInFlatTreeOrNonFlattenedNode(
+                rangeBoundaryFor))
+            .c_str());
+    return order.valueOr(1);
+  }
+}
+
+template <TreeKind aKind, typename PT, typename RT,
+          typename = std::enable_if_t<aKind == TreeKind::ShadowIncludingDOM ||
+                                      aKind == TreeKind::FlatForSelection>>
+static int32_t CompareToRangeStart(
+    const RangeBoundaryBase<PT, RT>& aCompareBoundary, RangeBoundaryFor aFor,
+    const AbstractRange& aRange) {
+  return CompareToRangeStart<aKind>(aCompareBoundary, aFor, aRange, nullptr);
+}
+
+template <TreeKind aKind, typename PT, typename RT,
+          typename = std::enable_if_t<aKind == TreeKind::ShadowIncludingDOM ||
+                                      aKind == TreeKind::FlatForSelection>>
+static int32_t CompareToRangeEnd(
+    const RangeBoundaryBase<PT, RT>& aCompareBoundary, RangeBoundaryFor aFor,
+    const AbstractRange& aRange) {
+  MOZ_ASSERT(aCompareBoundary.IsSet());
+  MOZ_ASSERT(aRange.IsPositioned());
+  const RangeBoundary& endRef = aRange.MayCrossShadowBoundaryEndRef();
+  if (aCompareBoundary.GetComposedDoc() != endRef.GetComposedDoc() ||
+      !endRef.IsSetAndInComposedDoc()) {
+    NS_WARNING(
+        "`CompareToRangeEnd` couldn't compare nodes, pretending some order.");
+    return 1;
+  }
+  if constexpr (aKind == TreeKind::ShadowIncludingDOM) {
+    const Maybe<int32_t> order =
+        nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+            aCompareBoundary.AsConstRaw().AsRangeBoundaryInDOMTree(),
+            endRef.AsConstRaw().AsRangeBoundaryInDOMTree());
+    NS_WARNING_ASSERTION(
+        order.isSome(),
+        fmt::format("\naCompareBoundary={}\n"
+                    "  .AsRangeBoundaryInDOMTree()={}\n"
+                    "endRef={}\n"
+                    "  .AsRangeBoundaryInDOM()={}\n",
+                    aCompareBoundary,
+                    aCompareBoundary.AsConstRaw().AsRangeBoundaryInDOMTree(),
+                    endRef, endRef.AsConstRaw().AsRangeBoundaryInDOMTree())
+            .c_str());
+    return order.valueOr(1);
+  } else {
+    const auto rangeBoundaryFor =
+        aRange.AreNormalRangeAndCrossShadowBoundaryRangeCollapsed()
+            ? RangeBoundaryFor::Collapsed
+            : RangeBoundaryFor::End;
+    const Maybe<int32_t> order =
+        nsContentUtils::ComparePoints<TreeKind::FlatForSelection>(
+            aCompareBoundary.AsRangeBoundaryInFlatTreeOrNonFlattenedNode(aFor),
+            endRef.AsRangeBoundaryInFlatTreeOrNonFlattenedNode(
+                rangeBoundaryFor));
+    NS_WARNING_ASSERTION(
+        order.isSome(),
+        fmt::format(
+            "\naCompareBoundary={}\n"
+            "  .AsRangeBoundaryInFlatTreeOrNonFlattenedNode({})={}\n"
+            "endRef={}\n"
+            "  .AsRangeBoundaryInFlatTreeOrNonFlattenedNode({})={}\n",
+            aCompareBoundary, aFor,
+            aCompareBoundary.AsConstRaw()
+                .AsRangeBoundaryInFlatTreeOrNonFlattenedNode(aFor),
+            endRef, rangeBoundaryFor,
+            endRef.AsConstRaw().AsRangeBoundaryInFlatTreeOrNonFlattenedNode(
+                rangeBoundaryFor))
+            .c_str());
+    return order.valueOr(1);
+  }
+}
+
+template <typename T>
+static const AbstractRange* ExtractRange(const T& aElement) = delete;
+
+template <>
+const AbstractRange* ExtractRange<const StyledRange>(
+    const StyledRange& aElement) {
+  return aElement.mRange;
+}
+
+template <>
+const AbstractRange* ExtractRange<RefPtr<AbstractRange>>(
+    const RefPtr<AbstractRange>& aElement) {
+  return aElement.get();
+}
+
+template <typename PT, typename RT, typename ArrayType>
+size_t Selection::StyledRanges::FindInsertionPoint(
+    const ArrayType& aElementArray, const RangeBoundaryBase<PT, RT>& aBoundary,
+    RangeBoundaryFor aFor,
+    int32_t (*aComparator)(const RangeBoundaryBase<PT, RT>&, RangeBoundaryFor,
+                           const AbstractRange&)) {
+  using ElementType = std::remove_reference_t<decltype(aElementArray[0])>;
+
+  int32_t beginSearch = 0;
+  int32_t endSearch = aElementArray.Length();  
+
+  if (endSearch) {
+    int32_t center = endSearch - 1;  
+    do {
+      const AbstractRange* range =
+          ExtractRange<ElementType>(aElementArray[center]);
+
+      int32_t cmp{aComparator(aBoundary, aFor, *range)};
+
+      if (cmp < 0) {  
+        endSearch = center;
+      } else if (cmp > 0) {  
+        beginSearch = center + 1;
+      } else {  
+        beginSearch = center;
+        break;
+      }
+      center = (endSearch - beginSearch) / 2 + beginSearch;
+    } while (endSearch - beginSearch > 0);
+  }
+
+  return AssertedCast<size_t>(beginSearch);
+}
+
+
+nsresult Selection::StyledRanges::SubtractRange(
+    StyledRange& aRange, nsRange& aSubtract, nsTArray<StyledRange>* aOutput) {
+  AbstractRange* range = aRange.mRange;
+  if (NS_WARN_IF(!range->IsPositioned())) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  if (range->GetStartContainer()->SubtreeRoot() !=
+      aSubtract.GetStartContainer()->SubtreeRoot()) {
+    aOutput->InsertElementAt(0, aRange);
+    return NS_OK;
+  }
+
+  int32_t cmp = CompareToRangeStart<TreeKind::FlatForSelection>(
+      range->StartRef(),
+      range->Collapsed() ? RangeBoundaryFor::Collapsed
+                         : RangeBoundaryFor::Start,
+      aSubtract);
+
+  int32_t cmp2 = CompareToRangeEnd<TreeKind::FlatForSelection>(
+      range->EndRef(),
+      range->Collapsed() ? RangeBoundaryFor::Collapsed : RangeBoundaryFor::End,
+      aSubtract);
+
+
+  if (cmp2 > 0) {
+    ErrorResult error;
+    RefPtr<nsRange> postOverlap =
+        nsRange::Create(aSubtract.EndRef(), range->EndRef(), error);
+    if (NS_WARN_IF(error.Failed())) {
+      return error.StealNSResult();
+    }
+    MOZ_ASSERT(postOverlap);
+    if (!postOverlap->Collapsed()) {
+      aOutput->InsertElementAt(0, StyledRange(postOverlap));
+      (*aOutput)[0].mTextRangeStyle = aRange.mTextRangeStyle;
+    }
+  }
+
+  if (cmp < 0) {
+    ErrorResult error;
+    RefPtr<nsRange> preOverlap =
+        nsRange::Create(range->StartRef(), aSubtract.StartRef(), error);
+    if (NS_WARN_IF(error.Failed())) {
+      return error.StealNSResult();
+    }
+    MOZ_ASSERT(preOverlap);
+    if (!preOverlap->Collapsed()) {
+      aOutput->InsertElementAt(0, StyledRange(preOverlap));
+      (*aOutput)[0].mTextRangeStyle = aRange.mTextRangeStyle;
+    }
+  }
+
+  return NS_OK;
+}
+
+static void UserSelectRangesToAdd(nsRange* aItem,
+                                  nsTArray<RefPtr<nsRange>>& aRangesToAdd) {
+  if (!StaticPrefs::dom_selection_exclude_non_selectable_nodes() ||
+      (IsEditorNode(aItem->GetStartContainer()) &&
+       IsEditorNode(aItem->GetEndContainer()))) {
+    aRangesToAdd.AppendElement(aItem);
+  } else {
+    aItem->ExcludeNonSelectableNodes(&aRangesToAdd);
+  }
+}
+
+static nsINode* DetermineSelectstartEventTarget(const nsRange& aRange) {
+  nsINode* target = aRange.GetStartContainer();
+  if (target && target->IsInNativeAnonymousSubtree()) {
+    target = StaticPrefs::dom_select_events_textcontrols_selectstart_enabled()
+                 ? target->GetClosestNativeAnonymousSubtreeRootParentOrHost()
+                 : nullptr;
+  }
+  return target;
+}
+
+static bool MaybeDispatchSelectstartEvent(const nsRange& aRange,
+                                          Document* aDocument) {
+  nsCOMPtr<nsINode> selectstartEventTarget =
+      DetermineSelectstartEventTarget(aRange);
+
+  bool executeDefaultAction = true;
+
+  if (selectstartEventTarget) {
+    nsContentUtils::DispatchTrustedEvent(
+        aDocument, selectstartEventTarget, u"selectstart"_ns, CanBubble::eYes,
+        Cancelable::eYes, &executeDefaultAction);
+  }
+
+  return executeDefaultAction;
+}
+
+bool Selection::IsUserSelectionCollapsed(
+    const nsRange& aRange, nsTArray<RefPtr<nsRange>>& aTempRangesToAdd) {
+  MOZ_ASSERT(aTempRangesToAdd.IsEmpty());
+
+  RefPtr<nsRange> scratchRange = aRange.CloneRange();
+  UserSelectRangesToAdd(scratchRange, aTempRangesToAdd);
+  const bool userSelectionCollapsed =
+      (aTempRangesToAdd.Length() == 0) ||
+      ((aTempRangesToAdd.Length() == 1) && aTempRangesToAdd[0]->Collapsed());
+
+  aTempRangesToAdd.ClearAndRetainStorage();
+
+  return userSelectionCollapsed;
+}
+
+nsresult Selection::AddRangesForUserSelectableNodes(
+    nsRange* aRange, Maybe<size_t>* aOutIndex,
+    const DispatchSelectstartEvent aDispatchSelectstartEvent) {
+  MOZ_ASSERT(mUserInitiated);
+  MOZ_ASSERT(aOutIndex);
+  MOZ_ASSERT(aOutIndex->isNothing());
+
+  if (!aRange) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  if (!aRange->IsPositioned()) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  AutoTArray<RefPtr<nsRange>, 4> rangesToAdd;
+  if (mStyledRanges.Length()) {
+    aOutIndex->emplace(mStyledRanges.Length() - 1);
+  }
+
+  Document* doc = GetDocument();
+
+  if (aDispatchSelectstartEvent == DispatchSelectstartEvent::Maybe &&
+      mSelectionType == SelectionType::eNormal && IsCollapsed() &&
+      !IsBlockingSelectionChangeEvents()) {
+
+
+    const bool userSelectionCollapsed =
+        IsUserSelectionCollapsed(*aRange, rangesToAdd);
+    MOZ_ASSERT(userSelectionCollapsed || nsContentUtils::IsSafeToRunScript());
+    if (!userSelectionCollapsed && nsContentUtils::IsSafeToRunScript()) {
+      const bool executeDefaultAction =
+          MaybeDispatchSelectstartEvent(*aRange, doc);
+
+      if (!executeDefaultAction) {
+        return NS_OK;
+      }
+
+      if (!aRange->IsPositioned()) {
+        return NS_ERROR_UNEXPECTED;
+      }
+    }
+  }
+
+  UserSelectRangesToAdd(aRange, rangesToAdd);
+  size_t newAnchorFocusIndex =
+      GetDirection() == eDirPrevious ? 0 : rangesToAdd.Length() - 1;
+  for (size_t i = 0; i < rangesToAdd.Length(); ++i) {
+    Maybe<size_t> index;
+    nsresult rv = mStyledRanges.MaybeAddRangeAndTruncateOverlaps(
+        MOZ_KnownLive(rangesToAdd[i]), &index);
+    NS_ENSURE_SUCCESS(rv, rv);
+    if (i == newAnchorFocusIndex) {
+      *aOutIndex = index;
+      rangesToAdd[i]->SetIsGenerated(false);
+    } else {
+      rangesToAdd[i]->SetIsGenerated(true);
+    }
+  }
+  return NS_OK;
+}
+
+nsresult Selection::AddRangesForSelectableNodes(
+    nsRange* aRange, Maybe<size_t>* aOutIndex,
+    const DispatchSelectstartEvent aDispatchSelectstartEvent) {
+  MOZ_ASSERT(aOutIndex);
+  MOZ_ASSERT(aOutIndex->isNothing());
+
+  if (!aRange) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  if (!aRange->IsPositioned()) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  MOZ_LOG_FMT(
+      sSelectionLog, LogLevel::Debug,
+      "{}: selection={}, type={}, range=({}, StartOffset={}, EndOffset={})",
+      __func__, static_cast<void*>(this), GetType(), static_cast<void*>(aRange),
+      aRange->StartOffset(), aRange->EndOffset());
+
+  if (mUserInitiated) {
+    return AddRangesForUserSelectableNodes(aRange, aOutIndex,
+                                           aDispatchSelectstartEvent);
+  }
+
+  return mStyledRanges.MaybeAddRangeAndTruncateOverlaps(aRange, aOutIndex);
+}
+
+nsresult Selection::StyledRanges::AddRangeAndIgnoreOverlaps(
+    AbstractRange* aRange) {
+  MOZ_ASSERT(aRange);
+  MOZ_ASSERT(aRange->IsPositioned());
+  MOZ_ASSERT(mSelection.mSelectionType == SelectionType::eHighlight);
+  if (aRange->IsStaticRange() && !aRange->AsStaticRange()->IsValid()) {
+    mInvalidStaticRanges.AppendElement(StyledRange(aRange));
+    return NS_OK;
+  }
+
+  if (mRanges.Length() == 0) {
+    if (NS_WARN_IF(
+            NS_FAILED(aRange->RegisterSelection(MOZ_KnownLive(mSelection))))) {
+      return NS_ERROR_FAILURE;
+    }
+    mRanges.AppendElement(StyledRange(aRange));
+#ifdef ACCESSIBILITY
+    a11y::SelectionManager::SelectionRangeChanged(mSelection.GetType(),
+                                                  *aRange);
+#endif
+    return NS_OK;
+  }
+
+  Maybe<size_t> maybeStartIndex, maybeEndIndex;
+  nsresult rv =
+      GetIndicesForInterval(aRange->GetStartContainer(), aRange->StartOffset(),
+                            aRange->GetEndContainer(), aRange->EndOffset(),
+                            false, maybeStartIndex, maybeEndIndex);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  size_t startIndex(0);
+  if (maybeEndIndex.isNothing()) {
+    startIndex = 0;
+  } else if (maybeStartIndex.isNothing()) {
+    startIndex = mRanges.Length();
+  } else {
+    startIndex = *maybeStartIndex;
+  }
+
+  if (NS_WARN_IF(
+          NS_FAILED(aRange->RegisterSelection(MOZ_KnownLive(mSelection))))) {
+    return NS_ERROR_FAILURE;
+  }
+  mRanges.InsertElementAt(startIndex, StyledRange(aRange));
+#ifdef ACCESSIBILITY
+  a11y::SelectionManager::SelectionRangeChanged(mSelection.GetType(), *aRange);
+#endif
+  return NS_OK;
+}
+
+nsresult Selection::StyledRanges::MaybeAddRangeAndTruncateOverlaps(
+    nsRange* aRange, Maybe<size_t>* aOutIndex) {
+  MOZ_ASSERT(aRange);
+  MOZ_ASSERT(aRange->IsPositioned());
+  MOZ_ASSERT(aOutIndex);
+  MOZ_ASSERT(aOutIndex->isNothing());
+
+  if (mRanges.Length() == 0) {
+    if (NS_WARN_IF(
+            NS_FAILED(aRange->RegisterSelection(MOZ_KnownLive(mSelection))))) {
+      return NS_ERROR_FAILURE;
+    }
+    mRanges.AppendElement(StyledRange(aRange));
+#ifdef ACCESSIBILITY
+    a11y::SelectionManager::SelectionRangeChanged(mSelection.GetType(),
+                                                  *aRange);
+#endif
+
+    aOutIndex->emplace(0u);
+    return NS_OK;
+  }
+
+  Maybe<size_t> maybeStartIndex, maybeEndIndex;
+  nsresult rv =
+      GetIndicesForInterval(aRange->GetStartContainer(), aRange->StartOffset(),
+                            aRange->GetEndContainer(), aRange->EndOffset(),
+                            false, maybeStartIndex, maybeEndIndex);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  size_t startIndex, endIndex;
+  if (maybeEndIndex.isNothing()) {
+    startIndex = endIndex = 0;
+  } else if (maybeStartIndex.isNothing()) {
+    startIndex = endIndex = mRanges.Length();
+  } else {
+    startIndex = *maybeStartIndex;
+    endIndex = *maybeEndIndex;
+  }
+
+  const bool sameRange = HasEqualRangeBoundariesAt(*aRange, startIndex);
+  if (sameRange) {
+    aOutIndex->emplace(startIndex);
+    return NS_OK;
+  }
+
+#ifdef ACCESSIBILITY
+  a11y::SelectionManager::SelectionRangeChanged(mSelection.GetType(), *aRange);
+#endif
+
+  if (startIndex == endIndex) {
+    if (NS_WARN_IF(
+            NS_FAILED(aRange->RegisterSelection(MOZ_KnownLive(mSelection))))) {
+      return NS_ERROR_FAILURE;
+    }
+    mRanges.InsertElementAt(startIndex, StyledRange(aRange));
+    aOutIndex->emplace(startIndex);
+    return NS_OK;
+  }
+
+  AutoTArray<StyledRange, 2> overlaps;
+  overlaps.AppendElement(GetStyledRangeAt(startIndex));
+  if (endIndex - 1 != startIndex) {
+    overlaps.AppendElement(GetStyledRangeAt(endIndex - 1));
+  }
+
+  for (size_t i = startIndex; i < endIndex; ++i) {
+    GetAbstractRangeAt(i)->UnregisterSelection(mSelection);
+  }
+  mRanges.RemoveElementsAt(startIndex, endIndex - startIndex);
+
+  AutoTArray<StyledRange, 3> temp;
+  for (const size_t i : Reversed(IntegerRange(overlaps.Length()))) {
+    nsresult rv = SubtractRange(overlaps[i], *aRange, &temp);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  size_t insertionPoint =
+      FindInsertionPoint(temp, aRange->StartRef(),
+                         aRange->Collapsed() ? RangeBoundaryFor::Collapsed
+                                             : RangeBoundaryFor::Start,
+                         CompareToRangeStart<TreeKind::FlatForSelection>);
+
+  temp.InsertElementAt(insertionPoint, StyledRange(aRange));
+
+  for (uint32_t i = 0; i < temp.Length(); ++i) {
+    if (temp[i].mRange->IsDynamicRange()) {
+      if (NS_WARN_IF(
+              NS_FAILED(MOZ_KnownLive(temp[i].mRange->AsDynamicRange())
+                            ->RegisterSelection(MOZ_KnownLive(mSelection))))) {
+        return NS_ERROR_FAILURE;
+      }
+    }
+  }
+
+  mRanges.InsertElementsAt(startIndex, temp);
+
+  aOutIndex->emplace(startIndex + insertionPoint);
+  return NS_OK;
+}
+
+nsresult Selection::StyledRanges::RemoveRangeAndUnregisterSelection(
+    AbstractRange& aRange) {
+  const bool rangeExists = mRanges.RemoveElement(&aRange);
+  if (!rangeExists) {
+    return NS_ERROR_DOM_NOT_FOUND_ERR;
+  }
+
+  aRange.UnregisterSelection(mSelection);
+#ifdef ACCESSIBILITY
+  a11y::SelectionManager::SelectionRangeChanged(mSelection.GetType(), aRange);
+#endif
+
+  return NS_OK;
+}
+nsresult Selection::RemoveCollapsedRanges() {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__);
+    LogStackForSelectionAPI();
+  }
+
+  return mStyledRanges.RemoveCollapsedRanges();
+}
+
+nsresult Selection::StyledRanges::RemoveCollapsedRanges() {
+  uint32_t i = 0;
+  while (i < mRanges.Length()) {
+    RefPtr<AbstractRange> range = GetAbstractRangeAt(i);
+    const bool collapsed =
+        range->Collapsed() && !range->MayCrossShadowBoundary();
+    MOZ_ASSERT_IF(
+        range->MayCrossShadowBoundary(),
+        !range->AsDynamicRange()->CrossShadowBoundaryRangeCollapsed());
+
+    if (collapsed) {
+      nsresult rv = RemoveRangeAndUnregisterSelection(*range);
+      NS_ENSURE_SUCCESS(rv, rv);
+    } else {
+      ++i;
+    }
+  }
+  return NS_OK;
+}
+
+void Selection::Clear(nsPresContext* aPresContext, IsUnlinking aIsUnlinking) {
+  RemoveAnchorFocusRange();
+
+  mStyledRanges.UnregisterSelection();
+  for (uint32_t i = 0; i < mStyledRanges.Length(); ++i) {
+    SelectFrames(aPresContext, *mStyledRanges.GetAbstractRangeAt(i), false);
+  }
+  mStyledRanges.Clear();
+
+  SetDirection(eDirNext);
+
+  if (mFrameSelection && mFrameSelection->GetDisplaySelection() ==
+                             nsISelectionController::SELECTION_ATTENTION) {
+    mFrameSelection->SetDisplaySelection(nsISelectionController::SELECTION_ON);
+  }
+}
+
+bool Selection::StyledRanges::HasEqualRangeBoundariesAt(
+    const AbstractRange& aRange, size_t aRangeIndex) const {
+  if (aRangeIndex < mRanges.Length()) {
+    const AbstractRange* range = GetAbstractRangeAt(aRangeIndex);
+    return range->HasEqualBoundaries(aRange);
+  }
+  return false;
+}
+
+void Selection::GetRangesForInterval(nsINode& aBeginNode, uint32_t aBeginOffset,
+                                     nsINode& aEndNode, uint32_t aEndOffset,
+                                     bool aAllowAdjacent,
+                                     nsTArray<RefPtr<nsRange>>& aReturn,
+                                     mozilla::ErrorResult& aRv) {
+  AutoTArray<nsRange*, 2> results;
+  nsresult rv =
+      GetDynamicRangesForIntervalArray(&aBeginNode, aBeginOffset, &aEndNode,
+                                       aEndOffset, aAllowAdjacent, &results);
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+    return;
+  }
+
+  aReturn.SetLength(results.Length());
+  for (size_t i = 0; i < results.Length(); ++i) {
+    aReturn[i] = results[i];  
+  }
+}
+
+nsresult Selection::GetAbstractRangesForIntervalArray(
+    nsINode* aBeginNode, uint32_t aBeginOffset, nsINode* aEndNode,
+    uint32_t aEndOffset, bool aAllowAdjacent,
+    nsTArray<AbstractRange*>* aRanges) {
+  if (NS_WARN_IF(!aBeginNode)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  if (NS_WARN_IF(!aEndNode)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  aRanges->Clear();
+  Maybe<size_t> maybeStartIndex, maybeEndIndex;
+  nsresult res = mStyledRanges.GetIndicesForInterval(
+      aBeginNode, aBeginOffset, aEndNode, aEndOffset, aAllowAdjacent,
+      maybeStartIndex, maybeEndIndex);
+  NS_ENSURE_SUCCESS(res, res);
+
+  if (maybeStartIndex.isNothing() || maybeEndIndex.isNothing()) {
+    return NS_OK;
+  }
+
+  for (const size_t i : IntegerRange(*maybeStartIndex, *maybeEndIndex)) {
+    aRanges->AppendElement(mStyledRanges.GetAbstractRangeAt(i));
+  }
+
+  return NS_OK;
+}
+
+nsresult Selection::GetDynamicRangesForIntervalArray(
+    nsINode* aBeginNode, uint32_t aBeginOffset, nsINode* aEndNode,
+    uint32_t aEndOffset, bool aAllowAdjacent, nsTArray<nsRange*>* aRanges) {
+  MOZ_ASSERT(mSelectionType != SelectionType::eHighlight);
+  AutoTArray<AbstractRange*, 2> abstractRanges;
+  nsresult rv = GetAbstractRangesForIntervalArray(
+      aBeginNode, aBeginOffset, aEndNode, aEndOffset, aAllowAdjacent,
+      &abstractRanges);
+  NS_ENSURE_SUCCESS(rv, rv);
+  aRanges->Clear();
+  aRanges->SetCapacity(abstractRanges.Length());
+  for (auto* abstractRange : abstractRanges) {
+    aRanges->AppendElement(abstractRange->AsDynamicRange());
+  }
+  return NS_OK;
+}
+
+nsresult Selection::StyledRanges::ReorderRangesIfNecessary() {
+  const Document* doc = mSelection.GetDocument();
+  if (!doc) {
+    return NS_OK;
+  }
+  if (mRanges.Length() < 2 && mInvalidStaticRanges.IsEmpty()) {
+    return NS_OK;
+  }
+  const int32_t currentDocumentGeneration = doc->GetGeneration();
+  const bool domMutationHasHappened =
+      currentDocumentGeneration != mDocumentGeneration;
+  if (domMutationHasHappened) {
+    nsTArray<StyledRange> invalidStaticRanges;
+    for (size_t i = 0; i < Length();) {
+      AbstractRange* range = GetAbstractRangeAt(i);
+      if (range->IsStaticRange() && !range->AsStaticRange()->IsValid()) {
+        invalidStaticRanges.AppendElement(mRanges.ExtractElementAt(i));
+      } else {
+        ++i;
+      }
+    }
+    for (auto iter = mInvalidStaticRanges.cbegin();
+         iter != mInvalidStaticRanges.cend();) {
+      MOZ_ASSERT(iter->mRange->IsStaticRange());
+      if (iter->mRange->AsStaticRange()->IsValid()) {
+        mRanges.AppendElement(*iter);
+        if (!iter->mRange->IsInSelection(mSelection)) {
+          if (NS_WARN_IF(
+                  NS_FAILED(iter->mRange->RegisterSelection(mSelection)))) {
+            return NS_ERROR_FAILURE;
+          }
+        }
+        iter = mInvalidStaticRanges.RemoveElementAt(iter);
+      } else {
+        ++iter;
+      }
+    }
+    mInvalidStaticRanges.AppendElements(std::move(invalidStaticRanges));
+  }
+  if (domMutationHasHappened || mRangesMightHaveChanged) {
+    nsContentUtils::NodeIndexCache cache;
+    bool rangeOrderHasChanged = false;
+    RawRangeBoundary previousStartRef;
+    for (const auto& range : mRanges.Ranges()) {
+      if (!previousStartRef.IsSet()) {
+        previousStartRef = range->StartRef().AsRaw();
+        continue;
+      }
+      const Maybe<int32_t> compareResult =
+          nsContentUtils::ComparePoints<TreeKind::FlatForSelection>(
+              range->StartRef(), previousStartRef, &cache);
+      if (compareResult.valueOr(1) != 1) {
+        rangeOrderHasChanged = true;
+        break;
+      }
+      previousStartRef = range->StartRef().AsRaw();
+    }
+    if (rangeOrderHasChanged) {
+      const auto compare = [&cache](const auto& a, const auto& b) {
+        return CompareToRangeStart<TreeKind::FlatForSelection>(
+            a->StartRef(),
+            a->Collapsed() ? RangeBoundaryFor::Collapsed
+                           : RangeBoundaryFor::Start,
+            *b, &cache);
+      };
+      mRanges.Sort(compare);
+    }
+    mDocumentGeneration = currentDocumentGeneration;
+    mRangesMightHaveChanged = false;
+  }
+  return NS_OK;
+}
+
+nsresult Selection::StyledRanges::GetIndicesForInterval(
+    const nsINode* aBeginNode, uint32_t aBeginOffset, const nsINode* aEndNode,
+    uint32_t aEndOffset, bool aAllowAdjacent, Maybe<size_t>& aStartIndex,
+    Maybe<size_t>& aEndIndex) {
+  MOZ_ASSERT(aStartIndex.isNothing());
+  MOZ_ASSERT(aEndIndex.isNothing());
+
+  if (NS_WARN_IF(!aBeginNode)) {
+    return NS_ERROR_INVALID_POINTER;
+  }
+
+  if (NS_WARN_IF(!aEndNode)) {
+    return NS_ERROR_INVALID_POINTER;
+  }
+
+  if (NS_WARN_IF(NS_FAILED(ReorderRangesIfNecessary()))) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (mRanges.Length() == 0) {
+    return NS_OK;
+  }
+
+  const bool intervalIsCollapsed =
+      aBeginNode == aEndNode && aBeginOffset == aEndOffset;
+
+  size_t endsBeforeIndex = FindInsertionPoint(
+      mRanges.Ranges(),
+      ConstRawRangeBoundary(aEndNode, aEndOffset, RangeBoundarySetBy::Offset),
+      intervalIsCollapsed ? RangeBoundaryFor::Collapsed : RangeBoundaryFor::End,
+      &CompareToRangeStart<TreeKind::FlatForSelection>);
+
+  if (endsBeforeIndex == 0) {
+    const AbstractRange* endRange = GetAbstractRangeAt(endsBeforeIndex);
+
+    if (!endRange->StartRef().Equals(aEndNode, aEndOffset)) {
+      return NS_OK;
+    }
+
+    if (!aAllowAdjacent && !(endRange->Collapsed() && intervalIsCollapsed))
+      return NS_OK;
+  }
+  aEndIndex.emplace(endsBeforeIndex);
+
+  size_t beginsAfterIndex =
+      FindInsertionPoint(mRanges.Ranges(),
+                         ConstRawRangeBoundary(aBeginNode, aBeginOffset,
+                                               RangeBoundarySetBy::Offset),
+                         intervalIsCollapsed ? RangeBoundaryFor::Collapsed
+                                             : RangeBoundaryFor::Start,
+                         &CompareToRangeEnd<TreeKind::FlatForSelection>);
+
+  if (beginsAfterIndex == mRanges.Length()) {
+    return NS_OK;  
+  }
+
+  if (aAllowAdjacent) {
+    while (endsBeforeIndex < mRanges.Length()) {
+      const AbstractRange* endRange = GetAbstractRangeAt(endsBeforeIndex);
+      if (!endRange->StartRef().Equals(aEndNode, aEndOffset)) {
+        break;
+      }
+      endsBeforeIndex++;
+    }
+
+    const AbstractRange* beginRange = GetAbstractRangeAt(beginsAfterIndex);
+    if (beginsAfterIndex > 0 && beginRange->Collapsed() &&
+        beginRange->EndRef().Equals(aBeginNode, aBeginOffset)) {
+      beginRange = GetAbstractRangeAt(beginsAfterIndex - 1);
+      if (beginRange->EndRef().Equals(aBeginNode, aBeginOffset)) {
+        beginsAfterIndex--;
+      }
+    }
+  } else {
+    const AbstractRange* beginRange = GetAbstractRangeAt(beginsAfterIndex);
+    if (beginRange->MayCrossShadowBoundaryEndRef().Equals(aBeginNode,
+                                                          aBeginOffset) &&
+        !beginRange->Collapsed()) {
+      beginsAfterIndex++;
+    }
+
+    if (endsBeforeIndex < mRanges.Length()) {
+      const AbstractRange* endRange = GetAbstractRangeAt(endsBeforeIndex);
+      if (endRange->MayCrossShadowBoundaryStartRef().Equals(aEndNode,
+                                                            aEndOffset) &&
+          endRange->Collapsed()) {
+        endsBeforeIndex++;
+      }
+    }
+  }
+
+  NS_ASSERTION(beginsAfterIndex <= endsBeforeIndex, "Is mRanges not ordered?");
+  NS_ENSURE_STATE(beginsAfterIndex <= endsBeforeIndex);
+
+  aStartIndex.emplace(beginsAfterIndex);
+  aEndIndex = Some(endsBeforeIndex);
+  return NS_OK;
+}
+
+nsIFrame* Selection::GetPrimaryFrameForAnchorNode() const {
+  MOZ_ASSERT(mSelectionType == SelectionType::eNormal);
+
+  nsCOMPtr<nsIContent> content = do_QueryInterface(GetAnchorNode());
+  if (content && mFrameSelection) {
+    return SelectionMovementUtils::GetFrameForNodeOffset(
+        content, AnchorOffset(), mFrameSelection->GetHint());
+  }
+  return nullptr;
+}
+
+PrimaryFrameData Selection::GetPrimaryFrameForCaretAtFocusNode(
+    bool aVisual) const {
+  nsIContent* content = nsIContent::FromNodeOrNull(GetFocusNode());
+  if (!content || !mFrameSelection || !mFrameSelection->GetPresShell()) {
+    return {};
+  }
+
+  MOZ_ASSERT(mFrameSelection->GetPresShell()->GetDocument() ==
+             content->GetComposedDoc());
+
+  CaretAssociationHint hint = mFrameSelection->GetHint();
+  intl::BidiEmbeddingLevel caretBidiLevel =
+      mFrameSelection->GetCaretBidiLevel();
+  return SelectionMovementUtils::GetPrimaryFrameForCaret(
+      content, FocusOffset(), aVisual, hint, caretBidiLevel);
+}
+
+void Selection::SelectFramesOf(nsIContent* aContent, bool aSelected) const {
+  nsIFrame* frame = aContent->GetPrimaryFrame();
+  if (!frame) {
+    return;
+  }
+  if (frame->IsTextFrame()) {
+    nsTextFrame* textFrame = static_cast<nsTextFrame*>(frame);
+    textFrame->SelectionStateChanged(
+        0, textFrame->CharacterDataBuffer().GetLength(), aSelected,
+        mSelectionType);
+  } else {
+    frame->SelectionStateChanged();
+  }
+}
+
+void Selection::SelectFramesInAllRanges(nsPresContext* aPresContext) {
+  MOZ_ASSERT(mSelectionType != SelectionType::eHighlight);
+  for (size_t i = 0; i < mStyledRanges.Length(); ++i) {
+    nsRange* range = mStyledRanges.GetAbstractRangeAt(i)->AsDynamicRange();
+    MOZ_ASSERT(range->IsInAnySelection());
+    SelectFrames(aPresContext, *range, range->IsInAnySelection());
+  }
+}
+
+nsresult Selection::SelectFrames(nsPresContext* aPresContext,
+                                 AbstractRange& aRange, bool aSelect) const {
+  if (!mFrameSelection || !aPresContext || !aPresContext->GetPresShell()) {
+    return NS_OK;
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT_IF(!aRange.IsPositioned(),
+                           !aRange.MayCrossShadowBoundary());
+
+  MOZ_DIAGNOSTIC_ASSERT(aRange.IsPositioned());
+
+  const Document* const document = GetDocument();
+  if (MOZ_UNLIKELY(!document ||
+                   aRange.GetComposedDocOfContainers() != document)) {
+    return NS_OK;  
+  }
+
+  if (aRange.IsStaticRange() && !aRange.AsStaticRange()->IsValid()) {
+    return NS_OK;
+  }
+
+  if (mFrameSelection->IsInTableSelectionMode()) {
+    const nsIContent* const commonAncestorContent =
+        nsIContent::FromNodeOrNull(aRange.GetClosestCommonInclusiveAncestor(
+            StaticPrefs::dom_select_events_textcontrols_selectstart_enabled()
+                ? AllowRangeCrossShadowBoundary::Yes
+                : AllowRangeCrossShadowBoundary::No));
+    nsIFrame* const frame = commonAncestorContent
+                                ? commonAncestorContent->GetPrimaryFrame()
+                                : aPresContext->PresShell()->GetRootFrame();
+    if (frame) {
+      if (frame->IsTextFrame()) {
+        MOZ_ASSERT(commonAncestorContent ==
+                   aRange.GetMayCrossShadowBoundaryStartContainer());
+        MOZ_ASSERT(commonAncestorContent ==
+                   aRange.GetMayCrossShadowBoundaryEndContainer());
+        static_cast<nsTextFrame*>(frame)->SelectionStateChanged(
+            aRange.MayCrossShadowBoundaryStartOffset(),
+            aRange.MayCrossShadowBoundaryEndOffset(), aSelect, mSelectionType);
+      } else {
+        frame->SelectionStateChanged();
+      }
+    }
+
+    return NS_OK;
+  }
+
+  nsIContent* const startContent = nsIContent::FromNodeOrNull(
+      aRange.GetMayCrossShadowBoundaryStartContainer());
+  if (MOZ_UNLIKELY(!startContent)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+  MOZ_DIAGNOSTIC_ASSERT(startContent->IsInComposedDoc());
+
+  nsINode* const endNode = aRange.GetMayCrossShadowBoundaryEndContainer();
+  if (NS_WARN_IF(!endNode)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+  const bool isFirstContentTextNode = startContent->IsText();
+  if (isFirstContentTextNode) {
+    if (nsIFrame* const frame = startContent->GetPrimaryFrame()) {
+      if (frame->IsTextFrame()) {
+        const uint32_t startOffset = aRange.MayCrossShadowBoundaryStartOffset();
+        const uint32_t endOffset =
+            endNode == startContent ? aRange.MayCrossShadowBoundaryEndOffset()
+                                    : startContent->Length();
+        static_cast<nsTextFrame*>(frame)->SelectionStateChanged(
+            startOffset, endOffset, aSelect, mSelectionType);
+      } else {
+        frame->SelectionStateChanged();
+      }
+    }
+  }
+
+  if ((aRange.Collapsed() && !aRange.MayCrossShadowBoundary()) ||
+      (startContent == endNode && !startContent->HasChildren())) {
+    if (!isFirstContentTextNode) {
+      SelectFramesOf(startContent, aSelect);
+    }
+    return NS_OK;
+  }
+
+  ContentSubtreeIterator subtreeIter;
+  nsresult rv = subtreeIter.InitWithAllowCrossShadowBoundary(&aRange);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  if (isFirstContentTextNode && !subtreeIter.IsDone() &&
+      subtreeIter.GetCurrentNode() == startContent) {
+    subtreeIter.Next();  
+  }
+  for (; !subtreeIter.IsDone(); subtreeIter.Next()) {
+    MOZ_DIAGNOSTIC_ASSERT(subtreeIter.GetCurrentNode());
+    if (nsIContent* const content =
+            nsIContent::FromNodeOrNull(subtreeIter.GetCurrentNode())) {
+      SelectFramesOfFlattenedTreeOfContent(content, aSelect);
+    }
+  }
+
+  if (endNode == startContent || !endNode->IsText()) {
+    return NS_OK;
+  }
+
+  if (nsIFrame* const frame = endNode->AsText()->GetPrimaryFrame()) {
+    if (frame->IsTextFrame()) {
+      static_cast<nsTextFrame*>(frame)->SelectionStateChanged(
+          0, aRange.MayCrossShadowBoundaryEndOffset(), aSelect, mSelectionType);
+    }
+  }
+  return NS_OK;
+}
+
+void Selection::SelectFramesOfFlattenedTreeOfContent(nsIContent* aContent,
+                                                     bool aSelected) const {
+  MOZ_ASSERT(aContent);
+  TreeIterator<FlattenedChildIteratorForSelection> iter(*aContent);
+  for (; iter.GetCurrent(); iter.GetNext()) {
+    SelectFramesOf(iter.GetCurrent(), aSelected);
+  }
+}
+
+
+UniquePtr<SelectionDetails> Selection::LookUpSelection(
+    nsIContent* aContent, uint32_t aContentOffset, uint32_t aContentLength,
+    UniquePtr<SelectionDetails> aDetailsHead, SelectionType aSelectionType) {
+  if (!aContent) {
+    return aDetailsHead;
+  }
+
+  if (mStyledRanges.Length() == 0) {
+    return aDetailsHead;
+  }
+
+  nsTArray<AbstractRange*> overlappingRanges;
+  SelectionNodeCache* cache =
+      GetPresShell() ? GetPresShell()->GetSelectionNodeCache() : nullptr;
+  if (cache && RangeCount() == 1) {
+    const bool isFullySelected =
+        cache->MaybeCollectNodesAndCheckIfFullySelected(aContent, this);
+    if (isFullySelected) {
+      auto newHead = MakeUnique<SelectionDetails>();
+
+      newHead->mNext = std::move(aDetailsHead);
+      newHead->mStart = AssertedCast<int32_t>(0);
+      newHead->mEnd = AssertedCast<int32_t>(aContentLength);
+      newHead->mSelectionType = aSelectionType;
+      newHead->mHighlightData = mHighlightData;
+      if (const TextRangeStyle* style =
+              mStyledRanges.GetNonDefaultTextRangeStyle(
+                  GetAbstractRangeAt(0))) {
+        newHead->mTextRangeStyle = *style;
+      }
+      auto detailsHead = std::move(newHead);
+
+      return detailsHead;
+    }
+  }
+
+  nsresult rv = GetAbstractRangesForIntervalArray(
+      aContent, aContentOffset, aContent, aContentOffset + aContentLength,
+      false, &overlappingRanges);
+  if (NS_FAILED(rv)) {
+    return aDetailsHead;
+  }
+
+  if (overlappingRanges.Length() == 0) {
+    return aDetailsHead;
+  }
+
+  UniquePtr<SelectionDetails> detailsHead = std::move(aDetailsHead);
+
+  for (size_t i = 0; i < overlappingRanges.Length(); i++) {
+    AbstractRange* range = overlappingRanges[i];
+    if (range->IsStaticRange() && !range->AsStaticRange()->IsValid()) {
+      continue;
+    }
+
+    nsINode* startNode = range->GetMayCrossShadowBoundaryStartContainer();
+    nsINode* endNode = range->GetMayCrossShadowBoundaryEndContainer();
+    uint32_t startOffset = range->MayCrossShadowBoundaryStartOffset();
+    uint32_t endOffset = range->MayCrossShadowBoundaryEndOffset();
+
+    Maybe<uint32_t> start, end;
+    if (startNode == aContent && endNode == aContent) {
+      if (startOffset < (aContentOffset + aContentLength) &&
+          endOffset > aContentOffset) {
+        start.emplace(
+            startOffset >= aContentOffset ? startOffset - aContentOffset : 0u);
+        end.emplace(std::min(aContentLength, endOffset - aContentOffset));
+      }
+    } else if (startNode == aContent) {
+      if (startOffset < (aContentOffset + aContentLength)) {
+        start.emplace(
+            startOffset >= aContentOffset ? startOffset - aContentOffset : 0u);
+        end.emplace(aContentLength);
+      }
+    } else if (endNode == aContent) {
+      if (endOffset > aContentOffset) {
+        start.emplace(0u);
+        end.emplace(std::min(aContentLength, endOffset - aContentOffset));
+      }
+    } else {
+      start.emplace(0u);
+      end.emplace(aContentLength);
+    }
+    if (start.isNothing()) {
+      continue;  
+    }
+
+    auto newHead = MakeUnique<SelectionDetails>();
+
+    newHead->mNext = std::move(detailsHead);
+    newHead->mStart = AssertedCast<int32_t>(*start);
+    newHead->mEnd = AssertedCast<int32_t>(*end);
+    newHead->mSelectionType = aSelectionType;
+    newHead->mHighlightData = mHighlightData;
+    if (const TextRangeStyle* style =
+            mStyledRanges.GetNonDefaultTextRangeStyle(range)) {
+      newHead->mTextRangeStyle = *style;
+    }
+    detailsHead = std::move(newHead);
+  }
+  return detailsHead;
+}
+
+NS_IMETHODIMP
+Selection::Repaint(nsPresContext* aPresContext) {
+  int32_t arrCount = (int32_t)mStyledRanges.Length();
+
+  if (arrCount < 1) return NS_OK;
+
+  int32_t i;
+
+  for (i = 0; i < arrCount; i++) {
+    MOZ_ASSERT(mStyledRanges.GetAbstractRangeAt(i));
+    nsresult rv =
+        SelectFrames(aPresContext, *mStyledRanges.GetAbstractRangeAt(i), true);
+
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+  }
+
+  return NS_OK;
+}
+
+void Selection::SetCanCacheFrameOffset(bool aCanCacheFrameOffset) {
+  if (!mCachedOffsetForFrame) {
+    mCachedOffsetForFrame = new CachedOffsetForFrame;
+  }
+
+  mCachedOffsetForFrame->mCanCacheFrameOffset = aCanCacheFrameOffset;
+
+  if (!aCanCacheFrameOffset) {
+    mCachedOffsetForFrame->mLastCaretFrame = nullptr;
+  }
+}
+
+nsresult Selection::GetCachedFrameOffset(nsIFrame* aFrame, int32_t inOffset,
+                                         nsPoint& aPoint) {
+  if (!mCachedOffsetForFrame) {
+    mCachedOffsetForFrame = new CachedOffsetForFrame;
+  }
+
+  nsresult rv = NS_OK;
+  if (mCachedOffsetForFrame->mCanCacheFrameOffset &&
+      mCachedOffsetForFrame->mLastCaretFrame &&
+      (aFrame == mCachedOffsetForFrame->mLastCaretFrame) &&
+      (inOffset == mCachedOffsetForFrame->mLastContentOffset)) {
+    aPoint = mCachedOffsetForFrame->mCachedFrameOffset;
+  } else {
+    rv = aFrame->GetPointFromOffset(inOffset, &aPoint);
+    if (NS_SUCCEEDED(rv) && mCachedOffsetForFrame->mCanCacheFrameOffset) {
+      mCachedOffsetForFrame->mCachedFrameOffset = aPoint;
+      mCachedOffsetForFrame->mLastCaretFrame = aFrame;
+      mCachedOffsetForFrame->mLastContentOffset = inOffset;
+    }
+  }
+
+  return rv;
+}
+
+Element* Selection::GetAncestorLimiter() const {
+  MOZ_ASSERT(mSelectionType == SelectionType::eNormal);
+
+  if (mFrameSelection) {
+    return mFrameSelection->GetAncestorLimiter();
+  }
+  return nullptr;
+}
+
+void Selection::SetAncestorLimiter(Element* aLimiter) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aLimiter", aLimiter);
+    LogStackForSelectionAPI();
+  }
+
+  MOZ_ASSERT(mSelectionType == SelectionType::eNormal);
+
+  if (mFrameSelection) {
+    RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+    frameSelection->SetAncestorLimiter(aLimiter);
+  }
+}
+
+void Selection::StyledRanges::UnregisterSelection(IsUnlinking aIsUnlinking) {
+  for (const auto& range : Ranges()) {
+    range->UnregisterSelection(mSelection, aIsUnlinking);
+  }
+}
+
+void Selection::StyledRanges::Clear() {
+#ifdef ACCESSIBILITY
+  for (auto& range : Ranges()) {
+    if (!a11y::SelectionManager::SelectionRangeChanged(mSelection.GetType(),
+                                                       *range)) {
+      break;
+    }
+  }
+#endif
+  mRanges.Clear();
+  mInvalidStaticRanges.Clear();
+}
+
+const TextRangeStyle* Selection::StyledRanges::GetNonDefaultTextRangeStyle(
+    const AbstractRange* aRange) {
+  return mRanges.GetTextRangeStyleIfNotDefault(aRange);
+}
+
+size_t Selection::StyledRanges::Length() const { return mRanges.Length(); }
+
+nsresult Selection::SetTextRangeStyle(nsRange* aRange,
+                                      const TextRangeStyle& aTextRangeStyle) {
+  NS_ENSURE_ARG_POINTER(aRange);
+  MOZ_ASSERT(
+      mStyledRanges.Ranges().IndexOf(aRange) != Span<AbstractRange>::npos,
+      "Range is not part of this Selection?");
+  mStyledRanges.mRanges.SetTextRangeStyle(aRange, aTextRangeStyle);
+  return NS_OK;
+}
+
+nsresult Selection::StartAutoScrollTimer(nsIFrame* aFrame,
+                                         const nsPoint& aPoint,
+                                         uint32_t aDelayInMs) {
+  MOZ_ASSERT(aFrame, "Need a frame");
+  MOZ_ASSERT(mSelectionType == SelectionType::eNormal);
+
+  if (!mFrameSelection) {
+    return NS_OK;  
+  }
+
+  if (!mAutoScroller) {
+    mAutoScroller = new AutoScroller(mFrameSelection);
+  }
+
+  mAutoScroller->SetDelay(aDelayInMs);
+
+  RefPtr<AutoScroller> autoScroller{mAutoScroller};
+  return autoScroller->DoAutoScroll(aFrame, aPoint);
+}
+
+nsresult Selection::StopAutoScrollTimer() {
+  MOZ_ASSERT(mSelectionType == SelectionType::eNormal);
+
+  if (mAutoScroller) {
+    mAutoScroller->Stop(AutoScroller::FurtherScrollingAllowed::kYes);
+  }
+
+  return NS_OK;
+}
+
+nsresult AutoScroller::DoAutoScroll(nsIFrame* aFrame, nsPoint aPoint) {
+  MOZ_ASSERT(aFrame, "Need a frame");
+
+  Stop(FurtherScrollingAllowed::kYes);
+
+  nsPresContext* presContext = aFrame->PresContext();
+  RefPtr<PresShell> presShell = presContext->PresShell();
+  nsRootPresContext* rootPC = presContext->GetRootPresContext();
+  if (!rootPC) {
+    return NS_OK;
+  }
+  nsIFrame* rootmostFrame = rootPC->PresShell()->GetRootFrame();
+  AutoWeakFrame weakRootFrame(rootmostFrame);
+  AutoWeakFrame weakFrame(aFrame);
+  nsPoint globalPoint = aPoint + aFrame->GetOffsetToCrossDoc(rootmostFrame);
+
+  bool done = false;
+  bool didScroll;
+  while (true) {
+    didScroll = presShell->ScrollFrameIntoView(
+        aFrame, Some(nsRect(aPoint, nsSize())), AxisScrollParams(),
+        AxisScrollParams(), ScrollFlags::None);
+    if (!weakFrame || !weakRootFrame) {
+      return NS_OK;
+    }
+    if (!didScroll && !done) {
+      nsRect rootRect = rootmostFrame->GetRect();
+      nscoord onePx = AppUnitsPerCSSPixel();
+      nscoord scrollAmount = 10 * onePx;
+      if (std::abs(rootRect.x - globalPoint.x) <= onePx) {
+        aPoint.x -= scrollAmount;
+      } else if (std::abs(rootRect.XMost() - globalPoint.x) <= onePx) {
+        aPoint.x += scrollAmount;
+      } else if (std::abs(rootRect.y - globalPoint.y) <= onePx) {
+        aPoint.y -= scrollAmount;
+      } else if (std::abs(rootRect.YMost() - globalPoint.y) <= onePx) {
+        aPoint.y += scrollAmount;
+      } else {
+        break;
+      }
+      done = true;
+      continue;
+    }
+    break;
+  }
+
+  if (didScroll && mFurtherScrollingAllowed == FurtherScrollingAllowed::kYes) {
+    nsPoint presContextPoint =
+        globalPoint -
+        presShell->GetRootFrame()->GetOffsetToCrossDoc(rootmostFrame);
+    ScheduleNextDoAutoScroll(presContext, presContextPoint);
+  }
+
+  return NS_OK;
+}
+
+void Selection::RemoveAllRanges(ErrorResult& aRv) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__);
+    LogStackForSelectionAPI();
+  }
+
+  RemoveAllRangesInternal(aRv);
+}
+
+already_AddRefed<StaticRange> Selection::GetComposedRange(
+    const AbstractRange* aRange,
+    const Sequence<OwningNonNull<ShadowRoot>>& aShadowRoots) const {
+  auto reScope = [&aShadowRoots](nsINode*& aNode, uint32_t& aOffset,
+                                 bool aIsEndNode) {
+    MOZ_ASSERT(aNode);
+    while (aNode) {
+      const ShadowRoot* shadowRootOfNode = aNode->GetContainingShadow();
+      if (!shadowRootOfNode) {
+        return;
+      }
+
+      for (const OwningNonNull<ShadowRoot>& shadowRoot : aShadowRoots) {
+        if (shadowRoot->IsShadowIncludingInclusiveDescendantOf(
+                shadowRootOfNode)) {
+          return;
+        }
+      }
+
+      const nsIContent* host = aNode->GetContainingShadowHost();
+      const Maybe<uint32_t> maybeIndex = host->ComputeIndexInParentContent();
+      MOZ_ASSERT(maybeIndex.isSome(), "not parent or anonymous child?");
+      if (MOZ_UNLIKELY(maybeIndex.isNothing())) {
+        aNode = nullptr;
+        return;
+      }
+      aOffset = maybeIndex.value();
+      if (aIsEndNode) {
+        aOffset += 1;
+      }
+      aNode = host->GetParentNode();
+    }
+  };
+
+  nsINode* startNode = aRange->GetMayCrossShadowBoundaryStartContainer();
+  uint32_t startOffset = aRange->MayCrossShadowBoundaryStartOffset();
+  nsINode* endNode = aRange->GetMayCrossShadowBoundaryEndContainer();
+  uint32_t endOffset = aRange->MayCrossShadowBoundaryEndOffset();
+
+  reScope(startNode, startOffset, false );
+  reScope(endNode, endOffset, true );
+
+  RefPtr<StaticRange> composedRange = StaticRange::Create(
+      startNode, startOffset, endNode, endOffset, IgnoreErrors());
+  NS_WARNING(mozilla::ToString(composedRange->StartRef()).c_str());
+  NS_WARNING(mozilla::ToString(composedRange->EndRef()).c_str());
+  return composedRange.forget();
+}
+
+void Selection::GetComposedRanges(
+    const ShadowRootOrGetComposedRangesOptions&
+        aShadowRootOrGetComposedRangesOptions,
+    const Sequence<OwningNonNull<ShadowRoot>>& aShadowRoots,
+    nsTArray<RefPtr<StaticRange>>& aComposedRanges) {
+  aComposedRanges.SetCapacity(mStyledRanges.Length());
+
+  auto GetComposedRangesForAllRanges =
+      [this, &aComposedRanges](
+          const Sequence<OwningNonNull<ShadowRoot>>& aShadowRoots) {
+        for (const auto& range : this->mStyledRanges.Ranges()) {
+          aComposedRanges.AppendElement(GetComposedRange(range, aShadowRoots));
+        }
+      };
+
+  if (aShadowRootOrGetComposedRangesOptions.IsGetComposedRangesOptions()) {
+    auto& options =
+        aShadowRootOrGetComposedRangesOptions.GetAsGetComposedRangesOptions();
+    return GetComposedRangesForAllRanges(options.mShadowRoots);
+  }
+
+  Sequence<OwningNonNull<ShadowRoot>> shadowRoots(aShadowRoots);
+
+  if (aShadowRootOrGetComposedRangesOptions.IsShadowRoot()) {
+    if (!shadowRoots.AppendElement(
+            aShadowRootOrGetComposedRangesOptions.GetAsShadowRoot(),
+            fallible)) {
+      return;
+    }
+  }
+
+  return GetComposedRangesForAllRanges(shadowRoots);
+}
+
+void Selection::RemoveAllRangesInternal(ErrorResult& aRv,
+                                        IsUnlinking aIsUnlinking) {
+  if (!mFrameSelection) {
+    aRv.Throw(NS_ERROR_NOT_INITIALIZED);
+    return;
+  }
+
+  RefPtr<nsPresContext> presContext = GetPresContext();
+  Clear(presContext, aIsUnlinking);
+
+  RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+  frameSelection->ClearTableCellSelection();
+
+  RefPtr<Selection> kungFuDeathGrip{this};
+  NotifySelectionListeners();
+}
+
+void Selection::AddRangeJS(nsRange& aRange, ErrorResult& aRv) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aRange", aRange);
+    LogStackForSelectionAPI();
+  }
+
+  AutoRestore<bool> calledFromJSRestorer(mCalledByJS);
+  mCalledByJS = true;
+  RefPtr<Document> document(GetDocument());
+  AddRangeAndSelectFramesAndNotifyListenersInternal(aRange, document, aRv);
+  if (StaticPrefs::dom_selection_mimic_chrome_tostring_enabled() &&
+      !aRv.Failed()) {
+    if (auto* presShell = GetPresShell()) {
+      presShell->UpdateLastSelectionForToString(mFrameSelection);
+    }
+  }
+}
+
+void Selection::AddRangeAndSelectFramesAndNotifyListeners(nsRange& aRange,
+                                                          ErrorResult& aRv) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aRange", aRange);
+    LogStackForSelectionAPI();
+  }
+
+  RefPtr<Document> document(GetDocument());
+  return AddRangeAndSelectFramesAndNotifyListenersInternal(aRange, document,
+                                                           aRv);
+}
+
+void Selection::AddRangeAndSelectFramesAndNotifyListenersInternal(
+    nsRange& aRange, Document* aDocument, ErrorResult& aRv) {
+  RefPtr<nsRange> range = &aRange;
+  if (aRange.IsInAnySelection()) {
+    if (aRange.IsInSelection(*this)) {
+      if (mSelectionType == SelectionType::eNormal) {
+        SetInterlinePosition(InterlinePosition::StartOfNextLine);
+      }
+      return;
+    }
+    if (mSelectionType != SelectionType::eNormal &&
+        mSelectionType != SelectionType::eHighlight) {
+      range = aRange.CloneRange();
+    }
+  }
+
+  nsINode* rangeRoot = range->GetRoot();
+  if (aDocument != rangeRoot &&
+      (!rangeRoot || aDocument != rangeRoot->GetComposedDoc())) {
+    return;
+  }
+
+  RefPtr<Selection> kungFuDeathGrip(this);
+
+  Maybe<size_t> maybeRangeIndex;
+  nsresult result = MaybeAddTableCellRange(*range, &maybeRangeIndex);
+  if (NS_FAILED(result)) {
+    aRv.Throw(result);
+    return;
+  }
+
+  if (maybeRangeIndex.isNothing()) {
+    result = AddRangesForSelectableNodes(range, &maybeRangeIndex,
+                                         DispatchSelectstartEvent::Maybe);
+    if (NS_FAILED(result)) {
+      aRv.Throw(result);
+      return;
+    }
+    if (maybeRangeIndex.isNothing()) {
+      return;
+    }
+  }
+
+  MOZ_ASSERT(*maybeRangeIndex < mStyledRanges.Length());
+
+  SetAnchorFocusRange(*maybeRangeIndex);
+
+  if (mSelectionType == SelectionType::eNormal) {
+    SetInterlinePosition(InterlinePosition::StartOfNextLine);
+  }
+
+  if (!mFrameSelection) {
+    return;  
+  }
+
+  RefPtr<nsPresContext> presContext = GetPresContext();
+  SelectFrames(presContext, *range, true);
+
+  NotifySelectionListeners();
+  mStyledRanges.mRangesMightHaveChanged = false;
+}
+
+void Selection::AddHighlightRangeAndSelectFramesAndNotifyListeners(
+    AbstractRange& aRange) {
+  MOZ_ASSERT(mSelectionType == SelectionType::eHighlight);
+  nsresult rv = mStyledRanges.AddRangeAndIgnoreOverlaps(&aRange);
+  if (NS_FAILED(rv)) {
+    return;
+  }
+
+  if (!mFrameSelection) {
+    return;  
+  }
+
+  RefPtr<nsPresContext> presContext = GetPresContext();
+  SelectFrames(presContext, aRange, true);
+
+  RefPtr<Selection> kungFuDeathGrip(this);
+  NotifySelectionListeners();
+  mStyledRanges.mRangesMightHaveChanged = false;
+}
+
+
+void Selection::RemoveRangeAndUnselectFramesAndNotifyListeners(
+    AbstractRange& aRange, ErrorResult& aRv) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aRange", aRange);
+    LogStackForSelectionAPI();
+  }
+
+  nsresult rv = mStyledRanges.RemoveRangeAndUnregisterSelection(aRange);
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+    return;
+  }
+
+  nsINode* beginNode = aRange.GetStartContainer();
+  nsINode* endNode = aRange.GetEndContainer();
+
+  if (!beginNode || !endNode) {
+    return;
+  }
+
+  uint32_t beginOffset, endOffset;
+  if (endNode->IsText()) {
+    beginOffset = 0;
+    endOffset = endNode->AsText()->TextLength();
+  } else {
+    beginOffset = aRange.StartOffset();
+    endOffset = aRange.EndOffset();
+  }
+
+  RefPtr<nsPresContext> presContext = GetPresContext();
+  SelectFrames(presContext, aRange, false);
+
+  nsTArray<AbstractRange*> affectedRanges;
+  rv = GetAbstractRangesForIntervalArray(beginNode, beginOffset, endNode,
+                                         endOffset, true, &affectedRanges);
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+    return;
+  }
+  for (uint32_t i = 0; i < affectedRanges.Length(); i++) {
+    MOZ_ASSERT(affectedRanges[i]);
+    SelectFrames(presContext, *affectedRanges[i], true);
+  }
+
+  if (&aRange == mAnchorFocusRange) {
+    const size_t rangeCount = mStyledRanges.Length();
+    if (rangeCount) {
+      SetAnchorFocusRange(rangeCount - 1);
+    } else {
+      RemoveAnchorFocusRange();
+    }
+
+    if (rangeCount) {
+      ScrollIntoView(nsISelectionController::SELECTION_FOCUS_REGION);
+    }
+  }
+
+  if (!mFrameSelection) return;  
+
+  RefPtr<Selection> kungFuDeathGrip{this};
+  NotifySelectionListeners();
+}
+
+bool Selection::IsValidNodeAndOffsetForBoundary(const nsINode& aContainer,
+                                                uint32_t aOffset,
+                                                ErrorResult& aRv) {
+  if (MOZ_UNLIKELY(aContainer.NodeType() == nsINode::DOCUMENT_TYPE_NODE)) {
+    aRv.ThrowInvalidNodeTypeError(kNoDocumentTypeNodeError);
+    return false;
+  }
+  if (MOZ_UNLIKELY(aOffset > aContainer.Length())) {
+    aRv.ThrowIndexSizeError(kIndexSizeError);
+    return false;
+  }
+  return true;
+}
+
+void Selection::CollapseJS(nsINode* aContainer, uint32_t aOffset,
+                           ErrorResult& aRv) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aContainer", aContainer, "aOffset",
+                    aOffset);
+    LogStackForSelectionAPI();
+  }
+
+  AutoRestore<bool> calledFromJSRestorer(mCalledByJS);
+  mCalledByJS = true;
+  if (!aContainer) {
+    RemoveAllRangesInternal(aRv);
+    return;
+  }
+  if (MOZ_UNLIKELY(
+          !IsValidNodeAndOffsetForBoundary(*aContainer, aOffset, aRv))) {
+    return;
+  }
+  CollapseInternal(InLimiter::eNo, RawRangeBoundary(aContainer, aOffset), aRv);
+}
+
+void Selection::CollapseInLimiter(const RawRangeBoundary& aPoint,
+                                  ErrorResult& aRv) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aPoint", aPoint);
+    LogStackForSelectionAPI();
+  }
+  if (!aPoint.IsSetAndValid()) {
+    aRv.Throw(NS_ERROR_INVALID_ARG);
+    return;
+  }
+  CollapseInternal(InLimiter::eYes, aPoint, aRv);
+}
+
+void Selection::CollapseInternal(InLimiter aInLimiter,
+                                 const RawRangeBoundary& aPoint,
+                                 ErrorResult& aRv) {
+  MOZ_ASSERT(aPoint.IsSetAndValid());
+
+  if (!mFrameSelection) {
+    aRv.Throw(NS_ERROR_NOT_INITIALIZED);  
+    return;
+  }
+
+  if (!HasSameRootOrSameComposedDoc(*aPoint.GetContainer())) {
+    return;
+  }
+
+  RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+  frameSelection->InvalidateDesiredCaretPos();
+  if (aInLimiter == InLimiter::eYes &&
+      !frameSelection->NodeIsInLimiters(aPoint.GetContainer())) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+  nsresult result;
+
+  RefPtr<nsPresContext> presContext = GetPresContext();
+  if (!presContext ||
+      presContext->Document() != aPoint.GetContainer()->OwnerDoc()) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+
+  Clear(presContext);
+
+  frameSelection->ClearTableCellSelection();
+
+  frameSelection->SetHint(ComputeCaretAssociationHint(
+      frameSelection->GetHint(), frameSelection->GetCaretBidiLevel(), aPoint));
+
+  RefPtr<nsRange> range = nsRange::Create(aPoint.GetContainer());
+  result = range->CollapseTo(aPoint);
+  if (NS_FAILED(result)) {
+    aRv.Throw(result);
+    return;
+  }
+
+#ifdef DEBUG_SELECTION
+  nsCOMPtr<nsIContent> content = do_QueryInterface(aPoint.GetContainer());
+  nsCOMPtr<Document> doc = do_QueryInterface(aPoint.GetContainer());
+  printf("Sel. Collapse to %p %s %d\n", container.get(),
+         content ? nsAtomCString(content->NodeInfo()->NameAtom()).get()
+                 : (doc ? "DOCUMENT" : "???"),
+         aPoint.Offset());
+#endif
+
+  Maybe<size_t> maybeRangeIndex;
+  result = AddRangesForSelectableNodes(range, &maybeRangeIndex,
+                                       DispatchSelectstartEvent::Maybe);
+  if (NS_FAILED(result)) {
+    aRv.Throw(result);
+    return;
+  }
+  SetAnchorFocusRange(0);
+  SelectFrames(presContext, *range, true);
+
+  RefPtr<Selection> kungFuDeathGrip{this};
+  NotifySelectionListeners();
+}
+
+void Selection::CollapseToStartJS(ErrorResult& aRv) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__);
+    LogStackForSelectionAPI();
+  }
+
+  AutoRestore<bool> calledFromJSRestorer(mCalledByJS);
+  mCalledByJS = true;
+  CollapseToStart(aRv);
+}
+
+void Selection::CollapseToStart(ErrorResult& aRv) {
+  if (!mCalledByJS && NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__);
+    LogStackForSelectionAPI();
+  }
+
+  if (RangeCount() == 0) {
+    aRv.ThrowInvalidStateError(kNoRangeExistsError);
+    return;
+  }
+
+  const AbstractRange* firstRange = mStyledRanges.GetAbstractRangeAt(0);
+  if (!firstRange) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+
+  if (mFrameSelection) {
+    mFrameSelection->AddChangeReasons(
+        nsISelectionListener::COLLAPSETOSTART_REASON);
+  }
+  nsINode* container = firstRange->GetStartContainer();
+  if (!container) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+  const uint32_t offset = firstRange->StartOffset();
+  if (MOZ_UNLIKELY(!IsValidNodeAndOffsetForBoundary(*container, offset, aRv))) {
+    return;
+  }
+  CollapseInternal(InLimiter::eNo, RawRangeBoundary(container, offset), aRv);
+}
+
+void Selection::CollapseToEndJS(ErrorResult& aRv) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__);
+    LogStackForSelectionAPI();
+  }
+
+  AutoRestore<bool> calledFromJSRestorer(mCalledByJS);
+  mCalledByJS = true;
+  CollapseToEnd(aRv);
+}
+
+void Selection::CollapseToEnd(ErrorResult& aRv) {
+  if (!mCalledByJS && NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__);
+    LogStackForSelectionAPI();
+  }
+
+  uint32_t cnt = RangeCount();
+  if (cnt == 0) {
+    aRv.ThrowInvalidStateError(kNoRangeExistsError);
+    return;
+  }
+
+  const AbstractRange* lastRange = mStyledRanges.GetAbstractRangeAt(cnt - 1);
+  if (!lastRange) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+
+  if (mFrameSelection) {
+    mFrameSelection->AddChangeReasons(
+        nsISelectionListener::COLLAPSETOEND_REASON);
+  }
+  nsINode* container = lastRange->GetEndContainer();
+  if (!container) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+  const uint32_t offset = lastRange->EndOffset();
+  if (MOZ_UNLIKELY(!IsValidNodeAndOffsetForBoundary(*container, offset, aRv))) {
+    return;
+  }
+  CollapseInternal(InLimiter::eNo, RawRangeBoundary(container, offset), aRv);
+}
+
+void Selection::GetType(nsAString& aOutType) const {
+  if (!RangeCount()) {
+    aOutType.AssignLiteral("None");
+  } else if (IsCollapsed()) {
+    aOutType.AssignLiteral("Caret");
+  } else {
+    aOutType.AssignLiteral("Range");
+  }
+}
+
+nsRange* Selection::GetRangeAt(uint32_t aIndex, ErrorResult& aRv) {
+  nsRange* range = GetRangeAt(aIndex);
+  if (!range) {
+    aRv.ThrowIndexSizeError(nsPrintfCString("%u is out of range", aIndex));
+    return nullptr;
+  }
+
+  return range;
+}
+
+AbstractRange* Selection::GetAbstractRangeAt(uint32_t aIndex) const {
+  return aIndex < mStyledRanges.Length()
+             ? mStyledRanges.GetAbstractRangeAt(aIndex)
+             : nullptr;
+}
+
+void Selection::GetDirection(nsAString& aDirection) const {
+  if (mStyledRanges.mRanges.IsEmpty() ||
+      (mFrameSelection && (mFrameSelection->IsDoubleClickSelection() ||
+                           mFrameSelection->IsTripleClickSelection()))) {
+    aDirection.AssignLiteral("none");
+  } else if (mDirection == nsDirection::eDirNext) {
+    if (AreNormalAndCrossShadowBoundaryRangesCollapsed()) {
+      aDirection.AssignLiteral("none");
+      return;
+    }
+    aDirection.AssignLiteral("forward");
+  } else {
+    MOZ_ASSERT(!AreNormalAndCrossShadowBoundaryRangesCollapsed());
+    aDirection.AssignLiteral("backward");
+  }
+}
+
+nsRange* Selection::GetRangeAt(uint32_t aIndex) const {
+  MOZ_ASSERT(mSelectionType != SelectionType::eHighlight);
+  AbstractRange* abstractRange = GetAbstractRangeAt(aIndex);
+  if (!abstractRange) {
+    return nullptr;
+  }
+  return abstractRange->AsDynamicRange();
+}
+
+nsresult Selection::SetAnchorFocusToRange(nsRange* aRange) {
+  NS_ENSURE_STATE(mAnchorFocusRange);
+
+  const DispatchSelectstartEvent dispatchSelectstartEvent =
+      IsCollapsed() ? DispatchSelectstartEvent::Maybe
+                    : DispatchSelectstartEvent::No;
+
+  nsresult rv =
+      mStyledRanges.RemoveRangeAndUnregisterSelection(*mAnchorFocusRange);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  Maybe<size_t> maybeOutIndex;
+  rv = AddRangesForSelectableNodes(aRange, &maybeOutIndex,
+                                   dispatchSelectstartEvent);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  if (maybeOutIndex.isSome()) {
+    SetAnchorFocusRange(*maybeOutIndex);
+  } else {
+    RemoveAnchorFocusRange();
+  }
+
+  return NS_OK;
+}
+
+void Selection::ReplaceAnchorFocusRange(nsRange* aRange) {
+  NS_ENSURE_TRUE_VOID(mAnchorFocusRange);
+  RefPtr<nsPresContext> presContext = GetPresContext();
+  if (presContext) {
+    SelectFrames(presContext, *mAnchorFocusRange, false);
+    SetAnchorFocusToRange(aRange);
+    SelectFrames(presContext, *mAnchorFocusRange, true);
+  }
+}
+
+void Selection::AdjustAnchorFocusForMultiRange(nsDirection aDirection) {
+  if (aDirection == mDirection) {
+    return;
+  }
+  SetDirection(aDirection);
+
+  if (RangeCount() <= 1) {
+    return;
+  }
+
+  nsRange* firstRange = GetRangeAt(0);
+  nsRange* lastRange = GetRangeAt(RangeCount() - 1);
+
+  if (mDirection == eDirPrevious) {
+    firstRange->SetIsGenerated(false);
+    lastRange->SetIsGenerated(true);
+    SetAnchorFocusRange(0);
+  } else {  
+    firstRange->SetIsGenerated(true);
+    lastRange->SetIsGenerated(false);
+    SetAnchorFocusRange(RangeCount() - 1);
+  }
+}
+
+void Selection::ExtendJS(nsINode& aContainer, uint32_t aOffset,
+                         ErrorResult& aRv) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aContainer", &aContainer, "aOffset",
+                    aOffset);
+    LogStackForSelectionAPI();
+  }
+
+  AutoRestore<bool> calledFromJSRestorer(mCalledByJS);
+  mCalledByJS = true;
+  ExtendInternal(aContainer, aOffset, aRv);
+}
+
+nsresult Selection::Extend(nsINode* aContainer, uint32_t aOffset) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aContainer", aContainer, "aOffset",
+                    aOffset);
+    LogStackForSelectionAPI();
+  }
+
+  if (!aContainer) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  ErrorResult result;
+  ExtendInternal(*aContainer, aOffset, result);
+  return result.StealNSResult();
+}
+
+void Selection::ExtendInternal(nsINode& aContainer, uint32_t aOffset,
+                               ErrorResult& aRv) {
+
+  if (!mAnchorFocusRange) {
+    aRv.ThrowInvalidStateError(kNoRangeExistsError);
+    return;
+  }
+
+  if (!mFrameSelection) {
+    aRv.Throw(NS_ERROR_NOT_INITIALIZED);  
+    return;
+  }
+
+  if (!HasSameRootOrSameComposedDoc(aContainer)) {
+    return;
+  }
+
+  if (!mFrameSelection->NodeIsInLimiters(&aContainer)) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+
+  if (aContainer.GetFrameSelection() != mFrameSelection) {
+    NS_ASSERTION(
+        false,
+        fmt::format("mFrameSelection is {} which is expected as "
+                    "aContainer.GetFrameSelection() ({})",
+                    mFrameSelection, RefPtr{aContainer.GetFrameSelection()})
+            .c_str());
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+
+  RefPtr<nsPresContext> presContext = GetPresContext();
+  if (!presContext || presContext->Document() != aContainer.OwnerDoc()) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+
+  if (MOZ_UNLIKELY(
+          !IsValidNodeAndOffsetForBoundary(aContainer, aOffset, aRv))) {
+    return;
+  }
+
+  DebugOnly<nsDirection> oldDirection = GetDirection();
+  const RawRangeBoundary newFocusRefInTreeKindDOM(
+      &aContainer, aOffset, RangeBoundarySetBy::Offset, TreeKind::DOM);
+
+  RefPtr<nsRange> range = mAnchorFocusRange->CloneRange();
+
+  const RawRangeBoundary startRefInTreeKindDOM =
+      range->MayCrossShadowBoundaryStartRef()
+          .AsRaw()
+          .AsRangeBoundaryInDOMTree();
+  const RawRangeBoundary endRefInTreeKindDOM =
+      range->MayCrossShadowBoundaryEndRef().AsRaw().AsRangeBoundaryInDOMTree();
+  const RawRangeBoundary& anchorRefInTreeKindDOM =
+      GetDirection() == nsDirection::eDirNext ? startRefInTreeKindDOM
+                                              : endRefInTreeKindDOM;
+  const RawRangeBoundary& focusRefInTreeKindDOM =
+      GetDirection() == nsDirection::eDirNext ? endRefInTreeKindDOM
+                                              : startRefInTreeKindDOM;
+
+  const Maybe<int32_t> anchorOldFocusOrder =
+      nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+          anchorRefInTreeKindDOM, focusRefInTreeKindDOM);
+  const Maybe<int32_t> oldFocusNewFocusOrder =
+      nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+          focusRefInTreeKindDOM, newFocusRefInTreeKindDOM);
+  const Maybe<int32_t> anchorNewFocusOrder =
+      nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+          anchorRefInTreeKindDOM, newFocusRefInTreeKindDOM);
+
+  if (!anchorOldFocusOrder || !oldFocusNewFocusOrder || !anchorNewFocusOrder) {
+    SelectFrames(presContext, *range, false);
+
+    nsresult rv = range->CollapseTo(&aContainer, aOffset);
+    if (NS_FAILED(rv)) {
+      aRv.Throw(rv);
+      return;
+    }
+
+    rv = SetAnchorFocusToRange(range);
+    if (NS_FAILED(rv)) {
+      aRv.Throw(rv);
+      return;
+    }
+  } else {
+    if ((*anchorOldFocusOrder == 0 && *anchorNewFocusOrder < 0) ||
+        (*anchorOldFocusOrder <= 0 && *oldFocusNewFocusOrder < 0)) {
+      range->SetEnd(newFocusRefInTreeKindDOM, aRv,
+                    AllowRangeCrossShadowBoundary::Yes);
+      if (MOZ_UNLIKELY(aRv.Failed())) {
+        return;
+      }
+      SetDirection(eDirNext);
+      const RefPtr<nsRange> diffRange =
+          nsRange::Create(focusRefInTreeKindDOM, newFocusRefInTreeKindDOM, aRv,
+                          AllowRangeCrossShadowBoundary::Yes);
+      if (NS_WARN_IF(aRv.Failed())) {
+        return;
+      }
+      SelectFrames(presContext, *diffRange, true);
+      nsresult rv = SetAnchorFocusToRange(range);
+      if (NS_FAILED(rv)) {
+        aRv.Throw(rv);
+        return;
+      }
+    }
+    else if (*anchorOldFocusOrder == 0 && *anchorNewFocusOrder > 0) {
+      SetDirection(eDirPrevious);
+      range->SetStart(newFocusRefInTreeKindDOM, aRv,
+                      AllowRangeCrossShadowBoundary::Yes);
+      if (MOZ_UNLIKELY(aRv.Failed())) {
+        return;
+      }
+      SelectFrames(presContext, *range, true);
+      nsresult rv = SetAnchorFocusToRange(range);
+      if (NS_FAILED(rv)) {
+        aRv.Throw(rv);
+        return;
+      }
+    }
+    else if (*anchorNewFocusOrder <= 0 && *oldFocusNewFocusOrder >= 0) {
+      const RefPtr<nsRange> diffRange =
+          nsRange::Create(newFocusRefInTreeKindDOM, focusRefInTreeKindDOM, aRv,
+                          AllowRangeCrossShadowBoundary::Yes);
+      if (NS_WARN_IF(aRv.Failed())) {
+        return;
+      }
+
+      range->SetEnd(newFocusRefInTreeKindDOM, aRv,
+                    AllowRangeCrossShadowBoundary::Yes);
+      if (MOZ_UNLIKELY(aRv.Failed())) {
+        return;
+      }
+      nsresult rv = SetAnchorFocusToRange(range);
+      if (NS_FAILED(rv)) {
+        aRv.Throw(rv);
+        return;
+      }
+      SelectFrames(presContext, *diffRange, false);
+      MOZ_ASSERT(
+          diffRange->MayCrossShadowBoundaryStartRef()
+                  .AsRangeBoundaryInDOMTree() ==
+              range->MayCrossShadowBoundaryEndRef().AsRangeBoundaryInDOMTree(),
+          "Do we need to deselect the frames in this range??");
+    }
+    else if (*anchorOldFocusOrder >= 0 && *anchorNewFocusOrder <= 0) {
+      RefPtr<nsRange> oldNonCollapsedRange;
+      if (*anchorOldFocusOrder) {
+        oldNonCollapsedRange = range->CloneRange();
+        range->Collapse(false);
+      }
+      SetDirection(eDirNext);
+      range->SetEnd(newFocusRefInTreeKindDOM, aRv,
+                    AllowRangeCrossShadowBoundary::Yes);
+      if (MOZ_UNLIKELY(aRv.Failed())) {
+        return;
+      }
+      nsresult rv = SetAnchorFocusToRange(range);
+      if (NS_FAILED(rv)) {
+        aRv.Throw(rv);
+        return;
+      }
+      if (oldNonCollapsedRange) {
+        SelectFrames(presContext, *oldNonCollapsedRange, false);
+      }
+      SelectFrames(presContext, *range, true);
+    }
+    else if (*oldFocusNewFocusOrder <= 0 && *anchorNewFocusOrder >= 0) {
+      RefPtr<nsRange> diffRange;
+      if (focusRefInTreeKindDOM != newFocusRefInTreeKindDOM) {
+        diffRange =
+            nsRange::Create(focusRefInTreeKindDOM, newFocusRefInTreeKindDOM,
+                            aRv, AllowRangeCrossShadowBoundary::Yes);
+        if (NS_WARN_IF(aRv.Failed())) {
+          return;
+        }
+
+        SetDirection(eDirPrevious);
+        range->SetStart(newFocusRefInTreeKindDOM, aRv,
+                        AllowRangeCrossShadowBoundary::Yes);
+        if (aRv.Failed()) {
+          return;
+        }
+      }
+
+      nsresult rv = SetAnchorFocusToRange(range);
+      if (NS_FAILED(rv)) {
+        aRv.Throw(rv);
+        return;
+      }
+
+      if (diffRange) {
+        SelectFrames(presContext, *diffRange, false);
+      }
+      MOZ_ASSERT(!diffRange || range->MayCrossShadowBoundaryStartRef()
+                                       .AsRangeBoundaryInDOMTree() ==
+                                   diffRange->MayCrossShadowBoundaryEndRef()
+                                       .AsRangeBoundaryInDOMTree(),
+                 "Do we need to deselect the frames in this range??");
+    }
+    else if (*anchorNewFocusOrder >= 0 && *anchorOldFocusOrder <= 0) {
+      RefPtr<nsRange> oldNonCollapsedRange;
+      if (*anchorOldFocusOrder) {
+        oldNonCollapsedRange = range->CloneRange();
+        range->Collapse(true);
+      }
+      SetDirection(eDirPrevious);
+      range->SetStart(newFocusRefInTreeKindDOM, aRv,
+                      AllowRangeCrossShadowBoundary::Yes);
+      if (MOZ_UNLIKELY(aRv.Failed())) {
+        return;
+      }
+      nsresult rv = SetAnchorFocusToRange(range);
+      if (NS_FAILED(rv)) {
+        aRv.Throw(rv);
+        return;
+      }
+      if (oldNonCollapsedRange) {
+        SelectFrames(presContext, *oldNonCollapsedRange, false);
+      }
+      SelectFrames(presContext, *range, true);
+    }
+    else if (*oldFocusNewFocusOrder >= 0 && *anchorOldFocusOrder >= 0) {
+      range->SetStart(newFocusRefInTreeKindDOM, aRv,
+                      AllowRangeCrossShadowBoundary::Yes);
+      if (MOZ_UNLIKELY(aRv.Failed())) {
+        return;
+      }
+      SetDirection(eDirPrevious);
+      const RefPtr<nsRange> diffRange =
+          nsRange::Create(newFocusRefInTreeKindDOM, focusRefInTreeKindDOM, aRv,
+                          AllowRangeCrossShadowBoundary::Yes);
+      if (NS_WARN_IF(aRv.Failed())) {
+        return;
+      }
+
+      SelectFrames(presContext, *diffRange, true);
+      nsresult rv = SetAnchorFocusToRange(range);
+      if (NS_FAILED(rv)) {
+        aRv.Throw(rv);
+        return;
+      }
+    }
+  }
+
+  if (mStyledRanges.Length() > 1) {
+    SelectFramesInAllRanges(presContext);
+  }
+
+  DEBUG_OUT_RANGE(range);
+#ifdef DEBUG_SELECTION
+  if (GetDirection() != oldDirection) {
+    printf("    direction changed to %s\n",
+           GetDirection() == eDirNext ? "eDirNext" : "eDirPrevious");
+  }
+  nsCOMPtr<nsIContent> content = do_QueryInterface(&aContainer);
+  printf("Sel. Extend to %p %s %d\n", content.get(),
+         nsAtomCString(content->NodeInfo()->NameAtom()).get(), aOffset);
+#endif
+
+  RefPtr<Selection> kungFuDeathGrip{this};
+  NotifySelectionListeners();
+}
+
+void Selection::SelectAllChildrenJS(nsINode& aNode, ErrorResult& aRv) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aNode", &aNode);
+    LogStackForSelectionAPI();
+  }
+
+  AutoRestore<bool> calledFromJSRestorer(mCalledByJS);
+  mCalledByJS = true;
+  SelectAllChildren(aNode, aRv);
+  if (StaticPrefs::dom_selection_mimic_chrome_tostring_enabled() &&
+      !aRv.Failed()) {
+    if (auto* presShell = GetPresShell()) {
+      presShell->UpdateLastSelectionForToString(mFrameSelection);
+    }
+  }
+}
+
+void Selection::SelectAllChildren(nsINode& aNode, ErrorResult& aRv) {
+  if (!mCalledByJS && NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aNode", &aNode);
+    LogStackForSelectionAPI();
+  }
+
+  if (aNode.NodeType() == nsINode::DOCUMENT_TYPE_NODE) {
+    aRv.ThrowInvalidNodeTypeError(kNoDocumentTypeNodeError);
+    return;
+  }
+
+  if (!HasSameRootOrSameComposedDoc(aNode)) {
+    return;
+  }
+
+  if (mFrameSelection) {
+    mFrameSelection->AddChangeReasons(nsISelectionListener::SELECTALL_REASON);
+  }
+
+  const RawRangeBoundary startOfNode = RawRangeBoundary::StartOfParent(aNode);
+  SetStartAndEndInternal(InLimiter::eNo, startOfNode,
+                         aNode.IsContainerNode()
+                             ? RawRangeBoundary::EndOfParent(aNode)
+                             : startOfNode,
+                         eDirNext, aRv);
+}
+
+bool Selection::ContainsNode(nsINode& aNode, bool aAllowPartial,
+                             ErrorResult& aRv) {
+  nsresult rv;
+  if (mStyledRanges.Length() == 0) {
+    return false;
+  }
+
+  if (aNode.GetClosestFlatTreeAncestorElementForNonFlatTreeNode<
+          TreeKind::FlatForSelection>()) {
+    return false;
+  }
+
+  uint32_t nodeLength;
+  auto* nodeAsCharData = CharacterData::FromNode(aNode);
+  if (nodeAsCharData) {
+    nodeLength = nodeAsCharData->TextLength();
+  } else {
+    nodeLength = aNode.GetChildCount();
+  }
+
+  nsTArray<AbstractRange*> overlappingRanges;
+  rv = GetAbstractRangesForIntervalArray(&aNode, 0, &aNode, nodeLength, false,
+                                         &overlappingRanges);
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+    return false;
+  }
+  if (overlappingRanges.Length() == 0) return false;  
+
+  if (aAllowPartial) {
+    return true;
+  }
+
+  if (nodeAsCharData) {
+    return true;
+  }
+
+  for (uint32_t i = 0; i < overlappingRanges.Length(); i++) {
+    bool nodeStartsBeforeRange, nodeEndsAfterRange;
+    if (NS_SUCCEEDED(RangeUtils::CompareNodeToRange(
+            &aNode, overlappingRanges[i], &nodeStartsBeforeRange,
+            &nodeEndsAfterRange))) {
+      if (!nodeStartsBeforeRange && !nodeEndsAfterRange) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+class PointInRectChecker : public mozilla::RectCallback {
+ public:
+  explicit PointInRectChecker(const nsPoint& aPoint)
+      : mPoint(aPoint), mMatchFound(false) {}
+
+  void AddRect(const nsRect& aRect) override {
+    mMatchFound = mMatchFound || aRect.Contains(mPoint);
+  }
+
+  bool MatchFound() { return mMatchFound; }
+
+ private:
+  nsPoint mPoint;
+  bool mMatchFound;
+};
+
+bool Selection::ContainsPoint(const nsPoint& aPoint) {
+  if (IsCollapsed()) {
+    return false;
+  }
+  PointInRectChecker checker(aPoint);
+  const uint32_t rangeCount = RangeCount();
+  for (const uint32_t i : IntegerRange(rangeCount)) {
+    MOZ_ASSERT(RangeCount() == rangeCount);
+    nsRange* range = GetRangeAt(i);
+    MOZ_ASSERT(range);
+    nsRange::CollectClientRectsAndText(
+        &checker, nullptr, range, range->GetStartContainer(),
+        range->StartOffset(), range->GetEndContainer(), range->EndOffset(),
+        true, false);
+    if (checker.MatchFound()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void Selection::MaybeNotifyAccessibleCaretEventHub(PresShell* aPresShell) {
+  MOZ_ASSERT(mSelectionType == SelectionType::eNormal);
+
+  if (!mAccessibleCaretEventHub && aPresShell) {
+    mAccessibleCaretEventHub = aPresShell->GetAccessibleCaretEventHub();
+  }
+}
+
+void Selection::StopNotifyingAccessibleCaretEventHub() {
+  MOZ_ASSERT(mSelectionType == SelectionType::eNormal);
+
+  mAccessibleCaretEventHub = nullptr;
+}
+
+nsPresContext* Selection::GetPresContext() const {
+  PresShell* presShell = GetPresShell();
+  return presShell ? presShell->GetPresContext() : nullptr;
+}
+
+PresShell* Selection::GetPresShell() const {
+  if (!mFrameSelection) {
+    return nullptr;  
+  }
+  return mFrameSelection->GetPresShell();
+}
+
+Document* Selection::GetDocument() const {
+  PresShell* presShell = GetPresShell();
+  return presShell ? presShell->GetDocument() : nullptr;
+}
+
+nsIFrame* Selection::GetSelectionAnchorGeometry(SelectionRegion aRegion,
+                                                nsRect* aRect) {
+  if (!mFrameSelection) return nullptr;  
+
+  NS_ENSURE_TRUE(aRect, nullptr);
+
+  aRect->SetRect(0, 0, 0, 0);
+
+  switch (aRegion) {
+    case nsISelectionController::SELECTION_ANCHOR_REGION:
+    case nsISelectionController::SELECTION_FOCUS_REGION:
+      return GetSelectionEndPointGeometry(aRegion, aRect);
+    case nsISelectionController::SELECTION_WHOLE_SELECTION:
+      break;
+    default:
+      return nullptr;
+  }
+
+  NS_ASSERTION(aRegion == nsISelectionController::SELECTION_WHOLE_SELECTION,
+               "should only be SELECTION_WHOLE_SELECTION here");
+
+  nsRect anchorRect;
+  nsIFrame* anchorFrame = GetSelectionEndPointGeometry(
+      nsISelectionController::SELECTION_ANCHOR_REGION, &anchorRect);
+  if (!anchorFrame) return nullptr;
+
+  nsRect focusRect;
+  nsIFrame* focusFrame = GetSelectionEndPointGeometry(
+      nsISelectionController::SELECTION_FOCUS_REGION, &focusRect);
+  if (!focusFrame) return nullptr;
+
+  NS_ASSERTION(anchorFrame->PresContext() == focusFrame->PresContext(),
+               "points of selection in different documents?");
+  focusRect += focusFrame->GetOffsetTo(anchorFrame);
+
+  *aRect = anchorRect.UnionEdges(focusRect);
+  return anchorFrame;
+}
+
+nsIFrame* Selection::GetSelectionEndPointGeometry(SelectionRegion aRegion,
+                                                  nsRect* aRect) {
+  if (!mFrameSelection) return nullptr;  
+
+  NS_ENSURE_TRUE(aRect, nullptr);
+
+  aRect->SetRect(0, 0, 0, 0);
+
+  nsINode* node = nullptr;
+  uint32_t nodeOffset = 0;
+
+  switch (aRegion) {
+    case nsISelectionController::SELECTION_ANCHOR_REGION:
+      node = GetAnchorNode();
+      nodeOffset = AnchorOffset();
+      break;
+    case nsISelectionController::SELECTION_FOCUS_REGION:
+      node = GetFocusNode();
+      nodeOffset = FocusOffset();
+      break;
+    default:
+      return nullptr;
+  }
+
+  if (!node) return nullptr;
+
+  nsCOMPtr<nsIContent> content = do_QueryInterface(node);
+  NS_ENSURE_TRUE(content.get(), nullptr);
+  FrameAndOffset frameAndOffset = SelectionMovementUtils::GetFrameForNodeOffset(
+      content, nodeOffset, mFrameSelection->GetHint());
+  if (!frameAndOffset) {
+    return nullptr;
+  }
+
+  SelectionMovementUtils::AdjustFrameForLineStart(
+      frameAndOffset.mFrame, frameAndOffset.mOffsetInFrameContent);
+
+  bool isText = node->IsText();
+
+  nsPoint pt(0, 0);
+  if (isText) {
+    nsIFrame* childFrame = nullptr;
+    int32_t frameOffset = 0;
+    nsresult rv = frameAndOffset->GetChildFrameContainingOffset(
+        nodeOffset, mFrameSelection->GetHint() == CaretAssociationHint::After,
+        &frameOffset, &childFrame);
+    if (NS_FAILED(rv)) return nullptr;
+    if (!childFrame) return nullptr;
+
+    frameAndOffset.mFrame = childFrame;
+
+    rv = GetCachedFrameOffset(
+        frameAndOffset.mFrame,
+        static_cast<int32_t>(frameAndOffset.mOffsetInFrameContent), pt);
+    if (NS_FAILED(rv)) return nullptr;
+  }
+
+  const WritingMode wm = frameAndOffset->GetWritingMode();
+  auto GetInlinePosition = [&]() {
+    if (isText) {
+      return wm.IsVertical() ? pt.y : pt.x;
+    }
+    return frameAndOffset->ISize(wm);
+  };
+
+  if (wm.IsVertical()) {
+    aRect->y = GetInlinePosition();
+    aRect->SetWidth(frameAndOffset->BSize(wm));
+  } else {
+    aRect->x = GetInlinePosition();
+    aRect->SetHeight(frameAndOffset->BSize(wm));
+  }
+
+  return frameAndOffset;
+}
+
+NS_IMETHODIMP
+Selection::ScrollSelectionIntoViewEvent::Run() {
+  if (!mSelection) {
+    return NS_OK;
+  }
+
+  const RefPtr<Selection> selection{mSelection};
+  selection->mScrollEvent.Forget();
+  selection->ScrollIntoView(mRegion, mVerticalScroll, mHorizontalScroll, mFlags,
+                            SelectionScrollMode::SyncFlush);
+  return NS_OK;
+}
+
+nsresult Selection::PostScrollSelectionIntoViewEvent(
+    SelectionRegion aRegion, ScrollFlags aFlags, AxisScrollParams aVertical,
+    AxisScrollParams aHorizontal) {
+  mScrollEvent.Revoke();
+  nsPresContext* presContext = GetPresContext();
+  NS_ENSURE_STATE(presContext);
+  nsRefreshDriver* refreshDriver = presContext->RefreshDriver();
+  NS_ENSURE_STATE(refreshDriver);
+
+  mScrollEvent = new ScrollSelectionIntoViewEvent(this, aRegion, aVertical,
+                                                  aHorizontal, aFlags);
+  refreshDriver->AddEarlyRunner(mScrollEvent.get());
+  return NS_OK;
+}
+
+nsresult Selection::ScrollIntoView(SelectionRegion aRegion,
+                                   AxisScrollParams aVertical,
+                                   AxisScrollParams aHorizontal,
+                                   ScrollFlags aScrollFlags,
+                                   SelectionScrollMode aMode) {
+  if (!mFrameSelection) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  RefPtr<PresShell> presShell = mFrameSelection->GetPresShell();
+  if (!presShell || !presShell->GetDocument()) {
+    return NS_OK;
+  }
+
+  if (mFrameSelection->IsBatching()) {
+    return NS_OK;
+  }
+
+  if (aMode == SelectionScrollMode::Async) {
+    return PostScrollSelectionIntoViewEvent(aRegion, aScrollFlags, aVertical,
+                                            aHorizontal);
+  }
+
+  MOZ_ASSERT(aMode == SelectionScrollMode::SyncFlush ||
+             aMode == SelectionScrollMode::SyncNoFlush);
+
+  RefPtr<PresShell> kungFuDeathGrip(presShell);
+
+  if (aMode == SelectionScrollMode::SyncFlush) {
+    presShell->GetDocument()->FlushPendingNotifications(FlushType::Layout);
+
+    presShell = mFrameSelection ? mFrameSelection->GetPresShell() : nullptr;
+    if (!presShell) {
+      return NS_OK;
+    }
+  }
+
+  nsRect rect;
+  nsIFrame* frame = GetSelectionAnchorGeometry(aRegion, &rect);
+  if (!frame) {
+    return NS_ERROR_FAILURE;
+  }
+
+  presShell->ScrollFrameIntoView(frame, Some(rect), aVertical, aHorizontal,
+                                 aScrollFlags);
+  return NS_OK;
+}
+
+void Selection::AddSelectionListener(nsISelectionListener* aNewListener) {
+  MOZ_ASSERT(aNewListener);
+  mSelectionListeners.AppendElement(aNewListener);  
+}
+
+void Selection::RemoveSelectionListener(
+    nsISelectionListener* aListenerToRemove) {
+  mSelectionListeners.RemoveElement(aListenerToRemove);  
+}
+
+Element* Selection::StyledRanges::GetCommonEditingHost() const {
+  Element* editingHost = nullptr;
+  for (const RefPtr<AbstractRange>& range : Ranges()) {
+    MOZ_ASSERT(range);
+    nsINode* commonAncestorNode = range->GetClosestCommonInclusiveAncestor();
+    if (!commonAncestorNode || !commonAncestorNode->IsContent()) {
+      return nullptr;
+    }
+    nsIContent* commonAncestor = commonAncestorNode->AsContent();
+    Element* foundEditingHost = commonAncestor->GetEditingHost();
+    if (!foundEditingHost) {
+      return nullptr;
+    }
+    if (!editingHost) {
+      editingHost = foundEditingHost;
+      continue;
+    }
+    if (editingHost == foundEditingHost) {
+      continue;
+    }
+    if (foundEditingHost->IsInclusiveDescendantOf(editingHost)) {
+      continue;
+    }
+    if (editingHost->IsInclusiveDescendantOf(foundEditingHost)) {
+      editingHost = foundEditingHost;
+      continue;
+    }
+    return nullptr;
+  }
+  return editingHost;
+}
+
+void Selection::StyledRanges::MaybeFocusCommonEditingHost(
+    PresShell* aPresShell) const {
+  if (!aPresShell) {
+    return;
+  }
+
+  nsPresContext* presContext = aPresShell->GetPresContext();
+  if (!presContext) {
+    return;
+  }
+
+  Document* document = aPresShell->GetDocument();
+  if (!document) {
+    return;
+  }
+
+  nsPIDOMWindowOuter* window = document->GetWindow();
+  if (window && !document->IsInDesignMode() &&
+      nsContentUtils::GetHTMLEditor(presContext)) {
+    RefPtr<Element> newEditingHost = GetCommonEditingHost();
+    RefPtr<nsFocusManager> fm = nsFocusManager::GetFocusManager();
+    nsCOMPtr<nsPIDOMWindowOuter> focusedWindow;
+    nsIContent* focusedContent = nsFocusManager::GetFocusedDescendant(
+        window, nsFocusManager::eOnlyCurrentWindow,
+        getter_AddRefs(focusedWindow));
+    nsCOMPtr<Element> focusedElement = do_QueryInterface(focusedContent);
+    if (newEditingHost && newEditingHost != focusedElement) {
+      MOZ_ASSERT(!newEditingHost->IsInNativeAnonymousSubtree());
+      fm->SetFocus(newEditingHost, nsIFocusManager::FLAG_NOSWITCHFRAME |
+                                       nsIFocusManager::FLAG_NOSCROLL);
+    }
+  }
+}
+
+void Selection::NotifySelectionListeners(
+    bool aCalledByJS, IsFromRangeMutationObserver aIsFromRange) {
+  AutoRestore<bool> calledFromJSRestorer(mCalledByJS);
+  mCalledByJS = aCalledByJS;
+  NotifySelectionListeners();
+  if (aIsFromRange == IsFromRangeMutationObserver::Yes &&
+      mSelectionChangeEventDispatcher) {
+    mSelectionChangeEventDispatcher->SelectionRangeObservedMutation();
+  }
+}
+
+void Selection::NotifySelectionListeners() {
+  if (!mFrameSelection) {
+    return;  
+  }
+
+  MOZ_LOG_FMT(sSelectionLog, LogLevel::Debug, "{}: selection={}", __func__,
+              static_cast<void*>(this));
+  SelectionChangeGuard::DidChange();
+
+  mStyledRanges.mRangesMightHaveChanged = true;
+
+  mFrameSelection->SetClickSelectionType(ClickSelectionType::NotApplicable);
+
+  if (mFrameSelection->IsBatching()) {
+    mChangesDuringBatching = true;
+    return;
+  }
+  mChangesDuringBatching = false;
+
+  AutoRestore<bool> calledByJSRestorer(mCalledByJS);
+  mCalledByJS = false;
+
+  if (mSelectionType == SelectionType::eNormal &&
+      calledByJSRestorer.SavedValue()) {
+    RefPtr<PresShell> presShell = GetPresShell();
+    mStyledRanges.MaybeFocusCommonEditingHost(presShell);
+  }
+
+  nsCOMPtr<Document> doc;
+  if (PresShell* presShell = GetPresShell()) {
+    doc = presShell->GetDocument();
+    presShell->ScheduleContentRelevancyUpdate(ContentRelevancyReason::Selected);
+    if (mSelectionType == SelectionType::eNormal && RangeCount() && doc) {
+      doc->SetPreviouslyFocusedContent(nullptr);
+      doc->SetSelectionMoreRecentThanFocus(true);
+    }
+  }
+
+  RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+
+  const CopyableAutoTArray<nsCOMPtr<nsISelectionListener>, 5>
+      selectionListeners = mSelectionListeners;
+
+  int32_t amount = static_cast<int32_t>(frameSelection->GetCaretMoveAmount());
+  int16_t reason = frameSelection->PopChangeReasons();
+  if (calledByJSRestorer.SavedValue()) {
+    reason |= nsISelectionListener::JS_REASON;
+  }
+  if (mSelectionType == SelectionType::eNormal) {
+    if (mNotifyAutoCopy) {
+      AutoCopyListener::OnSelectionChange(doc, *this, reason);
+    }
+
+    if (mAccessibleCaretEventHub) {
+      RefPtr<AccessibleCaretEventHub> hub(mAccessibleCaretEventHub);
+      hub->OnSelectionChange(doc, this, reason);
+    }
+
+    if (mSelectionChangeEventDispatcher) {
+      RefPtr<SelectionChangeEventDispatcher> dispatcher(
+          mSelectionChangeEventDispatcher);
+      dispatcher->OnSelectionChange(doc, this, reason);
+    }
+  }
+  for (const auto& listener : selectionListeners) {
+    MOZ_KnownLive(listener)->NotifySelectionChanged(doc, this, reason, amount);
+  }
+}
+
+void Selection::StartBatchChanges(const char* aDetails) {
+  if (mFrameSelection) {
+    RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+    frameSelection->StartBatchChanges(aDetails);
+  }
+}
+
+void Selection::EndBatchChanges(const char* aDetails, int16_t aReasons) {
+  if (mFrameSelection) {
+    RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+    frameSelection->EndBatchChanges(aDetails, aReasons);
+  }
+}
+
+void Selection::AddSelectionChangeBlocker() { mSelectionChangeBlockerCount++; }
+
+void Selection::RemoveSelectionChangeBlocker() {
+  MOZ_ASSERT(mSelectionChangeBlockerCount > 0,
+             "mSelectionChangeBlockerCount has an invalid value - "
+             "maybe you have a mismatched RemoveSelectionChangeBlocker?");
+  mSelectionChangeBlockerCount--;
+}
+
+bool Selection::IsBlockingSelectionChangeEvents() const {
+  return mSelectionChangeBlockerCount > 0;
+}
+
+void Selection::DeleteFromDocument(ErrorResult& aRv) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__);
+    LogStackForSelectionAPI();
+  }
+
+  if (mSelectionType != SelectionType::eNormal) {
+    return;  
+  }
+
+  if (IsCollapsed()) {
+    return;
+  }
+
+  nsTArray<RefPtr<AbstractRange>> ranges{mStyledRanges.Ranges()};
+  for (const auto& range : ranges) {
+    MOZ_KnownLive(range)->AsDynamicRange()->DeleteContents(aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+
+  if (AnchorOffset() > 0) {
+    RefPtr<nsINode> anchor = GetAnchorNode();
+    CollapseInLimiter(anchor, AnchorOffset());
+  }
+#ifdef DEBUG
+  else {
+    printf("Don't know how to set selection back past frame boundary\n");
+  }
+#endif
+}
+
+void Selection::Modify(const nsAString& aAlter, const nsAString& aDirection,
+                       const nsAString& aGranularity) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aAlter", aAlter, "aDirection", aDirection,
+                    "aGranularity", aGranularity);
+    LogStackForSelectionAPI();
+  }
+
+  if (!mFrameSelection) {
+    return;
+  }
+
+  if (!GetAnchorFocusRange() || !GetFocusNode()) {
+    return;
+  }
+
+  if (!aAlter.LowerCaseEqualsLiteral("move") &&
+      !aAlter.LowerCaseEqualsLiteral("extend")) {
+    return;
+  }
+
+  if (!aDirection.LowerCaseEqualsLiteral("forward") &&
+      !aDirection.LowerCaseEqualsLiteral("backward") &&
+      !aDirection.LowerCaseEqualsLiteral("left") &&
+      !aDirection.LowerCaseEqualsLiteral("right")) {
+    return;
+  }
+
+  if (RefPtr<Document> doc = GetDocument()) {
+    doc->FlushPendingNotifications(FlushType::Layout);
+  }
+
+  bool visual = aDirection.LowerCaseEqualsLiteral("left") ||
+                aDirection.LowerCaseEqualsLiteral("right") ||
+                aGranularity.LowerCaseEqualsLiteral("line");
+
+  bool forward = aDirection.LowerCaseEqualsLiteral("forward") ||
+                 aDirection.LowerCaseEqualsLiteral("right");
+
+  bool extend = aAlter.LowerCaseEqualsLiteral("extend");
+
+  nsSelectionAmount amount;
+  if (aGranularity.LowerCaseEqualsLiteral("character")) {
+    amount = eSelectCluster;
+  } else if (aGranularity.LowerCaseEqualsLiteral("word")) {
+    amount = eSelectWordNoSpace;
+  } else if (aGranularity.LowerCaseEqualsLiteral("line")) {
+    amount = eSelectLine;
+  } else if (aGranularity.LowerCaseEqualsLiteral("lineboundary")) {
+    amount = forward ? eSelectEndLine : eSelectBeginLine;
+  } else if (aGranularity.LowerCaseEqualsLiteral("sentence") ||
+             aGranularity.LowerCaseEqualsLiteral("sentenceboundary") ||
+             aGranularity.LowerCaseEqualsLiteral("paragraph") ||
+             aGranularity.LowerCaseEqualsLiteral("paragraphboundary") ||
+             aGranularity.LowerCaseEqualsLiteral("documentboundary")) {
+    Document* document = GetParentObject();
+    if (document) {
+      AutoTArray<nsString, 1> params;
+      params.AppendElement(aGranularity);
+      nsContentUtils::ReportToConsole(nsIScriptError::warningFlag, "DOM"_ns,
+                                      document, PropertiesFile::DOM_PROPERTIES,
+                                      "SelectionModifyGranualirtyUnsupported",
+                                      params);
+    }
+    return;
+  } else {
+    return;
+  }
+
+  nsresult rv = NS_OK;
+  if (!extend) {
+    RefPtr<nsINode> focusNode = GetFocusNode();
+    if (!focusNode) {
+      return;
+    }
+    uint32_t focusOffset = FocusOffset();
+    CollapseInLimiter(focusNode, focusOffset);
+  }
+
+  const PrimaryFrameData frameForFocus =
+      GetPrimaryFrameForCaretAtFocusNode(visual);
+  if (frameForFocus) {
+    if (visual) {
+      mFrameSelection->SetHint(frameForFocus.mHint);
+    }
+    mozilla::intl::BidiDirection paraDir =
+        nsBidiPresUtils::ParagraphDirection(frameForFocus.mFrame);
+
+    if (paraDir == mozilla::intl::BidiDirection::RTL && visual) {
+      if (amount == eSelectBeginLine) {
+        amount = eSelectEndLine;
+        forward = !forward;
+      } else if (amount == eSelectEndLine) {
+        amount = eSelectBeginLine;
+        forward = !forward;
+      }
+    }
+  }
+
+  RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+  rv = frameSelection->MoveCaret(
+      forward ? eDirNext : eDirPrevious,
+      nsFrameSelection::ExtendSelection(extend), amount,
+      visual ? nsFrameSelection::eVisual : nsFrameSelection::eLogical);
+
+  if (aGranularity.LowerCaseEqualsLiteral("line") && NS_FAILED(rv)) {
+    RefPtr<PresShell> presShell = frameSelection->GetPresShell();
+    if (!presShell) {
+      return;
+    }
+    presShell->CompleteMove(forward, extend);
+  }
+}
+
+void Selection::SetBaseAndExtentJS(nsINode& aAnchorNode, uint32_t aAnchorOffset,
+                                   nsINode& aFocusNode, uint32_t aFocusOffset,
+                                   ErrorResult& aRv) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aAnchorNode", aAnchorNode, "aAnchorOffset",
+                    aAnchorOffset, "aFocusNode", aFocusNode, "aFocusOffset",
+                    aFocusOffset);
+    LogStackForSelectionAPI();
+  }
+
+  if (MOZ_UNLIKELY(
+          !IsValidNodeAndOffsetForBoundary(aAnchorNode, aAnchorOffset, aRv) ||
+          !IsValidNodeAndOffsetForBoundary(aFocusNode, aFocusOffset, aRv))) {
+    return;
+  }
+
+  AutoRestore<bool> calledFromJSRestorer(mCalledByJS);
+  mCalledByJS = true;
+  SetBaseAndExtentInternal(InLimiter::eNo,
+                           RawRangeBoundary(&aAnchorNode, aAnchorOffset),
+                           RawRangeBoundary(&aFocusNode, aFocusOffset), aRv);
+  if (StaticPrefs::dom_selection_mimic_chrome_tostring_enabled() &&
+      !aRv.Failed()) {
+    if (auto* presShell = GetPresShell()) {
+      presShell->UpdateLastSelectionForToString(mFrameSelection);
+    }
+  }
+}
+
+void Selection::SetBaseAndExtent(nsINode& aAnchorNode, uint32_t aAnchorOffset,
+                                 nsINode& aFocusNode, uint32_t aFocusOffset,
+                                 ErrorResult& aRv) {
+  if (MOZ_UNLIKELY(
+          !IsValidNodeAndOffsetForBoundary(aAnchorNode, aAnchorOffset, aRv) ||
+          !IsValidNodeAndOffsetForBoundary(aFocusNode, aFocusOffset, aRv))) {
+    return;
+  }
+
+  SetBaseAndExtentInternal(InLimiter::eNo,
+                           RawRangeBoundary(&aAnchorNode, aAnchorOffset),
+                           RawRangeBoundary(&aFocusNode, aFocusOffset), aRv);
+}
+
+void Selection::SetBaseAndExtent(const RawRangeBoundary& aAnchorRef,
+                                 const RawRangeBoundary& aFocusRef,
+                                 ErrorResult& aRv) {
+  if (!mCalledByJS && NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aAnchorRef", aAnchorRef, "aFocusRef",
+                    aFocusRef);
+    LogStackForSelectionAPI();
+  }
+
+  if (NS_WARN_IF(!aAnchorRef.IsSetAndValid()) ||
+      NS_WARN_IF(!aFocusRef.IsSetAndValid())) {
+    aRv.Throw(NS_ERROR_INVALID_ARG);
+    return;
+  }
+
+  SetBaseAndExtentInternal(InLimiter::eNo, aAnchorRef, aFocusRef, aRv);
+}
+
+void Selection::SetBaseAndExtentInLimiter(const RawRangeBoundary& aAnchorRef,
+                                          const RawRangeBoundary& aFocusRef,
+                                          ErrorResult& aRv) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aAnchorRef", aAnchorRef, "aFocusRef",
+                    aFocusRef);
+    LogStackForSelectionAPI();
+  }
+
+  if (NS_WARN_IF(!aAnchorRef.IsSetAndValid()) ||
+      NS_WARN_IF(!aFocusRef.IsSetAndValid())) {
+    aRv.Throw(NS_ERROR_INVALID_ARG);
+    return;
+  }
+
+  SetBaseAndExtentInternal(InLimiter::eYes, aAnchorRef, aFocusRef, aRv);
+}
+
+void Selection::SetBaseAndExtentInternal(InLimiter aInLimiter,
+                                         const RawRangeBoundary& aAnchorRef,
+                                         const RawRangeBoundary& aFocusRef,
+                                         ErrorResult& aRv) {
+  MOZ_ASSERT(aAnchorRef.IsSetAndValid());
+  MOZ_ASSERT(aFocusRef.IsSetAndValid());
+
+  if (!mFrameSelection) {
+    aRv.Throw(NS_ERROR_NOT_INITIALIZED);
+    return;
+  }
+
+  if (!HasSameRootOrSameComposedDoc(*aAnchorRef.GetContainer()) ||
+      !HasSameRootOrSameComposedDoc(*aFocusRef.GetContainer())) {
+    return;
+  }
+
+  SelectionBatcher batch(this, __FUNCTION__);
+  const Maybe<int32_t> order =
+      IsEditorSelection()
+          ? nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+                aAnchorRef, aFocusRef)
+          : nsContentUtils::ComparePoints<TreeKind::FlatForSelection>(
+                aAnchorRef, aFocusRef);
+  if (order && (*order <= 0)) {
+    SetStartAndEndInternal(aInLimiter, aAnchorRef, aFocusRef, eDirNext, aRv);
+    return;
+  }
+
+  SetStartAndEndInternal(aInLimiter, aFocusRef, aAnchorRef, eDirPrevious, aRv);
+}
+
+void Selection::SetStartAndEndInLimiter(const RawRangeBoundary& aStartRef,
+                                        const RawRangeBoundary& aEndRef,
+                                        ErrorResult& aRv) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aStartRef", aStartRef, "aEndRef", aEndRef);
+    LogStackForSelectionAPI();
+  }
+
+  if (NS_WARN_IF(!aStartRef.IsSetAndValid()) ||
+      NS_WARN_IF(!aEndRef.IsSetAndValid())) {
+    aRv.Throw(NS_ERROR_INVALID_ARG);
+    return;
+  }
+
+  SetStartAndEndInternal(InLimiter::eYes, aStartRef, aEndRef, eDirNext, aRv);
+}
+
+Result<Ok, nsresult> Selection::SetStartAndEndInLimiter(
+    nsINode& aStartContainer, uint32_t aStartOffset, nsINode& aEndContainer,
+    uint32_t aEndOffset, nsDirection aDirection, int16_t aReason) {
+  MOZ_ASSERT(aDirection == eDirPrevious || aDirection == eDirNext);
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aStartContainer", aStartContainer,
+                    "aStartOffset", aStartOffset, "aEndContainer",
+                    aEndContainer, "aEndOffset", aEndOffset, "nsDirection",
+                    aDirection, "aReason", aReason);
+    LogStackForSelectionAPI();
+  }
+
+  if (mFrameSelection) {
+    mFrameSelection->AddChangeReasons(aReason);
+  }
+
+  ErrorResult error;
+  if (MOZ_UNLIKELY(
+          !IsValidNodeAndOffsetForBoundary(aStartContainer, aStartOffset,
+                                           error) ||
+          !IsValidNodeAndOffsetForBoundary(aEndContainer, aEndOffset, error))) {
+    return Err(error.StealNSResult());
+  }
+
+  SetStartAndEndInternal(
+      InLimiter::eYes, RawRangeBoundary(&aStartContainer, aStartOffset),
+      RawRangeBoundary(&aEndContainer, aEndOffset), aDirection, error);
+  MOZ_TRY(error.StealNSResult());
+  return Ok();
+}
+
+void Selection::SetStartAndEnd(const RawRangeBoundary& aStartRef,
+                               const RawRangeBoundary& aEndRef,
+                               ErrorResult& aRv) {
+  if (NeedsToLogSelectionAPI(*this)) {
+    LogSelectionAPI(this, __func__, "aStartRef", aStartRef, "aEndRef", aEndRef);
+    LogStackForSelectionAPI();
+  }
+
+  if (NS_WARN_IF(!aStartRef.IsSetAndValid()) ||
+      NS_WARN_IF(!aEndRef.IsSetAndValid())) {
+    aRv.Throw(NS_ERROR_INVALID_ARG);
+    return;
+  }
+
+  SetStartAndEndInternal(InLimiter::eNo, aStartRef, aEndRef, eDirNext, aRv);
+}
+
+void Selection::SetStartAndEndInternal(InLimiter aInLimiter,
+                                       const RawRangeBoundary& aStartRef,
+                                       const RawRangeBoundary& aEndRef,
+                                       nsDirection aDirection,
+                                       ErrorResult& aRv) {
+  MOZ_ASSERT(aStartRef.IsSetAndValid());
+  MOZ_ASSERT(aEndRef.IsSetAndValid());
+
+  SelectionBatcher batch(this, __FUNCTION__);
+
+  if (aInLimiter == InLimiter::eYes) {
+    if (!mFrameSelection ||
+        !mFrameSelection->NodeIsInLimiters(aStartRef.GetContainer())) {
+      aRv.Throw(NS_ERROR_FAILURE);
+      return;
+    }
+    if (aStartRef.GetContainer() != aEndRef.GetContainer() &&
+        !mFrameSelection->NodeIsInLimiters(aEndRef.GetContainer())) {
+      aRv.Throw(NS_ERROR_FAILURE);
+      return;
+    }
+  }
+
+  RefPtr<nsRange> newRange = nsRange::Create(
+      aStartRef, aEndRef, aRv,
+      aInLimiter == InLimiter::eNo ? AllowRangeCrossShadowBoundary::Yes
+                                   : AllowRangeCrossShadowBoundary::No);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  RemoveAllRangesInternal(aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  RefPtr<Document> document(GetDocument());
+  AddRangeAndSelectFramesAndNotifyListenersInternal(*newRange, document, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  if (mUserInitiated) {
+    RefPtr<nsPresContext> presContext = GetPresContext();
+    if (mStyledRanges.Length() > 1 && presContext) {
+      SelectFramesInAllRanges(presContext);
+    }
+  }
+
+  SetDirection(aDirection);
+}
+
+nsresult Selection::SelectionLanguageChange(bool aLangRTL) {
+  if (!mFrameSelection) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  RefPtr<nsFrameSelection> frameSelection = mFrameSelection;
+
+  mozilla::intl::BidiEmbeddingLevel kbdBidiLevel =
+      aLangRTL ? mozilla::intl::BidiEmbeddingLevel::RTL()
+               : mozilla::intl::BidiEmbeddingLevel::LTR();
+  if (kbdBidiLevel == frameSelection->mKbdBidiLevel) {
+    return NS_OK;
+  }
+
+  frameSelection->mKbdBidiLevel = kbdBidiLevel;
+
+  PrimaryFrameData focusFrameData = GetPrimaryFrameForCaretAtFocusNode(false);
+  if (!focusFrameData.mFrame) {
+    return NS_ERROR_FAILURE;
+  }
+
+  auto [frameStart, frameEnd] = focusFrameData.mFrame->GetOffsets();
+  RefPtr<nsPresContext> context = GetPresContext();
+  mozilla::intl::BidiEmbeddingLevel levelBefore, levelAfter;
+  if (!context) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mozilla::intl::BidiEmbeddingLevel level =
+      focusFrameData.mFrame->GetEmbeddingLevel();
+  int32_t focusOffset = static_cast<int32_t>(FocusOffset());
+  if ((focusOffset != frameStart) && (focusOffset != frameEnd))
+    levelBefore = levelAfter = level;
+  else {
+    nsCOMPtr<nsIContent> focusContent = do_QueryInterface(GetFocusNode());
+    nsPrevNextBidiLevels levels =
+        frameSelection->GetPrevNextBidiLevels(focusContent, focusOffset, false);
+
+    levelBefore = levels.mLevelBefore;
+    levelAfter = levels.mLevelAfter;
+  }
+
+  if (levelBefore.IsSameDirection(levelAfter)) {
+    if ((level != levelBefore) && (level != levelAfter)) {
+      level = std::min(levelBefore, levelAfter);
+    }
+    if (level.IsSameDirection(kbdBidiLevel)) {
+      frameSelection->SetCaretBidiLevelAndMaybeSchedulePaint(level);
+    } else {
+      frameSelection->SetCaretBidiLevelAndMaybeSchedulePaint(
+          mozilla::intl::BidiEmbeddingLevel(level + 1));
+    }
+  } else {
+    if (levelBefore.IsSameDirection(kbdBidiLevel)) {
+      frameSelection->SetCaretBidiLevelAndMaybeSchedulePaint(levelBefore);
+    } else {
+      frameSelection->SetCaretBidiLevelAndMaybeSchedulePaint(levelAfter);
+    }
+  }
+
+  frameSelection->InvalidateDesiredCaretPos();
+
+  return NS_OK;
+}
+
+void Selection::SetColors(const nsAString& aForegroundColor,
+                          const nsAString& aBackgroundColor,
+                          const nsAString& aAltForegroundColor,
+                          const nsAString& aAltBackgroundColor,
+                          ErrorResult& aRv) {
+  if (mSelectionType != SelectionType::eFind) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+
+  mCustomColors.reset(new SelectionCustomColors);
+
+  constexpr auto currentColorStr = u"currentColor"_ns;
+  constexpr auto transparentStr = u"transparent"_ns;
+
+  if (!aForegroundColor.Equals(currentColorStr)) {
+    nscolor foregroundColor;
+    nsAttrValue aForegroundColorValue;
+    aForegroundColorValue.ParseColor(aForegroundColor);
+    if (!aForegroundColorValue.GetColorValue(foregroundColor)) {
+      aRv.Throw(NS_ERROR_INVALID_ARG);
+      return;
+    }
+    mCustomColors->mForegroundColor = Some(foregroundColor);
+  } else {
+    mCustomColors->mForegroundColor = Nothing();
+  }
+
+  if (!aBackgroundColor.Equals(transparentStr)) {
+    nscolor backgroundColor;
+    nsAttrValue aBackgroundColorValue;
+    aBackgroundColorValue.ParseColor(aBackgroundColor);
+    if (!aBackgroundColorValue.GetColorValue(backgroundColor)) {
+      aRv.Throw(NS_ERROR_INVALID_ARG);
+      return;
+    }
+    mCustomColors->mBackgroundColor = Some(backgroundColor);
+  } else {
+    mCustomColors->mBackgroundColor = Nothing();
+  }
+
+  if (!aAltForegroundColor.Equals(currentColorStr)) {
+    nscolor altForegroundColor;
+    nsAttrValue aAltForegroundColorValue;
+    aAltForegroundColorValue.ParseColor(aAltForegroundColor);
+    if (!aAltForegroundColorValue.GetColorValue(altForegroundColor)) {
+      aRv.Throw(NS_ERROR_INVALID_ARG);
+      return;
+    }
+    mCustomColors->mAltForegroundColor = Some(altForegroundColor);
+  } else {
+    mCustomColors->mAltForegroundColor = Nothing();
+  }
+
+  if (!aAltBackgroundColor.Equals(transparentStr)) {
+    nscolor altBackgroundColor;
+    nsAttrValue aAltBackgroundColorValue;
+    aAltBackgroundColorValue.ParseColor(aAltBackgroundColor);
+    if (!aAltBackgroundColorValue.GetColorValue(altBackgroundColor)) {
+      aRv.Throw(NS_ERROR_INVALID_ARG);
+      return;
+    }
+    mCustomColors->mAltBackgroundColor = Some(altBackgroundColor);
+  } else {
+    mCustomColors->mAltBackgroundColor = Nothing();
+  }
+}
+
+void Selection::ResetColors() { mCustomColors = nullptr; }
+
+void Selection::SetHighlightSelectionData(
+    dom::HighlightSelectionData aHighlightSelectionData) {
+  MOZ_ASSERT(mSelectionType == SelectionType::eHighlight);
+  mHighlightData = std::move(aHighlightSelectionData);
+}
+
+JSObject* Selection::WrapObject(JSContext* aCx,
+                                JS::Handle<JSObject*> aGivenProto) {
+  return mozilla::dom::Selection_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+AutoHideSelectionChanges::AutoHideSelectionChanges(
+    const nsFrameSelection* aFrame)
+    : AutoHideSelectionChanges(aFrame ? &aFrame->NormalSelection() : nullptr) {}
+
+bool Selection::HasSameRootOrSameComposedDoc(const nsINode& aNode) const {
+  nsINode* root = aNode.SubtreeRoot();
+  Document* doc = GetDocument();
+  return doc == root || (root && doc == root->GetComposedDoc());
+}

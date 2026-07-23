@@ -1,0 +1,484 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+"use strict";
+
+
+const DownloadsButton = {
+  get _placeholder() {
+    return document.getElementById("downloads-button");
+  },
+
+  _customizing: false,
+
+  initializeIndicator() {
+    DownloadsIndicatorView.ensureInitialized();
+  },
+
+  _getAnchorInternal() {
+    let indicator = DownloadsIndicatorView.indicator;
+    if (!indicator) {
+      return null;
+    }
+
+    indicator.open = this._anchorRequested;
+
+    let widget = CustomizableUI.getWidget("downloads-button");
+    if (
+      !isElementVisible(indicator.parentNode) &&
+      widget.areaType == CustomizableUI.TYPE_TOOLBAR
+    ) {
+      return null;
+    }
+
+    return DownloadsIndicatorView.indicatorAnchor;
+  },
+
+  _anchorRequested: false,
+
+  getAnchor() {
+    if (this._customizing) {
+      return null;
+    }
+
+    this._anchorRequested = true;
+    return this._getAnchorInternal();
+  },
+
+  releaseAnchor() {
+    this._anchorRequested = false;
+    this._getAnchorInternal();
+  },
+
+  unhide(includePalette = false) {
+    let button = this._placeholder;
+    let wasHidden = false;
+    if (!button && includePalette) {
+      button = gNavToolbox.palette.querySelector("#downloads-button");
+    }
+    if (button && button.hasAttribute("hidden")) {
+      button.removeAttribute("hidden");
+      if (this._navBar.contains(button)) {
+        this._navBar.setAttribute("downloadsbuttonshown", "true");
+      }
+      wasHidden = true;
+    }
+    return wasHidden;
+  },
+
+  hide() {
+    let button = this._placeholder;
+    if (this.autoHideDownloadsButton && button && button.closest("toolbar")) {
+      DownloadsPanel.hidePanel();
+      button.hidden = true;
+      this._navBar.removeAttribute("downloadsbuttonshown");
+    }
+  },
+
+  startAutoHide() {
+    if (DownloadsIndicatorView.hasDownloads) {
+      this.unhide();
+    } else {
+      this.hide();
+    }
+  },
+
+  checkForAutoHide() {
+    let button = this._placeholder;
+    if (
+      !this._customizing &&
+      this.autoHideDownloadsButton &&
+      button &&
+      button.closest("toolbar")
+    ) {
+      this.startAutoHide();
+    } else {
+      this.unhide();
+    }
+  },
+
+  onWidgetAfterDOMChange(node) {
+    if (node == this._placeholder) {
+      this.checkForAutoHide();
+    }
+  },
+
+  onCustomizeStart(win) {
+    if (win == window) {
+      this._customizing = true;
+      this._anchorRequested = false;
+      this.unhide(true);
+    }
+  },
+
+  onCustomizeEnd(win) {
+    if (win == window) {
+      this._customizing = false;
+      this.checkForAutoHide();
+      DownloadsIndicatorView.afterCustomize();
+    }
+  },
+
+  init() {
+    XPCOMUtils.defineLazyPreferenceGetter(
+      this,
+      "autoHideDownloadsButton",
+      "browser.download.autohideButton",
+      true,
+      this.checkForAutoHide.bind(this)
+    );
+
+    CustomizableUI.addListener(this);
+    this.checkForAutoHide();
+  },
+
+  uninit() {
+    CustomizableUI.removeListener(this);
+  },
+
+  get _tabsToolbar() {
+    delete this._tabsToolbar;
+    return (this._tabsToolbar = document.getElementById("TabsToolbar"));
+  },
+
+  get _navBar() {
+    delete this._navBar;
+    return (this._navBar = document.getElementById("nav-bar"));
+  },
+};
+
+Object.defineProperty(this, "DownloadsButton", {
+  value: DownloadsButton,
+  enumerable: true,
+  writable: false,
+});
+
+
+const DownloadsIndicatorView = {
+  _initialized: false,
+
+  _operational: false,
+
+  ensureInitialized() {
+    if (this._initialized) {
+      return;
+    }
+    this._initialized = true;
+
+    window.addEventListener("unload", this);
+    window.addEventListener("visibilitychange", this);
+    DownloadsCommon.getIndicatorData(window).addView(this);
+  },
+
+  ensureTerminated() {
+    if (!this._initialized) {
+      return;
+    }
+    this._initialized = false;
+
+    window.removeEventListener("unload", this);
+    window.removeEventListener("visibilitychange", this);
+    DownloadsCommon.getIndicatorData(window).removeView(this);
+
+    this.percentComplete = 0;
+    this.attention = DownloadsCommon.ATTENTION_NONE;
+  },
+
+  _ensureOperational() {
+    if (this._operational) {
+      return;
+    }
+
+    if (!DownloadsButton._placeholder) {
+      return;
+    }
+
+    this._operational = true;
+
+    if (this._initialized) {
+      DownloadsCommon.getIndicatorData(window).refreshView(this);
+    }
+  },
+
+
+  _currentNotificationType: null,
+
+  _nextNotificationType: null,
+
+  _isAncestorPanelOpen(aNode) {
+    while (aNode && aNode.localName != "panel") {
+      aNode = aNode.parentNode;
+    }
+    return aNode && aNode.state == "open";
+  },
+
+  showEventNotification(aType) {
+    if (!this._initialized) {
+      return;
+    }
+
+    if (this._currentNotificationType) {
+      if (this._currentNotificationType != aType) {
+        this._nextNotificationType = aType;
+      }
+    } else {
+      this._showNotification(aType);
+    }
+  },
+
+  _showNotification(aType) {
+    let anchor = DownloadsButton._placeholder;
+    if (!anchor || !isElementVisible(anchor.parentNode)) {
+      return;
+    }
+
+    if (anchor.documentGlobal.matchMedia("(prefers-reduced-motion)").matches) {
+      return;
+    }
+
+    anchor.setAttribute("notification", aType);
+    anchor.setAttribute("animate", "");
+
+    anchor.toggleAttribute("washidden", !!this._wasHidden);
+    delete this._wasHidden;
+
+    this._currentNotificationType = aType;
+
+    const onNotificationAnimEnd = event => {
+      if (
+        event.animationName !== "downloadsButtonNotification" &&
+        event.animationName !== "downloadsButtonFinishedNotification"
+      ) {
+        return;
+      }
+      anchor.removeEventListener("animationend", onNotificationAnimEnd);
+
+      requestAnimationFrame(() => {
+        anchor.removeAttribute("notification");
+        anchor.removeAttribute("animate");
+
+        requestAnimationFrame(() => {
+          let nextType = this._nextNotificationType;
+          this._currentNotificationType = null;
+          this._nextNotificationType = null;
+          if (nextType && isElementVisible(anchor.parentNode)) {
+            this._showNotification(nextType);
+          }
+        });
+      });
+    };
+    anchor.addEventListener("animationend", onNotificationAnimEnd);
+  },
+
+
+  set hasDownloads(aValue) {
+    if (this._hasDownloads != aValue || (!this._operational && aValue)) {
+      this._hasDownloads = aValue;
+
+      if (aValue) {
+        this._wasHidden = DownloadsButton.unhide();
+        this._ensureOperational();
+      } else {
+        DownloadsButton.checkForAutoHide();
+      }
+    }
+  },
+  get hasDownloads() {
+    return this._hasDownloads;
+  },
+  _hasDownloads: false,
+
+  set percentComplete(aValue) {
+    if (!this._operational) {
+      return;
+    }
+    aValue = Math.min(100, aValue);
+    if (this._percentComplete !== aValue) {
+      if (this._percentComplete < 0 && aValue >= 0) {
+        this.showEventNotification("start");
+      }
+      this._percentComplete = aValue;
+      this._refreshAttention();
+      this._maybeScheduleProgressUpdate();
+    }
+  },
+
+  _maybeScheduleProgressUpdate() {
+    if (
+      this.indicator &&
+      !this._progressRaf &&
+      document.visibilityState == "visible"
+    ) {
+      this._progressRaf = requestAnimationFrame(() => {
+        if (this._percentComplete >= 0) {
+          if (!this.indicator.hasAttribute("progress")) {
+            this.indicator.setAttribute("progress", "true");
+          }
+          this._progressIcon.style.setProperty(
+            "--download-progress-pcent",
+            `${Math.max(10, this._percentComplete)}%`
+          );
+        } else {
+          this.indicator.removeAttribute("progress");
+          this._progressIcon.style.setProperty(
+            "--download-progress-pcent",
+            "0%"
+          );
+        }
+        this._progressRaf = null;
+      });
+    }
+  },
+  _percentComplete: -1,
+
+  set attention(aValue) {
+    if (!this._operational) {
+      return;
+    }
+    if (this._attention != aValue) {
+      this._attention = aValue;
+      this._refreshAttention();
+    }
+  },
+
+  _refreshAttention() {
+    let widgetGroup = CustomizableUI.getWidget("downloads-button");
+    let inMenu = widgetGroup.areaType == CustomizableUI.TYPE_PANEL;
+
+    let suppressAttention =
+      !inMenu &&
+      this._attention == DownloadsCommon.ATTENTION_SUCCESS &&
+      this._percentComplete >= 0;
+
+    if (
+      suppressAttention ||
+      this._attention == DownloadsCommon.ATTENTION_NONE
+    ) {
+      this.indicator.removeAttribute("attention");
+    } else {
+      this.indicator.setAttribute("attention", this._attention);
+    }
+  },
+  _attention: DownloadsCommon.ATTENTION_NONE,
+
+  handleEvent(aEvent) {
+    switch (aEvent.type) {
+      case "unload":
+        this.ensureTerminated();
+        break;
+
+      case "visibilitychange":
+        this._maybeScheduleProgressUpdate();
+        break;
+    }
+  },
+
+  onCommand(aEvent) {
+    if (
+      (aEvent.type == "mousedown" &&
+        (aEvent.button != 0 ||
+          (AppConstants.platform == "macosx" && aEvent.ctrlKey))) ||
+      (aEvent.type == "keypress" && aEvent.key != " " && aEvent.key != "Enter")
+    ) {
+      return;
+    }
+
+    DownloadsPanel.showPanel(
+       true,
+      aEvent.type.startsWith("key")
+    );
+    aEvent.stopPropagation();
+  },
+
+  onDragOver(aEvent) {
+    ToolbarDropHandler.onDragOver(aEvent);
+  },
+
+  onDrop(aEvent) {
+    let dt = aEvent.dataTransfer;
+    if (dt.mozGetDataAt("application/x-moz-file", 0)) {
+      return;
+    }
+
+    let links = Services.droppedLinkHandler.dropLinks(aEvent);
+    if (!links.length) {
+      return;
+    }
+    let sourceDoc = dt.mozSourceNode
+      ? dt.mozSourceNode.ownerDocument
+      : document;
+    let handled = false;
+    for (let link of links) {
+      if (link.url.startsWith("about:")) {
+        continue;
+      }
+      saveURL(
+        link.url,
+        null,
+        link.name,
+        null,
+        true,
+        true,
+        null,
+        null,
+        sourceDoc
+      );
+      handled = true;
+    }
+    if (handled) {
+      aEvent.preventDefault();
+    }
+  },
+
+  _indicator: null,
+  __progressIcon: null,
+
+  get indicator() {
+    if (!this._indicator) {
+      this._indicator = document.getElementById("downloads-button");
+    }
+
+    return this._indicator;
+  },
+
+  get indicatorAnchor() {
+    let widgetGroup = CustomizableUI.getWidget("downloads-button");
+    if (widgetGroup.areaType == CustomizableUI.TYPE_PANEL) {
+      let overflowIcon = widgetGroup.forWindow(window).anchor;
+      return overflowIcon.icon;
+    }
+
+    return this.indicator.badgeStack;
+  },
+
+  get _progressIcon() {
+    return (
+      this.__progressIcon ||
+      (this.__progressIcon = document.getElementById(
+        "downloads-indicator-progress-inner"
+      ))
+    );
+  },
+
+  _onCustomizedAway() {
+    this._indicator = null;
+    this.__progressIcon = null;
+  },
+
+  afterCustomize() {
+    if (this._indicator != document.getElementById("downloads-button")) {
+      this._onCustomizedAway();
+      this._operational = false;
+      this.ensureTerminated();
+      this.ensureInitialized();
+    }
+  },
+};
+
+Object.defineProperty(this, "DownloadsIndicatorView", {
+  value: DownloadsIndicatorView,
+  enumerable: true,
+  writable: false,
+});

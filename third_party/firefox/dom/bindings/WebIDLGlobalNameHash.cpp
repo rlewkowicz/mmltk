@@ -1,0 +1,206 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WebIDLGlobalNameHash.h"
+
+#include "WrapperFactory.h"
+#include "js/Class.h"
+#include "js/GCAPI.h"
+#include "js/Id.h"
+#include "js/Object.h"  // JS::GetClass, JS::GetReservedSlot
+#include "js/Wrapper.h"
+#include "jsapi.h"
+#include "jsfriendapi.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/dom/BindingNames.h"
+#include "mozilla/dom/DOMJSClass.h"
+#include "mozilla/dom/Exceptions.h"
+#include "mozilla/dom/JSSlots.h"
+#include "mozilla/dom/PrototypeList.h"
+#include "mozilla/dom/ProxyHandlerUtils.h"
+#include "mozilla/dom/RegisterBindings.h"
+#include "nsGlobalWindowInner.h"
+#include "nsTHashtable.h"
+
+namespace mozilla::dom {
+
+static JSObject* FindNamedConstructorForXray(
+    JSContext* aCx, JS::Handle<jsid> aId, const WebIDLNameTableEntry* aEntry) {
+  JSObject* interfaceObject =
+      GetPerInterfaceObjectHandle(aCx, aEntry->mConstructorId, aEntry->mCreate,
+                                  DefineInterfaceProperty::No);
+  if (!interfaceObject) {
+    return nullptr;
+  }
+
+  if (IsInterfaceObject(interfaceObject)) {
+    for (unsigned slot = INTERFACE_OBJECT_FIRST_LEGACY_FACTORY_FUNCTION;
+         slot < INTERFACE_OBJECT_MAX_SLOTS; ++slot) {
+      const JS::Value& v = js::GetFunctionNativeReserved(interfaceObject, slot);
+      if (!v.isObject()) {
+        break;
+      }
+      JSObject* constructor = &v.toObject();
+      if (JS_GetMaybePartialFunctionId(JS_GetObjectFunction(constructor)) ==
+          aId.toString()) {
+        return constructor;
+      }
+    }
+  }
+
+  return interfaceObject;
+}
+
+bool WebIDLGlobalNameHash::DefineIfEnabled(
+    JSContext* aCx, JS::Handle<JSObject*> aObj, JS::Handle<jsid> aId,
+    JS::MutableHandle<mozilla::Maybe<JS::PropertyDescriptor>> aDesc,
+    bool* aFound) {
+  MOZ_ASSERT(aId.isString(), "Check for string id before calling this!");
+
+  const WebIDLNameTableEntry* entry = GetEntry(aId.toLinearString());
+  if (!entry) {
+    *aFound = false;
+    return true;
+  }
+
+  *aFound = true;
+
+  ConstructorEnabled checkEnabledForScope = entry->mEnabled;
+  JS::Rooted<JSObject*> global(
+      aCx,
+      js::CheckedUnwrapDynamic(aObj, aCx,  false));
+  if (!global) {
+    return Throw(aCx, NS_ERROR_DOM_SECURITY_ERR);
+  }
+
+  {
+#ifdef DEBUG
+    JS::Rooted<JSObject*> temp(aCx, global);
+    DebugOnly<nsGlobalWindowInner*> win;
+    MOZ_ASSERT(NS_SUCCEEDED(
+        UNWRAP_MAYBE_CROSS_ORIGIN_OBJECT(Window, &temp, win, aCx)));
+#endif
+  }
+
+  if (checkEnabledForScope && !checkEnabledForScope(aCx, global)) {
+    return true;
+  }
+
+  if (xpc::WrapperFactory::IsXrayWrapper(aObj)) {
+    JS::Rooted<JSObject*> constructor(aCx);
+    {
+      JSAutoRealm ar(aCx, global);
+      constructor = FindNamedConstructorForXray(aCx, aId, entry);
+    }
+    if (NS_WARN_IF(!constructor)) {
+      return Throw(aCx, NS_ERROR_FAILURE);
+    }
+    if (!JS_WrapObject(aCx, &constructor)) {
+      return Throw(aCx, NS_ERROR_FAILURE);
+    }
+
+    aDesc.set(mozilla::Some(JS::PropertyDescriptor::Data(
+        JS::ObjectValue(*constructor), {JS::PropertyAttribute::Configurable,
+                                        JS::PropertyAttribute::Writable})));
+    return true;
+  }
+
+  JS::Rooted<JSObject*> interfaceObject(
+      aCx,
+      GetPerInterfaceObjectHandle(aCx, entry->mConstructorId, entry->mCreate,
+                                  DefineInterfaceProperty::Always));
+  if (NS_WARN_IF(!interfaceObject)) {
+    return Throw(aCx, NS_ERROR_FAILURE);
+  }
+
+  aDesc.set(
+      mozilla::Some(JS::PropertyDescriptor::Data(JS::UndefinedValue(), {})));
+  return true;
+}
+
+bool WebIDLGlobalNameHash::MayResolve(jsid aId) {
+  return GetEntry(aId.toLinearString()) != nullptr;
+}
+
+bool WebIDLGlobalNameHash::GetNames(JSContext* aCx, JS::Handle<JSObject*> aObj,
+                                    NameType aNameType,
+                                    JS::MutableHandleVector<jsid> aNames) {
+  ProtoAndIfaceCache* cache = GetProtoAndIfaceCache(aObj);
+  for (size_t i = 0; i < sCount; ++i) {
+    const WebIDLNameTableEntry& entry = sEntries[i];
+    if ((aNameType == AllNames ||
+         !cache->HasEntryInSlot(entry.mConstructorId)) &&
+        (!entry.mEnabled || entry.mEnabled(aCx, aObj))) {
+      JSString* str = JS_AtomizeStringN(aCx, BindingName(entry.mNameOffset),
+                                        entry.mNameLength);
+      if (!str || !aNames.append(JS::PropertyKey::NonIntAtom(str))) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+bool WebIDLGlobalNameHash::ResolveForSystemGlobal(JSContext* aCx,
+                                                  JS::Handle<JSObject*> aObj,
+                                                  JS::Handle<jsid> aId,
+                                                  bool* aResolvedp) {
+  MOZ_ASSERT(JS_IsGlobalObject(aObj));
+
+  if (!JS_ResolveStandardClass(aCx, aObj, aId, aResolvedp)) {
+    return false;
+  }
+  if (*aResolvedp) {
+    return true;
+  }
+
+  if (!aId.isString()) {
+    return true;
+  }
+
+  MOZ_ASSERT(!xpc::WrapperFactory::IsXrayWrapper(aObj), "Xrays not supported!");
+
+  const WebIDLNameTableEntry* entry = GetEntry(aId.toLinearString());
+  if (entry && (!entry->mEnabled || entry->mEnabled(aCx, aObj))) {
+    if (NS_WARN_IF(!GetPerInterfaceObjectHandle(
+            aCx, entry->mConstructorId, entry->mCreate,
+            DefineInterfaceProperty::Always))) {
+      return Throw(aCx, NS_ERROR_FAILURE);
+    }
+
+    *aResolvedp = true;
+  }
+  return true;
+}
+
+bool WebIDLGlobalNameHash::NewEnumerateSystemGlobal(
+    JSContext* aCx, JS::Handle<JSObject*> aObj,
+    JS::MutableHandleVector<jsid> aProperties, bool aEnumerableOnly) {
+  MOZ_ASSERT(JS_IsGlobalObject(aObj));
+
+  if (!JS_NewEnumerateStandardClasses(aCx, aObj, aProperties,
+                                      aEnumerableOnly)) {
+    return false;
+  }
+
+  if (aEnumerableOnly) {
+    return true;
+  }
+
+  for (size_t i = 0; i < sCount; ++i) {
+    const WebIDLNameTableEntry& entry = sEntries[i];
+    if (!entry.mEnabled || entry.mEnabled(aCx, aObj)) {
+      JSString* str = JS_AtomizeStringN(aCx, BindingName(entry.mNameOffset),
+                                        entry.mNameLength);
+      if (!str || !aProperties.append(JS::PropertyKey::NonIntAtom(str))) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+}  

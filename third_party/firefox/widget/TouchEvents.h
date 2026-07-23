@@ -1,0 +1,222 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_TouchEvents_h_
+#define mozilla_TouchEvents_h_
+
+#include <stdint.h>
+
+#include "mozilla/dom/Touch.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/RefPtr.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+
+class WidgetGestureNotifyEvent final : public WidgetGUIEvent {
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, GestureNotifyEvent);
+
+  WidgetGestureNotifyEvent(bool aIsTrusted, EventMessage aMessage,
+                           nsIWidget* aWidget,
+                           const WidgetEventTime* aTime = nullptr)
+      : WidgetGUIEvent(aIsTrusted, aMessage, aWidget, eGestureNotifyEventClass,
+                       aTime),
+        mPanDirection(ePanNone),
+        mDisplayPanFeedback(false) {}
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(WidgetGestureNotifyEvent,
+                                                    eGestureNotifyEventClass,
+                                                    eGUIEventClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == eGestureNotifyEventClass,
+               "Duplicate() must be overridden by sub class");
+    WidgetGestureNotifyEvent* result =
+        new WidgetGestureNotifyEvent(false, mMessage, nullptr, this);
+    result->AssignGestureNotifyEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  typedef int8_t PanDirectionType;
+  enum PanDirection : PanDirectionType {
+    ePanNone,
+    ePanVertical,
+    ePanHorizontal,
+    ePanBoth
+  };
+
+  PanDirection mPanDirection;
+  bool mDisplayPanFeedback;
+
+  void AssignGestureNotifyEventData(const WidgetGestureNotifyEvent& aEvent,
+                                    bool aCopyTargets) {
+    AssignGUIEventData(aEvent, aCopyTargets);
+
+    mPanDirection = aEvent.mPanDirection;
+    mDisplayPanFeedback = aEvent.mDisplayPanFeedback;
+  }
+};
+
+
+class WidgetSimpleGestureEvent final : public WidgetMouseEventBase {
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, SimpleGestureEvent);
+
+  WidgetSimpleGestureEvent(bool aIsTrusted, EventMessage aMessage,
+                           nsIWidget* aWidget,
+                           const WidgetEventTime* aTime = nullptr)
+      : WidgetMouseEventBase(aIsTrusted, aMessage, aWidget,
+                             eSimpleGestureEventClass, aTime),
+        mAllowedDirections(0),
+        mDirection(0),
+        mClickCount(0),
+        mDelta(0.0) {}
+
+  WidgetSimpleGestureEvent(const WidgetSimpleGestureEvent& aOther)
+      : WidgetMouseEventBase(aOther.IsTrusted(), aOther.mMessage,
+                             aOther.mWidget, eSimpleGestureEventClass),
+        mAllowedDirections(aOther.mAllowedDirections),
+        mDirection(aOther.mDirection),
+        mClickCount(0),
+        mDelta(aOther.mDelta) {}
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(WidgetSimpleGestureEvent,
+                                                    eSimpleGestureEventClass,
+                                                    eMouseEventBaseClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == eSimpleGestureEventClass,
+               "Duplicate() must be overridden by sub class");
+    WidgetSimpleGestureEvent* result =
+        new WidgetSimpleGestureEvent(false, mMessage, nullptr, this);
+    result->AssignSimpleGestureEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  uint32_t mAllowedDirections;
+  uint32_t mDirection;
+  uint32_t mClickCount;
+  double mDelta;
+
+  void AssignSimpleGestureEventData(const WidgetSimpleGestureEvent& aEvent,
+                                    bool aCopyTargets) {
+    AssignMouseEventBaseData(aEvent, aCopyTargets);
+
+    mDirection = aEvent.mDirection;
+    mDelta = aEvent.mDelta;
+    mClickCount = aEvent.mClickCount;
+  }
+};
+
+
+class WidgetTouchEvent final : public WidgetInputEvent {
+ public:
+  typedef nsTArray<RefPtr<mozilla::dom::Touch>> TouchArray;
+  typedef AutoTArray<RefPtr<mozilla::dom::Touch>, 10> AutoTouchArray;
+  typedef AutoTouchArray::base_type TouchArrayBase;
+
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, TouchEvent);
+
+  MOZ_COUNTED_DEFAULT_CTOR(WidgetTouchEvent)
+
+  enum class CloneTouches : bool { No, Yes };
+  WidgetTouchEvent(const WidgetTouchEvent& aOther,
+                   CloneTouches aCloneTouches = CloneTouches::No)
+      : WidgetInputEvent(aOther.IsTrusted(), aOther.mMessage, aOther.mWidget,
+                         eTouchEventClass) {
+    MOZ_COUNT_CTOR(WidgetTouchEvent);
+    mModifiers = aOther.mModifiers;
+    mTimeStamp = aOther.mTimeStamp;
+    if (static_cast<bool>(aCloneTouches)) {
+      mTouches.SetCapacity(aOther.mTouches.Length());
+      for (const RefPtr<dom::Touch>& touch : aOther.mTouches) {
+        auto clonedTouch = MakeRefPtr<dom::Touch>(*touch);
+        mTouches.AppendElement(std::move(clonedTouch));
+      }
+    } else {
+      mTouches.AppendElements(aOther.mTouches);
+    }
+    mInputSource = aOther.mInputSource;
+    mButton = aOther.mButton;
+    mButtons = aOther.mButtons;
+    mFlags.mCancelable = mMessage != eTouchCancel;
+    mFlags.mHandledByAPZ = aOther.mFlags.mHandledByAPZ;
+  }
+
+  WidgetTouchEvent(WidgetTouchEvent&& aOther)
+      : WidgetInputEvent(std::move(aOther)) {
+    MOZ_COUNT_CTOR(WidgetTouchEvent);
+    mModifiers = aOther.mModifiers;
+    mTimeStamp = aOther.mTimeStamp;
+    mTouches = std::move(aOther.mTouches);
+    mInputSource = aOther.mInputSource;
+    mButton = aOther.mButton;
+    mButtons = aOther.mButtons;
+    mFlags = aOther.mFlags;
+  }
+
+  WidgetTouchEvent& operator=(WidgetTouchEvent&&) = default;
+
+  WidgetTouchEvent(bool aIsTrusted, EventMessage aMessage, nsIWidget* aWidget,
+                   const WidgetEventTime* aTime = nullptr)
+      : WidgetInputEvent(aIsTrusted, aMessage, aWidget, eTouchEventClass,
+                         aTime) {
+    MOZ_COUNT_CTOR(WidgetTouchEvent);
+    mFlags.mCancelable = mMessage != eTouchCancel;
+  }
+
+#if defined(NS_BUILD_REFCNT_LOGGING) || defined(DEBUG)
+  virtual ~WidgetTouchEvent() {
+    MOZ_COUNT_DTOR(WidgetTouchEvent);
+    NS_ASSERT_EVENT_CLASS_ID(eTouchEventClass, eInputEventClass);
+  }
+#endif
+
+  WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == eTouchEventClass,
+               "Duplicate() must be overridden by sub class");
+    WidgetTouchEvent* result =
+        new WidgetTouchEvent(false, mMessage, nullptr, this);
+    result->AssignTouchEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  TouchArray mTouches;
+  uint16_t mInputSource = 5;  
+  int16_t mButton = eNotPressed;
+  int16_t mButtons = 0;
+
+  Maybe<uint64_t> mCallbackId;
+
+  void AssignTouchEventData(const WidgetTouchEvent& aEvent, bool aCopyTargets) {
+    AssignInputEventData(aEvent, aCopyTargets);
+
+    MOZ_ASSERT(mTouches.IsEmpty());
+    mTouches.AppendElements(aEvent.mTouches);
+    mInputSource = aEvent.mInputSource;
+  }
+
+  void SetConvertToPointerRawUpdate(bool aConvert) {
+    for (dom::Touch* const touch : mTouches) {
+      touch->convertToPointerRawUpdate = aConvert;
+    }
+  }
+  [[nodiscard]] bool CanConvertToPointerRawUpdate() const {
+    for (const dom::Touch* const touch : mTouches) {
+      if (touch->convertToPointerRawUpdate) {
+        return true;
+      }
+    }
+    return false;
+  }
+};
+
+}  
+
+#endif  // mozilla_TouchEvents_h_

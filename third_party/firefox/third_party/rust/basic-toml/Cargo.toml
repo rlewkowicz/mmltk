@@ -1,0 +1,34 @@
+
+[package]
+edition = "2021"
+name = "basic-toml"
+version = "0.1.2"
+authors = [
+    "Alex Crichton <alex@alexcrichton.com>",
+    "David Tolnay <dtolnay@gmail.com>",
+]
+description = "Minimal TOML library with few dependencies"
+documentation = "https://docs.rs/basic-toml"
+keywords = [
+    "toml",
+    "serde",
+]
+categories = [
+    "config",
+    "encoding",
+    "parser-implementations",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dtolnay/basic-toml"
+
+[package.metadata.docs.rs]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[lib]
+doc-scrape-examples = false
+
+[dependencies.serde]
+version = "1.0.97"

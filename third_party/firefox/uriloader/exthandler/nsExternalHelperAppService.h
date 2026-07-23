@@ -1,0 +1,263 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsExternalHelperAppService_h_
+#define nsExternalHelperAppService_h_
+
+#include "mozilla/Logging.h"
+#include "prtime.h"
+
+#include "nsIExternalHelperAppService.h"
+#include "nsIExternalProtocolService.h"
+#include "nsIWebProgressListener2.h"
+#include "nsIHelperAppLauncherDialog.h"
+
+#include "nsILoadInfo.h"
+#include "nsIMIMEInfo.h"
+#include "nsIMIMEService.h"
+#include "nsINamed.h"
+#include "nsIStreamListener.h"
+#include "nsIFile.h"
+#include "nsIPermission.h"
+#include "nsString.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsIChannel.h"
+#include "nsIBackgroundFileSaver.h"
+
+#include "nsCOMPtr.h"
+#include "nsIObserver.h"
+#include "nsCOMArray.h"
+#include "nsWeakReference.h"
+
+class nsExternalAppHandler;
+class nsIMIMEInfo;
+class nsITransfer;
+class nsIPrincipal;
+class MaybeCloseWindowHelper;
+
+#define EXTERNAL_APP_HANDLER_IID \
+  {0x50eb7479, 0x71ff, 0x4ef8, {0xb3, 0x1e, 0x3b, 0x59, 0xc8, 0xab, 0xb9, 0x24}}
+class nsExternalHelperAppService : public nsIExternalHelperAppService,
+                                   public nsPIExternalAppLauncher,
+                                   public nsIExternalProtocolService,
+                                   public nsIMIMEService,
+                                   public nsIObserver,
+                                   public nsSupportsWeakReference {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIEXTERNALHELPERAPPSERVICE
+  NS_DECL_NSPIEXTERNALAPPLAUNCHER
+  NS_DECL_NSIMIMESERVICE
+  NS_DECL_NSIOBSERVER
+
+  nsExternalHelperAppService();
+
+  [[nodiscard]] nsresult Init();
+
+  NS_IMETHOD ExternalProtocolHandlerExists(const char* aProtocolScheme,
+                                           bool* aHandlerExists) override;
+  NS_IMETHOD IsExposedProtocol(const char* aProtocolScheme,
+                               bool* aResult) override;
+  NS_IMETHOD GetProtocolHandlerInfo(const nsACString& aScheme,
+                                    nsIHandlerInfo** aHandlerInfo) override;
+
+  NS_IMETHOD LoadURI(nsIURI* aURI, nsIPrincipal* aTriggeringPrincipal,
+                     nsIPrincipal* aRedirectPrincipal,
+                     mozilla::dom::BrowsingContext* aBrowsingContext,
+                     bool aWasTriggeredExternally,
+                     bool aHasValidUserGestureActivation,
+                     bool aNewWindowTarget) override;
+  NS_IMETHOD SetProtocolHandlerDefaults(nsIHandlerInfo* aHandlerInfo,
+                                        bool aOSHandlerExists) override;
+
+  virtual nsresult GetFileTokenForPath(const char16_t* platformAppPath,
+                                       nsIFile** aFile);
+
+  NS_IMETHOD OSProtocolHandlerExists(const char* aScheme, bool* aExists) = 0;
+
+  virtual bool GetMIMETypeFromDefaultForExtension(const nsACString& aExtension,
+                                                  nsACString& aMIMEType);
+
+  virtual bool GetMIMETypeFromOSForExtension(const nsACString& aExtension,
+                                             nsACString& aMIMEType);
+
+  static already_AddRefed<nsExternalHelperAppService> GetSingleton();
+
+  static nsresult EscapeURI(nsIURI* aURI, nsIURI** aResult);
+
+  static bool ExternalProtocolIsBlockedBySandbox(
+      mozilla::dom::BrowsingContext* aBrowsingContext,
+      const bool aHasValidUserGestureActivation);
+
+  static mozilla::LazyLogModule sLog;
+
+ protected:
+  virtual ~nsExternalHelperAppService();
+
+  nsresult FillMIMEInfoForMimeTypeFromExtras(const nsACString& aContentType,
+                                             bool aOverwriteDescription,
+                                             nsIMIMEInfo* aMIMEInfo);
+  nsresult FillMIMEInfoForExtensionFromExtras(const nsACString& aExtension,
+                                              nsIMIMEInfo* aMIMEInfo);
+
+  bool MaybeReplacePrimaryExtension(const nsACString& aPrimaryExtension,
+                                    nsIMIMEInfo* aMIMEInfo);
+
+  bool GetTypeFromExtras(const nsACString& aExtension, nsACString& aMIMEType);
+
+  friend class nsExternalAppHandler;
+
+  static void ExpungeTemporaryFilesHelper(nsCOMArray<nsIFile>& fileList);
+  static nsresult DeleteTemporaryFileHelper(nsIFile* aTemporaryFile,
+                                            nsCOMArray<nsIFile>& aFileList);
+  void ExpungeTemporaryFiles();
+  void ExpungeTemporaryPrivateFiles();
+
+  void ExpungePrivateFiles();
+
+  bool GetFileNameFromChannel(nsIChannel* aChannel, nsAString& aFileName,
+                              nsIURI** aURI);
+
+  already_AddRefed<nsIMIMEInfo> ValidateFileNameForSaving(
+      nsAString& aFileName, const nsACString& aMimeType, nsIURI* aURI,
+      nsIURI* aOriginalURI, uint32_t aFlags, bool aAllowURLExtension);
+
+  void CheckDefaultFileName(nsAString& aFileName, uint32_t aFlags);
+
+  void SanitizeFileName(nsAString& aFileName, uint32_t aFlags);
+
+  enum ModifyExtensionType {
+    ModifyExtension_Replace = 0,
+    ModifyExtension_Append = 1,
+    ModifyExtension_Ignore = 2
+  };
+  ModifyExtensionType ShouldModifyExtension(nsIMIMEInfo* aMimeInfo,
+                                            bool aForceAppend,
+                                            const nsCString& aFileExt);
+
+  nsCOMArray<nsIFile> mTemporaryFilesList;
+  nsCOMArray<nsIFile> mTemporaryPrivateFilesList;
+  nsCOMArray<nsIFile> mPrivateFilesList;
+
+ private:
+  nsresult DoContentContentProcessHelper(
+      const nsACString& aMimeContentType, nsIChannel* aChannel,
+      mozilla::dom::BrowsingContext* aContentContext, bool aForceSave,
+      nsIInterfaceRequestor* aWindowContext,
+      nsIStreamListener** aStreamListener);
+};
+
+class nsExternalAppHandler final : public nsIStreamListener,
+                                   public nsIHelperAppLauncher,
+                                   public nsIBackgroundFileSaverObserver,
+                                   public nsINamed {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSIHELPERAPPLAUNCHER
+  NS_DECL_NSICANCELABLE
+  NS_DECL_NSIBACKGROUNDFILESAVEROBSERVER
+  NS_DECL_NSINAMED
+
+  NS_INLINE_DECL_STATIC_IID(EXTERNAL_APP_HANDLER_IID)
+
+  nsExternalAppHandler(nsIMIMEInfo* aMIMEInfo, const nsAString& aFileExtension,
+                       mozilla::dom::BrowsingContext* aBrowsingContext,
+                       nsIInterfaceRequestor* aWindowContext,
+                       nsExternalHelperAppService* aExtProtSvc,
+                       const nsAString& aSuggestedFileName,
+                       nsIHelperAppLauncherDialog::reason aReason,
+                       bool aForceSave);
+
+  void DidDivertRequest(nsIRequest* request);
+
+  void MaybeApplyDecodingForExtension(nsIRequest* request);
+
+ protected:
+  bool IsDownloadSpam(nsIChannel* aChannel);
+
+  ~nsExternalAppHandler();
+
+  nsCOMPtr<nsIFile> mTempFile;
+  nsCOMPtr<nsIURI> mSourceUrl;
+  nsString mFileExtension;
+  nsString mTempLeafName;
+
+  nsCOMPtr<nsIMIMEInfo> mMimeInfo;
+
+  RefPtr<mozilla::dom::BrowsingContext> mBrowsingContext;
+
+  nsCOMPtr<nsIInterfaceRequestor> mWindowContext;
+
+  RefPtr<MaybeCloseWindowHelper> mMaybeCloseWindowHelper;
+
+  nsString mSuggestedFileName;
+
+  bool mForceSave;
+
+  bool mForceSaveInternallyHandled;
+
+  bool mCanceled;
+
+  bool mStopRequestIssued;
+
+  bool mIsFileChannel;
+
+  bool mHandleInternally;
+
+  bool mDialogShowing;
+
+  nsIHelperAppLauncherDialog::reason mReason;
+
+  int32_t mDownloadClassification;
+
+  bool mTempFileIsExecutable;
+
+  PRTime mTimeDownloadStarted;
+  int64_t mContentLength;
+  int64_t mProgress; 
+
+  nsCOMPtr<nsIFile> mFinalFileDestination;
+
+  uint32_t mBufferSize;
+
+  nsCOMPtr<nsIBackgroundFileSaver> mSaver;
+
+  nsCOMPtr<nsIArray> mRedirects;
+  already_AddRefed<nsIInterfaceRequestor> GetDialogParent();
+  nsresult SetUpTempFile(nsIChannel* aChannel);
+  void RetargetLoadNotifications(nsIRequest* request);
+  nsresult CreateTransfer();
+
+  nsresult CreateFailedTransfer();
+
+
+  void RequestSaveDestination(const nsString& aDefaultFile,
+                              const nsString& aDefaultFileExt);
+
+  nsresult ContinueSave(nsIFile* aFile);
+
+  void NotifyTransfer(nsresult aStatus);
+
+  bool GetNeverAskFlagFromPref(const char* prefName, const char* aContentType);
+
+  void EnsureCorrectExtension(const nsString& aFileExt);
+
+  typedef enum { kReadError, kWriteError, kLaunchError } ErrorType;
+  void SendStatusChange(ErrorType type, nsresult aStatus, nsIRequest* aRequest,
+                        const nsString& path);
+
+  nsCOMPtr<nsIWebProgressListener2> mDialogProgressListener;
+  nsCOMPtr<nsITransfer> mTransfer;
+
+  nsCOMPtr<nsIHelperAppLauncherDialog> mDialog;
+
+  nsCOMPtr<nsIRequest> mRequest;
+
+  RefPtr<nsExternalHelperAppService> mExtProtSvc;
+};
+
+#endif  // nsExternalHelperAppService_h_

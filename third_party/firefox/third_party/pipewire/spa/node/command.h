@@ -1,0 +1,37 @@
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
+
+#ifndef SPA_COMMAND_NODE_H
+#define SPA_COMMAND_NODE_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+#include <spa/pod/command.h>
+
+enum spa_node_command {
+	SPA_NODE_COMMAND_Suspend,	
+	SPA_NODE_COMMAND_Pause,		
+	SPA_NODE_COMMAND_Start,		
+	SPA_NODE_COMMAND_Enable,
+	SPA_NODE_COMMAND_Disable,
+	SPA_NODE_COMMAND_Flush,
+	SPA_NODE_COMMAND_Drain,
+	SPA_NODE_COMMAND_Marker,
+	SPA_NODE_COMMAND_ParamBegin,	
+	SPA_NODE_COMMAND_ParamEnd,	
+	SPA_NODE_COMMAND_RequestProcess,
+};
+
+#define SPA_NODE_COMMAND_ID(cmd)	SPA_COMMAND_ID(cmd, SPA_TYPE_COMMAND_Node)
+#define SPA_NODE_COMMAND_INIT(id)	SPA_COMMAND_INIT(SPA_TYPE_COMMAND_Node, id)
+
+
+
+#ifdef __cplusplus
+}  
+#endif
+
+#endif /* SPA_COMMAND_NODE_H */

@@ -1,0 +1,467 @@
+/*
+ *
+ * Copyright 2025 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#if !defined(wasm_stacks_h)
+#define wasm_stacks_h
+
+#include "mozilla/UniquePtr.h"
+#include "mozilla/Vector.h"
+
+#include <bit>
+
+#include "gc/Barrier.h"
+#include "js/AllocPolicy.h"
+#include "js/TypeDecls.h"
+#include "js/Utility.h"
+#include "util/TrailingArray.h"
+#include "vm/NativeObject.h"
+#include "wasm/WasmAnyRef.h"
+#include "wasm/WasmCode.h"
+#include "wasm/WasmConstants.h"
+#include "wasm/WasmFrame.h"
+
+namespace js {
+class WasmTagObject;
+class Nursery;
+namespace jit {
+class CodeOffset;
+class Label;
+}  
+namespace wasm {
+class CallSiteDesc;
+}  
+}  
+
+namespace js::wasm {
+
+struct SwitchTarget;
+struct Handler;
+struct Handlers;
+class Instance;
+class ContStack;
+class ContObject;
+class ContStackArena;
+class ContStackAllocator;
+
+#if defined(ENABLE_WASM_JSPI)
+
+struct StackTarget {
+  ContStack* stack = nullptr;
+
+  JS::NativeStackLimit jitLimit = JS::NativeStackLimitMin;
+
+
+  bool isMainStack() const { return !stack; }
+};
+
+struct ContStackDeleter {
+  void operator()(ContStack* cont);
+};
+using UniqueContStack = mozilla::UniquePtr<ContStack, ContStackDeleter>;
+
+struct alignas(16) SwitchTarget {
+  void* framePointer = nullptr;
+  void* stackPointer = nullptr;
+  void* resumePC = nullptr;
+  wasm::Instance* instance = nullptr;
+  void* paramsArea = nullptr;
+  const StackTarget* stack = nullptr;
+
+  void trace(JSTracer* trc) const;
+};
+
+struct Handler {
+  WasmTagObject* tag = nullptr;
+  Handlers* handlers = nullptr;
+  SwitchTarget target;
+};
+
+struct alignas(16) Handlers : TrailingArray<Handlers> {
+  ContStack* self = nullptr;
+
+  UniqueContStack child = nullptr;
+
+  SwitchTarget returnTarget{};
+
+  uint32_t numHandlers;
+
+  static_assert(MaxHandlers < UINT32_MAX);
+
+  static constexpr size_t offsetOfHandler(size_t index) {
+    return sizeof(wasm::Handlers) + index * sizeof(wasm::Handler);
+  }
+
+  static constexpr size_t sizeOf(size_t numHandlers) {
+    MOZ_RELEASE_ASSERT(numHandlers <= wasm::MaxHandlers);
+    return sizeof(wasm::Handlers) + sizeof(wasm::Handler) * numHandlers;
+  }
+  size_t sizeOf() const { return Handlers::sizeOf(numHandlers); }
+
+  bool isMainStack() const { return returnTarget.stack->isMainStack(); }
+
+  Handler* handler(uint32_t index) {
+    MOZ_RELEASE_ASSERT(index < wasm::MaxHandlers);
+    return offsetToPointer<Handler>(offsetOfHandler(index));
+  }
+  const Handler* handler(uint32_t index) const {
+    MOZ_RELEASE_ASSERT(index < wasm::MaxHandlers);
+    return offsetToPointer<Handler>(offsetOfHandler(index));
+  }
+
+  Handlers() = delete;
+  ~Handlers() = delete;
+
+  void trace(JSTracer* trc) const;
+};
+
+struct ContStackSize {
+  size_t jitStackSize = 0;
+  size_t headerSize = 0;
+  size_t totalSize = 0;
+
+  void compute();
+};
+
+class ContStack {
+  ContStackArena* arena_ = nullptr;
+
+  uintptr_t allocationBase_ = 0;
+
+  JS::NativeStackBase stackBase_ = 0;
+  JS::NativeStackLimit stackLimitForSystem_ = JS::NativeStackLimitMin;
+  JS::NativeStackLimit stackLimitForJit_ = JS::NativeStackLimitMin;
+
+  SwitchTarget initialResumeTarget_{};
+  HeapPtr<JSFunction*> initialResumeCallee_;
+  SharedCode initialResumeCode_;
+
+  StackTarget target_{};
+
+  Handlers* handlers_ = nullptr;
+
+  SwitchTarget* resumeTarget_ = nullptr;
+
+  enum class PageState : uint8_t { Ready, Poisoned, Decommitted };
+  PageState pageState_ = PageState::Ready;
+
+  ContStack() = default;
+  ~ContStack() = default;
+
+  FrameWithInstances* baseFrame() {
+    uintptr_t baseFrameAddress =
+        reinterpret_cast<uintptr_t>(this) + ContStack::offsetOfBaseFrame();
+    return reinterpret_cast<FrameWithInstances*>(baseFrameAddress);
+  }
+
+  bool isDead() const { return !handlers_ && !resumeTarget_; }
+
+  static void init(ContStackArena* arena, uintptr_t allocationBase,
+                   const ContStackSize& size);
+  void prepare(Handle<ContObject*> continuation, Handle<JSFunction*> target,
+               void* contBaseFrameStub, const Code* creatorCode);
+  void reset();
+  void poison();
+  void decommit();
+
+  static void free(ContStack* stack);
+  friend ContStackDeleter;
+  friend class ContStackArena;
+
+ public:
+  static void unwind(wasm::Handlers* handlers);
+  static void freeSuspended(UniqueContStack resumeBase);
+
+  void traceFields(JSTracer* trc);
+  void traceSuspended(JSTracer* trc, JSObject* src);
+  void updateSuspendedForMovingGC(Nursery& nursery);
+
+  static ContStack* fromAllocation(uintptr_t allocation,
+                                   const ContStackSize& size) {
+    return reinterpret_cast<ContStack*>(allocation + size.totalSize -
+                                        size.headerSize);
+  }
+
+  static ContStack* fromBaseFrameFP(void* fp) {
+    return reinterpret_cast<ContStack*>(reinterpret_cast<uintptr_t>(fp) -
+                                        offsetOfBaseFrameFP());
+  }
+
+  static int32_t offsetOfBaseFrame();
+  static int32_t offsetOfBaseFrameFP();
+
+  static constexpr int32_t offsetOfInitialResumeTarget() {
+    return offsetof(ContStack, initialResumeTarget_);
+  }
+  static constexpr int32_t offsetOfInitialResumeCallee() {
+    return offsetof(ContStack, initialResumeCallee_);
+  }
+  static constexpr int32_t offsetOfHandlers() {
+    return offsetof(ContStack, handlers_);
+  }
+  static constexpr int32_t offsetOfStackTarget() {
+    return offsetof(ContStack, target_);
+  }
+  static constexpr int32_t offsetOfResumeTarget() {
+    return offsetof(ContStack, resumeTarget_);
+  }
+
+  uintptr_t allocationBase() const { return allocationBase_; }
+
+  bool canResume() const {
+    MOZ_RELEASE_ASSERT(!!handlers_ != !!resumeTarget_);
+    return !!resumeTarget_;
+  }
+  bool isInitial() const { return resumeTarget_ == &initialResumeTarget_; }
+
+  Handlers* handlers() { return handlers_; }
+  const Handlers* handlers() const { return handlers_; }
+  ContStack* handlersStack() const {
+    if (!handlers_) {
+      return nullptr;
+    }
+    return handlers_->returnTarget.stack->stack;
+  }
+  const SwitchTarget* resumeTarget() const { return resumeTarget_; }
+  ContStack* resumeTargetStack() const {
+    if (!resumeTarget_) {
+      return nullptr;
+    }
+    return resumeTarget_->stack->stack;
+  }
+  const StackTarget& stackTarget() const { return target_; }
+
+  JS::NativeStackBase stackBase() const { return stackBase_; }
+
+  JS::NativeStackLimit stackLimitForSystem() const {
+    return stackLimitForSystem_;
+  }
+
+  JS::NativeStackLimit stackLimitForJit() const { return stackLimitForJit_; }
+
+  bool hasStackAddress(uintptr_t stackAddress) const {
+    return stackBase_ >= stackAddress && stackAddress > stackLimitForSystem_;
+  }
+
+  bool findIfActive() const {
+    MOZ_RELEASE_ASSERT(!canResume());
+    const Handlers* baseHandlers = findBaseHandlers();
+    return baseHandlers && baseHandlers->isMainStack();
+  }
+
+  const Handlers* findBaseHandlers() const {
+    if (!handlers_) {
+      return nullptr;
+    }
+    const Handlers* handlers = handlers_;
+    while (handlers->self && handlers->self->handlers()) {
+      handlers = handlers->self->handlers();
+    }
+    return handlers;
+  }
+};
+
+using UniqueContStackArena =
+    mozilla::UniquePtr<ContStackArena, JS::DeletePolicy<ContStackArena>>;
+using ContStackArenaVector =
+    mozilla::Vector<UniqueContStackArena, 4, SystemAllocPolicy>;
+
+class ContStackArena {
+  ContStackAllocator* const owner_;
+  void* base_ = nullptr;
+  const uint32_t capacity_ = 0;
+  const uint64_t allFreeMask_ = 0;
+  uint64_t currentFreeMask_ = 0;
+  bool dirtySinceLastPurge_ = false;
+
+  void free(ContStack* stack);
+
+  bool isAllocated(uint32_t index) const {
+    MOZ_RELEASE_ASSERT(index < capacity_);
+    return (currentFreeMask_ & (uint64_t(1) << index)) == 0;
+  }
+
+  uintptr_t stackAllocation(uint32_t index) const;
+  ContStack* stack(uint32_t index) const;
+  uint32_t stackIndex(const ContStack* stack) const;
+
+  friend class ContStack;
+
+ public:
+  ContStackArena(ContStackAllocator* owner, void* base);
+  ~ContStackArena();
+
+  static constexpr size_t MaxCapacity = sizeof(currentFreeMask_) * CHAR_BIT;
+
+  static UniqueContStackArena create(ContStackAllocator* owner);
+
+  uintptr_t base() const { return reinterpret_cast<uintptr_t>(base_); }
+  uint32_t capacity() const { return capacity_; }
+  bool isEmpty() const { return currentFreeMask_ == allFreeMask_; }
+  bool isFull() const { return currentFreeMask_ == 0; }
+  bool contains(uintptr_t address) const;
+
+  UniqueContStack allocate(Handle<ContObject*> continuation,
+                           Handle<JSFunction*> target, void* contBaseFrameStub,
+                           const Code* creatorCode);
+
+  ContStack* findForAddress(uintptr_t address) const;
+
+  template <typename Fn>
+  void forEachAllocatedStack(Fn&& fn) const {
+    uint64_t allocatedMask = ~currentFreeMask_ & allFreeMask_;
+    while (allocatedMask) {
+      uint32_t index = uint32_t(std::countr_zero(allocatedMask));
+
+      fn(stack(index));
+
+      allocatedMask &= allocatedMask - 1;
+    }
+  }
+
+  template <typename Fn>
+  void forEachFreedStack(Fn&& fn) const {
+    uint64_t freeMask = currentFreeMask_;
+    while (freeMask) {
+      uint32_t index = uint32_t(std::countr_zero(freeMask));
+      fn(stack(index));
+      freeMask &= freeMask - 1;
+    }
+  }
+
+  void purge();
+};
+
+class ContStackAllocator {
+  ContStackSize stackSize_;
+  uint32_t arenaCapacity_ = 0;
+  ContStackArenaVector arenas_;
+  bool initialized_ = false;
+
+  void ensureInitialized();
+
+  ContStackArena* addArena(JSContext* cx);
+  ContStackArena* findOrAddArenaForAllocate(JSContext* cx);
+  ContStackArena* findArenaForAddress(uintptr_t address) const;
+
+ public:
+  ContStackAllocator() = default;
+
+  const ContStackSize& stackSize() const { return stackSize_; }
+  uint32_t arenaCapacity() const { return arenaCapacity_; }
+  size_t arenaSize() const {
+    return arenaCapacity_ * stackSize_.totalSize;
+  }
+
+  UniqueContStack allocate(JSContext* cx, Handle<ContObject*> continuation,
+                           Handle<JSFunction*> target, void* contBaseFrameStub,
+                           const Code* creatorCode);
+
+  ContStack* findForAddress(uintptr_t address) const;
+
+  template <typename Fn>
+  void forEachAllocatedStack(Fn&& fn) const {
+    for (const auto& arena : arenas_) {
+      arena->forEachAllocatedStack(fn);
+    }
+  }
+
+  void purge(bool shrinking);
+
+  size_t sizeOfNonHeap() const;
+};
+
+class ContObject : public NativeObject {
+ public:
+  static const JSClass class_;
+
+  enum {
+    ResumeBaseSlot,
+    SlotCount,
+  };
+
+  static ContObject* create(JSContext* cx, Handle<JSFunction*> target,
+                            void* contBaseFrameStub, const Code* creatorCode);
+  static ContObject* createEmpty(JSContext* cx);
+
+  static constexpr size_t offsetOfResumeBase() {
+    return NativeObject::getFixedSlotOffset(ResumeBaseSlot);
+  }
+
+ private:
+  static const JSClassOps classOps_;
+  static const ClassExtension classExt_;
+
+  ContStack* resumeBase() {
+    Value stackSlot = getFixedSlot(ResumeBaseSlot);
+    if (stackSlot.isUndefined()) {
+      return nullptr;
+    }
+    return reinterpret_cast<ContStack*>(stackSlot.toPrivate());
+  }
+
+  UniqueContStack takeResumeBase() {
+    UniqueContStack result = UniqueContStack(resumeBase());
+    setFixedSlot(ResumeBaseSlot, JS::UndefinedValue());
+    return result;
+  }
+
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+  static void trace(JSTracer* trc, JSObject* obj);
+};
+
+void EmitEnterStackTarget(jit::MacroAssembler& masm, jit::Register cx,
+                          jit::Register stackTarget, jit::Register scratch);
+
+void EmitSwitchStack(jit::MacroAssembler& masm, jit::Register switchTarget,
+                     jit::Register scratch1, jit::Register scratch2,
+                     jit::Register scratch3);
+
+void EmitClearSwitchTarget(jit::MacroAssembler& masm,
+                           jit::Register switchTarget);
+
+void EmitFindHandler(jit::MacroAssembler& masm, jit::Register instance,
+                     jit::Register tag, jit::Register output,
+                     jit::Register scratch1, jit::Register scratch2,
+                     jit::Register scratch3, jit::Register scratch4,
+                     jit::Label* fail);
+
+void EmitSuspend(jit::MacroAssembler& masm, jit::Register instance,
+                 jit::Register suspendedCont, jit::Register handler,
+                 jit::Register scratch1, jit::Register scratch2,
+                 jit::Register scratch3, const CallSiteDesc& callSiteDesc,
+                 jit::CodeOffset* suspendCodeOffset,
+                 uint32_t* suspendFramePushed);
+
+struct HandlerJitOffsets {
+  uint32_t tagInstanceDataOffset = UINT32_MAX;
+  uint32_t resultsAreaOffset = UINT32_MAX;
+};
+
+void EmitResume(jit::MacroAssembler& masm, jit::Register instance,
+                jit::Register cont, jit::Register handlersResultArea,
+                jit::Register scratch1, jit::Register scratch2,
+                jit::Register scratch3, jit::Label* fail,
+                mozilla::Span<HandlerJitOffsets> handlerOffsets,
+                mozilla::Span<jit::Label*> handlerLabels,
+                const CallSiteDesc& callSiteDesc,
+                jit::CodeOffset* resumeCodeOffset, uint32_t* resumeFramePushed);
+
+#endif
+
+}  
+
+#endif

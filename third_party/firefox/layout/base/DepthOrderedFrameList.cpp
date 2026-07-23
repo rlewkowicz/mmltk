@@ -1,0 +1,70 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DepthOrderedFrameList.h"
+
+#include "nsContainerFrame.h"
+#include "nsIFrame.h"
+
+namespace mozilla {
+
+void DepthOrderedFrameList::Add(nsIFrame* aFrame) {
+  MOZ_ASSERT(aFrame);
+
+  if (auto p = mFrames.lookupForAdd(aFrame)) {
+    MOZ_ASSERT(p->value() == aFrame->GetDepthInFrameTree());
+  } else {
+    if (!mFrames.add(p, aFrame, aFrame->GetDepthInFrameTree())) {
+      NS_WARNING("failed to add frame to DepthOrderedFrameList");
+    }
+    if (mFrames.count() == 1) {
+      MOZ_ASSERT(mSortedFrames.IsEmpty());
+      mSortedFrames.AppendElement(FrameAndDepth{aFrame, p->value()});
+    } else {
+      mSortedFrames.ClearAndRetainStorage();
+    }
+  }
+}
+
+nsIFrame* DepthOrderedFrameList::PopShallowestRoot() {
+  MOZ_ASSERT(!mFrames.empty(), "no frames in list!");
+
+  EnsureSortedList();
+
+  const FrameAndDepth& lastFAD = mSortedFrames.PopLastElement();
+  nsIFrame* frame = lastFAD.mFrame;
+  MOZ_ASSERT(frame->GetDepthInFrameTree() == lastFAD.mDepth);
+  mFrames.remove(frame);
+  return frame;
+}
+
+bool DepthOrderedFrameList::FrameIsAncestorOfAnyElement(
+    nsIFrame* aFrame) const {
+  MOZ_ASSERT(aFrame);
+
+  for (auto iter = mFrames.iter(); !iter.done(); iter.next()) {
+    nsIFrame* f = iter.get().key();
+    do {
+      if (f == aFrame) {
+        return true;
+      }
+      f = f->GetParent();
+    } while (f);
+  }
+
+  return false;
+}
+
+void DepthOrderedFrameList::BuildSortedList() const {
+  MOZ_ASSERT(mSortedFrames.IsEmpty());
+
+  mSortedFrames.SetCapacity(mFrames.count());
+  for (auto iter = mFrames.iter(); !iter.done(); iter.next()) {
+    mSortedFrames.AppendElement(
+        FrameAndDepth{iter.get().key(), iter.get().value()});
+  }
+  mSortedFrames.Sort();
+}
+
+}  

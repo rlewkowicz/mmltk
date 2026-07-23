@@ -1,0 +1,111 @@
+
+[package]
+edition = "2021"
+rust-version = "1.62.0"
+name = "chrono"
+version = "0.4.42"
+build = false
+include = [
+    "src/*",
+    "tests/*.rs",
+    "LICENSE.txt",
+    "CITATION.cff",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Date and time library for Rust"
+homepage = "https://github.com/chronotope/chrono"
+documentation = "https://docs.rs/chrono/"
+keywords = [
+    "date",
+    "time",
+    "calendar",
+]
+categories = ["date-and-time"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/chronotope/chrono"
+
+[package.metadata.docs.rs]
+features = [
+    "arbitrary",
+    "rkyv",
+    "serde",
+    "unstable-locales",
+]
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
+
+[package.metadata.playground]
+features = ["serde"]
+
+[features]
+__internal_bench = []
+alloc = []
+clock = [
+    "iana-time-zone",
+    "now",
+]
+core-error = []
+default = [
+    "clock",
+    "std",
+    "oldtime",
+]
+libc = []
+now = ["std"]
+oldtime = []
+rkyv = [
+    "dep:rkyv",
+    "rkyv/size_32",
+]
+rkyv-16 = [
+    "dep:rkyv",
+    "rkyv?/size_16",
+]
+rkyv-32 = [
+    "dep:rkyv",
+    "rkyv?/size_32",
+]
+rkyv-64 = [
+    "dep:rkyv",
+    "rkyv?/size_64",
+]
+rkyv-validation = ["rkyv?/validation"]
+std = ["alloc"]
+unstable-locales = ["pure-rust-locales"]
+
+[lib]
+name = "chrono"
+path = "src/lib.rs"
+
+[dependencies.arbitrary]
+version = "1.0.0"
+features = ["derive"]
+optional = true
+
+[dependencies.num-traits]
+version = "0.2"
+default-features = false
+
+[dependencies.pure-rust-locales]
+version = "0.8"
+optional = true
+
+[dependencies.rkyv]
+version = "0.7.43"
+optional = true
+default-features = false
+
+[dependencies.serde]
+version = "1.0.99"
+optional = true
+default-features = false
+
+[target."cfg(unix)".dependencies.iana-time-zone]
+version = "0.1.45"
+optional = true

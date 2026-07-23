@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_DATASURFACEHELPERS_H
+#define MOZILLA_GFX_DATASURFACEHELPERS_H
+
+#include "2D.h"
+
+#include "mozilla/UniquePtr.h"
+
+namespace mozilla {
+namespace gfx {
+
+int32_t StrideForFormatAndWidth(SurfaceFormat aFormat, int32_t aWidth);
+
+already_AddRefed<DataSourceSurface> CreateDataSourceSurfaceFromData(
+    const IntSize& aSize, SurfaceFormat aFormat, const uint8_t* aData,
+    int32_t aDataStride);
+
+already_AddRefed<DataSourceSurface> CreateDataSourceSurfaceWithStrideFromData(
+    const IntSize& aSize, SurfaceFormat aFormat, int32_t aStride,
+    const uint8_t* aData, int32_t aDataStride);
+
+void CopySurfaceDataToPackedArray(uint8_t* aSrc, uint8_t* aDst,
+                                  IntSize aSrcSize, int32_t aSrcStride,
+                                  int32_t aBytesPerPixel);
+
+UniquePtr<uint8_t[]> SurfaceToPackedBGRA(DataSourceSurface* aSurface);
+
+uint8_t* SurfaceToPackedBGR(DataSourceSurface* aSurface);
+
+void ClearDataSourceSurface(DataSourceSurface* aSurface);
+
+size_t BufferSizeFromStrideAndHeight(int32_t aStride, int32_t aHeight,
+                                     int32_t aExtraBytes = 0);
+
+size_t BufferSizeFromDimensions(int32_t aWidth, int32_t aHeight, int32_t aDepth,
+                                int32_t aExtraBytes = 0);
+bool CopyRect(DataSourceSurface* aSrc, DataSourceSurface* aDest,
+              IntRect aSrcRect, IntPoint aDestPoint);
+
+already_AddRefed<DataSourceSurface> CreateDataSourceSurfaceByCloning(
+    DataSourceSurface* aSource);
+
+uint8_t* DataAtOffset(DataSourceSurface* aSurface,
+                      const DataSourceSurface::MappedSurface* aMap,
+                      IntPoint aPoint);
+
+bool SurfaceContainsPoint(SourceSurface* aSurface, const IntPoint& aPoint);
+
+}  
+}  
+
+#endif  // MOZILLA_GFX_DATASURFACEHELPERS_H

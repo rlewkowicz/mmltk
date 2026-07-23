@@ -1,0 +1,221 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_places_Database_h_
+#define mozilla_places_Database_h_
+
+#include "MainThreadUtils.h"
+#include "nsWeakReference.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsIObserver.h"
+#include "mozilla/storage.h"
+#include "mozilla/storage/StatementCache.h"
+#include "nsIEventTarget.h"
+#include "Shutdown.h"
+#include "nsCategoryCache.h"
+
+#define DATABASE_FILENAME u"places.sqlite"_ns
+#define DATABASE_FAVICONS_FILENAME u"favicons.sqlite"_ns
+#define DATABASE_FAVICONS_SCHEMANAME "favicons"_ns
+
+#define DATABASE_BUSY_TIMEOUT_MS 100
+
+#define TOPIC_PLACES_INIT_COMPLETE "places-init-complete"
+#define TOPIC_PROFILE_CHANGE_TEARDOWN "profile-change-teardown"
+#define TOPIC_PLACES_SHUTDOWN "places-shutdown"
+#define TOPIC_PLACES_CONNECTION_CLOSED "places-connection-closed"
+
+#define TOPIC_SIMULATE_PLACES_SHUTDOWN "test-simulate-places-shutdown"
+
+class mozIStorageService;
+class nsIAsyncShutdownClient;
+class nsIRunnable;
+
+namespace mozilla::places {
+
+enum JournalMode {
+  JOURNAL_DELETE = 0
+  ,
+  JOURNAL_TRUNCATE
+  ,
+  JOURNAL_MEMORY
+  ,
+  JOURNAL_WAL
+};
+
+class ClientsShutdownBlocker;
+class ConnectionShutdownBlocker;
+
+class Database final : public nsIObserver, public nsSupportsWeakReference {
+  using StatementCache = mozilla::storage::StatementCache<mozIStorageStatement>;
+  using AsyncStatementCache =
+      mozilla::storage::StatementCache<mozIStorageAsyncStatement>;
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  Database();
+
+  nsresult Init();
+
+  already_AddRefed<nsIAsyncShutdownClient> GetClientsShutdown();
+
+  already_AddRefed<nsIAsyncShutdownClient> GetConnectionShutdown();
+
+  static already_AddRefed<Database> GetDatabase();
+
+  nsresult EnsureConnection();
+
+  nsresult NotifyConnectionInitalized();
+
+  uint16_t GetDatabaseStatus() {
+    (void)EnsureConnection();
+    return mDatabaseStatus;
+  }
+
+  mozIStorageConnection* MainConn() {
+    (void)EnsureConnection();
+    return mMainConn;
+  }
+
+  nsresult DispatchToAsyncThread(nsIRunnable* aEvent) {
+    if (mClosed) {
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+
+    nsresult rv = EnsureConnection();
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+
+    nsCOMPtr<nsIEventTarget> target = do_GetInterface(mMainConn);
+    if (!target) {
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+
+    return target->Dispatch(aEvent, NS_DISPATCH_NORMAL);
+  }
+
+
+  template <int N>
+  already_AddRefed<mozIStorageStatement> GetStatement(const char (&aQuery)[N]) {
+    nsDependentCString query(aQuery, N - 1);
+    return GetStatement(query);
+  }
+
+  already_AddRefed<mozIStorageStatement> GetStatement(const nsACString& aQuery);
+
+  template <int N>
+  already_AddRefed<mozIStorageAsyncStatement> GetAsyncStatement(
+      const char (&aQuery)[N]) {
+    nsDependentCString query(aQuery, N - 1);
+    return GetAsyncStatement(query);
+  }
+
+  already_AddRefed<mozIStorageAsyncStatement> GetAsyncStatement(
+      const nsACString& aQuery);
+
+  int64_t GetTagsFolderId() {
+    (void)EnsureConnection();
+    return mTagsRootId;
+  }
+
+  static nsresult InitFunctions(mozIStorageConnection*);
+
+ protected:
+  void Shutdown();
+
+  nsresult EnsureFaviconsDatabaseAttached(
+      const nsCOMPtr<mozIStorageService>& aStorage);
+
+  nsresult BackupAndReplaceDatabaseFile(nsCOMPtr<mozIStorageService>& aStorage,
+                                        const nsString& aDbFilename,
+                                        bool aTryToClone,
+                                        bool aReopenConnection);
+
+  nsresult TryToCloneTablesFromCorruptDatabase(
+      const nsCOMPtr<mozIStorageService>& aStorage,
+      const nsCOMPtr<nsIFile>& aDatabaseFile);
+
+  nsresult SetupDatabaseConnection(nsCOMPtr<mozIStorageService>& aStorage);
+
+  nsresult InitSchema(bool* aDatabaseMigrated);
+
+  nsresult CheckRoots();
+
+  nsresult EnsureBookmarkRoots(const int32_t startPosition,
+                               bool shouldReparentRoots);
+
+  nsresult InitTempEntities();
+
+  nsresult MigrateV53Up();
+  nsresult MigrateV54Up();
+  nsresult MigrateV55Up();
+  nsresult MigrateV56Up();
+  nsresult MigrateV57Up();
+  nsresult MigrateV60Up();
+  nsresult MigrateV61Up();
+  nsresult MigrateV67Up();
+  nsresult MigrateV69Up();
+  nsresult MigrateV70Up();
+  nsresult MigrateV71Up();
+  nsresult MigrateV72Up();
+  nsresult MigrateV73Up();
+  nsresult MigrateV74Up();
+  nsresult MigrateV75Up();
+  nsresult MigrateV77Up();
+  nsresult MigrateV78Up();
+  nsresult MigrateV79Up();
+  nsresult MigrateV80Up();
+  nsresult MigrateV81Up();
+  nsresult MigrateV82Up();
+  nsresult MigrateV83Up();
+  nsresult MigrateV85Up();
+  nsresult MigrateV86Up();
+
+  nsresult UpdateBookmarkRootTitles();
+
+  friend class ConnectionShutdownBlocker;
+
+  int64_t CreateMobileRoot();
+
+ private:
+  ~Database();
+
+  static already_AddRefed<Database> GetSingleton();
+
+  static Database* gDatabase;
+
+  nsCOMPtr<mozIStorageConnection> mMainConn;
+
+  mutable StatementCache mMainThreadStatements;
+  mutable AsyncStatementCache mMainThreadAsyncStatements;
+  mutable StatementCache mAsyncThreadStatements;
+
+  int32_t mDBPageSize;
+  uint16_t mDatabaseStatus;
+  bool mClosed;
+
+  already_AddRefed<nsIAsyncShutdownClient> GetProfileChangeTeardownPhase();
+  already_AddRefed<nsIAsyncShutdownClient> GetProfileBeforeChangePhase();
+
+  RefPtr<ClientsShutdownBlocker> mClientsShutdown;
+  RefPtr<ConnectionShutdownBlocker> mConnectionShutdown;
+
+  uint32_t mMaxUrlLength;
+
+  nsCategoryCache<nsIObserver> mCacheObservers;
+
+  int64_t mRootId;
+  int64_t mMenuRootId;
+  int64_t mTagsRootId;
+  int64_t mUnfiledRootId;
+  int64_t mToolbarRootId;
+  int64_t mMobileRootId;
+};
+
+}  
+
+#endif  // mozilla_places_Database_h_

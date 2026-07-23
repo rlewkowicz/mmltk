@@ -1,0 +1,1609 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsPlainTextSerializer.h"
+
+#include "mozilla/Casting.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/Span.h"
+#include "mozilla/StaticPrefs_converter.h"
+#include "mozilla/TextEditor.h"
+#include "mozilla/Utf16.h"
+#include "mozilla/dom/AbstractRange.h"
+#include "mozilla/dom/CharacterData.h"
+#include "mozilla/dom/CharacterDataBuffer.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/HTMLBRElement.h"
+#include "mozilla/dom/Text.h"
+#include "mozilla/intl/Segmenter.h"
+#include "mozilla/intl/UnicodeProperties.h"
+#include "nsCRT.h"
+#include "nsComputedDOMStyle.h"
+#include "nsContentUtils.h"
+#include "nsDebug.h"
+#include "nsGkAtoms.h"
+#include "nsIDocumentEncoder.h"
+#include "nsPrintfCString.h"
+#include "nsReadableUtils.h"
+#include "nsUnicharUtils.h"
+#include "nsUnicodeProperties.h"
+
+namespace mozilla {
+class Encoding;
+}
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+#define PREF_STRUCTS "converter.html2txt.structs"
+#define PREF_HEADER_STRATEGY "converter.html2txt.header_strategy"
+
+static const int32_t kTabSize = 4;
+static const int32_t kIndentSizeHeaders =
+    2; 
+static const int32_t kIndentIncrementHeaders =
+    2; 
+static const int32_t kIndentSizeList = kTabSize;
+static const int32_t kIndentSizeDD = kTabSize;  
+static const char16_t kNBSP = 160;
+static const char16_t kSPACE = ' ';
+
+static int32_t HeaderLevel(const nsAtom* aTag);
+static int32_t GetUnicharWidth(char32_t ucs);
+static int32_t GetUnicharStringWidth(Span<const char16_t> aString);
+
+static const uint32_t TagStackSize = 500;
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(nsPlainTextSerializer)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(nsPlainTextSerializer)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsPlainTextSerializer)
+  NS_INTERFACE_MAP_ENTRY(nsIContentSerializer)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTION(nsPlainTextSerializer)
+
+nsresult NS_NewPlainTextSerializer(nsIContentSerializer** aSerializer) {
+  RefPtr<nsPlainTextSerializer> it = new nsPlainTextSerializer();
+  it.forget(aSerializer);
+  return NS_OK;
+}
+
+static void DetermineLineBreak(const int32_t aFlags, nsAString& aLineBreak) {
+  if ((aFlags & nsIDocumentEncoder::OutputCRLineBreak) &&
+      (aFlags & nsIDocumentEncoder::OutputLFLineBreak)) {
+    aLineBreak.AssignLiteral(u"\r\n");
+  } else if (aFlags & nsIDocumentEncoder::OutputCRLineBreak) {
+    aLineBreak.AssignLiteral(u"\r");
+  } else if (aFlags & nsIDocumentEncoder::OutputLFLineBreak) {
+    aLineBreak.AssignLiteral(u"\n");
+  } else {
+    aLineBreak.AssignLiteral(NS_ULINEBREAK);
+  }
+}
+
+void nsPlainTextSerializer::CurrentLine::MaybeReplaceNbspsInContent(
+    const int32_t aFlags) {
+  if (!(aFlags & nsIDocumentEncoder::OutputPersistNBSP)) {
+    mContent.ReplaceChar(kNBSP, kSPACE);
+  }
+}
+
+void nsPlainTextSerializer::CurrentLine::ResetContentAndIndentationHeader() {
+  mContent.Truncate();
+  mIndentation.mHeader.Truncate();
+}
+
+int32_t nsPlainTextSerializer::CurrentLine::FindWrapIndexForContent(
+    const uint32_t aWrapColumn, bool aUseLineBreaker) const {
+  MOZ_ASSERT(!mContent.IsEmpty());
+
+  const uint32_t prefixwidth = DeterminePrefixWidth();
+  int32_t goodSpace = 0;
+
+  if (aUseLineBreaker) {
+    uint32_t width = 0;
+    intl::LineBreakIteratorUtf16 lineBreakIter(mContent);
+    while (Maybe<uint32_t> nextGoodSpace = lineBreakIter.Next()) {
+      const Maybe<uint32_t> originalNextGoodSpace = nextGoodSpace;
+      while (*nextGoodSpace > 0 &&
+             mContent.CharAt(*nextGoodSpace - 1) == u' ') {
+        *nextGoodSpace -= 1;
+      }
+      if (*nextGoodSpace == 0) {
+        nextGoodSpace = originalNextGoodSpace;
+      }
+      width += GetUnicharStringWidth(Span<const char16_t>(
+          mContent.get() + goodSpace, *nextGoodSpace - goodSpace));
+      if (prefixwidth + width > aWrapColumn) {
+        break;
+      }
+      goodSpace = AssertedCast<int32_t>(*nextGoodSpace);
+      if (mContent.CharAt(*nextGoodSpace) == u'\n') {
+        goodSpace += 1;
+        break;
+      }
+    }
+    return goodSpace;
+  }
+
+  if (aWrapColumn >= prefixwidth) {
+    goodSpace =
+        std::min<int32_t>(aWrapColumn - prefixwidth, mContent.Length() - 1);
+    while (goodSpace >= 0) {
+      if (nsCRT::IsAsciiSpace(mContent.CharAt(goodSpace))) {
+        return goodSpace;
+      }
+      goodSpace--;
+    }
+  }
+
+  goodSpace = (prefixwidth > aWrapColumn) ? 1 : aWrapColumn - prefixwidth;
+  const int32_t contentLength = mContent.Length();
+  while (goodSpace < contentLength &&
+         !nsCRT::IsAsciiSpace(mContent.CharAt(goodSpace))) {
+    goodSpace++;
+  }
+
+  return goodSpace;
+}
+
+nsPlainTextSerializer::OutputManager::OutputManager(const int32_t aFlags,
+                                                    nsAString& aOutput)
+    : mFlags{aFlags}, mOutput{aOutput}, mAtFirstColumn{true} {
+  MOZ_ASSERT(aOutput.IsEmpty());
+
+  DetermineLineBreak(mFlags, mLineBreak);
+}
+
+void nsPlainTextSerializer::OutputManager::Append(
+    const CurrentLine& aLine,
+    const StripTrailingWhitespaces aStripTrailingWhitespaces) {
+  if (IsAtFirstColumn()) {
+    nsAutoString quotesAndIndent;
+    aLine.CreateQuotesAndIndent(quotesAndIndent);
+
+    if ((aStripTrailingWhitespaces == StripTrailingWhitespaces::kMaybe)) {
+      const bool stripTrailingSpaces = aLine.mContent.IsEmpty();
+      if (stripTrailingSpaces) {
+        quotesAndIndent.Trim(" ", false, true, false);
+      }
+    }
+
+    Append(quotesAndIndent);
+  }
+
+  Append(aLine.mContent);
+}
+
+void nsPlainTextSerializer::OutputManager::Append(const nsAString& aString) {
+  if (!aString.IsEmpty()) {
+    mOutput.Append(aString);
+    mAtFirstColumn = false;
+  }
+}
+
+void nsPlainTextSerializer::OutputManager::AppendLineBreak(bool aForceCRLF) {
+  mOutput.Append(aForceCRLF ? u"\r\n"_ns : mLineBreak);
+  mAtFirstColumn = true;
+}
+
+uint32_t nsPlainTextSerializer::OutputManager::GetOutputLength() const {
+  return mOutput.Length();
+}
+
+nsPlainTextSerializer::nsPlainTextSerializer()
+    : mFloatingLines(-1),
+      kSpace(u" "_ns)  
+{
+  mSpanLevel = 0;
+  for (int32_t i = 0; i <= 6; i++) {
+    mHeaderCounter[i] = 0;
+  }
+
+  mEmptyLines = 1;  
+  mInWhitespace = false;
+  mPreFormattedMail = false;
+
+  mPreformattedBlockBoundary = false;
+
+  mTagStack = new const nsAtom*[TagStackSize];
+  mTagStackIndex = 0;
+  mIgnoreAboveIndex = (uint32_t)kNotFound;
+
+  mULCount = 0;
+}
+
+nsPlainTextSerializer::~nsPlainTextSerializer() {
+  delete[] mTagStack;
+  NS_WARNING_ASSERTION(mHeadLevel == 0, "Wrong head level!");
+}
+
+nsPlainTextSerializer::Settings::HeaderStrategy
+nsPlainTextSerializer::Settings::Convert(const int32_t aPrefHeaderStrategy) {
+  HeaderStrategy result{HeaderStrategy::kIndentIncreasedWithHeaderLevel};
+
+  switch (aPrefHeaderStrategy) {
+    case 0: {
+      result = HeaderStrategy::kNoIndentation;
+      break;
+    }
+    case 1: {
+      result = HeaderStrategy::kIndentIncreasedWithHeaderLevel;
+      break;
+    }
+    case 2: {
+      result = HeaderStrategy::kNumberHeadingsAndIndentSlightly;
+      break;
+    }
+    default: {
+      NS_WARNING(
+          nsPrintfCString("Header strategy pref contains undefined value: %i",
+                          aPrefHeaderStrategy)
+              .get());
+    }
+  }
+
+  return result;
+}
+
+const int32_t kDefaultHeaderStrategy = 1;
+
+void nsPlainTextSerializer::Settings::Init(const int32_t aFlags,
+                                           const uint32_t aWrapColumn) {
+  mFlags = aFlags;
+
+  if (mFlags & nsIDocumentEncoder::OutputFormatted) {
+    mStructs = Preferences::GetBool(PREF_STRUCTS, mStructs);
+
+    int32_t headerStrategy =
+        Preferences::GetInt(PREF_HEADER_STRATEGY, kDefaultHeaderStrategy);
+    mHeaderStrategy = Convert(headerStrategy);
+  }
+
+  mWithRubyAnnotation = StaticPrefs::converter_html2txt_always_include_ruby() ||
+                        (mFlags & nsIDocumentEncoder::OutputRubyAnnotation);
+
+  mFlags &= ~nsIDocumentEncoder::OutputNoFramesContent;
+
+  mWrapColumn = aWrapColumn;
+}
+
+void nsPlainTextSerializer::HardWrapString(nsAString& aString,
+                                           uint32_t aWrapColumn,
+                                           int32_t aFlags) {
+  MOZ_ASSERT(aFlags & nsIDocumentEncoder::OutputWrap, "Why?");
+  MOZ_ASSERT(aWrapColumn, "Why?");
+
+  Settings settings;
+  settings.Init(aFlags, aWrapColumn);
+
+  nsAutoString output;
+  {
+    OutputManager manager(aFlags, output);
+    CurrentLine line;
+    bool first = true;
+    for (const auto& content : aString.Split(u'\n')) {
+      if (first) {
+        first = false;
+      } else {
+        manager.Flush(line);
+        manager.AppendLineBreak();
+      }
+      line.mContent.Assign(content);
+      PerformWrapAndOutputCompleteLines(settings, line, manager,
+                                         true,
+                                         false,
+                                        nullptr);
+    }
+    manager.Flush(line);
+  }
+  aString.Assign(std::move(output));
+}
+
+NS_IMETHODIMP
+nsPlainTextSerializer::Init(const uint32_t aFlags, uint32_t aWrapColumn,
+                            const Encoding* aEncoding, bool aIsCopying,
+                            bool aIsWholeDocument,
+                            bool* aNeedsPreformatScanning, nsAString& aOutput) {
+#ifdef DEBUG
+  if (aFlags & nsIDocumentEncoder::OutputFormatFlowed) {
+    NS_ASSERTION((aFlags & nsIDocumentEncoder::OutputFormatted) !=
+                     (aFlags & nsIDocumentEncoder::OutputWrap),
+                 "If you want format=flowed, you must combine it "
+                 "with either nsIDocumentEncoder::OutputFormatted "
+                 "or nsIDocumentEncoder::OutputWrap");
+  }
+
+  if (aFlags & nsIDocumentEncoder::OutputFormatted) {
+    NS_ASSERTION(
+        !(aFlags & nsIDocumentEncoder::OutputPreformatted),
+        "Can't do formatted and preformatted output at the same time!");
+  }
+#endif
+  MOZ_ASSERT(!(aFlags & nsIDocumentEncoder::OutputFormatDelSp) ||
+             (aFlags & nsIDocumentEncoder::OutputFormatFlowed));
+
+  *aNeedsPreformatScanning = true;
+  mSettings.Init(aFlags, aWrapColumn);
+  mOutputManager.emplace(mSettings.GetFlags(), aOutput);
+
+  mUseLineBreaker = mSettings.MayWrap() && mSettings.MayBreakLines();
+
+  mLineBreakDue = false;
+  mFloatingLines = -1;
+
+  mPreformattedBlockBoundary = false;
+
+  MOZ_ASSERT(mOLStack.IsEmpty());
+
+  return NS_OK;
+}
+
+bool nsPlainTextSerializer::GetLastBool(const nsTArray<bool>& aStack) {
+  uint32_t size = aStack.Length();
+  if (size == 0) {
+    return false;
+  }
+  return aStack.ElementAt(size - 1);
+}
+
+void nsPlainTextSerializer::SetLastBool(nsTArray<bool>& aStack, bool aValue) {
+  uint32_t size = aStack.Length();
+  if (size > 0) {
+    aStack.ElementAt(size - 1) = aValue;
+  } else {
+    NS_ERROR("There is no \"Last\" value");
+  }
+}
+
+void nsPlainTextSerializer::PushBool(nsTArray<bool>& aStack, bool aValue) {
+  aStack.AppendElement(bool(aValue));
+}
+
+bool nsPlainTextSerializer::PopBool(nsTArray<bool>& aStack) {
+  return aStack.Length() ? aStack.PopLastElement() : false;
+}
+
+bool nsPlainTextSerializer::IsIgnorableRubyAnnotation(
+    const nsAtom* aTag) const {
+  if (mSettings.GetWithRubyAnnotation()) {
+    return false;
+  }
+
+  return aTag == nsGkAtoms::rp || aTag == nsGkAtoms::rt ||
+         aTag == nsGkAtoms::rtc;
+}
+
+static bool IsDisplayNone(Element* aElement) {
+  RefPtr<const ComputedStyle> computedStyle =
+      nsComputedDOMStyle::GetComputedStyleNoFlush(aElement);
+  return !computedStyle ||
+         computedStyle->StyleDisplay()->mDisplay == StyleDisplay::None;
+}
+
+static bool IsIgnorableScriptOrStyle(Element* aElement) {
+  return aElement->IsAnyOfHTMLElements(nsGkAtoms::script, nsGkAtoms::style) &&
+         IsDisplayNone(aElement);
+}
+
+NS_IMETHODIMP
+nsPlainTextSerializer::AppendText(Text* aText, int32_t aStartOffset,
+                                  int32_t aEndOffset) {
+  if (mIgnoreAboveIndex != (uint32_t)kNotFound) {
+    return NS_OK;
+  }
+
+  NS_ASSERTION(aStartOffset >= 0, "Negative start offset for text fragment!");
+  if (aStartOffset < 0) return NS_ERROR_INVALID_ARG;
+
+  NS_ENSURE_ARG(aText);
+
+  nsresult rv = NS_OK;
+
+  const CharacterDataBuffer* characterDataBuffer = nullptr;
+  if (!(characterDataBuffer = aText->GetCharacterDataBuffer())) {
+    return NS_ERROR_FAILURE;
+  }
+
+  int32_t fragLength = characterDataBuffer->GetLength();
+  int32_t endoffset =
+      (aEndOffset == -1) ? fragLength : std::min(aEndOffset, fragLength);
+  NS_ASSERTION(aStartOffset <= endoffset,
+               "A start offset is beyond the end of the text fragment!");
+
+  int32_t length = endoffset - aStartOffset;
+  if (length <= 0) {
+    return NS_OK;
+  }
+
+  if (!DoOutput()) {
+    return NS_OK;
+  }
+
+  if (mLineBreakDue) {
+    EnsureVerticalSpace(mFloatingLines);
+  }
+
+  if (MustSuppressLeaf()) {
+    return NS_OK;
+  }
+
+  nsAutoString textstr;
+  if (characterDataBuffer->Is2b()) {
+    textstr.Assign(characterDataBuffer->Get2b() + aStartOffset, length);
+  } else {
+    const char* data = characterDataBuffer->Get1b();
+    CopyASCIItoUTF16(Substring(data + aStartOffset, data + endoffset), textstr);
+  }
+
+  if (aText->HasFlag(NS_MAYBE_MASKED)) {
+    TextEditor::MaskString(textstr, *aText, 0, aStartOffset);
+  }
+
+  if (mSettings.HasFlag(nsIDocumentEncoder::OutputForPlainTextClipboardCopy)) {
+    Write(textstr);
+    return rv;
+  }
+
+  int32_t start = 0;
+  int32_t offset = textstr.FindCharInSet(u"\n\r");
+  while (offset != kNotFound) {
+    if (offset > start) {
+      DoAddText(Substring(textstr, start, offset - start));
+    }
+
+    DoAddLineBreak();
+
+    start = offset + 1;
+    offset = textstr.FindCharInSet(u"\n\r", start);
+  }
+
+  if (start < length) {
+    if (start) {
+      DoAddText(Substring(textstr, start, length - start));
+    } else {
+      DoAddText(textstr);
+    }
+  }
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsPlainTextSerializer::AppendCDATASection(Text* aCDATASection,
+                                          int32_t aStartOffset,
+                                          int32_t aEndOffset) {
+  MOZ_ASSERT(!aCDATASection ||
+             aCDATASection->NodeType() == nsINode::CDATA_SECTION_NODE);
+  return AppendText(aCDATASection, aStartOffset, aEndOffset);
+}
+
+NS_IMETHODIMP
+nsPlainTextSerializer::ScanElementForPreformat(Element* aElement) {
+  mPreformatStack.push(IsElementPreformatted(aElement));
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsPlainTextSerializer::ForgetElementForPreformat(Element* aElement) {
+  MOZ_RELEASE_ASSERT(!mPreformatStack.empty(),
+                     "Tried to pop without previous push.");
+  mPreformatStack.pop();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsPlainTextSerializer::AppendElementStart(Element* aElement,
+                                          Element* aOriginalElement) {
+  NS_ENSURE_ARG(aElement);
+
+  nsresult rv = NS_OK;
+  nsAtom* id = GetIdForContent(aElement);
+  if (!FragmentOrElement::IsHTMLVoid(id)) {
+    rv = DoOpenContainer(aElement, id);
+  } else {
+    rv = DoAddLeaf(aElement, id);
+  }
+
+  if (id == nsGkAtoms::head) {
+    ++mHeadLevel;
+  }
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsPlainTextSerializer::AppendElementEnd(Element* aElement,
+                                        Element* aOriginalElement) {
+  NS_ENSURE_ARG(aElement);
+
+  nsresult rv = NS_OK;
+  nsAtom* id = GetIdForContent(aElement);
+  if (!FragmentOrElement::IsHTMLVoid(id)) {
+    rv = DoCloseContainer(aElement, id);
+  }
+
+  if (id == nsGkAtoms::head) {
+    NS_ASSERTION(mHeadLevel != 0, "mHeadLevel being decremented below 0");
+    --mHeadLevel;
+  }
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsPlainTextSerializer::FlushAndFinish() {
+  MOZ_ASSERT(mOutputManager);
+
+  mOutputManager->Flush(mCurrentLine);
+  return Finish();
+}
+
+NS_IMETHODIMP
+nsPlainTextSerializer::Finish() {
+  mOutputManager.reset();
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsPlainTextSerializer::GetOutputLength(uint32_t& aLength) const {
+  MOZ_ASSERT(mOutputManager);
+
+  aLength = mOutputManager->GetOutputLength();
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsPlainTextSerializer::AppendDocumentStart(Document* aDocument) {
+  return NS_OK;
+}
+
+constexpr int32_t kOlStackDummyValue = 0;
+
+nsresult nsPlainTextSerializer::DoOpenContainer(Element* aElement,
+                                                const nsAtom* aTag) {
+  MOZ_ASSERT(aElement);
+  MOZ_ASSERT(GetIdForContent(aElement) == aTag);
+  MOZ_ASSERT(!FragmentOrElement::IsHTMLVoid(aTag));
+
+  if (IsIgnorableRubyAnnotation(aTag)) {
+    mIgnoredChildNodeLevel++;
+    return NS_OK;
+  }
+  if (IsIgnorableScriptOrStyle(aElement)) {
+    mIgnoredChildNodeLevel++;
+    return NS_OK;
+  }
+
+  if (mSettings.HasFlag(nsIDocumentEncoder::OutputForPlainTextClipboardCopy)) {
+    if (mPreformattedBlockBoundary && DoOutput()) {
+      if (mFloatingLines < 0) mFloatingLines = 0;
+      mLineBreakDue = true;
+    }
+    mPreformattedBlockBoundary = false;
+  }
+
+  if (mSettings.HasFlag(nsIDocumentEncoder::OutputRaw)) {
+
+    return NS_OK;
+  }
+
+  if (mTagStackIndex < TagStackSize) {
+    mTagStack[mTagStackIndex++] = aTag;
+  }
+
+  if (mIgnoreAboveIndex != (uint32_t)kNotFound) {
+    return NS_OK;
+  }
+
+  mHasWrittenCiteBlockquote =
+      mHasWrittenCiteBlockquote && aTag == nsGkAtoms::pre;
+
+  bool isInCiteBlockquote = false;
+
+  if (aTag == nsGkAtoms::blockquote) {
+    nsAutoString value;
+    nsresult rv = GetAttributeValue(aElement, nsGkAtoms::type, value);
+    isInCiteBlockquote = NS_SUCCEEDED(rv) && value.EqualsIgnoreCase("cite");
+  }
+
+  if (mLineBreakDue && !isInCiteBlockquote) EnsureVerticalSpace(mFloatingLines);
+
+  if ((aTag == nsGkAtoms::noscript &&
+       !mSettings.HasFlag(nsIDocumentEncoder::OutputNoScriptContent)) ||
+      ((aTag == nsGkAtoms::iframe || aTag == nsGkAtoms::noframes) &&
+       !mSettings.HasFlag(nsIDocumentEncoder::OutputNoFramesContent))) {
+    mIgnoreAboveIndex = mTagStackIndex - 1;
+    return NS_OK;
+  }
+
+  if (aTag == nsGkAtoms::body) {
+    nsAutoString style;
+    int32_t whitespace;
+    if (NS_SUCCEEDED(GetAttributeValue(aElement, nsGkAtoms::style, style)) &&
+        (kNotFound != (whitespace = style.Find(u"white-space:")))) {
+      if (kNotFound != style.LowerCaseFindASCII("pre-wrap", whitespace)) {
+#ifdef DEBUG_preformatted
+        printf("Set mPreFormattedMail based on style pre-wrap\n");
+#endif
+        mPreFormattedMail = true;
+      } else if (kNotFound != style.LowerCaseFindASCII("pre", whitespace)) {
+#ifdef DEBUG_preformatted
+        printf("Set mPreFormattedMail based on style pre\n");
+#endif
+        mPreFormattedMail = true;
+      }
+    } else {
+      mInWhitespace = true;
+      mPreFormattedMail = false;
+    }
+
+    return NS_OK;
+  }
+
+  if (!DoOutput()) {
+    return NS_OK;
+  }
+
+  if (aTag == nsGkAtoms::p)
+    EnsureVerticalSpace(1);
+  else if (aTag == nsGkAtoms::pre) {
+    if (GetLastBool(mIsInCiteBlockquote))
+      EnsureVerticalSpace(0);
+    else if (mHasWrittenCiteBlockquote) {
+      EnsureVerticalSpace(0);
+      mHasWrittenCiteBlockquote = false;
+    } else
+      EnsureVerticalSpace(1);
+  } else if (aTag == nsGkAtoms::tr) {
+    PushBool(mHasWrittenCellsForRow, false);
+  } else if (aTag == nsGkAtoms::td || aTag == nsGkAtoms::th) {
+
+    if (mHasWrittenCellsForRow.IsEmpty()) {
+      PushBool(mHasWrittenCellsForRow, true);  
+    } else if (GetLastBool(mHasWrittenCellsForRow)) {
+      AddToLine(u"\t", 1);
+      mInWhitespace = true;
+    } else {
+      SetLastBool(mHasWrittenCellsForRow, true);
+    }
+  } else if (aTag == nsGkAtoms::ul) {
+    EnsureVerticalSpace(IsInOlOrUl() ? 0 : 1);
+    mCurrentLine.mIndentation.mLength += kIndentSizeList;
+    mULCount++;
+  } else if (aTag == nsGkAtoms::ol) {
+    EnsureVerticalSpace(IsInOlOrUl() ? 0 : 1);
+    if (mSettings.HasFlag(nsIDocumentEncoder::OutputFormatted)) {
+      nsAutoString startAttr;
+      int32_t startVal = 1;
+      if (NS_SUCCEEDED(
+              GetAttributeValue(aElement, nsGkAtoms::start, startAttr))) {
+        nsresult rv = NS_OK;
+        startVal = startAttr.ToInteger(&rv);
+        if (NS_FAILED(rv)) {
+          startVal = 1;
+        }
+      }
+      mOLStack.AppendElement(startVal);
+    } else {
+      mOLStack.AppendElement(kOlStackDummyValue);
+    }
+    mCurrentLine.mIndentation.mLength += kIndentSizeList;  
+  } else if (aTag == nsGkAtoms::li &&
+             mSettings.HasFlag(nsIDocumentEncoder::OutputFormatted)) {
+    if (mTagStackIndex > 1 && IsInOL()) {
+      if (!mOLStack.IsEmpty()) {
+        nsAutoString valueAttr;
+        if (NS_SUCCEEDED(
+                GetAttributeValue(aElement, nsGkAtoms::value, valueAttr))) {
+          nsresult rv = NS_OK;
+          int32_t valueAttrVal = valueAttr.ToInteger(&rv);
+          if (NS_SUCCEEDED(rv)) {
+            mOLStack.LastElement() = valueAttrVal;
+          }
+        }
+        mCurrentLine.mIndentation.mHeader.AppendInt(mOLStack.LastElement(), 10);
+        mOLStack.LastElement()++;
+      } else {
+        mCurrentLine.mIndentation.mHeader.Append(char16_t('#'));
+      }
+
+      mCurrentLine.mIndentation.mHeader.Append(char16_t('.'));
+
+    } else {
+      static const char bulletCharArray[] = "*o+#";
+      uint32_t index = mULCount > 0 ? (mULCount - 1) : 3;
+      char bulletChar = bulletCharArray[index % 4];
+      mCurrentLine.mIndentation.mHeader.Append(char16_t(bulletChar));
+    }
+
+    mCurrentLine.mIndentation.mHeader.Append(char16_t(' '));
+  } else if (aTag == nsGkAtoms::dl) {
+    EnsureVerticalSpace(1);
+  } else if (aTag == nsGkAtoms::dt) {
+    EnsureVerticalSpace(0);
+  } else if (aTag == nsGkAtoms::dd) {
+    EnsureVerticalSpace(0);
+    mCurrentLine.mIndentation.mLength += kIndentSizeDD;
+  } else if (aTag == nsGkAtoms::span) {
+    ++mSpanLevel;
+  } else if (aTag == nsGkAtoms::blockquote) {
+    PushBool(mIsInCiteBlockquote, isInCiteBlockquote);
+    if (isInCiteBlockquote) {
+      EnsureVerticalSpace(0);
+      mCurrentLine.mCiteQuoteLevel++;
+    } else {
+      EnsureVerticalSpace(1);
+      mCurrentLine.mIndentation.mLength +=
+          kTabSize;  
+    }
+  } else if (aTag == nsGkAtoms::q) {
+    Write(u"\""_ns);
+  }
+
+  else if (IsCssBlockLevelElement(aElement)) {
+    EnsureVerticalSpace(0);
+  }
+
+  if (mSettings.HasFlag(nsIDocumentEncoder::OutputFormatted)) {
+    OpenContainerForOutputFormatted(aElement, aTag);
+  }
+  return NS_OK;
+}
+
+void nsPlainTextSerializer::OpenContainerForOutputFormatted(
+    Element* aElement, const nsAtom* aTag) {
+  MOZ_ASSERT(aElement);
+  MOZ_ASSERT(GetIdForContent(aElement) == aTag);
+  MOZ_ASSERT(!FragmentOrElement::IsHTMLVoid(aTag));
+
+  const bool currentNodeIsConverted = IsCurrentNodeConverted(aElement);
+
+  if (aTag == nsGkAtoms::h1 || aTag == nsGkAtoms::h2 || aTag == nsGkAtoms::h3 ||
+      aTag == nsGkAtoms::h4 || aTag == nsGkAtoms::h5 || aTag == nsGkAtoms::h6) {
+    EnsureVerticalSpace(2);
+    if (mSettings.GetHeaderStrategy() ==
+        Settings::HeaderStrategy::kNumberHeadingsAndIndentSlightly) {
+      mCurrentLine.mIndentation.mLength += kIndentSizeHeaders;
+      int32_t level = HeaderLevel(aTag);
+      mHeaderCounter[level]++;
+      int32_t i;
+
+      for (i = level + 1; i <= 6; i++) {
+        mHeaderCounter[i] = 0;
+      }
+
+      nsAutoString leadup;
+      for (i = 1; i <= level; i++) {
+        leadup.AppendInt(mHeaderCounter[i]);
+        leadup.Append(char16_t('.'));
+      }
+      leadup.Append(char16_t(' '));
+      Write(leadup);
+    } else if (mSettings.GetHeaderStrategy() ==
+               Settings::HeaderStrategy::kIndentIncreasedWithHeaderLevel) {
+      mCurrentLine.mIndentation.mLength += kIndentSizeHeaders;
+      for (int32_t i = HeaderLevel(aTag); i > 1; i--) {
+        mCurrentLine.mIndentation.mLength += kIndentIncrementHeaders;
+      }
+    }
+  } else if (aTag == nsGkAtoms::sup && mSettings.GetStructs() &&
+             !currentNodeIsConverted) {
+    Write(u"^"_ns);
+  } else if (aTag == nsGkAtoms::sub && mSettings.GetStructs() &&
+             !currentNodeIsConverted) {
+    Write(u"_"_ns);
+  } else if (aTag == nsGkAtoms::code && mSettings.GetStructs() &&
+             !currentNodeIsConverted) {
+    Write(u"|"_ns);
+  } else if ((aTag == nsGkAtoms::strong || aTag == nsGkAtoms::b) &&
+             mSettings.GetStructs() && !currentNodeIsConverted) {
+    Write(u"*"_ns);
+  } else if ((aTag == nsGkAtoms::em || aTag == nsGkAtoms::i) &&
+             mSettings.GetStructs() && !currentNodeIsConverted) {
+    Write(u"/"_ns);
+  } else if (aTag == nsGkAtoms::u && mSettings.GetStructs() &&
+             !currentNodeIsConverted) {
+    Write(u"_"_ns);
+  }
+
+  mInWhitespace = true;
+}
+
+nsresult nsPlainTextSerializer::DoCloseContainer(Element* aElement,
+                                                 const nsAtom* aTag) {
+  MOZ_ASSERT(aElement);
+  MOZ_ASSERT(GetIdForContent(aElement) == aTag);
+  MOZ_ASSERT(!FragmentOrElement::IsHTMLVoid(aTag));
+
+  if (IsIgnorableRubyAnnotation(aTag)) {
+    mIgnoredChildNodeLevel--;
+    return NS_OK;
+  }
+  if (IsIgnorableScriptOrStyle(aElement)) {
+    mIgnoredChildNodeLevel--;
+    return NS_OK;
+  }
+
+  if (mSettings.HasFlag(nsIDocumentEncoder::OutputForPlainTextClipboardCopy)) {
+    if (DoOutput() && IsElementPreformatted() &&
+        IsCssBlockLevelElement(aElement)) {
+      mPreformattedBlockBoundary = true;
+    }
+  }
+
+  if (mSettings.HasFlag(nsIDocumentEncoder::OutputRaw)) {
+
+    return NS_OK;
+  }
+
+  if (mTagStackIndex > 0) {
+    --mTagStackIndex;
+  }
+
+  if (mTagStackIndex >= mIgnoreAboveIndex) {
+    if (mTagStackIndex == mIgnoreAboveIndex) {
+      mIgnoreAboveIndex = (uint32_t)kNotFound;
+    }
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(mOutputManager);
+
+  if ((aTag == nsGkAtoms::body) || (aTag == nsGkAtoms::html)) {
+    if (mSettings.HasFlag(nsIDocumentEncoder::OutputFormatted)) {
+      EnsureVerticalSpace(0);
+    } else {
+      mOutputManager->Flush(mCurrentLine);
+    }
+    return NS_OK;
+  }
+
+  if (!DoOutput()) {
+    return NS_OK;
+  }
+
+  if (aTag == nsGkAtoms::tr) {
+    PopBool(mHasWrittenCellsForRow);
+    if (mFloatingLines < 0) mFloatingLines = 0;
+    mLineBreakDue = true;
+  } else if (((aTag == nsGkAtoms::li) || (aTag == nsGkAtoms::dt)) &&
+             mSettings.HasFlag(nsIDocumentEncoder::OutputFormatted)) {
+    if (mFloatingLines < 0) mFloatingLines = 0;
+    mLineBreakDue = true;
+  } else if (aTag == nsGkAtoms::pre) {
+    mFloatingLines = GetLastBool(mIsInCiteBlockquote) ? 0 : 1;
+    mLineBreakDue = true;
+  } else if (aTag == nsGkAtoms::ul) {
+    mOutputManager->Flush(mCurrentLine);
+    mCurrentLine.mIndentation.mLength -= kIndentSizeList;
+    --mULCount;
+    if (!IsInOlOrUl()) {
+      mFloatingLines = 1;
+      mLineBreakDue = true;
+    }
+  } else if (aTag == nsGkAtoms::ol) {
+    mOutputManager->Flush(mCurrentLine);  
+    mCurrentLine.mIndentation.mLength -= kIndentSizeList;
+    MOZ_ASSERT(!mOLStack.IsEmpty(), "Wrong OLStack level!");
+    mOLStack.RemoveLastElement();
+    if (!IsInOlOrUl()) {
+      mFloatingLines = 1;
+      mLineBreakDue = true;
+    }
+  } else if (aTag == nsGkAtoms::dl) {
+    mFloatingLines = 1;
+    mLineBreakDue = true;
+  } else if (aTag == nsGkAtoms::dd) {
+    mOutputManager->Flush(mCurrentLine);
+    mCurrentLine.mIndentation.mLength -= kIndentSizeDD;
+  } else if (aTag == nsGkAtoms::span) {
+    NS_ASSERTION(mSpanLevel, "Span level will be negative!");
+    --mSpanLevel;
+  } else if (aTag == nsGkAtoms::div) {
+    if (mFloatingLines < 0) mFloatingLines = 0;
+    mLineBreakDue = true;
+  } else if (aTag == nsGkAtoms::blockquote) {
+    mOutputManager->Flush(mCurrentLine);  
+
+    bool isInCiteBlockquote = PopBool(mIsInCiteBlockquote);
+
+    if (isInCiteBlockquote) {
+      NS_ASSERTION(mCurrentLine.mCiteQuoteLevel,
+                   "CiteQuote level will be negative!");
+      mCurrentLine.mCiteQuoteLevel--;
+      mFloatingLines = 0;
+      mHasWrittenCiteBlockquote = true;
+    } else {
+      mCurrentLine.mIndentation.mLength -= kTabSize;
+      mFloatingLines = 1;
+    }
+    mLineBreakDue = true;
+  } else if (aTag == nsGkAtoms::q) {
+    Write(u"\""_ns);
+  } else if (IsCssBlockLevelElement(aElement)) {
+    if (mSettings.HasFlag(nsIDocumentEncoder::OutputFormatted)) {
+      EnsureVerticalSpace(1);
+    } else {
+      if (mFloatingLines < 0) mFloatingLines = 0;
+      mLineBreakDue = true;
+    }
+  }
+
+  if (mSettings.HasFlag(nsIDocumentEncoder::OutputFormatted)) {
+    CloseContainerForOutputFormatted(aElement, aTag);
+  }
+
+  return NS_OK;
+}
+
+void nsPlainTextSerializer::CloseContainerForOutputFormatted(
+    Element* aElement, const nsAtom* aTag) {
+  MOZ_ASSERT(aElement);
+  MOZ_ASSERT(GetIdForContent(aElement) == aTag);
+  MOZ_ASSERT(!FragmentOrElement::IsHTMLVoid(aTag));
+
+  const bool currentNodeIsConverted = IsCurrentNodeConverted(aElement);
+
+  if (aTag == nsGkAtoms::h1 || aTag == nsGkAtoms::h2 || aTag == nsGkAtoms::h3 ||
+      aTag == nsGkAtoms::h4 || aTag == nsGkAtoms::h5 || aTag == nsGkAtoms::h6) {
+    using HeaderStrategy = Settings::HeaderStrategy;
+    if ((mSettings.GetHeaderStrategy() ==
+         HeaderStrategy::kIndentIncreasedWithHeaderLevel) ||
+        (mSettings.GetHeaderStrategy() ==
+         HeaderStrategy::kNumberHeadingsAndIndentSlightly)) {
+      mCurrentLine.mIndentation.mLength -= kIndentSizeHeaders;
+    }
+    if (mSettings.GetHeaderStrategy() ==
+        HeaderStrategy::kIndentIncreasedWithHeaderLevel) {
+      for (int32_t i = HeaderLevel(aTag); i > 1; i--) {
+        mCurrentLine.mIndentation.mLength -= kIndentIncrementHeaders;
+      }
+    }
+    EnsureVerticalSpace(1);
+  } else if (aTag == nsGkAtoms::a && !currentNodeIsConverted) {
+    nsAutoString url;
+    if (NS_SUCCEEDED(GetAttributeValue(aElement, nsGkAtoms::href, url)) &&
+        !url.IsEmpty()) {
+      nsAutoString temp;
+      temp.AssignLiteral(" <");
+      temp += url;
+      temp.Append(char16_t('>'));
+      Write(temp);
+    }
+  } else if ((aTag == nsGkAtoms::sup || aTag == nsGkAtoms::sub) &&
+             mSettings.GetStructs() && !currentNodeIsConverted) {
+    Write(kSpace);
+  } else if (aTag == nsGkAtoms::code && mSettings.GetStructs() &&
+             !currentNodeIsConverted) {
+    Write(u"|"_ns);
+  } else if ((aTag == nsGkAtoms::strong || aTag == nsGkAtoms::b) &&
+             mSettings.GetStructs() && !currentNodeIsConverted) {
+    Write(u"*"_ns);
+  } else if ((aTag == nsGkAtoms::em || aTag == nsGkAtoms::i) &&
+             mSettings.GetStructs() && !currentNodeIsConverted) {
+    Write(u"/"_ns);
+  } else if (aTag == nsGkAtoms::u && mSettings.GetStructs() &&
+             !currentNodeIsConverted) {
+    Write(u"_"_ns);
+  }
+}
+
+bool nsPlainTextSerializer::MustSuppressLeaf() const {
+  if (mIgnoredChildNodeLevel > 0) {
+    return true;
+  }
+
+  if ((mTagStackIndex > 1 &&
+       mTagStack[mTagStackIndex - 2] == nsGkAtoms::select) ||
+      (mTagStackIndex > 0 &&
+       mTagStack[mTagStackIndex - 1] == nsGkAtoms::select)) {
+    return true;
+  }
+
+  return false;
+}
+
+void nsPlainTextSerializer::DoAddLineBreak() {
+  MOZ_ASSERT(DoOutput());
+  MOZ_ASSERT(!mLineBreakDue);
+  MOZ_ASSERT(mIgnoreAboveIndex == (uint32_t)kNotFound);
+  MOZ_ASSERT(!MustSuppressLeaf());
+
+  if (mSettings.HasFlag(nsIDocumentEncoder::OutputPreformatted) ||
+      (mPreFormattedMail && !mSettings.GetWrapColumn()) ||
+      IsElementPreformatted()) {
+    EnsureVerticalSpace(mEmptyLines + 1);
+  } else if (!mInWhitespace) {
+    Write(kSpace);
+    mInWhitespace = true;
+  }
+}
+
+void nsPlainTextSerializer::DoAddText(const nsAString& aText) {
+  MOZ_ASSERT(DoOutput());
+  MOZ_ASSERT(!mLineBreakDue);
+  MOZ_ASSERT(mIgnoreAboveIndex == (uint32_t)kNotFound);
+  MOZ_ASSERT(!MustSuppressLeaf());
+
+  mHasWrittenCiteBlockquote = false;
+
+  Write(aText);
+}
+
+void CreateLineOfDashes(nsAString& aResult, const uint32_t aWrapColumn) {
+  MOZ_ASSERT(aResult.IsEmpty());
+
+  const uint32_t width = (aWrapColumn > 0 ? aWrapColumn : 25);
+  while (aResult.Length() < width) {
+    aResult.Append(char16_t('-'));
+  }
+}
+
+nsresult nsPlainTextSerializer::DoAddLeaf(Element* aElement,
+                                          const nsAtom* aTag) {
+  MOZ_ASSERT(aElement);
+  MOZ_ASSERT(GetIdForContent(aElement) == aTag);
+  MOZ_ASSERT(FragmentOrElement::IsHTMLVoid(aTag));
+
+  mPreformattedBlockBoundary = false;
+
+  if (!DoOutput()) {
+    return NS_OK;
+  }
+
+  if (mLineBreakDue) EnsureVerticalSpace(mFloatingLines);
+
+  if (MustSuppressLeaf()) {
+    return NS_OK;
+  }
+
+  if (aTag == nsGkAtoms::br) {
+    HTMLBRElement* brElement = HTMLBRElement::FromNodeOrNull(aElement);
+    if (!brElement || !brElement->IsPaddingForEmptyLastLine()) {
+      EnsureVerticalSpace(mEmptyLines + 1);
+    }
+  } else if (aTag == nsGkAtoms::hr &&
+             mSettings.HasFlag(nsIDocumentEncoder::OutputFormatted)) {
+    EnsureVerticalSpace(0);
+
+    nsAutoString line;
+    CreateLineOfDashes(line, mSettings.GetWrapColumn());
+    Write(line);
+
+    EnsureVerticalSpace(0);
+  } else if (aTag == nsGkAtoms::img) {
+    nsAutoString imageDescription;
+    if (NS_SUCCEEDED(
+            GetAttributeValue(aElement, nsGkAtoms::alt, imageDescription))) {
+    } else if (NS_SUCCEEDED(GetAttributeValue(aElement, nsGkAtoms::title,
+                                              imageDescription)) &&
+               !imageDescription.IsEmpty()) {
+      imageDescription = u" ["_ns + imageDescription + u"] "_ns;
+    }
+
+    Write(imageDescription);
+  }
+
+  return NS_OK;
+}
+
+void nsPlainTextSerializer::EnsureVerticalSpace(const int32_t aNumberOfRows) {
+  if (aNumberOfRows >= 0 && !mCurrentLine.mIndentation.mHeader.IsEmpty()) {
+    EndHardBreakLine();
+    mInWhitespace = true;
+  }
+
+  while (mEmptyLines < aNumberOfRows) {
+    EndHardBreakLine();
+    mInWhitespace = true;
+  }
+  mLineBreakDue = false;
+  mFloatingLines = -1;
+}
+
+void nsPlainTextSerializer::OutputManager::Flush(CurrentLine& aLine) {
+  if (!aLine.mContent.IsEmpty()) {
+    aLine.MaybeReplaceNbspsInContent(mFlags);
+
+    Append(aLine, StripTrailingWhitespaces::kNo);
+
+    aLine.ResetContentAndIndentationHeader();
+  }
+}
+
+static bool IsSpaceStuffable(const char16_t* s) {
+  return (s[0] == '>' || s[0] == ' ' || s[0] == kNBSP ||
+          NS_strncmp(s, u"From ", 5) == 0);
+}
+
+void nsPlainTextSerializer::PerformWrapAndOutputCompleteLines(
+    const Settings& aSettings, CurrentLine& aLine, OutputManager& aOutput,
+    bool aUseLineBreaker, bool aAllowBonusWidth,
+    nsPlainTextSerializer* aSerializer) {
+  if (!aSettings.MayWrap()) {
+    return;
+  }
+
+  const uint32_t wrapColumn = aSettings.GetWrapColumn();
+  const uint32_t bonusWidth = (wrapColumn > 20 && aAllowBonusWidth) ? 4 : 0;
+  while (!aLine.mContent.IsEmpty()) {
+    const uint32_t prefixwidth = aLine.DeterminePrefixWidth();
+    const uint32_t currentLineContentWidth =
+        GetUnicharStringWidth(aLine.mContent);
+    if (currentLineContentWidth + prefixwidth <= wrapColumn + bonusWidth) {
+      break;
+    }
+
+    const int32_t goodSpace =
+        aLine.FindWrapIndexForContent(wrapColumn, aUseLineBreaker);
+
+    const int32_t contentLength = aLine.mContent.Length();
+    if (goodSpace <= 0 || goodSpace >= contentLength) {
+      break;
+    }
+    nsAutoString restOfContent;
+    if (nsCRT::IsAsciiSpace(aLine.mContent.CharAt(goodSpace))) {
+      aLine.mContent.Right(restOfContent, contentLength - goodSpace - 1);
+    } else {
+      aLine.mContent.Right(restOfContent, contentLength - goodSpace);
+    }
+    const bool breakBySpace = aLine.mContent.CharAt(goodSpace) == ' ';
+    aLine.mContent.Truncate(goodSpace);
+    if (!aLine.mContent.IsEmpty()) {
+      if (aLine.mContent.Last() == '\n') {
+        aLine.mContent.Truncate(goodSpace - 1);
+      }
+      if (!aSettings.HasFlag(nsIDocumentEncoder::OutputPreformatted)) {
+        aLine.mContent.Trim(" ", false, true, false);
+      }
+      if (aSettings.HasFlag(nsIDocumentEncoder::OutputFormatFlowed) &&
+          !aLine.mIndentation.mLength) {
+
+        if (aSettings.HasFlag(nsIDocumentEncoder::OutputFormatDelSp) &&
+            breakBySpace) {
+          aLine.mContent.AppendLiteral("  ");
+        } else {
+          aLine.mContent.Append(char16_t(' '));
+        }
+      }
+      AppendLineToOutput(aSettings, aLine, aOutput);
+      if (aSerializer) {
+        aSerializer->ResetStateAfterLine();
+        aSerializer->mEmptyLines = -1;
+      }
+    }
+    aLine.mContent.Truncate();
+    if (aSettings.HasFlag(nsIDocumentEncoder::OutputFormatFlowed)) {
+      aLine.mSpaceStuffed = !restOfContent.IsEmpty() &&
+                            IsSpaceStuffable(restOfContent.get()) &&
+                            aLine.mCiteQuoteLevel == 0;
+    }
+    aLine.mContent.Append(restOfContent);
+  }
+}
+
+void nsPlainTextSerializer::MaybeWrapAndOutputCompleteLines() {
+  PerformWrapAndOutputCompleteLines(mSettings, mCurrentLine, *mOutputManager,
+                                    mUseLineBreaker,
+                                     true, this);
+}
+
+void nsPlainTextSerializer::AddToLine(const char16_t* aLineFragment,
+                                      int32_t aLineFragmentLength) {
+  if (mLineBreakDue) EnsureVerticalSpace(mFloatingLines);
+
+  if (mCurrentLine.mContent.IsEmpty()) {
+    if (0 == aLineFragmentLength) {
+      return;
+    }
+
+    if (mSettings.HasFlag(nsIDocumentEncoder::OutputFormatFlowed)) {
+      mCurrentLine.mSpaceStuffed =
+          IsSpaceStuffable(aLineFragment) && mCurrentLine.mCiteQuoteLevel == 0;
+    }
+    mEmptyLines = -1;
+  }
+
+  mCurrentLine.mContent.Append(aLineFragment, aLineFragmentLength);
+
+  MaybeWrapAndOutputCompleteLines();
+}
+
+const char kSignatureSeparator[] = "-- ";
+
+const char kDashEscapedSignatureSeparator[] = "- -- ";
+
+static bool IsSignatureSeparator(const nsAString& aString) {
+  return aString.EqualsLiteral(kSignatureSeparator) ||
+         aString.EqualsLiteral(kDashEscapedSignatureSeparator);
+}
+
+void nsPlainTextSerializer::AppendLineToOutput(const Settings& aSettings,
+                                               CurrentLine& aLine,
+                                               OutputManager& aOutput) {
+  aLine.MaybeReplaceNbspsInContent(aSettings.GetFlags());
+  aOutput.Append(aLine, OutputManager::StripTrailingWhitespaces::kMaybe);
+  aOutput.AppendLineBreak();
+  aLine.ResetContentAndIndentationHeader();
+}
+
+void nsPlainTextSerializer::EndHardBreakLine() {
+  if (!mSettings.HasFlag(nsIDocumentEncoder::OutputPreformatted) &&
+      !IsSignatureSeparator(mCurrentLine.mContent)) {
+    mCurrentLine.mContent.Trim(" ", false, true, false);
+  }
+
+  if (mCurrentLine.HasContentOrIndentationHeader()) {
+    mEmptyLines = 0;
+  } else {
+    mEmptyLines++;
+  }
+
+  MOZ_ASSERT(mOutputManager);
+  AppendLineToOutput(mSettings, mCurrentLine, *mOutputManager);
+  ResetStateAfterLine();
+}
+
+void nsPlainTextSerializer::CurrentLine::CreateQuotesAndIndent(
+    nsAString& aResult) const {
+  if (mCiteQuoteLevel > 0) {
+    nsAutoString quotes;
+    for (int i = 0; i < mCiteQuoteLevel; i++) {
+      quotes.Append(char16_t('>'));
+    }
+    if (!mContent.IsEmpty()) {
+      quotes.Append(char16_t(' '));
+    }
+    aResult = quotes;
+  }
+
+  int32_t indentwidth = mIndentation.mLength - mIndentation.mHeader.Length();
+  if (mSpaceStuffed) {
+    indentwidth += 1;
+  }
+
+  if (indentwidth > 0 && HasContentOrIndentationHeader()) {
+    nsAutoString spaces;
+    for (int i = 0; i < indentwidth; ++i) {
+      spaces.Append(char16_t(' '));
+    }
+    aResult += spaces;
+  }
+
+  if (!mIndentation.mHeader.IsEmpty()) {
+    aResult += mIndentation.mHeader;
+  }
+}
+
+static bool IsLineFeedCarriageReturnBlankOrTab(char16_t c) {
+  return ('\n' == c || '\r' == c || ' ' == c || '\t' == c);
+}
+
+static void ReplaceVisiblyTrailingNbsps(nsAString& aString) {
+  const int32_t totLen = aString.Length();
+  for (int32_t i = totLen - 1; i >= 0; i--) {
+    char16_t c = aString[i];
+    if (IsLineFeedCarriageReturnBlankOrTab(c)) {
+      continue;
+    }
+    if (kNBSP == c) {
+      aString.Replace(i, 1, ' ');
+    } else {
+      break;
+    }
+  }
+}
+
+void nsPlainTextSerializer::ConvertToLinesAndOutput(const nsAString& aString) {
+  nsAString::const_iterator iter;
+  aString.BeginReading(iter);
+  nsAString::const_iterator done_searching;
+  aString.EndReading(done_searching);
+
+  while (iter != done_searching) {
+    nsAString::const_iterator bol = iter;
+    nsAString::const_iterator newline = done_searching;
+
+    bool spacesOnly = true;
+    while (iter != done_searching) {
+      if ('\n' == *iter || '\r' == *iter) {
+        newline = iter;
+        break;
+      }
+      if (' ' != *iter) {
+        spacesOnly = false;
+      }
+      ++iter;
+    }
+
+    nsAutoString stringpart;
+    bool outputLineBreak = false;
+    bool isNewLineCRLF = false;
+    if (newline == done_searching) {
+      stringpart.Assign(Substring(bol, newline));
+      if (!stringpart.IsEmpty()) {
+        char16_t lastchar = stringpart.Last();
+        mInWhitespace = IsLineFeedCarriageReturnBlankOrTab(lastchar);
+      }
+      mEmptyLines = -1;
+    } else {
+      stringpart.Assign(Substring(bol, newline));
+      mInWhitespace = true;
+      outputLineBreak = true;
+      if ('\r' == *iter++ && '\n' == *iter) {
+        newline = iter++;
+        isNewLineCRLF = true;
+      }
+    }
+
+    if (mSettings.HasFlag(nsIDocumentEncoder::OutputFormatFlowed)) {
+      if ((outputLineBreak || !spacesOnly) &&  
+          !IsQuotedLine(stringpart) && !IsSignatureSeparator(stringpart)) {
+        stringpart.Trim(" ", false, true, true);
+      }
+      mCurrentLine.mSpaceStuffed =
+          IsSpaceStuffable(stringpart.get()) && !IsQuotedLine(stringpart);
+    }
+    mCurrentLine.mContent.Append(stringpart);
+
+    mCurrentLine.MaybeReplaceNbspsInContent(mSettings.GetFlags());
+
+    mOutputManager->Append(mCurrentLine,
+                           OutputManager::StripTrailingWhitespaces::kNo);
+    if (outputLineBreak) {
+      if (mSettings.HasFlag(
+              nsIDocumentEncoder::OutputForPlainTextClipboardCopy)) {
+        if ('\n' == *newline) {
+          mOutputManager->AppendLineBreak(isNewLineCRLF);
+          mEmptyLines = stringpart.IsEmpty() ? mEmptyLines + 1 : 0;
+        } else {
+          mOutputManager->Append(u"\r"_ns);
+          mEmptyLines = -1;
+        }
+      } else {
+        mOutputManager->AppendLineBreak();
+        mEmptyLines = 0;
+      }
+    }
+
+    mCurrentLine.ResetContentAndIndentationHeader();
+  }
+}
+
+void nsPlainTextSerializer::Write(const nsAString& aStr) {
+  nsAutoString str(aStr);
+
+#ifdef DEBUG_wrapping
+  printf("Write(%s): wrap col = %d\n", NS_ConvertUTF16toUTF8(str).get(),
+         mSettings.GetWrapColumn());
+#endif
+
+  const int32_t totLen = str.Length();
+
+  if (totLen <= 0) return;
+
+  if (mSettings.HasFlag(nsIDocumentEncoder::OutputFormatFlowed)) {
+    ReplaceVisiblyTrailingNbsps(str);
+  }
+
+  if ((mPreFormattedMail && !mSettings.GetWrapColumn()) ||
+      (IsElementPreformatted() && !mPreFormattedMail) ||
+      (mSpanLevel > 0 && mEmptyLines >= 0 && IsQuotedLine(str))) {
+
+    NS_ASSERTION(mCurrentLine.mContent.IsEmpty() ||
+                     (IsElementPreformatted() && !mPreFormattedMail),
+                 "Mixed wrapping data and nonwrapping data on the same line");
+    MOZ_ASSERT(mOutputManager);
+
+    if (!mCurrentLine.mContent.IsEmpty()) {
+      mOutputManager->Flush(mCurrentLine);
+    }
+
+    ConvertToLinesAndOutput(str);
+    return;
+  }
+
+  int32_t nextpos;
+  const char16_t* offsetIntoBuffer = nullptr;
+
+  int32_t bol = 0;
+  while (bol < totLen) {  
+    nextpos = str.FindCharInSet(u" \t\n\r", bol);
+#ifdef DEBUG_wrapping
+    nsAutoString remaining;
+    str.Right(remaining, totLen - bol);
+    foo = ToNewCString(remaining);
+    free(foo);
+#endif
+
+    if (nextpos == kNotFound) {
+      offsetIntoBuffer = str.get() + bol;
+      AddToLine(offsetIntoBuffer, totLen - bol);
+      bol = totLen;
+      mInWhitespace = false;
+    } else {
+      if (nextpos != 0 && (nextpos + 1) < totLen) {
+        offsetIntoBuffer = str.get() + nextpos;
+        if (offsetIntoBuffer[0] == '\n' && IS_CJ_CHAR(offsetIntoBuffer[-1]) &&
+            IS_CJ_CHAR(offsetIntoBuffer[1])) {
+          offsetIntoBuffer = str.get() + bol;
+          AddToLine(offsetIntoBuffer, nextpos - bol);
+          bol = nextpos + 1;
+          continue;
+        }
+      }
+      if (mInWhitespace && (nextpos == bol) && !mPreFormattedMail &&
+          !mSettings.HasFlag(nsIDocumentEncoder::OutputPreformatted)) {
+        bol++;
+        continue;
+      }
+
+      if (nextpos == bol &&
+          !mSettings.HasFlag(
+              nsIDocumentEncoder::OutputForPlainTextClipboardCopy)) {
+        mInWhitespace = true;
+        offsetIntoBuffer = str.get() + nextpos;
+        AddToLine(offsetIntoBuffer, 1);
+        bol++;
+        continue;
+      }
+
+      mInWhitespace = true;
+
+      offsetIntoBuffer = str.get() + bol;
+      if (mPreFormattedMail ||
+          mSettings.HasFlag(nsIDocumentEncoder::OutputPreformatted)) {
+        nextpos++;
+        AddToLine(offsetIntoBuffer, nextpos - bol);
+        bol = nextpos;
+      } else {
+        AddToLine(offsetIntoBuffer, nextpos - bol);
+        AddToLine(kSpace.get(), 1);
+        bol = nextpos + 1;  
+      }
+    }
+  }  
+}
+
+nsresult nsPlainTextSerializer::GetAttributeValue(Element* aElement,
+                                                  const nsAtom* aName,
+                                                  nsString& aValueRet) const {
+  MOZ_ASSERT(aElement);
+  MOZ_ASSERT(aName);
+
+  if (aElement->GetAttr(aName, aValueRet)) {
+    return NS_OK;
+  }
+
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+bool nsPlainTextSerializer::IsCurrentNodeConverted(Element* aElement) const {
+  MOZ_ASSERT(aElement);
+
+  nsAutoString value;
+  nsresult rv = GetAttributeValue(aElement, nsGkAtoms::_class, value);
+  return (NS_SUCCEEDED(rv) &&
+          (StringBeginsWith(value, u"moz-txt"_ns,
+                            nsASCIICaseInsensitiveStringComparator) ||
+           StringBeginsWith(value, u"\"moz-txt"_ns,
+                            nsASCIICaseInsensitiveStringComparator)));
+}
+
+nsAtom* nsPlainTextSerializer::GetIdForContent(nsIContent* aContent) {
+  if (!aContent->IsHTMLElement()) {
+    return nullptr;
+  }
+
+  nsAtom* localName = aContent->NodeInfo()->NameAtom();
+  return localName->IsStatic() ? localName : nullptr;
+}
+
+bool nsPlainTextSerializer::IsElementPreformatted() const {
+  return !mPreformatStack.empty() && mPreformatStack.top();
+}
+
+bool nsPlainTextSerializer::IsElementPreformatted(Element* aElement) {
+  RefPtr<const ComputedStyle> computedStyle =
+      nsComputedDOMStyle::GetComputedStyleNoFlush(aElement);
+  if (computedStyle) {
+    const nsStyleText* textStyle = computedStyle->StyleText();
+    return textStyle->WhiteSpaceOrNewlineIsSignificant();
+  }
+  return GetIdForContent(aElement) == nsGkAtoms::pre;
+}
+
+bool nsPlainTextSerializer::IsCssBlockLevelElement(Element* aElement) {
+  RefPtr<const ComputedStyle> computedStyle =
+      nsComputedDOMStyle::GetComputedStyleNoFlush(aElement);
+  if (computedStyle) {
+    const nsStyleDisplay* displayStyle = computedStyle->StyleDisplay();
+    return displayStyle->IsBlockOutsideStyle();
+  }
+  return nsContentUtils::IsHTMLBlockLevelElement(aElement);
+}
+
+bool nsPlainTextSerializer::IsInOL() const {
+  int32_t i = mTagStackIndex;
+  while (--i >= 0) {
+    if (mTagStack[i] == nsGkAtoms::ol) return true;
+    if (mTagStack[i] == nsGkAtoms::ul) {
+      return false;
+    }
+  }
+  return false;
+}
+
+bool nsPlainTextSerializer::IsInOlOrUl() const {
+  return (mULCount > 0) || !mOLStack.IsEmpty();
+}
+
+int32_t HeaderLevel(const nsAtom* aTag) {
+  if (aTag == nsGkAtoms::h1) {
+    return 1;
+  }
+  if (aTag == nsGkAtoms::h2) {
+    return 2;
+  }
+  if (aTag == nsGkAtoms::h3) {
+    return 3;
+  }
+  if (aTag == nsGkAtoms::h4) {
+    return 4;
+  }
+  if (aTag == nsGkAtoms::h5) {
+    return 5;
+  }
+  if (aTag == nsGkAtoms::h6) {
+    return 6;
+  }
+  return 0;
+}
+
+
+int32_t GetUnicharWidth(char32_t aCh) {
+  if (aCh == 0) {
+    return 0;
+  }
+  if (aCh < 32 || (aCh >= 0x7f && aCh < 0xa0)) {
+    return -1;
+  }
+
+  if (aCh < 0x0300) {
+    return 1;
+  }
+
+  auto gc = unicode::GetGeneralCategory(aCh);
+  if (gc == HB_UNICODE_GENERAL_CATEGORY_NON_SPACING_MARK ||
+      gc == HB_UNICODE_GENERAL_CATEGORY_ENCLOSING_MARK) {
+    return 0;
+  }
+
+
+  if (aCh < 0x1100) {
+    return 1;
+  }
+
+  return intl::UnicodeProperties::IsEastAsianWidthFW(aCh) ? 2 : 1;
+}
+
+int32_t GetUnicharStringWidth(Span<const char16_t> aString) {
+  int32_t width = 0;
+  for (auto iter = aString.begin(); iter != aString.end(); ++iter) {
+    char32_t c = *iter;
+    if (IsHighSurrogate(c) && (iter + 1) != aString.end() &&
+        IsLowSurrogate(*(iter + 1))) {
+      c = mozilla::SurrogateToUCS4(c, *++iter);
+    }
+    const int32_t w = GetUnicharWidth(c);
+    width += (w < 0 ? 1 : w);
+  }
+  return width;
+}

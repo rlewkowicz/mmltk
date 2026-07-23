@@ -1,0 +1,158 @@
+// Copyright (c) 2009-2017 The OTS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "post.h"
+
+#include "maxp.h"
+
+
+namespace ots {
+
+bool OpenTypePOST::Parse(const uint8_t *data, size_t length) {
+  Buffer table(data, length);
+
+  if (!table.ReadU32(&this->version)) {
+    return Error("Failed to read table version");
+  }
+
+  if (this->version != 0x00010000 &&
+      this->version != 0x00020000 &&
+      this->version != 0x00030000) {
+    return Error("Unsupported table version 0x%x", this->version);
+  }
+
+  if (!table.ReadU32(&this->italic_angle) ||
+      !table.ReadS16(&this->underline) ||
+      !table.ReadS16(&this->underline_thickness) ||
+      !table.ReadU32(&this->is_fixed_pitch) ||
+      !table.Skip(16)) {
+    return Error("Failed to read table header");
+  }
+
+  if (this->underline_thickness < 0) {
+    this->underline_thickness = 1;
+  }
+
+  if (this->version == 0x00010000 || this->version == 0x00030000) {
+    return true;
+  }
+
+
+  uint16_t num_glyphs = 0;
+  if (!table.ReadU16(&num_glyphs)) {
+    return Error("Failed to read numberOfGlyphs");
+  }
+
+  OpenTypeMAXP* maxp = static_cast<OpenTypeMAXP*>
+    (GetFont()->GetTable(OTS_TAG_MAXP));
+  if (!maxp) {
+    return Error("Missing required maxp table");
+  }
+
+  if (num_glyphs == 0) {
+    if (maxp->num_glyphs > 258) {
+      return Error("Can't have no glyphs in the post table if there are more "
+                   "than 258 glyphs in the font");
+    }
+    this->version = 0x00010000;
+    return Warning("Table version is 1, but no glyph names are found");
+  }
+
+  if (num_glyphs != maxp->num_glyphs) {
+    return Error("Bad number of glyphs: %d", num_glyphs);
+  }
+
+  this->glyph_name_index.resize(num_glyphs);
+  for (unsigned i = 0; i < num_glyphs; ++i) {
+    if (!table.ReadU16(&this->glyph_name_index[i])) {
+      return Error("Failed to read glyph name %d", i);
+    }
+  }
+
+  const size_t strings_offset = table.offset();
+  const uint8_t *strings = data + strings_offset;
+  const uint8_t *strings_end = data + length;
+
+  for (;;) {
+    if (strings == strings_end) break;
+    const unsigned string_length = *strings;
+    if (strings + 1 + string_length > strings_end) {
+      return Error("Bad string length %d", string_length);
+    }
+    if (std::memchr(strings + 1, '\0', string_length)) {
+      return Error("Bad string of length %d", string_length);
+    }
+    this->names.push_back(
+        std::string(reinterpret_cast<const char*>(strings + 1), string_length));
+    strings += 1 + string_length;
+  }
+  const unsigned num_strings = this->names.size();
+
+  for (unsigned i = 0; i < num_glyphs; ++i) {
+    unsigned offset = this->glyph_name_index[i];
+    if (offset < 258) {
+      continue;
+    }
+
+    offset -= 258;
+    if (offset >= num_strings) {
+      return Error("Bad string index %d", offset);
+    }
+  }
+
+  return true;
+}
+
+bool OpenTypePOST::Serialize(OTSStream *out) {
+  if (GetFont()->GetTable(OTS_TAG_CFF) && this->version != 0x00030000) {
+    Warning("Only version supported for fonts with CFF table is 0x00030000"
+            " not 0x%x", this->version);
+    this->version = 0x00030000;
+  }
+
+  if (!out->WriteU32(this->version) ||
+      !out->WriteU32(this->italic_angle) ||
+      !out->WriteS16(this->underline) ||
+      !out->WriteS16(this->underline_thickness) ||
+      !out->WriteU32(this->is_fixed_pitch) ||
+      !out->WriteU32(0) ||
+      !out->WriteU32(0) ||
+      !out->WriteU32(0) ||
+      !out->WriteU32(0)) {
+    return Error("Failed to write post header");
+  }
+
+  if (this->version != 0x00020000) {
+    return true;  
+  }
+
+  const uint16_t num_indexes =
+      static_cast<uint16_t>(this->glyph_name_index.size());
+  if (num_indexes != this->glyph_name_index.size() ||
+      !out->WriteU16(num_indexes)) {
+    return Error("Failed to write number of indices");
+  }
+
+  for (uint16_t i = 0; i < num_indexes; ++i) {
+    if (!out->WriteU16(this->glyph_name_index[i])) {
+      return Error("Failed to write name index %d", i);
+    }
+  }
+
+  for (unsigned i = 0; i < this->names.size(); ++i) {
+    const std::string& s = this->names[i];
+    const uint8_t string_length = static_cast<uint8_t>(s.size());
+    if (string_length != s.size() ||
+        !out->Write(&string_length, 1)) {
+      return Error("Failed to write string %d", i);
+    }
+    if (string_length > 0 && !out->Write(s.data(), string_length)) {
+      return Error("Failed to write string length for string %d", i);
+    }
+  }
+
+  return true;
+}
+
+}  

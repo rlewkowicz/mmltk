@@ -1,0 +1,145 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_FeaturePolicy_h
+#define mozilla_dom_FeaturePolicy_h
+
+#include "nsCycleCollectionParticipant.h"
+#include "nsIPrincipal.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "nsWrapperCache.h"
+
+
+class nsINode;
+
+namespace mozilla::dom {
+class Document;
+class BrowsingContext;
+class Feature;
+template <typename T>
+class Optional;
+
+class FeaturePolicyUtils;
+
+struct FeaturePolicyInfo final {
+  CopyableTArray<nsString> mInheritedDeniedFeatureNames;
+  CopyableTArray<nsString> mAttributeEnabledFeatureNames;
+  nsString mDeclaredString;
+  nsCOMPtr<nsIPrincipal> mDefaultOrigin;
+  nsCOMPtr<nsIPrincipal> mSelfOrigin;
+  nsCOMPtr<nsIPrincipal> mSrcOrigin;
+};
+
+using MaybeFeaturePolicyInfo = Maybe<FeaturePolicyInfo>;
+
+class FeaturePolicy final : public nsISupports, public nsWrapperCache {
+  friend class FeaturePolicyUtils;
+
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(FeaturePolicy)
+
+  explicit FeaturePolicy(nsINode* aNode);
+
+  void SetDefaultOrigin(nsIPrincipal* aPrincipal) {
+    mDefaultOrigin = aPrincipal;
+  }
+
+  void SetSrcOrigin(nsIPrincipal* aPrincipal) { mSrcOrigin = aPrincipal; }
+
+  nsIPrincipal* DefaultOrigin() const { return mDefaultOrigin; }
+
+  void InheritPolicy(FeaturePolicy* aParentFeaturePolicy);
+
+  void InheritPolicy(const FeaturePolicyInfo& aContainerFeaturePolicyInfo);
+
+  void SetDeclaredPolicy(mozilla::dom::Document* aDocument,
+                         const nsAString& aPolicyString,
+                         nsIPrincipal* aSelfOrigin, nsIPrincipal* aSrcOrigin);
+
+  void MaybeSetAllowedPolicy(const nsAString& aFeatureName);
+
+  void ResetDeclaredPolicy();
+
+  void AppendToDeclaredAllowInAncestorChain(const Feature& aFeature);
+
+  bool HasFeatureUnsafeAllowsAll(const nsAString& aFeatureName) const;
+
+  bool AllowsFeatureExplicitlyInAncestorChain(const nsAString& aFeatureName,
+                                              nsIPrincipal* aOrigin) const;
+
+  bool IsSameOriginAsSrc(nsIPrincipal* aPrincipal) const;
+
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  nsINode* GetParentObject() const { return mParentNode; }
+
+
+  bool AllowsFeature(const nsAString& aFeatureName,
+                     const Optional<nsAString>& aOrigin) const;
+
+  void Features(nsTArray<nsString>& aFeatures);
+
+  void AllowedFeatures(nsTArray<nsString>& aAllowedFeatures);
+
+  void GetAllowlistForFeature(const nsAString& aFeatureName,
+                              nsTArray<nsString>& aList) const;
+
+  const nsTArray<nsString>& InheritedDeniedFeatureNames() const {
+    return mInheritedDeniedFeatureNames;
+  }
+
+  const nsTArray<nsString>& AttributeEnabledFeatureNames() const {
+    return mAttributeEnabledFeatureNames;
+  }
+
+  void SetInheritedDeniedFeatureNames(
+      const nsTArray<nsString>& aInheritedDeniedFeatureNames) {
+    mInheritedDeniedFeatureNames = aInheritedDeniedFeatureNames.Clone();
+  }
+
+  const nsAString& DeclaredString() const { return mDeclaredString; }
+
+  nsIPrincipal* GetSelfOrigin() const { return mSelfOrigin; }
+  nsIPrincipal* GetSrcOrigin() const { return mSrcOrigin; }
+
+  FeaturePolicyInfo ToFeaturePolicyInfo() const;
+
+ private:
+  ~FeaturePolicy() = default;
+
+  bool AllowsFeatureInternal(const nsAString& aFeatureName,
+                             nsIPrincipal* aOrigin) const;
+
+  void SetInheritedDeniedFeature(const nsAString& aFeatureName);
+
+  bool HasInheritedDeniedFeature(const nsAString& aFeatureName) const;
+
+  bool HasDeclaredFeature(const nsAString& aFeatureName) const;
+
+  nsINode* mParentNode;
+
+  nsTArray<nsString> mInheritedDeniedFeatureNames;
+
+  nsTArray<nsString> mAttributeEnabledFeatureNames;
+
+  nsTArray<nsString> mParentAllowedAllFeatures;
+
+  nsTArray<Feature> mDeclaredFeaturesInAncestorChain;
+
+  nsTArray<Feature> mFeatures;
+
+  nsString mDeclaredString;
+
+  nsCOMPtr<nsIPrincipal> mDefaultOrigin;
+  nsCOMPtr<nsIPrincipal> mSelfOrigin;
+  nsCOMPtr<nsIPrincipal> mSrcOrigin;
+};
+
+}  
+
+#endif  // mozilla_dom_FeaturePolicy_h

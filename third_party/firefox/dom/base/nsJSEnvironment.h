@@ -1,0 +1,170 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsJSEnvironment_h
+#define nsJSEnvironment_h
+
+#include "mozilla/TimeStamp.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIArray.h"
+#include "nsIScriptContext.h"
+#include "nsIScriptGlobalObject.h"
+#include "nsThreadUtils.h"
+#include "prtime.h"
+#include "xpcpublic.h"
+
+class nsICycleCollectorListener;
+class nsIDocShell;
+
+namespace mozilla {
+
+template <class>
+class Maybe;
+struct CycleCollectorResults;
+
+static const uint32_t kMajorForgetSkippableCalls = 5;
+
+}  
+
+class nsJSContext : public nsIScriptContext {
+ public:
+  nsJSContext(bool aGCOnDestruction, nsIScriptGlobalObject* aGlobalObject);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_AMBIGUOUS(nsJSContext,
+                                                         nsIScriptContext)
+
+  virtual nsIScriptGlobalObject* GetGlobalObject() override;
+  inline nsIScriptGlobalObject* GetGlobalObjectRef() {
+    return mGlobalObjectRef;
+  }
+
+  virtual nsresult SetProperty(JS::Handle<JSObject*> aTarget,
+                               const char* aPropName,
+                               nsISupports* aVal) override;
+
+  virtual bool GetProcessingScriptTag() override;
+  virtual void SetProcessingScriptTag(bool aResult) override;
+
+  virtual nsresult InitClasses(JS::Handle<JSObject*> aGlobalObj) override;
+
+  virtual void SetWindowProxy(JS::Handle<JSObject*> aWindowProxy) override;
+  virtual JSObject* GetWindowProxy() override;
+
+  enum IsShrinking { ShrinkingGC, NonShrinkingGC };
+
+  static void EnsureStatics();
+
+  static void SetLowMemoryState(bool aState);
+
+  static void GarbageCollectNow(JS::GCReason reason,
+                                IsShrinking aShrinking = NonShrinkingGC);
+
+  static void RunIncrementalGCSlice(JS::GCReason aReason,
+                                    IsShrinking aShrinking,
+                                    JS::SliceBudget& aBudget);
+
+  static void CycleCollectNow(mozilla::CCReason aReason,
+                              nsICycleCollectorListener* aListener = nullptr);
+
+  static void PrepareForCycleCollectionSlice(mozilla::CCReason aReason,
+                                             mozilla::TimeStamp aDeadline);
+
+  static void RunCycleCollectorSlice(mozilla::CCReason aReason,
+                                     mozilla::TimeStamp aDeadline);
+
+  static void RunCycleCollectorWorkSlice(int64_t aWorkBudget);
+
+  static void BeginCycleCollectionCallback(mozilla::CCReason aReason);
+  static void EndCycleCollectionCallback(
+      const mozilla::CycleCollectorResults& aResults);
+
+  static uint32_t GetMaxCCSliceTimeSinceClear();
+  static void ClearMaxCCSliceTime();
+
+  static void RunNextCollectorTimer(
+      JS::GCReason aReason,
+      mozilla::TimeStamp aDeadline = mozilla::TimeStamp());
+  static void MaybeRunNextCollectorSlice(nsIDocShell* aDocShell,
+                                         JS::GCReason aReason);
+
+  static void PokeGC(JS::GCReason aReason, JSObject* aObj,
+                     mozilla::TimeDuration aDelay = {});
+
+  static void MaybePokeGC();
+
+  static void DoLowMemoryGC();
+
+  static void LowMemoryGC();
+
+  static void MaybePokeCC();
+
+  static void LikelyShortLivingObjectCreated();
+
+  static bool HasHadCleanupSinceLastGC();
+
+  nsIScriptGlobalObject* GetCachedGlobalObject() {
+    JSObject* global = GetWindowProxy();
+    return global ? mGlobalObjectRef.get() : nullptr;
+  }
+
+ protected:
+  virtual ~nsJSContext();
+
+  nsresult ConvertSupportsTojsvals(JSContext* aCx, nsISupports* aArgs,
+                                   JS::Handle<JSObject*> aScope,
+                                   JS::MutableHandleVector<JS::Value> aArgsOut);
+
+  nsresult AddSupportsPrimitiveTojsvals(JSContext* aCx, nsISupports* aArg,
+                                        JS::Value* aArgv);
+
+ private:
+  void Destroy();
+
+  JS::Heap<JSObject*> mWindowProxy;
+
+  bool mGCOnDestruction;
+  bool mProcessingScriptTag;
+
+  nsCOMPtr<nsIScriptGlobalObject> mGlobalObjectRef;
+
+  static bool DOMOperationCallback(JSContext* cx);
+};
+
+namespace mozilla::dom {
+
+class SerializedStackHolder;
+
+void StartupJSEnvironment();
+void ShutdownJSEnvironment();
+
+class AsyncErrorReporter final : public mozilla::Runnable {
+ public:
+  explicit AsyncErrorReporter(xpc::ErrorReport* aReport);
+  void SerializeStack(JSContext* aCx, JS::Handle<JSObject*> aStack);
+
+  void SetException(JSContext* aCx, JS::Handle<JS::Value> aException);
+
+ protected:
+  NS_IMETHOD Run() override;
+
+  JS::PersistentRooted<JS::Value> mException;
+  bool mHasException = false;
+
+  RefPtr<xpc::ErrorReport> mReport;
+  UniquePtr<SerializedStackHolder> mStackHolder;
+};
+
+}  
+
+#define NS_IJSARGARRAY_IID \
+  {0xb6acdac8, 0xf5c6, 0x432c, {0xa8, 0x6e, 0x33, 0xee, 0xb1, 0xb0, 0xcd, 0xdc}}
+
+class nsIJSArgArray : public nsIArray {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_IJSARGARRAY_IID)
+  virtual nsresult GetArgs(uint32_t* argc, void** argv) = 0;
+};
+
+#endif /* nsJSEnvironment_h */

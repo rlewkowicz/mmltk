@@ -1,0 +1,53 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+MOZ_SRC_FILES += [
+    "MemoryNotificationDB.sys.mjs",
+    "NotificationDB.sys.mjs",
+    "NotificationStorage.sys.mjs",
+]
+
+XPCOM_MANIFESTS += [
+    "components.conf",
+]
+
+XPIDL_MODULE = "dom_notification"
+
+XPIDL_SOURCES += [
+    "nsINotificationHandler.idl",
+]
+
+EXPORTS.mozilla.dom += [
+    "Notification.h",
+]
+
+EXPORTS.mozilla.dom.notification += [
+    "IPCUtils.h",
+    "NotificationChild.h",
+    "NotificationHandler.h",
+    "NotificationParent.h",
+    "NotificationUtils.h",
+]
+
+UNIFIED_SOURCES += [
+    "Notification.cpp",
+    "NotificationChild.cpp",
+    "NotificationHandler.cpp",
+    "NotificationParent.cpp",
+    "NotificationUtils.cpp",
+]
+
+IPDL_SOURCES += [
+    "PNotification.ipdl",
+]
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+FINAL_LIBRARY = "xul"
+LOCAL_INCLUDES += [
+    "/dom/base",
+    "/dom/ipc",
+    # NotificationHandler::RespondOnClick, but see bug 1966910.
+    "/js/xpconnect/src",
+]

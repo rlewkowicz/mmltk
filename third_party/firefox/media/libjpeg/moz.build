@@ -1,0 +1,10 @@
+DIRS += ['src/wrapper']
+EXPORTS += ['jconfig.h', 'src/jerror.h', 'src/jinclude.h', 'src/jmorecfg.h', 'src/jpegint.h', 'src/jpeglib.h']
+LOCAL_INCLUDES += ['/media/libjpeg', '/media/libjpeg/src']
+SOURCES += ['src/jcomapi.c', 'src/jdapimin.c', 'src/jdatadst.c', 'src/jdatasrc.c', 'src/jdhuff.c', 'src/jdicc.c', 'src/jdinput.c', 'src/jdlhuff.c', 'src/jdmarker.c', 'src/jdmaster.c', 'src/jdphuff.c', 'src/jdtrans.c', 'src/jerror.c', 'src/jfdctflt.c', 'src/jmemmgr.c', 'src/jmemnobs.c', 'src/jpeg_nbits.c']
+SOURCES += ['src/jcapimin.c', 'src/jchuff.c', 'src/jcicc.c', 'src/jcinit.c', 'src/jclhuff.c', 'src/jcmarker.c', 'src/jcmaster.c', 'src/jcparam.c', 'src/jcphuff.c', 'src/jctrans.c']
+include('/media/libjpeg/libjpeg-config.mozbuild')
+if CONFIG['LIBJPEG_TURBO_SIMD_FLAGS']:
+    SOURCES += ['simd/x86_64/jccolor-avx2.asm', 'simd/x86_64/jccolor-sse2.asm', 'simd/x86_64/jcgray-avx2.asm', 'simd/x86_64/jcgray-sse2.asm', 'simd/x86_64/jchuff-sse2.asm', 'simd/x86_64/jcphuff-sse2.asm', 'simd/x86_64/jcsample-avx2.asm', 'simd/x86_64/jcsample-sse2.asm', 'simd/x86_64/jdcolor-avx2.asm', 'simd/x86_64/jdcolor-sse2.asm', 'simd/x86_64/jdmerge-avx2.asm', 'simd/x86_64/jdmerge-sse2.asm', 'simd/x86_64/jdsample-avx2.asm', 'simd/x86_64/jdsample-sse2.asm', 'simd/x86_64/jfdctflt-sse.asm', 'simd/x86_64/jfdctfst-sse2.asm', 'simd/x86_64/jfdctint-avx2.asm', 'simd/x86_64/jfdctint-sse2.asm', 'simd/x86_64/jidctflt-sse2.asm', 'simd/x86_64/jidctfst-sse2.asm', 'simd/x86_64/jidctint-avx2.asm', 'simd/x86_64/jidctint-sse2.asm', 'simd/x86_64/jidctred-sse2.asm', 'simd/x86_64/jquantf-sse2.asm', 'simd/x86_64/jquanti-avx2.asm', 'simd/x86_64/jquanti-sse2.asm', 'simd/x86_64/jsimd.c', 'simd/x86_64/jsimdcpu.asm']
+AllowCompilerWarnings()
+FINAL_LIBRARY = 'xul'

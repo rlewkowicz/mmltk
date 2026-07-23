@@ -1,0 +1,106 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsNavHistoryQuery_h_
+#define nsNavHistoryQuery_h_
+
+
+#define NS_NAVHISTORYQUERY_IID \
+  {0xb10185e0, 0x86eb, 0x4612, {0x95, 0x7c, 0x09, 0x34, 0xf2, 0xb1, 0xce, 0xd7}}
+
+class nsNavHistoryQuery final : public nsINavHistoryQuery {
+ public:
+  nsNavHistoryQuery();
+  nsNavHistoryQuery(const nsNavHistoryQuery& aOther);
+
+  NS_INLINE_DECL_STATIC_IID(NS_NAVHISTORYQUERY_IID)
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSINAVHISTORYQUERY
+
+  int32_t MinVisits() { return mMinVisits; }
+  int32_t MaxVisits() { return mMaxVisits; }
+  PRTime BeginTime() { return mBeginTime; }
+  uint32_t BeginTimeReference() { return mBeginTimeReference; }
+  PRTime EndTime() { return mEndTime; }
+  uint32_t EndTimeReference() { return mEndTimeReference; }
+  const nsString& SearchTerms() { return mSearchTerms; }
+  bool DomainIsHost() { return mDomainIsHost; }
+  const nsCString& Domain() { return mDomain; }
+  nsIURI* Uri() { return mUri; }  
+  const nsTArray<nsCString>& Parents() const { return mParents; }
+
+  const nsTArray<nsString>& Tags() const { return mTags; }
+  void SetTags(nsTArray<nsString> aTags) { mTags = std::move(aTags); }
+  bool TagsAreNot() { return mTagsAreNot; }
+
+  const nsTArray<uint32_t>& Transitions() const { return mTransitions; }
+
+  nsresult Clone(nsNavHistoryQuery** _clone);
+
+  static nsresult QueryStringToQuery(const nsACString& aQueryString,
+                                     nsINavHistoryQuery** _query,
+                                     nsINavHistoryQueryOptions** _options);
+
+ private:
+  ~nsNavHistoryQuery() = default;
+
+ protected:
+  int32_t mMinVisits;
+  int32_t mMaxVisits;
+  PRTime mBeginTime;
+  uint32_t mBeginTimeReference;
+  PRTime mEndTime;
+  uint32_t mEndTimeReference;
+  nsString mSearchTerms;
+  bool mDomainIsHost;
+  nsCString mDomain;  
+  nsCOMPtr<nsIURI> mUri;
+  nsTArray<nsCString> mParents;
+  nsTArray<nsString> mTags;
+  bool mTagsAreNot;
+  nsTArray<uint32_t> mTransitions;
+};
+
+
+#define NS_NAVHISTORYQUERYOPTIONS_IID \
+  {0x95f8ba3b, 0xd681, 0x4d89, {0xab, 0xd1, 0xfd, 0xae, 0xf2, 0xa3, 0xde, 0x18}}
+
+class nsNavHistoryQueryOptions final : public nsINavHistoryQueryOptions {
+ public:
+  nsNavHistoryQueryOptions();
+  nsNavHistoryQueryOptions(const nsNavHistoryQueryOptions& other);
+
+  NS_INLINE_DECL_STATIC_IID(NS_NAVHISTORYQUERYOPTIONS_IID)
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSINAVHISTORYQUERYOPTIONS
+
+  uint16_t SortingMode() const { return mSort; }
+  uint16_t ResultType() const { return mResultType; }
+  bool ExcludeItems() const { return mExcludeItems; }
+  bool ExcludeQueries() const { return mExcludeQueries; }
+  bool ExpandQueries() const { return mExpandQueries; }
+  bool IncludeHidden() const { return mIncludeHidden; }
+  uint32_t MaxResults() const { return mMaxResults; }
+  uint16_t QueryType() const { return mQueryType; }
+  bool AsyncEnabled() const { return mAsyncEnabled; }
+
+  nsresult Clone(nsNavHistoryQueryOptions** _clone);
+
+ private:
+  ~nsNavHistoryQueryOptions() = default;
+
+  uint16_t mSort;
+  uint16_t mResultType;
+  bool mExcludeItems;
+  bool mExcludeQueries;
+  bool mExpandQueries;
+  bool mIncludeHidden;
+  uint32_t mMaxResults;
+  uint16_t mQueryType;
+  bool mAsyncEnabled;
+};
+
+#endif  // nsNavHistoryQuery_h_

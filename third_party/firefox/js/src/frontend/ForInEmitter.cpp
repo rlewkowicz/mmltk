@@ -1,0 +1,128 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "frontend/ForInEmitter.h"
+
+#include "frontend/BytecodeEmitter.h"
+#include "frontend/EmitterScope.h"
+#include "vm/Opcodes.h"
+#include "vm/StencilEnums.h"  // TryNoteKind
+
+using namespace js;
+using namespace js::frontend;
+
+using mozilla::Nothing;
+
+ForInEmitter::ForInEmitter(BytecodeEmitter* bce,
+                           const EmitterScope* headLexicalEmitterScope)
+    : bce_(bce), headLexicalEmitterScope_(headLexicalEmitterScope) {}
+
+bool ForInEmitter::emitIterated() {
+  MOZ_ASSERT(state_ == State::Start);
+  tdzCacheForIteratedValue_.emplace(bce_);
+
+#ifdef DEBUG
+  state_ = State::Iterated;
+#endif
+  return true;
+}
+
+bool ForInEmitter::emitInitialize() {
+  MOZ_ASSERT(state_ == State::Iterated);
+  tdzCacheForIteratedValue_.reset();
+
+  if (!bce_->emit1(JSOp::Iter)) {
+    return false;
+  }
+
+  loopInfo_.emplace(bce_, StatementKind::ForInLoop);
+
+  if (!loopInfo_->emitLoopHead(bce_, Nothing())) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::MoreIter)) {
+    return false;
+  }
+  if (!bce_->emit1(JSOp::IsNoIter)) {
+    return false;
+  }
+  if (!bce_->emitJump(JSOp::JumpIfTrue, &loopInfo_->breaks)) {
+    return false;
+  }
+
+  if (headLexicalEmitterScope_) {
+    MOZ_ASSERT(headLexicalEmitterScope_ == bce_->innermostEmitterScope());
+    MOZ_ASSERT(headLexicalEmitterScope_->scope(bce_).kind() ==
+               ScopeKind::Lexical);
+
+    if (headLexicalEmitterScope_->hasEnvironment()) {
+      if (!bce_->emitInternedScopeOp(headLexicalEmitterScope_->index(),
+                                     JSOp::RecreateLexicalEnv)) {
+        return false;
+      }
+    }
+
+    if (!headLexicalEmitterScope_->deadZoneFrameSlots(bce_)) {
+      return false;
+    }
+  }
+
+#ifdef DEBUG
+  loopDepth_ = bce_->bytecodeSection().stackDepth();
+#endif
+  MOZ_ASSERT(loopDepth_ >= 2);
+
+#ifdef DEBUG
+  state_ = State::Initialize;
+#endif
+  return true;
+}
+
+bool ForInEmitter::emitBody() {
+  MOZ_ASSERT(state_ == State::Initialize);
+
+  MOZ_ASSERT(bce_->bytecodeSection().stackDepth() == loopDepth_,
+             "iterator and iterval must be left on the stack");
+
+#ifdef DEBUG
+  state_ = State::Body;
+#endif
+  return true;
+}
+
+bool ForInEmitter::emitEnd(uint32_t forPos) {
+  MOZ_ASSERT(state_ == State::Body);
+
+  if (!bce_->updateSourceCoordNotes(forPos)) {
+    return false;
+  }
+
+  if (!loopInfo_->emitContinueTarget(bce_)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+  if (!loopInfo_->emitLoopEnd(bce_, JSOp::Goto, TryNoteKind::ForIn)) {
+    return false;
+  }
+
+  int32_t stackDepth = bce_->bytecodeSection().stackDepth() + 1;
+  MOZ_ASSERT(stackDepth == loopDepth_);
+  bce_->bytecodeSection().setStackDepth(stackDepth);
+
+
+  if (!bce_->emit1(JSOp::EndIter)) {
+    return false;
+  }
+
+  loopInfo_.reset();
+
+#ifdef DEBUG
+  state_ = State::End;
+#endif
+  return true;
+}

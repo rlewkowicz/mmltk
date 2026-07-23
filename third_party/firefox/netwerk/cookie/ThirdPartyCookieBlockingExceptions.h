@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_ThirdPartyCookieBlockingExceptions_h
+#define mozilla_net_ThirdPartyCookieBlockingExceptions_h
+
+#include "mozilla/MozPromise.h"
+#include "nsEffectiveTLDService.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nsTHashSet.h"
+#include "nsIThirdPartyCookieBlockingExceptionListService.h"
+
+class nsIEffectiveTLDService;
+class nsIURI;
+class nsIChannel;
+
+namespace mozilla {
+namespace net {
+
+class ThirdPartyCookieBlockingExceptions final {
+ public:
+  void Initialize();
+
+  bool CheckExceptionForURIs(nsIURI* aFirstPartyURI, nsIURI* aThirdPartyURI);
+
+  bool CheckExceptionForChannel(nsIChannel* aChannel);
+
+  void Insert(const nsACString& aException);
+  void Remove(const nsACString& aException);
+
+  void GetExceptions(nsTArray<nsCString>& aExceptions);
+
+  void Shutdown();
+
+  bool IsInitialized() const { return mIsInitialized; }
+
+ private:
+  nsCOMPtr<nsIThirdPartyCookieBlockingExceptionListService>
+      m3PCBExceptionService;
+
+  static void Create3PCBExceptionKey(const nsACString& aFirstPartySite,
+                                     const nsACString& aThirdPartySite,
+                                     nsACString& aKey) {
+    aKey.Truncate();
+    aKey.Append(aFirstPartySite);
+    aKey.AppendLiteral(",");
+    aKey.Append(aThirdPartySite);
+  }
+
+  bool CheckWildcardException(const nsACString& aThirdPartySite);
+
+  bool CheckException(const nsACString& aFirstPartySite,
+                      const nsACString& aThirdPartySite);
+
+  bool mIsInitialized = false;
+  nsTHashSet<nsCStringHashKey> m3PCBExceptionsSet;
+};
+
+}  
+}  
+
+#endif  // mozilla_net_ThirdPartyCookieBlockingExceptions_h

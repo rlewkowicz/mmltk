@@ -1,0 +1,53 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_AnimationCollection_h
+#define mozilla_AnimationCollection_h
+
+#include "mozilla/LinkedList.h"
+#include "mozilla/PseudoStyleRequest.h"
+#include "mozilla/RefPtr.h"
+#include "nsTArrayForwardDeclare.h"
+
+class nsAtom;
+class nsIFrame;
+class nsPresContext;
+
+namespace mozilla {
+namespace dom {
+class Element;
+}
+
+template <class AnimationType>
+class AnimationCollection
+    : public LinkedListElement<AnimationCollection<AnimationType>> {
+  typedef AnimationCollection<AnimationType> SelfType;
+
+ public:
+  AnimationCollection(dom::Element& aOwner,
+                      const PseudoStyleRequest& aPseudoRequest)
+      : mElement(aOwner), mPseudo(aPseudoRequest) {
+    MOZ_COUNT_CTOR(AnimationCollection);
+  }
+
+  ~AnimationCollection();
+
+  void Destroy();
+
+  static AnimationCollection* Get(const nsIFrame* aFrame);
+  static AnimationCollection* Get(const dom::Element* aElement,
+                                  const PseudoStyleRequest& aPseudoRequest);
+
+  dom::Element& mElement;
+  const PseudoStyleRequest mPseudo;
+
+  nsTArray<RefPtr<AnimationType>> mAnimations;
+
+ private:
+  bool mCalledDestroy = false;
+};
+
+}  
+
+#endif  // mozilla_AnimationCollection_h

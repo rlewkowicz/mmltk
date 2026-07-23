@@ -1,0 +1,94 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "OverrideBaseCallChecker.h"
+#include "CustomMatchers.h"
+
+void OverrideBaseCallChecker::registerMatchers(MatchFinder *AstMatcher) {
+  AstMatcher->addMatcher(cxxRecordDecl(hasBaseClasses()).bind("class"), this);
+}
+
+bool OverrideBaseCallChecker::isRequiredBaseMethod(
+    const CXXMethodDecl *Method) {
+  return hasCustomAttribute<moz_required_base_method>(Method);
+}
+
+void OverrideBaseCallChecker::evaluateExpression(
+    const Stmt *StmtExpr, std::list<const CXXMethodDecl *> &MethodList) {
+  if (!MethodList.size()) {
+    return;
+  }
+
+  if (auto MemberFuncCall = dyn_cast<CXXMemberCallExpr>(StmtExpr)) {
+    if (auto Method =
+            dyn_cast<CXXMethodDecl>(MemberFuncCall->getDirectCallee())) {
+      findBaseMethodCall(Method, MethodList);
+    }
+  }
+
+  for (auto S : StmtExpr->children()) {
+    if (S) {
+      evaluateExpression(S, MethodList);
+    }
+  }
+}
+
+void OverrideBaseCallChecker::getRequiredBaseMethod(
+    const CXXMethodDecl *Method,
+    std::list<const CXXMethodDecl *> &MethodsList) {
+
+  if (isRequiredBaseMethod(Method)) {
+    MethodsList.push_back(Method);
+  } else {
+    for (auto BaseMethod = Method->begin_overridden_methods();
+         BaseMethod != Method->end_overridden_methods(); BaseMethod++) {
+      getRequiredBaseMethod(*BaseMethod, MethodsList);
+    }
+  }
+}
+
+void OverrideBaseCallChecker::findBaseMethodCall(
+    const CXXMethodDecl *Method,
+    std::list<const CXXMethodDecl *> &MethodsList) {
+
+  MethodsList.remove(Method);
+  for (auto BaseMethod = Method->begin_overridden_methods();
+       BaseMethod != Method->end_overridden_methods(); BaseMethod++) {
+    findBaseMethodCall(*BaseMethod, MethodsList);
+  }
+}
+
+void OverrideBaseCallChecker::check(const MatchFinder::MatchResult &Result) {
+  const char *Error =
+      "Method %0 must be called in all overrides, but is not called in "
+      "this override defined for class %1";
+  const CXXRecordDecl *Decl = Result.Nodes.getNodeAs<CXXRecordDecl>("class");
+
+  for (auto Method : Decl->methods()) {
+    if (!Method->size_overridden_methods() || !Method->hasBody()) {
+      continue;
+    }
+
+    std::list<const CXXMethodDecl *> MethodsList;
+    for (auto BaseMethod = Method->begin_overridden_methods();
+         BaseMethod != Method->end_overridden_methods(); BaseMethod++) {
+      getRequiredBaseMethod(*BaseMethod, MethodsList);
+    }
+
+    if (!MethodsList.size()) {
+      continue;
+    }
+
+    evaluateExpression(Method->getBody(), MethodsList);
+
+    for (auto BaseMethod : MethodsList) {
+      std::string QualName;
+      raw_string_ostream OS(QualName);
+      BaseMethod->printQualifiedName(OS);
+
+      diag(Method->getLocation(), Error, DiagnosticIDs::Error)
+          << OS.str() << Decl->getName();
+    }
+  }
+}

@@ -1,0 +1,274 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ContentIterator_h
+#define mozilla_ContentIterator_h
+
+#include "js/GCAPI.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/RangeBoundary.h"
+#include "mozilla/RefPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsINode.h"
+#include "nsRange.h"
+#include "nsTArray.h"
+
+class nsIContent;
+
+namespace mozilla {
+
+template <typename NodeType>
+class ContentIteratorBase {
+ public:
+  ContentIteratorBase() = delete;
+  ContentIteratorBase(const ContentIteratorBase&) = delete;
+  ContentIteratorBase& operator=(const ContentIteratorBase&) = delete;
+  virtual ~ContentIteratorBase();
+
+  [[nodiscard]] virtual nsresult Init(nsINode* aRoot);
+
+  [[nodiscard]] virtual nsresult Init(dom::AbstractRange* aRange);
+  [[nodiscard]] virtual nsresult Init(nsINode* aStartContainer,
+                                      uint32_t aStartOffset,
+                                      nsINode* aEndContainer,
+                                      uint32_t aEndOffset);
+  [[nodiscard]] virtual nsresult Init(const RawRangeBoundary& aStart,
+                                      const RawRangeBoundary& aEnd);
+  [[nodiscard]] virtual nsresult InitWithoutValidatingPoints(
+      const RawRangeBoundary& aStart, const RawRangeBoundary& aEnd);
+  virtual void First();
+  virtual void Last();
+  virtual void Next();
+  virtual void Prev();
+
+  nsINode* GetCurrentNode() const { return mCurNode; }
+
+  bool IsDone() const { return !mCurNode; }
+
+  [[nodiscard]] virtual nsresult PositionAt(nsINode* aCurNode);
+
+ protected:
+  enum class Order {
+    Pre, /*!< <https://en.wikipedia.org/wiki/Tree_traversal#Pre-order_(NLR)>.
+          */
+    Post /*!< <https://en.wikipedia.org/wiki/Tree_traversal#Post-order_(LRN)>.
+          */
+  };
+
+  explicit ContentIteratorBase(Order aOrder);
+
+  class Initializer;
+
+  [[nodiscard]] nsresult InitInternal(const RawRangeBoundary& aStart,
+                                      const RawRangeBoundary& aEnd);
+
+  template <TreeKind>
+  static nsINode* GetDeepFirstInclusiveDescendant(nsINode*);
+  template <TreeKind>
+  static nsIContent* GetDeepFirstInclusiveDescendant(nsIContent*);
+  template <TreeKind>
+  static nsINode* GetDeepLastInclusiveDescendant(nsINode*);
+  template <TreeKind>
+  static nsIContent* GetDeepLastInclusiveDescendant(nsIContent*);
+
+  struct AncestorInfo {
+    nsIContent* mAncestor = nullptr;
+    bool mIsDescendantInShadowTree = false;
+  };
+
+  class InclusiveAncestorComparator {
+   public:
+    bool Equals(const AncestorInfo& aA, const nsINode* aB) const {
+      return aA.mAncestor == aB;
+    }
+  };
+  template <TreeKind>
+  static nsIContent* GetNextSibling(
+      nsINode* aNode,
+      nsTArray<AncestorInfo>* aInclusiveAncestorsOfEndContainer = nullptr);
+  template <TreeKind>
+  static nsIContent* GetPrevSibling(nsINode* aNode);
+
+  template <TreeKind>
+  nsINode* NextNode(nsINode* aNode);
+  template <TreeKind>
+  nsINode* PrevNode(nsINode* aNode);
+
+  void SetEmpty();
+
+  NodeType mCurNode = nullptr;
+  NodeType mFirst = nullptr;
+  NodeType mLast = nullptr;
+  NodeType mClosestCommonInclusiveAncestor = nullptr;
+
+  Maybe<nsMutationGuard> mMutationGuard;
+  Maybe<JS::AutoAssertNoGC> mAssertNoGC;
+
+  const Order mOrder;
+
+  template <typename T>
+  friend void ImplCycleCollectionTraverse(nsCycleCollectionTraversalCallback&,
+                                          ContentIteratorBase<T>&, const char*,
+                                          uint32_t);
+  template <typename T>
+  friend void ImplCycleCollectionUnlink(ContentIteratorBase<T>&);
+};
+
+template <typename NodeType>
+void ImplCycleCollectionTraverse(nsCycleCollectionTraversalCallback& aCallback,
+                                 ContentIteratorBase<NodeType>& aField,
+                                 const char* aName, uint32_t aFlags = 0) {
+  ImplCycleCollectionTraverse(aCallback, aField.mCurNode, aName, aFlags);
+  ImplCycleCollectionTraverse(aCallback, aField.mFirst, aName, aFlags);
+  ImplCycleCollectionTraverse(aCallback, aField.mLast, aName, aFlags);
+  ImplCycleCollectionTraverse(aCallback, aField.mClosestCommonInclusiveAncestor,
+                              aName, aFlags);
+}
+
+template <typename NodeType>
+void ImplCycleCollectionUnlink(ContentIteratorBase<NodeType>& aField) {
+  ImplCycleCollectionUnlink(aField.mCurNode);
+  ImplCycleCollectionUnlink(aField.mFirst);
+  ImplCycleCollectionUnlink(aField.mLast);
+  ImplCycleCollectionUnlink(aField.mClosestCommonInclusiveAncestor);
+}
+
+using SafeContentIteratorBase = ContentIteratorBase<RefPtr<nsINode>>;
+using UnsafeContentIteratorBase = ContentIteratorBase<nsINode*>;
+
+class PostContentIterator final : public SafeContentIteratorBase {
+ public:
+  PostContentIterator() : SafeContentIteratorBase(Order::Post) {}
+  PostContentIterator(const PostContentIterator&) = delete;
+  PostContentIterator& operator=(const PostContentIterator&) = delete;
+  virtual ~PostContentIterator() = default;
+  friend void ImplCycleCollectionTraverse(nsCycleCollectionTraversalCallback&,
+                                          PostContentIterator&, const char*,
+                                          uint32_t);
+  friend void ImplCycleCollectionUnlink(PostContentIterator&);
+};
+
+class MOZ_STACK_CLASS UnsafePostContentIterator final
+    : public UnsafeContentIteratorBase {
+ public:
+  UnsafePostContentIterator() : UnsafeContentIteratorBase(Order::Post) {}
+  UnsafePostContentIterator(const UnsafePostContentIterator&) = delete;
+  UnsafePostContentIterator& operator=(const UnsafePostContentIterator&) =
+      delete;
+  virtual ~UnsafePostContentIterator() = default;
+};
+
+class PreContentIterator final : public SafeContentIteratorBase {
+ public:
+  PreContentIterator() : ContentIteratorBase(Order::Pre) {}
+  PreContentIterator(const PreContentIterator&) = delete;
+  PreContentIterator& operator=(const PreContentIterator&) = delete;
+  virtual ~PreContentIterator() = default;
+  friend void ImplCycleCollectionTraverse(nsCycleCollectionTraversalCallback&,
+                                          PreContentIterator&, const char*,
+                                          uint32_t);
+  friend void ImplCycleCollectionUnlink(PreContentIterator&);
+};
+
+class MOZ_STACK_CLASS UnsafePreContentIterator final
+    : public UnsafeContentIteratorBase {
+ public:
+  UnsafePreContentIterator() : UnsafeContentIteratorBase(Order::Pre) {}
+  UnsafePreContentIterator(const UnsafePostContentIterator&) = delete;
+  UnsafePreContentIterator& operator=(const UnsafePostContentIterator&) =
+      delete;
+  virtual ~UnsafePreContentIterator() = default;
+};
+
+class ContentSubtreeIterator final : public SafeContentIteratorBase {
+ public:
+  ContentSubtreeIterator() : SafeContentIteratorBase(Order::Pre) {}
+  ContentSubtreeIterator(const ContentSubtreeIterator&) = delete;
+  ContentSubtreeIterator& operator=(const ContentSubtreeIterator&) = delete;
+  virtual ~ContentSubtreeIterator() = default;
+
+  [[nodiscard]] nsresult Init(nsINode* aRoot) override;
+
+  [[nodiscard]] nsresult Init(dom::AbstractRange* aRange) override;
+
+  [[nodiscard]] nsresult InitWithAllowCrossShadowBoundary(
+      dom::AbstractRange* aRange);
+
+  [[nodiscard]] nsresult Init(nsINode* aStartContainer, uint32_t aStartOffset,
+                              nsINode* aEndContainer,
+                              uint32_t aEndOffset) override;
+  [[nodiscard]] nsresult Init(const RawRangeBoundary& aStartBoundary,
+                              const RawRangeBoundary& aEndBoundary) override;
+  [[nodiscard]] nsresult InitWithoutValidatingPoints(
+      const RawRangeBoundary& aStart, const RawRangeBoundary& aEnd) override {
+    return Init(aStart, aEnd);
+  }
+
+  void Next() override;
+  void Prev() override;
+  void First() override;
+  void Last() override;
+
+  [[nodiscard]] nsresult PositionAt(nsINode* aCurNode) override;
+
+  friend void ImplCycleCollectionTraverse(nsCycleCollectionTraversalCallback&,
+                                          ContentSubtreeIterator&, const char*,
+                                          uint32_t);
+  friend void ImplCycleCollectionUnlink(ContentSubtreeIterator&);
+
+ private:
+  void CacheInclusiveAncestorsOfEndContainer();
+
+  nsIContent* DetermineCandidateForFirstContent() const;
+
+  nsIContent* DetermineCandidateForLastContent() const;
+
+  nsIContent* DetermineFirstContent() const;
+
+  nsIContent* DetermineLastContent() const;
+
+  [[nodiscard]] nsresult InitWithRange();
+
+  nsIContent* GetTopAncestorInRange(nsINode* aNode) const;
+
+  bool IterAllowCrossShadowBoundary() const {
+    return mAllowCrossShadowBoundary == dom::AllowRangeCrossShadowBoundary::Yes;
+  }
+
+  RefPtr<dom::AbstractRange> mRange;
+
+  AutoTArray<AncestorInfo, 8> mInclusiveAncestorsOfEndContainer;
+
+  dom::AllowRangeCrossShadowBoundary mAllowCrossShadowBoundary =
+      dom::AllowRangeCrossShadowBoundary::No;
+};
+
+class MOZ_STACK_CLASS RangeSubtreeIterator {
+ private:
+  enum RangeSubtreeIterState { eDone = 0, eUseStart, eUseIterator, eUseEnd };
+
+  Maybe<ContentSubtreeIterator> mSubtreeIter;
+  RangeSubtreeIterState mIterState;
+
+  nsCOMPtr<nsINode> mStart;
+  nsCOMPtr<nsINode> mEnd;
+
+ public:
+  RangeSubtreeIterator() : mIterState(eDone) {}
+  ~RangeSubtreeIterator() = default;
+
+  [[nodiscard]] nsresult Init(dom::AbstractRange* aRange,
+                              dom::AllowRangeCrossShadowBoundary =
+                                  dom::AllowRangeCrossShadowBoundary::No);
+  already_AddRefed<nsINode> GetCurrentNode();
+  void First();
+  void Last();
+  void Next();
+  void Prev();
+
+  bool IsDone() { return mIterState == eDone; }
+};
+}  
+
+#endif  // #ifndef mozilla_ContentIterator_h

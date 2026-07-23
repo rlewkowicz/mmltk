@@ -1,0 +1,48 @@
+// Copyright 2002 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+
+#if !defined(COMPILER_TRANSLATOR_CALLDAG_H_)
+#define COMPILER_TRANSLATOR_CALLDAG_H_
+
+#include <map>
+
+#include "compiler/translator/IntermNode.h"
+
+namespace sh
+{
+
+
+class CallDAG : angle::NonCopyable
+{
+  public:
+    CallDAG();
+    ~CallDAG();
+
+    struct Record
+    {
+        TIntermFunctionDefinition *node;  
+        std::vector<int> callees;
+    };
+
+    void init(TIntermNode *root);
+
+    size_t findIndex(const TSymbolUniqueId &id) const;
+
+    const Record &getRecordFromIndex(size_t index) const;
+    size_t size() const;
+    void clear();
+
+    const static size_t InvalidIndex;
+
+  private:
+    std::vector<Record> mRecords;
+    std::map<int, int> mFunctionIdToIndex;
+
+    class CallDAGCreator;
+};
+
+}  
+
+#endif

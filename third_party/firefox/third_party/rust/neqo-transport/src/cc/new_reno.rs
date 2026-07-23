@@ -1,0 +1,56 @@
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+
+use std::{
+    fmt::{self, Display},
+    time::{Duration, Instant},
+};
+
+use crate::{
+    cc::{CongestionTrigger, classic_cc::WindowAdjustment},
+    stats::CongestionControlStats,
+};
+
+#[derive(Debug, Default)]
+pub struct NewReno {}
+
+impl Display for NewReno {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "NewReno")?;
+        Ok(())
+    }
+}
+
+impl WindowAdjustment for NewReno {
+    fn bytes_for_cwnd_increase(
+        &mut self,
+        curr_cwnd: usize,
+        _new_acked_bytes: usize,
+        _min_rtt: Duration,
+        _max_datagram_size: usize,
+        _now: Instant,
+    ) -> usize {
+        curr_cwnd
+    }
+
+    fn reduce_cwnd(
+        &mut self,
+        curr_cwnd: usize,
+        acked_bytes: usize,
+        _max_datagram_size: usize,
+        _congestion_trigger: CongestionTrigger,
+        _cc_stats: &mut CongestionControlStats,
+    ) -> (usize, usize) {
+        (curr_cwnd / 2, acked_bytes / 2)
+    }
+
+    fn on_app_limited(&mut self) {}
+
+    fn save_undo_state(&mut self) {}
+
+    fn restore_undo_state(&mut self, _cc_stats: &mut CongestionControlStats) {}
+}

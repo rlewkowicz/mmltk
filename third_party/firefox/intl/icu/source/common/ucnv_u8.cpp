@@ -1,0 +1,862 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*  
+**********************************************************************
+*   Copyright (C) 2002-2016, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+**********************************************************************
+*   file name:  ucnv_u8.c
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+*   created on: 2002jul01
+*   created by: Markus W. Scherer
+*
+*   UTF-8 converter implementation. Used to be in ucnv_utf.c.
+*
+*   Also, CESU-8 implementation, see UTR 26.
+*   The CESU-8 converter uses all the same functions as the
+*   UTF-8 converter, with a branch for converting supplementary code points.
+*/
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_CONVERSION
+
+#include "unicode/ucnv.h"
+#include "unicode/utf.h"
+#include "unicode/utf8.h"
+#include "unicode/utf16.h"
+#include "uassert.h"
+#include "ucnv_bld.h"
+#include "ucnv_cnv.h"
+#include "cmemory.h"
+#include "ustr_imp.h"
+
+
+
+U_CFUNC void ucnv_fromUnicode_UTF8(UConverterFromUnicodeArgs *args,
+                                           UErrorCode *err);
+U_CFUNC void ucnv_fromUnicode_UTF8_OFFSETS_LOGIC(UConverterFromUnicodeArgs *args,
+                                                        UErrorCode *err);
+
+
+
+#define MAXIMUM_UCS2            0x0000FFFF
+
+static const uint32_t offsetsFromUTF8[5] = {0,
+  static_cast<uint32_t>(0x00000000), static_cast<uint32_t>(0x00003080),
+  static_cast<uint32_t>(0x000E2080), static_cast<uint32_t>(0x03C82080)
+};
+
+static UBool hasCESU8Data(const UConverter *cnv)
+{
+#if UCONFIG_ONLY_HTML_CONVERSION
+    return false;
+#else
+    return cnv->sharedData == &_CESU8Data;
+#endif
+}
+U_CDECL_BEGIN
+static void  U_CALLCONV ucnv_toUnicode_UTF8 (UConverterToUnicodeArgs * args,
+                                  UErrorCode * err)
+{
+    UConverter *cnv = args->converter;
+    const unsigned char *mySource = (unsigned char *) args->source;
+    char16_t *myTarget = args->target;
+    const unsigned char *sourceLimit = (unsigned char *) args->sourceLimit;
+    const char16_t *targetLimit = args->targetLimit;
+    unsigned char *toUBytes = cnv->toUBytes;
+    UBool isCESU8 = hasCESU8Data(cnv);
+    uint32_t ch, ch2 = 0;
+    int32_t i, inBytes;
+
+    if (cnv->toULength > 0 && myTarget < targetLimit)
+    {
+        inBytes = cnv->mode;            
+        i = cnv->toULength;             
+        cnv->toULength = 0;
+
+        ch = cnv->toUnicodeStatus;
+        cnv->toUnicodeStatus = 0;
+        goto morebytes;
+    }
+
+
+    while (mySource < sourceLimit && myTarget < targetLimit)
+    {
+        ch = *(mySource++);
+        if (U8_IS_SINGLE(ch))        
+        {
+            *(myTarget++) = (char16_t) ch;
+        }
+        else
+        {
+            toUBytes[0] = (char)ch;
+            inBytes = U8_COUNT_BYTES_NON_ASCII(ch); 
+            i = 1;
+
+morebytes:
+            while (i < inBytes)
+            {
+                if (mySource < sourceLimit)
+                {
+                    toUBytes[i] = (char) (ch2 = *mySource);
+                    if (!icu::UTF8::isValidTrail(ch, static_cast<uint8_t>(ch2), i, inBytes) &&
+                            !(isCESU8 && i == 1 && ch == 0xed && U8_IS_TRAIL(ch2)))
+                    {
+                        break; 
+                    }
+                    ch = (ch << 6) + ch2;
+                    ++mySource;
+                    i++;
+                }
+                else
+                {
+                    cnv->toUnicodeStatus = ch;
+                    cnv->mode = inBytes;
+                    cnv->toULength = (int8_t) i;
+                    goto donefornow;
+                }
+            }
+
+            if (i == inBytes && (!isCESU8 || i <= 3))
+            {
+                ch -= offsetsFromUTF8[inBytes];
+
+                if (ch <= MAXIMUM_UCS2) 
+                {
+                    *(myTarget++) = (char16_t) ch;
+                }
+                else
+                {
+                    *(myTarget++) = U16_LEAD(ch);
+                    ch = U16_TRAIL(ch);
+                    if (myTarget < targetLimit)
+                    {
+                        *(myTarget++) = (char16_t)ch;
+                    }
+                    else
+                    {
+                        cnv->UCharErrorBuffer[0] = (char16_t) ch;
+                        cnv->UCharErrorBufferLength = 1;
+                        *err = U_BUFFER_OVERFLOW_ERROR;
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                cnv->toULength = (int8_t)i;
+                *err = U_ILLEGAL_CHAR_FOUND;
+                break;
+            }
+        }
+    }
+
+donefornow:
+    if (mySource < sourceLimit && myTarget >= targetLimit && U_SUCCESS(*err))
+    {
+        *err = U_BUFFER_OVERFLOW_ERROR;
+    }
+
+    args->target = myTarget;
+    args->source = (const char *) mySource;
+}
+
+static void  U_CALLCONV ucnv_toUnicode_UTF8_OFFSETS_LOGIC (UConverterToUnicodeArgs * args,
+                                                UErrorCode * err)
+{
+    UConverter *cnv = args->converter;
+    const unsigned char *mySource = (unsigned char *) args->source;
+    char16_t *myTarget = args->target;
+    int32_t *myOffsets = args->offsets;
+    int32_t offsetNum = 0;
+    const unsigned char *sourceLimit = (unsigned char *) args->sourceLimit;
+    const char16_t *targetLimit = args->targetLimit;
+    unsigned char *toUBytes = cnv->toUBytes;
+    UBool isCESU8 = hasCESU8Data(cnv);
+    uint32_t ch, ch2 = 0;
+    int32_t i, inBytes;
+
+    if (cnv->toULength > 0 && myTarget < targetLimit)
+    {
+        inBytes = cnv->mode;            
+        i = cnv->toULength;             
+        cnv->toULength = 0;
+
+        ch = cnv->toUnicodeStatus;
+        cnv->toUnicodeStatus = 0;
+        goto morebytes;
+    }
+
+    while (mySource < sourceLimit && myTarget < targetLimit)
+    {
+        ch = *(mySource++);
+        if (U8_IS_SINGLE(ch))        
+        {
+            *(myTarget++) = (char16_t) ch;
+            *(myOffsets++) = offsetNum++;
+        }
+        else
+        {
+            toUBytes[0] = (char)ch;
+            inBytes = U8_COUNT_BYTES_NON_ASCII(ch);
+            i = 1;
+
+morebytes:
+            while (i < inBytes)
+            {
+                if (mySource < sourceLimit)
+                {
+                    toUBytes[i] = (char) (ch2 = *mySource);
+                    if (!icu::UTF8::isValidTrail(ch, static_cast<uint8_t>(ch2), i, inBytes) &&
+                            !(isCESU8 && i == 1 && ch == 0xed && U8_IS_TRAIL(ch2)))
+                    {
+                        break; 
+                    }
+                    ch = (ch << 6) + ch2;
+                    ++mySource;
+                    i++;
+                }
+                else
+                {
+                    cnv->toUnicodeStatus = ch;
+                    cnv->mode = inBytes;
+                    cnv->toULength = (int8_t)i;
+                    goto donefornow;
+                }
+            }
+
+            if (i == inBytes && (!isCESU8 || i <= 3))
+            {
+                ch -= offsetsFromUTF8[inBytes];
+
+                if (ch <= MAXIMUM_UCS2) 
+                {
+                    *(myTarget++) = (char16_t) ch;
+                    *(myOffsets++) = offsetNum;
+                }
+                else
+                {
+                    *(myTarget++) = U16_LEAD(ch);
+                    *(myOffsets++) = offsetNum;
+                    ch = U16_TRAIL(ch);
+                    if (myTarget < targetLimit)
+                    {
+                        *(myTarget++) = (char16_t)ch;
+                        *(myOffsets++) = offsetNum;
+                    }
+                    else
+                    {
+                        cnv->UCharErrorBuffer[0] = (char16_t) ch;
+                        cnv->UCharErrorBufferLength = 1;
+                        *err = U_BUFFER_OVERFLOW_ERROR;
+                    }
+                }
+                offsetNum += i;
+            }
+            else
+            {
+                cnv->toULength = (int8_t)i;
+                *err = U_ILLEGAL_CHAR_FOUND;
+                break;
+            }
+        }
+    }
+
+donefornow:
+    if (mySource < sourceLimit && myTarget >= targetLimit && U_SUCCESS(*err))
+    {   
+        *err = U_BUFFER_OVERFLOW_ERROR;
+    }
+
+    args->target = myTarget;
+    args->source = (const char *) mySource;
+    args->offsets = myOffsets;
+}
+U_CDECL_END
+
+U_CFUNC void  U_CALLCONV ucnv_fromUnicode_UTF8 (UConverterFromUnicodeArgs * args,
+                                    UErrorCode * err)
+{
+    UConverter *cnv = args->converter;
+    const char16_t *mySource = args->source;
+    const char16_t *sourceLimit = args->sourceLimit;
+    uint8_t *myTarget = (uint8_t *) args->target;
+    const uint8_t *targetLimit = (uint8_t *) args->targetLimit;
+    uint8_t *tempPtr;
+    UChar32 ch;
+    uint8_t tempBuf[4];
+    int32_t indexToWrite;
+    UBool isNotCESU8 = !hasCESU8Data(cnv);
+
+    if (cnv->fromUChar32 && myTarget < targetLimit)
+    {
+        ch = cnv->fromUChar32;
+        cnv->fromUChar32 = 0;
+        goto lowsurrogate;
+    }
+
+    while (mySource < sourceLimit && myTarget < targetLimit)
+    {
+        ch = *(mySource++);
+
+        if (ch < 0x80)        
+        {
+            *(myTarget++) = (uint8_t) ch;
+        }
+        else if (ch < 0x800)  
+        {
+            *(myTarget++) = (uint8_t) ((ch >> 6) | 0xc0);
+            if (myTarget < targetLimit)
+            {
+                *(myTarget++) = (uint8_t) ((ch & 0x3f) | 0x80);
+            }
+            else
+            {
+                cnv->charErrorBuffer[0] = (uint8_t) ((ch & 0x3f) | 0x80);
+                cnv->charErrorBufferLength = 1;
+                *err = U_BUFFER_OVERFLOW_ERROR;
+            }
+        }
+        else {
+            if(U16_IS_SURROGATE(ch) && isNotCESU8) {
+lowsurrogate:
+                if (mySource < sourceLimit) {
+                    if(U16_IS_SURROGATE_LEAD(ch) && U16_IS_TRAIL(*mySource)) {
+                        ch=U16_GET_SUPPLEMENTARY(ch, *mySource);
+                        ++mySource;
+                    }
+                    else {
+                        cnv->fromUChar32 = ch;
+                        *err = U_ILLEGAL_CHAR_FOUND;
+                        break;
+                    }
+                }
+                else {
+                    cnv->fromUChar32 = ch;
+                    break;
+                }
+            }
+
+            tempPtr = (((targetLimit - myTarget) >= 4) ? myTarget : tempBuf);
+
+            if (ch <= MAXIMUM_UCS2) {
+                indexToWrite = 2;
+                tempPtr[0] = (uint8_t) ((ch >> 12) | 0xe0);
+            }
+            else {
+                indexToWrite = 3;
+                tempPtr[0] = (uint8_t) ((ch >> 18) | 0xf0);
+                tempPtr[1] = (uint8_t) (((ch >> 12) & 0x3f) | 0x80);
+            }
+            tempPtr[indexToWrite-1] = (uint8_t) (((ch >> 6) & 0x3f) | 0x80);
+            tempPtr[indexToWrite] = (uint8_t) ((ch & 0x3f) | 0x80);
+
+            if (tempPtr == myTarget) {
+                myTarget += (indexToWrite + 1);
+            }
+            else {
+                for (; tempPtr <= (tempBuf + indexToWrite); tempPtr++) {
+                    if (myTarget < targetLimit) {
+                        *(myTarget++) = *tempPtr;
+                    }
+                    else {
+                        cnv->charErrorBuffer[cnv->charErrorBufferLength++] = *tempPtr;
+                        *err = U_BUFFER_OVERFLOW_ERROR;
+                    }
+                }
+            }
+        }
+    }
+
+    if (mySource < sourceLimit && myTarget >= targetLimit && U_SUCCESS(*err))
+    {
+        *err = U_BUFFER_OVERFLOW_ERROR;
+    }
+
+    args->target = (char *) myTarget;
+    args->source = mySource;
+}
+
+U_CFUNC void  U_CALLCONV ucnv_fromUnicode_UTF8_OFFSETS_LOGIC (UConverterFromUnicodeArgs * args,
+                                                  UErrorCode * err)
+{
+    UConverter *cnv = args->converter;
+    const char16_t *mySource = args->source;
+    int32_t *myOffsets = args->offsets;
+    const char16_t *sourceLimit = args->sourceLimit;
+    uint8_t *myTarget = (uint8_t *) args->target;
+    const uint8_t *targetLimit = (uint8_t *) args->targetLimit;
+    uint8_t *tempPtr;
+    UChar32 ch;
+    int32_t offsetNum, nextSourceIndex;
+    int32_t indexToWrite;
+    uint8_t tempBuf[4];
+    UBool isNotCESU8 = !hasCESU8Data(cnv);
+
+    if (cnv->fromUChar32 && myTarget < targetLimit)
+    {
+        ch = cnv->fromUChar32;
+        cnv->fromUChar32 = 0;
+        offsetNum = -1;
+        nextSourceIndex = 0;
+        goto lowsurrogate;
+    } else {
+        offsetNum = 0;
+    }
+
+    while (mySource < sourceLimit && myTarget < targetLimit)
+    {
+        ch = *(mySource++);
+
+        if (ch < 0x80)        
+        {
+            *(myOffsets++) = offsetNum++;
+            *(myTarget++) = (char) ch;
+        }
+        else if (ch < 0x800)  
+        {
+            *(myOffsets++) = offsetNum;
+            *(myTarget++) = (uint8_t) ((ch >> 6) | 0xc0);
+            if (myTarget < targetLimit)
+            {
+                *(myOffsets++) = offsetNum++;
+                *(myTarget++) = (uint8_t) ((ch & 0x3f) | 0x80);
+            }
+            else
+            {
+                cnv->charErrorBuffer[0] = (uint8_t) ((ch & 0x3f) | 0x80);
+                cnv->charErrorBufferLength = 1;
+                *err = U_BUFFER_OVERFLOW_ERROR;
+            }
+        }
+        else
+        {
+            nextSourceIndex = offsetNum + 1;
+
+            if(U16_IS_SURROGATE(ch) && isNotCESU8) {
+lowsurrogate:
+                if (mySource < sourceLimit) {
+                    if(U16_IS_SURROGATE_LEAD(ch) && U16_IS_TRAIL(*mySource)) {
+                        ch=U16_GET_SUPPLEMENTARY(ch, *mySource);
+                        ++mySource;
+                        ++nextSourceIndex;
+                    }
+                    else {
+                        cnv->fromUChar32 = ch;
+                        *err = U_ILLEGAL_CHAR_FOUND;
+                        break;
+                    }
+                }
+                else {
+                    cnv->fromUChar32 = ch;
+                    break;
+                }
+            }
+
+            tempPtr = (((targetLimit - myTarget) >= 4) ? myTarget : tempBuf);
+
+            if (ch <= MAXIMUM_UCS2) {
+                indexToWrite = 2;
+                tempPtr[0] = (uint8_t) ((ch >> 12) | 0xe0);
+            }
+            else {
+                indexToWrite = 3;
+                tempPtr[0] = (uint8_t) ((ch >> 18) | 0xf0);
+                tempPtr[1] = (uint8_t) (((ch >> 12) & 0x3f) | 0x80);
+            }
+            tempPtr[indexToWrite-1] = (uint8_t) (((ch >> 6) & 0x3f) | 0x80);
+            tempPtr[indexToWrite] = (uint8_t) ((ch & 0x3f) | 0x80);
+
+            if (tempPtr == myTarget) {
+                myTarget += (indexToWrite + 1);
+                myOffsets[0] = offsetNum;
+                myOffsets[1] = offsetNum;
+                myOffsets[2] = offsetNum;
+                if (indexToWrite >= 3) {
+                    myOffsets[3] = offsetNum;
+                }
+                myOffsets += (indexToWrite + 1);
+            }
+            else {
+                for (; tempPtr <= (tempBuf + indexToWrite); tempPtr++) {
+                    if (myTarget < targetLimit)
+                    {
+                        *(myOffsets++) = offsetNum;
+                        *(myTarget++) = *tempPtr;
+                    }
+                    else
+                    {
+                        cnv->charErrorBuffer[cnv->charErrorBufferLength++] = *tempPtr;
+                        *err = U_BUFFER_OVERFLOW_ERROR;
+                    }
+                }
+            }
+            offsetNum = nextSourceIndex;
+        }
+    }
+
+    if (mySource < sourceLimit && myTarget >= targetLimit && U_SUCCESS(*err))
+    {
+        *err = U_BUFFER_OVERFLOW_ERROR;
+    }
+
+    args->target = (char *) myTarget;
+    args->source = mySource;
+    args->offsets = myOffsets;
+}
+
+U_CDECL_BEGIN
+static UChar32 U_CALLCONV ucnv_getNextUChar_UTF8(UConverterToUnicodeArgs *args,
+                                               UErrorCode *err) {
+    UConverter *cnv;
+    const uint8_t *sourceInitial;
+    const uint8_t *source;
+    uint8_t myByte;
+    UChar32 ch;
+    int8_t i;
+
+
+    cnv = args->converter;
+    sourceInitial = source = (const uint8_t *)args->source;
+    if (source >= (const uint8_t *)args->sourceLimit)
+    {
+        *err = U_INDEX_OUTOFBOUNDS_ERROR;
+        return 0xffff;
+    }
+
+    myByte = *(source++);
+    if (U8_IS_SINGLE(myByte))
+    {
+        args->source = (const char *)source;
+        return (UChar32)myByte;
+    }
+
+    uint16_t countTrailBytes = U8_COUNT_TRAIL_BYTES(myByte);
+    if (countTrailBytes == 0) {
+        cnv->toUBytes[0] = myByte;
+        cnv->toULength = 1;
+        *err = U_ILLEGAL_CHAR_FOUND;
+        args->source = (const char *)source;
+        return 0xffff;
+    }
+
+    if (((const char *)source + countTrailBytes) > args->sourceLimit)
+    {
+        uint16_t extraBytesToWrite = countTrailBytes + 1;
+        cnv->toUBytes[0] = myByte;
+        i = 1;
+        *err = U_TRUNCATED_CHAR_FOUND;
+        while(source < (const uint8_t *)args->sourceLimit) {
+            uint8_t b = *source;
+            if(icu::UTF8::isValidTrail(myByte, b, i, extraBytesToWrite)) {
+                cnv->toUBytes[i++] = b;
+                ++source;
+            } else {
+                *err = U_ILLEGAL_CHAR_FOUND;
+                break;
+            }
+        }
+        cnv->toULength = i;
+        args->source = (const char *)source;
+        return 0xffff;
+    }
+
+    ch = myByte << 6;
+    if(countTrailBytes == 2) {
+        uint8_t t1 = *source, t2;
+        if(U8_IS_VALID_LEAD3_AND_T1(myByte, t1) && U8_IS_TRAIL(t2 = *++source)) {
+            args->source = (const char *)(source + 1);
+            return (((ch + t1) << 6) + t2) - offsetsFromUTF8[3];
+        }
+    } else if(countTrailBytes == 1) {
+        uint8_t t1 = *source;
+        if(U8_IS_TRAIL(t1)) {
+            args->source = (const char *)(source + 1);
+            return (ch + t1) - offsetsFromUTF8[2];
+        }
+    } else {  
+        uint8_t t1 = *source, t2, t3;
+        if(U8_IS_VALID_LEAD4_AND_T1(myByte, t1) && U8_IS_TRAIL(t2 = *++source) &&
+                U8_IS_TRAIL(t3 = *++source)) {
+            args->source = (const char *)(source + 1);
+            return (((((ch + t1) << 6) + t2) << 6) + t3) - offsetsFromUTF8[4];
+        }
+    }
+    args->source = (const char *)source;
+
+    for(i = 0; sourceInitial < source; ++i) {
+        cnv->toUBytes[i] = *sourceInitial++;
+    }
+    cnv->toULength = i;
+    *err = U_ILLEGAL_CHAR_FOUND;
+    return 0xffff;
+} 
+U_CDECL_END
+
+
+U_CDECL_BEGIN
+static void U_CALLCONV
+ucnv_UTF8FromUTF8(UConverterFromUnicodeArgs *pFromUArgs,
+                  UConverterToUnicodeArgs *pToUArgs,
+                  UErrorCode *pErrorCode) {
+    UConverter *utf8;
+    const uint8_t *source, *sourceLimit;
+    uint8_t *target;
+    int32_t targetCapacity;
+    int32_t count;
+
+    int8_t oldToULength, toULength, toULimit;
+
+    UChar32 c;
+    uint8_t b, t1, t2;
+
+    utf8=pToUArgs->converter;
+    source=(uint8_t *)pToUArgs->source;
+    sourceLimit=(uint8_t *)pToUArgs->sourceLimit;
+    target=(uint8_t *)pFromUArgs->target;
+    targetCapacity=(int32_t)(pFromUArgs->targetLimit-pFromUArgs->target);
+
+    if(utf8->toULength > 0) {
+        toULength=oldToULength=utf8->toULength;
+        toULimit=(int8_t)utf8->mode;
+        c=(UChar32)utf8->toUnicodeStatus;
+    } else {
+        toULength=oldToULength=toULimit=0;
+        c = 0;
+    }
+
+    count=(int32_t)(sourceLimit-source)+oldToULength;
+    if(count<toULimit) {
+    } else if(targetCapacity<toULimit) {
+        *pErrorCode=U_USING_DEFAULT_WARNING;
+        return;
+    } else {
+        if(count>targetCapacity) {
+            count=targetCapacity;
+        }
+
+
+        int32_t length=count-toULength;
+        U8_TRUNCATE_IF_INCOMPLETE(source, 0, length);
+        count=toULength+length;
+    }
+
+    if(c!=0) {
+        utf8->toUnicodeStatus=0;
+        utf8->toULength=0;
+        goto moreBytes;
+    }
+
+    while(count>0) {
+        b=*source++;
+        if(U8_IS_SINGLE(b)) {
+            *target++=b;
+            --count;
+            continue;
+        } else {
+            if(b>=0xe0) {
+                if( 
+                    b<0xf0 &&
+                    U8_IS_VALID_LEAD3_AND_T1(b, t1=source[0]) &&
+                    U8_IS_TRAIL(t2=source[1])
+                ) {
+                    source+=2;
+                    *target++=b;
+                    *target++=t1;
+                    *target++=t2;
+                    count-=3;
+                    continue;
+                }
+            } else {
+                if( 
+                    b>=0xc2 &&
+                    U8_IS_TRAIL(t1=*source)
+                ) {
+                    ++source;
+                    *target++=b;
+                    *target++=t1;
+                    count-=2;
+                    continue;
+                }
+            }
+
+            oldToULength=0;
+            toULength=1;
+            toULimit=U8_COUNT_BYTES_NON_ASCII(b);
+            c=b;
+moreBytes:
+            while(toULength<toULimit) {
+                if(source<sourceLimit) {
+                    b=*source;
+                    if(icu::UTF8::isValidTrail(c, b, toULength, toULimit)) {
+                        ++source;
+                        ++toULength;
+                        c=(c<<6)+b;
+                    } else {
+                        break; 
+                    }
+                } else {
+                    source-=(toULength-oldToULength);
+                    while(oldToULength<toULength) {
+                        utf8->toUBytes[oldToULength++]=*source++;
+                    }
+                    utf8->toUnicodeStatus=c;
+                    utf8->toULength=toULength;
+                    utf8->mode=toULimit;
+                    pToUArgs->source=(char *)source;
+                    pFromUArgs->target=(char *)target;
+                    return;
+                }
+            }
+
+            if(toULength!=toULimit) {
+                source-=(toULength-oldToULength);
+                while(oldToULength<toULength) {
+                    utf8->toUBytes[oldToULength++]=*source++;
+                }
+                utf8->toULength=toULength;
+                pToUArgs->source=(char *)source;
+                pFromUArgs->target=(char *)target;
+                *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+                return;
+            }
+
+            {
+                int8_t i;
+
+                for(i=0; i<oldToULength; ++i) {
+                    *target++=utf8->toUBytes[i];
+                }
+                source-=(toULength-oldToULength);
+                for(; i<toULength; ++i) {
+                    *target++=*source++;
+                }
+                count-=toULength;
+            }
+        }
+    }
+    U_ASSERT(count>=0);
+
+    if(U_SUCCESS(*pErrorCode) && source<sourceLimit) {
+        if(target==(const uint8_t *)pFromUArgs->targetLimit) {
+            *pErrorCode=U_BUFFER_OVERFLOW_ERROR;
+        } else {
+            b=*source;
+            toULimit=U8_COUNT_BYTES(b);
+            if(toULimit>(sourceLimit-source)) {
+                toULength=0;
+                c=b;
+                for(;;) {
+                    utf8->toUBytes[toULength++]=b;
+                    if(++source==sourceLimit) {
+                        utf8->toUnicodeStatus=c;
+                        utf8->toULength=toULength;
+                        utf8->mode=toULimit;
+                        break;
+                    } else if(!icu::UTF8::isValidTrail(c, b=*source, toULength, toULimit)) {
+                        utf8->toULength=toULength;
+                        *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+                        break;
+                    }
+                    c=(c<<6)+b;
+                }
+            } else {
+                *pErrorCode=U_USING_DEFAULT_WARNING;
+            }
+        }
+    }
+
+    pToUArgs->source=(char *)source;
+    pFromUArgs->target=(char *)target;
+}
+
+U_CDECL_END
+
+
+static const UConverterImpl _UTF8Impl={
+    UCNV_UTF8,
+
+    nullptr,
+    nullptr,
+
+    nullptr,
+    nullptr,
+    nullptr,
+
+    ucnv_toUnicode_UTF8,
+    ucnv_toUnicode_UTF8_OFFSETS_LOGIC,
+    ucnv_fromUnicode_UTF8,
+    ucnv_fromUnicode_UTF8_OFFSETS_LOGIC,
+    ucnv_getNextUChar_UTF8,
+
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    ucnv_getNonSurrogateUnicodeSet,
+
+    ucnv_UTF8FromUTF8,
+    ucnv_UTF8FromUTF8
+};
+
+static const UConverterStaticData _UTF8StaticData={
+    sizeof(UConverterStaticData),
+    "UTF-8",
+    1208, UCNV_IBM, UCNV_UTF8,
+    1, 3, 
+    { 0xef, 0xbf, 0xbd, 0 },3,false,false,
+    0,
+    0,
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 } 
+};
+
+
+const UConverterSharedData _UTF8Data=
+        UCNV_IMMUTABLE_SHARED_DATA_INITIALIZER(&_UTF8StaticData, &_UTF8Impl);
+
+
+static const UConverterImpl _CESU8Impl={
+    UCNV_CESU8,
+
+    nullptr,
+    nullptr,
+
+    nullptr,
+    nullptr,
+    nullptr,
+
+    ucnv_toUnicode_UTF8,
+    ucnv_toUnicode_UTF8_OFFSETS_LOGIC,
+    ucnv_fromUnicode_UTF8,
+    ucnv_fromUnicode_UTF8_OFFSETS_LOGIC,
+    nullptr,
+
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    ucnv_getCompleteUnicodeSet,
+
+    nullptr,
+    nullptr
+};
+
+static const UConverterStaticData _CESU8StaticData={
+    sizeof(UConverterStaticData),
+    "CESU-8",
+    9400, 
+    UCNV_UNKNOWN, UCNV_CESU8, 1, 3,
+    { 0xef, 0xbf, 0xbd, 0 },3,false,false,
+    0,
+    0,
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 } 
+};
+
+
+const UConverterSharedData _CESU8Data=
+        UCNV_IMMUTABLE_SHARED_DATA_INITIALIZER(&_CESU8StaticData, &_CESU8Impl);
+
+#endif

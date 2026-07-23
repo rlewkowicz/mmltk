@@ -1,0 +1,282 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SourceSurfaceSharedData.h"
+
+#include "mozilla/Likely.h"
+#include "mozilla/StaticPrefs_image.h"
+#include "mozilla/ipc/SharedMemoryMapping.h"
+#include "mozilla/layers/SharedSurfacesChild.h"
+#include "mozilla/layers/SharedSurfacesParent.h"
+#include "nsDebug.h"  // for NS_ABORT_OOM
+#include "mozilla/image/SurfaceCache.h"
+
+#include "base/process_util.h"
+
+#ifdef DEBUG
+#  define SHARED_SURFACE_PROTECT_FINALIZED
+#endif
+
+using namespace mozilla::layers;
+
+namespace mozilla {
+namespace gfx {
+
+void SourceSurfaceSharedDataWrapper::Init(
+    const IntSize& aSize, int32_t aStride, SurfaceFormat aFormat,
+    ipc::ReadOnlySharedMemoryHandle aHandle, base::ProcessId aCreatorPid) {
+  MOZ_ASSERT(!mBuf);
+  mSize = aSize;
+  mStride = aStride;
+  mFormat = aFormat;
+  mCreatorPid = aCreatorPid;
+
+  size_t len = GetAlignedDataLength();
+  mBufHandle = std::move(aHandle);
+  if (!mBufHandle) {
+    MOZ_CRASH("Invalid shared memory handle!");
+  }
+
+  bool mapped = EnsureMapped();
+  if ((sizeof(uintptr_t) <= 4 ||
+       StaticPrefs::image_mem_shared_unmap_force_enabled_AtStartup()) &&
+      len / 1024 >
+          StaticPrefs::image_mem_shared_unmap_min_threshold_kb_AtStartup()) {
+    mHandleLock.emplace("SourceSurfaceSharedDataWrapper::mHandleLock");
+
+    if (mapped) {
+      SharedSurfacesParent::AddTracking(this);
+    }
+  } else if (!mapped) {
+    NS_ABORT_OOM(len);
+  } else {
+    mBufHandle = nullptr;
+  }
+}
+
+void SourceSurfaceSharedDataWrapper::Init(SourceSurfaceSharedData* aSurface) {
+  MOZ_ASSERT(!mBuf);
+  MOZ_ASSERT(aSurface);
+  mSize = aSurface->mSize;
+  mStride = aSurface->mStride;
+  mFormat = aSurface->mFormat;
+  mCreatorPid = base::GetCurrentProcId();
+  mBuf = aSurface->mBuf;
+}
+
+bool SourceSurfaceSharedDataWrapper::EnsureMapped() {
+  MOZ_ASSERT(!GetData());
+
+  auto computedStride =
+      CheckedInt<int32_t>(mSize.width) * BytesPerPixel(mFormat);
+  auto computedLength = CheckedInt<int32_t>(mSize.height) * mStride;
+  if (mSize.width < 0 || mSize.height < 0 || mStride < 0 ||
+      !computedStride.isValid() || computedStride.value() <= 0 ||
+      mStride < computedStride.value() || !computedLength.isValid() ||
+      computedLength.value() <= 0 || !image::SurfaceCache::IsLegalSize(mSize) ||
+      mBufHandle.Size() < GetAlignedDataLength()) {
+    return false;
+  }
+
+  auto mapping = mBufHandle.Map();
+  while (!mapping) {
+    nsTArray<RefPtr<SourceSurfaceSharedDataWrapper>> expired;
+    if (!SharedSurfacesParent::AgeOneGeneration(expired)) {
+      return false;
+    }
+    MOZ_ASSERT(!expired.Contains(this));
+    SharedSurfacesParent::ExpireMap(expired);
+    mapping = mBufHandle.Map();
+  }
+
+  mBuf = std::make_shared<ipc::MutableOrReadOnlySharedMemoryMapping>(
+      std::move(mapping));
+
+  return true;
+}
+
+bool SourceSurfaceSharedDataWrapper::Map(MapType aMapType,
+                                         MappedSurface* aMappedSurface) {
+  uint8_t* dataPtr;
+
+  if (aMapType != MapType::READ) {
+    return false;
+  }
+
+  if (mHandleLock) {
+    MutexAutoLock lock(*mHandleLock);
+    dataPtr = GetData();
+    if (mMapCount == 0) {
+      if (mConsumers > 0) {
+        SharedSurfacesParent::RemoveTracking(this);
+      }
+      if (!dataPtr) {
+        if (!EnsureMapped()) {
+          NS_ABORT_OOM(GetAlignedDataLength());
+        }
+        dataPtr = GetData();
+      }
+    }
+    ++mMapCount;
+  } else {
+    dataPtr = GetData();
+    ++mMapCount;
+  }
+
+  MOZ_ASSERT(dataPtr);
+  aMappedSurface->mData = dataPtr;
+  aMappedSurface->mStride = mStride;
+  return true;
+}
+
+void SourceSurfaceSharedDataWrapper::Unmap() {
+  if (mHandleLock) {
+    MutexAutoLock lock(*mHandleLock);
+    if (--mMapCount == 0 && mConsumers > 0) {
+      SharedSurfacesParent::AddTracking(this);
+    }
+  } else {
+    --mMapCount;
+  }
+  MOZ_ASSERT(mMapCount >= 0);
+}
+
+void SourceSurfaceSharedDataWrapper::ExpireMap() {
+  MutexAutoLock lock(*mHandleLock);
+  if (mMapCount == 0) {
+    *mBuf = nullptr;
+  }
+}
+
+bool SourceSurfaceSharedData::Init(const IntSize& aSize, int32_t aStride,
+                                   SurfaceFormat aFormat,
+                                   bool aShare ) {
+  mSize = aSize;
+  mStride = aStride;
+  mFormat = aFormat;
+
+  size_t len = GetAlignedDataLength();
+  mBufHandle = ipc::shared_memory::Create(len);
+  mBuf = std::make_shared<ipc::MutableOrReadOnlySharedMemoryMapping>(
+      mBufHandle.Map());
+  if (NS_WARN_IF(!mBufHandle) || NS_WARN_IF(!mBuf || !*mBuf)) {
+    return false;
+  }
+
+  if (aShare) {
+    layers::SharedSurfacesChild::Share(this);
+  }
+
+  return true;
+}
+
+void SourceSurfaceSharedData::SizeOfExcludingThis(MallocSizeOf aMallocSizeOf,
+                                                  SizeOfInfo& aInfo) const {
+  MutexAutoLock lock(mMutex);
+  aInfo.AddType(SurfaceType::DATA_SHARED);
+  if (mBuf) {
+    aInfo.mNonHeapBytes = GetAlignedDataLength();
+  }
+  if (!mClosed) {
+    aInfo.mExternalHandles = 1;
+  }
+  Maybe<wr::ExternalImageId> extId = SharedSurfacesChild::GetExternalId(this);
+  if (extId) {
+    aInfo.mExternalId = wr::AsUint64(extId.ref());
+  }
+}
+
+uint8_t* SourceSurfaceSharedData::GetDataInternal() const {
+  mMutex.AssertCurrentThreadOwns();
+
+
+  if (MOZ_UNLIKELY(mOldBuf)) {
+    MOZ_ASSERT(mMapCount > 0);
+    MOZ_ASSERT(mFinalized);
+    return const_cast<uint8_t*>(mOldBuf->DataAs<uint8_t>());
+  }
+  return const_cast<uint8_t*>(mBuf->DataAs<uint8_t>());
+}
+
+nsresult SourceSurfaceSharedData::CloneHandle(
+    ipc::ReadOnlySharedMemoryHandle& aHandle) {
+  MutexAutoLock lock(mMutex);
+  MOZ_ASSERT(mHandleCount > 0);
+
+  if (mClosed) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  aHandle = mBufHandle.Clone().ToReadOnly();
+  if (MOZ_UNLIKELY(!aHandle)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  return NS_OK;
+}
+
+void SourceSurfaceSharedData::CloseHandleInternal() {
+  mMutex.AssertCurrentThreadOwns();
+
+  if (mClosed) {
+    MOZ_ASSERT(mHandleCount == 0);
+    MOZ_ASSERT(mShared);
+    return;
+  }
+
+  if (mShared) {
+    mBufHandle = nullptr;
+    mClosed = true;
+  }
+}
+
+bool SourceSurfaceSharedData::ReallocHandle() {
+  MutexAutoLock lock(mMutex);
+  MOZ_ASSERT(mHandleCount > 0);
+  MOZ_ASSERT(mClosed);
+
+  if (NS_WARN_IF(!mFinalized)) {
+    return false;
+  }
+
+  size_t len = GetAlignedDataLength();
+  auto handle = ipc::shared_memory::Create(len);
+  auto mapping = handle.Map();
+  if (NS_WARN_IF(!handle) || NS_WARN_IF(!mapping)) {
+    return false;
+  }
+
+  size_t copyLen = GetDataLength();
+  memcpy(mapping.Address(), mBuf->Address(), copyLen);
+#ifdef SHARED_SURFACE_PROTECT_FINALIZED
+  ipc::shared_memory::LocalProtect(mapping.DataAs<char>(), len,
+                                   ipc::shared_memory::AccessRead);
+#endif
+
+  if (mMapCount > 0 && !mOldBuf) {
+    mOldBuf = std::move(mBuf);
+  }
+  mBufHandle = std::move(handle);
+  mBuf = std::make_shared<ipc::MutableOrReadOnlySharedMemoryMapping>(
+      std::move(mapping));
+  mClosed = false;
+  mShared = false;
+  return true;
+}
+
+void SourceSurfaceSharedData::Finalize() {
+  MutexAutoLock lock(mMutex);
+  MOZ_ASSERT(!mFinalized);
+
+#ifdef SHARED_SURFACE_PROTECT_FINALIZED
+  size_t len = GetAlignedDataLength();
+  ipc::shared_memory::LocalProtect(const_cast<char*>(mBuf->DataAs<char>()), len,
+                                   ipc::shared_memory::AccessRead);
+#endif
+
+  mFinalized = true;
+}
+
+}  
+}  

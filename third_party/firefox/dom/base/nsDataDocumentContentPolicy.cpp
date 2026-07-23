@@ -1,0 +1,142 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsDataDocumentContentPolicy.h"
+
+#include "mozilla/ScopeExit.h"
+#include "mozilla/dom/Document.h"
+#include "nsContentPolicyUtils.h"
+#include "nsContentUtils.h"
+#include "nsINode.h"
+#include "nsIProtocolHandler.h"
+#include "nsIURI.h"
+#include "nsNetUtil.h"
+#include "nsScriptSecurityManager.h"
+
+using namespace mozilla;
+
+NS_IMPL_ISUPPORTS(nsDataDocumentContentPolicy, nsIContentPolicy)
+
+static bool HasFlags(nsIURI* aURI, uint32_t aURIFlags) {
+  bool hasFlags;
+  nsresult rv = NS_URIChainHasFlags(aURI, aURIFlags, &hasFlags);
+  return NS_SUCCEEDED(rv) && hasFlags;
+}
+
+NS_IMETHODIMP
+nsDataDocumentContentPolicy::ShouldLoad(nsIURI* aContentLocation,
+                                        nsILoadInfo* aLoadInfo,
+                                        int16_t* aDecision) {
+  auto setBlockingReason = mozilla::MakeScopeExit([&]() {
+    if (NS_CP_REJECTED(*aDecision)) {
+      NS_SetRequestBlockingReason(
+          aLoadInfo, nsILoadInfo::BLOCKING_REASON_CONTENT_POLICY_DATA_DOCUMENT);
+    }
+  });
+
+  ExtContentPolicyType contentType = aLoadInfo->GetExternalContentPolicyType();
+  nsCOMPtr<nsISupports> requestingContext = aLoadInfo->GetLoadingContext();
+
+  *aDecision = nsIContentPolicy::ACCEPT;
+  nsCOMPtr<mozilla::dom::Document> doc;
+  nsCOMPtr<nsINode> node = do_QueryInterface(requestingContext);
+  if (node) {
+    doc = node->OwnerDoc();
+  } else {
+    if (nsCOMPtr<nsPIDOMWindowOuter> window =
+            do_QueryInterface(requestingContext)) {
+      doc = window->GetDoc();
+    }
+  }
+
+  if (!doc || contentType == ExtContentPolicy::TYPE_DTD) {
+    return NS_OK;
+  }
+
+  if (doc->IsLoadedAsData()) {
+    bool allowed = [&] {
+      if (!doc->IsStaticDocument()) {
+        return false;
+      }
+      switch (contentType) {
+        case ExtContentPolicy::TYPE_IMAGE:
+        case ExtContentPolicy::TYPE_IMAGESET:
+        case ExtContentPolicy::TYPE_FONT:
+        case ExtContentPolicy::TYPE_UA_FONT:
+        case ExtContentPolicy::TYPE_OBJECT:
+          return true;
+        default:
+          return false;
+      }
+    }();
+
+    if (!allowed) {
+      *aDecision = nsIContentPolicy::REJECT_TYPE;
+      return NS_OK;
+    }
+  }
+
+  mozilla::dom::Document* docToCheckForImage = doc->GetDisplayDocument();
+  if (!docToCheckForImage) {
+    docToCheckForImage = doc;
+  }
+
+  if (docToCheckForImage->IsBeingUsedAsImage()) {
+    if (!(HasFlags(aContentLocation,
+                   nsIProtocolHandler::URI_IS_LOCAL_RESOURCE) &&
+          (HasFlags(aContentLocation,
+                    nsIProtocolHandler::URI_INHERITS_SECURITY_CONTEXT) ||
+           HasFlags(aContentLocation,
+                    nsIProtocolHandler::URI_LOADABLE_BY_SUBSUMERS)))) {
+      *aDecision = nsIContentPolicy::REJECT_TYPE;
+
+      if (node) {
+        nsIPrincipal* requestingPrincipal = node->NodePrincipal();
+        nsAutoCString sourceSpec;
+        requestingPrincipal->GetAsciiSpec(sourceSpec);
+        nsAutoCString targetSpec;
+        aContentLocation->GetAsciiSpec(targetSpec);
+        nsScriptSecurityManager::ReportError(
+            "ExternalDataError", sourceSpec, targetSpec,
+            requestingPrincipal->OriginAttributesRef().IsPrivateBrowsing());
+      }
+    } else if ((contentType == ExtContentPolicy::TYPE_IMAGE ||
+                contentType == ExtContentPolicy::TYPE_IMAGESET) &&
+               doc->GetDocumentURI()) {
+      bool isRecursiveLoad;
+      nsresult rv = aContentLocation->EqualsExceptRef(doc->GetDocumentURI(),
+                                                      &isRecursiveLoad);
+      if (NS_FAILED(rv) || isRecursiveLoad) {
+        NS_WARNING("Refusing to recursively load image");
+        *aDecision = nsIContentPolicy::REJECT_TYPE;
+      }
+    }
+    return NS_OK;
+  }
+
+  if (!doc->IsResourceDoc()) {
+    return NS_OK;
+  }
+
+  if (contentType == ExtContentPolicy::TYPE_OBJECT ||
+      contentType == ExtContentPolicy::TYPE_DOCUMENT ||
+      contentType == ExtContentPolicy::TYPE_SUBDOCUMENT ||
+      contentType == ExtContentPolicy::TYPE_SCRIPT ||
+      contentType == ExtContentPolicy::TYPE_XSLT ||
+      contentType == ExtContentPolicy::TYPE_FETCH ||
+      contentType == ExtContentPolicy::TYPE_WEB_MANIFEST) {
+    *aDecision = nsIContentPolicy::REJECT_TYPE;
+  }
+
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsDataDocumentContentPolicy::ShouldProcess(nsIURI* aContentLocation,
+                                           nsILoadInfo* aLoadInfo,
+                                           int16_t* aDecision) {
+  return ShouldLoad(aContentLocation, aLoadInfo, aDecision);
+}

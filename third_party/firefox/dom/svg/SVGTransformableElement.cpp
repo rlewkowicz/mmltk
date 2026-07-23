@@ -1,0 +1,57 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SVGTransformableElement.h"
+
+#include "DOMSVGAnimatedTransformList.h"
+#include "nsContentUtils.h"
+#include "nsIFrame.h"
+
+using namespace mozilla::gfx;
+
+namespace mozilla::dom {
+
+already_AddRefed<DOMSVGAnimatedTransformList>
+SVGTransformableElement::Transform() {
+  return DOMSVGAnimatedTransformList::GetDOMWrapper(
+      GetOrCreateAnimatedTransformList(), this);
+}
+
+
+bool SVGTransformableElement::IsAttributeMapped(
+    const nsAtom* aAttribute) const {
+  return aAttribute == nsGkAtoms::transform ||
+         SVGElement::IsAttributeMapped(aAttribute);
+}
+
+bool SVGTransformableElement::IsEventAttributeNameInternal(nsAtom* aName) {
+  return nsContentUtils::IsEventAttributeName(aName, EventNameType_SVGGraphic);
+}
+
+
+void SVGTransformableElement::SetAnimateMotionTransform(
+    const gfx::Matrix* aMatrix) {
+  if ((!aMatrix && !mAnimateMotionTransform) ||
+      (aMatrix && mAnimateMotionTransform &&
+       aMatrix->FuzzyEquals(*mAnimateMotionTransform))) {
+    return;
+  }
+  mAnimateMotionTransform =
+      aMatrix ? std::make_unique<gfx::Matrix>(*aMatrix) : nullptr;
+  DidAnimateTransformList();
+  nsIFrame* frame = GetPrimaryFrame();
+  if (frame) {
+    frame->SchedulePaint();
+  }
+}
+
+SVGAnimatedTransformList*
+SVGTransformableElement::GetOrCreateAnimatedTransformList() {
+  if (!mTransforms) {
+    mTransforms = std::make_unique<SVGAnimatedTransformList>();
+  }
+  return mTransforms.get();
+}
+
+}  

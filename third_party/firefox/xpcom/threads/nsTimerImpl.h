@@ -1,0 +1,184 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsTimerImpl_h_
+#define nsTimerImpl_h_
+
+#include "nsITimer.h"
+#include "nsIEventTarget.h"
+#include "nsIObserver.h"
+
+#include "nsCOMPtr.h"
+#include "nsString.h"
+
+#include "mozilla/Mutex.h"
+#include "mozilla/StaticMutex.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/Variant.h"
+#include "mozilla/Logging.h"
+
+extern mozilla::LogModule* GetTimerLog();
+
+#define NS_TIMER_CID                          \
+  { \
+   0x5ff24248,                                \
+   0x1dd2,                                    \
+   0x11b2,                                    \
+   {0x84, 0x27, 0xfb, 0xab, 0x44, 0xf2, 0x9b, 0xc8}}
+
+class nsIObserver;
+
+namespace mozilla {
+class LogModule;
+}
+
+class nsTimerImpl {
+  ~nsTimerImpl() {
+    MOZ_ASSERT(!mIsInTimerThread);
+
+    MOZ_ASSERT(
+        mCallback.is<UnknownCallback>() || mEventTarget->IsOnCurrentThread(),
+        "Must not release mCallback off-target without canceling");
+  }
+
+ public:
+  typedef mozilla::TimeStamp TimeStamp;
+
+  nsTimerImpl(nsITimer* aTimer, nsIEventTarget* aTarget);
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(nsTimerImpl)
+  NS_DECL_NON_VIRTUAL_NSITIMER
+
+  static nsresult Startup();
+  static void Shutdown();
+
+  void SetDelayInternal(uint32_t aDelay, TimeStamp aBase = TimeStamp::Now());
+  void CancelImpl(bool aClearITimer);
+
+  void Fire(uint64_t aTimerSeq);
+
+  struct UnknownCallback {};
+
+  using InterfaceCallback = nsCOMPtr<nsITimerCallback>;
+
+  using ObserverCallback = nsCOMPtr<nsIObserver>;
+
+  struct FuncCallback {
+    nsTimerCallbackFunc mFunc;
+    void* mClosure;
+  };
+
+  using ClosureCallback = std::function<void(nsITimer*)>;
+
+  using Callback =
+      mozilla::Variant<UnknownCallback, InterfaceCallback, ObserverCallback,
+                       FuncCallback, ClosureCallback>;
+
+  nsresult InitCommon(const mozilla::TimeDuration& aDelay, uint32_t aType,
+                      const nsACString& aName, Callback&& newCallback,
+                      const mozilla::MutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(mMutex);
+
+  Callback& GetCallback() MOZ_REQUIRES(mMutex) {
+    mMutex.AssertCurrentThreadOwns();
+    return mCallback;
+  }
+
+  bool IsRepeating() const {
+    static_assert(nsITimer::TYPE_ONE_SHOT < nsITimer::TYPE_REPEATING_SLACK,
+                  "invalid ordering of timer types!");
+    static_assert(
+        nsITimer::TYPE_REPEATING_SLACK < nsITimer::TYPE_REPEATING_PRECISE,
+        "invalid ordering of timer types!");
+    static_assert(nsITimer::TYPE_REPEATING_PRECISE <
+                      nsITimer::TYPE_REPEATING_PRECISE_CAN_SKIP,
+                  "invalid ordering of timer types!");
+    return mType >= nsITimer::TYPE_REPEATING_SLACK &&
+           mType < nsITimer::TYPE_ONE_SHOT_LOW_PRIORITY;
+  }
+
+  bool IsLowPriority() const {
+    return mType == nsITimer::TYPE_ONE_SHOT_LOW_PRIORITY ||
+           mType == nsITimer::TYPE_REPEATING_SLACK_LOW_PRIORITY;
+  }
+
+  bool IsSlack() const {
+    return mType == nsITimer::TYPE_REPEATING_SLACK ||
+           mType == nsITimer::TYPE_REPEATING_SLACK_LOW_PRIORITY;
+  }
+
+  bool IsInTimerThread() const { return mIsInTimerThread; }
+
+  void SetIsInTimerThread(bool aIsInTimerThread) {
+    mIsInTimerThread = aIsInTimerThread;
+  }
+
+  nsCOMPtr<nsIEventTarget> mEventTarget;
+
+  void LogFiring(const Callback& aCallback, uint8_t aType, uint32_t aDelay);
+
+  nsresult InitWithClosureCallback(std::function<void(nsITimer*)>&& aCallback,
+                                   const mozilla::TimeDuration& aDelay,
+                                   uint32_t aType,
+                                   const nsACString& aNameString);
+
+  bool mIsInTimerThread;
+
+  uint8_t mType;
+
+  uint64_t mTimerSeq MOZ_GUARDED_BY(mMutex);
+
+  mozilla::TimeDuration mDelay MOZ_GUARDED_BY(mMutex);
+  mozilla::TimeStamp mTimeout MOZ_GUARDED_BY(mMutex);
+
+  RefPtr<nsITimer> mITimer MOZ_GUARDED_BY(mMutex);
+  mozilla::Mutex mMutex;
+  nsCString mName MOZ_GUARDED_BY(mMutex);
+  Callback mCallback MOZ_GUARDED_BY(mMutex);
+  unsigned int mFiring MOZ_GUARDED_BY(mMutex);
+
+  static mozilla::StaticMutex sDeltaMutex;
+  static double sDeltaSum MOZ_GUARDED_BY(sDeltaMutex);
+  static double sDeltaSumSquared MOZ_GUARDED_BY(sDeltaMutex);
+  static double sDeltaNum MOZ_GUARDED_BY(sDeltaMutex);
+};
+
+class nsTimer final : public nsITimer {
+  explicit nsTimer(nsIEventTarget* aTarget)
+      : mImpl(new nsTimerImpl(this, aTarget)) {}
+
+  virtual ~nsTimer();
+
+ public:
+  friend class TimerThread;
+  friend class nsTimerEvent;
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_FORWARD_SAFE_NSITIMER(mImpl);
+
+  nsresult InitWithClosureCallback(std::function<void(nsITimer*)>&& aCallback,
+                                   const mozilla::TimeDuration& aDelay,
+                                   uint32_t aType,
+                                   const nsACString& aNameString) {
+    return mImpl ? mImpl->InitWithClosureCallback(std::move(aCallback), aDelay,
+                                                  aType, aNameString)
+                 : NS_ERROR_NULL_POINTER;
+  }
+
+  static RefPtr<nsTimer> WithEventTarget(nsIEventTarget* aTarget);
+
+  static nsresult XPCOMConstructor(REFNSIID aIID, void** aResult);
+
+ private:
+  RefPtr<nsTimerImpl> mImpl;
+};
+
+class nsTimerManager final : public nsITimerManager {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSITIMERMANAGER
+ private:
+  ~nsTimerManager() = default;
+};
+
+#endif /* nsTimerImpl_h_ */

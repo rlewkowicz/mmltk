@@ -1,0 +1,101 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/CSSMathNegate.h"
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/NotNull.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/CSSMathNegateBinding.h"
+#include "mozilla/dom/CSSNumericValue.h"
+#include "mozilla/dom/CSSNumericValueBinding.h"
+#include "nsString.h"
+
+namespace mozilla::dom {
+
+CSSMathNegate::CSSMathNegate(
+    nsCOMPtr<nsISupports> aParent,
+    MovingNotNull<UniquePtr<StyleNumericType>> aNumericType,
+    RefPtr<CSSNumericValue> aValue)
+    : CSSMathValue(std::move(aParent), std::move(aNumericType),
+                   MathValueType::MathNegate),
+      mValue(std::move(aValue)) {}
+
+RefPtr<CSSMathNegate> CSSMathNegate::Create(
+    nsCOMPtr<nsISupports> aParent, const StyleMathNegate& aMathNegate) {
+  RefPtr<CSSNumericValue> value =
+      CSSNumericValue::Create(aParent, *aMathNegate.value);
+
+  return MakeRefPtr<CSSMathNegate>(
+      std::move(aParent),
+      WrapMovingNotNull(MakeUnique<StyleNumericType>(aMathNegate.numeric_type)),
+      std::move(value));
+}
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED_0(CSSMathNegate, CSSMathValue)
+NS_IMPL_CYCLE_COLLECTION_INHERITED(CSSMathNegate, CSSMathValue, mValue)
+
+JSObject* CSSMathNegate::WrapObject(JSContext* aCx,
+                                    JS::Handle<JSObject*> aGivenProto) {
+  return CSSMathNegate_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+
+already_AddRefed<CSSMathNegate> CSSMathNegate::Constructor(
+    const GlobalObject& aGlobal, const CSSNumberish& aArg) {
+  nsCOMPtr<nsISupports> global = aGlobal.GetAsSupports();
+
+  RefPtr<CSSNumericValue> value = CSSNumericValue::Create(global, aArg);
+
+  auto numericType = MakeUnique<StyleNumericType>(value->GetNumericType());
+
+
+  return MakeAndAddRef<CSSMathNegate>(std::move(global),
+                                      WrapMovingNotNull(std::move(numericType)),
+                                      std::move(value));
+}
+
+CSSNumericValue* CSSMathNegate::Value() const { return mValue; }
+
+
+void CSSMathNegate::ToCssTextWithProperty(const CSSPropertyId& aPropertyId,
+                                          const SerializationContext& aContext,
+                                          nsACString& aDest) const {
+  if (!aContext.IsParenLess()) {
+    aDest.Append(aContext.IsNested() ? "("_ns : "calc("_ns);
+  }
+
+  aDest.Append("-"_ns);
+
+  mValue->ToCssTextWithProperty(aPropertyId, SerializationContext(Nested{}),
+                                aDest);
+
+  if (!aContext.IsParenLess()) {
+    aDest.Append(")"_ns);
+  }
+}
+
+StyleMathNegate CSSMathNegate::ToStyleMathNegate() const {
+  auto value = MakeUnique<StyleNumericValue>(mValue->ToStyleNumericValue());
+
+  return StyleMathNegate{GetNumericType(),
+                         StyleBox<StyleNumericValue>(std::move(value))};
+}
+
+const CSSMathNegate& CSSMathValue::GetAsCSSMathNegate() const {
+  MOZ_DIAGNOSTIC_ASSERT(mMathValueType == MathValueType::MathNegate);
+
+  return *static_cast<const CSSMathNegate*>(this);
+}
+
+CSSMathNegate& CSSMathValue::GetAsCSSMathNegate() {
+  MOZ_DIAGNOSTIC_ASSERT(mMathValueType == MathValueType::MathNegate);
+
+  return *static_cast<CSSMathNegate*>(this);
+}
+
+}  

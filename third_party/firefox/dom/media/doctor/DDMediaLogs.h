@@ -1,0 +1,131 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DDMediaLogs_h_
+#define DDMediaLogs_h_
+
+#include "DDLifetimes.h"
+#include "DDMediaLog.h"
+#include "MultiWriterQueue.h"
+#include "mozilla/MozPromise.h"
+
+namespace mozilla {
+
+struct DDMediaLogs {
+ public:
+  struct ConstructionResult {
+    nsresult mRv;
+    DDMediaLogs* mMediaLogs;
+  };
+  static ConstructionResult New();
+
+  ~DDMediaLogs();
+
+  void Panic();
+
+  inline void Log(const char* aSubjectTypeName, const void* aSubjectPointer,
+                  DDLogCategory aCategory, const char* aLabel,
+                  DDLogValue&& aValue) {
+    if (mMessagesQueue.PushF(
+            [&](DDLogMessage& aMessage, MessagesQueue::Index i) {
+              aMessage.mIndex = i;
+              aMessage.mTimeStamp = DDNow();
+              aMessage.mObject.Set(aSubjectTypeName, aSubjectPointer);
+              aMessage.mCategory = aCategory;
+              aMessage.mLabel = aLabel;
+              aMessage.mValue = std::move(aValue);
+            })) {
+      DispatchProcessLog();
+    }
+  }
+
+  void ProcessLog();
+
+  using LogMessagesPromise =
+      MozPromise<nsCString, nsresult,  true>;
+
+  RefPtr<LogMessagesPromise> RetrieveMessages(
+      const dom::HTMLMediaElement* aMediaElement);
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const;
+
+ private:
+  explicit DDMediaLogs(nsCOMPtr<nsIThread>&& aThread);
+
+  void Shutdown(bool aPanic);
+
+  DDMediaLog& LogForUnassociatedMessages();
+  const DDMediaLog& LogForUnassociatedMessages() const;
+
+  DDMediaLog* GetLogFor(const dom::HTMLMediaElement* aMediaElement);
+
+  DDMediaLog& LogFor(const dom::HTMLMediaElement* aMediaElement);
+
+  void SetMediaElement(DDLifetime& aLifetime,
+                       const dom::HTMLMediaElement* aMediaElement);
+
+  DDLifetime& FindOrCreateLifetime(const DDLogObject& aObject,
+                                   DDMessageIndex aIndex,
+                                   const DDTimeStamp& aTimeStamp);
+
+  void LinkLifetimes(DDLifetime& aParentLifetime, const char* aLinkName,
+                     DDLifetime& aChildLifetime, DDMessageIndex aIndex);
+
+  void UnlinkLifetime(DDLifetime& aLifetime, DDMessageIndex aIndex);
+
+  void UnlinkLifetimes(DDLifetime& aParentLifetime, DDLifetime& aChildLifetime,
+                       DDMessageIndex aIndex);
+
+  void DestroyLifetimeLinks(const DDLifetime& aLifetime);
+
+  void ProcessBuffer();
+
+  void FulfillPromises();
+
+  void CleanUpLogs();
+
+  nsresult DispatchProcessLog();
+
+  nsresult DispatchProcessLog(const MutexAutoLock& aProofOfLock);
+
+  using MessagesQueue =
+      MultiWriterQueue<DDLogMessage, MultiWriterQueueDefaultBufferSize,
+                       MultiWriterQueueReaderLocking_None>;
+  MessagesQueue mMessagesQueue;
+
+  DDLifetimes mLifetimes;
+
+  nsTArray<DDMediaLog> mMediaLogs;
+
+  struct DDObjectLink {
+    const DDLogObject mParent;
+    const DDLogObject mChild;
+    const char* const mLinkName;
+    const DDMessageIndex mLinkingIndex;
+    Maybe<DDMessageIndex> mUnlinkingIndex;
+
+    DDObjectLink(DDLogObject aParent, DDLogObject aChild, const char* aLinkName,
+                 DDMessageIndex aLinkingIndex)
+        : mParent(aParent),
+          mChild(aChild),
+          mLinkName(aLinkName),
+          mLinkingIndex(aLinkingIndex),
+          mUnlinkingIndex(Nothing{}) {}
+  };
+  nsTArray<DDObjectLink> mObjectLinks;
+
+  Mutex mMutex MOZ_UNANNOTATED;
+
+  nsCOMPtr<nsIThread> mThread;
+
+  struct PendingPromise {
+    MozPromiseHolder<LogMessagesPromise> mPromiseHolder;
+    const dom::HTMLMediaElement* mMediaElement;
+  };
+  AutoTArray<PendingPromise, 2> mPendingPromises;
+};
+
+}  
+
+#endif  // DDMediaLogs_h_

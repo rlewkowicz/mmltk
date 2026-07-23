@@ -1,0 +1,363 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsFrameLoaderOwner.h"
+
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/EventStateManager.h"
+#include "mozilla/Logging.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/StaticPrefs_fission.h"
+#include "mozilla/dom/BrowserBridgeChild.h"
+#include "mozilla/dom/BrowserBridgeHost.h"
+#include "mozilla/dom/BrowserHost.h"
+#include "mozilla/dom/BrowserParent.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/CanonicalBrowsingContext.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/FrameLoaderBinding.h"
+#include "mozilla/dom/HTMLIFrameElement.h"
+#include "mozilla/dom/MozFrameLoaderOwnerBinding.h"
+#include "nsFocusManager.h"
+#include "nsFrameLoader.h"
+#include "nsNetUtil.h"
+#include "nsQueryObject.h"
+#include "nsSubDocumentFrame.h"
+
+extern mozilla::LazyLogModule gSHIPBFCacheLog;
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+already_AddRefed<nsFrameLoader> nsFrameLoaderOwner::GetFrameLoader() {
+  return do_AddRef(mFrameLoader);
+}
+
+void nsFrameLoaderOwner::SetFrameLoader(nsFrameLoader* aNewFrameLoader) {
+  mFrameLoader = aNewFrameLoader;
+}
+
+mozilla::dom::BrowsingContext* nsFrameLoaderOwner::GetBrowsingContext() {
+  if (mFrameLoader) {
+    return mFrameLoader->GetBrowsingContext();
+  }
+  return nullptr;
+}
+
+mozilla::dom::BrowsingContext* nsFrameLoaderOwner::GetExtantBrowsingContext() {
+  if (mFrameLoader) {
+    return mFrameLoader->GetExtantBrowsingContext();
+  }
+  return nullptr;
+}
+
+bool nsFrameLoaderOwner::UseRemoteSubframes() {
+  RefPtr<Element> owner = do_QueryObject(this);
+
+  nsILoadContext* loadContext = owner->OwnerDoc()->GetLoadContext();
+  MOZ_DIAGNOSTIC_ASSERT(loadContext);
+
+  return loadContext->UseRemoteSubframes();
+}
+
+nsFrameLoaderOwner::ChangeRemotenessContextType
+nsFrameLoaderOwner::ShouldPreserveBrowsingContext(
+    bool aIsRemote, bool aReplaceBrowsingContext) {
+  if (aReplaceBrowsingContext) {
+    return ChangeRemotenessContextType::DONT_PRESERVE;
+  }
+
+  if (XRE_IsParentProcess()) {
+    if (!aIsRemote) {
+      return ChangeRemotenessContextType::DONT_PRESERVE;
+    }
+
+    if (mFrameLoader && !mFrameLoader->IsRemoteFrame()) {
+      return ChangeRemotenessContextType::DONT_PRESERVE;
+    }
+  }
+
+  return ChangeRemotenessContextType::PRESERVE;
+}
+
+void nsFrameLoaderOwner::ChangeRemotenessCommon(
+    const ChangeRemotenessContextType& aContextType,
+    const NavigationIsolationOptions& aOptions, bool aSwitchingInProgressLoad,
+    bool aIsRemote, BrowsingContextGroup* aGroup,
+    std::function<void()>& aFrameLoaderInit, mozilla::ErrorResult& aRv) {
+  MOZ_ASSERT_IF(aGroup, aContextType != ChangeRemotenessContextType::PRESERVE);
+
+  RefPtr<mozilla::dom::BrowsingContext> bc;
+  bool networkCreated = false;
+
+  RefPtr<Element> owner = do_QueryObject(this);
+  MOZ_ASSERT(owner);
+
+  RefPtr<Document> doc = owner->OwnerDoc();
+  doc->BlockOnload();
+  auto cleanup = MakeScopeExit([&]() { doc->UnblockOnload(false); });
+
+  RefPtr<SessionHistoryEntry> bfcacheEntry;
+
+  {
+    nsAutoScriptBlocker sb;
+
+    if (mFrameLoader) {
+      bc = mFrameLoader->GetMaybePendingBrowsingContext();
+
+      if (nsFocusManager* fm = nsFocusManager::GetFocusManager()) {
+        fm->FixUpFocusBeforeFrameLoaderChange(*owner, bc);
+      }
+
+      networkCreated = mFrameLoader->IsNetworkCreated();
+
+      MOZ_ASSERT_IF(aOptions.mTryUseBFCache, aOptions.mReplaceBrowsingContext);
+      if (aOptions.mTryUseBFCache && bc) {
+        bfcacheEntry = bc->Canonical()->GetActiveSessionHistoryEntry();
+        bool useBFCache = bfcacheEntry &&
+                          bfcacheEntry == aOptions.mActiveSessionHistoryEntry &&
+                          !bfcacheEntry->GetFrameLoader();
+        if (useBFCache) {
+          MOZ_LOG(gSHIPBFCacheLog, LogLevel::Debug,
+                  ("nsFrameLoaderOwner::ChangeRemotenessCommon: store the old "
+                   "page in bfcache"));
+          bc->Canonical()->DeactivateDocuments();
+          bfcacheEntry->SetFrameLoader(mFrameLoader);
+          mFrameLoader = nullptr;
+        }
+      }
+
+      if (mFrameLoader) {
+        if (aContextType == ChangeRemotenessContextType::PRESERVE) {
+          mFrameLoader->SetWillChangeProcess();
+        }
+
+        mFrameLoader->Destroy(aSwitchingInProgressLoad);
+        mFrameLoader = nullptr;
+      }
+    }
+
+    mFrameLoader = nsFrameLoader::Recreate(
+        owner, bc, aGroup, aOptions, aIsRemote, networkCreated,
+        aContextType == ChangeRemotenessContextType::PRESERVE);
+    if (NS_WARN_IF(!mFrameLoader)) {
+      aRv.Throw(NS_ERROR_FAILURE);
+      return;
+    }
+
+    aFrameLoaderInit();
+    if (NS_WARN_IF(aRv.Failed())) {
+      return;
+    }
+  }
+
+  const bool retainPaint = bfcacheEntry && mFrameLoader->IsRemoteFrame();
+  if (!retainPaint) {
+    MOZ_LOG(
+        gSHIPBFCacheLog, LogLevel::Debug,
+        ("Previous frameLoader not entering BFCache - not retaining paint data"
+         "(bfcacheEntry=%p, isRemoteFrame=%d)",
+         bfcacheEntry.get(), mFrameLoader->IsRemoteFrame()));
+  }
+
+  ChangeFrameLoaderCommon(owner, retainPaint);
+
+  UpdateFocusAndMouseEnterStateAfterFrameLoaderChange(owner);
+}
+
+void nsFrameLoaderOwner::ChangeFrameLoaderCommon(Element* aOwner,
+                                                 bool aRetainPaint) {
+  if (nsSubDocumentFrame* ourFrame = do_QueryFrame(aOwner->GetPrimaryFrame())) {
+    auto retain = aRetainPaint ? nsSubDocumentFrame::RetainPaintData::Yes
+                               : nsSubDocumentFrame::RetainPaintData::No;
+    ourFrame->ResetFrameLoader(retain);
+  }
+
+  if (aOwner->IsXULElement()) {
+    mozilla::AsyncEventDispatcher::RunDOMEventWhenSafe(
+        *aOwner, u"XULFrameLoaderCreated"_ns, mozilla::CanBubble::eYes,
+        mozilla::ChromeOnlyDispatch::eYes);
+  }
+
+  if (mFrameLoader) {
+    mFrameLoader->PropagateIsUnderHiddenEmbedderElement(
+        !aOwner->GetPrimaryFrame() ||
+        !aOwner->GetPrimaryFrame()->StyleVisibility()->IsVisible());
+  }
+}
+
+void nsFrameLoaderOwner::UpdateFocusAndMouseEnterStateAfterFrameLoaderChange() {
+  RefPtr<Element> owner = do_QueryObject(this);
+  UpdateFocusAndMouseEnterStateAfterFrameLoaderChange(owner);
+}
+
+void nsFrameLoaderOwner::UpdateFocusAndMouseEnterStateAfterFrameLoaderChange(
+    Element* aOwner) {
+  if (RefPtr<nsFocusManager> fm = nsFocusManager::GetFocusManager()) {
+    if (fm->GetFocusedElement() == aOwner) {
+      fm->FixUpFocusAfterFrameLoaderChange(*aOwner);
+    }
+  }
+
+  if (aOwner->GetPrimaryFrame()) {
+    EventStateManager* eventManager =
+        aOwner->GetPrimaryFrame()->PresContext()->EventStateManager();
+    eventManager->RecomputeMouseEnterStateForRemoteFrame(*aOwner);
+  }
+}
+
+void nsFrameLoaderOwner::ChangeRemoteness(
+    const mozilla::dom::RemotenessOptions& aOptions, mozilla::ErrorResult& rv) {
+  bool isRemote = !aOptions.mRemoteType.IsEmpty();
+
+  MOZ_RELEASE_ASSERT(mFrameLoader, "Expecting to have mFrameLoader here.");
+  std::function<void()> frameLoaderInit = [&] {
+    MOZ_RELEASE_ASSERT(mFrameLoader,
+                       "Expecting still to have mFrameLoader here.");
+    if (isRemote) {
+      mFrameLoader->ConfigRemoteProcess(aOptions.mRemoteType, nullptr);
+    }
+
+    if (aOptions.mPendingSwitchID.WasPassed()) {
+      mFrameLoader->ResumeLoad(aOptions.mPendingSwitchID.Value());
+    } else {
+      mFrameLoader->LoadFrame( false,
+                               false);
+    }
+  };
+
+  auto shouldPreserve = ShouldPreserveBrowsingContext(
+      isRemote,  false);
+  NavigationIsolationOptions options;
+  ChangeRemotenessCommon(shouldPreserve, options,
+                         aOptions.mSwitchingInProgressLoad, isRemote,
+                          nullptr, frameLoaderInit, rv);
+}
+
+void nsFrameLoaderOwner::ChangeRemotenessWithBridge(BrowserBridgeChild* aBridge,
+                                                    mozilla::ErrorResult& rv) {
+  MOZ_ASSERT(XRE_IsContentProcess());
+  if (NS_WARN_IF(!mFrameLoader)) {
+    rv.Throw(NS_ERROR_UNEXPECTED);
+    return;
+  }
+
+  std::function<void()> frameLoaderInit = [&] {
+    MOZ_DIAGNOSTIC_ASSERT(!mFrameLoader->mInitialized);
+    RefPtr<BrowserBridgeHost> host = aBridge->FinishInit(mFrameLoader);
+    mFrameLoader->mPendingBrowsingContext->SetEmbedderElement(
+        mFrameLoader->GetOwnerContent());
+    mFrameLoader->mRemoteBrowser = host;
+    mFrameLoader->mInitialized = true;
+  };
+
+  NavigationIsolationOptions options;
+  ChangeRemotenessCommon(ChangeRemotenessContextType::PRESERVE, options,
+                          true,
+                          true,  nullptr,
+                         frameLoaderInit, rv);
+}
+
+void nsFrameLoaderOwner::ChangeRemotenessToProcess(
+    ContentParent* aContentParent, const NavigationIsolationOptions& aOptions,
+    BrowsingContextGroup* aGroup, mozilla::ErrorResult& rv) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  MOZ_ASSERT_IF(aGroup, aOptions.mReplaceBrowsingContext);
+  bool isRemote = aContentParent != nullptr;
+
+  std::function<void()> frameLoaderInit = [&] {
+    if (isRemote) {
+      mFrameLoader->ConfigRemoteProcess(aContentParent->GetRemoteType(),
+                                        aContentParent);
+    }
+  };
+
+  auto shouldPreserve =
+      ShouldPreserveBrowsingContext(isRemote, aOptions.mReplaceBrowsingContext);
+  ChangeRemotenessCommon(shouldPreserve, aOptions,  true,
+                         isRemote, aGroup, frameLoaderInit, rv);
+}
+
+void nsFrameLoaderOwner::SubframeCrashed() {
+  MOZ_ASSERT(XRE_IsContentProcess());
+
+  std::function<void()> frameLoaderInit = [&] {
+    RefPtr<nsFrameLoader> frameLoader = mFrameLoader;
+    nsContentUtils::AddScriptRunner(NS_NewRunnableFunction(
+        "nsFrameLoaderOwner::SubframeCrashed", [frameLoader]() {
+          nsCOMPtr<nsIURI> uri;
+          nsresult rv = NS_NewURI(getter_AddRefs(uri), "about:blank");
+          if (NS_WARN_IF(NS_FAILED(rv))) {
+            return;
+          }
+
+          RefPtr<nsDocShell> docShell =
+              frameLoader->GetDocShell(IgnoreErrors());
+          if (NS_WARN_IF(!docShell)) {
+            return;
+          }
+          bool displayed = false;
+          docShell->DisplayLoadError(NS_ERROR_FRAME_CRASHED, uri,
+                                     u"about:blank", nullptr, &displayed);
+        }));
+  };
+
+  NavigationIsolationOptions options;
+  ChangeRemotenessCommon(ChangeRemotenessContextType::PRESERVE, options,
+                          false,  false,
+                          nullptr, frameLoaderInit, IgnoreErrors());
+}
+
+void nsFrameLoaderOwner::RestoreFrameLoaderFromBFCache(
+    nsFrameLoader* aNewFrameLoader) {
+  MOZ_LOG(gSHIPBFCacheLog, LogLevel::Debug,
+          ("nsFrameLoaderOwner::RestoreFrameLoaderFromBFCache: Replace "
+           "frameloader"));
+
+  Maybe<bool> renderLayers;
+  if (mFrameLoader) {
+    if (auto* oldParent = mFrameLoader->GetBrowserParent()) {
+      renderLayers.emplace(oldParent->GetRenderLayers());
+    }
+  }
+
+  mFrameLoader = aNewFrameLoader;
+
+  if (auto* browserParent = mFrameLoader->GetBrowserParent()) {
+    browserParent->AddWindowListeners();
+    if (renderLayers.isSome()) {
+      browserParent->SetRenderLayers(renderLayers.value());
+    }
+  }
+
+  RefPtr<Element> owner = do_QueryObject(this);
+  ChangeFrameLoaderCommon(owner,  false);
+}
+
+void nsFrameLoaderOwner::AttachFrameLoader(nsFrameLoader* aFrameLoader) {
+  mFrameLoaderList.insertBack(aFrameLoader);
+}
+
+void nsFrameLoaderOwner::DetachFrameLoader(nsFrameLoader* aFrameLoader) {
+  if (aFrameLoader->isInList()) {
+    MOZ_ASSERT(mFrameLoaderList.contains(aFrameLoader));
+    aFrameLoader->remove();
+  }
+}
+
+void nsFrameLoaderOwner::FrameLoaderDestroying(nsFrameLoader* aFrameLoader,
+                                               bool aDestroyBFCached) {
+  if (aFrameLoader == mFrameLoader) {
+    if (aDestroyBFCached) {
+      while (!mFrameLoaderList.isEmpty()) {
+        RefPtr<nsFrameLoader> loader = mFrameLoaderList.popFirst();
+        if (loader != mFrameLoader) {
+          loader->Destroy();
+        }
+      }
+    }
+  } else {
+    DetachFrameLoader(aFrameLoader);
+  }
+}

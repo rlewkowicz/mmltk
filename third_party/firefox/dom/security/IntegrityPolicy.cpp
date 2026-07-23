@@ -1,0 +1,451 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "IntegrityPolicy.h"
+
+#include "mozilla/Logging.h"
+#include "mozilla/StaticPrefs_security.h"
+#include "mozilla/dom/RequestBinding.h"
+#include "mozilla/dom/WindowGlobalChild.h"
+#include "mozilla/ipc/PBackgroundSharedTypes.h"
+#include "mozilla/net/SFV.h"
+#include "nsCOMPtr.h"
+#include "nsIClassInfoImpl.h"
+#include "nsIObjectInputStream.h"
+#include "nsIObjectOutputStream.h"
+#include "nsString.h"
+
+using namespace mozilla;
+
+static LazyLogModule sIntegrityPolicyLogModule("IntegrityPolicy");
+#define LOG(fmt, ...) \
+  MOZ_LOG_FMT(sIntegrityPolicyLogModule, LogLevel::Debug, fmt, ##__VA_ARGS__)
+
+namespace mozilla::dom {
+
+RequestDestination ContentTypeToDestination(nsContentPolicyType aType) {
+  switch (aType) {
+    case nsIContentPolicy::TYPE_INTERNAL_SCRIPT:
+    case nsIContentPolicy::TYPE_INTERNAL_SCRIPT_PRELOAD:
+    case nsIContentPolicy::TYPE_INTERNAL_MODULE:
+    case nsIContentPolicy::TYPE_INTERNAL_MODULE_PRELOAD:
+    case nsIContentPolicy::TYPE_INTERNAL_CHROMEUTILS_COMPILED_SCRIPT:
+    case nsIContentPolicy::TYPE_INTERNAL_FRAME_MESSAGEMANAGER_SCRIPT:
+    case nsIContentPolicy::TYPE_SCRIPT:
+      return RequestDestination::Script;
+
+    case nsIContentPolicy::TYPE_STYLESHEET:
+    case nsIContentPolicy::TYPE_INTERNAL_STYLESHEET:
+    case nsIContentPolicy::TYPE_INTERNAL_STYLESHEET_PRELOAD:
+      return RequestDestination::Style;
+
+    default:
+      return RequestDestination::_empty;
+  }
+}
+
+Maybe<IntegrityPolicy::DestinationType> DOMRequestDestinationToDestinationType(
+    RequestDestination aDestination) {
+  switch (aDestination) {
+    case RequestDestination::Script:
+      return Some(IntegrityPolicy::DestinationType::Script);
+    case RequestDestination::Style:
+      return StaticPrefs::security_integrity_policy_stylesheet_enabled()
+                 ? Some(IntegrityPolicy::DestinationType::Style)
+                 : Nothing{};
+
+    default:
+      return Nothing{};
+  }
+}
+
+Maybe<IntegrityPolicy::DestinationType>
+IntegrityPolicy::ContentTypeToDestinationType(nsContentPolicyType aType) {
+  return DOMRequestDestinationToDestinationType(
+      ContentTypeToDestination(aType));
+}
+
+nsresult GetTokenValuesFromInnerList(const net::SFV::InnerListResult& aList,
+                                     nsTArray<nsCString>& aValues) {
+  size_t len = aList.Length();
+  for (size_t i = 0; i < len; i++) {
+    auto item = aList.GetItemAt(i);
+    if (!item.IsValid()) {
+      return NS_ERROR_FAILURE;
+    }
+
+    nsAutoCString tokenValue;
+    nsresult rv = item.GetValue<net::SFV::Token>(tokenValue);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    aValues.AppendElement(tokenValue);
+  }
+
+  return NS_OK;
+}
+
+Result<IntegrityPolicy::Sources, nsresult> ParseSources(
+    const net::SFV::DictResult& aDict) {
+
+  auto innerList = aDict.GetInnerList("sources"_ns);
+  if (!innerList.IsValid()) {
+    return IntegrityPolicy::Sources(IntegrityPolicy::SourceType::Inline);
+  }
+
+  nsTArray<nsCString> sources;
+  nsresult rv = GetTokenValuesFromInnerList(innerList, sources);
+  NS_ENSURE_SUCCESS(rv, Err(rv));
+
+  IntegrityPolicy::Sources result;
+  for (const auto& source : sources) {
+    if (source.EqualsLiteral("inline")) {
+      result += IntegrityPolicy::SourceType::Inline;
+    } else {
+      LOG("ParseSources: Unknown source: {}", source.get());
+      continue;
+    }
+  }
+
+  return result;
+}
+
+Result<IntegrityPolicy::Destinations, nsresult>
+IntegrityPolicy::ParseDestinations(const net::SFV::DictResult& aDict,
+                                   bool aIsWAICT) {
+
+  auto innerList = aDict.GetInnerList("blocked-destinations"_ns);
+  if (!innerList.IsValid()) {
+    if (aIsWAICT) {
+      return Err(NS_ERROR_FAILURE);
+    }
+    return IntegrityPolicy::Destinations();
+  }
+
+  nsTArray<nsCString> destinations;
+  nsresult rv = GetTokenValuesFromInnerList(innerList, destinations);
+  NS_ENSURE_SUCCESS(rv, Err(rv));
+
+  IntegrityPolicy::Destinations result;
+  for (const auto& destination : destinations) {
+    if (destination.EqualsLiteral("script")) {
+      result += IntegrityPolicy::DestinationType::Script;
+    } else if (destination.EqualsLiteral("style")) {
+      if (StaticPrefs::security_integrity_policy_stylesheet_enabled()) {
+        result += IntegrityPolicy::DestinationType::Style;
+      }
+    } else if (aIsWAICT && destination.EqualsLiteral("image")) {
+      result += IntegrityPolicy::DestinationType::Image;
+    } else {
+      LOG("ParseDestinations: Unknown destination: {}", destination.get());
+      continue;
+    }
+  }
+
+  return result;
+}
+
+Result<nsTArray<nsCString>, nsresult> IntegrityPolicy::ParseEndpoints(
+    const net::SFV::DictResult& aDict) {
+  auto innerList = aDict.GetInnerList("endpoints"_ns);
+  if (!innerList.IsValid()) {
+    return nsTArray<nsCString>();
+  }
+
+  nsTArray<nsCString> endpoints;
+  nsresult rv = GetTokenValuesFromInnerList(innerList, endpoints);
+  NS_ENSURE_SUCCESS(rv, Err(rv));
+
+  return endpoints;
+}
+
+nsresult IntegrityPolicy::ParseHeaders(const nsACString& aHeader,
+                                       const nsACString& aHeaderRO,
+                                       IntegrityPolicy** aPolicy) {
+  if (!StaticPrefs::security_integrity_policy_enabled()) {
+    return NS_OK;
+  }
+
+  RefPtr<IntegrityPolicy> policy = new IntegrityPolicy();
+
+  LOG("[{}] Parsing headers: enforcement='{}' report-only='{}'",
+      static_cast<void*>(policy), PromiseFlatCString(aHeader).get(),
+      PromiseFlatCString(aHeaderRO).get());
+
+  for (const auto& isROHeader : {false, true}) {
+    const auto& headerString = isROHeader ? aHeaderRO : aHeader;
+
+    if (headerString.IsEmpty()) {
+      LOG("[{}] No {} header.", static_cast<void*>(policy),
+          isROHeader ? "report-only" : "enforcement");
+      continue;
+    }
+
+    auto dict = net::SFV::ParseDict(headerString);
+    if (!dict.IsValid()) {
+      LOG("[{}] Failed to parse {} header.", static_cast<void*>(policy),
+          isROHeader ? "report-only" : "enforcement");
+      continue;
+    }
+
+    auto sourcesResult = ParseSources(dict);
+    if (sourcesResult.isErr()) {
+      LOG("[{}] Failed to parse sources for {} header.",
+          static_cast<void*>(policy),
+          isROHeader ? "report-only" : "enforcement");
+      continue;
+    }
+
+    auto destinationsResult = ParseDestinations(dict,  false);
+    if (destinationsResult.isErr()) {
+      LOG("[{}] Failed to parse destinations for {} header.",
+          static_cast<void*>(policy),
+          isROHeader ? "report-only" : "enforcement");
+      continue;
+    }
+
+    auto endpointsResult = ParseEndpoints(dict);
+    if (endpointsResult.isErr()) {
+      LOG("[{}] Failed to parse endpoints for {} header.",
+          static_cast<void*>(policy),
+          isROHeader ? "report-only" : "enforcement");
+      continue;
+    }
+
+    LOG("[{}] Creating policy for {} header. sources={} destinations={} "
+        "endpoints=[{}]",
+        static_cast<void*>(policy), isROHeader ? "report-only" : "enforcement",
+        sourcesResult.unwrap().serialize(),
+        destinationsResult.unwrap().serialize(),
+        fmt::join(endpointsResult.unwrap(), ", "));
+
+    Entry entry = Entry(sourcesResult.unwrap(), destinationsResult.unwrap(),
+                        endpointsResult.unwrap());
+    if (isROHeader) {
+      policy->mReportOnly.emplace(entry);
+    } else {
+      policy->mEnforcement.emplace(entry);
+    }
+  }
+
+  policy.forget(aPolicy);
+
+  LOG("[{}] Finished parsing headers.", static_cast<void*>(policy));
+
+  return NS_OK;
+}
+
+void IntegrityPolicy::PolicyContains(DestinationType aDestination,
+                                     bool* aContains, bool* aROContains) const {
+  *aContains = false;
+  *aROContains = false;
+
+  if (mEnforcement && mEnforcement->mDestinations.contains(aDestination) &&
+      mEnforcement->mSources.contains(SourceType::Inline)) {
+    *aContains = true;
+  }
+
+  if (mReportOnly && mReportOnly->mDestinations.contains(aDestination) &&
+      mReportOnly->mSources.contains(SourceType::Inline)) {
+    *aROContains = true;
+  }
+}
+
+void IntegrityPolicy::Endpoints(nsTArray<nsCString>& aEnforcement,
+                                nsTArray<nsCString>& aReportOnly) const {
+  if (mEnforcement) {
+    aEnforcement = mEnforcement->mEndpoints.Clone();
+  }
+  if (mReportOnly) {
+    aReportOnly = mReportOnly->mEndpoints.Clone();
+  }
+}
+
+void IntegrityPolicy::ToArgs(const IntegrityPolicy* aPolicy,
+                             mozilla::ipc::IntegrityPolicyArgs& aArgs) {
+  aArgs.enforcement() = Nothing();
+  aArgs.reportOnly() = Nothing();
+
+  if (!aPolicy) {
+    return;
+  }
+
+  if (aPolicy->mEnforcement) {
+    mozilla::ipc::IntegrityPolicyEntry entry;
+    entry.sources() = aPolicy->mEnforcement->mSources;
+    entry.destinations() = aPolicy->mEnforcement->mDestinations;
+    entry.endpoints() = aPolicy->mEnforcement->mEndpoints.Clone();
+    aArgs.enforcement() = Some(entry);
+  }
+
+  if (aPolicy->mReportOnly) {
+    mozilla::ipc::IntegrityPolicyEntry entry;
+    entry.sources() = aPolicy->mReportOnly->mSources;
+    entry.destinations() = aPolicy->mReportOnly->mDestinations;
+    entry.endpoints() = aPolicy->mReportOnly->mEndpoints.Clone();
+    aArgs.reportOnly() = Some(entry);
+  }
+}
+
+void IntegrityPolicy::FromArgs(const mozilla::ipc::IntegrityPolicyArgs& aArgs,
+                               IntegrityPolicy** aPolicy) {
+  RefPtr<IntegrityPolicy> policy = new IntegrityPolicy();
+
+  if (aArgs.enforcement().isSome()) {
+    const auto& entry = *aArgs.enforcement();
+    policy->mEnforcement.emplace(Entry(entry.sources(), entry.destinations(),
+                                       entry.endpoints().Clone()));
+  }
+
+  if (aArgs.reportOnly().isSome()) {
+    const auto& entry = *aArgs.reportOnly();
+    policy->mReportOnly.emplace(Entry(entry.sources(), entry.destinations(),
+                                      entry.endpoints().Clone()));
+  }
+
+  policy.forget(aPolicy);
+}
+
+void IntegrityPolicy::InitFromOther(IntegrityPolicy* aOther) {
+  if (!aOther) {
+    return;
+  }
+
+  if (aOther->mEnforcement) {
+    mEnforcement.emplace(Entry(*aOther->mEnforcement));
+  }
+
+  if (aOther->mReportOnly) {
+    mReportOnly.emplace(Entry(*aOther->mReportOnly));
+  }
+}
+
+bool IntegrityPolicy::Equals(const IntegrityPolicy* aPolicy,
+                             const IntegrityPolicy* aOtherPolicy) {
+  if (aPolicy == aOtherPolicy) {
+    return true;
+  }
+
+  if (!aPolicy || !aOtherPolicy) {
+    return false;
+  }
+
+  if (!Entry::Equals(aPolicy->mEnforcement, aOtherPolicy->mEnforcement)) {
+    return false;
+  }
+
+  if (!Entry::Equals(aPolicy->mReportOnly, aOtherPolicy->mReportOnly)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool IntegrityPolicy::Entry::Equals(const Maybe<Entry>& aPolicy,
+                                    const Maybe<Entry>& aOtherPolicy) {
+  if (aPolicy.isSome() != aOtherPolicy.isSome()) {
+    return false;
+  }
+
+  if (aPolicy.isNothing() && aOtherPolicy.isNothing()) {
+    return true;
+  }
+
+  if (aPolicy->mSources != aOtherPolicy->mSources) {
+    return false;
+  }
+
+  if (aPolicy->mDestinations != aOtherPolicy->mDestinations) {
+    return false;
+  }
+
+  if (aPolicy->mEndpoints != aOtherPolicy->mEndpoints) {
+    return false;
+  }
+
+  return true;
+}
+
+constexpr static const uint32_t kIntegrityPolicySerializationVersion = 1;
+
+NS_IMETHODIMP
+IntegrityPolicy::Read(nsIObjectInputStream* aStream) {
+  uint32_t version;
+  MOZ_TRY(aStream->Read32(&version));
+
+  if (version != kIntegrityPolicySerializationVersion) {
+    LOG("IntegrityPolicy::Read: Unsupported version: {}", version);
+    return NS_ERROR_FAILURE;
+  }
+
+  for (const bool& isRO : {false, true}) {
+    bool hasPolicy;
+    MOZ_TRY(aStream->ReadBoolean(&hasPolicy));
+
+    if (!hasPolicy) {
+      continue;
+    }
+
+    uint32_t sources;
+    MOZ_TRY(aStream->Read32(&sources));
+
+    Sources sourcesSet;
+    sourcesSet.deserialize(sources);
+
+    uint32_t destinations;
+    MOZ_TRY(aStream->Read32(&destinations));
+
+    Destinations destinationsSet;
+    destinationsSet.deserialize(destinations);
+
+    uint32_t endpointsLen;
+    MOZ_TRY(aStream->Read32(&endpointsLen));
+
+    nsTArray<nsCString> endpoints(endpointsLen);
+    for (size_t endpointI = 0; endpointI < endpointsLen; endpointI++) {
+      nsCString endpoint;
+      MOZ_TRY(aStream->ReadCString(endpoint));
+      endpoints.AppendElement(std::move(endpoint));
+    }
+
+    Entry entry = Entry(sourcesSet, destinationsSet, std::move(endpoints));
+    if (isRO) {
+      mReportOnly.emplace(entry);
+    } else {
+      mEnforcement.emplace(entry);
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+IntegrityPolicy::Write(nsIObjectOutputStream* aStream) {
+  MOZ_TRY(aStream->Write32(kIntegrityPolicySerializationVersion));
+
+  for (const auto& entry : {mEnforcement, mReportOnly}) {
+    if (!entry) {
+      MOZ_TRY(aStream->WriteBoolean(false));
+      continue;
+    }
+
+    MOZ_TRY(aStream->WriteBoolean(true));
+
+    MOZ_TRY(aStream->Write32(entry->mSources.serialize()));
+    MOZ_TRY(aStream->Write32(entry->mDestinations.serialize()));
+
+    MOZ_TRY(aStream->Write32(entry->mEndpoints.Length()));
+    for (const auto& endpoint : entry->mEndpoints) {
+      MOZ_TRY(aStream->WriteCString(endpoint));
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMPL_CLASSINFO(IntegrityPolicy, nullptr, 0, NS_IINTEGRITYPOLICY_IID)
+NS_IMPL_ISUPPORTS_CI(IntegrityPolicy, nsIIntegrityPolicy, nsISerializable)
+
+}  
+
+#undef LOG

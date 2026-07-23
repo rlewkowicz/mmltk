@@ -1,0 +1,239 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_PendingStyles_h
+#define mozilla_PendingStyles_h
+
+#include "mozilla/EditorDOMPoint.h"
+#include "mozilla/EditorForwards.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/UniquePtr.h"
+#include "nsAtom.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsGkAtoms.h"
+#include "nsISupportsImpl.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nscore.h"
+
+class nsINode;
+
+namespace mozilla {
+namespace dom {
+class MouseEvent;
+class Selection;
+}  
+
+enum class SpecifiedStyle : uint8_t { Preserve, Discard };
+
+class PendingStyle final {
+ public:
+  PendingStyle() = delete;
+  PendingStyle(nsStaticAtom* aTag, nsAtom* aAttribute, const nsAString& aValue,
+               SpecifiedStyle aSpecifiedStyle = SpecifiedStyle::Preserve)
+      : mTag(aTag),
+        mAttribute(aAttribute != nsGkAtoms::_empty ? aAttribute : nullptr),
+        mAttributeValueOrCSSValue(aValue),
+        mSpecifiedStyle(aSpecifiedStyle) {
+    MOZ_COUNT_CTOR(PendingStyle);
+  }
+  MOZ_COUNTED_DTOR(PendingStyle)
+
+  MOZ_KNOWN_LIVE nsStaticAtom* GetTag() const { return mTag; }
+  MOZ_KNOWN_LIVE nsAtom* GetAttribute() const { return mAttribute; }
+  const nsString& AttributeValueOrCSSValueRef() const {
+    return mAttributeValueOrCSSValue;
+  }
+  void UpdateAttributeValueOrCSSValue(const nsAString& aNewValue) {
+    mAttributeValueOrCSSValue = aNewValue;
+  }
+  SpecifiedStyle GetSpecifiedStyle() const { return mSpecifiedStyle; }
+
+  EditorInlineStyle ToInlineStyle() const;
+  EditorInlineStyleAndValue ToInlineStyleAndValue() const;
+
+ private:
+  MOZ_KNOWN_LIVE nsStaticAtom* const mTag = nullptr;
+  MOZ_KNOWN_LIVE const RefPtr<nsAtom> mAttribute;
+  nsString mAttributeValueOrCSSValue;
+  const SpecifiedStyle mSpecifiedStyle = SpecifiedStyle::Preserve;
+};
+
+class PendingStyleCache final {
+ public:
+  PendingStyleCache() = delete;
+  PendingStyleCache(const nsStaticAtom& aTag, const nsStaticAtom* aAttribute,
+                    const nsAString& aValue)
+      : mTag(const_cast<nsStaticAtom&>(aTag)),
+        mAttribute(const_cast<nsStaticAtom*>(aAttribute)),
+        mAttributeValueOrCSSValue(aValue) {}
+  PendingStyleCache(const nsStaticAtom& aTag, const nsStaticAtom* aAttribute,
+                    nsAString&& aValue)
+      : mTag(const_cast<nsStaticAtom&>(aTag)),
+        mAttribute(const_cast<nsStaticAtom*>(aAttribute)),
+        mAttributeValueOrCSSValue(std::move(aValue)) {}
+
+  MOZ_KNOWN_LIVE nsStaticAtom& TagRef() const { return mTag; }
+  MOZ_KNOWN_LIVE nsStaticAtom* GetAttribute() const { return mAttribute; }
+  const nsString& AttributeValueOrCSSValueRef() const {
+    return mAttributeValueOrCSSValue;
+  }
+
+  EditorInlineStyle ToInlineStyle() const;
+
+ private:
+  MOZ_KNOWN_LIVE nsStaticAtom& mTag;
+  MOZ_KNOWN_LIVE nsStaticAtom* const mAttribute;
+  const nsString mAttributeValueOrCSSValue;
+};
+
+class MOZ_STACK_CLASS AutoPendingStyleCacheArray final
+    : public AutoTArray<PendingStyleCache, 21> {
+ public:
+  [[nodiscard]] index_type IndexOf(const nsStaticAtom& aTag,
+                                   const nsStaticAtom* aAttribute) const {
+    for (index_type index = 0; index < Length(); ++index) {
+      const PendingStyleCache& styleCache = ElementAt(index);
+      if (&styleCache.TagRef() == &aTag &&
+          styleCache.GetAttribute() == aAttribute) {
+        return index;
+      }
+    }
+    return NoIndex;
+  }
+
+  [[nodiscard]] bool Contains(const nsStaticAtom& aTag,
+                              const nsStaticAtom* aAttribute) const {
+    return IndexOf(aTag, aAttribute) != NoIndex;
+  }
+};
+
+enum class PendingStyleState {
+  NotUpdated,
+  BeingPreserved,
+  BeingCleared,
+};
+
+class PendingStyles final {
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(PendingStyles)
+  NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(PendingStyles)
+
+  PendingStyles() = default;
+
+  void Reset() {
+    mClearingStyles.Clear();
+    mPreservingStyles.Clear();
+  }
+
+  nsresult UpdateSelState(const HTMLEditor& aHTMLEditor);
+
+  void PreHandleMouseEvent(const dom::MouseEvent& aMouseDownOrUpEvent);
+
+  void PreHandleSelectionChangeCommand(Command aCommand);
+  void PostHandleSelectionChangeCommand(const HTMLEditor& aHTMLEditor,
+                                        Command aCommand);
+
+  void OnSelectionChange(const HTMLEditor& aHTMLEditor, int16_t aReason);
+
+  void PreserveStyle(nsStaticAtom& aHTMLProperty, nsAtom* aAttribute,
+                     const nsAString& aAttributeValueOrCSSValue);
+
+  void PreserveStyles(
+      const nsTArray<EditorInlineStyleAndValue>& aStylesToPreserve);
+
+  void PreserveStyle(const PendingStyleCache& aStyleToPreserve) {
+    PreserveStyle(aStyleToPreserve.TagRef(), aStyleToPreserve.GetAttribute(),
+                  aStyleToPreserve.AttributeValueOrCSSValueRef());
+  }
+
+  void ClearStyle(nsStaticAtom& aHTMLProperty, nsAtom* aAttribute) {
+    ClearStyleInternal(&aHTMLProperty, aAttribute);
+  }
+
+  void ClearStyles(const nsTArray<EditorInlineStyle>& aStylesToClear);
+
+  void ClearAllStyles() {
+    ClearStyleInternal(nullptr, nullptr);
+  }
+
+  void ClearLinkAndItsSpecifiedStyle() {
+    ClearStyleInternal(nsGkAtoms::a, nullptr, SpecifiedStyle::Discard);
+  }
+
+  UniquePtr<PendingStyle> TakeClearingStyle() {
+    if (mClearingStyles.IsEmpty()) {
+      return nullptr;
+    }
+    return mClearingStyles.PopLastElement();
+  }
+
+  void TakeAllPreservedStyles(
+      nsTArray<EditorInlineStyleAndValue>& aOutStylesAndValues);
+
+  int32_t TakeRelativeFontSize();
+
+  PendingStyleState GetStyleState(
+      nsStaticAtom& aHTMLProperty, nsAtom* aAttribute = nullptr,
+      nsString* aOutNewAttributeValueOrCSSValue = nullptr) const;
+
+ protected:
+  virtual ~PendingStyles() { Reset(); };
+
+  void ClearStyleInternal(
+      nsStaticAtom* aHTMLProperty, nsAtom* aAttribute,
+      SpecifiedStyle aSpecifiedStyle = SpecifiedStyle::Preserve);
+
+  void CancelPreservingStyle(nsStaticAtom* aHTMLProperty, nsAtom* aAttribute);
+  void CancelClearingStyle(nsStaticAtom& aHTMLProperty, nsAtom* aAttribute);
+
+  Maybe<size_t> IndexOfPreservingStyle(nsStaticAtom& aHTMLProperty,
+                                       nsAtom* aAttribute,
+                                       nsAString* aOutValue = nullptr) const {
+    return IndexOfStyleInArray(&aHTMLProperty, aAttribute, aOutValue,
+                               mPreservingStyles);
+  }
+  Maybe<size_t> IndexOfClearingStyle(nsStaticAtom* aHTMLProperty,
+                                     nsAtom* aAttribute) const {
+    return IndexOfStyleInArray(aHTMLProperty, aAttribute, nullptr,
+                               mClearingStyles);
+  }
+
+  bool IsLinkStyleSet() const {
+    return IndexOfPreservingStyle(*nsGkAtoms::a, nullptr).isSome();
+  }
+  bool IsExplicitlyLinkStyleCleared() const {
+    return IndexOfClearingStyle(nsGkAtoms::a, nullptr).isSome();
+  }
+  bool IsOnlyLinkStyleCleared() const {
+    return mClearingStyles.Length() == 1 && IsExplicitlyLinkStyleCleared();
+  }
+  bool IsStyleCleared(nsStaticAtom* aHTMLProperty, nsAtom* aAttribute) const {
+    return IndexOfClearingStyle(aHTMLProperty, aAttribute).isSome() ||
+           AreAllStylesCleared();
+  }
+  bool AreAllStylesCleared() const {
+    return IndexOfClearingStyle(nullptr, nullptr).isSome();
+  }
+  bool AreSomeStylesSet() const { return !mPreservingStyles.IsEmpty(); }
+  bool AreSomeStylesCleared() const { return !mClearingStyles.IsEmpty(); }
+
+  static Maybe<size_t> IndexOfStyleInArray(
+      nsStaticAtom* aHTMLProperty, nsAtom* aAttribute, nsAString* aOutValue,
+      const nsTArray<UniquePtr<PendingStyle>>& aArray);
+
+  nsTArray<UniquePtr<PendingStyle>> mPreservingStyles;
+  nsTArray<UniquePtr<PendingStyle>> mClearingStyles;
+  EditorDOMPoint mLastSelectionPoint;
+  int32_t mRelativeFontSize = 0;
+  Command mLastSelectionCommand = Command::DoNothing;
+  bool mMouseDownFiredInLinkElement = false;
+  bool mMouseUpFiredInLinkElement = false;
+};
+
+}  
+
+#endif  // #ifndef mozilla_PendingStyles_h

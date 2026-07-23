@@ -1,0 +1,50 @@
+
+
+#ifndef CATCH_REPORTER_XML_HPP_INCLUDED
+#define CATCH_REPORTER_XML_HPP_INCLUDED
+
+#include <catch2/reporters/catch_reporter_streaming_base.hpp>
+
+#include <catch2/internal/catch_xmlwriter.hpp>
+#include <catch2/catch_timer.hpp>
+
+namespace Catch {
+class XmlReporter : public StreamingReporterBase {
+   public:
+    XmlReporter(ReporterConfig&& _config);
+
+    ~XmlReporter() override;
+
+    static std::string getDescription();
+
+    virtual std::string getStylesheetRef() const;
+
+    void writeSourceInfo(SourceLineInfo const& sourceInfo);
+
+   public:
+    void testRunStarting(TestRunInfo const& testInfo) override;
+
+    void testCaseStarting(TestCaseInfo const& testInfo) override;
+
+    void sectionStarting(SectionInfo const& sectionInfo) override;
+
+    void assertionEnded(AssertionStats const& assertionStats) override;
+
+    void sectionEnded(SectionStats const& sectionStats) override;
+
+    void testCaseEnded(TestCaseStats const& testCaseStats) override;
+
+    void testRunEnded(TestRunStats const& testRunStats) override;
+
+    CATCH_REPORTER_BENCHMARK_OVERRIDES();
+    CATCH_REPORTER_LISTING_OVERRIDES();
+
+   private:
+    Timer m_testCaseTimer;
+    XmlWriter m_xml;
+    int m_sectionDepth = 0;
+};
+
+}  
+
+#endif  // CATCH_REPORTER_XML_HPP_INCLUDED

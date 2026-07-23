@@ -1,0 +1,819 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "InputBlockState.h"
+
+#include "APZUtils.h"
+#include "AsyncPanZoomController.h"  // for AsyncPanZoomController
+
+#include "mozilla/MouseEvents.h"
+#include "mozilla/StaticPrefs_apz.h"
+#include "mozilla/StaticPrefs_browser.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/StaticPrefs_mousewheel.h"
+#include "mozilla/ToString.h"
+#include "mozilla/layers/APZEventState.h"
+#include "mozilla/layers/IAPZCTreeManager.h"  // for AllowedTouchBehavior
+#include "OverscrollHandoffState.h"
+#include "QueuedInput.h"
+
+static mozilla::LazyLogModule sApzIbsLog("apz.inputstate");
+#define TBS_LOG(...) MOZ_LOG(sApzIbsLog, LogLevel::Debug, (__VA_ARGS__))
+
+namespace mozilla {
+namespace layers {
+
+static uint64_t sBlockCounter = InputBlockState::NO_BLOCK_ID + 1;
+
+InputBlockState::InputBlockState(
+    const RefPtr<AsyncPanZoomController>& aTargetApzc,
+    TargetConfirmationFlags aFlags)
+    : mTargetApzc(aTargetApzc),
+      mRequiresTargetConfirmation(aFlags.mRequiresTargetConfirmation),
+      mBlockId(sBlockCounter++),
+      mTransformToApzc(aTargetApzc->GetTransformToThis()) {
+  MOZ_ASSERT(mTargetApzc);
+  mOverscrollHandoffChain = mTargetApzc->BuildOverscrollHandoffChain();
+  bool startingDrag = StaticPrefs::apz_drag_enabled() && aFlags.mHitScrollThumb;
+  mTargetConfirmed = aFlags.mTargetConfirmed && !startingDrag
+                         ? TargetConfirmationState::eConfirmed
+                         : TargetConfirmationState::eUnconfirmed;
+}
+
+bool InputBlockState::SetConfirmedTargetApzc(
+    const RefPtr<AsyncPanZoomController>& aTargetApzc,
+    TargetConfirmationState aState, InputQueueIterator aFirstInput,
+    bool aForScrollbarDrag) {
+  MOZ_ASSERT(aState == TargetConfirmationState::eConfirmed ||
+             aState == TargetConfirmationState::eTimedOut);
+
+  if (AsDragBlock() && aForScrollbarDrag &&
+      mTargetConfirmed == TargetConfirmationState::eConfirmed &&
+      aState == TargetConfirmationState::eConfirmed && mTargetApzc &&
+      aTargetApzc && mTargetApzc->GetGuid() != aTargetApzc->GetGuid()) {
+    MOZ_ASSERT(false,
+               "APZ and main thread confirmed scrollbar drag block with "
+               "different targets");
+    UpdateTargetApzc(aTargetApzc);
+    return true;
+  }
+
+  if (mTargetConfirmed != TargetConfirmationState::eUnconfirmed) {
+    return false;
+  }
+  mTargetConfirmed = aState;
+
+  TBS_LOG("%p got confirmed target APZC %p\n", this, mTargetApzc.get());
+  if (mTargetApzc == aTargetApzc) {
+    return true;
+  }
+
+  TBS_LOG("%p replacing unconfirmed target %p with real target %p\n", this,
+          mTargetApzc.get(), aTargetApzc.get());
+
+  UpdateTargetApzc(aTargetApzc);
+  return true;
+}
+
+void InputBlockState::UpdateTargetApzc(
+    const RefPtr<AsyncPanZoomController>& aTargetApzc) {
+  if (mTargetApzc == aTargetApzc) {
+    MOZ_ASSERT_UNREACHABLE(
+        "The new target APZC should be different from the old one");
+    return;
+  }
+
+  if (mTargetApzc) {
+    mTargetApzc->SnapBackIfOverscrolled();
+
+    uint32_t i = mOverscrollHandoffChain->IndexOf(mTargetApzc) + 1;
+    for (; i < mOverscrollHandoffChain->Length(); i++) {
+      AsyncPanZoomController* apzc = mOverscrollHandoffChain->GetApzcAtIndex(i);
+      if (apzc != aTargetApzc) {
+        MOZ_ASSERT(!apzc->IsOverscrolled() ||
+                   apzc->IsOverscrollAnimationRunning());
+        apzc->SnapBackIfOverscrolled();
+      }
+    }
+  }
+
+  mTargetApzc = aTargetApzc;
+  mTransformToApzc = aTargetApzc ? aTargetApzc->GetTransformToThis()
+                                 : ScreenToParentLayerMatrix4x4();
+  mOverscrollHandoffChain =
+      (mTargetApzc ? mTargetApzc->BuildOverscrollHandoffChain() : nullptr);
+}
+
+const RefPtr<AsyncPanZoomController>& InputBlockState::GetTargetApzc() const {
+  return mTargetApzc;
+}
+
+const RefPtr<const OverscrollHandoffChain>&
+InputBlockState::GetOverscrollHandoffChain() const {
+  return mOverscrollHandoffChain;
+}
+
+uint64_t InputBlockState::GetBlockId() const { return mBlockId; }
+
+bool InputBlockState::IsTargetConfirmed() const {
+  return mTargetConfirmed != TargetConfirmationState::eUnconfirmed;
+}
+
+bool InputBlockState::ShouldDropEvents() const {
+  return mRequiresTargetConfirmation &&
+         (mTargetConfirmed != TargetConfirmationState::eConfirmed);
+}
+
+bool InputBlockState::IsDownchainOf(AsyncPanZoomController* aA,
+                                    AsyncPanZoomController* aB) const {
+  if (aA == aB) {
+    return true;
+  }
+
+  bool seenA = false;
+  for (size_t i = 0; i < mOverscrollHandoffChain->Length(); ++i) {
+    AsyncPanZoomController* apzc = mOverscrollHandoffChain->GetApzcAtIndex(i);
+    if (apzc == aB) {
+      return seenA;
+    }
+    if (apzc == aA) {
+      seenA = true;
+    }
+  }
+  return false;
+}
+
+void InputBlockState::SetScrolledApzc(AsyncPanZoomController* aApzc) {
+  MOZ_ASSERT(!mScrolledApzc || (StaticPrefs::apz_allow_immediate_handoff()
+                                    ? IsDownchainOf(mScrolledApzc, aApzc)
+                                    : mScrolledApzc == aApzc));
+
+  mScrolledApzc = aApzc;
+}
+
+AsyncPanZoomController* InputBlockState::GetScrolledApzc() const {
+  return mScrolledApzc;
+}
+
+bool InputBlockState::IsDownchainOfScrolledApzc(
+    AsyncPanZoomController* aApzc) const {
+  MOZ_ASSERT(aApzc && mScrolledApzc);
+
+  return IsDownchainOf(mScrolledApzc, aApzc);
+}
+
+void InputBlockState::DispatchEvent(const InputData& aEvent) const {
+  GetTargetApzc()->HandleInputEvent(aEvent, mTransformToApzc);
+}
+
+CancelableBlockState::CancelableBlockState(
+    const RefPtr<AsyncPanZoomController>& aTargetApzc,
+    TargetConfirmationFlags aFlags)
+    : InputBlockState(aTargetApzc, aFlags),
+      mPreventDefault(false),
+      mContentResponded(false),
+      mContentResponseTimerExpired(false),
+      mHasStateBeenReset(false) {}
+
+bool CancelableBlockState::SetContentResponse(bool aPreventDefault) {
+  if (mContentResponded) {
+    return false;
+  }
+  TBS_LOG("%p got content response %d with timer expired %d\n", this,
+          aPreventDefault, mContentResponseTimerExpired);
+  mPreventDefault = aPreventDefault;
+  mContentResponded = true;
+  return true;
+}
+
+bool CancelableBlockState::TimeoutContentResponse() {
+  if (mContentResponseTimerExpired) {
+    return false;
+  }
+  TBS_LOG("%p got content timer expired with response received %d\n", this,
+          mContentResponded);
+  if (!mContentResponded) {
+    mPreventDefault = false;
+  }
+  mContentResponseTimerExpired = true;
+  return true;
+}
+
+bool CancelableBlockState::IsContentResponseTimerExpired() const {
+  return mContentResponseTimerExpired;
+}
+
+bool CancelableBlockState::IsDefaultPrevented() const {
+  MOZ_ASSERT(mContentResponded || mContentResponseTimerExpired);
+  return mPreventDefault;
+}
+
+bool CancelableBlockState::IsReadyForHandling() const {
+  if (!IsTargetConfirmed()) {
+    return false;
+  }
+  return mContentResponded || mContentResponseTimerExpired;
+}
+
+bool CancelableBlockState::ShouldDropEvents() const {
+  return InputBlockState::ShouldDropEvents() || IsDefaultPrevented();
+}
+
+DragBlockState::DragBlockState(
+    const RefPtr<AsyncPanZoomController>& aTargetApzc,
+    TargetConfirmationFlags aFlags, const MouseInput& aInitialEvent)
+    : CancelableBlockState(aTargetApzc, aFlags), mReceivedMouseUp(false) {}
+
+bool DragBlockState::HasReceivedMouseUp() { return mReceivedMouseUp; }
+
+void DragBlockState::MarkMouseUpReceived() { mReceivedMouseUp = true; }
+
+void DragBlockState::SetInitialThumbPos(OuterCSSCoord aThumbPos) {
+  mInitialThumbPos = aThumbPos;
+}
+
+void DragBlockState::SetDragMetrics(const AsyncDragMetrics& aDragMetrics,
+                                    const CSSRect& aScrollableRect) {
+  mDragMetrics = aDragMetrics;
+  mInitialScrollableRect = aScrollableRect;
+}
+
+void DragBlockState::DispatchEvent(const InputData& aEvent) const {
+  MouseInput mouseInput = aEvent.AsMouseInput();
+  if (!mouseInput.TransformToLocal(mTransformToApzc)) {
+    return;
+  }
+
+  GetTargetApzc()->HandleDragEvent(mouseInput, mDragMetrics, mInitialThumbPos,
+                                   mInitialScrollableRect);
+}
+
+bool DragBlockState::MustStayActive() { return !mReceivedMouseUp; }
+
+const char* DragBlockState::Type() { return "drag"; }
+static uint64_t sLastWheelBlockId = InputBlockState::NO_BLOCK_ID;
+
+WheelBlockState::WheelBlockState(
+    const RefPtr<AsyncPanZoomController>& aTargetApzc,
+    TargetConfirmationFlags aFlags, const ScrollWheelInput& aInitialEvent)
+    : CancelableBlockState(aTargetApzc, aFlags),
+      mScrollSeriesCounter(0),
+      mTransactionEnded(false) {
+  sLastWheelBlockId = GetBlockId();
+
+  if (aFlags.mTargetConfirmed) {
+    RefPtr<AsyncPanZoomController> apzc =
+        mOverscrollHandoffChain->FindFirstScrollable(aInitialEvent,
+                                                     &mAllowedScrollDirections);
+
+    if (apzc) {
+      if (apzc != GetTargetApzc()) {
+        UpdateTargetApzc(apzc);
+      }
+    } else if (!mOverscrollHandoffChain->CanBePanned(
+                   mOverscrollHandoffChain->GetApzcAtIndex(0))) {
+      mIsScrollable = false;
+    } else {
+      EndTransaction();
+    }
+  }
+}
+
+bool WheelBlockState::SetContentResponse(bool aPreventDefault) {
+  if (aPreventDefault) {
+    EndTransaction();
+  }
+  return CancelableBlockState::SetContentResponse(aPreventDefault);
+}
+
+bool WheelBlockState::SetConfirmedTargetApzc(
+    const RefPtr<AsyncPanZoomController>& aTargetApzc,
+    TargetConfirmationState aState, InputQueueIterator aFirstInput,
+    bool aForScrollbarDrag) {
+  RefPtr<AsyncPanZoomController> apzc = aTargetApzc;
+  if (apzc && aFirstInput) {
+    auto handoffChain = apzc->BuildOverscrollHandoffChain();
+    apzc = handoffChain->FindFirstScrollable(*aFirstInput->Input(),
+                                             &mAllowedScrollDirections);
+
+    while (!apzc) {
+      ++aFirstInput;
+      if (!aFirstInput) break;
+      if (aFirstInput->Block() != this) {
+        continue;
+      }
+      apzc = handoffChain->FindFirstScrollable(*aFirstInput->Input(),
+                                               &mAllowedScrollDirections);
+    }
+  }
+
+  InputBlockState::SetConfirmedTargetApzc(apzc, aState, aFirstInput,
+                                          aForScrollbarDrag);
+  return true;
+}
+
+void WheelBlockState::Update(ScrollWheelInput& aEvent) {
+  if (!InTransaction()) {
+    return;
+  }
+
+  if (!mLastEventTime.IsNull() &&
+      (aEvent.mTimeStamp - mLastEventTime).ToMilliseconds() >
+          StaticPrefs::mousewheel_scroll_series_timeout()) {
+    mScrollSeriesCounter = 0;
+  }
+  aEvent.mScrollSeriesNumber = ++mScrollSeriesCounter;
+
+  RefPtr<AsyncPanZoomController> apzc = GetTargetApzc();
+  if (mIsScrollable && IsTargetConfirmed() && !apzc->CanScroll(aEvent)) {
+    return;
+  }
+
+  mLastEventTime = aEvent.mTimeStamp;
+  mLastMouseMove = TimeStamp();
+}
+
+Maybe<LayersId> WheelBlockState::WheelTransactionLayersId() const {
+  return (InTransaction() && TargetApzc()) ? Some(TargetApzc()->GetLayersId())
+                                           : Nothing();
+}
+
+bool WheelBlockState::MustStayActive() { return !mTransactionEnded; }
+
+const char* WheelBlockState::Type() { return "scroll wheel"; }
+
+bool WheelBlockState::ShouldAcceptNewEvent() const {
+  if (!InTransaction()) {
+    return false;
+  }
+
+  RefPtr<AsyncPanZoomController> apzc = GetTargetApzc();
+  if (apzc->IsDestroyed()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool WheelBlockState::MaybeTimeout(const ScrollWheelInput& aEvent) {
+  MOZ_ASSERT(InTransaction());
+
+  if (MaybeTimeout(aEvent.mTimeStamp)) {
+    return true;
+  }
+
+  if (!mLastMouseMove.IsNull()) {
+    TimeDuration duration = TimeStamp::Now() - mLastMouseMove;
+    if (duration.ToMilliseconds() >=
+        StaticPrefs::mousewheel_transaction_ignoremovedelay()) {
+      TBS_LOG("%p wheel transaction timed out after mouse move\n", this);
+      EndTransaction();
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool WheelBlockState::MaybeTimeout(const TimeStamp& aTimeStamp) {
+  MOZ_ASSERT(InTransaction());
+
+  TimeDuration duration = aTimeStamp - mLastEventTime;
+  if (duration.ToMilliseconds() <
+      StaticPrefs::mousewheel_transaction_timeout()) {
+    return false;
+  }
+
+  TBS_LOG("%p wheel transaction timed out\n", this);
+
+  EndTransaction();
+  return true;
+}
+
+void WheelBlockState::OnMouseMove(
+    const ScreenIntPoint& aPoint,
+    const Maybe<ScrollableLayerGuid>& aTargetGuid) {
+  MOZ_ASSERT(InTransaction());
+
+  if (!GetTargetApzc()->Contains(aPoint) ||
+      (!mIsScrollable && aTargetGuid.isSome() &&
+       aTargetGuid.value() != GetTargetApzc()->GetGuid())) {
+    EndTransaction();
+    return;
+  }
+
+  if (mLastMouseMove.IsNull()) {
+    TimeStamp now = TimeStamp::Now();
+    TimeDuration duration = now - mLastEventTime;
+    if (duration.ToMilliseconds() >=
+        StaticPrefs::mousewheel_transaction_ignoremovedelay()) {
+      mLastMouseMove = now;
+    }
+  }
+}
+
+void WheelBlockState::UpdateTargetApzc(
+    const RefPtr<AsyncPanZoomController>& aTargetApzc) {
+  InputBlockState::UpdateTargetApzc(aTargetApzc);
+
+  if (!GetTargetApzc()) {
+    EndTransaction();
+  }
+}
+
+bool WheelBlockState::InTransaction() const {
+  if (GetBlockId() != sLastWheelBlockId) {
+    return false;
+  }
+
+  if (mTransactionEnded) {
+    return false;
+  }
+
+  MOZ_ASSERT(GetTargetApzc());
+  return true;
+}
+
+bool WheelBlockState::AllowScrollHandoff() const {
+  return !IsTargetConfirmed() || !InTransaction();
+}
+
+void WheelBlockState::EndTransaction() {
+  TBS_LOG("%p ending wheel transaction\n", this);
+  mTransactionEnded = true;
+}
+
+PanGestureBlockState::PanGestureBlockState(
+    const RefPtr<AsyncPanZoomController>& aTargetApzc,
+    TargetConfirmationFlags aFlags, const PanGestureInput& aInitialEvent)
+    : CancelableBlockState(aTargetApzc, aFlags),
+      mInterrupted(false),
+      mWaitingForContentResponse(false),
+      mWaitingForBrowserGestureResponse(false),
+      mStartedBrowserGesture(false) {
+  if (aFlags.mTargetConfirmed) {
+    RefPtr<AsyncPanZoomController> apzc =
+        mOverscrollHandoffChain->FindFirstScrollable(aInitialEvent,
+                                                     &mAllowedScrollDirections);
+
+    if (apzc && apzc != GetTargetApzc()) {
+      UpdateTargetApzc(apzc);
+    }
+  }
+}
+
+bool PanGestureBlockState::SetConfirmedTargetApzc(
+    const RefPtr<AsyncPanZoomController>& aTargetApzc,
+    TargetConfirmationState aState, InputQueueIterator aFirstInput,
+    bool aForScrollbarDrag) {
+  RefPtr<AsyncPanZoomController> apzc = aTargetApzc;
+  if (apzc && aFirstInput) {
+    RefPtr<AsyncPanZoomController> scrollableApzc =
+        apzc->BuildOverscrollHandoffChain()->FindFirstScrollable(
+            *aFirstInput->Input(), &mAllowedScrollDirections);
+    if (scrollableApzc) {
+      apzc = scrollableApzc;
+    }
+  }
+
+  InputBlockState::SetConfirmedTargetApzc(apzc, aState, aFirstInput,
+                                          aForScrollbarDrag);
+  return true;
+}
+
+bool PanGestureBlockState::MustStayActive() { return !mInterrupted; }
+
+const char* PanGestureBlockState::Type() { return "pan gesture"; }
+
+bool PanGestureBlockState::SetContentResponse(bool aPreventDefault) {
+  if (aPreventDefault) {
+    TBS_LOG("%p setting interrupted flag\n", this);
+    mInterrupted = true;
+  }
+  bool stateChanged = CancelableBlockState::SetContentResponse(aPreventDefault);
+  if (mWaitingForContentResponse) {
+    mWaitingForContentResponse = false;
+    stateChanged = true;
+  }
+  return stateChanged;
+}
+
+bool PanGestureBlockState::IsReadyForHandling() const {
+  if (!CancelableBlockState::IsReadyForHandling()) {
+    return false;
+  }
+  return !mWaitingForBrowserGestureResponse &&
+         (!mWaitingForContentResponse || IsContentResponseTimerExpired());
+}
+
+bool PanGestureBlockState::ShouldDropEvents() const {
+  return CancelableBlockState::ShouldDropEvents() || mStartedBrowserGesture;
+}
+
+bool PanGestureBlockState::TimeoutContentResponse() {
+  mWaitingForBrowserGestureResponse = false;
+  return CancelableBlockState::TimeoutContentResponse();
+}
+
+bool PanGestureBlockState::AllowScrollHandoff() const { return false; }
+
+void PanGestureBlockState::SetNeedsToWaitForContentResponse(
+    bool aWaitForContentResponse) {
+  mWaitingForContentResponse = aWaitForContentResponse;
+}
+
+void PanGestureBlockState::SetNeedsToWaitForBrowserGestureResponse(
+    bool aWaitForBrowserGestureResponse) {
+  mWaitingForBrowserGestureResponse = aWaitForBrowserGestureResponse;
+}
+
+void PanGestureBlockState::SetBrowserGestureResponse(
+    BrowserGestureResponse aResponse) {
+  mWaitingForBrowserGestureResponse = false;
+  mStartedBrowserGesture = bool(aResponse);
+}
+
+Maybe<LayersId> PanGestureBlockState::WheelTransactionLayersId() const {
+  return TargetApzc() ? Some(TargetApzc()->GetLayersId()) : Nothing();
+}
+
+PinchGestureBlockState::PinchGestureBlockState(
+    const RefPtr<AsyncPanZoomController>& aTargetApzc,
+    TargetConfirmationFlags aFlags)
+    : CancelableBlockState(aTargetApzc, aFlags),
+      mInterrupted(false),
+      mWaitingForContentResponse(false) {}
+
+bool PinchGestureBlockState::MustStayActive() { return true; }
+
+const char* PinchGestureBlockState::Type() { return "pinch gesture"; }
+
+bool PinchGestureBlockState::SetContentResponse(bool aPreventDefault) {
+  if (aPreventDefault) {
+    TBS_LOG("%p setting interrupted flag\n", this);
+    mInterrupted = true;
+  }
+  bool stateChanged = CancelableBlockState::SetContentResponse(aPreventDefault);
+  if (mWaitingForContentResponse) {
+    mWaitingForContentResponse = false;
+    stateChanged = true;
+  }
+  return stateChanged;
+}
+
+bool PinchGestureBlockState::IsReadyForHandling() const {
+  if (!CancelableBlockState::IsReadyForHandling()) {
+    return false;
+  }
+  return !mWaitingForContentResponse || IsContentResponseTimerExpired();
+}
+
+void PinchGestureBlockState::SetNeedsToWaitForContentResponse(
+    bool aWaitForContentResponse) {
+  mWaitingForContentResponse = aWaitForContentResponse;
+}
+
+TouchBlockState::TouchBlockState(
+    const RefPtr<AsyncPanZoomController>& aTargetApzc,
+    TargetConfirmationFlags aFlags, TouchCounter& aCounter)
+    : CancelableBlockState(aTargetApzc, aFlags),
+      mAllowedTouchBehaviorSet(false),
+      mDuringFastFling(false),
+      mInSlop(false),
+      mForLongTap(false),
+      mLongTapWasProcessed(false),
+      mIsWaitingLongTapResult(false),
+      mNeedsWaitTouchMove(false),
+      mSingleTapState(apz::SingleTapState::NotClick),
+      mTouchCounter(aCounter),
+      mStartTime(GetTargetApzc()->GetFrameTime().Time()) {
+  mOriginalTargetConfirmedState = mTargetConfirmed;
+  TBS_LOG("Creating %p\n", this);
+}
+
+bool TouchBlockState::SetAllowedTouchBehaviors(
+    const nsTArray<TouchBehaviorFlags>& aBehaviors) {
+  if (mAllowedTouchBehaviorSet) {
+    return false;
+  }
+  TBS_LOG("%p got allowed touch behaviours for %zu points\n", this,
+          aBehaviors.Length());
+  mAllowedTouchBehaviors.AppendElements(aBehaviors);
+  mAllowedTouchBehaviorSet = true;
+  return true;
+}
+
+bool TouchBlockState::GetAllowedTouchBehaviors(
+    nsTArray<TouchBehaviorFlags>& aOutBehaviors) const {
+  if (!mAllowedTouchBehaviorSet) {
+    return false;
+  }
+  aOutBehaviors.AppendElements(mAllowedTouchBehaviors);
+  return true;
+}
+
+bool TouchBlockState::HasAllowedTouchBehaviors() const {
+  return mAllowedTouchBehaviorSet;
+}
+
+void TouchBlockState::CopyPropertiesFrom(const TouchBlockState& aOther) {
+  TBS_LOG("%p copying properties from %p\n", this, &aOther);
+  MOZ_ASSERT(aOther.mAllowedTouchBehaviorSet ||
+             aOther.IsContentResponseTimerExpired());
+  SetAllowedTouchBehaviors(aOther.mAllowedTouchBehaviors);
+  mTransformToApzc = aOther.mTransformToApzc;
+}
+
+bool TouchBlockState::IsReadyForHandling() const {
+  if (!CancelableBlockState::IsReadyForHandling()) {
+    return false;
+  }
+
+  if (mIsWaitingLongTapResult) {
+    return false;
+  }
+
+  return mAllowedTouchBehaviorSet || IsContentResponseTimerExpired();
+}
+
+void TouchBlockState::SetDuringFastFling() {
+  TBS_LOG("%p setting fast-motion flag\n", this);
+  mDuringFastFling = true;
+}
+
+bool TouchBlockState::IsDuringFastFling() const { return mDuringFastFling; }
+
+void TouchBlockState::SetSingleTapState(apz::SingleTapState aState) {
+  TBS_LOG("%p setting single-tap-state: %d\n", this,
+          static_cast<uint8_t>(aState));
+  mSingleTapState = aState;
+}
+
+bool TouchBlockState::MustStayActive() {
+  return !mForLongTap || !IsReadyForHandling();
+}
+
+const char* TouchBlockState::Type() { return "touch"; }
+
+TimeDuration TouchBlockState::GetTimeSinceBlockStart() const {
+  return GetTargetApzc()->GetFrameTime().Time() - mStartTime;
+}
+
+void TouchBlockState::DispatchEvent(const InputData& aEvent) const {
+  MOZ_ASSERT(aEvent.mInputType == MULTITOUCH_INPUT);
+  mTouchCounter.Update(aEvent.AsMultiTouchInput());
+  CancelableBlockState::DispatchEvent(aEvent);
+}
+
+bool TouchBlockState::TouchActionAllowsPinchZoom() const {
+  bool forceUserScalable = StaticPrefs::browser_ui_zoom_force_user_scalable();
+
+  for (auto& behavior : mAllowedTouchBehaviors) {
+    if (
+        !(behavior & AllowedTouchBehavior::PINCH_ZOOM) &&
+        !(behavior & AllowedTouchBehavior::ANIMATING_ZOOM) &&
+        !(behavior & AllowedTouchBehavior::VERTICAL_PAN) &&
+        !(behavior & AllowedTouchBehavior::HORIZONTAL_PAN)) {
+      return false;
+    }
+
+    if (forceUserScalable) {
+      return true;
+    }
+
+    if (!(behavior & AllowedTouchBehavior::PINCH_ZOOM)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool TouchBlockState::TouchActionAllowsDoubleTapZoom() const {
+  for (auto& behavior : mAllowedTouchBehaviors) {
+    if (!(behavior & AllowedTouchBehavior::ANIMATING_ZOOM)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool TouchBlockState::TouchActionAllowsPanningX() const {
+  if (mAllowedTouchBehaviors.IsEmpty()) {
+    return true;
+  }
+  TouchBehaviorFlags flags = mAllowedTouchBehaviors[0];
+  return (flags & AllowedTouchBehavior::HORIZONTAL_PAN);
+}
+
+bool TouchBlockState::TouchActionAllowsPanningY() const {
+  if (mAllowedTouchBehaviors.IsEmpty()) {
+    return true;
+  }
+  TouchBehaviorFlags flags = mAllowedTouchBehaviors[0];
+  return (flags & AllowedTouchBehavior::VERTICAL_PAN);
+}
+
+bool TouchBlockState::TouchActionAllowsPanningXY() const {
+  if (mAllowedTouchBehaviors.IsEmpty()) {
+    return true;
+  }
+  TouchBehaviorFlags flags = mAllowedTouchBehaviors[0];
+  return (flags & AllowedTouchBehavior::HORIZONTAL_PAN) &&
+         (flags & AllowedTouchBehavior::VERTICAL_PAN);
+}
+
+bool TouchBlockState::UpdateSlopState(const MultiTouchInput& aInput,
+                                      bool aApzcCanConsumeEvents) {
+  if (aInput.mType == MultiTouchInput::MULTITOUCH_START) {
+    mInSlop = (aInput.mTouches.Length() == 1);
+    if (mInSlop) {
+      mSlopOrigin = aInput.mTouches[0].mScreenPoint;
+      TBS_LOG("%p entering slop with origin %s\n", this,
+              ToString(mSlopOrigin).c_str());
+    }
+    return false;
+  }
+  if (mInSlop) {
+    ScreenCoord threshold = 0;
+    if (const RefPtr<AsyncPanZoomController>& apzc = GetTargetApzc()) {
+      threshold = aApzcCanConsumeEvents ? apzc->GetTouchStartTolerance()
+                                        : apzc->GetTouchMoveTolerance();
+    }
+    bool stayInSlop =
+        (aInput.mType == MultiTouchInput::MULTITOUCH_MOVE) &&
+        (aInput.mTouches.Length() == 1) &&
+        ((aInput.mTouches[0].mScreenPoint - mSlopOrigin).Length() < threshold);
+    if (!stayInSlop) {
+      TBS_LOG("%p exiting slop\n", this);
+      mInSlop = false;
+    }
+  }
+  return mInSlop;
+}
+
+TouchBlockState::InSlop TouchBlockState::IsInSlop() const {
+  return mInSlop ? InSlop::Yes : InSlop::No;
+}
+
+Maybe<ScrollDirection> TouchBlockState::GetBestGuessPanDirection(
+    const MultiTouchInput& aInput) const {
+  if (aInput.mType != MultiTouchInput::MULTITOUCH_MOVE ||
+      aInput.mTouches.Length() != 1) {
+    return Nothing();
+  }
+  RefPtr<AsyncPanZoomController> apzc = GetTargetApzc();
+  if (!apzc) {
+    return Nothing();
+  }
+  ScreenPoint screenVector =
+      ScreenPoint(aInput.mTouches[0].mScreenPoint - mSlopOrigin);
+  ParentLayerPoint vector =
+      apzc->ToParentLayerCoordinates(screenVector, ScreenPoint(mSlopOrigin));
+
+  double angleThreshold = TouchActionAllowsPanningXY()
+                              ? StaticPrefs::apz_axis_lock_lock_angle()
+                              : StaticPrefs::apz_axis_lock_direct_pan_angle();
+  if (apz::IsCloseToHorizontal(vector, angleThreshold)) {
+    return Some(ScrollDirection::eHorizontal);
+  }
+  if (apz::IsCloseToVertical(vector, angleThreshold)) {
+    return Some(ScrollDirection::eVertical);
+  }
+  return Nothing();
+}
+
+uint32_t TouchBlockState::GetActiveTouchCount() const {
+  return mTouchCounter.GetActiveTouchCount();
+}
+
+bool TouchBlockState::IsTargetOriginallyConfirmed() const {
+  return mOriginalTargetConfirmedState != TargetConfirmationState::eUnconfirmed;
+}
+
+bool TouchBlockState::NeedsContentResponseAfterLongTap(
+    const MultiTouchInput& aEvent, InSlop aWasInSlop) const {
+  if (aWasInSlop != InSlop::Yes) {
+    return false;
+  }
+  if (aEvent.mType != MultiTouchInput::MULTITOUCH_MOVE) {
+    return false;
+  }
+  if (!WasLongTapProcessed() && !IsWaitingLongTapResult()) {
+    return false;
+  }
+  if (IsTargetOriginallyConfirmed()) {
+    return false;
+  }
+  if (InputBlockState::ShouldDropEvents()) {
+    return false;
+  }
+  return !HasContentResponded() || !IsDefaultPrevented();
+}
+
+KeyboardBlockState::KeyboardBlockState(
+    const RefPtr<AsyncPanZoomController>& aTargetApzc)
+    : InputBlockState(aTargetApzc, TargetConfirmationFlags{true}) {}
+
+}  
+}  

@@ -1,0 +1,15 @@
+
+[package]
+edition = "2018"
+name = "uluru"
+version = "3.0.0"
+authors = ["The Servo Project Developers", "Matt Brubeck <mbrubeck@limpet.net>"]
+include = ["src/**/*", "LICENSE", "README.md"]
+description = "A simple, fast, LRU cache implementation"
+keywords = ["cache", "linkedlist", "array", "no_std"]
+categories = ["data-structures", "no-std"]
+license = "MPL-2.0"
+repository = "https://github.com/servo/uluru"
+[dependencies.arrayvec]
+version = "0.7"
+default-features = false

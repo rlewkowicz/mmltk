@@ -1,0 +1,125 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/Mutex.h"
+#include "nsCOMPtr.h"
+#include "nsITransport.h"
+#include "nsProxyRelease.h"
+#include "nsSocketTransportService2.h"
+#include "nsThreadUtils.h"
+#include "nsTransportUtils.h"
+
+using namespace mozilla;
+
+
+class nsTransportStatusEvent;
+
+class nsTransportEventSinkProxy : public nsITransportEventSink {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSITRANSPORTEVENTSINK
+
+  nsTransportEventSinkProxy(nsITransportEventSink* sink, nsIEventTarget* target)
+      : mSink(sink),
+        mTarget(target),
+        mLock("nsTransportEventSinkProxy.mLock") {}
+
+ private:
+  virtual ~nsTransportEventSinkProxy() {
+    NS_ProxyRelease("nsTransportEventSinkProxy::mSink", mTarget,
+                    mSink.forget());
+  }
+
+ public:
+  nsCOMPtr<nsITransportEventSink> mSink;
+  nsCOMPtr<nsIEventTarget> mTarget;
+  Mutex mLock;
+  RefPtr<nsTransportStatusEvent> mLastEvent MOZ_GUARDED_BY(mLock);
+};
+
+class nsTransportStatusEvent : public Runnable {
+ public:
+  nsTransportStatusEvent(nsTransportEventSinkProxy* proxy,
+                         nsITransport* transport, nsresult status,
+                         int64_t progress, int64_t progressMax)
+      : Runnable("nsTransportStatusEvent"),
+        mProxy(proxy),
+        mTransport(transport),
+        mStatus(status),
+        mProgress(progress),
+        mProgressMax(progressMax) {}
+
+  ~nsTransportStatusEvent() {
+    auto ReleaseTransport = [transport(std::move(mTransport))]() mutable {};
+    if (!net::OnSocketThread()) {
+      net::gSocketTransportService->Dispatch(NS_NewRunnableFunction(
+          "nsHttpConnection::~nsHttpConnection", std::move(ReleaseTransport)));
+    }
+  }
+
+  NS_IMETHOD Run() override {
+    {
+      MutexAutoLock lock(mProxy->mLock);
+      if (mProxy->mLastEvent == this) {
+        mProxy->mLastEvent = nullptr;
+      }
+    }
+
+    mProxy->mSink->OnTransportStatus(mTransport, mStatus, mProgress,
+                                     mProgressMax);
+    mProxy = nullptr;
+    return NS_OK;
+  }
+
+  RefPtr<nsTransportEventSinkProxy> mProxy;
+
+  nsCOMPtr<nsITransport> mTransport;
+  nsresult mStatus;
+  int64_t mProgress;
+  int64_t mProgressMax;
+};
+
+NS_IMPL_ISUPPORTS(nsTransportEventSinkProxy, nsITransportEventSink)
+
+NS_IMETHODIMP
+nsTransportEventSinkProxy::OnTransportStatus(nsITransport* transport,
+                                             nsresult status, int64_t progress,
+                                             int64_t progressMax) {
+  nsresult rv = NS_OK;
+  RefPtr<nsTransportStatusEvent> event;
+  {
+    MutexAutoLock lock(mLock);
+
+    if (mLastEvent && (mLastEvent->mStatus == status)) {
+      mLastEvent->mStatus = status;
+      mLastEvent->mProgress = progress;
+      mLastEvent->mProgressMax = progressMax;
+    } else {
+      event = new nsTransportStatusEvent(this, transport, status, progress,
+                                         progressMax);
+      if (!event) rv = NS_ERROR_OUT_OF_MEMORY;
+      mLastEvent = event;  
+    }
+  }
+  if (event) {
+    rv = mTarget->Dispatch(event, NS_DISPATCH_NORMAL);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("unable to post transport status event");
+
+      MutexAutoLock lock(mLock);  
+      mLastEvent = nullptr;
+    }
+  }
+  return rv;
+}
+
+
+nsresult net_NewTransportEventSinkProxy(nsITransportEventSink** result,
+                                        nsITransportEventSink* sink,
+                                        nsIEventTarget* target) {
+  RefPtr<nsTransportEventSinkProxy> res =
+      new nsTransportEventSinkProxy(sink, target);
+  res.forget(result);
+  return NS_OK;
+}

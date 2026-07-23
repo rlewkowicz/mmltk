@@ -1,0 +1,1019 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsBMPDecoder.h"
+
+#include <stdlib.h>
+
+#include <algorithm>
+
+#include "ImageLogging.h"
+#include "RasterImage.h"
+#include "SurfacePipeFactory.h"
+#include "gfxPlatform.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/EndianUtils.h"
+#include "mozilla/UniquePtrExtensions.h"
+
+using namespace mozilla::gfx;
+
+namespace mozilla {
+namespace image {
+namespace bmp {
+
+struct Compression {
+  enum { RGB = 0, RLE8 = 1, RLE4 = 2, BITFIELDS = 3 };
+};
+
+struct RLE {
+  enum {
+    ESCAPE = 0,
+    ESCAPE_EOL = 0,
+    ESCAPE_EOF = 1,
+    ESCAPE_DELTA = 2,
+
+    SEGMENT_LENGTH = 2,
+    DELTA_LENGTH = 2
+  };
+};
+
+}  
+
+using namespace bmp;
+
+static double FixedPoint2Dot30_To_Double(uint32_t aFixed) {
+  constexpr double factor = 1.0 / 1073741824.0;  
+  return double(aFixed) * factor;
+}
+
+static float FixedPoint16Dot16_To_Float(uint32_t aFixed) {
+  constexpr double factor = 1.0 / 65536.0;  
+  return double(aFixed) * factor;
+}
+
+static float CalRbgEndpointToQcms(const CalRgbEndpoint& aIn,
+                                  qcms_CIE_xyY& aOut) {
+  aOut.x = FixedPoint2Dot30_To_Double(aIn.mX);
+  aOut.y = FixedPoint2Dot30_To_Double(aIn.mY);
+  aOut.Y = FixedPoint2Dot30_To_Double(aIn.mZ);
+  return FixedPoint16Dot16_To_Float(aIn.mGamma);
+}
+
+static void ReadCalRgbEndpoint(const char* aData, uint32_t aEndpointOffset,
+                               uint32_t aGammaOffset, CalRgbEndpoint& aOut) {
+  aOut.mX = LittleEndian::readUint32(aData + aEndpointOffset);
+  aOut.mY = LittleEndian::readUint32(aData + aEndpointOffset + 4);
+  aOut.mZ = LittleEndian::readUint32(aData + aEndpointOffset + 8);
+  aOut.mGamma = LittleEndian::readUint32(aData + aGammaOffset);
+}
+
+static void SetPixel(uint32_t*& aDecoded, uint8_t aRed, uint8_t aGreen,
+                     uint8_t aBlue, uint8_t aAlpha = 0xFF) {
+  *aDecoded++ = gfxPackedPixelNoPreMultiply(aAlpha, aRed, aGreen, aBlue);
+}
+
+static void SetPixel(uint32_t*& aDecoded, uint8_t idx,
+                     const UniquePtr<ColorTableEntry[]>& aColors) {
+  SetPixel(aDecoded, aColors[idx].mRed, aColors[idx].mGreen,
+           aColors[idx].mBlue);
+}
+
+static void Set4BitPixel(uint32_t*& aDecoded, uint8_t aData, uint32_t& aCount,
+                         const UniquePtr<ColorTableEntry[]>& aColors) {
+  uint8_t idx = aData >> 4;
+  SetPixel(aDecoded, idx, aColors);
+  if (--aCount > 0) {
+    idx = aData & 0xF;
+    SetPixel(aDecoded, idx, aColors);
+    --aCount;
+  }
+}
+
+static mozilla::LazyLogModule sBMPLog("BMPDecoder");
+
+static const uint32_t BIHSIZE_FIELD_LENGTH = 4;
+
+nsBMPDecoder::nsBMPDecoder(RasterImage* aImage, State aState, size_t aLength,
+                           bool aForClipboard)
+    : Decoder(aImage),
+      mLexer(Transition::To(aState, aLength), Transition::TerminateSuccess()),
+      mIsWithinICO(false),
+      mIsForClipboard(aForClipboard),
+      mMayHaveTransparency(false),
+      mDoesHaveTransparency(false),
+      mNumColors(0),
+      mColors(nullptr),
+      mBytesPerColor(0),
+      mPreGapLength(0),
+      mPixelRowSize(0),
+      mCurrentRow(0),
+      mCurrentPos(0),
+      mAbsoluteModeNumPixels(0) {}
+
+nsBMPDecoder::nsBMPDecoder(RasterImage* aImage, bool aForClipboard)
+    : nsBMPDecoder(aImage,
+                   aForClipboard ? State::INFO_HEADER_SIZE : State::FILE_HEADER,
+                   aForClipboard ? BIHSIZE_FIELD_LENGTH : FILE_HEADER_LENGTH,
+                   aForClipboard) {}
+
+nsBMPDecoder::nsBMPDecoder(RasterImage* aImage, uint32_t aDataOffset)
+    : nsBMPDecoder(aImage, State::INFO_HEADER_SIZE, BIHSIZE_FIELD_LENGTH,
+                    false) {
+  SetIsWithinICO();
+
+  mPreGapLength += FILE_HEADER_LENGTH;
+
+  mH.mDataOffset = aDataOffset;
+}
+
+nsBMPDecoder::~nsBMPDecoder() = default;
+
+uint32_t nsBMPDecoder::GetCompressedImageSize() const {
+  MOZ_ASSERT(mPixelRowSize != 0);
+  return mH.mCompression == Compression::RGB ? mPixelRowSize * AbsoluteHeight()
+                                             : mH.mImageSize;
+}
+
+nsresult nsBMPDecoder::BeforeFinishInternal() {
+  if (!IsMetadataDecode() && !mImageData) {
+    return NS_ERROR_FAILURE;  
+  }
+
+  return NS_OK;
+}
+
+nsresult nsBMPDecoder::FinishInternal() {
+  MOZ_ASSERT(!HasError(), "Can't call FinishInternal on error!");
+
+  MOZ_ASSERT(GetFrameCount() <= 1, "Multiple BMP frames?");
+
+  if (!IsMetadataDecode() && HasSize()) {
+    MOZ_ASSERT(mImageData);
+
+    while (mCurrentRow > 0) {
+      uint32_t* dst = RowBuffer();
+      while (mCurrentPos < mH.mWidth) {
+        SetPixel(dst, 0, 0, 0);
+        mCurrentPos++;
+      }
+      mCurrentPos = 0;
+      FinishRow();
+    }
+
+    MOZ_ASSERT_IF(mDoesHaveTransparency, mMayHaveTransparency);
+
+    const Opacity opacity = mDoesHaveTransparency || mIsWithinICO
+                                ? Opacity::SOME_TRANSPARENCY
+                                : Opacity::FULLY_OPAQUE;
+
+    PostFrameStop(opacity);
+    PostDecodeDone();
+  }
+
+  return NS_OK;
+}
+
+
+void BitFields::Value::Set(uint32_t aMask) {
+  mMask = aMask;
+
+  if (mMask == 0x0) {
+    mRightShift = 0;
+    mBitWidth = 1;
+    return;
+  }
+
+  uint8_t i;
+  for (i = 0; i < 32; i++) {
+    if (mMask & (1 << i)) {
+      break;
+    }
+  }
+  mRightShift = i;
+
+  for (i = i + 1; i < 32; i++) {
+    if (!(mMask & (1 << i))) {
+      break;
+    }
+  }
+  mBitWidth = i - mRightShift;
+}
+
+MOZ_ALWAYS_INLINE uint8_t BitFields::Value::Get(uint32_t aValue) const {
+  uint32_t v = (aValue & mMask) >> mRightShift;
+
+  uint8_t v2 = 0;
+  int32_t i;  
+  for (i = 8 - mBitWidth; i > 0; i -= mBitWidth) {
+    v2 |= v << uint32_t(i);
+  }
+  v2 |= v >> uint32_t(-i);
+  return v2;
+}
+
+MOZ_ALWAYS_INLINE uint8_t BitFields::Value::GetAlpha(uint32_t aValue,
+                                                     bool& aHasAlphaOut) const {
+  if (mMask == 0x0) {
+    return 0xff;
+  }
+  aHasAlphaOut = true;
+  return Get(aValue);
+}
+
+MOZ_ALWAYS_INLINE uint8_t BitFields::Value::Get5(uint32_t aValue) const {
+  MOZ_ASSERT(mBitWidth == 5);
+  uint32_t v = (aValue & mMask) >> mRightShift;
+  return (v << 3u) | (v >> 2u);
+}
+
+MOZ_ALWAYS_INLINE uint8_t BitFields::Value::Get8(uint32_t aValue) const {
+  MOZ_ASSERT(mBitWidth == 8);
+  uint32_t v = (aValue & mMask) >> mRightShift;
+  return v;
+}
+
+void BitFields::SetR5G5B5() {
+  mRed.Set(0x7c00);
+  mGreen.Set(0x03e0);
+  mBlue.Set(0x001f);
+}
+
+void BitFields::SetR8G8B8() {
+  mRed.Set(0xff0000);
+  mGreen.Set(0xff00);
+  mBlue.Set(0x00ff);
+}
+
+bool BitFields::IsR5G5B5() const {
+  return mRed.mBitWidth == 5 && mGreen.mBitWidth == 5 && mBlue.mBitWidth == 5 &&
+         mAlpha.mMask == 0x0;
+}
+
+bool BitFields::IsR8G8B8() const {
+  return mRed.mBitWidth == 8 && mGreen.mBitWidth == 8 && mBlue.mBitWidth == 8 &&
+         mAlpha.mMask == 0x0;
+}
+
+uint32_t* nsBMPDecoder::RowBuffer() { return mRowBuffer.get() + mCurrentPos; }
+
+void nsBMPDecoder::ClearRowBufferRemainder() {
+  int32_t len = mH.mWidth - mCurrentPos;
+  memset(RowBuffer(), mMayHaveTransparency ? 0 : 0xFF, len * sizeof(uint32_t));
+}
+
+void nsBMPDecoder::FinishRow() {
+  mPipe.WriteBuffer(mRowBuffer.get());
+  Maybe<SurfaceInvalidRect> invalidRect = mPipe.TakeInvalidRect();
+  if (invalidRect) {
+    PostInvalidation(invalidRect->mInputSpaceRect,
+                     Some(invalidRect->mOutputSpaceRect));
+  }
+  mCurrentRow--;
+}
+
+LexerResult nsBMPDecoder::DoDecode(SourceBufferIterator& aIterator,
+                                   IResumable* aOnResume) {
+  MOZ_ASSERT(!HasError(), "Shouldn't call DoDecode after error!");
+
+  return mLexer.Lex(
+      aIterator, aOnResume,
+      [this](State aState, const char* aData, size_t aLength) {
+        switch (aState) {
+          case State::FILE_HEADER:
+            return ReadFileHeader(aData, aLength);
+          case State::INFO_HEADER_SIZE:
+            return ReadInfoHeaderSize(aData, aLength);
+          case State::INFO_HEADER_REST:
+            return ReadInfoHeaderRest(aData, aLength);
+          case State::BITFIELDS:
+            return ReadBitfields(aData, aLength);
+          case State::SKIP_TO_COLOR_PROFILE:
+            return Transition::ContinueUnbuffered(State::SKIP_TO_COLOR_PROFILE);
+          case State::FOUND_COLOR_PROFILE:
+            return Transition::To(State::COLOR_PROFILE,
+                                  mH.mColorSpace.mProfile.mLength);
+          case State::COLOR_PROFILE:
+            return ReadColorProfile(aData, aLength);
+          case State::ALLOCATE_SURFACE:
+            return AllocateSurface();
+          case State::COLOR_TABLE:
+            return ReadColorTable(aData, aLength);
+          case State::GAP:
+            return SkipGap();
+          case State::AFTER_GAP:
+            return AfterGap();
+          case State::PIXEL_ROW:
+            return ReadPixelRow(aData);
+          case State::RLE_SEGMENT:
+            return ReadRLESegment(aData);
+          case State::RLE_DELTA:
+            return ReadRLEDelta(aData);
+          case State::RLE_ABSOLUTE:
+            return ReadRLEAbsolute(aData, aLength);
+          default:
+            MOZ_CRASH("Unknown State");
+        }
+      });
+}
+
+LexerTransition<nsBMPDecoder::State> nsBMPDecoder::ReadFileHeader(
+    const char* aData, size_t aLength) {
+  mPreGapLength += aLength;
+
+  bool signatureOk = aData[0] == 'B' && aData[1] == 'M';
+  if (!signatureOk) {
+    return Transition::TerminateFailure();
+  }
+
+
+  mH.mDataOffset = LittleEndian::readUint32(aData + 10);
+
+  return Transition::To(State::INFO_HEADER_SIZE, BIHSIZE_FIELD_LENGTH);
+}
+
+LexerTransition<nsBMPDecoder::State> nsBMPDecoder::ReadInfoHeaderSize(
+    const char* aData, size_t aLength) {
+  mH.mBIHSize = LittleEndian::readUint32(aData);
+
+  if (!mIsForClipboard && mH.mDataOffset < mPreGapLength + mH.mBIHSize) {
+    mH.mDataOffset = mPreGapLength + mH.mBIHSize;
+  }
+
+  mPreGapLength += aLength;
+
+  bool bihSizeOk = mH.mBIHSize == InfoHeaderLength::WIN_V2 ||
+                   mH.mBIHSize == InfoHeaderLength::WIN_V3 ||
+                   mH.mBIHSize == InfoHeaderLength::BITMAPV2INFOHEADER ||
+                   mH.mBIHSize == InfoHeaderLength::BITMAPV3INFOHEADER ||
+                   mH.mBIHSize == InfoHeaderLength::WIN_V4 ||
+                   mH.mBIHSize == InfoHeaderLength::WIN_V5 ||
+                   (mH.mBIHSize >= InfoHeaderLength::OS2_V2_MIN &&
+                    mH.mBIHSize <= InfoHeaderLength::OS2_V2_MAX);
+  if (!bihSizeOk) {
+    return Transition::TerminateFailure();
+  }
+  MOZ_ASSERT_IF(mIsWithinICO, mH.mBIHSize == InfoHeaderLength::WIN_V3);
+
+  return Transition::To(State::INFO_HEADER_REST,
+                        mH.mBIHSize - BIHSIZE_FIELD_LENGTH);
+}
+
+LexerTransition<nsBMPDecoder::State> nsBMPDecoder::ReadInfoHeaderRest(
+    const char* aData, size_t aLength) {
+  mPreGapLength += aLength;
+
+  if (mH.mBIHSize == InfoHeaderLength::WIN_V2) {
+    mH.mWidth = LittleEndian::readUint16(aData + 0);
+    mH.mHeight = LittleEndian::readUint16(aData + 2);
+    mH.mBpp = LittleEndian::readUint16(aData + 6);
+  } else {
+    mH.mWidth = LittleEndian::readUint32(aData + 0);
+    mH.mHeight = LittleEndian::readUint32(aData + 4);
+    mH.mBpp = LittleEndian::readUint16(aData + 10);
+
+    mH.mCompression = aLength >= 16 ? LittleEndian::readUint32(aData + 12) : 0;
+    mH.mImageSize = aLength >= 20 ? LittleEndian::readUint32(aData + 16) : 0;
+    mH.mNumColors = aLength >= 32 ? LittleEndian::readUint32(aData + 28) : 0;
+
+    mH.mCsType =
+        aLength >= 56
+            ? static_cast<InfoColorSpace>(LittleEndian::readUint32(aData + 52))
+            : InfoColorSpace::SRGB;
+    mH.mCsIntent = aLength >= 108 ? static_cast<InfoColorIntent>(
+                                        LittleEndian::readUint32(aData + 104))
+                                  : InfoColorIntent::IMAGES;
+
+    switch (mH.mCsType) {
+      case InfoColorSpace::CALIBRATED_RGB:
+        if (aLength >= 104) {
+          ReadCalRgbEndpoint(aData, 56, 92, mH.mColorSpace.mCalibrated.mRed);
+          ReadCalRgbEndpoint(aData, 68, 96, mH.mColorSpace.mCalibrated.mGreen);
+          ReadCalRgbEndpoint(aData, 80, 100, mH.mColorSpace.mCalibrated.mBlue);
+        } else {
+          mH.mCsType = InfoColorSpace::SRGB;
+        }
+        break;
+      case InfoColorSpace::EMBEDDED:
+        if (aLength >= 116) {
+          mH.mColorSpace.mProfile.mOffset =
+              LittleEndian::readUint32(aData + 108);
+          mH.mColorSpace.mProfile.mLength =
+              LittleEndian::readUint32(aData + 112);
+        } else {
+          mH.mCsType = InfoColorSpace::SRGB;
+        }
+        break;
+      case InfoColorSpace::LINKED:
+      case InfoColorSpace::SRGB:
+      case InfoColorSpace::WIN:
+      default:
+        break;
+    }
+
+  }
+
+  if (mIsWithinICO) {
+    mH.mHeight = abs(mH.mHeight) / 2;
+  }
+
+  MOZ_LOG(sBMPLog, LogLevel::Debug,
+          ("BMP: bihsize=%u, %d x %d, bpp=%u, compression=%u, colors=%u, "
+           "data-offset=%u\n",
+           mH.mBIHSize, mH.mWidth, mH.mHeight, uint32_t(mH.mBpp),
+           mH.mCompression, mH.mNumColors, mH.mDataOffset));
+
+  const int32_t k64KWidth = 0x0000FFFF;
+  bool sizeOk =
+      0 <= mH.mWidth && mH.mWidth <= k64KWidth && mH.mHeight != INT_MIN;
+  if (!sizeOk) {
+    return Transition::TerminateFailure();
+  }
+
+  bool bppCompressionOk =
+      (mH.mCompression == Compression::RGB &&
+       (mH.mBpp == 1 || mH.mBpp == 4 || mH.mBpp == 8 || mH.mBpp == 16 ||
+        mH.mBpp == 24 || mH.mBpp == 32)) ||
+      (mH.mCompression == Compression::RLE8 && mH.mBpp == 8) ||
+      (mH.mCompression == Compression::RLE4 && mH.mBpp == 4) ||
+      (mH.mCompression == Compression::BITFIELDS &&
+       (mH.mBIHSize == InfoHeaderLength::WIN_V3 ||
+        mH.mBIHSize == InfoHeaderLength::BITMAPV2INFOHEADER ||
+        mH.mBIHSize == InfoHeaderLength::BITMAPV3INFOHEADER ||
+        mH.mBIHSize == InfoHeaderLength::WIN_V4 ||
+        mH.mBIHSize == InfoHeaderLength::WIN_V5) &&
+       (mH.mBpp == 16 || mH.mBpp == 32));
+  if (!bppCompressionOk) {
+    return Transition::TerminateFailure();
+  }
+
+  mCurrentRow = AbsoluteHeight();
+
+  mPixelRowSize = (mH.mBpp * mH.mWidth + 7) / 8;
+  uint32_t surplus = mPixelRowSize % 4;
+  if (surplus != 0) {
+    mPixelRowSize += 4 - surplus;
+  }
+
+  if (mIsWithinICO && mH.mCompression == Compression::RGB) {
+    auto product = CheckedInt<uint32_t>(mPixelRowSize) * AbsoluteHeight();
+    if (!product.isValid()) {
+      return Transition::TerminateFailure();
+    }
+  }
+
+  size_t bitFieldsLengthStillToRead = 0;
+  if (mH.mCompression == Compression::BITFIELDS) {
+    if (mH.mBIHSize >= InfoHeaderLength::BITMAPV2INFOHEADER) {
+      bool hasAlpha = mH.mBIHSize >= InfoHeaderLength::BITMAPV3INFOHEADER;
+      mBitFields.ReadFromHeader(aData + 36, hasAlpha);
+
+      if (mIsForClipboard) {
+        mH.mDataOffset += BitFields::LENGTH;
+      }
+    } else {
+      bitFieldsLengthStillToRead = BitFields::LENGTH;
+    }
+  } else if (mH.mBpp == 16) {
+    mBitFields.SetR5G5B5();
+  } else if (mH.mBpp == 32) {
+    mBitFields.SetR8G8B8();
+  }
+
+  return Transition::To(State::BITFIELDS, bitFieldsLengthStillToRead);
+}
+
+void BitFields::ReadFromHeader(const char* aData, bool aReadAlpha) {
+  mRed.Set(LittleEndian::readUint32(aData + 0));
+  mGreen.Set(LittleEndian::readUint32(aData + 4));
+  mBlue.Set(LittleEndian::readUint32(aData + 8));
+  if (aReadAlpha) {
+    mAlpha.Set(LittleEndian::readUint32(aData + 12));
+  }
+}
+
+LexerTransition<nsBMPDecoder::State> nsBMPDecoder::ReadBitfields(
+    const char* aData, size_t aLength) {
+  mPreGapLength += aLength;
+
+  if (aLength != 0) {
+    mBitFields.ReadFromHeader(aData,  false);
+  }
+
+  mMayHaveTransparency = mIsWithinICO || mH.mCompression == Compression::RLE8 ||
+                         mH.mCompression == Compression::RLE4 ||
+                         (mH.mCompression == Compression::BITFIELDS &&
+                          mBitFields.mAlpha.IsPresent());
+  if (mMayHaveTransparency) {
+    PostHasTransparency();
+  }
+
+  PostSize(mH.mWidth, AbsoluteHeight());
+  if (WantsFrameCount()) {
+    PostFrameCount( 1);
+  }
+  if (HasError()) {
+    return Transition::TerminateFailure();
+  }
+
+  if (IsMetadataDecode()) {
+    return Transition::TerminateSuccess();
+  }
+
+  if (mH.mBpp <= 8) {
+    mNumColors = 1 << mH.mBpp;
+    if (0 < mH.mNumColors && mH.mNumColors < mNumColors) {
+      mNumColors = mH.mNumColors;
+    }
+
+    mColors = MakeUniqueFallible<ColorTableEntry[]>(256);
+    if (NS_WARN_IF(!mColors)) {
+      return Transition::TerminateFailure();
+    }
+    memset(mColors.get(), 0, 256 * sizeof(ColorTableEntry));
+
+    mBytesPerColor = (mH.mBIHSize == InfoHeaderLength::WIN_V2) ? 3 : 4;
+  }
+
+  if (mCMSMode != CMSMode::Off) {
+    switch (mH.mCsType) {
+      case InfoColorSpace::EMBEDDED:
+        return SeekColorProfile(aLength);
+      case InfoColorSpace::CALIBRATED_RGB:
+        PrepareCalibratedColorProfile();
+        break;
+      case InfoColorSpace::SRGB:
+      case InfoColorSpace::WIN:
+        MOZ_LOG(sBMPLog, LogLevel::Debug, ("using sRGB color profile\n"));
+        if (mColors) {
+          mTransform = GetCMSsRGBTransform(SurfaceFormat::R8G8B8);
+        } else {
+          mTransform = GetCMSsRGBTransform(SurfaceFormat::OS_RGBA);
+        }
+        break;
+      case InfoColorSpace::LINKED:
+      default:
+        MOZ_LOG(sBMPLog, LogLevel::Debug, ("color space type not provided\n"));
+        break;
+    }
+  }
+
+  return Transition::To(State::ALLOCATE_SURFACE, 0);
+}
+
+void nsBMPDecoder::PrepareCalibratedColorProfile() {
+  qcms_CIE_xyY white_point = qcms_white_point_sRGB();
+
+  qcms_CIE_xyYTRIPLE primaries;
+  float redGamma =
+      CalRbgEndpointToQcms(mH.mColorSpace.mCalibrated.mRed, primaries.red);
+  float greenGamma =
+      CalRbgEndpointToQcms(mH.mColorSpace.mCalibrated.mGreen, primaries.green);
+  float blueGamma =
+      CalRbgEndpointToQcms(mH.mColorSpace.mCalibrated.mBlue, primaries.blue);
+
+  mInProfile = qcms_profile_create_rgb_with_gamma_set(
+      white_point, primaries, redGamma, greenGamma, blueGamma);
+  if (mInProfile && qcms_profile_is_bogus(mInProfile)) {
+    qcms_profile_release(mInProfile);
+    mInProfile = nullptr;
+  }
+
+  if (mInProfile) {
+    MOZ_LOG(sBMPLog, LogLevel::Debug, ("using calibrated RGB color profile\n"));
+    PrepareColorProfileTransform();
+  } else {
+    MOZ_LOG(sBMPLog, LogLevel::Debug,
+            ("failed to create calibrated RGB color profile, using sRGB\n"));
+    if (mColors) {
+      mTransform = GetCMSsRGBTransform(SurfaceFormat::R8G8B8);
+    } else {
+      mTransform = GetCMSsRGBTransform(SurfaceFormat::OS_RGBA);
+    }
+  }
+}
+
+void nsBMPDecoder::PrepareColorProfileTransform() {
+  if (!mInProfile || !GetCMSOutputProfile()) {
+    return;
+  }
+
+  qcms_data_type inType;
+  qcms_data_type outType;
+  if (mColors) {
+    inType = QCMS_DATA_RGB_8;
+    outType = QCMS_DATA_RGB_8;
+  } else {
+    inType = gfxPlatform::GetCMSOSRGBAType();
+    outType = inType;
+  }
+
+  qcms_intent intent;
+  switch (mH.mCsIntent) {
+    case InfoColorIntent::BUSINESS:
+      intent = QCMS_INTENT_SATURATION;
+      break;
+    case InfoColorIntent::GRAPHICS:
+      intent = QCMS_INTENT_RELATIVE_COLORIMETRIC;
+      break;
+    case InfoColorIntent::ABS_COLORIMETRIC:
+      intent = QCMS_INTENT_ABSOLUTE_COLORIMETRIC;
+      break;
+    case InfoColorIntent::IMAGES:
+    default:
+      intent = QCMS_INTENT_PERCEPTUAL;
+      break;
+  }
+
+  mTransform = qcms_transform_create(mInProfile, inType, GetCMSOutputProfile(),
+                                     outType, intent);
+  if (!mTransform) {
+    MOZ_LOG(sBMPLog, LogLevel::Debug,
+            ("failed to create color profile transform\n"));
+  }
+}
+
+LexerTransition<nsBMPDecoder::State> nsBMPDecoder::SeekColorProfile(
+    size_t aLength) {
+  uint32_t offset = mH.mColorSpace.mProfile.mOffset;
+  if (offset <= mH.mBIHSize + aLength + mNumColors * mBytesPerColor ||
+      mH.mColorSpace.mProfile.mLength == 0) {
+    return Transition::To(State::ALLOCATE_SURFACE, 0);
+  }
+
+  offset -= mH.mBIHSize + aLength;
+
+  MOZ_ASSERT(!mReturnIterator.isSome());
+  mReturnIterator = mLexer.Clone(*mIterator, SIZE_MAX);
+  if (!mReturnIterator) {
+    return Transition::TerminateFailure();
+  }
+
+  return Transition::ToUnbuffered(State::FOUND_COLOR_PROFILE,
+                                  State::SKIP_TO_COLOR_PROFILE, offset);
+}
+
+LexerTransition<nsBMPDecoder::State> nsBMPDecoder::ReadColorProfile(
+    const char* aData, size_t aLength) {
+  mInProfile = qcms_profile_from_memory(aData, aLength);
+  if (mInProfile) {
+    MOZ_LOG(sBMPLog, LogLevel::Debug, ("using embedded color profile\n"));
+    PrepareColorProfileTransform();
+  }
+
+  MOZ_ASSERT(mReturnIterator.isSome());
+  mIterator = std::move(mReturnIterator);
+  return Transition::To(State::ALLOCATE_SURFACE, 0);
+}
+
+LexerTransition<nsBMPDecoder::State> nsBMPDecoder::AllocateSurface() {
+  SurfaceFormat format;
+  SurfacePipeFlags pipeFlags = SurfacePipeFlags();
+
+  if (mMayHaveTransparency) {
+    format = SurfaceFormat::OS_RGBA;
+    if (!(GetSurfaceFlags() & SurfaceFlags::NO_PREMULTIPLY_ALPHA)) {
+      pipeFlags |= SurfacePipeFlags::PREMULTIPLY_ALPHA;
+    }
+  } else {
+    format = SurfaceFormat::OS_RGBX;
+  }
+
+  if (mH.mHeight >= 0) {
+    pipeFlags |= SurfacePipeFlags::FLIP_VERTICALLY;
+  }
+
+  mRowBuffer.reset(new (fallible) uint32_t[mH.mWidth]);
+  if (!mRowBuffer) {
+    return Transition::TerminateFailure();
+  }
+
+  qcms_transform* transform = mColors ? nullptr : mTransform;
+
+  Maybe<SurfacePipe> pipe = SurfacePipeFactory::CreateSurfacePipe(
+      this, Size(), OutputSize(), FullFrame(), format, format, Nothing(),
+      transform, pipeFlags);
+  if (!pipe) {
+    return Transition::TerminateFailure();
+  }
+
+  mPipe = std::move(*pipe);
+  ClearRowBufferRemainder();
+
+  MOZ_ASSERT(!mReturnIterator.isSome());
+  mReturnIterator = mLexer.Clone(*mIterator, SIZE_MAX);
+  if (!mReturnIterator) {
+    return Transition::TerminateFailure();
+  }
+
+  return Transition::To(State::COLOR_TABLE, mNumColors * mBytesPerColor);
+}
+
+LexerTransition<nsBMPDecoder::State> nsBMPDecoder::ReadColorTable(
+    const char* aData, size_t aLength) {
+  MOZ_ASSERT_IF(aLength != 0, mNumColors > 0 && mColors);
+
+  mPreGapLength += aLength;
+
+  for (uint32_t i = 0; i < mNumColors; i++) {
+    mColors[i].mBlue = uint8_t(aData[0]);
+    mColors[i].mGreen = uint8_t(aData[1]);
+    mColors[i].mRed = uint8_t(aData[2]);
+    aData += mBytesPerColor;
+  }
+
+  if (mColors && mTransform) {
+    qcms_transform_data(mTransform, mColors.get(), mColors.get(), 256);
+  }
+
+  if (mIsForClipboard) {
+    mH.mDataOffset += mPreGapLength;
+  }
+
+  if (mPreGapLength > mH.mDataOffset) {
+    if (mPreGapLength - aLength > mH.mDataOffset) {
+      return Transition::TerminateFailure();
+    }
+    MOZ_ASSERT(mReturnIterator.isSome());
+    mIterator = std::move(mReturnIterator);
+    uint32_t gapLength = mH.mDataOffset - (mPreGapLength - aLength);
+    return Transition::ToUnbuffered(State::AFTER_GAP, State::GAP, gapLength);
+  }
+
+  mReturnIterator.reset();
+
+  uint32_t gapLength = mH.mDataOffset - mPreGapLength;
+  return Transition::ToUnbuffered(State::AFTER_GAP, State::GAP, gapLength);
+}
+
+LexerTransition<nsBMPDecoder::State> nsBMPDecoder::SkipGap() {
+  return Transition::ContinueUnbuffered(State::GAP);
+}
+
+LexerTransition<nsBMPDecoder::State> nsBMPDecoder::AfterGap() {
+  if (mH.mWidth == 0 || mH.mHeight == 0) {
+    return Transition::TerminateSuccess();
+  }
+
+  bool hasRLE = mH.mCompression == Compression::RLE8 ||
+                mH.mCompression == Compression::RLE4;
+  return hasRLE ? Transition::To(State::RLE_SEGMENT, RLE::SEGMENT_LENGTH)
+                : Transition::To(State::PIXEL_ROW, mPixelRowSize);
+}
+
+LexerTransition<nsBMPDecoder::State> nsBMPDecoder::ReadPixelRow(
+    const char* aData) {
+  MOZ_ASSERT(mCurrentRow > 0);
+  MOZ_ASSERT(mCurrentPos == 0);
+
+  const uint8_t* src = reinterpret_cast<const uint8_t*>(aData);
+  uint32_t* dst = RowBuffer();
+  uint32_t lpos = mH.mWidth;
+  switch (mH.mBpp) {
+    case 1:
+      while (lpos > 0) {
+        int8_t bit;
+        uint8_t idx;
+        for (bit = 7; bit >= 0 && lpos > 0; bit--) {
+          idx = (*src >> bit) & 1;
+          SetPixel(dst, idx, mColors);
+          --lpos;
+        }
+        ++src;
+      }
+      break;
+
+    case 4:
+      while (lpos > 0) {
+        Set4BitPixel(dst, *src, lpos, mColors);
+        ++src;
+      }
+      break;
+
+    case 8:
+      while (lpos > 0) {
+        SetPixel(dst, *src, mColors);
+        --lpos;
+        ++src;
+      }
+      break;
+
+    case 16:
+      if (mBitFields.IsR5G5B5()) {
+        while (lpos > 0) {
+          uint16_t val = LittleEndian::readUint16(src);
+          SetPixel(dst, mBitFields.mRed.Get5(val), mBitFields.mGreen.Get5(val),
+                   mBitFields.mBlue.Get5(val));
+          --lpos;
+          src += 2;
+        }
+      } else {
+        bool anyHasAlpha = false;
+        while (lpos > 0) {
+          uint16_t val = LittleEndian::readUint16(src);
+          SetPixel(dst, mBitFields.mRed.Get(val), mBitFields.mGreen.Get(val),
+                   mBitFields.mBlue.Get(val),
+                   mBitFields.mAlpha.GetAlpha(val, anyHasAlpha));
+          --lpos;
+          src += 2;
+        }
+        if (anyHasAlpha) {
+          MOZ_ASSERT(mMayHaveTransparency);
+          mDoesHaveTransparency = true;
+        }
+      }
+      break;
+
+    case 24:
+      while (lpos > 0) {
+        SetPixel(dst, src[2], src[1], src[0]);
+        --lpos;
+        src += 3;
+      }
+      break;
+
+    case 32:
+      if (mH.mCompression == Compression::RGB && mIsWithinICO &&
+          mH.mBpp == 32) {
+        while (lpos > 0) {
+          if (!mDoesHaveTransparency && src[3] != 0) {
+
+            mPipe.ResetToFirstRow();
+
+            MOZ_ASSERT(mCurrentPos == 0);
+            int32_t currentRow = mCurrentRow;
+            mCurrentRow = AbsoluteHeight();
+            ClearRowBufferRemainder();
+            while (mCurrentRow > currentRow) {
+              FinishRow();
+            }
+
+            dst = RowBuffer() + (mH.mWidth - lpos);
+
+            MOZ_ASSERT(mMayHaveTransparency);
+            mDoesHaveTransparency = true;
+          }
+
+          SetPixel(dst, src[2], src[1], src[0],
+                   mDoesHaveTransparency ? src[3] : 0xff);
+          src += 4;
+          --lpos;
+        }
+      } else if (mBitFields.IsR8G8B8()) {
+        while (lpos > 0) {
+          uint32_t val = LittleEndian::readUint32(src);
+          SetPixel(dst, mBitFields.mRed.Get8(val), mBitFields.mGreen.Get8(val),
+                   mBitFields.mBlue.Get8(val));
+          --lpos;
+          src += 4;
+        }
+      } else {
+        bool anyHasAlpha = false;
+        while (lpos > 0) {
+          uint32_t val = LittleEndian::readUint32(src);
+          SetPixel(dst, mBitFields.mRed.Get(val), mBitFields.mGreen.Get(val),
+                   mBitFields.mBlue.Get(val),
+                   mBitFields.mAlpha.GetAlpha(val, anyHasAlpha));
+          --lpos;
+          src += 4;
+        }
+        if (anyHasAlpha) {
+          MOZ_ASSERT(mMayHaveTransparency);
+          mDoesHaveTransparency = true;
+        }
+      }
+      break;
+
+    default:
+      MOZ_CRASH("Unsupported color depth; earlier check didn't catch it?");
+  }
+
+  FinishRow();
+  return mCurrentRow == 0 ? Transition::TerminateSuccess()
+                          : Transition::To(State::PIXEL_ROW, mPixelRowSize);
+}
+
+LexerTransition<nsBMPDecoder::State> nsBMPDecoder::ReadRLESegment(
+    const char* aData) {
+  if (mCurrentRow == 0) {
+    return Transition::TerminateSuccess();
+  }
+
+  uint8_t byte1 = uint8_t(aData[0]);
+  uint8_t byte2 = uint8_t(aData[1]);
+
+  if (byte1 != RLE::ESCAPE) {
+    uint32_t pixelsNeeded = std::min<uint32_t>(mH.mWidth - mCurrentPos, byte1);
+    if (pixelsNeeded) {
+      uint32_t* dst = RowBuffer();
+      mCurrentPos += pixelsNeeded;
+      if (mH.mCompression == Compression::RLE8) {
+        do {
+          SetPixel(dst, byte2, mColors);
+          pixelsNeeded--;
+        } while (pixelsNeeded);
+      } else {
+        do {
+          Set4BitPixel(dst, byte2, pixelsNeeded, mColors);
+        } while (pixelsNeeded);
+      }
+    }
+    return Transition::To(State::RLE_SEGMENT, RLE::SEGMENT_LENGTH);
+  }
+
+  if (byte2 == RLE::ESCAPE_EOL) {
+    ClearRowBufferRemainder();
+    mCurrentPos = 0;
+    FinishRow();
+    return mCurrentRow == 0
+               ? Transition::TerminateSuccess()
+               : Transition::To(State::RLE_SEGMENT, RLE::SEGMENT_LENGTH);
+  }
+
+  if (byte2 == RLE::ESCAPE_EOF) {
+    return Transition::TerminateSuccess();
+  }
+
+  if (byte2 == RLE::ESCAPE_DELTA) {
+    return Transition::To(State::RLE_DELTA, RLE::DELTA_LENGTH);
+  }
+
+  MOZ_ASSERT(mAbsoluteModeNumPixels == 0);
+  mAbsoluteModeNumPixels = byte2;
+  uint32_t length = byte2;
+  if (mH.mCompression == Compression::RLE4) {
+    length = (length + 1) / 2;  
+  }
+  if (length & 1) {
+    length++;
+  }
+  return Transition::To(State::RLE_ABSOLUTE, length);
+}
+
+LexerTransition<nsBMPDecoder::State> nsBMPDecoder::ReadRLEDelta(
+    const char* aData) {
+  MOZ_ASSERT(mMayHaveTransparency);
+  mDoesHaveTransparency = true;
+
+  ClearRowBufferRemainder();
+
+  mCurrentPos += uint8_t(aData[0]);
+  if (mCurrentPos > mH.mWidth) {
+    mCurrentPos = mH.mWidth;
+  }
+
+  int32_t yDelta = std::min<int32_t>(uint8_t(aData[1]), mCurrentRow);
+  if (yDelta > 0) {
+    FinishRow();
+
+    memset(mRowBuffer.get(), 0, mH.mWidth * sizeof(uint32_t));
+    for (int32_t line = 1; line < yDelta; line++) {
+      FinishRow();
+    }
+  }
+
+  return mCurrentRow == 0
+             ? Transition::TerminateSuccess()
+             : Transition::To(State::RLE_SEGMENT, RLE::SEGMENT_LENGTH);
+}
+
+LexerTransition<nsBMPDecoder::State> nsBMPDecoder::ReadRLEAbsolute(
+    const char* aData, size_t aLength) {
+  uint32_t n = mAbsoluteModeNumPixels;
+  mAbsoluteModeNumPixels = 0;
+
+  if (mCurrentPos + n > uint32_t(mH.mWidth)) {
+    if (mH.mCompression == Compression::RLE8 && n > 0 && (n & 1) == 0 &&
+        mCurrentPos + n - uint32_t(mH.mWidth) == 1 && aLength > 0 &&
+        aData[aLength - 1] == 0) {
+      n--;
+    } else {
+      return Transition::TerminateSuccess();
+    }
+  }
+
+  uint32_t* dst = RowBuffer();
+  uint32_t iSrc = 0;
+  uint32_t* oldPos = dst;
+  if (mH.mCompression == Compression::RLE8) {
+    while (n > 0) {
+      SetPixel(dst, aData[iSrc], mColors);
+      n--;
+      iSrc++;
+    }
+  } else {
+    while (n > 0) {
+      Set4BitPixel(dst, aData[iSrc], n, mColors);
+      iSrc++;
+    }
+  }
+  mCurrentPos += dst - oldPos;
+
+  MOZ_ASSERT(iSrc == aLength - 1 || iSrc == aLength);
+
+  return Transition::To(State::RLE_SEGMENT, RLE::SEGMENT_LENGTH);
+}
+
+}  
+}  

@@ -1,0 +1,258 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsChangeHint_h_
+#define nsChangeHint_h_
+
+#include "mozilla/Assertions.h"
+
+
+enum nsChangeHint : uint32_t {
+  nsChangeHint_Empty = 0,
+
+  nsChangeHint_RepaintFrame = 1 << 0,
+
+  nsChangeHint_NeedReflow = 1 << 1,
+
+  nsChangeHint_ClearAncestorIntrinsics = 1 << 2,
+
+  nsChangeHint_ClearDescendantIntrinsics = 1 << 3,
+
+  nsChangeHint_NeedDirtyReflow = 1 << 4,
+
+  nsChangeHint_UpdateCursor = 1 << 5,
+
+  nsChangeHint_UpdateEffects = 1 << 6,
+
+  nsChangeHint_UpdateOpacityLayer = 1 << 7,
+  nsChangeHint_UpdateTransformLayer = 1 << 8,
+
+  nsChangeHint_ReconstructFrame = 1 << 9,
+
+  nsChangeHint_UpdateOverflow = 1 << 10,
+
+  nsChangeHint_UpdateSubtreeOverflow = 1 << 11,
+
+  nsChangeHint_UpdatePostTransformOverflow = 1 << 12,
+
+  nsChangeHint_UpdateParentOverflow = 1 << 13,
+
+  nsChangeHint_ChildrenOnlyTransform = 1 << 14,
+
+  nsChangeHint_RecomputePosition = 1 << 15,
+
+  nsChangeHint_UpdateContainingBlock = 1 << 16,
+
+  nsChangeHint_SchedulePaint = 1 << 17,
+
+  nsChangeHint_NeutralChange = 1 << 18,
+
+  nsChangeHint_InvalidateRenderingObservers = 1 << 19,
+
+  nsChangeHint_ReflowChangesSizeOrPosition = 1 << 20,
+
+  nsChangeHint_UpdateComputedBSize = 1 << 21,
+
+  nsChangeHint_UpdateUsesOpacity = 1 << 22,
+
+  nsChangeHint_UpdateBackgroundPosition = 1 << 23,
+
+  nsChangeHint_AddOrRemoveTransform = 1 << 24,
+
+  nsChangeHint_ScrollbarChange = 1 << 25,
+
+  nsChangeHint_UpdateTableCellSpans = 1 << 26,
+
+  nsChangeHint_VisibilityChange = 1u << 27,
+
+
+  nsChangeHint_AllHints = uint32_t((1ull << 28) - 1),
+};
+
+inline void operator<(nsChangeHint s1, nsChangeHint s2) {}
+inline void operator>(nsChangeHint s1, nsChangeHint s2) {}
+inline void operator!=(nsChangeHint s1, nsChangeHint s2) {}
+inline void operator==(nsChangeHint s1, nsChangeHint s2) {}
+inline void operator<=(nsChangeHint s1, nsChangeHint s2) {}
+inline void operator>=(nsChangeHint s1, nsChangeHint s2) {}
+
+
+inline bool NS_IsHintSubset(nsChangeHint aSubset, nsChangeHint aSuperSet) {
+  return (aSubset & aSuperSet) == aSubset;
+}
+
+typedef decltype(nsChangeHint(0) + nsChangeHint(0)) nsChangeHint_size_t;
+
+inline nsChangeHint constexpr operator|(nsChangeHint aLeft,
+                                        nsChangeHint aRight) {
+  return nsChangeHint(nsChangeHint_size_t(aLeft) | nsChangeHint_size_t(aRight));
+}
+
+inline nsChangeHint constexpr operator&(nsChangeHint aLeft,
+                                        nsChangeHint aRight) {
+  return nsChangeHint(nsChangeHint_size_t(aLeft) & nsChangeHint_size_t(aRight));
+}
+
+inline nsChangeHint& operator|=(nsChangeHint& aLeft, nsChangeHint aRight) {
+  return aLeft = aLeft | aRight;
+}
+
+inline nsChangeHint& operator&=(nsChangeHint& aLeft, nsChangeHint aRight) {
+  return aLeft = aLeft & aRight;
+}
+
+inline nsChangeHint constexpr operator~(nsChangeHint aArg) {
+  return nsChangeHint(~nsChangeHint_size_t(aArg));
+}
+
+inline nsChangeHint constexpr operator^(nsChangeHint aLeft,
+                                        nsChangeHint aRight) {
+  return nsChangeHint(nsChangeHint_size_t(aLeft) ^ nsChangeHint_size_t(aRight));
+}
+
+inline nsChangeHint operator^=(nsChangeHint& aLeft, nsChangeHint aRight) {
+  return aLeft = aLeft ^ aRight;
+}
+
+
+#define nsChangeHint_Hints_AlwaysHandledForDescendants                     \
+  (nsChangeHint_ClearDescendantIntrinsics | nsChangeHint_NeedDirtyReflow | \
+   nsChangeHint_NeutralChange | nsChangeHint_ReconstructFrame |            \
+   nsChangeHint_RepaintFrame | nsChangeHint_SchedulePaint |                \
+   nsChangeHint_UpdateCursor | nsChangeHint_UpdateSubtreeOverflow |        \
+   nsChangeHint_VisibilityChange)
+
+#define nsChangeHint_Hints_NeverHandledForDescendants                       \
+  (nsChangeHint_ChildrenOnlyTransform | nsChangeHint_ScrollbarChange |      \
+   nsChangeHint_InvalidateRenderingObservers |                              \
+   nsChangeHint_RecomputePosition | nsChangeHint_UpdateBackgroundPosition | \
+   nsChangeHint_UpdateComputedBSize | nsChangeHint_UpdateContainingBlock |  \
+   nsChangeHint_UpdateEffects | nsChangeHint_UpdateOpacityLayer |           \
+   nsChangeHint_UpdateOverflow | nsChangeHint_UpdateParentOverflow |        \
+   nsChangeHint_UpdatePostTransformOverflow |                               \
+   nsChangeHint_UpdateTableCellSpans | nsChangeHint_UpdateTransformLayer |  \
+   nsChangeHint_UpdateUsesOpacity | nsChangeHint_AddOrRemoveTransform)
+
+#define nsChangeHint_Hints_SometimesHandledForDescendants           \
+  (nsChangeHint_ClearAncestorIntrinsics | nsChangeHint_NeedReflow | \
+   nsChangeHint_ReflowChangesSizeOrPosition)
+
+static_assert(!(nsChangeHint_Hints_AlwaysHandledForDescendants &
+                nsChangeHint_Hints_NeverHandledForDescendants) &&
+                  !(nsChangeHint_Hints_AlwaysHandledForDescendants &
+                    nsChangeHint_Hints_SometimesHandledForDescendants) &&
+                  !(nsChangeHint_Hints_NeverHandledForDescendants &
+                    nsChangeHint_Hints_SometimesHandledForDescendants) &&
+                  !(nsChangeHint_AllHints ^
+                    nsChangeHint_Hints_AlwaysHandledForDescendants ^
+                    nsChangeHint_Hints_NeverHandledForDescendants ^
+                    nsChangeHint_Hints_SometimesHandledForDescendants),
+              "change hints must be present in exactly one of "
+              "nsChangeHint_Hints_{Always,Never,Sometimes}"
+              "HandledForDescendants");
+
+#define nsChangeHint_Hints_NotHandledForDescendants \
+  (nsChangeHint_Hints_NeverHandledForDescendants |  \
+   nsChangeHint_Hints_SometimesHandledForDescendants)
+
+#define NS_STYLE_HINT_VISUAL \
+  nsChangeHint(nsChangeHint_RepaintFrame | nsChangeHint_SchedulePaint)
+#define nsChangeHint_AllReflowHints                                        \
+  nsChangeHint(                                                            \
+      nsChangeHint_NeedReflow | nsChangeHint_ReflowChangesSizeOrPosition | \
+      nsChangeHint_ClearAncestorIntrinsics |                               \
+      nsChangeHint_ClearDescendantIntrinsics | nsChangeHint_NeedDirtyReflow)
+
+
+#define nsChangeHint_ReflowHintsForISizeChange            \
+  nsChangeHint(nsChangeHint_AllReflowHints &              \
+               ~(nsChangeHint_ClearDescendantIntrinsics | \
+                 nsChangeHint_NeedDirtyReflow))
+
+#define nsChangeHint_ReflowHintsForBSizeChange                           \
+  nsChangeHint(                                                          \
+      (nsChangeHint_AllReflowHints | nsChangeHint_UpdateComputedBSize) & \
+      ~(nsChangeHint_ClearDescendantIntrinsics |                         \
+        nsChangeHint_NeedDirtyReflow))
+
+#define nsChangeHint_ReflowHintsForScrollbarChange      \
+  nsChangeHint(nsChangeHint_ReflowHintsForBSizeChange | \
+               nsChangeHint_ReflowHintsForISizeChange)
+
+#define nsChangeHint_ReflowHintsForFloatAreaChange        \
+  nsChangeHint(nsChangeHint_AllReflowHints &              \
+               ~(nsChangeHint_ClearDescendantIntrinsics | \
+                 nsChangeHint_NeedDirtyReflow))
+
+#define NS_STYLE_HINT_REFLOW \
+  nsChangeHint(NS_STYLE_HINT_VISUAL | nsChangeHint_AllReflowHints)
+
+#define nsChangeHint_ComprehensiveAddOrRemoveTransform \
+  nsChangeHint(nsChangeHint_UpdateContainingBlock |    \
+               nsChangeHint_AddOrRemoveTransform |     \
+               nsChangeHint_UpdateOverflow | nsChangeHint_RepaintFrame)
+
+inline nsChangeHint NS_HintsNotHandledForDescendantsIn(
+    nsChangeHint aChangeHint) {
+  nsChangeHint result =
+      aChangeHint & nsChangeHint_Hints_NeverHandledForDescendants;
+
+  if (!(aChangeHint & nsChangeHint_NeedDirtyReflow)) {
+    if (aChangeHint & nsChangeHint_NeedReflow) {
+      result |= nsChangeHint_NeedReflow;
+    }
+
+    if (aChangeHint & nsChangeHint_ReflowChangesSizeOrPosition) {
+      result |= nsChangeHint_ReflowChangesSizeOrPosition;
+    }
+  }
+
+  if (!(aChangeHint & nsChangeHint_ClearDescendantIntrinsics) &&
+      (aChangeHint & nsChangeHint_ClearAncestorIntrinsics)) {
+    result |= nsChangeHint_ClearAncestorIntrinsics;
+  }
+
+  MOZ_ASSERT(
+      NS_IsHintSubset(result, nsChangeHint_Hints_NotHandledForDescendants),
+      "something is inconsistent");
+
+  return result;
+}
+
+inline nsChangeHint NS_HintsHandledForDescendantsIn(nsChangeHint aChangeHint) {
+  return aChangeHint & ~NS_HintsNotHandledForDescendantsIn(aChangeHint);
+}
+
+inline nsChangeHint NS_RemoveSubsumedHints(nsChangeHint aOurChange,
+                                           nsChangeHint aHintsHandled) {
+  nsChangeHint result =
+      aOurChange & ~NS_HintsHandledForDescendantsIn(aHintsHandled);
+
+  if (result &
+      (nsChangeHint_ClearAncestorIntrinsics |
+       nsChangeHint_ClearDescendantIntrinsics | nsChangeHint_NeedDirtyReflow |
+       nsChangeHint_ReflowChangesSizeOrPosition |
+       nsChangeHint_UpdateComputedBSize)) {
+    result |= nsChangeHint_NeedReflow;
+  }
+
+  if (result & (nsChangeHint_ClearDescendantIntrinsics)) {
+    MOZ_ASSERT(result & nsChangeHint_ClearAncestorIntrinsics);
+    result |=  
+        nsChangeHint_NeedDirtyReflow;
+  }
+
+  return result;
+}
+
+namespace mozilla {
+
+struct StyleRestyleHint;
+
+using RestyleHint = StyleRestyleHint;
+
+}  
+
+#endif /* nsChangeHint_h_ */

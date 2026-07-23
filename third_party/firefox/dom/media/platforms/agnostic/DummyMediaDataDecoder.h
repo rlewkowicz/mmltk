@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(DummyMediaDataDecoder_h_)
+#  define DummyMediaDataDecoder_h_
+
+#  include "MediaInfo.h"
+#  include "PlatformDecoderModule.h"
+#  include "ReorderQueue.h"
+#  include "mozilla/UniquePtr.h"
+
+namespace mozilla {
+
+class MediaRawData;
+
+class DummyDataCreator {
+ public:
+  virtual ~DummyDataCreator();
+  virtual already_AddRefed<MediaData> Create(MediaRawData* aSample) = 0;
+};
+
+DDLoggedTypeDeclNameAndBase(DummyMediaDataDecoder, MediaDataDecoder);
+
+class DummyMediaDataDecoder
+    : public MediaDataDecoder,
+      public DecoderDoctorLifeLogger<DummyMediaDataDecoder> {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(DummyMediaDataDecoder, final);
+
+  DummyMediaDataDecoder(UniquePtr<DummyDataCreator>&& aCreator,
+                        const nsACString& aDescription,
+                        const CreateDecoderParams& aParams);
+
+  RefPtr<InitPromise> Init() override;
+
+  RefPtr<ShutdownPromise> Shutdown() override;
+
+  RefPtr<DecodePromise> Decode(MediaRawData* aSample) override;
+
+  RefPtr<DecodePromise> Drain() override;
+
+  RefPtr<FlushPromise> Flush() override;
+
+  nsCString GetDescriptionName() const override;
+
+  nsCString GetCodecName() const override;
+
+  ConversionRequired NeedsConversion() const override;
+
+ protected:
+  ~DummyMediaDataDecoder() = default;
+
+  UniquePtr<DummyDataCreator> mCreator;
+  const bool mIsH264;
+  uint32_t mMaxRefFrames;
+  ReorderQueue mReorderQueue;
+  TrackInfo::TrackType mType;
+  nsCString mDescription;
+};
+
+}  
+
+#endif  // !defined(DummyMediaDataDecoder_h_)

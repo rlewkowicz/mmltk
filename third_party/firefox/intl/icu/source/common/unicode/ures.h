@@ -1,0 +1,295 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+*   Copyright (C) 1997-2016, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+**********************************************************************
+*
+* File URES.H (formerly CRESBUND.H)
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   04/01/97    aliu        Creation.
+*   02/22/99    damiba      overhaul.
+*   04/04/99    helena      Fixed internal header inclusion.
+*   04/15/99    Madhu       Updated Javadoc
+*   06/14/99    stephen     Removed functions taking a filename suffix.
+*   07/20/99    stephen     Language-independent typedef to void*
+*   11/09/99    weiv        Added ures_getLocale()
+*   06/24/02    weiv        Added support for resource sharing
+******************************************************************************
+*/
+
+#ifndef URES_H
+#define URES_H
+
+#include "unicode/char16ptr.h"
+#include "unicode/utypes.h"
+#include "unicode/uloc.h"
+
+#if U_SHOW_CPLUSPLUS_API
+#include "unicode/localpointer.h"
+#endif   // U_SHOW_CPLUSPLUS_API
+
+
+struct UResourceBundle;
+
+typedef struct UResourceBundle UResourceBundle;
+
+typedef enum {
+    URES_NONE=-1,
+
+    URES_STRING=0,
+
+    URES_BINARY=1,
+
+    URES_TABLE=2,
+
+    URES_ALIAS=3,
+
+    URES_INT=7,
+
+    URES_ARRAY=8,
+
+    URES_INT_VECTOR = 14,
+#ifndef U_HIDE_DEPRECATED_API
+    RES_NONE=URES_NONE,
+    RES_STRING=URES_STRING,
+    RES_BINARY=URES_BINARY,
+    RES_TABLE=URES_TABLE,
+    RES_ALIAS=URES_ALIAS,
+    RES_INT=URES_INT,
+    RES_ARRAY=URES_ARRAY,
+    RES_INT_VECTOR=URES_INT_VECTOR,
+    RES_RESERVED=15,
+
+    URES_LIMIT = 16
+#endif  // U_HIDE_DEPRECATED_API
+} UResType;
+
+
+U_CAPI UResourceBundle*  U_EXPORT2
+ures_open(const char*    packageName,
+          const char*  locale,
+          UErrorCode*     status);
+
+
+U_CAPI UResourceBundle* U_EXPORT2
+ures_openDirect(const char* packageName,
+                const char* locale,
+                UErrorCode* status);
+
+U_CAPI UResourceBundle* U_EXPORT2
+ures_openU(const UChar* packageName,
+           const char* locale,
+           UErrorCode* status);
+
+#ifndef U_HIDE_DEPRECATED_API
+U_DEPRECATED int32_t U_EXPORT2
+ures_countArrayItems(const UResourceBundle* resourceBundle,
+                     const char* resourceKey,
+                     UErrorCode* err);
+#endif  /* U_HIDE_DEPRECATED_API */
+
+U_CAPI void U_EXPORT2
+ures_close(UResourceBundle* resourceBundle);
+
+#if U_SHOW_CPLUSPLUS_API
+
+U_NAMESPACE_BEGIN
+
+U_DEFINE_LOCAL_OPEN_POINTER(LocalUResourceBundlePointer, UResourceBundle, ures_close);
+
+U_NAMESPACE_END
+
+#endif
+
+#ifndef U_HIDE_DEPRECATED_API
+U_DEPRECATED const char* U_EXPORT2
+ures_getVersionNumber(const UResourceBundle*   resourceBundle);
+#endif  /* U_HIDE_DEPRECATED_API */
+
+U_CAPI void U_EXPORT2
+ures_getVersion(const UResourceBundle* resB,
+                UVersionInfo versionInfo);
+
+#ifndef U_HIDE_DEPRECATED_API
+U_DEPRECATED const char* U_EXPORT2
+ures_getLocale(const UResourceBundle* resourceBundle,
+               UErrorCode* status);
+#endif  /* U_HIDE_DEPRECATED_API */
+
+U_CAPI const char* U_EXPORT2
+ures_getLocaleByType(const UResourceBundle* resourceBundle,
+                     ULocDataLocaleType type,
+                     UErrorCode* status);
+
+
+#ifndef U_HIDE_INTERNAL_API
+U_CAPI void U_EXPORT2
+ures_openFillIn(UResourceBundle *r,
+                const char* packageName,
+                const char* localeID,
+                UErrorCode* status);
+#endif  /* U_HIDE_INTERNAL_API */
+
+U_CAPI const UChar* U_EXPORT2
+ures_getString(const UResourceBundle* resourceBundle,
+               int32_t* len,
+               UErrorCode* status);
+
+U_CAPI const char * U_EXPORT2
+ures_getUTF8String(const UResourceBundle *resB,
+                   char *dest, int32_t *length,
+                   UBool forceCopy,
+                   UErrorCode *status);
+
+U_CAPI const uint8_t* U_EXPORT2
+ures_getBinary(const UResourceBundle* resourceBundle,
+               int32_t* len,
+               UErrorCode* status);
+
+U_CAPI const int32_t* U_EXPORT2
+ures_getIntVector(const UResourceBundle* resourceBundle,
+                  int32_t* len,
+                  UErrorCode* status);
+
+U_CAPI uint32_t U_EXPORT2
+ures_getUInt(const UResourceBundle* resourceBundle,
+             UErrorCode *status);
+
+U_CAPI int32_t U_EXPORT2
+ures_getInt(const UResourceBundle* resourceBundle,
+            UErrorCode *status);
+
+U_CAPI int32_t U_EXPORT2
+ures_getSize(const UResourceBundle *resourceBundle);
+
+U_CAPI UResType U_EXPORT2
+ures_getType(const UResourceBundle *resourceBundle);
+
+U_CAPI const char * U_EXPORT2
+ures_getKey(const UResourceBundle *resourceBundle);
+
+
+U_CAPI void U_EXPORT2
+ures_resetIterator(UResourceBundle *resourceBundle);
+
+U_CAPI UBool U_EXPORT2
+ures_hasNext(const UResourceBundle *resourceBundle);
+
+U_CAPI UResourceBundle* U_EXPORT2
+ures_getNextResource(UResourceBundle *resourceBundle,
+                     UResourceBundle *fillIn,
+                     UErrorCode *status);
+
+U_CAPI const UChar* U_EXPORT2
+ures_getNextString(UResourceBundle *resourceBundle,
+                   int32_t* len,
+                   const char ** key,
+                   UErrorCode *status);
+
+U_CAPI UResourceBundle* U_EXPORT2
+ures_getByIndex(const UResourceBundle *resourceBundle,
+                int32_t indexR,
+                UResourceBundle *fillIn,
+                UErrorCode *status);
+
+U_CAPI const UChar* U_EXPORT2
+ures_getStringByIndex(const UResourceBundle *resourceBundle,
+                      int32_t indexS,
+                      int32_t* len,
+                      UErrorCode *status);
+
+U_CAPI const char * U_EXPORT2
+ures_getUTF8StringByIndex(const UResourceBundle *resB,
+                          int32_t stringIndex,
+                          char *dest, int32_t *pLength,
+                          UBool forceCopy,
+                          UErrorCode *status);
+
+U_CAPI UResourceBundle* U_EXPORT2
+ures_getByKey(const UResourceBundle *resourceBundle,
+              const char* key,
+              UResourceBundle *fillIn,
+              UErrorCode *status);
+
+U_CAPI const UChar* U_EXPORT2
+ures_getStringByKey(const UResourceBundle *resB,
+                    const char* key,
+                    int32_t* len,
+                    UErrorCode *status);
+
+U_CAPI const char * U_EXPORT2
+ures_getUTF8StringByKey(const UResourceBundle *resB,
+                        const char *key,
+                        char *dest, int32_t *pLength,
+                        UBool forceCopy,
+                        UErrorCode *status);
+
+#if U_SHOW_CPLUSPLUS_API
+#include "unicode/unistr.h"
+
+U_NAMESPACE_BEGIN
+inline UnicodeString
+ures_getUnicodeString(const UResourceBundle *resB, UErrorCode* status) {
+    UnicodeString result;
+    int32_t len = 0;
+    const char16_t *r = ConstChar16Ptr(ures_getString(resB, &len, status));
+    if(U_SUCCESS(*status)) {
+        result.setTo(true, r, len);
+    } else {
+        result.setToBogus();
+    }
+    return result;
+}
+
+inline UnicodeString
+ures_getNextUnicodeString(UResourceBundle *resB, const char ** key, UErrorCode* status) {
+    UnicodeString result;
+    int32_t len = 0;
+    const char16_t* r = ConstChar16Ptr(ures_getNextString(resB, &len, key, status));
+    if(U_SUCCESS(*status)) {
+        result.setTo(true, r, len);
+    } else {
+        result.setToBogus();
+    }
+    return result;
+}
+
+inline UnicodeString
+ures_getUnicodeStringByIndex(const UResourceBundle *resB, int32_t indexS, UErrorCode* status) {
+    UnicodeString result;
+    int32_t len = 0;
+    const char16_t* r = ConstChar16Ptr(ures_getStringByIndex(resB, indexS, &len, status));
+    if(U_SUCCESS(*status)) {
+        result.setTo(true, r, len);
+    } else {
+        result.setToBogus();
+    }
+    return result;
+}
+
+inline UnicodeString
+ures_getUnicodeStringByKey(const UResourceBundle *resB, const char* key, UErrorCode* status) {
+    UnicodeString result;
+    int32_t len = 0;
+    const char16_t* r = ConstChar16Ptr(ures_getStringByKey(resB, key, &len, status));
+    if(U_SUCCESS(*status)) {
+        result.setTo(true, r, len);
+    } else {
+        result.setToBogus();
+    }
+    return result;
+}
+
+U_NAMESPACE_END
+
+#endif
+
+U_CAPI UEnumeration* U_EXPORT2
+ures_openAvailableLocales(const char *packageName, UErrorCode *status);
+
+
+#endif /*_URES*/

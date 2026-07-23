@@ -1,0 +1,6628 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "debugger/Debugger-inl.h"
+
+#include "mozilla/Attributes.h"        // for MOZ_STACK_CLASS, MOZ_RAII
+#include "mozilla/DebugOnly.h"         // for DebugOnly
+#include "mozilla/DoublyLinkedList.h"  // for DoublyLinkedList<>::Iterator
+#include "mozilla/HashTable.h"         // for HashMapEntry
+#include "mozilla/Maybe.h"             // for Maybe, Nothing, Some
+#include "mozilla/ScopeExit.h"         // for MakeScopeExit, ScopeExit
+#include "mozilla/Sprintf.h"           // for SprintfLiteral
+#include "mozilla/TimeStamp.h"         // for TimeStamp
+#include "mozilla/UniquePtr.h"         // for UniquePtr
+#include "mozilla/Variant.h"           // for AsVariant, AsVariantTemporary
+#include "mozilla/Vector.h"            // for Vector, Vector<>::ConstRange
+
+#include <algorithm>    // for std::find, std::max
+#include <functional>   // for function
+#include <stddef.h>     // for size_t
+#include <stdint.h>     // for uint32_t, uint64_t, int32_t
+#include <string.h>     // for strlen, strcmp
+#include <type_traits>  // for std::underlying_type_t
+#include <utility>      // for std::move
+
+#include "jsapi.h"    // for CallArgs, CallArgsFromVp
+#include "jstypes.h"  // for JS_PUBLIC_API
+
+#include "builtin/Array.h"            // for NewDenseFullyAllocatedArray
+#include "debugger/DebugAPI.h"        // for ResumeMode, DebugAPI
+#include "debugger/DebuggerMemory.h"  // for DebuggerMemory
+#include "debugger/DebugScript.h"     // for DebugScript
+#include "debugger/Environment.h"     // for DebuggerEnvironment
+#ifdef MOZ_EXECUTION_TRACING
+#  include "debugger/ExecutionTracer.h"  // for ExecutionTracer::onEnterFrame, ExecutionTracer::onLeaveFrame
+#endif
+#include "debugger/Frame.h"               // for DebuggerFrame
+#include "debugger/NoExecute.h"           // for EnterDebuggeeNoExecute
+#include "debugger/Object.h"              // for DebuggerObject
+#include "debugger/Script.h"              // for DebuggerScript
+#include "debugger/Source.h"              // for DebuggerSource
+#include "frontend/CompilationStencil.h"  // for CompilationStencil
+#include "frontend/FrontendContext.h"     // for AutoReportFrontendContext
+#include "frontend/Parser.h"              // for Parser
+#include "gc/GC.h"                        // for IterateScripts
+#include "gc/GCContext.h"                 // for JS::GCContext
+#include "gc/GCMarker.h"                  // for GCMarker
+#include "gc/GCRuntime.h"                 // for GCRuntime, AutoEnterIteration
+#include "gc/HashUtil.h"                  // for DependentAddPtr
+#include "gc/Marking.h"                   // for IsAboutToBeFinalized
+#include "gc/PublicIterators.h"           // for RealmsIter, CompartmentsIter
+#include "gc/Statistics.h"                // for Statistics::SliceData
+#include "gc/Tracer.h"                    // for TraceEdge
+#include "gc/Zone.h"                      // for Zone
+#include "gc/ZoneAllocator.h"             // for ZoneAllocPolicy
+#include "jit/BaselineDebugModeOSR.h"  // for RecompileOnStackBaselineScriptsForDebugMode
+#include "jit/BaselineJIT.h"           // for FinishDiscardBaselineScript
+#include "jit/Invalidation.h"         // for IonScriptKeyVector
+#include "jit/JitContext.h"           // for JitContext
+#include "jit/JitScript.h"            // for JitScript
+#include "jit/JSJitFrameIter.h"       // for InlineFrameIterator
+#include "jit/RematerializedFrame.h"  // for RematerializedFrame
+#include "js/CallAndConstruct.h"      // JS::IsCallable
+#include "js/Conversions.h"           // for ToBoolean, ToUint32
+#include "js/Debug.h"                 // for Builder::Object, Builder
+#include "js/friend/ErrorMessages.h"  // for GetErrorMessage, JSMSG_*
+#include "js/GCAPI.h"                 // for GarbageCollectionEvent
+#include "js/GCVariant.h"             // for GCVariant
+#include "js/HeapAPI.h"               // for ExposeObjectToActiveJS
+#include "js/Promise.h"               // for AutoDebuggerJobQueueInterruption
+#include "js/PropertyAndElement.h"    // for JS_GetProperty
+#include "js/Proxy.h"                 // for PropertyDescriptor
+#include "js/SourceText.h"            // for SourceText
+#include "js/StableStringChars.h"     // for AutoStableStringChars
+#include "js/UbiNode.h"               // for Node, RootList, Edge
+#include "js/UbiNodeBreadthFirst.h"   // for BreadthFirst
+#include "js/Wrapper.h"               // for CheckedUnwrapStatic
+#include "util/Identifier.h"          // for IsIdentifier
+#include "util/Text.h"                // for DuplicateString, js_strlen
+#include "vm/ArrayObject.h"           // for ArrayObject
+#include "vm/AsyncFunction.h"         // for AsyncFunctionGeneratorObject
+#include "vm/AsyncIteration.h"        // for AsyncGeneratorObject
+#include "vm/BytecodeUtil.h"          // for JSDVG_IGNORE_STACK
+#include "vm/Compartment.h"           // for CrossCompartmentKey
+#include "vm/EnvironmentObject.h"     // for IsSyntacticEnvironment
+#include "vm/ErrorReporting.h"        // for ReportErrorToGlobal
+#include "vm/GeneratorObject.h"       // for AbstractGeneratorObject
+#include "vm/GlobalObject.h"          // for GlobalObject
+#include "vm/Interpreter.h"           // for Call, ReportIsNotFunction
+#include "vm/Iteration.h"             // for CreateIterResultObject
+#include "vm/JSAtomUtils.h"  // for Atomize, AtomizeUTF8Chars, AtomIsMarked, AtomToId, ClassName
+#include "vm/JSContext.h"         // for JSContext
+#include "vm/JSFunction.h"        // for JSFunction
+#include "vm/JSObject.h"          // for JSObject, RequireObject,
+#include "vm/JSScript.h"          // for BaseScript, ScriptSourceObject
+#include "vm/ObjectOperations.h"  // for DefineDataProperty
+#include "vm/PlainObject.h"       // for js::PlainObject
+#include "vm/PromiseObject.h"     // for js::PromiseObject
+#include "vm/ProxyObject.h"       // for ProxyObject, JSObject::is
+#include "vm/Realm.h"             // for AutoRealm, Realm
+#include "vm/Runtime.h"           // for ReportOutOfMemory, JSRuntime
+#include "vm/SavedFrame.h"        // for SavedFrame
+#include "vm/SavedStacks.h"       // for SavedStacks
+#include "vm/Scope.h"             // for Scope
+#include "vm/StringType.h"        // for JSString, PropertyName
+#include "vm/WrapperObject.h"     // for CrossCompartmentWrapperObject
+#include "wasm/WasmDebug.h"       // for DebugState
+#include "wasm/WasmInstance.h"    // for Instance
+#include "wasm/WasmJS.h"          // for WasmInstanceObject
+#include "wasm/WasmRealm.h"       // for Realm
+#include "wasm/WasmStacks.h"      // for ContStack
+#include "wasm/WasmTypeDecls.h"   // for WasmInstanceObjectVector
+
+#include "debugger/DebugAPI-inl.h"
+#include "debugger/Environment-inl.h"  // for DebuggerEnvironment::owner
+#include "debugger/Frame-inl.h"        // for DebuggerFrame::hasGeneratorInfo
+#include "debugger/Object-inl.h"  // for DebuggerObject::owner and isInstance.
+#include "debugger/Script-inl.h"  // for DebuggerScript::getReferent
+#include "gc/GC-inl.h"            // for ZoneCellIter
+#include "gc/Marking-inl.h"       // for MaybeForwarded
+#include "gc/StableCellHasher-inl.h"
+#include "gc/WeakMap-inl.h"        // for DebuggerWeakMap::trace
+#include "vm/Compartment-inl.h"    // for Compartment::wrap
+#include "vm/GeckoProfiler-inl.h"  // for AutoSuppressProfilerSampling
+#include "vm/JSAtomUtils-inl.h"    // for AtomToId, ValueToId
+#include "vm/JSContext-inl.h"      // for JSContext::check
+#include "vm/JSObject-inl.h"       // for JSObject::isCallable
+#include "vm/JSScript-inl.h"       // for JSScript::isDebuggee, JSScript
+#include "vm/NativeObject-inl.h"  // for NativeObject::ensureDenseInitializedLength
+#include "vm/ObjectOperations-inl.h"  // for GetProperty, HasProperty
+#include "vm/Realm-inl.h"             // for AutoRealm::AutoRealm
+#include "vm/Stack-inl.h"             // for AbstractFramePtr::script
+#include "wasm/WasmInstance-inl.h"    // for Instance::codeMeta()
+
+namespace js {
+
+namespace frontend {
+class FullParseHandler;
+}
+
+namespace gc {
+class Cell;
+}
+
+namespace jit {
+class BaselineFrame;
+}
+
+} 
+
+using namespace js;
+
+using JS::AutoStableStringChars;
+using JS::CompileOptions;
+using JS::dbg::Builder;
+using mozilla::AsVariant;
+using mozilla::DebugOnly;
+using mozilla::MakeScopeExit;
+using mozilla::Maybe;
+using mozilla::Nothing;
+using mozilla::Some;
+using mozilla::TimeStamp;
+
+
+bool js::IsInterpretedNonSelfHostedFunction(JSFunction* fun) {
+  return fun->isInterpreted() && !fun->isSelfHostedBuiltin();
+}
+
+JSScript* js::GetOrCreateFunctionScript(JSContext* cx, HandleFunction fun) {
+  MOZ_ASSERT(IsInterpretedNonSelfHostedFunction(fun));
+  AutoRealm ar(cx, fun);
+  return JSFunction::getOrCreateScript(cx, fun);
+}
+
+ArrayObject* js::GetFunctionParameterNamesArray(JSContext* cx,
+                                                HandleFunction fun) {
+  RootedValueVector names(cx);
+
+  if (!names.growBy(fun->nargs())) {
+    return nullptr;
+  }
+
+  if (IsInterpretedNonSelfHostedFunction(fun) && fun->nargs() > 0) {
+    RootedScript script(cx, GetOrCreateFunctionScript(cx, fun));
+    if (!script) {
+      return nullptr;
+    }
+
+    MOZ_ASSERT(fun->nargs() == script->numArgs());
+
+    PositionalFormalParameterIter fi(script);
+    for (size_t i = 0; i < fun->nargs(); i++, fi++) {
+      MOZ_ASSERT(fi.argumentSlot() == i);
+      if (JSAtom* atom = fi.name()) {
+        if (IsIdentifier(atom)) {
+          cx->markAtom(atom);
+          names[i].setString(atom);
+        }
+      }
+    }
+  }
+
+  return NewDenseCopiedArray(cx, names.length(), names.begin());
+}
+
+bool js::ValueToIdentifier(JSContext* cx, HandleValue v, MutableHandleId id) {
+  if (!ToPropertyKey(cx, v, id)) {
+    return false;
+  }
+  if (!id.isAtom() || !IsIdentifier(id.toAtom())) {
+    RootedValue val(cx, v);
+    ReportValueError(cx, JSMSG_UNEXPECTED_TYPE, JSDVG_SEARCH_STACK, val,
+                     nullptr, "not an identifier");
+    return false;
+  }
+  return true;
+}
+
+class js::AutoRestoreRealmDebugMode {
+  Realm* realm_;
+  uint32_t bits_;
+
+ public:
+  explicit AutoRestoreRealmDebugMode(Realm* realm)
+      : realm_(realm), bits_(realm->debugModeBits_) {
+    MOZ_ASSERT(realm_);
+  }
+
+  ~AutoRestoreRealmDebugMode() {
+    if (realm_) {
+      realm_->restoreDebugModeBitsOnOOM(bits_);
+    }
+  }
+
+  void release() { realm_ = nullptr; }
+};
+
+bool DebugAPI::slowPathCheckNoExecute(JSContext* cx, HandleScript script) {
+  MOZ_ASSERT(cx->realm()->isDebuggee());
+  MOZ_ASSERT(cx->noExecuteDebuggerTop);
+  return EnterDebuggeeNoExecute::reportIfFoundInStack(cx, script);
+}
+
+static void PropagateForcedReturn(JSContext* cx, AbstractFramePtr frame,
+                                  HandleValue rval) {
+  MOZ_ASSERT(!cx->isExceptionPending());
+  cx->setPropagatingForcedReturn();
+  frame.setReturnValue(rval);
+}
+
+[[nodiscard]] static bool AdjustGeneratorResumptionValue(JSContext* cx,
+                                                         AbstractFramePtr frame,
+                                                         ResumeMode& resumeMode,
+                                                         MutableHandleValue vp);
+
+[[nodiscard]] static bool ApplyFrameResumeMode(JSContext* cx,
+                                               AbstractFramePtr frame,
+                                               ResumeMode resumeMode,
+                                               HandleValue rv,
+                                               Handle<SavedFrame*> exnStack) {
+  RootedValue rval(cx, rv);
+
+  if (!cx->compartment()->wrap(cx, &rval)) {
+    return false;
+  }
+
+  if (!AdjustGeneratorResumptionValue(cx, frame, resumeMode, &rval)) {
+    return false;
+  }
+
+  switch (resumeMode) {
+    case ResumeMode::Continue:
+      break;
+
+    case ResumeMode::Throw:
+      if (exnStack) {
+        cx->setPendingException(rval, exnStack);
+      } else {
+        cx->setPendingException(rval, ShouldCaptureStack::Always);
+      }
+      return false;
+
+    case ResumeMode::Terminate:
+      cx->reportUncatchableException();
+      return false;
+
+    case ResumeMode::Return:
+      PropagateForcedReturn(cx, frame, rval);
+      return false;
+
+    default:
+      MOZ_CRASH("bad Debugger::onEnterFrame resume mode");
+  }
+
+  return true;
+}
+static bool ApplyFrameResumeMode(JSContext* cx, AbstractFramePtr frame,
+                                 ResumeMode resumeMode, HandleValue rval) {
+  Rooted<SavedFrame*> nullStack(cx);
+  return ApplyFrameResumeMode(cx, frame, resumeMode, rval, nullStack);
+}
+
+bool js::ValueToStableChars(JSContext* cx, const char* fnname,
+                            HandleValue value,
+                            AutoStableStringChars& stableChars) {
+  if (!value.isString()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_NOT_EXPECTED_TYPE, fnname, "string",
+                              InformalValueTypeName(value));
+    return false;
+  }
+  Rooted<JSLinearString*> linear(cx, value.toString()->ensureLinear(cx));
+  if (!linear) {
+    return false;
+  }
+  if (!stableChars.initTwoByte(cx, linear)) {
+    return false;
+  }
+  return true;
+}
+
+bool EvalOptions::setFilename(JSContext* cx, const char* filename) {
+  JS::UniqueChars copy;
+  if (filename) {
+    copy = DuplicateString(cx, filename);
+    if (!copy) {
+      return false;
+    }
+  }
+
+  filename_ = std::move(copy);
+  return true;
+}
+
+bool js::ParseEvalOptions(JSContext* cx, HandleValue value,
+                          EvalOptions& options) {
+  if (!value.isObject()) {
+    return true;
+  }
+
+  RootedObject opts(cx, &value.toObject());
+
+  RootedValue v(cx);
+  if (!JS_GetProperty(cx, opts, "url", &v)) {
+    return false;
+  }
+  if (!v.isUndefined()) {
+    RootedString url_str(cx, ToString<CanGC>(cx, v));
+    if (!url_str) {
+      return false;
+    }
+    UniqueChars url_bytes = JS_EncodeStringToUTF8(cx, url_str);
+    if (!url_bytes) {
+      return false;
+    }
+    if (!options.setFilename(cx, url_bytes.get())) {
+      return false;
+    }
+  }
+
+  if (!JS_GetProperty(cx, opts, "lineNumber", &v)) {
+    return false;
+  }
+  if (!v.isUndefined()) {
+    uint32_t lineno;
+    if (!ToUint32(cx, v, &lineno)) {
+      return false;
+    }
+    options.setLineno(lineno);
+  }
+
+  if (!JS_GetProperty(cx, opts, "hideFromDebugger", &v)) {
+    return false;
+  }
+  options.setHideFromDebugger(ToBoolean(v));
+
+  if (!JS_GetProperty(cx, opts, "bypassCSP", &v)) {
+    return false;
+  }
+  options.setBypassCSP(ToBoolean(v));
+
+  if (options.kind() == EvalOptions::EnvKind::GlobalWithExtraOuterBindings) {
+    if (!JS_GetProperty(cx, opts, "useInnerBindings", &v)) {
+      return false;
+    }
+    if (ToBoolean(v)) {
+      options.setUseInnerBindings();
+    }
+  }
+
+  return true;
+}
+
+template <class R, class W, bool IKO>
+DebuggerWeakMap<R, W, IKO>::DebuggerWeakMap(JSContext* cx)
+    : Base(cx->zone()), compartment(cx->compartment()) {}
+
+
+bool BreakpointSite::isEmpty() const { return breakpoints.isEmpty(); }
+
+void BreakpointSite::trace(JSTracer* trc) {
+  for (auto p = breakpoints.begin(); p; p++) {
+    p->trace(trc);
+  }
+}
+
+void BreakpointSite::finalize(JS::GCContext* gcx) {
+  while (!breakpoints.isEmpty()) {
+    breakpoints.begin()->delete_(gcx);
+  }
+}
+
+Breakpoint* BreakpointSite::firstBreakpoint() const {
+  if (isEmpty()) {
+    return nullptr;
+  }
+  return &(*breakpoints.begin());
+}
+
+bool BreakpointSite::hasBreakpoint(Breakpoint* toFind) {
+  const BreakpointList::Iterator bp(toFind);
+  for (auto p = breakpoints.begin(); p; p++) {
+    if (p == bp) {
+      return true;
+    }
+  }
+  return false;
+}
+
+Breakpoint::Breakpoint(Debugger* debugger, HandleObject wrappedDebugger,
+                       BreakpointSite* site, HandleObject handler)
+    : debugger(debugger),
+      wrappedDebugger(wrappedDebugger),
+      site(site),
+      handler(handler) {
+  MOZ_ASSERT(UncheckedUnwrap(wrappedDebugger) == debugger->object);
+  MOZ_ASSERT(handler->compartment() == wrappedDebugger->compartment());
+
+  debugger->breakpoints.pushBack(this);
+  site->breakpoints.pushBack(this);
+}
+
+void Breakpoint::trace(JSTracer* trc) {
+  MOZ_ASSERT_IF(trc->kind() != JS::TracerKind::Moving,
+                !IsDeadProxyObject(wrappedDebugger));
+  TraceEdge(trc, &wrappedDebugger, "breakpoint owner");
+
+  TraceEdge(trc, &handler, "breakpoint handler");
+}
+
+void Breakpoint::delete_(JS::GCContext* gcx) {
+  debugger->breakpoints.remove(this);
+  site->breakpoints.remove(this);
+  gc::Cell* cell = site->owningCell();
+  gcx->delete_(cell, this, MemoryUse::Breakpoint);
+}
+
+void Breakpoint::remove(JS::GCContext* gcx) {
+  BreakpointSite* savedSite = site;
+  delete_(gcx);
+
+  savedSite->destroyIfEmpty(gcx);
+}
+
+Breakpoint* Breakpoint::nextInDebugger() { return debuggerLink.mNext; }
+
+Breakpoint* Breakpoint::nextInSite() { return siteLink.mNext; }
+
+JSBreakpointSite::JSBreakpointSite(JSScript* script, jsbytecode* pc)
+    : script(script), pc(pc) {
+  MOZ_ASSERT(!DebugAPI::hasBreakpointsAt(script, pc));
+}
+
+void JSBreakpointSite::remove(JS::GCContext* gcx) {
+  DebugScript::destroyBreakpointSite(gcx, script, pc);
+}
+
+void JSBreakpointSite::trace(JSTracer* trc) {
+  BreakpointSite::trace(trc);
+  TraceEdge(trc, &script, "breakpoint script");
+}
+
+void JSBreakpointSite::delete_(JS::GCContext* gcx) {
+  BreakpointSite::finalize(gcx);
+
+  gcx->delete_(script, this, MemoryUse::BreakpointSite);
+}
+
+gc::Cell* JSBreakpointSite::owningCell() { return script; }
+
+Realm* JSBreakpointSite::realm() const { return script->realm(); }
+
+WasmBreakpointSite::WasmBreakpointSite(WasmInstanceObject* instanceObject_,
+                                       uint32_t offset_)
+    : instanceObject(instanceObject_), offset(offset_) {
+  MOZ_ASSERT(instanceObject_);
+  MOZ_ASSERT(instanceObject_->instance().debugEnabled());
+}
+
+void WasmBreakpointSite::trace(JSTracer* trc) {
+  BreakpointSite::trace(trc);
+  TraceEdge(trc, &instanceObject, "breakpoint Wasm instance");
+}
+
+void WasmBreakpointSite::remove(JS::GCContext* gcx) {
+  instanceObject->instance().destroyBreakpointSite(gcx, offset);
+}
+
+void WasmBreakpointSite::delete_(JS::GCContext* gcx) {
+  BreakpointSite::finalize(gcx);
+
+  gcx->delete_(instanceObject, this, MemoryUse::BreakpointSite);
+}
+
+gc::Cell* WasmBreakpointSite::owningCell() { return instanceObject; }
+
+Realm* WasmBreakpointSite::realm() const { return instanceObject->realm(); }
+
+
+Debugger::Debugger(JSContext* cx, NativeObject* dbg)
+    : object(dbg),
+      debuggees(cx->zone()),
+      uncaughtExceptionHook(nullptr),
+      allowUnobservedWasm(false),
+      exclusiveDebuggerOnEval(false),
+      inspectNativeCallArguments(false),
+      collectCoverageInfo(false),
+      shouldAvoidSideEffects(false),
+      observedGCs(cx->zone()),
+      allocationsLog(cx),
+      trackingAllocationSites(false),
+      allocationSamplingProbability(1.0),
+      maxAllocationsLogLength(DEFAULT_MAX_LOG_LENGTH),
+      allocationsLogOverflowed(false),
+      frames(cx->zone()),
+      generatorFrames(cx),
+#ifdef ENABLE_WASM_JSPI
+      wasmContFrames(cx->zone()),
+#endif
+      scripts(cx),
+      sources(cx),
+      objects(cx),
+      environments(cx),
+      wasmInstanceScripts(cx),
+      wasmInstanceSources(cx) {
+  cx->check(dbg);
+
+  cx->runtime()->debuggerList().insertBack(this);
+}
+
+template <typename ElementAccess>
+static void RemoveDebuggerEntry(
+    mozilla::DoublyLinkedList<Debugger, ElementAccess>& list, Debugger* dbg) {
+  if (list.ElementProbablyInList(dbg)) {
+    list.remove(dbg);
+  }
+}
+
+Debugger::~Debugger() {
+  MOZ_ASSERT(debuggees.empty());
+  allocationsLog.clear();
+
+  MOZ_ASSERT(breakpoints.isEmpty());
+
+  JSContext* cx = TlsContext.get();
+  RemoveDebuggerEntry(cx->runtime()->onNewGlobalObjectWatchers(), this);
+  RemoveDebuggerEntry(cx->runtime()->onGarbageCollectionWatchers(), this);
+}
+
+#ifdef DEBUG
+bool Debugger::isChildJSObject(JSObject* obj) {
+  return obj->getClass() == &DebuggerFrame::class_ ||
+         obj->getClass() == &DebuggerScript::class_ ||
+         obj->getClass() == &DebuggerSource::class_ ||
+         obj->getClass() == &DebuggerObject::class_ ||
+         obj->getClass() == &DebuggerEnvironment::class_;
+}
+#endif
+
+bool Debugger::hasMemory() const {
+  return object->getReservedSlot(JSSLOT_DEBUG_MEMORY_INSTANCE).isObject();
+}
+
+DebuggerMemory& Debugger::memory() const {
+  MOZ_ASSERT(hasMemory());
+  return object->getReservedSlot(JSSLOT_DEBUG_MEMORY_INSTANCE)
+      .toObject()
+      .as<DebuggerMemory>();
+}
+
+
+bool Debugger::getFrame(JSContext* cx, const FrameIter& iter,
+                        MutableHandleValue vp) {
+  Rooted<DebuggerFrame*> result(cx);
+  if (!Debugger::getFrame(cx, iter, &result)) {
+    return false;
+  }
+  vp.setObject(*result);
+  return true;
+}
+
+bool Debugger::getFrame(JSContext* cx, MutableHandle<DebuggerFrame*> result) {
+  RootedObject proto(
+      cx, &object->getReservedSlot(JSSLOT_DEBUG_FRAME_PROTO).toObject());
+  Rooted<NativeObject*> debugger(cx, object);
+
+  Rooted<DebuggerFrame*> frame(
+      cx, DebuggerFrame::create(cx, proto, debugger, nullptr, nullptr));
+  if (!frame) {
+    return false;
+  }
+
+  result.set(frame);
+  return true;
+}
+
+bool Debugger::getFrame(JSContext* cx, const FrameIter& iter,
+                        MutableHandle<DebuggerFrame*> result) {
+  AbstractFramePtr referent = iter.abstractFramePtr();
+  MOZ_ASSERT_IF(referent.hasScript(), !referent.script()->selfHosted());
+
+  FrameMap::AddPtr p = frames.lookupForAdd(referent);
+  if (!p) {
+    Rooted<AbstractGeneratorObject*> genObj(cx);
+    if (referent.isGeneratorFrame()) {
+      if (referent.isFunctionFrame()) {
+        AutoRealm ar(cx, referent.callee());
+        genObj = GetGeneratorObjectForFrame(cx, referent);
+      } else {
+        MOZ_ASSERT(referent.isModuleFrame());
+        AutoRealm ar(cx, referent.script()->module());
+        genObj = GetGeneratorObjectForFrame(cx, referent);
+      }
+
+      MOZ_ASSERT_IF(genObj, !generatorFrames.has(genObj));
+
+      if (genObj && genObj->isClosed()) {
+        genObj = nullptr;
+      }
+
+    }
+
+    RootedObject proto(
+        cx, &object->getReservedSlot(JSSLOT_DEBUG_FRAME_PROTO).toObject());
+    Rooted<NativeObject*> debugger(cx, object);
+
+    Rooted<DebuggerFrame*> frame(
+        cx, DebuggerFrame::create(cx, proto, debugger, &iter, genObj));
+    if (!frame) {
+      return false;
+    }
+
+    auto terminateDebuggerFrameGuard = MakeScopeExit([&] {
+      terminateDebuggerFrame(cx->gcContext(), this, frame, referent);
+    });
+
+    if (genObj) {
+      DependentAddPtr<GeneratorWeakMap> genPtr(cx, generatorFrames, genObj);
+      if (!genPtr.add(cx, generatorFrames, genObj, frame)) {
+        return false;
+      }
+    }
+
+    if (!ensureExecutionObservabilityOfFrame(cx, referent)) {
+      return false;
+    }
+
+    if (!frames.add(p, referent, frame)) {
+      ReportOutOfMemory(cx);
+      return false;
+    }
+
+#ifdef ENABLE_WASM_JSPI
+    if (frame->isWasmContFrame()) {
+      if (!wasmContFrames.append(referent)) {
+        ReportOutOfMemory(cx);
+        return false;
+      }
+    }
+#endif
+
+    terminateDebuggerFrameGuard.release();
+  }
+
+  result.set(p->value());
+  return true;
+}
+
+bool Debugger::getFrame(JSContext* cx, Handle<AbstractGeneratorObject*> genObj,
+                        MutableHandle<DebuggerFrame*> result) {
+  MOZ_ASSERT(genObj->isSuspended());
+
+  DependentAddPtr<GeneratorWeakMap> p(cx, generatorFrames, genObj);
+  if (p) {
+    MOZ_ASSERT(&p->value()->unwrappedGenerator() == genObj);
+    result.set(p->value());
+    return true;
+  }
+
+  RootedObject proto(
+      cx, &object->getReservedSlot(JSSLOT_DEBUG_FRAME_PROTO).toObject());
+  Rooted<NativeObject*> debugger(cx, object);
+
+  result.set(DebuggerFrame::create(cx, proto, debugger, nullptr, genObj));
+  if (!result) {
+    return false;
+  }
+
+  if (!p.add(cx, generatorFrames, genObj, result)) {
+    terminateDebuggerFrame(cx->gcContext(), this, result, NullFramePtr());
+    return false;
+  }
+
+  return true;
+}
+
+static bool DebuggerExists(
+    GlobalObject* global, const std::function<bool(Debugger* dbg)>& predicate) {
+  JS::AutoSuppressGCAnalysis nogc;
+
+  for (Realm::DebuggerVectorEntry& entry : global->getDebuggers(nogc)) {
+    if (predicate(entry.dbg.unbarrieredGet())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool Debugger::hasLiveHook(GlobalObject* global, Hook which) {
+  return DebuggerExists(global,
+                        [=](Debugger* dbg) { return dbg->getHook(which); });
+}
+
+bool DebugAPI::debuggerObservesAllExecution(GlobalObject* global) {
+  return DebuggerExists(
+      global, [=](Debugger* dbg) { return dbg->observesAllExecution(); });
+}
+
+bool DebugAPI::debuggerObservesCoverage(GlobalObject* global) {
+  return DebuggerExists(global,
+                        [=](Debugger* dbg) { return dbg->observesCoverage(); });
+}
+
+bool DebugAPI::debuggerObservesWasm(GlobalObject* global) {
+  return DebuggerExists(global,
+                        [=](Debugger* dbg) { return dbg->observesWasm(); });
+}
+
+bool DebugAPI::debuggerObservesNativeCall(GlobalObject* global) {
+  return DebuggerExists(
+      global, [=](Debugger* dbg) { return dbg->observesNativeCalls(); });
+}
+
+bool DebugAPI::hasExceptionUnwindHook(GlobalObject* global) {
+  return Debugger::hasLiveHook(global, Debugger::OnExceptionUnwind);
+}
+
+bool DebugAPI::hasDebuggerStatementHook(GlobalObject* global) {
+  return Debugger::hasLiveHook(global, Debugger::OnDebuggerStatement);
+}
+
+template <typename HookIsEnabledFun >
+bool DebuggerList<HookIsEnabledFun>::init(JSContext* cx) {
+  Handle<GlobalObject*> global = cx->global();
+  JS::AutoAssertNoGC nogc;
+  for (Realm::DebuggerVectorEntry& entry : global->getDebuggers(nogc)) {
+    Debugger* dbg = entry.dbg;
+    if (dbg->isHookCallAllowed(cx) && hookIsEnabled(dbg)) {
+      if (!debuggers.append(ObjectValue(*dbg->toJSObject()))) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+template <typename HookIsEnabledFun >
+template <typename FireHookFun >
+bool DebuggerList<HookIsEnabledFun>::dispatchHook(JSContext* cx,
+                                                  FireHookFun fireHook) {
+  JS::AutoDebuggerJobQueueInterruption adjqi;
+  if (!adjqi.init(cx)) {
+    return false;
+  }
+
+  Handle<GlobalObject*> global = cx->global();
+  for (Value* p = debuggers.begin(); p != debuggers.end(); p++) {
+    Debugger* dbg = Debugger::fromJSObject(&p->toObject());
+    EnterDebuggeeNoExecute nx(cx, *dbg, adjqi);
+    if (dbg->debuggees.has(global) && hookIsEnabled(dbg)) {
+      bool result =
+          dbg->enterDebuggerHook(cx, [&]() -> bool { return fireHook(dbg); });
+      adjqi.runJobs();
+      if (!result) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+template <typename HookIsEnabledFun >
+template <typename FireHookFun >
+void DebuggerList<HookIsEnabledFun>::dispatchQuietHook(JSContext* cx,
+                                                       FireHookFun fireHook) {
+  bool result =
+      dispatchHook(cx, [&](Debugger* dbg) -> bool { return fireHook(dbg); });
+
+  if (!result) {
+    cx->clearPendingException();
+  }
+}
+
+template <typename HookIsEnabledFun >
+template <typename FireHookFun >
+bool DebuggerList<HookIsEnabledFun>::dispatchResumptionHook(
+    JSContext* cx, AbstractFramePtr frame, FireHookFun fireHook) {
+  ResumeMode resumeMode = ResumeMode::Continue;
+  RootedValue rval(cx);
+  return dispatchHook(cx,
+                      [&](Debugger* dbg) -> bool {
+                        return fireHook(dbg, resumeMode, &rval);
+                      }) &&
+         ApplyFrameResumeMode(cx, frame, resumeMode, rval);
+}
+
+JSObject* Debugger::getHook(Hook hook) const {
+  MOZ_ASSERT(hook >= 0 && hook < HookCount);
+  const Value& v = object->getReservedSlot(JSSLOT_DEBUG_HOOK_START +
+                                           std::underlying_type_t<Hook>(hook));
+  return v.isUndefined() ? nullptr : &v.toObject();
+}
+
+bool Debugger::hasAnyLiveHooks() const {
+  if (getHook(OnDebuggerStatement) || getHook(OnExceptionUnwind) ||
+      getHook(OnNewScript) || getHook(OnEnterFrame)) {
+    return true;
+  }
+
+  return false;
+}
+
+bool DebugAPI::slowPathOnEnterFrame(JSContext* cx, AbstractFramePtr frame) {
+#ifdef MOZ_EXECUTION_TRACING
+  if (cx->hasExecutionTracer()) {
+    cx->getExecutionTracer().onEnterFrame(cx, frame);
+  }
+#endif
+  return Debugger::dispatchResumptionHook(
+      cx, frame,
+      [frame](Debugger* dbg) -> bool {
+        return dbg->observesFrame(frame) && dbg->observesEnterFrame();
+      },
+      [&](Debugger* dbg, ResumeMode& resumeMode, MutableHandleValue vp)
+          -> bool { return dbg->fireEnterFrame(cx, resumeMode, vp); });
+}
+
+bool DebugAPI::slowPathOnResumeFrame(JSContext* cx, AbstractFramePtr frame) {
+#ifdef MOZ_EXECUTION_TRACING
+  if (cx->hasExecutionTracer()) {
+    cx->getExecutionTracer().onEnterFrame(cx, frame);
+  }
+#endif
+  MOZ_ASSERT(frame.isGeneratorFrame());
+  MOZ_ASSERT(frame.isDebuggee());
+
+  Rooted<AbstractGeneratorObject*> genObj(
+      cx, GetGeneratorObjectForFrame(cx, frame));
+  MOZ_ASSERT(genObj);
+
+  auto terminateDebuggerFramesGuard = MakeScopeExit([&] {
+    Debugger::terminateDebuggerFrames(cx, frame);
+
+    MOZ_ASSERT(!DebugAPI::inFrameMaps(frame));
+  });
+
+  FrameIter iter(cx);
+  MOZ_ASSERT(iter.abstractFramePtr() == frame);
+  {
+    JS::AutoAssertNoGC nogc;
+    for (Realm::DebuggerVectorEntry& entry :
+         frame.global()->getDebuggers(nogc)) {
+      Debugger* dbg = entry.dbg;
+      if (Debugger::GeneratorWeakMap::Ptr generatorEntry =
+              dbg->generatorFrames.lookup(genObj)) {
+        DebuggerFrame* frameObj = generatorEntry->value();
+        MOZ_ASSERT(&frameObj->unwrappedGenerator() == genObj);
+        if (!dbg->frames.putNew(frame, frameObj)) {
+          ReportOutOfMemory(cx);
+          return false;
+        }
+        if (!frameObj->resume(iter)) {
+          return false;
+        }
+      }
+    }
+  }
+
+  terminateDebuggerFramesGuard.release();
+
+  return slowPathOnEnterFrame(cx, frame);
+}
+
+NativeResumeMode DebugAPI::slowPathOnNativeCall(JSContext* cx,
+                                                const CallArgs& args,
+                                                CallReason reason) {
+  if (!cx->realm()->debuggerObservesNativeCall()) {
+    return NativeResumeMode::Continue;
+  }
+
+  DebuggerList debuggerList(cx, [](Debugger* dbg) -> bool {
+    return dbg->getHook(Debugger::OnNativeCall);
+  });
+
+  if (!debuggerList.init(cx)) {
+    return NativeResumeMode::Abort;
+  }
+
+  if (debuggerList.empty()) {
+    return NativeResumeMode::Continue;
+  }
+
+  JSScript* script = cx->currentScript();
+  if (script && script->selfHosted() && reason != CallReason::CallContent &&
+      reason != CallReason::FunCall && reason != CallReason::Getter &&
+      reason != CallReason::Setter) {
+    return NativeResumeMode::Continue;
+  }
+
+  RootedValue rval(cx);
+  ResumeMode resumeMode = ResumeMode::Continue;
+  bool result = debuggerList.dispatchHook(cx, [&](Debugger* dbg) -> bool {
+    return dbg->fireNativeCall(cx, args, reason, resumeMode, &rval);
+  });
+  if (!result) {
+    return NativeResumeMode::Abort;
+  }
+
+  if (resumeMode == ResumeMode::Return) {
+    if (args.isConstructing() && !rval.isObject()) {
+      JS_ReportErrorASCII(
+          cx, "onNativeCall hook must return an object for constructor call");
+      return NativeResumeMode::Abort;
+    }
+  }
+
+  if (!cx->compartment()->wrap(cx, &rval)) {
+    return NativeResumeMode::Abort;
+  }
+
+  switch (resumeMode) {
+    case ResumeMode::Continue:
+      break;
+
+    case ResumeMode::Throw:
+      cx->setPendingException(rval, ShouldCaptureStack::Always);
+      return NativeResumeMode::Abort;
+
+    case ResumeMode::Terminate:
+      cx->reportUncatchableException();
+      return NativeResumeMode::Abort;
+
+    case ResumeMode::Return:
+      args.rval().set(rval);
+      return NativeResumeMode::Override;
+  }
+
+  return NativeResumeMode::Continue;
+}
+
+bool DebugAPI::slowPathShouldAvoidSideEffects(JSContext* cx) {
+  return DebuggerExists(
+      cx->global(), [=](Debugger* dbg) { return dbg->shouldAvoidSideEffects; });
+}
+
+class MOZ_RAII AutoSetGeneratorRunning {
+  int32_t resumeIndex_;
+  AsyncGeneratorObject::State asyncGenState_;
+  Rooted<AbstractGeneratorObject*> genObj_;
+
+ public:
+  AutoSetGeneratorRunning(JSContext* cx,
+                          Handle<AbstractGeneratorObject*> genObj)
+      : resumeIndex_(0),
+        asyncGenState_(static_cast<AsyncGeneratorObject::State>(0)),
+        genObj_(cx, genObj) {
+    if (genObj) {
+      if (!genObj->isClosed() && !genObj->isBeforeInitialYield() &&
+          genObj->isSuspended()) {
+        resumeIndex_ = genObj->resumeIndex();
+        genObj->setRunning();
+
+        if (genObj->is<AsyncGeneratorObject>()) {
+          auto* generator = &genObj->as<AsyncGeneratorObject>();
+          asyncGenState_ = generator->state();
+          generator->setExecuting();
+        }
+      } else {
+        genObj_ = nullptr;
+      }
+    }
+  }
+
+  ~AutoSetGeneratorRunning() {
+    if (genObj_) {
+      MOZ_ASSERT(genObj_->isRunning());
+      genObj_->setResumeIndex(resumeIndex_);
+      if (genObj_->is<AsyncGeneratorObject>()) {
+        genObj_->as<AsyncGeneratorObject>().setState(asyncGenState_);
+      }
+    }
+  }
+};
+
+bool DebugAPI::slowPathOnLeaveFrame(JSContext* cx, AbstractFramePtr frame,
+                                    const jsbytecode* pc, bool frameOk) {
+#ifdef MOZ_EXECUTION_TRACING
+  if (cx->hasExecutionTracer()) {
+    cx->getExecutionTracer().onLeaveFrame(cx, frame);
+  }
+#endif
+  MOZ_ASSERT_IF(!frame.isWasmDebugFrame(), pc);
+
+  mozilla::DebugOnly<Handle<GlobalObject*>> debuggeeGlobal = cx->global();
+
+  Rooted<Completion> completion(cx);
+  bool success = false;
+
+  auto frameMapsGuard = MakeScopeExit([&] {
+    if (success && completion.get().suspending()) {
+      Debugger::suspendGeneratorDebuggerFrames(cx, frame);
+    } else {
+      if (frame.isWasmDebugFrame()) {
+        DebugEnvironments::onPopWasm(cx, frame);
+      }
+      Debugger::terminateDebuggerFrames(cx, frame);
+    }
+  });
+
+  Rooted<Debugger::DebuggerFrameVector> frames(cx);
+  if (!Debugger::getDebuggerFrames(frame, &frames)) {
+    if (!frameOk) {
+      cx->clearPendingException();
+    }
+    ReportOutOfMemory(cx);
+    return false;
+  }
+  if (frames.empty()) {
+    return frameOk;
+  }
+
+  completion = Completion::fromJSFramePop(cx, frame, pc, frameOk);
+
+  ResumeMode resumeMode = ResumeMode::Continue;
+  RootedValue rval(cx);
+
+  {
+    JS::AutoDebuggerJobQueueInterruption adjqi;
+    if (!adjqi.init(cx)) {
+      return false;
+    }
+
+    if (!cx->isThrowingOverRecursed() && !cx->isThrowingOutOfMemory()) {
+      Rooted<AbstractGeneratorObject*> genObj(
+          cx, frame.isGeneratorFrame() ? GetGeneratorObjectForFrame(cx, frame)
+                                       : nullptr);
+
+      for (size_t i = 0; i < frames.length(); i++) {
+        Handle<DebuggerFrame*> frameobj = frames[i];
+        Debugger* dbg = frameobj->owner();
+        EnterDebuggeeNoExecute nx(cx, *dbg, adjqi);
+
+        if (frameobj->isOnStack(cx) && frameobj->onPopHandler()) {
+          OnPopHandler* handler = frameobj->onPopHandler();
+
+          bool result = dbg->enterDebuggerHook(cx, [&]() -> bool {
+            ResumeMode nextResumeMode = ResumeMode::Continue;
+            RootedValue nextValue(cx);
+
+            bool success;
+            {
+              AutoSetGeneratorRunning asgr(cx, genObj);
+              success = handler->onPop(cx, frameobj, completion, nextResumeMode,
+                                       &nextValue);
+            }
+
+            return dbg->processParsedHandlerResult(cx, frame, pc, success,
+                                                   nextResumeMode, nextValue,
+                                                   resumeMode, &rval);
+          });
+          adjqi.runJobs();
+
+          if (!result) {
+            return false;
+          }
+
+          MOZ_ASSERT(!cx->isExceptionPending());
+        }
+      }
+    }
+  }
+
+  completion.get().updateFromHookResult(resumeMode, rval);
+
+  ResumeMode completionResumeMode;
+  RootedValue completionValue(cx);
+  Rooted<SavedFrame*> completionStack(cx);
+  completion.get().toResumeMode(completionResumeMode, &completionValue,
+                                &completionStack);
+
+  if (resumeMode == ResumeMode::Continue &&
+      completionResumeMode == ResumeMode::Return) {
+    completionResumeMode = ResumeMode::Continue;
+  }
+
+  if (!ApplyFrameResumeMode(cx, frame, completionResumeMode, completionValue,
+                            completionStack)) {
+    if (!cx->isPropagatingForcedReturn()) {
+      return false;
+    }
+
+    cx->clearPropagatingForcedReturn();
+  }
+  success = true;
+  return true;
+}
+
+bool DebugAPI::slowPathOnNewGenerator(JSContext* cx, AbstractFramePtr frame,
+                                      Handle<AbstractGeneratorObject*> genObj) {
+
+  auto terminateDebuggerFramesGuard =
+      MakeScopeExit([&] { Debugger::terminateDebuggerFrames(cx, frame); });
+
+  bool ok = true;
+  gc::AutoSuppressGC nogc(cx);
+  Debugger::forEachOnStackDebuggerFrame(
+      frame, nogc, [&](Debugger* dbg, DebuggerFrame* frameObjPtr) {
+        if (!ok) {
+          return;
+        }
+
+        Rooted<DebuggerFrame*> frameObj(cx, frameObjPtr);
+
+        AutoRealm ar(cx, frameObj);
+
+        if (!DebuggerFrame::setGeneratorInfo(cx, frameObj, genObj)) {
+          ok = false;
+          return;
+        }
+
+        DependentAddPtr<Debugger::GeneratorWeakMap> genPtr(
+            cx, dbg->generatorFrames, genObj);
+        if (!genPtr.add(cx, dbg->generatorFrames, genObj, frameObj)) {
+          ok = false;
+        }
+      });
+
+  if (!ok) {
+    return false;
+  }
+
+  terminateDebuggerFramesGuard.release();
+  return true;
+}
+
+bool DebugAPI::slowPathOnDebuggerStatement(JSContext* cx,
+                                           AbstractFramePtr frame) {
+  return Debugger::dispatchResumptionHook(
+      cx, frame,
+      [](Debugger* dbg) -> bool {
+        return dbg->getHook(Debugger::OnDebuggerStatement);
+      },
+      [&](Debugger* dbg, ResumeMode& resumeMode, MutableHandleValue vp)
+          -> bool { return dbg->fireDebuggerStatement(cx, resumeMode, vp); });
+}
+
+bool DebugAPI::slowPathOnExceptionUnwind(JSContext* cx,
+                                         AbstractFramePtr frame) {
+  if (cx->isThrowingOverRecursed() || cx->isThrowingOutOfMemory()) {
+    return true;
+  }
+
+  if (frame.hasScript() && frame.script()->selfHosted()) {
+    return true;
+  }
+
+  DebuggerList debuggerList(cx, [](Debugger* dbg) -> bool {
+    return dbg->getHook(Debugger::OnExceptionUnwind);
+  });
+
+  if (!debuggerList.init(cx)) {
+    return false;
+  }
+
+  if (debuggerList.empty()) {
+    return true;
+  }
+
+  RootedValue exc(cx);
+  Rooted<SavedFrame*> stack(cx, cx->getPendingExceptionStack());
+  if (!cx->getPendingException(&exc)) {
+    return false;
+  }
+  cx->clearPendingException();
+
+  bool result = debuggerList.dispatchResumptionHook(
+      cx, frame,
+      [&](Debugger* dbg, ResumeMode& resumeMode,
+          MutableHandleValue vp) -> bool {
+        return dbg->fireExceptionUnwind(cx, exc, resumeMode, vp);
+      });
+  if (!result) {
+    return false;
+  }
+
+  cx->setPendingException(exc, stack);
+  return true;
+}
+
+bool Debugger::wrapEnvironment(JSContext* cx, Handle<Env*> env,
+                               MutableHandleValue rval) {
+  if (!env) {
+    rval.setNull();
+    return true;
+  }
+
+  Rooted<DebuggerEnvironment*> envobj(cx);
+
+  if (!wrapEnvironment(cx, env, &envobj)) {
+    return false;
+  }
+
+  rval.setObject(*envobj);
+  return true;
+}
+
+bool Debugger::wrapEnvironment(JSContext* cx, Handle<Env*> env,
+                               MutableHandle<DebuggerEnvironment*> result) {
+  MOZ_ASSERT(env);
+
+  MOZ_ASSERT(!IsSyntacticEnvironment(env));
+
+  DependentAddPtr<EnvironmentWeakMap> p(cx, environments, env);
+  if (p) {
+    result.set(&p->value()->as<DebuggerEnvironment>());
+  } else {
+    RootedObject proto(
+        cx, &object->getReservedSlot(JSSLOT_DEBUG_ENV_PROTO).toObject());
+    Rooted<NativeObject*> debugger(cx, object);
+
+    Rooted<DebuggerEnvironment*> envobj(
+        cx, DebuggerEnvironment::create(cx, proto, env, debugger));
+    if (!envobj) {
+      return false;
+    }
+
+    if (!p.add(cx, environments, env, envobj)) {
+      envobj->clearReferent();
+      return false;
+    }
+
+    result.set(envobj);
+  }
+
+  return true;
+}
+
+bool Debugger::wrapDebuggeeValue(JSContext* cx, MutableHandleValue vp) {
+  cx->check(object.get());
+
+  if (vp.isObject()) {
+    RootedObject obj(cx, &vp.toObject());
+    Rooted<DebuggerObject*> dobj(cx);
+
+    if (!wrapDebuggeeObject(cx, obj, &dobj)) {
+      return false;
+    }
+
+    vp.setObject(*dobj);
+  } else if (vp.isMagic()) {
+    Rooted<PlainObject*> optObj(cx, NewPlainObject(cx));
+    if (!optObj) {
+      return false;
+    }
+
+    PropertyName* name;
+    switch (vp.whyMagic()) {
+      case JS_MISSING_ARGUMENTS:
+        name = cx->names().missingArguments;
+        break;
+      case JS_OPTIMIZED_OUT:
+        name = cx->names().optimizedOut;
+        break;
+      case JS_UNINITIALIZED_LEXICAL:
+        name = cx->names().uninitialized;
+        break;
+      default:
+        MOZ_CRASH("Unsupported magic value escaped to Debugger");
+    }
+
+    RootedValue trueVal(cx, BooleanValue(true));
+    if (!DefineDataProperty(cx, optObj, name, trueVal)) {
+      return false;
+    }
+
+    vp.setObject(*optObj);
+  } else if (!cx->compartment()->wrap(cx, vp)) {
+    vp.setUndefined();
+    return false;
+  }
+
+  return true;
+}
+
+bool Debugger::wrapNullableDebuggeeObject(
+    JSContext* cx, HandleObject obj, MutableHandle<DebuggerObject*> result) {
+  if (!obj) {
+    result.set(nullptr);
+    return true;
+  }
+
+  return wrapDebuggeeObject(cx, obj, result);
+}
+
+bool Debugger::wrapDebuggeeObject(JSContext* cx, HandleObject obj,
+                                  MutableHandle<DebuggerObject*> result) {
+  MOZ_ASSERT(obj);
+
+  DependentAddPtr<ObjectWeakMap> p(cx, objects, obj);
+  if (p) {
+    result.set(&p->value()->as<DebuggerObject>());
+  } else {
+    Rooted<NativeObject*> debugger(cx, object);
+    RootedObject proto(
+        cx, &object->getReservedSlot(JSSLOT_DEBUG_OBJECT_PROTO).toObject());
+    Rooted<DebuggerObject*> dobj(
+        cx, DebuggerObject::create(cx, proto, obj, debugger));
+    if (!dobj) {
+      return false;
+    }
+
+    if (!p.add(cx, objects, obj, dobj)) {
+      dobj->clearReferent();
+      return false;
+    }
+
+    result.set(dobj);
+  }
+
+  return true;
+}
+
+static DebuggerObject* ToNativeDebuggerObject(JSContext* cx,
+                                              MutableHandleObject obj) {
+  if (!obj->is<DebuggerObject>()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_NOT_EXPECTED_TYPE, "Debugger",
+                              "Debugger.Object", obj->getClass()->name);
+    return nullptr;
+  }
+
+  return &obj->as<DebuggerObject>();
+}
+
+bool Debugger::unwrapDebuggeeObject(JSContext* cx, MutableHandleObject obj) {
+  DebuggerObject* ndobj = ToNativeDebuggerObject(cx, obj);
+  if (!ndobj) {
+    return false;
+  }
+
+  if (ndobj->owner() != Debugger::fromJSObject(object)) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_DEBUG_WRONG_OWNER, "Debugger.Object");
+    return false;
+  }
+
+  obj.set(ndobj->referent());
+  return true;
+}
+
+bool Debugger::unwrapDebuggeeValue(JSContext* cx, MutableHandleValue vp) {
+  cx->check(object.get(), vp);
+  if (vp.isObject()) {
+    RootedObject dobj(cx, &vp.toObject());
+    if (!unwrapDebuggeeObject(cx, &dobj)) {
+      return false;
+    }
+    vp.setObject(*dobj);
+  }
+  return true;
+}
+
+static bool CheckArgCompartment(JSContext* cx, JSObject* obj, JSObject* arg,
+                                const char* methodname, const char* propname) {
+  if (arg->compartment() != obj->compartment()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_DEBUG_COMPARTMENT_MISMATCH, methodname,
+                              propname);
+    return false;
+  }
+  return true;
+}
+
+static bool CheckArgCompartment(JSContext* cx, JSObject* obj, HandleValue v,
+                                const char* methodname, const char* propname) {
+  if (v.isObject()) {
+    return CheckArgCompartment(cx, obj, &v.toObject(), methodname, propname);
+  }
+  return true;
+}
+
+bool Debugger::unwrapPropertyDescriptor(
+    JSContext* cx, HandleObject obj, MutableHandle<PropertyDescriptor> desc) {
+  if (desc.hasValue()) {
+    RootedValue value(cx, desc.value());
+    if (!unwrapDebuggeeValue(cx, &value) ||
+        !CheckArgCompartment(cx, obj, value, "defineProperty", "value")) {
+      return false;
+    }
+    desc.setValue(value);
+  }
+
+  if (desc.hasGetter()) {
+    RootedObject get(cx, desc.getter());
+    if (get) {
+      if (!unwrapDebuggeeObject(cx, &get)) {
+        return false;
+      }
+      if (!CheckArgCompartment(cx, obj, get, "defineProperty", "get")) {
+        return false;
+      }
+    }
+    desc.setGetter(get);
+  }
+
+  if (desc.hasSetter()) {
+    RootedObject set(cx, desc.setter());
+    if (set) {
+      if (!unwrapDebuggeeObject(cx, &set)) {
+        return false;
+      }
+      if (!CheckArgCompartment(cx, obj, set, "defineProperty", "set")) {
+        return false;
+      }
+    }
+    desc.setSetter(set);
+  }
+
+  return true;
+}
+
+
+static bool GetResumptionProperty(JSContext* cx, HandleObject obj,
+                                  Handle<PropertyName*> name,
+                                  ResumeMode namedMode, ResumeMode& resumeMode,
+                                  MutableHandleValue vp, int* hits) {
+  bool found;
+  if (!HasProperty(cx, obj, name, &found)) {
+    return false;
+  }
+  if (found) {
+    ++*hits;
+    resumeMode = namedMode;
+    if (!GetProperty(cx, obj, obj, name, vp)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool js::ParseResumptionValue(JSContext* cx, HandleValue rval,
+                              ResumeMode& resumeMode, MutableHandleValue vp) {
+  if (rval.isUndefined()) {
+    resumeMode = ResumeMode::Continue;
+    vp.setUndefined();
+    return true;
+  }
+  if (rval.isNull()) {
+    resumeMode = ResumeMode::Terminate;
+    vp.setUndefined();
+    return true;
+  }
+
+  int hits = 0;
+  if (rval.isObject()) {
+    RootedObject obj(cx, &rval.toObject());
+    if (!GetResumptionProperty(cx, obj, cx->names().return_, ResumeMode::Return,
+                               resumeMode, vp, &hits)) {
+      return false;
+    }
+    if (!GetResumptionProperty(cx, obj, cx->names().throw_, ResumeMode::Throw,
+                               resumeMode, vp, &hits)) {
+      return false;
+    }
+  }
+
+  if (hits != 1) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_DEBUG_BAD_RESUMPTION);
+    return false;
+  }
+  return true;
+}
+
+static bool CheckResumptionValue(JSContext* cx, AbstractFramePtr frame,
+                                 const jsbytecode* pc, ResumeMode resumeMode,
+                                 MutableHandleValue vp) {
+  if (resumeMode != ResumeMode::Return || !frame) {
+    return true;
+  }
+
+  if (frame.debuggerNeedsCheckPrimitiveReturn() && vp.isPrimitive()) {
+    if (!vp.isUndefined()) {
+      ReportValueError(cx, JSMSG_BAD_DERIVED_RETURN, JSDVG_IGNORE_STACK, vp,
+                       nullptr);
+      return false;
+    }
+
+    RootedValue thisv(cx);
+    {
+      AutoRealm ar(cx, frame.environmentChain());
+      if (!GetThisValueForDebuggerFrameMaybeOptimizedOut(cx, frame, pc,
+                                                         &thisv)) {
+        return false;
+      }
+    }
+
+    if (thisv.isMagic(JS_UNINITIALIZED_LEXICAL)) {
+      return ThrowUninitializedThis(cx);
+    }
+    MOZ_ASSERT(!thisv.isMagic());
+
+    if (!cx->compartment()->wrap(cx, &thisv)) {
+      return false;
+    }
+    vp.set(thisv);
+  }
+
+  if (frame.isFunctionFrame() && frame.callee()->isGenerator()) {
+    Rooted<AbstractGeneratorObject*> genObj(cx);
+    {
+      AutoRealm ar(cx, frame.callee());
+      genObj = GetGeneratorObjectForFrame(cx, frame);
+    }
+
+    if (!genObj || genObj->isBeforeInitialYield()) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                JSMSG_DEBUG_FORCED_RETURN_DISALLOWED);
+      return false;
+    }
+  }
+
+  return true;
+}
+
+[[nodiscard]] static bool AdjustGeneratorResumptionValue(
+    JSContext* cx, AbstractFramePtr frame, ResumeMode& resumeMode,
+    MutableHandleValue vp) {
+  if (resumeMode != ResumeMode::Return && resumeMode != ResumeMode::Throw) {
+    return true;
+  }
+
+  if (!frame) {
+    return true;
+  }
+  bool isAsyncModule = frame.isModuleFrame() && frame.script()->isAsync();
+  if (!frame.isFunctionFrame() && !isAsyncModule) {
+    return true;
+  }
+
+  if (frame.isFunctionFrame() && frame.callee()->isGenerator()) {
+    if (resumeMode == ResumeMode::Throw) {
+      return true;
+    }
+
+    Rooted<AbstractGeneratorObject*> genObj(
+        cx, GetGeneratorObjectForFrame(cx, frame));
+
+    MOZ_RELEASE_ASSERT(genObj && !genObj->isBeforeInitialYield());
+
+    if (!genObj->is<AsyncGeneratorObject>()) {
+      PlainObject* pair = CreateIterResultObject(cx, vp, true);
+      if (!pair) {
+        return false;
+      }
+      vp.setObject(*pair);
+    }
+
+    genObj->setClosed(cx);
+
+    if (genObj->is<AsyncGeneratorObject>()) {
+      genObj->as<AsyncGeneratorObject>().setCompleted();
+    }
+  } else if (isAsyncModule || frame.callee()->isAsync()) {
+    if (AbstractGeneratorObject* genObj =
+            GetGeneratorObjectForFrame(cx, frame)) {
+      if (resumeMode == ResumeMode::Throw) {
+        return true;
+      }
+
+      Rooted<AsyncFunctionGeneratorObject*> generator(
+          cx, &genObj->as<AsyncFunctionGeneratorObject>());
+
+      Rooted<PromiseObject*> promise(cx, generator->promise());
+      if (promise->state() == JS::PromiseState::Pending) {
+        if (!AsyncFunctionResolve(cx, generator, vp)) {
+          return false;
+        }
+      }
+      vp.setObject(*promise);
+
+      generator->setClosed(cx);
+    } else {
+
+      JSObject* promise = resumeMode == ResumeMode::Throw
+                              ? PromiseObject::unforgeableReject(cx, vp)
+                              : PromiseObject::unforgeableResolve(cx, vp);
+      if (!promise) {
+        return false;
+      }
+      vp.setObject(*promise);
+
+      resumeMode = ResumeMode::Return;
+    }
+  }
+
+  return true;
+}
+
+bool Debugger::processParsedHandlerResult(JSContext* cx, AbstractFramePtr frame,
+                                          const jsbytecode* pc, bool success,
+                                          ResumeMode resumeMode,
+                                          HandleValue value,
+                                          ResumeMode& resultMode,
+                                          MutableHandleValue vp) {
+  RootedValue rootValue(cx, value);
+  if (!success || !prepareResumption(cx, frame, pc, resumeMode, &rootValue)) {
+    RootedValue exceptionRv(cx);
+    if (!callUncaughtExceptionHandler(cx, &exceptionRv) ||
+        !ParseResumptionValue(cx, exceptionRv, resumeMode, &rootValue) ||
+        !prepareResumption(cx, frame, pc, resumeMode, &rootValue)) {
+      return false;
+    }
+  }
+
+  if (resumeMode != ResumeMode::Continue) {
+    if (resultMode != ResumeMode::Continue) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                JSMSG_DEBUG_RESUMPTION_CONFLICT);
+      return false;
+    }
+
+    vp.set(rootValue);
+    resultMode = resumeMode;
+  }
+
+  return true;
+}
+
+bool Debugger::processHandlerResult(JSContext* cx, bool success, HandleValue rv,
+                                    AbstractFramePtr frame, jsbytecode* pc,
+                                    ResumeMode& resultMode,
+                                    MutableHandleValue vp) {
+  ResumeMode resumeMode = ResumeMode::Continue;
+  RootedValue value(cx);
+  if (success) {
+    success = ParseResumptionValue(cx, rv, resumeMode, &value);
+  }
+  return processParsedHandlerResult(cx, frame, pc, success, resumeMode, value,
+                                    resultMode, vp);
+}
+
+bool Debugger::prepareResumption(JSContext* cx, AbstractFramePtr frame,
+                                 const jsbytecode* pc, ResumeMode& resumeMode,
+                                 MutableHandleValue vp) {
+  return unwrapDebuggeeValue(cx, vp) &&
+         CheckResumptionValue(cx, frame, pc, resumeMode, vp);
+}
+
+bool Debugger::callUncaughtExceptionHandler(JSContext* cx,
+                                            MutableHandleValue vp) {
+  MOZ_ASSERT(EnterDebuggeeNoExecute::isLockedInStack(cx, *this));
+
+  if (cx->isExceptionPending() && uncaughtExceptionHook) {
+    RootedValue exc(cx);
+    if (!cx->getPendingException(&exc)) {
+      return false;
+    }
+    cx->clearPendingException();
+
+    RootedValue fval(cx, ObjectValue(*uncaughtExceptionHook));
+    if (js::Call(cx, fval, object, exc, vp)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool Debugger::handleUncaughtException(JSContext* cx) {
+  RootedValue rv(cx);
+
+  return callUncaughtExceptionHandler(cx, &rv);
+}
+
+void Debugger::reportUncaughtException(JSContext* cx) {
+  MOZ_ASSERT(EnterDebuggeeNoExecute::isLockedInStack(cx, *this));
+
+  if (cx->isExceptionPending()) {
+    RootedValue exn(cx);
+    if (cx->getPendingException(&exn)) {
+      cx->clearPendingException();
+      ReportErrorToGlobal(cx, cx->global(), exn);
+    }
+
+    cx->clearPendingException();
+  }
+}
+
+
+Completion Completion::fromJSResult(JSContext* cx, bool ok, const Value& rv) {
+  MOZ_ASSERT_IF(ok, !cx->isExceptionPending());
+
+  if (ok) {
+    return Completion(Return(rv));
+  }
+
+  if (!cx->isExceptionPending()) {
+    return Completion(Terminate());
+  }
+
+  RootedValue exception(cx);
+  Rooted<SavedFrame*> stack(cx, cx->getPendingExceptionStack());
+  bool getSucceeded = cx->getPendingException(&exception);
+  cx->clearPendingException();
+  if (!getSucceeded) {
+    return Completion(Terminate());
+  }
+
+  return Completion(Throw(exception, stack));
+}
+
+Completion Completion::fromJSFramePop(JSContext* cx, AbstractFramePtr frame,
+                                      const jsbytecode* pc, bool ok) {
+  MOZ_ASSERT_IF(!frame.isWasmDebugFrame(), pc);
+
+  if (!ok || !frame.isGeneratorFrame()) {
+    return fromJSResult(cx, ok, frame.returnValue());
+  }
+
+
+  MOZ_ASSERT(!frame.isWasmDebugFrame());
+
+  Rooted<AbstractGeneratorObject*> generatorObj(
+      cx, GetGeneratorObjectForFrame(cx, frame));
+
+  if (generatorObj && !generatorObj->isClosed()) {
+    switch (JSOp(*pc)) {
+      case JSOp::InitialYield:
+        return Completion(InitialYield(generatorObj));
+
+      case JSOp::Yield:
+        return Completion(Yield(generatorObj, frame.returnValue()));
+
+      case JSOp::Await:
+        return Completion(Await(generatorObj, frame.returnValue()));
+
+      default:
+        break;
+    }
+  }
+
+  return Completion(Return(frame.returnValue()));
+}
+
+void Completion::trace(JSTracer* trc) {
+  variant.match([=](auto& var) { var.trace(trc); });
+}
+
+struct MOZ_STACK_CLASS Completion::BuildValueMatcher {
+  JSContext* cx;
+  Debugger* dbg;
+  MutableHandleValue result;
+
+  BuildValueMatcher(JSContext* cx, Debugger* dbg, MutableHandleValue result)
+      : cx(cx), dbg(dbg), result(result) {
+    cx->check(dbg->toJSObject());
+  }
+
+  bool operator()(const Completion::Return& ret) {
+    Rooted<NativeObject*> obj(cx, newObject());
+    RootedValue retval(cx, ret.value);
+    if (!obj || !wrap(&retval) || !add(obj, cx->names().return_, retval)) {
+      return false;
+    }
+    result.setObject(*obj);
+    return true;
+  }
+
+  bool operator()(const Completion::Throw& thr) {
+    Rooted<NativeObject*> obj(cx, newObject());
+    RootedValue exc(cx, thr.exception);
+    if (!obj || !wrap(&exc) || !add(obj, cx->names().throw_, exc)) {
+      return false;
+    }
+    if (thr.stack) {
+      RootedValue stack(cx, ObjectValue(*thr.stack));
+      if (!wrapStack(&stack) || !add(obj, cx->names().stack, stack)) {
+        return false;
+      }
+    }
+    result.setObject(*obj);
+    return true;
+  }
+
+  bool operator()(const Completion::Terminate& term) {
+    result.setNull();
+    return true;
+  }
+
+  bool operator()(const Completion::InitialYield& initialYield) {
+    Rooted<NativeObject*> obj(cx, newObject());
+    RootedValue gen(cx, ObjectValue(*initialYield.generatorObject));
+    if (!obj || !wrap(&gen) || !add(obj, cx->names().return_, gen) ||
+        !add(obj, cx->names().yield, TrueHandleValue) ||
+        !add(obj, cx->names().initial, TrueHandleValue)) {
+      return false;
+    }
+    result.setObject(*obj);
+    return true;
+  }
+
+  bool operator()(const Completion::Yield& yield) {
+    Rooted<NativeObject*> obj(cx, newObject());
+    RootedValue iteratorResult(cx, yield.iteratorResult);
+    if (!obj || !wrap(&iteratorResult) ||
+        !add(obj, cx->names().return_, iteratorResult) ||
+        !add(obj, cx->names().yield, TrueHandleValue)) {
+      return false;
+    }
+    result.setObject(*obj);
+    return true;
+  }
+
+  bool operator()(const Completion::Await& await) {
+    Rooted<NativeObject*> obj(cx, newObject());
+    RootedValue awaitee(cx, await.awaitee);
+    if (!obj || !wrap(&awaitee) || !add(obj, cx->names().return_, awaitee) ||
+        !add(obj, cx->names().await, TrueHandleValue)) {
+      return false;
+    }
+    result.setObject(*obj);
+    return true;
+  }
+
+ private:
+  NativeObject* newObject() const { return NewPlainObject(cx); }
+
+  bool add(Handle<NativeObject*> obj, PropertyName* name,
+           HandleValue value) const {
+    return NativeDefineDataProperty(cx, obj, name, value, JSPROP_ENUMERATE);
+  }
+
+  bool wrap(MutableHandleValue v) const {
+    return dbg->wrapDebuggeeValue(cx, v);
+  }
+
+  bool wrapStack(MutableHandleValue stack) const {
+    return cx->compartment()->wrap(cx, stack);
+  }
+};
+
+bool Completion::buildCompletionValue(JSContext* cx, Debugger* dbg,
+                                      MutableHandleValue result) const {
+  return variant.match(BuildValueMatcher(cx, dbg, result));
+}
+
+void Completion::updateFromHookResult(ResumeMode resumeMode,
+                                      HandleValue value) {
+  switch (resumeMode) {
+    case ResumeMode::Continue:
+      break;
+
+    case ResumeMode::Throw:
+      variant = Variant(Throw(value, nullptr));
+      break;
+
+    case ResumeMode::Terminate:
+      variant = Variant(Terminate());
+      break;
+
+    case ResumeMode::Return:
+      variant = Variant(Return(value));
+      break;
+
+    default:
+      MOZ_CRASH("invalid resumeMode value");
+  }
+}
+
+struct MOZ_STACK_CLASS Completion::ToResumeModeMatcher {
+  MutableHandleValue value;
+  MutableHandle<SavedFrame*> exnStack;
+  ToResumeModeMatcher(MutableHandleValue value,
+                      MutableHandle<SavedFrame*> exnStack)
+      : value(value), exnStack(exnStack) {}
+
+  ResumeMode operator()(const Return& ret) {
+    value.set(ret.value);
+    return ResumeMode::Return;
+  }
+
+  ResumeMode operator()(const Throw& thr) {
+    value.set(thr.exception);
+    exnStack.set(thr.stack);
+    return ResumeMode::Throw;
+  }
+
+  ResumeMode operator()(const Terminate& term) {
+    value.setUndefined();
+    return ResumeMode::Terminate;
+  }
+
+  ResumeMode operator()(const InitialYield& initialYield) {
+    value.setObject(*initialYield.generatorObject);
+    return ResumeMode::Return;
+  }
+
+  ResumeMode operator()(const Yield& yield) {
+    value.set(yield.iteratorResult);
+    return ResumeMode::Return;
+  }
+
+  ResumeMode operator()(const Await& await) {
+    value.set(await.awaitee);
+    return ResumeMode::Return;
+  }
+};
+
+void Completion::toResumeMode(ResumeMode& resumeMode, MutableHandleValue value,
+                              MutableHandle<SavedFrame*> exnStack) const {
+  resumeMode = variant.match(ToResumeModeMatcher(value, exnStack));
+}
+
+
+static bool CallMethodIfPresent(JSContext* cx, HandleObject obj,
+                                const char* name, size_t argc, Value* argv,
+                                MutableHandleValue rval) {
+  rval.setUndefined();
+  JSAtom* atom = Atomize(cx, name, strlen(name));
+  if (!atom) {
+    return false;
+  }
+
+  RootedId id(cx, AtomToId(atom));
+  RootedValue fval(cx);
+  if (!GetProperty(cx, obj, obj, id, &fval)) {
+    return false;
+  }
+
+  if (!IsCallable(fval)) {
+    return true;
+  }
+
+  InvokeArgs args(cx);
+  if (!args.init(cx, argc)) {
+    return false;
+  }
+
+  for (size_t i = 0; i < argc; i++) {
+    args[i].set(argv[i]);
+  }
+
+  rval.setObject(*obj);  
+  return js::Call(cx, fval, rval, args, rval);
+}
+
+bool Debugger::fireDebuggerStatement(JSContext* cx, ResumeMode& resumeMode,
+                                     MutableHandleValue vp) {
+  RootedObject hook(cx, getHook(OnDebuggerStatement));
+  MOZ_ASSERT(hook);
+  MOZ_ASSERT(hook->isCallable());
+
+  ScriptFrameIter iter(cx);
+  RootedValue scriptFrame(cx);
+  if (!getFrame(cx, iter, &scriptFrame)) {
+    return false;
+  }
+
+  RootedValue fval(cx, ObjectValue(*hook));
+  RootedValue rv(cx);
+  bool ok = js::Call(cx, fval, object, scriptFrame, &rv);
+  return processHandlerResult(cx, ok, rv, iter.abstractFramePtr(), iter.pc(),
+                              resumeMode, vp);
+}
+
+bool Debugger::fireExceptionUnwind(JSContext* cx, HandleValue exc,
+                                   ResumeMode& resumeMode,
+                                   MutableHandleValue vp) {
+  RootedObject hook(cx, getHook(OnExceptionUnwind));
+  MOZ_ASSERT(hook);
+  MOZ_ASSERT(hook->isCallable());
+
+  RootedValue scriptFrame(cx);
+  RootedValue wrappedExc(cx, exc);
+
+  FrameIter iter(cx);
+  if (!getFrame(cx, iter, &scriptFrame) ||
+      !wrapDebuggeeValue(cx, &wrappedExc)) {
+    return false;
+  }
+
+  RootedValue fval(cx, ObjectValue(*hook));
+  RootedValue rv(cx);
+  bool ok = js::Call(cx, fval, object, scriptFrame, wrappedExc, &rv);
+  return processHandlerResult(cx, ok, rv, iter.abstractFramePtr(), iter.pc(),
+                              resumeMode, vp);
+}
+
+bool Debugger::fireEnterFrame(JSContext* cx, ResumeMode& resumeMode,
+                              MutableHandleValue vp) {
+  RootedObject hook(cx, getHook(OnEnterFrame));
+  MOZ_ASSERT(hook);
+  MOZ_ASSERT(hook->isCallable());
+
+  RootedValue scriptFrame(cx);
+
+  FrameIter iter(cx);
+
+#if DEBUG
+  if (iter.hasScript() && JSOp(*iter.pc()) == JSOp::AfterYield) {
+    AutoRealm ar(cx, iter.script());
+    auto* genObj = GetGeneratorObjectForFrame(cx, iter.abstractFramePtr());
+    MOZ_ASSERT(genObj->isRunning());
+  }
+#endif
+
+  if (!getFrame(cx, iter, &scriptFrame)) {
+    return false;
+  }
+
+  RootedValue fval(cx, ObjectValue(*hook));
+  RootedValue rv(cx);
+  bool ok = js::Call(cx, fval, object, scriptFrame, &rv);
+
+  return processHandlerResult(cx, ok, rv, iter.abstractFramePtr(), iter.pc(),
+                              resumeMode, vp);
+}
+
+bool Debugger::fireNativeCall(JSContext* cx, const CallArgs& args,
+                              CallReason reason, ResumeMode& resumeMode,
+                              MutableHandleValue vp) {
+  RootedObject hook(cx, getHook(OnNativeCall));
+  MOZ_ASSERT(hook);
+  MOZ_ASSERT(hook->isCallable());
+
+  RootedValue fval(cx, ObjectValue(*hook));
+  RootedValue calleeval(cx, args.calleev());
+  if (!wrapDebuggeeValue(cx, &calleeval)) {
+    return false;
+  }
+
+  JSAtom* reasonAtom = nullptr;
+  switch (reason) {
+    case CallReason::Call:
+      reasonAtom = cx->names().call;
+      break;
+    case CallReason::CallContent:
+      reasonAtom = cx->names().call;
+      break;
+    case CallReason::FunCall:
+      reasonAtom = cx->names().call;
+      break;
+    case CallReason::Getter:
+      reasonAtom = cx->names().get;
+      break;
+    case CallReason::Setter:
+      reasonAtom = cx->names().set;
+      break;
+  }
+  MOZ_ASSERT(AtomIsMarked(cx->zone(), reasonAtom));
+
+  RootedValue reasonval(cx, StringValue(reasonAtom));
+
+  bool ok = false;
+  RootedValue rv(cx);
+  if (inspectNativeCallArguments) {
+    RootedValue thisVal(cx, args.thisv());
+    if (thisVal.isMagic() && thisVal.whyMagic() != JS_MISSING_ARGUMENTS &&
+        thisVal.whyMagic() != JS_UNINITIALIZED_LEXICAL) {
+      thisVal.setMagic(JS_OPTIMIZED_OUT);
+    }
+    if (!wrapDebuggeeValue(cx, &thisVal)) {
+      return false;
+    }
+
+    unsigned arrsize = args.length();
+    Rooted<ArrayObject*> arrobj(cx, NewDenseFullyAllocatedArray(cx, arrsize));
+    if (!arrobj) {
+      return false;
+    }
+    arrobj->ensureDenseInitializedLength(0, arrsize);
+    for (unsigned i = 0; i < arrsize; i++) {
+      RootedValue v(cx, args.get(i));
+      if (!wrapDebuggeeValue(cx, &v)) {
+        return false;
+      }
+      arrobj->setDenseElement(i, v);
+    }
+    RootedValue arrayval(cx, ObjectValue(*arrobj));
+    if (!wrapDebuggeeValue(cx, &arrayval)) {
+      return false;
+    }
+
+    FixedInvokeArgs<4> iargs(cx);
+    iargs[0].set(calleeval);
+    iargs[1].set(reasonval);
+    iargs[2].set(thisVal);
+    iargs[3].set(arrayval);
+
+    RootedValue thisv(cx, ObjectOrNullValue(object));
+    ok = js::Call(cx, fval, thisv, iargs, &rv);
+  } else {
+    ok = js::Call(cx, fval, object, calleeval, reasonval, &rv);
+  }
+
+  return processHandlerResult(cx, ok, rv, NullFramePtr(), nullptr, resumeMode,
+                              vp);
+}
+
+bool Debugger::fireNewScript(JSContext* cx,
+                             Handle<DebuggerScriptReferent> scriptReferent) {
+  RootedObject hook(cx, getHook(OnNewScript));
+  MOZ_ASSERT(hook);
+  MOZ_ASSERT(hook->isCallable());
+
+  JSObject* dsobj = wrapVariantReferent(cx, scriptReferent);
+  if (!dsobj) {
+    return false;
+  }
+
+  RootedValue fval(cx, ObjectValue(*hook));
+  RootedValue dsval(cx, ObjectValue(*dsobj));
+  RootedValue rv(cx);
+  return js::Call(cx, fval, object, dsval, &rv) || handleUncaughtException(cx);
+}
+
+bool Debugger::fireOnGarbageCollectionHook(
+    JSContext* cx, const JS::dbg::GarbageCollectionEvent::Ptr& gcData) {
+  MOZ_ASSERT(observedGC(gcData->majorGCNumber()));
+  observedGCs.remove(gcData->majorGCNumber());
+
+  RootedObject hook(cx, getHook(OnGarbageCollection));
+  MOZ_ASSERT(hook);
+  MOZ_ASSERT(hook->isCallable());
+
+  JSObject* dataObj = gcData->toJSObject(cx);
+  if (!dataObj) {
+    return false;
+  }
+
+  RootedValue fval(cx, ObjectValue(*hook));
+  RootedValue dataVal(cx, ObjectValue(*dataObj));
+  RootedValue rv(cx);
+  return js::Call(cx, fval, object, dataVal, &rv) ||
+         handleUncaughtException(cx);
+}
+
+template <typename HookIsEnabledFun ,
+          typename FireHookFun >
+void Debugger::dispatchQuietHook(JSContext* cx, HookIsEnabledFun hookIsEnabled,
+                                 FireHookFun fireHook) {
+  DebuggerList<HookIsEnabledFun> debuggerList(cx, hookIsEnabled);
+
+  if (!debuggerList.init(cx)) {
+    cx->clearPendingException();
+    return;
+  }
+
+  debuggerList.dispatchQuietHook(cx, fireHook);
+}
+
+template <typename HookIsEnabledFun , typename FireHookFun >
+bool Debugger::dispatchResumptionHook(JSContext* cx, AbstractFramePtr frame,
+                                      HookIsEnabledFun hookIsEnabled,
+                                      FireHookFun fireHook) {
+  DebuggerList<HookIsEnabledFun> debuggerList(cx, hookIsEnabled);
+
+  if (!debuggerList.init(cx)) {
+    return false;
+  }
+
+  return debuggerList.dispatchResumptionHook(cx, frame, fireHook);
+}
+
+static const size_t SourceURLMaxLength = 1024;
+
+static const size_t SourceURLRealmLimit = 100;
+
+static bool RememberSourceURL(JSContext* cx, HandleScript script) {
+  cx->check(script);
+
+  if (script->sourceObject()->unwrappedIntroductionScript()) {
+    return true;
+  }
+
+  const char* filename = script->filename();
+  if (!filename ||
+      strnlen(filename, SourceURLMaxLength + 1) > SourceURLMaxLength) {
+    return true;
+  }
+
+  Rooted<ArrayObject*> holder(cx, script->global().getSourceURLsHolder());
+  if (!holder) {
+    holder = NewDenseEmptyArray(cx);
+    if (!holder) {
+      return false;
+    }
+    script->global().setSourceURLsHolder(holder);
+  }
+
+  if (holder->length() >= SourceURLRealmLimit) {
+    return true;
+  }
+
+  RootedString filenameString(cx,
+                              AtomizeUTF8Chars(cx, filename, strlen(filename)));
+  if (!filenameString) {
+    return false;
+  }
+
+  return NewbornArrayPush(cx, holder, StringValue(filenameString));
+}
+
+void DebugAPI::onNewScript(JSContext* cx, HandleScript script) {
+  if (!script->realm()->isDebuggee()) {
+    if (!script->realm()->isSystem()) {
+      if (!RememberSourceURL(cx, script)) {
+        cx->clearPendingException();
+      }
+    }
+    return;
+  }
+
+  Debugger::dispatchQuietHook(
+      cx,
+      [script](Debugger* dbg) -> bool {
+        return dbg->observesNewScript() && dbg->observesScript(script);
+      },
+      [&](Debugger* dbg) -> bool {
+        BaseScript* base = script.get();
+        Rooted<DebuggerScriptReferent> scriptReferent(cx, base);
+        return dbg->fireNewScript(cx, scriptReferent);
+      });
+}
+
+#ifdef ENABLE_WASM_JSPI
+static bool ContStackChainHasAddress(wasm::ContStack* resumeBase,
+                                     uintptr_t addr) {
+  if (resumeBase->hasStackAddress(addr)) {
+    return true;
+  }
+  wasm::ContStack* resumeTargetStack = resumeBase->resumeTargetStack();
+  if (resumeTargetStack) {
+    for (wasm::Handlers* h = resumeTargetStack->handlers(); h;
+         h = h->self->handlers()) {
+      if (h->child && h->child->hasStackAddress(addr)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void DebugAPI::onLeaveWasmCont(JSContext* cx, wasm::ContStack* resumeBase) {
+  JS::GCContext* gcx = cx->gcContext();
+  JSRuntime* rt = cx->runtime();
+  for (Debugger* dbg = rt->debuggerList().getFirst(); dbg;
+       dbg = dbg->getNext()) {
+    for (auto iter = dbg->frames.modIter(); !iter.done(); iter.next()) {
+      DebuggerFrame* frameObj = iter.get().value();
+      JS::Value slot =
+          frameObj->getReservedSlot(DebuggerFrame::WASM_CONT_FRAME_PTR_SLOT);
+      if (slot.isUndefined()) {
+        continue;
+      }
+      AbstractFramePtr fp = AbstractFramePtr::fromRaw(slot.toPrivate());
+      if (!fp.isWasmDebugFrame()) {
+        continue;
+      }
+      uintptr_t addr = reinterpret_cast<uintptr_t>(fp.asWasmDebugFrame());
+      if (!ContStackChainHasAddress(resumeBase, addr)) {
+        continue;
+      }
+      Debugger::terminateDebuggerFrame(gcx, dbg, frameObj, fp, &iter, nullptr);
+    }
+  }
+}
+#endif  // ENABLE_WASM_JSPI
+
+void DebugAPI::slowPathOnNewWasmInstance(
+    JSContext* cx, Handle<WasmInstanceObject*> wasmInstance) {
+  Debugger::dispatchQuietHook(
+      cx,
+      [wasmInstance](Debugger* dbg) -> bool {
+        return dbg->observesNewScript() &&
+               dbg->observesGlobal(&wasmInstance->global());
+      },
+      [&](Debugger* dbg) -> bool {
+        Rooted<DebuggerScriptReferent> scriptReferent(cx, wasmInstance.get());
+        return dbg->fireNewScript(cx, scriptReferent);
+      });
+}
+
+bool DebugAPI::onTrap(JSContext* cx) {
+  FrameIter iter(cx);
+  JS::AutoSaveExceptionState savedExc(cx);
+  Rooted<GlobalObject*> global(cx);
+  BreakpointSite* site;
+  bool isJS;       
+  jsbytecode* pc;  
+  uint32_t bytecodeOffset;  
+  if (iter.hasScript()) {
+    RootedScript script(cx, iter.script());
+    MOZ_ASSERT(script->isDebuggee());
+    global.set(&script->global());
+    isJS = true;
+    pc = iter.pc();
+    bytecodeOffset = 0;
+    site = DebugScript::getBreakpointSite(script, pc);
+  } else {
+    MOZ_ASSERT(iter.isWasm());
+    global.set(&iter.wasmInstance()->object()->global());
+    isJS = false;
+    pc = nullptr;
+    bytecodeOffset = iter.wasmBytecodeOffset();
+    site = iter.wasmInstance()->debug().getBreakpointSite(bytecodeOffset);
+  }
+
+  Vector<Breakpoint*> triggered(cx);
+  for (Breakpoint* bp = site->firstBreakpoint(); bp; bp = bp->nextInSite()) {
+    if (!triggered.append(bp)) {
+      return false;
+    }
+  }
+
+  ResumeMode resumeMode = ResumeMode::Continue;
+  RootedValue rval(cx);
+
+  if (triggered.length() > 0) {
+    JS::AutoDebuggerJobQueueInterruption adjqi;
+    if (!adjqi.init(cx)) {
+      return false;
+    }
+
+    for (Breakpoint* bp : triggered) {
+      if (!site || !site->hasBreakpoint(bp)) {
+        continue;
+      }
+
+      Debugger* dbg = bp->debugger;
+      if (dbg->debuggees.has(global)) {
+        EnterDebuggeeNoExecute nx(cx, *dbg, adjqi);
+
+        bool result = dbg->enterDebuggerHook(cx, [&]() -> bool {
+          RootedValue scriptFrame(cx);
+          if (!dbg->getFrame(cx, iter, &scriptFrame)) {
+            return false;
+          }
+
+          Rooted<JSObject*> handler(cx, bp->handler);
+          if (!cx->compartment()->wrap(cx, &handler)) {
+            return false;
+          }
+
+          RootedValue rv(cx);
+          bool ok = CallMethodIfPresent(cx, handler, "hit", 1,
+                                        scriptFrame.address(), &rv);
+
+          return dbg->processHandlerResult(cx, ok, rv, iter.abstractFramePtr(),
+                                           iter.pc(), resumeMode, &rval);
+        });
+        adjqi.runJobs();
+
+        if (!result) {
+          return false;
+        }
+
+        if (isJS) {
+          site = DebugScript::getBreakpointSite(iter.script(), pc);
+        } else {
+          site = iter.wasmInstance()->debug().getBreakpointSite(bytecodeOffset);
+        }
+      }
+    }
+  }
+
+  if (!ApplyFrameResumeMode(cx, iter.abstractFramePtr(), resumeMode, rval)) {
+    savedExc.drop();
+    return false;
+  }
+  return true;
+}
+
+bool DebugAPI::onSingleStep(JSContext* cx) {
+  FrameIter iter(cx);
+
+  JS::AutoSaveExceptionState savedExc(cx);
+
+  Rooted<Debugger::DebuggerFrameVector> frames(cx);
+  if (!Debugger::getDebuggerFrames(iter.abstractFramePtr(), &frames)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+#ifdef DEBUG
+  if (iter.hasScript()) {
+    uint32_t liveStepperCount = 0;
+    uint32_t suspendedStepperCount = 0;
+    JSScript* trappingScript = iter.script();
+    JS::AutoAssertNoGC nogc;
+    for (Realm::DebuggerVectorEntry& entry : cx->global()->getDebuggers(nogc)) {
+      Debugger* dbg = entry.dbg;
+      for (auto iter = dbg->frames.iter(); !iter.done(); iter.next()) {
+        AbstractFramePtr frame = iter.get().key();
+        NativeObject* frameobj = iter.get().value();
+        if (frame.isWasmDebugFrame()) {
+          continue;
+        }
+        if (frame.script() == trappingScript &&
+            !frameobj->getReservedSlot(DebuggerFrame::ONSTEP_HANDLER_SLOT)
+                 .isUndefined()) {
+          liveStepperCount++;
+        }
+      }
+
+      for (auto iter = dbg->generatorFrames.iter(); !iter.done(); iter.next()) {
+        AbstractGeneratorObject& genObj = *iter.get().key();
+        DebuggerFrame& frameObj = *iter.get().value();
+        MOZ_ASSERT(&frameObj.unwrappedGenerator() == &genObj);
+
+        if (frameObj.isOnStack(cx)) {
+          continue;
+        }
+
+        if (genObj.isClosed()) {
+          continue;
+        }
+
+        MOZ_ASSERT(genObj.isSuspended());
+
+        if (genObj.callee().hasBaseScript() &&
+            genObj.callee().baseScript() == trappingScript &&
+            !frameObj.getReservedSlot(DebuggerFrame::ONSTEP_HANDLER_SLOT)
+                 .isUndefined()) {
+          suspendedStepperCount++;
+        }
+      }
+    }
+
+    MOZ_ASSERT(liveStepperCount + suspendedStepperCount ==
+               DebugScript::getStepperCount(trappingScript));
+  }
+#endif
+
+  RootedValue rval(cx);
+  ResumeMode resumeMode = ResumeMode::Continue;
+
+  if (frames.length() > 0) {
+    JS::AutoDebuggerJobQueueInterruption adjqi;
+    if (!adjqi.init(cx)) {
+      return false;
+    }
+
+    for (size_t i = 0; i < frames.length(); i++) {
+      Handle<DebuggerFrame*> frame = frames[i];
+      OnStepHandler* handler = frame->onStepHandler();
+      if (!handler) {
+        continue;
+      }
+
+      Debugger* dbg = frame->owner();
+      EnterDebuggeeNoExecute nx(cx, *dbg, adjqi);
+
+      bool result = dbg->enterDebuggerHook(cx, [&]() -> bool {
+        ResumeMode nextResumeMode = ResumeMode::Continue;
+        RootedValue nextValue(cx);
+
+        bool success = handler->onStep(cx, frame, nextResumeMode, &nextValue);
+        return dbg->processParsedHandlerResult(
+            cx, iter.abstractFramePtr(), iter.pc(), success, nextResumeMode,
+            nextValue, resumeMode, &rval);
+      });
+      adjqi.runJobs();
+
+      if (!result) {
+        return false;
+      }
+    }
+  }
+
+  if (!ApplyFrameResumeMode(cx, iter.abstractFramePtr(), resumeMode, rval)) {
+    savedExc.drop();
+    return false;
+  }
+  return true;
+}
+
+bool Debugger::fireNewGlobalObject(JSContext* cx,
+                                   Handle<GlobalObject*> global) {
+  RootedObject hook(cx, getHook(OnNewGlobalObject));
+  MOZ_ASSERT(hook);
+  MOZ_ASSERT(hook->isCallable());
+
+  RootedValue wrappedGlobal(cx, ObjectValue(*global));
+  if (!wrapDebuggeeValue(cx, &wrappedGlobal)) {
+    return false;
+  }
+
+  RootedValue rv(cx);
+  RootedValue fval(cx, ObjectValue(*hook));
+  bool ok = js::Call(cx, fval, object, wrappedGlobal, &rv);
+  if (ok && !rv.isUndefined()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_DEBUG_RESUMPTION_VALUE_DISALLOWED);
+    ok = false;
+  }
+
+  return ok || handleUncaughtException(cx);
+}
+
+void DebugAPI::slowPathOnNewGlobalObject(JSContext* cx,
+                                         Handle<GlobalObject*> global) {
+  MOZ_ASSERT(!cx->runtime()->onNewGlobalObjectWatchers().isEmpty());
+  if (global->realm()->creationOptions().invisibleToDebugger()) {
+    return;
+  }
+
+  RootedObjectVector watchers(cx);
+  for (auto& dbg : cx->runtime()->onNewGlobalObjectWatchers()) {
+    MOZ_ASSERT(dbg.observesNewGlobalObject());
+    JSObject* obj = dbg.object;
+    JS::ExposeObjectToActiveJS(obj);
+    if (!watchers.append(obj)) {
+      if (cx->isExceptionPending()) {
+        cx->clearPendingException();
+      }
+      return;
+    }
+  }
+
+  JS::AutoDebuggerJobQueueInterruption adjqi;
+  if (!adjqi.init(cx)) {
+    cx->clearPendingException();
+    return;
+  }
+
+  for (size_t i = 0; i < watchers.length(); i++) {
+    Debugger* dbg = Debugger::fromJSObject(watchers[i]);
+    EnterDebuggeeNoExecute nx(cx, *dbg, adjqi);
+
+    if (dbg->observesNewGlobalObject()) {
+      bool result = dbg->enterDebuggerHook(
+          cx, [&]() -> bool { return dbg->fireNewGlobalObject(cx, global); });
+      adjqi.runJobs();
+
+      if (!result) {
+        cx->clearPendingException();
+        break;
+      }
+    }
+  }
+  MOZ_ASSERT(!cx->isExceptionPending());
+}
+
+void DebugAPI::slowPathOnGeneratorClosed(JSContext* cx,
+                                         AbstractGeneratorObject* genObj) {
+  JS::AutoAssertNoGC nogc;
+  for (Realm::DebuggerVectorEntry& entry : cx->global()->getDebuggers(nogc)) {
+    Debugger* dbg = entry.dbg;
+    if (Debugger::GeneratorWeakMap::Ptr frameEntry =
+            dbg->generatorFrames.lookup(genObj)) {
+      DebuggerFrame* frameObj = frameEntry->value();
+      frameObj->onGeneratorClosed(cx->gcContext());
+    }
+  }
+}
+
+void DebugAPI::slowPathNotifyParticipatesInGC(uint64_t majorGCNumber,
+                                              Realm::DebuggerVector& dbgs,
+                                              const JS::AutoRequireNoGC& nogc) {
+  for (Realm::DebuggerVector::Range r = dbgs.all(); !r.empty(); r.popFront()) {
+    if (!r.front().dbg.unbarrieredGet()->debuggeeIsBeingCollected(
+            majorGCNumber)) {
+#ifdef DEBUG
+      fprintf(stderr,
+              "OOM while notifying observing Debuggers of a GC: The "
+              "onGarbageCollection\n"
+              "hook will not be fired for this GC for some Debuggers!\n");
+#endif
+      return;
+    }
+  }
+}
+
+Maybe<double> DebugAPI::allocationSamplingProbability(GlobalObject* global) {
+  JS::AutoAssertNoGC nogc;
+  Realm::DebuggerVector& dbgs = global->getDebuggers(nogc);
+  if (dbgs.empty()) {
+    return Nothing();
+  }
+
+  DebugOnly<Realm::DebuggerVectorEntry*> begin = dbgs.begin();
+
+  double probability = 0;
+  bool foundAnyDebuggers = false;
+  for (auto p = dbgs.begin(); p < dbgs.end(); p++) {
+    MOZ_ASSERT(dbgs.begin() == begin);
+    Debugger* dbgp = p->dbg.unbarrieredGet();
+
+    if (dbgp->trackingAllocationSites) {
+      foundAnyDebuggers = true;
+      probability = std::max(dbgp->allocationSamplingProbability, probability);
+    }
+  }
+
+  return foundAnyDebuggers ? Some(probability) : Nothing();
+}
+
+bool DebugAPI::slowPathOnLogAllocationSite(JSContext* cx, HandleObject obj,
+                                           Handle<SavedFrame*> frame,
+                                           mozilla::TimeStamp when,
+                                           Realm::DebuggerVector& dbgs,
+                                           const gc::AutoSuppressGC& nogc) {
+  MOZ_ASSERT(!dbgs.empty());
+  mozilla::DebugOnly<Realm::DebuggerVectorEntry*> begin = dbgs.begin();
+
+
+  for (auto p = dbgs.begin(); p < dbgs.end(); p++) {
+    MOZ_ASSERT(dbgs.begin() == begin);
+
+    if (p->dbg->trackingAllocationSites &&
+        !p->dbg->appendAllocationSite(cx, obj, frame, when)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool Debugger::isDebuggeeUnbarriered(const Realm* realm) const {
+  MOZ_ASSERT(realm);
+  return realm->isDebuggee() &&
+         debuggees.has(realm->unsafeUnbarrieredMaybeGlobal());
+}
+
+bool Debugger::appendAllocationSite(JSContext* cx, HandleObject obj,
+                                    Handle<SavedFrame*> frame,
+                                    mozilla::TimeStamp when) {
+  MOZ_ASSERT(trackingAllocationSites);
+
+  AutoRealm ar(cx, object);
+  RootedObject wrappedFrame(cx, frame);
+  if (!cx->compartment()->wrap(cx, &wrappedFrame)) {
+    return false;
+  }
+
+  auto className = obj->getClass()->name;
+  auto size =
+      JS::ubi::Node(obj.get()).size(cx->runtime()->debuggerMallocSizeOf);
+  auto inNursery = gc::IsInsideNursery(obj);
+
+  if (!allocationsLog.emplaceBack(wrappedFrame, when, className, size,
+                                  inNursery)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  if (allocationsLog.length() > maxAllocationsLogLength) {
+    allocationsLog.popFront();
+    MOZ_ASSERT(allocationsLog.length() == maxAllocationsLogLength);
+    allocationsLogOverflowed = true;
+  }
+
+  return true;
+}
+
+bool Debugger::firePromiseHook(JSContext* cx, Hook hook, HandleObject promise) {
+  MOZ_ASSERT(hook == OnNewPromise || hook == OnPromiseSettled);
+
+  RootedObject hookObj(cx, getHook(hook));
+  MOZ_ASSERT(hookObj);
+  MOZ_ASSERT(hookObj->isCallable());
+
+  RootedValue dbgObj(cx, ObjectValue(*promise));
+  if (!wrapDebuggeeValue(cx, &dbgObj)) {
+    return false;
+  }
+
+  RootedValue fval(cx, ObjectValue(*hookObj));
+  RootedValue rv(cx);
+  bool ok = js::Call(cx, fval, object, dbgObj, &rv);
+  if (ok && !rv.isUndefined()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_DEBUG_RESUMPTION_VALUE_DISALLOWED);
+    ok = false;
+  }
+
+  return ok || handleUncaughtException(cx);
+}
+
+void Debugger::slowPathPromiseHook(JSContext* cx, Hook hook,
+                                   Handle<PromiseObject*> promise) {
+  MOZ_ASSERT(hook == OnNewPromise || hook == OnPromiseSettled);
+
+  if (hook == OnPromiseSettled) {
+    cx->check(promise);
+  }
+
+  AutoRealm ar(cx, promise);
+
+  Debugger::dispatchQuietHook(
+      cx, [hook](Debugger* dbg) -> bool { return dbg->getHook(hook); },
+      [&](Debugger* dbg) -> bool {
+        return dbg->firePromiseHook(cx, hook, promise);
+      });
+}
+
+void DebugAPI::slowPathOnNewPromise(JSContext* cx,
+                                    Handle<PromiseObject*> promise) {
+  Debugger::slowPathPromiseHook(cx, Debugger::OnNewPromise, promise);
+}
+
+void DebugAPI::slowPathOnPromiseSettled(JSContext* cx,
+                                        Handle<PromiseObject*> promise) {
+  Debugger::slowPathPromiseHook(cx, Debugger::OnPromiseSettled, promise);
+}
+
+
+class MOZ_RAII ExecutionObservableRealms
+    : public DebugAPI::ExecutionObservableSet {
+  HashSet<Realm*> realms_;
+  HashSet<Zone*> zones_;
+
+ public:
+  explicit ExecutionObservableRealms(JSContext* cx) : realms_(cx), zones_(cx) {}
+
+  bool add(Realm* realm) {
+    return realms_.put(realm) && zones_.put(realm->zone());
+  }
+
+  using RealmIterator = HashSet<Realm*>::Iterator;
+  const HashSet<Realm*>* realms() const { return &realms_; }
+
+  const HashSet<Zone*>* zones() const override { return &zones_; }
+  bool shouldRecompileOrInvalidate(JSScript* script) const override {
+    return script->hasBaselineScript() && realms_.has(script->realm());
+  }
+  bool shouldMarkAsDebuggee(FrameIter& iter) const override {
+    return iter.hasUsableAbstractFramePtr() && realms_.has(iter.realm());
+  }
+};
+
+class MOZ_RAII ExecutionObservableFrame
+    : public DebugAPI::ExecutionObservableSet {
+  AbstractFramePtr frame_;
+
+ public:
+  explicit ExecutionObservableFrame(AbstractFramePtr frame) : frame_(frame) {}
+
+  Zone* singleZone() const override {
+    return frame_.script()->zone();
+  }
+
+  JSScript* singleScriptForZoneInvalidation() const override {
+    MOZ_CRASH(
+        "ExecutionObservableFrame shouldn't need zone-wide invalidation.");
+    return nullptr;
+  }
+
+  bool shouldRecompileOrInvalidate(JSScript* script) const override {
+    if (!script->hasBaselineScript()) {
+      return false;
+    }
+
+    if (frame_.hasScript() && script == frame_.script()) {
+      return true;
+    }
+
+    return frame_.isRematerializedFrame() &&
+           script == frame_.asRematerializedFrame()->outerScript();
+  }
+
+  bool shouldMarkAsDebuggee(FrameIter& iter) const override {
+    return iter.hasUsableAbstractFramePtr() &&
+           iter.abstractFramePtr() == frame_;
+  }
+};
+
+class MOZ_RAII ExecutionObservableScript
+    : public DebugAPI::ExecutionObservableSet {
+  RootedScript script_;
+
+ public:
+  ExecutionObservableScript(JSContext* cx, JSScript* script)
+      : script_(cx, script) {}
+
+  Zone* singleZone() const override { return script_->zone(); }
+  JSScript* singleScriptForZoneInvalidation() const override { return script_; }
+  bool shouldRecompileOrInvalidate(JSScript* script) const override {
+    return script->hasBaselineScript() && script == script_;
+  }
+  bool shouldMarkAsDebuggee(FrameIter& iter) const override {
+    return iter.hasUsableAbstractFramePtr() && !iter.isWasm() &&
+           iter.abstractFramePtr().script() == script_;
+  }
+};
+
+bool Debugger::updateExecutionObservabilityOfFrames(
+    JSContext* cx, const DebugAPI::ExecutionObservableSet& obs,
+    IsObserving observing) {
+  AutoSuppressProfilerSampling suppressProfilerSampling(cx);
+
+  if (!jit::RecompileOnStackBaselineScriptsForDebugMode(cx, obs, observing)) {
+    return false;
+  }
+
+  AbstractFramePtr oldestEnabledFrame;
+  for (AllFramesIter iter(cx); !iter.done(); ++iter) {
+    if (obs.shouldMarkAsDebuggee(iter)) {
+      if (observing) {
+        if (!iter.abstractFramePtr().isDebuggee()) {
+          oldestEnabledFrame = iter.abstractFramePtr();
+          oldestEnabledFrame.setIsDebuggee();
+        }
+        if (iter.abstractFramePtr().isWasmDebugFrame()) {
+          iter.abstractFramePtr().asWasmDebugFrame()->observe(cx);
+        }
+      } else {
+#ifdef DEBUG
+        MOZ_ASSERT(!DebugAPI::inFrameMaps(iter.abstractFramePtr()));
+#endif
+        iter.abstractFramePtr().unsetIsDebuggee();
+      }
+    }
+  }
+
+  if (oldestEnabledFrame) {
+    AutoRealm ar(cx, oldestEnabledFrame.environmentChain());
+    DebugEnvironments::unsetPrevUpToDateUntil(cx, oldestEnabledFrame);
+  }
+
+  return true;
+}
+
+static inline void MarkJitScriptActiveIfObservable(
+    JSScript* script, const DebugAPI::ExecutionObservableSet& obs) {
+  if (obs.shouldRecompileOrInvalidate(script)) {
+    script->jitScript()->icScript()->setActive();
+  }
+}
+
+static bool AppendAndInvalidateScript(JSContext* cx, Zone* zone,
+                                      JSScript* script,
+                                      jit::IonScriptKeyVector& invalid,
+                                      Vector<JSScript*>& scripts) {
+  MOZ_ASSERT(script->zone() == zone);
+  AutoRealm ar(cx, script);
+  AddPendingInvalidation(invalid, script);
+  return scripts.append(script);
+}
+
+static bool UpdateExecutionObservabilityOfScriptsInZone(
+    JSContext* cx, Zone* zone, const DebugAPI::ExecutionObservableSet& obs,
+    Debugger::IsObserving observing) {
+  using namespace js::jit;
+
+  AutoSuppressProfilerSampling suppressProfilerSampling(cx);
+
+  CancelOffThreadBaselineCompile(zone);
+
+  JS::GCContext* gcx = cx->gcContext();
+
+  Vector<JSScript*> scripts(cx);
+
+  {
+    IonScriptKeyVector invalid;
+    if (JSScript* script = obs.singleScriptForZoneInvalidation()) {
+      if (obs.shouldRecompileOrInvalidate(script)) {
+        if (!AppendAndInvalidateScript(cx, zone, script, invalid, scripts)) {
+          return false;
+        }
+      }
+    } else {
+      for (auto base = zone->cellIter<BaseScript>(); !base.done();
+           base.next()) {
+        if (!base->hasJitScript()) {
+          continue;
+        }
+        JSScript* script = base->asJSScript();
+        if (obs.shouldRecompileOrInvalidate(script)) {
+          if (!AppendAndInvalidateScript(cx, zone, script, invalid, scripts)) {
+            return false;
+          }
+        }
+      }
+    }
+    Invalidate(cx, invalid);
+  }
+
+  for (size_t i = 0; i < scripts.length(); i++) {
+    MOZ_ASSERT(!scripts[i]->jitScript()->icScript()->active());
+  }
+
+  for (JitActivationIterator actIter(cx); !actIter.done(); ++actIter) {
+    if (actIter->compartment()->zone() != zone) {
+      continue;
+    }
+
+    for (OnlyJSJitFrameIter iter(actIter); !iter.done(); ++iter) {
+      const JSJitFrameIter& frame = iter.frame();
+      switch (frame.type()) {
+        case FrameType::BaselineJS:
+          MarkJitScriptActiveIfObservable(frame.script(), obs);
+          break;
+        case FrameType::IonJS:
+          MarkJitScriptActiveIfObservable(frame.script(), obs);
+          for (InlineFrameIterator inlineIter(cx, &frame); inlineIter.more();
+               ++inlineIter) {
+            MarkJitScriptActiveIfObservable(inlineIter.script(), obs);
+          }
+          break;
+        default:;
+      }
+    }
+  }
+
+  for (size_t i = 0; i < scripts.length(); i++) {
+    if (!scripts[i]->jitScript()->icScript()->active()) {
+      FinishDiscardBaselineScript(gcx, scripts[i]);
+    }
+    scripts[i]->jitScript()->icScript()->resetActive();
+  }
+
+  for (RealmsInZoneIter r(zone); !r.done(); r.next()) {
+    for (wasm::Instance* instance : r->wasm.instances()) {
+      if (!instance->debugEnabled()) {
+        continue;
+      }
+
+      bool enableTrap = observing == Debugger::Observing;
+      instance->debug().ensureEnterFrameTrapsState(cx, instance, enableTrap);
+    }
+  }
+
+  return true;
+}
+
+bool Debugger::updateExecutionObservabilityOfScripts(
+    JSContext* cx, const DebugAPI::ExecutionObservableSet& obs,
+    IsObserving observing) {
+  if (Zone* zone = obs.singleZone()) {
+    return UpdateExecutionObservabilityOfScriptsInZone(cx, zone, obs,
+                                                       observing);
+  }
+
+  for (auto iter = obs.zones()->iter(); !iter.done(); iter.next()) {
+    if (!UpdateExecutionObservabilityOfScriptsInZone(cx, iter.get(), obs,
+                                                     observing)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+template <typename FrameFn>
+void Debugger::forEachOnStackDebuggerFrame(AbstractFramePtr frame,
+                                           const JS::AutoRequireNoGC& nogc,
+                                           FrameFn fn) {
+  for (Realm::DebuggerVectorEntry& entry : frame.global()->getDebuggers(nogc)) {
+    Debugger* dbg = entry.dbg;
+    if (FrameMap::Ptr frameEntry = dbg->frames.lookup(frame)) {
+      fn(dbg, frameEntry->value());
+    }
+  }
+}
+
+template <typename FrameFn>
+void Debugger::forEachOnStackOrSuspendedGeneratorDebuggerFrame(
+    JSContext* cx, AbstractFramePtr frame, const JS::AutoRequireNoGC& nogc,
+    FrameFn fn) {
+  Rooted<AbstractGeneratorObject*> genObj(
+      cx, frame.isGeneratorFrame() ? GetGeneratorObjectForFrame(cx, frame)
+                                   : nullptr);
+
+  for (Realm::DebuggerVectorEntry& entry : frame.global()->getDebuggers(nogc)) {
+    Debugger* dbg = entry.dbg;
+
+    DebuggerFrame* frameObj = nullptr;
+    if (FrameMap::Ptr frameEntry = dbg->frames.lookup(frame)) {
+      frameObj = frameEntry->value();
+    } else if (GeneratorWeakMap::Ptr frameEntry =
+                   dbg->generatorFrames.lookup(genObj)) {
+      frameObj = frameEntry->value();
+    }
+
+    if (frameObj) {
+      fn(dbg, frameObj);
+    }
+  }
+}
+
+bool Debugger::getDebuggerFrames(AbstractFramePtr frame,
+                                 MutableHandle<DebuggerFrameVector> frames) {
+  bool hadOOM = false;
+  JS::AutoAssertNoGC nogc;
+  forEachOnStackDebuggerFrame(frame, nogc,
+                              [&](Debugger*, DebuggerFrame* frameobj) {
+                                if (!hadOOM && !frames.append(frameobj)) {
+                                  hadOOM = true;
+                                }
+                              });
+  return !hadOOM;
+}
+
+bool Debugger::updateExecutionObservability(
+    JSContext* cx, DebugAPI::ExecutionObservableSet& obs,
+    IsObserving observing) {
+  if (!obs.singleZone() && obs.zones()->empty()) {
+    return true;
+  }
+
+  return updateExecutionObservabilityOfScripts(cx, obs, observing) &&
+         updateExecutionObservabilityOfFrames(cx, obs, observing);
+}
+
+bool Debugger::ensureExecutionObservabilityOfScript(JSContext* cx,
+                                                    JSScript* script) {
+  if (script->isDebuggee()) {
+    return true;
+  }
+  ExecutionObservableScript obs(cx, script);
+  return updateExecutionObservability(cx, obs, Observing);
+}
+
+bool DebugAPI::ensureExecutionObservabilityOfOsrFrame(
+    JSContext* cx, AbstractFramePtr osrSourceFrame) {
+  MOZ_ASSERT(osrSourceFrame.isDebuggee());
+  if (osrSourceFrame.script()->hasBaselineScript() &&
+      osrSourceFrame.script()->baselineScript()->hasDebugInstrumentation()) {
+    return true;
+  }
+  ExecutionObservableFrame obs(osrSourceFrame);
+  return Debugger::updateExecutionObservabilityOfFrames(cx, obs, Observing);
+}
+
+bool Debugger::ensureExecutionObservabilityOfFrame(JSContext* cx,
+                                                   AbstractFramePtr frame) {
+  MOZ_ASSERT_IF(frame.hasScript() && frame.script()->isDebuggee(),
+                frame.isDebuggee());
+  MOZ_ASSERT_IF(frame.isWasmDebugFrame(), frame.wasmInstance()->debugEnabled());
+  if (frame.isDebuggee()) {
+    return true;
+  }
+  ExecutionObservableFrame obs(frame);
+  return updateExecutionObservabilityOfFrames(cx, obs, Observing);
+}
+
+bool Debugger::ensureExecutionObservabilityOfRealm(JSContext* cx,
+                                                   Realm* realm) {
+  if (realm->debuggerObservesAllExecution()) {
+    return true;
+  }
+  ExecutionObservableRealms obs(cx);
+  if (!obs.add(realm)) {
+    return false;
+  }
+  realm->updateDebuggerObservesAllExecution();
+  return updateExecutionObservability(cx, obs, Observing);
+}
+
+bool Debugger::hookObservesAllExecution(Hook which) {
+  return which == OnEnterFrame;
+}
+
+Debugger::IsObserving Debugger::observesAllExecution() const {
+  if (!!getHook(OnEnterFrame)) {
+    return Observing;
+  }
+  return NotObserving;
+}
+
+Debugger::IsObserving Debugger::observesWasm() const {
+  if (!allowUnobservedWasm) {
+    return Observing;
+  }
+  return NotObserving;
+}
+
+Debugger::IsObserving Debugger::observesCoverage() const {
+  if (collectCoverageInfo) {
+    return Observing;
+  }
+  return NotObserving;
+}
+
+Debugger::IsObserving Debugger::observesNativeCalls() const {
+  if (getHook(Debugger::OnNativeCall)) {
+    return Observing;
+  }
+  return NotObserving;
+}
+
+bool Debugger::isExclusiveDebuggerOnEval() const {
+  return exclusiveDebuggerOnEval;
+}
+
+bool Debugger::updateObservesAllExecutionOnDebuggees(JSContext* cx,
+                                                     IsObserving observing) {
+  ExecutionObservableRealms obs(cx);
+
+  for (auto iter = debuggees.iter(); !iter.done(); iter.next()) {
+    GlobalObject* global = iter.get();
+    JS::Realm* realm = global->realm();
+
+    if (realm->debuggerObservesAllExecution() == observing) {
+      continue;
+    }
+
+    if (observing && !obs.add(realm)) {
+      return false;
+    }
+  }
+
+  if (!updateExecutionObservability(cx, obs, observing)) {
+    return false;
+  }
+
+  for (auto iter = obs.realms()->iter(); !iter.done(); iter.next()) {
+    iter.get()->updateDebuggerObservesAllExecution();
+  }
+
+  return true;
+}
+
+bool Debugger::updateObservesCoverageOnDebuggees(JSContext* cx,
+                                                 IsObserving observing) {
+  ExecutionObservableRealms obs(cx);
+
+  for (auto iter = debuggees.iter(); !iter.done(); iter.next()) {
+    GlobalObject* global = iter.get();
+    Realm* realm = global->realm();
+
+    if (realm->debuggerObservesCoverage() == observing) {
+      continue;
+    }
+
+    if (!obs.add(realm)) {
+      return false;
+    }
+  }
+
+  for (AllFramesIter iter(cx); !iter.done(); ++iter) {
+    if (obs.shouldMarkAsDebuggee(iter)) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                JSMSG_DEBUG_NOT_IDLE);
+      return false;
+    }
+  }
+
+  if (!updateExecutionObservability(cx, obs, observing)) {
+    return false;
+  }
+
+  for (auto iter = obs.realms()->iter(); !iter.done(); iter.next()) {
+    iter.get()->updateDebuggerObservesCoverage();
+  }
+
+  return true;
+}
+
+void Debugger::updateObservesWasmOnDebuggees(IsObserving observing) {
+  for (auto iter = debuggees.iter(); !iter.done(); iter.next()) {
+    GlobalObject* global = iter.get();
+    Realm* realm = global->realm();
+
+    if (realm->debuggerObservesWasm() == observing) {
+      continue;
+    }
+
+    realm->updateDebuggerObservesWasm();
+  }
+}
+
+void Debugger::updateObservesNativeCallOnDebuggees(IsObserving observing) {
+  for (auto iter = debuggees.iter(); !iter.done(); iter.next()) {
+    GlobalObject* global = iter.get();
+    Realm* realm = global->realm();
+
+    if (realm->debuggerObservesNativeCall() == observing) {
+      continue;
+    }
+
+    realm->updateDebuggerObservesNativeCall();
+  }
+}
+
+
+bool Debugger::cannotTrackAllocations(const GlobalObject& global) {
+  auto existingCallback = global.realm()->getAllocationMetadataBuilder();
+  return existingCallback && existingCallback != &SavedStacks::metadataBuilder;
+}
+
+bool DebugAPI::isObservedByDebuggerTrackingAllocations(
+    const GlobalObject& debuggee) {
+  JS::AutoAssertNoGC nogc;
+  for (Realm::DebuggerVectorEntry& entry : debuggee.getDebuggers(nogc)) {
+    Debugger* dbg = entry.dbg.unbarrieredGet();
+    if (dbg->trackingAllocationSites) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void Debugger::addAllocationsTracking(JSContext* cx,
+                                      Handle<GlobalObject*> debuggee) {
+  MOZ_ASSERT(DebugAPI::isObservedByDebuggerTrackingAllocations(*debuggee));
+
+  MOZ_ASSERT(!cannotTrackAllocations(*debuggee));
+
+  debuggee->realm()->setAllocationMetadataBuilder(
+      &SavedStacks::metadataBuilder);
+  debuggee->realm()->chooseAllocationSamplingProbability();
+}
+
+bool Debugger::checkCanAddAllocationsTracking(JSContext* cx,
+                                              Handle<GlobalObject*> debuggee) {
+  if (Debugger::cannotTrackAllocations(*debuggee)) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_OBJECT_METADATA_CALLBACK_ALREADY_SET);
+    return false;
+  }
+
+  return true;
+}
+
+void Debugger::removeAllocationsTracking(GlobalObject& global) {
+  if (DebugAPI::isObservedByDebuggerTrackingAllocations(global)) {
+    global.realm()->chooseAllocationSamplingProbability();
+    return;
+  }
+
+  if (!global.realm()->runtimeFromMainThread()->recordAllocationCallback) {
+    global.realm()->forgetAllocationMetadataBuilder();
+  }
+}
+
+bool Debugger::addAllocationsTrackingForAllDebuggees(JSContext* cx) {
+  MOZ_ASSERT(trackingAllocationSites);
+
+  Rooted<GlobalObject*> g(cx);
+  for (auto iter = debuggees.iter(); !iter.done(); iter.next()) {
+    g = iter.get().get();
+    if (!checkCanAddAllocationsTracking(cx, g)) {
+      return false;
+    }
+  }
+
+  for (auto iter = debuggees.iter(); !iter.done(); iter.next()) {
+    g = iter.get().get();
+    Debugger::addAllocationsTracking(cx, g);
+  }
+
+  return true;
+}
+
+void Debugger::removeAllocationsTrackingForAllDebuggees() {
+  for (auto iter = debuggees.iter(); !iter.done(); iter.next()) {
+    Debugger::removeAllocationsTracking(*iter.get().get());
+  }
+
+  allocationsLog.clear();
+}
+
+
+template <typename F>
+inline void Debugger::forEachWeakMap(const F& f) {
+  f(generatorFrames);
+  f(objects);
+  f(environments);
+  f(scripts);
+  f(sources);
+  f(wasmInstanceScripts);
+  f(wasmInstanceSources);
+}
+
+void Debugger::traceCrossCompartmentEdges(JSTracer* trc) {
+  forEachWeakMap(
+      [trc](auto& weakMap) { weakMap.traceCrossCompartmentEdges(trc); });
+}
+
+void DebugAPI::traceCrossCompartmentEdges(JSTracer* trc) {
+  MOZ_ASSERT(JS::RuntimeHeapIsMajorCollecting());
+
+  JSRuntime* rt = trc->runtime();
+  gc::State state = rt->gc.state();
+
+  for (Debugger* dbg : rt->debuggerList()) {
+    Zone* zone = MaybeForwarded(dbg->object.get())->zone();
+    if (!zone->isCollecting() || state == gc::State::Compact) {
+      dbg->traceCrossCompartmentEdges(trc);
+    }
+  }
+}
+
+#ifdef DEBUG
+
+static bool RuntimeHasDebugger(JSRuntime* rt, Debugger* dbg) {
+  for (Debugger* d : rt->debuggerList()) {
+    if (d == dbg) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool DebugAPI::edgeIsInDebuggerWeakmap(JSRuntime* rt, JSObject* src,
+                                       JS::GCCellPtr dst) {
+  if (!Debugger::isChildJSObject(src)) {
+    return false;
+  }
+
+  if (src->is<DebuggerFrame>()) {
+    DebuggerFrame* frame = &src->as<DebuggerFrame>();
+    Debugger* dbg = frame->owner();
+    MOZ_ASSERT(RuntimeHasDebugger(rt, dbg));
+
+    if (dst.is<BaseScript>()) {
+      AbstractGeneratorObject* genObj = &frame->unwrappedGenerator();
+      return frame->generatorScript() == &dst.as<BaseScript>() &&
+             dbg->generatorFrames.hasEntry(genObj, frame);
+    }
+    return dst.is<JSObject>() &&
+           dst.as<JSObject>().is<AbstractGeneratorObject>() &&
+           dbg->generatorFrames.hasEntry(
+               &dst.as<JSObject>().as<AbstractGeneratorObject>(), frame);
+  }
+  if (src->is<DebuggerObject>()) {
+    DebuggerObject* dobj = &src->as<DebuggerObject>();
+    Debugger* dbg = dobj->owner();
+    MOZ_ASSERT(RuntimeHasDebugger(rt, dbg));
+    return dst.is<JSObject>() &&
+           dbg->objects.hasEntry(&dst.as<JSObject>(), dobj);
+  }
+  if (src->is<DebuggerEnvironment>()) {
+    DebuggerEnvironment* denv = &src->as<DebuggerEnvironment>();
+    Debugger* dbg = denv->owner();
+    MOZ_ASSERT(RuntimeHasDebugger(rt, dbg));
+    return dst.is<JSObject>() &&
+           dbg->environments.hasEntry(&dst.as<JSObject>(), denv);
+  }
+  if (src->is<DebuggerScript>()) {
+    DebuggerScript* dscript = &src->as<DebuggerScript>();
+    Debugger* dbg = dscript->owner();
+    MOZ_ASSERT(RuntimeHasDebugger(rt, dbg));
+
+    return src->as<DebuggerScript>().getReferent().match(
+        [=](BaseScript* script) {
+          return dst.is<BaseScript>() && script == &dst.as<BaseScript>() &&
+                 dbg->scripts.hasEntry(script, dscript);
+        },
+        [=](WasmInstanceObject* instance) {
+          return dst.is<JSObject>() && instance == &dst.as<JSObject>() &&
+                 dbg->wasmInstanceScripts.hasEntry(instance, dscript);
+        });
+  }
+  if (src->is<DebuggerSource>()) {
+    DebuggerSource* dsource = &src->as<DebuggerSource>();
+    Debugger* dbg = dsource->owner();
+    MOZ_ASSERT(RuntimeHasDebugger(rt, dbg));
+
+    return src->as<DebuggerSource>().getReferent().match(
+        [=](ScriptSourceObject* sso) {
+          return dst.is<JSObject>() && sso == &dst.as<JSObject>() &&
+                 dbg->sources.hasEntry(sso, dsource);
+        },
+        [=](WasmInstanceObject* instance) {
+          return dst.is<JSObject>() && instance == &dst.as<JSObject>() &&
+                 dbg->wasmInstanceSources.hasEntry(instance, dsource);
+        });
+  }
+  MOZ_ASSERT_UNREACHABLE("Unhandled cross-compartment edge");
+}
+
+#endif
+
+void DebugAPI::traceFramesWithLiveHooks(JSTracer* tracer) {
+  JSRuntime* rt = tracer->runtime();
+
+  for (Debugger* dbg : rt->debuggerList()) {
+    if (!dbg->zone()->isGCMarking() && !tracer->isCallbackTracer()) {
+      continue;
+    }
+
+#ifdef ENABLE_WASM_JSPI
+    JSContext* cx = tracer->runtime()->mainContextFromOwnThread();
+#endif
+    for (auto iter = dbg->frames.iter(); !iter.done(); iter.next()) {
+      HeapPtr<DebuggerFrame*>& frameobj = iter.get().value();
+      MOZ_ASSERT(frameobj->isOnStackOrSuspendedWasmStack());
+#ifdef ENABLE_WASM_JSPI
+      if (!frameobj->isOnStack(cx)) {
+        continue;
+      }
+#endif
+      if (frameobj->hasAnyHooks()) {
+        TraceEdge(tracer, &frameobj, "Debugger.Frame with live hooks");
+      }
+    }
+  }
+}
+
+#ifdef ENABLE_WASM_JSPI
+void DebugAPI::traceWasmContFrame(JSTracer* tracer, JSObject* src,
+                                  wasm::DebugFrame* debugFrame,
+                                  wasm::Instance* instance) {
+  MOZ_ASSERT(tracer->isMarkingTracer());
+
+  JS::AutoAssertNoGC nogc;
+  AbstractFramePtr fp(debugFrame);
+  for (Realm::DebuggerVectorEntry& entry :
+       instance->realm()->getDebuggers(nogc)) {
+    Debugger* dbg = entry.dbg.unbarrieredGet();
+    auto p = dbg->frames.lookup(fp);
+    if (!p) {
+      continue;
+    }
+    HeapPtr<DebuggerFrame*>& frameobj = p->value();
+    if (frameobj->hasAnyHooks()) {
+      TraceCrossCompartmentEdge(tracer, src, &frameobj,
+                                "wasm cont Debugger.Frame with live hooks");
+    }
+  }
+}
+#endif
+
+void DebugAPI::slowPathTraceGeneratorFrame(JSTracer* tracer,
+                                           AbstractGeneratorObject* generator) {
+  MOZ_ASSERT(generator->realm()->isDebuggee());
+
+  if (!tracer->isMarkingTracer()) {
+    return;
+  }
+
+  mozilla::Maybe<AutoLockGC> lock;
+  GCMarker* marker = GCMarker::fromTracer(tracer);
+  if (marker->isParallelMarking()) {
+    lock.emplace(marker->runtime());
+  }
+
+  JS::AutoAssertNoGC nogc;
+  for (Realm::DebuggerVectorEntry& entry :
+       generator->realm()->getDebuggers(nogc)) {
+    Debugger* dbg = entry.dbg.unbarrieredGet();
+
+    if (Debugger::GeneratorWeakMap::Ptr entry =
+            dbg->generatorFrames.lookupUnbarriered(generator)) {
+      const PreBarriered<DebuggerFrame*>& frameObj = entry->value();
+      if (frameObj->hasAnyHooks()) {
+        TraceCrossCompartmentEdge(tracer, generator, &frameObj,
+                                  "Debugger.Frame with hooks for generator");
+      }
+    }
+  }
+}
+
+void DebugAPI::traceAllForMovingGC(JSTracer* trc) {
+  JSRuntime* rt = trc->runtime();
+  for (Debugger* dbg : rt->debuggerList()) {
+    dbg->traceForMovingGC(trc);
+  }
+}
+
+void Debugger::traceForMovingGC(JSTracer* trc) {
+  trace(trc);
+
+  for (auto iter = debuggees.modIter(); !iter.done(); iter.next()) {
+    TraceEdge(trc, &iter.getMutable(), "Global Object");
+  }
+}
+
+void Debugger::traceObject(JSTracer* trc, JSObject* obj) {
+  if (Debugger* dbg = Debugger::fromJSObject(obj)) {
+    dbg->trace(trc);
+  }
+}
+
+void Debugger::trace(JSTracer* trc) {
+  TraceEdge(trc, &object, "Debugger Object");
+
+  TraceEdge(trc, &uncaughtExceptionHook, "hooks");
+
+  for (auto iter = frames.iter(); !iter.done(); iter.next()) {
+    HeapPtr<DebuggerFrame*>& frameobj = iter.get().value();
+    TraceEdge(trc, &frameobj, "live Debugger.Frame");
+    MOZ_ASSERT(frameobj->isOnStackOrSuspendedWasmStack());
+  }
+
+  allocationsLog.trace(trc);
+
+  forEachWeakMap([trc](auto& weakMap) { weakMap.trace(trc); });
+}
+
+void DebugAPI::traceFromRealm(JSTracer* trc, Realm* realm) {
+  JS::AutoAssertNoGC nogc;
+  for (Realm::DebuggerVectorEntry& entry : realm->getDebuggers(nogc)) {
+    TraceEdge(trc, &entry.debuggerLink, "realm debugger");
+  }
+}
+
+void DebugAPI::sweepAll(JS::GCContext* gcx) {
+  JSRuntime* rt = gcx->runtime();
+
+  Debugger* next;
+  for (Debugger* dbg = rt->debuggerList().getFirst(); dbg; dbg = next) {
+    next = dbg->getNext();
+
+    if (dbg->zone()->isGCSweeping()) {
+      for (auto iter = dbg->generatorFrames.modIter(); !iter.done();
+           iter.next()) {
+        DebuggerFrame* frameObj = iter.get().value();
+        if (IsAboutToBeFinalizedUnbarriered(frameObj)) {
+          Debugger::terminateDebuggerFrame(gcx, dbg, frameObj, NullFramePtr(),
+                                           nullptr, &iter);
+        }
+      }
+
+#ifdef ENABLE_WASM_JSPI
+      for (size_t i = 0; i < dbg->wasmContFrames.length();) {
+        AbstractFramePtr fp = dbg->wasmContFrames[i];
+        wasm::Instance* inst = fp.asWasmDebugFrame()->instance();
+        if (!IsAboutToBeFinalizedUnbarriered(inst->objectUnbarriered())) {
+          i++;
+          continue;
+        }
+        auto p = dbg->frames.lookup(fp);
+        MOZ_ASSERT(p);
+        mozilla::DebugOnly<size_t> lengthBefore = dbg->wasmContFrames.length();
+        Debugger::terminateDebuggerFrame(gcx, dbg, p->value(), fp, nullptr,
+                                         nullptr);
+        MOZ_ASSERT(dbg->wasmContFrames.length() == lengthBefore - 1);
+      }
+#endif
+    }
+
+    bool debuggerDying = IsAboutToBeFinalized(dbg->object);
+    for (auto iter = dbg->debuggees.modIter(); !iter.done(); iter.next()) {
+      GlobalObject* global = iter.get().unbarrieredGet();
+      if (debuggerDying || IsAboutToBeFinalizedUnbarriered(global)) {
+        dbg->removeDebuggeeGlobal(gcx, global, &iter, Debugger::FromSweep::Yes);
+      }
+    }
+
+    if (debuggerDying) {
+      gcx->delete_(dbg->object, dbg, MemoryUse::Debugger);
+    }
+
+    dbg = next;
+  }
+}
+
+static inline bool SweepZonesInSameGroup(Zone* a, Zone* b) {
+  return a->addSweepGroupEdgeTo(b) && b->addSweepGroupEdgeTo(a);
+}
+
+bool DebugAPI::findSweepGroupEdges(JSRuntime* rt) {
+
+  for (Debugger* dbg : rt->debuggerList()) {
+    Zone* debuggerZone = dbg->object->zone();
+    if (!debuggerZone->isGCMarking()) {
+      continue;
+    }
+
+    for (auto iter = dbg->debuggeeZones.iter(); !iter.done(); iter.next()) {
+      Zone* debuggeeZone = iter.get();
+      if (!debuggeeZone->isGCMarking()) {
+        continue;
+      }
+
+      if (!SweepZonesInSameGroup(debuggerZone, debuggeeZone)) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+template <class UnbarrieredKey, class Wrapper, bool InvisibleKeysOk>
+bool DebuggerWeakMap<UnbarrieredKey, Wrapper,
+                     InvisibleKeysOk>::findSweepGroupEdges(Zone* atomsZone) {
+  Zone* debuggerZone = zone();
+  MOZ_ASSERT(debuggerZone->isGCMarking());
+  for (auto iter = this->iter(); !iter.done(); iter.next()) {
+    MOZ_ASSERT(iter.get().value()->zone() == debuggerZone);
+
+    Zone* keyZone = iter.get().key()->zone();
+    if (keyZone->isGCMarking() &&
+        !SweepZonesInSameGroup(debuggerZone, keyZone)) {
+      return false;
+    }
+  }
+
+  return Base::findSweepGroupEdges(atomsZone);
+}
+
+const JSClassOps DebuggerInstanceObject::classOps_ = {
+    .trace = Debugger::traceObject,
+};
+
+const JSClass DebuggerInstanceObject::class_ = {
+    "Debugger",
+    JSCLASS_HAS_RESERVED_SLOTS(Debugger::JSSLOT_DEBUG_COUNT),
+    &classOps_,
+};
+
+static_assert(Debugger::JSSLOT_DEBUG_PROTO_START == 0,
+              "DebuggerPrototypeObject only needs slots for the proto objects");
+
+const JSClass DebuggerPrototypeObject::class_ = {
+    "DebuggerPrototype",
+    JSCLASS_HAS_RESERVED_SLOTS(Debugger::JSSLOT_DEBUG_PROTO_STOP),
+};
+
+static Debugger* Debugger_fromThisValue(JSContext* cx, const CallArgs& args,
+                                        const char* fnname) {
+  JSObject* thisobj = RequireObject(cx, args.thisv());
+  if (!thisobj) {
+    return nullptr;
+  }
+  if (!thisobj->is<DebuggerInstanceObject>()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_INCOMPATIBLE_PROTO, "Debugger", fnname,
+                              thisobj->getClass()->name);
+    return nullptr;
+  }
+
+  Debugger* dbg = Debugger::fromJSObject(thisobj);
+  MOZ_ASSERT(dbg);
+  return dbg;
+}
+
+struct MOZ_STACK_CLASS Debugger::CallData {
+  JSContext* cx;
+  const CallArgs& args;
+
+  Debugger* dbg;
+
+  CallData(JSContext* cx, const CallArgs& args, Debugger* dbg)
+      : cx(cx), args(args), dbg(dbg) {}
+
+  bool getOnDebuggerStatement();
+  bool setOnDebuggerStatement();
+  bool getOnExceptionUnwind();
+  bool setOnExceptionUnwind();
+  bool getOnNewScript();
+  bool setOnNewScript();
+  bool getOnEnterFrame();
+  bool setOnEnterFrame();
+  bool getOnNativeCall();
+  bool setOnNativeCall();
+  bool getShouldAvoidSideEffects();
+  bool setShouldAvoidSideEffects();
+  bool getOnNewGlobalObject();
+  bool setOnNewGlobalObject();
+  bool getOnNewPromise();
+  bool setOnNewPromise();
+  bool getOnPromiseSettled();
+  bool setOnPromiseSettled();
+  bool getUncaughtExceptionHook();
+  bool setUncaughtExceptionHook();
+  bool getAllowUnobservedWasm();
+  bool setAllowUnobservedWasm();
+  bool getExclusiveDebuggerOnEval();
+  bool setExclusiveDebuggerOnEval();
+  bool getInspectNativeCallArguments();
+  bool setInspectNativeCallArguments();
+  bool getCollectCoverageInfo();
+  bool setCollectCoverageInfo();
+  bool getMemory();
+  bool addDebuggee();
+  bool addAllGlobalsAsDebuggees();
+  bool removeDebuggee();
+  bool removeAllDebuggees();
+  bool hasDebuggee();
+  bool getDebuggees();
+  bool getNewestFrame();
+  bool clearAllBreakpoints();
+  bool findScripts();
+  bool findSources();
+  bool findObjects();
+  bool findAllGlobals();
+  bool findSourceURLs();
+  bool makeGlobalObjectReference();
+  bool adoptDebuggeeValue();
+  bool adoptFrame();
+  bool adoptSource();
+  bool enableAsyncStack();
+  bool disableAsyncStack();
+  bool enableUnlimitedStacksCapturing();
+  bool disableUnlimitedStacksCapturing();
+
+  using Method = bool (CallData::*)();
+
+  template <Method MyMethod>
+  static bool ToNative(JSContext* cx, unsigned argc, Value* vp);
+};
+
+template <Debugger::CallData::Method MyMethod>
+bool Debugger::CallData::ToNative(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  Debugger* dbg = Debugger_fromThisValue(cx, args, "method");
+  if (!dbg) {
+    return false;
+  }
+
+  CallData data(cx, args, dbg);
+  return (data.*MyMethod)();
+}
+
+bool Debugger::getHookImpl(JSContext* cx, const CallArgs& args, Debugger& dbg,
+                           Hook which) {
+  MOZ_ASSERT(which >= 0 && which < HookCount);
+  args.rval().set(dbg.object->getReservedSlot(
+      JSSLOT_DEBUG_HOOK_START + std::underlying_type_t<Hook>(which)));
+  return true;
+}
+
+bool Debugger::setHookImpl(JSContext* cx, const CallArgs& args, Debugger& dbg,
+                           Hook which) {
+  MOZ_ASSERT(which >= 0 && which < HookCount);
+  if (!args.requireAtLeast(cx, "Debugger.setHook", 1)) {
+    return false;
+  }
+  if (args[0].isObject()) {
+    if (!args[0].toObject().isCallable()) {
+      return ReportIsNotFunction(cx, args[0], args.length() - 1);
+    }
+  } else if (!args[0].isUndefined()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_NOT_CALLABLE_OR_UNDEFINED);
+    return false;
+  }
+
+  if (dbg.collectCoverageInfo && which == Hook::OnEnterFrame) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_DEBUG_EXCLUSIVE_FRAME_COVERAGE);
+    return false;
+  }
+
+  uint32_t slot = JSSLOT_DEBUG_HOOK_START + std::underlying_type_t<Hook>(which);
+  RootedValue oldHook(cx, dbg.object->getReservedSlot(slot));
+  dbg.object->setReservedSlot(slot, args[0]);
+  if (hookObservesAllExecution(which)) {
+    if (!dbg.updateObservesAllExecutionOnDebuggees(
+            cx, dbg.observesAllExecution())) {
+      dbg.object->setReservedSlot(slot, oldHook);
+      return false;
+    }
+  }
+
+  Rooted<DebuggerDebuggeeLink*> debuggeeLink(cx, dbg.getDebuggeeLink());
+  if (dbg.hasAnyLiveHooks()) {
+    debuggeeLink->setLinkSlot(dbg);
+  } else {
+    debuggeeLink->clearLinkSlot();
+  }
+
+  args.rval().setUndefined();
+  return true;
+}
+
+bool Debugger::getGarbageCollectionHook(JSContext* cx, const CallArgs& args,
+                                        Debugger& dbg) {
+  return getHookImpl(cx, args, dbg, OnGarbageCollection);
+}
+
+bool Debugger::setGarbageCollectionHook(JSContext* cx, const CallArgs& args,
+                                        Debugger& dbg) {
+  Rooted<JSObject*> oldHook(cx, dbg.getHook(OnGarbageCollection));
+
+  if (!setHookImpl(cx, args, dbg, OnGarbageCollection)) {
+    MOZ_ASSERT(dbg.getHook(OnGarbageCollection) == oldHook);
+    return false;
+  }
+
+  JSObject* newHook = dbg.getHook(OnGarbageCollection);
+  if (!oldHook && newHook) {
+    cx->runtime()->onGarbageCollectionWatchers().pushBack(&dbg);
+  } else if (oldHook && !newHook) {
+    cx->runtime()->onGarbageCollectionWatchers().remove(&dbg);
+  }
+
+  return true;
+}
+
+bool Debugger::CallData::getOnDebuggerStatement() {
+  return getHookImpl(cx, args, *dbg, OnDebuggerStatement);
+}
+
+bool Debugger::CallData::setOnDebuggerStatement() {
+  return setHookImpl(cx, args, *dbg, OnDebuggerStatement);
+}
+
+bool Debugger::CallData::getOnExceptionUnwind() {
+  return getHookImpl(cx, args, *dbg, OnExceptionUnwind);
+}
+
+bool Debugger::CallData::setOnExceptionUnwind() {
+  return setHookImpl(cx, args, *dbg, OnExceptionUnwind);
+}
+
+bool Debugger::CallData::getOnNewScript() {
+  return getHookImpl(cx, args, *dbg, OnNewScript);
+}
+
+bool Debugger::CallData::setOnNewScript() {
+  return setHookImpl(cx, args, *dbg, OnNewScript);
+}
+
+bool Debugger::CallData::getOnNewPromise() {
+  return getHookImpl(cx, args, *dbg, OnNewPromise);
+}
+
+bool Debugger::CallData::setOnNewPromise() {
+  return setHookImpl(cx, args, *dbg, OnNewPromise);
+}
+
+bool Debugger::CallData::getOnPromiseSettled() {
+  return getHookImpl(cx, args, *dbg, OnPromiseSettled);
+}
+
+bool Debugger::CallData::setOnPromiseSettled() {
+  return setHookImpl(cx, args, *dbg, OnPromiseSettled);
+}
+
+bool Debugger::CallData::getOnEnterFrame() {
+  return getHookImpl(cx, args, *dbg, OnEnterFrame);
+}
+
+bool Debugger::CallData::setOnEnterFrame() {
+  return setHookImpl(cx, args, *dbg, OnEnterFrame);
+}
+
+bool Debugger::CallData::getOnNativeCall() {
+  return getHookImpl(cx, args, *dbg, OnNativeCall);
+}
+
+bool Debugger::CallData::setOnNativeCall() {
+  RootedObject oldHook(cx, dbg->getHook(OnNativeCall));
+
+  if (!setHookImpl(cx, args, *dbg, OnNativeCall)) {
+    return false;
+  }
+
+  JSObject* newHook = dbg->getHook(OnNativeCall);
+  if (!oldHook && newHook) {
+    dbg->updateObservesNativeCallOnDebuggees(Observing);
+  } else if (oldHook && !newHook) {
+    dbg->updateObservesNativeCallOnDebuggees(NotObserving);
+  }
+
+  return true;
+}
+
+bool Debugger::CallData::getShouldAvoidSideEffects() {
+  args.rval().setBoolean(dbg->shouldAvoidSideEffects);
+  return true;
+}
+
+bool Debugger::CallData::setShouldAvoidSideEffects() {
+  if (!args.requireAtLeast(cx, "Debugger.set shouldAvoidSideEffects", 1)) {
+    return false;
+  }
+
+  dbg->shouldAvoidSideEffects = ToBoolean(args[0]);
+
+  args.rval().setUndefined();
+  return true;
+}
+
+bool Debugger::CallData::getOnNewGlobalObject() {
+  return getHookImpl(cx, args, *dbg, OnNewGlobalObject);
+}
+
+bool Debugger::CallData::setOnNewGlobalObject() {
+  RootedObject oldHook(cx, dbg->getHook(OnNewGlobalObject));
+
+  if (!setHookImpl(cx, args, *dbg, OnNewGlobalObject)) {
+    return false;
+  }
+
+  JSObject* newHook = dbg->getHook(OnNewGlobalObject);
+  if (!oldHook && newHook) {
+    cx->runtime()->onNewGlobalObjectWatchers().pushBack(dbg);
+  } else if (oldHook && !newHook) {
+    cx->runtime()->onNewGlobalObjectWatchers().remove(dbg);
+  }
+
+  return true;
+}
+
+bool Debugger::CallData::getUncaughtExceptionHook() {
+  args.rval().setObjectOrNull(dbg->uncaughtExceptionHook);
+  return true;
+}
+
+bool Debugger::CallData::setUncaughtExceptionHook() {
+  if (!args.requireAtLeast(cx, "Debugger.set uncaughtExceptionHook", 1)) {
+    return false;
+  }
+  if (!args[0].isNull() &&
+      (!args[0].isObject() || !args[0].toObject().isCallable())) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_ASSIGN_FUNCTION_OR_NULL,
+                              "uncaughtExceptionHook");
+    return false;
+  }
+  dbg->uncaughtExceptionHook = args[0].toObjectOrNull();
+  args.rval().setUndefined();
+  return true;
+}
+
+bool Debugger::CallData::getAllowUnobservedWasm() {
+  args.rval().setBoolean(dbg->allowUnobservedWasm);
+  return true;
+}
+
+bool Debugger::CallData::setAllowUnobservedWasm() {
+  if (!args.requireAtLeast(cx, "Debugger.set allowUnobservedWasm", 1)) {
+    return false;
+  }
+  dbg->allowUnobservedWasm = ToBoolean(args[0]);
+
+  for (auto iter = dbg->debuggees.iter(); !iter.done(); iter.next()) {
+    GlobalObject* global = iter.get();
+    Realm* realm = global->realm();
+    realm->updateDebuggerObservesWasm();
+  }
+
+  args.rval().setUndefined();
+  return true;
+}
+
+bool Debugger::CallData::getExclusiveDebuggerOnEval() {
+  args.rval().setBoolean(dbg->exclusiveDebuggerOnEval);
+  return true;
+}
+
+bool Debugger::CallData::setExclusiveDebuggerOnEval() {
+  if (!args.requireAtLeast(cx, "Debugger.set exclusiveDebuggerOnEval", 1)) {
+    return false;
+  }
+  dbg->exclusiveDebuggerOnEval = ToBoolean(args[0]);
+
+  args.rval().setUndefined();
+  return true;
+}
+
+bool Debugger::CallData::getInspectNativeCallArguments() {
+  args.rval().setBoolean(dbg->inspectNativeCallArguments);
+  return true;
+}
+
+bool Debugger::CallData::setInspectNativeCallArguments() {
+  if (!args.requireAtLeast(cx, "Debugger.set inspectNativeCallArguments", 1)) {
+    return false;
+  }
+  dbg->inspectNativeCallArguments = ToBoolean(args[0]);
+
+  args.rval().setUndefined();
+  return true;
+}
+
+bool Debugger::CallData::getCollectCoverageInfo() {
+  args.rval().setBoolean(dbg->collectCoverageInfo);
+  return true;
+}
+
+bool Debugger::CallData::setCollectCoverageInfo() {
+  if (!args.requireAtLeast(cx, "Debugger.set collectCoverageInfo", 1)) {
+    return false;
+  }
+
+  uint32_t slot = JSSLOT_DEBUG_HOOK_START +
+                  std::underlying_type_t<Hook>(Hook::OnEnterFrame);
+  if (!dbg->object->getReservedSlot(slot).isUndefined()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_DEBUG_EXCLUSIVE_FRAME_COVERAGE);
+    return false;
+  }
+
+  if (cx->realm()->isTracingExecution()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_DEBUG_EXCLUSIVE_EXECUTION_TRACE_COVERAGE);
+    return false;
+  }
+
+  bool oldFlag = dbg->collectCoverageInfo;
+  bool newFlag = ToBoolean(args[0]);
+  dbg->collectCoverageInfo = newFlag;
+
+  IsObserving observing = dbg->collectCoverageInfo ? Observing : NotObserving;
+  if (!dbg->updateObservesCoverageOnDebuggees(cx, observing)) {
+    dbg->collectCoverageInfo = oldFlag;
+    return false;
+  }
+
+  args.rval().setUndefined();
+  return true;
+}
+
+bool Debugger::CallData::getMemory() {
+  Value memoryValue =
+      dbg->object->getReservedSlot(JSSLOT_DEBUG_MEMORY_INSTANCE);
+
+  if (!memoryValue.isObject()) {
+    RootedObject memory(cx, DebuggerMemory::create(cx, dbg));
+    if (!memory) {
+      return false;
+    }
+    memoryValue = ObjectValue(*memory);
+  }
+
+  args.rval().set(memoryValue);
+  return true;
+}
+
+GlobalObject* Debugger::unwrapDebuggeeArgument(JSContext* cx, const Value& v) {
+  if (!v.isObject()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_UNEXPECTED_TYPE, "argument",
+                              "not a global object");
+    return nullptr;
+  }
+
+  RootedObject obj(cx, &v.toObject());
+
+  if (obj->getClass() == &DebuggerObject::class_) {
+    RootedValue rv(cx, v);
+    if (!unwrapDebuggeeValue(cx, &rv)) {
+      return nullptr;
+    }
+    obj = &rv.toObject();
+  }
+
+  obj = CheckedUnwrapDynamic(obj, cx,  false);
+  if (!obj) {
+    ReportAccessDenied(cx);
+    return nullptr;
+  }
+
+  if (JS_IsDeadWrapper(obj)) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_DEAD_OBJECT);
+    return nullptr;
+  }
+
+  if (!obj->is<GlobalObject>()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_UNEXPECTED_TYPE, "argument",
+                              "not a global object");
+    return nullptr;
+  }
+
+  return &obj->as<GlobalObject>();
+}
+
+bool Debugger::CallData::addDebuggee() {
+  if (!args.requireAtLeast(cx, "Debugger.addDebuggee", 1)) {
+    return false;
+  }
+  Rooted<GlobalObject*> global(cx, dbg->unwrapDebuggeeArgument(cx, args[0]));
+  if (!global) {
+    return false;
+  }
+
+  if (!dbg->addDebuggeeGlobal(cx, global)) {
+    return false;
+  }
+
+  RootedValue v(cx, ObjectValue(*global));
+  if (!dbg->wrapDebuggeeValue(cx, &v)) {
+    return false;
+  }
+  args.rval().set(v);
+  return true;
+}
+
+bool Debugger::CallData::addAllGlobalsAsDebuggees() {
+  for (CompartmentsIter comp(cx->runtime()); !comp.done(); comp.next()) {
+    if (comp == dbg->object->compartment()) {
+      continue;
+    }
+    for (RealmsInCompartmentIter r(comp); !r.done(); r.next()) {
+      if (r->creationOptions().invisibleToDebugger()) {
+        continue;
+      }
+      if (!r->hasInitializedGlobal()) {
+        continue;
+      }
+      r->compartment()->gcState.scheduledForDestruction = false;
+      Rooted<GlobalObject*> global(cx, r->maybeGlobal());
+      MOZ_ASSERT(global);
+      if (!dbg->addDebuggeeGlobal(cx, global)) {
+        return false;
+      }
+    }
+  }
+
+  args.rval().setUndefined();
+  return true;
+}
+
+bool Debugger::CallData::removeDebuggee() {
+  if (!args.requireAtLeast(cx, "Debugger.removeDebuggee", 1)) {
+    return false;
+  }
+  Rooted<GlobalObject*> global(cx, dbg->unwrapDebuggeeArgument(cx, args[0]));
+  if (!global) {
+    return false;
+  }
+
+  ExecutionObservableRealms obs(cx);
+
+  if (dbg->debuggees.has(global)) {
+    dbg->removeDebuggeeGlobal(cx->gcContext(), global, nullptr, FromSweep::No);
+
+    if (!global->hasDebuggers() && !obs.add(global->realm())) {
+      return false;
+    }
+    if (!updateExecutionObservability(cx, obs, NotObserving)) {
+      return false;
+    }
+  }
+
+  args.rval().setUndefined();
+  return true;
+}
+
+bool Debugger::CallData::removeAllDebuggees() {
+  ExecutionObservableRealms obs(cx);
+
+  for (auto iter = dbg->debuggees.modIter(); !iter.done(); iter.next()) {
+    Rooted<GlobalObject*> global(cx, iter.get());
+    dbg->removeDebuggeeGlobal(cx->gcContext(), global, &iter, FromSweep::No);
+
+    if (!global->hasDebuggers() && !obs.add(global->realm())) {
+      return false;
+    }
+  }
+
+  if (!updateExecutionObservability(cx, obs, NotObserving)) {
+    return false;
+  }
+
+  args.rval().setUndefined();
+  return true;
+}
+
+bool Debugger::CallData::hasDebuggee() {
+  if (!args.requireAtLeast(cx, "Debugger.hasDebuggee", 1)) {
+    return false;
+  }
+  GlobalObject* global = dbg->unwrapDebuggeeArgument(cx, args[0]);
+  if (!global) {
+    return false;
+  }
+  args.rval().setBoolean(!!dbg->debuggees.lookup(global));
+  return true;
+}
+
+bool Debugger::CallData::getDebuggees() {
+  unsigned count = dbg->debuggees.count();
+  RootedValueVector debuggees(cx);
+  if (!debuggees.resize(count)) {
+    return false;
+  }
+  unsigned i = 0;
+  {
+    JS::AutoCheckCannotGC nogc;
+    for (auto iter = dbg->debuggees.iter(); !iter.done(); iter.next()) {
+      debuggees[i++].setObject(*iter.get().get());
+    }
+  }
+
+  Rooted<ArrayObject*> arrobj(cx, NewDenseFullyAllocatedArray(cx, count));
+  if (!arrobj) {
+    return false;
+  }
+  arrobj->ensureDenseInitializedLength(0, count);
+  for (i = 0; i < count; i++) {
+    RootedValue v(cx, debuggees[i]);
+    if (!dbg->wrapDebuggeeValue(cx, &v)) {
+      return false;
+    }
+    arrobj->setDenseElement(i, v);
+  }
+
+  args.rval().setObject(*arrobj);
+  return true;
+}
+
+bool Debugger::CallData::getNewestFrame() {
+  for (FrameIter iter(cx); !iter.done(); ++iter) {
+    if (dbg->observesFrame(iter)) {
+      if (iter.isIon() && !iter.ensureHasRematerializedFrame(cx)) {
+        return false;
+      }
+      return dbg->getFrame(cx, iter, args.rval());
+    }
+  }
+  args.rval().setNull();
+  return true;
+}
+
+bool Debugger::CallData::clearAllBreakpoints() {
+  JS::GCContext* gcx = cx->gcContext();
+  Breakpoint* nextbp;
+  for (Breakpoint* bp = dbg->firstBreakpoint(); bp; bp = nextbp) {
+    nextbp = bp->nextInDebugger();
+
+    bp->remove(gcx);
+  }
+  MOZ_ASSERT(!dbg->firstBreakpoint());
+
+  return true;
+}
+
+bool Debugger::construct(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  for (unsigned i = 0; i < args.length(); i++) {
+    JSObject* argobj = RequireObject(cx, args[i]);
+    if (!argobj) {
+      return false;
+    }
+    if (!argobj->is<CrossCompartmentWrapperObject>()) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                JSMSG_DEBUG_CCW_REQUIRED, "Debugger");
+      return false;
+    }
+  }
+
+  RootedValue v(cx);
+  RootedObject callee(cx, &args.callee());
+  if (!GetProperty(cx, callee, callee, cx->names().prototype, &v)) {
+    return false;
+  }
+  Rooted<NativeObject*> proto(cx, &v.toObject().as<NativeObject>());
+  MOZ_ASSERT(proto->is<DebuggerPrototypeObject>());
+
+  Rooted<DebuggerInstanceObject*> obj(
+      cx, NewObjectWithGivenProto<DebuggerInstanceObject>(
+              cx, proto, {.newKind = TenuredObject}));
+  if (!obj) {
+    return false;
+  }
+  for (unsigned slot = JSSLOT_DEBUG_PROTO_START; slot < JSSLOT_DEBUG_PROTO_STOP;
+       slot++) {
+    obj->setReservedSlot(slot, proto->getReservedSlot(slot));
+  }
+  obj->setReservedSlot(JSSLOT_DEBUG_MEMORY_INSTANCE, NullValue());
+
+  Rooted<NativeObject*> livenessLink(
+      cx, NewObjectWithGivenProto<DebuggerDebuggeeLink>(cx, nullptr));
+  if (!livenessLink) {
+    return false;
+  }
+  obj->setReservedSlot(JSSLOT_DEBUG_DEBUGGEE_LINK, ObjectValue(*livenessLink));
+
+  Debugger* debugger;
+  {
+    auto dbg = cx->make_unique<Debugger>(cx, obj.get());
+    if (!dbg) {
+      return false;
+    }
+
+    debugger = dbg.release();
+    InitReservedSlot(obj, JSSLOT_DEBUG_DEBUGGER, debugger, MemoryUse::Debugger);
+  }
+
+  for (unsigned i = 0; i < args.length(); i++) {
+    JSObject& wrappedObj =
+        args[i].toObject().as<ProxyObject>().private_().toObject();
+    Rooted<GlobalObject*> debuggee(cx, &wrappedObj.nonCCWGlobal());
+    if (!debugger->addDebuggeeGlobal(cx, debuggee)) {
+      return false;
+    }
+  }
+
+  args.rval().setObject(*obj);
+  return true;
+}
+
+bool Debugger::addDebuggeeGlobal(JSContext* cx, Handle<GlobalObject*> global) {
+  if (debuggees.has(global)) {
+    return true;
+  }
+
+  Realm* debuggeeRealm = global->realm();
+  if (debuggeeRealm->creationOptions().invisibleToDebugger()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_DEBUG_CANT_DEBUG_GLOBAL);
+    return false;
+  }
+
+  if (debuggeeRealm->compartment() == object->compartment()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_DEBUG_SAME_COMPARTMENT);
+    return false;
+  }
+
+  Vector<Realm*> visited(cx);
+  if (!visited.append(object->realm())) {
+    return false;
+  }
+  for (size_t i = 0; i < visited.length(); i++) {
+    Realm* realm = visited[i];
+    if (realm == debuggeeRealm) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_DEBUG_LOOP);
+      return false;
+    }
+
+    if (realm->isDebuggee()) {
+      JS::AutoAssertNoGC nogc;
+      for (Realm::DebuggerVectorEntry& entry : realm->getDebuggers(nogc)) {
+        Realm* next = entry.dbg->object->realm();
+        if (std::find(visited.begin(), visited.end(), next) == visited.end()) {
+          if (!visited.append(next)) {
+            return false;
+          }
+        }
+      }
+    }
+  }
+
+  if (!Debugger::checkCanAddAllocationsTracking(cx, global)) {
+    return false;
+  }
+
+
+  AutoRealm ar(cx, global);
+  Zone* zone = global->zone();
+
+  RootedObject debuggeeLink(cx, getDebuggeeLink());
+  if (!cx->compartment()->wrap(cx, &debuggeeLink)) {
+    return false;
+  }
+
+  JS::AutoAssertNoGC nogc;
+
+  auto& globalDebuggers = global->getDebuggers(nogc);
+  if (!globalDebuggers.append(Realm::DebuggerVectorEntry(this, debuggeeLink))) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+  auto globalDebuggersGuard = MakeScopeExit([&] { globalDebuggers.popBack(); });
+
+  if (!debuggees.put(global)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+  auto debuggeesGuard = MakeScopeExit([&] { debuggees.remove(global); });
+
+  bool addingZoneRelation = !debuggeeZones.has(zone);
+
+  if (addingZoneRelation && !debuggeeZones.put(zone)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+  auto debuggeeZonesGuard = MakeScopeExit([&] {
+    if (addingZoneRelation) {
+      debuggeeZones.remove(zone);
+    }
+  });
+
+  if (trackingAllocationSites) {
+    Debugger::addAllocationsTracking(cx, global);
+  }
+
+  auto allocationsTrackingGuard = MakeScopeExit([&] {
+    if (trackingAllocationSites) {
+      Debugger::removeAllocationsTracking(*global);
+    }
+  });
+
+  AutoRestoreRealmDebugMode debugModeGuard(debuggeeRealm);
+  debuggeeRealm->setIsDebuggee();
+  debuggeeRealm->updateDebuggerObservesWasm();
+  debuggeeRealm->updateDebuggerObservesCoverage();
+  if (observesAllExecution() &&
+      !ensureExecutionObservabilityOfRealm(cx, debuggeeRealm)) {
+    return false;
+  }
+
+  globalDebuggersGuard.release();
+  debuggeesGuard.release();
+  debuggeeZonesGuard.release();
+  allocationsTrackingGuard.release();
+  debugModeGuard.release();
+  return true;
+}
+
+void Debugger::recomputeDebuggeeZoneSet() {
+  AutoEnterOOMUnsafeRegion oomUnsafe;
+  debuggeeZones.clear();
+  for (auto iter = debuggees.iter(); !iter.done(); iter.next()) {
+    if (!debuggeeZones.put(iter.get().unbarrieredGet()->zone())) {
+      oomUnsafe.crash("Debugger::removeDebuggeeGlobal");
+    }
+  }
+}
+
+template <typename T, typename AP>
+static T* findDebuggerInVector(Debugger* dbg, Vector<T, 0, AP>* vec) {
+  T* p;
+  for (p = vec->begin(); p != vec->end(); p++) {
+    if (p->dbg == dbg) {
+      break;
+    }
+  }
+  MOZ_ASSERT(p != vec->end());
+  return p;
+}
+
+void Debugger::removeDebuggeeGlobal(JS::GCContext* gcx, GlobalObject* global,
+                                    WeakGlobalObjectSet::ModIterator* debugIter,
+                                    FromSweep fromSweep) {
+  MOZ_ASSERT(debuggees.has(global));
+  MOZ_ASSERT(debuggeeZones.has(global->zone()));
+  MOZ_ASSERT_IF(debugIter, debugIter->get().unbarrieredGet() == global);
+
+  if (fromSweep == FromSweep::No) {
+    for (auto iter = generatorFrames.modIter(); !iter.done(); iter.next()) {
+      AbstractGeneratorObject& genObj = *iter.get().key();
+      if (&genObj.global() == global) {
+        terminateDebuggerFrame(gcx, this, iter.get().value(), NullFramePtr(),
+                               nullptr, &iter);
+      }
+    }
+  }
+
+  for (auto iter = frames.modIter(); !iter.done(); iter.next()) {
+    AbstractFramePtr frame = iter.get().key();
+    if (frame.hasGlobal(global)) {
+      terminateDebuggerFrame(gcx, this, iter.get().value(), frame, &iter);
+    }
+  }
+
+  JS::AutoAssertNoGC nogc;
+  auto& globalDebuggersVector = global->getDebuggers(nogc);
+
+  globalDebuggersVector.erase(
+      findDebuggerInVector(this, &globalDebuggersVector));
+
+  if (debugIter) {
+    debugIter->remove();
+  } else {
+    debuggees.remove(global);
+  }
+
+  recomputeDebuggeeZoneSet();
+
+  Breakpoint* nextbp;
+  for (Breakpoint* bp = firstBreakpoint(); bp; bp = nextbp) {
+    nextbp = bp->nextInDebugger();
+
+    if (bp->site->realm() == global->realm()) {
+      bp->remove(gcx);
+    }
+  }
+  MOZ_ASSERT_IF(debuggees.empty(), !firstBreakpoint());
+
+  if (trackingAllocationSites) {
+    Debugger::removeAllocationsTracking(*global);
+  }
+
+  if (!global->realm()->hasDebuggers() &&
+      !global->realm()->isTracingExecution()) {
+    global->realm()->unsetIsDebuggee();
+  } else {
+    global->realm()->updateDebuggerObservesAllExecution();
+    global->realm()->updateDebuggerObservesWasm();
+    global->realm()->updateDebuggerObservesCoverage();
+  }
+}
+
+class MOZ_STACK_CLASS Debugger::QueryBase {
+ protected:
+  QueryBase(JSContext* cx, Debugger* dbg)
+      : cx(cx),
+        debugger(dbg),
+        iterMarker(&cx->runtime()->gc),
+        realms(cx->zone()) {}
+
+  JSContext* cx;
+
+  Debugger* debugger;
+
+  gc::AutoEnterIteration iterMarker;
+
+  using RealmSet = HashSet<Realm*, DefaultHasher<Realm*>, ZoneAllocPolicy>;
+
+  RealmSet realms;
+
+  bool oom = false;
+
+  bool addRealm(Realm* realm) { return realms.put(realm); }
+
+  bool matchSingleGlobal(GlobalObject* global) {
+    MOZ_ASSERT(realms.count() == 0);
+    if (!addRealm(global->realm())) {
+      ReportOutOfMemory(cx);
+      return false;
+    }
+    return true;
+  }
+
+  bool matchAllDebuggeeGlobals() {
+    MOZ_ASSERT(realms.count() == 0);
+    for (auto iter = debugger->debuggees.iter(); !iter.done(); iter.next()) {
+      if (!addRealm(iter.get()->realm())) {
+        ReportOutOfMemory(cx);
+        return false;
+      }
+    }
+    return true;
+  }
+};
+
+class MOZ_STACK_CLASS Debugger::ScriptQuery : public Debugger::QueryBase {
+ public:
+  ScriptQuery(JSContext* cx, Debugger* dbg)
+      : QueryBase(cx, dbg),
+        url(cx),
+        displayURLString(cx),
+        source(cx, AsVariant(static_cast<ScriptSourceObject*>(nullptr))),
+        scriptVector(cx, BaseScriptVector(cx)),
+        partialMatchVector(cx, BaseScriptVector(cx)),
+        wasmInstanceVector(cx, WasmInstanceObjectVector(cx)) {}
+
+  bool parseQuery(HandleObject query) {
+    RootedValue global(cx);
+    if (!GetProperty(cx, query, query, cx->names().global, &global)) {
+      return false;
+    }
+    if (global.isUndefined()) {
+      if (!matchAllDebuggeeGlobals()) {
+        return false;
+      }
+    } else {
+      GlobalObject* globalObject = debugger->unwrapDebuggeeArgument(cx, global);
+      if (!globalObject) {
+        return false;
+      }
+
+      if (debugger->debuggees.has(globalObject)) {
+        if (!matchSingleGlobal(globalObject)) {
+          return false;
+        }
+      }
+    }
+
+    if (!GetProperty(cx, query, query, cx->names().url, &url)) {
+      return false;
+    }
+    if (!url.isUndefined() && !url.isString()) {
+      JS_ReportErrorNumberASCII(
+          cx, GetErrorMessage, nullptr, JSMSG_UNEXPECTED_TYPE,
+          "query object's 'url' property", "neither undefined nor a string");
+      return false;
+    }
+
+    RootedValue debuggerSource(cx);
+    if (!GetProperty(cx, query, query, cx->names().source, &debuggerSource)) {
+      return false;
+    }
+    if (!debuggerSource.isUndefined()) {
+      if (!debuggerSource.isObject() ||
+          !debuggerSource.toObject().is<DebuggerSource>()) {
+        JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                  JSMSG_UNEXPECTED_TYPE,
+                                  "query object's 'source' property",
+                                  "not undefined nor a Debugger.Source object");
+        return false;
+      }
+
+      DebuggerSource& debuggerSourceObj =
+          debuggerSource.toObject().as<DebuggerSource>();
+
+      if (debuggerSourceObj.owner() != debugger) {
+        JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                  JSMSG_DEBUG_WRONG_OWNER, "Debugger.Source");
+        return false;
+      }
+
+      hasSource = true;
+      source = debuggerSourceObj.getReferent();
+    }
+
+    RootedValue displayURL(cx);
+    if (!GetProperty(cx, query, query, cx->names().displayURL, &displayURL)) {
+      return false;
+    }
+    if (!displayURL.isUndefined() && !displayURL.isString()) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                JSMSG_UNEXPECTED_TYPE,
+                                "query object's 'displayURL' property",
+                                "neither undefined nor a string");
+      return false;
+    }
+
+    if (displayURL.isString()) {
+      displayURLString = displayURL.toString()->ensureLinear(cx);
+      if (!displayURLString) {
+        return false;
+      }
+    }
+
+    RootedValue lineProperty(cx);
+    if (!GetProperty(cx, query, query, cx->names().line, &lineProperty)) {
+      return false;
+    }
+    if (lineProperty.isUndefined()) {
+      hasLine = false;
+    } else if (lineProperty.isNumber()) {
+      if (displayURL.isUndefined() && url.isUndefined() && !hasSource) {
+        JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                  JSMSG_QUERY_LINE_WITHOUT_URL,
+                                  "'line' property");
+        return false;
+      }
+      if (!parsePositiveInteger(lineProperty, line, JSMSG_DEBUG_BAD_LINE)) {
+        return false;
+      }
+      hasLine = true;
+      lineEnd = line;
+    } else {
+      JS_ReportErrorNumberASCII(
+          cx, GetErrorMessage, nullptr, JSMSG_UNEXPECTED_TYPE,
+          "query object's 'line' property", "neither undefined nor an integer");
+      return false;
+    }
+
+    RootedValue startProperty(cx);
+    if (!GetProperty(cx, query, query, cx->names().start, &startProperty)) {
+      return false;
+    }
+    if (startProperty.isObject()) {
+      Rooted<JSObject*> startObject(cx, &startProperty.toObject());
+      if (!parseLineColumnObject(startObject, "start", line, columnStart)) {
+        return false;
+      }
+      hasLine = true;
+    } else if (!startProperty.isUndefined()) {
+      JS_ReportErrorNumberASCII(
+          cx, GetErrorMessage, nullptr, JSMSG_UNEXPECTED_TYPE,
+          "query object's 'start' property", "neither undefined nor an object");
+      return false;
+    }
+
+    RootedValue endProperty(cx);
+    if (!GetProperty(cx, query, query, cx->names().end, &endProperty)) {
+      return false;
+    }
+    if (endProperty.isObject()) {
+      Rooted<JSObject*> endObject(cx, &endProperty.toObject());
+      if (!parseLineColumnObject(endObject, "end", lineEnd, columnEnd)) {
+        return false;
+      }
+    } else if (!endProperty.isUndefined()) {
+      JS_ReportErrorNumberASCII(
+          cx, GetErrorMessage, nullptr, JSMSG_UNEXPECTED_TYPE,
+          "query object's 'end' property", "neither undefined nor an object");
+      return false;
+    }
+
+    if (startProperty.isUndefined() ^ endProperty.isUndefined()) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                JSMSG_QUERY_USE_START_AND_END_TOGETHER);
+      return false;
+    }
+
+    if (!startProperty.isUndefined()) {
+      if (displayURL.isUndefined() && url.isUndefined() && !hasSource) {
+        JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                  JSMSG_QUERY_LINE_WITHOUT_URL,
+                                  "'start' and 'end' properties");
+        return false;
+      }
+    }
+
+    if (hasLine && lineEnd < line) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                JSMSG_QUERY_START_LINE_IS_AFTER_END);
+      return false;
+    }
+
+    PropertyName* innermostName = cx->names().innermost;
+    RootedValue innermostProperty(cx);
+    if (!GetProperty(cx, query, query, innermostName, &innermostProperty)) {
+      return false;
+    }
+    innermost = ToBoolean(innermostProperty);
+    if (innermost) {
+      if ((displayURL.isUndefined() && url.isUndefined() && !hasSource) ||
+          !hasLine) {
+        JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                  JSMSG_QUERY_INNERMOST_WITHOUT_LINE_URL);
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  bool omittedQuery() {
+    url.setUndefined();
+    hasLine = false;
+    innermost = false;
+    displayURLString = nullptr;
+    return matchAllDebuggeeGlobals();
+  }
+
+  bool findScripts() {
+    if (!prepareQuery()) {
+      return false;
+    }
+
+    Realm* singletonRealm = nullptr;
+    if (realms.count() == 1) {
+      auto iter = realms.iter();
+      singletonRealm = iter.get();
+    }
+
+    MOZ_ASSERT(scriptVector.empty());
+    MOZ_ASSERT(partialMatchVector.empty());
+    oom = false;
+    IterateScripts(cx, singletonRealm, this, considerScript);
+    if (oom) {
+      ReportOutOfMemory(cx);
+      return false;
+    }
+
+    MOZ_ASSERT(hasLine || partialMatchVector.empty());
+    Rooted<BaseScript*> script(cx);
+    RootedFunction fun(cx);
+    while (!partialMatchVector.empty()) {
+      script = partialMatchVector.popCopy();
+
+      if (script->extent().sourceEnd <= sourceOffsetLowerBound) {
+        continue;
+      }
+
+      MOZ_ASSERT(script->isFunction());
+      MOZ_ASSERT(script->isReadyForDelazification());
+
+      fun = script->function();
+
+      if (fun->isGhost()) {
+        continue;
+      }
+
+      JSScript* compiledScript = GetOrCreateFunctionScript(cx, fun);
+      if (!compiledScript) {
+        return false;
+      }
+
+      if (!scriptIsLineMatch(compiledScript)) {
+        continue;
+      }
+
+      if (!scriptVector.append(compiledScript)) {
+        return false;
+      }
+
+      if (!script->hasInnerFunctions()) {
+        continue;
+      }
+
+      for (JS::GCCellPtr thing : script->gcthings()) {
+        if (!thing.is<JSObject>() || !thing.as<JSObject>().is<JSFunction>()) {
+          continue;
+        }
+        JSFunction* fun = &thing.as<JSObject>().as<JSFunction>();
+        if (!fun->hasBaseScript()) {
+          continue;
+        }
+        BaseScript* inner = fun->baseScript();
+        MOZ_ASSERT(inner);
+        if (!inner) {
+          continue;
+        }
+
+        if (!scriptIsPartialLineMatch(inner)) {
+          continue;
+        }
+
+        if (!partialMatchVector.append(inner)) {
+          return false;
+        }
+      }
+    }
+
+    if (innermost) {
+      using RealmToScriptMap =
+          GCHashMap<Realm*, BaseScript*, DefaultHasher<Realm*>>;
+
+      Rooted<RealmToScriptMap> innermostForRealm(cx, cx);
+
+      for (BaseScript* script : scriptVector) {
+        Realm* realm = script->realm();
+        RealmToScriptMap::AddPtr p = innermostForRealm.lookupForAdd(realm);
+        if (p) {
+          BaseScript* incumbent = p->value();
+          if (script->asJSScript()->innermostScope()->chainLength() >
+              incumbent->asJSScript()->innermostScope()->chainLength()) {
+            p->value() = script;
+          }
+        } else {
+          if (!innermostForRealm.add(p, realm, script)) {
+            return false;
+          }
+        }
+      }
+
+      scriptVector.clear();
+
+      for (auto iter = innermostForRealm.iter(); !iter.done(); iter.next()) {
+        if (!scriptVector.append(iter.get().value())) {
+          return false;
+        }
+      }
+    }
+
+    for (auto iter = debugger->allDebuggees(); !iter.done(); iter.next()) {
+      for (wasm::Instance* instance : iter.get()->realm()->wasm.instances()) {
+        if (instance->codeMeta().isSelfHostedModule()) {
+          continue;
+        }
+        consider(instance->object());
+        if (oom) {
+          ReportOutOfMemory(cx);
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  Handle<BaseScriptVector> foundScripts() const { return scriptVector; }
+
+  Handle<WasmInstanceObjectVector> foundWasmInstances() const {
+    return wasmInstanceVector;
+  }
+
+ private:
+  static const uint32_t LINE_CONSTRAINT_NOT_PROVIDED = 0;
+
+  RootedValue url;
+
+  UniqueChars urlCString;
+
+  Rooted<JSLinearString*> displayURLString;
+
+  bool hasSource = false;
+  Rooted<DebuggerSourceReferent> source;
+
+  bool hasLine = false;
+
+  uint32_t line = LINE_CONSTRAINT_NOT_PROVIDED;
+
+  uint32_t lineEnd = LINE_CONSTRAINT_NOT_PROVIDED;
+
+  Maybe<JS::LimitedColumnNumberOneOrigin> columnStart;
+
+  Maybe<JS::LimitedColumnNumberOneOrigin> columnEnd;
+
+  mutable uint32_t sourceOffsetLowerBound = 0;
+
+  bool innermost = false;
+
+  Rooted<BaseScriptVector> scriptVector;
+
+  Rooted<BaseScriptVector> partialMatchVector;
+
+  Rooted<WasmInstanceObjectVector> wasmInstanceVector;
+
+  bool prepareQuery() {
+    if (url.isString()) {
+      Rooted<JSString*> str(cx, url.toString());
+      urlCString = JS_EncodeStringToUTF8(cx, str);
+      if (!urlCString) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  template <size_t N>
+  bool parseLineColumnObject(
+      Handle<JSObject*> obj, const char (&propName)[N], uint32_t& lineOut,
+      Maybe<JS::LimitedColumnNumberOneOrigin>& columnOut) {
+    RootedValue lineProp(cx);
+    if (!GetProperty(cx, obj, obj, cx->names().line, &lineProp)) {
+      return false;
+    }
+    if (!lineProp.isNumber()) {
+      static const char propMessageFormat[] =
+          "query object's '%s.line' property";
+      char propMessage[N - 1 
+                       + sizeof(propMessageFormat) - 2 ];
+      DebugOnly<size_t> checkLen =
+          SprintfLiteral(propMessage, propMessageFormat, propName);
+      MOZ_ASSERT(checkLen == sizeof(propMessage) - 1 );
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                JSMSG_UNEXPECTED_TYPE, propMessage,
+                                "not a number");
+      return false;
+    }
+    if (!parsePositiveInteger(lineProp, lineOut, JSMSG_DEBUG_BAD_LINE)) {
+      return false;
+    }
+
+    RootedValue columnProp(cx);
+    if (!GetProperty(cx, obj, obj, cx->names().column, &columnProp)) {
+      return false;
+    }
+    if (!columnProp.isUndefined()) {
+      if (!columnProp.isNumber()) {
+        static const char propMessageFormat[] =
+            "query object's '%s.column' property";
+        char propMessage[N - 1 
+                         + sizeof(propMessageFormat) -
+                         2 ];
+        DebugOnly<size_t> checkLen =
+            SprintfLiteral(propMessage, propMessageFormat, propName);
+        MOZ_ASSERT(checkLen == sizeof(propMessage) - 1 );
+        JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                  JSMSG_UNEXPECTED_TYPE, propMessage,
+                                  "not a number");
+        return false;
+      }
+      uint32_t uintColumn = 0;
+      if (!parsePositiveInteger(columnProp, uintColumn,
+                                JSMSG_BAD_COLUMN_NUMBER)) {
+        return false;
+      }
+      if (uintColumn > JS::LimitedColumnNumberOneOrigin::Limit) {
+        JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                  JSMSG_BAD_COLUMN_NUMBER);
+        return false;
+      }
+      columnOut.emplace(JS::LimitedColumnNumberOneOrigin(uintColumn));
+    }
+    return true;
+  }
+
+  bool parsePositiveInteger(Handle<Value> numberProp, uint32_t& result,
+                            JSErrNum errorNumber) {
+    double doubleVal = numberProp.toNumber();
+    uint32_t uintVal = (uint32_t)doubleVal;
+    if (doubleVal <= 0 || uintVal != doubleVal) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, errorNumber);
+      return false;
+    }
+    result = uintVal;
+    return true;
+  }
+
+  void updateSourceOffsetLowerBound(const SourceExtent& extent) {
+    MOZ_ASSERT(line != LINE_CONSTRAINT_NOT_PROVIDED &&
+               lineEnd != LINE_CONSTRAINT_NOT_PROVIDED);
+    MOZ_ASSERT(extent.lineno <= lineEnd);
+    if (extent.lineno >= line) {
+      return;
+    }
+
+    if (extent.sourceStart > sourceOffsetLowerBound) {
+      sourceOffsetLowerBound = extent.sourceStart;
+    }
+  }
+
+  bool scriptIsPartialLineMatch(BaseScript* script) {
+    const SourceExtent& extent = script->extent();
+
+    MOZ_ASSERT(line != LINE_CONSTRAINT_NOT_PROVIDED &&
+               lineEnd != LINE_CONSTRAINT_NOT_PROVIDED);
+    MOZ_ASSERT(line <= lineEnd);
+    if (extent.lineno > lineEnd) {
+      return false;
+    }
+    if (columnEnd.isSome() && script->lineno() == lineEnd &&
+        script->column() > columnEnd.value()) {
+      return false;
+    }
+
+    updateSourceOffsetLowerBound(script->extent());
+
+    return extent.sourceEnd > sourceOffsetLowerBound;
+  }
+
+  bool scriptIsLineMatch(JSScript* script) {
+    MOZ_ASSERT(scriptIsPartialLineMatch(script));
+
+    JS::LimitedColumnNumberOneOrigin scriptEndColumn;
+    uint32_t lineCount = GetScriptLineExtent(script, &scriptEndColumn);
+    if (columnStart.isSome() && script->lineno() + lineCount - 1 == line) {
+      if (scriptEndColumn <= columnStart.value()) {
+        return false;
+      }
+    }
+    return (script->lineno() + lineCount > line);
+  }
+
+  static void considerScript(JSRuntime* rt, void* data, BaseScript* script,
+                             const JS::AutoRequireNoGC& nogc) {
+    ScriptQuery* self = static_cast<ScriptQuery*>(data);
+    self->consider(script, nogc);
+  }
+
+  template <typename T>
+  [[nodiscard]] bool commonFilter(T script, const JS::AutoRequireNoGC& nogc) {
+    if (urlCString) {
+      bool gotFilename = false;
+      if (script->filename() &&
+          strcmp(script->filename(), urlCString.get()) == 0) {
+        gotFilename = true;
+      }
+
+      bool gotSourceURL = false;
+      if (!gotFilename && script->scriptSource()->introducerFilename() &&
+          strcmp(script->scriptSource()->introducerFilename(),
+                 urlCString.get()) == 0) {
+        gotSourceURL = true;
+      }
+      if (!gotFilename && !gotSourceURL) {
+        return false;
+      }
+    }
+    if (displayURLString) {
+      if (!script->scriptSource() || !script->scriptSource()->hasDisplayURL()) {
+        return false;
+      }
+
+      const char16_t* s = script->scriptSource()->displayURL();
+      if (CompareChars(s, js_strlen(s), displayURLString) != 0) {
+        return false;
+      }
+    }
+    if (hasSource && !(source.is<ScriptSourceObject*>() &&
+                       source.as<ScriptSourceObject*>()->source() ==
+                           script->scriptSource())) {
+      return false;
+    }
+    return true;
+  }
+
+  void consider(BaseScript* script, const JS::AutoRequireNoGC& nogc) {
+    if (oom || script->selfHosted()) {
+      return;
+    }
+
+    Realm* realm = script->realm();
+    if (!realms.has(realm)) {
+      return;
+    }
+
+    if (!commonFilter(script, nogc)) {
+      return;
+    }
+
+    bool partial = false;
+
+    if (hasLine) {
+      if (!scriptIsPartialLineMatch(script)) {
+        return;
+      }
+
+      if (script->hasBytecode()) {
+        if (!scriptIsLineMatch(script->asJSScript())) {
+          return;
+        }
+      } else {
+        if (!script->isReadyForDelazification()) {
+          return;
+        }
+        partial = true;
+      }
+    }
+
+    MOZ_ASSERT_IF(innermost, hasLine);
+
+    Rooted<BaseScriptVector>& vec = partial ? partialMatchVector : scriptVector;
+    if (!vec.append(script)) {
+      oom = true;
+    }
+  }
+
+  void consider(WasmInstanceObject* instanceObject) {
+    if (oom) {
+      return;
+    }
+
+    if (hasSource && source != AsVariant(instanceObject)) {
+      return;
+    }
+
+    if (!wasmInstanceVector.append(instanceObject)) {
+      oom = true;
+    }
+  }
+};
+
+bool Debugger::CallData::findScripts() {
+  ScriptQuery query(cx, dbg);
+
+  if (args.length() >= 1) {
+    RootedObject queryObject(cx, RequireObject(cx, args[0]));
+    if (!queryObject || !query.parseQuery(queryObject)) {
+      return false;
+    }
+  } else {
+    if (!query.omittedQuery()) {
+      return false;
+    }
+  }
+
+  if (!query.findScripts()) {
+    return false;
+  }
+
+  Handle<BaseScriptVector> scripts(query.foundScripts());
+  Handle<WasmInstanceObjectVector> wasmInstances(query.foundWasmInstances());
+
+  size_t resultLength = scripts.length() + wasmInstances.length();
+  Rooted<ArrayObject*> result(cx,
+                              NewDenseFullyAllocatedArray(cx, resultLength));
+  if (!result) {
+    return false;
+  }
+
+  result->ensureDenseInitializedLength(0, resultLength);
+
+  for (size_t i = 0; i < scripts.length(); i++) {
+    JSObject* scriptObject = dbg->wrapScript(cx, scripts[i]);
+    if (!scriptObject) {
+      return false;
+    }
+    result->setDenseElement(i, ObjectValue(*scriptObject));
+  }
+
+  size_t wasmStart = scripts.length();
+  for (size_t i = 0; i < wasmInstances.length(); i++) {
+    JSObject* scriptObject = dbg->wrapWasmScript(cx, wasmInstances[i]);
+    if (!scriptObject) {
+      return false;
+    }
+    result->setDenseElement(wasmStart + i, ObjectValue(*scriptObject));
+  }
+
+  args.rval().setObject(*result);
+  return true;
+}
+
+class MOZ_STACK_CLASS Debugger::SourceQuery : public Debugger::QueryBase {
+ public:
+  using SourceSet = JS::GCHashSet<JSObject*, js::StableCellHasher<JSObject*>,
+                                  ZoneAllocPolicy>;
+
+  SourceQuery(JSContext* cx, Debugger* dbg)
+      : QueryBase(cx, dbg), sources(cx, SourceSet(cx->zone())) {}
+
+  bool findSources() {
+    if (!matchAllDebuggeeGlobals()) {
+      return false;
+    }
+
+    Realm* singletonRealm = nullptr;
+    if (realms.count() == 1) {
+      auto iter = realms.iter();
+      singletonRealm = iter.get();
+    }
+
+    MOZ_ASSERT(sources.empty());
+    oom = false;
+    IterateScripts(cx, singletonRealm, this, considerScript);
+    if (oom) {
+      ReportOutOfMemory(cx);
+      return false;
+    }
+
+    for (auto iter = debugger->allDebuggees(); !iter.done(); iter.next()) {
+      auto siter = ObjectRealm::get(iter.get()).moduleScriptSources.iter();
+      for (; !siter.done(); siter.next()) {
+        if (ScriptSourceObject* sso = siter.get().get()) {
+          if (!sources.put(sso)) {
+            ReportOutOfMemory(cx);
+            return false;
+          }
+        }
+      }
+    }
+
+    for (auto iter = debugger->allDebuggees(); !iter.done(); iter.next()) {
+      for (wasm::Instance* instance : iter.get()->realm()->wasm.instances()) {
+        if (instance->codeMeta().isSelfHostedModule()) {
+          continue;
+        }
+        consider(instance->object());
+        if (oom) {
+          ReportOutOfMemory(cx);
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  Handle<SourceSet> foundSources() const { return sources; }
+
+ private:
+  Rooted<SourceSet> sources;
+
+  static void considerScript(JSRuntime* rt, void* data, BaseScript* script,
+                             const JS::AutoRequireNoGC& nogc) {
+    SourceQuery* self = static_cast<SourceQuery*>(data);
+    self->consider(script, nogc);
+  }
+
+  void consider(BaseScript* script, const JS::AutoRequireNoGC& nogc) {
+    if (oom || script->selfHosted()) {
+      return;
+    }
+
+    Realm* realm = script->realm();
+    if (!realms.has(realm)) {
+      return;
+    }
+
+    ScriptSourceObject* source = script->sourceObject();
+    if (!sources.put(source)) {
+      oom = true;
+    }
+  }
+
+  void consider(WasmInstanceObject* instanceObject) {
+    if (oom) {
+      return;
+    }
+
+    if (!sources.put(instanceObject)) {
+      oom = true;
+    }
+  }
+};
+
+static inline DebuggerSourceReferent AsSourceReferent(JSObject* obj) {
+  if (obj->is<ScriptSourceObject>()) {
+    return AsVariant(&obj->as<ScriptSourceObject>());
+  }
+  return AsVariant(&obj->as<WasmInstanceObject>());
+}
+
+bool Debugger::CallData::findSources() {
+  SourceQuery query(cx, dbg);
+  if (!query.findSources()) {
+    return false;
+  }
+
+  Handle<SourceQuery::SourceSet> sources(query.foundSources());
+
+  size_t resultLength = sources.count();
+  Rooted<ArrayObject*> result(cx,
+                              NewDenseFullyAllocatedArray(cx, resultLength));
+  if (!result) {
+    return false;
+  }
+
+  result->ensureDenseInitializedLength(0, resultLength);
+
+  size_t i = 0;
+  for (auto iter = sources.get().iter(); !iter.done(); iter.next()) {
+    Rooted<DebuggerSourceReferent> sourceReferent(cx,
+                                                  AsSourceReferent(iter.get()));
+    RootedObject sourceObject(cx, dbg->wrapVariantReferent(cx, sourceReferent));
+    if (!sourceObject) {
+      return false;
+    }
+    result->setDenseElement(i, ObjectValue(*sourceObject));
+    i++;
+  }
+
+  args.rval().setObject(*result);
+  return true;
+}
+
+class MOZ_STACK_CLASS Debugger::ObjectQuery {
+ public:
+  ObjectQuery(JSContext* cx, Debugger* dbg)
+      : objects(cx),
+        cx(cx),
+        dbg(dbg),
+        queryType(QueryType::None),
+        jsClassName(cx),
+        unwrappedCtorOrProto(cx) {}
+
+  RootedObjectVector objects;
+
+  JS::CompartmentSet debuggeeCompartments;
+
+  bool parseQuery(HandleObject query) {
+    RootedValue cls(cx);
+    if (!GetProperty(cx, query, query, cx->names().class_, &cls)) {
+      return false;
+    }
+
+    if (cls.isUndefined()) {
+      return true;
+    }
+
+    if (cls.isString()) {
+      JSLinearString* str = cls.toString()->ensureLinear(cx);
+      if (!str) {
+        return false;
+      }
+      if (!StringIsAscii(str)) {
+        JS_ReportErrorNumberASCII(
+            cx, GetErrorMessage, nullptr, JSMSG_UNEXPECTED_TYPE,
+            "query object's 'class' property string",
+            "not a string containing only ASCII characters");
+        return false;
+      }
+      jsClassName = cls;
+      queryType = QueryType::JSClassName;
+      return true;
+    }
+
+    if (cls.isObject()) {
+      JS::Rooted<JSObject*> obj(cx, &cls.toObject());
+      obj = UncheckedUnwrap(obj);
+      if (JS_IsDeadWrapper(obj)) {
+        JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                  JSMSG_DEAD_OBJECT);
+        return false;
+      }
+      if (!obj->is<DebuggerObject>()) {
+        JS_ReportErrorNumberASCII(
+            cx, GetErrorMessage, nullptr, JSMSG_UNEXPECTED_TYPE,
+            "query object's 'class' property object", "not Debugger.Object");
+        return false;
+      }
+
+      unwrappedCtorOrProto = obj->as<DebuggerObject>().referent();
+      unwrappedCtorOrProto = UncheckedUnwrap(unwrappedCtorOrProto);
+      if (JS_IsDeadWrapper(unwrappedCtorOrProto)) {
+        JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                  JSMSG_DEAD_OBJECT);
+        return false;
+      }
+      queryType = QueryType::CtorOrProto;
+      return true;
+    }
+
+    JS_ReportErrorNumberASCII(
+        cx, GetErrorMessage, nullptr, JSMSG_UNEXPECTED_TYPE,
+        "query object's 'class' property",
+        "none of JSClass name string, constructor/prototype debuggee object, "
+        "or undefined");
+    return false;
+  }
+
+  void omittedQuery() {
+    jsClassName.setUndefined();
+    unwrappedCtorOrProto = nullptr;
+    queryType = QueryType::None;
+  }
+
+  bool findObjects() {
+    if (!prepareQuery()) {
+      return false;
+    }
+
+    for (auto iter = dbg->allDebuggees(); !iter.done(); iter.next()) {
+      if (!debuggeeCompartments.put(iter.get()->compartment())) {
+        ReportOutOfMemory(cx);
+        return false;
+      }
+    }
+
+    {
+      RootedObject dbgObj(cx, dbg->object);
+      JS::ubi::RootList rootList(cx);
+      auto [ok, nogc] = rootList.init(dbgObj);
+      if (!ok) {
+        ReportOutOfMemory(cx);
+        return false;
+      }
+
+      Traversal traversal(cx, *this, nogc);
+      traversal.wantNames = false;
+
+      if (!traversal.addStart(JS::ubi::Node(&rootList)) ||
+          !traversal.traverse()) {
+        ReportOutOfMemory(cx);
+        return false;
+      }
+      return true;
+    }
+  }
+
+  class NodeData {};
+  using Traversal = JS::ubi::BreadthFirst<ObjectQuery>;
+  bool operator()(Traversal& traversal, JS::ubi::Node origin,
+                  const JS::ubi::Edge& edge, NodeData*, bool first) {
+    if (!first) {
+      return true;
+    }
+
+    JS::ubi::Node referent = edge.referent;
+
+    JS::Compartment* comp = referent.compartment();
+    if (comp && !debuggeeCompartments.has(comp)) {
+      traversal.abandonReferent();
+      return true;
+    }
+
+    Realm* realm = referent.realm();
+    if (realm && !dbg->isDebuggeeUnbarriered(realm)) {
+      return true;
+    }
+
+
+    if (!referent.is<JSObject>() || referent.exposeToJS().isUndefined()) {
+      return true;
+    }
+
+    JSObject* obj = referent.as<JSObject>();
+
+    switch (queryType) {
+      case QueryType::None:
+        break;
+      case QueryType::JSClassName: {
+        const char* objJSClassName = obj->getClass()->name;
+        if (strcmp(objJSClassName, jsClassNameCString.get()) != 0) {
+          return true;
+        }
+        break;
+      }
+      case QueryType::CtorOrProto:
+        if (!hasConstructorOrPrototype(obj, unwrappedCtorOrProto, cx)) {
+          return true;
+        }
+        break;
+    }
+
+    return objects.append(obj);
+  }
+
+  static bool hasConstructorOrPrototype(JSObject* obj, JSObject* ctorOrProto,
+                                        JSContext* cx) {
+    obj = UncheckedUnwrap(obj);
+
+    while (true) {
+      if (!obj->hasStaticPrototype()) {
+        break;
+      }
+
+      JSObject* proto = obj->staticPrototype();
+      if (!proto) {
+        break;
+      }
+      proto = UncheckedUnwrap(proto);
+      if (proto == ctorOrProto) {
+        return true;
+      }
+
+      JS::Value ctorVal;
+      bool result;
+      {
+        AutoRealm ar(cx, proto);
+        result = GetPropertyPure(cx, proto, NameToId(cx->names().constructor),
+                                 &ctorVal);
+      }
+      if (result && ctorVal.isObject()) {
+        JSObject* ctor = &ctorVal.toObject();
+        ctor = UncheckedUnwrap(ctor);
+        if (ctor == ctorOrProto) {
+          return true;
+        }
+      }
+
+      obj = proto;
+    }
+
+    return false;
+  }
+
+ private:
+  JSContext* cx;
+
+  Debugger* dbg;
+
+  enum class QueryType {
+    None,
+
+    JSClassName,
+
+    CtorOrProto,
+  };
+  QueryType queryType;
+
+  RootedValue jsClassName;
+
+  UniqueChars jsClassNameCString;
+
+  JS::Rooted<JSObject*> unwrappedCtorOrProto;
+
+  bool prepareQuery() {
+    if (jsClassName.isString()) {
+      jsClassNameCString = JS_EncodeStringToASCII(cx, jsClassName.toString());
+      if (!jsClassNameCString) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+};
+
+bool Debugger::CallData::findObjects() {
+  ObjectQuery query(cx, dbg);
+
+  if (args.length() >= 1) {
+    RootedObject queryObject(cx, RequireObject(cx, args[0]));
+    if (!queryObject || !query.parseQuery(queryObject)) {
+      return false;
+    }
+  } else {
+    query.omittedQuery();
+  }
+
+  if (!query.findObjects()) {
+    return false;
+  }
+
+  size_t length = query.objects.length();
+  Rooted<ArrayObject*> result(cx, NewDenseFullyAllocatedArray(cx, length));
+  if (!result) {
+    return false;
+  }
+
+  result->ensureDenseInitializedLength(0, length);
+
+  for (size_t i = 0; i < length; i++) {
+    RootedValue debuggeeVal(cx, ObjectValue(*query.objects[i]));
+    if (!dbg->wrapDebuggeeValue(cx, &debuggeeVal)) {
+      return false;
+    }
+    result->setDenseElement(i, debuggeeVal);
+  }
+
+  args.rval().setObject(*result);
+  return true;
+}
+
+bool Debugger::CallData::findAllGlobals() {
+  RootedObjectVector globals(cx);
+
+  {
+    JS::AutoCheckCannotGC nogc;
+
+    for (RealmsIter r(cx->runtime()); !r.done(); r.next()) {
+      if (r->creationOptions().invisibleToDebugger()) {
+        continue;
+      }
+
+      if (!r->hasInitializedGlobal()) {
+        continue;
+      }
+
+      if (JS::RealmBehaviorsRef(r).isNonLive()) {
+        continue;
+      }
+
+      r->compartment()->gcState.scheduledForDestruction = false;
+
+      GlobalObject* global = r->maybeGlobal();
+
+      JS::ExposeObjectToActiveJS(global);
+      if (!globals.append(global)) {
+        return false;
+      }
+    }
+  }
+
+  RootedObject result(cx, NewDenseEmptyArray(cx));
+  if (!result) {
+    return false;
+  }
+
+  for (size_t i = 0; i < globals.length(); i++) {
+    RootedValue globalValue(cx, ObjectValue(*globals[i]));
+    if (!dbg->wrapDebuggeeValue(cx, &globalValue)) {
+      return false;
+    }
+    if (!NewbornArrayPush(cx, result, globalValue)) {
+      return false;
+    }
+  }
+
+  args.rval().setObject(*result);
+  return true;
+}
+
+bool Debugger::CallData::findSourceURLs() {
+  RootedObject result(cx, NewDenseEmptyArray(cx));
+  if (!result) {
+    return false;
+  }
+
+  for (auto iter = dbg->allDebuggees(); !iter.done(); iter.next()) {
+    RootedObject holder(cx, iter.get()->getSourceURLsHolder());
+    if (holder) {
+      for (size_t i = 0; i < holder->as<ArrayObject>().length(); i++) {
+        Value v = holder->as<ArrayObject>().getDenseElement(i);
+
+        MOZ_ASSERT(v.isString() && v.toString()->isAtom());
+        cx->markAtomValue(v);
+
+        if (!NewbornArrayPush(cx, result, v)) {
+          return false;
+        }
+      }
+    }
+  }
+
+  args.rval().setObject(*result);
+  return true;
+}
+
+bool Debugger::CallData::makeGlobalObjectReference() {
+  if (!args.requireAtLeast(cx, "Debugger.makeGlobalObjectReference", 1)) {
+    return false;
+  }
+
+  Rooted<GlobalObject*> global(cx, dbg->unwrapDebuggeeArgument(cx, args[0]));
+  if (!global) {
+    return false;
+  }
+
+  if (global->realm()->creationOptions().invisibleToDebugger()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_DEBUG_INVISIBLE_COMPARTMENT);
+    return false;
+  }
+
+  args.rval().setObject(*global);
+  return dbg->wrapDebuggeeValue(cx, args.rval());
+}
+
+bool Debugger::isCompilableUnit(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (!args.requireAtLeast(cx, "Debugger.isCompilableUnit", 1)) {
+    return false;
+  }
+
+  if (!args[0].isString()) {
+    JS_ReportErrorNumberASCII(
+        cx, GetErrorMessage, nullptr, JSMSG_NOT_EXPECTED_TYPE,
+        "Debugger.isCompilableUnit", "string", InformalValueTypeName(args[0]));
+    return false;
+  }
+
+  JSString* str = args[0].toString();
+  size_t length = str->length();
+
+  AutoStableStringChars chars(cx);
+  if (!chars.initTwoByte(cx, str)) {
+    return false;
+  }
+
+  bool result = true;
+
+  AutoReportFrontendContext fc(cx,
+                               AutoReportFrontendContext::Warning::Suppress);
+  CompileOptions options(cx);
+  Rooted<frontend::CompilationInput> input(cx,
+                                           frontend::CompilationInput(options));
+  if (!input.get().initForGlobal(&fc)) {
+    return false;
+  }
+
+  LifoAllocScope allocScope(&cx->tempLifoAlloc());
+  frontend::NoScopeBindingCache scopeCache;
+  frontend::CompilationState compilationState(&fc, allocScope, input.get());
+  if (!compilationState.init(&fc, &scopeCache)) {
+    return false;
+  }
+
+  frontend::Parser<frontend::FullParseHandler, char16_t> parser(
+      &fc, options, chars.twoByteChars(), length, compilationState,
+       nullptr);
+  if (!parser.checkOptions() || parser.parse().isErr()) {
+    if (fc.hadOutOfMemory()) {
+      return false;
+    }
+
+    if (parser.isUnexpectedEOF()) {
+      result = false;
+    }
+
+    fc.clearAutoReport();
+  }
+
+  args.rval().setBoolean(result);
+  return true;
+}
+
+bool Debugger::CallData::adoptDebuggeeValue() {
+  if (!args.requireAtLeast(cx, "Debugger.adoptDebuggeeValue", 1)) {
+    return false;
+  }
+
+  RootedValue v(cx, args[0]);
+  if (v.isObject()) {
+    RootedObject obj(cx, &v.toObject());
+    DebuggerObject* ndobj = ToNativeDebuggerObject(cx, &obj);
+    if (!ndobj) {
+      return false;
+    }
+
+    obj.set(ndobj->referent());
+    v = ObjectValue(*obj);
+
+    if (!dbg->wrapDebuggeeValue(cx, &v)) {
+      return false;
+    }
+  }
+
+  args.rval().set(v);
+  return true;
+}
+
+class DebuggerAdoptSourceMatcher {
+  JSContext* cx_;
+  Debugger* dbg_;
+
+ public:
+  explicit DebuggerAdoptSourceMatcher(JSContext* cx, Debugger* dbg)
+      : cx_(cx), dbg_(dbg) {}
+
+  using ReturnType = DebuggerSource*;
+
+  ReturnType match(Handle<ScriptSourceObject*> source) {
+    if (source->compartment() == cx_->compartment()) {
+      JS_ReportErrorASCII(cx_,
+                          "Source is in the same compartment as this debugger");
+      return nullptr;
+    }
+    return dbg_->wrapSource(cx_, source);
+  }
+  ReturnType match(Handle<WasmInstanceObject*> wasmInstance) {
+    if (wasmInstance->compartment() == cx_->compartment()) {
+      JS_ReportErrorASCII(
+          cx_, "WasmInstance is in the same compartment as this debugger");
+      return nullptr;
+    }
+    return dbg_->wrapWasmSource(cx_, wasmInstance);
+  }
+};
+
+bool Debugger::CallData::adoptFrame() {
+  if (!args.requireAtLeast(cx, "Debugger.adoptFrame", 1)) {
+    return false;
+  }
+
+  RootedObject obj(cx, RequireObject(cx, args[0]));
+  if (!obj) {
+    return false;
+  }
+
+  obj = UncheckedUnwrap(obj);
+  if (!obj->is<DebuggerFrame>()) {
+    JS_ReportErrorASCII(cx, "Argument is not a Debugger.Frame");
+    return false;
+  }
+
+  RootedValue objVal(cx, ObjectValue(*obj));
+  Rooted<DebuggerFrame*> frameObj(cx, DebuggerFrame::check(cx, objVal));
+  if (!frameObj) {
+    return false;
+  }
+
+  Rooted<DebuggerFrame*> adoptedFrame(cx);
+  if (frameObj->isOnStack(cx)) {
+    FrameIter iter = frameObj->getFrameIter(cx);
+    if (!dbg->observesFrame(iter)) {
+      JS_ReportErrorASCII(cx, "Debugger.Frame's global is not a debuggee");
+      return false;
+    }
+    if (!dbg->getFrame(cx, iter, &adoptedFrame)) {
+      return false;
+    }
+  } else if (frameObj->isSuspendedGeneratorFrame()) {
+    Rooted<AbstractGeneratorObject*> gen(cx, &frameObj->unwrappedGenerator());
+    if (!dbg->observesGlobal(&gen->global())) {
+      JS_ReportErrorASCII(cx, "Debugger.Frame's global is not a debuggee");
+      return false;
+    }
+
+    if (!dbg->getFrame(cx, gen, &adoptedFrame)) {
+      return false;
+    }
+  } else {
+    if (!dbg->getFrame(cx, &adoptedFrame)) {
+      return false;
+    }
+  }
+
+  args.rval().setObject(*adoptedFrame);
+  return true;
+}
+
+bool Debugger::CallData::adoptSource() {
+  if (!args.requireAtLeast(cx, "Debugger.adoptSource", 1)) {
+    return false;
+  }
+
+  RootedObject obj(cx, RequireObject(cx, args[0]));
+  if (!obj) {
+    return false;
+  }
+
+  obj = UncheckedUnwrap(obj);
+  if (!obj->is<DebuggerSource>()) {
+    JS_ReportErrorASCII(cx, "Argument is not a Debugger.Source");
+    return false;
+  }
+
+  Rooted<DebuggerSource*> sourceObj(cx, &obj->as<DebuggerSource>());
+  if (!sourceObj->getReferentRawObject()) {
+    JS_ReportErrorASCII(cx, "Argument is Debugger.Source.prototype");
+    return false;
+  }
+
+  Rooted<DebuggerSourceReferent> referent(cx, sourceObj->getReferent());
+
+  DebuggerAdoptSourceMatcher matcher(cx, dbg);
+  DebuggerSource* res = referent.match(matcher);
+  if (!res) {
+    return false;
+  }
+
+  args.rval().setObject(*res);
+  return true;
+}
+
+bool Debugger::CallData::enableAsyncStack() {
+  if (!args.requireAtLeast(cx, "Debugger.enableAsyncStack", 1)) {
+    return false;
+  }
+  Rooted<GlobalObject*> global(cx, dbg->unwrapDebuggeeArgument(cx, args[0]));
+  if (!global) {
+    return false;
+  }
+
+  global->realm()->isAsyncStackCapturingEnabled = true;
+
+  args.rval().setUndefined();
+  return true;
+}
+
+bool Debugger::CallData::disableAsyncStack() {
+  if (!args.requireAtLeast(cx, "Debugger.disableAsyncStack", 1)) {
+    return false;
+  }
+  Rooted<GlobalObject*> global(cx, dbg->unwrapDebuggeeArgument(cx, args[0]));
+  if (!global) {
+    return false;
+  }
+
+  global->realm()->isAsyncStackCapturingEnabled = false;
+
+  args.rval().setUndefined();
+  return true;
+}
+
+bool Debugger::CallData::enableUnlimitedStacksCapturing() {
+  if (!args.requireAtLeast(cx, "Debugger.enableUnlimitedStacksCapturing", 1)) {
+    return false;
+  }
+  Rooted<GlobalObject*> global(cx, dbg->unwrapDebuggeeArgument(cx, args[0]));
+  if (!global) {
+    return false;
+  }
+
+  global->realm()->isUnlimitedStacksCapturingEnabled = true;
+
+  args.rval().setUndefined();
+  return true;
+}
+
+bool Debugger::CallData::disableUnlimitedStacksCapturing() {
+  if (!args.requireAtLeast(cx, "Debugger.disableUnlimitedStacksCapturing", 1)) {
+    return false;
+  }
+  Rooted<GlobalObject*> global(cx, dbg->unwrapDebuggeeArgument(cx, args[0]));
+  if (!global) {
+    return false;
+  }
+
+  global->realm()->isUnlimitedStacksCapturingEnabled = false;
+
+  args.rval().setUndefined();
+  return true;
+}
+
+const JSPropertySpec Debugger::properties[] = {
+    JS_DEBUG_PSGS("onDebuggerStatement", getOnDebuggerStatement,
+                  setOnDebuggerStatement),
+    JS_DEBUG_PSGS("onExceptionUnwind", getOnExceptionUnwind,
+                  setOnExceptionUnwind),
+    JS_DEBUG_PSGS("onNewScript", getOnNewScript, setOnNewScript),
+    JS_DEBUG_PSGS("onNewPromise", getOnNewPromise, setOnNewPromise),
+    JS_DEBUG_PSGS("onPromiseSettled", getOnPromiseSettled, setOnPromiseSettled),
+    JS_DEBUG_PSGS("onEnterFrame", getOnEnterFrame, setOnEnterFrame),
+    JS_DEBUG_PSGS("onNativeCall", getOnNativeCall, setOnNativeCall),
+    JS_DEBUG_PSGS("shouldAvoidSideEffects", getShouldAvoidSideEffects,
+                  setShouldAvoidSideEffects),
+    JS_DEBUG_PSGS("onNewGlobalObject", getOnNewGlobalObject,
+                  setOnNewGlobalObject),
+    JS_DEBUG_PSGS("uncaughtExceptionHook", getUncaughtExceptionHook,
+                  setUncaughtExceptionHook),
+    JS_DEBUG_PSGS("allowUnobservedWasm", getAllowUnobservedWasm,
+                  setAllowUnobservedWasm),
+    JS_DEBUG_PSGS("collectCoverageInfo", getCollectCoverageInfo,
+                  setCollectCoverageInfo),
+    JS_DEBUG_PSGS("exclusiveDebuggerOnEval", getExclusiveDebuggerOnEval,
+                  setExclusiveDebuggerOnEval),
+    JS_DEBUG_PSGS("inspectNativeCallArguments", getInspectNativeCallArguments,
+                  setInspectNativeCallArguments),
+    JS_DEBUG_PSG("memory", getMemory),
+    JS_STRING_SYM_PS(toStringTag, "Debugger", JSPROP_READONLY),
+    JS_PS_END,
+};
+
+const JSFunctionSpec Debugger::methods[] = {
+    JS_DEBUG_FN("addDebuggee", addDebuggee, 1),
+    JS_DEBUG_FN("addAllGlobalsAsDebuggees", addAllGlobalsAsDebuggees, 0),
+    JS_DEBUG_FN("removeDebuggee", removeDebuggee, 1),
+    JS_DEBUG_FN("removeAllDebuggees", removeAllDebuggees, 0),
+    JS_DEBUG_FN("hasDebuggee", hasDebuggee, 1),
+    JS_DEBUG_FN("getDebuggees", getDebuggees, 0),
+    JS_DEBUG_FN("getNewestFrame", getNewestFrame, 0),
+    JS_DEBUG_FN("clearAllBreakpoints", clearAllBreakpoints, 0),
+    JS_DEBUG_FN("findScripts", findScripts, 1),
+    JS_DEBUG_FN("findSources", findSources, 1),
+    JS_DEBUG_FN("findObjects", findObjects, 1),
+    JS_DEBUG_FN("findAllGlobals", findAllGlobals, 0),
+    JS_DEBUG_FN("findSourceURLs", findSourceURLs, 0),
+    JS_DEBUG_FN("makeGlobalObjectReference", makeGlobalObjectReference, 1),
+    JS_DEBUG_FN("adoptDebuggeeValue", adoptDebuggeeValue, 1),
+    JS_DEBUG_FN("adoptFrame", adoptFrame, 1),
+    JS_DEBUG_FN("adoptSource", adoptSource, 1),
+    JS_DEBUG_FN("enableAsyncStack", enableAsyncStack, 1),
+    JS_DEBUG_FN("disableAsyncStack", disableAsyncStack, 1),
+    JS_DEBUG_FN("enableUnlimitedStacksCapturing",
+                enableUnlimitedStacksCapturing, 1),
+    JS_DEBUG_FN("disableUnlimitedStacksCapturing",
+                disableUnlimitedStacksCapturing, 1),
+    JS_FS_END,
+};
+
+const JSFunctionSpec Debugger::static_methods[]{
+    JS_FN("isCompilableUnit", Debugger::isCompilableUnit, 1, 0),
+    JS_FS_END,
+};
+
+DebuggerScript* Debugger::newDebuggerScript(
+    JSContext* cx, Handle<DebuggerScriptReferent> referent) {
+  cx->check(object.get());
+
+  RootedObject proto(
+      cx, &object->getReservedSlot(JSSLOT_DEBUG_SCRIPT_PROTO).toObject());
+  MOZ_ASSERT(proto);
+  Rooted<NativeObject*> debugger(cx, object);
+
+  return DebuggerScript::create(cx, proto, referent, debugger);
+}
+
+template <typename ReferentType, typename Map>
+typename Map::WrapperType* Debugger::wrapVariantReferent(
+    JSContext* cx, Map& map,
+    Handle<typename Map::WrapperType::ReferentVariant> referent) {
+  cx->check(object);
+
+  Handle<ReferentType*> untaggedReferent =
+      referent.template as<ReferentType*>();
+  MOZ_ASSERT(cx->compartment() != untaggedReferent->compartment());
+
+  DependentAddPtr<Map> p(cx, map, untaggedReferent);
+  if (!p) {
+    typename Map::WrapperType* wrapper = newVariantWrapper(cx, referent);
+    if (!wrapper) {
+      return nullptr;
+    }
+
+    if (!p.add(cx, map, untaggedReferent, wrapper)) {
+      wrapper->clearReferent();
+      return nullptr;
+    }
+  }
+
+  return &p->value()->template as<typename Map::WrapperType>();
+}
+
+DebuggerScript* Debugger::wrapVariantReferent(
+    JSContext* cx, Handle<DebuggerScriptReferent> referent) {
+  if (referent.is<BaseScript*>()) {
+    return wrapVariantReferent<BaseScript>(cx, scripts, referent);
+  }
+
+  return wrapVariantReferent<WasmInstanceObject>(cx, wasmInstanceScripts,
+                                                 referent);
+}
+
+DebuggerScript* Debugger::wrapScript(JSContext* cx,
+                                     Handle<BaseScript*> script) {
+  Rooted<DebuggerScriptReferent> referent(cx,
+                                          DebuggerScriptReferent(script.get()));
+  return wrapVariantReferent(cx, referent);
+}
+
+DebuggerScript* Debugger::wrapWasmScript(
+    JSContext* cx, Handle<WasmInstanceObject*> wasmInstance) {
+  Rooted<DebuggerScriptReferent> referent(cx, wasmInstance.get());
+  return wrapVariantReferent(cx, referent);
+}
+
+DebuggerSource* Debugger::newDebuggerSource(
+    JSContext* cx, Handle<DebuggerSourceReferent> referent) {
+  cx->check(object.get());
+
+  RootedObject proto(
+      cx, &object->getReservedSlot(JSSLOT_DEBUG_SOURCE_PROTO).toObject());
+  MOZ_ASSERT(proto);
+  Rooted<NativeObject*> debugger(cx, object);
+  return DebuggerSource::create(cx, proto, referent, debugger);
+}
+
+DebuggerSource* Debugger::wrapVariantReferent(
+    JSContext* cx, Handle<DebuggerSourceReferent> referent) {
+  DebuggerSource* obj;
+  if (referent.is<ScriptSourceObject*>()) {
+    obj = wrapVariantReferent<ScriptSourceObject>(cx, sources, referent);
+  } else {
+    obj = wrapVariantReferent<WasmInstanceObject>(cx, wasmInstanceSources,
+                                                  referent);
+  }
+  MOZ_ASSERT_IF(obj, obj->getReferent() == referent);
+  return obj;
+}
+
+DebuggerSource* Debugger::wrapSource(JSContext* cx,
+                                     Handle<ScriptSourceObject*> source) {
+  Rooted<DebuggerSourceReferent> referent(cx, source.get());
+  return wrapVariantReferent(cx, referent);
+}
+
+DebuggerSource* Debugger::wrapWasmSource(
+    JSContext* cx, Handle<WasmInstanceObject*> wasmInstance) {
+  Rooted<DebuggerSourceReferent> referent(cx, wasmInstance.get());
+  return wrapVariantReferent(cx, referent);
+}
+
+bool Debugger::observesFrame(AbstractFramePtr frame) const {
+  if (frame.isWasmDebugFrame()) {
+    return observesWasm(frame.wasmInstance());
+  }
+
+  return observesScript(frame.script());
+}
+
+bool Debugger::observesFrame(const FrameIter& iter) const {
+  if (iter.isInterp() && iter.isFunctionFrame()) {
+    const Value& thisVal = iter.interpFrame()->thisArgument();
+    if (thisVal.isMagic() && thisVal.whyMagic() == JS_IS_CONSTRUCTING) {
+      return false;
+    }
+  }
+  if (iter.isWasm()) {
+    if (!iter.wasmDebugEnabled()) {
+      return false;
+    }
+    return observesWasm(iter.wasmInstance());
+  }
+  return observesScript(iter.script());
+}
+
+bool Debugger::observesScript(JSScript* script) const {
+  return observesGlobal(&script->global()) && !script->selfHosted();
+}
+
+bool Debugger::observesWasm(wasm::Instance* instance) const {
+  if (!instance->debugEnabled()) {
+    return false;
+  }
+  return observesGlobal(&instance->object()->global());
+}
+
+void Debugger::replaceFrameGuts(JSContext* cx, AbstractFramePtr from,
+                                AbstractFramePtr to, ScriptFrameIter& iter) {
+  MOZ_ASSERT(from != to);
+  AutoEnterOOMUnsafeRegion unsafe;
+
+  DebugEnvironments::forwardLiveFrame(cx, from, to);
+
+  Rooted<DebuggerFrameVector> frames(cx);
+  if (!getDebuggerFrames(from, &frames)) {
+    unsafe.crash("replaceFrameGuts");
+  }
+
+  for (size_t i = 0; i < frames.length(); i++) {
+    Handle<DebuggerFrame*> frameobj = frames[i];
+    Debugger* dbg = frameobj->owner();
+
+    if (!frameobj->replaceFrameIterData(cx, iter)) {
+      unsafe.crash("replaceFrameGuts");
+    }
+
+    if (!dbg->frames.putNew(to, frameobj)) {
+      unsafe.crash("replaceFrameGuts");
+    }
+
+    dbg->frames.remove(from);
+  }
+
+  MOZ_ASSERT(!DebugAPI::inFrameMaps(from));
+  MOZ_ASSERT_IF(!frames.empty(), DebugAPI::inFrameMaps(to));
+}
+
+bool DebugAPI::inFrameMaps(AbstractFramePtr frame) {
+  bool foundAny = false;
+  JS::AutoAssertNoGC nogc;
+  Debugger::forEachOnStackDebuggerFrame(
+      frame, nogc,
+      [&](Debugger*, DebuggerFrame* frameobj) { foundAny = true; });
+  return foundAny;
+}
+
+void Debugger::suspendGeneratorDebuggerFrames(JSContext* cx,
+                                              AbstractFramePtr frame) {
+  JS::GCContext* gcx = cx->gcContext();
+  JS::AutoAssertNoGC nogc;
+  forEachOnStackDebuggerFrame(
+      frame, nogc, [&](Debugger* dbg, DebuggerFrame* dbgFrame) {
+        dbg->frames.remove(frame);
+
+#if DEBUG
+        MOZ_ASSERT(dbgFrame->hasGeneratorInfo());
+        AbstractGeneratorObject& genObj = dbgFrame->unwrappedGenerator();
+        GeneratorWeakMap::Ptr p = dbg->generatorFrames.lookup(&genObj);
+        MOZ_ASSERT(p);
+        MOZ_ASSERT(p->value() == dbgFrame);
+#endif
+
+        dbgFrame->suspendGeneratorFrame(gcx);
+      });
+}
+
+void Debugger::terminateDebuggerFrames(JSContext* cx, AbstractFramePtr frame) {
+  JS::GCContext* gcx = cx->gcContext();
+
+  JS::AutoAssertNoGC nogc;
+  forEachOnStackOrSuspendedGeneratorDebuggerFrame(
+      cx, frame, nogc, [&](Debugger* dbg, DebuggerFrame* dbgFrame) {
+        Debugger::terminateDebuggerFrame(gcx, dbg, dbgFrame, frame);
+      });
+
+  if (frame.isEvalFrame()) {
+    RootedScript script(cx, frame.script());
+    DebugScript::clearBreakpointsIn(cx->gcContext(), script, nullptr, nullptr);
+  }
+}
+
+void Debugger::terminateDebuggerFrame(
+    JS::GCContext* gcx, Debugger* dbg, DebuggerFrame* dbgFrame,
+    AbstractFramePtr frame, FrameMap::ModIterator* maybeFramesIter,
+    GeneratorWeakMap::ModIterator* maybeGeneratorFramesIter) {
+  MOZ_ASSERT_IF(!frame, !maybeFramesIter);
+  MOZ_ASSERT_IF(!frame, dbgFrame->hasGeneratorInfo());
+  MOZ_ASSERT_IF(!dbgFrame->hasGeneratorInfo(), !maybeGeneratorFramesIter);
+
+  if (frame) {
+    if (maybeFramesIter) {
+      maybeFramesIter->remove();
+    } else {
+      dbg->frames.remove(frame);
+    }
+#ifdef ENABLE_WASM_JSPI
+    dbg->wasmContFrames.eraseIf(
+        [&frame](const AbstractFramePtr& fp) { return fp == frame; });
+#endif
+  }
+
+  if (dbgFrame->hasGeneratorInfo()) {
+    if (maybeGeneratorFramesIter) {
+      maybeGeneratorFramesIter->remove();
+    } else {
+      dbg->generatorFrames.remove(&dbgFrame->unwrappedGenerator());
+    }
+  }
+
+  dbgFrame->terminate(gcx, frame);
+}
+
+DebuggerDebuggeeLink* Debugger::getDebuggeeLink() {
+  return &object->getReservedSlot(JSSLOT_DEBUG_DEBUGGEE_LINK)
+              .toObject()
+              .as<DebuggerDebuggeeLink>();
+}
+
+void DebuggerDebuggeeLink::setLinkSlot(Debugger& dbg) {
+  setReservedSlot(DEBUGGER_LINK_SLOT, ObjectValue(*dbg.toJSObject()));
+}
+
+void DebuggerDebuggeeLink::clearLinkSlot() {
+  setReservedSlot(DEBUGGER_LINK_SLOT, UndefinedValue());
+}
+
+const JSClass DebuggerDebuggeeLink::class_ = {
+    "DebuggerDebuggeeLink",
+    JSCLASS_HAS_RESERVED_SLOTS(RESERVED_SLOTS),
+};
+
+void DebugAPI::handleBaselineOsr(JSContext* cx, InterpreterFrame* from,
+                                 jit::BaselineFrame* to) {
+  ScriptFrameIter iter(cx);
+  MOZ_ASSERT(iter.abstractFramePtr() == to);
+  Debugger::replaceFrameGuts(cx, from, to, iter);
+}
+
+void DebugAPI::handleIonBailout(JSContext* cx, jit::RematerializedFrame* from,
+                                jit::BaselineFrame* to) {
+  ScriptFrameIter iter(cx);
+  while (iter.abstractFramePtr() != to) {
+    ++iter;
+  }
+  Debugger::replaceFrameGuts(cx, from, to, iter);
+}
+
+void DebugAPI::handleUnrecoverableIonBailoutError(
+    JSContext* cx, jit::RematerializedFrame* frame) {
+  Debugger::terminateDebuggerFrames(cx, frame);
+}
+
+
+Builder::Builder(JSContext* cx, js::Debugger* debugger)
+    : debuggerObject(cx, debugger->toJSObject().get()), debugger(debugger) {}
+
+#if DEBUG
+void Builder::assertBuilt(JSObject* obj) {
+  MOZ_ASSERT_IF(obj, debuggerObject->compartment() == obj->compartment());
+}
+#endif
+
+bool Builder::Object::definePropertyToTrusted(JSContext* cx, const char* name,
+                                              JS::MutableHandleValue trusted) {
+  MOZ_ASSERT(value);
+
+  JSAtom* atom = Atomize(cx, name, strlen(name));
+  if (!atom) {
+    return false;
+  }
+  RootedId id(cx, AtomToId(atom));
+
+  return DefineDataProperty(cx, value, id, trusted);
+}
+
+bool Builder::Object::defineProperty(JSContext* cx, const char* name,
+                                     JS::HandleValue propval_) {
+  AutoRealm ar(cx, debuggerObject());
+
+  RootedValue propval(cx, propval_);
+  if (!debugger()->wrapDebuggeeValue(cx, &propval)) {
+    return false;
+  }
+
+  return definePropertyToTrusted(cx, name, &propval);
+}
+
+bool Builder::Object::defineProperty(JSContext* cx, const char* name,
+                                     JS::HandleObject propval_) {
+  RootedValue propval(cx, ObjectOrNullValue(propval_));
+  return defineProperty(cx, name, propval);
+}
+
+bool Builder::Object::defineProperty(JSContext* cx, const char* name,
+                                     Builder::Object& propval_) {
+  AutoRealm ar(cx, debuggerObject());
+
+  RootedValue propval(cx, ObjectOrNullValue(propval_.value));
+  return definePropertyToTrusted(cx, name, &propval);
+}
+
+Builder::Object Builder::newObject(JSContext* cx) {
+  AutoRealm ar(cx, debuggerObject);
+
+  Rooted<PlainObject*> obj(cx, NewPlainObject(cx));
+
+  return Object(cx, *this, obj);
+}
+
+
+extern JS_PUBLIC_API bool JS_DefineDebuggerObject(JSContext* cx,
+                                                  HandleObject obj) {
+  Rooted<NativeObject*> debugCtor(cx), debugProto(cx), frameProto(cx),
+      scriptProto(cx), sourceProto(cx), objectProto(cx), envProto(cx),
+      memoryProto(cx);
+  RootedObject debuggeeWouldRunProto(cx);
+  RootedValue debuggeeWouldRunCtor(cx);
+  Handle<GlobalObject*> global = obj.as<GlobalObject>();
+
+  debugProto = InitClass(cx, global, &DebuggerPrototypeObject::class_, nullptr,
+                         "Debugger", Debugger::construct, 1,
+                         Debugger::properties, Debugger::methods, nullptr,
+                         Debugger::static_methods, debugCtor.address());
+  if (!debugProto) {
+    return false;
+  }
+
+  frameProto = DebuggerFrame::initClass(cx, global, debugCtor);
+  if (!frameProto) {
+    return false;
+  }
+
+  scriptProto = DebuggerScript::initClass(cx, global, debugCtor);
+  if (!scriptProto) {
+    return false;
+  }
+
+  sourceProto = DebuggerSource::initClass(cx, global, debugCtor);
+  if (!sourceProto) {
+    return false;
+  }
+
+  objectProto = DebuggerObject::initClass(cx, global, debugCtor);
+  if (!objectProto) {
+    return false;
+  }
+
+  envProto = DebuggerEnvironment::initClass(cx, global, debugCtor);
+  if (!envProto) {
+    return false;
+  }
+
+  memoryProto = InitClass(
+      cx, debugCtor, nullptr, nullptr, "Memory", DebuggerMemory::construct, 0,
+      DebuggerMemory::properties, DebuggerMemory::methods, nullptr, nullptr);
+  if (!memoryProto) {
+    return false;
+  }
+
+  debuggeeWouldRunProto = GlobalObject::getOrCreateCustomErrorPrototype(
+      cx, global, JSEXN_DEBUGGEEWOULDRUN);
+  if (!debuggeeWouldRunProto) {
+    return false;
+  }
+  debuggeeWouldRunCtor =
+      ObjectValue(global->getConstructor(JSProto_DebuggeeWouldRun));
+  RootedId debuggeeWouldRunId(
+      cx, NameToId(ClassName(JSProto_DebuggeeWouldRun, cx)));
+  if (!DefineDataProperty(cx, debugCtor, debuggeeWouldRunId,
+                          debuggeeWouldRunCtor, 0)) {
+    return false;
+  }
+
+  debugProto->setReservedSlot(Debugger::JSSLOT_DEBUG_FRAME_PROTO,
+                              ObjectValue(*frameProto));
+  debugProto->setReservedSlot(Debugger::JSSLOT_DEBUG_OBJECT_PROTO,
+                              ObjectValue(*objectProto));
+  debugProto->setReservedSlot(Debugger::JSSLOT_DEBUG_SCRIPT_PROTO,
+                              ObjectValue(*scriptProto));
+  debugProto->setReservedSlot(Debugger::JSSLOT_DEBUG_SOURCE_PROTO,
+                              ObjectValue(*sourceProto));
+  debugProto->setReservedSlot(Debugger::JSSLOT_DEBUG_ENV_PROTO,
+                              ObjectValue(*envProto));
+  debugProto->setReservedSlot(Debugger::JSSLOT_DEBUG_MEMORY_PROTO,
+                              ObjectValue(*memoryProto));
+  return true;
+}
+
+extern JS_PUBLIC_API const char* JS_GetLastOOMStackTrace(JSContext* cx) {
+  return cx->getOOMStackTrace();
+}
+
+JS_PUBLIC_API bool JS::dbg::IsDebugger(JSObject& obj) {
+  JSObject* unwrapped = CheckedUnwrapStatic(&obj);
+  if (!unwrapped || !unwrapped->is<DebuggerInstanceObject>()) {
+    return false;
+  }
+  MOZ_ASSERT(js::Debugger::fromJSObject(unwrapped));
+  return true;
+}
+
+JS_PUBLIC_API bool JS::dbg::GetDebuggeeGlobals(
+    JSContext* cx, JSObject& dbgObj, MutableHandleObjectVector vector) {
+  MOZ_ASSERT(IsDebugger(dbgObj));
+  js::Debugger* dbg = js::Debugger::fromJSObject(CheckedUnwrapStatic(&dbgObj));
+
+  if (!vector.reserve(vector.length() + dbg->debuggees.count())) {
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
+
+  for (auto iter = dbg->allDebuggees(); !iter.done(); iter.next()) {
+    vector.infallibleAppend(static_cast<JSObject*>(iter.get()));
+  }
+
+  return true;
+}
+
+#ifdef DEBUG
+bool Debugger::isDebuggerCrossCompartmentEdge(JSObject* obj,
+                                              const gc::Cell* target) {
+  MOZ_ASSERT(target);
+
+  const gc::Cell* referent = nullptr;
+  if (obj->is<DebuggerScript>()) {
+    referent = obj->as<DebuggerScript>().getReferentCell();
+  } else if (obj->is<DebuggerSource>()) {
+    referent = obj->as<DebuggerSource>().getReferentRawObject();
+  } else if (obj->is<DebuggerObject>()) {
+    referent = obj->as<DebuggerObject>().referent();
+  } else if (obj->is<DebuggerEnvironment>()) {
+    referent = obj->as<DebuggerEnvironment>().referent();
+  }
+
+  return referent == target;
+}
+
+static void CheckDebuggeeThingRealm(Realm* realm, bool invisibleOk) {
+  MOZ_ASSERT_IF(!invisibleOk, !realm->creationOptions().invisibleToDebugger());
+}
+
+void js::CheckDebuggeeThing(BaseScript* script, bool invisibleOk) {
+  CheckDebuggeeThingRealm(script->realm(), invisibleOk);
+}
+
+void js::CheckDebuggeeThing(JSObject* obj, bool invisibleOk) {
+  if (Realm* realm = JS::GetObjectRealmOrNull(obj)) {
+    CheckDebuggeeThingRealm(realm, invisibleOk);
+  }
+}
+#endif  // DEBUG
+
+
+namespace JS {
+namespace dbg {
+
+ GarbageCollectionEvent::Ptr GarbageCollectionEvent::Create(
+    JSRuntime* rt, ::js::gcstats::Statistics& stats, uint64_t gcNumber) {
+  auto data = MakeUnique<GarbageCollectionEvent>(gcNumber);
+  if (!data) {
+    return nullptr;
+  }
+
+  data->nonincrementalReason = stats.nonincrementalReason();
+
+  for (auto& slice : stats.slices()) {
+    if (!data->reason) {
+      data->reason = ExplainGCReason(slice.reason);
+      MOZ_ASSERT(data->reason);
+    }
+
+    if (!data->collections.growBy(1)) {
+      return nullptr;
+    }
+
+    data->collections.back().startTimestamp = slice.start;
+    data->collections.back().endTimestamp = slice.end;
+  }
+
+  return data;
+}
+
+static bool DefineStringProperty(JSContext* cx, HandleObject obj,
+                                 PropertyName* propName, const char* strVal) {
+  RootedValue val(cx, UndefinedValue());
+  if (strVal) {
+    JSAtom* atomized = Atomize(cx, strVal, strlen(strVal));
+    if (!atomized) {
+      return false;
+    }
+    val = StringValue(atomized);
+  }
+  return DefineDataProperty(cx, obj, propName, val);
+}
+
+JSObject* GarbageCollectionEvent::toJSObject(JSContext* cx) const {
+  RootedObject obj(cx, NewPlainObject(cx));
+  RootedValue gcCycleNumberVal(cx, NumberValue(majorGCNumber_));
+  if (!obj ||
+      !DefineStringProperty(cx, obj, cx->names().nonincrementalReason,
+                            nonincrementalReason) ||
+      !DefineStringProperty(cx, obj, cx->names().reason, reason) ||
+      !DefineDataProperty(cx, obj, cx->names().gcCycleNumber,
+                          gcCycleNumberVal)) {
+    return nullptr;
+  }
+
+  Rooted<ArrayObject*> slicesArray(cx, NewDenseEmptyArray(cx));
+  if (!slicesArray) {
+    return nullptr;
+  }
+
+  TimeStamp originTime = TimeStamp::ProcessCreation();
+
+  size_t idx = 0;
+  for (auto range = collections.all(); !range.empty(); range.popFront()) {
+    Rooted<PlainObject*> collectionObj(cx, NewPlainObject(cx));
+    if (!collectionObj) {
+      return nullptr;
+    }
+
+    RootedValue start(cx), end(cx);
+    start = NumberValue(
+        (range.front().startTimestamp - originTime).ToMilliseconds());
+    end =
+        NumberValue((range.front().endTimestamp - originTime).ToMilliseconds());
+    if (!DefineDataProperty(cx, collectionObj, cx->names().startTimestamp,
+                            start) ||
+        !DefineDataProperty(cx, collectionObj, cx->names().endTimestamp, end)) {
+      return nullptr;
+    }
+
+    RootedValue collectionVal(cx, ObjectValue(*collectionObj));
+    if (!DefineDataElement(cx, slicesArray, idx++, collectionVal)) {
+      return nullptr;
+    }
+  }
+
+  RootedValue slicesValue(cx, ObjectValue(*slicesArray));
+  if (!DefineDataProperty(cx, obj, cx->names().collections, slicesValue)) {
+    return nullptr;
+  }
+
+  return obj;
+}
+
+JS_PUBLIC_API bool FireOnGarbageCollectionHookRequired(JSContext* cx) {
+  AutoCheckCannotGC noGC;
+
+  for (auto& dbg : cx->runtime()->onGarbageCollectionWatchers()) {
+    MOZ_ASSERT(dbg.getHook(Debugger::OnGarbageCollection));
+    if (dbg.observedGC(cx->runtime()->gc.majorGCCount())) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+JS_PUBLIC_API bool FireOnGarbageCollectionHook(
+    JSContext* cx, JS::dbg::GarbageCollectionEvent::Ptr&& data) {
+  RootedObjectVector triggered(cx);
+
+  {
+    AutoCheckCannotGC noGC;
+
+    for (auto& dbg : cx->runtime()->onGarbageCollectionWatchers()) {
+      MOZ_ASSERT(dbg.getHook(Debugger::OnGarbageCollection));
+      if (dbg.observedGC(data->majorGCNumber())) {
+        if (!triggered.append(dbg.object)) {
+          JS_ReportOutOfMemory(cx);
+          return false;
+        }
+      }
+    }
+  }
+
+  JS::AutoDebuggerJobQueueInterruption adjqi;
+  if (!adjqi.init(cx)) {
+    cx->clearPendingException();
+    return false;
+  }
+
+  for (; !triggered.empty(); triggered.popBack()) {
+    Debugger* dbg = Debugger::fromJSObject(triggered.back());
+    EnterDebuggeeNoExecute nx(cx, *dbg, adjqi);
+
+    if (dbg->getHook(Debugger::OnGarbageCollection)) {
+      (void)dbg->enterDebuggerHook(cx, [&]() -> bool {
+        return dbg->fireOnGarbageCollectionHook(cx, data);
+      });
+      MOZ_ASSERT(!cx->isExceptionPending());
+      adjqi.runJobs();
+    }
+  }
+
+  return true;
+}
+
+bool ShouldAvoidSideEffects(JSContext* cx) {
+  return DebugAPI::shouldAvoidSideEffects(cx);
+}
+
+}  
+}  

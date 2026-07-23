@@ -1,0 +1,150 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsNavBookmarks_h_
+#define nsNavBookmarks_h_
+
+#include "nsINavBookmarksService.h"
+#include "nsNavHistory.h"
+#include "nsToolkitCompsCID.h"
+#include "nsCategoryCache.h"
+#include "nsTHashtable.h"
+#include "mozilla/Attributes.h"
+#include "prtime.h"
+
+class nsNavBookmarks;
+
+namespace mozilla {
+namespace places {
+
+enum BookmarkStatementId {
+  DB_FIND_REDIRECTED_BOOKMARK = 0,
+  DB_GET_BOOKMARKS_FOR_URI
+};
+
+struct BookmarkData {
+  int64_t id = -1;
+  nsCString url;
+  nsCString title;
+  int32_t position = -1;
+  int64_t placeId = -1;
+  int64_t parentId = -1;
+  int64_t grandParentId = -1;
+  int32_t type = 0;
+  nsCString serviceCID;
+  PRTime dateAdded = 0;
+  PRTime lastModified = 0;
+  nsCString guid;
+  nsCString parentGuid;
+};
+
+struct ItemVisitData {
+  BookmarkData bookmark;
+  int64_t visitId;
+  uint32_t transitionType;
+  PRTime time;
+};
+
+typedef void (nsNavBookmarks::*ItemVisitMethod)(const ItemVisitData&);
+
+enum BookmarkDate { LAST_MODIFIED };
+
+}  
+}  
+
+class nsNavBookmarks final : public nsINavBookmarksService,
+                             public nsIObserver,
+                             public nsSupportsWeakReference {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSINAVBOOKMARKSSERVICE
+  NS_DECL_NSIOBSERVER
+
+  nsNavBookmarks();
+
+  static already_AddRefed<nsNavBookmarks> GetSingleton();
+
+  nsresult Init();
+
+  static nsNavBookmarks* GetBookmarksService() {
+    if (!gBookmarksService) {
+      nsCOMPtr<nsINavBookmarksService> serv =
+          do_GetService(NS_NAVBOOKMARKSSERVICE_CONTRACTID);
+      NS_ENSURE_TRUE(serv, nullptr);
+      NS_ASSERTION(gBookmarksService,
+                   "Should have static instance pointer now");
+    }
+    return gBookmarksService;
+  }
+
+  typedef mozilla::places::BookmarkData BookmarkData;
+  typedef mozilla::places::ItemVisitData ItemVisitData;
+  typedef mozilla::places::BookmarkStatementId BookmarkStatementId;
+
+  nsresult OnVisit(nsIURI* aURI, int64_t aVisitId, PRTime aTime,
+                   int64_t aSessionId, int64_t aReferringId,
+                   uint32_t aTransitionType, const nsACString& aGUID,
+                   bool aHidden, uint32_t aVisitCount, uint32_t aTyped,
+                   const nsAString& aLastKnownTitle);
+
+  nsresult FetchItemInfo(int64_t aItemId, BookmarkData& _bookmark);
+
+  void NotifyItemVisited(const ItemVisitData& aData);
+
+  static const int32_t kGetChildrenIndex_Guid;
+  static const int32_t kGetChildrenIndex_Position;
+  static const int32_t kGetChildrenIndex_Type;
+  static const int32_t kGetChildrenIndex_PlaceID;
+
+  static mozilla::Atomic<int64_t> sLastInsertedItemId;
+  static void StoreLastInsertedId(const nsACString& aTable,
+                                  const int64_t aLastInsertedId);
+
+ private:
+  static nsNavBookmarks* gBookmarksService;
+
+  ~nsNavBookmarks();
+
+  nsresult AdjustIndices(int64_t aFolder, int32_t aStartIndex,
+                         int32_t aEndIndex, int32_t aDelta);
+
+  nsresult FetchFolderInfo(int64_t aFolderId, int32_t* _folderCount,
+                           nsACString& _guid, int64_t* _parentId);
+
+  nsresult SetItemTitleInternal(BookmarkData& aBookmark,
+                                const nsACString& aTitle);
+
+  RefPtr<mozilla::places::Database> mDB;
+
+  nsresult SetItemDateInternal(enum mozilla::places::BookmarkDate aDateType,
+                               int64_t aItemId, PRTime aValue);
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult RemoveFolderChildren(int64_t aFolderId, uint16_t aSource);
+
+  nsresult GetDescendantChildren(int64_t aFolderId,
+                                 const nsACString& aFolderGuid,
+                                 int64_t aGrandParentId,
+                                 nsTArray<BookmarkData>& aFolderChildrenArray);
+
+  enum ItemType {
+    BOOKMARK = TYPE_BOOKMARK,
+    FOLDER = TYPE_FOLDER,
+    SEPARATOR = TYPE_SEPARATOR,
+  };
+
+  nsresult InsertBookmarkInDB(int64_t aPlaceId, enum ItemType aItemType,
+                              int64_t aParentId, int32_t aIndex,
+                              const nsACString& aTitle, PRTime aDateAdded,
+                              PRTime aLastModified,
+                              const nsACString& aParentGuid,
+                              int64_t aGrandParentId, nsIURI* aURI,
+                              int64_t* _itemId, nsACString& _guid);
+
+  nsresult GetBookmarksForURI(nsIURI* aURI, nsTArray<BookmarkData>& _bookmarks);
+
+  bool mCanNotify;
+};
+
+#endif  // nsNavBookmarks_h_

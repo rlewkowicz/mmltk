@@ -1,0 +1,198 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MediaEncoder_h_
+#define MediaEncoder_h_
+
+#include "ContainerWriter.h"
+#include "CubebUtils.h"
+#include "MediaQueue.h"
+#include "MediaTrackGraph.h"
+#include "MediaTrackListener.h"
+#include "TrackEncoder.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/UniquePtr.h"
+#include "nsIMemoryReporter.h"
+
+namespace mozilla {
+
+class DriftCompensator;
+class Muxer;
+class Runnable;
+class TaskQueue;
+
+namespace dom {
+class AudioNode;
+class AudioStreamTrack;
+class BlobImpl;
+class MediaStreamTrack;
+class MutableBlobStorage;
+class VideoStreamTrack;
+}  
+
+class DriftCompensator;
+
+class MediaEncoder {
+ private:
+  class AudioTrackListener;
+  class VideoTrackListener;
+  class EncoderListener;
+
+ public:
+  using BlobPromise =
+      MozPromise<RefPtr<dom::BlobImpl>, nsresult, false >;
+  using SizeOfPromise = MozPromise<size_t, size_t, true >;
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaEncoder)
+
+ private:
+  MediaEncoder(RefPtr<TaskQueue> aEncoderThread,
+               RefPtr<DriftCompensator> aDriftCompensator,
+               UniquePtr<ContainerWriter> aWriter,
+               UniquePtr<AudioTrackEncoder> aAudioEncoder,
+               UniquePtr<VideoTrackEncoder> aVideoEncoder,
+               UniquePtr<MediaQueue<EncodedFrame>> aEncodedAudioQueue,
+               UniquePtr<MediaQueue<EncodedFrame>> aEncodedVideoQueue,
+               TrackRate aTrackRate, const nsAString& aMIMEType,
+               uint64_t aMaxMemory, TimeDuration aTimeslice);
+
+ public:
+  void Suspend();
+
+  void Resume();
+
+  void DisconnectTracks();
+
+  void ConnectAudioNode(dom::AudioNode* aNode, uint32_t aOutput);
+
+  void ConnectMediaStreamTrack(dom::MediaStreamTrack* aTrack);
+
+  void RemoveMediaStreamTrack(dom::MediaStreamTrack* aTrack);
+
+  static already_AddRefed<MediaEncoder> CreateEncoder(
+      RefPtr<TaskQueue> aEncoderThread, const nsAString& aMimeType,
+      uint32_t aAudioBitrate, uint32_t aVideoBitrate, uint8_t aTrackTypes,
+      TrackRate aTrackRate, uint64_t aMaxMemory, TimeDuration aTimeslice);
+
+  nsresult GetEncodedData(nsTArray<nsTArray<uint8_t>>* aOutputBufs);
+
+  void AssertShutdownCalled() { MOZ_ASSERT(mShutdownPromise); }
+
+  RefPtr<GenericNonExclusivePromise> Stop();
+
+  RefPtr<GenericNonExclusivePromise> Cancel();
+
+  bool HasError();
+
+  static bool IsWebMEncoderEnabled();
+
+  void UpdateInitialized();
+
+  void UpdateStarted();
+
+  MOZ_DEFINE_MALLOC_SIZE_OF(MallocSizeOf)
+  RefPtr<SizeOfPromise> SizeOfExcludingThis(
+      mozilla::MallocSizeOf aMallocSizeOf);
+
+  RefPtr<BlobPromise> RequestData();
+
+  MediaEventSource<void>& StartedEvent() { return mStartedEvent; }
+  MediaEventSource<void>& ErrorEvent() { return mErrorEvent; }
+  MediaEventSource<void>& ShutdownEvent() { return mShutdownEvent; }
+  MediaEventSource<RefPtr<dom::BlobImpl>>& DataAvailableEvent() {
+    return mDataAvailableEvent;
+  }
+
+ protected:
+  ~MediaEncoder();
+
+ private:
+  void RegisterListeners();
+
+  void EnsureGraphTrackFrom(MediaTrack* aTrack);
+
+  void MaybeShutdown();
+
+  RefPtr<GenericNonExclusivePromise> Shutdown();
+
+  void SetError();
+
+  void MaybeCreateMutableBlobStorage();
+
+  void OnEncodedAudioPushed(const RefPtr<EncodedFrame>& aFrame);
+
+  void OnEncodedVideoPushed(const RefPtr<EncodedFrame>& aFrame);
+
+  void MaybeExtractOrGatherBlob();
+
+  RefPtr<GenericPromise> Extract();
+
+  RefPtr<BlobPromise> GatherBlob();
+
+  RefPtr<BlobPromise> GatherBlobImpl();
+
+  const RefPtr<nsISerialEventTarget> mMainThread;
+  const RefPtr<TaskQueue> mEncoderThread;
+  const RefPtr<DriftCompensator> mDriftCompensator;
+
+  const UniquePtr<MediaQueue<EncodedFrame>> mEncodedAudioQueue;
+  const UniquePtr<MediaQueue<EncodedFrame>> mEncodedVideoQueue;
+
+  const UniquePtr<Muxer> mMuxer;
+  const UniquePtr<AudioTrackEncoder> mAudioEncoder;
+  const RefPtr<AudioTrackListener> mAudioListener;
+  const UniquePtr<VideoTrackEncoder> mVideoEncoder;
+  const RefPtr<VideoTrackListener> mVideoListener;
+  const RefPtr<EncoderListener> mEncoderListener;
+
+ public:
+  const nsString mMimeType;
+
+  const uint64_t mMaxMemory;
+
+  const TimeDuration mTimeslice;
+
+ private:
+  MediaEventListener mAudioPushListener;
+  MediaEventListener mAudioFinishListener;
+  MediaEventListener mVideoPushListener;
+  MediaEventListener mVideoFinishListener;
+
+  MediaEventProducer<void> mStartedEvent;
+  MediaEventProducer<void> mErrorEvent;
+  MediaEventProducer<void> mShutdownEvent;
+  MediaEventProducer<RefPtr<dom::BlobImpl>> mDataAvailableEvent;
+
+  RefPtr<dom::AudioNode> mAudioNode;
+  RefPtr<AudioNodeTrack> mPipeTrack;
+  RefPtr<MediaInputPort> mInputPort;
+  RefPtr<dom::AudioStreamTrack> mAudioTrack;
+  RefPtr<dom::VideoStreamTrack> mVideoTrack;
+
+  RefPtr<SharedDummyTrack> mGraphTrack;
+
+  RefPtr<dom::MutableBlobStorage> mMutableBlobStorage;
+  RefPtr<BlobPromise> mBlobPromise;
+  media::TimeUnit mLastBlobTime;
+  media::TimeUnit mLastExtractTime;
+  media::TimeUnit mMuxedAudioEndTime;
+  media::TimeUnit mMuxedVideoEndTime;
+
+  TimeStamp mStartTime;
+  bool mInitialized;
+  bool mStarted;
+  bool mCompleted;
+  bool mError;
+  RefPtr<GenericNonExclusivePromise> mShutdownPromise;
+  double GetEncodeTimeStamp() {
+    TimeDuration decodeTime;
+    decodeTime = TimeStamp::Now() - mStartTime;
+    return decodeTime.ToMilliseconds();
+  }
+};
+
+}  
+
+#endif

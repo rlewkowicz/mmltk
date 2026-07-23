@@ -1,0 +1,44 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef include_dom_media_ipc_RemoteAudioDecoderChild_h
+#define include_dom_media_ipc_RemoteAudioDecoderChild_h
+#include "RemoteDecoderChild.h"
+#include "RemoteDecoderParent.h"
+
+namespace mozilla {
+
+using mozilla::ipc::IPCResult;
+
+class RemoteAudioDecoderChild final : public RemoteDecoderChild {
+ public:
+  explicit RemoteAudioDecoderChild(RemoteMediaIn aLocation);
+
+  MOZ_IS_CLASS_INIT
+  MediaResult InitIPDL(const AudioInfo& aAudioInfo,
+                       const CreateDecoderParams::OptionSet& aOptions);
+
+  MediaResult ProcessOutput(DecodedOutputIPDL&& aDecodedData) override;
+};
+
+class RemoteAudioDecoderParent final : public RemoteDecoderParent {
+ public:
+  RemoteAudioDecoderParent(RemoteMediaManagerParent* aParent,
+                           const AudioInfo& aAudioInfo,
+                           const CreateDecoderParams::OptionSet& aOptions,
+                           nsISerialEventTarget* aManagerThread,
+                           TaskQueue* aDecodeTaskQueue);
+
+ protected:
+  IPCResult RecvConstruct(ConstructResolver&& aResolver) override;
+  MediaResult ProcessDecodedData(MediaDataDecoder::DecodedData&& aData,
+                                 DecodedOutputIPDL& aDecodedData) override;
+
+ private:
+  const AudioInfo mAudioInfo;
+  const CreateDecoderParams::OptionSet mOptions;
+};
+
+}  
+
+#endif  // include_dom_media_ipc_RemoteAudioDecoderChild_h

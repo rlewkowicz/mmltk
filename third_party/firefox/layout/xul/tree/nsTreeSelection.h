@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsTreeSelection_h_
+#define nsTreeSelection_h_
+
+#include "XULTreeElement.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsITimer.h"
+#include "nsITreeSelection.h"
+
+class nsTreeColumn;
+struct nsTreeRange;
+
+class nsTreeSelection final : public nsINativeTreeSelection {
+ public:
+  explicit nsTreeSelection(mozilla::dom::XULTreeElement* aTree);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS(nsTreeSelection)
+  NS_DECL_NSITREESELECTION
+
+  NS_IMETHOD EnsureNative() override { return NS_OK; }
+
+  friend struct nsTreeRange;
+
+ protected:
+  ~nsTreeSelection();
+
+  nsresult FireOnSelectHandler();
+  static void SelectCallback(nsITimer* aTimer, void* aClosure);
+
+ protected:
+  RefPtr<mozilla::dom::XULTreeElement> mTree;
+
+  bool mSuppressed;       
+  int32_t mCurrentIndex;  
+  int32_t mShiftSelectPivot;  
+
+  nsTreeRange* mFirstRange;  
+
+  nsCOMPtr<nsITimer> mSelectTimer;
+};
+
+nsresult NS_NewTreeSelection(mozilla::dom::XULTreeElement* aTree,
+                             nsITreeSelection** aResult);
+
+#endif

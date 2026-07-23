@@ -1,0 +1,41 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+EXPORTS += [
+    "nsIPopupContainer.h",
+    "nsIScrollbarMediator.h",
+    "nsMenuPopupFrame.h",
+    "nsXULPopupManager.h",
+    "nsXULTooltipListener.h",
+]
+
+UNIFIED_SOURCES += [
+    "MiddleCroppingLabelFrame.cpp",
+    "nsMenuPopupFrame.cpp",
+    "nsRepeatService.cpp",
+    "nsScrollbarButtonFrame.cpp",
+    "nsScrollbarFrame.cpp",
+    "nsSliderFrame.cpp",
+    "nsSplitterFrame.cpp",
+    "nsXULPopupManager.cpp",
+    "nsXULTooltipListener.cpp",
+    "SimpleXULLeafFrame.cpp",
+]
+
+DIRS += ["tree"]
+
+CFLAGS += CONFIG["MOZ_GTK3_CFLAGS"]
+CXXFLAGS += CONFIG["MOZ_GTK3_CFLAGS"]
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+FINAL_LIBRARY = "xul"
+LOCAL_INCLUDES += [
+    "../base",
+    "../generic",
+    "../painting",
+    "../style",
+    "/dom/base",
+    "/dom/xul",
+]

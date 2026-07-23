@@ -1,0 +1,335 @@
+// Copyright © 2021 Mozilla Foundation
+// This program is made available under an ISC-style license.  See the
+// accompanying file LICENSE for details
+
+use crossbeam_queue::ArrayQueue;
+use mio::Token;
+use std::cell::UnsafeCell;
+use std::collections::VecDeque;
+use std::io::{self, Error, Result};
+use std::marker::PhantomPinned;
+use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+
+use crate::ipccore::EventLoopHandle;
+
+struct Completion<T> {
+    item: UnsafeCell<Option<T>>,
+    writer: AtomicBool,
+    _pin: PhantomPinned, 
+}
+
+impl<T> Completion<T> {
+    fn new() -> Self {
+        Completion {
+            item: UnsafeCell::new(None),
+            writer: AtomicBool::new(false),
+            _pin: PhantomPinned,
+        }
+    }
+
+    fn wait(&self) -> Option<T> {
+        while self.writer.load(Ordering::Acquire) {
+            std::thread::park();
+        }
+        unsafe { (*self.item.get()).take() }
+    }
+
+    fn writer(&self) -> CompletionWriter<T> {
+        assert!(!self.writer.load(Ordering::Relaxed));
+        self.writer.store(true, Ordering::Release);
+        CompletionWriter {
+            ptr: self as *const _ as *mut _,
+            waiter: std::thread::current(),
+        }
+    }
+}
+
+impl<T> Drop for Completion<T> {
+    fn drop(&mut self) {
+        while self.writer.load(Ordering::Acquire) {
+            std::thread::park();
+        }
+    }
+}
+
+struct CompletionWriter<T> {
+    ptr: *mut Completion<T>, 
+    waiter: std::thread::Thread, 
+}
+
+impl<T> CompletionWriter<T> {
+    fn set(self, value: T) {
+        unsafe {
+            assert!((*self.ptr).writer.load(Ordering::Relaxed));
+            *(*self.ptr).item.get() = Some(value);
+        }
+    }
+}
+
+impl<T> Drop for CompletionWriter<T> {
+    fn drop(&mut self) {
+        unsafe {
+            (*self.ptr).writer.store(false, Ordering::Release);
+        }
+        self.waiter.unpark();
+    }
+}
+
+unsafe impl<T> Send for CompletionWriter<T> {}
+
+pub(crate) trait Handler {
+    type In;
+    type Out;
+
+    fn consume(&mut self, request: Self::In) -> Result<()>;
+
+    fn produce(&mut self) -> Result<Option<Self::Out>>;
+}
+
+pub trait Client {
+    type ServerMessage;
+    type ClientMessage;
+}
+
+pub trait Server {
+    type ServerMessage;
+    type ClientMessage;
+
+    fn process(&mut self, req: Self::ServerMessage) -> Self::ClientMessage;
+}
+
+type ProxyRequest<Request, Response> = (Request, CompletionWriter<Response>);
+
+#[derive(Debug)]
+pub struct Proxy<Request, Response> {
+    handle: Option<(EventLoopHandle, Token)>,
+    requests: ManuallyDrop<RequestQueueSender<ProxyRequest<Request, Response>>>,
+}
+
+impl<Request, Response> Proxy<Request, Response> {
+    fn new(requests: RequestQueueSender<ProxyRequest<Request, Response>>) -> Self {
+        Self {
+            handle: None,
+            requests: ManuallyDrop::new(requests),
+        }
+    }
+
+    pub fn call(&self, request: Request) -> Result<Response> {
+        let response = Completion::new();
+        self.requests.push((request, response.writer()))?;
+        self.wake_connection();
+        match response.wait() {
+            Some(resp) => Ok(resp),
+            None => Err(Error::other("proxy recv error")),
+        }
+    }
+
+    pub(crate) fn connect_event_loop(&mut self, handle: EventLoopHandle, token: Token) {
+        self.handle = Some((handle, token));
+    }
+
+    fn wake_connection(&self) {
+        let (handle, token) = self
+            .handle
+            .as_ref()
+            .expect("proxy not connected to event loop");
+        handle.wake_connection(*token);
+    }
+}
+
+impl<Request, Response> Clone for Proxy<Request, Response> {
+    fn clone(&self) -> Self {
+        let mut clone = Self::new((*self.requests).clone());
+        let (handle, token) = self
+            .handle
+            .as_ref()
+            .expect("proxy not connected to event loop");
+        clone.connect_event_loop(handle.clone(), *token);
+        clone
+    }
+}
+
+impl<Request, Response> Drop for Proxy<Request, Response> {
+    fn drop(&mut self) {
+        trace!("Proxy drop, waking EventLoop");
+        let last_proxy = self.requests.live_proxies();
+        unsafe {
+            ManuallyDrop::drop(&mut self.requests);
+        }
+        if last_proxy == 1 && self.handle.is_some() {
+            self.wake_connection()
+        }
+    }
+}
+
+const RPC_CLIENT_INITIAL_PROXIES: usize = 32; 
+
+pub(crate) struct ClientHandler<C: Client> {
+    in_flight: VecDeque<CompletionWriter<C::ClientMessage>>,
+    requests: Arc<RequestQueue<ProxyRequest<C::ServerMessage, C::ClientMessage>>>,
+}
+
+impl<C: Client> ClientHandler<C> {
+    fn new(
+        requests: Arc<RequestQueue<ProxyRequest<C::ServerMessage, C::ClientMessage>>>,
+    ) -> ClientHandler<C> {
+        ClientHandler::<C> {
+            in_flight: VecDeque::with_capacity(RPC_CLIENT_INITIAL_PROXIES),
+            requests,
+        }
+    }
+}
+
+impl<C: Client> Handler for ClientHandler<C> {
+    type In = C::ClientMessage;
+    type Out = C::ServerMessage;
+
+    fn consume(&mut self, response: Self::In) -> Result<()> {
+        trace!("ClientHandler::consume");
+        if let Some(response_writer) = self.in_flight.pop_front() {
+            response_writer.set(response);
+        } else {
+            return Err(Error::other("request/response mismatch"));
+        }
+
+        Ok(())
+    }
+
+    fn produce(&mut self) -> Result<Option<Self::Out>> {
+        trace!("ClientHandler::produce");
+
+        self.requests.check_live_proxies()?;
+        match self.requests.pop() {
+            Some((request, response_writer)) => {
+                trace!("  --> received request");
+                self.in_flight.push_back(response_writer);
+                Ok(Some(request))
+            }
+            None => {
+                trace!("  --> no request");
+                Ok(None)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RequestQueue<T> {
+    queue: ArrayQueue<T>,
+}
+
+impl<T> RequestQueue<T> {
+    pub(crate) fn new(size: usize) -> Self {
+        RequestQueue {
+            queue: ArrayQueue::new(size),
+        }
+    }
+
+    pub(crate) fn pop(&self) -> Option<T> {
+        self.queue.pop()
+    }
+
+    pub(crate) fn new_sender(self: &Arc<Self>) -> RequestQueueSender<T> {
+        RequestQueueSender {
+            inner: Arc::downgrade(self),
+        }
+    }
+
+    pub(crate) fn check_live_proxies(self: &Arc<Self>) -> Result<()> {
+        if Arc::weak_count(self) == 0 {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct RequestQueueSender<T> {
+    inner: Weak<RequestQueue<T>>,
+}
+
+impl<T> RequestQueueSender<T> {
+    pub(crate) fn push(&self, request: T) -> Result<()> {
+        if let Some(consumer) = self.inner.upgrade() {
+            if consumer.queue.push(request).is_err() {
+                debug!("Proxy[{self:p}]: call failed - CH::requests full");
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            return Ok(());
+        }
+        debug!("Proxy[{self:p}]: call failed - CH::requests dropped");
+        Err(Error::other("proxy send error"))
+    }
+
+    pub(crate) fn live_proxies(&self) -> usize {
+        Weak::weak_count(&self.inner)
+    }
+}
+
+impl<T> Clone for RequestQueueSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for RequestQueueSender<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestQueueProducer")
+            .field("inner", &self.inner.as_ptr())
+            .finish()
+    }
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn make_client<C: Client>(
+) -> Result<(ClientHandler<C>, Proxy<C::ServerMessage, C::ClientMessage>)> {
+    let requests = Arc::new(RequestQueue::new(RPC_CLIENT_INITIAL_PROXIES));
+    let proxy_req = requests.new_sender();
+    let handler = ClientHandler::new(requests);
+
+    Ok((handler, Proxy::new(proxy_req)))
+}
+
+pub(crate) struct ServerHandler<S: Server> {
+    server: S,
+    in_flight: VecDeque<S::ClientMessage>,
+}
+
+impl<S: Server> Handler for ServerHandler<S> {
+    type In = S::ServerMessage;
+    type Out = S::ClientMessage;
+
+    fn consume(&mut self, message: Self::In) -> Result<()> {
+        trace!("ServerHandler::consume");
+        let response = self.server.process(message);
+        self.in_flight.push_back(response);
+        Ok(())
+    }
+
+    fn produce(&mut self) -> Result<Option<Self::Out>> {
+        trace!("ServerHandler::produce");
+
+        match self.in_flight.pop_front() {
+            Some(res) => {
+                trace!("  --> received response");
+                Ok(Some(res))
+            }
+            None => {
+                trace!("  --> no response ready");
+                Ok(None)
+            }
+        }
+    }
+}
+
+const RPC_SERVER_INITIAL_CLIENTS: usize = 32; 
+
+pub(crate) fn make_server<S: Server>(server: S) -> ServerHandler<S> {
+    ServerHandler::<S> {
+        server,
+        in_flight: VecDeque::with_capacity(RPC_SERVER_INITIAL_CLIENTS),
+    }
+}

@@ -1,0 +1,241 @@
+#![allow(clippy::missing_safety_doc, clippy::needless_lifetimes)]
+
+use core::cell::UnsafeCell;
+use core::marker::PhantomData;
+use core::mem;
+use core::ptr::{drop_in_place, read, NonNull};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+extern crate alloc;
+
+use alloc::alloc::{dealloc, Layout};
+
+
+#[doc(hidden)]
+pub struct JoinedCell<Owner, Dependent> {
+    pub owner: Owner,
+    pub dependent: Dependent,
+}
+
+#[doc(hidden)]
+pub struct UnsafeSelfCell<ContainedIn, Owner, DependentStatic: 'static> {
+    joined_void_ptr: NonNull<u8>,
+
+    contained_in_marker: PhantomData<ContainedIn>,
+
+    owner_marker: PhantomData<Owner>,
+    dependent_marker: PhantomData<DependentStatic>,
+}
+
+impl<ContainedIn, Owner, DependentStatic> UnsafeSelfCell<ContainedIn, Owner, DependentStatic> {
+    pub unsafe fn new(joined_void_ptr: NonNull<u8>) -> Self {
+        Self {
+            joined_void_ptr,
+            contained_in_marker: PhantomData,
+            owner_marker: PhantomData,
+            dependent_marker: PhantomData,
+        }
+    }
+
+
+    pub unsafe fn borrow_owner<'a, Dependent>(&'a self) -> &'a Owner {
+        let joined_ptr = self.joined_void_ptr.cast::<JoinedCell<Owner, Dependent>>();
+
+        &(*joined_ptr.as_ptr()).owner
+    }
+
+    pub unsafe fn borrow_dependent<'a, Dependent>(&'a self) -> &'a Dependent {
+        let joined_ptr = self.joined_void_ptr.cast::<JoinedCell<Owner, Dependent>>();
+
+        &(*joined_ptr.as_ptr()).dependent
+    }
+
+    pub unsafe fn borrow_mut<'a, Dependent>(&'a mut self) -> (&'a Owner, &'a mut Dependent) {
+        let joined_ptr = self.joined_void_ptr.cast::<JoinedCell<Owner, Dependent>>();
+
+        (
+            &(*joined_ptr.as_ptr()).owner,
+            &mut (*joined_ptr.as_ptr()).dependent,
+        )
+    }
+
+    pub unsafe fn drop_joined<Dependent>(&mut self) {
+        let joined_ptr = self.joined_void_ptr.cast::<JoinedCell<Owner, Dependent>>();
+
+        let _guard = OwnerAndCellDropGuard { joined_ptr };
+
+        drop_in_place(&mut (*joined_ptr.as_ptr()).dependent);
+
+    }
+
+    pub unsafe fn into_owner<Dependent>(self) -> Owner {
+        let joined_ptr = self.joined_void_ptr.cast::<JoinedCell<Owner, Dependent>>();
+
+        let drop_guard = OwnerAndCellDropGuard::new(joined_ptr);
+
+        drop_in_place(&mut (*joined_ptr.as_ptr()).dependent);
+
+        mem::forget(drop_guard);
+
+        let owner_ptr: *const Owner = &(*joined_ptr.as_ptr()).owner;
+
+        let owner = read(owner_ptr);
+
+        let layout = Layout::new::<JoinedCell<Owner, Dependent>>();
+        dealloc(self.joined_void_ptr.as_ptr(), layout);
+
+        owner
+    }
+}
+
+unsafe impl<ContainedIn, Owner, DependentStatic> Send
+    for UnsafeSelfCell<ContainedIn, Owner, DependentStatic>
+where
+    Owner: Send,
+    DependentStatic: Send,
+{
+}
+
+unsafe impl<ContainedIn, Owner, DependentStatic> Sync
+    for UnsafeSelfCell<ContainedIn, Owner, DependentStatic>
+where
+    Owner: Sync,
+    DependentStatic: Sync,
+{
+}
+
+#[doc(hidden)]
+pub struct OwnerAndCellDropGuard<Owner, Dependent> {
+    joined_ptr: NonNull<JoinedCell<Owner, Dependent>>,
+}
+
+impl<Owner, Dependent> OwnerAndCellDropGuard<Owner, Dependent> {
+    pub unsafe fn new(joined_ptr: NonNull<JoinedCell<Owner, Dependent>>) -> Self {
+        Self { joined_ptr }
+    }
+}
+
+impl<Owner, Dependent> Drop for OwnerAndCellDropGuard<Owner, Dependent> {
+    fn drop(&mut self) {
+        struct DeallocGuard {
+            ptr: *mut u8,
+            layout: Layout,
+        }
+        impl Drop for DeallocGuard {
+            fn drop(&mut self) {
+                unsafe { dealloc(self.ptr, self.layout) }
+            }
+        }
+
+        let _guard = DeallocGuard {
+            ptr: self.joined_ptr.as_ptr() as *mut u8,
+            layout: Layout::new::<JoinedCell<Owner, Dependent>>(),
+        };
+
+        unsafe {
+            drop_in_place(&mut (*self.joined_ptr.as_ptr()).owner);
+        }
+
+    }
+}
+
+impl<Owner, Dependent> JoinedCell<Owner, Dependent> {
+    #[doc(hidden)]
+    #[cfg(not(feature = "old_rust"))]
+    pub unsafe fn _field_pointers(this: *mut Self) -> (*mut Owner, *mut Dependent) {
+        let owner_ptr = core::ptr::addr_of_mut!((*this).owner);
+        let dependent_ptr = core::ptr::addr_of_mut!((*this).dependent);
+
+        (owner_ptr, dependent_ptr)
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "old_rust")]
+    #[rustversion::since(1.51)]
+    pub unsafe fn _field_pointers(this: *mut Self) -> (*mut Owner, *mut Dependent) {
+        let owner_ptr = core::ptr::addr_of_mut!((*this).owner);
+        let dependent_ptr = core::ptr::addr_of_mut!((*this).dependent);
+
+        (owner_ptr, dependent_ptr)
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "old_rust")]
+    #[rustversion::before(1.51)]
+    pub unsafe fn _field_pointers(this: *mut Self) -> (*mut Owner, *mut Dependent) {
+        let owner_ptr = &mut (*this).owner as *mut Owner;
+        let dependent_ptr = &mut (*this).dependent as *mut Dependent;
+
+        (owner_ptr, dependent_ptr)
+    }
+}
+
+/// Wrapper type that allows creating a self-referential type that hold a mutable borrow `&mut T`.
+///
+/// Example usage:
+///
+/// ```
+/// use self_cell::{self_cell, MutBorrow};
+///
+/// type MutStringRef<'a> = &'a mut String;
+///
+/// self_cell!(
+///     struct MutStringCell {
+///         owner: MutBorrow<String>,
+///
+///         #[covariant]
+///         dependent: MutStringRef,
+///     }
+/// );
+///
+/// let mut cell = MutStringCell::new(MutBorrow::new("abc".into()), |owner| owner.borrow_mut());
+/// cell.with_dependent_mut(|_owner, dependent| {
+///     assert_eq!(dependent, &"abc");
+///     dependent.pop();
+///     assert_eq!(dependent, &"ab");
+/// });
+///
+/// let recovered_owner: String = cell.into_owner().into_inner();
+/// assert_eq!(recovered_owner, "ab");
+/// ```
+pub struct MutBorrow<T> {
+    is_locked: AtomicBool,
+    value: UnsafeCell<T>,
+}
+
+impl<T> MutBorrow<T> {
+    /// Constructs a new `MutBorrow`.
+    pub fn new(value: T) -> Self {
+        Self {
+            is_locked: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    /// Obtains a mutable reference to the underlying data.
+    ///
+    /// This function can only sensibly be used in the builder function. Afterwards, it's impossible
+    /// to access the inner value, with the exception of [`MutBorrow::into_inner`].
+    ///
+    /// # Panics
+    ///
+    /// Will panic if called anywhere but in the dependent constructor. Will also panic if called
+    /// more than once.
+    #[allow(clippy::mut_from_ref)]
+    pub fn borrow_mut(&self) -> &mut T {
+        let was_locked = self.is_locked.swap(true, Ordering::Relaxed);
+
+        if was_locked {
+            panic!("Tried to access locked MutBorrow")
+        } else {
+            unsafe { &mut *self.value.get() }
+        }
+    }
+
+    /// Consumes `self` and returns the wrapped value.
+    pub fn into_inner(self) -> T {
+        self.value.into_inner()
+    }
+}
+
+unsafe impl<T: Send> Sync for MutBorrow<T> {}

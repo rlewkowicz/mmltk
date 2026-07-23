@@ -1,0 +1,170 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_FONT_INFO_LOADER_H
+#define GFX_FONT_INFO_LOADER_H
+
+#include "nsCOMPtr.h"
+#include "nsIObserver.h"
+#include "nsITimer.h"
+#include "nsIThread.h"
+#include "nsString.h"
+#include "gfxFontEntry.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/TimeStamp.h"
+#include "nsISupports.h"
+
+
+struct FontFaceData {
+  nsCString mFullName;
+  nsCString mPostscriptName;
+  RefPtr<gfxCharacterMap> mCharacterMap;
+  uint32_t mUVSOffset = 0;
+};
+
+
+class FontInfoData {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(FontInfoData)
+
+  FontInfoData(bool aLoadOtherNames, bool aLoadFaceNames, bool aLoadCmaps)
+      : mCanceled(false),
+        mLoadOtherNames(aLoadOtherNames),
+        mLoadFaceNames(aLoadFaceNames),
+        mLoadCmaps(aLoadCmaps) {
+    MOZ_COUNT_CTOR(FontInfoData);
+  }
+
+ protected:
+  MOZ_COUNTED_DTOR_VIRTUAL(FontInfoData)
+
+ public:
+  virtual void Load();
+
+  virtual void LoadFontFamilyData(const nsACString& aFamilyName) = 0;
+
+
+  virtual already_AddRefed<gfxCharacterMap> GetCMAP(const nsACString& aFontName,
+                                                    uint32_t& aUVSOffset) {
+    FontFaceData faceData;
+    if (!mFontFaceData.Get(aFontName, &faceData) || !faceData.mCharacterMap) {
+      return nullptr;
+    }
+
+    aUVSOffset = faceData.mUVSOffset;
+    RefPtr<gfxCharacterMap> cmap = faceData.mCharacterMap;
+    return cmap.forget();
+  }
+
+  virtual void GetFaceNames(const nsACString& aFontName, nsACString& aFullName,
+                            nsACString& aPostscriptName) {
+    FontFaceData faceData;
+    if (!mFontFaceData.Get(aFontName, &faceData)) {
+      return;
+    }
+
+    aFullName = faceData.mFullName;
+    aPostscriptName = faceData.mPostscriptName;
+  }
+
+  const nsTArray<nsCString>* GetOtherFamilyNames(
+      const nsACString& aFamilyName) {
+    return mOtherFamilyNames.Lookup(aFamilyName).DataPtrOrNull();
+  }
+
+  nsTArray<nsCString> mFontFamiliesToLoad;
+
+  mozilla::Atomic<bool> mCanceled;
+
+  mozilla::TimeDuration mLoadTime;
+
+  struct FontCounts {
+    uint32_t families;
+    uint32_t fonts;
+    uint32_t cmaps;
+    uint32_t facenames;
+    uint32_t othernames;
+  };
+
+  FontCounts mLoadStats;
+
+  bool mLoadOtherNames;
+  bool mLoadFaceNames;
+  bool mLoadCmaps;
+
+  nsTHashMap<nsCStringHashKey, FontFaceData> mFontFaceData;
+
+  nsTHashMap<nsCStringHashKey, CopyableTArray<nsCString> > mOtherFamilyNames;
+};
+
+
+
+class gfxFontInfoLoader {
+ public:
+  typedef enum {
+    stateInitial,
+    stateTimerOnDelay,
+    stateAsyncLoad,
+    stateTimerOff
+  } TimerState;
+
+  gfxFontInfoLoader() : mState(stateInitial) {
+    MOZ_COUNT_CTOR(gfxFontInfoLoader);
+  }
+
+  virtual ~gfxFontInfoLoader();
+
+  void StartLoader(uint32_t aDelay);
+
+  virtual void FinalizeLoader(FontInfoData* aFontInfo);
+
+  void CancelLoader();
+
+ protected:
+  friend class FinalizeLoaderRunnable;
+
+  class ShutdownObserver : public nsIObserver {
+   public:
+    NS_DECL_ISUPPORTS
+    NS_DECL_NSIOBSERVER
+
+    explicit ShutdownObserver(gfxFontInfoLoader* aLoader) : mLoader(aLoader) {}
+
+   protected:
+    virtual ~ShutdownObserver() = default;
+
+    gfxFontInfoLoader* mLoader;
+  };
+
+  virtual already_AddRefed<FontInfoData> CreateFontInfoData() {
+    return nullptr;
+  }
+
+  virtual void InitLoader() = 0;
+
+  virtual bool LoadFontInfo() = 0;
+
+  virtual void CleanupLoader() { mFontInfo = nullptr; }
+
+  static void DelayedStartCallback(nsITimer* aTimer, void* aThis) {
+    gfxFontInfoLoader* loader = static_cast<gfxFontInfoLoader*>(aThis);
+    loader->StartLoader(0);
+  }
+
+  void LoadFontInfoTimerFire();
+
+  void AddShutdownObserver();
+  void RemoveShutdownObserver();
+
+  nsCOMPtr<nsITimer> mTimer;
+  nsCOMPtr<nsIObserver> mObserver;
+  nsCOMPtr<nsIThread> mFontLoaderThread;
+  TimerState mState;
+
+  RefPtr<FontInfoData> mFontInfo;
+
+  mozilla::TimeDuration mLoadTime;
+};
+
+#endif /* GFX_FONT_INFO_LOADER_H */

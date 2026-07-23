@@ -1,0 +1,283 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef gc_ArenaList_h
+#define gc_ArenaList_h
+
+#include <utility>
+
+#include "ds/SinglyLinkedList.h"
+#include "gc/AllocKind.h"
+#include "gc/Memory.h"
+#include "js/GCAPI.h"
+#include "js/HeapAPI.h"
+#include "js/TypeDecls.h"
+#include "threading/ProtectedData.h"
+
+namespace JS {
+class SliceBudget;
+}
+
+namespace js {
+
+class Nursery;
+
+namespace gcstats {
+struct Statistics;
+}
+
+namespace gc {
+
+class Arena;
+class ArenaIter;
+class ArenaIterInGC;
+class AutoGatherSweptArenas;
+class BackgroundUnmarkTask;
+struct FinalizePhase;
+class FreeSpan;
+class TenuredCell;
+class TenuringTracer;
+
+enum class ReleaseEmpty : bool { No = false, Yes = true };
+
+class ArenaList : public SinglyLinkedList<Arena> {
+ public:
+  inline bool hasNonFullArenas() const;
+
+  inline Arena* takeInitialNonFullArena();
+
+  std::pair<Arena*, Arena*> pickArenasToRelocate(AllocKind kind,
+                                                 size_t& arenaTotalOut,
+                                                 size_t& relocTotalOut);
+
+  Arena* relocateArenas(Arena* toRelocate, Arena* relocated,
+                        JS::SliceBudget& sliceBudget,
+                        gcstats::Statistics& stats);
+
+#ifdef DEBUG
+  void dump();
+#endif
+};
+
+class SortedArenaList {
+ public:
+  static_assert(ArenaSize <= 4096,
+                "When increasing the Arena size, please consider how"
+                " this will affect the size of a SortedArenaList.");
+
+  static_assert(MinCellSize >= 16,
+                "When decreasing the minimum thing size, please consider"
+                " how this will affect the size of a SortedArenaList.");
+
+  static const size_t MaxThingsPerArena =
+      (ArenaSize - ArenaHeaderSize) / MinCellSize;
+
+  static const size_t BucketCount = HowMany(MaxThingsPerArena - 1, 2) + 2;
+
+ private:
+  using Bucket = SinglyLinkedList<Arena>;
+
+  const size_t thingsPerArena_;
+  Bucket buckets[BucketCount];
+
+#ifdef DEBUG
+  AllocKind allocKind_;
+  bool isConvertedToArenaList = false;
+#endif
+
+ public:
+  inline explicit SortedArenaList(AllocKind allocKind);
+
+  size_t thingsPerArena() const { return thingsPerArena_; }
+
+  inline void insertAt(Arena* arena, size_t nfree);
+
+  inline bool hasEmptyArenas() const;
+
+  inline void extractEmptyTo(Arena** destListHeadPtr);
+
+  inline ArenaList convertToArenaList(
+      Arena* maybeBucketLastOut[BucketCount] = nullptr);
+
+  inline void restoreFromArenaList(ArenaList& list,
+                                   Arena* bucketLast[BucketCount]);
+
+#ifdef DEBUG
+  AllocKind allocKind() const { return allocKind_; }
+#endif
+
+ private:
+  inline size_t index(size_t nfree, bool* frontOut) const;
+  inline size_t emptyIndex() const;
+  inline size_t bucketsUsed() const;
+
+  inline void check() const;
+};
+
+class MOZ_RAII AutoGatherSweptArenas {
+  SortedArenaList* sortedList = nullptr;
+
+  Arena* bucketLastPointers[SortedArenaList::BucketCount];
+
+  ArenaList linked;
+
+ public:
+  AutoGatherSweptArenas(JS::Zone* zone, AllocKind kind);
+  ~AutoGatherSweptArenas();
+
+  ArenaList& sweptArenas() { return linked; }
+};
+
+enum class ShouldCheckThresholds {
+  DontCheckThresholds = 0,
+  CheckThresholds = 1
+};
+
+class FreeLists {
+  AllAllocKindArray<FreeSpan*> freeLists_;
+
+ public:
+  static FreeSpan emptySentinel;
+
+  FreeLists();
+
+#ifdef DEBUG
+  inline bool allEmpty() const;
+  inline bool isEmpty(AllocKind kind) const;
+#endif
+
+  inline void clear();
+
+  MOZ_ALWAYS_INLINE TenuredCell* allocate(AllocKind kind);
+
+  inline void* setArenaAndAllocate(Arena* arena, AllocKind kind);
+
+  inline void unmarkPreMarkedFreeCells(AllocKind kind);
+
+  FreeSpan** addressOfFreeList(AllocKind thingKind) {
+    return &freeLists_[thingKind];
+  }
+};
+
+class ArenaLists {
+  enum class ConcurrentUse : uint32_t {
+    None,
+    BackgroundFinalize,
+    BackgroundFinalizeFinished
+  };
+
+  using ConcurrentUseState = mozilla::Atomic<ConcurrentUse, mozilla::Relaxed>;
+
+  JS::Zone* zone_;
+
+  UnprotectedData<AllAllocKindArray<ConcurrentUseState>> concurrentUseState_;
+
+  MainThreadData<FreeLists> freeLists_;
+
+  MainThreadOrGCTaskData<AllAllocKindArray<ArenaList>> arenaLists_;
+
+  MainThreadOrGCTaskData<AllAllocKindArray<ArenaList>> collectingArenaLists_;
+
+  MainThreadData<Arena*> gcCompactPropMapArenasToUpdate;
+  MainThreadData<Arena*> gcNormalPropMapArenasToUpdate;
+
+  MainThreadOrGCTaskData<Arena*> savedEmptyArenas;
+
+ public:
+  explicit ArenaLists(JS::Zone* zone);
+  ~ArenaLists();
+
+  FreeLists& freeLists() { return freeLists_.ref(); }
+  const FreeLists& freeLists() const { return freeLists_.ref(); }
+
+  FreeSpan** addressOfFreeList(AllocKind thingKind) {
+    return freeLists_.refNoCheck().addressOfFreeList(thingKind);
+  }
+
+  inline Arena* getFirstArena(AllocKind thingKind) const;
+  inline Arena* getFirstCollectingArena(AllocKind thingKind) const;
+
+  inline bool arenaListsAreEmpty() const;
+
+  inline bool doneBackgroundFinalize(AllocKind kind) const;
+
+  inline void clearFreeLists();
+
+  inline void unmarkPreMarkedFreeCells();
+
+  MOZ_ALWAYS_INLINE TenuredCell* allocateFromFreeList(AllocKind thingKind);
+
+  inline void checkEmptyFreeLists();
+  inline void checkEmptyArenaLists();
+  inline void checkEmptyFreeList(AllocKind kind);
+
+  void checkEmptyArenaList(AllocKind kind);
+
+  bool relocateArenas(Arena*& relocatedListOut, JS::GCReason reason,
+                      JS::SliceBudget& sliceBudget, gcstats::Statistics& stats);
+
+  void queueForegroundObjectsForSweep(JS::GCContext* gcx);
+  void queueForegroundThingsForSweep();
+
+  bool foregroundFinalize(JS::GCContext* gcx, AllocKind thingKind,
+                          JS::SliceBudget& sliceBudget,
+                          SortedArenaList& sweepList);
+  template <ReleaseEmpty releaseEmpty>
+  void backgroundFinalize(JS::GCContext* gcx, AllocKind kind,
+                          Arena** empty = nullptr);
+
+  Arena* takeSweptEmptyArenas();
+
+  void mergeBackgroundSweptArenas();
+  void maybeMergeSweptArenas(AllocKind thingKind);
+  void mergeSweptArenas(AllocKind thingKind, ArenaList& sweptArenas);
+
+  void moveArenasToCollectingLists();
+  void mergeArenasFromCollectingLists();
+
+  void checkGCStateNotInUse();
+  void checkSweepStateNotInUse();
+  void checkNoArenasToUpdate();
+  void checkNoArenasToUpdateForKind(AllocKind kind);
+
+ private:
+  ArenaList& arenaList(AllocKind i) { return arenaLists_.ref()[i]; }
+  const ArenaList& arenaList(AllocKind i) const { return arenaLists_.ref()[i]; }
+
+  ArenaList& collectingArenaList(AllocKind i) {
+    return collectingArenaLists_.ref()[i];
+  }
+  const ArenaList& collectingArenaList(AllocKind i) const {
+    return collectingArenaLists_.ref()[i];
+  }
+
+  ConcurrentUseState& concurrentUse(AllocKind i) {
+    return concurrentUseState_.ref()[i];
+  }
+  ConcurrentUse concurrentUse(AllocKind i) const {
+    return concurrentUseState_.ref()[i];
+  }
+
+  inline JSRuntime* runtime();
+  inline JSRuntime* runtimeFromAnyThread();
+
+  void initBackgroundSweep(AllocKind thingKind);
+
+  void* refillFreeListAndAllocate(AllocKind thingKind,
+                                  ShouldCheckThresholds checkThresholds,
+                                  StallAndRetry stallAndRetry);
+
+  friend class ArenaIter;
+  friend class ArenaIterInGC;
+  friend class BackgroundUnmarkTask;
+  friend class GCRuntime;
+  friend class js::Nursery;
+  friend class TenuringTracer;
+};
+
+} 
+} 
+
+#endif /* gc_ArenaList_h */

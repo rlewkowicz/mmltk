@@ -1,0 +1,221 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsScanner.h"
+
+#include "mozilla/Encoding.h"
+#include "mozilla/UniquePtr.h"
+#include "nsDebug.h"
+#include "nsReadableUtils.h"
+#include "nsUTF8Utils.h"  // for LossyConvertEncoding
+#include "nsCRT.h"
+#include "nsParser.h"
+#include "nsCharsetSource.h"
+
+nsReadEndCondition::nsReadEndCondition(const char16_t* aTerminateChars)
+    : mChars(aTerminateChars),
+      mFilter(char16_t(~0))  
+{
+
+  const char16_t* current = aTerminateChars;
+  char16_t terminalChar = *current;
+  while (terminalChar) {
+    mFilter &= ~terminalChar;
+    ++current;
+    terminalChar = *current;
+  }
+}
+
+nsScanner::nsScanner(const nsAString& anHTMLString, bool aIncremental)
+    : mIncremental(aIncremental) {
+  MOZ_COUNT_CTOR(nsScanner);
+
+  AppendToBuffer(anHTMLString);
+  MOZ_ASSERT(mMarkPosition == mCurrentPosition);
+}
+
+nsScanner::nsScanner(nsIURI* aURI) : mURI(aURI), mIncremental(true) {
+  MOZ_COUNT_CTOR(nsScanner);
+
+  memset(&mCurrentPosition, 0, sizeof(mCurrentPosition));
+  mMarkPosition = mCurrentPosition;
+  mEndPosition = mCurrentPosition;
+
+  SetDocumentCharset(UTF_8_ENCODING, kCharsetFromDocTypeDefault);
+}
+
+nsresult nsScanner::SetDocumentCharset(NotNull<const Encoding*> aEncoding,
+                                       int32_t aSource) {
+  if (aSource < mCharsetSource)  
+    return NS_OK;
+
+  mCharsetSource = aSource;
+  nsCString charsetName;
+  aEncoding->Name(charsetName);
+  if (!mCharset.IsEmpty() && charsetName.Equals(mCharset)) {
+    return NS_OK;  
+  }
+
+
+  mCharset.Assign(charsetName);
+
+  mUnicodeDecoder = aEncoding->NewDecoderWithBOMRemoval();
+
+  return NS_OK;
+}
+
+nsScanner::~nsScanner() { MOZ_COUNT_DTOR(nsScanner); }
+
+void nsScanner::RewindToMark(void) {
+  if (mSlidingBuffer) {
+    mCurrentPosition = mMarkPosition;
+  }
+}
+
+int32_t nsScanner::Mark() {
+  int32_t distance = 0;
+  if (mSlidingBuffer) {
+    nsScannerIterator oldStart;
+    mSlidingBuffer->BeginReading(oldStart);
+
+    distance = Distance(oldStart, mCurrentPosition);
+
+    mSlidingBuffer->DiscardPrefix(mCurrentPosition);
+    mSlidingBuffer->BeginReading(mCurrentPosition);
+    mMarkPosition = mCurrentPosition;
+  }
+
+  return distance;
+}
+
+bool nsScanner::UngetReadable(const nsAString& aBuffer) {
+  if (!mSlidingBuffer) {
+    return false;
+  }
+
+  mSlidingBuffer->UngetReadable(aBuffer, mCurrentPosition);
+  mSlidingBuffer->BeginReading(
+      mCurrentPosition);  
+  mSlidingBuffer->EndReading(mEndPosition);
+
+  return true;
+}
+
+nsresult nsScanner::Append(const nsAString& aBuffer) {
+  if (!AppendToBuffer(aBuffer)) return NS_ERROR_OUT_OF_MEMORY;
+  return NS_OK;
+}
+
+nsresult nsScanner::Append(const char* aBuffer, uint32_t aLen) {
+  nsresult res = NS_OK;
+  if (mUnicodeDecoder) {
+    mozilla::CheckedInt<size_t> needed =
+        mUnicodeDecoder->MaxUTF16BufferLength(aLen);
+    if (!needed.isValid()) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    mozilla::CheckedInt<uint32_t> allocLen(
+        1);  
+    allocLen += needed.value();
+    if (!allocLen.isValid()) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    nsScannerString::Buffer* buffer =
+        nsScannerString::AllocBuffer(allocLen.value());
+    NS_ENSURE_TRUE(buffer, NS_ERROR_OUT_OF_MEMORY);
+    char16_t* unichars = buffer->DataStart();
+
+    uint32_t result;
+    size_t read;
+    size_t written;
+    std::tie(result, read, written) =
+        mUnicodeDecoder->DecodeToUTF16WithoutReplacement(
+            AsBytes(mozilla::Span(aBuffer, aLen)),
+            mozilla::Span(unichars, needed.value()),
+            false);  
+    MOZ_ASSERT(result != mozilla::kOutputFull);
+    MOZ_ASSERT(read <= aLen);
+    MOZ_ASSERT(written <= needed.value());
+    if (result != mozilla::kInputEmpty) {
+      unichars[written++] = 0xFFFF;
+    }
+    buffer->SetDataLength(written);
+    res = NS_OK;
+    AppendToBuffer(buffer);
+  } else {
+    NS_WARNING("No decoder found.");
+    res = NS_ERROR_FAILURE;
+  }
+
+  return res;
+}
+
+nsresult nsScanner::GetChar(char16_t& aChar) {
+  if (!mSlidingBuffer || mCurrentPosition == mEndPosition) {
+    aChar = 0;
+    return NS_ERROR_HTMLPARSER_EOF;
+  }
+
+  aChar = *mCurrentPosition++;
+
+  return NS_OK;
+}
+
+void nsScanner::BindSubstring(nsScannerSubstring& aSubstring,
+                              const nsScannerIterator& aStart,
+                              const nsScannerIterator& aEnd) {
+  aSubstring.Rebind(*mSlidingBuffer, aStart, aEnd);
+}
+
+void nsScanner::CurrentPosition(nsScannerIterator& aPosition) {
+  aPosition = mCurrentPosition;
+}
+
+void nsScanner::EndReading(nsScannerIterator& aPosition) {
+  aPosition = mEndPosition;
+}
+
+void nsScanner::SetPosition(nsScannerIterator& aPosition, bool aTerminate) {
+  if (mSlidingBuffer) {
+    mCurrentPosition = aPosition;
+    if (aTerminate && (mCurrentPosition == mEndPosition)) {
+      mMarkPosition = mCurrentPosition;
+      mSlidingBuffer->DiscardPrefix(mCurrentPosition);
+    }
+  }
+}
+
+void nsScanner::AppendToBuffer(nsScannerString::Buffer* aBuf) {
+  if (!mSlidingBuffer) {
+    mSlidingBuffer = mozilla::MakeUnique<nsScannerString>(aBuf);
+    mSlidingBuffer->BeginReading(mCurrentPosition);
+    mMarkPosition = mCurrentPosition;
+  } else {
+    mSlidingBuffer->AppendBuffer(aBuf);
+    if (mCurrentPosition == mEndPosition) {
+      mSlidingBuffer->BeginReading(mCurrentPosition);
+    }
+  }
+  mSlidingBuffer->EndReading(mEndPosition);
+}
+
+bool nsScanner::CopyUnusedData(nsString& aCopyBuffer) {
+  if (!mSlidingBuffer) {
+    aCopyBuffer.Truncate();
+    return true;
+  }
+
+  nsScannerIterator start, end;
+  start = mCurrentPosition;
+  end = mEndPosition;
+
+  return CopyUnicodeTo(start, end, aCopyBuffer);
+}
+
+
+void nsScanner::SelfTest(void) {
+#ifdef _DEBUG
+#endif
+}

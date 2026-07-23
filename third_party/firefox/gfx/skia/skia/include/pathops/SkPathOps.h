@@ -1,0 +1,90 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+#if !defined(SkPathOps_DEFINED)
+#define SkPathOps_DEFINED
+
+#include "include/core/SkPath.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkTArray.h"
+#include "include/private/base/SkTDArray.h"
+
+#include <optional>
+
+struct SkRect;
+
+enum SkPathOp {
+    kDifference_SkPathOp,         
+    kIntersect_SkPathOp,          
+    kUnion_SkPathOp,              
+    kXOR_SkPathOp,                
+    kReverseDifference_SkPathOp,  
+};
+
+std::optional<SkPath> SK_API Op(const SkPath& one, const SkPath& two, SkPathOp op);
+
+static inline bool Op(const SkPath& one, const SkPath& two, SkPathOp op, SkPath* result) {
+    if (auto res = Op(one, two, op)) {
+        *result = *res;
+        return true;
+    }
+    return false;
+}
+
+std::optional<SkPath> SK_API Simplify(const SkPath& path);
+
+static inline bool Simplify(const SkPath& path, SkPath* result) {
+    if (auto res = Simplify(path)) {
+        *result = *res;
+        return true;
+    }
+    return false;
+}
+
+[[deprecated]]
+static inline bool TightBounds(const SkPath& path, SkRect* result) {
+    auto rect = path.computeTightBounds();
+    if (rect.isFinite()) {
+        *result = rect;
+        return true;
+    }
+    return false;
+}
+
+std::optional<SkPath> SK_API AsWinding(const SkPath& path);
+
+static inline bool AsWinding(const SkPath& path, SkPath* result) {
+    if (auto res = AsWinding(path)) {
+        *result = *res;
+        return true;
+    }
+    return false;
+}
+
+class SK_API SkOpBuilder {
+public:
+    void add(const SkPath& path, SkPathOp _operator);
+
+    std::optional<SkPath> resolve();
+
+    bool resolve(SkPath* result) {
+        if (auto res = this->resolve()) {
+            *result = *res;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    skia_private::TArray<SkPath> fPathRefs;
+    SkTDArray<SkPathOp> fOps;
+
+    static bool FixWinding(SkPath* path);
+    static void ReversePath(SkPath* path);
+    void reset();
+};
+
+#endif

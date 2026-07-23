@@ -1,0 +1,160 @@
+/*
+ * Copyright 2018 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkContourMeasure_DEFINED)
+#define SkContourMeasure_DEFINED
+
+#include "include/core/SkPathTypes.h" // IWYU pragma: keep
+#include "include/core/SkPoint.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkSpan.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkTDArray.h"
+
+#include <cstddef>
+#include <memory>
+
+class SkMatrix;
+class SkPath;
+class SkPathBuilder;
+
+class SK_API SkContourMeasure : public SkRefCnt {
+public:
+    SkScalar length() const { return fLength; }
+
+    [[nodiscard]] bool getPosTan(SkScalar distance, SkPoint* position, SkVector* tangent) const;
+
+    enum MatrixFlags {
+        kGetPosition_MatrixFlag     = 0x01,
+        kGetTangent_MatrixFlag      = 0x02,
+        kGetPosAndTan_MatrixFlag    = kGetPosition_MatrixFlag | kGetTangent_MatrixFlag
+    };
+
+    [[nodiscard]] bool getMatrix(SkScalar distance, SkMatrix* matrix,
+                                 MatrixFlags flags = kGetPosAndTan_MatrixFlag) const;
+
+    [[nodiscard]] bool getSegment(SkScalar startD, SkScalar stopD, SkPathBuilder* dst,
+                                  bool startWithMoveTo) const;
+
+    bool isClosed() const { return fIsClosed; }
+
+    struct VerbMeasure {
+        SkScalar              fDistance; 
+        SkPathVerb            fVerb;     
+        SkSpan<const SkPoint> fPts;      
+    };
+
+private:
+    struct Segment;
+
+public:
+    class ForwardVerbIterator final {
+    public:
+        VerbMeasure operator*() const;
+
+        ForwardVerbIterator& operator++() {
+            SkASSERT(!fSegments.empty());
+
+            fSegments = LastSegForCurrentVerb(fSegments.subspan(1));
+
+            return *this;
+        }
+
+        bool operator==(const ForwardVerbIterator& other) const {
+            SkASSERT(fSegments.data() != other.fSegments.data() ||
+                     fSegments.size() == other.fSegments.size());
+            return fSegments.data() == other.fSegments.data();
+        }
+
+        bool operator!=(const ForwardVerbIterator& other) const {
+            return !((*this) == other);
+        }
+
+    private:
+        friend class SkContourMeasure;
+
+        ForwardVerbIterator(SkSpan<const Segment> segs, SkSpan<const SkPoint> pts)
+            : fSegments(LastSegForCurrentVerb(segs))
+            , fPts(pts) {}
+
+        static SkSpan<const Segment> LastSegForCurrentVerb(const SkSpan<const Segment>& segs) {
+            size_t i = 1;
+            while (i < segs.size() && segs[0].fPtIndex == segs[i].fPtIndex) {
+                ++i;
+            }
+
+            return segs.subspan(i - 1);
+        }
+
+        SkSpan<const Segment> fSegments;
+
+        SkSpan<const SkPoint> fPts;
+    };
+
+    ForwardVerbIterator begin() const {
+        return ForwardVerbIterator(fSegments, fPts);
+    }
+    ForwardVerbIterator end() const {
+        return ForwardVerbIterator(SkSpan(fSegments.end(), 0), fPts);
+    }
+
+private:
+    struct Segment {
+        SkScalar    fDistance;  
+        unsigned    fPtIndex; 
+        unsigned    fTValue : 30;
+        unsigned    fType : 2;  
+
+        SkScalar getScalarT() const;
+
+        static const Segment* Next(const Segment* seg) {
+            unsigned ptIndex = seg->fPtIndex;
+            do {
+                ++seg;
+            } while (seg->fPtIndex == ptIndex);
+            return seg;
+        }
+
+    };
+
+    const SkTDArray<Segment>  fSegments;
+    const SkTDArray<SkPoint>  fPts; 
+
+    const SkScalar fLength;
+    const bool fIsClosed;
+
+    SkContourMeasure(SkTDArray<Segment>&& segs, SkTDArray<SkPoint>&& pts,
+                     SkScalar length, bool isClosed);
+    ~SkContourMeasure() override {}
+
+    const Segment* distanceToSegment(SkScalar distance, SkScalar* t) const;
+
+    friend class SkContourMeasureIter;
+    friend class SkPathMeasurePriv;
+};
+
+class SK_API SkContourMeasureIter {
+public:
+    SkContourMeasureIter();
+    SkContourMeasureIter(const SkPath& path, bool forceClosed, SkScalar resScale = 1);
+    ~SkContourMeasureIter();
+
+    SkContourMeasureIter(SkContourMeasureIter&&);
+    SkContourMeasureIter& operator=(SkContourMeasureIter&&);
+
+    void reset(const SkPath& path, bool forceClosed, SkScalar resScale = 1);
+
+    sk_sp<SkContourMeasure> next();
+
+private:
+    class Impl;
+
+    std::unique_ptr<Impl> fImpl;
+};
+
+#endif

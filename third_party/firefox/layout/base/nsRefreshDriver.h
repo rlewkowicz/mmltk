@@ -1,0 +1,388 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsRefreshDriver_h_
+#define nsRefreshDriver_h_
+#include "LayersTypes.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/FlushType.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/RenderingPhase.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/layers/TransactionIdAllocator.h"
+#include "nsClassHashtable.h"
+#include "nsHashKeys.h"
+#include "nsRefreshObservers.h"
+#include "nsTArray.h"
+#include "nsTHashSet.h"
+#include "nsTObserverArray.h"
+#include "nsThreadUtils.h"
+
+class nsPresContext;
+
+class imgIRequest;
+class nsIRunnable;
+
+struct DocumentFrameCallbacks;
+
+namespace mozilla {
+class AnimationEventDispatcher;
+class PresShell;
+class RefreshDriverTimer;
+class Runnable;
+class Task;
+
+namespace dom {
+class Document;
+}
+
+}  
+
+class nsRefreshDriver final : public mozilla::layers::TransactionIdAllocator,
+                              public nsARefreshObserver {
+  using Document = mozilla::dom::Document;
+  using TransactionId = mozilla::layers::TransactionId;
+  using LogPresShellObserver = mozilla::LogPresShellObserver;
+
+ public:
+  explicit nsRefreshDriver(nsPresContext* aPresContext);
+  ~nsRefreshDriver();
+
+  void AdvanceTimeAndRefresh(int64_t aMilliseconds);
+  void RestoreNormalRefresh();
+  void DoTick();
+  bool IsTestControllingRefreshesEnabled() const {
+    return mTestControllingRefreshes;
+  }
+
+  mozilla::TimeStamp MostRecentRefresh() const { return mMostRecentRefresh; }
+
+  void AddRefreshObserver(nsARefreshObserver* aObserver,
+                          mozilla::FlushType aFlushType,
+                          const char* aObserverDescription);
+  bool RemoveRefreshObserver(nsARefreshObserver* aObserver,
+                             mozilla::FlushType aFlushType);
+
+  MOZ_CAN_RUN_SCRIPT void FlushLayoutOnPendingDocsAndFixUpFocus();
+
+  void AddPostRefreshObserver(nsAPostRefreshObserver* aObserver);
+  void AddPostRefreshObserver(mozilla::ManagedPostRefreshObserver*) = delete;
+  void RemovePostRefreshObserver(nsAPostRefreshObserver* aObserver);
+  void RemovePostRefreshObserver(mozilla::ManagedPostRefreshObserver*) = delete;
+
+  void AddImageRequest(imgIRequest* aRequest);
+  void RemoveImageRequest(imgIRequest* aRequest);
+  void StartTimerForAnimatedImagesIfNeeded();
+  void StopTimerForAnimatedImagesIfNeeded();
+
+  void EnterUserInputProcessing() { mUserInputProcessingCount++; }
+  void ExitUserInputProcessing() {
+    MOZ_ASSERT(mUserInputProcessingCount > 0);
+    mUserInputProcessingCount--;
+  }
+
+  void AddEarlyRunner(nsIRunnable* aRunnable) {
+    mEarlyRunners.AppendElement(aRunnable);
+    EnsureTimerStarted();
+  }
+
+  void SchedulePaint();
+  bool IsPaintPending() const {
+    return mRenderingPhasesNeeded.contains(mozilla::RenderingPhase::Paint);
+  }
+
+  MOZ_CAN_RUN_SCRIPT bool PaintIfNeeded();
+
+  void ScheduleFrameVisibilityUpdate() { mNeedToRecomputeVisibility = true; }
+
+  void Disconnect();
+
+  bool IsFrozen() const { return mFreezeCount > 0; }
+
+  bool IsThrottled() const { return mThrottled; }
+
+  void Freeze();
+
+  void Thaw();
+
+  void SetActivity(bool aIsActive);
+
+  nsPresContext* GetPresContext() const;
+
+  void CreateVsyncRefreshTimer();
+
+#ifdef DEBUG
+  bool IsRefreshObserver(nsARefreshObserver* aObserver,
+                         mozilla::FlushType aFlushType);
+#endif
+
+  static int32_t DefaultInterval();
+
+  static double HighRateMultiplier();
+
+  bool IsInRefresh() { return mInRefresh; }
+
+  void SetIsResizeSuppressed() { mResizeSuppressed = true; }
+  bool IsResizeSuppressed() const { return mResizeSuppressed; }
+
+  TransactionId GetTransactionId(bool aThrottle) override;
+  TransactionId LastTransactionId() const override;
+  void NotifyTransactionCompleted(TransactionId aTransactionId) override;
+  void RevokeTransactionId(TransactionId aTransactionId) override;
+  void ClearPendingTransactions() override;
+  void ResetInitialTransactionId(TransactionId aTransactionId) override;
+  mozilla::TimeStamp GetTransactionStart() override;
+  mozilla::VsyncId GetVsyncId() override;
+  mozilla::TimeStamp GetVsyncStart() override;
+
+  bool IsWaitingForPaint(mozilla::TimeStamp aTime);
+  void ScheduleAutoFocusFlush() {
+    ScheduleRenderingPhase(mozilla::RenderingPhase::FlushAutoFocusCandidates);
+  }
+
+  NS_IMETHOD_(MozExternalRefCountType) AddRef(void) override {
+    return TransactionIdAllocator::AddRef();
+  }
+  NS_IMETHOD_(MozExternalRefCountType) Release(void) override {
+    return TransactionIdAllocator::Release();
+  }
+  virtual void WillRefresh(mozilla::TimeStamp aTime) override;
+
+  enum IdleCheck { OnlyThisProcessRefreshDriver, AllVsyncListeners };
+  static mozilla::TimeStamp GetIdleDeadlineHint(mozilla::TimeStamp aDefault,
+                                                IdleCheck aCheckType);
+
+  static mozilla::Maybe<mozilla::TimeStamp> GetNextTickHint();
+
+  static bool IsRegularRateTimerTicking();
+
+  static void DispatchIdleTaskAfterTickUnlessExists(mozilla::Task* aTask);
+  static void CancelIdleTask(mozilla::Task* aTask);
+
+  void InitializeTimer() {
+    MOZ_ASSERT(!mActiveTimer);
+    EnsureTimerStarted();
+  }
+
+  bool HasPendingTick() const { return mActiveTimer; }
+
+  void ScheduleRenderingPhases(mozilla::RenderingPhases aPhases) {
+    mRenderingPhasesNeeded += aPhases;
+    EnsureTimerStarted();
+  }
+
+  void ScheduleRenderingPhase(mozilla::RenderingPhase aPhase) {
+    ScheduleRenderingPhases({aPhase});
+  }
+
+  void EnsureIntersectionObservationsUpdateHappens() {
+    ScheduleRenderingPhase(
+        mozilla::RenderingPhase::UpdateIntersectionObservations);
+  }
+
+  void EnsureViewTransitionOperationsHappen() {
+    ScheduleRenderingPhase(mozilla::RenderingPhase::ViewTransitionOperations);
+  }
+
+  void EnsureAnimationUpdate() {
+    ScheduleRenderingPhase(
+        mozilla::RenderingPhase::UpdateAnimationsAndSendEvents);
+  }
+
+  void ScheduleMediaQueryListenerUpdate() {
+    ScheduleRenderingPhase(
+        mozilla::RenderingPhase::EvaluateMediaQueriesAndReportChanges);
+  }
+
+  void RegisterCompositionPayload(
+      const mozilla::layers::CompositionPayload& aPayload);
+
+  enum class TickReasons : uint32_t {
+    None = 0,
+    HasObservers = 1 << 0,
+    HasImageAnimations = 1 << 1,
+    HasPendingRenderingSteps = 1 << 2,
+    RootNeedsMoreTicksForUserInput = 1 << 3,
+  };
+
+  void AddForceNotifyContentfulPaintPresContext(nsPresContext* aPresContext);
+  void FlushForceNotifyContentfulPaintPresContext();
+
+  void FinishedVsyncTick() { mAttemptedExtraTickSinceLastVsync = false; }
+
+  bool HasReasonsToTick() const;
+
+ private:
+  using RequestTable = nsTHashSet<RefPtr<imgIRequest>>;
+  struct ImageStartData {
+    ImageStartData() = default;
+
+    mozilla::Maybe<mozilla::TimeStamp> mStartTime;
+    RequestTable mEntries;
+  };
+  using ImageStartTable = nsClassHashtable<nsUint32HashKey, ImageStartData>;
+
+  struct ObserverData {
+    nsARefreshObserver* mObserver;
+    const char* mDescription;
+    mozilla::TimeStamp mRegisterTime;
+    mozilla::FlushType mFlushType;
+
+    bool operator==(nsARefreshObserver* aObserver) const {
+      return mObserver == aObserver;
+    }
+    operator RefPtr<nsARefreshObserver>() { return mObserver; }
+  };
+  using ObserverArray = nsTObserverArray<ObserverData>;
+  void RunFullscreenSteps();
+
+  MOZ_CAN_RUN_SCRIPT
+  void RunVideoAndFrameRequestCallbacks(mozilla::TimeStamp aNowTime);
+  MOZ_CAN_RUN_SCRIPT
+  void RunVideoFrameCallbacks(const nsTArray<RefPtr<Document>>&,
+                              mozilla::TimeStamp aNowTime);
+  MOZ_CAN_RUN_SCRIPT
+  void RunFrameRequestCallbacks(const nsTArray<RefPtr<Document>>&,
+                                mozilla::TimeStamp aNowTime);
+  void UpdateRemoteFrameEffects();
+  void UpdateRelevancyOfContentVisibilityAutoFrames();
+  MOZ_CAN_RUN_SCRIPT void PerformPendingViewTransitionOperations();
+  void MaybeIncreaseMeasuredTicksSinceLoading();
+  void EvaluateMediaQueriesAndReportChanges();
+
+  enum class IsExtraTick {
+    No,
+    Yes,
+  };
+
+  MOZ_CAN_RUN_SCRIPT
+  bool TickObserverArray(uint32_t aIdx, mozilla::TimeStamp aNowTime);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void Tick(mozilla::VsyncId aId, mozilla::TimeStamp aNowTime,
+            IsExtraTick aIsExtraTick = IsExtraTick::No);
+
+  enum EnsureTimerStartedFlags {
+    eNone = 0,
+    eForceAdjustTimer = 1 << 0,
+    eAllowTimeToGoBackwards = 1 << 1,
+  };
+  void EnsureTimerStarted(EnsureTimerStartedFlags aFlags = eNone);
+  void StopTimer();
+
+  void UpdateThrottledState();
+
+  bool HasObservers() const;
+  void AppendObserverDescriptionsToString(nsACString& aStr) const;
+  uint32_t ObserverCount() const;
+  bool ComputeHasImageAnimations() const;
+  bool ShouldKeepTimerRunningWhileWaitingForFirstContentfulPaint();
+  bool ShouldKeepTimerRunningAfterPageLoad();
+  ObserverArray& ArrayFor(mozilla::FlushType aFlushType);
+  void DoRefresh();
+
+  void UpdateAnimatedImages(mozilla::TimeStamp aPreviousRefresh,
+                            mozilla::TimeStamp aNowTime);
+
+  TickReasons GetReasonsToTick() const;
+  void AppendTickReasonsToString(TickReasons aReasons, nsACString& aStr) const;
+
+  double GetRegularTimerInterval() const;
+  static double GetThrottledTimerInterval();
+
+  static mozilla::TimeDuration GetMinRecomputeVisibilityInterval();
+
+  void FinishedWaitingForTransaction();
+
+  bool CanDoCatchUpTick();
+  bool CanDoExtraTick();
+
+  bool AtPendingTransactionLimit() {
+    return mPendingTransactions.Length() == 2;
+  }
+  bool TooManyPendingTransactions() {
+    return mPendingTransactions.Length() >= 2;
+  }
+
+  mozilla::RefreshDriverTimer* ChooseTimer();
+  mozilla::RefreshDriverTimer* mActiveTimer;
+  RefPtr<mozilla::RefreshDriverTimer> mOwnTimer;
+  mozilla::WeakPtr<nsPresContext> mPresContext;
+
+  RefPtr<nsRefreshDriver> mRootRefresh;
+
+  TransactionId mNextTransactionId;
+  AutoTArray<TransactionId, 3> mPendingTransactions;
+
+  uint32_t mFreezeCount;
+  uint32_t mUserInputProcessingCount = 0;
+
+  const mozilla::TimeDuration mThrottledFrameRequestInterval;
+
+  const mozilla::TimeDuration mMinRecomputeVisibilityInterval;
+
+  bool mThrottled : 1;
+  bool mNeedToRecomputeVisibility : 1;
+  bool mTestControllingRefreshes : 1;
+  bool mInRefresh : 1;
+
+  bool mWaitingForTransaction : 1;
+  bool mSkippedPaints : 1;
+
+  bool mResizeSuppressed : 1;
+
+  bool mNeedToRunFrameRequestCallbacks : 1;
+
+  bool mInNormalTick : 1;
+
+  bool mAttemptedExtraTickSinceLastVsync : 1;
+
+  bool mHasExceededAfterLoadTickPeriod : 1;
+
+  bool mHasImageAnimations : 1;
+
+  bool mHasStartedTimerAtLeastOnce : 1;
+
+  mozilla::TimeStamp mMostRecentRefresh;
+  mozilla::TimeStamp mTickStart;
+  mozilla::VsyncId mTickVsyncId;
+  mozilla::TimeStamp mTickVsyncTime;
+  mozilla::TimeStamp mNextThrottledFrameRequestTick;
+  mozilla::TimeStamp mNextRecomputeVisibilityTick;
+  mozilla::TimeStamp mBeforeFirstContentfulPaintTimerRunningLimit;
+
+  mozilla::EnumSet<mozilla::RenderingPhase, uint16_t> mRenderingPhasesNeeded;
+
+  template <typename Callback>
+  MOZ_CAN_RUN_SCRIPT void RunRenderingPhaseLegacy(mozilla::RenderingPhase,
+                                                  Callback&&);
+
+  using DocFilter = bool (*)(const Document&);
+
+  template <typename Callback>
+  MOZ_CAN_RUN_SCRIPT void RunRenderingPhase(mozilla::RenderingPhase, Callback&&,
+                                            DocFilter = nullptr);
+
+  ObserverArray mObservers[3];
+  nsTArray<mozilla::layers::CompositionPayload> mCompositionPayloads;
+  RequestTable mRequests;
+  ImageStartTable mStartTable;
+  AutoTArray<nsCOMPtr<nsIRunnable>, 16> mEarlyRunners;
+  nsTObserverArray<nsAPostRefreshObserver*> mPostRefreshObservers;
+
+  nsTArray<mozilla::WeakPtr<nsPresContext>>
+      mForceNotifyContentfulPaintPresContexts;
+
+  void BeginRefreshingImages(RequestTable& aEntries,
+                             mozilla::TimeStamp aDesired);
+
+  friend class mozilla::RefreshDriverTimer;
+
+  static void Shutdown();
+};
+
+#endif /* !defined(nsRefreshDriver_h_) */

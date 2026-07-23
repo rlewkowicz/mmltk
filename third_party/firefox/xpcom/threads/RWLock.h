@@ -1,0 +1,196 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_RWLock_h
+#define mozilla_RWLock_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/BlockingResourceBase.h"
+#include "mozilla/PlatformRWLock.h"
+#include "mozilla/ThreadSafety.h"
+
+namespace mozilla {
+
+class MOZ_CAPABILITY("rwlock") RWLock : public detail::RWLockImpl,
+                                        public BlockingResourceBase {
+ public:
+  explicit RWLock(const char* aName);
+
+#ifdef DEBUG
+  bool LockedForWritingByCurrentThread();
+  [[nodiscard]] bool TryReadLock() MOZ_SHARED_TRYLOCK_FUNCTION(true);
+  void ReadLock() MOZ_ACQUIRE_SHARED();
+  void ReadUnlock() MOZ_RELEASE_SHARED();
+  [[nodiscard]] bool TryWriteLock() MOZ_TRY_ACQUIRE(true);
+  void WriteLock() MOZ_CAPABILITY_ACQUIRE();
+  void WriteUnlock() MOZ_EXCLUSIVE_RELEASE();
+#else
+  [[nodiscard]] bool TryReadLock() MOZ_SHARED_TRYLOCK_FUNCTION(true) {
+    return detail::RWLockImpl::tryReadLock();
+  }
+  void ReadLock() MOZ_ACQUIRE_SHARED() { detail::RWLockImpl::readLock(); }
+  void ReadUnlock() MOZ_RELEASE_SHARED() { detail::RWLockImpl::readUnlock(); }
+  [[nodiscard]] bool TryWriteLock() MOZ_TRY_ACQUIRE(true) {
+    return detail::RWLockImpl::tryWriteLock();
+  }
+  void WriteLock() MOZ_CAPABILITY_ACQUIRE() { detail::RWLockImpl::writeLock(); }
+  void WriteUnlock() MOZ_EXCLUSIVE_RELEASE() {
+    detail::RWLockImpl::writeUnlock();
+  }
+#endif
+
+ private:
+  RWLock() = delete;
+  RWLock(const RWLock&) = delete;
+  RWLock& operator=(const RWLock&) = delete;
+
+#ifdef DEBUG
+  PRThread* mOwningThread;
+#endif
+};
+
+template <typename T>
+class MOZ_RAII BaseAutoTryReadLock {
+ public:
+  explicit BaseAutoTryReadLock(T& aLock)
+      : mLock(aLock.TryReadLock() ? &aLock : nullptr) {}
+
+  ~BaseAutoTryReadLock() {
+    if (mLock) {
+      mLock->ReadUnlock();
+    }
+  }
+
+  explicit operator bool() const { return mLock; }
+
+ private:
+  BaseAutoTryReadLock() = delete;
+  BaseAutoTryReadLock(const BaseAutoTryReadLock&) = delete;
+  BaseAutoTryReadLock& operator=(const BaseAutoTryReadLock&) = delete;
+
+  T* mLock;
+};
+
+template <typename T>
+class MOZ_SCOPED_CAPABILITY MOZ_RAII BaseAutoReadLock {
+ public:
+  explicit BaseAutoReadLock(T& aLock) MOZ_ACQUIRE_SHARED(aLock)
+      : mLock(&aLock) {
+    MOZ_ASSERT(mLock, "null lock");
+    mLock->ReadLock();
+  }
+
+  ~BaseAutoReadLock() MOZ_RELEASE_GENERIC() { mLock->ReadUnlock(); }
+
+ private:
+  BaseAutoReadLock() = delete;
+  BaseAutoReadLock(const BaseAutoReadLock&) = delete;
+  BaseAutoReadLock& operator=(const BaseAutoReadLock&) = delete;
+
+  T* mLock;
+};
+
+template <typename T>
+class MOZ_RAII BaseAutoTryWriteLock {
+ public:
+  explicit BaseAutoTryWriteLock(T& aLock)
+      : mLock(aLock.TryWriteLock() ? &aLock : nullptr) {}
+
+  ~BaseAutoTryWriteLock() {
+    if (mLock) {
+      mLock->WriteUnlock();
+    }
+  }
+
+  explicit operator bool() const { return mLock; }
+
+ private:
+  BaseAutoTryWriteLock() = delete;
+  BaseAutoTryWriteLock(const BaseAutoTryWriteLock&) = delete;
+  BaseAutoTryWriteLock& operator=(const BaseAutoTryWriteLock&) = delete;
+
+  T* mLock;
+};
+
+template <typename T>
+class MOZ_SCOPED_CAPABILITY MOZ_RAII BaseAutoWriteLock final {
+ public:
+  explicit BaseAutoWriteLock(T& aLock) MOZ_CAPABILITY_ACQUIRE(aLock)
+      : mLock(&aLock) {
+    MOZ_ASSERT(mLock, "null lock");
+    mLock->WriteLock();
+  }
+
+  ~BaseAutoWriteLock() MOZ_CAPABILITY_RELEASE() { mLock->WriteUnlock(); }
+
+ private:
+  BaseAutoWriteLock() = delete;
+  BaseAutoWriteLock(const BaseAutoWriteLock&) = delete;
+  BaseAutoWriteLock& operator=(const BaseAutoWriteLock&) = delete;
+
+  T* mLock;
+};
+
+typedef BaseAutoTryReadLock<RWLock> AutoTryReadLock;
+
+typedef BaseAutoReadLock<RWLock> AutoReadLock;
+
+typedef BaseAutoTryWriteLock<RWLock> AutoTryWriteLock;
+
+typedef BaseAutoWriteLock<RWLock> AutoWriteLock;
+
+class MOZ_ONLY_USED_TO_AVOID_STATIC_CONSTRUCTORS MOZ_CAPABILITY("rwlock")
+    StaticRWLock {
+ public:
+#ifdef DEBUG
+  StaticRWLock() { MOZ_ASSERT(!mLock); }
+#endif
+
+  [[nodiscard]] bool TryReadLock() MOZ_SHARED_TRYLOCK_FUNCTION(true) {
+    return Lock()->TryReadLock();
+  }
+  void ReadLock() MOZ_ACQUIRE_SHARED() { Lock()->ReadLock(); }
+  void ReadUnlock() MOZ_RELEASE_SHARED() { Lock()->ReadUnlock(); }
+  [[nodiscard]] bool TryWriteLock() MOZ_TRY_ACQUIRE(true) {
+    return Lock()->TryWriteLock();
+  }
+  void WriteLock() MOZ_CAPABILITY_ACQUIRE() { Lock()->WriteLock(); }
+  void WriteUnlock() MOZ_EXCLUSIVE_RELEASE() { Lock()->WriteUnlock(); }
+
+ private:
+  [[nodiscard]] RWLock* Lock() MOZ_RETURN_CAPABILITY(*mLock) {
+    if (mLock) {
+      return mLock;
+    }
+
+    RWLock* lock = new RWLock("StaticRWLock");
+    if (!mLock.compareExchange(nullptr, lock)) {
+      delete lock;
+    }
+
+    return mLock;
+  }
+
+  Atomic<RWLock*> mLock;
+
+#ifdef DEBUG
+  StaticRWLock(const StaticRWLock& aOther);
+#endif
+
+  StaticRWLock& operator=(StaticRWLock* aRhs) = delete;
+  static void* operator new(size_t) noexcept(true) = delete;
+  static void operator delete(void*) = delete;
+};
+
+typedef BaseAutoTryReadLock<StaticRWLock> StaticAutoTryReadLock;
+typedef BaseAutoReadLock<StaticRWLock> StaticAutoReadLock;
+typedef BaseAutoTryWriteLock<StaticRWLock> StaticAutoTryWriteLock;
+typedef BaseAutoWriteLock<StaticRWLock> StaticAutoWriteLock;
+
+}  
+
+#endif  // mozilla_RWLock_h

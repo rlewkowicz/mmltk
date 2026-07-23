@@ -1,0 +1,79 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsISupportsUtils_h_
+#define nsISupportsUtils_h_
+
+#include <type_traits>
+
+#include "nscore.h"
+#include "nsIOutputStream.h"
+#include "nsISupports.h"
+#include "nsError.h"
+#include "nsDebug.h"
+#include "nsISupportsImpl.h"
+#include "mozilla/RefPtr.h"
+
+#define NS_ADDREF(_ptr) (_ptr)->AddRef()
+
+#define NS_ADDREF_THIS() AddRef()
+
+template <class T>
+inline void ns_if_addref(T aExpr) {
+  if (aExpr) {
+    aExpr->AddRef();
+  }
+}
+
+#define NS_IF_ADDREF(_expr) ns_if_addref(_expr)
+
+
+#define NS_RELEASE(_ptr) \
+  do {                   \
+    (_ptr)->Release();   \
+    (_ptr) = 0;          \
+  } while (0)
+
+#define NS_RELEASE_THIS() Release()
+
+#define NS_RELEASE2(_ptr, _rc)  \
+  do {                          \
+    _rc = (_ptr)->Release();    \
+    if (0 == (_rc)) (_ptr) = 0; \
+  } while (0)
+
+#define NS_IF_RELEASE(_ptr) \
+  do {                      \
+    if (_ptr) {             \
+      (_ptr)->Release();    \
+      (_ptr) = 0;           \
+    }                       \
+  } while (0)
+
+
+#define NS_ISUPPORTS_CAST(__unambiguousBase, __expr) \
+  static_cast<nsISupports*>(static_cast<__unambiguousBase>(__expr))
+
+template <class T, class DestinationType>
+inline nsresult CallQueryInterface(T* aSource, DestinationType** aDestination) {
+  static_assert(
+      !(std::is_same_v<DestinationType, T> ||
+        std::is_base_of<DestinationType, T>::value) ||
+          std::is_same_v<DestinationType, nsISupports>,
+      "don't use CallQueryInterface for compile-time-determinable casts");
+
+  MOZ_ASSERT(aSource, "null parameter");
+  MOZ_ASSERT(aDestination, "null parameter");
+
+  return aSource->QueryInterface(NS_GET_IID(DestinationType),
+                                 reinterpret_cast<void**>(aDestination));
+}
+
+template <class SourceType, class DestinationType>
+inline nsresult CallQueryInterface(RefPtr<SourceType>& aSourcePtr,
+                                   DestinationType** aDestPtr) {
+  return CallQueryInterface(aSourcePtr.get(), aDestPtr);
+}
+
+#endif /* __nsISupportsUtils_h */

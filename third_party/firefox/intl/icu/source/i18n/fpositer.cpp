@@ -1,0 +1,109 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+* Copyright (C) 2009-2012, International Business Machines Corporation and
+* others. All Rights Reserved.
+******************************************************************************
+*   Date        Name        Description
+*   12/14/09    doug        Creation.
+******************************************************************************
+*/
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/fpositer.h"
+#include "cmemory.h"
+#include "uvectr32.h"
+
+U_NAMESPACE_BEGIN
+
+FieldPositionIterator::~FieldPositionIterator() {
+  delete data;
+  data = nullptr;
+  pos = -1;
+}
+
+FieldPositionIterator::FieldPositionIterator()
+    : data(nullptr), pos(-1) {
+}
+
+FieldPositionIterator::FieldPositionIterator(const FieldPositionIterator &rhs)
+  : UObject(rhs), data(nullptr), pos(rhs.pos) {
+
+  if (rhs.data) {
+    UErrorCode status = U_ZERO_ERROR;
+    data = new UVector32(status);
+    data->assign(*rhs.data, status);
+    if (status != U_ZERO_ERROR) {
+      delete data;
+      data = nullptr;
+      pos = -1;
+    }
+  }
+}
+
+bool FieldPositionIterator::operator==(const FieldPositionIterator &rhs) const {
+  if (&rhs == this) {
+    return true;
+  }
+  if (pos != rhs.pos) {
+    return false;
+  }
+  if (!data) {
+    return rhs.data == nullptr;
+  }
+  return rhs.data ? data->operator==(*rhs.data) : false;
+}
+
+void FieldPositionIterator::setData(UVector32 *adopt, UErrorCode& status) {
+  if (U_SUCCESS(status)) {
+    if (adopt) {
+      if (adopt->size() == 0) {
+        delete adopt;
+        adopt = nullptr;
+      } else if ((adopt->size() % 4) != 0) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+      } else {
+        for (int i = 2; i < adopt->size(); i += 4) {
+          if (adopt->elementAti(i) >= adopt->elementAti(i+1)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  if (!U_SUCCESS(status)) {
+    delete adopt;
+    return;
+  }
+
+  delete data;
+  data = adopt;
+  pos = adopt == nullptr ? -1 : 0;
+}
+
+UBool FieldPositionIterator::next(FieldPosition& fp) {
+  if (pos == -1) {
+    return false;
+  }
+
+  pos++;
+  fp.setField(data->elementAti(pos++));
+  fp.setBeginIndex(data->elementAti(pos++));
+  fp.setEndIndex(data->elementAti(pos++));
+
+  if (pos == data->size()) {
+    pos = -1;
+  }
+
+  return true;
+}
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+

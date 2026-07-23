@@ -1,0 +1,75 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+
+#ifndef TouchManager_h_
+#define TouchManager_h_
+
+#include "Units.h"
+#include "mozilla/BasicEvents.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/TouchEvents.h"
+#include "mozilla/dom/Touch.h"
+#include "nsRefPtrHashtable.h"
+
+namespace mozilla {
+class PresShell;
+class TimeStamp;
+
+class TouchManager {
+ public:
+  static void InitializeStatics();
+  static void ReleaseStatics();
+
+  void Init(PresShell* aPresShell, dom::Document* aDocument);
+  void Destroy();
+
+  static nsIFrame* SetupTarget(WidgetTouchEvent* aEvent, nsIFrame* aFrame);
+
+  static nsIFrame* SuppressInvalidPointsAndGetTargetedFrame(
+      WidgetTouchEvent* aEvent);
+
+  bool PreHandleEvent(mozilla::WidgetEvent* aEvent, nsEventStatus* aStatus,
+                      bool& aTouchIsNew,
+                      nsCOMPtr<nsIContent>& aCurrentEventContent);
+  void PostHandleEvent(const mozilla::WidgetEvent* aEvent,
+                       const nsEventStatus* aStatus);
+
+  static already_AddRefed<nsIContent> GetAnyCapturedTouchTarget();
+  static bool HasCapturedTouch(int32_t aId);
+  static already_AddRefed<dom::Touch> GetCapturedTouch(int32_t aId);
+  static bool ShouldConvertTouchToPointer(const dom::Touch* aTouch,
+                                          const WidgetTouchEvent* aEvent);
+
+  static bool IsSingleTapEndToDoDefault(const WidgetTouchEvent* aTouchEndEvent);
+
+  static bool IsPrecedingTouchPointerDownConsumedByContent();
+
+ private:
+  void EvictTouches(dom::Document* aLimitToDocument = nullptr);
+  static void EvictTouchPoint(RefPtr<dom::Touch>& aTouch,
+                              dom::Document* aLimitToDocument);
+  static void AppendToTouchList(WidgetTouchEvent::TouchArrayBase* aTouchList);
+
+  RefPtr<PresShell> mPresShell;
+  RefPtr<dom::Document> mDocument;
+
+  struct TouchInfo {
+    RefPtr<mozilla::dom::Touch> mTouch;
+    nsCOMPtr<nsIContent> mNonAnonymousTarget;
+    bool mConvertToPointer;
+  };
+
+  static StaticAutoPtr<nsTHashMap<nsUint32HashKey, TouchInfo>>
+      sCaptureTouchList;
+  static layers::LayersId sCaptureTouchLayersId;
+  static TimeStamp sSingleTouchStartTimeStamp;
+  static LayoutDeviceIntPoint sSingleTouchStartPoint;
+  static bool sPrecedingTouchPointerDownConsumedByContent;
+};
+
+}  
+
+#endif /* !defined(TouchManager_h_) */

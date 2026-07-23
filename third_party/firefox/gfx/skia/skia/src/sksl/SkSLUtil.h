@@ -1,0 +1,152 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_UTIL)
+#define SKSL_UTIL
+
+#include "include/core/SkTypes.h"
+#include "include/sksl/SkSLVersion.h"
+#include "src/sksl/SkSLGLSL.h"
+
+#include <memory>
+
+enum class SkSLType : char;
+
+namespace SkSL {
+
+class Context;
+class OutputStream;
+class StringStream;
+class Type;
+
+struct ShaderCaps {
+    enum AdvBlendEqInteraction {
+        kNotSupported_AdvBlendEqInteraction,     
+        kAutomatic_AdvBlendEqInteraction,        
+        kGeneralEnable_AdvBlendEqInteraction,    
+
+        kLast_AdvBlendEqInteraction = kGeneralEnable_AdvBlendEqInteraction
+    };
+
+    bool mustEnableAdvBlendEqs() const {
+        return fAdvBlendEqInteraction >= kGeneralEnable_AdvBlendEqInteraction;
+    }
+
+    bool mustDeclareFragmentShaderOutput() const {
+        return fGLSLGeneration > SkSL::GLSLGeneration::k110;
+    }
+
+    const char* shaderDerivativeExtensionString() const {
+        SkASSERT(this->fShaderDerivativeSupport);
+        return fShaderDerivativeExtensionString;
+    }
+
+    const char* externalTextureExtensionString() const {
+        SkASSERT(this->fExternalTextureSupport);
+        return fExternalTextureExtensionString;
+    }
+
+    const char* secondExternalTextureExtensionString() const {
+        SkASSERT(this->fExternalTextureSupport);
+        return fSecondExternalTextureExtensionString;
+    }
+
+    SkSL::Version supportedSkSLVerion() const {
+        if (fShaderDerivativeSupport && fNonsquareMatrixSupport && fIntegerSupport &&
+            fGLSLGeneration >= SkSL::GLSLGeneration::k330) {
+            return SkSL::Version::k300;
+        }
+        return SkSL::Version::k100;
+    }
+
+    bool supportsDistanceFieldText() const { return fShaderDerivativeSupport; }
+
+    bool fFloatIs32Bits = true; 
+    SkSL::GLSLGeneration fGLSLGeneration = SkSL::GLSLGeneration::k330;
+    bool fFlatInterpolationSupport = false; 
+    bool fUsesPrecisionModifiers = false; 
+
+    bool fDualSourceBlendingSupport = false;
+    bool fShaderDerivativeSupport = false;
+    bool fExplicitTextureLodSupport = false;
+    bool fIntegerSupport = false;
+    bool fNonsquareMatrixSupport = false;
+    bool fInverseHyperbolicSupport = false;
+    bool fFBFetchSupport = false;
+    bool fFBFetchNeedsCustomOutput = false;
+    bool fNoPerspectiveInterpolationSupport = false;
+    bool fSampleMaskSupport = false;
+    bool fExternalTextureSupport = false;
+
+    bool fInfinitySupport = false;
+
+    bool fBuiltinFMASupport = true;
+    bool fBuiltinDeterminantSupport = true;
+
+    bool fCanUseVoidInSequenceExpressions = true;
+    bool fCanUseMinAndAbsTogether = true;
+    bool fCanUseFractForNegativeValues = true;
+    bool fMustForceNegatedAtanParamToFloat = false;
+    bool fMustForceNegatedLdexpParamToMultiply = false;  
+    bool fAtan2ImplementedAsAtanYOverX = false;
+    bool fMustDoOpBetweenFloorAndAbs = false;
+    bool fMustGuardDivisionEvenAfterExplicitZeroCheck = false;
+    bool fCanUseFragCoord = true;
+    bool fAddAndTrueToLoopCondition = false;
+    bool fUnfoldShortCircuitAsTernary = false;
+    bool fEmulateAbsIntFunction = false;
+    bool fRewriteDoWhileLoops = false;
+    bool fRewriteSwitchStatements = false;
+    bool fRemovePowWithConstantExponent = false;
+    bool fNoDefaultPrecisionForExternalSamplers = false;
+    bool fRewriteMatrixVectorMultiply = false;
+    bool fRewriteMatrixComparisons = false;
+    bool fRemoveConstFromFunctionParameters = false;
+    bool fPerlinNoiseRoundingFix = false;
+    bool fMustDeclareFragmentFrontFacing = false;
+    bool fForceStd430ArrayLayout = false;
+    bool fCannotUseRelaxedPrecisionOnImageSample = false;
+    bool fVectorClampMinMaxSupport = true;
+
+    const char* fVersionDeclString = "";
+
+    const char* fShaderDerivativeExtensionString = nullptr;
+    const char* fExternalTextureExtensionString = nullptr;
+    const char* fSecondExternalTextureExtensionString = nullptr;
+    const char* fFBFetchColorName = nullptr;
+
+    AdvBlendEqInteraction fAdvBlendEqInteraction = kNotSupported_AdvBlendEqInteraction;
+};
+
+class ShaderCapsFactory {
+public:
+    static const ShaderCaps* Default() {
+        static const SkSL::ShaderCaps* const sCaps = [] {
+            std::unique_ptr<ShaderCaps> caps = MakeShaderCaps();
+            caps->fVersionDeclString = "#version 400";
+            caps->fShaderDerivativeSupport = true;
+            return caps.release();
+        }();
+        return sCaps;
+    }
+
+    static const ShaderCaps* Standalone() {
+        static const SkSL::ShaderCaps* const sCaps = MakeShaderCaps().release();
+        return sCaps;
+    }
+
+protected:
+    static std::unique_ptr<ShaderCaps> MakeShaderCaps();
+};
+
+bool type_to_sksltype(const Context& context, const Type& type, SkSLType* outType);
+
+void write_stringstream(const StringStream& d, OutputStream& out);
+
+}  
+
+#endif

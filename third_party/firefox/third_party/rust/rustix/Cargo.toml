@@ -1,0 +1,216 @@
+
+[package]
+edition = "2021"
+rust-version = "1.63"
+name = "rustix"
+version = "1.1.4"
+authors = [
+    "Dan Gohman <dev@sunfishcode.online>",
+    "Jakub Konka <kubkon@jakubkonka.com>",
+]
+build = "build.rs"
+include = [
+    "src",
+    "build.rs",
+    "Cargo.toml",
+    "COPYRIGHT",
+    "LICENSE*",
+    "/*.md",
+    "benches",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Safe Rust bindings to POSIX/Unix/Linux/Winsock-like syscalls"
+documentation = "https://docs.rs/rustix"
+keywords = [
+    "api",
+    "file",
+    "network",
+    "safe",
+    "syscall",
+]
+categories = [
+    "os::unix-apis",
+    "date-and-time",
+    "filesystem",
+    "network-programming",
+]
+license = "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+repository = "https://github.com/bytecodealliance/rustix"
+
+[package.metadata.docs.rs]
+features = ["all-apis"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[features]
+all-apis = [
+    "event",
+    "fs",
+    "io_uring",
+    "mm",
+    "mount",
+    "net",
+    "param",
+    "pipe",
+    "process",
+    "pty",
+    "rand",
+    "runtime",
+    "shm",
+    "stdio",
+    "system",
+    "termios",
+    "thread",
+    "time",
+]
+alloc = []
+default = ["std"]
+event = []
+fs = []
+io_uring = [
+    "event",
+    "fs",
+    "net",
+    "thread",
+    "linux-raw-sys/io_uring",
+]
+linux_4_11 = []
+linux_5_1 = ["linux_4_11"]
+linux_5_11 = ["linux_5_1"]
+linux_latest = ["linux_5_11"]
+mm = []
+mount = []
+net = [
+    "linux-raw-sys/net",
+    "linux-raw-sys/netlink",
+    "linux-raw-sys/if_ether",
+    "linux-raw-sys/xdp",
+]
+param = []
+pipe = []
+process = ["linux-raw-sys/prctl"]
+pty = ["fs"]
+rand = []
+runtime = ["linux-raw-sys/prctl"]
+rustc-dep-of-std = [
+    "core",
+    "rustc-std-workspace-alloc",
+    "linux-raw-sys/rustc-dep-of-std",
+    "bitflags/rustc-dep-of-std",
+]
+shm = ["fs"]
+std = [
+    "bitflags/std",
+    "alloc",
+    "libc?/std",
+    "libc_errno?/std",
+]
+stdio = []
+system = ["linux-raw-sys/system"]
+termios = []
+thread = ["linux-raw-sys/prctl"]
+time = []
+try_close = []
+use-explicitly-provided-auxv = []
+use-libc = [
+    "libc_errno",
+    "libc",
+]
+use-libc-auxv = []
+
+[lib]
+name = "rustix"
+path = "src/lib.rs"
+
+[dependencies.bitflags]
+version = "2.4.0"
+default-features = false
+
+[dependencies.core]
+version = "1.0.0"
+optional = true
+package = "rustc-std-workspace-core"
+
+[dependencies.rustc-std-workspace-alloc]
+version = "1.0.0"
+optional = true
+
+[target.'cfg(rustix_use_libc)'.dependencies.linux-raw-sys]
+version = "0.12"
+features = [
+    "general",
+    "ioctl",
+    "no_std",
+]
+default-features = false
+
+[target.'cfg(not(rustix_use_libc))'.dependencies.libc]
+version = "0.2.182"
+optional = true
+default-features = false
+
+[target.'cfg(not(rustix_use_libc))'.dependencies.libc_errno]
+version = "0.3.10"
+optional = true
+default-features = false
+package = "errno"
+
+[target.'cfg(not(rustix_use_libc))'.dependencies.linux-raw-sys]
+version = "0.12"
+features = [
+    "auxvec",
+    "general",
+    "errno",
+    "ioctl",
+    "no_std",
+    "elf",
+]
+default-features = false
+
+[target.'cfg(rustix_use_libc)'.dependencies.libc]
+version = "0.2.182"
+default-features = false
+
+[target.'cfg(rustix_use_libc)'.dependencies.libc_errno]
+version = "0.3.10"
+default-features = false
+package = "errno"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = [
+    "cfg(alloc_c_string)",
+    "cfg(alloc_ffi)",
+    "cfg(asm_experimental_arch)",
+    "cfg(core_c_str)",
+    "cfg(core_ffi_c)",
+    "cfg(core_intrinsics)",
+    "cfg(criterion)",
+    "cfg(document_experimental_runtime_api)",
+    "cfg(error_in_core)",
+    "cfg(fix_y2038)",
+    "cfg(libc)",
+    "cfg(linux_kernel)",
+    "cfg(linux_like)",
+    "cfg(linux_raw)",
+    "cfg(linux_raw_dep)",
+    "cfg(lower_upper_exp_for_non_zero)",
+    "cfg(sanitize_memory)",
+    "cfg(rustc_attrs)",
+    "cfg(rustc_diagnostics)",
+    "cfg(staged_api)",
+    "cfg(static_assertions)",
+    "cfg(thumb_mode)",
+    'cfg(target_arch, values("xtensa"))',
+    'cfg(target_os, values("cygwin"))',
+]
+
+[hints]
+mostly-unused = true

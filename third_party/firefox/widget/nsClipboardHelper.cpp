@@ -1,0 +1,94 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsClipboardHelper.h"
+
+#include "nsComponentManagerUtils.h"
+#include "nsCOMPtr.h"
+#include "nsXPCOM.h"
+#include "nsISupportsPrimitives.h"
+#include "nsServiceManagerUtils.h"
+
+#include "nsIClipboard.h"
+#include "mozilla/dom/Document.h"
+#include "nsITransferable.h"
+#include "nsReadableUtils.h"
+
+NS_IMPL_ISUPPORTS(nsClipboardHelper, nsIClipboardHelper)
+
+
+nsClipboardHelper::nsClipboardHelper() = default;
+
+nsClipboardHelper::~nsClipboardHelper() = default;
+
+
+NS_IMETHODIMP
+nsClipboardHelper::CopyStringToClipboard(
+    const nsAString& aString, nsIClipboard::ClipboardType aClipboardID,
+    mozilla::dom::WindowContext* aSettingWindowContext,
+    SensitiveData aSensitive) {
+  nsresult rv;
+
+  nsCOMPtr<nsIClipboard> clipboard(
+      do_GetService("@mozilla.org/widget/clipboard;1", &rv));
+  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_TRUE(clipboard, NS_ERROR_FAILURE);
+
+  if (nsIClipboard::kSelectionClipboard == aClipboardID &&
+      !clipboard->IsClipboardTypeSupported(nsIClipboard::kSelectionClipboard)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (nsIClipboard::kFindClipboard == aClipboardID &&
+      !clipboard->IsClipboardTypeSupported(nsIClipboard::kFindClipboard)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsITransferable> trans(
+      do_CreateInstance("@mozilla.org/widget/transferable;1", &rv));
+  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_TRUE(trans, NS_ERROR_FAILURE);
+
+  trans->Init(nullptr);
+  if (aSensitive == SensitiveData::Sensitive) {
+    trans->SetIsPrivateData(true);
+  }
+
+  rv = trans->AddDataFlavor(kTextMime);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsISupportsString> data(
+      do_CreateInstance("@mozilla.org/supports-string;1", &rv));
+  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_TRUE(data, NS_ERROR_FAILURE);
+
+  rv = data->SetData(aString);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = trans->SetTransferData(kTextMime, ToSupports(data));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = clipboard->SetData(trans, nullptr, aClipboardID, aSettingWindowContext);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsClipboardHelper::CopyString(
+    const nsAString& aString,
+    mozilla::dom::WindowContext* aSettingWindowContext,
+    SensitiveData aSensitive) {
+  nsresult rv;
+
+  rv = CopyStringToClipboard(aString, nsIClipboard::kGlobalClipboard,
+                             aSettingWindowContext, aSensitive);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  CopyStringToClipboard(aString, nsIClipboard::kSelectionClipboard,
+                        aSettingWindowContext, aSensitive);
+
+  return NS_OK;
+}

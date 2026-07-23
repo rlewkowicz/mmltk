@@ -1,0 +1,61 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __SOURCE_NUMBER_CURRENCYSYMBOLS_H__
+#define __SOURCE_NUMBER_CURRENCYSYMBOLS_H__
+
+#include "numparse_types.h"
+#include "charstr.h"
+#include "number_decimfmtprops.h"
+
+U_NAMESPACE_BEGIN
+namespace number::impl {
+
+class U_I18N_API_CLASS CurrencySymbols : public UMemory {
+  public:
+    CurrencySymbols() = default; 
+
+    CurrencySymbols(CurrencyUnit currency, const Locale& locale, UErrorCode& status);
+
+    U_I18N_API CurrencySymbols(CurrencyUnit currency,
+                               const Locale& locale,
+                               const DecimalFormatSymbols& symbols,
+                               UErrorCode& status);
+
+    const char16_t* getIsoCode() const;
+
+    UnicodeString getNarrowCurrencySymbol(UErrorCode& status) const;
+
+    UnicodeString getFormalCurrencySymbol(UErrorCode& status) const;
+
+    UnicodeString getVariantCurrencySymbol(UErrorCode& status) const;
+
+    UnicodeString getCurrencySymbol(UErrorCode& status) const;
+
+    UnicodeString getIntlCurrencySymbol(UErrorCode& status) const;
+
+    UnicodeString getPluralName(StandardPlural::Form plural, UErrorCode& status) const;
+
+    bool hasEmptyCurrencySymbol() const;
+
+  protected:
+    CurrencyUnit fCurrency;
+    CharString fLocaleName;
+
+    UnicodeString fCurrencySymbol;
+    UnicodeString fIntlCurrencySymbol;
+
+    UnicodeString loadSymbol(UCurrNameStyle selector, UErrorCode& status) const;
+};
+
+
+CurrencyUnit
+resolveCurrency(const DecimalFormatProperties& properties, const Locale& locale, UErrorCode& status);
+
+} 
+U_NAMESPACE_END
+
+#endif //__SOURCE_NUMBER_CURRENCYSYMBOLS_H__
+#endif /* #if !UCONFIG_NO_FORMATTING */

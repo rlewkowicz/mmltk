@@ -1,0 +1,125 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MediaRecorder_h
+#define MediaRecorder_h
+
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/dom/MediaRecorderBinding.h"
+#include "nsIDocumentActivity.h"
+
+#define MAX_ALLOW_MEMORY_BUFFER 1024000
+namespace mozilla {
+
+class AudioNodeTrack;
+class DOMMediaStream;
+class ErrorResult;
+struct MediaRecorderOptions;
+class GlobalObject;
+
+namespace dom {
+
+class AudioNode;
+class BlobImpl;
+class Document;
+class DOMException;
+
+
+class MediaRecorder final : public DOMEventTargetHelper,
+                            public nsIDocumentActivity {
+ public:
+  class Session;
+
+  explicit MediaRecorder(nsPIDOMWindowInner* aOwnerWindow);
+
+  MediaRecorder& operator=(const MediaRecorder& x) = delete;
+  MediaRecorder(const MediaRecorder& x) = delete;  
+
+  static nsTArray<RefPtr<Session>> GetSessions();
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(MediaRecorder, DOMEventTargetHelper)
+
+  void Start(const Optional<uint32_t>& timeSlice, ErrorResult& aResult);
+  void Stop(ErrorResult& aResult);
+  void Pause(ErrorResult& aResult);
+  void Resume(ErrorResult& aResult);
+  void RequestData(ErrorResult& aResult);
+  DOMMediaStream* Stream() const { return mStream; }
+  void GetMimeType(nsString& aMimeType);
+  RecordingState State() const { return mState; }
+
+  static bool IsTypeSupported(GlobalObject& aGlobal,
+                              const nsAString& aMIMEType);
+  static bool IsTypeSupported(const nsAString& aMIMEType);
+
+  static already_AddRefed<MediaRecorder> Constructor(
+      const GlobalObject& aGlobal, DOMMediaStream& aStream,
+      const MediaRecorderOptions& aOptions, ErrorResult& aRv);
+  static already_AddRefed<MediaRecorder> Constructor(
+      const GlobalObject& aGlobal, AudioNode& aAudioNode,
+      uint32_t aAudioNodeOutput, const MediaRecorderOptions& aOptions,
+      ErrorResult& aRv);
+
+  typedef MozPromise<size_t, size_t, true> SizeOfPromise;
+  RefPtr<SizeOfPromise> SizeOfExcludingThis(
+      mozilla::MallocSizeOf aMallocSizeOf);
+  IMPL_EVENT_HANDLER(start)
+  IMPL_EVENT_HANDLER(stop)
+  IMPL_EVENT_HANDLER(dataavailable)
+  IMPL_EVENT_HANDLER(pause)
+  IMPL_EVENT_HANDLER(resume)
+  IMPL_EVENT_HANDLER(error)
+
+  NS_DECL_NSIDOCUMENTACTIVITY
+
+  uint32_t AudioBitsPerSecond() const { return mAudioBitsPerSecond; }
+  uint32_t VideoBitsPerSecond() const { return mVideoBitsPerSecond; }
+
+ protected:
+  virtual ~MediaRecorder();
+
+  nsresult CreateAndDispatchBlobEvent(BlobImpl* aBlobImpl);
+  void DispatchSimpleEvent(const nsAString& aStr);
+  void NotifyError(nsresult aRv);
+
+  void RemoveSession(Session* aSession);
+  void InitializeDomExceptions();
+  void Inactivate();
+  void StopForSessionDestruction();
+  RefPtr<DOMMediaStream> mStream;
+  RefPtr<AudioNode> mAudioNode;
+  uint32_t mAudioNodeOutput = 0;
+
+  RecordingState mState = RecordingState::Inactive;
+  nsTArray<RefPtr<Session>> mSessions;
+
+  RefPtr<Document> mDocument;
+
+  nsString mMimeType;
+  nsString mConstrainedMimeType;
+
+  uint32_t mAudioBitsPerSecond = 0;
+  uint32_t mVideoBitsPerSecond = 0;
+  Maybe<uint32_t> mConstrainedBitsPerSecond;
+
+  RefPtr<DOMException> mOtherDomException;
+  RefPtr<DOMException> mSecurityDomException;
+  RefPtr<DOMException> mUnknownDomException;
+
+ private:
+  void RegisterActivityObserver();
+  void UnRegisterActivityObserver();
+
+  bool CheckPermission(const nsString& aType);
+};
+
+}  
+}  
+
+#endif

@@ -1,0 +1,155 @@
+/* gzguts.h -- zlib internal header definitions for gz* operations
+ * Copyright (C) 2004-2026 Mark Adler
+ * For conditions of distribution and use, see copyright notice in zlib.h
+ */
+
+#if defined(_LARGEFILE64_SOURCE)
+#if !defined(_LARGEFILE_SOURCE)
+#    define _LARGEFILE_SOURCE 1
+#endif
+#  undef _FILE_OFFSET_BITS
+#  undef _TIME_BITS
+#endif
+
+#if defined(HAVE_HIDDEN)
+#  define ZLIB_INTERNAL __attribute__((visibility ("hidden")))
+#else
+#  define ZLIB_INTERNAL
+#endif
+
+
+#include <stdio.h>
+#include "zlib.h"
+#if defined(STDC)
+#  include <string.h>
+#  include <stdlib.h>
+#  include <limits.h>
+#endif
+
+#if !defined(_POSIX_C_SOURCE)
+#  define _POSIX_C_SOURCE 200112L
+#endif
+#include <fcntl.h>
+
+
+#if defined(__TURBOC__) || defined(_MSC_VER) || 0
+#  include <io.h>
+#  include <sys/stat.h>
+#endif
+
+
+#if defined(NO_DEFLATE)
+#  define NO_GZCOMPRESS
+#endif
+
+#if defined(STDC99) || (defined(__TURBOC__) && __TURBOC__ >= 0x550)
+#if !defined(HAVE_VSNPRINTF)
+#    define HAVE_VSNPRINTF
+#endif
+#endif
+
+
+#if defined(MSDOS) && defined(__BORLANDC__) && (BORLANDC > 0x410)
+#if !defined(HAVE_VSNPRINTF)
+#    define HAVE_VSNPRINTF
+#endif
+#endif
+
+#if !defined(HAVE_VSNPRINTF)
+#if !defined(NO_vsnprintf) && \
+      (defined(MSDOS) || defined(__TURBOC__) || defined(__SASC) || \
+       defined(VMS) || defined(__OS400) || defined(__MVS__))
+#    define NO_vsnprintf
+#endif
+#if !defined(__STDC_VERSION__) || __STDC_VERSION__-0 < 199901L
+#if !defined(NO_snprintf)
+#      define NO_snprintf
+#endif
+#if !defined(NO_vsnprintf)
+#      define NO_vsnprintf
+#endif
+#endif
+#endif
+
+#if defined(_MSC_VER) && _MSC_VER < 1900
+#  define snprintf _snprintf
+#endif
+
+#if !defined(local)
+#  define local static
+#endif
+
+#if !defined(STDC)
+  extern voidp  malloc(uInt size);
+  extern void   free(voidpf ptr);
+#endif
+
+#if defined UNDER_CE
+#  include <windows.h>
+#  define zstrerror() gz_strwinerror((DWORD)GetLastError())
+#else
+#if !defined(NO_STRERROR)
+#    include <errno.h>
+#    define zstrerror() strerror(errno)
+#else
+#    define zstrerror() "stdio error (consult errno)"
+#endif
+#endif
+
+#if !defined(_LARGEFILE64_SOURCE) || _LFS64_LARGEFILE-0 == 0
+    ZEXTERN gzFile ZEXPORT gzopen64(const char *, const char *);
+    ZEXTERN z_off64_t ZEXPORT gzseek64(gzFile, z_off64_t, int);
+    ZEXTERN z_off64_t ZEXPORT gztell64(gzFile);
+    ZEXTERN z_off64_t ZEXPORT gzoffset64(gzFile);
+#endif
+
+#if MAX_MEM_LEVEL >= 8
+#  define DEF_MEM_LEVEL 8
+#else
+#  define DEF_MEM_LEVEL  MAX_MEM_LEVEL
+#endif
+
+#define GZBUFSIZE 8192
+
+#define GZ_NONE 0
+#define GZ_READ 7247
+#define GZ_WRITE 31153
+#define GZ_APPEND 1     /* mode set to GZ_WRITE after the file is opened */
+
+#define LOOK 0      /* look for a gzip header */
+#define COPY 1      /* copy input directly */
+#define GZIP 2      /* decompress a gzip stream */
+
+typedef struct {
+    struct gzFile_s x;      
+    int mode;               
+    int fd;                 
+    char *path;             
+    unsigned size;          
+    unsigned want;          
+    unsigned char *in;      
+    unsigned char *out;     
+    int direct;             
+    int junk;               
+    int how;                
+    int again;              
+    z_off64_t start;        
+    int eof;                
+    int past;               
+    int level;              
+    int strategy;           
+    int reset;              
+    z_off64_t skip;         
+    int err;                
+    char *msg;              
+    z_stream strm;          
+} gz_state;
+typedef gz_state FAR *gz_statep;
+
+void ZLIB_INTERNAL gz_error(gz_statep, int, const char *);
+#if defined UNDER_CE
+char ZLIB_INTERNAL *gz_strwinerror(DWORD error);
+#endif
+
+unsigned ZLIB_INTERNAL gz_intmax(void);
+#define GT_OFF(x) (sizeof(int) == sizeof(z_off64_t) && (x) > gz_intmax())

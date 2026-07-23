@@ -1,0 +1,325 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkImage_DEFINED)
+#define SkImage_DEFINED
+
+#include "include/core/SkAlphaType.h"
+#include "include/core/SkImageInfo.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkSize.h"
+#include "include/private/base/SkAPI.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+
+class GrDirectContext;
+class SkBitmap;
+class SkColorSpace;
+class SkData;
+class SkImage;
+class SkImageFilter;
+class SkImageGenerator;
+class SkMatrix;
+class SkMipmap;
+class SkPaint;
+class SkPicture;
+class SkPixmap;
+class SkRecorder;
+class SkShader;
+class SkSurfaceProps;
+enum SkColorType : int;
+enum class SkTextureCompressionType;
+enum class SkTileMode;
+
+struct SkIPoint;
+struct SkSamplingOptions;
+
+namespace SkImages {
+
+using ReleaseContext = void*;
+using RasterReleaseProc = void(const void* pixels, ReleaseContext);
+
+SK_API sk_sp<SkImage> RasterFromBitmap(const SkBitmap& bitmap);
+
+SK_API sk_sp<SkImage> RasterFromCompressedTextureData(sk_sp<SkData> data,
+                                                      int width,
+                                                      int height,
+                                                      SkTextureCompressionType type);
+
+SK_API sk_sp<SkImage> DeferredFromEncodedData(sk_sp<const SkData> encoded,
+                                              std::optional<SkAlphaType> alphaType = std::nullopt);
+
+SK_API sk_sp<SkImage> DeferredFromGenerator(std::unique_ptr<SkImageGenerator> imageGenerator);
+
+enum class BitDepth {
+    kU8,   
+    kF16,  
+};
+
+SK_API sk_sp<SkImage> DeferredFromPicture(sk_sp<SkPicture> picture,
+                                          const SkISize& dimensions,
+                                          const SkMatrix* matrix,
+                                          const SkPaint* paint,
+                                          BitDepth bitDepth,
+                                          sk_sp<SkColorSpace> colorSpace,
+                                          SkSurfaceProps props);
+SK_API sk_sp<SkImage> DeferredFromPicture(sk_sp<SkPicture> picture,
+                                          const SkISize& dimensions,
+                                          const SkMatrix* matrix,
+                                          const SkPaint* paint,
+                                          BitDepth bitDepth,
+                                          sk_sp<SkColorSpace> colorSpace);
+
+SK_API sk_sp<SkImage> RasterFromPixmapCopy(const SkPixmap& pixmap);
+
+SK_API sk_sp<SkImage> RasterFromPixmap(const SkPixmap& pixmap,
+                                       RasterReleaseProc rasterReleaseProc,
+                                       ReleaseContext releaseContext);
+
+SK_API sk_sp<SkImage> RasterFromData(const SkImageInfo& info,
+                                     sk_sp<SkData> pixels,
+                                     size_t rowBytes);
+
+SK_API sk_sp<SkImage> MakeWithFilter(sk_sp<SkImage> src,
+                                     const SkImageFilter* filter,
+                                     const SkIRect& subset,
+                                     const SkIRect& clipBounds,
+                                     SkIRect* outSubset,
+                                     SkIPoint* offset);
+
+}  
+
+class SK_API SkImage : public SkRefCnt {
+public:
+    const SkImageInfo& imageInfo() const { return fInfo; }
+
+    int width() const { return fInfo.width(); }
+
+    int height() const { return fInfo.height(); }
+
+    SkISize dimensions() const { return SkISize::Make(fInfo.width(), fInfo.height()); }
+
+    SkIRect bounds() const { return SkIRect::MakeWH(fInfo.width(), fInfo.height()); }
+
+    uint32_t uniqueID() const { return fUniqueID; }
+
+    SkAlphaType alphaType() const;
+
+    SkColorType colorType() const;
+
+    SkColorSpace* colorSpace() const;
+
+    sk_sp<SkColorSpace> refColorSpace() const;
+
+    bool isAlphaOnly() const;
+
+    bool isOpaque() const { return SkAlphaTypeIsOpaque(this->alphaType()); }
+
+    sk_sp<SkShader> makeShader(SkTileMode tmx, SkTileMode tmy, const SkSamplingOptions&,
+                               const SkMatrix* localMatrix = nullptr) const;
+    sk_sp<SkShader> makeShader(SkTileMode tmx, SkTileMode tmy, const SkSamplingOptions& sampling,
+                               const SkMatrix& lm) const;
+    sk_sp<SkShader> makeShader(const SkSamplingOptions& sampling, const SkMatrix& lm) const;
+    sk_sp<SkShader> makeShader(const SkSamplingOptions& sampling,
+                               const SkMatrix* lm = nullptr) const;
+
+    sk_sp<SkShader> makeRawShader(SkTileMode tmx, SkTileMode tmy, const SkSamplingOptions&,
+                                  const SkMatrix* localMatrix = nullptr) const;
+    sk_sp<SkShader> makeRawShader(SkTileMode tmx, SkTileMode tmy, const SkSamplingOptions& sampling,
+                                  const SkMatrix& lm) const;
+    sk_sp<SkShader> makeRawShader(const SkSamplingOptions& sampling, const SkMatrix& lm) const;
+    sk_sp<SkShader> makeRawShader(const SkSamplingOptions& sampling,
+                                  const SkMatrix* lm = nullptr) const;
+
+    bool peekPixels(SkPixmap* pixmap) const;
+
+    virtual bool isTextureBacked() const = 0;
+
+    virtual size_t textureSize() const = 0;
+
+    virtual bool isValid(SkRecorder*) const = 0;
+
+    /** \enum SkImage::CachingHint
+        CachingHint selects whether Skia may internally cache SkBitmap generated by
+        decoding SkImage, or by copying SkImage from GPU to CPU. The default behavior
+        allows caching SkBitmap.
+
+        Choose kDisallow_CachingHint if SkImage pixels are to be used only once, or
+        if SkImage pixels reside in a cache outside of Skia, or to reduce memory pressure.
+
+        Choosing kAllow_CachingHint does not ensure that pixels will be cached.
+        SkImage pixels may not be cached if memory requirements are too large or
+        pixels are not accessible.
+    */
+    enum CachingHint {
+        kAllow_CachingHint,    
+        kDisallow_CachingHint, 
+    };
+
+    bool readPixels(GrDirectContext* context,
+                    const SkImageInfo& dstInfo,
+                    void* dstPixels,
+                    size_t dstRowBytes,
+                    int srcX, int srcY,
+                    CachingHint cachingHint = kAllow_CachingHint) const;
+
+    bool readPixels(GrDirectContext* context,
+                    const SkPixmap& dst,
+                    int srcX,
+                    int srcY,
+                    CachingHint cachingHint = kAllow_CachingHint) const;
+
+#if !defined(SK_IMAGE_READ_PIXELS_DISABLE_LEGACY_API)
+    bool readPixels(const SkImageInfo& dstInfo, void* dstPixels, size_t dstRowBytes,
+                    int srcX, int srcY, CachingHint cachingHint = kAllow_CachingHint) const;
+    bool readPixels(const SkPixmap& dst, int srcX, int srcY,
+                    CachingHint cachingHint = kAllow_CachingHint) const;
+#endif
+
+    class AsyncReadResult {
+    public:
+        AsyncReadResult(const AsyncReadResult&) = delete;
+        AsyncReadResult(AsyncReadResult&&) = delete;
+        AsyncReadResult& operator=(const AsyncReadResult&) = delete;
+        AsyncReadResult& operator=(AsyncReadResult&&) = delete;
+
+        virtual ~AsyncReadResult() = default;
+        virtual int count() const = 0;
+        virtual const void* data(int i) const = 0;
+        virtual size_t rowBytes(int i) const = 0;
+
+    protected:
+        AsyncReadResult() = default;
+    };
+
+    using ReadPixelsContext = void*;
+
+    using ReadPixelsCallback = void(ReadPixelsContext, std::unique_ptr<const AsyncReadResult>);
+
+    enum class RescaleGamma : bool { kSrc, kLinear };
+
+    enum class RescaleMode {
+        kNearest,
+        kLinear,
+        kRepeatedLinear,
+        kRepeatedCubic,
+    };
+
+    void asyncRescaleAndReadPixels(const SkImageInfo& info,
+                                   const SkIRect& srcRect,
+                                   RescaleGamma rescaleGamma,
+                                   RescaleMode rescaleMode,
+                                   ReadPixelsCallback callback,
+                                   ReadPixelsContext context) const;
+
+    void asyncRescaleAndReadPixelsYUV420(SkYUVColorSpace yuvColorSpace,
+                                         sk_sp<SkColorSpace> dstColorSpace,
+                                         const SkIRect& srcRect,
+                                         const SkISize& dstSize,
+                                         RescaleGamma rescaleGamma,
+                                         RescaleMode rescaleMode,
+                                         ReadPixelsCallback callback,
+                                         ReadPixelsContext context) const;
+
+    void asyncRescaleAndReadPixelsYUVA420(SkYUVColorSpace yuvColorSpace,
+                                          sk_sp<SkColorSpace> dstColorSpace,
+                                          const SkIRect& srcRect,
+                                          const SkISize& dstSize,
+                                          RescaleGamma rescaleGamma,
+                                          RescaleMode rescaleMode,
+                                          ReadPixelsCallback callback,
+                                          ReadPixelsContext context) const;
+
+    bool scalePixels(const SkPixmap& dst, const SkSamplingOptions&,
+                     CachingHint cachingHint = kAllow_CachingHint) const;
+
+    sk_sp<SkImage> makeScaled(SkRecorder*, const SkImageInfo&, const SkSamplingOptions&) const;
+    sk_sp<SkImage> makeScaled(SkRecorder*,
+                              const SkImageInfo&,
+                              const SkSamplingOptions&,
+                              const SkSurfaceProps&) const;
+
+    sk_sp<SkImage> makeScaled(const SkImageInfo& info, const SkSamplingOptions& sampling) const;
+
+    sk_sp<const SkData> refEncodedData() const;
+
+    struct RequiredProperties {
+        bool fMipmapped = false;
+
+        bool operator==(const RequiredProperties& other) const {
+            return fMipmapped == other.fMipmapped;
+        }
+
+        bool operator!=(const RequiredProperties& other) const { return !(*this == other); }
+
+        bool operator<(const RequiredProperties& other) const {
+            return fMipmapped < other.fMipmapped;
+        }
+    };
+
+    virtual sk_sp<SkImage> makeSubset(SkRecorder*,
+                                      const SkIRect& subset,
+                                      RequiredProperties) const = 0;
+
+    bool hasMipmaps() const;
+
+    bool isProtected() const;
+
+    sk_sp<SkImage> withDefaultMipmaps() const;
+
+    sk_sp<SkImage> makeNonTextureImage(GrDirectContext* = nullptr) const;
+
+    sk_sp<SkImage> makeRasterImage(GrDirectContext*,
+                                   CachingHint cachingHint = kDisallow_CachingHint) const;
+
+#if !defined(SK_IMAGE_READ_PIXELS_DISABLE_LEGACY_API)
+    sk_sp<SkImage> makeRasterImage(CachingHint cachingHint = kDisallow_CachingHint) const {
+        return this->makeRasterImage(nullptr, cachingHint);
+    }
+#endif
+
+    enum LegacyBitmapMode {
+        kRO_LegacyBitmapMode, 
+    };
+
+    bool asLegacyBitmap(SkBitmap* bitmap,
+                        LegacyBitmapMode legacyBitmapMode = kRO_LegacyBitmapMode) const;
+
+    virtual bool isLazyGenerated() const = 0;
+
+    virtual sk_sp<SkImage> makeColorSpace(SkRecorder*,
+                                          sk_sp<SkColorSpace> targetColorSpace,
+                                          RequiredProperties) const = 0;
+
+    virtual sk_sp<SkImage> makeColorTypeAndColorSpace(SkRecorder*,
+                                                      SkColorType targetColorType,
+                                                      sk_sp<SkColorSpace> targetColorSpace,
+                                                      RequiredProperties) const = 0;
+
+    sk_sp<SkImage> reinterpretColorSpace(sk_sp<SkColorSpace> newColorSpace) const;
+
+private:
+    SkImage(const SkImageInfo& info, uint32_t uniqueID);
+
+    friend class SkBitmap;
+    friend class SkImage_Base;   
+    friend class SkImage_Raster; 
+    friend class SkMipmapBuilder;
+
+    SkImageInfo     fInfo;
+    const uint32_t  fUniqueID;
+
+    sk_sp<SkImage> withMipmaps(sk_sp<SkMipmap>) const;
+
+    using INHERITED = SkRefCnt;
+};
+
+#endif

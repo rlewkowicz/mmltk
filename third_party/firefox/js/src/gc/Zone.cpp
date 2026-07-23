@@ -1,0 +1,831 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "gc/Zone.h"
+#include "js/shadow/Zone.h"  // JS::shadow::Zone
+
+#include "mozilla/Sprintf.h"
+#include "mozilla/TimeStamp.h"
+
+#include "gc/FinalizationObservers.h"
+#include "gc/GCContext.h"
+#include "gc/PublicIterators.h"
+#include "jit/BaselineIC.h"
+#include "jit/BaselineJIT.h"
+#include "jit/Invalidation.h"
+#include "jit/JitScript.h"
+#include "jit/JitZone.h"
+#include "vm/Runtime.h"
+#include "vm/Time.h"
+
+#include "debugger/DebugAPI-inl.h"
+#include "gc/GC-inl.h"
+#include "gc/Marking-inl.h"
+#include "gc/Nursery-inl.h"
+#include "gc/StableCellHasher-inl.h"
+#include "gc/WeakMap-inl.h"
+#include "vm/JSScript-inl.h"
+#include "vm/Realm-inl.h"
+
+using namespace js;
+using namespace js::gc;
+
+Zone* const Zone::NotOnList = reinterpret_cast<Zone*>(1);
+
+ZoneAllocator::ZoneAllocator(JSRuntime* rt, Kind kind)
+    : JS::shadow::Zone(rt, rt->gc.marker().tracer(), kind),
+      jitHeapThreshold(size_t(jit::MaxCodeBytesPerProcess * 0.8)) {}
+
+ZoneAllocator::~ZoneAllocator() {
+#ifdef DEBUG
+  mallocTracker.checkEmptyOnDestroy();
+  MOZ_ASSERT(gcHeapSize.bytes() == 0);
+  MOZ_ASSERT(mallocHeapSize.bytes() == 0);
+  MOZ_ASSERT(jitHeapSize.bytes() == 0);
+#endif
+}
+
+void ZoneAllocator::fixupAfterMovingGC() {
+#ifdef DEBUG
+  mallocTracker.fixupAfterMovingGC();
+#endif
+}
+
+void js::ZoneAllocator::updateSchedulingStateOnGCStart() {
+  gcHeapSize.updateOnGCStart();
+  mallocHeapSize.updateOnGCStart();
+  jitHeapSize.updateOnGCStart();
+  perZoneGCTime = mozilla::TimeDuration::Zero();
+}
+
+void js::ZoneAllocator::updateGCStartThresholds(GCRuntime& gc) {
+  bool isAtomsZone = JS::Zone::from(this)->isAtomsZone();
+  gcHeapThreshold.updateStartThreshold(
+      gcHeapSize.retainedBytes(), smoothedAllocationRate.ref(),
+      smoothedCollectionRate.ref(), gc.tunables, gc.schedulingState,
+      isAtomsZone);
+
+  mallocHeapThreshold.updateStartThreshold(mallocHeapSize.retainedBytes(),
+                                           gc.tunables, gc.schedulingState);
+}
+
+void js::ZoneAllocator::setGCSliceThresholds(GCRuntime& gc,
+                                             bool waitingOnBGTask) {
+  gcHeapThreshold.setSliceThreshold(this, gcHeapSize, gc.tunables,
+                                    waitingOnBGTask);
+  mallocHeapThreshold.setSliceThreshold(this, mallocHeapSize, gc.tunables,
+                                        waitingOnBGTask);
+  jitHeapThreshold.setSliceThreshold(this, jitHeapSize, gc.tunables,
+                                     waitingOnBGTask);
+}
+
+void js::ZoneAllocator::clearGCSliceThresholds() {
+  gcHeapThreshold.clearSliceThreshold();
+  mallocHeapThreshold.clearSliceThreshold();
+  jitHeapThreshold.clearSliceThreshold();
+}
+
+bool ZoneAllocator::addSharedMemory(void* mem, size_t nbytes, MemoryUse use) {
+
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(runtime_));
+
+  auto ptr = sharedMemoryUseCounts.lookupForAdd(mem);
+  MOZ_ASSERT_IF(ptr, ptr->value().use == use);
+
+  if (!ptr && !sharedMemoryUseCounts.add(ptr, mem, gc::SharedMemoryUse(use))) {
+    return false;
+  }
+
+  ptr->value().count++;
+
+  if (nbytes > ptr->value().nbytes) {
+    mallocHeapSize.addBytes(nbytes - ptr->value().nbytes);
+    ptr->value().nbytes = nbytes;
+  }
+
+  maybeTriggerGCOnMalloc();
+
+  return true;
+}
+
+void ZoneAllocator::removeSharedMemory(void* mem, size_t nbytes,
+                                       MemoryUse use) {
+
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(runtime_));
+  MOZ_ASSERT(CurrentThreadIsGCFinalizing());
+
+  auto ptr = sharedMemoryUseCounts.lookup(mem);
+
+  MOZ_ASSERT(ptr);
+  MOZ_ASSERT(ptr->value().count != 0);
+  MOZ_ASSERT(ptr->value().use == use);
+  MOZ_ASSERT(ptr->value().nbytes >= nbytes);
+
+  ptr->value().count--;
+  if (ptr->value().count == 0) {
+    mallocHeapSize.removeBytes(ptr->value().nbytes, true);
+    sharedMemoryUseCounts.remove(ptr);
+  }
+}
+
+template <TrackingKind kind>
+void js::TrackedAllocPolicy<kind>::decMemory(size_t nbytes) {
+  bool updateRetainedSize = false;
+  if constexpr (kind == TrackingKind::Cell) {
+    JS::GCContext* gcx = TlsGCContext.get();
+    updateRetainedSize = gcx->isFinalizing();
+  }
+
+  zone_->decNonGCMemory(this, nbytes, MemoryUse::TrackedAllocPolicy,
+                        updateRetainedSize);
+}
+
+namespace js {
+template class TrackedAllocPolicy<TrackingKind::Zone>;
+template class TrackedAllocPolicy<TrackingKind::Cell>;
+}  
+
+MOZ_COLD void BufferAllocPolicy::reportAllocOverflow() const {
+  zone->reportAllocOverflow();
+}
+
+JS::Zone::Zone(JSRuntime* rt, Kind kind)
+    : ZoneAllocator(rt, kind),
+      arenas(this),
+      bufferAllocator(&rt->gc, this),
+      data(nullptr),
+      suppressAllocationMetadataBuilder(false),
+      allocNurseryObjects_(true),
+      allocNurseryStrings_(true),
+      allocNurseryBigInts_(true),
+      allocNurseryGetterSetters_(true),
+      pretenuring(this),
+      crossZoneStringWrappers_(this),
+      shapeZone_(this),
+      gcScheduled_(false),
+      gcScheduledSaved_(false),
+      gcPreserveCode_(false),
+      keepPropMapTables_(false),
+      wasCollected_(false),
+      listNext_(NotOnList),
+      keptAliveSet(this),
+      objectFuses(this) {
+  MOZ_ASSERT(reinterpret_cast<JS::shadow::Zone*>(this) ==
+             static_cast<JS::shadow::Zone*>(this));
+  MOZ_ASSERT_IF(isAtomsZone(), rt->gc.zones().empty());
+
+  updateGCStartThresholds(rt->gc);
+  rt->gc.nursery().setAllocFlagsForZone(this);
+}
+
+Zone::~Zone() {
+  MOZ_ASSERT_IF(regExps_.ref(), regExps().empty());
+
+  MOZ_ASSERT(numRealmsWithAllocMetadataBuilder_ == 0);
+
+  DebugAPI::deleteDebugScriptMap(debugScriptMap);
+  js_delete(finalizationObservers_.ref().release());
+
+  js_delete(jitZone_.ref());
+
+  MOZ_ASSERT(gcSystemWeakMaps().isEmpty());
+  MOZ_ASSERT(gcUserWeakMaps().isEmpty());
+  MOZ_ASSERT(gcMarkedUserWeakMaps().isEmpty());
+  MOZ_ASSERT(objectsWithWeakPointers.ref().empty());
+
+  JSRuntime* rt = runtimeFromAnyThread();
+  if (this == rt->gc.systemZone) {
+    MOZ_ASSERT(isSystemZone());
+    rt->gc.systemZone = nullptr;
+  }
+
+  if (preservedWrappers_) {
+    MOZ_RELEASE_ASSERT(preservedWrappersCount_ == 0);
+    js_free(preservedWrappers_);
+  }
+
+  scriptCountsMap.reset();
+  scriptLCovMap.reset();
+#ifdef MOZ_VTUNE
+  scriptVTuneIdMap.reset();
+#endif
+#ifdef JS_CACHEIR_SPEW
+  scriptFinalWarmUpCountMap.reset();
+#endif
+  profilerStrings.reset();
+}
+
+bool Zone::init() {
+  regExps_.ref() = make_unique<RegExpZone>(this);
+  return !!regExps_.ref();
+}
+
+void Zone::setNeedsMarkingBarrier(GCRuntime* gc, bool needs) {
+  uint32_t newState = 0;
+  if (needs) {
+    newState = Incremental;
+    if (gc->isConcurrentMarkingEnabled()) {
+      newState |= Concurrent;
+    }
+  }
+
+  needsMarkingBarrier_ = newState;
+}
+
+void Zone::changeGCState(GCRuntime* gc, GCState prev, GCState next) {
+  MOZ_ASSERT(RuntimeHeapIsBusy());
+  MOZ_ASSERT(gcState() == prev);
+  MOZ_ASSERT_IF(isGCMarkingOrVerifyingPreBarriers(), needsMarkingBarrier_);
+
+  gcState_ = next;
+  setNeedsMarkingBarrier(gc, isGCMarkingOrVerifyingPreBarriers());
+}
+
+template <class Pred>
+static void EraseIf(js::gc::EphemeronEdgeVector& entries, Pred pred) {
+  auto* begin = entries.begin();
+  auto* const end = entries.end();
+
+  auto* newEnd = begin;
+  for (auto* p = begin; p != end; p++) {
+    if (!pred(*p)) {
+      *newEnd++ = *p;
+    }
+  }
+
+  size_t removed = end - newEnd;
+  entries.shrinkBy(removed);
+}
+
+void Zone::sweepAfterMinorGC(JSTracer* trc) {
+  crossZoneStringWrappers().sweepAfterMinorGC(trc);
+
+  for (CompartmentsInZoneIter comp(this); !comp.done(); comp.next()) {
+    comp->sweepAfterMinorGC(trc);
+  }
+}
+
+void Zone::traceWeakCCWEdges(JSTracer* trc) {
+  crossZoneStringWrappers().traceWeak(trc);
+  for (CompartmentsInZoneIter comp(this); !comp.done(); comp.next()) {
+    comp->traceCrossCompartmentObjectWrapperEdges(trc);
+  }
+}
+
+void Zone::fixupAllCrossCompartmentWrappersAfterMovingGC(JSTracer* trc) {
+  MOZ_ASSERT(trc->runtime()->gc.isHeapCompacting());
+
+  for (ZonesIter zone(trc->runtime(), WithAtoms); !zone.done(); zone.next()) {
+    zone->crossZoneStringWrappers().traceWeak(trc);
+
+    for (CompartmentsInZoneIter comp(zone); !comp.done(); comp.next()) {
+      comp->fixupCrossCompartmentObjectWrappersAfterMovingGC(trc);
+    }
+  }
+}
+
+void Zone::dropStringWrappersOnGC() {
+  MOZ_ASSERT(JS::RuntimeHeapIsCollecting());
+  crossZoneStringWrappers().clear();
+}
+
+#ifdef JSGC_HASH_TABLE_CHECKS
+
+void Zone::checkAllCrossCompartmentWrappersAfterMovingGC() {
+  checkStringWrappersAfterMovingGC();
+  for (CompartmentsInZoneIter comp(this); !comp.done(); comp.next()) {
+    comp->checkObjectWrappersAfterMovingGC();
+  }
+}
+
+void Zone::checkStringWrappersAfterMovingGC() {
+  CheckTableAfterMovingGC(crossZoneStringWrappers(), [this](const auto& entry) {
+    JSString* key = entry.key().get();
+    CheckGCThingAfterMovingGC(key);  
+    CheckGCThingAfterMovingGC(entry.value().unbarrieredGet(), this);
+    return key;
+  });
+}
+#endif
+
+void Zone::maybeDiscardJitCode(JS::GCContext* gcx) {
+  if (!isPreservingCode()) {
+    forceDiscardJitCode(gcx);
+  }
+}
+
+void Zone::forceDiscardJitCode(JS::GCContext* gcx,
+                               const JitDiscardOptions& options) {
+  if (!jitZone()) {
+    return;
+  }
+
+  if (options.discardJitScripts) {
+    lastDiscardedCodeTime_ = mozilla::TimeStamp::Now();
+  }
+
+  jit::ICStubSpace newStubSpace;
+
+#ifdef DEBUG
+  jitZone()->forEachJitScript([](jit::JitScript* jitScript) {
+    MOZ_ASSERT(!jitScript->hasActiveICScript());
+  });
+#endif
+
+  jit::MarkActiveICScriptsAndCopyStubs(this, newStubSpace);
+
+  jit::InvalidateAll(gcx, this);
+
+  jitZone()->forEachJitScript<jit::IncludeDyingScripts>(
+      [&](jit::JitScript* jitScript) {
+        JSScript* script = jitScript->owningScript();
+        jit::FinishInvalidation(gcx, script);
+
+        if (jitScript->hasBaselineScript() &&
+            !jitScript->icScript()->active()) {
+          jit::FinishDiscardBaselineScript(gcx, script);
+        }
+
+#ifdef JS_CACHEIR_SPEW
+        maybeUpdateWarmUpCount(script);
+#endif
+
+        script->resetWarmUpCounterForGC();
+
+        if (options.discardJitScripts) {
+          script->maybeReleaseJitScript(gcx);
+          jitScript = script->maybeJitScript();
+          if (!jitScript) {
+            if (!script->realm()->collectCoverageForDebug() &&
+                !gcx->runtime()->profilingScripts) {
+              script->destroyScriptCounts();
+            }
+            script->realm()->removeFromCompileQueue(script);
+            return;  
+          }
+        }
+
+        jitScript->purgeInactiveICScripts();
+        jitScript->purgeStubs(script, newStubSpace);
+
+        if (options.resetNurseryAllocSites ||
+            options.resetPretenuredAllocSites) {
+          jitScript->resetAllocSites(options.resetNurseryAllocSites,
+                                     options.resetPretenuredAllocSites);
+        }
+
+        jitScript->resetAllActiveFlags();
+      });
+
+  for (auto regExp = cellIterUnsafe<RegExpShared>(); !regExp.done();
+       regExp.next()) {
+    regExp->discardJitCode();
+  }
+
+  jitZone()->stubSpace()->freeAllAfterMinorGC(this);
+  jitZone()->stubSpace()->transferFrom(newStubSpace);
+  jitZone()->purgeIonCacheIRStubInfo();
+
+}
+
+void JS::Zone::resetAllocSitesAndInvalidate(bool resetNurserySites,
+                                            bool resetPretenuredSites) {
+  MOZ_ASSERT(resetNurserySites || resetPretenuredSites);
+
+  if (!jitZone()) {
+    return;
+  }
+
+  JSContext* cx = runtime_->mainContextFromOwnThread();
+  jitZone()->forEachJitScript<jit::IncludeDyingScripts>(
+      [&](jit::JitScript* jitScript) {
+        if (jitScript->resetAllocSites(resetNurserySites,
+                                       resetPretenuredSites)) {
+          JSScript* script = jitScript->owningScript();
+          CancelOffThreadIonCompile(script);
+          if (script->hasIonScript()) {
+            jit::Invalidate(cx, script,
+                             true,
+                             true);
+          }
+        }
+      });
+}
+
+void JS::Zone::traceWeakJitScripts(JSTracer* trc) {
+  if (jitZone()) {
+    jitZone()->forEachJitScript(
+        [&](jit::JitScript* jitScript) { jitScript->traceWeak(trc); });
+  }
+}
+
+void JS::Zone::beforeClearDelegateInternal(JSObject* wrapper,
+                                           JSObject* delegate) {
+  MOZ_ASSERT(js::gc::detail::GetDelegate(wrapper) == delegate);
+  MOZ_ASSERT(needsMarkingBarrier());
+  MOZ_ASSERT(!RuntimeFromMainThreadIsHeapMajorCollecting(this));
+
+  PreWriteBarrier(wrapper);
+}
+
+#ifdef JSGC_HASH_TABLE_CHECKS
+void JS::Zone::checkUniqueIdTableAfterMovingGC() {
+  CheckTableAfterMovingGC(uniqueIds(), [this](const auto& entry) {
+    js::gc::CheckGCThingAfterMovingGC(entry.key(), this);
+    return entry.key();
+  });
+}
+#endif
+
+js::jit::JitZone* Zone::createJitZone(JSContext* cx) {
+  MOZ_ASSERT(!jitZone_);
+#ifndef ENABLE_PORTABLE_BASELINE_INTERP
+  MOZ_ASSERT(cx->runtime()->hasJitRuntime());
+#endif
+
+  auto jitZone = cx->make_unique<jit::JitZone>(cx, allocNurseryStrings());
+  if (!jitZone) {
+    return nullptr;
+  }
+
+  jitZone_ = jitZone.release();
+  return jitZone_;
+}
+
+bool Zone::hasMarkedRealms() {
+  for (RealmsInZoneIter realm(this); !realm.done(); realm.next()) {
+    if (realm->marked()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void Zone::notifyObservingDebuggers() {
+  AutoAssertNoGC nogc;
+  MOZ_ASSERT(JS::RuntimeHeapIsCollecting(),
+             "This method should be called during GC.");
+
+  JSRuntime* rt = runtimeFromMainThread();
+
+  for (RealmsInZoneIter realms(this); !realms.done(); realms.next()) {
+    GlobalObject* global = realms->unsafeUnbarrieredMaybeGlobal();
+    if (!global) {
+      continue;
+    }
+
+    DebugAPI::notifyParticipatesInGC(global, rt->gc.majorGCCount());
+  }
+}
+
+bool Zone::isOnList() const { return listNext_ != NotOnList; }
+
+Zone* Zone::nextZone() const {
+  MOZ_ASSERT(isOnList());
+  return listNext_;
+}
+
+void Zone::prepareForMovingGC() {
+  JS::GCContext* gcx = runtimeFromMainThread()->gcContext();
+
+  MOZ_ASSERT(!isPreservingCode());
+  forceDiscardJitCode(gcx);
+}
+
+void Zone::fixupAfterMovingGC() {
+  ZoneAllocator::fixupAfterMovingGC();
+  shapeZone().fixupPropMapShapeTableAfterMovingGC();
+}
+
+void Zone::purgeAtomCache() {
+  atomCache_.ref().reset();
+
+  for (RealmsInZoneIter r(this); !r.done(); r.next()) {
+    r->dtoaCache.purge();
+  }
+}
+
+void Zone::addSizeOfIncludingThis(
+    mozilla::MallocSizeOf mallocSizeOf, size_t* zoneObject, JS::CodeSizes* code,
+    size_t* regexpZone, size_t* jitZone, size_t* cacheIRStubs,
+    size_t* objectFusesArg, size_t* uniqueIdMap, size_t* initialPropMapTable,
+    size_t* shapeTables, size_t* atomsMarkBitmaps, size_t* compartmentObjects,
+    size_t* crossCompartmentWrappersTables, size_t* compartmentsPrivateData,
+    size_t* scriptCountsMapArg) {
+  *zoneObject += mallocSizeOf(this);
+  *regexpZone += regExps().sizeOfIncludingThis(mallocSizeOf);
+  if (jitZone_) {
+    jitZone_->addSizeOfIncludingThis(mallocSizeOf, code, jitZone, cacheIRStubs);
+  }
+  *objectFusesArg += objectFuses.sizeOfExcludingThis(mallocSizeOf);
+  *uniqueIdMap += uniqueIds().shallowSizeOfExcludingThis(mallocSizeOf);
+  shapeZone().addSizeOfExcludingThis(mallocSizeOf, initialPropMapTable,
+                                     shapeTables);
+  *atomsMarkBitmaps += markedAtoms().sizeOfExcludingThis(mallocSizeOf);
+  *crossCompartmentWrappersTables +=
+      crossZoneStringWrappers().sizeOfExcludingThis(mallocSizeOf);
+
+  for (CompartmentsInZoneIter comp(this); !comp.done(); comp.next()) {
+    comp->addSizeOfIncludingThis(mallocSizeOf, compartmentObjects,
+                                 crossCompartmentWrappersTables,
+                                 compartmentsPrivateData);
+  }
+
+  if (scriptCountsMap) {
+    ScriptCountsMap& map = scriptCountsMap->get();
+    *scriptCountsMapArg += map.shallowSizeOfIncludingThis(mallocSizeOf);
+    for (auto iter = map.iter(); !iter.done(); iter.next()) {
+      *scriptCountsMapArg +=
+          iter.get().value()->sizeOfIncludingThis(mallocSizeOf);
+    }
+  }
+}
+
+void* ZoneAllocator::onOutOfMemory(js::AllocFunction allocFunc,
+                                   arena_id_t arena, size_t nbytes,
+                                   void* reallocPtr) {
+  if (!js::CurrentThreadCanAccessRuntime(runtime_)) {
+    return nullptr;
+  }
+  JS::AutoSuppressGCAnalysis suppress;
+  return runtimeFromMainThread()->onOutOfMemory(allocFunc, arena, nbytes,
+                                                reallocPtr);
+}
+
+void ZoneAllocator::reportAllocOverflow() const {
+  js::ReportAllocationOverflow(static_cast<JSContext*>(nullptr));
+}
+
+ZoneList::ZoneList() : head(nullptr), tail(nullptr) {}
+
+ZoneList::ZoneList(Zone* zone) : head(zone), tail(zone) {
+  MOZ_RELEASE_ASSERT(!zone->isOnList());
+  zone->listNext_ = nullptr;
+}
+
+ZoneList::~ZoneList() { MOZ_ASSERT(isEmpty()); }
+
+void ZoneList::check() const {
+#ifdef DEBUG
+  MOZ_ASSERT((head == nullptr) == (tail == nullptr));
+  if (!head) {
+    return;
+  }
+
+  Zone* zone = head;
+  for (;;) {
+    MOZ_ASSERT(zone && zone->isOnList());
+    if (zone == tail) break;
+    zone = zone->listNext_;
+  }
+  MOZ_ASSERT(!zone->listNext_);
+#endif
+}
+
+bool ZoneList::isEmpty() const { return head == nullptr; }
+
+Zone* ZoneList::front() const {
+  MOZ_ASSERT(!isEmpty());
+  MOZ_ASSERT(head->isOnList());
+  return head;
+}
+
+void ZoneList::prepend(Zone* zone) { prependList(ZoneList(zone)); }
+
+void ZoneList::append(Zone* zone) { appendList(ZoneList(zone)); }
+
+void ZoneList::prependList(ZoneList&& other) {
+  check();
+  other.check();
+
+  if (other.isEmpty()) {
+    return;
+  }
+
+  MOZ_ASSERT(tail != other.tail);
+
+  if (!isEmpty()) {
+    other.tail->listNext_ = head;
+  } else {
+    tail = other.tail;
+  }
+  head = other.head;
+
+  other.head = nullptr;
+  other.tail = nullptr;
+}
+
+void ZoneList::appendList(ZoneList&& other) {
+  check();
+  other.check();
+
+  if (other.isEmpty()) {
+    return;
+  }
+
+  MOZ_ASSERT(tail != other.tail);
+
+  if (!isEmpty()) {
+    tail->listNext_ = other.head;
+  } else {
+    head = other.head;
+  }
+  tail = other.tail;
+
+  other.head = nullptr;
+  other.tail = nullptr;
+}
+
+Zone* ZoneList::removeFront() {
+  MOZ_ASSERT(!isEmpty());
+  check();
+
+  Zone* front = head;
+  head = head->listNext_;
+  if (!head) {
+    tail = nullptr;
+  }
+
+  front->listNext_ = Zone::NotOnList;
+
+  return front;
+}
+
+void ZoneList::clear() {
+  while (!isEmpty()) {
+    removeFront();
+  }
+}
+
+JS_PUBLIC_API void JS::shadow::RegisterWeakCache(
+    JS::Zone* zone, detail::WeakCacheBase* cachep) {
+  zone->registerWeakCache(cachep);
+}
+
+void Zone::traceRootsInMajorGC(JSTracer* trc) {
+  if (trc->isMarkingTracer() && !isGCMarking()) {
+    return;
+  }
+
+  traceScriptTableRoots(trc);
+}
+
+void Zone::traceScriptTableRoots(JSTracer* trc) {
+  static_assert(std::is_convertible_v<BaseScript*, gc::TenuredCell*>,
+                "BaseScript must not be nursery-allocated for script-table "
+                "tracing to work");
+
+  MOZ_ASSERT(!JS::RuntimeHeapIsMinorCollecting());
+
+  if (scriptCountsMap && trc->runtime()->profilingScripts) {
+    for (auto iter = scriptCountsMap->get().iter(); !iter.done(); iter.next()) {
+      BaseScript* script = iter.get().key();
+      MOZ_ASSERT(script->hasScriptCounts());
+      TraceRoot(trc, &script, "profilingScripts");
+    }
+  }
+
+  if (debugScriptMap) {
+    DebugAPI::traceDebugScriptMap(trc, debugScriptMap);
+  }
+
+  if (jitZone()) {
+    jitZone()->traceScriptTableRoots(trc);
+  }
+}
+
+#ifdef JSGC_HASH_TABLE_CHECKS
+void Zone::checkScriptMapsAfterMovingGC() {
+
+  if (scriptCountsMap) {
+    CheckTableAfterMovingGC(scriptCountsMap->get(), [this](const auto& entry) {
+      BaseScript* script = entry.key();
+      CheckGCThingAfterMovingGC(script, this);
+      return script;
+    });
+  }
+
+  if (scriptLCovMap) {
+    CheckTableAfterMovingGC(scriptLCovMap->get(), [this](const auto& entry) {
+      BaseScript* script = entry.key();
+      CheckGCThingAfterMovingGC(script, this);
+      return script;
+    });
+  }
+
+#  ifdef MOZ_VTUNE
+  if (scriptVTuneIdMap) {
+    CheckTableAfterMovingGC(scriptVTuneIdMap->get(), [this](const auto& entry) {
+      BaseScript* script = entry.key();
+      CheckGCThingAfterMovingGC(script, this);
+      return script;
+    });
+  }
+#  endif  // MOZ_VTUNE
+
+#  ifdef JS_CACHEIR_SPEW
+  if (scriptFinalWarmUpCountMap) {
+    CheckTableAfterMovingGC(scriptFinalWarmUpCountMap->get(),
+                            [this](const auto& entry) {
+                              BaseScript* script = entry.key();
+                              CheckGCThingAfterMovingGC(script, this);
+                              return script;
+                            });
+  }
+#  endif  // JS_CACHEIR_SPEW
+
+  if (profilerStrings) {
+    ProfileStringMap& map = profilerStrings->get();
+    CheckTableAfterMovingGC(map, [this](const auto& entry) {
+      BaseScript* script = entry.key();
+      CheckGCThingAfterMovingGC(script, this);
+      return script;
+    });
+  }
+}
+#endif
+
+void Zone::clearScriptCounts(Realm* realm) {
+  if (!scriptCountsMap) {
+    return;
+  }
+
+  for (auto i = scriptCountsMap->get().modIter(); !i.done(); i.next()) {
+    const HeapPtr<BaseScript*>& script = i.get().key();
+    if (IsAboutToBeFinalized(script)) {
+      continue;
+    }
+
+    if (script->realm() != realm) {
+      continue;
+    }
+    if (script->hasBaselineScript()) {
+      continue;
+    }
+    script->clearHasScriptCounts();
+    i.remove();
+  }
+}
+
+void Zone::clearScriptLCov(Realm* realm) {
+  if (!scriptLCovMap) {
+    return;
+  }
+
+  for (auto i = scriptLCovMap->get().modIter(); !i.done(); i.next()) {
+    const HeapPtr<BaseScript*>& script = i.get().key();
+    if (IsAboutToBeFinalized(script)) {
+      continue;
+    }
+
+    if (script->realm() == realm) {
+      i.remove();
+    }
+  }
+}
+
+void Zone::clearRootsForShutdownGC() {
+  if (finalizationObservers()) {
+    finalizationObservers()->clearRecords();
+  }
+
+  clearKeptObjects();
+}
+
+void Zone::finishRoots() {
+  if (jitZone()) {
+    jitZone()->finishScriptTableRoots();
+  }
+
+  for (RealmsInZoneIter r(this); !r.done(); r.next()) {
+    r->finishRoots();
+  }
+}
+
+void Zone::traceKeptObjects(JSTracer* trc) { keptAliveSet.ref().trace(trc); }
+
+bool Zone::addToKeptObjects(HandleValue target) {
+  MOZ_ASSERT(CanBeHeldWeakly(target));
+  MOZ_ASSERT_IF(target.isSymbol(),
+                !target.toSymbol()->isPermanentAndMayBeShared());
+
+  return keptAliveSet.ref().put(target);
+}
+
+void Zone::clearKeptObjects() { keptAliveSet.ref().clear(); }
+
+bool Zone::ensureFinalizationObservers() {
+  if (finalizationObservers_.ref()) {
+    return true;
+  }
+
+  finalizationObservers_ = js::MakeUnique<FinalizationObservers>(this);
+  return bool(finalizationObservers_.ref());
+}
+
+bool Zone::registerObjectWithWeakPointers(JSObject* obj) {
+  MOZ_ASSERT(obj->getClass()->hasTrace());
+  MOZ_ASSERT(!IsInsideNursery(obj));
+  return objectsWithWeakPointers.ref().append(obj);
+}

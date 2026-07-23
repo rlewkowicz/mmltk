@@ -1,0 +1,336 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(threading_ProtectedData_h)
+#define threading_ProtectedData_h
+
+#include "mozilla/Atomics.h"
+#include <utility>
+#include "jstypes.h"
+#include "threading/ThreadId.h"
+
+struct JS_PUBLIC_API JSContext;
+
+namespace js {
+
+class Mutex;
+
+
+#if defined(DEBUG) && !0
+#  define JS_HAS_PROTECTED_DATA_CHECKS
+#endif
+
+#define DECLARE_ONE_BOOL_OPERATOR(OP, T)     \
+  template <typename U>                      \
+  bool operator OP(const U& other) const {   \
+    if constexpr (std::is_integral_v<T>) {   \
+      return ref() OP static_cast<T>(other); \
+    } else {                                 \
+      return ref() OP other;                 \
+    }                                        \
+  }
+
+#define DECLARE_BOOL_OPERATORS(T)  \
+  DECLARE_ONE_BOOL_OPERATOR(==, T) \
+  DECLARE_ONE_BOOL_OPERATOR(!=, T) \
+  DECLARE_ONE_BOOL_OPERATOR(<=, T) \
+  DECLARE_ONE_BOOL_OPERATOR(>=, T) \
+  DECLARE_ONE_BOOL_OPERATOR(<, T)  \
+  DECLARE_ONE_BOOL_OPERATOR(>, T)
+
+class MOZ_RAII AutoNoteSingleThreadedRegion {
+ public:
+#if defined(JS_HAS_PROTECTED_DATA_CHECKS)
+  static mozilla::Atomic<size_t, mozilla::SequentiallyConsistent> count;
+  AutoNoteSingleThreadedRegion() { count++; }
+  ~AutoNoteSingleThreadedRegion() { count--; }
+#else
+  AutoNoteSingleThreadedRegion() {}
+#endif
+};
+
+template <typename Check, typename T>
+class ProtectedData {
+  using ThisType = ProtectedData<Check, T>;
+
+ public:
+  template <typename... Args>
+  explicit ProtectedData(const Check& check, Args&&... args)
+      : value(std::forward<Args>(args)...)
+#if defined(JS_HAS_PROTECTED_DATA_CHECKS)
+        ,
+        check(check)
+#endif
+  {
+  }
+
+  DECLARE_BOOL_OPERATORS(T)
+
+  operator const T&() const { return ref(); }
+  const T& operator->() const { return ref(); }
+
+  template <typename U>
+  ThisType& operator=(const U& p) {
+    this->ref() = p;
+    return *this;
+  }
+
+  template <typename U>
+  ThisType& operator=(U&& p) {
+    this->ref() = std::forward<U>(p);
+    return *this;
+  }
+
+  template <typename U>
+  T& operator+=(const U& rhs) {
+    return ref() += rhs;
+  }
+  template <typename U>
+  T& operator-=(const U& rhs) {
+    return ref() -= rhs;
+  }
+  template <typename U>
+  T& operator*=(const U& rhs) {
+    return ref() *= rhs;
+  }
+  template <typename U>
+  T& operator/=(const U& rhs) {
+    return ref() /= rhs;
+  }
+  template <typename U>
+  T& operator&=(const U& rhs) {
+    return ref() &= rhs;
+  }
+  template <typename U>
+  T& operator|=(const U& rhs) {
+    return ref() |= rhs;
+  }
+  T& operator++() { return ++ref(); }
+  T& operator--() { return --ref(); }
+  T operator++(int) { return ref()++; }
+  T operator--(int) { return ref()--; }
+
+  T& ref() {
+#if defined(JS_HAS_PROTECTED_DATA_CHECKS)
+    if (!AutoNoteSingleThreadedRegion::count) {
+      check.check();
+    }
+#endif
+    return value;
+  }
+
+  const T& ref() const {
+#if defined(JS_HAS_PROTECTED_DATA_CHECKS)
+    if (!AutoNoteSingleThreadedRegion::count) {
+      check.check();
+    }
+#endif
+    return value;
+  }
+
+  T& refNoCheck() { return value; }
+  const T& refNoCheck() const { return value; }
+
+  static constexpr size_t offsetOfValue() { return offsetof(ThisType, value); }
+
+ private:
+  T value;
+#if defined(JS_HAS_PROTECTED_DATA_CHECKS)
+  Check check;
+#endif
+};
+
+template <typename Check, typename T>
+class ProtectedDataNoCheckArgs : public ProtectedData<Check, T> {
+  using Base = ProtectedData<Check, T>;
+
+ public:
+  template <typename... Args>
+  explicit ProtectedDataNoCheckArgs(Args&&... args)
+      : ProtectedData<Check, T>(Check(), std::forward<Args>(args)...) {}
+
+  using Base::operator=;
+};
+
+template <typename CheckArg, typename Check, typename T>
+class ProtectedDataWithArg : public ProtectedData<Check, T> {
+  using Base = ProtectedData<Check, T>;
+
+ public:
+  template <typename... Args>
+  explicit ProtectedDataWithArg(CheckArg checkArg, Args&&... args)
+      : ProtectedData<Check, T>(Check(checkArg), std::forward<Args>(args)...) {}
+
+  using Base::operator=;
+};
+
+template <typename Check, typename T>
+using ProtectedDataContextArg = ProtectedDataWithArg<JSContext*, Check, T>;
+
+template <typename Check, typename T>
+using ProtectedDataMutexArg = ProtectedDataWithArg<const Mutex&, Check, T>;
+
+class CheckUnprotected {
+#if defined(JS_HAS_PROTECTED_DATA_CHECKS)
+ public:
+  inline void check() const {}
+#endif
+};
+
+template <typename T>
+using UnprotectedData = ProtectedDataNoCheckArgs<CheckUnprotected, T>;
+
+class CheckThreadLocal {
+#if defined(JS_HAS_PROTECTED_DATA_CHECKS)
+  ThreadId id;
+
+ public:
+  CheckThreadLocal() : id(ThreadId::ThisThreadId()) {}
+
+  void check() const;
+#endif
+};
+
+class CheckContextLocal {
+#if defined(JS_HAS_PROTECTED_DATA_CHECKS)
+  JSContext* cx_;
+
+ public:
+  explicit CheckContextLocal(JSContext* cx) : cx_(cx) {}
+
+  void check() const;
+#else
+ public:
+  explicit CheckContextLocal(JSContext* cx) {}
+#endif
+};
+
+class CheckMutexHeld {
+#if defined(JS_HAS_PROTECTED_DATA_CHECKS)
+  const Mutex& mutex_;
+
+ public:
+  explicit CheckMutexHeld(const Mutex& mutex) : mutex_(mutex) {}
+
+  void check() const;
+#else
+ public:
+  explicit CheckMutexHeld(const Mutex& mutex) {}
+#endif
+};
+
+template <typename T>
+using ThreadData = ProtectedDataNoCheckArgs<CheckThreadLocal, T>;
+
+template <typename T>
+using ContextData = ProtectedDataContextArg<CheckContextLocal, T>;
+
+template <typename T>
+using MutexData = ProtectedDataMutexArg<CheckMutexHeld, T>;
+
+enum class AllowedHelperThread {
+  None,
+  GCTask,
+  IonCompile,
+  GCTaskOrIonCompile,
+};
+
+template <AllowedHelperThread Helper>
+class CheckMainThread {
+ public:
+  void check() const;
+};
+
+template <typename T>
+using MainThreadData =
+    ProtectedDataNoCheckArgs<CheckMainThread<AllowedHelperThread::None>, T>;
+
+template <typename T>
+using MainThreadOrGCTaskData =
+    ProtectedDataNoCheckArgs<CheckMainThread<AllowedHelperThread::GCTask>, T>;
+template <typename T>
+using MainThreadOrIonCompileData =
+    ProtectedDataNoCheckArgs<CheckMainThread<AllowedHelperThread::IonCompile>,
+                             T>;
+template <typename T>
+using MainThreadOrGCTaskOrIonCompileData = ProtectedDataNoCheckArgs<
+    CheckMainThread<AllowedHelperThread::GCTaskOrIonCompile>, T>;
+
+enum class GlobalLock { GCLock, HelperThreadLock };
+
+template <GlobalLock Lock, AllowedHelperThread Helper>
+class CheckGlobalLock {
+#if defined(JS_HAS_PROTECTED_DATA_CHECKS)
+ public:
+  void check() const;
+#endif
+};
+
+template <typename T>
+using GCLockData = ProtectedDataNoCheckArgs<
+    CheckGlobalLock<GlobalLock::GCLock, AllowedHelperThread::None>, T>;
+
+template <typename T>
+using HelperThreadLockData = ProtectedDataNoCheckArgs<
+    CheckGlobalLock<GlobalLock::HelperThreadLock, AllowedHelperThread::None>,
+    T>;
+
+template <typename Check, typename T>
+class ProtectedDataWriteOnce {
+  using ThisType = ProtectedDataWriteOnce<Check, T>;
+
+ public:
+  template <typename... Args>
+  explicit ProtectedDataWriteOnce(Args&&... args)
+      : value(std::forward<Args>(args)...)
+#if defined(JS_HAS_PROTECTED_DATA_CHECKS)
+        ,
+        nwrites(0)
+#endif
+  {
+  }
+
+  DECLARE_BOOL_OPERATORS(T)
+
+  operator const T&() const { return ref(); }
+  const T& operator->() const { return ref(); }
+
+  template <typename U>
+  ThisType& operator=(const U& p) {
+    if (ref() != p) {
+      this->writeRef() = p;
+    }
+    return *this;
+  }
+
+  const T& ref() const { return value; }
+
+  T& writeRef() {
+#if defined(JS_HAS_PROTECTED_DATA_CHECKS)
+    if (!AutoNoteSingleThreadedRegion::count) {
+      check.check();
+    }
+    MOZ_ASSERT(++nwrites <= 2);
+#endif
+    return value;
+  }
+
+ private:
+  T value;
+#if defined(JS_HAS_PROTECTED_DATA_CHECKS)
+  Check check;
+  size_t nwrites;
+#endif
+};
+
+template <typename T>
+using WriteOnceData = ProtectedDataWriteOnce<CheckUnprotected, T>;
+
+#undef DECLARE_ASSIGNMENT_OPERATOR
+#undef DECLARE_ONE_BOOL_OPERATOR
+#undef DECLARE_BOOL_OPERATORS
+
+}  
+
+#endif

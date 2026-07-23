@@ -1,0 +1,111 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_GlobalStyleSheetCache_h_
+#define mozilla_GlobalStyleSheetCache_h_
+
+#include "mozilla/BuiltInStyleSheets.h"
+#include "mozilla/EnumeratedArray.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/NotNull.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/ipc/SharedMemoryHandle.h"
+#include "mozilla/ipc/SharedMemoryMapping.h"
+#include "nsIMemoryReporter.h"
+#include "nsIObserver.h"
+
+class nsIFile;
+class nsIURI;
+
+namespace mozilla {
+class StyleSheet;
+enum class StyleOrigin : uint8_t;
+struct StyleLockedCssRules;
+
+namespace css {
+class Loader;
+enum FailureAction { eCrash = 0, eLogToConsole };
+
+}  
+
+class GlobalStyleSheetCache final : public nsIObserver,
+                                    public nsIMemoryReporter {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSIMEMORYREPORTER
+
+  static GlobalStyleSheetCache* Singleton();
+
+#define STYLE_SHEET(identifier_, url_, flags_)           \
+  NotNull<StyleSheet*> identifier_##Sheet() {            \
+    return BuiltInSheet(BuiltInStyleSheet::identifier_); \
+  }
+#include "mozilla/BuiltInStyleSheetList.inc"
+#undef STYLE_SHEET
+
+  NotNull<StyleSheet*> BuiltInSheet(BuiltInStyleSheet);
+
+  StyleSheet* GetUserContentSheet();
+  StyleSheet* GetUserChromeSheet();
+
+  static void Shutdown();
+
+  static void SetUserContentCSSURL(nsIURI* aURI);
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const;
+
+  static void SetSharedMemory(mozilla::ipc::ReadOnlySharedMemoryHandle aHandle,
+                              uintptr_t aAddress);
+
+  mozilla::ipc::ReadOnlySharedMemoryHandle CloneHandle();
+
+  uintptr_t GetSharedMemoryAddress() {
+    return sSharedMemory.IsEmpty() ? 0 : uintptr_t(sSharedMemory.data());
+  }
+
+  static constexpr size_t kSharedMemorySize = 1024 * 450;
+
+ private:
+  struct Header {
+    static constexpr uint32_t kMagic = 0x55415353;
+    uint32_t mMagic;  
+    const StyleLockedCssRules* mSheets[size_t(BuiltInStyleSheet::Count)];
+    uint8_t mBuffer[1];
+  };
+
+  GlobalStyleSheetCache();
+  ~GlobalStyleSheetCache();
+
+  void InitFromProfile();
+  void InitSharedSheetsInParent();
+  void InitMemoryReporter();
+  RefPtr<StyleSheet> LoadSheetURL(const nsACString& aURL, StyleOrigin,
+                                  css::FailureAction aFailureAction);
+  RefPtr<StyleSheet> LoadSheetFile(nsIFile* aFile, StyleOrigin);
+  RefPtr<StyleSheet> LoadSheet(nsIURI* aURI, StyleOrigin,
+                               css::FailureAction aFailureAction);
+  void LoadSheetFromSharedMemory(const nsACString& aURL,
+                                 RefPtr<StyleSheet>* aSheet, StyleOrigin,
+                                 const Header*, BuiltInStyleSheet);
+
+  static StaticRefPtr<GlobalStyleSheetCache> gStyleCache;
+  static StaticRefPtr<css::Loader> gCSSLoader;
+  static StaticRefPtr<nsIURI> gUserContentSheetURL;
+
+  EnumeratedArray<BuiltInStyleSheet, RefPtr<StyleSheet>,
+                  size_t(BuiltInStyleSheet::Count)>
+      mBuiltIns;
+
+  RefPtr<StyleSheet> mUserChromeSheet;
+  RefPtr<StyleSheet> mUserContentSheet;
+
+  static mozilla::ipc::shared_memory::LeakedReadOnlyMapping sSharedMemory;
+
+  static size_t sUsedSharedMemory;
+};
+
+}  
+
+#endif

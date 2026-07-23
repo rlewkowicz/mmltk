@@ -1,0 +1,56 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_clearsitedata_h
+#define mozilla_clearsitedata_h
+
+#include "nsIObserver.h"
+#include "nsTArray.h"
+
+class nsIHttpChannel;
+class nsIPrincipal;
+class nsIURI;
+
+namespace mozilla {
+
+class ClearSiteData final : public nsIObserver {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  static void Initialize();
+
+ private:
+  ClearSiteData();
+  ~ClearSiteData() = default;
+
+  static void Shutdown();
+
+  class PendingCleanupHolder;
+
+  void ClearDataFromChannel(nsIHttpChannel* aChannel);
+
+  uint32_t ParseHeader(nsIHttpChannel* aChannel, nsIURI* aURI) const;
+
+  enum Type {
+    eCache = 0x01,
+    eCookies = 0x02,
+    eStorage = 0x04,
+  };
+
+  void LogOpToConsole(nsIHttpChannel* aChannel, nsIURI* aURI, Type aType) const;
+
+  void LogErrorToConsole(nsIHttpChannel* aChannel, nsIURI* aURI,
+                         const nsACString& aUnknownType) const;
+
+  void LogToConsoleInternal(nsIHttpChannel* aChannel, nsIURI* aURI,
+                            const char* aMsg,
+                            const nsTArray<nsString>& aParams) const;
+
+  void TypeToString(Type aType, nsAString& aStr) const;
+};
+
+}  
+
+#endif  // mozilla_clearsitedata_h

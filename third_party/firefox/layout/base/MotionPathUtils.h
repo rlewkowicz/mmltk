@@ -1,0 +1,197 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_MotionPathUtils_h
+#define mozilla_MotionPathUtils_h
+
+#include "Units.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/gfx/Point.h"
+#include "mozilla/gfx/Rect.h"
+
+class nsIFrame;
+
+namespace nsStyleTransformMatrix {
+class TransformReferenceBox;
+}
+
+namespace mozilla {
+
+namespace layers {
+class MotionPathData;
+class PathCommand;
+}  
+
+struct ResolvedMotionPathData {
+  gfx::Point mTranslate;
+  float mRotate;
+  gfx::Point mShift;
+};
+
+struct OffsetPathData {
+  enum class Type : uint8_t {
+    None,
+    Shape,
+    Ray,
+  };
+
+  struct ShapeData {
+    RefPtr<gfx::Path> mGfxPath;
+    nsPoint mCurrentPosition;
+    bool mIsClosedLoop;
+  };
+
+  struct RayData {
+    const StyleRayFunction* mRay;
+    nsRect mCoordBox;
+    nsPoint mCurrentPosition;
+    CSSCoord mContainReferenceLength;
+  };
+
+  Type mType;
+  union {
+    ShapeData mShape;
+    RayData mRay;
+  };
+
+  static OffsetPathData None() { return OffsetPathData(); }
+  static OffsetPathData Shape(already_AddRefed<gfx::Path> aGfxPath,
+                              nsPoint&& aCurrentPosition, bool aIsClosedPath) {
+    return OffsetPathData(std::move(aGfxPath), std::move(aCurrentPosition),
+                          aIsClosedPath);
+  }
+  static OffsetPathData Ray(const StyleRayFunction& aRay, nsRect&& aCoordBox,
+                            nsPoint&& aPosition,
+                            CSSCoord&& aContainReferenceLength) {
+    return OffsetPathData(&aRay, std::move(aCoordBox), std::move(aPosition),
+                          std::move(aContainReferenceLength));
+  }
+  static OffsetPathData Ray(const StyleRayFunction& aRay,
+                            const nsRect& aCoordBox, const nsPoint& aPosition,
+                            const CSSCoord& aContainReferenceLength) {
+    return OffsetPathData(&aRay, aCoordBox, aPosition, aContainReferenceLength);
+  }
+
+  bool IsNone() const { return mType == Type::None; }
+  bool IsShape() const { return mType == Type::Shape; }
+  bool IsRay() const { return mType == Type::Ray; }
+
+  const ShapeData& AsShape() const {
+    MOZ_ASSERT(IsShape());
+    return mShape;
+  }
+
+  const RayData& AsRay() const {
+    MOZ_ASSERT(IsRay());
+    return mRay;
+  }
+
+  ~OffsetPathData() {
+    switch (mType) {
+      case Type::Shape:
+        mShape.~ShapeData();
+        break;
+      case Type::Ray:
+        mRay.~RayData();
+        break;
+      default:
+        break;
+    }
+  }
+
+  OffsetPathData(const OffsetPathData& aOther) : mType(aOther.mType) {
+    switch (mType) {
+      case Type::Shape:
+        mShape = aOther.mShape;
+        break;
+      case Type::Ray:
+        mRay = aOther.mRay;
+        break;
+      default:
+        break;
+    }
+  }
+
+  OffsetPathData(OffsetPathData&& aOther) : mType(aOther.mType) {
+    switch (mType) {
+      case Type::Shape:
+        mShape = std::move(aOther.mShape);
+        break;
+      case Type::Ray:
+        mRay = std::move(aOther.mRay);
+        break;
+      default:
+        break;
+    }
+  }
+
+ private:
+  OffsetPathData() : mType(Type::None) {}
+  OffsetPathData(already_AddRefed<gfx::Path> aPath, nsPoint&& aCurrentPosition,
+                 bool aIsClosed)
+      : mType(Type::Shape),
+        mShape{std::move(aPath), std::move(aCurrentPosition), aIsClosed} {}
+  OffsetPathData(const StyleRayFunction* aRay, nsRect&& aCoordBox,
+                 nsPoint&& aPosition, CSSCoord&& aContainReferenceLength)
+      : mType(Type::Ray),
+        mRay{aRay, std::move(aCoordBox), std::move(aPosition),
+             std::move(aContainReferenceLength)} {}
+  OffsetPathData(const StyleRayFunction* aRay, const nsRect& aCoordBox,
+                 const nsPoint& aPosition,
+                 const CSSCoord& aContainReferenceLength)
+      : mType(Type::Ray),
+        mRay{aRay, aCoordBox, aPosition, aContainReferenceLength} {}
+  OffsetPathData& operator=(const OffsetPathData&) = delete;
+  OffsetPathData& operator=(OffsetPathData&&) = delete;
+};
+
+class MotionPathUtils final {
+  using TransformReferenceBox = nsStyleTransformMatrix::TransformReferenceBox;
+
+ public:
+  static CSSPoint ComputeAnchorPointAdjustment(const nsIFrame& aFrame);
+
+  static const nsIFrame* GetOffsetPathReferenceBox(const nsIFrame* aFrame,
+                                                   nsRect& aOutputRect);
+
+  static CSSCoord GetRayContainReferenceSize(nsIFrame* aFrame);
+
+  static nsTArray<nscoord> ComputeBorderRadii(
+      const StyleBorderRadius& aBorderRadius, const nsRect& aCoordBox);
+
+  static Maybe<ResolvedMotionPathData> ResolveMotionPath(
+      const OffsetPathData& aPath, const LengthPercentage& aDistance,
+      const StyleOffsetRotate& aRotate, const StylePositionOrAuto& aAnchor,
+      const StyleOffsetPosition& aPosition, const CSSPoint& aTransformOrigin,
+      TransformReferenceBox&, const CSSPoint& aAnchorPointAdjustment);
+
+  static Maybe<ResolvedMotionPathData> ResolveMotionPath(
+      const nsIFrame* aFrame, TransformReferenceBox&);
+
+  static Maybe<ResolvedMotionPathData> ResolveMotionPath(
+      const StyleOffsetPath* aPath, const StyleLengthPercentage* aDistance,
+      const StyleOffsetRotate* aRotate, const StylePositionOrAuto* aAnchor,
+      const StyleOffsetPosition* aPosition,
+      const Maybe<layers::MotionPathData>& aMotionPathData,
+      TransformReferenceBox&, gfx::Path* aCachedMotionPath);
+
+  static already_AddRefed<gfx::Path> BuildSVGPath(
+      const StyleSVGPathData& aPath, gfx::PathBuilder* aPathBuilder);
+
+  static already_AddRefed<gfx::Path> BuildPath(const StyleBasicShape&,
+                                               const StyleOffsetPosition&,
+                                               const nsRect& aCoordBox,
+                                               const nsPoint& aCurrentPosition,
+                                               gfx::PathBuilder*);
+
+  static already_AddRefed<gfx::PathBuilder> GetPathBuilder();
+
+  static already_AddRefed<gfx::PathBuilder> GetCompositorPathBuilder();
+};
+
+}  
+
+#endif  // mozilla_MotionPathUtils_h

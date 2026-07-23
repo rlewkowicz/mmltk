@@ -1,0 +1,22 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsISizeOfEventTarget_h_
+#define nsISizeOfEventTarget_h_
+
+#include "mozilla/MemoryReporting.h"
+#include "nsISupports.h"
+
+#define NS_ISIZEOFEVENTTARGET_IID \
+  {0xa1e08cb9, 0x5455, 0x4593, {0xb4, 0x1f, 0x38, 0x7a, 0x85, 0x44, 0xd0, 0xb5}}
+
+class nsISizeOfEventTarget : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_ISIZEOFEVENTTARGET_IID)
+
+  virtual size_t SizeOfEventTargetIncludingThis(
+      mozilla::MallocSizeOf aMallocSizeOf) const = 0;
+};
+
+#endif /* nsISizeOfEventTarget_h_ */

@@ -1,0 +1,60 @@
+
+[package]
+edition = "2021"
+rust-version = "1.60.0"
+name = "aho-corasick"
+version = "1.1.0"
+authors = ["Andrew Gallant <jamslam@gmail.com>"]
+exclude = [
+    "/aho-corasick-debug",
+    "/benchmarks",
+    "/tmp",
+]
+autotests = false
+description = "Fast multiple substring searching."
+homepage = "https://github.com/BurntSushi/aho-corasick"
+keywords = [
+    "string",
+    "search",
+    "text",
+    "pattern",
+    "multi",
+]
+categories = ["text-processing"]
+license = "Unlicense OR MIT"
+repository = "https://github.com/BurntSushi/aho-corasick"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+    "--generate-link-to-definition",
+]
+
+[profile.bench]
+debug = 2
+
+[profile.release]
+debug = 2
+
+[lib]
+name = "aho_corasick"
+
+[dependencies.log]
+version = "0.4.17"
+optional = true
+
+[dependencies.memchr]
+version = "2.4.0"
+optional = true
+default-features = false
+
+[features]
+default = [
+    "std",
+    "perf-literal",
+]
+logging = ["dep:log"]
+perf-literal = ["dep:memchr"]
+std = ["memchr?/std"]

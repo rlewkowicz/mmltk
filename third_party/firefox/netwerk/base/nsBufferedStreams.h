@@ -1,0 +1,139 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsBufferedStreams_h_
+#define nsBufferedStreams_h_
+
+#include "nsIBufferedStreams.h"
+#include "nsIInputStream.h"
+#include "nsIOutputStream.h"
+#include "nsISafeOutputStream.h"
+#include "nsISeekableStream.h"
+#include "nsIStreamBufferAccess.h"
+#include "nsCOMPtr.h"
+#include "nsIIPCSerializableInputStream.h"
+#include "nsIAsyncInputStream.h"
+#include "nsICloneableInputStream.h"
+#include "nsIInputStreamLength.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/RecursiveMutex.h"
+
+
+class nsBufferedStream : public nsISeekableStream {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSISEEKABLESTREAM
+  NS_DECL_NSITELLABLESTREAM
+
+  nsBufferedStream() = default;
+
+  void Close();
+
+ protected:
+  virtual ~nsBufferedStream();
+
+  nsresult Init(nsISupports* stream, uint32_t bufferSize);
+  nsresult GetData(nsISupports** aResult);
+  NS_IMETHOD Fill() = 0;
+  NS_IMETHOD Flush() = 0;
+
+  uint32_t mBufferSize{0};
+  char* mBuffer MOZ_GUARDED_BY(mBufferMutex){nullptr};
+
+  mozilla::RecursiveMutex mBufferMutex{"nsBufferedStream::mBufferMutex"};
+
+  int64_t mBufferStartOffset{0};
+
+  uint32_t mCursor{0};
+
+  uint32_t mFillPoint{0};
+
+  nsCOMPtr<nsISupports> mStream;  
+
+  bool mBufferDisabled{false};
+  bool mEOF{false};  
+  bool mSeekable{true};
+  uint8_t mGetBufferCount{0};
+};
+
+
+class nsBufferedInputStream final : public nsBufferedStream,
+                                    public nsIBufferedInputStream,
+                                    public nsIStreamBufferAccess,
+                                    public nsIIPCSerializableInputStream,
+                                    public nsIAsyncInputStream,
+                                    public nsIInputStreamCallback,
+                                    public nsICloneableInputStream,
+                                    public nsIInputStreamLength,
+                                    public nsIAsyncInputStreamLength,
+                                    public nsIInputStreamLengthCallback {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIINPUTSTREAM
+  NS_DECL_NSIBUFFEREDINPUTSTREAM
+  NS_DECL_NSISTREAMBUFFERACCESS
+  NS_DECL_NSIIPCSERIALIZABLEINPUTSTREAM
+  NS_DECL_NSIASYNCINPUTSTREAM
+  NS_DECL_NSIINPUTSTREAMCALLBACK
+  NS_DECL_NSICLONEABLEINPUTSTREAM
+  NS_DECL_NSIINPUTSTREAMLENGTH
+  NS_DECL_NSIASYNCINPUTSTREAMLENGTH
+  NS_DECL_NSIINPUTSTREAMLENGTHCALLBACK
+
+  nsBufferedInputStream() = default;
+
+  static nsresult Create(REFNSIID aIID, void** aResult);
+
+  nsIInputStream* Source() { return (nsIInputStream*)mStream.get(); }
+
+  already_AddRefed<nsIInputStream> GetInputStream();
+
+ protected:
+  virtual ~nsBufferedInputStream() = default;
+
+  NS_IMETHOD Fill() override;
+  NS_IMETHOD Flush() override { return NS_OK; }  
+
+  mozilla::Mutex mMutex{"nsBufferedInputStream::mMutex"};
+
+  nsCOMPtr<nsIInputStreamCallback> mAsyncWaitCallback MOZ_GUARDED_BY(mMutex);
+
+  nsCOMPtr<nsIInputStreamLengthCallback> mAsyncInputStreamLengthCallback
+      MOZ_GUARDED_BY(mMutex);
+
+  bool mIsIPCSerializable{true};
+  bool mIsAsyncInputStream{false};
+  bool mIsCloneableInputStream{false};
+  bool mIsInputStreamLength{false};
+  bool mIsAsyncInputStreamLength{false};
+};
+
+
+class nsBufferedOutputStream : public nsBufferedStream,
+                               public nsISafeOutputStream,
+                               public nsIBufferedOutputStream,
+                               public nsIStreamBufferAccess {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIOUTPUTSTREAM
+  NS_DECL_NSISAFEOUTPUTSTREAM
+  NS_DECL_NSIBUFFEREDOUTPUTSTREAM
+  NS_DECL_NSISTREAMBUFFERACCESS
+
+  nsBufferedOutputStream() = default;
+
+  static nsresult Create(REFNSIID aIID, void** aResult);
+
+  nsIOutputStream* Sink() { return (nsIOutputStream*)mStream.get(); }
+
+ protected:
+  virtual ~nsBufferedOutputStream() { nsBufferedOutputStream::Close(); }
+
+  NS_IMETHOD Fill() override { return NS_OK; }  
+
+  nsCOMPtr<nsISafeOutputStream> mSafeStream;  
+};
+
+
+#endif  // nsBufferedStreams_h_

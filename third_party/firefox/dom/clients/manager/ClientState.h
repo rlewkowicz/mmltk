@@ -1,0 +1,115 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _mozilla_dom_ClientState_h
+#define _mozilla_dom_ClientState_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/Variant.h"
+#include "nsContentUtils.h"
+
+namespace mozilla {
+enum class StorageAccess;
+}  
+
+namespace mozilla::dom {
+
+enum class VisibilityState : uint8_t;
+
+class IPCClientState;
+class IPCClientWindowState;
+class IPCClientWorkerState;
+
+class ClientWindowState final {
+  UniquePtr<IPCClientWindowState> mData;
+
+ public:
+  ClientWindowState(mozilla::dom::VisibilityState aVisibilityState,
+                    const TimeStamp& aLastFocusTime,
+                    StorageAccess aStorageAccess, bool aFocused);
+
+  explicit ClientWindowState(const IPCClientWindowState& aData);
+
+  ClientWindowState(const ClientWindowState& aRight);
+  ClientWindowState(ClientWindowState&& aRight);
+
+  ClientWindowState& operator=(const ClientWindowState& aRight);
+
+  ClientWindowState& operator=(ClientWindowState&& aRight);
+
+  ~ClientWindowState();
+
+  mozilla::dom::VisibilityState VisibilityState() const;
+
+  const TimeStamp& LastFocusTime() const;
+
+  bool Focused() const;
+
+  StorageAccess GetStorageAccess() const;
+
+  const IPCClientWindowState& ToIPC() const;
+};
+
+class ClientWorkerState final {
+  UniquePtr<IPCClientWorkerState> mData;
+
+ public:
+  explicit ClientWorkerState(StorageAccess aStorageAccess);
+
+  explicit ClientWorkerState(const IPCClientWorkerState& aData);
+
+  ClientWorkerState(const ClientWorkerState& aRight);
+  ClientWorkerState(ClientWorkerState&& aRight);
+
+  ClientWorkerState& operator=(const ClientWorkerState& aRight);
+
+  ClientWorkerState& operator=(ClientWorkerState&& aRight);
+
+  ~ClientWorkerState();
+
+  StorageAccess GetStorageAccess() const;
+
+  const IPCClientWorkerState& ToIPC() const;
+};
+
+class ClientState final {
+  Maybe<Variant<ClientWindowState, ClientWorkerState>> mData;
+
+ public:
+  ClientState();
+
+  explicit ClientState(const ClientWindowState& aWindowState);
+  explicit ClientState(const ClientWorkerState& aWorkerState);
+  explicit ClientState(const IPCClientWindowState& aData);
+  explicit ClientState(const IPCClientWorkerState& aData);
+
+  ClientState(const ClientState& aRight) = default;
+  ClientState(ClientState&& aRight);
+
+  ClientState& operator=(const ClientState& aRight) = default;
+
+  ClientState& operator=(ClientState&& aRight);
+
+  ~ClientState();
+
+  static ClientState FromIPC(const IPCClientState& aData);
+
+  bool IsWindowState() const;
+
+  const ClientWindowState& AsWindowState() const;
+
+  bool IsWorkerState() const;
+
+  const ClientWorkerState& AsWorkerState() const;
+
+  StorageAccess GetStorageAccess() const;
+
+  const IPCClientState ToIPC() const;
+};
+
+}  
+
+#endif  // _mozilla_dom_ClientState_h

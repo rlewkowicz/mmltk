@@ -1,0 +1,106 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_AnimationTimeline_h
+#define mozilla_dom_AnimationTimeline_h
+
+#include "mozilla/AnimationUtils.h"
+#include "mozilla/dom/CSSNumericValueBindingFwd.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsHashKeys.h"
+#include "nsIGlobalObject.h"
+#include "nsISupports.h"
+#include "nsTHashSet.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla::dom {
+
+class Animation;
+class Document;
+class ScrollTimeline;
+class ViewTimeline;
+
+struct AnimationRange;
+
+class AnimationTimeline : public nsISupports, public nsWrapperCache {
+ public:
+  AnimationTimeline(nsIGlobalObject* aWindow, RTPCallerType);
+
+  struct TickState {
+    TickState() = default;
+  };
+
+ protected:
+  virtual ~AnimationTimeline();
+
+  bool Tick(TickState&);
+
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(AnimationTimeline)
+
+  nsIGlobalObject* GetParentObject() const { return mWindow; }
+
+  virtual void GetCurrentTime(Nullable<OwningCSSNumberish>& aRetVal) const;
+  void GetDuration(Nullable<OwningDoubleOrCSSNumericValue>& aRetVal,
+                   ErrorResult& aRv) const;
+
+  virtual Nullable<TimeDuration> GetCurrentTimeAsDuration() const = 0;
+
+  Nullable<double> GetCurrentTimeAsDouble() const {
+    return AnimationUtils::TimeDurationToDouble(GetCurrentTimeAsDuration(),
+                                                mRTPCallerType);
+  }
+
+  TimeStamp GetCurrentTimeAsTimeStamp() const {
+    Nullable<TimeDuration> currentTime = GetCurrentTimeAsDuration();
+    return !currentTime.IsNull() ? ToTimeStamp(currentTime.Value())
+                                 : TimeStamp();
+  }
+
+  virtual bool TracksWallclockTime() const = 0;
+
+  virtual Nullable<TimeDuration> ToTimelineTime(
+      const TimeStamp& aTimeStamp) const = 0;
+
+  virtual TimeStamp ToTimeStamp(const TimeDuration& aTimelineTime) const = 0;
+
+  virtual void NotifyAnimationUpdated(Animation& aAnimation);
+
+  bool HasAnimations() const { return !mAnimations.IsEmpty(); }
+
+  void RemoveAnimation(Animation* aAnimation);
+  virtual void NotifyAnimationContentVisibilityChanged(Animation* aAnimation,
+                                                       bool aIsVisible);
+  void UpdateHiddenByContentVisibility();
+
+  virtual Document* GetDocument() const = 0;
+
+  virtual bool IsMonotonicallyIncreasing() const = 0;
+
+  RTPCallerType GetRTPCallerType() const { return mRTPCallerType; }
+
+  virtual bool IsScrollTimeline() const { return false; }
+  virtual const ScrollTimeline* AsScrollTimeline() const { return nullptr; }
+  virtual bool IsViewTimeline() const { return false; }
+  virtual const ViewTimeline* AsViewTimeline() const { return nullptr; }
+  virtual bool IsInactiveTimeline() const { return false; }
+
+  virtual Nullable<TimeDuration> TimelineDuration(const AnimationRange&) const {
+    return nullptr;
+  }
+
+ protected:
+  nsCOMPtr<nsIGlobalObject> mWindow;
+
+  using AnimationSet = nsTHashSet<nsRefPtrHashKey<dom::Animation>>;
+  AnimationSet mAnimations;
+  LinkedList<dom::Animation> mAnimationOrder;
+
+  enum RTPCallerType mRTPCallerType;
+};
+
+}  
+
+#endif  // mozilla_dom_AnimationTimeline_h

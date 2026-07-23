@@ -1,0 +1,100 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(PDMFactory_h_)
+#  define PDMFactory_h_
+
+#  include "DecoderDoctorDiagnostics.h"
+#  include "MediaCodecsSupport.h"
+#  include "PlatformDecoderModule.h"
+#  include "mozilla/AlreadyAddRefed.h"
+#  include "mozilla/MozPromise.h"
+#  include "mozilla/RefPtr.h"
+#  include "mozilla/ipc/UtilityProcessTypes.h"
+#  include "nsISupports.h"
+#  include "nsStringFwd.h"
+#  include "nsTArray.h"
+
+namespace mozilla {
+
+class MediaDataDecoder;
+class MediaResult;
+class StaticMutex;
+struct CreateDecoderParams;
+struct CreateDecoderParamsForAsync;
+struct SupportDecoderParams;
+enum class RemoteMediaIn;
+
+using PDMCreateDecoderPromise = PlatformDecoderModule::CreateDecoderPromise;
+
+class PDMFactory final {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(PDMFactory)
+
+  PDMFactory();
+
+  RefPtr<PDMCreateDecoderPromise> CreateDecoder(
+      const CreateDecoderParams& aParams);
+
+  media::DecodeSupportSet SupportsMimeType(const nsACString& aMimeType) const;
+  media::DecodeSupportSet Supports(
+      const SupportDecoderParams& aParams,
+      DecoderDoctorDiagnostics* aDiagnostics) const;
+
+  static constexpr int kYUV400 = 0;
+  static constexpr int kYUV420 = 1;
+  static constexpr int kYUV422 = 2;
+  static constexpr int kYUV444 = 3;
+
+  static media::MediaCodecsSupported Supported(bool aForceRefresh = false);
+  static media::DecodeSupportSet SupportsMimeType(
+      const nsACString& aMimeType,
+      const media::MediaCodecsSupported& aSupported, RemoteMediaIn aLocation);
+
+  static bool AllDecodersAreRemote();
+
+  class MOZ_RAII AutoForcePDM {
+   public:
+    explicit AutoForcePDM(PlatformDecoderModule* aPDM) { ForcePDM(aPDM); }
+    ~AutoForcePDM() { ForcePDM(nullptr); }
+  };
+
+ private:
+  ~PDMFactory();
+
+  void CreatePDMs();
+  void CreateNullPDM();
+  void CreateGpuPDMs();
+  void CreateRddPDMs();
+  void CreateUtilityPDMs();
+  void CreateContentPDMs();
+  void CreateDefaultPDMs();
+
+  bool StartupPDM(already_AddRefed<PlatformDecoderModule> aPDM,
+                  bool aInsertAtBeginning = false);
+  already_AddRefed<PlatformDecoderModule> GetDecoderModule(
+      const SupportDecoderParams& aParams,
+      DecoderDoctorDiagnostics* aDiagnostics) const;
+
+  RefPtr<PDMCreateDecoderPromise> CreateDecoderWithPDM(
+      PlatformDecoderModule* aPDM, const CreateDecoderParams& aParams);
+  RefPtr<PDMCreateDecoderPromise> CheckAndMaybeCreateDecoder(
+      CreateDecoderParamsForAsync&& aParams, uint32_t aIndex,
+      Maybe<MediaResult> aEarlierError = Nothing());
+
+  nsTArray<RefPtr<PlatformDecoderModule>> mCurrentPDMs;
+  RefPtr<PlatformDecoderModule> mNullPDM;
+
+  DecoderDoctorDiagnostics::FlagsSet mFailureFlags;
+
+  static StaticMutex sSupportedMutex;
+
+  friend class RemoteVideoDecoderParent;
+  static void EnsureInit();
+  static void ForcePDM(PlatformDecoderModule* aPDM);
+};
+
+}  
+
+#endif /* PDMFactory_h_ */

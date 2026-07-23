@@ -1,0 +1,44 @@
+/*
+ * Copyright 2014 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPatchUtils_DEFINED)
+#define SkPatchUtils_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkRefCnt.h"
+
+class SkColorSpace;
+class SkMatrix;
+class SkVertices;
+struct SkISize;
+struct SkPoint;
+
+class SkPatchUtils {
+
+public:
+    enum {
+    kNumCtrlPts = 12,
+        kNumCorners = 4,
+        kNumPtsCubic = 4
+    };
+
+    static void GetTopCubic(const SkPoint cubics[12], SkPoint points[4]);
+
+    static void GetBottomCubic(const SkPoint cubics[12], SkPoint points[4]);
+
+    static void GetLeftCubic(const SkPoint cubics[12], SkPoint points[4]);
+
+    static void GetRightCubic(const SkPoint cubics[12], SkPoint points[4]);
+
+    static SkISize GetLevelOfDetail(const SkPoint cubics[12], const SkMatrix* matrix);
+
+    static sk_sp<SkVertices> MakeVertices(const SkPoint cubics[12], const SkColor colors[4],
+                                          const SkPoint texCoords[4], int lodX, int lodY,
+                                          SkColorSpace* colorSpace = nullptr);
+};
+
+#endif

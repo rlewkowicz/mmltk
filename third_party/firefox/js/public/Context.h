@@ -1,0 +1,60 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_Context_h
+#define js_Context_h
+
+#include "jspubtd.h"
+
+extern JS_PUBLIC_API JSContext* JS_NewContext(
+    uint32_t maxbytes, JSRuntime* parentRuntime = nullptr);
+
+extern JS_PUBLIC_API void JS_DestroyContext(JSContext* cx);
+
+JS_PUBLIC_API void* JS_GetContextPrivate(JSContext* cx);
+
+JS_PUBLIC_API void JS_SetContextPrivate(JSContext* cx, void* data);
+
+extern JS_PUBLIC_API JSRuntime* JS_GetParentRuntime(JSContext* cx);
+
+extern JS_PUBLIC_API JSRuntime* JS_GetRuntime(JSContext* cx);
+
+extern JS_PUBLIC_API void JS_SetFutexCanWait(JSContext* cx);
+
+namespace js {
+
+void AssertHeapIsIdle();
+
+} 
+
+namespace JS {
+
+JS_PUBLIC_API void AssertObjectBelongsToCurrentThread(JSObject* obj);
+
+using FilenameValidationCallback = bool (*)(JSContext* cx,
+                                            const char* filename);
+JS_PUBLIC_API void SetFilenameValidationCallback(FilenameValidationCallback cb);
+
+using EnsureCanAddPrivateElementOp = bool (*)(JSContext* cx, HandleValue val);
+
+JS_PUBLIC_API void SetHostEnsureCanAddPrivateElementHook(
+    JSContext* cx, EnsureCanAddPrivateElementOp op);
+
+JS_PUBLIC_API bool SetBrittleMode(JSContext* cx, bool setting);
+
+class AutoBrittleMode {
+  bool wasBrittle;
+  JSContext* cx;
+
+ public:
+  explicit AutoBrittleMode(JSContext* cx) : cx(cx) {
+    wasBrittle = SetBrittleMode(cx, true);
+  }
+  ~AutoBrittleMode() { MOZ_ALWAYS_TRUE(SetBrittleMode(cx, wasBrittle)); }
+};
+
+} 
+
+#endif  // js_Context_h

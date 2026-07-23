@@ -1,0 +1,194 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef intl_components_TimeZone_h_
+#define intl_components_TimeZone_h_
+
+#if !MOZ_SYSTEM_ICU
+#  define MOZ_INTL_USE_ICU_CPP_TIMEZONE 1
+#else
+#  define MOZ_INTL_USE_ICU_CPP_TIMEZONE 0
+#endif
+
+#include <stdint.h>
+#include <utility>
+
+#include "unicode/ucal.h"
+#include "unicode/utypes.h"
+#if MOZ_INTL_USE_ICU_CPP_TIMEZONE
+#  include "unicode/locid.h"
+#  include "unicode/timezone.h"
+#  include "unicode/unistr.h"
+#endif
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Casting.h"
+#include "mozilla/intl/ICU4CGlue.h"
+#include "mozilla/intl/ICUError.h"
+#include "mozilla/intl/Locale.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Result.h"
+#include "mozilla/Span.h"
+#include "mozilla/UniquePtr.h"
+
+namespace mozilla::intl {
+
+class TimeZone final {
+ public:
+#if MOZ_INTL_USE_ICU_CPP_TIMEZONE
+  explicit TimeZone(UniquePtr<icu::TimeZone> aTimeZone)
+      : mTimeZone(std::move(aTimeZone)) {
+    MOZ_ASSERT(mTimeZone);
+  }
+#else
+  explicit TimeZone(UCalendar* aCalendar) : mCalendar(aCalendar) {
+    MOZ_ASSERT(mCalendar);
+  }
+#endif
+
+  TimeZone(const TimeZone&) = delete;
+  TimeZone& operator=(const TimeZone&) = delete;
+
+#if MOZ_INTL_USE_ICU_CPP_TIMEZONE
+  ~TimeZone() = default;
+#else
+  ~TimeZone();
+#endif
+
+  static Result<UniquePtr<TimeZone>, ICUError> TryCreate(
+      Maybe<Span<const char>> aTimeZoneOverride = Nothing{});
+
+  Result<int32_t, ICUError> GetRawOffsetMs();
+
+  Result<int32_t, ICUError> GetDSTOffsetMs(int64_t aUTCMilliseconds);
+
+  Result<int32_t, ICUError> GetOffsetMs(int64_t aUTCMilliseconds);
+
+  Result<int32_t, ICUError> GetUTCOffsetMs(int64_t aLocalMilliseconds);
+
+  enum class LocalOption {
+    Former,
+
+    Latter,
+  };
+
+  Result<int32_t, ICUError> GetUTCOffsetMs(int64_t aLocalMilliseconds,
+                                           LocalOption aSkippedTime,
+                                           LocalOption aRepeatedTime);
+
+  Result<Maybe<int64_t>, ICUError> GetPreviousTransition(
+      int64_t aUTCMilliseconds);
+
+  Result<Maybe<int64_t>, ICUError> GetNextTransition(int64_t aUTCMilliseconds);
+
+  enum class DaylightSavings : bool { No, Yes };
+
+  template <typename B>
+  ICUResult GetDisplayName(const char* aLocale,
+                           DaylightSavings aDaylightSavings, B& aBuffer) {
+#if MOZ_INTL_USE_ICU_CPP_TIMEZONE
+    icu::UnicodeString displayName;
+    mTimeZone->getDisplayName(static_cast<bool>(aDaylightSavings),
+                              icu::TimeZone::LONG, icu::Locale(aLocale),
+                              displayName);
+    return FillBuffer(displayName, aBuffer);
+#else
+    return FillBufferWithICUCall(
+        aBuffer, [&](UChar* target, int32_t length, UErrorCode* status) {
+          UCalendarDisplayNameType type =
+              static_cast<bool>(aDaylightSavings) ? UCAL_DST : UCAL_STANDARD;
+          return ucal_getTimeZoneDisplayName(mCalendar, type, aLocale, target,
+                                             length, status);
+        });
+#endif
+  }
+
+  template <typename B>
+  ICUResult GetId(B& aBuffer) {
+#if MOZ_INTL_USE_ICU_CPP_TIMEZONE
+    icu::UnicodeString id;
+    mTimeZone->getID(id);
+    return FillBuffer(id, aBuffer);
+#else
+    return FillBufferWithICUCall(
+        aBuffer, [&](UChar* target, int32_t length, UErrorCode* status) {
+          return ucal_getTimeZoneID(mCalendar, target, length, status);
+        });
+#endif
+  }
+
+  template <typename B>
+  static ICUResult GetDefaultTimeZone(B& aBuffer) {
+    return FillBufferWithICUCall(aBuffer, ucal_getDefaultTimeZone);
+  }
+
+  template <typename B>
+  static ICUResult GetHostTimeZone(B& aBuffer) {
+    return FillBufferWithICUCall(aBuffer, ucal_getHostTimeZone);
+  }
+
+  static Result<bool, ICUError> SetDefaultTimeZone(Span<const char> aTimeZone);
+
+  static ICUResult SetDefaultTimeZoneFromHostTimeZone();
+
+  static Result<Span<const char>, ICUError> GetTZDataVersion();
+
+  static constexpr size_t TimeZoneIdentifierLength = 32;
+
+  template <typename B>
+  static ICUResult GetCanonicalTimeZoneID(Span<const char16_t> inputTimeZone,
+                                          B& aBuffer) {
+    static_assert(std::is_same_v<typename B::CharType, char16_t>,
+                  "Currently only UTF-16 buffers are supported.");
+
+    if (aBuffer.capacity() == 0) {
+      if (!aBuffer.reserve(TimeZoneIdentifierLength)) {
+        return Err(ICUError::OutOfMemory);
+      }
+    }
+
+    return FillBufferWithICUCall(
+        aBuffer,
+        [&inputTimeZone](UChar* target, int32_t length, UErrorCode* status) {
+          return ucal_getCanonicalTimeZoneID(
+              inputTimeZone.Elements(),
+              static_cast<int32_t>(inputTimeZone.Length()), target, length,
+               nullptr, status);
+        });
+  }
+
+  static Result<SpanEnumeration<char>, ICUError> GetAvailableTimeZones(
+      const RegionSubtag& aRegion);
+
+  static Result<SpanEnumeration<char>, ICUError> GetAvailableTimeZones();
+
+ private:
+#if MOZ_INTL_USE_ICU_CPP_TIMEZONE
+  template <typename B>
+  static ICUResult FillBuffer(const icu::UnicodeString& aString, B& aBuffer) {
+    int32_t length = aString.length();
+    if (!aBuffer.reserve(AssertedCast<size_t>(length))) {
+      return Err(ICUError::OutOfMemory);
+    }
+
+    UErrorCode status = U_ZERO_ERROR;
+    int32_t written = aString.extract(aBuffer.data(), length, status);
+    if (!ICUSuccessForStringSpan(status)) {
+      return Err(ToICUError(status));
+    }
+    MOZ_ASSERT(written == length);
+
+    aBuffer.written(written);
+
+    return Ok{};
+  }
+
+  UniquePtr<icu::TimeZone> mTimeZone = nullptr;
+#else
+  UCalendar* mCalendar = nullptr;
+#endif
+};
+
+}  
+
+#endif

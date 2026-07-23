@@ -1,0 +1,3408 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "BrowserChild.h"
+
+#if defined(ACCESSIBILITY)
+#  include "mozilla/a11y/DocAccessibleChild.h"
+#  include "nsAccessibilityService.h"
+#endif
+#include <utility>
+
+#include "BrowserParent.h"
+#include "ContentChild.h"
+#include "EventStateManager.h"
+#include "MMPrinter.h"
+#include "PuppetWidget.h"
+#include "StructuredCloneData.h"
+#include "UnitTransforms.h"
+#include "Units.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/EventListenerManager.h"
+#include "mozilla/HoldDropJSObjects.h"
+#include "mozilla/IMEStateManager.h"
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/MediaFeatureChange.h"
+#include "mozilla/MiscEvents.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/NativeKeyBindingsType.h"
+#include "mozilla/NullPrincipal.h"
+#include "mozilla/PointerLockManager.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ProcessHangMonitor.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/Services.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/ToString.h"
+#include "mozilla/dom/BrowserBridgeChild.h"
+#include "mozilla/dom/DataTransfer.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/ImageDocument.h"
+#include "mozilla/dom/JSWindowActorChild.h"
+#include "mozilla/dom/LoadURIOptionsBinding.h"
+#include "mozilla/dom/MessageManagerBinding.h"
+#include "mozilla/dom/MouseEventBinding.h"
+#include "mozilla/dom/Nullable.h"
+#include "mozilla/dom/PBrowser.h"
+#include "mozilla/dom/PointerEventHandler.h"
+#include "mozilla/dom/SessionStoreChild.h"
+#include "mozilla/dom/SessionStoreUtils.h"
+#include "mozilla/dom/UserActivation.h"
+#include "mozilla/dom/ViewTransition.h"
+#include "mozilla/dom/WindowGlobalChild.h"
+#include "mozilla/dom/WindowProxyHolder.h"
+#include "mozilla/gfx/CrossProcessPaint.h"
+#include "mozilla/gfx/Matrix.h"
+#include "mozilla/ipc/BackgroundChild.h"
+#include "mozilla/ipc/BackgroundUtils.h"
+#include "mozilla/ipc/PBackgroundChild.h"
+#include "mozilla/layers/APZCCallbackHelper.h"
+#include "mozilla/layers/APZCTreeManagerChild.h"
+#include "mozilla/layers/APZChild.h"
+#include "mozilla/layers/APZEventState.h"
+#include "mozilla/layers/CompositorBridgeChild.h"
+#include "mozilla/layers/ContentProcessController.h"
+#include "mozilla/layers/DoubleTapToZoom.h"
+#include "mozilla/layers/IAPZCTreeManager.h"
+#include "mozilla/layers/ImageBridgeChild.h"
+#include "mozilla/layers/InputAPZContext.h"
+#include "mozilla/layers/TouchActionHelper.h"
+#include "mozilla/layers/WebRenderLayerManager.h"
+#include "mozilla/widget/ScreenManager.h"
+#include "mozilla/widget/WidgetLogging.h"
+#include "nsCommandParams.h"
+#include "nsContentPermissionHelper.h"
+#include "nsContentUtils.h"
+#include "nsDeviceContext.h"
+#include "nsDocShell.h"
+#include "nsDocShellLoadState.h"
+#include "nsDragServiceProxy.h"
+#include "nsFilePickerProxy.h"
+#include "nsFocusManager.h"
+#include "nsGlobalWindowOuter.h"
+#include "nsIBaseWindow.h"
+#include "nsIBrowserDOMWindow.h"
+#include "nsIClassifiedChannel.h"
+#include "nsIDocShell.h"
+#include "nsIFrame.h"
+#include "nsILoadContext.h"
+#include "nsIOpenWindowInfo.h"
+#include "nsISHEntry.h"
+#include "nsISHistory.h"
+#include "nsIScreenManager.h"
+#include "nsIScriptError.h"
+#include "nsIURI.h"
+#include "nsIURIMutator.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsIWebBrowser.h"
+#include "nsIWebProgress.h"
+#include "nsIXULRuntime.h"
+#include "nsLayoutUtils.h"
+#include "nsNetUtil.h"
+#include "nsPIDOMWindow.h"
+#include "nsPIWindowRoot.h"
+#include "nsPrintfCString.h"
+#include "nsRefreshDriver.h"
+#include "nsThreadManager.h"
+#include "nsThreadUtils.h"
+#include "nsVariant.h"
+#include "nsWebBrowser.h"
+#include "nsWindowWatcher.h"
+
+#if defined(MOZ_WAYLAND)
+#  include "nsAppRunner.h"
+#endif
+
+static mozilla::LazyLogModule sApzChildLog("apz.child");
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using namespace mozilla::dom::ipc;
+using namespace mozilla::ipc;
+using namespace mozilla::layers;
+using namespace mozilla::layout;
+using namespace mozilla::widget;
+using mozilla::layers::GeckoContentController;
+
+static const char BEFORE_FIRST_PAINT[] = "before-first-paint";
+
+static uint32_t sConsecutiveTouchMoveCount = 0;
+
+using BrowserChildMap = nsTHashMap<nsUint64HashKey, BrowserChild*>;
+static BrowserChildMap* sBrowserChildren;
+StaticMutex sBrowserChildrenMutex;
+
+namespace {
+
+class SynthesizedEventChildCallback final : public nsISynthesizedEventCallback {
+  NS_DECL_ISUPPORTS
+
+ public:
+  SynthesizedEventChildCallback(BrowserChild* aBrowserChild,
+                                const uint64_t& aCallbackId)
+      : mBrowserChild(aBrowserChild), mCallbackId(aCallbackId) {
+    MOZ_ASSERT(mBrowserChild);
+    MOZ_ASSERT(mCallbackId > 0, "Invalid callback ID");
+  }
+
+  NS_IMETHOD OnCompleteDispatch() override {
+    MOZ_ASSERT(mCallbackId > 0, "Invalid callback ID");
+
+    if (!mBrowserChild) {
+      MOZ_ASSERT_UNREACHABLE("OnCompleteDispatch called multiple times");
+      return NS_OK;
+    }
+
+    if (mBrowserChild->IsDestroyed()) {
+      NS_WARNING(
+          "BrowserChild was unexpectedly destroyed during event "
+          "synthesization response!");
+    } else if (!mBrowserChild->SendSynthesizedEventResponse(mCallbackId)) {
+      NS_WARNING("Unable to send event synthesization response!");
+    }
+    mBrowserChild = nullptr;
+    return NS_OK;
+  }
+
+ private:
+  virtual ~SynthesizedEventChildCallback() = default;
+
+  RefPtr<BrowserChild> mBrowserChild;
+  uint64_t mCallbackId;
+};
+
+NS_IMPL_ISUPPORTS(SynthesizedEventChildCallback, nsISynthesizedEventCallback)
+
+template <class T>
+class MOZ_RAII AutoSynthesizedEventResponder final {
+ public:
+  AutoSynthesizedEventResponder(BrowserChild* aBrowserChild, const T& aEvent) {
+    if (aEvent.mCallbackId.isSome()) {
+      mCallback = MakeAndAddRef<SynthesizedEventChildCallback>(
+          aBrowserChild, aEvent.mCallbackId.ref());
+    }
+  }
+
+  ~AutoSynthesizedEventResponder() {
+    if (mCallback) {
+      mCallback->OnCompleteDispatch();
+    }
+  }
+
+ private:
+  nsCOMPtr<nsISynthesizedEventCallback> mCallback;
+};
+
+}  
+
+already_AddRefed<Document> BrowserChild::GetTopLevelDocument() const {
+  nsCOMPtr<nsIDocShell> docShell = do_GetInterface(WebNavigation());
+  nsCOMPtr<Document> doc = docShell ? docShell->GetExtantDocument() : nullptr;
+  return doc.forget();
+}
+
+PresShell* BrowserChild::GetTopLevelPresShell() const {
+  if (RefPtr<Document> doc = GetTopLevelDocument()) {
+    return doc->GetPresShell();
+  }
+  return nullptr;
+}
+
+bool BrowserChild::UpdateFrame(const RepaintRequest& aRequest) {
+  MOZ_ASSERT(aRequest.GetScrollId() != ScrollableLayerGuid::NULL_SCROLL_ID);
+
+  if (aRequest.IsRootContent()) {
+    if (PresShell* presShell = GetTopLevelPresShell()) {
+      if (aRequest.GetPresShellId() == presShell->GetPresShellId()) {
+        APZCCallbackHelper::UpdateRootFrame(aRequest);
+        return true;
+      }
+    }
+  } else {
+    APZCCallbackHelper::UpdateSubFrame(aRequest);
+    return true;
+  }
+  return true;
+}
+
+class BrowserChild::DelayedDeleteRunnable final : public Runnable,
+                                                  public nsIRunnablePriority {
+  RefPtr<BrowserChild> mBrowserChild;
+
+  bool mReadyToDelete = false;
+
+ public:
+  explicit DelayedDeleteRunnable(BrowserChild* aBrowserChild)
+      : Runnable("BrowserChild::DelayedDeleteRunnable"),
+        mBrowserChild(aBrowserChild) {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT(aBrowserChild);
+  }
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+ private:
+  ~DelayedDeleteRunnable() {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT(!mBrowserChild);
+  }
+
+  NS_IMETHOD GetPriority(uint32_t* aPriority) override {
+    *aPriority = nsIRunnablePriority::PRIORITY_NORMAL;
+    return NS_OK;
+  }
+
+  NS_IMETHOD
+  Run() override {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT(mBrowserChild);
+
+    if (!mReadyToDelete) {
+      mReadyToDelete = true;
+      MOZ_ALWAYS_SUCCEEDS(NS_DispatchToCurrentThread(this));
+      return NS_OK;
+    }
+
+    if (mBrowserChild->IPCOpen()) {
+      (void)PBrowserChild::Send__delete__(mBrowserChild);
+    }
+
+    mBrowserChild = nullptr;
+    return NS_OK;
+  }
+};
+
+NS_IMPL_ISUPPORTS_INHERITED(BrowserChild::DelayedDeleteRunnable, Runnable,
+                            nsIRunnablePriority)
+
+namespace {
+std::map<TabId, RefPtr<BrowserChild>>& NestedBrowserChildMap() {
+  MOZ_ASSERT(NS_IsMainThread());
+  static std::map<TabId, RefPtr<BrowserChild>> sNestedBrowserChildMap;
+  return sNestedBrowserChildMap;
+}
+}  
+
+already_AddRefed<BrowserChild> BrowserChild::FindBrowserChild(
+    const TabId& aTabId) {
+  auto iter = NestedBrowserChildMap().find(aTabId);
+  if (iter == NestedBrowserChildMap().end()) {
+    return nullptr;
+  }
+  RefPtr<BrowserChild> browserChild = iter->second;
+  return browserChild.forget();
+}
+
+already_AddRefed<BrowserChild> BrowserChild::Create(
+    ContentChild* aManager, const TabId& aTabId, const TabContext& aContext,
+    BrowsingContext* aBrowsingContext, uint32_t aChromeFlags,
+    bool aIsTopLevel) {
+  RefPtr<BrowserChild> iframe = new BrowserChild(
+      aManager, aTabId, aContext, aBrowsingContext, aChromeFlags, aIsTopLevel);
+  return iframe.forget();
+}
+
+BrowserChild::BrowserChild(ContentChild* aManager, const TabId& aTabId,
+                           const TabContext& aContext,
+                           BrowsingContext* aBrowsingContext,
+                           uint32_t aChromeFlags, bool aIsTopLevel)
+    : TabContext(aContext),
+      mBrowserChildMessageManager(nullptr),
+      mManager(aManager),
+      mBrowsingContext(aBrowsingContext),
+      mChromeFlags(aChromeFlags),
+      mMaxTouchPoints(0),
+      mLayersId{0},
+      mEffectsInfo{EffectsInfo::FullyHidden()},
+      mDynamicToolbarMaxHeight(0),
+      mKeyboardHeight(0),
+      mUniqueId(aTabId),
+      mDidFakeShow(false),
+      mTriedBrowserInit(false),
+      mHasValidInnerSize(false),
+      mDestroyed(false),
+      mInAndroidPipMode(false),
+      mIsTopLevel(aIsTopLevel),
+      mIsTransparent(false),
+      mIPCOpen(false),
+      mDidSetRealShowInfo(false),
+      mDidLoadURLInit(false),
+      mSkipKeyPress(false),
+      mShouldSendWebProgressEventsToParent(false),
+      mRenderLayers(true),
+      mIsPreservingLayers(false),
+      mCancelContentJSEpoch(0) {
+  mozilla::HoldJSObjects(this);
+
+  if (mUniqueId) {
+    MOZ_ASSERT(NestedBrowserChildMap().find(mUniqueId) ==
+               NestedBrowserChildMap().end());
+    NestedBrowserChildMap()[mUniqueId] = this;
+  }
+  mCoalesceMouseMoveEvents = StaticPrefs::dom_events_coalesce_mousemove();
+  if (mCoalesceMouseMoveEvents) {
+    mCoalescedMouseEventFlusher = new CoalescedMouseMoveFlusher(this);
+  }
+
+  if (StaticPrefs::dom_events_coalesce_touchmove()) {
+    mCoalescedTouchMoveEventFlusher = new CoalescedTouchMoveFlusher(this);
+  }
+}
+
+const CompositorOptions& BrowserChild::GetCompositorOptions() const {
+  MOZ_ASSERT(mCompositorOptions);
+  return mCompositorOptions.ref();
+}
+
+bool BrowserChild::AsyncPanZoomEnabled() const {
+  return mCompositorOptions ? mCompositorOptions->UseAPZ() : true;
+}
+
+NS_IMETHODIMP
+BrowserChild::Observe(nsISupports* aSubject, const char* aTopic,
+                      const char16_t* aData) {
+  if (!strcmp(aTopic, BEFORE_FIRST_PAINT)) {
+    if (AsyncPanZoomEnabled()) {
+      nsCOMPtr<Document> subject(do_QueryInterface(aSubject));
+      nsCOMPtr<Document> doc(GetTopLevelDocument());
+
+      if (subject == doc) {
+        RefPtr<PresShell> presShell = doc->GetPresShell();
+        if (presShell) {
+          presShell->SetIsFirstPaint(true);
+        }
+
+        APZCCallbackHelper::InitializeRootDisplayport(presShell);
+      }
+    }
+  }
+
+  return NS_OK;
+}
+
+void BrowserChild::ContentReceivedInputBlock(uint64_t aInputBlockId,
+                                             bool aPreventDefault) const {
+  if (mApzcTreeManager) {
+    mApzcTreeManager->ContentReceivedInputBlock(aInputBlockId, aPreventDefault);
+  }
+}
+
+void BrowserChild::SetTargetAPZC(
+    uint64_t aInputBlockId,
+    const nsTArray<ScrollableLayerGuid>& aTargets) const {
+  if (mApzcTreeManager) {
+    mApzcTreeManager->SetTargetAPZC(aInputBlockId, aTargets);
+  }
+}
+
+void BrowserChild::NotifyApzAwareListenerAdded(
+    ScrollableLayerGuid::ViewID aScrollId) const {
+  if (mApzcTreeManager) {
+    mApzcTreeManager->NotifyApzAwareListenerAdded(
+        ScrollableLayerGuid(mLayersId, 0, aScrollId));
+  }
+}
+
+bool BrowserChild::DoUpdateZoomConstraints(
+    const uint32_t& aPresShellId, const ViewID& aViewId,
+    const Maybe<ZoomConstraints>& aConstraints) {
+  if (!mApzcTreeManager || mDestroyed) {
+    return false;
+  }
+
+  ScrollableLayerGuid guid =
+      ScrollableLayerGuid(mLayersId, aPresShellId, aViewId);
+
+  mApzcTreeManager->UpdateZoomConstraints(guid, aConstraints);
+  return true;
+}
+
+nsresult BrowserChild::Init(mozIDOMWindowProxy* aParent,
+                            WindowGlobalChild* aInitialWindowChild,
+                            nsIOpenWindowInfo* aOpenWindowInfo) {
+  MOZ_ASSERT(aOpenWindowInfo, "Must have openwindowinfo");
+  MOZ_ASSERT(aInitialWindowChild, "Must have window child");
+  MOZ_ASSERT(aInitialWindowChild->BrowsingContext() == mBrowsingContext);
+  MOZ_ASSERT(aInitialWindowChild->DocumentPrincipal() ==
+             aOpenWindowInfo->PrincipalToInheritForAboutBlank());
+
+  auto markAsUntrustedGuard =
+      MakeScopeExit([&] { ContentChild::MaybeBecomeUntrusted(); });
+
+  nsCOMPtr<nsIWidget> widget = nsIWidget::CreatePuppetWidget(this);
+  mPuppetWidget = static_cast<PuppetWidget*>(widget.get());
+  if (!mPuppetWidget) {
+    NS_ERROR("couldn't create fake widget");
+    return NS_ERROR_FAILURE;
+  }
+  mPuppetWidget->InfallibleCreate(nullptr, LayoutDeviceIntRect(),
+                                  widget::InitData());
+
+  MOZ_TRY(nsWebBrowser::Create(this, mPuppetWidget, mBrowsingContext,
+                               aInitialWindowChild, aOpenWindowInfo,
+                               getter_AddRefs(mWebBrowser)));
+  if (!mWebBrowser) {
+    return NS_ERROR_FAILURE;
+  }
+  nsIWebBrowser* webBrowser = mWebBrowser;
+
+  mWebNav = do_QueryInterface(webBrowser);
+  NS_ASSERTION(mWebNav, "nsWebBrowser doesn't implement nsIWebNavigation?");
+
+  mWebBrowser->SetAllowDNSPrefetch(true);
+
+  nsCOMPtr<nsIDocShell> docShell = do_GetInterface(WebNavigation());
+  MOZ_ASSERT(docShell);
+
+#if defined(DEBUG)
+  nsCOMPtr<nsILoadContext> loadContext = do_GetInterface(WebNavigation());
+  MOZ_ASSERT(loadContext);
+  MOZ_ASSERT(loadContext->UseRemoteTabs() ==
+             !!(mChromeFlags & nsIWebBrowserChrome::CHROME_REMOTE_WINDOW));
+  MOZ_ASSERT(loadContext->UseRemoteSubframes() ==
+             !!(mChromeFlags & nsIWebBrowserChrome::CHROME_FISSION_WINDOW));
+#endif
+
+  nsCOMPtr<nsPIDOMWindowOuter> window = do_GetInterface(WebNavigation());
+  NS_ENSURE_TRUE(window, NS_ERROR_FAILURE);
+  nsCOMPtr<EventTarget> chromeHandler = window->GetChromeEventHandler();
+  docShell->SetChromeEventHandler(chromeHandler);
+
+  if (mIsTopLevel) {
+    nsContentUtils::SetScrollbarsVisibility(
+        docShell, !!(mChromeFlags & nsIWebBrowserChrome::CHROME_SCROLLBARS));
+  }
+
+  nsWeakPtr weakPtrThis = do_GetWeakReference(
+      static_cast<nsIBrowserChild*>(this));  
+  ContentReceivedInputBlockCallback callback(
+      [weakPtrThis](uint64_t aInputBlockId, bool aPreventDefault) {
+        if (nsCOMPtr<nsIBrowserChild> browserChild =
+                do_QueryReferent(weakPtrThis)) {
+          static_cast<BrowserChild*>(browserChild.get())
+              ->ContentReceivedInputBlock(aInputBlockId, aPreventDefault);
+        }
+      });
+  mAPZEventState = new APZEventState(mPuppetWidget, std::move(callback));
+
+  mIPCOpen = true;
+
+  if (SessionStorePlatformCollection()) {
+    mSessionStoreChild = SessionStoreChild::GetOrCreate(mBrowsingContext);
+  }
+
+  UpdateVisibility();
+
+  return NS_OK;
+}
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(BrowserChild)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(BrowserChild)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mBrowserChildMessageManager)
+  tmp->nsMessageManagerScriptExecutor::Unlink();
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mWebBrowser)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mWebNav)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mBrowsingContext)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mSessionStoreChild)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mContentTransformPromise)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_REFERENCE
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(BrowserChild)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mBrowserChildMessageManager)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mWebBrowser)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mWebNav)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mBrowsingContext)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mSessionStoreChild)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mContentTransformPromise)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN(BrowserChild)
+  tmp->nsMessageManagerScriptExecutor::Trace(aCallbacks, aClosure);
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(BrowserChild)
+  NS_INTERFACE_MAP_ENTRY_CONCRETE(BrowserChild)
+  NS_INTERFACE_MAP_ENTRY(nsIWebBrowserChrome)
+  NS_INTERFACE_MAP_ENTRY(nsIInterfaceRequestor)
+  NS_INTERFACE_MAP_ENTRY(nsIWindowProvider)
+  NS_INTERFACE_MAP_ENTRY(nsIBrowserChild)
+  NS_INTERFACE_MAP_ENTRY(nsIObserver)
+  NS_INTERFACE_MAP_ENTRY(nsISupportsWeakReference)
+  NS_INTERFACE_MAP_ENTRY(nsITooltipListener)
+  NS_INTERFACE_MAP_ENTRY(nsIWebProgressListener)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIBrowserChild)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(BrowserChild)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(BrowserChild)
+
+NS_IMETHODIMP
+BrowserChild::GetChromeFlags(uint32_t* aChromeFlags) {
+  *aChromeFlags = mChromeFlags;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+BrowserChild::SetChromeFlags(uint32_t aChromeFlags) {
+  NS_WARNING("trying to SetChromeFlags from content process?");
+
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+BrowserChild::RemoteDropLinks(
+    const nsTArray<RefPtr<nsIDroppedLinkItem>>& aLinks) {
+  nsTArray<nsString> linksArray;
+  nsresult rv = NS_OK;
+  for (nsIDroppedLinkItem* link : aLinks) {
+    nsString tmp;
+    rv = link->GetUrl(tmp);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    linksArray.AppendElement(tmp);
+
+    rv = link->GetName(tmp);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    linksArray.AppendElement(tmp);
+
+    rv = link->GetType(tmp);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    linksArray.AppendElement(tmp);
+  }
+  bool sent = SendDropLinks(linksArray);
+
+  return sent ? NS_OK : NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+BrowserChild::ShowAsModal() {
+  NS_WARNING("BrowserChild::ShowAsModal not supported in BrowserChild");
+
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+BrowserChild::IsWindowModal(bool* aRetVal) {
+  *aRetVal = false;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+BrowserChild::SetLinkStatus(const nsAString& aStatusText) {
+  if (IPCOpen()) {
+    SendSetLinkStatus(aStatusText);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+BrowserChild::SetDimensions(DimensionRequest&& aRequest) {
+
+  double scale = mPuppetWidget ? mPuppetWidget->GetDefaultScale().scale : 1.0;
+  SendSetDimensions(aRequest, scale);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+BrowserChild::GetDimensions(DimensionKind aDimensionKind, int32_t* aX,
+                            int32_t* aY, int32_t* aCx, int32_t* aCy) {
+  LayoutDeviceIntRect rect = GetOuterRect();
+  if (aDimensionKind == DimensionKind::Inner) {
+    if (aX || aY) {
+      return NS_ERROR_NOT_IMPLEMENTED;
+    }
+    rect.SizeTo(GetInnerSize());
+  }
+  if (aX) {
+    *aX = rect.x;
+  }
+  if (aY) {
+    *aY = rect.y;
+  }
+  if (aCx) {
+    *aCx = rect.width;
+  }
+  if (aCy) {
+    *aCy = rect.height;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+BrowserChild::Blur() { return NS_ERROR_NOT_IMPLEMENTED; }
+
+NS_IMETHODIMP
+BrowserChild::GetInterface(const nsIID& aIID, void** aSink) {
+  return QueryInterface(aIID, aSink);
+}
+
+NS_IMETHODIMP
+BrowserChild::ProvideWindow(nsIOpenWindowInfo* aOpenWindowInfo,
+                            uint32_t aChromeFlags, bool aCalledFromJS,
+                            nsIURI* aURI, const nsAString& aName,
+                            const nsACString& aFeatures,
+                            const UserActivation::Modifiers& aModifiers,
+                            bool aForceNoOpener, bool aForceNoReferrer,
+                            bool aIsPopupRequested,
+                            nsDocShellLoadState* aLoadState, bool* aWindowIsNew,
+                            BrowsingContext** aReturn) {
+  *aReturn = nullptr;
+
+  RefPtr<BrowsingContext> parent = aOpenWindowInfo->GetParent();
+
+  int32_t openLocation = nsWindowWatcher::GetWindowOpenLocation(
+      parent->GetDOMWindow(), aChromeFlags, aModifiers, aCalledFromJS,
+      aOpenWindowInfo->GetIsForPrinting());
+
+  if (openLocation == nsIBrowserDOMWindow::OPEN_CURRENTWINDOW) {
+    nsCOMPtr<nsIWebBrowser> browser = do_GetInterface(WebNavigation());
+    *aWindowIsNew = false;
+
+    nsCOMPtr<mozIDOMWindowProxy> win;
+    MOZ_TRY(browser->GetContentDOMWindow(getter_AddRefs(win)));
+
+    RefPtr<BrowsingContext> bc(
+        nsPIDOMWindowOuter::From(win)->GetBrowsingContext());
+    bc.forget(aReturn);
+    return NS_OK;
+  }
+
+  ContentChild* cc = ContentChild::GetSingleton();
+  return cc->ProvideWindowCommon(
+      WrapNotNull(this), aOpenWindowInfo, aChromeFlags, aCalledFromJS, aURI,
+      aName, aFeatures, aModifiers, aForceNoOpener, aForceNoReferrer,
+      aIsPopupRequested, aLoadState, aWindowIsNew, aReturn);
+}
+
+void BrowserChild::DestroyWindow() {
+  mBrowsingContext = nullptr;
+
+  if (mCoalescedMouseEventFlusher) {
+    mCoalescedMouseEventFlusher->RemoveObserver();
+    mCoalescedMouseEventFlusher = nullptr;
+  }
+
+  if (mCoalescedTouchMoveEventFlusher) {
+    mCoalescedTouchMoveEventFlusher->RemoveObserver();
+    mCoalescedTouchMoveEventFlusher = nullptr;
+  }
+
+  if (mSessionStoreChild) {
+    mSessionStoreChild->Stop();
+    mSessionStoreChild = nullptr;
+  }
+
+  while (mToBeDispatchedMouseData.GetSize() > 0) {
+    UniquePtr<CoalescedMouseData> data(
+        static_cast<CoalescedMouseData*>(mToBeDispatchedMouseData.PopFront()));
+    data.reset();
+  }
+
+  nsCOMPtr<nsIBaseWindow> baseWindow = do_QueryInterface(WebNavigation());
+  if (baseWindow) baseWindow->Destroy();
+
+  if (mPuppetWidget) {
+    mPuppetWidget->Destroy();
+  }
+
+  mLayersConnected = Nothing();
+
+  if (mLayersId.IsValid()) {
+    StaticMutexAutoLock lock(sBrowserChildrenMutex);
+
+    MOZ_ASSERT(sBrowserChildren);
+    sBrowserChildren->Remove(uint64_t(mLayersId));
+    if (!sBrowserChildren->Count()) {
+      delete sBrowserChildren;
+      sBrowserChildren = nullptr;
+    }
+    mLayersId = layers::LayersId{0};
+  }
+
+  if (mAPZEventState) {
+    mAPZEventState->Destroy();
+    mAPZEventState = nullptr;
+  }
+}
+
+void BrowserChild::ActorDestroy(ActorDestroyReason why) {
+  mIPCOpen = false;
+
+  DestroyWindow();
+
+  if (mBrowserChildMessageManager) {
+    MOZ_DIAGNOSTIC_ASSERT(mBrowserChildMessageManager->GetMessageManager());
+    if (mBrowserChildMessageManager->GetMessageManager()) {
+      mBrowserChildMessageManager->DisconnectMessageManager();
+    }
+  }
+
+  if (GetTabId() != 0) {
+    NestedBrowserChildMap().erase(GetTabId());
+  }
+}
+
+BrowserChild::~BrowserChild() {
+  mAnonymousGlobalScopes.Clear();
+
+  DestroyWindow();
+
+  nsCOMPtr<nsIWebBrowser> webBrowser = do_QueryInterface(WebNavigation());
+  if (webBrowser) {
+    webBrowser->SetContainerWindow(nullptr);
+  }
+
+  mozilla::DropJSObjects(this);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvWillChangeProcess() {
+  if (mWebBrowser) {
+    mWebBrowser->SetWillChangeProcess();
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvLoadURL(
+    nsDocShellLoadState* aLoadState, const ParentShowInfo& aInfo) {
+  if (!mDidLoadURLInit) {
+    mDidLoadURLInit = true;
+    if (!InitBrowserChildMessageManager()) {
+      return IPC_FAIL_NO_REASON(this);
+    }
+
+    ApplyParentShowInfo(aInfo);
+  }
+  nsAutoCString spec;
+  aLoadState->URI()->GetSpec(spec);
+
+  nsCOMPtr<nsIDocShell> docShell = do_GetInterface(WebNavigation());
+  if (!docShell) {
+    NS_WARNING("WebNavigation does not have a docshell");
+    return IPC_OK();
+  }
+  docShell->LoadURI(aLoadState, true);
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvCreateAboutBlankDocumentViewer(
+    nsIPrincipal* aPrincipal, nsIPrincipal* aPartitionedPrincipal) {
+  if (aPrincipal->GetIsExpandedPrincipal() ||
+      aPartitionedPrincipal->GetIsExpandedPrincipal()) {
+    return IPC_FAIL(this, "Cannot create document with an expanded principal");
+  }
+  if (aPrincipal->IsSystemPrincipal() ||
+      aPartitionedPrincipal->IsSystemPrincipal()) {
+    MOZ_ASSERT_UNREACHABLE(
+        "Cannot use CreateAboutBlankDocumentViewer to create system principal "
+        "document in content");
+    return IPC_OK();
+  }
+
+  nsCOMPtr<nsIDocShell> docShell = do_GetInterface(WebNavigation());
+  if (!docShell) {
+    MOZ_ASSERT_UNREACHABLE("WebNavigation does not have a docshell");
+    return IPC_OK();
+  }
+
+  nsCOMPtr<nsIURI> currentURI;
+  MOZ_ALWAYS_SUCCEEDS(
+      WebNavigation()->GetCurrentURI(getter_AddRefs(currentURI)));
+  if (!currentURI || !NS_IsAboutBlank(currentURI)) {
+    NS_WARNING("Can't create a DocumentViewer unless on about:blank");
+    return IPC_OK();
+  }
+
+  docShell->CreateAboutBlankDocumentViewer(aPrincipal, aPartitionedPrincipal,
+                                           nullptr);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvResumeLoad(
+    const uint64_t& aPendingSwitchID, const ParentShowInfo& aInfo) {
+  if (!mDidLoadURLInit) {
+    mDidLoadURLInit = true;
+    if (!InitBrowserChildMessageManager()) {
+      return IPC_FAIL_NO_REASON(this);
+    }
+
+    ApplyParentShowInfo(aInfo);
+  }
+
+  nsresult rv = WebNavigation()->ResumeRedirectedLoad(aPendingSwitchID);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("WebNavigation()->ResumeRedirectedLoad failed");
+  }
+
+  return IPC_OK();
+}
+
+void BrowserChild::DoFakeShow(const ParentShowInfo& aParentShowInfo) {
+  OwnerShowInfo ownerInfo{LayoutDeviceIntSize(), ScrollbarPreference::Auto,
+                          nsSizeMode_Normal};
+  RecvShow(aParentShowInfo, ownerInfo);
+  mDidFakeShow = true;
+}
+
+void BrowserChild::ApplyParentShowInfo(const ParentShowInfo& aInfo) {
+  if (aInfo.dpi() > 0) {
+    mPuppetWidget->UpdateBackingScaleCache(aInfo.dpi(), aInfo.widgetRounding(),
+                                           aInfo.defaultScale(),
+                                           aInfo.desktopToDeviceScale());
+  }
+
+  if (mDidSetRealShowInfo) {
+    return;
+  }
+
+  if (!aInfo.fakeShowInfo()) {
+    mDidSetRealShowInfo = true;
+  }
+
+  mIsTransparent = aInfo.isTransparent();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvShow(
+    const ParentShowInfo& aParentInfo, const OwnerShowInfo& aOwnerInfo) {
+  bool res = true;
+
+  mPuppetWidget->SetSizeMode(aOwnerInfo.sizeMode());
+  if (!mDidFakeShow) {
+    nsCOMPtr<nsIBaseWindow> baseWindow = do_QueryInterface(WebNavigation());
+    if (!baseWindow) {
+      NS_ERROR("WebNavigation() doesn't QI to nsIBaseWindow");
+      return IPC_FAIL_NO_REASON(this);
+    }
+
+    baseWindow->SetVisibility(true);
+    res = InitBrowserChildMessageManager();
+  }
+
+  ApplyParentShowInfo(aParentInfo);
+
+  if (!mIsTopLevel) {
+    RecvScrollbarPreferenceChanged(aOwnerInfo.scrollbarPreference());
+  }
+
+  if (!res) {
+    return IPC_FAIL_NO_REASON(this);
+  }
+
+  UpdateVisibility();
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvInitRendering(
+    const TextureFactoryIdentifier& aTextureFactoryIdentifier,
+    const layers::LayersId& aLayersId,
+    const CompositorOptions& aCompositorOptions, const bool& aLayersConnected) {
+  mLayersConnected = Some(aLayersConnected);
+  mLayersConnectRequested = Some(aLayersConnected);
+  InitRenderingState(aTextureFactoryIdentifier, aLayersId, aCompositorOptions);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvScrollbarPreferenceChanged(
+    ScrollbarPreference aPreference) {
+  MOZ_ASSERT(!mIsTopLevel,
+             "Scrollbar visibility should be derived from chrome flags for "
+             "top-level windows");
+  if (nsCOMPtr<nsIDocShell> docShell = do_GetInterface(WebNavigation())) {
+    nsDocShell::Cast(docShell)->SetScrollbarPreference(aPreference);
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvCompositorOptionsChanged(
+    const CompositorOptions& aNewOptions) {
+  MOZ_ASSERT(mCompositorOptions);
+
+  mCompositorOptions->SetUseAPZ(aNewOptions.UseAPZ());
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvUpdateDimensions(
+    const DimensionInfo& aDimensionInfo) {
+  if (mLayersConnected.isNothing()) {
+    return IPC_OK();
+  }
+
+  mUnscaledOuterRect = aDimensionInfo.rect();
+  mClientOffset = aDimensionInfo.clientOffset();
+  mChromeOffset = aDimensionInfo.chromeOffset();
+  MOZ_ASSERT_IF(!IsTopLevel(), mChromeOffset == LayoutDeviceIntPoint());
+
+  SetUnscaledInnerSize(aDimensionInfo.size());
+  if (!mHasValidInnerSize && aDimensionInfo.size().width != 0 &&
+      aDimensionInfo.size().height != 0) {
+    mHasValidInnerSize = true;
+  }
+
+  const LayoutDeviceIntSize innerSize = GetInnerSize();
+  nsCOMPtr<nsIBaseWindow> baseWin = do_QueryInterface(WebNavigation());
+  baseWin->SetPositionAndSize(0, 0, innerSize.width, innerSize.height,
+                              nsIBaseWindow::eRepaint);
+
+  const LayoutDeviceIntRect widgetRect(
+      GetOuterRect().TopLeft() + mClientOffset + mChromeOffset, innerSize);
+  mPuppetWidget->Resize(widgetRect / mPuppetWidget->GetDesktopToDeviceScale(),
+                        true);
+
+  RecvSafeAreaInsetsChanged(mPuppetWidget->GetSafeAreaInsets());
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvSizeModeChanged(
+    const nsSizeMode& aSizeMode) {
+  mPuppetWidget->SetSizeMode(aSizeMode);
+  if (!mPuppetWidget->IsVisible()) {
+    return IPC_OK();
+  }
+  nsCOMPtr<Document> document(GetTopLevelDocument());
+  if (!document) {
+    return IPC_OK();
+  }
+  nsPresContext* presContext = document->GetPresContext();
+  if (presContext) {
+    presContext->SizeModeChanged(aSizeMode);
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvChildToParentMatrix(
+    const Maybe<gfx::Matrix4x4>& aMatrix,
+    const ScreenRect& aTopLevelViewportVisibleRectInBrowserCoords) {
+  mChildToParentConversionMatrix =
+      LayoutDeviceToLayoutDeviceMatrix4x4::FromUnknownMatrix(aMatrix);
+  mTopLevelViewportVisibleRectInBrowserCoords =
+      aTopLevelViewportVisibleRectInBrowserCoords;
+
+  if (mContentTransformPromise) {
+    mContentTransformPromise->MaybeResolveWithUndefined();
+    mContentTransformPromise = nullptr;
+  }
+
+  if (RefPtr<Document> toplevelDoc = GetTopLevelDocument()) {
+    if (nsPresContext* pc = toplevelDoc->GetPresContext()) {
+      pc->RefreshDriver()->EnsureIntersectionObservationsUpdateHappens();
+    }
+  }
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvUpdateRemoteStyle(
+    const StyleImageRendering& aImageRendering) {
+  BrowsingContext* context = GetBrowsingContext();
+  if (!context) {
+    return IPC_OK();
+  }
+
+  Document* document = context->GetDocument();
+  if (!document) {
+    return IPC_OK();
+  }
+
+  if (document->IsImageDocument()) {
+    document->AsImageDocument()->UpdateRemoteStyle(aImageRendering);
+  }
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvDynamicToolbarMaxHeightChanged(
+    const ScreenIntCoord& aHeight) {
+  mDynamicToolbarMaxHeight = aHeight;
+
+  RefPtr<Document> document = GetTopLevelDocument();
+  if (!document) {
+    return IPC_OK();
+  }
+
+  if (RefPtr<nsPresContext> presContext = document->GetPresContext()) {
+    presContext->SetDynamicToolbarMaxHeight(aHeight);
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvDynamicToolbarOffsetChanged(
+    const ScreenIntCoord& aOffset) {
+  RefPtr<Document> document = GetTopLevelDocument();
+  if (!document) {
+    return IPC_OK();
+  }
+
+  if (nsPresContext* presContext = document->GetPresContext()) {
+    presContext->UpdateDynamicToolbarOffset(aOffset);
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvKeyboardHeightChanged(
+    const ScreenIntCoord& aHeight) {
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvAndroidPipModeChanged(bool aPipMode) {
+  if (mInAndroidPipMode == aPipMode) {
+    return IPC_OK();
+  }
+  mInAndroidPipMode = aPipMode;
+  if (RefPtr<Document> document = GetTopLevelDocument()) {
+    if (nsPresContext* presContext = document->GetPresContext()) {
+      presContext->MediaFeatureValuesChanged(
+          {MediaFeatureChangeReason::DisplayModeChange},
+          MediaFeatureChangePropagation::JustThisDocument);
+    }
+    nsContentUtils::DispatchEventOnlyToChrome(
+        document, document,
+        aPipMode ? u"MozAndroidPipModeEntered"_ns
+                 : u"MozAndroidPipModeExited"_ns,
+        CanBubble::eYes, Cancelable::eNo,  nullptr);
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvSuppressDisplayport(
+    const bool& aEnabled) {
+  if (RefPtr<PresShell> presShell = GetTopLevelPresShell()) {
+    presShell->SuppressDisplayport(aEnabled);
+  }
+  return IPC_OK();
+}
+
+void BrowserChild::HandleDoubleTap(const CSSPoint& aPoint,
+                                   const Modifiers& aModifiers,
+                                   const ScrollableLayerGuid& aGuid,
+                                   const DoubleTapToZoomMetrics& aMetrics) {
+  MOZ_LOG(
+      sApzChildLog, LogLevel::Debug,
+      ("Handling double tap at %s with %p %p\n", ToString(aPoint).c_str(),
+       mBrowserChildMessageManager ? mBrowserChildMessageManager->GetWrapper()
+                                   : nullptr,
+       mBrowserChildMessageManager.get()));
+
+  if (!mBrowserChildMessageManager) {
+    return;
+  }
+
+  RefPtr<Document> document = GetTopLevelDocument();
+  ZoomTarget zoomTarget = CalculateRectToZoomTo(document, aPoint, aMetrics);
+  uint32_t presShellId;
+  ViewID viewId;
+  if (APZCCallbackHelper::GetOrCreateScrollIdentifiers(
+          document->GetDocumentElement(), &presShellId, &viewId) &&
+      mApzcTreeManager) {
+    ScrollableLayerGuid guid(mLayersId, presShellId, viewId);
+
+    mApzcTreeManager->ZoomToRect(guid, zoomTarget,
+                                 ZoomToRectBehavior::DEFAULT_BEHAVIOR);
+  }
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvHandleTap(
+    const GeckoContentController::TapType& aType,
+    const LayoutDevicePoint& aPoint, const Modifiers& aModifiers,
+    const ScrollableLayerGuid& aGuid, const uint64_t& aInputBlockId,
+    const Maybe<DoubleTapToZoomMetrics>& aDoubleTapToZoomMetrics) {
+  RefPtr<BrowserChild> kungFuDeathGrip(this);
+  RefPtr<PresShell> presShell = GetTopLevelPresShell();
+  if (!presShell || !presShell->GetPresContext() || !mAPZEventState) {
+    return IPC_OK();
+  }
+  CSSToLayoutDeviceScale scale(
+      presShell->GetPresContext()->CSSToDevPixelScale());
+  CSSPoint point = aPoint / scale;
+
+  InputAPZContext context(aGuid, aInputBlockId, nsEventStatus_eSentinel);
+
+  switch (aType) {
+    case GeckoContentController::TapType::eSingleTap:
+      if (mBrowserChildMessageManager) {
+        RefPtr<APZEventState> eventState(mAPZEventState);
+        eventState->ProcessSingleTap(point, scale, aModifiers, 1,
+                                     aInputBlockId);
+      }
+      break;
+    case GeckoContentController::TapType::eDoubleTap:
+      HandleDoubleTap(point, aModifiers, aGuid, *aDoubleTapToZoomMetrics);
+      break;
+    case GeckoContentController::TapType::eSecondTap:
+      if (mBrowserChildMessageManager) {
+        RefPtr<APZEventState> eventState(mAPZEventState);
+        eventState->ProcessSingleTap(point, scale, aModifiers, 2,
+                                     aInputBlockId);
+      }
+      break;
+    case GeckoContentController::TapType::eLongTap:
+      if (mBrowserChildMessageManager) {
+        RefPtr<APZEventState> eventState(mAPZEventState);
+        eventState->ProcessLongTap(presShell, point, scale, aModifiers,
+                                   aInputBlockId);
+      }
+      break;
+    case GeckoContentController::TapType::eLongTapUp:
+      if (mBrowserChildMessageManager) {
+        RefPtr<APZEventState> eventState(mAPZEventState);
+        eventState->ProcessLongTapUp(presShell, point, scale, aModifiers);
+      }
+      break;
+  }
+
+  PointerEventHandler::ReleasePointerCapturingElementAtLastPointerUp();
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvNormalPriorityHandleTap(
+    const GeckoContentController::TapType& aType,
+    const LayoutDevicePoint& aPoint, const Modifiers& aModifiers,
+    const ScrollableLayerGuid& aGuid, const uint64_t& aInputBlockId,
+    const Maybe<DoubleTapToZoomMetrics>& aDoubleTapToZoomMetrics) {
+  RefPtr<BrowserChild> kungFuDeathGrip(this);
+  return RecvHandleTap(aType, aPoint, aModifiers, aGuid, aInputBlockId,
+                       aDoubleTapToZoomMetrics);
+}
+
+void BrowserChild::NotifyAPZStateChange(
+    const ViewID& aViewId,
+    const layers::GeckoContentController::APZStateChange& aChange,
+    const int& aArg, Maybe<uint64_t> aInputBlockId) {
+  if (mAPZEventState) {
+    mAPZEventState->ProcessAPZStateChange(aViewId, aChange, aArg,
+                                          aInputBlockId);
+  }
+  nsCOMPtr<nsIObserverService> observerService =
+      mozilla::services::GetObserverService();
+  if (aChange ==
+      layers::GeckoContentController::APZStateChange::eTransformEnd) {
+    observerService->NotifyObservers(nullptr, "APZ:TransformEnd", nullptr);
+    observerService->NotifyObservers(nullptr, "PanZoom:StateChange",
+                                     u"NOTHING");
+  } else if (aChange ==
+             layers::GeckoContentController::APZStateChange::eTransformBegin) {
+    observerService->NotifyObservers(nullptr, "PanZoom:StateChange",
+                                     u"PANNING");
+  }
+}
+
+void BrowserChild::StartScrollbarDrag(
+    const layers::AsyncDragMetrics& aDragMetrics) {
+  ScrollableLayerGuid guid(mLayersId, aDragMetrics.mPresShellId,
+                           aDragMetrics.mViewId);
+
+  if (mApzcTreeManager) {
+    mApzcTreeManager->StartScrollbarDrag(guid, aDragMetrics);
+  }
+}
+
+void BrowserChild::ZoomToRect(const uint32_t& aPresShellId,
+                              const ScrollableLayerGuid::ViewID& aViewId,
+                              const CSSRect& aRect, const uint32_t& aFlags) {
+  ScrollableLayerGuid guid(mLayersId, aPresShellId, aViewId);
+
+  if (mApzcTreeManager) {
+    mApzcTreeManager->ZoomToRect(guid, ZoomTarget{aRect}, aFlags);
+  }
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvActivate(uint64_t aActionId) {
+  MOZ_ASSERT(mWebBrowser);
+  mWebBrowser->FocusActivate(aActionId);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvDeactivate(uint64_t aActionId) {
+  MOZ_ASSERT(mWebBrowser);
+  mWebBrowser->FocusDeactivate(aActionId);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvStopIMEStateManagement() {
+  IMEStateManager::StopIMEStateManagement();
+  return IPC_OK();
+}
+
+void BrowserChild::ProcessPendingCoalescedTouchData() {
+  MOZ_ASSERT(StaticPrefs::dom_events_coalesce_touchmove());
+
+  if (mCoalescedTouchData.IsEmpty()) {
+    return;
+  }
+
+  if (mCoalescedTouchMoveEventFlusher) {
+    mCoalescedTouchMoveEventFlusher->RemoveObserver();
+  }
+
+  UniquePtr<WidgetTouchEvent> touchMoveEvent =
+      mCoalescedTouchData.TakeCoalescedEvent();
+  (void)RecvRealTouchEvent(*touchMoveEvent,
+                           mCoalescedTouchData.GetScrollableLayerGuid(),
+                           mCoalescedTouchData.GetInputBlockId(),
+                           mCoalescedTouchData.GetApzResponse());
+}
+
+void BrowserChild::ProcessPendingCoalescedMouseDataAndDispatchEvents() {
+  if (!mCoalesceMouseMoveEvents || !mCoalescedMouseEventFlusher) {
+    return;
+  }
+
+
+  mCoalescedMouseEventFlusher->StartObserver();
+
+  while (mToBeDispatchedMouseData.GetSize() > 0) {
+    UniquePtr<CoalescedMouseData> data(
+        static_cast<CoalescedMouseData*>(mToBeDispatchedMouseData.PopFront()));
+
+    if (const UniquePtr<WidgetMouseEvent> mouseOrPointerEvent =
+            data->TakeCoalescedEvent()) {
+      MOZ_ASSERT_IF(mouseOrPointerEvent->AsPointerEvent(),
+                    IsPointerEventMessage(mouseOrPointerEvent->mMessage));
+      MOZ_ASSERT_IF(!mouseOrPointerEvent->AsPointerEvent(),
+                    !IsPointerEventMessage(mouseOrPointerEvent->mMessage));
+      MOZ_ASSERT_IF(mToBeDispatchedMouseData.GetSize() > 0,
+                    !mouseOrPointerEvent->convertToPointerRawUpdate);
+      HandleRealMouseButtonEvent(*mouseOrPointerEvent,
+                                 data->GetScrollableLayerGuid(),
+                                 data->GetInputBlockId());
+    }
+  }
+  if (mCoalescedMouseEventFlusher) {
+    mCoalescedMouseEventFlusher->RemoveObserver();
+  }
+}
+
+LayoutDeviceToLayoutDeviceMatrix4x4
+BrowserChild::GetChildToParentConversionMatrix() const {
+  if (mChildToParentConversionMatrix) {
+    return *mChildToParentConversionMatrix;
+  }
+  LayoutDevicePoint offset(GetChromeOffset());
+  return LayoutDeviceToLayoutDeviceMatrix4x4::Translation(offset);
+}
+
+Maybe<ScreenRect> BrowserChild::GetTopLevelViewportVisibleRectInBrowserCoords()
+    const {
+  if (!mChildToParentConversionMatrix) {
+    return Nothing();
+  }
+  return Some(mTopLevelViewportVisibleRectInBrowserCoords);
+}
+
+void BrowserChild::FlushAllCoalescedMouseData() {
+  MOZ_ASSERT(mCoalesceMouseMoveEvents);
+
+  for (const auto& data : mCoalescedMouseData.Values()) {
+    if (!data || data->IsEmpty()) {
+      continue;
+    }
+    UniquePtr<CoalescedMouseData> dispatchData =
+        MakeUnique<CoalescedMouseData>();
+
+    dispatchData->RetrieveDataFrom(*data);
+    mToBeDispatchedMouseData.Push(dispatchData.release());
+  }
+  mCoalescedMouseData.Clear();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvRealMouseMoveEvent(
+    const WidgetMouseEvent& aMouseEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId) {
+  MOZ_ASSERT(!aMouseEvent.AsPointerEvent());
+  MOZ_ASSERT(!aMouseEvent.AsDragEvent());
+  if (mCoalesceMouseMoveEvents && mCoalescedMouseEventFlusher) {
+    CoalescedMouseData* data =
+        mCoalescedMouseData.GetOrInsertNew(aMouseEvent.pointerId);
+    MOZ_ASSERT(data);
+    if (data->CanCoalesce(aMouseEvent, aGuid, aInputBlockId,
+                          mCoalescedMouseEventFlusher->GetRefreshDriver())) {
+      MOZ_ASSERT_IF(!data->IsEmpty(), aMouseEvent.mCallbackId.isNothing());
+
+      WidgetMouseEvent pendingMouseMoveEvent(aMouseEvent);
+      pendingMouseMoveEvent.mCallbackId = aMouseEvent.mCallbackId;
+      pendingMouseMoveEvent.convertToPointerRawUpdate = false;
+      data->Coalesce(pendingMouseMoveEvent, aGuid, aInputBlockId);
+      mCoalescedMouseEventFlusher->StartObserver();
+      HandleMouseRawUpdateEvent(pendingMouseMoveEvent, aGuid, aInputBlockId);
+      return IPC_OK();
+    }
+
+    UniquePtr<CoalescedMouseData> dispatchData =
+        MakeUnique<CoalescedMouseData>();
+
+    dispatchData->RetrieveDataFrom(*data);
+    mToBeDispatchedMouseData.Push(dispatchData.release());
+
+    CoalescedMouseData* newData =
+        mCoalescedMouseData
+            .InsertOrUpdate(aMouseEvent.pointerId,
+                            MakeUnique<CoalescedMouseData>())
+            .get();
+    WidgetMouseEvent pendingMouseMoveEvent(aMouseEvent);
+    pendingMouseMoveEvent.mCallbackId = std::move(aMouseEvent.mCallbackId);
+    pendingMouseMoveEvent.convertToPointerRawUpdate = false;
+    newData->Coalesce(pendingMouseMoveEvent, aGuid, aInputBlockId);
+
+    ProcessPendingCoalescedMouseDataAndDispatchEvents();
+
+    mCoalescedMouseEventFlusher->StartObserver();
+    HandleMouseRawUpdateEvent(pendingMouseMoveEvent, aGuid, aInputBlockId);
+    return IPC_OK();
+  }
+
+  if (!RecvRealMouseButtonEvent(aMouseEvent, aGuid, aInputBlockId)) {
+    return IPC_FAIL_NO_REASON(this);
+  }
+  return IPC_OK();
+}
+
+void BrowserChild::HandleMouseRawUpdateEvent(
+    const WidgetMouseEvent& aPendingMouseEvent,
+    const ScrollableLayerGuid& aGuid, const uint64_t& aInputBlockId) {
+  MOZ_ASSERT(!aPendingMouseEvent.AsPointerEvent());
+  MOZ_ASSERT(!aPendingMouseEvent.AsDragEvent());
+  if (!mPointerRawUpdateWindowCount || aPendingMouseEvent.IsSynthesized()) {
+    return;
+  }
+  WidgetMouseEvent mouseRawUpdateEvent(aPendingMouseEvent);
+  mouseRawUpdateEvent.mMessage = eMouseRawUpdate;
+  mouseRawUpdateEvent.mButton = MouseButton::eNotPressed;
+  mouseRawUpdateEvent.mCoalescedWidgetEvents = nullptr;
+  mouseRawUpdateEvent.convertToPointer = true;
+  mouseRawUpdateEvent.convertToPointerRawUpdate = true;
+  HandleRealMouseButtonEvent(mouseRawUpdateEvent, aGuid, aInputBlockId);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvRealMouseMoveEventNoCompress(
+    const WidgetMouseEvent& aMouseEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId) {
+  return RecvRealMouseMoveEvent(aMouseEvent, aGuid, aInputBlockId);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvNormalPriorityRealMouseMoveEvent(
+    const WidgetMouseEvent& aMouseEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId) {
+  return RecvRealMouseMoveEvent(aMouseEvent, aGuid, aInputBlockId);
+}
+
+mozilla::ipc::IPCResult
+BrowserChild::RecvNormalPriorityRealMouseMoveEventNoCompress(
+    const WidgetMouseEvent& aMouseEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId) {
+  return RecvRealMouseMoveEvent(aMouseEvent, aGuid, aInputBlockId);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvSynthMouseMoveEvent(
+    const WidgetMouseEvent& aMouseEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId) {
+  if (!RecvRealMouseButtonEvent(aMouseEvent, aGuid, aInputBlockId)) {
+    return IPC_FAIL_NO_REASON(this);
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvNormalPrioritySynthMouseMoveEvent(
+    const WidgetMouseEvent& aMouseEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId) {
+  return RecvSynthMouseMoveEvent(aMouseEvent, aGuid, aInputBlockId);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvRealMouseButtonEvent(
+    const WidgetMouseEvent& aMouseOrPointerEvent,
+    const ScrollableLayerGuid& aGuid, const uint64_t& aInputBlockId) {
+  MOZ_ASSERT(!aMouseOrPointerEvent.AsDragEvent());
+  if (mCoalesceMouseMoveEvents && mCoalescedMouseEventFlusher &&
+      aMouseOrPointerEvent.mMessage != eMouseMove) {
+    FlushAllCoalescedMouseData();
+
+    UniquePtr<CoalescedMouseData> dispatchData =
+        MakeUnique<CoalescedMouseData>();
+
+    MOZ_ASSERT(aMouseOrPointerEvent.convertToPointerRawUpdate);
+    dispatchData->Coalesce(aMouseOrPointerEvent, aGuid, aInputBlockId);
+
+    mToBeDispatchedMouseData.Push(dispatchData.release());
+    ProcessPendingCoalescedMouseDataAndDispatchEvents();
+    return IPC_OK();
+  }
+  HandleRealMouseButtonEvent(aMouseOrPointerEvent, aGuid, aInputBlockId);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvRealPointerButtonEvent(
+    const WidgetPointerEvent& aPointerEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId) {
+  return RecvRealMouseButtonEvent(aPointerEvent, aGuid, aInputBlockId);
+}
+
+void BrowserChild::HandleRealMouseButtonEvent(
+    const WidgetMouseEvent& aMouseOrPointerEvent,
+    const ScrollableLayerGuid& aGuid, const uint64_t& aInputBlockId) {
+  MOZ_ASSERT(!aMouseOrPointerEvent.AsDragEvent());
+
+  AutoSynthesizedEventResponder<WidgetMouseEvent> responder(
+      this, aMouseOrPointerEvent);
+
+  Maybe<WidgetPointerEvent> pointerEvent;
+  Maybe<WidgetMouseEvent> mouseEvent;
+  if (aMouseOrPointerEvent.mClass == ePointerEventClass) {
+    pointerEvent.emplace(
+        WidgetPointerEvent::MakeCopyFromMouseEvent(aMouseOrPointerEvent));
+  } else {
+    MOZ_DIAGNOSTIC_ASSERT(!aMouseOrPointerEvent.AsPointerEvent());
+    MOZ_DIAGNOSTIC_ASSERT(!aMouseOrPointerEvent.AsDragEvent());
+    mouseEvent.emplace(aMouseOrPointerEvent);
+  }
+  WidgetMouseEvent& localEvent =
+      pointerEvent.isSome() ? pointerEvent.ref() : mouseEvent.ref();
+  localEvent.mWidget = mPuppetWidget;
+
+  InputAPZContext context1(aGuid, aInputBlockId, nsEventStatus_eSentinel);
+
+  RefPtr<DisplayportSetListener> postLayerization;
+  if (aInputBlockId && localEvent.mFlags.mHandledByAPZ) {
+    nsCOMPtr<Document> document(GetTopLevelDocument());
+    postLayerization = APZCCallbackHelper::SendSetTargetAPZCNotification(
+        mPuppetWidget, document, localEvent, aGuid.mLayersId, aInputBlockId);
+  }
+
+  InputAPZContext context2(aGuid, aInputBlockId, nsEventStatus_eSentinel,
+                           postLayerization != nullptr);
+
+  DispatchWidgetEventViaAPZ(localEvent);
+
+  if (aInputBlockId && localEvent.mFlags.mHandledByAPZ && mAPZEventState) {
+    mAPZEventState->ProcessMouseEvent(localEvent, aInputBlockId);
+  }
+
+  if (postLayerization) {
+    postLayerization->Register();
+  }
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvNormalPriorityRealMouseButtonEvent(
+    const WidgetMouseEvent& aMouseOrPointerEvent,
+    const ScrollableLayerGuid& aGuid, const uint64_t& aInputBlockId) {
+  return RecvRealMouseButtonEvent(aMouseOrPointerEvent, aGuid, aInputBlockId);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvNormalPriorityRealPointerButtonEvent(
+    const WidgetPointerEvent& aPointerEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId) {
+  return RecvNormalPriorityRealMouseButtonEvent(aPointerEvent, aGuid,
+                                                aInputBlockId);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvRealMouseEnterExitWidgetEvent(
+    const WidgetMouseEvent& aMouseEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId) {
+  return RecvRealMouseButtonEvent(aMouseEvent, aGuid, aInputBlockId);
+}
+
+mozilla::ipc::IPCResult
+BrowserChild::RecvNormalPriorityRealMouseEnterExitWidgetEvent(
+    const WidgetMouseEvent& aMouseEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId) {
+  return RecvRealMouseButtonEvent(aMouseEvent, aGuid, aInputBlockId);
+}
+
+nsEventStatus BrowserChild::DispatchWidgetEventViaAPZ(WidgetGUIEvent& aEvent) {
+  aEvent.ResetWaitingReplyFromRemoteProcessState();
+  return APZCCallbackHelper::DispatchWidgetEvent(aEvent);
+}
+
+void BrowserChild::DispatchCoalescedWheelEvent() {
+  UniquePtr<WidgetWheelEvent> wheelEvent =
+      mCoalescedWheelData.TakeCoalescedEvent();
+  MOZ_ASSERT(wheelEvent);
+  DispatchWheelEvent(*wheelEvent, mCoalescedWheelData.GetScrollableLayerGuid(),
+                     mCoalescedWheelData.GetInputBlockId());
+}
+
+void BrowserChild::DispatchWheelEvent(const WidgetWheelEvent& aEvent,
+                                      const ScrollableLayerGuid& aGuid,
+                                      const uint64_t& aInputBlockId) {
+  WidgetWheelEvent localEvent(aEvent);
+  if (aInputBlockId && aEvent.mFlags.mHandledByAPZ) {
+    nsCOMPtr<Document> document(GetTopLevelDocument());
+    RefPtr<DisplayportSetListener> postLayerization =
+        APZCCallbackHelper::SendSetTargetAPZCNotification(
+            mPuppetWidget, document, aEvent, aGuid.mLayersId, aInputBlockId);
+    if (postLayerization) {
+      postLayerization->Register();
+    }
+  }
+
+  localEvent.mWidget = mPuppetWidget;
+
+  InputAPZContext context(aGuid, aInputBlockId, nsEventStatus_eSentinel);
+
+  DispatchWidgetEventViaAPZ(localEvent);
+
+  if (localEvent.mCanTriggerSwipe) {
+    SendRespondStartSwipeEvent(aInputBlockId, localEvent.TriggersSwipe());
+  }
+
+  if (aInputBlockId && aEvent.mFlags.mHandledByAPZ && mAPZEventState) {
+    mAPZEventState->ProcessWheelEvent(localEvent, aInputBlockId);
+  }
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvMouseWheelEvent(
+    const WidgetWheelEvent& aEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId) {
+  AutoSynthesizedEventResponder<WidgetWheelEvent> responder(this, aEvent);
+
+  bool isNextWheelEvent = false;
+  if (aEvent.mMessage == eWheel) {
+    GetIPCChannel()->PeekMessages(
+        [&isNextWheelEvent](const IPC::Message& aMsg) -> bool {
+          if (aMsg.type() == mozilla::dom::PBrowser::Msg_MouseWheelEvent__ID) {
+            isNextWheelEvent = true;
+          }
+          return false;  
+        });
+
+    if (!mCoalescedWheelData.IsEmpty() &&
+        !mCoalescedWheelData.CanCoalesce(aEvent, aGuid, aInputBlockId)) {
+      DispatchCoalescedWheelEvent();
+      MOZ_ASSERT(mCoalescedWheelData.IsEmpty());
+    }
+    mCoalescedWheelData.Coalesce(aEvent, aGuid, aInputBlockId);
+
+    MOZ_ASSERT(!mCoalescedWheelData.IsEmpty());
+    if (!isNextWheelEvent) {
+      DispatchCoalescedWheelEvent();
+    }
+  } else {
+    DispatchWheelEvent(aEvent, aGuid, aInputBlockId);
+  }
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvNormalPriorityMouseWheelEvent(
+    const WidgetWheelEvent& aEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId) {
+  return RecvMouseWheelEvent(aEvent, aGuid, aInputBlockId);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvRealTouchEvent(
+    const WidgetTouchEvent& aEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId, const nsEventStatus& aApzResponse) {
+  MOZ_LOG(sApzChildLog, LogLevel::Debug,
+          ("Receiving touch event of type %d\n", aEvent.mMessage));
+
+  AutoSynthesizedEventResponder<WidgetTouchEvent> responder(this, aEvent);
+
+  if (StaticPrefs::dom_events_coalesce_touchmove()) {
+    if (aEvent.mMessage == eTouchEnd || aEvent.mMessage == eTouchStart) {
+      ProcessPendingCoalescedTouchData();
+    }
+
+    if (aEvent.mMessage != eTouchMove && aEvent.mMessage != eTouchRawUpdate) {
+      sConsecutiveTouchMoveCount = 0;
+    }
+  }
+
+  WidgetTouchEvent localEvent(aEvent);
+  localEvent.mWidget = mPuppetWidget;
+
+  InputAPZContext context(aGuid, aInputBlockId, aApzResponse);
+
+  nsTArray<TouchBehaviorFlags> allowedTouchBehaviors;
+  if (localEvent.mMessage == eTouchStart && AsyncPanZoomEnabled()) {
+    nsCOMPtr<Document> document = GetTopLevelDocument();
+    allowedTouchBehaviors = TouchActionHelper::GetAllowedTouchBehavior(
+        mPuppetWidget, document, localEvent);
+    if (!allowedTouchBehaviors.IsEmpty() && mApzcTreeManager) {
+      mApzcTreeManager->SetAllowedTouchBehavior(aInputBlockId,
+                                                allowedTouchBehaviors);
+    }
+    RefPtr<DisplayportSetListener> postLayerization =
+        APZCCallbackHelper::SendSetTargetAPZCNotification(
+            mPuppetWidget, document, localEvent, aGuid.mLayersId,
+            aInputBlockId);
+    if (postLayerization) {
+      postLayerization->Register();
+    }
+  }
+
+  nsEventStatus status = DispatchWidgetEventViaAPZ(localEvent);
+
+  if (!AsyncPanZoomEnabled()) {
+    MOZ_ASSERT(false);
+    return IPC_OK();
+  }
+
+  if (mAPZEventState) {
+    mAPZEventState->ProcessTouchEvent(localEvent, aGuid, aInputBlockId,
+                                      aApzResponse, status,
+                                      std::move(allowedTouchBehaviors));
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvNormalPriorityRealTouchEvent(
+    const WidgetTouchEvent& aEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId, const nsEventStatus& aApzResponse) {
+  return RecvRealTouchEvent(aEvent, aGuid, aInputBlockId, aApzResponse);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvRealTouchMoveEvent(
+    const WidgetTouchEvent& aEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId, const nsEventStatus& aApzResponse) {
+  if (StaticPrefs::dom_events_coalesce_touchmove()) {
+    ++sConsecutiveTouchMoveCount;
+    if (mCoalescedTouchMoveEventFlusher) {
+      MOZ_ASSERT(aEvent.mMessage == eTouchMove);
+      const auto PostponeDispatchingTouchMove = [&]() {
+        return sConsecutiveTouchMoveCount > 1;
+      };
+      if (aEvent.mFlags.mIsSynthesizedForTests) {
+        ProcessPendingCoalescedTouchData();
+        if (!RecvRealTouchEvent(aEvent, aGuid, aInputBlockId, aApzResponse)) {
+          return IPC_FAIL_NO_REASON(this);
+        }
+        return IPC_OK();
+      }
+      if (mCoalescedTouchData.IsEmpty() ||
+          mCoalescedTouchData.CanCoalesce(aEvent, aGuid, aInputBlockId,
+                                          aApzResponse)) {
+        if (PostponeDispatchingTouchMove()) {
+          WidgetTouchEvent pendingTouchMoveEvent(
+              aEvent, WidgetTouchEvent::CloneTouches::Yes);
+          pendingTouchMoveEvent.SetConvertToPointerRawUpdate(false);
+          mCoalescedTouchData.Coalesce(pendingTouchMoveEvent, aGuid,
+                                       aInputBlockId, aApzResponse);
+          MOZ_ASSERT(PostponeDispatchingTouchMove());
+          mCoalescedTouchMoveEventFlusher->StartObserver();
+          HandleTouchRawUpdateEvent(pendingTouchMoveEvent, aGuid, aInputBlockId,
+                                    aApzResponse);
+          return IPC_OK();
+        }
+
+        MOZ_ASSERT(aEvent.CanConvertToPointerRawUpdate());
+        mCoalescedTouchData.Coalesce(aEvent, aGuid, aInputBlockId,
+                                     aApzResponse);
+        MOZ_ASSERT(!PostponeDispatchingTouchMove());
+      } else {
+        UniquePtr<WidgetTouchEvent> touchMoveEvent =
+            mCoalescedTouchData.TakeCoalescedEvent();
+        MOZ_ASSERT(touchMoveEvent->mMessage == eTouchMove);
+
+        MOZ_ASSERT(aEvent.CanConvertToPointerRawUpdate());
+        mCoalescedTouchData.Coalesce(aEvent, aGuid, aInputBlockId,
+                                     aApzResponse);
+        MOZ_ASSERT(!PostponeDispatchingTouchMove());
+
+        MOZ_ASSERT(!touchMoveEvent->CanConvertToPointerRawUpdate());
+        const uint32_t generation = mCoalescedTouchData.Generation();
+        if (!RecvRealTouchEvent(*touchMoveEvent,
+                                mCoalescedTouchData.GetScrollableLayerGuid(),
+                                mCoalescedTouchData.GetInputBlockId(),
+                                mCoalescedTouchData.GetApzResponse())) {
+          return IPC_FAIL_NO_REASON(this);
+        }
+        if (PostponeDispatchingTouchMove()) {
+          mCoalescedTouchMoveEventFlusher->StartObserver();
+          if (generation == mCoalescedTouchData.Generation()) {
+            mCoalescedTouchData.NotifyTouchRawUpdateOfHandled(aEvent);
+            HandleTouchRawUpdateEvent(aEvent, aGuid, aInputBlockId,
+                                      aApzResponse);
+          }
+          return IPC_OK();
+        }
+      }
+      ProcessPendingCoalescedTouchData();
+      return IPC_OK();
+    }
+  }
+
+  if (!RecvRealTouchEvent(aEvent, aGuid, aInputBlockId, aApzResponse)) {
+    return IPC_FAIL_NO_REASON(this);
+  }
+  return IPC_OK();
+}
+
+void BrowserChild::HandleTouchRawUpdateEvent(
+    const WidgetTouchEvent& aPendingTouchEvent,
+    const ScrollableLayerGuid& aGuid, const uint64_t& aInputBlockId,
+    const nsEventStatus& aApzResponse) {
+  if (!mPointerRawUpdateWindowCount) {
+    return;  
+  }
+
+  WidgetTouchEvent touchRawUpdateEvent(aPendingTouchEvent,
+                                       WidgetTouchEvent::CloneTouches::Yes);
+  touchRawUpdateEvent.mMessage = eTouchRawUpdate;
+  for (Touch* const touch : touchRawUpdateEvent.mTouches) {
+    touch->mMessage = eTouchRawUpdate;
+    touch->mCoalescedWidgetEvents = nullptr;
+    touch->convertToPointer = true;
+    touch->convertToPointerRawUpdate = true;
+  }
+  RecvRealTouchEvent(touchRawUpdateEvent, aGuid, aInputBlockId, aApzResponse);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvNormalPriorityRealTouchMoveEvent(
+    const WidgetTouchEvent& aEvent, const ScrollableLayerGuid& aGuid,
+    const uint64_t& aInputBlockId, const nsEventStatus& aApzResponse) {
+  return RecvRealTouchMoveEvent(aEvent, aGuid, aInputBlockId, aApzResponse);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvRealDragEvent(
+    const WidgetDragEvent& aEvent, const uint32_t& aDragAction,
+    const uint32_t& aDropEffect, nsIPrincipal* aPrincipal,
+    nsIPolicyContainer* aPolicyContainer) {
+  WidgetDragEvent localEvent(aEvent);
+  localEvent.mWidget = mPuppetWidget;
+
+  nsCOMPtr<nsIDragSession> dragSession = GetDragSession();
+  DRAGSERVICE_LOGD(
+      "[%p] %s | aEvent.mMessage: %s | aDragAction: %u | aDropEffect: %u | "
+      "widgetRelativePt: (%d,%d) | dragSession: %p",
+      this, __FUNCTION__,
+      NS_ConvertUTF16toUTF8(dom::Event::GetEventName(aEvent.mMessage)).get(),
+      aDragAction, aDropEffect, static_cast<int>(localEvent.mRefPoint.x),
+      static_cast<int>(localEvent.mRefPoint.y), dragSession.get());
+  if (dragSession) {
+    dragSession->SetDragAction(aDragAction);
+    dragSession->SetTriggeringPrincipal(aPrincipal);
+    dragSession->SetPolicyContainer(aPolicyContainer);
+    RefPtr<DataTransfer> initialDataTransfer = dragSession->GetDataTransfer();
+    if (initialDataTransfer) {
+      initialDataTransfer->SetDropEffectInt(aDropEffect);
+    }
+  }
+
+  if (aEvent.mMessage == eDrop) {
+    bool canDrop = true;
+    if (!dragSession || NS_FAILED(dragSession->GetCanDrop(&canDrop)) ||
+        !canDrop) {
+      DRAGSERVICE_LOGD("[%p] %s | changed drop to dragexit", this,
+                       __FUNCTION__);
+      localEvent.mMessage = eDragExit;
+    }
+  } else if (aEvent.mMessage == eDragOver) {
+    if (dragSession) {
+      dragSession->FireDragEventAtSource(eDrag, aEvent.mModifiers);
+    }
+  }
+
+  DispatchWidgetEventViaAPZ(localEvent);
+  return IPC_OK();
+}
+
+already_AddRefed<DataTransfer> BrowserChild::ConvertToDataTransfer(
+    nsIPrincipal* aPrincipal, nsTArray<IPCTransferableData>&& aTransferables,
+    EventMessage aMessage) {
+  if (!aPrincipal || Manager()->GetRemoteType() != EXTENSION_REMOTE_TYPE) {
+    aPrincipal = nsContentUtils::GetSystemPrincipal();
+  }
+
+  bool hasFiles = false;
+  for (uint32_t i = 0; i < aTransferables.Length() && !hasFiles; ++i) {
+    auto& items = aTransferables[i].items();
+    for (uint32_t j = 0; j < items.Length() && !hasFiles; ++j) {
+      if (items[j].data().type() ==
+          IPCTransferableDataType::TIPCTransferableDataBlob) {
+        hasFiles = true;
+      }
+    }
+  }
+  RefPtr<DataTransfer> dataTransfer =
+      new DataTransfer(nullptr, aMessage, false, Nothing());
+  for (uint32_t i = 0; i < aTransferables.Length(); ++i) {
+    auto& items = aTransferables[i].items();
+    for (uint32_t j = 0; j < items.Length(); ++j) {
+      const IPCTransferableDataItem& item = items[j];
+      RefPtr<nsVariantCC> variant = new nsVariantCC();
+      nsresult rv =
+          nsContentUtils::IPCTransferableDataItemToVariant(item, variant);
+      if (NS_FAILED(rv)) {
+        continue;
+      }
+
+      bool hidden =
+          hasFiles && item.data().type() !=
+                          IPCTransferableDataType::TIPCTransferableDataBlob;
+      dataTransfer->SetDataWithPrincipalFromOtherProcess(
+          NS_ConvertUTF8toUTF16(item.flavor()), variant, i, aPrincipal, hidden);
+    }
+  }
+  return dataTransfer.forget();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvInvokeChildDragSession(
+    const MaybeDiscarded<WindowContext>& aSourceWindowContext,
+    const MaybeDiscarded<WindowContext>& aSourceTopWindowContext,
+    nsIPrincipal* aPrincipal, nsTArray<IPCTransferableData>&& aTransferables,
+    const uint32_t& aAction) {
+  if (nsCOMPtr<nsIDragService> dragService =
+          do_GetService("@mozilla.org/widget/dragservice;1")) {
+    nsIWidget* widget = WebWidget();
+    dragService->StartDragSession(widget);
+    if (RefPtr<nsIDragSession> session = GetDragSession()) {
+      session->SetSourceWindowContext(aSourceWindowContext.GetMaybeDiscarded());
+      session->SetSourceTopWindowContext(
+          aSourceTopWindowContext.GetMaybeDiscarded());
+      session->SetDragAction(aAction);
+      RefPtr<DataTransfer> dataTransfer = ConvertToDataTransfer(
+          aPrincipal, std::move(aTransferables), eDragStart);
+      session->SetDataTransfer(dataTransfer);
+      DRAGSERVICE_LOGD("[%p] %s | Successfully started dragSession: %p", this,
+                       __FUNCTION__, session.get());
+    } else {
+      DRAGSERVICE_LOGE("[%p] %s | Failed to start dragSession", this,
+                       __FUNCTION__);
+    }
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvUpdateDragSession(
+    nsIPrincipal* aPrincipal, nsTArray<IPCTransferableData>&& aTransferables,
+    EventMessage aEventMessage) {
+  if (RefPtr<nsIDragSession> session = GetDragSession()) {
+    nsCOMPtr<DataTransfer> dataTransfer = ConvertToDataTransfer(
+        aPrincipal, std::move(aTransferables), aEventMessage);
+    session->SetDataTransfer(dataTransfer);
+    DRAGSERVICE_LOGD(
+        "[%p] %s | session: %p | aEventMessage: %s | Updated dragSession "
+        "dataTransfer",
+        this, __FUNCTION__, session.get(),
+        NS_ConvertUTF16toUTF8(dom::Event::GetEventName(aEventMessage)).get());
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvEndDragSession(
+    const bool& aDoneDrag, const bool& aUserCancelled,
+    const LayoutDeviceIntPoint& aDragEndPoint, const uint32_t& aKeyModifiers,
+    const uint32_t& aDropEffect) {
+  RefPtr<nsIDragSession> dragSession = GetDragSession();
+  if (dragSession) {
+    DRAGSERVICE_LOGD(
+        "[%p] %s | dragSession: %p | aDoneDrag: %s | aUserCancelled: %s | "
+        "aDragEndPoint: (%d, %d) | aKeyModifiers: %u | aDropEffect: %u",
+        this, __FUNCTION__, dragSession.get(), TrueOrFalse(aDoneDrag),
+        TrueOrFalse(aUserCancelled), static_cast<int>(aDragEndPoint.x),
+        static_cast<int>(aDragEndPoint.y), aKeyModifiers, aDropEffect);
+
+    if (aUserCancelled) {
+      dragSession->UserCancelled();
+    }
+
+    RefPtr<DataTransfer> dataTransfer = dragSession->GetDataTransfer();
+    if (dataTransfer) {
+      dataTransfer->SetDropEffectInt(aDropEffect);
+    }
+    dragSession->SetDragEndPoint(aDragEndPoint.x, aDragEndPoint.y);
+    dragSession->EndDragSession(aDoneDrag, aKeyModifiers);
+  }
+  return IPC_OK();
+}
+
+void BrowserChild::RequestEditCommands(NativeKeyBindingsType aType,
+                                       const WidgetKeyboardEvent& aEvent,
+                                       nsTArray<CommandInt>& aCommands) {
+  MOZ_ASSERT(aCommands.IsEmpty());
+
+  if (NS_WARN_IF(aEvent.IsEditCommandsInitialized(aType))) {
+    aCommands = aEvent.EditCommandsConstRef(aType).Clone();
+    return;
+  }
+
+  switch (aType) {
+    case NativeKeyBindingsType::SingleLineEditor:
+    case NativeKeyBindingsType::MultiLineEditor:
+    case NativeKeyBindingsType::RichTextEditor:
+      break;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Invalid native key bindings type");
+  }
+
+  WidgetKeyboardEvent localEvent(aEvent);
+  SendRequestNativeKeyBindings(aType, localEvent, &aCommands);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvSynthesizedEventResponse(
+    const uint64_t& aCallbackId) {
+  NS_ENSURE_TRUE(false, IPC_FAIL(this, "Unexpected event"));
+  mozilla::widget::AutoSynthesizedEventCallbackNotifier::NotifySavedCallback(
+      aCallbackId);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvUpdateSHistory() {
+  if (mSessionStoreChild) {
+    mSessionStoreChild->UpdateSHistoryChanges();
+  }
+  return IPC_OK();
+}
+
+bool BrowserChild::SkipRepeatedKeyEvent(const WidgetKeyboardEvent& aEvent) {
+  if (mRepeatedKeyEventTime.IsNull() || !aEvent.CanSkipInRemoteProcess() ||
+      (aEvent.mMessage != eKeyDown && aEvent.mMessage != eKeyPress)) {
+    mRepeatedKeyEventTime = TimeStamp();
+    mSkipKeyPress = false;
+    return false;
+  }
+
+  if ((aEvent.mMessage == eKeyDown &&
+       (mRepeatedKeyEventTime > aEvent.mTimeStamp)) ||
+      (mSkipKeyPress && (aEvent.mMessage == eKeyPress))) {
+    mSkipKeyPress |= aEvent.mMessage == eKeyDown;
+    return true;
+  }
+
+  if (aEvent.mMessage == eKeyDown) {
+    mRepeatedKeyEventTime = TimeStamp();
+    mSkipKeyPress = false;
+  }
+  return false;
+}
+
+void BrowserChild::UpdateRepeatedKeyEventEndTime(
+    const WidgetKeyboardEvent& aEvent) {
+  if (aEvent.mIsRepeat &&
+      (aEvent.mMessage == eKeyDown || aEvent.mMessage == eKeyPress)) {
+    mRepeatedKeyEventTime = TimeStamp::Now();
+  }
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvRealKeyEvent(
+    const WidgetKeyboardEvent& aEvent, const nsID& aUUID) {
+  MOZ_ASSERT_IF(aEvent.mMessage == eKeyPress,
+                aEvent.AreAllEditCommandsInitialized());
+
+  const bool isPrecedingKeyDownEventConsumed =
+      aEvent.mMessage == eKeyPress && mPreviousConsumedKeyDownCode.isSome() &&
+      mPreviousConsumedKeyDownCode.value() == aEvent.mCodeNameIndex;
+
+  WidgetKeyboardEvent localEvent(aEvent);
+  localEvent.mWidget = mPuppetWidget;
+  localEvent.mUniqueId = aEvent.mUniqueId;
+
+  if (!SkipRepeatedKeyEvent(aEvent) && !isPrecedingKeyDownEventConsumed) {
+    const bool isOtherKeyDownBeingDispatched =
+        mCurrentBeingDispatchedKeyDownCode.isSome();
+    if (aEvent.mMessage == eKeyDown && !isOtherKeyDownBeingDispatched) {
+      mCurrentBeingDispatchedKeyDownCode.emplace(aEvent.mCodeNameIndex);
+    }
+    nsEventStatus status = DispatchWidgetEventViaAPZ(localEvent);
+    NS_WARNING_ASSERTION(!isOtherKeyDownBeingDispatched ||
+                             localEvent.mFlags.mIsSuppressedOrDelayed,
+                         "keypress event isn't suppressed or delayed while "
+                         "event loop is being spun");
+
+    UpdateRepeatedKeyEventEndTime(localEvent);
+
+    if (aEvent.mMessage == eKeyDown) {
+      if (status == nsEventStatus_eConsumeNoDefault) {
+        MOZ_ASSERT_IF(!aEvent.mFlags.mIsSynthesizedForTests,
+                      aEvent.mCodeNameIndex != CODE_NAME_INDEX_USE_STRING);
+        MOZ_ASSERT(!localEvent.mFlags.mIsSuppressedOrDelayed);
+        MOZ_ASSERT(!isOtherKeyDownBeingDispatched);
+
+        if (MOZ_LIKELY(mCurrentBeingDispatchedKeyDownCode)) {
+          MOZ_ASSERT(mCurrentBeingDispatchedKeyDownCode.value() ==
+                     aEvent.mCodeNameIndex);
+          mPreviousConsumedKeyDownCode = Some(aEvent.mCodeNameIndex);
+        }
+      }
+      else if (mPreviousConsumedKeyDownCode.isSome() &&
+               aEvent.mCodeNameIndex == mPreviousConsumedKeyDownCode.value()) {
+        mPreviousConsumedKeyDownCode.reset();
+      }
+
+      if (!isOtherKeyDownBeingDispatched &&
+          mCurrentBeingDispatchedKeyDownCode) {
+        MOZ_ASSERT(mCurrentBeingDispatchedKeyDownCode.value() ==
+                   aEvent.mCodeNameIndex);
+        mCurrentBeingDispatchedKeyDownCode.reset();
+      }
+    }
+    else if (aEvent.mMessage == eKeyUp &&
+             mPreviousConsumedKeyDownCode.isSome() &&
+             aEvent.mCodeNameIndex == mPreviousConsumedKeyDownCode.value()) {
+      mPreviousConsumedKeyDownCode.reset();
+    }
+    else if (aEvent.mMessage == eKeyPress &&
+             mCurrentBeingDispatchedKeyDownCode &&
+             mCurrentBeingDispatchedKeyDownCode.value() ==
+                 aEvent.mCodeNameIndex) {
+      MOZ_DIAGNOSTIC_ASSERT(isOtherKeyDownBeingDispatched);
+      NS_WARNING_ASSERTION(localEvent.mFlags.mIsSuppressedOrDelayed,
+                           "keypress event isn't suppressed or delayed while "
+                           "event loop is being spun");
+      mCurrentBeingDispatchedKeyDownCode.reset();
+    }
+
+    if (localEvent.mFlags.mIsSuppressedOrDelayed) {
+      localEvent.PreventDefault();
+    }
+
+    if (!localEvent.DefaultPrevented() &&
+        status == nsEventStatus_eConsumeNoDefault) {
+      localEvent.PreventDefault();
+    }
+
+    MOZ_DIAGNOSTIC_ASSERT(!localEvent.PropagationStopped());
+  }
+  else {
+    localEvent.StopPropagation();
+  }
+
+  if (!aEvent.WantReplyFromContentProcess()) {
+    return IPC_OK();
+  }
+
+  localEvent.mFlags.mNoRemoteProcessDispatch = false;
+  localEvent.PreventNativeKeyBindings();
+  SendReplyKeyEvent(localEvent, aUUID);
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvNormalPriorityRealKeyEvent(
+    const WidgetKeyboardEvent& aEvent, const nsID& aUUID) {
+  return RecvRealKeyEvent(aEvent, aUUID);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvCompositionEvent(
+    const WidgetCompositionEvent& aEvent) {
+  WidgetCompositionEvent localEvent(aEvent);
+  localEvent.mWidget = mPuppetWidget;
+  DispatchWidgetEventViaAPZ(localEvent);
+  (void)SendOnEventNeedingAckHandled(aEvent.mMessage,
+                                     localEvent.mCompositionId);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvNormalPriorityCompositionEvent(
+    const WidgetCompositionEvent& aEvent) {
+  return RecvCompositionEvent(aEvent);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvSelectionEvent(
+    const WidgetSelectionEvent& aEvent) {
+  WidgetSelectionEvent localEvent(aEvent);
+  localEvent.mWidget = mPuppetWidget;
+  DispatchWidgetEventViaAPZ(localEvent);
+  (void)SendOnEventNeedingAckHandled(aEvent.mMessage, 0u);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvNormalPrioritySelectionEvent(
+    const WidgetSelectionEvent& aEvent) {
+  return RecvSelectionEvent(aEvent);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvSimpleContentCommandEvent(
+    const EventMessage& aMessage) {
+  WidgetContentCommandEvent localEvent(true, aMessage, mPuppetWidget);
+  DispatchWidgetEventViaAPZ(localEvent);
+  (void)SendOnEventNeedingAckHandled(aMessage, 0u);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult
+BrowserChild::RecvNormalPrioritySimpleContentCommandEvent(
+    const EventMessage& aMessage) {
+  return RecvSimpleContentCommandEvent(aMessage);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvInsertText(
+    const nsAString& aStringToInsert) {
+  WidgetContentCommandEvent localEvent(true, eContentCommandInsertText,
+                                       mPuppetWidget);
+  localEvent.mString = Some(nsString(aStringToInsert));
+  DispatchWidgetEventViaAPZ(localEvent);
+  (void)SendOnEventNeedingAckHandled(eContentCommandInsertText, 0u);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvNormalPriorityInsertText(
+    const nsAString& aStringToInsert) {
+  return RecvInsertText(aStringToInsert);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvReplaceText(
+    const nsString& aReplaceSrcString, const nsString& aStringToInsert,
+    uint32_t aOffset, bool aPreventSetSelection) {
+  WidgetContentCommandEvent localEvent(true, eContentCommandReplaceText,
+                                       mPuppetWidget);
+  localEvent.mString = Some(aStringToInsert);
+  localEvent.mSelection.mReplaceSrcString = aReplaceSrcString;
+  localEvent.mSelection.mOffset = aOffset;
+  localEvent.mSelection.mPreventSetSelection = aPreventSetSelection;
+  DispatchWidgetEventViaAPZ(localEvent);
+  (void)SendOnEventNeedingAckHandled(eContentCommandReplaceText, 0u);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvNormalPriorityReplaceText(
+    const nsString& aReplaceSrcString, const nsString& aStringToInsert,
+    uint32_t aOffset, bool aPreventSetSelection) {
+  return RecvReplaceText(aReplaceSrcString, aStringToInsert, aOffset,
+                         aPreventSetSelection);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvPasteTransferable(
+    const IPCTransferable& aTransferable) {
+  nsresult rv;
+  nsCOMPtr<nsITransferable> trans =
+      do_CreateInstance("@mozilla.org/widget/transferable;1", &rv);
+  NS_ENSURE_SUCCESS(rv, IPC_OK());
+  trans->Init(nullptr);
+
+  rv = nsContentUtils::IPCTransferableToTransferable(
+      aTransferable, true , trans,
+      false );
+  NS_ENSURE_SUCCESS(rv, IPC_OK());
+
+  nsCOMPtr<nsIDocShell> ourDocShell = do_GetInterface(WebNavigation());
+  if (NS_WARN_IF(!ourDocShell)) {
+    return IPC_OK();
+  }
+
+  RefPtr<nsCommandParams> params = new nsCommandParams();
+  rv = params->SetISupports("transferable", trans);
+  NS_ENSURE_SUCCESS(rv, IPC_OK());
+
+  ourDocShell->DoCommandWithParams("cmd_pasteTransferable", params);
+  return IPC_OK();
+}
+
+#if defined(ACCESSIBILITY)
+a11y::PDocAccessibleChild* BrowserChild::AllocPDocAccessibleChild(
+    PDocAccessibleChild*, const uint64_t&, const MaybeDiscardedBrowsingContext&,
+    const bool&) {
+  MOZ_ASSERT_UNREACHABLE("should never call this!");
+  return nullptr;
+}
+
+bool BrowserChild::DeallocPDocAccessibleChild(
+    a11y::PDocAccessibleChild* aChild) {
+  delete static_cast<mozilla::a11y::DocAccessibleChild*>(aChild);
+  return true;
+}
+#endif
+
+RefPtr<VsyncMainChild> BrowserChild::GetVsyncChild() {
+#if defined(MOZ_WAYLAND)
+  if (IsWaylandEnabled()) {
+    if (auto* actor = static_cast<VsyncMainChild*>(
+            LoneManagedOrNullAsserts(ManagedPVsyncChild()))) {
+      return actor;
+    }
+    auto actor = MakeRefPtr<VsyncMainChild>();
+    if (!SendPVsyncConstructor(actor)) {
+      return nullptr;
+    }
+    return actor;
+  }
+#endif
+  return nullptr;
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvLoadRemoteScript(
+    const nsAString& aURL, const bool& aRunInGlobalScope) {
+  if (!InitBrowserChildMessageManager())
+    return IPC_OK();
+
+  JS::Rooted<JSObject*> mm(RootingCx(),
+                           mBrowserChildMessageManager->GetOrCreateWrapper());
+  if (!mm) {
+    return IPC_OK();
+  }
+
+  LoadScriptInternal(mm, aURL, !aRunInGlobalScope);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvAsyncMessage(
+    const nsAString& aMessage, NotNull<StructuredCloneData*> aData) {
+  MMPrinter::Print("BrowserChild::RecvAsyncMessage", aMessage, aData);
+
+  if (!mBrowserChildMessageManager) {
+    return IPC_OK();
+  }
+
+  RefPtr<nsFrameMessageManager> mm =
+      mBrowserChildMessageManager->GetMessageManager();
+
+  MOZ_DIAGNOSTIC_ASSERT(mm);
+  if (!mm) {
+    return IPC_OK();
+  }
+
+  JS::Rooted<JSObject*> kungFuDeathGrip(
+      dom::RootingCx(), mBrowserChildMessageManager->GetWrapper());
+  mm->ReceiveMessage(static_cast<EventTarget*>(mBrowserChildMessageManager),
+                     nullptr, aMessage, false, aData, nullptr);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvSwappedWithOtherRemoteLoader(
+    const IPCTabContext& aContext) {
+  nsCOMPtr<nsIDocShell> ourDocShell = do_GetInterface(WebNavigation());
+  if (NS_WARN_IF(!ourDocShell)) {
+    return IPC_OK();
+  }
+
+  nsCOMPtr<nsPIDOMWindowOuter> ourWindow = ourDocShell->GetWindow();
+  if (NS_WARN_IF(!ourWindow)) {
+    return IPC_OK();
+  }
+
+  RefPtr<nsDocShell> docShell = static_cast<nsDocShell*>(ourDocShell.get());
+
+  nsCOMPtr<EventTarget> ourEventTarget = nsGlobalWindowOuter::Cast(ourWindow);
+
+  docShell->SetInFrameSwap(true);
+
+  nsContentUtils::FirePageShowEventForFrameLoaderSwap(
+      ourDocShell, ourEventTarget, false, true);
+  nsContentUtils::FirePageHideEventForFrameLoaderSwap(ourDocShell,
+                                                      ourEventTarget, true);
+
+  MaybeInvalidTabContext maybeContext(aContext);
+  if (!maybeContext.IsValid()) {
+    NS_ERROR(nsPrintfCString("Received an invalid TabContext from "
+                             "the parent process. (%s)",
+                             maybeContext.GetInvalidReason())
+                 .get());
+    MOZ_CRASH("Invalid TabContext received from the parent process.");
+  }
+
+  if (!UpdateTabContextAfterSwap(maybeContext.GetTabContext())) {
+    MOZ_CRASH("Update to TabContext after swap was denied.");
+  }
+
+  mTriedBrowserInit = true;
+
+  nsContentUtils::FirePageShowEventForFrameLoaderSwap(
+      ourDocShell, ourEventTarget, true, true);
+
+  docShell->SetInFrameSwap(false);
+
+  if (RefPtr<Document> doc = docShell->GetDocument()) {
+    doc->UpdateVisibilityState();
+  }
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvHandleAccessKey(
+    const WidgetKeyboardEvent& aEvent, nsTArray<uint32_t>&& aCharCodes) {
+  nsCOMPtr<Document> document(GetTopLevelDocument());
+  RefPtr<nsPresContext> pc = document->GetPresContext();
+  if (pc) {
+    if (!pc->EventStateManager()->HandleAccessKey(
+            &(const_cast<WidgetKeyboardEvent&>(aEvent)), pc, aCharCodes)) {
+      WidgetKeyboardEvent localEvent(aEvent);
+      localEvent.mWidget = mPuppetWidget;
+      SendAccessKeyNotHandled(localEvent);
+    }
+  }
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvUpdateNativeWindowHandle(
+    const uintptr_t& aNewHandle) {
+  return IPC_FAIL_NO_REASON(this);
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvDestroy() {
+  MOZ_ASSERT(!mDestroyed);
+  mDestroyed = true;
+
+  nsTArray<PContentPermissionRequestChild*> childArray =
+      nsContentPermissionUtils::GetContentPermissionRequestChildById(
+          GetTabId());
+
+  for (auto& permissionRequestChild : childArray) {
+    auto* child = static_cast<RemotePermissionRequest*>(permissionRequestChild);
+    child->Destroy();
+  }
+
+  if (mBrowserChildMessageManager) {
+    MOZ_ASSERT(nsContentUtils::IsSafeToRunScript());
+    mBrowserChildMessageManager->DispatchTrustedEvent(u"unload"_ns);
+  }
+
+  nsCOMPtr<nsIObserverService> observerService =
+      mozilla::services::GetObserverService();
+
+  observerService->RemoveObserver(this, BEFORE_FIRST_PAINT);
+
+  DestroyWindow();
+
+  nsCOMPtr<nsIRunnable> deleteRunnable = new DelayedDeleteRunnable(this);
+  MOZ_ALWAYS_SUCCEEDS(NS_DispatchToCurrentThread(deleteRunnable));
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvRenderLayers(const bool& aEnabled) {
+  auto clearPaintWhileInterruptingJS = MakeScopeExit([&] {
+    if (aEnabled) {
+      ProcessHangMonitor::ClearPaintWhileInterruptingJS();
+    }
+  });
+
+  if (aEnabled) {
+    ProcessHangMonitor::MaybeStartPaintWhileInterruptingJS();
+  }
+
+  mRenderLayers = aEnabled;
+  const bool wasVisible = IsVisible();
+
+  UpdateVisibility();
+
+  const bool becameVisible = !wasVisible && IsVisible();
+  if (!becameVisible) {
+    return IPC_OK();
+  }
+
+  nsCOMPtr<nsIDocShell> docShell = do_GetInterface(WebNavigation());
+  if (!docShell) {
+    return IPC_OK();
+  }
+
+  RefPtr<PresShell> presShell = docShell->GetPresShell();
+  if (!presShell) {
+    return IPC_OK();
+  }
+
+  if (nsIFrame* root = presShell->GetRootFrame()) {
+    root->SchedulePaint();
+  }
+
+  presShell->SuppressDisplayport(true);
+  if (nsContentUtils::IsSafeToRunScript()) {
+    WebWidget()->PaintNowIfNeeded();
+  } else {
+    presShell->PaintAndRequestComposite(presShell->GetRootFrame(),
+                                        mPuppetWidget->GetWindowRenderer(),
+                                        PaintFlags::None);
+  }
+  presShell->SuppressDisplayport(false);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvNavigateByKey(
+    const bool& aForward, const bool& aForDocumentNavigation) {
+  nsFocusManager* fm = nsFocusManager::GetFocusManager();
+  if (!fm) {
+    return IPC_OK();
+  }
+
+  RefPtr<Element> result;
+  nsCOMPtr<nsPIDOMWindowOuter> window = do_GetInterface(WebNavigation());
+
+  {
+    uint32_t type =
+        aForward
+            ? (aForDocumentNavigation
+                   ? static_cast<uint32_t>(nsIFocusManager::MOVEFOCUS_FIRSTDOC)
+                   : static_cast<uint32_t>(nsIFocusManager::MOVEFOCUS_FIRST))
+            : (aForDocumentNavigation
+                   ? static_cast<uint32_t>(nsIFocusManager::MOVEFOCUS_LASTDOC)
+                   : static_cast<uint32_t>(nsIFocusManager::MOVEFOCUS_LAST));
+    uint32_t flags = nsIFocusManager::FLAG_BYKEY;
+    if (aForward || aForDocumentNavigation) {
+      flags |= nsIFocusManager::FLAG_NOSCROLL;
+    }
+    fm->MoveFocus(window, nullptr, type, flags, getter_AddRefs(result));
+  }
+
+  if (!result && aForward && !aForDocumentNavigation) {
+    fm->MoveFocus(window, nullptr, nsIFocusManager::MOVEFOCUS_FIRST,
+                  nsIFocusManager::FLAG_BYKEY, getter_AddRefs(result));
+  }
+
+  SendRequestFocus(false, CallerType::System);
+  return IPC_OK();
+}
+
+bool BrowserChild::InitBrowserChildMessageManager() {
+  mShouldSendWebProgressEventsToParent = true;
+
+  if (!mBrowserChildMessageManager) {
+    nsCOMPtr<nsPIDOMWindowOuter> window = do_GetInterface(WebNavigation());
+    NS_ENSURE_TRUE(window, false);
+    nsCOMPtr<EventTarget> chromeHandler = window->GetChromeEventHandler();
+    NS_ENSURE_TRUE(chromeHandler, false);
+
+    RefPtr<BrowserChildMessageManager> scope = mBrowserChildMessageManager =
+        new BrowserChildMessageManager(this);
+
+    MOZ_ALWAYS_TRUE(nsMessageManagerScriptExecutor::Init());
+
+    nsCOMPtr<nsPIWindowRoot> root = do_QueryInterface(chromeHandler);
+    if (NS_WARN_IF(!root)) {
+      mBrowserChildMessageManager = nullptr;
+      return false;
+    }
+    root->SetParentTarget(scope);
+  }
+
+  if (!mTriedBrowserInit) {
+    mTriedBrowserInit = true;
+  }
+
+  return true;
+}
+
+void BrowserChild::InitRenderingState(
+    const TextureFactoryIdentifier& aTextureFactoryIdentifier,
+    const layers::LayersId& aLayersId,
+    const CompositorOptions& aCompositorOptions) {
+  mPuppetWidget->InitIMEState();
+
+  MOZ_ASSERT(aLayersId.IsValid());
+  mTextureFactoryIdentifier = aTextureFactoryIdentifier;
+
+  if (!CompositorBridgeChild::Get()) {
+    mLayersConnected = Some(false);
+    NS_WARNING("failed to get CompositorBridgeChild instance");
+    return;
+  }
+
+  mCompositorOptions = Some(aCompositorOptions);
+
+  if (aLayersId.IsValid()) {
+    StaticMutexAutoLock lock(sBrowserChildrenMutex);
+
+    if (!sBrowserChildren) {
+      sBrowserChildren = new BrowserChildMap;
+    }
+    MOZ_ASSERT(!sBrowserChildren->Contains(uint64_t(aLayersId)));
+    sBrowserChildren->InsertOrUpdate(uint64_t(aLayersId), this);
+    mLayersId = aLayersId;
+  }
+
+  MOZ_ASSERT(!mPuppetWidget->HasWindowRenderer() ||
+             mPuppetWidget->GetWindowRenderer()->GetBackendType() ==
+                 layers::LayersBackend::LAYERS_NONE);
+  bool success = false;
+  if (mLayersConnected == Some(true)) {
+    success = CreateRemoteLayerManager();
+  }
+
+  if (success) {
+    MOZ_ASSERT(mLayersConnected == Some(true));
+    ImageBridgeChild::IdentifyCompositorTextureHost(mTextureFactoryIdentifier);
+    InitAPZState();
+  } else {
+    mLayersConnected = Some(false);
+  }
+
+  nsCOMPtr<nsIObserverService> observerService =
+      mozilla::services::GetObserverService();
+
+  if (observerService) {
+    observerService->AddObserver(this, BEFORE_FIRST_PAINT, false);
+  }
+}
+
+bool BrowserChild::CreateRemoteLayerManager() {
+  return mPuppetWidget->CreateRemoteLayerManager(
+      [&](WebRenderLayerManager* aLayerManager) -> bool {
+        nsCString error;
+        return aLayerManager->Initialize(&mTextureFactoryIdentifier, error);
+      });
+}
+
+void BrowserChild::InitAPZState() {
+  if (!mCompositorOptions->UseAPZ()) {
+    return;
+  }
+  auto* cbc = CompositorBridgeChild::Get();
+
+  auto treeManager = MakeRefPtr<APZCTreeManagerChild>();
+  if (!cbc->SendPAPZCTreeManagerConstructor(treeManager, mLayersId)) {
+    MOZ_ASSERT(false,
+               "Allocating a TreeManager should not fail with APZ enabled");
+    return;
+  }
+
+  mApzcTreeManager = treeManager;
+
+  auto contentController = MakeRefPtr<ContentProcessController>(this);
+  auto apzChild = MakeRefPtr<APZChild>(contentController);
+  cbc->SendPAPZConstructor(apzChild, mLayersId);
+}
+
+IPCResult BrowserChild::RecvUpdateEffects(const EffectsInfo& aEffects) {
+  bool needInvalidate = false;
+  if (mEffectsInfo.IsVisible() && aEffects.IsVisible() &&
+      mEffectsInfo != aEffects) {
+    needInvalidate = true;
+  }
+
+  mEffectsInfo = aEffects;
+  UpdateVisibility();
+
+  if (needInvalidate) {
+    if (nsCOMPtr<nsIDocShell> docShell = do_GetInterface(WebNavigation())) {
+      if (RefPtr<PresShell> presShell = docShell->GetPresShell()) {
+        if (nsIFrame* root = presShell->GetRootFrame()) {
+          root->InvalidateFrame();
+        }
+      }
+    }
+  }
+
+  return IPC_OK();
+}
+
+bool BrowserChild::IsVisible() {
+  return mPuppetWidget && mPuppetWidget->IsVisible();
+}
+
+void BrowserChild::UpdateVisibility() {
+  const bool shouldBeVisible = [&] {
+    if (mBrowsingContext && mBrowsingContext->IsUnderHiddenEmbedderElement()) {
+      return false;
+    }
+    if (!mRenderLayers) {
+      return false;
+    }
+    if (!mIsTopLevel) {
+      if (!mEffectsInfo.IsVisible()) {
+        return false;
+      }
+      if (!mIsPreservingLayers && mBrowsingContext &&
+          !mBrowsingContext->IsActive()) {
+        return false;
+      }
+    }
+    return true;
+  }();
+
+  const bool isVisible = IsVisible();
+  if (shouldBeVisible == isVisible) {
+    return;
+  }
+  if (shouldBeVisible) {
+    MakeVisible();
+  } else {
+    MakeHidden();
+  }
+}
+
+void BrowserChild::MakeVisible() {
+  if (IsVisible()) {
+    return;
+  }
+
+  if (mPuppetWidget) {
+    mPuppetWidget->Show(true);
+  }
+
+  PresShellActivenessMaybeChanged();
+}
+
+void BrowserChild::MakeHidden() {
+  if (!IsVisible()) {
+    return;
+  }
+
+  if (mPuppetWidget) {
+    if (mPuppetWidget->HasWindowRenderer()) {
+      ClearCachedResources();
+    }
+    mPuppetWidget->Show(false);
+  }
+
+  PresShellActivenessMaybeChanged();
+}
+
+IPCResult BrowserChild::RecvPreserveLayers(bool aPreserve) {
+  mIsPreservingLayers = aPreserve;
+
+  UpdateVisibility();
+  PresShellActivenessMaybeChanged();
+
+  return IPC_OK();
+}
+
+void BrowserChild::PresShellActivenessMaybeChanged() {
+  nsCOMPtr<nsIDocShell> docShell = do_GetInterface(WebNavigation());
+  if (!docShell) {
+    return;
+  }
+  RefPtr<PresShell> presShell = docShell->GetPresShell();
+  if (!presShell) {
+    return;
+  }
+  presShell->ActivenessMaybeChanged();
+}
+
+NS_IMETHODIMP
+BrowserChild::GetMessageManager(ContentFrameMessageManager** aResult) {
+  RefPtr<ContentFrameMessageManager> mm(mBrowserChildMessageManager);
+  mm.forget(aResult);
+  return *aResult ? NS_OK : NS_ERROR_FAILURE;
+}
+
+void BrowserChild::SendRequestFocus(bool aCanFocus, CallerType aCallerType) {
+  nsFocusManager* fm = nsFocusManager::GetFocusManager();
+  if (!fm) {
+    return;
+  }
+
+  nsCOMPtr<nsPIDOMWindowOuter> window = do_GetInterface(WebNavigation());
+  if (!window) {
+    return;
+  }
+
+  BrowsingContext* focusedBC = fm->GetFocusedBrowsingContext();
+  if (focusedBC == window->GetBrowsingContext()) {
+    return;
+  }
+
+  PBrowserChild::SendRequestFocus(aCanFocus, aCallerType);
+}
+
+NS_IMETHODIMP
+BrowserChild::GetTabId(uint64_t* aId) {
+  *aId = GetTabId();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+BrowserChild::GetChromeOuterWindowID(uint64_t* aId) {
+  *aId = ChromeOuterWindowID();
+  return NS_OK;
+}
+
+bool BrowserChild::DoSendBlockingMessage(
+    const nsAString& aMessage, NotNull<StructuredCloneData*> aData,
+    nsTArray<NotNull<RefPtr<StructuredCloneData>>>* aRetVal) {
+  return SendSyncMessage(PromiseFlatString(aMessage), aData, aRetVal);
+}
+
+nsresult BrowserChild::DoSendAsyncMessage(const nsAString& aMessage,
+                                          NotNull<StructuredCloneData*> aData) {
+  if (!SendAsyncMessage(PromiseFlatString(aMessage), aData)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+  return NS_OK;
+}
+
+nsTArray<RefPtr<BrowserChild>> BrowserChild::GetAll() {
+  StaticMutexAutoLock lock(sBrowserChildrenMutex);
+
+  if (!sBrowserChildren) {
+    return {};
+  }
+
+  return ToTArray<nsTArray<RefPtr<BrowserChild>>>(sBrowserChildren->Values());
+}
+
+BrowserChild* BrowserChild::GetFrom(PresShell* aPresShell) {
+  Document* doc = aPresShell->GetDocument();
+  if (!doc) {
+    return nullptr;
+  }
+  nsCOMPtr<nsIDocShell> docShell(doc->GetDocShell());
+  return GetFrom(docShell);
+}
+
+BrowserChild* BrowserChild::GetFrom(layers::LayersId aLayersId) {
+  StaticMutexAutoLock lock(sBrowserChildrenMutex);
+  if (!sBrowserChildren) {
+    return nullptr;
+  }
+  return sBrowserChildren->Get(uint64_t(aLayersId));
+}
+
+void BrowserChild::DidComposite(mozilla::layers::TransactionId aTransactionId,
+                                const TimeStamp& aCompositeStart,
+                                const TimeStamp& aCompositeEnd) {
+  MOZ_ASSERT(mPuppetWidget);
+  RefPtr<WebRenderLayerManager> lm =
+      mPuppetWidget->GetWindowRenderer()->AsWebRender();
+  MOZ_ASSERT(lm);
+
+  if (lm) {
+    lm->DidComposite(aTransactionId, aCompositeStart, aCompositeEnd);
+  }
+}
+
+void BrowserChild::ClearCachedResources() {
+  MOZ_ASSERT(mPuppetWidget);
+  RefPtr<WebRenderLayerManager> lm =
+      mPuppetWidget->GetWindowRenderer()->AsWebRender();
+  if (lm) {
+    lm->ClearCachedResources();
+  }
+
+  if (nsCOMPtr<Document> document = GetTopLevelDocument()) {
+    nsPresContext* presContext = document->GetPresContext();
+    if (presContext) {
+      presContext->NotifyPaintStatusReset();
+    }
+  }
+}
+
+void BrowserChild::SchedulePaint() {
+  nsCOMPtr<nsIDocShell> docShell = do_GetInterface(WebNavigation());
+  if (!docShell) {
+    return;
+  }
+
+  if (RefPtr<PresShell> presShell = docShell->GetPresShell()) {
+    if (nsIFrame* root = presShell->GetRootFrame()) {
+      root->SchedulePaint();
+    }
+  }
+}
+
+void SkipViewTransitionsAfterRenderingReset(Document& aDocument) {
+  if (RefPtr<ViewTransition> transition = aDocument.GetActiveViewTransition()) {
+    transition->SkipTransition(SkipTransitionReason::ResetRendering);
+  }
+
+  aDocument.EnumerateSubDocuments([&](Document& aSubDoc) {
+    SkipViewTransitionsAfterRenderingReset(aSubDoc);
+    return CallState::Continue;
+  });
+}
+
+void BrowserChild::ReinitRendering() {
+  MOZ_ASSERT(mLayersId.IsValid());
+
+  if (RefPtr<Document> doc = GetTopLevelDocument()) {
+    SkipViewTransitionsAfterRenderingReset(*doc);
+  }
+
+  if (mLayersConnectRequested.isNothing() ||
+      mLayersConnectRequested == Some(false)) {
+    return;
+  }
+
+  bool success = false;
+  Maybe<CompositorOptions> options;
+  SendEnsureLayersConnected(&options);
+  if (options) {
+    mCompositorOptions = options;
+    if (CompositorBridgeChild::Get()) {
+      success = CreateRemoteLayerManager();
+    }
+  }
+
+  if (!success) {
+    NS_WARNING("failed to recreate layer manager");
+    return;
+  }
+
+  mLayersConnected = Some(true);
+  ImageBridgeChild::IdentifyCompositorTextureHost(mTextureFactoryIdentifier);
+
+  InitAPZState();
+  if (nsCOMPtr<Document> doc = GetTopLevelDocument()) {
+    doc->NotifyLayerManagerRecreated();
+  }
+
+  if (mRenderLayers) {
+    SchedulePaint();
+  }
+}
+
+void BrowserChild::ReinitRenderingForDeviceReset() {
+  RefPtr<WebRenderLayerManager> lm =
+      mPuppetWidget->GetWindowRenderer()->AsWebRender();
+  if (lm) {
+    lm->DoDestroy( true);
+  }
+
+  ReinitRendering();
+}
+
+NS_IMETHODIMP
+BrowserChild::OnShowTooltip(int32_t aXCoords, int32_t aYCoords,
+                            const nsAString& aTipText,
+                            const nsAString& aTipDir) {
+  nsString str(aTipText);
+  nsString dir(aTipDir);
+  SendShowTooltip(aXCoords, aYCoords, str, dir);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+BrowserChild::OnHideTooltip() {
+  SendHideTooltip();
+  return NS_OK;
+}
+
+void BrowserChild::NotifyJankedAnimations(
+    const nsTArray<uint64_t>& aJankedAnimations) {
+  MOZ_ASSERT(mPuppetWidget);
+  RefPtr<WebRenderLayerManager> lm =
+      mPuppetWidget->GetWindowRenderer()->AsWebRender();
+  if (lm) {
+    lm->UpdatePartialPrerenderedAnimations(aJankedAnimations);
+  }
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvUIResolutionChanged(
+    const float& aDpi, const int32_t& aRounding, const double& aScale,
+    const double& aDesktopToDeviceScale) {
+  const LayoutDeviceIntSize oldInnerSize = GetInnerSize();
+  if (aDpi > 0) {
+    mPuppetWidget->UpdateBackingScaleCache(aDpi, aRounding, aScale,
+                                           aDesktopToDeviceScale);
+  }
+
+  const LayoutDeviceIntSize innerSize = GetInnerSize();
+  if (mHasValidInnerSize && oldInnerSize != innerSize) {
+    nsCOMPtr<nsIBaseWindow> baseWin = do_QueryInterface(WebNavigation());
+    baseWin->SetPositionAndSize(0, 0, innerSize.width, innerSize.height,
+                                nsIBaseWindow::eRepaint);
+
+    const LayoutDeviceIntRect widgetRect(
+        GetOuterRect().TopLeft() + mClientOffset + mChromeOffset, innerSize);
+    mPuppetWidget->Resize(widgetRect / mPuppetWidget->GetDesktopToDeviceScale(),
+                          true);
+  }
+
+  nsCOMPtr<Document> document(GetTopLevelDocument());
+  RefPtr<nsPresContext> presContext =
+      document ? document->GetPresContext() : nullptr;
+  if (presContext) {
+    presContext->UIResolutionChangedSync();
+  }
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvTransparencyChanged(
+    const bool& aIsTransparent) {
+  mIsTransparent = aIsTransparent;
+  SchedulePaint();
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvSafeAreaInsetsChanged(
+    const mozilla::LayoutDeviceIntMargin& aSafeAreaInsets) {
+  mPuppetWidget->UpdateSafeAreaInsets(aSafeAreaInsets);
+
+  LayoutDeviceIntMargin currentSafeAreaInsets;
+  LayoutDeviceIntRect outerRect = GetOuterRect();
+  RefPtr<Screen> screen = widget::ScreenManager::GetSingleton().ScreenForRect(
+      RoundedToInt(outerRect / mPuppetWidget->GetDesktopToDeviceScale()));
+  if (screen) {
+    LayoutDeviceIntRect windowRect = outerRect + mClientOffset + mChromeOffset;
+    currentSafeAreaInsets = nsContentUtils::GetWindowSafeAreaInsets(
+        screen, aSafeAreaInsets, windowRect);
+  }
+
+  if (nsCOMPtr<Document> document = GetTopLevelDocument()) {
+    if (nsPresContext* presContext = document->GetPresContext()) {
+      presContext->SetSafeAreaInsets(currentSafeAreaInsets);
+    }
+  }
+
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvInitSupportsUnadjustedMovement(
+    const bool& aSupportsUnadjustedMovement) {
+  mPuppetWidget->InitSupportsUnadjustedMovement(aSupportsUnadjustedMovement);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvAllowScriptsToClose() {
+  nsCOMPtr<nsPIDOMWindowOuter> window = do_GetInterface(WebNavigation());
+  if (window) {
+    nsGlobalWindowOuter::Cast(window)->AllowScriptsToClose();
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvReleaseAllPointerCapture() {
+  PointerEventHandler::ReleaseAllPointerCapture();
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult BrowserChild::RecvReleasePointerLock() {
+  PointerLockManager::Unlock("BrowserChild::RecvReleasePointerLock");
+  return IPC_OK();
+}
+
+LayoutDeviceIntSize BrowserChild::GetInnerSize() {
+  return RoundedToInt(mUnscaledInnerSize * mPuppetWidget->GetDefaultScale());
+};
+
+Maybe<nsRect> BrowserChild::GetVisibleRect() const {
+  if (mIsTopLevel) {
+    return Nothing();
+  }
+  return mEffectsInfo.mVisibleRect;
+}
+
+Maybe<LayoutDeviceRect>
+BrowserChild::GetTopLevelViewportVisibleRectInSelfCoords() const {
+  if (mIsTopLevel) {
+    return Nothing();
+  }
+
+  if (!mChildToParentConversionMatrix) {
+    return Nothing();
+  }
+
+  Maybe<LayoutDeviceToLayoutDeviceMatrix4x4> inverse =
+      mChildToParentConversionMatrix->MaybeInverse();
+  if (!inverse) {
+    return Nothing();
+  }
+
+  Maybe<LayoutDeviceRect> rect = UntransformBy(
+      *inverse,
+      ViewAs<LayoutDevicePixel>(
+          mTopLevelViewportVisibleRectInBrowserCoords,
+          PixelCastJustification::ContentProcessIsLayerInUiProcess),
+      LayoutDeviceRect::MaxIntRect());
+  if (!rect) {
+    return Nothing();
+  }
+
+  return rect;
+}
+
+LayoutDeviceIntRect BrowserChild::GetOuterRect() {
+  return RoundedToInt(mUnscaledOuterRect * mPuppetWidget->GetDefaultScale());
+}
+
+void BrowserChild::PaintWhileInterruptingJS() {
+  if (!IPCOpen() || !mPuppetWidget || !mPuppetWidget->HasWindowRenderer()) {
+    return;
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(nsContentUtils::IsSafeToRunScript());
+  nsAutoScriptBlocker scriptBlocker;
+  RecvRenderLayers( true);
+}
+
+void BrowserChild::UnloadLayersWhileInterruptingJS() {
+  if (!IPCOpen() || !mPuppetWidget || !mPuppetWidget->HasWindowRenderer()) {
+    return;
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(nsContentUtils::IsSafeToRunScript());
+  nsAutoScriptBlocker scriptBlocker;
+  RecvRenderLayers( false);
+}
+
+nsresult BrowserChild::CanCancelContentJS(
+    nsIRemoteTab::NavigationType aNavigationType, int32_t aNavigationIndex,
+    nsIURI* aNavigationURI, int32_t aEpoch, bool* aCanCancel) {
+  *aCanCancel = false;
+
+  if (aEpoch <= mCancelContentJSEpoch) {
+    return NS_OK;
+  }
+
+  *aCanCancel = true;
+  return NS_OK;
+}
+
+NS_IMETHODIMP BrowserChild::OnStateChange(nsIWebProgress* aWebProgress,
+                                          nsIRequest* aRequest,
+                                          uint32_t aStateFlags,
+                                          nsresult aStatus) {
+  if (!IPCOpen() || mDestroyed || !mShouldSendWebProgressEventsToParent) {
+    return NS_OK;
+  }
+
+  if (aStateFlags & nsIWebProgressListener::STATE_IS_REDIRECTED_DOCUMENT) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIDocShell> docShell = do_QueryInterface(aWebProgress);
+  if (!docShell) {
+    MOZ_ASSERT_UNREACHABLE("aWebProgress is null or not a nsIDocShell?");
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  WebProgressData webProgressData;
+  Maybe<WebProgressStateChangeData> stateChangeData;
+  RequestData requestData;
+
+  MOZ_TRY(PrepareProgressListenerData(aWebProgress, aRequest, webProgressData,
+                                      requestData));
+
+  RefPtr<BrowsingContext> browsingContext = docShell->GetBrowsingContext();
+  if (browsingContext->IsTopContent()) {
+    stateChangeData.emplace();
+
+    stateChangeData->isNavigating() = docShell->GetIsNavigating();
+    stateChangeData->mayEnableCharacterEncodingMenu() =
+        docShell->GetMayEnableCharacterEncodingMenu();
+
+    RefPtr<Document> document = browsingContext->GetExtantDocument();
+    if (document && aStateFlags & nsIWebProgressListener::STATE_STOP) {
+      document->GetContentType(stateChangeData->contentType());
+      document->GetCharacterSet(stateChangeData->charset());
+      stateChangeData->documentURI() = document->GetDocumentURIObject();
+    } else {
+      stateChangeData->contentType().SetIsVoid(true);
+      stateChangeData->charset().SetIsVoid(true);
+    }
+  }
+
+  (void)SendOnStateChange(webProgressData, requestData, aStateFlags, aStatus,
+                          stateChangeData);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP BrowserChild::OnProgressChange(nsIWebProgress* aWebProgress,
+                                             nsIRequest* aRequest,
+                                             int32_t aCurSelfProgress,
+                                             int32_t aMaxSelfProgress,
+                                             int32_t aCurTotalProgress,
+                                             int32_t aMaxTotalProgress) {
+  if (!IPCOpen() || mDestroyed || !mShouldSendWebProgressEventsToParent) {
+    return NS_OK;
+  }
+
+  if (!GetBrowsingContext()->IsTopContent()) {
+    return NS_OK;
+  }
+
+  (void)SendOnProgressChange(aCurTotalProgress, aMaxTotalProgress);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP BrowserChild::OnLocationChange(nsIWebProgress* aWebProgress,
+                                             nsIRequest* aRequest,
+                                             nsIURI* aLocation,
+                                             uint32_t aFlags) {
+  if (!IPCOpen() || mDestroyed || !mShouldSendWebProgressEventsToParent) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIDocShell> docShell = do_QueryInterface(aWebProgress);
+  if (!docShell) {
+    MOZ_ASSERT_UNREACHABLE("aWebProgress is null or not a nsIDocShell?");
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  RefPtr<BrowsingContext> browsingContext = docShell->GetBrowsingContext();
+  RefPtr<Document> document = browsingContext->GetExtantDocument();
+  if (!document) {
+    return NS_OK;
+  }
+
+  WebProgressData webProgressData;
+  RequestData requestData;
+
+  MOZ_TRY(PrepareProgressListenerData(aWebProgress, aRequest, webProgressData,
+                                      requestData));
+
+  Maybe<WebProgressLocationChangeData> locationChangeData;
+
+  bool canGoBack = false;
+  bool canGoBackIgnoringUserInteraction = false;
+  bool canGoForward = false;
+
+  if (browsingContext->IsTopContent()) {
+    MOZ_ASSERT(
+        browsingContext == GetBrowsingContext(),
+        "Toplevel content BrowsingContext which isn't GetBrowsingContext()?");
+
+    locationChangeData.emplace();
+
+    document->GetContentType(locationChangeData->contentType());
+    locationChangeData->isNavigating() = docShell->GetIsNavigating();
+    locationChangeData->documentURI() = document->GetDocumentURIObject();
+    document->GetTitle(locationChangeData->title());
+    document->GetCharacterSet(locationChangeData->charset());
+
+    locationChangeData->mayEnableCharacterEncodingMenu() =
+        docShell->GetMayEnableCharacterEncodingMenu();
+
+    locationChangeData->contentPrincipal() = document->NodePrincipal();
+    locationChangeData->contentPartitionedPrincipal() =
+        document->PartitionedPrincipal();
+    locationChangeData->policyContainer() = document->GetPolicyContainer();
+    locationChangeData->referrerInfo() = document->ReferrerInfo();
+    locationChangeData->isSyntheticDocument() = document->IsSyntheticDocument();
+
+    if (nsCOMPtr<nsILoadGroup> loadGroup = document->GetDocumentLoadGroup()) {
+      uint64_t requestContextID = 0;
+      MOZ_TRY(loadGroup->GetRequestContextID(&requestContextID));
+      locationChangeData->requestContextID() = Some(requestContextID);
+    }
+
+  }
+
+  (void)SendOnLocationChange(webProgressData, requestData, aLocation, aFlags,
+                             canGoBack, canGoBackIgnoringUserInteraction,
+                             canGoForward, locationChangeData);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP BrowserChild::OnStatusChange(nsIWebProgress* aWebProgress,
+                                           nsIRequest* aRequest,
+                                           nsresult aStatus,
+                                           const char16_t* aMessage) {
+  if (!IPCOpen() || mDestroyed || !mShouldSendWebProgressEventsToParent) {
+    return NS_OK;
+  }
+
+  (void)SendOnStatusChange(nsDependentString(aMessage));
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP BrowserChild::OnSecurityChange(nsIWebProgress* aWebProgress,
+                                             nsIRequest* aRequest,
+                                             uint32_t aState) {
+  return NS_OK;
+}
+
+NS_IMETHODIMP BrowserChild::OnContentBlockingEvent(nsIWebProgress* aWebProgress,
+                                                   nsIRequest* aRequest,
+                                                   uint32_t aEvent) {
+  MOZ_DIAGNOSTIC_ASSERT(
+      false, "OnContentBlockingEvent should not be seen in content process.");
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP BrowserChild::NotifyNavigationFinished() {
+  (void)SendNavigationFinished();
+  return NS_OK;
+}
+
+nsresult BrowserChild::PrepareRequestData(nsIRequest* aRequest,
+                                          RequestData& aRequestData) {
+  nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest);
+  if (!channel) {
+    aRequestData.requestURI() = nullptr;
+    return NS_OK;
+  }
+
+  nsresult rv = channel->GetURI(getter_AddRefs(aRequestData.requestURI()));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = channel->GetOriginalURI(
+      getter_AddRefs(aRequestData.originalRequestURI()));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = channel->GetCanceledReason(aRequestData.canceledReason());
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIClassifiedChannel> classifiedChannel = do_QueryInterface(channel);
+  if (classifiedChannel) {
+    rv = classifiedChannel->GetMatchedList(aRequestData.matchedList());
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return NS_OK;
+}
+
+nsresult BrowserChild::PrepareProgressListenerData(
+    nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+    WebProgressData& aWebProgressData, RequestData& aRequestData) {
+  nsCOMPtr<nsIDocShell> docShell = do_QueryInterface(aWebProgress);
+  if (!docShell) {
+    MOZ_ASSERT_UNREACHABLE("aWebProgress is null or not a nsIDocShell?");
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  aWebProgressData.browsingContext() = docShell->GetBrowsingContext();
+  nsresult rv = aWebProgress->GetLoadType(&aWebProgressData.loadType());
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return PrepareRequestData(aRequest, aRequestData);
+}
+
+void BrowserChild::UpdateSessionStore() {
+  if (mSessionStoreChild) {
+    mSessionStoreChild->UpdateSessionStore();
+  }
+}
+
+
+void BrowserChild::NotifyContentBlockingEvent(
+    uint32_t aEvent, nsIChannel* aChannel, bool aBlocked,
+    const nsACString& aTrackingOrigin,
+    const nsTArray<nsCString>& aTrackingFullHashes,
+    const Maybe<
+        mozilla::ContentBlockingNotifier::StorageAccessPermissionGrantedReason>&
+        aReason,
+    const Maybe<CanvasFingerprintingEvent>& aCanvasFingerprintingEvent) {
+  if (!IPCOpen()) {
+    return;
+  }
+
+  RequestData requestData;
+  if (NS_SUCCEEDED(PrepareRequestData(aChannel, requestData))) {
+    (void)SendNotifyContentBlockingEvent(
+        aEvent, requestData, aBlocked, PromiseFlatCString(aTrackingOrigin),
+        aTrackingFullHashes, aReason, aCanvasFingerprintingEvent);
+  }
+}
+
+NS_IMETHODIMP
+BrowserChild::ContentTransformsReceived(JSContext* aCx,
+                                        dom::Promise** aPromise) {
+  auto* globalObject = xpc::CurrentNativeGlobal(aCx);
+  ErrorResult rv;
+  if (mChildToParentConversionMatrix) {
+    RefPtr<Promise> promise =
+        Promise::CreateResolvedWithUndefined(globalObject, rv);
+    promise.forget(aPromise);
+    return rv.StealNSResult();
+  }
+
+  if (!mContentTransformPromise) {
+    mContentTransformPromise = Promise::Create(globalObject, rv);
+  }
+
+  MOZ_ASSERT(globalObject == mContentTransformPromise->GetGlobalObject());
+  NS_IF_ADDREF(*aPromise = mContentTransformPromise);
+  return rv.StealNSResult();
+}
+
+already_AddRefed<nsIDragSession> BrowserChild::GetDragSession() {
+  return RefPtr(mDragSession).forget();
+}
+
+void BrowserChild::SetDragSession(nsIDragSession* aSession) {
+  mDragSession = aSession;
+}
+
+LazyLogModule gPointerRawUpdateEventListenersLog(
+    "PointerRawUpdateEventListeners");
+
+void BrowserChild::OnPointerRawUpdateEventListenerAdded(
+    const nsPIDOMWindowInner* aWindow) {
+  mPointerRawUpdateWindowCount++;
+  MOZ_LOG(gPointerRawUpdateEventListenersLog, LogLevel::Info,
+          ("Added for %p (total: %u)", aWindow, mPointerRawUpdateWindowCount));
+}
+
+void BrowserChild::OnPointerRawUpdateEventListenerRemoved(
+    const nsPIDOMWindowInner* aWindow) {
+  MOZ_ASSERT(mPointerRawUpdateWindowCount);
+  if (MOZ_LIKELY(mPointerRawUpdateWindowCount)) {
+    mPointerRawUpdateWindowCount--;
+  }
+  MOZ_LOG(gPointerRawUpdateEventListenersLog, LogLevel::Info,
+          ("Removed for %p (remaining: %u)", aWindow,
+           mPointerRawUpdateWindowCount));
+}
+
+#if defined(ACCESSIBILITY) && defined(MOZ_ENABLE_SKIA_PDF)
+mozilla::ipc::IPCResult BrowserChild::RecvRequestDocAccessibleForPrint() {
+  if (RefPtr<Document> doc = GetTopLevelDocument()) {
+    a11y::DocManager::NotifyOfPrintDocument(doc);
+  }
+  return IPC_OK();
+}
+#endif
+
+BrowserChildMessageManager::BrowserChildMessageManager(
+    BrowserChild* aBrowserChild)
+    : ContentFrameMessageManager(new nsFrameMessageManager(aBrowserChild)),
+      mBrowserChild(aBrowserChild) {}
+
+BrowserChildMessageManager::~BrowserChildMessageManager() = default;
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(BrowserChildMessageManager)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(BrowserChildMessageManager,
+                                                DOMEventTargetHelper)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mMessageManager);
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mBrowserChild);
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_REFERENCE
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(BrowserChildMessageManager,
+                                                  DOMEventTargetHelper)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mMessageManager)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mBrowserChild)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(BrowserChildMessageManager)
+  NS_INTERFACE_MAP_ENTRY(nsIMessageSender)
+  NS_INTERFACE_MAP_ENTRY_CONCRETE(ContentFrameMessageManager)
+  NS_INTERFACE_MAP_ENTRY(nsISupportsWeakReference)
+NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
+
+NS_IMPL_ADDREF_INHERITED(BrowserChildMessageManager, DOMEventTargetHelper)
+NS_IMPL_RELEASE_INHERITED(BrowserChildMessageManager, DOMEventTargetHelper)
+
+JSObject* BrowserChildMessageManager::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return ContentFrameMessageManager_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void BrowserChildMessageManager::MarkForCC() {
+  if (mBrowserChild) {
+    mBrowserChild->MarkScopesForCC();
+  }
+  EventListenerManager* elm = GetExistingListenerManager();
+  if (elm) {
+    elm->MarkForCC();
+  }
+  MessageManagerGlobal::MarkForCC();
+}
+
+Nullable<WindowProxyHolder> BrowserChildMessageManager::GetContent(
+    ErrorResult& aError) {
+  nsCOMPtr<nsIDocShell> docShell = GetDocShell(aError);
+  if (!docShell) {
+    return nullptr;
+  }
+  return WindowProxyHolder(docShell->GetBrowsingContext());
+}
+
+already_AddRefed<nsIDocShell> BrowserChildMessageManager::GetDocShell(
+    ErrorResult& aError) {
+  if (!mBrowserChild) {
+    aError.Throw(NS_ERROR_NULL_POINTER);
+    return nullptr;
+  }
+  nsCOMPtr<nsIDocShell> window =
+      do_GetInterface(mBrowserChild->WebNavigation());
+  return window.forget();
+}
+
+already_AddRefed<nsIEventTarget>
+BrowserChildMessageManager::GetTabEventTarget() {
+  return do_AddRef(GetMainThreadSerialEventTarget());
+}
+
+nsresult BrowserChildMessageManager::Dispatch(
+    already_AddRefed<nsIRunnable> aRunnable) const {
+  return SchedulerGroup::Dispatch(std::move(aRunnable));
+}

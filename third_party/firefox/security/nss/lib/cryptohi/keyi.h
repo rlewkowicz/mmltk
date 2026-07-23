@@ -1,0 +1,42 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _KEYI_H_
+#define _KEYI_H_
+#include "secerr.h"
+
+SEC_BEGIN_PROTOS
+KeyType seckey_GetKeyType(SECOidTag pubKeyOid);
+
+SECStatus sec_DecodeSigAlg(const SECKEYPublicKey *key, SECOidTag sigAlg,
+                           const SECItem *param, SECOidTag *encalg,
+                           SECOidTag *hashalg, CK_MECHANISM_TYPE *mech,
+                           SECItem *mechparams);
+
+SECOidTag sec_GetEncAlgFromSigAlg(SECOidTag sigAlg);
+
+SECStatus sec_DecodeRSAPSSParams(PLArenaPool *arena,
+                                 const SECItem *params,
+                                 SECOidTag *hashAlg,
+                                 SECOidTag *maskHashAlg,
+                                 unsigned long *saltLength);
+
+SECStatus sec_DecodeRSAPSSParamsToMechanism(PLArenaPool *arena,
+                                            const SECItem *params,
+                                            CK_RSA_PKCS_PSS_PARAMS *mech,
+                                            SECOidTag *hashAlg);
+
+SECOidTag seckey_GetParameterSet(const SECKEYPrivateKey *key);
+
+KyberParams seckey_GetKyberParamsByOidTag(SECOidTag tag);
+
+SECOidTag seckey_GetMLKEMOidTagByPkcs11ParamSet(CK_ML_KEM_PARAMETER_SET_TYPE paramSet);
+
+CK_ML_KEM_PARAMETER_SET_TYPE seckey_GetMLKEMPkcs11ParamsByKyberParams(KyberParams kyberParams);
+
+KyberParams seckey_GetKyberParamsByPkcs11ParamSet(CK_ML_KEM_PARAMETER_SET_TYPE paramSet);
+
+SEC_END_PROTOS
+
+#endif /* _KEYHI_H_ */

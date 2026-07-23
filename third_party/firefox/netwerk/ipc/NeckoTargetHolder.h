@@ -1,0 +1,32 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_NeckoTargetHolder_h
+#define mozilla_net_NeckoTargetHolder_h
+
+#include "nsIEventTarget.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla {
+namespace net {
+
+class NeckoTargetHolder {
+ public:
+  explicit NeckoTargetHolder(nsISerialEventTarget* aNeckoTarget)
+      : mNeckoTarget(aNeckoTarget) {}
+
+ protected:
+  virtual ~NeckoTargetHolder() = default;
+  virtual already_AddRefed<nsISerialEventTarget> GetNeckoTarget();
+  nsresult Dispatch(
+      already_AddRefed<nsIRunnable> aRunnable,
+      nsIEventTarget::DispatchFlags aDispatchFlags = NS_DISPATCH_NORMAL);
+
+  nsCOMPtr<nsISerialEventTarget> mNeckoTarget;
+};
+
+}  
+}  
+
+#endif

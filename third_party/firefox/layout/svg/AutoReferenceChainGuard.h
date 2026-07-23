@@ -1,0 +1,100 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_AUTOREFERENCECHAINGUARD_H_
+#define LAYOUT_SVG_AUTOREFERENCECHAINGUARD_H_
+
+#include "Element.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Likely.h"
+#include "mozilla/dom/Document.h"
+#include "nsDebug.h"
+#include "nsIFrame.h"
+
+namespace mozilla {
+
+class MOZ_RAII AutoReferenceChainGuard {
+  static constexpr int16_t sDefaultMaxChainLength = 10;  
+
+ public:
+  static constexpr int16_t noChain = -2;
+
+  AutoReferenceChainGuard(nsIFrame* aFrame, bool* aFrameInUse,
+                          int16_t* aChainCounter,
+                          int16_t aMaxChainLength = sDefaultMaxChainLength)
+      : mFrame(aFrame),
+        mFrameInUse(aFrameInUse),
+        mChainCounter(aChainCounter),
+        mMaxChainLength(aMaxChainLength),
+        mBrokeReference(false) {
+    MOZ_ASSERT(aFrame && aFrameInUse && aChainCounter);
+    MOZ_ASSERT(aMaxChainLength > 0);
+    MOZ_ASSERT(*aChainCounter == noChain ||
+               (*aChainCounter >= 0 && *aChainCounter < aMaxChainLength));
+  }
+
+  ~AutoReferenceChainGuard() {
+    if (mBrokeReference) {
+      return;
+    }
+
+    *mFrameInUse = false;
+
+    MOZ_ASSERT(*mChainCounter < mMaxChainLength);
+
+    (*mChainCounter)++;
+
+    if (*mChainCounter == mMaxChainLength) {
+      *mChainCounter = noChain;  
+    }
+  }
+
+  [[nodiscard]] bool Reference() {
+    if (MOZ_UNLIKELY(*mFrameInUse)) {
+      mBrokeReference = true;
+      ReportErrorToConsole();
+      return false;
+    }
+
+    if (*mChainCounter == noChain) {
+      *mChainCounter = mMaxChainLength;
+    } else {
+      MOZ_ASSERT(*mChainCounter >= 0);
+
+      if (MOZ_UNLIKELY(*mChainCounter < 1)) {
+        mBrokeReference = true;
+        ReportErrorToConsole();
+        return false;
+      }
+    }
+
+    *mFrameInUse = true;
+    (*mChainCounter)--;
+
+    return true;
+  }
+
+ private:
+  void ReportErrorToConsole() {
+    AutoTArray<nsString, 2> params;
+    dom::Element* element = mFrame->GetContent()->AsElement();
+    element->GetTagName(*params.AppendElement());
+    element->GetId(*params.AppendElement());
+    auto doc = mFrame->GetContent()->OwnerDoc();
+    auto warning = *mFrameInUse ? dom::Document::eSVGRefLoop
+                                : dom::Document::eSVGRefChainLengthExceeded;
+    doc->WarnOnceAbout(warning,  true, params);
+  }
+
+  nsIFrame* mFrame;
+  bool* mFrameInUse;
+  int16_t* mChainCounter;
+  const int16_t mMaxChainLength;
+  bool mBrokeReference;
+};
+
+}  
+
+#endif  // LAYOUT_SVG_AUTOREFERENCECHAINGUARD_H_

@@ -1,0 +1,101 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsUserIdleService_h_
+#define nsUserIdleService_h_
+
+#include "nsIUserIdleServiceInternal.h"
+#include "nsCOMPtr.h"
+#include "nsITimer.h"
+#include "nsTArray.h"
+#include "nsIObserver.h"
+#include "nsIUserIdleService.h"
+#include "nsCategoryCache.h"
+#include "nsWeakReference.h"
+#include "mozilla/TimeStamp.h"
+
+class IdleListener {
+ public:
+  nsCOMPtr<nsIObserver> observer;
+  uint32_t reqIdleTime;
+  bool isIdle;
+
+  IdleListener(nsIObserver* obs, uint32_t reqIT, bool aIsIdle = false)
+      : observer(obs), reqIdleTime(reqIT), isIdle(aIsIdle) {}
+  ~IdleListener() = default;
+};
+
+class nsUserIdleService;
+
+class nsUserIdleServiceDaily : public nsIObserver,
+                               public nsSupportsWeakReference {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  explicit nsUserIdleServiceDaily(nsIUserIdleService* aIdleService);
+
+  void Init();
+
+ private:
+  virtual ~nsUserIdleServiceDaily();
+
+  void StageIdleDaily(bool aHasBeenLongWait);
+
+  nsIUserIdleService* mIdleService;
+
+  nsCOMPtr<nsITimer> mTimer;
+
+  static void DailyCallback(nsITimer* aTimer, void* aClosure);
+
+  nsCategoryCache<nsIObserver> mCategoryObservers;
+
+  PRTime mExpectedTriggerTime;
+
+  int32_t mIdleDailyTriggerWait;
+};
+
+class nsUserIdleService : public nsIUserIdleServiceInternal {
+ public:
+  NS_DECL_ISUPPORTS
+ NS_DECL_NSIUSERIDLESERVICE NS_DECL_NSIUSERIDLESERVICEINTERNAL
+
+     protected : static already_AddRefed<nsUserIdleService>
+                 GetInstance();
+
+  nsUserIdleService();
+  virtual ~nsUserIdleService();
+
+  virtual bool PollIdleTime(uint32_t* aIdleTime);
+
+ public:
+  void SetDisabledForShutdown();
+
+ private:
+  void SetTimerExpiryIfBefore(mozilla::TimeStamp aNextTimeout);
+
+  mozilla::TimeStamp mCurrentlySetToTimeoutAt;
+
+  nsCOMPtr<nsITimer> mTimer;
+
+  nsTArray<IdleListener> mArrayListeners;
+
+  RefPtr<nsUserIdleServiceDaily> mDailyIdle;
+
+  uint32_t mIdleObserverCount;
+
+  uint32_t mDeltaToNextIdleSwitchInS;
+
+  bool mDisabled = false;
+
+  mozilla::TimeStamp mLastUserInteraction;
+
+  void ReconfigureTimer(void);
+
+  static void StaticIdleTimerCallback(nsITimer* aTimer, void* aClosure);
+
+  void IdleTimerCallback(void);
+};
+
+#endif  // nsUserIdleService_h_

@@ -1,0 +1,277 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ServiceWorkerUtils.h"
+
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/LoadInfo.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/ClientIPCTypes.h"
+#include "mozilla/dom/ClientInfo.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Navigator.h"
+#include "mozilla/dom/ServiceWorkerGlobalScopeBinding.h"
+#include "mozilla/dom/ServiceWorkerRegistrarTypes.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "mozilla/dom/WorkerRunnable.h"
+#include "nsCOMPtr.h"
+#include "nsContentPolicyUtils.h"
+#include "nsIContentSecurityPolicy.h"
+#include "nsIGlobalObject.h"
+#include "nsIPrincipal.h"
+#include "nsIURL.h"
+#include "nsPrintfCString.h"
+
+namespace mozilla::dom {
+
+bool ServiceWorkersEnabled(JSContext* aCx, JSObject* aGlobal) {
+  if (!StaticPrefs::dom_serviceWorkers_enabled()) {
+    return false;
+  }
+
+  JS::Rooted<JSObject*> jsGlobal(aCx, aGlobal);
+  nsIGlobalObject* global = xpc::CurrentNativeGlobal(aCx);
+
+  if (const nsCOMPtr<nsIPrincipal> principal = global->PrincipalOrNull()) {
+    if (principal->GetIsInPrivateBrowsing() &&
+        !(StaticPrefs::dom_cache_privateBrowsing_enabled() &&
+          StaticPrefs::dom_serviceWorkers_privateBrowsing_enabled())) {
+      return false;
+    }
+
+  }
+
+  if (IsSecureContextOrObjectIsFromSecureContext(aCx, jsGlobal)) {
+    return true;
+  }
+
+  return false;
+}
+
+bool ServiceWorkersStorageAllowedForGlobal(nsIGlobalObject* aGlobal) {
+  Maybe<ClientInfo> clientInfo = aGlobal->GetClientInfo();
+  nsICookieJarSettings* cookieJarSettings = aGlobal->GetCookieJarSettings();
+  nsIPrincipal* principal = aGlobal->PrincipalOrNull();
+
+  if (NS_WARN_IF(clientInfo.isNothing() || !cookieJarSettings || !principal)) {
+    return false;
+  }
+
+  auto storageAllowed = aGlobal->GetStorageAccess();
+
+  return (storageAllowed == StorageAccess::eAllow ||
+          (storageAllowed == StorageAccess::ePrivateBrowsing &&
+           StaticPrefs::dom_serviceWorkers_privateBrowsing_enabled()) ||
+          (ShouldPartitionStorage(storageAllowed) &&
+           StaticPrefs::privacy_partition_serviceWorkers() &&
+           StoragePartitioningEnabled(storageAllowed, cookieJarSettings) &&
+           (!principal->GetIsInPrivateBrowsing() ||
+            StaticPrefs::dom_serviceWorkers_privateBrowsing_enabled())));
+}
+
+bool ServiceWorkersStorageAllowedForClient(
+    const ClientInfoAndState& aInfoAndState) {
+  ClientInfo info(aInfoAndState.info());
+  ClientState state(ClientState::FromIPC(aInfoAndState.state()));
+
+  auto storageAllowed = state.GetStorageAccess();
+  return (storageAllowed == StorageAccess::eAllow ||
+          (storageAllowed == StorageAccess::ePrivateBrowsing &&
+           StaticPrefs::dom_serviceWorkers_privateBrowsing_enabled()) ||
+          (ShouldPartitionStorage(storageAllowed) &&
+           StaticPrefs::privacy_partition_serviceWorkers() &&
+           (!info.IsPrivateBrowsing() ||
+            StaticPrefs::dom_serviceWorkers_privateBrowsing_enabled())));
+}
+
+bool ServiceWorkerRegistrationDataIsValid(
+    const ServiceWorkerRegistrationData& aData) {
+  return !aData.scope().IsEmpty() && !aData.currentWorkerURL().IsEmpty() &&
+         !aData.cacheName().IsEmpty();
+}
+
+class WorkerCheckMayLoadSyncRunnable final : public WorkerMainThreadRunnable {
+ public:
+  explicit WorkerCheckMayLoadSyncRunnable(
+      std::function<void(ErrorResult&)>&& aCheckFunc)
+      : WorkerMainThreadRunnable(GetCurrentThreadWorkerPrivate(),
+                                 "WorkerCheckMayLoadSyncRunnable"_ns),
+        mCheckFunc(aCheckFunc) {}
+
+  bool MainThreadRun() override {
+    ErrorResult localResult;
+    mCheckFunc(localResult);
+    mRv = CopyableErrorResult(std::move(localResult));
+    return true;
+  }
+
+  void PropagateErrorResult(ErrorResult& aOutRv) {
+    aOutRv = ErrorResult(std::move(mRv));
+  }
+
+ private:
+  std::function<void(ErrorResult&)> mCheckFunc;
+  CopyableErrorResult mRv;
+};
+
+namespace {
+
+void CheckForSlashEscapedCharsInPath(nsIURI* aURI, const char* aURLDescription,
+                                     ErrorResult& aRv) {
+  MOZ_ASSERT(aURI);
+
+  nsCOMPtr<nsIURL> url(do_QueryInterface(aURI));
+  if (NS_WARN_IF(!url)) {
+    aRv.ThrowInvalidStateError("http: or https: URL without a concept of path");
+    return;
+  }
+
+  nsAutoCString path;
+  nsresult rv = url->GetFilePath(path);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aRv.ThrowInvalidStateError("http: or https: URL without a concept of path");
+    return;
+  }
+
+  ToLowerCase(path);
+  if (path.Find("%2f") != kNotFound || path.Find("%5c") != kNotFound) {
+    nsPrintfCString err("%s contains %%2f or %%5c", aURLDescription);
+    aRv.ThrowTypeError(err);
+  }
+}
+
+void CheckMayLoadOnMainThread(ErrorResult& aRv,
+                              std::function<void(ErrorResult&)>&& aCheckFunc) {
+  if (NS_IsMainThread()) {
+    aCheckFunc(aRv);
+    return;
+  }
+
+  RefPtr<WorkerCheckMayLoadSyncRunnable> runnable =
+      new WorkerCheckMayLoadSyncRunnable(std::move(aCheckFunc));
+  runnable->Dispatch(GetCurrentThreadWorkerPrivate(), Canceling, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+  runnable->PropagateErrorResult(aRv);
+}
+
+}  
+
+void ServiceWorkerScopeAndScriptAreValid(const ClientInfo& aClientInfo,
+                                         nsIURI* aScopeURI, nsIURI* aScriptURI,
+                                         ErrorResult& aRv,
+                                         nsIGlobalObject* aGlobalForReporting) {
+  MOZ_DIAGNOSTIC_ASSERT(aScopeURI);
+  MOZ_DIAGNOSTIC_ASSERT(aScriptURI);
+
+  auto principalOrErr = aClientInfo.GetPrincipal();
+  if (NS_WARN_IF(principalOrErr.isErr())) {
+    aRv.ThrowInvalidStateError("Can't make security decisions about Client");
+    return;
+  }
+
+  auto hasHTTPScheme = [](nsIURI* aURI) -> bool {
+    return net::SchemeIsHttpOrHttps(aURI);
+  };
+  nsCOMPtr<nsIPrincipal> principal = principalOrErr.unwrap();
+
+  if (!hasHTTPScheme(aScriptURI)) {
+    aRv.ThrowTypeError("Script URL's scheme is not 'http' or 'https'"_ns);
+    return;
+  }
+
+  CheckForSlashEscapedCharsInPath(aScriptURI, "script URL", aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return;
+  }
+
+  if (!hasHTTPScheme(aScopeURI)) {
+    aRv.ThrowTypeError("Scope URL's scheme is not 'http' or 'https'"_ns);
+    return;
+  }
+
+  CheckForSlashEscapedCharsInPath(aScopeURI, "scope URL", aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return;
+  }
+
+  nsAutoCString ref;
+  (void)aScopeURI->GetRef(ref);
+  if (NS_WARN_IF(!ref.IsEmpty())) {
+    aRv.ThrowSecurityError("Non-empty fragment on scope URL");
+    return;
+  }
+
+  (void)aScriptURI->GetRef(ref);
+  if (NS_WARN_IF(!ref.IsEmpty())) {
+    aRv.ThrowSecurityError("Non-empty fragment on script URL");
+    return;
+  }
+
+  Document* maybeDoc = nullptr;
+  nsCOMPtr<nsICSPEventListener> cspListener;
+  if (aGlobalForReporting) {
+    if (auto* win = aGlobalForReporting->GetAsInnerWindow()) {
+      maybeDoc = win->GetExtantDoc();
+      if (!maybeDoc) {
+        aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+        return;
+      }
+      principal = maybeDoc->NodePrincipal();
+    } else if (auto* wp = GetCurrentThreadWorkerPrivate()) {
+      cspListener = wp->CSPEventListener();
+    }
+  }
+
+  CheckMayLoadOnMainThread(aRv, [&](ErrorResult& aResult) {
+    nsresult rv = principal->CheckMayLoadWithReporting(
+        aScopeURI, false , 0 );
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      aResult.ThrowSecurityError("Scope URL is not same-origin with Client");
+      return;
+    }
+
+    rv = principal->CheckMayLoadWithReporting(
+        aScriptURI, false ,
+        0 );
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      aResult.ThrowSecurityError("Script URL is not same-origin with Client");
+      return;
+    }
+
+    Result<RefPtr<net::LoadInfo>, nsresult> maybeLoadInfo =
+        net::LoadInfo::Create(
+            principal,  
+            principal,  
+            maybeDoc,   
+            nsILoadInfo::SEC_ONLY_FOR_EXPLICIT_CONTENTSEC_CHECK,
+            nsIContentPolicy::TYPE_INTERNAL_SERVICE_WORKER, Some(aClientInfo));
+    if (NS_WARN_IF(maybeLoadInfo.isErr())) {
+      aResult.ThrowSecurityError("Script URL is not allowed by policy.");
+      return;
+    }
+    RefPtr<net::LoadInfo> secCheckLoadInfo = maybeLoadInfo.unwrap();
+
+    if (cspListener) {
+      rv = secCheckLoadInfo->SetCspEventListener(cspListener);
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+        return;
+      }
+    }
+
+    int16_t decision = nsIContentPolicy::ACCEPT;
+    rv = NS_CheckContentLoadPolicy(aScriptURI, secCheckLoadInfo, &decision);
+    if (NS_FAILED(rv) || NS_WARN_IF(decision != nsIContentPolicy::ACCEPT)) {
+      aResult.ThrowSecurityError("Script URL is not allowed by policy.");
+      return;
+    }
+  });
+}
+
+}  

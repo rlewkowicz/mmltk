@@ -1,0 +1,208 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __NUMBER_PATTERNSTRING_H__
+#define __NUMBER_PATTERNSTRING_H__
+
+
+#include <cstdint>
+#include "unicode/unum.h"
+#include "unicode/unistr.h"
+#include "number_types.h"
+#include "number_decimalquantity.h"
+#include "number_decimfmtprops.h"
+#include "number_affixutils.h"
+
+U_NAMESPACE_BEGIN
+namespace number::impl {
+
+class PatternParser;
+
+enum PatternSignType {
+    PATTERN_SIGN_TYPE_POS,
+    PATTERN_SIGN_TYPE_POS_SIGN,
+    PATTERN_SIGN_TYPE_NEG,
+    PATTERN_SIGN_TYPE_COUNT
+};
+
+struct U_I18N_API Endpoints {
+    int32_t start = 0;
+    int32_t end = 0;
+};
+
+struct U_I18N_API ParsedSubpatternInfo {
+    uint64_t groupingSizes = 0x0000ffffffff0000L;
+    int32_t integerLeadingHashSigns = 0;
+    int32_t integerTrailingHashSigns = 0;
+    int32_t integerNumerals = 0;
+    int32_t integerAtSigns = 0;
+    int32_t integerTotal = 0; 
+    int32_t fractionNumerals = 0;
+    int32_t fractionHashSigns = 0;
+    int32_t fractionTotal = 0; 
+    bool hasDecimal = false;
+    int32_t widthExceptAffixes = 0;
+    bool hasPadding = false;
+    UNumberFormatPadPosition paddingLocation = UNUM_PAD_BEFORE_PREFIX;
+    DecimalQuantity rounding;
+    bool exponentHasPlusSign = false;
+    int32_t exponentZeros = 0;
+    bool hasPercentSign = false;
+    bool hasPerMilleSign = false;
+    bool hasCurrencySign = false;
+    bool hasCurrencyDecimal = false;
+    bool hasMinusSign = false;
+    bool hasPlusSign = false;
+
+    Endpoints prefixEndpoints;
+    Endpoints suffixEndpoints;
+    Endpoints paddingEndpoints;
+};
+
+struct U_I18N_API ParsedPatternInfo : public AffixPatternProvider, public UMemory {
+    UnicodeString pattern;
+    ParsedSubpatternInfo positive;
+    ParsedSubpatternInfo negative;
+
+    ParsedPatternInfo()
+            : state(this->pattern), currentSubpattern(nullptr) {}
+
+    ~ParsedPatternInfo() override = default;
+
+    ParsedPatternInfo& operator=(ParsedPatternInfo&& src) noexcept = default;
+
+    static int32_t getLengthFromEndpoints(const Endpoints& endpoints);
+
+    char16_t charAt(int32_t flags, int32_t index) const override;
+
+    int32_t length(int32_t flags) const override;
+
+    UnicodeString getString(int32_t flags) const override;
+
+    bool positiveHasPlusSign() const override;
+
+    bool hasNegativeSubpattern() const override;
+
+    bool negativeHasMinusSign() const override;
+
+    bool hasCurrencySign() const override;
+
+    bool containsSymbolType(AffixPatternType type, UErrorCode& status) const override;
+
+    bool hasBody() const override;
+
+    bool currencyAsDecimal() const override;
+
+  private:
+    struct U_I18N_API ParserState {
+        const UnicodeString& pattern; 
+        int32_t offset = 0;
+
+        explicit ParserState(const UnicodeString& _pattern)
+                : pattern(_pattern) {}
+
+        ParserState& operator=(ParserState&& src) noexcept {
+            offset = src.offset;
+            return *this;
+        }
+
+        UChar32 peek();
+
+        UChar32 peek2();
+
+        UChar32 next();
+
+        inline void toParseException(const char16_t* message) { (void) message; }
+    } state;
+
+
+    ParsedSubpatternInfo* currentSubpattern;
+
+    bool fHasNegativeSubpattern = false;
+
+    const Endpoints& getEndpoints(int32_t flags) const;
+
+    void consumePattern(const UnicodeString& patternString, UErrorCode& status);
+
+    void consumeSubpattern(UErrorCode& status);
+
+    void consumePadding(PadPosition paddingLocation, UErrorCode& status);
+
+    void consumeAffix(Endpoints& endpoints, UErrorCode& status);
+
+    void consumeLiteral(UErrorCode& status);
+
+    void consumeFormat(UErrorCode& status);
+
+    void consumeIntegerFormat(UErrorCode& status);
+
+    void consumeFractionFormat(UErrorCode& status);
+
+    void consumeExponent(UErrorCode& status);
+
+    friend class PatternParser;
+};
+
+enum IgnoreRounding {
+    IGNORE_ROUNDING_NEVER = 0, IGNORE_ROUNDING_IF_CURRENCY = 1, IGNORE_ROUNDING_ALWAYS = 2
+};
+
+class U_I18N_API PatternParser {
+  public:
+    static void parseToPatternInfo(const UnicodeString& patternString, ParsedPatternInfo& patternInfo,
+                                   UErrorCode& status);
+
+    static DecimalFormatProperties parseToProperties(const UnicodeString& pattern,
+                                                     IgnoreRounding ignoreRounding, UErrorCode& status);
+
+    static DecimalFormatProperties parseToProperties(const UnicodeString& pattern, UErrorCode& status);
+
+    static void parseToExistingProperties(const UnicodeString& pattern,
+                                          DecimalFormatProperties& properties,
+                                          IgnoreRounding ignoreRounding, UErrorCode& status);
+
+  private:
+    static void parseToExistingPropertiesImpl(const UnicodeString& pattern,
+                                              DecimalFormatProperties& properties,
+                                              IgnoreRounding ignoreRounding, UErrorCode& status);
+
+    static void patternInfoToProperties(DecimalFormatProperties& properties,
+                                        ParsedPatternInfo& patternInfo, IgnoreRounding _ignoreRounding,
+                                        UErrorCode& status);
+};
+
+class U_I18N_API PatternStringUtils {
+  public:
+     static bool ignoreRoundingIncrement(double roundIncr, int32_t maxFrac);
+
+    static UnicodeString propertiesToPatternString(const DecimalFormatProperties& properties,
+                                                   UErrorCode& status);
+
+
+    static UnicodeString convertLocalized(const UnicodeString& input, const DecimalFormatSymbols& symbols,
+                                          bool toLocalized, UErrorCode& status);
+
+    static void patternInfoToStringBuilder(const AffixPatternProvider& patternInfo, bool isPrefix,
+                                           PatternSignType patternSignType,
+                                           bool approximately,
+                                           StandardPlural::Form plural,
+                                           bool perMilleReplacesPercent,
+                                           bool dropCurrencySymbols,
+                                           UnicodeString& output);
+
+    static PatternSignType resolveSignDisplay(UNumberSignDisplay signDisplay, Signum signum);
+
+  private:
+    static int escapePaddingString(UnicodeString input, UnicodeString& output, int startIndex,
+                                   UErrorCode& status);
+};
+
+} 
+U_NAMESPACE_END
+
+
+#endif //__NUMBER_PATTERNSTRING_H__
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

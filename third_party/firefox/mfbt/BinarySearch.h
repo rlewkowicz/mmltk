@@ -1,0 +1,150 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_BinarySearch_h
+#define mozilla_BinarySearch_h
+
+#include "mozilla/Assertions.h"
+
+#include <cstddef>
+#include <utility>
+
+namespace mozilla {
+
+
+template <typename Container, typename Comparator>
+bool BinarySearchIf(const Container& aContainer, size_t aBegin, size_t aEnd,
+                    const Comparator& aCompare,
+                    size_t* aMatchOrInsertionPoint) {
+  MOZ_ASSERT(aBegin <= aEnd);
+
+  size_t low = aBegin;
+  size_t high = aEnd;
+  while (high != low) {
+    size_t middle = low + (high - low) / 2;
+
+    const int result = aCompare(aContainer[middle]);
+
+    if (result == 0) {
+      *aMatchOrInsertionPoint = middle;
+      return true;
+    }
+
+    if (result < 0) {
+      high = middle;
+    } else {
+      low = middle + 1;
+    }
+  }
+
+  *aMatchOrInsertionPoint = low;
+  return false;
+}
+
+namespace detail {
+
+template <class T>
+class BinarySearchDefaultComparator {
+ public:
+  explicit BinarySearchDefaultComparator(const T& aTarget) : mTarget(aTarget) {}
+
+  template <class U>
+  int operator()(const U& aVal) const {
+    if (mTarget == aVal) {
+      return 0;
+    }
+
+    if (mTarget < aVal) {
+      return -1;
+    }
+
+    return 1;
+  }
+
+ private:
+  const T& mTarget;
+};
+
+}  
+
+template <typename Container, typename T>
+bool BinarySearch(const Container& aContainer, size_t aBegin, size_t aEnd,
+                  T aTarget, size_t* aMatchOrInsertionPoint) {
+  return BinarySearchIf(aContainer, aBegin, aEnd,
+                        detail::BinarySearchDefaultComparator<T>(aTarget),
+                        aMatchOrInsertionPoint);
+}
+
+template <typename Container, typename Comparator>
+size_t LowerBound(const Container& aContainer, size_t aBegin, size_t aEnd,
+                  const Comparator& aCompare) {
+  MOZ_ASSERT(aBegin <= aEnd);
+
+  size_t low = aBegin;
+  size_t high = aEnd;
+  while (high != low) {
+    size_t middle = low + (high - low) / 2;
+
+    const int result = aCompare(aContainer[middle]);
+
+    if (result <= 0) {
+      high = middle;
+    } else {
+      low = middle + 1;
+    }
+  }
+
+  return low;
+}
+
+template <typename Container, typename Comparator>
+size_t UpperBound(const Container& aContainer, size_t aBegin, size_t aEnd,
+                  const Comparator& aCompare) {
+  MOZ_ASSERT(aBegin <= aEnd);
+
+  size_t low = aBegin;
+  size_t high = aEnd;
+  while (high != low) {
+    size_t middle = low + (high - low) / 2;
+
+    const int result = aCompare(aContainer[middle]);
+
+    if (result < 0) {
+      high = middle;
+    } else {
+      low = middle + 1;
+    }
+  }
+
+  return high;
+}
+
+template <typename Container, typename Comparator>
+std::pair<size_t, size_t> EqualRange(const Container& aContainer, size_t aBegin,
+                                     size_t aEnd, const Comparator& aCompare) {
+  MOZ_ASSERT(aBegin <= aEnd);
+
+  size_t low = aBegin;
+  size_t high = aEnd;
+  while (high != low) {
+    size_t middle = low + (high - low) / 2;
+
+    const int result = aCompare(aContainer[middle]);
+
+    if (result < 0) {
+      high = middle;
+    } else if (result > 0) {
+      low = middle + 1;
+    } else {
+      return {LowerBound(aContainer, low, middle, aCompare),
+              UpperBound(aContainer, middle + 1, high, aCompare)};
+    }
+  }
+
+  return {low, high};
+}
+
+}  
+
+#endif  // mozilla_BinarySearch_h

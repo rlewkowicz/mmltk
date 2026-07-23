@@ -1,0 +1,153 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef FrameStatistics_h_
+#define FrameStatistics_h_
+
+#include "mozilla/ReentrantMonitor.h"
+
+namespace mozilla {
+
+struct FrameStatisticsData {
+  uint64_t mParsedFrames = 0;
+
+  uint64_t mDecodedFrames = 0;
+
+  uint64_t mDroppedDecodedFrames = 0;
+
+  uint64_t mDroppedSinkFrames = 0;
+
+  uint64_t mDroppedCompositorFrames = 0;
+
+  uint64_t mPresentedFrames = 0;
+
+  uint64_t mInterKeyframeSum_us = 0;
+  size_t mInterKeyframeCount = 0;
+
+  uint64_t mInterKeyFrameMax_us = 0;
+
+  FrameStatisticsData() = default;
+  FrameStatisticsData(uint64_t aParsed, uint64_t aDecoded, uint64_t aPresented,
+                      uint64_t aDroppedDecodedFrames,
+                      uint64_t aDroppedSinkFrames,
+                      uint64_t aDroppedCompositorFrames)
+      : mParsedFrames(aParsed),
+        mDecodedFrames(aDecoded),
+        mDroppedDecodedFrames(aDroppedDecodedFrames),
+        mDroppedSinkFrames(aDroppedSinkFrames),
+        mDroppedCompositorFrames(aDroppedCompositorFrames),
+        mPresentedFrames(aPresented) {}
+
+  void Accumulate(const FrameStatisticsData& aStats) {
+    mParsedFrames += aStats.mParsedFrames;
+    mDecodedFrames += aStats.mDecodedFrames;
+    mPresentedFrames += aStats.mPresentedFrames;
+    mDroppedDecodedFrames += aStats.mDroppedDecodedFrames;
+    mDroppedSinkFrames += aStats.mDroppedSinkFrames;
+    mDroppedCompositorFrames += aStats.mDroppedCompositorFrames;
+    mInterKeyframeSum_us += aStats.mInterKeyframeSum_us;
+    mInterKeyframeCount += aStats.mInterKeyframeCount;
+    if (mInterKeyFrameMax_us < aStats.mInterKeyFrameMax_us) {
+      mInterKeyFrameMax_us = aStats.mInterKeyFrameMax_us;
+    }
+  }
+};
+
+class FrameStatistics {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(FrameStatistics);
+
+  FrameStatistics() : mReentrantMonitor("FrameStats") {}
+
+  FrameStatisticsData GetFrameStatisticsData() const {
+    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+    return mFrameStatisticsData;
+  }
+
+  uint64_t GetParsedFrames() const {
+    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+    return mFrameStatisticsData.mParsedFrames;
+  }
+
+  uint64_t GetDecodedFrames() const {
+    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+    return mFrameStatisticsData.mDecodedFrames;
+  }
+
+  uint64_t GetPresentedFrames() const {
+    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+    return mFrameStatisticsData.mPresentedFrames;
+  }
+
+  uint64_t GetTotalFrames() const {
+    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+    return GetTotalFrames(mFrameStatisticsData);
+  }
+
+  static uint64_t GetTotalFrames(const FrameStatisticsData& aData) {
+    return aData.mPresentedFrames + GetDroppedFrames(aData);
+  }
+
+  uint64_t GetDroppedFrames() const {
+    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+    return GetDroppedFrames(mFrameStatisticsData);
+  }
+
+  static uint64_t GetDroppedFrames(const FrameStatisticsData& aData) {
+    return aData.mDroppedDecodedFrames + aData.mDroppedSinkFrames +
+           aData.mDroppedCompositorFrames;
+  }
+
+  uint64_t GetDroppedDecodedFrames() const {
+    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+    return mFrameStatisticsData.mDroppedDecodedFrames;
+  }
+
+  uint64_t GetDroppedSinkFrames() const {
+    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+    return mFrameStatisticsData.mDroppedSinkFrames;
+  }
+
+  uint64_t GetDroppedCompositorFrames() const {
+    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+    return mFrameStatisticsData.mDroppedCompositorFrames;
+  }
+
+  void Accumulate(const FrameStatisticsData& aStats) {
+    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+    mFrameStatisticsData.Accumulate(aStats);
+  }
+
+  void NotifyPresentedFrame() {
+    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+    ++mFrameStatisticsData.mPresentedFrames;
+  }
+
+  class AutoNotifyDecoded {
+   public:
+    explicit AutoNotifyDecoded(FrameStatistics* aFrameStats)
+        : mFrameStats(aFrameStats) {}
+    ~AutoNotifyDecoded() {
+      if (mFrameStats) {
+        mFrameStats->Accumulate(mStats);
+      }
+    }
+
+    FrameStatisticsData mStats;
+
+   private:
+    FrameStatistics* mFrameStats;
+  };
+
+ private:
+  ~FrameStatistics() = default;
+
+  mutable ReentrantMonitor mReentrantMonitor MOZ_UNANNOTATED;
+
+  FrameStatisticsData mFrameStatisticsData;
+};
+
+}  
+
+#endif  // FrameStatistics_h_

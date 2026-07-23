@@ -1,0 +1,281 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_AsyncIteration_h
+#define vm_AsyncIteration_h
+
+#include "builtin/Promise.h"  // js::PromiseHandler
+#include "builtin/SelfHostingDefines.h"
+#include "js/Class.h"
+#include "vm/GeneratorObject.h"
+#include "vm/JSObject.h"
+#include "vm/List.h"
+#include "vm/PromiseObject.h"
+
+
+namespace js {
+
+class AsyncGeneratorObject;
+enum class CompletionKind : uint8_t;
+
+extern const JSClass AsyncGeneratorFunctionClass;
+
+[[nodiscard]] bool AsyncGeneratorPromiseReactionJob(
+    JSContext* cx, PromiseHandler handler,
+    Handle<AsyncGeneratorObject*> generator, HandleValue argument);
+
+bool AsyncGeneratorNext(JSContext* cx, unsigned argc, Value* vp);
+bool AsyncGeneratorReturn(JSContext* cx, unsigned argc, Value* vp);
+bool AsyncGeneratorThrow(JSContext* cx, unsigned argc, Value* vp);
+
+class AsyncGeneratorRequest : public NativeObject {
+ private:
+  enum AsyncGeneratorRequestSlots {
+    Slot_CompletionKind = 0,
+
+    Slot_CompletionValue,
+
+    Slot_Promise,
+
+    Slots,
+  };
+
+  void init(CompletionKind completionKind, const Value& completionValue,
+            PromiseObject* promise) {
+    setFixedSlot(Slot_CompletionKind,
+                 Int32Value(static_cast<int32_t>(completionKind)));
+    setFixedSlot(Slot_CompletionValue, completionValue);
+    setFixedSlot(Slot_Promise, ObjectValue(*promise));
+  }
+
+  void clearData() {
+    setFixedSlot(Slot_CompletionValue, NullValue());
+    setFixedSlot(Slot_Promise, NullValue());
+  }
+
+  friend AsyncGeneratorObject;
+
+ public:
+  static const JSClass class_;
+
+  static AsyncGeneratorRequest* create(JSContext* cx,
+                                       CompletionKind completionKind,
+                                       HandleValue completionValue,
+                                       Handle<PromiseObject*> promise);
+
+  CompletionKind completionKind() const {
+    return static_cast<CompletionKind>(
+        getFixedSlot(Slot_CompletionKind).toInt32());
+  }
+  JS::Value completionValue() const {
+    return getFixedSlot(Slot_CompletionValue);
+  }
+  PromiseObject* promise() const {
+    return &getFixedSlot(Slot_Promise).toObject().as<PromiseObject>();
+  }
+};
+
+class AsyncGeneratorObject : public AbstractGeneratorObject {
+ private:
+  enum AsyncGeneratorObjectSlots {
+    Slot_State = AbstractGeneratorObject::RESERVED_SLOTS,
+
+    Slot_QueueOrRequest,
+
+    Slot_CachedRequest,
+
+    Slots
+  };
+
+ public:
+  enum State {
+    State_SuspendedStart,
+
+    State_SuspendedYield,
+
+    State_Executing,
+
+    State_Executing_AwaitingYieldReturn,
+
+    State_DrainingQueue,
+
+    State_DrainingQueue_AwaitingReturn,
+
+    State_Completed
+  };
+
+  State state() const {
+    return static_cast<State>(getFixedSlot(Slot_State).toInt32());
+  }
+  void setState(State state_) {
+    setNeverGCThingFixedSlot(Slot_State, Int32Value(state_));
+  }
+
+ private:
+
+  bool isSingleQueue() const {
+    return getFixedSlot(Slot_QueueOrRequest).isNull() ||
+           getFixedSlot(Slot_QueueOrRequest)
+               .toObject()
+               .is<AsyncGeneratorRequest>();
+  }
+  bool isSingleQueueEmpty() const {
+    return getFixedSlot(Slot_QueueOrRequest).isNull();
+  }
+  void setSingleQueueRequest(AsyncGeneratorRequest* request) {
+    setFixedSlot(Slot_QueueOrRequest, ObjectValue(*request));
+  }
+  void clearSingleQueueRequest() {
+    setFixedSlot(Slot_QueueOrRequest, NullValue());
+  }
+  AsyncGeneratorRequest* singleQueueRequest() const {
+    return &getFixedSlot(Slot_QueueOrRequest)
+                .toObject()
+                .as<AsyncGeneratorRequest>();
+  }
+
+  ListObject* queue() const {
+    return &getFixedSlot(Slot_QueueOrRequest).toObject().as<ListObject>();
+  }
+  void setQueue(ListObject* queue_) {
+    setFixedSlot(Slot_QueueOrRequest, ObjectValue(*queue_));
+  }
+
+ public:
+  static const JSClass class_;
+  static const JSClassOps classOps_;
+
+  static AsyncGeneratorObject* create(JSContext* cx, HandleFunction asyncGen);
+
+  bool isSuspendedStart() const { return state() == State_SuspendedStart; }
+  bool isSuspendedYield() const { return state() == State_SuspendedYield; }
+  bool isExecuting() const { return state() == State_Executing; }
+  bool isExecuting_AwaitingYieldReturn() const {
+    return state() == State_Executing_AwaitingYieldReturn;
+  }
+  bool isDrainingQueue() const { return state() == State_DrainingQueue; }
+  bool isDrainingQueue_AwaitingReturn() const {
+    return state() == State_DrainingQueue_AwaitingReturn;
+  }
+  bool isCompleted() const { return state() == State_Completed; }
+
+  void setSuspendedStart() { setState(State_SuspendedStart); }
+  void setSuspendedYield() { setState(State_SuspendedYield); }
+  void setExecuting() { setState(State_Executing); }
+  void setExecuting_AwaitingYieldReturn() {
+    setState(State_Executing_AwaitingYieldReturn);
+  }
+  void setDrainingQueue() { setState(State_DrainingQueue); }
+  void setDrainingQueue_AwaitingReturn() {
+    setState(State_DrainingQueue_AwaitingReturn);
+  }
+  void setCompleted() { setState(State_Completed); }
+
+  [[nodiscard]] static bool enqueueRequest(
+      JSContext* cx, Handle<AsyncGeneratorObject*> generator,
+      Handle<AsyncGeneratorRequest*> request);
+
+  static AsyncGeneratorRequest* dequeueRequest(
+      JSContext* cx, Handle<AsyncGeneratorObject*> generator);
+
+  static AsyncGeneratorRequest* peekRequest(
+      Handle<AsyncGeneratorObject*> generator);
+
+  bool isQueueEmpty() const {
+    if (isSingleQueue()) {
+      return isSingleQueueEmpty();
+    }
+    return queue()->getDenseInitializedLength() == 0;
+  }
+
+#ifdef DEBUG
+  bool isQueueLengthOne() const {
+    if (isSingleQueue()) {
+      return !isSingleQueueEmpty();
+    }
+    return queue()->getDenseInitializedLength() == 1;
+  }
+#endif
+
+  static AsyncGeneratorRequest* createRequest(
+      JSContext* cx, Handle<AsyncGeneratorObject*> generator,
+      CompletionKind completionKind, HandleValue completionValue,
+      Handle<PromiseObject*> promise);
+
+  void cacheRequest(AsyncGeneratorRequest* request) {
+    if (hasCachedRequest()) {
+      return;
+    }
+
+    request->clearData();
+    setFixedSlot(Slot_CachedRequest, ObjectValue(*request));
+  }
+
+ private:
+  bool hasCachedRequest() const {
+    return getFixedSlot(Slot_CachedRequest).isObject();
+  }
+
+  AsyncGeneratorRequest* takeCachedRequest() {
+    auto request = &getFixedSlot(Slot_CachedRequest)
+                        .toObject()
+                        .as<AsyncGeneratorRequest>();
+    clearCachedRequest();
+    return request;
+  }
+
+  void clearCachedRequest() { setFixedSlot(Slot_CachedRequest, NullValue()); }
+};
+
+JSObject* CreateAsyncFromSyncIterator(JSContext* cx, HandleObject iter,
+                                      HandleValue nextMethod);
+
+class AsyncFromSyncIteratorObject : public NativeObject {
+ private:
+  enum AsyncFromSyncIteratorObjectSlots {
+    Slot_Iterator = 0,
+
+    Slot_NextMethod = 1,
+
+    Slots
+  };
+
+  void init(JSObject* iterator, const Value& nextMethod) {
+    setFixedSlot(Slot_Iterator, ObjectValue(*iterator));
+    setFixedSlot(Slot_NextMethod, nextMethod);
+  }
+
+ public:
+  static const JSClass class_;
+
+  static JSObject* create(JSContext* cx, HandleObject iter,
+                          HandleValue nextMethod);
+
+  JSObject* iterator() const { return &getFixedSlot(Slot_Iterator).toObject(); }
+
+  const Value& nextMethod() const { return getFixedSlot(Slot_NextMethod); }
+};
+
+class AsyncIteratorObject : public NativeObject {
+ public:
+  static const JSClass class_;
+  static const JSClass protoClass_;
+};
+
+class AsyncIteratorHelperObject : public NativeObject {
+ public:
+  static const JSClass class_;
+
+  enum { GeneratorSlot, SlotCount };
+
+  static_assert(GeneratorSlot == ASYNC_ITERATOR_HELPER_GENERATOR_SLOT,
+                "GeneratorSlot must match self-hosting define for generator "
+                "object slot.");
+};
+
+AsyncIteratorHelperObject* NewAsyncIteratorHelper(JSContext* cx);
+
+}  
+
+#endif /* vm_AsyncIteration_h */

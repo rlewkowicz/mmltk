@@ -1,0 +1,183 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_PresShellForwards_h
+#define mozilla_PresShellForwards_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/TypedEnumBits.h"
+
+struct CapturingContentInfo;
+
+namespace mozilla {
+
+class PresShell;
+
+enum class CaptureFlags {
+  None = 0,
+  IgnoreAllowedState = 1 << 0,
+  RetargetToElement = 1 << 1,
+  PreventDragStart = 1 << 2,
+  PointerLock = 1 << 3,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(CaptureFlags)
+
+enum class ResizeReflowOptions : uint32_t {
+  NoOption = 0,
+  BSizeLimit = 1 << 0,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(ResizeReflowOptions)
+
+enum class IntrinsicDirty {
+  None,
+  FrameAndAncestors,
+  FrameAncestorsAndDescendants,
+};
+
+enum class ReflowRootHandling {
+  PositionOrSizeChange,    
+  NoPositionOrSizeChange,  
+  InferFromBitToAdd,       
+
+};
+
+struct WhereToScroll {
+  Maybe<int16_t> mPercentage;
+  bool mIsAuto = false;
+
+  constexpr WhereToScroll() = default;
+
+  explicit constexpr WhereToScroll(int16_t aPercentage)
+      : mPercentage(Some(aPercentage)) {}
+
+  enum { Nearest };
+  MOZ_IMPLICIT constexpr WhereToScroll(decltype(Nearest)) : WhereToScroll() {}
+  enum { Start };
+  MOZ_IMPLICIT constexpr WhereToScroll(decltype(Start)) : WhereToScroll(0) {}
+  enum { Center };
+  MOZ_IMPLICIT constexpr WhereToScroll(decltype(Center)) : WhereToScroll(50) {}
+  enum { End };
+  MOZ_IMPLICIT constexpr WhereToScroll(decltype(End)) : WhereToScroll(100) {}
+  enum { Auto };
+  MOZ_IMPLICIT constexpr WhereToScroll(decltype(Auto)) : mIsAuto(true) {}
+};
+
+enum class WhenToScroll : uint8_t {
+  Always,
+  IfNotVisible,
+  IfNotFullyVisible,
+};
+
+struct AxisScrollParams final {
+  explicit AxisScrollParams(
+      WhereToScroll aWhere = WhereToScroll::Nearest,
+      WhenToScroll aWhen = WhenToScroll::IfNotFullyVisible)
+      : mWhereToScroll(aWhere), mWhenToScroll(aWhen) {}
+
+  WhereToScroll mWhereToScroll;
+  WhenToScroll mWhenToScroll;
+};
+
+enum class ScrollFlags : uint8_t {
+  None = 0,
+  ScrollFirstAncestorOnly = 1 << 0,
+  ScrollOverflowHidden = 1 << 1,
+  ScrollNoParentFrames = 1 << 2,
+  ScrollSmooth = 1 << 3,
+  ScrollSmoothAuto = 1 << 4,
+  TriggeredByScript = 1 << 5,
+  AxesAreLogical = 1 << 6,
+  ForZoomToFocusedInput = 1 << 7,
+  AnchorScrollFlags =
+      ScrollOverflowHidden | ScrollNoParentFrames | TriggeredByScript,
+  ALL_BITS = (1 << 8) - 1,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(ScrollFlags)
+
+enum class RenderDocumentFlags {
+  None = 0,
+  IsUntrusted = 1 << 0,
+  IgnoreViewportScrolling = 1 << 1,
+  DrawCaret = 1 << 2,
+  UseWidgetLayers = 1 << 3,
+  AsyncDecodeImages = 1 << 4,
+  DocumentRelative = 1 << 5,
+  DrawWindowNotFlushing = 1 << 6,
+  UseHighQualityScaling = 1 << 7,
+  ResetViewportScrolling = 1 << 8,
+  ForPrinting = 1 << 9,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(RenderDocumentFlags)
+
+enum class RenderImageFlags {
+  None = 0,
+  IsImage = 1 << 0,
+  AutoScale = 1 << 1,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(RenderImageFlags)
+
+enum class ResolutionChangeOrigin : uint8_t {
+  Apz,
+  Test,
+  MainThreadRestore,
+  MainThreadAdjustment,
+};
+
+enum class PaintFlags {
+  None = 0,
+  PaintSyncDecodeImages = 1 << 1,
+  PaintCompositeOffscreen = 1 << 2,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(PaintFlags)
+
+enum class PaintInternalFlags {
+  None = 0,
+  PaintSyncDecodeImages = 1 << 1,
+  PaintComposite = 1 << 2,
+  PaintCompositeOffscreen = 1 << 3,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(PaintInternalFlags)
+
+enum class RenderingStateFlags : uint8_t {
+  None = 0,
+  IgnoringViewportScrolling = 1 << 0,
+  DrawWindowNotFlushing = 1 << 1,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(RenderingStateFlags)
+
+enum class DynamicToolbarState {
+  None,          
+  Expanded,      
+  InTransition,  
+  Collapsed,     
+};
+
+#ifdef DEBUG
+
+enum class VerifyReflowFlags {
+  None = 0,
+  On = 1 << 0,
+  Noisy = 1 << 1,
+  All = 1 << 2,
+  DumpCommands = 1 << 3,
+  NoisyCommands = 1 << 4,
+  ReallyNoisyCommands = 1 << 5,
+  DuringResizeReflow = 1 << 6,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(VerifyReflowFlags)
+
+#endif  // #ifdef DEBUG
+
+}  
+
+#endif  // #ifndef mozilla_PresShellForwards_h

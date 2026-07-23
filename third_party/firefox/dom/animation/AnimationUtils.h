@@ -1,0 +1,120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_AnimationUtils_h
+#define mozilla_dom_AnimationUtils_h
+
+#include "mozilla/PseudoStyleRequest.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/CSSNumericValueBindingFwd.h"
+#include "mozilla/dom/Nullable.h"
+#include "nsRFPService.h"
+#include "nsStringFwd.h"
+
+class nsIContent;
+class nsIFrame;
+class nsIGlobalObject;
+struct JSContext;
+
+namespace mozilla {
+
+class EffectSet;
+class ErrorResult;
+
+namespace dom {
+class Document;
+class Element;
+}  
+
+class AnimationUtils {
+ public:
+  using Document = dom::Document;
+
+  static dom::Nullable<double> TimeDurationToDouble(
+      const dom::Nullable<TimeDuration>& aTime, RTPCallerType aRTPCallerType) {
+    dom::Nullable<double> result;
+
+    if (!aTime.IsNull()) {
+      result.SetValue(nsRFPService::ReduceTimePrecisionAsMSecsRFPOnly(
+          aTime.Value().ToMilliseconds(), 0, aRTPCallerType));
+    }
+
+    return result;
+  }
+
+  static dom::Nullable<TimeDuration> DoubleToTimeDuration(
+      const dom::Nullable<double>& aTime) {
+    dom::Nullable<TimeDuration> result;
+
+    if (!aTime.IsNull()) {
+      result.SetValue(TimeDuration::FromMilliseconds(aTime.Value()));
+    }
+
+    return result;
+  }
+
+  static bool ValidateCSSNumberishTime(const dom::CSSNumberish& aValue,
+                                       bool aProgressBased, ErrorResult& aRv);
+
+  static void DoubleToCSSNumberish(double aMs, bool aProgressBased,
+                                   nsIGlobalObject* aGlobal,
+                                   dom::OwningCSSNumberish& aRetVal);
+
+  static void DurationToCSSNumberish(
+      const dom::Nullable<TimeDuration>& aTime, bool aProgressBased,
+      RTPCallerType aRTPCallerType, nsIGlobalObject* aGlobal,
+      dom::Nullable<dom::OwningCSSNumberish>& aRetVal);
+
+  static dom::Nullable<TimeDuration> CSSNumberishToDuration(
+      const dom::CSSNumberish& aValue, bool aProgressBased);
+
+  static void LogAsyncAnimationFailure(nsCString& aMessage,
+                                       const nsIContent* aContent = nullptr);
+
+  static Document* GetCurrentRealmDocument(JSContext* aCx);
+
+  static Document* GetDocumentFromGlobal(JSObject* aGlobalObject);
+
+  static bool FrameHasAnimatedScale(const nsIFrame* aFrame);
+
+  static bool HasCurrentTransitions(const dom::Element* aElement,
+                                    const PseudoStyleRequest& aPseudoRequest =
+                                        PseudoStyleRequest::NotPseudo());
+
+  static bool StoresAnimationsInParent(PseudoStyleType aType) {
+    return aType == PseudoStyleType::Before ||
+           aType == PseudoStyleType::After ||
+           aType == PseudoStyleType::Marker ||
+           aType == PseudoStyleType::Backdrop ||
+           aType == PseudoStyleType::Checkmark ||
+           aType == PseudoStyleType::PickerIcon;
+  }
+
+  static bool IsSupportedPseudoForAnimations(PseudoStyleType aType) {
+    return PseudoStyle::IsViewTransitionPseudoElement(aType) ||
+           StoresAnimationsInParent(aType);
+  }
+  static bool IsSupportedPseudoForAnimations(
+      const PseudoStyleRequest& aRequest) {
+    return IsSupportedPseudoForAnimations(aRequest.mType);
+  }
+
+  static bool IsWithinAnimationTimeTolerance(const TimeDuration& aFirst,
+                                             const TimeDuration& aSecond) {
+    if (aFirst == TimeDuration::Forever() ||
+        aSecond == TimeDuration::Forever()) {
+      return aFirst == aSecond;
+    }
+
+    TimeDuration diff = aFirst >= aSecond ? aFirst - aSecond : aSecond - aFirst;
+    return diff <= TimeDuration::FromMicroseconds(1);
+  }
+
+  static std::pair<const dom::Element*, PseudoStyleRequest>
+  GetElementPseudoPair(const dom::Element* aElementOrPseudo);
+};
+
+}  
+
+#endif

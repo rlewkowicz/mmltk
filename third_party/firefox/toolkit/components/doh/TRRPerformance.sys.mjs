@@ -1,0 +1,324 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
+
+const lazy = {};
+
+XPCOMUtils.defineLazyServiceGetter(
+  lazy,
+  "gNetworkLinkService",
+  "@mozilla.org/network/network-link-service;1",
+  Ci.nsINetworkLinkService
+);
+
+XPCOMUtils.defineLazyServiceGetter(
+  lazy,
+  "gCaptivePortalService",
+  "@mozilla.org/network/captive-portal-service;1",
+  Ci.nsICaptivePortalService
+);
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  lazy,
+  "kCanonicalDomain",
+  "doh-rollout.trrRace.canonicalDomain",
+  "firefox-dns-perf-test.net."
+);
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  lazy,
+  "kRepeats",
+  "doh-rollout.trrRace.randomSubdomainCount",
+  5
+);
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  lazy,
+  "kPopularDomains",
+  "doh-rollout.trrRace.popularDomains",
+  null,
+  null,
+  val =>
+    val
+      ? val.split(",").map(t => t.trim())
+      : [
+          "google.com.",
+          "youtube.com.",
+          "amazon.com.",
+          "facebook.com.",
+          "yahoo.com.",
+        ]
+);
+
+function getRandomSubdomain() {
+  let uuid = Services.uuid.generateUUID().toString().slice(1, -1); 
+  return `${uuid}.${lazy.kCanonicalDomain}`;
+}
+
+export class DNSLookup {
+  constructor(domain, trrServer, callback) {
+    this._domain = domain;
+    this.trrServer = trrServer;
+    this.callback = callback;
+    this.retryCount = 0;
+  }
+
+  doLookup() {
+    this.retryCount++;
+    try {
+      this.usedDomain = this._domain || getRandomSubdomain();
+      Services.dns.asyncResolve(
+        this.usedDomain,
+        Ci.nsIDNSService.RESOLVE_TYPE_DEFAULT,
+        Ci.nsIDNSService.RESOLVE_BYPASS_CACHE,
+        Services.dns.newAdditionalInfo(this.trrServer, -1),
+        this,
+        Services.tm.currentThread,
+        {}
+      );
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  onLookupComplete(request, record, status) {
+    if (!Components.isSuccessCode(status) && this.retryCount < 3) {
+      this.doLookup();
+      return;
+    }
+
+    this.callback(request, record, status, this.usedDomain, this.retryCount);
+  }
+}
+
+DNSLookup.prototype.QueryInterface = ChromeUtils.generateQI(["nsIDNSListener"]);
+
+export class LookupAggregator {
+  constructor(onCompleteCallback, trrList) {
+    this.onCompleteCallback = onCompleteCallback;
+    this.trrList = trrList;
+    this.aborted = false;
+    this.networkUnstable = false;
+    this.captivePortal = false;
+
+    this.domains = [];
+    for (let i = 0; i < lazy.kRepeats; ++i) {
+      this.domains.push(null);
+    }
+    this.domains.push(...lazy.kPopularDomains);
+    this.totalLookups = this.trrList.length * this.domains.length;
+    this.completedLookups = 0;
+    this.results = [];
+  }
+
+  run() {
+    if (this._ran || this._aborted) {
+      console.error("Trying to re-run a LookupAggregator.");
+      return;
+    }
+
+    this._ran = true;
+    for (let trr of this.trrList) {
+      for (let domain of this.domains) {
+        new DNSLookup(
+          domain,
+          trr,
+          (request, record, status, usedDomain, retryCount) => {
+            this.results.push({
+              domain: usedDomain,
+              trr,
+              status,
+              time: record
+                ? record.QueryInterface(Ci.nsIDNSAddrRecord)
+                    .trrFetchDurationNetworkOnly
+                : -1,
+              retryCount,
+            });
+
+            this.completedLookups++;
+            if (this.completedLookups == this.totalLookups) {
+              this.recordResults();
+            }
+          }
+        ).doLookup();
+      }
+    }
+  }
+
+  abort() {
+    this.aborted = true;
+  }
+
+  markUnstableNetwork() {
+    this.networkUnstable = true;
+  }
+
+  markCaptivePortal() {
+    this.captivePortal = true;
+  }
+
+  recordResults() {
+    if (this.aborted) {
+      return;
+    }
+
+    for (let { domain, trr, status, time, retryCount } of this.results) {
+      if (
+        !(
+          lazy.kPopularDomains.includes(domain) ||
+          domain.includes(lazy.kCanonicalDomain)
+        )
+      ) {
+        console.error("Expected known domain for reporting, got ", domain);
+        return;
+      }
+
+    }
+
+    this.onCompleteCallback();
+  }
+}
+
+export class TRRRacer {
+  constructor(onCompleteCallback, trrList) {
+    this._aggregator = null;
+    this._retryCount = 0;
+    this._complete = false;
+    this._onCompleteCallback = onCompleteCallback;
+    this._trrList = trrList;
+  }
+
+  run() {
+    if (
+      lazy.gNetworkLinkService.isLinkUp &&
+      lazy.gCaptivePortalService.state !=
+        lazy.gCaptivePortalService.LOCKED_PORTAL
+    ) {
+      this._runNewAggregator();
+      if (
+        lazy.gCaptivePortalService.state ==
+        lazy.gCaptivePortalService.UNLOCKED_PORTAL
+      ) {
+        this._aggregator.markCaptivePortal();
+      }
+    }
+
+    Services.obs.addObserver(this, "ipc:network:captive-portal-set-state");
+    Services.obs.addObserver(this, "network:link-status-changed");
+  }
+
+  onComplete() {
+    Services.obs.removeObserver(this, "ipc:network:captive-portal-set-state");
+    Services.obs.removeObserver(this, "network:link-status-changed");
+
+    this._complete = true;
+
+    if (this._onCompleteCallback) {
+      this._onCompleteCallback();
+    }
+  }
+
+  getFastestTRR(returnRandomDefault = false) {
+    if (!this._complete) {
+      throw new Error("getFastestTRR: Measurement still running.");
+    }
+
+    return this._getFastestTRRFromResults(
+      this._aggregator.results,
+      returnRandomDefault
+    );
+  }
+
+  _getFastestTRRFromResults(results, returnRandomDefault = false) {
+    let TRRTimingMap = new Map();
+    let TRRErrorCount = new Map();
+    for (let { trr, time } of results) {
+      if (!TRRTimingMap.has(trr)) {
+        TRRTimingMap.set(trr, []);
+      }
+      if (time != -1) {
+        TRRTimingMap.get(trr).push(time);
+      } else {
+        TRRErrorCount.set(trr, 1 + (TRRErrorCount.get(trr) || 0));
+      }
+    }
+
+    let fastestTRR;
+    let fastestAverageTime = -1;
+    let trrs = [...TRRTimingMap.keys()];
+    for (let trr of trrs) {
+      let times = TRRTimingMap.get(trr);
+      if (!times.length) {
+        continue;
+      }
+
+      let errorCount = TRRErrorCount.get(trr) || 0;
+      let totalResults = times.length + errorCount;
+      if (errorCount / totalResults > 0.3) {
+        continue;
+      }
+
+      let averageTime =
+        times.map(a => Math.log(a + 1)).reduce((a, b) => a + b) / times.length;
+      if (fastestAverageTime == -1 || averageTime < fastestAverageTime) {
+        fastestAverageTime = averageTime;
+        fastestTRR = trr;
+      }
+    }
+
+    if (returnRandomDefault && !fastestTRR) {
+      fastestTRR = trrs[Math.floor(Math.random() * trrs.length)];
+    }
+
+    return fastestTRR;
+  }
+
+  _runNewAggregator() {
+    this._aggregator = new LookupAggregator(
+      () => this.onComplete(),
+      this._trrList
+    );
+    this._aggregator.run();
+    this._retryCount++;
+  }
+
+  observe(subject, topic, data) {
+    switch (topic) {
+      case "network:link-status-changed":
+        if (this._aggregator && data == "down") {
+          if (this._retryCount < 5) {
+            this._aggregator.abort();
+          } else {
+            this._aggregator.markUnstableNetwork();
+          }
+        } else if (
+          data == "up" &&
+          (!this._aggregator || this._aggregator.aborted)
+        ) {
+          this._runNewAggregator();
+        }
+        break;
+      case "ipc:network:captive-portal-set-state":
+        if (
+          this._aggregator &&
+          lazy.gCaptivePortalService.state ==
+            lazy.gCaptivePortalService.LOCKED_PORTAL
+        ) {
+          if (this._retryCount < 5) {
+            this._aggregator.abort();
+          } else {
+            this._aggregator.markCaptivePortal();
+          }
+        } else if (
+          lazy.gCaptivePortalService.state ==
+            lazy.gCaptivePortalService.UNLOCKED_PORTAL &&
+          (!this._aggregator || this._aggregator.aborted)
+        ) {
+          this._runNewAggregator();
+        }
+        break;
+    }
+  }
+}

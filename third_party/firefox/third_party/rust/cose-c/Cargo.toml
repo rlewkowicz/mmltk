@@ -1,0 +1,15 @@
+
+[package]
+name = "cose-c"
+version = "0.1.5"
+authors = ["Franziskus Kiefer <franziskuskiefer@gmail.com>"]
+description = "C API for the cose crate"
+keywords = ["cose", "jose", "cbor"]
+license = "MPL-2.0"
+repository = "https://github.com/franziskuskiefer/cose-c-api"
+
+[lib]
+name = "cosec"
+path = "src/lib.rs"
+[dependencies.cose]
+version = "0.1.4"

@@ -1,0 +1,1278 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/BaselineJIT.h"
+
+#include "mozilla/BinarySearch.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/ScopeExit.h"
+
+#include <algorithm>
+
+#include "debugger/DebugAPI.h"
+#include "gc/GCContext.h"
+#include "gc/PublicIterators.h"
+#include "jit/AutoWritableJitCode.h"
+#include "jit/BaselineCodeGen.h"
+#include "jit/BaselineCompileTask.h"
+#include "jit/BaselineDebugModeOSR.h"
+#include "jit/BaselineIC.h"
+#include "jit/CalleeToken.h"
+#include "jit/Ion.h"
+#include "jit/IonOptimizationLevels.h"
+#include "jit/JitcodeMap.h"
+#include "jit/JitCommon.h"
+#include "jit/JitRuntime.h"
+#include "jit/JitSpewer.h"
+#include "jit/MacroAssembler.h"
+#include "js/friend/StackLimits.h"  // js::AutoCheckRecursionLimit
+#include "vm/Interpreter.h"
+
+#include "debugger/DebugAPI-inl.h"
+#include "gc/GC-inl.h"
+#include "gc/WeakMap-inl.h"
+#include "jit/JitHints-inl.h"
+#include "jit/JitScript-inl.h"
+#include "vm/GeckoProfiler-inl.h"
+#include "vm/JSScript-inl.h"
+#include "vm/Stack-inl.h"
+
+using mozilla::BinarySearchIf;
+using mozilla::CheckedInt;
+
+using namespace js;
+using namespace js::jit;
+
+void ICStubSpace::freeAllAfterMinorGC(Zone* zone) {
+  if (zone->isAtomsZone()) {
+    MOZ_ASSERT(allocator_.isEmpty());
+  } else {
+    JSRuntime* rt = zone->runtimeFromMainThread();
+    rt->gc.queueAllLifoBlocksForFreeAfterMinorGC(&allocator_);
+  }
+}
+
+static bool CheckFrame(InterpreterFrame* fp) {
+  if (fp->isDebuggerEvalFrame()) {
+    JitSpew(JitSpew_BaselineAbort, "debugger frame");
+    return false;
+  }
+
+  if (fp->isFunctionFrame() && TooManyActualArguments(fp->numActualArgs())) {
+    JitSpew(JitSpew_BaselineAbort, "Too many arguments (%u)",
+            fp->numActualArgs());
+    return false;
+  }
+
+  return true;
+}
+
+struct EnterJitData {
+  explicit EnterJitData(JSContext* cx)
+      : jitcode(nullptr),
+        osrFrame(nullptr),
+        calleeToken(nullptr),
+        maxArgv(nullptr),
+        maxArgc(0),
+        numActualArgs(0),
+        osrNumStackValues(0),
+        envChain(cx),
+        result(cx),
+        constructing(false) {}
+
+  uint8_t* jitcode;
+  InterpreterFrame* osrFrame;
+
+  void* calleeToken;
+
+  Value* maxArgv;
+  unsigned maxArgc;
+  unsigned numActualArgs;
+  unsigned osrNumStackValues;
+
+  RootedObject envChain;
+  RootedValue result;
+
+  bool constructing;
+
+  Value& thisv() const { return maxArgv[-1]; }
+};
+
+static JitExecStatus EnterBaseline(JSContext* cx, EnterJitData& data) {
+  MOZ_ASSERT(data.osrFrame);
+
+  uint32_t extra =
+      BaselineFrame::Size() + (data.osrNumStackValues * sizeof(Value));
+  AutoCheckRecursionLimit recursion(cx);
+  if (!recursion.checkWithExtra(cx, extra)) {
+    return JitExec_Aborted;
+  }
+
+#ifdef DEBUG
+  mozilla::Maybe<JS::AutoAssertNoGC> nogc;
+  nogc.emplace(cx);
+#endif
+
+  MOZ_ASSERT(IsBaselineInterpreterEnabled());
+  MOZ_ASSERT(CheckFrame(data.osrFrame));
+
+  EnterJitCode enter = cx->runtime()->jitRuntime()->enterJit();
+
+  MOZ_ASSERT_IF(data.constructing,
+                data.thisv().isObject() ||
+                    data.thisv().isMagic(JS_UNINITIALIZED_LEXICAL));
+
+  data.result.setInt32(data.numActualArgs);
+  {
+    AssertRealmUnchanged aru(cx);
+    JitActivation activation(cx);
+
+    data.osrFrame->setRunningInJit();
+
+#ifdef DEBUG
+    nogc.reset();
+#endif
+    CALL_GENERATED_CODE(enter, data.jitcode, data.maxArgc, data.maxArgv,
+                        data.osrFrame, data.calleeToken, data.envChain.get(),
+                        data.osrNumStackValues, data.result.address());
+
+    data.osrFrame->clearRunningInJit();
+  }
+
+  if (!data.result.isMagic() && data.constructing &&
+      data.result.isPrimitive()) {
+    MOZ_ASSERT(data.thisv().isObject());
+    data.result = data.thisv();
+  }
+
+  cx->runtime()->jitRuntime()->freeIonOsrTempData();
+
+  MOZ_ASSERT_IF(data.result.isMagic(), data.result.isMagic(JS_ION_ERROR));
+  return data.result.isMagic() ? JitExec_Error : JitExec_Ok;
+}
+
+JitExecStatus jit::EnterBaselineInterpreterAtBranch(JSContext* cx,
+                                                    InterpreterFrame* fp,
+                                                    jsbytecode* pc) {
+  MOZ_ASSERT(JSOp(*pc) == JSOp::LoopHead);
+
+  EnterJitData data(cx);
+
+  const BaselineInterpreter& interp =
+      cx->runtime()->jitRuntime()->baselineInterpreter();
+  data.jitcode = interp.interpretOpNoDebugTrapAddr().value;
+
+  data.osrFrame = fp;
+  data.osrNumStackValues =
+      fp->script()->nfixed() + cx->interpreterRegs().stackDepth();
+
+  if (fp->isFunctionFrame()) {
+    data.constructing = fp->isConstructing();
+    data.numActualArgs = fp->numActualArgs();
+    data.maxArgc = std::max(fp->numActualArgs(), fp->numFormalArgs());
+    data.maxArgv = fp->argv();
+    data.envChain = nullptr;
+    data.calleeToken = CalleeToToken(&fp->callee(), data.constructing);
+  } else {
+    data.constructing = false;
+    data.numActualArgs = 0;
+    data.maxArgc = 0;
+    data.maxArgv = nullptr;
+    data.envChain = fp->environmentChain();
+    data.calleeToken = CalleeToToken(fp->script());
+  }
+
+  JitExecStatus status = EnterBaseline(cx, data);
+  if (status != JitExec_Ok) {
+    return status;
+  }
+
+  fp->setReturnValue(data.result);
+  return JitExec_Ok;
+}
+
+bool BaselineCompileTask::OffThreadBaselineCompilationAvailable(
+    JSContext* cx, JSScript* script, bool isEager) {
+  if (!isEager && !cx->runtime()->canUseOffthreadBaselineCompilation()) {
+    return false;
+  }
+  if (cx->runtime()->profilingScripts) {
+    return false;
+  }
+  if (script->hasScriptCounts() || cx->realm()->collectCoverageForDebug()) {
+    return false;
+  }
+  if (script->isDebuggee()) {
+    return false;
+  }
+  if (IsRealmIndependentBaselineCode(script)) {
+    return false;
+  }
+  return CanUseExtraThreads();
+}
+
+static bool DispatchOffThreadBaselineCompile(JSContext* cx,
+                                             BaselineSnapshot& snapshot) {
+  JSScript* script = snapshot.script();
+  MOZ_ASSERT(
+      BaselineCompileTask::OffThreadBaselineCompilationAvailable(cx, script));
+
+  auto alloc = cx->make_unique<LifoAlloc>(TempAllocator::PreferredLifoChunkSize,
+                                          js::BackgroundMallocArena);
+  if (!alloc) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+  auto* snapshotCopy = alloc->new_<OffThreadBaselineSnapshot>(snapshot);
+  if (!snapshotCopy) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  BaselineSnapshotList snapshots;
+  snapshots.insertFront(snapshotCopy);
+  CompileRealm* realm = CompileRealm::get(cx->realm());
+  BaselineCompileTask* task = alloc->new_<BaselineCompileTask>(
+      realm, alloc.get(), std::move(snapshots));
+  if (!task) {
+    snapshots.clear();
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  AutoLockHelperThreadState lock;
+  if (!StartOffThreadBaselineCompile(task, lock)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  script->jitScript()->setIsBaselineCompiling(script);
+
+  (void)alloc.release();
+
+  return true;
+}
+
+static bool DispatchOffThreadBaselineBatchImpl(JSContext* cx, bool isEager) {
+  BaselineCompileQueue& queue = cx->realm()->baselineCompileQueue();
+  MOZ_ASSERT(queue.numQueued() > 0);
+
+#ifdef DEBUG
+  auto queueIsNotFullOnExit = mozilla::MakeScopeExit([&]() {
+    MOZ_ASSERT(queue.numQueued() < JitOptions.baselineQueueCapacity);
+  });
+#endif
+
+  auto alloc = cx->make_unique<LifoAlloc>(TempAllocator::PreferredLifoChunkSize,
+                                          js::BackgroundMallocArena);
+  if (!alloc) {
+    if (queue.numQueued() == JitOptions.baselineQueueCapacity) {
+      JSScript* script = queue.pop();
+      if (script->hasJitScript()) {
+        script->jitScript()->clearIsBaselineQueued(script);
+      }
+    }
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  gc::AutoSuppressGC suppressGC(cx);
+
+  BaselineSnapshotList snapshots;
+  auto clearSnapshotList = mozilla::MakeScopeExit([&]() { snapshots.clear(); });
+
+  GlobalLexicalEnvironmentObject* globalLexical =
+      &cx->global()->lexicalEnvironment();
+  JSObject* globalThis = globalLexical->thisObject();
+
+  Rooted<JSScript*> script(cx);
+  while (!queue.isEmpty()) {
+    script = queue.pop();
+    if (script->hasJitScript()) {
+      script->jitScript()->clearIsBaselineQueued(script);
+    }
+
+    MOZ_ASSERT(cx->realm() == script->realm());
+
+    if (!IsBaselineJitEnabled(cx)) {
+      script->disableBaselineCompile();
+      continue;
+    }
+
+    if (!BaselineCompileTask::OffThreadBaselineCompilationAvailable(cx, script,
+                                                                    isEager)) {
+      BaselineOptions options({BaselineOption::ForceMainThreadCompilation});
+      MethodStatus status = BaselineCompile(cx, script, options);
+      if (status != Method_Compiled) {
+        return false;
+      }
+      continue;
+    }
+
+    bool compileDebugInstrumentation = false;
+    if (!BaselineCompiler::PrepareToCompile(cx, script,
+                                            compileDebugInstrumentation)) {
+      return false;
+    }
+
+    uint32_t baseWarmUpThreshold =
+        OptimizationInfo::baseWarmUpThresholdForScript(cx, script);
+    bool isIonCompileable = IsIonEnabled(cx) && CanIonCompileScript(cx, script);
+
+    MOZ_ASSERT(!script->isDebuggee());
+
+    auto* offThreadSnapshot = alloc->new_<OffThreadBaselineSnapshot>(
+        script, globalLexical, globalThis, baseWarmUpThreshold,
+        isIonCompileable, compileDebugInstrumentation);
+    if (!offThreadSnapshot) {
+      ReportOutOfMemory(cx);
+      return false;
+    }
+    snapshots.insertFront(offThreadSnapshot);
+  }
+
+  if (snapshots.isEmpty()) {
+    return true;
+  }
+
+  CompileRealm* realm = CompileRealm::get(cx->realm());
+  BaselineCompileTask* task = alloc->new_<BaselineCompileTask>(
+      realm, alloc.get(), std::move(snapshots));
+  if (!task) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+  task->markScriptsAsCompiling();
+  clearSnapshotList.release();
+
+  AutoLockHelperThreadState lock;
+  if (!StartOffThreadBaselineCompile(task, lock)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  (void)alloc.release();
+
+  return true;
+}
+
+bool jit::DispatchOffThreadBaselineBatchEager(JSContext* cx) {
+  return DispatchOffThreadBaselineBatchImpl(cx,  true);
+}
+
+bool jit::DispatchOffThreadBaselineBatch(JSContext* cx) {
+  return DispatchOffThreadBaselineBatchImpl(cx,  false);
+}
+
+MethodStatus jit::BaselineCompile(JSContext* cx, JSScript* script,
+                                  BaselineOptions options) {
+  cx->check(script);
+  MOZ_ASSERT(!script->hasBaselineScript());
+  MOZ_ASSERT(script->canBaselineCompile());
+  MOZ_ASSERT(IsBaselineJitEnabled(cx));
+  AutoGeckoProfilerEntry pseudoFrame(
+      cx, "Baseline script compilation",
+      JS::ProfilingCategoryPair::JS_BaselineCompilation);
+
+  bool compileDebugInstrumentation =
+      script->isDebuggee() ||
+      options.hasFlag(BaselineOption::ForceDebugInstrumentation);
+  bool forceMainThread =
+      compileDebugInstrumentation ||
+      options.hasFlag(BaselineOption::ForceMainThreadCompilation);
+
+  JitContext jctx(cx);
+
+  gc::AutoSuppressGC suppressGC(cx);
+
+  Rooted<JSScript*> rooted(cx, script);
+  if (!BaselineCompiler::PrepareToCompile(cx, rooted,
+                                          compileDebugInstrumentation)) {
+    return Method_Error;
+  }
+
+  GlobalLexicalEnvironmentObject* globalLexical =
+      &cx->global()->lexicalEnvironment();
+  JSObject* globalThis = globalLexical->thisObject();
+  uint32_t baseWarmUpThreshold =
+      OptimizationInfo::baseWarmUpThresholdForScript(cx, script);
+  bool isIonCompileable = IsIonEnabled(cx) && CanIonCompileScript(cx, script);
+
+  BaselineSnapshot snapshot(script, globalLexical, globalThis,
+                            baseWarmUpThreshold, isIonCompileable,
+                            compileDebugInstrumentation);
+
+  if (BaselineCompileTask::OffThreadBaselineCompilationAvailable(cx, script) &&
+      !forceMainThread) {
+    if (!DispatchOffThreadBaselineCompile(cx, snapshot)) {
+      ReportOutOfMemory(cx);
+      return Method_Error;
+    }
+    return Method_Skipped;
+  }
+
+  TempAllocator temp(&cx->tempLifoAlloc());
+
+  mozilla::Maybe<JSAutoNullableRealm> ar;
+  if (IsRealmIndependentBaselineCode(script)) {
+    ar.emplace(cx, nullptr);
+  }
+  StackMacroAssembler masm(cx, temp);
+
+  BaselineCompiler compiler(temp, CompileRuntime::get(cx->runtime()), masm,
+                            &snapshot);
+  if (!compiler.init()) {
+    ReportOutOfMemory(cx);
+    return Method_Error;
+  }
+
+  MethodStatus status = compiler.compile(cx);
+
+  MOZ_ASSERT_IF(status == Method_Compiled, script->hasBaselineScript());
+  MOZ_ASSERT_IF(status != Method_Compiled, !script->hasBaselineScript());
+
+  if (status == Method_CantCompile) {
+    script->disableBaselineCompile();
+  }
+
+  return status;
+}
+
+static MethodStatus CanEnterBaselineJIT(JSContext* cx, HandleScript script,
+                                        AbstractFramePtr osrSourceFrame) {
+  if (!CanBaselineCompileScript(cx, script)) {
+    return Method_CantCompile;
+  }
+
+  if (osrSourceFrame && osrSourceFrame.isDebuggee() &&
+      !DebugAPI::ensureExecutionObservabilityOfOsrFrame(cx, osrSourceFrame)) {
+    return Method_Error;
+  }
+
+  if (script->hasBaselineScript()) {
+    return Method_Compiled;
+  }
+
+  if (script->isBaselineCompilingOffThread()) {
+    return Method_Skipped;
+  }
+
+  bool mightHaveEagerBaselineHint = false;
+  if (!JitOptions.disableJitHints && !script->noEagerBaselineHint() &&
+      cx->runtime()->jitRuntime()->hasJitHintsMap()) {
+    JitHintsMap* jitHints = cx->runtime()->jitRuntime()->getJitHintsMap();
+    if (jitHints->mightHaveEagerBaselineHint(script)) {
+      mightHaveEagerBaselineHint = true;
+    }
+  }
+  if (!mightHaveEagerBaselineHint) {
+    if (script->getWarmUpCount() <= JitOptions.baselineJitWarmUpThreshold) {
+      return Method_Skipped;
+    }
+  }
+
+  if (!CanLikelyAllocateMoreExecutableMemory()) {
+    return Method_Skipped;
+  }
+
+  if (!cx->zone()->ensureJitZoneExists(cx)) {
+    return Method_Error;
+  }
+
+  BaselineOptions options;
+  if (osrSourceFrame && osrSourceFrame.isDebuggee()) {
+    options.setFlag(BaselineOption::ForceDebugInstrumentation);
+  }
+  return BaselineCompile(cx, script, options);
+}
+
+bool jit::CanBaselineInterpretScript(JSScript* script) {
+  MOZ_ASSERT(IsBaselineInterpreterEnabled());
+
+  if (script->hasForceInterpreterOp()) {
+    return false;
+  }
+
+  if (script->nslots() > BaselineMaxScriptSlots) {
+    return false;
+  }
+
+  return true;
+}
+
+bool jit::CanBaselineCompileScript(JSContext* cx, JSScript* script) {
+  if (!script->canBaselineCompile()) {
+    return false;
+  }
+  if (!IsBaselineJitEnabled(cx)) {
+    script->disableBaselineCompile();
+    return false;
+  }
+  if (!CanBaselineInterpretScript(script)) {
+    script->disableBaselineCompile();
+    return false;
+  }
+  if (script->length() > BaselineMaxScriptLength) {
+    script->disableBaselineCompile();
+    return false;
+  }
+  MOZ_RELEASE_ASSERT(script->nslots() <= BaselineMaxScriptSlots,
+                     "nslots is checked in CanBaselineInterpretScript");
+  return true;
+}
+
+static bool MaybeCreateBaselineInterpreterEntryScript(JSContext* cx,
+                                                      JSScript* script) {
+  MOZ_ASSERT(script->hasJitScript());
+
+  Zone* zone = script->zone();
+  EntryTrampolineMap* map =
+      zone->jitZone()->getOrCreateInterpreterEntryMap(zone);
+  if (!map) {
+    return false;
+  }
+
+  JitRuntime* jitRuntime = cx->runtime()->jitRuntime();
+  if (script->jitCodeRaw() != jitRuntime->baselineInterpreter().codeRaw()) {
+#ifdef DEBUG
+    auto ptr = map->lookup(script);
+    MOZ_ASSERT(ptr);
+    MOZ_ASSERT(ptr->value()->raw() == script->jitCodeRaw());
+#endif
+    return true;
+  }
+
+  auto ptr = map->lookupForAdd(script);
+  if (!ptr) {
+    Rooted<JitCode*> code(
+        cx, jitRuntime->generateEntryTrampolineForScript(cx, script));
+    if (!code || !map->relookupOrAdd(ptr, script, code)) {
+      return false;
+    }
+  }
+
+  script->updateJitCodeRaw(cx->runtime());
+  return true;
+}
+
+static MethodStatus CanEnterBaselineInterpreter(JSContext* cx,
+                                                JSScript* script) {
+  MOZ_ASSERT(IsBaselineInterpreterEnabled());
+
+  if (script->hasJitScript()) {
+    return Method_Compiled;
+  }
+
+  if (!CanBaselineInterpretScript(script)) {
+    return Method_CantCompile;
+  }
+
+  if (script->getWarmUpCount() <=
+      JitOptions.baselineInterpreterWarmUpThreshold) {
+    return Method_Skipped;
+  }
+
+  if (!cx->zone()->ensureJitZoneExists(cx)) {
+    return Method_Error;
+  }
+
+  AutoKeepJitScripts keepJitScript(cx);
+  if (!script->ensureHasJitScript(cx, keepJitScript)) {
+    return Method_Error;
+  }
+
+  if (JitOptions.emitInterpreterEntryTrampoline) {
+    if (!MaybeCreateBaselineInterpreterEntryScript(cx, script)) {
+      ReportOutOfMemory(cx);
+      return Method_Error;
+    }
+  }
+  return Method_Compiled;
+}
+
+MethodStatus jit::CanEnterBaselineInterpreterAtBranch(JSContext* cx,
+                                                      InterpreterFrame* fp) {
+  if (!CheckFrame(fp)) {
+    return Method_CantCompile;
+  }
+
+  if (cx->realm()->debuggerObservesNativeCall()) {
+    return Method_CantCompile;
+  }
+
+  return CanEnterBaselineInterpreter(cx, fp->script());
+}
+
+template <BaselineTier Tier>
+MethodStatus jit::CanEnterBaselineMethod(JSContext* cx, RunState& state) {
+  if (state.isInvoke()) {
+    InvokeState& invoke = *state.asInvoke();
+    if (TooManyActualArguments(invoke.args().length())) {
+      JitSpew(JitSpew_BaselineAbort, "Too many arguments (%u)",
+              invoke.args().length());
+      return Method_CantCompile;
+    }
+  } else {
+    if (state.asExecute()->isDebuggerEval()) {
+      JitSpew(JitSpew_BaselineAbort, "debugger frame");
+      return Method_CantCompile;
+    }
+  }
+
+  RootedScript script(cx, state.script());
+  switch (Tier) {
+    case BaselineTier::Interpreter:
+      return CanEnterBaselineInterpreter(cx, script);
+
+    case BaselineTier::Compiler:
+      return CanEnterBaselineJIT(cx, script,
+                                  NullFramePtr());
+  }
+
+  MOZ_CRASH("Unexpected tier");
+}
+
+template MethodStatus jit::CanEnterBaselineMethod<BaselineTier::Interpreter>(
+    JSContext* cx, RunState& state);
+template MethodStatus jit::CanEnterBaselineMethod<BaselineTier::Compiler>(
+    JSContext* cx, RunState& state);
+
+bool jit::BaselineCompileFromBaselineInterpreter(JSContext* cx,
+                                                 BaselineFrame* frame,
+                                                 uint8_t** res) {
+  MOZ_ASSERT(frame->runningInInterpreter());
+
+  RootedScript script(cx, frame->script());
+  jsbytecode* pc = frame->interpreterPC();
+  MOZ_ASSERT(pc == script->code() || JSOp(*pc) == JSOp::LoopHead);
+
+  MethodStatus status = CanEnterBaselineJIT(cx, script,
+                                             frame);
+  switch (status) {
+    case Method_Error:
+      return false;
+
+    case Method_CantCompile:
+    case Method_Skipped:
+      *res = nullptr;
+      return true;
+
+    case Method_Compiled: {
+      if (JSOp(*pc) == JSOp::LoopHead) {
+        MOZ_ASSERT(pc > script->code(),
+                   "Prologue vs OSR cases must not be ambiguous");
+        BaselineScript* baselineScript = script->baselineScript();
+        uint32_t pcOffset = script->pcToOffset(pc);
+        *res = baselineScript->nativeCodeForOSREntry(pcOffset);
+      } else {
+        *res = script->baselineScript()->warmUpCheckPrologueAddr();
+      }
+      frame->prepareForBaselineInterpreterToJitOSR();
+      return true;
+    }
+  }
+
+  MOZ_CRASH("Unexpected status");
+}
+
+#ifdef DEBUG
+void BaselineCompileQueue::assertInvariants() const {
+  MOZ_ASSERT(numQueued_ <= JitOptions.baselineQueueCapacity);
+  MOZ_ASSERT(JitOptions.baselineQueueCapacity <= MaxCapacity);
+  for (uint32_t i = 0; i < numQueued_; i++) {
+    MOZ_ASSERT(queue_[i]);
+    if (queue_[i]->hasJitScript()) {
+      MOZ_ASSERT(queue_[i]->jitScript()->isBaselineQueued());
+    }
+  }
+  for (uint32_t i = numQueued_; i < MaxCapacity; i++) {
+    MOZ_ASSERT(!queue_[i]);
+  }
+}
+#endif
+
+void BaselineCompileQueue::trace(JSTracer* trc) {
+  assertInvariants();
+  for (uint32_t i = 0; i < numQueued_; i++) {
+    TraceEdge(trc, &queue_[i], "baseline_compile_queue");
+  }
+}
+
+void BaselineCompileQueue::remove(JSScript* script) {
+  assertInvariants();
+  for (uint32_t i = 0; i < numQueued_; i++) {
+    if (queue_[i] == script) {
+      std::swap(queue_[i], queue_[numQueued_ - 1]);
+      pop();
+      break;
+    }
+  }
+  assertInvariants();
+}
+
+BaselineScript* BaselineScript::New(JSContext* cx,
+                                    uint32_t warmUpCheckPrologueOffset,
+                                    uint32_t profilerEnterToggleOffset,
+                                    uint32_t profilerExitToggleOffset,
+                                    size_t retAddrEntries, size_t osrEntries,
+                                    size_t debugTrapEntries,
+                                    size_t resumeEntries) {
+  CheckedInt<Offset> size = sizeof(BaselineScript);
+  size += CheckedInt<Offset>(resumeEntries) * sizeof(uintptr_t);
+  size += CheckedInt<Offset>(retAddrEntries) * sizeof(RetAddrEntry);
+  size += CheckedInt<Offset>(osrEntries) * sizeof(OSREntry);
+  size += CheckedInt<Offset>(debugTrapEntries) * sizeof(DebugTrapEntry);
+
+  if (!size.isValid()) {
+    ReportAllocationOverflow(cx);
+    return nullptr;
+  }
+
+  void* raw = cx->pod_malloc<uint8_t>(size.value());
+  MOZ_ASSERT(uintptr_t(raw) % alignof(BaselineScript) == 0);
+  if (!raw) {
+    return nullptr;
+  }
+  BaselineScript* script = new (raw)
+      BaselineScript(warmUpCheckPrologueOffset, profilerEnterToggleOffset,
+                     profilerExitToggleOffset);
+
+  Offset cursor = sizeof(BaselineScript);
+
+  MOZ_ASSERT(isAlignedOffset<uintptr_t>(cursor));
+  script->resumeEntriesOffset_ = cursor;
+  cursor += resumeEntries * sizeof(uintptr_t);
+
+  MOZ_ASSERT(isAlignedOffset<RetAddrEntry>(cursor));
+  script->retAddrEntriesOffset_ = cursor;
+  cursor += retAddrEntries * sizeof(RetAddrEntry);
+
+  MOZ_ASSERT(isAlignedOffset<OSREntry>(cursor));
+  script->osrEntriesOffset_ = cursor;
+  cursor += osrEntries * sizeof(OSREntry);
+
+  MOZ_ASSERT(isAlignedOffset<DebugTrapEntry>(cursor));
+  script->debugTrapEntriesOffset_ = cursor;
+  cursor += debugTrapEntries * sizeof(DebugTrapEntry);
+
+  MOZ_ASSERT(isAlignedOffset<uint32_t>(cursor));
+
+  script->allocBytes_ = cursor;
+
+  MOZ_ASSERT(script->endOffset() == size.value());
+
+  return script;
+}
+
+BaselineScript* BaselineScript::Copy(JSContext* cx, BaselineScript* bs) {
+  BaselineScript* script = jit::BaselineScript::New(
+      cx, bs->warmUpCheckPrologueOffset_, bs->profilerEnterToggleOffset_,
+      bs->profilerExitToggleOffset_, bs->retAddrEntries().size(),
+      bs->osrEntries().size(), bs->debugTrapEntries().size(),
+      bs->resumeEntryList().size());
+  if (!script) {
+    return nullptr;
+  }
+
+  script->setMethod(bs->method());
+  script->copyRetAddrEntries(bs->retAddrEntries().data());
+  script->copyOSREntries(bs->osrEntries().data());
+  script->copyDebugTrapEntries(bs->debugTrapEntries().data());
+
+  script->flags_ = bs->flags_;
+
+  std::copy_n(bs->resumeEntryList().begin(), script->resumeEntryList().size(),
+              script->resumeEntryList().data());
+
+  if (bs->hasDebugInstrumentation()) {
+    script->setHasDebugInstrumentation();
+  }
+  MOZ_ASSERT(script->method_ == bs->method_);
+  MOZ_ASSERT(script->pendingIonCompileTask_ == bs->pendingIonCompileTask_);
+  MOZ_ASSERT(script->warmUpCheckPrologueOffset_ ==
+             bs->warmUpCheckPrologueOffset_);
+  MOZ_ASSERT(script->profilerEnterToggleOffset_ ==
+             bs->profilerEnterToggleOffset_);
+  MOZ_ASSERT(script->profilerExitToggleOffset_ ==
+             bs->profilerExitToggleOffset_);
+  MOZ_ASSERT(script->resumeEntriesOffset_ == bs->resumeEntriesOffset_);
+  MOZ_ASSERT(script->retAddrEntriesOffset_ == bs->retAddrEntriesOffset_);
+  MOZ_ASSERT(script->osrEntriesOffset_ == bs->osrEntriesOffset_);
+  MOZ_ASSERT(script->debugTrapEntriesOffset_ == bs->debugTrapEntriesOffset_);
+  MOZ_ASSERT(script->allocBytes_ == bs->allocBytes_);
+  MOZ_ASSERT(script->flags_ == bs->flags_);
+  return script;
+}
+
+void BaselineScript::trace(JSTracer* trc) {
+  TraceEdge(trc, &method_, "baseline-method");
+}
+
+void BaselineScript::Destroy(JS::GCContext* gcx, BaselineScript* script) {
+  MOZ_ASSERT(!script->hasPendingIonCompileTask());
+
+  gcx->deleteUntracked(script);
+}
+
+void JS::DeletePolicy<js::jit::BaselineScript>::operator()(
+    const js::jit::BaselineScript* script) {
+  BaselineScript::Destroy(rt_->gcContext(),
+                          const_cast<BaselineScript*>(script));
+}
+
+const RetAddrEntry& BaselineScript::retAddrEntryFromReturnOffset(
+    CodeOffset returnOffset) {
+  mozilla::Span<RetAddrEntry> entries = retAddrEntries();
+  size_t loc;
+#ifdef DEBUG
+  bool found =
+#endif
+      BinarySearchIf(
+          entries.data(), 0, entries.size(),
+          [&returnOffset](const RetAddrEntry& entry) {
+            size_t roffset = returnOffset.offset();
+            size_t entryRoffset = entry.returnOffset().offset();
+            if (roffset < entryRoffset) {
+              return -1;
+            }
+            if (entryRoffset < roffset) {
+              return 1;
+            }
+            return 0;
+          },
+          &loc);
+
+  MOZ_ASSERT(found);
+  MOZ_ASSERT(entries[loc].returnOffset().offset() == returnOffset.offset());
+  return entries[loc];
+}
+
+template <typename Entry>
+static bool ComputeBinarySearchMid(mozilla::Span<Entry> entries,
+                                   uint32_t pcOffset, size_t* loc) {
+  return BinarySearchIf(
+      entries.data(), 0, entries.size(),
+      [pcOffset](const Entry& entry) {
+        uint32_t entryOffset = entry.pcOffset();
+        if (pcOffset < entryOffset) {
+          return -1;
+        }
+        if (entryOffset < pcOffset) {
+          return 1;
+        }
+        return 0;
+      },
+      loc);
+}
+
+uint8_t* BaselineScript::returnAddressForEntry(const RetAddrEntry& ent) {
+  return method()->raw() + ent.returnOffset().offset();
+}
+
+const RetAddrEntry& BaselineScript::retAddrEntryFromPCOffset(
+    uint32_t pcOffset, RetAddrEntry::Kind kind) {
+  mozilla::Span<RetAddrEntry> entries = retAddrEntries();
+  size_t mid;
+  MOZ_ALWAYS_TRUE(ComputeBinarySearchMid(entries, pcOffset, &mid));
+  MOZ_ASSERT(mid < entries.size());
+
+  size_t first = mid;
+  while (first > 0 && entries[first - 1].pcOffset() == pcOffset) {
+    first--;
+  }
+
+  size_t last = mid;
+  while (last + 1 < entries.size() &&
+         entries[last + 1].pcOffset() == pcOffset) {
+    last++;
+  }
+
+  MOZ_ASSERT(first <= last);
+  MOZ_ASSERT(entries[first].pcOffset() == pcOffset);
+  MOZ_ASSERT(entries[last].pcOffset() == pcOffset);
+
+  for (size_t i = first; i <= last; i++) {
+    const RetAddrEntry& entry = entries[i];
+    if (entry.kind() != kind) {
+      continue;
+    }
+
+#ifdef DEBUG
+    for (size_t j = i + 1; j <= last; j++) {
+      MOZ_ASSERT(entries[j].kind() != kind);
+    }
+#endif
+
+    return entry;
+  }
+
+  MOZ_CRASH("Didn't find RetAddrEntry.");
+}
+
+const RetAddrEntry& BaselineScript::prologueRetAddrEntry(
+    RetAddrEntry::Kind kind) {
+  MOZ_ASSERT(kind == RetAddrEntry::Kind::StackCheck);
+
+  for (const RetAddrEntry& entry : retAddrEntries()) {
+    if (entry.pcOffset() != 0) {
+      break;
+    }
+    if (entry.kind() == kind) {
+      return entry;
+    }
+  }
+  MOZ_CRASH("Didn't find prologue RetAddrEntry.");
+}
+
+const RetAddrEntry& BaselineScript::retAddrEntryFromReturnAddress(
+    const uint8_t* returnAddr) {
+  MOZ_ASSERT(returnAddr > method_->raw());
+  MOZ_ASSERT(returnAddr < method_->raw() + method_->instructionsSize());
+  CodeOffset offset(returnAddr - method_->raw());
+  return retAddrEntryFromReturnOffset(offset);
+}
+
+uint8_t* BaselineScript::nativeCodeForOSREntry(uint32_t pcOffset) {
+  mozilla::Span<OSREntry> entries = osrEntries();
+  size_t mid;
+  if (!ComputeBinarySearchMid(entries, pcOffset, &mid)) {
+    return nullptr;
+  }
+
+  uint32_t nativeOffset = entries[mid].nativeOffset();
+  return method_->raw() + nativeOffset;
+}
+
+void BaselineScript::computeResumeNativeOffsets(
+    JSScript* script, const ResumeOffsetEntryVector& entries) {
+  auto computeNative = [this, &entries](uint32_t pcOffset) -> uint8_t* {
+    mozilla::Span<const ResumeOffsetEntry> entriesSpan =
+        mozilla::Span(entries.begin(), entries.length());
+    size_t mid;
+    if (!ComputeBinarySearchMid(entriesSpan, pcOffset, &mid)) {
+      return nullptr;
+    }
+
+    uint32_t nativeOffset = entries[mid].nativeOffset();
+    return method_->raw() + nativeOffset;
+  };
+
+  mozilla::Span<const uint32_t> pcOffsets = script->resumeOffsets();
+  mozilla::Span<uint8_t*> nativeOffsets = resumeEntryList();
+  std::transform(pcOffsets.begin(), pcOffsets.end(), nativeOffsets.begin(),
+                 computeNative);
+}
+
+bool BaselineScript::OSREntryForFrame(JSContext* cx, BaselineFrame* frame,
+                                      uint8_t** entry) {
+  MOZ_ASSERT(frame->runningInInterpreter());
+
+  JSScript* script = frame->script();
+  BaselineScript* baselineScript = script->baselineScript();
+  jsbytecode* pc = frame->interpreterPC();
+  size_t pcOffset = script->pcToOffset(pc);
+
+  if (MOZ_UNLIKELY(frame->isDebuggee() &&
+                   !baselineScript->hasDebugInstrumentation())) {
+    if (!DebugAPI::ensureExecutionObservabilityOfOsrFrame(cx, frame)) {
+      return false;
+    }
+    baselineScript = script->baselineScript();
+  }
+
+  if (JSOp(*pc) == JSOp::LoopHead) {
+    MOZ_ASSERT(pc > script->code(),
+               "Prologue vs OSR cases must not be ambiguous");
+    *entry = baselineScript->nativeCodeForOSREntry(pcOffset);
+  } else {
+    *entry = baselineScript->warmUpCheckPrologueAddr();
+  }
+
+  frame->prepareForBaselineInterpreterToJitOSR();
+  return true;
+}
+
+void BaselineScript::copyRetAddrEntries(const RetAddrEntry* entries) {
+  std::copy_n(entries, retAddrEntries().size(), retAddrEntries().data());
+}
+
+void BaselineScript::copyOSREntries(const OSREntry* entries) {
+  std::copy_n(entries, osrEntries().size(), osrEntries().data());
+}
+
+void BaselineScript::copyDebugTrapEntries(const DebugTrapEntry* entries) {
+  std::copy_n(entries, debugTrapEntries().size(), debugTrapEntries().data());
+}
+
+jsbytecode* BaselineScript::approximatePcForNativeAddress(
+    JSScript* script, uint8_t* nativeAddress) {
+  MOZ_ASSERT(script->baselineScript() == this);
+  MOZ_ASSERT(containsCodeAddress(nativeAddress));
+
+  uint32_t nativeOffset = nativeAddress - method_->raw();
+
+
+  for (const RetAddrEntry& entry : retAddrEntries()) {
+    uint32_t retOffset = entry.returnOffset().offset();
+    if (retOffset >= nativeOffset) {
+      return script->offsetToPC(entry.pcOffset());
+    }
+  }
+
+  MOZ_ASSERT(!retAddrEntries().empty());
+  return script->offsetToPC(retAddrEntries().crbegin()->pcOffset());
+}
+
+void BaselineScript::toggleDebugTraps(JSScript* script, jsbytecode* pc) {
+  MOZ_ASSERT(script->baselineScript() == this);
+
+  if (!hasDebugInstrumentation()) {
+    return;
+  }
+
+  AutoWritableJitCode awjc(method());
+
+  for (const DebugTrapEntry& entry : debugTrapEntries()) {
+    jsbytecode* entryPC = script->offsetToPC(entry.pcOffset());
+
+    if (pc && pc != entryPC) {
+      continue;
+    }
+
+    bool enabled = DebugAPI::stepModeEnabled(script) ||
+                   DebugAPI::hasBreakpointsAt(script, entryPC);
+
+    CodeLocationLabel label(method(), CodeOffset(entry.nativeOffset()));
+    Assembler::ToggleCall(label, enabled);
+  }
+}
+
+void BaselineScript::setPendingIonCompileTask(JSRuntime* rt, JSScript* script,
+                                              IonCompileTask* task) {
+  MOZ_ASSERT(script->baselineScript() == this);
+  MOZ_ASSERT(task);
+  MOZ_ASSERT(!hasPendingIonCompileTask());
+
+  if (script->isIonCompilingOffThread()) {
+    script->jitScript()->clearIsIonCompilingOffThread(script);
+  }
+
+  pendingIonCompileTask_ = task;
+  script->updateJitCodeRaw(rt);
+}
+
+void BaselineScript::removePendingIonCompileTask(JSRuntime* rt,
+                                                 JSScript* script) {
+  MOZ_ASSERT(script->baselineScript() == this);
+  MOZ_ASSERT(hasPendingIonCompileTask());
+
+  pendingIonCompileTask_ = nullptr;
+  script->updateJitCodeRaw(rt);
+}
+
+static void ToggleProfilerInstrumentation(JitCode* code,
+                                          uint32_t profilerEnterToggleOffset,
+                                          uint32_t profilerExitToggleOffset,
+                                          bool enable) {
+  CodeLocationLabel enterToggleLocation(code,
+                                        CodeOffset(profilerEnterToggleOffset));
+  CodeLocationLabel exitToggleLocation(code,
+                                       CodeOffset(profilerExitToggleOffset));
+
+  code->setProfilerInstrumented(enable);
+  if (enable) {
+    Assembler::ToggleToCmp(enterToggleLocation);
+    Assembler::ToggleToCmp(exitToggleLocation);
+  } else {
+    Assembler::ToggleToJmp(enterToggleLocation);
+    Assembler::ToggleToJmp(exitToggleLocation);
+  }
+}
+
+void BaselineScript::toggleProfilerInstrumentation(bool enable) {
+  JitSpew(JitSpew_BaselineIC, "  toggling profiling %s for BaselineScript %p",
+          enable ? "on" : "off", this);
+
+  ToggleProfilerInstrumentation(method_, profilerEnterToggleOffset_,
+                                profilerExitToggleOffset_, enable);
+}
+
+void BaselineInterpreter::toggleProfilerInstrumentation(bool enable) {
+  if (!IsBaselineInterpreterEnabled()) {
+    return;
+  }
+
+  AutoWritableJitCode awjc(code_);
+  ToggleProfilerInstrumentation(code_, profilerEnterToggleOffset_,
+                                profilerExitToggleOffset_, enable);
+}
+
+void BaselineInterpreter::toggleDebuggerInstrumentation(bool enable) {
+  if (!IsBaselineInterpreterEnabled()) {
+    return;
+  }
+
+  AutoWritableJitCode awjc(code_);
+
+  for (uint32_t offset : debugInstrumentationOffsets_) {
+    CodeLocationLabel label(code_, CodeOffset(offset));
+    if (enable) {
+      Assembler::ToggleToCmp(label);
+    } else {
+      Assembler::ToggleToJmp(label);
+    }
+  }
+
+
+  uint8_t* debugTrapHandler = codeAtOffset(debugTrapHandlerOffset_);
+
+  for (uint32_t offset : debugTrapOffsets_) {
+    uint8_t* trap = codeAtOffset(offset);
+    if (enable) {
+      MacroAssembler::patchNopToCall(trap, debugTrapHandler);
+    } else {
+      MacroAssembler::patchCallToNop(trap);
+    }
+  }
+}
+
+void BaselineInterpreter::toggleCodeCoverageInstrumentationUnchecked(
+    bool enable) {
+  if (!IsBaselineInterpreterEnabled()) {
+    return;
+  }
+
+  AutoWritableJitCode awjc(code_);
+
+  for (uint32_t offset : codeCoverageOffsets_) {
+    CodeLocationLabel label(code_, CodeOffset(offset));
+    if (enable) {
+      Assembler::ToggleToCmp(label);
+    } else {
+      Assembler::ToggleToJmp(label);
+    }
+  }
+}
+
+void BaselineInterpreter::toggleCodeCoverageInstrumentation(bool enable) {
+  if (coverage::IsLCovEnabled()) {
+    return;
+  }
+
+  toggleCodeCoverageInstrumentationUnchecked(enable);
+}
+
+void jit::FinishDiscardBaselineScript(JS::GCContext* gcx, JSScript* script) {
+  MOZ_ASSERT(script->hasBaselineScript());
+  MOZ_ASSERT(!script->jitScript()->icScript()->active());
+
+  BaselineScript* baseline =
+      script->jitScript()->clearBaselineScript(gcx, script);
+  BaselineScript::Destroy(gcx, baseline);
+}
+
+void jit::AddSizeOfBaselineData(JSScript* script,
+                                mozilla::MallocSizeOf mallocSizeOf,
+                                size_t* data) {
+  if (script->hasBaselineScript()) {
+    script->baselineScript()->addSizeOfIncludingThis(mallocSizeOf, data);
+  }
+}
+
+static void EnsureBaselineJitcodeGlobalEntry(JSContext* cx, JSScript* script) {
+  JitRuntime* jrt = cx->runtime()->jitRuntime();
+  if (!jrt->hasJitcodeGlobalTable()) {
+    return;
+  }
+  JitcodeGlobalTable* table = jrt->getJitcodeGlobalTable();
+
+  JitCode* code = script->baselineScript()->method();
+  JitcodeGlobalEntry* existing = table->lookup(code->raw());
+  if (existing && existing->jitcode() == code) {
+    return;
+  }
+
+  if (!AddBaselineJitcodeGlobalEntry(cx, script, code)) {
+    cx->recoverFromOutOfMemory();
+  }
+}
+
+void jit::ToggleBaselineProfiling(JSContext* cx, bool enable) {
+  JitRuntime* jrt = cx->runtime()->jitRuntime();
+  if (!jrt) {
+    return;
+  }
+
+  jrt->baselineInterpreter().toggleProfilerInstrumentation(enable);
+
+  for (ZonesIter zone(cx->runtime(), SkipAtoms); !zone.done(); zone.next()) {
+    if (!zone->jitZone()) {
+      continue;
+    }
+    zone->jitZone()->forEachJitScript([&](jit::JitScript* jitScript) {
+      JSScript* script = jitScript->owningScript();
+      if (enable) {
+        jitScript->ensureProfileString(cx, script);
+        jitScript->ensureProfilerScriptSource(cx, script);
+      }
+      if (script->hasBaselineScript()) {
+        if (enable) {
+          EnsureBaselineJitcodeGlobalEntry(cx, script);
+        }
+        BaselineScript* baselineScript = script->baselineScript();
+        if (baselineScript->isProfilerInstrumentationOn() != enable) {
+          AutoWritableJitCode awjc(baselineScript->method());
+          baselineScript->toggleProfilerInstrumentation(enable);
+        }
+      }
+    });
+  }
+}
+
+void BaselineInterpreter::init(JitCode* code, uint32_t interpretOpOffset,
+                               uint32_t interpretOpNoDebugTrapOffset,
+                               uint32_t bailoutPrologueOffset,
+                               uint32_t profilerEnterToggleOffset,
+                               uint32_t profilerExitToggleOffset,
+                               uint32_t debugTrapHandlerOffset,
+                               CodeOffsetVector&& debugInstrumentationOffsets,
+                               CodeOffsetVector&& debugTrapOffsets,
+                               CodeOffsetVector&& codeCoverageOffsets,
+                               ICReturnOffsetVector&& icReturnOffsets,
+                               const CallVMOffsets& callVMOffsets) {
+  code_ = code;
+  interpretOpOffset_ = interpretOpOffset;
+  interpretOpNoDebugTrapOffset_ = interpretOpNoDebugTrapOffset;
+  bailoutPrologueOffset_ = bailoutPrologueOffset;
+  profilerEnterToggleOffset_ = profilerEnterToggleOffset;
+  profilerExitToggleOffset_ = profilerExitToggleOffset;
+  debugTrapHandlerOffset_ = debugTrapHandlerOffset;
+  debugInstrumentationOffsets_ = std::move(debugInstrumentationOffsets);
+  debugTrapOffsets_ = std::move(debugTrapOffsets);
+  codeCoverageOffsets_ = std::move(codeCoverageOffsets);
+  icReturnOffsets_ = std::move(icReturnOffsets);
+  callVMOffsets_ = callVMOffsets;
+}
+
+uint8_t* BaselineInterpreter::retAddrForIC(JSOp op) const {
+  for (const ICReturnOffset& entry : icReturnOffsets_) {
+    if (entry.op == op) {
+      return codeAtOffset(entry.offset);
+    }
+  }
+  MOZ_CRASH("Unexpected op");
+}
+
+bool jit::GenerateBaselineInterpreter(JSContext* cx,
+                                      BaselineInterpreter& interpreter) {
+  if (IsBaselineInterpreterEnabled()) {
+    TempAllocator temp(&cx->tempLifoAlloc());
+    StackMacroAssembler masm(cx, temp);
+    BaselineInterpreterGenerator generator(cx, temp, masm);
+    return generator.generate(cx, interpreter);
+  }
+
+  return true;
+}

@@ -1,0 +1,119 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_SVGFILTERINSTANCE_H_
+#define LAYOUT_SVG_SVGFILTERINSTANCE_H_
+
+#include "SVGAnimatedNumber.h"
+#include "SVGAnimatedNumberPair.h"
+#include "SVGFilters.h"
+#include "gfxMatrix.h"
+#include "gfxRect.h"
+#include "mozilla/ServoStyleConsts.h"
+
+namespace mozilla {
+class SVGFilterFrame;
+
+namespace dom {
+class SVGFilterElement;
+}  
+
+class SVGFilterInstance {
+  using Point3D = gfx::Point3D;
+  using IntRect = gfx::IntRect;
+  using SourceSurface = gfx::SourceSurface;
+  using FilterPrimitiveDescription = gfx::FilterPrimitiveDescription;
+  using SVGFilterPrimitiveElement = dom::SVGFilterPrimitiveElement;
+  using UserSpaceMetrics = dom::UserSpaceMetrics;
+
+ public:
+  SVGFilterInstance(const StyleFilter& aFilter, SVGFilterFrame* aFilterFrame,
+                    nsIContent* aTargetContent,
+                    const UserSpaceMetrics& aMetrics,
+                    const gfxRect& aTargetBBox,
+                    const gfx::MatrixScalesDouble& aUserSpaceToFilterSpaceScale,
+                    gfxRect& aFilterSpaceBoundsNotSnapped);
+
+  bool IsInitialized() const { return mInitialized; }
+
+  nsresult BuildPrimitives(
+      nsTArray<FilterPrimitiveDescription>& aPrimitiveDescrs,
+      nsTArray<RefPtr<SourceSurface>>& aInputImages, bool aInputIsTainted);
+
+  float GetPrimitiveUserSpaceUnitValue(SVGLength::Axis aAxis) const;
+
+  float GetPrimitiveNumber(SVGLength::Axis aAxis,
+                           const SVGAnimatedNumber* aNumber) const {
+    return GetPrimitiveNumber(aAxis, aNumber->GetAnimValue());
+  }
+  float GetPrimitiveNumber(SVGLength::Axis aAxis,
+                           const SVGAnimatedNumberPair* aNumberPair,
+                           SVGAnimatedNumberPairWhichOne aPairWhichOne) const {
+    return GetPrimitiveNumber(aAxis, aNumberPair->GetAnimValue(aPairWhichOne));
+  }
+
+  Point3D ConvertLocation(const Point3D& aPoint) const;
+
+  float UserSpaceToFilterSpace(SVGLength::Axis aAxis, float aValue) const;
+
+  gfxRect UserSpaceToFilterSpace(const gfxRect& aUserSpaceRect) const;
+
+ private:
+  IntRect ComputeFilterPrimitiveSubregion(
+      SVGFilterPrimitiveElement* aFilterElement,
+      const nsTArray<FilterPrimitiveDescription>& aPrimitiveDescrs,
+      const nsTArray<int32_t>& aInputIndices);
+
+  void GetInputsAreTainted(
+      const nsTArray<FilterPrimitiveDescription>& aPrimitiveDescrs,
+      const nsTArray<int32_t>& aInputIndices, bool aFilterInputIsTainted,
+      nsTArray<bool>& aOutInputsAreTainted);
+
+  float GetPrimitiveNumber(SVGLength::Axis aAxis, float aValue) const;
+
+  gfxMatrix GetUserSpaceToFrameSpaceInCSSPxTransform() const;
+
+  int32_t GetOrCreateSourceAlphaIndex(
+      nsTArray<FilterPrimitiveDescription>& aPrimitiveDescrs);
+
+  nsresult GetSourceIndices(
+      SVGFilterPrimitiveElement* aPrimitiveElement,
+      nsTArray<FilterPrimitiveDescription>& aPrimitiveDescrs,
+      const nsTHashMap<nsStringHashKey, int32_t>& aImageTable,
+      nsTArray<int32_t>& aSourceIndices);
+
+  bool ComputeBounds();
+
+  const StyleFilter& mFilter;
+
+  nsIContent* mTargetContent;
+
+  const UserSpaceMetrics& mMetrics;
+
+  const dom::SVGFilterElement* mFilterElement;
+
+  SVGFilterFrame* mFilterFrame;
+
+  gfxRect mTargetBBox;
+
+  nsIntRect mFilterSpaceBounds;
+
+  gfxRect mFilterSpaceBoundsNotSnapped;
+
+  gfx::MatrixScalesDouble mUserSpaceToFilterSpaceScale;
+
+  uint16_t mPrimitiveUnits;
+
+  MOZ_INIT_OUTSIDE_CTOR int32_t mSourceGraphicIndex;
+
+  MOZ_INIT_OUTSIDE_CTOR int32_t mSourceAlphaIndex;
+
+  int32_t mSourceAlphaAvailable;
+
+  bool mInitialized;
+};
+
+}  
+
+#endif  // LAYOUT_SVG_SVGFILTERINSTANCE_H_

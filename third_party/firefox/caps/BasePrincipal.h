@@ -1,0 +1,390 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_BasePrincipal_h
+#define mozilla_BasePrincipal_h
+
+#include <stdint.h>
+#include "ErrorList.h"
+#include "js/TypeDecls.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/OriginAttributes.h"
+#include "mozilla/RefPtr.h"
+#include "nsAtom.h"
+#include "nsIObjectOutputStream.h"
+#include "nsIPrincipal.h"
+#include "nsJSPrincipals.h"
+#include "nsStringFwd.h"
+#include "nscore.h"
+
+class ExpandedPrincipal;
+class mozIDOMWindow;
+class nsIChannel;
+class nsIReferrerInfo;
+class nsISupports;
+class nsIURI;
+
+namespace mozilla {
+
+class JSONWriter;
+
+namespace dom {
+enum class ReferrerPolicy : uint8_t;
+}
+
+class BasePrincipal;
+
+class SiteIdentifier {
+ public:
+  void Init(BasePrincipal* aPrincipal) {
+    MOZ_ASSERT(aPrincipal);
+    mPrincipal = aPrincipal;
+  }
+
+  bool IsInitialized() const { return !!mPrincipal; }
+
+  bool Equals(const SiteIdentifier& aOther) const;
+
+ private:
+  friend class ::ExpandedPrincipal;
+
+  BasePrincipal* GetPrincipal() const {
+    MOZ_ASSERT(IsInitialized());
+    return mPrincipal;
+  }
+
+  RefPtr<BasePrincipal> mPrincipal;
+};
+
+class BasePrincipal : public nsJSPrincipals {
+ public:
+  enum PrincipalKind {
+    eNullPrincipal = 0,
+    eContentPrincipal,
+    eExpandedPrincipal,
+    eSystemPrincipal,
+    eKindMax = eSystemPrincipal
+  };
+
+  static constexpr char NullPrincipalKey = '0';
+  static_assert(eNullPrincipal == 0);
+  static constexpr char ContentPrincipalKey = '1';
+  static_assert(eContentPrincipal == 1);
+  static constexpr char ExpandedPrincipalKey = '2';
+  static_assert(eExpandedPrincipal == 2);
+  static constexpr char SystemPrincipalKey = '3';
+  static_assert(eSystemPrincipal == 3);
+
+  template <typename T>
+  bool Is() const {
+    return mKind == T::Kind();
+  }
+
+  template <typename T>
+  T* As() {
+    MOZ_ASSERT(Is<T>());
+    return static_cast<T*>(this);
+  }
+
+  enum DocumentDomainConsideration {
+    DontConsiderDocumentDomain,
+    ConsiderDocumentDomain
+  };
+  bool Subsumes(nsIPrincipal* aOther,
+                DocumentDomainConsideration aConsideration);
+
+  NS_IMETHOD GetOrigin(nsACString& aOrigin) final;
+  NS_IMETHOD GetWebExposedOriginSerialization(nsACString& aOrigin) override;
+  NS_IMETHOD GetOriginNoSuffix(nsACString& aOrigin) final;
+  NS_IMETHOD Equals(nsIPrincipal* other, bool* _retval) final;
+  NS_IMETHOD EqualsConsideringDomain(nsIPrincipal* other, bool* _retval) final;
+  NS_IMETHOD EqualsURI(nsIURI* aOtherURI, bool* _retval) override;
+  NS_IMETHOD EqualsForPermission(nsIPrincipal* other, bool aExactHost,
+                                 bool* _retval) final;
+  NS_IMETHOD Subsumes(nsIPrincipal* other, bool* _retval) final;
+  NS_IMETHOD SubsumesConsideringDomain(nsIPrincipal* other,
+                                       bool* _retval) final;
+  NS_IMETHOD SubsumesConsideringDomainIgnoringFPD(nsIPrincipal* other,
+                                                  bool* _retval) final;
+  NS_IMETHOD CheckMayLoad(nsIURI* uri, bool allowIfInheritsPrincipal) final;
+  NS_IMETHOD CheckMayLoadWithReporting(nsIURI* uri,
+                                       bool allowIfInheritsPrincipal,
+                                       uint64_t innerWindowID) final;
+  NS_IMETHOD GetIsNullPrincipal(bool* aResult) override;
+  NS_IMETHOD GetIsContentPrincipal(bool* aResult) override;
+  NS_IMETHOD GetIsExpandedPrincipal(bool* aResult) override;
+  NS_IMETHOD GetIsSystemPrincipal(bool* aResult) override;
+  NS_IMETHOD GetScheme(nsACString& aScheme) override;
+  NS_IMETHOD SchemeIs(const char* aScheme, bool* aResult) override;
+  NS_IMETHOD IsURIInPrefList(const char* aPref, bool* aResult) override;
+  NS_IMETHOD IsURIInList(const nsACString& aList, bool* aResult) override;
+  NS_IMETHOD IsContentAccessibleAboutURI(bool* aResult) override;
+  NS_IMETHOD IsL10nAllowed(nsIURI* aURI, bool* aResult) override;
+  NS_IMETHOD GetAboutModuleFlags(uint32_t* flags) override;
+  NS_IMETHOD GetOriginAttributes(JSContext* aCx,
+                                 JS::MutableHandle<JS::Value> aVal) final;
+  NS_IMETHOD GetAsciiSpec(nsACString& aSpec) override;
+  NS_IMETHOD GetSpec(nsACString& aSpec) override;
+  NS_IMETHOD GetExposablePrePath(nsACString& aResult) override;
+  NS_IMETHOD GetExposableSpec(nsACString& aSpec) override;
+  NS_IMETHOD GetHostPort(nsACString& aRes) override;
+  NS_IMETHOD GetHost(nsACString& aRes) override;
+  NS_IMETHOD GetPrePath(nsACString& aResult) override;
+  NS_IMETHOD GetFilePath(nsACString& aResult) override;
+  NS_IMETHOD GetOriginSuffix(nsACString& aOriginSuffix) final;
+  NS_IMETHOD GetIsIpAddress(bool* aIsIpAddress) override;
+  NS_IMETHOD GetIsLocalIpAddress(bool* aIsIpAddress) override;
+  NS_IMETHOD GetIsOnion(bool* aIsOnion) override;
+  NS_IMETHOD GetUserContextId(uint32_t* aUserContextId) final;
+  NS_IMETHOD GetPrivateBrowsingId(uint32_t* aPrivateBrowsingId) final;
+  NS_IMETHOD GetIsInPrivateBrowsing(bool* aIsInPrivateBrowsing) final;
+  NS_IMETHOD GetSiteOrigin(nsACString& aSiteOrigin) final;
+  NS_IMETHOD GetSiteOriginNoSuffix(nsACString& aSiteOrigin) override;
+  NS_IMETHOD IsThirdPartyURI(nsIURI* uri, bool* aRes) override;
+  NS_IMETHOD IsThirdPartyPrincipal(nsIPrincipal* uri, bool* aRes) override;
+  NS_IMETHOD IsThirdPartyChannel(nsIChannel* aChannel, bool* aRes) override;
+  NS_IMETHOD GetIsOriginPotentiallyTrustworthy(bool* aResult) override;
+  NS_IMETHOD GetIsLoopbackHost(bool* aResult) override;
+  NS_IMETHOD IsSameOrigin(nsIURI* aURI, bool* aRes) override;
+  NS_IMETHOD GetPrefLightCacheKey(nsIURI* aURI, bool aWithCredentials,
+                                  const OriginAttributes& aOriginAttributes,
+                                  nsACString& _retval) override;
+  NS_IMETHOD HasFirstpartyStorageAccess(mozIDOMWindow* aCheckWindow,
+                                        uint32_t* aRejectedReason,
+                                        bool* aOutAllowed) override;
+  NS_IMETHOD GetAsciiHost(nsACString& aAsciiHost) override;
+  NS_IMETHOD GetLocalStorageQuotaKey(nsACString& aRes) override;
+  NS_IMETHOD CreateReferrerInfo(mozilla::dom::ReferrerPolicy aReferrerPolicy,
+                                nsIReferrerInfo** _retval) override;
+  NS_IMETHOD GetIsScriptAllowedByPolicy(
+      bool* aIsScriptAllowedByPolicy) override;
+  NS_IMETHOD GetStorageOriginKey(nsACString& aOriginKey) override;
+
+  NS_IMETHOD GetNextSubDomainPrincipal(
+      nsIPrincipal** aNextSubDomainPrincipal) override;
+
+  NS_IMETHOD GetPrecursorPrincipal(nsIPrincipal** aPrecursor) override;
+
+  nsresult ToJSON(nsACString& aJSON);
+  nsresult ToJSON(JSONWriter& aWriter);
+  nsresult WriteJSONProperties(JSONWriter& aWriter);
+
+  static already_AddRefed<BasePrincipal> FromJSON(const nsACString& aJSON);
+
+  virtual nsresult WriteJSONInnerProperties(JSONWriter& aWriter);
+
+  virtual bool IsContentPrincipal() const { return false; };
+
+  static BasePrincipal* Cast(nsIPrincipal* aPrin) {
+    return static_cast<BasePrincipal*>(aPrin);
+  }
+
+  static BasePrincipal& Cast(nsIPrincipal& aPrin) {
+    return *static_cast<BasePrincipal*>(&aPrin);
+  }
+
+  static const BasePrincipal* Cast(const nsIPrincipal* aPrin) {
+    return static_cast<const BasePrincipal*>(aPrin);
+  }
+
+  static const BasePrincipal& Cast(const nsIPrincipal& aPrin) {
+    return *static_cast<const BasePrincipal*>(&aPrin);
+  }
+
+  static already_AddRefed<BasePrincipal> CreateContentPrincipal(
+      const nsACString& aOrigin);
+
+
+  static already_AddRefed<BasePrincipal> CreateContentPrincipal(
+      nsIURI* aURI, const OriginAttributes& aAttrs,
+      nsIURI* aInitialDomain = nullptr);
+
+  const OriginAttributes& OriginAttributesRef() final {
+    return mOriginAttributes;
+  }
+  uint32_t UserContextId() const { return mOriginAttributes.mUserContextId; }
+  uint32_t PrivateBrowsingId() const {
+    return mOriginAttributes.mPrivateBrowsingId;
+  }
+
+  PrincipalKind Kind() const { return mKind; }
+
+  already_AddRefed<BasePrincipal> CloneForcingOriginAttributes(
+      const OriginAttributes& aOriginAttributes);
+
+  inline bool FastEquals(nsIPrincipal* aOther);
+  inline bool FastEqualsConsideringDomain(nsIPrincipal* aOther);
+  inline bool FastSubsumes(nsIPrincipal* aOther);
+  inline bool FastSubsumesConsideringDomain(nsIPrincipal* aOther);
+  inline bool FastSubsumesIgnoringFPD(nsIPrincipal* aOther);
+  inline bool FastSubsumesConsideringDomainIgnoringFPD(nsIPrincipal* aOther);
+
+  inline bool IsSystemPrincipal() const;
+
+  nsIPrincipal* PrincipalToInherit(nsIURI* aRequestedURI = nullptr);
+
+  uint32_t GetOriginNoSuffixHash() const { return mOriginNoSuffix->hash(); }
+  uint32_t GetOriginSuffixHash() const { return mOriginSuffix->hash(); }
+
+  virtual nsresult GetSiteIdentifier(SiteIdentifier& aSite) = 0;
+
+ protected:
+  BasePrincipal(PrincipalKind aKind, const nsACString& aOriginNoSuffix,
+                const OriginAttributes& aOriginAttributes);
+  BasePrincipal(BasePrincipal* aOther,
+                const OriginAttributes& aOriginAttributes);
+
+  virtual ~BasePrincipal();
+
+  virtual bool SubsumesInternal(nsIPrincipal* aOther,
+                                DocumentDomainConsideration aConsider) = 0;
+
+  virtual bool MayLoadInternal(nsIURI* aURI) = 0;
+  friend class ::ExpandedPrincipal;
+
+  nsresult CheckMayLoadHelper(nsIURI* aURI, bool aAllowIfInheritsPrincipal,
+                              bool aReport, uint64_t aInnerWindowID);
+
+  void SetHasExplicitDomain() { mHasExplicitDomain = true; }
+  bool GetHasExplicitDomain() { return mHasExplicitDomain; }
+
+  template <typename SerializedKey>
+  struct KeyValT {
+    static_assert(sizeof(SerializedKey) == 1,
+                  "SerializedKey should be a uint8_t");
+    SerializedKey key;
+    bool valueWasSerialized;
+    nsCString value;
+  };
+
+  class Deserializer : public nsISerializable {
+   public:
+    NS_DECL_ISUPPORTS
+    NS_IMETHOD Write(nsIObjectOutputStream* aStream) override;
+
+   protected:
+    virtual ~Deserializer() = default;
+    RefPtr<BasePrincipal> mPrincipal;
+  };
+
+ private:
+  static constexpr Span<const char> JSONEnumKeyStrings[4] = {
+      MakeStringSpan("0"),
+      MakeStringSpan("1"),
+      MakeStringSpan("2"),
+      MakeStringSpan("3"),
+  };
+
+  static void WriteJSONProperty(JSONWriter& aWriter,
+                                const Span<const char>& aKey,
+                                const nsCString& aValue);
+
+ protected:
+  template <size_t EnumValue>
+  static inline constexpr const Span<const char>& JSONEnumKeyString() {
+    static_assert(EnumValue < std::size(JSONEnumKeyStrings));
+    return JSONEnumKeyStrings[EnumValue];
+  }
+  template <size_t EnumValue>
+  static void WriteJSONProperty(JSONWriter& aWriter, const nsCString& aValue) {
+    WriteJSONProperty(aWriter, JSONEnumKeyString<EnumValue>(), aValue);
+  }
+
+ private:
+  static already_AddRefed<BasePrincipal> CreateContentPrincipal(
+      nsIURI* aURI, const OriginAttributes& aAttrs,
+      const nsACString& aOriginNoSuffix, nsIURI* aInitialDomain);
+
+  bool FastSubsumesIgnoringFPD(nsIPrincipal* aOther,
+                               DocumentDomainConsideration aConsideration);
+
+  const RefPtr<nsAtom> mOriginNoSuffix;
+  const RefPtr<nsAtom> mOriginSuffix;
+
+  const OriginAttributes mOriginAttributes;
+  const PrincipalKind mKind;
+  std::atomic<bool> mHasExplicitDomain;
+};
+
+inline bool BasePrincipal::FastEquals(nsIPrincipal* aOther) {
+  MOZ_ASSERT(aOther);
+
+  auto other = Cast(aOther);
+  if (Kind() != other->Kind()) {
+    return false;
+  }
+
+  if (Kind() == eSystemPrincipal) {
+    return this == other;
+  }
+
+  if (Kind() == eContentPrincipal || Kind() == eNullPrincipal) {
+    return mOriginNoSuffix == other->mOriginNoSuffix &&
+           mOriginSuffix == other->mOriginSuffix;
+  }
+
+  MOZ_ASSERT(Kind() == eExpandedPrincipal);
+  return mOriginNoSuffix == other->mOriginNoSuffix;
+}
+
+inline bool BasePrincipal::FastEqualsConsideringDomain(nsIPrincipal* aOther) {
+  MOZ_ASSERT(aOther);
+
+  auto other = Cast(aOther);
+  if (!mHasExplicitDomain && !other->mHasExplicitDomain) {
+    return FastEquals(aOther);
+  }
+
+  if (Kind() != other->Kind()) {
+    return false;
+  }
+
+  MOZ_ASSERT(IsContentPrincipal(),
+             "Only content principals can set mHasExplicitDomain");
+
+  return Subsumes(aOther, ConsiderDocumentDomain) &&
+         other->Subsumes(this, ConsiderDocumentDomain);
+}
+
+inline bool BasePrincipal::FastSubsumes(nsIPrincipal* aOther) {
+  MOZ_ASSERT(aOther);
+
+  if (FastEquals(aOther)) {
+    return true;
+  }
+
+  return Subsumes(aOther, DontConsiderDocumentDomain);
+}
+
+inline bool BasePrincipal::FastSubsumesConsideringDomain(nsIPrincipal* aOther) {
+  MOZ_ASSERT(aOther);
+
+  if (!mHasExplicitDomain && !Cast(aOther)->mHasExplicitDomain) {
+    return FastSubsumes(aOther);
+  }
+
+  return Subsumes(aOther, ConsiderDocumentDomain);
+}
+
+inline bool BasePrincipal::FastSubsumesIgnoringFPD(nsIPrincipal* aOther) {
+  return FastSubsumesIgnoringFPD(aOther, DontConsiderDocumentDomain);
+}
+
+inline bool BasePrincipal::FastSubsumesConsideringDomainIgnoringFPD(
+    nsIPrincipal* aOther) {
+  return FastSubsumesIgnoringFPD(aOther, ConsiderDocumentDomain);
+}
+
+inline bool BasePrincipal::IsSystemPrincipal() const {
+  return Kind() == eSystemPrincipal;
+}
+
+}  
+
+inline bool nsIPrincipal::IsSystemPrincipal() const {
+  return mozilla::BasePrincipal::Cast(this)->IsSystemPrincipal();
+}
+
+#endif /* mozilla_BasePrincipal_h */

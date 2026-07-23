@@ -1,0 +1,74 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_IMAGETYPES_H
+#define GFX_IMAGETYPES_H
+
+#include <stdint.h>  // for uint32_t
+#include "mozilla/Maybe.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/Variant.h"
+
+namespace mozilla {
+
+enum class ImageFormat {
+  PLANAR_YCBCR,
+
+  NV_IMAGE,
+
+  SHARED_RGB,
+
+  MOZ2D_SURFACE,
+
+  MAC_IOSURFACE,
+
+  SURFACE_TEXTURE,
+
+  D3D9_RGB32_TEXTURE,
+
+  OVERLAY_IMAGE,
+
+  D3D11_SHARE_HANDLE_TEXTURE,
+
+  D3D11_TEXTURE_ZERO_COPY,
+
+  TEXTURE_WRAPPER,
+
+  GPU_VIDEO,
+
+  DMABUF,
+
+  DCOMP_SURFACE,
+
+  ANDROID_IMAGE_READER,
+};
+
+enum class StereoMode {
+  MONO,
+  LEFT_RIGHT,
+  RIGHT_LEFT,
+  BOTTOM_TOP,
+  TOP_BOTTOM,
+  MAX,
+};
+
+namespace layers {
+
+using ContainerFrameID = uint32_t;
+constexpr ContainerFrameID kContainerFrameID_Invalid = 0;
+
+using ContainerProducerID = uint32_t;
+constexpr ContainerProducerID kContainerProducerID_Invalid = 0;
+
+using ContainerCaptureTime = Variant<Nothing, TimeStamp, int64_t>;
+
+using ContainerReceiveTime = Maybe<int64_t>;
+
+using ContainerRtpTimestamp = Maybe<uint32_t>;
+
+}  
+
+}  
+
+#endif

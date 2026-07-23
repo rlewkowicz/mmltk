@@ -1,0 +1,560 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(js_Utility_h)
+#define js_Utility_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/CheckedArithmetic.h"
+#include "mozilla/Likely.h"
+#include "mozilla/UniquePtr.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <type_traits>
+#include <utility>
+
+#include "jstypes.h"
+#include "mozmemory.h"
+#include "js/TypeDecls.h"
+
+namespace JS {}
+
+namespace mozilla {}
+
+namespace js {}
+
+[[noreturn]] extern MOZ_COLD JS_PUBLIC_API void JS_Assert(const char* s,
+                                                          const char* file,
+                                                          int ln);
+
+#if defined JS_USE_CUSTOM_ALLOCATOR
+#  include "jscustomallocator.h"
+#else
+
+namespace js {
+
+enum ThreadType {
+  THREAD_TYPE_NONE = 0,                       
+  THREAD_TYPE_MAIN,                           
+  THREAD_TYPE_WASM_COMPILE_TIER1,             
+  THREAD_TYPE_WASM_COMPILE_TIER2,             
+  THREAD_TYPE_BASELINE,                       
+  THREAD_TYPE_ION,                            
+  THREAD_TYPE_COMPRESS,                       
+  THREAD_TYPE_GCPARALLEL,                     
+  THREAD_TYPE_PROMISE_TASK,                   
+  THREAD_TYPE_ION_FREE,                       
+  THREAD_TYPE_WASM_GENERATOR_COMPLETE_TIER2,  
+  THREAD_TYPE_WASM_COMPILE_PARTIAL_TIER2,     
+  THREAD_TYPE_WORKER,                         
+  THREAD_TYPE_DELAZIFY,                       
+  THREAD_TYPE_DELAZIFY_FREE,                  
+  THREAD_TYPE_MAX  
+};
+
+namespace oom {
+
+#if defined(DEBUG) || defined(JS_OOM_BREAKPOINT)
+
+const ThreadType FirstThreadTypeToTest = THREAD_TYPE_MAIN;
+const ThreadType LastThreadTypeToTest = THREAD_TYPE_WASM_COMPILE_PARTIAL_TIER2;
+
+extern bool InitThreadType(void);
+extern void SetThreadType(ThreadType);
+extern JS_PUBLIC_API uint32_t GetThreadType(void);
+
+#else
+
+inline bool InitThreadType(void) { return true; }
+inline void SetThreadType(ThreadType t) {};
+inline uint32_t GetThreadType(void) { return 0; }
+inline uint32_t GetAllocationThreadType(void) { return 0; }
+inline uint32_t GetStackCheckThreadType(void) { return 0; }
+inline uint32_t GetInterruptCheckThreadType(void) { return 0; }
+
+#endif
+
+} 
+} 
+
+#if defined(DEBUG) || defined(JS_OOM_BREAKPOINT)
+
+#if defined(JS_OOM_BREAKPOINT)
+#if defined(_MSC_VER)
+static MOZ_NEVER_INLINE void js_failedAllocBreakpoint() {
+  __asm {}
+  ;
+}
+#else
+static MOZ_NEVER_INLINE void js_failedAllocBreakpoint() { asm(""); }
+#endif
+#      define JS_OOM_CALL_BP_FUNC() js_failedAllocBreakpoint()
+#else
+#      define JS_OOM_CALL_BP_FUNC() \
+        do {                        \
+        } while (0)
+#endif
+
+namespace js {
+namespace oom {
+
+class FailureSimulator {
+ public:
+  enum class Kind : uint8_t { Nothing, OOM, StackOOM, Interrupt };
+
+ private:
+  Kind kind_ = Kind::Nothing;
+  uint32_t targetThread_ = 0;
+  uint64_t maxChecks_ = UINT64_MAX;
+  uint64_t counter_ = 0;
+  bool failAlways_ = true;
+  bool inUnsafeRegion_ = false;
+
+ public:
+  uint64_t maxChecks() const { return maxChecks_; }
+  uint64_t counter() const { return counter_; }
+  void setInUnsafeRegion(bool b) {
+    MOZ_ASSERT(inUnsafeRegion_ != b);
+    inUnsafeRegion_ = b;
+  }
+  uint32_t targetThread() const { return targetThread_; }
+  bool isThreadSimulatingAny() const {
+    return targetThread_ && targetThread_ == js::oom::GetThreadType() &&
+           !inUnsafeRegion_;
+  }
+  bool isThreadSimulating(Kind kind) const {
+    return kind_ == kind && isThreadSimulatingAny();
+  }
+  bool isSimulatedFailure(Kind kind) const {
+    if (!isThreadSimulating(kind)) {
+      return false;
+    }
+    return counter_ == maxChecks_ || (counter_ > maxChecks_ && failAlways_);
+  }
+  bool hadFailure(Kind kind) const {
+    return kind_ == kind && counter_ >= maxChecks_;
+  }
+  bool shouldFail(Kind kind) {
+    if (!isThreadSimulating(kind)) {
+      return false;
+    }
+    counter_++;
+    if (isSimulatedFailure(kind)) {
+      JS_OOM_CALL_BP_FUNC();
+      return true;
+    }
+    return false;
+  }
+
+  void simulateFailureAfter(Kind kind, uint64_t checks, uint32_t thread,
+                            bool always);
+  void reset();
+};
+extern JS_PUBLIC_DATA FailureSimulator simulator;
+
+inline bool IsSimulatedOOMAllocation() {
+  return simulator.isSimulatedFailure(FailureSimulator::Kind::OOM);
+}
+
+inline bool ShouldFailWithOOM() {
+  return simulator.shouldFail(FailureSimulator::Kind::OOM);
+}
+
+inline bool HadSimulatedOOM() {
+  return simulator.hadFailure(FailureSimulator::Kind::OOM);
+}
+
+
+inline bool IsSimulatedStackOOMCheck() {
+  return simulator.isSimulatedFailure(FailureSimulator::Kind::StackOOM);
+}
+
+inline bool ShouldFailWithStackOOM() {
+  return simulator.shouldFail(FailureSimulator::Kind::StackOOM);
+}
+
+inline bool HadSimulatedStackOOM() {
+  return simulator.hadFailure(FailureSimulator::Kind::StackOOM);
+}
+
+
+inline bool IsSimulatedInterruptCheck() {
+  return simulator.isSimulatedFailure(FailureSimulator::Kind::Interrupt);
+}
+
+inline bool ShouldFailWithInterrupt() {
+  return simulator.shouldFail(FailureSimulator::Kind::Interrupt);
+}
+
+inline bool HadSimulatedInterrupt() {
+  return simulator.hadFailure(FailureSimulator::Kind::Interrupt);
+}
+
+} 
+} 
+
+#    define JS_OOM_POSSIBLY_FAIL()                        \
+      do {                                                \
+        if (js::oom::ShouldFailWithOOM()) return nullptr; \
+      } while (0)
+
+#    define JS_OOM_POSSIBLY_FAIL_BOOL()                 \
+      do {                                              \
+        if (js::oom::ShouldFailWithOOM()) return false; \
+      } while (0)
+
+#    define JS_STACK_OOM_POSSIBLY_FAIL()                     \
+      do {                                                   \
+        if (js::oom::ShouldFailWithStackOOM()) return false; \
+      } while (0)
+
+#    define JS_INTERRUPT_POSSIBLY_FAIL()                             \
+      do {                                                           \
+        if (MOZ_UNLIKELY(js::oom::ShouldFailWithInterrupt())) {      \
+          cx->requestInterrupt(js::InterruptReason::CallbackUrgent); \
+          return cx->handleInterrupt();                              \
+        }                                                            \
+      } while (0)
+
+#else
+
+#    define JS_OOM_POSSIBLY_FAIL() \
+      do {                         \
+      } while (0)
+#    define JS_OOM_POSSIBLY_FAIL_BOOL() \
+      do {                              \
+      } while (0)
+#    define JS_STACK_OOM_POSSIBLY_FAIL() \
+      do {                               \
+      } while (0)
+#    define JS_INTERRUPT_POSSIBLY_FAIL() \
+      do {                               \
+      } while (0)
+namespace js {
+namespace oom {
+static inline bool IsSimulatedOOMAllocation() { return false; }
+static inline bool ShouldFailWithOOM() { return false; }
+} 
+} 
+
+#endif
+
+#    define JS_CHECK_LARGE_ALLOC(x) \
+      do {                          \
+      } while (0)
+
+namespace js {
+
+struct MOZ_RAII JS_PUBLIC_DATA AutoEnterOOMUnsafeRegion {
+  [[noreturn]] MOZ_COLD void crash(const char* reason) { crash_impl(reason); }
+  [[noreturn]] MOZ_COLD void crash(size_t size, const char* reason) {
+    crash_impl(reason);
+  }
+
+  using AnnotateOOMAllocationSizeCallback = void (*)(size_t);
+  static mozilla::Atomic<AnnotateOOMAllocationSizeCallback, mozilla::Relaxed>
+      annotateOOMSizeCallback;
+  static void setAnnotateOOMAllocationSizeCallback(
+      AnnotateOOMAllocationSizeCallback callback) {
+    annotateOOMSizeCallback = callback;
+  }
+
+#if defined(DEBUG) || defined(JS_OOM_BREAKPOINT)
+  AutoEnterOOMUnsafeRegion()
+      : oomEnabled_(oom::simulator.isThreadSimulatingAny()) {
+    if (oomEnabled_) {
+      MOZ_ALWAYS_TRUE(owner_.compareExchange(nullptr, this));
+      oom::simulator.setInUnsafeRegion(true);
+    }
+  }
+
+  ~AutoEnterOOMUnsafeRegion() {
+    if (oomEnabled_) {
+      oom::simulator.setInUnsafeRegion(false);
+      MOZ_ALWAYS_TRUE(owner_.compareExchange(this, nullptr));
+    }
+  }
+
+ private:
+  static mozilla::Atomic<AutoEnterOOMUnsafeRegion*> owner_;
+
+  bool oomEnabled_;
+#endif
+ private:
+  [[noreturn]] static MOZ_COLD void crash_impl(const char* reason);
+  [[noreturn]] static MOZ_COLD void crash_impl(size_t size, const char* reason);
+};
+
+} 
+
+
+namespace js {
+
+extern JS_PUBLIC_DATA arena_id_t MallocArena;
+extern JS_PUBLIC_DATA arena_id_t BackgroundMallocArena;
+
+extern JS_PUBLIC_DATA arena_id_t ArrayBufferContentsArena;
+extern JS_PUBLIC_DATA arena_id_t StringBufferArena;
+
+extern void InitMallocAllocator();
+extern void ShutDownMallocAllocator();
+
+extern void AssertJSStringBufferInCorrectArena(const void* ptr);
+
+} 
+
+static inline void* js_arena_malloc(arena_id_t arena, size_t bytes) {
+  JS_OOM_POSSIBLY_FAIL();
+  JS_CHECK_LARGE_ALLOC(bytes);
+  return moz_arena_malloc(arena, bytes);
+}
+
+static inline void* js_malloc(size_t bytes) {
+  return js_arena_malloc(js::MallocArena, bytes);
+}
+
+static inline void* js_arena_calloc(arena_id_t arena, size_t bytes) {
+  JS_OOM_POSSIBLY_FAIL();
+  JS_CHECK_LARGE_ALLOC(bytes);
+  return moz_arena_calloc(arena, bytes, 1);
+}
+
+static inline void* js_arena_calloc(arena_id_t arena, size_t nmemb,
+                                    size_t size) {
+  JS_OOM_POSSIBLY_FAIL();
+  JS_CHECK_LARGE_ALLOC(nmemb * size);
+  return moz_arena_calloc(arena, nmemb, size);
+}
+
+static inline void* js_calloc(size_t bytes) {
+  return js_arena_calloc(js::MallocArena, bytes);
+}
+
+static inline void* js_calloc(size_t nmemb, size_t size) {
+  return js_arena_calloc(js::MallocArena, nmemb, size);
+}
+
+static inline void* js_arena_realloc(arena_id_t arena, void* p, size_t bytes) {
+  MOZ_ASSERT(bytes != 0);
+
+  JS_OOM_POSSIBLY_FAIL();
+  JS_CHECK_LARGE_ALLOC(bytes);
+  return moz_arena_realloc(arena, p, bytes);
+}
+
+static inline void* js_realloc(void* p, size_t bytes) {
+  return js_arena_realloc(js::MallocArena, p, bytes);
+}
+
+static inline void js_free(void* p) {
+  free(p);
+}
+#endif
+
+#include <new>
+
+
+#define JS_DECLARE_NEW_METHODS(NEWNAME, ALLOCATOR, QUALIFIERS)              \
+  template <class T, typename... Args>                                      \
+  QUALIFIERS T* MOZ_HEAP_ALLOCATOR NEWNAME(Args&&... args) {                \
+    static_assert(                                                          \
+        alignof(T) <= alignof(max_align_t),                                 \
+        "over-aligned type is not supported by JS_DECLARE_NEW_METHODS");    \
+    void* memory = ALLOCATOR(sizeof(T));                                    \
+    return MOZ_LIKELY(memory) ? new (memory) T(std::forward<Args>(args)...) \
+                              : nullptr;                                    \
+  }
+
+#define JS_DECLARE_NEW_ARENA_METHODS(NEWNAME, ALLOCATOR, QUALIFIERS)           \
+  template <class T, typename... Args>                                         \
+  QUALIFIERS T* MOZ_HEAP_ALLOCATOR NEWNAME(arena_id_t arena, Args&&... args) { \
+    static_assert(                                                             \
+        alignof(T) <= alignof(max_align_t),                                    \
+        "over-aligned type is not supported by JS_DECLARE_NEW_ARENA_METHODS"); \
+    void* memory = ALLOCATOR(arena, sizeof(T));                                \
+    return MOZ_LIKELY(memory) ? new (memory) T(std::forward<Args>(args)...)    \
+                              : nullptr;                                       \
+  }
+
+#define JS_DECLARE_MAKE_METHODS(MAKENAME, NEWNAME, QUALIFIERS)             \
+  template <class T, typename... Args>                                     \
+  QUALIFIERS mozilla::UniquePtr<T, JS::DeletePolicy<T>> MOZ_HEAP_ALLOCATOR \
+  MAKENAME(Args&&... args) {                                               \
+    T* ptr = NEWNAME<T>(std::forward<Args>(args)...);                      \
+    return mozilla::UniquePtr<T, JS::DeletePolicy<T>>(ptr);                \
+  }
+
+JS_DECLARE_NEW_METHODS(js_new, js_malloc, static MOZ_ALWAYS_INLINE)
+JS_DECLARE_NEW_ARENA_METHODS(js_arena_new, js_arena_malloc,
+                             static MOZ_ALWAYS_INLINE)
+
+namespace js {
+
+template <typename T>
+[[nodiscard]] inline bool CalculateAllocSize(size_t numElems,
+                                             size_t* bytesOut) {
+  return mozilla::SafeMul(numElems, sizeof(T), bytesOut);
+}
+
+template <typename T, typename Extra>
+[[nodiscard]] inline bool CalculateAllocSizeWithExtra(size_t numExtra,
+                                                      size_t* bytesOut) {
+  size_t tmp;
+  return mozilla::SafeMul(numExtra, sizeof(Extra), &tmp) &&
+         mozilla::SafeAdd(sizeof(T), tmp, bytesOut);
+}
+
+} 
+
+template <class T>
+static MOZ_ALWAYS_INLINE void js_delete(const T* p) {
+  if (p) {
+    p->~T();
+    js_free(const_cast<T*>(p));
+  }
+}
+
+template <class T>
+static MOZ_ALWAYS_INLINE void js_delete_poison(const T* p) {
+  if (p) {
+    p->~T();
+    memset(static_cast<void*>(const_cast<T*>(p)), 0x3B, sizeof(T));
+    js_free(const_cast<T*>(p));
+  }
+}
+
+template <class T>
+static MOZ_ALWAYS_INLINE T* js_pod_arena_malloc(arena_id_t arena,
+                                                size_t numElems) {
+  size_t bytes;
+  if (MOZ_UNLIKELY(!js::CalculateAllocSize<T>(numElems, &bytes))) {
+    return nullptr;
+  }
+  return static_cast<T*>(js_arena_malloc(arena, bytes));
+}
+
+template <class T>
+static MOZ_ALWAYS_INLINE T* js_pod_malloc(size_t numElems) {
+  return js_pod_arena_malloc<T>(js::MallocArena, numElems);
+}
+
+template <class T>
+static MOZ_ALWAYS_INLINE T* js_pod_arena_calloc(arena_id_t arena,
+                                                size_t numElems) {
+  size_t bytes;
+  if (MOZ_UNLIKELY(!js::CalculateAllocSize<T>(numElems, &bytes))) {
+    return nullptr;
+  }
+  return static_cast<T*>(js_arena_calloc(arena, bytes, 1));
+}
+
+template <class T>
+static MOZ_ALWAYS_INLINE T* js_pod_calloc(size_t numElems) {
+  return js_pod_arena_calloc<T>(js::MallocArena, numElems);
+}
+
+template <class T>
+static MOZ_ALWAYS_INLINE T* js_pod_arena_realloc(arena_id_t arena, T* prior,
+                                                 size_t oldSize,
+                                                 size_t newSize) {
+  [[maybe_unused]] size_t tmp;
+  MOZ_ASSERT(mozilla::SafeMul(oldSize, sizeof(T), &tmp));
+  size_t bytes;
+  if (MOZ_UNLIKELY(!js::CalculateAllocSize<T>(newSize, &bytes))) {
+    return nullptr;
+  }
+  return static_cast<T*>(js_arena_realloc(arena, prior, bytes));
+}
+
+template <class T>
+static MOZ_ALWAYS_INLINE T* js_pod_realloc(T* prior, size_t oldSize,
+                                           size_t newSize) {
+  return js_pod_arena_realloc<T>(js::MallocArena, prior, oldSize, newSize);
+}
+
+template <class T, std::integral N>
+  requires(sizeof(N) > sizeof(size_t))
+static T* js_pod_arena_malloc(arena_id_t arena, N numElems) = delete;
+
+template <class T, std::integral N>
+  requires(sizeof(N) > sizeof(size_t))
+static T* js_pod_malloc(N numElems) = delete;
+
+template <class T, std::integral N>
+  requires(sizeof(N) > sizeof(size_t))
+static T* js_pod_arena_calloc(arena_id_t arena, N numElems) = delete;
+
+template <class T, std::integral N>
+  requires(sizeof(N) > sizeof(size_t))
+static T* js_pod_calloc(N numElems) = delete;
+
+template <class T, std::integral N>
+  requires(sizeof(N) > sizeof(size_t))
+static T* js_pod_arena_realloc(arena_id_t arena, T* prior, N oldSize,
+                               N newSize) = delete;
+
+template <class T, std::integral N>
+  requires(sizeof(N) > sizeof(size_t))
+static T* js_pod_realloc(T* prior, N oldSize, N newSize) = delete;
+
+namespace JS {
+
+template <typename T>
+struct DeletePolicy {
+  constexpr DeletePolicy() = default;
+
+  template <typename U>
+  MOZ_IMPLICIT DeletePolicy(
+      DeletePolicy<U> other,
+      std::enable_if_t<std::is_convertible_v<U*, T*>, int> dummy = 0) {}
+
+  void operator()(const T* ptr) { js_delete(const_cast<T*>(ptr)); }
+};
+
+struct FreePolicy {
+  void operator()(const void* ptr) { js_free(const_cast<void*>(ptr)); }
+};
+
+using UniqueChars = mozilla::UniquePtr<char[], JS::FreePolicy>;
+using UniqueTwoByteChars = mozilla::UniquePtr<char16_t[], JS::FreePolicy>;
+using UniqueLatin1Chars = mozilla::UniquePtr<JS::Latin1Char[], JS::FreePolicy>;
+using UniqueWideChars = mozilla::UniquePtr<wchar_t[], JS::FreePolicy>;
+
+}  
+
+#if !defined(HAVE_STATIC_ANNOTATIONS)
+#  define HAVE_STATIC_ANNOTATIONS
+#if defined(XGILL_PLUGIN)
+#    define STATIC_PRECONDITION(COND) __attribute__((precondition(#COND)))
+#    define STATIC_PRECONDITION_ASSUME(COND) \
+      __attribute__((precondition_assume(#COND)))
+#    define STATIC_POSTCONDITION(COND) __attribute__((postcondition(#COND)))
+#    define STATIC_POSTCONDITION_ASSUME(COND) \
+      __attribute__((postcondition_assume(#COND)))
+#    define STATIC_INVARIANT(COND) __attribute__((invariant(#COND)))
+#    define STATIC_INVARIANT_ASSUME(COND) \
+      __attribute__((invariant_assume(#COND)))
+#    define STATIC_ASSUME(COND)                                          \
+      JS_BEGIN_MACRO                                                     \
+        __attribute__((assume_static(#COND), unused)) int STATIC_PASTE1( \
+            assume_static_, __COUNTER__);                                \
+      JS_END_MACRO
+#else
+#    define STATIC_PRECONDITION(COND)         /* nothing */
+#    define STATIC_PRECONDITION_ASSUME(COND)  /* nothing */
+#    define STATIC_POSTCONDITION(COND)        /* nothing */
+#    define STATIC_POSTCONDITION_ASSUME(COND) /* nothing */
+#    define STATIC_INVARIANT(COND)            /* nothing */
+#    define STATIC_INVARIANT_ASSUME(COND)     /* nothing */
+#    define STATIC_ASSUME(COND)    \
+      JS_BEGIN_MACRO  \
+      JS_END_MACRO
+#endif
+#  define STATIC_SKIP_INFERENCE STATIC_INVARIANT(skip_inference())
+#endif
+
+#endif

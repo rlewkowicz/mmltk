@@ -1,0 +1,672 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_USER_FONT_SET_H
+#define GFX_USER_FONT_SET_H
+
+#include <new>
+#include "PLDHashTable.h"
+#include "gfxFontEntry.h"
+#include "gfxFontUtils.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/FontPropertyTypes.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/RecursiveMutex.h"
+#include "mozilla/RefPtr.h"
+#include "nsCOMPtr.h"
+#include "nsHashKeys.h"
+#include "nsIMemoryReporter.h"
+#include "nsIObserver.h"
+#include "nsIScriptError.h"
+#include "nsISupports.h"
+#include "nsRefPtrHashtable.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nscore.h"
+
+#include <utility>                // for move, forward
+#include "MainThreadUtils.h"      // for NS_IsMainThread
+#include "gfxFontFeatures.h"      // for gfxFontFeature
+#include "gfxFontSrcPrincipal.h"  // for gfxFontSrcPrincipal
+#include "gfxFontSrcURI.h"        // for gfxFontSrcURI
+#include "mozilla/Assertions.h"  // for AssertionConditionType, MOZ_ASSERT_HELPER2, MOZ_ASSERT, MOZ_ASSERT_UNREACHABLE, MOZ_ASSER...
+#include "mozilla/HashFunctions.h"      // for HashBytes, HashGeneric
+#include "mozilla/TimeStamp.h"          // for TimeStamp
+#include "mozilla/gfx/FontVariation.h"  // for FontVariation
+#include "nsDebug.h"                    // for NS_WARNING
+#include "nsIReferrerInfo.h"            // for nsIReferrerInfo
+
+class gfxFont;
+class gfxUserFontSet;
+class nsIFontLoadCompleteCallback;
+class nsIRunnable;
+struct gfxFontStyle;
+struct gfxFontVariationAxis;
+struct gfxFontVariationInstance;
+template <class T>
+class nsMainThreadPtrHandle;
+
+namespace mozilla {
+class LogModule;
+class PostTraversalTask;
+enum class StyleFontDisplay : uint8_t;
+}  
+class nsFontFaceLoader;
+
+
+class gfxFontFaceBufferSource {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(gfxFontFaceBufferSource)
+ public:
+  virtual void TakeBuffer(uint8_t*& aBuffer, uint32_t& aLength) = 0;
+
+ protected:
+  virtual ~gfxFontFaceBufferSource() = default;
+};
+
+struct gfxFontFaceSrc {
+  enum SourceType { eSourceType_Local, eSourceType_URL, eSourceType_Buffer };
+
+  SourceType mSourceType;
+
+  bool mUseOriginPrincipal = false;
+
+  mozilla::StyleFontFaceSourceTechFlags mTechFlags;
+
+  mozilla::StyleFontFaceSourceFormatKeyword mFormatHint;
+
+  nsCString mLocalName;                     
+  RefPtr<gfxFontSrcURI> mURI;               
+  nsCOMPtr<nsIReferrerInfo> mReferrerInfo;  
+  RefPtr<gfxFontSrcPrincipal>
+      mOriginPrincipal;  
+
+  RefPtr<gfxFontFaceBufferSource> mBuffer;
+
+  already_AddRefed<gfxFontSrcPrincipal> LoadPrincipal(
+      const gfxUserFontSet&) const;
+};
+
+inline bool operator==(const gfxFontFaceSrc& a, const gfxFontFaceSrc& b) {
+  if (a.mSourceType != b.mSourceType) {
+    return false;
+  }
+  switch (a.mSourceType) {
+    case gfxFontFaceSrc::eSourceType_Local:
+      return a.mLocalName == b.mLocalName;
+    case gfxFontFaceSrc::eSourceType_URL: {
+      if (a.mUseOriginPrincipal != b.mUseOriginPrincipal) {
+        return false;
+      }
+      if (a.mUseOriginPrincipal) {
+        if (!a.mOriginPrincipal->Equals(b.mOriginPrincipal)) {
+          return false;
+        }
+      }
+      bool equals;
+      return a.mFormatHint == b.mFormatHint && a.mTechFlags == b.mTechFlags &&
+             (a.mURI == b.mURI || a.mURI->Equals(b.mURI)) &&
+             NS_SUCCEEDED(a.mReferrerInfo->Equals(b.mReferrerInfo, &equals)) &&
+             equals;
+    }
+    case gfxFontFaceSrc::eSourceType_Buffer:
+      return a.mBuffer == b.mBuffer;
+  }
+  NS_WARNING("unexpected mSourceType");
+  return false;
+}
+
+class gfxUserFontData {
+ public:
+  gfxUserFontData()
+      : mSrcIndex(0),
+        mMetaOrigLen(0),
+        mTechFlags(mozilla::StyleFontFaceSourceTechFlags::Empty()),
+        mFormatHint(mozilla::StyleFontFaceSourceFormatKeyword::None),
+        mCompression(kUnknownCompression),
+        mPrivate(false),
+        mIsBuffer(false) {}
+  virtual ~gfxUserFontData() = default;
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+  nsTArray<uint8_t> mMetadata;  
+  RefPtr<gfxFontSrcURI> mURI;   
+  RefPtr<gfxFontSrcPrincipal>
+      mPrincipal;         
+  nsCString mLocalName;   
+  nsCString mRealName;    
+  uint32_t mSrcIndex;     
+  uint32_t mMetaOrigLen;  
+  mozilla::StyleFontFaceSourceTechFlags mTechFlags;  
+  mozilla::StyleFontFaceSourceFormatKeyword
+      mFormatHint;       
+  uint8_t mCompression;  
+  bool mPrivate;         
+  bool mIsBuffer;        
+
+  enum {
+    kUnknownCompression = 0,
+    kZlibCompression = 1,
+    kBrotliCompression = 2
+  };
+};
+
+
+class gfxUserFontFamily : public gfxFontFamily {
+ public:
+  friend class gfxUserFontSet;
+
+  explicit gfxUserFontFamily(const nsACString& aName)
+      : gfxFontFamily(aName, FontVisibility::Webfont) {}
+
+  virtual ~gfxUserFontFamily();
+
+  void AddFontEntry(gfxFontEntry* aFontEntry) {
+    nsCString entryName = aFontEntry->FamilyName();
+
+    mozilla::AutoWriteLock lock(mLock);
+    MOZ_ASSERT(!mIsSimpleFamily, "not valid for user-font families");
+
+    if (!mAvailableFonts.IsEmpty()) {
+      if (mAvailableFonts.LastElement() == aFontEntry) {
+        return;
+      }
+    }
+
+    mAvailableFonts.AppendElement(aFontEntry);
+
+    if (entryName.IsEmpty()) {
+      aFontEntry->SetFamilyName(Name());
+    } else {
+#ifdef DEBUG
+      nsCString thisName = Name();
+      ToLowerCase(thisName);
+      ToLowerCase(entryName);
+      MOZ_ASSERT(thisName.Equals(entryName));
+#endif
+    }
+    ResetCharacterMap();
+  }
+
+  void RemoveFontEntry(gfxFontEntry* aFontEntry) {
+    mozilla::AutoWriteLock lock(mLock);
+    MOZ_ASSERT(!mIsSimpleFamily, "not valid for user-font families");
+    mAvailableFonts.RemoveElement(aFontEntry);
+  }
+
+  void DetachFontEntries() {
+    mozilla::AutoWriteLock lock(mLock);
+    mAvailableFonts.Clear();
+  }
+};
+
+class gfxUserFontEntry;
+class gfxOTSMessageContext;
+
+struct gfxUserFontAttributes {
+  using FontStretch = mozilla::FontStretch;
+  using StretchRange = mozilla::StretchRange;
+  using FontSlantStyle = mozilla::FontSlantStyle;
+  using SlantStyleRange = mozilla::SlantStyleRange;
+  using FontWeight = mozilla::FontWeight;
+  using WeightRange = mozilla::WeightRange;
+  using StyleFontFaceSourceListComponent =
+      mozilla::StyleFontFaceSourceListComponent;
+  using RangeFlags = gfxFontEntry::RangeFlags;
+
+  WeightRange mWeight = WeightRange(FontWeight::NORMAL);
+  StretchRange mStretch = StretchRange(FontStretch::NORMAL);
+  SlantStyleRange mStyle = SlantStyleRange(FontSlantStyle::NORMAL);
+  RangeFlags mRangeFlags = RangeFlags::eAutoWeight | RangeFlags::eAutoStretch |
+                           RangeFlags::eAutoSlantStyle;
+  mozilla::StyleFontDisplay mFontDisplay = mozilla::StyleFontDisplay::Auto;
+  float mAscentOverride = -1.0;
+  float mDescentOverride = -1.0;
+  float mLineGapOverride = -1.0;
+  float mSizeAdjust = 1.0;
+  uint32_t mLanguageOverride = NO_FONT_LANGUAGE_OVERRIDE;
+  nsTArray<gfxFontFeature> mFeatureSettings;
+  nsTArray<gfxFontVariation> mVariationSettings;
+  RefPtr<gfxCharacterMap> mUnicodeRanges;
+
+  nsCString mFamilyName;
+  AutoTArray<StyleFontFaceSourceListComponent, 8> mSources;
+};
+
+class gfxUserFontSet {
+  friend class gfxUserFontEntry;
+  friend class gfxOTSMessageContext;
+
+ public:
+  using FontStretch = mozilla::FontStretch;
+  using StretchRange = mozilla::StretchRange;
+  using FontSlantStyle = mozilla::FontSlantStyle;
+  using SlantStyleRange = mozilla::SlantStyleRange;
+  using FontWeight = mozilla::FontWeight;
+  using WeightRange = mozilla::WeightRange;
+  using RangeFlags = gfxFontEntry::RangeFlags;
+
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  gfxUserFontSet();
+
+  void Destroy();
+
+  virtual already_AddRefed<gfxUserFontEntry> CreateUserFontEntry(
+      nsTArray<gfxFontFaceSrc>&& aFontFaceSrcList,
+      gfxUserFontAttributes&& aAttr) = 0;
+
+  already_AddRefed<gfxUserFontEntry> FindOrCreateUserFontEntry(
+      nsTArray<gfxFontFaceSrc>&& aFontFaceSrcList,
+      gfxUserFontAttributes&& aAttr);
+
+  void AddUserFontEntry(const nsCString& aFamilyName,
+                        gfxUserFontEntry* aUserFontEntry);
+
+  virtual already_AddRefed<gfxUserFontFamily> LookupFamily(
+      const nsACString& aName) const;
+
+  virtual already_AddRefed<gfxFontSrcPrincipal> GetStandardFontLoadPrincipal()
+      const = 0;
+  virtual FontVisibilityProvider* GetFontVisibilityProvider() const = 0;
+
+  virtual bool IsFontLoadAllowed(const gfxFontFaceSrc&) = 0;
+
+  virtual nsresult StartLoad(gfxUserFontEntry* aUserFontEntry,
+                             uint32_t aSrcIndex) = 0;
+
+  uint64_t GetGeneration() { return mGeneration; }
+
+  void IncrementGeneration(bool aIsRebuild = false) {
+    mozilla::RecursiveMutexAutoLock lock(mMutex);
+    IncrementGenerationLocked(aIsRebuild);
+  }
+  void IncrementGenerationLocked(bool aIsRebuild = false) MOZ_REQUIRES(mMutex);
+
+  uint64_t GetRebuildGeneration() { return mRebuildGeneration; }
+
+  void RebuildLocalRules();
+
+  virtual void ForgetLocalFaces();
+
+  class UserFontCache {
+   public:
+    static void CacheFont(gfxFontEntry* aFontEntry);
+
+    static void ForgetFont(gfxFontEntry* aFontEntry);
+
+    static gfxFontEntry* GetFont(const gfxFontFaceSrc&,
+                                 const gfxUserFontEntry&);
+
+    static void Shutdown();
+
+    class MemoryReporter final : public nsIMemoryReporter {
+     private:
+      ~MemoryReporter() = default;
+
+     public:
+      NS_DECL_ISUPPORTS
+      NS_DECL_NSIMEMORYREPORTER
+    };
+
+#ifdef DEBUG_USERFONT_CACHE
+    static void Dump();
+#endif
+
+   private:
+    class Flusher : public nsIObserver {
+      virtual ~Flusher() = default;
+
+     public:
+      NS_DECL_ISUPPORTS
+      NS_DECL_NSIOBSERVER
+      Flusher() = default;
+    };
+
+    struct Key {
+      RefPtr<gfxFontSrcURI> mURI;
+      RefPtr<gfxFontSrcPrincipal> mPrincipal;  
+      gfxFontEntry* MOZ_NON_OWNING_REF mFontEntry;
+      bool mPrivate;
+
+      Key(gfxFontSrcURI* aURI, gfxFontSrcPrincipal* aPrincipal,
+          gfxFontEntry* aFontEntry, bool aPrivate)
+          : mURI(aURI),
+            mPrincipal(aPrincipal),
+            mFontEntry(aFontEntry),
+            mPrivate(aPrivate) {}
+    };
+
+    class Entry : public PLDHashEntryHdr {
+     public:
+      typedef const Key& KeyType;
+      typedef const Key* KeyTypePointer;
+
+      explicit Entry(KeyTypePointer aKey)
+          : mURI(aKey->mURI),
+            mPrincipal(aKey->mPrincipal),
+            mFontEntry(aKey->mFontEntry),
+            mPrivate(aKey->mPrivate) {}
+
+      Entry(Entry&& aOther)
+          : PLDHashEntryHdr(std::move(aOther)),
+            mURI(std::move(aOther.mURI)),
+            mPrincipal(std::move(aOther.mPrincipal)),
+            mFontEntry(std::move(aOther.mFontEntry)),
+            mPrivate(std::move(aOther.mPrivate)) {}
+
+      ~Entry() = default;
+
+      bool KeyEquals(const KeyTypePointer aKey) const;
+
+      static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+
+      static PLDHashNumber HashKey(const KeyTypePointer aKey) {
+        PLDHashNumber principalHash =
+            aKey->mPrincipal ? aKey->mPrincipal->Hash() : 0;
+        return mozilla::HashGeneric(
+            principalHash + int(aKey->mPrivate), aKey->mURI->Hash(),
+            HashFeatures(aKey->mFontEntry->mFeatureSettings),
+            HashVariations(aKey->mFontEntry->mVariationSettings),
+            mozilla::HashString(aKey->mFontEntry->FamilyName()),
+            aKey->mFontEntry->Weight().AsScalar(),
+            aKey->mFontEntry->SlantStyle().AsScalar(),
+            aKey->mFontEntry->Stretch().AsScalar(),
+            aKey->mFontEntry->AutoRangeFlags(),
+            aKey->mFontEntry->mLanguageOverride);
+      }
+
+      enum { ALLOW_MEMMOVE = false };
+
+      gfxFontSrcURI* GetURI() const { return mURI; }
+      gfxFontSrcPrincipal* GetPrincipal() const { return mPrincipal; }
+      gfxFontEntry* GetFontEntry() const { return mFontEntry; }
+      bool IsPrivate() const { return mPrivate; }
+
+      void ReportMemory(nsIHandleReportCallback* aHandleReport,
+                        nsISupports* aData, bool aAnonymize);
+
+#ifdef DEBUG_USERFONT_CACHE
+      void Dump();
+#endif
+
+     private:
+      static uint32_t HashFeatures(const nsTArray<gfxFontFeature>& aFeatures) {
+        return mozilla::HashBytes(aFeatures.Elements(),
+                                  aFeatures.Length() * sizeof(gfxFontFeature));
+      }
+
+      static uint32_t HashVariations(
+          const nsTArray<mozilla::gfx::FontVariation>& aVariations) {
+        return mozilla::HashBytes(
+            aVariations.Elements(),
+            aVariations.Length() * sizeof(mozilla::gfx::FontVariation));
+      }
+
+      RefPtr<gfxFontSrcURI> mURI;
+      RefPtr<gfxFontSrcPrincipal> mPrincipal;  
+
+      gfxFontEntry* MOZ_NON_OWNING_REF mFontEntry;
+
+      bool mPrivate;
+    };
+
+    static nsTHashtable<Entry>* sUserFonts;
+  };
+
+  void SetLocalRulesUsed() { mLocalRulesUsed = true; }
+
+  static mozilla::LogModule* GetUserFontsLog();
+
+  virtual void RecordFontLoadDone(uint32_t aFontSize,
+                                  mozilla::TimeStamp aDoneTime) {}
+
+  void GetLoadStatistics(uint32_t& aLoadCount, uint64_t& aLoadSize) const {
+    aLoadCount = mDownloadCount;
+    aLoadSize = mDownloadSize;
+  }
+
+ protected:
+  virtual ~gfxUserFontSet();
+
+  virtual bool GetPrivateBrowsing() = 0;
+
+  virtual bool BypassCache() = 0;
+
+  virtual nsresult SyncLoadFontData(gfxUserFontEntry* aFontToLoad,
+                                    const gfxFontFaceSrc* aFontFaceSrc,
+                                    uint8_t*& aBuffer,
+                                    uint32_t& aBufferLength) = 0;
+
+  virtual nsresult LogMessage(gfxUserFontEntry* aUserFontEntry,
+                              uint32_t aSrcIndex, const char* aMessage,
+                              uint32_t aFlags = nsIScriptError::errorFlag,
+                              nsresult aStatus = NS_OK) = 0;
+
+  virtual void DoRebuildUserFontSet() = 0;
+
+  virtual void RemoveLoader(nsFontFaceLoader* aLoader) = 0;
+
+  gfxUserFontEntry* FindExistingUserFontEntry(
+      gfxUserFontFamily* aFamily,
+      const nsTArray<gfxFontFaceSrc>& aFontFaceSrcList,
+      const gfxUserFontAttributes& aAttr);
+
+  virtual already_AddRefed<gfxUserFontFamily> GetFamily(
+      const nsACString& aFamilyName);
+
+  void ForgetLocalFace(gfxUserFontFamily* aFontFamily);
+
+  nsRefPtrHashtable<nsCStringHashKey, gfxUserFontFamily> mFontFamilies;
+
+  mozilla::Atomic<uint64_t> mGeneration;  
+  uint64_t mRebuildGeneration;            
+
+  bool mLocalRulesUsed;
+
+  bool mRebuildLocalRules;
+
+  uint32_t mDownloadCount;
+  uint64_t mDownloadSize;
+
+  mutable mozilla::RecursiveMutex mMutex;
+};
+
+
+class gfxUserFontEntry : public gfxFontEntry {
+  friend class mozilla::PostTraversalTask;
+  friend class gfxUserFontSet;
+  friend class nsUserFontSet;
+  friend class nsFontFaceLoader;
+  friend class gfxOTSMessageContext;
+
+ public:
+  enum UserFontLoadState {
+    STATUS_NOT_LOADED = 0,
+    STATUS_LOAD_PENDING,
+    STATUS_LOADING,
+    STATUS_LOADED,
+    STATUS_FAILED
+  };
+
+  gfxUserFontEntry(nsTArray<gfxFontFaceSrc>&& aFontFaceSrcList,
+                   gfxUserFontAttributes&& aAttr);
+
+  ~gfxUserFontEntry() override;
+
+  void UpdateAttributes(gfxUserFontAttributes&& aAttr);
+
+  bool Matches(const nsTArray<gfxFontFaceSrc>& aFontFaceSrcList,
+               const gfxUserFontAttributes& aAttr);
+
+  gfxFont* CreateFontInstance(const gfxFontStyle* aFontStyle) override;
+
+  gfxFontEntry* GetPlatformFontEntry() const { return mPlatformFontEntry; }
+
+  UserFontLoadState LoadState() const { return mUserFontLoadState; }
+
+  void LoadCanceled() {
+    MOZ_ASSERT(NS_IsMainThread());
+
+    mUserFontLoadState = STATUS_NOT_LOADED;
+    mFontDataLoadingState = NOT_LOADING;
+    mLoader = nullptr;
+    mCurrentSrcIndex = 0;
+    mSeenLocalSource = false;
+  }
+
+  bool WaitForUserFont() const {
+    return (mUserFontLoadState == STATUS_LOAD_PENDING ||
+            mUserFontLoadState == STATUS_LOADING) &&
+           mFontDataLoadingState < LOADING_SLOWLY;
+  }
+
+  bool CharacterInUnicodeRange(uint32_t ch) const {
+    if (const auto* map = GetUnicodeRangeMap()) {
+      return map->test(ch);
+    }
+    return true;
+  }
+
+  gfxCharacterMap* GetUnicodeRangeMap() const { return GetCharacterMap(); }
+  void SetUnicodeRangeMap(RefPtr<gfxCharacterMap>&& aCharMap) {
+    auto* oldCmap = GetUnicodeRangeMap();
+    if (oldCmap != aCharMap) {
+      auto* newCmap = aCharMap.forget().take();
+      if (mCharacterMap.compareExchange(oldCmap, newCmap)) {
+        NS_IF_RELEASE(oldCmap);
+      } else {
+        NS_IF_RELEASE(newCmap);
+      }
+    }
+  }
+
+  mozilla::StyleFontDisplay GetFontDisplay() const { return mFontDisplay; }
+
+  void Load();
+
+  void FontLoadComplete();
+
+  void SetLoader(nsFontFaceLoader* aLoader) {
+    MOZ_ASSERT(NS_IsMainThread());
+    mLoader = aLoader;
+  }
+
+  nsFontFaceLoader* GetLoader() const {
+    MOZ_ASSERT(NS_IsMainThread());
+    return mLoader;
+  }
+
+  gfxFontSrcPrincipal* GetPrincipal() const { return mPrincipal; }
+  void GetFamilyNameAndURIForLogging(uint32_t aSrcIndex,
+                                     nsACString& aFamilyName, nsACString& aURI);
+
+  gfxFontEntry* Clone() const override {
+    MOZ_ASSERT_UNREACHABLE("cannot Clone user fonts");
+    return nullptr;
+  }
+
+  virtual already_AddRefed<gfxUserFontSet> GetUserFontSet() const = 0;
+
+  const nsTArray<gfxFontFaceSrc>& SourceList() const { return mSrcList; }
+
+  const gfxFontFaceSrc& SourceAt(uint32_t aSrcIndex) const {
+    return mSrcList[aSrcIndex];
+  }
+
+  bool HasVariations() override {
+    MOZ_ASSERT_UNREACHABLE("not meaningful for a userfont placeholder");
+    return false;
+  }
+  void GetVariationAxes(nsTArray<gfxFontVariationAxis>&) override {
+    MOZ_ASSERT_UNREACHABLE("not meaningful for a userfont placeholder");
+  }
+  void GetVariationInstances(nsTArray<gfxFontVariationInstance>&) override {
+    MOZ_ASSERT_UNREACHABLE("not meaningful for a userfont placeholder");
+  }
+
+ protected:
+  struct OTSMessage {
+    nsCString mMessage;
+    int mLevel;  
+  };
+
+  const uint8_t* SanitizeOpenTypeData(const uint8_t* aData, uint32_t aLength,
+                                      uint32_t& aSanitaryLength,
+                                      gfxUserFontType& aFontType,
+                                      nsTArray<OTSMessage>& aMessages);
+
+  void LoadNextSrc();
+  void ContinueLoad();
+  void DoLoadNextSrc(bool aIsContinue);
+
+  virtual void SetLoadState(UserFontLoadState aLoadState);
+
+  void FontDataDownloadComplete(uint32_t aSrcIndex, const uint8_t* aFontData,
+                                uint32_t aLength, nsresult aDownloadStatus,
+                                nsIFontLoadCompleteCallback* aCallback);
+
+  bool LoadPlatformFontSync(uint32_t aSrcIndex, const uint8_t* aFontData,
+                            uint32_t aLength);
+
+  void LoadPlatformFontAsync(uint32_t aSrcIndex, const uint8_t* aFontData,
+                             uint32_t aLength,
+                             nsIFontLoadCompleteCallback* aCallback);
+
+  void StartPlatformFontLoadOnBackgroundThread(
+      uint32_t aSrcIndex, const uint8_t* aFontData, uint32_t aLength,
+      nsMainThreadPtrHandle<nsIFontLoadCompleteCallback> aCallback);
+
+  void ContinuePlatformFontLoadOnMainThread(
+      uint32_t aSrcIndex, const uint8_t* aOriginalFontData,
+      uint32_t aOriginalLength, gfxUserFontType aFontType,
+      const uint8_t* aSanitizedFontData, uint32_t aSanitizedLength,
+      nsTArray<OTSMessage>&& aMessages,
+      nsMainThreadPtrHandle<nsIFontLoadCompleteCallback> aCallback);
+
+  bool LoadPlatformFont(uint32_t aSrcIndex, const uint8_t* aOriginalFontData,
+                        uint32_t aOriginalLength, gfxUserFontType aFontType,
+                        const uint8_t* aSanitizedFontData,
+                        uint32_t aSanitizedLength,
+                        nsTArray<OTSMessage>&& aMessages);
+
+  void FontLoadFailed(nsIFontLoadCompleteCallback* aCallback);
+
+  void StoreUserFontData(gfxFontEntry* aFontEntry, uint32_t aSrcIndex,
+                         bool aPrivate, const nsACString& aOriginalName,
+                         FallibleTArray<uint8_t>* aMetadata,
+                         uint32_t aMetaOrigLen, uint8_t aCompression);
+
+  virtual void GetUserFontSets(nsTArray<RefPtr<gfxUserFontSet>>& aResult);
+
+  FontTableCache* GetFontTableCache(bool aCreate) override { return nullptr; }
+
+  UserFontLoadState mUserFontLoadState;
+
+  enum FontDataLoadingState {
+    NOT_LOADING = 0,      
+    LOADING_STARTED,      
+    LOADING_ALMOST_DONE,  
+    LOADING_SLOWLY,       
+    LOADING_TIMED_OUT,    
+    LOADING_FAILED        
+  };
+  FontDataLoadingState mFontDataLoadingState;
+
+  bool mSeenLocalSource;
+  bool mUnsupportedFormat;
+  mozilla::StyleFontDisplay mFontDisplay;  
+
+  RefPtr<gfxFontEntry> mPlatformFontEntry;
+  nsTArray<gfxFontFaceSrc> mSrcList;
+  uint32_t mCurrentSrcIndex;  
+  nsFontFaceLoader* MOZ_NON_OWNING_REF
+      mLoader;  
+  RefPtr<gfxUserFontSet> mLoadingFontSet;
+  RefPtr<gfxFontSrcPrincipal> mPrincipal;
+};
+
+#endif /* GFX_USER_FONT_SET_H */

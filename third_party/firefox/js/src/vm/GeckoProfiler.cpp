@@ -1,0 +1,637 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "vm/GeckoProfiler-inl.h"
+
+#include "mozilla/DebugOnly.h"
+#include "mozilla/Sprintf.h"
+
+#include "gc/GC.h"
+#include "gc/PublicIterators.h"
+#include "jit/BaselineJIT.h"
+#include "jit/JitcodeMap.h"
+#include "jit/JitRuntime.h"
+#include "jit/JSJitFrameIter.h"
+#include "jit/PerfSpewer.h"
+#include "js/experimental/SourceHook.h"
+#include "vm/FrameIter.h"  // js::OnlyJSJitFrameIter
+#include "vm/JitActivation.h"
+#include "vm/JSScript.h"
+#include "vm/MutexIDs.h"
+
+#include "gc/Marking-inl.h"
+#include "jit/JSJitFrameIter-inl.h"
+
+using namespace js;
+using mozilla::Utf8Unit;
+
+GeckoProfilerThread::GeckoProfilerThread()
+    : profilingStack_(nullptr), profilingStackIfEnabled_(nullptr) {}
+
+GeckoProfilerRuntime::GeckoProfilerRuntime(JSRuntime* rt)
+    : rt(rt),
+      scriptSources_(mutexid::GeckoProfilerScriptSources),
+      slowAssertions(false),
+      enabled_(false) {
+  MOZ_ASSERT(rt != nullptr);
+}
+
+void GeckoProfilerThread::setProfilingStack(ProfilingStack* profilingStack,
+                                            bool enabled) {
+  profilingStack_ = profilingStack;
+  profilingStackIfEnabled_ = enabled ? profilingStack : nullptr;
+}
+
+static jit::JitFrameLayout* GetTopProfilingJitFrame(jit::JitActivation* act) {
+  if (!act->hasExitFP()) {
+    return nullptr;
+  }
+
+  OnlyJSJitFrameIter iter(act);
+  if (iter.done()) {
+    return nullptr;
+  }
+
+  jit::JSJitProfilingFrameIterator jitIter(
+      (jit::CommonFrameLayout*)iter.frame().fp());
+  if (jitIter.done()) {
+    return nullptr;
+  }
+
+  return jitIter.framePtr();
+}
+
+void GeckoProfilerRuntime::enable(bool enabled) {
+  JSContext* cx = rt->mainContextFromAnyThread();
+  MOZ_ASSERT(cx->geckoProfiler().infraInstalled());
+
+  if (enabled_ == enabled) {
+    return;
+  }
+
+  ReleaseAllJITCode(rt->gcContext());
+
+  if (rt->hasJitRuntime() && rt->jitRuntime()->hasJitcodeGlobalTable()) {
+    rt->jitRuntime()->getJitcodeGlobalTable()->setAllEntriesAsExpired();
+  }
+  rt->setProfilerSampleBufferRangeStart(0);
+
+  if (cx->jitActivation) {
+    cx->jitActivation->setLastProfilingFrame(nullptr);
+    cx->jitActivation->setLastProfilingCallSite(nullptr);
+  }
+
+  jit::ResetPerfSpewer(enabled);
+
+  enabled_ = enabled;
+
+  scriptSources_.writeLock()->clear();
+
+  jit::ToggleBaselineProfiling(cx, enabled);
+
+  if (cx->jitActivation) {
+    if (enabled) {
+      jit::JitActivation* jitActivation = cx->jitActivation;
+      while (jitActivation) {
+        auto* lastProfilingFrame = GetTopProfilingJitFrame(jitActivation);
+        jitActivation->setLastProfilingFrame(lastProfilingFrame);
+        jitActivation->setLastProfilingCallSite(nullptr);
+        jitActivation = jitActivation->prevJitActivation();
+      }
+    } else {
+      jit::JitActivation* jitActivation = cx->jitActivation;
+      while (jitActivation) {
+        jitActivation->setLastProfilingFrame(nullptr);
+        jitActivation->setLastProfilingCallSite(nullptr);
+        jitActivation = jitActivation->prevJitActivation();
+      }
+    }
+  }
+
+  for (RealmsIter r(rt); !r.done(); r.next()) {
+    r->wasm.ensureProfilingLabels(enabled);
+  }
+
+#ifdef JS_STRUCTURED_SPEW
+  if (enabled) {
+    cx->spewer().enableSpewing();
+  } else {
+    cx->spewer().disableSpewing();
+  }
+#endif
+}
+
+const char* GeckoProfilerRuntime::profileString(JSContext* cx,
+                                                BaseScript* script) {
+  JS::Zone* zone = script->zone();
+  if (!zone->profilerStrings) {
+    auto map = cx->make_unique<JS::WeakCache<ProfileStringMap>>(zone);
+    if (!map) {
+      return nullptr;
+    }
+    zone->profilerStrings = std::move(map);
+  }
+
+  ProfileStringMap& map = zone->profilerStrings->get();
+  ProfileStringMap::AddPtr ptr = map.lookupForAdd(script);
+
+  if (!ptr) {
+    UniqueChars str = allocProfileString(cx, script);
+    if (!str) {
+      return nullptr;
+    }
+    MOZ_ASSERT(script->hasBytecode());
+    if (!map.add(ptr, script, std::move(str))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+  }
+
+  return ptr->value().get();
+}
+
+bool GeckoProfilerThread::enter(JSContext* cx, JSScript* script) {
+  const char* dynamicString =
+      cx->runtime()->geckoProfiler().profileString(cx, script);
+  if (dynamicString == nullptr) {
+    return false;
+  }
+
+  if (!cx->runtime()->geckoProfiler().insertScriptSource(
+          script->scriptSource())) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+#ifdef DEBUG
+  uint32_t sp = profilingStack_->stackPointer;
+  if (sp > 0 && sp - 1 < profilingStack_->stackCapacity()) {
+    size_t start = (sp > 4) ? sp - 4 : 0;
+    for (size_t i = start; i < sp - 1; i++) {
+      MOZ_ASSERT_IF(profilingStack_->frames[i].isJsFrame(),
+                    profilingStack_->frames[i].pc());
+    }
+  }
+#endif
+
+  profilingStack_->pushJsFrame(
+      "", dynamicString, script, script->code(),
+      script->realm()->creationOptions().profilerRealmID(),
+      script->scriptSource()->id());
+  return true;
+}
+
+void GeckoProfilerThread::exit(JSContext* cx, JSScript* script) {
+  profilingStack_->pop();
+
+#ifdef DEBUG
+  uint32_t sp = profilingStack_->stackPointer;
+  if (sp < profilingStack_->stackCapacity()) {
+    JSRuntime* rt = script->runtimeFromMainThread();
+    const char* dynamicString = rt->geckoProfiler().profileString(cx, script);
+    MOZ_ASSERT(dynamicString);
+
+    if (!profilingStack_->frames[sp].isJsFrame()) {
+      fprintf(stderr, "--- ABOUT TO FAIL ASSERTION ---\n");
+      fprintf(stderr, " frames=%p size=%u/%u\n", (void*)profilingStack_->frames,
+              uint32_t(profilingStack_->stackPointer),
+              profilingStack_->stackCapacity());
+      for (int32_t i = sp; i >= 0; i--) {
+        ProfilingStackFrame& frame = profilingStack_->frames[i];
+        if (frame.isJsFrame()) {
+          fprintf(stderr, "  [%d] JS %s\n", i, frame.dynamicString());
+        } else {
+          fprintf(stderr, "  [%d] Label %s\n", i, frame.dynamicString());
+        }
+      }
+    }
+
+    ProfilingStackFrame& frame = profilingStack_->frames[sp];
+    MOZ_ASSERT(frame.isJsFrame());
+    MOZ_ASSERT(frame.script() == script);
+    MOZ_ASSERT(strcmp((const char*)frame.dynamicString(), dynamicString) == 0);
+  }
+#endif
+}
+
+UniqueChars GeckoProfilerRuntime::allocProfileString(JSContext* cx,
+                                                     BaseScript* script) {
+
+  JSAtom* name = nullptr;
+  size_t nameLength = 0;
+  JSFunction* func = script->function();
+  if (func && func->fullDisplayAtom()) {
+    name = func->fullDisplayAtom();
+    nameLength = JS::GetDeflatedUTF8StringLength(name);
+  }
+
+  constexpr size_t MaxFilenameLength = 200;
+  const char* filenameStr = script->filename() ? script->filename() : "(null)";
+  size_t filenameLength = js_strnlen(filenameStr, MaxFilenameLength);
+
+  bool hasLineAndColumn = false;
+  size_t lineAndColumnLength = 0;
+  char lineAndColumnStr[30];
+  if (name || script->isFunction() || script->isForEval()) {
+    lineAndColumnLength =
+        SprintfLiteral(lineAndColumnStr, "%u:%u", script->lineno(),
+                       script->column().oneOriginValue());
+    hasLineAndColumn = true;
+  }
+
+
+  size_t fullLength = 0;
+  if (name) {
+    MOZ_ASSERT(hasLineAndColumn);
+    fullLength = nameLength + 2 + filenameLength + 1 + lineAndColumnLength + 1;
+  } else if (hasLineAndColumn) {
+    fullLength = filenameLength + 1 + lineAndColumnLength;
+  } else {
+    fullLength = filenameLength;
+  }
+
+  UniqueChars str(cx->pod_malloc<char>(fullLength + 1));
+  if (!str) {
+    return nullptr;
+  }
+
+  size_t cur = 0;
+
+  if (name) {
+    mozilla::DebugOnly<size_t> written = JS::DeflateStringToUTF8Buffer(
+        name, mozilla::Span(str.get() + cur, nameLength));
+    MOZ_ASSERT(written == nameLength);
+    cur += nameLength;
+    str[cur++] = ' ';
+    str[cur++] = '(';
+  }
+
+  memcpy(str.get() + cur, filenameStr, filenameLength);
+  cur += filenameLength;
+
+  if (hasLineAndColumn) {
+    str[cur++] = ':';
+    memcpy(str.get() + cur, lineAndColumnStr, lineAndColumnLength);
+    cur += lineAndColumnLength;
+  }
+
+  if (name) {
+    str[cur++] = ')';
+  }
+
+  MOZ_ASSERT(cur == fullLength);
+  str[cur] = 0;
+
+  return str;
+}
+
+void GeckoProfilerThread::trace(JSTracer* trc) {
+  if (profilingStack_) {
+    size_t size = profilingStack_->stackSize();
+    for (size_t i = 0; i < size; i++) {
+      profilingStack_->frames[i].trace(trc);
+    }
+  }
+}
+
+size_t GeckoProfilerRuntime::stringsCount() {
+  size_t count = 0;
+  for (AllZonesIter zone(rt); !zone.done(); zone.next()) {
+    if (zone->profilerStrings) {
+      count += zone->profilerStrings->get().count();
+    }
+  }
+  return count;
+}
+
+void GeckoProfilerRuntime::stringsReset() {
+  for (AllZonesIter zone(rt); !zone.done(); zone.next()) {
+    if (zone->profilerStrings) {
+      zone->profilerStrings->get().clear();
+    }
+  }
+}
+
+js::ProfilerJSSources GeckoProfilerRuntime::getProfilerScriptSources(
+    bool gatherSourceText) {
+  js::ProfilerJSSources result;
+
+  auto guard = scriptSources_.readLock();
+  for (auto iter = guard->iter(); !iter.done(); iter.next()) {
+    const RefPtr<ScriptSource>& scriptSource = iter.get();
+    MOZ_ASSERT(scriptSource);
+
+    bool hasSourceText;
+    bool retrievableSource;
+    ScriptSource::getSourceProperties(scriptSource, &hasSourceText,
+                                      &retrievableSource);
+
+    uint32_t sourceId = scriptSource->id();
+
+    const char* filename = scriptSource->filename();
+    size_t filenameLen = 0;
+    JS::UniqueChars filenameCopy;
+    if (filename) {
+      filenameLen = strlen(filename);
+      filenameCopy.reset(static_cast<char*>(js_malloc(filenameLen + 1)));
+      if (filenameCopy) {
+        strcpy(filenameCopy.get(), filename);
+      }
+    }
+
+    uint32_t startLine = scriptSource->startLine();
+    uint32_t startColumn = scriptSource->startColumn().oneOriginValue();
+
+    const char16_t* sourceMapURL = nullptr;
+    size_t sourceMapURLLen = 0;
+    JS::UniqueTwoByteChars sourceMapURLCopy;
+    if (scriptSource->hasSourceMapURL()) {
+      sourceMapURL = scriptSource->sourceMapURL();
+      sourceMapURLLen = js_strlen(sourceMapURL);
+      sourceMapURLCopy.reset(static_cast<char16_t*>(
+          js_malloc((sourceMapURLLen + 1) * sizeof(char16_t))));
+      if (sourceMapURLCopy) {
+        js_memcpy(sourceMapURLCopy.get(), sourceMapURL,
+                  sourceMapURLLen * sizeof(char16_t));
+        sourceMapURLCopy[sourceMapURLLen] = 0;
+      } else {
+        sourceMapURLLen = 0;
+      }
+    }
+
+    if (!gatherSourceText) {
+      (void)result.append(ProfilerJSSourceData(
+          sourceId, std::move(filenameCopy), filenameLen, startLine,
+          startColumn, std::move(sourceMapURLCopy), sourceMapURLLen));
+      continue;
+    }
+
+    if (retrievableSource) {
+      (void)result.append(ProfilerJSSourceData::CreateRetrievableFile(
+          sourceId, std::move(filenameCopy), filenameLen, startLine,
+          startColumn, std::move(sourceMapURLCopy), sourceMapURLLen));
+      continue;
+    }
+
+    if (!hasSourceText) {
+      (void)result.append(ProfilerJSSourceData(
+          sourceId, std::move(filenameCopy), filenameLen, startLine,
+          startColumn, std::move(sourceMapURLCopy), sourceMapURLLen));
+      continue;
+    }
+
+    size_t sourceLength = scriptSource->length();
+    if (sourceLength == 0) {
+      (void)result.append(ProfilerJSSourceData(
+          sourceId, JS::UniqueTwoByteChars(), 0, std::move(filenameCopy),
+          filenameLen, startLine, startColumn, std::move(sourceMapURLCopy),
+          sourceMapURLLen));
+      continue;
+    }
+
+    SubstringCharsResult sourceResult(JS::UniqueChars(nullptr));
+    size_t charsLength = 0;
+
+    if (scriptSource->shouldUnwrapEventHandlerBody()) {
+      sourceResult = scriptSource->functionBodyStringChars(&charsLength);
+
+      if (charsLength == 0) {
+        (void)result.append(ProfilerJSSourceData(
+            sourceId, JS::UniqueTwoByteChars(), 0, std::move(filenameCopy),
+            filenameLen, startLine, startColumn, std::move(sourceMapURLCopy),
+            sourceMapURLLen));
+        continue;
+      }
+    } else {
+      sourceResult = scriptSource->substringChars(0, sourceLength);
+      charsLength = sourceLength;
+    }
+
+    if (sourceResult.is<JS::UniqueChars>()) {
+      auto& utf8Chars = sourceResult.as<JS::UniqueChars>();
+      if (!utf8Chars) {
+        continue;
+      }
+      (void)result.append(ProfilerJSSourceData(
+          sourceId, std::move(utf8Chars), charsLength, std::move(filenameCopy),
+          filenameLen, startLine, startColumn, std::move(sourceMapURLCopy),
+          sourceMapURLLen));
+    } else {
+      auto& utf16Chars = sourceResult.as<JS::UniqueTwoByteChars>();
+      if (!utf16Chars) {
+        continue;
+      }
+      (void)result.append(ProfilerJSSourceData(
+          sourceId, std::move(utf16Chars), charsLength, std::move(filenameCopy),
+          filenameLen, startLine, startColumn, std::move(sourceMapURLCopy),
+          sourceMapURLLen));
+    }
+  }
+
+  return result;
+}
+
+void ProfilingStackFrame::trace(JSTracer* trc) {
+  if (isJsFrame()) {
+    JSScript* s = rawScript();
+    TraceRoot(trc, &s, "ProfilingStackFrame script");
+    spOrScript = s;
+  }
+}
+
+GeckoProfilerBaselineOSRMarker::GeckoProfilerBaselineOSRMarker(
+    JSContext* cx, bool hasProfilerFrame)
+    : profiler(&cx->geckoProfiler()) {
+  if (!hasProfilerFrame || !cx->runtime()->geckoProfiler().enabled()) {
+    profiler = nullptr;
+    return;
+  }
+
+  uint32_t sp = profiler->profilingStack_->stackPointer;
+  if (sp >= profiler->profilingStack_->stackCapacity()) {
+    profiler = nullptr;
+    return;
+  }
+
+  spBefore_ = sp;
+  if (sp == 0) {
+    return;
+  }
+
+  ProfilingStackFrame& frame = profiler->profilingStack_->frames[sp - 1];
+  MOZ_ASSERT(!frame.isOSRFrame());
+  frame.setIsOSRFrame(true);
+}
+
+GeckoProfilerBaselineOSRMarker::~GeckoProfilerBaselineOSRMarker() {
+  if (profiler == nullptr) {
+    return;
+  }
+
+  uint32_t sp = profiler->stackPointer();
+  MOZ_ASSERT(spBefore_ == sp);
+  if (sp == 0) {
+    return;
+  }
+
+  ProfilingStackFrame& frame = profiler->stack()[sp - 1];
+  MOZ_ASSERT(frame.isOSRFrame());
+  frame.setIsOSRFrame(false);
+}
+
+JS_PUBLIC_API JSScript* ProfilingStackFrame::script() const {
+  MOZ_ASSERT(isJsFrame());
+  auto* script = reinterpret_cast<JSScript*>(spOrScript.operator void*());
+  if (!script) {
+    return nullptr;
+  }
+
+  JSContext* cx = script->runtimeFromAnyThread()->mainContextFromAnyThread();
+  if (!cx->isProfilerSamplingEnabled()) {
+    return nullptr;
+  }
+
+  MOZ_ASSERT(!IsForwarded(script));
+  return script;
+}
+
+JS_PUBLIC_API JSFunction* ProfilingStackFrame::function() const {
+  JSScript* script = this->script();
+  return script ? script->function() : nullptr;
+}
+
+JS_PUBLIC_API jsbytecode* ProfilingStackFrame::pc() const {
+  MOZ_ASSERT(isJsFrame());
+  if (pcOffsetIfJS_ == NullPCOffset) {
+    return nullptr;
+  }
+
+  JSScript* script = this->script();
+  return script ? script->offsetToPC(pcOffsetIfJS_) : nullptr;
+}
+
+int32_t ProfilingStackFrame::pcToOffset(JSScript* aScript, jsbytecode* aPc) {
+  return aPc ? aScript->pcToOffset(aPc) : NullPCOffset;
+}
+
+void ProfilingStackFrame::setPC(jsbytecode* pc) {
+  MOZ_ASSERT(isJsFrame());
+  JSScript* script = this->script();
+  MOZ_ASSERT(
+      script);  
+  pcOffsetIfJS_ = pcToOffset(script, pc);
+}
+
+JS_PUBLIC_API uint32_t ProfilingStackFrame::sourceId() const {
+  return sourceId_;
+}
+
+JS_PUBLIC_API void js::SetContextProfilingStack(
+    JSContext* cx, ProfilingStack* profilingStack) {
+  cx->geckoProfiler().setProfilingStack(
+      profilingStack, cx->runtime()->geckoProfiler().enabled());
+}
+
+JS_PUBLIC_API void js::EnableContextProfilingStack(JSContext* cx,
+                                                   bool enabled) {
+  cx->geckoProfiler().enable(enabled);
+  cx->runtime()->geckoProfiler().enable(enabled);
+}
+
+
+JS_PUBLIC_API js::ProfilerJSSources js::GetProfilerScriptSources(
+    JSRuntime* rt, bool gatherSourceText) {
+  return rt->geckoProfiler().getProfilerScriptSources(gatherSourceText);
+}
+
+JS_PUBLIC_API ProfilerJSSourceData
+js::RetrieveProfilerSourceContent(JSContext* cx, const char* filename) {
+  MOZ_ASSERT(filename && strlen(filename));
+  if (!cx) {
+    return ProfilerJSSourceData();  
+  }
+
+  if (!cx->runtime()->sourceHook.ref()) {
+    return ProfilerJSSourceData();  
+  }
+
+  size_t sourceLength = 0;
+  char* utf8Source = nullptr;
+
+  bool loadSuccess = cx->runtime()->sourceHook->load(
+      cx, filename, nullptr, &utf8Source, &sourceLength);
+
+  if (!loadSuccess) {
+    JS_ClearPendingException(cx);
+    return ProfilerJSSourceData();  
+  }
+
+  if (utf8Source) {
+    return ProfilerJSSourceData(JS::UniqueChars(utf8Source), sourceLength);
+  }
+
+  return ProfilerJSSourceData();
+}
+
+AutoSuppressProfilerSampling::AutoSuppressProfilerSampling(JSContext* cx)
+    : cx_(cx), previouslyEnabled_(cx->isProfilerSamplingEnabled()) {
+  if (previouslyEnabled_) {
+    cx_->disableProfilerSampling();
+  }
+}
+
+AutoSuppressProfilerSampling::~AutoSuppressProfilerSampling() {
+  if (previouslyEnabled_) {
+    cx_->enableProfilerSampling();
+  }
+}
+
+namespace JS {
+
+// clang-format off
+
+#define SUBCATEGORY_ENUMS_BEGIN_CATEGORY(name, labelAsString, color) \
+  enum class ProfilingSubcategory_##name : uint32_t {
+#define SUBCATEGORY_ENUMS_SUBCATEGORY(category, name, labelAsString) \
+    name,
+#define SUBCATEGORY_ENUMS_END_CATEGORY \
+  };
+JS_EXECUTION_CATEGORY_LIST(SUBCATEGORY_ENUMS_BEGIN_CATEGORY,
+                           SUBCATEGORY_ENUMS_SUBCATEGORY,
+                           SUBCATEGORY_ENUMS_END_CATEGORY)
+#undef SUBCATEGORY_ENUMS_BEGIN_CATEGORY
+#undef SUBCATEGORY_ENUMS_SUBCATEGORY
+#undef SUBCATEGORY_ENUMS_END_CATEGORY
+
+#define CATEGORY_INFO_BEGIN_CATEGORY(name, labelAsString, color)
+#define CATEGORY_INFO_SUBCATEGORY(category, name, labelAsString) \
+  {ProfilingCategory::category,                                  \
+   uint32_t(ProfilingSubcategory_##category::name), labelAsString},
+#define CATEGORY_INFO_END_CATEGORY
+const ProfilingCategoryPairInfo sProfilingCategoryPairInfo[] = {
+  JS_EXECUTION_CATEGORY_LIST(CATEGORY_INFO_BEGIN_CATEGORY,
+                             CATEGORY_INFO_SUBCATEGORY,
+                             CATEGORY_INFO_END_CATEGORY)
+};
+#undef CATEGORY_INFO_BEGIN_CATEGORY
+#undef CATEGORY_INFO_SUBCATEGORY
+#undef CATEGORY_INFO_END_CATEGORY
+
+// clang-format on
+
+JS_PUBLIC_API const ProfilingCategoryPairInfo& GetProfilingCategoryPairInfo(
+    ProfilingCategoryPair aCategoryPair) {
+  static_assert(
+      std::size(sProfilingCategoryPairInfo) ==
+          uint32_t(ProfilingCategoryPair::COUNT),
+      "sProfilingCategoryPairInfo and ProfilingCategory need to have the "
+      "same order and the same length");
+
+  uint32_t categoryPairIndex = uint32_t(aCategoryPair);
+  MOZ_RELEASE_ASSERT(categoryPairIndex <=
+                     uint32_t(ProfilingCategoryPair::LAST));
+  return sProfilingCategoryPairInfo[categoryPairIndex];
+}
+
+}  

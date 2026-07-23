@@ -1,0 +1,460 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_ContentList_h_
+#define mozilla_dom_ContentList_h_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/HashFunctions.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/NameSpaceConstants.h"
+#include "mozilla/dom/NodeList.h"
+#include "nsAtomHashKeys.h"
+#include "nsContentListDeclarations.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsHashKeys.h"
+#include "nsISupports.h"
+#include "nsNameSpaceManager.h"
+#include "nsString.h"
+#include "nsStubMutationObserver.h"
+#include "nsTArray.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla::dom {
+
+class BaseContentList : public NodeList {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+
+  int32_t IndexOf(nsIContent* aContent) override;
+  nsIContent* Item(uint32_t aIndex) override;
+
+  uint32_t Length() override { return mElements.Length(); }
+
+  NS_DECL_CYCLE_COLLECTION_SKIPPABLE_WRAPPERCACHE_CLASS(BaseContentList)
+
+  void AppendElement(nsIContent* aContent) {
+    MOZ_ASSERT(aContent);
+    mElements.AppendElement(aContent);
+  }
+  void MaybeAppendElement(nsIContent* aContent) {
+    if (aContent) {
+      AppendElement(aContent);
+    }
+  }
+
+  void InsertElementAt(nsIContent* aContent, int32_t aIndex) {
+    NS_ASSERTION(aContent, "Element to insert must not be null");
+    mElements.InsertElementAt(aIndex, aContent);
+  }
+
+  void RemoveElement(nsIContent* aContent) {
+    mElements.RemoveElement(aContent);
+  }
+
+  void Reset() { mElements.Clear(); }
+
+  virtual int32_t IndexOf(nsIContent* aContent, bool aDoFlush);
+
+  JSObject* WrapObject(JSContext* cx,
+                       JS::Handle<JSObject*> aGivenProto) override = 0;
+
+  void SetCapacity(uint32_t aCapacity) { mElements.SetCapacity(aCapacity); }
+
+  virtual void LastRelease() {}
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+ protected:
+  virtual ~BaseContentList();
+
+  virtual void RemoveFromCaches() {}
+
+  AutoTArray<nsCOMPtr<nsIContent>, 10> mElements;
+};
+
+class SimpleContentList : public BaseContentList {
+ public:
+  explicit SimpleContentList(nsINode* aRoot) : mRoot(aRoot) {}
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(SimpleContentList, BaseContentList)
+
+  nsINode* GetParentObject() override { return mRoot; }
+  JSObject* WrapObject(JSContext* cx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+ protected:
+  virtual ~SimpleContentList() = default;
+
+ private:
+  nsCOMPtr<nsINode> mRoot;
+};
+
+class HTMLCollection : public BaseContentList {
+ public:
+  Element* Item(uint32_t aIndex) override = 0;
+  Element* IndexedGetter(uint32_t aIndex, bool& aFound) {
+    Element* item = Item(aIndex);
+    aFound = !!item;
+    return item;
+  }
+  Element* NamedItem(const nsAString& aName) {
+    bool dummy;
+    return NamedGetter(aName, dummy);
+  }
+  Element* NamedGetter(const nsAString& aName, bool& aFound) {
+    return GetFirstNamedElement(aName, aFound);
+  }
+  virtual Element* GetFirstNamedElement(const nsAString& aName,
+                                        bool& aFound) = 0;
+  virtual void GetSupportedNames(nsTArray<nsString>& aNames) = 0;
+
+ protected:
+  Element* DefaultGetFirstNamedElement(const nsAString& aName, bool& aFound);
+
+  using FilterElementWithName = bool (*)(nsIContent*);
+  void GetSupportedNames(nsTArray<nsString>& aNames,
+                         FilterElementWithName aFilter);
+};
+
+class EmptyContentList final : public HTMLCollection {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(EmptyContentList, HTMLCollection)
+
+  explicit EmptyContentList(nsINode* aRoot) : mRoot(aRoot) {}
+
+  nsINode* GetParentObject() override { return mRoot; }
+
+  JSObject* WrapObject(JSContext* cx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  uint32_t Length() final { return 0; }
+  Element* Item(uint32_t aIndex) override { return nullptr; }
+  Element* GetFirstNamedElement(const nsAString& aName, bool& aFound) override {
+    aFound = false;
+    return nullptr;
+  }
+  void GetSupportedNames(nsTArray<nsString>& aNames) override {}
+
+ protected:
+  virtual ~EmptyContentList() = default;
+
+ private:
+  nsCOMPtr<nsINode> mRoot;
+};
+
+struct ContentListKey {
+  ContentListKey(nsINode* aRootNode, int32_t aMatchNameSpaceId,
+                 const nsAString& aTagname, bool aIsHTMLDocument)
+      : mRootNode(aRootNode),
+        mMatchNameSpaceId(aMatchNameSpaceId),
+        mTagname(aTagname),
+        mIsHTMLDocument(aIsHTMLDocument),
+        mHash(mozilla::AddToHash(mozilla::HashString(aTagname), mRootNode,
+                                 mMatchNameSpaceId, mIsHTMLDocument)) {}
+
+  ContentListKey(const ContentListKey& aContentListKey) = default;
+
+  inline uint32_t GetHash(void) const { return mHash; }
+
+  nsINode* const mRootNode;  
+  const int32_t mMatchNameSpaceId;
+  const nsAString& mTagname;
+  bool mIsHTMLDocument;
+  const uint32_t mHash;
+};
+
+class ContentList : public HTMLCollection, public nsStubMultiMutationObserver {
+ protected:
+  enum class State : uint8_t {
+    UpToDate = 0,
+    Dirty,
+    Lazy,
+  };
+
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+
+  ContentList(nsINode* aRootNode, int32_t aMatchNameSpaceId,
+              nsAtom* aHTMLMatchAtom, nsAtom* aXMLMatchAtom, bool aDeep = true,
+              bool aLiveList = true, bool aKnownParserCreated = false);
+
+  ContentList(nsINode* aRootNode, nsContentListMatchFunc aFunc,
+              nsContentListDestroyFunc aDestroyFunc, void* aData,
+              bool aDeep = true, nsAtom* aMatchAtom = nullptr,
+              int32_t aMatchNameSpaceId = kNameSpaceID_None,
+              bool aFuncMayDependOnAttr = true, bool aLiveList = true,
+              bool aKnownParserCreated = false);
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+ protected:
+  virtual ~ContentList();
+
+ public:
+  int32_t IndexOf(nsIContent* aContent, bool aDoFlush) override;
+  int32_t IndexOf(nsIContent* aContent) override;
+  nsINode* GetParentObject() override { return mRootNode; }
+
+  uint32_t Length() final { return Length(true); }
+  Element* Item(uint32_t aIndex) final;
+  Element* GetFirstNamedElement(const nsAString& aName, bool& aFound) override {
+    Element* item = NamedItem(aName, true);
+    aFound = !!item;
+    return item;
+  }
+  void GetSupportedNames(nsTArray<nsString>& aNames) override {
+    GetSupportedNames(aNames, nullptr);
+  }
+
+  void GetSupportedNames(nsTArray<nsString>& aNames,
+                         FilterElementWithName aFilter) {
+    BringSelfUpToDate(true);
+    HTMLCollection::GetSupportedNames(aNames, aFilter);
+  }
+
+  using HTMLCollection::NamedItem;
+
+  uint32_t Length(bool aDoFlush);
+  Element* Item(uint32_t aIndex, bool aDoFlush);
+  Element* NamedItem(const nsAString& aName, bool aDoFlush);
+
+  NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTECHANGED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTAPPENDED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTINSERTED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTREMOVED
+  NS_DECL_NSIMUTATIONOBSERVER_NODEWILLBEDESTROYED
+
+  bool MatchesKey(const ContentListKey& aKey) const {
+    MOZ_ASSERT(mXMLMatchAtom,
+               "How did we get here with a null match atom on our list?");
+    return mXMLMatchAtom->Equals(aKey.mTagname) &&
+           mRootNode == aKey.mRootNode &&
+           mMatchNameSpaceId == aKey.mMatchNameSpaceId &&
+           mIsHTMLDocument == aKey.mIsHTMLDocument;
+  }
+
+  void SetDirty() {
+    mState = State::Dirty;
+    InvalidateNamedItemsCache();
+    Reset();
+    SetEnabledCallbacks(nsIMutationObserver::kNodeWillBeDestroyed);
+  }
+
+  void LastRelease() override;
+
+  class HashEntry;
+
+ protected:
+  using NamedItemsCache = nsTHashMap<nsAtomHashKey, Element*>;
+
+  void InvalidateNamedItemsCache() {
+    mNamedItemsCache = nullptr;
+    mNamedItemsCacheValid = false;
+  }
+
+  inline void InsertElementInNamedItemsCache(nsIContent&);
+  inline void InvalidateNamedItemsCacheForAttributeChange(int32_t aNameSpaceID,
+                                                          nsAtom* aAttribute);
+  inline void InvalidateNamedItemsCacheForInsertion(Element&);
+  inline void InvalidateNamedItemsCacheForDeletion(Element&);
+
+  void EnsureNamedItemsCacheValid(bool aDoFlush);
+
+  bool Match(Element* aElement);
+  bool MatchSelf(nsIContent* aContent);
+
+  virtual nsINode* GetNextNode(nsINode* aCurrent);
+
+  virtual void PopulateSelf(uint32_t aNeededLength,
+                            uint32_t aExpectedElementsIfDirty = 0);
+
+  bool MayContainRelevantNodes(nsINode* aContainer) {
+    return mDeep || aContainer == mRootNode;
+  }
+
+  void RemoveFromHashtable();
+  void BringSelfUpToDate(bool aDoFlush);
+
+  void RemoveFromCaches() override { RemoveFromHashtable(); }
+
+  void MaybeMarkDirty() {
+    if (mState != State::Dirty && ++mMissedUpdates > 128) {
+      mMissedUpdates = 0;
+      SetDirty();
+    }
+  }
+
+  nsINode* mRootNode;  
+  int32_t mMatchNameSpaceId;
+  RefPtr<nsAtom> mHTMLMatchAtom;
+  RefPtr<nsAtom> mXMLMatchAtom;
+
+  nsContentListMatchFunc mFunc = nullptr;
+  nsContentListDestroyFunc mDestroyFunc = nullptr;
+  void* mData = nullptr;
+
+  mozilla::UniquePtr<NamedItemsCache> mNamedItemsCache;
+
+  uint8_t mMissedUpdates = 0;
+
+  State mState;
+
+  bool mMatchAll : 1;
+  bool mDeep : 1;
+  bool mFuncMayDependOnAttr : 1;
+  bool mFlushesNeeded : 1;
+  bool mIsHTMLDocument : 1;
+  bool mNamedItemsCacheValid : 1;
+  const bool mIsLiveList : 1;
+  bool mInHashtable : 1;
+
+#ifdef DEBUG_CONTENT_LIST
+  void AssertInSync();
+#endif
+};
+
+class CacheableFuncStringContentList;
+
+class MOZ_STACK_CLASS FuncStringCacheKey {
+ public:
+  FuncStringCacheKey(nsINode* aRootNode, nsContentListMatchFunc aFunc,
+                     const nsAString& aString)
+      : mRootNode(aRootNode), mFunc(aFunc), mString(aString) {}
+
+  uint32_t GetHash(void) const {
+    uint32_t hash = mozilla::HashString(mString);
+    return mozilla::AddToHash(hash, mRootNode, mFunc);
+  }
+
+ private:
+  friend class CacheableFuncStringContentList;
+
+  nsINode* const mRootNode;
+  const nsContentListMatchFunc mFunc;
+  const nsAString& mString;
+};
+
+class CacheableFuncStringContentList : public ContentList {
+ public:
+  virtual ~CacheableFuncStringContentList();
+
+  bool Equals(const FuncStringCacheKey* aKey) {
+    return mRootNode == aKey->mRootNode && mFunc == aKey->mFunc &&
+           mString == aKey->mString;
+  }
+
+  enum ContentListType { eNodeList, eHTMLCollection };
+#ifdef DEBUG
+  ContentListType mType;
+#endif
+
+  class HashEntry;
+
+ protected:
+  CacheableFuncStringContentList(
+      nsINode* aRootNode, nsContentListMatchFunc aFunc,
+      nsContentListDestroyFunc aDestroyFunc,
+      nsFuncStringContentListDataAllocator aDataAllocator,
+      const nsAString& aString, mozilla::DebugOnly<ContentListType> aType)
+      : ContentList(aRootNode, aFunc, aDestroyFunc, nullptr),
+#ifdef DEBUG
+        mType(aType),
+#endif
+        mString(aString) {
+    mData = (*aDataAllocator)(aRootNode, &mString);
+    MOZ_ASSERT(mData);
+  }
+
+  void RemoveFromCaches() override { RemoveFromFuncStringHashtable(); }
+  void RemoveFromFuncStringHashtable();
+
+  nsString mString;
+};
+
+class CachableElementsByNameNodeList : public CacheableFuncStringContentList {
+ public:
+  CachableElementsByNameNodeList(
+      nsINode* aRootNode, nsContentListMatchFunc aFunc,
+      nsContentListDestroyFunc aDestroyFunc,
+      nsFuncStringContentListDataAllocator aDataAllocator,
+      const nsAString& aString)
+      : CacheableFuncStringContentList(aRootNode, aFunc, aDestroyFunc,
+                                       aDataAllocator, aString, eNodeList) {}
+
+  NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTECHANGED
+
+  JSObject* WrapObject(JSContext* cx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+#ifdef DEBUG
+  static const ContentListType sType;
+#endif
+};
+
+class CacheableFuncStringHTMLCollection
+    : public CacheableFuncStringContentList {
+ public:
+  CacheableFuncStringHTMLCollection(
+      nsINode* aRootNode, nsContentListMatchFunc aFunc,
+      nsContentListDestroyFunc aDestroyFunc,
+      nsFuncStringContentListDataAllocator aDataAllocator,
+      const nsAString& aString)
+      : CacheableFuncStringContentList(aRootNode, aFunc, aDestroyFunc,
+                                       aDataAllocator, aString,
+                                       eHTMLCollection) {}
+
+  JSObject* WrapObject(JSContext* cx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+#ifdef DEBUG
+  static const ContentListType sType;
+#endif
+};
+
+class LabelsNodeList final : public ContentList {
+ public:
+  LabelsNodeList(nsGenericHTMLElement* aLabeledElement, nsINode* aSubtreeRoot,
+                 nsContentListMatchFunc aMatchFunc,
+                 nsContentListDestroyFunc aDestroyFunc);
+
+  NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTECHANGED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTAPPENDED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTINSERTED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTREMOVED
+  NS_DECL_NSIMUTATIONOBSERVER_NODEWILLBEDESTROYED
+
+  JSObject* WrapObject(JSContext* cx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  void ResetRoots();
+
+  void LastRelease() override;
+
+ protected:
+  virtual ~LabelsNodeList();
+
+  nsINode* GetNextNode(nsINode* aCurrent) override;
+
+ private:
+  void PopulateSelf(uint32_t aNeededLength,
+                    uint32_t aExpectedElementsIfDirty = 0) override;
+
+  bool NodeIsInScope(nsINode* aNode);
+
+  static bool ResetRootsCallback(void* aData);
+  static bool SetDirtyCallback(void* aData);
+
+  void WatchLabeledDescendantsOfNearestAncestorLabel(Element* labeledHost);
+
+  nsTArray<nsINode*> mRoots;
+};
+
+}  
+#endif  // mozilla_dom_ContentList_h_

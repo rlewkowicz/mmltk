@@ -1,0 +1,1378 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsXMLContentSink.h"
+
+#include "js/ColumnNumber.h"  // JS::ColumnNumberOneOrigin
+#include "mozAutoDocUpdate.h"
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/LoadInfo.h"
+#include "mozilla/Logging.h"
+#include "mozilla/StyleSheetInlines.h"
+#include "mozilla/css/Loader.h"
+#include "mozilla/dom/CDATASection.h"
+#include "mozilla/dom/Comment.h"
+#include "mozilla/dom/CustomElementRegistry.h"
+#include "mozilla/dom/DocGroup.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentType.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/HTMLTemplateElement.h"
+#include "mozilla/dom/MutationObservers.h"
+#include "mozilla/dom/NameSpaceConstants.h"
+#include "mozilla/dom/ProcessingInstruction.h"
+#include "mozilla/dom/ScriptLoader.h"
+#include "mozilla/dom/nsCSPUtils.h"
+#include "mozilla/dom/txMozillaXSLTProcessor.h"
+#include "mozilla/intl/LocaleService.h"
+#include "nsCOMPtr.h"
+#include "nsCRT.h"
+#include "nsContentCreatorFunctions.h"
+#include "nsContentPolicyUtils.h"
+#include "nsContentUtils.h"
+#include "nsDocElementCreatedNotificationRunner.h"
+#include "nsError.h"
+#include "nsGkAtoms.h"
+#include "nsHTMLParts.h"
+#include "nsHtml5SVGLoadDispatcher.h"
+#include "nsIChannel.h"
+#include "nsIContent.h"
+#include "nsIContentPolicy.h"
+#include "nsIDocShell.h"
+#include "nsIDocumentViewer.h"
+#include "nsIParser.h"
+#include "nsIScriptContext.h"
+#include "nsIScriptElement.h"
+#include "nsIScriptGlobalObject.h"
+#include "nsIScriptSecurityManager.h"
+#include "nsIURI.h"
+#include "nsMimeTypes.h"
+#include "nsNameSpaceManager.h"
+#include "nsNetUtil.h"
+#include "nsNodeInfoManager.h"
+#include "nsReadableUtils.h"
+#include "nsRect.h"
+#include "nsTextNode.h"
+#include "nsUnicharUtils.h"
+#include "nsXMLPrettyPrinter.h"
+#include "prtime.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+
+nsresult NS_NewXMLContentSink(nsIXMLContentSink** aResult, Document* aDoc,
+                              nsIURI* aURI, nsISupports* aContainer,
+                              nsIChannel* aChannel) {
+  MOZ_ASSERT(nullptr != aResult, "null ptr");
+  if (nullptr == aResult) {
+    return NS_ERROR_NULL_POINTER;
+  }
+  RefPtr<nsXMLContentSink> it = new nsXMLContentSink();
+
+  nsresult rv = it->Init(aDoc, aURI, aContainer, aChannel);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  it.forget(aResult);
+  return NS_OK;
+}
+
+nsXMLContentSink::nsXMLContentSink() = default;
+nsXMLContentSink::~nsXMLContentSink() = default;
+
+nsresult nsXMLContentSink::Init(Document* aDoc, nsIURI* aURI,
+                                nsISupports* aContainer, nsIChannel* aChannel) {
+  nsresult rv = nsContentSink::Init(aDoc, aURI, aContainer, aChannel);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  aDoc->AddObserver(this);
+  mIsDocumentObserver = true;
+
+  if (!mDocShell) {
+    mPrettyPrintXML = false;
+  }
+
+  mState = eXMLContentSinkState_InProlog;
+  mDocElement = nullptr;
+
+  return NS_OK;
+}
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    nsXMLContentSink::StackNode& aField, const char* aName,
+    uint32_t aFlags = 0) {
+  ImplCycleCollectionTraverse(aCallback, aField.mContent, aName, aFlags);
+}
+
+inline void ImplCycleCollectionUnlink(nsXMLContentSink::StackNode& aField) {
+  ImplCycleCollectionUnlink(aField.mContent);
+}
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsXMLContentSink)
+  NS_INTERFACE_MAP_ENTRY(nsIContentSink)
+  NS_INTERFACE_MAP_ENTRY(nsIXMLContentSink)
+  NS_INTERFACE_MAP_ENTRY(nsIExpatSink)
+  NS_INTERFACE_MAP_ENTRY(nsITransformObserver)
+NS_INTERFACE_MAP_END_INHERITING(nsContentSink)
+
+NS_IMPL_ADDREF_INHERITED(nsXMLContentSink, nsContentSink)
+NS_IMPL_RELEASE_INHERITED(nsXMLContentSink, nsContentSink)
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(nsXMLContentSink, nsContentSink,
+                                   mCurrentHead, mDocElement, mLastTextNode,
+                                   mContentStack, mDocumentChildren)
+
+NS_IMETHODIMP
+nsXMLContentSink::WillParse(void) { return WillParseImpl(); }
+
+NS_IMETHODIMP
+nsXMLContentSink::WillBuildModel() {
+  WillBuildModelImpl();
+
+  mDocument->BeginLoad();
+
+  if (mPrettyPrintXML) {
+    nsAutoCString command;
+    GetParser()->GetCommand(command);
+    if (!command.EqualsLiteral("view")) {
+      mPrettyPrintXML = false;
+    }
+  }
+
+  return NS_OK;
+}
+
+bool nsXMLContentSink::CanStillPrettyPrint() {
+  return mPrettyPrintXML &&
+         (!mPrettyPrintHasFactoredElements || mPrettyPrintHasSpecialRoot);
+}
+
+nsresult nsXMLContentSink::MaybePrettyPrint() {
+  if (!CanStillPrettyPrint()) {
+    mPrettyPrintXML = false;
+
+    return NS_OK;
+  }
+
+  {
+    nsAutoMicroTask mt;
+  }
+
+  mDocument->RemoveObserver(this);
+  mIsDocumentObserver = false;
+
+  mDocument->EnsureCSSLoader().SetEnabled(true);
+
+  RefPtr<nsXMLPrettyPrinter> printer;
+  nsresult rv = NS_NewXMLPrettyPrinter(getter_AddRefs(printer));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  bool isPrettyPrinting;
+  rv = printer->PrettyPrint(mDocument, mXSLTIsDisabled, &isPrettyPrinting);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mPrettyPrinting = isPrettyPrinting;
+  return NS_OK;
+}
+
+static void CheckXSLTParamPI(ProcessingInstruction* aPi,
+                             nsIDocumentTransformer* aProcessor,
+                             nsINode* aSource) {
+  nsAutoString target, data;
+  aPi->GetTarget(target);
+
+  if (target.EqualsLiteral("xslt-param-namespace")) {
+    aPi->GetData(data);
+    nsAutoString prefix, namespaceAttr;
+    nsContentUtils::GetPseudoAttributeValue(data, nsGkAtoms::prefix, prefix);
+    if (!prefix.IsEmpty() && nsContentUtils::GetPseudoAttributeValue(
+                                 data, nsGkAtoms::_namespace, namespaceAttr)) {
+      aProcessor->AddXSLTParamNamespace(prefix, namespaceAttr);
+    }
+  }
+
+  else if (target.EqualsLiteral("xslt-param")) {
+    aPi->GetData(data);
+    nsAutoString name, namespaceAttr, select, value;
+    nsContentUtils::GetPseudoAttributeValue(data, nsGkAtoms::name, name);
+    nsContentUtils::GetPseudoAttributeValue(data, nsGkAtoms::_namespace,
+                                            namespaceAttr);
+    if (!nsContentUtils::GetPseudoAttributeValue(data, nsGkAtoms::select,
+                                                 select)) {
+      select.SetIsVoid(true);
+    }
+    if (!nsContentUtils::GetPseudoAttributeValue(data, nsGkAtoms::value,
+                                                 value)) {
+      value.SetIsVoid(true);
+    }
+    if (!name.IsEmpty()) {
+      aProcessor->AddXSLTParam(name, namespaceAttr, select, value, aSource);
+    }
+  }
+}
+
+NS_IMETHODIMP
+nsXMLContentSink::DidBuildModel(bool aTerminated) {
+  if (!mParser) {
+    return NS_OK;
+  }
+
+  FlushTags();
+
+  DidBuildModelImpl(aTerminated);
+
+  if (mXSLTProcessor) {
+    mDocument->RemoveObserver(this);
+    mIsDocumentObserver = false;
+
+    ErrorResult rv;
+    RefPtr<DocumentFragment> source = mDocument->CreateDocumentFragment();
+    for (nsIContent* child : mDocumentChildren) {
+      if (child->NodeType() != nsINode::DOCUMENT_TYPE_NODE) {
+        source->AppendChild(*child, rv);
+        if (rv.Failed()) {
+          return rv.StealNSResult();
+        }
+      }
+    }
+
+    for (nsIContent* child : mDocumentChildren) {
+      if (auto pi = ProcessingInstruction::FromNode(child)) {
+        CheckXSLTParamPI(pi, mXSLTProcessor, source);
+      } else if (child->IsElement()) {
+        break;
+      }
+    }
+
+    mXSLTProcessor->SetSourceContentModel(source);
+    mXSLTProcessor = nullptr;
+  } else {
+
+    MaybePrettyPrint();
+
+    bool startLayout = true;
+
+    if (mPrettyPrinting) {
+      NS_ASSERTION(!mPendingSheetCount, "Shouldn't have pending sheets here!");
+
+      css::Loader* cssLoader = mDocument->GetExistingCSSLoader();
+      if (cssLoader && cssLoader->HasPendingLoads()) {
+        cssLoader->AddObserver(this);
+        startLayout = false;
+      }
+    }
+
+    if (startLayout) {
+      StartLayout(false);
+
+      ScrollToRef();
+    }
+
+    mDocument->RemoveObserver(this);
+    mIsDocumentObserver = false;
+
+    RefPtr<Document> doc = mDocument;
+    if (!mDeferredLayoutStart && doc->IsBeingUsedAsImage()) {
+      doc->FlushPendingNotifications(FlushType::Layout);
+    }
+
+    doc->EndLoad();
+
+    DropParserAndPerfHint();
+  }
+
+  return NS_OK;
+}
+
+nsresult nsXMLContentSink::OnDocumentCreated(Document* aSourceDocument,
+                                             Document* aResultDocument) {
+  aResultDocument->SetDocWriteDisabled(true);
+
+  nsCOMPtr<nsIDocumentViewer> viewer;
+  mDocShell->GetDocViewer(getter_AddRefs(viewer));
+  if (viewer && viewer->GetDocument() == aSourceDocument) {
+    return viewer->SetDocumentInternal(aResultDocument, true);
+  }
+  return NS_OK;
+}
+
+nsresult nsXMLContentSink::OnTransformDone(Document* aSourceDocument,
+                                           nsresult aResult,
+                                           Document* aResultDocument) {
+  MOZ_ASSERT(aResultDocument,
+             "Don't notify about transform end without a document.");
+
+  mDocumentChildren.Clear();
+
+  nsCOMPtr<nsIDocumentViewer> viewer;
+  mDocShell->GetDocViewer(getter_AddRefs(viewer));
+
+  RefPtr<Document> originalDocument = mDocument;
+  bool blockingOnload = mIsBlockingOnload;
+
+  auto IsXSLTError = [](nsresult aResult, nsIDocumentViewer* aViewer,
+                        Document* aResultDocument) -> bool {
+    return NS_FAILED(aResult) && aViewer->GetDocument() && aResultDocument &&
+           aViewer->GetDocument()->GetPrincipal() ==
+               aResultDocument->GetPrincipal() &&
+           aResultDocument->GetDocumentElement() &&
+           aResultDocument->GetDocumentElement()->NodeInfo()->Equals(
+               nsGkAtoms::parsererror) &&
+           aResultDocument->GetDocumentElement()->NodeInfo()->NamespaceEquals(
+               nsDependentAtomString(nsGkAtoms::nsuri_parsererror));
+  };
+
+  if (viewer && (viewer->GetDocument() == aSourceDocument ||
+                 viewer->GetDocument() == aResultDocument ||
+                 IsXSLTError(aResult, viewer, aResultDocument))) {
+    if (NS_FAILED(aResult)) {
+      aResultDocument->SetMayStartLayout(false);
+      viewer->SetDocument(aResultDocument);
+    }
+
+    if (!mRunsToCompletion) {
+      aResultDocument->BlockOnload();
+      mIsBlockingOnload = true;
+    }
+    mDocument = aResultDocument;
+    aResultDocument->SetDocWriteDisabled(false);
+
+    nsIContent* rootElement = mDocument->GetRootElement();
+    if (rootElement) {
+      NS_ASSERTION(mDocument->ComputeIndexOf(rootElement).isSome(),
+                   "rootElement not in doc?");
+      mDocument->BeginUpdate();
+      MutationObservers::NotifyContentInserted(mDocument, rootElement, {});
+      mDocument->EndUpdate();
+    }
+
+    StartLayout(false);
+
+    ScrollToRef();
+  }
+
+  originalDocument->EndLoad();
+  if (blockingOnload) {
+    originalDocument->UnblockOnload(true);
+  }
+
+  DropParserAndPerfHint();
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsXMLContentSink::StyleSheetLoaded(StyleSheet* aSheet, bool aWasDeferred,
+                                   nsresult aStatus) {
+  if (!mPrettyPrinting) {
+    return nsContentSink::StyleSheetLoaded(aSheet, aWasDeferred, aStatus);
+  }
+
+  if (mDocument->GetExistingCSSLoader() &&
+      !mDocument->GetExistingCSSLoader()->HasPendingLoads()) {
+    mDocument->GetExistingCSSLoader()->RemoveObserver(this);
+    StartLayout(false);
+    ScrollToRef();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsXMLContentSink::WillInterrupt(void) { return WillInterruptImpl(); }
+
+void nsXMLContentSink::WillResume() { WillResumeImpl(); }
+
+NS_IMETHODIMP
+nsXMLContentSink::SetParser(nsParserBase* aParser) {
+  MOZ_ASSERT(aParser, "Should have a parser here!");
+  mParser = aParser;
+  return NS_OK;
+}
+
+static bool FindIsAttrValue(const char16_t** aAtts, const char16_t** aResult) {
+  RefPtr<nsAtom> prefix, localName;
+  for (; *aAtts; aAtts += 2) {
+    int32_t nameSpaceID;
+    nsContentUtils::SplitExpatName(aAtts[0], getter_AddRefs(prefix),
+                                   getter_AddRefs(localName), &nameSpaceID);
+    if (nameSpaceID == kNameSpaceID_None && localName == nsGkAtoms::is) {
+      *aResult = aAtts[1];
+
+      return true;
+    }
+  }
+
+  return false;
+}
+
+nsresult nsXMLContentSink::CreateElement(
+    const char16_t** aAtts, uint32_t aAttsCount,
+    mozilla::dom::NodeInfo* aNodeInfo, uint32_t aLineNumber,
+    uint32_t aColumnNumber, nsIContent** aResult, bool* aAppendContent,
+    FromParser aFromParser) {
+  NS_ASSERTION(aNodeInfo, "can't create element without nodeinfo");
+
+  *aResult = nullptr;
+  *aAppendContent = true;
+  nsresult rv = NS_OK;
+
+  RefPtr<mozilla::dom::NodeInfo> ni = aNodeInfo;
+  RefPtr<Element> element;
+
+  const char16_t* is = nullptr;
+  RefPtr<nsAtom> isAtom;
+  uint32_t namespaceID = ni->NamespaceID();
+  bool isXHTMLOrXUL =
+      namespaceID == kNameSpaceID_XHTML || namespaceID == kNameSpaceID_XUL;
+  if (isXHTMLOrXUL && FindIsAttrValue(aAtts, &is)) {
+    isAtom = NS_AtomizeMainThread(nsDependentString(is));
+  }
+
+  CustomElementDefinition* customElementDefinition = nullptr;
+  nsAtom* nameAtom = ni->NameAtom();
+  if (mDocument && !mDocument->IsLoadedAsData() && isXHTMLOrXUL &&
+      (isAtom || nsContentUtils::IsCustomElementName(nameAtom, namespaceID))) {
+    nsAtom* typeAtom = is ? isAtom.get() : nameAtom;
+
+    MOZ_ASSERT(nameAtom->Equals(ni->LocalName()));
+    customElementDefinition = nsContentUtils::LookupCustomElementDefinition(
+        mDocument, nameAtom, namespaceID, typeAtom);
+  }
+
+  if (customElementDefinition) {
+    FlushTags();
+    {
+      nsAutoMicroTask mt;
+    }
+
+    Maybe<AutoCEReaction> autoCEReaction;
+    if (auto* docGroup = mDocument->GetDocGroup()) {
+      autoCEReaction.emplace(docGroup->CustomElementReactionsStack(), nullptr);
+    }
+    rv = NS_NewElement(getter_AddRefs(element), ni.forget(), aFromParser,
+                       isAtom, customElementDefinition);
+  } else {
+    rv = NS_NewElement(getter_AddRefs(element), ni.forget(), aFromParser,
+                       isAtom);
+  }
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (aNodeInfo->Equals(nsGkAtoms::script, kNameSpaceID_XHTML) ||
+      aNodeInfo->Equals(nsGkAtoms::script, kNameSpaceID_SVG)) {
+    if (nsCOMPtr<nsIScriptElement> sele = do_QueryInterface(element)) {
+      sele->SetScriptLineNumber(aLineNumber);
+      sele->SetScriptColumnNumber(
+          JS::ColumnNumberOneOrigin::fromZeroOrigin(aColumnNumber));
+      sele->SetCreatorParser(GetParser());
+    } else {
+      MOZ_ASSERT(nsNameSpaceManager::GetInstance()->mSVGDisabled,
+                 "Node didn't QI to script, but SVG wasn't disabled.");
+    }
+  }
+
+  if (aNodeInfo->NamespaceEquals(kNameSpaceID_XHTML)) {
+    mPrettyPrintHasFactoredElements = true;
+  } else {
+    if (!mPrettyPrintHasFactoredElements && !mPrettyPrintHasSpecialRoot &&
+        mPrettyPrintXML) {
+      mPrettyPrintHasFactoredElements =
+          nsNameSpaceManager::GetInstance()->HasElementCreator(
+              aNodeInfo->NamespaceID());
+    }
+
+    if (!aNodeInfo->NamespaceEquals(kNameSpaceID_SVG)) {
+      element.forget(aResult);
+      return NS_OK;
+    }
+  }
+
+  if (auto* linkStyle = LinkStyle::FromNode(*element)) {
+    if (aFromParser) {
+      linkStyle->DisableUpdates();
+    }
+    if (!aNodeInfo->Equals(nsGkAtoms::link, kNameSpaceID_XHTML)) {
+      linkStyle->SetLineNumber(aFromParser ? aLineNumber : 0);
+      linkStyle->SetColumnNumber(aFromParser ? aColumnNumber + 1 : 1);
+    }
+  }
+
+  element.forget(aResult);
+  return NS_OK;
+}
+
+nsresult nsXMLContentSink::CloseElement(nsIContent* aContent) {
+  NS_ASSERTION(aContent, "missing element to close");
+
+  mozilla::dom::NodeInfo* nodeInfo = aContent->NodeInfo();
+
+  if (nsIContent::RequiresDoneAddingChildren(nodeInfo->NamespaceID(),
+                                             nodeInfo->NameAtom())) {
+    aContent->DoneAddingChildren(HaveNotifiedForCurrentContent());
+  }
+
+  if (IsMonolithicContainer(nodeInfo)) {
+    mInMonolithicContainer--;
+  }
+
+  if (!nodeInfo->NamespaceEquals(kNameSpaceID_XHTML) &&
+      !nodeInfo->NamespaceEquals(kNameSpaceID_SVG)) {
+    return NS_OK;
+  }
+
+  if (nodeInfo->Equals(nsGkAtoms::script, kNameSpaceID_XHTML) ||
+      nodeInfo->Equals(nsGkAtoms::script, kNameSpaceID_SVG)) {
+    nsCOMPtr<nsIScriptElement> sele = do_QueryInterface(aContent);
+    if (!sele) {
+      MOZ_ASSERT(nsNameSpaceManager::GetInstance()->mSVGDisabled,
+                 "Node didn't QI to script, but SVG wasn't disabled.");
+      return NS_OK;
+    }
+
+    if (mPreventScriptExecution) {
+      sele->PreventExecution();
+      return NS_OK;
+    }
+
+    StopDeflecting();
+
+    FlushTags();
+
+    {
+      nsAutoMicroTask mt;
+    }
+
+    bool block = sele->AttemptToExecute(GetParser());
+
+    if (mParser && !mParser->IsParserEnabled()) {
+      block = true;
+    }
+    return block ? NS_ERROR_HTMLPARSER_BLOCK : NS_OK;
+  }
+
+  if (auto* linkStyle = LinkStyle::FromNode(*aContent)) {
+    auto updateOrError = linkStyle->EnableUpdatesAndUpdateStyleSheet(
+        mRunsToCompletion ? nullptr : this);
+    if (updateOrError.isErr()) {
+      return updateOrError.unwrapErr();
+    }
+    if (updateOrError.unwrap().ShouldBlock() && !mRunsToCompletion) {
+      ++mPendingSheetCount;
+      if (mScriptLoader) {
+        mScriptLoader->AddParserBlockingScriptExecutionBlocker();
+      }
+    }
+  }
+  return NS_OK;
+}
+
+nsresult nsXMLContentSink::AddContentAsLeaf(nsIContent* aContent) {
+  nsresult result = NS_OK;
+
+  if (mState == eXMLContentSinkState_InProlog) {
+    NS_ASSERTION(mDocument, "Fragments have no prolog");
+    mDocumentChildren.AppendElement(aContent);
+  } else if (mState == eXMLContentSinkState_InEpilog) {
+    NS_ASSERTION(mDocument, "Fragments have no epilog");
+    if (mXSLTProcessor) {
+      mDocumentChildren.AppendElement(aContent);
+    } else {
+      mDocument->AppendChildTo(aContent, false, IgnoreErrors());
+    }
+  } else {
+    nsCOMPtr<nsIContent> parent = GetCurrentContent();
+
+    if (parent) {
+      ErrorResult rv;
+      parent->AppendChildTo(aContent, false, rv);
+      result = rv.StealNSResult();
+    }
+  }
+  return result;
+}
+
+nsresult nsXMLContentSink::LoadXSLStyleSheet(nsIURI* aUrl) {
+  nsCOMPtr<nsIDocumentTransformer> processor = new txMozillaXSLTProcessor();
+  mDocument->WarnOnceAndReportAbout(DeprecatedOperations::eXSLTDeprecated);
+
+  processor->SetTransformObserver(this);
+
+  if (NS_SUCCEEDED(processor->LoadStyleSheet(aUrl, mDocument))) {
+    mXSLTProcessor.swap(processor);
+  }
+
+
+  return NS_OK;
+}
+
+nsresult nsXMLContentSink::ProcessStyleLinkFromHeader(
+    const nsAString& aHref, bool aAlternate, const nsAString& aTitle,
+    const nsAString& aIntegrity, const nsAString& aType,
+    const nsAString& aMedia, const nsAString& aReferrerPolicy,
+    const nsAString& aFetchPriority) {
+  mPrettyPrintXML = false;
+
+  nsAutoCString cmd;
+  if (mParser) GetParser()->GetCommand(cmd);
+  if (cmd.EqualsASCII(kLoadAsData))
+    return NS_OK;  
+
+  bool wasXSLT;
+  nsresult rv = MaybeProcessXSLTLink(nullptr, aHref, aAlternate, aType, aType,
+                                     aMedia, aReferrerPolicy, &wasXSLT);
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (wasXSLT) {
+    return NS_OK;
+  }
+
+  // Otherwise fall through to nsContentSink to handle CSS Link headers.
+  return nsContentSink::ProcessStyleLinkFromHeader(
+      aHref, aAlternate, aTitle, aIntegrity, aType, aMedia, aReferrerPolicy,
+      aFetchPriority);
+}
+
+nsresult nsXMLContentSink::MaybeProcessXSLTLink(
+    ProcessingInstruction* aProcessingInstruction, const nsAString& aHref,
+    bool aAlternate, const nsAString& aTitle, const nsAString& aType,
+    const nsAString& aMedia, const nsAString& aReferrerPolicy, bool* aWasXSLT) {
+  bool wasXSLTType = aType.LowerCaseEqualsLiteral(TEXT_XSL) ||
+                     aType.LowerCaseEqualsLiteral(APPLICATION_XSLT_XML) ||
+                     aType.LowerCaseEqualsLiteral(TEXT_XML) ||
+                     aType.LowerCaseEqualsLiteral(APPLICATION_XML);
+  bool wasXSLT = StaticPrefs::dom_xslt_enabled() && wasXSLTType;
+
+  if (aWasXSLT) {
+    *aWasXSLT = wasXSLT;
+  }
+
+  if (aAlternate) {
+    return NS_OK;
+  }
+  if (!mDocShell) {
+    return NS_OK;
+  }
+
+  if (!wasXSLT) {
+    mPrettyPrintXML =
+        mPrettyPrintXML || (wasXSLTType && !StaticPrefs::dom_xslt_enabled());
+    mXSLTIsDisabled = wasXSLTType;
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIURI> url;
+  nsresult rv = NS_NewURI(getter_AddRefs(url), aHref, nullptr,
+                          mDocument->GetDocBaseURI());
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsIScriptSecurityManager* secMan = nsContentUtils::GetSecurityManager();
+  rv = secMan->CheckLoadURIWithPrincipal(mDocument->NodePrincipal(), url,
+                                         nsIScriptSecurityManager::ALLOW_CHROME,
+                                         mDocument->InnerWindowID());
+  NS_ENSURE_SUCCESS(rv, NS_OK);
+
+  nsCOMPtr<nsILoadInfo> secCheckLoadInfo = MOZ_TRY(
+      net::LoadInfo::Create(mDocument->NodePrincipal(),  
+                            mDocument->NodePrincipal(),  
+                            aProcessingInstruction,
+                            nsILoadInfo::SEC_ONLY_FOR_EXPLICIT_CONTENTSEC_CHECK,
+                            nsIContentPolicy::TYPE_XSLT));
+
+  int16_t decision = nsIContentPolicy::ACCEPT;
+  rv = NS_CheckContentLoadPolicy(url, secCheckLoadInfo, &decision,
+                                 nsContentUtils::GetContentPolicy());
+
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (NS_CP_REJECTED(decision)) {
+    return NS_OK;
+  }
+
+  return LoadXSLStyleSheet(url);
+}
+
+void nsXMLContentSink::SetDocumentCharset(NotNull<const Encoding*> aEncoding) {
+  if (mDocument) {
+    mDocument->SetDocumentCharacterSet(aEncoding);
+  }
+}
+
+nsISupports* nsXMLContentSink::GetTarget() { return ToSupports(mDocument); }
+
+nsresult nsXMLContentSink::FlushText(bool aReleaseTextNode) {
+  nsresult rv = NS_OK;
+
+  if (!mText.IsEmpty()) {
+    if (mLastTextNode) {
+      bool notify = HaveNotifiedForCurrentContent();
+      if (notify) {
+        ++mInNotification;
+      }
+      rv = mLastTextNode->AppendText(mText.Elements(), mText.Length(), notify);
+      if (notify) {
+        --mInNotification;
+      }
+
+      mText.ClearAndRetainStorage();
+    } else {
+      RefPtr<nsTextNode> textContent =
+          new (mNodeInfoManager) nsTextNode(mNodeInfoManager);
+
+      mLastTextNode = textContent;
+
+      textContent->SetText(mText.Elements(), mText.Length(), false);
+      mText.ClearAndRetainStorage();
+
+      rv = AddContentAsLeaf(textContent);
+    }
+  }
+
+  if (aReleaseTextNode) {
+    mLastTextNode = nullptr;
+  }
+
+  return rv;
+}
+
+nsIContent* nsXMLContentSink::GetCurrentContent() {
+  if (mContentStack.Length() == 0) {
+    return nullptr;
+  }
+  return GetCurrentStackNode()->mContent;
+}
+
+nsXMLContentSink::StackNode* nsXMLContentSink::GetCurrentStackNode() {
+  int32_t count = mContentStack.Length();
+  return count != 0 ? &mContentStack[count - 1] : nullptr;
+}
+
+nsresult nsXMLContentSink::PushContent(nsIContent* aContent) {
+  MOZ_ASSERT(aContent, "Null content being pushed!");
+  StackNode* sn = mContentStack.AppendElement();
+  NS_ENSURE_TRUE(sn, NS_ERROR_OUT_OF_MEMORY);
+
+  nsIContent* contentToPush = aContent;
+
+  if (contentToPush->IsHTMLElement(nsGkAtoms::_template)) {
+    HTMLTemplateElement* templateElement =
+        static_cast<HTMLTemplateElement*>(contentToPush);
+    contentToPush = templateElement->Content();
+  }
+
+  sn->mContent = contentToPush;
+  sn->mNumFlushed = 0;
+  return NS_OK;
+}
+
+void nsXMLContentSink::PopContent() {
+  if (mContentStack.IsEmpty()) {
+    NS_WARNING("Popping empty stack");
+    return;
+  }
+
+  mContentStack.RemoveLastElement();
+}
+
+bool nsXMLContentSink::HaveNotifiedForCurrentContent() const {
+  uint32_t stackLength = mContentStack.Length();
+  if (stackLength) {
+    const StackNode& stackNode = mContentStack[stackLength - 1];
+    nsIContent* parent = stackNode.mContent;
+    return stackNode.mNumFlushed == parent->GetChildCount();
+  }
+  return true;
+}
+
+void nsXMLContentSink::MaybeStartLayout(bool aIgnorePendingSheets) {
+  if (mLayoutStarted || mXSLTProcessor || CanStillPrettyPrint()) {
+    return;
+  }
+  StartLayout(aIgnorePendingSheets);
+}
+
+
+bool nsXMLContentSink::SetDocElement(int32_t aNameSpaceID, nsAtom* aTagName,
+                                     nsIContent* aContent) {
+  if (mDocElement) return false;
+
+  mDocElement = aContent;
+
+  if (mXSLTProcessor) {
+    mDocumentChildren.AppendElement(aContent);
+    return true;
+  }
+
+  auto documentChildren = std::move(mDocumentChildren);
+  MOZ_ASSERT(mDocumentChildren.IsEmpty());
+  for (nsIContent* child : documentChildren) {
+    auto* linkStyle = LinkStyle::FromNode(*child);
+    if (linkStyle) {
+      linkStyle->DisableUpdates();
+    }
+    mDocument->AppendChildTo(child, false, IgnoreErrors());
+    if (linkStyle) {
+      auto updateOrError = linkStyle->EnableUpdatesAndUpdateStyleSheet(
+          mRunsToCompletion ? nullptr : this);
+      if (updateOrError.isErr()) {
+        continue;
+      }
+      auto update = updateOrError.unwrap();
+      if (update.ShouldBlock() && !mRunsToCompletion) {
+        ++mPendingSheetCount;
+        if (mScriptLoader) {
+          mScriptLoader->AddParserBlockingScriptExecutionBlocker();
+        }
+      }
+    }
+  }
+
+  if (aNameSpaceID == kNameSpaceID_XSLT &&
+      (aTagName == nsGkAtoms::stylesheet || aTagName == nsGkAtoms::transform)) {
+    mPrettyPrintHasSpecialRoot = true;
+    if (mPrettyPrintXML) {
+      if (dom::ScriptLoader* scriptLoader = mDocument->GetScriptLoader()) {
+        scriptLoader->SetEnabled(false);
+      }
+      mDocument->EnsureCSSLoader().SetEnabled(false);
+    }
+  }
+
+  IgnoredErrorResult rv;
+  mDocument->AppendChildTo(mDocElement, NotifyForDocElement(), rv);
+  if (rv.Failed()) {
+    return false;
+  }
+
+  return true;
+}
+
+NS_IMETHODIMP
+nsXMLContentSink::HandleStartElement(const char16_t* aName,
+                                     const char16_t** aAtts,
+                                     uint32_t aAttsCount, uint32_t aLineNumber,
+                                     uint32_t aColumnNumber) {
+  return HandleStartElement(aName, aAtts, aAttsCount, aLineNumber,
+                            aColumnNumber, true);
+}
+
+nsresult nsXMLContentSink::HandleStartElement(
+    const char16_t* aName, const char16_t** aAtts, uint32_t aAttsCount,
+    uint32_t aLineNumber, uint32_t aColumnNumber, bool aInterruptable) {
+  MOZ_RELEASE_ASSERT(aAttsCount % 2 == 0, "incorrect aAttsCount");
+  aAttsCount /= 2;
+
+  nsresult result = NS_OK;
+  bool appendContent = true;
+  nsCOMPtr<nsIContent> content;
+
+  MOZ_ASSERT(eXMLContentSinkState_InEpilog != mState);
+
+  FlushText();
+  DidAddContent();
+
+  mState = eXMLContentSinkState_InDocumentElement;
+
+  int32_t nameSpaceID;
+  RefPtr<nsAtom> prefix, localName;
+  nsContentUtils::SplitExpatName(aName, getter_AddRefs(prefix),
+                                 getter_AddRefs(localName), &nameSpaceID);
+
+  if (!OnOpenContainer(aAtts, aAttsCount, nameSpaceID, localName,
+                       aLineNumber)) {
+    return NS_OK;
+  }
+
+  RefPtr<mozilla::dom::NodeInfo> nodeInfo;
+  nodeInfo = mNodeInfoManager->GetNodeInfo(localName, prefix, nameSpaceID,
+                                           nsINode::ELEMENT_NODE);
+
+  result = CreateElement(aAtts, aAttsCount, nodeInfo, aLineNumber,
+                         aColumnNumber, getter_AddRefs(content), &appendContent,
+                         FROM_PARSER_NETWORK);
+  NS_ENSURE_SUCCESS(result, result);
+
+  nsCOMPtr<nsIContent> parent = GetCurrentContent();
+
+  result = PushContent(content);
+  NS_ENSURE_SUCCESS(result, result);
+
+  result = AddAttributes(aAtts, content->AsElement());
+
+  if (NS_OK == result) {
+    if (!SetDocElement(nameSpaceID, localName, content) && appendContent) {
+      NS_ENSURE_TRUE(parent, NS_ERROR_UNEXPECTED);
+
+      parent->AppendChildTo(content, false, IgnoreErrors());
+    }
+  }
+
+  if (nsIContent::RequiresDoneCreatingElement(nodeInfo->NamespaceID(),
+                                              nodeInfo->NameAtom())) {
+    content->DoneCreatingElement();
+  }
+
+  if (nodeInfo->NamespaceID() == kNameSpaceID_XHTML &&
+      nodeInfo->NameAtom() == nsGkAtoms::head && !mCurrentHead) {
+    mCurrentHead = content;
+  }
+
+  if (IsMonolithicContainer(nodeInfo)) {
+    mInMonolithicContainer++;
+  }
+
+  if (!mXSLTProcessor) {
+    if (content == mDocElement) {
+      nsContentUtils::AddScriptRunner(
+          MakeAndAddRef<nsDocElementCreatedNotificationRunner>(mDocument));
+
+      if (aInterruptable && NS_SUCCEEDED(result) && mParser &&
+          !mParser->IsParserEnabled()) {
+        return NS_ERROR_HTMLPARSER_BLOCK;
+      }
+    } else if (!mCurrentHead) {
+      MaybeStartLayout(false);
+    }
+  }
+
+  return aInterruptable && NS_SUCCEEDED(result) ? DidProcessATokenImpl()
+                                                : result;
+}
+
+NS_IMETHODIMP
+nsXMLContentSink::HandleEndElement(const char16_t* aName) {
+  return HandleEndElement(aName, true);
+}
+
+nsresult nsXMLContentSink::HandleEndElement(const char16_t* aName,
+                                            bool aInterruptable) {
+  nsresult result = NS_OK;
+
+  MOZ_ASSERT(eXMLContentSinkState_InDocumentElement == mState);
+
+  FlushText();
+
+  StackNode* sn = GetCurrentStackNode();
+  if (!sn) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  nsCOMPtr<nsIContent> content;
+  sn->mContent.swap(content);
+  uint32_t numFlushed = sn->mNumFlushed;
+
+  PopContent();
+  NS_ASSERTION(content, "failed to pop content");
+#ifdef DEBUG
+  RefPtr<nsAtom> debugNameSpacePrefix, debugTagAtom;
+  int32_t debugNameSpaceID;
+  nsContentUtils::SplitExpatName(aName, getter_AddRefs(debugNameSpacePrefix),
+                                 getter_AddRefs(debugTagAtom),
+                                 &debugNameSpaceID);
+  bool isTemplateElement = debugTagAtom == nsGkAtoms::_template &&
+                           debugNameSpaceID == kNameSpaceID_XHTML;
+  NS_ASSERTION(
+      content->NodeInfo()->Equals(debugTagAtom, debugNameSpaceID) ||
+          (debugNameSpaceID == kNameSpaceID_MathML &&
+           content->NodeInfo()->NamespaceID() == kNameSpaceID_disabled_MathML &&
+           content->NodeInfo()->Equals(debugTagAtom)) ||
+          (debugNameSpaceID == kNameSpaceID_SVG &&
+           content->NodeInfo()->NamespaceID() == kNameSpaceID_disabled_SVG &&
+           content->NodeInfo()->Equals(debugTagAtom)) ||
+          isTemplateElement,
+      "Wrong element being closed");
+#endif
+
+  int32_t stackLen = mContentStack.Length();
+  if (mNotifyLevel >= stackLen) {
+    if (numFlushed < content->GetChildCount()) {
+      NotifyAppend(content, numFlushed);
+    }
+    mNotifyLevel = stackLen - 1;
+  }
+
+  result = CloseElement(content);
+
+  if (mCurrentHead == content) {
+    mCurrentHead = nullptr;
+  }
+
+  if (mDocElement == content) {
+    mState = eXMLContentSinkState_InEpilog;
+
+    mDocument->OnParsingCompleted();
+
+    MaybeStartLayout(false);
+  }
+
+  DidAddContent();
+
+  if (content->IsSVGElement(nsGkAtoms::svg)) {
+    FlushTags();
+    nsCOMPtr<nsIRunnable> event = new nsHtml5SVGLoadDispatcher(content);
+    if (NS_FAILED(content->OwnerDoc()->Dispatch(event.forget()))) {
+      NS_WARNING("failed to dispatch svg load dispatcher");
+    }
+  }
+
+  return aInterruptable && NS_SUCCEEDED(result) ? DidProcessATokenImpl()
+                                                : result;
+}
+
+NS_IMETHODIMP
+nsXMLContentSink::HandleComment(const char16_t* aName) {
+  FlushText();
+
+  RefPtr<Comment> comment = new (mNodeInfoManager) Comment(mNodeInfoManager);
+  comment->SetText(nsDependentString(aName), false);
+  nsresult rv = AddContentAsLeaf(comment);
+  DidAddContent();
+
+  return NS_SUCCEEDED(rv) ? DidProcessATokenImpl() : rv;
+}
+
+NS_IMETHODIMP
+nsXMLContentSink::HandleCDataSection(const char16_t* aData, uint32_t aLength) {
+  if (mXSLTProcessor) {
+    return AddText(Span(aData, aLength));
+  }
+
+  FlushText();
+
+  RefPtr<CDATASection> cdata =
+      new (mNodeInfoManager) CDATASection(mNodeInfoManager);
+  cdata->SetText(aData, aLength, false);
+  nsresult rv = AddContentAsLeaf(cdata);
+  DidAddContent();
+
+  return NS_SUCCEEDED(rv) ? DidProcessATokenImpl() : rv;
+}
+
+NS_IMETHODIMP
+nsXMLContentSink::HandleDoctypeDecl(const nsAString& aSubset,
+                                    const nsAString& aName,
+                                    const nsAString& aSystemId,
+                                    const nsAString& aPublicId,
+                                    nsISupports* aCatalogData) {
+  FlushText();
+
+  NS_ASSERTION(mDocument, "Shouldn't get here from a document fragment");
+
+  RefPtr<nsAtom> name = NS_Atomize(aName);
+  NS_ENSURE_TRUE(name, NS_ERROR_OUT_OF_MEMORY);
+
+  RefPtr<DocumentType> docType = NS_NewDOMDocumentType(
+      mNodeInfoManager, name, aPublicId, aSystemId, aSubset);
+
+  MOZ_ASSERT(!aCatalogData,
+             "Need to add back support for catalog style "
+             "sheets");
+
+  mDocumentChildren.AppendElement(docType);
+  DidAddContent();
+  return DidProcessATokenImpl();
+}
+
+NS_IMETHODIMP
+nsXMLContentSink::HandleCharacterData(const char16_t* aData, uint32_t aLength) {
+  return HandleCharacterData(aData, aLength, true);
+}
+
+nsresult nsXMLContentSink::HandleCharacterData(const char16_t* aData,
+                                               uint32_t aLength,
+                                               bool aInterruptable) {
+  nsresult rv = NS_OK;
+  if (aData && mState != eXMLContentSinkState_InProlog &&
+      mState != eXMLContentSinkState_InEpilog) {
+    rv = AddText(Span(aData, aLength));
+  }
+  return aInterruptable && NS_SUCCEEDED(rv) ? DidProcessATokenImpl() : rv;
+}
+
+NS_IMETHODIMP
+nsXMLContentSink::HandleProcessingInstruction(const char16_t* aTarget,
+                                              const char16_t* aData) {
+  FlushText();
+
+  const nsDependentString target(aTarget);
+  const nsDependentString data(aData);
+
+  RefPtr<ProcessingInstruction> node =
+      NS_NewXMLProcessingInstruction(mNodeInfoManager, target, data);
+
+  if (LinkStyle::FromNode(*node)) {
+    mPrettyPrintXML = false;
+  }
+
+  nsresult rv = AddContentAsLeaf(node);
+  NS_ENSURE_SUCCESS(rv, rv);
+  DidAddContent();
+
+  if (mState == eXMLContentSinkState_InProlog && target.EqualsLiteral("csp") &&
+      mDocument->NodePrincipal()->IsSystemPrincipal()) {
+    CSP_ApplyMetaCSPToDoc(*mDocument, data);
+  }
+
+  nsAutoString type;
+  nsContentUtils::GetPseudoAttributeValue(data, nsGkAtoms::type, type);
+  nsAutoString mimeType, notUsed;
+  nsContentUtils::SplitMimeType(type, mimeType, notUsed);
+
+  if (mState != eXMLContentSinkState_InProlog ||
+      !target.EqualsLiteral("xml-stylesheet") || mimeType.IsEmpty() ||
+      mimeType.LowerCaseEqualsLiteral("text/css")) {
+    return DidProcessATokenImpl();
+  }
+
+  nsAutoString href, title, media;
+  bool isAlternate = false;
+
+  if (!ParsePIData(data, href, title, media, isAlternate)) {
+    return DidProcessATokenImpl();
+  }
+
+  rv =
+      MaybeProcessXSLTLink(node, href, isAlternate, title, type, media, u""_ns);
+  return NS_SUCCEEDED(rv) ? DidProcessATokenImpl() : rv;
+}
+
+bool nsXMLContentSink::ParsePIData(const nsString& aData, nsString& aHref,
+                                   nsString& aTitle, nsString& aMedia,
+                                   bool& aIsAlternate) {
+  if (!nsContentUtils::GetPseudoAttributeValue(aData, nsGkAtoms::href, aHref)) {
+    return false;
+  }
+
+  nsContentUtils::GetPseudoAttributeValue(aData, nsGkAtoms::title, aTitle);
+
+  nsContentUtils::GetPseudoAttributeValue(aData, nsGkAtoms::media, aMedia);
+
+  nsAutoString alternate;
+  nsContentUtils::GetPseudoAttributeValue(aData, nsGkAtoms::alternate,
+                                          alternate);
+
+  aIsAlternate = alternate.EqualsLiteral("yes");
+
+  return true;
+}
+
+NS_IMETHODIMP
+nsXMLContentSink::HandleXMLDeclaration(const char16_t* aVersion,
+                                       const char16_t* aEncoding,
+                                       int32_t aStandalone) {
+  mDocument->SetXMLDeclaration(aVersion, aEncoding, aStandalone);
+
+  return DidProcessATokenImpl();
+}
+
+NS_IMETHODIMP
+nsXMLContentSink::ReportError(const char16_t* aErrorText,
+                              const char16_t* aSourceText,
+                              nsIScriptError* aError, bool* _retval) {
+  MOZ_ASSERT(aError && aSourceText && aErrorText, "Check arguments!!!");
+  nsresult rv = NS_OK;
+
+  *_retval = true;
+
+  mPrettyPrintXML = false;
+
+  mState = eXMLContentSinkState_InProlog;
+
+
+  mDocument->RemoveObserver(this);
+  mIsDocumentObserver = false;
+
+  mDocumentChildren.Clear();
+  while (mDocument->GetLastChild()) {
+    mDocument->GetLastChild()->Remove();
+  }
+  mDocElement = nullptr;
+
+  mText.ClearAndRetainStorage();
+
+  if (mXSLTProcessor) {
+    mXSLTProcessor->CancelLoads();
+    mXSLTProcessor = nullptr;
+  }
+
+  mContentStack.Clear();
+  mNotifyLevel = 0;
+
+  if (mDocument->SuppressParserErrorElement()) {
+    return NS_OK;
+  }
+
+
+  constexpr auto errorNs =
+      u"http://www.mozilla.org/newlayout/xml/parsererror.xml"_ns;
+
+  nsAutoString parsererror(errorNs);
+  parsererror.Append((char16_t)0xFFFF);
+  parsererror.AppendLiteral("parsererror");
+
+  const char16_t* dirAttr[] = {u"dir", u"ltr", nullptr, nullptr};
+  if (intl::LocaleService::GetInstance()->IsAppLocaleRTL() &&
+      !mDocument->ShouldResistFingerprinting(RFPTarget::JSLocale)) {
+    dirAttr[1] = u"rtl";
+  }
+  rv = HandleStartElement(parsererror.get(), dirAttr, 0, 2, 0);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = HandleCharacterData(aErrorText, NS_strlen(aErrorText), false);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoString sourcetext(errorNs);
+  sourcetext.Append((char16_t)0xFFFF);
+  sourcetext.AppendLiteral("sourcetext");
+
+  const char16_t* noAtts[] = {nullptr, nullptr};
+  rv = HandleStartElement(sourcetext.get(), noAtts, 0, (uint32_t)-1, 0);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = HandleCharacterData(aSourceText, NS_strlen(aSourceText), false);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = HandleEndElement(sourcetext.get(), false);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = HandleEndElement(parsererror.get(), false);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  FlushTags();
+
+  return NS_OK;
+}
+
+nsresult nsXMLContentSink::AddAttributes(const char16_t** aAtts,
+                                         Element* aContent) {
+  RefPtr<nsAtom> prefix, localName;
+  while (*aAtts) {
+    int32_t nameSpaceID;
+    nsContentUtils::SplitExpatName(aAtts[0], getter_AddRefs(prefix),
+                                   getter_AddRefs(localName), &nameSpaceID);
+
+    aContent->SetAttr(nameSpaceID, localName, prefix,
+                      nsDependentString(aAtts[1]), false);
+    aAtts += 2;
+  }
+
+  return NS_OK;
+}
+
+nsresult nsXMLContentSink::AddText(mozilla::Span<const char16_t> aNewText) {
+  while (!aNewText.IsEmpty()) {
+    size_t spaceRemaining = mText.Capacity() - mText.Length();
+    if (spaceRemaining == 0) {
+      nsresult rv = FlushText(false);
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        return rv;
+      }
+      MOZ_ASSERT(mText.IsEmpty());
+      spaceRemaining = mText.Capacity();
+    }
+
+    size_t numCharsToCopy = std::min(spaceRemaining, aNewText.Length());
+    const auto [newText1, newText2] = aNewText.SplitAt(numCharsToCopy);
+    mText.AppendElements(newText1);
+    aNewText = newText2;
+  }
+
+  return NS_OK;
+}
+
+void nsXMLContentSink::InitialTranslationCompleted() { StartLayout(false); }
+
+void nsXMLContentSink::FlushPendingNotifications(FlushType aType) {
+  if (!mInNotification) {
+    if (mIsDocumentObserver) {
+      if (aType >= FlushType::ContentAndNotify) {
+        FlushTags();
+      } else {
+        FlushText(false);
+      }
+    }
+    if (aType >= FlushType::EnsurePresShellInitAndFrames) {
+      MaybeStartLayout(true);
+    }
+  }
+}
+
+nsresult nsXMLContentSink::FlushTags() {
+  mDeferredFlushTags = false;
+  uint32_t oldUpdates = mUpdatesInNotification;
+
+  mUpdatesInNotification = 0;
+  ++mInNotification;
+  {
+    mozAutoDocUpdate updateBatch(mDocument, true);
+
+    FlushText(false);
+
+
+    int32_t stackPos;
+    int32_t stackLen = mContentStack.Length();
+    bool flushed = false;
+    uint32_t childCount;
+    nsIContent* content;
+
+    for (stackPos = 0; stackPos < stackLen; ++stackPos) {
+      content = mContentStack[stackPos].mContent;
+      childCount = content->GetChildCount();
+
+      if (!flushed && (mContentStack[stackPos].mNumFlushed < childCount)) {
+        NotifyAppend(content, mContentStack[stackPos].mNumFlushed);
+        flushed = true;
+      }
+
+      mContentStack[stackPos].mNumFlushed = childCount;
+    }
+    mNotifyLevel = stackLen - 1;
+  }
+  --mInNotification;
+
+  if (mUpdatesInNotification > 1) {
+    UpdateChildCounts();
+  }
+
+  mUpdatesInNotification = oldUpdates;
+  return NS_OK;
+}
+
+void nsXMLContentSink::UpdateChildCounts() {
+  int32_t stackLen = mContentStack.Length();
+  int32_t stackPos = stackLen - 1;
+  while (stackPos >= 0) {
+    StackNode& node = mContentStack[stackPos];
+    node.mNumFlushed = node.mContent->GetChildCount();
+
+    stackPos--;
+  }
+  mNotifyLevel = stackLen - 1;
+}
+
+bool nsXMLContentSink::IsMonolithicContainer(
+    mozilla::dom::NodeInfo* aNodeInfo) {
+  return ((aNodeInfo->NamespaceID() == kNameSpaceID_XHTML &&
+           (aNodeInfo->NameAtom() == nsGkAtoms::tr ||
+            aNodeInfo->NameAtom() == nsGkAtoms::select ||
+            aNodeInfo->NameAtom() == nsGkAtoms::object)) ||
+          (aNodeInfo->NamespaceID() == kNameSpaceID_MathML &&
+           (aNodeInfo->NameAtom() == nsGkAtoms::math)));
+}
+
+void nsXMLContentSink::ContinueInterruptedParsingIfEnabled() {
+  if (mParser && mParser->IsParserEnabled()) {
+    GetParser()->ContinueInterruptedParsing();
+  }
+}
+
+void nsXMLContentSink::ContinueInterruptedParsingAsync() {
+  nsCOMPtr<nsIRunnable> ev = NewRunnableMethod(
+      "nsXMLContentSink::ContinueInterruptedParsingIfEnabled", this,
+      &nsXMLContentSink::ContinueInterruptedParsingIfEnabled);
+  mDocument->Dispatch(ev.forget());
+}
+
+nsIParser* nsXMLContentSink::GetParser() {
+  return static_cast<nsIParser*>(mParser.get());
+}

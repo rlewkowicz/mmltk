@@ -1,0 +1,317 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+*
+*   Copyright (C) 2004-2012, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+*******************************************************************************
+*   file name:  ucase.h
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+*   created on: 2004aug30
+*   created by: Markus W. Scherer
+*
+*   Low-level Unicode character/string case mapping code.
+*/
+
+#ifndef __UCASE_H__
+#define __UCASE_H__
+
+#include "unicode/utypes.h"
+#include "unicode/uset.h"
+#include "putilimp.h"
+#include "uset_imp.h"
+#include "udataswp.h"
+#include "utrie2.h"
+
+#ifdef __cplusplus
+U_NAMESPACE_BEGIN
+
+class UnicodeString;
+
+U_NAMESPACE_END
+#endif
+
+
+U_CFUNC void U_EXPORT2
+ucase_addPropertyStarts(const USetAdder *sa, UErrorCode *pErrorCode);
+
+U_CFUNC int32_t
+ucase_getCaseLocale(const char *locale);
+
+enum {
+    UCASE_LOC_UNKNOWN,
+    UCASE_LOC_ROOT,
+    UCASE_LOC_TURKISH,
+    UCASE_LOC_LITHUANIAN,
+    UCASE_LOC_GREEK,
+    UCASE_LOC_DUTCH,
+    UCASE_LOC_ARMENIAN
+};
+
+#define _STRCASECMP_OPTIONS_MASK 0xffff
+
+#define _FOLD_CASE_OPTIONS_MASK 7
+
+
+U_CAPI UChar32 U_EXPORT2
+ucase_tolower(UChar32 c);
+
+U_CAPI UChar32 U_EXPORT2
+ucase_toupper(UChar32 c);
+
+U_CAPI UChar32 U_EXPORT2
+ucase_totitle(UChar32 c);
+
+U_CAPI UChar32 U_EXPORT2
+ucase_fold(UChar32 c, uint32_t options);
+
+U_CFUNC void U_EXPORT2
+ucase_addCaseClosure(UChar32 c, const USetAdder *sa);
+
+U_CFUNC void U_EXPORT2
+ucase_addSimpleCaseClosure(UChar32 c, const USetAdder *sa);
+
+U_CFUNC UBool U_EXPORT2
+ucase_addStringCaseClosure(const UChar *s, int32_t length, const USetAdder *sa);
+
+#ifdef __cplusplus
+U_NAMESPACE_BEGIN
+
+class U_COMMON_API FullCaseFoldingIterator {
+public:
+    FullCaseFoldingIterator();
+    UChar32 next(UnicodeString &full);
+private:
+    FullCaseFoldingIterator(const FullCaseFoldingIterator &) = delete;  
+    FullCaseFoldingIterator &operator=(const FullCaseFoldingIterator &) = delete;  
+
+    const char16_t *unfold;
+    int32_t unfoldRows;
+    int32_t unfoldRowWidth;
+    int32_t unfoldStringWidth;
+    int32_t currentRow;
+    int32_t rowCpIndex;
+};
+
+namespace LatinCase {
+
+constexpr char16_t LIMIT = 0x180;
+constexpr char16_t LONG_S = 0x17f;
+constexpr int8_t EXC = -0x80;
+
+extern const int8_t TO_LOWER_NORMAL[LIMIT];
+extern const int8_t TO_LOWER_TR_LT[LIMIT];
+
+extern const int8_t TO_UPPER_NORMAL[LIMIT];
+extern const int8_t TO_UPPER_TR[LIMIT];
+
+}  
+
+U_NAMESPACE_END
+#endif
+
+U_CAPI int32_t U_EXPORT2
+ucase_getType(UChar32 c);
+
+U_CAPI int32_t U_EXPORT2
+ucase_getTypeOrIgnorable(UChar32 c);
+
+U_CAPI UBool U_EXPORT2
+ucase_isSoftDotted(UChar32 c);
+
+U_CAPI UBool U_EXPORT2
+ucase_isCaseSensitive(UChar32 c);
+
+
+U_CDECL_BEGIN
+
+typedef UChar32 U_CALLCONV
+UCaseContextIterator(void *context, int8_t dir);
+
+struct UCaseContext {
+    void *p;
+    int32_t start, index, limit;
+    int32_t cpStart, cpLimit;
+    int8_t dir;
+    int8_t b1, b2, b3;
+};
+typedef struct UCaseContext UCaseContext;
+
+U_CDECL_END
+
+#define UCASECONTEXT_INITIALIZER { NULL,  0, 0, 0,  0, 0,  0,  0, 0, 0 }
+
+enum {
+    UCASE_MAX_STRING_LENGTH=0x1f
+};
+
+U_CAPI int32_t U_EXPORT2
+ucase_toFullLower(UChar32 c,
+                  UCaseContextIterator *iter, void *context,
+                  const UChar **pString,
+                  int32_t caseLocale);
+
+U_CAPI int32_t U_EXPORT2
+ucase_toFullUpper(UChar32 c,
+                  UCaseContextIterator *iter, void *context,
+                  const UChar **pString,
+                  int32_t caseLocale);
+
+U_CAPI int32_t U_EXPORT2
+ucase_toFullTitle(UChar32 c,
+                  UCaseContextIterator *iter, void *context,
+                  const UChar **pString,
+                  int32_t caseLocale);
+
+U_CAPI int32_t U_EXPORT2
+ucase_toFullFolding(UChar32 c,
+                    const UChar **pString,
+                    uint32_t options);
+
+U_CFUNC int32_t U_EXPORT2
+ucase_hasBinaryProperty(UChar32 c, UProperty which);
+
+
+U_CDECL_BEGIN
+
+typedef int32_t U_CALLCONV
+UCaseMapFull(UChar32 c,
+             UCaseContextIterator *iter, void *context,
+             const UChar **pString,
+             int32_t caseLocale);
+
+U_CDECL_END
+
+
+struct UCaseProps {
+    void *mem;  
+    const int32_t *indexes;
+    const uint16_t *exceptions;
+    const uint16_t *unfold;
+
+    UTrie2 trie;
+    uint8_t formatVersion[4];
+};
+
+U_CAPI const struct UCaseProps * U_EXPORT2
+ucase_getSingleton(int32_t *pExceptionsLength, int32_t *pUnfoldLength);
+
+
+#define UCASE_DATA_NAME "ucase"
+#define UCASE_DATA_TYPE "icu"
+
+#define UCASE_FMT_0 0x63
+#define UCASE_FMT_1 0x41
+#define UCASE_FMT_2 0x53
+#define UCASE_FMT_3 0x45
+
+enum {
+    UCASE_IX_INDEX_TOP,
+    UCASE_IX_LENGTH,
+    UCASE_IX_TRIE_SIZE,
+    UCASE_IX_EXC_LENGTH,
+    UCASE_IX_UNFOLD_LENGTH,
+
+    UCASE_IX_MAX_FULL_LENGTH=15,
+    UCASE_IX_TOP=16
+};
+
+
+U_CFUNC const UTrie2 * U_EXPORT2
+ucase_getTrie(void);
+
+#define UCASE_TYPE_MASK     3
+enum {
+    UCASE_NONE,
+    UCASE_LOWER,
+    UCASE_UPPER,
+    UCASE_TITLE
+};
+
+#define UCASE_GET_TYPE(props) ((props)&UCASE_TYPE_MASK)
+#define UCASE_GET_TYPE_AND_IGNORABLE(props) ((props)&7)
+
+#define UCASE_IS_UPPER_OR_TITLE(props) ((props)&2)
+
+#define UCASE_IGNORABLE         4
+#define UCASE_EXCEPTION         8
+#define UCASE_SENSITIVE         0x10
+
+#define UCASE_HAS_EXCEPTION(props) ((props)&UCASE_EXCEPTION)
+
+#define UCASE_DOT_MASK      0x60
+enum {
+    UCASE_NO_DOT=0,         
+    UCASE_SOFT_DOTTED=0x20, 
+    UCASE_ABOVE=0x40,       
+    UCASE_OTHER_ACCENT=0x60 
+};
+
+#define UCASE_DELTA_SHIFT   7
+#define UCASE_DELTA_MASK    0xff80
+#define UCASE_MAX_DELTA     0xff
+#define UCASE_MIN_DELTA     (-UCASE_MAX_DELTA-1)
+
+#if U_SIGNED_RIGHT_SHIFT_IS_ARITHMETIC
+#   define UCASE_GET_DELTA(props) ((int16_t)(props)>>UCASE_DELTA_SHIFT)
+#else
+#   define UCASE_GET_DELTA(props) (int16_t)(((props)&0x8000) ? (((props)>>UCASE_DELTA_SHIFT)|0xfe00) : ((uint16_t)(props)>>UCASE_DELTA_SHIFT))
+#endif
+
+#define UCASE_EXC_SHIFT     4
+#define UCASE_EXC_MASK      0xfff0
+#define UCASE_MAX_EXCEPTIONS ((UCASE_EXC_MASK>>UCASE_EXC_SHIFT)+1)
+
+
+enum {
+    UCASE_EXC_LOWER,
+    UCASE_EXC_FOLD,
+    UCASE_EXC_UPPER,
+    UCASE_EXC_TITLE,
+    UCASE_EXC_DELTA,
+    UCASE_EXC_5,            
+    UCASE_EXC_CLOSURE,
+    UCASE_EXC_FULL_MAPPINGS,
+    UCASE_EXC_ALL_SLOTS     
+};
+
+#define UCASE_EXC_DOUBLE_SLOTS      0x100
+
+enum {
+    UCASE_EXC_NO_SIMPLE_CASE_FOLDING=0x200,
+    UCASE_EXC_DELTA_IS_NEGATIVE=0x400,
+    UCASE_EXC_SENSITIVE=0x800
+};
+
+#define UCASE_EXC_DOT_SHIFT     7
+
+#define UCASE_EXC_DOT_MASK      0x3000
+enum {
+    UCASE_EXC_NO_DOT=0,
+    UCASE_EXC_SOFT_DOTTED=0x1000,
+    UCASE_EXC_ABOVE=0x2000,         
+    UCASE_EXC_OTHER_ACCENT=0x3000   
+};
+
+#define UCASE_EXC_CONDITIONAL_SPECIAL   0x4000
+#define UCASE_EXC_CONDITIONAL_FOLD      0x8000
+
+#define UCASE_FULL_LOWER    0xf
+#define UCASE_FULL_FOLDING  0xf0
+#define UCASE_FULL_UPPER    0xf00
+#define UCASE_FULL_TITLE    0xf000
+
+#define UCASE_FULL_MAPPINGS_MAX_LENGTH (4*0xf)
+#define UCASE_CLOSURE_MAX_LENGTH 0xf
+
+enum {
+    UCASE_UNFOLD_ROWS,
+    UCASE_UNFOLD_ROW_WIDTH,
+    UCASE_UNFOLD_STRING_WIDTH
+};
+
+#endif

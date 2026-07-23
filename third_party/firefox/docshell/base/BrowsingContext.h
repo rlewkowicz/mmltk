@@ -1,0 +1,1479 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_BrowsingContext_h
+#define mozilla_dom_BrowsingContext_h
+
+#include <tuple>
+#include "GVAutoplayRequestUtils.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/HalScreenConfiguration.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Span.h"
+
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/LocationBase.h"
+#include "mozilla/dom/MaybeDiscarded.h"
+#include "mozilla/dom/NavigationBinding.h"
+#include "mozilla/dom/PopupBlocker.h"
+#include "mozilla/dom/UserActivation.h"
+#include "mozilla/dom/BrowsingContextBinding.h"
+#include "mozilla/dom/ScreenOrientationBinding.h"
+#include "mozilla/dom/SyncedContext.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIDocShell.h"
+#include "nsTArray.h"
+#include "nsWrapperCache.h"
+#include "nsILoadInfo.h"
+#include "nsILoadContext.h"
+#include "nsThreadUtils.h"
+
+class nsDocShellLoadState;
+class nsGlobalWindowInner;
+class nsGlobalWindowOuter;
+class nsIPrincipal;
+class nsOuterWindowProxy;
+struct nsPoint;
+class PickleIterator;
+
+namespace IPC {
+class Message;
+class MessageReader;
+class MessageWriter;
+template <typename T>
+struct ParamTraits;
+}  
+
+namespace mozilla {
+
+class ErrorResult;
+class LogModule;
+
+namespace ipc {
+class IProtocol;
+class IPCResult;
+}  
+
+namespace dom {
+class BrowsingContent;
+class BrowsingContextGroup;
+class CanonicalBrowsingContext;
+class ChildSHistory;
+class ContentParent;
+class Element;
+struct LoadingSessionHistoryInfo;
+class Location;
+template <typename>
+struct Nullable;
+class PreviousSessionHistoryInfo;
+template <typename T>
+class Sequence;
+class SessionHistoryInfo;
+class SessionStorageManager;
+class StructuredCloneHolder;
+struct NavigationAPIMethodTracker;
+class WindowContext;
+class WindowGlobalChild;
+struct WindowPostMessageOptions;
+class WindowProxyHolder;
+
+enum class ExplicitActiveStatus : uint8_t {
+  None,
+  Active,
+  Inactive,
+  EndGuard_,
+};
+
+struct EmbedderColorSchemes {
+  PrefersColorSchemeOverride mUsed{};
+  PrefersColorSchemeOverride mPreferred{};
+
+  bool operator==(const EmbedderColorSchemes& aOther) const {
+    return mUsed == aOther.mUsed && mPreferred == aOther.mPreferred;
+  }
+
+  bool operator!=(const EmbedderColorSchemes& aOther) const {
+    return !(*this == aOther);
+  }
+};
+
+#define MOZ_EACH_BC_FIELD(FIELD)                                              \
+  FIELD(Name, nsString)                                                       \
+  FIELD(Closed, bool)                                                         \
+  FIELD(ExplicitActive, ExplicitActiveStatus)                                 \
+                                              \
+  FIELD(SuspendMediaWhenInactive, bool)                                       \
+                         \
+  FIELD(PendingInitialization, bool)                                          \
+                                                    \
+  FIELD(IsActiveBrowserWindowInternal, bool)                                  \
+  FIELD(OpenerPolicy, nsILoadInfo::CrossOriginOpenerPolicy)                   \
+                  \
+  FIELD(OpenerId, uint64_t)                                                   \
+  FIELD(OnePermittedSandboxedNavigatorId, uint64_t)                           \
+                       \
+  FIELD(EmbedderInnerWindowId, uint64_t)                                      \
+  FIELD(CurrentInnerWindowId, uint64_t)                                       \
+  FIELD(HadOriginalOpener, bool)                                              \
+                                \
+  FIELD(TopLevelCreatedByWebContent, bool)                                    \
+  FIELD(IsPopupSpam, bool)                                                    \
+                                                           \
+  FIELD(Muted, bool)                                                          \
+                                                           \
+  FIELD(IsAppTab, bool)                                                       \
+                                                  \
+  FIELD(IsCaptivePortalTab, bool)                                             \
+                                          \
+  FIELD(HasSiblings, bool)                                                    \
+                                                 \
+  FIELD(ShouldDelayMediaFromStart, bool)                                      \
+                            \
+  FIELD(SandboxFlags, uint32_t)                                               \
+                   \
+  FIELD(InitialSandboxFlags, uint32_t)                                        \
+                         \
+  FIELD(BrowserId, uint64_t)                                                  \
+  FIELD(HistoryID, nsID)                                                      \
+  FIELD(InRDMPane, bool)                                                      \
+  FIELD(Loading, bool)                                                        \
+      \
+  FIELD(IsPrinting, bool)                                                     \
+  FIELD(AncestorLoading, bool)                                                \
+  FIELD(AllowContentRetargeting, bool)                                        \
+  FIELD(AllowContentRetargetingOnChildren, bool)                              \
+  FIELD(ForceEnableTrackingProtection, bool)                                  \
+  FIELD(UseGlobalHistory, bool)                                               \
+  FIELD(TargetTopLevelLinkClicksToBlankInternal, bool)                        \
+  FIELD(FullscreenAllowedByOwner, bool)                                       \
+  FIELD(ForceDesktopViewport, bool)                                           \
+                                                                           \
+  FIELD(IsPopupRequested, bool)                                               \
+                                                                \
+  FIELD(GVAudibleAutoplayRequestStatus, GVAutoplayRequestStatus)              \
+  FIELD(GVInaudibleAutoplayRequestStatus, GVAutoplayRequestStatus)            \
+  FIELD(ScreenHeightOverride, uint64_t)                                       \
+  FIELD(ScreenWidthOverride, uint64_t)                                        \
+  FIELD(HasScreenAreaOverride, bool)                                          \
+                                          \
+  FIELD(CurrentOrientationAngle, float)                                       \
+  FIELD(CurrentOrientationType, mozilla::dom::OrientationType)                \
+  FIELD(OrientationLock, mozilla::hal::ScreenOrientation)                     \
+  FIELD(HasOrientationOverride, bool)                                         \
+  FIELD(UserAgentOverride, nsString)                                          \
+  FIELD(TouchEventsOverrideInternal, mozilla::dom::TouchEventsOverride)       \
+  FIELD(EmbedderElementType, Maybe<nsString>)                                 \
+  FIELD(MessageManagerGroup, nsString)                                        \
+  FIELD(MaxTouchPointsOverride, uint8_t)                                      \
+  FIELD(FullZoom, float)                                                      \
+  FIELD(WatchedByDevToolsInternal, bool)                                      \
+  FIELD(TextZoom, float)                                                      \
+  FIELD(OverrideDPPX, float)                                                  \
+                                           \
+  FIELD(CurrentLoadIdentifier, Maybe<uint64_t>)                               \
+                \
+  FIELD(AndroidAppLinkLoadIdentifier, Maybe<uint64_t>)                        \
+                                      \
+  FIELD(DefaultLoadFlags, uint32_t)                                           \
+                                              \
+  FIELD(HasSessionHistory, bool)                                              \
+  FIELD(UseErrorPages, bool)                                                  \
+  FIELD(PlatformOverride, nsString)                                           \
+                                                              \
+  FIELD(HasLoadedNonInitialDocument, bool)                                    \
+                                                                \
+  FIELD(AuthorStyleDisabledDefault, bool)                                     \
+  FIELD(MediumOverride, nsString)                                             \
+                              \
+  FIELD(PrefersColorSchemeOverride, dom::PrefersColorSchemeOverride)          \
+  FIELD(LanguageOverride, nsCString)                                          \
+  FIELD(TimezoneOverride, nsString)                                           \
+                            \
+  FIELD(PrefersReducedMotionOverride, dom::PrefersReducedMotionOverride)      \
+                                     \
+  FIELD(ForcedColorsOverride, dom::ForcedColorsOverride)                      \
+                        \
+  FIELD(AnimationsPlayBackRateMultiplier, double)                             \
+                                             \
+  FIELD(EmbedderColorSchemes, EmbedderColorSchemes)                           \
+  FIELD(DisplayMode, dom::DisplayMode)                                        \
+                                                       \
+  FIELD(HistoryEntryCount, uint32_t)                                          \
+  FIELD(HasRestoreData, bool)                                                 \
+  FIELD(SessionStoreEpoch, uint32_t)                                          \
+            \
+  FIELD(AllowJavascript, bool)                                                \
+       \
+  FIELD(PageAwakeRequestCount, uint32_t)                                      \
+                               \
+  FIELD(ParentInitiatedNavigationEpoch, uint64_t)                             \
+                                  \
+  FIELD(IsSyntheticDocumentContainer, bool)                                   \
+                                                      \
+  FIELD(EmbeddedInContentDocument, bool)                                      \
+    \
+  FIELD(IsUnderHiddenEmbedderElement, bool)                                   \
+                               \
+  FIELD(ForceOffline, bool)                                                   \
+                                                             \
+  FIELD(InnerSizeSpoofedForRFP, CSSIntSize)                                   \
+                            \
+  FIELD(IPAddressSpace, nsILoadInfo::IPAddressSpace)
+
+#define NS_DOM_BROWSINGCONTEXT_IID \
+  {0x5059a6aa, 0xf09, 0x415c, {0x89, 0xbd, 0x63, 0xfd, 0xe5, 0xab, 0x1a, 0x66}};
+
+class BrowsingContext : public nsILoadContext, public nsWrapperCache {
+  MOZ_DECL_SYNCED_CONTEXT(BrowsingContext, MOZ_EACH_BC_FIELD)
+  NS_INLINE_DECL_STATIC_IID(NS_DOM_BROWSINGCONTEXT_IID)
+
+ public:
+  enum class Type { Chrome, Content };
+
+  static void Init();
+  static LogModule* GetLog();
+  static LogModule* GetSyncLog();
+
+  static already_AddRefed<BrowsingContext> Get(uint64_t aId);
+  static already_AddRefed<BrowsingContext> Get(GlobalObject&, uint64_t aId) {
+    return Get(aId);
+  }
+  static already_AddRefed<BrowsingContext> GetCurrentTopByBrowserId(
+      uint64_t aBrowserId);
+  static already_AddRefed<BrowsingContext> GetCurrentTopByBrowserId(
+      GlobalObject&, uint64_t aId) {
+    return GetCurrentTopByBrowserId(aId);
+  }
+
+  static void UpdateCurrentTopByBrowserId(BrowsingContext* aNewBrowsingContext);
+
+  static already_AddRefed<BrowsingContext> GetFromWindow(
+      WindowProxyHolder& aProxy);
+  static already_AddRefed<BrowsingContext> GetFromWindow(
+      GlobalObject&, WindowProxyHolder& aProxy) {
+    return GetFromWindow(aProxy);
+  }
+
+  static void DiscardFromContentParent(ContentParent* aCP);
+
+  static already_AddRefed<BrowsingContext> CreateIndependent(Type aType,
+                                                             bool aWindowless);
+
+  struct CreateDetachedOptions {
+    bool isPopupRequested = false;
+    bool createdDynamically = false;
+    bool topLevelCreatedByWebContent = false;
+    bool isForPrinting = false;
+    bool windowless = false;
+  };
+
+  static already_AddRefed<BrowsingContext> CreateDetached(
+      nsGlobalWindowInner* aParent, BrowsingContext* aOpener,
+      BrowsingContextGroup* aSpecificGroup, const nsAString& aName, Type aType,
+      CreateDetachedOptions aOptions);
+
+  void EnsureAttached();
+
+  bool EverAttached() const { return mEverAttached; }
+
+  CanonicalBrowsingContext* Canonical();
+
+  bool IsInProcess() const { return mIsInProcess; }
+
+  bool IsOwnedByProcess() const;
+
+  bool CanHaveRemoteOuterProxies() const {
+    return !mIsInProcess || mDanglingRemoteOuterProxies;
+  }
+
+  bool IsDiscarded() const { return mIsDiscarded; }
+
+  bool AncestorsAreCurrent() const;
+
+  bool Windowless() const { return mWindowless; }
+
+  nsIDocShell* GetDocShell() const { return mDocShell; }
+  void SetDocShell(nsIDocShell* aDocShell);
+  void ClearDocShell() { mDocShell = nullptr; }
+
+  Document* GetDocument() const {
+    return mDocShell ? mDocShell->GetDocument() : nullptr;
+  }
+  Document* GetExtantDocument() const {
+    return mDocShell ? mDocShell->GetExtantDocument() : nullptr;
+  }
+
+  void CleanUpDanglingRemoteOuterWindowProxies(
+      JSContext* aCx, JS::MutableHandle<JSObject*> aOuter);
+
+  Element* GetEmbedderElement() const { return mEmbedderElement; }
+  void SetEmbedderElement(Element* aEmbedder);
+
+  bool IsEmbedderTypeObjectOrEmbed();
+
+  void Embed();
+
+  nsPIDOMWindowOuter* GetDOMWindow() const {
+    return mDocShell ? mDocShell->GetWindow() : nullptr;
+  }
+
+  uint64_t GetRequestContextId() const { return mRequestContextId; }
+
+  void Detach(bool aFromIPC = false);
+
+  void PrepareForProcessChange();
+
+  nsresult LoadURI(nsDocShellLoadState* aLoadState,
+                   bool aSetNavigating = false);
+
+  nsresult InternalLoad(nsDocShellLoadState* aLoadState);
+
+  void Navigate(
+      nsIURI* aURI, Document* aSourceDocument, nsIPrincipal& aSubjectPrincipal,
+      ErrorResult& aRv,
+      NavigationHistoryBehavior aHistoryHandling =
+          NavigationHistoryBehavior::Auto,
+      bool aNeedsCompletelyLoadedDocument = false,
+      nsIStructuredCloneContainer* aNavigationAPIState = nullptr,
+      dom::NavigationAPIMethodTracker* aNavigationAPIMethodTracker = nullptr);
+
+  bool RemoveRootFromBFCacheSync();
+
+  nsresult CheckSandboxFlags(nsDocShellLoadState* aLoadState);
+
+  nsresult CheckFramebusting(nsDocShellLoadState* aLoadState);
+
+  bool ComputeIsFramebustingAllowed();
+
+  void DisplayLoadError(const nsAString& aURI);
+
+  bool IsTargetable() const;
+
+  bool InactiveForSuspend() const;
+
+  const nsString& Name() const { return GetName(); }
+  void GetName(nsAString& aName) { aName = GetName(); }
+  bool NameEquals(const nsAString& aName) { return GetName().Equals(aName); }
+
+  Type GetType() const { return mType; }
+  bool IsContent() const { return mType == Type::Content; }
+  bool IsChrome() const { return !IsContent(); }
+
+  bool IsTop() const { return !GetParent(); }
+  bool IsSubframe() const { return !IsTop(); }
+
+  bool IsTopContent() const { return IsContent() && IsTop(); }
+
+  bool IsInSubtreeOf(BrowsingContext* aContext);
+
+  bool IsContentSubframe() const { return IsContent() && IsSubframe(); }
+
+
+  uint64_t Id() const { return mBrowsingContextId; }
+
+  BrowsingContext* GetParent() const;
+  BrowsingContext* Top();
+  const BrowsingContext* Top() const;
+
+  int32_t IndexOf(BrowsingContext* aChild);
+
+  WindowContext* GetParentWindowContext() const { return mParentWindow; }
+  WindowContext* GetTopWindowContext() const;
+
+  already_AddRefed<BrowsingContext> GetOpener() const {
+    RefPtr<BrowsingContext> opener(Get(GetOpenerId()));
+    if (!mIsDiscarded && opener && !opener->mIsDiscarded) {
+      MOZ_DIAGNOSTIC_ASSERT(opener->mType == mType);
+      return opener.forget();
+    }
+    return nullptr;
+  }
+  void SetOpener(BrowsingContext* aOpener);
+  bool HasOpener() const;
+
+  bool HadOriginalOpener() const { return GetHadOriginalOpener(); }
+
+  bool SameOriginWithTop();
+
+  already_AddRefed<BrowsingContext> GetOnePermittedSandboxedNavigator() const {
+    return Get(GetOnePermittedSandboxedNavigatorId());
+  }
+  [[nodiscard]] nsresult SetOnePermittedSandboxedNavigator(
+      BrowsingContext* aNavigator) {
+    if (GetOnePermittedSandboxedNavigatorId()) {
+      MOZ_ASSERT(false,
+                 "One Permitted Sandboxed Navigator should only be set once.");
+      return NS_ERROR_FAILURE;
+    } else {
+      return SetOnePermittedSandboxedNavigatorId(aNavigator ? aNavigator->Id()
+                                                            : 0);
+    }
+  }
+
+  uint32_t SandboxFlags() const { return GetSandboxFlags(); }
+
+  Span<RefPtr<BrowsingContext>> Children() const;
+  void GetChildren(nsTArray<RefPtr<BrowsingContext>>& aChildren);
+
+  Span<RefPtr<BrowsingContext>> NonSyntheticChildren() const;
+
+  BrowsingContext* NonSyntheticLightDOMChildAt(uint32_t aIndex) const;
+  uint32_t NonSyntheticLightDOMChildrenCount() const;
+
+  const nsTArray<RefPtr<WindowContext>>& GetWindowContexts() {
+    return mWindowContexts;
+  }
+  void GetWindowContexts(nsTArray<RefPtr<WindowContext>>& aWindows);
+
+  void RegisterWindowContext(WindowContext* aWindow);
+  void UnregisterWindowContext(WindowContext* aWindow);
+  WindowContext* GetCurrentWindowContext() const {
+    return mCurrentWindowContext;
+  }
+
+  enum class WalkFlag {
+    Next,
+    Skip,
+    Stop,
+  };
+
+  template <typename F>
+  void PreOrderWalk(F&& aCallback) {
+    if constexpr (std::is_void_v<
+                      typename std::invoke_result_t<F, BrowsingContext*>>) {
+      PreOrderWalkVoid(std::forward<F>(aCallback));
+    } else {
+      PreOrderWalkFlag(std::forward<F>(aCallback));
+    }
+  }
+
+  void PreOrderWalkVoid(const std::function<void(BrowsingContext*)>& aCallback);
+  WalkFlag PreOrderWalkFlag(
+      const std::function<WalkFlag(BrowsingContext*)>& aCallback);
+
+  void PostOrderWalk(const std::function<void(BrowsingContext*)>& aCallback);
+
+  void GetAllBrowsingContextsInSubtree(
+      nsTArray<RefPtr<BrowsingContext>>& aBrowsingContexts);
+
+  BrowsingContextGroup* Group() { return mGroup; }
+
+  Nullable<WindowProxyHolder> GetAssociatedWindow();
+  Nullable<WindowProxyHolder> GetTopWindow();
+  Element* GetTopFrameElement();
+  bool GetIsContent() { return IsContent(); }
+  void SetUsePrivateBrowsing(bool aUsePrivateBrowsing, ErrorResult& aError);
+  void SetUseTrackingProtectionWebIDL(bool aUseTrackingProtection,
+                                      ErrorResult& aRv);
+  bool UseTrackingProtectionWebIDL() { return UseTrackingProtection(); }
+  void GetOriginAttributes(JSContext* aCx, JS::MutableHandle<JS::Value> aVal,
+                           ErrorResult& aError);
+
+  bool InRDMPane() const { return GetInRDMPane(); }
+
+  bool WatchedByDevTools();
+  void SetWatchedByDevTools(bool aWatchedByDevTools, ErrorResult& aRv);
+
+  dom::TouchEventsOverride TouchEventsOverride() const;
+  bool TargetTopLevelLinkClicksToBlank() const;
+
+  bool FullscreenAllowed() const;
+
+  float FullZoom() const { return GetFullZoom(); }
+  float TextZoom() const { return GetTextZoom(); }
+
+  float OverrideDPPX() const { return Top()->GetOverrideDPPX(); }
+
+  bool SuspendMediaWhenInactive() const {
+    return GetSuspendMediaWhenInactive();
+  }
+
+  bool IsActive() const;
+  bool ForceOffline() const { return GetForceOffline(); }
+
+  nsILoadInfo::IPAddressSpace GetCurrentIPAddressSpace() const {
+    return GetIPAddressSpace();
+  }
+
+  void SetCurrentIPAddressSpace(nsILoadInfo::IPAddressSpace aIPAddressSpace) {
+    (void)SetIPAddressSpace(aIPAddressSpace);
+  }
+
+  bool ForceDesktopViewport() const { return GetForceDesktopViewport(); }
+
+  bool AuthorStyleDisabledDefault() const {
+    return GetAuthorStyleDisabledDefault();
+  }
+
+  bool UseGlobalHistory() const { return GetUseGlobalHistory(); }
+
+  bool GetIsActiveBrowserWindow();
+
+  void SetIsActiveBrowserWindow(bool aActive);
+
+  uint64_t BrowserId() const { return GetBrowserId(); }
+
+  bool IsLoading();
+
+  void GetEmbedderElementType(nsString& aElementType) {
+    if (GetEmbedderElementType().isSome()) {
+      aElementType = GetEmbedderElementType().value();
+    }
+  }
+
+  bool IsLoadingIdentifier(uint64_t aLoadIdentifer) {
+    if (GetCurrentLoadIdentifier() &&
+        *GetCurrentLoadIdentifier() == aLoadIdentifer) {
+      return true;
+    }
+    return false;
+  }
+
+  CSSIntSize TopInnerSizeSpoofedForRFP() const {
+    return Top()->GetInnerSizeSpoofedForRFP();
+  }
+
+  [[nodiscard]] nsresult SetScreenAreaOverride(uint64_t aScreenWidth,
+                                               uint64_t aScreenHeight) {
+    if (GetHasScreenAreaOverride() &&
+        GetScreenWidthOverride() == aScreenWidth &&
+        GetScreenHeightOverride() == aScreenHeight) {
+      return NS_OK;
+    }
+
+    Transaction txn;
+    txn.SetScreenWidthOverride(aScreenWidth);
+    txn.SetScreenHeightOverride(aScreenHeight);
+    txn.SetHasScreenAreaOverride(true);
+    return txn.Commit(this);
+  }
+
+  void SetScreenAreaOverride(uint64_t aScreenWidth, uint64_t aScreenHeight,
+                             ErrorResult& aRv) {
+    MOZ_ASSERT(IsTop());
+
+    if (NS_FAILED(SetScreenAreaOverride(aScreenWidth, aScreenHeight))) {
+      aRv.ThrowInvalidStateError("Browsing context is discarded");
+    }
+  }
+
+  void ResetScreenAreaOverride() {
+    MOZ_ASSERT(IsTop());
+
+    (void)SetHasScreenAreaOverride(false);
+  }
+
+  bool HasScreenAreaOverride() const {
+    return Top()->GetHasScreenAreaOverride();
+  }
+
+  Maybe<CSSIntSize> GetScreenAreaOverride() {
+    if (!HasScreenAreaOverride()) {
+      return Nothing();
+    }
+    CSSIntSize screenSize(Top()->GetScreenWidthOverride(),
+                          Top()->GetScreenHeightOverride());
+    return Some(screenSize);
+  }
+
+  [[nodiscard]] nsresult SetCurrentOrientation(OrientationType aType,
+                                               float aAngle) {
+    Transaction txn;
+    txn.SetCurrentOrientationType(aType);
+    txn.SetCurrentOrientationAngle(aAngle);
+    return txn.Commit(this);
+  }
+
+  bool HasOrientationOverride() const {
+    return Top()->GetHasOrientationOverride();
+  }
+
+  [[nodiscard]] nsresult SetOrientationOverride(OrientationType aType,
+                                                float aAngle) {
+    if (GetHasOrientationOverride() && GetCurrentOrientationType() == aType &&
+        GetCurrentOrientationAngle() == aAngle) {
+      return NS_OK;
+    }
+
+    Transaction txn;
+    txn.SetCurrentOrientationType(aType);
+    txn.SetCurrentOrientationAngle(aAngle);
+    txn.SetHasOrientationOverride(true);
+    return txn.Commit(this);
+  }
+
+  void SetOrientationOverride(OrientationType aType, float aAngle,
+                              ErrorResult& aRv) {
+    MOZ_ASSERT(IsTop());
+
+    if (NS_FAILED(SetOrientationOverride(aType, aAngle))) {
+      aRv.ThrowInvalidStateError("Browsing context is discarded");
+    }
+  }
+
+  void ResetOrientationOverride() {
+    MOZ_ASSERT(IsTop());
+
+    (void)SetHasOrientationOverride(false);
+  }
+
+  void SetRDMPaneMaxTouchPoints(uint8_t aMaxTouchPoints, ErrorResult& aRv) {
+    if (InRDMPane()) {
+      SetMaxTouchPointsOverride(aMaxTouchPoints, aRv);
+    }
+  }
+
+  BrowsingContext* FindChildWithName(const nsAString& aName,
+                                     WindowGlobalChild& aRequestingWindow);
+
+  BrowsingContext* FindWithNameInSubtree(const nsAString& aName,
+                                         WindowGlobalChild* aRequestingWindow);
+
+  BrowsingContext* FindWithSpecialName(const nsAString& aName,
+                                       WindowGlobalChild& aRequestingWindow);
+
+  nsISupports* GetParentObject() const;
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  inline JSObject* GetWindowProxy() const { return mWindowProxy; }
+  inline JSObject* GetUnbarrieredWindowProxy() const {
+    return mWindowProxy.unbarrieredGet();
+  }
+
+  void SetWindowProxy(JS::Handle<JSObject*> aWindowProxy) {
+    mWindowProxy = aWindowProxy;
+  }
+
+  static void SweepWindowProxies(JSTracer* aTrc);
+
+  Nullable<WindowProxyHolder> GetWindow();
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_SKIPPABLE_SCRIPT_HOLDER_CLASS(BrowsingContext)
+  NS_DECL_NSILOADCONTEXT
+
+  WindowProxyHolder Window();
+  BrowsingContext* GetBrowsingContext() { return this; };
+  BrowsingContext* Self() { return this; }
+  void Location(JSContext* aCx, JS::MutableHandle<JSObject*> aLocation,
+                ErrorResult& aError);
+  void Close(CallerType aCallerType, ErrorResult& aError);
+  bool GetClosed(ErrorResult&) { return GetClosed(); }
+  void Focus(CallerType aCallerType, ErrorResult& aError);
+  void Blur(CallerType aCallerType, ErrorResult& aError);
+  WindowProxyHolder GetFrames(ErrorResult& aError);
+  int32_t Length() const { return Children().Length(); }
+  Nullable<WindowProxyHolder> GetTop(ErrorResult& aError);
+  void GetOpener(JSContext* aCx, JS::MutableHandle<JS::Value> aOpener,
+                 ErrorResult& aError) const;
+  Nullable<WindowProxyHolder> GetParent(ErrorResult& aError);
+  void PostMessageMoz(JSContext* aCx, JS::Handle<JS::Value> aMessage,
+                      const nsAString& aTargetOrigin,
+                      const Sequence<JSObject*>& aTransfer,
+                      nsIPrincipal& aSubjectPrincipal, ErrorResult& aError);
+  void PostMessageMoz(JSContext* aCx, JS::Handle<JS::Value> aMessage,
+                      const WindowPostMessageOptions& aOptions,
+                      nsIPrincipal& aSubjectPrincipal, ErrorResult& aError);
+
+  void GetCustomUserAgent(nsAString& aUserAgent) {
+    aUserAgent = Top()->GetUserAgentOverride();
+  }
+  nsresult SetCustomUserAgent(const nsAString& aUserAgent);
+  void SetCustomUserAgent(const nsAString& aUserAgent, ErrorResult& aRv);
+
+  void GetCustomPlatform(nsAString& aPlatform) {
+    aPlatform = Top()->GetPlatformOverride();
+  }
+  void SetCustomPlatform(const nsAString& aPlatform, ErrorResult& aRv);
+
+  JSObject* WrapObject(JSContext* aCx);
+
+  static JSObject* ReadStructuredClone(JSContext* aCx,
+                                       JSStructuredCloneReader* aReader,
+                                       StructuredCloneHolder* aHolder);
+  bool WriteStructuredClone(JSContext* aCx, JSStructuredCloneWriter* aWriter,
+                            StructuredCloneHolder* aHolder);
+
+  void StartDelayedAutoplayMediaComponents();
+
+  [[nodiscard]] nsresult ResetGVAutoplayRequestStatus();
+
+  struct IPCInitializer {
+    uint64_t mId = 0;
+
+    uint64_t mParentId = 0;
+    already_AddRefed<WindowContext> GetParent();
+    already_AddRefed<BrowsingContext> GetOpener();
+
+    uint64_t GetOpenerId() const { return mFields.Get<IDX_OpenerId>(); }
+
+    bool mWindowless = false;
+    bool mUseRemoteTabs = false;
+    bool mUseRemoteSubframes = false;
+    bool mCreatedDynamically = false;
+    int32_t mChildOffset = 0;
+    int32_t mSessionHistoryIndex = -1;
+    int32_t mSessionHistoryCount = 0;
+    OriginAttributes mOriginAttributes;
+    uint64_t mRequestContextId = 0;
+
+    FieldValues mFields;
+  };
+
+  IPCInitializer GetIPCInitializer();
+
+  static mozilla::ipc::IPCResult CreateFromIPC(IPCInitializer&& aInitializer,
+                                               BrowsingContextGroup* aGroup,
+                                               ContentParent* aOriginProcess);
+
+  bool IsSandboxedFrom(BrowsingContext* aTarget);
+
+  void AddDeprioritizedLoadRunner(nsIRunnable* aRunner);
+
+  RefPtr<SessionStorageManager> GetSessionStorageManager();
+
+  void InitPendingInitialization(bool aPendingInitialization) {
+    MOZ_ASSERT(!EverAttached());
+    mFields.SetWithoutSyncing<IDX_PendingInitialization>(
+        aPendingInitialization);
+  }
+
+  bool CreatedDynamically() const { return mCreatedDynamically; }
+
+  bool IsDynamic() const;
+
+  int32_t ChildOffset() const { return mChildOffset; }
+
+  bool GetOffsetPath(nsTArray<uint32_t>& aPath) const;
+
+  const OriginAttributes& OriginAttributesRef() { return mOriginAttributes; }
+  nsresult SetOriginAttributes(const OriginAttributes& aAttrs);
+
+  void GetHistoryID(JSContext* aCx, JS::MutableHandle<JS::Value> aVal,
+                    ErrorResult& aError);
+
+  void InitSessionHistory();
+
+  ChildSHistory* GetChildSessionHistory();
+
+  bool CrossOriginIsolated();
+
+  bool IsPopupAllowed();
+
+  void SessionHistoryCommit(const LoadingSessionHistoryInfo& aInfo,
+                            uint32_t aLoadType, nsIURI* aCurrentURI,
+                            SessionHistoryInfo* aPreviousActiveEntry,
+                            bool aCloneEntryChildren, bool aChannelExpired,
+                            uint32_t aCacheKey);
+
+  void SetActiveSessionHistoryEntry(const Maybe<nsPoint>& aPreviousScrollPos,
+                                    SessionHistoryInfo* aInfo,
+                                    SessionHistoryInfo* aPreviousActiveEntry,
+                                    uint32_t aLoadType,
+                                    uint32_t aUpdatedCacheKey,
+                                    bool aUpdateLength = true);
+
+  void ReplaceActiveSessionHistoryEntry(SessionHistoryInfo* aInfo);
+
+  void RemoveDynEntriesFromActiveSessionHistoryEntry();
+
+  void RemoveFromSessionHistory(const nsID& aChangeID);
+
+  void SetTriggeringAndInheritPrincipals(nsIPrincipal* aTriggeringPrincipal,
+                                         nsIPrincipal* aPrincipalToInherit,
+                                         uint64_t aLoadIdentifier);
+
+  std::tuple<nsCOMPtr<nsIPrincipal>, nsCOMPtr<nsIPrincipal>>
+  GetTriggeringAndInheritPrincipalsForCurrentLoad();
+
+  MOZ_CAN_RUN_SCRIPT
+  void HistoryGo(int32_t aOffset, uint64_t aHistoryEpoch,
+                 bool aRequireUserInteraction, bool aUserActivation,
+                 std::function<void(Maybe<int32_t>&&)>&& aResolver);
+
+  MOZ_CAN_RUN_SCRIPT
+  void NavigationTraverse(const nsID& aKey, uint64_t aHistoryEpoch,
+                          bool aUserActivation, bool aCheckForCancelation,
+                          std::function<void(nsresult)>&& aResolver);
+
+  bool ShouldUpdateSessionHistory(uint32_t aLoadType);
+
+  nsresult CheckNavigationRateLimit(CallerType aCallerType);
+
+  void ResetNavigationRateLimit();
+
+  mozilla::dom::DisplayMode DisplayMode() { return Top()->GetDisplayMode(); }
+
+  std::tuple<bool, bool> CanFocusCheck(CallerType aCallerType);
+
+  bool CanBlurCheck(CallerType aCallerType);
+
+  PopupBlocker::PopupControlState RevisePopupAbuseLevel(
+      PopupBlocker::PopupControlState aControl);
+
+  void GetUserActivationModifiersForPopup(
+      UserActivation::Modifiers* aModifiers);
+
+  void IncrementHistoryEntryCountForBrowsingContext();
+
+  void GetMediumOverride(nsAString& aOverride) const {
+    aOverride = GetMediumOverride();
+  }
+
+  void GetLanguageOverride(nsACString& aLanguageOverride) const {
+    aLanguageOverride = GetLanguageOverride();
+  }
+
+  void GetTimezoneOverride(nsAString& aTimezoneOverride) const {
+    aTimezoneOverride = GetTimezoneOverride();
+  }
+
+  dom::PrefersColorSchemeOverride PrefersColorSchemeOverride() const {
+    return GetPrefersColorSchemeOverride();
+  }
+
+  dom::ForcedColorsOverride ForcedColorsOverride() const {
+    return GetForcedColorsOverride();
+  }
+
+  dom::PrefersReducedMotionOverride PrefersReducedMotionOverride() const {
+    return GetPrefersReducedMotionOverride();
+  }
+
+  double AnimationsPlayBackRateMultiplier() const {
+    return Top()->GetAnimationsPlayBackRateMultiplier();
+  }
+
+  bool IsInBFCache() const;
+  bool IsEnteringBFCache() const { return mIsEnteringBFCache; }
+  void DeactivateDocuments();
+
+  MOZ_CAN_RUN_SCRIPT
+  void ReactivateDocuments(
+      const Maybe<SessionHistoryInfo>& aReactivatedEntry,
+      const nsTArray<SessionHistoryInfo>& aNewSHEs,
+      const Maybe<PreviousSessionHistoryInfo>& aPreviousEntryForActivation);
+
+  MOZ_CAN_RUN_SCRIPT
+  void UpdateForReactivation(
+      const Maybe<SessionHistoryInfo>& aReactivatedEntry,
+      const nsTArray<SessionHistoryInfo>& aNewSHEs,
+      const Maybe<PreviousSessionHistoryInfo>& aPreviousEntryForActivation);
+
+  bool AllowJavascript() const { return GetAllowJavascript(); }
+  bool CanExecuteScripts() const { return mCanExecuteScripts; }
+
+  uint32_t DefaultLoadFlags() const { return GetDefaultLoadFlags(); }
+
+  void RequestForPageAwake();
+  void RevokeForPageAwake();
+
+  void AddDiscardListener(std::function<void(uint64_t)>&& aListener);
+
+  bool IsAppTab() { return GetIsAppTab(); }
+  bool HasSiblings() { return GetHasSiblings(); }
+
+  bool IsUnderHiddenEmbedderElement() const {
+    return GetIsUnderHiddenEmbedderElement();
+  }
+
+  void LocationCreated(dom::Location* aLocation);
+  void ClearCachedValuesOfLocations();
+
+  void ConsumeHistoryActivation();
+  void SynchronizeNavigationAPIState(nsIStructuredCloneContainer* aState);
+
+ protected:
+  virtual ~BrowsingContext();
+  BrowsingContext(WindowContext* aParentWindow, BrowsingContextGroup* aGroup,
+                  uint64_t aBrowsingContextId, Type aType, FieldValues&& aInit);
+
+  void SetChildSHistory(ChildSHistory* aChildSHistory);
+  already_AddRefed<ChildSHistory> ForgetChildSHistory() {
+    return mChildSessionHistory.forget();
+  }
+
+  static bool ShouldAddEntryForRefresh(nsIURI* aCurrentURI,
+                                       const SessionHistoryInfo& aInfo);
+  static bool ShouldAddEntryForRefresh(nsIURI* aCurrentURI, nsIURI* aNewURI,
+                                       bool aHasPostData);
+
+  void SetIsInBFCache(bool aIsInBFCache);
+
+  void SetIsEnteringBFCache(bool aIsEnteringBFCache);
+
+ private:
+  already_AddRefed<nsDocShellLoadState> CheckURLAndCreateLoadState(
+      nsIURI* aURI, nsIPrincipal& aSubjectPrincipal, Document* aSourceDocument,
+      ErrorResult& aRv);
+
+  bool AddSHEntryWouldIncreaseLength(SessionHistoryInfo* aCurrentEntry) const;
+
+  [[nodiscard]] const char* BrowsingContextCoherencyChecks(
+      ContentParent* aOriginProcess);
+
+  void Attach(bool aFromIPC, ContentParent* aOriginProcess);
+
+  void RecomputeCanExecuteScripts();
+
+  bool CanSetOriginAttributes();
+
+  void AssertOriginAttributesMatchPrivateBrowsing();
+
+  friend class ::nsOuterWindowProxy;
+  friend class ::nsGlobalWindowOuter;
+  friend class WindowContext;
+
+  void UpdateWindowProxy(JSObject* obj, JSObject* old) {
+    if (mWindowProxy) {
+      MOZ_ASSERT(mWindowProxy == old);
+      mWindowProxy = obj;
+    }
+  }
+  void ClearWindowProxy() { mWindowProxy = nullptr; }
+
+  friend class Location;
+  friend class RemoteLocationProxy;
+  class LocationProxy final : public LocationBase {
+   public:
+    MozExternalRefCountType AddRef() { return GetBrowsingContext()->AddRef(); }
+    MozExternalRefCountType Release() {
+      return GetBrowsingContext()->Release();
+    }
+
+   protected:
+    friend class RemoteLocationProxy;
+    BrowsingContext* GetBrowsingContext() override {
+      return reinterpret_cast<BrowsingContext*>(
+          uintptr_t(this) - offsetof(BrowsingContext, mLocation));
+    }
+
+    nsIDocShell* GetDocShell() override { return nullptr; }
+  };
+
+  void SendCommitTransaction(ContentParent* aParent,
+                             const BaseTransaction& aTxn, uint64_t aEpoch);
+  void SendCommitTransaction(ContentChild* aChild, const BaseTransaction& aTxn,
+                             uint64_t aEpoch);
+
+  void ActivenessChanged(bool aIsActive);
+
+  using CanSetResult = syncedcontext::CanSetResult;
+
+  template <size_t I, typename T>
+  bool CanSet(FieldIndex<I>, const T&, ContentParent*) = delete;
+
+  template <size_t I>
+  void DidSet(FieldIndex<I>) {}
+  template <size_t I, typename T>
+  void DidSet(FieldIndex<I>, T&& aOldValue) {}
+
+  bool CanSet(FieldIndex<IDX_SessionStoreEpoch>, uint32_t aEpoch,
+              ContentParent* aSource) {
+    return IsTop() && !aSource;
+  }
+
+  void DidSet(FieldIndex<IDX_SessionStoreEpoch>, uint32_t aOldValue);
+
+  bool CanSet(FieldIndex<IDX_OpenerId>, const uint64_t& aValue,
+              ContentParent* aSource) {
+    if (aValue != 0) {
+      RefPtr<BrowsingContext> opener = Get(aValue);
+      return opener && opener->Group() == Group();
+    }
+    return true;
+  }
+
+  bool CanSet(FieldIndex<IDX_OpenerPolicy>,
+              nsILoadInfo::CrossOriginOpenerPolicy, ContentParent*);
+
+  bool CanSet(FieldIndex<IDX_LanguageOverride>, const nsCString&,
+              ContentParent*) {
+    return IsTop();
+  }
+
+  bool CanSet(FieldIndex<IDX_TimezoneOverride>, const nsString&,
+              ContentParent*) {
+    return IsTop();
+  }
+
+  bool CanSet(FieldIndex<IDX_MediumOverride>, const nsString&, ContentParent*) {
+    return IsTop();
+  }
+
+  bool CanSet(FieldIndex<IDX_EmbedderColorSchemes>, const EmbedderColorSchemes&,
+              ContentParent* aSource) {
+    return CheckOnlyEmbedderCanSet(aSource);
+  }
+
+  bool CanSet(FieldIndex<IDX_PrefersColorSchemeOverride>,
+              dom::PrefersColorSchemeOverride, ContentParent*) {
+    return IsTop();
+  }
+
+  bool CanSet(FieldIndex<IDX_ForcedColorsOverride>, dom::ForcedColorsOverride,
+              ContentParent*) {
+    return IsTop();
+  }
+
+  bool CanSet(FieldIndex<IDX_PrefersReducedMotionOverride>,
+              dom::PrefersReducedMotionOverride, ContentParent*) {
+    return IsTop();
+  }
+
+  bool CanSet(FieldIndex<IDX_AnimationsPlayBackRateMultiplier>, double&,
+              ContentParent*) {
+    return IsTop();
+  }
+
+  bool CanSet(FieldIndex<IDX_InRDMPane>, const bool&, ContentParent* aSource);
+  void DidSet(FieldIndex<IDX_InRDMPane>, bool aOldValue);
+  bool CanSet(FieldIndex<IDX_HasOrientationOverride>, const bool&,
+              ContentParent*) {
+    return true;
+  }
+  void DidSet(FieldIndex<IDX_HasOrientationOverride>, bool aOldValue);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void DidSet(FieldIndex<IDX_ForceDesktopViewport>,
+                                          bool aOldValue);
+
+  void DidSet(FieldIndex<IDX_EmbedderColorSchemes>,
+              EmbedderColorSchemes&& aOldValue);
+
+  void DidSet(FieldIndex<IDX_PrefersColorSchemeOverride>,
+              dom::PrefersColorSchemeOverride aOldValue);
+
+  void DidSet(FieldIndex<IDX_ForcedColorsOverride>,
+              dom::ForcedColorsOverride aOldValue);
+
+  void DidSet(FieldIndex<IDX_PrefersReducedMotionOverride>,
+              dom::PrefersReducedMotionOverride aOldValue);
+
+  void DidSet(FieldIndex<IDX_AnimationsPlayBackRateMultiplier>,
+              double aOldValue);
+
+  template <typename Callback>
+  void WalkPresContexts(Callback&&);
+  void PresContextAffectingFieldChanged();
+
+  void DidSet(FieldIndex<IDX_LanguageOverride>, nsCString&& aOldValue);
+
+  void DidSet(FieldIndex<IDX_TimezoneOverride>, nsString&& aOldValue);
+
+  void DidSet(FieldIndex<IDX_MediumOverride>, nsString&& aOldValue);
+
+  bool CanSet(FieldIndex<IDX_SuspendMediaWhenInactive>, bool, ContentParent*) {
+    return IsTop();
+  }
+
+  bool CanSet(FieldIndex<IDX_TouchEventsOverrideInternal>,
+              dom::TouchEventsOverride aTouchEventsOverride,
+              ContentParent* aSource);
+  void DidSet(FieldIndex<IDX_TouchEventsOverrideInternal>,
+              dom::TouchEventsOverride&& aOldValue);
+
+  bool CanSet(FieldIndex<IDX_DisplayMode>, const enum DisplayMode& aDisplayMode,
+              ContentParent* aSource) {
+    return IsTop();
+  }
+
+  void DidSet(FieldIndex<IDX_DisplayMode>, enum DisplayMode aOldValue);
+
+  bool CanSet(FieldIndex<IDX_ExplicitActive>, const ExplicitActiveStatus&,
+              ContentParent* aSource);
+  void DidSet(FieldIndex<IDX_ExplicitActive>, ExplicitActiveStatus aOldValue);
+
+  bool CanSet(FieldIndex<IDX_IsActiveBrowserWindowInternal>, const bool& aValue,
+              ContentParent* aSource);
+  void DidSet(FieldIndex<IDX_IsActiveBrowserWindowInternal>, bool aOldValue);
+
+  bool CanSet(FieldIndex<IDX_Muted>, const bool&, ContentParent*) {
+    return true;
+  }
+  void DidSet(FieldIndex<IDX_Muted>);
+
+  bool CanSet(FieldIndex<IDX_IsAppTab>, const bool& aValue,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_IsCaptivePortalTab>, const bool& aValue,
+              ContentParent* aSource) {
+    return true;
+  }
+
+  bool CanSet(FieldIndex<IDX_HasSiblings>, const bool& aValue,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_ShouldDelayMediaFromStart>, const bool& aValue,
+              ContentParent* aSource);
+  void DidSet(FieldIndex<IDX_ShouldDelayMediaFromStart>, bool aOldValue);
+
+  bool CanSet(FieldIndex<IDX_OverrideDPPX>, const float& aValue,
+              ContentParent* aSource);
+  void DidSet(FieldIndex<IDX_OverrideDPPX>, float aOldValue);
+
+  bool CanSet(FieldIndex<IDX_EmbedderInnerWindowId>, const uint64_t& aValue,
+              ContentParent* aSource);
+
+  CanSetResult CanSet(FieldIndex<IDX_CurrentInnerWindowId>,
+                      const uint64_t& aValue, ContentParent* aSource);
+
+  void DidSet(FieldIndex<IDX_CurrentInnerWindowId>);
+
+  bool CanSet(FieldIndex<IDX_ParentInitiatedNavigationEpoch>,
+              const uint64_t& aValue, ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_IsPopupSpam>, const bool& aValue,
+              ContentParent* aSource);
+
+  void DidSet(FieldIndex<IDX_IsPopupSpam>);
+
+  bool CanSet(FieldIndex<IDX_GVAudibleAutoplayRequestStatus>,
+              const GVAutoplayRequestStatus&, ContentParent*) {
+    return true;
+  }
+  void DidSet(FieldIndex<IDX_GVAudibleAutoplayRequestStatus>);
+  bool CanSet(FieldIndex<IDX_GVInaudibleAutoplayRequestStatus>,
+              const GVAutoplayRequestStatus&, ContentParent*) {
+    return true;
+  }
+  void DidSet(FieldIndex<IDX_GVInaudibleAutoplayRequestStatus>);
+
+  bool CanSet(FieldIndex<IDX_Loading>, const bool&, ContentParent*) {
+    return true;
+  }
+  void DidSet(FieldIndex<IDX_Loading>);
+
+  bool CanSet(FieldIndex<IDX_AncestorLoading>, const bool&, ContentParent*) {
+    return true;
+  }
+  void DidSet(FieldIndex<IDX_AncestorLoading>);
+
+  void DidSet(FieldIndex<IDX_PlatformOverride>);
+  CanSetResult CanSet(FieldIndex<IDX_PlatformOverride>,
+                      const nsString& aPlatformOverride,
+                      ContentParent* aSource);
+
+  void DidSet(FieldIndex<IDX_UserAgentOverride>);
+  CanSetResult CanSet(FieldIndex<IDX_UserAgentOverride>,
+                      const nsString& aUserAgent, ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_OrientationLock>,
+              const mozilla::hal::ScreenOrientation& aOrientationLock,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_EmbedderElementType>,
+              const Maybe<nsString>& aInitiatorType, ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_MessageManagerGroup>,
+              const nsString& aMessageManagerGroup, ContentParent* aSource);
+
+  CanSetResult CanSet(FieldIndex<IDX_AllowContentRetargeting>,
+                      const bool& aAllowContentRetargeting,
+                      ContentParent* aSource);
+  CanSetResult CanSet(FieldIndex<IDX_AllowContentRetargetingOnChildren>,
+                      const bool& aAllowContentRetargetingOnChildren,
+                      ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_FullscreenAllowedByOwner>, const bool&,
+              ContentParent*);
+  bool CanSet(FieldIndex<IDX_WatchedByDevToolsInternal>,
+              const bool& aWatchedByDevToolsInternal, ContentParent* aSource);
+
+  CanSetResult CanSet(FieldIndex<IDX_DefaultLoadFlags>,
+                      const uint32_t& aDefaultLoadFlags,
+                      ContentParent* aSource);
+  void DidSet(FieldIndex<IDX_DefaultLoadFlags>);
+
+  bool CanSet(FieldIndex<IDX_UseGlobalHistory>, const bool& aUseGlobalHistory,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_TargetTopLevelLinkClicksToBlankInternal>,
+              const bool& aTargetTopLevelLinkClicksToBlankInternal,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_HasSessionHistory>, const bool&, ContentParent*) {
+    return true;
+  }
+  void DidSet(FieldIndex<IDX_HasSessionHistory>, bool aOldValue);
+
+  bool CanSet(FieldIndex<IDX_BrowserId>, const uint64_t& aValue,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_UseErrorPages>, const bool& aUseErrorPages,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_PendingInitialization>, bool aNewValue,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_TopLevelCreatedByWebContent>,
+              const bool& aNewValue, ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_PageAwakeRequestCount>, uint32_t aNewValue,
+              ContentParent* aSource);
+  void DidSet(FieldIndex<IDX_PageAwakeRequestCount>, uint32_t aOldValue);
+
+  CanSetResult CanSet(FieldIndex<IDX_AllowJavascript>, bool aValue,
+                      ContentParent* aSource);
+  void DidSet(FieldIndex<IDX_AllowJavascript>, bool aOldValue);
+
+  bool CanSet(FieldIndex<IDX_ForceDesktopViewport>, bool aValue,
+              ContentParent* aSource) {
+    return IsTop() && XRE_IsParentProcess();
+  }
+
+
+  bool CanSet(FieldIndex<IDX_HasRestoreData>, bool aNewValue,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_IsUnderHiddenEmbedderElement>,
+              const bool& aIsUnderHiddenEmbedderElement,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_ForceOffline>, bool aNewValue,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_InnerSizeSpoofedForRFP>, const CSSIntSize&,
+              ContentParent*) {
+    return IsTop();
+  }
+
+  bool CanSet(FieldIndex<IDX_EmbeddedInContentDocument>, bool,
+              ContentParent* aSource) {
+    return CheckOnlyEmbedderCanSet(aSource);
+  }
+
+  bool CanSet(FieldIndex<IDX_IPAddressSpace>, nsILoadInfo::IPAddressSpace,
+              ContentParent*) {
+    return XRE_IsParentProcess();
+  }
+
+  bool CanSet(FieldIndex<IDX_Name>, const nsString&, ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_Closed>, const bool&, ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_OnePermittedSandboxedNavigatorId>, const uint64_t&,
+              ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_HadOriginalOpener>, const bool&, ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_SandboxFlags>, const uint32_t&, ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_InitialSandboxFlags>, const uint32_t&,
+              ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_HistoryID>, const nsID&, ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_IsPrinting>, const bool&, ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_ForceEnableTrackingProtection>, const bool&,
+              ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_IsPopupRequested>, const bool&, ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_ScreenHeightOverride>, const uint64_t&,
+              ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_ScreenWidthOverride>, const uint64_t&,
+              ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_HasScreenAreaOverride>, const bool&,
+              ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_CurrentOrientationAngle>, const float&,
+              ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_CurrentOrientationType>,
+              const mozilla::dom::OrientationType&, ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_MaxTouchPointsOverride>, const uint8_t&,
+              ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_CurrentLoadIdentifier>, const Maybe<uint64_t>&,
+              ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_AndroidAppLinkLoadIdentifier>,
+              const Maybe<uint64_t>&, ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_HasLoadedNonInitialDocument>, const bool&,
+              ContentParent*) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_HistoryEntryCount>, const uint32_t&,
+              ContentParent*) {
+    return true;
+  }
+
+  bool CanSet(FieldIndex<IDX_FullZoom>, const float&, ContentParent*) {
+    return true;
+  }
+  void DidSet(FieldIndex<IDX_FullZoom>, float aOldValue);
+  bool CanSet(FieldIndex<IDX_TextZoom>, const float&, ContentParent*) {
+    return true;
+  }
+  void DidSet(FieldIndex<IDX_TextZoom>, float aOldValue);
+  bool CanSet(FieldIndex<IDX_AuthorStyleDisabledDefault>, const bool&,
+              ContentParent*) {
+    return true;
+  }
+  void DidSet(FieldIndex<IDX_AuthorStyleDisabledDefault>);
+
+  bool CanSet(FieldIndex<IDX_IsSyntheticDocumentContainer>, const bool&,
+              ContentParent*) {
+    return true;
+  }
+  void DidSet(FieldIndex<IDX_IsSyntheticDocumentContainer>);
+
+  void DidSet(FieldIndex<IDX_IsUnderHiddenEmbedderElement>, bool aOldValue);
+
+  void DidSet(FieldIndex<IDX_ForceOffline>, bool aOldValue);
+
+  CanSetResult LegacyRevertIfNotOwningOrParentProcess(ContentParent* aSource);
+
+  bool CheckOnlyEmbedderCanSet(ContentParent* aSource);
+
+  void CreateChildSHistory();
+
+  using PrincipalWithLoadIdentifierTuple =
+      std::tuple<nsCOMPtr<nsIPrincipal>, uint64_t>;
+
+  nsIPrincipal* GetSavedPrincipal(
+      Maybe<PrincipalWithLoadIdentifierTuple> aPrincipalTuple);
+
+  const Type mType;
+
+  const uint64_t mBrowsingContextId;
+
+  RefPtr<BrowsingContextGroup> mGroup;
+  RefPtr<WindowContext> mParentWindow;
+  nsCOMPtr<nsIDocShell> mDocShell;
+
+  RefPtr<Element> mEmbedderElement;
+
+  nsTArray<RefPtr<WindowContext>> mWindowContexts;
+  RefPtr<WindowContext> mCurrentWindowContext;
+
+
+  JS::Heap<JSObject*> mWindowProxy;
+  LocationProxy mLocation;
+
+  OriginAttributes mOriginAttributes;
+
+  uint64_t mRequestContextId = 0;
+
+  uint32_t mPrivateBrowsingId;
+
+  bool mEverAttached : 1;
+
+  bool mIsInProcess : 1;
+
+  bool mIsDiscarded : 1;
+
+  bool mWindowless : 1;
+
+  bool mDanglingRemoteOuterProxies : 1;
+
+  bool mEmbeddedByThisProcess : 1;
+
+  bool mUseRemoteTabs : 1;
+
+  bool mUseRemoteSubframes : 1;
+
+  bool mCreatedDynamically : 1;
+
+  bool mIsInBFCache : 1;
+
+  bool mIsEnteringBFCache : 1 = false;
+
+  bool mCanExecuteScripts : 1;
+
+  int32_t mChildOffset;
+
+  TimeStamp mUserGestureStart;
+
+  Maybe<PrincipalWithLoadIdentifierTuple> mTriggeringPrincipal;
+  Maybe<PrincipalWithLoadIdentifierTuple> mPrincipalToInherit;
+
+  class DeprioritizedLoadRunner
+      : public mozilla::Runnable,
+        public mozilla::LinkedListElement<DeprioritizedLoadRunner> {
+   public:
+    explicit DeprioritizedLoadRunner(nsIRunnable* aInner)
+        : Runnable("DeprioritizedLoadRunner"), mInner(aInner) {}
+
+    NS_IMETHOD Run() override {
+      if (mInner) {
+        RefPtr<nsIRunnable> inner = std::move(mInner);
+        inner->Run();
+      }
+
+      return NS_OK;
+    }
+
+   private:
+    RefPtr<nsIRunnable> mInner;
+  };
+
+  mozilla::LinkedList<DeprioritizedLoadRunner> mDeprioritizedLoadRunner;
+
+  RefPtr<SessionStorageManager> mSessionStorageManager;
+  RefPtr<ChildSHistory> mChildSessionHistory;
+
+  nsTArray<std::function<void(uint64_t)>> mDiscardListeners;
+
+  uint32_t mNavigationRateLimitCount;
+  mozilla::TimeStamp mNavigationRateLimitSpanStart;
+
+  mozilla::LinkedList<dom::Location> mLocations;
+};
+
+extern bool GetRemoteOuterWindowProxy(JSContext* aCx, BrowsingContext* aContext,
+                                      JS::Handle<JSObject*> aTransplantTo,
+                                      JS::MutableHandle<JSObject*> aRetVal);
+
+using BrowsingContextTransaction = BrowsingContext::BaseTransaction;
+using BrowsingContextInitializer = BrowsingContext::IPCInitializer;
+using MaybeDiscardedBrowsingContext = MaybeDiscarded<BrowsingContext>;
+
+extern template class syncedcontext::Transaction<BrowsingContext>;
+
+}  
+}  
+
+namespace IPC {
+template <>
+struct ParamTraits<
+    mozilla::dom::MaybeDiscarded<mozilla::dom::BrowsingContext>> {
+  using paramType = mozilla::dom::MaybeDiscarded<mozilla::dom::BrowsingContext>;
+  static void Write(IPC::MessageWriter* aWriter, const paramType& aParam);
+  static bool Read(IPC::MessageReader* aReader, paramType* aResult);
+};
+
+template <>
+struct ParamTraits<mozilla::dom::BrowsingContext::IPCInitializer> {
+  using paramType = mozilla::dom::BrowsingContext::IPCInitializer;
+  static void Write(IPC::MessageWriter* aWriter, const paramType& aInitializer);
+  static bool Read(IPC::MessageReader* aReader, paramType* aInitializer);
+};
+}  
+
+#endif  // !defined(mozilla_dom_BrowsingContext_h)

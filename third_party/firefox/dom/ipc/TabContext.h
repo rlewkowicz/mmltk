@@ -1,0 +1,81 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_TabContext_h
+#define mozilla_dom_TabContext_h
+
+#include "mozilla/BasePrincipal.h"
+#include "nsCOMPtr.h"
+#include "nsPIDOMWindow.h"
+#include "nsPIWindowRoot.h"
+
+namespace mozilla::dom {
+
+class IPCTabContext;
+
+class TabContext {
+ public:
+  TabContext();
+
+
+  IPCTabContext AsIPCTabContext() const;
+
+  uint64_t ChromeOuterWindowID() const;
+
+  uint32_t MaxTouchPoints() const { return mMaxTouchPoints; }
+
+ protected:
+  friend class MaybeInvalidTabContext;
+
+
+  bool SetTabContext(const TabContext& aContext);
+
+  bool SetTabContext(uint64_t aChromeOuterWindowID, uint32_t aMaxTouchPoints);
+
+  bool UpdateTabContextAfterSwap(const TabContext& aContext);
+
+  void SetMaxTouchPoints(uint32_t aMaxTouchPoints) {
+    mMaxTouchPoints = aMaxTouchPoints;
+  }
+
+ private:
+  bool mInitialized;
+
+  uint64_t mChromeOuterWindowID;
+
+  uint32_t mMaxTouchPoints;
+};
+
+class MutableTabContext : public TabContext {
+ public:
+  bool SetTabContext(const TabContext& aContext) {
+    return TabContext::SetTabContext(aContext);
+  }
+
+  bool SetTabContext(uint64_t aChromeOuterWindowID, uint32_t aMaxTouchPoints) {
+    return TabContext::SetTabContext(aChromeOuterWindowID, aMaxTouchPoints);
+  }
+};
+
+class MaybeInvalidTabContext {
+ public:
+  explicit MaybeInvalidTabContext(const IPCTabContext& aContext);
+
+  bool IsValid();
+
+  const char* GetInvalidReason();
+
+  const TabContext& GetTabContext();
+
+ private:
+  MaybeInvalidTabContext(const MaybeInvalidTabContext&) = delete;
+  MaybeInvalidTabContext& operator=(const MaybeInvalidTabContext&) = delete;
+
+  const char* mInvalidReason;
+  MutableTabContext mTabContext;
+};
+
+}  
+
+#endif

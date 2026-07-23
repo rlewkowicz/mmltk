@@ -1,0 +1,288 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_ChannelEventQueue_h
+#define mozilla_net_ChannelEventQueue_h
+
+#include "nsTArray.h"
+#include "nsIEventTarget.h"
+#include "nsThreadUtils.h"
+#include "nsXULAppAPI.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/RecursiveMutex.h"
+#include "mozilla/UniquePtr.h"
+class nsISupports;
+
+namespace mozilla {
+namespace net {
+
+class ChannelEvent {
+ public:
+  MOZ_COUNTED_DEFAULT_CTOR(ChannelEvent)
+  MOZ_COUNTED_DTOR_VIRTUAL(ChannelEvent)
+  virtual void Run() = 0;
+  virtual already_AddRefed<nsIEventTarget> GetEventTarget() = 0;
+};
+
+class MainThreadChannelEvent : public ChannelEvent {
+ public:
+  MOZ_COUNTED_DEFAULT_CTOR(MainThreadChannelEvent)
+  MOZ_COUNTED_DTOR_OVERRIDE(MainThreadChannelEvent)
+
+  already_AddRefed<nsIEventTarget> GetEventTarget() override {
+    MOZ_ASSERT(XRE_IsParentProcess());
+
+    return do_AddRef(GetMainThreadSerialEventTarget());
+  }
+};
+
+class ChannelFunctionEvent : public ChannelEvent {
+ public:
+  ChannelFunctionEvent(
+      std::function<already_AddRefed<nsIEventTarget>()>&& aGetEventTarget,
+      std::function<void()>&& aCallback)
+      : mGetEventTarget(std::move(aGetEventTarget)),
+        mCallback(std::move(aCallback)) {}
+
+  void Run() override { mCallback(); }
+  already_AddRefed<nsIEventTarget> GetEventTarget() override {
+    return mGetEventTarget();
+  }
+
+ private:
+  const std::function<already_AddRefed<nsIEventTarget>()> mGetEventTarget;
+  const std::function<void()> mCallback;
+};
+
+template <typename T>
+class UnsafePtr {
+ public:
+  explicit UnsafePtr(T* aPtr) : mPtr(aPtr) {}
+
+  T& operator*() const { return *mPtr; }
+  T* operator->() const {
+    MOZ_ASSERT(mPtr, "dereferencing a null pointer");
+    return mPtr;
+  }
+  operator T*() const& { return mPtr; }
+  explicit operator bool() const { return mPtr != nullptr; }
+
+ private:
+  T* const mPtr;
+};
+
+class NeckoTargetChannelFunctionEvent : public ChannelFunctionEvent {
+ public:
+  template <typename T>
+  NeckoTargetChannelFunctionEvent(T* aChild, std::function<void()>&& aCallback)
+      : ChannelFunctionEvent(
+            [child = UnsafePtr<T>(aChild)]() {
+              MOZ_ASSERT(child);
+              return child->GetNeckoTarget();
+            },
+            std::move(aCallback)) {}
+};
+
+
+class ChannelEventQueue final {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ChannelEventQueue)
+
+ public:
+  explicit ChannelEventQueue(nsISupports* owner)
+      : mSuspendCount(0),
+        mSuspended(false),
+        mForcedCount(0),
+        mFlushing(false),
+        mHasCheckedForAsyncXMLHttpRequest(false),
+        mForAsyncXMLHttpRequest(false),
+        mOwner(owner),
+        mMutex("ChannelEventQueue::mMutex"),
+        mRunningMutex("ChannelEventQueue::mRunningMutex") {}
+
+  inline void RunOrEnqueue(UniquePtr<ChannelEvent> aChannelEvent,
+                           bool aAssertionWhenNotQueued = false);
+
+  inline void PrependEvent(UniquePtr<ChannelEvent>&& aEvent);
+  inline void PrependEventInternal(UniquePtr<ChannelEvent>&& aEvent)
+      MOZ_REQUIRES(mMutex);
+  inline void PrependEvents(nsTArray<UniquePtr<ChannelEvent>>& aEvents);
+
+  inline void StartForcedQueueing();
+  inline void EndForcedQueueing();
+
+  void Suspend();
+  void Resume();
+
+  void NotifyReleasingOwner() {
+    MutexAutoLock lock(mMutex);
+    mOwner = nullptr;
+  }
+
+  void DiscardQueuedEvents() {
+    MutexAutoLock lock(mMutex);
+    mEventQueue.Clear();
+  }
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  bool IsEmpty() {
+    MutexAutoLock lock(mMutex);
+    return mEventQueue.IsEmpty();
+  }
+#endif
+
+ private:
+  ~ChannelEventQueue() = default;
+
+  void SuspendInternal() MOZ_REQUIRES(mMutex);
+  void ResumeInternal() MOZ_REQUIRES(mMutex);
+
+  bool MaybeSuspendIfEventsAreSuppressed() MOZ_REQUIRES(mMutex);
+
+  inline void MaybeFlushQueue() MOZ_REQUIRES(mMutex);
+  void FlushQueue() MOZ_REQUIRES(mMutex);
+  inline void CompleteResume();
+
+  ChannelEvent* TakeEvent();
+
+  nsTArray<UniquePtr<ChannelEvent>> mEventQueue MOZ_GUARDED_BY(mMutex);
+
+  uint32_t mSuspendCount MOZ_GUARDED_BY(mMutex);
+  bool mSuspended MOZ_GUARDED_BY(mMutex);
+  uint32_t mForcedCount  
+      MOZ_GUARDED_BY(mMutex);
+  bool mFlushing MOZ_GUARDED_BY(mMutex);
+
+  bool mHasCheckedForAsyncXMLHttpRequest;
+  bool mForAsyncXMLHttpRequest;
+
+  nsISupports* mOwner MOZ_GUARDED_BY(mMutex);
+
+  Mutex mMutex;
+
+  RecursiveMutex mRunningMutex MOZ_ACQUIRED_BEFORE(mMutex);
+
+  friend class AutoEventEnqueuer;
+};
+
+inline void ChannelEventQueue::RunOrEnqueue(
+    UniquePtr<ChannelEvent> aChannelEvent, bool aAssertionWhenNotQueued) {
+  MOZ_ASSERT(aChannelEvent);
+  nsCOMPtr<nsISupports> kungFuDeathGrip;
+
+  RecursiveMutexAutoLock lock(mRunningMutex);
+  {
+    MutexAutoLock lock(mMutex);
+    kungFuDeathGrip = mOwner;  
+
+    bool enqueue = !!mForcedCount || mSuspended || mFlushing ||
+                   !mEventQueue.IsEmpty() ||
+                   MaybeSuspendIfEventsAreSuppressed();
+    if (enqueue) {
+      mEventQueue.AppendElement(std::move(aChannelEvent));
+      return;
+    }
+
+    nsCOMPtr<nsIEventTarget> target = aChannelEvent->GetEventTarget();
+    MOZ_ASSERT(target);
+
+    bool isCurrentThread = false;
+    DebugOnly<nsresult> rv = target->IsOnCurrentThread(&isCurrentThread);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+    if (!isCurrentThread) {
+      SuspendInternal();
+
+
+      mEventQueue.AppendElement(std::move(aChannelEvent));
+      ResumeInternal();
+      return;
+    }
+  }
+
+  MOZ_RELEASE_ASSERT(!aAssertionWhenNotQueued);
+  aChannelEvent->Run();
+}
+
+inline void ChannelEventQueue::StartForcedQueueing() {
+  MutexAutoLock lock(mMutex);
+  ++mForcedCount;
+}
+
+inline void ChannelEventQueue::EndForcedQueueing() {
+  MutexAutoLock lock(mMutex);
+  MOZ_ASSERT(mForcedCount > 0);
+  if (!--mForcedCount) {
+    MaybeFlushQueue();
+  }
+}
+
+inline void ChannelEventQueue::PrependEvent(UniquePtr<ChannelEvent>&& aEvent) {
+  MutexAutoLock lock(mMutex);
+  PrependEventInternal(std::move(aEvent));
+}
+
+inline void ChannelEventQueue::PrependEventInternal(
+    UniquePtr<ChannelEvent>&& aEvent) {
+  mMutex.AssertCurrentThreadOwns();
+
+  MOZ_ASSERT(mSuspended || !!mForcedCount);
+
+  mEventQueue.InsertElementAt(0, std::move(aEvent));
+}
+
+inline void ChannelEventQueue::PrependEvents(
+    nsTArray<UniquePtr<ChannelEvent>>& aEvents) {
+  MutexAutoLock lock(mMutex);
+
+  MOZ_ASSERT(mSuspended || !!mForcedCount);
+
+  mEventQueue.InsertElementsAt(0, aEvents.Length());
+
+  for (uint32_t i = 0; i < aEvents.Length(); i++) {
+    mEventQueue[i] = std::move(aEvents[i]);
+  }
+}
+
+inline void ChannelEventQueue::CompleteResume() {
+  MutexAutoLock lock(mMutex);
+
+  if (!mSuspendCount) {
+    mSuspended = false;
+    MaybeFlushQueue();
+  }
+}
+
+inline void ChannelEventQueue::MaybeFlushQueue() {
+  mMutex.AssertCurrentThreadOwns();
+  bool flushQueue = !mForcedCount && !mFlushing && !mSuspended &&
+                    !mEventQueue.IsEmpty() &&
+                    !MaybeSuspendIfEventsAreSuppressed();
+
+  if (flushQueue) {
+    mFlushing = true;
+    FlushQueue();
+  }
+}
+
+class MOZ_STACK_CLASS AutoEventEnqueuer {
+ public:
+  explicit AutoEventEnqueuer(ChannelEventQueue* queue) : mEventQueue(queue) {
+    {
+      MutexAutoLock lock(queue->mMutex);
+      mOwner = queue->mOwner;
+    }
+    mEventQueue->StartForcedQueueing();
+  }
+  ~AutoEventEnqueuer() { mEventQueue->EndForcedQueueing(); }
+
+ private:
+  RefPtr<ChannelEventQueue> mEventQueue;
+  nsCOMPtr<nsISupports> mOwner;
+};
+
+}  
+}  
+
+#endif

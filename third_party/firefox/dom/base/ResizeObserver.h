@@ -1,0 +1,251 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ResizeObserver_h
+#define mozilla_dom_ResizeObserver_h
+
+#include "gfxPoint.h"
+#include "js/TypeDecls.h"
+#include "mozilla/AppUnits.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/WritingModes.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/DOMRect.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/ResizeObserverBinding.h"
+#include "nsCoord.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsRefPtrHashtable.h"
+#include "nsTArray.h"
+#include "nsWrapperCache.h"
+
+#include "nsPIDOMWindow.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+class Element;
+
+class LogicalPixelSize {
+ public:
+  LogicalPixelSize() = default;
+  LogicalPixelSize(WritingMode aWM, const gfx::Size& aSize) {
+    mSize = aSize;
+    if (aWM.IsVertical()) {
+      std::swap(mSize.width, mSize.height);
+    }
+  }
+
+  gfx::Size PhysicalSize(WritingMode aWM) const {
+    if (!aWM.IsVertical()) {
+      return mSize;
+    }
+    gfx::Size result(mSize);
+    std::swap(result.width, result.height);
+    return result;
+  }
+
+  bool operator==(const LogicalPixelSize& aOther) const {
+    return mSize == aOther.mSize;
+  }
+  bool operator!=(const LogicalPixelSize& aOther) const {
+    return !(*this == aOther);
+  }
+
+  float ISize() const { return mSize.width; }
+  float BSize() const { return mSize.height; }
+  float& ISize() { return mSize.width; }
+  float& BSize() { return mSize.height; }
+
+ private:
+  gfx::Size mSize;
+};
+
+class ResizeObservation final : public LinkedListElement<ResizeObservation> {
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(ResizeObservation)
+  NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(ResizeObservation)
+
+  ResizeObservation(Element&, ResizeObserver&, ResizeObserverBoxOptions);
+
+  Element* Target() const { return mTarget; }
+
+  ResizeObserverBoxOptions BoxOptions() const { return mObservedBox; }
+
+  bool IsActive() const;
+
+  void UpdateLastReportedSize(const nsTArray<LogicalPixelSize>& aSize);
+
+  enum class RemoveFromObserver : bool { No, Yes };
+  void Unlink(RemoveFromObserver);
+
+ protected:
+  ~ResizeObservation() { Unlink(RemoveFromObserver::No); };
+
+  nsCOMPtr<Element> mTarget;
+
+  ResizeObserver* mObserver;
+
+  const ResizeObserverBoxOptions mObservedBox;
+
+  AutoTArray<LogicalPixelSize, 1> mLastReportedSize;
+};
+
+class ResizeObserver final : public nsISupports,
+                             public nsWrapperCache,
+                             public LinkedListElement<ResizeObserver> {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(ResizeObserver)
+
+  ResizeObserver(nsCOMPtr<nsPIDOMWindowInner>&& aOwner, Document* aDocument,
+                 ResizeObserverCallback& aCb)
+      : mOwner(std::move(aOwner)),
+        mDocument(aDocument),
+        mCallback(RefPtr(&aCb)) {
+    MOZ_ASSERT(mOwner, "Need a non-null owner window");
+    MOZ_ASSERT(mDocument, "Need a non-null doc");
+    MOZ_ASSERT(mDocument == mOwner->GetExtantDoc());
+  }
+
+  using NativeCallback =
+      void (*)(const Sequence<OwningNonNull<ResizeObserverEntry>>& aCb);
+  ResizeObserver(nsCOMPtr<nsPIDOMWindowInner>&& aOwner, Document* aDocument,
+                 NativeCallback aCb)
+      : mOwner(std::move(aOwner)), mDocument(aDocument), mCallback(aCb) {
+    MOZ_ASSERT(mOwner, "Need a non-null owner window");
+    MOZ_ASSERT(mDocument, "Need a non-null doc");
+    MOZ_ASSERT(mDocument == mOwner->GetExtantDoc());
+  }
+
+  nsISupports* GetParentObject() const { return mOwner; }
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override {
+    return ResizeObserver_Binding::Wrap(aCx, this, aGivenProto);
+  }
+
+  static already_AddRefed<ResizeObserver> Constructor(
+      const GlobalObject& aGlobal, ResizeObserverCallback& aCb,
+      ErrorResult& aRv);
+
+  void Observe(Element&, const ResizeObserverOptions&);
+  void Unobserve(Element&);
+
+  void Disconnect();
+
+  void GatherActiveObservations(uint32_t aDepth);
+
+  bool HasActiveObservations() const { return !mActiveTargets.IsEmpty(); }
+
+  bool HasSkippedObservations() const { return mHasSkippedTargets; }
+
+  MOZ_CAN_RUN_SCRIPT uint32_t BroadcastActiveObservations();
+
+  static AutoTArray<LogicalPixelSize, 1> CalculateBoxSize(
+      Element* aTarget, ResizeObserverBoxOptions aBox,
+      bool aForceFragmentHandling = false);
+
+  bool Observes(Element& aElement) const {
+    return mObservationMap.Contains(&aElement);
+  }
+
+ protected:
+  ~ResizeObserver() { Disconnect(); }
+
+  nsCOMPtr<nsPIDOMWindowInner> mOwner;
+  RefPtr<Document> mDocument;
+  Variant<RefPtr<ResizeObserverCallback>, NativeCallback> mCallback;
+  nsTArray<RefPtr<ResizeObservation>> mActiveTargets;
+  bool mHasSkippedTargets = false;
+
+  nsRefPtrHashtable<nsPtrHashKey<Element>, ResizeObservation> mObservationMap;
+  LinkedList<ResizeObservation> mObservationList;
+};
+
+class ResizeObserverEntry final : public nsISupports, public nsWrapperCache {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(ResizeObserverEntry)
+
+  ResizeObserverEntry(
+      nsISupports* aOwner, Element& aTarget,
+      const nsTArray<LogicalPixelSize>& aBorderBoxSize,
+      const nsTArray<LogicalPixelSize>& aContentBoxSize,
+      const nsTArray<LogicalPixelSize>& aDevicePixelContentBoxSize)
+      : mOwner(aOwner), mTarget(&aTarget) {
+    MOZ_ASSERT(mOwner, "Need a non-null owner");
+    MOZ_ASSERT(mTarget, "Need a non-null target element");
+
+    SetBorderBoxSize(aBorderBoxSize);
+    SetContentRectAndSize(aContentBoxSize);
+    SetDevicePixelContentSize(aDevicePixelContentBoxSize);
+  }
+
+  nsISupports* GetParentObject() const { return mOwner; }
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override {
+    return ResizeObserverEntry_Binding::Wrap(aCx, this, aGivenProto);
+  }
+
+  Element* Target() const { return mTarget; }
+
+  DOMRectReadOnly* ContentRect() const { return mContentRect; }
+
+  void GetBorderBoxSize(nsTArray<RefPtr<ResizeObserverSize>>& aRetVal) const;
+  void GetContentBoxSize(nsTArray<RefPtr<ResizeObserverSize>>& aRetVal) const;
+  void GetDevicePixelContentBoxSize(
+      nsTArray<RefPtr<ResizeObserverSize>>& aRetVal) const;
+
+ private:
+  ~ResizeObserverEntry() = default;
+
+  void SetBorderBoxSize(const nsTArray<LogicalPixelSize>& aSize);
+  void SetContentRectAndSize(const nsTArray<LogicalPixelSize>& aSize);
+  void SetDevicePixelContentSize(const nsTArray<LogicalPixelSize>& aSize);
+
+  nsCOMPtr<nsISupports> mOwner;
+  nsCOMPtr<Element> mTarget;
+
+  RefPtr<DOMRectReadOnly> mContentRect;
+  AutoTArray<RefPtr<ResizeObserverSize>, 1> mBorderBoxSize;
+  AutoTArray<RefPtr<ResizeObserverSize>, 1> mContentBoxSize;
+  AutoTArray<RefPtr<ResizeObserverSize>, 1> mDevicePixelContentBoxSize;
+};
+
+class ResizeObserverSize final : public nsISupports, public nsWrapperCache {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(ResizeObserverSize)
+
+  ResizeObserverSize(nsISupports* aOwner, const LogicalPixelSize& aSize)
+      : mOwner(aOwner), mSize(aSize) {
+    MOZ_ASSERT(mOwner, "Need a non-null owner");
+  }
+
+  nsISupports* GetParentObject() const { return mOwner; }
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override {
+    return ResizeObserverSize_Binding::Wrap(aCx, this, aGivenProto);
+  }
+
+  float InlineSize() const { return mSize.ISize(); }
+  float BlockSize() const { return mSize.BSize(); }
+
+ protected:
+  ~ResizeObserverSize() = default;
+
+  nsCOMPtr<nsISupports> mOwner;
+  const LogicalPixelSize mSize;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_ResizeObserver_h

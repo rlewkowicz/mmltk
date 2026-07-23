@@ -1,0 +1,76 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_MIDIAccess_h
+#define mozilla_dom_MIDIAccess_h
+
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/Observer.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsWrapperCache.h"
+
+struct JSContext;
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+class MIDIAccessManager;
+class MIDIInputMap;
+struct MIDIOptions;
+class MIDIOutputMap;
+class MIDIPermissionRequest;
+class MIDIPort;
+class MIDIPortChangeEvent;
+class MIDIPortInfo;
+class MIDIPortList;
+class Promise;
+
+class MIDIAccess final : public DOMEventTargetHelper,
+                         public Observer<MIDIPortList> {
+  friend class MIDIPermissionRequest;
+  friend class MIDIAccessManager;
+
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_INHERITED(MIDIAccess,
+                                                         DOMEventTargetHelper)
+ public:
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  MIDIInputMap* Inputs() const { return mInputMap; }
+
+  MIDIOutputMap* Outputs() const { return mOutputMap; }
+
+  bool SysexEnabled() const { return mSysexEnabled; }
+
+  void Notify(const MIDIPortList& aEvent) override;
+
+  void FireConnectionEvent(MIDIPort* aPort);
+
+  void Shutdown();
+  IMPL_EVENT_HANDLER(statechange);
+
+  void DisconnectFromOwner() override;
+
+ private:
+  MIDIAccess(nsPIDOMWindowInner* aWindow, bool aSysexEnabled,
+             Promise* aAccessPromise);
+  ~MIDIAccess();
+
+  void MaybeCreateMIDIPort(const MIDIPortInfo& aInfo, ErrorResult& aRv);
+
+  RefPtr<MIDIInputMap> mInputMap;
+  RefPtr<MIDIOutputMap> mOutputMap;
+  bool mSysexEnabled;
+  RefPtr<Promise> mAccessPromise;
+  bool mHasShutdown;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_MIDIAccess_h

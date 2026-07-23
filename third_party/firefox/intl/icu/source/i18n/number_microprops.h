@@ -1,0 +1,119 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __NUMBER_MICROPROPS_H__
+#define __NUMBER_MICROPROPS_H__
+
+#include "unicode/numberformatter.h"
+#include "number_types.h"
+#include "number_decimalquantity.h"
+#include "number_scientific.h"
+#include "number_patternstring.h"
+#include "number_modifiers.h"
+#include "number_multiplier.h"
+#include "number_roundingutils.h"
+#include "decNumber.h"
+#include "charstr.h"
+#include "util.h"
+
+U_NAMESPACE_BEGIN
+namespace number::impl {
+
+class IntMeasures : public MaybeStackArray<int64_t, 2> {
+  public:
+    IntMeasures() : MaybeStackArray<int64_t, 2>() {}
+
+    IntMeasures(const IntMeasures &other) : MaybeStackArray<int64_t, 2>() {
+        this->operator=(other);
+    }
+
+    IntMeasures &operator=(const IntMeasures &rhs) {
+        if (this == &rhs) {
+            return *this;
+        }
+        copyFrom(rhs, status);
+        return *this;
+    }
+
+    IntMeasures(IntMeasures &&src) = default;
+
+    IntMeasures &operator=(IntMeasures &&src) = default;
+
+    UErrorCode status = U_ZERO_ERROR;
+};
+
+struct SimpleMicroProps : public UMemory {
+    Grouper grouping;
+    bool useCurrency = false;
+    UNumberDecimalSeparatorDisplay decimal = UNUM_DECIMAL_SEPARATOR_AUTO;
+
+    UnicodeString currencyAsDecimal = ICU_Utility::makeBogusString();
+
+    const DecimalFormatSymbols* symbols = nullptr;
+};
+
+struct MicroProps : public MicroPropsGenerator {
+    SimpleMicroProps simple;
+
+    RoundingImpl rounder;
+    Padder padding;
+    IntegerWidth integerWidth;
+    UNumberSignDisplay sign;
+    char nsName[9];
+
+    const char *gender;
+
+
+
+    const Modifier* modOuter;
+    const Modifier* modMiddle = nullptr;
+    const Modifier* modInner;
+
+    struct {
+        ScientificModifier scientificModifier;
+        EmptyModifier emptyWeakModifier{false};
+        EmptyModifier emptyStrongModifier{true};
+        MultiplierFormatHandler multiplier;
+        SimpleModifier mixedUnitModifier;
+    } helpers;
+
+    MeasureUnit outputUnit;
+
+    IntMeasures mixedMeasures;
+
+    int32_t indexOfQuantity = -1;
+
+    int32_t mixedMeasuresCount = 0;
+
+    MicroProps() = default;
+
+    MicroProps(const MicroProps& other) = default;
+
+    MicroProps& operator=(const MicroProps& other) = default;
+
+    void processQuantity(DecimalQuantity &quantity, MicroProps &micros,
+                         UErrorCode &status) const override {
+        (void) quantity;
+        (void) status;
+        if (this == &micros) {
+            U_ASSERT(!exhausted);
+            micros.exhausted = true;
+            U_ASSERT(exhausted);
+        } else {
+            U_ASSERT(!exhausted);
+            micros = *this;
+        }
+    }
+
+  private:
+    bool exhausted = false;
+};
+
+} 
+U_NAMESPACE_END
+
+#endif // __NUMBER_MICROPROPS_H__
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

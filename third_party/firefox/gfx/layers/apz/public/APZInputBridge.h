@@ -1,0 +1,173 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_APZInputBridge_h
+#define mozilla_layers_APZInputBridge_h
+
+#include "Units.h"                  // for LayoutDeviceIntPoint
+#include "mozilla/EventForwards.h"  // for WidgetInputEvent, nsEventStatus
+#include "mozilla/layers/APZPublicUtils.h"  // for APZWheelAction, DispatchToContent
+#include "mozilla/layers/LayersTypes.h"          // for ScrollDirections
+#include "mozilla/layers/ScrollableLayerGuid.h"  // for ScrollableLayerGuid
+
+namespace mozilla {
+
+class InputData;
+
+namespace layers {
+
+class APZInputBridgeParent;
+class AsyncPanZoomController;
+class InputBlockState;
+class TouchBlockState;
+struct ScrollableLayerGuid;
+struct TargetConfirmationFlags;
+struct PointerEventsConsumableFlags;
+
+enum class APZHandledPlace : uint8_t {
+  Unhandled = 0,         
+  HandledByRoot = 1,     
+  HandledByContent = 2,  
+  Invalid = 3,
+  Last = Invalid
+};
+
+struct APZHandledResult {
+  APZHandledPlace mPlace = APZHandledPlace::Invalid;
+  SideBits mScrollableDirections = SideBits::eNone;
+  ScrollDirections mOverscrollDirections = ScrollDirections();
+
+  APZHandledResult() = default;
+  APZHandledResult(APZHandledPlace aPlace,
+                   const AsyncPanZoomController* aTarget,
+                   bool aPopulateDirectionsForUnhandled = false);
+  APZHandledResult(APZHandledPlace aPlace, SideBits aScrollableDirections,
+                   ScrollDirections aOverscrollDirections)
+      : mPlace(aPlace),
+        mScrollableDirections(aScrollableDirections),
+        mOverscrollDirections(aOverscrollDirections) {}
+
+  bool IsHandledByContent() const {
+    return mPlace == APZHandledPlace::HandledByContent;
+  }
+  bool IsHandledByRoot() const {
+    return mPlace == APZHandledPlace::HandledByRoot;
+  }
+  bool operator==(const APZHandledResult& aOther) const {
+    return mPlace == aOther.mPlace &&
+           mScrollableDirections == aOther.mScrollableDirections &&
+           mOverscrollDirections == aOther.mOverscrollDirections;
+  }
+
+  static Maybe<APZHandledResult> Initialize(
+      const AsyncPanZoomController* aInitialTarget,
+      DispatchToContent aDispatchToContent);
+
+  static void UpdateForTouchEvent(Maybe<APZHandledResult>& aHandledResult,
+                                  const InputBlockState& aBlock,
+                                  PointerEventsConsumableFlags aConsumableFlags,
+                                  const AsyncPanZoomController* aTarget,
+                                  DispatchToContent aDispatchToContent);
+};
+
+struct APZEventResult {
+  APZEventResult();
+
+  APZEventResult(const RefPtr<AsyncPanZoomController>& aInitialTarget,
+                 TargetConfirmationFlags aFlags);
+
+  void SetStatusAsConsumeNoDefault() {
+    mStatus = nsEventStatus_eConsumeNoDefault;
+  }
+
+  void SetStatusAsIgnore() { mStatus = nsEventStatus_eIgnore; }
+
+  void SetStatusAsConsumeDoDefault(
+      const RefPtr<AsyncPanZoomController>& aTarget);
+
+  void SetStatusAsConsumeDoDefault() {
+    mStatus = nsEventStatus_eConsumeDoDefault;
+  }
+
+  void SetStatusAsConsumeDoDefault(const InputBlockState& aBlock);
+  void SetStatusForTouchEvent(const InputBlockState& aBlock,
+                              TargetConfirmationFlags aFlags,
+                              PointerEventsConsumableFlags aConsumableFlags,
+                              const AsyncPanZoomController* aTarget);
+
+  void SetStatusForFastFling(const TouchBlockState& aBlock,
+                             TargetConfirmationFlags aFlags,
+                             PointerEventsConsumableFlags aConsumableFlags,
+                             const AsyncPanZoomController* aTarget);
+
+  void UpdateStatus(nsEventStatus aStatus) { mStatus = aStatus; }
+  nsEventStatus GetStatus() const { return mStatus; };
+
+  void UpdateHandledResult(const Maybe<APZHandledResult>& aHandledResult) {
+    mHandledResult = aHandledResult;
+  }
+  const Maybe<APZHandledResult>& GetHandledResult() const {
+    return mHandledResult;
+  }
+
+  bool WillHaveDelayedResult() const {
+    return GetStatus() != nsEventStatus_eConsumeNoDefault &&
+           !GetHandledResult();
+  }
+
+ private:
+  nsEventStatus mStatus;
+
+  Maybe<APZHandledResult> mHandledResult;
+
+ public:
+  ScrollableLayerGuid mTargetGuid;
+  uint64_t mInputBlockId;
+
+  bool mTargetCanScrollHorizontally = false;
+};
+
+class APZInputBridge {
+ public:
+  using InputBlockCallback = std::function<void(
+      uint64_t aInputBlockId, const APZHandledResult& aHandledResult)>;
+
+  virtual APZEventResult ReceiveInputEvent(
+      InputData& aEvent,
+      InputBlockCallback&& aCallback = InputBlockCallback()) = 0;
+
+  APZEventResult ReceiveInputEvent(
+      WidgetInputEvent& aEvent,
+      InputBlockCallback&& aCallback = InputBlockCallback());
+
+  static Maybe<APZWheelAction> ActionForWheelEvent(WidgetWheelEvent* aEvent);
+
+ protected:
+  friend class APZInputBridgeParent;
+
+
+  virtual void ProcessUnhandledEvent(LayoutDeviceIntPoint* aRefPoint,
+                                     ScrollableLayerGuid* aOutTargetGuid,
+                                     uint64_t* aOutFocusSequenceNumber,
+                                     LayersId* aOutLayersId) = 0;
+
+  virtual void UpdateWheelTransaction(
+      LayoutDeviceIntPoint aRefPoint, EventMessage aEventMessage,
+      const Maybe<ScrollableLayerGuid>& aTargetGuid) = 0;
+
+  virtual ~APZInputBridge() = default;
+};
+
+std::ostream& operator<<(std::ostream& aOut,
+                         const APZHandledResult& aHandledResult);
+
+enum class BrowserGestureResponse : bool {
+  NotConsumed = 0,  
+  Consumed = 1,  
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_APZInputBridge_h

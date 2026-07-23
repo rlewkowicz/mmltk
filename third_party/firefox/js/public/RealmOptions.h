@@ -1,0 +1,253 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_RealmOptions_h
+#define js_RealmOptions_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+#include "mozilla/Maybe.h"
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "js/Class.h"  // JSTraceOp
+#include "js/RefCounted.h"
+
+struct JS_PUBLIC_API JSContext;
+class JS_PUBLIC_API JSObject;
+
+namespace JS {
+
+class JS_PUBLIC_API Compartment;
+class JS_PUBLIC_API Realm;
+class JS_PUBLIC_API Zone;
+
+}  
+
+namespace JS {
+
+enum class CompartmentSpecifier {
+  NewCompartmentInSystemZone,
+
+  NewCompartmentInExistingZone,
+
+  NewCompartmentAndZone,
+
+  ExistingCompartment,
+};
+
+struct LocaleString : js::RefCounted<LocaleString> {
+  const char* chars_;
+
+  explicit LocaleString(const char* chars) : chars_(chars) {}
+
+  auto* chars() const { return chars_; }
+};
+
+struct TimeZoneString : js::RefCounted<TimeZoneString> {
+  const char* chars_;
+
+  explicit TimeZoneString(const char* chars) : chars_(chars) {}
+
+  auto* chars() const { return chars_; }
+};
+
+class JS_PUBLIC_API RealmCreationOptions {
+ public:
+  RealmCreationOptions() : comp_(nullptr) {}
+
+  JSTraceOp getTrace() const { return traceGlobal_; }
+  RealmCreationOptions& setTrace(JSTraceOp op) {
+    traceGlobal_ = op;
+    return *this;
+  }
+
+  Zone* zone() const {
+    MOZ_ASSERT(compSpec_ == CompartmentSpecifier::NewCompartmentInExistingZone);
+    return zone_;
+  }
+  Compartment* compartment() const {
+    MOZ_ASSERT(compSpec_ == CompartmentSpecifier::ExistingCompartment);
+    return comp_;
+  }
+  CompartmentSpecifier compartmentSpecifier() const { return compSpec_; }
+
+  RealmCreationOptions& setNewCompartmentInSystemZone();
+  RealmCreationOptions& setNewCompartmentInExistingZone(JSObject* obj);
+  RealmCreationOptions& setNewCompartmentAndZone();
+  RealmCreationOptions& setExistingCompartment(JSObject* obj);
+  RealmCreationOptions& setExistingCompartment(Compartment* compartment);
+
+  bool invisibleToDebugger() const { return invisibleToDebugger_; }
+  RealmCreationOptions& setInvisibleToDebugger(bool flag) {
+    invisibleToDebugger_ = flag;
+    return *this;
+  }
+
+  bool preserveJitCode() const { return preserveJitCode_; }
+  RealmCreationOptions& setPreserveJitCode(bool flag) {
+    preserveJitCode_ = flag;
+    return *this;
+  }
+
+  bool getSharedMemoryAndAtomicsEnabled() const;
+  RealmCreationOptions& setSharedMemoryAndAtomicsEnabled(bool flag);
+
+  bool defineSharedArrayBufferConstructor() const {
+    return defineSharedArrayBufferConstructor_;
+  }
+  RealmCreationOptions& setDefineSharedArrayBufferConstructor(bool flag) {
+    defineSharedArrayBufferConstructor_ = flag;
+    return *this;
+  }
+
+  bool getCoopAndCoepEnabled() const;
+  RealmCreationOptions& setCoopAndCoepEnabled(bool flag);
+
+  bool getToSourceEnabled() const { return toSource_; }
+  RealmCreationOptions& setToSourceEnabled(bool flag) {
+    toSource_ = flag;
+    return *this;
+  }
+
+  bool secureContext() const { return secureContext_; }
+  RealmCreationOptions& setSecureContext(bool flag) {
+    secureContext_ = flag;
+    return *this;
+  }
+
+  bool freezeBuiltins() const { return freezeBuiltins_; }
+  RealmCreationOptions& setFreezeBuiltins(bool flag) {
+    freezeBuiltins_ = flag;
+    return *this;
+  }
+
+  bool alwaysUseFdlibm() const { return alwaysUseFdlibm_; }
+  RealmCreationOptions& setAlwaysUseFdlibm(bool flag) {
+    alwaysUseFdlibm_ = flag;
+    return *this;
+  }
+
+  uint64_t profilerRealmID() const { return profilerRealmID_; }
+  RealmCreationOptions& setProfilerRealmID(uint64_t id) {
+    profilerRealmID_ = id;
+    return *this;
+  }
+
+ private:
+  JSTraceOp traceGlobal_ = nullptr;
+  CompartmentSpecifier compSpec_ = CompartmentSpecifier::NewCompartmentAndZone;
+  union {
+    Compartment* comp_;
+    Zone* zone_;
+  };
+  uint64_t profilerRealmID_ = 0;
+  bool invisibleToDebugger_ = false;
+  bool preserveJitCode_ = false;
+  bool sharedMemoryAndAtomics_ = false;
+  bool defineSharedArrayBufferConstructor_ = true;
+  bool coopAndCoep_ = false;
+  bool toSource_ = false;
+
+  bool secureContext_ = false;
+  bool freezeBuiltins_ = false;
+  bool alwaysUseFdlibm_ = false;
+};
+
+struct RTPCallerTypeToken {
+  uint8_t value;
+};
+
+class JS_PUBLIC_API RealmBehaviors {
+ public:
+  RealmBehaviors() = default;
+
+  mozilla::Maybe<RTPCallerTypeToken> reduceTimerPrecisionCallerType() const {
+    return rtpCallerType;
+  }
+  RealmBehaviors& setReduceTimerPrecisionCallerType(RTPCallerTypeToken type) {
+    rtpCallerType = mozilla::Some(type);
+    return *this;
+  }
+
+  bool discardSource() const { return discardSource_; }
+  RealmBehaviors& setDiscardSource(bool flag) {
+    discardSource_ = flag;
+    return *this;
+  }
+
+  bool clampAndJitterTime() const { return clampAndJitterTime_; }
+  RealmBehaviors& setClampAndJitterTime(bool flag) {
+    clampAndJitterTime_ = flag;
+    return *this;
+  }
+
+  bool isNonLive() const { return isNonLive_; }
+  RealmBehaviors& setNonLive() {
+    isNonLive_ = true;
+    return *this;
+  }
+
+  RefPtr<LocaleString> localeOverride() const { return localeOverride_; }
+  RealmBehaviors& setLocaleOverride(const char* locale);
+
+  RefPtr<TimeZoneString> timeZoneOverride() const { return timeZoneOverride_; }
+  RealmBehaviors& setTimeZoneOverride(const char* timeZone);
+
+  void copyOverrideStrings();
+
+ private:
+  RefPtr<LocaleString> localeOverride_;
+  RefPtr<TimeZoneString> timeZoneOverride_;
+  mozilla::Maybe<RTPCallerTypeToken> rtpCallerType;
+  bool discardSource_ = false;
+  bool clampAndJitterTime_ = true;
+  bool isNonLive_ = false;
+};
+
+class JS_PUBLIC_API RealmOptions {
+ public:
+  explicit RealmOptions() : creationOptions_(), behaviors_() {}
+
+  RealmOptions(const RealmCreationOptions& realmCreation,
+               const RealmBehaviors& realmBehaviors)
+      : creationOptions_(realmCreation), behaviors_(realmBehaviors) {}
+
+  RealmCreationOptions& creationOptions() { return creationOptions_; }
+  const RealmCreationOptions& creationOptions() const {
+    return creationOptions_;
+  }
+
+  RealmBehaviors& behaviors() { return behaviors_; }
+  const RealmBehaviors& behaviors() const { return behaviors_; }
+
+ private:
+  RealmCreationOptions creationOptions_;
+  RealmBehaviors behaviors_;
+};
+
+extern JS_PUBLIC_API const RealmCreationOptions& RealmCreationOptionsRef(
+    Realm* realm);
+
+extern JS_PUBLIC_API const RealmCreationOptions& RealmCreationOptionsRef(
+    JSContext* cx);
+
+extern JS_PUBLIC_API const RealmBehaviors& RealmBehaviorsRef(Realm* realm);
+
+extern JS_PUBLIC_API const RealmBehaviors& RealmBehaviorsRef(JSContext* cx);
+
+extern JS_PUBLIC_API void SetRealmLocaleOverride(Realm* realm,
+                                                 const char* locale);
+
+extern JS_PUBLIC_API void SetRealmTimezoneOverride(Realm* realm,
+                                                   const char* timezone);
+
+extern JS_PUBLIC_API void SetRealmNonLive(Realm* realm);
+
+extern JS_PUBLIC_API void SetRealmReduceTimerPrecisionCallerType(
+    Realm* realm, RTPCallerTypeToken type);
+
+}  
+
+#endif  // js_RealmOptions_h

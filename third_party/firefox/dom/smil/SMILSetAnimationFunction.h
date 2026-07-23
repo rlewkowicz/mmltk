@@ -1,0 +1,32 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SMIL_SMILSETANIMATIONFUNCTION_H_
+#define DOM_SMIL_SMILSETANIMATIONFUNCTION_H_
+
+#include "mozilla/SMILAnimationFunction.h"
+
+namespace mozilla {
+
+class SMILSetAnimationFunction : public SMILAnimationFunction {
+ protected:
+  bool IsDisallowedAttribute(const nsAtom* aAttribute) const override {
+    return aAttribute == nsGkAtoms::calcMode ||
+           aAttribute == nsGkAtoms::values ||
+           aAttribute == nsGkAtoms::keyTimes ||
+           aAttribute == nsGkAtoms::keySplines ||
+           aAttribute == nsGkAtoms::from || aAttribute == nsGkAtoms::by ||
+           aAttribute == nsGkAtoms::additive ||
+           aAttribute == nsGkAtoms::accumulate;
+  }
+
+  bool IsToAnimation() const override { return false; }
+
+  bool IsValueFixedForSimpleDuration() const override { return true; }
+  bool WillReplace() const override { return true; }
+};
+
+}  
+
+#endif  // DOM_SMIL_SMILSETANIMATIONFUNCTION_H_

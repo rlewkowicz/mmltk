@@ -1,0 +1,43 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef PollableEvent_h_
+#define PollableEvent_h_
+
+#include "mozilla/Mutex.h"
+#include "mozilla/TimeStamp.h"
+
+struct PRFileDesc;
+
+namespace mozilla {
+namespace net {
+
+class PollableEvent {
+ public:
+  PollableEvent();
+  ~PollableEvent();
+
+  bool Signal(bool aForce = false);
+  bool Clear();
+  bool Valid() { return mWriteFD && mReadFD; }
+
+  void MarkFirstSignalTimestamp();
+  void AdjustFirstSignalTimestamp();
+  bool IsSignallingAlive(TimeDuration const& timeout);
+
+  PRFileDesc* PollableFD() { return mReadFD; }
+
+ private:
+  PRFileDesc* mWriteFD{nullptr};
+  PRFileDesc* mReadFD{nullptr};
+  bool mSignaled{false};
+  bool mWriteFailed{false};
+  bool mSignalTimestampAdjusted{false};
+  TimeStamp mFirstSignalAfterClear;
+};
+
+}  
+}  
+
+#endif

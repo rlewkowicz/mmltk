@@ -1,0 +1,157 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef AccessibleCaret_h_
+#define AccessibleCaret_h_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/AnonymousContent.h"
+#include "nsCOMPtr.h"
+#include "nsIDOMEventListener.h"
+#include "nsIFrame.h"  // for WeakFrame only
+#include "nsISupports.h"
+#include "nsISupportsImpl.h"
+#include "nsLiteralString.h"
+#include "nsRect.h"
+#include "nsString.h"
+
+class nsIFrame;
+struct nsPoint;
+
+namespace mozilla {
+class PresShell;
+namespace dom {
+class Element;
+class Event;
+}  
+
+class AccessibleCaret {
+ public:
+  explicit AccessibleCaret(PresShell* aPresShell);
+  virtual ~AccessibleCaret();
+
+  enum class Appearance : uint8_t {
+    None,
+
+    Normal,
+
+    NormalNotShown,
+
+    Left,
+
+    Right
+  };
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const Appearance& aAppearance);
+
+  Appearance GetAppearance() const { return mAppearance; }
+
+  virtual void SetAppearance(Appearance aAppearance);
+
+  bool IsLogicallyVisible() const { return mAppearance != Appearance::None; }
+
+  bool IsVisuallyVisible() const {
+    return (mAppearance != Appearance::None) &&
+           (mAppearance != Appearance::NormalNotShown);
+  }
+
+  enum class PositionChangedResult : uint8_t {
+    NotChanged,
+
+    Position,
+
+    Zoom,
+
+    Invisible
+  };
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const PositionChangedResult& aResult);
+
+  virtual PositionChangedResult SetPosition(nsIFrame* aFrame, int32_t aOffset);
+
+  bool Intersects(const AccessibleCaret& aCaret) const;
+
+  enum class TouchArea {
+    Full,  
+    CaretImage
+  };
+  bool Contains(const nsPoint& aPoint, TouchArea aTouchArea) const;
+
+  nsPoint LogicalPosition() const { return mImaginaryCaretRect.Center(); }
+
+  dom::Element& CaretElement() const { return *mCaretElementHolder->Host(); }
+
+  void EnsureApzAware();
+
+  bool IsInPositionFixedSubtree() const;
+
+ protected:
+  void SetCaretElementStyle(const nsRect& aRect, float aZoomLevel);
+  void SetTextOverlayElementStyle(const nsRect& aRect, float aZoomLevel);
+  void SetCaretImageElementStyle(const nsRect& aRect, float aZoomLevel);
+
+  float GetZoomLevel();
+
+  dom::Element* TextOverlayElement() const;
+
+  dom::Element* CaretImageElement() const;
+
+  nsIFrame* RootFrame() const;
+
+  nsIFrame* CustomContentContainerFrame() const;
+
+  static nsAutoString AppearanceString(Appearance aAppearance);
+
+  void CreateCaretElement() const;
+
+  void InjectCaretElement(dom::Document*);
+
+  void RemoveCaretElement(dom::Document*);
+
+  void ClearCachedData();
+
+  static nsPoint CaretElementPosition(const nsRect& aRect) {
+    return aRect.TopLeft() + nsPoint(aRect.width / 2, 0);
+  }
+
+  class DummyTouchListener final : public nsIDOMEventListener {
+   public:
+    NS_DECL_ISUPPORTS
+    NS_IMETHOD HandleEvent(mozilla::dom::Event* aEvent) override {
+      return NS_OK;
+    }
+
+   private:
+    virtual ~DummyTouchListener() = default;
+  };
+
+  Appearance mAppearance = Appearance::None;
+
+  PresShell* const MOZ_NON_OWNING_REF mPresShell = nullptr;
+
+  RefPtr<dom::AnonymousContent> mCaretElementHolder;
+
+  nsRect mImaginaryCaretRect;
+
+  nsRect mImaginaryCaretRectInContainerFrame;
+
+  WeakFrame mImaginaryCaretReferenceFrame;
+
+  float mZoomLevel = 0.0f;
+
+  RefPtr<DummyTouchListener> mDummyTouchListener{new DummyTouchListener()};
+};  
+
+std::ostream& operator<<(std::ostream& aStream,
+                         const AccessibleCaret::Appearance& aAppearance);
+
+std::ostream& operator<<(std::ostream& aStream,
+                         const AccessibleCaret::PositionChangedResult& aResult);
+
+}  
+
+#endif  // AccessibleCaret_h_

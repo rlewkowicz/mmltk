@@ -1,0 +1,208 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "txNodeSorter.h"
+
+#include "mozilla/CheckedInt.h"
+#include "mozilla/UniquePtrExtensions.h"
+#include "nsGkAtoms.h"
+#include "nsRFPService.h"
+#include "txExecutionState.h"
+#include "txExpr.h"
+#include "txNodeSetContext.h"
+#include "txStringUtils.h"
+#include "txXPathResultComparator.h"
+
+using mozilla::CheckedUint32;
+using mozilla::MakeUnique;
+using mozilla::MakeUniqueFallible;
+using mozilla::nsRFPService;
+using mozilla::RFPTarget;
+using mozilla::UniquePtr;
+
+
+txNodeSorter::txNodeSorter() : mNKeys(0) {}
+
+txNodeSorter::~txNodeSorter() {
+  txListIterator iter(&mSortKeys);
+  while (iter.hasNext()) {
+    SortKey* key = (SortKey*)iter.next();
+    delete key->mComparator;
+    delete key;
+  }
+}
+
+nsresult txNodeSorter::addSortElement(Expr* aSelectExpr, Expr* aLangExpr,
+                                      Expr* aDataTypeExpr, Expr* aOrderExpr,
+                                      Expr* aCaseOrderExpr,
+                                      txIEvalContext* aContext) {
+  UniquePtr<SortKey> key(new SortKey);
+  nsresult rv = NS_OK;
+
+  key->mExpr = aSelectExpr;
+
+  bool ascending = true;
+  if (aOrderExpr) {
+    nsAutoString attrValue;
+    rv = aOrderExpr->evaluateToString(aContext, attrValue);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    if (TX_StringEqualsAtom(attrValue, nsGkAtoms::descending)) {
+      ascending = false;
+    } else if (!TX_StringEqualsAtom(attrValue, nsGkAtoms::ascending)) {
+      return NS_ERROR_XSLT_BAD_VALUE;
+    }
+  }
+
+  nsAutoString dataType;
+  if (aDataTypeExpr) {
+    rv = aDataTypeExpr->evaluateToString(aContext, dataType);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  if (!aDataTypeExpr || TX_StringEqualsAtom(dataType, nsGkAtoms::text)) {
+
+    nsAutoCStringN<6> lang;
+    if (aLangExpr) {
+      nsAutoStringN<6> utf16lang;
+      rv = aLangExpr->evaluateToString(aContext, utf16lang);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+
+    bool upperFirst = false;
+    if (aCaseOrderExpr) {
+      nsAutoString attrValue;
+
+      rv = aCaseOrderExpr->evaluateToString(aContext, attrValue);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      if (TX_StringEqualsAtom(attrValue, nsGkAtoms::upperFirst)) {
+        upperFirst = true;
+      } else if (!TX_StringEqualsAtom(attrValue, nsGkAtoms::lowerFirst)) {
+        return NS_ERROR_XSLT_BAD_VALUE;
+      }
+    }
+
+    UniquePtr<txResultStringComparator> comparator =
+        MakeUnique<txResultStringComparator>(ascending, upperFirst);
+    rv = comparator->init(
+        lang, aContext->getContextNode().OwnerDoc()->ShouldResistFingerprinting(
+                  RFPTarget::JSLocale));
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    key->mComparator = comparator.release();
+  } else if (TX_StringEqualsAtom(dataType, nsGkAtoms::number)) {
+    key->mComparator = new txResultNumberComparator(ascending);
+  } else {
+    return NS_ERROR_XSLT_BAD_VALUE;
+  }
+
+  mSortKeys.add(key.release());
+  mNKeys++;
+
+  return NS_OK;
+}
+
+nsresult txNodeSorter::sortNodeSet(txNodeSet* aNodes, txExecutionState* aEs,
+                                   txNodeSet** aResult) {
+  if (mNKeys == 0 || aNodes->isEmpty()) {
+    RefPtr<txNodeSet> ref(aNodes);
+    ref.forget(aResult);
+
+    return NS_OK;
+  }
+
+  *aResult = nullptr;
+
+  RefPtr<txNodeSet> sortedNodes;
+  nsresult rv = aEs->recycler()->getNodeSet(getter_AddRefs(sortedNodes));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  CheckedUint32 len = aNodes->size();
+  CheckedUint32 numSortValues = len * mNKeys;
+  CheckedUint32 sortValuesSize = numSortValues * sizeof(txObject*);
+  if (!sortValuesSize.isValid()) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  nsTArray<uint32_t> indexes(len.value());
+  indexes.SetLengthAndRetainStorage(len.value());
+  nsTArray<UniquePtr<txObject>> sortValues(numSortValues.value());
+  sortValues.SetLengthAndRetainStorage(numSortValues.value());
+
+  uint32_t i;
+  for (i = 0; i < len.value(); ++i) {
+    indexes[i] = i;
+  }
+
+  auto nodeSetContext = MakeUnique<txNodeSetContext>(aNodes, aEs);
+
+  SortData sortData{this, nodeSetContext.get(), sortValues.Elements(), NS_OK};
+
+  aEs->pushEvalContext(nodeSetContext.release());
+
+  indexes.StableSort([&sortData](uint32_t left, uint32_t right) {
+    return compareNodes(left, right, sortData);
+  });
+
+  if (NS_FAILED(sortData.mRv)) {
+    return sortData.mRv;
+  }
+
+  for (i = 0; i < len.value(); ++i) {
+    rv = sortedNodes->append(aNodes->get(indexes[i]));
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+  }
+
+  delete aEs->popEvalContext();
+
+  sortedNodes.forget(aResult);
+
+  return NS_OK;
+}
+
+int txNodeSorter::compareNodes(uint32_t aIndexA, uint32_t aIndexB,
+                               SortData& aSortData) {
+  txListIterator iter(&aSortData.mNodeSorter->mSortKeys);
+  UniquePtr<txObject>* sortValuesA =
+      aSortData.mSortValues + aIndexA * aSortData.mNodeSorter->mNKeys;
+  UniquePtr<txObject>* sortValuesB =
+      aSortData.mSortValues + aIndexB * aSortData.mNodeSorter->mNKeys;
+
+  unsigned int i;
+  for (i = 0; i < aSortData.mNodeSorter->mNKeys; ++i) {
+    SortKey* key = (SortKey*)iter.next();
+    if (!sortValuesA[i]) {
+      sortValuesA[i] = calcSortValue(key, &aSortData, aIndexA);
+    }
+    if (!sortValuesB[i]) {
+      sortValuesB[i] = calcSortValue(key, &aSortData, aIndexB);
+    }
+
+    int compRes = key->mComparator->compareValues(sortValuesA[i].get(),
+                                                  sortValuesB[i].get());
+    if (compRes != 0) {
+      return compRes;
+    }
+  }
+
+  return 0;
+}
+
+UniquePtr<txObject> txNodeSorter::calcSortValue(SortKey* aKey,
+                                                SortData* aSortData,
+                                                uint32_t aNodeIndex) {
+  aSortData->mContext->setPosition(aNodeIndex + 1);  
+
+  UniquePtr<txObject> sortValue;
+  nsresult rv;
+  std::tie(sortValue, rv) =
+      aKey->mComparator->createSortableValue(aKey->mExpr, aSortData->mContext);
+  if (NS_FAILED(rv) && NS_SUCCEEDED(aSortData->mRv)) {
+    aSortData->mRv = rv;
+  }
+  return sortValue;
+}

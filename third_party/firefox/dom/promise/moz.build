@@ -1,0 +1,27 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+EXPORTS.mozilla.dom += [
+    "Promise-inl.h",
+    "Promise.h",
+    "PromiseDebugging.h",
+    "PromiseNativeHandler.h",
+    "PromiseWorkerProxy.h",
+]
+
+UNIFIED_SOURCES += [
+    "Promise.cpp",
+    "PromiseDebugging.cpp",
+    "PromiseNativeHandler.cpp",
+]
+
+LOCAL_INCLUDES += [
+    "../base",
+    "../ipc",
+    "/js/xpconnect/src",
+]
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+FINAL_LIBRARY = "xul"

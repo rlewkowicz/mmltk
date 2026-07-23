@@ -1,0 +1,118 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#ifndef ABSL_STRINGS_STR_REPLACE_H_
+#define ABSL_STRINGS_STR_REPLACE_H_
+
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "absl/base/attributes.h"
+#include "absl/base/nullability.h"
+#include "absl/strings/string_view.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+[[nodiscard]] std::string StrReplaceAll(
+    absl::string_view s,
+    std::initializer_list<std::pair<absl::string_view, absl::string_view>>
+        replacements);
+
+template <typename StrToStrMapping>
+std::string StrReplaceAll(absl::string_view s,
+                          const StrToStrMapping& replacements);
+
+int StrReplaceAll(
+    std::initializer_list<std::pair<absl::string_view, absl::string_view>>
+        replacements,
+    std::string* absl_nonnull target);
+
+template <typename StrToStrMapping>
+int StrReplaceAll(const StrToStrMapping& replacements,
+                  std::string* absl_nonnull target);
+
+namespace strings_internal {
+
+struct ViableSubstitution {
+  absl::string_view old;
+  absl::string_view replacement;
+  size_t offset;
+
+  ViableSubstitution(absl::string_view old_str,
+                     absl::string_view replacement_str, size_t offset_val)
+      : old(old_str), replacement(replacement_str), offset(offset_val) {}
+
+  bool OccursBefore(const ViableSubstitution& y) const {
+    if (offset != y.offset) return offset < y.offset;
+    return old.size() > y.old.size();
+  }
+};
+
+template <typename StrToStrMapping>
+std::vector<ViableSubstitution> FindSubstitutions(
+    absl::string_view s, const StrToStrMapping& replacements) {
+  std::vector<ViableSubstitution> subs;
+  subs.reserve(replacements.size());
+
+  for (const auto& rep : replacements) {
+    using std::get;
+    absl::string_view old(get<0>(rep));
+
+    size_t pos = s.find(old);
+    if (pos == s.npos) continue;
+
+    if (old.empty()) continue;
+
+    subs.emplace_back(old, get<1>(rep), pos);
+
+    size_t index = subs.size();
+    while (--index && subs[index - 1].OccursBefore(subs[index])) {
+      std::swap(subs[index], subs[index - 1]);
+    }
+  }
+  return subs;
+}
+
+int ApplySubstitutions(absl::string_view s,
+                       std::vector<ViableSubstitution>* absl_nonnull subs_ptr,
+                       std::string* absl_nonnull result_ptr);
+
+}  
+
+template <typename StrToStrMapping>
+std::string StrReplaceAll(absl::string_view s,
+                          const StrToStrMapping& replacements) {
+  auto subs = strings_internal::FindSubstitutions(s, replacements);
+  std::string result;
+  result.reserve(s.size());
+  strings_internal::ApplySubstitutions(s, &subs, &result);
+  return result;
+}
+
+template <typename StrToStrMapping>
+int StrReplaceAll(const StrToStrMapping& replacements,
+                  std::string* absl_nonnull target) {
+  auto subs = strings_internal::FindSubstitutions(*target, replacements);
+  if (subs.empty()) return 0;
+
+  std::string result;
+  result.reserve(target->size());
+  int substitutions =
+      strings_internal::ApplySubstitutions(*target, &subs, &result);
+  target->swap(result);
+  return substitutions;
+}
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_STRINGS_STR_REPLACE_H_

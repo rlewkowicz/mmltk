@@ -1,0 +1,98 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef SubstitutingProtocolHandler_h_
+#define SubstitutingProtocolHandler_h_
+
+#include "nsISubstitutingProtocolHandler.h"
+
+#include "nsTHashMap.h"
+#include "nsStandardURL.h"
+#include "nsJARURI.h"
+#include "mozilla/chrome/RegistryMessageUtils.h"
+#include "mozilla/RWLock.h"
+
+class nsIIOService;
+
+namespace mozilla {
+namespace net {
+
+class SubstitutingProtocolHandler {
+ public:
+  explicit SubstitutingProtocolHandler(const char* aScheme,
+                                       bool aEnforceFileOrJar = true);
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(SubstitutingProtocolHandler);
+  NS_DECL_NON_VIRTUAL_NSIPROTOCOLHANDLER;
+  NS_DECL_NON_VIRTUAL_NSISUBSTITUTINGPROTOCOLHANDLER;
+
+  bool HasSubstitution(const nsACString& aRoot) const {
+    AutoReadLock lock(const_cast<RWLock&>(mSubstitutionsLock));
+    return mSubstitutions.Get(aRoot, nullptr);
+  }
+
+  nsresult NewURI(const nsACString& aSpec, const char* aCharset,
+                  nsIURI* aBaseURI, nsIURI** aResult);
+
+  [[nodiscard]] nsresult CollectSubstitutions(
+      nsTArray<SubstitutionMapping>& aMappings);
+
+ protected:
+  virtual ~SubstitutingProtocolHandler() = default;
+  void ConstructInternal();
+
+  [[nodiscard]] nsresult SendSubstitution(const nsACString& aRoot,
+                                          nsIURI* aBaseURI, uint32_t aFlags);
+
+  nsresult GetSubstitutionFlags(const nsACString& root, uint32_t* flags);
+
+  [[nodiscard]] virtual nsresult GetSubstitutionInternal(
+      const nsACString& aRoot, nsIURI** aResult) {
+    *aResult = nullptr;
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  [[nodiscard]] virtual bool ResolveSpecialCases(const nsACString& aHost,
+                                                 const nsACString& aPath,
+                                                 const nsACString& aPathname,
+                                                 nsACString& aResult) {
+    return false;
+  }
+
+  [[nodiscard]] virtual uint32_t GetJARFlags(const nsACString& aRoot) {
+    return 0;
+  }
+
+  [[nodiscard]] virtual nsresult SubstituteChannel(nsIURI* uri,
+                                                   nsILoadInfo* aLoadInfo,
+                                                   nsIChannel** result) {
+    return NS_OK;
+  }
+
+  nsIIOService* IOService() { return mIOService; }
+
+ private:
+  struct SubstitutionEntry {
+    nsCOMPtr<nsIURI> baseURI;
+    uint32_t flags = 0;
+  };
+
+  void NotifyObservers(const nsACString& aRoot, nsIURI* aBaseURI);
+
+  nsCString mScheme;
+
+  RWLock mSubstitutionsLock;
+  nsTHashMap<nsCStringHashKey, SubstitutionEntry> mSubstitutions
+      MOZ_GUARDED_BY(mSubstitutionsLock);
+  nsCOMPtr<nsIIOService> mIOService;
+
+  nsresult ResolveJARURI(nsIURL* aURL, nsIURI** aResult);
+
+  bool mEnforceFileOrJar;
+};
+
+}  
+}  
+
+#endif /* SubstitutingProtocolHandler_h_ */

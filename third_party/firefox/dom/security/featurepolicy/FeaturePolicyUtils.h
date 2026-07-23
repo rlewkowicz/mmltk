@@ -1,0 +1,74 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_FeaturePolicyUtils_h
+#define mozilla_dom_FeaturePolicyUtils_h
+
+#include <functional>
+
+#include "mozilla/dom/FeaturePolicy.h"
+
+class PickleIterator;
+
+namespace IPC {
+class Message;
+class MessageReader;
+class MessageWriter;
+}  
+
+namespace mozilla {
+namespace dom {
+
+class Document;
+
+class FeaturePolicyUtils final {
+ public:
+  enum FeaturePolicyValue {
+    eAll,
+
+    eSelf,
+
+    eNone,
+  };
+
+  static bool IsFeatureAllowed(Document* aDocument,
+                               const nsAString& aFeatureName);
+
+  static bool IsSupportedFeature(const nsAString& aFeatureName);
+
+  static bool IsExperimentalFeature(const nsAString& aFeatureName);
+
+  static void ForEachFeature(const std::function<void(const char*)>& aCallback);
+
+  static FeaturePolicyValue DefaultAllowListFeature(
+      const nsAString& aFeatureName);
+
+  static bool IsFeatureUnsafeAllowedAll(Document* aDocument,
+                                        const nsAString& aFeatureName);
+
+ private:
+  static void ReportViolation(Document* aDocument,
+                              const nsAString& aFeatureName);
+};
+
+}  
+}  
+
+namespace IPC {
+
+template <typename T>
+struct ParamTraits;
+
+template <>
+struct ParamTraits<mozilla::dom::FeaturePolicyInfo> {
+  using paramType = mozilla::dom::FeaturePolicyInfo;
+  static void Write(MessageWriter* aWriter,
+                    const mozilla::dom::FeaturePolicyInfo& aParam);
+  static bool Read(MessageReader* aReader,
+                   mozilla::dom::FeaturePolicyInfo* aResult);
+};
+
+}  
+
+#endif  // mozilla_dom_FeaturePolicyUtils_h

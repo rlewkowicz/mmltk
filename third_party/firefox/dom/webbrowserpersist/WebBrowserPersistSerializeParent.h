@@ -1,0 +1,41 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef WebBrowserPersistSerializeParent_h_
+#define WebBrowserPersistSerializeParent_h_
+
+#include "mozilla/PWebBrowserPersistSerializeParent.h"
+#include "nsCOMPtr.h"
+#include "nsIOutputStream.h"
+#include "nsIWebBrowserPersistDocument.h"
+
+namespace mozilla {
+
+class WebBrowserPersistSerializeParent
+    : public PWebBrowserPersistSerializeParent {
+ public:
+  WebBrowserPersistSerializeParent(
+      nsIWebBrowserPersistDocument* aDocument, nsIOutputStream* aStream,
+      nsIWebBrowserPersistWriteCompletion* aFinish);
+  virtual ~WebBrowserPersistSerializeParent();
+
+  virtual mozilla::ipc::IPCResult RecvWriteData(
+      nsTArray<uint8_t>&& aData) override;
+
+  virtual mozilla::ipc::IPCResult Recv__delete__(
+      const nsACString& aContentType, const nsresult& aStatus) override;
+
+  virtual void ActorDestroy(ActorDestroyReason aWhy) override;
+
+ private:
+  nsCOMPtr<nsIWebBrowserPersistDocument> mDocument;
+  nsCOMPtr<nsIOutputStream> mStream;
+  nsCOMPtr<nsIWebBrowserPersistWriteCompletion> mFinish;
+  nsresult mOutputError;
+};
+
+}  
+
+#endif  // WebBrowserPersistSerializeParent_h_

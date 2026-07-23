@@ -1,0 +1,199 @@
+// Copyright 2018 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_CONTAINER_FLAT_HASH_SET_H_
+#define ABSL_CONTAINER_FLAT_HASH_SET_H_
+
+#include <cstddef>
+#include <memory>
+#include <type_traits>
+#include <utility>
+
+#include "absl/algorithm/container.h"
+#include "absl/base/attributes.h"
+#include "absl/base/macros.h"
+#include "absl/container/hash_container_defaults.h"
+#include "absl/container/internal/container_memory.h"
+#include "absl/container/internal/raw_hash_set.h"  // IWYU pragma: export
+#include "absl/memory/memory.h"
+#include "absl/meta/type_traits.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace container_internal {
+template <typename T>
+struct FlatHashSetPolicy;
+}  
+
+template <
+    class T,
+    class Hash = typename container_internal::FlatHashSetPolicy<T>::DefaultHash,
+    class Eq = typename container_internal::FlatHashSetPolicy<T>::DefaultEq,
+    class Allocator =
+        typename container_internal::FlatHashSetPolicy<T>::DefaultAlloc>
+class ABSL_ATTRIBUTE_OWNER flat_hash_set
+    : public absl::container_internal::InstantiateRawHashSet<
+          absl::container_internal::FlatHashSetPolicy<T>, Hash, Eq,
+          Allocator>::type {
+  using Base = typename flat_hash_set::raw_hash_set;
+
+ public:
+  flat_hash_set() {}
+  using Base::Base;
+
+  using Base::begin;
+
+  using Base::cbegin;
+
+  using Base::cend;
+
+  using Base::end;
+
+  using Base::capacity;
+
+  using Base::empty;
+
+  using Base::max_size;
+
+  using Base::size;
+
+  using Base::clear;
+
+  using Base::erase;
+
+  using Base::insert;
+
+  using Base::emplace;
+
+  using Base::emplace_hint;
+
+  using Base::extract;
+
+  using Base::merge;
+
+  using Base::swap;
+
+  using Base::rehash;
+
+  using Base::reserve;
+
+  using Base::contains;
+
+  using Base::count;
+
+  using Base::equal_range;
+
+  using Base::find;
+
+  using Base::bucket_count;
+
+  using Base::load_factor;
+
+  using Base::max_load_factor;
+
+  using Base::get_allocator;
+
+  using Base::hash_function;
+
+  using Base::key_eq;
+};
+
+template <typename T, typename H, typename E, typename A, typename Predicate>
+typename flat_hash_set<T, H, E, A>::size_type erase_if(
+    flat_hash_set<T, H, E, A>& c, Predicate pred) {
+  return container_internal::EraseIf(pred, &c);
+}
+
+template <typename T, typename H, typename E, typename A>
+void swap(flat_hash_set<T, H, E, A>& x,
+          flat_hash_set<T, H, E, A>& y) noexcept(noexcept(x.swap(y))) {
+  return x.swap(y);
+}
+
+namespace container_internal {
+
+template <typename T, typename H, typename E, typename A, typename Function>
+std::decay_t<Function> c_for_each_fast(const flat_hash_set<T, H, E, A>& c,
+                                       Function&& f) {
+  container_internal::ForEach(f, &c);
+  return f;
+}
+template <typename T, typename H, typename E, typename A, typename Function>
+std::decay_t<Function> c_for_each_fast(flat_hash_set<T, H, E, A>& c,
+                                       Function&& f) {
+  container_internal::ForEach(f, &c);
+  return f;
+}
+template <typename T, typename H, typename E, typename A, typename Function>
+std::decay_t<Function> c_for_each_fast(flat_hash_set<T, H, E, A>&& c,
+                                       Function&& f) {
+  container_internal::ForEach(f, &c);
+  return f;
+}
+
+}  
+
+namespace container_internal {
+
+template <class T>
+struct FlatHashSetPolicy {
+  using slot_type = T;
+  using key_type = T;
+  using init_type = T;
+  using constant_iterators = std::true_type;
+
+  using DefaultHash = DefaultHashContainerHash<T>;
+  using DefaultEq = DefaultHashContainerEq<T>;
+  using DefaultAlloc = std::allocator<T>;
+
+  template <class Allocator, class... Args>
+  static void construct(Allocator* alloc, slot_type* slot, Args&&... args) {
+    std::allocator_traits<Allocator>::construct(*alloc, slot,
+                                                std::forward<Args>(args)...);
+  }
+
+  template <class Allocator>
+  static auto destroy(Allocator* alloc, slot_type* slot) {
+    std::allocator_traits<Allocator>::destroy(*alloc, slot);
+    return IsDestructionTrivial<Allocator, slot_type>();
+  }
+
+  static T& element(slot_type* slot) { return *slot; }
+
+  template <class F, class... Args>
+  static decltype(absl::container_internal::DecomposeValue(
+      std::declval<F>(), std::declval<Args>()...))
+  apply(F&& f, Args&&... args) {
+    return absl::container_internal::DecomposeValue(
+        std::forward<F>(f), std::forward<Args>(args)...);
+  }
+
+  static size_t space_used(const T*) { return 0; }
+
+  template <class Hash, bool kIsDefault>
+  static constexpr HashSlotFn get_hash_slot_fn() {
+    return &TypeErasedApplyToSlotFn<Hash, T, kIsDefault>;
+  }
+};
+}  
+
+namespace container_algorithm_internal {
+
+template <class Key, class Hash, class KeyEqual, class Allocator>
+struct IsUnorderedContainer<absl::flat_hash_set<Key, Hash, KeyEqual, Allocator>>
+    : std::true_type {};
+
+}  
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_CONTAINER_FLAT_HASH_SET_H_

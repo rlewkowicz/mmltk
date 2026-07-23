@@ -1,0 +1,34 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_IProgressObserver_h
+#define mozilla_image_IProgressObserver_h
+
+#include "mozilla/WeakPtr.h"
+#include "nsISupports.h"
+#include "nsRect.h"
+
+namespace mozilla {
+namespace image {
+
+class IProgressObserver : public SupportsWeakPtr {
+ public:
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  virtual void Notify(int32_t aType, const nsIntRect* aRect = nullptr) = 0;
+  virtual void OnLoadComplete(bool aLastPart) = 0;
+
+  virtual void SetHasImage() = 0;
+  virtual bool NotificationsDeferred() const = 0;
+  virtual void MarkPendingNotify() = 0;
+  virtual void ClearPendingNotify() = 0;
+
+ protected:
+  virtual ~IProgressObserver() = default;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_IProgressObserver_h

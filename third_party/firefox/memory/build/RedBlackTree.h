@@ -1,0 +1,616 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+// Portions of this file were originally under the following license:
+// Copyright (C) 2008 Jason Evans <jasone@FreeBSD.org>.
+// All rights reserved.
+// Redistribution and use in source and binary forms, with or without
+// 1. Redistributions of source code must retain the above copyright
+//    copyright notices.
+// 2. Redistributions in binary form must reproduce the above copyright
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER(S) ``AS IS'' AND ANY
+// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDER(S) BE
+
+#ifndef RB_H_
+#define RB_H_
+
+#include "mozilla/Alignment.h"
+#include "mozilla/Assertions.h"
+#include "Utils.h"
+
+enum NodeColor {
+  Black = 0,
+  Red = 1,
+};
+
+template <typename T>
+class RedBlackTreeNode {
+  T* mLeft;
+  T* mRightAndColor;
+
+ public:
+  T* Left() { return mLeft; }
+
+  void SetLeft(T* aValue) { mLeft = aValue; }
+
+  T* Right() {
+    return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(mRightAndColor) &
+                                uintptr_t(~1));
+  }
+
+  void SetRight(T* aValue) {
+    mRightAndColor = reinterpret_cast<T*>(
+        (reinterpret_cast<uintptr_t>(aValue) & uintptr_t(~1)) | Color());
+  }
+
+  NodeColor Color() {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wuninitialized"
+    return static_cast<NodeColor>(reinterpret_cast<uintptr_t>(mRightAndColor) &
+                                  1);
+#pragma GCC diagnostic pop
+  }
+
+  bool IsBlack() { return Color() == NodeColor::Black; }
+
+  bool IsRed() { return Color() == NodeColor::Red; }
+
+  void SetColor(NodeColor aColor) {
+    mRightAndColor = reinterpret_cast<T*>(
+        (reinterpret_cast<uintptr_t>(mRightAndColor) & uintptr_t(~1)) | aColor);
+  }
+};
+
+template <typename T, typename Trait>
+class RedBlackTree {
+ public:
+  constexpr RedBlackTree() : mRoot(nullptr) {}
+
+  T* First(T* aStart = nullptr) { return First(TreeNode(aStart)).Get(); }
+
+  T* Last(T* aStart = nullptr) { return Last(TreeNode(aStart)).Get(); }
+
+  T* Next(T* aNode) { return Next(TreeNode(aNode)).Get(); }
+
+  T* Prev(T* aNode) { return Prev(TreeNode(aNode)).Get(); }
+
+  T* Search(typename Trait::SearchKey aKey) { return SearchImpl(aKey).Get(); }
+
+  T* SearchOrNext(typename Trait::SearchKey aKey) {
+    return SearchOrNextImpl(aKey).Get();
+  }
+
+  void Insert(T* aNode) { Insert(TreeNode(aNode)); }
+
+  void Remove(T* aNode) { Remove(TreeNode(aNode)); }
+
+  class TreeNode {
+   public:
+    constexpr TreeNode() : mNode(nullptr) {}
+
+    MOZ_IMPLICIT TreeNode(T* aNode) : mNode(aNode) {}
+
+    TreeNode& operator=(TreeNode aOther) {
+      mNode = aOther.mNode;
+      return *this;
+    }
+
+    TreeNode Left() {
+      return TreeNode(mNode ? Trait::GetTreeNode(mNode).Left() : nullptr);
+    }
+
+    void SetLeft(TreeNode aNode) {
+      MOZ_RELEASE_ASSERT(mNode);
+      Trait::GetTreeNode(mNode).SetLeft(aNode.mNode);
+    }
+
+    TreeNode Right() {
+      return TreeNode(mNode ? Trait::GetTreeNode(mNode).Right() : nullptr);
+    }
+
+    void SetRight(TreeNode aNode) {
+      MOZ_RELEASE_ASSERT(mNode);
+      Trait::GetTreeNode(mNode).SetRight(aNode.mNode);
+    }
+
+    NodeColor Color() {
+      return mNode ? Trait::GetTreeNode(mNode).Color() : NodeColor::Black;
+    }
+
+    bool IsRed() { return Color() == NodeColor::Red; }
+
+    bool IsBlack() { return Color() == NodeColor::Black; }
+
+    void SetColor(NodeColor aColor) {
+      MOZ_RELEASE_ASSERT(mNode);
+      Trait::GetTreeNode(mNode).SetColor(aColor);
+    }
+
+    T* Get() { return mNode; }
+
+    MOZ_IMPLICIT operator bool() { return !!mNode; }
+
+    bool operator==(TreeNode& aOther) { return mNode == aOther.mNode; }
+
+   private:
+    T* mNode;
+  };
+
+ private:
+  T* mRoot;
+
+  TreeNode First(TreeNode aStart) {
+    TreeNode ret;
+    for (ret = aStart ? aStart : mRoot; ret.Left(); ret = ret.Left()) {
+    }
+    return ret;
+  }
+
+  TreeNode Last(TreeNode aStart) {
+    TreeNode ret;
+    for (ret = aStart ? aStart : mRoot; ret.Right(); ret = ret.Right()) {
+    }
+    return ret;
+  }
+
+  TreeNode Next(TreeNode aNode) {
+    TreeNode ret;
+    if (aNode.Right()) {
+      ret = First(aNode.Right());
+    } else {
+      TreeNode rbp_n_t = mRoot;
+      MOZ_ASSERT(rbp_n_t);
+      ret = nullptr;
+      while (true) {
+        Order rbp_n_cmp = Trait::Compare(aNode.Get(), rbp_n_t.Get());
+        if (rbp_n_cmp == Order::eLess) {
+          ret = rbp_n_t;
+          rbp_n_t = rbp_n_t.Left();
+        } else if (rbp_n_cmp == Order::eGreater) {
+          rbp_n_t = rbp_n_t.Right();
+        } else {
+          break;
+        }
+        MOZ_ASSERT(rbp_n_t);
+      }
+    }
+    return ret;
+  }
+
+  TreeNode Prev(TreeNode aNode) {
+    TreeNode ret;
+    if (aNode.Left()) {
+      ret = Last(aNode.Left());
+    } else {
+      TreeNode rbp_p_t = mRoot;
+      MOZ_ASSERT(rbp_p_t);
+      ret = nullptr;
+      while (true) {
+        Order rbp_p_cmp = Trait::Compare(aNode.Get(), rbp_p_t.Get());
+        if (rbp_p_cmp == Order::eLess) {
+          rbp_p_t = rbp_p_t.Left();
+        } else if (rbp_p_cmp == Order::eGreater) {
+          ret = rbp_p_t;
+          rbp_p_t = rbp_p_t.Right();
+        } else {
+          break;
+        }
+        MOZ_ASSERT(rbp_p_t);
+      }
+    }
+    return ret;
+  }
+
+  TreeNode SearchImpl(typename Trait::SearchKey aKey) {
+    TreeNode ret = mRoot;
+    Order rbp_se_cmp;
+    while (ret &&
+           (rbp_se_cmp = Trait::Compare(aKey, ret.Get())) != Order::eEqual) {
+      if (rbp_se_cmp == Order::eLess) {
+        ret = ret.Left();
+      } else {
+        ret = ret.Right();
+      }
+    }
+    return ret;
+  }
+
+  TreeNode SearchOrNextImpl(typename Trait::SearchKey aKey) {
+    TreeNode ret = nullptr;
+    TreeNode rbp_ns_t = mRoot;
+    while (rbp_ns_t) {
+      Order rbp_ns_cmp = Trait::Compare(aKey, rbp_ns_t.Get());
+      if (rbp_ns_cmp == Order::eLess) {
+        ret = rbp_ns_t;
+        rbp_ns_t = rbp_ns_t.Left();
+      } else if (rbp_ns_cmp == Order::eGreater) {
+        rbp_ns_t = rbp_ns_t.Right();
+      } else {
+        ret = rbp_ns_t;
+        break;
+      }
+    }
+    return ret;
+  }
+
+  void Insert(TreeNode aNode) {
+    mozilla::AlignedStorage2<T> rbp_i_s;
+    TreeNode rbp_i_g, rbp_i_p, rbp_i_c, rbp_i_t, rbp_i_u;
+    Order rbp_i_cmp = Order::eEqual;
+    rbp_i_g = nullptr;
+    rbp_i_p = rbp_i_s.addr();
+    rbp_i_p.SetLeft(mRoot);
+    rbp_i_p.SetRight(nullptr);
+    rbp_i_p.SetColor(NodeColor::Black);
+    rbp_i_c = mRoot;
+    while (rbp_i_c) {
+      rbp_i_t = rbp_i_c.Left();
+      rbp_i_u = rbp_i_t.Left();
+      if (rbp_i_t.IsRed() && rbp_i_u.IsRed()) {
+        rbp_i_t = RotateRight(rbp_i_c);
+        rbp_i_u = rbp_i_t.Left();
+        rbp_i_u.SetColor(NodeColor::Black);
+        if (rbp_i_p.Left() == rbp_i_c) {
+          rbp_i_p.SetLeft(rbp_i_t);
+          rbp_i_c = rbp_i_t;
+        } else {
+          MOZ_ASSERT(rbp_i_p.Right() == rbp_i_c);
+          rbp_i_p.SetRight(rbp_i_t);
+          rbp_i_u = LeanLeft(rbp_i_p);
+          if (rbp_i_g.Left() == rbp_i_p) {
+            rbp_i_g.SetLeft(rbp_i_u);
+          } else {
+            MOZ_ASSERT(rbp_i_g.Right() == rbp_i_p);
+            rbp_i_g.SetRight(rbp_i_u);
+          }
+          rbp_i_p = rbp_i_u;
+          rbp_i_cmp = Trait::Compare(aNode.Get(), rbp_i_p.Get());
+          if (rbp_i_cmp == Order::eLess) {
+            rbp_i_c = rbp_i_p.Left();
+          } else {
+            MOZ_ASSERT(rbp_i_cmp == Order::eGreater);
+            rbp_i_c = rbp_i_p.Right();
+          }
+          continue;
+        }
+      }
+      rbp_i_g = rbp_i_p;
+      rbp_i_p = rbp_i_c;
+      rbp_i_cmp = Trait::Compare(aNode.Get(), rbp_i_c.Get());
+      if (rbp_i_cmp == Order::eLess) {
+        rbp_i_c = rbp_i_c.Left();
+      } else {
+        MOZ_ASSERT(rbp_i_cmp == Order::eGreater);
+        rbp_i_c = rbp_i_c.Right();
+      }
+    }
+    aNode.SetLeft(nullptr);
+    aNode.SetRight(nullptr);
+    aNode.SetColor(NodeColor::Red);
+    if (rbp_i_cmp == Order::eGreater) {
+      rbp_i_p.SetRight(aNode);
+      rbp_i_t = LeanLeft(rbp_i_p);
+      if (rbp_i_g.Left() == rbp_i_p) {
+        rbp_i_g.SetLeft(rbp_i_t);
+      } else if (rbp_i_g.Right() == rbp_i_p) {
+        rbp_i_g.SetRight(rbp_i_t);
+      }
+    } else {
+      rbp_i_p.SetLeft(aNode);
+    }
+    TreeNode root = TreeNode(rbp_i_s.addr()).Left();
+    root.SetColor(NodeColor::Black);
+    mRoot = root.Get();
+  }
+
+  void Remove(TreeNode aNode) {
+    mozilla::AlignedStorage2<T> rbp_r_s;
+    TreeNode rbp_r_p, rbp_r_c, rbp_r_xp, rbp_r_t, rbp_r_u;
+    Order rbp_r_cmp;
+    rbp_r_p = TreeNode(rbp_r_s.addr());
+    rbp_r_p.SetLeft(mRoot);
+    rbp_r_p.SetRight(nullptr);
+    rbp_r_p.SetColor(NodeColor::Black);
+    rbp_r_c = mRoot;
+    rbp_r_xp = nullptr;
+    rbp_r_cmp = Trait::Compare(aNode.Get(), rbp_r_c.Get());
+    if (rbp_r_cmp == Order::eLess) {
+      rbp_r_t = rbp_r_c.Left();
+      rbp_r_u = rbp_r_t.Left();
+      if (rbp_r_t.IsBlack() && rbp_r_u.IsBlack()) {
+        rbp_r_t = MoveRedLeft(rbp_r_c);
+        rbp_r_t.SetColor(NodeColor::Black);
+        rbp_r_p.SetLeft(rbp_r_t);
+        rbp_r_c = rbp_r_t;
+      } else {
+        rbp_r_p = rbp_r_c;
+        rbp_r_c = rbp_r_c.Left();
+      }
+    } else {
+      if (rbp_r_cmp == Order::eEqual) {
+        MOZ_ASSERT(aNode == rbp_r_c);
+        if (!rbp_r_c.Right()) {
+          if (rbp_r_c.Left()) {
+            rbp_r_t = LeanRight(rbp_r_c);
+            rbp_r_t.SetRight(nullptr);
+          } else {
+            rbp_r_t = nullptr;
+          }
+          rbp_r_p.SetLeft(rbp_r_t);
+        } else {
+          rbp_r_xp = rbp_r_p;
+          rbp_r_cmp = Order::eGreater;  
+        }
+      }
+      if (rbp_r_cmp == Order::eGreater) {
+        if (rbp_r_c.Right().Left().IsBlack()) {
+          rbp_r_t = rbp_r_c.Left();
+          if (rbp_r_t.IsRed()) {
+            rbp_r_t = MoveRedRight(rbp_r_c);
+          } else {
+            rbp_r_c.SetColor(NodeColor::Red);
+            rbp_r_u = rbp_r_t.Left();
+            if (rbp_r_u.IsRed()) {
+              rbp_r_u.SetColor(NodeColor::Black);
+              rbp_r_t = RotateRight(rbp_r_c);
+              rbp_r_u = RotateLeft(rbp_r_c);
+              rbp_r_t.SetRight(rbp_r_u);
+            } else {
+              rbp_r_t.SetColor(NodeColor::Red);
+              rbp_r_t = RotateLeft(rbp_r_c);
+            }
+          }
+          rbp_r_p.SetLeft(rbp_r_t);
+          rbp_r_c = rbp_r_t;
+        } else {
+          rbp_r_p = rbp_r_c;
+          rbp_r_c = rbp_r_c.Right();
+        }
+      }
+    }
+    if (rbp_r_cmp != Order::eEqual) {
+      while (true) {
+        MOZ_ASSERT(rbp_r_p);
+        rbp_r_cmp = Trait::Compare(aNode.Get(), rbp_r_c.Get());
+        if (rbp_r_cmp == Order::eLess) {
+          rbp_r_t = rbp_r_c.Left();
+          if (!rbp_r_t) {
+            if (rbp_r_xp.Left() == aNode) {
+              rbp_r_xp.SetLeft(rbp_r_c);
+            } else {
+              MOZ_ASSERT(rbp_r_xp.Right() == (aNode));
+              rbp_r_xp.SetRight(rbp_r_c);
+            }
+            rbp_r_c.SetLeft(aNode.Left());
+            rbp_r_c.SetRight(aNode.Right());
+            rbp_r_c.SetColor(aNode.Color());
+            if (rbp_r_p.Left() == rbp_r_c) {
+              rbp_r_p.SetLeft(nullptr);
+            } else {
+              MOZ_ASSERT(rbp_r_p.Right() == rbp_r_c);
+              rbp_r_p.SetRight(nullptr);
+            }
+            break;
+          }
+          rbp_r_u = rbp_r_t.Left();
+          if (rbp_r_t.IsBlack() && rbp_r_u.IsBlack()) {
+            rbp_r_t = MoveRedLeft(rbp_r_c);
+            if (rbp_r_p.Left() == rbp_r_c) {
+              rbp_r_p.SetLeft(rbp_r_t);
+            } else {
+              rbp_r_p.SetRight(rbp_r_t);
+            }
+            rbp_r_c = rbp_r_t;
+          } else {
+            rbp_r_p = rbp_r_c;
+            rbp_r_c = rbp_r_c.Left();
+          }
+        } else {
+          if (rbp_r_cmp == Order::eEqual) {
+            MOZ_ASSERT(aNode == rbp_r_c);
+            if (!rbp_r_c.Right()) {
+              if (rbp_r_c.Left()) {
+                rbp_r_t = LeanRight(rbp_r_c);
+                rbp_r_t.SetRight(nullptr);
+              } else {
+                rbp_r_t = nullptr;
+              }
+              if (rbp_r_p.Left() == rbp_r_c) {
+                rbp_r_p.SetLeft(rbp_r_t);
+              } else {
+                rbp_r_p.SetRight(rbp_r_t);
+              }
+              break;
+            }
+            rbp_r_xp = rbp_r_p;
+          }
+          rbp_r_t = rbp_r_c.Right();
+          rbp_r_u = rbp_r_t.Left();
+          if (rbp_r_u.IsBlack()) {
+            rbp_r_t = MoveRedRight(rbp_r_c);
+            if (rbp_r_p.Left() == rbp_r_c) {
+              rbp_r_p.SetLeft(rbp_r_t);
+            } else {
+              rbp_r_p.SetRight(rbp_r_t);
+            }
+            rbp_r_c = rbp_r_t;
+          } else {
+            rbp_r_p = rbp_r_c;
+            rbp_r_c = rbp_r_c.Right();
+          }
+        }
+      }
+    }
+    mRoot = TreeNode(rbp_r_s.addr()).Left().Get();
+    aNode.SetLeft(nullptr);
+    aNode.SetRight(nullptr);
+    aNode.SetColor(NodeColor::Black);
+  }
+
+  TreeNode RotateLeft(TreeNode aNode) {
+    TreeNode node = aNode.Right();
+    aNode.SetRight(node.Left());
+    node.SetLeft(aNode);
+    return node;
+  }
+
+  TreeNode RotateRight(TreeNode aNode) {
+    TreeNode node = aNode.Left();
+    aNode.SetLeft(node.Right());
+    node.SetRight(aNode);
+    return node;
+  }
+
+  TreeNode LeanLeft(TreeNode aNode) {
+    TreeNode node = RotateLeft(aNode);
+    NodeColor color = aNode.Color();
+    node.SetColor(color);
+    aNode.SetColor(NodeColor::Red);
+    return node;
+  }
+
+  TreeNode LeanRight(TreeNode aNode) {
+    TreeNode node = RotateRight(aNode);
+    NodeColor color = aNode.Color();
+    node.SetColor(color);
+    aNode.SetColor(NodeColor::Red);
+    return node;
+  }
+
+  TreeNode MoveRedLeft(TreeNode aNode) {
+    TreeNode node;
+    TreeNode rbp_mrl_t, rbp_mrl_u;
+    rbp_mrl_t = aNode.Left();
+    rbp_mrl_t.SetColor(NodeColor::Red);
+    rbp_mrl_t = aNode.Right();
+    rbp_mrl_u = rbp_mrl_t.Left();
+    if (rbp_mrl_u.IsRed()) {
+      rbp_mrl_u = RotateRight(rbp_mrl_t);
+      aNode.SetRight(rbp_mrl_u);
+      node = RotateLeft(aNode);
+      rbp_mrl_t = aNode.Right();
+      if (rbp_mrl_t.IsRed()) {
+        rbp_mrl_t.SetColor(NodeColor::Black);
+        aNode.SetColor(NodeColor::Red);
+        rbp_mrl_t = RotateLeft(aNode);
+        node.SetLeft(rbp_mrl_t);
+      } else {
+        aNode.SetColor(NodeColor::Black);
+      }
+    } else {
+      aNode.SetColor(NodeColor::Red);
+      node = RotateLeft(aNode);
+    }
+    return node;
+  }
+
+  TreeNode MoveRedRight(TreeNode aNode) {
+    TreeNode node;
+    TreeNode rbp_mrr_t;
+    rbp_mrr_t = aNode.Left();
+    if (rbp_mrr_t.IsRed()) {
+      TreeNode rbp_mrr_u, rbp_mrr_v;
+      rbp_mrr_u = rbp_mrr_t.Right();
+      rbp_mrr_v = rbp_mrr_u.Left();
+      if (rbp_mrr_v.IsRed()) {
+        rbp_mrr_u.SetColor(aNode.Color());
+        rbp_mrr_v.SetColor(NodeColor::Black);
+        rbp_mrr_u = RotateLeft(rbp_mrr_t);
+        aNode.SetLeft(rbp_mrr_u);
+        node = RotateRight(aNode);
+        rbp_mrr_t = RotateLeft(aNode);
+        node.SetRight(rbp_mrr_t);
+      } else {
+        rbp_mrr_t.SetColor(aNode.Color());
+        rbp_mrr_u.SetColor(NodeColor::Red);
+        node = RotateRight(aNode);
+        rbp_mrr_t = RotateLeft(aNode);
+        node.SetRight(rbp_mrr_t);
+      }
+      aNode.SetColor(NodeColor::Red);
+    } else {
+      rbp_mrr_t.SetColor(NodeColor::Red);
+      rbp_mrr_t = rbp_mrr_t.Left();
+      if (rbp_mrr_t.IsRed()) {
+        rbp_mrr_t.SetColor(NodeColor::Black);
+        node = RotateRight(aNode);
+        rbp_mrr_t = RotateLeft(aNode);
+        node.SetRight(rbp_mrr_t);
+      } else {
+        node = RotateLeft(aNode);
+      }
+    }
+    return node;
+  }
+
+
+ public:
+  class Iterator {
+    TreeNode mPath[3 * ((sizeof(void*) << 3) - (LOG2(sizeof(void*)) + 1))];
+
+    unsigned mDepth;
+
+   public:
+    explicit Iterator(RedBlackTree<T, Trait>* aTree) : mDepth(0) {
+      if (aTree->mRoot) {
+        TreeNode node;
+        mPath[mDepth++] = aTree->mRoot;
+        while ((node = mPath[mDepth - 1].Left())) {
+          mPath[mDepth++] = node;
+        }
+      }
+    }
+
+    template <typename Iterator>
+    class Item {
+      Iterator* mIterator;
+      T* mItem;
+
+     public:
+      Item(Iterator* aIterator, T* aItem)
+          : mIterator(aIterator), mItem(aItem) {}
+
+      bool operator!=(const Item& aOther) const {
+        return (mIterator != aOther.mIterator) || (mItem != aOther.mItem);
+      }
+
+      T* operator*() const { return mItem; }
+
+      const Item& operator++() {
+        mItem = mIterator->Next();
+        return *this;
+      }
+    };
+
+    Item<Iterator> begin() { return Item<Iterator>(this, Current()); }
+
+    Item<Iterator> end() { return Item<Iterator>(this, nullptr); }
+
+    T* Next() {
+      TreeNode node;
+      if ((node = mPath[mDepth - 1].Right())) {
+        mPath[mDepth++] = node;
+        while ((node = mPath[mDepth - 1].Left())) {
+          mPath[mDepth++] = node;
+        }
+      } else {
+        for (mDepth--; mDepth > 0; mDepth--) {
+          if (mPath[mDepth - 1].Left() == mPath[mDepth]) {
+            break;
+          }
+        }
+      }
+      return Current();
+    }
+
+    T* Current() { return mDepth > 0 ? mPath[mDepth - 1].Get() : nullptr; }
+
+    bool NotDone() { return !!mDepth; }
+  };
+
+  Iterator iter() { return Iterator(this); }
+};
+
+#endif  // RB_H_

@@ -1,0 +1,480 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+
+#if !defined(GOOGLE_PROTOBUF_GENERATED_MESSAGE_TCTABLE_DECL_H__)
+#define GOOGLE_PROTOBUF_GENERATED_MESSAGE_TCTABLE_DECL_H__
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+
+#include "absl/log/absl_check.h"
+#include "absl/types/span.h"
+#include "google/protobuf/arena.h"
+#include "google/protobuf/message_lite.h"
+#include "google/protobuf/parse_context.h"
+#include "google/protobuf/port.h"
+#include "google/protobuf/wire_format_lite.h"
+
+#include "google/protobuf/port_def.inc"
+
+namespace google {
+namespace protobuf {
+namespace internal {
+
+struct TcFieldData {
+  constexpr TcFieldData() : data(0) {}
+  explicit constexpr TcFieldData(uint64_t data) : data(data) {}
+
+  constexpr TcFieldData(uint16_t coded_tag, uint8_t hasbit_idx, uint8_t aux_idx,
+                        uint16_t offset)
+      : data(uint64_t{offset} << 48 |      
+             uint64_t{aux_idx} << 24 |     
+             uint64_t{hasbit_idx} << 16 |  
+             uint64_t{coded_tag}) {}
+
+  struct DefaultInit {};
+  TcFieldData(DefaultInit) {}  // NOLINT(google-explicit-constructor)
+
+
+  template <typename TagType = uint16_t>
+  TagType coded_tag() const {
+    return static_cast<TagType>(data);
+  }
+  uint8_t hasbit_idx() const { return static_cast<uint8_t>(data >> 16); }
+  uint8_t aux_idx() const { return static_cast<uint8_t>(data >> 24); }
+  uint16_t offset() const { return static_cast<uint16_t>(data >> 48); }
+
+  constexpr TcFieldData(uint16_t coded_tag, uint16_t nonfield_info)
+      : data(uint64_t{nonfield_info} << 16 |  
+             uint64_t{coded_tag}) {}
+
+
+  uint16_t decoded_tag() const { return static_cast<uint16_t>(data >> 16); }
+
+
+  uint32_t tag() const { return static_cast<uint32_t>(data); }
+  uint32_t entry_offset() const { return static_cast<uint32_t>(data >> 32); }
+
+  union {
+    uint64_t data;
+  };
+};
+
+struct TcParseTableBase;
+
+using TailCallParseFunc = PROTOBUF_CC const char* (*)(PROTOBUF_TC_PARAM_DECL);
+
+namespace field_layout {
+struct Offset {
+  uint32_t off;
+};
+}  
+
+#if defined(_MSC_VER) && !0
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
+
+struct FieldAuxMessageGlobals {};
+struct FieldAuxEnumData {};
+
+class MapTypeCard {
+ public:
+  MapTypeCard() = default;
+  constexpr MapTypeCard(int number, WireFormatLite::WireType wiretype,
+                        bool is_signed, bool is_zigzag, bool is_utf8)
+      : tag_(static_cast<uint8_t>(WireFormatLite::MakeTag(number, wiretype))),
+        is_signed_(is_signed),
+        is_zigzag_(is_zigzag),
+        is_utf8_(is_utf8) {}
+
+  uint8_t tag() const { return tag_; }
+
+  WireFormatLite::WireType wiretype() const {
+    return static_cast<WireFormatLite::WireType>(tag_ & 7);
+  }
+
+  bool is_signed() const { return is_signed_; }
+
+  bool is_zigzag() const {
+    ABSL_DCHECK(wiretype() == WireFormatLite::WIRETYPE_VARINT);
+    return is_zigzag_;
+  }
+  bool is_utf8() const {
+    ABSL_DCHECK(wiretype() == WireFormatLite::WIRETYPE_LENGTH_DELIMITED);
+    return is_utf8_;
+  }
+
+ private:
+  uint8_t tag_;
+  uint8_t is_signed_ : 1;
+  uint8_t is_zigzag_ : 1;
+  uint8_t is_utf8_ : 1;
+};
+
+constexpr MapTypeCard MakeMapTypeCard(int number,
+                                      WireFormatLite::FieldType type) {
+  switch (type) {
+    case WireFormatLite::TYPE_FLOAT:
+      return {number, WireFormatLite::WIRETYPE_FIXED32, true, false, false};
+    case WireFormatLite::TYPE_FIXED32:
+      return {number, WireFormatLite::WIRETYPE_FIXED32, false, false, false};
+    case WireFormatLite::TYPE_SFIXED32:
+      return {number, WireFormatLite::WIRETYPE_FIXED32, true, false, false};
+
+    case WireFormatLite::TYPE_DOUBLE:
+      return {number, WireFormatLite::WIRETYPE_FIXED64, true, false, false};
+    case WireFormatLite::TYPE_FIXED64:
+      return {number, WireFormatLite::WIRETYPE_FIXED64, false, false, false};
+    case WireFormatLite::TYPE_SFIXED64:
+      return {number, WireFormatLite::WIRETYPE_FIXED64, true, false, false};
+
+    case WireFormatLite::TYPE_BOOL:
+      return {number, WireFormatLite::WIRETYPE_VARINT, false, false, false};
+
+    case WireFormatLite::TYPE_ENUM:
+      return {number, WireFormatLite::WIRETYPE_VARINT, true, false, false};
+    case WireFormatLite::TYPE_INT32:
+      return {number, WireFormatLite::WIRETYPE_VARINT, true, false, false};
+    case WireFormatLite::TYPE_UINT32:
+      return {number, WireFormatLite::WIRETYPE_VARINT, false, false, false};
+
+    case WireFormatLite::TYPE_INT64:
+      return {number, WireFormatLite::WIRETYPE_VARINT, true, false, false};
+    case WireFormatLite::TYPE_UINT64:
+      return {number, WireFormatLite::WIRETYPE_VARINT, false, false, false};
+
+    case WireFormatLite::TYPE_SINT32:
+      return {number, WireFormatLite::WIRETYPE_VARINT, true, true, false};
+    case WireFormatLite::TYPE_SINT64:
+      return {number, WireFormatLite::WIRETYPE_VARINT, true, true, false};
+
+    case WireFormatLite::TYPE_STRING:
+      return {number, WireFormatLite::WIRETYPE_LENGTH_DELIMITED, false, false,
+              true};
+    case WireFormatLite::TYPE_BYTES:
+      return {number, WireFormatLite::WIRETYPE_LENGTH_DELIMITED, false, false,
+              false};
+
+    case WireFormatLite::TYPE_MESSAGE:
+      return {number, WireFormatLite::WIRETYPE_LENGTH_DELIMITED, false, false,
+              false};
+
+    case WireFormatLite::TYPE_GROUP:
+    default:
+      Unreachable();
+  }
+}
+
+struct MapAuxInfo {
+  MapTypeCard key_type_card;
+  MapTypeCard value_type_card;
+  uint8_t is_supported : 1;
+  uint8_t use_lite : 1;
+  uint8_t fail_on_utf8_failure : 1;
+  uint8_t value_is_validated_enum : 1;
+};
+static_assert(sizeof(MapAuxInfo) <= 8, "");
+
+struct alignas(uint64_t) TcParseTableBase {
+  uint16_t has_bits_offset;
+  uint16_t extension_offset;
+  uint32_t max_field_number;
+  uint8_t fast_idx_mask;
+  uint8_t has_post_loop_handler : 1;
+  uint16_t lookup_table_offset;
+  uint32_t skipmap32;
+  uint32_t field_entries_offset;
+  uint16_t num_field_entries;
+
+  uint16_t num_aux_entries;
+  uint32_t aux_offset;
+
+  const ClassData* class_data;
+  using PostLoopHandler = const char* (*)(MessageLite * msg, const char* ptr,
+                                          ParseContext* ctx);
+  PostLoopHandler post_loop_handler;
+
+  TailCallParseFunc fallback;
+
+#if defined(PROTOBUF_PREFETCH_PARSE_TABLE)
+  const TcParseTableBase* to_prefetch;
+#endif
+
+  constexpr TcParseTableBase(uint16_t has_bits_offset,
+                             uint16_t extension_offset,
+                             uint32_t max_field_number, uint8_t fast_idx_mask,
+                             uint16_t lookup_table_offset, uint32_t skipmap32,
+                             uint32_t field_entries_offset,
+                             uint16_t num_field_entries,
+                             uint16_t num_aux_entries, uint32_t aux_offset,
+                             const ClassData* class_data,
+                             PostLoopHandler post_loop_handler,
+                             TailCallParseFunc fallback
+#if defined(PROTOBUF_PREFETCH_PARSE_TABLE)
+                             ,
+                             const TcParseTableBase* to_prefetch
+#endif
+                             )
+      : has_bits_offset(has_bits_offset),
+        extension_offset(extension_offset),
+        max_field_number(max_field_number),
+        fast_idx_mask(fast_idx_mask),
+        has_post_loop_handler(post_loop_handler != nullptr),
+        lookup_table_offset(lookup_table_offset),
+        skipmap32(skipmap32),
+        field_entries_offset(field_entries_offset),
+        num_field_entries(num_field_entries),
+        num_aux_entries(num_aux_entries),
+        aux_offset(aux_offset),
+        class_data(class_data),
+        post_loop_handler(post_loop_handler),
+        fallback(fallback)
+#if defined(PROTOBUF_PREFETCH_PARSE_TABLE)
+        ,
+        to_prefetch(to_prefetch)
+#endif
+  {
+  }
+
+  struct FastFieldEntry {
+    TailCallParseFunc target_function;
+
+    TcFieldData bits;
+
+    FastFieldEntry() = default;
+
+    constexpr FastFieldEntry(TailCallParseFunc func, TcFieldData bits)
+        : target_function(func), bits(bits) {}
+
+    FastFieldEntry(const FastFieldEntry& rhs) noexcept = default;
+    FastFieldEntry& operator=(const FastFieldEntry& rhs) noexcept = default;
+
+    TailCallParseFunc target() const { return target_function; }
+  };
+  const FastFieldEntry* fast_entry(size_t idx) const {
+    return reinterpret_cast<const FastFieldEntry*>(this + 1) + idx;
+  }
+  FastFieldEntry* fast_entry(size_t idx) {
+    return reinterpret_cast<FastFieldEntry*>(this + 1) + idx;
+  }
+
+  static uint32_t RecodeTagForFastParsing(uint32_t tag) {
+    ABSL_DCHECK_LE(tag, 0x3FFFu);
+    uint32_t hibits = tag & 0xFFFFFF80;
+    if (hibits != 0) {
+      tag = tag + hibits + 0x80;
+    }
+    return tag;
+  }
+
+  static constexpr size_t kMaxFastFields = 32;
+  static uint32_t TagToIdx(uint32_t tag, uint32_t fast_table_size) {
+    ABSL_DCHECK_EQ((fast_table_size & (fast_table_size - 1)), uint32_t{0});
+
+    uint32_t idx_mask = fast_table_size - 1;
+    return (tag >> 3) & idx_mask;
+  }
+
+  const uint16_t* field_lookup_begin() const {
+    return reinterpret_cast<const uint16_t*>(reinterpret_cast<uintptr_t>(this) +
+                                             lookup_table_offset);
+  }
+  uint16_t* field_lookup_begin() {
+    return reinterpret_cast<uint16_t*>(reinterpret_cast<uintptr_t>(this) +
+                                       lookup_table_offset);
+  }
+
+  struct FieldEntry {
+    uint32_t offset;     
+    int32_t has_idx;     
+    uint16_t aux_idx;    
+    uint16_t type_card;  
+
+    static constexpr uint16_t kNoAuxIdx = 0xFFFF;
+  };
+
+  const FieldEntry* field_entries_begin() const {
+    return reinterpret_cast<const FieldEntry*>(
+        reinterpret_cast<uintptr_t>(this) + field_entries_offset);
+  }
+  absl::Span<const FieldEntry> field_entries() const {
+    return {field_entries_begin(), num_field_entries};
+  }
+  FieldEntry* field_entries_begin() {
+    return reinterpret_cast<FieldEntry*>(reinterpret_cast<uintptr_t>(this) +
+                                         field_entries_offset);
+  }
+
+  union FieldAux {
+    constexpr FieldAux() : message_globals_p(nullptr) {}
+    constexpr FieldAux(FieldAuxEnumData, const uint32_t* enum_data)
+        : enum_data(enum_data) {}
+    // NOLINTBEGIN(google-explicit-constructor)
+    constexpr FieldAux(field_layout::Offset off) : offset(off.off) {}
+    constexpr FieldAux(int32_t range_first, int32_t range_last)
+        : enum_range{range_first, range_last} {}
+    constexpr FieldAux(FieldAuxMessageGlobals, const void* globals)
+        : message_globals_p(globals) {}
+    constexpr FieldAux(const TcParseTableBase* table) : table(table) {}
+    constexpr FieldAux(MapAuxInfo map_info) : map_info(map_info) {}
+    constexpr FieldAux(LazyEagerVerifyFnType verify_func)
+        : verify_func(verify_func) {}
+    // NOLINTEND(google-explicit-constructor)
+    struct {
+      int32_t first;  
+      int32_t last;   
+    } enum_range;
+    uint32_t offset;
+    const void* message_globals_p;
+    const uint32_t* enum_data;
+    const TcParseTableBase* table;
+    MapAuxInfo map_info;
+    LazyEagerVerifyFnType verify_func;
+
+    const MessageLite* message_default() const {
+      return MessageGlobalsBase::ToDefaultInstance(message_globals_p);
+    }
+    const MessageLite* message_default_weak() const {
+      return MessageGlobalsBase::ToDefaultInstance(message_globals_weak());
+    }
+    const MessageGlobalsBase* message_globals() const {
+      return static_cast<const MessageGlobalsBase*>(message_globals_p);
+    }
+    const MessageGlobalsBase* message_globals_weak() const {
+      return *static_cast<const MessageGlobalsBase* const*>(message_globals_p);
+    }
+    const TcParseTableBase* table_ptr() const {
+#if !defined(PROTOBUF_MESSAGE_GLOBALS)
+      return table;
+#else
+      return MessageGlobalsBase::ToParseTableBase(message_globals_p);
+#endif
+    }
+  };
+  const FieldAux* field_aux(uint32_t idx) const {
+    return reinterpret_cast<const FieldAux*>(reinterpret_cast<uintptr_t>(this) +
+                                             aux_offset) +
+           idx;
+  }
+  FieldAux* field_aux(uint32_t idx) {
+    return reinterpret_cast<FieldAux*>(reinterpret_cast<uintptr_t>(this) +
+                                       aux_offset) +
+           idx;
+  }
+  const FieldAux* field_aux(const FieldEntry* entry) const {
+    return field_aux(entry->aux_idx);
+  }
+
+  const char* name_data() const {
+    return reinterpret_cast<const char*>(reinterpret_cast<uintptr_t>(this) +
+                                         aux_offset +
+                                         num_aux_entries * sizeof(FieldAux));
+  }
+  char* name_data() {
+    return reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(this) +
+                                   aux_offset +
+                                   num_aux_entries * sizeof(FieldAux));
+  }
+
+  const MessageLite* default_instance() const {
+    return class_data->default_instance();
+  }
+};
+
+#if defined(_MSC_VER) && !0
+#pragma warning(pop)
+#endif
+
+static_assert(sizeof(TcParseTableBase::FastFieldEntry) <= 16,
+              "Fast field entry is too big.");
+static_assert(sizeof(TcParseTableBase::FieldEntry) <= 16,
+              "Field entry is too big.");
+
+template <size_t kFastTableSizeLog2, size_t kNumFieldEntries = 0,
+          size_t kNumFieldAux = 0, size_t kNameTableSize = 0,
+          size_t kFieldLookupSize = 2>
+struct TcParseTable {
+  TcParseTableBase header;
+
+  std::array<TcParseTableBase::FastFieldEntry, (1 << kFastTableSizeLog2)>
+      fast_entries;
+
+  std::array<uint16_t, kFieldLookupSize> field_lookup_table;
+  std::array<TcParseTableBase::FieldEntry, kNumFieldEntries> field_entries;
+  std::array<TcParseTableBase::FieldAux, kNumFieldAux> aux_entries;
+  std::array<char, kNameTableSize == 0 ? 1 : kNameTableSize> field_names;
+};
+
+template <size_t kFastTableSizeLog2, size_t kNumFieldEntries,
+          size_t kNameTableSize, size_t kFieldLookupSize>
+struct TcParseTable<kFastTableSizeLog2, kNumFieldEntries, 0, kNameTableSize,
+                    kFieldLookupSize> {
+  TcParseTableBase header;
+  std::array<TcParseTableBase::FastFieldEntry, (1 << kFastTableSizeLog2)>
+      fast_entries;
+  std::array<uint16_t, kFieldLookupSize> field_lookup_table;
+  std::array<TcParseTableBase::FieldEntry, kNumFieldEntries> field_entries;
+  std::array<char, kNameTableSize == 0 ? 1 : kNameTableSize> field_names;
+};
+
+template <size_t kNameTableSize, size_t kFieldLookupSize>
+struct TcParseTable<0, 0, 0, kNameTableSize, kFieldLookupSize> {
+  TcParseTableBase header;
+  std::array<TcParseTableBase::FastFieldEntry, 1> fast_entries;
+  std::array<uint16_t, kFieldLookupSize> field_lookup_table;
+  std::array<char, kNameTableSize == 0 ? 1 : kNameTableSize> field_names;
+};
+
+static_assert(std::is_standard_layout<TcParseTable<1>>::value,
+              "TcParseTable must be standard layout.");
+
+static_assert(offsetof(TcParseTable<1>, fast_entries) ==
+                  sizeof(TcParseTableBase),
+              "Table entries must be laid out after TcParseTableBase.");
+
+template <typename T,
+          PROTOBUF_CC const char* (*func)(T*, const char*, ParseContext*)>
+PROTOBUF_CC const char* StubParseImpl(PROTOBUF_TC_PARAM_DECL) {
+  return func(static_cast<T*>(msg), ptr, ctx);
+}
+
+template <typename T,
+          PROTOBUF_CC const char* (*func)(T*, const char*, ParseContext*)>
+constexpr TcParseTable<0> CreateStubTcParseTable(
+    const ClassData* class_data,
+    TcParseTableBase::PostLoopHandler post_loop_handler = nullptr) {
+  return {
+      {
+          0,                  
+          0,                  
+          0,                  
+          0,                  
+          0,                  
+          0,                  
+          0,                  
+          0,                  
+          0,                  
+          0,                  
+          class_data,         
+          post_loop_handler,  
+          nullptr,            
+#if defined(PROTOBUF_PREFETCH_PARSE_TABLE)
+          nullptr,  
+#endif
+      },
+      {{{StubParseImpl<T, func>, {}}}},
+  };
+}
+
+}  
+}  
+}  
+
+#include "google/protobuf/port_undef.inc"
+
+#endif

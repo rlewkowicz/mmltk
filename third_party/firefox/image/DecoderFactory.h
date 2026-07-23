@@ -1,0 +1,79 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_DecoderFactory_h
+#define mozilla_image_DecoderFactory_h
+
+#include "DecoderFlags.h"
+#include "Orientation.h"
+#include "SurfaceFlags.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/NotNull.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/image/ImageUtils.h"
+#include "nsCOMPtr.h"
+
+namespace mozilla::image {
+
+class Decoder;
+class IDecodingTask;
+class nsICODecoder;
+class RasterImage;
+class SourceBuffer;
+class SourceBufferIterator;
+
+class DecoderFactory {
+ public:
+  static DecoderType GetDecoderType(const char* aMimeType);
+
+  static nsresult CreateDecoder(DecoderType aType, NotNull<RasterImage*> aImage,
+                                NotNull<SourceBuffer*> aSourceBuffer,
+                                const gfx::IntSize& aIntrinsicSize,
+                                const gfx::IntSize& aOutputSize,
+                                DecoderFlags aDecoderFlags,
+                                SurfaceFlags aSurfaceFlags,
+                                IDecodingTask** aOutTask);
+
+  static nsresult CreateAnimationDecoder(
+      DecoderType aType, NotNull<RasterImage*> aImage,
+      NotNull<SourceBuffer*> aSourceBuffer, const gfx::IntSize& aIntrinsicSize,
+      DecoderFlags aDecoderFlags, SurfaceFlags aSurfaceFlags,
+      size_t aCurrentFrame, IDecodingTask** aOutTask);
+
+  static already_AddRefed<Decoder> CloneAnimationDecoder(Decoder* aDecoder);
+
+  static already_AddRefed<Decoder> CloneAnonymousMetadataDecoder(
+      Decoder* aDecoder, const Maybe<DecoderFlags>& aDecoderFlags = Nothing());
+
+  static already_AddRefed<IDecodingTask> CreateMetadataDecoder(
+      DecoderType aType, NotNull<RasterImage*> aImage, DecoderFlags aFlags,
+      NotNull<SourceBuffer*> aSourceBuffer);
+
+  static already_AddRefed<Decoder> CreateDecoderForICOResource(
+      DecoderType aType, SourceBufferIterator&& aIterator,
+      NotNull<nsICODecoder*> aICODecoder, bool aIsMetadataDecode,
+      const Maybe<OrientedIntSize>& aExpectedSize,
+      const Maybe<uint32_t>& aDataOffset = Nothing());
+
+  static already_AddRefed<Decoder> CreateAnonymousDecoder(
+      DecoderType aType, NotNull<SourceBuffer*> aSourceBuffer,
+      const Maybe<gfx::IntSize>& aOutputSize, DecoderFlags aDecoderFlags,
+      SurfaceFlags aSurfaceFlags);
+
+  static already_AddRefed<Decoder> CreateAnonymousMetadataDecoder(
+      DecoderType aType, NotNull<SourceBuffer*> aSourceBuffer,
+      DecoderFlags aDecoderFlags);
+
+ private:
+  virtual ~DecoderFactory() = 0;
+
+  static already_AddRefed<Decoder> GetDecoder(DecoderType aType,
+                                              RasterImage* aImage,
+                                              bool aIsRedecode);
+};
+
+}  
+
+#endif  // mozilla_image_DecoderFactory_h

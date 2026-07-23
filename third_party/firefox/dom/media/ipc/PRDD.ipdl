@@ -1,0 +1,61 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+include GraphicsMessages;
+include MemoryReportTypes;
+include PrefsTypes;
+
+include protocol PRemoteMediaManager;
+include protocol PVideoBridge;
+
+
+using mozilla::dom::ContentParentId from "mozilla/dom/ipc/IdType.h";
+using mozilla::media::MediaCodecsSupported from "MediaCodecsSupport.h";
+
+
+namespace mozilla {
+
+// This protocol allows the UI process to talk to the RDD
+// (RemoteDataDecoder) process. There is one instance of this protocol,
+// with the RDDParent living on the main thread of the RDD process and
+// the RDDChild living on the main thread of the UI process.
+[NeedsOtherPid, ParentProc=RDD, ChildProc=Parent]
+protocol PRDD
+{
+parent:
+
+  async Init(GfxVarUpdate[] vars, FileDescriptor? sandboxBroker);
+
+
+  async NewContentRemoteMediaManager(
+            Endpoint<PRemoteMediaManagerParent> endpoint, ContentParentId childId);
+
+  async RequestMemoryReport(uint32_t generation,
+                            bool anonymize,
+                            bool minimizeMemoryUsage,
+                            FileDescriptor? DMDFile)
+      returns (uint32_t aGeneration);
+
+  async PreferenceUpdate(Pref pref);
+
+  async UpdateVar(GfxVarUpdate[] var);
+
+  async InitVideoBridge(Endpoint<PVideoBridgeChild> endpoint,
+                        bool createHardwareDevice,
+                        ContentDeviceData contentDeviceData);
+
+
+
+child:
+
+  async AddMemoryReport(MemoryReport aReport);
+
+
+  // Update the cached list of codec supported following a check in the
+  // RDD parent.
+  async UpdateMediaCodecsSupported(MediaCodecsSupported aSupported);
+
+};
+
+} // namespace mozilla

@@ -1,0 +1,480 @@
+/*
+ * Copyright © 2009  Red Hat, Inc.
+ * Copyright © 2018  Ebrahim Byagowi
+ *
+ *  This is part of HarfBuzz, a text shaping library.
+ *
+ * Permission is hereby granted, without written agreement and without
+ * license or royalty fees, to use, copy, modify, and distribute this
+ * software and its documentation for any purpose, provided that the
+ * above copyright notice and the following two paragraphs appear in
+ * all copies of this software.
+ *
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE TO ANY PARTY FOR
+ * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES
+ * ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN
+ * IF THE COPYRIGHT HOLDER HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ *
+ * THE COPYRIGHT HOLDER SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING,
+ * BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+ * FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ * ON AN "AS IS" BASIS, AND THE COPYRIGHT HOLDER HAS NO OBLIGATION TO
+ * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ *
+ * Red Hat Author(s): Behdad Esfahbod
+ */
+
+#include "hb.hh"
+#include "hb-blob.hh"
+
+#if defined(HAVE_SYS_MMAN_H)
+#if defined(HAVE_UNISTD_H)
+#include <unistd.h>
+#endif
+#include <sys/mman.h>
+#endif
+
+
+
+
+hb_blob_t *
+hb_blob_create (const char        *data,
+		unsigned int       length,
+		hb_memory_mode_t   mode,
+		void              *user_data,
+		hb_destroy_func_t  destroy)
+{
+  if (!length)
+  {
+    if (destroy)
+      destroy (user_data);
+    return hb_blob_get_empty ();
+  }
+
+  hb_blob_t *blob = hb_blob_create_or_fail (data, length, mode,
+					    user_data, destroy);
+  return likely (blob) ? blob : hb_blob_get_empty ();
+}
+
+hb_blob_t *
+hb_blob_create_or_fail (const char        *data,
+			unsigned int       length,
+			hb_memory_mode_t   mode,
+			void              *user_data,
+			hb_destroy_func_t  destroy)
+{
+  hb_blob_t *blob;
+
+  if (length >= 1u << 31 ||
+      !(blob = hb_object_create<hb_blob_t> ()))
+  {
+    if (destroy)
+      destroy (user_data);
+    return nullptr;
+  }
+
+  blob->data = data;
+  blob->length = length;
+  blob->mode = mode;
+
+  blob->user_data = user_data;
+  blob->destroy = destroy;
+
+  if (blob->mode == HB_MEMORY_MODE_DUPLICATE) {
+    blob->mode = HB_MEMORY_MODE_READONLY;
+    if (!blob->try_make_writable ())
+    {
+      hb_blob_destroy (blob);
+      return nullptr;
+    }
+  }
+
+  return blob;
+}
+
+static void
+_hb_blob_destroy (void *data)
+{
+  hb_blob_destroy ((hb_blob_t *) data);
+}
+
+hb_blob_t *
+hb_blob_create_sub_blob (hb_blob_t    *parent,
+			 unsigned int  offset,
+			 unsigned int  length)
+{
+  hb_blob_t *blob;
+
+  if (!length || !parent || offset >= parent->length)
+    return hb_blob_get_empty ();
+
+  hb_blob_make_immutable (parent);
+
+  blob = hb_blob_create (parent->data + offset,
+			 hb_min (length, parent->length - offset),
+			 HB_MEMORY_MODE_READONLY,
+			 hb_blob_reference (parent),
+			 _hb_blob_destroy);
+
+  return blob;
+}
+
+hb_blob_t *
+hb_blob_copy_writable_or_fail (hb_blob_t *blob)
+{
+  blob = hb_blob_create (blob->data,
+			 blob->length,
+			 HB_MEMORY_MODE_DUPLICATE,
+			 nullptr,
+			 nullptr);
+
+  if (unlikely (blob == hb_blob_get_empty ()))
+    blob = nullptr;
+
+  return blob;
+}
+
+hb_blob_t *
+hb_blob_get_empty ()
+{
+  return const_cast<hb_blob_t *> (&Null (hb_blob_t));
+}
+
+hb_blob_t *
+hb_blob_reference (hb_blob_t *blob)
+{
+  return hb_object_reference (blob);
+}
+
+void
+hb_blob_destroy (hb_blob_t *blob)
+{
+  if (!hb_object_destroy (blob)) return;
+
+  hb_free (blob);
+}
+
+hb_bool_t
+hb_blob_set_user_data (hb_blob_t          *blob,
+		       hb_user_data_key_t *key,
+		       void *              data,
+		       hb_destroy_func_t   destroy,
+		       hb_bool_t           replace)
+{
+  return hb_object_set_user_data (blob, key, data, destroy, replace);
+}
+
+void *
+hb_blob_get_user_data (const hb_blob_t    *blob,
+		       hb_user_data_key_t *key)
+{
+  return hb_object_get_user_data (blob, key);
+}
+
+
+void
+hb_blob_make_immutable (hb_blob_t *blob)
+{
+  if (hb_object_is_immutable (blob))
+    return;
+
+  hb_object_make_immutable (blob);
+}
+
+hb_bool_t
+hb_blob_is_immutable (hb_blob_t *blob)
+{
+  return hb_object_is_immutable (blob);
+}
+
+
+unsigned int
+hb_blob_get_length (hb_blob_t *blob)
+{
+  return blob->length;
+}
+
+const char *
+hb_blob_get_data (hb_blob_t *blob, unsigned int *length)
+{
+  if (length)
+    *length = blob->length;
+
+  return blob->data;
+}
+
+char *
+hb_blob_get_data_writable (hb_blob_t *blob, unsigned int *length)
+{
+  if (hb_object_is_immutable (blob) ||
+     !blob->try_make_writable ())
+  {
+    if (length) *length = 0;
+    return nullptr;
+  }
+
+  if (length) *length = blob->length;
+  return const_cast<char *> (blob->data);
+}
+
+
+bool
+hb_blob_t::try_make_writable_inplace_unix ()
+{
+#if defined(HAVE_SYS_MMAN_H) && defined(HAVE_MPROTECT)
+  uintptr_t pagesize = -1, mask, length;
+  const char *addr;
+
+#if defined(HAVE_SYSCONF) && defined(_SC_PAGE_SIZE)
+  pagesize = (uintptr_t) sysconf (_SC_PAGE_SIZE);
+#elif defined(HAVE_SYSCONF) && defined(_SC_PAGESIZE)
+  pagesize = (uintptr_t) sysconf (_SC_PAGESIZE);
+#elif defined(HAVE_GETPAGESIZE)
+  pagesize = (uintptr_t) getpagesize ();
+#endif
+
+  if ((uintptr_t) -1L == pagesize) {
+    DEBUG_MSG_FUNC (BLOB, this, "failed to get pagesize: %s", strerror (errno));
+    return false;
+  }
+  DEBUG_MSG_FUNC (BLOB, this, "pagesize is %lu", (unsigned long) pagesize);
+
+  mask = ~(pagesize-1);
+  addr = (const char *) (((uintptr_t) this->data) & mask);
+  length = (const char *) (((uintptr_t) this->data + this->length + pagesize-1) & mask)  - addr;
+  DEBUG_MSG_FUNC (BLOB, this,
+		  "calling mprotect on [%p..%p] (%lu bytes)",
+		  addr, addr+length, (unsigned long) length);
+  if (-1 == mprotect ((void *) addr, length, PROT_READ | PROT_WRITE)) {
+    DEBUG_MSG_FUNC (BLOB, this, "mprotect failed: %s", strerror (errno));
+    return false;
+  }
+
+  this->mode = HB_MEMORY_MODE_WRITABLE;
+
+  DEBUG_MSG_FUNC (BLOB, this,
+		  "successfully made [%p..%p] (%lu bytes) writable\n",
+		  addr, addr+length, (unsigned long) length);
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool
+hb_blob_t::try_make_writable_inplace ()
+{
+  DEBUG_MSG_FUNC (BLOB, this, "making writable inplace\n");
+
+  if (this->try_make_writable_inplace_unix ())
+    return true;
+
+  DEBUG_MSG_FUNC (BLOB, this, "making writable -> FAILED\n");
+
+  this->mode = HB_MEMORY_MODE_READONLY;
+  return false;
+}
+
+bool
+hb_blob_t::try_make_writable ()
+{
+  if (unlikely (!length))
+    mode = HB_MEMORY_MODE_WRITABLE;
+
+  if (this->mode == HB_MEMORY_MODE_WRITABLE)
+    return true;
+
+  if (this->mode == HB_MEMORY_MODE_READONLY_MAY_MAKE_WRITABLE && this->try_make_writable_inplace ())
+    return true;
+
+  if (this->mode == HB_MEMORY_MODE_WRITABLE)
+    return true;
+
+
+  DEBUG_MSG_FUNC (BLOB, this, "current data is -> %p\n", this->data);
+
+  char *new_data;
+
+  new_data = (char *) hb_malloc (this->length);
+  if (unlikely (!new_data))
+    return false;
+
+  DEBUG_MSG_FUNC (BLOB, this, "dupped successfully -> %p\n", this->data);
+
+  hb_memcpy (new_data, this->data, this->length);
+  this->destroy_user_data ();
+  this->mode = HB_MEMORY_MODE_WRITABLE;
+  this->data = new_data;
+  this->user_data = new_data;
+  this->destroy = hb_free;
+
+  return true;
+}
+
+
+#if !defined(HB_NO_OPEN)
+#if defined(HAVE_MMAP)
+# include <sys/types.h>
+# include <sys/stat.h>
+# include <fcntl.h>
+#endif
+
+#if !defined(O_BINARY)
+#  define O_BINARY 0
+#endif
+
+#if !defined(MAP_NORESERVE)
+# define MAP_NORESERVE 0
+#endif
+
+struct hb_mapped_file_t
+{
+  char *contents;
+  unsigned long length;
+};
+
+#if (defined(HAVE_MMAP) || 0) && !defined(HB_NO_MMAP)
+static void
+_hb_mapped_file_destroy (void *file_)
+{
+  hb_mapped_file_t *file = (hb_mapped_file_t *) file_;
+#if defined(HAVE_MMAP)
+  munmap (file->contents, file->length);
+#else
+  assert (0); 
+#endif
+
+  hb_free (file);
+}
+#endif
+
+#if defined(_PATH_RSRCFORKSPEC)
+static int
+_open_resource_fork (const char *file_name, hb_mapped_file_t *file)
+{
+  size_t name_len = strlen (file_name);
+  size_t len = name_len + sizeof (_PATH_RSRCFORKSPEC);
+
+  char *rsrc_name = (char *) hb_malloc (len);
+  if (unlikely (!rsrc_name)) return -1;
+
+  strncpy (rsrc_name, file_name, name_len);
+  strncpy (rsrc_name + name_len, _PATH_RSRCFORKSPEC,
+	   sizeof (_PATH_RSRCFORKSPEC));
+
+  int fd = open (rsrc_name, O_RDONLY | O_BINARY, 0);
+  hb_free (rsrc_name);
+
+  if (fd != -1)
+  {
+    struct stat st;
+    if (fstat (fd, &st) != -1)
+      file->length = (unsigned long) st.st_size;
+    else
+    {
+      close (fd);
+      fd = -1;
+    }
+  }
+
+  return fd;
+}
+#endif
+
+hb_blob_t *
+hb_blob_create_from_file (const char *file_name)
+{
+  hb_blob_t *blob = hb_blob_create_from_file_or_fail (file_name);
+  return likely (blob) ? blob : hb_blob_get_empty ();
+}
+
+#if defined(HAVE_MMAP) && !defined(HB_NO_MMAP)
+static hb_blob_t *
+_hb_blob_try_mmap (const char *file_name)
+{
+  hb_mapped_file_t *file = (hb_mapped_file_t *) hb_calloc (1, sizeof (hb_mapped_file_t));
+  if (unlikely (!file)) return nullptr;
+  auto file_guard = hb_make_scope_guard ([&]() { hb_free (file); });
+
+  int fd = open (file_name, O_RDONLY | O_BINARY, 0);
+  if (unlikely (fd == -1)) return nullptr;
+  auto fd_guard = hb_make_scope_guard ([&]() { close (fd); });
+
+  struct stat st;
+  if (unlikely (fstat (fd, &st) == -1)) return nullptr;
+
+  file->length = (unsigned long) st.st_size;
+
+#if defined(_PATH_RSRCFORKSPEC)
+  if (unlikely (file->length == 0))
+  {
+    int rfd = _open_resource_fork (file_name, file);
+    if (rfd != -1)
+    {
+      close (fd);
+      fd = rfd;
+    }
+  }
+#endif
+
+  file->contents = (char *) mmap (nullptr, file->length, PROT_READ,
+				  MAP_PRIVATE | MAP_NORESERVE, fd, 0);
+  if (unlikely (file->contents == MAP_FAILED)) return nullptr;
+
+  file_guard.release ();
+  return hb_blob_create_or_fail (file->contents, file->length,
+				 HB_MEMORY_MODE_READONLY_MAY_MAKE_WRITABLE, (void *) file,
+				 (hb_destroy_func_t) _hb_mapped_file_destroy);
+}
+#endif
+
+static hb_blob_t *
+_hb_blob_read_file (const char *file_name)
+{
+  unsigned long len = 0, allocated = BUFSIZ * 16;
+  char *data = (char *) hb_malloc (allocated);
+  if (unlikely (!data)) return nullptr;
+  auto data_guard = hb_make_scope_guard ([&]() { hb_free (data); });
+
+  FILE *fp = fopen (file_name, "rb");
+  if (unlikely (!fp)) return nullptr;
+  HB_SCOPE_GUARD (fclose (fp));
+
+  while (!feof (fp))
+  {
+    if (allocated - len < BUFSIZ)
+    {
+      allocated *= 2;
+      if (unlikely (allocated > (2 << 28))) return nullptr;
+      char *new_data = (char *) hb_realloc (data, allocated);
+      if (unlikely (!new_data)) return nullptr;
+      data = new_data;
+    }
+
+    unsigned long addition = fread (data + len, 1, allocated - len, fp);
+
+    int err = ferror (fp);
+#if defined(EINTR)
+    if (unlikely (err == EINTR)) continue;
+#endif
+    if (unlikely (err)) return nullptr;
+
+    len += addition;
+  }
+
+  data_guard.release ();
+  return hb_blob_create_or_fail (data, len, HB_MEMORY_MODE_WRITABLE, data,
+				 (hb_destroy_func_t) hb_free);
+}
+
+hb_blob_t *
+hb_blob_create_from_file_or_fail (const char *file_name)
+{
+#if (defined(HAVE_MMAP) || 0) && !defined(HB_NO_MMAP)
+  if (hb_blob_t *blob = _hb_blob_try_mmap (file_name))
+    return blob;
+#endif
+  return _hb_blob_read_file (file_name);
+}
+#endif

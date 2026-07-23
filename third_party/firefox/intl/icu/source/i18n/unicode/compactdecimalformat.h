@@ -1,0 +1,69 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+********************************************************************************
+*   Copyright (C) 2012-2016, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+********************************************************************************
+*
+* File COMPACTDECIMALFORMAT.H
+********************************************************************************
+*/
+
+#ifndef __COMPACT_DECIMAL_FORMAT_H__
+#define __COMPACT_DECIMAL_FORMAT_H__
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/decimfmt.h"
+
+struct UHashtable;
+
+U_NAMESPACE_BEGIN
+
+class PluralRules;
+
+class U_I18N_API CompactDecimalFormat : public DecimalFormat {
+public:
+
+     static CompactDecimalFormat* U_EXPORT2 createInstance(
+          const Locale& inLocale, UNumberCompactStyle style, UErrorCode& status);
+
+    CompactDecimalFormat(const CompactDecimalFormat& source);
+
+    ~CompactDecimalFormat() override;
+
+    CompactDecimalFormat& operator=(const CompactDecimalFormat& rhs);
+
+    CompactDecimalFormat* clone() const override;
+
+    using DecimalFormat::format;
+
+    void parse(const UnicodeString& text, Formattable& result,
+               ParsePosition& parsePosition) const override;
+
+    void parse(const UnicodeString& text, Formattable& result, UErrorCode& status) const override;
+
+#ifndef U_HIDE_INTERNAL_API
+    CurrencyAmount* parseCurrency(const UnicodeString& text, ParsePosition& pos) const override;
+#endif  /* U_HIDE_INTERNAL_API */
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    UClassID getDynamicClassID() const override;
+
+  private:
+    CompactDecimalFormat(const Locale& inLocale, UNumberCompactStyle style, UErrorCode& status);
+};
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // __COMPACT_DECIMAL_FORMAT_H__

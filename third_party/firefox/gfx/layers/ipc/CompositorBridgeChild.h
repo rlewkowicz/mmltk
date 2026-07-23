@@ -1,0 +1,202 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_CompositorBridgeChild_h
+#define mozilla_layers_CompositorBridgeChild_h
+
+#include "base/basictypes.h"  // for DISALLOW_EVIL_CONSTRUCTORS
+#include "mozilla/Monitor.h"
+#include "mozilla/ipc/ProtocolUtils.h"
+#include "mozilla/layers/PCompositorBridgeChild.h"
+#include "mozilla/layers/TextureForwarder.h"  // for TextureForwarder
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "mozilla/RefPtr.h"
+#include "nsClassHashtable.h"  // for nsClassHashtable
+#include "nsCOMPtr.h"          // for nsCOMPtr
+#include "nsHashKeys.h"        // for nsUint64HashKey
+#include "nsISupportsImpl.h"   // for NS_INLINE_DECL_REFCOUNTING
+#include "nsIWeakReferenceUtils.h"
+#include "nsStringFwd.h"
+
+#include <unordered_map>
+
+class nsIWidget;
+
+namespace mozilla {
+
+namespace dom {
+class BrowserChild;
+}  
+
+namespace widget {
+class CompositorWidget;
+}  
+
+namespace layers {
+
+using mozilla::dom::BrowserChild;
+
+class IAPZCTreeManager;
+class APZCTreeManagerChild;
+class CanvasChild;
+class CompositorBridgeParent;
+class CompositorManagerChild;
+class CompositorOptions;
+class WebRenderLayerManager;
+class TextureClient;
+struct FrameMetrics;
+struct FwdTransactionCounter;
+
+class CompositorBridgeChild final : public PCompositorBridgeChild,
+                                    public TextureForwarder {
+  typedef nsTArray<AsyncParentMessageData> AsyncParentMessageArray;
+
+  friend class PCompositorBridgeChild;
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(CompositorBridgeChild, override);
+
+  explicit CompositorBridgeChild(CompositorManagerChild* aManager);
+
+  void InitForContent(uint32_t aNamespace);
+
+  void InitForWidget(uint64_t aProcessToken, uint32_t aNamespace);
+
+  RefPtr<WebRenderLayerManager> CreateLayerManager(nsIWidget* aWidget,
+                                                   wr::PipelineId aPipelineId,
+                                                   nsCString& aError);
+
+  void Destroy();
+
+  static CompositorBridgeChild* Get();
+
+  static bool CompositorIsInGPUProcess();
+
+  mozilla::ipc::IPCResult RecvDidComposite(
+      const LayersId& aId, const nsTArray<TransactionId>& aTransactionIds,
+      const TimeStamp& aCompositeStart, const TimeStamp& aCompositeEnd);
+
+  mozilla::ipc::IPCResult RecvNotifyFrameStats(
+      nsTArray<FrameStats>&& aFrameStats);
+
+  mozilla::ipc::IPCResult RecvNotifyJankedAnimations(
+      const LayersId& aLayersId, nsTArray<uint64_t>&& aJankedAnimations);
+
+  mozilla::ipc::IPCResult RecvParentAsyncMessages(
+      nsTArray<AsyncParentMessageData>&& aMessages);
+  already_AddRefed<PTextureChild> CreateTexture(
+      const SurfaceDescriptor& aSharedData, ReadLockDescriptor&& aReadLock,
+      LayersBackend aLayersBackend, TextureFlags aFlags,
+      const dom::ContentParentId& aContentId, uint64_t aSerial,
+      wr::MaybeExternalImageId& aExternalImageId) override;
+
+  already_AddRefed<CanvasChild> GetCanvasChild() final;
+
+  void EndCanvasTransaction();
+
+  void ClearCachedResources();
+
+  bool SendWillClose();
+  bool SendPause();
+  bool SendResume();
+  bool SendResumeAsync();
+  bool SendAdoptChild(const LayersId& id);
+  bool SendFlushRendering(const wr::RenderReasons& aReasons);
+  bool SendFlushRenderingAsync(const wr::RenderReasons& aReasons);
+
+  void SetForceSyncFlushRendering(bool aForceSyncFlushRendering);
+
+  bool SendStartFrameTimeRecording(const int32_t& bufferSize,
+                                   uint32_t* startIndex);
+  bool SendStopFrameTimeRecording(const uint32_t& startIndex,
+                                  nsTArray<float>* intervals);
+  bool IsSameProcess() const override;
+
+  bool IPCOpen() const override { return mCanSend; }
+
+  bool IsPaused() const { return mPaused; }
+
+  static void ShutDown();
+
+  FwdTransactionCounter& GetFwdTransactionCounter();
+
+  void HoldUntilCompositableRefReleasedIfNecessary(TextureClient* aClient);
+
+  void NotifyNotUsed(uint64_t aTextureId, uint64_t aFwdTransactionId);
+
+  void CancelWaitForNotifyNotUsed(uint64_t aTextureId) override;
+
+  FixedSizeSmallShmemSectionAllocator* GetTileLockAllocator() override;
+
+  nsISerialEventTarget* GetThread() const override { return mThread; }
+
+  base::ProcessId GetParentPid() const override { return OtherPid(); }
+
+  bool AllocUnsafeShmem(size_t aSize, mozilla::ipc::Shmem* aShmem) override;
+  bool AllocShmem(size_t aSize, mozilla::ipc::Shmem* aShmem) override;
+  bool DeallocShmem(mozilla::ipc::Shmem& aShmem) override;
+
+  already_AddRefed<PAPZCTreeManagerChild> AllocPAPZCTreeManagerChild(
+      const LayersId& aLayersId);
+  already_AddRefed<PAPZChild> AllocPAPZChild(const LayersId& aLayersId);
+
+  wr::MaybeExternalImageId GetNextExternalImageId() override;
+
+  wr::PipelineId GetNextPipelineId();
+
+ private:
+  virtual ~CompositorBridgeChild();
+
+  void ResumeIPCAfterAsyncPaint();
+
+  void PrepareFinalDestroy();
+  void AfterDestroy();
+
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  mozilla::ipc::IPCResult RecvObserveLayersUpdate(const LayersId& aLayersId,
+                                                  const bool& aActive);
+
+  mozilla::ipc::IPCResult RecvCompositorOptionsChanged(
+      const LayersId& aLayersId, const CompositorOptions& aNewOptions);
+
+  uint64_t GetNextResourceId();
+
+  RefPtr<CompositorManagerChild> mCompositorManager;
+
+  RefPtr<WebRenderLayerManager> mLayerManager;
+
+  uint32_t mIdNamespace;
+  uint32_t mResourceId;
+
+  RefPtr<CompositorBridgeParent> mCompositorBridgeParent;
+
+  DISALLOW_EVIL_CONSTRUCTORS(CompositorBridgeChild);
+
+  bool mCanSend;
+
+  bool mActorDestroyed;
+
+  bool mPaused;
+
+  bool mForceSyncFlushRendering;
+
+  std::unordered_map<uint64_t, RefPtr<TextureClient>>
+      mTexturesWaitingNotifyNotUsed;
+
+  nsCOMPtr<nsISerialEventTarget> mThread;
+
+  uint64_t mProcessToken;
+
+  FixedSizeSmallShmemSectionAllocator* mSectionAllocator;
+
+  nsTArray<RefPtr<TextureClient>> mTextureClientsForAsyncPaint;
+
+  RefPtr<CanvasChild> mCanvasChild;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_CompositorBrigedChild_h

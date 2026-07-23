@@ -1,0 +1,292 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkBitmap_DEFINED)
+#define SkBitmap_DEFINED
+
+#include "include/core/SkAlphaType.h"
+#include "include/core/SkColor.h"
+#include "include/core/SkImageInfo.h"
+#include "include/core/SkPixmap.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkSamplingOptions.h"
+#include "include/core/SkSize.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkCPUTypes.h"
+#include "include/private/base/SkDebug.h"
+
+#include <cstddef>
+#include <cstdint>
+
+class SkColorSpace;
+class SkImage;
+class SkMatrix;
+class SkPaint;
+class SkPixelRef;
+class SkShader;
+enum SkColorType : int;
+enum class SkTileMode;
+
+class SK_API SkBitmap {
+public:
+    class SK_API Allocator;
+
+    SkBitmap();
+
+    SkBitmap(const SkBitmap& src);
+
+    SkBitmap(SkBitmap&& src);
+
+    ~SkBitmap();
+
+    SkBitmap& operator=(const SkBitmap& src);
+
+    SkBitmap& operator=(SkBitmap&& src);
+
+    void swap(SkBitmap& other);
+
+    const SkPixmap& pixmap() const { return fPixmap; }
+
+    const SkImageInfo& info() const { return fPixmap.info(); }
+
+    int width() const { return fPixmap.width(); }
+
+    int height() const { return fPixmap.height(); }
+
+    SkColorType colorType() const { return fPixmap.colorType(); }
+
+    SkAlphaType alphaType() const { return fPixmap.alphaType(); }
+
+    SkColorSpace* colorSpace() const;
+
+    sk_sp<SkColorSpace> refColorSpace() const;
+
+    int bytesPerPixel() const { return fPixmap.info().bytesPerPixel(); }
+
+    int rowBytesAsPixels() const { return fPixmap.rowBytesAsPixels(); }
+
+    int shiftPerPixel() const { return fPixmap.shiftPerPixel(); }
+
+    bool empty() const { return fPixmap.info().isEmpty(); }
+
+    bool isNull() const { return nullptr == fPixelRef; }
+
+    bool drawsNothing() const {
+        return this->empty() || this->isNull();
+    }
+
+    size_t rowBytes() const { return fPixmap.rowBytes(); }
+
+    bool setAlphaType(SkAlphaType alphaType);
+
+    void setColorSpace(sk_sp<SkColorSpace> colorSpace);
+
+    void* getPixels() const { return fPixmap.writable_addr(); }
+
+    size_t computeByteSize() const { return fPixmap.computeByteSize(); }
+
+    bool isImmutable() const;
+
+    void setImmutable();
+
+    bool isOpaque() const {
+        return SkAlphaTypeIsOpaque(this->alphaType());
+    }
+
+    void reset();
+
+    static bool ComputeIsOpaque(const SkBitmap& bm) {
+        return bm.pixmap().computeIsOpaque();
+    }
+
+    void getBounds(SkRect* bounds) const;
+
+    void getBounds(SkIRect* bounds) const;
+
+    SkIRect bounds() const { return fPixmap.info().bounds(); }
+
+    SkISize dimensions() const { return fPixmap.info().dimensions(); }
+
+    SkIRect getSubset() const {
+        SkIPoint origin = this->pixelRefOrigin();
+        return SkIRect::MakeXYWH(origin.x(), origin.y(), this->width(), this->height());
+    }
+
+    bool setInfo(const SkImageInfo& imageInfo, size_t rowBytes = 0);
+
+    enum AllocFlags {
+        kZeroPixels_AllocFlag = 1 << 0, 
+    };
+
+    [[nodiscard]] bool tryAllocPixelsFlags(const SkImageInfo& info, uint32_t flags);
+
+    void allocPixelsFlags(const SkImageInfo& info, uint32_t flags);
+
+    [[nodiscard]] bool tryAllocPixels(const SkImageInfo& info, size_t rowBytes);
+
+    void allocPixels(const SkImageInfo& info, size_t rowBytes);
+
+    [[nodiscard]] bool tryAllocPixels(const SkImageInfo& info) {
+        return this->tryAllocPixels(info, info.minRowBytes());
+    }
+
+    void allocPixels(const SkImageInfo& info);
+
+    [[nodiscard]] bool tryAllocN32Pixels(int width, int height, bool isOpaque = false);
+
+    void allocN32Pixels(int width, int height, bool isOpaque = false);
+
+    bool installPixels(const SkImageInfo& info, void* pixels, size_t rowBytes,
+                       void (*releaseProc)(void* addr, void* context), void* context);
+
+    bool installPixels(const SkImageInfo& info, void* pixels, size_t rowBytes) {
+        return this->installPixels(info, pixels, rowBytes, nullptr, nullptr);
+    }
+
+    bool installPixels(const SkPixmap& pixmap);
+
+    void setPixels(void* pixels);
+
+    [[nodiscard]] bool tryAllocPixels() {
+        return this->tryAllocPixels((Allocator*)nullptr);
+    }
+
+    void allocPixels();
+
+    [[nodiscard]] bool tryAllocPixels(Allocator* allocator);
+
+    void allocPixels(Allocator* allocator);
+
+    SkPixelRef* pixelRef() const { return fPixelRef.get(); }
+
+    SkIPoint pixelRefOrigin() const;
+
+    void setPixelRef(sk_sp<SkPixelRef> pixelRef, int dx, int dy);
+
+    bool readyToDraw() const {
+        return this->getPixels() != nullptr;
+    }
+
+    uint32_t getGenerationID() const;
+
+    void notifyPixelsChanged() const;
+
+    void eraseColor(SkColor4f) const;
+
+    void eraseColor(SkColor c) const;
+
+    void eraseARGB(U8CPU a, U8CPU r, U8CPU g, U8CPU b) const {
+        this->eraseColor(SkColorSetARGB(a, r, g, b));
+    }
+
+    void erase(SkColor4f c, const SkIRect& area) const;
+
+    void erase(SkColor c, const SkIRect& area) const;
+
+    void eraseArea(const SkIRect& area, SkColor c) const {
+        this->erase(c, area);
+    }
+
+    SkColor getColor(int x, int y) const {
+        return this->pixmap().getColor(x, y);
+    }
+
+    SkColor4f getColor4f(int x, int y) const { return this->pixmap().getColor4f(x, y); }
+
+    float getAlphaf(int x, int y) const {
+        return this->pixmap().getAlphaf(x, y);
+    }
+
+    void* getAddr(int x, int y) const;
+
+    inline uint32_t* getAddr32(int x, int y) const;
+
+    inline uint16_t* getAddr16(int x, int y) const;
+
+    inline uint8_t* getAddr8(int x, int y) const;
+
+    bool extractSubset(SkBitmap* dst, const SkIRect& subset) const;
+
+    bool readPixels(const SkImageInfo& dstInfo, void* dstPixels, size_t dstRowBytes,
+                    int srcX, int srcY) const;
+
+    bool readPixels(const SkPixmap& dst, int srcX, int srcY) const;
+
+    bool readPixels(const SkPixmap& dst) const {
+        return this->readPixels(dst, 0, 0);
+    }
+
+    bool writePixels(const SkPixmap& src, int dstX, int dstY);
+
+    bool writePixels(const SkPixmap& src) {
+        return this->writePixels(src, 0, 0);
+    }
+
+    bool extractAlpha(SkBitmap* dst) const {
+        return this->extractAlpha(dst, nullptr, nullptr, nullptr);
+    }
+
+    bool extractAlpha(SkBitmap* dst, const SkPaint* paint,
+                      SkIPoint* offset) const {
+        return this->extractAlpha(dst, paint, nullptr, offset);
+    }
+
+    bool extractAlpha(SkBitmap* dst, const SkPaint* paint, Allocator* allocator,
+                      SkIPoint* offset) const;
+
+    bool peekPixels(SkPixmap* pixmap) const;
+
+    sk_sp<SkShader> makeShader(SkTileMode tmx, SkTileMode tmy, const SkSamplingOptions&,
+                               const SkMatrix* localMatrix = nullptr) const;
+    sk_sp<SkShader> makeShader(SkTileMode tmx, SkTileMode tmy, const SkSamplingOptions& sampling,
+                               const SkMatrix& lm) const;
+    sk_sp<SkShader> makeShader(const SkSamplingOptions& sampling, const SkMatrix& lm) const;
+    sk_sp<SkShader> makeShader(const SkSamplingOptions& sampling,
+                               const SkMatrix* lm = nullptr) const;
+
+    sk_sp<SkImage> asImage() const;
+
+    SkDEBUGCODE(void validate() const;)
+
+    class Allocator : public SkRefCnt {
+    public:
+
+        virtual bool allocPixelRef(SkBitmap* bitmap) = 0;
+    private:
+        using INHERITED = SkRefCnt;
+    };
+
+    class SK_API HeapAllocator : public Allocator {
+    public:
+
+        bool allocPixelRef(SkBitmap* bitmap) override;
+    };
+
+private:
+    sk_sp<SkPixelRef> fPixelRef;
+    SkPixmap fPixmap;
+};
+
+
+inline uint32_t* SkBitmap::getAddr32(int x, int y) const {
+    SkASSERT(fPixmap.addr());
+    return fPixmap.writable_addr32(x, y);
+}
+
+inline uint16_t* SkBitmap::getAddr16(int x, int y) const {
+    SkASSERT(fPixmap.addr());
+    return fPixmap.writable_addr16(x, y);
+}
+
+inline uint8_t* SkBitmap::getAddr8(int x, int y) const {
+    SkASSERT(fPixmap.addr());
+    return fPixmap.writable_addr8(x, y);
+}
+
+#endif

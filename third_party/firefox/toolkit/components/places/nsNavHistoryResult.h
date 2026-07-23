@@ -1,0 +1,703 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsNavHistoryResult_h_
+#define nsNavHistoryResult_h_
+
+#include "INativePlacesEventCallback.h"
+#include "nsCOMArray.h"
+#include "nsTArray.h"
+#include "nsMaybeWeakPtr.h"
+#include "nsInterfaceHashtable.h"
+#include "nsINavHistoryService.h"
+#include "nsTHashMap.h"
+#include "nsCycleCollectionParticipant.h"
+#include "mozIStoragePendingStatement.h"
+#include "mozIStorageValueArray.h"
+#include "Helpers.h"
+
+class nsNavHistory;
+class nsNavHistoryQuery;
+class nsNavHistoryQueryOptions;
+
+class nsNavHistoryContainerResultNode;
+class nsNavHistoryFolderResultNode;
+class nsNavHistoryQueryResultNode;
+
+class nsTrimInt64HashKey : public PLDHashEntryHdr {
+ public:
+  using KeyType = const int64_t&;
+  using KeyTypePointer = const int64_t*;
+
+  explicit nsTrimInt64HashKey(KeyTypePointer aKey) : mValue(*aKey) {}
+  nsTrimInt64HashKey(const nsTrimInt64HashKey& toCopy)
+      : mValue(toCopy.mValue) {}
+  ~nsTrimInt64HashKey() = default;
+
+  KeyType GetKey() const { return mValue; }
+  bool KeyEquals(KeyTypePointer aKey) const { return *aKey == mValue; }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    return static_cast<uint32_t>((*aKey) & UINT32_MAX);
+  }
+  enum { ALLOW_MEMMOVE = true };
+
+ private:
+  const int64_t mValue;
+};
+
+
+#define NS_NAVHISTORYRESULT_IID \
+  {0x455d1d40, 0x1b9b, 0x40e6, {0xa6, 0x41, 0x8b, 0xb7, 0xe8, 0x82, 0x23, 0x87}}
+
+class nsNavHistoryResult final
+    : public nsSupportsWeakReference,
+      public nsINavHistoryResult,
+      public mozilla::places::INativePlacesEventCallback {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_NAVHISTORYRESULT_IID)
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_NSINAVHISTORYRESULT
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsNavHistoryResult,
+                                           nsINavHistoryResult)
+
+  void AddHistoryObserver(nsNavHistoryQueryResultNode* aNode);
+  void AddBookmarkFolderObserver(nsNavHistoryFolderResultNode* aNode,
+                                 const nsACString& aFolderGUID);
+  void AddAllBookmarksObserver(nsNavHistoryQueryResultNode* aNode);
+  void AddMobilePrefsObserver(nsNavHistoryQueryResultNode* aNode);
+  void RemoveHistoryObserver(nsNavHistoryQueryResultNode* aNode);
+  void RemoveBookmarkFolderObserver(nsNavHistoryFolderResultNode* aNode,
+                                    const nsACString& aFolderGUID);
+  void RemoveAllBookmarksObserver(nsNavHistoryQueryResultNode* aNode);
+  void RemoveMobilePrefsObserver(nsNavHistoryQueryResultNode* aNode);
+  void StopObserving();
+  void EnsureIsObservingBookmarks();
+
+  nsresult OnVisit(nsIURI* aURI, int64_t aVisitId, PRTime aTime,
+                   uint32_t aTransitionType, const nsACString& aGUID,
+                   bool aHidden, uint32_t aVisitCount,
+                   const nsAString& aLastKnownTitle, int64_t aFrecency);
+
+  void OnIconChanged(nsIURI* aURI, nsIURI* aFaviconURI,
+                     const nsACString& aGUID);
+
+  explicit nsNavHistoryResult(nsNavHistoryContainerResultNode* aRoot,
+                              const RefPtr<nsNavHistoryQuery>& aQuery,
+                              const RefPtr<nsNavHistoryQueryOptions>& aOptions);
+
+  RefPtr<nsNavHistoryContainerResultNode> mRootNode;
+
+  RefPtr<nsNavHistoryQuery> mQuery;
+  RefPtr<nsNavHistoryQueryOptions> mOptions;
+
+  uint16_t mSortingMode;
+  bool mNeedsToApplySortingMode;
+
+  bool mIsHistoryObserver;
+  bool mIsBookmarksObserver;
+  bool mIsMobilePrefObserver;
+
+  using QueryObserverList = nsTArray<RefPtr<nsNavHistoryQueryResultNode>>;
+  QueryObserverList mHistoryObservers;
+  QueryObserverList mAllBookmarksObservers;
+  QueryObserverList mMobilePrefObservers;
+
+  using FolderObserverList = nsTArray<RefPtr<nsNavHistoryFolderResultNode>>;
+  nsTHashMap<nsCStringHashKey, FolderObserverList*> mBookmarkFolderObservers;
+  FolderObserverList* BookmarkFolderObserversForGUID(
+      const nsACString& aFolderGUID, bool aCreate);
+
+  using ContainerObserverList =
+      nsTArray<RefPtr<nsNavHistoryContainerResultNode>>;
+
+  void RecursiveExpandCollapse(nsNavHistoryContainerResultNode* aContainer,
+                               bool aExpand);
+
+  void InvalidateTree();
+
+  nsMaybeWeakPtrArray<nsINavHistoryResultObserver> mObservers;
+  bool mSuppressNotifications;
+
+  bool mIsHistoryDetailsObserver;
+  bool mObserversWantHistoryDetails;
+  bool UpdateHistoryDetailsObservers();
+  bool CanSkipHistoryDetailsNotifications() const;
+
+  ContainerObserverList mRefreshParticipants;
+  void requestRefresh(nsNavHistoryContainerResultNode* aContainer);
+
+  void HandlePlacesEvent(const PlacesEventSequence& aEvents) override;
+
+  bool IsBulkPageRemovedEvent(const PlacesEventSequence& aEvents);
+
+  void OnMobilePrefChanged();
+
+  bool IsBatching() const { return mBatchInProgress > 0; };
+
+  static void OnMobilePrefChangedCallback(const char* prefName, void* self);
+
+ protected:
+  virtual ~nsNavHistoryResult();
+
+ private:
+  uint32_t mBatchInProgress;
+
+  void StopObservingOnUnlink();
+};
+
+
+#define NS_NAVHISTORYRESULTNODE_IID \
+  {0x54b61d38, 0x57c1, 0x11da, {0x95, 0xb8, 0x00, 0x13, 0x21, 0xc9, 0xf6, 0x9e}}
+
+#define NS_IMPLEMENT_SIMPLE_RESULTNODE                         \
+  NS_IMETHOD GetTitle(nsACString& aTitle) override {           \
+    aTitle = mTitle;                                           \
+    return NS_OK;                                              \
+  }                                                            \
+  NS_IMETHOD GetAccessCount(uint32_t* aAccessCount) override { \
+    *aAccessCount = mAccessCount;                              \
+    return NS_OK;                                              \
+  }                                                            \
+  NS_IMETHOD GetTime(PRTime* aTime) override {                 \
+    *aTime = mTime;                                            \
+    return NS_OK;                                              \
+  }                                                            \
+  NS_IMETHOD GetIndentLevel(int32_t* aIndentLevel) override {  \
+    *aIndentLevel = mIndentLevel;                              \
+    return NS_OK;                                              \
+  }                                                            \
+  NS_IMETHOD GetBookmarkIndex(int32_t* aIndex) override {      \
+    *aIndex = mBookmarkIndex;                                  \
+    return NS_OK;                                              \
+  }                                                            \
+  NS_IMETHOD GetDateAdded(PRTime* aDateAdded) override {       \
+    *aDateAdded = mDateAdded;                                  \
+    return NS_OK;                                              \
+  }                                                            \
+  NS_IMETHOD GetLastModified(PRTime* aLastModified) override { \
+    *aLastModified = mLastModified;                            \
+    return NS_OK;                                              \
+  }                                                            \
+  NS_IMETHOD GetItemId(int64_t* aId) override {                \
+    *aId = mItemId;                                            \
+    return NS_OK;                                              \
+  }
+
+#define NS_FORWARD_COMMON_RESULTNODE_TO_BASE                                  \
+  NS_IMPLEMENT_SIMPLE_RESULTNODE                                              \
+  NS_IMETHOD GetIcon(nsACString& aIcon) override {                            \
+    return nsNavHistoryResultNode::GetIcon(aIcon);                            \
+  }                                                                           \
+  NS_IMETHOD GetParent(nsINavHistoryContainerResultNode** aParent) override { \
+    return nsNavHistoryResultNode::GetParent(aParent);                        \
+  }                                                                           \
+  NS_IMETHOD GetParentResult(nsINavHistoryResult** aResult) override {        \
+    return nsNavHistoryResultNode::GetParentResult(aResult);                  \
+  }                                                                           \
+  NS_IMETHOD GetTags(nsAString& aTags) override {                             \
+    return nsNavHistoryResultNode::GetTags(aTags);                            \
+  }                                                                           \
+  NS_IMETHOD GetPageGuid(nsACString& aPageGuid) override {                    \
+    return nsNavHistoryResultNode::GetPageGuid(aPageGuid);                    \
+  }                                                                           \
+  NS_IMETHOD GetBookmarkGuid(nsACString& aBookmarkGuid) override {            \
+    return nsNavHistoryResultNode::GetBookmarkGuid(aBookmarkGuid);            \
+  }                                                                           \
+  NS_IMETHOD GetVisitId(int64_t* aVisitId) override {                         \
+    return nsNavHistoryResultNode::GetVisitId(aVisitId);                      \
+  }                                                                           \
+  NS_IMETHOD GetVisitType(uint32_t* aVisitType) override {                    \
+    return nsNavHistoryResultNode::GetVisitType(aVisitType);                  \
+  }
+
+class nsNavHistoryResultNode : public nsINavHistoryResultNode {
+ public:
+  nsNavHistoryResultNode(const nsACString& aURI, const nsACString& aTitle,
+                         uint32_t aAccessCount, PRTime aTime);
+
+  NS_INLINE_DECL_STATIC_IID(NS_NAVHISTORYRESULTNODE_IID)
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS(nsNavHistoryResultNode)
+
+  NS_IMPLEMENT_SIMPLE_RESULTNODE
+  NS_IMETHOD GetIcon(nsACString& aIcon) override;
+  NS_IMETHOD GetParent(nsINavHistoryContainerResultNode** aParent) override;
+  NS_IMETHOD GetParentResult(nsINavHistoryResult** aResult) override;
+  NS_IMETHOD GetType(uint32_t* type) override {
+    *type = nsNavHistoryResultNode::RESULT_TYPE_URI;
+    return NS_OK;
+  }
+  NS_IMETHOD GetUri(nsACString& aURI) override {
+    aURI = mURI;
+    return NS_OK;
+  }
+  NS_IMETHOD GetTags(nsAString& aTags) override;
+  NS_IMETHOD GetPageGuid(nsACString& aPageGuid) override;
+  NS_IMETHOD GetBookmarkGuid(nsACString& aBookmarkGuid) override;
+  NS_IMETHOD GetVisitId(int64_t* aVisitId) override;
+  NS_IMETHOD GetVisitType(uint32_t* aVisitType) override;
+
+  virtual void OnRemoving();
+
+  nsresult OnItemKeywordChanged(int64_t aItemId, const nsACString& aKeyword);
+  nsresult OnItemTagsChanged(int64_t aItemId, const nsAString& aURL,
+                             const nsAString& aTags);
+  nsresult OnItemTimeChanged(int64_t aItemId, const nsACString& aGUID,
+                             PRTime aDateAdded, PRTime aLastModified);
+  nsresult OnItemTitleChanged(int64_t aItemId, const nsACString& aGUID,
+                              const nsACString& aTitle, PRTime aLastModified);
+  nsresult OnItemUrlChanged(int64_t aItemId, const nsACString& aGUID,
+                            const nsACString& aURL, PRTime aLastModified);
+
+  virtual nsresult OnMobilePrefChanged(bool newValue) { return NS_OK; };
+
+  nsresult OnVisitsRemoved();
+
+ protected:
+  virtual ~nsNavHistoryResultNode() = default;
+
+ public:
+  nsNavHistoryResult* GetResult();
+  void SetTags(const nsAString& aTags);
+
+  bool IsContainer() {
+    uint32_t type;
+    GetType(&type);
+    return type == nsINavHistoryResultNode::RESULT_TYPE_QUERY ||
+           type == nsINavHistoryResultNode::RESULT_TYPE_FOLDER ||
+           type == nsINavHistoryResultNode::RESULT_TYPE_FOLDER_SHORTCUT;
+  }
+
+  bool IsURI() {
+    uint32_t type;
+    GetType(&type);
+    return type == nsINavHistoryResultNode::RESULT_TYPE_URI;
+  }
+
+  bool IsFolderOrShortcut() {
+    uint32_t type;
+    GetType(&type);
+    return type == nsINavHistoryResultNode::RESULT_TYPE_FOLDER ||
+           type == nsINavHistoryResultNode::RESULT_TYPE_FOLDER_SHORTCUT;
+  }
+
+  bool IsQuery() {
+    uint32_t type;
+    GetType(&type);
+    return type == nsINavHistoryResultNode::RESULT_TYPE_QUERY;
+  }
+
+  bool IsSeparator() {
+    uint32_t type;
+    GetType(&type);
+    return type == nsINavHistoryResultNode::RESULT_TYPE_SEPARATOR;
+  }
+
+  nsNavHistoryContainerResultNode* GetAsContainer() {
+    NS_ASSERTION(IsContainer(), "Not a container");
+    return reinterpret_cast<nsNavHistoryContainerResultNode*>(this);
+  }
+  nsNavHistoryFolderResultNode* GetAsFolder() {
+    NS_ASSERTION(IsFolderOrShortcut(), "Not a folder");
+    return reinterpret_cast<nsNavHistoryFolderResultNode*>(this);
+  }
+  nsNavHistoryQueryResultNode* GetAsQuery() {
+    NS_ASSERTION(IsQuery(), "Not a query");
+    return reinterpret_cast<nsNavHistoryQueryResultNode*>(this);
+  }
+
+  RefPtr<nsNavHistoryContainerResultNode> mParent;
+  nsCString mURI;  
+  nsCString mTitle;
+  nsString mTags;
+  uint32_t mAccessCount;
+  int64_t mTime;
+  int32_t mBookmarkIndex;
+  int64_t mItemId;
+  int64_t mVisitId;
+  PRTime mDateAdded;
+  PRTime mLastModified;
+
+  int32_t mIndentLevel;
+
+  int64_t mFrecency;
+
+  bool mHidden;
+
+  uint32_t mTransitionType;
+
+  nsCString mPageGuid;
+
+  nsCString mBookmarkGuid;
+};
+
+
+#define NS_FORWARD_CONTAINERNODE_EXCEPT_HASCHILDREN                           \
+  NS_IMETHOD GetState(uint16_t* _state) override {                            \
+    return nsNavHistoryContainerResultNode::GetState(_state);                 \
+  }                                                                           \
+  NS_IMETHOD GetContainerOpen(bool* aContainerOpen) override {                \
+    return nsNavHistoryContainerResultNode::GetContainerOpen(aContainerOpen); \
+  }                                                                           \
+  NS_IMETHOD SetContainerOpen(bool aContainerOpen) override {                 \
+    return nsNavHistoryContainerResultNode::SetContainerOpen(aContainerOpen); \
+  }                                                                           \
+  NS_IMETHOD GetChildCount(uint32_t* aChildCount) override {                  \
+    return nsNavHistoryContainerResultNode::GetChildCount(aChildCount);       \
+  }                                                                           \
+  NS_IMETHOD GetChild(uint32_t index, nsINavHistoryResultNode** _retval)      \
+      override {                                                              \
+    return nsNavHistoryContainerResultNode::GetChild(index, _retval);         \
+  }                                                                           \
+  NS_IMETHOD GetChildIndex(nsINavHistoryResultNode* aNode, uint32_t* _retval) \
+      override {                                                              \
+    return nsNavHistoryContainerResultNode::GetChildIndex(aNode, _retval);    \
+  }
+
+#define NS_NAVHISTORYCONTAINERRESULTNODE_IID \
+  {0x6e3bf8d3, 0x22aa, 0x4065, {0x86, 0xbc, 0x37, 0x46, 0xb5, 0xb3, 0x2c, 0xe8}}
+
+class nsNavHistoryContainerResultNode
+    : public nsNavHistoryResultNode,
+      public nsINavHistoryContainerResultNode {
+ public:
+  nsNavHistoryContainerResultNode(const nsACString& aURI,
+                                  const nsACString& aTitle, PRTime aTime,
+                                  uint32_t aContainerType,
+                                  nsNavHistoryQueryOptions* aOptions);
+
+  virtual nsresult Refresh();
+
+  NS_INLINE_DECL_STATIC_IID(NS_NAVHISTORYCONTAINERRESULTNODE_IID)
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(nsNavHistoryContainerResultNode,
+                                           nsNavHistoryResultNode)
+  NS_FORWARD_COMMON_RESULTNODE_TO_BASE
+  NS_IMETHOD GetType(uint32_t* type) override {
+    *type = mContainerType;
+    return NS_OK;
+  }
+  NS_IMETHOD GetUri(nsACString& aURI) override {
+    aURI = mURI;
+    return NS_OK;
+  }
+  NS_DECL_NSINAVHISTORYCONTAINERRESULTNODE
+
+ public:
+  virtual void OnRemoving() override;
+
+  nsresult OnVisitsRemoved(nsIURI* aURI);
+
+  bool AreChildrenVisible();
+
+  virtual nsresult OpenContainer();
+  nsresult CloseContainer(bool aSuppressNotifications = false);
+
+  virtual nsresult OpenContainerAsync();
+
+  RefPtr<nsNavHistoryResult> mResult;
+
+  uint32_t mContainerType;
+
+  bool mExpanded;
+
+  nsCOMArray<nsNavHistoryResultNode> mChildren;
+
+  RefPtr<nsNavHistoryQueryOptions> mOriginalOptions;
+  RefPtr<nsNavHistoryQueryOptions> mOptions;
+
+  void FillStats();
+  void SetAsParentOfNode(nsNavHistoryResultNode* aNode);
+
+  using SortComparator = nsCOMArray<nsNavHistoryResultNode>::TComparatorFunc;
+  virtual uint16_t GetSortType();
+
+  static SortComparator GetSortingComparator(uint16_t aSortType);
+  virtual void RecursiveSort(SortComparator aComparator);
+  int32_t FindInsertionPoint(nsNavHistoryResultNode* aNode,
+                             SortComparator aComparator, bool* aItemExists);
+  bool DoesChildNeedResorting(int32_t aIndex, SortComparator aComparator);
+
+  static int32_t SortComparison_StringLess(const nsAString& a,
+                                           const nsAString& b);
+
+  static int32_t SortComparison_Bookmark(nsNavHistoryResultNode* a,
+                                         nsNavHistoryResultNode* b);
+  static int32_t SortComparison_TitleLess(nsNavHistoryResultNode* a,
+                                          nsNavHistoryResultNode* b);
+  static int32_t SortComparison_TitleGreater(nsNavHistoryResultNode* a,
+                                             nsNavHistoryResultNode* b);
+  static int32_t SortComparison_DateLess(nsNavHistoryResultNode* a,
+                                         nsNavHistoryResultNode* b);
+  static int32_t SortComparison_DateGreater(nsNavHistoryResultNode* a,
+                                            nsNavHistoryResultNode* b);
+  static int32_t SortComparison_URILess(nsNavHistoryResultNode* a,
+                                        nsNavHistoryResultNode* b);
+  static int32_t SortComparison_URIGreater(nsNavHistoryResultNode* a,
+                                           nsNavHistoryResultNode* b);
+  static int32_t SortComparison_VisitCountLess(nsNavHistoryResultNode* a,
+                                               nsNavHistoryResultNode* b);
+  static int32_t SortComparison_VisitCountGreater(nsNavHistoryResultNode* a,
+                                                  nsNavHistoryResultNode* b);
+  static int32_t SortComparison_DateAddedLess(nsNavHistoryResultNode* a,
+                                              nsNavHistoryResultNode* b);
+  static int32_t SortComparison_DateAddedGreater(nsNavHistoryResultNode* a,
+                                                 nsNavHistoryResultNode* b);
+  static int32_t SortComparison_LastModifiedLess(nsNavHistoryResultNode* a,
+                                                 nsNavHistoryResultNode* b);
+  static int32_t SortComparison_LastModifiedGreater(nsNavHistoryResultNode* a,
+                                                    nsNavHistoryResultNode* b);
+  static int32_t SortComparison_TagsLess(nsNavHistoryResultNode* a,
+                                         nsNavHistoryResultNode* b);
+  static int32_t SortComparison_TagsGreater(nsNavHistoryResultNode* a,
+                                            nsNavHistoryResultNode* b);
+  static int32_t SortComparison_FrecencyLess(nsNavHistoryResultNode* a,
+                                             nsNavHistoryResultNode* b);
+  static int32_t SortComparison_FrecencyGreater(nsNavHistoryResultNode* a,
+                                                nsNavHistoryResultNode* b);
+
+  nsNavHistoryResultNode* FindChildByURI(const nsACString& aSpec,
+                                         uint32_t* aNodeIndex);
+  void FindChildrenByURI(const nsCString& aSpec,
+                         nsCOMArray<nsNavHistoryResultNode>* aMatches);
+  int32_t FindChild(nsNavHistoryResultNode* aNode) {
+    return mChildren.IndexOf(aNode);
+  }
+
+  nsNavHistoryResultNode* FindChildByGuid(const nsACString& guid,
+                                          int32_t* nodeIndex);
+
+  nsNavHistoryResultNode* FindChildById(int64_t aItemId, int32_t* aNodeIndex);
+
+  nsresult InsertChildAt(nsNavHistoryResultNode* aNode, int32_t aIndex);
+  nsresult InsertSortedChild(nsNavHistoryResultNode* aNode,
+                             bool aIgnoreDuplicates = false);
+  bool EnsureItemPosition(int32_t aIndex);
+
+  nsresult RemoveChildAt(int32_t aIndex);
+
+  void RecursiveFindURIs(bool aOnlyOne,
+                         nsNavHistoryContainerResultNode* aContainer,
+                         const nsCString& aSpec,
+                         nsCOMArray<nsNavHistoryResultNode>* aMatches);
+  bool UpdateURIs(bool aRecursive, bool aOnlyOne, bool aUpdateSort,
+                  const nsCString& aSpec,
+                  nsresult (*aCallback)(nsNavHistoryResultNode*, const void*,
+                                        const nsNavHistoryResult*),
+                  const void* aClosure);
+  nsresult ChangeTitles(nsIURI* aURI, const nsACString& aNewTitle,
+                        bool aRecursive, bool aOnlyOne);
+
+ protected:
+  virtual ~nsNavHistoryContainerResultNode();
+
+  enum AsyncCanceledState { NOT_CANCELED, CANCELED, CANCELED_RESTART_NEEDED };
+
+  void CancelAsyncOpen(bool aRestart);
+  nsresult NotifyOnStateChange(uint16_t aOldState);
+
+  nsCOMPtr<mozIStoragePendingStatement> mAsyncPendingStmt;
+  AsyncCanceledState mAsyncCanceledState;
+};
+
+
+class nsNavHistoryQueryResultNode final
+    : public nsNavHistoryContainerResultNode,
+      public nsINavHistoryQueryResultNode {
+ public:
+  nsNavHistoryQueryResultNode(const nsACString& aTitle, PRTime aTime,
+                              const nsACString& aQueryURI,
+                              const RefPtr<nsNavHistoryQuery>& aQuery,
+                              const RefPtr<nsNavHistoryQueryOptions>& aOptions);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_FORWARD_COMMON_RESULTNODE_TO_BASE
+  NS_IMETHOD GetType(uint32_t* type) override {
+    *type = nsNavHistoryResultNode::RESULT_TYPE_QUERY;
+    return NS_OK;
+  }
+  NS_IMETHOD GetUri(nsACString& aURI) override;  
+  NS_FORWARD_CONTAINERNODE_EXCEPT_HASCHILDREN
+  NS_IMETHOD GetHasChildren(bool* aHasChildren) override;
+  NS_DECL_NSINAVHISTORYQUERYRESULTNODE
+
+  virtual nsresult OnMobilePrefChanged(bool newValue) override;
+
+  bool CanExpand();
+  bool IsContainersQuery();
+
+  virtual nsresult OpenContainer() override;
+
+  nsresult OnItemAdded(int64_t aItemId, int64_t aParentId, int32_t aIndex,
+                       uint16_t aItemType, nsIURI* aURI, PRTime aDateAdded,
+                       const nsACString& aGUID, const nsACString& aParentGUID,
+                       uint16_t aSource);
+  nsresult OnItemRemoved(int64_t aItemId, int64_t aParentFolder, int32_t aIndex,
+                         uint16_t aItemType, nsIURI* aURI,
+                         const nsACString& aGUID, const nsACString& aParentGUID,
+                         uint16_t aSource);
+  nsresult OnItemMoved(int64_t aFolder, int32_t aOldIndex, int32_t aNewIndex,
+                       uint16_t aItemType, const nsACString& aGUID,
+                       const nsACString& aOldParentGUID,
+                       const nsACString& aNewParentGUID, uint16_t aSource,
+                       const nsACString& aURI);
+  nsresult OnItemTagsChanged(int64_t aItemId, const nsAString& aURL,
+                             const nsAString& aTags);
+  nsresult OnItemTimeChanged(int64_t aItemId, const nsACString& aGUID,
+                             PRTime aDateAdded, PRTime aLastModified);
+  nsresult OnItemTitleChanged(int64_t aItemId, const nsACString& aGUID,
+                              const nsACString& aTitle, PRTime aLastModified);
+  nsresult OnItemUrlChanged(int64_t aItemId, const nsACString& aGUID,
+                            const nsACString& aURL, PRTime aLastModified);
+
+  nsresult OnVisit(nsIURI* aURI, int64_t aVisitId, PRTime aTime,
+                   uint32_t aTransitionType, const nsACString& aGUID,
+                   bool aHidden, uint32_t aVisitCount,
+                   const nsAString& aLastKnownTitle, int64_t aFrecency,
+                   uint32_t* aAdded);
+  nsresult OnTitleChanged(nsIURI* aURI, const nsAString& aPageTitle,
+                          const nsACString& aGUID);
+  nsresult OnClearHistory();
+  nsresult OnPageRemovedFromStore(nsIURI* aURI, const nsACString& aGUID,
+                                  uint16_t aReason);
+  nsresult OnPageRemovedVisits(nsIURI* aURI, bool aPartialRemoval,
+                               const nsACString& aGUID, uint16_t aReason,
+                               uint32_t aTransitionType);
+
+  virtual void OnRemoving() override;
+
+  nsresult OnBeginUpdateBatch();
+  nsresult OnEndUpdateBatch();
+
+ public:
+  RefPtr<nsNavHistoryQuery> mQuery;
+  bool mHasSearchTerms;
+  uint32_t mLiveUpdate;  
+
+  nsNavHistoryQueryOptions* Options();
+
+  bool mContentsValid;
+
+  nsresult FillChildren();
+  void ClearChildren(bool unregister);
+  nsresult Refresh() override;
+
+  virtual uint16_t GetSortType() override;
+  virtual void RecursiveSort(SortComparator aComparator) override;
+
+  uint32_t mBatchChanges;
+
+  nsTArray<uint32_t> mTransitions;
+
+ protected:
+  virtual ~nsNavHistoryQueryResultNode();
+};
+
+
+class nsNavHistoryFolderResultNode final
+    : public nsNavHistoryContainerResultNode,
+      public nsINavHistoryQueryResultNode,
+      public mozilla::places::WeakAsyncStatementCallback {
+ public:
+  nsNavHistoryFolderResultNode(int64_t aItemId, const nsACString& aBookmarkGuid,
+                               int64_t aTargetFolderItemId,
+                               const nsACString& aTargetFolderGuid,
+                               const nsACString& aTitle,
+                               nsNavHistoryQueryOptions* aOptions);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_FORWARD_COMMON_RESULTNODE_TO_BASE
+  NS_IMETHOD GetType(uint32_t* type) override {
+    if (mTargetFolderItemId != mItemId) {
+      *type = nsNavHistoryResultNode::RESULT_TYPE_FOLDER_SHORTCUT;
+    } else {
+      *type = nsNavHistoryResultNode::RESULT_TYPE_FOLDER;
+    }
+    return NS_OK;
+  }
+  NS_IMETHOD GetUri(nsACString& aURI) override;
+  NS_FORWARD_CONTAINERNODE_EXCEPT_HASCHILDREN
+  NS_IMETHOD GetHasChildren(bool* aHasChildren) override;
+  NS_DECL_NSINAVHISTORYQUERYRESULTNODE
+
+  virtual nsresult OpenContainer() override;
+
+  virtual nsresult OpenContainerAsync() override;
+  NS_DECL_ASYNCSTATEMENTCALLBACK
+
+  nsresult OnItemAdded(int64_t aItemId, int64_t aParentFolder, int32_t aIndex,
+                       uint16_t aItemType, nsIURI* aURI, PRTime aDateAdded,
+                       const nsACString& aGUID, const nsACString& aParentGUID,
+                       uint16_t aSource, const nsACString& aTitle,
+                       const nsAString& aTags, int64_t aFrecency, bool aHidden,
+                       uint32_t aVisitCount, PRTime aLastVisitDate,
+                       int64_t aTargetFolderItemId,
+                       const nsACString& aTargetFolderGuid,
+                       const nsACString& aTargetFolderTitle);
+  nsresult OnItemRemoved(int64_t aItemId, int64_t aParentFolder, int32_t aIndex,
+                         uint16_t aItemType, nsIURI* aURI,
+                         const nsACString& aGUID, const nsACString& aParentGUID,
+                         uint16_t aSource);
+  nsresult OnItemMoved(int64_t aItemId, int32_t aOldIndex, int32_t aNewIndex,
+                       uint16_t aItemType, const nsACString& aGUID,
+                       const nsACString& aOldParentGUID,
+                       const nsACString& aNewParentGUID, uint16_t aSource,
+                       const nsACString& aURI, const nsACString& aTitle,
+                       const nsAString& aTags, int64_t aFrecency, bool aHidden,
+                       uint32_t aVisitCount, PRTime aLastVisitDate,
+                       PRTime aDateAdded);
+  nsresult OnItemVisited(nsIURI* aURI, int64_t aVisitId, PRTime aTime,
+                         int64_t aFrecency);
+
+  virtual void OnRemoving() override;
+
+  bool mContentsValid;
+
+  int64_t mTargetFolderItemId;
+  nsCString mTargetFolderGuid;
+
+  nsresult FillChildren();
+  void ClearChildren(bool aUnregister);
+  nsresult Refresh() override;
+
+  bool StartIncrementalUpdate();
+  void ReindexRange(int32_t aStartIndex, int32_t aEndIndex, int32_t aDelta);
+
+  nsresult OnBeginUpdateBatch();
+  nsresult OnEndUpdateBatch();
+
+ protected:
+  virtual ~nsNavHistoryFolderResultNode();
+
+ private:
+  nsresult OnChildrenFilled();
+  void EnsureRegisteredAsFolderObserver();
+  nsresult FillChildrenAsync();
+  nsresult FillChildrenInternal(
+      mozIStoragePendingStatement** aPendingStmt = nullptr);
+
+  nsresult AppendRowAsChild(mozIStorageValueArray* aRow,
+                            int32_t& aCurrentIndex);
+
+  bool mIsRegisteredFolderObserver;
+  int32_t mAsyncBookmarkIndex;
+};
+
+class nsNavHistorySeparatorResultNode : public nsNavHistoryResultNode {
+ public:
+  nsNavHistorySeparatorResultNode();
+
+  NS_IMETHOD GetType(uint32_t* type) override {
+    *type = nsNavHistoryResultNode::RESULT_TYPE_SEPARATOR;
+    return NS_OK;
+  }
+};
+
+#endif  // nsNavHistoryResult_h_

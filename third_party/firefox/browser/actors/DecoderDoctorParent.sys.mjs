@@ -1,0 +1,241 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
+
+const lazy = {};
+
+ChromeUtils.defineLazyGetter(lazy, "gNavigatorBundle", function () {
+  return Services.strings.createBundle(
+    "chrome://browser/locale/browser.properties"
+  );
+});
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  lazy,
+  "DEBUG_LOG",
+  "media.decoder-doctor.testing",
+  false
+);
+
+function LOG_DD(message) {
+  if (lazy.DEBUG_LOG) {
+    dump("[DecoderDoctorParent] " + message + "\n");
+  }
+}
+
+export class DecoderDoctorParent extends JSWindowActorParent {
+  getLabelForNotificationBox({ type, decoderDoctorReportId }) {
+    if (type == "platform-decoder-not-found") {
+      if (decoderDoctorReportId == "MediaWMFNeeded") {
+        return lazy.gNavigatorBundle.GetStringFromName(
+          "decoder.noHWAcceleration.message"
+        );
+      }
+      if (decoderDoctorReportId == "MediaPlatformDecoderNotFound") {
+        return lazy.gNavigatorBundle.GetStringFromName(
+          "decoder.noCodecsLinux.message"
+        );
+      }
+    }
+    if (type == "cannot-initialize-pulseaudio") {
+      return lazy.gNavigatorBundle.GetStringFromName(
+        "decoder.noPulseAudio.message"
+      );
+    }
+    if (type == "unsupported-libavcodec" && AppConstants.platform == "linux") {
+      return lazy.gNavigatorBundle.GetStringFromName(
+        "decoder.unsupportedLibavcodec.message"
+      );
+    }
+    if (type == "decode-error") {
+      return lazy.gNavigatorBundle.GetStringFromName(
+        "decoder.decodeError.message"
+      );
+    }
+    if (type == "decode-warning") {
+      return lazy.gNavigatorBundle.GetStringFromName(
+        "decoder.decodeWarning.message"
+      );
+    }
+    return "";
+  }
+
+  getSumoForLearnHowButton({ type, decoderDoctorReportId }) {
+    if (
+      type == "platform-decoder-not-found" &&
+      decoderDoctorReportId == "MediaWMFNeeded"
+    ) {
+      return "fix-video-audio-problems-firefox-windows";
+    }
+    if (type == "cannot-initialize-pulseaudio") {
+      return "fix-common-audio-and-video-issues";
+    }
+    return "";
+  }
+
+  getEndpointForReportIssueButton(type) {
+    if (type == "decode-error" || type == "decode-warning") {
+      return Services.prefs.getStringPref(
+        "media.decoder-doctor.new-issue-endpoint",
+        ""
+      );
+    }
+    return "";
+  }
+
+  receiveMessage(aMessage) {
+    let browser = this.browsingContext.top.embedderElement;
+    let window = browser?.documentGlobal;
+
+    if (!browser || !window) {
+      return;
+    }
+
+    let box = browser.getTabBrowser().getNotificationBox(browser);
+    let notificationId = "decoder-doctor-notification";
+    if (box.getNotificationWithValue(notificationId)) {
+      return;
+    }
+
+    let parsedData;
+    try {
+      parsedData = JSON.parse(aMessage.data);
+    } catch (ex) {
+      console.error(
+        "Malformed Decoder Doctor message with data: ",
+        aMessage.data
+      );
+      return;
+    }
+    // - 'resourceURL' is the resource with the issue.
+    let {
+      type,
+      isSolved,
+      decoderDoctorReportId,
+      formats,
+      decodeIssue,
+      docURL,
+      resourceURL,
+    } = parsedData;
+    type = type.toLowerCase();
+    if (!/^\w+$/im.test(decoderDoctorReportId)) {
+      return;
+    }
+    LOG_DD(
+      `type=${type}, isSolved=${isSolved}, ` +
+        `decoderDoctorReportId=${decoderDoctorReportId}, formats=${formats}, ` +
+        `decodeIssue=${decodeIssue}, docURL=${docURL}, ` +
+        `resourceURL=${resourceURL}`
+    );
+    let title = this.getLabelForNotificationBox({
+      type,
+      decoderDoctorReportId,
+    });
+    if (!title) {
+      return;
+    }
+
+    let formatsPref =
+      formats && "media.decoder-doctor." + decoderDoctorReportId + ".formats";
+    let buttonClickedPref =
+      "media.decoder-doctor." + decoderDoctorReportId + ".button-clicked";
+    let formatsInPref = formats && Services.prefs.getCharPref(formatsPref, "");
+
+    if (!isSolved) {
+      if (formats) {
+        if (!formatsInPref) {
+          Services.prefs.setCharPref(formatsPref, formats);
+        } else {
+          let existing = formatsInPref.split(",").map(x => x.trim());
+          let newbies = formats
+            .split(",")
+            .map(x => x.trim())
+            .filter(x => !existing.includes(x));
+          if (newbies.length) {
+            Services.prefs.setCharPref(
+              formatsPref,
+              existing.concat(newbies).join(", ")
+            );
+          }
+        }
+      } else if (!decodeIssue) {
+        console.error(
+          "Malformed Decoder Doctor unsolved message with no formats nor decode issue"
+        );
+        return;
+      }
+
+      let buttons = [];
+      let sumo = this.getSumoForLearnHowButton({ type, decoderDoctorReportId });
+      if (sumo) {
+        LOG_DD(`sumo=${sumo}`);
+        buttons.push({
+          label: lazy.gNavigatorBundle.GetStringFromName(
+            "decoder.noCodecs.button"
+          ),
+          supportPage: sumo,
+          callback() {
+            let clickedInPref = Services.prefs.getBoolPref(
+              buttonClickedPref,
+              false
+            );
+            if (!clickedInPref) {
+              Services.prefs.setBoolPref(buttonClickedPref, true);
+            }
+          },
+        });
+      }
+      let endpoint = this.getEndpointForReportIssueButton(type);
+      if (endpoint) {
+        LOG_DD(`endpoint=${endpoint}`);
+        buttons.push({
+          label: lazy.gNavigatorBundle.GetStringFromName(
+            "decoder.decodeError.button"
+          ),
+          accessKey: lazy.gNavigatorBundle.GetStringFromName(
+            "decoder.decodeError.accesskey"
+          ),
+          callback() {
+            let clickedInPref = Services.prefs.getBoolPref(
+              buttonClickedPref,
+              false
+            );
+            if (!clickedInPref) {
+              Services.prefs.setBoolPref(buttonClickedPref, true);
+            }
+
+            let params = new URLSearchParams();
+            params.append("url", docURL);
+            params.append("label", "type-media");
+            params.append("problem_type", "video_bug");
+            params.append("src", "media-decode-error");
+
+            let details = { "Technical Information:": decodeIssue };
+            if (resourceURL) {
+              details["Resource:"] = resourceURL;
+            }
+
+            params.append("details", JSON.stringify(details));
+            window.openTrustedLinkIn(endpoint + "?" + params.toString(), "tab");
+          },
+        });
+      }
+
+      box.appendNotification(
+        notificationId,
+        {
+          label: title,
+          image: "", 
+          priority: box.PRIORITY_INFO_LOW,
+        },
+        buttons
+      );
+    } else if (formatsInPref) {
+      Services.prefs.clearUserPref(formatsPref);
+      Services.prefs.clearUserPref(buttonClickedPref);
+    }
+  }
+}

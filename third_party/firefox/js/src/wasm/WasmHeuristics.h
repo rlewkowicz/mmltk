@@ -1,0 +1,146 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef wasm_WasmHeuristics_h
+#define wasm_WasmHeuristics_h
+
+#include <math.h>
+
+#include "js/Prefs.h"
+#include "threading/ExclusiveData.h"
+#include "vm/MutexIDs.h"
+#include "wasm/WasmConstants.h"
+
+namespace js {
+namespace wasm {
+
+
+
+class LazyTieringHeuristics {
+  static constexpr uint32_t MIN_LEVEL = 1;
+  static constexpr uint32_t MAX_LEVEL = 9;
+  static constexpr uint32_t SMALL_MODULE_THRESH = 150000;
+
+  static constexpr float scale_[7] = {27.0,  9.0,   3.0,
+                                      1.0,  
+                                      0.333, 0.111, 0.037};
+
+ public:
+  static uint32_t rawLevel() {
+    uint32_t level = JS::Prefs::wasm_lazy_tiering_level();
+    return std::clamp(level, MIN_LEVEL, MAX_LEVEL);
+  }
+
+
+  static int32_t estimateIonCompilationCost(uint32_t bodyLength,
+                                            size_t codeSectionSize) {
+    uint32_t level = rawLevel();
+
+    MOZ_ASSERT(codeSectionSize > 0);
+    if (codeSectionSize <= SMALL_MODULE_THRESH && level < MAX_LEVEL) {
+      level += 1;
+    }
+
+    if (MOZ_LIKELY(MIN_LEVEL < level && level < MAX_LEVEL)) {
+      float thresholdF = 30000.0 + 4000.0 * float(bodyLength);
+
+      thresholdF *= 0.25;
+
+      thresholdF *= scale_[level - (MIN_LEVEL + 1)];
+
+      constexpr float thresholdHigh = 2.0e9f;  
+      int32_t thresholdI = int32_t(std::clamp(thresholdF, 10.f, thresholdHigh));
+      MOZ_RELEASE_ASSERT(thresholdI >= 0);
+      return thresholdI;
+    }
+    if (level == MIN_LEVEL) {
+      return INT32_MAX;
+    }
+    if (level == MAX_LEVEL) {
+      return 0;
+    }
+    MOZ_CRASH();
+  }
+};
+
+
+
+
+
+static constexpr int64_t PerModuleMaxInliningRatio = 1;
+
+static constexpr int64_t PerFunctionMaxInliningRatio = 99;
+
+class InliningHeuristics {
+  static constexpr uint32_t MIN_LEVEL = 1;
+  static constexpr uint32_t MAX_LEVEL = 9;
+
+  static constexpr uint32_t LARGE_FUNCTION_THRESH_1 = 400000;
+  static constexpr uint32_t LARGE_FUNCTION_THRESH_2 = 800000;
+  static constexpr uint32_t LARGE_FUNCTION_THRESH_3 = 1200000;
+
+ public:
+  static uint32_t rawLevel() {
+    uint32_t level = JS::Prefs::wasm_inlining_level();
+    return std::clamp(level, MIN_LEVEL, MAX_LEVEL);
+  }
+  static bool rawDirectAllowed() { return JS::Prefs::wasm_direct_inlining(); }
+  static bool rawCallRefAllowed() {
+    return JS::Prefs::wasm_call_ref_inlining();
+  }
+  static uint32_t rawCallRefPercent() {
+    uint32_t percent = JS::Prefs::wasm_call_ref_inlining_percent();
+    return std::clamp(percent, 10u, 100u);
+  }
+
+  static int64_t moduleInliningBudget(size_t codeSectionSize) {
+    int64_t budget = int64_t(codeSectionSize) * PerModuleMaxInliningRatio;
+
+    return std::max<int64_t>(budget, 1000);
+  }
+
+  enum class CallKind { Direct, CallRef };
+  static bool isSmallEnoughToInline(CallKind callKind, uint32_t inliningDepth,
+                                    uint32_t bodyLength,
+                                    uint32_t rootFunctionBodyLength,
+                                    bool* largeFunctionBackoff) {
+    *largeFunctionBackoff = false;
+
+    MOZ_RELEASE_ASSERT(inliningDepth <= 10);  
+    MOZ_ASSERT(rootFunctionBodyLength > 0 &&
+               rootFunctionBodyLength <= wasm::MaxFunctionBytes);
+
+    if ((callKind == CallKind::Direct && !rawDirectAllowed()) ||
+        (callKind == CallKind::CallRef && !rawCallRefAllowed())) {
+      return false;
+    }
+    static constexpr int32_t baseSize[9] = {0,   40,  80,  120,
+                                            160,  
+                                            200, 240, 280, 320};
+    uint32_t level = rawLevel();
+
+    if (rootFunctionBodyLength > LARGE_FUNCTION_THRESH_1 && level > MIN_LEVEL) {
+      level--;
+      *largeFunctionBackoff = true;
+    }
+    if (rootFunctionBodyLength > LARGE_FUNCTION_THRESH_2 && level > MIN_LEVEL) {
+      level--;
+      *largeFunctionBackoff = true;
+    }
+    if (rootFunctionBodyLength > LARGE_FUNCTION_THRESH_3 && level > MIN_LEVEL) {
+      level--;
+      *largeFunctionBackoff = true;
+    }
+
+    MOZ_RELEASE_ASSERT(level >= MIN_LEVEL && level <= MAX_LEVEL);
+    int32_t allowedSize = baseSize[level - MIN_LEVEL];
+    allowedSize -= int32_t(40 * inliningDepth);
+    return allowedSize > 0 && bodyLength <= uint32_t(allowedSize);
+  }
+};
+
+}  
+}  
+
+#endif /* wasm_WasmHeuristics_h */

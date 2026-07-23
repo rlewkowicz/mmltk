@@ -1,0 +1,30 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_RemoteType_h
+#define mozilla_dom_RemoteType_h
+
+#include "nsReadableUtils.h"
+#include "nsString.h"
+
+#define PREALLOC_REMOTE_TYPE "prealloc"_ns
+#define WEB_REMOTE_TYPE "web"_ns
+#define FILE_REMOTE_TYPE "file"_ns
+#define EXTENSION_REMOTE_TYPE "extension"_ns
+#define PRIVILEGEDABOUT_REMOTE_TYPE "privilegedabout"_ns
+#define PRIVILEGEDMOZILLA_REMOTE_TYPE "privilegedmozilla"_ns
+#define INFERENCE_REMOTE_TYPE "inference"_ns
+
+#define DEFAULT_REMOTE_TYPE WEB_REMOTE_TYPE
+
+#define FISSION_WEB_REMOTE_TYPE "webIsolated"_ns
+#define WITH_COOP_COEP_REMOTE_TYPE "webCOOP+COEP"_ns
+#define WITH_COOP_COEP_REMOTE_TYPE_PREFIX "webCOOP+COEP="_ns
+#define SERVICEWORKER_REMOTE_TYPE "webServiceWorker"_ns
+
+#define DISABLE_JIT_REMOTE_TYPE_SUFFIX "disableJit=1"_ns
+
+#define NOT_REMOTE_TYPE VoidCString()
+
+#endif  // mozilla_dom_RemoteType_h

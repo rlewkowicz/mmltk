@@ -1,0 +1,161 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+
+#ifndef __EDITS_H__
+#define __EDITS_H__
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/uobject.h"
+
+
+U_NAMESPACE_BEGIN
+
+class UnicodeString;
+
+class U_COMMON_API Edits final : public UMemory {
+public:
+    Edits() :
+            array(stackArray), capacity(STACK_CAPACITY), length(0), delta(0), numChanges(0),
+            errorCode_(U_ZERO_ERROR) {}
+    Edits(const Edits &other) :
+            array(stackArray), capacity(STACK_CAPACITY), length(other.length),
+            delta(other.delta), numChanges(other.numChanges),
+            errorCode_(other.errorCode_) {
+        copyArray(other);
+    }
+    Edits(Edits &&src) noexcept :
+            array(stackArray), capacity(STACK_CAPACITY), length(src.length),
+            delta(src.delta), numChanges(src.numChanges),
+            errorCode_(src.errorCode_) {
+        moveArray(src);
+    }
+
+    ~Edits();
+
+    Edits &operator=(const Edits &other);
+
+    Edits &operator=(Edits &&src) noexcept;
+
+    void reset() noexcept;
+
+    void addUnchanged(int32_t unchangedLength);
+    void addReplace(int32_t oldLength, int32_t newLength);
+    UBool copyErrorTo(UErrorCode &outErrorCode) const;
+
+    int32_t lengthDelta() const { return delta; }
+    UBool hasChanges() const { return numChanges != 0; }
+
+    int32_t numberOfChanges() const { return numChanges; }
+
+    struct U_COMMON_API Iterator final : public UMemory {
+        Iterator() :
+                array(nullptr), index(0), length(0),
+                remaining(0), onlyChanges_(false), coarse(false),
+                dir(0), changed(false), oldLength_(0), newLength_(0),
+                srcIndex(0), replIndex(0), destIndex(0) {}
+        Iterator(const Iterator &other) = default;
+        Iterator &operator=(const Iterator &other) = default;
+
+        UBool next(UErrorCode &errorCode) { return next(onlyChanges_, errorCode); }
+
+        UBool findSourceIndex(int32_t i, UErrorCode &errorCode) {
+            return findIndex(i, true, errorCode) == 0;
+        }
+
+        UBool findDestinationIndex(int32_t i, UErrorCode &errorCode) {
+            return findIndex(i, false, errorCode) == 0;
+        }
+
+        int32_t destinationIndexFromSourceIndex(int32_t i, UErrorCode &errorCode);
+
+        int32_t sourceIndexFromDestinationIndex(int32_t i, UErrorCode &errorCode);
+
+        UBool hasChange() const { return changed; }
+
+        int32_t oldLength() const { return oldLength_; }
+
+        int32_t newLength() const { return newLength_; }
+
+        int32_t sourceIndex() const { return srcIndex; }
+
+        int32_t replacementIndex() const {
+            return replIndex;
+        }
+
+        int32_t destinationIndex() const { return destIndex; }
+
+#ifndef U_HIDE_INTERNAL_API
+        UnicodeString& toString(UnicodeString& appendTo) const;
+#endif  // U_HIDE_INTERNAL_API
+
+    private:
+        friend class Edits;
+
+        Iterator(const uint16_t *a, int32_t len, UBool oc, UBool crs);
+
+        int32_t readLength(int32_t head);
+        void updateNextIndexes();
+        void updatePreviousIndexes();
+        UBool noNext();
+        UBool next(UBool onlyChanges, UErrorCode &errorCode);
+        UBool previous(UErrorCode &errorCode);
+        int32_t findIndex(int32_t i, UBool findSource, UErrorCode &errorCode);
+
+        const uint16_t *array;
+        int32_t index, length;
+        int32_t remaining;
+        UBool onlyChanges_, coarse;
+
+        int8_t dir;  
+        UBool changed;
+        int32_t oldLength_, newLength_;
+        int32_t srcIndex, replIndex, destIndex;
+    };
+
+    Iterator getCoarseChangesIterator() const {
+        return Iterator(array, length, true, true);
+    }
+
+    Iterator getCoarseIterator() const {
+        return Iterator(array, length, false, true);
+    }
+
+    Iterator getFineChangesIterator() const {
+        return Iterator(array, length, true, false);
+    }
+
+    Iterator getFineIterator() const {
+        return Iterator(array, length, false, false);
+    }
+
+    Edits &mergeAndAppend(const Edits &ab, const Edits &bc, UErrorCode &errorCode);
+
+private:
+    void releaseArray() noexcept;
+    Edits &copyArray(const Edits &other);
+    Edits &moveArray(Edits &src) noexcept;
+
+    void setLastUnit(int32_t last) { array[length - 1] = static_cast<uint16_t>(last); }
+    int32_t lastUnit() const { return length > 0 ? array[length - 1] : 0xffff; }
+
+    void append(int32_t r);
+    UBool growArray();
+
+    static const int32_t STACK_CAPACITY = 100;
+    uint16_t *array;
+    int32_t capacity;
+    int32_t length;
+    int32_t delta;
+    int32_t numChanges;
+    UErrorCode errorCode_;
+    uint16_t stackArray[STACK_CAPACITY];
+};
+
+U_NAMESPACE_END
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif  // __EDITS_H__

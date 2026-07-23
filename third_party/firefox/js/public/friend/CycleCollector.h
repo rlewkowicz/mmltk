@@ -1,0 +1,79 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_friend_CycleCollector_h
+#define js_friend_CycleCollector_h
+
+#include "jstypes.h"
+
+#include "js/HeapAPI.h"  // JS::GCCellPtr
+#include "js/TraceKind.h"
+
+using JSGrayRootsTracer = bool (*)(JSTracer* trc, JS::SliceBudget& budget,
+                                   void* data);
+
+extern JS_PUBLIC_API void JS_SetGrayGCRootsTracer(JSContext* cx,
+                                                  JSGrayRootsTracer traceOp,
+                                                  void* data);
+
+using JSObjectsTenuredCallback = void (*)(JS::GCContext* gcx, void* data);
+
+extern JS_PUBLIC_API void JS_SetObjectsTenuredCallback(
+    JSContext* cx, JSObjectsTenuredCallback cb, void* data);
+
+extern JS_PUBLIC_API void JS_TraceShapeCycleCollectorChildren(JSTracer* trc,
+                                                              js::Shape* shape);
+
+namespace JS {
+
+using DoCycleCollectionCallback = void (*)(JSContext* cx);
+
+extern JS_PUBLIC_API DoCycleCollectionCallback
+SetDoCycleCollectionCallback(JSContext* cx, DoCycleCollectionCallback callback);
+
+inline JS_PUBLIC_API bool NeedGrayRootsForZone(Zone* zoneArg) {
+  shadow::Zone* zone = shadow::Zone::from(zoneArg);
+  return zone->isGCMarkingBlackAndGray() || zone->isGCCompacting();
+}
+
+using ShouldClearWeakRefTargetCallback = bool (*)(GCCellPtr ptr, void* data);
+
+extern JS_PUBLIC_API void MaybeClearWeakRefTargets(
+    JSRuntime* runtime, ShouldClearWeakRefTargetCallback callback, void* data);
+
+}  
+
+namespace js {
+
+struct WeakMapTracer {
+  JSRuntime* runtime;
+
+  explicit WeakMapTracer(JSRuntime* rt) : runtime(rt) {}
+
+  virtual void trace(JSObject* m, JS::GCCellPtr key, JS::GCCellPtr value) = 0;
+};
+
+extern JS_PUBLIC_API void TraceWeakMaps(WeakMapTracer* trc);
+
+extern JS_PUBLIC_API bool AreGCGrayBitsValid(JSRuntime* rt);
+
+extern JS_PUBLIC_API bool ZoneGlobalsAreAllGray(JS::Zone* zone);
+
+extern JS_PUBLIC_API void TraceGrayWrapperTargets(JSTracer* trc,
+                                                  JS::Zone* zone);
+
+using IterateGCThingCallback = void (*)(void*, JS::GCCellPtr,
+                                        const JS::AutoRequireNoGC&);
+
+extern JS_PUBLIC_API void IterateGrayObjects(
+    JS::Zone* zone, IterateGCThingCallback cellCallback, void* data);
+
+#if defined(JS_GC_ZEAL) || defined(DEBUG)
+extern JS_PUBLIC_API bool CheckGrayMarkingState(JSRuntime* rt);
+#endif
+
+}  
+
+#endif  // js_friend_CycleCollector_h

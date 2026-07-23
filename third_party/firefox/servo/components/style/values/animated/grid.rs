@@ -1,0 +1,127 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+//! Animation implementation for various grid-related types.
+
+
+use super::{Animate, Procedure, ToAnimatedZero};
+use crate::values::computed::Integer;
+use crate::values::computed::LengthPercentage;
+use crate::values::computed::{GridTemplateComponent, TrackList, TrackSize};
+use crate::values::distance::{ComputeSquaredDistance, SquaredDistance};
+use crate::values::generics::grid as generics;
+
+fn discrete<T: Clone>(from: &T, to: &T, procedure: Procedure) -> Result<T, ()> {
+    if let Procedure::Interpolate { progress } = procedure {
+        Ok(if progress < 0.5 {
+            from.clone()
+        } else {
+            to.clone()
+        })
+    } else {
+        Ok(to.clone())
+    }
+}
+
+fn animate_with_discrete_fallback<T: Animate + Clone>(
+    from: &T,
+    to: &T,
+    procedure: Procedure,
+) -> Result<T, ()> {
+    from.animate(to, procedure)
+        .or_else(|_| discrete(from, to, procedure))
+}
+
+impl Animate for TrackSize {
+    fn animate(&self, other: &Self, procedure: Procedure) -> Result<Self, ()> {
+        match (self, other) {
+            (&generics::TrackSize::Breadth(ref from), &generics::TrackSize::Breadth(ref to)) => {
+                animate_with_discrete_fallback(from, to, procedure)
+                    .map(generics::TrackSize::Breadth)
+            },
+            (
+                &generics::TrackSize::Minmax(ref from_min, ref from_max),
+                &generics::TrackSize::Minmax(ref to_min, ref to_max),
+            ) => Ok(generics::TrackSize::Minmax(
+                animate_with_discrete_fallback(from_min, to_min, procedure)?,
+                animate_with_discrete_fallback(from_max, to_max, procedure)?,
+            )),
+            (
+                &generics::TrackSize::FitContent(ref from),
+                &generics::TrackSize::FitContent(ref to),
+            ) => animate_with_discrete_fallback(from, to, procedure)
+                .map(generics::TrackSize::FitContent),
+            (_, _) => discrete(self, other, procedure),
+        }
+    }
+}
+
+impl Animate for generics::TrackRepeat<LengthPercentage, Integer> {
+    fn animate(&self, other: &Self, procedure: Procedure) -> Result<Self, ()> {
+        match (&self.count, &other.count) {
+            (&generics::RepeatCount::Number(from), &generics::RepeatCount::Number(to))
+                if from == to =>
+            {
+                ()
+            },
+            (_, _) => return Err(()),
+        }
+
+        let count = self.count;
+        let track_sizes = super::lists::by_computed_value::animate(
+            &self.track_sizes,
+            &other.track_sizes,
+            procedure,
+        )?;
+
+        let line_names = discrete(&self.line_names, &other.line_names, procedure)?;
+
+        Ok(generics::TrackRepeat {
+            count,
+            line_names,
+            track_sizes,
+        })
+    }
+}
+
+impl Animate for TrackList {
+    fn animate(&self, other: &Self, procedure: Procedure) -> Result<Self, ()> {
+        if self.values.len() != other.values.len() {
+            return Err(());
+        }
+
+        if self.is_explicit() != other.is_explicit() {
+            return Err(());
+        }
+
+        if self.has_auto_repeat() || other.has_auto_repeat() {
+            return Err(());
+        }
+
+        let values =
+            super::lists::by_computed_value::animate(&self.values, &other.values, procedure)?;
+
+        let line_names = discrete(&self.line_names, &other.line_names, procedure)?;
+
+        Ok(TrackList {
+            values,
+            line_names,
+            auto_repeat_index: self.auto_repeat_index,
+        })
+    }
+}
+
+impl ComputeSquaredDistance for GridTemplateComponent {
+    #[inline]
+    fn compute_squared_distance(&self, _other: &Self) -> Result<SquaredDistance, ()> {
+        Err(())
+    }
+}
+
+impl ToAnimatedZero for GridTemplateComponent {
+    #[inline]
+    fn to_animated_zero(&self) -> Result<Self, ()> {
+        Err(())
+    }
+}

@@ -1,0 +1,219 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_DecoderTemplate_h
+#define mozilla_dom_DecoderTemplate_h
+
+#include <queue>
+
+#include "SimpleMap.h"
+#include "WebCodecsUtils.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/DecoderAgent.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Result.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/WorkerRef.h"
+#include "mozilla/media/MediaUtils.h"
+#include "nsStringFwd.h"
+
+namespace mozilla {
+
+class TrackInfo;
+
+namespace dom {
+
+class WebCodecsErrorCallback;
+class Promise;
+enum class CodecState : uint8_t;
+
+template <typename DecoderType>
+class DecoderTemplate : public DOMEventTargetHelper {
+  using Self = DecoderTemplate<DecoderType>;
+  using ConfigType = typename DecoderType::ConfigType;
+  using ConfigTypeInternal = typename DecoderType::ConfigTypeInternal;
+  using InputType = typename DecoderType::InputType;
+  using InputTypeInternal = typename DecoderType::InputTypeInternal;
+  using OutputType = typename DecoderType::OutputType;
+  using OutputCallbackType = typename DecoderType::OutputCallbackType;
+
+ protected:
+  class ConfigureMessage;
+  class DecodeMessage;
+  class FlushMessage;
+
+  class ControlMessage {
+   public:
+    ControlMessage(WebCodecsId aConfigId) : mConfigId(aConfigId) {};
+    virtual ~ControlMessage() = default;
+    virtual void Cancel() = 0;
+    virtual bool IsProcessing() = 0;
+
+    virtual nsCString ToString() const = 0;
+    virtual ConfigureMessage* AsConfigureMessage() { return nullptr; }
+    virtual DecodeMessage* AsDecodeMessage() { return nullptr; }
+    virtual FlushMessage* AsFlushMessage() { return nullptr; }
+
+    const WebCodecsId mConfigId;
+  };
+
+  class ConfigureMessage final
+      : public ControlMessage,
+        public MessageRequestHolder<DecoderAgent::ConfigurePromise> {
+   public:
+    static ConfigureMessage* Create(
+        already_AddRefed<ConfigTypeInternal> aConfig);
+
+    ~ConfigureMessage() = default;
+    virtual void Cancel() override { Disconnect(); }
+    virtual bool IsProcessing() override { return Exists(); };
+    virtual nsCString ToString() const override;
+    virtual ConfigureMessage* AsConfigureMessage() override { return this; }
+    const ConfigTypeInternal& Config() { return *mConfig; }
+    already_AddRefed<ConfigTypeInternal> TakeConfig() {
+      return mConfig.forget();
+    }
+
+   private:
+    ConfigureMessage(WebCodecsId aConfigId,
+                     already_AddRefed<ConfigTypeInternal> aConfig);
+
+    RefPtr<ConfigTypeInternal> mConfig;
+    const nsCString mCodec;
+  };
+
+  class DecodeMessage final
+      : public ControlMessage,
+        public MessageRequestHolder<DecoderAgent::DecodePromise> {
+   public:
+    DecodeMessage(WebCodecsId aSeqId, WebCodecsId aConfigId,
+                  UniquePtr<InputTypeInternal>&& aData);
+    ~DecodeMessage() = default;
+    virtual void Cancel() override { Disconnect(); }
+    virtual bool IsProcessing() override { return Exists(); };
+    virtual nsCString ToString() const override;
+    virtual DecodeMessage* AsDecodeMessage() override { return this; }
+
+    const WebCodecsId mSeqId;
+    UniquePtr<InputTypeInternal> mData;
+  };
+
+  class FlushMessage final
+      : public ControlMessage,
+        public MessageRequestHolder<DecoderAgent::DecodePromise> {
+   public:
+    FlushMessage(WebCodecsId aSeqId, WebCodecsId aConfigId);
+    ~FlushMessage() = default;
+    virtual void Cancel() override { Disconnect(); }
+    virtual bool IsProcessing() override { return Exists(); };
+    virtual nsCString ToString() const override;
+    virtual FlushMessage* AsFlushMessage() override { return this; }
+
+    const WebCodecsId mSeqId;
+    const int64_t mUniqueId;
+  };
+
+ protected:
+  DecoderTemplate(nsIGlobalObject* aGlobalObject,
+                  RefPtr<WebCodecsErrorCallback>&& aErrorCallback,
+                  RefPtr<OutputCallbackType>&& aOutputCallback);
+
+  virtual ~DecoderTemplate() = default;
+
+ public:
+  IMPL_EVENT_HANDLER(dequeue)
+
+  CodecState State() const { return mState; };
+
+  uint32_t DecodeQueueSize() const { return mDecodeQueueSize; };
+
+  void Configure(const ConfigType& aConfig, ErrorResult& aRv);
+
+  void Decode(InputType& aInput, ErrorResult& aRv);
+
+  already_AddRefed<Promise> Flush(ErrorResult& aRv);
+
+  void Reset(ErrorResult& aRv);
+
+  void Close(ErrorResult& aRv);
+
+ protected:
+  virtual already_AddRefed<MediaRawData> InputDataToMediaRawData(
+      UniquePtr<InputTypeInternal>&& aData, TrackInfo& aInfo,
+      const ConfigTypeInternal& aConfig) = 0;
+  virtual nsTArray<RefPtr<OutputType>> DecodedDataToOutputType(
+      nsIGlobalObject* aGlobalObject, const nsTArray<RefPtr<MediaData>>&& aData,
+      const ConfigTypeInternal& aConfig) = 0;
+
+ protected:
+  void AssertIsOnOwningThread() const {
+    NS_ASSERT_OWNINGTHREAD(DecoderTemplate);
+  }
+
+  Result<Ok, nsresult> ResetInternal(const nsresult& aResult);
+  MOZ_CAN_RUN_SCRIPT
+  void CloseInternal(const nsresult& aResult);
+  Result<Ok, nsresult> CloseInternalWithAbort();
+
+  MOZ_CAN_RUN_SCRIPT void ReportError(const nsresult& aResult);
+  MOZ_CAN_RUN_SCRIPT void OutputDecodedData(
+      const nsTArray<RefPtr<MediaData>>&& aData,
+      const ConfigTypeInternal& aConfig);
+
+  void ScheduleDequeueEventIfNeeded();
+  nsresult FireEvent(nsAtom* aTypeWithOn, const nsAString& aEventType);
+
+  void ProcessControlMessageQueue();
+  void CancelPendingControlMessagesAndFlushPromises(const nsresult& aResult);
+
+  template <typename Func>
+  void QueueATask(const char* aName, Func&& aSteps);
+
+  MessageProcessedResult ProcessConfigureMessage(
+      UniquePtr<ControlMessage>& aMessage);
+
+  MessageProcessedResult ProcessDecodeMessage(
+      UniquePtr<ControlMessage>& aMessage);
+
+  MessageProcessedResult ProcessFlushMessage(
+      UniquePtr<ControlMessage>& aMessage);
+
+  bool CreateDecoderAgent(DecoderAgent::Id aId,
+                          already_AddRefed<ConfigTypeInternal> aConfig,
+                          UniquePtr<TrackInfo>&& aInfo);
+  void DestroyDecoderAgentIfAny();
+
+  RefPtr<WebCodecsErrorCallback> mErrorCallback;
+  RefPtr<OutputCallbackType> mOutputCallback;
+
+  CodecState mState;
+  bool mKeyChunkRequired;
+
+  bool mMessageQueueBlocked;
+  std::queue<UniquePtr<ControlMessage>> mControlMessageQueue;
+  UniquePtr<ControlMessage> mProcessingMessage;
+
+  SimpleMap<int64_t, RefPtr<Promise>> mPendingFlushPromises;
+
+  uint32_t mDecodeQueueSize;
+  bool mDequeueEventScheduled;
+
+  uint32_t mLatestConfigureId;
+  size_t mDecodeCounter;
+  size_t mFlushCounter;
+
+  RefPtr<DecoderAgent> mAgent;
+  RefPtr<ConfigTypeInternal> mActiveConfig;
+
+  UniquePtr<media::ShutdownBlockingTicket> mShutdownBlocker;
+
+  RefPtr<ThreadSafeWorkerRef> mWorkerRef;
+
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_DecoderTemplate_h

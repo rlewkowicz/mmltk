@@ -1,0 +1,112 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SMILKeySpline.h"
+
+#include <stdint.h>
+
+#include <cmath>
+
+namespace mozilla {
+
+#define NEWTON_ITERATIONS 4
+#define NEWTON_MIN_SLOPE 0.02
+#define SUBDIVISION_PRECISION 0.0000001
+#define SUBDIVISION_MAX_ITERATIONS 10
+
+void SMILKeySpline::Init(double aX1, double aY1, double aX2, double aY2) {
+  mX1 = aX1;
+  mY1 = aY1;
+  mX2 = aX2;
+  mY2 = aY2;
+
+  if (mX1 != mY1 || mX2 != mY2) CalcSampleValues();
+}
+
+double SMILKeySpline::GetSplineValue(double aX) const {
+  if (mX1 == mY1 && mX2 == mY2) return aX;
+
+  return CalcBezier(GetTForX(aX), mY1, mY2);
+}
+
+void SMILKeySpline::GetSplineDerivativeValues(double aX, double& aDX,
+                                              double& aDY) const {
+  double t = GetTForX(aX);
+  aDX = GetSlope(t, mX1, mX2);
+  aDY = GetSlope(t, mY1, mY2);
+}
+
+void SMILKeySpline::CalcSampleValues() {
+  for (uint32_t i = 0; i < kSplineTableSize; ++i) {
+    mSampleValues[i] = CalcBezier(double(i) * kSampleStepSize, mX1, mX2);
+  }
+}
+
+double SMILKeySpline::CalcBezier(double aT, double aA1, double aA2) {
+  return ((A(aA1, aA2) * aT + B(aA1, aA2)) * aT + C(aA1)) * aT;
+}
+
+double SMILKeySpline::GetSlope(double aT, double aA1, double aA2) {
+  return 3.0 * A(aA1, aA2) * aT * aT + 2.0 * B(aA1, aA2) * aT + C(aA1);
+}
+
+double SMILKeySpline::GetTForX(double aX) const {
+  if (aX == 1.0) {
+    return 1.0;
+  }
+  double intervalStart = 0.0;
+  const double* currentSample = &mSampleValues[1];
+  const double* const lastSample = &mSampleValues[kSplineTableSize - 1];
+  for (; currentSample != lastSample && *currentSample <= aX; ++currentSample) {
+    intervalStart += kSampleStepSize;
+  }
+  --currentSample;  
+
+  double dist = (aX - *currentSample) / (*(currentSample + 1) - *currentSample);
+  double guessForT = intervalStart + dist * kSampleStepSize;
+
+  double initialSlope = GetSlope(guessForT, mX1, mX2);
+  if (initialSlope >= NEWTON_MIN_SLOPE) {
+    return NewtonRaphsonIterate(aX, guessForT);
+  }
+  if (initialSlope == 0.0) {
+    return guessForT;
+  }
+  return BinarySubdivide(aX, intervalStart, intervalStart + kSampleStepSize);
+}
+
+double SMILKeySpline::NewtonRaphsonIterate(double aX, double aGuessT) const {
+  for (uint32_t i = 0; i < NEWTON_ITERATIONS; ++i) {
+    double currentX = CalcBezier(aGuessT, mX1, mX2) - aX;
+    double currentSlope = GetSlope(aGuessT, mX1, mX2);
+
+    if (currentSlope == 0.0) return aGuessT;
+
+    aGuessT -= currentX / currentSlope;
+  }
+
+  return aGuessT;
+}
+
+double SMILKeySpline::BinarySubdivide(double aX, double aA, double aB) const {
+  double currentX;
+  double currentT;
+  uint32_t i = 0;
+
+  do {
+    currentT = aA + (aB - aA) / 2.0;
+    currentX = CalcBezier(currentT, mX1, mX2) - aX;
+
+    if (currentX > 0.0) {
+      aB = currentT;
+    } else {
+      aA = currentT;
+    }
+  } while (std::abs(currentX) > SUBDIVISION_PRECISION &&
+           ++i < SUBDIVISION_MAX_ITERATIONS);
+
+  return currentT;
+}
+
+}  

@@ -1,0 +1,41 @@
+/*
+ * Copyright 2017 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkOffsetPolygon_DEFINED)
+#define SkOffsetPolygon_DEFINED
+
+#include "include/core/SkPoint.h"
+#include "include/core/SkScalar.h"
+
+#include <cstdint>
+
+#if !defined(SK_ENABLE_OPTIMIZE_SIZE)
+struct SkRect;
+template <typename T> class SkTDArray;
+
+bool SkInsetConvexPolygon(const SkPoint* inputPolygonVerts, int inputPolygonSize,
+                          SkScalar inset, SkTDArray<SkPoint>* insetPolygon);
+
+bool SkOffsetSimplePolygon(const SkPoint* inputPolygonVerts, int inputPolygonSize,
+                           const SkRect& bounds, SkScalar offset, SkTDArray<SkPoint>* offsetPolygon,
+                           SkTDArray<int>* polygonIndices = nullptr);
+
+bool SkComputeRadialSteps(const SkVector& offset0, const SkVector& offset1, SkScalar offset,
+                          SkScalar* rotSin, SkScalar* rotCos, int* n);
+
+int SkGetPolygonWinding(const SkPoint* polygonVerts, int polygonSize);
+
+bool SkIsConvexPolygon(const SkPoint* polygonVerts, int polygonSize);
+
+ bool SkIsSimplePolygon(const SkPoint* polygonVerts, int polygonSize);
+
+ bool SkTriangulateSimplePolygon(const SkPoint* polygonVerts, uint16_t* indexMap, int polygonSize,
+                                 SkTDArray<uint16_t>* triangleIndices);
+
+#endif
+
+#endif

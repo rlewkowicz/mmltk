@@ -1,0 +1,2062 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "builtin/Object.h"
+#include "js/Object.h"  // JS::GetBuiltinClass
+
+#include "mozilla/Maybe.h"
+#include "mozilla/Range.h"
+#include "mozilla/RangedPtr.h"
+
+#include <algorithm>
+#include <string_view>
+
+#include "jsapi.h"
+
+#include "builtin/Eval.h"
+#include "builtin/SelfHostingDefines.h"
+#include "gc/GC.h"
+#include "jit/InlinableNatives.h"
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#include "js/friend/StackLimits.h"    // js::AutoCheckRecursionLimit
+#include "js/PropertySpec.h"
+#include "js/UniquePtr.h"
+#include "util/Identifier.h"  // js::IsIdentifier
+#include "util/StringBuilder.h"
+#include "util/Text.h"
+#include "vm/BooleanObject.h"
+#include "vm/DateObject.h"
+#include "vm/EqualityOperations.h"  // js::SameValue
+#include "vm/ErrorObject.h"
+#include "vm/Iteration.h"
+#include "vm/JSContext.h"
+#include "vm/NumberObject.h"
+#include "vm/PlainObject.h"  // js::PlainObject
+#include "vm/RegExpObject.h"
+#include "vm/StringObject.h"
+#include "vm/StringType.h"
+#include "vm/ToSource.h"  // js::ValueToSource
+#include "vm/Watchtower.h"
+#include "vm/GeckoProfiler-inl.h"
+#include "vm/JSObject-inl.h"
+#include "vm/NativeObject-inl.h"
+#include "vm/Shape-inl.h"
+
+
+using namespace js;
+
+using mozilla::Maybe;
+using mozilla::Range;
+using mozilla::RangedPtr;
+
+static PlainObject* CreateThis(JSContext* cx, HandleObject newTarget) {
+  RootedObject proto(cx);
+  if (!GetPrototypeFromConstructor(cx, newTarget, JSProto_Object, &proto)) {
+    return nullptr;
+  }
+
+  gc::AllocKind allocKind = NewObjectGCKind();
+
+  if (proto) {
+    return NewPlainObjectWithProto(cx, proto, {.allocKind = allocKind});
+  }
+  return NewPlainObject(cx, {.allocKind = allocKind});
+}
+
+bool js::obj_construct(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  JSObject* obj;
+  if (args.isConstructing() &&
+      (&args.newTarget().toObject() != &args.callee())) {
+    RootedObject newTarget(cx, &args.newTarget().toObject());
+    obj = CreateThis(cx, newTarget);
+  } else if (args.length() > 0 && !args[0].isNullOrUndefined()) {
+    obj = ToObject(cx, args[0]);
+  } else {
+    gc::AllocKind allocKind = NewObjectGCKind();
+    obj = NewPlainObject(cx, {.allocKind = allocKind});
+  }
+  if (!obj) {
+    return false;
+  }
+
+  args.rval().setObject(*obj);
+  return true;
+}
+
+bool js::obj_propertyIsEnumerable(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  HandleValue idValue = args.get(0);
+
+
+  jsid id;
+  if (args.thisv().isObject() && idValue.isPrimitive() &&
+      PrimitiveValueToId<NoGC>(cx, idValue, &id)) {
+    JSObject* obj = &args.thisv().toObject();
+
+    PropertyResult prop;
+    if (obj->is<NativeObject>() &&
+        NativeLookupOwnProperty<NoGC>(cx, &obj->as<NativeObject>(), id,
+                                      &prop)) {
+      if (prop.isNotFound()) {
+        args.rval().setBoolean(false);
+        return true;
+      }
+
+      JS::PropertyAttributes attrs = GetPropertyAttributes(obj, prop);
+      args.rval().setBoolean(attrs.enumerable());
+      return true;
+    }
+  }
+
+  RootedId idRoot(cx);
+  if (!ToPropertyKey(cx, idValue, &idRoot)) {
+    return false;
+  }
+
+  RootedObject obj(cx, ToObject(cx, args.thisv()));
+  if (!obj) {
+    return false;
+  }
+
+  Rooted<Maybe<PropertyDescriptor>> desc(cx);
+  if (!GetOwnPropertyDescriptor(cx, obj, idRoot, &desc)) {
+    return false;
+  }
+
+  if (desc.isNothing()) {
+    args.rval().setBoolean(false);
+    return true;
+  }
+
+  args.rval().setBoolean(desc->enumerable());
+  return true;
+}
+
+static bool obj_toSource(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "Object.prototype", "toSource");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  AutoCheckRecursionLimit recursion(cx);
+  if (!recursion.check(cx)) {
+    return false;
+  }
+
+  RootedObject obj(cx, ToObject(cx, args.thisv()));
+  if (!obj) {
+    return false;
+  }
+
+  JSString* str = ObjectToSource(cx, obj);
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+template <typename CharT>
+static bool Consume(RangedPtr<const CharT>& s, RangedPtr<const CharT> e,
+                    std::string_view chars) {
+  MOZ_ASSERT(s <= e);
+  size_t len = chars.length();
+  if (e - s < len) {
+    return false;
+  }
+  if (!EqualChars(s.get(), chars.data(), len)) {
+    return false;
+  }
+  s += len;
+  return true;
+}
+
+template <typename CharT>
+static bool ConsumeUntil(RangedPtr<const CharT>& s, RangedPtr<const CharT> e,
+                         char16_t ch) {
+  MOZ_ASSERT(s <= e);
+  const CharT* result = js_strchr_limit(s.get(), ch, e.get());
+  if (!result) {
+    return false;
+  }
+  s += result - s.get();
+  MOZ_ASSERT(*s == ch);
+  return true;
+}
+
+template <typename CharT>
+static void ConsumeSpaces(RangedPtr<const CharT>& s, RangedPtr<const CharT> e) {
+  while (s < e && *s == ' ') {
+    s++;
+  }
+}
+
+template <typename CharT>
+static bool ArgsAndBodySubstring(Range<const CharT> chars, size_t* outOffset,
+                                 size_t* outLen) {
+  const RangedPtr<const CharT> start = chars.begin();
+  RangedPtr<const CharT> s = start;
+  RangedPtr<const CharT> e = chars.end();
+
+  if (s == e) {
+    return false;
+  }
+
+  if (*s == '(' && *(e - 1) == ')') {
+    s++;
+    e--;
+  }
+
+
+  (void)Consume(s, e, "async");
+  ConsumeSpaces(s, e);
+  (void)(Consume(s, e, "function") || Consume(s, e, "get") ||
+         Consume(s, e, "set"));
+  ConsumeSpaces(s, e);
+  (void)Consume(s, e, "*");
+  ConsumeSpaces(s, e);
+
+  if (Consume(s, e, "[")) {
+    if (!ConsumeUntil(s, e, ']')) {
+      return false;
+    }
+    s++;  
+    ConsumeSpaces(s, e);
+    if (s >= e || *s != '(') {
+      return false;
+    }
+  } else {
+    if (!ConsumeUntil(s, e, '(')) {
+      return false;
+    }
+  }
+
+  MOZ_ASSERT(*s == '(');
+
+  *outOffset = s - start;
+  *outLen = e - s;
+  MOZ_ASSERT(*outOffset + *outLen <= chars.length());
+  return true;
+}
+
+enum class PropertyKind { Getter, Setter, Method, Normal };
+
+JSString* js::ObjectToSource(JSContext* cx, HandleObject obj) {
+  bool outermost = cx->cycleDetectorVector().empty();
+
+  AutoCycleDetector detector(cx, obj);
+  if (!detector.init()) {
+    return nullptr;
+  }
+  if (detector.foundCycle()) {
+    return NewStringCopyZ<CanGC>(cx, "{}");
+  }
+
+  JSStringBuilder buf(cx);
+  if (outermost && !buf.append('(')) {
+    return nullptr;
+  }
+  if (!buf.append('{')) {
+    return nullptr;
+  }
+
+  RootedIdVector idv(cx);
+  if (!GetPropertyKeys(cx, obj, JSITER_OWNONLY | JSITER_SYMBOLS, &idv)) {
+    return nullptr;
+  }
+
+  bool comma = false;
+
+  auto AddProperty = [cx, &comma, &buf](HandleId id, HandleValue val,
+                                        PropertyKind kind) -> bool {
+    RootedString idstr(cx);
+    if (id.isSymbol()) {
+      RootedValue v(cx, SymbolValue(id.toSymbol()));
+      idstr = ValueToSource(cx, v);
+      if (!idstr) {
+        return false;
+      }
+    } else {
+      RootedValue idv(cx, IdToValue(id));
+      idstr = ToString<CanGC>(cx, idv);
+      if (!idstr) {
+        return false;
+      }
+
+      if (id.isAtom() ? !IsIdentifier(id.toAtom()) : id.toInt() < 0) {
+        UniqueChars quotedId = QuoteString(cx, idstr, '\'');
+        if (!quotedId) {
+          return false;
+        }
+        idstr = NewStringCopyZ<CanGC>(cx, quotedId.get());
+        if (!idstr) {
+          return false;
+        }
+      }
+    }
+
+    RootedString valsource(cx, ValueToSource(cx, val));
+    if (!valsource) {
+      return false;
+    }
+
+    Rooted<JSLinearString*> valstr(cx, valsource->ensureLinear(cx));
+    if (!valstr) {
+      return false;
+    }
+
+    if (comma && !buf.append(", ")) {
+      return false;
+    }
+    comma = true;
+
+    size_t voffset, vlength;
+
+    if (kind == PropertyKind::Getter || kind == PropertyKind::Setter ||
+        kind == PropertyKind::Method) {
+      RootedFunction fun(cx);
+      if (val.toObject().is<JSFunction>()) {
+        fun = &val.toObject().as<JSFunction>();
+        if (((fun->isGetter() && kind == PropertyKind::Getter &&
+              !fun->isAccessorWithLazyName()) ||
+             (fun->isSetter() && kind == PropertyKind::Setter &&
+              !fun->isAccessorWithLazyName()) ||
+             kind == PropertyKind::Method) &&
+            fun->fullExplicitName()) {
+          bool result;
+          if (!EqualStrings(cx, fun->fullExplicitName(), idstr, &result)) {
+            return false;
+          }
+
+          if (result) {
+            if (!buf.append(valstr)) {
+              return false;
+            }
+            return true;
+          }
+        }
+      }
+
+      {
+        bool success;
+        JS::AutoCheckCannotGC nogc;
+        if (valstr->hasLatin1Chars()) {
+          success = ArgsAndBodySubstring(valstr->latin1Range(nogc), &voffset,
+                                         &vlength);
+        } else {
+          success = ArgsAndBodySubstring(valstr->twoByteRange(nogc), &voffset,
+                                         &vlength);
+        }
+        if (!success) {
+          kind = PropertyKind::Normal;
+        }
+      }
+
+      if (kind == PropertyKind::Getter) {
+        if (!buf.append("get ")) {
+          return false;
+        }
+      } else if (kind == PropertyKind::Setter) {
+        if (!buf.append("set ")) {
+          return false;
+        }
+      } else if (kind == PropertyKind::Method && fun) {
+        if (fun->isAsync()) {
+          if (!buf.append("async ")) {
+            return false;
+          }
+        }
+
+        if (fun->isGenerator()) {
+          if (!buf.append('*')) {
+            return false;
+          }
+        }
+      }
+    }
+
+    bool needsBracket = id.isSymbol();
+    if (needsBracket && !buf.append('[')) {
+      return false;
+    }
+    if (!buf.append(idstr)) {
+      return false;
+    }
+    if (needsBracket && !buf.append(']')) {
+      return false;
+    }
+
+    if (kind == PropertyKind::Getter || kind == PropertyKind::Setter ||
+        kind == PropertyKind::Method) {
+      if (!buf.appendSubstring(valstr, voffset, vlength)) {
+        return false;
+      }
+    } else {
+      if (!buf.append(':')) {
+        return false;
+      }
+      if (!buf.append(valstr)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  RootedId id(cx);
+  Rooted<Maybe<PropertyDescriptor>> desc(cx);
+  RootedValue val(cx);
+  for (size_t i = 0; i < idv.length(); ++i) {
+    id = idv[i];
+    if (!GetOwnPropertyDescriptor(cx, obj, id, &desc)) {
+      return nullptr;
+    }
+
+    if (desc.isNothing()) {
+      continue;
+    }
+
+    if (desc->isAccessorDescriptor()) {
+      if (desc->hasGetter() && desc->getter()) {
+        val.setObject(*desc->getter());
+        if (!AddProperty(id, val, PropertyKind::Getter)) {
+          return nullptr;
+        }
+      }
+      if (desc->hasSetter() && desc->setter()) {
+        val.setObject(*desc->setter());
+        if (!AddProperty(id, val, PropertyKind::Setter)) {
+          return nullptr;
+        }
+      }
+      continue;
+    }
+
+    val.set(desc->value());
+
+    JSFunction* fun = nullptr;
+    if (IsFunctionObject(val, &fun) && fun->isMethod()) {
+      if (!AddProperty(id, val, PropertyKind::Method)) {
+        return nullptr;
+      }
+      continue;
+    }
+
+    if (!AddProperty(id, val, PropertyKind::Normal)) {
+      return nullptr;
+    }
+  }
+
+  if (!buf.append('}')) {
+    return nullptr;
+  }
+  if (outermost && !buf.append(')')) {
+    return nullptr;
+  }
+
+  return buf.finishString();
+}
+
+static JSString* GetBuiltinTagSlow(JSContext* cx, HandleObject obj) {
+  bool isArray;
+  if (!IsArray(cx, obj, &isArray)) {
+    return nullptr;
+  }
+
+  if (isArray) {
+    return cx->names().object_Array_;
+  }
+
+  ESClass cls;
+  if (!JS::GetBuiltinClass(cx, obj, &cls)) {
+    return nullptr;
+  }
+
+  switch (cls) {
+    case ESClass::String:
+      return cx->names().object_String_;
+    case ESClass::Arguments:
+      return cx->names().object_Arguments_;
+    case ESClass::Error:
+      return cx->names().object_Error_;
+    case ESClass::Boolean:
+      return cx->names().object_Boolean_;
+    case ESClass::Number:
+      return cx->names().object_Number_;
+    case ESClass::Date:
+      return cx->names().object_Date_;
+    case ESClass::RegExp:
+      return cx->names().object_RegExp_;
+    default:
+      if (obj->isCallable()) {
+        return cx->names().object_Function_;
+      }
+      return cx->names().object_Object_;
+  }
+}
+
+static MOZ_ALWAYS_INLINE JSString* GetBuiltinTagFast(JSObject* obj,
+                                                     JSContext* cx) {
+  const JSClass* clasp = obj->getClass();
+  MOZ_ASSERT(!clasp->isProxyObject());
+
+  if (clasp == &PlainObject::class_) {
+    return cx->names().object_Object_;
+  }
+
+  if (clasp == &ArrayObject::class_) {
+    return cx->names().object_Array_;
+  }
+
+  if (clasp->isJSFunction()) {
+    return cx->names().object_Function_;
+  }
+
+  if (clasp == &StringObject::class_) {
+    return cx->names().object_String_;
+  }
+
+  if (clasp == &NumberObject::class_) {
+    return cx->names().object_Number_;
+  }
+
+  if (clasp == &BooleanObject::class_) {
+    return cx->names().object_Boolean_;
+  }
+
+  if (clasp == &DateObject::class_) {
+    return cx->names().object_Date_;
+  }
+
+  if (clasp == &RegExpObject::class_) {
+    return cx->names().object_RegExp_;
+  }
+
+  if (obj->is<ArgumentsObject>()) {
+    return cx->names().object_Arguments_;
+  }
+
+  if (obj->is<ErrorObject>()) {
+    return cx->names().object_Error_;
+  }
+
+  if (obj->isCallable()) {
+    return cx->names().object_Function_;
+  }
+
+  return cx->names().object_Object_;
+}
+
+static JSAtom* MaybeObjectToStringPrimitive(JSContext* cx, const Value& v) {
+  JSProtoKey protoKey = js::PrimitiveToProtoKey(cx, v);
+
+  // If prototype doesn't exist yet, just fall through.
+  JSObject* proto = cx->global()->maybeGetPrototype(protoKey);
+  if (!proto) {
+    return nullptr;
+  }
+
+  if (MaybeHasInterestingSymbolProperty(
+          cx, proto, cx->wellKnownSymbols().toStringTag, nullptr)) {
+    return nullptr;
+  }
+
+  switch (protoKey) {
+    case JSProto_String:
+      return cx->names().object_String_;
+    case JSProto_Number:
+      return cx->names().object_Number_;
+    case JSProto_Boolean:
+      return cx->names().object_Boolean_;
+    case JSProto_Symbol:
+      return cx->names().object_Symbol_;
+    case JSProto_BigInt:
+      return cx->names().object_BigInt_;
+    default:
+      break;
+  }
+
+  return nullptr;
+}
+
+bool js::obj_toString(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "Object.prototype", "toString");
+  CallArgs args = CallArgsFromVp(argc, vp);
+  RootedObject obj(cx);
+
+  if (args.thisv().isPrimitive()) {
+    if (args.thisv().isUndefined()) {
+      args.rval().setString(cx->names().object_Undefined_);
+      return true;
+    }
+
+    if (args.thisv().isNull()) {
+      args.rval().setString(cx->names().object_Null_);
+      return true;
+    }
+
+    JSAtom* result = MaybeObjectToStringPrimitive(cx, args.thisv());
+    if (result) {
+      args.rval().setString(result);
+      return true;
+    }
+
+    obj = ToObject(cx, args.thisv());
+    if (!obj) {
+      return false;
+    }
+  } else {
+    obj = &args.thisv().toObject();
+  }
+
+  RootedString builtinTag(cx);
+  if (MOZ_UNLIKELY(obj->is<ProxyObject>())) {
+    builtinTag = GetBuiltinTagSlow(cx, obj);
+    if (!builtinTag) {
+      return false;
+    }
+  }
+
+  RootedValue tag(cx);
+  if (!GetInterestingSymbolProperty(cx, obj, cx->wellKnownSymbols().toStringTag,
+                                    &tag)) {
+    return false;
+  }
+
+  if (!tag.isString()) {
+    if (!builtinTag) {
+      builtinTag = GetBuiltinTagFast(obj, cx);
+#ifdef DEBUG
+      JSString* builtinTagSlow = GetBuiltinTagSlow(cx, obj);
+      if (!builtinTagSlow) {
+        return false;
+      }
+      MOZ_ASSERT(builtinTagSlow == builtinTag);
+#endif
+    }
+
+    args.rval().setString(builtinTag);
+    return true;
+  }
+
+  StringBuilder sb(cx);
+  if (!sb.append("[object ") || !sb.append(tag.toString()) || !sb.append(']')) {
+    return false;
+  }
+
+  JSString* str = sb.finishAtom();
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+JSString* js::ObjectClassToString(JSContext* cx, JSObject* obj) {
+  AutoUnsafeCallWithABI unsafe;
+
+  if (MaybeHasInterestingSymbolProperty(cx, obj,
+                                        cx->wellKnownSymbols().toStringTag)) {
+    return nullptr;
+  }
+  return GetBuiltinTagFast(obj, cx);
+}
+
+static bool obj_setPrototypeOf(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (!args.requireAtLeast(cx, "Object.setPrototypeOf", 2)) {
+    return false;
+  }
+
+  if (args[0].isNullOrUndefined()) {
+    JS_ReportErrorNumberASCII(
+        cx, GetErrorMessage, nullptr, JSMSG_CANT_CONVERT_TO,
+        args[0].isNull() ? "null" : "undefined", "object");
+    return false;
+  }
+
+  if (!args[1].isObjectOrNull()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_NOT_EXPECTED_TYPE, "Object.setPrototypeOf",
+                              "an object or null",
+                              InformalValueTypeName(args[1]));
+    return false;
+  }
+
+  if (!args[0].isObject()) {
+    args.rval().set(args[0]);
+    return true;
+  }
+
+  RootedObject obj(cx, &args[0].toObject());
+  RootedObject newProto(cx, args[1].toObjectOrNull());
+  if (!SetPrototype(cx, obj, newProto)) {
+    return false;
+  }
+
+  args.rval().set(args[0]);
+  return true;
+}
+
+static bool PropertyIsEnumerable(JSContext* cx, HandleObject obj, HandleId id,
+                                 bool* enumerable) {
+  PropertyResult prop;
+  if (obj->is<NativeObject>() &&
+      NativeLookupOwnProperty<NoGC>(cx, &obj->as<NativeObject>(), id, &prop)) {
+    if (prop.isNotFound()) {
+      *enumerable = false;
+      return true;
+    }
+
+    JS::PropertyAttributes attrs = GetPropertyAttributes(obj, prop);
+    *enumerable = attrs.enumerable();
+    return true;
+  }
+
+  Rooted<Maybe<PropertyDescriptor>> desc(cx);
+  if (!GetOwnPropertyDescriptor(cx, obj, id, &desc)) {
+    return false;
+  }
+
+  *enumerable = desc.isSome() && desc->enumerable();
+  return true;
+}
+
+static bool CanAddNewPropertyExcludingProtoFast(PlainObject* obj) {
+  if (!obj->isExtensible() || obj->isUsedAsPrototype()) {
+    return false;
+  }
+
+  if (Watchtower::watchesPropertyValueChange(obj)) {
+    return false;
+  }
+
+  while (true) {
+    if (obj->hasNonWritableOrAccessorPropExclProto()) {
+      return false;
+    }
+
+    JSObject* proto = obj->staticPrototype();
+    if (!proto) {
+      return true;
+    }
+    if (!proto->is<PlainObject>()) {
+      return false;
+    }
+    obj = &proto->as<PlainObject>();
+  }
+}
+
+#ifdef DEBUG
+void PlainObjectAssignCache::assertValid() const {
+  MOZ_ASSERT(emptyToShape_);
+  MOZ_ASSERT(fromShape_);
+  MOZ_ASSERT(newToShape_);
+
+  MOZ_ASSERT(emptyToShape_->propMapLength() == 0);
+  MOZ_ASSERT(emptyToShape_->base() == newToShape_->base());
+  MOZ_ASSERT(emptyToShape_->numFixedSlots() == newToShape_->numFixedSlots());
+
+  MOZ_ASSERT(emptyToShape_->getObjectClass() == &PlainObject::class_);
+  MOZ_ASSERT(fromShape_->getObjectClass() == &PlainObject::class_);
+
+  MOZ_ASSERT(fromShape_->slotSpan() == newToShape_->slotSpan());
+}
+#endif
+
+[[nodiscard]] static bool TryAssignPlain(JSContext* cx, HandleObject to,
+                                         HandleObject from, bool* optimized) {
+
+  MOZ_ASSERT(*optimized == false);
+
+  if (!from->is<PlainObject>() || !to->is<PlainObject>()) {
+    return true;
+  }
+
+  Handle<PlainObject*> fromPlain = from.as<PlainObject>();
+  if (fromPlain->getDenseInitializedLength() > 0 || fromPlain->isIndexed()) {
+    return true;
+  }
+  MOZ_ASSERT(!fromPlain->getClass()->getNewEnumerate());
+  MOZ_ASSERT(!fromPlain->getClass()->getEnumerate());
+
+  if (fromPlain->empty()) {
+    *optimized = true;
+    return true;
+  }
+
+  Handle<PlainObject*> toPlain = to.as<PlainObject>();
+  if (!CanAddNewPropertyExcludingProtoFast(toPlain)) {
+    return true;
+  }
+
+  const bool toWasEmpty = toPlain->empty();
+  if (toWasEmpty) {
+    const PlainObjectAssignCache& cache = cx->realm()->plainObjectAssignCache;
+    SharedShape* newShape = cache.lookup(toPlain->shape(), fromPlain->shape());
+    if (newShape) {
+      *optimized = true;
+      uint32_t oldSpan = 0;
+      uint32_t newSpan = newShape->slotSpan();
+      if (!toPlain->setShapeAndAddNewSlots(cx, newShape, oldSpan, newSpan)) {
+        return false;
+      }
+      MOZ_ASSERT(fromPlain->slotSpan() == newSpan);
+      for (size_t i = 0; i < newSpan; i++) {
+        toPlain->initSlot(i, fromPlain->getSlot(i));
+      }
+      return true;
+    }
+  }
+
+
+  Rooted<PropertyInfoWithKeyVector> props(cx, PropertyInfoWithKeyVector(cx));
+
+#ifdef DEBUG
+  Rooted<Shape*> fromShape(cx, fromPlain->shape());
+#endif
+
+  bool hasPropsWithNonDefaultAttrs = false;
+  bool hasOnlyEnumerableProps = true;
+  for (ShapePropertyIter<NoGC> iter(fromPlain->shape()); !iter.done(); iter++) {
+    jsid id = iter->key();
+    if (MOZ_UNLIKELY(id.isSymbol())) {
+      return true;
+    }
+    if (MOZ_UNLIKELY(id.isAtom(cx->names().proto_))) {
+      return true;
+    }
+    if (MOZ_UNLIKELY(!iter->isDataProperty())) {
+      return true;
+    }
+    if (iter->flags() != PropertyFlags::defaultDataPropFlags) {
+      hasPropsWithNonDefaultAttrs = true;
+      if (!iter->enumerable()) {
+        hasOnlyEnumerableProps = false;
+        continue;
+      }
+    }
+    if (MOZ_UNLIKELY(!props.append(*iter))) {
+      return false;
+    }
+  }
+
+  MOZ_ASSERT_IF(hasOnlyEnumerableProps && !fromPlain->inDictionaryMode(),
+                fromPlain->slotSpan() == props.length());
+
+  *optimized = true;
+
+  Rooted<Shape*> origToShape(cx, toPlain->shape());
+
+  if (toWasEmpty && !hasPropsWithNonDefaultAttrs) {
+    CanReuseShape canReuse =
+        toPlain->canReuseShapeForNewProperties(fromPlain->shape());
+    if (canReuse != CanReuseShape::NoReuse) {
+      SharedShape* newShape;
+      if (canReuse == CanReuseShape::CanReuseShape) {
+        newShape = fromPlain->sharedShape();
+      } else {
+        MOZ_ASSERT(canReuse == CanReuseShape::CanReusePropMap);
+        ObjectFlags objectFlags = fromPlain->sharedShape()->objectFlags();
+        Rooted<SharedPropMap*> map(cx, fromPlain->sharedShape()->propMap());
+        uint32_t mapLength = fromPlain->sharedShape()->propMapLength();
+        BaseShape* base = toPlain->sharedShape()->base();
+        uint32_t nfixed = toPlain->sharedShape()->numFixedSlots();
+        newShape = SharedShape::getPropMapShape(cx, base, nfixed, map,
+                                                mapLength, objectFlags);
+        if (!newShape) {
+          return false;
+        }
+      }
+      uint32_t oldSpan = 0;
+      uint32_t newSpan = props.length();
+      if (!toPlain->setShapeAndAddNewSlots(cx, newShape, oldSpan, newSpan)) {
+        return false;
+      }
+      MOZ_ASSERT(fromPlain->slotSpan() == newSpan);
+      MOZ_ASSERT(toPlain->slotSpan() == newSpan);
+      for (size_t i = 0; i < newSpan; i++) {
+        toPlain->initSlot(i, fromPlain->getSlot(i));
+      }
+      PlainObjectAssignCache& cache = cx->realm()->plainObjectAssignCache;
+      cache.fill(&origToShape->asShared(), fromPlain->sharedShape(), newShape);
+      return true;
+    }
+  }
+
+  RootedValue propValue(cx);
+  RootedId nextKey(cx);
+
+  for (size_t i = props.length(); i > 0; i--) {
+    MOZ_ASSERT(fromPlain->shape() == fromShape);
+
+    PropertyInfoWithKey fromProp = props[i - 1];
+    MOZ_ASSERT(fromProp.isDataProperty());
+    MOZ_ASSERT(fromProp.enumerable());
+
+    nextKey = fromProp.key();
+    propValue = fromPlain->getSlot(fromProp.slot());
+
+    if (!toWasEmpty) {
+      if (Maybe<PropertyInfo> toProp = toPlain->lookup(cx, nextKey)) {
+        MOZ_ASSERT(toProp->isDataProperty());
+        MOZ_ASSERT(toProp->writable());
+        toPlain->setSlot(toProp->slot(), propValue);
+        continue;
+      }
+    }
+
+    MOZ_ASSERT(!toPlain->containsPure(nextKey));
+
+    if (!AddDataPropertyToNativeObjectNoHooks(cx, toPlain, nextKey,
+                                              propValue)) {
+      return false;
+    }
+  }
+
+  if (toWasEmpty && hasOnlyEnumerableProps && !fromPlain->inDictionaryMode() &&
+      !toPlain->inDictionaryMode()) {
+    PlainObjectAssignCache& cache = cx->realm()->plainObjectAssignCache;
+    cache.fill(&origToShape->asShared(), fromPlain->sharedShape(),
+               toPlain->sharedShape());
+  }
+
+  return true;
+}
+
+static bool TryAssignNative(JSContext* cx, HandleObject to, HandleObject from,
+                            bool* optimized) {
+  MOZ_ASSERT(*optimized == false);
+
+  if (!from->is<NativeObject>() || !to->is<NativeObject>()) {
+    return true;
+  }
+
+  NativeObject* fromNative = &from->as<NativeObject>();
+  if (fromNative->getDenseInitializedLength() > 0 || fromNative->isIndexed() ||
+      fromNative->is<TypedArrayObject>() ||
+      fromNative->getClass()->getNewEnumerate() ||
+      fromNative->getClass()->getEnumerate()) {
+    return true;
+  }
+
+
+  Rooted<PropertyInfoWithKeyVector> props(cx, PropertyInfoWithKeyVector(cx));
+
+  Rooted<NativeShape*> fromShape(cx, fromNative->shape());
+  for (ShapePropertyIter<NoGC> iter(fromShape); !iter.done(); iter++) {
+    if (MOZ_UNLIKELY(iter->key().isSymbol())) {
+      return true;
+    }
+    if (MOZ_UNLIKELY(!props.append(*iter))) {
+      return false;
+    }
+  }
+
+  *optimized = true;
+
+  RootedValue propValue(cx);
+  RootedId nextKey(cx);
+  RootedValue toReceiver(cx, ObjectValue(*to));
+
+  for (size_t i = props.length(); i > 0; i--) {
+    PropertyInfoWithKey prop = props[i - 1];
+    nextKey = prop.key();
+
+    if (MOZ_LIKELY(from->shape() == fromShape && prop.isDataProperty())) {
+      if (!prop.enumerable()) {
+        continue;
+      }
+      propValue = from->as<NativeObject>().getSlot(prop.slot());
+    } else {
+      bool enumerable;
+      if (!PropertyIsEnumerable(cx, from, nextKey, &enumerable)) {
+        return false;
+      }
+      if (!enumerable) {
+        continue;
+      }
+      if (!GetProperty(cx, from, from, nextKey, &propValue)) {
+        return false;
+      }
+    }
+
+    ObjectOpResult result;
+    if (MOZ_UNLIKELY(
+            !SetProperty(cx, to, nextKey, propValue, toReceiver, result))) {
+      return false;
+    }
+    if (MOZ_UNLIKELY(!result.checkStrict(cx, to, nextKey))) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool AssignSlow(JSContext* cx, HandleObject to, HandleObject from) {
+  RootedIdVector keys(cx);
+  if (!GetPropertyKeys(
+          cx, from, JSITER_OWNONLY | JSITER_HIDDEN | JSITER_SYMBOLS, &keys)) {
+    return false;
+  }
+
+  RootedId nextKey(cx);
+  RootedValue propValue(cx);
+  for (size_t i = 0, len = keys.length(); i < len; i++) {
+    nextKey = keys[i];
+
+    bool enumerable;
+    if (MOZ_UNLIKELY(!PropertyIsEnumerable(cx, from, nextKey, &enumerable))) {
+      return false;
+    }
+    if (!enumerable) {
+      continue;
+    }
+
+    if (MOZ_UNLIKELY(!GetProperty(cx, from, from, nextKey, &propValue))) {
+      return false;
+    }
+
+    if (MOZ_UNLIKELY(!SetProperty(cx, to, nextKey, propValue))) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+JS_PUBLIC_API bool JS_AssignObject(JSContext* cx, JS::HandleObject target,
+                                   JS::HandleObject src) {
+  bool optimized = false;
+
+  if (!TryAssignPlain(cx, target, src, &optimized)) {
+    return false;
+  }
+  if (optimized) {
+    return true;
+  }
+
+  if (!TryAssignNative(cx, target, src, &optimized)) {
+    return false;
+  }
+  if (optimized) {
+    return true;
+  }
+
+  return AssignSlow(cx, target, src);
+}
+
+static bool obj_assign(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "Object", "assign");
+  CallArgs args = CallArgsFromVp(argc, vp);
+  RootedTuple<JSObject*, JSObject*> roots(cx);
+
+  RootedField<JSObject*, 0> to(roots, ToObject(cx, args.get(0)));
+  if (!to) {
+    return false;
+  }
+
+
+  for (size_t i = 1; i < args.length(); i++) {
+    if (args[i].isNullOrUndefined()) {
+      continue;
+    }
+
+    RootedField<JSObject*, 1> from(roots, ToObject(cx, args[i]));
+    if (!from) {
+      return false;
+    }
+
+    if (!JS_AssignObject(cx, to, from)) {
+      return false;
+    }
+  }
+
+  args.rval().setObject(*to);
+  return true;
+}
+
+bool js::obj_isPrototypeOf(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (args.length() < 1 || !args[0].isObject()) {
+    args.rval().setBoolean(false);
+    return true;
+  }
+
+  RootedObject obj(cx, ToObject(cx, args.thisv()));
+  if (!obj) {
+    return false;
+  }
+
+  bool isPrototype;
+  if (!IsPrototypeOf(cx, obj, &args[0].toObject(), &isPrototype)) {
+    return false;
+  }
+  args.rval().setBoolean(isPrototype);
+  return true;
+}
+
+PlainObject* js::ObjectCreateImpl(JSContext* cx, HandleObject proto,
+                                  NewObjectKind newKind) {
+  gc::AllocKind allocKind = NewObjectGCKind();
+  return NewPlainObjectWithProto(cx, proto,
+                                 {.newKind = newKind, .allocKind = allocKind});
+}
+
+PlainObject* js::ObjectCreateWithTemplate(JSContext* cx,
+                                          Handle<PlainObject*> templateObj) {
+  RootedObject proto(cx, templateObj->staticPrototype());
+  return ObjectCreateImpl(cx, proto, GenericObject);
+}
+
+static bool ObjectDefineProperties(JSContext* cx, HandleObject obj,
+                                   HandleValue properties,
+                                   bool* failedOnWindowProxy) {
+  RootedObject props(cx, ToObject(cx, properties));
+  if (!props) {
+    return false;
+  }
+
+  RootedIdVector keys(cx);
+  if (!GetPropertyKeys(
+          cx, props, JSITER_OWNONLY | JSITER_SYMBOLS | JSITER_HIDDEN, &keys)) {
+    return false;
+  }
+
+  RootedId nextKey(cx);
+  Rooted<Maybe<PropertyDescriptor>> keyDesc(cx);
+  Rooted<PropertyDescriptor> desc(cx);
+  RootedValue descObj(cx);
+
+  Rooted<PropertyDescriptorVector> descriptors(cx,
+                                               PropertyDescriptorVector(cx));
+  RootedIdVector descriptorKeys(cx);
+
+  for (size_t i = 0, len = keys.length(); i < len; i++) {
+    nextKey = keys[i];
+
+    if (!GetOwnPropertyDescriptor(cx, props, nextKey, &keyDesc)) {
+      return false;
+    }
+
+    if (keyDesc.isSome() && keyDesc->enumerable()) {
+      if (!GetProperty(cx, props, props, nextKey, &descObj) ||
+          !ToPropertyDescriptor(cx, descObj, true, &desc) ||
+          !descriptors.append(desc) || !descriptorKeys.append(nextKey)) {
+        return false;
+      }
+    }
+  }
+
+  *failedOnWindowProxy = false;
+  for (size_t i = 0, len = descriptors.length(); i < len; i++) {
+    ObjectOpResult result;
+    if (!DefineProperty(cx, obj, descriptorKeys[i], descriptors[i], result)) {
+      return false;
+    }
+
+    if (!result.ok()) {
+      if (result.failureCode() == JSMSG_CANT_DEFINE_WINDOW_NC) {
+        *failedOnWindowProxy = true;
+      } else if (!result.checkStrict(cx, obj, descriptorKeys[i])) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+bool js::obj_create(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (!args.requireAtLeast(cx, "Object.create", 1)) {
+    return false;
+  }
+
+  if (!args[0].isObjectOrNull()) {
+    UniqueChars bytes =
+        DecompileValueGenerator(cx, JSDVG_SEARCH_STACK, args[0], nullptr);
+    if (!bytes) {
+      return false;
+    }
+
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                             JSMSG_UNEXPECTED_TYPE, bytes.get(),
+                             "not an object or null");
+    return false;
+  }
+
+  RootedObject proto(cx, args[0].toObjectOrNull());
+  Rooted<PlainObject*> obj(cx, ObjectCreateImpl(cx, proto));
+  if (!obj) {
+    return false;
+  }
+
+  if (args.hasDefined(1)) {
+    bool failedOnWindowProxy = false;
+    if (!ObjectDefineProperties(cx, obj, args[1], &failedOnWindowProxy)) {
+      return false;
+    }
+    MOZ_ASSERT(!failedOnWindowProxy, "How did we get a WindowProxy here?");
+  }
+
+  args.rval().setObject(*obj);
+  return true;
+}
+
+static bool FromPropertyDescriptorToArray(
+    JSContext* cx, Handle<Maybe<PropertyDescriptor>> desc,
+    MutableHandleValue vp) {
+  if (desc.isNothing()) {
+    vp.setUndefined();
+    return true;
+  }
+
+
+  int32_t attrsAndKind = 0;
+  if (desc->enumerable()) {
+    attrsAndKind |= ATTR_ENUMERABLE;
+  }
+  if (desc->configurable()) {
+    attrsAndKind |= ATTR_CONFIGURABLE;
+  }
+  if (!desc->isAccessorDescriptor()) {
+    if (desc->writable()) {
+      attrsAndKind |= ATTR_WRITABLE;
+    }
+    attrsAndKind |= DATA_DESCRIPTOR_KIND;
+  } else {
+    attrsAndKind |= ACCESSOR_DESCRIPTOR_KIND;
+  }
+
+  Rooted<ArrayObject*> result(cx);
+  if (!desc->isAccessorDescriptor()) {
+    result = NewDenseFullyAllocatedArray(cx, 2);
+    if (!result) {
+      return false;
+    }
+    result->setDenseInitializedLength(2);
+
+    result->initDenseElement(PROP_DESC_ATTRS_AND_KIND_INDEX,
+                             Int32Value(attrsAndKind));
+    result->initDenseElement(PROP_DESC_VALUE_INDEX, desc->value());
+  } else {
+    result = NewDenseFullyAllocatedArray(cx, 3);
+    if (!result) {
+      return false;
+    }
+    result->setDenseInitializedLength(3);
+
+    result->initDenseElement(PROP_DESC_ATTRS_AND_KIND_INDEX,
+                             Int32Value(attrsAndKind));
+
+    if (JSObject* get = desc->getter()) {
+      result->initDenseElement(PROP_DESC_GETTER_INDEX, ObjectValue(*get));
+    } else {
+      result->initDenseElement(PROP_DESC_GETTER_INDEX, UndefinedValue());
+    }
+
+    if (JSObject* set = desc->setter()) {
+      result->initDenseElement(PROP_DESC_SETTER_INDEX, ObjectValue(*set));
+    } else {
+      result->initDenseElement(PROP_DESC_SETTER_INDEX, UndefinedValue());
+    }
+  }
+
+  vp.setObject(*result);
+  return true;
+}
+
+bool js::GetOwnPropertyDescriptorToArray(JSContext* cx, unsigned argc,
+                                         Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  MOZ_ASSERT(args.length() == 2);
+
+  RootedObject obj(cx, ToObject(cx, args[0]));
+  if (!obj) {
+    return false;
+  }
+
+  RootedId id(cx);
+  if (!ToPropertyKey(cx, args[1], &id)) {
+    return false;
+  }
+
+  Rooted<Maybe<PropertyDescriptor>> desc(cx);
+  if (!GetOwnPropertyDescriptor(cx, obj, id, &desc)) {
+    return false;
+  }
+
+  return FromPropertyDescriptorToArray(cx, desc, args.rval());
+}
+
+static bool NewValuePair(JSContext* cx, HandleValue val1, HandleValue val2,
+                         MutableHandleValue rval,
+                         gc::Heap heap = gc::Heap::Default) {
+  NewObjectKind kind =
+      heap == gc::Heap::Tenured ? TenuredObject : GenericObject;
+  ArrayObject* array = NewDenseFullyAllocatedArray(cx, 2, kind);
+  if (!array) {
+    return false;
+  }
+
+  array->setDenseInitializedLength(2);
+  array->initDenseElement(0, val1);
+  array->initDenseElement(1, val2);
+
+  rval.setObject(*array);
+  return true;
+}
+
+enum class EnumerableOwnPropertiesKind { Keys, Values, KeysAndValues, Names };
+
+static bool HasEnumerableStringNonDataProperties(NativeObject* obj) {
+  if (!obj->hasEnumerableProperty()) {
+    return false;
+  }
+  for (ShapePropertyIter<NoGC> iter(obj->shape()); !iter.done(); iter++) {
+    if (!iter->isDataProperty() && iter->enumerable() &&
+        !iter->key().isSymbol()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+template <EnumerableOwnPropertiesKind kind>
+static bool TryEnumerableOwnPropertiesNative(JSContext* cx, HandleObject obj,
+                                             MutableHandleValue rval,
+                                             bool* optimized) {
+  *optimized = false;
+
+  if (!obj->is<NativeObject>() || obj->as<NativeObject>().isIndexed() ||
+      obj->getClass()->getNewEnumerate() || obj->is<StringObject>()) {
+    return true;
+  }
+
+  Handle<NativeObject*> nobj = obj.as<NativeObject>();
+
+  if (JSEnumerateOp enumerate = nobj->getClass()->getEnumerate()) {
+    if (!enumerate(cx, nobj)) {
+      return false;
+    }
+
+    if (nobj->isIndexed()) {
+      return true;
+    }
+  }
+
+  *optimized = true;
+
+  RootedValueVector properties(cx);
+  RootedValue key(cx);
+  RootedValue value(cx);
+
+  if (kind == EnumerableOwnPropertiesKind::Keys) {
+    Rooted<PropertyIteratorObject*> piter(cx,
+                                          LookupInShapeIteratorCache(cx, nobj));
+    if (piter) {
+      do {
+        NativeIterator* ni = piter->getNativeIterator();
+
+        if (ni->mayHavePrototypeProperties()) {
+          break;
+        }
+
+        IteratorProperty* properties = ni->propertiesBegin();
+        JSObject* array = NewDenseCopiedArray(cx, ni->numKeys(), properties);
+        if (!array) {
+          return false;
+        }
+
+        rval.setObject(*array);
+        return true;
+
+      } while (false);
+    }
+  }
+
+  AutoSelectGCHeap gcHeap(cx, 1);
+
+  if (nobj->getDenseInitializedLength() > 0 &&
+      !properties.reserve(nobj->getDenseInitializedLength())) {
+    return false;
+  }
+  for (uint32_t i = 0, len = nobj->getDenseInitializedLength(); i < len; i++) {
+    value.set(nobj->getDenseElement(i));
+    if (value.isMagic(JS_ELEMENTS_HOLE)) {
+      continue;
+    }
+
+    JSString* str;
+    if (kind != EnumerableOwnPropertiesKind::Values) {
+      static_assert(
+          NativeObject::MAX_DENSE_ELEMENTS_COUNT <= PropertyKey::IntMax,
+          "dense elements don't exceed PropertyKey::IntMax");
+      str = Int32ToStringWithHeap<CanGC>(cx, i, gcHeap);
+      if (!str) {
+        return false;
+      }
+    }
+
+    if (kind == EnumerableOwnPropertiesKind::Keys ||
+        kind == EnumerableOwnPropertiesKind::Names) {
+      value.setString(str);
+    } else if (kind == EnumerableOwnPropertiesKind::KeysAndValues) {
+      key.setString(str);
+      if (!NewValuePair(cx, key, value, &value, gcHeap)) {
+        return false;
+      }
+    }
+
+    if (!properties.append(value)) {
+      return false;
+    }
+  }
+
+  if (obj->is<TypedArrayObject>()) {
+    Handle<TypedArrayObject*> tobj = obj.as<TypedArrayObject>();
+    size_t len = tobj->length().valueOr(0);
+
+    if (len > NativeObject::MAX_DENSE_ELEMENTS_COUNT) {
+      ReportOversizedAllocation(cx, JSMSG_ALLOC_OVERFLOW);
+      return false;
+    }
+
+    MOZ_ASSERT(properties.empty(), "typed arrays cannot have dense elements");
+    if (!properties.resize(len)) {
+      return false;
+    }
+
+    for (uint32_t i = 0; i < len; i++) {
+      JSString* str;
+      if (kind != EnumerableOwnPropertiesKind::Values) {
+        static_assert(
+            NativeObject::MAX_DENSE_ELEMENTS_COUNT <= PropertyKey::IntMax,
+            "dense elements don't exceed PropertyKey::IntMax");
+        str = Int32ToStringWithHeap<CanGC>(cx, i, gcHeap);
+        if (!str) {
+          return false;
+        }
+      }
+
+      if (kind == EnumerableOwnPropertiesKind::Keys ||
+          kind == EnumerableOwnPropertiesKind::Names) {
+        value.setString(str);
+      } else if (kind == EnumerableOwnPropertiesKind::Values) {
+        if (!tobj->getElement<CanGC>(cx, i, &value)) {
+          return false;
+        }
+      } else {
+        key.setString(str);
+        if (!tobj->getElement<CanGC>(cx, i, &value)) {
+          return false;
+        }
+        if (!NewValuePair(cx, key, value, &value, gcHeap)) {
+          return false;
+        }
+      }
+
+      properties[i].set(value);
+    }
+  }
+
+  size_t approximatePropertyCount =
+      nobj->shape()->propMap()
+          ? nobj->shape()->propMap()->approximateEntryCount()
+          : 0;
+  if (!properties.reserve(properties.length() + approximatePropertyCount)) {
+    return false;
+  }
+
+  if (kind == EnumerableOwnPropertiesKind::Keys ||
+      kind == EnumerableOwnPropertiesKind::Names ||
+      !HasEnumerableStringNonDataProperties(nobj)) {
+
+    constexpr bool onlyEnumerable = kind != EnumerableOwnPropertiesKind::Names;
+    if (!onlyEnumerable || nobj->hasEnumerableProperty()) {
+      size_t elements = properties.length();
+      constexpr AllowGC allowGC =
+          kind != EnumerableOwnPropertiesKind::KeysAndValues ? AllowGC::NoGC
+                                                             : AllowGC::CanGC;
+      mozilla::Maybe<ShapePropertyIter<allowGC>> m;
+      if constexpr (allowGC == AllowGC::NoGC) {
+        m.emplace(nobj->shape());
+      } else {
+        m.emplace(cx, nobj->shape());
+      }
+      for (auto& iter = m.ref(); !iter.done(); iter++) {
+        jsid id = iter->key();
+        if ((onlyEnumerable && !iter->enumerable()) || id.isSymbol()) {
+          continue;
+        }
+        MOZ_ASSERT(!id.isInt(), "Unexpected indexed property");
+        MOZ_ASSERT_IF(kind == EnumerableOwnPropertiesKind::Values ||
+                          kind == EnumerableOwnPropertiesKind::KeysAndValues,
+                      iter->isDataProperty());
+
+        if constexpr (kind == EnumerableOwnPropertiesKind::Keys ||
+                      kind == EnumerableOwnPropertiesKind::Names) {
+          value.setString(id.toString());
+        } else if constexpr (kind == EnumerableOwnPropertiesKind::Values) {
+          value.set(nobj->getSlot(iter->slot()));
+        } else {
+          key.setString(id.toString());
+          value.set(nobj->getSlot(iter->slot()));
+          if (!NewValuePair(cx, key, value, &value, gcHeap)) {
+            return false;
+          }
+        }
+
+        if (!properties.append(value)) {
+          return false;
+        }
+      }
+
+      std::reverse(properties.begin() + elements, properties.end());
+    }
+  } else {
+    MOZ_ASSERT(kind == EnumerableOwnPropertiesKind::Values ||
+               kind == EnumerableOwnPropertiesKind::KeysAndValues);
+
+    Rooted<PropertyInfoWithKeyVector> props(cx, PropertyInfoWithKeyVector(cx));
+
+    Rooted<NativeShape*> objShape(cx, nobj->shape());
+    for (ShapePropertyIter<NoGC> iter(objShape); !iter.done(); iter++) {
+      if (iter->key().isSymbol()) {
+        continue;
+      }
+      MOZ_ASSERT(!iter->key().isInt(), "Unexpected indexed property");
+
+      if (!props.append(*iter)) {
+        return false;
+      }
+    }
+
+    RootedId id(cx);
+    for (size_t i = props.length(); i > 0; i--) {
+      PropertyInfoWithKey prop = props[i - 1];
+      id = prop.key();
+
+      if (obj->shape() == objShape && prop.isDataProperty()) {
+        if (!prop.enumerable()) {
+          continue;
+        }
+        value = obj->as<NativeObject>().getSlot(prop.slot());
+      } else {
+        bool enumerable;
+        if (!PropertyIsEnumerable(cx, obj, id, &enumerable)) {
+          return false;
+        }
+        if (!enumerable) {
+          continue;
+        }
+        if (!GetProperty(cx, obj, obj, id, &value)) {
+          return false;
+        }
+      }
+
+      if (kind == EnumerableOwnPropertiesKind::KeysAndValues) {
+        key.setString(id.toString());
+        if (!NewValuePair(cx, key, value, &value, gcHeap)) {
+          return false;
+        }
+      }
+
+      if (!properties.append(value)) {
+        return false;
+      }
+    }
+  }
+
+  JSObject* array =
+      NewDenseCopiedArray(cx, properties.length(), properties.begin());
+  if (!array) {
+    return false;
+  }
+
+  rval.setObject(*array);
+  return true;
+}
+
+template <EnumerableOwnPropertiesKind kind>
+static bool EnumerableOwnProperties(JSContext* cx, const JS::CallArgs& args) {
+  static_assert(kind == EnumerableOwnPropertiesKind::Values ||
+                    kind == EnumerableOwnPropertiesKind::KeysAndValues,
+                "Only implemented for Object.keys and Object.entries");
+
+  RootedObject obj(cx, ToObject(cx, args.get(0)));
+  if (!obj) {
+    return false;
+  }
+
+  bool optimized;
+  if (!TryEnumerableOwnPropertiesNative<kind>(cx, obj, args.rval(),
+                                              &optimized)) {
+    return false;
+  }
+  if (optimized) {
+    return true;
+  }
+
+  MOZ_ASSERT(!obj->is<TypedArrayObject>());
+
+  RootedIdVector ids(cx);
+  if (!GetPropertyKeys(cx, obj, JSITER_OWNONLY | JSITER_HIDDEN, &ids)) {
+    return false;
+  }
+
+  RootedValueVector properties(cx);
+  size_t len = ids.length();
+  if (!properties.resize(len)) {
+    return false;
+  }
+
+  RootedId id(cx);
+  RootedValue key(cx);
+  RootedValue value(cx);
+  Rooted<Shape*> shape(cx);
+  Rooted<Maybe<PropertyDescriptor>> desc(cx);
+  size_t out = 0;
+  for (size_t i = 0; i < len; i++) {
+    id = ids[i];
+
+    MOZ_ASSERT(!id.isSymbol());
+
+    if (kind != EnumerableOwnPropertiesKind::Values) {
+      if (!IdToStringOrSymbol(cx, id, &key)) {
+        return false;
+      }
+    }
+
+    if (obj->is<NativeObject>()) {
+      Handle<NativeObject*> nobj = obj.as<NativeObject>();
+      if (id.isInt() && nobj->containsDenseElement(id.toInt())) {
+        value.set(nobj->getDenseElement(id.toInt()));
+      } else {
+        Maybe<PropertyInfo> prop = nobj->lookup(cx, id);
+        if (prop.isNothing() || !prop->enumerable()) {
+          continue;
+        }
+        if (prop->isDataProperty()) {
+          value = nobj->getSlot(prop->slot());
+        } else if (!GetProperty(cx, obj, obj, id, &value)) {
+          return false;
+        }
+      }
+    } else {
+      if (!GetOwnPropertyDescriptor(cx, obj, id, &desc)) {
+        return false;
+      }
+
+      if (desc.isNothing() || !desc->enumerable()) {
+        continue;
+      }
+
+
+      if (!GetProperty(cx, obj, obj, id, &value)) {
+        return false;
+      }
+    }
+
+    if (kind == EnumerableOwnPropertiesKind::Values) {
+      properties[out++].set(value);
+    } else if (!NewValuePair(cx, key, value, properties[out++])) {
+      return false;
+    }
+  }
+
+
+  JSObject* aobj = NewDenseCopiedArray(cx, out, properties.begin());
+  if (!aobj) {
+    return false;
+  }
+
+  args.rval().setObject(*aobj);
+  return true;
+}
+
+bool js::obj_keys(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "Object", "keys");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedObject obj(cx, ToObject(cx, args.get(0)));
+  if (!obj) {
+    return false;
+  }
+
+  bool optimized;
+  static constexpr EnumerableOwnPropertiesKind kind =
+      EnumerableOwnPropertiesKind::Keys;
+  if (!TryEnumerableOwnPropertiesNative<kind>(cx, obj, args.rval(),
+                                              &optimized)) {
+    return false;
+  }
+  if (optimized) {
+    return true;
+  }
+
+  return GetOwnPropertyKeys(cx, obj, JSITER_OWNONLY, args.rval());
+}
+
+static bool obj_values(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "Object", "values");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  return EnumerableOwnProperties<EnumerableOwnPropertiesKind::Values>(cx, args);
+}
+
+static bool obj_entries(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "Object", "entries");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  return EnumerableOwnProperties<EnumerableOwnPropertiesKind::KeysAndValues>(
+      cx, args);
+}
+
+bool js::obj_is(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  bool same;
+  if (!SameValue(cx, args.get(0), args.get(1), &same)) {
+    return false;
+  }
+
+  args.rval().setBoolean(same);
+  return true;
+}
+
+bool js::IdToStringOrSymbol(JSContext* cx, HandleId id,
+                            MutableHandleValue result) {
+  if (id.isInt()) {
+    JSString* str = Int32ToString<CanGC>(cx, id.toInt());
+    if (!str) {
+      return false;
+    }
+    result.setString(str);
+  } else if (id.isAtom()) {
+    result.setString(id.toAtom());
+  } else {
+    result.setSymbol(id.toSymbol());
+  }
+  return true;
+}
+
+bool js::GetOwnPropertyKeys(JSContext* cx, HandleObject obj, unsigned flags,
+                            MutableHandleValue rval) {
+
+  RootedIdVector keys(cx);
+  if (!GetPropertyKeys(cx, obj, flags, &keys)) {
+    return false;
+  }
+
+  Rooted<ArrayObject*> array(cx,
+                             NewDenseFullyAllocatedArray(cx, keys.length()));
+  if (!array) {
+    return false;
+  }
+
+  array->ensureDenseInitializedLength(0, keys.length());
+
+  RootedValue val(cx);
+  for (size_t i = 0, len = keys.length(); i < len; i++) {
+    MOZ_ASSERT_IF(keys[i].isSymbol(), flags & JSITER_SYMBOLS);
+    MOZ_ASSERT_IF(!keys[i].isSymbol(), !(flags & JSITER_SYMBOLSONLY));
+    if (!IdToStringOrSymbol(cx, keys[i], &val)) {
+      return false;
+    }
+    array->initDenseElement(i, val);
+  }
+
+  rval.setObject(*array);
+  return true;
+}
+
+static bool obj_getOwnPropertyNames(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "Object", "getOwnPropertyNames");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedObject obj(cx, ToObject(cx, args.get(0)));
+  if (!obj) {
+    return false;
+  }
+
+  bool optimized;
+  static constexpr EnumerableOwnPropertiesKind kind =
+      EnumerableOwnPropertiesKind::Names;
+  if (!TryEnumerableOwnPropertiesNative<kind>(cx, obj, args.rval(),
+                                              &optimized)) {
+    return false;
+  }
+  if (optimized) {
+    return true;
+  }
+
+  return GetOwnPropertyKeys(cx, obj, JSITER_OWNONLY | JSITER_HIDDEN,
+                            args.rval());
+}
+
+static bool obj_getOwnPropertySymbols(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "Object", "getOwnPropertySymbols");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedObject obj(cx, ToObject(cx, args.get(0)));
+  if (!obj) {
+    return false;
+  }
+
+  return GetOwnPropertyKeys(
+      cx, obj,
+      JSITER_OWNONLY | JSITER_HIDDEN | JSITER_SYMBOLS | JSITER_SYMBOLSONLY,
+      args.rval());
+}
+
+static bool obj_defineProperties(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "Object", "defineProperties");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedObject obj(cx);
+  if (!GetFirstArgumentAsObject(cx, args, "Object.defineProperties", &obj)) {
+    return false;
+  }
+
+  if (!args.requireAtLeast(cx, "Object.defineProperties", 2)) {
+    return false;
+  }
+
+  bool failedOnWindowProxy = false;
+  if (!ObjectDefineProperties(cx, obj, args[1], &failedOnWindowProxy)) {
+    return false;
+  }
+
+  if (failedOnWindowProxy) {
+    args.rval().setNull();
+  } else {
+    args.rval().setObject(*obj);
+  }
+  return true;
+}
+
+static bool obj_preventExtensions(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  args.rval().set(args.get(0));
+
+  if (!args.get(0).isObject()) {
+    return true;
+  }
+
+  RootedObject obj(cx, &args.get(0).toObject());
+  return PreventExtensions(cx, obj);
+}
+
+static bool obj_freeze(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  args.rval().set(args.get(0));
+
+  if (!args.get(0).isObject()) {
+    return true;
+  }
+
+  RootedObject obj(cx, &args.get(0).toObject());
+  return SetIntegrityLevel(cx, obj, IntegrityLevel::Frozen);
+}
+
+static bool obj_isFrozen(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  bool frozen = true;
+
+  if (args.get(0).isObject()) {
+    RootedObject obj(cx, &args.get(0).toObject());
+    if (!TestIntegrityLevel(cx, obj, IntegrityLevel::Frozen, &frozen)) {
+      return false;
+    }
+  }
+  args.rval().setBoolean(frozen);
+  return true;
+}
+
+static bool obj_seal(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  args.rval().set(args.get(0));
+
+  if (!args.get(0).isObject()) {
+    return true;
+  }
+
+  RootedObject obj(cx, &args.get(0).toObject());
+  return SetIntegrityLevel(cx, obj, IntegrityLevel::Sealed);
+}
+
+static bool obj_isSealed(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  bool sealed = true;
+
+  if (args.get(0).isObject()) {
+    RootedObject obj(cx, &args.get(0).toObject());
+    if (!TestIntegrityLevel(cx, obj, IntegrityLevel::Sealed, &sealed)) {
+      return false;
+    }
+  }
+  args.rval().setBoolean(sealed);
+  return true;
+}
+
+bool js::obj_setProto(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  MOZ_ASSERT(args.length() == 1);
+
+  HandleValue thisv = args.thisv();
+  if (thisv.isNullOrUndefined()) {
+    ReportIncompatible(cx, args);
+    return false;
+  }
+  if (thisv.isPrimitive()) {
+    args.rval().setUndefined();
+    return true;
+  }
+
+  if (!args[0].isObjectOrNull()) {
+    args.rval().setUndefined();
+    return true;
+  }
+
+  Rooted<JSObject*> obj(cx, &args.thisv().toObject());
+  Rooted<JSObject*> newProto(cx, args[0].toObjectOrNull());
+  if (!SetPrototype(cx, obj, newProto)) {
+    return false;
+  }
+
+  args.rval().setUndefined();
+  return true;
+}
+
+static const JSFunctionSpec object_methods[] = {
+    JS_FN("toSource", obj_toSource, 0, 0),
+    JS_INLINABLE_FN("toString", obj_toString, 0, 0, ObjectToString),
+    JS_SELF_HOSTED_FN("toLocaleString", "Object_toLocaleString", 0, 0),
+    JS_SELF_HOSTED_FN("valueOf", "Object_valueOf", 0, 0),
+    JS_SELF_HOSTED_FN("hasOwnProperty", "Object_hasOwnProperty", 1, 0),
+    JS_INLINABLE_FN("isPrototypeOf", obj_isPrototypeOf, 1, 0,
+                    ObjectIsPrototypeOf),
+    JS_FN("propertyIsEnumerable", obj_propertyIsEnumerable, 1, 0),
+    JS_SELF_HOSTED_FN("__defineGetter__", "ObjectDefineGetter", 2, 0),
+    JS_SELF_HOSTED_FN("__defineSetter__", "ObjectDefineSetter", 2, 0),
+    JS_SELF_HOSTED_FN("__lookupGetter__", "ObjectLookupGetter", 1, 0),
+    JS_SELF_HOSTED_FN("__lookupSetter__", "ObjectLookupSetter", 1, 0),
+    JS_FS_END,
+};
+
+static const JSPropertySpec object_properties[] = {
+    JS_SELF_HOSTED_GETSET("__proto__", "$ObjectProtoGetter",
+                          "$ObjectProtoSetter", 0),
+    JS_PS_END,
+};
+
+static const JSFunctionSpec object_static_methods[] = {
+    JS_FN("assign", obj_assign, 2, 0),
+    JS_SELF_HOSTED_FN("getPrototypeOf", "ObjectGetPrototypeOf", 1, 0),
+    JS_FN("setPrototypeOf", obj_setPrototypeOf, 2, 0),
+    JS_SELF_HOSTED_FN("getOwnPropertyDescriptor",
+                      "ObjectGetOwnPropertyDescriptor", 2, 0),
+    JS_SELF_HOSTED_FN("getOwnPropertyDescriptors",
+                      "ObjectGetOwnPropertyDescriptors", 1, 0),
+    JS_INLINABLE_FN("keys", obj_keys, 1, 0, ObjectKeys),
+    JS_FN("values", obj_values, 1, 0),
+    JS_FN("entries", obj_entries, 1, 0),
+    JS_INLINABLE_FN("is", obj_is, 2, 0, ObjectIs),
+    JS_SELF_HOSTED_FN("defineProperty", "ObjectDefineProperty", 3, 0),
+    JS_FN("defineProperties", obj_defineProperties, 2, 0),
+    JS_INLINABLE_FN("create", obj_create, 2, 0, ObjectCreate),
+    JS_FN("getOwnPropertyNames", obj_getOwnPropertyNames, 1, 0),
+    JS_FN("getOwnPropertySymbols", obj_getOwnPropertySymbols, 1, 0),
+    JS_SELF_HOSTED_FN("isExtensible", "ObjectIsExtensible", 1, 0),
+    JS_FN("preventExtensions", obj_preventExtensions, 1, 0),
+    JS_FN("freeze", obj_freeze, 1, 0),
+    JS_FN("isFrozen", obj_isFrozen, 1, 0),
+    JS_FN("seal", obj_seal, 1, 0),
+    JS_FN("isSealed", obj_isSealed, 1, 0),
+    JS_SELF_HOSTED_FN("fromEntries", "ObjectFromEntries", 1, 0),
+    JS_SELF_HOSTED_FN("hasOwn", "ObjectHasOwn", 2, 0),
+    JS_SELF_HOSTED_FN("groupBy", "ObjectGroupBy", 2, 0),
+    JS_FS_END,
+};
+
+static JSObject* CreateObjectConstructor(JSContext* cx, JSProtoKey key) {
+  Rooted<GlobalObject*> self(cx, cx->global());
+  if (!GlobalObject::ensureConstructor(cx, self, JSProto_Function)) {
+    return nullptr;
+  }
+
+  JSFunction* fun = NewNativeConstructor(
+      cx, obj_construct, 1, Handle<PropertyName*>(cx->names().Object),
+      gc::AllocKind::FUNCTION, TenuredObject);
+  if (!fun) {
+    return nullptr;
+  }
+
+  fun->setJitInfo(&jit::JitInfo_Object);
+  return fun;
+}
+
+static JSObject* CreateObjectPrototype(JSContext* cx, JSProtoKey key) {
+  MOZ_ASSERT(!cx->zone()->isAtomsZone());
+  MOZ_ASSERT(cx->global()->is<NativeObject>());
+
+  Rooted<PlainObject*> objectProto(
+      cx, NewPlainObjectWithProto(cx, nullptr, {.newKind = TenuredObject}));
+  if (!objectProto) {
+    return nullptr;
+  }
+
+  bool succeeded;
+  if (!SetImmutablePrototype(cx, objectProto, &succeeded)) {
+    return nullptr;
+  }
+  MOZ_ASSERT(succeeded,
+             "should have been able to make a fresh Object.prototype's "
+             "[[Prototype]] immutable");
+
+  return objectProto;
+}
+
+static bool FinishObjectClassInit(JSContext* cx, JS::HandleObject ctor,
+                                  JS::HandleObject proto) {
+  Rooted<GlobalObject*> global(cx, cx->global());
+
+  RootedId evalId(cx, NameToId(cx->names().eval));
+  JSFunction* evalobj =
+      DefineFunction(cx, global, evalId, IndirectEval, 1, JSPROP_RESOLVING);
+  if (!evalobj) {
+    return false;
+  }
+  global->setOriginalEval(evalobj);
+
+  MOZ_ASSERT(global->staticPrototype() == nullptr);
+  MOZ_ASSERT(!global->staticPrototypeIsImmutable());
+  return SetPrototype(cx, global, proto);
+}
+
+static const ClassSpec PlainObjectClassSpec = {
+    CreateObjectConstructor, CreateObjectPrototype,
+    object_static_methods,   nullptr,
+    object_methods,          object_properties,
+    FinishObjectClassInit,
+};
+
+const JSClass PlainObject::class_ = {
+    "Object",
+    JSCLASS_HAS_CACHED_PROTO(JSProto_Object),
+    JS_NULL_CLASS_OPS,
+    &PlainObjectClassSpec,
+};
+
+const JSClass* const js::ObjectClassPtr = &PlainObject::class_;

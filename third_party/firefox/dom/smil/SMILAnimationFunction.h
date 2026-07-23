@@ -1,0 +1,242 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SMIL_SMILANIMATIONFUNCTION_H_
+#define DOM_SMIL_SMILANIMATIONFUNCTION_H_
+
+#include "mozilla/SMILAttr.h"
+#include "mozilla/SMILKeySpline.h"
+#include "mozilla/SMILTargetIdentifier.h"
+#include "mozilla/SMILTimeValue.h"
+#include "mozilla/SMILTypes.h"
+#include "mozilla/SMILValue.h"
+#include "nsAttrValue.h"
+#include "nsContentUtils.h"
+#include "nsGkAtoms.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+namespace dom {
+class SVGAnimationElement;
+}  
+
+class SMILAnimationFunction {
+ public:
+  SMILAnimationFunction() = default;
+
+  void SetAnimationElement(dom::SVGAnimationElement* aAnimationElement);
+
+  bool HasSameAnimationElement(const SMILAnimationFunction* aOther) const {
+    return aOther && aOther->mAnimationElement == mAnimationElement;
+  };
+
+  virtual bool SetAttr(nsAtom* aAttribute, const nsAString& aValue,
+                       nsAttrValue& aResult, nsresult* aParseResult = nullptr);
+
+  virtual bool UnsetAttr(nsAtom* aAttribute);
+
+  void SampleAt(SMILTime aSampleTime, const SMILTimeValue& aSimpleDuration,
+                uint32_t aRepeatIteration);
+
+  void SampleLastValue(uint32_t aRepeatIteration);
+
+  void Activate(SMILTime aBeginTime);
+
+  void Inactivate(bool aIsFrozen);
+
+  void ComposeResult(const SMILAttr& aSMILAttr, SMILValue& aResult);
+
+  int32_t CompareTo(const SMILAnimationFunction* aOther,
+                    nsContentUtils::NodeIndexCache& aCache) const;
+
+
+  bool IsActiveOrFrozen() const {
+    return mIsActive || mIsFrozen;
+  }
+
+  bool IsActive() const { return mIsActive; }
+
+  virtual bool WillReplace() const;
+
+  bool HasChanged() const;
+
+  void ClearHasChanged() {
+    MOZ_ASSERT(HasChanged(),
+               "clearing mHasChanged flag, when it's already false");
+    MOZ_ASSERT(!IsActiveOrFrozen(),
+               "clearing mHasChanged flag for active animation");
+    mHasChanged = false;
+  }
+
+  bool UpdateCachedTarget(const SMILTargetIdentifier& aNewTarget);
+
+  bool WasSkippedInPrevSample() const { return mWasSkippedInPrevSample; }
+
+  void SetWasSkipped() { mWasSkippedInPrevSample = true; }
+
+  class MOZ_STACK_CLASS Comparator final {
+   public:
+    bool Equals(const SMILAnimationFunction* aElem1,
+                const SMILAnimationFunction* aElem2) const {
+      return aElem1->CompareTo(aElem2, mCache) == 0;
+    }
+    bool LessThan(const SMILAnimationFunction* aElem1,
+                  const SMILAnimationFunction* aElem2) const {
+      return aElem1->CompareTo(aElem2, mCache) < 0;
+    }
+
+   private:
+    mutable nsContentUtils::NodeIndexCache mCache;
+  };
+
+ protected:
+  using SMILValueArray = FallibleTArray<SMILValue>;
+
+  enum class SMILCalcMode : uint8_t { Linear, Discrete, Paced, Spline };
+
+  SMILTime GetBeginTime() const { return mBeginTime; }
+
+  bool GetAccumulate() const;
+  bool GetAdditive() const;
+  virtual SMILCalcMode GetCalcMode() const;
+
+  nsresult SetAccumulate(const nsAString& aAccumulate, nsAttrValue& aResult);
+  nsresult SetAdditive(const nsAString& aAdditive, nsAttrValue& aResult);
+  nsresult SetCalcMode(const nsAString& aCalcMode, nsAttrValue& aResult);
+  nsresult SetKeyTimes(const nsAString& aKeyTimes, nsAttrValue& aResult);
+  nsresult SetKeySplines(const nsAString& aKeySplines, nsAttrValue& aResult);
+
+  void UnsetAccumulate();
+  void UnsetAdditive();
+  void UnsetCalcMode();
+  void UnsetKeyTimes();
+  void UnsetKeySplines();
+
+  virtual bool IsDisallowedAttribute(const nsAtom* aAttribute) const {
+    return false;
+  }
+  virtual nsresult InterpolateResult(const SMILValueArray& aValues,
+                                     SMILValue& aResult, SMILValue& aBaseValue);
+  nsresult AccumulateResult(const SMILValueArray& aValues, SMILValue& aResult);
+
+  nsresult ComputePacedPosition(const SMILValueArray& aValues,
+                                double aSimpleProgress,
+                                double& aIntervalProgress,
+                                const SMILValue*& aFrom, const SMILValue*& aTo);
+  double ComputePacedTotalDistance(const SMILValueArray& aValues) const;
+
+  double ScaleSimpleProgress(double aProgress, SMILCalcMode aCalcMode,
+                             double aValueMultiplier);
+  double ScaleIntervalProgress(double aProgress, uint32_t aIntervalIndex);
+
+  bool HasAttr(nsAtom* aAttName) const;
+  const nsAttrValue* GetAttr(nsAtom* aAttName) const;
+  bool GetAttr(nsAtom* aAttName, nsAString& aResult) const;
+
+  bool ParseAttr(nsAtom* aAttName, const SMILAttr& aSMILAttr,
+                 SMILValue& aResult, bool& aPreventCachingOfSandwich) const;
+
+  virtual nsresult GetValues(const SMILAttr& aSMILAttr,
+                             SMILValueArray& aResult);
+
+  virtual void CheckValueListDependentAttrs(uint32_t aNumValues);
+  void CheckKeyTimes(uint32_t aNumValues);
+  void CheckKeySplines(uint32_t aNumValues);
+
+  virtual bool IsToAnimation() const {
+    return !HasAttr(nsGkAtoms::values) && HasAttr(nsGkAtoms::to) &&
+           !HasAttr(nsGkAtoms::from);
+  }
+
+  virtual bool IsValueFixedForSimpleDuration() const;
+
+  inline bool IsAdditive() const {
+    bool isByAnimation = (!HasAttr(nsGkAtoms::values) &&
+                          HasAttr(nsGkAtoms::by) && !HasAttr(nsGkAtoms::from));
+    return !IsToAnimation() && (GetAdditive() || isByAnimation);
+  }
+
+  enum class ErrorFlag : uint8_t {
+    Accumulate,
+    Additive,
+    CalcMode,
+    KeyTimes,
+    KeySplines,
+    KeyPoints  
+  };
+  using ErrorFlags = EnumSet<ErrorFlag>;
+
+  inline void SetAccumulateErrorFlag(bool aNewValue) {
+    SetErrorFlag(ErrorFlag::Accumulate, aNewValue);
+  }
+  inline void SetAdditiveErrorFlag(bool aNewValue) {
+    SetErrorFlag(ErrorFlag::Additive, aNewValue);
+  }
+  inline void SetCalcModeErrorFlag(bool aNewValue) {
+    SetErrorFlag(ErrorFlag::CalcMode, aNewValue);
+  }
+  inline void SetKeyTimesErrorFlag(bool aNewValue) {
+    SetErrorFlag(ErrorFlag::KeyTimes, aNewValue);
+  }
+  inline void SetKeySplinesErrorFlag(bool aNewValue) {
+    SetErrorFlag(ErrorFlag::KeySplines, aNewValue);
+  }
+  inline void SetKeyPointsErrorFlag(bool aNewValue) {
+    SetErrorFlag(ErrorFlag::KeyPoints, aNewValue);
+  }
+  inline void SetErrorFlag(ErrorFlag aField, bool aValue) {
+    if (aValue) {
+      mErrorFlags += aField;
+    } else {
+      mErrorFlags -= aField;
+    }
+  }
+
+
+  static constexpr nsAttrValue::EnumTableEntry sAdditiveTable[] = {
+      {"replace", false},
+      {"sum", true},
+  };
+
+  static constexpr nsAttrValue::EnumTableEntry sAccumulateTable[] = {
+      {"none", false},
+      {"sum", true},
+  };
+
+  static constexpr nsAttrValue::EnumTableEntry sCalcModeTable[] = {
+      {"linear", SMILCalcMode::Linear},
+      {"discrete", SMILCalcMode::Discrete},
+      {"paced", SMILCalcMode::Paced},
+      {"spline", SMILCalcMode::Spline},
+  };
+
+  FallibleTArray<double> mKeyTimes;
+  FallibleTArray<SMILKeySpline> mKeySplines;
+
+  SMILTime mSampleTime = -1;  
+  SMILTimeValue mSimpleDuration;
+
+  SMILTime mBeginTime = std::numeric_limits<SMILTime>::min();  
+
+  dom::SVGAnimationElement* mAnimationElement = nullptr;
+
+  SMILWeakTargetIdentifier mLastTarget;
+
+  uint32_t mRepeatIteration = 0;
+
+  ErrorFlags mErrorFlags;
+
+  bool mIsActive : 1 = false;
+  bool mIsFrozen : 1 = false;
+  bool mLastValue : 1 = false;
+  bool mHasChanged : 1 = true;
+  bool mValueNeedsReparsingEverySample : 1 = false;
+  bool mPrevSampleWasSingleValueAnimation : 1 = false;
+  bool mWasSkippedInPrevSample : 1 = false;
+};
+
+}  
+
+#endif  // DOM_SMIL_SMILANIMATIONFUNCTION_H_

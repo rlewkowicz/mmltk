@@ -1,0 +1,451 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ *****************************************************************************
+ * Copyright (C) 1996-2015, International Business Machines Corporation and
+ * others. All Rights Reserved.
+ *****************************************************************************
+ */
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_NORMALIZATION
+
+#include "unicode/caniter.h"
+#include "unicode/normalizer2.h"
+#include "unicode/uchar.h"
+#include "unicode/uniset.h"
+#include "unicode/usetiter.h"
+#include "unicode/ustring.h"
+#include "unicode/utf16.h"
+#include "cmemory.h"
+#include "hash.h"
+#include "normalizer2impl.h"
+
+
+
+U_NAMESPACE_BEGIN
+
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(CanonicalIterator)
+
+
+CanonicalIterator::CanonicalIterator(const UnicodeString &sourceStr, UErrorCode &status) :
+    pieces(nullptr),
+    pieces_length(0),
+    pieces_lengths(nullptr),
+    current(nullptr),
+    current_length(0),
+    nfd(Normalizer2::getNFDInstance(status)),
+    nfcImpl(Normalizer2Factory::getNFCImpl(status))
+{
+    if(U_SUCCESS(status) && nfcImpl->ensureCanonIterData(status)) {
+      setSource(sourceStr, status);
+    }
+}
+
+CanonicalIterator::~CanonicalIterator() {
+  cleanPieces();
+}
+
+void CanonicalIterator::cleanPieces() {
+    int32_t i = 0;
+    if(pieces != nullptr) {
+        for(i = 0; i < pieces_length; i++) {
+            if(pieces[i] != nullptr) {
+                delete[] pieces[i];
+            }
+        }
+        uprv_free(pieces);
+        pieces = nullptr;
+        pieces_length = 0;
+    }
+    if(pieces_lengths != nullptr) {
+        uprv_free(pieces_lengths);
+        pieces_lengths = nullptr;
+    }
+    if(current != nullptr) {
+        uprv_free(current);
+        current = nullptr;
+        current_length = 0;
+    }
+}
+
+UnicodeString CanonicalIterator::getSource() {
+  return source;
+}
+
+void CanonicalIterator::reset() {
+    done = false;
+    for (int i = 0; i < current_length; ++i) {
+        current[i] = 0;
+    }
+}
+
+UnicodeString CanonicalIterator::next() {
+    int32_t i = 0;
+
+    if (done) {
+      buffer.setToBogus();
+      return buffer;
+    }
+
+    buffer.remove();
+
+
+    for (i = 0; i < pieces_length; ++i) {
+        buffer.append(pieces[i][current[i]]);
+    }
+
+
+    for (i = current_length - 1; ; --i) {
+        if (i < 0) {
+            done = true;
+            break;
+        }
+        current[i]++;
+        if (current[i] < pieces_lengths[i]) break; 
+        current[i] = 0;
+    }
+    return buffer;
+}
+
+void CanonicalIterator::setSource(const UnicodeString &newSource, UErrorCode &status) {
+    int32_t list_length = 0;
+    UChar32 cp = 0;
+    int32_t start = 0;
+    int32_t i = 0;
+    UnicodeString *list = nullptr;
+
+    nfd->normalize(newSource, source, status);
+    if(U_FAILURE(status)) {
+      return;
+    }
+    done = false;
+
+    cleanPieces();
+
+    if (newSource.length() == 0) {
+        pieces = static_cast<UnicodeString**>(uprv_malloc(sizeof(UnicodeString*)));
+        pieces_lengths = static_cast<int32_t*>(uprv_malloc(1 * sizeof(int32_t)));
+        pieces_length = 1;
+        current = static_cast<int32_t*>(uprv_malloc(1 * sizeof(int32_t)));
+        current_length = 1;
+        if (pieces == nullptr || pieces_lengths == nullptr || current == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            goto CleanPartialInitialization;
+        }
+        current[0] = 0;
+        pieces[0] = new UnicodeString[1];
+        pieces_lengths[0] = 1;
+        if (pieces[0] == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            goto CleanPartialInitialization;
+        }
+        return;
+    }
+
+
+    list = new UnicodeString[source.length()];
+    if (list == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        goto CleanPartialInitialization;
+    }
+
+    i = U16_LENGTH(source.char32At(0));
+    for (; i < source.length(); i += U16_LENGTH(cp)) {
+        cp = source.char32At(i);
+        if (nfcImpl->isCanonSegmentStarter(cp)) {
+            source.extract(start, i-start, list[list_length++]); 
+            start = i;
+        }
+    }
+    source.extract(start, i-start, list[list_length++]); 
+
+
+    pieces = static_cast<UnicodeString**>(uprv_malloc(list_length * sizeof(UnicodeString*)));
+    pieces_length = list_length;
+    pieces_lengths = static_cast<int32_t*>(uprv_malloc(list_length * sizeof(int32_t)));
+    current = static_cast<int32_t*>(uprv_malloc(list_length * sizeof(int32_t)));
+    current_length = list_length;
+    if (pieces == nullptr || pieces_lengths == nullptr || current == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        goto CleanPartialInitialization;
+    }
+
+    for (i = 0; i < current_length; i++) {
+        current[i] = 0;
+    }
+    for (i = 0; i < pieces_length; ++i) {
+        pieces[i] = getEquivalents(list[i], pieces_lengths[i], status);
+    }
+
+    delete[] list;
+    return;
+CleanPartialInitialization:
+    delete[] list;
+    cleanPieces();
+}
+
+void U_EXPORT2 CanonicalIterator::permute(UnicodeString &source, UBool skipZeros, Hashtable *result, UErrorCode &status, int32_t depth) {
+    if(U_FAILURE(status)) {
+        return;
+    }
+    constexpr int32_t kPermuteDepthLimit = 8;
+    if (depth > kPermuteDepthLimit) {
+        status = U_UNSUPPORTED_ERROR;
+        return;
+    }
+    int32_t i = 0;
+
+    if (source.length() <= 2 && source.countChar32() <= 1) {
+        UnicodeString *toPut = new UnicodeString(source);
+        if (toPut == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return;
+        }
+        result->put(source, toPut, status);
+        return;
+    }
+
+    UChar32 cp;
+    Hashtable subpermute(status);
+    if(U_FAILURE(status)) {
+        return;
+    }
+    subpermute.setValueDeleter(uprv_deleteUObject);
+
+    for (i = 0; i < source.length(); i += U16_LENGTH(cp)) {
+        cp = source.char32At(i);
+        const UHashElement *ne = nullptr;
+        int32_t el = UHASH_FIRST;
+        UnicodeString subPermuteString = source;
+
+        if (skipZeros && i != 0 && u_getCombiningClass(cp) == 0) {
+            continue;
+        }
+
+        subpermute.removeAll();
+
+        permute(subPermuteString.remove(i, U16_LENGTH(cp)), skipZeros, &subpermute, status, depth+1);
+        if(U_FAILURE(status)) {
+            return;
+        }
+
+        ne = subpermute.nextElement(el);
+        while (ne != nullptr) {
+            UnicodeString* permRes = static_cast<UnicodeString*>(ne->value.pointer);
+            UnicodeString *chStr = new UnicodeString(cp);
+            if (chStr == nullptr) {
+                status = U_MEMORY_ALLOCATION_ERROR;
+                return;
+            }
+            chStr->append(*permRes); 
+            result->put(*chStr, chStr, status);
+            ne = subpermute.nextElement(el);
+        }
+    }
+}
+
+
+UnicodeString* CanonicalIterator::getEquivalents(const UnicodeString &segment, int32_t &result_len, UErrorCode &status) {
+    Hashtable result(status);
+    Hashtable permutations(status);
+    Hashtable basic(status);
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    result.setValueDeleter(uprv_deleteUObject);
+    permutations.setValueDeleter(uprv_deleteUObject);
+    basic.setValueDeleter(uprv_deleteUObject);
+
+    char16_t USeg[256];
+    int32_t segLen = segment.extract(USeg, 256, status);
+    getEquivalents2(&basic, USeg, segLen, status);
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+
+    const UHashElement *ne = nullptr;
+    int32_t el = UHASH_FIRST;
+    ne = basic.nextElement(el);
+    while (ne != nullptr) {
+        UnicodeString item = *static_cast<UnicodeString*>(ne->value.pointer);
+
+        permutations.removeAll();
+        permute(item, CANITER_SKIP_ZEROES, &permutations, status);
+        const UHashElement *ne2 = nullptr;
+        int32_t el2 = UHASH_FIRST;
+        ne2 = permutations.nextElement(el2);
+        while (ne2 != nullptr) {
+            UnicodeString possible(*static_cast<UnicodeString*>(ne2->value.pointer));
+            UnicodeString attempt;
+            nfd->normalize(possible, attempt, status);
+
+            if (attempt==segment) {
+                result.put(possible, new UnicodeString(possible), status); 
+            } else {
+            }
+
+            ne2 = permutations.nextElement(el2);
+        }
+        ne = basic.nextElement(el);
+    }
+
+    if(U_FAILURE(status)) {
+        return nullptr;
+    }
+    UnicodeString *finalResult = nullptr;
+    int32_t resultCount;
+    if((resultCount = result.count()) != 0) {
+        finalResult = new UnicodeString[resultCount];
+        if (finalResult == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return nullptr;
+        }
+    }
+    else {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return nullptr;
+    }
+    result_len = 0;
+    el = UHASH_FIRST;
+    ne = result.nextElement(el);
+    while(ne != nullptr) {
+        finalResult[result_len++] = *static_cast<UnicodeString*>(ne->value.pointer);
+        ne = result.nextElement(el);
+    }
+
+
+    return finalResult;
+}
+
+Hashtable *CanonicalIterator::getEquivalents2(Hashtable *fillinResult, const char16_t *segment, int32_t segLen, UErrorCode &status) {
+
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+
+    UnicodeString toPut(segment, segLen);
+
+    fillinResult->put(toPut, new UnicodeString(toPut), status);
+
+    UnicodeSet starts;
+
+    UChar32 cp;
+    for (int32_t i = 0; i < segLen; i += U16_LENGTH(cp)) {
+        U16_GET(segment, 0, i, segLen, cp);
+        if (!nfcImpl->getCanonStartSet(cp, starts)) {
+            continue;
+        }
+        UnicodeSetIterator iter(starts);
+        while (iter.next()) {
+            UChar32 cp2 = iter.getCodepoint();
+            Hashtable remainder(status);
+            remainder.setValueDeleter(uprv_deleteUObject);
+            if (extract(&remainder, cp2, segment, segLen, i, status) == nullptr) {
+                if (U_FAILURE(status)) {
+                    return nullptr;
+                }
+                continue;
+            }
+
+            UnicodeString prefix(segment, i);
+            prefix += cp2;
+
+            int32_t el = UHASH_FIRST;
+            const UHashElement *ne = remainder.nextElement(el);
+            while (ne != nullptr) {
+                UnicodeString item = *static_cast<UnicodeString*>(ne->value.pointer);
+                UnicodeString *toAdd = new UnicodeString(prefix);
+                if (toAdd == nullptr) {
+                    status = U_MEMORY_ALLOCATION_ERROR;
+                    return nullptr;
+                }
+                *toAdd += item;
+                fillinResult->put(*toAdd, toAdd, status);
+
+
+                ne = remainder.nextElement(el);
+            }
+            constexpr int32_t kResultLimit = 4096;
+            if (fillinResult->count() > kResultLimit) {
+                status = U_UNSUPPORTED_ERROR;
+                return nullptr;
+            }
+        }
+    }
+
+    if(U_FAILURE(status)) {
+        return nullptr;
+    }
+    return fillinResult;
+}
+
+Hashtable *CanonicalIterator::extract(Hashtable *fillinResult, UChar32 comp, const char16_t *segment, int32_t segLen, int32_t segmentPos, UErrorCode &status) {
+
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+    UnicodeString temp(comp);
+    int32_t inputLen=temp.length();
+    UnicodeString decompString;
+    nfd->normalize(temp, decompString, status);
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    if (decompString.isBogus()) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return nullptr;
+    }
+    const char16_t *decomp=decompString.getBuffer();
+    int32_t decompLen=decompString.length();
+
+    UBool ok = false;
+    UChar32 cp;
+    int32_t decompPos = 0;
+    UChar32 decompCp;
+    U16_NEXT(decomp, decompPos, decompLen, decompCp);
+
+    int32_t i = segmentPos;
+    while(i < segLen) {
+        U16_NEXT(segment, i, segLen, cp);
+
+        if (cp == decompCp) { 
+
+
+            if (decompPos == decompLen) { 
+                temp.append(segment+i, segLen-i);
+                ok = true;
+                break;
+            }
+            U16_NEXT(decomp, decompPos, decompLen, decompCp);
+        } else {
+
+            temp.append(cp);
+
+        }
+    }
+    if (!ok)
+        return nullptr; 
+
+
+    if (inputLen == temp.length()) {
+        fillinResult->put(UnicodeString(), new UnicodeString(), status);
+        return fillinResult; 
+    }
+
+    UnicodeString trial;
+    nfd->normalize(temp, trial, status);
+    if(U_FAILURE(status) || trial.compare(segment+segmentPos, segLen - segmentPos) != 0) {
+        return nullptr;
+    }
+
+    return getEquivalents2(fillinResult, temp.getBuffer()+inputLen, temp.length()-inputLen, status);
+}
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_NORMALIZATION */

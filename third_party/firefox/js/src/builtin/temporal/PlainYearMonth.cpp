@@ -1,0 +1,1033 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "builtin/temporal/PlainYearMonth.h"
+
+#include "mozilla/Assertions.h"
+
+#include "jspubtd.h"
+#include "NamespaceImports.h"
+
+#include "builtin/intl/DateTimeFormat.h"
+#include "builtin/temporal/Calendar.h"
+#include "builtin/temporal/CalendarFields.h"
+#include "builtin/temporal/Duration.h"
+#include "builtin/temporal/Instant.h"
+#include "builtin/temporal/PlainDate.h"
+#include "builtin/temporal/PlainDateTime.h"
+#include "builtin/temporal/PlainMonthDay.h"
+#include "builtin/temporal/Temporal.h"
+#include "builtin/temporal/TemporalParser.h"
+#include "builtin/temporal/TemporalRoundingMode.h"
+#include "builtin/temporal/TemporalTypes.h"
+#include "builtin/temporal/TemporalUnit.h"
+#include "builtin/temporal/TimeZone.h"
+#include "builtin/temporal/ToString.h"
+#include "gc/AllocKind.h"
+#include "gc/Barrier.h"
+#include "gc/GCEnum.h"
+#include "js/CallArgs.h"
+#include "js/CallNonGenericMethod.h"
+#include "js/Class.h"
+#include "js/ErrorReport.h"
+#include "js/friend/ErrorMessages.h"
+#include "js/PropertyDescriptor.h"
+#include "js/PropertySpec.h"
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "vm/BytecodeUtil.h"
+#include "vm/GlobalObject.h"
+#include "vm/JSAtomState.h"
+#include "vm/JSContext.h"
+#include "vm/JSObject.h"
+#include "vm/PlainObject.h"
+#include "vm/StringType.h"
+
+#include "vm/JSObject-inl.h"
+#include "vm/NativeObject-inl.h"
+
+using namespace js;
+using namespace js::temporal;
+
+static inline bool IsPlainYearMonth(Handle<Value> v) {
+  return v.isObject() && v.toObject().is<PlainYearMonthObject>();
+}
+
+bool js::temporal::ISOYearMonthWithinLimits(const ISODate& isoDate) {
+  MOZ_ASSERT(IsValidISODate(isoDate));
+
+  constexpr auto min = ISODate::min();
+  constexpr auto max = ISODate::max();
+
+  const auto& year = isoDate.year;
+
+  if (min.year < year && year < max.year) {
+    return true;
+  }
+
+  if (year < 0) {
+    return isoDate >= ISODate{min.year, min.month, 1};
+  }
+  return isoDate < ISODate{max.year, max.month + 1, 1};
+}
+
+static PlainYearMonthObject* CreateTemporalYearMonth(
+    JSContext* cx, const CallArgs& args, const ISODate& isoDate,
+    Handle<CalendarValue> calendar) {
+  if (!ISOYearMonthWithinLimits(isoDate)) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_TEMPORAL_PLAIN_YEAR_MONTH_INVALID);
+    return nullptr;
+  }
+
+  Rooted<JSObject*> proto(cx);
+  if (!GetPrototypeFromBuiltinConstructor(cx, args, JSProto_PlainYearMonth,
+                                          &proto)) {
+    return nullptr;
+  }
+
+  auto* object = NewObjectWithClassProto<PlainYearMonthObject>(cx, proto);
+  if (!object) {
+    return nullptr;
+  }
+
+  auto packedDate = PackedDate::pack(isoDate);
+  object->initFixedSlot(PlainYearMonthObject::PACKED_DATE_SLOT,
+                        PrivateUint32Value(packedDate.value));
+
+  object->initFixedSlot(PlainYearMonthObject::CALENDAR_SLOT,
+                        calendar.toSlotValue());
+
+  return object;
+}
+
+PlainYearMonthObject* js::temporal::CreateTemporalYearMonth(
+    JSContext* cx, Handle<PlainYearMonth> yearMonth) {
+  MOZ_ASSERT(IsValidISODate(yearMonth));
+
+  MOZ_ASSERT(ISOYearMonthWithinLimits(yearMonth));
+
+  auto* object = NewBuiltinClassInstance<PlainYearMonthObject>(cx);
+  if (!object) {
+    return nullptr;
+  }
+
+  auto packedDate = PackedDate::pack(yearMonth);
+  object->initFixedSlot(PlainYearMonthObject::PACKED_DATE_SLOT,
+                        PrivateUint32Value(packedDate.value));
+
+  object->initFixedSlot(PlainYearMonthObject::CALENDAR_SLOT,
+                        yearMonth.calendar().toSlotValue());
+
+  return object;
+}
+
+bool js::temporal::CreateTemporalYearMonth(
+    JSContext* cx, const ISODate& isoDate, Handle<CalendarValue> calendar,
+    MutableHandle<PlainYearMonth> result) {
+  MOZ_ASSERT(IsValidISODate(isoDate));
+
+  if (!ISOYearMonthWithinLimits(isoDate)) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_TEMPORAL_PLAIN_YEAR_MONTH_INVALID);
+    return false;
+  }
+
+  result.set(PlainYearMonth{isoDate, calendar});
+  return true;
+}
+
+struct YearMonthOptions {
+  TemporalOverflow overflow = TemporalOverflow::Constrain;
+};
+
+static bool ToTemporalYearMonthOptions(JSContext* cx, Handle<Value> options,
+                                       YearMonthOptions* result) {
+  if (options.isUndefined()) {
+    *result = {};
+    return true;
+  }
+
+
+  Rooted<JSObject*> resolvedOptions(
+      cx, RequireObjectArg(cx, "options", "from", options));
+  if (!resolvedOptions) {
+    return false;
+  }
+
+  auto overflow = TemporalOverflow::Constrain;
+  if (!GetTemporalOverflowOption(cx, resolvedOptions, &overflow)) {
+    return false;
+  }
+
+  *result = {overflow};
+  return true;
+}
+
+static bool ToTemporalYearMonth(JSContext* cx, Handle<JSObject*> item,
+                                Handle<Value> options,
+                                MutableHandle<PlainYearMonth> result) {
+
+  if (auto* plainYearMonth = item->maybeUnwrapIf<PlainYearMonthObject>()) {
+    auto date = plainYearMonth->date();
+    Rooted<CalendarValue> calendar(cx, plainYearMonth->calendar());
+    if (!calendar.wrap(cx)) {
+      return false;
+    }
+
+    YearMonthOptions ignoredOptions;
+    if (!ToTemporalYearMonthOptions(cx, options, &ignoredOptions)) {
+      return false;
+    }
+
+    result.set(PlainYearMonth{date, calendar});
+    return true;
+  }
+
+  Rooted<CalendarValue> calendar(cx);
+  if (!GetTemporalCalendarWithISODefault(cx, item, &calendar)) {
+    return false;
+  }
+
+  Rooted<CalendarFields> fields(cx);
+  if (!PrepareCalendarFields(cx, calendar, item,
+                             {
+                                 CalendarField::Year,
+                                 CalendarField::Month,
+                                 CalendarField::MonthCode,
+                             },
+                             &fields)) {
+    return false;
+  }
+
+  YearMonthOptions resolvedOptions;
+  if (!ToTemporalYearMonthOptions(cx, options, &resolvedOptions)) {
+    return false;
+  }
+  auto [overflow] = resolvedOptions;
+
+  return CalendarYearMonthFromFields(cx, calendar, fields, overflow, result);
+}
+
+static bool ToTemporalYearMonth(JSContext* cx, Handle<Value> item,
+                                Handle<Value> options,
+                                MutableHandle<PlainYearMonth> result) {
+
+  if (item.isObject()) {
+    Rooted<JSObject*> itemObj(cx, &item.toObject());
+    return ToTemporalYearMonth(cx, itemObj, options, result);
+  }
+
+  if (!item.isString()) {
+    ReportValueError(cx, JSMSG_UNEXPECTED_TYPE, JSDVG_IGNORE_STACK, item,
+                     nullptr, "not a string");
+    return false;
+  }
+  Rooted<JSString*> string(cx, item.toString());
+
+  ISODate date;
+  Rooted<JSString*> calendarString(cx);
+  if (!ParseTemporalYearMonthString(cx, string, &date, &calendarString)) {
+    return false;
+  }
+
+  Rooted<CalendarValue> calendar(cx, CalendarValue(CalendarId::ISO8601));
+  if (calendarString) {
+    if (!CanonicalizeCalendar(cx, calendarString, &calendar)) {
+      return false;
+    }
+  }
+
+  YearMonthOptions ignoredOptions;
+  if (!ToTemporalYearMonthOptions(cx, options, &ignoredOptions)) {
+    return false;
+  }
+
+  Rooted<PlainYearMonth> yearMonth(cx);
+  if (!CreateTemporalYearMonth(cx, date, calendar, &yearMonth)) {
+    return false;
+  }
+
+  Rooted<CalendarFields> fields(cx);
+  if (!ISODateToFields(cx, yearMonth, &fields)) {
+    return false;
+  }
+
+  return CalendarYearMonthFromFields(cx, calendar, fields,
+                                     TemporalOverflow::Constrain, result);
+}
+
+static bool ToTemporalYearMonth(JSContext* cx, Handle<Value> item,
+                                MutableHandle<PlainYearMonth> result) {
+  return ToTemporalYearMonth(cx, item, UndefinedHandleValue, result);
+}
+
+static bool DifferenceTemporalPlainYearMonth(JSContext* cx,
+                                             TemporalDifference operation,
+                                             const CallArgs& args) {
+  Rooted<PlainYearMonth> yearMonth(
+      cx, &args.thisv().toObject().as<PlainYearMonthObject>());
+
+  Rooted<PlainYearMonth> other(cx);
+  if (!ToTemporalYearMonth(cx, args.get(0), &other)) {
+    return false;
+  }
+
+  auto calendar = yearMonth.calendar();
+
+  if (!CalendarEquals(calendar, other.calendar())) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_TEMPORAL_CALENDAR_INCOMPATIBLE,
+                              CalendarIdentifier(calendar).data(),
+                              CalendarIdentifier(other.calendar()).data());
+    return false;
+  }
+
+  DifferenceSettings settings;
+  Rooted<PlainObject*> resolvedOptions(cx);
+  if (args.hasDefined(1)) {
+    Rooted<JSObject*> options(
+        cx, RequireObjectArg(cx, "options", ToName(operation), args[1]));
+    if (!options) {
+      return false;
+    }
+
+    if (!GetDifferenceSettings(cx, operation, options, TemporalUnitGroup::Date,
+                               TemporalUnit::Month, TemporalUnit::Month,
+                               TemporalUnit::Year, &settings)) {
+      return false;
+    }
+  } else {
+    settings = {
+        TemporalUnit::Month,
+        TemporalUnit::Year,
+        TemporalRoundingMode::Trunc,
+        Increment{1},
+    };
+  }
+
+  if (yearMonth.date() == other.date()) {
+    auto* obj = CreateTemporalDuration(cx, {});
+    if (!obj) {
+      return false;
+    }
+
+    args.rval().setObject(*obj);
+    return true;
+  }
+
+  Rooted<CalendarFields> thisFields(cx);
+  if (!ISODateToFields(cx, yearMonth, &thisFields)) {
+    return false;
+  }
+
+  MOZ_ASSERT(!thisFields.has(CalendarField::Day));
+  thisFields.setDay(1);
+
+  Rooted<PlainDate> thisDate(cx);
+  if (!CalendarDateFromFields(cx, calendar, thisFields,
+                              TemporalOverflow::Constrain, &thisDate)) {
+    return false;
+  }
+
+  Rooted<CalendarFields> otherFields(cx);
+  if (!ISODateToFields(cx, other, &otherFields)) {
+    return false;
+  }
+
+  MOZ_ASSERT(!otherFields.has(CalendarField::Day));
+  otherFields.setDay(1);
+
+  Rooted<PlainDate> otherDate(cx);
+  if (!CalendarDateFromFields(cx, calendar, otherFields,
+                              TemporalOverflow::Constrain, &otherDate)) {
+    return false;
+  }
+
+  DateDuration until;
+  if (!CalendarDateUntil(cx, calendar, thisDate, otherDate,
+                         settings.largestUnit, &until)) {
+    return false;
+  }
+
+  auto dateDuration = DateDuration{until.years, until.months};
+
+  auto duration = InternalDuration{dateDuration, {}};
+
+  if (settings.smallestUnit != TemporalUnit::Month ||
+      settings.roundingIncrement != Increment{1}) {
+    auto isoDateTime = ISODateTime{thisDate, {}};
+
+    auto originEpochNs = GetUTCEpochNanoseconds(isoDateTime);
+
+    auto isoDateTimeOther = ISODateTime{otherDate, {}};
+
+    auto destEpochNs = GetUTCEpochNanoseconds(isoDateTimeOther);
+
+    Rooted<TimeZoneValue> timeZone(cx, TimeZoneValue{});
+    if (!RoundRelativeDuration(
+            cx, duration, originEpochNs, destEpochNs, isoDateTime, timeZone,
+            calendar, settings.largestUnit, settings.roundingIncrement,
+            settings.smallestUnit, settings.roundingMode, &duration)) {
+      return false;
+    }
+  }
+  MOZ_ASSERT(IsValidDuration(duration));
+  MOZ_ASSERT(duration.date.weeks == 0);
+  MOZ_ASSERT(duration.date.days == 0);
+  MOZ_ASSERT(duration.time == TimeDuration{});
+
+  auto result = duration.date.toDuration();
+
+  if (operation == TemporalDifference::Since) {
+    result = result.negate();
+  }
+
+  auto* obj = CreateTemporalDuration(cx, result);
+  if (!obj) {
+    return false;
+  }
+
+  args.rval().setObject(*obj);
+  return true;
+}
+
+const char* NonZeroDurationPartAfterMonths(const Duration& duration) {
+  if (duration.weeks != 0) {
+    return "weeks";
+  }
+  if (duration.days != 0) {
+    return "days";
+  }
+  if (duration.hours != 0) {
+    return "hours";
+  }
+  if (duration.minutes != 0) {
+    return "minutes";
+  }
+  if (duration.seconds != 0) {
+    return "seconds";
+  }
+  if (duration.milliseconds != 0) {
+    return "milliseconds";
+  }
+  if (duration.microseconds != 0) {
+    return "microseconds";
+  }
+  if (duration.nanoseconds != 0) {
+    return "nanoseconds";
+  }
+  return nullptr;
+}
+
+static bool AddDurationToYearMonth(JSContext* cx, TemporalAddDuration operation,
+                                   const CallArgs& args) {
+  Rooted<PlainYearMonth> yearMonth(
+      cx, &args.thisv().toObject().as<PlainYearMonthObject>());
+
+  Duration duration;
+  if (!ToTemporalDuration(cx, args.get(0), &duration)) {
+    return false;
+  }
+
+  if (operation == TemporalAddDuration::Subtract) {
+    duration = duration.negate();
+  }
+
+  auto internalDuration = ToInternalDurationRecord(duration);
+
+  auto overflow = TemporalOverflow::Constrain;
+  if (args.hasDefined(1)) {
+    Rooted<JSObject*> options(
+        cx, RequireObjectArg(cx, "options", ToName(operation), args[1]));
+    if (!options) {
+      return false;
+    }
+
+    if (!GetTemporalOverflowOption(cx, options, &overflow)) {
+      return false;
+    }
+  }
+
+  const auto& durationToAdd = internalDuration.date;
+
+  if (durationToAdd.weeks != 0 || durationToAdd.days != 0 ||
+      internalDuration.time != TimeDuration{}) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_TEMPORAL_PLAIN_YEAR_MONTH_BAD_DURATION,
+                              NonZeroDurationPartAfterMonths(duration));
+    return false;
+  }
+
+  auto calendar = yearMonth.calendar();
+
+  Rooted<CalendarFields> fields(cx);
+  if (!ISODateToFields(cx, yearMonth, &fields)) {
+    return false;
+  }
+
+  MOZ_ASSERT(!fields.has(CalendarField::Day));
+  fields.setDay(1);
+
+  Rooted<PlainDate> date(cx);
+  if (!CalendarDateFromFields(cx, calendar, fields, TemporalOverflow::Constrain,
+                              &date)) {
+    return false;
+  }
+
+  ISODate addedDate;
+  if (!CalendarDateAdd(cx, calendar, date, durationToAdd, overflow,
+                       &addedDate)) {
+    return false;
+  }
+  MOZ_ASSERT(ISODateWithinLimits(addedDate));
+
+  Rooted<PlainYearMonth> addedYearMonth(cx,
+                                        PlainYearMonth{addedDate, calendar});
+
+  Rooted<CalendarFields> addedDateFields(cx);
+  if (!ISODateToFields(cx, addedYearMonth, &addedDateFields)) {
+    return false;
+  }
+
+  Rooted<PlainYearMonth> isoDate(cx);
+  if (!CalendarYearMonthFromFields(cx, calendar, addedDateFields, overflow,
+                                   &isoDate)) {
+    return false;
+  }
+
+  auto* obj = CreateTemporalYearMonth(cx, isoDate);
+  if (!obj) {
+    return false;
+  }
+
+  args.rval().setObject(*obj);
+  return true;
+}
+
+static bool PlainYearMonthConstructor(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (!ThrowIfNotConstructing(cx, args, "Temporal.PlainYearMonth")) {
+    return false;
+  }
+
+  double isoYear;
+  if (!ToIntegerWithTruncation(cx, args.get(0), "year", &isoYear)) {
+    return false;
+  }
+
+  double isoMonth;
+  if (!ToIntegerWithTruncation(cx, args.get(1), "month", &isoMonth)) {
+    return false;
+  }
+
+  Rooted<CalendarValue> calendar(cx, CalendarValue(CalendarId::ISO8601));
+  if (args.hasDefined(2)) {
+    if (!args[2].isString()) {
+      ReportValueError(cx, JSMSG_UNEXPECTED_TYPE, JSDVG_IGNORE_STACK, args[2],
+                       nullptr, "not a string");
+      return false;
+    }
+
+    Rooted<JSString*> calendarString(cx, args[2].toString());
+    if (!CanonicalizeCalendar(cx, calendarString, &calendar)) {
+      return false;
+    }
+  }
+
+  double isoDay = 1;
+  if (args.hasDefined(3)) {
+    if (!ToIntegerWithTruncation(cx, args[3], "day", &isoDay)) {
+      return false;
+    }
+  }
+
+  if (!ThrowIfInvalidISODate(cx, isoYear, isoMonth, isoDay)) {
+    return false;
+  }
+
+  auto isoDate = ISODate{int32_t(isoYear), int32_t(isoMonth), int32_t(isoDay)};
+
+  auto* yearMonth = CreateTemporalYearMonth(cx, args, isoDate, calendar);
+  if (!yearMonth) {
+    return false;
+  }
+
+  args.rval().setObject(*yearMonth);
+  return true;
+}
+
+static bool PlainYearMonth_from(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  Rooted<PlainYearMonth> yearMonth(cx);
+  if (!ToTemporalYearMonth(cx, args.get(0), args.get(1), &yearMonth)) {
+    return false;
+  }
+
+  auto* result = CreateTemporalYearMonth(cx, yearMonth);
+  if (!result) {
+    return false;
+  }
+
+  args.rval().setObject(*result);
+  return true;
+}
+
+static bool PlainYearMonth_compare(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  Rooted<PlainYearMonth> one(cx);
+  if (!ToTemporalYearMonth(cx, args.get(0), &one)) {
+    return false;
+  }
+
+  Rooted<PlainYearMonth> two(cx);
+  if (!ToTemporalYearMonth(cx, args.get(1), &two)) {
+    return false;
+  }
+
+  args.rval().setInt32(CompareISODate(one, two));
+  return true;
+}
+
+static bool PlainYearMonth_calendarId(JSContext* cx, const CallArgs& args) {
+  auto* yearMonth = &args.thisv().toObject().as<PlainYearMonthObject>();
+
+  auto* str =
+      NewStringCopy<CanGC>(cx, CalendarIdentifier(yearMonth->calendar()));
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+static bool PlainYearMonth_calendarId(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_calendarId>(
+      cx, args);
+}
+
+static bool PlainYearMonth_era(JSContext* cx, const CallArgs& args) {
+  auto* yearMonth = &args.thisv().toObject().as<PlainYearMonthObject>();
+  Rooted<CalendarValue> calendar(cx, yearMonth->calendar());
+
+  return CalendarEra(cx, calendar, yearMonth->date(), args.rval());
+}
+
+static bool PlainYearMonth_era(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_era>(cx, args);
+}
+
+static bool PlainYearMonth_eraYear(JSContext* cx, const CallArgs& args) {
+  auto* yearMonth = &args.thisv().toObject().as<PlainYearMonthObject>();
+  Rooted<CalendarValue> calendar(cx, yearMonth->calendar());
+
+  return CalendarEraYear(cx, calendar, yearMonth->date(), args.rval());
+}
+
+static bool PlainYearMonth_eraYear(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_eraYear>(cx,
+                                                                        args);
+}
+
+static bool PlainYearMonth_year(JSContext* cx, const CallArgs& args) {
+  auto* yearMonth = &args.thisv().toObject().as<PlainYearMonthObject>();
+  Rooted<CalendarValue> calendar(cx, yearMonth->calendar());
+
+  return CalendarYear(cx, calendar, yearMonth->date(), args.rval());
+}
+
+static bool PlainYearMonth_year(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_year>(cx, args);
+}
+
+static bool PlainYearMonth_month(JSContext* cx, const CallArgs& args) {
+  auto* yearMonth = &args.thisv().toObject().as<PlainYearMonthObject>();
+  Rooted<CalendarValue> calendar(cx, yearMonth->calendar());
+
+  return CalendarMonth(cx, calendar, yearMonth->date(), args.rval());
+}
+
+static bool PlainYearMonth_month(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_month>(cx, args);
+}
+
+static bool PlainYearMonth_monthCode(JSContext* cx, const CallArgs& args) {
+  auto* yearMonth = &args.thisv().toObject().as<PlainYearMonthObject>();
+  Rooted<CalendarValue> calendar(cx, yearMonth->calendar());
+
+  return CalendarMonthCode(cx, calendar, yearMonth->date(), args.rval());
+}
+
+static bool PlainYearMonth_monthCode(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_monthCode>(cx,
+                                                                          args);
+}
+
+static bool PlainYearMonth_daysInYear(JSContext* cx, const CallArgs& args) {
+  auto* yearMonth = &args.thisv().toObject().as<PlainYearMonthObject>();
+  Rooted<CalendarValue> calendar(cx, yearMonth->calendar());
+
+  return CalendarDaysInYear(cx, calendar, yearMonth->date(), args.rval());
+}
+
+static bool PlainYearMonth_daysInYear(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_daysInYear>(
+      cx, args);
+}
+
+static bool PlainYearMonth_daysInMonth(JSContext* cx, const CallArgs& args) {
+  auto* yearMonth = &args.thisv().toObject().as<PlainYearMonthObject>();
+  Rooted<CalendarValue> calendar(cx, yearMonth->calendar());
+
+  return CalendarDaysInMonth(cx, calendar, yearMonth->date(), args.rval());
+}
+
+static bool PlainYearMonth_daysInMonth(JSContext* cx, unsigned argc,
+                                       Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_daysInMonth>(
+      cx, args);
+}
+
+static bool PlainYearMonth_monthsInYear(JSContext* cx, const CallArgs& args) {
+  auto* yearMonth = &args.thisv().toObject().as<PlainYearMonthObject>();
+  Rooted<CalendarValue> calendar(cx, yearMonth->calendar());
+
+  return CalendarMonthsInYear(cx, calendar, yearMonth->date(), args.rval());
+}
+
+static bool PlainYearMonth_monthsInYear(JSContext* cx, unsigned argc,
+                                        Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_monthsInYear>(
+      cx, args);
+}
+
+static bool PlainYearMonth_inLeapYear(JSContext* cx, const CallArgs& args) {
+  auto* yearMonth = &args.thisv().toObject().as<PlainYearMonthObject>();
+  Rooted<CalendarValue> calendar(cx, yearMonth->calendar());
+
+  return CalendarInLeapYear(cx, calendar, yearMonth->date(), args.rval());
+}
+
+static bool PlainYearMonth_inLeapYear(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_inLeapYear>(
+      cx, args);
+}
+
+static bool PlainYearMonth_with(JSContext* cx, const CallArgs& args) {
+  Rooted<PlainYearMonth> yearMonth(
+      cx, &args.thisv().toObject().as<PlainYearMonthObject>());
+
+  Rooted<JSObject*> temporalYearMonthLike(
+      cx, RequireObjectArg(cx, "temporalYearMonthLike", "with", args.get(0)));
+  if (!temporalYearMonthLike) {
+    return false;
+  }
+  if (!ThrowIfTemporalLikeObject(cx, temporalYearMonthLike)) {
+    return false;
+  }
+
+  auto calendar = yearMonth.calendar();
+
+  Rooted<CalendarFields> fields(cx);
+  if (!ISODateToFields(cx, yearMonth, &fields)) {
+    return false;
+  }
+
+  Rooted<CalendarFields> partialYearMonth(cx);
+  if (!PreparePartialCalendarFields(cx, calendar, temporalYearMonthLike,
+                                    {
+                                        CalendarField::Year,
+                                        CalendarField::Month,
+                                        CalendarField::MonthCode,
+                                    },
+                                    &partialYearMonth)) {
+    return false;
+  }
+  MOZ_ASSERT(!partialYearMonth.keys().isEmpty());
+
+  fields = CalendarMergeFields(calendar, fields, partialYearMonth);
+
+  auto overflow = TemporalOverflow::Constrain;
+  if (args.hasDefined(1)) {
+    Rooted<JSObject*> options(cx,
+                              RequireObjectArg(cx, "options", "with", args[1]));
+    if (!options) {
+      return false;
+    }
+
+    if (!GetTemporalOverflowOption(cx, options, &overflow)) {
+      return false;
+    }
+  }
+
+  Rooted<PlainYearMonth> result(cx);
+  if (!CalendarYearMonthFromFields(cx, calendar, fields, overflow, &result)) {
+    return false;
+  }
+
+  auto* obj = CreateTemporalYearMonth(cx, result);
+  if (!obj) {
+    return false;
+  }
+
+  args.rval().setObject(*obj);
+  return true;
+}
+
+static bool PlainYearMonth_with(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_with>(cx, args);
+}
+
+static bool PlainYearMonth_add(JSContext* cx, const CallArgs& args) {
+  return AddDurationToYearMonth(cx, TemporalAddDuration::Add, args);
+}
+
+static bool PlainYearMonth_add(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_add>(cx, args);
+}
+
+static bool PlainYearMonth_subtract(JSContext* cx, const CallArgs& args) {
+  return AddDurationToYearMonth(cx, TemporalAddDuration::Subtract, args);
+}
+
+static bool PlainYearMonth_subtract(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_subtract>(cx,
+                                                                         args);
+}
+
+static bool PlainYearMonth_until(JSContext* cx, const CallArgs& args) {
+  return DifferenceTemporalPlainYearMonth(cx, TemporalDifference::Until, args);
+}
+
+static bool PlainYearMonth_until(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_until>(cx, args);
+}
+
+static bool PlainYearMonth_since(JSContext* cx, const CallArgs& args) {
+  return DifferenceTemporalPlainYearMonth(cx, TemporalDifference::Since, args);
+}
+
+static bool PlainYearMonth_since(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_since>(cx, args);
+}
+
+static bool PlainYearMonth_equals(JSContext* cx, const CallArgs& args) {
+  auto* yearMonth = &args.thisv().toObject().as<PlainYearMonthObject>();
+  auto date = yearMonth->date();
+  Rooted<CalendarValue> calendar(cx, yearMonth->calendar());
+
+  Rooted<PlainYearMonth> other(cx);
+  if (!ToTemporalYearMonth(cx, args.get(0), &other)) {
+    return false;
+  }
+
+  bool equals =
+      date == other.date() && CalendarEquals(calendar, other.calendar());
+
+  args.rval().setBoolean(equals);
+  return true;
+}
+
+static bool PlainYearMonth_equals(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_equals>(cx,
+                                                                       args);
+}
+
+static bool PlainYearMonth_toString(JSContext* cx, const CallArgs& args) {
+  Rooted<PlainYearMonthObject*> yearMonth(
+      cx, &args.thisv().toObject().as<PlainYearMonthObject>());
+
+  auto showCalendar = ShowCalendar::Auto;
+  if (args.hasDefined(0)) {
+    Rooted<JSObject*> options(
+        cx, RequireObjectArg(cx, "options", "toString", args[0]));
+    if (!options) {
+      return false;
+    }
+
+    if (!GetTemporalShowCalendarNameOption(cx, options, &showCalendar)) {
+      return false;
+    }
+  }
+
+  JSString* str = TemporalYearMonthToString(cx, yearMonth, showCalendar);
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+static bool PlainYearMonth_toString(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_toString>(cx,
+                                                                         args);
+}
+
+static bool PlainYearMonth_toLocaleString(JSContext* cx, const CallArgs& args) {
+  return intl::TemporalObjectToLocaleString(cx, args,
+                                            intl::DateTimeFormatKind::Date);
+}
+
+static bool PlainYearMonth_toLocaleString(JSContext* cx, unsigned argc,
+                                          Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_toLocaleString>(
+      cx, args);
+}
+
+static bool PlainYearMonth_toJSON(JSContext* cx, const CallArgs& args) {
+  Rooted<PlainYearMonthObject*> yearMonth(
+      cx, &args.thisv().toObject().as<PlainYearMonthObject>());
+
+  JSString* str = TemporalYearMonthToString(cx, yearMonth, ShowCalendar::Auto);
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+static bool PlainYearMonth_toJSON(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_toJSON>(cx,
+                                                                       args);
+}
+
+static bool PlainYearMonth_valueOf(JSContext* cx, unsigned argc, Value* vp) {
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_CANT_CONVERT_TO,
+                            "PlainYearMonth", "primitive type");
+  return false;
+}
+
+static bool PlainYearMonth_toPlainDate(JSContext* cx, const CallArgs& args) {
+  Rooted<PlainYearMonth> yearMonth(
+      cx, &args.thisv().toObject().as<PlainYearMonthObject>());
+
+  Rooted<JSObject*> item(
+      cx, RequireObjectArg(cx, "item", "toPlainDate", args.get(0)));
+  if (!item) {
+    return false;
+  }
+
+  auto calendar = yearMonth.calendar();
+
+  Rooted<CalendarFields> fields(cx);
+  if (!ISODateToFields(cx, yearMonth, &fields)) {
+    return false;
+  }
+
+  Rooted<CalendarFields> inputFields(cx);
+  if (!PrepareCalendarFields(cx, calendar, item,
+                             {
+                                 CalendarField::Day,
+                             },
+                             &inputFields)) {
+    return false;
+  }
+
+  fields = CalendarMergeFields(calendar, fields, inputFields);
+
+  Rooted<PlainDate> result(cx);
+  if (!CalendarDateFromFields(cx, calendar, fields, TemporalOverflow::Constrain,
+                              &result)) {
+    return false;
+  }
+
+  auto* obj = CreateTemporalDate(cx, result);
+  if (!obj) {
+    return false;
+  }
+
+  args.rval().setObject(*obj);
+  return true;
+}
+
+static bool PlainYearMonth_toPlainDate(JSContext* cx, unsigned argc,
+                                       Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainYearMonth, PlainYearMonth_toPlainDate>(
+      cx, args);
+}
+
+const JSClass PlainYearMonthObject::class_ = {
+    "Temporal.PlainYearMonth",
+    JSCLASS_HAS_RESERVED_SLOTS(PlainYearMonthObject::SLOT_COUNT) |
+        JSCLASS_HAS_CACHED_PROTO(JSProto_PlainYearMonth),
+    JS_NULL_CLASS_OPS,
+    &PlainYearMonthObject::classSpec_,
+};
+
+const JSClass& PlainYearMonthObject::protoClass_ = PlainObject::class_;
+
+static const JSFunctionSpec PlainYearMonth_methods[] = {
+    JS_FN("from", PlainYearMonth_from, 1, 0),
+    JS_FN("compare", PlainYearMonth_compare, 2, 0),
+    JS_FS_END,
+};
+
+static const JSFunctionSpec PlainYearMonth_prototype_methods[] = {
+    JS_FN("with", PlainYearMonth_with, 1, 0),
+    JS_FN("add", PlainYearMonth_add, 1, 0),
+    JS_FN("subtract", PlainYearMonth_subtract, 1, 0),
+    JS_FN("until", PlainYearMonth_until, 1, 0),
+    JS_FN("since", PlainYearMonth_since, 1, 0),
+    JS_FN("equals", PlainYearMonth_equals, 1, 0),
+    JS_FN("toString", PlainYearMonth_toString, 0, 0),
+    JS_FN("toLocaleString", PlainYearMonth_toLocaleString, 0, 0),
+    JS_FN("toJSON", PlainYearMonth_toJSON, 0, 0),
+    JS_FN("valueOf", PlainYearMonth_valueOf, 0, 0),
+    JS_FN("toPlainDate", PlainYearMonth_toPlainDate, 1, 0),
+    JS_FS_END,
+};
+
+static const JSPropertySpec PlainYearMonth_prototype_properties[] = {
+    JS_PSG("calendarId", PlainYearMonth_calendarId, 0),
+    JS_PSG("era", PlainYearMonth_era, 0),
+    JS_PSG("eraYear", PlainYearMonth_eraYear, 0),
+    JS_PSG("year", PlainYearMonth_year, 0),
+    JS_PSG("month", PlainYearMonth_month, 0),
+    JS_PSG("monthCode", PlainYearMonth_monthCode, 0),
+    JS_PSG("daysInYear", PlainYearMonth_daysInYear, 0),
+    JS_PSG("daysInMonth", PlainYearMonth_daysInMonth, 0),
+    JS_PSG("monthsInYear", PlainYearMonth_monthsInYear, 0),
+    JS_PSG("inLeapYear", PlainYearMonth_inLeapYear, 0),
+    JS_STRING_SYM_PS(toStringTag, "Temporal.PlainYearMonth", JSPROP_READONLY),
+    JS_PS_END,
+};
+
+const ClassSpec PlainYearMonthObject::classSpec_ = {
+    GenericCreateConstructor<PlainYearMonthConstructor, 2,
+                             gc::AllocKind::FUNCTION>,
+    GenericCreatePrototype<PlainYearMonthObject>,
+    PlainYearMonth_methods,
+    nullptr,
+    PlainYearMonth_prototype_methods,
+    PlainYearMonth_prototype_properties,
+    nullptr,
+    ClassSpec::DontDefineConstructor,
+};

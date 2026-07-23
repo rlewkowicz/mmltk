@@ -1,0 +1,181 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_Modules_h
+#define js_Modules_h
+
+#include <stdint.h>  // uint32_t
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "js/AllocPolicy.h"     // js::SystemAllocPolicy
+#include "js/ColumnNumber.h"    // JS::ColumnNumberOneOrigin
+#include "js/CompileOptions.h"  // JS::ReadOnlyCompileOptions
+#include "js/RootingAPI.h"      // JS::{Mutable,}Handle
+#include "js/Value.h"           // JS::Value
+#include "js/Vector.h"          // js::Vector
+
+struct JS_PUBLIC_API JSContext;
+class JS_PUBLIC_API JSObject;
+struct JS_PUBLIC_API JSRuntime;
+class JS_PUBLIC_API JSString;
+
+namespace JS {
+template <typename UnitT>
+class SourceText;
+}  
+
+namespace mozilla {
+union Utf8Unit;
+}
+
+namespace JS {
+
+enum class ModuleType : uint32_t {
+  Unknown = 0,
+  JavaScript,
+  JSON,
+  CSS,
+  Bytes,
+  Text,
+
+  JavaScriptOrWasm = JavaScript,
+
+  Limit = Text,
+};
+
+using ModuleLoadHook = bool (*)(JSContext* cx, Handle<JSScript*> referrer,
+                                Handle<JSObject*> moduleRequest,
+                                Handle<Value> hostDefined,
+                                Handle<Value> payload, uint32_t lineNumber,
+                                JS::ColumnNumberOneOrigin columnNumber);
+
+extern JS_PUBLIC_API ModuleLoadHook GetModuleLoadHook(JSRuntime* rt);
+
+extern JS_PUBLIC_API void SetModuleLoadHook(JSRuntime* rt, ModuleLoadHook func);
+
+using LoadModuleResolvedCallback = bool (*)(JSContext* cx,
+                                            JS::Handle<JS::Value>);
+using LoadModuleRejectedCallback = bool (*)(JSContext* cx,
+                                            JS::Handle<JS::Value> hostDefined,
+                                            Handle<JS::Value> error);
+
+extern JS_PUBLIC_API bool LoadRequestedModules(
+    JSContext* cx, Handle<JSObject*> module, Handle<Value> hostDefined,
+    LoadModuleResolvedCallback resolved, LoadModuleRejectedCallback rejected);
+
+extern JS_PUBLIC_API bool LoadRequestedModules(
+    JSContext* cx, Handle<JSObject*> module, Handle<Value> hostDefined,
+    MutableHandle<JSObject*> promiseOut);
+
+using ModuleMetadataHook = bool (*)(JSContext* cx,
+                                    Handle<JSObject*> moduleRecord,
+                                    Handle<JSObject*> metaObject);
+
+extern JS_PUBLIC_API ModuleMetadataHook GetModuleMetadataHook(JSRuntime* rt);
+
+extern JS_PUBLIC_API void SetModuleMetadataHook(JSRuntime* rt,
+                                                ModuleMetadataHook func);
+
+extern JS_PUBLIC_API bool FinishLoadingImportedModule(
+    JSContext* cx, Handle<JSScript*> referrer, Handle<JSObject*> moduleRequest,
+    Handle<Value> payload, Handle<JSObject*> result, bool usePromise);
+
+extern JS_PUBLIC_API bool FinishLoadingImportedModuleFailed(
+    JSContext* cx, Handle<Value> payload, Handle<Value> error);
+
+extern JS_PUBLIC_API bool FinishLoadingImportedModuleFailedWithPendingException(
+    JSContext* cx, Handle<Value> payload);
+
+extern JS_PUBLIC_API JSObject* CompileModule(
+    JSContext* cx, const ReadOnlyCompileOptions& options,
+    SourceText<char16_t>& srcBuf);
+
+extern JS_PUBLIC_API JSObject* CompileModule(
+    JSContext* cx, const ReadOnlyCompileOptions& options,
+    SourceText<mozilla::Utf8Unit>& srcBuf);
+
+extern JS_PUBLIC_API JSObject* CompileJsonModule(
+    JSContext* cx, const ReadOnlyCompileOptions& options,
+    SourceText<char16_t>& srcBuf);
+
+extern JS_PUBLIC_API JSObject* CompileJsonModule(
+    JSContext* cx, const ReadOnlyCompileOptions& options,
+    SourceText<mozilla::Utf8Unit>& srcBuf);
+
+extern JS_PUBLIC_API JSObject* CreateDefaultExportSyntheticModule(
+    JSContext* cx, Handle<Value> defaultExport);
+
+extern JS_PUBLIC_API JSObject* CompileWasmModule(
+    JSContext* cx, const ReadOnlyCompileOptions& options,
+    js::Vector<uint8_t, 0, js::MallocAllocPolicy>& srcBuf);
+
+extern JS_PUBLIC_API JSObject* CompileWasmModuleAsSource(
+    JSContext* cx, const ReadOnlyCompileOptions& options,
+    js::Vector<uint8_t, 0, js::MallocAllocPolicy>& srcBuf);
+
+extern JS_PUBLIC_API void SetModulePrivate(JSObject* module,
+                                           const Value& value);
+extern JS_PUBLIC_API void ClearModulePrivate(JSObject* module);
+
+extern JS_PUBLIC_API Value GetModulePrivate(JSObject* module);
+
+extern JS_PUBLIC_API bool IsCyclicModule(JSObject* module);
+
+#ifdef DEBUG
+extern JS_PUBLIC_API void SetModulePreload(JSObject* module, bool isPreload);
+#endif
+
+extern JS_PUBLIC_API void ResetPreloadedModule(JSObject* module);
+
+extern JS_PUBLIC_API bool ModuleLink(JSContext* cx,
+                                     Handle<JSObject*> moduleRecord);
+
+extern JS_PUBLIC_API bool ModuleEvaluate(JSContext* cx,
+                                         Handle<JSObject*> moduleRecord,
+                                         MutableHandleValue rval);
+
+enum ModuleErrorBehaviour {
+  ReportModuleErrorsAsync,
+
+  ThrowModuleErrorsSync
+};
+
+extern JS_PUBLIC_API bool ThrowOnModuleEvaluationFailure(
+    JSContext* cx, Handle<JSObject*> evaluationPromise,
+    ModuleErrorBehaviour errorBehaviour = ReportModuleErrorsAsync);
+
+extern JS_PUBLIC_API ModuleType GetRequestedModuleType(
+    JSContext* cx, Handle<JSObject*> moduleRecord, uint32_t index);
+
+extern JS_PUBLIC_API JSScript* GetModuleScript(Handle<JSObject*> moduleRecord);
+
+extern JS_PUBLIC_API JSString* GetModuleRequestSpecifier(
+    JSContext* cx, Handle<JSObject*> moduleRequestArg);
+
+extern JS_PUBLIC_API ModuleType
+GetModuleRequestType(JSContext* cx, Handle<JSObject*> moduleRequestArg);
+
+extern JS_PUBLIC_API bool ModuleRequestIsSourcePhase(
+    JSContext* cx, Handle<JSObject*> moduleRequestArg);
+
+extern JS_PUBLIC_API JSObject* GetModuleObject(Handle<JSScript*> moduleScript);
+
+extern JS_PUBLIC_API JSObject* GetModuleNamespace(
+    JSContext* cx, Handle<JSObject*> moduleRecord);
+
+extern JS_PUBLIC_API JSObject* GetModuleForNamespace(
+    JSContext* cx, Handle<JSObject*> moduleNamespace);
+
+extern JS_PUBLIC_API JSObject* GetModuleEnvironment(
+    JSContext* cx, Handle<JSObject*> moduleObj);
+
+extern JS_PUBLIC_API void ClearModuleEnvironment(JSObject* moduleObj);
+
+extern JS_PUBLIC_API bool ModuleIsLinked(JSObject* moduleObj);
+
+}  
+
+#endif  // js_Modules_h

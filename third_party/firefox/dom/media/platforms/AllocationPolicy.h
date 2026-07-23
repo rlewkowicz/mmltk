@@ -1,0 +1,151 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef AllocationPolicy_h_
+#define AllocationPolicy_h_
+
+#include <queue>
+
+#include "MediaInfo.h"
+#include "PlatformDecoderModule.h"
+#include "TimeUnits.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/NotNull.h"
+#include "mozilla/ReentrantMonitor.h"
+#include "mozilla/StaticMutex.h"
+
+namespace mozilla {
+
+class AllocPolicy {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(AllocPolicy)
+
+ public:
+  class Token {
+    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(Token)
+   protected:
+    virtual ~Token() = default;
+  };
+  using Promise = MozPromise<RefPtr<Token>, bool, true>;
+
+  virtual RefPtr<Promise> Alloc() = 0;
+
+ protected:
+  virtual ~AllocPolicy() = default;
+};
+
+class GlobalAllocPolicy {
+ public:
+  static NotNull<AllocPolicy*> Instance(TrackInfo::TrackType aTrack);
+
+ private:
+  static StaticMutex sMutex MOZ_UNANNOTATED;
+};
+
+class AllocPolicyImpl : public AllocPolicy {
+ public:
+  explicit AllocPolicyImpl(int aDecoderLimit);
+  RefPtr<Promise> Alloc() override;
+
+ protected:
+  virtual ~AllocPolicyImpl();
+  void RejectAll();
+  int MaxDecoderLimit() const { return mMaxDecoderLimit; }
+
+ private:
+  class AutoDeallocToken;
+  using PromisePrivate = Promise::Private;
+  void Dealloc();
+  void ResolvePromise(ReentrantMonitorAutoEnter& aProofOfLock);
+
+  const int mMaxDecoderLimit;
+  ReentrantMonitor mMonitor MOZ_UNANNOTATED;
+  int mDecoderLimit;
+  std::queue<RefPtr<PromisePrivate>> mPromises;
+};
+
+class SingleAllocPolicy : public AllocPolicyImpl {
+  using TrackType = TrackInfo::TrackType;
+
+ public:
+  SingleAllocPolicy(TrackType aTrack, TaskQueue* aOwnerThread)
+      : AllocPolicyImpl(1), mTrack(aTrack), mOwnerThread(aOwnerThread) {}
+
+  RefPtr<Promise> Alloc() override;
+
+  void Cancel();
+
+ private:
+  class AutoDeallocCombinedToken;
+  virtual ~SingleAllocPolicy();
+
+  const TrackType mTrack;
+  RefPtr<TaskQueue> mOwnerThread;
+  MozPromiseHolder<Promise> mPendingPromise;
+  MozPromiseRequestHolder<Promise> mTokenRequest;
+};
+
+class AllocationWrapper final : public MediaDataDecoder {
+  using Token = AllocPolicy::Token;
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(AllocationWrapper, final);
+
+  AllocationWrapper(already_AddRefed<MediaDataDecoder> aDecoder,
+                    already_AddRefed<Token> aToken);
+
+  RefPtr<InitPromise> Init() override { return mDecoder->Init(); }
+  RefPtr<DecodePromise> Decode(MediaRawData* aSample) override {
+    return mDecoder->Decode(aSample);
+  }
+  bool CanDecodeBatch() const override { return mDecoder->CanDecodeBatch(); }
+  RefPtr<DecodePromise> DecodeBatch(
+      nsTArray<RefPtr<MediaRawData>>&& aSamples) override {
+    return mDecoder->DecodeBatch(std::move(aSamples));
+  }
+  RefPtr<DecodePromise> Drain() override { return mDecoder->Drain(); }
+  RefPtr<FlushPromise> Flush() override { return mDecoder->Flush(); }
+  bool IsHardwareAccelerated(nsACString& aFailureReason) const override {
+    return mDecoder->IsHardwareAccelerated(aFailureReason);
+  }
+  nsCString GetDescriptionName() const override {
+    return mDecoder->GetDescriptionName();
+  }
+  nsCString GetProcessName() const override {
+    return mDecoder->GetProcessName();
+  }
+  nsCString GetCodecName() const override { return mDecoder->GetCodecName(); }
+  void SetSeekThreshold(const media::TimeUnit& aTime) override {
+    mDecoder->SetSeekThreshold(aTime);
+  }
+  bool SupportDecoderRecycling() const override {
+    return mDecoder->SupportDecoderRecycling();
+  }
+  bool ShouldDecoderAlwaysBeRecycled() const override {
+    return mDecoder->ShouldDecoderAlwaysBeRecycled();
+  }
+  RefPtr<ShutdownPromise> Shutdown() override;
+  ConversionRequired NeedsConversion() const override {
+    return mDecoder->NeedsConversion();
+  }
+
+  Maybe<PropertyValue> GetDecodeProperty(PropertyName aName) const override {
+    return mDecoder->GetDecodeProperty(aName);
+  }
+
+  typedef MozPromise<RefPtr<MediaDataDecoder>, MediaResult,
+                      true>
+      AllocateDecoderPromise;
+  static RefPtr<AllocateDecoderPromise> CreateDecoder(
+      const CreateDecoderParams& aParams, AllocPolicy* aPolicy = nullptr);
+
+ private:
+  ~AllocationWrapper();
+
+  RefPtr<MediaDataDecoder> mDecoder;
+  RefPtr<Token> mToken;
+};
+
+}  
+
+#endif

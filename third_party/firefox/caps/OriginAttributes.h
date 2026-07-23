@@ -1,0 +1,268 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_OriginAttributes_h
+#define mozilla_OriginAttributes_h
+
+#include "mozilla/HashFunctions.h"
+#include "mozilla/dom/OriginAttributesBinding.h"
+#include "mozilla/StaticPrefs_privacy.h"
+#include "nsIScriptSecurityManager.h"
+
+namespace mozilla {
+
+class OriginAttributes : public dom::OriginAttributesDictionary {
+ public:
+  OriginAttributes() = default;
+
+  explicit OriginAttributes(const OriginAttributesDictionary& aOther)
+      : OriginAttributesDictionary(aOther) {}
+
+  void SetFirstPartyDomain(const bool aIsTopLevelDocument, nsIURI* aURI,
+                           bool aForced = false);
+  void SetFirstPartyDomain(const bool aIsTopLevelDocument,
+                           const nsACString& aDomain);
+  void SetFirstPartyDomain(const bool aIsTopLevelDocument,
+                           const nsAString& aDomain, bool aForced = false);
+
+  void SetPartitionKey(nsIURI* aURI, bool aForeignByAncestorContext);
+  void SetPartitionKey(const nsACString& aOther);
+  void SetPartitionKey(const nsAString& aOther);
+
+  enum {
+    STRIP_FIRST_PARTY_DOMAIN = 0x01,
+    STRIP_USER_CONTEXT_ID = 0x02,
+    STRIP_PRIVATE_BROWSING_ID = 0x04,
+    STRIP_PARITION_KEY = 0x08,
+  };
+
+  inline void StripAttributes(uint32_t aFlags) {
+    if (aFlags & STRIP_FIRST_PARTY_DOMAIN) {
+      mFirstPartyDomain.Truncate();
+    }
+
+    if (aFlags & STRIP_USER_CONTEXT_ID) {
+      mUserContextId = nsIScriptSecurityManager::DEFAULT_USER_CONTEXT_ID;
+    }
+
+    if (aFlags & STRIP_PRIVATE_BROWSING_ID) {
+      mPrivateBrowsingId =
+          nsIScriptSecurityManager::DEFAULT_PRIVATE_BROWSING_ID;
+    }
+
+    if (aFlags & STRIP_PARITION_KEY) {
+      mPartitionKey.Truncate();
+    }
+  }
+
+  bool operator==(const OriginAttributes& aOther) const {
+    return EqualsIgnoringFPD(aOther) &&
+           mFirstPartyDomain == aOther.mFirstPartyDomain &&
+           mPartitionKey == aOther.mPartitionKey;
+  }
+
+  bool operator!=(const OriginAttributes& aOther) const {
+    return !(*this == aOther);
+  }
+
+  [[nodiscard]] bool EqualsIgnoringFPD(const OriginAttributes& aOther) const {
+    return mUserContextId == aOther.mUserContextId &&
+           mPrivateBrowsingId == aOther.mPrivateBrowsingId &&
+           mGeckoViewSessionContextId == aOther.mGeckoViewSessionContextId;
+  }
+
+  [[nodiscard]] bool EqualsIgnoringPartitionKey(
+      const OriginAttributes& aOther) const {
+    return EqualsIgnoringFPD(aOther) &&
+           mFirstPartyDomain == aOther.mFirstPartyDomain;
+  }
+
+  [[nodiscard]] inline bool IsPrivateBrowsing() const {
+    return mPrivateBrowsingId !=
+           nsIScriptSecurityManager::DEFAULT_PRIVATE_BROWSING_ID;
+  }
+
+  [[nodiscard]] HashNumber Hash() const {
+    return AddToHash(
+        mUserContextId, mPrivateBrowsingId,
+        HashString(mFirstPartyDomain.BeginReading(),
+                   mFirstPartyDomain.Length()),
+        HashString(mGeckoViewSessionContextId.BeginReading(),
+                   mGeckoViewSessionContextId.Length()),
+        HashString(mPartitionKey.BeginReading(), mPartitionKey.Length()));
+  }
+
+  void CreateSuffix(nsACString& aStr) const;
+
+  already_AddRefed<nsAtom> CreateSuffixAtom() const;
+
+  void CreateAnonymizedSuffix(nsACString& aStr) const;
+
+  [[nodiscard]] bool PopulateFromSuffix(const nsACString& aStr);
+
+  [[nodiscard]] bool PopulateFromOrigin(const nsACString& aOrigin,
+                                        nsACString& aOriginNoSuffix);
+
+  void SyncAttributesWithPrivateBrowsing(bool aInPrivateBrowsing);
+
+  static inline bool IsFirstPartyEnabled() {
+    return StaticPrefs::privacy_firstparty_isolate();
+  }
+
+  static inline bool IsRestrictOpenerAccessForFPI() {
+    return !StaticPrefs::privacy_firstparty_isolate() ||
+           StaticPrefs::privacy_firstparty_isolate_restrict_opener_access();
+  }
+
+  [[nodiscard]] static inline bool IsBlockPostMessageForFPI() {
+    return StaticPrefs::privacy_firstparty_isolate() &&
+           StaticPrefs::privacy_firstparty_isolate_block_post_message();
+  }
+
+  static bool IsPrivateBrowsing(const nsACString& aOrigin);
+
+  static bool ParsePartitionKey(const nsAString& aPartitionKey,
+                                nsAString& outScheme, nsAString& outBaseDomain,
+                                int32_t& outPort,
+                                bool& outForeignByAncestorContext);
+
+  static bool ExtractSiteFromPartitionKey(const nsAString& aPartitionKey,
+                                          nsAString& aOutSite);
+};
+
+class OriginAttributesPattern : public dom::OriginAttributesPatternDictionary {
+ public:
+  OriginAttributesPattern() = default;
+
+  explicit OriginAttributesPattern(
+      const OriginAttributesPatternDictionary& aOther)
+      : OriginAttributesPatternDictionary(aOther) {}
+
+  bool Matches(const OriginAttributes& aAttrs) const {
+    if (mUserContextId.WasPassed() &&
+        mUserContextId.Value() != aAttrs.mUserContextId) {
+      return false;
+    }
+
+    if (mPrivateBrowsingId.WasPassed() &&
+        mPrivateBrowsingId.Value() != aAttrs.mPrivateBrowsingId) {
+      return false;
+    }
+
+    if (mFirstPartyDomain.WasPassed() &&
+        mFirstPartyDomain.Value() != aAttrs.mFirstPartyDomain) {
+      return false;
+    }
+
+    if (mGeckoViewSessionContextId.WasPassed() &&
+        mGeckoViewSessionContextId.Value() !=
+            aAttrs.mGeckoViewSessionContextId) {
+      return false;
+    }
+
+    if (mPartitionKey.WasPassed()) {
+      if (mPartitionKey.Value() != aAttrs.mPartitionKey) {
+        return false;
+      }
+    } else if (mPartitionKeyPattern.WasPassed()) {
+      auto& pkPattern = mPartitionKeyPattern.Value();
+
+      if (pkPattern.mScheme.WasPassed() || pkPattern.mBaseDomain.WasPassed() ||
+          pkPattern.mPort.WasPassed()) {
+        if (aAttrs.mPartitionKey.IsEmpty()) {
+          return false;
+        }
+
+        nsString scheme;
+        nsString baseDomain;
+        int32_t port;
+        bool ancestor;
+        bool success = OriginAttributes::ParsePartitionKey(
+            aAttrs.mPartitionKey, scheme, baseDomain, port, ancestor);
+        if (!success) {
+          return false;
+        }
+
+        if (pkPattern.mScheme.WasPassed() &&
+            pkPattern.mScheme.Value() != scheme) {
+          return false;
+        }
+        if (pkPattern.mBaseDomain.WasPassed() &&
+            pkPattern.mBaseDomain.Value() != baseDomain) {
+          return false;
+        }
+        if (pkPattern.mPort.WasPassed() && pkPattern.mPort.Value() != port) {
+          return false;
+        }
+        if (pkPattern.mForeignByAncestorContext.WasPassed() &&
+            pkPattern.mForeignByAncestorContext.Value() != ancestor) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  bool Overlaps(const OriginAttributesPattern& aOther) const {
+    if (mUserContextId.WasPassed() && aOther.mUserContextId.WasPassed() &&
+        mUserContextId.Value() != aOther.mUserContextId.Value()) {
+      return false;
+    }
+
+    if (mPrivateBrowsingId.WasPassed() &&
+        aOther.mPrivateBrowsingId.WasPassed() &&
+        mPrivateBrowsingId.Value() != aOther.mPrivateBrowsingId.Value()) {
+      return false;
+    }
+
+    if (mFirstPartyDomain.WasPassed() && aOther.mFirstPartyDomain.WasPassed() &&
+        mFirstPartyDomain.Value() != aOther.mFirstPartyDomain.Value()) {
+      return false;
+    }
+
+    if (mGeckoViewSessionContextId.WasPassed() &&
+        aOther.mGeckoViewSessionContextId.WasPassed() &&
+        mGeckoViewSessionContextId.Value() !=
+            aOther.mGeckoViewSessionContextId.Value()) {
+      return false;
+    }
+
+    if (mPartitionKey.WasPassed() && aOther.mPartitionKey.WasPassed() &&
+        mPartitionKey.Value() != aOther.mPartitionKey.Value()) {
+      return false;
+    }
+
+    if (mPartitionKeyPattern.WasPassed() &&
+        aOther.mPartitionKeyPattern.WasPassed()) {
+      auto& self = mPartitionKeyPattern.Value();
+      auto& other = aOther.mPartitionKeyPattern.Value();
+
+      if (self.mScheme.WasPassed() && other.mScheme.WasPassed() &&
+          self.mScheme.Value() != other.mScheme.Value()) {
+        return false;
+      }
+      if (self.mBaseDomain.WasPassed() && other.mBaseDomain.WasPassed() &&
+          self.mBaseDomain.Value() != other.mBaseDomain.Value()) {
+        return false;
+      }
+      if (self.mPort.WasPassed() && other.mPort.WasPassed() &&
+          self.mPort.Value() != other.mPort.Value()) {
+        return false;
+      }
+      if (self.mForeignByAncestorContext.WasPassed() &&
+          other.mForeignByAncestorContext.WasPassed() &&
+          self.mForeignByAncestorContext.Value() !=
+              other.mForeignByAncestorContext.Value()) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+};
+
+}  
+
+#endif /* mozilla_OriginAttributes_h */

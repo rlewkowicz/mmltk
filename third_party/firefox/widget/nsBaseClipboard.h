@@ -1,0 +1,253 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsBaseClipboard_h_
+#define nsBaseClipboard_h_
+
+#include "mozilla/Array.h"
+#include "mozilla/dom/PContent.h"
+#include "mozilla/Logging.h"
+#include "mozilla/MoveOnlyFunction.h"
+#include "mozilla/Result.h"
+#include "nsIClipboard.h"
+#include "nsITransferable.h"
+#include "nsCOMPtr.h"
+
+extern mozilla::LazyLogModule gWidgetClipboardLog;
+#define MOZ_CLIPBOARD_LOG(...) \
+  MOZ_LOG(gWidgetClipboardLog, mozilla::LogLevel::Debug, (__VA_ARGS__))
+#define MOZ_CLIPBOARD_LOG_ENABLED() \
+  MOZ_LOG_TEST(gWidgetClipboardLog, mozilla::LogLevel::Debug)
+
+class nsITransferable;
+class nsIClipboardOwner;
+class nsIPrincipal;
+class nsIWidget;
+
+namespace mozilla::dom {
+class WindowContext;
+}  
+
+class nsBaseClipboard : public nsIClipboard {
+ public:
+  explicit nsBaseClipboard(
+      const mozilla::dom::ClipboardCapabilities& aClipboardCaps);
+
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD SetData(
+      nsITransferable* aTransferable, nsIClipboardOwner* aOwner,
+      ClipboardType aWhichClipboard,
+      mozilla::dom::WindowContext* aWindowContext) override final;
+  NS_IMETHOD AsyncSetData(ClipboardType aWhichClipboard,
+                          mozilla::dom::WindowContext* aSettingWindowContext,
+                          nsIAsyncClipboardRequestCallback* aCallback,
+                          nsIAsyncSetClipboardData** _retval) override final;
+  NS_IMETHOD GetData(
+      nsITransferable* aTransferable, ClipboardType aWhichClipboard,
+      mozilla::dom::WindowContext* aWindowContext) override final;
+  NS_IMETHOD GetDataIfSmallerThan(
+      nsITransferable* aTransferable, uint64_t aThreshold,
+      ClipboardType aWhichClipboard,
+      mozilla::dom::WindowContext* aWindowContext, JSContext* aJSContext,
+      mozilla::dom::Promise** aPromise) override final;
+  NS_IMETHOD GetDataIfSmallerThanNative(
+      nsITransferable* aTransferable, uint64_t aThreshold,
+      ClipboardType aWhichClipboard,
+      mozilla::dom::WindowContext* aWindowContext) override final;
+  NS_IMETHOD GetDataSnapshot(
+      const nsTArray<nsCString>& aFlavorList, ClipboardType aWhichClipboard,
+      mozilla::dom::WindowContext* aRequestingWindowContext,
+      nsIPrincipal* aRequestingPrincipal,
+      nsIClipboardGetDataSnapshotCallback* aCallback) override final;
+  NS_IMETHOD GetDataSnapshotSync(
+      const nsTArray<nsCString>& aFlavorList, ClipboardType aWhichClipboard,
+      mozilla::dom::WindowContext* aRequestingWindowContext,
+      nsIClipboardDataSnapshot** _retval) override final;
+  NS_IMETHOD EmptyClipboard(ClipboardType aWhichClipboard) override final;
+  NS_IMETHOD HasDataMatchingFlavors(const nsTArray<nsCString>& aFlavorList,
+                                    ClipboardType aWhichClipboard,
+                                    bool* aOutResult) override final;
+  NS_IMETHOD IsClipboardTypeSupported(ClipboardType aWhichClipboard,
+                                      bool* aRetval) override final;
+
+  void GetDataSnapshotInternal(
+      const nsTArray<nsCString>& aFlavorList,
+      nsIClipboard::ClipboardType aClipboardType,
+      mozilla::dom::WindowContext* aRequestingWindowContext,
+      nsIClipboardGetDataSnapshotCallback* aCallback);
+
+  using GetNativeDataCallback = mozilla::MoveOnlyFunction<void(
+      mozilla::Result<nsCOMPtr<nsISupports>, nsresult>)>;
+  using HasMatchingFlavorsCallback = mozilla::MoveOnlyFunction<void(
+      mozilla::Result<nsTArray<nsCString>, nsresult>)>;
+  using GetWebCustomFormatsCallback = mozilla::MoveOnlyFunction<void(
+      mozilla::Result<nsTArray<nsCString>, nsresult>)>;
+
+  mozilla::Maybe<uint64_t> GetClipboardCacheInnerWindowId(
+      ClipboardType aClipboardType);
+  virtual mozilla::Result<int32_t, nsresult> GetNativeClipboardSequenceNumber(
+      ClipboardType aWhichClipboard) = 0;
+
+  class ClipboardPopulatedDataSnapshot final : public nsIClipboardDataSnapshot {
+   public:
+    explicit ClipboardPopulatedDataSnapshot(nsITransferable* aTransferable);
+
+    NS_DECL_ISUPPORTS
+    NS_DECL_NSICLIPBOARDDATASNAPSHOT
+   private:
+    virtual ~ClipboardPopulatedDataSnapshot() = default;
+    nsCOMPtr<nsITransferable> mTransferable;
+    nsTArray<nsCString> mFlavors;
+  };
+
+ protected:
+  virtual ~nsBaseClipboard();
+
+  NS_IMETHOD SetNativeClipboardData(nsITransferable* aTransferable,
+                                    ClipboardType aWhichClipboard) = 0;
+  virtual mozilla::Result<nsCOMPtr<nsISupports>, nsresult>
+  GetNativeClipboardData(const nsACString& aFlavor,
+                         ClipboardType aWhichClipboard,
+                         uint64_t aThreshold = 0) = 0;
+  virtual void AsyncGetNativeClipboardData(const nsACString& aFlavor,
+                                           ClipboardType aWhichClipboard,
+                                           GetNativeDataCallback&& aCallback);
+  virtual nsresult EmptyNativeClipboardData(ClipboardType aWhichClipboard) = 0;
+  virtual mozilla::Result<bool, nsresult> HasNativeClipboardDataMatchingFlavors(
+      const nsTArray<nsCString>& aFlavorList,
+      ClipboardType aWhichClipboard) = 0;
+  virtual void AsyncHasNativeClipboardDataMatchingFlavors(
+      const nsTArray<nsCString>& aFlavorList, ClipboardType aWhichClipboard,
+      HasMatchingFlavorsCallback&& aCallback);
+
+  nsTArray<nsCString> GetWebCustomFormatsFromClipboard(
+      ClipboardType aWhichClipboard);
+
+  void ClearClipboardCache(ClipboardType aClipboardType);
+
+  static bool IsValidFlavor(const nsACString& aFlavor);
+
+ private:
+  void RejectPendingAsyncSetDataRequestIfAny(ClipboardType aClipboardType);
+
+  class AsyncSetClipboardData final : public nsIAsyncSetClipboardData {
+   public:
+    NS_DECL_ISUPPORTS
+    NS_DECL_NSIASYNCSETCLIPBOARDDATA
+
+    AsyncSetClipboardData(nsIClipboard::ClipboardType aClipboardType,
+                          nsBaseClipboard* aClipboard,
+                          mozilla::dom::WindowContext* aRequestingWindowContext,
+                          nsIAsyncClipboardRequestCallback* aCallback);
+
+   private:
+    virtual ~AsyncSetClipboardData() = default;
+    bool IsValid() const {
+      MOZ_ASSERT_IF(!mClipboard, !mCallback);
+      return !!mClipboard;
+    }
+    void MaybeNotifyCallback(nsresult aResult);
+
+    nsIClipboard::ClipboardType mClipboardType;
+    nsBaseClipboard* mClipboard;
+    RefPtr<mozilla::dom::WindowContext> mWindowContext;
+    nsCOMPtr<nsIAsyncClipboardRequestCallback> mCallback;
+  };
+
+  class ClipboardDataSnapshot final : public nsIClipboardDataSnapshot {
+   public:
+    ClipboardDataSnapshot(
+        nsIClipboard::ClipboardType aClipboardType, int32_t aSequenceNumber,
+        nsTArray<nsCString>&& aFlavors, bool aFromCache,
+        nsBaseClipboard* aClipboard,
+        mozilla::dom::WindowContext* aRequestingWindowContext);
+
+    NS_DECL_ISUPPORTS
+    NS_DECL_NSICLIPBOARDDATASNAPSHOT
+
+   private:
+    virtual ~ClipboardDataSnapshot() = default;
+    bool IsValid();
+
+    using GetDataInternalCallback = mozilla::MoveOnlyFunction<void(nsresult)>;
+    void GetDataInternal(nsTArray<nsCString>&& aTypes,
+                         nsTArray<nsCString>::index_type aIndex,
+                         nsITransferable* aTransferable,
+                         GetDataInternalCallback&& aCallback);
+
+    const nsIClipboard::ClipboardType mClipboardType;
+    const int32_t mSequenceNumber;
+    const nsTArray<nsCString> mFlavors;
+    const bool mFromCache;
+    RefPtr<nsBaseClipboard> mClipboard;
+    RefPtr<mozilla::dom::WindowContext> mRequestingWindowContext;
+  };
+
+  class ClipboardCache final {
+   public:
+    ~ClipboardCache() {
+      Clear();
+    }
+
+    void Clear();
+    void Update(nsITransferable* aTransferable,
+                nsIClipboardOwner* aClipboardOwner, int32_t aSequenceNumber,
+                mozilla::Maybe<uint64_t> aInnerWindowId) {
+      Clear();
+      mTransferable = aTransferable;
+      mClipboardOwner = aClipboardOwner;
+      mSequenceNumber = aSequenceNumber;
+      mInnerWindowId = std::move(aInnerWindowId);
+    }
+    nsITransferable* GetTransferable() const { return mTransferable; }
+    nsIClipboardOwner* GetClipboardOwner() const { return mClipboardOwner; }
+    int32_t GetSequenceNumber() const { return mSequenceNumber; }
+    mozilla::Maybe<uint64_t> GetInnerWindowId() const { return mInnerWindowId; }
+    nsresult GetData(nsITransferable* aTransferable) const;
+
+   private:
+    nsCOMPtr<nsITransferable> mTransferable;
+    nsCOMPtr<nsIClipboardOwner> mClipboardOwner;
+    int32_t mSequenceNumber = -1;
+    mozilla::Maybe<uint64_t> mInnerWindowId;
+  };
+
+  void MaybeRetryGetAvailableFlavors(
+      const nsTArray<nsCString>& aFlavorList,
+      nsIClipboard::ClipboardType aWhichClipboard,
+      nsIClipboardGetDataSnapshotCallback* aCallback, int32_t aRetryCount,
+      mozilla::dom::WindowContext* aRequestingWindowContext);
+
+  ClipboardCache* GetClipboardCacheIfValid(ClipboardType aClipboardType);
+
+  mozilla::Result<nsTArray<nsCString>, nsresult> GetFlavorsFromClipboardCache(
+      ClipboardType aClipboardType);
+  nsresult GetDataFromClipboardCache(nsITransferable* aTransferable,
+                                     ClipboardType aClipboardType);
+  void RequestUserConfirmation(ClipboardType aClipboardType,
+                               const nsTArray<nsCString>& aFlavorList,
+                               mozilla::dom::WindowContext* aWindowContext,
+                               nsIPrincipal* aRequestingPrincipal,
+                               nsIClipboardGetDataSnapshotCallback* aCallback);
+
+  already_AddRefed<nsIClipboardDataSnapshot>
+  MaybeCreateGetRequestFromClipboardCache(
+      const nsTArray<nsCString>& aFlavorList, ClipboardType aClipboardType,
+      mozilla::dom::WindowContext* aRequestingWindowContext);
+
+  static nsresult SanitizeForClipboard(nsITransferable* aTransferable);
+
+  mozilla::Array<RefPtr<AsyncSetClipboardData>,
+                 nsIClipboard::kClipboardTypeCount>
+      mPendingWriteRequests;
+
+  mozilla::Array<mozilla::UniquePtr<ClipboardCache>,
+                 nsIClipboard::kClipboardTypeCount>
+      mCaches;
+  const mozilla::dom::ClipboardCapabilities mClipboardCaps;
+  bool mIgnoreEmptyNotification = false;
+};
+
+#endif  // nsBaseClipboard_h_

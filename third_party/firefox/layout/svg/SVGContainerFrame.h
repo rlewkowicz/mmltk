@@ -1,0 +1,107 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_SVGCONTAINERFRAME_H_
+#define LAYOUT_SVG_SVGCONTAINERFRAME_H_
+
+#include <memory>
+
+#include "mozilla/ISVGDisplayableFrame.h"
+#include "nsContainerFrame.h"
+#include "nsIFrame.h"
+#include "nsQueryFrame.h"
+#include "nsRect.h"
+
+class gfxContext;
+class nsFrameList;
+class nsIContent;
+
+struct nsRect;
+
+namespace mozilla {
+class PresShell;
+}  
+
+nsIFrame* NS_NewSVGContainerFrame(mozilla::PresShell* aPresShell,
+                                  mozilla::ComputedStyle* aStyle);
+
+namespace mozilla {
+
+class SVGContainerFrame : public nsContainerFrame {
+  friend nsIFrame* ::NS_NewSVGContainerFrame(mozilla::PresShell* aPresShell,
+                                             ComputedStyle* aStyle);
+
+ protected:
+  SVGContainerFrame(ComputedStyle* aStyle, nsPresContext* aPresContext,
+                    ClassID aID)
+      : nsContainerFrame(aStyle, aPresContext, aID) {
+    AddStateBits(NS_FRAME_SVG_LAYOUT);
+  }
+
+ public:
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(SVGContainerFrame)
+
+  virtual gfxMatrix GetCanvasTM() { return gfxMatrix(); }
+
+  virtual bool HasChildrenOnlyTransform(Matrix* aTransform) const {
+    return false;
+  }
+
+  void AppendFrames(ChildListID aListID, nsFrameList&& aFrameList) override;
+  void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                    const nsLineList::iterator* aPrevFrameLine,
+                    nsFrameList&& aFrameList) override;
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override {}
+
+  bool ComputeCustomOverflow(mozilla::OverflowAreas& aOverflowAreas) override;
+
+ protected:
+  static void ReflowSVGNonDisplayText(nsIFrame* aContainer);
+};
+
+class SVGDisplayContainerFrame : public SVGContainerFrame,
+                                 public ISVGDisplayableFrame {
+ protected:
+  SVGDisplayContainerFrame(ComputedStyle* aStyle, nsPresContext* aPresContext,
+                           nsIFrame::ClassID aID)
+      : SVGContainerFrame(aStyle, aPresContext, aID) {
+    AddStateBits(NS_FRAME_MAY_BE_TRANSFORMED);
+  }
+
+ public:
+  NS_DECL_QUERYFRAME
+  NS_DECL_QUERYFRAME_TARGET(SVGDisplayContainerFrame)
+  NS_DECL_ABSTRACT_FRAME(SVGDisplayContainerFrame)
+
+  void DidSetComputedStyle(ComputedStyle*) override;
+  void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                    const nsLineList::iterator* aPrevFrameLine,
+                    nsFrameList&& aFrameList) override;
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  bool DoGetParentSVGTransforms(Matrix*) const override;
+
+  void PaintSVG(gfxContext& aContext, const gfxMatrix& aTransform,
+                imgDrawingParams& aImgParams) override;
+  nsIFrame* GetFrameForPoint(const gfxPoint& aPoint) override;
+  void ReflowSVG() override;
+  void NotifySVGChanged(ChangeFlags aFlags) override;
+  SVGBBox GetBBoxContribution(const Matrix& aToBBoxUserspace,
+                              SVGBBoxFlags aFlags) override;
+  bool IsDisplayContainer() override { return true; }
+  gfxMatrix GetCanvasTM() override;
+
+ protected:
+  std::unique_ptr<gfxMatrix> mCanvasTM;
+};
+
+}  
+
+#endif  // LAYOUT_SVG_SVGCONTAINERFRAME_H_

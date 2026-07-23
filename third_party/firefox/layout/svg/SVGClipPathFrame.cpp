@@ -1,0 +1,407 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SVGClipPathFrame.h"
+
+#include "AutoReferenceChainGuard.h"
+#include "ImgDrawResult.h"
+#include "gfxContext.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/SVGGeometryFrame.h"
+#include "mozilla/SVGObserverUtils.h"
+#include "mozilla/SVGUtils.h"
+#include "mozilla/dom/SVGClipPathElement.h"
+#include "mozilla/dom/SVGGeometryElement.h"
+#include "nsGkAtoms.h"
+
+using namespace mozilla::dom;
+using namespace mozilla::gfx;
+using namespace mozilla::image;
+
+
+nsIFrame* NS_NewSVGClipPathFrame(mozilla::PresShell* aPresShell,
+                                 mozilla::ComputedStyle* aStyle) {
+  return new (aPresShell)
+      mozilla::SVGClipPathFrame(aStyle, aPresShell->GetPresContext());
+}
+
+namespace mozilla {
+
+NS_IMPL_FRAMEARENA_HELPERS(SVGClipPathFrame)
+
+void SVGClipPathFrame::ApplyClipPath(gfxContext& aContext,
+                                     nsIFrame* aClippedFrame,
+                                     const gfxMatrix& aMatrix) {
+  nsIFrame* singleClipPathChild = nullptr;
+  DebugOnly<bool> trivial = IsTrivial(&singleClipPathChild);
+  MOZ_ASSERT(trivial, "Caller needs to use GetClipMask");
+
+  const DrawTarget* drawTarget = aContext.GetDrawTarget();
+
+
+  gfxContextMatrixAutoSaveRestore autoRestoreTransform(&aContext);
+
+  RefPtr<Path> clipPath;
+
+  if (singleClipPathChild) {
+    SVGGeometryFrame* pathFrame = do_QueryFrame(singleClipPathChild);
+    if (pathFrame && pathFrame->StyleVisibility()->IsVisible()) {
+      SVGGeometryElement* pathElement =
+          static_cast<SVGGeometryElement*>(pathFrame->GetContent());
+
+      gfxMatrix toChildsUserSpace =
+          SVGUtils::GetTransformMatrixInUserSpace(pathFrame) *
+          (GetClipPathTransform(aClippedFrame) * aMatrix);
+
+      gfxMatrix newMatrix = aContext.CurrentMatrixDouble()
+                                .PreMultiply(toChildsUserSpace)
+                                .NudgeToIntegers();
+      if (!newMatrix.IsSingular()) {
+        aContext.SetMatrixDouble(newMatrix);
+        FillRule clipRule =
+            SVGUtils::ToFillRule(pathFrame->StyleSVG()->mClipRule);
+        clipPath = pathElement->GetOrBuildPath(drawTarget, clipRule);
+      }
+    }
+  }
+
+  if (clipPath) {
+    aContext.Clip(clipPath);
+  } else {
+    aContext.Clip(Rect());
+  }
+}
+
+static void ComposeExtraMask(DrawTarget* aTarget, SourceSurface* aExtraMask) {
+  MOZ_ASSERT(aExtraMask);
+
+  Matrix origin = aTarget->GetTransform();
+  aTarget->SetTransform(Matrix());
+  aTarget->MaskSurface(ColorPattern(DeviceColor(0.0, 0.0, 0.0, 1.0)),
+                       aExtraMask, Point(0, 0),
+                       DrawOptions(1.0, CompositionOp::OP_IN));
+  aTarget->SetTransform(origin);
+}
+
+void SVGClipPathFrame::PaintChildren(gfxContext& aMaskContext,
+                                     nsIFrame* aClippedFrame,
+                                     const gfxMatrix& aMatrix) {
+  SVGUtils::MaskUsage maskUsage = SVGUtils::DetermineMaskUsage(this, true);
+  gfxGroupForBlendAutoSaveRestore autoGroupForBlend(&aMaskContext);
+
+  if (maskUsage.ShouldApplyClipPath()) {
+    SVGClipPathFrame* clipPathThatClipsClipPath;
+    SVGObserverUtils::GetAndObserveClipPath(this, &clipPathThatClipsClipPath);
+    clipPathThatClipsClipPath->ApplyClipPath(aMaskContext, aClippedFrame,
+                                             aMatrix);
+  } else if (maskUsage.ShouldGenerateClipMaskLayer()) {
+    SVGClipPathFrame* clipPathThatClipsClipPath;
+    SVGObserverUtils::GetAndObserveClipPath(this, &clipPathThatClipsClipPath);
+    RefPtr<SourceSurface> maskSurface = clipPathThatClipsClipPath->GetClipMask(
+        aMaskContext, aClippedFrame, aMatrix);
+    Matrix maskTransform = aMaskContext.CurrentMatrix();
+    maskTransform.Invert();
+    autoGroupForBlend.PushGroupForBlendBack(gfxContentType::ALPHA, 1.0f,
+                                            maskSurface, maskTransform);
+  }
+
+  for (auto* kid : mFrames) {
+    PaintFrameIntoMask(kid, aClippedFrame, aMaskContext);
+  }
+
+  if (maskUsage.ShouldApplyClipPath()) {
+    aMaskContext.PopClip();
+  }
+}
+
+void SVGClipPathFrame::PaintClipMask(gfxContext& aMaskContext,
+                                     nsIFrame* aClippedFrame,
+                                     const gfxMatrix& aMatrix,
+                                     SourceSurface* aExtraMask) {
+  static int16_t sRefChainLengthCounter = AutoReferenceChainGuard::noChain;
+
+  AutoReferenceChainGuard refChainGuard(this, &mIsBeingProcessed,
+                                        &sRefChainLengthCounter);
+  if (MOZ_UNLIKELY(!refChainGuard.Reference())) {
+    return;  
+  }
+  if (!IsValid()) {
+    return;
+  }
+
+  DrawTarget* maskDT = aMaskContext.GetDrawTarget();
+  MOZ_ASSERT(maskDT->GetFormat() == SurfaceFormat::A8);
+
+  mMatrixForChildren = GetClipPathTransform(aClippedFrame) * aMatrix;
+
+  PaintChildren(aMaskContext, aClippedFrame, aMatrix);
+
+  if (aExtraMask) {
+    ComposeExtraMask(maskDT, aExtraMask);
+  }
+}
+
+void SVGClipPathFrame::PaintFrameIntoMask(nsIFrame* aFrame,
+                                          nsIFrame* aClippedFrame,
+                                          gfxContext& aTarget) {
+  ISVGDisplayableFrame* frame = do_QueryFrame(aFrame);
+  if (!frame) {
+    return;
+  }
+
+  frame->NotifySVGChanged(ISVGDisplayableFrame::ChangeFlag::TransformChanged);
+
+  SVGClipPathFrame* clipPathThatClipsChild;
+  if (SVGObserverUtils::GetAndObserveClipPath(aFrame,
+                                              &clipPathThatClipsChild) ==
+      SVGObserverUtils::ReferenceState::HasRefsSomeInvalid) {
+    return;
+  }
+
+  SVGUtils::MaskUsage maskUsage = SVGUtils::DetermineMaskUsage(aFrame, true);
+  gfxGroupForBlendAutoSaveRestore autoGroupForBlend(&aTarget);
+  if (maskUsage.ShouldApplyClipPath()) {
+    clipPathThatClipsChild->ApplyClipPath(
+        aTarget, aClippedFrame,
+        SVGUtils::GetTransformMatrixInUserSpace(aFrame) * mMatrixForChildren);
+  } else if (maskUsage.ShouldGenerateClipMaskLayer()) {
+    RefPtr<SourceSurface> maskSurface = clipPathThatClipsChild->GetClipMask(
+        aTarget, aClippedFrame,
+        SVGUtils::GetTransformMatrixInUserSpace(aFrame) * mMatrixForChildren);
+
+    Matrix maskTransform = aTarget.CurrentMatrix();
+    maskTransform.Invert();
+    autoGroupForBlend.PushGroupForBlendBack(gfxContentType::ALPHA, 1.0f,
+                                            maskSurface, maskTransform);
+  }
+
+  gfxMatrix toChildsUserSpace = mMatrixForChildren;
+  nsIFrame* child = do_QueryFrame(frame);
+  nsIContent* childContent = child->GetContent();
+  if (childContent->IsSVGElement()) {
+    toChildsUserSpace =
+        SVGUtils::GetTransformMatrixInUserSpace(child) * mMatrixForChildren;
+  }
+
+  image::imgDrawingParams imgParams;
+
+  frame->PaintSVG(aTarget, toChildsUserSpace, imgParams);
+
+  if (maskUsage.ShouldApplyClipPath()) {
+    aTarget.PopClip();
+  }
+}
+
+already_AddRefed<SourceSurface> SVGClipPathFrame::GetClipMask(
+    gfxContext& aReferenceContext, nsIFrame* aClippedFrame,
+    const gfxMatrix& aMatrix, SourceSurface* aExtraMask) {
+  RefPtr<DrawTarget> maskDT =
+      aReferenceContext.GetDrawTarget()->CreateClippedDrawTarget(
+          Rect(), SurfaceFormat::A8);
+  if (!maskDT) {
+    return nullptr;
+  }
+
+  gfxContext maskContext(maskDT,  true);
+  PaintClipMask(maskContext, aClippedFrame, aMatrix, aExtraMask);
+
+  RefPtr<SourceSurface> surface = maskDT->Snapshot();
+  return surface.forget();
+}
+
+bool SVGClipPathFrame::PointIsInsideClipPath(nsIFrame* aClippedFrame,
+                                             const gfxPoint& aPoint) {
+  static int16_t sRefChainLengthCounter = AutoReferenceChainGuard::noChain;
+
+  AutoReferenceChainGuard refChainGuard(this, &mIsBeingProcessed,
+                                        &sRefChainLengthCounter);
+  if (MOZ_UNLIKELY(!refChainGuard.Reference())) {
+    return false;  
+  }
+  if (!IsValid()) {
+    return false;
+  }
+
+  gfxMatrix matrix = GetClipPathTransform(aClippedFrame);
+  if (!matrix.Invert()) {
+    return false;
+  }
+  gfxPoint point = matrix.TransformPoint(aPoint);
+
+  SVGClipPathFrame* clipPathFrame;
+  SVGObserverUtils::GetAndObserveClipPath(this, &clipPathFrame);
+  if (clipPathFrame &&
+      !clipPathFrame->PointIsInsideClipPath(aClippedFrame, aPoint)) {
+    return false;
+  }
+
+  for (auto* kid : mFrames) {
+    ISVGDisplayableFrame* SVGFrame = do_QueryFrame(kid);
+    if (SVGFrame) {
+      gfxPoint pointForChild = point;
+
+      gfxMatrix m = SVGUtils::GetTransformMatrixInUserSpace(kid);
+      if (!m.IsIdentity()) {
+        if (!m.Invert()) {
+          return false;
+        }
+        pointForChild = m.TransformPoint(point);
+      }
+      if (SVGFrame->GetFrameForPoint(pointForChild)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+bool SVGClipPathFrame::IsTrivial(nsIFrame** aSingleChild) {
+  if (SVGObserverUtils::GetAndObserveClipPath(this, nullptr) ==
+      SVGObserverUtils::ReferenceState::HasRefsAllValid) {
+    return false;
+  }
+
+  if (aSingleChild) {
+    *aSingleChild = nullptr;
+  }
+
+  nsIFrame* foundChild = nullptr;
+  for (auto* kid : mFrames) {
+    ISVGDisplayableFrame* svgChild = do_QueryFrame(kid);
+    if (!svgChild) {
+      continue;
+    }
+    if (foundChild || svgChild->IsDisplayContainer()) {
+      return false;
+    }
+
+    if (SVGObserverUtils::GetAndObserveClipPath(kid, nullptr) ==
+        SVGObserverUtils::ReferenceState::HasRefsAllValid) {
+      return false;
+    }
+
+    foundChild = kid;
+  }
+  if (aSingleChild) {
+    *aSingleChild = foundChild;
+  }
+  return true;
+}
+
+bool SVGClipPathFrame::IsValid() {
+  if (SVGObserverUtils::GetAndObserveClipPath(this, nullptr) ==
+      SVGObserverUtils::ReferenceState::HasRefsSomeInvalid) {
+    return false;
+  }
+
+  for (auto* kid : mFrames) {
+    LayoutFrameType kidType = kid->Type();
+
+    if (kidType == LayoutFrameType::SVGUse) {
+      for (nsIFrame* grandKid : kid->PrincipalChildList()) {
+        LayoutFrameType grandKidType = grandKid->Type();
+
+        if (grandKidType != LayoutFrameType::SVGGeometry &&
+            grandKidType != LayoutFrameType::SVGText) {
+          return false;
+        }
+      }
+      continue;
+    }
+
+    if (kidType != LayoutFrameType::SVGGeometry &&
+        kidType != LayoutFrameType::SVGText) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+nsresult SVGClipPathFrame::AttributeChanged(int32_t aNameSpaceID,
+                                            nsAtom* aAttribute,
+                                            AttrModType aModType) {
+  if (aNameSpaceID == kNameSpaceID_None &&
+      aAttribute == nsGkAtoms::clipPathUnits) {
+    SVGObserverUtils::InvalidateRenderingObservers(this);
+  }
+  return SVGContainerFrame::AttributeChanged(aNameSpaceID, aAttribute,
+                                             aModType);
+}
+
+#ifdef DEBUG
+void SVGClipPathFrame::Init(nsIContent* aContent, nsContainerFrame* aParent,
+                            nsIFrame* aPrevInFlow) {
+  NS_ASSERTION(aContent->IsSVGElement(nsGkAtoms::clipPath),
+               "Content is not an SVG clipPath!");
+
+  SVGContainerFrame::Init(aContent, aParent, aPrevInFlow);
+}
+#endif
+
+gfxMatrix SVGClipPathFrame::GetCanvasTM() { return mMatrixForChildren; }
+
+gfxMatrix SVGClipPathFrame::GetClipPathTransform(nsIFrame* aClippedFrame) {
+  gfxMatrix tm = SVGUtils::GetTransformMatrixInUserSpace(this);
+
+  auto* content = static_cast<SVGClipPathElement*>(GetContent());
+  SVGAnimatedEnumeration* clipPathUnits =
+      &content->mEnumAttributes[SVGClipPathElement::CLIPPATHUNITS];
+
+  SVGBBoxFlags flags = SVGBBoxFlag::IncludeFillGeometry;
+
+  if (aClippedFrame->StyleBorder()->mBoxDecorationBreak ==
+      StyleBoxDecorationBreak::Clone) {
+    flags += SVGBBoxFlag::IncludeOnlyCurrentFrameForNonSVGElement;
+  }
+
+  return SVGUtils::AdjustMatrixForUnits(tm, clipPathUnits, aClippedFrame,
+                                        flags);
+}
+
+SVGBBox SVGClipPathFrame::GetBBoxForClipPathFrame(const SVGBBox& aBBox,
+                                                  const gfxMatrix& aMatrix,
+                                                  SVGBBoxFlags aFlags) {
+  SVGClipPathFrame* clipPathThatClipsClipPath;
+  if (SVGObserverUtils::GetAndObserveClipPath(this,
+                                              &clipPathThatClipsClipPath) ==
+      SVGObserverUtils::ReferenceState::HasRefsSomeInvalid) {
+    return SVGBBox();
+  }
+
+  nsIContent* node = GetContent()->GetFirstChild();
+  SVGBBox unionBBox;
+  for (; node; node = node->GetNextSibling()) {
+    if (nsIFrame* frame = node->GetPrimaryFrame()) {
+      ISVGDisplayableFrame* svg = do_QueryFrame(frame);
+      if (svg) {
+        gfxMatrix matrix =
+            SVGUtils::GetTransformMatrixInUserSpace(frame) * aMatrix;
+        SVGBBox tmpBBox = svg->GetBBoxContribution(
+            gfx::ToMatrix(matrix), SVGBBoxFlag::IncludeFillGeometry);
+        SVGClipPathFrame* clipPathFrame;
+        if (SVGObserverUtils::GetAndObserveClipPath(frame, &clipPathFrame) !=
+                SVGObserverUtils::ReferenceState::HasRefsSomeInvalid &&
+            clipPathFrame) {
+          tmpBBox =
+              clipPathFrame->GetBBoxForClipPathFrame(tmpBBox, aMatrix, aFlags);
+        }
+        if (!aFlags.contains(
+                SVGBBoxFlag::DoNotClipToBBoxOfContentInsideClipPath)) {
+          tmpBBox.Intersect(aBBox);
+        }
+        unionBBox.UnionEdges(tmpBBox);
+      }
+    }
+  }
+
+  if (clipPathThatClipsClipPath) {
+    unionBBox.Intersect(clipPathThatClipsClipPath->GetBBoxForClipPathFrame(
+        aBBox, aMatrix, aFlags));
+  }
+  return unionBBox;
+}
+
+}  

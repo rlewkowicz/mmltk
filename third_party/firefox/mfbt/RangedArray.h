@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_RangedArray_h
+#define mozilla_RangedArray_h
+
+#include "mozilla/Array.h"
+
+namespace mozilla {
+
+template <typename T, size_t MinIndex, size_t Length>
+class RangedArray {
+ private:
+  typedef Array<T, Length> ArrayType;
+  ArrayType mArr;
+
+ public:
+  static size_t length() { return Length; }
+  static size_t minIndex() { return MinIndex; }
+
+  T& operator[](size_t aIndex) {
+    MOZ_ASSERT(aIndex >= MinIndex);
+    return mArr[aIndex - MinIndex];
+  }
+
+  const T& operator[](size_t aIndex) const {
+    MOZ_ASSERT(aIndex >= MinIndex);
+    return mArr[aIndex - MinIndex];
+  }
+
+  typedef typename ArrayType::iterator iterator;
+  typedef typename ArrayType::const_iterator const_iterator;
+  typedef typename ArrayType::reverse_iterator reverse_iterator;
+  typedef typename ArrayType::const_reverse_iterator const_reverse_iterator;
+
+  iterator begin() { return mArr.begin(); }
+  const_iterator begin() const { return mArr.begin(); }
+  const_iterator cbegin() const { return mArr.cbegin(); }
+  iterator end() { return mArr.end(); }
+  const_iterator end() const { return mArr.end(); }
+  const_iterator cend() const { return mArr.cend(); }
+
+  reverse_iterator rbegin() { return mArr.rbegin(); }
+  const_reverse_iterator rbegin() const { return mArr.rbegin(); }
+  const_reverse_iterator crbegin() const { return mArr.crbegin(); }
+  reverse_iterator rend() { return mArr.rend(); }
+  const_reverse_iterator rend() const { return mArr.rend(); }
+  const_reverse_iterator crend() const { return mArr.crend(); }
+};
+
+}  
+
+#endif  // mozilla_RangedArray_h

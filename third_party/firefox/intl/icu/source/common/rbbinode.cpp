@@ -1,0 +1,396 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+***************************************************************************
+*   Copyright (C) 2002-2016 International Business Machines Corporation   *
+*   and others. All rights reserved.                                      *
+***************************************************************************
+*/
+
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_BREAK_ITERATION
+
+#include "unicode/unistr.h"
+#include "unicode/uniset.h"
+#include "unicode/uchar.h"
+#include "unicode/parsepos.h"
+
+#include "cstr.h"
+#include "uvector.h"
+
+#include "rbbirb.h"
+#include "rbbinode.h"
+
+#include "uassert.h"
+
+
+U_NAMESPACE_BEGIN
+
+#ifdef RBBI_DEBUG
+static int  gLastSerial = 0;
+#endif
+
+
+RBBINode::RBBINode(NodeType t, UErrorCode& status) : UMemory() {
+    if (U_FAILURE(status)) {
+        return;
+    }
+#ifdef RBBI_DEBUG
+    fSerialNum    = ++gLastSerial;
+#endif
+    fType         = t;
+    fParent       = nullptr;
+    fLeftChild    = nullptr;
+    fRightChild   = nullptr;
+    fInputSet     = nullptr;
+    fFirstPos     = 0;
+    fLastPos      = 0;
+    fNullable     = false;
+    fLookAheadEnd = false;
+    fRuleRoot     = false;
+    fChainIn      = false;
+    fVal          = 0;
+    fPrecedence   = precZero;
+
+    fFirstPosSet  = new UVector(status);
+    fLastPosSet   = new UVector(status);
+    fFollowPos    = new UVector(status);
+    if (U_SUCCESS(status) &&
+        (fFirstPosSet == nullptr || fLastPosSet == nullptr || fFollowPos == nullptr)) {
+        status =  U_MEMORY_ALLOCATION_ERROR;
+    }
+    if      (t==opCat)    {fPrecedence = precOpCat;}
+    else if (t==opOr)     {fPrecedence = precOpOr;}
+    else if (t==opStart)  {fPrecedence = precStart;}
+    else if (t==opLParen) {fPrecedence = precLParen;}
+
+}
+
+
+RBBINode::RBBINode(const RBBINode &other, UErrorCode& status) : UMemory(other) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+#ifdef RBBI_DEBUG
+    fSerialNum   = ++gLastSerial;
+#endif
+    fType        = other.fType;
+    fParent      = nullptr;
+    fLeftChild   = nullptr;
+    fRightChild  = nullptr;
+    fInputSet    = other.fInputSet;
+    fPrecedence  = other.fPrecedence;
+    fText        = other.fText;
+    fFirstPos    = other.fFirstPos;
+    fLastPos     = other.fLastPos;
+    fNullable    = other.fNullable;
+    fVal         = other.fVal;
+    fRuleRoot    = false;
+    fChainIn     = other.fChainIn;
+    fFirstPosSet = new UVector(status);   
+    fLastPosSet  = new UVector(status);
+    fFollowPos   = new UVector(status);
+    if (U_SUCCESS(status) &&
+        (fFirstPosSet == nullptr || fLastPosSet == nullptr || fFollowPos == nullptr)) {
+        status =  U_MEMORY_ALLOCATION_ERROR;
+    }
+}
+
+
+RBBINode::~RBBINode() {
+    delete fInputSet;
+    fInputSet = nullptr;
+
+    switch (this->fType) {
+    case varRef:
+    case setRef:
+        break;
+
+    default:
+        NRDeleteNode(fLeftChild);
+        fLeftChild =   nullptr;
+        NRDeleteNode(fRightChild);
+        fRightChild = nullptr;
+    }
+
+    delete fFirstPosSet;
+    delete fLastPosSet;
+    delete fFollowPos;
+}
+
+void RBBINode::NRDeleteNode(RBBINode *node) {
+    if (node == nullptr) {
+        return;
+    }
+
+    RBBINode *stopNode = node->fParent;
+    RBBINode *nextNode = node;
+    while (nextNode != stopNode && nextNode != nullptr) {
+        RBBINode *currentNode = nextNode;
+
+        if ((currentNode->fLeftChild == nullptr && currentNode->fRightChild == nullptr) ||
+                currentNode->fType == varRef ||      
+                currentNode->fType == setRef) {      
+            nextNode = currentNode->fParent;
+            if (nextNode) {
+                if (nextNode->fLeftChild == currentNode) {
+                    nextNode->fLeftChild = nullptr;
+                } else if (nextNode->fRightChild == currentNode) {
+                    nextNode->fRightChild = nullptr;
+                }
+            }
+            delete currentNode;
+        } else if (currentNode->fLeftChild) {
+            nextNode = currentNode->fLeftChild;
+            if (nextNode->fParent == nullptr) {
+                nextNode->fParent = currentNode;
+            }
+            U_ASSERT(nextNode->fParent == currentNode);
+        } else if (currentNode->fRightChild) {
+            nextNode = currentNode->fRightChild;
+            if (nextNode->fParent == nullptr) {
+                nextNode->fParent = currentNode;
+            }
+            U_ASSERT(nextNode->fParent == currentNode);
+        }
+    }
+}
+
+constexpr int kRecursiveDepthLimit = 3500;
+RBBINode *RBBINode::cloneTree(UErrorCode &status, int depth) {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    if (depth > kRecursiveDepthLimit) {
+        status = U_INPUT_TOO_LONG_ERROR;
+        return nullptr;
+    }
+    RBBINode    *n;
+
+    if (fType == RBBINode::varRef) {
+        n = fLeftChild->cloneTree(status, depth+1);
+        if (U_FAILURE(status)) {
+            return nullptr;
+        }
+    } else if (fType == RBBINode::uset) {
+        n = this;
+    } else {
+        n = new RBBINode(*this, status);
+        if (U_FAILURE(status)) {
+            delete n;
+            return nullptr;
+        }
+        if (n == nullptr) {
+            status =  U_MEMORY_ALLOCATION_ERROR;
+            return nullptr;
+        }
+        if (fLeftChild != nullptr) {
+            n->fLeftChild          = fLeftChild->cloneTree(status, depth+1);
+            if (U_FAILURE(status)) {
+                delete n;
+                return nullptr;
+            }
+            n->fLeftChild->fParent = n;
+        }
+        if (fRightChild != nullptr) {
+            n->fRightChild          = fRightChild->cloneTree(status, depth+1);
+            if (U_FAILURE(status)) {
+                delete n;
+                return nullptr;
+            }
+            n->fRightChild->fParent = n;
+        }
+    }
+    return n;
+}
+
+
+
+RBBINode *RBBINode::flattenVariables(UErrorCode& status, int depth) {
+    if (U_FAILURE(status)) {
+        return this;
+    }
+    if (depth > kRecursiveDepthLimit) {
+        status = U_INPUT_TOO_LONG_ERROR;
+        return this;
+    }
+    if (fType == varRef) {
+        RBBINode *retNode  = fLeftChild->cloneTree(status, depth+1);
+        if (U_FAILURE(status)) {
+            return this;
+        }
+        retNode->fRuleRoot = this->fRuleRoot;
+        retNode->fChainIn  = this->fChainIn;
+        delete this;   
+        return retNode;
+    }
+
+    if (fLeftChild != nullptr) {
+        fLeftChild = fLeftChild->flattenVariables(status, depth+1);
+        if (fLeftChild == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+        }
+        if (U_FAILURE(status)) {
+            return this;
+        }
+        fLeftChild->fParent  = this;
+    }
+    if (fRightChild != nullptr) {
+        fRightChild = fRightChild->flattenVariables(status, depth+1);
+        if (fRightChild == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+        }
+        if (U_FAILURE(status)) {
+            return this;
+        }
+        fRightChild->fParent = this;
+    }
+    return this;
+}
+
+
+void RBBINode::flattenSets(UErrorCode &status, int depth) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (depth > kRecursiveDepthLimit) {
+        status = U_INPUT_TOO_LONG_ERROR;
+        return;
+    }
+    U_ASSERT(fType != setRef);
+
+    if (fLeftChild != nullptr) {
+        if (fLeftChild->fType==setRef) {
+            RBBINode *setRefNode = fLeftChild;
+            RBBINode *usetNode   = setRefNode->fLeftChild;
+            RBBINode *replTree   = usetNode->fLeftChild;
+            fLeftChild           = replTree->cloneTree(status, depth+1);
+            if (U_FAILURE(status)) {
+                delete setRefNode;
+                return;
+            }
+            fLeftChild->fParent  = this;
+            delete setRefNode;
+        } else {
+            fLeftChild->flattenSets(status, depth+1);
+        }
+    }
+
+    if (fRightChild != nullptr) {
+        if (fRightChild->fType==setRef) {
+            RBBINode *setRefNode = fRightChild;
+            RBBINode *usetNode   = setRefNode->fLeftChild;
+            RBBINode *replTree   = usetNode->fLeftChild;
+            fRightChild           = replTree->cloneTree(status, depth+1);
+            if (U_FAILURE(status)) {
+                delete setRefNode;
+                return;
+            }
+            fRightChild->fParent  = this;
+            delete setRefNode;
+        } else {
+            fRightChild->flattenSets(status, depth+1);
+        }
+    }
+}
+
+
+
+void   RBBINode::findNodes(UVector *dest, RBBINode::NodeType kind, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    U_ASSERT(!dest->hasDeleter());
+    if (fType == kind) {
+        dest->addElement(this, status);
+    }
+    if (fLeftChild != nullptr) {
+        fLeftChild->findNodes(dest, kind, status);
+    }
+    if (fRightChild != nullptr) {
+        fRightChild->findNodes(dest, kind, status);
+    }
+}
+
+
+#ifdef RBBI_DEBUG
+
+static int32_t serial(const RBBINode *node) {
+    return (node == nullptr? -1 : node->fSerialNum);
+}
+
+
+void RBBINode::printNode(const RBBINode *node) {
+    static const char * const nodeTypeNames[] = {
+                "setRef",
+                "uset",
+                "varRef",
+                "leafChar",
+                "lookAhead",
+                "tag",
+                "endMark",
+                "opStart",
+                "opCat",
+                "opOr",
+                "opStar",
+                "opPlus",
+                "opQuestion",
+                "opBreak",
+                "opReverse",
+                "opLParen"
+    };
+
+    if (node==nullptr) {
+        RBBIDebugPrintf("%10p", (void *)node);
+    } else {
+        RBBIDebugPrintf("%10p %5d %12s %c%c  %5d       %5d     %5d       %6d     %d ",
+            (void *)node, node->fSerialNum, nodeTypeNames[node->fType],
+            node->fRuleRoot?'R':' ', node->fChainIn?'C':' ',
+            serial(node->fLeftChild), serial(node->fRightChild), serial(node->fParent),
+            node->fFirstPos, node->fVal);
+        if (node->fType == varRef) {
+            RBBI_DEBUG_printUnicodeString(node->fText);
+        }
+    }
+    RBBIDebugPrintf("\n");
+}
+#endif
+
+
+#ifdef RBBI_DEBUG
+U_CFUNC void RBBI_DEBUG_printUnicodeString(const UnicodeString &s, int minWidth) {
+    RBBIDebugPrintf("%*s", minWidth, CStr(s)());
+}
+#endif
+
+
+#ifdef RBBI_DEBUG
+void RBBINode::printNodeHeader() {
+    RBBIDebugPrintf(" Address   serial        type     LeftChild  RightChild   Parent   position value\n");
+}
+    
+void RBBINode::printTree(const RBBINode *node, UBool printHeading) {
+    if (printHeading) {
+        printNodeHeader();
+    }
+    printNode(node);
+    if (node != nullptr) {
+        if (node->fType != varRef) {
+            if (node->fLeftChild != nullptr) {
+                printTree(node->fLeftChild, false);
+            }
+            
+            if (node->fRightChild != nullptr) {
+                printTree(node->fRightChild, false);
+            }
+        }
+    }
+}
+#endif
+
+
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_BREAK_ITERATION */

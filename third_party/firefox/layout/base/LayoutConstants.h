@@ -1,0 +1,59 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef LayoutConstants_h_
+#define LayoutConstants_h_
+
+#include "Units.h"
+#include "mozilla/EnumSet.h"
+
+inline constexpr nscoord NS_UNCONSTRAINEDSIZE = nscoord_MAX;
+
+inline constexpr nscoord NS_AUTOOFFSET = NS_UNCONSTRAINEDSIZE;
+
+inline constexpr nscoord NS_AUTOMARGIN = NS_UNCONSTRAINEDSIZE + 1;
+
+inline constexpr nscoord NS_INTRINSIC_ISIZE_UNKNOWN = nscoord_MIN;
+
+namespace mozilla {
+
+enum class ComputeSizeFlag : uint8_t {
+  ShrinkWrap,
+
+  IsGridMeasuringReflow,
+
+  IClampMarginBoxMinSize,  
+  BClampMarginBoxMinSize,  
+
+  IApplyAutoMinSize,  
+};
+using ComputeSizeFlags = mozilla::EnumSet<ComputeSizeFlag>;
+
+inline constexpr CSSIntCoord kFallbackIntrinsicWidthInPixels(300);
+inline constexpr CSSIntCoord kFallbackIntrinsicHeightInPixels(150);
+inline constexpr CSSIntSize kFallbackIntrinsicSizeInPixels(
+    kFallbackIntrinsicWidthInPixels, kFallbackIntrinsicHeightInPixels);
+
+inline constexpr nscoord kFallbackIntrinsicWidth =
+    kFallbackIntrinsicWidthInPixels * AppUnitsPerCSSPixel();
+inline constexpr nscoord kFallbackIntrinsicHeight =
+    kFallbackIntrinsicHeightInPixels * AppUnitsPerCSSPixel();
+inline constexpr nsSize kFallbackIntrinsicSize(kFallbackIntrinsicWidth,
+                                               kFallbackIntrinsicHeight);
+
+enum class IntrinsicISizeType { MinISize, PrefISize };
+
+enum class ContentRelevancyReason {
+  Visible,
+
+  FocusInSubtree,
+
+  Selected,
+};
+using ContentRelevancy = EnumSet<ContentRelevancyReason, uint8_t>;
+
+}  
+
+#endif  // LayoutConstants_h_

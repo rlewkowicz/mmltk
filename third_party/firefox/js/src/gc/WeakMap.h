@@ -1,0 +1,475 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_WeakMap_h
+#define gc_WeakMap_h
+
+#include "mozilla/Atomics.h"
+#include "mozilla/Maybe.h"
+
+#include "ds/SlimLinkedList.h"
+#include "gc/AllocKind.h"
+#include "gc/Barrier.h"
+#include "gc/Cell.h"
+#include "gc/Marking.h"
+#include "gc/Tracer.h"
+#include "gc/ZoneAllocator.h"
+#include "js/GCVector.h"
+#include "js/HashTable.h"
+#include "js/HeapAPI.h"
+#include "vm/JSObject.h"
+
+namespace JS {
+class Zone;
+}
+
+namespace js {
+
+class GCMarker;
+class WeakMapBase;
+struct WeakMapTracer;
+
+template <typename T>
+struct WeakMapKeyHasher;
+
+extern void DumpWeakMapLog(JSRuntime* rt);
+
+namespace gc {
+
+void MarkSymbolForWeakMapReadBarrier(JS::Zone* zone, JS::Symbol* sym);
+
+#if defined(JS_GC_ZEAL) || defined(DEBUG)
+bool CheckWeakMapEntryMarking(const WeakMapBase* map, Cell* key, Cell* value);
+#endif
+
+template <typename PtrT>
+struct MightBeInNursery {
+  using T = std::remove_pointer_t<PtrT>;
+  static_assert(std::is_base_of_v<Cell, T>);
+  static_assert(!std::is_same_v<Cell, T> && !std::is_same_v<TenuredCell, T>);
+
+#define CAN_NURSERY_ALLOC_KIND_OR(_1, _2, Type, _3, _4, canNurseryAlloc, _5) \
+  std::is_base_of_v<Type, T> ? canNurseryAlloc:
+
+  static constexpr bool value =
+      FOR_EACH_ALLOCKIND(CAN_NURSERY_ALLOC_KIND_OR) true;
+#undef CAN_NURSERY_ALLOC_KIND_OR
+};
+template <>
+struct MightBeInNursery<JS::Value> {
+  static constexpr bool value = true;
+};
+
+}  
+
+
+
+using WeakMapColors = HashMap<WeakMapBase*, js::gc::CellColor,
+                              DefaultHasher<WeakMapBase*>, SystemAllocPolicy>;
+
+class WeakMapBase;
+using WeakMapList = SlimLinkedList<WeakMapBase>;
+
+class WeakMapBase : public SlimLinkedListElement<WeakMapBase> {
+  friend class js::GCMarker;
+
+ public:
+  using CellColor = js::gc::CellColor;
+
+  WeakMapBase(JSObject* memOf, JS::Zone* zone);
+  virtual ~WeakMapBase() = default;
+
+  JS::Zone* zone() const { return zone_; }
+
+  bool isSystem() const { return !memberOf; }
+
+
+  static void unmarkZone(JS::Zone* zone);
+#ifdef DEBUG
+  static void checkZoneUnmarked(JS::Zone* zone);
+#else
+  static void checkZoneUnmarked(JS::Zone* zone) {}
+#endif
+
+  static bool markZoneIteratively(JS::Zone* zone, GCMarker* marker);
+
+  [[nodiscard]] static bool findSweepGroupEdgesForZone(JS::Zone* atomsZone,
+                                                       JS::Zone* mapZone);
+
+  static void traceAllMappings(WeakMapTracer* tracer);
+
+#if defined(JS_GC_ZEAL)
+  static bool saveZoneMarkedWeakMaps(JS::Zone* zone,
+                                     WeakMapColors& markedWeakMaps);
+
+  static void restoreMarkedWeakMaps(WeakMapColors& markedWeakMaps);
+#endif
+
+#if defined(JS_GC_ZEAL) || defined(DEBUG)
+  static bool checkMarkingForZone(JS::Zone* zone);
+#endif
+
+#ifdef JSGC_HASH_TABLE_CHECKS
+  static void checkWeakMapsAfterMovingGC(JS::Zone* zone);
+#endif
+
+ protected:
+  virtual bool empty() const = 0;
+  virtual void trace(JSTracer* tracer) = 0;
+  virtual bool findSweepGroupEdges(Zone* atomsZone) = 0;
+  virtual void traceWeakEdgesDuringSweeping(JSTracer* trc) = 0;
+  virtual void traceMappings(WeakMapTracer* tracer) = 0;
+  virtual void clearAndCompact() = 0;
+
+  virtual bool markEntries(GCMarker* marker) = 0;
+
+  virtual bool traceNurseryEntriesOnMinorGC(JSTracer* trc) = 0;
+  virtual bool sweepAfterMinorGC() = 0;
+
+  [[nodiscard]] bool addEphemeronEdgesForEntry(gc::MarkColor mapColor,
+                                               gc::TenuredCell* key,
+                                               gc::Cell* delegate,
+                                               gc::TenuredCell* value);
+  [[nodiscard]] bool addEphemeronEdge(gc::MarkColor color, gc::TenuredCell* src,
+                                      gc::TenuredCell* dst);
+
+  gc::CellColor mapColor() const { return gc::CellColor(uint32_t(mapColor_)); }
+  void setMapColor(gc::CellColor newColor) { mapColor_ = uint32_t(newColor); }
+
+  bool isMarked() const { return gc::IsMarked(mapColor()); }
+
+  mozilla::Maybe<gc::CellColor> markMap(gc::MarkColor markColor);
+
+  void setHasNurseryEntries();
+
+#ifdef DEBUG
+  virtual void checkCachedFlags() const = 0;
+#endif
+
+#ifdef JS_GC_ZEAL
+  virtual bool checkMarking() const = 0;
+  virtual bool allowKeysInOtherZones() const { return false; }
+  friend bool gc::CheckWeakMapEntryMarking(const WeakMapBase*, gc::Cell*,
+                                           gc::Cell*);
+#endif
+
+#ifdef JSGC_HASH_TABLE_CHECKS
+  virtual void checkAfterMovingGC() const = 0;
+#endif
+
+  HeapPtr<JSObject*> memberOf;
+
+  JS::Zone* zone_;
+
+  mozilla::Atomic<uint32_t, mozilla::Relaxed> mapColor_;
+
+  bool mayHaveKeyDelegates = false;
+  bool mayHaveSymbolKeys = false;
+
+  bool hasNurseryEntries = false;
+
+  bool nurseryKeysValid = true;
+
+  friend class JS::Zone;
+  friend class js::Nursery;
+};
+
+HashNumber GetSymbolHash(JS::Symbol* sym);
+
+template <typename T>
+struct WeakMapKeyHasher : public DefaultHasher<T> {};
+
+template <>
+struct WeakMapKeyHasher<JS::Value> {
+  using Key = JS::Value;
+  using Lookup = JS::Value;
+
+  static HashNumber hash(const Lookup& l) {
+    checkValueType(l);
+    if (l.isSymbol()) {
+      return GetSymbolHash(l.toSymbol());
+    }
+    return mozilla::HashGeneric(l.asRawBits());
+  }
+
+  static bool match(const Key& k, const Lookup& l) {
+    checkValueType(k);
+    return k == l;
+  }
+
+  static void rekey(Key& k, const Key& newKey) { k = newKey; }
+
+ private:
+  static void checkValueType(const Value& value);
+};
+
+template <>
+struct WeakMapKeyHasher<PreBarriered<JS::Value>> {
+  using Key = PreBarriered<JS::Value>;
+  using Lookup = JS::Value;
+
+  static HashNumber hash(const Lookup& l) {
+    return WeakMapKeyHasher<JS::Value>::hash(l);
+  }
+  static bool match(const Key& k, const Lookup& l) {
+    return WeakMapKeyHasher<JS::Value>::match(k, l);
+  }
+  static void rekey(Key& k, const Lookup& newKey) { k.unbarrieredSet(newKey); }
+};
+
+template <class Key, class Value, class AllocPolicy>
+class WeakMap : public WeakMapBase {
+  using BarrieredKey = PreBarriered<Key>;
+  using BarrieredValue = PreBarriered<Value>;
+
+  using Map = HashMap<BarrieredKey, BarrieredValue,
+                      WeakMapKeyHasher<BarrieredKey>, AllocPolicy>;
+  using UnbarrieredMap =
+      HashMap<Key, Value, WeakMapKeyHasher<Key>, AllocPolicy>;
+
+  UnbarrieredMap map_;  
+
+  GCVector<Key, 0, AllocPolicy> nurseryKeys;
+
+ public:
+  using Lookup = typename Map::Lookup;
+  using Entry = typename Map::Entry;
+  using Iterator = typename Map::Iterator;
+  using ModIterator = typename Map::ModIterator;
+
+
+  using MutablePtr = typename Map::Ptr;
+  class Ptr {
+    MutablePtr ptr;
+    friend class WeakMap;
+
+   public:
+    explicit Ptr(const MutablePtr& ptr) : ptr(ptr) {}
+    bool found() const { return ptr.found(); }
+    explicit operator bool() const { return found(); }
+    const Entry& operator*() const { return *ptr; }
+    const Entry* operator->() const { return &*ptr; }
+  };
+
+  using MutableAddPtr = typename Map::AddPtr;
+  class AddPtr {
+    MutableAddPtr ptr;
+    friend class WeakMap;
+
+   public:
+    explicit AddPtr(const MutableAddPtr& ptr) : ptr(ptr) {}
+    bool found() const { return ptr.found(); }
+    explicit operator bool() const { return found(); }
+    const Entry& operator*() const { return *ptr; }
+    const Entry* operator->() const { return &*ptr; }
+  };
+
+  explicit WeakMap(JSContext* cx, JSObject* memOf);
+
+  explicit WeakMap(JS::Zone* zone);
+
+  ~WeakMap() override;
+
+  Iterator iter() const { return map().iter(); }
+  ModIterator modIter() { return map().modIter(); }
+  uint32_t count() const { return map().count(); }
+  bool empty() const override { return map().empty(); }
+  bool has(const Lookup& lookup) const { return map().has(lookup); }
+  void remove(const Lookup& lookup) { return map().remove(lookup); }
+  void remove(Ptr ptr) { return map().remove(ptr.ptr); }
+
+  Value get(const Lookup& l) const {
+    Ptr ptr = lookup(l);
+    if (!ptr) {
+      return Value();
+    }
+    return ptr->value();
+  }
+
+  Ptr lookup(const Lookup& l) const {
+    Ptr p = lookupUnbarriered(l);
+    if (p) {
+      valueReadBarrier(p->value());
+    }
+    return p;
+  }
+
+  Ptr lookupUnbarriered(const Lookup& l) const { return Ptr(map().lookup(l)); }
+
+  AddPtr lookupForAdd(const Lookup& l) {
+    AddPtr p(map().lookupForAdd(l));
+    if (p) {
+      valueReadBarrier(p->value());
+    }
+    return p;
+  }
+
+  [[nodiscard]] bool add(AddPtr& p, const Key& k, const Value& v) {
+    MOZ_ASSERT(gc::ToMarkable(k));
+    writeBarrier(k, v);
+    return map().add(p.ptr, k, v);
+  }
+
+  [[nodiscard]] bool relookupOrAdd(AddPtr& p, const Key& k, const Value& v) {
+    MOZ_ASSERT(gc::ToMarkable(k));
+    writeBarrier(k, v);
+    return map().relookupOrAdd(p.ptr, k, v);
+  }
+
+  [[nodiscard]] bool put(const Key& k, const Value& v) {
+    MOZ_ASSERT(gc::ToMarkable(k));
+    writeBarrier(k, v);
+    return map().put(k, v);
+  }
+
+  [[nodiscard]] bool putNew(const Key& k, const Value& v) {
+    MOZ_ASSERT(gc::ToMarkable(k));
+    writeBarrier(k, v);
+    return map().putNew(k, v);
+  }
+
+  void clear() {
+    map().clear();
+    nurseryKeys.clear();
+    nurseryKeysValid = true;
+    mayHaveSymbolKeys = false;
+    if (!isSystem()) {
+      mayHaveKeyDelegates = false;
+    }
+  }
+
+#ifdef DEBUG
+  bool hasEntry(const Key& key, const Value& value) const {
+    Ptr p = lookupUnbarriered(key);
+    return p && p->value() == value;
+  }
+#endif
+
+  bool markEntry(GCMarker* marker, gc::CellColor mapColor, ModIterator& iter,
+                 bool populateWeakKeysTable);
+
+  void trace(JSTracer* trc) override;
+
+  void traceKeys(JSTracer* trc);
+  void traceKey(JSTracer* trc, ModIterator& iter);
+
+  size_t shallowSizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf);
+
+  static size_t offsetOfHashShift() {
+    return offsetof(WeakMap, map_) + UnbarrieredMap::offsetOfHashShift();
+  }
+  static size_t offsetOfTable() {
+    return offsetof(WeakMap, map_) + UnbarrieredMap::offsetOfTable();
+  }
+  static size_t offsetOfEntryCount() {
+    return offsetof(WeakMap, map_) + UnbarrieredMap::offsetOfEntryCount();
+  }
+
+ protected:
+  inline void assertMapIsSameZoneWithValue(const BarrieredValue& v);
+
+  bool markEntries(GCMarker* marker) override;
+
+  bool findSweepGroupEdges(Zone* atomsZone) override;
+
+#if DEBUG
+  void assertEntriesNotAboutToBeFinalized();
+  void checkCachedFlags() const override;
+#endif
+
+#ifdef JS_GC_ZEAL
+  bool checkMarking() const override;
+#endif
+
+#ifdef JSGC_HASH_TABLE_CHECKS
+  void checkAfterMovingGC() const override;
+#endif
+
+ private:
+  static void staticAssertions();
+
+  Map& map() { return reinterpret_cast<Map&>(map_); }
+  const Map& map() const { return reinterpret_cast<const Map&>(map_); }
+
+  MutablePtr lookupMutableUnbarriered(const Lookup& l) {
+    return map().lookup(l);
+  }
+
+  void valueReadBarrier(const JS::Value& v) const {
+    JS::ExposeValueToActiveJS(v);
+    if (MOZ_UNLIKELY(v.isSymbol())) {
+      gc::MarkSymbolForWeakMapReadBarrier(zone(), v.toSymbol());
+    }
+  }
+  static void valueReadBarrier(JSObject* obj) {
+    JS::ExposeObjectToActiveJS(obj);
+  }
+  static void valueReadBarrier(jit::JitCode* code) {
+    gc::ExposeGCThingToActiveJS(JS::GCCellPtr(code));
+  }
+
+  void writeBarrier(const Key& key, const Value& value) {
+    keyKindBarrier(key);
+    nurseryEntryBarrier(key, value);
+  }
+
+  void keyKindBarrier(const JS::Value& key) {
+    if (key.isSymbol() && !mayHaveSymbolKeys) {
+      setMayHaveSymbolKeys();
+    }
+    if (key.isObject()) {
+      keyKindBarrier(&key.toObject());
+    }
+  }
+  void keyKindBarrier(JSObject* key) {
+    if (!IsProxy(key)) {
+      MOZ_ASSERT(!ObjectMayBeSwapped(key));
+      return;
+    }
+    keyKindBarrierSlow(key);
+  }
+  void keyKindBarrierSlow(JSObject* key) {
+    if (!mayHaveKeyDelegates) {
+      JSObject* delegate = UncheckedUnwrapWithoutExpose(key);
+      if (delegate != key || ObjectMayBeSwapped(key)) {
+        setMayHaveKeyDelegates();
+      }
+    }
+  }
+  void keyKindBarrier(BaseScript* key) {}
+
+  void nurseryEntryBarrier(const Key& key, const Value& value) {
+    if ((gc::MightBeInNursery<Key>::value &&
+         !JS::GCPolicy<Key>::isTenured(key)) ||
+        (gc::MightBeInNursery<Value>::value &&
+         !JS::GCPolicy<Value>::isTenured(value))) {
+      if (!hasNurseryEntries) {
+        setHasNurseryEntries();
+      }
+
+      addNurseryKey(key);
+    }
+  }
+
+  void addNurseryKey(const Key& key);
+  void setMayHaveSymbolKeys();
+  void setMayHaveKeyDelegates();
+
+  void traceWeakEdgesDuringSweeping(JSTracer* trc) override;
+
+  void clearAndCompact() override {
+    clear();
+    map().compact();
+    nurseryKeys.clearAndFree();
+  }
+
+  void traceMappings(WeakMapTracer* tracer) override;
+
+  bool traceNurseryEntriesOnMinorGC(JSTracer* trc) override;
+  bool sweepAfterMinorGC() override;
+};
+
+} 
+
+#endif /* gc_WeakMap_h */

@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<extension href="template/">
+
+  <name>template</name>
+
+
+  <aliases>
+    <alias>VENDOR_EXT_NAME</alias>
+
+    <alias>VENDOR_EXT_NAME</alias>
+  </aliases>
+
+
+
+  <contact> <a href="https://www.khronos.org/webgl/public-mailing-list/">WebGL
+  working group</a> (public_webgl 'at' khronos.org) </contact>
+
+
+  <contributors>
+    <contributor>Members of the WebGL working group</contributor>
+  </contributors>
+
+  <number>k </number>
+
+  <depends>
+    <api version="1.0"/>
+
+    <core version="2.0"/>
+
+
+    <core version="2.0">
+      <glsl version="300 es"/>
+
+
+      <addendum> Difference in core spec from extension. </addendum>
+    </core>
+
+    <removed version="2.0"/>
+
+
+    <ext name="WEBGL_required_ext" require="true"/>
+
+    <ext name="WEBGL_base_ext"/>
+
+  </depends>
+
+  <overview>
+
+    <mirrors href="http://www.khronos.org/registry/gles/extensions/OES/OES_texture_float.txt"
+             name="OES_texture_float">
+
+      <addendum>Optional support for <code>FLOAT</code> textures as FBO
+      attachments.</addendum>
+
+    </mirrors>
+
+
+    <div class="nonnormative">
+      <p> This template for WebGL extensions is derived from the <a
+      href="http://www.opengl.org/registry/doc/template/txt">OpenGL extension
+      template</a>. Refer to the OpenGL extension template for full
+      documentation of the content that should be contained in the sections
+      below. Because WebGL is fundamentally a Web API, its extensions are
+      specified in XML transformed with XSLT into HTML for easier
+      hyperlinking. </p>
+
+      <p> Because most WebGL extensions are expected to simply mirror existing
+      OpenGL and OpenGL ES extensions, it is desirable to keep the WebGL
+      extension specifications as small as possible and simply refer to the
+      other specifications for the behavioral definitions. </p>
+    </div>
+
+    <features>
+
+      <feature>Frobs the <b>baz</b></feature>
+
+
+      <glsl extname="GL_OES_foo_bar">
+        <alias extname="GL_NV_foo_bar"/>
+
+        <alias extname="GL_ATI_foo_bar"/>
+
+        <stage type="fragment"/>
+
+        <stage type="vertex"/>
+
+        <function name="myfun" type="vec4">
+          <param type="vec4"/>
+        </function>
+      </glsl>
+    </features>
+  </overview>
+
+  <idl xml:space="preserve"> 
+module webgl {
+
+interface OES_foo_bar {
+  const GLenum NEW_ENUM = 0xF00;
+
+  void doSomethingNew(GLenum state, GLuint value);
+}; // interface OES_foo_bar
+
+}; // module webgl
+  </idl>
+
+
+  <newfun>
+    <function name="loseContext" type="void"> XHTML description </function>
+  </newfun>
+
+
+  <newtypes>
+    <typedef name="in_pipe"> <type>unsigned long long</type> XHTML </typedef>
+
+    <typedef name="out_pipe"> <type>unsigned long long</type> XHTML </typedef>
+
+    <interface name="Plumber">
+      <member>Plumber work(in_pipe,out_pipe);</member>
+
+      <p>After attempting a connection, the plumber is no longer the same.</p>
+    </interface>
+
+    <interface name="Agency" noobject="true"> <member>void
+    register(Plumber);</member> <member>Plumber find();</member> XHTML
+    </interface>
+  </newtypes>
+
+
+  <newtok>
+    <function name="getParameter" type="any"> <param name="pname"
+    type="GLenum"/> XHTML </function>
+  </newtok>
+
+
+
+  <security/>
+
+  <ipstatus/>
+
+  <additions/>
+
+
+  <errors/>
+
+  <newstate/>
+
+  <newimplstate/>
+
+
+  <samplecode/>
+
+  <tests/>
+
+  <issues/>
+
+  <history>
+
+
+    <revision date="YYYY/MM/DD">
+
+      <change>Quuxed the bar</change>
+
+      <change>Fooed the frob</change>
+    </revision>
+  </history>
+</extension>

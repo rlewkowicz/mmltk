@@ -1,0 +1,877 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ds_LifoAlloc_h
+#define ds_LifoAlloc_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/CheckedArithmetic.h"
+#include "mozilla/MemoryChecking.h"
+#include "mozilla/MemoryReporting.h"
+
+#include <algorithm>
+#include <bit>
+#include <new>
+#include <stddef.h>  // size_t
+#include <type_traits>
+#include <utility>
+
+
+#include "js/UniquePtr.h"
+#include "util/Memory.h"
+#include "util/Poison.h"
+
+namespace js {
+
+
+template <typename T, typename = void>
+struct CanLifoAlloc : std::false_type {};
+
+template <typename T>
+struct CanLifoAlloc<T*> : std::true_type {};
+
+template <typename T>
+using lifo_alloc_pointer = std::enable_if_t<
+    js::CanLifoAlloc<std::remove_pointer_t<T>>::value ||
+        std::is_trivially_destructible_v<std::remove_pointer_t<T>>,
+    T>;
+
+namespace detail {
+
+template <typename T, typename D>
+class SingleLinkedList;
+
+template <typename T, typename D = JS::DeletePolicy<T>>
+class SingleLinkedListElement {
+  friend class SingleLinkedList<T, D>;
+  js::UniquePtr<T, D> next_;
+
+ public:
+  SingleLinkedListElement() : next_(nullptr) {}
+  ~SingleLinkedListElement() { MOZ_ASSERT(!next_); }
+
+  T* next() const { return next_.get(); }
+};
+
+template <typename T, typename D = JS::DeletePolicy<T>>
+class SingleLinkedList {
+ private:
+  UniquePtr<T, D> head_;
+
+  T* last_;
+
+  void assertInvariants() {
+    MOZ_ASSERT(bool(head_) == bool(last_));
+    MOZ_ASSERT_IF(last_, !last_->next_);
+  }
+
+ public:
+  SingleLinkedList() : head_(nullptr), last_(nullptr) { assertInvariants(); }
+
+  SingleLinkedList(SingleLinkedList&& other)
+      : head_(std::move(other.head_)), last_(other.last_) {
+    other.last_ = nullptr;
+    assertInvariants();
+    other.assertInvariants();
+  }
+
+  ~SingleLinkedList() {
+    MOZ_ASSERT(!head_);
+    MOZ_ASSERT(!last_);
+  }
+
+  SingleLinkedList& operator=(SingleLinkedList&& other) {
+    head_ = std::move(other.head_);
+    last_ = other.last_;
+    other.last_ = nullptr;
+    assertInvariants();
+    other.assertInvariants();
+    return *this;
+  }
+
+  bool empty() const { return !last_; }
+
+  class Iterator {
+    T* current_;
+
+   public:
+    explicit Iterator(T* current) : current_(current) {}
+
+    T& operator*() const { return *current_; }
+    T* operator->() const { return current_; }
+    T* get() const { return current_; }
+
+    const Iterator& operator++() {
+      current_ = current_->next();
+      return *this;
+    }
+
+    bool operator!=(const Iterator& other) const {
+      return current_ != other.current_;
+    }
+    bool operator==(const Iterator& other) const {
+      return current_ == other.current_;
+    }
+  };
+
+  Iterator begin() const { return Iterator(head_.get()); }
+  Iterator end() const { return Iterator(nullptr); }
+  Iterator last() const { return Iterator(last_); }
+
+  SingleLinkedList splitAfter(T* newLast) {
+    MOZ_ASSERT(newLast);
+    SingleLinkedList result;
+    if (newLast->next_) {
+      result.head_ = std::move(newLast->next_);
+      result.last_ = last_;
+      last_ = newLast;
+    }
+    assertInvariants();
+    result.assertInvariants();
+    return result;
+  }
+
+  void pushFront(UniquePtr<T, D>&& elem) {
+    if (!last_) {
+      last_ = elem.get();
+    }
+    elem->next_ = std::move(head_);
+    head_ = std::move(elem);
+    assertInvariants();
+  }
+
+  void append(UniquePtr<T, D>&& elem) {
+    if (last_) {
+      last_->next_ = std::move(elem);
+      last_ = last_->next_.get();
+    } else {
+      head_ = std::move(elem);
+      last_ = head_.get();
+    }
+    assertInvariants();
+  }
+  void appendAll(SingleLinkedList&& list) {
+    if (list.empty()) {
+      return;
+    }
+    if (last_) {
+      last_->next_ = std::move(list.head_);
+    } else {
+      head_ = std::move(list.head_);
+    }
+    last_ = list.last_;
+    list.last_ = nullptr;
+    assertInvariants();
+    list.assertInvariants();
+  }
+  void steal(SingleLinkedList&& list) {
+    head_ = std::move(list.head_);
+    last_ = list.last_;
+    list.last_ = nullptr;
+    assertInvariants();
+    list.assertInvariants();
+  }
+  void prependAll(SingleLinkedList&& list) {
+    list.appendAll(std::move(*this));
+    steal(std::move(list));
+  }
+  UniquePtr<T, D> popFirst() {
+    MOZ_ASSERT(head_);
+    UniquePtr<T, D> result = std::move(head_);
+    head_ = std::move(result->next_);
+    if (!head_) {
+      last_ = nullptr;
+    }
+    assertInvariants();
+    return result;
+  }
+};
+
+static const size_t LIFO_ALLOC_ALIGN = 8;
+
+MOZ_ALWAYS_INLINE
+uint8_t* AlignPtr(uint8_t* orig) {
+  static_assert(std::has_single_bit(LIFO_ALLOC_ALIGN),
+                "LIFO_ALLOC_ALIGN must be a power of two");
+
+  uint8_t* result = (uint8_t*)AlignBytes(uintptr_t(orig), LIFO_ALLOC_ALIGN);
+  MOZ_ASSERT(uintptr_t(result) % LIFO_ALLOC_ALIGN == 0);
+  return result;
+}
+
+class BumpChunk : public SingleLinkedListElement<BumpChunk> {
+ private:
+  uint8_t* bump_;
+  uint8_t* const capacity_;
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  const uintptr_t magic_ : 24;
+  static constexpr uintptr_t magicNumber = uintptr_t(0x4c6966);
+#endif
+
+#if defined(DEBUG)
+#  define LIFO_CHUNK_PROTECT 1
+#endif
+
+#if defined(DEBUG)
+#  define LIFO_HAVE_MEM_CHECKS 1
+#  define LIFO_MAKE_MEM_NOACCESS(addr, size)       \
+    do {                                           \
+      uint8_t* base = (addr);                      \
+      size_t sz = (size);                          \
+      MOZ_MAKE_MEM_UNDEFINED(base, sz);            \
+      memset(base, JS_LIFO_UNDEFINED_PATTERN, sz); \
+      MOZ_MAKE_MEM_NOACCESS(base, sz);             \
+    } while (0)
+
+#  define LIFO_MAKE_MEM_UNDEFINED(addr, size)          \
+    do {                                               \
+      uint8_t* base = (addr);                          \
+      size_t sz = (size);                              \
+      MOZ_MAKE_MEM_UNDEFINED(base, sz);                \
+      memset(base, JS_LIFO_UNINITIALIZED_PATTERN, sz); \
+      MOZ_MAKE_MEM_UNDEFINED(base, sz);                \
+    } while (0)
+
+#elif defined(MOZ_HAVE_MEM_CHECKS)
+#  define LIFO_HAVE_MEM_CHECKS 1
+#  define LIFO_MAKE_MEM_NOACCESS(addr, size) \
+    MOZ_MAKE_MEM_NOACCESS((addr), (size))
+#  define LIFO_MAKE_MEM_UNDEFINED(addr, size) \
+    MOZ_MAKE_MEM_UNDEFINED((addr), (size))
+#endif
+
+#ifdef LIFO_HAVE_MEM_CHECKS
+  static constexpr size_t RedZoneSize = 16;
+#else
+  static constexpr size_t RedZoneSize = 0;
+#endif
+
+  void assertInvariants() {
+    MOZ_DIAGNOSTIC_ASSERT(magic_ == magicNumber);
+    MOZ_ASSERT(begin() <= end());
+    MOZ_ASSERT(end() <= capacity_);
+  }
+
+  explicit BumpChunk(uintptr_t capacity)
+      : bump_(begin()),
+        capacity_(base() + capacity)
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+        ,
+        magic_(magicNumber)
+#endif
+  {
+    assertInvariants();
+#if defined(LIFO_HAVE_MEM_CHECKS)
+    LIFO_MAKE_MEM_NOACCESS(bump_, capacity_ - bump_);
+#endif
+  }
+
+  const uint8_t* base() const { return reinterpret_cast<const uint8_t*>(this); }
+  uint8_t* base() { return reinterpret_cast<uint8_t*>(this); }
+
+  void setBump(uint8_t* newBump) {
+    assertInvariants();
+    MOZ_ASSERT(begin() <= newBump);
+    MOZ_ASSERT(newBump <= capacity_);
+#if defined(LIFO_HAVE_MEM_CHECKS)
+    if (bump_ > newBump) {
+      LIFO_MAKE_MEM_NOACCESS(newBump, bump_ - newBump);
+    } else if (newBump > bump_) {
+      MOZ_ASSERT(newBump - RedZoneSize >= bump_);
+      LIFO_MAKE_MEM_UNDEFINED(bump_, newBump - RedZoneSize - bump_);
+    }
+#endif
+    bump_ = newBump;
+  }
+
+ public:
+  ~BumpChunk() { release(); }
+
+  BumpChunk& operator=(const BumpChunk&) = delete;
+  BumpChunk(const BumpChunk&) = delete;
+
+  bool empty() const { return end() == begin(); }
+
+  size_t used() const { return end() - begin(); }
+
+  inline const uint8_t* begin() const;
+  inline uint8_t* begin();
+  uint8_t* end() const { return bump_; }
+
+  static UniquePtr<BumpChunk> newWithCapacity(size_t size, arena_id_t arena);
+
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return mallocSizeOf(this);
+  }
+
+  size_t computedSizeOfIncludingThis() const { return capacity_ - base(); }
+
+  class Mark {
+    BumpChunk* chunk_;
+    uint8_t* bump_;
+
+    friend class BumpChunk;
+    Mark(BumpChunk* chunk, uint8_t* bump) : chunk_(chunk), bump_(bump) {}
+
+   public:
+    Mark() : chunk_(nullptr), bump_(nullptr) {}
+
+    BumpChunk* markedChunk() const { return chunk_; }
+  };
+
+  Mark mark() { return Mark(this, end()); }
+
+  bool contains(const void* ptr) const {
+    return begin() <= ptr && ptr <= end();
+  }
+
+  bool contains(Mark m) const {
+    MOZ_ASSERT(m.chunk_ == this);
+    return contains(m.bump_);
+  }
+
+  void release() { setBump(begin()); }
+
+  void release(Mark m) {
+    MOZ_RELEASE_ASSERT(contains(m));
+    setBump(m.bump_);
+  }
+
+  [[nodiscard]] static inline bool allocSizeWithRedZone(size_t amount,
+                                                        size_t* size);
+
+  static uint8_t* nextAllocBase(uint8_t* e) { return detail::AlignPtr(e); }
+  static uint8_t* nextAllocEnd(uint8_t* b, size_t n) {
+    return b + n + RedZoneSize;
+  }
+
+  bool canAlloc(size_t n) const {
+    uint8_t* newBump = nextAllocEnd(nextAllocBase(end()), n);
+    return bump_ <= newBump && newBump <= capacity_;
+  }
+
+  size_t unused() const {
+    uint8_t* aligned = nextAllocBase(end());
+    if (aligned < capacity_) {
+      return capacity_ - aligned;
+    }
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE
+  void* tryAlloc(size_t n) {
+    uint8_t* aligned = nextAllocBase(end());
+    uint8_t* newBump = nextAllocEnd(aligned, n);
+
+    if (newBump > capacity_) {
+      return nullptr;
+    }
+
+    if (MOZ_UNLIKELY(newBump < bump_)) {
+      return nullptr;
+    }
+
+    MOZ_ASSERT(canAlloc(n));  
+    setBump(newBump);
+    return aligned;
+  }
+
+#ifdef LIFO_CHUNK_PROTECT
+  void setReadOnly();
+  void setReadWrite();
+#else
+  void setReadOnly() const {}
+  void setReadWrite() const {}
+#endif
+};
+
+static constexpr size_t BumpChunkReservedSpace =
+    AlignBytes(sizeof(BumpChunk), LIFO_ALLOC_ALIGN);
+
+[[nodiscard]]  inline bool BumpChunk::allocSizeWithRedZone(
+    size_t amount, size_t* size) {
+  constexpr size_t SpaceBefore = BumpChunkReservedSpace;
+  static_assert((SpaceBefore % LIFO_ALLOC_ALIGN) == 0,
+                "reserved space presumed already aligned");
+
+  constexpr size_t SpaceAfter = RedZoneSize;  
+
+  constexpr size_t SpaceBeforeAndAfter = SpaceBefore + SpaceAfter;
+  static_assert(SpaceBeforeAndAfter >= SpaceBefore,
+                "intermediate addition must not overflow");
+
+  *size = SpaceBeforeAndAfter + amount;
+  return MOZ_LIKELY(*size >= SpaceBeforeAndAfter);
+}
+
+inline const uint8_t* BumpChunk::begin() const {
+  return base() + BumpChunkReservedSpace;
+}
+
+inline uint8_t* BumpChunk::begin() { return base() + BumpChunkReservedSpace; }
+
+}  
+
+class LifoAlloc {
+  using UniqueBumpChunk = js::UniquePtr<detail::BumpChunk>;
+  using BumpChunkList = detail::SingleLinkedList<detail::BumpChunk>;
+
+  BumpChunkList chunks_;
+
+  BumpChunkList oversize_;
+
+  BumpChunkList unused_;
+
+  size_t markCount;
+  size_t defaultChunkSize_;
+  size_t oversizeThreshold_;
+
+  size_t curSize_;
+  size_t peakSize_;
+
+  size_t smallAllocsSize_;
+
+  arena_id_t arena_;
+
+#if defined(DEBUG) || defined(JS_OOM_BREAKPOINT)
+  bool fallibleScope_;
+#endif
+
+  UniqueBumpChunk newChunkWithCapacity(size_t n, bool oversize);
+
+  UniqueBumpChunk getOrCreateChunk(size_t n);
+
+  void reset(size_t defaultChunkSize);
+
+  void appendUnused(BumpChunkList&& otherUnused) {
+#ifdef DEBUG
+    for (detail::BumpChunk& bc : otherUnused) {
+      MOZ_ASSERT(bc.empty());
+    }
+#endif
+    unused_.appendAll(std::move(otherUnused));
+  }
+
+  void appendUsed(BumpChunkList&& otherChunks) {
+    chunks_.appendAll(std::move(otherChunks));
+  }
+
+  void incrementCurSize(size_t size) {
+    curSize_ += size;
+    if (curSize_ > peakSize_) {
+      peakSize_ = curSize_;
+    }
+  }
+  void decrementCurSize(size_t size) {
+    MOZ_ASSERT(curSize_ >= size);
+    curSize_ -= size;
+    MOZ_ASSERT(curSize_ >= smallAllocsSize_);
+  }
+
+  void* allocImplColdPath(size_t n);
+  void* allocImplOversize(size_t n);
+
+  MOZ_ALWAYS_INLINE
+  void* allocImpl(size_t n) {
+    void* result;
+    if (MOZ_UNLIKELY(n > oversizeThreshold_)) {
+      return allocImplOversize(n);
+    }
+    if (MOZ_LIKELY(!chunks_.empty() &&
+                   (result = chunks_.last()->tryAlloc(n)))) {
+      return result;
+    }
+    return allocImplColdPath(n);
+  }
+
+  [[nodiscard]] bool ensureUnusedApproximateColdPath(size_t n, size_t total);
+
+ public:
+  LifoAlloc(size_t defaultChunkSize, arena_id_t arena)
+      : peakSize_(0),
+        arena_(arena)
+#if defined(DEBUG) || defined(JS_OOM_BREAKPOINT)
+        ,
+        fallibleScope_(true)
+#endif
+  {
+    reset(defaultChunkSize);
+  }
+
+  void operator=(const LifoAlloc&) = delete;
+  LifoAlloc(const LifoAlloc&) = delete;
+
+  void disableOversize() { oversizeThreshold_ = SIZE_MAX; }
+  void setOversizeThreshold(size_t oversizeThreshold) {
+    MOZ_ASSERT(oversizeThreshold <= defaultChunkSize_);
+    oversizeThreshold_ = oversizeThreshold;
+  }
+
+  void steal(LifoAlloc* other);
+
+  void transferFrom(LifoAlloc* other);
+
+  void transferUnusedFrom(LifoAlloc* other);
+
+  ~LifoAlloc() { freeAll(); }
+
+  size_t defaultChunkSize() const { return defaultChunkSize_; }
+
+  void freeAll();
+
+  void freeAllIfHugeAndUnused() {
+    if (markCount == 0 && isHuge()) {
+      freeAll();
+    }
+  }
+
+  MOZ_ALWAYS_INLINE
+  void* alloc(size_t n) {
+#if defined(DEBUG) || defined(JS_OOM_BREAKPOINT)
+    if (fallibleScope_) {
+      JS_OOM_POSSIBLY_FAIL();
+    }
+#endif
+    return allocImpl(n);
+  }
+
+  MOZ_ALWAYS_INLINE
+  void* allocEnsureUnused(size_t n, size_t needed) {
+    JS_OOM_POSSIBLY_FAIL();
+    MOZ_ASSERT(fallibleScope_);
+
+    Mark m = mark();
+    void* result = allocImpl(n);
+    if (!ensureUnusedApproximate(needed)) {
+      release(m);
+      return nullptr;
+    }
+    cancelMark(m);
+    return result;
+  }
+
+  template <typename T, typename... Args>
+  MOZ_ALWAYS_INLINE auto newWithSize(size_t n, Args&&... args)
+      -> js::lifo_alloc_pointer<T*> {
+    MOZ_ASSERT(n >= sizeof(T), "must request enough space to store a T");
+    static_assert(alignof(T) <= detail::LIFO_ALLOC_ALIGN,
+                  "LifoAlloc must provide enough alignment to store T");
+    void* ptr = alloc(n);
+    if (!ptr) {
+      return nullptr;
+    }
+
+    return new (ptr) T(std::forward<Args>(args)...);
+  }
+
+  MOZ_ALWAYS_INLINE
+  void* allocInfallible(size_t n) {
+    AutoEnterOOMUnsafeRegion oomUnsafe;
+    if (void* result = allocImpl(n)) {
+      return result;
+    }
+    oomUnsafe.crash("LifoAlloc::allocInfallible");
+    return nullptr;
+  }
+
+  [[nodiscard]] MOZ_ALWAYS_INLINE bool ensureUnusedApproximate(size_t n) {
+    AutoFallibleScope fallibleAllocator(this);
+    size_t total = 0;
+    if (!chunks_.empty()) {
+      total += chunks_.last()->unused();
+      if (total >= n) {
+        return true;
+      }
+    }
+
+    return ensureUnusedApproximateColdPath(n, total);
+  }
+
+  MOZ_ALWAYS_INLINE
+  void setAsInfallibleByDefault() {
+#if defined(DEBUG) || defined(JS_OOM_BREAKPOINT)
+    fallibleScope_ = false;
+#endif
+  }
+
+  class MOZ_NON_TEMPORARY_CLASS AutoFallibleScope {
+#if defined(DEBUG) || defined(JS_OOM_BREAKPOINT)
+    LifoAlloc* lifoAlloc_;
+    bool prevFallibleScope_;
+
+   public:
+    explicit AutoFallibleScope(LifoAlloc* lifoAlloc) {
+      lifoAlloc_ = lifoAlloc;
+      prevFallibleScope_ = lifoAlloc->fallibleScope_;
+      lifoAlloc->fallibleScope_ = true;
+    }
+
+    ~AutoFallibleScope() { lifoAlloc_->fallibleScope_ = prevFallibleScope_; }
+#else
+   public:
+    explicit AutoFallibleScope(LifoAlloc*) {}
+#endif
+  };
+
+  template <typename T>
+  T* newArray(size_t count) {
+    static_assert(std::is_trivial_v<T>,
+                  "T must be trivially constructible so that constructors need "
+                  "not be called");
+    static_assert(std::is_trivially_destructible_v<T>,
+                  "T must be trivially destructible so destructors don't need "
+                  "to be called when the LifoAlloc is freed");
+    return newArrayUninitialized<T>(count);
+  }
+
+  template <typename T>
+  T* newArrayUninitialized(size_t count) {
+    size_t bytes;
+    if (MOZ_UNLIKELY(!CalculateAllocSize<T>(count, &bytes))) {
+      return nullptr;
+    }
+    return static_cast<T*>(alloc(bytes));
+  }
+
+  class Mark {
+    friend class LifoAlloc;
+    detail::BumpChunk::Mark chunk;
+    detail::BumpChunk::Mark oversize;
+  };
+
+  MOZ_NEVER_INLINE Mark mark();
+
+  void release(Mark mark);
+
+  void cancelMark(Mark mark) { markCount--; }
+
+  void releaseAll() {
+    MOZ_ASSERT(!markCount);
+
+    smallAllocsSize_ = 0;
+
+    for (detail::BumpChunk& bc : chunks_) {
+      bc.release();
+    }
+    unused_.appendAll(std::move(chunks_));
+
+    while (!oversize_.empty()) {
+      UniqueBumpChunk bc = oversize_.popFirst();
+      decrementCurSize(bc->computedSizeOfIncludingThis());
+    }
+  }
+
+#ifdef LIFO_CHUNK_PROTECT
+  void setReadOnly();
+  void setReadWrite();
+#else
+  void setReadOnly() const {}
+  void setReadWrite() const {}
+#endif
+
+  size_t used() const {
+    size_t accum = 0;
+    for (const detail::BumpChunk& chunk : chunks_) {
+      accum += chunk.used();
+    }
+    return accum;
+  }
+
+  bool isEmpty() const {
+    bool empty = chunks_.empty() ||
+                 (chunks_.begin() == chunks_.last() && chunks_.last()->empty());
+    MOZ_ASSERT_IF(!oversize_.empty(), !oversize_.last()->empty());
+    return empty && oversize_.empty();
+  }
+
+  static const unsigned HUGE_ALLOCATION = 50 * 1024 * 1024;
+  bool isHuge() const { return curSize_ > HUGE_ALLOCATION; }
+
+  size_t availableInCurrentChunk() const {
+    if (chunks_.empty()) {
+      return 0;
+    }
+    return chunks_.last()->unused();
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    size_t n = 0;
+    for (const detail::BumpChunk& chunk : chunks_) {
+      n += chunk.sizeOfIncludingThis(mallocSizeOf);
+    }
+    for (const detail::BumpChunk& chunk : oversize_) {
+      n += chunk.sizeOfIncludingThis(mallocSizeOf);
+    }
+    for (const detail::BumpChunk& chunk : unused_) {
+      n += chunk.sizeOfIncludingThis(mallocSizeOf);
+    }
+    return n;
+  }
+
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return mallocSizeOf(this) + sizeOfExcludingThis(mallocSizeOf);
+  }
+
+  size_t computedSizeOfExcludingThis() const { return curSize_; }
+
+  size_t peakSizeOfExcludingThis() const { return peakSize_; }
+
+  template <typename T>
+  MOZ_ALWAYS_INLINE T* pod_malloc() {
+    return static_cast<T*>(alloc(sizeof(T)));
+  }
+
+  JS_DECLARE_NEW_METHODS(new_, alloc, MOZ_ALWAYS_INLINE)
+  JS_DECLARE_NEW_METHODS(newInfallible, allocInfallible, MOZ_ALWAYS_INLINE)
+
+#ifdef DEBUG
+  bool contains(const void* ptr) const {
+    for (const detail::BumpChunk& chunk : chunks_) {
+      if (chunk.contains(ptr)) {
+        return true;
+      }
+    }
+    for (const detail::BumpChunk& chunk : oversize_) {
+      if (chunk.contains(ptr)) {
+        return true;
+      }
+    }
+    return false;
+  }
+#endif
+
+  class Enum {
+    friend class LifoAlloc;
+    friend class detail::BumpChunk;
+
+    BumpChunkList::Iterator chunkIt_;
+    BumpChunkList::Iterator chunkEnd_;
+    uint8_t* head_;
+
+    uint8_t* seekBaseAndAdvanceBy(size_t size) {
+      MOZ_ASSERT(!empty());
+
+      uint8_t* aligned = detail::BumpChunk::nextAllocBase(head_);
+      if (detail::BumpChunk::nextAllocEnd(aligned, size) > chunkIt_->end()) {
+        ++chunkIt_;
+        aligned = chunkIt_->begin();
+        MOZ_ASSERT(!chunkIt_->empty());
+      }
+      head_ = detail::BumpChunk::nextAllocEnd(aligned, size);
+      MOZ_ASSERT(head_ <= chunkIt_->end());
+      return aligned;
+    }
+
+   public:
+    explicit Enum(LifoAlloc& alloc)
+        : chunkIt_(alloc.chunks_.begin()),
+          chunkEnd_(alloc.chunks_.end()),
+          head_(nullptr) {
+      MOZ_RELEASE_ASSERT(alloc.oversize_.empty());
+      if (chunkIt_ != chunkEnd_) {
+        head_ = chunkIt_->begin();
+      }
+    }
+
+    bool empty() {
+      return chunkIt_ == chunkEnd_ ||
+             (chunkIt_->next() == chunkEnd_.get() && head_ >= chunkIt_->end());
+    }
+
+    template <typename T>
+    T* read(size_t size = sizeof(T)) {
+      return reinterpret_cast<T*>(read(size));
+    }
+
+    void* read(size_t size) { return seekBaseAndAdvanceBy(size); }
+  };
+};
+
+class MOZ_NON_TEMPORARY_CLASS LifoAllocScope {
+  LifoAlloc* lifoAlloc;
+  LifoAlloc::Mark mark;
+  LifoAlloc::AutoFallibleScope fallibleScope;
+
+ public:
+  explicit LifoAllocScope(LifoAlloc* lifoAlloc)
+      : lifoAlloc(lifoAlloc),
+        mark(lifoAlloc->mark()),
+        fallibleScope(lifoAlloc) {}
+
+  ~LifoAllocScope() {
+    lifoAlloc->release(mark);
+
+    lifoAlloc->freeAllIfHugeAndUnused();
+  }
+
+  LifoAlloc& alloc() { return *lifoAlloc; }
+};
+
+enum Fallibility { Fallible, Infallible };
+
+template <Fallibility fb>
+class LifoAllocPolicy : public AllocPolicyBase {
+  LifoAlloc& alloc_;
+
+ public:
+  MOZ_IMPLICIT LifoAllocPolicy(LifoAlloc& alloc) : alloc_(alloc) {}
+  template <typename T>
+  T* maybe_pod_malloc(size_t numElems) {
+    size_t bytes;
+    if (MOZ_UNLIKELY(!CalculateAllocSize<T>(numElems, &bytes))) {
+      return nullptr;
+    }
+    void* p =
+        fb == Fallible ? alloc_.alloc(bytes) : alloc_.allocInfallible(bytes);
+    return static_cast<T*>(p);
+  }
+  template <typename T>
+  T* maybe_pod_calloc(size_t numElems) {
+    T* p = maybe_pod_malloc<T>(numElems);
+    if (MOZ_UNLIKELY(!p)) {
+      return nullptr;
+    }
+    memset(p, 0, numElems * sizeof(T));
+    return p;
+  }
+  template <typename T>
+  T* maybe_pod_realloc(T* p, size_t oldSize, size_t newSize) {
+    T* n = maybe_pod_malloc<T>(newSize);
+    if (MOZ_UNLIKELY(!n)) {
+      return nullptr;
+    }
+    size_t oldLength;
+    [[maybe_unused]] bool nooverflow =
+        mozilla::SafeMul(oldSize, sizeof(T), &oldLength);
+    MOZ_ASSERT(nooverflow);
+    memcpy(n, p, std::min(oldLength, newSize * sizeof(T)));
+    return n;
+  }
+  template <typename T>
+  T* pod_malloc(size_t numElems) {
+    return maybe_pod_malloc<T>(numElems);
+  }
+  template <typename T>
+  T* pod_calloc(size_t numElems) {
+    return maybe_pod_calloc<T>(numElems);
+  }
+  template <typename T>
+  T* pod_realloc(T* p, size_t oldSize, size_t newSize) {
+    return maybe_pod_realloc<T>(p, oldSize, newSize);
+  }
+  template <typename T>
+  void free_(T* p, size_t numElems) {}
+  [[nodiscard]] bool checkSimulatedOOM() const {
+    return fb == Infallible || !js::oom::ShouldFailWithOOM();
+  }
+
+  bool operator==(const LifoAllocPolicy<fb>& other) const {
+    return &alloc_ == &other.alloc_;
+  }
+};
+
+}  
+
+#endif /* ds_LifoAlloc_h */

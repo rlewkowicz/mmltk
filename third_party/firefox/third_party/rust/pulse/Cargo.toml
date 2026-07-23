@@ -1,0 +1,23 @@
+
+[package]
+edition = "2021"
+name = "pulse"
+version = "0.3.0"
+authors = ["Dan Glastonbury <dglastonbury@mozilla.com>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+license = "ISC"
+
+[lib]
+name = "pulse"
+path = "src/lib.rs"
+
+[dependencies]
+bitflags = "2"
+
+[dependencies.pulse-ffi]
+path = "../pulse-ffi"

@@ -1,0 +1,1462 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_NORMALIZATION
+
+#if !UCONFIG_NO_FORMATTING
+
+#if !UCONFIG_NO_MF2
+
+#include "unicode/uniset.h"
+#include "messageformat2_errors.h"
+#include "messageformat2_macros.h"
+#include "messageformat2_parser.h"
+#include "ucln_in.h"
+#include "umutex.h"
+#include "uvector.h" // U_ASSERT
+
+U_NAMESPACE_BEGIN
+
+namespace message2 {
+
+using namespace pluralimpl;
+
+using namespace data_model;
+
+#define ERROR(errorCode)                                                                                \
+    if (!errors.hasSyntaxError()) {                                                                     \
+        setParseError(parseError, index);                                                               \
+        errors.addSyntaxError(errorCode);                                                               \
+    }
+
+#define ERROR_AT(errorCode, i)                                                                          \
+    if (!errors.hasSyntaxError()) {                                                                     \
+        setParseError(parseError, i);                                                                   \
+        errors.addSyntaxError(errorCode);                                                               \
+    }
+
+void Parser::maybeAdvanceLine() {
+    if (peek() == LF) {
+        parseError.line++;
+        parseError.lengthBeforeCurrentLine = index + 1;
+    }
+}
+
+#define CHECK_BOUNDS(errorCode)                                                            \
+    if (!inBounds()) {                                                                     \
+        ERROR(errorCode);                                                                  \
+        return;                                                                            \
+    }
+#define CHECK_BOUNDS_1(errorCode)                                                          \
+    if (!inBounds(1)) {                                                                    \
+        ERROR_AT(errorCode, index + 1);                                                    \
+        return;                                                                            \
+    }
+
+
+static void copyContext(const UChar in[U_PARSE_CONTEXT_LEN], UChar out[U_PARSE_CONTEXT_LEN]) {
+    for (int32_t i = 0; i < U_PARSE_CONTEXT_LEN; i++) {
+        out[i] = in[i];
+        if (in[i] == '\0') {
+            break;
+        }
+    }
+}
+
+ void Parser::translateParseError(const MessageParseError &messageParseError, UParseError &parseError) {
+    parseError.line = messageParseError.line;
+    parseError.offset = messageParseError.offset;
+    copyContext(messageParseError.preContext, parseError.preContext);
+    copyContext(messageParseError.postContext, parseError.postContext);
+}
+
+ void Parser::setParseError(MessageParseError &parseError, uint32_t index) {
+    parseError.offset = index                               
+                      - parseError.lengthBeforeCurrentLine; 
+    parseError.preContext[0] = 0;
+    parseError.postContext[0] = 0;
+}
+
+
+namespace unisets {
+
+UnicodeSet* gUnicodeSets[unisets::UNISETS_KEY_COUNT] = {};
+
+inline UnicodeSet* getImpl(Key key) {
+    return gUnicodeSets[key];
+}
+
+icu::UInitOnce gMF2ParseUniSetsInitOnce {};
+}
+
+UnicodeSet* initContentChars(UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+    UnicodeSet* result = new UnicodeSet(0x0001, 0x0008); 
+    if (result == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return nullptr;
+    }
+    result->add(0x000B, 0x000C); 
+    result->add(0x000E, 0x001F); 
+    result->add(0x0021, 0x002D); 
+    result->add(0x002F, 0x003F); 
+    result->add(0x0041, 0x005B); 
+    result->add(0x005D, 0x007A); 
+    result->add(0x007E, 0x2FFF); 
+    result->add(0x3001, 0x10FFFF); 
+    result->freeze();
+    return result;
+}
+
+UnicodeSet* initWhitespace(UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+    UnicodeSet* result = new UnicodeSet();
+    if (result == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return nullptr;
+    }
+    result->add(SPACE);
+    result->add(HTAB);
+    result->add(CR);
+    result->add(LF);
+    result->add(IDEOGRAPHIC_SPACE);
+    result->freeze();
+    return result;
+}
+
+UnicodeSet* initBidiControls(UErrorCode& status) {
+    UnicodeSet* result = new UnicodeSet(UnicodeString("[\\u061C]"), status);
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    result->add(0x200E, 0x200F);
+    result->add(0x2066, 0x2069);
+    result->freeze();
+    return result;
+}
+
+UnicodeSet* initAlpha(UErrorCode& status) {
+    UnicodeSet* result = new UnicodeSet(UnicodeString("[:letter:]"), status);
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    result->freeze();
+    return result;
+}
+
+UnicodeSet* initDigits(UErrorCode& status) {
+    UnicodeSet* result = new UnicodeSet(UnicodeString("[:number:]"), status);
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    result->freeze();
+    return result;
+}
+
+UnicodeSet* initNameStartChars(UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+    UnicodeSet* isAlpha = unisets::gUnicodeSets[unisets::ALPHA] = initAlpha(status);
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    UnicodeSet* result = new UnicodeSet();
+    if (result == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return nullptr;
+    };
+
+    result->addAll(*isAlpha);
+    result->add(0x002B);
+    result->add(0x005F);
+    result->add(0x00A1, 0x061B);
+    result->add(0x061D, 0x167F);
+    result->add(0x1681, 0x1FFF);
+    result->add(0x200B, 0x200D);
+    result->add(0x2010, 0x2027);
+    result->add(0x2030, 0x205E);
+    result->add(0x2060, 0x2065);
+    result->add(0x206A, 0x2FFF);
+    result->add(0x3001, 0xD7FF);
+    result->add(0xE000, 0xFDCF);
+    result->add(0xFDF0, 0xFFFD);
+    result->add(0x10000, 0x1FFFD);
+    result->add(0x20000, 0x2FFFD);
+    result->add(0x30000, 0x3FFFD);
+    result->add(0x40000, 0x4FFFD);
+    result->add(0x50000, 0x5FFFD);
+    result->add(0x60000, 0x6FFFD);
+    result->add(0x70000, 0x7FFFD);
+    result->add(0x80000, 0x8FFFD);
+    result->add(0x90000, 0x9FFFD);
+    result->add(0xA0000, 0xAFFFD);
+    result->add(0xB0000, 0xBFFFD);
+    result->add(0xC0000, 0xCFFFD);
+    result->add(0xD0000, 0xDFFFD);
+    result->add(0xE0000, 0xEFFFD);
+    result->add(0xF0000, 0xFFFFD);
+    result->add(0x100000, 0x10FFFD);
+    result->freeze();
+    return result;
+}
+
+UnicodeSet* initNameChars(UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+    UnicodeSet* nameStart = unisets::gUnicodeSets[unisets::NAME_START] = initNameStartChars(status);
+    UnicodeSet* digit = unisets::gUnicodeSets[unisets::DIGIT] = initDigits(status);
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    UnicodeSet* result = new UnicodeSet();
+    if (result == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return nullptr;
+    };
+    result->addAll(*nameStart);
+    result->addAll(*digit);
+    result->add(HYPHEN);
+    result->add(PERIOD);
+    result->freeze();
+    return result;
+}
+
+UnicodeSet* initTextChars(UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+    UnicodeSet* content = unisets::gUnicodeSets[unisets::CONTENT] = initContentChars(status);
+    UnicodeSet* whitespace = unisets::gUnicodeSets[unisets::WHITESPACE] = initWhitespace(status);
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    UnicodeSet* result = new UnicodeSet();
+    if (result == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return nullptr;
+    };
+    result->addAll(*content);
+    result->addAll(*whitespace);
+    result->add(PERIOD);
+    result->add(AT);
+    result->add(PIPE);
+    result->freeze();
+    return result;
+}
+
+UnicodeSet* initQuotedChars(UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+    unisets::gUnicodeSets[unisets::TEXT] = initTextChars(status);
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    UnicodeSet* result = new UnicodeSet();
+    if (result == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return nullptr;
+    };
+    UnicodeSet* content = unisets::getImpl(unisets::CONTENT);
+    if (content == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return nullptr;
+    }
+    result->addAll(*content);
+    UnicodeSet* whitespace = unisets::getImpl(unisets::WHITESPACE);
+    if (whitespace == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return nullptr;
+    }
+    result->addAll(*whitespace);
+    result->add(PERIOD);
+    result->add(AT);
+    result->add(LEFT_CURLY_BRACE);
+    result->add(RIGHT_CURLY_BRACE);
+    result->freeze();
+    return result;
+}
+
+UnicodeSet* initEscapableChars(UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+    UnicodeSet* result = new UnicodeSet();
+    if (result == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return nullptr;
+    }
+    result->add(PIPE);
+    result->add(BACKSLASH);
+    result->add(LEFT_CURLY_BRACE);
+    result->add(RIGHT_CURLY_BRACE);
+    result->freeze();
+    return result;
+}
+
+namespace unisets {
+
+UBool U_CALLCONV cleanupMF2ParseUniSets() {
+    for (int32_t i = 0; i < UNISETS_KEY_COUNT; i++) {
+        delete gUnicodeSets[i];
+        gUnicodeSets[i] = nullptr;
+    }
+    gMF2ParseUniSetsInitOnce.reset();
+    return true;
+}
+
+void U_CALLCONV initMF2ParseUniSets(UErrorCode& status) {
+    ucln_i18n_registerCleanup(UCLN_I18N_MF2_UNISETS, cleanupMF2ParseUniSets);
+    gUnicodeSets[unisets::BIDI] = initBidiControls(status);
+    gUnicodeSets[unisets::NAME_CHAR] = initNameChars(status);
+    gUnicodeSets[unisets::QUOTED] = initQuotedChars(status);
+    gUnicodeSets[unisets::ESCAPABLE] = initEscapableChars(status);
+
+    if (U_FAILURE(status)) {
+        cleanupMF2ParseUniSets();
+    }
+}
+
+const UnicodeSet* get(Key key, UErrorCode& status) {
+    umtx_initOnce(gMF2ParseUniSetsInitOnce, &initMF2ParseUniSets, status);
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    UnicodeSet* result = getImpl(key);
+    if (result == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+    }
+    return result;
+}
+
+}
+
+
+
+bool Parser::isContentChar(UChar32 c) const {
+    return contentChars->contains(c);
+}
+
+bool Parser::isBidiControl(UChar32 c) const {
+    return bidiControlChars->contains(c);
+}
+
+bool Parser::isWhitespace(UChar32 c) const {
+    return whitespaceChars->contains(c);
+}
+
+bool Parser::isTextChar(UChar32 c) const {
+    return textChars->contains(c);
+}
+
+bool Parser::isAlpha(UChar32 c) const {
+    return alphaChars->contains(c);
+}
+
+bool Parser::isDigit(UChar32 c) const {
+    return digitChars->contains(c);
+}
+
+bool Parser::isNameStart(UChar32 c) const {
+    return nameStartChars->contains(c);
+}
+
+bool Parser::isNameChar(UChar32 c) const {
+    return nameChars->contains(c);
+}
+
+bool Parser::isUnquotedStart(UChar32 c) const {
+    return isNameChar(c);
+}
+
+bool Parser::isQuotedChar(UChar32 c) const {
+    return quotedChars->contains(c);
+}
+
+bool Parser::isEscapableChar(UChar32 c) const {
+    return escapableChars->contains(c);
+}
+
+static bool isFunctionStart(UChar32 c) {
+    switch (c) {
+    case COLON: {
+        return true;
+    }
+    default: {
+        return false;
+    }
+    }
+}
+
+static bool isAnnotationStart(UChar32 c) {
+    return isFunctionStart(c);
+}
+
+bool Parser::isLiteralStart(UChar32 c) const {
+    return (c == PIPE || isNameStart(c) || c == HYPHEN || isDigit(c));
+}
+
+bool Parser::isKeyStart(UChar32 c) const {
+    return (c == ASTERISK || isLiteralStart(c));
+}
+
+bool Parser::isDeclarationStart() {
+    return (peek() == ID_LOCAL[0]
+            && inBounds(1)
+            && peek(1) == ID_LOCAL[1])
+        || (peek() == ID_INPUT[0]
+            && inBounds(1)
+            && peek(1) == ID_INPUT[1]);
+}
+
+
+
+
+
+void Parser::parseRequiredWS(UErrorCode& errorCode) {
+    bool sawWhitespace = false;
+
+    while (true) {
+        if (!inBounds()) {
+            if (sawWhitespace) {
+                return;
+            }
+            ERROR(errorCode);
+            return;
+        }
+
+        if (isWhitespace(peek())) {
+            sawWhitespace = true;
+            maybeAdvanceLine();
+            next();
+        } else {
+            break;
+        }
+    }
+
+    if (!sawWhitespace) {
+        ERROR(errorCode);
+    }
+}
+
+void Parser::parseOptionalBidi() {
+    while (true) {
+        if (!inBounds()) {
+            return;
+        }
+        if (isBidiControl(peek())) {
+            next();
+        } else {
+            break;
+        }
+    }
+}
+
+void Parser::parseRequiredWhitespace(UErrorCode& errorCode) {
+    parseOptionalBidi();
+    parseRequiredWS(errorCode);
+    parseOptionalWhitespace();
+    normalizedInput += SPACE;
+}
+
+void Parser::parseOptionalWhitespace() {
+    while (true) {
+        if (!inBounds()) {
+            return;
+        }
+        auto cp = peek();
+        if (isWhitespace(cp) || isBidiControl(cp)) {
+            maybeAdvanceLine();
+            next();
+        } else {
+            break;
+        }
+    }
+}
+
+void Parser::parseToken(UChar32 c, UErrorCode& errorCode) {
+    CHECK_BOUNDS(errorCode);
+
+    if (peek() == c) {
+        next();
+        normalizedInput += c;
+        return;
+    }
+    ERROR(errorCode);
+}
+
+void Parser::parseToken(const std::u16string_view& token, UErrorCode& errorCode) {
+    U_ASSERT(inBounds());
+
+    int32_t tokenPos = 0;
+    while (tokenPos < static_cast<int32_t>(token.length())) {
+        if (peek() != token[tokenPos]) {
+            ERROR(errorCode);
+            return;
+        }
+        normalizedInput += token[tokenPos];
+        next();
+        tokenPos++;
+    }
+}
+
+void Parser::parseTokenWithWhitespace(const std::u16string_view& token, UErrorCode& errorCode) {
+    parseOptionalWhitespace();
+    CHECK_BOUNDS(errorCode);
+    parseToken(token, errorCode);
+    parseOptionalWhitespace();
+    CHECK_BOUNDS(errorCode);
+}
+
+void Parser::parseTokenWithWhitespace(UChar32 c, UErrorCode& errorCode) {
+    parseOptionalWhitespace();
+    CHECK_BOUNDS(errorCode);
+    parseToken(c, errorCode);
+    parseOptionalWhitespace();
+    CHECK_BOUNDS(errorCode);
+}
+
+UnicodeString Parser::parseNameChars(UnicodeString& str, UErrorCode& errorCode) {
+    if (U_FAILURE(errorCode)) {
+        return {};
+    }
+
+    while (isNameChar(peek())) {
+        UChar32 c = peek();
+        str += c;
+        normalizedInput += c;
+        next();
+        if (!inBounds()) {
+            ERROR(errorCode);
+            break;
+        }
+    }
+
+    return str;
+}
+
+UnicodeString Parser::parseName(UErrorCode& errorCode) {
+    UnicodeString name;
+
+    U_ASSERT(inBounds());
+
+    if (!(isNameStart(peek()) || isBidiControl(peek()))) {
+        ERROR(errorCode);
+        return name;
+    }
+
+
+    parseOptionalBidi();
+
+    parseNameChars(name, errorCode);
+
+    parseOptionalBidi();
+
+    return name;
+}
+
+VariableName Parser::parseVariableName(UErrorCode& errorCode) {
+    VariableName result;
+
+    U_ASSERT(inBounds());
+
+    parseToken(DOLLAR, errorCode);
+    if (!inBounds()) {
+        ERROR(errorCode);
+        return result;
+    }
+    return VariableName(parseName(errorCode));
+}
+
+UnicodeString Parser::parseIdentifier(UErrorCode& errorCode) {
+    U_ASSERT(inBounds());
+
+    UnicodeString result;
+
+    result += parseName(errorCode);
+    int32_t firstColon = -1;
+    while (inBounds() && peek() == COLON) {
+        if (firstColon == -1) {
+            firstColon = index;
+        }
+        parseToken(COLON, errorCode);
+        result += COLON;
+        if (!inBounds()) {
+            ERROR(errorCode);
+        } else {
+            result += parseName(errorCode);
+        }
+    }
+
+    if (firstColon != -1) {
+        for (int32_t i = firstColon + 1; i < result.length(); i++) {
+            if (result[i] == COLON) {
+                ERROR_AT(errorCode, i);
+                return {};
+            }
+        }
+    }
+
+    return result;
+}
+
+FunctionName Parser::parseFunction(UErrorCode& errorCode) {
+    U_ASSERT(inBounds());
+    if (!isFunctionStart(peek())) {
+        ERROR(errorCode);
+        return FunctionName();
+    }
+
+    normalizedInput += peek();
+    next(); 
+    if (!inBounds()) {
+        ERROR(errorCode);
+        return FunctionName();
+    }
+    return parseIdentifier(errorCode);
+}
+
+
+UnicodeString Parser::parseEscapeSequence(UErrorCode& errorCode) {
+    U_ASSERT(inBounds());
+    U_ASSERT(peek() == BACKSLASH);
+    normalizedInput += BACKSLASH;
+    next(); 
+    UnicodeString str;
+    if (inBounds()) {
+        switch (peek()) {
+        case LEFT_CURLY_BRACE:
+        case RIGHT_CURLY_BRACE:
+        case PIPE:
+        case BACKSLASH: {
+            str += peek();
+            normalizedInput += peek();
+            next();
+            return str;
+        }
+        default: {
+            break;
+        }
+        }
+    }
+   ERROR(errorCode);
+   return str;
+}
+
+
+Literal Parser::parseQuotedLiteral(UErrorCode& errorCode) {
+    bool error = false;
+
+    UnicodeString contents;
+    if (U_SUCCESS(errorCode)) {
+        parseToken(PIPE, errorCode);
+        if (!inBounds()) {
+            ERROR(errorCode);
+            error = true;
+        } else {
+            bool done = false;
+            while (!done) {
+                if (peek() == BACKSLASH) {
+                    contents += parseEscapeSequence(errorCode);
+                } else if (isQuotedChar(peek())) {
+                    contents += peek();
+                    if (isEscapableChar(peek())) {
+                        normalizedInput += BACKSLASH;
+                    }
+                    normalizedInput += peek();
+                    next(); 
+                    maybeAdvanceLine();
+                } else {
+                    done = true;
+                }
+                if (!inBounds()) {
+                    ERROR(errorCode);
+                    error = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (error) {
+        return {};
+    }
+
+    parseToken(PIPE, errorCode);
+
+    return Literal(true, contents);
+}
+
+UnicodeString Parser::parseDigits(UErrorCode& errorCode) {
+    if (U_FAILURE(errorCode)) {
+        return {};
+    }
+
+    U_ASSERT(isDigit(peek()));
+
+    UnicodeString contents;
+    do {
+        contents += peek();
+        normalizedInput += peek();
+        next();
+        if (!inBounds()) {
+            ERROR(errorCode);
+            return {};
+        }
+    } while (isDigit(peek()));
+
+    return contents;
+}
+Literal Parser::parseUnquotedLiteral(UErrorCode& errorCode) {
+    if (U_FAILURE(errorCode)) {
+        return {};
+    }
+
+    if (!(isNameChar(peek()))) {
+        ERROR(errorCode);
+        return {};
+    }
+
+    UnicodeString contents;
+    parseNameChars(contents, errorCode);
+    return Literal(false, contents);
+}
+
+Literal Parser::parseLiteral(UErrorCode& errorCode) {
+    Literal result;
+    if (!inBounds()) {
+        ERROR(errorCode);
+    } else {
+        if (peek() == PIPE) {
+            result = parseQuotedLiteral(errorCode);
+        } else {
+            result = parseUnquotedLiteral(errorCode);
+        }
+        if (!inBounds()) {
+            ERROR(errorCode);
+        }
+    }
+
+    return result;
+}
+
+template<class T>
+void Parser::parseAttribute(AttributeAdder<T>& attrAdder, UErrorCode& errorCode) {
+    U_ASSERT(inBounds());
+
+    U_ASSERT(peek() == AT);
+    parseToken(AT, errorCode);
+
+    UnicodeString lhs = parseIdentifier(errorCode);
+
+    int32_t savedIndex = index;
+    parseOptionalWhitespace();
+
+    Operand rand;
+    if (peek() == EQUALS) {
+        parseTokenWithWhitespace(EQUALS, errorCode);
+
+        UnicodeString rhsStr;
+        rand = Operand(parseLiteral(errorCode));
+    } else {
+        index = savedIndex;
+    }
+
+    attrAdder.addAttribute(lhs, std::move(Operand(rand)), errorCode);
+}
+
+template<class T>
+void Parser::parseOption(OptionAdder<T>& addOption, UErrorCode& errorCode) {
+    U_ASSERT(inBounds());
+
+    UnicodeString lhs = parseIdentifier(errorCode);
+
+    parseTokenWithWhitespace(EQUALS, errorCode);
+
+    UnicodeString rhsStr;
+    Operand rand;
+    switch (peek()) {
+    case DOLLAR: {
+        rand = Operand(parseVariableName(errorCode));
+        break;
+    }
+    default: {
+        rand = Operand(parseLiteral(errorCode));
+        break;
+    }
+    }
+    U_ASSERT(!rand.isNull());
+
+    UErrorCode status = U_ZERO_ERROR;
+    addOption.addOption(lhs, std::move(rand), status);
+    if (U_FAILURE(status)) {
+      U_ASSERT(status == U_MF_DUPLICATE_OPTION_NAME_ERROR);
+      errors.setDuplicateOptionName(errorCode);
+    }
+}
+
+
+template <class T>
+void Parser::parseOptions(OptionAdder<T>& addOption, UErrorCode& errorCode) {
+    CHECK_BOUNDS(errorCode);
+
+
+    while(true) {
+        if (!isWhitespace(peek())) {
+            break;
+        }
+        int32_t firstWhitespace = index;
+
+        parseRequiredWhitespace(errorCode);
+        CHECK_BOUNDS(errorCode);
+
+        if (!isNameStart(peek())) {
+            normalizedInput.truncate(normalizedInput.length() - 1);
+            index = firstWhitespace;
+            break;
+        }
+        parseOption(addOption, errorCode);
+    }
+}
+
+template<class T>
+void Parser::parseAttributes(AttributeAdder<T>& attrAdder, UErrorCode& errorCode) {
+
+    if (!inBounds()) {
+        ERROR(errorCode);
+        return;
+    }
+
+
+    while(true) {
+        if (!isWhitespace(peek())) {
+            break;
+        }
+
+        parseRequiredWhitespace(errorCode);
+        if (!inBounds()) {
+            ERROR(errorCode);
+            break;
+        }
+
+        if (peek() != AT) {
+            normalizedInput.truncate(normalizedInput.length() - 1);
+            break;
+        }
+        parseAttribute(attrAdder, errorCode);
+    }
+}
+
+Operator Parser::parseAnnotation(UErrorCode& status) {
+    U_ASSERT(inBounds());
+    Operator::Builder ratorBuilder(status);
+    if (U_FAILURE(status)) {
+        return {};
+    }
+    if (isFunctionStart(peek())) {
+        FunctionName func = parseFunction(status);
+        ratorBuilder.setFunctionName(std::move(func));
+
+        OptionAdder<Operator::Builder> addOptions(ratorBuilder);
+        parseOptions(addOptions, status);
+    } else {
+        ERROR(status);
+    }
+    return ratorBuilder.build(status);
+}
+
+void Parser::parseLiteralOrVariableWithAnnotation(bool isVariable,
+                                                  Expression::Builder& builder,
+                                                  UErrorCode& status) {
+    CHECK_ERROR(status);
+
+    U_ASSERT(inBounds());
+
+    Operand rand;
+    if (isVariable) {
+        rand = Operand(parseVariableName(status));
+    } else {
+        rand = Operand(parseLiteral(status));
+    }
+
+    builder.setOperand(std::move(rand));
+
+
+    if (isWhitespace(peek())) {
+      int32_t firstWhitespace = index;
+
+      parseOptionalWhitespace();
+      CHECK_BOUNDS(status);
+
+      bool isSAnnotation = isAnnotationStart(peek());
+
+      if (isSAnnotation) {
+        normalizedInput += SPACE;
+      }
+
+      if (isSAnnotation) {
+        builder.setOperator(parseAnnotation(status));
+      } else {
+          index = firstWhitespace;
+      }
+    } else {
+    }
+
+}
+
+
+static void exprFallback(Expression::Builder& exprBuilder) {
+    exprBuilder.setOperand(Operand(Literal(false, UnicodeString(REPLACEMENT))));
+}
+
+static Expression exprFallback(UErrorCode& status) {
+    Expression result;
+    if (U_SUCCESS(status)) {
+        Expression::Builder exprBuilder(status);
+        if (U_SUCCESS(status)) {
+            exprBuilder.setOperand(Operand(Literal(false, UnicodeString(REPLACEMENT))));
+            UErrorCode status = U_ZERO_ERROR;
+            result = exprBuilder.build(status);
+            U_ASSERT(U_SUCCESS(status));
+        }
+    }
+    return result;
+}
+
+Expression Parser::parseExpression(UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return {};
+    }
+
+    U_ASSERT(inBounds());
+
+    parseToken(LEFT_CURLY_BRACE, status);
+    parseOptionalWhitespace();
+
+    Expression::Builder exprBuilder(status);
+    if (!inBounds()) {
+        exprFallback(exprBuilder);
+    } else {
+        switch (peek()) {
+        case PIPE: {
+            parseLiteralOrVariableWithAnnotation(false, exprBuilder, status);
+            break;
+        }
+        case DOLLAR: {
+            parseLiteralOrVariableWithAnnotation(true, exprBuilder, status);
+            break;
+        }
+        default: {
+            if (isAnnotationStart(peek())) {
+                Operator rator = parseAnnotation(status);
+                exprBuilder.setOperator(std::move(rator));
+            } else if (isUnquotedStart(peek())) {
+                parseLiteralOrVariableWithAnnotation(false, exprBuilder, status);
+            } else {
+                ERROR(status);
+                exprFallback(exprBuilder);
+                break;
+            }
+            break;
+        }
+        }
+    }
+
+    AttributeAdder<Expression::Builder> attrAdder(exprBuilder);
+    parseAttributes(attrAdder, status);
+
+    parseOptionalWhitespace();
+
+    UErrorCode localStatus = U_ZERO_ERROR;
+    Expression result = exprBuilder.build(localStatus);
+    U_ASSERT(U_SUCCESS(localStatus));
+
+    if (!inBounds()) {
+        ERROR(status);
+    } else {
+        parseToken(RIGHT_CURLY_BRACE, status);
+    }
+    return result;
+}
+
+void Parser::parseLocalDeclaration(UErrorCode& status) {
+    CHECK_BOUNDS(status);
+
+    parseToken(ID_LOCAL, status);
+    parseRequiredWhitespace(status);
+
+    CHECK_BOUNDS(status);
+    VariableName lhs = parseVariableName(status);
+    parseTokenWithWhitespace(EQUALS, status);
+    CHECK_BOUNDS(status);
+
+    Expression rhs = parseExpression(status);
+
+    CHECK_ERROR(status);
+    if (!errors.hasSyntaxError()) {
+        dataModel.addBinding(Binding(std::move(lhs), std::move(rhs)), status);
+        if (status == U_MF_DUPLICATE_DECLARATION_ERROR) {
+            status = U_ZERO_ERROR;
+            errors.addError(StaticErrorType::DuplicateDeclarationError, status);
+        }
+    }
+}
+
+void Parser::parseInputDeclaration(UErrorCode& status) {
+    CHECK_BOUNDS(status);
+
+    parseToken(ID_INPUT, status);
+    parseOptionalWhitespace();
+
+    CHECK_BOUNDS(status);
+
+    int32_t exprIndex = index;
+    Expression rhs = parseExpression(status);
+
+    if (!rhs.getOperand().isVariable()) {
+        ERROR_AT(status, exprIndex);
+        return;
+    }
+
+    VariableName lhs = rhs.getOperand().asVariable();
+
+    CHECK_ERROR(status);
+    if (!errors.hasSyntaxError()) {
+        dataModel.addBinding(Binding::input(std::move(lhs), std::move(rhs), status), status);
+        if (status == U_MF_DUPLICATE_DECLARATION_ERROR) {
+            status = U_ZERO_ERROR;
+            errors.addError(StaticErrorType::DuplicateDeclarationError, status);
+        }
+    }
+}
+
+void Parser::parseDeclarations(UErrorCode& status) {
+    CHECK_BOUNDS(status);
+
+    while (peek() == PERIOD) {
+        CHECK_BOUNDS_1(status);
+        if (peek(1) == ID_LOCAL[1]) {
+            parseLocalDeclaration(status);
+        } else if (peek(1) == ID_INPUT[1]) {
+            parseInputDeclaration(status);
+        } else {
+            break;
+        }
+
+        CHECK_ERROR(status);
+
+        parseOptionalWhitespace();
+        CHECK_BOUNDS(status);
+    }
+}
+
+UnicodeString Parser::parseTextChar(UErrorCode& status) {
+    UnicodeString str;
+    if (!inBounds() || !(isTextChar(peek()))) {
+        ERROR(status);
+    } else {
+        if (isEscapableChar(peek())) {
+            normalizedInput += BACKSLASH;
+        }
+        normalizedInput += peek();
+        str += peek();
+        next();
+        maybeAdvanceLine();
+    }
+    return str;
+}
+
+Key Parser::parseKey(UErrorCode& status) {
+    U_ASSERT(inBounds());
+
+    Key k; 
+    switch (peek()) {
+    case ASTERISK: {
+        next();
+        normalizedInput += ASTERISK;
+        if (!inBounds()) {
+            ERROR(status);
+            return k;
+        }
+        break;
+    }
+    default: {
+        k = Key(parseLiteral(status));
+        break;
+    }
+    }
+    return k;
+}
+
+SelectorKeys Parser::parseNonEmptyKeys(UErrorCode& status) {
+    SelectorKeys result;
+
+    if (U_FAILURE(status)) {
+        return result;
+    }
+
+    U_ASSERT(inBounds());
+
+
+    SelectorKeys::Builder keysBuilder(status);
+    if (U_FAILURE(status)) {
+        return result;
+    }
+
+    keysBuilder.add(parseKey(status), status);
+
+    if (!inBounds()) {
+        ERROR(status);
+        return result;
+    }
+
+    while (peek() != LEFT_CURLY_BRACE || isWhitespace(peek()) || isBidiControl(peek())) {
+        bool wasWhitespace = isWhitespace(peek()) || isBidiControl(peek());
+        parseRequiredWhitespace(status);
+        if (!wasWhitespace) {
+            next();
+        }
+
+        if (!inBounds()) {
+            ERROR(status);
+            return result;
+        }
+
+        if (peek() == LEFT_CURLY_BRACE) {
+
+            normalizedInput.truncate(normalizedInput.length() - 1);
+            break;
+        }
+        keysBuilder.add(parseKey(status), status);
+    }
+
+    return keysBuilder.build(status);
+}
+
+Pattern Parser::parseQuotedPattern(UErrorCode& status) {
+    U_ASSERT(inBounds());
+
+    parseToken(LEFT_CURLY_BRACE, status);
+    parseToken(LEFT_CURLY_BRACE, status);
+    Pattern p = parseSimpleMessage(status);
+    parseToken(RIGHT_CURLY_BRACE, status);
+    parseToken(RIGHT_CURLY_BRACE, status);
+    return p;
+}
+
+Markup Parser::parseMarkup(UErrorCode& status) {
+    U_ASSERT(inBounds(1));
+
+    U_ASSERT(peek() == LEFT_CURLY_BRACE);
+
+    Markup::Builder builder(status);
+    if (U_FAILURE(status)) {
+        return {};
+    }
+
+    next();
+    normalizedInput += LEFT_CURLY_BRACE;
+    parseOptionalWhitespace();
+    bool closing = false;
+    switch (peek()) {
+    case NUMBER_SIGN: {
+        normalizedInput += peek();
+        next();
+        break;
+    }
+    case SLASH: {
+        normalizedInput += peek();
+        closing = true;
+        next();
+        break;
+    }
+    default: {
+        ERROR(status);
+        return {};
+    }
+    }
+
+    builder.setName(parseIdentifier(status));
+
+    if (inBounds() && (isWhitespace(peek()) || isBidiControl(peek()))) {
+        OptionAdder<Markup::Builder> optionAdder(builder);
+        parseOptions(optionAdder, status);
+    }
+
+    if (inBounds() && (isWhitespace(peek()) || isBidiControl(peek()))) {
+        AttributeAdder<Markup::Builder> attrAdder(builder);
+        parseAttributes(attrAdder, status);
+    }
+
+    parseOptionalWhitespace();
+
+    bool standalone = false;
+    if (!closing) {
+        if (inBounds() && peek() == SLASH) {
+            standalone = true;
+            normalizedInput += SLASH;
+            next();
+        }
+    }
+
+    parseToken(RIGHT_CURLY_BRACE, status);
+
+    if (standalone) {
+        builder.setStandalone();
+    } else if (closing) {
+        builder.setClose();
+    } else {
+        builder.setOpen();
+    }
+
+    return builder.build(status);
+}
+
+std::variant<Expression, Markup> Parser::parsePlaceholder(UErrorCode& status) {
+    U_ASSERT(peek() == LEFT_CURLY_BRACE);
+
+    if (!inBounds()) {
+        ERROR(status);
+        return exprFallback(status);
+    }
+
+    int32_t tempIndex = 1;
+    bool isMarkup = false;
+    while (inBounds(1)) {
+        UChar32 c = peek(tempIndex);
+        if (c == NUMBER_SIGN || c == SLASH) {
+            isMarkup = true;
+            break;
+        }
+        if (!(isWhitespace(c) || isBidiControl(c))) {
+            break;
+        }
+        tempIndex++;
+    }
+
+    if (isMarkup) {
+        return parseMarkup(status);
+    }
+    return parseExpression(status);
+}
+
+Pattern Parser::parseSimpleMessage(UErrorCode& status) {
+    Pattern::Builder result(status);
+
+    if (U_SUCCESS(status)) {
+        Expression expression;
+        while (inBounds()) {
+            switch (peek()) {
+            case LEFT_CURLY_BRACE: {
+                std::variant<Expression, Markup> piece = parsePlaceholder(status);
+                if (std::holds_alternative<Expression>(piece)) {
+                    Expression expr = *std::get_if<Expression>(&piece);
+                    result.add(std::move(expr), status);
+                } else {
+                    Markup markup = *std::get_if<Markup>(&piece);
+                    result.add(std::move(markup), status);
+                }
+                break;
+            }
+            case BACKSLASH: {
+                result.add(parseEscapeSequence(status), status);
+                break;
+            }
+            case RIGHT_CURLY_BRACE: {
+                break;
+            }
+            default: {
+                result.add(parseTextChar(status), status);
+                break;
+            }
+            }
+            if (peek() == RIGHT_CURLY_BRACE) {
+                break;
+            }
+            if (errors.hasSyntaxError() || U_FAILURE(status)) {
+                break;
+            }
+        }
+    }
+    return result.build(status);
+}
+
+void Parser::parseVariant(UErrorCode& status) {
+    CHECK_ERROR(status);
+
+    SelectorKeys keyList(parseNonEmptyKeys(status));
+
+
+    CHECK_BOUNDS(status);
+    Pattern rhs = parseQuotedPattern(status);
+
+    dataModel.addVariant(std::move(keyList), std::move(rhs), status);
+}
+
+void Parser::parseSelectors(UErrorCode& status) {
+    CHECK_ERROR(status);
+
+    U_ASSERT(inBounds());
+
+    parseToken(ID_MATCH, status);
+
+    bool empty = true;
+    while (isWhitespace(peek()) || peek() == DOLLAR) {
+        int32_t whitespaceStart = index;
+        parseRequiredWhitespace(status);
+        CHECK_BOUNDS(status);
+        if (peek() != DOLLAR) {
+            normalizedInput.truncate(normalizedInput.length() - 1);
+            index = whitespaceStart;
+            break;
+        }
+        VariableName var = parseVariableName(status);
+        empty = false;
+
+        dataModel.addSelector(std::move(var), status);
+        CHECK_ERROR(status);
+    }
+
+    if (empty) {
+        ERROR(status);
+        return;
+    }
+
+    #define CHECK_END_OF_INPUT                     \
+        if (!inBounds()) {                         \
+            break;                                 \
+        }                                          \
+
+
+    parseRequiredWhitespace(status);
+    if (!inBounds()) {
+        ERROR(status);
+        return;
+    }
+    parseVariant(status);
+    if (!inBounds()) {
+        return;
+    }
+
+    while (isWhitespace(peek()) || isBidiControl(peek()) || isKeyStart(peek())) {
+        parseOptionalWhitespace();
+        if (!inBounds()) {
+            return;
+        }
+
+        parseVariant(status);
+
+        CHECK_END_OF_INPUT
+
+        if (errors.hasSyntaxError() || U_FAILURE(status)) {
+            break;
+        }
+    }
+}
+
+
+void Parser::errorPattern(UErrorCode& status) {
+    errors.addSyntaxError(status);
+    Pattern::Builder result = Pattern::Builder(status);
+    CHECK_ERROR(status);
+
+    UnicodeString partStr(LEFT_CURLY_BRACE);
+    while (inBounds()) {
+        partStr += peek();
+        next();
+    }
+    partStr += RIGHT_CURLY_BRACE;
+    result.add(std::move(partStr), status);
+    dataModel.setPattern(result.build(status));
+}
+
+void Parser::parseBody(UErrorCode& status) {
+    CHECK_ERROR(status);
+
+    if (!inBounds()) {
+        errorPattern(status);
+        return;
+    }
+
+    switch (peek()) {
+    case LEFT_CURLY_BRACE: {
+        dataModel.setPattern(parseQuotedPattern(status));
+        break;
+    }
+    case ID_MATCH[0]: {
+        parseSelectors(status);
+        return;
+    }
+    default: {
+        ERROR(status);
+        errorPattern(status);
+        return;
+    }
+    }
+}
+
+
+void Parser::parse(UParseError &parseErrorResult, UErrorCode& status) {
+    CHECK_ERROR(status);
+
+    bool complex = false;
+    while (inBounds(index) && (isWhitespace(peek()) || isBidiControl(peek()))) {
+        next();
+    }
+
+    if (inBounds()) {
+        if (peek() == PERIOD
+            || (inBounds(1)
+                && peek() == LEFT_CURLY_BRACE
+                && peek(1) == LEFT_CURLY_BRACE)) {
+            complex = true;
+        }
+    }
+    index = 0;
+
+    if (complex) {
+        parseOptionalWhitespace();
+        parseDeclarations(status);
+        parseBody(status);
+        parseOptionalWhitespace();
+    } else {
+        normalizedInput += LEFT_CURLY_BRACE;
+        normalizedInput += LEFT_CURLY_BRACE;
+        dataModel.setPattern(parseSimpleMessage(status));
+        normalizedInput += RIGHT_CURLY_BRACE;
+        normalizedInput += RIGHT_CURLY_BRACE;
+    }
+
+    CHECK_ERROR(status);
+
+    if (!allConsumed()) {
+        ERROR(status);
+    }
+
+    translateParseError(parseError, parseErrorResult);
+}
+
+Parser::~Parser() {}
+
+} 
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_MF2 */
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* #if !UCONFIG_NO_NORMALIZATION */

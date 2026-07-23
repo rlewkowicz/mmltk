@@ -1,0 +1,90 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_intl_FormatBuffer_h
+#define builtin_intl_FormatBuffer_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Span.h"
+#include "mozilla/TextUtils.h"
+
+#include <stddef.h>
+
+#include "js/AllocPolicy.h"
+#include "js/TypeDecls.h"
+#include "js/UniquePtr.h"
+#include "js/Vector.h"
+#include "vm/StringType.h"
+
+namespace js::intl {
+
+template <typename CharT, size_t MinInlineCapacity = 0,
+          class AllocPolicy = TempAllocPolicy>
+class FormatBuffer {
+ public:
+  using CharType = CharT;
+
+  FormatBuffer(FormatBuffer&& other) noexcept = default;
+  FormatBuffer& operator=(FormatBuffer&& other) noexcept = default;
+
+  explicit FormatBuffer(AllocPolicy aP = AllocPolicy())
+      : buffer_(std::move(aP)) {
+    MOZ_ASSERT(buffer_.capacity() == MinInlineCapacity);
+    if constexpr (MinInlineCapacity > 0) {
+      MOZ_ALWAYS_TRUE(buffer_.reserve(MinInlineCapacity));
+    }
+  }
+
+  operator mozilla::Span<CharType>() { return buffer_; }
+  operator mozilla::Span<const CharType>() const { return buffer_; }
+
+  [[nodiscard]] bool reserve(size_t size) {
+    return buffer_.reserve(size) && buffer_.reserve(buffer_.capacity());
+  }
+
+  CharType* data() { return buffer_.begin(); }
+
+  size_t length() const { return buffer_.length(); }
+
+  size_t capacity() const { return buffer_.capacity(); }
+
+  void written(size_t amount) {
+    MOZ_ASSERT(amount <= buffer_.capacity());
+    size_t curLength = length();
+    if (amount > curLength) {
+      buffer_.infallibleGrowByUninitialized(amount - curLength);
+    } else {
+      buffer_.shrinkBy(curLength - amount);
+    }
+  }
+
+  JSLinearString* toString(JSContext* cx) const {
+    static_assert(std::is_same_v<CharT, char16_t>);
+    return NewStringCopyN<CanGC>(cx, buffer_.begin(), buffer_.length());
+  }
+
+  JSLinearString* toAsciiString(JSContext* cx) const {
+    static_assert(std::is_same_v<CharT, char>);
+
+    MOZ_ASSERT(mozilla::IsAscii(buffer_));
+    return NewStringCopyN<CanGC>(cx, buffer_.begin(), buffer_.length());
+  }
+
+  UniquePtr<CharType[], JS::FreePolicy> extractStringZ() {
+    MOZ_ASSERT_IF(!buffer_.empty(), buffer_.end()[-1] != '\0');
+
+    if (!buffer_.append('\0')) {
+      return nullptr;
+    }
+    return UniquePtr<CharType[], JS::FreePolicy>(
+        buffer_.extractOrCopyRawBuffer());
+  }
+
+ private:
+  js::Vector<CharT, MinInlineCapacity, AllocPolicy> buffer_;
+};
+
+}  
+
+#endif /* builtin_intl_FormatBuffer_h */

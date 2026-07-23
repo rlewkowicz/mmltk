@@ -1,0 +1,30 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozStorageSQLFunctions_h
+#define mozStorageSQLFunctions_h
+
+#include "sqlite3.h"
+#include "nscore.h"
+
+namespace mozilla {
+namespace storage {
+
+int registerFunctions(sqlite3* aDB);
+
+
+void caseFunction(sqlite3_context* aCtx, int aArgc, sqlite3_value** aArgv);
+
+void likeFunction(sqlite3_context* aCtx, int aArgc, sqlite3_value** aArgv);
+
+void levenshteinDistanceFunction(sqlite3_context* aCtx, int aArgc,
+                                 sqlite3_value** aArgv);
+
+void utf16LengthFunction(sqlite3_context* aCtx, int aArgc,
+                         sqlite3_value** aArgv);
+
+}  
+}  
+
+#endif  // mozStorageSQLFunctions_h

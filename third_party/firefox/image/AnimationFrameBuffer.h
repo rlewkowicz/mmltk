@@ -1,0 +1,266 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_AnimationFrameBuffer_h
+#define mozilla_image_AnimationFrameBuffer_h
+
+#include <deque>
+
+#include "ISurfaceProvider.h"
+
+namespace mozilla {
+namespace image {
+
+class AnimationFrameBuffer {
+ public:
+  enum class InsertStatus : uint8_t {
+    YIELD,            
+    CONTINUE,         
+    DISCARD_YIELD,    
+    DISCARD_CONTINUE  
+  };
+
+  AnimationFrameBuffer(size_t aBatch, size_t aStartFrame)
+      : mSize(0),
+        mBatch(aBatch),
+        mGetIndex(0),
+        mAdvance(aStartFrame),
+        mPending(0),
+        mSizeKnown(false),
+        mMayDiscard(false),
+        mRedecodeError(false),
+        mRecycling(false) {
+    if (mBatch > SIZE_MAX / 4) {
+      mBatch = SIZE_MAX / 4;
+    } else if (mBatch < 1) {
+      mBatch = 1;
+    }
+  }
+
+  AnimationFrameBuffer(const AnimationFrameBuffer& aOther)
+      : mSize(aOther.mSize),
+        mBatch(aOther.mBatch),
+        mGetIndex(aOther.mGetIndex),
+        mAdvance(aOther.mAdvance),
+        mPending(aOther.mPending),
+        mSizeKnown(aOther.mSizeKnown),
+        mMayDiscard(aOther.mMayDiscard),
+        mRedecodeError(aOther.mRedecodeError),
+        mRecycling(aOther.mRecycling) {}
+
+  virtual ~AnimationFrameBuffer() = default;
+
+  bool MayDiscard() const { return mMayDiscard; }
+
+  bool IsRecycling() const {
+    MOZ_ASSERT_IF(mRecycling, mMayDiscard);
+    return mRecycling;
+  }
+
+  bool SizeKnown() const { return mSizeKnown; }
+
+  size_t Size() const { return mSize; }
+
+  const gfx::IntRect& FirstFrameRefreshArea() const {
+    return mFirstFrameRefreshArea;
+  }
+
+  bool HasRedecodeError() const { return mRedecodeError; }
+
+  size_t Displayed() const { return mGetIndex; }
+
+  size_t PendingDecode() const { return mPending; }
+
+  size_t PendingAdvance() const { return mAdvance; }
+
+  size_t Batch() const { return mBatch; }
+
+  bool Reset() {
+    mGetIndex = 0;
+    mAdvance = 0;
+    return ResetInternal();
+  }
+
+  bool AdvanceTo(size_t aExpectedFrame) {
+    MOZ_ASSERT(mAdvance == 0);
+
+    if (++mGetIndex == mSize && mSizeKnown) {
+      mGetIndex = 0;
+    }
+    MOZ_ASSERT(mGetIndex == aExpectedFrame);
+
+    bool hasPending = mPending > 0;
+    AdvanceInternal();
+    return !hasPending && mPending > 0;
+  }
+
+  InsertStatus Insert(RefPtr<imgFrame>&& aFrame) {
+    MOZ_ASSERT(mPending > 0);
+    MOZ_ASSERT(aFrame);
+
+    --mPending;
+    bool retain = InsertInternal(std::move(aFrame));
+
+    if (mAdvance > 0 && mSize > 1) {
+      --mAdvance;
+      ++mGetIndex;
+      AdvanceInternal();
+    }
+
+    if (!retain) {
+      return mPending > 0 ? InsertStatus::DISCARD_CONTINUE
+                          : InsertStatus::DISCARD_YIELD;
+    }
+
+    return mPending > 0 ? InsertStatus::CONTINUE : InsertStatus::YIELD;
+  }
+
+  virtual imgFrame* Get(size_t aFrame, bool aForDisplay) = 0;
+
+  virtual bool IsFirstFrameFinished() const = 0;
+
+  virtual bool IsLastInsertedFrame(imgFrame* aFrame) const = 0;
+
+  virtual bool MarkComplete(const gfx::IntRect& aFirstFrameRefreshArea) = 0;
+
+  typedef ISurfaceProvider::AddSizeOfCbData AddSizeOfCbData;
+  typedef ISurfaceProvider::AddSizeOfCb AddSizeOfCb;
+
+  virtual void AddSizeOfExcludingThis(MallocSizeOf aMallocSizeOf,
+                                      const AddSizeOfCb& aCallback) = 0;
+
+  virtual RawAccessFrameRef RecycleFrame(gfx::IntRect& aRecycleRect) {
+    MOZ_ASSERT(!mRecycling);
+    return RawAccessFrameRef();
+  }
+
+ protected:
+  virtual bool InsertInternal(RefPtr<imgFrame>&& aFrame) = 0;
+
+  virtual void AdvanceInternal() = 0;
+
+  virtual bool ResetInternal() = 0;
+
+  gfx::IntRect mFirstFrameRefreshArea;
+
+  size_t mSize;
+
+  size_t mBatch;
+
+  size_t mGetIndex;
+
+  size_t mAdvance;
+
+  size_t mPending;
+
+  bool mSizeKnown;
+
+  bool mMayDiscard;
+
+  bool mRedecodeError;
+
+  bool mRecycling;
+};
+
+class AnimationFrameRetainedBuffer final : public AnimationFrameBuffer {
+ public:
+  AnimationFrameRetainedBuffer(size_t aThreshold, size_t aBatch,
+                               size_t aCurrentFrame);
+
+  size_t Threshold() const { return mThreshold; }
+
+  const nsTArray<RefPtr<imgFrame>>& Frames() const { return mFrames; }
+
+  imgFrame* Get(size_t aFrame, bool aForDisplay) override;
+  bool IsFirstFrameFinished() const override;
+  bool IsLastInsertedFrame(imgFrame* aFrame) const override;
+  bool MarkComplete(const gfx::IntRect& aFirstFrameRefreshArea) override;
+  void AddSizeOfExcludingThis(MallocSizeOf aMallocSizeOf,
+                              const AddSizeOfCb& aCallback) override;
+
+ private:
+  friend class AnimationFrameDiscardingQueue;
+  friend class AnimationFrameRecyclingQueue;
+
+  bool InsertInternal(RefPtr<imgFrame>&& aFrame) override;
+  void AdvanceInternal() override;
+  bool ResetInternal() override;
+
+  nsTArray<RefPtr<imgFrame>> mFrames;
+
+  size_t mThreshold;
+};
+
+class AnimationFrameDiscardingQueue : public AnimationFrameBuffer {
+ public:
+  explicit AnimationFrameDiscardingQueue(AnimationFrameRetainedBuffer&& aQueue);
+
+  imgFrame* Get(size_t aFrame, bool aForDisplay) final;
+  bool IsFirstFrameFinished() const final;
+  bool IsLastInsertedFrame(imgFrame* aFrame) const final;
+  bool MarkComplete(const gfx::IntRect& aFirstFrameRefreshArea) override;
+  void AddSizeOfExcludingThis(MallocSizeOf aMallocSizeOf,
+                              const AddSizeOfCb& aCallback) override;
+
+  const std::deque<RefPtr<imgFrame>>& Display() const { return mDisplay; }
+  const imgFrame* FirstFrame() const { return mFirstFrame; }
+  size_t PendingInsert() const { return mInsertIndex; }
+
+ protected:
+  bool InsertInternal(RefPtr<imgFrame>&& aFrame) override;
+  void AdvanceInternal() override;
+  bool ResetInternal() override;
+
+  size_t mInsertIndex;
+
+  std::deque<RefPtr<imgFrame>> mDisplay;
+
+  RefPtr<imgFrame> mFirstFrame;
+};
+
+class AnimationFrameRecyclingQueue final
+    : public AnimationFrameDiscardingQueue {
+ public:
+  explicit AnimationFrameRecyclingQueue(AnimationFrameRetainedBuffer&& aQueue);
+
+  void AddSizeOfExcludingThis(MallocSizeOf aMallocSizeOf,
+                              const AddSizeOfCb& aCallback) override;
+
+  RawAccessFrameRef RecycleFrame(gfx::IntRect& aRecycleRect) override;
+
+  struct RecycleEntry {
+    explicit RecycleEntry(const gfx::IntRect& aDirtyRect)
+        : mDirtyRect(aDirtyRect) {}
+
+    RecycleEntry(RecycleEntry&& aOther)
+        : mFrame(std::move(aOther.mFrame)), mDirtyRect(aOther.mDirtyRect) {}
+
+    RecycleEntry& operator=(RecycleEntry&& aOther) {
+      mFrame = std::move(aOther.mFrame);
+      mDirtyRect = aOther.mDirtyRect;
+      return *this;
+    }
+
+    RecycleEntry(const RecycleEntry& aOther) = delete;
+    RecycleEntry& operator=(const RecycleEntry& aOther) = delete;
+
+    RefPtr<imgFrame> mFrame;  
+    gfx::IntRect mDirtyRect;  
+  };
+
+  const std::deque<RecycleEntry>& Recycle() const { return mRecycle; }
+
+ protected:
+  void AdvanceInternal() override;
+  bool ResetInternal() override;
+
+  std::deque<RecycleEntry> mRecycle;
+
+  bool mForceUseFirstFrameRefreshArea;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_AnimationFrameBuffer_h

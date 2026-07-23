@@ -1,0 +1,156 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include "nsString.h"
+#include "nsITextToSubURI.h"
+#include "nsEscape.h"
+#include "nsTextToSubURI.h"
+#include "nsCRT.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/TextUtils.h"
+#include "mozilla/Utf8.h"
+
+using namespace mozilla;
+
+nsTextToSubURI::~nsTextToSubURI() = default;
+
+NS_IMPL_ISUPPORTS(nsTextToSubURI, nsITextToSubURI)
+
+NS_IMETHODIMP
+nsTextToSubURI::ConvertAndEscape(const nsACString& aCharset,
+                                 const nsAString& aText, nsACString& aOut) {
+  auto encoding = Encoding::ForLabelNoReplacement(aCharset);
+  if (!encoding) {
+    aOut.Truncate();
+    return NS_ERROR_UCONV_NOCONV;
+  }
+  nsresult rv;
+  nsAutoCString intermediate;
+  std::tie(rv, std::ignore) = encoding->Encode(aText, intermediate);
+  if (NS_FAILED(rv)) {
+    aOut.Truncate();
+    return rv;
+  }
+  bool ok = NS_Escape(intermediate, aOut, url_XPAlphas);
+  if (!ok) {
+    aOut.Truncate();
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsTextToSubURI::UnEscapeAndConvert(const nsACString& aCharset,
+                                   const nsACString& aText, nsAString& aOut) {
+  auto encoding = Encoding::ForLabelNoReplacement(aCharset);
+  if (!encoding) {
+    aOut.Truncate();
+    return NS_ERROR_UCONV_NOCONV;
+  }
+  nsAutoCString unescaped(aText);
+  NS_UnescapeURL(unescaped);
+  auto rv = encoding->DecodeWithoutBOMHandling(unescaped, aOut);
+  if (NS_SUCCEEDED(rv)) {
+    return NS_OK;
+  }
+  return rv;
+}
+
+static bool statefulCharset(const char* charset) {
+  if (!nsCRT::strncasecmp(charset, "ISO-2022-", sizeof("ISO-2022-") - 1) ||
+      !nsCRT::strcasecmp(charset, "UTF-7") ||
+      !nsCRT::strcasecmp(charset, "HZ-GB-2312"))
+    return true;
+
+  return false;
+}
+
+nsresult nsTextToSubURI::convertURItoUnicode(const nsCString& aCharset,
+                                             const nsCString& aURI,
+                                             nsAString& aOut) {
+  bool isStatefulCharset = statefulCharset(aCharset.get());
+
+  if (!isStatefulCharset) {
+    if (IsAscii(aURI)) {
+      CopyASCIItoUTF16(aURI, aOut);
+      return NS_OK;
+    }
+    if (IsUtf8(aURI)) {
+      CopyUTF8toUTF16(aURI, aOut);
+      return NS_OK;
+    }
+  }
+
+  NS_ENSURE_FALSE(aCharset.IsEmpty(), NS_ERROR_INVALID_ARG);
+
+  auto encoding = Encoding::ForLabelNoReplacement(aCharset);
+  if (!encoding) {
+    aOut.Truncate();
+    return NS_ERROR_UCONV_NOCONV;
+  }
+  return encoding->DecodeWithoutBOMHandlingAndWithoutReplacement(aURI, aOut);
+}
+
+NS_IMETHODIMP nsTextToSubURI::UnEscapeURIForUI(const nsACString& aURIFragment,
+                                               bool aDontEscape,
+                                               nsAString& _retval) {
+  nsAutoCString unescapedSpec;
+  NS_UnescapeURL(PromiseFlatCString(aURIFragment),
+                 esc_SkipControl | esc_AlwaysCopy, unescapedSpec);
+
+  if (convertURItoUnicode("UTF-8"_ns, unescapedSpec, _retval) != NS_OK) {
+    CopyUTF8toUTF16(aURIFragment, _retval);
+  }
+
+  if (aDontEscape) {
+    return NS_OK;
+  }
+
+  if (mIDNBlocklist.IsEmpty()) {
+    mozilla::net::InitializeBlocklist(mIDNBlocklist);
+    mozilla::net::RemoveCharFromBlocklist(u' ', mIDNBlocklist);
+    mozilla::net::RemoveCharFromBlocklist(0x3000, mIDNBlocklist);
+  }
+
+  MOZ_ASSERT(!mIDNBlocklist.IsEmpty());
+  const nsPromiseFlatString& unescapedResult = PromiseFlatString(_retval);
+  nsString reescapedSpec;
+  _retval = NS_EscapeURL(
+      unescapedResult,
+      [&](char16_t aChar) -> bool {
+        return mozilla::net::CharInBlocklist(aChar, mIDNBlocklist);
+      },
+      reescapedSpec);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsTextToSubURI::UnEscapeNonAsciiURIJS(const nsACString& aCharset,
+                                      const nsACString& aURIFragment,
+                                      nsAString& _retval) {
+  return UnEscapeNonAsciiURI(aCharset, aURIFragment, _retval);
+}
+
+nsresult nsTextToSubURI::UnEscapeNonAsciiURI(const nsACString& aCharset,
+                                             const nsACString& aURIFragment,
+                                             nsAString& _retval) {
+  nsAutoCString unescapedSpec;
+  NS_UnescapeURL(PromiseFlatCString(aURIFragment),
+                 esc_AlwaysCopy | esc_OnlyNonASCII, unescapedSpec);
+  if (!IsUtf8(unescapedSpec) &&
+      (aCharset.LowerCaseEqualsLiteral("utf-16") ||
+       aCharset.LowerCaseEqualsLiteral("utf-16be") ||
+       aCharset.LowerCaseEqualsLiteral("utf-16le") ||
+       aCharset.LowerCaseEqualsLiteral("utf-7") ||
+       aCharset.LowerCaseEqualsLiteral("x-imap4-modified-utf7"))) {
+    CopyASCIItoUTF16(aURIFragment, _retval);
+    return NS_OK;
+  }
+
+  nsresult rv =
+      convertURItoUnicode(PromiseFlatCString(aCharset), unescapedSpec, _retval);
+  return rv == NS_OK_UDEC_MOREINPUT ? NS_ERROR_UDEC_ILLEGALINPUT : rv;
+}
+

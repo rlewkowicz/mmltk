@@ -1,0 +1,745 @@
+use std::mem;
+use std::mem::MaybeUninit;
+use std::ops::{Deref, DerefMut};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::slice;
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use std::{cmp, io, ptr};
+
+use crate::Interest;
+use crate::Token;
+
+/// Unique id for use as `SelectorId`.
+#[cfg(debug_assertions)]
+static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+
+type Count = libc::c_int;
+
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+type Filter = i16;
+
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+type Flags = u16;
+
+type UData = *mut libc::c_void;
+
+macro_rules! kevent {
+    ($id: expr, $filter: expr, $flags: expr, $data: expr) => {
+        libc::kevent {
+            ident: $id as libc::uintptr_t,
+            filter: $filter as Filter,
+            flags: $flags,
+            udata: $data as UData,
+            ..unsafe { mem::zeroed() }
+        }
+    };
+}
+
+#[derive(Debug)]
+pub struct Selector {
+    #[cfg(debug_assertions)]
+    id: usize,
+    kq: OwnedFd,
+}
+
+impl Selector {
+    pub fn new() -> io::Result<Selector> {
+        let kq = unsafe { OwnedFd::from_raw_fd(syscall!(kqueue())?) };
+        syscall!(fcntl(kq.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC))?;
+        Ok(Selector {
+            #[cfg(debug_assertions)]
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            kq,
+        })
+    }
+
+    pub fn try_clone(&self) -> io::Result<Selector> {
+        self.kq.try_clone().map(|kq| Selector {
+            #[cfg(debug_assertions)]
+            id: self.id,
+            kq,
+        })
+    }
+
+    pub fn select(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
+        let timeout = timeout.map(|to| libc::timespec {
+            tv_sec: cmp::min(to.as_secs(), libc::time_t::MAX as u64) as libc::time_t,
+            tv_nsec: libc::c_long::from(to.subsec_nanos() as i32),
+        });
+        let timeout = timeout
+            .as_ref()
+            .map(|s| s as *const _)
+            .unwrap_or(ptr::null_mut());
+
+        events.clear();
+        syscall!(kevent(
+            self.kq.as_raw_fd(),
+            ptr::null(),
+            0,
+            events.as_mut_ptr().cast(),
+            events.capacity() as Count,
+            timeout,
+        ))
+        .map(|n_events| {
+            unsafe { events.set_len(n_events as usize) };
+        })
+    }
+
+    #[cfg_attr(not(feature = "os-ext"), allow(dead_code))]
+    pub fn register(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<()> {
+        let flags = libc::EV_CLEAR | libc::EV_RECEIPT | libc::EV_ADD;
+        let mut changes: [MaybeUninit<libc::kevent>; 2] =
+            [MaybeUninit::uninit(), MaybeUninit::uninit()];
+        let mut n_changes = 0;
+
+        if interests.is_writable() {
+            let kevent = kevent!(fd, libc::EVFILT_WRITE, flags, token.0);
+            changes[n_changes] = MaybeUninit::new(kevent);
+            n_changes += 1;
+        }
+
+        if interests.is_readable() {
+            let kevent = kevent!(fd, libc::EVFILT_READ, flags, token.0);
+            changes[n_changes] = MaybeUninit::new(kevent);
+            n_changes += 1;
+        }
+
+        let changes = unsafe {
+            slice::from_raw_parts_mut(changes[0].as_mut_ptr(), n_changes)
+        };
+        kevent_register(self.kq.as_raw_fd(), changes, &[libc::EPIPE as i64])
+    }
+
+    cfg_any_os_ext! {
+    pub fn reregister(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<()> {
+        let flags = libc::EV_CLEAR | libc::EV_RECEIPT;
+        let write_flags = if interests.is_writable() {
+            flags | libc::EV_ADD
+        } else {
+            flags | libc::EV_DELETE
+        };
+        let read_flags = if interests.is_readable() {
+            flags | libc::EV_ADD
+        } else {
+            flags | libc::EV_DELETE
+        };
+
+        let mut changes: [libc::kevent; 2] = [
+            kevent!(fd, libc::EVFILT_WRITE, write_flags, token.0),
+            kevent!(fd, libc::EVFILT_READ, read_flags, token.0),
+        ];
+
+        kevent_register(
+            self.kq.as_raw_fd(),
+            &mut changes,
+            &[libc::ENOENT as i64, libc::EPIPE as i64],
+        )
+    }
+
+    pub fn deregister(&self, fd: RawFd) -> io::Result<()> {
+        let flags = libc::EV_DELETE | libc::EV_RECEIPT;
+        let mut changes: [libc::kevent; 2] = [
+            kevent!(fd, libc::EVFILT_WRITE, flags, 0),
+            kevent!(fd, libc::EVFILT_READ, flags, 0),
+        ];
+
+        kevent_register(self.kq.as_raw_fd(), &mut changes, &[libc::ENOENT as i64])
+    }
+    }
+
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+pub fn setup_waker(&self, token: Token) -> io::Result<()> {
+        let mut kevent = kevent!(
+            0,
+            libc::EVFILT_USER,
+            libc::EV_ADD | libc::EV_CLEAR | libc::EV_RECEIPT,
+            token.0
+        );
+
+        let kq = self.kq.as_raw_fd();
+        syscall!(kevent(kq, &kevent, 1, &mut kevent, 1, ptr::null())).and_then(|_| {
+            if (kevent.flags & libc::EV_ERROR) != 0 && kevent.data != 0 {
+                Err(io::Error::from_raw_os_error(kevent.data as i32))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+pub fn wake(&self, token: Token) -> io::Result<()> {
+        let mut kevent = kevent!(
+            0,
+            libc::EVFILT_USER,
+            libc::EV_ADD | libc::EV_RECEIPT,
+            token.0
+        );
+        kevent.fflags = libc::NOTE_TRIGGER;
+
+        let kq = self.kq.as_raw_fd();
+        syscall!(kevent(kq, &kevent, 1, &mut kevent, 1, ptr::null())).and_then(|_| {
+            if (kevent.flags & libc::EV_ERROR) != 0 && kevent.data != 0 {
+                Err(io::Error::from_raw_os_error(kevent.data as i32))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+/// Register `changes` with `kq`ueue.
+fn kevent_register(
+    kq: RawFd,
+    changes: &mut [libc::kevent],
+    ignored_errors: &[i64],
+) -> io::Result<()> {
+    syscall!(kevent(
+        kq,
+        changes.as_ptr(),
+        changes.len() as Count,
+        changes.as_mut_ptr(),
+        changes.len() as Count,
+        ptr::null(),
+    ))
+    .map(|_| ())
+    .or_else(|err| {
+        if err.raw_os_error() == Some(libc::EINTR) {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    })
+    .and_then(|()| check_errors(changes, ignored_errors))
+}
+
+/// Check all events for possible errors, it returns the first error found.
+fn check_errors(events: &[libc::kevent], ignored_errors: &[i64]) -> io::Result<()> {
+    for event in events {
+        let data = event.data as _;
+        if (event.flags & libc::EV_ERROR != 0) && data != 0 && !ignored_errors.contains(&data) {
+            return Err(io::Error::from_raw_os_error(data as i32));
+        }
+    }
+    Ok(())
+}
+
+cfg_io_source! {
+    #[cfg(debug_assertions)]
+    impl Selector {
+        pub fn id(&self) -> usize {
+            self.id
+        }
+    }
+}
+
+impl AsFd for Selector {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.kq.as_fd()
+    }
+}
+
+impl AsRawFd for Selector {
+    fn as_raw_fd(&self) -> RawFd {
+        self.kq.as_raw_fd()
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct Event(libc::kevent);
+
+unsafe impl Send for Event {}
+unsafe impl Sync for Event {}
+
+impl Deref for Event {
+    type Target = libc::kevent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Event {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+pub struct Events(Vec<Event>);
+
+impl Deref for Events {
+    type Target = Vec<Event>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Events {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Events {
+    pub fn with_capacity(capacity: usize) -> Events {
+        Events(Vec::with_capacity(capacity))
+    }
+}
+
+unsafe impl Send for Events {}
+unsafe impl Sync for Events {}
+
+pub mod event {
+    use std::fmt;
+
+    use crate::sys::Event;
+    use crate::Token;
+
+    use super::{Filter, Flags};
+
+    pub fn token(event: &Event) -> Token {
+        Token(event.0.udata as usize)
+    }
+
+    pub fn is_readable(event: &Event) -> bool {
+        event.0.filter == libc::EVFILT_READ || {
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+            {
+                event.filter == libc::EVFILT_USER
+            }
+#[cfg(not(any(target_os = "tvos", target_os = "visionos", target_os = "watchos")))]
+{
+                false
+            }
+        }
+    }
+
+    pub fn is_writable(event: &Event) -> bool {
+        event.0.filter == libc::EVFILT_WRITE
+    }
+
+    pub fn is_error(event: &Event) -> bool {
+        (event.0.flags & libc::EV_ERROR) != 0 ||
+            (event.0.flags & libc::EV_EOF) != 0 && event.0.fflags != 0
+    }
+
+    pub fn is_read_closed(event: &Event) -> bool {
+        event.0.filter == libc::EVFILT_READ && event.0.flags & libc::EV_EOF != 0
+    }
+
+    pub fn is_write_closed(event: &Event) -> bool {
+        event.0.filter == libc::EVFILT_WRITE && event.0.flags & libc::EV_EOF != 0
+    }
+
+    pub fn is_priority(_: &Event) -> bool {
+        false
+    }
+
+    #[allow(unused_variables)] 
+    pub fn is_aio(event: &Event) -> bool {
+        #[cfg(any(
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos",
+        ))]
+        {
+            event.0.filter == libc::EVFILT_AIO
+        }
+        #[cfg(not(any(
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos",
+        )))]
+        {
+            false
+        }
+    }
+
+    #[allow(unused_variables)] 
+    pub fn is_lio(event: &Event) -> bool {
+#[cfg(any())]
+
+
+
+
+
+
+
+
+
+        {
+            event.0.filter == libc::EVFILT_LIO
+        }
+{
+            false
+        }
+    }
+
+    pub fn debug_details(f: &mut fmt::Formatter<'_>, event: &Event) -> fmt::Result {
+        debug_detail!(
+            FilterDetails(Filter),
+            PartialEq::eq,
+            libc::EVFILT_READ,
+            libc::EVFILT_WRITE,
+            libc::EVFILT_AIO,
+            libc::EVFILT_VNODE,
+            libc::EVFILT_PROC,
+            libc::EVFILT_SIGNAL,
+            libc::EVFILT_TIMER,
+#[cfg(any())]
+
+
+
+
+
+
+
+
+
+            libc::EVFILT_PROCDESC,
+            #[cfg(any(
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos",
+            ))]
+            libc::EVFILT_FS,
+#[cfg(any())]
+
+
+
+
+
+
+
+
+
+            libc::EVFILT_LIO,
+            #[cfg(any(
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos",
+            ))]
+            libc::EVFILT_USER,
+#[cfg(any())]
+
+
+
+
+
+
+
+
+
+            libc::EVFILT_SENDFILE,
+#[cfg(any())]
+
+
+
+
+
+
+
+
+
+            libc::EVFILT_EMPTY,
+#[cfg(any())]
+
+
+
+
+
+
+
+
+
+            libc::EVFILT_EXCEPT,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::EVFILT_MACHPORT,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::EVFILT_VM,
+        );
+
+        #[allow(clippy::trivially_copy_pass_by_ref)]
+        fn check_flag(got: &Flags, want: &Flags) -> bool {
+            (got & want) != 0
+        }
+        debug_detail!(
+            FlagsDetails(Flags),
+            check_flag,
+            libc::EV_ADD,
+            libc::EV_DELETE,
+            libc::EV_ENABLE,
+            libc::EV_DISABLE,
+            libc::EV_ONESHOT,
+            libc::EV_CLEAR,
+            libc::EV_RECEIPT,
+            libc::EV_DISPATCH,
+#[cfg(any())]
+
+
+
+
+
+
+
+
+
+            libc::EV_DROP,
+            libc::EV_FLAG1,
+            libc::EV_ERROR,
+            libc::EV_EOF,
+libc::EV_SYSFLAGS,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::EV_FLAG0,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::EV_POLL,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::EV_OOBAND,
+#[cfg(any())]
+
+
+
+
+
+
+
+
+
+            libc::EV_NODATA,
+        );
+
+        #[allow(clippy::trivially_copy_pass_by_ref)]
+        fn check_fflag(got: &u32, want: &u32) -> bool {
+            (got & want) != 0
+        }
+        debug_detail!(
+            FflagsDetails(u32),
+            check_fflag,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos",
+            ))]
+            libc::NOTE_TRIGGER,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos",
+            ))]
+            libc::NOTE_FFNOP,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos",
+            ))]
+            libc::NOTE_FFAND,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos",
+            ))]
+            libc::NOTE_FFOR,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos",
+            ))]
+            libc::NOTE_FFCOPY,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos",
+            ))]
+            libc::NOTE_FFCTRLMASK,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos",
+            ))]
+            libc::NOTE_FFLAGSMASK,
+            libc::NOTE_LOWAT,
+            libc::NOTE_DELETE,
+            libc::NOTE_WRITE,
+#[cfg(any())]
+
+
+
+
+
+
+
+
+
+            libc::NOTE_OOB,
+#[cfg(any())]
+
+
+
+
+
+
+
+
+
+            libc::NOTE_EOF,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_EXTEND,
+            libc::NOTE_ATTRIB,
+            libc::NOTE_LINK,
+            libc::NOTE_RENAME,
+            libc::NOTE_REVOKE,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_NONE,
+#[cfg(any())]
+
+
+
+
+
+
+
+
+
+            libc::NOTE_TRUNCATE,
+            libc::NOTE_EXIT,
+            libc::NOTE_FORK,
+            libc::NOTE_EXEC,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_SIGNAL,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_EXITSTATUS,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_EXIT_DETAIL,
+            libc::NOTE_PDATAMASK,
+            libc::NOTE_PCTRLMASK,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+            ))]
+            libc::NOTE_TRACK,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+            ))]
+            libc::NOTE_TRACKERR,
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+            ))]
+            libc::NOTE_CHILD,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_EXIT_DETAIL_MASK,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_EXIT_DECRYPTFAIL,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_EXIT_MEMORY,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_EXIT_CSERROR,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_VM_PRESSURE,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_VM_PRESSURE_TERMINATE,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_VM_PRESSURE_SUDDEN_TERMINATE,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_VM_ERROR,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_SECONDS,
+#[cfg(any())]
+
+
+
+
+
+
+
+
+
+            libc::NOTE_MSECONDS,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_USECONDS,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_NSECONDS,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_ABSOLUTE,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_LEEWAY,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_CRITICAL,
+#[cfg(any(target_os = "tvos", target_os = "visionos", target_os = "watchos"))]
+libc::NOTE_BACKGROUND,
+        );
+
+        let ident = event.0.ident;
+        let data = event.0.data;
+        let udata = event.0.udata;
+        f.debug_struct("kevent")
+            .field("ident", &ident)
+            .field("filter", &FilterDetails(event.0.filter))
+            .field("flags", &FlagsDetails(event.0.flags))
+            .field("fflags", &FflagsDetails(event.0.fflags))
+            .field("data", &data)
+            .field("udata", &udata)
+            .finish()
+    }
+}
+
+pub(crate) use crate::sys::unix::waker::Waker;
+
+cfg_io_source! {
+    mod stateless_io_source;
+    pub(crate) use stateless_io_source::IoSourceState;
+}

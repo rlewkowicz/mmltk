@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_MEDIATRACKLISTENER_h_
+#define MOZILLA_MEDIATRACKLISTENER_h_
+
+#include "MediaTrackGraph.h"
+#include "PrincipalHandle.h"
+
+namespace mozilla {
+
+class AudioSegment;
+class MediaTrackGraph;
+class MediaStreamVideoSink;
+class VideoSegment;
+
+class MediaTrackListener {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaTrackListener)
+
+ public:
+  virtual void NotifyPull(MediaTrackGraph* aGraph, TrackTime aEndOfAppendedData,
+                          TrackTime aDesiredTime) {}
+
+  virtual void NotifyQueuedChanges(MediaTrackGraph* aGraph,
+                                   TrackTime aTrackOffset,
+                                   const MediaSegment& aQueuedMedia) {}
+
+  virtual void NotifyPrincipalHandleChanged(
+      MediaTrackGraph* aGraph, const PrincipalHandle& aNewPrincipalHandle) {}
+
+  virtual void NotifyEnabledStateChanged(MediaTrackGraph* aGraph,
+                                         bool aEnabled) {}
+
+  virtual void NotifyOutput(MediaTrackGraph* aGraph,
+                            TrackTime aCurrentTrackTime) {}
+
+  virtual void NotifyEnded(MediaTrackGraph* aGraph) {}
+
+  virtual void NotifyRemoved(MediaTrackGraph* aGraph) {}
+
+ protected:
+  virtual ~MediaTrackListener() = default;
+};
+
+class DirectMediaTrackListener : public MediaTrackListener {
+  friend class SourceMediaTrack;
+  friend class ForwardedInputTrack;
+
+ public:
+  virtual void NotifyRealtimeTrackData(MediaTrackGraph* aGraph,
+                                       TrackTime aTrackOffset,
+                                       const MediaSegment& aMedia) {}
+
+  enum class InstallationResult {
+    TRACK_NOT_SUPPORTED,
+    ALREADY_EXISTS,
+    SUCCESS
+  };
+  virtual void NotifyDirectListenerInstalled(InstallationResult aResult) {}
+  virtual void NotifyDirectListenerUninstalled() {}
+
+ protected:
+  virtual ~DirectMediaTrackListener() = default;
+
+  void MirrorAndDisableSegment(AudioSegment& aFrom, AudioSegment& aTo);
+  void MirrorAndDisableSegment(VideoSegment& aFrom, VideoSegment& aTo,
+                               DisabledTrackMode aMode);
+  void NotifyRealtimeTrackDataAndApplyTrackDisabling(MediaTrackGraph* aGraph,
+                                                     TrackTime aTrackOffset,
+                                                     MediaSegment& aMedia);
+
+  void IncreaseDisabled(DisabledTrackMode aMode);
+  void DecreaseDisabled(DisabledTrackMode aMode);
+
+  Atomic<int32_t> mDisabledFreezeCount;
+  Atomic<int32_t> mDisabledBlackCount;
+};
+
+}  
+
+#endif  // MOZILLA_MEDIATRACKLISTENER_h_

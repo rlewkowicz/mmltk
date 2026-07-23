@@ -1,0 +1,102 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef HTMLFrameSetElement_h
+#define HTMLFrameSetElement_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Span.h"
+#include "nsGenericHTMLElement.h"
+#include "nsTArray.h"
+
+enum nsFramesetUnit {
+  eFramesetUnit_Fixed = 0,
+  eFramesetUnit_Percent,
+  eFramesetUnit_Relative
+};
+
+struct nsFramesetSpec {
+  nsFramesetUnit mUnit;
+  nscoord mValue;
+};
+
+#define NS_MAX_FRAMESET_SPEC_COUNT 16000
+
+
+namespace mozilla::dom {
+
+class OnBeforeUnloadEventHandlerNonNull;
+
+class HTMLFrameSetElement final : public nsGenericHTMLElement {
+ public:
+  explicit HTMLFrameSetElement(
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+      : nsGenericHTMLElement(std::move(aNodeInfo)),
+        mCurrentRowColHint(NS_STYLE_HINT_REFLOW) {
+    SetHasWeirdParserInsertionMode();
+  }
+
+  NS_IMPL_FROMNODE_HTML_WITH_TAG(HTMLFrameSetElement, frameset)
+
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(HTMLFrameSetElement,
+                                       nsGenericHTMLElement)
+
+  void GetCols(DOMString& aCols) { GetHTMLAttr(nsGkAtoms::cols, aCols); }
+  void SetCols(const nsAString& aCols, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::cols, aCols, aError);
+  }
+  void GetRows(DOMString& aRows) { GetHTMLAttr(nsGkAtoms::rows, aRows); }
+  void SetRows(const nsAString& aRows, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::rows, aRows, aError);
+  }
+
+  bool IsEventAttributeNameInternal(nsAtom* aName) override;
+
+#define EVENT(name_, id_, type_, \
+              struct_) 
+#define WINDOW_EVENT_HELPER(name_, type_) \
+  type_* GetOn##name_();                  \
+  void SetOn##name_(type_* handler);
+#define WINDOW_EVENT(name_, id_, type_, struct_) \
+  WINDOW_EVENT_HELPER(name_, EventHandlerNonNull)
+#define BEFOREUNLOAD_EVENT(name_, id_, type_, struct_) \
+  WINDOW_EVENT_HELPER(name_, OnBeforeUnloadEventHandlerNonNull)
+#include "mozilla/EventNameList.inc"  // IWYU pragma: keep
+#undef BEFOREUNLOAD_EVENT
+#undef WINDOW_EVENT
+#undef WINDOW_EVENT_HELPER
+#undef EVENT
+
+  Span<const nsFramesetSpec> GetRowSpec() MOZ_LIFETIME_BOUND;
+  Span<const nsFramesetSpec> GetColSpec() MOZ_LIFETIME_BOUND;
+
+  bool ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                      const nsAString& aValue,
+                      nsIPrincipal* aMaybeScriptedPrincipal,
+                      nsAttrValue& aResult) override;
+  nsChangeHint GetAttributeChangeHint(const nsAtom* aAttribute,
+                                      AttrModType aModType) const override;
+
+  nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
+
+ protected:
+  virtual ~HTMLFrameSetElement();
+
+  JSObject* WrapNode(JSContext*, JS::Handle<JSObject*> aGivenProto) override;
+
+  void BeforeSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                     const nsAttrValue* aValue, bool aNotify) override;
+
+ private:
+  nsresult ParseRowCol(const nsAttrValue& aValue,
+                       nsTArray<nsFramesetSpec>& aSpecs);
+
+  nsChangeHint mCurrentRowColHint;
+  nsTArray<nsFramesetSpec> mRowSpecs;  
+  nsTArray<nsFramesetSpec> mColSpecs;  
+};
+
+}  
+
+#endif  // HTMLFrameSetElement_h

@@ -1,0 +1,54 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkSpinlock_DEFINED)
+#define SkSpinlock_DEFINED
+
+#include "include/private/base/SkAPI.h"
+#include "include/private/base/SkThreadAnnotations.h"
+
+#include <atomic>
+
+class SK_CAPABILITY("mutex") SkSpinlock {
+public:
+    constexpr SkSpinlock() = default;
+
+    void acquire() SK_ACQUIRE() {
+        if (fLocked.exchange(true, std::memory_order_acquire)) {
+            this->contendedAcquire();
+        }
+    }
+
+    bool tryAcquire() SK_TRY_ACQUIRE(true) {
+        if (fLocked.exchange(true, std::memory_order_acquire)) {
+            return false;
+        }
+        return true;
+    }
+
+    void release() SK_RELEASE_CAPABILITY() {
+        fLocked.store(false, std::memory_order_release);
+    }
+
+private:
+    SK_API void contendedAcquire();
+
+    std::atomic<bool> fLocked{false};
+};
+
+class SK_SCOPED_CAPABILITY SkAutoSpinlock {
+public:
+    explicit SkAutoSpinlock(SkSpinlock& mutex) SK_ACQUIRE(mutex) : fSpinlock(mutex) {
+        fSpinlock.acquire();
+    }
+    ~SkAutoSpinlock() SK_RELEASE_CAPABILITY() { fSpinlock.release(); }
+
+private:
+    SkSpinlock& fSpinlock;
+};
+
+#endif

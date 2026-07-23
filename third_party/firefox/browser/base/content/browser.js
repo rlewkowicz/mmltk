@@ -1,0 +1,3489 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+var { XPCOMUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/XPCOMUtils.sys.mjs"
+);
+var { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+
+
+ChromeUtils.defineESModuleGetters(this, {
+  ActionsProviderContextualSearch:
+    "moz-src:///browser/components/urlbar/ActionsProviderContextualSearch.sys.mjs",
+  BrowserUIUtils: "resource:///modules/BrowserUIUtils.sys.mjs",
+  BrowserWindowTracker: "resource:///modules/BrowserWindowTracker.sys.mjs",
+  Color: "resource://gre/modules/Color.sys.mjs",
+  ContextualIdentityService:
+    "moz-src:///toolkit/components/contextualidentity/ContextualIdentityService.sys.mjs",
+  CustomizableUI:
+    "moz-src:///browser/components/customizableui/CustomizableUI.sys.mjs",
+  DownloadUtils: "resource://gre/modules/DownloadUtils.sys.mjs",
+  DownloadsCommon:
+    "moz-src:///browser/components/downloads/DownloadsCommon.sys.mjs",
+  E10SUtils: "resource://gre/modules/E10SUtils.sys.mjs",
+  HomePage: "resource:///modules/HomePage.sys.mjs",
+  LightweightThemeConsumer:
+    "resource://gre/modules/LightweightThemeConsumer.sys.mjs",
+  NetUtil: "resource://gre/modules/NetUtil.sys.mjs",
+  nsContextMenu: "chrome://browser/content/nsContextMenu.sys.mjs",
+  OpenSearchManager:
+    "moz-src:///browser/components/search/OpenSearchManager.sys.mjs",
+  PageActions: "resource:///modules/PageActions.sys.mjs",
+  PanelMultiView:
+    "moz-src:///browser/components/customizableui/PanelMultiView.sys.mjs",
+  PanelView:
+    "moz-src:///browser/components/customizableui/PanelMultiView.sys.mjs",
+  PlacesTransactions: "resource://gre/modules/PlacesTransactions.sys.mjs",
+  PlacesUIUtils: "moz-src:///browser/components/places/PlacesUIUtils.sys.mjs",
+  PlacesUtils: "resource://gre/modules/PlacesUtils.sys.mjs",
+  PopupAndRedirectBlockerObserver:
+    "resource:///modules/PopupAndRedirectBlockerObserver.sys.mjs",
+  PrivateBrowsingUtils: "resource://gre/modules/PrivateBrowsingUtils.sys.mjs",
+  ReducedProtectionNotification:
+    "resource:///modules/ReducedProtectionNotification.sys.mjs",
+  PrivateBrowsingUI: "moz-src:///browser/modules/PrivateBrowsingUI.sys.mjs",
+  PromptUtils: "resource://gre/modules/PromptUtils.sys.mjs",
+  ResetPBMPanel:
+    "moz-src:///browser/components/privatebrowsing/ResetPBMPanel.sys.mjs",
+  Sanitizer: "resource:///modules/Sanitizer.sys.mjs",
+  SearchUIUtils: "moz-src:///browser/components/search/SearchUIUtils.sys.mjs",
+  SessionStartup: "resource:///modules/sessionstore/SessionStartup.sys.mjs",
+  SessionStore: "resource:///modules/sessionstore/SessionStore.sys.mjs",
+  SessionWindowUI: "resource:///modules/sessionstore/SessionWindowUI.sys.mjs",
+  ShortcutUtils: "resource://gre/modules/ShortcutUtils.sys.mjs",
+  SiteDataManager: "resource:///modules/SiteDataManager.sys.mjs",
+  SitePermissions: "resource:///modules/SitePermissions.sys.mjs",
+  SubDialog: "resource://gre/modules/SubDialog.sys.mjs",
+  SubDialogManager: "resource://gre/modules/SubDialog.sys.mjs",
+  ToolbarContextMenu:
+    "moz-src:///browser/components/customizableui/ToolbarContextMenu.sys.mjs",
+  ToolbarDropHandler:
+    "moz-src:///browser/components/customizableui/ToolbarDropHandler.sys.mjs",
+  ToolbarIconColor: "moz-src:///browser/themes/ToolbarIconColor.sys.mjs",
+  URILoadingHelper: "resource:///modules/URILoadingHelper.sys.mjs",
+  UrlbarPrefs: "moz-src:///browser/components/urlbar/UrlbarPrefs.sys.mjs",
+  UrlbarTokenizer:
+    "moz-src:///browser/components/urlbar/UrlbarTokenizer.sys.mjs",
+  UrlbarUtils: "moz-src:///browser/components/urlbar/UrlbarUtils.sys.mjs",
+  WebNavigationFrames: "resource://gre/modules/WebNavigationFrames.sys.mjs",
+  ZoomUI: "resource:///modules/ZoomUI.sys.mjs",
+});
+
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  ["BrowserCommands", "kSkipCacheFlags"],
+  "chrome://browser/content/browser-commands.js"
+);
+
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "PlacesTreeView",
+  "chrome://browser/content/places/treeView.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  ["PlacesInsertionPoint", "PlacesController", "PlacesControllerDragHelper"],
+  "chrome://browser/content/places/controller.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "ZoomManager",
+  "chrome://global/content/viewZoomOverlay.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "FullZoom",
+  "chrome://browser/content/tabbrowser/browser-fullZoom.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "PanelUI",
+  "chrome://browser/content/customizableui/panelUI.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "gViewSourceUtils",
+  "chrome://global/content/viewSourceUtils.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "gTabsPanel",
+  "chrome://browser/content/tabbrowser/browser-allTabsMenu.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "ctrlTab",
+  "chrome://browser/content/tabbrowser/browser-ctrlTab.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  ["CustomizationHandler", "AutoHideMenubar"],
+  "chrome://browser/content/browser-customization.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  ["PointerLock", "FullScreen"],
+  "chrome://browser/content/browser-fullScreenAndPointerLock.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "gIdentityHandler",
+  "chrome://browser/content/browser-siteIdentity.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "gPermissionPanel",
+  "chrome://browser/content/browser-sitePermissionPanel.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "gProtectionsHandler",
+  "chrome://browser/content/browser-siteProtections.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "gTrustPanelHandler",
+  "chrome://browser/content/browser-trustPanel.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  ["gGestureSupport", "gHistorySwipeAnimation"],
+  "chrome://browser/content/browser-gestureSupport.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  [
+    "DownloadsPanel",
+    "DownloadsOverlayLoader",
+    "DownloadsView",
+    "DownloadsViewUI",
+    "DownloadsViewController",
+    "DownloadsSummary",
+    "DownloadsFooter",
+  ],
+  "chrome://browser/content/downloads/downloads.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  ["DownloadsButton", "DownloadsIndicatorView"],
+  "chrome://browser/content/downloads/indicator.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "gEditItemOverlay",
+  "chrome://browser/content/places/editBookmark.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "gGfxUtils",
+  "chrome://browser/content/browser-graphics-utils.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "ToolbarKeyboardNavigator",
+  "chrome://browser/content/browser-toolbarKeyNav.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "gPageStyleMenu",
+  "chrome://browser/content/browser-pagestyle.js"
+);
+
+XPCOMUtils.defineLazyServiceGetters(this, {
+  classifierService: [
+    "@mozilla.org/url-classifier/dbservice;1",
+    Ci.nsIURIClassifier,
+  ],
+  Favicons: ["@mozilla.org/browser/favicon-service;1", Ci.nsIFaviconService],
+  BrowserHandler: ["@mozilla.org/browser/clh;1", Ci.nsIBrowserHandler],
+});
+
+ChromeUtils.defineLazyGetter(this, "RTL_UI", () => {
+  return Services.locale.isAppLocaleRTL;
+});
+function gLocaleChangeObserver() {
+  delete window.RTL_UI;
+  window.RTL_UI = Services.locale.isAppLocaleRTL;
+}
+
+ChromeUtils.defineLazyGetter(this, "gBrandBundle", () => {
+  return Services.strings.createBundle(
+    "chrome://branding/locale/brand.properties"
+  );
+});
+
+ChromeUtils.defineLazyGetter(this, "gBrowserBundle", () => {
+  return Services.strings.createBundle(
+    "chrome://browser/locale/browser.properties"
+  );
+});
+
+ChromeUtils.defineLazyGetter(this, "gCustomizeMode", () => {
+  let { CustomizeMode } = ChromeUtils.importESModule(
+    "moz-src:///browser/components/customizableui/CustomizeMode.sys.mjs"
+  );
+  return new CustomizeMode(window);
+});
+
+ChromeUtils.defineLazyGetter(this, "gNavToolbox", () => {
+  return document.getElementById("navigator-toolbox");
+});
+
+ChromeUtils.defineLazyGetter(this, "gURLBar", () => {
+  let urlbar = document.getElementById("urlbar");
+
+  let beforeFocusOrSelect = event => {
+    if (
+      CustomizationHandler.isCustomizing() ||
+      CustomizationHandler.isExitingCustomizeMode
+    ) {
+      gNavToolbox.addEventListener(
+        "aftercustomization",
+        () => {
+          if (event.type == "beforeselect") {
+            gURLBar.select();
+          } else {
+            gURLBar.focus();
+          }
+        },
+        {
+          once: true,
+        }
+      );
+      event.preventDefault();
+      return;
+    }
+
+    if (window.fullScreen) {
+      FullScreen.showNavToolbox();
+    }
+  };
+  urlbar.addEventListener("beforefocus", beforeFocusOrSelect);
+  urlbar.addEventListener("beforeselect", beforeFocusOrSelect);
+
+  return urlbar;
+});
+
+ChromeUtils.defineLazyGetter(this, "gNotificationBox", () => {
+  let securityDelayMS = Services.prefs.getIntPref(
+    "security.notification_enable_delay"
+  );
+
+  return new MozElements.NotificationBox(element => {
+    element.classList.add("global-notificationbox");
+    element.setAttribute("notificationside", "top");
+    element.setAttribute("prepend-notifications", true);
+    document.getElementById("notifications-toolbar").prepend(element);
+  }, securityDelayMS);
+});
+
+ChromeUtils.defineLazyGetter(this, "PopupNotifications", () => {
+  // eslint-disable-next-line no-shadow
+  let { PopupNotifications } = ChromeUtils.importESModule(
+    "resource://gre/modules/PopupNotifications.sys.mjs"
+  );
+  try {
+    let shouldSuppress = () => {
+      const urlBarEdited = isBlankPageURL(gBrowser.currentURI.spec)
+        ? gURLBar.hasAttribute("usertyping")
+        : gURLBar.getAttribute("pageproxystate") != "valid";
+      return (
+        (urlBarEdited && gURLBar.focused) ||
+        (gURLBar.getAttribute("pageproxystate") != "valid" &&
+          gBrowser.selectedBrowser._awaitingSetURI) ||
+        shouldSuppressPopupNotifications()
+      );
+    };
+
+    const getVisibleAnchorElement = anchorElement => {
+      gURLBar.maybeHandleRevertFromPopup(anchorElement);
+      anchorElement?.dispatchEvent(
+        new CustomEvent("PopupNotificationsBeforeAnchor", { bubbles: true })
+      );
+      if (anchorElement?.checkVisibility()) {
+        return anchorElement;
+      }
+      let fallback = [
+        document.getElementById("trust-icon-container"),
+        gURLBar.querySelector(".searchmode-switcher-icon"),
+        document.getElementById("identity-icon"),
+      ];
+      return fallback.find(element => element?.checkVisibility()) ?? null;
+    };
+
+    return new PopupNotifications(
+      gBrowser,
+      document.getElementById("notification-popup"),
+      document.getElementById("notification-popup-box"),
+      { shouldSuppress, getVisibleAnchorElement }
+    );
+  } catch (ex) {
+    console.error(ex);
+    return null;
+  }
+});
+
+ChromeUtils.defineLazyGetter(this, "MacUserActivityUpdater", () => {
+  if (AppConstants.platform != "macosx") {
+    return null;
+  }
+
+  return Cc["@mozilla.org/widget/macuseractivityupdater;1"].getService(
+    Ci.nsIMacUserActivityUpdater
+  );
+});
+
+ChromeUtils.defineLazyGetter(this, "Win7Features", () => {
+  if (AppConstants.platform != "win") {
+    return null;
+  }
+
+  const WINTASKBAR_CONTRACTID = "@mozilla.org/windows-taskbar;1";
+  if (
+    WINTASKBAR_CONTRACTID in Cc &&
+    Cc[WINTASKBAR_CONTRACTID].getService(Ci.nsIWinTaskbar).available
+  ) {
+    let { AeroPeek } = ChromeUtils.importESModule(
+      "resource:///modules/WindowsPreviewPerTab.sys.mjs"
+    );
+    return {
+      onOpenWindow() {
+        AeroPeek.onOpenWindow(window);
+        this.handledOpening = true;
+      },
+      onCloseWindow() {
+        if (this.handledOpening) {
+          AeroPeek.onCloseWindow(window);
+        }
+      },
+      handledOpening: false,
+    };
+  }
+  return null;
+});
+
+ChromeUtils.defineLazyGetter(this, "gRestoreLastSessionObserver", () => {
+  let { RestoreLastSessionObserver } = ChromeUtils.importESModule(
+    "resource:///modules/sessionstore/SessionWindowUI.sys.mjs"
+  );
+  return new RestoreLastSessionObserver(window);
+});
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  this,
+  "gToolbarKeyNavEnabled",
+  "browser.toolbars.keyboard_navigation",
+  false,
+  (aPref, aOldVal, aNewVal) => {
+    if (window.closed) {
+      return;
+    }
+    if (aNewVal) {
+      ToolbarKeyboardNavigator.init();
+    } else {
+      ToolbarKeyboardNavigator.uninit();
+    }
+  }
+);
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  this,
+  "gBookmarksToolbarVisibility",
+  "browser.toolbars.bookmarks.visibility",
+  "newtab"
+);
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  this,
+  "gMiddleClickNewTabUsesPasteboard",
+  "browser.tabs.searchclipboardfor.middleclick",
+  true
+);
+
+var gBrowser;
+var gContextMenu = null; 
+var gMultiProcessBrowser = window.docShell.QueryInterface(
+  Ci.nsILoadContext
+).useRemoteTabs;
+var gFissionBrowser = window.docShell.QueryInterface(
+  Ci.nsILoadContext
+).useRemoteSubframes;
+
+var gBrowserAllowScriptsToCloseInitialTabs = false;
+
+if (AppConstants.platform != "macosx") {
+  var gEditUIVisible = true;
+}
+
+Object.defineProperty(this, "gReduceMotion", {
+  enumerable: true,
+  get() {
+    return typeof gReduceMotionOverride == "boolean"
+      ? gReduceMotionOverride
+      : gReduceMotionSetting;
+  },
+});
+let gReduceMotionSetting = true;
+var gReduceMotionOverride;
+
+
+Object.defineProperty(this, "gFindBar", {
+  enumerable: true,
+  get() {
+    return gBrowser.getCachedFindBar();
+  },
+});
+
+Object.defineProperty(this, "gFindBarInitialized", {
+  enumerable: true,
+  get() {
+    return gBrowser.isFindBarInitialized();
+  },
+});
+
+Object.defineProperty(this, "gFindBarPromise", {
+  enumerable: true,
+  get() {
+    return gBrowser.getFindBar();
+  },
+});
+
+function shouldSuppressPopupNotifications() {
+  return (
+    window.windowState == window.STATE_MINIMIZED ||
+    gBrowser?.selectedBrowser.hasAttribute("tabDialogShowing") ||
+    gDialogBox?.isOpen
+  );
+}
+
+async function gLazyFindCommand(cmd, ...args) {
+  let fb = await gFindBarPromise;
+  if (fb && fb[cmd]) {
+    fb[cmd].apply(fb, args);
+  }
+}
+
+var gPageIcons = {
+  "about:privatebrowsing": "chrome://browser/skin/privatebrowsing/favicon.svg",
+};
+
+var gInitialPages = [
+  "about:blank",
+  "about:privatebrowsing",
+  "about:sessionrestore",
+  "chrome://browser/content/blanktab.html",
+];
+
+function isInitialPage(url) {
+  if (!(url instanceof Ci.nsIURI)) {
+    try {
+      url = Services.io.newURI(url);
+    } catch (ex) {
+      return false;
+    }
+  }
+
+  let nonQuery = url.prePath + url.filePath;
+  return gInitialPages.includes(nonQuery) || nonQuery == BROWSER_NEW_TAB_URL;
+}
+
+function browserWindows() {
+  return Services.wm.getEnumerator("navigator:browser");
+}
+
+var gNavigatorBundle = {
+  getString(key) {
+    return gBrowserBundle.GetStringFromName(key);
+  },
+  getFormattedString(key, array) {
+    return gBrowserBundle.formatStringFromName(key, array);
+  },
+};
+
+function UpdateBackForwardCommands(aWebNavigation) {
+  var backCommand = document.getElementById("Browser:Back");
+  var forwardCommand = document.getElementById("Browser:Forward");
+
+
+  var backDisabled = backCommand.hasAttribute("disabled");
+  var forwardDisabled = forwardCommand.hasAttribute("disabled");
+  if (backDisabled == aWebNavigation.canGoBack) {
+    if (backDisabled) {
+      backCommand.removeAttribute("disabled");
+    } else {
+      backCommand.setAttribute("disabled", true);
+    }
+  }
+
+  if (forwardDisabled == aWebNavigation.canGoForward) {
+    if (forwardDisabled) {
+      forwardCommand.removeAttribute("disabled");
+    } else {
+      forwardCommand.setAttribute("disabled", true);
+    }
+  }
+}
+
+function SetClickAndHoldHandlers() {
+  let popup = document.getElementById("backForwardMenu").cloneNode(true);
+  popup.removeAttribute("id");
+  popup.setAttribute("context", "");
+
+  function backForwardMenuCommand(event) {
+    BrowserCommands.gotoHistoryIndex(event);
+    event.stopPropagation();
+  }
+
+  let backButton = document.getElementById("back-button");
+  backButton.setAttribute("type", "menu");
+  popup.addEventListener("command", backForwardMenuCommand);
+  popup.addEventListener("popupshowing", FillHistoryMenu);
+  backButton.prepend(popup);
+  gClickAndHoldListenersOnElement.add(backButton);
+
+  let forwardButton = document.getElementById("forward-button");
+  popup = popup.cloneNode(true);
+  forwardButton.setAttribute("type", "menu");
+  popup.addEventListener("command", backForwardMenuCommand);
+  popup.addEventListener("popupshowing", FillHistoryMenu);
+  forwardButton.prepend(popup);
+  gClickAndHoldListenersOnElement.add(forwardButton);
+}
+
+const gClickAndHoldListenersOnElement = {
+  _timers: new Map(),
+
+  _mousedownHandler(aEvent) {
+    if (
+      aEvent.button != 0 ||
+      aEvent.currentTarget.open ||
+      aEvent.currentTarget.disabled
+    ) {
+      return;
+    }
+
+    aEvent.currentTarget.menupopup.hidden = true;
+
+    aEvent.currentTarget.addEventListener("mouseout", this);
+    aEvent.currentTarget.addEventListener("mouseup", this);
+    this._timers.set(
+      aEvent.currentTarget,
+      setTimeout(b => this._openMenu(b), 500, aEvent.currentTarget)
+    );
+  },
+
+  _clickHandler(aEvent) {
+    if (
+      aEvent.button == 0 &&
+      aEvent.target == aEvent.currentTarget &&
+      !aEvent.currentTarget.open &&
+      !aEvent.currentTarget.disabled &&
+      aEvent.currentTarget.menupopup.hidden
+    ) {
+      let cmdEvent = document.createEvent("xulcommandevent");
+      cmdEvent.initCommandEvent(
+        "command",
+        true,
+        true,
+        window,
+        0,
+        aEvent.ctrlKey,
+        aEvent.altKey,
+        aEvent.shiftKey,
+        aEvent.metaKey,
+        0,
+        null,
+        aEvent.inputSource
+      );
+      aEvent.currentTarget.dispatchEvent(cmdEvent);
+
+      aEvent.preventDefault();
+    }
+  },
+
+  _openMenu(aButton) {
+    this._cancelHold(aButton);
+    aButton.firstElementChild.hidden = false;
+    aButton.open = true;
+  },
+
+  _mouseoutHandler(aEvent) {
+    let buttonRect = aEvent.currentTarget.getBoundingClientRect();
+    if (
+      aEvent.clientX >= buttonRect.left &&
+      aEvent.clientX <= buttonRect.right &&
+      aEvent.clientY >= buttonRect.bottom
+    ) {
+      this._openMenu(aEvent.currentTarget);
+    } else {
+      this._cancelHold(aEvent.currentTarget);
+    }
+  },
+
+  _mouseupHandler(aEvent) {
+    this._cancelHold(aEvent.currentTarget);
+  },
+
+  _cancelHold(aButton) {
+    clearTimeout(this._timers.get(aButton));
+    aButton.removeEventListener("mouseout", this);
+    aButton.removeEventListener("mouseup", this);
+  },
+
+  _keypressHandler(aEvent) {
+    if (aEvent.key == " " || aEvent.key == "Enter") {
+      aEvent.preventDefault();
+      aEvent.target.click();
+    }
+  },
+
+  handleEvent(e) {
+    switch (e.type) {
+      case "mouseout":
+        this._mouseoutHandler(e);
+        break;
+      case "mousedown":
+        this._mousedownHandler(e);
+        break;
+      case "click":
+        this._clickHandler(e);
+        break;
+      case "mouseup":
+        this._mouseupHandler(e);
+        break;
+      case "keypress":
+        if (!e.defaultPrevented) {
+          this._keypressHandler(e);
+        }
+        break;
+    }
+  },
+
+  remove(aButton) {
+    aButton.removeEventListener("mousedown", this, true);
+    aButton.removeEventListener("click", this, true);
+    aButton.removeEventListener("keypress", this, true);
+  },
+
+  add(aElm) {
+    this._timers.delete(aElm);
+
+    aElm.addEventListener("mousedown", this, true);
+    aElm.addEventListener("click", this, true);
+    aElm.addEventListener("keypress", this, true);
+  },
+};
+
+const gSessionHistoryObserver = {
+  observe(subject, topic) {
+    if (topic != "browser:purge-session-history") {
+      return;
+    }
+
+    var backCommand = document.getElementById("Browser:Back");
+    backCommand.setAttribute("disabled", "true");
+    var fwdCommand = document.getElementById("Browser:Forward");
+    fwdCommand.setAttribute("disabled", "true");
+
+    gURLBar.editor.clearUndoRedo();
+  },
+};
+
+const gStoragePressureObserver = {
+  _lastNotificationTime: -1,
+
+  async observe(subject, topic) {
+    if (topic != "QuotaManager::StoragePressure") {
+      return;
+    }
+
+    const NOTIFICATION_VALUE = "storage-pressure-notification";
+    if (gNotificationBox.getNotificationWithValue(NOTIFICATION_VALUE)) {
+      return;
+    }
+
+    const MIN_NOTIFICATION_INTERVAL_MS = Services.prefs.getIntPref(
+      "browser.storageManager.pressureNotification.minIntervalMS"
+    );
+    let duration = Date.now() - this._lastNotificationTime;
+    if (duration <= MIN_NOTIFICATION_INTERVAL_MS) {
+      return;
+    }
+    this._lastNotificationTime = Date.now();
+
+    MozXULElement.insertFTLIfNeeded("branding/brand.ftl");
+    MozXULElement.insertFTLIfNeeded("browser/preferences/preferences.ftl");
+
+    const BYTES_IN_GIGABYTE = 1073741824;
+    const USAGE_THRESHOLD_BYTES =
+      BYTES_IN_GIGABYTE *
+      Services.prefs.getIntPref(
+        "browser.storageManager.pressureNotification.usageThresholdGB"
+      );
+    let messageFragment = document.createDocumentFragment();
+    let message = document.createElement("span");
+
+    let buttons = [{ supportPage: "storage-permissions" }];
+    let usage = subject.QueryInterface(Ci.nsISupportsPRUint64).data;
+    if (usage < USAGE_THRESHOLD_BYTES) {
+      document.l10n.setAttributes(message, "space-alert-under-5gb-message2");
+    } else {
+      document.l10n.setAttributes(message, "space-alert-over-5gb-message2");
+      buttons.push({
+        "l10n-id": "space-alert-over-5gb-settings-button",
+        callback() {
+          openPreferences("privacy-sitedata");
+        },
+      });
+    }
+    messageFragment.appendChild(message);
+
+    await gNotificationBox.appendNotification(
+      NOTIFICATION_VALUE,
+      {
+        label: messageFragment,
+        priority: gNotificationBox.PRIORITY_WARNING_HIGH,
+      },
+      buttons
+    );
+
+    document.l10n.translateFragment(gNotificationBox.currentNotification);
+  },
+};
+
+var gKeywordURIFixup = {
+  check(browser, { fixedURI, keywordProviderId, preferredURI }) {
+    if (
+      !keywordProviderId ||
+      !fixedURI ||
+      !fixedURI.host ||
+      UrlbarPrefs.get("browser.fixup.dns_first_for_single_words") ||
+      UrlbarPrefs.get("dnsResolveSingleWordsAfterSearch") == 0
+    ) {
+      return;
+    }
+
+    let contentPrincipal = browser.contentPrincipal;
+
+    let previousURI = browser.currentURI;
+
+    let weakBrowser = Cu.getWeakReference(browser);
+    browser = null;
+
+    let hostName = fixedURI.displayHost;
+    let asciiHost = fixedURI.asciiHost;
+
+    let onLookupCompleteListener = {
+      async onLookupComplete(request, record, status) {
+        let browserRef = weakBrowser.get();
+        if (!Components.isSuccessCode(status) || !browserRef) {
+          return;
+        }
+
+        let currentURI = browserRef.currentURI;
+        if (
+          !currentURI.equals(previousURI) &&
+          !currentURI.equals(preferredURI)
+        ) {
+          return;
+        }
+
+        let notificationBox = gBrowser.getNotificationBox(browserRef);
+        if (notificationBox.getNotificationWithValue("keyword-uri-fixup")) {
+          return;
+        }
+
+        let displayHostName = "http://" + hostName + "/";
+        let message = gNavigatorBundle.getFormattedString(
+          "keywordURIFixup.message",
+          [displayHostName]
+        );
+        let yesMessage = gNavigatorBundle.getFormattedString(
+          "keywordURIFixup.goTo",
+          [displayHostName]
+        );
+
+        let buttons = [
+          {
+            label: yesMessage,
+            accessKey: gNavigatorBundle.getString(
+              "keywordURIFixup.goTo.accesskey"
+            ),
+            callback() {
+              if (!PrivateBrowsingUtils.isWindowPrivate(window)) {
+                let prefHost = asciiHost;
+                if (prefHost.indexOf(".") == prefHost.length - 1) {
+                  prefHost = prefHost.slice(0, -1);
+                }
+                let pref = "browser.fixup.domainwhitelist." + prefHost;
+                Services.prefs.setBoolPref(pref, true);
+              }
+              openTrustedLinkIn(fixedURI.spec, "current");
+            },
+          },
+        ];
+        let notification = await notificationBox.appendNotification(
+          "keyword-uri-fixup",
+          {
+            label: message,
+            priority: notificationBox.PRIORITY_INFO_HIGH,
+          },
+          buttons
+        );
+        notification.persistence = 1;
+      },
+    };
+
+    try {
+      Services.uriFixup.checkHost(
+        fixedURI,
+        onLookupCompleteListener,
+        contentPrincipal.originAttributes
+      );
+    } catch (ex) {
+    }
+  },
+
+  observe(fixupInfo) {
+    fixupInfo.QueryInterface(Ci.nsIURIFixupInfo);
+
+    let browser = fixupInfo.consumer?.top?.embedderElement;
+    if (!browser || browser.documentGlobal != window) {
+      return;
+    }
+
+    this.check(browser, fixupInfo);
+  },
+};
+
+function HandleAppCommandEvent(evt) {
+  switch (evt.command) {
+    case "Back":
+      BrowserCommands.back();
+      break;
+    case "Forward":
+      BrowserCommands.forward();
+      break;
+    case "Reload":
+      BrowserCommands.reloadSkipCache();
+      break;
+    case "Stop":
+      if (XULBrowserWindow.stopCommand.hasAttribute("disabled")) {
+        BrowserCommands.stop();
+      }
+      break;
+    case "Search":
+      SearchUIUtils.webSearch(window);
+      break;
+    case "Home":
+      BrowserCommands.home();
+      break;
+    case "New":
+      BrowserCommands.openTab();
+      break;
+    case "Close":
+      BrowserCommands.closeTabOrWindow();
+      break;
+    case "Find":
+      gLazyFindCommand("onFindCommand");
+      break;
+    case "Help":
+      openHelpLink("firefox-help");
+      break;
+    case "Open":
+      BrowserCommands.openFileWindow();
+      break;
+    case "Save":
+      saveBrowser(gBrowser.selectedBrowser);
+      break;
+    case "SendMail":
+      MailIntegration.sendLinkForBrowser(gBrowser.selectedBrowser);
+      break;
+    default:
+      return;
+  }
+  evt.stopPropagation();
+  evt.preventDefault();
+}
+
+function loadOneOrMoreURIs(
+  aURIString,
+  {
+    triggeringPrincipal = Services.scriptSecurityManager.getSystemPrincipal(),
+    newWindowLoad = false,
+  } = {}
+) {
+  if (window.location.href != AppConstants.BROWSER_CHROME_URL) {
+    window.openDialog(
+      AppConstants.BROWSER_CHROME_URL,
+      "_blank",
+      "all,dialog=no",
+      aURIString
+    );
+    return;
+  }
+
+  try {
+    gBrowser.loadTabs(aURIString.split("|"), {
+      inBackground: false,
+      replace: true,
+      triggeringPrincipal,
+      newWindowLoad,
+    });
+  } catch (e) {}
+}
+
+function openLocation(event) {
+  if (window.location.href == AppConstants.BROWSER_CHROME_URL) {
+    let focusTarget = UrlbarUtils.getURLBarForFocus(window);
+    focusTarget.select();
+    focusTarget.view.autoOpen({ event });
+    return;
+  }
+
+  let win = URILoadingHelper.getTargetWindow(window);
+  if (win) {
+    win.focus();
+    win.openLocation();
+    return;
+  }
+
+  window.openDialog(
+    AppConstants.BROWSER_CHROME_URL,
+    "_blank",
+    "chrome,all,dialog=no",
+    BROWSER_NEW_TAB_URL
+  );
+}
+
+var gLastOpenDirectory = {
+  _lastDir: null,
+  get path() {
+    if (!this._lastDir || !this._lastDir.exists()) {
+      try {
+        this._lastDir = Services.prefs.getComplexValue(
+          "browser.open.lastDir",
+          Ci.nsIFile
+        );
+        if (!this._lastDir.exists()) {
+          this._lastDir = null;
+        }
+      } catch (e) {}
+    }
+    return this._lastDir;
+  },
+  set path(val) {
+    try {
+      if (!val || !val.isDirectory()) {
+        return;
+      }
+    } catch (e) {
+      return;
+    }
+    this._lastDir = val.clone();
+
+    if (!PrivateBrowsingUtils.isWindowPrivate(window)) {
+      Services.prefs.setComplexValue(
+        "browser.open.lastDir",
+        Ci.nsIFile,
+        this._lastDir
+      );
+    }
+  },
+  reset() {
+    this._lastDir = null;
+  },
+};
+
+function readFromClipboard() {
+  var url = "";
+
+  try {
+    var trans = Cc["@mozilla.org/widget/transferable;1"].createInstance(
+      Ci.nsITransferable
+    );
+    trans.init(window.docShell.QueryInterface(Ci.nsILoadContext));
+
+    trans.addDataFlavor("text/plain");
+
+    let clipboard = Services.clipboard;
+    if (clipboard.isClipboardTypeSupported(clipboard.kSelectionClipboard)) {
+      clipboard.getData(trans, clipboard.kSelectionClipboard);
+    } else {
+      clipboard.getData(trans, clipboard.kGlobalClipboard);
+    }
+
+    var data = {};
+    trans.getTransferData("text/plain", data);
+
+    if (data) {
+      data = data.value.QueryInterface(Ci.nsISupportsString);
+      url = data.data;
+    }
+  } catch (ex) {}
+
+  return url;
+}
+
+function UpdateUrlbarSearchSplitterState() {
+  var splitter = document.getElementById("urlbar-search-splitter");
+  var urlbar = document.getElementById("urlbar-container");
+  var searchbar = document.getElementById("search-container");
+
+  if (document.documentElement.hasAttribute("customizing")) {
+    if (splitter) {
+      splitter.remove();
+    }
+    return;
+  }
+
+  if (
+    splitter &&
+    ((splitter.nextElementSibling == searchbar &&
+      splitter.previousElementSibling == urlbar) ||
+      (splitter.nextElementSibling == urlbar &&
+        splitter.previousElementSibling == searchbar))
+  ) {
+    return;
+  }
+
+  let ibefore = null;
+  let resizebefore = "none";
+  let resizeafter = "none";
+  if (urlbar && searchbar) {
+    if (urlbar.nextElementSibling == searchbar) {
+      resizeafter = "sibling";
+      ibefore = searchbar;
+    } else if (searchbar.nextElementSibling == urlbar) {
+      resizebefore = "sibling";
+      ibefore = urlbar;
+    }
+  }
+
+  if (ibefore) {
+    if (!splitter) {
+      splitter = document.createXULElement("splitter");
+      splitter.id = "urlbar-search-splitter";
+      splitter.setAttribute("resizebefore", resizebefore);
+      splitter.setAttribute("resizeafter", resizeafter);
+      splitter.setAttribute("skipintoolbarset", "true");
+      splitter.setAttribute("overflows", "false");
+      splitter.className = "chromeclass-toolbar-additional";
+    }
+    urlbar.parentNode.insertBefore(splitter, ibefore);
+  } else if (splitter) {
+    splitter.remove();
+  }
+}
+
+function UpdatePopupNotificationsVisibility() {
+  if (!Object.getOwnPropertyDescriptor(window, "PopupNotifications").get) {
+    PopupNotifications.anchorVisibilityChange();
+  }
+
+}
+
+function PageProxyClickHandler(aEvent) {
+  if (aEvent.button == 1 && Services.prefs.getBoolPref("middlemouse.paste")) {
+    middleMousePaste(aEvent);
+  }
+}
+
+function CreateContainerTabMenu(event) {
+  if (event.target.triggerNode?.closest("menupopup")) {
+    event.preventDefault();
+    return;
+  }
+  createUserContextMenu(event, {
+    useAccessKeys: false,
+    showDefaultTab: true,
+  });
+}
+
+var gContainerCreation = {
+  _editor: null,
+
+  get _panel() {
+    return document.getElementById("containerCreation-panel");
+  },
+
+  get _anchorEl() {
+    return document.getElementById("userContext-icons");
+  },
+
+  isPillPinned: false,
+
+  async open() {
+    let panel = this._panel;
+    if (panel.state == "open" || panel.state == "showing") {
+      return;
+    }
+
+    let { ContainerEditor } =
+      await import("chrome://browser/content/usercontext/ContainerEditor.mjs");
+
+    let body = document.getElementById("containerCreation-panel-body");
+    body.replaceChildren();
+    this._editor = new ContainerEditor(body);
+    this._editor.render();
+
+    let createButton = document.getElementById(
+      "containerCreation-create-button"
+    );
+    let cancelButton = document.getElementById(
+      "containerCreation-cancel-button"
+    );
+
+    let updateValidity = () => {
+      createButton.disabled = !this._editor.isValid;
+    };
+    this._editor.form.addEventListener("input", updateValidity);
+    updateValidity();
+
+    let onCreate = () => {
+      this._editor.commit();
+      panel.hidePopup();
+    };
+    let onCancel = () => panel.hidePopup();
+    createButton.addEventListener("click", onCreate);
+    cancelButton.addEventListener("click", onCancel);
+
+    panel.addEventListener("popupshown", () => this._editor?.focus(), {
+      once: true,
+    });
+    panel.addEventListener(
+      "popuphidden",
+      () => {
+        createButton.removeEventListener("click", onCreate);
+        cancelButton.removeEventListener("click", onCancel);
+        body.replaceChildren();
+        this._editor = null;
+        this._unpinAnchor();
+      },
+      { once: true }
+    );
+
+    let anchor = this._anchorEl;
+    if (anchor.hidden) {
+      anchor.classList.add("container-anchor-pinned");
+      anchor.hidden = false;
+      this.isPillPinned = true;
+    }
+
+    panel.openPopup(anchor, "bottomright topright");
+  },
+
+  _unpinAnchor() {
+    if (!this.isPillPinned) {
+      return;
+    }
+    this.isPillPinned = false;
+    let anchor = this._anchorEl;
+    anchor.hidden = true;
+    anchor.classList.remove("container-anchor-pinned");
+  },
+};
+
+function FillHistoryMenu(event) {
+  let parent = event.target;
+
+  if (!parent.hasStatusListener) {
+    parent.addEventListener("DOMMenuItemActive", function (aEvent) {
+      if (!aEvent.target.hasAttribute("checked")) {
+        XULBrowserWindow.setOverLink(aEvent.target.getAttribute("uri"));
+      }
+    });
+    parent.addEventListener("DOMMenuItemInactive", function () {
+      XULBrowserWindow.setOverLink("");
+    });
+
+    parent.hasStatusListener = true;
+  }
+
+  let children = parent.children;
+  for (var i = children.length - 1; i >= 0; --i) {
+    if (children[i].hasAttribute("index")) {
+      parent.removeChild(children[i]);
+    }
+  }
+
+  const MAX_HISTORY_MENU_ITEMS = 15;
+
+  const tooltipBack = gNavigatorBundle.getString("tabHistory.goBack");
+  const tooltipCurrent = gNavigatorBundle.getString("tabHistory.reloadCurrent");
+  const tooltipForward = gNavigatorBundle.getString("tabHistory.goForward");
+
+  function updateSessionHistory(sessionHistory, initial, ssInParent) {
+    let count = ssInParent
+      ? sessionHistory.count
+      : sessionHistory.entries.length;
+
+    if (!initial) {
+      if (count <= 1) {
+        parent.hidePopup();
+        return;
+      } else if (parent.id != "backForwardMenu" && !parent.parentNode.open) {
+        parent.parentNode.open = true;
+        return;
+      }
+    }
+
+    let index = sessionHistory.index;
+    let half_length = Math.floor(MAX_HISTORY_MENU_ITEMS / 2);
+    let start = Math.max(index - half_length, 0);
+    let end = Math.min(
+      start == 0 ? MAX_HISTORY_MENU_ITEMS : index + half_length + 1,
+      count
+    );
+    if (end == count) {
+      start = Math.max(count - MAX_HISTORY_MENU_ITEMS, 0);
+    }
+
+    let existingIndex = 0;
+
+    for (let j = end - 1; j >= start; j--) {
+      let entry = ssInParent
+        ? sessionHistory.getEntryAtIndex(j)
+        : sessionHistory.entries[j];
+      if (
+        BrowserUtils.navigationRequireUserInteraction &&
+        entry.hasUserInteraction === false &&
+        j != end - 1 &&
+        j != index
+      ) {
+        continue;
+      }
+      let uri = ssInParent ? entry.URI.spec : entry.url;
+
+      let item =
+        existingIndex < children.length
+          ? children[existingIndex]
+          : document.createXULElement("menuitem");
+
+      item.setAttribute("uri", uri);
+      item.setAttribute("label", entry.title || uri);
+      item.setAttribute("index", j);
+
+      item.setAttribute("historyindex", j - index);
+
+      if (j != index) {
+        item.style.setProperty(
+          "--menuitem-icon",
+          `url(page-icon:${CSS.escape(uri)})`
+        );
+      }
+
+      if (j < index) {
+        item.className =
+          "unified-nav-back menuitem-iconic menuitem-with-favicon";
+        item.setAttribute("tooltiptext", tooltipBack);
+      } else if (j == index) {
+        item.setAttribute("type", "radio");
+        item.setAttribute("checked", "true");
+        item.className = "unified-nav-current";
+        item.setAttribute("tooltiptext", tooltipCurrent);
+      } else {
+        item.className =
+          "unified-nav-forward menuitem-iconic menuitem-with-favicon";
+        item.setAttribute("tooltiptext", tooltipForward);
+      }
+
+      if (!item.parentNode) {
+        parent.appendChild(item);
+      }
+
+      existingIndex++;
+    }
+
+    if (!initial) {
+      let existingLength = children.length;
+      while (existingIndex < existingLength) {
+        parent.removeChild(parent.lastElementChild);
+        existingIndex++;
+      }
+    }
+  }
+
+  let sessionHistory = gBrowser.selectedBrowser.browsingContext.sessionHistory;
+  if (sessionHistory?.count) {
+    if (sessionHistory.count <= 1) {
+      event.preventDefault();
+      return;
+    }
+
+    updateSessionHistory(sessionHistory, true, true);
+  } else {
+    sessionHistory = SessionStore.getSessionHistory(
+      gBrowser.selectedTab,
+      updateSessionHistory
+    );
+    updateSessionHistory(sessionHistory, true, false);
+  }
+}
+
+function toOpenWindowByType(inType, uri, features) {
+  var topWindow = Services.wm.getMostRecentWindow(inType);
+
+  if (topWindow) {
+    topWindow.focus();
+  } else if (features) {
+    window.open(uri, "_blank", features);
+  } else {
+    window.open(
+      uri,
+      "_blank",
+      "chrome,extrachrome,menubar,resizable,scrollbars,status,toolbar"
+    );
+  }
+}
+function OpenBrowserWindow(options) {
+  options ??= {};
+  options.openerWindow ??= window;
+  return BrowserWindowTracker.openWindow(options);
+}
+
+function updateEditUIVisibility() {
+  if (AppConstants.platform == "macosx") {
+    return;
+  }
+
+  let editMenuPopupState = document.getElementById("menu_EditPopup").state;
+  let contextMenuPopupState = document.getElementById(
+    "contentAreaContextMenu"
+  ).state;
+  let placesContextMenuPopupState =
+    document.getElementById("placesContext")?.state;
+
+  let oldVisible = gEditUIVisible;
+
+  gEditUIVisible =
+    editMenuPopupState == "showing" ||
+    editMenuPopupState == "open" ||
+    contextMenuPopupState == "showing" ||
+    contextMenuPopupState == "open" ||
+    placesContextMenuPopupState == "showing" ||
+    placesContextMenuPopupState == "open";
+  const kOpenPopupStates = ["showing", "open"];
+  if (!gEditUIVisible) {
+    let placement = CustomizableUI.getPlacementOfWidget("edit-controls");
+    let areaType = placement ? CustomizableUI.getAreaType(placement.area) : "";
+    if (areaType == CustomizableUI.TYPE_PANEL) {
+      let customizablePanel = PanelUI.overflowPanel;
+      gEditUIVisible = kOpenPopupStates.includes(customizablePanel.state);
+    } else if (
+      areaType == CustomizableUI.TYPE_TOOLBAR &&
+      window.toolbar.visible
+    ) {
+      if (placement.area == "nav-bar") {
+        let editControls = document.getElementById("edit-controls");
+        gEditUIVisible =
+          !editControls.hasAttribute("overflowedItem") ||
+          kOpenPopupStates.includes(
+            document.getElementById("widget-overflow").state
+          );
+      } else {
+        gEditUIVisible = true;
+      }
+    }
+  }
+
+  if (!gEditUIVisible) {
+    gEditUIVisible = kOpenPopupStates.includes(PanelUI.panel.state);
+  }
+
+  if (gEditUIVisible == oldVisible) {
+    return;
+  }
+
+  if (gEditUIVisible) {
+    goUpdateGlobalEditMenuItems();
+  } else {
+    goSetCommandEnabled("cmd_undo", true);
+    goSetCommandEnabled("cmd_redo", true);
+    goSetCommandEnabled("cmd_cut", true);
+    goSetCommandEnabled("cmd_copy", true);
+    goSetCommandEnabled("cmd_paste", true);
+    goSetCommandEnabled("cmd_selectAll", true);
+    goSetCommandEnabled("cmd_delete", true);
+    goSetCommandEnabled("cmd_switchTextDirection", true);
+  }
+}
+
+let gFileMenu = {
+  updateUserContextUIVisibility() {
+    let menu = document.getElementById("menu_newUserContext");
+    menu.hidden = !Services.prefs.getBoolPref(
+      "privacy.userContext.enabled",
+      false
+    );
+    if (PrivateBrowsingUtils.isWindowPrivate(window)) {
+      menu.setAttribute("disabled", "true");
+    }
+  },
+
+
+  updateTabCloseCountState() {
+    document.l10n.setAttributes(
+      document.getElementById("menu_close"),
+      "menu-file-close-tab",
+      { tabCount: gBrowser.selectedTabs.length }
+    );
+  },
+
+  onPopupShowing(event) {
+    if (event.target.id != "menu_FilePopup") {
+      return;
+    }
+    this.updateUserContextUIVisibility();
+    if (typeof gBrowser != "undefined") {
+      this.updateTabCloseCountState();
+
+    }
+
+  },
+};
+
+function openNewUserContextTab(event) {
+  openTrustedLinkIn(BROWSER_NEW_TAB_URL, "tab", {
+    userContextId: parseInt(event.target.getAttribute("data-usercontextid")),
+  });
+}
+
+var XULBrowserWindow = {
+  status: "",
+  defaultStatus: "",
+  overLink: "",
+  startTime: 0,
+  isBusy: false,
+  busyUI: false,
+
+  QueryInterface: ChromeUtils.generateQI([
+    "nsIWebProgressListener",
+    "nsIWebProgressListener2",
+    "nsISupportsWeakReference",
+    "nsIXULBrowserWindow",
+  ]),
+
+  get stopCommand() {
+    delete this.stopCommand;
+    return (this.stopCommand = document.getElementById("Browser:Stop"));
+  },
+  get reloadCommand() {
+    delete this.reloadCommand;
+    return (this.reloadCommand = document.getElementById("Browser:Reload"));
+  },
+  get _elementsForTextBasedTypes() {
+    delete this._elementsForTextBasedTypes;
+    return (this._elementsForTextBasedTypes = [
+      document.getElementById("pageStyleMenu"),
+      document.getElementById("context-viewpartialsource-selection"),
+    ]);
+  },
+  get _elementsForFind() {
+    delete this._elementsForFind;
+    return (this._elementsForFind = [
+      document.getElementById("cmd_find"),
+      document.getElementById("cmd_findAgain"),
+      document.getElementById("cmd_findPrevious"),
+    ]);
+  },
+  get _elementsForViewSource() {
+    delete this._elementsForViewSource;
+    return (this._elementsForViewSource = [
+      document.getElementById("context-viewsource"),
+      document.getElementById("View:PageSource"),
+    ]);
+  },
+  get _menuItemForRepairTextEncoding() {
+    delete this._menuItemForRepairTextEncoding;
+    return (this._menuItemForRepairTextEncoding = document.getElementById(
+      "repair-text-encoding"
+    ));
+  },
+
+  setDefaultStatus(status) {
+    this.defaultStatus = status;
+    StatusPanel.update();
+  },
+
+  setOverLink(url, options = undefined) {
+    window.dispatchEvent(
+      new CustomEvent("OverLink", {
+        detail: { url },
+      })
+    );
+
+    if (url) {
+      url = Services.textToSubURI.unEscapeURIForUI(url);
+
+      url = url.replace(
+        /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g,
+        encodeURIComponent
+      );
+
+      if (UrlbarPrefs.get("trimURLs")) {
+        url = BrowserUIUtils.trimURL(url);
+      }
+    }
+
+    this.overLink = url;
+    LinkTargetDisplay.update(options);
+  },
+
+  onEnterDOMFullscreen() {
+    this.status = "";
+    this.setDefaultStatus("");
+    this.setOverLink("", { hideStatusPanelImmediately: true });
+  },
+
+  showTooltip(xDevPix, yDevPix, tooltip, direction, _browser) {
+    if (
+      Cc["@mozilla.org/widget/dragservice;1"]
+        .getService(Ci.nsIDragService)
+        .getCurrentSession()
+    ) {
+      return;
+    }
+
+    if (!document.hasFocus()) {
+      return;
+    }
+
+    let elt = document.getElementById("remoteBrowserTooltip");
+    elt.label = tooltip;
+    elt.style.direction = direction;
+    elt.openPopupAtScreen(
+      xDevPix / window.devicePixelRatio,
+      yDevPix / window.devicePixelRatio,
+      false,
+      null
+    );
+  },
+
+  hideTooltip() {
+    let elt = document.getElementById("remoteBrowserTooltip");
+    elt.hidePopup();
+  },
+
+  getTabCount() {
+    return gBrowser.tabs.length;
+  },
+
+  onProgressChange() {
+  },
+
+  onProgressChange64(
+    aWebProgress,
+    aRequest,
+    aCurSelfProgress,
+    aMaxSelfProgress,
+    aCurTotalProgress,
+    aMaxTotalProgress
+  ) {
+    return this.onProgressChange(
+      aWebProgress,
+      aRequest,
+      aCurSelfProgress,
+      aMaxSelfProgress,
+      aCurTotalProgress,
+      aMaxTotalProgress
+    );
+  },
+
+  onStateChange(aWebProgress, aRequest, aStateFlags, aStatus) {
+    const nsIWebProgressListener = Ci.nsIWebProgressListener;
+
+    let browser = gBrowser.selectedBrowser;
+    gProtectionsHandler.onStateChange(aWebProgress, aStateFlags);
+
+    if (
+      aStateFlags & nsIWebProgressListener.STATE_START &&
+      aStateFlags & nsIWebProgressListener.STATE_IS_NETWORK
+    ) {
+      if (aRequest && aWebProgress.isTopLevel) {
+        OpenSearchManager.clearEngines(browser);
+      }
+
+      this.isBusy = true;
+
+      if (
+        !(aStateFlags & nsIWebProgressListener.STATE_RESTORING) &&
+        aWebProgress.isTopLevel
+      ) {
+        this.busyUI = true;
+
+        if (this.spinCursorWhileBusy) {
+          window.setCursor("progress");
+        }
+
+        this.stopCommand.removeAttribute("disabled");
+        CombinedStopReload.switchToStop(aRequest, aWebProgress);
+      }
+    } else if (aStateFlags & nsIWebProgressListener.STATE_STOP) {
+      if (aRequest) {
+        let msg = "";
+        let location;
+        let canViewSource = true;
+        if (aRequest instanceof Ci.nsIChannel || "URI" in aRequest) {
+          location = aRequest.URI;
+
+          if (location.scheme == "keyword" && aWebProgress.isTopLevel) {
+            gBrowser.userTypedValue = null;
+          }
+
+          canViewSource = location.scheme != "view-source";
+
+          if (location.spec != "about:blank") {
+            switch (aStatus) {
+              case Cr.NS_ERROR_NET_TIMEOUT:
+                msg = gNavigatorBundle.getString("nv_timeout");
+                break;
+            }
+          }
+        }
+
+        this.status = "";
+        this.setDefaultStatus(msg);
+
+        let isText =
+          browser.documentContentType &&
+          BrowserUtils.mimeTypeIsTextBased(browser.documentContentType);
+        for (let element of this._elementsForViewSource) {
+          if (canViewSource && isText) {
+            element.removeAttribute("disabled");
+          } else {
+            element.setAttribute("disabled", "true");
+          }
+        }
+
+        this._updateElementsForContentType();
+
+        let button = document.getElementById("characterencoding-button");
+        if (browser.mayEnableCharacterEncodingMenu) {
+          this._menuItemForRepairTextEncoding.removeAttribute("disabled");
+          button?.removeAttribute("disabled");
+        } else {
+          this._menuItemForRepairTextEncoding.setAttribute("disabled", "true");
+          button?.setAttribute("disabled", "true");
+        }
+      }
+
+      this.isBusy = false;
+
+      if (this.busyUI && aWebProgress.isTopLevel) {
+        this.busyUI = false;
+
+        if (this.spinCursorWhileBusy) {
+          window.setCursor("auto");
+        }
+
+        this.stopCommand.setAttribute("disabled", "true");
+        CombinedStopReload.switchToReload(aRequest, aWebProgress);
+      }
+    }
+  },
+
+  onLocationChange(aWebProgress, aRequest, aLocationURI, aFlags, aIsSimulated) {
+    var location = aLocationURI ? aLocationURI.spec : "";
+
+    UpdateBackForwardCommands(gBrowser.webNavigation);
+
+    Services.obs.notifyObservers(
+      aWebProgress,
+      "touchbar-location-change",
+      location
+    );
+
+
+    if (!aWebProgress.isTopLevel) {
+      return;
+    }
+
+    this.setOverLink("", { hideStatusPanelImmediately: true });
+
+    let isSameDocument =
+      aFlags & Ci.nsIWebProgressListener.LOCATION_CHANGE_SAME_DOCUMENT;
+    if (
+      (location == "about:blank" &&
+        BrowserUIUtils.checkEmptyPageOrigin(gBrowser.selectedBrowser)) ||
+      location == "" ||
+      location == "chrome://browser/content/blanktab.html"
+    ) {
+      this.reloadCommand.setAttribute("disabled", "true");
+    } else {
+      this.reloadCommand.removeAttribute("disabled");
+    }
+
+    let isSessionRestore = !!(
+      aFlags & Ci.nsIWebProgressListener.LOCATION_CHANGE_SESSION_STORE
+    );
+
+    gURLBar.setURI({
+      uri: aLocationURI,
+      dueToTabSwitch: aIsSimulated,
+      dueToSessionRestore: isSessionRestore,
+      isSameDocument,
+    });
+
+    let closeOpenPanels = selector => {
+      for (let panel of document.querySelectorAll(selector)) {
+        if (panel.state != "closed") {
+          panel.hidePopup();
+        }
+      }
+    };
+
+    if (aIsSimulated) {
+      closeOpenPanels(":is(panel, menupopup)[tabspecific='true']");
+    }
+
+    if (!isSameDocument) {
+      closeOpenPanels(":is(panel, menupopup)[locationspecific='true']");
+    }
+
+    this._updateElementsForContentType();
+
+    this._updateMacUserActivity(window, aLocationURI, aWebProgress);
+
+    let button = document.getElementById("characterencoding-button");
+    this._menuItemForRepairTextEncoding.setAttribute("disabled", "true");
+    button?.setAttribute("disabled", "true");
+
+    if (
+      location == "about:blank" &&
+      gBrowser.selectedTab.hasAttribute("customizemode")
+    ) {
+      gCustomizeMode.enter();
+    } else if (
+      CustomizationHandler.isEnteringCustomizeMode ||
+      CustomizationHandler.isCustomizing()
+    ) {
+      gCustomizeMode.exit();
+    }
+
+    BrowserUtils.callModulesFromCategory(
+      { categoryName: "browser-window-location-change", jsGlobal: globalThis },
+      window,
+      aLocationURI,
+      aWebProgress,
+      aFlags
+    );
+
+    if (!gMultiProcessBrowser) {
+      gGestureSupport.restoreRotationState();
+    }
+
+    if (aRequest) {
+      setTimeout(function () {
+        XULBrowserWindow.asyncUpdateUI();
+      }, 0);
+    } else {
+      this.asyncUpdateUI();
+    }
+
+  },
+
+  _updateElementsForContentType() {
+    let browser = gBrowser.selectedBrowser;
+
+    let isText =
+      browser.documentContentType &&
+      BrowserUtils.mimeTypeIsTextBased(browser.documentContentType);
+    for (let element of this._elementsForTextBasedTypes) {
+      if (isText) {
+        element.removeAttribute("disabled");
+      } else {
+        element.setAttribute("disabled", "true");
+      }
+    }
+
+    let enableFind =
+      isText && BrowserUtils.canFindInPage(gBrowser.currentURI.spec);
+    for (let element of this._elementsForFind) {
+      if (enableFind) {
+        element.removeAttribute("disabled");
+      } else {
+        element.setAttribute("disabled", "true");
+      }
+    }
+
+  },
+
+  _updateMacUserActivity(win, uri, webProgress) {
+    if (!webProgress.isTopLevel || AppConstants.platform != "macosx") {
+      return;
+    }
+
+    let url = uri.spec;
+    if (PrivateBrowsingUtils.isWindowPrivate(win)) {
+      url = "";
+    }
+    let baseWin = win.docShell.treeOwner.QueryInterface(Ci.nsIBaseWindow);
+    MacUserActivityUpdater.updateLocation(
+      url,
+      win.gBrowser.contentTitle,
+      baseWin
+    );
+  },
+
+  _securityURIOverride(browser) {
+    let uri = browser.currentURI;
+    if (!uri) {
+      return null;
+    }
+
+    let { URI_INHERITS_SECURITY_CONTEXT } = Ci.nsIProtocolHandler;
+    if (
+      !(doGetProtocolFlags(uri) & URI_INHERITS_SECURITY_CONTEXT) &&
+      !(uri.scheme == "about" && uri.filePath == "srcdoc") &&
+      !(uri.scheme == "about" && uri.filePath == "blank")
+    ) {
+      return null;
+    }
+
+    let principal = browser.contentPrincipal;
+
+    if (principal.isNullPrincipal) {
+      principal = principal.precursorPrincipal;
+    }
+
+    if (!principal) {
+      return null;
+    }
+
+    return principal.URI;
+  },
+
+  asyncUpdateUI() {
+    OpenSearchManager.updateOpenSearchBadge(window);
+  },
+
+  onStatusChange(aWebProgress, aRequest, aStatus, aMessage) {
+    this.status = aMessage;
+    StatusPanel.update();
+  },
+
+  _event: null,
+  _lastLocationForEvent: null,
+
+  onContentBlockingEvent(aWebProgress, aRequest, aEvent, aIsSimulated) {
+    let uri = gBrowser.currentURI;
+    let spec = uri.spec;
+    if (this._event == aEvent && this._lastLocationForEvent == spec) {
+      return;
+    }
+    this._lastLocationForEvent = spec;
+
+    if (
+      typeof aIsSimulated != "boolean" &&
+      typeof aIsSimulated != "undefined"
+    ) {
+      throw new Error(
+        "onContentBlockingEvent: aIsSimulated receieved an unexpected type"
+      );
+    }
+
+    gProtectionsHandler.onContentBlockingEvent(
+      aEvent,
+      aWebProgress,
+      aIsSimulated,
+      this._event 
+    );
+
+    gTrustPanelHandler.onContentBlockingEvent(
+      aEvent,
+      aWebProgress,
+      aIsSimulated,
+      this._event 
+    );
+
+    this._event = aEvent;
+  },
+
+  onSecurityChange(aWebProgress, aRequest, aState, _aIsSimulated) {
+    gURLBar.formatValue();
+
+    let uri = gBrowser.currentURI;
+    let uriOverride = this._securityURIOverride(gBrowser.selectedBrowser);
+    if (uriOverride) {
+      uri = uriOverride;
+      aState |= Ci.nsIWebProgressListener.STATE_IDENTITY_ASSOCIATED;
+    }
+
+    try {
+      uri = Services.io.createExposableURI(uri);
+    } catch (e) {}
+    gIdentityHandler.updateIdentity(aState, uri);
+    gTrustPanelHandler.updateIdentity(aState, uri);
+  },
+
+  onUpdateCurrentBrowser: function XWB_onUpdateCurrentBrowser(
+    aStateFlags,
+    aStatus,
+    aMessage,
+    _aTotalProgress
+  ) {
+    if (FullZoom.updateBackgroundTabs) {
+      FullZoom.onLocationChange(gBrowser.currentURI, true);
+    }
+
+    this.hideTooltip();
+
+    document.getElementById("aHTMLTooltip").hidePopup();
+
+    var nsIWebProgressListener = Ci.nsIWebProgressListener;
+    var loadingDone = aStateFlags & nsIWebProgressListener.STATE_STOP;
+    this.onStateChange(
+      gBrowser.webProgress,
+      { URI: gBrowser.currentURI },
+      loadingDone
+        ? nsIWebProgressListener.STATE_STOP
+        : nsIWebProgressListener.STATE_START,
+      aStatus
+    );
+    if (loadingDone) {
+      return;
+    }
+    this.onStatusChange(gBrowser.webProgress, null, 0, aMessage);
+  },
+};
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  XULBrowserWindow,
+  "spinCursorWhileBusy",
+  "browser.spin_cursor_while_busy"
+);
+
+var LinkTargetDisplay = {
+  get DELAY_SHOW() {
+    delete this.DELAY_SHOW;
+    return (this.DELAY_SHOW = Services.prefs.getIntPref(
+      "browser.overlink-delay"
+    ));
+  },
+
+  DELAY_HIDE: 250,
+  _timer: 0,
+
+  get _contextMenu() {
+    delete this._contextMenu;
+    return (this._contextMenu = document.getElementById(
+      "contentAreaContextMenu"
+    ));
+  },
+
+  update({ hideStatusPanelImmediately = false } = {}) {
+    if (
+      this._contextMenu.state == "open" ||
+      this._contextMenu.state == "showing"
+    ) {
+      this._contextMenu.addEventListener("popuphidden", () => this.update(), {
+        once: true,
+      });
+      return;
+    }
+
+    clearTimeout(this._timer);
+    window.removeEventListener("mousemove", this, true);
+
+    if (!XULBrowserWindow.overLink) {
+      if (hideStatusPanelImmediately) {
+        this._hide();
+      } else {
+        this._timer = setTimeout(this._hide.bind(this), this.DELAY_HIDE);
+      }
+      return;
+    }
+
+    if (StatusPanel.isVisible) {
+      StatusPanel.update();
+    } else {
+      this._showDelayed();
+      window.addEventListener("mousemove", this, true);
+    }
+  },
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "mousemove":
+        clearTimeout(this._timer);
+        this._showDelayed();
+        break;
+    }
+  },
+
+  _showDelayed() {
+    this._timer = setTimeout(
+      function (self) {
+        StatusPanel.update();
+        window.removeEventListener("mousemove", self, true);
+      },
+      this.DELAY_SHOW,
+      this
+    );
+  },
+
+  _hide() {
+    clearTimeout(this._timer);
+
+    StatusPanel.update();
+  },
+};
+
+var CombinedStopReload = {
+  ensureInitialized() {
+    if (this._initialized) {
+      return true;
+    }
+    if (this._destroyed) {
+      return false;
+    }
+
+    let reload = document.getElementById("reload-button");
+    let stop = document.getElementById("stop-button");
+    if (!stop || !reload) {
+      return false;
+    }
+
+    this._initialized = true;
+    if (!XULBrowserWindow.stopCommand.hasAttribute("disabled")) {
+      reload.setAttribute("displaystop", "true");
+    }
+    stop.addEventListener("click", this);
+
+    for (let button of [stop, reload]) {
+      if (button.hasAttribute("disabled")) {
+        let command = document.getElementById(button.getAttribute("command"));
+        if (!command.hasAttribute("disabled")) {
+          button.removeAttribute("disabled");
+        }
+      }
+    }
+
+    this.reload = reload;
+    this.stop = stop;
+
+    return true;
+  },
+
+  uninit() {
+    this._destroyed = true;
+
+    if (!this._initialized) {
+      return;
+    }
+
+    this._cancelTransition();
+    this.stop.removeEventListener("click", this);
+    this.reload = null;
+    this.stop = null;
+  },
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "click":
+        if (event.button == 0 && !this.stop.disabled) {
+          this._stopClicked = true;
+        }
+        break;
+    }
+  },
+
+  switchToStop(aRequest, aWebProgress) {
+    if (
+      !this.ensureInitialized() ||
+      !this._shouldSwitch(aRequest, aWebProgress)
+    ) {
+      return;
+    }
+
+    this.reload.setAttribute("displaystop", "true");
+  },
+
+  switchToReload() {
+    if (!this.ensureInitialized() || !this.reload.hasAttribute("displaystop")) {
+      return;
+    }
+
+    this.reload.removeAttribute("displaystop");
+
+    if (this._stopClicked) {
+      this._stopClicked = false;
+      this.reload.disabled =
+        XULBrowserWindow.reloadCommand.hasAttribute("disabled");
+      return;
+    }
+
+    if (this._timer) {
+      return;
+    }
+
+    this.reload.disabled = true;
+    this._timer = setTimeout(
+      function (self) {
+        self._timer = 0;
+        self.reload.disabled =
+          XULBrowserWindow.reloadCommand.hasAttribute("disabled");
+      },
+      650,
+      this
+    );
+  },
+
+  _shouldSwitch(aRequest, aWebProgress) {
+    if (
+      aRequest &&
+      aRequest.originalURI &&
+      (aRequest.originalURI.schemeIs("chrome") ||
+        (aRequest.originalURI.schemeIs("about") &&
+          aWebProgress.isTopLevel))
+    ) {
+      return false;
+    }
+
+    return true;
+  },
+
+  _cancelTransition() {
+    if (this._timer) {
+      clearTimeout(this._timer);
+      this._timer = 0;
+    }
+  },
+};
+
+var TabsProgressListener = {
+
+  onLocationChange(aBrowser, aWebProgress, aRequest, aLocationURI, aFlags) {
+    if (!aWebProgress.isTopLevel) {
+      return;
+    }
+
+    if (aFlags & Ci.nsIWebProgressListener.LOCATION_CHANGE_SAME_DOCUMENT) {
+      return;
+    }
+
+    if (!Object.getOwnPropertyDescriptor(window, "PopupNotifications").get) {
+      PopupNotifications.locationChange(aBrowser);
+    }
+
+    gBrowser.readNotificationBox(aBrowser)?.removeTransientNotifications();
+
+    FullZoom.onLocationChange(aLocationURI, false, aBrowser);
+  },
+
+  onLinkIconAvailable(browser, dataURI, iconURI) {
+    if (!iconURI) {
+      return;
+    }
+    if (browser == gBrowser.selectedBrowser) {
+      OpenSearchManager.updateOpenSearchBadge(window);
+    }
+  },
+};
+
+function showFullScreenViewContextMenuItems(popup) {
+  for (let node of popup.querySelectorAll('[contexttype="fullscreen"]')) {
+    node.hidden = !window.fullScreen;
+  }
+  let autoHide = popup.querySelector(".fullscreen-context-autohide");
+  if (autoHide) {
+    FullScreen.updateAutohideMenuitem(autoHide);
+  }
+}
+
+function onViewToolbarCommand(aEvent) {
+  let node = aEvent.originalTarget;
+  let menuId;
+  let toolbarId;
+  let isVisible;
+  if (node.dataset.bookmarksToolbarVisibility) {
+    isVisible = node.dataset.visibilityEnum;
+    toolbarId = "PersonalToolbar";
+    menuId = node.parentNode.parentNode.parentNode.id;
+    Services.prefs.setCharPref(
+      "browser.toolbars.bookmarks.visibility",
+      isVisible
+    );
+  } else {
+    menuId = node.parentNode.id;
+    toolbarId = node.getAttribute("toolbarId");
+    isVisible = node.hasAttribute("checked");
+  }
+  CustomizableUI.setToolbarVisibility(toolbarId, isVisible);
+}
+
+function setToolbarVisibility(
+  toolbar,
+  isVisible,
+  persist = true,
+  animated = true
+) {
+  let hidingAttribute;
+  if (toolbar.getAttribute("type") == "menubar") {
+    hidingAttribute = "autohide";
+    if (AppConstants.platform == "linux") {
+      Services.prefs.setBoolPref("ui.key.menuAccessKeyFocuses", !isVisible);
+    }
+  } else {
+    hidingAttribute = "collapsed";
+  }
+
+  if (toolbar == BookmarkingUI.toolbar) {
+    if (persist) {
+      let prefValue;
+      if (typeof isVisible == "string") {
+        prefValue = isVisible;
+      } else {
+        prefValue = isVisible ? "always" : "never";
+      }
+      Services.prefs.setCharPref(
+        "browser.toolbars.bookmarks.visibility",
+        prefValue
+      );
+    }
+
+    switch (isVisible) {
+      case true:
+      case "always":
+        isVisible = true;
+        break;
+      case false:
+      case "never":
+        isVisible = false;
+        break;
+      case "newtab":
+      default: {
+        let currentURI;
+        if (!gBrowserInit.domContentLoaded) {
+          let uriToLoad = gBrowserInit.uriToLoadPromise;
+          if (uriToLoad) {
+            if (Array.isArray(uriToLoad)) {
+              uriToLoad = uriToLoad[0];
+            }
+            currentURI = URL.parse(uriToLoad)?.URI;
+            if (!currentURI) {
+              currentURI = gBrowser?.currentURI;
+            }
+          }
+        } else {
+          currentURI = gBrowser.currentURI;
+        }
+        isVisible = BookmarkingUI.isOnNewTabPage(currentURI);
+        break;
+      }
+    }
+  }
+
+  if (toolbar.hasAttribute(hidingAttribute) != isVisible) {
+    return;
+  }
+
+  toolbar.classList.toggle("instant", !animated);
+  toolbar.toggleAttribute(hidingAttribute, !isVisible);
+  if (persist && toolbar.id != "PersonalToolbar") {
+    Services.xulStore.persist(toolbar, hidingAttribute);
+  }
+
+  let eventParams = {
+    detail: {
+      visible: isVisible,
+    },
+    bubbles: true,
+  };
+  let event = new CustomEvent("toolbarvisibilitychange", eventParams);
+  toolbar.dispatchEvent(event);
+}
+
+function updateToggleControlLabel(control) {
+  if (!control.hasAttribute("label-checked")) {
+    return;
+  }
+
+  if (!control.hasAttribute("label-unchecked")) {
+    control.setAttribute("label-unchecked", control.getAttribute("label"));
+  }
+  let prefix = control.hasAttribute("checked") ? "" : "un";
+  control.setAttribute("label", control.getAttribute(`label-${prefix}checked`));
+}
+
+function displaySecurityInfo() {
+  BrowserCommands.pageInfo(null, "securityTab");
+}
+
+var gUIDensity = {
+  MODE_NORMAL: 0,
+  MODE_COMPACT: 1,
+  MODE_TOUCH: 2,
+  uiDensityPref: "browser.uidensity",
+
+  init() {
+    this.update();
+    Services.prefs.addObserver(this.uiDensityPref, this);
+  },
+
+  uninit() {
+    Services.prefs.removeObserver(this.uiDensityPref, this);
+  },
+
+  observe(aSubject, aTopic, aPrefName) {
+    if (aTopic == "nsPref:changed" && aPrefName == this.uiDensityPref) {
+      this.update();
+    }
+  },
+
+  update(mode) {
+    if (mode == null) {
+      mode = Services.prefs.getIntPref(this.uiDensityPref);
+    }
+
+    for (let doc of [document.documentElement]) {
+      switch (mode) {
+        case this.MODE_COMPACT:
+          doc.setAttribute("uidensity", "compact");
+          break;
+        case this.MODE_TOUCH:
+          doc.setAttribute("uidensity", "touch");
+          break;
+        default:
+          doc.removeAttribute("uidensity");
+          break;
+      }
+    }
+
+    if (mode == this._appliedMode) {
+      return;
+    }
+    this._appliedMode = mode;
+    window.dispatchEvent(new CustomEvent("uidensitychanged"));
+  },
+};
+
+const DynamicShortcutTooltip = {
+  nodeToTooltipMap: {
+    "bookmarks-menu-button": "bookmarksMenuButton.tooltip",
+    "context-reload": "reloadButton.tooltip",
+    "context-stop": "stopButton.tooltip",
+    "downloads-button": "downloads.tooltip",
+    "fullscreen-button": "fullscreenButton.tooltip",
+    "appMenu-fullscreen-button2": "fullscreenButton.tooltip",
+    "new-window-button": "newWindowButton.tooltip",
+    "new-tab-button": "newTabButton.tooltip",
+    "tabs-newtab-button": "newTabButton.tooltip",
+    "reload-button": "reloadButton.tooltip",
+    "stop-button": "stopButton.tooltip",
+    "urlbar-zoom-button": "urlbar-zoom-button.tooltip",
+    "appMenu-zoomEnlarge-button2": "zoomEnlarge-button.tooltip",
+    "appMenu-zoomReset-button2": "zoomReset-button.tooltip",
+    "appMenu-zoomReduce-button2": "zoomReduce-button.tooltip",
+  },
+
+  nodeToShortcutMap: {
+    "bookmarks-menu-button": "manBookmarkKb",
+    "context-reload": "key_reload",
+    "context-stop": "key_stop",
+    "downloads-button": "key_openDownloads",
+    "fullscreen-button": "key_enterFullScreen",
+    "appMenu-fullscreen-button2": "key_enterFullScreen",
+    "new-window-button": "key_newNavigator",
+    "new-tab-button": "key_newNavigatorTab",
+    "tabs-newtab-button": "key_newNavigatorTab",
+    "reload-button": "key_reload",
+    "stop-button": "key_stop",
+    "urlbar-zoom-button": "key_fullZoomReset",
+    "appMenu-zoomEnlarge-button2": "key_fullZoomEnlarge",
+    "appMenu-zoomReset-button2": "key_fullZoomReset",
+    "appMenu-zoomReduce-button2": "key_fullZoomReduce",
+  },
+
+  getText(nodeId) {
+    if (!this.cache.has(nodeId) && nodeId in this.nodeToTooltipMap) {
+      let strId = this.nodeToTooltipMap[nodeId];
+      let args = [];
+      let shouldCache = true;
+      if (nodeId in this.nodeToShortcutMap) {
+        let shortcutId = this.nodeToShortcutMap[nodeId];
+        let shortcut = document.getElementById(shortcutId);
+        if (shortcut) {
+          let prettyShortcut = ShortcutUtils.prettifyShortcut(shortcut);
+          args.push(prettyShortcut);
+          if (!prettyShortcut) {
+            shouldCache = false;
+          }
+        }
+      }
+      let string = gNavigatorBundle.getFormattedString(strId, args);
+      if (shouldCache) {
+        this.cache.set(nodeId, string);
+      }
+      return string;
+    }
+    return this.cache.get(nodeId);
+  },
+
+  updateText(aTooltip) {
+    let nodeId = aTooltip.triggerNode.id;
+    aTooltip.setAttribute("label", this.getText(nodeId));
+  },
+
+  cache: new Map(),
+};
+
+
+function contentAreaClick(event, isPanelClick) {
+  if (!event.isTrusted || event.defaultPrevented || event.button != 0) {
+    return;
+  }
+
+  let [href, linkNode] = BrowserUtils.hrefAndLinkNodeForClickEvent(event);
+  if (!href) {
+    if (
+      event.button == 1 &&
+      Services.prefs.getBoolPref("middlemouse.contentLoadURL") &&
+      !Services.prefs.getBoolPref("general.autoScroll")
+    ) {
+      middleMousePaste(event);
+      event.preventDefault();
+    }
+    return;
+  }
+
+  if (
+    linkNode &&
+    event.button == 0 &&
+    !event.ctrlKey &&
+    !event.shiftKey &&
+    !event.altKey &&
+    !event.metaKey
+  ) {
+    let target = linkNode.target;
+    let mainTarget = !target || target == "_content" || target == "_main";
+    if (isPanelClick && mainTarget) {
+      if (
+        linkNode.getAttribute("onclick") ||
+        href.startsWith("javascript:") ||
+        href.startsWith("data:")
+      ) {
+        return;
+      }
+
+      try {
+        urlSecurityCheck(href, linkNode.ownerDocument.nodePrincipal);
+      } catch (ex) {
+        event.preventDefault();
+        return;
+      }
+
+      openLinkIn(href, "current", {
+        allowThirdPartyFixup: false,
+      });
+      event.preventDefault();
+      return;
+    }
+  }
+
+  handleLinkClick(event, href, linkNode);
+
+  try {
+    if (!PrivateBrowsingUtils.isWindowPrivate(window)) {
+      PlacesUIUtils.markPageAsFollowedLink(href);
+    }
+  } catch (ex) {
+  }
+}
+
+function handleLinkClick(event, href, linkNode) {
+  if (event.button == 2) {
+    return false;
+  }
+
+  var where = BrowserUtils.whereToOpenLink(event);
+  if (where == "current") {
+    return false;
+  }
+
+  var doc = event.target.ownerDocument;
+  let referrerInfo = Cc["@mozilla.org/referrer-info;1"].createInstance(
+    Ci.nsIReferrerInfo
+  );
+  if (linkNode) {
+    referrerInfo.initWithElement(linkNode);
+  } else {
+    referrerInfo.initWithDocument(doc);
+  }
+
+  if (where == "save") {
+    saveURL(
+      href,
+      null,
+      linkNode ? gatherTextUnder(linkNode) : "",
+      null,
+      true,
+      true,
+      referrerInfo,
+      doc.cookieJarSettings,
+      doc
+    );
+    event.preventDefault();
+    return true;
+  }
+
+  let frameID = WebNavigationFrames.getFrameId(doc.defaultView);
+
+  urlSecurityCheck(href, doc.nodePrincipal);
+  let params = {
+    charset: doc.characterSet,
+    referrerInfo,
+    originPrincipal: doc.nodePrincipal,
+    originStoragePrincipal: doc.effectiveStoragePrincipal,
+    triggeringPrincipal: doc.nodePrincipal,
+    policyContainer: doc.policyContainer,
+    frameID,
+  };
+
+  if (doc.nodePrincipal.originAttributes.userContextId) {
+    params.userContextId = doc.nodePrincipal.originAttributes.userContextId;
+  }
+
+  openLinkIn(href, where, params);
+  event.preventDefault();
+  return true;
+}
+
+function middleMousePaste(event) {
+  let clipboard = readFromClipboard();
+  if (!clipboard) {
+    return;
+  }
+
+  clipboard = clipboard.replace(/\s*\n\s*/g, "");
+
+  clipboard = UrlbarUtils.stripUnsafeProtocolOnPaste(clipboard);
+
+  let where = BrowserUtils.whereToOpenLink(event, true, false);
+  let lastLocationChange;
+  if (where == "current") {
+    lastLocationChange = gBrowser.selectedBrowser.lastLocationChange;
+  }
+
+  UrlbarUtils.getShortcutOrURIAndPostData(clipboard).then(data => {
+    try {
+      makeURI(data.url);
+    } catch (ex) {
+      return;
+    }
+
+    try {
+      UrlbarUtils.addToUrlbarHistory(data.url, window);
+    } catch (ex) {
+      console.error(ex);
+    }
+
+    if (
+      where != "current" ||
+      lastLocationChange == gBrowser.selectedBrowser.lastLocationChange
+    ) {
+      openUILink(data.url, event, {
+        ignoreButton: true,
+        allowInheritPrincipal: data.mayInheritPrincipal,
+        triggeringPrincipal: gBrowser.selectedBrowser.contentPrincipal,
+        policyContainer: gBrowser.selectedBrowser.policyContainer,
+      });
+    }
+  });
+
+  if (Event.isInstance(event)) {
+    event.stopPropagation();
+  }
+}
+
+var BrowserOffline = {
+  _inited: false,
+
+  init() {
+    if (!this._uiElement) {
+      this._uiElement = document.getElementById("cmd_toggleOfflineStatus");
+    }
+
+    Services.obs.addObserver(this, "network:offline-status-changed");
+
+    this._updateOfflineUI(Services.io.offline);
+
+    this._inited = true;
+  },
+
+  uninit() {
+    if (this._inited) {
+      Services.obs.removeObserver(this, "network:offline-status-changed");
+    }
+  },
+
+  toggleOfflineStatus() {
+    var ioService = Services.io;
+
+    if (!ioService.offline && !this._canGoOffline()) {
+      this._updateOfflineUI(false);
+      return;
+    }
+
+    ioService.offline = !ioService.offline;
+  },
+
+  observe(aSubject, aTopic) {
+    if (aTopic != "network:offline-status-changed") {
+      return;
+    }
+
+    this._updateOfflineUI(Services.io.offline);
+  },
+
+  _canGoOffline() {
+    try {
+      var cancelGoOffline = Cc["@mozilla.org/supports-PRBool;1"].createInstance(
+        Ci.nsISupportsPRBool
+      );
+      Services.obs.notifyObservers(cancelGoOffline, "offline-requested");
+
+      if (cancelGoOffline.data) {
+        return false;
+      }
+    } catch (ex) {}
+
+    return true;
+  },
+
+  _uiElement: null,
+  _updateOfflineUI(aOffline) {
+    var offlineLocked = Services.prefs.prefIsLocked("network.online");
+    this._uiElement.toggleAttribute("disabled", !!offlineLocked);
+    this._uiElement.toggleAttribute("checked", aOffline);
+  },
+};
+
+function CanCloseWindow() {
+  if (Services.startup.shuttingDown || window.skipNextCanClose) {
+    return true;
+  }
+
+  for (let browser of gBrowser.browsers) {
+    if (!browser.isConnected) {
+      continue;
+    }
+
+    let { permitUnload } = browser.permitUnload();
+    if (!permitUnload) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function WindowIsClosing(event) {
+  let source;
+  if (event) {
+    let target = event.sourceEvent?.target;
+    if (target?.id?.startsWith("menu_")) {
+      source = "menuitem";
+    } else if (target?.nodeName == "toolbarbutton") {
+      source = "close-button";
+    } else {
+      let key = AppConstants.platform == "macosx" ? "metaKey" : "ctrlKey";
+      source = event[key] ? "shortcut" : "OS";
+    }
+  }
+  if (!closeWindow(false, warnAboutClosingWindow, source)) {
+    return false;
+  }
+
+  if (CanCloseWindow()) {
+    window.skipNextCanClose = true;
+    return true;
+  }
+
+  return false;
+}
+
+function warnAboutClosingWindow() {
+  let isPBWindow =
+    PrivateBrowsingUtils.isWindowPrivate(window) &&
+    !PrivateBrowsingUtils.permanentPrivateBrowsing;
+
+  if (!isPBWindow && !toolbar.visible) {
+    return gBrowser.warnAboutClosingTabs(
+      gBrowser.openTabs.length,
+      gBrowser.closingTabsEnum.ALL
+    );
+  }
+
+  let otherPBWindowExists = false;
+  let otherWindowExists = false;
+  for (let win of browserWindows()) {
+    if (!win.closed && win != window) {
+      otherWindowExists = true;
+      if (isPBWindow && PrivateBrowsingUtils.isWindowPrivate(win)) {
+        otherPBWindowExists = true;
+      }
+      if (!isPBWindow || otherPBWindowExists) {
+        break;
+      }
+    }
+  }
+
+  if (isPBWindow && !otherPBWindowExists) {
+    let exitingCanceled = Cc["@mozilla.org/supports-PRBool;1"].createInstance(
+      Ci.nsISupportsPRBool
+    );
+    exitingCanceled.data = false;
+    Services.obs.notifyObservers(exitingCanceled, "last-pb-context-exiting");
+    if (exitingCanceled.data) {
+      return false;
+    }
+  }
+
+  if (otherWindowExists) {
+    return (
+      isPBWindow ||
+      gBrowser.warnAboutClosingTabs(
+        gBrowser.openTabs.length,
+        gBrowser.closingTabsEnum.ALL
+      )
+    );
+  }
+
+  let os = Services.obs;
+
+  let closingCanceled = Cc["@mozilla.org/supports-PRBool;1"].createInstance(
+    Ci.nsISupportsPRBool
+  );
+  os.notifyObservers(closingCanceled, "browser-lastwindow-close-requested");
+  if (closingCanceled.data) {
+    return false;
+  }
+
+  os.notifyObservers(null, "browser-lastwindow-close-granted");
+
+  return (
+    AppConstants.platform != "macosx" ||
+    isPBWindow ||
+    gBrowser.warnAboutClosingTabs(
+      gBrowser.openTabs.length,
+      gBrowser.closingTabsEnum.ALL
+    )
+  );
+}
+
+var MailIntegration = {
+  sendLinkForBrowser(aBrowser) {
+    this.sendMessage(
+      gURLBar.makeURIReadable(aBrowser.currentURI).displaySpec,
+      aBrowser.contentTitle
+    );
+  },
+
+  sendMessage(aBody, aSubject) {
+    var mailtoUrl = "mailto:";
+    if (aBody) {
+      mailtoUrl += "?body=" + encodeURIComponent(aBody);
+      mailtoUrl += "&subject=" + encodeURIComponent(aSubject);
+    }
+
+    var uri = makeURI(mailtoUrl);
+
+    this._launchExternalUrl(uri);
+  },
+
+  _launchExternalUrl(aURL) {
+    var extProtocolSvc = Cc[
+      "@mozilla.org/uriloader/external-protocol-service;1"
+    ].getService(Ci.nsIExternalProtocolService);
+    if (extProtocolSvc) {
+      extProtocolSvc.loadURI(
+        aURL,
+        Services.scriptSecurityManager.getSystemPrincipal()
+      );
+    }
+  },
+};
+
+function switchToTabHavingURI(
+  aURI,
+  aOpenNew,
+  aOpenParams = {},
+  aUserContextId = null,
+  aSplitView = null
+) {
+  return URILoadingHelper.switchToTabHavingURI(
+    window,
+    aURI,
+    aOpenNew,
+    aOpenParams,
+    aUserContextId,
+    aSplitView
+  );
+}
+
+function safeModeRestart() {
+  if (Services.appinfo.inSafeMode) {
+    let cancelQuit = Cc["@mozilla.org/supports-PRBool;1"].createInstance(
+      Ci.nsISupportsPRBool
+    );
+    Services.obs.notifyObservers(
+      cancelQuit,
+      "quit-application-requested",
+      "restart"
+    );
+
+    if (cancelQuit.data) {
+      return;
+    }
+
+    Services.startup.quit(
+      Ci.nsIAppStartup.eRestart | Ci.nsIAppStartup.eAttemptQuit
+    );
+    return;
+  }
+
+  Services.obs.notifyObservers(window, "restart-in-safe-mode");
+}
+
+function duplicateTabIn(aTab, where, delta) {
+  switch (where) {
+    case "window": {
+      let otherWin = OpenBrowserWindow({
+        private: PrivateBrowsingUtils.isBrowserPrivate(aTab.linkedBrowser),
+      });
+      let delayedStartupFinished = (subject, topic) => {
+        if (
+          topic == "browser-delayed-startup-finished" &&
+          subject == otherWin
+        ) {
+          Services.obs.removeObserver(delayedStartupFinished, topic);
+          let otherGBrowser = otherWin.gBrowser;
+          let otherTab = otherGBrowser.selectedTab;
+          SessionStore.duplicateTab(otherWin, aTab, delta);
+          otherGBrowser.removeTab(otherTab, { animate: false });
+        }
+      };
+
+      Services.obs.addObserver(
+        delayedStartupFinished,
+        "browser-delayed-startup-finished"
+      );
+      break;
+    }
+    case "tabshifted":
+      SessionStore.duplicateTab(window, aTab, delta);
+      break;
+    case "tab":
+      SessionStore.duplicateTab(window, aTab, delta, true, {
+        inBackground: false,
+      });
+      break;
+  }
+  if (aTab.group) {
+  }
+}
+
+var MousePosTracker = {
+  _listeners: new Set(),
+  _x: 0,
+  _y: 0,
+
+  addListener(listener) {
+    if (this._listeners.has(listener)) {
+      return;
+    }
+
+    listener._hover = false;
+    this._listeners.add(listener);
+
+    this._callListener(listener);
+  },
+
+  removeListener(listener) {
+    this._listeners.delete(listener);
+  },
+
+  handleEvent(event) {
+    if (event.type === "mouseout" && event.currentTarget !== window) {
+      return;
+    }
+
+    const sourceWin = event.target.documentGlobal;
+    const scale =
+      sourceWin !== window
+        ? sourceWin.devicePixelRatio / window.devicePixelRatio
+        : 1;
+    this._x = event.screenX * scale - window.mozInnerScreenX;
+    this._y = event.screenY * scale - window.mozInnerScreenY;
+
+    this._listeners.forEach(listener => {
+      try {
+        this._callListener(listener);
+      } catch (e) {
+        console.error(e);
+      }
+    });
+  },
+
+  _callListener(listener) {
+    let rect = listener.getMouseTargetRect();
+    let hover =
+      this._x >= rect.left &&
+      this._x <= rect.right &&
+      this._y >= rect.top &&
+      this._y <= rect.bottom;
+
+    if (hover == listener._hover) {
+      return;
+    }
+
+    listener._hover = hover;
+
+    if (hover) {
+      if (listener.onMouseEnter) {
+        listener.onMouseEnter();
+      }
+    } else if (listener.onMouseLeave) {
+      listener.onMouseLeave();
+    }
+  },
+};
+
+class TabDialogBox {
+  static _containerFor(browser) {
+    return browser.closest(
+      ".browserSidebarContainer"
+    );
+  }
+
+  constructor(browser) {
+    this._weakBrowserRef = Cu.getWeakReference(browser);
+
+    let template = document.getElementById("dialogStackTemplate");
+    let dialogStack = template.content.cloneNode(true).firstElementChild;
+    dialogStack.classList.add("tab-prompt-dialog");
+
+    TabDialogBox._containerFor(browser).appendChild(dialogStack);
+
+    let dialogTemplate = dialogStack.firstElementChild;
+
+    this._tabDialogManager = new SubDialogManager({
+      dialogStack,
+      dialogTemplate,
+      orderType: SubDialogManager.ORDER_QUEUE,
+      allowDuplicateDialogs: true,
+      dialogOptions: {
+        consumeOutsideClicks: false,
+      },
+    });
+  }
+
+  open(
+    aURL,
+    {
+      features = null,
+      allowDuplicateDialogs = true,
+      sizeTo,
+      keepOpenSameOriginNav,
+      modalType = null,
+      allowFocusCheckbox = false,
+      hideContent = false,
+      webProgress = undefined,
+    } = {},
+    ...aParams
+  ) {
+    let resolveClosed;
+    let closedPromise = new Promise(resolve => (resolveClosed = resolve));
+    let dialogManager =
+      modalType === Ci.nsIPrompt.MODAL_TYPE_CONTENT
+        ? this.getContentDialogManager()
+        : this._tabDialogManager;
+
+    let hasDialogs = () =>
+      this._tabDialogManager.hasDialogs ||
+      this._contentDialogManager?.hasDialogs;
+
+    if (!hasDialogs()) {
+      this._onFirstDialogOpen(webProgress ?? this.browser.webProgress);
+    }
+
+    let closingCallback = event => {
+      if (!hasDialogs()) {
+        this._onLastDialogClose(webProgress ?? this.browser.webProgress);
+      }
+
+      if (allowFocusCheckbox && !event.detail?.abort) {
+        this.maybeSetAllowTabSwitchPermission(event.target);
+      }
+    };
+
+    if (modalType == Ci.nsIPrompt.MODAL_TYPE_CONTENT) {
+      sizeTo = "limitheight";
+    }
+
+    let dialog = dialogManager.open(
+      aURL,
+      {
+        features,
+        allowDuplicateDialogs,
+        sizeTo,
+        closingCallback,
+        closedCallback: resolveClosed,
+        hideContent,
+      },
+      ...aParams
+    );
+
+    if (dialog) {
+      dialog._keepOpenSameOriginNav = keepOpenSameOriginNav;
+    }
+    return { closedPromise, dialog };
+  }
+
+  _onFirstDialogOpen(webProgress) {
+    this.browser.setAttribute("tabDialogShowing", true);
+    UpdatePopupNotificationsVisibility();
+
+    this._lastPrincipal = this.browser.contentPrincipal;
+    webProgress.addProgressListener(this, Ci.nsIWebProgress.NOTIFY_LOCATION);
+
+    this.tab?.addEventListener("TabClose", this);
+  }
+
+  _onLastDialogClose(webProgress) {
+    this.browser.removeAttribute("tabDialogShowing");
+    UpdatePopupNotificationsVisibility();
+
+    webProgress.removeProgressListener(this);
+    this._lastPrincipal = null;
+
+    this.tab?.removeEventListener("TabClose", this);
+  }
+
+  _buildContentPromptDialog() {
+    let template = document.getElementById("dialogStackTemplate");
+    let contentDialogStack = template.content.cloneNode(true).firstElementChild;
+    contentDialogStack.classList.add("content-prompt-dialog");
+
+    let browserContainer = TabDialogBox._containerFor(this.browser);
+    let tabPromptDialog = browserContainer.querySelector(".tab-prompt-dialog");
+    browserContainer.insertBefore(contentDialogStack, tabPromptDialog);
+
+    let contentDialogTemplate = contentDialogStack.firstElementChild;
+    this._contentDialogManager = new SubDialogManager({
+      dialogStack: contentDialogStack,
+      dialogTemplate: contentDialogTemplate,
+      orderType: SubDialogManager.ORDER_QUEUE,
+      allowDuplicateDialogs: true,
+      dialogOptions: {
+        consumeOutsideClicks: false,
+      },
+    });
+  }
+
+  handleEvent(event) {
+    if (event.type !== "TabClose") {
+      return;
+    }
+    this.abortAllDialogs();
+  }
+
+  abortAllDialogs() {
+    this._tabDialogManager.abortDialogs();
+    this._contentDialogManager?.abortDialogs();
+  }
+
+  focus() {
+    if (this._tabDialogManager._dialogs.length) {
+      this._tabDialogManager.focusTopDialog();
+      return;
+    }
+    this._contentDialogManager?.focusTopDialog();
+  }
+
+  onLocationChange(aWebProgress, aRequest, aLocation, aFlags) {
+    if (
+      !aWebProgress.isTopLevel ||
+      aFlags & Ci.nsIWebProgressListener.LOCATION_CHANGE_SAME_DOCUMENT
+    ) {
+      return;
+    }
+
+    let filterFn;
+
+    if (
+      this._lastPrincipal?.isSameOrigin(
+        aLocation,
+        this.browser.browsingContext.usePrivateBrowsing
+      )
+    ) {
+      filterFn = dialog => !dialog._keepOpenSameOriginNav;
+    }
+
+    this._lastPrincipal = this.browser.contentPrincipal;
+
+    this._tabDialogManager.abortDialogs(filterFn);
+    this._contentDialogManager?.abortDialogs(filterFn);
+  }
+
+  get tab() {
+    return gBrowser.getTabForBrowser(this.browser);
+  }
+
+  get browser() {
+    let browser = this._weakBrowserRef.get();
+    if (!browser) {
+      throw new Error("Stale dialog box! The associated browser is gone.");
+    }
+    return browser;
+  }
+
+  getTabDialogManager() {
+    return this._tabDialogManager;
+  }
+
+  getContentDialogManager() {
+    if (!this._contentDialogManager) {
+      this._buildContentPromptDialog();
+    }
+    return this._contentDialogManager;
+  }
+
+  onNextPromptShowAllowFocusCheckboxFor(principal) {
+    this._allowTabFocusByPromptPrincipal = principal;
+  }
+
+  maybeSetAllowTabSwitchPermission(dialog) {
+    let checkbox = dialog.querySelector("checkbox");
+
+    if (checkbox.checked) {
+      Services.perms.addFromPrincipal(
+        this._allowTabFocusByPromptPrincipal,
+        "focus-tab-by-prompt",
+        Services.perms.ALLOW_ACTION
+      );
+    }
+
+    this._allowTabFocusByPromptPrincipal = null;
+  }
+}
+
+TabDialogBox.prototype.QueryInterface = ChromeUtils.generateQI([
+  "nsIWebProgressListener",
+  "nsISupportsWeakReference",
+]);
+
+var gDialogBox = {
+  _dialog: null,
+  _nextOpenJumpsQueue: false,
+  _queued: [],
+
+  _didCloseHTMLDialog: null,
+  _didOpenHTMLDialog: false,
+
+  get dialog() {
+    return this._dialog;
+  },
+
+  get isOpen() {
+    return !!this._dialog;
+  },
+
+  replaceDialogIfOpen() {
+    this._dialog?.close();
+    this._nextOpenJumpsQueue = true;
+  },
+
+  async open(uri, args) {
+    const queueMethod = this._nextOpenJumpsQueue ? "unshift" : "push";
+    this._nextOpenJumpsQueue = false;
+
+    if (this.isOpen) {
+      return new Promise((resolve, reject) => {
+        this._queued[queueMethod]({ resolve, reject, uri, args });
+      });
+    }
+
+    if (window.windowUtils.isInModalState() && !args.getProperty("async")) {
+      throw Components.Exception(
+        "Prompt could not be shown.",
+        Cr.NS_ERROR_NOT_AVAILABLE
+      );
+    }
+
+    this._didOpenHTMLDialog = false;
+    let haveClosedPromise = new Promise(resolve => {
+      this._didCloseHTMLDialog = resolve;
+    });
+
+    window.focus();
+
+    try {
+      for (let mozUrlbar of document.querySelectorAll("moz-urlbar")) {
+        mozUrlbar.incrementBreakoutBlockerCount();
+      }
+    } catch (ex) {
+      console.error(ex);
+    }
+
+    try {
+      await this._open(uri, args);
+    } catch (ex) {
+      console.error(ex);
+    } finally {
+      let dialog = document.getElementById("window-modal-dialog");
+      if (dialog.open) {
+        dialog.close();
+      }
+      if (this._didOpenHTMLDialog) {
+        await haveClosedPromise;
+      }
+      dialog.style.visibility = "hidden";
+      dialog.style.height = "0";
+      dialog.style.width = "0";
+      document.documentElement.removeAttribute("window-modal-open");
+      dialog.removeEventListener("dialogopen", this);
+      dialog.removeEventListener("close", this);
+      this._updateMenuAndCommandState(true );
+      this._dialog = null;
+      UpdatePopupNotificationsVisibility();
+      for (let mozUrlbar of document.querySelectorAll("moz-urlbar")) {
+        mozUrlbar.decrementBreakoutBlockerCount();
+      }
+    }
+    if (this._queued.length) {
+      setTimeout(() => this._openNextDialog(), 0);
+    }
+    return args;
+  },
+
+  _openNextDialog() {
+    if (!this.isOpen) {
+      let { resolve, reject, uri, args } = this._queued.shift();
+      this.open(uri, args).then(resolve, reject);
+    }
+  },
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "dialogopen":
+        this._dialog.focus(true);
+        break;
+      case "close":
+        this._didCloseHTMLDialog();
+        this._dialog.close();
+        break;
+    }
+  },
+
+  _open(uri, args) {
+    let offset = window.windowUtils.getBoundsWithoutFlushing(
+      gBrowser.selectedBrowser
+    ).top;
+    let parentElement = document.getElementById("window-modal-dialog");
+    parentElement.style.setProperty("--chrome-offset", offset + "px");
+    parentElement.style.removeProperty("visibility");
+    parentElement.style.removeProperty("width");
+    parentElement.style.removeProperty("height");
+    document.documentElement.setAttribute("window-modal-open", true);
+    parentElement.showModal();
+    this._didOpenHTMLDialog = true;
+
+    this._updateMenuAndCommandState(false );
+
+    let template = document.getElementById("window-modal-dialog-template")
+      .content.firstElementChild;
+    parentElement.addEventListener("dialogopen", this);
+    parentElement.addEventListener("close", this);
+    this._dialog = new SubDialog({
+      template,
+      parentElement,
+      id: "window-modal-dialog-subdialog",
+      dialogOptions: {
+        consumeOutsideClicks: false,
+      },
+    });
+    let closedPromise = new Promise(resolve => {
+      this._closedCallback = function () {
+        PromptUtils.fireDialogEvent(window, "DOMModalDialogClosed");
+        resolve();
+      };
+    });
+    this._dialog.open(
+      uri,
+      {
+        features: "resizable=no",
+        modalType: Ci.nsIPrompt.MODAL_TYPE_INTERNAL_WINDOW,
+        closedCallback: () => {
+          this._closedCallback();
+        },
+      },
+      args
+    );
+    UpdatePopupNotificationsVisibility();
+    return closedPromise;
+  },
+
+  _nonUpdatableElements: new Set([
+    "key_browserConsole",
+    "key_browserToolbox",
+
+    "key_undo",
+    "key_redo",
+
+    "key_cut",
+    "key_copy",
+    "key_paste",
+    "key_delete",
+    "key_selectAll",
+  ]),
+
+  _updateMenuAndCommandState(shouldBeEnabled) {
+    let editorCommands = document.getElementById("editMenuCommands");
+    for (let element of document.querySelectorAll(
+      "menubar > menu, command, key:not([command])"
+    )) {
+      if (
+        editorCommands?.contains(element) ||
+        (element.id && this._nonUpdatableElements.has(element.id))
+      ) {
+        continue;
+      }
+      if (element.nodeName == "key" && element.command) {
+        continue;
+      }
+      if (!shouldBeEnabled) {
+        if (!element.hasAttribute("disabled")) {
+          element.setAttribute("disabled", true);
+        } else {
+          element.setAttribute("wasdisabled", true);
+        }
+      } else if (element.getAttribute("wasdisabled") != "true") {
+        element.removeAttribute("disabled");
+      } else {
+        element.removeAttribute("wasdisabled");
+      }
+    }
+  },
+};
+
+if (window.location.href != AppConstants.BROWSER_CHROME_URL) {
+  gDialogBox = null;
+}
+
+var ConfirmationHint = {
+  _timerID: null,
+
+  show(
+    anchor,
+    messageId,
+    {
+      hideCheckmark = false,
+      descriptionId,
+      l10nArgs,
+      showDescription,
+      position,
+      event,
+    } = {}
+  ) {
+    this._reset();
+
+    MozXULElement.insertFTLIfNeeded("toolkit/branding/brandings.ftl");
+    MozXULElement.insertFTLIfNeeded("browser/confirmationHints.ftl");
+
+
+    document.l10n.setAttributes(this._message, messageId, l10nArgs);
+    if (descriptionId) {
+      document.l10n.setAttributes(this._description, descriptionId);
+      this._description.hidden = false;
+      this._panel.classList.add("with-description");
+    } else {
+      this._description.hidden = true;
+      this._panel.classList.remove("with-description");
+    }
+
+    this._panel.setAttribute("data-message-id", messageId);
+
+    if (!hideCheckmark) {
+      this._panel.classList.add("with-checkmark");
+    }
+
+    const DURATION = showDescription ? 6000 : 3000;
+    this._panel.addEventListener(
+      "popupshown",
+      () => {
+        this._animationBox.setAttribute("animate", "true");
+        this._timerID = setTimeout(() => {
+          this._panel.hidePopup(true);
+        }, DURATION + 120);
+      },
+      { once: true }
+    );
+
+    this._panel.addEventListener(
+      "popuphidden",
+      () => {
+        this._reset();
+      },
+      { once: true }
+    );
+
+    this._panel.openPopup(anchor, {
+      position: position ?? "bottomleft topleft",
+      triggerEvent: event,
+    });
+  },
+
+  _reset() {
+    if (this._timerID) {
+      clearTimeout(this._timerID);
+      this._timerID = null;
+    }
+    if (this.__panel) {
+      this._animationBox.removeAttribute("animate");
+      this._panel.removeAttribute("data-message-id");
+      this._panel.classList.remove("with-checkmark");
+    }
+  },
+
+  get _panel() {
+    this._ensurePanel();
+    return this.__panel;
+  },
+
+  get _animationBox() {
+    this._ensurePanel();
+    delete this._animationBox;
+    return (this._animationBox = document.getElementById(
+      "confirmation-hint-checkmark-animation-container"
+    ));
+  },
+
+  get _message() {
+    this._ensurePanel();
+    delete this._message;
+    return (this._message = document.getElementById(
+      "confirmation-hint-message"
+    ));
+  },
+
+  get _description() {
+    this._ensurePanel();
+    delete this._description;
+    return (this._description = document.getElementById(
+      "confirmation-hint-description"
+    ));
+  },
+
+  _ensurePanel() {
+    if (!this.__panel) {
+      let wrapper = document.getElementById("confirmation-hint-wrapper");
+      wrapper.replaceWith(wrapper.content);
+      this.__panel = document.getElementById("confirmation-hint");
+    }
+  },
+};

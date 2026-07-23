@@ -1,0 +1,108 @@
+use std::ffi::OsStr;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::{self, SocketAddr};
+use std::path::Path;
+use std::{io, mem};
+
+use crate::net::UnixStream;
+use crate::sys::unix::net::new_socket;
+use crate::sys::unix::uds::{path_offset, unix_addr};
+
+pub(crate) fn bind_addr(address: &SocketAddr) -> io::Result<net::UnixListener> {
+    let fd = new_socket(libc::AF_UNIX, libc::SOCK_STREAM)?;
+    let socket = unsafe { net::UnixListener::from_raw_fd(fd) };
+
+    let (unix_address, addrlen) = unix_addr(address);
+    let sockaddr = &unix_address as *const libc::sockaddr_un as *const libc::sockaddr;
+    syscall!(bind(fd, sockaddr, addrlen))?;
+    let backlog = if cfg!(any(
+        target_os = "windows",
+        target_os = "redox",
+        target_os = "espidf",
+        target_os = "horizon"
+    )) {
+        128
+    } else if cfg!(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_vendor = "apple"
+    )) {
+        -1
+    } else {
+        libc::SOMAXCONN
+    };
+    syscall!(listen(fd, backlog))?;
+
+    Ok(socket)
+}
+
+pub(crate) fn accept(listener: &net::UnixListener) -> io::Result<(UnixStream, SocketAddr)> {
+    let mut sockaddr = unsafe { mem::zeroed::<libc::sockaddr_un>() };
+
+    let mut socklen = mem::size_of_val(&sockaddr) as libc::socklen_t;
+
+    #[cfg(not(any(
+        target_os = "aix",
+        target_os = "haiku",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "redox",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+        target_os = "espidf",
+        target_os = "vita",
+        target_os = "nto",
+        all(target_arch = "x86", target_os = "android"),
+    )))]
+    let socket = {
+        let flags = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+        syscall!(accept4(
+            listener.as_raw_fd(),
+            &mut sockaddr as *mut libc::sockaddr_un as *mut libc::sockaddr,
+            &mut socklen,
+            flags
+        ))
+        .map(|socket| unsafe { net::UnixStream::from_raw_fd(socket) })
+    };
+
+#[cfg(any(target_os = "aix", target_os = "redox", target_os = "tvos", target_os = "visionos", target_os = "watchos", target_os = "espidf", target_os = "vita", target_os = "nto"))]
+let socket = syscall!(accept(
+        listener.as_raw_fd(),
+        &mut sockaddr as *mut libc::sockaddr_un as *mut libc::sockaddr,
+        &mut socklen,
+    ))
+    .and_then(|socket| {
+        let s = unsafe { net::UnixStream::from_raw_fd(socket) };
+        #[cfg(not(any(target_os = "espidf", target_os = "vita")))]
+        syscall!(fcntl(socket, libc::F_SETFD, libc::FD_CLOEXEC))?;
+
+        #[cfg(any(
+            all(target_arch = "x86", target_os = "android"),
+            target_os = "espidf",
+            target_os = "vita",
+            target_os = "nto",
+        ))]
+        syscall!(fcntl(socket, libc::F_SETFL, libc::O_NONBLOCK))?;
+
+        Ok(s)
+    });
+
+    let socket = socket.map(UnixStream::from_std)?;
+
+    #[allow(unused_mut)] 
+    let mut path_len = socklen as usize - path_offset(&sockaddr);
+    if sockaddr.sun_path[0] == 0 {
+        path_len = 0;
+    }
+    let mut path =
+        unsafe { &*(&sockaddr.sun_path[..path_len] as *const [libc::c_char] as *const [u8]) };
+    if let Some(0) = path.last() {
+        path = &path[..path.len() - 1];
+    }
+    let address = SocketAddr::from_pathname(Path::new(OsStr::from_bytes(path)))?;
+    Ok((socket, address))
+}

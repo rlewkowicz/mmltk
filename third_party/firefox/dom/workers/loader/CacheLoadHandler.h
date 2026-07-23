@@ -1,0 +1,163 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_workers_CacheLoadHandler_h_
+#define mozilla_dom_workers_CacheLoadHandler_h_
+
+#include "mozilla/StaticPrefs_browser.h"
+#include "mozilla/dom/CacheBinding.h"
+#include "mozilla/dom/ChannelInfo.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/PromiseNativeHandler.h"
+#include "mozilla/dom/ScriptLoadHandler.h"
+#include "mozilla/dom/WorkerCommon.h"
+#include "mozilla/dom/WorkerRef.h"
+#include "mozilla/dom/cache/Cache.h"
+#include "mozilla/dom/cache/CacheStorage.h"
+#include "mozilla/dom/workerinternals/ScriptLoader.h"
+#include "nsIContentPolicy.h"
+#include "nsIInputStreamPump.h"
+#include "nsIStreamLoader.h"
+#include "nsStreamUtils.h"
+#include "nsStringFwd.h"
+
+using mozilla::dom::cache::Cache;
+using mozilla::dom::cache::CacheStorage;
+using mozilla::ipc::PrincipalInfo;
+
+namespace mozilla::dom {
+
+class WorkerLoadContext;
+
+namespace workerinternals::loader {
+
+
+class CacheLoadHandler final : public PromiseNativeHandler,
+                               public nsIStreamLoaderObserver {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSISTREAMLOADEROBSERVER
+
+  CacheLoadHandler(ThreadSafeWorkerRef* aWorkerRef,
+                   ThreadSafeRequestHandle* aRequestHandle,
+                   bool aIsWorkerScript,
+                   bool aOnlyExistingCachedResourcesAllowed,
+                   WorkerScriptLoader* aLoader);
+
+  void Fail(nsresult aRv);
+
+  void Load(Cache* aCache);
+
+  virtual void ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                                ErrorResult& aRv) override;
+
+  virtual void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                                ErrorResult& aRv) override;
+
+ private:
+  ~CacheLoadHandler() { AssertIsOnMainThread(); }
+
+  nsresult DataReceivedFromCache(
+      const uint8_t* aString, uint32_t aStringLen,
+      const mozilla::dom::ChannelInfo& aChannelInfo,
+      UniquePtr<PrincipalInfo> aPrincipalInfo,
+      const nsACString& aCSPHeaderValue,
+      const nsACString& aCSPReportOnlyHeaderValue,
+      const nsACString& aReferrerPolicyHeaderValue,
+      const nsACString& aReportingEndpointsHeaderValue);
+  nsresult DataReceived();
+
+  RefPtr<ThreadSafeRequestHandle> mRequestHandle;
+  const RefPtr<WorkerScriptLoader> mLoader;
+  RefPtr<ThreadSafeWorkerRef> mWorkerRef;
+  const bool mIsWorkerScript;
+  bool mFailed;
+  bool mOnlyExistingCachedResourcesAllowed;
+  nsCOMPtr<nsIInputStreamPump> mPump;
+  nsCOMPtr<nsIURI> mBaseURI;
+  mozilla::dom::ChannelInfo mChannelInfo;
+  UniquePtr<PrincipalInfo> mPrincipalInfo;
+  UniquePtr<ScriptDecoder> mDecoder;
+  nsCString mCSPHeaderValue;
+  nsCString mCSPReportOnlyHeaderValue;
+  nsCString mReferrerPolicyHeaderValue;
+  nsCString mReportingEndpointsHeaderValue;
+  nsCOMPtr<nsISerialEventTarget> mMainThreadEventTarget;
+};
+
+
+class CacheCreator final : public PromiseNativeHandler {
+ public:
+  NS_DECL_ISUPPORTS
+
+  explicit CacheCreator(WorkerPrivate* aWorkerPrivate);
+
+  void AddLoader(MovingNotNull<RefPtr<CacheLoadHandler>> aLoader) {
+    AssertIsOnMainThread();
+    MOZ_ASSERT(!mCacheStorage);
+    mLoaders.AppendElement(std::move(aLoader));
+  }
+
+  virtual void ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                                ErrorResult& aRv) override;
+
+  virtual void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                                ErrorResult& aRv) override;
+
+  nsresult Load(nsIPrincipal* aPrincipal);
+
+  Cache* Cache_() const {
+    AssertIsOnMainThread();
+    MOZ_ASSERT(mCache);
+    return mCache;
+  }
+
+  nsIGlobalObject* Global() const {
+    AssertIsOnMainThread();
+    MOZ_ASSERT(mSandboxGlobalObject);
+    return mSandboxGlobalObject;
+  }
+
+  void DeleteCache(nsresult aReason);
+
+ private:
+  ~CacheCreator() = default;
+
+  nsresult CreateCacheStorage(nsIPrincipal* aPrincipal);
+
+  void FailLoaders(nsresult aRv);
+
+  RefPtr<Cache> mCache;
+  RefPtr<CacheStorage> mCacheStorage;
+  nsCOMPtr<nsIGlobalObject> mSandboxGlobalObject;
+  nsTArray<NotNull<RefPtr<CacheLoadHandler>>> mLoaders;
+
+  nsString mCacheName;
+  OriginAttributes mOriginAttributes;
+};
+
+class CachePromiseHandler final : public PromiseNativeHandler {
+ public:
+  NS_DECL_ISUPPORTS
+
+  CachePromiseHandler(WorkerScriptLoader* aLoader,
+                      ThreadSafeRequestHandle* aRequestHandle);
+
+  virtual void ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                                ErrorResult& aRv) override;
+
+  virtual void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                                ErrorResult& aRv) override;
+
+ private:
+  ~CachePromiseHandler() { AssertIsOnMainThread(); }
+
+  RefPtr<WorkerScriptLoader> mLoader;
+  RefPtr<ThreadSafeRequestHandle> mRequestHandle;
+};
+
+}  
+}  
+
+#endif /* mozilla_dom_workers_CacheLoadHandler_h_ */

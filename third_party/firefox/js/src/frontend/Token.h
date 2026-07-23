@@ -1,0 +1,148 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef frontend_Token_h
+#define frontend_Token_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+
+#include <compare>   // std::strong_ordering
+#include <stdint.h>  // uint32_t
+
+#include "frontend/ParserAtom.h"  // TaggedParserAtomIndex, TrivialTaggedParserAtomIndex
+#include "frontend/TokenKind.h"  // js::frontend::TokenKind
+#include "js/RegExpFlags.h"      // JS::RegExpFlags
+
+namespace js {
+
+namespace frontend {
+
+struct TokenPos {
+  uint32_t begin = 0;  
+  uint32_t end = 0;    
+
+  TokenPos() = default;
+  TokenPos(uint32_t begin, uint32_t end) : begin(begin), end(end) {}
+
+  static TokenPos box(const TokenPos& left, const TokenPos& right) {
+    MOZ_ASSERT(left.begin <= left.end);
+    MOZ_ASSERT(left.end <= right.begin);
+    MOZ_ASSERT(right.begin <= right.end);
+    return TokenPos(left.begin, right.end);
+  }
+
+  constexpr bool operator==(const TokenPos& bpos) const = default;
+
+  constexpr auto operator<=>(const TokenPos& bpos) const {
+    return begin <=> bpos.begin;
+  }
+
+  bool encloses(const TokenPos& pos) const {
+    return begin <= pos.begin && pos.end <= end;
+  }
+};
+
+enum DecimalPoint { NoDecimal = false, HasDecimal = true };
+
+enum class IdentifierEscapes { None, SawUnicodeEscape };
+
+enum class NameVisibility { Public, Private };
+
+class TokenStreamShared;
+
+struct Token {
+ private:
+  enum Modifier {
+    SlashIsDiv,
+
+    SlashIsRegExp,
+
+    SlashIsInvalid,
+  };
+  friend class TokenStreamShared;
+
+ public:
+  TokenKind type;
+
+  TokenPos pos;
+
+  union U {
+   private:
+    friend struct Token;
+
+    TrivialTaggedParserAtomIndex atom;
+
+    struct {
+      double value;
+
+      DecimalPoint decimalPoint;
+    } number;
+
+    JS::RegExpFlags reflags;
+
+   public:
+    U() {};
+  } u;
+
+#ifdef DEBUG
+  Modifier modifier;
+#endif
+
+
+  void setName(TaggedParserAtomIndex name) {
+    MOZ_ASSERT(type == TokenKind::Name || type == TokenKind::PrivateName);
+    u.atom = TrivialTaggedParserAtomIndex::from(name);
+  }
+
+  void setAtom(TaggedParserAtomIndex atom) {
+    MOZ_ASSERT(type == TokenKind::String || type == TokenKind::TemplateHead ||
+               type == TokenKind::NoSubsTemplate);
+    u.atom = TrivialTaggedParserAtomIndex::from(atom);
+  }
+
+  void setRegExpFlags(JS::RegExpFlags flags) {
+    MOZ_ASSERT(type == TokenKind::RegExp);
+    u.reflags = flags;
+  }
+
+  void setNumber(double n, DecimalPoint decimalPoint) {
+    MOZ_ASSERT(type == TokenKind::Number);
+    u.number.value = n;
+    u.number.decimalPoint = decimalPoint;
+  }
+
+
+  TaggedParserAtomIndex name() const {
+    MOZ_ASSERT(type == TokenKind::Name || type == TokenKind::PrivateName);
+    return u.atom;
+  }
+
+  TaggedParserAtomIndex atom() const {
+    MOZ_ASSERT(type == TokenKind::String || type == TokenKind::TemplateHead ||
+               type == TokenKind::NoSubsTemplate);
+    return u.atom;
+  }
+
+  JS::RegExpFlags regExpFlags() const {
+    MOZ_ASSERT(type == TokenKind::RegExp);
+    return u.reflags;
+  }
+
+  double number() const {
+    MOZ_ASSERT(type == TokenKind::Number);
+    return u.number.value;
+  }
+
+  DecimalPoint decimalPoint() const {
+    MOZ_ASSERT(type == TokenKind::Number);
+    return u.number.decimalPoint;
+  }
+};
+
+}  
+
+}  
+
+#endif  // frontend_Token_h

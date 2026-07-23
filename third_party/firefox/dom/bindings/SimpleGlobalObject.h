@@ -1,0 +1,76 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_SimpleGlobalObject_h_
+#define mozilla_dom_SimpleGlobalObject_h_
+
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "nsContentUtils.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIGlobalObject.h"
+#include "nsISupportsImpl.h"
+#include "nsThreadUtils.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla::dom {
+
+class SimpleGlobalObject final : public nsIGlobalObject, public nsWrapperCache {
+ public:
+  enum class GlobalType {
+    BindingDetail,  
+    WorkerDebuggerSandbox,
+    NotSimpleGlobal  
+  };
+
+  static JSObject* Create(GlobalType globalType, JS::Handle<JS::Value> proto =
+                                                     JS::UndefinedHandleValue);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(SimpleGlobalObject)
+
+  GlobalType Type() const { return mType; }
+
+  static GlobalType SimpleGlobalType(JSObject* obj);
+
+  JSObject* GetGlobalJSObject() override { return GetWrapper(); }
+  JSObject* GetGlobalJSObjectPreserveColor() const override {
+    return GetWrapperPreserveColor();
+  }
+
+  OriginTrials Trials() const override { return {}; }
+
+  nsISerialEventTarget* SerialEventTarget() const final {
+    return NS_GetCurrentThread();
+  }
+  nsresult Dispatch(already_AddRefed<nsIRunnable> aRunnable) const final {
+    return NS_DispatchToCurrentThread(std::move(aRunnable));
+  }
+
+  JSObject* WrapObject(JSContext* cx,
+                       JS::Handle<JSObject*> aGivenProto) override {
+    MOZ_CRASH("SimpleGlobalObject doesn't use DOM bindings!");
+  }
+
+  bool ShouldResistFingerprinting(RFPTarget aTarget) const override {
+    return nsContentUtils::ShouldResistFingerprinting(
+        "Presently we don't have enough context to make an informed decision"
+        "on JS Sandboxes. See 1782853",
+        aTarget);
+  }
+
+ private:
+  SimpleGlobalObject(JSObject* global, GlobalType type) : mType(type) {
+    SetWrapper(global);
+  }
+
+  virtual ~SimpleGlobalObject() { MOZ_ASSERT(!GetWrapperMaybeDead()); }
+
+  const GlobalType mType;
+};
+
+}  
+
+#endif /* mozilla_dom_SimpleGlobalObject_h_ */

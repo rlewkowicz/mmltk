@@ -1,0 +1,50 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+browser.jar:
+%  content browser %content/browser/ contentaccessible=yes
+
+        content/browser/logos/etp-mobile.svg          (content/logos/etp-mobile.svg)
+        content/browser/logos/tracking-protection-dark-theme.svg (content/logos/tracking-protection-dark-theme.svg)
+        content/browser/logos/tracking-protection.svg (content/logos/tracking-protection.svg)
+        content/browser/blanktab.html                 (content/blanktab.html)
+        content/browser/browser.js                    (content/browser.js)
+*       content/browser/browser.xhtml                 (content/browser.xhtml)
+        content/browser/browser-commands.js           (content/browser-commands.js)
+        content/browser/browser-context.js            (content/browser-context.js)
+        content/browser/browser-customization.js      (content/browser-customization.js)
+        content/browser/browser-fullScreenAndPointerLock.js (content/browser-fullScreenAndPointerLock.js)
+        content/browser/browser-gestureSupport.js           (content/browser-gestureSupport.js)
+        content/browser/browser-init.js                     (content/browser-init.js)
+        content/browser/browser-main.js                     (content/browser-main.js)
+        content/browser/browser-menubar.js                  (content/browser-menubar.js)
+        content/browser/browser-pageActions.js              (content/browser-pageActions.js)
+        content/browser/browser-pagestyle.js                (content/browser-pagestyle.js)
+#if defined(MOZ_PLACES)
+#endif
+        content/browser/browser-sets.js                     (content/browser-sets.js)
+        content/browser/browser-siteIdentity.js             (content/browser-siteIdentity.js)
+        content/browser/browser-sitePermissionPanel.js      (content/browser-sitePermissionPanel.js)
+        content/browser/browser-siteProtections.js          (content/browser-siteProtections.js)
+        content/browser/browser-customtitlebar.js           (content/browser-customtitlebar.js)
+        content/browser/browser-toolbarKeyNav.js            (content/browser-toolbarKeyNav.js)
+        content/browser/browser-trustPanel.js               (content/browser-trustPanel.js)
+        content/browser/browser-graphics-utils.js           (content/browser-graphics-utils.js)
+        content/browser/global-scripts.js                   (content/global-scripts.js)
+        content/browser/main-popupset.js                    (content/main-popupset.js)
+        content/browser/pageinfo/pageInfo.xhtml             (content/pageinfo/pageInfo.xhtml)
+        content/browser/pageinfo/pageInfo.js                (content/pageinfo/pageInfo.js)
+        content/browser/pageinfo/pageInfo.css               (content/pageinfo/pageInfo.css)
+        content/browser/pageinfo/permissions.js             (content/pageinfo/permissions.js)
+        content/browser/pageinfo/security.js                (content/pageinfo/security.js)
+        content/browser/sanitize_v2.xhtml                   (content/sanitize_v2.xhtml)
+        content/browser/sanitizeDialog.js                   (content/sanitizeDialog.js)
+        content/browser/utilityOverlay.js                   (content/utilityOverlay.js)
+        content/browser/navigator-toolbox.js                (content/navigator-toolbox.js)
+        content/browser/nsContextMenu.sys.mjs               (content/nsContextMenu.sys.mjs)
+        content/browser/contentTheme.js                     (content/contentTheme.js)
+#if defined(MOZ_PLACES)
+#endif
+
+# L10n resources and overrides.
+% override chrome://global/locale/appstrings.properties chrome://browser/locale/appstrings.properties

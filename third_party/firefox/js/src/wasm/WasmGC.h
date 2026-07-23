@@ -1,0 +1,434 @@
+/*
+ * Copyright 2019 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_gc_h
+#define wasm_gc_h
+
+#include "jit/ABIArgGenerator.h"  // For ABIArgIter
+#include "js/AllocPolicy.h"
+#include "js/Vector.h"
+#include "util/Memory.h"
+#include "wasm/WasmBuiltins.h"
+#include "wasm/WasmFrame.h"
+#include "wasm/WasmSerialize.h"
+
+namespace js {
+
+namespace jit {
+class Label;
+class MacroAssembler;
+}  
+
+namespace wasm {
+
+class ArgTypeVector;
+class BytecodeOffset;
+
+
+using ExitStubMapVector = Vector<bool, 32, SystemAllocPolicy>;
+
+struct StackMapHeader {
+  explicit StackMapHeader(uint32_t numMappedWords = 0)
+      : numMappedWords(numMappedWords),
+#ifdef DEBUG
+        numExitStubWords(0),
+#endif
+        frameOffsetFromTop(0),
+        hasDebugFrameWithLiveRefs(0) {
+    MOZ_ASSERT(numMappedWords <= maxMappedWords);
+  }
+
+  static constexpr size_t MappedWordsBits = 18;
+  static_assert(((1 << MappedWordsBits) - 1) * sizeof(void*) >= MaxFrameSize);
+  uint32_t numMappedWords : MappedWordsBits;
+
+  static constexpr size_t ExitStubWordsBits = 6;
+#ifdef DEBUG
+  uint32_t numExitStubWords : ExitStubWordsBits;
+#endif
+
+  static constexpr size_t FrameOffsetBits = 12;
+  uint32_t frameOffsetFromTop : FrameOffsetBits;
+
+  uint32_t hasDebugFrameWithLiveRefs : 1;
+
+  WASM_CHECK_CACHEABLE_POD(numMappedWords,
+#ifdef DEBUG
+                           numExitStubWords,
+#endif
+                           frameOffsetFromTop, hasDebugFrameWithLiveRefs);
+
+  static constexpr uint32_t maxMappedWords = (1 << MappedWordsBits) - 1;
+  static constexpr uint32_t maxExitStubWords = (1 << ExitStubWordsBits) - 1;
+  static constexpr uint32_t maxFrameOffsetFromTop = (1 << FrameOffsetBits) - 1;
+
+  static constexpr size_t MaxParamSize =
+      std::max(sizeof(jit::FloatRegisters::RegisterContent),
+               sizeof(jit::Registers::RegisterContent));
+
+  static_assert(sizeof(FrameWithInstances) / sizeof(void*) <= 8);
+  static_assert(maxFrameOffsetFromTop >=
+                    (MaxParams * MaxParamSize / sizeof(void*)) + 16,
+                "limited size of the offset field");
+
+  bool operator==(const StackMapHeader& rhs) const {
+    return numMappedWords == rhs.numMappedWords &&
+#ifdef DEBUG
+           numExitStubWords == rhs.numExitStubWords &&
+#endif
+           frameOffsetFromTop == rhs.frameOffsetFromTop &&
+           hasDebugFrameWithLiveRefs == rhs.hasDebugFrameWithLiveRefs;
+  }
+  bool operator!=(const StackMapHeader& rhs) const { return !(*this == rhs); }
+};
+
+WASM_DECLARE_CACHEABLE_POD(StackMapHeader);
+
+#ifndef DEBUG
+static_assert(sizeof(StackMapHeader) == 4,
+              "wasm::StackMapHeader has unexpected size");
+#endif
+
+struct StackMap final {
+  friend class StackMaps;
+
+  StackMapHeader header;
+
+  enum Kind : uint32_t {
+    POD = 0,
+    AnyRef = 1,
+
+    StructDataPointer = 2,
+
+    ArrayDataPointer = 3,
+
+    Limit,
+  };
+
+ private:
+  uint32_t bitmap[1];
+
+  explicit StackMap(uint32_t numMappedWords) : header(numMappedWords) {
+    const uint32_t nBitmap = calcBitmapNumElems(header.numMappedWords);
+    memset(bitmap, 0, nBitmap * sizeof(bitmap[0]));
+  }
+
+ public:
+  static size_t allocationSizeInBytes(uint32_t numMappedWords) {
+    uint32_t nBitmap = calcBitmapNumElems(numMappedWords);
+    return sizeof(StackMap) + (nBitmap - 1) * sizeof(bitmap[0]);
+  }
+
+  size_t allocationSizeInBytes() const {
+    return allocationSizeInBytes(header.numMappedWords);
+  }
+
+  void setExitStubWords(uint32_t nWords) {
+    MOZ_RELEASE_ASSERT(nWords <= header.maxExitStubWords);
+#ifdef DEBUG
+    MOZ_ASSERT(header.numExitStubWords == 0);
+    MOZ_ASSERT(nWords <= header.numMappedWords);
+    header.numExitStubWords = nWords;
+#endif
+  }
+
+  void setFrameOffsetFromTop(uint32_t nWords) {
+    MOZ_ASSERT(header.frameOffsetFromTop == 0);
+    MOZ_RELEASE_ASSERT(nWords <= StackMapHeader::maxFrameOffsetFromTop);
+    MOZ_ASSERT(header.frameOffsetFromTop < header.numMappedWords);
+    header.frameOffsetFromTop = nWords;
+  }
+
+  void setHasDebugFrameWithLiveRefs() {
+    MOZ_ASSERT(header.hasDebugFrameWithLiveRefs == 0);
+    header.hasDebugFrameWithLiveRefs = 1;
+  }
+
+  inline void set(uint32_t index, Kind kind) {
+    MOZ_ASSERT(index < header.numMappedWords);
+    MOZ_ASSERT(kind < Kind::Limit);
+    MOZ_ASSERT(get(index) == (Kind)0);
+    uint32_t wordIndex = index / mappedWordsPerBitmapElem;
+    uint32_t wordOffset = index % mappedWordsPerBitmapElem * bitsPerMappedWord;
+    bitmap[wordIndex] |= (kind << wordOffset);
+  }
+
+  inline Kind get(uint32_t index) const {
+    MOZ_ASSERT(index < header.numMappedWords);
+    uint32_t wordIndex = index / mappedWordsPerBitmapElem;
+    uint32_t wordOffset = index % mappedWordsPerBitmapElem * bitsPerMappedWord;
+    Kind result = Kind((bitmap[wordIndex] >> wordOffset) & valueMask);
+    return result;
+  }
+
+  inline uint8_t* rawBitmap() { return (uint8_t*)&bitmap; }
+  inline const uint8_t* rawBitmap() const { return (const uint8_t*)&bitmap; }
+  inline size_t rawBitmapLengthInBytes() const {
+    return calcBitmapNumElems(header.numMappedWords) * sizeof(bitmap[0]);
+  }
+
+  inline uint32_t numMappedWords() const { return header.numMappedWords; }
+
+#ifdef JS_JITSPEW
+  void show(uint32_t codeOffset) const;
+#endif
+
+ private:
+  static constexpr uint32_t bitsPerMappedWord = 2;
+  static constexpr uint32_t mappedWordsPerBitmapElem =
+      sizeof(bitmap[0]) * CHAR_BIT / bitsPerMappedWord;
+  static constexpr uint32_t valueMask = js::BitMask(bitsPerMappedWord);
+  static_assert(8 % bitsPerMappedWord == 0);
+  static_assert(Kind::Limit - 1 <= valueMask);
+
+  static uint32_t calcBitmapNumElems(uint32_t numMappedWords) {
+    MOZ_RELEASE_ASSERT(numMappedWords <= StackMapHeader::maxMappedWords);
+    uint32_t nBitmap = js::HowMany(numMappedWords, mappedWordsPerBitmapElem);
+    return nBitmap == 0 ? 1 : nBitmap;
+  }
+
+ public:
+  bool operator==(const StackMap& rhs) const {
+    if (header != rhs.header) {
+      return false;
+    }
+    return memcmp(bitmap, rhs.bitmap, rawBitmapLengthInBytes()) == 0;
+  }
+};
+
+#ifndef DEBUG
+static_assert(sizeof(StackMap) == 8, "wasm::StackMap has unexpected size");
+#endif
+
+using StackMapHashMap =
+    HashMap<uint32_t, StackMap*, DefaultHasher<uint32_t>, SystemAllocPolicy>;
+
+class StackMaps {
+ private:
+  LifoAlloc stackMaps_;
+  StackMapHashMap codeOffsetToStackMap_;
+
+  StackMap* lastAdded_ = nullptr;
+  LifoAlloc::Mark beforeLastCreated_;
+#ifdef DEBUG
+  StackMap* createdButNotFinalized_ = nullptr;
+#endif
+
+ public:
+  StackMaps() : stackMaps_(4096, js::BackgroundMallocArena) {}
+
+  [[nodiscard]] StackMap* create(uint32_t numMappedWords) {
+    MOZ_ASSERT(!createdButNotFinalized_,
+               "a previous StackMap has been created but not finalized");
+
+    beforeLastCreated_ = stackMaps_.mark();
+    void* mem =
+        stackMaps_.alloc(StackMap::allocationSizeInBytes(numMappedWords));
+    if (!mem) {
+      return nullptr;
+    }
+    StackMap* newMap = new (mem) StackMap(numMappedWords);
+#ifdef DEBUG
+    createdButNotFinalized_ = newMap;
+#endif
+    return newMap;
+  }
+
+  [[nodiscard]] StackMap* create(const StackMapHeader& header) {
+    StackMap* map = create(header.numMappedWords);
+    if (!map) {
+      return nullptr;
+    }
+    map->header = header;
+    return map;
+  }
+
+  [[nodiscard]] StackMap* finalize(StackMap* map) {
+#ifdef DEBUG
+    MOZ_ASSERT(
+        map == createdButNotFinalized_,
+        "the provided stack map was not from the most recent call to create()");
+    createdButNotFinalized_ = nullptr;
+#endif
+
+    if (lastAdded_ && *map == *lastAdded_) {
+      stackMaps_.release(beforeLastCreated_);
+      return lastAdded_;
+    }
+
+    lastAdded_ = map;
+    stackMaps_.cancelMark(beforeLastCreated_);
+    return map;
+  }
+
+  [[nodiscard]] bool add(uint32_t codeOffset, StackMap* map) {
+#ifdef JS_JITSPEW
+    if (JitSpewEnabled(jit::JitSpew_Codegen)) {
+      map->show(codeOffset);
+    }
+#endif
+    MOZ_ASSERT(!createdButNotFinalized_);
+    MOZ_ASSERT(stackMaps_.contains(map));
+    return codeOffsetToStackMap_.put(codeOffset, map);
+  }
+
+  [[nodiscard]] bool finalize(uint32_t codeOffset, StackMap* map) {
+    return add(codeOffset, finalize(map));
+  }
+
+  void clear() {
+    MOZ_ASSERT(!createdButNotFinalized_);
+    codeOffsetToStackMap_.clear();
+    stackMaps_.freeAll();
+    lastAdded_ = nullptr;
+  }
+  bool empty() const { return length() == 0; }
+  size_t length() const { return codeOffsetToStackMap_.count(); }
+
+  [[nodiscard]] bool appendAll(StackMaps& other, uint32_t offsetInModule) {
+    MOZ_ASSERT(!other.createdButNotFinalized_);
+
+    if (!codeOffsetToStackMap_.reserve(codeOffsetToStackMap_.count() +
+                                       other.codeOffsetToStackMap_.count())) {
+      return false;
+    }
+
+    stackMaps_.transferFrom(&other.stackMaps_);
+
+    for (auto iter = other.codeOffsetToStackMap_.modIter(); !iter.done();
+         iter.next()) {
+      uint32_t newOffset = iter.get().key() + offsetInModule;
+      StackMap* stackMap = iter.get().value();
+      codeOffsetToStackMap_.putNewInfallible(newOffset, stackMap);
+    }
+
+    other.clear();
+    return true;
+  }
+
+  const StackMap* lookup(uint32_t codeOffset) const {
+    auto ptr = codeOffsetToStackMap_.readonlyThreadsafeLookup(codeOffset);
+    if (!ptr) {
+      return nullptr;
+    }
+
+    return ptr->value();
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return codeOffsetToStackMap_.shallowSizeOfExcludingThis(mallocSizeOf) +
+           stackMaps_.sizeOfExcludingThis(mallocSizeOf);
+  }
+
+  void checkInvariants(const uint8_t* base) const;
+
+  WASM_DECLARE_FRIEND_SERIALIZE(StackMaps);
+};
+
+
+template <class T>
+static inline size_t StackArgAreaSizeUnaligned(const T& argTypes,
+                                               jit::ABIKind kind) {
+  jit::ABIArgIter<const T> i(argTypes, kind);
+  while (!i.done()) {
+    i++;
+  }
+  return i.stackBytesConsumedSoFar();
+}
+
+static inline size_t StackArgAreaSizeUnaligned(
+    const SymbolicAddressSignature& saSig, jit::ABIKind kind) {
+  class MOZ_STACK_CLASS ItemsAndLength {
+    const jit::MIRType* items_;
+    size_t length_;
+
+   public:
+    ItemsAndLength(const jit::MIRType* items, size_t length)
+        : items_(items), length_(length) {}
+    size_t length() const { return length_; }
+    jit::MIRType operator[](size_t i) const { return items_[i]; }
+  };
+
+  MOZ_ASSERT(saSig.numArgs <
+             sizeof(saSig.argTypes) / sizeof(saSig.argTypes[0]));
+  MOZ_ASSERT(saSig.argTypes[saSig.numArgs] ==
+             jit::MIRType::None );
+
+  ItemsAndLength itemsAndLength(saSig.argTypes, saSig.numArgs);
+  return StackArgAreaSizeUnaligned(itemsAndLength, kind);
+}
+
+static inline size_t AlignStackArgAreaSize(size_t unalignedSize) {
+  return AlignBytes(unalignedSize, jit::WasmStackAlignment);
+}
+
+[[nodiscard]] bool CreateStackMapForFunctionEntryTrap(
+    const ArgTypeVector& argTypes, const jit::RegisterOffsets& trapExitLayout,
+    size_t trapExitLayoutWords, size_t nBytesReservedBeforeTrap,
+    size_t nInboundStackArgBytes, wasm::StackMaps& stackMaps,
+    wasm::StackMap** result);
+
+// (code generated by) GenerateTrapExit().  This function writes into |args| a
+[[nodiscard]] bool GenerateStackmapEntriesForTrapExit(
+    const ArgTypeVector& args, const jit::RegisterOffsets& trapExitLayout,
+    const size_t trapExitLayoutNumWords, ExitStubMapVector* extras);
+
+
+template <class Addr>
+void EmitWasmPreBarrierGuard(jit::MacroAssembler& masm, jit::Register instance,
+                             jit::Register scratch, Addr addr,
+                             jit::Label* skipBarrier,
+                             MaybeTrapSiteDesc trapSiteDesc);
+
+void EmitWasmPreBarrierCallImmediate(jit::MacroAssembler& masm,
+                                     jit::Register instance,
+                                     jit::Register scratch,
+                                     jit::Register valueAddr,
+                                     size_t valueOffset);
+void EmitWasmPreBarrierCallIndex(jit::MacroAssembler& masm,
+                                 jit::Register instance, jit::Register scratch1,
+                                 jit::Register scratch2, jit::BaseIndex addr);
+
+#ifdef ENABLE_WASM_JSPI
+
+void EmitWasmResumeBarrierGuard(jit::MacroAssembler& masm,
+                                jit::Register instance, jit::Register scratch,
+                                jit::Label* enterBarrier);
+
+void EmitWasmResumeBarrier(jit::MacroAssembler& masm, jit::Register instance,
+                           jit::Register cont);
+
+#endif  // ENABLE_WASM_JSPI
+
+void EmitWasmPostBarrierGuard(jit::MacroAssembler& masm,
+                              const mozilla::Maybe<jit::Register>& object,
+                              jit::Register otherScratch,
+                              jit::Register setValue, jit::Label* skipBarrier);
+
+void CheckWholeCellLastElementCache(jit::MacroAssembler& masm,
+                                    jit::Register instance,
+                                    jit::Register object, jit::Register temp,
+                                    jit::Label* skipBarrier);
+
+#ifdef DEBUG
+
+bool IsPlausibleStackMapKey(const uint8_t* nextPC);
+#endif
+
+}  
+}  
+
+#endif  // wasm_gc_h

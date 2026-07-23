@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_AUDIO_RING_BUFFER_H_
+#define MOZILLA_AUDIO_RING_BUFFER_H_
+
+#include <functional>
+
+#include "AudioSampleFormat.h"
+#include "mozilla/Span.h"
+
+namespace mozilla {
+
+class AudioRingBuffer final {
+ public:
+  explicit AudioRingBuffer(uint32_t aSizeInBytes);
+  ~AudioRingBuffer();
+
+  void SetSampleFormat(AudioSampleFormat aFormat);
+
+  uint32_t Write(const Span<const float>& aBuffer);
+
+  uint32_t Write(const Span<const int16_t>& aBuffer);
+
+  uint32_t Write(const AudioRingBuffer& aBuffer, uint32_t aSamples);
+
+  uint32_t PrependSilence(uint32_t aSamples);
+
+  uint32_t WriteSilence(uint32_t aSamples);
+
+  uint32_t Read(const Span<float>& aBuffer);
+
+  uint32_t Read(const Span<int16_t>& aBuffer);
+
+  uint32_t ReadNoCopy(
+      std::function<uint32_t(const Span<const float>&)>&& aCallable);
+
+  uint32_t ReadNoCopy(
+      std::function<uint32_t(const Span<const int16_t>&)>&& aCallable);
+
+  uint32_t Discard(uint32_t aSamples);
+
+  uint32_t Clear();
+
+  bool EnsureLengthBytes(uint32_t aLengthBytes);
+
+  uint32_t Capacity() const;
+
+  bool IsFull() const;
+
+  bool IsEmpty() const;
+
+  uint32_t AvailableWrite() const;
+
+  uint32_t AvailableRead() const;
+
+ private:
+  class AudioRingBufferPrivate;
+  UniquePtr<AudioRingBufferPrivate> mPtr;
+};
+
+}  
+
+#endif  // MOZILLA_AUDIO_RING_BUFFER_H_

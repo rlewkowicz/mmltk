@@ -1,0 +1,309 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include "TextDirectiveFinder.h"
+
+#include "Document.h"
+#include "TextDirectiveUtil.h"
+#include "fragmentdirectives_ffi_generated.h"
+#include "mozilla/CycleCollectedUniquePtr.h"
+#include "mozilla/ToString.h"
+#include "nsFind.h"
+#include "nsRange.h"
+
+namespace mozilla::dom {
+
+TextDirectiveFinder::TextDirectiveFinder(
+    Document* aDocument, nsTArray<TextDirective>&& aTextDirectives)
+    : mDocument(WrapNotNull(aDocument)),
+      mUninvokedTextDirectives(std::move(aTextDirectives)) {}
+
+TextDirectiveFinder::~TextDirectiveFinder() {
+  if (mFoundDirectiveCount) {
+
+
+    TEXT_FRAGMENT_LOG("Found {} directives in {}ms", mFoundDirectiveCount,
+                      mFindTextDirectivesDuration.ToMilliseconds());
+  }
+}
+
+void TextDirectiveFinder::Traverse(
+    nsCycleCollectionTraversalCallback& aCallback) {
+  CycleCollectionNoteChild(aCallback, mDocument.get().get(),
+                           "TextDirectiveFinder::mDocument", aCallback.Flags());
+}
+
+bool TextDirectiveFinder::HasUninvokedDirectives() const {
+  return !mUninvokedTextDirectives.IsEmpty();
+}
+
+nsTArray<RefPtr<nsRange>> TextDirectiveFinder::FindTextDirectivesInDocument() {
+  if (mUninvokedTextDirectives.IsEmpty()) {
+    return {};
+  }
+
+  const TimeStamp start = TimeStamp::Now();
+
+  auto uri = TextDirectiveUtil::ShouldLog() && mDocument->GetDocumentURI()
+                 ? mDocument->GetDocumentURI()->GetSpecOrDefault()
+                 : nsCString();
+  TEXT_FRAGMENT_LOG("Trying to find text directives in document '{}'.", uri);
+  nsTArray<RefPtr<nsRange>> textDirectiveRanges(
+      mUninvokedTextDirectives.Length());
+
+  nsTArray<TextDirective> uninvokedTextDirectives(
+      mUninvokedTextDirectives.Length());
+
+  for (TextDirective& textDirective : mUninvokedTextDirectives) {
+    if (RefPtr<nsRange> range = FindRangeForTextDirective(textDirective)) {
+      textDirectiveRanges.AppendElement(range);
+      TEXT_FRAGMENT_LOG("Found text directive '{}'",
+                        ToString(textDirective).c_str());
+      if (RefPtr startNode = range->GetStartContainer()) {
+        startNode->QueueAncestorRevealingAlgorithm();
+      }
+    } else {
+      uninvokedTextDirectives.AppendElement(std::move(textDirective));
+    }
+  }
+  if (TextDirectiveUtil::ShouldLog()) {
+    if (uninvokedTextDirectives.Length() == mUninvokedTextDirectives.Length()) {
+      TEXT_FRAGMENT_LOG("Did not find any of the {} uninvoked text directives.",
+                        mUninvokedTextDirectives.Length());
+    } else {
+      TEXT_FRAGMENT_LOG(
+          "Found {} of {} text directives in the document.",
+          mUninvokedTextDirectives.Length() - uninvokedTextDirectives.Length(),
+          mUninvokedTextDirectives.Length());
+    }
+    if (uninvokedTextDirectives.IsEmpty()) {
+      TEXT_FRAGMENT_LOG("No uninvoked text directives left.");
+    } else {
+      TEXT_FRAGMENT_LOG("There are {} uninvoked text directives left:",
+                        uninvokedTextDirectives.Length());
+      for (size_t index = 0; index < uninvokedTextDirectives.Length();
+           ++index) {
+        TEXT_FRAGMENT_LOG(" [{}]: {}", index,
+                          ToString(uninvokedTextDirectives[index]).c_str());
+      }
+    }
+  }
+  mUninvokedTextDirectives = std::move(uninvokedTextDirectives);
+
+  mFindTextDirectivesDuration += TimeStamp::Now() - start;
+  mFoundDirectiveCount += static_cast<int64_t>(textDirectiveRanges.Length());
+
+  return textDirectiveRanges;
+}
+
+RefPtr<nsRange> TextDirectiveFinder::FindRangeForTextDirective(
+    const TextDirective& aTextDirective) {
+  TEXT_FRAGMENT_LOG("Find range for text directive '{}'.",
+                    ToString(aTextDirective).c_str());
+  ErrorResult rv;
+  RefPtr<nsRange> searchRange =
+      nsRange::Create(mDocument, 0, mDocument, mDocument->Length(), rv);
+  if (rv.Failed()) {
+    return nullptr;
+  }
+
+  nsContentUtils::NodeIndexCache nodeIndexCache;
+  RefPtr<nsFind> finder = new nsFind();
+  finder->SetNodeIndexCache(&nodeIndexCache);
+
+  while (!searchRange->Collapsed()) {
+    RefPtr<nsRange> potentialMatch;
+    if (!aTextDirective.prefix.IsEmpty()) {
+      RefPtr<nsRange> prefixMatch = TextDirectiveUtil::FindStringInRange(
+          finder, searchRange->StartRef(), searchRange->EndRef(),
+          aTextDirective.prefix, true, false);
+      if (!prefixMatch) {
+        TEXT_FRAGMENT_LOG(
+            "Did not find prefix '{}'. The text directive does not exist "
+            "in the document.",
+            NS_ConvertUTF16toUTF8(aTextDirective.prefix));
+        return nullptr;
+      }
+      TEXT_FRAGMENT_LOG("Did find prefix '{}'.",
+                        NS_ConvertUTF16toUTF8(aTextDirective.prefix));
+
+      MOZ_DIAGNOSTIC_ASSERT(prefixMatch->GetStartContainer()->IsText());
+      const RangeBoundary boundaryPoint =
+          TextDirectiveUtil::MoveToNextBoundaryPoint(prefixMatch->StartRef());
+      if (!boundaryPoint.IsSetAndValid()) {
+        return nullptr;
+      }
+      searchRange->SetStart(boundaryPoint.AsRaw(), rv);
+      if (rv.Failed()) {
+        return nullptr;
+      }
+
+      RefPtr<nsRange> matchRange = nsRange::Create(
+          prefixMatch->GetEndContainer(), prefixMatch->EndOffset(),
+          searchRange->GetEndContainer(), searchRange->EndOffset(), rv);
+      if (rv.Failed()) {
+        return nullptr;
+      }
+      const bool thereIsMoreNonWhitespaceText =
+          TextDirectiveUtil::AdvanceStartToNextNonWhitespacePosition(
+              *matchRange);
+      if (!thereIsMoreNonWhitespaceText) {
+        return nullptr;
+      }
+      MOZ_ASSERT(matchRange->GetStartContainer()->IsText());
+      auto nextBlockBoundary =
+          TextDirectiveUtil::FindNextBlockBoundary<TextScanDirection::Right>(
+              matchRange->StartRef());
+
+      matchRange->SetEnd(nextBlockBoundary.AsRaw(), IgnoreErrors());
+
+      const bool mustEndAtWordBoundary =
+          !aTextDirective.end.IsEmpty() || aTextDirective.suffix.IsEmpty();
+      potentialMatch = TextDirectiveUtil::FindStringInRange(
+          finder, matchRange->StartRef(), matchRange->EndRef(),
+          aTextDirective.start, false, mustEndAtWordBoundary);
+      if (!potentialMatch) {
+        TEXT_FRAGMENT_LOG(
+            "Did not find start '{}' in the sub range of the end of `prefix` "
+            "and the next block boundary. Restarting outer loop.",
+            NS_ConvertUTF16toUTF8(aTextDirective.start));
+        continue;
+      }
+      if (potentialMatch->StartRef() != matchRange->StartRef()) {
+        TEXT_FRAGMENT_LOG(
+            "The prefix is not directly followed by the start element. "
+            "Restarting outer loop.");
+        continue;
+      }
+      TEXT_FRAGMENT_LOG("Did find start '{}'.",
+                        NS_ConvertUTF16toUTF8(aTextDirective.start));
+    }
+    else {
+      const bool mustEndAtWordBoundary =
+          !aTextDirective.end.IsEmpty() || aTextDirective.suffix.IsEmpty();
+      potentialMatch = TextDirectiveUtil::FindStringInRange(
+          finder, searchRange->StartRef(), searchRange->EndRef(),
+          aTextDirective.start, true, mustEndAtWordBoundary);
+      if (!potentialMatch) {
+        TEXT_FRAGMENT_LOG(
+            "Did not find start '{}'. The text directive does not exist "
+            "in the document.",
+            NS_ConvertUTF16toUTF8(aTextDirective.start));
+        return nullptr;
+      }
+      if (potentialMatch && aTextDirective.end.IsEmpty() &&
+          aTextDirective.suffix.IsEmpty()) {
+        return potentialMatch;
+      }
+      MOZ_DIAGNOSTIC_ASSERT(potentialMatch->GetStartContainer()->IsText());
+      const RangeBoundary newRangeBoundary =
+          TextDirectiveUtil::MoveToNextBoundaryPoint(
+              potentialMatch->StartRef());
+
+      if (!newRangeBoundary.IsSetAndValid()) {
+        return nullptr;
+      }
+      searchRange->SetStart(newRangeBoundary.AsRaw(), rv);
+      if (rv.Failed()) {
+        return nullptr;
+      }
+    }
+    RefPtr<nsRange> rangeEndSearchRange = nsRange::Create(
+        potentialMatch->GetEndContainer(), potentialMatch->EndOffset(),
+        searchRange->GetEndContainer(), searchRange->EndOffset(), rv);
+    if (rv.Failed()) {
+      return nullptr;
+    }
+    while (!rangeEndSearchRange->Collapsed()) {
+      if (!aTextDirective.end.IsEmpty()) {
+        const bool mustEndAtWordBoundary = aTextDirective.suffix.IsEmpty();
+        RefPtr<nsRange> endMatch = TextDirectiveUtil::FindStringInRange(
+            finder, rangeEndSearchRange->StartRef(),
+            rangeEndSearchRange->EndRef(), aTextDirective.end, true,
+            mustEndAtWordBoundary);
+        if (!endMatch) {
+          TEXT_FRAGMENT_LOG(
+              "Did not find end '{}'. The text directive does not exist "
+              "in the document.",
+              NS_ConvertUTF16toUTF8(aTextDirective.end));
+          return nullptr;
+        }
+        potentialMatch->SetEnd(endMatch->GetEndContainer(),
+                               endMatch->EndOffset());
+      }
+      MOZ_ASSERT(potentialMatch && !potentialMatch->Collapsed());
+
+      if (aTextDirective.suffix.IsEmpty()) {
+        TEXT_FRAGMENT_LOG("Did find a match.");
+        return potentialMatch;
+      }
+      RefPtr<nsRange> suffixRange = nsRange::Create(
+          potentialMatch->GetEndContainer(), potentialMatch->EndOffset(),
+          searchRange->GetEndContainer(), searchRange->EndOffset(), rv);
+      if (rv.Failed()) {
+        return nullptr;
+      }
+      const bool thereIsMoreNonWhitespaceText =
+          TextDirectiveUtil::AdvanceStartToNextNonWhitespacePosition(
+              *suffixRange);
+      if (!thereIsMoreNonWhitespaceText) {
+        break;
+      }
+      auto nextBlockBoundary =
+          TextDirectiveUtil::FindNextBlockBoundary<TextScanDirection::Right>(
+              suffixRange->StartRef());
+      suffixRange->SetEnd(nextBlockBoundary.AsRaw(), IgnoreErrors());
+
+      RefPtr<nsRange> suffixMatch = TextDirectiveUtil::FindStringInRange(
+          finder, suffixRange->StartRef(), suffixRange->EndRef(),
+          aTextDirective.suffix, false, true);
+      rangeEndSearchRange->SetStart(potentialMatch->GetEndContainer(),
+                                    potentialMatch->EndOffset());
+      if (!suffixMatch) {
+        if (aTextDirective.end.IsEmpty()) {
+          TEXT_FRAGMENT_LOG(
+              "Did not find suffix in the sub range of the end of `start` and "
+              "the next block boundary. Restarting outer loop.");
+          break;
+        }
+        TEXT_FRAGMENT_LOG(
+            "Did not find suffix in the sub range of the end of `end` and the "
+            "next block boundary. Discarding this `end` candidate and "
+            "continuing inner loop.");
+        continue;
+      }
+      if (suffixMatch->GetStartContainer() ==
+              suffixRange->GetStartContainer() &&
+          suffixMatch->StartOffset() == suffixRange->StartOffset()) {
+        TEXT_FRAGMENT_LOG("Did find a match.");
+        return potentialMatch;
+      }
+      if (aTextDirective.end.IsEmpty()) {
+        TEXT_FRAGMENT_LOG(
+            "Did find suffix in the sub range of end of `start` to the end of "
+            "the next block boundary, but not at the start. Restarting outer "
+            "loop.");
+        break;
+      }
+      TEXT_FRAGMENT_LOG(
+          "Did find `suffix` in the sub range of end of `end` to the end of "
+          "the current block, but not at the start. Restarting inner loop.");
+    }
+    if (rangeEndSearchRange->Collapsed()) {
+      if (aTextDirective.end.IsEmpty() && aTextDirective.suffix.IsEmpty()) {
+        TEXT_FRAGMENT_LOG(
+            "rangeEndSearchRange was collapsed, no end or suffix "
+            "present. Returning a match");
+        return potentialMatch;
+      }
+      TEXT_FRAGMENT_LOG(
+          "rangeEndSearchRange was collapsed, there is an end or "
+          "suffix. There can't be a match.");
+      return nullptr;
+    }
+  }
+  TEXT_FRAGMENT_LOG("Did not find a match.");
+  return nullptr;
+}
+
+}  

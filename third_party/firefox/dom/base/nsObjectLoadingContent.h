@@ -1,0 +1,217 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef NSOBJECTLOADINGCONTENT_H_
+#define NSOBJECTLOADINGCONTENT_H_
+
+#include "mozilla/Maybe.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "nsFrameLoaderOwner.h"
+#include "nsIChannelEventSink.h"
+#include "nsIFrame.h"  // for WeakFrame only
+#include "nsIObjectLoadingContent.h"
+#include "nsIStreamListener.h"
+
+class nsStopPluginRunnable;
+class nsIPrincipal;
+class nsFrameLoader;
+
+namespace mozilla::dom {
+struct BindContext;
+class FeaturePolicy;
+template <typename T>
+class Sequence;
+class HTMLIFrameElement;
+template <typename T>
+struct Nullable;
+class WindowProxyHolder;
+class XULFrameElement;
+}  
+
+class nsObjectLoadingContent : public nsIStreamListener,
+                               public nsFrameLoaderOwner,
+                               public nsIObjectLoadingContent,
+                               public nsIChannelEventSink {
+  friend class AutoSetLoadingToFalse;
+
+ public:
+  enum class ObjectType : uint8_t {
+    Loading = TYPE_LOADING,
+    Document = TYPE_DOCUMENT,
+    Fallback = TYPE_FALLBACK
+  };
+
+  nsObjectLoadingContent();
+  virtual ~nsObjectLoadingContent();
+
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSIOBJECTLOADINGCONTENT
+  NS_DECL_NSICHANNELEVENTSINK
+
+  ObjectType Type() const { return mType; }
+
+  void SetIsNetworkCreated(bool aNetworkCreated) {
+    mNetworkCreated = aNetworkCreated;
+  }
+
+  static bool IsSuccessfulRequest(nsIRequest*, nsresult* aStatus);
+
+  mozilla::dom::Document* GetContentDocument(nsIPrincipal& aSubjectPrincipal);
+  void GetActualType(nsAString& aType) const {
+    CopyUTF8toUTF16(mContentType, aType);
+  }
+  uint32_t DisplayedType() const { return uint32_t(mType); }
+  nsIURI* GetSrcURI() const { return mURI; }
+
+  void SwapFrameLoaders(mozilla::dom::HTMLIFrameElement& aOtherLoaderOwner,
+                        mozilla::ErrorResult& aRv) {
+    aRv.Throw(NS_ERROR_NOT_IMPLEMENTED);
+  }
+  void SwapFrameLoaders(mozilla::dom::XULFrameElement& aOtherLoaderOwner,
+                        mozilla::ErrorResult& aRv) {
+    aRv.Throw(NS_ERROR_NOT_IMPLEMENTED);
+  }
+
+  bool IsRewrittenYoutubeEmbed() const { return mRewrittenYoutubeEmbed; }
+
+  bool IsSyntheticImageDocument() const;
+
+  const mozilla::Maybe<mozilla::IntrinsicSize>& GetSubdocumentIntrinsicSize()
+      const {
+    return mSubdocumentIntrinsicSize;
+  }
+
+  const mozilla::Maybe<mozilla::AspectRatio>& GetSubdocumentIntrinsicRatio()
+      const {
+    return mSubdocumentIntrinsicRatio;
+  }
+
+  void SubdocumentIntrinsicSizeOrRatioChanged(
+      const mozilla::Maybe<mozilla::IntrinsicSize>& aIntrinsicSize,
+      const mozilla::Maybe<mozilla::AspectRatio>& aIntrinsicRatio);
+
+  void SubdocumentImageLoadComplete(nsresult aResult);
+
+ protected:
+  nsresult LoadObject(bool aNotify, bool aForceLoad = false);
+
+  enum Capabilities {
+    eSupportImages = 1u << 0,     
+    eSupportDocuments = 1u << 1,  
+
+    eFallbackIfClassIDPresent = 1u << 2,
+
+    eAllowPluginSkipChannel = 1u << 3
+  };
+
+  virtual uint32_t GetCapabilities() const;
+
+  void Destroy();
+
+  static void Traverse(nsObjectLoadingContent* tmp,
+                       nsCycleCollectionTraversalCallback& cb);
+  static void Unlink(nsObjectLoadingContent* tmp);
+
+  void UnbindFromTree();
+
+  virtual nsContentPolicyType GetContentPolicyType() const = 0;
+
+  virtual const mozilla::dom::Element* AsElement() const = 0;
+  mozilla::dom::Element* AsElement() {
+    return const_cast<mozilla::dom::Element*>(
+        const_cast<const nsObjectLoadingContent*>(this)->AsElement());
+  }
+
+  bool BlockEmbedOrObjectContentLoading();
+
+  void RefreshFeaturePolicy();
+
+ private:
+  enum ParameterUpdateFlags {
+    eParamNoChange = 0,
+    eParamChannelChanged = 1u << 0,
+    eParamStateChanged = 1u << 1,
+    eParamContentTypeChanged = 1u << 2
+  };
+
+  void TriggerInnerFallbackLoads();
+
+  nsresult LoadObject(bool aNotify, bool aForceLoad,
+                      nsIRequest* aLoadingChannel);
+
+  ParameterUpdateFlags UpdateObjectParameters();
+
+ public:
+  bool IsAboutBlankLoadOntoInitialAboutBlank(nsIURI* aURI,
+                                             bool aInheritPrincipal,
+                                             nsIPrincipal* aPrincipalToInherit);
+
+ private:
+  nsresult OpenChannel();
+
+  nsresult CloseChannel();
+
+  bool PreferFallback(bool aIsPluginClickToPlay);
+
+  bool CheckLoadPolicy(int16_t* aContentPolicy);
+
+  bool CheckProcessPolicy(int16_t* aContentPolicy);
+
+  void SetupFrameLoader();
+
+  already_AddRefed<nsIDocShell> SetupDocShell(nsIURI* aRecursionCheckURI);
+
+  void UnloadObject(bool aResetState = true);
+
+  void NotifyStateChanged(ObjectType aOldType, bool aNotify);
+
+  ObjectType GetTypeOfContent(const nsCString& aMIMEType);
+
+  void MaybeRewriteYoutubeEmbed(nsIURI* aURI, nsIURI* aBaseURI,
+                                nsIURI** aRewrittenURI);
+
+  void MaybeFireErrorEvent();
+
+  void MaybeStoreCrossOriginFeaturePolicy();
+
+  static already_AddRefed<nsIPrincipal> GetFeaturePolicyDefaultOrigin(
+      nsINode* aNode);
+
+  nsCOMPtr<nsIStreamListener> mFinalListener;
+
+  nsCString mContentType;
+
+  nsCString mOriginalContentType;
+
+  nsCOMPtr<nsIChannel> mChannel;
+
+  nsCOMPtr<nsIURI> mURI;
+
+  nsCOMPtr<nsIURI> mOriginalURI;
+
+  nsCOMPtr<nsIURI> mBaseURI;
+
+  ObjectType mType;
+
+  bool mChannelLoaded : 1;
+
+  bool mNetworkCreated : 1;
+
+  bool mIsStopping : 1;
+
+  bool mIsLoading : 1;
+
+  bool mScriptRequested : 1;
+
+  bool mRewrittenYoutubeEmbed : 1;
+
+  mozilla::Maybe<mozilla::IntrinsicSize> mSubdocumentIntrinsicSize;
+  mozilla::Maybe<mozilla::AspectRatio> mSubdocumentIntrinsicRatio;
+
+  RefPtr<mozilla::dom::FeaturePolicy> mFeaturePolicy;
+};
+
+#endif

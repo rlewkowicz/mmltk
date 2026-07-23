@@ -1,0 +1,214 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+*
+*   Copyright (C) 1999-2014, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+*******************************************************************************
+*   file name:  unistr_case.cpp
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:2
+*
+*   created on: 2004aug19
+*   created by: Markus W. Scherer
+*
+*   Case-mapping functions moved here from unistr.cpp
+*/
+
+#include "unicode/utypes.h"
+#include "unicode/brkiter.h"
+#include "unicode/casemap.h"
+#include "unicode/edits.h"
+#include "unicode/putil.h"
+#include "cstring.h"
+#include "cmemory.h"
+#include "unicode/ustring.h"
+#include "unicode/unistr.h"
+#include "unicode/uchar.h"
+#include "uassert.h"
+#include "ucasemap_imp.h"
+#include "uelement.h"
+
+U_NAMESPACE_BEGIN
+
+
+int8_t
+UnicodeString::doCaseCompare(int32_t start,
+                             int32_t length,
+                             const char16_t *srcChars,
+                             int32_t srcStart,
+                             int32_t srcLength,
+                             uint32_t options) const
+{
+  if(isBogus()) {
+    return -1;
+  }
+
+  pinIndices(start, length);
+
+  if(srcChars == nullptr) {
+    srcStart = srcLength = 0;
+  }
+
+  const char16_t *chars = getArrayStart();
+
+  chars += start;
+  if(srcStart!=0) {
+    srcChars += srcStart;
+  }
+
+  if(chars != srcChars) {
+    UErrorCode errorCode=U_ZERO_ERROR;
+    int32_t result=u_strcmpFold(chars, length, srcChars, srcLength,
+                                options|U_COMPARE_IGNORE_CASE, &errorCode);
+    if(result!=0) {
+      return static_cast<int8_t>(result >> 24 | 1);
+    }
+  } else {
+    if(srcLength < 0) {
+      srcLength = u_strlen(srcChars + srcStart);
+    }
+    if(length != srcLength) {
+      return static_cast<int8_t>((length - srcLength) >> 24 | 1);
+    }
+  }
+  return 0;
+}
+
+
+UnicodeString &
+UnicodeString::caseMap(int32_t caseLocale, uint32_t options, UCASEMAP_BREAK_ITERATOR_PARAM
+                       UStringCaseMapper *stringCaseMapper) {
+  if(isEmpty() || !isWritable()) {
+    return *this;
+  }
+
+  char16_t oldBuffer[2 * US_STACKBUF_SIZE];
+  char16_t *oldArray;
+  int32_t oldLength = length();
+  int32_t newLength;
+  UBool writable = isBufferWritable();
+  UErrorCode errorCode = U_ZERO_ERROR;
+
+#if !UCONFIG_NO_BREAK_ITERATION
+  UnicodeString oldString;
+#endif
+
+  if (writable ? oldLength <= UPRV_LENGTHOF(oldBuffer) : oldLength < US_STACKBUF_SIZE) {
+    char16_t *buffer = getArrayStart();
+    int32_t capacity;
+    oldArray = oldBuffer;
+    u_memcpy(oldBuffer, buffer, oldLength);
+    if (writable) {
+      capacity = getCapacity();
+    } else {
+      if (!cloneArrayIfNeeded(US_STACKBUF_SIZE, US_STACKBUF_SIZE,  false)) {
+        return *this;
+      }
+      U_ASSERT(fUnion.fFields.fLengthAndFlags & kUsingStackBuffer);
+      buffer = fUnion.fStackFields.fBuffer;
+      capacity = US_STACKBUF_SIZE;
+    }
+#if !UCONFIG_NO_BREAK_ITERATION
+    if (iter != nullptr) {
+      oldString.setTo(false, oldArray, oldLength);
+      iter->setText(oldString);
+    }
+#endif
+    newLength = stringCaseMapper(caseLocale, options, UCASEMAP_BREAK_ITERATOR
+                                 buffer, capacity,
+                                 oldArray, oldLength, nullptr, errorCode);
+    if (U_SUCCESS(errorCode)) {
+      setLength(newLength);
+      return *this;
+    } else if (errorCode == U_BUFFER_OVERFLOW_ERROR) {
+    } else {
+      setToBogus();
+      return *this;
+    }
+  } else {
+    oldArray = getArrayStart();
+    Edits edits;
+    char16_t replacementChars[200];
+#if !UCONFIG_NO_BREAK_ITERATION
+    if (iter != nullptr) {
+      oldString.setTo(false, oldArray, oldLength);
+      iter->setText(oldString);
+    }
+#endif
+    stringCaseMapper(caseLocale, options | U_OMIT_UNCHANGED_TEXT, UCASEMAP_BREAK_ITERATOR
+                     replacementChars, UPRV_LENGTHOF(replacementChars),
+                     oldArray, oldLength, &edits, errorCode);
+    if (U_SUCCESS(errorCode)) {
+      newLength = oldLength + edits.lengthDelta();
+      if (newLength > oldLength && !cloneArrayIfNeeded(newLength, newLength)) {
+        return *this;
+      }
+      for (Edits::Iterator ei = edits.getCoarseChangesIterator(); ei.next(errorCode);) {
+        doReplace(ei.destinationIndex(), ei.oldLength(),
+                  replacementChars, ei.replacementIndex(), ei.newLength());
+      }
+      if (U_FAILURE(errorCode)) {
+        setToBogus();
+      }
+      return *this;
+    } else if (errorCode == U_BUFFER_OVERFLOW_ERROR) {
+      newLength = oldLength + edits.lengthDelta();
+    } else {
+      setToBogus();
+      return *this;
+    }
+  }
+
+  int32_t *bufferToDelete = nullptr;
+  if (!cloneArrayIfNeeded(newLength, newLength, false, &bufferToDelete, true)) {
+    return *this;
+  }
+  errorCode = U_ZERO_ERROR;
+  newLength = stringCaseMapper(caseLocale, options, UCASEMAP_BREAK_ITERATOR
+                               getArrayStart(), getCapacity(),
+                               oldArray, oldLength, nullptr, errorCode);
+  if (bufferToDelete) {
+    uprv_free(bufferToDelete);
+  }
+  if (U_SUCCESS(errorCode)) {
+    setLength(newLength);
+  } else {
+    setToBogus();
+  }
+  return *this;
+}
+
+UnicodeString &
+UnicodeString::foldCase(uint32_t options) {
+  return caseMap(UCASE_LOC_ROOT, options, UCASEMAP_BREAK_ITERATOR_NULL ustrcase_internalFold);
+}
+
+U_NAMESPACE_END
+
+U_CAPI int32_t U_EXPORT2
+uhash_hashCaselessUnicodeString(const UElement key) {
+    U_NAMESPACE_USE
+    const UnicodeString *str = (const UnicodeString*) key.pointer;
+    if (str == nullptr) {
+        return 0;
+    }
+    UnicodeString copy(*str);
+    return copy.foldCase().hashCode();
+}
+
+U_CAPI UBool U_EXPORT2
+uhash_compareCaselessUnicodeString(const UElement key1, const UElement key2) {
+    U_NAMESPACE_USE
+    const UnicodeString *str1 = (const UnicodeString*) key1.pointer;
+    const UnicodeString *str2 = (const UnicodeString*) key2.pointer;
+    if (str1 == str2) {
+        return true;
+    }
+    if (str1 == nullptr || str2 == nullptr) {
+        return false;
+    }
+    return str1->caseCompare(*str2, U_FOLD_CASE_DEFAULT) == 0;
+}

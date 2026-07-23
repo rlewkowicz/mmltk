@@ -1,0 +1,840 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_MouseEvents_h_
+#define mozilla_MouseEvents_h_
+
+#include <stdint.h>
+
+#include "mozilla/BasicEvents.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/Logging.h"
+#include "mozilla/MathAlgorithms.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/dom/DataTransfer.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/ipc/IPCForwards.h"
+#include "nsCOMPtr.h"
+
+namespace mozilla {
+
+namespace dom {
+class PBrowserParent;
+class PBrowserChild;
+class PBrowserBridgeParent;
+}  
+
+class WidgetPointerEvent;
+}  
+
+namespace mozilla {
+class WidgetPointerEventHolder final {
+ public:
+  nsTArray<WidgetPointerEvent> mEvents;
+  NS_INLINE_DECL_REFCOUNTING(WidgetPointerEventHolder)
+
+ private:
+  virtual ~WidgetPointerEventHolder() = default;
+};
+
+
+class WidgetPointerHelper {
+ public:
+  struct Tilt {
+    bool operator==(const Tilt&) const = default;
+    int32_t mX = 0;
+    int32_t mY = 0;
+  };
+
+  struct Angle {
+    bool operator==(const Angle&) const = default;
+    double mAltitude = 0.0;
+    double mAzimuth = 0.0;
+  };
+
+  uint32_t pointerId = 0;
+  Maybe<Tilt> mTilt;
+  int32_t twist = 0;
+  Maybe<Angle> mAngle;
+  float tangentialPressure = 0.0f;
+  bool convertToPointer = true;
+  bool convertToPointerRawUpdate = true;
+  RefPtr<WidgetPointerEventHolder> mCoalescedWidgetEvents;
+
+  WidgetPointerHelper() = default;
+  WidgetPointerHelper(uint32_t aPointerId, uint32_t aTiltX, uint32_t aTiltY,
+                      uint32_t aTwist = 0, float aTangentialPressure = 0)
+      : pointerId(aPointerId),
+        mTilt(Some(
+            Tilt{static_cast<int32_t>(aTiltX), static_cast<int32_t>(aTiltY)})),
+        twist(aTwist),
+        tangentialPressure(aTangentialPressure),
+        convertToPointer(true) {
+    MOZ_ASSERT(aTiltX <= INT32_MAX);
+    MOZ_ASSERT(aTiltY <= INT32_MAX);
+  }
+
+  WidgetPointerHelper(const WidgetPointerHelper&) = default;
+  WidgetPointerHelper(WidgetPointerHelper&&) = default;
+  WidgetPointerHelper& operator=(const WidgetPointerHelper&) = default;
+  WidgetPointerHelper& operator=(WidgetPointerHelper&&) = default;
+
+  constexpr static double kPi =
+#ifdef M_PI
+      M_PI;
+#else
+      3.14159265358979323846;
+#endif
+  constexpr static double kHalfPi =
+#ifdef M_PI_2
+      M_PI_2;
+#else
+      1.57079632679489661923;
+#endif
+  constexpr static double kDoublePi = kPi * 2;
+
+  constexpr static double GetDefaultAltitudeAngle() { return kHalfPi; }
+  constexpr static double GetDefaultAzimuthAngle() { return 0.0; }
+
+  double ComputeAltitudeAngle() const {
+    if (mAngle.isSome()) {
+      return mAngle->mAltitude;
+    }
+    if (mTilt.isSome()) {
+      return ComputeAltitudeAngle(mTilt->mX, mTilt->mY);
+    }
+    return GetDefaultAltitudeAngle();
+  }
+  double ComputeAzimuthAngle() const {
+    if (mAngle.isSome()) {
+      return mAngle->mAzimuth;
+    }
+    if (mTilt.isSome()) {
+      return ComputeAzimuthAngle(mTilt->mX, mTilt->mY);
+    }
+    return GetDefaultAzimuthAngle();
+  }
+
+  static double ComputeAltitudeAngle(int32_t aTiltX, int32_t aTiltY);
+  static double ComputeAzimuthAngle(int32_t aTiltX, int32_t aTiltY);
+
+  constexpr static int32_t GetDefaultTiltX() { return 0; }
+  constexpr static int32_t GetDefaultTiltY() { return 0; }
+
+  int32_t ComputeTiltX() const {
+    if (mTilt.isSome()) {
+      return mTilt->mX;
+    }
+    if (mAngle.isSome()) {
+      return ComputeTiltX(mAngle->mAltitude, mAngle->mAzimuth);
+    }
+    return GetDefaultTiltX();
+  }
+  int32_t ComputeTiltY() const {
+    if (mTilt.isSome()) {
+      return mTilt->mY;
+    }
+    if (mAngle.isSome()) {
+      return ComputeTiltY(mAngle->mAltitude, mAngle->mAzimuth);
+    }
+    return GetDefaultTiltY();
+  }
+
+  static double ComputeTiltX(double aAltitudeAngle, double aAzimuthAngle);
+  static double ComputeTiltY(double aAltitudeAngle, double aAzimuthAngle);
+
+  void AssignPointerHelperData(const WidgetPointerHelper& aEvent,
+                               bool aCopyCoalescedEvents = false) {
+    pointerId = aEvent.pointerId;
+    mTilt = aEvent.mTilt;
+    twist = aEvent.twist;
+    tangentialPressure = aEvent.tangentialPressure;
+    convertToPointer = aEvent.convertToPointer;
+    convertToPointerRawUpdate = aEvent.convertToPointerRawUpdate;
+    if (aCopyCoalescedEvents) {
+      mCoalescedWidgetEvents = aEvent.mCoalescedWidgetEvents;
+    }
+  }
+
+ private:
+  static int32_t GetValidTiltValue(int32_t aTilt);
+  static double GetValidAltitudeAngle(double aAltitudeAngle);
+  static double GetValidAzimuthAngle(double aAzimuthAngle);
+};
+
+
+class WidgetMouseEventBase : public WidgetInputEvent {
+ private:
+  friend class dom::PBrowserParent;
+  friend class dom::PBrowserChild;
+  friend class dom::PBrowserBridgeParent;
+  ALLOW_DEPRECATED_READPARAM
+
+ protected:
+  WidgetMouseEventBase()
+      : mPressure(0),
+        mButton(0),
+        mButtons(0),
+        mInputSource( 1) {}
+
+  WidgetMouseEventBase(bool aIsTrusted, EventMessage aMessage,
+                       nsIWidget* aWidget, EventClassID aEventClassID,
+                       const WidgetEventTime* aTime = nullptr)
+      : WidgetInputEvent(aIsTrusted, aMessage, aWidget, aEventClassID, aTime),
+        mPressure(0),
+        mButton(0),
+        mButtons(0),
+        mInputSource( 1) {}
+
+  WidgetMouseEventBase(const WidgetMouseEventBase&) = default;
+  WidgetMouseEventBase(WidgetMouseEventBase&&) = default;
+  WidgetMouseEventBase& operator=(const WidgetMouseEventBase&) = default;
+  WidgetMouseEventBase& operator=(WidgetMouseEventBase&&) = default;
+
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, MouseEventBase);
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(WidgetMouseEventBase,
+                                                    eMouseEventBaseClass,
+                                                    eInputEventClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    MOZ_CRASH("WidgetMouseEventBase must not be most-subclass");
+  }
+
+  float mPressure;
+
+  [[nodiscard]] float ComputeMouseButtonPressure() const;
+
+  int16_t mButton;
+
+  int16_t mButtons;
+
+  uint16_t mInputSource;
+
+  bool IsLeftButtonPressed() const {
+    return !!(mButtons & MouseButtonsFlag::ePrimaryFlag);
+  }
+  bool IsRightButtonPressed() const {
+    return !!(mButtons & MouseButtonsFlag::eSecondaryFlag);
+  }
+  bool IsMiddleButtonPressed() const {
+    return !!(mButtons & MouseButtonsFlag::eMiddleFlag);
+  }
+  bool Is4thButtonPressed() const {
+    return !!(mButtons & MouseButtonsFlag::e4thFlag);
+  }
+  bool Is5thButtonPressed() const {
+    return !!(mButtons & MouseButtonsFlag::e5thFlag);
+  }
+
+  void AssignMouseEventBaseData(const WidgetMouseEventBase& aEvent,
+                                bool aCopyTargets) {
+    AssignInputEventData(aEvent, aCopyTargets);
+
+    mButton = aEvent.mButton;
+    mButtons = aEvent.mButtons;
+    mPressure = aEvent.mPressure;
+    mInputSource = aEvent.mInputSource;
+  }
+
+  bool IsLeftClickEvent() const {
+    return mMessage == ePointerClick && mButton == MouseButton::ePrimary;
+  }
+
+  [[nodiscard]] bool IsPressingButton() const {
+    MOZ_ASSERT(IsTrusted());
+    if (mClass == eMouseEventClass) {
+      return mMessage == eMouseDown;
+    }
+    if (mButton == MouseButton::eNotPressed) {
+      return false;
+    }
+    if (mMessage == ePointerDown) {
+      return true;
+    }
+    const bool buttonsContainButton = !!(
+        mButtons & MouseButtonsFlagToChange(static_cast<MouseButton>(mButton)));
+    return mMessage == ePointerMove && buttonsContainButton;
+  }
+
+  [[nodiscard]] bool IsReleasingButton() const {
+    MOZ_ASSERT(IsTrusted());
+    if (mClass == eMouseEventClass) {
+      return mMessage == eMouseUp;
+    }
+    if (mButton == MouseButton::eNotPressed) {
+      return false;
+    }
+    if (mMessage == ePointerUp) {
+      return true;
+    }
+    const bool buttonsLoseTheButton = !(
+        mButtons & MouseButtonsFlagToChange(static_cast<MouseButton>(mButton)));
+    return mMessage == ePointerMove && buttonsLoseTheButton;
+  }
+
+  [[nodiscard]] int16_t ComputeButtonsBeforeDispatch() const {
+    if (IsPressingButton()) {
+      return mButtons &
+             ~MouseButtonsFlagToChange(static_cast<MouseButton>(mButton));
+    }
+    if (IsReleasingButton()) {
+      return mButtons |
+             MouseButtonsFlagToChange(static_cast<MouseButton>(mButton));
+    }
+    return mButtons;
+  }
+
+  [[nodiscard]] static bool InputSourceSupportsHover(uint16_t aInputSource);
+
+  [[nodiscard]] bool InputSourceSupportsHover() const {
+    return InputSourceSupportsHover(mInputSource);
+  }
+
+  [[nodiscard]] bool DOMEventShouldUseFractionalCoords() const;
+};
+
+
+class WidgetMouseEvent : public WidgetMouseEventBase,
+                         public WidgetPointerHelper {
+ private:
+  friend class dom::PBrowserParent;
+  friend class dom::PBrowserChild;
+  friend class dom::PBrowserBridgeParent;
+  ALLOW_DEPRECATED_READPARAM
+
+ public:
+  enum Reason : bool { eReal, eSynthesized };
+
+  enum ContextMenuTrigger : uint8_t { eNormal, eContextMenuKey, eControlClick };
+
+  enum ExitFrom : uint8_t {
+    ePlatformChild,
+    ePlatformTopLevel,
+    ePuppet,
+    ePuppetParentToPuppetChild
+  };
+
+ protected:
+  WidgetMouseEvent() = default;
+
+  WidgetMouseEvent(bool aIsTrusted, EventMessage aMessage, nsIWidget* aWidget,
+                   EventClassID aEventClassID, Reason aReason,
+                   ContextMenuTrigger aContextMenuTrigger,
+                   const WidgetEventTime* aTime = nullptr)
+      : WidgetMouseEventBase(aIsTrusted, aMessage, aWidget, aEventClassID,
+                             aTime),
+        mReason(aReason),
+        mContextMenuTrigger(aContextMenuTrigger) {}
+
+#ifdef DEBUG
+  void AssertContextMenuEventButtonConsistency() const;
+#endif
+
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, MouseEvent);
+
+  WidgetMouseEvent(bool aIsTrusted, EventMessage aMessage, nsIWidget* aWidget,
+                   Reason aReason = eReal,
+                   ContextMenuTrigger aContextMenuTrigger = eNormal,
+                   const WidgetEventTime* aTime = nullptr)
+      : WidgetMouseEventBase(aIsTrusted, aMessage, aWidget, eMouseEventClass,
+                             aTime),
+        mReason(aReason),
+        mContextMenuTrigger(aContextMenuTrigger) {
+    MOZ_ASSERT_IF(aIsTrusted, !IsPointerEventMessage(mMessage));
+    if (aMessage == eContextMenu) {
+      mButton = (mContextMenuTrigger == eNormal) ? MouseButton::eSecondary
+                                                 : MouseButton::ePrimary;
+    }
+  }
+
+  WidgetMouseEvent(const WidgetMouseEvent& aEvent)
+      : WidgetMouseEventBase(aEvent), WidgetPointerHelper(aEvent) {
+    AssignMouseEventDataOnly(aEvent);
+  }
+  WidgetMouseEvent(WidgetMouseEvent&& aEvent)
+      : WidgetMouseEventBase(
+            std::move(static_cast<WidgetMouseEventBase&>(aEvent))),
+        WidgetPointerHelper(
+            std::move(static_cast<WidgetPointerHelper&>(aEvent))) {
+    AssignMouseEventDataOnly(aEvent);
+  }
+  WidgetMouseEvent& operator=(const WidgetMouseEvent&) = default;
+  WidgetMouseEvent& operator=(WidgetMouseEvent&&) = default;
+
+  WidgetMouseEvent(const WidgetDragEvent&) = delete;
+  WidgetMouseEvent(const WidgetPointerEvent&) = delete;
+  WidgetMouseEvent(WidgetDragEvent&&) = delete;
+  WidgetMouseEvent(WidgetPointerEvent&&) = delete;
+  WidgetMouseEvent& operator=(const WidgetDragEvent&) = delete;
+  WidgetMouseEvent& operator=(const WidgetPointerEvent&) = delete;
+  WidgetMouseEvent& operator=(WidgetDragEvent&&) = delete;
+  WidgetMouseEvent& operator=(WidgetPointerEvent&&) = delete;
+
+  static WidgetMouseEvent MakeLossyCopy(const WidgetMouseEvent& aOther,
+                                        EventMessage aMouseEventMessage) {
+    MOZ_ASSERT(aMouseEventMessage >= eMouseEventFirst &&
+               aMouseEventMessage <= eMouseEventLast);
+    WidgetMouseEvent copy(aOther);
+    copy.mMessage = aMouseEventMessage;
+    copy.mClass = eMouseEventClass;
+    copy.mSpecifiedEventType = nullptr;
+    copy.mContextMenuTrigger = ContextMenuTrigger::eNormal;
+    return copy;
+  }
+
+#ifdef DEBUG
+  virtual ~WidgetMouseEvent() {
+    AssertContextMenuEventButtonConsistency();
+    NS_ASSERT_EVENT_CLASS_ID(eMouseEventClass, eMouseEventBaseClass);
+  }
+#endif
+
+  virtual WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == eMouseEventClass,
+               "Duplicate() must be overridden by sub class");
+    WidgetMouseEvent* result = new WidgetMouseEvent(
+        false, mMessage, nullptr, mReason, mContextMenuTrigger, this);
+    result->AssignMouseEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+ public:
+  nsCOMPtr<dom::EventTarget> mClickTarget;
+
+  Reason mReason = eReal;
+
+  ContextMenuTrigger mContextMenuTrigger = eNormal;
+
+  Maybe<ExitFrom> mExitFrom;
+
+  uint32_t mClickCount = 0;
+
+  bool mIgnoreRootScrollFrame = false;
+
+  bool mIgnoreCapturingContent = false;
+
+  bool mClickEventPrevented = false;
+
+  bool mSynthesizeMoveAfterDispatch = false;
+
+  RefPtr<dom::Event> mTriggerEvent;
+
+  Maybe<uint64_t> mCallbackId;
+
+  Maybe<LayoutDeviceIntPoint> mMovement;
+
+  void AssignMouseEventData(const WidgetMouseEvent& aEvent, bool aCopyTargets,
+                            bool aCopyCoalescedEvents = true) {
+    AssignMouseEventBaseData(aEvent, aCopyTargets);
+    AssignPointerHelperData(aEvent, aCopyCoalescedEvents);
+    AssignMouseEventDataOnly(aEvent);
+  }
+
+  void AssignMouseEventDataOnly(const WidgetMouseEvent& aEvent) {
+    mReason = aEvent.mReason;
+    mContextMenuTrigger = aEvent.mContextMenuTrigger;
+    mExitFrom = aEvent.mExitFrom;
+    mClickCount = aEvent.mClickCount;
+    mIgnoreRootScrollFrame = aEvent.mIgnoreRootScrollFrame;
+    mIgnoreCapturingContent = aEvent.mIgnoreCapturingContent;
+    mClickEventPrevented = aEvent.mClickEventPrevented;
+    mTriggerEvent = aEvent.mTriggerEvent;
+    mMovement = aEvent.mMovement;
+  }
+
+  bool IsContextMenuKeyEvent() const {
+    return mMessage == eContextMenu && mContextMenuTrigger == eContextMenuKey;
+  }
+
+  [[nodiscard]] bool IsReal() const { return mReason == eReal; }
+
+  [[nodiscard]] bool IsSynthesized() const { return mReason == eSynthesized; }
+
+  static bool IsMiddleClickPasteEnabled();
+};
+
+MOZ_DEFINE_BOOL_PRETTY_PRINTER(RealOrSynthesized, Real, Synthesized);
+
+
+class WidgetDragEvent final : public WidgetMouseEvent {
+ private:
+  friend class mozilla::dom::PBrowserParent;
+  friend class mozilla::dom::PBrowserChild;
+  ALLOW_DEPRECATED_READPARAM
+
+ protected:
+  WidgetDragEvent()
+      : mUserCancelled(false),
+        mDefaultPreventedOnContent(false),
+        mInHTMLEditorEventListener(false) {}
+
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, DragEvent);
+
+  WidgetDragEvent(bool aIsTrusted, EventMessage aMessage, nsIWidget* aWidget,
+                  const WidgetEventTime* aTime = nullptr)
+      : WidgetMouseEvent(aIsTrusted, aMessage, aWidget, eDragEventClass, eReal,
+                         eNormal, aTime),
+        mUserCancelled(false),
+        mDefaultPreventedOnContent(false),
+        mInHTMLEditorEventListener(false) {}
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(WidgetDragEvent,
+                                                    eDragEventClass,
+                                                    eMouseEventClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == eDragEventClass,
+               "Duplicate() must be overridden by sub class");
+    WidgetDragEvent* result =
+        new WidgetDragEvent(false, mMessage, nullptr, this);
+    result->AssignDragEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  nsCOMPtr<dom::DataTransfer> mDataTransfer;
+
+  bool mUserCancelled;
+  bool mDefaultPreventedOnContent;
+  bool mInHTMLEditorEventListener;
+
+  void AssignDragEventData(const WidgetDragEvent& aEvent, bool aCopyTargets) {
+    AssignMouseEventData(aEvent, aCopyTargets);
+
+    mDataTransfer = aEvent.mDataTransfer;
+    mUserCancelled = false;
+    mDefaultPreventedOnContent = aEvent.mDefaultPreventedOnContent;
+    mInHTMLEditorEventListener = false;
+  }
+
+  bool CanConvertToInputData() const {
+    return mMessage == eDragStart || mMessage == eDragEnd ||
+           mMessage == eDragEnter || mMessage == eDragOver ||
+           mMessage == eDragExit || mMessage == eDrop;
+  }
+
+  void InitDropEffectForTests();
+};
+
+
+class WidgetMouseScrollEvent : public WidgetMouseEventBase {
+ private:
+  WidgetMouseScrollEvent() : mDelta(0), mIsHorizontal(false) {}
+
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, MouseScrollEvent);
+
+  WidgetMouseScrollEvent(bool aIsTrusted, EventMessage aMessage,
+                         nsIWidget* aWidget,
+                         const WidgetEventTime* aTime = nullptr)
+      : WidgetMouseEventBase(aIsTrusted, aMessage, aWidget,
+                             eMouseScrollEventClass, aTime),
+        mDelta(0),
+        mIsHorizontal(false) {}
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(WidgetMouseScrollEvent,
+                                                    eMouseScrollEventClass,
+                                                    eMouseEventBaseClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == eMouseScrollEventClass,
+               "Duplicate() must be overridden by sub class");
+    WidgetMouseScrollEvent* result =
+        new WidgetMouseScrollEvent(false, mMessage, nullptr, this);
+    result->AssignMouseScrollEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  int32_t mDelta;
+
+  bool mIsHorizontal;
+
+  void AssignMouseScrollEventData(const WidgetMouseScrollEvent& aEvent,
+                                  bool aCopyTargets) {
+    AssignMouseEventBaseData(aEvent, aCopyTargets);
+
+    mDelta = aEvent.mDelta;
+    mIsHorizontal = aEvent.mIsHorizontal;
+  }
+};
+
+
+class WidgetWheelEvent : public WidgetMouseEventBase {
+ private:
+  friend class mozilla::dom::PBrowserParent;
+  friend class mozilla::dom::PBrowserChild;
+  ALLOW_DEPRECATED_READPARAM
+
+  WidgetWheelEvent()
+      : mDeltaX(0.0),
+        mDeltaY(0.0),
+        mDeltaZ(0.0),
+        mOverflowDeltaX(0.0),
+        mOverflowDeltaY(0.0)
+        ,
+        mDeltaMode( 0),
+        mLineOrPageDeltaX(0),
+        mLineOrPageDeltaY(0),
+        mScrollType(SCROLL_DEFAULT),
+        mCustomizedByUserPrefs(false),
+        mMayHaveMomentum(false),
+        mIsMomentum(false),
+        mIsNoLineOrPageDelta(false),
+        mViewPortIsOverscrolled(false),
+        mCanTriggerSwipe(false),
+        mAllowToOverrideSystemScrollSpeed(false),
+        mDeltaValuesHorizontalizedForDefaultHandler(false) {}
+
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, WheelEvent);
+
+  WidgetWheelEvent(bool aIsTrusted, EventMessage aMessage, nsIWidget* aWidget,
+                   const WidgetEventTime* aTime = nullptr)
+      : WidgetMouseEventBase(aIsTrusted, aMessage, aWidget, eWheelEventClass,
+                             aTime),
+        mDeltaX(0.0),
+        mDeltaY(0.0),
+        mDeltaZ(0.0),
+        mOverflowDeltaX(0.0),
+        mOverflowDeltaY(0.0)
+        ,
+        mDeltaMode( 0),
+        mLineOrPageDeltaX(0),
+        mLineOrPageDeltaY(0),
+        mScrollType(SCROLL_DEFAULT),
+        mCustomizedByUserPrefs(false),
+        mMayHaveMomentum(false),
+        mIsMomentum(false),
+        mIsNoLineOrPageDelta(false),
+        mViewPortIsOverscrolled(false),
+        mCanTriggerSwipe(false),
+        mAllowToOverrideSystemScrollSpeed(true),
+        mDeltaValuesHorizontalizedForDefaultHandler(false) {}
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(WidgetWheelEvent,
+                                                    eWheelEventClass,
+                                                    eMouseEventBaseClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == eWheelEventClass,
+               "Duplicate() must be overridden by sub class");
+    WidgetWheelEvent* result =
+        new WidgetWheelEvent(false, mMessage, nullptr, this);
+    result->AssignWheelEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  bool TriggersSwipe() const {
+    return mCanTriggerSwipe && mViewPortIsOverscrolled &&
+           this->mOverflowDeltaX != 0.0;
+  }
+
+  double mDeltaX;
+  double mDeltaY;
+  double mDeltaZ;
+
+  double mWheelTicksX = 0.0;
+  double mWheelTicksY = 0.0;
+
+  enum class DeltaModeCheckingState : uint8_t {
+    Unknown,
+    Unchecked,
+    Checked,
+  };
+
+  DeltaModeCheckingState mDeltaModeCheckingState =
+      DeltaModeCheckingState::Unknown;
+
+  nsSize mScrollAmount;
+
+  double mOverflowDeltaX;
+  double mOverflowDeltaY;
+
+  uint32_t mDeltaMode;
+
+  int32_t mLineOrPageDeltaX;
+  int32_t mLineOrPageDeltaY;
+
+  int32_t GetPreferredIntDelta() {
+    if (!mLineOrPageDeltaX && !mLineOrPageDeltaY) {
+      return 0;
+    }
+    if (mLineOrPageDeltaY && !mLineOrPageDeltaX) {
+      return mLineOrPageDeltaY;
+    }
+    if (mLineOrPageDeltaX && !mLineOrPageDeltaY) {
+      return mLineOrPageDeltaX;
+    }
+    if ((mLineOrPageDeltaX < 0 && mLineOrPageDeltaY > 0) ||
+        (mLineOrPageDeltaX > 0 && mLineOrPageDeltaY < 0)) {
+      return 0;  
+    }
+    return (Abs(mLineOrPageDeltaX) > Abs(mLineOrPageDeltaY))
+               ? mLineOrPageDeltaX
+               : mLineOrPageDeltaY;
+  }
+
+  enum ScrollType : uint8_t {
+    SCROLL_DEFAULT,
+    SCROLL_SYNCHRONOUSLY,
+    SCROLL_ASYNCHRONOUSLY,
+    SCROLL_SMOOTHLY
+  };
+  ScrollType mScrollType;
+
+  bool mCustomizedByUserPrefs;
+
+  bool mMayHaveMomentum;
+  bool mIsMomentum;
+
+  bool mIsNoLineOrPageDelta;
+
+  bool mViewPortIsOverscrolled;
+
+  bool mCanTriggerSwipe;
+
+  bool mAllowToOverrideSystemScrollSpeed;
+
+  bool mDeltaValuesHorizontalizedForDefaultHandler;
+
+  Maybe<uint64_t> mCallbackId;
+
+  void AssignWheelEventData(const WidgetWheelEvent& aEvent, bool aCopyTargets) {
+    AssignMouseEventBaseData(aEvent, aCopyTargets);
+
+    mDeltaX = aEvent.mDeltaX;
+    mDeltaY = aEvent.mDeltaY;
+    mDeltaZ = aEvent.mDeltaZ;
+    mDeltaMode = aEvent.mDeltaMode;
+    mScrollAmount = aEvent.mScrollAmount;
+    mCustomizedByUserPrefs = aEvent.mCustomizedByUserPrefs;
+    mMayHaveMomentum = aEvent.mMayHaveMomentum;
+    mIsMomentum = aEvent.mIsMomentum;
+    mIsNoLineOrPageDelta = aEvent.mIsNoLineOrPageDelta;
+    mLineOrPageDeltaX = aEvent.mLineOrPageDeltaX;
+    mLineOrPageDeltaY = aEvent.mLineOrPageDeltaY;
+    mScrollType = aEvent.mScrollType;
+    mOverflowDeltaX = aEvent.mOverflowDeltaX;
+    mOverflowDeltaY = aEvent.mOverflowDeltaY;
+    mViewPortIsOverscrolled = aEvent.mViewPortIsOverscrolled;
+    mCanTriggerSwipe = aEvent.mCanTriggerSwipe;
+    mAllowToOverrideSystemScrollSpeed =
+        aEvent.mAllowToOverrideSystemScrollSpeed;
+    mDeltaValuesHorizontalizedForDefaultHandler =
+        aEvent.mDeltaValuesHorizontalizedForDefaultHandler;
+  }
+
+  double OverriddenDeltaX() const;
+  double OverriddenDeltaY() const;
+
+  static double ComputeOverriddenDelta(double aDelta, bool aIsForVertical);
+
+ private:
+  static bool sInitialized;
+  static bool sIsSystemScrollSpeedOverrideEnabled;
+  static int32_t sOverrideFactorX;
+  static int32_t sOverrideFactorY;
+  static void Initialize();
+};
+
+
+class WidgetPointerEvent final : public WidgetMouseEvent {
+  friend class mozilla::dom::PBrowserParent;
+  friend class mozilla::dom::PBrowserChild;
+  ALLOW_DEPRECATED_READPARAM
+
+  WidgetPointerEvent() = default;
+
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, PointerEvent);
+
+  WidgetPointerEvent(bool aIsTrusted, EventMessage aMsg, nsIWidget* w,
+                     const WidgetEventTime* aTime)
+      : WidgetMouseEvent(aIsTrusted, aMsg, w, ePointerEventClass, eReal,
+                         eNormal, aTime) {
+    if (aMsg == eContextMenu) {
+      mButton = (mContextMenuTrigger == eNormal) ? MouseButton::eSecondary
+                                                 : MouseButton::ePrimary;
+    }
+  }
+
+  WidgetPointerEvent(bool aIsTrusted, EventMessage aMsg, nsIWidget* w,
+                     ContextMenuTrigger aContextMenuTrigger = eNormal,
+                     const WidgetEventTime* aTime = nullptr)
+      : WidgetMouseEvent(aIsTrusted, aMsg, w, ePointerEventClass, eReal,
+                         aContextMenuTrigger, aTime) {
+    if (aMsg == eContextMenu) {
+      mButton = (mContextMenuTrigger == eNormal) ? MouseButton::eSecondary
+                                                 : MouseButton::ePrimary;
+    }
+  }
+
+ private:
+  explicit WidgetPointerEvent(const WidgetMouseEvent& aEvent)
+      : WidgetMouseEvent(aEvent) {
+    MOZ_ASSERT(!aEvent.AsPointerEvent(),
+               "You're using wrong copy constructor, cast the source event to "
+               "`const WidgetPointerEvent&`");
+    mClass = ePointerEventClass;
+  }
+
+ public:
+  static inline WidgetPointerEvent MakeCopyFromMouseEvent(
+      const WidgetMouseEvent& aPointerOrMouseEvent) {
+    if (aPointerOrMouseEvent.mClass == ePointerEventClass) {
+      MOZ_ASSERT(aPointerOrMouseEvent.AsPointerEvent());
+      return WidgetPointerEvent(
+          static_cast<const WidgetPointerEvent&>(aPointerOrMouseEvent));
+    }
+    MOZ_ASSERT(!aPointerOrMouseEvent.AsPointerEvent());
+    return WidgetPointerEvent(aPointerOrMouseEvent);
+  }
+
+  explicit WidgetPointerEvent(EventMessage aMsg,
+                              const WidgetPointerEvent& aOther)
+      : WidgetPointerEvent(aOther.IsTrusted(), aMsg, aOther.mWidget, &aOther) {
+    AssignPointerEventData(aOther, false);
+  }
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(WidgetPointerEvent,
+                                                    ePointerEventClass,
+                                                    eMouseEventClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == ePointerEventClass,
+               "Duplicate() must be overridden by sub class");
+    WidgetPointerEvent* result = new WidgetPointerEvent(
+        false, mMessage, nullptr, mContextMenuTrigger, this);
+    result->AssignPointerEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  double mWidth = 1.0;
+  double mHeight = 1.0;
+  bool mIsPrimary = true;
+  bool mFromTouchEvent = false;
+
+  void AssignPointerEventData(const WidgetPointerEvent& aEvent,
+                              bool aCopyTargets,
+                              bool aCopyCoalescedEvents = true) {
+    AssignMouseEventData(aEvent, aCopyTargets, aCopyCoalescedEvents);
+
+    mWidth = aEvent.mWidth;
+    mHeight = aEvent.mHeight;
+    mIsPrimary = aEvent.mIsPrimary;
+    mFromTouchEvent = aEvent.mFromTouchEvent;
+  }
+};
+
+}  
+
+#endif  // mozilla_MouseEvents_h_

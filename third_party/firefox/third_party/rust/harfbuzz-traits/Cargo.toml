@@ -1,0 +1,28 @@
+
+[package]
+edition = "2021"
+name = "harfbuzz-traits"
+version = "0.6.0"
+authors = ["The Servo Project Developers"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Rust traits for the HarfBuzz text shaping engine bindings"
+documentation = "https://docs.rs/harfbuzz/"
+keywords = [
+    "opentype",
+    "font",
+    "text",
+    "unicode",
+    "shaping",
+]
+categories = ["text-processing"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/servo/rust-harfbuzz"
+
+[lib]
+name = "harfbuzz_traits"
+path = "src/lib.rs"

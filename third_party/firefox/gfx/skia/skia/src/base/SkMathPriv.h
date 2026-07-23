@@ -1,0 +1,145 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkMathPriv_DEFINED)
+#define SkMathPriv_DEFINED
+
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkCPUTypes.h"
+#include "include/private/base/SkTemplates.h"
+
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+
+static constexpr int SkCLZ(uint32_t x) {
+    return std::countl_zero<uint32_t>(x);
+}
+
+static constexpr int SkCTZ(uint32_t x) {
+    return std::countr_zero<uint32_t>(x);
+}
+
+static constexpr int SkPopCount(uint32_t x) {
+    return std::popcount<uint32_t>(x);
+}
+
+int32_t SkSqrtBits(int32_t value, int bitBias);
+
+static inline int32_t SkSqrt32(int32_t n) { return SkSqrtBits(n, 15); }
+
+static inline int SkClampPos(int value) {
+    return value & ~(value >> 31);
+}
+
+template <typename In, typename Out>
+inline void SkTDivMod(In numer, In denom, Out* div, Out* mod) {
+    *div = static_cast<Out>(numer/denom);
+    *mod = static_cast<Out>(numer%denom);
+}
+
+#define SkExtractSign(n)    ((int32_t)(n) >> 31)
+
+static inline int32_t SkApplySign(int32_t n, int32_t sign) {
+    SkASSERT(sign == 0 || sign == -1);
+    return (n ^ sign) - sign;
+}
+
+static inline int32_t SkCopySign32(int32_t x, int32_t y) {
+    return SkApplySign(x, SkExtractSign(x ^ y));
+}
+
+static inline unsigned SkClampUMax(unsigned value, unsigned max) {
+    if (value > max) {
+        value = max;
+    }
+    return value;
+}
+
+static inline size_t sk_negate_to_size_t(int32_t value) {
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4146)  // Thanks MSVC, we know what we're negating an unsigned
+#endif
+    return -static_cast<size_t>(value);
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+}
+
+
+static inline U8CPU SkMulDiv255Trunc(U8CPU a, U8CPU b) {
+    SkASSERT((uint8_t)a == a);
+    SkASSERT((uint8_t)b == b);
+    unsigned prod = a*b + 1;
+    return (prod + (prod >> 8)) >> 8;
+}
+
+static inline U8CPU SkMulDiv255Ceiling(U8CPU a, U8CPU b) {
+    SkASSERT((uint8_t)a == a);
+    SkASSERT((uint8_t)b == b);
+    unsigned prod = a*b + 255;
+    return (prod + (prod >> 8)) >> 8;
+}
+
+static inline unsigned SkDiv255Round(unsigned prod) {
+    prod += 128;
+    return (prod + (prod >> 8)) >> 8;
+}
+
+#if defined(_MSC_VER)
+    #include <stdlib.h>
+    static inline uint32_t SkBSwap32(uint32_t v) { return _byteswap_ulong(v); }
+#else
+    static inline uint32_t SkBSwap32(uint32_t v) { return __builtin_bswap32(v); }
+#endif
+
+static constexpr int SkNextLog2(uint32_t value) {
+    SkASSERT(value != 0);
+    return 32 - SkCLZ(value - 1);
+}
+
+static constexpr int SkPrevLog2(uint32_t value) {
+    SkASSERT(value != 0);
+    return 32 - SkCLZ(value >> 1);
+}
+
+static constexpr int SkNextPow2(int value) {
+    SkASSERT(value > 0);
+    return 1 << SkNextLog2(static_cast<uint32_t>(value));
+}
+
+static constexpr int SkPrevPow2(int value) {
+    SkASSERT(value > 0);
+    return 1 << SkPrevLog2(static_cast<uint32_t>(value));
+}
+
+
+static constexpr size_t SkNextSizePow2(size_t n) {
+    constexpr int kNumSizeTBits = 8 * sizeof(size_t);
+    constexpr size_t kHighBitSet = size_t(1) << (kNumSizeTBits - 1);
+
+    if (!n) {
+        return 1;
+    } else if (n >= kHighBitSet) {
+        return n;
+    }
+
+    n--;
+    uint32_t shift = 1;
+    while (shift < kNumSizeTBits) {
+        n |= n >> shift;
+        shift <<= 1;
+    }
+    return n + 1;
+}
+
+template <typename T> static inline bool SkFitsInFixed(T x) {
+    return SkTAbs(x) <= 32767.0f;
+}
+
+#endif

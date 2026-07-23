@@ -1,0 +1,307 @@
+use crate::selection_list::Catalog;
+
+use iced_core::{
+    Border, Color, Element, Event, Layout, Length, Padding, Pixels, Point, Rectangle, Shell, Size,
+    Widget,
+    alignment::Vertical,
+    layout::{Limits, Node},
+    mouse::{self, Cursor},
+    renderer, touch,
+    widget::text::{LineHeight, Wrapping},
+    widget::{
+        Tree,
+        tree::{State, Tag},
+    },
+};
+use std::{
+    collections::hash_map::DefaultHasher,
+    fmt::Display,
+    hash::{Hash, Hasher},
+    marker::PhantomData,
+};
+
+#[allow(missing_debug_implementations)]
+pub struct List<'a, T: 'a, Message, Theme, Renderer>
+where
+    T: Clone + Display + Eq + Hash,
+    [T]: ToOwned<Owned = Vec<T>>,
+    Renderer: renderer::Renderer + iced_core::text::Renderer<Font = iced_core::Font>,
+    Theme: Catalog,
+{
+        pub options: &'a [T],
+            pub font: Renderer::Font,
+        pub class: <Theme as Catalog>::Class<'a>,
+        pub on_selected: Box<dyn Fn(usize, T) -> Message>,
+        pub padding: Padding,
+        pub text_size: f32,
+        pub selected: Option<usize>,
+        pub phantomdata: PhantomData<Renderer>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ListState {
+        pub hovered_option: Option<usize>,
+        pub last_selected_index: Option<(usize, u64)>,
+}
+
+impl<T, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
+    for List<'_, T, Message, Theme, Renderer>
+where
+    T: Clone + Display + Eq + Hash,
+    Renderer: renderer::Renderer + iced_core::text::Renderer<Font = iced_core::Font>,
+    Theme: Catalog + iced_widget::text::Catalog,
+{
+    fn tag(&self) -> Tag {
+        Tag::of::<ListState>()
+    }
+
+    fn state(&self) -> State {
+        State::new(ListState::default())
+    }
+
+    fn diff(&mut self, state: &mut Tree) {
+        let list_state = state.state.downcast_mut::<ListState>();
+
+        if let Some(id) = self.selected {
+            if let Some(option) = self.options.get(id) {
+                let mut hasher = DefaultHasher::new();
+                option.hash(&mut hasher);
+
+                list_state.last_selected_index = Some((id, hasher.finish()));
+            } else {
+                list_state.last_selected_index = None;
+            }
+        } else if let Some((id, hash)) = list_state.last_selected_index {
+            if let Some(option) = self.options.get(id) {
+                let mut hasher = DefaultHasher::new();
+                option.hash(&mut hasher);
+
+                if hash != hasher.finish() {
+                    list_state.last_selected_index = None;
+                }
+            } else {
+                list_state.last_selected_index = None;
+            }
+        }
+
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Shrink)
+    }
+
+    fn layout(&mut self, _tree: &mut Tree, _renderer: &Renderer, limits: &Limits) -> Node {
+        use std::f32;
+        let limits = limits.height(Length::Fill).width(Length::Fill);
+
+        #[allow(clippy::cast_precision_loss)]
+        let intrinsic = Size::new(
+            limits.max().width,
+            (self.text_size + self.padding.y()) * self.options.len() as f32,
+        );
+
+        Node::new(intrinsic)
+    }
+
+    fn update(
+        &mut self,
+        state: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: Cursor,
+        _renderer: &Renderer,
+        shell: &mut Shell<Message>,
+        _viewport: &Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        let list_state = state.state.downcast_mut::<ListState>();
+        let cursor = cursor.position().unwrap_or_default();
+
+        if bounds.contains(cursor) {
+            match event {
+                Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                    list_state.hovered_option = Some(
+                        ((cursor.y - bounds.y) / (self.text_size + self.padding.y())) as usize,
+                    );
+
+                    shell.request_redraw();
+                }
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                | Event::Touch(touch::Event::FingerPressed { .. }) => {
+                    list_state.hovered_option = Some(
+                        ((cursor.y - bounds.y) / (self.text_size + self.padding.y())) as usize,
+                    );
+
+                    if let Some(index) = list_state.hovered_option
+                        && let Some(option) = self.options.get(index)
+                    {
+                        let mut hasher = DefaultHasher::new();
+                        option.hash(&mut hasher);
+                        list_state.last_selected_index = Some((index, hasher.finish()));
+                    }
+
+                    list_state.last_selected_index.iter().for_each(|last| {
+                        if let Some(option) = self.options.get(last.0) {
+                            shell.publish((self.on_selected)(last.0, option.clone()));
+                            shell.capture_event();
+                        }
+                    });
+
+                    shell.request_redraw();
+                }
+                _ => {}
+            }
+        } else if list_state.hovered_option.is_some() {
+            list_state.hovered_option = None;
+            shell.request_redraw();
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        _state: &Tree,
+        layout: Layout<'_>,
+        cursor: Cursor,
+        _viewport: &Rectangle,
+        _renderer: &Renderer,
+    ) -> mouse::Interaction {
+        let bounds = layout.bounds();
+
+        if bounds.contains(cursor.position().unwrap_or_default()) {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::default()
+        }
+    }
+
+    fn draw(
+        &self,
+        state: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        _style: &renderer::Style,
+        layout: Layout<'_>,
+        _cursor: Cursor,
+        viewport: &Rectangle,
+    ) {
+        use std::f32;
+
+        let bounds = layout.bounds();
+        let option_height = self.text_size + self.padding.y();
+        let offset = viewport.y - bounds.y;
+        let start = (offset / option_height) as usize;
+        let end = ((offset + viewport.height) / option_height).ceil() as usize;
+        let list_state = state.state.downcast_ref::<ListState>();
+
+        for i in start..end.min(self.options.len()) {
+            let is_selected = list_state.last_selected_index.is_some_and(|u| u.0 == i);
+            let is_hovered = list_state.hovered_option == Some(i);
+
+            let bounds = Rectangle {
+                x: bounds.x,
+                y: bounds.y + option_height * i as f32,
+                width: bounds.width,
+                height: self.text_size + self.padding.y(),
+            };
+
+            if (is_selected || is_hovered) && (bounds.width > 0.) && (bounds.height > 0.) {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds,
+                        border: Border {
+                            radius: (0.0).into(),
+                            width: 0.0,
+                            color: Color::TRANSPARENT,
+                        },
+                        ..renderer::Quad::default()
+                    },
+                    if is_selected {
+                        <Theme as Catalog>::style(
+                            theme,
+                            &self.class,
+                            crate::style::Status::Selected,
+                        )
+                        .background
+                    } else {
+                        <Theme as Catalog>::style(theme, &self.class, crate::style::Status::Hovered)
+                            .background
+                    },
+                );
+            }
+
+            let text_color = if is_selected {
+                <Theme as Catalog>::style(theme, &self.class, crate::style::Status::Selected)
+                    .text_color
+            } else if is_hovered {
+                <Theme as Catalog>::style(theme, &self.class, crate::style::Status::Hovered)
+                    .text_color
+            } else {
+                <Theme as Catalog>::style(theme, &self.class, crate::style::Status::Active)
+                    .text_color
+            };
+
+            renderer.fill_text(
+                iced_core::text::Text {
+                    content: self.options[i].to_string(),
+                    bounds: Size::new(f32::INFINITY, bounds.height),
+                    size: Pixels(self.text_size),
+                    font: self.font,
+                    align_x: iced_widget::text::Alignment::Left,
+                    align_y: Vertical::Center,
+                    line_height: LineHeight::default(),
+                    shaping: iced_widget::text::Shaping::Advanced,
+                    wrapping: Wrapping::default(),
+                    ellipsis: iced_core::text::Ellipsis::None,
+                    hint_factor: renderer.scale_factor(),
+                },
+                Point::new(bounds.x, bounds.center_y()),
+                text_color,
+                bounds,
+            );
+        }
+    }
+
+    fn operate(
+        &mut self,
+        _state: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn iced_core::widget::Operation<()>,
+    ) {
+        use iced_core::layout::Node;
+        use iced_core::{Size, Vector};
+
+        let bounds = layout.bounds();
+        let option_height = self.text_size + self.padding.y();
+
+        for (i, option) in self.options.iter().enumerate() {
+            let text_widget = iced_widget::Text::new(option.to_string())
+                .size(self.text_size)
+                .font(self.font);
+
+            let text_node = Node::new(Size::new(bounds.width, option_height));
+
+            let text_layout =
+                Layout::with_offset(Vector::new(0.0, option_height * i as f32), &text_node);
+
+            let mut element: Element<(), Theme, Renderer> = Element::new(text_widget);
+            let mut text_tree = Tree::new(element.as_widget());
+            element
+                .as_widget_mut()
+                .operate(&mut text_tree, text_layout, renderer, operation);
+        }
+    }
+}
+
+impl<'a, T, Message, Theme, Renderer> From<List<'a, T, Message, Theme, Renderer>>
+    for Element<'a, Message, Theme, Renderer>
+where
+    T: Clone + Display + Eq + Hash,
+    Message: 'a,
+    Renderer: 'a + renderer::Renderer + iced_core::text::Renderer<Font = iced_core::Font>,
+    Theme: 'a + Catalog + iced_widget::text::Catalog,
+{
+    fn from(list: List<'a, T, Message, Theme, Renderer>) -> Self {
+        Element::new(list)
+    }
+}

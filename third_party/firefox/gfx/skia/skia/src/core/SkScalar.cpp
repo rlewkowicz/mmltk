@@ -1,0 +1,34 @@
+/*
+ * Copyright 2010 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/core/SkScalar.h"
+#include "include/private/base/SkDebug.h"
+
+float SkFloatInterpFunc(float searchKey, const float keys[], const float values[], int length) {
+    SkASSERT(length > 0);
+    SkASSERT(keys != nullptr);
+    SkASSERT(values != nullptr);
+#if defined(SK_DEBUG)
+    for (int i = 1; i < length; i++) {
+        SkASSERT(keys[i-1] <= keys[i]);
+    }
+#endif
+    int right = 0;
+    while (right < length && keys[right] < searchKey) {
+        ++right;
+    }
+    if (right == length) {
+        return values[length-1];
+    }
+    if (right == 0) {
+        return values[0];
+    }
+    float leftKey = keys[right-1];
+    float rightKey = keys[right];
+    float fract = (searchKey - leftKey) / (rightKey - leftKey);
+    return SkScalarInterp(values[right-1], values[right], fract);
+}

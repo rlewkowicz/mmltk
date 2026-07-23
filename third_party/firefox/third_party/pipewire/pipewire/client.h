@@ -1,0 +1,122 @@
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
+
+#ifndef PIPEWIRE_CLIENT_H
+#define PIPEWIRE_CLIENT_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <spa/utils/defs.h>
+#include <spa/param/param.h>
+
+#include <pipewire/type.h>
+#include <pipewire/proxy.h>
+#include <pipewire/permission.h>
+
+
+#define PW_TYPE_INTERFACE_Client	PW_TYPE_INFO_INTERFACE_BASE "Client"
+
+#define PW_CLIENT_PERM_MASK		PW_PERM_RWXM
+
+#define PW_VERSION_CLIENT		3
+struct pw_client;
+
+#ifndef PW_API_CLIENT_IMPL
+#define PW_API_CLIENT_IMPL static inline
+#endif
+
+#define PW_ID_CLIENT			1
+
+struct pw_client_info {
+	uint32_t id;			
+#define PW_CLIENT_CHANGE_MASK_PROPS	(1 << 0)
+#define PW_CLIENT_CHANGE_MASK_ALL	((1 << 1)-1)
+	uint64_t change_mask;		
+	struct spa_dict *props;		
+};
+
+struct pw_client_info *
+pw_client_info_update(struct pw_client_info *info,
+		const struct pw_client_info *update);
+struct pw_client_info *
+pw_client_info_merge(struct pw_client_info *info,
+		const struct pw_client_info *update, bool reset);
+void pw_client_info_free(struct pw_client_info *info);
+
+
+#define PW_CLIENT_EVENT_INFO		0
+#define PW_CLIENT_EVENT_PERMISSIONS	1
+#define PW_CLIENT_EVENT_NUM		2
+
+struct pw_client_events {
+#define PW_VERSION_CLIENT_EVENTS	0
+	uint32_t version;
+	void (*info) (void *data, const struct pw_client_info *info);
+	void (*permissions) (void *data,
+			     uint32_t index,
+			     uint32_t n_permissions,
+			     const struct pw_permission *permissions);
+};
+
+
+#define PW_CLIENT_METHOD_ADD_LISTENER		0
+#define PW_CLIENT_METHOD_ERROR			1
+#define PW_CLIENT_METHOD_UPDATE_PROPERTIES	2
+#define PW_CLIENT_METHOD_GET_PERMISSIONS	3
+#define PW_CLIENT_METHOD_UPDATE_PERMISSIONS	4
+#define PW_CLIENT_METHOD_NUM			5
+
+struct pw_client_methods {
+#define PW_VERSION_CLIENT_METHODS	0
+	uint32_t version;
+
+	int (*add_listener) (void *object,
+			struct spa_hook *listener,
+			const struct pw_client_events *events,
+			void *data);
+	int (*error) (void *object, uint32_t id, int res, const char *message);
+	int (*update_properties) (void *object, const struct spa_dict *props);
+
+	int (*get_permissions) (void *object, uint32_t index, uint32_t num);
+	int (*update_permissions) (void *object, uint32_t n_permissions,
+			const struct pw_permission *permissions);
+};
+
+PW_API_CLIENT_IMPL int pw_client_add_listener(struct pw_client *object,
+			struct spa_hook *listener,
+			const struct pw_client_events *events,
+			void *data)
+{
+	return spa_api_method_r(int, -ENOTSUP, pw_client, (struct spa_interface*)object, add_listener, 0,
+			listener, events, data);
+}
+PW_API_CLIENT_IMPL int pw_client_error(struct pw_client *object, uint32_t id, int res, const char *message)
+{
+	return spa_api_method_r(int, -ENOTSUP, pw_client, (struct spa_interface*)object, error, 0,
+			id, res, message);
+}
+PW_API_CLIENT_IMPL int pw_client_update_properties(struct pw_client *object, const struct spa_dict *props)
+{
+	return spa_api_method_r(int, -ENOTSUP, pw_client, (struct spa_interface*)object, update_properties, 0,
+			props);
+}
+PW_API_CLIENT_IMPL int pw_client_get_permissions(struct pw_client *object, uint32_t index, uint32_t num)
+{
+	return spa_api_method_r(int, -ENOTSUP, pw_client, (struct spa_interface*)object, get_permissions, 0,
+			index, num);
+}
+PW_API_CLIENT_IMPL int pw_client_update_permissions(struct pw_client *object, uint32_t n_permissions,
+			const struct pw_permission *permissions)
+{
+	return spa_api_method_r(int, -ENOTSUP, pw_client, (struct spa_interface*)object, update_permissions, 0,
+			n_permissions, permissions);
+}
+
+
+#ifdef __cplusplus
+}  
+#endif
+
+#endif /* PIPEWIRE_CLIENT_H */

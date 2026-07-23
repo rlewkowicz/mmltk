@@ -1,0 +1,40 @@
+//! Helpers built around pointer-sized atomics.
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+struct LazyUsize(AtomicUsize);
+
+impl LazyUsize {
+    const UNINIT: usize = usize::MAX;
+
+    const fn new() -> Self {
+        Self(AtomicUsize::new(Self::UNINIT))
+    }
+
+    fn unsync_init(&self, init: impl FnOnce() -> usize) -> usize {
+        #[cold]
+        fn do_init(this: &LazyUsize, init: impl FnOnce() -> usize) -> usize {
+            let val = init();
+            this.0.store(val, Ordering::Relaxed);
+            val
+        }
+
+        let val = self.0.load(Ordering::Relaxed);
+        if val != Self::UNINIT {
+            val
+        } else {
+            do_init(self, init)
+        }
+    }
+}
+
+pub(crate) struct LazyBool(LazyUsize);
+
+impl LazyBool {
+    pub const fn new() -> Self {
+        Self(LazyUsize::new())
+    }
+
+    pub fn unsync_init(&self, init: impl FnOnce() -> bool) -> bool {
+        self.0.unsync_init(|| usize::from(init())) != 0
+    }
+}

@@ -1,0 +1,308 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(nsFrameList_h_)
+#define nsFrameList_h_
+
+#include <stdio.h> /* for FILE* */
+
+#include "mozilla/EnumSet.h"
+#include "mozilla/FunctionTypeTraits.h"
+#include "nsDebug.h"
+#include "nsTArray.h"
+
+#if defined(DEBUG) || defined(MOZ_DUMP_PAINTING) || 0
+#  define DEBUG_FRAME_DUMP 1
+#endif
+
+class nsContainerFrame;
+class nsIContent;
+class nsIFrame;
+class nsPresContext;
+
+namespace mozilla {
+
+struct FrameDestroyContext;
+
+class PresShell;
+class FrameChildList;
+enum class FrameChildListID {
+  Principal,
+  Absolute,
+  PushedAbsolute,
+  Overflow,
+  OverflowContainers,
+  ExcessOverflowContainers,
+  OverflowOutOfFlow,
+  Float,
+  Marker,
+  PushedFloats,
+  NoReflowPrincipal,
+};
+
+}  
+
+
+class nsFrameList {
+  struct ForwardFrameTraversal final {
+    static inline nsIFrame* Next(nsIFrame*);
+    static inline nsIFrame* Prev(nsIFrame*);
+  };
+  struct BackwardFrameTraversal final {
+    static inline nsIFrame* Next(nsIFrame*);
+    static inline nsIFrame* Prev(nsIFrame*);
+  };
+
+ public:
+  template <typename FrameTraversal>
+  class Iterator;
+  class Slice;
+
+  using iterator = Iterator<ForwardFrameTraversal>;
+  using const_iterator = Iterator<ForwardFrameTraversal>;
+  using reverse_iterator = Iterator<BackwardFrameTraversal>;
+  using const_reverse_iterator = Iterator<BackwardFrameTraversal>;
+
+  constexpr nsFrameList() : mFirstChild(nullptr), mLastChild(nullptr) {}
+
+  nsFrameList(nsIFrame* aFirstFrame, nsIFrame* aLastFrame)
+      : mFirstChild(aFirstFrame), mLastChild(aLastFrame) {
+    VerifyList();
+  }
+
+  nsFrameList(const nsFrameList& aOther) = delete;
+  nsFrameList& operator=(const nsFrameList& aOther) = delete;
+  nsFrameList Clone() const { return nsFrameList(mFirstChild, mLastChild); }
+
+  nsFrameList(nsFrameList&& aOther)
+      : mFirstChild(aOther.mFirstChild), mLastChild(aOther.mLastChild) {
+    aOther.Clear();
+    VerifyList();
+  }
+  nsFrameList& operator=(nsFrameList&& aOther) {
+    if (this != &aOther) {
+      MOZ_ASSERT(IsEmpty(), "Assigning to a non-empty list will lose frames!");
+      mFirstChild = aOther.FirstChild();
+      mLastChild = aOther.LastChild();
+      aOther.Clear();
+    }
+    return *this;
+  }
+
+  void* operator new(size_t sz, mozilla::PresShell* aPresShell);
+
+  void Delete(mozilla::PresShell* aPresShell);
+
+  void DestroyFrames(mozilla::FrameDestroyContext&);
+
+  void Clear() { mFirstChild = mLastChild = nullptr; }
+
+  Slice AppendFrames(nsContainerFrame* aParent, nsFrameList&& aFrameList) {
+    return InsertFrames(aParent, LastChild(), std::move(aFrameList));
+  }
+
+  void AppendFrame(nsContainerFrame* aParent, nsIFrame* aFrame) {
+    AppendFrames(aParent, nsFrameList(aFrame, aFrame));
+  }
+
+  void RemoveFrame(nsIFrame* aFrame);
+
+  [[nodiscard]] nsFrameList TakeFramesBefore(nsIFrame* aFrame);
+
+  [[nodiscard]] nsFrameList TakeFramesAfter(nsIFrame* aFrame);
+
+  nsIFrame* RemoveFirstChild();
+  nsIFrame* RemoveLastChild();
+
+  inline bool StartRemoveFrame(nsIFrame* aFrame);
+
+  inline bool ContinueRemoveFrame(nsIFrame* aFrame);
+
+  void DestroyFrame(mozilla::FrameDestroyContext&, nsIFrame*);
+
+  void InsertFrame(nsContainerFrame* aParent, nsIFrame* aPrevSibling,
+                   nsIFrame* aFrame) {
+    InsertFrames(aParent, aPrevSibling, nsFrameList(aFrame, aFrame));
+  }
+
+  Slice InsertFrames(nsContainerFrame* aParent, nsIFrame* aPrevSibling,
+                     nsFrameList&& aFrameList);
+
+  template <typename Predicate>
+  nsFrameList Split(Predicate&& aPredicate) {
+    static_assert(
+        std::is_same_v<
+            typename mozilla::FunctionTypeTraits<Predicate>::ReturnType,
+            bool> &&
+            mozilla::FunctionTypeTraits<Predicate>::arity == 1 &&
+            std::is_same_v<typename mozilla::FunctionTypeTraits<
+                               Predicate>::template ParameterType<0>,
+                           nsIFrame*>,
+        "aPredicate should be of this function signature: bool(nsIFrame*)");
+
+    for (nsIFrame* f : *this) {
+      if (aPredicate(f)) {
+        return TakeFramesBefore(f);
+      }
+    }
+    return std::move(*this);
+  }
+
+  nsIFrame* FirstChild() const { return mFirstChild; }
+
+  nsIFrame* LastChild() const { return mLastChild; }
+
+  nsIFrame* FrameAt(int32_t aIndex) const;
+  int32_t IndexOf(const nsIFrame* aFrame) const;
+
+  bool IsEmpty() const { return nullptr == mFirstChild; }
+
+  bool NotEmpty() const { return nullptr != mFirstChild; }
+
+  bool ContainsFrame(const nsIFrame* aFrame) const;
+
+  int32_t GetLength() const;
+
+  nsIFrame* OnlyChild() const {
+    if (FirstChild() == LastChild()) {
+      return FirstChild();
+    }
+    return nullptr;
+  }
+
+  void ApplySetParent(nsContainerFrame* aParent) const;
+
+  inline void AppendIfNonempty(nsTArray<mozilla::FrameChildList>* aLists,
+                               mozilla::FrameChildListID aListID) const {
+    if (NotEmpty()) {
+      aLists->EmplaceBack(*this, aListID);
+    }
+  }
+
+  nsIFrame* GetPrevVisualFor(nsIFrame* aFrame) const;
+
+  nsIFrame* GetNextVisualFor(nsIFrame* aFrame) const;
+
+#if defined(DEBUG_FRAME_DUMP)
+  void List(FILE* out) const;
+#endif
+
+  static inline const nsFrameList& EmptyList() { return sEmptyList; };
+
+  class Slice {
+   public:
+    MOZ_IMPLICIT Slice(const nsFrameList& aList)
+        : mStart(aList.FirstChild()), mEnd(nullptr) {}
+    Slice(nsIFrame* aStart, nsIFrame* aEnd) : mStart(aStart), mEnd(aEnd) {}
+
+    void operator delete(void*) = delete;
+
+    iterator begin() const { return iterator(mStart); }
+    const_iterator cbegin() const { return begin(); }
+    iterator end() const { return iterator(mEnd); }
+    const_iterator cend() const { return end(); }
+
+   private:
+    nsIFrame* const mStart;
+
+    nsIFrame* const mEnd;
+  };
+
+  template <typename FrameTraversal>
+  class Iterator final {
+   public:
+    using value_type = nsIFrame* const;
+    using pointer = value_type*;
+    using reference = value_type&;
+    using difference_type = ptrdiff_t;
+    using iterator_category = std::input_iterator_tag;
+
+    explicit constexpr Iterator(nsIFrame* aCurrent) : mCurrent(aCurrent) {}
+
+    nsIFrame* operator*() const { return mCurrent; }
+
+    Iterator& operator++() {
+      mCurrent = FrameTraversal::Next(mCurrent);
+      return *this;
+    }
+    Iterator& operator--() {
+      mCurrent = FrameTraversal::Prev(mCurrent);
+      return *this;
+    }
+
+    Iterator operator++(int) {
+      auto ret = *this;
+      ++*this;
+      return ret;
+    }
+    Iterator operator--(int) {
+      auto ret = *this;
+      --*this;
+      return ret;
+    }
+
+    bool operator==(const Iterator<FrameTraversal>& aOther) const = default;
+    bool operator!=(const Iterator<FrameTraversal>& aOther) const = default;
+
+   private:
+    nsIFrame* mCurrent;
+  };
+
+  iterator begin() const { return iterator(mFirstChild); }
+  const_iterator cbegin() const { return begin(); }
+  iterator end() const { return iterator(nullptr); }
+  const_iterator cend() const { return end(); }
+  reverse_iterator rbegin() const { return reverse_iterator(mLastChild); }
+  const_reverse_iterator crbegin() const { return rbegin(); }
+  reverse_iterator rend() const { return reverse_iterator(nullptr); }
+  const_reverse_iterator crend() const { return rend(); }
+
+ private:
+  static const nsFrameList sEmptyList;
+
+#if defined(DEBUG_FRAME_LIST)
+  void VerifyList() const;
+#else
+  void VerifyList() const {}
+#endif
+
+ protected:
+  static void UnhookFrameFromSiblings(nsIFrame* aFrame);
+
+  nsIFrame* mFirstChild;
+  nsIFrame* mLastChild;
+};
+
+namespace mozilla {
+
+#if defined(DEBUG_FRAME_DUMP)
+extern const char* ChildListName(FrameChildListID aListID);
+#endif
+
+using FrameChildListIDs = EnumSet<FrameChildListID>;
+
+class FrameChildList {
+ public:
+  FrameChildList(const nsFrameList& aList, FrameChildListID aID)
+      : mList(aList.Clone()), mID(aID) {}
+  nsFrameList mList;
+  FrameChildListID mID;
+};
+
+class MOZ_RAII AutoFrameListPtr final {
+ public:
+  AutoFrameListPtr(nsPresContext* aPresContext, nsFrameList* aFrameList)
+      : mPresContext(aPresContext), mFrameList(aFrameList) {}
+  ~AutoFrameListPtr();
+  operator nsFrameList*() const { return mFrameList; }
+  nsFrameList* operator->() const { return mFrameList; }
+
+ private:
+  nsPresContext* mPresContext;
+  nsFrameList* mFrameList;
+};
+
+}  
+
+#endif

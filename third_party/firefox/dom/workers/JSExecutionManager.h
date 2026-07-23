@@ -1,0 +1,124 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_workers_jsexecutionmanager_h_
+#define mozilla_dom_workers_jsexecutionmanager_h_
+
+#include <stdint.h>
+
+#include <deque>
+
+#include "MainThreadUtils.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/CondVar.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/RefPtr.h"
+#include "nsISupports.h"
+
+class nsIGlobalObject;
+namespace mozilla {
+
+class ErrorResult;
+
+namespace dom {
+class WorkerPrivate;
+
+
+class AutoRequestJSThreadExecution;
+class AutoYieldJSThreadExecution;
+
+class JSExecutionManager {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(JSExecutionManager)
+
+  explicit JSExecutionManager(int32_t aMaxRunning = 1)
+      : mMaxRunning(aMaxRunning) {}
+
+  enum class RequestState { Granted, ExecutingAlready };
+
+  static void Initialize();
+  static void Shutdown();
+
+  static JSExecutionManager* GetSABSerializationManager();
+
+ private:
+  friend class AutoRequestJSThreadExecution;
+  friend class AutoYieldJSThreadExecution;
+  ~JSExecutionManager() = default;
+
+
+  RequestState RequestJSThreadExecution();
+
+  void YieldJSThreadExecution();
+
+  bool YieldJSThreadExecutionIfGranted();
+
+  RequestState RequestJSThreadExecutionMainThread();
+
+  static JSExecutionManager* mCurrentMTManager;
+
+  std::deque<WorkerPrivate*> mExecutionQueue
+      MOZ_GUARDED_BY(mExecutionQueueMutex);
+
+  int32_t mRunning MOZ_GUARDED_BY(mExecutionQueueMutex) = 0;
+
+  int32_t mMaxRunning MOZ_GUARDED_BY(mExecutionQueueMutex) = 1;
+
+  Mutex mExecutionQueueMutex =
+      Mutex{"JSExecutionManager::sExecutionQueueMutex"};
+
+  CondVar mExecutionQueueCondVar =
+      CondVar{mExecutionQueueMutex, "JSExecutionManager::sExecutionQueueMutex"};
+
+  bool mMainThreadIsExecuting = false;
+
+  bool mMainThreadAwaitingExecution MOZ_GUARDED_BY(mExecutionQueueMutex) =
+      false;
+};
+
+class MOZ_STACK_CLASS AutoRequestJSThreadExecution {
+ public:
+  explicit AutoRequestJSThreadExecution(nsIGlobalObject* aGlobalObject,
+                                        bool aIsMainThread);
+
+  ~AutoRequestJSThreadExecution() {
+    if (mExecutionGrantingManager) {
+      mExecutionGrantingManager->YieldJSThreadExecution();
+    }
+    if (mIsMainThread) {
+      if (mOldGrantingManager) {
+        mOldGrantingManager->RequestJSThreadExecution();
+      }
+      JSExecutionManager::mCurrentMTManager = mOldGrantingManager;
+    }
+  }
+
+ private:
+  RefPtr<JSExecutionManager> mExecutionGrantingManager;
+  RefPtr<JSExecutionManager> mOldGrantingManager;
+
+  bool mIsMainThread;
+};
+
+class MOZ_STACK_CLASS AutoYieldJSThreadExecution {
+ public:
+  AutoYieldJSThreadExecution();
+
+  ~AutoYieldJSThreadExecution() {
+    if (mExecutionGrantingManager) {
+      mExecutionGrantingManager->RequestJSThreadExecution();
+      if (NS_IsMainThread()) {
+        JSExecutionManager::mCurrentMTManager = mExecutionGrantingManager;
+      }
+    }
+  }
+
+ private:
+  RefPtr<JSExecutionManager> mExecutionGrantingManager;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_workers_jsexecutionmanager_h_

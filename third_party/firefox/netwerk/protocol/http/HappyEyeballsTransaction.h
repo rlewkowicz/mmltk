@@ -1,0 +1,110 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef HappyEyeballsTransaction_h_
+#define HappyEyeballsTransaction_h_
+
+#include <functional>
+
+#include "mozilla/Maybe.h"
+#include "SpeculativeTransaction.h"
+#include "ZeroRttHandle.h"
+
+namespace mozilla {
+namespace net {
+
+class HappyEyeballsConnectionAttempt;
+class nsHttpTransaction;
+
+class HappyEyeballsTransaction final : public SpeculativeTransaction {
+ public:
+  using StatusForwarder = std::function<void(nsITransport*, nsresult, int64_t)>;
+  using ClientAuthForwarder = std::function<void()>;
+
+  HappyEyeballsTransaction(nsHttpConnectionInfo* aConnInfo,
+                           nsIInterfaceRequestor* aCallbacks, uint32_t aCaps,
+                           uint64_t aBrowserId,
+                           StatusForwarder&& aStatusForwarder,
+                           ClientAuthForwarder&& aClientAuthRequestedForwarder,
+                           ClientAuthForwarder&& aClientAuthSelectedForwarder,
+                           ZeroRttHandle* aZeroRttHandle);
+
+  uint64_t BrowserId() override { return mBrowserId; }
+
+  void SetConnectedCallback(std::function<void(nsresult)>&& aCallback) {
+    mCloseCallback = std::move(aCallback);
+  }
+
+  void Adopt(nsHttpTransaction* aRealTxn);
+
+  enum class State : uint8_t {
+    Racing,
+    Adopted,
+    Closed,
+  };
+  State GetState() const { return mState; }
+
+  bool IsAdopted() const { return !!mRealTxn; }
+
+  void OnTransportStatus(nsITransport* aTransport, nsresult aStatus,
+                         int64_t aProgress) override;
+  void OnClientAuthCertificateRequested() override;
+  void OnClientAuthCertificateSelected() override;
+  nsresult ReadSegments(nsAHttpSegmentReader* aReader, uint32_t aCount,
+                        uint32_t* aCountRead) override;
+  nsresult WriteSegments(nsAHttpSegmentWriter* aWriter, uint32_t aCount,
+                         uint32_t* aCountWritten) override;
+  void Close(nsresult aReason) override;
+  nsHttpTransaction* QueryHttpTransaction() override;
+
+  bool AllowedToConnectToIpAddressSpace(
+      nsILoadInfo::IPAddressSpace aTargetIpAddressSpace) override;
+
+  const nsHttpRequestHead* RequestHead() override;
+
+  nsresult FetchHTTPSRR() override;
+  nsresult OnHTTPSRRAvailable(nsIDNSHTTPSSVCRecord* aHTTPSSVCRecord,
+                              nsISVCBRecord* aHighestPriorityRecord,
+                              const nsACString& aCname) override;
+
+  bool Do0RTT(bool aCanSendEarlyData) override;
+  nsresult Finish0RTT(bool aRestart, bool aAlpnChanged) override {
+    return mZeroRttHandle
+               ? mZeroRttHandle->Finish0RTT(this, aRestart, aAlpnChanged)
+               : NS_OK;
+  }
+
+  Maybe<uint64_t>& Request0RttStreamOffset() {
+    return m0RttRequestStreamOffset;
+  }
+  const Maybe<uint64_t>& Request0RttStreamOffset() const {
+    return m0RttRequestStreamOffset;
+  }
+  bool Entered0RTT() const { return m0RttRequestStreamOffset.isSome(); }
+
+  void MaybeRemoveSSLTokens();
+
+ private:
+  ~HappyEyeballsTransaction() override;
+
+  void Transition(State aNext, nsHttpTransaction* aRealTxn = nullptr,
+                  nsresult aReason = NS_OK);
+
+  StatusForwarder mStatusForwarder;
+  ClientAuthForwarder mClientAuthRequestedForwarder;
+  ClientAuthForwarder mClientAuthSelectedForwarder;
+  RefPtr<ZeroRttHandle> mZeroRttHandle;
+  uint64_t mBrowserId = 0;
+
+  RefPtr<nsHttpTransaction> mRealTxn;
+
+  Maybe<uint64_t> m0RttRequestStreamOffset;
+
+  State mState = State::Racing;
+};
+
+}  
+}  
+
+#endif

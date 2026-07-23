@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ChaosMode_h
+#define mozilla_ChaosMode_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Atomics.h"
+
+#include <cstdint>
+
+namespace mozilla {
+
+enum class ChaosFeature : uint32_t {
+  None = 0x0,
+  ThreadScheduling = 0x1,
+  NetworkScheduling = 0x2,
+  TimerScheduling = 0x4,
+  IOAmounts = 0x8,
+  HashTableIteration = 0x10,
+  ImageCache = 0x20,
+  TaskDispatching = 0x40,
+  TaskRunning = 0x80,
+  Any = 0xffffffff,
+};
+
+namespace detail {
+extern MFBT_DATA Atomic<uint32_t, Relaxed> gChaosModeCounter;
+extern MFBT_DATA ChaosFeature gChaosFeatures;
+}  
+
+class ChaosMode {
+ public:
+  static void SetChaosFeature(ChaosFeature aChaosFeature) {
+    detail::gChaosFeatures = aChaosFeature;
+  }
+
+  static bool isActive(ChaosFeature aFeature) {
+    return detail::gChaosModeCounter > 0 &&
+           (uint32_t(detail::gChaosFeatures) & uint32_t(aFeature));
+  }
+
+  static void enterChaosMode() { detail::gChaosModeCounter++; }
+
+  static void leaveChaosMode() {
+    MOZ_ASSERT(detail::gChaosModeCounter > 0);
+    detail::gChaosModeCounter--;
+  }
+
+  static uint32_t randomUint32LessThan(uint32_t aBound) {
+    MOZ_ASSERT(aBound != 0);
+    return uint32_t(rand()) % aBound;
+  }
+
+  static int32_t randomInt32InRange(int32_t aLow, int32_t aHigh) {
+    MOZ_ASSERT(aHigh >= aLow);
+    return (int32_t(rand()) % (aHigh - aLow + 1)) + aLow;
+  }
+};
+
+} 
+
+#endif /* mozilla_ChaosMode_h */

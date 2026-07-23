@@ -1,0 +1,46 @@
+// Copyright 2020 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_STRINGS_INTERNAL_STRING_CONSTANT_H_
+#define ABSL_STRINGS_INTERNAL_STRING_CONSTANT_H_
+
+#include "absl/meta/type_traits.h"
+#include "absl/strings/string_view.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace strings_internal {
+
+template <typename T>
+struct StringConstant {
+ private:
+  static constexpr bool TryConstexprEval(absl::string_view view) {
+    return view.empty() || 2 * view[0] != 1;
+  }
+
+ public:
+  static constexpr absl::string_view value = T{}();
+  constexpr absl::string_view operator()() const { return value; }
+
+  static_assert(TryConstexprEval(value),
+                "The input string_view must point to constant data.");
+};
+
+template <typename T>
+constexpr StringConstant<T> MakeStringConstant(T) {
+  return {};
+}
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_STRINGS_INTERNAL_STRING_CONSTANT_H_

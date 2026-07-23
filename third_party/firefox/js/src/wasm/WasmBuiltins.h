@@ -1,0 +1,301 @@
+/*
+ * Copyright 2017 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_builtins_h
+#define wasm_builtins_h
+
+#include "intgemm/IntegerGemmIntrinsic.h"
+#include "jit/IonTypes.h"
+#include "wasm/WasmBuiltinModuleGenerated.h"
+#include "wasm/WasmConstants.h"
+
+namespace js {
+class JitFrameIter;
+namespace jit {
+class AutoMarkJitCodeWritableForThread;
+struct ResumeFromException;
+}  
+namespace wasm {
+
+class WasmFrameIter;
+class CodeRange;
+class FuncType;
+
+
+enum class SymbolicAddress {
+  ToInt32,
+#if defined(JS_CODEGEN_ARM)
+  aeabi_idivmod,
+  aeabi_uidivmod,
+#endif
+  ModD,
+  CeilD,
+  CeilF,
+  FloorD,
+  FloorF,
+  TruncD,
+  TruncF,
+  NearbyIntD,
+  NearbyIntF,
+  AddSubI128,
+  MulI64Wide,
+  ArrayMemMove,
+  ArrayRefsMove,
+  HandleDebugTrap,
+  HandleRequestTierUp,
+  HandleThrow,
+  HandleTrap,
+  ReportV128JSCall,
+  CallImport_General,
+  CoerceInPlace_ToInt32,
+  CoerceInPlace_ToNumber,
+  CoerceInPlace_JitEntry,
+  CoerceInPlace_ToBigInt,
+  AllocateBigInt,
+  BoxValue_Anyref,
+  DivI64,
+  UDivI64,
+  ModI64,
+  UModI64,
+  TruncateDoubleToInt64,
+  TruncateDoubleToUint64,
+  SaturatingTruncateDoubleToInt64,
+  SaturatingTruncateDoubleToUint64,
+  Uint64ToFloat32,
+  Uint64ToDouble,
+  Int64ToFloat32,
+  Int64ToDouble,
+  MemoryGrowM32,
+  MemoryGrowM64,
+  MemorySizeM32,
+  MemorySizeM64,
+  WaitI32M32,
+  WaitI32M64,
+  WaitI64M32,
+  WaitI64M64,
+  WakeM32,
+  WakeM64,
+  MemCopyM32,
+  MemCopySharedM32,
+  MemCopyM64,
+  MemCopySharedM64,
+  MemCopyAny,
+  DataDrop,
+  MemFillM32,
+  MemFillSharedM32,
+  MemFillM64,
+  MemFillSharedM64,
+  MemDiscardM32,
+  MemDiscardSharedM32,
+  MemDiscardM64,
+  MemDiscardSharedM64,
+  MemInitM32,
+  MemInitM64,
+  TableCopy,
+  ElemDrop,
+  TableFill,
+  TableGet,
+  TableGrow,
+  TableInit,
+  TableSet,
+  TableSize,
+  RefFunc,
+  PostBarrierEdge,
+  PostBarrierEdgePrecise,
+  PostBarrierWholeCell,
+#ifdef ENABLE_WASM_JSPI
+  ResumeBarrier,
+#endif
+  ExceptionNew,
+  ThrowException,
+  StructNewIL_true,
+  StructNewIL_false,
+  StructNewOOL_true,
+  StructNewOOL_false,
+  ArrayNew_true,
+  ArrayNew_false,
+  ArrayNewData,
+  ArrayNewElem,
+  ArrayInitData,
+  ArrayInitElem,
+  ArrayCopy,
+  SlotsToAllocKindBytesTable,
+#ifdef ENABLE_WASM_JSPI
+  ContNew,
+  ContNewEmpty,
+  ContUnwind,
+#endif
+#define VISIT_BUILTIN_FUNC(op, export, sa_name, ...) sa_name,
+  FOR_EACH_BUILTIN_MODULE_FUNC(VISIT_BUILTIN_FUNC)
+#undef VISIT_BUILTIN_FUNC
+#ifdef WASM_CODEGEN_DEBUG
+      PrintI32,
+  PrintPtr,
+  PrintF32,
+  PrintF64,
+  PrintText,
+  Printf,
+#endif
+  Limit
+};
+
+
+enum class FailureMode : uint8_t {
+  Infallible,
+  FailOnNegI32,
+  FailOnMaxI32,
+  FailOnNullPtr,
+  FailOnInvalidRef,
+};
+
+
+static constexpr size_t SymbolicAddressSignatureMaxArgs = 14;
+
+struct SymbolicAddressSignature {
+  const SymbolicAddress identity;
+  const jit::MIRType retType;
+  const FailureMode failureMode;
+  const Trap failureTrap;
+  const uint8_t numArgs;
+  const jit::MIRType argTypes[SymbolicAddressSignatureMaxArgs + 1];
+};
+
+
+static_assert(sizeof(SymbolicAddressSignature) <= 32,
+              "SymbolicAddressSignature unexpectedly large");
+
+
+extern const SymbolicAddressSignature SASigCeilD;
+extern const SymbolicAddressSignature SASigCeilF;
+extern const SymbolicAddressSignature SASigFloorD;
+extern const SymbolicAddressSignature SASigFloorF;
+extern const SymbolicAddressSignature SASigTruncD;
+extern const SymbolicAddressSignature SASigTruncF;
+extern const SymbolicAddressSignature SASigNearbyIntD;
+extern const SymbolicAddressSignature SASigNearbyIntF;
+extern const SymbolicAddressSignature SASigAddSubI128;
+extern const SymbolicAddressSignature SASigMulI64Wide;
+extern const SymbolicAddressSignature SASigArrayMemMove;
+extern const SymbolicAddressSignature SASigArrayRefsMove;
+extern const SymbolicAddressSignature SASigMemoryGrowM32;
+extern const SymbolicAddressSignature SASigMemoryGrowM64;
+extern const SymbolicAddressSignature SASigMemorySizeM32;
+extern const SymbolicAddressSignature SASigMemorySizeM64;
+extern const SymbolicAddressSignature SASigWaitI32M32;
+extern const SymbolicAddressSignature SASigWaitI32M64;
+extern const SymbolicAddressSignature SASigWaitI64M32;
+extern const SymbolicAddressSignature SASigWaitI64M64;
+extern const SymbolicAddressSignature SASigWakeM32;
+extern const SymbolicAddressSignature SASigWakeM64;
+extern const SymbolicAddressSignature SASigMemCopyM32;
+extern const SymbolicAddressSignature SASigMemCopySharedM32;
+extern const SymbolicAddressSignature SASigMemCopyM64;
+extern const SymbolicAddressSignature SASigMemCopySharedM64;
+extern const SymbolicAddressSignature SASigMemCopyAny;
+extern const SymbolicAddressSignature SASigDataDrop;
+extern const SymbolicAddressSignature SASigMemFillM32;
+extern const SymbolicAddressSignature SASigMemFillSharedM32;
+extern const SymbolicAddressSignature SASigMemFillM64;
+extern const SymbolicAddressSignature SASigMemFillSharedM64;
+extern const SymbolicAddressSignature SASigMemDiscardM32;
+extern const SymbolicAddressSignature SASigMemDiscardSharedM32;
+extern const SymbolicAddressSignature SASigMemDiscardM64;
+extern const SymbolicAddressSignature SASigMemDiscardSharedM64;
+extern const SymbolicAddressSignature SASigMemInitM32;
+extern const SymbolicAddressSignature SASigMemInitM64;
+extern const SymbolicAddressSignature SASigTableCopy;
+extern const SymbolicAddressSignature SASigElemDrop;
+extern const SymbolicAddressSignature SASigTableFill;
+extern const SymbolicAddressSignature SASigTableGet;
+extern const SymbolicAddressSignature SASigTableGrow;
+extern const SymbolicAddressSignature SASigTableInit;
+extern const SymbolicAddressSignature SASigTableSet;
+extern const SymbolicAddressSignature SASigTableSize;
+extern const SymbolicAddressSignature SASigRefFunc;
+extern const SymbolicAddressSignature SASigPostBarrierEdge;
+extern const SymbolicAddressSignature SASigPostBarrierEdgePrecise;
+extern const SymbolicAddressSignature SASigPostBarrierWholeCell;
+extern const SymbolicAddressSignature SASigExceptionNew;
+extern const SymbolicAddressSignature SASigThrowException;
+extern const SymbolicAddressSignature SASigStructNewIL_true;
+extern const SymbolicAddressSignature SASigStructNewIL_false;
+extern const SymbolicAddressSignature SASigStructNewOOL_true;
+extern const SymbolicAddressSignature SASigStructNewOOL_false;
+extern const SymbolicAddressSignature SASigArrayNew_true;
+extern const SymbolicAddressSignature SASigArrayNew_false;
+extern const SymbolicAddressSignature SASigArrayNewData;
+extern const SymbolicAddressSignature SASigArrayNewElem;
+extern const SymbolicAddressSignature SASigArrayInitData;
+extern const SymbolicAddressSignature SASigArrayInitElem;
+extern const SymbolicAddressSignature SASigArrayCopy;
+#ifdef ENABLE_WASM_JSPI
+extern const SymbolicAddressSignature SASigContNew;
+extern const SymbolicAddressSignature SASigContNewEmpty;
+extern const SymbolicAddressSignature SASigContUnwind;
+#endif
+#define VISIT_BUILTIN_FUNC(op, export, sa_name, ...) \
+  extern const SymbolicAddressSignature SASig##sa_name;
+FOR_EACH_BUILTIN_MODULE_FUNC(VISIT_BUILTIN_FUNC)
+#undef VISIT_BUILTIN_FUNC
+
+bool IsRoundingFunction(SymbolicAddress callee, jit::RoundingMode* mode);
+
+
+bool NeedsBuiltinThunk(SymbolicAddress sym);
+
+inline jit::ABIKind ABIForBuiltin(SymbolicAddress sym) {
+  if (NeedsBuiltinThunk(sym)) {
+    return jit::ABIKind::Wasm;
+  }
+
+  return jit::ABIKind::System;
+}
+
+
+bool LookupBuiltinThunk(void* pc, const CodeRange** codeRange,
+                        const uint8_t** codeBase);
+
+
+bool EnsureBuiltinThunksInitialized();
+bool EnsureBuiltinThunksInitialized(
+    jit::AutoMarkJitCodeWritableForThread& writable);
+
+void HandleExceptionWasm(JSContext* cx, JitFrameIter& iter,
+                         jit::ResumeFromException* rfe);
+
+void* SymbolicAddressTarget(SymbolicAddress sym);
+
+void* ProvisionalLazyJitEntryStub();
+
+void* MaybeGetTypedNative(JSFunction* f, const FuncType& funcType);
+
+void ReleaseBuiltinThunks();
+
+void* AddressOf(SymbolicAddress imm, jit::ABIFunctionType* abiType);
+
+#ifdef WASM_CODEGEN_DEBUG
+void PrintI32(int32_t val);
+void PrintF32(float val);
+void PrintF64(double val);
+void PrintPtr(uint8_t* val);
+void PrintText(const char* out);
+void Printf(const char* out, uintptr_t value);
+#endif
+
+}  
+}  
+
+#endif  // wasm_builtins_h

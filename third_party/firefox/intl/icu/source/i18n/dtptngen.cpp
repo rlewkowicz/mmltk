@@ -1,0 +1,2814 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2007-2016, International Business Machines Corporation and
+* others. All Rights Reserved.
+*******************************************************************************
+*
+* File DTPTNGEN.CPP
+*
+*******************************************************************************
+*/
+
+#include "unicode/utypes.h"
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/datefmt.h"
+#include "unicode/decimfmt.h"
+#include "unicode/dtfmtsym.h"
+#include "unicode/dtptngen.h"
+#include "unicode/localpointer.h"
+#include "unicode/simpleformatter.h"
+#include "unicode/smpdtfmt.h"
+#include "unicode/udat.h"
+#include "unicode/udatpg.h"
+#include "unicode/uniset.h"
+#include "unicode/uloc.h"
+#include "unicode/ures.h"
+#include "unicode/ustring.h"
+#include "unicode/rep.h"
+#include "unicode/region.h"
+#include "cpputils.h"
+#include "mutex.h"
+#include "umutex.h"
+#include "cmemory.h"
+#include "cstring.h"
+#include "locbased.h"
+#include "hash.h"
+#include "uhash.h"
+#include "ulocimp.h"
+#include "uresimp.h"
+#include "ulocimp.h"
+#include "dtptngen_impl.h"
+#include "ucln_in.h"
+#include "charstr.h"
+#include "uassert.h"
+
+#if U_CHARSET_FAMILY==U_EBCDIC_FAMILY
+#define U_USE_ASCII_BUNDLE_ITERATOR
+#define U_SORT_ASCII_BUNDLE_ITERATOR
+#endif
+
+#if defined(U_USE_ASCII_BUNDLE_ITERATOR)
+
+#include "unicode/ustring.h"
+#include "uarrsort.h"
+
+struct UResAEntry {
+    char16_t *key;
+    UResourceBundle *item;
+};
+
+struct UResourceBundleAIterator {
+    UResourceBundle  *bund;
+    UResAEntry *entries;
+    int32_t num;
+    int32_t cursor;
+};
+
+
+U_CDECL_BEGIN
+
+static int32_t U_CALLCONV
+ures_a_codepointSort(const void *context, const void *left, const void *right) {
+    return u_strcmp(((const UResAEntry *)left)->key,
+                    ((const UResAEntry *)right)->key);
+}
+
+U_CDECL_END
+
+static void ures_a_open(UResourceBundleAIterator *aiter, UResourceBundle *bund, UErrorCode *status) {
+    if(U_FAILURE(*status)) {
+        return;
+    }
+    aiter->bund = bund;
+    aiter->num = ures_getSize(aiter->bund);
+    aiter->cursor = 0;
+#if !defined(U_SORT_ASCII_BUNDLE_ITERATOR)
+    aiter->entries = nullptr;
+#else
+    aiter->entries = (UResAEntry*)uprv_malloc(sizeof(UResAEntry)*aiter->num);
+    for(int i=0;i<aiter->num;i++) {
+        aiter->entries[i].item = ures_getByIndex(aiter->bund, i, nullptr, status);
+        const char *akey = ures_getKey(aiter->entries[i].item);
+        int32_t len = uprv_strlen(akey)+1;
+        aiter->entries[i].key = (char16_t*)uprv_malloc(len*sizeof(char16_t));
+        u_charsToUChars(akey, aiter->entries[i].key, len);
+    }
+    uprv_sortArray(aiter->entries, aiter->num, sizeof(UResAEntry), ures_a_codepointSort, nullptr, true, status);
+#endif
+}
+
+static void ures_a_close(UResourceBundleAIterator *aiter) {
+#if defined(U_SORT_ASCII_BUNDLE_ITERATOR)
+    for(int i=0;i<aiter->num;i++) {
+        uprv_free(aiter->entries[i].key);
+        ures_close(aiter->entries[i].item);
+    }
+#endif
+}
+
+static const char16_t *ures_a_getNextString(UResourceBundleAIterator *aiter, int32_t *len, const char **key, UErrorCode *err) {
+#if !defined(U_SORT_ASCII_BUNDLE_ITERATOR)
+    return ures_getNextString(aiter->bund, len, key, err);
+#else
+    if(U_FAILURE(*err)) return nullptr;
+    UResourceBundle *item = aiter->entries[aiter->cursor].item;
+    const char16_t* ret = ures_getString(item, len, err);
+    *key = ures_getKey(item);
+    aiter->cursor++;
+    return ret;
+#endif
+}
+
+
+#endif
+
+
+U_NAMESPACE_BEGIN
+
+static const char16_t Canonical_Items[] = {
+    CAP_G, LOW_Y, CAP_Q, CAP_M, LOW_W, CAP_W, CAP_E,
+    CAP_D, CAP_F, LOW_D, LOW_A, 
+    CAP_H, LOW_M, LOW_S, CAP_S, LOW_V, 0
+};
+
+static const dtTypeElem dtTypes[] = {
+    {CAP_G, UDATPG_ERA_FIELD, DT_SHORT, 1, 3,},
+    {CAP_G, UDATPG_ERA_FIELD, DT_LONG,  4, 0},
+    {CAP_G, UDATPG_ERA_FIELD, DT_NARROW, 5, 0},
+
+    {LOW_Y, UDATPG_YEAR_FIELD, DT_NUMERIC, 1, 20},
+    {CAP_Y, UDATPG_YEAR_FIELD, DT_NUMERIC + DT_DELTA, 1, 20},
+    {LOW_U, UDATPG_YEAR_FIELD, DT_NUMERIC + 2*DT_DELTA, 1, 20},
+    {LOW_R, UDATPG_YEAR_FIELD, DT_NUMERIC + 3*DT_DELTA, 1, 20},
+    {CAP_U, UDATPG_YEAR_FIELD, DT_SHORT, 1, 3},
+    {CAP_U, UDATPG_YEAR_FIELD, DT_LONG, 4, 0},
+    {CAP_U, UDATPG_YEAR_FIELD, DT_NARROW, 5, 0},
+
+    {CAP_Q, UDATPG_QUARTER_FIELD, DT_NUMERIC, 1, 2},
+    {CAP_Q, UDATPG_QUARTER_FIELD, DT_SHORT, 3, 0},
+    {CAP_Q, UDATPG_QUARTER_FIELD, DT_LONG, 4, 0},
+    {CAP_Q, UDATPG_QUARTER_FIELD, DT_NARROW, 5, 0},
+    {LOW_Q, UDATPG_QUARTER_FIELD, DT_NUMERIC + DT_DELTA, 1, 2},
+    {LOW_Q, UDATPG_QUARTER_FIELD, DT_SHORT - DT_DELTA, 3, 0},
+    {LOW_Q, UDATPG_QUARTER_FIELD, DT_LONG - DT_DELTA, 4, 0},
+    {LOW_Q, UDATPG_QUARTER_FIELD, DT_NARROW - DT_DELTA, 5, 0},
+
+    {CAP_M, UDATPG_MONTH_FIELD, DT_NUMERIC, 1, 2},
+    {CAP_M, UDATPG_MONTH_FIELD, DT_SHORT, 3, 0},
+    {CAP_M, UDATPG_MONTH_FIELD, DT_LONG, 4, 0},
+    {CAP_M, UDATPG_MONTH_FIELD, DT_NARROW, 5, 0},
+    {CAP_L, UDATPG_MONTH_FIELD, DT_NUMERIC + DT_DELTA, 1, 2},
+    {CAP_L, UDATPG_MONTH_FIELD, DT_SHORT - DT_DELTA, 3, 0},
+    {CAP_L, UDATPG_MONTH_FIELD, DT_LONG - DT_DELTA, 4, 0},
+    {CAP_L, UDATPG_MONTH_FIELD, DT_NARROW - DT_DELTA, 5, 0},
+    {LOW_L, UDATPG_MONTH_FIELD, DT_NUMERIC + DT_DELTA, 1, 1},
+
+    {LOW_W, UDATPG_WEEK_OF_YEAR_FIELD, DT_NUMERIC, 1, 2},
+
+    {CAP_W, UDATPG_WEEK_OF_MONTH_FIELD, DT_NUMERIC, 1, 0},
+
+    {CAP_E, UDATPG_WEEKDAY_FIELD, DT_SHORT, 1, 3},
+    {CAP_E, UDATPG_WEEKDAY_FIELD, DT_LONG, 4, 0},
+    {CAP_E, UDATPG_WEEKDAY_FIELD, DT_NARROW, 5, 0},
+    {CAP_E, UDATPG_WEEKDAY_FIELD, DT_SHORTER, 6, 0},
+    {LOW_C, UDATPG_WEEKDAY_FIELD, DT_NUMERIC + 2*DT_DELTA, 1, 2},
+    {LOW_C, UDATPG_WEEKDAY_FIELD, DT_SHORT - 2*DT_DELTA, 3, 0},
+    {LOW_C, UDATPG_WEEKDAY_FIELD, DT_LONG - 2*DT_DELTA, 4, 0},
+    {LOW_C, UDATPG_WEEKDAY_FIELD, DT_NARROW - 2*DT_DELTA, 5, 0},
+    {LOW_C, UDATPG_WEEKDAY_FIELD, DT_SHORTER - 2*DT_DELTA, 6, 0},
+    {LOW_E, UDATPG_WEEKDAY_FIELD, DT_NUMERIC + DT_DELTA, 1, 2}, 
+    {LOW_E, UDATPG_WEEKDAY_FIELD, DT_SHORT - DT_DELTA, 3, 0},
+    {LOW_E, UDATPG_WEEKDAY_FIELD, DT_LONG - DT_DELTA, 4, 0},
+    {LOW_E, UDATPG_WEEKDAY_FIELD, DT_NARROW - DT_DELTA, 5, 0},
+    {LOW_E, UDATPG_WEEKDAY_FIELD, DT_SHORTER - DT_DELTA, 6, 0},
+
+    {LOW_D, UDATPG_DAY_FIELD, DT_NUMERIC, 1, 2},
+    {LOW_G, UDATPG_DAY_FIELD, DT_NUMERIC + DT_DELTA, 1, 20}, 
+
+    {CAP_D, UDATPG_DAY_OF_YEAR_FIELD, DT_NUMERIC, 1, 3},
+
+    {CAP_F, UDATPG_DAY_OF_WEEK_IN_MONTH_FIELD, DT_NUMERIC, 1, 0},
+
+    {LOW_A, UDATPG_DAYPERIOD_FIELD, DT_SHORT, 1, 3},
+    {LOW_A, UDATPG_DAYPERIOD_FIELD, DT_LONG, 4, 0},
+    {LOW_A, UDATPG_DAYPERIOD_FIELD, DT_NARROW, 5, 0},
+    {LOW_B, UDATPG_DAYPERIOD_FIELD, DT_SHORT - DT_DELTA, 1, 3},
+    {LOW_B, UDATPG_DAYPERIOD_FIELD, DT_LONG - DT_DELTA, 4, 0},
+    {LOW_B, UDATPG_DAYPERIOD_FIELD, DT_NARROW - DT_DELTA, 5, 0},
+    {CAP_B, UDATPG_DAYPERIOD_FIELD, DT_SHORT - 3*DT_DELTA, 1, 3},
+    {CAP_B, UDATPG_DAYPERIOD_FIELD, DT_LONG - 3*DT_DELTA, 4, 0},
+    {CAP_B, UDATPG_DAYPERIOD_FIELD, DT_NARROW - 3*DT_DELTA, 5, 0},
+
+    {CAP_H, UDATPG_HOUR_FIELD, DT_NUMERIC + 10*DT_DELTA, 1, 2}, 
+    {LOW_K, UDATPG_HOUR_FIELD, DT_NUMERIC + 11*DT_DELTA, 1, 2}, 
+    {LOW_H, UDATPG_HOUR_FIELD, DT_NUMERIC, 1, 2}, 
+    {CAP_K, UDATPG_HOUR_FIELD, DT_NUMERIC + DT_DELTA, 1, 2}, 
+    {CAP_J, UDATPG_HOUR_FIELD, DT_NUMERIC + 5*DT_DELTA, 1, 2}, 
+    {LOW_J, UDATPG_HOUR_FIELD, DT_NUMERIC + 6*DT_DELTA, 1, 6}, 
+    {CAP_C, UDATPG_HOUR_FIELD, DT_NUMERIC + 7*DT_DELTA, 1, 6}, 
+
+    {LOW_M, UDATPG_MINUTE_FIELD, DT_NUMERIC, 1, 2},
+
+    {LOW_S, UDATPG_SECOND_FIELD, DT_NUMERIC, 1, 2},
+    {CAP_A, UDATPG_SECOND_FIELD, DT_NUMERIC + DT_DELTA, 1, 1000},
+
+    {CAP_S, UDATPG_FRACTIONAL_SECOND_FIELD, DT_NUMERIC, 1, 1000},
+
+    {LOW_V, UDATPG_ZONE_FIELD, DT_SHORT - 2*DT_DELTA, 1, 0},
+    {LOW_V, UDATPG_ZONE_FIELD, DT_LONG - 2*DT_DELTA, 4, 0},
+    {LOW_Z, UDATPG_ZONE_FIELD, DT_SHORT, 1, 3},
+    {LOW_Z, UDATPG_ZONE_FIELD, DT_LONG, 4, 0},
+    {CAP_Z, UDATPG_ZONE_FIELD, DT_NARROW - DT_DELTA, 1, 3},
+    {CAP_Z, UDATPG_ZONE_FIELD, DT_LONG - DT_DELTA, 4, 0},
+    {CAP_Z, UDATPG_ZONE_FIELD, DT_SHORT - DT_DELTA, 5, 0},
+    {CAP_O, UDATPG_ZONE_FIELD, DT_SHORT - DT_DELTA, 1, 0},
+    {CAP_O, UDATPG_ZONE_FIELD, DT_LONG - DT_DELTA, 4, 0},
+    {CAP_V, UDATPG_ZONE_FIELD, DT_SHORT - DT_DELTA, 1, 0},
+    {CAP_V, UDATPG_ZONE_FIELD, DT_LONG - DT_DELTA, 2, 0},
+    {CAP_V, UDATPG_ZONE_FIELD, DT_LONG-1 - DT_DELTA, 3, 0},
+    {CAP_V, UDATPG_ZONE_FIELD, DT_LONG-2 - DT_DELTA, 4, 0},
+    {CAP_X, UDATPG_ZONE_FIELD, DT_NARROW - DT_DELTA, 1, 0},
+    {CAP_X, UDATPG_ZONE_FIELD, DT_SHORT - DT_DELTA, 2, 0},
+    {CAP_X, UDATPG_ZONE_FIELD, DT_LONG - DT_DELTA, 4, 0},
+    {LOW_X, UDATPG_ZONE_FIELD, DT_NARROW - DT_DELTA, 1, 0},
+    {LOW_X, UDATPG_ZONE_FIELD, DT_SHORT - DT_DELTA, 2, 0},
+    {LOW_X, UDATPG_ZONE_FIELD, DT_LONG - DT_DELTA, 4, 0},
+
+    {0, UDATPG_FIELD_COUNT, 0, 0, 0} , 
+ };
+
+static const char* const CLDR_FIELD_APPEND[] = {
+    "Era", "Year", "Quarter", "Month", "Week", "*", "Day-Of-Week",
+    "*", "*", "Day", "DayPeriod", 
+    "Hour", "Minute", "Second", "FractionalSecond", "Timezone"
+};
+
+static const char* const CLDR_FIELD_NAME[UDATPG_FIELD_COUNT] = {
+    "era", "year", "quarter", "month", "week", "weekOfMonth", "weekday",
+    "dayOfYear", "weekdayOfMonth", "day", "dayperiod", 
+    "hour", "minute", "second", "fractionalSecond", "zone"
+};
+
+static const char* const CLDR_FIELD_WIDTH[] = { 
+    "", "-short", "-narrow"
+};
+
+static constexpr UDateTimePGDisplayWidth UDATPG_WIDTH_APPENDITEM = UDATPG_WIDE;
+static constexpr int32_t UDATPG_FIELD_KEY_MAX = 24; 
+
+static const char16_t UDATPG_ItemFormat[]= {0x7B, 0x30, 0x7D, 0x20, 0x251C, 0x7B, 0x32, 0x7D, 0x3A,
+    0x20, 0x7B, 0x31, 0x7D, 0x2524, 0};  
+
+
+static const char DT_DateTimePatternsTag[]="DateTimePatterns";
+static const char DT_DateAtTimePatternsTag[]="DateTimePatterns%atTime";
+static const char DT_DateTimeCalendarTag[]="calendar";
+static const char DT_DateTimeGregorianTag[]="gregorian";
+static const char DT_DateTimeAppendItemsTag[]="appendItems";
+static const char DT_DateTimeFieldsTag[]="fields";
+static const char DT_DateTimeAvailableFormatsTag[]="availableFormats";
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(DateTimePatternGenerator)
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(DTSkeletonEnumeration)
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(DTRedundantEnumeration)
+
+DateTimePatternGenerator*  U_EXPORT2
+DateTimePatternGenerator::createInstance(UErrorCode& status) {
+    return createInstance(Locale::getDefault(), status);
+}
+
+DateTimePatternGenerator* U_EXPORT2
+DateTimePatternGenerator::createInstance(const Locale& locale, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    LocalPointer<DateTimePatternGenerator> result(
+            new DateTimePatternGenerator(locale, status), status);
+    return U_SUCCESS(status) ? result.orphan() : nullptr;
+}
+
+DateTimePatternGenerator* U_EXPORT2
+DateTimePatternGenerator::createInstanceNoStdPat(const Locale& locale, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    LocalPointer<DateTimePatternGenerator> result(
+            new DateTimePatternGenerator(locale, status, true), status);
+    return U_SUCCESS(status) ? result.orphan() : nullptr;
+}
+
+DateTimePatternGenerator*  U_EXPORT2
+DateTimePatternGenerator::createEmptyInstance(UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    LocalPointer<DateTimePatternGenerator> result(
+            new DateTimePatternGenerator(status), status);
+    return U_SUCCESS(status) ? result.orphan() : nullptr;
+}
+
+DateTimePatternGenerator::DateTimePatternGenerator(UErrorCode &status) :
+    skipMatcher(nullptr),
+    fAvailableFormatKeyHash(nullptr),
+    fDefaultHourFormatChar(0),
+    internalErrorCode(U_ZERO_ERROR)
+{
+    fp = new FormatParser();
+    dtMatcher = new DateTimeMatcher();
+    distanceInfo = new DistanceInfo();
+    patternMap = new PatternMap();
+    if (fp == nullptr || dtMatcher == nullptr || distanceInfo == nullptr || patternMap == nullptr) {
+        internalErrorCode = status = U_MEMORY_ALLOCATION_ERROR;
+    }
+}
+
+DateTimePatternGenerator::DateTimePatternGenerator(const Locale& locale, UErrorCode &status, UBool skipStdPatterns) :
+    skipMatcher(nullptr),
+    fAvailableFormatKeyHash(nullptr),
+    fDefaultHourFormatChar(0),
+    internalErrorCode(U_ZERO_ERROR)
+{
+    fp = new FormatParser();
+    dtMatcher = new DateTimeMatcher();
+    distanceInfo = new DistanceInfo();
+    patternMap = new PatternMap();
+    if (fp == nullptr || dtMatcher == nullptr || distanceInfo == nullptr || patternMap == nullptr) {
+        internalErrorCode = status = U_MEMORY_ALLOCATION_ERROR;
+    }
+    else {
+        initData(locale, status, skipStdPatterns);
+    }
+}
+
+DateTimePatternGenerator::DateTimePatternGenerator(const DateTimePatternGenerator& other) :
+    UObject(),
+    skipMatcher(nullptr),
+    fAvailableFormatKeyHash(nullptr),
+    fDefaultHourFormatChar(0),
+    internalErrorCode(U_ZERO_ERROR)
+{
+    fp = new FormatParser();
+    dtMatcher = new DateTimeMatcher();
+    distanceInfo = new DistanceInfo();
+    patternMap = new PatternMap();
+    if (fp == nullptr || dtMatcher == nullptr || distanceInfo == nullptr || patternMap == nullptr) {
+        internalErrorCode = U_MEMORY_ALLOCATION_ERROR;
+    }
+    *this=other;
+}
+
+DateTimePatternGenerator&
+DateTimePatternGenerator::operator=(const DateTimePatternGenerator& other) {
+    if (&other == this) {
+        return *this;
+    }
+    internalErrorCode = other.internalErrorCode;
+    pLocale = other.pLocale;
+    fDefaultHourFormatChar = other.fDefaultHourFormatChar;
+    *fp = *(other.fp);
+    dtMatcher->copyFrom(other.dtMatcher->skeleton);
+    *distanceInfo = *(other.distanceInfo);
+    for (int32_t style = UDAT_FULL; style <= UDAT_SHORT; style++) {
+        dateTimeFormat[style] = other.dateTimeFormat[style];
+    }
+    decimal = other.decimal;
+    for (int32_t style = UDAT_FULL; style <= UDAT_SHORT; style++) {
+        dateTimeFormat[style].getTerminatedBuffer(); 
+    }
+    decimal.getTerminatedBuffer();
+    delete skipMatcher;
+    if ( other.skipMatcher == nullptr ) {
+        skipMatcher = nullptr;
+    }
+    else {
+        skipMatcher = new DateTimeMatcher(*other.skipMatcher);
+        if (skipMatcher == nullptr)
+        {
+            internalErrorCode = U_MEMORY_ALLOCATION_ERROR;
+            return *this;
+        }
+    }
+    for (int32_t i=0; i< UDATPG_FIELD_COUNT; ++i ) {
+        appendItemFormats[i] = other.appendItemFormats[i];
+        appendItemFormats[i].getTerminatedBuffer(); 
+        for (int32_t j=0; j< UDATPG_WIDTH_COUNT; ++j ) {
+            fieldDisplayNames[i][j] = other.fieldDisplayNames[i][j];
+            fieldDisplayNames[i][j].getTerminatedBuffer(); 
+        }
+    }
+    patternMap->copyFrom(*other.patternMap, internalErrorCode);
+    copyHashtable(other.fAvailableFormatKeyHash, internalErrorCode);
+    return *this;
+}
+
+
+bool
+DateTimePatternGenerator::operator==(const DateTimePatternGenerator& other) const {
+    if (this == &other) {
+        return true;
+    }
+    if ((pLocale==other.pLocale) && (patternMap->equals(*other.patternMap)) &&
+        (decimal==other.decimal)) {
+        for (int32_t style = UDAT_FULL; style <= UDAT_SHORT; style++) {
+            if (dateTimeFormat[style] != other.dateTimeFormat[style]) {
+                return false;
+            }
+        }
+        for ( int32_t i=0 ; i<UDATPG_FIELD_COUNT; ++i ) {
+            if (appendItemFormats[i] != other.appendItemFormats[i]) {
+                return false;
+            }
+            for (int32_t j=0; j< UDATPG_WIDTH_COUNT; ++j ) {
+                if (fieldDisplayNames[i][j] != other.fieldDisplayNames[i][j]) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    else {
+        return false;
+    }
+}
+
+bool
+DateTimePatternGenerator::operator!=(const DateTimePatternGenerator& other) const {
+    return  !operator==(other);
+}
+
+DateTimePatternGenerator::~DateTimePatternGenerator() {
+    delete fAvailableFormatKeyHash;
+    delete fp;
+    delete dtMatcher;
+    delete distanceInfo;
+    delete patternMap;
+    delete skipMatcher;
+}
+
+namespace {
+
+UInitOnce initOnce {};
+UHashtable *localeToAllowedHourFormatsMap = nullptr;
+
+U_CFUNC void U_CALLCONV deleteAllowedHourFormats(void *ptr) {
+    uprv_free(ptr);
+}
+
+U_CFUNC UBool U_CALLCONV allowedHourFormatsCleanup() {
+    uhash_close(localeToAllowedHourFormatsMap);
+    return true;
+}
+
+enum AllowedHourFormat{
+    ALLOWED_HOUR_FORMAT_UNKNOWN = -1,
+    ALLOWED_HOUR_FORMAT_h,
+    ALLOWED_HOUR_FORMAT_H,
+    ALLOWED_HOUR_FORMAT_K,  
+    ALLOWED_HOUR_FORMAT_k,  
+    ALLOWED_HOUR_FORMAT_hb,
+    ALLOWED_HOUR_FORMAT_hB,
+    ALLOWED_HOUR_FORMAT_Kb, 
+    ALLOWED_HOUR_FORMAT_KB, 
+    ALLOWED_HOUR_FORMAT_Hb,
+    ALLOWED_HOUR_FORMAT_HB
+};
+
+}  
+
+void
+DateTimePatternGenerator::initData(const Locale& locale, UErrorCode &status, UBool skipStdPatterns) {
+    if (U_FAILURE(status)) { return; }
+    if (locale.isBogus()) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+
+    skipMatcher = nullptr;
+    fAvailableFormatKeyHash=nullptr;
+    addCanonicalItems(status);
+    if (!skipStdPatterns) { 
+        addICUPatterns(locale, status);
+    }
+    addCLDRData(locale, status);
+    setDateTimeFromCalendar(locale, status);
+    setDecimalSymbols(locale, status);
+    umtx_initOnce(initOnce, loadAllowedHourFormatsData, status);
+    getAllowedHourFormats(locale, status);
+    internalErrorCode = status;
+} 
+
+namespace {
+
+struct AllowedHourFormatsSink : public ResourceSink {
+    AllowedHourFormatsSink() {}
+    virtual ~AllowedHourFormatsSink();
+
+    virtual void put(const char *key, ResourceValue &value, UBool ,
+                     UErrorCode &errorCode) override {
+        ResourceTable timeData = value.getTable(errorCode);
+        if (U_FAILURE(errorCode)) { return; }
+        for (int32_t i = 0; timeData.getKeyAndValue(i, key, value); ++i) {
+            const char *regionOrLocale = key;
+            ResourceTable formatList = value.getTable(errorCode);
+            if (U_FAILURE(errorCode)) { return; }
+            LocalMemory<int32_t> list;
+            int32_t length = 0;
+            int32_t preferredFormat = ALLOWED_HOUR_FORMAT_UNKNOWN;
+            for (int32_t j = 0; formatList.getKeyAndValue(j, key, value); ++j) {
+                if (uprv_strcmp(key, "allowed") == 0) {
+                    if (value.getType() == URES_STRING) {
+                        length = 2; 
+                        if (list.allocateInsteadAndReset(length + 1) == nullptr) {
+                            errorCode = U_MEMORY_ALLOCATION_ERROR;
+                            return;
+                        }
+                        list[1] = getHourFormatFromUnicodeString(value.getUnicodeString(errorCode));
+                    }
+                    else {
+                        ResourceArray allowedFormats = value.getArray(errorCode);
+                        length = allowedFormats.getSize() + 1; 
+                        if (list.allocateInsteadAndReset(length + 1) == nullptr) {
+                            errorCode = U_MEMORY_ALLOCATION_ERROR;
+                            return;
+                        }
+                        for (int32_t k = 1; k < length; ++k) {
+                            allowedFormats.getValue(k-1, value);
+                            list[k] = getHourFormatFromUnicodeString(value.getUnicodeString(errorCode));
+                        }
+                    }
+                } else if (uprv_strcmp(key, "preferred") == 0) {
+                    preferredFormat = getHourFormatFromUnicodeString(value.getUnicodeString(errorCode));
+                }
+            }
+            if (length > 1) {
+                list[0] = (preferredFormat!=ALLOWED_HOUR_FORMAT_UNKNOWN)? preferredFormat: list[1];
+            } else {
+                length = 2; 
+                if (list.allocateInsteadAndReset(length + 1) == nullptr) {
+                    errorCode = U_MEMORY_ALLOCATION_ERROR;
+                    return;
+                }
+                list[0] = (preferredFormat!=ALLOWED_HOUR_FORMAT_UNKNOWN)? preferredFormat: ALLOWED_HOUR_FORMAT_H;
+                list[1] = list[0];
+            }
+            list[length] = ALLOWED_HOUR_FORMAT_UNKNOWN;
+            uhash_put(localeToAllowedHourFormatsMap, const_cast<char *>(regionOrLocale), list.orphan(), &errorCode);
+            if (U_FAILURE(errorCode)) { return; }
+        }
+    }
+
+    AllowedHourFormat getHourFormatFromUnicodeString(const UnicodeString &s) {
+        if (s.length() == 1) {
+            if (s[0] == LOW_H) { return ALLOWED_HOUR_FORMAT_h; }
+            if (s[0] == CAP_H) { return ALLOWED_HOUR_FORMAT_H; }
+            if (s[0] == CAP_K) { return ALLOWED_HOUR_FORMAT_K; }
+            if (s[0] == LOW_K) { return ALLOWED_HOUR_FORMAT_k; }
+        } else if (s.length() == 2) {
+            if (s[0] == LOW_H && s[1] == LOW_B) { return ALLOWED_HOUR_FORMAT_hb; }
+            if (s[0] == LOW_H && s[1] == CAP_B) { return ALLOWED_HOUR_FORMAT_hB; }
+            if (s[0] == CAP_K && s[1] == LOW_B) { return ALLOWED_HOUR_FORMAT_Kb; }
+            if (s[0] == CAP_K && s[1] == CAP_B) { return ALLOWED_HOUR_FORMAT_KB; }
+            if (s[0] == CAP_H && s[1] == LOW_B) { return ALLOWED_HOUR_FORMAT_Hb; }
+            if (s[0] == CAP_H && s[1] == CAP_B) { return ALLOWED_HOUR_FORMAT_HB; }
+        }
+
+        return ALLOWED_HOUR_FORMAT_UNKNOWN;
+    }
+};
+
+}  
+
+AllowedHourFormatsSink::~AllowedHourFormatsSink() {}
+
+U_CFUNC void U_CALLCONV DateTimePatternGenerator::loadAllowedHourFormatsData(UErrorCode &status) {
+    if (U_FAILURE(status)) { return; }
+    localeToAllowedHourFormatsMap = uhash_open(
+        uhash_hashChars, uhash_compareChars, nullptr, &status);
+    if (U_FAILURE(status)) { return; }
+
+    uhash_setValueDeleter(localeToAllowedHourFormatsMap, deleteAllowedHourFormats);
+    ucln_i18n_registerCleanup(UCLN_I18N_ALLOWED_HOUR_FORMATS, allowedHourFormatsCleanup);
+
+    LocalUResourceBundlePointer rb(ures_openDirect(nullptr, "supplementalData", &status));
+    if (U_FAILURE(status)) { return; }
+
+    AllowedHourFormatsSink sink;
+    ures_getAllItemsWithFallback(rb.getAlias(), "timeData", sink, status);    
+}
+
+static int32_t* getAllowedHourFormatsLangCountry(const char* language, const char* country, UErrorCode& status) {
+    CharString langCountry;
+    langCountry.append(language, status);
+    langCountry.append('_', status);
+    langCountry.append(country, status);
+
+    int32_t* allowedFormats;
+    allowedFormats = static_cast<int32_t*>(uhash_get(localeToAllowedHourFormatsMap, langCountry.data()));
+    if (allowedFormats == nullptr) {
+        allowedFormats = static_cast<int32_t*>(uhash_get(localeToAllowedHourFormatsMap, const_cast<char*>(country)));
+    }
+
+    return allowedFormats;
+}
+
+void DateTimePatternGenerator::getAllowedHourFormats(const Locale &locale, UErrorCode &status) {
+    if (U_FAILURE(status)) { return; }
+
+    const char *language = locale.getLanguage();
+    CharString baseCountry = ulocimp_getRegionForSupplementalData(locale.getName(), false, status);
+    const char* country = baseCountry.data();
+
+    Locale maxLocale;  
+    if (*language == '\0' || *country == '\0') {
+        maxLocale = locale;
+        UErrorCode localStatus = U_ZERO_ERROR;
+        maxLocale.addLikelySubtags(localStatus);
+        if (U_SUCCESS(localStatus)) {
+            language = maxLocale.getLanguage();
+            country = maxLocale.getCountry();
+        }
+    }
+    if (*language == '\0') {
+        language = "und";
+    }
+    if (*country == '\0') {
+        country = "001";
+    }
+
+    int32_t* allowedFormats = getAllowedHourFormatsLangCountry(language, country, status);
+
+    char buffer[8];
+    int32_t count = locale.getKeywordValue("hours", buffer, sizeof(buffer), status);
+
+    fDefaultHourFormatChar = 0;
+    if (U_SUCCESS(status) && count > 0) {
+        if(uprv_strcmp(buffer, "h24") == 0) {
+            fDefaultHourFormatChar = LOW_K;
+        } else if(uprv_strcmp(buffer, "h23") == 0) {
+            fDefaultHourFormatChar = CAP_H;
+        } else if(uprv_strcmp(buffer, "h12") == 0) {
+            fDefaultHourFormatChar = LOW_H;
+        } else if(uprv_strcmp(buffer, "h11") == 0) {
+            fDefaultHourFormatChar = CAP_K;
+        }
+    }
+
+    if (allowedFormats == nullptr) {
+        UErrorCode localStatus = U_ZERO_ERROR;
+        const Region* region = Region::getInstance(country, localStatus);
+        if (U_SUCCESS(localStatus)) {
+            country = region->getRegionCode(); 
+            allowedFormats = getAllowedHourFormatsLangCountry(language, country, status);
+        }
+    }
+
+    if (allowedFormats != nullptr) {  
+        if (!fDefaultHourFormatChar) {
+            switch (allowedFormats[0]) {
+                case ALLOWED_HOUR_FORMAT_h: fDefaultHourFormatChar = LOW_H; break;
+                case ALLOWED_HOUR_FORMAT_H: fDefaultHourFormatChar = CAP_H; break;
+                case ALLOWED_HOUR_FORMAT_K: fDefaultHourFormatChar = CAP_K; break;
+                case ALLOWED_HOUR_FORMAT_k: fDefaultHourFormatChar = LOW_K; break;
+                default: fDefaultHourFormatChar = CAP_H; break;
+            }
+        }
+
+        for (int32_t i = 0; i < UPRV_LENGTHOF(fAllowedHourFormats); ++i) {
+            fAllowedHourFormats[i] = allowedFormats[i + 1];
+            if (fAllowedHourFormats[i] == ALLOWED_HOUR_FORMAT_UNKNOWN) {
+                break;
+            }
+        }
+    } else {  
+        if (!fDefaultHourFormatChar) {
+            fDefaultHourFormatChar = CAP_H;
+        }
+        fAllowedHourFormats[0] = ALLOWED_HOUR_FORMAT_H;
+        fAllowedHourFormats[1] = ALLOWED_HOUR_FORMAT_UNKNOWN;
+    }
+}
+
+UDateFormatHourCycle
+DateTimePatternGenerator::getDefaultHourCycle(UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return UDAT_HOUR_CYCLE_23;
+    }
+    if (fDefaultHourFormatChar == 0) {
+        status = U_UNSUPPORTED_ERROR;
+        return UDAT_HOUR_CYCLE_23;
+    }
+    switch (fDefaultHourFormatChar) {
+        case CAP_K:
+            return UDAT_HOUR_CYCLE_11;
+        case LOW_H:
+            return UDAT_HOUR_CYCLE_12;
+        case CAP_H:
+            return UDAT_HOUR_CYCLE_23;
+        case LOW_K:
+            return UDAT_HOUR_CYCLE_24;
+        default:
+            UPRV_UNREACHABLE_EXIT;
+    }
+}
+
+UnicodeString
+DateTimePatternGenerator::getSkeleton(const UnicodeString& pattern, UErrorCode&
+) {
+    FormatParser fp2;
+    DateTimeMatcher matcher;
+    PtnSkeleton localSkeleton;
+    matcher.set(pattern, &fp2, localSkeleton);
+    return localSkeleton.getSkeleton();
+}
+
+UnicodeString
+DateTimePatternGenerator::staticGetSkeleton(
+        const UnicodeString& pattern, UErrorCode& ) {
+    FormatParser fp;
+    DateTimeMatcher matcher;
+    PtnSkeleton localSkeleton;
+    matcher.set(pattern, &fp, localSkeleton);
+    return localSkeleton.getSkeleton();
+}
+
+UnicodeString
+DateTimePatternGenerator::getBaseSkeleton(const UnicodeString& pattern, UErrorCode& ) {
+    FormatParser fp2;
+    DateTimeMatcher matcher;
+    PtnSkeleton localSkeleton;
+    matcher.set(pattern, &fp2, localSkeleton);
+    return localSkeleton.getBaseSkeleton();
+}
+
+UnicodeString
+DateTimePatternGenerator::staticGetBaseSkeleton(
+        const UnicodeString& pattern, UErrorCode& ) {
+    FormatParser fp;
+    DateTimeMatcher matcher;
+    PtnSkeleton localSkeleton;
+    matcher.set(pattern, &fp, localSkeleton);
+    return localSkeleton.getBaseSkeleton();
+}
+
+void
+DateTimePatternGenerator::addICUPatterns(const Locale& locale, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    
+    LocalUResourceBundlePointer rb(ures_open(nullptr, locale.getBaseName(), &status));
+    CharString calendarTypeToUse; 
+    getCalendarTypeToUse(locale, calendarTypeToUse, status);
+
+    if (uprv_strcmp(locale.getBaseName(), "ja_JP_TRADITIONAL") == 0) {
+        calendarTypeToUse.clear().append("gregorian", status);
+    }
+    
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    CharString patternResourcePath;
+    patternResourcePath.append(DT_DateTimeCalendarTag, status)
+        .append('/', status)
+        .append(calendarTypeToUse, status)
+        .append('/', status)
+        .append(DT_DateTimePatternsTag, status);
+
+    LocalUResourceBundlePointer dateTimePatterns(ures_getByKeyWithFallback(rb.getAlias(), patternResourcePath.data(),
+                                                                           nullptr, &status));
+    if (ures_getType(dateTimePatterns.getAlias()) != URES_ARRAY || ures_getSize(dateTimePatterns.getAlias()) < 8) {
+        status = U_INVALID_FORMAT_ERROR;
+        return;
+    }
+
+    for (int32_t i = 0; U_SUCCESS(status) && i < DateFormat::kDateTime; i++) {
+        LocalUResourceBundlePointer patternRes(ures_getByIndex(dateTimePatterns.getAlias(), i, nullptr, &status));
+        UnicodeString pattern;
+        switch (ures_getType(patternRes.getAlias())) {
+            case URES_STRING:
+                pattern = ures_getUnicodeString(patternRes.getAlias(), &status);
+                break;
+            case URES_ARRAY:
+                pattern = ures_getUnicodeStringByIndex(patternRes.getAlias(), 0, &status);
+                break;
+            default:
+                status = U_INVALID_FORMAT_ERROR;
+                return;
+        }
+        
+        if (U_SUCCESS(status)) {
+            UnicodeString conflictingPattern;
+            addPatternWithOptionalSkeleton(pattern, nullptr, false, conflictingPattern, status);
+        }
+    }
+}
+
+void
+DateTimePatternGenerator::hackTimes(const UnicodeString& hackPattern, UErrorCode& status)  {
+    UnicodeString conflictingString;
+
+    fp->set(hackPattern);
+    UnicodeString mmss;
+    UBool gotMm=false;
+    for (int32_t i=0; i<fp->itemNumber; ++i) {
+        UnicodeString field = fp->items[i];
+        if ( fp->isQuoteLiteral(field) ) {
+            if ( gotMm ) {
+               UnicodeString quoteLiteral;
+               fp->getQuoteLiteral(quoteLiteral, &i);
+               mmss += quoteLiteral;
+            }
+        }
+        else {
+            if (fp->isPatternSeparator(field) && gotMm) {
+                mmss+=field;
+            }
+            else {
+                char16_t ch=field.charAt(0);
+                if (ch==LOW_M) {
+                    gotMm=true;
+                    mmss+=field;
+                }
+                else {
+                    if (ch==LOW_S) {
+                        if (!gotMm) {
+                            break;
+                        }
+                        mmss+= field;
+                        addPattern(mmss, false, conflictingString, status);
+                        break;
+                    }
+                    else {
+                        if (gotMm || ch==LOW_Z || ch==CAP_Z || ch==LOW_V || ch==CAP_V) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#define ULOC_LOCALE_IDENTIFIER_CAPACITY (ULOC_FULLNAME_CAPACITY + 1 + ULOC_KEYWORD_AND_VALUES_CAPACITY)
+
+void
+DateTimePatternGenerator::getCalendarTypeToUse(const Locale& locale, CharString& destination, UErrorCode& err) {
+    destination.clear().append(DT_DateTimeGregorianTag, -1, err); 
+    if ( U_SUCCESS(err) ) {
+        UErrorCode localStatus = U_ZERO_ERROR;
+        char localeWithCalendarKey[ULOC_LOCALE_IDENTIFIER_CAPACITY];
+        ures_getFunctionalEquivalent(
+            localeWithCalendarKey,
+            ULOC_LOCALE_IDENTIFIER_CAPACITY,
+            nullptr,
+            "calendar",
+            "calendar",
+            locale.getName(),
+            nullptr,
+            false,
+            &localStatus);
+        localeWithCalendarKey[ULOC_LOCALE_IDENTIFIER_CAPACITY-1] = 0; 
+        if (U_SUCCESS(localStatus)) {
+            destination = ulocimp_getKeywordValue(localeWithCalendarKey, "calendar", localStatus);
+        }
+        if (U_FAILURE(localStatus) && localStatus != U_MISSING_RESOURCE_ERROR) {
+            err = localStatus;
+        }
+    }
+}
+
+void
+DateTimePatternGenerator::consumeShortTimePattern(const UnicodeString& shortTimePattern,
+        UErrorCode& status) {
+    if (U_FAILURE(status)) { return; }
+
+    hackTimes(shortTimePattern, status);
+}
+
+struct DateTimePatternGenerator::AppendItemFormatsSink : public ResourceSink {
+
+    DateTimePatternGenerator& dtpg;
+
+    AppendItemFormatsSink(DateTimePatternGenerator& _dtpg) : dtpg(_dtpg) {}
+    virtual ~AppendItemFormatsSink();
+
+    virtual void put(const char *key, ResourceValue &value, UBool ,
+            UErrorCode &errorCode) override {
+        UDateTimePatternField field = dtpg.getAppendFormatNumber(key);
+        if (field == UDATPG_FIELD_COUNT) { return; }
+        const UnicodeString& valueStr = value.getUnicodeString(errorCode);
+        if (dtpg.getAppendItemFormat(field).isEmpty() && !valueStr.isEmpty()) {
+            dtpg.setAppendItemFormat(field, valueStr);
+        }
+    }
+
+    void fillInMissing() {
+        UnicodeString defaultItemFormat(true, UDATPG_ItemFormat, UPRV_LENGTHOF(UDATPG_ItemFormat)-1);  
+        for (int32_t i = 0; i < UDATPG_FIELD_COUNT; i++) {
+            UDateTimePatternField field = static_cast<UDateTimePatternField>(i);
+            if (dtpg.getAppendItemFormat(field).isEmpty()) {
+                dtpg.setAppendItemFormat(field, defaultItemFormat);
+            }
+        }
+    }
+};
+
+struct DateTimePatternGenerator::AppendItemNamesSink : public ResourceSink {
+
+    DateTimePatternGenerator& dtpg;
+
+    AppendItemNamesSink(DateTimePatternGenerator& _dtpg) : dtpg(_dtpg) {}
+    virtual ~AppendItemNamesSink();
+
+    virtual void put(const char *key, ResourceValue &value, UBool ,
+            UErrorCode &errorCode) override {
+        UDateTimePGDisplayWidth width;
+        UDateTimePatternField field = dtpg.getFieldAndWidthIndices(key, &width);
+        if (field == UDATPG_FIELD_COUNT) { return; }
+        ResourceTable detailsTable = value.getTable(errorCode);
+        if (U_FAILURE(errorCode)) { return; }
+        if (!detailsTable.findValue("dn", value)) { return; }
+        const UnicodeString& valueStr = value.getUnicodeString(errorCode);
+        if (U_SUCCESS(errorCode) && dtpg.getFieldDisplayName(field,width).isEmpty() && !valueStr.isEmpty()) {
+            dtpg.setFieldDisplayName(field,width,valueStr);
+        }
+    }
+
+    void fillInMissing() {
+        for (int32_t i = 0; i < UDATPG_FIELD_COUNT; i++) {
+            UnicodeString& valueStr = dtpg.getMutableFieldDisplayName(static_cast<UDateTimePatternField>(i), UDATPG_WIDE);
+            if (valueStr.isEmpty()) {
+                valueStr = CAP_F;
+                U_ASSERT(i < 20);
+                if (i < 10) {
+                    valueStr += static_cast<char16_t>(i + 0x30);
+                } else {
+                    valueStr += static_cast<char16_t>(0x31);
+                    valueStr += static_cast<char16_t>(i - 10 + 0x30);
+                }
+                valueStr.getTerminatedBuffer();
+            }
+            for (int32_t j = 1; j < UDATPG_WIDTH_COUNT; j++) {
+                UnicodeString& valueStr2 = dtpg.getMutableFieldDisplayName(static_cast<UDateTimePatternField>(i), static_cast<UDateTimePGDisplayWidth>(j));
+                if (valueStr2.isEmpty()) {
+                    valueStr2 = dtpg.getFieldDisplayName(static_cast<UDateTimePatternField>(i), static_cast<UDateTimePGDisplayWidth>(j - 1));
+                }
+            }
+        }
+    }
+};
+
+struct DateTimePatternGenerator::AvailableFormatsSink : public ResourceSink {
+
+    DateTimePatternGenerator& dtpg;
+
+    UnicodeString conflictingPattern;
+
+    AvailableFormatsSink(DateTimePatternGenerator& _dtpg) : dtpg(_dtpg) {}
+    virtual ~AvailableFormatsSink();
+
+    virtual void put(const char *key, ResourceValue &value, UBool ,
+            UErrorCode &errorCode) override {
+        const UnicodeString formatKey(key, -1, US_INV);
+        if (!dtpg.isAvailableFormatSet(formatKey) ) {
+            dtpg.setAvailableFormat(formatKey, errorCode);
+            const UnicodeString& formatValue = value.getUnicodeString(errorCode);
+            conflictingPattern.remove();
+            dtpg.addPatternWithSkeleton(formatValue, formatKey, true, conflictingPattern, errorCode);
+        }
+    }
+};
+
+DateTimePatternGenerator::AppendItemFormatsSink::~AppendItemFormatsSink() {}
+DateTimePatternGenerator::AppendItemNamesSink::~AppendItemNamesSink() {}
+DateTimePatternGenerator::AvailableFormatsSink::~AvailableFormatsSink() {}
+
+void
+DateTimePatternGenerator::addCLDRData(const Locale& locale, UErrorCode& errorCode) {
+    if (U_FAILURE(errorCode)) { return; }
+    UnicodeString rbPattern, value, field;
+    CharString path;
+
+    LocalUResourceBundlePointer rb(ures_open(nullptr, locale.getName(), &errorCode));
+    if (U_FAILURE(errorCode)) { return; }
+
+    CharString calendarTypeToUse; 
+    getCalendarTypeToUse(locale, calendarTypeToUse, errorCode);
+    if (U_FAILURE(errorCode)) { return; }
+
+    UErrorCode err = U_ZERO_ERROR;
+
+    AppendItemFormatsSink appendItemFormatsSink(*this);
+    path.clear()
+        .append(DT_DateTimeCalendarTag, errorCode)
+        .append('/', errorCode)
+        .append(calendarTypeToUse, errorCode)
+        .append('/', errorCode)
+        .append(DT_DateTimeAppendItemsTag, errorCode); 
+    if (U_FAILURE(errorCode)) { return; }
+    ures_getAllChildrenWithFallback(rb.getAlias(), path.data(), appendItemFormatsSink, err);
+    appendItemFormatsSink.fillInMissing();
+
+    err = U_ZERO_ERROR;
+    AppendItemNamesSink appendItemNamesSink(*this);
+    ures_getAllChildrenWithFallback(rb.getAlias(), DT_DateTimeFieldsTag, appendItemNamesSink, err);
+    appendItemNamesSink.fillInMissing();
+
+    err = U_ZERO_ERROR;
+    initHashtable(errorCode);
+    if (U_FAILURE(errorCode)) { return; }
+    AvailableFormatsSink availableFormatsSink(*this);
+    path.clear()
+        .append(DT_DateTimeCalendarTag, errorCode)
+        .append('/', errorCode)
+        .append(calendarTypeToUse, errorCode)
+        .append('/', errorCode)
+        .append(DT_DateTimeAvailableFormatsTag, errorCode); 
+    if (U_FAILURE(errorCode)) { return; }
+    ures_getAllChildrenWithFallback(rb.getAlias(), path.data(), availableFormatsSink, err);
+}
+
+void
+DateTimePatternGenerator::initHashtable(UErrorCode& err) {
+    if (U_FAILURE(err)) { return; }
+    if (fAvailableFormatKeyHash!=nullptr) {
+        return;
+    }
+    LocalPointer<Hashtable> hash(new Hashtable(false, err), err);
+    if (U_SUCCESS(err)) {
+        fAvailableFormatKeyHash = hash.orphan();
+    }
+}
+
+void
+DateTimePatternGenerator::setAppendItemFormat(UDateTimePatternField field, const UnicodeString& value) {
+    appendItemFormats[field] = value;
+    appendItemFormats[field].getTerminatedBuffer();
+}
+
+const UnicodeString&
+DateTimePatternGenerator::getAppendItemFormat(UDateTimePatternField field) const {
+    return appendItemFormats[field];
+}
+
+void
+DateTimePatternGenerator::setAppendItemName(UDateTimePatternField field, const UnicodeString& value) {
+    setFieldDisplayName(field, UDATPG_WIDTH_APPENDITEM, value);
+}
+
+const UnicodeString&
+DateTimePatternGenerator::getAppendItemName(UDateTimePatternField field) const {
+    return fieldDisplayNames[field][UDATPG_WIDTH_APPENDITEM];
+}
+
+void
+DateTimePatternGenerator::setFieldDisplayName(UDateTimePatternField field, UDateTimePGDisplayWidth width, const UnicodeString& value) {
+    fieldDisplayNames[field][width] = value;
+    fieldDisplayNames[field][width].getTerminatedBuffer();
+}
+
+UnicodeString
+DateTimePatternGenerator::getFieldDisplayName(UDateTimePatternField field, UDateTimePGDisplayWidth width) const {
+    return fieldDisplayNames[field][width];
+}
+
+UnicodeString&
+DateTimePatternGenerator::getMutableFieldDisplayName(UDateTimePatternField field, UDateTimePGDisplayWidth width) {
+    return fieldDisplayNames[field][width];
+}
+
+void
+DateTimePatternGenerator::getAppendName(UDateTimePatternField field, UnicodeString& value) {
+    value = SINGLE_QUOTE;
+    value += fieldDisplayNames[field][UDATPG_WIDTH_APPENDITEM];
+    value += SINGLE_QUOTE;
+}
+
+UnicodeString
+DateTimePatternGenerator::getBestPattern(const UnicodeString& patternForm, UErrorCode& status) {
+    return getBestPattern(patternForm, UDATPG_MATCH_NO_OPTIONS, status);
+}
+
+UnicodeString
+DateTimePatternGenerator::getBestPattern(const UnicodeString& patternForm, UDateTimePatternMatchOptions options, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return {};
+    }
+    if (U_FAILURE(internalErrorCode)) {
+        status = internalErrorCode;
+        return {};
+    }
+    const UnicodeString *bestPattern = nullptr;
+    UnicodeString dtFormat;
+    UnicodeString resultPattern;
+    int32_t flags = kDTPGNoFlags;
+
+    int32_t dateMask=(1<<UDATPG_DAYPERIOD_FIELD) - 1;
+    int32_t timeMask=(1<<UDATPG_FIELD_COUNT) - 1 - dateMask;
+
+    UnicodeString patternFormMapped = mapSkeletonMetacharacters(patternForm, &flags, status);
+    if (U_FAILURE(status)) {
+        return {};
+    }
+
+    resultPattern.remove();
+    dtMatcher->set(patternFormMapped, fp);
+    const PtnSkeleton* specifiedSkeleton = nullptr;
+    bestPattern=getBestRaw(*dtMatcher, -1, distanceInfo, status, &specifiedSkeleton);
+    if (U_FAILURE(status)) {
+        return {};
+    }
+
+    if ( distanceInfo->missingFieldMask==0 && distanceInfo->extraFieldMask==0 ) {
+        resultPattern = adjustFieldTypes(*bestPattern, specifiedSkeleton, flags, options);
+
+        return resultPattern;
+    }
+    int32_t neededFields = dtMatcher->getFieldMask();
+    UnicodeString datePattern=getBestAppending(neededFields & dateMask, flags, status, options);
+    UnicodeString timePattern=getBestAppending(neededFields & timeMask, flags, status, options);
+    if (U_FAILURE(status)) {
+        return {};
+    }
+    if (datePattern.length()==0) {
+        if (timePattern.length()==0) {
+            resultPattern.remove();
+        }
+        else {
+            return timePattern;
+        }
+    }
+    if (timePattern.length()==0) {
+        return datePattern;
+    }
+    resultPattern.remove();
+    status = U_ZERO_ERROR;
+    PtnSkeleton* reqSkeleton = dtMatcher->getSkeletonPtr();
+    UDateFormatStyle style = UDAT_SHORT;
+    int32_t monthFieldLen = reqSkeleton->baseOriginal.getFieldLength(UDATPG_MONTH_FIELD);
+    if (monthFieldLen == 4) {
+        if (reqSkeleton->baseOriginal.getFieldLength(UDATPG_WEEKDAY_FIELD) > 0) {
+            style = UDAT_FULL;
+        } else {
+            style = UDAT_LONG;
+        }
+    } else if (monthFieldLen == 3) {
+        style = UDAT_MEDIUM;
+    }
+    dtFormat=getDateTimeFormat(style, status);
+    SimpleFormatter(dtFormat, 2, 2, status).format(timePattern, datePattern, resultPattern, status);
+    return resultPattern;
+}
+
+UnicodeString
+DateTimePatternGenerator::mapSkeletonMetacharacters(const UnicodeString& patternForm, int32_t* flags, UErrorCode& status) {
+    UnicodeString patternFormMapped;
+    patternFormMapped.remove();
+    UBool inQuoted = false;
+    int32_t patPos, patLen = patternForm.length();
+    for (patPos = 0; patPos < patLen; patPos++) {
+        char16_t patChr = patternForm.charAt(patPos);
+        if (patChr == SINGLE_QUOTE) {
+            inQuoted = !inQuoted;
+        } else if (!inQuoted) {
+            if (patChr == LOW_J || patChr == CAP_C) {
+                int32_t extraLen = 0; 
+                while (patPos+1 < patLen && patternForm.charAt(patPos+1)==patChr) {
+                    extraLen++;
+                    patPos++;
+                }
+                int32_t hourLen = 1 + (extraLen & 1);
+                int32_t dayPeriodLen = (extraLen < 2)? 1: 3 + (extraLen >> 1);
+                char16_t hourChar = LOW_H;
+                char16_t dayPeriodChar = LOW_A;
+                if (patChr == LOW_J) {
+                    hourChar = fDefaultHourFormatChar;
+                } else {
+                    AllowedHourFormat bestAllowed;
+                    if (fAllowedHourFormats[0] != ALLOWED_HOUR_FORMAT_UNKNOWN) {
+                        bestAllowed = static_cast<AllowedHourFormat>(fAllowedHourFormats[0]);
+                    } else {
+                        status = U_INVALID_FORMAT_ERROR;
+                        return {};
+                    }
+                    if (bestAllowed == ALLOWED_HOUR_FORMAT_H || bestAllowed == ALLOWED_HOUR_FORMAT_HB || bestAllowed == ALLOWED_HOUR_FORMAT_Hb) {
+                        hourChar = CAP_H;
+                    } else if (bestAllowed == ALLOWED_HOUR_FORMAT_K || bestAllowed == ALLOWED_HOUR_FORMAT_KB || bestAllowed == ALLOWED_HOUR_FORMAT_Kb) {
+                        hourChar = CAP_K;
+                    } else if (bestAllowed == ALLOWED_HOUR_FORMAT_k) {
+                        hourChar = LOW_K;
+                    }
+                    if (bestAllowed == ALLOWED_HOUR_FORMAT_HB || bestAllowed == ALLOWED_HOUR_FORMAT_hB || bestAllowed == ALLOWED_HOUR_FORMAT_KB) {
+                        dayPeriodChar = CAP_B;
+                    } else if (bestAllowed == ALLOWED_HOUR_FORMAT_Hb || bestAllowed == ALLOWED_HOUR_FORMAT_hb || bestAllowed == ALLOWED_HOUR_FORMAT_Kb) {
+                        dayPeriodChar = LOW_B;
+                    }
+                }
+                if (hourChar==CAP_H || hourChar==LOW_K) {
+                    dayPeriodLen = 0;
+                }
+                while (dayPeriodLen-- > 0) {
+                    patternFormMapped.append(dayPeriodChar);
+                }
+                while (hourLen-- > 0) {
+                    patternFormMapped.append(hourChar);
+                }
+            } else if (patChr == CAP_J) {
+                patternFormMapped.append(CAP_H);
+                *flags |= kDTPGSkeletonUsesCapJ;
+            } else {
+                patternFormMapped.append(patChr);
+            }
+        }
+    }
+    return patternFormMapped;
+}
+
+UnicodeString
+DateTimePatternGenerator::replaceFieldTypes(const UnicodeString& pattern,
+                                            const UnicodeString& skeleton,
+                                            UErrorCode& status) {
+    return replaceFieldTypes(pattern, skeleton, UDATPG_MATCH_NO_OPTIONS, status);
+}
+
+UnicodeString
+DateTimePatternGenerator::replaceFieldTypes(const UnicodeString& pattern,
+                                            const UnicodeString& skeleton,
+                                            UDateTimePatternMatchOptions options,
+                                            UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return {};
+    }
+    if (U_FAILURE(internalErrorCode)) {
+        status = internalErrorCode;
+        return {};
+    }
+    dtMatcher->set(skeleton, fp);
+    UnicodeString result = adjustFieldTypes(pattern, nullptr, kDTPGNoFlags, options);
+    return result;
+}
+
+void
+DateTimePatternGenerator::setDecimal(const UnicodeString& newDecimal) {
+    this->decimal = newDecimal;
+    this->decimal.getTerminatedBuffer();
+}
+
+const UnicodeString&
+DateTimePatternGenerator::getDecimal() const {
+    return decimal;
+}
+
+void
+DateTimePatternGenerator::addCanonicalItems(UErrorCode& status) {
+    if (U_FAILURE(status)) { return; }
+    UnicodeString  conflictingPattern;
+
+    for (int32_t i=0; i<UDATPG_FIELD_COUNT; i++) {
+        if (Canonical_Items[i] > 0) {
+            addPattern(UnicodeString(Canonical_Items[i]), false, conflictingPattern, status);
+        }
+        if (U_FAILURE(status)) { return; }
+    }
+}
+
+void
+DateTimePatternGenerator::setDateTimeFormat(const UnicodeString& dtFormat) {
+    UErrorCode status = U_ZERO_ERROR;
+    for (int32_t style = UDAT_FULL; style <= UDAT_SHORT; style++) {
+        setDateTimeFormat(static_cast<UDateFormatStyle>(style), dtFormat, status);
+    }
+}
+
+const UnicodeString&
+DateTimePatternGenerator::getDateTimeFormat() const {
+    UErrorCode status = U_ZERO_ERROR;
+    return getDateTimeFormat(UDAT_MEDIUM, status);
+}
+
+void
+DateTimePatternGenerator::setDateTimeFormat(UDateFormatStyle style, const UnicodeString& dtFormat, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (style < UDAT_FULL || style > UDAT_SHORT) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+    dateTimeFormat[style] = dtFormat;
+    dateTimeFormat[style].getTerminatedBuffer(); 
+}
+
+const UnicodeString&
+DateTimePatternGenerator::getDateTimeFormat(UDateFormatStyle style, UErrorCode& status) const {
+    static const UnicodeString emptyString = UNICODE_STRING_SIMPLE("");
+    if (U_FAILURE(status)) {
+        return emptyString;
+    }
+    if (style < UDAT_FULL || style > UDAT_SHORT) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return emptyString;
+    }
+    return dateTimeFormat[style];
+}
+
+static const int32_t cTypeBufMax = 32;
+
+void
+DateTimePatternGenerator::setDateTimeFromCalendar(const Locale& locale, UErrorCode& status) {
+    if (U_FAILURE(status)) { return; }
+
+    const char16_t *resStr;
+    int32_t resStrLen = 0;
+
+    LocalUResourceBundlePointer calData(ures_open(nullptr, locale.getBaseName(), &status));
+    if (U_FAILURE(status)) { return; }
+    ures_getByKey(calData.getAlias(), DT_DateTimeCalendarTag, calData.getAlias(), &status);
+    if (U_FAILURE(status)) { return; }
+
+    char cType[cTypeBufMax + 1];
+    Calendar::getCalendarTypeFromLocale(locale, cType, cTypeBufMax, status);
+    cType[cTypeBufMax] = 0;
+    if (U_FAILURE(status) || cType[0] == 0) {
+        status = U_ZERO_ERROR;
+        uprv_strcpy(cType, DT_DateTimeGregorianTag);
+    }
+    UBool cTypeIsGregorian = (uprv_strcmp(cType, DT_DateTimeGregorianTag) == 0);
+
+    LocalUResourceBundlePointer specificCalBundle;
+    LocalUResourceBundlePointer dateTimePatterns;
+    int32_t dateTimeOffset = 0; 
+    if (!cTypeIsGregorian) {
+        specificCalBundle.adoptInstead(ures_getByKeyWithFallback(calData.getAlias(), cType,
+                                        nullptr, &status));
+        dateTimePatterns.adoptInstead(ures_getByKeyWithFallback(specificCalBundle.getAlias(), DT_DateAtTimePatternsTag, 
+                                        nullptr, &status));
+    }
+    if (dateTimePatterns.isNull() || status == U_MISSING_RESOURCE_ERROR) {
+        status = U_ZERO_ERROR;
+        specificCalBundle.adoptInstead(ures_getByKeyWithFallback(calData.getAlias(), DT_DateTimeGregorianTag,
+                                        nullptr, &status));
+        dateTimePatterns.adoptInstead(ures_getByKeyWithFallback(specificCalBundle.getAlias(), DT_DateAtTimePatternsTag, 
+                                        nullptr, &status));
+    }
+    if (U_SUCCESS(status) && (ures_getSize(dateTimePatterns.getAlias()) < 4)) {
+        status = U_INVALID_FORMAT_ERROR;
+    }
+    if (status == U_MISSING_RESOURCE_ERROR) {
+        status = U_ZERO_ERROR;
+        dateTimePatterns.orphan();
+        dateTimeOffset = static_cast<int32_t>(DateFormat::kDateTimeOffset);
+        if (!cTypeIsGregorian) {
+            specificCalBundle.adoptInstead(ures_getByKeyWithFallback(calData.getAlias(), cType,
+                                            nullptr, &status));
+            dateTimePatterns.adoptInstead(ures_getByKeyWithFallback(specificCalBundle.getAlias(), DT_DateTimePatternsTag, 
+                                            nullptr, &status));
+        }
+        if (dateTimePatterns.isNull() || status == U_MISSING_RESOURCE_ERROR) {
+            status = U_ZERO_ERROR;
+            specificCalBundle.adoptInstead(ures_getByKeyWithFallback(calData.getAlias(), DT_DateTimeGregorianTag,
+                                            nullptr, &status));
+            dateTimePatterns.adoptInstead(ures_getByKeyWithFallback(specificCalBundle.getAlias(), DT_DateTimePatternsTag, 
+                                            nullptr, &status));
+        }
+        if (U_SUCCESS(status) && (ures_getSize(dateTimePatterns.getAlias()) <= DateFormat::kDateTimeOffset + DateFormat::kShort)) {
+            status = U_INVALID_FORMAT_ERROR;
+        }
+    }
+    if (U_FAILURE(status)) { return; }
+    for (int32_t style = UDAT_FULL; style <= UDAT_SHORT; style++) {
+        resStr = ures_getStringByIndex(dateTimePatterns.getAlias(), dateTimeOffset + style, &resStrLen, &status);
+        setDateTimeFormat(static_cast<UDateFormatStyle>(style), UnicodeString(true, resStr, resStrLen), status);
+    }
+}
+
+void
+DateTimePatternGenerator::setDecimalSymbols(const Locale& locale, UErrorCode& status) {
+    DecimalFormatSymbols dfs = DecimalFormatSymbols(locale, status);
+    if(U_SUCCESS(status)) {
+        decimal = dfs.getSymbol(DecimalFormatSymbols::kDecimalSeparatorSymbol);
+        decimal.getTerminatedBuffer();
+    }
+}
+
+UDateTimePatternConflict
+DateTimePatternGenerator::addPattern(
+    const UnicodeString& pattern,
+    UBool override,
+    UnicodeString &conflictingPattern,
+    UErrorCode& status)
+{
+    if (U_FAILURE(internalErrorCode)) {
+        status = internalErrorCode;
+        return UDATPG_NO_CONFLICT;
+    }
+
+    return addPatternWithOptionalSkeleton(pattern, nullptr, override, conflictingPattern, status);
+}
+
+UDateTimePatternConflict
+DateTimePatternGenerator::addPatternWithSkeleton(
+    const UnicodeString& pattern,
+    const UnicodeString& skeletonToUse,
+    UBool override,
+    UnicodeString& conflictingPattern,
+    UErrorCode& status)
+{
+    return addPatternWithOptionalSkeleton(pattern, &skeletonToUse, override, conflictingPattern, status);
+}
+
+UDateTimePatternConflict
+DateTimePatternGenerator::addPatternWithOptionalSkeleton(
+    const UnicodeString& pattern,
+    const UnicodeString* skeletonToUse,
+    UBool override,
+    UnicodeString& conflictingPattern,
+    UErrorCode& status)
+{
+    if (U_FAILURE(internalErrorCode)) {
+        status = internalErrorCode;
+        return UDATPG_NO_CONFLICT;
+    }
+
+    UnicodeString basePattern;
+    PtnSkeleton   skeleton;
+    UDateTimePatternConflict conflictingStatus = UDATPG_NO_CONFLICT;
+
+    DateTimeMatcher matcher;
+    if ( skeletonToUse == nullptr ) {
+        matcher.set(pattern, fp, skeleton);
+        matcher.getBasePattern(basePattern);
+    } else {
+        matcher.set(*skeletonToUse, fp, skeleton); 
+        matcher.getBasePattern(basePattern); 
+    }
+    UBool entryHadSpecifiedSkeleton;
+    const UnicodeString *duplicatePattern = patternMap->getPatternFromBasePattern(basePattern, entryHadSpecifiedSkeleton);
+    if (duplicatePattern != nullptr && (!entryHadSpecifiedSkeleton || (skeletonToUse != nullptr && !override))) {
+        conflictingStatus = UDATPG_BASE_CONFLICT;
+        conflictingPattern = *duplicatePattern;
+        if (!override) {
+            return conflictingStatus;
+        }
+    }
+    const PtnSkeleton* entrySpecifiedSkeleton = nullptr;
+    duplicatePattern = patternMap->getPatternFromSkeleton(skeleton, &entrySpecifiedSkeleton);
+    if (duplicatePattern != nullptr ) {
+        conflictingStatus = UDATPG_CONFLICT;
+        conflictingPattern = *duplicatePattern;
+        if (!override || (skeletonToUse != nullptr && entrySpecifiedSkeleton != nullptr)) {
+            return conflictingStatus;
+        }
+    }
+    patternMap->add(basePattern, skeleton, pattern, skeletonToUse != nullptr, status);
+    if(U_FAILURE(status)) {
+        return conflictingStatus;
+    }
+
+    return UDATPG_NO_CONFLICT;
+}
+
+
+UDateTimePatternField
+DateTimePatternGenerator::getAppendFormatNumber(const char* field) const {
+    for (int32_t i=0; i<UDATPG_FIELD_COUNT; ++i ) {
+        if (uprv_strcmp(CLDR_FIELD_APPEND[i], field)==0) {
+            return static_cast<UDateTimePatternField>(i);
+        }
+    }
+    return UDATPG_FIELD_COUNT;
+}
+
+UDateTimePatternField
+DateTimePatternGenerator::getFieldAndWidthIndices(const char* key, UDateTimePGDisplayWidth* widthP) const {
+    char cldrFieldKey[UDATPG_FIELD_KEY_MAX + 1];
+    uprv_strncpy(cldrFieldKey, key, UDATPG_FIELD_KEY_MAX);
+    cldrFieldKey[UDATPG_FIELD_KEY_MAX]=0; 
+    *widthP = UDATPG_WIDE;
+    char* hyphenPtr = uprv_strchr(cldrFieldKey, '-');
+    if (hyphenPtr) {
+        for (int32_t i=UDATPG_WIDTH_COUNT-1; i>0; --i) {
+            if (uprv_strcmp(CLDR_FIELD_WIDTH[i], hyphenPtr)==0) {
+                *widthP = static_cast<UDateTimePGDisplayWidth>(i);
+                break;
+            }
+        }
+        *hyphenPtr = 0; 
+    }
+    for (int32_t i=0; i<UDATPG_FIELD_COUNT; ++i ) {
+        if (uprv_strcmp(CLDR_FIELD_NAME[i],cldrFieldKey)==0) {
+            return static_cast<UDateTimePatternField>(i);
+        }
+    }
+    return UDATPG_FIELD_COUNT;
+}
+
+const UnicodeString*
+DateTimePatternGenerator::getBestRaw(DateTimeMatcher& source,
+                                     int32_t includeMask,
+                                     DistanceInfo* missingFields,
+                                     UErrorCode &status,
+                                     const PtnSkeleton** specifiedSkeletonPtr) {
+    int32_t bestDistance = 0x7fffffff;
+    int32_t bestMissingFieldMask = -1;
+    DistanceInfo tempInfo;
+    const UnicodeString *bestPattern=nullptr;
+    const PtnSkeleton* specifiedSkeleton=nullptr;
+
+    PatternMapIterator it(status);
+    if (U_FAILURE(status)) { return nullptr; }
+
+    for (it.set(*patternMap); it.hasNext(); ) {
+        DateTimeMatcher trial = it.next();
+        if (trial.equals(skipMatcher)) {
+            continue;
+        }
+        int32_t distance=source.getDistance(trial, includeMask, tempInfo);
+        if (distance<bestDistance || (distance==bestDistance && bestMissingFieldMask<tempInfo.missingFieldMask)) {
+            bestDistance=distance;
+            bestMissingFieldMask=tempInfo.missingFieldMask;
+            bestPattern=patternMap->getPatternFromSkeleton(*trial.getSkeletonPtr(), &specifiedSkeleton);
+            missingFields->setTo(tempInfo);
+            if (distance==0) {
+                break;
+            }
+        }
+    }
+
+    if (bestPattern && specifiedSkeletonPtr) {
+        *specifiedSkeletonPtr = specifiedSkeleton;
+    }
+    return bestPattern;
+}
+
+UnicodeString
+DateTimePatternGenerator::adjustFieldTypes(const UnicodeString& pattern,
+                                           const PtnSkeleton* specifiedSkeleton,
+                                           int32_t flags,
+                                           UDateTimePatternMatchOptions options) {
+    UnicodeString newPattern;
+    fp->set(pattern);
+    for (int32_t i=0; i < fp->itemNumber; i++) {
+        UnicodeString field = fp->items[i];
+        if ( fp->isQuoteLiteral(field) ) {
+
+            UnicodeString quoteLiteral;
+            fp->getQuoteLiteral(quoteLiteral, &i);
+            newPattern += quoteLiteral;
+        }
+        else {
+            if (fp->isPatternSeparator(field)) {
+                newPattern+=field;
+                continue;
+            }
+            int32_t canonicalIndex = fp->getCanonicalIndex(field);
+            if (canonicalIndex < 0) {
+                newPattern+=field;
+                continue;  
+            }
+            const dtTypeElem *row = &dtTypes[canonicalIndex];
+            int32_t typeValue = row->field;
+
+
+            if ((flags & kDTPGFixFractionalSeconds) != 0 && typeValue == UDATPG_SECOND_FIELD) {
+                field += decimal;
+                dtMatcher->skeleton.original.appendFieldTo(UDATPG_FRACTIONAL_SECOND_FIELD, field);
+            } else if (dtMatcher->skeleton.type[typeValue]!=0) {
+
+                    char16_t reqFieldChar = dtMatcher->skeleton.original.getFieldChar(typeValue);
+                    int32_t reqFieldLen = dtMatcher->skeleton.original.getFieldLength(typeValue);
+                    if (reqFieldChar == CAP_E && reqFieldLen < 3)
+                        reqFieldLen = 3; 
+                    int32_t adjFieldLen = reqFieldLen;
+                    if ( (typeValue==UDATPG_HOUR_FIELD && (options & UDATPG_MATCH_HOUR_FIELD_LENGTH)==0) ||
+                         (typeValue==UDATPG_MINUTE_FIELD && (options & UDATPG_MATCH_MINUTE_FIELD_LENGTH)==0) ||
+                         (typeValue==UDATPG_SECOND_FIELD && (options & UDATPG_MATCH_SECOND_FIELD_LENGTH)==0) ) {
+                         adjFieldLen = field.length();
+                    } else if (specifiedSkeleton && reqFieldChar != LOW_C && reqFieldChar != LOW_E) {
+                        int32_t skelFieldLen = specifiedSkeleton->original.getFieldLength(typeValue);
+                        UBool patFieldIsNumeric = (row->type > 0);
+                        UBool reqFieldIsNumeric = (dtMatcher->skeleton.type[typeValue] > 0);
+                        if (skelFieldLen == reqFieldLen || (patFieldIsNumeric && !reqFieldIsNumeric) || (reqFieldIsNumeric && !patFieldIsNumeric)) {
+                            adjFieldLen = field.length();
+                        }
+                    }
+                    char16_t c = (typeValue!= UDATPG_HOUR_FIELD
+                            && typeValue!= UDATPG_MONTH_FIELD
+                            && typeValue!= UDATPG_WEEKDAY_FIELD
+                            && (typeValue!= UDATPG_YEAR_FIELD || reqFieldChar==CAP_Y))
+                            ? reqFieldChar
+                            : field.charAt(0);
+                    if (c == CAP_E && adjFieldLen < 3) {
+                        c = LOW_E;
+                    }
+                    if (typeValue == UDATPG_HOUR_FIELD && fDefaultHourFormatChar != 0) {
+
+                        if ((flags & kDTPGSkeletonUsesCapJ) != 0 || reqFieldChar == fDefaultHourFormatChar) {
+                            c = fDefaultHourFormatChar;
+                        } else if (reqFieldChar == LOW_H && fDefaultHourFormatChar == CAP_K) {
+                            c = CAP_K;
+                        } else if (reqFieldChar == CAP_H && fDefaultHourFormatChar == LOW_K) {
+                            c = LOW_K;
+                        } else if (reqFieldChar == LOW_K && fDefaultHourFormatChar == CAP_H) {
+                            c = CAP_H;
+                        } else if (reqFieldChar == CAP_K && fDefaultHourFormatChar == LOW_H) {
+                            c = LOW_H;
+                        }
+                    }
+
+                    field.remove();
+                    for (int32_t j=adjFieldLen; j>0; --j) {
+                        field += c;
+                    }
+            }
+            newPattern+=field;
+        }
+    }
+    return newPattern;
+}
+
+UnicodeString
+DateTimePatternGenerator::getBestAppending(int32_t missingFields, int32_t flags, UErrorCode &status, UDateTimePatternMatchOptions options) {
+    if (U_FAILURE(status)) {
+        return {};
+    }
+    UnicodeString  resultPattern, tempPattern;
+    const UnicodeString* tempPatternPtr;
+    int32_t lastMissingFieldMask=0;
+    if (missingFields!=0) {
+        resultPattern=UnicodeString();
+        const PtnSkeleton* specifiedSkeleton=nullptr;
+        tempPatternPtr = getBestRaw(*dtMatcher, missingFields, distanceInfo, status, &specifiedSkeleton);
+        if (U_FAILURE(status)) {
+            return {};
+        }
+        tempPattern = *tempPatternPtr;
+        resultPattern = adjustFieldTypes(tempPattern, specifiedSkeleton, flags, options);
+        if ( distanceInfo->missingFieldMask==0 ) {
+            return resultPattern;
+        }
+        while (distanceInfo->missingFieldMask!=0) { 
+            if ( lastMissingFieldMask == distanceInfo->missingFieldMask ) {
+                break;  
+            }
+            if (((distanceInfo->missingFieldMask & UDATPG_SECOND_AND_FRACTIONAL_MASK)==UDATPG_FRACTIONAL_MASK) &&
+                ((missingFields & UDATPG_SECOND_AND_FRACTIONAL_MASK) == UDATPG_SECOND_AND_FRACTIONAL_MASK)) {
+                resultPattern = adjustFieldTypes(resultPattern, specifiedSkeleton, flags | kDTPGFixFractionalSeconds, options);
+                distanceInfo->missingFieldMask &= ~UDATPG_FRACTIONAL_MASK;
+                continue;
+            }
+            int32_t startingMask = distanceInfo->missingFieldMask;
+            tempPatternPtr = getBestRaw(*dtMatcher, distanceInfo->missingFieldMask, distanceInfo, status, &specifiedSkeleton);
+            if (U_FAILURE(status)) {
+                return {};
+            }
+            tempPattern = *tempPatternPtr;
+            tempPattern = adjustFieldTypes(tempPattern, specifiedSkeleton, flags, options);
+            int32_t foundMask=startingMask& ~distanceInfo->missingFieldMask;
+            int32_t topField=getTopBitNumber(foundMask);
+
+            if (appendItemFormats[topField].length() != 0) {
+                UnicodeString appendName;
+                getAppendName(static_cast<UDateTimePatternField>(topField), appendName);
+                const UnicodeString *values[3] = {
+                    &resultPattern,
+                    &tempPattern,
+                    &appendName
+                };
+                SimpleFormatter(appendItemFormats[topField], 2, 3, status).
+                    formatAndReplace(values, 3, resultPattern, nullptr, 0, status);
+            }
+            lastMissingFieldMask = distanceInfo->missingFieldMask;
+        }
+    }
+    return resultPattern;
+}
+
+int32_t
+DateTimePatternGenerator::getTopBitNumber(int32_t foundMask) const {
+    if ( foundMask==0 ) {
+        return 0;
+    }
+    int32_t i=0;
+    while (foundMask!=0) {
+        foundMask >>=1;
+        ++i;
+    }
+    if (i-1 >UDATPG_ZONE_FIELD) {
+        return UDATPG_ZONE_FIELD;
+    }
+    else
+        return i-1;
+}
+
+void
+DateTimePatternGenerator::setAvailableFormat(const UnicodeString &key, UErrorCode& err)
+{
+    fAvailableFormatKeyHash->puti(key, 1, err);
+}
+
+UBool
+DateTimePatternGenerator::isAvailableFormatSet(const UnicodeString &key) const {
+    return fAvailableFormatKeyHash->geti(key) == 1;
+}
+
+void
+DateTimePatternGenerator::copyHashtable(Hashtable *other, UErrorCode &status) {
+    if (other == nullptr || U_FAILURE(status)) {
+        return;
+    }
+    if (fAvailableFormatKeyHash != nullptr) {
+        delete fAvailableFormatKeyHash;
+        fAvailableFormatKeyHash = nullptr;
+    }
+    initHashtable(status);
+    if(U_FAILURE(status)){
+        return;
+    }
+    int32_t pos = UHASH_FIRST;
+    const UHashElement* elem = nullptr;
+    while((elem = other->nextElement(pos))!= nullptr){
+        const UHashTok otherKeyTok = elem->key;
+        UnicodeString* otherKey = static_cast<UnicodeString*>(otherKeyTok.pointer);
+        fAvailableFormatKeyHash->puti(*otherKey, 1, status);
+        if(U_FAILURE(status)){
+            return;
+        }
+    }
+}
+
+StringEnumeration*
+DateTimePatternGenerator::getSkeletons(UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    if (U_FAILURE(internalErrorCode)) {
+        status = internalErrorCode;
+        return nullptr;
+    }
+    LocalPointer<StringEnumeration> skeletonEnumerator(
+        new DTSkeletonEnumeration(*patternMap, DT_SKELETON, status), status);
+
+    return U_SUCCESS(status) ? skeletonEnumerator.orphan() : nullptr;
+}
+
+const UnicodeString&
+DateTimePatternGenerator::getPatternForSkeleton(const UnicodeString& skeleton) const {
+    PtnElem *curElem;
+
+    if (skeleton.length() ==0) {
+        return emptyString;
+    }
+    curElem = patternMap->getHeader(skeleton.charAt(0));
+    while ( curElem != nullptr ) {
+        if ( curElem->skeleton->getSkeleton()==skeleton ) {
+            return curElem->pattern;
+        }
+        curElem = curElem->next.getAlias();
+    }
+    return emptyString;
+}
+
+StringEnumeration*
+DateTimePatternGenerator::getBaseSkeletons(UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    if (U_FAILURE(internalErrorCode)) {
+        status = internalErrorCode;
+        return nullptr;
+    }
+    LocalPointer<StringEnumeration> baseSkeletonEnumerator(
+        new DTSkeletonEnumeration(*patternMap, DT_BASESKELETON, status), status);
+
+    return U_SUCCESS(status) ? baseSkeletonEnumerator.orphan() : nullptr;
+}
+
+StringEnumeration*
+DateTimePatternGenerator::getRedundants(UErrorCode& status) {
+    if (U_FAILURE(status)) { return nullptr; }
+    if (U_FAILURE(internalErrorCode)) {
+        status = internalErrorCode;
+        return nullptr;
+    }
+    LocalPointer<StringEnumeration> output(new DTRedundantEnumeration(), status);
+    if (U_FAILURE(status)) { return nullptr; }
+    const UnicodeString *pattern;
+    PatternMapIterator it(status);
+    if (U_FAILURE(status)) { return nullptr; }
+
+    for (it.set(*patternMap); it.hasNext(); ) {
+        DateTimeMatcher current = it.next();
+        pattern = patternMap->getPatternFromSkeleton(*(it.getSkeleton()));
+        if ( isCanonicalItem(*pattern) ) {
+            continue;
+        }
+        if ( skipMatcher == nullptr ) {
+            skipMatcher = new DateTimeMatcher(current);
+            if (skipMatcher == nullptr) {
+                status = U_MEMORY_ALLOCATION_ERROR;
+                return nullptr;
+            }
+        }
+        else {
+            *skipMatcher = current;
+        }
+        UnicodeString trial = getBestPattern(current.getPattern(), status);
+        if (U_FAILURE(status)) { return nullptr; }
+        if (trial == *pattern) {
+            ((DTRedundantEnumeration *)output.getAlias())->add(*pattern, status);
+            if (U_FAILURE(status)) { return nullptr; }
+        }
+        if (current.equals(skipMatcher)) {
+            continue;
+        }
+    }
+    return output.orphan();
+}
+
+UBool
+DateTimePatternGenerator::isCanonicalItem(const UnicodeString& item) const {
+    if ( item.length() != 1 ) {
+        return false;
+    }
+    for (int32_t i=0; i<UDATPG_FIELD_COUNT; ++i) {
+        if (item.charAt(0)==Canonical_Items[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+
+DateTimePatternGenerator*
+DateTimePatternGenerator::clone() const {
+    return new DateTimePatternGenerator(*this);
+}
+
+PatternMap::PatternMap() {
+   for (int32_t i=0; i < MAX_PATTERN_ENTRIES; ++i ) {
+       boot[i] = nullptr;
+   }
+   isDupAllowed = true;
+}
+
+void
+PatternMap::copyFrom(const PatternMap& other, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    this->isDupAllowed = other.isDupAllowed;
+    for (int32_t bootIndex = 0; bootIndex < MAX_PATTERN_ENTRIES; ++bootIndex) {
+        PtnElem *curElem, *otherElem, *prevElem=nullptr;
+        otherElem = other.boot[bootIndex];
+        while (otherElem != nullptr) {
+            LocalPointer<PtnElem> newElem(new PtnElem(otherElem->basePattern, otherElem->pattern), status);
+            if (U_FAILURE(status)) {
+                return; 
+            }
+            newElem->skeleton.adoptInsteadAndCheckErrorCode(new PtnSkeleton(*(otherElem->skeleton)), status);
+            if (U_FAILURE(status)) {
+                return; 
+            }
+            newElem->skeletonWasSpecified = otherElem->skeletonWasSpecified;
+
+            curElem = newElem.orphan();
+
+            if (this->boot[bootIndex] == nullptr) {
+                this->boot[bootIndex] = curElem;
+            } else {
+                if (prevElem != nullptr) {
+                    prevElem->next.adoptInstead(curElem);
+                } else {
+                    UPRV_UNREACHABLE_EXIT;
+                }
+            }
+            prevElem = curElem;
+            otherElem = otherElem->next.getAlias();
+        }
+
+    }
+}
+
+PtnElem*
+PatternMap::getHeader(char16_t baseChar) const {
+    PtnElem* curElem;
+
+    if ( (baseChar >= CAP_A) && (baseChar <= CAP_Z) ) {
+         curElem = boot[baseChar-CAP_A];
+    }
+    else {
+        if ( (baseChar >=LOW_A) && (baseChar <= LOW_Z) ) {
+            curElem = boot[26+baseChar-LOW_A];
+        }
+        else {
+            return nullptr;
+        }
+    }
+    return curElem;
+}
+
+PatternMap::~PatternMap() {
+   for (int32_t i=0; i < MAX_PATTERN_ENTRIES; ++i ) {
+       if (boot[i] != nullptr ) {
+           delete boot[i];
+           boot[i] = nullptr;
+       }
+   }
+}  
+
+void
+PatternMap::add(const UnicodeString& basePattern,
+                const PtnSkeleton& skeleton,
+                const UnicodeString& value,
+                UBool skeletonWasSpecified,
+                UErrorCode &status) {
+    char16_t baseChar = basePattern.charAt(0);
+    PtnElem *curElem, *baseElem;
+    status = U_ZERO_ERROR;
+
+    if ((baseChar >= CAP_A) && (baseChar <= CAP_Z)) {
+        baseElem = boot[baseChar-CAP_A];
+    }
+    else {
+        if ((baseChar >=LOW_A) && (baseChar <= LOW_Z)) {
+            baseElem = boot[26+baseChar-LOW_A];
+         }
+         else {
+             status = U_ILLEGAL_CHARACTER;
+             return;
+         }
+    }
+
+    if (baseElem == nullptr) {
+        LocalPointer<PtnElem> newElem(new PtnElem(basePattern, value), status);
+        if (U_FAILURE(status)) {
+            return; 
+        }
+        newElem->skeleton.adoptInsteadAndCheckErrorCode(new PtnSkeleton(skeleton), status);
+        if (U_FAILURE(status)) {
+            return; 
+        }
+        newElem->skeletonWasSpecified = skeletonWasSpecified;
+        if (baseChar >= LOW_A) {
+            boot[26 + (baseChar - LOW_A)] = newElem.orphan(); 
+        }
+        else {
+            boot[baseChar - CAP_A] = newElem.orphan(); 
+        }
+    }
+    if ( baseElem != nullptr ) {
+        curElem = getDuplicateElem(basePattern, skeleton, baseElem);
+
+        if (curElem == nullptr) {
+            curElem = baseElem;
+            while( curElem -> next != nullptr )
+            {
+                curElem = curElem->next.getAlias();
+            }
+
+            LocalPointer<PtnElem> newElem(new PtnElem(basePattern, value), status);
+            if (U_FAILURE(status)) {
+                return; 
+            }
+            newElem->skeleton.adoptInsteadAndCheckErrorCode(new PtnSkeleton(skeleton), status);
+            if (U_FAILURE(status)) {
+                return; 
+            }
+            newElem->skeletonWasSpecified = skeletonWasSpecified;
+            curElem->next.adoptInstead(newElem.orphan());
+            curElem = curElem->next.getAlias();
+        }
+        else {
+            if ( !isDupAllowed ) {
+                return;
+            }
+            curElem->pattern = value;
+            curElem->skeletonWasSpecified = skeletonWasSpecified;
+        }
+    }
+}  
+
+const UnicodeString *
+PatternMap::getPatternFromBasePattern(const UnicodeString& basePattern, UBool& skeletonWasSpecified) const { 
+   PtnElem *curElem;
+
+   if ((curElem=getHeader(basePattern.charAt(0)))==nullptr) {
+       return nullptr;  
+   }
+
+   do  {
+       if ( basePattern.compare(curElem->basePattern)==0 ) {
+          skeletonWasSpecified = curElem->skeletonWasSpecified;
+          return &(curElem->pattern);
+       }
+       curElem = curElem->next.getAlias();
+   } while (curElem != nullptr);
+
+   return nullptr;
+}  
+
+
+const UnicodeString *
+PatternMap::getPatternFromSkeleton(const PtnSkeleton& skeleton, const PtnSkeleton** specifiedSkeletonPtr) const { 
+   PtnElem *curElem;
+
+   if (specifiedSkeletonPtr) {
+       *specifiedSkeletonPtr = nullptr;
+   }
+
+   char16_t baseChar = skeleton.getFirstChar();
+   if ((curElem=getHeader(baseChar))==nullptr) {
+       return nullptr;  
+   }
+
+   do  {
+       UBool equal;
+       if (specifiedSkeletonPtr != nullptr) { 
+           equal = curElem->skeleton->original == skeleton.original;
+       } else { 
+           equal = curElem->skeleton->baseOriginal == skeleton.baseOriginal;
+       }
+       if (equal) {
+           if (specifiedSkeletonPtr && curElem->skeletonWasSpecified) {
+               *specifiedSkeletonPtr = curElem->skeleton.getAlias();
+           }
+           return &(curElem->pattern);
+       }
+       curElem = curElem->next.getAlias();
+   } while (curElem != nullptr);
+
+   return nullptr;
+}
+
+UBool
+PatternMap::equals(const PatternMap& other) const {
+    if ( this==&other ) {
+        return true;
+    }
+    for (int32_t bootIndex = 0; bootIndex < MAX_PATTERN_ENTRIES; ++bootIndex) {
+        if (boot[bootIndex] == other.boot[bootIndex]) {
+            continue;
+        }
+        if ((boot[bootIndex] == nullptr) || (other.boot[bootIndex] == nullptr)) {
+            return false;
+        }
+        PtnElem *otherElem = other.boot[bootIndex];
+        PtnElem *myElem = boot[bootIndex];
+        while ((otherElem != nullptr) || (myElem != nullptr)) {
+            if ( myElem == otherElem ) {
+                break;
+            }
+            if ((otherElem == nullptr) || (myElem == nullptr)) {
+                return false;
+            }
+            if ( (myElem->basePattern != otherElem->basePattern) ||
+                 (myElem->pattern != otherElem->pattern) ) {
+                return false;
+            }
+            if ((myElem->skeleton.getAlias() != otherElem->skeleton.getAlias()) &&
+                !myElem->skeleton->equals(*(otherElem->skeleton))) {
+                return false;
+            }
+            myElem = myElem->next.getAlias();
+            otherElem = otherElem->next.getAlias();
+        }
+    }
+    return true;
+}
+
+PtnElem*
+PatternMap::getDuplicateElem(
+            const UnicodeString &basePattern,
+            const PtnSkeleton &skeleton,
+            PtnElem *baseElem) {
+   PtnElem *curElem;
+
+   if ( baseElem == nullptr ) {
+         return nullptr;
+   }
+   else {
+         curElem = baseElem;
+   }
+   do {
+     if ( basePattern.compare(curElem->basePattern)==0 ) {
+         UBool isEqual = true;
+         for (int32_t i = 0; i < UDATPG_FIELD_COUNT; ++i) {
+            if (curElem->skeleton->type[i] != skeleton.type[i] ) {
+                isEqual = false;
+                break;
+            }
+        }
+        if (isEqual) {
+            return curElem;
+        }
+     }
+     curElem = curElem->next.getAlias();
+   } while( curElem != nullptr );
+
+   return nullptr;
+
+}  
+
+DateTimeMatcher::DateTimeMatcher() {
+}
+
+DateTimeMatcher::~DateTimeMatcher() {}
+
+DateTimeMatcher::DateTimeMatcher(const DateTimeMatcher& other) {
+    copyFrom(other.skeleton);
+}
+
+DateTimeMatcher& DateTimeMatcher::operator=(const DateTimeMatcher& other) {
+    if (this != &other) {
+        copyFrom(other.skeleton);
+    }
+    return *this;
+}
+
+
+void
+DateTimeMatcher::set(const UnicodeString& pattern, FormatParser* fp) {
+    PtnSkeleton localSkeleton;
+    return set(pattern, fp, localSkeleton);
+}
+
+void
+DateTimeMatcher::set(const UnicodeString& pattern, FormatParser* fp, PtnSkeleton& skeletonResult) {
+    int32_t i;
+    for (i=0; i<UDATPG_FIELD_COUNT; ++i) {
+        skeletonResult.type[i] = NONE;
+    }
+    skeletonResult.original.clear();
+    skeletonResult.baseOriginal.clear();
+    skeletonResult.addedDefaultDayPeriod = false;
+
+    fp->set(pattern);
+    for (i=0; i < fp->itemNumber; i++) {
+        const UnicodeString& value = fp->items[i];
+
+        if ( fp->isQuoteLiteral(value) ) {
+            UnicodeString quoteLiteral;
+            fp->getQuoteLiteral(quoteLiteral, &i);
+            continue;
+        }
+        int32_t canonicalIndex = fp->getCanonicalIndex(value);
+        if (canonicalIndex < 0) {
+            continue;
+        }
+        const dtTypeElem *row = &dtTypes[canonicalIndex];
+        int32_t field = row->field;
+        skeletonResult.original.populate(field, value);
+        char16_t repeatChar = row->patternChar;
+        int32_t repeatCount = row->minLen;
+        skeletonResult.baseOriginal.populate(field, repeatChar, repeatCount);
+        int16_t subField = row->type;
+        if (row->type > 0) {
+            U_ASSERT(value.length() < INT16_MAX);
+            subField += static_cast<int16_t>(value.length());
+        }
+        skeletonResult.type[field] = subField;
+    }
+
+    if (!skeletonResult.original.isFieldEmpty(UDATPG_MINUTE_FIELD)
+        && !skeletonResult.original.isFieldEmpty(UDATPG_FRACTIONAL_SECOND_FIELD)
+        && skeletonResult.original.isFieldEmpty(UDATPG_SECOND_FIELD)) {
+        for (i = 0; dtTypes[i].patternChar != 0; i++) {
+            if (dtTypes[i].field == UDATPG_SECOND_FIELD) {
+                skeletonResult.original.populate(UDATPG_SECOND_FIELD, dtTypes[i].patternChar, dtTypes[i].minLen);
+                skeletonResult.baseOriginal.populate(UDATPG_SECOND_FIELD, dtTypes[i].patternChar, dtTypes[i].minLen);
+                int16_t subField = dtTypes[i].type;
+                skeletonResult.type[UDATPG_SECOND_FIELD] = (subField > 0) ? subField + 1 : subField;
+                break;
+            }
+        }
+    }
+
+    if (!skeletonResult.original.isFieldEmpty(UDATPG_HOUR_FIELD)) {
+        if (skeletonResult.original.getFieldChar(UDATPG_HOUR_FIELD)==LOW_H || skeletonResult.original.getFieldChar(UDATPG_HOUR_FIELD)==CAP_K) {
+            if (skeletonResult.original.isFieldEmpty(UDATPG_DAYPERIOD_FIELD)) {
+                for (i = 0; dtTypes[i].patternChar != 0; i++) {
+                    if ( dtTypes[i].field == UDATPG_DAYPERIOD_FIELD ) {
+                        skeletonResult.original.populate(UDATPG_DAYPERIOD_FIELD, dtTypes[i].patternChar, dtTypes[i].minLen);
+                        skeletonResult.baseOriginal.populate(UDATPG_DAYPERIOD_FIELD, dtTypes[i].patternChar, dtTypes[i].minLen);
+                        skeletonResult.type[UDATPG_DAYPERIOD_FIELD] = dtTypes[i].type;
+                        skeletonResult.addedDefaultDayPeriod = true;
+                        break;
+                    }
+                }
+            }
+        } else {
+            skeletonResult.original.clearField(UDATPG_DAYPERIOD_FIELD);
+            skeletonResult.baseOriginal.clearField(UDATPG_DAYPERIOD_FIELD);
+            skeletonResult.type[UDATPG_DAYPERIOD_FIELD] = NONE;
+        }
+    }
+    copyFrom(skeletonResult);
+}
+
+void
+DateTimeMatcher::getBasePattern(UnicodeString &result ) {
+    result.remove(); 
+    skeleton.baseOriginal.appendTo(result);
+}
+
+UnicodeString
+DateTimeMatcher::getPattern() {
+    UnicodeString result;
+    return skeleton.original.appendTo(result);
+}
+
+int32_t
+DateTimeMatcher::getDistance(const DateTimeMatcher& other, int32_t includeMask, DistanceInfo& distanceInfo) const {
+    int32_t result = 0;
+    distanceInfo.clear();
+    for (int32_t i=0; i<UDATPG_FIELD_COUNT; ++i ) {
+        int32_t myType = (includeMask&(1<<i))==0 ? 0 : skeleton.type[i];
+        int32_t otherType = other.skeleton.type[i];
+        if (myType==otherType) {
+            continue;
+        }
+        if (myType==0) {
+            result += EXTRA_FIELD;
+            distanceInfo.addExtra(i);
+        }
+        else {
+            if (otherType==0) {
+                result += MISSING_FIELD;
+                distanceInfo.addMissing(i);
+            }
+            else {
+                result += abs(myType - otherType);
+            }
+        }
+
+    }
+    return result;
+}
+
+void
+DateTimeMatcher::copyFrom(const PtnSkeleton& newSkeleton) {
+    skeleton.copyFrom(newSkeleton);
+}
+
+void
+DateTimeMatcher::copyFrom() {
+    skeleton.clear();
+}
+
+UBool
+DateTimeMatcher::equals(const DateTimeMatcher* other) const {
+    if (other==nullptr) { return false; }
+    return skeleton.original == other->skeleton.original;
+}
+
+int32_t
+DateTimeMatcher::getFieldMask() const {
+    int32_t result = 0;
+
+    for (int32_t i=0; i<UDATPG_FIELD_COUNT; ++i) {
+        if (skeleton.type[i]!=0) {
+            result |= (1<<i);
+        }
+    }
+    return result;
+}
+
+PtnSkeleton*
+DateTimeMatcher::getSkeletonPtr() {
+    return &skeleton;
+}
+
+FormatParser::FormatParser () {
+    status = START;
+    itemNumber = 0;
+}
+
+
+FormatParser::~FormatParser () {
+}
+
+
+FormatParser::TokenStatus
+FormatParser::setTokens(const UnicodeString& pattern, int32_t startPos, int32_t *len) {
+    int32_t curLoc = startPos;
+    if ( curLoc >= pattern.length()) {
+        return DONE;
+    }
+    do {
+        char16_t c=pattern.charAt(curLoc);
+        if ( (c>=CAP_A && c<=CAP_Z) || (c>=LOW_A && c<=LOW_Z) ) {
+           curLoc++;
+        }
+        else {
+               startPos = curLoc;
+               *len=1;
+               return ADD_TOKEN;
+        }
+
+        if ( pattern.charAt(curLoc)!= pattern.charAt(startPos) ) {
+            break;  
+        }
+    } while(curLoc <= pattern.length());
+    *len = curLoc-startPos;
+    return ADD_TOKEN;
+}
+
+void
+FormatParser::set(const UnicodeString& pattern) {
+    int32_t startPos = 0;
+    TokenStatus result = START;
+    int32_t len = 0;
+    itemNumber = 0;
+
+    do {
+        result = setTokens( pattern, startPos, &len );
+        if ( result == ADD_TOKEN )
+        {
+            items[itemNumber++] = UnicodeString(pattern, startPos, len );
+            startPos += len;
+        }
+        else {
+            break;
+        }
+    } while (result==ADD_TOKEN && itemNumber < MAX_DT_TOKEN);
+}
+
+int32_t
+FormatParser::getCanonicalIndex(const UnicodeString& s, UBool strict) {
+    int32_t len = s.length();
+    if (len == 0) {
+        return -1;
+    }
+    char16_t ch = s.charAt(0);
+
+    for (int32_t l = 1; l < len; l++) {
+        if (ch != s.charAt(l)) {
+            return -1;
+        }
+    }
+    int32_t i = 0;
+    int32_t bestRow = -1;
+    while (dtTypes[i].patternChar != 0x0000) {
+        if ( dtTypes[i].patternChar != ch ) {
+            ++i;
+            continue;
+        }
+        bestRow = i;
+        if (dtTypes[i].patternChar != dtTypes[i+1].patternChar) {
+            return i;
+        }
+        if (dtTypes[i+1].minLen <= len) {
+            ++i;
+            continue;
+        }
+        return i;
+    }
+    return strict ? -1 : bestRow;
+}
+
+UBool
+FormatParser::isQuoteLiteral(const UnicodeString& s) {
+    return s.charAt(0) == SINGLE_QUOTE;
+}
+
+void
+FormatParser::getQuoteLiteral(UnicodeString& quote, int32_t *itemIndex) {
+    int32_t i = *itemIndex;
+
+    quote.remove();
+    if (items[i].charAt(0)==SINGLE_QUOTE) {
+        quote += items[i];
+        ++i;
+    }
+    while ( i < itemNumber ) {
+        if ( items[i].charAt(0)==SINGLE_QUOTE ) {
+            if ( (i+1<itemNumber) && (items[i+1].charAt(0)==SINGLE_QUOTE)) {
+                quote += items[i++];
+                quote += items[i++];
+                continue;
+            }
+            else {
+                quote += items[i];
+                break;
+            }
+        }
+        else {
+            quote += items[i];
+        }
+        ++i;
+    }
+    *itemIndex=i;
+}
+
+UBool
+FormatParser::isPatternSeparator(const UnicodeString& field) const {
+    for (int32_t i=0; i<field.length(); ++i ) {
+        char16_t c= field.charAt(i);
+        if ( (c==SINGLE_QUOTE) || (c==BACKSLASH) || (c==SPACE) || (c==COLON) ||
+             (c==QUOTATION_MARK) || (c==COMMA) || (c==HYPHEN) ||(items[i].charAt(0)==DOT) ) {
+            continue;
+        }
+        else {
+            return false;
+        }
+    }
+    return true;
+}
+
+DistanceInfo::~DistanceInfo() {}
+
+void
+DistanceInfo::setTo(const DistanceInfo& other) {
+    missingFieldMask = other.missingFieldMask;
+    extraFieldMask= other.extraFieldMask;
+}
+
+PatternMapIterator::PatternMapIterator(UErrorCode& status) :
+    bootIndex(0), nodePtr(nullptr), matcher(nullptr), patternMap(nullptr)
+{
+    if (U_FAILURE(status)) { return; }
+    matcher.adoptInsteadAndCheckErrorCode(new DateTimeMatcher(), status);
+}
+
+PatternMapIterator::~PatternMapIterator() {
+}
+
+void
+PatternMapIterator::set(PatternMap& newPatternMap) {
+    this->patternMap=&newPatternMap;
+}
+
+PtnSkeleton*
+PatternMapIterator::getSkeleton() const {
+    if ( nodePtr == nullptr ) {
+        return nullptr;
+    }
+    else {
+        return nodePtr->skeleton.getAlias();
+    }
+}
+
+UBool
+PatternMapIterator::hasNext() const {
+    int32_t headIndex = bootIndex;
+    PtnElem *curPtr = nodePtr;
+
+    if (patternMap==nullptr) {
+        return false;
+    }
+    while ( headIndex < MAX_PATTERN_ENTRIES ) {
+        if ( curPtr != nullptr ) {
+            if ( curPtr->next != nullptr ) {
+                return true;
+            }
+            else {
+                headIndex++;
+                curPtr=nullptr;
+                continue;
+            }
+        }
+        else {
+            if ( patternMap->boot[headIndex] != nullptr ) {
+                return true;
+            }
+            else {
+                headIndex++;
+                continue;
+            }
+        }
+    }
+    return false;
+}
+
+DateTimeMatcher&
+PatternMapIterator::next() {
+    while ( bootIndex < MAX_PATTERN_ENTRIES ) {
+        if ( nodePtr != nullptr ) {
+            if ( nodePtr->next != nullptr ) {
+                nodePtr = nodePtr->next.getAlias();
+                break;
+            }
+            else {
+                bootIndex++;
+                nodePtr=nullptr;
+                continue;
+            }
+        }
+        else {
+            if ( patternMap->boot[bootIndex] != nullptr ) {
+                nodePtr = patternMap->boot[bootIndex];
+                break;
+            }
+            else {
+                bootIndex++;
+                continue;
+            }
+        }
+    }
+    if (nodePtr!=nullptr) {
+        matcher->copyFrom(*nodePtr->skeleton);
+    }
+    else {
+        matcher->copyFrom();
+    }
+    return *matcher;
+}
+
+
+SkeletonFields::SkeletonFields() {
+    clear();
+}
+
+void SkeletonFields::clear() {
+    uprv_memset(chars, 0, sizeof(chars));
+    uprv_memset(lengths, 0, sizeof(lengths));
+}
+
+void SkeletonFields::copyFrom(const SkeletonFields& other) {
+    uprv_memcpy(chars, other.chars, sizeof(chars));
+    uprv_memcpy(lengths, other.lengths, sizeof(lengths));
+}
+
+void SkeletonFields::clearField(int32_t field) {
+    chars[field] = 0;
+    lengths[field] = 0;
+}
+
+char16_t SkeletonFields::getFieldChar(int32_t field) const {
+    return chars[field];
+}
+
+int32_t SkeletonFields::getFieldLength(int32_t field) const {
+    return lengths[field];
+}
+
+void SkeletonFields::populate(int32_t field, const UnicodeString& value) {
+    populate(field, value.charAt(0), value.length());
+}
+
+void SkeletonFields::populate(int32_t field, char16_t ch, int32_t length) {
+    chars[field] = static_cast<int8_t>(ch);
+    lengths[field] = static_cast<int8_t>(length);
+}
+
+UBool SkeletonFields::isFieldEmpty(int32_t field) const {
+    return lengths[field] == 0;
+}
+
+UnicodeString& SkeletonFields::appendTo(UnicodeString& string) const {
+    for (int32_t i = 0; i < UDATPG_FIELD_COUNT; ++i) {
+        appendFieldTo(i, string);
+    }
+    return string;
+}
+
+UnicodeString& SkeletonFields::appendFieldTo(int32_t field, UnicodeString& string) const {
+    char16_t ch(chars[field]);
+    int32_t length = static_cast<int32_t>(lengths[field]);
+
+    for (int32_t i=0; i<length; i++) {
+        string += ch;
+    }
+    return string;
+}
+
+char16_t SkeletonFields::getFirstChar() const {
+    for (int32_t i = 0; i < UDATPG_FIELD_COUNT; ++i) {
+        if (lengths[i] != 0) {
+            return chars[i];
+        }
+    }
+    return '\0';
+}
+
+
+PtnSkeleton::PtnSkeleton()
+    : addedDefaultDayPeriod(false) {
+}
+
+PtnSkeleton::PtnSkeleton(const PtnSkeleton& other) {
+    copyFrom(other);
+}
+
+void PtnSkeleton::copyFrom(const PtnSkeleton& other) {
+    uprv_memcpy(type, other.type, sizeof(type));
+    original.copyFrom(other.original);
+    baseOriginal.copyFrom(other.baseOriginal);
+    addedDefaultDayPeriod = other.addedDefaultDayPeriod;
+}
+
+void PtnSkeleton::clear() {
+    uprv_memset(type, 0, sizeof(type));
+    original.clear();
+    baseOriginal.clear();
+}
+
+UBool
+PtnSkeleton::equals(const PtnSkeleton& other) const  {
+    return (original == other.original)
+        && (baseOriginal == other.baseOriginal)
+        && (uprv_memcmp(type, other.type, sizeof(type)) == 0);
+}
+
+UnicodeString
+PtnSkeleton::getSkeleton() const {
+    UnicodeString result;
+    result = original.appendTo(result);
+    int32_t pos;
+    if (addedDefaultDayPeriod && (pos = result.indexOf(LOW_A)) >= 0) {
+        result.remove(pos, 1);
+    }
+    return result;
+}
+
+UnicodeString
+PtnSkeleton::getBaseSkeleton() const {
+    UnicodeString result;
+    result = baseOriginal.appendTo(result);
+    int32_t pos;
+    if (addedDefaultDayPeriod && (pos = result.indexOf(LOW_A)) >= 0) {
+        result.remove(pos, 1);
+    }
+    return result;
+}
+
+char16_t
+PtnSkeleton::getFirstChar() const {
+    return baseOriginal.getFirstChar();
+}
+
+PtnSkeleton::~PtnSkeleton() {
+}
+
+PtnElem::PtnElem(const UnicodeString &basePat, const UnicodeString &pat) :
+    basePattern(basePat), skeleton(nullptr), pattern(pat), next(nullptr)
+{
+}
+
+PtnElem::~PtnElem() {
+}
+
+DTSkeletonEnumeration::DTSkeletonEnumeration(PatternMap& patternMap, dtStrEnum type, UErrorCode& status) : fSkeletons(nullptr) {
+    PtnElem  *curElem;
+    PtnSkeleton *curSkeleton;
+    UnicodeString s;
+    int32_t bootIndex;
+
+    pos=0;
+    fSkeletons.adoptInsteadAndCheckErrorCode(new UVector(status), status);
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    for (bootIndex=0; bootIndex<MAX_PATTERN_ENTRIES; ++bootIndex ) {
+        curElem = patternMap.boot[bootIndex];
+        while (curElem!=nullptr) {
+            switch(type) {
+                case DT_BASESKELETON:
+                    s=curElem->basePattern;
+                    break;
+                case DT_PATTERN:
+                    s=curElem->pattern;
+                    break;
+                case DT_SKELETON:
+                    curSkeleton=curElem->skeleton.getAlias();
+                    s=curSkeleton->getSkeleton();
+                    break;
+            }
+            if ( !isCanonicalItem(s) ) {
+                LocalPointer<UnicodeString> newElem(s.clone(), status);
+                if (U_FAILURE(status)) { 
+                    return;
+                }
+                fSkeletons->addElement(newElem.getAlias(), status);
+                if (U_FAILURE(status)) {
+                    fSkeletons.adoptInstead(nullptr);
+                    return;
+                }
+                newElem.orphan(); 
+            }
+            curElem = curElem->next.getAlias();
+        }
+    }
+    if ((bootIndex==MAX_PATTERN_ENTRIES) && (curElem!=nullptr) ) {
+        status = U_BUFFER_OVERFLOW_ERROR;
+    }
+}
+
+const UnicodeString*
+DTSkeletonEnumeration::snext(UErrorCode& status) {
+    if (U_SUCCESS(status) && fSkeletons.isValid() && pos < fSkeletons->size()) {
+        return static_cast<const UnicodeString*>(fSkeletons->elementAt(pos++));
+    }
+    return nullptr;
+}
+
+void
+DTSkeletonEnumeration::reset(UErrorCode& ) {
+    pos=0;
+}
+
+int32_t
+DTSkeletonEnumeration::count(UErrorCode& ) const {
+   return (fSkeletons.isNull()) ? 0 : fSkeletons->size();
+}
+
+UBool
+DTSkeletonEnumeration::isCanonicalItem(const UnicodeString& item) {
+    if ( item.length() != 1 ) {
+        return false;
+    }
+    for (int32_t i=0; i<UDATPG_FIELD_COUNT; ++i) {
+        if (item.charAt(0)==Canonical_Items[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+DTSkeletonEnumeration::~DTSkeletonEnumeration() {
+    UnicodeString *s;
+    if (fSkeletons.isValid()) {
+        for (int32_t i = 0; i < fSkeletons->size(); ++i) {
+            if ((s = static_cast<UnicodeString*>(fSkeletons->elementAt(i))) != nullptr) {
+                delete s;
+            }
+        }
+    }
+}
+
+DTRedundantEnumeration::DTRedundantEnumeration() : pos(0), fPatterns(nullptr) {
+}
+
+void
+DTRedundantEnumeration::add(const UnicodeString& pattern, UErrorCode& status) {
+    if (U_FAILURE(status)) { return; }
+    if (fPatterns.isNull())  {
+        fPatterns.adoptInsteadAndCheckErrorCode(new UVector(status), status);
+        if (U_FAILURE(status)) {
+            return;
+       }
+    }
+    LocalPointer<UnicodeString> newElem(new UnicodeString(pattern), status);
+    if (U_FAILURE(status)) {
+        return;
+    }
+    fPatterns->addElement(newElem.getAlias(), status);
+    if (U_FAILURE(status)) {
+        fPatterns.adoptInstead(nullptr);
+        return;
+    }
+    newElem.orphan(); 
+}
+
+const UnicodeString*
+DTRedundantEnumeration::snext(UErrorCode& status) {
+    if (U_SUCCESS(status) && fPatterns.isValid() && pos < fPatterns->size()) {
+        return static_cast<const UnicodeString*>(fPatterns->elementAt(pos++));
+    }
+    return nullptr;
+}
+
+void
+DTRedundantEnumeration::reset(UErrorCode& ) {
+    pos=0;
+}
+
+int32_t
+DTRedundantEnumeration::count(UErrorCode& ) const {
+    return (fPatterns.isNull()) ? 0 : fPatterns->size();
+}
+
+UBool
+DTRedundantEnumeration::isCanonicalItem(const UnicodeString& item) const {
+    if ( item.length() != 1 ) {
+        return false;
+    }
+    for (int32_t i=0; i<UDATPG_FIELD_COUNT; ++i) {
+        if (item.charAt(0)==Canonical_Items[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+DTRedundantEnumeration::~DTRedundantEnumeration() {
+    UnicodeString *s;
+    if (fPatterns.isValid()) {
+        for (int32_t i = 0; i < fPatterns->size(); ++i) {
+            if ((s = static_cast<UnicodeString*>(fPatterns->elementAt(i))) != nullptr) {
+                delete s;
+            }
+        }
+    }    
+}
+
+U_NAMESPACE_END
+
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+

@@ -1,0 +1,246 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsMathMLFrame.h"
+
+#include "PseudoStyleType.h"
+#include "gfxContext.h"
+#include "gfxMathTable.h"
+#include "gfxUtils.h"
+#include "mozilla/StaticPrefs_mathml.h"
+#include "mozilla/dom/MathMLElement.h"
+#include "mozilla/gfx/2D.h"
+#include "nsCSSValue.h"
+#include "nsLayoutUtils.h"
+#include "nsMathMLChar.h"
+#include "nsNameSpaceManager.h"
+#include "nsPresContextInlines.h"
+
+#include "mozilla/dom/SVGAnimatedLength.h"
+#include "mozilla/dom/SVGLength.h"
+
+#include "mozilla/ServoStyleSet.h"
+#include "nsDisplayList.h"
+
+using namespace mozilla;
+using namespace mozilla::gfx;
+
+MathMLFrameType nsMathMLFrame::GetMathMLFrameType() {
+  if (mEmbellishData.coreFrame) {
+    return GetMathMLFrameTypeFor(mEmbellishData.coreFrame);
+  }
+
+  if (mPresentationData.baseFrame) {
+    return GetMathMLFrameTypeFor(mPresentationData.baseFrame);
+  }
+
+  return MathMLFrameType::Ordinary;
+}
+
+NS_IMETHODIMP
+nsMathMLFrame::InheritAutomaticData(nsIFrame* aParent) {
+  mEmbellishData.flags.clear();
+  mEmbellishData.coreFrame = nullptr;
+  mEmbellishData.direction = StretchDirection::Unsupported;
+  mEmbellishData.leadingSpace = 0;
+  mEmbellishData.trailingSpace = 0;
+
+  mPresentationData.flags.clear();
+  mPresentationData.baseFrame = nullptr;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsMathMLFrame::UpdatePresentationData(MathMLPresentationFlags aFlagsValues,
+                                      MathMLPresentationFlags aWhichFlags) {
+  NS_ASSERTION(aWhichFlags.contains(MathMLPresentationFlag::Dtls),
+               "aWhichFlags should only dtls flag");
+  if (aWhichFlags.contains(MathMLPresentationFlag::Dtls)) {
+    if (aFlagsValues.contains(MathMLPresentationFlag::Dtls)) {
+      mPresentationData.flags += MathMLPresentationFlag::Dtls;
+    } else {
+      mPresentationData.flags -= MathMLPresentationFlag::Dtls;
+    }
+  }
+  return NS_OK;
+}
+
+void nsMathMLFrame::GetEmbellishDataFrom(nsIFrame* aFrame,
+                                         nsEmbellishData& aEmbellishData) {
+  aEmbellishData.flags.clear();
+  aEmbellishData.coreFrame = nullptr;
+  aEmbellishData.direction = StretchDirection::Unsupported;
+  aEmbellishData.leadingSpace = 0;
+  aEmbellishData.trailingSpace = 0;
+
+  if (aFrame && aFrame->IsMathMLFrame()) {
+    nsIMathMLFrame* mathMLFrame = do_QueryFrame(aFrame);
+    if (mathMLFrame) {
+      mathMLFrame->GetEmbellishData(aEmbellishData);
+    }
+  }
+}
+
+void nsMathMLFrame::GetRuleThickness(DrawTarget* aDrawTarget,
+                                     nsFontMetrics* aFontMetrics,
+                                     nscoord& aRuleThickness) {
+  nscoord xHeight = aFontMetrics->XHeight();
+  char16_t overBar = 0x00AF;
+  nsBoundingMetrics bm = nsLayoutUtils::AppUnitBoundsOfString(
+      &overBar, 1, *aFontMetrics, aDrawTarget);
+  aRuleThickness = bm.ascent + bm.descent;
+  if (aRuleThickness <= 0 || aRuleThickness >= xHeight) {
+    GetRuleThickness(aFontMetrics, aRuleThickness);
+  }
+}
+
+void nsMathMLFrame::GetAxisHeight(DrawTarget* aDrawTarget,
+                                  nsFontMetrics* aFontMetrics,
+                                  nscoord& aAxisHeight) {
+  RefPtr<gfxFont> mathFont =
+      aFontMetrics->GetThebesFontGroup()->GetFirstMathFont();
+  if (mathFont) {
+    aAxisHeight = mathFont->MathTable()->Constant(
+        gfxMathTable::AxisHeight, aFontMetrics->AppUnitsPerDevPixel());
+    return;
+  }
+
+  nscoord xHeight = aFontMetrics->XHeight();
+  char16_t minus = 0x2212;  
+  nsBoundingMetrics bm = nsLayoutUtils::AppUnitBoundsOfString(
+      &minus, 1, *aFontMetrics, aDrawTarget);
+  aAxisHeight = bm.ascent - (bm.ascent + bm.descent) / 2;
+  if (aAxisHeight <= 0 || aAxisHeight >= xHeight) {
+    GetAxisHeight(aFontMetrics, aAxisHeight);
+  }
+}
+
+nscoord nsMathMLFrame::CalcLength(const nsCSSValue& aCSSValue,
+                                  float aFontSizeInflation, nsIFrame* aFrame) {
+  NS_ASSERTION(aCSSValue.IsLengthUnit(), "not a length unit");
+
+  nsCSSUnit unit = aCSSValue.GetUnit();
+  mozilla::dom::NonSVGFrameUserSpaceMetrics userSpaceMetrics(aFrame);
+
+  return nsPresContext::CSSPixelsToAppUnits(
+      aCSSValue.GetFloatValue() *
+      SVGLength::GetPixelsPerCSSUnit(userSpaceMetrics, unit,
+                                     SVGLength::Axis::XY,
+                                      true));
+}
+
+void nsMathMLFrame::GetSubDropFromChild(nsIFrame* aChild, nscoord& aSubDrop,
+                                        float aFontSizeInflation) {
+  RefPtr<nsFontMetrics> fm =
+      nsLayoutUtils::GetFontMetricsForFrame(aChild, aFontSizeInflation);
+  GetSubDrop(fm, aSubDrop);
+}
+
+void nsMathMLFrame::GetSupDropFromChild(nsIFrame* aChild, nscoord& aSupDrop,
+                                        float aFontSizeInflation) {
+  RefPtr<nsFontMetrics> fm =
+      nsLayoutUtils::GetFontMetricsForFrame(aChild, aFontSizeInflation);
+  GetSupDrop(fm, aSupDrop);
+}
+
+void nsMathMLFrame::ParseAndCalcNumericValue(
+    const nsString& aString, nscoord* aLengthValue, float aFontSizeInflation,
+    nsIFrame* aFrame, dom::MathMLElement::ParseFlags aFlags) {
+  nsCSSValue cssValue;
+
+  if (!dom::MathMLElement::ParseNumericValue(
+          aString, cssValue, aFrame->PresContext()->Document(), aFlags)) {
+    return;
+  }
+
+  nsCSSUnit unit = cssValue.GetUnit();
+
+  if (unit == eCSSUnit_Percent) {
+    *aLengthValue = NSToCoordRound(*aLengthValue * cssValue.GetPercentValue());
+    return;
+  }
+
+  *aLengthValue = CalcLength(cssValue, aFontSizeInflation, aFrame);
+}
+
+namespace mozilla {
+
+class nsDisplayMathMLBar final : public nsPaintedDisplayItem {
+ public:
+  nsDisplayMathMLBar(nsDisplayListBuilder* aBuilder, nsIFrame* aFrame,
+                     const nsRect& aRect)
+      : nsPaintedDisplayItem(aBuilder, aFrame), mRect(aRect) {
+    MOZ_COUNT_CTOR(nsDisplayMathMLBar);
+  }
+
+  MOZ_COUNTED_DTOR_FINAL(nsDisplayMathMLBar)
+
+  void Paint(nsDisplayListBuilder* aBuilder, gfxContext* aCtx) override;
+  NS_DISPLAY_DECL_NAME("MathMLBar", TYPE_MATHML_BAR)
+
+ private:
+  nsRect mRect;
+};
+
+void nsDisplayMathMLBar::Paint(nsDisplayListBuilder* aBuilder,
+                               gfxContext* aCtx) {
+  DrawTarget* drawTarget = aCtx->GetDrawTarget();
+  Rect rect = NSRectToNonEmptySnappedRect(
+      mRect + ToReferenceFrame(), mFrame->PresContext()->AppUnitsPerDevPixel(),
+      *drawTarget);
+  ColorPattern color(ToDeviceColor(
+      mFrame->GetVisitedDependentColor(&nsStyleText::mWebkitTextFillColor)));
+  drawTarget->FillRect(rect, color);
+}
+
+}  
+
+void nsMathMLFrame::DisplayBar(nsDisplayListBuilder* aBuilder, nsIFrame* aFrame,
+                               const nsRect& aRect,
+                               const nsDisplayListSet& aLists,
+                               uint16_t aIndex) {
+  if (!aFrame->StyleVisibility()->IsVisible() || aRect.IsEmpty()) {
+    return;
+  }
+
+  aLists.Content()->AppendNewToTopWithIndex<nsDisplayMathMLBar>(
+      aBuilder, aFrame, aIndex, aRect);
+}
+
+void nsMathMLFrame::GetRadicalParameters(nsFontMetrics* aFontMetrics,
+                                         bool aDisplayStyle,
+                                         nscoord& aRadicalRuleThickness,
+                                         nscoord& aRadicalExtraAscender,
+                                         nscoord& aRadicalVerticalGap) {
+  nscoord oneDevPixel = aFontMetrics->AppUnitsPerDevPixel();
+  RefPtr<gfxFont> mathFont =
+      aFontMetrics->GetThebesFontGroup()->GetFirstMathFont();
+
+  if (mathFont) {
+    aRadicalRuleThickness = mathFont->MathTable()->Constant(
+        gfxMathTable::RadicalRuleThickness, oneDevPixel);
+  } else {
+    GetRuleThickness(aFontMetrics, aRadicalRuleThickness);
+  }
+
+  if (mathFont) {
+    aRadicalExtraAscender = mathFont->MathTable()->Constant(
+        gfxMathTable::RadicalExtraAscender, oneDevPixel);
+  } else {
+    nscoord em;
+    GetEmHeight(aFontMetrics, em);
+    aRadicalExtraAscender = nscoord(0.2f * em);
+  }
+
+  if (mathFont) {
+    aRadicalVerticalGap = mathFont->MathTable()->Constant(
+        aDisplayStyle ? gfxMathTable::RadicalDisplayStyleVerticalGap
+                      : gfxMathTable::RadicalVerticalGap,
+        oneDevPixel);
+  } else {
+    aRadicalVerticalGap =
+        aRadicalRuleThickness +
+        (aDisplayStyle ? aFontMetrics->XHeight() : aRadicalRuleThickness) / 4;
+  }
+}

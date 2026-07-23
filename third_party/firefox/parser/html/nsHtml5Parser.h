@@ -1,0 +1,178 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef NS_HTML5_PARSER
+#define NS_HTML5_PARSER
+
+#include "mozilla/UniquePtr.h"
+#include "nsIParser.h"
+#include "nsDeque.h"
+#include "nsIContentSink.h"
+#include "nsIRequest.h"
+#include "nsIChannel.h"
+#include "nsCOMArray.h"
+#include "nsContentSink.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsHtml5OwningUTF16Buffer.h"
+#include "nsHtml5TreeOpExecutor.h"
+#include "nsHtml5StreamParser.h"
+#include "nsHtml5AtomTable.h"
+#include "nsWeakReference.h"
+#include "nsHtml5StreamListener.h"
+#include "nsCharsetSource.h"
+
+class nsHtml5Parser final : public nsIParser,
+                            public nsSupportsWeakReference,
+                            public nsIStreamListener {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsHtml5Parser, nsIParser)
+
+  nsHtml5Parser();
+
+  NS_IMETHOD OnStartRequest(nsIRequest* aRequest) override;
+
+  NS_IMETHOD OnDataAvailable(nsIRequest* aRequest, nsIInputStream* aInStream,
+                             uint64_t aSourceOffset, uint32_t aLength) override;
+
+  NS_IMETHOD OnStopRequest(nsIRequest* aRequest, nsresult aStatus) override;
+
+  NS_IMETHOD_(void) SetContentSink(nsIContentSink* aSink) override;
+
+  NS_IMETHOD_(nsIContentSink*) GetContentSink() override;
+
+  NS_IMETHOD_(void) GetCommand(nsCString& aCommand) override;
+
+  NS_IMETHOD_(void) SetCommand(const char* aCommand) override;
+
+  NS_IMETHOD_(void) SetCommand(eParserCommands aParserCommand) override;
+
+  virtual void SetDocumentCharset(NotNull<const Encoding*> aEncoding,
+                                  int32_t aSource,
+                                  bool aForceAutoDetection) override;
+
+  nsresult GetChannel(nsIChannel** aChannel);
+
+  virtual nsIStreamListener* GetStreamListener() override;
+
+  NS_IMETHOD ContinueInterruptedParsing() override;
+
+  NS_IMETHOD_(void) BlockParser() override;
+
+  NS_IMETHOD_(void) UnblockParser() override;
+
+  NS_IMETHOD_(void) ContinueInterruptedParsingAsync() override;
+
+  NS_IMETHOD_(bool) IsParserEnabled() override;
+
+  NS_IMETHOD_(bool) IsParserClosed() override;
+
+  NS_IMETHOD_(bool) IsComplete() override;
+
+  NS_IMETHOD Parse(nsIURI* aURL) override;
+
+  nsresult Parse(const nsAString& aSourceBuffer, void* aKey, bool aLastCall);
+
+  NS_IMETHOD Terminate() override;
+
+  virtual bool IsInsertionPointDefined() override;
+
+  void IncrementScriptNestingLevel() final;
+
+  void DecrementScriptNestingLevel() final;
+
+  bool HasNonzeroScriptNestingLevel() const final;
+
+  void MarkAsNotScriptCreated(const char* aCommand);
+
+  virtual bool IsScriptCreated() override;
+
+  virtual bool IsAboutBlankMode() override;
+
+
+
+ public:
+  virtual nsresult Initialize(mozilla::dom::Document* aDoc, nsIURI* aURI,
+                              nsISupports* aContainer, nsIChannel* aChannel);
+
+  inline nsHtml5Tokenizer* GetTokenizer() { return mTokenizer.get(); }
+
+  void InitializeDocWriteParserState(nsAHtml5TreeBuilderState* aState,
+                                     int32_t aLine);
+
+  void DropStreamParser() {
+    if (GetStreamParser()) {
+      GetStreamParser()->DropTimer();
+      mStreamListener->DropDelegate();
+      mStreamListener = nullptr;
+    }
+  }
+
+  void StartTokenizer(bool aScriptingEnabled);
+
+  void ContinueAfterFailedCharsetSwitch();
+
+  nsHtml5StreamParser* GetStreamParser() {
+    if (!mStreamListener) {
+      return nullptr;
+    }
+    return mStreamListener->GetDelegate();
+  }
+
+  void PermanentlyUndefineInsertionPoint() {
+    mInsertionPointPermanentlyUndefined = true;
+  }
+
+  nsresult ParseUntilBlocked();
+
+  nsresult StartExecutor();
+
+ private:
+  virtual ~nsHtml5Parser();
+
+
+  bool mAboutBlankMode;
+
+  bool mLastWasCR;
+
+  bool mDocWriteSpeculativeLastWasCR;
+
+  uint32_t mBlocked;
+
+  bool mDocWriteSpeculatorActive;
+
+  int32_t mScriptNestingLevel;
+
+  bool mTerminationStarted;
+
+  bool mDocumentClosed;
+
+  bool mInDocumentWrite;
+
+  bool mInsertionPointPermanentlyUndefined;
+
+  RefPtr<nsHtml5OwningUTF16Buffer> mFirstBuffer;
+
+  nsHtml5OwningUTF16Buffer* mLastBuffer;  
+
+  RefPtr<nsHtml5TreeOpExecutor> mExecutor;
+
+  const mozilla::UniquePtr<nsHtml5TreeBuilder> mTreeBuilder;
+
+  const mozilla::UniquePtr<nsHtml5Tokenizer> mTokenizer;
+
+  mozilla::UniquePtr<nsHtml5TreeBuilder> mDocWriteSpeculativeTreeBuilder;
+
+  mozilla::UniquePtr<nsHtml5Tokenizer> mDocWriteSpeculativeTokenizer;
+
+  RefPtr<nsHtml5StreamListener> mStreamListener;
+
+  int32_t mRootContextLineNumber;
+
+  bool mReturnToStreamParserPermitted;
+
+  nsHtml5AtomTable mAtomTable;
+};
+#endif

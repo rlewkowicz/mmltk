@@ -1,0 +1,105 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+* Copyright (c) 2002-2014, International Business Machines
+* Corporation and others.  All Rights Reserved.
+**********************************************************************
+*/
+#ifndef USETITER_H
+#define USETITER_H
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/uobject.h"
+#include "unicode/unistr.h"
+
+
+U_NAMESPACE_BEGIN
+
+class UnicodeSet;
+class UnicodeString;
+
+class U_COMMON_API UnicodeSetIterator final : public UObject {
+    enum { IS_STRING = -1 };
+
+    UChar32 codepoint;
+
+    UChar32 codepointEnd;
+
+    const UnicodeString* string;
+
+ public:
+
+    UnicodeSetIterator(const UnicodeSet& set);
+
+    UnicodeSetIterator();
+
+    virtual ~UnicodeSetIterator();
+
+    inline UBool isString() const;
+
+    inline UChar32 getCodepoint() const;
+
+    inline UChar32 getCodepointEnd() const;
+
+    const UnicodeString& getString();
+
+    inline UnicodeSetIterator &skipToStrings() {
+        range = endRange;
+        endElement = -1;
+        nextElement = 0;
+        return *this;
+    }
+
+    UBool next();
+
+    UBool nextRange();
+
+    void reset(const UnicodeSet& set);
+
+    void reset();
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual UClassID getDynamicClassID() const override;
+
+
+private:
+
+    const UnicodeSet* set;
+    int32_t endRange;
+    int32_t range;
+    int32_t endElement;
+    int32_t nextElement;
+    int32_t nextString;
+    int32_t stringCount;
+
+    UnicodeString *cpString;
+
+    UnicodeSetIterator(const UnicodeSetIterator&) = delete;
+
+    UnicodeSetIterator& operator=(const UnicodeSetIterator&) = delete;
+
+    void loadRange(int32_t range);
+};
+
+inline UBool UnicodeSetIterator::isString() const {
+    return codepoint < 0;
+}
+
+inline UChar32 UnicodeSetIterator::getCodepoint() const {
+    return codepoint;
+}
+
+inline UChar32 UnicodeSetIterator::getCodepointEnd() const {
+    return codepointEnd;
+}
+
+
+U_NAMESPACE_END
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif

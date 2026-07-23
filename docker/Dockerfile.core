@@ -1,0 +1,211 @@
+# syntax=docker/dockerfile:1
+
+ARG MMLTK_PYTORCH_DEVEL_IMAGE=pytorch/pytorch:2.10.0-cuda13.0-cudnn9-devel
+
+FROM ${MMLTK_PYTORCH_DEVEL_IMAGE} AS toolchain
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG MMLTK_IMAGE_FINGERPRINT=unlabeled
+ARG MMLTK_BINARYEN_ARCHIVE_URL=https://github.com/WebAssembly/binaryen/releases/download/version_130/binaryen-version_130-x86_64-linux.tar.gz
+ARG MMLTK_BINARYEN_SHA256=0a18362361ad05465118cd8eeb72edaeec89de6894bc283576ef4e07aa3babcc
+ARG MMLTK_BINARYEN_VERSION=130
+ARG MMLTK_CARGO_DUPES_VERSION=0.2.1
+ARG MMLTK_CLANG_VERSION=18
+ARG MMLTK_CUDA_VERSION=13.0
+ARG MMLTK_MOLD_ARCHIVE_URL=https://github.com/rui314/mold/releases/download/v2.41.0/mold-2.41.0-x86_64-linux.tar.gz
+ARG MMLTK_MOLD_SHA256=a3696680d99e692970590a178bc3a33d78d60d1c6dc9db7a11b557b02b751f5d
+ARG MMLTK_MOLD_VERSION=2.41.0
+ARG MMLTK_NINJA_ARCHIVE_URL=https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-linux.zip
+ARG MMLTK_NINJA_SHA256=5749cbc4e668273514150a80e387a957f933c6ed3f5f11e03fb30955e2bbead6
+ARG MMLTK_NINJA_VERSION=1.13.2
+ARG MMLTK_ONNX_COMMIT=e709452ef2bbc1d113faf678c24e6d3467696e83
+ARG MMLTK_ONNXRUNTIME_VERSION=1.23.2
+ARG MMLTK_ONNXRUNTIME_SHA256=2083e361072a79ce16a90dcd5f5cb3ab92574a82a3ce0ac01e5cfa3158176f53
+ARG MMLTK_RUST_TOOLCHAIN=1.93.1
+ARG MMLTK_TENSORRT_VERSION=10.14.1.48-1+cuda13.0
+ARG MMLTK_TORCH_CUDA_ARCH_LIST="8.6 8.7 8.9 9.0 10.0 10.3 11.0 12.0 12.1"
+ARG MMLTK_TRUNK_VERSION=0.21.14
+ARG MMLTK_WASM_BINDGEN_VERSION=0.2.108
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV CUDA_HOME=/usr/local/cuda-${MMLTK_CUDA_VERSION} \
+    CUDA_BIN_PATH=/usr/local/cuda-${MMLTK_CUDA_VERSION} \
+    CUDACXX=/usr/local/cuda-${MMLTK_CUDA_VERSION}/bin/nvcc \
+    CC=/usr/bin/gcc-14 \
+    CXX=/usr/bin/g++-14 \
+    CARGO_HOME=/opt/rust/cargo \
+    RUSTUP_HOME=/opt/rust/rustup \
+    PATH=/opt/mold/bin:/opt/binaryen/bin:/opt/rust/cargo/bin:${PATH} \
+    TORCH_CUDA_ARCH_LIST=${MMLTK_TORCH_CUDA_ARCH_LIST}
+
+RUN sed -i \
+        -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+        -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
+        /etc/apt/sources.list.d/ubuntu.sources \
+    && printf '%s\n' \
+        'Acquire::Retries "5";' \
+        'Acquire::http::Timeout "30";' \
+        'Acquire::https::Timeout "30";' \
+        'APT::Update::Error-Mode "any";' \
+        >/etc/apt/apt.conf.d/99mmltk-network \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        bzip2 \
+        ca-certificates \
+        ccache \
+        clang-${MMLTK_CLANG_VERSION} \
+        clang-format \
+        clang-tidy \
+        cmake \
+        cppcheck \
+        curl \
+        file \
+        g++-14 \
+        gcc-14 \
+        gdb \
+        git \
+        gzip \
+        libasound2-dev \
+        libcurl4-openssl-dev \
+        libdbus-glib-1-dev \
+        libdrm-dev \
+        libegl-dev \
+        libgbm-dev \
+        libgtk-3-dev \
+        libnvinfer-dev=${MMLTK_TENSORRT_VERSION} \
+        libnvinfer-headers-dev=${MMLTK_TENSORRT_VERSION} \
+        libnvinfer-headers-plugin-dev=${MMLTK_TENSORRT_VERSION} \
+        libnvinfer-plugin-dev=${MMLTK_TENSORRT_VERSION} \
+        libnvinfer-plugin10=${MMLTK_TENSORRT_VERSION} \
+        libnvinfer10=${MMLTK_TENSORRT_VERSION} \
+        libnuma-dev \
+        libnvonnxparsers-dev=${MMLTK_TENSORRT_VERSION} \
+        libnvonnxparsers10=${MMLTK_TENSORRT_VERSION} \
+        libomp-dev \
+        libopenblas-dev \
+        libopenmpi-dev \
+        libprotobuf-dev \
+        libudev-dev \
+        libvulkan-dev \
+        libwayland-dev \
+        libx11-xcb-dev \
+        libxkbcommon-dev \
+        mercurial \
+        nasm \
+        openmpi-bin \
+        patch \
+        pkg-config \
+        procps \
+        protobuf-compiler \
+        python3-dev \
+        python3-pip \
+        python3-venv \
+        rsync \
+        software-properties-common \
+        tar \
+        unzip \
+        xz-utils \
+        yasm \
+        zip \
+        zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL "${MMLTK_MOLD_ARCHIVE_URL}" -o /tmp/mold.tar.gz \
+    && echo "${MMLTK_MOLD_SHA256}  /tmp/mold.tar.gz" | sha256sum -c - \
+    && mkdir -p /opt \
+    && tar -xzf /tmp/mold.tar.gz -C /opt \
+    && mv "/opt/mold-${MMLTK_MOLD_VERSION}-x86_64-linux" /opt/mold \
+    && rm -f /tmp/mold.tar.gz \
+    && /opt/mold/bin/mold --version
+
+RUN curl -fsSL "${MMLTK_NINJA_ARCHIVE_URL}" -o /tmp/ninja.zip \
+    && echo "${MMLTK_NINJA_SHA256}  /tmp/ninja.zip" | sha256sum -c - \
+    && unzip -qo /tmp/ninja.zip -d /usr/local/bin \
+    && rm -f /tmp/ninja.zip \
+    && test "$(ninja --version)" = "${MMLTK_NINJA_VERSION}"
+
+RUN python3 - <<'PY'
+from pathlib import Path
+import torch
+
+torch_root = Path(torch.utils.cmake_prefix_path).resolve().parents[1]
+link_path = Path("/opt/pytorch")
+if link_path.exists() or link_path.is_symlink():
+    link_path.unlink()
+link_path.symlink_to(torch_root)
+print(f"linked /opt/pytorch -> {torch_root}")
+PY
+
+RUN curl -fsSL \
+        "https://github.com/microsoft/onnxruntime/releases/download/v${MMLTK_ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-gpu-${MMLTK_ONNXRUNTIME_VERSION}.tgz" \
+        -o /tmp/onnxruntime.tgz \
+    && echo "${MMLTK_ONNXRUNTIME_SHA256}  /tmp/onnxruntime.tgz" | sha256sum -c - \
+    && tar -xzf /tmp/onnxruntime.tgz -C /opt \
+    && mv "/opt/onnxruntime-linux-x64-gpu-${MMLTK_ONNXRUNTIME_VERSION}" /opt/onnxruntime \
+    && rm -f /tmp/onnxruntime.tgz
+
+RUN git init /tmp/onnx-src \
+    && git -C /tmp/onnx-src remote add origin https://github.com/onnx/onnx.git \
+    && git -C /tmp/onnx-src -c protocol.version=2 fetch \
+        --depth 1 --filter=blob:none origin "${MMLTK_ONNX_COMMIT}" \
+    && git -C /tmp/onnx-src checkout --force FETCH_HEAD \
+    && cmake -S /tmp/onnx-src -B /tmp/onnx-build -G Ninja \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/opt/onnx \
+        -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=mold \
+        -DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=mold \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=mold \
+        -DONNX_BUILD_CUSTOM_PROTOBUF=OFF \
+        -DONNX_BUILD_PYTHON=OFF \
+        -DONNX_BUILD_TESTS=OFF \
+        -DONNX_CUSTOM_PROTOC_EXECUTABLE=/usr/bin/protoc \
+        -DONNX_ML=ON \
+        -DONNX_NAMESPACE=onnx_torch \
+        -DONNX_USE_LITE_PROTO=OFF \
+        -DONNX_USE_PROTOBUF_SHARED_LIBS=ON \
+        -DONNX_WERROR=OFF \
+        -DProtobuf_PROTOC_EXECUTABLE=/usr/bin/protoc \
+    && cmake --build /tmp/onnx-build --parallel "$(nproc)" \
+    && cmake --install /tmp/onnx-build \
+    && rm -rf /tmp/onnx-src /tmp/onnx-build
+
+RUN if [[ ! -f /opt/pytorch/lib/libkineto.a ]]; then ar rcs /opt/pytorch/lib/libkineto.a; fi
+
+RUN curl -fsSL "${MMLTK_BINARYEN_ARCHIVE_URL}" -o /tmp/binaryen.tar.gz \
+    && echo "${MMLTK_BINARYEN_SHA256}  /tmp/binaryen.tar.gz" | sha256sum -c - \
+    && rm -rf /opt/binaryen \
+    && tar -xzf /tmp/binaryen.tar.gz -C /opt \
+    && mv "/opt/binaryen-version_${MMLTK_BINARYEN_VERSION}" /opt/binaryen \
+    && rm -f /tmp/binaryen.tar.gz \
+    && /opt/binaryen/bin/wasm-opt --version
+
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "${MMLTK_RUST_TOOLCHAIN}" \
+    && rustup target add wasm32-unknown-unknown \
+    && rustup component add rustfmt \
+    && export RUSTFLAGS="-C link-arg=-fuse-ld=mold" \
+    && cargo install trunk --version "${MMLTK_TRUNK_VERSION}" --locked \
+    && cargo install wasm-bindgen-cli --version "${MMLTK_WASM_BINDGEN_VERSION}" --locked \
+    && cargo install cargo-dupes --version "${MMLTK_CARGO_DUPES_VERSION}" --locked \
+    && unset RUSTFLAGS \
+    && chmod -R a+rX "${CARGO_HOME}" "${RUSTUP_HOME}" \
+    && trunk --version \
+    && wasm-bindgen --version \
+    && cargo dupes --version \
+    && rustfmt --version
+
+COPY utilities/wasm-opt-wrapper /usr/local/bin/wasm-opt
+RUN chmod 0755 /usr/local/bin/wasm-opt \
+    && cmake --version \
+    && ninja --version \
+    && ccache --version \
+    && mold --version \
+    && wasm-opt --version
+
+WORKDIR /workspace
+
+LABEL com.mmltk.input-fingerprint="${MMLTK_IMAGE_FINGERPRINT}"

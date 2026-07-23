@@ -1,0 +1,101 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_decoders_nsICODecoder_h
+#define mozilla_image_decoders_nsICODecoder_h
+
+#include "Decoder.h"
+#include "Downscaler.h"
+#include "ICOFileHeaders.h"
+#include "StreamingLexer.h"
+#include "imgFrame.h"
+#include "mozilla/gfx/2D.h"
+#include "nsBMPDecoder.h"
+#include "nsPNGDecoder.h"
+
+namespace mozilla {
+namespace image {
+
+class RasterImage;
+
+enum class ICOState {
+  HEADER,
+  DIR_ENTRY,
+  FINISHED_DIR_ENTRY,
+  ITERATE_UNSIZED_DIR_ENTRY,
+  SKIP_TO_RESOURCE,
+  FOUND_RESOURCE,
+  SNIFF_RESOURCE,
+  READ_RESOURCE,
+  PREPARE_FOR_MASK,
+  READ_MASK_ROW,
+  FINISH_MASK,
+  SKIP_MASK,
+  FINISHED_RESOURCE
+};
+
+class nsICODecoder : public Decoder {
+ public:
+  virtual ~nsICODecoder() = default;
+
+  size_t FirstResourceOffset() const;
+
+  DecoderType GetType() const override { return DecoderType::ICO; }
+  LexerResult DoDecode(SourceBufferIterator& aIterator,
+                       IResumable* aOnResume) override;
+  nsresult FinishInternal() override;
+  nsresult FinishWithErrorInternal() override;
+
+ private:
+  friend class DecoderFactory;
+
+  explicit nsICODecoder(RasterImage* aImage);
+
+  bool FlushContainedDecoder();
+
+  nsresult GetFinalStateFromContainedDecoder();
+
+  uint16_t GetNumColors();
+
+  LexerTransition<ICOState> ReadHeader(const char* aData);
+  LexerTransition<ICOState> ReadDirEntry(const char* aData);
+  LexerTransition<ICOState> IterateUnsizedDirEntry();
+  LexerTransition<ICOState> FinishDirEntry();
+  LexerTransition<ICOState> SniffResource(const char* aData);
+  LexerTransition<ICOState> ReadResource();
+  LexerTransition<ICOState> ReadBIH(const char* aData);
+  LexerTransition<ICOState> PrepareForMask();
+  LexerTransition<ICOState> ReadMaskRow(const char* aData);
+  LexerTransition<ICOState> FinishMask();
+  LexerTransition<ICOState> FinishResource();
+
+  bool IsVerifyingResourceSizes() const { return mReturnIterator.isSome(); }
+
+  struct IconDirEntryEx : public IconDirEntry {
+    OrientedIntSize mSize;
+  };
+
+  StreamingLexer<ICOState, 32> mLexer;  
+  Maybe<Downscaler> mDownscaler;        
+  RefPtr<Decoder> mContainedDecoder;    
+  Maybe<SourceBufferIterator>
+      mReturnIterator;               
+  UniquePtr<uint8_t[]> mMaskBuffer;  
+  nsTArray<IconDirEntryEx> mDirEntries;  
+  nsTArray<IconDirEntryEx> mUnsizedDirEntries;  
+  IconDirEntryEx* mDirEntry;  
+  uint16_t mNumIcons;         
+  uint16_t mCurrIcon;  
+  uint16_t mBPP;       
+  uint32_t
+      mMaskRowSize;  
+  uint32_t mCurrMaskLine;  
+  bool mIsCursor;          
+  bool mHasMaskAlpha;      
+};
+
+}  
+}  
+
+#endif  // mozilla_image_decoders_nsICODecoder_h

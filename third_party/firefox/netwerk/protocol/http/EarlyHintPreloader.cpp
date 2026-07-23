@@ -1,0 +1,687 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "EarlyHintPreloader.h"
+
+#include "EarlyHintRegistrar.h"
+#include "EarlyHintsService.h"
+#include "ErrorList.h"
+#include "HttpChannelParent.h"
+#include "MainThreadUtils.h"
+#include "NeckoCommon.h"
+#include "gfxPlatform.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/nsCSPContext.h"
+#include "mozilla/dom/nsMixedContentBlocker.h"
+#include "mozilla/dom/ReferrerInfo.h"
+#include "mozilla/ipc/BackgroundUtils.h"
+#include "mozilla/LoadInfo.h"
+#include "mozilla/Logging.h"
+#include "mozilla/net/EarlyHintRegistrar.h"
+#include "mozilla/net/NeckoChannelParams.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "nsAttrValue.h"
+#include "nsCOMPtr.h"
+#include "nsContentPolicyUtils.h"
+#include "nsContentSecurityManager.h"
+#include "nsContentUtils.h"
+#include "nsDebug.h"
+#include "nsHttpChannel.h"
+#include "nsIAsyncVerifyRedirectCallback.h"
+#include "nsIChannel.h"
+#include "nsIContentSecurityPolicy.h"
+#include "nsIHttpChannel.h"
+#include "nsIInputStream.h"
+#include "nsILoadContext.h"
+#include "nsILoadInfo.h"
+#include "nsIParentChannel.h"
+#include "nsIReferrerInfo.h"
+#include "nsITimer.h"
+#include "nsIURI.h"
+#include "nsNetUtil.h"
+#include "nsQueryObject.h"
+#include "ParentChannelListener.h"
+#include "nsIChannel.h"
+#include "nsInterfaceRequestorAgg.h"
+
+static mozilla::LazyLogModule gEarlyHintLog("EarlyHint");
+
+#undef LOG
+#define LOG(args) MOZ_LOG(gEarlyHintLog, mozilla::LogLevel::Debug, args)
+
+#undef LOG_ENABLED
+#define LOG_ENABLED() MOZ_LOG_TEST(gEarlyHintLog, mozilla::LogLevel::Debug)
+
+namespace mozilla::net {
+
+namespace {
+static uint64_t gEarlyHintPreloaderId{0};
+}  
+
+
+void OngoingEarlyHints::CancelAll(const nsACString& aReason) {
+  for (auto& preloader : mPreloaders) {
+    preloader->CancelChannel(NS_ERROR_ABORT, aReason,  true);
+  }
+  mPreloaders.Clear();
+  mStartedPreloads.Clear();
+}
+
+bool OngoingEarlyHints::Contains(const PreloadHashKey& aKey) {
+  return mStartedPreloads.Contains(aKey);
+}
+
+bool OngoingEarlyHints::Add(const PreloadHashKey& aKey,
+                            RefPtr<EarlyHintPreloader> aPreloader) {
+  if (!mStartedPreloads.Contains(aKey)) {
+    mStartedPreloads.Insert(aKey);
+    mPreloaders.AppendElement(aPreloader);
+    return true;
+  }
+  return false;
+}
+
+void OngoingEarlyHints::RegisterLinksAndGetConnectArgs(
+    dom::ContentParentId aCpId, nsTArray<EarlyHintConnectArgs>& aOutLinks) {
+  for (auto& preload : mPreloaders) {
+    EarlyHintConnectArgs args;
+    if (preload->Register(aCpId, args)) {
+      aOutLinks.AppendElement(std::move(args));
+    }
+  }
+}
+
+
+EarlyHintPreloader::EarlyHintPreloader() {
+  AssertIsOnMainThread();
+  mConnectArgs.earlyHintPreloaderId() = ++gEarlyHintPreloaderId;
+};
+
+EarlyHintPreloader::~EarlyHintPreloader() {
+  if (mTimer) {
+    mTimer->Cancel();
+    mTimer = nullptr;
+  }
+}
+
+Maybe<PreloadHashKey> EarlyHintPreloader::GenerateHashKey(
+    ASDestination aAs, nsIURI* aURI, nsIPrincipal* aPrincipal,
+    CORSMode aCorsMode, bool aIsModulepreload) {
+  if (aIsModulepreload) {
+    return Some(PreloadHashKey::CreateAsScript(
+        aURI, aCorsMode, JS::loader::ScriptKind::eModule));
+  }
+  if (aAs == ASDestination::DESTINATION_FONT && aCorsMode != CORS_NONE) {
+    return Some(PreloadHashKey::CreateAsFont(aURI, aCorsMode));
+  }
+  if (aAs == ASDestination::DESTINATION_IMAGE) {
+    return Some(PreloadHashKey::CreateAsImage(aURI, aPrincipal, aCorsMode));
+  }
+  if (aAs == ASDestination::DESTINATION_SCRIPT) {
+    return Some(PreloadHashKey::CreateAsScript(
+        aURI, aCorsMode, JS::loader::ScriptKind::eClassic));
+  }
+  if (aAs == ASDestination::DESTINATION_STYLE) {
+    return Some(PreloadHashKey::CreateAsStyle(aURI, aPrincipal, aCorsMode));
+  }
+  if (aAs == ASDestination::DESTINATION_FETCH && aCorsMode != CORS_NONE) {
+    return Some(PreloadHashKey::CreateAsFetch(aURI, aCorsMode));
+  }
+  return Nothing();
+}
+
+nsSecurityFlags EarlyHintPreloader::ComputeSecurityFlags(CORSMode aCORSMode,
+                                                         ASDestination aAs) {
+  if (aAs == ASDestination::DESTINATION_FONT) {
+    return nsContentSecurityManager::ComputeSecurityFlags(
+        CORSMode::CORS_NONE,
+        nsContentSecurityManager::CORSSecurityMapping::REQUIRE_CORS_CHECKS);
+  }
+  if (aAs == ASDestination::DESTINATION_IMAGE) {
+    return nsContentSecurityManager::ComputeSecurityFlags(
+               aCORSMode, nsContentSecurityManager::CORSSecurityMapping::
+                              CORS_NONE_MAPS_TO_INHERITED_CONTEXT) |
+           nsILoadInfo::SEC_ALLOW_CHROME;
+  }
+  if (aAs == ASDestination::DESTINATION_SCRIPT) {
+    return nsContentSecurityManager::ComputeSecurityFlags(
+               aCORSMode, nsContentSecurityManager::CORSSecurityMapping::
+                              CORS_NONE_MAPS_TO_DISABLED_CORS_CHECKS) |
+           nsILoadInfo::SEC_ALLOW_CHROME;
+  }
+  if (aAs == ASDestination::DESTINATION_STYLE) {
+    return nsContentSecurityManager::ComputeSecurityFlags(
+               aCORSMode, nsContentSecurityManager::CORSSecurityMapping::
+                              CORS_NONE_MAPS_TO_INHERITED_CONTEXT) |
+           nsILoadInfo::SEC_ALLOW_CHROME;
+    ;
+  }
+  if (aAs == ASDestination::DESTINATION_FETCH) {
+    return nsContentSecurityManager::ComputeSecurityFlags(
+        aCORSMode, nsContentSecurityManager::CORSSecurityMapping::
+                       CORS_NONE_MAPS_TO_DISABLED_CORS_CHECKS);
+  }
+  MOZ_ASSERT(false, "Unexpected ASDestination");
+  return nsContentSecurityManager::ComputeSecurityFlags(
+      CORSMode::CORS_NONE,
+      nsContentSecurityManager::CORSSecurityMapping::REQUIRE_CORS_CHECKS);
+}
+
+void EarlyHintPreloader::MaybeCreateAndInsertPreload(
+    OngoingEarlyHints* aOngoingEarlyHints, const LinkHeader& aLinkHeader,
+    nsIURI* aBaseURI, nsIPrincipal* aPrincipal,
+    nsICookieJarSettings* aCookieJarSettings,
+    const nsACString& aResponseReferrerPolicy, const nsACString& aCSPHeader,
+    uint64_t aBrowsingContextID,
+    dom::CanonicalBrowsingContext* aLoadingBrowsingContext,
+    bool aIsModulepreload) {
+  nsAttrValue as;
+  ParseAsValue(aLinkHeader.mAs, as);
+
+  ASDestination destination = static_cast<ASDestination>(as.GetEnumValue());
+
+  if (!StaticPrefs::network_early_hints_enabled()) {
+    return;
+  }
+
+  if (destination == ASDestination::DESTINATION_INVALID && !aIsModulepreload) {
+    return;
+  }
+
+  if (destination == ASDestination::DESTINATION_FONT &&
+      !gfxPlatform::GetPlatform()->DownloadableFontsEnabled()) {
+    return;
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  NS_ENSURE_SUCCESS_VOID(
+      NS_NewURI(getter_AddRefs(uri), aLinkHeader.mHref, nullptr, aBaseURI));
+  if (!nsContentUtils::LinkContextIsURI(aLinkHeader.mAnchor, uri)) {
+    return;
+  }
+
+  if (!nsMixedContentBlocker::IsPotentiallyTrustworthyOrigin(uri)) {
+    return;
+  }
+
+  CORSMode corsMode = dom::Element::StringToCORSMode(aLinkHeader.mCrossOrigin);
+
+  Maybe<PreloadHashKey> hashKey =
+      GenerateHashKey(destination, uri, aPrincipal, corsMode, aIsModulepreload);
+  if (!hashKey) {
+    return;
+  }
+
+  if (aOngoingEarlyHints->Contains(*hashKey)) {
+    return;
+  }
+
+  nsContentPolicyType contentPolicyType =
+      aIsModulepreload ? (IsScriptLikeOrInvalid(aLinkHeader.mAs)
+                              ? nsContentPolicyType::TYPE_SCRIPT
+                              : nsContentPolicyType::TYPE_INVALID)
+                       : AsValueToContentPolicy(as);
+
+  if (contentPolicyType == nsContentPolicyType::TYPE_INVALID) {
+    return;
+  }
+
+  dom::ReferrerPolicy linkReferrerPolicy =
+      dom::ReferrerInfo::ReferrerPolicyAttributeFromString(
+          aLinkHeader.mReferrerPolicy);
+
+  dom::ReferrerPolicy responseReferrerPolicy =
+      dom::ReferrerInfo::ReferrerPolicyAttributeFromString(
+          NS_ConvertUTF8toUTF16(aResponseReferrerPolicy));
+
+  dom::ReferrerPolicy finalReferrerPolicy = responseReferrerPolicy;
+  if (linkReferrerPolicy != dom::ReferrerPolicy::_empty) {
+    finalReferrerPolicy = linkReferrerPolicy;
+  }
+  nsCOMPtr<nsIReferrerInfo> referrerInfo =
+      new dom::ReferrerInfo(aBaseURI, finalReferrerPolicy);
+
+  RefPtr<EarlyHintPreloader> earlyHintPreloader = new EarlyHintPreloader();
+
+  earlyHintPreloader->mLoadContext = aLoadingBrowsingContext;
+
+  nsSecurityFlags securityFlags =
+      aIsModulepreload
+          ? ((aLinkHeader.mAs.LowerCaseEqualsASCII("worker") ||
+              aLinkHeader.mAs.LowerCaseEqualsASCII("sharedworker") ||
+              aLinkHeader.mAs.LowerCaseEqualsASCII("serviceworker"))
+                 ? nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_DATA_IS_BLOCKED
+                 : nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT) |
+                (corsMode == CORS_USE_CREDENTIALS
+                     ? nsILoadInfo::SEC_COOKIES_INCLUDE
+                     : nsILoadInfo::SEC_COOKIES_SAME_ORIGIN) |
+                nsILoadInfo::SEC_ALLOW_CHROME
+          : EarlyHintPreloader::ComputeSecurityFlags(corsMode, destination);
+
+
+  Result<nsCOMPtr<nsILoadInfo>, nsresult> maybeLoadInfo = LoadInfo::Create(
+      aPrincipal,  
+      aPrincipal,  
+      nullptr ,
+      nsILoadInfo::SEC_ONLY_FOR_EXPLICIT_CONTENTSEC_CHECK, contentPolicyType);
+  if (NS_WARN_IF(maybeLoadInfo.isErr())) {
+    return;
+  }
+  nsCOMPtr<nsILoadInfo> secCheckLoadInfo = maybeLoadInfo.unwrap();
+
+  if (aCSPHeader.Length() != 0) {
+    nsCOMPtr<nsIContentSecurityPolicy> csp = new nsCSPContext();
+    nsresult rv = csp->SetRequestContextWithPrincipal(
+        aPrincipal, aBaseURI, ""_ns, 0 );
+    NS_ENSURE_SUCCESS_VOID(rv);
+    rv = CSP_AppendCSPFromHeader(csp, NS_ConvertUTF8toUTF16(aCSPHeader),
+                                 false );
+    NS_ENSURE_SUCCESS_VOID(rv);
+
+
+    mozilla::ipc::PrincipalInfo principalInfo;
+    rv = PrincipalToPrincipalInfo(aPrincipal, &principalInfo);
+    NS_ENSURE_SUCCESS_VOID(rv);
+    dom::ClientInfo clientInfo(nsID::GenerateUUID(), Nothing(),
+                               dom::ClientType::Window, principalInfo,
+                               TimeStamp::Now(), ""_ns, dom::FrameType::None);
+
+    ipc::CSPInfo cspInfo;
+    rv = CSPToCSPInfo(csp, &cspInfo);
+    NS_ENSURE_SUCCESS_VOID(rv);
+
+    ipc::PolicyContainerArgs policyContainerArgs;
+    policyContainerArgs.csp() = Some(cspInfo);
+
+    clientInfo.SetPolicyContainerArgs(policyContainerArgs);
+
+    secCheckLoadInfo->SetClientInfo(clientInfo);
+  }
+
+  dom::RequestMode requestMode =
+      nsContentSecurityManager::SecurityModeToRequestMode(
+          nsContentSecurityManager::ComputeSecurityMode(securityFlags));
+  secCheckLoadInfo->SetRequestMode(Some(requestMode));
+
+  int16_t shouldLoad = nsIContentPolicy::ACCEPT;
+  nsresult rv = NS_CheckContentLoadPolicy(uri, secCheckLoadInfo, &shouldLoad,
+                                          nsContentUtils::GetContentPolicy());
+
+  if (NS_FAILED(rv) || NS_CP_REJECTED(shouldLoad)) {
+    return;
+  }
+
+  NS_ENSURE_SUCCESS_VOID(earlyHintPreloader->OpenChannel(
+      uri, aPrincipal, securityFlags, contentPolicyType, referrerInfo,
+      aCookieJarSettings, aBrowsingContextID));
+
+  earlyHintPreloader->SetLinkHeader(aLinkHeader);
+
+  DebugOnly<bool> result =
+      aOngoingEarlyHints->Add(*hashKey, earlyHintPreloader);
+  MOZ_ASSERT(result);
+}
+
+nsresult EarlyHintPreloader::OpenChannel(
+    nsIURI* aURI, nsIPrincipal* aPrincipal, nsSecurityFlags aSecurityFlags,
+    nsContentPolicyType aContentPolicyType, nsIReferrerInfo* aReferrerInfo,
+    nsICookieJarSettings* aCookieJarSettings, uint64_t aBrowsingContextID) {
+  MOZ_ASSERT(aContentPolicyType == nsContentPolicyType::TYPE_IMAGE ||
+             aContentPolicyType ==
+                 nsContentPolicyType::TYPE_INTERNAL_FETCH_PRELOAD ||
+             aContentPolicyType == nsContentPolicyType::TYPE_SCRIPT ||
+             aContentPolicyType == nsContentPolicyType::TYPE_STYLESHEET ||
+             aContentPolicyType == nsContentPolicyType::TYPE_FONT);
+
+  nsresult rv =
+      NS_NewChannel(getter_AddRefs(mChannel), aURI, aPrincipal, aSecurityFlags,
+                    aContentPolicyType, aCookieJarSettings,
+                     nullptr,
+                     nullptr,
+                     this, nsIRequest::LOAD_NORMAL);
+
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  RefPtr<nsHttpChannel> httpChannelObject = do_QueryObject(mChannel);
+  if (!httpChannelObject) {
+    mChannel = nullptr;
+    return NS_ERROR_ABORT;
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(mChannel);
+  if (!httpChannel) {
+    mChannel = nullptr;
+    return NS_ERROR_ABORT;
+  }
+  DebugOnly<nsresult> success = httpChannel->SetReferrerInfo(aReferrerInfo);
+  MOZ_ASSERT(NS_SUCCEEDED(success));
+  success = httpChannel->SetRequestHeader("X-Moz"_ns, "early hint"_ns, false);
+  MOZ_ASSERT(NS_SUCCEEDED(success));
+
+  mParentListener = new ParentChannelListener(this, nullptr);
+
+  PriorizeAsPreload();
+
+  rv = mChannel->AsyncOpen(mParentListener);
+  if (NS_FAILED(rv)) {
+    mParentListener = nullptr;
+    return rv;
+  }
+
+  SetState(ePreloaderOpened);
+
+  nsCOMPtr<nsILoadInfo> loadInfo = mChannel->LoadInfo();
+  static_cast<LoadInfo*>(loadInfo.get())
+      ->UpdateBrowsingContextID(aBrowsingContextID);
+
+  return NS_OK;
+}
+
+void EarlyHintPreloader::PriorizeAsPreload() {
+  nsLoadFlags loadFlags = nsIRequest::LOAD_NORMAL;
+  (void)mChannel->GetLoadFlags(&loadFlags);
+  (void)mChannel->SetLoadFlags(loadFlags | nsIRequest::LOAD_BACKGROUND);
+
+  if (nsCOMPtr<nsIClassOfService> cos = do_QueryInterface(mChannel)) {
+    (void)cos->AddClassFlags(nsIClassOfService::Unblocked);
+  }
+}
+
+void EarlyHintPreloader::SetLinkHeader(const LinkHeader& aLinkHeader) {
+  mConnectArgs.link() = aLinkHeader;
+}
+
+bool EarlyHintPreloader::IsFromContentParent(dom::ContentParentId aCpId) const {
+  return aCpId == mCpId;
+}
+
+bool EarlyHintPreloader::Register(dom::ContentParentId aCpId,
+                                  EarlyHintConnectArgs& aOut) {
+  mCpId = aCpId;
+
+  nsresult rv = NS_NewTimerWithCallback(
+      getter_AddRefs(mTimer), this,
+      std::max(StaticPrefs::network_early_hints_parent_connect_timeout(),
+               (uint32_t)1),
+      nsITimer::TYPE_ONE_SHOT);
+  if (NS_FAILED(rv)) {
+    MOZ_ASSERT(!mTimer);
+    CancelChannel(NS_ERROR_ABORT, "new-timer-failed"_ns,
+                   false);
+    return false;
+  }
+
+  RefPtr<EarlyHintRegistrar> registrar = EarlyHintRegistrar::GetOrCreate();
+  registrar->RegisterEarlyHint(mConnectArgs.earlyHintPreloaderId(), this);
+
+  aOut = mConnectArgs;
+  return true;
+}
+
+nsresult EarlyHintPreloader::CancelChannel(nsresult aStatus,
+                                           const nsACString& aReason,
+                                           bool aDeleteEntry) {
+  LOG(("EarlyHintPreloader::CancelChannel [this=%p]\n", this));
+
+  if (mTimer) {
+    mTimer->Cancel();
+    mTimer = nullptr;
+  }
+  if (aDeleteEntry) {
+    RefPtr<EarlyHintRegistrar> registrar = EarlyHintRegistrar::GetOrCreate();
+    registrar->DeleteEntry(mCpId, mConnectArgs.earlyHintPreloaderId());
+  }
+  mRedirectChannel = nullptr;
+  if (mChannel) {
+    if (mSuspended) {
+      mChannel->Resume();
+    }
+    mChannel->CancelWithReason(aStatus, aReason);
+    mChannel = nullptr;
+    SetState(ePreloaderCancelled);
+  }
+  return NS_OK;
+}
+
+void EarlyHintPreloader::OnParentReady(nsIParentChannel* aParent) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(aParent);
+  LOG(("EarlyHintPreloader::OnParentReady [this=%p]\n", this));
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  if (obs) {
+    obs->NotifyObservers(mChannel, "earlyhints-connectback", nullptr);
+  }
+
+  mParent = aParent;
+
+  if (mTimer) {
+    mTimer->Cancel();
+    mTimer = nullptr;
+  }
+
+  RefPtr<EarlyHintRegistrar> registrar = EarlyHintRegistrar::GetOrCreate();
+  registrar->DeleteEntry(mCpId, mConnectArgs.earlyHintPreloaderId());
+
+  if (mOnStartRequestCalled) {
+    SetParentChannel();
+    InvokeStreamListenerFunctions();
+  }
+}
+
+void EarlyHintPreloader::SetParentChannel() {
+  RefPtr<HttpBaseChannel> channel = do_QueryObject(mChannel);
+  RefPtr<HttpChannelParent> parent = do_QueryObject(mParent);
+  parent->SetHttpChannelFromEarlyHintPreloader(channel);
+}
+
+void EarlyHintPreloader::InvokeStreamListenerFunctions() {
+  AssertIsOnMainThread();
+  RefPtr<EarlyHintPreloader> self(this);
+
+  LOG((
+      "EarlyHintPreloader::InvokeStreamListenerFunctions [this=%p parent=%p]\n",
+      this, mParent.get()));
+
+  if (!mIsFinished) {
+    mParentListener->SetListenerAfterRedirect(mParent);
+  }
+  nsTArray<StreamListenerFunction> streamListenerFunctions =
+      std::move(mStreamListenerFunctions);
+
+  ForwardStreamListenerFunctions(std::move(streamListenerFunctions), mParent);
+
+  NS_ASSERTION(mStreamListenerFunctions.IsEmpty(),
+               "Should not have added new stream listener function!");
+
+  if (mChannel && mSuspended) {
+    mChannel->Resume();
+  }
+  mChannel = nullptr;
+  mParent = nullptr;
+  mParentListener = nullptr;
+
+  SetState(ePreloaderUsed);
+}
+
+
+NS_IMPL_ISUPPORTS(EarlyHintPreloader, nsIRequestObserver, nsIStreamListener,
+                  nsIChannelEventSink, nsIInterfaceRequestor,
+                  nsIRedirectResultListener, nsIMultiPartChannelListener,
+                  nsINamed, nsITimerCallback);
+
+
+NS_IMETHODIMP
+EarlyHintPreloader::OnStartRequest(nsIRequest* aRequest) {
+  LOG(("EarlyHintPreloader::OnStartRequest [this=%p]\n", this));
+  AssertIsOnMainThread();
+
+  mOnStartRequestCalled = true;
+
+  nsCOMPtr<nsIMultiPartChannel> multiPartChannel = do_QueryInterface(aRequest);
+  if (multiPartChannel) {
+    multiPartChannel->GetBaseChannel(getter_AddRefs(mChannel));
+  } else {
+    mChannel = do_QueryInterface(aRequest);
+  }
+  MOZ_DIAGNOSTIC_ASSERT(mChannel);
+
+  nsresult status = NS_OK;
+  (void)aRequest->GetStatus(&status);
+
+  if (nsCOMPtr<nsIParentChannel> parent = mParent) {
+    SetParentChannel();
+    parent->OnStartRequest(aRequest);
+    InvokeStreamListenerFunctions();
+  } else {
+    if (NS_SUCCEEDED(status)) {
+      mChannel->Suspend();
+      mSuspended = true;
+    }
+    mStreamListenerFunctions.AppendElement(
+        AsVariant(OnStartRequestParams{aRequest}));
+  }
+
+  return status;
+}
+
+NS_IMETHODIMP
+EarlyHintPreloader::OnStopRequest(nsIRequest* aRequest, nsresult aStatusCode) {
+  AssertIsOnMainThread();
+  LOG(("EarlyHintPreloader::OnStopRequest [this=%p]\n", this));
+  mStreamListenerFunctions.AppendElement(
+      AsVariant(OnStopRequestParams{aRequest, aStatusCode}));
+
+  nsCOMPtr<nsIMultiPartChannel> multiPartChannel = do_QueryInterface(aRequest);
+  if (!multiPartChannel) {
+    mIsFinished = true;
+  }
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+EarlyHintPreloader::OnDataAvailable(nsIRequest* aRequest,
+                                    nsIInputStream* aInputStream,
+                                    uint64_t aOffset, uint32_t aCount) {
+  AssertIsOnMainThread();
+  LOG(("EarlyHintPreloader::OnDataAvailable [this=%p]\n", this));
+  nsCString data;
+  nsresult rv = NS_ReadInputStreamToString(aInputStream, data, aCount);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mStreamListenerFunctions.AppendElement(AsVariant(
+      OnDataAvailableParams{aRequest, std::move(data), aOffset, aCount}));
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+EarlyHintPreloader::OnAfterLastPart(nsresult aStatus) {
+  LOG(("EarlyHintPreloader::OnAfterLastPart [this=%p]", this));
+  mStreamListenerFunctions.AppendElement(
+      AsVariant(OnAfterLastPartParams{aStatus}));
+  mIsFinished = true;
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+EarlyHintPreloader::AsyncOnChannelRedirect(
+    nsIChannel* aOldChannel, nsIChannel* aNewChannel, uint32_t aFlags,
+    nsIAsyncVerifyRedirectCallback* callback) {
+  LOG(("EarlyHintPreloader::AsyncOnChannelRedirect [this=%p]", this));
+  nsCOMPtr<nsIURI> newURI;
+  nsresult rv = NS_GetFinalChannelURI(aNewChannel, getter_AddRefs(newURI));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = aNewChannel->GetURI(getter_AddRefs(newURI));
+  if (NS_FAILED(rv)) {
+    callback->OnRedirectVerifyCallback(rv);
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(aNewChannel);
+  NS_ENSURE_STATE(httpChannel);
+
+  rv = httpChannel->SetRequestHeader("X-Moz"_ns, "early hint"_ns, false);
+  MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+  mRedirectChannel = aNewChannel;
+
+  callback->OnRedirectVerifyCallback(NS_OK);
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+EarlyHintPreloader::OnRedirectResult(nsresult aStatus) {
+  LOG(("EarlyHintPreloader::OnRedirectResult [this=%p] aProceeding=0x%" PRIx32,
+       this, static_cast<uint32_t>(aStatus)));
+  if (NS_SUCCEEDED(aStatus) && mRedirectChannel) {
+    mChannel = mRedirectChannel;
+  }
+
+  mRedirectChannel = nullptr;
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+EarlyHintPreloader::GetName(nsACString& aName) {
+  aName.AssignLiteral("EarlyHintPreloader");
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+EarlyHintPreloader::Notify(nsITimer* timer) {
+  RefPtr<EarlyHintPreloader> deathGrip(this);
+
+  RefPtr<EarlyHintRegistrar> registrar = EarlyHintRegistrar::GetOrCreate();
+  registrar->DeleteEntry(mCpId, mConnectArgs.earlyHintPreloaderId());
+
+  mTimer = nullptr;
+  mRedirectChannel = nullptr;
+  if (mChannel) {
+    if (mSuspended) {
+      mChannel->Resume();
+    }
+    mChannel->CancelWithReason(NS_ERROR_ABORT, "parent-connect-timeout"_ns);
+
+    mChannel = nullptr;
+  }
+  SetState(ePreloaderTimeout);
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+EarlyHintPreloader::GetInterface(const nsIID& aIID, void** aResult) {
+  if (aIID.Equals(NS_GET_IID(nsIChannelEventSink))) {
+    NS_ADDREF_THIS();
+    *aResult = static_cast<nsIChannelEventSink*>(this);
+    return NS_OK;
+  }
+
+  if (aIID.Equals(NS_GET_IID(nsIRedirectResultListener))) {
+    NS_ADDREF_THIS();
+    *aResult = static_cast<nsIRedirectResultListener*>(this);
+    return NS_OK;
+  }
+
+  if (aIID.Equals(NS_GET_IID(nsILoadContext)) && mLoadContext != nullptr) {
+    nsCOMPtr<nsILoadContext> loadContext = mLoadContext;
+    loadContext.forget(aResult);
+    return NS_OK;
+  }
+
+  return NS_ERROR_NO_INTERFACE;
+}
+}  

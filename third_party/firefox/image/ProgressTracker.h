@@ -1,0 +1,163 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_ProgressTracker_h
+#define mozilla_image_ProgressTracker_h
+
+#include "CopyOnWrite.h"
+#include "IProgressObserver.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/WeakPtr.h"
+#include "nsCOMPtr.h"
+#include "nsRect.h"
+#include "nsTHashMap.h"
+#include "nsTObserverArray.h"
+#include "nsThreadUtils.h"
+
+class nsIRunnable;
+
+namespace mozilla {
+namespace image {
+
+class AsyncNotifyRunnable;
+class AsyncNotifyCurrentStateRunnable;
+class Image;
+
+enum {
+  FLAG_SIZE_AVAILABLE = 1u << 0,    
+  FLAG_DECODE_COMPLETE = 1u << 1,   
+  FLAG_FRAME_COMPLETE = 1u << 2,    
+  FLAG_LOAD_COMPLETE = 1u << 3,     
+  FLAG_IS_ANIMATED = 1u << 6,       
+  FLAG_HAS_TRANSPARENCY = 1u << 7,  
+  FLAG_LAST_PART_COMPLETE = 1u << 8,
+  FLAG_HAS_ERROR = 1u << 9  
+};
+
+typedef uint32_t Progress;
+
+const uint32_t NoProgress = 0;
+
+inline Progress LoadCompleteProgress(bool aLastPart, bool aError,
+                                     nsresult aStatus) {
+  Progress progress = FLAG_LOAD_COMPLETE;
+  if (aLastPart) {
+    progress |= FLAG_LAST_PART_COMPLETE;
+  }
+  if (NS_FAILED(aStatus) || aError) {
+    progress |= FLAG_HAS_ERROR;
+  }
+  return progress;
+}
+
+class ObserverTable : public nsTHashMap<nsPtrHashKey<IProgressObserver>,
+                                        WeakPtr<IProgressObserver>> {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(ObserverTable);
+
+  ObserverTable() = default;
+
+  ObserverTable(const ObserverTable& aOther)
+      : nsTHashMap<nsPtrHashKey<IProgressObserver>, WeakPtr<IProgressObserver>>(
+            aOther.Clone()) {
+    NS_WARNING("Forced to copy ObserverTable due to nested notifications");
+  }
+
+ private:
+  ~ObserverTable() = default;
+};
+
+class ProgressTracker : public mozilla::SupportsWeakPtr {
+  virtual ~ProgressTracker() = default;
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ProgressTracker)
+
+  ProgressTracker();
+  ProgressTracker(const ProgressTracker& aOther) = delete;
+
+  bool HasImage() const {
+    MutexAutoLock lock(mMutex);
+    return mImage;
+  }
+  already_AddRefed<Image> GetImage() const {
+    MutexAutoLock lock(mMutex);
+    RefPtr<Image> image = mImage;
+    return image.forget();
+  }
+
+  uint32_t GetImageStatus() const;
+
+  Progress GetProgress() const { return mProgress; }
+
+  void Notify(IProgressObserver* aObserver);
+
+  void NotifyCurrentState(IProgressObserver* aObserver);
+
+  void SyncNotify(IProgressObserver* aObserver);
+
+  void ResetForNewRequest();
+
+  void OnDiscard();
+  void OnUnlockedDraw();
+  void OnImageAvailable();
+
+  Progress Difference(Progress aProgress) const {
+    return ~mProgress & aProgress;
+  }
+
+  void SyncNotifyProgress(Progress aProgress,
+                          const nsIntRect& aInvalidRect = nsIntRect());
+
+  void AddObserver(IProgressObserver* aObserver);
+  bool RemoveObserver(IProgressObserver* aObserver);
+  uint32_t ObserverCount() const;
+
+  void ResetImage();
+
+  void SetIsMultipart() { mIsMultipart = true; }
+
+ private:
+  friend class AsyncNotifyRunnable;
+  friend class AsyncNotifyCurrentStateRunnable;
+  friend class ImageFactory;
+
+  void SetImage(Image* aImage);
+
+  void EmulateRequestFinished(IProgressObserver* aObserver);
+
+  void FireFailureNotification();
+
+  class RenderBlockingRunnable final : public PrioritizableRunnable {
+    explicit RenderBlockingRunnable(
+        already_AddRefed<AsyncNotifyRunnable> aEvent);
+    virtual ~RenderBlockingRunnable() = default;
+
+   public:
+    void AddObserver(IProgressObserver* aObserver);
+    void RemoveObserver(IProgressObserver* aObserver);
+
+    static already_AddRefed<RenderBlockingRunnable> Create(
+        already_AddRefed<AsyncNotifyRunnable> aEvent);
+  };
+
+  RefPtr<RenderBlockingRunnable> mRunnable;
+
+  mutable Mutex mMutex MOZ_UNANNOTATED;
+
+  Image* mImage;
+
+  CopyOnWrite<ObserverTable> mObservers;
+
+  Progress mProgress;
+
+  bool mIsMultipart;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_ProgressTracker_h

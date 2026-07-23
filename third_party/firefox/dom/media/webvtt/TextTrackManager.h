@@ -1,0 +1,146 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_TextTrackManager_h
+#define mozilla_dom_TextTrackManager_h
+
+#include "TimeUnits.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/dom/TextTrack.h"
+#include "mozilla/dom/TextTrackCueList.h"
+#include "mozilla/dom/TextTrackList.h"
+#include "nsContentUtils.h"
+
+class nsIWebVTTParserWrapper;
+
+namespace mozilla {
+template <typename T>
+class Maybe;
+namespace dom {
+
+class HTMLMediaElement;
+
+class CompareTextTracks {
+ private:
+  HTMLMediaElement* mMediaElement;
+  Maybe<uint32_t> TrackChildPosition(TextTrack* aTrack) const;
+
+ public:
+  explicit CompareTextTracks(HTMLMediaElement* aMediaElement);
+  bool Equals(TextTrack* aOne, TextTrack* aTwo) const;
+  bool LessThan(TextTrack* aOne, TextTrack* aTwo) const;
+};
+
+class TextTrack;
+class TextTrackCue;
+
+class TextTrackManager final : public nsISupports {
+  ~TextTrackManager();
+
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS(TextTrackManager)
+
+  explicit TextTrackManager(HTMLMediaElement* aMediaElement);
+
+  TextTrackList* GetTextTracks() const;
+  already_AddRefed<TextTrack> AddTextTrack(TextTrackKind aKind,
+                                           const nsAString& aLabel,
+                                           const nsAString& aLanguage,
+                                           TextTrackMode aMode,
+                                           TextTrackReadyState aReadyState,
+                                           TextTrackSource aTextTrackSource);
+  void AddTextTrack(TextTrack* aTextTrack);
+  void RemoveTextTrack(TextTrack* aTextTrack, bool aPendingListOnly);
+  void DidSeek();
+
+  void NotifyCueAdded(TextTrackCue& aCue);
+  void AddCues(TextTrack* aTextTrack);
+  void NotifyCueRemoved(TextTrackCue& aCue);
+
+  void PopulatePendingList();
+
+  RefPtr<HTMLMediaElement> mMediaElement;
+
+  void DispatchTimeMarchesOn();
+  void TimeMarchesOn();
+  void DispatchUpdateCueDisplay();
+
+  void NotifyShutdown() { mShutdown = true; }
+
+  void NotifyCueUpdated(TextTrackCue* aCue);
+
+  void NotifyReset();
+
+  bool IsLoaded();
+
+  void SetCuesDirty();
+  void UpdateCueDisplay();
+
+ private:
+  RefPtr<TextTrackList> mTextTracks;
+  RefPtr<TextTrackList> mPendingTextTracks;
+
+  RefPtr<TextTrackCueList> mNewCues;
+
+  bool mHasSeeked;
+  media::TimeUnit mLastTimeMarchesOnCalled;
+
+  bool mTimeMarchesOnDispatched;
+  bool mUpdateCueDisplayDispatched;
+
+  static StaticRefPtr<nsIWebVTTParserWrapper> sParserWrapper;
+
+  bool performedTrackSelection;
+
+  void HonorUserPreferencesForTrackSelection();
+  void PerformTrackSelection(TextTrackKind aTextTrackKind);
+  void PerformTrackSelection(TextTrackKind aTextTrackKinds[], uint32_t size);
+  void GetTextTracksOfKinds(TextTrackKind aTextTrackKinds[], uint32_t size,
+                            nsTArray<TextTrack*>& aTextTracks);
+  void GetTextTracksOfKind(TextTrackKind aTextTrackKind,
+                           nsTArray<TextTrack*>& aTextTracks);
+  bool TrackIsDefault(TextTrack* aTextTrack);
+
+  bool IsShutdown() const;
+
+  void MaybeRunTimeMarchesOn();
+
+  class ShutdownObserverProxy final : public nsIObserver {
+    NS_DECL_ISUPPORTS
+
+   public:
+    explicit ShutdownObserverProxy(TextTrackManager* aManager)
+        : mManager(aManager) {
+      nsContentUtils::RegisterShutdownObserver(this);
+    }
+
+    NS_IMETHODIMP Observe(nsISupports* aSubject, const char* aTopic,
+                          const char16_t* aData) override {
+      MOZ_ASSERT(NS_IsMainThread());
+      if (strcmp(aTopic, NS_XPCOM_SHUTDOWN_OBSERVER_ID) == 0) {
+        if (mManager) {
+          mManager->NotifyShutdown();
+        }
+        Unregister();
+      }
+      return NS_OK;
+    }
+
+    void Unregister();
+
+   private:
+    ~ShutdownObserverProxy() = default;
+
+    TextTrackManager* mManager;
+  };
+
+  RefPtr<ShutdownObserverProxy> mShutdownProxy;
+  bool mShutdown;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_TextTrackManager_h

@@ -1,0 +1,98 @@
+
+
+#ifndef CATCH_INTERFACES_CONFIG_HPP_INCLUDED
+#define CATCH_INTERFACES_CONFIG_HPP_INCLUDED
+
+#include <catch2/internal/catch_noncopyable.hpp>
+#include <catch2/internal/catch_stringref.hpp>
+
+#include <chrono>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace Catch {
+
+enum class Verbosity : std::uint8_t {
+    Quiet = 0,
+    Normal,
+    High
+};
+
+struct WarnAbout {
+    enum What : std::uint8_t {
+        Nothing = 0x00,
+        NoAssertions = 0x01,
+        UnmatchedTestSpec = 0x02,
+        InfiniteGenerator = 0x04,
+    };
+};
+
+enum class ShowDurations : std::uint8_t {
+    DefaultForReporter,
+    Always,
+    Never
+};
+enum class TestRunOrder : std::uint8_t {
+    Declared,
+    LexicographicallySorted,
+    Randomized
+};
+enum class ColourMode : std::uint8_t {
+    PlatformDefault,
+    ANSI,
+    Win32,
+    None
+};
+struct WaitForKeypress {
+    enum When : std::uint8_t {
+        Never,
+        BeforeStart = 1,
+        BeforeExit = 2,
+        BeforeStartAndExit = BeforeStart | BeforeExit
+    };
+};
+
+class TestSpec;
+class IStream;
+struct PathFilter;
+
+class IConfig : public Detail::NonCopyable {
+   public:
+    virtual ~IConfig();
+
+    virtual bool allowThrows() const = 0;
+    virtual StringRef name() const = 0;
+    virtual bool includeSuccessfulResults() const = 0;
+    virtual bool shouldDebugBreak() const = 0;
+    virtual bool warnAboutMissingAssertions() const = 0;
+    virtual bool warnAboutUnmatchedTestSpecs() const = 0;
+    virtual bool warnAboutInfiniteGenerators() const = 0;
+    virtual bool zeroTestsCountAsSuccess() const = 0;
+    virtual int abortAfter() const = 0;
+    virtual bool showInvisibles() const = 0;
+    virtual ShowDurations showDurations() const = 0;
+    virtual double minDuration() const = 0;
+    virtual TestSpec const& testSpec() const = 0;
+    virtual bool hasTestFilters() const = 0;
+    virtual std::vector<std::string> const& getTestsOrTags() const = 0;
+    virtual TestRunOrder runOrder() const = 0;
+    virtual uint32_t rngSeed() const = 0;
+    virtual unsigned int shardCount() const = 0;
+    virtual unsigned int shardIndex() const = 0;
+    virtual ColourMode defaultColourMode() const = 0;
+    virtual std::vector<PathFilter> const& getPathFilters() const = 0;
+    virtual bool useNewFilterBehaviour() const = 0;
+
+    virtual Verbosity verbosity() const = 0;
+
+    virtual bool skipBenchmarks() const = 0;
+    virtual bool benchmarkNoAnalysis() const = 0;
+    virtual unsigned int benchmarkSamples() const = 0;
+    virtual double benchmarkConfidenceInterval() const = 0;
+    virtual unsigned int benchmarkResamples() const = 0;
+    virtual std::chrono::milliseconds benchmarkWarmupTime() const = 0;
+};
+}  
+
+#endif  // CATCH_INTERFACES_CONFIG_HPP_INCLUDED

@@ -1,0 +1,76 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "LogCommandLineHandler.h"
+
+#include "mozilla/Tokenizer.h"
+#include "nsDebug.h"
+
+namespace mozilla {
+
+void LoggingHandleCommandLineArgs(
+    int argc, char const* const* argv,
+    std::function<void(nsACString const&)> const& consumer) {
+  nsAutoCString env;
+
+  auto const names = {"MOZ_LOG"_ns, "MOZ_LOG_FILE"_ns};
+
+  for (int arg = 1; arg < argc; ++arg) {
+    Tokenizer p(argv[arg]);
+
+    if (!env.IsEmpty() && p.CheckChar('-')) {
+      NS_WARNING(
+          "Expects value after -MOZ_LOG(_FILE) argument, but another argument "
+          "found");
+
+      p.Rollback();
+      env.Truncate();
+    }
+
+    if (env.IsEmpty()) {
+      if (!p.CheckChar('-')) {
+        continue;
+      }
+      (void)p.CheckChar('-');
+
+      for (auto const& name : names) {
+        if (!p.CheckWord(name)) {
+          continue;
+        }
+
+        env.Assign(name);
+        env.Append('=');
+        break;
+      }
+
+      if (env.IsEmpty()) {
+        continue;
+      }
+
+
+      if (p.CheckEOF()) {
+        continue;
+      }
+
+      if (!p.CheckChar('=')) {
+        NS_WARNING("-MOZ_LOG(_FILE) argument not in a proper form");
+
+        env.Truncate();
+        continue;
+      }
+    }
+
+    if (!env.IsEmpty()) {
+      nsDependentCSubstring value;
+      (void)p.ReadUntil(Tokenizer::Token::EndOfFile(), value);
+      env.Append(value);
+
+      consumer(env);
+
+      env.Truncate();
+    }
+  }
+}
+
+}  

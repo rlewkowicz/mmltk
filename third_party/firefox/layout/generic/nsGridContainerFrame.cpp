@@ -1,0 +1,8861 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsGridContainerFrame.h"
+
+#include <stdlib.h>  // for div()
+
+#include <functional>
+#include <type_traits>
+
+#ifdef DEBUG
+#  include "fmt/base.h"
+#endif
+#include "gfxContext.h"
+#include "mozilla/AbsoluteContainingBlock.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/Baseline.h"
+#include "mozilla/CSSAlignUtils.h"
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/IntegerRange.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/PodOperations.h"  // for PodZero
+#include "mozilla/PresShell.h"
+#include "mozilla/ReflowInput.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/dom/Grid.h"
+#include "mozilla/dom/GridBinding.h"
+#include "nsCSSFrameConstructor.h"
+#include "nsDisplayList.h"
+#include "nsFieldSetFrame.h"
+#include "nsHashKeys.h"
+#include "nsIFrameInlines.h"  // for nsIFrame::GetLogicalNormalPosition (don't remove)
+#include "nsLayoutUtils.h"
+#include "nsPlaceholderFrame.h"
+#include "nsPresContext.h"
+#include "nsReadableUtils.h"
+#include "nsTableWrapperFrame.h"
+
+using namespace mozilla;
+
+using AlignJustifyFlag = CSSAlignUtils::AlignJustifyFlag;
+using AlignJustifyFlags = CSSAlignUtils::AlignJustifyFlags;
+using GridItemCachedBAxisMeasurement =
+    nsGridContainerFrame::CachedBAxisMeasurement;
+using GridTemplate = StyleGridTemplateComponent;
+using NameList = StyleOwnedSlice<StyleCustomIdent>;
+using SizingConstraint = nsGridContainerFrame::SizingConstraint;
+using TrackListValue =
+    StyleGenericTrackListValue<LengthPercentage, StyleInteger>;
+using TrackRepeat = StyleGenericTrackRepeat<LengthPercentage, StyleInteger>;
+using TrackSize = nsGridContainerFrame::TrackSize;
+
+static mozilla::LazyLogModule gGridContainerLog("GridContainer");
+#define GRID_LOG(...) \
+  MOZ_LOG(gGridContainerLog, LogLevel::Debug, (__VA_ARGS__));
+
+static const int32_t kMaxLine = 10000;
+static const int32_t kMinLine = -10000;
+static const uint32_t kTranslatedMaxLine = uint32_t(kMaxLine - kMinLine);
+static const uint32_t kAutoLine = kTranslatedMaxLine + 3457U;
+
+static const nsFrameState kIsSubgridBits =
+    (NS_STATE_GRID_IS_COL_SUBGRID | NS_STATE_GRID_IS_ROW_SUBGRID);
+
+namespace mozilla {
+
+template <>
+inline Span<const StyleOwnedSlice<StyleCustomIdent>>
+GridTemplate::LineNameLists(bool aIsSubgrid) const {
+  if (IsTrackList()) {
+    return AsTrackList()->line_names.AsSpan();
+  }
+  if (IsSubgrid() && aIsSubgrid) {
+    return {};
+  }
+  MOZ_ASSERT(IsNone() || IsMasonry() || (IsSubgrid() && !aIsSubgrid));
+  return {};
+}
+
+template <>
+inline const StyleTrackBreadth& StyleTrackSize::GetMax() const {
+  if (IsBreadth()) {
+    return AsBreadth();
+  }
+  if (IsMinmax()) {
+    return AsMinmax()._1;
+  }
+  MOZ_ASSERT(IsFitContent());
+  return AsFitContent();
+}
+
+template <>
+inline const StyleTrackBreadth& StyleTrackSize::GetMin() const {
+  static const StyleTrackBreadth kAuto = StyleTrackBreadth::Auto();
+  if (IsBreadth()) {
+    return AsBreadth().IsFlex() ? kAuto : AsBreadth();
+  }
+  if (IsMinmax()) {
+    return AsMinmax()._0;
+  }
+  MOZ_ASSERT(IsFitContent());
+  return kAuto;
+}
+
+}  
+
+static nscoord ClampToCSSMaxBSize(nscoord aSize,
+                                  const ReflowInput* aReflowInput) {
+  auto maxSize = aReflowInput->ComputedMaxBSize();
+  if (MOZ_UNLIKELY(maxSize != NS_UNCONSTRAINEDSIZE)) {
+    MOZ_ASSERT(aReflowInput->ComputedMinBSize() <= maxSize);
+    aSize = std::min(aSize, maxSize);
+  }
+  return aSize;
+}
+
+static nscoord ClampToCSSMaxBSize(nscoord aSize,
+                                  const ReflowInput* aReflowInput,
+                                  nsReflowStatus* aStatus) {
+  auto maxSize = aReflowInput->ComputedMaxBSize();
+  if (MOZ_UNLIKELY(maxSize != NS_UNCONSTRAINEDSIZE)) {
+    MOZ_ASSERT(aReflowInput->ComputedMinBSize() <= maxSize);
+    if (aSize < maxSize) {
+      aStatus->SetIncomplete();
+    } else {
+      aSize = maxSize;
+    }
+  } else {
+    aStatus->SetIncomplete();
+  }
+  return aSize;
+}
+
+template <typename Size>
+static bool IsPercentOfIndefiniteSize(const Size& aCoord,
+                                      nscoord aPercentBasis) {
+  return aPercentBasis == NS_UNCONSTRAINEDSIZE && aCoord.HasPercent();
+}
+
+static nscoord ResolveToDefiniteSize(const StyleTrackBreadth& aBreadth,
+                                     nscoord aPercentBasis) {
+  MOZ_ASSERT(aBreadth.IsBreadth());
+  if (::IsPercentOfIndefiniteSize(aBreadth.AsBreadth(), aPercentBasis)) {
+    return nscoord(0);
+  }
+  return std::max(nscoord(0), aBreadth.AsBreadth().Resolve(aPercentBasis));
+}
+
+static nscoord SynthesizeBaselineFromBorderBox(BaselineSharingGroup aGroup,
+                                               WritingMode aWM,
+                                               LogicalAxis aAxis,
+                                               nscoord aBorderBoxSize) {
+  const bool useAlphabeticBaseline =
+      (aAxis == LogicalAxis::Inline) ? true : aWM.IsAlphabeticalBaseline();
+
+  if (aGroup == BaselineSharingGroup::First) {
+    return useAlphabeticBaseline ? aBorderBoxSize : aBorderBoxSize / 2;
+  }
+  MOZ_ASSERT(aGroup == BaselineSharingGroup::Last);
+  return useAlphabeticBaseline ? 0
+                               : (aBorderBoxSize / 2) + (aBorderBoxSize % 2);
+}
+
+struct BoxSizingAdjustment {
+  BoxSizingAdjustment() = delete;
+  BoxSizingAdjustment(const WritingMode aWM, const ComputedStyle& aStyle)
+      : mWM(aWM), mStyle(aStyle) {}
+
+  const LogicalSize& EnsureAndGet() {
+    if (mValue) {
+      return mValue.ref();
+    }
+
+    if (mStyle.StylePosition()->mBoxSizing != StyleBoxSizing::BorderBox) {
+      mValue.emplace(mWM);
+      return mValue.ref();
+    }
+
+    const auto& padding = mStyle.StylePadding()->mPadding;
+    LogicalMargin border(mWM, mStyle.StyleBorder()->GetComputedBorder());
+    const nscoord percentageBasis = 0;
+    const nscoord iBP =
+        std::max(padding.GetIStart(mWM).Resolve(percentageBasis), 0) +
+        std::max(padding.GetIEnd(mWM).Resolve(percentageBasis), 0) +
+        border.IStartEnd(mWM);
+    const nscoord bBP =
+        std::max(padding.GetBStart(mWM).Resolve(percentageBasis), 0) +
+        std::max(padding.GetBEnd(mWM).Resolve(percentageBasis), 0) +
+        border.BStartEnd(mWM);
+    mValue.emplace(mWM, iBP, bBP);
+    return mValue.ref();
+  }
+
+ private:
+  const WritingMode mWM;
+  const ComputedStyle& mStyle;
+  Maybe<LogicalSize> mValue;
+};
+
+static Maybe<nscoord> GetPercentageBasisForAR(
+    const LogicalAxis aRatioDeterminingAxis, const WritingMode aWM,
+    const Maybe<LogicalSize>& aContainingBlockSize) {
+  if (!aContainingBlockSize) {
+    return Nothing();
+  }
+
+  const nscoord basis = aContainingBlockSize->Size(aRatioDeterminingAxis, aWM);
+  return basis == NS_UNCONSTRAINEDSIZE ? Nothing() : Some(basis);
+}
+
+template <typename Type>
+static Maybe<nscoord> ComputeTransferredSize(
+    const Type& aRatioDeterminingSize, const LogicalAxis aAxis,
+    const WritingMode aWM, const AspectRatio& aAspectRatio,
+    BoxSizingAdjustment& aBoxSizingAdjustment,
+    const Maybe<LogicalSize>& aContainingBlockSize) {
+  const Maybe<nscoord> basis = GetPercentageBasisForAR(
+      GetOrthogonalAxis(aAxis), aWM, aContainingBlockSize);
+  nscoord rdSize = 0;
+  if (aRatioDeterminingSize->ConvertsToLength()) {
+    rdSize = aRatioDeterminingSize->ToLength();
+  } else if (aRatioDeterminingSize->HasPercent() && basis) {
+    rdSize = aRatioDeterminingSize->AsLengthPercentage().Resolve(*basis);
+  } else {
+    return Nothing();
+  }
+  return Some(aAspectRatio.ComputeRatioDependentSize(
+      aAxis, aWM, rdSize, aBoxSizingAdjustment.EnsureAndGet()));
+}
+
+class nsGridContainerFrame::CachedBAxisMeasurement final {
+ public:
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(Prop, CachedBAxisMeasurement)
+
+  CachedBAxisMeasurement(const nsIFrame* aFrame, const LogicalSize& aCBSize,
+                         const nscoord aBSize)
+      : mKey(aFrame, aCBSize), mBSize(aBSize) {}
+
+  bool IsValidFor(const nsIFrame* aFrame, const LogicalSize& aCBSize) const {
+    if (aFrame->IsSubtreeDirty()) {
+      return false;
+    }
+    return mKey == Key(aFrame, aCBSize);
+  }
+
+  nscoord BSize() const { return mBSize; }
+
+  void Update(const nsIFrame* aFrame, const LogicalSize& aCBSize,
+              const nscoord aBSize) {
+    mKey.Update(aFrame, aCBSize);
+    mBSize = aBSize;
+  }
+
+ private:
+  struct Key final {
+    nscoord mCBSizeInItemInlineAxis;
+    nscoord mBaselinePaddingInItemBlockAxis;
+
+    Key(const nsIFrame* aFrame, const LogicalSize& aCBSize) {
+      Update(aFrame, aCBSize);
+    }
+
+    void Update(const nsIFrame* aFrame, const LogicalSize& aCBSize) {
+      mCBSizeInItemInlineAxis = aCBSize.ISize(aFrame->GetWritingMode());
+      mBaselinePaddingInItemBlockAxis =
+          aFrame->GetProperty(nsIFrame::BBaselinePadProperty());
+    }
+
+    bool operator==(const Key& aOther) const = default;
+  };
+
+  Key mKey;
+  nscoord mBSize;
+};
+
+struct RepeatTrackSizingInput {
+  explicit RepeatTrackSizingInput(WritingMode aWM)
+      : mMin(aWM, 0, 0),
+        mSize(aWM, NS_UNCONSTRAINEDSIZE, NS_UNCONSTRAINEDSIZE),
+        mMax(aWM, NS_UNCONSTRAINEDSIZE, NS_UNCONSTRAINEDSIZE) {}
+
+  RepeatTrackSizingInput(const LogicalSize& aMin, const LogicalSize& aSize,
+                         const LogicalSize& aMax)
+      : mMin(aMin), mSize(aSize), mMax(aMax) {}
+
+  void InitFromStyle(LogicalAxis aAxis, WritingMode aWM, const nsIFrame* aFrame,
+                     const ComputedStyle* aStyle,
+                     const AspectRatio& aAspectRatio,
+                     const Maybe<LogicalSize>& aContainingBlockSize) {
+    const auto& pos = aStyle->StylePosition();
+    const AnchorPosResolutionParams anchorResolutionParams{
+        aFrame, aStyle->StyleDisplay()->mPosition};
+    BoxSizingAdjustment boxSizingAdjustment(aWM, *aStyle);
+    const nscoord cbSizeInAxis = aContainingBlockSize
+                                     ? aContainingBlockSize->Size(aAxis, aWM)
+                                     : NS_UNCONSTRAINEDSIZE;
+
+    auto adjustForBoxSizing = [aWM, aAxis,
+                               &boxSizingAdjustment](nscoord aSize) {
+      return std::max(
+          aSize - boxSizingAdjustment.EnsureAndGet().Size(aAxis, aWM), 0);
+    };
+
+    nscoord& min = mMin.Size(aAxis, aWM);
+    const auto styleMinSize = pos->MinSize(aAxis, aWM, anchorResolutionParams);
+    if (styleMinSize->ConvertsToLength()) {
+      min = adjustForBoxSizing(styleMinSize->ToLength());
+    } else if (styleMinSize->HasPercent() &&
+               cbSizeInAxis != NS_UNCONSTRAINEDSIZE) {
+      min = adjustForBoxSizing(
+          styleMinSize->AsLengthPercentage().Resolve(cbSizeInAxis));
+    } else if (aAspectRatio && styleMinSize->BehavesLikeInitialValue(aAxis)) {
+      const auto styleRDMinSize =
+          pos->MinSize(GetOrthogonalAxis(aAxis), aWM, anchorResolutionParams);
+      if (Maybe<nscoord> resolvedMinSize = ComputeTransferredSize(
+              styleRDMinSize, aAxis, aWM, aAspectRatio, boxSizingAdjustment,
+              aContainingBlockSize)) {
+        min = *resolvedMinSize;
+      }
+    }
+
+    nscoord& max = mMax.Size(aAxis, aWM);
+    const auto styleMaxSize = pos->MaxSize(aAxis, aWM, anchorResolutionParams);
+    if (styleMaxSize->ConvertsToLength()) {
+      max = std::max(min, adjustForBoxSizing(styleMaxSize->ToLength()));
+    } else if (styleMaxSize->HasPercent() &&
+               cbSizeInAxis != NS_UNCONSTRAINEDSIZE) {
+      max = std::max(
+          min, adjustForBoxSizing(
+                   styleMaxSize->AsLengthPercentage().Resolve(cbSizeInAxis)));
+    } else if (aAspectRatio && styleMaxSize->BehavesLikeInitialValue(aAxis)) {
+      const auto styleRDMaxSize =
+          pos->MaxSize(GetOrthogonalAxis(aAxis), aWM, anchorResolutionParams);
+      if (Maybe<nscoord> resolvedMaxSize = ComputeTransferredSize(
+              styleRDMaxSize, aAxis, aWM, aAspectRatio, boxSizingAdjustment,
+              aContainingBlockSize)) {
+        max = std::max(min, *resolvedMaxSize);
+      }
+    }
+
+    nscoord& size = mSize.Size(aAxis, aWM);
+    const auto styleSize = aAxis == LogicalAxis::Inline
+                               ? AnchorResolvedSizeHelper::Auto()
+                               : pos->BSize(aWM, anchorResolutionParams);
+    if (styleSize->ConvertsToLength()) {
+      size = std::clamp(adjustForBoxSizing(styleSize->ToLength()), min, max);
+    } else if (styleSize->HasPercent() &&
+               cbSizeInAxis != NS_UNCONSTRAINEDSIZE) {
+      size =
+          std::clamp(adjustForBoxSizing(
+                         styleSize->AsLengthPercentage().Resolve(cbSizeInAxis)),
+                     min, max);
+    } else if (aAspectRatio && styleSize->BehavesLikeInitialValue(aAxis)) {
+      const auto styleRDSize =
+          pos->Size(GetOrthogonalAxis(aAxis), aWM, anchorResolutionParams);
+      if (Maybe<nscoord> resolvedSize = ComputeTransferredSize(
+              styleRDSize, aAxis, aWM, aAspectRatio, boxSizingAdjustment,
+              aContainingBlockSize)) {
+        size = std::clamp(*resolvedSize, min, max);
+      }
+    }
+  }
+
+  LogicalSize mMin;
+  LogicalSize mSize;
+  LogicalSize mMax;
+};
+
+enum class GridLineSide {
+  BeforeGridGap,
+  AfterGridGap,
+};
+
+struct nsGridContainerFrame::TrackSize {
+  enum StateBits : uint16_t {
+    eNone = 0,
+    eAutoMinSizing = 1 << 0,
+    eMinContentMinSizing = 1 << 1,
+    eMaxContentMinSizing = 1 << 2,
+    eMinOrMaxContentMinSizing = eMinContentMinSizing | eMaxContentMinSizing,
+    eIntrinsicMinSizing = eMinOrMaxContentMinSizing | eAutoMinSizing,
+    eModified = 1 << 3,
+    eAutoMaxSizing = 1 << 4,
+    eMinContentMaxSizing = 1 << 5,
+    eMaxContentMaxSizing = 1 << 6,
+    eAutoOrMaxContentMaxSizing = eAutoMaxSizing | eMaxContentMaxSizing,
+    eIntrinsicMaxSizing = eAutoOrMaxContentMaxSizing | eMinContentMaxSizing,
+    eFlexMaxSizing = 1 << 7,
+    eFrozen = 1 << 8,
+    eSkipGrowUnlimited1 = 1 << 9,
+    eSkipGrowUnlimited2 = 1 << 10,
+    eSkipGrowUnlimited = eSkipGrowUnlimited1 | eSkipGrowUnlimited2,
+    eBreakBefore = 1 << 11,
+    eApplyFitContentClamping = 1 << 12,
+    eInfinitelyGrowable = 1 << 13,
+
+    eItemStretchSize = 1 << 0,
+    eClampToLimit = 1 << 1,
+    eItemHasAutoMargin = 1 << 2,
+  };
+
+  StateBits Initialize(nscoord aPercentageBasis, const StyleTrackSize&);
+  bool IsFrozen() const { return mState & eFrozen; }
+#ifdef DEBUG
+  static void DumpStateBits(StateBits aState);
+  void Dump() const;
+#endif
+
+  static bool IsDefiniteMaxSizing(StateBits aStateBits) {
+    return (aStateBits & (eIntrinsicMaxSizing | eFlexMaxSizing)) == 0;
+  }
+
+  nscoord mBase;
+
+  nscoord mLimit;
+
+  nscoord mPosition;  
+  PerBaseline<nscoord> mBaselineSubtreeSize;
+  StateBits mState;
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(TrackSize::StateBits)
+
+static_assert(std::is_trivially_copyable_v<nsGridContainerFrame::TrackSize>,
+              "Must be trivially copyable");
+static_assert(std::is_trivially_destructible_v<nsGridContainerFrame::TrackSize>,
+              "Must be trivially destructible");
+
+TrackSize::StateBits nsGridContainerFrame::TrackSize::Initialize(
+    nscoord aPercentageBasis, const StyleTrackSize& aSize) {
+  using Tag = StyleTrackBreadth::Tag;
+
+  MOZ_ASSERT(mBase == 0 && mLimit == 0 && mState == 0,
+             "track size data is expected to be initialized to zero");
+  mBaselineSubtreeSize[BaselineSharingGroup::First] = nscoord(0);
+  mBaselineSubtreeSize[BaselineSharingGroup::Last] = nscoord(0);
+
+  auto& min = aSize.GetMin();
+  auto& max = aSize.GetMax();
+
+  Tag minSizeTag = min.tag;
+  Tag maxSizeTag = max.tag;
+  if (aSize.IsFitContent()) {
+    if (!::IsPercentOfIndefiniteSize(aSize.AsFitContent(), aPercentageBasis)) {
+      mState = eApplyFitContentClamping;
+    }
+    minSizeTag = Tag::Auto;
+    maxSizeTag = Tag::MaxContent;
+  }
+  if (::IsPercentOfIndefiniteSize(min, aPercentageBasis)) {
+    minSizeTag = Tag::Auto;
+  }
+  if (::IsPercentOfIndefiniteSize(max, aPercentageBasis)) {
+    maxSizeTag = Tag::Auto;
+  }
+
+  switch (minSizeTag) {
+    case Tag::Auto:
+      mState |= eAutoMinSizing;
+      break;
+    case Tag::MinContent:
+      mState |= eMinContentMinSizing;
+      break;
+    case Tag::MaxContent:
+      mState |= eMaxContentMinSizing;
+      break;
+    default:
+      MOZ_ASSERT(!min.IsFlex(), "<flex> min-sizing is invalid as a track size");
+      mBase = ::ResolveToDefiniteSize(min, aPercentageBasis);
+  }
+  switch (maxSizeTag) {
+    case Tag::Auto:
+      mState |= eAutoMaxSizing;
+      mLimit = NS_UNCONSTRAINEDSIZE;
+      break;
+    case Tag::MinContent:
+    case Tag::MaxContent:
+      mState |= maxSizeTag == Tag::MinContent ? eMinContentMaxSizing
+                                              : eMaxContentMaxSizing;
+      mLimit = NS_UNCONSTRAINEDSIZE;
+      break;
+    case Tag::Flex:
+      mState |= eFlexMaxSizing;
+      mLimit = NS_UNCONSTRAINEDSIZE;
+      break;
+    default:
+      mLimit = ::ResolveToDefiniteSize(max, aPercentageBasis);
+      if (mLimit < mBase) {
+        mLimit = mBase;
+      }
+  }
+  return mState;
+}
+
+enum class TrackSizingStep {
+  NotFlex,  
+  Flex,     
+};
+
+enum class TrackSizingPhase {
+  IntrinsicMinimums,
+  ContentBasedMinimums,
+  MaxContentMinimums,
+  IntrinsicMaximums,
+  MaxContentMaximums,
+};
+
+enum class GridIntrinsicSizeType {
+  MinContribution,
+  MinContentContribution,
+  MaxContentContribution
+};
+
+static constexpr GridIntrinsicSizeType kAllGridIntrinsicSizeTypes[] = {
+    GridIntrinsicSizeType::MinContribution,
+    GridIntrinsicSizeType::MinContentContribution,
+    GridIntrinsicSizeType::MaxContentContribution};
+
+namespace mozilla {
+template <>
+struct MaxContiguousEnumValue<GridIntrinsicSizeType> {
+  static constexpr GridIntrinsicSizeType value =
+      GridIntrinsicSizeType::MaxContentContribution;
+};
+}  
+
+static GridIntrinsicSizeType SizeTypeForPhase(TrackSizingPhase aPhase) {
+  switch (aPhase) {
+    case TrackSizingPhase::IntrinsicMinimums:
+      return GridIntrinsicSizeType::MinContribution;
+    case TrackSizingPhase::ContentBasedMinimums:
+    case TrackSizingPhase::IntrinsicMaximums:
+      return GridIntrinsicSizeType::MinContentContribution;
+    case TrackSizingPhase::MaxContentMinimums:
+    case TrackSizingPhase::MaxContentMaximums:
+      return GridIntrinsicSizeType::MaxContentContribution;
+  }
+  MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Unexpected phase");
+}
+
+class nsGridContainerFrame::TrackPlan {
+ public:
+  TrackPlan() = default;
+
+  explicit TrackPlan(size_t aCapacity) : mTrackSizes(aCapacity) {}
+
+  TrackPlan(const TrackPlan& aOther) = default;
+
+  TrackPlan(TrackPlan&& aOther) : mTrackSizes(std::move(aOther.mTrackSizes)) {}
+
+  ~TrackPlan() = default;
+
+  TrackPlan& operator=(const TrackPlan& aOther) {
+    mTrackSizes.Assign(aOther.mTrackSizes);
+    return *this;
+  }
+  TrackPlan& operator=(TrackPlan&& aOther) {
+    mTrackSizes.Assign(std::move(aOther.mTrackSizes));
+    return *this;
+  }
+
+  size_t Length() const { return mTrackSizes.Length(); }
+
+  void SetLength(size_t aSize) { mTrackSizes.SetLength(aSize); }
+
+  bool IsEmpty() const { return mTrackSizes.IsEmpty(); }
+
+  void Assign(const TrackPlan& aRHS) { mTrackSizes.Assign(aRHS.mTrackSizes); }
+
+  nsGridContainerFrame::TrackSize* AppendElement(
+      nsGridContainerFrame::TrackSize aElement) {
+    return mTrackSizes.AppendElement(aElement);
+  }
+
+  nsGridContainerFrame::TrackSize& LastElement() {
+    return mTrackSizes.LastElement();
+  }
+
+  nsGridContainerFrame::TrackSize& operator[](size_t aIndex) {
+    return mTrackSizes[aIndex];
+  }
+
+  const nsGridContainerFrame::TrackSize& operator[](size_t aIndex) const {
+    return mTrackSizes[aIndex];
+  }
+
+  void ClearAndRetainStorage() { mTrackSizes.ClearAndRetainStorage(); }
+
+  void ZeroInitialize() {
+    PodZero(mTrackSizes.Elements(), mTrackSizes.Length());
+  }
+
+  using iterator = nsTArray<nsGridContainerFrame::TrackSize>::iterator;
+  iterator begin() { return mTrackSizes.begin(); }
+  iterator end() { return mTrackSizes.end(); }
+
+  using const_iterator =
+      nsTArray<nsGridContainerFrame::TrackSize>::const_iterator;
+  const_iterator begin() const { return mTrackSizes.begin(); }
+  const_iterator end() const { return mTrackSizes.end(); }
+
+  void Initialize(TrackSizingPhase aPhase, const Tracks& aTracks);
+
+  nscoord DistributeToFlexTrackSizes(
+      nscoord aAvailableSpace, const nsTArray<uint32_t>& aGrowableTracks,
+      const TrackSizingFunctions& aFunctions,
+      const nsGridContainerFrame::Tracks& aTracks);
+
+ private:
+  CopyableTArray<nsGridContainerFrame::TrackSize> mTrackSizes;
+};
+
+using TrackPlan = nsGridContainerFrame::TrackPlan;
+
+class nsGridContainerFrame::ItemPlan {
+ public:
+  ItemPlan() = default;
+
+  explicit ItemPlan(size_t aCapacity) : mTrackSizes(aCapacity) {}
+
+  ~ItemPlan() = default;
+
+  void SetLength(size_t aSize) { mTrackSizes.SetLength(aSize); }
+
+  nsGridContainerFrame::TrackSize& operator[](size_t aIndex) {
+    return mTrackSizes[aIndex];
+  }
+
+  void Initialize(TrackSizingPhase aPhase,
+                  const nsTArray<uint32_t>& aGrowableTracks,
+                  const nsGridContainerFrame::Tracks& aTracks);
+
+  using FitContentClamper =
+      std::function<bool(uint32_t aTrack, nscoord aMinSize, nscoord* aSize)>;
+
+  nscoord GrowTracksToLimit(nscoord aAvailableSpace,
+                            const nsTArray<uint32_t>& aGrowableTracks,
+                            const FitContentClamper& aFitContentClamper);
+
+  uint32_t MarkExcludedTracks(uint32_t aNumGrowable,
+                              const nsTArray<uint32_t>& aGrowableTracks,
+                              TrackSize::StateBits aMinSizingSelector,
+                              TrackSize::StateBits aMaxSizingSelector,
+                              TrackSize::StateBits aSkipFlag);
+
+  uint32_t MarkExcludedTracks(TrackSizingPhase aPhase,
+                              const nsTArray<uint32_t>& aGrowableTracks,
+                              SizingConstraint aConstraint);
+
+  void GrowSelectedTracksUnlimited(nscoord aAvailableSpace,
+                                   const nsTArray<uint32_t>& aGrowableTracks,
+                                   uint32_t aNumGrowable,
+                                   const FitContentClamper& aFitContentClamper);
+
+ private:
+  nsTArray<nsGridContainerFrame::TrackSize> mTrackSizes;
+};
+
+using ItemPlan = nsGridContainerFrame::ItemPlan;
+
+struct nsGridContainerFrame::LineRange {
+  LineRange(int32_t aStart, int32_t aEnd)
+      : mUntranslatedStart(aStart), mUntranslatedEnd(aEnd) {
+#ifdef DEBUG
+    if (!IsAutoAuto()) {
+      if (IsAuto()) {
+        MOZ_ASSERT(aEnd >= kMinLine && aEnd <= kMaxLine, "invalid span");
+      } else {
+        MOZ_ASSERT(aStart >= kMinLine && aStart <= kMaxLine,
+                   "invalid start line");
+        MOZ_ASSERT(aEnd == int32_t(kAutoLine) ||
+                       (aEnd >= kMinLine && aEnd <= kMaxLine),
+                   "invalid end line");
+      }
+    }
+#endif
+  }
+  bool IsAutoAuto() const { return mStart == kAutoLine && mEnd == kAutoLine; }
+  bool IsAuto() const { return mStart == kAutoLine; }
+  bool IsDefinite() const { return mStart != kAutoLine; }
+  uint32_t Extent() const {
+    MOZ_ASSERT(mEnd != kAutoLine, "Extent is undefined for abs.pos. 'auto'");
+    if (IsAuto()) {
+      MOZ_ASSERT(mEnd >= 1 && mEnd < uint32_t(kMaxLine), "invalid span");
+      return mEnd;
+    }
+    return mEnd - mStart;
+  }
+
+  auto Range() const { return IntegerRange<uint32_t>(mStart, mEnd); }
+
+  void ResolveAutoPosition(uint32_t aStart, uint32_t aClampMaxLine) {
+    MOZ_ASSERT(IsAuto(), "Why call me?");
+    mStart = aStart;
+    mEnd += aStart;
+    if (MOZ_UNLIKELY(mStart >= aClampMaxLine)) {
+      mEnd = aClampMaxLine;
+      mStart = mEnd - 1;
+    } else if (MOZ_UNLIKELY(mEnd > aClampMaxLine)) {
+      mEnd = aClampMaxLine;
+    }
+  }
+  void AdjustForRemovedTracks(const nsTArray<uint32_t>& aNumRemovedTracks) {
+    MOZ_ASSERT(mStart != kAutoLine, "invalid resolved line for a grid item");
+    MOZ_ASSERT(mEnd != kAutoLine, "invalid resolved line for a grid item");
+    uint32_t numRemovedTracks = aNumRemovedTracks[mStart];
+    MOZ_ASSERT(numRemovedTracks == aNumRemovedTracks[mEnd],
+               "tracks that a grid item spans can't be removed");
+    mStart -= numRemovedTracks;
+    mEnd -= numRemovedTracks;
+  }
+  void AdjustAbsPosForRemovedTracks(
+      const nsTArray<uint32_t>& aNumRemovedTracks) {
+    if (mStart != kAutoLine) {
+      mStart -= aNumRemovedTracks[mStart];
+    }
+    if (mEnd != kAutoLine) {
+      MOZ_ASSERT(mStart == kAutoLine || mEnd > mStart, "invalid line range");
+      mEnd -= aNumRemovedTracks[mEnd];
+    }
+  }
+
+  uint32_t HypotheticalEnd() const { return mEnd; }
+
+  void ToPositionAndLength(const TrackPlan& aTrackPlan, nscoord* aPos,
+                           nscoord* aLength) const;
+
+  nscoord ToLength(const TrackPlan& aTrackPlan) const;
+
+  void ToPositionAndLengthForAbsPos(const Tracks& aTracks, nscoord aGridOrigin,
+                                    nscoord* aPos, nscoord* aLength) const;
+
+  void Translate(int32_t aOffset) {
+    MOZ_ASSERT(IsDefinite());
+    mStart += aOffset;
+    mEnd += aOffset;
+  }
+
+  void ReverseDirection(uint32_t aGridEnd) {
+    MOZ_ASSERT(IsDefinite());
+    MOZ_ASSERT(aGridEnd >= mEnd);
+    uint32_t newStart = aGridEnd - mEnd;
+    mEnd = aGridEnd - mStart;
+    mStart = newStart;
+  }
+
+  union {
+    uint32_t mStart;
+    int32_t mUntranslatedStart;
+  };
+  union {
+    uint32_t mEnd;
+    int32_t mUntranslatedEnd;
+  };
+
+ protected:
+  LineRange() : mStart(0), mEnd(0) {}
+};
+
+struct nsGridContainerFrame::TranslatedLineRange : public LineRange {
+  TranslatedLineRange(uint32_t aStart, uint32_t aEnd) {
+    MOZ_ASSERT(aStart < aEnd && aEnd <= kTranslatedMaxLine);
+    mStart = aStart;
+    mEnd = aEnd;
+  }
+};
+
+struct nsGridContainerFrame::GridArea {
+  GridArea(const LineRange& aCols, const LineRange& aRows)
+      : mCols(aCols), mRows(aRows) {}
+  bool IsDefinite() const { return mCols.IsDefinite() && mRows.IsDefinite(); }
+  LineRange& LineRangeForAxis(LogicalAxis aAxis) {
+    return aAxis == LogicalAxis::Inline ? mCols : mRows;
+  }
+  const LineRange& LineRangeForAxis(LogicalAxis aAxis) const {
+    return aAxis == LogicalAxis::Inline ? mCols : mRows;
+  }
+  LineRange mCols;
+  LineRange mRows;
+};
+
+struct nsGridContainerFrame::GridItemInfo {
+  enum StateBits : uint16_t {
+    eIsFlexing = 0x1,
+
+    eFirstBaseline = 0x2,
+    eLastBaseline = 0x4,
+    eIsBaselineAligned = eFirstBaseline | eLastBaseline,
+
+    eSelfBaseline = 0x8,  
+    eContentBaseline = 0x10,
+
+    eEndSideBaseline = 0x20,
+
+    eLastBaselineSharingGroup = 0x40,
+
+    eAllBaselineBits = eIsBaselineAligned | eSelfBaseline | eContentBaseline |
+                       eEndSideBaseline | eLastBaselineSharingGroup,
+
+    eContentBasedAutoMinSize = 0x80,
+    eClampMarginBoxMinSize = 0x100,
+    eIsSubgrid = 0x200,
+    eStartEdge = 0x400,
+    eEndEdge = 0x800,
+    eEdgeBits = eStartEdge | eEndEdge,
+    eAutoPlacement = 0x1000,
+    eIsLastItemInMasonryTrack = 0x2000,
+
+    eTrackSizingBits =
+        eIsFlexing | eContentBasedAutoMinSize | eClampMarginBoxMinSize,
+  };
+
+  GridItemInfo(nsIFrame* aFrame, const GridArea& aArea);
+
+  GridItemInfo(const GridItemInfo& aOther)
+      : mFrame(aOther.mFrame), mArea(aOther.mArea) {
+    mBaselineOffset = aOther.mBaselineOffset;
+    mState = aOther.mState;
+  }
+
+  GridItemInfo& operator=(const GridItemInfo&) = delete;
+
+  static bool BaselineAlignmentAffectsEndSide(StateBits state) {
+    return state & StateBits::eEndSideBaseline;
+  }
+
+  void MaybeInhibitSubgridInMasonry(nsGridContainerFrame* aParent,
+                                    uint32_t aGridAxisTrackCount);
+
+  void InhibitSubgrid(nsGridContainerFrame* aParent, LogicalAxis aAxis);
+
+  GridItemInfo Transpose() const {
+    GridItemInfo info(mFrame, GridArea(mArea.mRows, mArea.mCols));
+    info.mState[LogicalAxis::Block] = mState[LogicalAxis::Inline];
+    info.mState[LogicalAxis::Inline] = mState[LogicalAxis::Block];
+    info.mBaselineOffset[LogicalAxis::Block] =
+        mBaselineOffset[LogicalAxis::Inline];
+    info.mBaselineOffset[LogicalAxis::Inline] =
+        mBaselineOffset[LogicalAxis::Block];
+    return info;
+  }
+
+  void ResetTrackSizingBits(LogicalAxis aAxis);
+
+  inline void ReverseDirection(LogicalAxis aAxis, uint32_t aGridEnd);
+
+  bool IsSubgrid(LogicalAxis aAxis) const {
+    return mState[aAxis] & StateBits::eIsSubgrid;
+  }
+
+  bool IsSubgrid() const {
+    return IsSubgrid(LogicalAxis::Inline) || IsSubgrid(LogicalAxis::Block);
+  }
+
+  nsGridContainerFrame* SubgridFrame() const {
+    MOZ_ASSERT(IsSubgrid());
+    nsGridContainerFrame* gridFrame = GetGridContainerFrame(mFrame);
+    MOZ_ASSERT(gridFrame && gridFrame->IsSubgrid());
+    return gridFrame;
+  }
+
+  void AdjustForRemovedTracks(LogicalAxis aAxis,
+                              const nsTArray<uint32_t>& aNumRemovedTracks);
+
+  StyleAlignFlags GetSelfBaseline(StyleAlignFlags aAlign, LogicalAxis aAxis,
+                                  nscoord* aBaselineOffset) const {
+    MOZ_ASSERT(aAlign == StyleAlignFlags::BASELINE ||
+               aAlign == StyleAlignFlags::LAST_BASELINE);
+    if (!(mState[aAxis] & eSelfBaseline)) {
+      return aAlign == StyleAlignFlags::BASELINE ? StyleAlignFlags::SELF_START
+                                                 : StyleAlignFlags::SELF_END;
+    }
+    *aBaselineOffset = mBaselineOffset[aAxis];
+    return aAlign;
+  }
+
+  bool MinContributionDependsOnAutoMinSize(WritingMode aContainerWM,
+                                           LogicalAxis aContainerAxis) const {
+    MOZ_ASSERT(
+        mArea.LineRangeForAxis(aContainerAxis).Extent() == 1,
+        "Should not be called with grid items that span multiple tracks.");
+    const LogicalAxis itemAxis =
+        aContainerWM.ConvertAxisTo(aContainerAxis, mFrame->GetWritingMode());
+    const auto* styleFrame = mFrame->IsTableWrapperFrame()
+                                 ? mFrame->PrincipalChildList().FirstChild()
+                                 : mFrame;
+    const auto* pos = styleFrame->StylePosition();
+    const auto anchorResolutionParams =
+        AnchorPosResolutionParams::From(styleFrame);
+    const auto size =
+        pos->Size(aContainerAxis, aContainerWM, anchorResolutionParams);
+    bool isAuto = size->BehavesLikeInitialValue(itemAxis);
+    if (!isAuto && !size->HasPercent()) {
+      return false;
+    }
+    const auto minSize =
+        pos->MinSize(aContainerAxis, aContainerWM, anchorResolutionParams);
+    isAuto = minSize->BehavesLikeInitialValue(itemAxis);
+    return isAuto && !mFrame->StyleDisplay()->IsScrollableOverflow();
+  }
+
+#ifdef DEBUG
+  void Dump() const;
+#endif
+
+  static bool IsStartRowLessThan(const GridItemInfo* a, const GridItemInfo* b) {
+    return a->mArea.mRows.mStart < b->mArea.mRows.mStart;
+  }
+
+  static bool RowMasonryOrdered(const GridItemInfo* a, const GridItemInfo* b) {
+    return a->mArea.mRows.mStart == 0 && b->mArea.mRows.mStart != 0 &&
+           !a->mFrame->HasAnyStateBits(NS_FRAME_OUT_OF_FLOW);
+  }
+  static bool ColMasonryOrdered(const GridItemInfo* a, const GridItemInfo* b) {
+    return a->mArea.mCols.mStart == 0 && b->mArea.mCols.mStart != 0 &&
+           !a->mFrame->HasAnyStateBits(NS_FRAME_OUT_OF_FLOW);
+  }
+
+  static bool RowMasonryDefiniteFirst(const GridItemInfo* a,
+                                      const GridItemInfo* b) {
+    bool isContinuationA = a->mFrame->GetPrevInFlow();
+    bool isContinuationB = b->mFrame->GetPrevInFlow();
+    if (isContinuationA != isContinuationB) {
+      return isContinuationA;
+    }
+    auto masonryA = a->mArea.mRows.mStart;
+    auto gridA = a->mState[LogicalAxis::Inline] & StateBits::eAutoPlacement;
+    auto masonryB = b->mArea.mRows.mStart;
+    auto gridB = b->mState[LogicalAxis::Inline] & StateBits::eAutoPlacement;
+    return (masonryA == 0 ? masonryB != 0 : (masonryB != 0 && gridA < gridB)) &&
+           !a->mFrame->HasAnyStateBits(NS_FRAME_OUT_OF_FLOW);
+  }
+  static bool ColMasonryDefiniteFirst(const GridItemInfo* a,
+                                      const GridItemInfo* b) {
+    MOZ_ASSERT(!a->mFrame->GetPrevInFlow() && !b->mFrame->GetPrevInFlow(),
+               "fragmentation not supported in inline axis");
+    auto masonryA = a->mArea.mCols.mStart;
+    auto gridA = a->mState[LogicalAxis::Block] & StateBits::eAutoPlacement;
+    auto masonryB = b->mArea.mCols.mStart;
+    auto gridB = b->mState[LogicalAxis::Block] & StateBits::eAutoPlacement;
+    return (masonryA == 0 ? masonryB != 0 : (masonryB != 0 && gridA < gridB)) &&
+           !a->mFrame->HasAnyStateBits(NS_FRAME_OUT_OF_FLOW);
+  }
+
+  bool IsBSizeDependentOnContainerSize(WritingMode aContainerWM) const {
+    const auto IsDependentOnContainerSize = [](const auto& size) -> bool {
+      return size.HasPercent() || size.BehavesLikeStretchOnInlineAxis();
+    };
+
+    const nsStylePosition* stylePos = mFrame->StylePosition();
+    const auto anchorResolutionParams = AnchorPosResolutionParams::From(mFrame);
+    bool isItemAutoSize = IsDependentOnContainerSize(*stylePos->BSize(
+                              aContainerWM, anchorResolutionParams)) ||
+                          IsDependentOnContainerSize(*stylePos->MinBSize(
+                              aContainerWM, anchorResolutionParams)) ||
+                          IsDependentOnContainerSize(*stylePos->MaxBSize(
+                              aContainerWM, anchorResolutionParams));
+
+    return isItemAutoSize;
+  }
+
+  nsIFrame* const mFrame;
+  GridArea mArea;
+
+  mutable PerLogicalAxis<nscoord> mBaselineOffset;
+
+  mutable PerLogicalAxis<StateBits> mState;
+};
+
+using GridItemInfo = nsGridContainerFrame::GridItemInfo;
+using ItemState = GridItemInfo::StateBits;
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(ItemState)
+
+GridItemInfo::GridItemInfo(nsIFrame* aFrame, const GridArea& aArea)
+    : mFrame(aFrame), mArea(aArea), mBaselineOffset{0, 0} {
+  mState[LogicalAxis::Block] =
+      StateBits(mArea.mRows.mStart == kAutoLine ? eAutoPlacement : 0);
+  mState[LogicalAxis::Inline] =
+      StateBits(mArea.mCols.mStart == kAutoLine ? eAutoPlacement : 0);
+
+  if (auto* gridFrame = GetGridContainerFrame(mFrame)) {
+    auto parentWM = aFrame->GetParent()->GetWritingMode();
+    bool isOrthogonal = parentWM.IsOrthogonalTo(gridFrame->GetWritingMode());
+    if (gridFrame->IsColSubgrid()) {
+      mState[isOrthogonal ? LogicalAxis::Block : LogicalAxis::Inline] |=
+          StateBits::eIsSubgrid;
+    }
+    if (gridFrame->IsRowSubgrid()) {
+      mState[isOrthogonal ? LogicalAxis::Inline : LogicalAxis::Block] |=
+          StateBits::eIsSubgrid;
+    }
+  }
+}
+
+void GridItemInfo::ResetTrackSizingBits(LogicalAxis aAxis) {
+  mState[aAxis] &= ~StateBits::eTrackSizingBits;
+}
+
+void GridItemInfo::ReverseDirection(LogicalAxis aAxis, uint32_t aGridEnd) {
+  mArea.LineRangeForAxis(aAxis).ReverseDirection(aGridEnd);
+  ItemState& state = mState[aAxis];
+  ItemState newState = state & ~ItemState::eEdgeBits;
+  if (state & ItemState::eStartEdge) {
+    newState |= ItemState::eEndEdge;
+  }
+  if (state & ItemState::eEndEdge) {
+    newState |= ItemState::eStartEdge;
+  }
+  state = newState;
+}
+
+void GridItemInfo::InhibitSubgrid(nsGridContainerFrame* aParent,
+                                  LogicalAxis aAxis) {
+  MOZ_ASSERT(IsSubgrid(aAxis));
+  auto bit = NS_STATE_GRID_IS_COL_SUBGRID;
+  if (aParent->GetWritingMode().IsOrthogonalTo(mFrame->GetWritingMode()) !=
+      (aAxis == LogicalAxis::Block)) {
+    bit = NS_STATE_GRID_IS_ROW_SUBGRID;
+  }
+  MOZ_ASSERT(SubgridFrame()->HasAnyStateBits(bit));
+  SubgridFrame()->RemoveStateBits(bit);
+  mState[aAxis] &= StateBits(~StateBits::eIsSubgrid);
+}
+
+void GridItemInfo::MaybeInhibitSubgridInMasonry(nsGridContainerFrame* aParent,
+                                                uint32_t aGridAxisTrackCount) {
+  if (IsSubgrid(LogicalAxis::Inline) && aParent->IsRowMasonry() &&
+      mArea.mRows.mStart != 0 && mArea.mCols.Extent() != aGridAxisTrackCount &&
+      (mState[LogicalAxis::Inline] & eAutoPlacement)) {
+    InhibitSubgrid(aParent, LogicalAxis::Inline);
+    return;
+  }
+  if (IsSubgrid(LogicalAxis::Block) && aParent->IsColMasonry() &&
+      mArea.mCols.mStart != 0 && mArea.mRows.Extent() != aGridAxisTrackCount &&
+      (mState[LogicalAxis::Block] & eAutoPlacement)) {
+    InhibitSubgrid(aParent, LogicalAxis::Block);
+  }
+}
+
+struct nsGridContainerFrame::Subgrid {
+  Subgrid(const GridArea& aArea, bool aIsOrthogonal, WritingMode aCBWM)
+      : mArea(aArea),
+        mGridColEnd(0),
+        mGridRowEnd(0),
+        mMarginBorderPadding(aCBWM),
+        mIsOrthogonal(aIsOrthogonal) {}
+
+  const LineRange& SubgridCols() const {
+    return mIsOrthogonal ? mArea.mRows : mArea.mCols;
+  }
+  const LineRange& SubgridRows() const {
+    return mIsOrthogonal ? mArea.mCols : mArea.mRows;
+  }
+
+  nsTArray<GridItemInfo> mGridItems;
+  nsTArray<GridItemInfo> mAbsPosItems;
+  GridArea mArea;
+  uint32_t mGridColEnd;
+  uint32_t mGridRowEnd;
+  LogicalMargin mMarginBorderPadding;
+  bool mIsOrthogonal;
+
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(Prop, Subgrid)
+};
+using Subgrid = nsGridContainerFrame::Subgrid;
+
+void GridItemInfo::AdjustForRemovedTracks(
+    LogicalAxis aAxis, const nsTArray<uint32_t>& aNumRemovedTracks) {
+  const bool abspos = mFrame->HasAnyStateBits(NS_FRAME_OUT_OF_FLOW);
+  auto& lines = mArea.LineRangeForAxis(aAxis);
+  if (abspos) {
+    lines.AdjustAbsPosForRemovedTracks(aNumRemovedTracks);
+  } else {
+    lines.AdjustForRemovedTracks(aNumRemovedTracks);
+  }
+  if (IsSubgrid()) {
+    auto* subgrid = SubgridFrame()->GetProperty(Subgrid::Prop());
+    if (subgrid) {
+      auto& lines = subgrid->mArea.LineRangeForAxis(aAxis);
+      if (abspos) {
+        lines.AdjustAbsPosForRemovedTracks(aNumRemovedTracks);
+      } else {
+        lines.AdjustForRemovedTracks(aNumRemovedTracks);
+      }
+    }
+  }
+}
+
+struct nsGridContainerFrame::UsedTrackSizes {
+  UsedTrackSizes() : mCanResolveLineRangeSize{false, false} {}
+
+  void ResolveTrackSizesForAxis(nsGridContainerFrame* aFrame, LogicalAxis aAxis,
+                                gfxContext& aRC);
+
+  void ResolveSubgridTrackSizesForAxis(nsGridContainerFrame* aFrame,
+                                       LogicalAxis aAxis, Subgrid* aSubgrid,
+                                       gfxContext& aRC,
+                                       nscoord aContentBoxSize);
+
+  PerLogicalAxis<TrackPlan> mTrackPlans;
+  PerLogicalAxis<bool> mCanResolveLineRangeSize;
+
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(Prop, UsedTrackSizes)
+};
+using UsedTrackSizes = nsGridContainerFrame::UsedTrackSizes;
+
+#ifdef DEBUG
+void nsGridContainerFrame::GridItemInfo::Dump() const {
+  auto Dump1 = [this](const char* aMsg, LogicalAxis aAxis) {
+    auto state = mState[aAxis];
+    if (!state) {
+      return;
+    }
+    printf("%s", aMsg);
+    if (state & ItemState::eEdgeBits) {
+      printf("subgrid-adjacent-edges(");
+      if (state & ItemState::eStartEdge) {
+        printf("start ");
+      }
+      if (state & ItemState::eEndEdge) {
+        printf("end");
+      }
+      printf(") ");
+    }
+    if (state & ItemState::eAutoPlacement) {
+      printf("masonry-auto ");
+    }
+    if (state & ItemState::eIsSubgrid) {
+      printf("subgrid ");
+    }
+    if (state & ItemState::eIsFlexing) {
+      printf("flexing ");
+    }
+    if (state & ItemState::eContentBasedAutoMinSize) {
+      printf("auto-min-size ");
+    }
+    if (state & ItemState::eClampMarginBoxMinSize) {
+      printf("clamp ");
+    }
+    if (state & ItemState::eIsLastItemInMasonryTrack) {
+      printf("last-in-track ");
+    }
+    if (state & ItemState::eFirstBaseline) {
+      printf("first baseline %s-alignment ",
+             (state & ItemState::eSelfBaseline) ? "self" : "content");
+    }
+    if (state & ItemState::eLastBaseline) {
+      printf("last baseline %s-alignment ",
+             (state & ItemState::eSelfBaseline) ? "self" : "content");
+    }
+    if (state & ItemState::eIsBaselineAligned) {
+      printf("%.2fpx", NSAppUnitsToFloatPixels(mBaselineOffset[aAxis],
+                                               AppUnitsPerCSSPixel()));
+    }
+    printf("\n");
+  };
+  printf("grid-row: %d %d\n", mArea.mRows.mStart, mArea.mRows.mEnd);
+  Dump1("  grid block-axis: ", LogicalAxis::Block);
+  printf("grid-column: %d %d\n", mArea.mCols.mStart, mArea.mCols.mEnd);
+  Dump1("  grid inline-axis: ", LogicalAxis::Inline);
+}
+#endif
+
+struct nsGridContainerFrame::TrackSizingFunctions {
+ private:
+  TrackSizingFunctions(const GridTemplate& aTemplate,
+                       const StyleImplicitGridTracks& aAutoSizing,
+                       const Maybe<size_t>& aRepeatAutoIndex, bool aIsSubgrid)
+      : mTemplate(aTemplate),
+        mTrackListValues(aTemplate.TrackListValues()),
+        mAutoSizing(aAutoSizing),
+        mExplicitGridOffset(0),
+        mRepeatAutoStart(aRepeatAutoIndex.valueOr(0)),
+        mRepeatAutoEnd(mRepeatAutoStart),
+        mHasRepeatAuto(aRepeatAutoIndex.isSome()) {
+    MOZ_ASSERT(!mHasRepeatAuto || !aIsSubgrid,
+               "a track-list for a subgrid can't have an <auto-repeat> track");
+    if (!aIsSubgrid) {
+      ExpandNonRepeatAutoTracks();
+    }
+
+#ifdef DEBUG
+    if (mHasRepeatAuto) {
+      MOZ_ASSERT(mExpandedTracks.Length() >= 1);
+      const unsigned maxTrack = kMaxLine - 1;
+      if (mExpandedTracks.Length() < maxTrack) {
+        MOZ_ASSERT(mRepeatAutoStart < mExpandedTracks.Length());
+      }
+    }
+#endif
+  }
+
+ public:
+  TrackSizingFunctions(const GridTemplate& aGridTemplate,
+                       const StyleImplicitGridTracks& aAutoSizing,
+                       bool aIsSubgrid)
+      : TrackSizingFunctions(aGridTemplate, aAutoSizing,
+                             aGridTemplate.RepeatAutoIndex(), aIsSubgrid) {}
+
+ private:
+  enum { ForSubgridFallbackTag };
+  TrackSizingFunctions(const GridTemplate& aGridTemplate,
+                       const StyleImplicitGridTracks& aAutoSizing,
+                       decltype(ForSubgridFallbackTag))
+      : TrackSizingFunctions(aGridTemplate, aAutoSizing, Nothing(),
+                              true) {}
+
+ public:
+  static TrackSizingFunctions ForSubgridFallback(
+      nsGridContainerFrame* aSubgridFrame, const Subgrid* aSubgrid,
+      nsGridContainerFrame* aParentGridContainer, LogicalAxis aParentAxis) {
+    MOZ_ASSERT(aSubgrid);
+    MOZ_ASSERT(aSubgridFrame->IsSubgrid(aSubgrid->mIsOrthogonal
+                                            ? GetOrthogonalAxis(aParentAxis)
+                                            : aParentAxis));
+    nsGridContainerFrame* parent = aParentGridContainer;
+    auto parentAxis = aParentAxis;
+    LineRange range = aSubgrid->mArea.LineRangeForAxis(parentAxis);
+    while (parent->IsSubgrid(parentAxis)) {
+      const auto* parentSubgrid = parent->GetProperty(Subgrid::Prop());
+      auto* grandParent = parent->ParentGridContainerForSubgrid();
+      auto grandParentWM = grandParent->GetWritingMode();
+      bool isSameDirInAxis =
+          parent->GetWritingMode().ParallelAxisStartsOnSameSide(parentAxis,
+                                                                grandParentWM);
+      if (MOZ_UNLIKELY(!isSameDirInAxis)) {
+        auto end = parentAxis == LogicalAxis::Block
+                       ? parentSubgrid->mGridRowEnd
+                       : parentSubgrid->mGridColEnd;
+        range.ReverseDirection(end);
+      }
+      auto grandParentAxis = parentSubgrid->mIsOrthogonal
+                                 ? GetOrthogonalAxis(parentAxis)
+                                 : parentAxis;
+      const auto& parentRange =
+          parentSubgrid->mArea.LineRangeForAxis(grandParentAxis);
+      range.Translate(parentRange.mStart);
+      parentAxis = grandParentAxis;
+      parent = grandParent;
+    }
+    const auto* pos = parent->StylePosition();
+    const auto isInlineAxis = parentAxis == LogicalAxis::Inline;
+    const auto& szf =
+        isInlineAxis ? pos->mGridTemplateRows : pos->mGridTemplateColumns;
+    const auto& autoSizing =
+        isInlineAxis ? pos->mGridAutoColumns : pos->mGridAutoRows;
+    return TrackSizingFunctions(szf, autoSizing, ForSubgridFallbackTag);
+  }
+
+  void InitRepeatTracks(const NonNegativeLengthPercentageOrNormal& aGridGap,
+                        nscoord aMinSize, nscoord aSize, nscoord aMaxSize) {
+    const uint32_t maxTrack = kMaxLine - 1;
+    if (MOZ_UNLIKELY(mRepeatAutoStart >= maxTrack)) {
+      mHasRepeatAuto = false;
+      mRepeatAutoStart = 0;
+      mRepeatAutoEnd = 0;
+      return;
+    }
+    uint32_t repeatTracks =
+        CalculateRepeatFillCount(aGridGap, aMinSize, aSize, aMaxSize) *
+        NumRepeatTracks();
+    repeatTracks = std::min(repeatTracks, maxTrack - mRepeatAutoStart);
+    SetNumRepeatTracks(repeatTracks);
+    mRemovedRepeatTracks.SetLength(repeatTracks);
+    for (auto& track : mRemovedRepeatTracks) {
+      track = false;
+    }
+  }
+
+  uint32_t CalculateRepeatFillCount(
+      const NonNegativeLengthPercentageOrNormal& aGridGap, nscoord aMinSize,
+      nscoord aSize, nscoord aMaxSize) const {
+    if (!mHasRepeatAuto) {
+      return 0;
+    }
+    MOZ_ASSERT(RepeatEndDelta() >= 0);
+    const uint32_t numTracks = mExpandedTracks.Length() + RepeatEndDelta();
+    MOZ_ASSERT(numTracks >= 1, "expected at least the repeat() track");
+    if (MOZ_UNLIKELY(numTracks >= kMaxLine)) {
+      return 1;
+    }
+    nscoord maxFill = aSize != NS_UNCONSTRAINEDSIZE ? aSize : aMaxSize;
+    if (maxFill == NS_UNCONSTRAINEDSIZE && aMinSize == 0) {
+      return 1;
+    }
+    nscoord repeatTrackSum = 0;
+    nscoord sum = 0;
+    const nscoord percentBasis = aSize;
+    for (uint32_t i = 0; i < numTracks; ++i) {
+      nscoord trackSize;
+      {
+        const auto& sizingFunction = SizingFor(i);
+        const auto& maxCoord = sizingFunction.GetMax();
+        const auto& minCoord = sizingFunction.GetMin();
+        if (maxCoord.IsBreadth() && minCoord.IsBreadth()) {
+          const nscoord minSize =
+              ::ResolveToDefiniteSize(minCoord, percentBasis);
+          const nscoord maxSize =
+              ::ResolveToDefiniteSize(maxCoord, percentBasis);
+          trackSize = std::max(maxSize, minSize);
+        } else {
+          const auto* coord = &maxCoord;
+          if (!coord->IsBreadth()) {
+            coord = &minCoord;
+            if (!coord->IsBreadth()) {
+              return 1;
+            }
+          }
+          trackSize = ::ResolveToDefiniteSize(*coord, percentBasis);
+        }
+      }
+
+      if (i >= mRepeatAutoStart && i < mRepeatAutoEnd) {
+        if (trackSize < AppUnitsPerCSSPixel()) {
+          trackSize = AppUnitsPerCSSPixel();
+        }
+        repeatTrackSum += trackSize;
+      }
+      sum += trackSize;
+    }
+    nscoord gridGap = nsLayoutUtils::ResolveGapToLength(aGridGap, aSize);
+    if (numTracks > 1) {
+      sum += gridGap * (numTracks - 1);
+    }
+    nscoord available = maxFill != NS_UNCONSTRAINEDSIZE ? maxFill : aMinSize;
+    nscoord spaceToFill = available - sum;
+    if (spaceToFill <= 0) {
+      return 1;
+    }
+    div_t q = div(spaceToFill, repeatTrackSum + gridGap * NumRepeatTracks());
+    uint32_t numRepeatTracks = q.quot + 1;
+    if (q.rem != 0 && maxFill == NS_UNCONSTRAINEDSIZE) {
+      ++numRepeatTracks;  
+    }
+    MOZ_ASSERT(numTracks >= NumRepeatTracks());
+    const uint32_t maxRepeatTrackCount = kMaxLine - numTracks;
+    const uint32_t maxRepetitions = maxRepeatTrackCount / NumRepeatTracks();
+    return std::min(numRepeatTracks, maxRepetitions);
+  }
+
+  uint32_t ComputeExplicitGridEnd(uint32_t aGridTemplateAreasEnd) {
+    uint32_t end = NumExplicitTracks() + 1;
+    end = std::max(end, aGridTemplateAreasEnd);
+    end = std::min(end, uint32_t(kMaxLine));
+    return end;
+  }
+  const StyleTrackSize& SizingFor(uint32_t aTrackIndex) const {
+    static const StyleTrackSize kAutoTrackSize =
+        StyleTrackSize::Breadth(StyleTrackBreadth::Auto());
+    auto getImplicitSize = [this](int32_t aIndex) -> const StyleTrackSize& {
+      MOZ_ASSERT(!(mAutoSizing.Length() == 1 &&
+                   mAutoSizing.AsSpan()[0] == kAutoTrackSize),
+                 "It's impossible to have one track with auto value because we "
+                 "filter out this case during parsing");
+
+      if (mAutoSizing.IsEmpty()) {
+        return kAutoTrackSize;
+      }
+
+      int32_t i = aIndex % int32_t(mAutoSizing.Length());
+      if (i < 0) {
+        i += mAutoSizing.Length();
+      }
+      return mAutoSizing.AsSpan()[i];
+    };
+
+    if (MOZ_UNLIKELY(aTrackIndex < mExplicitGridOffset)) {
+      return getImplicitSize(int32_t(aTrackIndex) -
+                             int32_t(mExplicitGridOffset));
+    }
+    uint32_t index = aTrackIndex - mExplicitGridOffset;
+    MOZ_ASSERT(mRepeatAutoStart <= mRepeatAutoEnd);
+
+    if (index >= mRepeatAutoStart) {
+      if (index < mRepeatAutoEnd) {
+        const auto& indices = mExpandedTracks[mRepeatAutoStart];
+        const TrackListValue& value = mTrackListValues[indices.first];
+
+        MOZ_ASSERT(indices.second == 0);
+
+        const auto& repeatTracks = value.AsTrackRepeat().track_sizes.AsSpan();
+
+        const uint32_t finalRepeatIndex = (index - mRepeatAutoStart);
+        uint32_t repeatWithCollapsed = 0;
+        if (mRemovedRepeatTracks.IsEmpty()) {
+          repeatWithCollapsed = finalRepeatIndex;
+        } else {
+          for (uint32_t repeatNoCollapsed = 0;
+               repeatNoCollapsed < finalRepeatIndex; repeatWithCollapsed++) {
+            if (!mRemovedRepeatTracks[repeatWithCollapsed]) {
+              repeatNoCollapsed++;
+            }
+          }
+          while (mRemovedRepeatTracks[repeatWithCollapsed]) {
+            repeatWithCollapsed++;
+          }
+        }
+        return repeatTracks[repeatWithCollapsed % repeatTracks.Length()];
+      } else {
+        index -= RepeatEndDelta();
+      }
+    }
+    if (index >= mExpandedTracks.Length()) {
+      return getImplicitSize(index - mExpandedTracks.Length());
+    }
+    auto& indices = mExpandedTracks[index];
+    const TrackListValue& value = mTrackListValues[indices.first];
+    if (value.IsTrackSize()) {
+      MOZ_ASSERT(indices.second == 0);
+      return value.AsTrackSize();
+    }
+    return value.AsTrackRepeat().track_sizes.AsSpan()[indices.second];
+  }
+  const StyleTrackBreadth& MaxSizingFor(uint32_t aTrackIndex) const {
+    return SizingFor(aTrackIndex).GetMax();
+  }
+  const StyleTrackBreadth& MinSizingFor(uint32_t aTrackIndex) const {
+    return SizingFor(aTrackIndex).GetMin();
+  }
+  uint32_t NumExplicitTracks() const {
+    return mExpandedTracks.Length() + RepeatEndDelta();
+  }
+  uint32_t NumRepeatTracks() const { return mRepeatAutoEnd - mRepeatAutoStart; }
+  int32_t RepeatEndDelta() const {
+    return mHasRepeatAuto ? int32_t(NumRepeatTracks()) - 1 : 0;
+  }
+  void SetNumRepeatTracks(uint32_t aNumRepeatTracks) {
+    MOZ_ASSERT(mHasRepeatAuto || aNumRepeatTracks == 0);
+    mRepeatAutoEnd = mRepeatAutoStart + aNumRepeatTracks;
+  }
+
+  void ExpandNonRepeatAutoTracks() {
+    for (size_t i = 0; i < mTrackListValues.Length(); ++i) {
+      auto& value = mTrackListValues[i];
+      if (value.IsTrackSize()) {
+        mExpandedTracks.EmplaceBack(i, 0);
+        continue;
+      }
+      auto& repeat = value.AsTrackRepeat();
+      if (!repeat.count.IsNumber()) {
+        MOZ_ASSERT(i == mRepeatAutoStart);
+        mRepeatAutoStart = mExpandedTracks.Length();
+        mRepeatAutoEnd = mRepeatAutoStart + repeat.track_sizes.Length();
+        mExpandedTracks.EmplaceBack(i, 0);
+        continue;
+      }
+      for (auto j : IntegerRange(repeat.count.AsNumber())) {
+        (void)j;
+        size_t trackSizesCount = repeat.track_sizes.Length();
+        for (auto k : IntegerRange(trackSizesCount)) {
+          mExpandedTracks.EmplaceBack(i, k);
+        }
+      }
+    }
+    if (MOZ_UNLIKELY(mExpandedTracks.Length() > kMaxLine - 1)) {
+      mExpandedTracks.TruncateLength(kMaxLine - 1);
+      if (mHasRepeatAuto && mRepeatAutoStart > kMaxLine - 1) {
+        mHasRepeatAuto = false;
+      }
+    }
+  }
+
+  const GridTemplate& mTemplate;
+  const Span<const TrackListValue> mTrackListValues;
+  const StyleImplicitGridTracks& mAutoSizing;
+  nsTArray<std::pair<size_t, size_t>> mExpandedTracks;
+  uint32_t mExplicitGridOffset;
+  uint32_t mRepeatAutoStart;
+  uint32_t mRepeatAutoEnd;
+  bool mHasRepeatAuto;
+  nsTArray<bool> mRemovedRepeatTracks;
+};
+
+class MOZ_STACK_CLASS nsGridContainerFrame::LineNameMap {
+ public:
+  LineNameMap(const nsStylePosition* aStylePosition,
+              const ImplicitNamedAreas* aImplicitNamedAreas,
+              const TrackSizingFunctions& aTracks,
+              const LineNameMap* aParentLineNameMap, const LineRange* aRange,
+              bool aIsSameDirection = true, bool aIsOrthogonal = false)
+      : mStylePosition(aStylePosition),
+        mAreas(aImplicitNamedAreas),
+        mRepeatAutoStart(aTracks.mRepeatAutoStart),
+        mRepeatAutoEnd(aTracks.mRepeatAutoEnd),
+        mRepeatEndDelta(aTracks.RepeatEndDelta()),
+        mParentLineNameMap(aParentLineNameMap),
+        mRange(aRange),
+        mIsSameDirection(aIsSameDirection),
+        mIsOrthogonal(aIsOrthogonal),
+        mHasRepeatAuto(aTracks.mHasRepeatAuto) {
+    if (MOZ_UNLIKELY(aRange)) {  
+      mClampMinLine = 1;
+      mClampMaxLine = 1 + aRange->Extent();
+      MOZ_ASSERT(aTracks.mTemplate.IsSubgrid(), "Should be subgrid type");
+      ExpandRepeatLineNamesForSubgrid(*aTracks.mTemplate.AsSubgrid());
+      mRepeatAutoStart = 0;
+      mRepeatAutoEnd = mRepeatAutoStart;
+      mHasRepeatAuto = false;
+    } else {
+      mClampMinLine = kMinLine;
+      mClampMaxLine = kMaxLine;
+      if (mHasRepeatAuto) {
+        mTrackAutoRepeatLineNames =
+            aTracks.mTemplate.GetRepeatAutoValue()->line_names.AsSpan();
+      }
+      ExpandRepeatLineNames(aTracks);
+    }
+    if (mHasRepeatAuto) {
+      mTemplateLinesEnd = mExpandedLineNames.Length() -
+                          (mTrackAutoRepeatLineNames.Length() - 2) +
+                          mRepeatEndDelta;
+    } else {
+      mTemplateLinesEnd = mExpandedLineNames.Length();
+    }
+    MOZ_ASSERT(mHasRepeatAuto || mRepeatEndDelta <= 0);
+    MOZ_ASSERT(!mHasRepeatAuto || aRange ||
+               (mExpandedLineNames.Length() >= 2 &&
+                mRepeatAutoStart <= mExpandedLineNames.Length()));
+  }
+
+  void ExpandRepeatLineNames(const TrackSizingFunctions& aTracks) {
+    auto lineNameLists = aTracks.mTemplate.LineNameLists(false);
+
+    const auto& trackListValues = aTracks.mTrackListValues;
+    const NameList* nameListToMerge = nullptr;
+    SmallPointerArray<const NameList> names;
+    const uint32_t end =
+        std::min<uint32_t>(lineNameLists.Length(), mClampMaxLine + 1);
+    for (uint32_t i = 0; i < end; ++i) {
+      if (nameListToMerge) {
+        names.AppendElement(nameListToMerge);
+        nameListToMerge = nullptr;
+      }
+      names.AppendElement(&lineNameLists[i]);
+      if (i >= trackListValues.Length()) {
+        mExpandedLineNames.AppendElement(std::move(names));
+        continue;
+      }
+      const auto& value = trackListValues[i];
+      if (value.IsTrackSize()) {
+        mExpandedLineNames.AppendElement(std::move(names));
+        continue;
+      }
+      const auto& repeat = value.AsTrackRepeat();
+      if (!repeat.count.IsNumber()) {
+        const auto repeatNames = repeat.line_names.AsSpan();
+        MOZ_ASSERT(!mHasRepeatAuto ||
+                   mRepeatAutoStart == mExpandedLineNames.Length());
+        MOZ_ASSERT(repeatNames.Length() >= 2);
+        for (const auto j : IntegerRange(repeatNames.Length() - 1)) {
+          names.AppendElement(&repeatNames[j]);
+          mExpandedLineNames.AppendElement(std::move(names));
+        }
+        nameListToMerge = &repeatNames[repeatNames.Length() - 1];
+        continue;
+      }
+      for (auto j : IntegerRange(repeat.count.AsNumber())) {
+        (void)j;
+        if (nameListToMerge) {
+          names.AppendElement(nameListToMerge);
+          nameListToMerge = nullptr;
+        }
+        size_t trackSizesCount = repeat.track_sizes.Length();
+        auto repeatLineNames = repeat.line_names.AsSpan();
+        MOZ_ASSERT(repeatLineNames.Length() == trackSizesCount ||
+                   repeatLineNames.Length() == trackSizesCount + 1);
+        for (auto k : IntegerRange(trackSizesCount)) {
+          names.AppendElement(&repeatLineNames[k]);
+          mExpandedLineNames.AppendElement(std::move(names));
+        }
+        if (repeatLineNames.Length() == trackSizesCount + 1) {
+          nameListToMerge = &repeatLineNames[trackSizesCount];
+        }
+      }
+    }
+
+    if (MOZ_UNLIKELY(mExpandedLineNames.Length() > uint32_t(mClampMaxLine))) {
+      mExpandedLineNames.TruncateLength(mClampMaxLine);
+    }
+  }
+
+  void ExpandRepeatLineNamesForSubgrid(
+      const StyleGenericLineNameList<StyleInteger>& aStyleLineNameList) {
+    const auto& lineNameList = aStyleLineNameList.line_names.AsSpan();
+    const uint32_t maxCount = mClampMaxLine + 1;
+    const uint32_t end = lineNameList.Length();
+    for (uint32_t i = 0; i < end && mExpandedLineNames.Length() < maxCount;
+         ++i) {
+      const auto& item = lineNameList[i];
+      if (item.IsLineNames()) {
+        SmallPointerArray<const NameList> names;
+        names.AppendElement(&item.AsLineNames());
+        mExpandedLineNames.AppendElement(std::move(names));
+        continue;
+      }
+
+      MOZ_ASSERT(item.IsRepeat());
+      const auto& repeat = item.AsRepeat();
+      const auto repeatLineNames = repeat.line_names.AsSpan();
+
+      if (repeat.count.IsNumber()) {
+        for (uint32_t repeatCount = 0;
+             repeatCount < (uint32_t)repeat.count.AsNumber(); ++repeatCount) {
+          for (const NameList& lineNames : repeatLineNames) {
+            SmallPointerArray<const NameList> names;
+            names.AppendElement(&lineNames);
+            mExpandedLineNames.AppendElement(std::move(names));
+            if (mExpandedLineNames.Length() >= maxCount) {
+              break;
+            }
+          }
+        }
+        continue;
+      }
+
+      MOZ_ASSERT(repeat.count.IsAutoFill(),
+                 "RepeatCount of subgrid is number or auto-fill");
+
+      const size_t fillLen = repeatLineNames.Length();
+      const int32_t extraAutoFillLineCount =
+          mClampMaxLine -
+          (int32_t)aStyleLineNameList.expanded_line_names_length;
+      const uint32_t possibleRepeatLength =
+          std::max<int32_t>(0, extraAutoFillLineCount);
+      const uint32_t repeatRemainder = possibleRepeatLength % fillLen;
+
+      const size_t len = possibleRepeatLength - repeatRemainder;
+      for (size_t j = 0; j < len; ++j) {
+        SmallPointerArray<const NameList> names;
+        names.AppendElement(&repeatLineNames[j % fillLen]);
+        mExpandedLineNames.AppendElement(std::move(names));
+        if (mExpandedLineNames.Length() >= maxCount) {
+          break;
+        }
+      }
+    }
+
+    if (MOZ_UNLIKELY(mExpandedLineNames.Length() > uint32_t(mClampMaxLine))) {
+      mExpandedLineNames.TruncateLength(mClampMaxLine);
+    }
+  }
+
+  uint32_t FindNamedLine(nsAtom* aName, int32_t* aNth, uint32_t aFromIndex,
+                         const nsTArray<uint32_t>& aImplicitLines) const {
+    MOZ_ASSERT(aName);
+    MOZ_ASSERT(!aName->IsEmpty());
+    MOZ_ASSERT(aNth && *aNth != 0);
+    if (*aNth > 0) {
+      return FindLine(aName, aNth, aFromIndex, aImplicitLines);
+    }
+    int32_t nth = -*aNth;
+    int32_t line = RFindLine(aName, &nth, aFromIndex, aImplicitLines);
+    *aNth = -nth;
+    return line;
+  }
+
+  void FindNamedAreas(nsAtom* aName, LogicalSide aSide,
+                      nsTArray<uint32_t>& aImplicitLines) const {
+    bool sameDirectionAsThis = true;
+    uint32_t min = !mParentLineNameMap ? 1 : mClampMinLine;
+    uint32_t max = mClampMaxLine;
+    for (auto* map = this; true;) {
+      uint32_t line = map->FindNamedArea(aName, aSide, min, max);
+      if (line > 0) {
+        if (MOZ_LIKELY(sameDirectionAsThis)) {
+          line -= min - 1;
+        } else {
+          line = max - line + 1;
+        }
+        aImplicitLines.AppendElement(line);
+      }
+      auto* parent = map->mParentLineNameMap;
+      if (!parent) {
+        if (MOZ_UNLIKELY(aImplicitLines.Length() > 1)) {
+          aImplicitLines.Sort();
+          for (size_t i = 0; i < aImplicitLines.Length(); ++i) {
+            uint32_t prev = aImplicitLines[i];
+            auto j = i + 1;
+            const auto start = j;
+            while (j < aImplicitLines.Length() && aImplicitLines[j] == prev) {
+              ++j;
+            }
+            if (j != start) {
+              aImplicitLines.RemoveElementsAt(start, j - start);
+            }
+          }
+        }
+        return;
+      }
+      if (MOZ_UNLIKELY(!map->mIsSameDirection)) {
+        aSide = GetOppositeSide(aSide);
+        sameDirectionAsThis = !sameDirectionAsThis;
+      }
+      if (MOZ_UNLIKELY(map->mIsOrthogonal)) {
+        aSide =
+            MakeLogicalSide(GetOrthogonalAxis(GetAxis(aSide)), GetEdge(aSide));
+      }
+      min = map->TranslateToParentMap(min);
+      max = map->TranslateToParentMap(max);
+      if (min > max) {
+        MOZ_ASSERT(!map->mIsSameDirection);
+        std::swap(min, max);
+      }
+      map = parent;
+    }
+  }
+
+  bool HasImplicitNamedArea(nsAtom* aName) const {
+    const auto* map = this;
+    do {
+      if (map->mAreas && map->mAreas->has(aName)) {
+        return true;
+      }
+      map = map->mParentLineNameMap;
+    } while (map);
+    return false;
+  }
+
+  nsTArray<nsTArray<StyleCustomIdent>>
+  GetResolvedLineNamesForComputedGridTrackInfo() const {
+    nsTArray<nsTArray<StyleCustomIdent>> result;
+    for (auto& expandedLine : mExpandedLineNames) {
+      nsTArray<StyleCustomIdent> line;
+      for (auto* chunk : expandedLine) {
+        for (auto& name : chunk->AsSpan()) {
+          line.AppendElement(name);
+        }
+      }
+      result.AppendElement(std::move(line));
+    }
+    return result;
+  }
+
+  nsTArray<RefPtr<nsAtom>> GetExplicitLineNamesAtIndex(uint32_t aIndex) const {
+    nsTArray<RefPtr<nsAtom>> lineNames;
+    if (aIndex < mTemplateLinesEnd) {
+      const auto nameLists = GetLineNamesAt(aIndex);
+      for (const NameList* nameList : nameLists) {
+        for (const auto& name : nameList->AsSpan()) {
+          lineNames.AppendElement(name.AsAtom());
+        }
+      }
+    }
+    return lineNames;
+  }
+
+  const nsTArray<SmallPointerArray<const NameList>>& ExpandedLineNames() const {
+    return mExpandedLineNames;
+  }
+  const Span<const StyleOwnedSlice<StyleCustomIdent>>&
+  TrackAutoRepeatLineNames() const {
+    return mTrackAutoRepeatLineNames;
+  }
+  bool HasRepeatAuto() const { return mHasRepeatAuto; }
+  uint32_t NumRepeatTracks() const { return mRepeatAutoEnd - mRepeatAutoStart; }
+  uint32_t RepeatAutoStart() const { return mRepeatAutoStart; }
+
+  int32_t mClampMinLine;
+  int32_t mClampMaxLine;
+
+ private:
+  bool IsSubgridded() const { return mParentLineNameMap != nullptr; }
+
+  uint32_t FindLine(nsAtom* aName, int32_t* aNth, uint32_t aFromIndex,
+                    const nsTArray<uint32_t>& aImplicitLines) const {
+    MOZ_ASSERT(aNth && *aNth > 0);
+    int32_t nth = *aNth;
+    const uint32_t end = IsSubgridded() ? mClampMaxLine : mTemplateLinesEnd;
+    uint32_t line;
+    uint32_t i = aFromIndex;
+    for (; i < end; i = line) {
+      line = i + 1;
+      if (Contains(i, aName) || aImplicitLines.Contains(line)) {
+        if (--nth == 0) {
+          return line;
+        }
+      }
+    }
+    for (auto implicitLine : aImplicitLines) {
+      if (implicitLine > i) {
+        if (--nth == 0) {
+          return implicitLine;
+        }
+      }
+    }
+    MOZ_ASSERT(nth > 0, "should have returned a valid line above already");
+    *aNth = nth;
+    return 0;
+  }
+
+  uint32_t RFindLine(nsAtom* aName, int32_t* aNth, uint32_t aFromIndex,
+                     const nsTArray<uint32_t>& aImplicitLines) const {
+    MOZ_ASSERT(aNth && *aNth > 0);
+    if (MOZ_UNLIKELY(aFromIndex == 0)) {
+      return 0;  
+    }
+    --aFromIndex;  
+    int32_t nth = *aNth;
+    const uint32_t end = IsSubgridded() ? mClampMaxLine : mTemplateLinesEnd;
+    for (auto implicitLine : Reversed(aImplicitLines)) {
+      if (implicitLine <= end) {
+        break;
+      }
+      if (implicitLine < aFromIndex) {
+        if (--nth == 0) {
+          return implicitLine;
+        }
+      }
+    }
+    for (uint32_t i = std::min(aFromIndex, end); i; --i) {
+      if (Contains(i - 1, aName) || aImplicitLines.Contains(i)) {
+        if (--nth == 0) {
+          return i;
+        }
+      }
+    }
+    MOZ_ASSERT(nth > 0, "should have returned a valid line above already");
+    *aNth = nth;
+    return 0;
+  }
+
+  bool Contains(uint32_t aIndex, nsAtom* aName) const {
+    const auto* map = this;
+    while (true) {
+      if (aIndex < map->mTemplateLinesEnd && map->HasNameAt(aIndex, aName)) {
+        return true;
+      }
+      auto* parent = map->mParentLineNameMap;
+      if (!parent) {
+        return false;
+      }
+      uint32_t line = map->TranslateToParentMap(aIndex + 1);
+      MOZ_ASSERT(line >= 1, "expected a 1-based line number");
+      aIndex = line - 1;
+      map = parent;
+    }
+    MOZ_ASSERT_UNREACHABLE("we always return from inside the loop above");
+  }
+
+  static bool Contains(Span<const StyleCustomIdent> aNames, nsAtom* aName) {
+    for (auto& name : aNames) {
+      if (name.AsAtom() == aName) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool HasNameAt(const uint32_t aIndex, nsAtom* const aName) const {
+    const auto nameLists = GetLineNamesAt(aIndex);
+    for (const NameList* nameList : nameLists) {
+      if (Contains(nameList->AsSpan(), aName)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  SmallPointerArray<const NameList> GetLineNamesAt(
+      const uint32_t aIndex) const {
+    SmallPointerArray<const NameList> names;
+    uint32_t repeatAdjustedIndex = aIndex;
+    if (mHasRepeatAuto) {
+      const uint32_t maxRepeatLine = mTrackAutoRepeatLineNames.Length() - 1;
+      if (aIndex > mRepeatAutoStart && aIndex < mRepeatAutoEnd) {
+        const uint32_t repeatIndex =
+            (aIndex - mRepeatAutoStart) % maxRepeatLine;
+        if (repeatIndex == 0) {
+          names.AppendElement(&mTrackAutoRepeatLineNames[maxRepeatLine]);
+        }
+        names.AppendElement(&mTrackAutoRepeatLineNames[repeatIndex]);
+        return names;
+      }
+      if (aIndex != mRepeatAutoStart && aIndex >= mRepeatAutoEnd) {
+        repeatAdjustedIndex -= mRepeatEndDelta;
+        repeatAdjustedIndex += mTrackAutoRepeatLineNames.Length() - 2;
+      }
+    }
+    MOZ_ASSERT(repeatAdjustedIndex < mExpandedLineNames.Length(),
+               "Incorrect repeatedAdjustedIndex");
+    MOZ_ASSERT(names.IsEmpty());
+    const auto& nameLists = mExpandedLineNames[repeatAdjustedIndex];
+    for (const NameList* nameList : nameLists) {
+      names.AppendElement(nameList);
+    }
+    return names;
+  }
+
+  uint32_t TranslateToParentMap(uint32_t aLine) const {
+    if (MOZ_LIKELY(mIsSameDirection)) {
+      return aLine + mRange->mStart;
+    }
+    MOZ_ASSERT(mRange->mEnd + 1 >= aLine);
+    return mRange->mEnd - (aLine - 1) + 1;
+  }
+
+  uint32_t FindNamedArea(nsAtom* aName, LogicalSide aSide, int32_t aMin,
+                         int32_t aMax) const {
+    if (const NamedArea* area = FindNamedArea(aName)) {
+      int32_t start = IsBlock(aSide) ? area->rows.start : area->columns.start;
+      int32_t end = IsBlock(aSide) ? area->rows.end : area->columns.end;
+      if (IsStart(aSide)) {
+        if (start >= aMin) {
+          if (start <= aMax) {
+            return start;
+          }
+        } else if (end >= aMin) {
+          return aMin;
+        }
+      } else {
+        if (end <= aMax) {
+          if (end >= aMin) {
+            return end;
+          }
+        } else if (start <= aMax) {
+          return aMax;
+        }
+      }
+    }
+    return 0;  
+  }
+
+  const NamedArea* FindNamedArea(nsAtom* aName) const {
+    if (mStylePosition->mGridTemplateAreas.IsNone()) {
+      return nullptr;
+    }
+    const auto areas = mStylePosition->mGridTemplateAreas.AsAreas();
+    for (const NamedArea& area : areas->areas.AsSpan()) {
+      if (area.name.AsAtom() == aName) {
+        return &area;
+      }
+    }
+    return nullptr;
+  }
+
+  const nsStylePosition* mStylePosition;
+  const ImplicitNamedAreas* mAreas;
+  nsTArray<SmallPointerArray<const NameList>> mExpandedLineNames;
+  Span<const StyleOwnedSlice<StyleCustomIdent>> mTrackAutoRepeatLineNames;
+  uint32_t mRepeatAutoStart;
+  uint32_t mRepeatAutoEnd;
+  int32_t mRepeatEndDelta;
+  uint32_t mTemplateLinesEnd;
+
+  const LineNameMap* mParentLineNameMap;
+  const LineRange* mRange;
+  const bool mIsSameDirection;
+  const bool mIsOrthogonal;
+
+  bool mHasRepeatAuto;
+};
+
+struct CachedIntrinsicSizes;
+
+struct nsGridContainerFrame::Tracks {
+  explicit Tracks(LogicalAxis aAxis)
+      : mContentBoxSize(NS_UNCONSTRAINEDSIZE),
+        mGridGap(NS_UNCONSTRAINEDSIZE),
+        mStateUnion(TrackSize::StateBits::eNone),
+        mAxis(aAxis),
+        mCanResolveLineRangeSize(false),
+        mIsMasonry(false) {
+    mBaselineSubtreeAlign[BaselineSharingGroup::First] = StyleAlignFlags::AUTO;
+    mBaselineSubtreeAlign[BaselineSharingGroup::Last] = StyleAlignFlags::AUTO;
+  }
+
+  void Initialize(const TrackSizingFunctions& aFunctions,
+                  const NonNegativeLengthPercentageOrNormal& aGridGap,
+                  uint32_t aNumTracks, nscoord aContentBoxSize);
+
+  TrackSize::StateBits StateBitsForRange(const LineRange& aRange) const;
+
+  struct ItemBaselineData {
+    uint32_t mBaselineTrack;
+    nscoord mBaseline;
+    nscoord mSize;
+    GridItemInfo* mGridItem;
+    static bool IsBaselineTrackLessThan(const ItemBaselineData& a,
+                                        const ItemBaselineData& b) {
+      return a.mBaselineTrack < b.mBaselineTrack;
+    }
+  };
+
+  void CalculateItemBaselines(nsTArray<ItemBaselineData>& aBaselineItems,
+                              BaselineSharingGroup aBaselineGroup);
+
+  void InitializeItemBaselines(GridReflowInput& aGridRI,
+                               nsTArray<GridItemInfo>& aGridItems);
+
+  struct BaselineAlignmentSet {
+    bool MatchTrackAlignment(StyleAlignFlags aTrackAlignment) const {
+      if (mTrackAlignmentSet == BaselineAlignmentSet::StartStretch) {
+        return aTrackAlignment == StyleAlignFlags::START ||
+               (aTrackAlignment == StyleAlignFlags::STRETCH &&
+                mItemSet == BaselineAlignmentSet::FirstItems);
+      }
+      return aTrackAlignment == StyleAlignFlags::END ||
+             (aTrackAlignment == StyleAlignFlags::STRETCH &&
+              mItemSet == BaselineAlignmentSet::LastItems);
+    }
+
+    enum ItemSet { FirstItems, LastItems };
+    ItemSet mItemSet = FirstItems;
+    enum TrackAlignmentSet { StartStretch, EndStretch };
+    TrackAlignmentSet mTrackAlignmentSet = StartStretch;
+  };
+  void InitializeItemBaselinesInMasonryAxis(
+      GridReflowInput& aGridRI, nsTArray<GridItemInfo>& aGridItems,
+      BaselineAlignmentSet aSet, const nsSize& aContainerSize,
+      nsTArray<nscoord>& aTrackSizes,
+      nsTArray<ItemBaselineData>& aFirstBaselineItems,
+      nsTArray<ItemBaselineData>& aLastBaselineItems);
+
+  void AlignBaselineSubtree(const GridItemInfo& aGridItem) const;
+
+  static TrackSize::StateBits SelectorForPhase(TrackSizingPhase aPhase,
+                                               SizingConstraint aConstraint) {
+    switch (aPhase) {
+      case TrackSizingPhase::IntrinsicMinimums:
+        return TrackSize::eIntrinsicMinSizing;
+      case TrackSizingPhase::ContentBasedMinimums:
+        return aConstraint == SizingConstraint::MinContent
+                   ? TrackSize::eIntrinsicMinSizing
+                   : TrackSize::eMinOrMaxContentMinSizing;
+      case TrackSizingPhase::MaxContentMinimums:
+        return aConstraint == SizingConstraint::MaxContent
+                   ? (TrackSize::eMaxContentMinSizing |
+                      TrackSize::eAutoMinSizing)
+                   : TrackSize::eMaxContentMinSizing;
+      case TrackSizingPhase::IntrinsicMaximums:
+        return TrackSize::eIntrinsicMaxSizing;
+      case TrackSizingPhase::MaxContentMaximums:
+        return TrackSize::eAutoOrMaxContentMaxSizing;
+    }
+    MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Unexpected phase");
+  }
+
+  struct SpanningItemData final {
+    uint32_t mSpan;
+    TrackSize::StateBits mState;
+    LineRange mLineRange;
+    EnumeratedArray<GridIntrinsicSizeType, nscoord> mSizes;
+    nsIFrame* mFrame;
+
+    static bool IsSpanLessThan(const SpanningItemData& a,
+                               const SpanningItemData& b) {
+      return a.mSpan < b.mSpan;
+    }
+
+    nscoord SizeContributionForPhase(TrackSizingPhase aPhase) const {
+      return mSizes[SizeTypeForPhase(aPhase)];
+    }
+
+#ifdef DEBUG
+    void Dump() const {
+      printf(
+          "SpanningItemData { mSpan: %d, mState: %d, mLineRange: (%d, %d), "
+          "mSizes: {MinContribution: %d, MinContentContribution: %d, "
+          "MaxContentContribution: %d}, mFrame: %p\n",
+          mSpan, mState, mLineRange.mStart, mLineRange.mEnd,
+          mSizes[GridIntrinsicSizeType::MinContribution],
+          mSizes[GridIntrinsicSizeType::MinContentContribution],
+          mSizes[GridIntrinsicSizeType::MaxContentContribution], mFrame);
+    }
+#endif
+  };
+
+  using FitContentClamper =
+      std::function<bool(uint32_t aTrack, nscoord aMinSize, nscoord* aSize)>;
+
+  bool GrowSizeForSpanningItems(
+      TrackSizingStep aStep, TrackSizingPhase aPhase,
+      nsTArray<SpanningItemData>::iterator aIter,
+      nsTArray<SpanningItemData>::iterator aIterEnd,
+      nsTArray<uint32_t>& aTracks, TrackPlan& aTrackPlan, ItemPlan& aItemPlan,
+      SizingConstraint aConstraint, bool aIsGridIntrinsicSizing,
+      const TrackSizingFunctions& aFunctions,
+      const FitContentClamper& aFitContentClamper = nullptr,
+      bool aNeedInfinitelyGrowableFlag = false);
+
+  Maybe<nscoord> ComputeMinSizeClamp(const TrackSizingFunctions& aFunctions,
+                                     nscoord aPercentageBasis,
+                                     const LineRange& aLineRange) const {
+    return ComputeMinSizeClamp(aFunctions, aPercentageBasis, aLineRange,
+                               StateBitsForRange(aLineRange));
+  }
+
+  Maybe<nscoord> ComputeMinSizeClamp(const TrackSizingFunctions& aFunctions,
+                                     nscoord aPercentageBasis,
+                                     const LineRange& aLineRange,
+                                     const TrackSize::StateBits aState) const;
+
+  void ResolveIntrinsicSize(GridReflowInput& aGridRI,
+                            nsTArray<GridItemInfo>& aGridItems,
+                            const TrackSizingFunctions& aFunctions,
+                            LineRange GridArea::* aRange,
+                            nscoord aPercentageBasis,
+                            SizingConstraint aConstraint);
+
+  void ResolveIntrinsicSizeForNonSpanningItems(
+      GridReflowInput& aGridRI, const TrackSizingFunctions& aFunctions,
+      nscoord aPercentageBasis, SizingConstraint aConstraint,
+      const LineRange& aRange, const GridItemInfo& aGridItem);
+
+  static nscoord StartSizeInDistribution(TrackSizingPhase aPhase,
+                                         const TrackSize& aSize) {
+    switch (aPhase) {
+      case TrackSizingPhase::IntrinsicMinimums:
+      case TrackSizingPhase::ContentBasedMinimums:
+      case TrackSizingPhase::MaxContentMinimums:
+        return aSize.mBase;
+      case TrackSizingPhase::IntrinsicMaximums:
+      case TrackSizingPhase::MaxContentMaximums:
+        if (aSize.mLimit == NS_UNCONSTRAINEDSIZE) {
+          return aSize.mBase;
+        }
+        return aSize.mLimit;
+    }
+    MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Unexpected phase");
+  }
+
+  nscoord CollectGrowable(TrackSizingStep aStep, TrackSizingPhase aPhase,
+                          nscoord aAvailableSpace, const LineRange& aRange,
+                          SizingConstraint aConstraint,
+                          nsTArray<uint32_t>& aGrowableTracks) const {
+    MOZ_ASSERT(aAvailableSpace > 0, "why call me?");
+    nscoord space = aAvailableSpace - mGridGap * (aRange.Extent() - 1);
+    const TrackSize::StateBits selector = SelectorForPhase(aPhase, aConstraint);
+    for (auto i : aRange.Range()) {
+      const TrackSize& sz = mSizes[i];
+      space -= StartSizeInDistribution(aPhase, sz);
+      if (space <= 0) {
+        return 0;
+      }
+      if (aStep == TrackSizingStep::Flex &&
+          !(sz.mState & TrackSize::eFlexMaxSizing)) {
+        continue;
+      }
+      if (sz.mState & selector) {
+        aGrowableTracks.AppendElement(i);
+      }
+    }
+    return aGrowableTracks.IsEmpty() ? 0 : space;
+  }
+
+  void CopyPlanToSize(TrackSizingPhase aPhase, const TrackPlan& aTrackPlan,
+                      bool aNeedInfinitelyGrowableFlag) {
+    MOZ_ASSERT(aTrackPlan.Length() == mSizes.Length());
+    auto plan = aTrackPlan.begin();
+    auto sz = mSizes.begin();
+    for (; plan != aTrackPlan.end() && sz != mSizes.end(); plan++, sz++) {
+      MOZ_ASSERT(plan->mBase >= 0);
+      switch (aPhase) {
+        case TrackSizingPhase::IntrinsicMinimums:
+        case TrackSizingPhase::ContentBasedMinimums:
+        case TrackSizingPhase::MaxContentMinimums:
+          sz->mBase = plan->mBase;
+          break;
+        case TrackSizingPhase::IntrinsicMaximums:
+          if (plan->mState & TrackSize::eModified) {
+            if (sz->mLimit == NS_UNCONSTRAINEDSIZE &&
+                aNeedInfinitelyGrowableFlag) {
+              sz->mState |= TrackSize::eInfinitelyGrowable;
+            }
+            sz->mLimit = plan->mBase;
+          }
+          break;
+        case TrackSizingPhase::MaxContentMaximums:
+          if (plan->mState & TrackSize::eModified) {
+            sz->mLimit = plan->mBase;
+          }
+          sz->mState &= ~TrackSize::eInfinitelyGrowable;
+          break;
+      }
+    }
+  }
+
+  void DistributeToTrackSizes(
+      TrackSizingStep aStep, TrackSizingPhase aPhase, nscoord aAvailableSpace,
+      TrackPlan& aTrackPlan, ItemPlan& aItemPlan,
+      const nsTArray<uint32_t>& aGrowableTracks, SizingConstraint aConstraint,
+      const TrackSizingFunctions& aFunctions,
+      const FitContentClamper& aFitContentClamper) const {
+    aItemPlan.Initialize(aPhase, aGrowableTracks, *this);
+    nscoord space = aAvailableSpace;
+    if (aStep == TrackSizingStep::Flex) {
+      space = aTrackPlan.DistributeToFlexTrackSizes(space, aGrowableTracks,
+                                                    aFunctions, *this);
+    } else {
+      space = aItemPlan.GrowTracksToLimit(space, aGrowableTracks,
+                                          aFitContentClamper);
+    }
+
+    if (space > 0) {
+      uint32_t numGrowable =
+          aItemPlan.MarkExcludedTracks(aPhase, aGrowableTracks, aConstraint);
+      aItemPlan.GrowSelectedTracksUnlimited(space, aGrowableTracks, numGrowable,
+                                            aFitContentClamper);
+    }
+
+    for (uint32_t track : aGrowableTracks) {
+      nscoord& plannedSize = aTrackPlan[track].mBase;
+      nscoord itemIncurredSize = aItemPlan[track].mBase;
+      if (plannedSize < itemIncurredSize) {
+        plannedSize = itemIncurredSize;
+      }
+    }
+  }
+
+  void DistributeFreeSpace(nscoord aAvailableSize) {
+    const uint32_t numTracks = mSizes.Length();
+    if (MOZ_UNLIKELY(numTracks == 0 || aAvailableSize <= 0)) {
+      return;
+    }
+    if (aAvailableSize == NS_UNCONSTRAINEDSIZE) {
+      for (TrackSize& sz : mSizes) {
+        sz.mBase = sz.mLimit;
+      }
+    } else {
+      nscoord space = aAvailableSize;
+      uint32_t numGrowable = numTracks;
+      for (const TrackSize& sz : mSizes) {
+        space -= sz.mBase;
+        MOZ_ASSERT(sz.mBase <= sz.mLimit);
+        if (sz.mBase == sz.mLimit) {
+          --numGrowable;
+        }
+      }
+      while (space > 0 && numGrowable) {
+        nscoord spacePerTrack = std::max<nscoord>(space / numGrowable, 1);
+        for (TrackSize& sz : mSizes) {
+          if (sz.mBase == sz.mLimit) {
+            continue;
+          }
+          nscoord newBase = sz.mBase + spacePerTrack;
+          if (newBase >= sz.mLimit) {
+            space -= sz.mLimit - sz.mBase;
+            sz.mBase = sz.mLimit;
+            --numGrowable;
+          } else {
+            space -= spacePerTrack;
+            sz.mBase = newBase;
+          }
+          if (space <= 0) {
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  float FindFrUnitSize(const LineRange& aRange,
+                       const nsTArray<uint32_t>& aFlexTracks,
+                       const TrackSizingFunctions& aFunctions,
+                       nscoord aSpaceToFill) const;
+
+  float FindUsedFlexFraction(GridReflowInput& aGridRI,
+                             const nsTArray<GridItemInfo>& aGridItems,
+                             const nsTArray<uint32_t>& aFlexTracks,
+                             const TrackSizingFunctions& aFunctions,
+                             nscoord aAvailableSize) const;
+
+  void StretchFlexibleTracks(GridReflowInput& aGridRI,
+                             const nsTArray<GridItemInfo>& aGridItems,
+                             const TrackSizingFunctions& aFunctions,
+                             nscoord aAvailableSize);
+
+  void CalculateSizes(GridReflowInput& aGridRI,
+                      nsTArray<GridItemInfo>& aGridItems,
+                      const TrackSizingFunctions& aFunctions,
+                      nscoord aContentBoxSize, LineRange GridArea::* aRange,
+                      SizingConstraint aConstraint);
+
+  void AlignJustifyContent(const nsStylePosition* aStyle,
+                           StyleContentDistribution aAligmentStyleValue,
+                           WritingMode aWM, nscoord aContentBoxSize,
+                           bool aIsSubgridded);
+
+  nscoord TotalTrackSizeWithoutAlignment(
+      const nsGridContainerFrame* aGridContainerFrame) const;
+
+  nscoord GridLineEdge(uint32_t aLine, GridLineSide aSide) const {
+    if (MOZ_UNLIKELY(mSizes.IsEmpty())) {
+      MOZ_ASSERT(aLine == 0, "We should only resolve line 1 in an empty grid");
+      return nscoord(0);
+    }
+    MOZ_ASSERT(aLine <= mSizes.Length(), "mSizes is too small");
+    if (aSide == GridLineSide::BeforeGridGap) {
+      if (aLine == 0) {
+        return nscoord(0);
+      }
+      const TrackSize& sz = mSizes[aLine - 1];
+      return sz.mPosition + sz.mBase;
+    }
+    if (aLine == mSizes.Length()) {
+      return mContentBoxSize;
+    }
+    return mSizes[aLine].mPosition;
+  }
+
+  nscoord SumOfGridTracksAndGaps() const {
+    return SumOfGridTracks() + SumOfGridGaps();
+  }
+
+  nscoord SumOfGridTracks() const {
+    nscoord result = 0;
+    for (const TrackSize& size : mSizes) {
+      result += size.mBase;
+    }
+    return result;
+  }
+
+  nscoord SumOfGridGaps() const {
+    auto len = mSizes.Length();
+    return MOZ_LIKELY(len > 1) ? (len - 1) * mGridGap : 0;
+  }
+
+  void BreakBeforeRow(uint32_t aRow) {
+    MOZ_ASSERT(mAxis == LogicalAxis::Block,
+               "Should only be fragmenting in the block axis (between rows)");
+    nscoord prevRowEndPos = 0;
+    if (aRow != 0) {
+      auto& prevSz = mSizes[aRow - 1];
+      prevRowEndPos = prevSz.mPosition + prevSz.mBase;
+    }
+    auto& sz = mSizes[aRow];
+    const nscoord gap = sz.mPosition - prevRowEndPos;
+    sz.mState |= TrackSize::eBreakBefore;
+    if (gap != 0) {
+      for (uint32_t i = aRow, len = mSizes.Length(); i < len; ++i) {
+        mSizes[i].mPosition -= gap;
+      }
+    }
+  }
+
+  void ResizeRow(uint32_t aRow, nscoord aNewSize) {
+    MOZ_ASSERT(mAxis == LogicalAxis::Block,
+               "Should only be fragmenting in the block axis (between rows)");
+    MOZ_ASSERT(aNewSize >= 0);
+    auto& sz = mSizes[aRow];
+    nscoord delta = aNewSize - sz.mBase;
+    NS_WARNING_ASSERTION(delta != nscoord(0), "Useless call to ResizeRow");
+    sz.mBase = aNewSize;
+    const uint32_t numRows = mSizes.Length();
+    for (uint32_t r = aRow + 1; r < numRows; ++r) {
+      mSizes[r].mPosition += delta;
+    }
+  }
+
+  nscoord ResolveSize(const LineRange& aRange) const {
+    MOZ_ASSERT(mCanResolveLineRangeSize);
+    MOZ_ASSERT(aRange.Extent() > 0, "grid items cover at least one track");
+    return aRange.ToLength(mSizes);
+  }
+
+  Maybe<nscoord> GetBaseline(uint32_t aTrack,
+                             BaselineSharingGroup aBaselineSharingGroup) const {
+    if (aTrack >= mBaselines.Length()) {
+      return {};
+    }
+
+    const auto& trackBaselines = mBaselines[aTrack];
+    if (auto b = trackBaselines[aBaselineSharingGroup]) {
+      return b;
+    }
+    if (auto b = trackBaselines[GetOppositeBaselineSharingGroup(
+            aBaselineSharingGroup)]) {
+      return Some(mSizes[aTrack].mBase - *b);
+    }
+
+    return {};
+  }
+
+#ifdef DEBUG
+  void Dump() const;
+#endif
+
+  TrackPlan mSizes;
+  nscoord mContentBoxSize;
+  nscoord mGridGap;
+
+  CopyableTArray<PerBaseline<Maybe<nscoord>>> mBaselines;
+
+  TrackSize::StateBits mStateUnion;
+  LogicalAxis mAxis;
+  PerBaseline<StyleAlignFlags> mBaselineSubtreeAlign;
+  bool mCanResolveLineRangeSize;
+  bool mIsMasonry;
+};
+
+#ifdef DEBUG
+void nsGridContainerFrame::Tracks::Dump() const {
+  const size_t numTracks = mSizes.Length();
+  const char* trackName = mAxis == LogicalAxis::Inline ? "column" : "row";
+
+  auto BaselineToStr = [](Maybe<nscoord> aBaseline) {
+    if (!aBaseline) {
+      return std::string("not set");
+    }
+
+    return std::to_string(*aBaseline);
+  };
+
+  auto CoordToStr = [](nscoord aCoord) {
+    return aCoord == NS_UNCONSTRAINEDSIZE ? std::string("unconstrained")
+                                          : std::to_string(aCoord);
+  };
+
+  fmt::print("{} {} {}{}, track union bits: ", numTracks,
+             mIsMasonry ? "masonry" : "grid", trackName,
+             numTracks > 1 ? "s" : "");
+  TrackSize::DumpStateBits(mStateUnion);
+  printf("\n");
+
+  for (uint32_t i = 0; i < numTracks; ++i) {
+    fmt::print("  {} {}: ", trackName, i);
+    mSizes[i].Dump();
+    printf("\n");
+  }
+
+  fmt::println("  first baseline: {}, last baseline: {}",
+               BaselineToStr(GetBaseline(0, BaselineSharingGroup::First)),
+               BaselineToStr(GetBaseline(mBaselines.Length() - 1,
+                                         BaselineSharingGroup::Last)));
+  fmt::println("  {} gap: {}, content-box {}-size: {}", trackName,
+               CoordToStr(mGridGap),
+               mAxis == LogicalAxis::Inline ? "inline" : "block",
+               CoordToStr(mContentBoxSize));
+}
+#endif
+
+struct nsGridContainerFrame::SharedGridData {
+  SharedGridData()
+      : mCols(LogicalAxis::Inline),
+        mRows(LogicalAxis::Block),
+        mGenerateComputedGridInfo(false) {}
+  Tracks mCols;
+  Tracks mRows;
+  struct RowData {
+    nscoord mBase;  
+    nscoord mGap;   
+  };
+  nsTArray<RowData> mOriginalRowData;
+  nsTArray<GridItemInfo> mGridItems;
+  nsTArray<GridItemInfo> mAbsPosItems;
+  bool mGenerateComputedGridInfo;
+
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(Prop, SharedGridData)
+};
+
+struct MOZ_STACK_CLASS nsGridContainerFrame::GridReflowInput {
+  GridReflowInput(nsGridContainerFrame* aFrame, const ReflowInput& aRI)
+      : GridReflowInput(aFrame, *aRI.mRenderingContext, &aRI,
+                        aRI.mStylePosition, aRI.GetWritingMode()) {}
+  GridReflowInput(nsGridContainerFrame* aFrame, gfxContext& aRC)
+      : GridReflowInput(aFrame, aRC, nullptr, aFrame->StylePosition(),
+                        aFrame->GetWritingMode()) {}
+
+  void InitializeForContinuation(nsGridContainerFrame* aGridContainerFrame,
+                                 nscoord aConsumedBSize) {
+    MOZ_ASSERT(aGridContainerFrame->GetPrevInFlow(),
+               "don't call this on the first-in-flow");
+    MOZ_ASSERT(mGridItems.IsEmpty() && mAbsPosItems.IsEmpty(),
+               "shouldn't have any item data yet");
+
+    uint32_t fragment = 0;
+    nsIFrame* firstInFlow = aGridContainerFrame;
+    for (auto pif = aGridContainerFrame->GetPrevInFlow(); pif;
+         pif = pif->GetPrevInFlow()) {
+      ++fragment;
+      firstInFlow = pif;
+    }
+    mSharedGridData = firstInFlow->GetProperty(SharedGridData::Prop());
+    MOZ_ASSERT(mSharedGridData, "first-in-flow must have SharedGridData");
+
+    auto& rowSizes = mSharedGridData->mRows.mSizes;
+    const uint32_t numRows = rowSizes.Length();
+    mStartRow = numRows;
+    for (uint32_t row = 0, breakCount = 0; row < numRows; ++row) {
+      if (rowSizes[row].mState & TrackSize::eBreakBefore) {
+        if (fragment == ++breakCount) {
+          mStartRow = row;
+          mFragBStart = rowSizes[row].mPosition;
+          const auto& origRowData = mSharedGridData->mOriginalRowData;
+          rowSizes[row].mBase = origRowData[row].mBase;
+          nscoord prevEndPos = rowSizes[row].mPosition + rowSizes[row].mBase;
+          while (++row < numRows) {
+            auto& sz = rowSizes[row];
+            const auto& orig = origRowData[row];
+            sz.mPosition = prevEndPos + orig.mGap;
+            sz.mBase = orig.mBase;
+            sz.mState &= ~TrackSize::eBreakBefore;
+            prevEndPos = sz.mPosition + sz.mBase;
+          }
+          break;
+        }
+      }
+    }
+    if (mStartRow == numRows || aGridContainerFrame->IsRowMasonry()) {
+      mFragBStart = aConsumedBSize;
+    }
+
+    mCols = mSharedGridData->mCols;
+    mRows = mSharedGridData->mRows;
+
+    if (firstInFlow->GetProperty(UsedTrackSizes::Prop())) {
+      auto* prop = aGridContainerFrame->GetOrCreateDeletableProperty(
+          UsedTrackSizes::Prop());
+      prop->mCanResolveLineRangeSize = {true, true};
+      prop->mTrackPlans[LogicalAxis::Inline].Assign(mCols.mSizes);
+      prop->mTrackPlans[LogicalAxis::Block].Assign(mRows.mSizes);
+    }
+
+    mIter.Reset();
+    for (; !mIter.AtEnd(); mIter.Next()) {
+      nsIFrame* child = *mIter;
+      nsIFrame* childFirstInFlow = child->FirstInFlow();
+      DebugOnly<size_t> len = mGridItems.Length();
+      for (auto& itemInfo : mSharedGridData->mGridItems) {
+        if (itemInfo.mFrame == childFirstInFlow) {
+          auto item =
+              mGridItems.AppendElement(GridItemInfo(child, itemInfo.mArea));
+          item->mState[LogicalAxis::Block] |=
+              itemInfo.mState[LogicalAxis::Block] & ItemState::eAllBaselineBits;
+          item->mState[LogicalAxis::Inline] |=
+              itemInfo.mState[LogicalAxis::Inline] &
+              ItemState::eAllBaselineBits;
+          item->mBaselineOffset[LogicalAxis::Block] =
+              itemInfo.mBaselineOffset[LogicalAxis::Block];
+          item->mBaselineOffset[LogicalAxis::Inline] =
+              itemInfo.mBaselineOffset[LogicalAxis::Inline];
+          item->mState[LogicalAxis::Block] |=
+              itemInfo.mState[LogicalAxis::Block] & ItemState::eAutoPlacement;
+          item->mState[LogicalAxis::Inline] |=
+              itemInfo.mState[LogicalAxis::Inline] & ItemState::eAutoPlacement;
+          break;
+        }
+      }
+      MOZ_ASSERT(mGridItems.Length() == len + 1, "can't find GridItemInfo");
+    }
+
+    if (auto* absCB = aGridContainerFrame->GetAbsoluteContainingBlock()) {
+      absCB->PrepareAbsoluteFrames(aGridContainerFrame);
+    }
+    const nsFrameList& absPosChildren =
+        aGridContainerFrame->GetChildList(FrameChildListID::Absolute);
+    for (auto f : absPosChildren) {
+      nsIFrame* childFirstInFlow = f->FirstInFlow();
+      DebugOnly<size_t> len = mAbsPosItems.Length();
+      for (auto& itemInfo : mSharedGridData->mAbsPosItems) {
+        if (itemInfo.mFrame == childFirstInFlow) {
+          mAbsPosItems.AppendElement(GridItemInfo(f, itemInfo.mArea));
+          break;
+        }
+      }
+      MOZ_ASSERT(mAbsPosItems.Length() == len + 1, "can't find GridItemInfo");
+    }
+
+    if (mSharedGridData->mGenerateComputedGridInfo) {
+      aGridContainerFrame->AddStateBits(NS_STATE_GRID_COMPUTED_INFO);
+    }
+  }
+
+  void CalculateTrackSizesForAxis(LogicalAxis aAxis, const Grid& aGrid,
+                                  nscoord aCBSize,
+                                  SizingConstraint aConstraint);
+
+  void InvalidateTrackSizesForAxis(LogicalAxis aAxis);
+
+  LogicalSize PercentageBasisFor(LogicalAxis aAxis,
+                                 const GridItemInfo& aGridItem) const;
+
+  LogicalRect ContainingBlockFor(const GridArea& aArea) const;
+
+  LogicalRect ContainingBlockForAbsPos(const GridArea& aArea,
+                                       const LogicalPoint& aGridOrigin,
+                                       const LogicalRect& aGridCB) const;
+
+  void AlignJustifyContentInMasonryAxis(nscoord aMasonryBoxSize,
+                                        nscoord aContentBoxSize);
+  void AlignJustifyTracksInMasonryAxis(const LogicalSize& aContentSize,
+                                       const nsSize& aContainerSize);
+
+  static void CollectSubgridItemsForAxisHelper(
+      LogicalAxis aAxis, WritingMode aContainerWM,
+      const LineRange& aRangeInAxis, const LineRange& aRangeInOppositeAxis,
+      const GridItemInfo& aItem, const nsTArray<GridItemInfo>& aItems,
+      nsTArray<GridItemInfo>& aResult) {
+    const auto oppositeAxis = GetOrthogonalAxis(aAxis);
+    bool itemIsSubgridInOppositeAxis = aItem.IsSubgrid(oppositeAxis);
+    auto subgridWM = aItem.mFrame->GetWritingMode();
+    bool isOrthogonal = subgridWM.IsOrthogonalTo(aContainerWM);
+    bool isSameDirInAxis =
+        subgridWM.ParallelAxisStartsOnSameSide(aAxis, aContainerWM);
+    bool isSameDirInOppositeAxis =
+        subgridWM.ParallelAxisStartsOnSameSide(oppositeAxis, aContainerWM);
+    if (isOrthogonal) {
+      std::swap(isSameDirInAxis, isSameDirInOppositeAxis);
+    }
+    uint32_t offsetInAxis = aRangeInAxis.mStart;
+    uint32_t gridEndInAxis = aRangeInAxis.Extent();
+    uint32_t offsetInOppositeAxis = aRangeInOppositeAxis.mStart;
+    uint32_t gridEndInOppositeAxis = aRangeInOppositeAxis.Extent();
+    for (const auto& subgridItem : aItems) {
+      auto newItem = aResult.AppendElement(
+          isOrthogonal ? subgridItem.Transpose() : subgridItem);
+      if (MOZ_UNLIKELY(!isSameDirInAxis)) {
+        newItem->ReverseDirection(aAxis, gridEndInAxis);
+      }
+      newItem->mArea.LineRangeForAxis(aAxis).Translate(offsetInAxis);
+      if (itemIsSubgridInOppositeAxis) {
+        if (MOZ_UNLIKELY(!isSameDirInOppositeAxis)) {
+          newItem->ReverseDirection(oppositeAxis, gridEndInOppositeAxis);
+        }
+        LineRange& range = newItem->mArea.LineRangeForAxis(oppositeAxis);
+        range.Translate(offsetInOppositeAxis);
+      }
+      if (newItem->IsSubgrid(aAxis)) {
+        auto* subgrid =
+            subgridItem.SubgridFrame()->GetProperty(Subgrid::Prop());
+        CollectSubgridItemsForAxisHelper(
+            aAxis, aContainerWM, newItem->mArea.LineRangeForAxis(aAxis),
+            newItem->mArea.LineRangeForAxis(oppositeAxis), *newItem,
+            subgrid->mGridItems, aResult);
+      }
+    }
+  }
+
+  void CollectSubgridItemsForAxis(LogicalAxis aAxis,
+                                  nsTArray<GridItemInfo>& aResult) const {
+    for (const auto& item : mGridItems) {
+      if (item.IsSubgrid(aAxis)) {
+        const auto oppositeAxis = GetOrthogonalAxis(aAxis);
+        auto* subgrid = item.SubgridFrame()->GetProperty(Subgrid::Prop());
+        CollectSubgridItemsForAxisHelper(
+            aAxis, mWM, item.mArea.LineRangeForAxis(aAxis),
+            item.mArea.LineRangeForAxis(oppositeAxis), item,
+            subgrid->mGridItems, aResult);
+      }
+    }
+  }
+
+  static void CopyBaselineMetricsToSubgridItemsHelper(
+      LogicalAxis aAxis, WritingMode aContainerWM, nsIFrame* aSubgridFrame,
+      const nsTArray<GridItemInfo>& aContainerGridItems,
+      size_t& aContainerGridItemsIdx) {
+    Subgrid* subgridProp = aSubgridFrame->GetProperty(Subgrid::Prop());
+    nsTArray<GridItemInfo>& subgridItems = subgridProp->mGridItems;
+
+    auto subgridWM = aSubgridFrame->GetWritingMode();
+    bool isOrthogonal = subgridWM.IsOrthogonalTo(aContainerWM);
+    LogicalAxis subgridAxis = isOrthogonal ? GetOrthogonalAxis(aAxis) : aAxis;
+
+    for (auto& subgridItem : subgridItems) {
+      if (MOZ_UNLIKELY(aContainerGridItemsIdx >=
+                       aContainerGridItems.Length())) {
+        MOZ_ASSERT_UNREACHABLE("Out-of-bounds aContainerGridItemsIdx");
+        return;
+      }
+      const auto& itemFromContainer =
+          aContainerGridItems[aContainerGridItemsIdx];
+      aContainerGridItemsIdx++;
+
+      if (MOZ_UNLIKELY(subgridItem.mFrame != itemFromContainer.mFrame)) {
+        MOZ_ASSERT_UNREACHABLE("Found unexpected frame during traversal");
+        return;
+      }
+
+      const auto baselineStateBits =
+          itemFromContainer.mState[aAxis] & ItemState::eAllBaselineBits;
+
+      if (subgridItem.IsSubgrid(subgridAxis)) {
+        MOZ_ASSERT(!baselineStateBits,
+                   "subgrids themselves can't be baseline-aligned "
+                   "(or self-aligned in any way) in their subgrid axis");
+        CopyBaselineMetricsToSubgridItemsHelper(
+            aAxis, aContainerWM, subgridItem.SubgridFrame(),
+            aContainerGridItems, aContainerGridItemsIdx);
+      } else if (baselineStateBits) {
+        subgridItem.mState[subgridAxis] |= baselineStateBits;
+        subgridItem.mBaselineOffset[subgridAxis] =
+            itemFromContainer.mBaselineOffset[aAxis];
+      }
+    }
+  }
+
+  void CopyBaselineMetricsToSubgridItems(LogicalAxis aAxis,
+                                         size_t aOriginalLength) {
+    MOZ_ASSERT(aOriginalLength <= mGridItems.Length(),
+               "aOriginalLength is the length that mGridItems had *before* we "
+               "appended temporary copies of subgrid items to it, so it's not "
+               "possible for it to be more than the current length");
+
+    size_t subgridItemIdx = aOriginalLength;
+
+    for (size_t i = 0;
+         (i < aOriginalLength && subgridItemIdx < mGridItems.Length()); i++) {
+      const auto& item = mGridItems[i];
+      if (item.IsSubgrid(aAxis)) {
+        CopyBaselineMetricsToSubgridItemsHelper(aAxis, mWM, item.SubgridFrame(),
+                                                mGridItems, subgridItemIdx);
+      }
+    }
+  }
+
+  Tracks& TracksFor(LogicalAxis aAxis) {
+    return aAxis == LogicalAxis::Block ? mRows : mCols;
+  }
+  const Tracks& TracksFor(LogicalAxis aAxis) const {
+    return aAxis == LogicalAxis::Block ? mRows : mCols;
+  }
+
+  CSSOrderAwareFrameIterator mIter;
+  const nsStylePosition* const mGridStyle;
+  Tracks mCols;
+  Tracks mRows;
+  TrackSizingFunctions mColFunctions;
+  TrackSizingFunctions mRowFunctions;
+  nsTArray<GridItemInfo> mGridItems;
+  nsTArray<GridItemInfo> mAbsPosItems;
+
+  const ReflowInput* const mReflowInput;
+  gfxContext& mRenderingContext;
+  nsGridContainerFrame* const mFrame;
+  SharedGridData* mSharedGridData = nullptr;
+  LogicalMargin mBorderPadding;
+  nscoord mFragBStart = 0;
+  uint32_t mStartRow = 0;
+  uint32_t mNextFragmentStartRow = 0;
+  LogicalSides mSkipSides;
+  const WritingMode mWM;
+  bool mInFragmentainer = false;
+  bool mIsGridIntrinsicSizing = false;
+
+ private:
+  GridReflowInput(nsGridContainerFrame* aFrame, gfxContext& aRenderingContext,
+                  const ReflowInput* aReflowInput,
+                  const nsStylePosition* aGridStyle, const WritingMode& aWM)
+      : mIter(aFrame, FrameChildListID::Principal),
+        mGridStyle(aGridStyle),
+        mCols(LogicalAxis::Inline),
+        mRows(LogicalAxis::Block),
+        mColFunctions(mGridStyle->mGridTemplateColumns,
+                      mGridStyle->mGridAutoColumns, aFrame->IsColSubgrid()),
+        mRowFunctions(mGridStyle->mGridTemplateRows, mGridStyle->mGridAutoRows,
+                      aFrame->IsRowSubgrid()),
+        mReflowInput(aReflowInput),
+        mRenderingContext(aRenderingContext),
+        mFrame(aFrame),
+        mBorderPadding(aWM),
+        mSkipSides(aFrame->GetWritingMode()),
+        mWM(aWM) {
+    MOZ_ASSERT(!aReflowInput || aReflowInput->mFrame == mFrame);
+    if (aReflowInput) {
+      mBorderPadding = aReflowInput->ComputedLogicalBorderPadding(mWM);
+      mSkipSides = aFrame->PreReflowBlockLevelLogicalSkipSides();
+      mBorderPadding.ApplySkipSides(mSkipSides);
+    }
+    mCols.mIsMasonry = aFrame->IsColMasonry();
+    mRows.mIsMasonry = aFrame->IsRowMasonry();
+    MOZ_ASSERT(!(mCols.mIsMasonry && mRows.mIsMasonry),
+               "can't have masonry layout in both axes");
+  }
+};
+
+using GridReflowInput = nsGridContainerFrame::GridReflowInput;
+
+struct MOZ_STACK_CLASS nsGridContainerFrame::Grid {
+  explicit Grid(const Grid* aParentGrid = nullptr) : mParentGrid(aParentGrid) {}
+
+  void PlaceGridItems(GridReflowInput& aGridRI,
+                      const RepeatTrackSizingInput& aRepeatSizing);
+
+  void SubgridPlaceGridItems(GridReflowInput& aParentGridRI, Grid* aParentGrid,
+                             const GridItemInfo& aGridItem);
+
+  LineRange ResolveAbsPosLineRange(const StyleGridLine& aStart,
+                                   const StyleGridLine& aEnd,
+                                   const LineNameMap& aNameMap,
+                                   LogicalAxis aAxis, uint32_t aExplicitGridEnd,
+                                   int32_t aGridStart, int32_t aGridEnd,
+                                   const nsStylePosition* aStyle);
+
+  GridArea PlaceAbsPos(nsIFrame* aChild, const LineNameMap& aColLineNameMap,
+                       const LineNameMap& aRowLineNameMap,
+                       const nsStylePosition* aStyle);
+
+  uint32_t FindAutoCol(uint32_t aStartCol, uint32_t aLockedRow,
+                       const GridArea* aArea) const;
+
+  void PlaceAutoCol(uint32_t aStartCol, GridArea* aArea,
+                    uint32_t aClampMaxColLine) const;
+
+  uint32_t FindAutoRow(uint32_t aLockedCol, uint32_t aStartRow,
+                       const GridArea* aArea) const;
+
+  void PlaceAutoRow(uint32_t aStartRow, GridArea* aArea,
+                    uint32_t aClampMaxRowLine) const;
+
+  void PlaceAutoAutoInRowOrder(uint32_t aStartCol, uint32_t aStartRow,
+                               GridArea* aArea, uint32_t aClampMaxColLine,
+                               uint32_t aClampMaxRowLine) const;
+
+  void PlaceAutoAutoInColOrder(uint32_t aStartCol, uint32_t aStartRow,
+                               GridArea* aArea, uint32_t aClampMaxColLine,
+                               uint32_t aClampMaxRowLine) const;
+
+  static int32_t AutoIfOutside(int32_t aLine, int32_t aMin, int32_t aMax) {
+    MOZ_ASSERT(aMin <= aMax);
+    if (aLine < aMin || aLine > aMax) {
+      return kAutoLine;
+    }
+    return aLine;
+  }
+
+  void InflateGridFor(const GridArea& aArea) {
+    mGridColEnd = std::max(mGridColEnd, aArea.mCols.HypotheticalEnd());
+    mGridRowEnd = std::max(mGridRowEnd, aArea.mRows.HypotheticalEnd());
+    MOZ_ASSERT(mGridColEnd <= kTranslatedMaxLine &&
+               mGridRowEnd <= kTranslatedMaxLine);
+  }
+
+  template <typename IsEmptyFuncT>
+  static Maybe<nsTArray<uint32_t>> CalculateAdjustForAutoFitElements(
+      uint32_t* aOutNumEmptyTracks, TrackSizingFunctions& aSizingFunctions,
+      uint32_t aNumGridLines, IsEmptyFuncT aIsEmptyFunc);
+
+  int32_t ResolveLine(const StyleGridLine& aLine, int32_t aNth,
+                      uint32_t aFromIndex, const LineNameMap& aNameMap,
+                      LogicalSide aSide, uint32_t aExplicitGridEnd,
+                      const nsStylePosition* aStyle);
+
+  typedef std::pair<int32_t, int32_t> LinePair;
+  LinePair ResolveLineRangeHelper(const StyleGridLine& aStart,
+                                  const StyleGridLine& aEnd,
+                                  const LineNameMap& aNameMap,
+                                  LogicalAxis aAxis, uint32_t aExplicitGridEnd,
+                                  const nsStylePosition* aStyle);
+
+  LineRange ResolveLineRange(const StyleGridLine& aStart,
+                             const StyleGridLine& aEnd,
+                             const LineNameMap& aNameMap, LogicalAxis aAxis,
+                             uint32_t aExplicitGridEnd,
+                             const nsStylePosition* aStyle);
+
+  GridArea PlaceDefinite(nsIFrame* aChild, const LineNameMap& aColLineNameMap,
+                         const LineNameMap& aRowLineNameMap,
+                         const nsStylePosition* aStyle);
+
+  bool HasImplicitNamedArea(nsAtom* aName) const {
+    return mAreas && mAreas->has(aName);
+  }
+
+  static bool IsNameWithSuffix(nsAtom* aString, const nsString& aSuffix,
+                               uint32_t* aIndex) {
+    if (StringEndsWith(nsDependentAtomString(aString), aSuffix)) {
+      *aIndex = aString->GetLength() - aSuffix.Length();
+      return *aIndex != 0;
+    }
+    return false;
+  }
+
+  static bool IsNameWithEndSuffix(nsAtom* aString, uint32_t* aIndex) {
+    return IsNameWithSuffix(aString, u"-end"_ns, aIndex);
+  }
+
+  static bool IsNameWithStartSuffix(nsAtom* aString, uint32_t* aIndex) {
+    return IsNameWithSuffix(aString, u"-start"_ns, aIndex);
+  }
+
+  const LineNameMap* ParentLineMapForAxis(bool aIsOrthogonal,
+                                          LogicalAxis aAxis) const {
+    if (!mParentGrid) {
+      return nullptr;
+    }
+    bool isRows = aIsOrthogonal == (aAxis == LogicalAxis::Inline);
+    return isRows ? mParentGrid->mRowNameMap : mParentGrid->mColNameMap;
+  }
+
+  void SetLineMaps(const LineNameMap* aColNameMap,
+                   const LineNameMap* aRowNameMap) {
+    mColNameMap = aColNameMap;
+    mRowNameMap = aRowNameMap;
+  }
+
+  struct CellMap {
+    struct Cell {
+      constexpr Cell() : mIsOccupied(false) {}
+      bool mIsOccupied : 1;
+    };
+
+    void Fill(const GridArea& aGridArea) {
+      MOZ_ASSERT(aGridArea.IsDefinite());
+      MOZ_ASSERT(aGridArea.mRows.mStart < aGridArea.mRows.mEnd);
+      MOZ_ASSERT(aGridArea.mCols.mStart < aGridArea.mCols.mEnd);
+      const auto numRows = aGridArea.mRows.mEnd;
+      const auto numCols = aGridArea.mCols.mEnd;
+      mCells.EnsureLengthAtLeast(numRows);
+      for (auto i = aGridArea.mRows.mStart; i < numRows; ++i) {
+        nsTArray<Cell>& cellsInRow = mCells[i];
+        cellsInRow.EnsureLengthAtLeast(numCols);
+        for (auto j = aGridArea.mCols.mStart; j < numCols; ++j) {
+          cellsInRow[j].mIsOccupied = true;
+        }
+      }
+    }
+
+    uint32_t IsEmptyCol(uint32_t aCol) const {
+      for (auto& row : mCells) {
+        if (aCol < row.Length() && row[aCol].mIsOccupied) {
+          return false;
+        }
+      }
+      return true;
+    }
+    uint32_t IsEmptyRow(uint32_t aRow) const {
+      if (aRow >= mCells.Length()) {
+        return true;
+      }
+      for (const Cell& cell : mCells[aRow]) {
+        if (cell.mIsOccupied) {
+          return false;
+        }
+      }
+      return true;
+    }
+#ifdef DEBUG
+    void Dump() const {
+      const size_t numRows = mCells.Length();
+      for (size_t i = 0; i < numRows; ++i) {
+        const nsTArray<Cell>& cellsInRow = mCells[i];
+        const size_t numCols = cellsInRow.Length();
+        printf("%lu:\t", (unsigned long)i + 1);
+        for (size_t j = 0; j < numCols; ++j) {
+          printf(cellsInRow[j].mIsOccupied ? "X " : ". ");
+        }
+        printf("\n");
+      }
+    }
+#endif
+
+    nsTArray<nsTArray<Cell>> mCells;
+  };
+
+  CellMap mCellMap;
+  ImplicitNamedAreas* mAreas;
+  uint32_t mExplicitGridColEnd;
+  uint32_t mExplicitGridRowEnd;
+  uint32_t mGridColEnd;
+  uint32_t mGridRowEnd;
+
+  uint32_t mExplicitGridOffsetCol;
+  uint32_t mExplicitGridOffsetRow;
+
+  const Grid* mParentGrid;
+
+  const LineNameMap* mColNameMap;
+  const LineNameMap* mRowNameMap;
+};
+
+static Subgrid* SubgridComputeMarginBorderPadding(
+    const GridItemInfo& aGridItem, const LogicalSize& aPercentageBasis) {
+  auto* subgridFrame = aGridItem.SubgridFrame();
+  auto cbWM = aGridItem.mFrame->GetParent()->GetWritingMode();
+  auto* subgrid = subgridFrame->GetProperty(Subgrid::Prop());
+  auto wm = subgridFrame->GetWritingMode();
+  auto pmPercentageBasis = cbWM.IsOrthogonalTo(wm) ? aPercentageBasis.BSize(wm)
+                                                   : aPercentageBasis.ISize(wm);
+  SizeComputationInput sz(subgridFrame, nullptr, cbWM, pmPercentageBasis);
+  subgrid->mMarginBorderPadding =
+      sz.ComputedLogicalMargin(cbWM) + sz.ComputedLogicalBorderPadding(cbWM);
+  if (aGridItem.mFrame == subgridFrame) {
+    return subgrid;
+  }
+
+  if (ScrollContainerFrame* scrollContainerFrame =
+          aGridItem.mFrame->GetScrollTargetFrame()) {
+    MOZ_ASSERT(sz.ComputedLogicalMargin(cbWM) == LogicalMargin(cbWM) &&
+                   sz.ComputedLogicalBorderPadding(cbWM) == LogicalMargin(cbWM),
+               "A scrolled inner frame should not have any margin or border / "
+               "padding!");
+    SizeComputationInput szOuterFrame(scrollContainerFrame, nullptr, cbWM,
+                                      pmPercentageBasis);
+    subgrid->mMarginBorderPadding +=
+        szOuterFrame.ComputedLogicalMargin(cbWM) +
+        szOuterFrame.ComputedLogicalBorderPadding(cbWM) +
+        LogicalMargin(cbWM,
+                      scrollContainerFrame->IntrinsicScrollbarGutterSize());
+  }
+
+  if (nsFieldSetFrame* f = do_QueryFrame(aGridItem.mFrame)) {
+    const auto* inner = f->GetInner();
+    auto wm = inner->GetWritingMode();
+    LogicalPoint pos = inner->GetLogicalPosition(aGridItem.mFrame->GetSize());
+    LogicalMargin offsets(wm, pos.B(wm), 0, 0, 0);
+    subgrid->mMarginBorderPadding += offsets.ConvertTo(cbWM, wm);
+  }
+
+  return subgrid;
+}
+
+static void CopyUsedTrackSizes(TrackPlan& aResult,
+                               const nsGridContainerFrame* aUsedTrackSizesFrame,
+                               const UsedTrackSizes* aUsedTrackSizes,
+                               const nsGridContainerFrame* aSubgridFrame,
+                               const Subgrid* aSubgrid,
+                               LogicalAxis aSubgridAxis) {
+  MOZ_ASSERT(aSubgridFrame->ParentGridContainerForSubgrid() ==
+             aUsedTrackSizesFrame);
+  aResult.SetLength(aSubgridAxis == LogicalAxis::Inline
+                        ? aSubgrid->mGridColEnd
+                        : aSubgrid->mGridRowEnd);
+  auto parentAxis =
+      aSubgrid->mIsOrthogonal ? GetOrthogonalAxis(aSubgridAxis) : aSubgridAxis;
+  const auto& parentSizes = aUsedTrackSizes->mTrackPlans[parentAxis];
+  MOZ_ASSERT(aUsedTrackSizes->mCanResolveLineRangeSize[parentAxis]);
+  if (parentSizes.IsEmpty()) {
+    return;
+  }
+  const auto& range = aSubgrid->mArea.LineRangeForAxis(parentAxis);
+  const auto cbwm = aUsedTrackSizesFrame->GetWritingMode();
+  const auto wm = aSubgridFrame->GetWritingMode();
+  if (parentAxis == LogicalAxis::Inline) {
+    const nsIFrame* outerGridItemFrame = aSubgridFrame;
+    for (nsIFrame* parent = aSubgridFrame->GetParent();
+         parent != aUsedTrackSizesFrame; parent = parent->GetParent()) {
+      MOZ_ASSERT(!parent->IsGridContainerFrame());
+      outerGridItemFrame = parent;
+    }
+    auto sizeInAxis = range.ToLength(aUsedTrackSizes->mTrackPlans[parentAxis]);
+    LogicalSize pmPercentageBasis =
+        aSubgrid->mIsOrthogonal ? LogicalSize(wm, nscoord(0), sizeInAxis)
+                                : LogicalSize(wm, sizeInAxis, nscoord(0));
+    GridItemInfo info(const_cast<nsIFrame*>(outerGridItemFrame),
+                      aSubgrid->mArea);
+    SubgridComputeMarginBorderPadding(info, pmPercentageBasis);
+  }
+  const LogicalMargin& mbp = aSubgrid->mMarginBorderPadding;
+  nscoord startMBP;
+  nscoord endMBP;
+  if (MOZ_LIKELY(cbwm.ParallelAxisStartsOnSameSide(parentAxis, wm))) {
+    startMBP = mbp.Start(parentAxis, cbwm);
+    endMBP = mbp.End(parentAxis, cbwm);
+    uint32_t i = range.mStart;
+    nscoord startPos = parentSizes[i].mPosition + startMBP;
+    for (auto& sz : aResult) {
+      sz = parentSizes[i++];
+      sz.mPosition -= startPos;
+    }
+  } else {
+    startMBP = mbp.End(parentAxis, cbwm);
+    endMBP = mbp.Start(parentAxis, cbwm);
+    uint32_t i = range.mEnd - 1;
+    const auto& parentEnd = parentSizes[i];
+    nscoord parentEndPos = parentEnd.mPosition + parentEnd.mBase - startMBP;
+    for (auto& sz : aResult) {
+      sz = parentSizes[i--];
+      sz.mPosition = parentEndPos - (sz.mPosition + sz.mBase);
+    }
+  }
+  auto& startTrack = aResult[0];
+  startTrack.mPosition = 0;
+  startTrack.mBase -= startMBP;
+  if (MOZ_UNLIKELY(startTrack.mBase < nscoord(0))) {
+    startTrack.mPosition = startTrack.mBase;
+    startTrack.mBase = nscoord(0);
+  }
+  auto& endTrack = aResult.LastElement();
+  endTrack.mBase -= endMBP;
+  if (MOZ_UNLIKELY(endTrack.mBase < nscoord(0))) {
+    endTrack.mBase = nscoord(0);
+  }
+}
+
+void nsGridContainerFrame::UsedTrackSizes::ResolveTrackSizesForAxis(
+    nsGridContainerFrame* aFrame, LogicalAxis aAxis, gfxContext& aRC) {
+  if (mCanResolveLineRangeSize[aAxis]) {
+    return;
+  }
+  if (!aFrame->IsSubgrid()) {
+    return;
+  }
+  auto* parent = aFrame->ParentGridContainerForSubgrid();
+  auto* parentSizes =
+      parent->GetOrCreateDeletableProperty(UsedTrackSizes::Prop());
+  auto* subgrid = aFrame->GetProperty(Subgrid::Prop());
+  const auto parentAxis =
+      subgrid->mIsOrthogonal ? GetOrthogonalAxis(aAxis) : aAxis;
+  parentSizes->ResolveTrackSizesForAxis(parent, parentAxis, aRC);
+  if (!parentSizes->mCanResolveLineRangeSize[parentAxis]) {
+    if (aFrame->IsSubgrid(aAxis)) {
+      ResolveSubgridTrackSizesForAxis(aFrame, aAxis, subgrid, aRC,
+                                      NS_UNCONSTRAINEDSIZE);
+    }
+    return;
+  }
+  if (aFrame->IsSubgrid(aAxis)) {
+    CopyUsedTrackSizes(mTrackPlans[aAxis], parent, parentSizes, aFrame, subgrid,
+                       aAxis);
+    mCanResolveLineRangeSize[aAxis] = true;
+  } else {
+    const auto& range = subgrid->mArea.LineRangeForAxis(parentAxis);
+    nscoord contentBoxSize =
+        range.ToLength(parentSizes->mTrackPlans[parentAxis]);
+    auto parentWM = aFrame->GetParent()->GetWritingMode();
+    contentBoxSize -=
+        subgrid->mMarginBorderPadding.StartEnd(parentAxis, parentWM);
+    contentBoxSize = std::max(nscoord(0), contentBoxSize);
+    ResolveSubgridTrackSizesForAxis(aFrame, aAxis, subgrid, aRC,
+                                    contentBoxSize);
+  }
+}
+
+void nsGridContainerFrame::UsedTrackSizes::ResolveSubgridTrackSizesForAxis(
+    nsGridContainerFrame* aFrame, LogicalAxis aAxis, Subgrid* aSubgrid,
+    gfxContext& aRC, nscoord aContentBoxSize) {
+  GridReflowInput gridRI(aFrame, aRC);
+  gridRI.mGridItems = aSubgrid->mGridItems.Clone();
+  Grid grid;
+  grid.mGridColEnd = aSubgrid->mGridColEnd;
+  grid.mGridRowEnd = aSubgrid->mGridRowEnd;
+  gridRI.CalculateTrackSizesForAxis(aAxis, grid, aContentBoxSize,
+                                    SizingConstraint::NoConstraint);
+  const auto& tracks = gridRI.TracksFor(aAxis);
+  mTrackPlans[aAxis].Assign(tracks.mSizes);
+  mCanResolveLineRangeSize[aAxis] = tracks.mCanResolveLineRangeSize;
+  MOZ_ASSERT(mCanResolveLineRangeSize[aAxis]);
+}
+
+void nsGridContainerFrame::GridReflowInput::CalculateTrackSizesForAxis(
+    LogicalAxis aAxis, const Grid& aGrid, nscoord aContentBoxSize,
+    SizingConstraint aConstraint) {
+  auto& tracks = TracksFor(aAxis);
+  const auto& sizingFunctions =
+      aAxis == LogicalAxis::Inline ? mColFunctions : mRowFunctions;
+  const auto& gapStyle = aAxis == LogicalAxis::Inline ? mGridStyle->mColumnGap
+                                                      : mGridStyle->mRowGap;
+  if (tracks.mIsMasonry) {
+    tracks.Initialize(sizingFunctions, gapStyle, 2, aContentBoxSize);
+    tracks.mCanResolveLineRangeSize = true;
+    return;
+  }
+  uint32_t gridEnd =
+      aAxis == LogicalAxis::Inline ? aGrid.mGridColEnd : aGrid.mGridRowEnd;
+  Maybe<TrackSizingFunctions> fallbackTrackSizing;
+
+  bool useParentGaps = false;
+  const bool isSubgriddedAxis = mFrame->IsSubgrid(aAxis);
+  if (MOZ_LIKELY(!isSubgriddedAxis)) {
+    tracks.Initialize(sizingFunctions, gapStyle, gridEnd, aContentBoxSize);
+  } else {
+    tracks.mGridGap =
+        nsLayoutUtils::ResolveGapToLength(gapStyle, aContentBoxSize);
+    tracks.mContentBoxSize = aContentBoxSize;
+    const auto* subgrid = mFrame->GetProperty(Subgrid::Prop());
+    tracks.mSizes.SetLength(gridEnd);
+    auto* parent = mFrame->ParentGridContainerForSubgrid();
+    auto parentAxis = subgrid->mIsOrthogonal ? GetOrthogonalAxis(aAxis) : aAxis;
+    const auto* parentSizes = parent->GetUsedTrackSizes();
+    if (parentSizes && parentSizes->mCanResolveLineRangeSize[parentAxis]) {
+      CopyUsedTrackSizes(tracks.mSizes, parent, parentSizes, mFrame, subgrid,
+                         aAxis);
+      useParentGaps = gapStyle.IsNormal();
+    } else {
+      fallbackTrackSizing.emplace(TrackSizingFunctions::ForSubgridFallback(
+          mFrame, subgrid, parent, parentAxis));
+      tracks.Initialize(*fallbackTrackSizing, gapStyle, gridEnd,
+                        aContentBoxSize);
+    }
+  }
+
+  if (MOZ_LIKELY(!isSubgriddedAxis) || fallbackTrackSizing.isSome()) {
+    const size_t origGridItemCount = mGridItems.Length();
+    const bool hasSubgridItems = mFrame->HasSubgridItems(aAxis);
+    if (hasSubgridItems) {
+      AutoTArray<GridItemInfo, 8> collectedItems;
+      CollectSubgridItemsForAxis(aAxis, collectedItems);
+      mGridItems.AppendElements(collectedItems);
+    }
+    tracks.CalculateSizes(
+        *this, mGridItems,
+        fallbackTrackSizing ? *fallbackTrackSizing : sizingFunctions,
+        aContentBoxSize,
+        aAxis == LogicalAxis::Inline ? &GridArea::mCols : &GridArea::mRows,
+        aConstraint);
+
+    if (hasSubgridItems &&
+        StaticPrefs::layout_css_grid_subgrid_baselines_enabled()) {
+      CopyBaselineMetricsToSubgridItems(aAxis, origGridItemCount);
+    }
+    mGridItems.TruncateLength(origGridItemCount);
+  }
+  if (isSubgriddedAxis) {
+    tracks.mBaselineSubtreeAlign[BaselineSharingGroup::First] =
+        StyleAlignFlags::START;
+    tracks.mBaselineSubtreeAlign[BaselineSharingGroup::Last] =
+        StyleAlignFlags::END;
+  }
+
+  if (aContentBoxSize != NS_UNCONSTRAINEDSIZE) {
+    auto alignment = mGridStyle->UsedContentAlignment(tracks.mAxis);
+    tracks.AlignJustifyContent(mGridStyle, alignment, mWM, aContentBoxSize,
+                               isSubgriddedAxis);
+  } else if (!useParentGaps) {
+    const nscoord gridGap = tracks.mGridGap;
+    nscoord pos = 0;
+    for (TrackSize& sz : tracks.mSizes) {
+      sz.mPosition = pos;
+      pos += sz.mBase + gridGap;
+    }
+  }
+
+  if (aConstraint == SizingConstraint::NoConstraint &&
+      (mFrame->HasSubgridItems() || mFrame->IsSubgrid())) {
+    mFrame->StoreUsedTrackSizes(aAxis, tracks.mSizes);
+  }
+
+  tracks.mCanResolveLineRangeSize = true;
+}
+
+void nsGridContainerFrame::GridReflowInput::InvalidateTrackSizesForAxis(
+    LogicalAxis aAxis) {
+  for (auto& item : mGridItems) {
+    item.ResetTrackSizingBits(aAxis);
+  }
+  TracksFor(aAxis).mCanResolveLineRangeSize = false;
+}
+
+static void AlignJustifySelf(StyleAlignFlags aAlignment, LogicalAxis aAxis,
+                             AlignJustifyFlags aFlags, nscoord aBaselineAdjust,
+                             nscoord aCBSize, const ReflowInput& aRI,
+                             const LogicalSize& aChildSize,
+                             LogicalPoint* aPos) {
+  MOZ_ASSERT(aAlignment != StyleAlignFlags::AUTO,
+             "unexpected 'auto' "
+             "computed value for normal flow grid item");
+
+  nscoord offset = CSSAlignUtils::AlignJustifySelf(
+      aAlignment, aAxis, aFlags, aBaselineAdjust, aCBSize, aRI, aChildSize);
+
+  if (offset != 0) {
+    WritingMode wm = aRI.GetWritingMode();
+    nscoord& pos = aAxis == LogicalAxis::Block ? aPos->B(wm) : aPos->I(wm);
+    pos += MOZ_LIKELY(aFlags.contains(AlignJustifyFlag::SameSide)) ? offset
+                                                                   : -offset;
+  }
+}
+
+static void AlignSelf(const nsGridContainerFrame::GridItemInfo& aGridItem,
+                      StyleAlignFlags aAlignSelf, nscoord aCBSize,
+                      const WritingMode aCBWM, const ReflowInput& aRI,
+                      const LogicalSize& aSize, AlignJustifyFlags aFlags,
+                      LogicalPoint* aPos) {
+  AlignJustifyFlags flags = aFlags;
+  if (aAlignSelf & StyleAlignFlags::SAFE) {
+    flags += AlignJustifyFlag::OverflowSafe;
+  }
+  aAlignSelf &= ~StyleAlignFlags::FLAG_BITS;
+
+  WritingMode childWM = aRI.GetWritingMode();
+  if (aCBWM.ParallelAxisStartsOnSameSide(LogicalAxis::Block, childWM)) {
+    flags += AlignJustifyFlag::SameSide;
+  }
+
+  if (aGridItem.mState[LogicalAxis::Block] &
+      GridItemInfo::eLastBaselineSharingGroup) {
+    flags += AlignJustifyFlag::LastBaselineSharingGroup;
+  }
+
+  if (aAlignSelf == StyleAlignFlags::LEFT ||
+      aAlignSelf == StyleAlignFlags::RIGHT) {
+    aAlignSelf = StyleAlignFlags::START;
+  }
+  if (MOZ_LIKELY(aAlignSelf == StyleAlignFlags::NORMAL)) {
+    aAlignSelf = StyleAlignFlags::STRETCH;
+  }
+
+  nscoord baselineAdjust = 0;
+  if (aAlignSelf == StyleAlignFlags::BASELINE ||
+      aAlignSelf == StyleAlignFlags::LAST_BASELINE) {
+    aAlignSelf = aGridItem.GetSelfBaseline(aAlignSelf, LogicalAxis::Block,
+                                           &baselineAdjust);
+  }
+
+  const auto bAxisInChildWM = aCBWM.ConvertAxisTo(LogicalAxis::Block, childWM);
+  AlignJustifySelf(aAlignSelf, bAxisInChildWM, flags, baselineAdjust, aCBSize,
+                   aRI, aSize, aPos);
+}
+
+static void JustifySelf(const nsGridContainerFrame::GridItemInfo& aGridItem,
+                        StyleAlignFlags aJustifySelf, nscoord aCBSize,
+                        const WritingMode aCBWM, const ReflowInput& aRI,
+                        const LogicalSize& aSize, AlignJustifyFlags aFlags,
+                        LogicalPoint* aPos) {
+  AlignJustifyFlags flags = aFlags;
+  if (aJustifySelf & StyleAlignFlags::SAFE) {
+    flags += AlignJustifyFlag::OverflowSafe;
+  }
+  aJustifySelf &= ~StyleAlignFlags::FLAG_BITS;
+
+  WritingMode childWM = aRI.GetWritingMode();
+  if (aCBWM.ParallelAxisStartsOnSameSide(LogicalAxis::Inline, childWM)) {
+    flags += AlignJustifyFlag::SameSide;
+  }
+
+  if (aGridItem.mState[LogicalAxis::Inline] &
+      GridItemInfo::eLastBaselineSharingGroup) {
+    flags += AlignJustifyFlag::LastBaselineSharingGroup;
+  }
+
+  if (MOZ_LIKELY(aJustifySelf == StyleAlignFlags::NORMAL)) {
+    aJustifySelf = StyleAlignFlags::STRETCH;
+  }
+
+  nscoord baselineAdjust = 0;
+  if (aJustifySelf == StyleAlignFlags::LEFT) {
+    aJustifySelf =
+        aCBWM.IsBidiLTR() ? StyleAlignFlags::START : StyleAlignFlags::END;
+  } else if (aJustifySelf == StyleAlignFlags::RIGHT) {
+    aJustifySelf =
+        aCBWM.IsBidiLTR() ? StyleAlignFlags::END : StyleAlignFlags::START;
+  } else if (aJustifySelf == StyleAlignFlags::BASELINE ||
+             aJustifySelf == StyleAlignFlags::LAST_BASELINE) {
+    aJustifySelf = aGridItem.GetSelfBaseline(aJustifySelf, LogicalAxis::Inline,
+                                             &baselineAdjust);
+  }
+
+  const auto iAxisInChildWM = aCBWM.ConvertAxisTo(LogicalAxis::Inline, childWM);
+  AlignJustifySelf(aJustifySelf, iAxisInChildWM, flags, baselineAdjust, aCBSize,
+                   aRI, aSize, aPos);
+}
+
+static StyleAlignFlags GetAlignJustifyValue(StyleAlignFlags aAlignment,
+                                            const WritingMode aWM,
+                                            const bool aIsAlign,
+                                            bool* aOverflowSafe) {
+  *aOverflowSafe = bool(aAlignment & StyleAlignFlags::SAFE);
+  aAlignment &= ~StyleAlignFlags::FLAG_BITS;
+
+  if (aAlignment == StyleAlignFlags::LEFT ||
+      aAlignment == StyleAlignFlags::RIGHT) {
+    if (aIsAlign) {
+      return StyleAlignFlags::START;
+    }
+    bool isStart = aWM.IsBidiLTR() == (aAlignment == StyleAlignFlags::LEFT);
+    return isStart ? StyleAlignFlags::START : StyleAlignFlags::END;
+  }
+  if (aAlignment == StyleAlignFlags::FLEX_START) {
+    return StyleAlignFlags::START;  
+  }
+  if (aAlignment == StyleAlignFlags::FLEX_END) {
+    return StyleAlignFlags::END;  
+  }
+  return aAlignment;
+}
+
+static Maybe<StyleAlignFlags> GetAlignJustifyDistributionFallback(
+    const StyleContentDistribution& aDistribution, bool* aOverflowSafe) {
+  if (aDistribution.primary == StyleAlignFlags::SPACE_BETWEEN) {
+    *aOverflowSafe = true;
+    return Some(StyleAlignFlags::START);
+  }
+  if (aDistribution.primary == StyleAlignFlags::SPACE_AROUND ||
+      aDistribution.primary == StyleAlignFlags::SPACE_EVENLY) {
+    *aOverflowSafe = true;
+    return Some(StyleAlignFlags::CENTER);
+  }
+  if (aDistribution.primary == StyleAlignFlags::STRETCH) {
+    *aOverflowSafe = false;
+    return Some(StyleAlignFlags::START);
+  }
+  return Nothing();
+}
+
+
+
+NS_QUERYFRAME_HEAD(nsGridContainerFrame)
+  NS_QUERYFRAME_ENTRY(nsGridContainerFrame)
+NS_QUERYFRAME_TAIL_INHERITING(nsContainerFrame)
+
+NS_IMPL_FRAMEARENA_HELPERS(nsGridContainerFrame)
+
+nsContainerFrame* NS_NewGridContainerFrame(PresShell* aPresShell,
+                                           ComputedStyle* aStyle) {
+  return new (aPresShell)
+      nsGridContainerFrame(aStyle, aPresShell->GetPresContext());
+}
+
+
+
+ const nsRect& nsGridContainerFrame::GridItemCB(nsIFrame* aChild) {
+  MOZ_ASSERT(aChild->IsAbsolutelyPositioned());
+  nsRect* cb = aChild->GetProperty(GridItemContainingBlockRect());
+  MOZ_ASSERT(cb,
+             "this method must only be called on grid items, and the grid "
+             "container should've reflowed this item by now and set up cb");
+  return *cb;
+}
+
+void nsGridContainerFrame::AddImplicitNamedAreasInternal(
+    LineNameList& aNameList,
+    nsGridContainerFrame::ImplicitNamedAreas*& aAreas) {
+  for (const auto& nameIdent : aNameList.AsSpan()) {
+    nsAtom* name = nameIdent.AsAtom();
+    uint32_t indexOfSuffix;
+    if (Grid::IsNameWithStartSuffix(name, &indexOfSuffix) ||
+        Grid::IsNameWithEndSuffix(name, &indexOfSuffix)) {
+      nsDependentSubstring areaName(nsDependentAtomString(name), 0,
+                                    indexOfSuffix);
+
+      if (!aAreas) {
+        aAreas = new nsGridContainerFrame::ImplicitNamedAreas;
+        SetProperty(nsGridContainerFrame::ImplicitNamedAreasProperty(), aAreas);
+      }
+
+      RefPtr<nsAtom> name = NS_Atomize(areaName);
+      auto addPtr = aAreas->lookupForAdd(name);
+      if (!addPtr) {
+        if (!aAreas->add(addPtr, name,
+                         nsGridContainerFrame::NamedArea{
+                             StyleAtom(do_AddRef(name)), {0, 0}, {0, 0}})) {
+          MOZ_CRASH("OOM while adding grid name lists");
+        }
+      }
+    }
+  }
+}
+
+void nsGridContainerFrame::AddImplicitNamedAreas(
+    Span<LineNameList> aLineNameLists) {
+  ImplicitNamedAreas* areas = GetImplicitNamedAreas();
+  const uint32_t len = std::min(aLineNameLists.Length(), size_t(kMaxLine));
+  for (uint32_t i = 0; i < len; ++i) {
+    AddImplicitNamedAreasInternal(aLineNameLists[i], areas);
+  }
+}
+
+void nsGridContainerFrame::AddImplicitNamedAreas(
+    Span<StyleLineNameListValue> aLineNameList) {
+  uint32_t count = 0;
+  ImplicitNamedAreas* areas = GetImplicitNamedAreas();
+  for (const auto& nameList : aLineNameList) {
+    if (nameList.IsRepeat()) {
+      for (const auto& repeatNameList :
+           nameList.AsRepeat().line_names.AsSpan()) {
+        AddImplicitNamedAreasInternal(repeatNameList, areas);
+        ++count;
+      }
+    } else {
+      MOZ_ASSERT(nameList.IsLineNames());
+      AddImplicitNamedAreasInternal(nameList.AsLineNames(), areas);
+      ++count;
+    }
+
+    if (count >= size_t(kMaxLine)) {
+      break;
+    }
+  }
+}
+
+void nsGridContainerFrame::InitImplicitNamedAreas(
+    const nsStylePosition* aStyle) {
+  ImplicitNamedAreas* areas = GetImplicitNamedAreas();
+  if (areas) {
+    areas->clear();
+  }
+  auto Add = [&](const GridTemplate& aTemplate, bool aIsSubgrid) {
+    AddImplicitNamedAreas(aTemplate.LineNameLists(aIsSubgrid));
+    for (auto& value : aTemplate.TrackListValues()) {
+      if (value.IsTrackRepeat()) {
+        AddImplicitNamedAreas(value.AsTrackRepeat().line_names.AsSpan());
+      }
+    }
+
+    if (aIsSubgrid && aTemplate.IsSubgrid()) {
+      AddImplicitNamedAreas(aTemplate.AsSubgrid()->line_names.AsSpan());
+    }
+  };
+  Add(aStyle->mGridTemplateColumns, IsColSubgrid());
+  Add(aStyle->mGridTemplateRows, IsRowSubgrid());
+  if (areas && areas->count() == 0) {
+    RemoveProperty(ImplicitNamedAreasProperty());
+  }
+}
+
+int32_t nsGridContainerFrame::Grid::ResolveLine(
+    const StyleGridLine& aLine, int32_t aNth, uint32_t aFromIndex,
+    const LineNameMap& aNameMap, LogicalSide aSide, uint32_t aExplicitGridEnd,
+    const nsStylePosition* aStyle) {
+  MOZ_ASSERT(!aLine.IsAuto());
+  aNth = std::clamp(aNth, kMinLine, kMaxLine);
+  int32_t line = 0;
+  if (aLine.LineName()->IsEmpty()) {
+    MOZ_ASSERT(aNth != 0, "css-grid 9.2: <integer> must not be zero.");
+    line = int32_t(aFromIndex) + aNth;
+  } else {
+    if (aNth == 0) {
+      aNth = 1;
+    }
+    bool isNameOnly = !aLine.is_span && aLine.line_num == 0;
+    if (isNameOnly) {
+      AutoTArray<uint32_t, 16> implicitLines;
+      aNameMap.FindNamedAreas(aLine.ident.AsAtom(), aSide, implicitLines);
+      if (!implicitLines.IsEmpty() ||
+          aNameMap.HasImplicitNamedArea(aLine.LineName())) {
+        nsAutoString lineName(nsDependentAtomString(aLine.LineName()));
+        if (IsStart(aSide)) {
+          lineName.AppendLiteral("-start");
+        } else {
+          lineName.AppendLiteral("-end");
+        }
+        RefPtr<nsAtom> name = NS_Atomize(lineName);
+        line = aNameMap.FindNamedLine(name, &aNth, aFromIndex, implicitLines);
+      }
+    }
+
+    if (line == 0) {
+      AutoTArray<uint32_t, 16> implicitLines;
+      uint32_t index;
+      bool useStart = IsNameWithStartSuffix(aLine.LineName(), &index);
+      if (useStart || IsNameWithEndSuffix(aLine.LineName(), &index)) {
+        auto side = MakeLogicalSide(
+            GetAxis(aSide), useStart ? LogicalEdge::Start : LogicalEdge::End);
+        RefPtr<nsAtom> name = NS_Atomize(nsDependentSubstring(
+            nsDependentAtomString(aLine.LineName()), 0, index));
+        aNameMap.FindNamedAreas(name, side, implicitLines);
+      }
+      line = aNameMap.FindNamedLine(aLine.LineName(), &aNth, aFromIndex,
+                                    implicitLines);
+    }
+
+    if (line == 0) {
+      MOZ_ASSERT(aNth != 0, "we found all N named lines but 'line' is zero!");
+      int32_t edgeLine;
+      if (aLine.is_span) {
+        edgeLine = IsStart(aSide) ? 1 : aExplicitGridEnd;
+      } else {
+        edgeLine = aNth < 0 ? 1 : aExplicitGridEnd;
+      }
+      line = edgeLine + aNth;
+    }
+  }
+  return line;
+}
+
+nsGridContainerFrame::Grid::LinePair
+nsGridContainerFrame::Grid::ResolveLineRangeHelper(
+    const StyleGridLine& aStart, const StyleGridLine& aEnd,
+    const LineNameMap& aNameMap, LogicalAxis aAxis, uint32_t aExplicitGridEnd,
+    const nsStylePosition* aStyle) {
+  MOZ_ASSERT(int32_t(kAutoLine) > kMaxLine);
+  auto startNum = std::clamp(aStart.line_num, kMinLine, kMaxLine);
+  auto endNum = std::clamp(aEnd.line_num, kMinLine, kMaxLine);
+
+  if (aStart.is_span) {
+    if (aEnd.is_span || aEnd.IsAuto()) {
+      if (aStart.LineName()->IsEmpty()) {
+        return LinePair(kAutoLine, startNum);
+      }
+      return LinePair(kAutoLine, 1);  
+    }
+
+    uint32_t from = endNum < 0 ? aExplicitGridEnd + 1 : 0;
+    auto end = ResolveLine(aEnd, endNum, from, aNameMap,
+                           MakeLogicalSide(aAxis, LogicalEdge::End),
+                           aExplicitGridEnd, aStyle);
+    int32_t span = startNum == 0 ? 1 : startNum;
+    if (end <= 1) {
+      int32_t start = std::max(end - span, aNameMap.mClampMinLine);
+      return LinePair(start, end);
+    }
+    auto start = ResolveLine(aStart, -span, end, aNameMap,
+                             MakeLogicalSide(aAxis, LogicalEdge::Start),
+                             aExplicitGridEnd, aStyle);
+    return LinePair(start, end);
+  }
+
+  int32_t start = kAutoLine;
+  if (aStart.IsAuto()) {
+    if (aEnd.IsAuto()) {
+      return LinePair(start, 1);  
+    }
+    if (aEnd.is_span) {
+      if (aEnd.LineName()->IsEmpty()) {
+        MOZ_ASSERT(endNum != 0);
+        return LinePair(start, endNum);
+      }
+      return LinePair(start, 1);  
+    }
+  } else {
+    uint32_t from = startNum < 0 ? aExplicitGridEnd + 1 : 0;
+    start = ResolveLine(aStart, startNum, from, aNameMap,
+                        MakeLogicalSide(aAxis, LogicalEdge::Start),
+                        aExplicitGridEnd, aStyle);
+    if (aEnd.IsAuto()) {
+      return LinePair(start, start);
+    }
+  }
+
+  uint32_t from;
+  int32_t nth = endNum == 0 ? 1 : endNum;
+  if (aEnd.is_span) {
+    if (MOZ_UNLIKELY(start < 0)) {
+      if (aEnd.LineName()->IsEmpty()) {
+        return LinePair(start, start + nth);
+      }
+      from = 0;
+    } else {
+      if (start >= int32_t(aExplicitGridEnd)) {
+        return LinePair(start, std::min(start + nth, aNameMap.mClampMaxLine));
+      }
+      from = start;
+    }
+  } else {
+    from = endNum < 0 ? aExplicitGridEnd + 1 : 0;
+  }
+  auto end = ResolveLine(aEnd, nth, from, aNameMap,
+                         MakeLogicalSide(aAxis, LogicalEdge::End),
+                         aExplicitGridEnd, aStyle);
+  if (start == int32_t(kAutoLine)) {
+    start = std::max(aNameMap.mClampMinLine, end - 1);
+  }
+  return LinePair(start, end);
+}
+
+nsGridContainerFrame::LineRange nsGridContainerFrame::Grid::ResolveLineRange(
+    const StyleGridLine& aStart, const StyleGridLine& aEnd,
+    const LineNameMap& aNameMap, LogicalAxis aAxis, uint32_t aExplicitGridEnd,
+    const nsStylePosition* aStyle) {
+  LinePair r = ResolveLineRangeHelper(aStart, aEnd, aNameMap, aAxis,
+                                      aExplicitGridEnd, aStyle);
+  MOZ_ASSERT(r.second != int32_t(kAutoLine));
+
+  if (r.first == int32_t(kAutoLine)) {
+    r.second = std::min(r.second, aNameMap.mClampMaxLine - 1);
+  } else {
+    r.first =
+        std::clamp(r.first, aNameMap.mClampMinLine, aNameMap.mClampMaxLine);
+    r.second =
+        std::clamp(r.second, aNameMap.mClampMinLine, aNameMap.mClampMaxLine);
+
+    if (r.first > r.second) {
+      std::swap(r.first, r.second);
+    } else if (r.first == r.second) {
+      if (MOZ_UNLIKELY(r.first == aNameMap.mClampMaxLine)) {
+        r.first = aNameMap.mClampMaxLine - 1;
+      }
+      r.second = r.first + 1;
+    }
+  }
+  return LineRange(r.first, r.second);
+}
+
+nsGridContainerFrame::GridArea nsGridContainerFrame::Grid::PlaceDefinite(
+    nsIFrame* aChild, const LineNameMap& aColLineNameMap,
+    const LineNameMap& aRowLineNameMap, const nsStylePosition* aStyle) {
+  const nsStylePosition* itemStyle = aChild->StylePosition();
+  return GridArea(
+      ResolveLineRange(itemStyle->mGridColumnStart, itemStyle->mGridColumnEnd,
+                       aColLineNameMap, LogicalAxis::Inline,
+                       mExplicitGridColEnd, aStyle),
+      ResolveLineRange(itemStyle->mGridRowStart, itemStyle->mGridRowEnd,
+                       aRowLineNameMap, LogicalAxis::Block, mExplicitGridRowEnd,
+                       aStyle));
+}
+
+nsGridContainerFrame::LineRange
+nsGridContainerFrame::Grid::ResolveAbsPosLineRange(
+    const StyleGridLine& aStart, const StyleGridLine& aEnd,
+    const LineNameMap& aNameMap, LogicalAxis aAxis, uint32_t aExplicitGridEnd,
+    int32_t aGridStart, int32_t aGridEnd, const nsStylePosition* aStyle) {
+  if (aStart.IsAuto()) {
+    if (aEnd.IsAuto()) {
+      return LineRange(kAutoLine, kAutoLine);
+    }
+    uint32_t from = aEnd.line_num < 0 ? aExplicitGridEnd + 1 : 0;
+    int32_t end = ResolveLine(aEnd, aEnd.line_num, from, aNameMap,
+                              MakeLogicalSide(aAxis, LogicalEdge::End),
+                              aExplicitGridEnd, aStyle);
+    if (aEnd.is_span) {
+      ++end;
+    }
+    end = AutoIfOutside(end, aGridStart, aGridEnd);
+    return LineRange(kAutoLine, end);
+  }
+
+  if (aEnd.IsAuto()) {
+    uint32_t from = aStart.line_num < 0 ? aExplicitGridEnd + 1 : 0;
+    int32_t start = ResolveLine(aStart, aStart.line_num, from, aNameMap,
+                                MakeLogicalSide(aAxis, LogicalEdge::Start),
+                                aExplicitGridEnd, aStyle);
+    if (aStart.is_span) {
+      start = std::max(aGridEnd - start, aGridStart);
+    }
+    start = AutoIfOutside(start, aGridStart, aGridEnd);
+    return LineRange(start, kAutoLine);
+  }
+
+  LineRange r =
+      ResolveLineRange(aStart, aEnd, aNameMap, aAxis, aExplicitGridEnd, aStyle);
+  if (r.IsAuto()) {
+    MOZ_ASSERT(aStart.is_span && aEnd.is_span,
+               "span / span is the only case "
+               "leading to IsAuto here -- we dealt with the other cases above");
+    return LineRange(kAutoLine, kAutoLine);
+  }
+
+  return LineRange(AutoIfOutside(r.mUntranslatedStart, aGridStart, aGridEnd),
+                   AutoIfOutside(r.mUntranslatedEnd, aGridStart, aGridEnd));
+}
+
+nsGridContainerFrame::GridArea nsGridContainerFrame::Grid::PlaceAbsPos(
+    nsIFrame* aChild, const LineNameMap& aColLineNameMap,
+    const LineNameMap& aRowLineNameMap, const nsStylePosition* aStyle) {
+  const nsStylePosition* itemStyle = aChild->StylePosition();
+  int32_t gridColStart = 1 - mExplicitGridOffsetCol;
+  int32_t gridRowStart = 1 - mExplicitGridOffsetRow;
+  return GridArea(ResolveAbsPosLineRange(
+                      itemStyle->mGridColumnStart, itemStyle->mGridColumnEnd,
+                      aColLineNameMap, LogicalAxis::Inline, mExplicitGridColEnd,
+                      gridColStart, mGridColEnd, aStyle),
+                  ResolveAbsPosLineRange(
+                      itemStyle->mGridRowStart, itemStyle->mGridRowEnd,
+                      aRowLineNameMap, LogicalAxis::Block, mExplicitGridRowEnd,
+                      gridRowStart, mGridRowEnd, aStyle));
+}
+
+uint32_t nsGridContainerFrame::Grid::FindAutoCol(uint32_t aStartCol,
+                                                 uint32_t aLockedRow,
+                                                 const GridArea* aArea) const {
+  const uint32_t extent = aArea->mCols.Extent();
+  const uint32_t iStart = aLockedRow;
+  const uint32_t iEnd = iStart + aArea->mRows.Extent();
+  uint32_t candidate = aStartCol;
+  for (uint32_t i = iStart; i < iEnd;) {
+    if (i >= mCellMap.mCells.Length()) {
+      break;
+    }
+    const nsTArray<CellMap::Cell>& cellsInRow = mCellMap.mCells[i];
+    const uint32_t len = cellsInRow.Length();
+    const uint32_t lastCandidate = candidate;
+    for (uint32_t j = candidate, gap = 0; j < len && gap < extent; ++j) {
+      if (!cellsInRow[j].mIsOccupied) {
+        ++gap;
+        continue;
+      }
+      candidate = j + 1;
+      gap = 0;
+    }
+    if (lastCandidate < candidate && i != iStart) {
+      i = iStart;
+    } else {
+      ++i;
+    }
+  }
+  return candidate;
+}
+
+void nsGridContainerFrame::Grid::PlaceAutoCol(uint32_t aStartCol,
+                                              GridArea* aArea,
+                                              uint32_t aClampMaxColLine) const {
+  MOZ_ASSERT(aArea->mRows.IsDefinite() && aArea->mCols.IsAuto());
+  uint32_t col = FindAutoCol(aStartCol, aArea->mRows.mStart, aArea);
+  aArea->mCols.ResolveAutoPosition(col, aClampMaxColLine);
+  MOZ_ASSERT(aArea->IsDefinite());
+}
+
+uint32_t nsGridContainerFrame::Grid::FindAutoRow(uint32_t aLockedCol,
+                                                 uint32_t aStartRow,
+                                                 const GridArea* aArea) const {
+  const uint32_t extent = aArea->mRows.Extent();
+  const uint32_t jStart = aLockedCol;
+  const uint32_t jEnd = jStart + aArea->mCols.Extent();
+  const uint32_t iEnd = mCellMap.mCells.Length();
+  uint32_t candidate = aStartRow;
+  for (uint32_t i = candidate, gap = 0; i < iEnd && gap < extent; ++i) {
+    ++gap;  
+    const nsTArray<CellMap::Cell>& cellsInRow = mCellMap.mCells[i];
+    const uint32_t clampedJEnd = std::min<uint32_t>(jEnd, cellsInRow.Length());
+    for (uint32_t j = jStart; j < clampedJEnd; ++j) {
+      if (cellsInRow[j].mIsOccupied) {
+        candidate = i + 1;
+        gap = 0;
+        break;
+      }
+    }
+  }
+  return candidate;
+}
+
+void nsGridContainerFrame::Grid::PlaceAutoRow(uint32_t aStartRow,
+                                              GridArea* aArea,
+                                              uint32_t aClampMaxRowLine) const {
+  MOZ_ASSERT(aArea->mCols.IsDefinite() && aArea->mRows.IsAuto());
+  uint32_t row = FindAutoRow(aArea->mCols.mStart, aStartRow, aArea);
+  aArea->mRows.ResolveAutoPosition(row, aClampMaxRowLine);
+  MOZ_ASSERT(aArea->IsDefinite());
+}
+
+void nsGridContainerFrame::Grid::PlaceAutoAutoInRowOrder(
+    uint32_t aStartCol, uint32_t aStartRow, GridArea* aArea,
+    uint32_t aClampMaxColLine, uint32_t aClampMaxRowLine) const {
+  MOZ_ASSERT(aArea->mCols.IsAuto() && aArea->mRows.IsAuto());
+  const uint32_t colExtent = aArea->mCols.Extent();
+  const uint32_t gridRowEnd = mGridRowEnd;
+  const uint32_t gridColEnd = mGridColEnd;
+  uint32_t col = aStartCol;
+  uint32_t row = aStartRow;
+  for (; row < gridRowEnd; ++row) {
+    col = FindAutoCol(col, row, aArea);
+    if (col + colExtent <= gridColEnd) {
+      break;
+    }
+    col = 0;
+  }
+  MOZ_ASSERT(row < gridRowEnd || col == 0,
+             "expected column 0 for placing in a new row");
+  aArea->mCols.ResolveAutoPosition(col, aClampMaxColLine);
+  aArea->mRows.ResolveAutoPosition(row, aClampMaxRowLine);
+  MOZ_ASSERT(aArea->IsDefinite());
+}
+
+void nsGridContainerFrame::Grid::PlaceAutoAutoInColOrder(
+    uint32_t aStartCol, uint32_t aStartRow, GridArea* aArea,
+    uint32_t aClampMaxColLine, uint32_t aClampMaxRowLine) const {
+  MOZ_ASSERT(aArea->mCols.IsAuto() && aArea->mRows.IsAuto());
+  const uint32_t rowExtent = aArea->mRows.Extent();
+  const uint32_t gridRowEnd = mGridRowEnd;
+  const uint32_t gridColEnd = mGridColEnd;
+  uint32_t col = aStartCol;
+  uint32_t row = aStartRow;
+  for (; col < gridColEnd; ++col) {
+    row = FindAutoRow(col, row, aArea);
+    if (row + rowExtent <= gridRowEnd) {
+      break;
+    }
+    row = 0;
+  }
+  MOZ_ASSERT(col < gridColEnd || row == 0,
+             "expected row 0 for placing in a new column");
+  aArea->mCols.ResolveAutoPosition(col, aClampMaxColLine);
+  aArea->mRows.ResolveAutoPosition(row, aClampMaxRowLine);
+  MOZ_ASSERT(aArea->IsDefinite());
+}
+
+template <typename IsEmptyFuncT>
+Maybe<nsTArray<uint32_t>>
+nsGridContainerFrame::Grid::CalculateAdjustForAutoFitElements(
+    uint32_t* const aOutNumEmptyLines, TrackSizingFunctions& aSizingFunctions,
+    uint32_t aNumGridLines, IsEmptyFuncT aIsEmptyFunc) {
+  Maybe<nsTArray<uint32_t>> trackAdjust;
+  uint32_t& numEmptyLines = *aOutNumEmptyLines;
+  numEmptyLines = 0;
+  if (aSizingFunctions.NumRepeatTracks() > 0) {
+    MOZ_ASSERT(aSizingFunctions.mHasRepeatAuto);
+    const uint32_t repeatStart = (aSizingFunctions.mExplicitGridOffset +
+                                  aSizingFunctions.mRepeatAutoStart);
+    const uint32_t numRepeats = aSizingFunctions.NumRepeatTracks();
+    for (uint32_t i = 0; i < numRepeats; ++i) {
+      if (numEmptyLines) {
+        MOZ_ASSERT(trackAdjust.isSome());
+        (*trackAdjust)[repeatStart + i] = numEmptyLines;
+      }
+      if (aIsEmptyFunc(repeatStart + i)) {
+        ++numEmptyLines;
+        if (trackAdjust.isNothing()) {
+          trackAdjust.emplace(aNumGridLines);
+          trackAdjust->SetLength(aNumGridLines);
+          PodZero(trackAdjust->Elements(), trackAdjust->Length());
+        }
+
+        aSizingFunctions.mRemovedRepeatTracks[i] = true;
+      }
+    }
+    if (numEmptyLines) {
+      for (uint32_t line = repeatStart + numRepeats; line < aNumGridLines;
+           ++line) {
+        (*trackAdjust)[line] = numEmptyLines;
+      }
+    }
+  }
+
+  return trackAdjust;
+}
+
+void nsGridContainerFrame::Grid::SubgridPlaceGridItems(
+    GridReflowInput& aParentGridRI, Grid* aParentGrid,
+    const GridItemInfo& aGridItem) {
+  MOZ_ASSERT(aGridItem.mArea.IsDefinite() ||
+                 aGridItem.mFrame->HasAnyStateBits(NS_FRAME_OUT_OF_FLOW),
+             "the subgrid's lines should be resolved by now");
+  if (aGridItem.IsSubgrid(LogicalAxis::Inline)) {
+    aParentGridRI.mFrame->AddStateBits(NS_STATE_GRID_HAS_COL_SUBGRID_ITEM);
+  }
+  if (aGridItem.IsSubgrid(LogicalAxis::Block)) {
+    aParentGridRI.mFrame->AddStateBits(NS_STATE_GRID_HAS_ROW_SUBGRID_ITEM);
+  }
+  auto* childGrid = aGridItem.SubgridFrame();
+  const auto* pos = childGrid->StylePosition();
+  childGrid->NormalizeChildLists();
+  GridReflowInput gridRI(childGrid, aParentGridRI.mRenderingContext);
+  childGrid->InitImplicitNamedAreas(pos);
+
+  const bool isOrthogonal = aParentGridRI.mWM.IsOrthogonalTo(gridRI.mWM);
+  auto* subgrid = childGrid->GetProperty(Subgrid::Prop());
+  if (!subgrid) {
+    subgrid = new Subgrid(aGridItem.mArea, isOrthogonal, aParentGridRI.mWM);
+    childGrid->SetProperty(Subgrid::Prop(), subgrid);
+  } else {
+    subgrid->mArea = aGridItem.mArea;
+    subgrid->mIsOrthogonal = isOrthogonal;
+    subgrid->mGridItems.Clear();
+    subgrid->mAbsPosItems.Clear();
+  }
+
+  if (MOZ_UNLIKELY(subgrid->mArea.mCols.mStart == kAutoLine)) {
+    subgrid->mArea.mCols.mStart = 0;
+  }
+  if (MOZ_UNLIKELY(subgrid->mArea.mCols.mEnd == kAutoLine)) {
+    subgrid->mArea.mCols.mEnd = aParentGrid->mGridColEnd - 1;
+  }
+  if (MOZ_UNLIKELY(subgrid->mArea.mRows.mStart == kAutoLine)) {
+    subgrid->mArea.mRows.mStart = 0;
+  }
+  if (MOZ_UNLIKELY(subgrid->mArea.mRows.mEnd == kAutoLine)) {
+    subgrid->mArea.mRows.mEnd = aParentGrid->mGridRowEnd - 1;
+  }
+
+  MOZ_ASSERT((subgrid->mArea.mCols.Extent() > 0 &&
+              subgrid->mArea.mRows.Extent() > 0) ||
+                 gridRI.mGridItems.IsEmpty(),
+             "subgrid needs at least one track for its items");
+
+  RepeatTrackSizingInput repeatSizing(gridRI.mWM);
+  if (!childGrid->IsColSubgrid() && gridRI.mColFunctions.mHasRepeatAuto) {
+    repeatSizing.InitFromStyle(LogicalAxis::Inline, gridRI.mWM, gridRI.mFrame,
+                               gridRI.mFrame->Style(),
+                               gridRI.mFrame->GetAspectRatio(), Nothing());
+  }
+  if (!childGrid->IsRowSubgrid() && gridRI.mRowFunctions.mHasRepeatAuto) {
+    repeatSizing.InitFromStyle(LogicalAxis::Block, gridRI.mWM, gridRI.mFrame,
+                               gridRI.mFrame->Style(),
+                               gridRI.mFrame->GetAspectRatio(), Nothing());
+  }
+
+  PlaceGridItems(gridRI, repeatSizing);
+
+  subgrid->mGridItems = std::move(gridRI.mGridItems);
+  subgrid->mAbsPosItems = std::move(gridRI.mAbsPosItems);
+  subgrid->mGridColEnd = mGridColEnd;
+  subgrid->mGridRowEnd = mGridRowEnd;
+}
+
+void nsGridContainerFrame::Grid::PlaceGridItems(
+    GridReflowInput& aGridRI, const RepeatTrackSizingInput& aSizes) {
+  MOZ_ASSERT(mCellMap.mCells.IsEmpty(), "unexpected entries in cell map");
+
+  mAreas = aGridRI.mFrame->GetImplicitNamedAreas();
+
+  if (aGridRI.mFrame->HasSubgridItems() || aGridRI.mFrame->IsSubgrid()) {
+    if (auto* uts = aGridRI.mFrame->GetUsedTrackSizes()) {
+      uts->mCanResolveLineRangeSize = {false, false};
+      uts->mTrackPlans[LogicalAxis::Inline].ClearAndRetainStorage();
+      uts->mTrackPlans[LogicalAxis::Block].ClearAndRetainStorage();
+    }
+  }
+
+  aGridRI.mFrame->RemoveStateBits(NS_STATE_GRID_HAS_COL_SUBGRID_ITEM |
+                                  NS_STATE_GRID_HAS_ROW_SUBGRID_ITEM);
+
+  const nsStylePosition* const gridStyle = aGridRI.mGridStyle;
+  const auto* areas = gridStyle->mGridTemplateAreas.IsNone()
+                          ? nullptr
+                          : &*gridStyle->mGridTemplateAreas.AsAreas();
+  const LineNameMap* parentLineNameMap = nullptr;
+  const LineRange* subgridRange = nullptr;
+  bool subgridAxisIsSameDirection = true;
+  bool subgridIsOrthogonal = false;
+  if (!aGridRI.mFrame->IsColSubgrid()) {
+    aGridRI.mColFunctions.InitRepeatTracks(
+        gridStyle->mColumnGap, aSizes.mMin.ISize(aGridRI.mWM),
+        aSizes.mSize.ISize(aGridRI.mWM), aSizes.mMax.ISize(aGridRI.mWM));
+    uint32_t areaCols = areas ? areas->width + 1 : 1;
+    mExplicitGridColEnd =
+        aGridRI.mColFunctions.ComputeExplicitGridEnd(areaCols);
+  } else {
+    const auto* subgrid = aGridRI.mFrame->GetProperty(Subgrid::Prop());
+    subgridRange = &subgrid->SubgridCols();
+    uint32_t extent = subgridRange->Extent();
+    mExplicitGridColEnd = extent + 1;  
+    parentLineNameMap =
+        ParentLineMapForAxis(subgrid->mIsOrthogonal, LogicalAxis::Inline);
+    auto parentWM =
+        aGridRI.mFrame->ParentGridContainerForSubgrid()->GetWritingMode();
+    subgridAxisIsSameDirection =
+        aGridRI.mWM.ParallelAxisStartsOnSameSide(LogicalAxis::Inline, parentWM);
+    subgridIsOrthogonal = subgrid->mIsOrthogonal;
+  }
+  mGridColEnd = mExplicitGridColEnd;
+  LineNameMap colLineNameMap(gridStyle, mAreas, aGridRI.mColFunctions,
+                             parentLineNameMap, subgridRange,
+                             subgridAxisIsSameDirection, subgridIsOrthogonal);
+
+  if (!aGridRI.mFrame->IsRowSubgrid()) {
+    const Maybe<nscoord> containBSize = aGridRI.mFrame->ContainIntrinsicBSize();
+    const nscoord repeatTrackSizingBSize = [&] {
+      if (containBSize &&
+          aSizes.mSize.BSize(aGridRI.mWM) == NS_UNCONSTRAINEDSIZE) {
+        return CSSMinMax(*containBSize, aSizes.mMin.BSize(aGridRI.mWM),
+                         aSizes.mMax.BSize(aGridRI.mWM));
+      }
+      return aSizes.mSize.BSize(aGridRI.mWM);
+    }();
+    aGridRI.mRowFunctions.InitRepeatTracks(
+        gridStyle->mRowGap, aSizes.mMin.BSize(aGridRI.mWM),
+        repeatTrackSizingBSize, aSizes.mMax.BSize(aGridRI.mWM));
+    uint32_t areaRows = areas ? areas->strings.Length() + 1 : 1;
+    mExplicitGridRowEnd =
+        aGridRI.mRowFunctions.ComputeExplicitGridEnd(areaRows);
+    parentLineNameMap = nullptr;
+    subgridRange = nullptr;
+  } else {
+    const auto* subgrid = aGridRI.mFrame->GetProperty(Subgrid::Prop());
+    subgridRange = &subgrid->SubgridRows();
+    uint32_t extent = subgridRange->Extent();
+    mExplicitGridRowEnd = extent + 1;  
+    parentLineNameMap =
+        ParentLineMapForAxis(subgrid->mIsOrthogonal, LogicalAxis::Block);
+    auto parentWM =
+        aGridRI.mFrame->ParentGridContainerForSubgrid()->GetWritingMode();
+    subgridAxisIsSameDirection =
+        aGridRI.mWM.ParallelAxisStartsOnSameSide(LogicalAxis::Block, parentWM);
+    subgridIsOrthogonal = subgrid->mIsOrthogonal;
+  }
+  mGridRowEnd = mExplicitGridRowEnd;
+  LineNameMap rowLineNameMap(gridStyle, mAreas, aGridRI.mRowFunctions,
+                             parentLineNameMap, subgridRange,
+                             subgridAxisIsSameDirection, subgridIsOrthogonal);
+
+  const bool isSubgridOrItemInSubgrid =
+      aGridRI.mFrame->IsSubgrid() || !!mParentGrid;
+  auto SetSubgridChildEdgeBits =
+      [this, isSubgridOrItemInSubgrid](GridItemInfo& aItem) -> void {
+    if (isSubgridOrItemInSubgrid) {
+      const auto& area = aItem.mArea;
+      if (area.mCols.mStart == 0) {
+        aItem.mState[LogicalAxis::Inline] |= ItemState::eStartEdge;
+      }
+      if (area.mCols.mEnd == mGridColEnd) {
+        aItem.mState[LogicalAxis::Inline] |= ItemState::eEndEdge;
+      }
+      if (area.mRows.mStart == 0) {
+        aItem.mState[LogicalAxis::Block] |= ItemState::eStartEdge;
+      }
+      if (area.mRows.mEnd == mGridRowEnd) {
+        aItem.mState[LogicalAxis::Block] |= ItemState::eEndEdge;
+      }
+    }
+  };
+
+  SetLineMaps(&colLineNameMap, &rowLineNameMap);
+
+  int32_t minCol = 1;
+  int32_t minRow = 1;
+  aGridRI.mGridItems.ClearAndRetainStorage();
+  aGridRI.mIter.Reset();
+
+  for (; !aGridRI.mIter.AtEnd(); aGridRI.mIter.Next()) {
+    nsIFrame* child = *aGridRI.mIter;
+    GridItemInfo* info = aGridRI.mGridItems.AppendElement(GridItemInfo(
+        child,
+        PlaceDefinite(child, colLineNameMap, rowLineNameMap, gridStyle)));
+    MOZ_ASSERT(aGridRI.mIter.ItemIndex() == aGridRI.mGridItems.Length() - 1,
+               "ItemIndex() is broken");
+    GridArea& area = info->mArea;
+    if (area.mCols.IsDefinite()) {
+      minCol = std::min(minCol, area.mCols.mUntranslatedStart);
+    }
+    if (area.mRows.IsDefinite()) {
+      minRow = std::min(minRow, area.mRows.mUntranslatedStart);
+    }
+  }
+
+  mExplicitGridOffsetCol = 1 - minCol;  
+  mExplicitGridOffsetRow = 1 - minRow;
+  aGridRI.mColFunctions.mExplicitGridOffset = mExplicitGridOffsetCol;
+  aGridRI.mRowFunctions.mExplicitGridOffset = mExplicitGridOffsetRow;
+  const int32_t offsetToColZero = int32_t(mExplicitGridOffsetCol) - 1;
+  const int32_t offsetToRowZero = int32_t(mExplicitGridOffsetRow) - 1;
+  const bool isRowMasonry = aGridRI.mFrame->IsRowMasonry();
+  const bool isColMasonry = aGridRI.mFrame->IsColMasonry();
+  const bool isMasonry = isColMasonry || isRowMasonry;
+  mGridColEnd += offsetToColZero;
+  mGridRowEnd += offsetToRowZero;
+  const uint32_t gridAxisTrackCount = isRowMasonry ? mGridColEnd : mGridRowEnd;
+  aGridRI.mIter.Reset();
+  for (; !aGridRI.mIter.AtEnd(); aGridRI.mIter.Next()) {
+    auto& item = aGridRI.mGridItems[aGridRI.mIter.ItemIndex()];
+    GridArea& area = item.mArea;
+    if (area.mCols.IsDefinite()) {
+      area.mCols.mStart = area.mCols.mUntranslatedStart + offsetToColZero;
+      area.mCols.mEnd = area.mCols.mUntranslatedEnd + offsetToColZero;
+    }
+    if (area.mRows.IsDefinite()) {
+      area.mRows.mStart = area.mRows.mUntranslatedStart + offsetToRowZero;
+      area.mRows.mEnd = area.mRows.mUntranslatedEnd + offsetToRowZero;
+    }
+    if (area.IsDefinite()) {
+      if (isMasonry) {
+        item.MaybeInhibitSubgridInMasonry(aGridRI.mFrame, gridAxisTrackCount);
+      }
+      if (item.IsSubgrid()) {
+        Grid grid(this);
+        grid.SubgridPlaceGridItems(aGridRI, this, item);
+      }
+      mCellMap.Fill(area);
+      InflateGridFor(area);
+      SetSubgridChildEdgeBits(item);
+    }
+  }
+
+  auto flowStyle = gridStyle->mGridAutoFlow;
+  const bool isRowOrder =
+      isMasonry ? isRowMasonry : !!(flowStyle & StyleGridAutoFlow::ROW);
+  const bool isSparse = !(flowStyle & StyleGridAutoFlow::DENSE);
+  uint32_t clampMaxColLine = colLineNameMap.mClampMaxLine + offsetToColZero;
+  uint32_t clampMaxRowLine = rowLineNameMap.mClampMaxLine + offsetToRowZero;
+  {
+    Maybe<nsTHashMap<nsUint32HashKey, uint32_t>> cursors;
+    if (isSparse) {
+      cursors.emplace();
+    }
+    auto placeAutoMinorFunc =
+        isRowOrder ? &Grid::PlaceAutoCol : &Grid::PlaceAutoRow;
+    uint32_t clampMaxLine = isRowOrder ? clampMaxColLine : clampMaxRowLine;
+    aGridRI.mIter.Reset();
+    for (; !aGridRI.mIter.AtEnd(); aGridRI.mIter.Next()) {
+      auto& item = aGridRI.mGridItems[aGridRI.mIter.ItemIndex()];
+      GridArea& area = item.mArea;
+      LineRange& major = isRowOrder ? area.mRows : area.mCols;
+      LineRange& minor = isRowOrder ? area.mCols : area.mRows;
+      if (major.IsDefinite() && minor.IsAuto()) {
+        const uint32_t cursor = isSparse ? cursors->Get(major.mStart) : 0;
+        (this->*placeAutoMinorFunc)(cursor, &area, clampMaxLine);
+        if (isMasonry) {
+          item.MaybeInhibitSubgridInMasonry(aGridRI.mFrame, gridAxisTrackCount);
+        }
+        if (item.IsSubgrid()) {
+          Grid grid(this);
+          grid.SubgridPlaceGridItems(aGridRI, this, item);
+        }
+        mCellMap.Fill(area);
+        SetSubgridChildEdgeBits(item);
+        if (isSparse) {
+          cursors->InsertOrUpdate(major.mStart, minor.mEnd);
+        }
+      }
+      InflateGridFor(area);  
+    }
+  }
+
+
+  uint32_t cursorMajor = 0;  
+  uint32_t cursorMinor = 0;
+  auto placeAutoMajorFunc =
+      isRowOrder ? &Grid::PlaceAutoRow : &Grid::PlaceAutoCol;
+  uint32_t clampMaxMajorLine = isRowOrder ? clampMaxRowLine : clampMaxColLine;
+  aGridRI.mIter.Reset();
+  for (; !aGridRI.mIter.AtEnd(); aGridRI.mIter.Next()) {
+    auto& item = aGridRI.mGridItems[aGridRI.mIter.ItemIndex()];
+    GridArea& area = item.mArea;
+    MOZ_ASSERT(*aGridRI.mIter == item.mFrame,
+               "iterator out of sync with aState.mGridItems");
+    LineRange& major = isRowOrder ? area.mRows : area.mCols;
+    LineRange& minor = isRowOrder ? area.mCols : area.mRows;
+    if (major.IsAuto()) {
+      if (minor.IsDefinite()) {
+        if (isSparse) {
+          if (minor.mStart < cursorMinor) {
+            ++cursorMajor;
+          }
+          cursorMinor = minor.mStart;
+        }
+        (this->*placeAutoMajorFunc)(cursorMajor, &area, clampMaxMajorLine);
+        if (isSparse) {
+          cursorMajor = major.mStart;
+        }
+      } else {
+        if (isRowOrder) {
+          PlaceAutoAutoInRowOrder(cursorMinor, cursorMajor, &area,
+                                  clampMaxColLine, clampMaxRowLine);
+        } else {
+          PlaceAutoAutoInColOrder(cursorMajor, cursorMinor, &area,
+                                  clampMaxColLine, clampMaxRowLine);
+        }
+        if (isSparse) {
+          cursorMajor = major.mStart;
+          cursorMinor = minor.mEnd;
+#ifdef DEBUG
+          uint32_t gridMajorEnd = isRowOrder ? mGridRowEnd : mGridColEnd;
+          uint32_t gridMinorEnd = isRowOrder ? mGridColEnd : mGridRowEnd;
+          MOZ_ASSERT(cursorMajor <= gridMajorEnd,
+                     "we shouldn't need to place items further than 1 track "
+                     "past the current end of the grid, in major dimension");
+          MOZ_ASSERT(cursorMinor <= gridMinorEnd,
+                     "we shouldn't add implicit minor tracks for auto/auto");
+#endif
+        }
+      }
+      if (isMasonry) {
+        item.MaybeInhibitSubgridInMasonry(aGridRI.mFrame, gridAxisTrackCount);
+      }
+      if (item.IsSubgrid()) {
+        Grid grid(this);
+        grid.SubgridPlaceGridItems(aGridRI, this, item);
+      }
+      mCellMap.Fill(area);
+      InflateGridFor(area);
+      SetSubgridChildEdgeBits(item);
+    }
+  }
+
+  if (isMasonry) {
+    auto masonryAxis = isRowMasonry ? LogicalAxis::Block : LogicalAxis::Inline;
+    aGridRI.mIter.Reset();
+    for (; !aGridRI.mIter.AtEnd(); aGridRI.mIter.Next()) {
+      auto& item = aGridRI.mGridItems[aGridRI.mIter.ItemIndex()];
+      auto& masonryRange = item.mArea.LineRangeForAxis(masonryAxis);
+      masonryRange.mStart = std::min(masonryRange.mStart, 1U);
+      masonryRange.mEnd = masonryRange.mStart + 1U;
+    }
+  }
+
+  if (auto* absCB = aGridRI.mFrame->GetAbsoluteContainingBlock();
+      absCB && absCB->PrepareAbsoluteFrames(aGridRI.mFrame)) {
+    const nsFrameList& children = absCB->GetChildList();
+    const int32_t offsetToColZero = int32_t(mExplicitGridOffsetCol) - 1;
+    const int32_t offsetToRowZero = int32_t(mExplicitGridOffsetRow) - 1;
+    AutoRestore<uint32_t> zeroOffsetGridColEnd(mGridColEnd);
+    AutoRestore<uint32_t> zeroOffsetGridRowEnd(mGridRowEnd);
+    mGridColEnd -= offsetToColZero;
+    mGridRowEnd -= offsetToRowZero;
+    aGridRI.mAbsPosItems.ClearAndRetainStorage();
+    for (nsIFrame* child : children) {
+      GridItemInfo* info = aGridRI.mAbsPosItems.AppendElement(GridItemInfo(
+          child,
+          PlaceAbsPos(child, colLineNameMap, rowLineNameMap, gridStyle)));
+      GridArea& area = info->mArea;
+      if (area.mCols.mUntranslatedStart != int32_t(kAutoLine)) {
+        area.mCols.mStart = area.mCols.mUntranslatedStart + offsetToColZero;
+        if (isColMasonry) {
+          area.mCols.mStart = std::min(area.mCols.mStart, 1U);
+        }
+      }
+      if (area.mCols.mUntranslatedEnd != int32_t(kAutoLine)) {
+        area.mCols.mEnd = area.mCols.mUntranslatedEnd + offsetToColZero;
+        if (isColMasonry) {
+          area.mCols.mEnd = std::min(area.mCols.mEnd, 1U);
+        }
+      }
+      if (area.mRows.mUntranslatedStart != int32_t(kAutoLine)) {
+        area.mRows.mStart = area.mRows.mUntranslatedStart + offsetToRowZero;
+        if (isRowMasonry) {
+          area.mRows.mStart = std::min(area.mRows.mStart, 1U);
+        }
+      }
+      if (area.mRows.mUntranslatedEnd != int32_t(kAutoLine)) {
+        area.mRows.mEnd = area.mRows.mUntranslatedEnd + offsetToRowZero;
+        if (isRowMasonry) {
+          area.mRows.mEnd = std::min(area.mRows.mEnd, 1U);
+        }
+      }
+      if (isMasonry) {
+        info->MaybeInhibitSubgridInMasonry(aGridRI.mFrame, gridAxisTrackCount);
+      }
+
+      if (info->IsSubgrid(LogicalAxis::Inline)) {
+        if (info->mArea.mCols.mStart == zeroOffsetGridColEnd.SavedValue() ||
+            info->mArea.mCols.mEnd == 0) {
+          info->InhibitSubgrid(aGridRI.mFrame, LogicalAxis::Inline);
+        }
+      }
+      if (info->IsSubgrid(LogicalAxis::Block)) {
+        if (info->mArea.mRows.mStart == zeroOffsetGridRowEnd.SavedValue() ||
+            info->mArea.mRows.mEnd == 0) {
+          info->InhibitSubgrid(aGridRI.mFrame, LogicalAxis::Block);
+        }
+      }
+
+      if (info->IsSubgrid()) {
+        Grid grid(this);
+        grid.SubgridPlaceGridItems(aGridRI, this, *info);
+      }
+    }
+  }
+
+
+  Maybe<nsTArray<uint32_t>> colAdjust;
+  uint32_t numEmptyCols = 0;
+  if (aGridRI.mColFunctions.mHasRepeatAuto &&
+      gridStyle->mGridTemplateColumns.GetRepeatAutoValue()->count.IsAutoFit()) {
+    const auto& cellMap = mCellMap;
+    colAdjust = CalculateAdjustForAutoFitElements(
+        &numEmptyCols, aGridRI.mColFunctions, mGridColEnd + 1,
+        [&cellMap](uint32_t i) -> bool { return cellMap.IsEmptyCol(i); });
+  }
+
+  Maybe<nsTArray<uint32_t>> rowAdjust;
+  uint32_t numEmptyRows = 0;
+  if (aGridRI.mRowFunctions.mHasRepeatAuto &&
+      gridStyle->mGridTemplateRows.GetRepeatAutoValue()->count.IsAutoFit()) {
+    const auto& cellMap = mCellMap;
+    rowAdjust = CalculateAdjustForAutoFitElements(
+        &numEmptyRows, aGridRI.mRowFunctions, mGridRowEnd + 1,
+        [&cellMap](uint32_t i) -> bool { return cellMap.IsEmptyRow(i); });
+  }
+  MOZ_ASSERT((numEmptyCols > 0) == colAdjust.isSome());
+  MOZ_ASSERT((numEmptyRows > 0) == rowAdjust.isSome());
+  if (numEmptyCols || numEmptyRows) {
+    for (auto& item : aGridRI.mGridItems) {
+      if (numEmptyCols) {
+        item.AdjustForRemovedTracks(LogicalAxis::Inline, *colAdjust);
+      }
+      if (numEmptyRows) {
+        item.AdjustForRemovedTracks(LogicalAxis::Block, *rowAdjust);
+      }
+    }
+    for (auto& item : aGridRI.mAbsPosItems) {
+      if (numEmptyCols) {
+        item.AdjustForRemovedTracks(LogicalAxis::Inline, *colAdjust);
+      }
+      if (numEmptyRows) {
+        item.AdjustForRemovedTracks(LogicalAxis::Block, *rowAdjust);
+      }
+    }
+    mGridColEnd -= numEmptyCols;
+    mExplicitGridColEnd -= numEmptyCols;
+    mGridRowEnd -= numEmptyRows;
+    mExplicitGridRowEnd -= numEmptyRows;
+    auto colRepeatCount = aGridRI.mColFunctions.NumRepeatTracks();
+    aGridRI.mColFunctions.SetNumRepeatTracks(colRepeatCount - numEmptyCols);
+    auto rowRepeatCount = aGridRI.mRowFunctions.NumRepeatTracks();
+    aGridRI.mRowFunctions.SetNumRepeatTracks(rowRepeatCount - numEmptyRows);
+  }
+
+  if (mAreas && aGridRI.mFrame->HasAnyStateBits(NS_STATE_GRID_COMPUTED_INFO)) {
+    for (auto iter = mAreas->iter(); !iter.done(); iter.next()) {
+      auto& areaInfo = iter.get().value();
+
+      StyleGridLine lineStartAndEnd;
+      lineStartAndEnd.ident._0 = areaInfo.name;
+
+      LineRange columnLines =
+          ResolveLineRange(lineStartAndEnd, lineStartAndEnd, colLineNameMap,
+                           LogicalAxis::Inline, mExplicitGridColEnd, gridStyle);
+
+      LineRange rowLines =
+          ResolveLineRange(lineStartAndEnd, lineStartAndEnd, rowLineNameMap,
+                           LogicalAxis::Block, mExplicitGridRowEnd, gridStyle);
+
+      areaInfo.columns.start = columnLines.mStart + mExplicitGridOffsetCol;
+      areaInfo.columns.end = columnLines.mEnd + mExplicitGridOffsetCol;
+      areaInfo.rows.start = rowLines.mStart + mExplicitGridOffsetRow;
+      areaInfo.rows.end = rowLines.mEnd + mExplicitGridOffsetRow;
+    }
+  }
+}
+
+void nsGridContainerFrame::Tracks::Initialize(
+    const TrackSizingFunctions& aFunctions,
+    const NonNegativeLengthPercentageOrNormal& aGridGap, uint32_t aNumTracks,
+    nscoord aContentBoxSize) {
+  mSizes.SetLength(aNumTracks);
+  mSizes.ZeroInitialize();
+  for (uint32_t i = 0, len = mSizes.Length(); i < len; ++i) {
+    auto& sz = mSizes[i];
+    mStateUnion |= sz.Initialize(aContentBoxSize, aFunctions.SizingFor(i));
+    if (mIsMasonry) {
+      sz.mBase = aContentBoxSize;
+      sz.mLimit = aContentBoxSize;
+    }
+  }
+  mGridGap = nsLayoutUtils::ResolveGapToLength(aGridGap, aContentBoxSize);
+  mContentBoxSize = aContentBoxSize;
+}
+
+static nscoord MeasuringReflow(nsIFrame* aChild,
+                               const ReflowInput* aReflowInput, gfxContext* aRC,
+                               const LogicalSize& aAvailableSize,
+                               const LogicalSize& aCBSize,
+                               nscoord aIMinSizeClamp = NS_MAXSIZE,
+                               nscoord aBMinSizeClamp = NS_MAXSIZE) {
+  MOZ_ASSERT(aChild->IsGridItem(), "aChild should be a grid item!");
+  auto* parent = static_cast<nsGridContainerFrame*>(aChild->GetParent());
+  nsPresContext* pc = aChild->PresContext();
+  Maybe<ReflowInput> dummyParentState;
+  const ReflowInput* rs = aReflowInput;
+  if (!aReflowInput) {
+    MOZ_ASSERT(!parent->HasAnyStateBits(NS_FRAME_IN_REFLOW));
+    dummyParentState.emplace(
+        pc, parent, aRC,
+        LogicalSize(parent->GetWritingMode(), 0, NS_UNCONSTRAINEDSIZE),
+        ReflowInput::InitFlag::DummyParentReflowInput);
+    rs = dummyParentState.ptr();
+  }
+#ifdef DEBUG
+  parent->SetProperty(nsContainerFrame::DebugReflowingWithInfiniteISize(),
+                      true);
+#endif
+  auto wm = aChild->GetWritingMode();
+  ComputeSizeFlags csFlags = ComputeSizeFlag::IsGridMeasuringReflow;
+  if (!parent->GridItemShouldStretch(aChild, LogicalAxis::Inline)) {
+    csFlags += ComputeSizeFlag::ShrinkWrap;
+  }
+  if (aAvailableSize.ISize(wm) == INFINITE_ISIZE_COORD) {
+    csFlags += ComputeSizeFlag::ShrinkWrap;
+  }
+  if (aIMinSizeClamp != NS_MAXSIZE) {
+    csFlags += ComputeSizeFlag::IClampMarginBoxMinSize;
+  }
+  if (aBMinSizeClamp != NS_MAXSIZE) {
+    csFlags += ComputeSizeFlag::BClampMarginBoxMinSize;
+    aChild->SetProperty(nsIFrame::BClampMarginBoxMinSizeProperty(),
+                        aBMinSizeClamp);
+  } else {
+    aChild->RemoveProperty(nsIFrame::BClampMarginBoxMinSizeProperty());
+  }
+  ReflowInput childRI(pc, *rs, aChild, aAvailableSize, Some(aCBSize), {}, {},
+                      csFlags);
+
+  childRI.SetBResize(true);
+  childRI.SetBResizeForPercentages(true);
+
+  ReflowOutput childSize(childRI);
+  nsReflowStatus childStatus;
+  const nsIFrame::ReflowChildFlags flags =
+      nsIFrame::ReflowChildFlags::NoMoveFrame |
+      nsIFrame::ReflowChildFlags::NoDeleteNextInFlowChild;
+
+  if (const GridItemCachedBAxisMeasurement* cachedMeasurement =
+          aChild->GetProperty(GridItemCachedBAxisMeasurement::Prop());
+      cachedMeasurement && cachedMeasurement->IsValidFor(aChild, aCBSize)) {
+    childSize.BSize(wm) = cachedMeasurement->BSize();
+    childSize.ISize(wm) = aChild->ISize(wm);
+    nsContainerFrame::FinishReflowChild(aChild, pc, childSize, &childRI, wm,
+                                        LogicalPoint(wm), nsSize(), flags);
+    GRID_LOG(
+        "[perf] MeasuringReflow accepted cached value=%d, child=%p, "
+        "aCBSize.ISize=%d",
+        cachedMeasurement->BSize(), aChild, aCBSize.ISize(wm));
+    return cachedMeasurement->BSize();
+  }
+
+  parent->ReflowChild(aChild, pc, childSize, childRI, wm, LogicalPoint(wm),
+                      nsSize(), flags, childStatus);
+  nsContainerFrame::FinishReflowChild(aChild, pc, childSize, &childRI, wm,
+                                      LogicalPoint(wm), nsSize(), flags);
+#ifdef DEBUG
+  parent->RemoveProperty(nsContainerFrame::DebugReflowingWithInfiniteISize());
+#endif
+
+  if (GridItemCachedBAxisMeasurement* cachedMeasurement =
+          aChild->GetProperty(GridItemCachedBAxisMeasurement::Prop())) {
+    cachedMeasurement->Update(aChild, aCBSize, childSize.BSize(wm));
+    GRID_LOG(
+        "[perf] MeasuringReflow rejected but updated cached value=%d, "
+        "child=%p, aCBSize.ISize=%d",
+        cachedMeasurement->BSize(), aChild, aCBSize.ISize(wm));
+  } else {
+    cachedMeasurement = new GridItemCachedBAxisMeasurement(aChild, aCBSize,
+                                                           childSize.BSize(wm));
+    aChild->SetProperty(GridItemCachedBAxisMeasurement::Prop(),
+                        cachedMeasurement);
+    GRID_LOG(
+        "[perf] MeasuringReflow created new cached value=%d, child=%p, "
+        "aCBSize.ISize=%d",
+        cachedMeasurement->BSize(), aChild, aCBSize.ISize(wm));
+  }
+
+  return childSize.BSize(wm);
+}
+
+static LogicalMargin SubgridAccumulatedMarginBorderPadding(
+    nsIFrame* aFrame, const Subgrid* aSubgrid, WritingMode aResultWM,
+    LogicalAxis aAxis) {
+  MOZ_ASSERT(aFrame->IsGridContainerFrame());
+  auto* subgridFrame = static_cast<nsGridContainerFrame*>(aFrame);
+  LogicalMargin result(aSubgrid->mMarginBorderPadding);
+  auto* parent = subgridFrame->ParentGridContainerForSubgrid();
+  auto subgridCBWM = parent->GetWritingMode();
+  auto childRange = aSubgrid->mArea.LineRangeForAxis(aAxis);
+  bool skipStartSide = false;
+  bool skipEndSide = false;
+  auto axis = aSubgrid->mIsOrthogonal ? GetOrthogonalAxis(aAxis) : aAxis;
+  while (parent->IsSubgrid(axis)) {
+    auto* parentSubgrid = parent->GetProperty(Subgrid::Prop());
+    auto* grandParent = parent->ParentGridContainerForSubgrid();
+    auto parentCBWM = grandParent->GetWritingMode();
+    if (parentCBWM.IsOrthogonalTo(subgridCBWM)) {
+      axis = GetOrthogonalAxis(axis);
+    }
+    const auto& parentRange = parentSubgrid->mArea.LineRangeForAxis(axis);
+    bool sameDir = parentCBWM.ParallelAxisStartsOnSameSide(axis, subgridCBWM);
+    if (sameDir) {
+      skipStartSide |= childRange.mStart != 0;
+      skipEndSide |= childRange.mEnd != parentRange.Extent();
+    } else {
+      skipEndSide |= childRange.mStart != 0;
+      skipStartSide |= childRange.mEnd != parentRange.Extent();
+    }
+    if (skipStartSide && skipEndSide) {
+      break;
+    }
+    auto mbp =
+        parentSubgrid->mMarginBorderPadding.ConvertTo(subgridCBWM, parentCBWM);
+    if (skipStartSide) {
+      mbp.Start(aAxis, subgridCBWM) = nscoord(0);
+    }
+    if (skipEndSide) {
+      mbp.End(aAxis, subgridCBWM) = nscoord(0);
+    }
+    result += mbp;
+    parent = grandParent;
+    childRange = parentRange;
+  }
+  return result.ConvertTo(aResultWM, subgridCBWM);
+}
+
+static nscoord ContentContribution(const GridItemInfo& aGridItem,
+                                   const GridReflowInput& aGridRI,
+                                   LogicalAxis aAxis,
+                                   const LogicalSize& aPercentageBasis,
+                                   IntrinsicISizeType aConstraint,
+                                   nscoord aMinSizeClamp = NS_MAXSIZE,
+                                   const StyleSizeOverrides& aOverrides = {}) {
+  nsIFrame* child = aGridItem.mFrame;
+
+  const WritingMode gridWM = aGridRI.mWM;
+  nscoord extraMargin = 0;
+  nsGridContainerFrame::Subgrid* subgrid = nullptr;
+  if (child->GetParent() != aGridRI.mFrame) {
+    auto* subgridFrame = child->GetParent();
+    subgrid = subgridFrame->GetProperty(Subgrid::Prop());
+    const auto itemEdgeBits = aGridItem.mState[aAxis] & ItemState::eEdgeBits;
+    if (itemEdgeBits) {
+      LogicalMargin mbp = SubgridAccumulatedMarginBorderPadding(
+          subgridFrame, subgrid, gridWM, aAxis);
+      if (itemEdgeBits & ItemState::eStartEdge) {
+        extraMargin += mbp.Start(aAxis, gridWM);
+      }
+      if (itemEdgeBits & ItemState::eEndEdge) {
+        extraMargin += mbp.End(aAxis, gridWM);
+      }
+    }
+    if (itemEdgeBits != ItemState::eEdgeBits) {
+      const auto subgridAxis =
+          gridWM.ConvertAxisTo(aAxis, subgridFrame->GetWritingMode());
+      auto& gapStyle = subgridAxis == LogicalAxis::Block
+                           ? subgridFrame->StylePosition()->mRowGap
+                           : subgridFrame->StylePosition()->mColumnGap;
+      if (!gapStyle.IsNormal()) {
+        auto subgridExtent = subgridAxis == LogicalAxis::Block
+                                 ? subgrid->mGridRowEnd
+                                 : subgrid->mGridColEnd;
+        if (subgridExtent > 1) {
+          nscoord subgridGap =
+              nsLayoutUtils::ResolveGapToLength(gapStyle, NS_UNCONSTRAINEDSIZE);
+          const auto& tracks = aGridRI.TracksFor(aAxis);
+          auto gapDelta = subgridGap - tracks.mGridGap;
+          if (!itemEdgeBits) {
+            extraMargin += gapDelta;
+          } else {
+            extraMargin += gapDelta / 2;
+          }
+        }
+      }
+    }
+  }
+
+  gfxContext* rc = &aGridRI.mRenderingContext;
+  PhysicalAxis axis = gridWM.PhysicalAxis(aAxis);
+  nscoord size = nsLayoutUtils::IntrinsicForAxis(
+      axis, rc, child, aConstraint, Some(aPercentageBasis),
+      nsLayoutUtils::BAIL_IF_REFLOW_NEEDED, aMinSizeClamp, aOverrides);
+  auto childWM = child->GetWritingMode();
+  const bool isOrthogonal = childWM.IsOrthogonalTo(gridWM);
+  auto childAxis = isOrthogonal ? GetOrthogonalAxis(aAxis) : aAxis;
+  if (size == NS_INTRINSIC_ISIZE_UNKNOWN && childAxis == LogicalAxis::Block) {
+    if (aGridRI.mIsGridIntrinsicSizing && aAxis == LogicalAxis::Block) {
+      size = 0;
+    } else {
+      nscoord availISize = INFINITE_ISIZE_COORD;
+      nscoord availBSize = NS_UNCONSTRAINEDSIZE;
+      nscoord iMinSizeClamp = NS_MAXSIZE;
+      nscoord bMinSizeClamp = NS_MAXSIZE;
+      LogicalSize cbSize = aPercentageBasis;
+      if (child->GetParent() != aGridRI.mFrame) {
+        auto* subgridFrame =
+            static_cast<nsGridContainerFrame*>(child->GetParent());
+        MOZ_ASSERT(subgridFrame->IsGridContainerFrame());
+        auto* uts =
+            subgridFrame->GetOrCreateDeletableProperty(UsedTrackSizes::Prop());
+        const auto subgridAxis = childWM.ConvertAxisTo(
+            LogicalAxis::Inline, subgridFrame->GetWritingMode());
+        uts->ResolveTrackSizesForAxis(subgridFrame, subgridAxis, *rc);
+        if (uts->mCanResolveLineRangeSize[subgridAxis]) {
+          auto* subgrid =
+              subgridFrame->GetProperty(nsGridContainerFrame::Subgrid::Prop());
+          const GridItemInfo* originalItem = nullptr;
+          for (const auto& item : subgrid->mGridItems) {
+            if (item.mFrame == child) {
+              originalItem = &item;
+              break;
+            }
+          }
+          MOZ_ASSERT(originalItem, "huh?");
+          const auto& range = originalItem->mArea.LineRangeForAxis(subgridAxis);
+          const nscoord sz = range.ToLength(uts->mTrackPlans[subgridAxis]);
+          if (childWM.IsOrthogonalTo(subgridFrame->GetWritingMode())) {
+            availBSize = sz;
+            cbSize.BSize(childWM) = sz;
+            if (aGridItem.mState[aAxis] & ItemState::eClampMarginBoxMinSize) {
+              bMinSizeClamp = sz;
+            }
+          } else {
+            availISize = sz;
+            cbSize.ISize(childWM) = sz;
+            if (aGridItem.mState[aAxis] & ItemState::eClampMarginBoxMinSize) {
+              iMinSizeClamp = sz;
+            }
+          }
+        }
+      } else {
+        const LogicalAxis inlineAxisInChildWM =
+            isOrthogonal ? LogicalAxis::Block : LogicalAxis::Inline;
+        const nscoord colSize = cbSize.Size(inlineAxisInChildWM, childWM);
+        if (colSize != NS_UNCONSTRAINEDSIZE) {
+          MOZ_ASSERT(aGridRI.mCols.mCanResolveLineRangeSize,
+                     "Grid column sizes should be resolvable!");
+          if (isOrthogonal) {
+            availBSize = colSize;
+            if (aGridItem.mState[aAxis] & ItemState::eClampMarginBoxMinSize) {
+              bMinSizeClamp = colSize;
+            }
+          } else {
+            availISize = colSize;
+            if (aGridItem.mState[aAxis] & ItemState::eClampMarginBoxMinSize) {
+              iMinSizeClamp = colSize;
+            }
+          }
+        }
+      }
+      if (isOrthogonal == (aAxis == LogicalAxis::Inline)) {
+        bMinSizeClamp = aMinSizeClamp;
+      } else {
+        iMinSizeClamp = aMinSizeClamp;
+      }
+      LogicalSize availableSize(childWM, availISize, availBSize);
+      size = ::MeasuringReflow(child, aGridRI.mReflowInput, rc, availableSize,
+                               cbSize, iMinSizeClamp, bMinSizeClamp);
+    }
+    size += child->GetLogicalUsedMargin(childWM).BStartEnd(childWM);
+    nscoord overflow = size - aMinSizeClamp;
+    if (MOZ_UNLIKELY(overflow > 0)) {
+      nscoord contentSize = child->ContentBSize(childWM);
+      nscoord newContentSize = std::max(nscoord(0), contentSize - overflow);
+      size -= contentSize - newContentSize;
+    }
+  }
+  MOZ_ASSERT(aGridItem.mBaselineOffset[aAxis] >= 0,
+             "baseline offset should be non-negative at this point");
+  MOZ_ASSERT((aGridItem.mState[aAxis] & ItemState::eIsBaselineAligned) ||
+                 aGridItem.mBaselineOffset[aAxis] == nscoord(0),
+             "baseline offset should be zero when not baseline-aligned");
+  size += aGridItem.mBaselineOffset[aAxis];
+  size += extraMargin;
+  return std::max(size, 0);
+}
+
+struct CachedIntrinsicSizes {
+  CachedIntrinsicSizes() = delete;
+  CachedIntrinsicSizes(const GridItemInfo& aGridItem,
+                       const GridReflowInput& aGridRI, const LogicalAxis aAxis)
+      : mPercentageBasis(aGridRI.PercentageBasisFor(aAxis, aGridItem)) {}
+
+  void EnsureContributions(EnumSet<GridIntrinsicSizeType> aTypes,
+                           const GridItemInfo& aGridItem,
+                           const GridReflowInput& aGridRI, LogicalAxis aAxis) {
+
+    if (aTypes.contains(GridIntrinsicSizeType::MinContribution)) {
+      nsIFrame* const child = aGridItem.mFrame;
+      const nsStylePosition* const stylePos = child->StylePosition();
+      const auto anchorResolutionParams =
+          AnchorPosResolutionParams::From(child);
+      const WritingMode cbwm = aGridRI.mWM;
+      auto styleSize = stylePos->Size(aAxis, cbwm, anchorResolutionParams);
+      const LogicalAxis axisInItemWM =
+          cbwm.ConvertAxisTo(aAxis, child->GetWritingMode());
+      if (!styleSize->BehavesLikeInitialValue(axisInItemWM) &&
+          !styleSize->HasPercent()) {
+        aTypes -= GridIntrinsicSizeType::MinContribution;
+        aTypes += GridIntrinsicSizeType::MinContentContribution;
+        EnsureContributions(aTypes, aGridItem, aGridRI, aAxis);
+        mSizes[GridIntrinsicSizeType::MinContribution] =
+            mSizes[GridIntrinsicSizeType::MinContentContribution];
+        return;
+      }
+    }
+
+    for (const GridIntrinsicSizeType type : aTypes) {
+      if (mSizes[type].isNothing()) {
+        mSizes[type].emplace(ComputeContribution(
+            type, aGridItem, aGridRI, aAxis, mPercentageBasis, mMinSizeClamp));
+      }
+    }
+  }
+
+ private:
+  static nscoord ComputeContribution(GridIntrinsicSizeType aType,
+                                     const GridItemInfo& aGridItem,
+                                     const GridReflowInput& aGridRI,
+                                     LogicalAxis aAxis,
+                                     const LogicalSize& aPercentageBasis,
+                                     nscoord aMinSizeClamp) {
+    const WritingMode containerWM = aGridRI.mWM;
+    gfxContext* const rc = &aGridRI.mRenderingContext;
+    switch (aType) {
+      case GridIntrinsicSizeType::MinContentContribution:
+        return ContentContribution(aGridItem, aGridRI, aAxis, aPercentageBasis,
+                                   IntrinsicISizeType::MinISize, aMinSizeClamp);
+      case GridIntrinsicSizeType::MaxContentContribution:
+        return ContentContribution(aGridItem, aGridRI, aAxis, aPercentageBasis,
+                                   IntrinsicISizeType::PrefISize,
+                                   aMinSizeClamp);
+      case GridIntrinsicSizeType::MinContribution: {
+        nsIFrame* const child = aGridItem.mFrame;
+        const nsStylePosition* const stylePos = child->StylePosition();
+        const auto anchorResolutionParams =
+            AnchorPosResolutionParams::From(child);
+        const LogicalAxis axisInItemWM =
+            containerWM.ConvertAxisTo(aAxis, child->GetWritingMode());
+#ifdef DEBUG
+        {
+          const auto styleSize =
+              stylePos->Size(aAxis, containerWM, anchorResolutionParams);
+          MOZ_ASSERT(styleSize->BehavesLikeInitialValue(axisInItemWM) ||
+                         styleSize->HasPercent(),
+                     "Should have been caught in EnsureContributions");
+        }
+#endif
+        MOZ_ASSERT(aGridItem.mBaselineOffset[aAxis] >= 0,
+                   "baseline offset should be non-negative at this point");
+        MOZ_ASSERT((aGridItem.mState[aAxis] & ItemState::eIsBaselineAligned) ||
+                       aGridItem.mBaselineOffset[aAxis] == (nscoord)0,
+                   "baseline offset should be zero when not baseline-aligned");
+        const auto styleMinSize =
+            stylePos->MinSize(aAxis, containerWM, anchorResolutionParams);
+
+        const bool isAuto = styleMinSize->BehavesLikeInitialValue(axisInItemWM);
+        nscoord s = aGridItem.mBaselineOffset[aAxis];
+
+        if (!isAuto ||
+            (aGridItem.mState[aAxis] & ItemState::eContentBasedAutoMinSize)) {
+          nscoord contrib = nsLayoutUtils::MinSizeContributionForAxis(
+              containerWM.PhysicalAxis(aAxis), rc, child,
+              IntrinsicISizeType::MinISize, aPercentageBasis);
+          if (contrib == NS_UNCONSTRAINEDSIZE) {
+            s = contrib;
+          } else {
+            s += contrib;
+          }
+
+          if ((axisInItemWM == LogicalAxis::Inline &&
+               nsIFrame::ToExtremumLength(*styleMinSize)) ||
+              (isAuto && !child->StyleDisplay()->IsScrollableOverflow())) {
+            StyleSizeOverrides overrides;
+            if (axisInItemWM == LogicalAxis::Inline) {
+              overrides.mStyleISize.emplace(*styleMinSize.get());
+            } else {
+              overrides.mStyleBSize.emplace(*styleMinSize.get());
+            }
+            MOZ_ASSERT(isAuto || s == NS_UNCONSTRAINEDSIZE);
+            s = std::min(s, ContentContribution(aGridItem, aGridRI, aAxis,
+                                                aPercentageBasis,
+                                                IntrinsicISizeType::MinISize,
+                                                aMinSizeClamp, overrides));
+          }
+        }
+        return s;
+      }
+    }
+    MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Unexpected contribution type");
+  }
+
+ public:
+  EnumeratedArray<GridIntrinsicSizeType, nscoord> SizesOrDefault() const {
+    EnumeratedArray<GridIntrinsicSizeType, nscoord> sizes;
+    for (GridIntrinsicSizeType type : kAllGridIntrinsicSizeTypes) {
+      sizes[type] = mSizes[type].valueOr(0);
+    }
+    return sizes;
+  }
+
+  EnumeratedArray<GridIntrinsicSizeType, Maybe<nscoord>> mSizes;
+
+  const LogicalSize mPercentageBasis;
+
+  nscoord mMinSizeClamp = NS_MAXSIZE;
+};
+
+void nsGridContainerFrame::Tracks::CalculateSizes(
+    GridReflowInput& aGridRI, nsTArray<GridItemInfo>& aGridItems,
+    const TrackSizingFunctions& aFunctions, nscoord aContentBoxSize,
+    LineRange GridArea::* aRange, SizingConstraint aConstraint) {
+  nscoord percentageBasis = aContentBoxSize;
+  if (percentageBasis == NS_UNCONSTRAINEDSIZE) {
+    percentageBasis = 0;
+  }
+  InitializeItemBaselines(aGridRI, aGridItems);
+
+  ResolveIntrinsicSize(aGridRI, aGridItems, aFunctions, aRange, percentageBasis,
+                       aConstraint);
+
+  if (aConstraint != SizingConstraint::MinContent) {
+    nscoord freeSpace = aContentBoxSize;
+    if (freeSpace != NS_UNCONSTRAINEDSIZE) {
+      freeSpace -= SumOfGridGaps();
+    }
+    DistributeFreeSpace(freeSpace);
+
+    StretchFlexibleTracks(aGridRI, aGridItems, aFunctions, freeSpace);
+  }
+}
+
+TrackSize::StateBits nsGridContainerFrame::Tracks::StateBitsForRange(
+    const LineRange& aRange) const {
+  MOZ_ASSERT(!aRange.IsAuto(), "must have a definite range");
+  TrackSize::StateBits state = TrackSize::StateBits::eNone;
+  for (auto i : aRange.Range()) {
+    state |= mSizes[i].mState;
+  }
+  return state;
+}
+
+static void AddSubgridContribution(TrackSize& aSize,
+                                   nscoord aMarginBorderPadding) {
+  if (aSize.mState & TrackSize::eIntrinsicMinSizing) {
+    aSize.mBase = std::max(aSize.mBase, aMarginBorderPadding);
+    aSize.mLimit = std::max(aSize.mLimit, aSize.mBase);
+  }
+  if (aSize.mState &
+      (TrackSize::eIntrinsicMaxSizing | TrackSize::eApplyFitContentClamping)) {
+    aSize.mLimit = std::max(aSize.mLimit, aMarginBorderPadding);
+  }
+}
+
+Maybe<nscoord> nsGridContainerFrame::Tracks::ComputeMinSizeClamp(
+    const TrackSizingFunctions& aFunctions, nscoord aPercentageBasis,
+    const LineRange& aLineRange, const TrackSize::StateBits aState) const {
+  if (!TrackSize::IsDefiniteMaxSizing(aState)) {
+    return Nothing();
+  }
+  nscoord minSizeClamp = 0;
+  for (auto i : aLineRange.Range()) {
+    minSizeClamp +=
+        aFunctions.MaxSizingFor(i).AsBreadth().Resolve(aPercentageBasis);
+  }
+  minSizeClamp += mGridGap * (aLineRange.Extent() - 1);
+  return Some(minSizeClamp);
+}
+
+void nsGridContainerFrame::Tracks::ResolveIntrinsicSizeForNonSpanningItems(
+    GridReflowInput& aGridRI, const TrackSizingFunctions& aFunctions,
+    nscoord aPercentageBasis, SizingConstraint aConstraint,
+    const LineRange& aRange, const GridItemInfo& aGridItem) {
+  CachedIntrinsicSizes cache{aGridItem, aGridRI, mAxis};
+  TrackSize& sz = mSizes[aRange.mStart];
+
+  Maybe<GridIntrinsicSizeType> baseSizeType;
+  if (sz.mState & TrackSize::eAutoMinSizing) {
+    if (aGridItem.MinContributionDependsOnAutoMinSize(aGridRI.mWM, mAxis)) {
+      if (const Maybe<nscoord> minSizeClamp =
+              ComputeMinSizeClamp(aFunctions, aPercentageBasis, aRange)) {
+        cache.mMinSizeClamp = *minSizeClamp;
+        aGridItem.mState[mAxis] |= ItemState::eClampMarginBoxMinSize;
+      }
+      baseSizeType.emplace((aConstraint == SizingConstraint::MaxContent)
+                               ? GridIntrinsicSizeType::MaxContentContribution
+                               : GridIntrinsicSizeType::MinContentContribution);
+    } else {
+      baseSizeType.emplace(GridIntrinsicSizeType::MinContribution);
+    }
+  } else if (sz.mState & TrackSize::eMinContentMinSizing) {
+    baseSizeType.emplace(GridIntrinsicSizeType::MinContentContribution);
+  } else if (sz.mState & TrackSize::eMaxContentMinSizing) {
+    baseSizeType.emplace(GridIntrinsicSizeType::MaxContentContribution);
+  }
+
+  Maybe<nscoord> fitContentClamp;
+  Maybe<GridIntrinsicSizeType> limitType;
+  if (sz.mState & TrackSize::eMinContentMaxSizing) {
+    limitType.emplace(GridIntrinsicSizeType::MinContentContribution);
+  } else if (sz.mState &
+             (TrackSize::eAutoMaxSizing | TrackSize::eMaxContentMaxSizing)) {
+    limitType.emplace(GridIntrinsicSizeType::MaxContentContribution);
+    if (MOZ_UNLIKELY(sz.mState & TrackSize::eApplyFitContentClamping)) {
+      fitContentClamp.emplace(aFunctions.SizingFor(aRange.mStart)
+                                  .AsFitContent()
+                                  .AsBreadth()
+                                  .Resolve(aPercentageBasis));
+    }
+  }
+
+  MOZ_ASSERT(
+      limitType != Some(GridIntrinsicSizeType::MinContribution),
+      "We should never be using the minimum contribution as the limit size.");
+
+  {
+    EnumSet<GridIntrinsicSizeType> sizeTypesToCalculate;
+    for (const auto& maybeType : {baseSizeType, limitType}) {
+      if (maybeType) {
+        sizeTypesToCalculate += *maybeType;
+      }
+    }
+    cache.EnsureContributions(sizeTypesToCalculate, aGridItem, aGridRI, mAxis);
+  }
+
+  if (baseSizeType) {
+    sz.mBase = std::max(sz.mBase, *cache.mSizes[*baseSizeType]);
+  }
+
+  if (limitType) {
+    if (sz.mLimit == NS_UNCONSTRAINEDSIZE) {
+      sz.mLimit = 0;  
+    }
+    sz.mLimit = std::max(sz.mLimit, *cache.mSizes[*limitType]);
+    if (fitContentClamp) {
+      sz.mLimit = std::min(sz.mLimit, *fitContentClamp);
+    }
+  }
+
+  sz.mLimit = std::max(sz.mLimit, sz.mBase);
+}
+
+void nsGridContainerFrame::Tracks::CalculateItemBaselines(
+    nsTArray<ItemBaselineData>& aBaselineItems,
+    BaselineSharingGroup aBaselineGroup) {
+  if (aBaselineItems.IsEmpty()) {
+    return;
+  }
+
+  std::sort(aBaselineItems.begin(), aBaselineItems.end(),
+            ItemBaselineData::IsBaselineTrackLessThan);
+
+  MOZ_ASSERT(mSizes.Length() > 0, "having an item implies at least one track");
+
+  auto baselineCount = aBaselineItems.LastElement().mBaselineTrack + 1;
+  mBaselines.EnsureLengthAtLeast(baselineCount);
+
+  nscoord maxBaseline = 0;
+  nscoord maxDescent = 0;
+  uint32_t currentTrack = kAutoLine;  
+  uint32_t trackStartIndex = 0;
+  for (uint32_t i = 0, len = aBaselineItems.Length(); true; ++i) {
+    if (i != len) {
+      const ItemBaselineData& item = aBaselineItems[i];
+      if (currentTrack == item.mBaselineTrack) {
+        maxBaseline = std::max(maxBaseline, item.mBaseline);
+        maxDescent = std::max(maxDescent, item.mSize - item.mBaseline);
+        continue;
+      }
+    }
+    for (uint32_t j = trackStartIndex; j < i; ++j) {
+      const ItemBaselineData& item = aBaselineItems[j];
+      item.mGridItem->mBaselineOffset[mAxis] = maxBaseline - item.mBaseline;
+      MOZ_ASSERT(item.mGridItem->mBaselineOffset[mAxis] >= 0);
+    }
+    if (i != 0) {
+      mSizes[currentTrack].mBaselineSubtreeSize[aBaselineGroup] =
+          maxBaseline + maxDescent;
+
+      mBaselines[currentTrack][aBaselineGroup] = Some(maxBaseline);
+    }
+    if (i == len) {
+      break;
+    }
+    const ItemBaselineData& item = aBaselineItems[i];
+    currentTrack = item.mBaselineTrack;
+    trackStartIndex = i;
+    maxBaseline = item.mBaseline;
+    maxDescent = item.mSize - item.mBaseline;
+  }
+}
+
+void nsGridContainerFrame::Tracks::InitializeItemBaselines(
+    GridReflowInput& aGridRI, nsTArray<GridItemInfo>& aGridItems) {
+  MOZ_ASSERT(!mIsMasonry);
+  if (aGridRI.mFrame->IsSubgrid(mAxis)) {
+    return;
+  }
+
+  nsTArray<ItemBaselineData> firstBaselineItems;
+  nsTArray<ItemBaselineData> lastBaselineItems;
+  const WritingMode containerWM = aGridRI.mWM;
+  ComputedStyle* containerStyle = aGridRI.mFrame->Style();
+
+  for (GridItemInfo& gridItem : aGridItems) {
+    if (gridItem.IsSubgrid(mAxis)) {
+      continue;
+    }
+
+    nsIFrame* child = gridItem.mFrame;
+    uint32_t baselineTrack = kAutoLine;
+    auto state = ItemState(0);
+    const auto childWM = child->GetWritingMode();
+
+    const bool isOrthogonal = containerWM.IsOrthogonalTo(childWM);
+    const bool isInlineAxis = mAxis == LogicalAxis::Inline;  
+    const bool itemHasBaselineParallelToTrack = isInlineAxis == isOrthogonal;
+
+    auto selfAlignment =
+        child->StylePosition()->UsedSelfAlignment(mAxis, containerStyle);
+    selfAlignment &= ~StyleAlignFlags::FLAG_BITS;
+    if (selfAlignment == StyleAlignFlags::BASELINE) {
+      state |= ItemState::eFirstBaseline | ItemState::eSelfBaseline;
+    } else if (selfAlignment == StyleAlignFlags::LAST_BASELINE) {
+      state |= ItemState::eLastBaseline | ItemState::eSelfBaseline;
+    }
+
+    if (!isInlineAxis) {
+      auto alignContent = child->StylePosition()->mAlignContent.primary;
+      alignContent &= ~StyleAlignFlags::FLAG_BITS;
+      if (alignContent == StyleAlignFlags::BASELINE ||
+          alignContent == StyleAlignFlags::LAST_BASELINE) {
+        const auto selfAlignEdge = alignContent == StyleAlignFlags::BASELINE
+                                       ? StyleAlignFlags::SELF_START
+                                       : StyleAlignFlags::SELF_END;
+        bool validCombo = selfAlignment == StyleAlignFlags::NORMAL ||
+                          selfAlignment == StyleAlignFlags::STRETCH ||
+                          selfAlignment == selfAlignEdge;
+        if (!validCombo) {
+          LogicalAxis alignAxis = GetOrthogonalAxis(mAxis);
+          bool sameSide =
+              containerWM.ParallelAxisStartsOnSameSide(alignAxis, childWM);
+          if (selfAlignment == StyleAlignFlags::LEFT) {
+            selfAlignment = containerWM.IsBidiLTR() ? StyleAlignFlags::START
+                                                    : StyleAlignFlags::END;
+          } else if (selfAlignment == StyleAlignFlags::RIGHT) {
+            selfAlignment = StyleAlignFlags::START;
+          }
+
+          if (selfAlignment == StyleAlignFlags::START ||
+              selfAlignment == StyleAlignFlags::FLEX_START) {
+            validCombo =
+                sameSide == (alignContent == StyleAlignFlags::BASELINE);
+          } else if (selfAlignment == StyleAlignFlags::END ||
+                     selfAlignment == StyleAlignFlags::FLEX_END) {
+            validCombo =
+                sameSide == (alignContent == StyleAlignFlags::LAST_BASELINE);
+          }
+        }
+        if (validCombo) {
+          const GridArea& area = gridItem.mArea;
+          if (alignContent == StyleAlignFlags::BASELINE) {
+            state |= ItemState::eFirstBaseline | ItemState::eContentBaseline;
+            baselineTrack = area.mRows.mStart;
+          } else if (alignContent == StyleAlignFlags::LAST_BASELINE) {
+            state |= ItemState::eLastBaseline | ItemState::eContentBaseline;
+            baselineTrack = area.mRows.mEnd - 1;
+          }
+        }
+      }
+    }
+
+    if (state & ItemState::eIsBaselineAligned) {
+      bool isFirstBaseline = (state & ItemState::eFirstBaseline) != 0;
+      BaselineSharingGroup baselineAlignment = isFirstBaseline
+                                                   ? BaselineSharingGroup::First
+                                                   : BaselineSharingGroup::Last;
+      auto baselineWM = WritingMode::DetermineWritingModeForBaselineSynthesis(
+          containerWM, childWM, GetOrthogonalAxis(mAxis));
+
+      auto sameSideInBaselineWM =
+          containerWM.ParallelAxisStartsOnSameSide(mAxis, baselineWM);
+      auto baselineSharingGroup = BaselineSharingGroup::First;
+      if (sameSideInBaselineWM != isFirstBaseline) {
+        baselineSharingGroup = BaselineSharingGroup::Last;
+        state |= ItemState::eLastBaselineSharingGroup;
+
+        baselineTrack = (isInlineAxis ? gridItem.mArea.mCols.mEnd
+                                      : gridItem.mArea.mRows.mEnd) -
+                        1;
+      } else {
+        baselineTrack = isInlineAxis ? gridItem.mArea.mCols.mStart
+                                     : gridItem.mArea.mRows.mStart;
+      }
+
+
+      auto* rc = &aGridRI.mRenderingContext;
+      const LogicalSize cbSize = aGridRI.PercentageBasisFor(mAxis, gridItem);
+      LogicalSize avail(childWM, INFINITE_ISIZE_COORD, NS_UNCONSTRAINEDSIZE);
+      const LogicalAxis inlineAxisInChildWM =
+          isOrthogonal ? LogicalAxis::Block : LogicalAxis::Inline;
+      const nscoord colSize = cbSize.Size(inlineAxisInChildWM, childWM);
+      if (colSize != NS_UNCONSTRAINEDSIZE) {
+        avail.Size(inlineAxisInChildWM, childWM) = colSize;
+      }
+      ::MeasuringReflow(child, aGridRI.mReflowInput, rc, avail, cbSize);
+
+      nsGridContainerFrame* grid = do_QueryFrame(child);
+      auto frameSize =
+          isInlineAxis ? child->ISize(containerWM) : child->BSize(containerWM);
+      auto margin = child->GetLogicalUsedMargin(containerWM);
+      auto alignSize =
+          frameSize + (isInlineAxis ? margin.IStartEnd(containerWM)
+                                    : margin.BStartEnd(containerWM));
+
+      Maybe<nscoord> baseline;
+      if (grid) {
+        baseline.emplace((isOrthogonal == isInlineAxis)
+                             ? grid->GetBBaseline(baselineAlignment)
+                             : grid->GetIBaseline(baselineAlignment));
+      } else {
+        if (itemHasBaselineParallelToTrack) {
+          baseline = child->GetNaturalBaselineBOffset(
+              childWM, baselineAlignment, BaselineExportContext::Other);
+        }
+
+        if (!baseline) {
+
+          auto range = gridItem.mArea.LineRangeForAxis(mAxis).Range();
+          auto isTrackAutoSize =
+              std::find_if(range.begin(), range.end(), [&](auto track) {
+                constexpr auto intrinsicSizeFlags =
+                    TrackSize::eIntrinsicMinSizing |
+                    TrackSize::eIntrinsicMaxSizing |
+                    TrackSize::eApplyFitContentClamping |
+                    TrackSize::eFlexMaxSizing;
+                return (mSizes[track].mState & intrinsicSizeFlags) != 0;
+              }) != range.end();
+
+          if (!isTrackAutoSize ||
+              !gridItem.IsBSizeDependentOnContainerSize(containerWM)) {
+
+            if (containerWM.IsCentralBaseline()) {
+              const bool isFirstBaselineSharingGroup =
+                  baselineSharingGroup == BaselineSharingGroup::First;
+              baseline.emplace(frameSize / 2 + (isFirstBaselineSharingGroup
+                                                    ? 0
+                                                    : frameSize % 2));
+            } else {
+              baseline.emplace((isFirstBaseline == baselineWM.IsLineInverted())
+                                   ? 0
+                                   : frameSize);
+            }
+          }
+        }
+      }
+
+      if (baseline) {
+        nscoord finalBaseline = *baseline;
+        NS_ASSERTION(finalBaseline != NS_INTRINSIC_ISIZE_UNKNOWN,
+                     "about to use an unknown baseline");
+
+        nscoord marginAdjust = 0;
+        if (baselineSharingGroup == BaselineSharingGroup::First) {
+          marginAdjust = isInlineAxis ? margin.IStart(containerWM)
+                                      : margin.BStart(containerWM);
+        } else {
+          marginAdjust = isInlineAxis ? margin.IEnd(containerWM)
+                                      : margin.BEnd(containerWM);
+
+          state |= GridItemInfo::eEndSideBaseline;
+        }
+        finalBaseline += marginAdjust;
+
+        auto& baselineItems =
+            (baselineSharingGroup == BaselineSharingGroup::First)
+                ? firstBaselineItems
+                : lastBaselineItems;
+        baselineItems.AppendElement(ItemBaselineData{
+            baselineTrack, finalBaseline, alignSize, &gridItem});
+      } else {
+        state &= ~ItemState::eAllBaselineBits;
+      }
+    }
+
+    MOZ_ASSERT(
+        (state & (ItemState::eFirstBaseline | ItemState::eLastBaseline)) !=
+            (ItemState::eFirstBaseline | ItemState::eLastBaseline),
+        "first/last baseline bits are mutually exclusive");
+    MOZ_ASSERT(
+        (state & (ItemState::eSelfBaseline | ItemState::eContentBaseline)) !=
+            (ItemState::eSelfBaseline | ItemState::eContentBaseline),
+        "*-self and *-content baseline bits are mutually exclusive");
+    MOZ_ASSERT(
+        !(state & (ItemState::eFirstBaseline | ItemState::eLastBaseline)) ==
+            !(state & (ItemState::eSelfBaseline | ItemState::eContentBaseline)),
+        "first/last bit requires self/content bit and vice versa");
+
+    gridItem.mState[mAxis] |= state;
+    gridItem.mBaselineOffset[mAxis] = nscoord(0);
+  }
+
+  if (firstBaselineItems.IsEmpty() && lastBaselineItems.IsEmpty()) {
+    return;
+  }
+
+  mBaselineSubtreeAlign[BaselineSharingGroup::First] = StyleAlignFlags::START;
+  mBaselineSubtreeAlign[BaselineSharingGroup::Last] = StyleAlignFlags::END;
+
+  CalculateItemBaselines(firstBaselineItems, BaselineSharingGroup::First);
+  CalculateItemBaselines(lastBaselineItems, BaselineSharingGroup::Last);
+}
+
+void nsGridContainerFrame::Tracks::InitializeItemBaselinesInMasonryAxis(
+    GridReflowInput& aGridRI, nsTArray<GridItemInfo>& aGridItems,
+    BaselineAlignmentSet aSet, const nsSize& aContainerSize,
+    nsTArray<nscoord>& aTrackSizes,
+    nsTArray<ItemBaselineData>& aFirstBaselineItems,
+    nsTArray<ItemBaselineData>& aLastBaselineItems) {
+  MOZ_ASSERT(mIsMasonry);
+  WritingMode wm = aGridRI.mWM;
+  ComputedStyle* containerSC = aGridRI.mFrame->Style();
+  for (GridItemInfo& gridItem : aGridItems) {
+    if (gridItem.IsSubgrid(mAxis)) {
+      continue;
+    }
+    const auto& area = gridItem.mArea;
+    if (aSet.mItemSet == BaselineAlignmentSet::LastItems) {
+      if (!(gridItem.mState[mAxis] & ItemState::eIsLastItemInMasonryTrack) ||
+          (gridItem.mState[mAxis] & ItemState::eIsBaselineAligned)) {
+        continue;
+      }
+    } else {
+      if (area.LineRangeForAxis(mAxis).mStart > 0 ||
+          (gridItem.mState[mAxis] & ItemState::eIsBaselineAligned)) {
+        continue;
+      }
+    }
+    if (!aSet.MatchTrackAlignment(StyleAlignFlags::START)) {
+      continue;
+    }
+
+    nsIFrame* child = gridItem.mFrame;
+    uint32_t baselineTrack = kAutoLine;
+    auto state = ItemState(0);
+    auto childWM = child->GetWritingMode();
+    const bool isOrthogonal = wm.IsOrthogonalTo(childWM);
+    const bool isInlineAxis = mAxis == LogicalAxis::Inline;  
+    const bool itemHasBaselineParallelToTrack = isInlineAxis == isOrthogonal;
+    if (itemHasBaselineParallelToTrack) {
+      const auto* pos = child->StylePosition();
+      auto selfAlignment = pos->UsedSelfAlignment(mAxis, containerSC);
+      selfAlignment &= ~StyleAlignFlags::FLAG_BITS;
+      if (selfAlignment == StyleAlignFlags::BASELINE) {
+        state |= ItemState::eFirstBaseline | ItemState::eSelfBaseline;
+        baselineTrack = isInlineAxis ? area.mCols.mStart : area.mRows.mStart;
+      } else if (selfAlignment == StyleAlignFlags::LAST_BASELINE) {
+        state |= ItemState::eLastBaseline | ItemState::eSelfBaseline;
+        baselineTrack = (isInlineAxis ? area.mCols.mEnd : area.mRows.mEnd) - 1;
+      } else {
+        auto childAxis = isOrthogonal ? GetOrthogonalAxis(mAxis) : mAxis;
+        auto alignContent = pos->UsedContentAlignment(childAxis).primary;
+        alignContent &= ~StyleAlignFlags::FLAG_BITS;
+        if (alignContent == StyleAlignFlags::BASELINE) {
+          state |= ItemState::eFirstBaseline | ItemState::eContentBaseline;
+          baselineTrack = isInlineAxis ? area.mCols.mStart : area.mRows.mStart;
+        } else if (alignContent == StyleAlignFlags::LAST_BASELINE) {
+          state |= ItemState::eLastBaseline | ItemState::eContentBaseline;
+          baselineTrack =
+              (isInlineAxis ? area.mCols.mEnd : area.mRows.mEnd) - 1;
+        }
+      }
+    }
+
+    if (state & ItemState::eIsBaselineAligned) {
+
+      nscoord baseline;
+      nsGridContainerFrame* grid = do_QueryFrame(child);
+      if (state & ItemState::eFirstBaseline) {
+        if (grid) {
+          if (isOrthogonal == isInlineAxis) {
+            baseline = grid->GetBBaseline(BaselineSharingGroup::First);
+          } else {
+            baseline = grid->GetIBaseline(BaselineSharingGroup::First);
+          }
+        }
+        if (grid || nsLayoutUtils::GetFirstLineBaseline(wm, child, &baseline)) {
+          NS_ASSERTION(baseline != NS_INTRINSIC_ISIZE_UNKNOWN,
+                       "about to use an unknown baseline");
+          auto frameSize = isInlineAxis ? child->ISize(wm) : child->BSize(wm);
+          nscoord alignSize;
+          LogicalPoint pos =
+              child->GetLogicalNormalPosition(wm, aContainerSize);
+          baseline += pos.Pos(mAxis, wm);
+          if (aSet.mTrackAlignmentSet == BaselineAlignmentSet::EndStretch) {
+            state |= ItemState::eEndSideBaseline;
+            baseline =
+                aTrackSizes[gridItem.mArea
+                                .LineRangeForAxis(GetOrthogonalAxis(mAxis))
+                                .mStart] -
+                baseline;
+          }
+          alignSize = frameSize;
+          aFirstBaselineItems.AppendElement(ItemBaselineData(
+              {baselineTrack, baseline, alignSize, &gridItem}));
+        } else {
+          state &= ~ItemState::eAllBaselineBits;
+        }
+      } else {
+        if (grid) {
+          if (isOrthogonal == isInlineAxis) {
+            baseline = grid->GetBBaseline(BaselineSharingGroup::Last);
+          } else {
+            baseline = grid->GetIBaseline(BaselineSharingGroup::Last);
+          }
+        }
+        if (grid || nsLayoutUtils::GetLastLineBaseline(wm, child, &baseline)) {
+          NS_ASSERTION(baseline != NS_INTRINSIC_ISIZE_UNKNOWN,
+                       "about to use an unknown baseline");
+          auto frameSize = isInlineAxis ? child->ISize(wm) : child->BSize(wm);
+          auto m = child->GetLogicalUsedMargin(wm);
+          if (!grid &&
+              aSet.mTrackAlignmentSet == BaselineAlignmentSet::EndStretch) {
+            state |= ItemState::eEndSideBaseline;
+            LogicalPoint pos =
+                child->GetLogicalNormalPosition(wm, aContainerSize);
+            baseline += pos.Pos(mAxis, wm);
+            baseline =
+                aTrackSizes[gridItem.mArea
+                                .LineRangeForAxis(GetOrthogonalAxis(mAxis))
+                                .mStart] -
+                baseline;
+          } else if (grid && aSet.mTrackAlignmentSet ==
+                                 BaselineAlignmentSet::StartStretch) {
+            baseline = frameSize - baseline;
+          }
+          if (aSet.mItemSet == BaselineAlignmentSet::LastItems &&
+              aSet.mTrackAlignmentSet == BaselineAlignmentSet::StartStretch) {
+            LogicalPoint pos =
+                child->GetLogicalNormalPosition(wm, aContainerSize);
+            baseline += pos.B(wm);
+          }
+          if (aSet.mTrackAlignmentSet == BaselineAlignmentSet::EndStretch) {
+            state |= ItemState::eEndSideBaseline;
+          }
+          auto descent =
+              baseline + ((state & ItemState::eEndSideBaseline)
+                              ? (isInlineAxis ? m.IEnd(wm) : m.BEnd(wm))
+                              : (isInlineAxis ? m.IStart(wm) : m.BStart(wm)));
+          auto alignSize =
+              frameSize + (isInlineAxis ? m.IStartEnd(wm) : m.BStartEnd(wm));
+          aLastBaselineItems.AppendElement(
+              ItemBaselineData({baselineTrack, descent, alignSize, &gridItem}));
+        } else {
+          state &= ~ItemState::eAllBaselineBits;
+        }
+      }
+    }
+    MOZ_ASSERT(
+        (state & (ItemState::eFirstBaseline | ItemState::eLastBaseline)) !=
+            (ItemState::eFirstBaseline | ItemState::eLastBaseline),
+        "first/last baseline bits are mutually exclusive");
+    MOZ_ASSERT(
+        (state & (ItemState::eSelfBaseline | ItemState::eContentBaseline)) !=
+            (ItemState::eSelfBaseline | ItemState::eContentBaseline),
+        "*-self and *-content baseline bits are mutually exclusive");
+    MOZ_ASSERT(
+        !(state & (ItemState::eFirstBaseline | ItemState::eLastBaseline)) ==
+            !(state & (ItemState::eSelfBaseline | ItemState::eContentBaseline)),
+        "first/last bit requires self/content bit and vice versa");
+    gridItem.mState[mAxis] |= state;
+    gridItem.mBaselineOffset[mAxis] = nscoord(0);
+  }
+
+  CalculateItemBaselines(aFirstBaselineItems, BaselineSharingGroup::First);
+  CalculateItemBaselines(aLastBaselineItems, BaselineSharingGroup::Last);
+
+
+  MOZ_ASSERT(aFirstBaselineItems.Length() != 1 ||
+                 aFirstBaselineItems[0].mGridItem->mBaselineOffset[mAxis] == 0,
+             "a baseline group that contains only one item should not "
+             "produce a non-zero item baseline offset");
+  MOZ_ASSERT(aLastBaselineItems.Length() != 1 ||
+                 aLastBaselineItems[0].mGridItem->mBaselineOffset[mAxis] == 0,
+             "a baseline group that contains only one item should not "
+             "produce a non-zero item baseline offset");
+}
+
+void nsGridContainerFrame::Tracks::AlignBaselineSubtree(
+    const GridItemInfo& aGridItem) const {
+  if (mIsMasonry) {
+    return;
+  }
+  auto state = aGridItem.mState[mAxis];
+  if (!(state & ItemState::eIsBaselineAligned)) {
+    return;
+  }
+  const GridArea& area = aGridItem.mArea;
+  int32_t baselineTrack;
+  const bool isFirstBaseline = state & ItemState::eFirstBaseline;
+  if (isFirstBaseline) {
+    baselineTrack =
+        mAxis == LogicalAxis::Block ? area.mRows.mStart : area.mCols.mStart;
+  } else {
+    baselineTrack =
+        (mAxis == LogicalAxis::Block ? area.mRows.mEnd : area.mCols.mEnd) - 1;
+  }
+  const TrackSize& sz = mSizes[baselineTrack];
+  auto baselineGroup = isFirstBaseline ? BaselineSharingGroup::First
+                                       : BaselineSharingGroup::Last;
+  nscoord delta = sz.mBase - sz.mBaselineSubtreeSize[baselineGroup];
+  const auto subtreeAlign = mBaselineSubtreeAlign[baselineGroup];
+  if (subtreeAlign == StyleAlignFlags::START) {
+    if (state & ItemState::eLastBaseline) {
+      aGridItem.mBaselineOffset[mAxis] += delta;
+    }
+  } else if (subtreeAlign == StyleAlignFlags::END) {
+    if (isFirstBaseline) {
+      aGridItem.mBaselineOffset[mAxis] += delta;
+    }
+  } else if (subtreeAlign == StyleAlignFlags::CENTER) {
+    aGridItem.mBaselineOffset[mAxis] += delta / 2;
+  } else {
+    MOZ_ASSERT_UNREACHABLE("unexpected baseline subtree alignment");
+  }
+}
+
+bool nsGridContainerFrame::Tracks::GrowSizeForSpanningItems(
+    TrackSizingStep aStep, TrackSizingPhase aPhase,
+    nsTArray<SpanningItemData>::iterator aIter,
+    nsTArray<SpanningItemData>::iterator aIterEnd, nsTArray<uint32_t>& aTracks,
+    TrackPlan& aTrackPlan, ItemPlan& aItemPlan, SizingConstraint aConstraint,
+    bool aIsGridIntrinsicSizing, const TrackSizingFunctions& aFunctions,
+    const FitContentClamper& aFitContentClamper,
+    bool aNeedInfinitelyGrowableFlag) {
+  const bool isMaxSizingPhase = aPhase == TrackSizingPhase::IntrinsicMaximums ||
+                                aPhase == TrackSizingPhase::MaxContentMaximums;
+  bool needToUpdateSizes = false;
+  aTrackPlan.Initialize(aPhase, *this);
+  for (; aIter != aIterEnd; ++aIter) {
+    const SpanningItemData& item = *aIter;
+    if (!(item.mState & SelectorForPhase(aPhase, aConstraint))) {
+      continue;
+    }
+    if (isMaxSizingPhase) {
+      for (auto i : item.mLineRange.Range()) {
+        aTrackPlan[i].mState |= TrackSize::eModified;
+      }
+    }
+    if (aStep == TrackSizingStep::Flex && aIsGridIntrinsicSizing) {
+      continue;
+    }
+    nscoord space = item.SizeContributionForPhase(aPhase);
+    if (space <= 0) {
+      continue;
+    }
+    aTracks.ClearAndRetainStorage();
+    space = CollectGrowable(aStep, aPhase, space, item.mLineRange, aConstraint,
+                            aTracks);
+    if (space > 0) {
+      DistributeToTrackSizes(aStep, aPhase, space, aTrackPlan, aItemPlan,
+                             aTracks, aConstraint, aFunctions,
+                             aFitContentClamper);
+      needToUpdateSizes = true;
+    }
+  }
+  if (isMaxSizingPhase) {
+    needToUpdateSizes = true;
+  }
+  if (needToUpdateSizes) {
+    CopyPlanToSize(aPhase, aTrackPlan, aNeedInfinitelyGrowableFlag);
+  }
+  return needToUpdateSizes;
+}
+
+void nsGridContainerFrame::Tracks::ResolveIntrinsicSize(
+    GridReflowInput& aGridRI, nsTArray<GridItemInfo>& aGridItems,
+    const TrackSizingFunctions& aFunctions, LineRange GridArea::* aRange,
+    nscoord aPercentageBasis, SizingConstraint aConstraint) {
+
+  nsTArray<SpanningItemData> nonFlexSpanningItems, flexSpanningItems;
+  uint32_t maxSpan = 0;
+
+  const auto orthogonalAxis = GetOrthogonalAxis(mAxis);
+  const bool isMasonryInOtherAxis = aGridRI.mFrame->IsMasonry(orthogonalAxis);
+
+  for (auto& gridItem : aGridItems) {
+    MOZ_ASSERT(!(gridItem.mState[mAxis] &
+                 (ItemState::eContentBasedAutoMinSize | ItemState::eIsFlexing |
+                  ItemState::eClampMarginBoxMinSize)),
+               "Why are any of these bits set already?");
+
+    const GridArea& area = gridItem.mArea;
+    const LineRange& lineRange = area.*aRange;
+    const TrackSize::StateBits state = StateBitsForRange(lineRange);
+    if (state & TrackSize::eFlexMaxSizing) {
+      gridItem.mState[mAxis] |= ItemState::eIsFlexing;
+    }
+
+    if (isMasonryInOtherAxis &&
+        gridItem.mArea.LineRangeForAxis(orthogonalAxis).mStart != 0 &&
+        (gridItem.mState[mAxis] & ItemState::eAutoPlacement) &&
+        gridItem.mArea.LineRangeForAxis(mAxis).Extent() != mSizes.Length()) {
+      continue;
+    }
+
+    uint32_t span = lineRange.Extent();
+    if (MOZ_UNLIKELY(gridItem.mState[mAxis] & ItemState::eIsSubgrid)) {
+      auto itemWM = gridItem.mFrame->GetWritingMode();
+      auto percentageBasis = aGridRI.PercentageBasisFor(mAxis, gridItem);
+
+      if (percentageBasis.ISize(itemWM) == NS_UNCONSTRAINEDSIZE) {
+        percentageBasis.ISize(itemWM) = nscoord(0);
+      }
+
+      if (percentageBasis.BSize(itemWM) == NS_UNCONSTRAINEDSIZE) {
+        percentageBasis.BSize(itemWM) = nscoord(0);
+      }
+
+      const WritingMode wm = aGridRI.mWM;
+      auto* subgrid =
+          SubgridComputeMarginBorderPadding(gridItem, percentageBasis);
+      LogicalMargin mbp = SubgridAccumulatedMarginBorderPadding(
+          gridItem.SubgridFrame(), subgrid, wm, mAxis);
+
+      if (span == 1) {
+        AddSubgridContribution(mSizes[lineRange.mStart],
+                               mbp.StartEnd(mAxis, wm));
+      } else {
+        AddSubgridContribution(mSizes[lineRange.mStart], mbp.Start(mAxis, wm));
+        AddSubgridContribution(mSizes[lineRange.mEnd - 1], mbp.End(mAxis, wm));
+      }
+      continue;
+    }
+
+    if (!gridItem.mFrame->StyleDisplay()->IsScrollableOverflow() &&
+        state & TrackSize::eAutoMinSizing &&
+        (span == 1 || !(state & TrackSize::eFlexMaxSizing))) {
+      gridItem.mState[mAxis] |= ItemState::eContentBasedAutoMinSize;
+    }
+
+    if (span == 1) {
+      ResolveIntrinsicSizeForNonSpanningItems(aGridRI, aFunctions,
+                                              aPercentageBasis, aConstraint,
+                                              lineRange, gridItem);
+    } else {
+
+      nsTArray<SpanningItemData>* items;
+      if (state & TrackSize::eFlexMaxSizing) {
+        gridItem.mState[mAxis] |= ItemState::eIsFlexing;
+        items = &flexSpanningItems;
+      } else {
+        items = &nonFlexSpanningItems;
+      }
+
+      if (state &
+          (TrackSize::eIntrinsicMinSizing | TrackSize::eIntrinsicMaxSizing)) {
+        maxSpan = std::max(maxSpan, span);
+        CachedIntrinsicSizes cache{gridItem, aGridRI, mAxis};
+
+        if (gridItem.mState[mAxis] & ItemState::eContentBasedAutoMinSize) {
+          if (const Maybe<nscoord> minSizeClamp = ComputeMinSizeClamp(
+                  aFunctions, aPercentageBasis, lineRange, state)) {
+            cache.mMinSizeClamp = *minSizeClamp;
+            gridItem.mState[mAxis] |= ItemState::eClampMarginBoxMinSize;
+          }
+        }
+
+        EnumSet<GridIntrinsicSizeType> sizeTypesToCalculate;
+        TrackSize::StateBits selector =
+            SelectorForPhase(TrackSizingPhase::IntrinsicMinimums, aConstraint);
+
+        if (state & selector) {
+          sizeTypesToCalculate += GridIntrinsicSizeType::MinContribution;
+        }
+
+        selector =
+            SelectorForPhase(TrackSizingPhase::IntrinsicMaximums, aConstraint) |
+            SelectorForPhase(TrackSizingPhase::ContentBasedMinimums,
+                             aConstraint);
+        if (state & selector) {
+          sizeTypesToCalculate += GridIntrinsicSizeType::MinContentContribution;
+        }
+
+        selector =
+            SelectorForPhase(TrackSizingPhase::MaxContentMinimums,
+                             aConstraint) |
+            SelectorForPhase(TrackSizingPhase::MaxContentMaximums, aConstraint);
+        if (state & selector) {
+          sizeTypesToCalculate += GridIntrinsicSizeType::MaxContentContribution;
+        }
+
+        cache.EnsureContributions(sizeTypesToCalculate, gridItem, aGridRI,
+                                  mAxis);
+        items->AppendElement(SpanningItemData(
+            {span, state, lineRange, cache.SizesOrDefault(), gridItem.mFrame}));
+      }
+    }
+
+    MOZ_ASSERT(
+        !(gridItem.mState[mAxis] & ItemState::eClampMarginBoxMinSize) ||
+            (gridItem.mState[mAxis] & ItemState::eContentBasedAutoMinSize),
+        "clamping only applies to Automatic Minimum Size");
+  }
+
+  MOZ_ASSERT(maxSpan != 1, "Should only count spans greater than 1");
+  if (maxSpan) {
+    auto fitContentClamper = [&aFunctions, aPercentageBasis](uint32_t aTrack,
+                                                             nscoord aMinSize,
+                                                             nscoord* aSize) {
+      nscoord fitContentLimit = ::ResolveToDefiniteSize(
+          aFunctions.MaxSizingFor(aTrack), aPercentageBasis);
+      if (*aSize > fitContentLimit) {
+        *aSize = std::max(aMinSize, fitContentLimit);
+        return true;
+      }
+      return false;
+    };
+
+    std::sort(nonFlexSpanningItems.begin(), nonFlexSpanningItems.end(),
+              SpanningItemData::IsSpanLessThan);
+
+    nsTArray<uint32_t> tracks(maxSpan);
+    TrackPlan plan(mSizes.Length());
+    plan.SetLength(mSizes.Length());
+    ItemPlan itemPlan(mSizes.Length());
+    itemPlan.SetLength(mSizes.Length());
+
+    auto spanGroupStart = nonFlexSpanningItems.begin();
+    auto spanGroupEnd = spanGroupStart;
+    const auto end = nonFlexSpanningItems.end();
+
+    for (; spanGroupStart != end; spanGroupStart = spanGroupEnd) {
+      const uint32_t span = spanGroupStart->mSpan;
+      TrackSize::StateBits stateBitsForSpan = TrackSize::StateBits::eNone;
+      MOZ_ASSERT(spanGroupEnd == spanGroupStart);
+      do {
+        stateBitsForSpan |= StateBitsForRange(spanGroupEnd->mLineRange);
+      } while (++spanGroupEnd != end && spanGroupEnd->mSpan == span);
+      MOZ_ASSERT(!(stateBitsForSpan & TrackSize::eFlexMaxSizing),
+                 "Non-flex spanning items should not include any flex tracks");
+      bool updatedBase = false;  
+      TrackSizingPhase phase = TrackSizingPhase::IntrinsicMinimums;
+      if (stateBitsForSpan & SelectorForPhase(phase, aConstraint)) {
+        updatedBase = GrowSizeForSpanningItems(
+            TrackSizingStep::NotFlex, phase, spanGroupStart, spanGroupEnd,
+            tracks, plan, itemPlan, aConstraint, aGridRI.mIsGridIntrinsicSizing,
+            aFunctions);
+      }
+
+      phase = TrackSizingPhase::ContentBasedMinimums;
+      if (stateBitsForSpan & SelectorForPhase(phase, aConstraint)) {
+        updatedBase |= GrowSizeForSpanningItems(
+            TrackSizingStep::NotFlex, phase, spanGroupStart, spanGroupEnd,
+            tracks, plan, itemPlan, aConstraint, aGridRI.mIsGridIntrinsicSizing,
+            aFunctions);
+      }
+
+      phase = TrackSizingPhase::MaxContentMinimums;
+      if (stateBitsForSpan & SelectorForPhase(phase, aConstraint)) {
+        updatedBase |= GrowSizeForSpanningItems(
+            TrackSizingStep::NotFlex, phase, spanGroupStart, spanGroupEnd,
+            tracks, plan, itemPlan, aConstraint, aGridRI.mIsGridIntrinsicSizing,
+            aFunctions);
+      }
+
+      if (updatedBase) {
+        for (TrackSize& sz : mSizes) {
+          if (sz.mBase > sz.mLimit) {
+            sz.mLimit = sz.mBase;
+          }
+        }
+      }
+
+      phase = TrackSizingPhase::IntrinsicMaximums;
+      bool willRunStep3_6 = false;
+      if (stateBitsForSpan & SelectorForPhase(phase, aConstraint)) {
+        willRunStep3_6 =
+            stateBitsForSpan & TrackSize::eAutoOrMaxContentMaxSizing;
+        GrowSizeForSpanningItems(
+            TrackSizingStep::NotFlex, phase, spanGroupStart, spanGroupEnd,
+            tracks, plan, itemPlan, aConstraint, aGridRI.mIsGridIntrinsicSizing,
+            aFunctions, fitContentClamper, willRunStep3_6);
+      }
+      if (willRunStep3_6) {
+        phase = TrackSizingPhase::MaxContentMaximums;
+        GrowSizeForSpanningItems(
+            TrackSizingStep::NotFlex, phase, spanGroupStart, spanGroupEnd,
+            tracks, plan, itemPlan, aConstraint, aGridRI.mIsGridIntrinsicSizing,
+            aFunctions, fitContentClamper);
+      }
+    }
+
+    TrackSize::StateBits stateBitsForSpan = TrackSize::StateBits::eNone;
+    for (const SpanningItemData& spanningData : flexSpanningItems) {
+      const TrackSize::StateBits bits =
+          StateBitsForRange(spanningData.mLineRange);
+      MOZ_ASSERT(bits & TrackSize::eFlexMaxSizing,
+                 "All flex spanning items should have at least one flex track");
+      stateBitsForSpan |= bits;
+    }
+    bool updatedBase = false;  
+    TrackSizingPhase phase = TrackSizingPhase::IntrinsicMinimums;
+    if (stateBitsForSpan & SelectorForPhase(phase, aConstraint)) {
+      updatedBase = GrowSizeForSpanningItems(
+          TrackSizingStep::Flex, phase, flexSpanningItems.begin(),
+          flexSpanningItems.end(), tracks, plan, itemPlan, aConstraint,
+          aGridRI.mIsGridIntrinsicSizing, aFunctions);
+    }
+
+    phase = TrackSizingPhase::ContentBasedMinimums;
+    if (stateBitsForSpan & SelectorForPhase(phase, aConstraint)) {
+      updatedBase |= GrowSizeForSpanningItems(
+          TrackSizingStep::Flex, phase, flexSpanningItems.begin(),
+          flexSpanningItems.end(), tracks, plan, itemPlan, aConstraint,
+          aGridRI.mIsGridIntrinsicSizing, aFunctions);
+    }
+
+    phase = TrackSizingPhase::MaxContentMinimums;
+    if (stateBitsForSpan & SelectorForPhase(phase, aConstraint)) {
+      updatedBase |= GrowSizeForSpanningItems(
+          TrackSizingStep::Flex, phase, flexSpanningItems.begin(),
+          flexSpanningItems.end(), tracks, plan, itemPlan, aConstraint,
+          aGridRI.mIsGridIntrinsicSizing, aFunctions);
+    }
+
+    if (updatedBase) {
+      for (TrackSize& sz : mSizes) {
+        if (sz.mBase > sz.mLimit) {
+          sz.mLimit = sz.mBase;
+        }
+      }
+    }
+  }
+
+  for (TrackSize& sz : mSizes) {
+    if (sz.mLimit == NS_UNCONSTRAINEDSIZE) {
+      sz.mLimit = sz.mBase;
+    }
+  }
+}
+
+float nsGridContainerFrame::Tracks::FindFrUnitSize(
+    const LineRange& aRange, const nsTArray<uint32_t>& aFlexTracks,
+    const TrackSizingFunctions& aFunctions, nscoord aSpaceToFill) const {
+  MOZ_ASSERT(aSpaceToFill > 0 && !aFlexTracks.IsEmpty());
+  float flexFactorSum = 0.0f;
+  nscoord leftOverSpace = aSpaceToFill;
+  for (auto i : aRange.Range()) {
+    const TrackSize& sz = mSizes[i];
+    if (sz.mState & TrackSize::eFlexMaxSizing) {
+      flexFactorSum += aFunctions.MaxSizingFor(i).AsFlex()._0;
+    } else {
+      leftOverSpace -= sz.mBase;
+      if (leftOverSpace <= 0) {
+        return 0.0f;
+      }
+    }
+  }
+  bool restart;
+  float hypotheticalFrSize;
+  nsTArray<uint32_t> flexTracks(aFlexTracks.Clone());
+  uint32_t numFlexTracks = flexTracks.Length();
+  do {
+    restart = false;
+
+    hypotheticalFrSize = leftOverSpace / std::max(flexFactorSum, 1.0f);
+    for (uint32_t& track : flexTracks) {
+      if (track == kAutoLine) {
+        continue;  
+      }
+      float flexFactor = aFunctions.MaxSizingFor(track).AsFlex()._0;
+      const nscoord base = mSizes[track].mBase;
+      if (flexFactor * hypotheticalFrSize < base) {
+        track = kAutoLine;
+        flexFactorSum -= flexFactor;
+        leftOverSpace -= base;
+        --numFlexTracks;
+        if (numFlexTracks == 0 || leftOverSpace <= 0) {
+          return 0.0f;
+        }
+        restart = true;
+      }
+    }
+  } while (restart);
+  return hypotheticalFrSize;
+}
+
+float nsGridContainerFrame::Tracks::FindUsedFlexFraction(
+    GridReflowInput& aGridRI, const nsTArray<GridItemInfo>& aGridItems,
+    const nsTArray<uint32_t>& aFlexTracks,
+    const TrackSizingFunctions& aFunctions, nscoord aAvailableSize) const {
+  if (aAvailableSize != NS_UNCONSTRAINEDSIZE) {
+    const TranslatedLineRange range(0, mSizes.Length());
+    return FindFrUnitSize(range, aFlexTracks, aFunctions, aAvailableSize);
+  }
+
+  float fr = 0.0f;
+  for (uint32_t track : aFlexTracks) {
+    float flexFactor = aFunctions.MaxSizingFor(track).AsFlex()._0;
+    float possiblyDividedBaseSize = (flexFactor > 1.0f)
+                                        ? mSizes[track].mBase / flexFactor
+                                        : mSizes[track].mBase;
+    fr = std::max(fr, possiblyDividedBaseSize);
+  }
+  for (const GridItemInfo& item : aGridItems) {
+    if (item.mState[mAxis] & ItemState::eIsFlexing) {
+      const auto percentageBasis = aGridRI.PercentageBasisFor(mAxis, item);
+      nscoord spaceToFill = ContentContribution(
+          item, aGridRI, mAxis, percentageBasis, IntrinsicISizeType::PrefISize);
+      const LineRange& range =
+          mAxis == LogicalAxis::Inline ? item.mArea.mCols : item.mArea.mRows;
+      MOZ_ASSERT(range.Extent() >= 1);
+      const auto spannedGaps = range.Extent() - 1;
+      if (spannedGaps > 0) {
+        spaceToFill -= mGridGap * spannedGaps;
+      }
+      if (spaceToFill <= 0) {
+        continue;
+      }
+      nsTArray<uint32_t> itemFlexTracks;
+      for (auto i : range.Range()) {
+        if (mSizes[i].mState & TrackSize::eFlexMaxSizing) {
+          itemFlexTracks.AppendElement(i);
+        }
+      }
+      float itemFr =
+          FindFrUnitSize(range, itemFlexTracks, aFunctions, spaceToFill);
+      fr = std::max(fr, itemFr);
+    }
+  }
+  return fr;
+}
+
+void nsGridContainerFrame::Tracks::StretchFlexibleTracks(
+    GridReflowInput& aGridRI, const nsTArray<GridItemInfo>& aGridItems,
+    const TrackSizingFunctions& aFunctions, nscoord aAvailableSize) {
+  if (aAvailableSize <= 0) {
+    return;
+  }
+  nsTArray<uint32_t> flexTracks(mSizes.Length());
+  for (uint32_t i = 0, len = mSizes.Length(); i < len; ++i) {
+    if (mSizes[i].mState & TrackSize::eFlexMaxSizing) {
+      flexTracks.AppendElement(i);
+    }
+  }
+  if (flexTracks.IsEmpty()) {
+    return;
+  }
+  nscoord minSize = 0;
+  nscoord maxSize = NS_UNCONSTRAINEDSIZE;
+  if (aGridRI.mReflowInput) {
+    auto* ri = aGridRI.mReflowInput;
+    minSize = mAxis == LogicalAxis::Block ? ri->ComputedMinBSize()
+                                          : ri->ComputedMinISize();
+    maxSize = mAxis == LogicalAxis::Block ? ri->ComputedMaxBSize()
+                                          : ri->ComputedMaxISize();
+  }
+  Maybe<TrackPlan> origSizes;
+  bool applyMinMax = (minSize != 0 || maxSize != NS_UNCONSTRAINEDSIZE) &&
+                     aAvailableSize == NS_UNCONSTRAINEDSIZE;
+  while (true) {
+    float fr = FindUsedFlexFraction(aGridRI, aGridItems, flexTracks, aFunctions,
+                                    aAvailableSize);
+    if (fr != 0.0f) {
+      for (uint32_t i : flexTracks) {
+        float flexFactor = aFunctions.MaxSizingFor(i).AsFlex()._0;
+        nscoord flexLength = NSToCoordRound(flexFactor * fr);
+        nscoord& base = mSizes[i].mBase;
+        if (flexLength > base) {
+          if (applyMinMax && origSizes.isNothing()) {
+            origSizes.emplace(mSizes);
+          }
+          base = flexLength;
+        }
+      }
+    }
+    if (applyMinMax) {
+      applyMinMax = false;
+      const auto sumOfGridGaps = SumOfGridGaps();
+      nscoord newSize = SumOfGridTracks() + sumOfGridGaps;
+      if (newSize > maxSize) {
+        aAvailableSize = maxSize;
+      } else if (newSize < minSize) {
+        aAvailableSize = minSize;
+      }
+      if (aAvailableSize != NS_UNCONSTRAINEDSIZE) {
+        aAvailableSize = std::max(0, aAvailableSize - sumOfGridGaps);
+        if (origSizes.isSome()) {
+          mSizes = std::move(*origSizes);
+          origSizes.reset();
+        }  
+        if (aAvailableSize == 0) {
+          break;  
+        }
+        continue;
+      }
+    }
+    break;
+  }
+}
+
+void nsGridContainerFrame::Tracks::AlignJustifyContent(
+    const nsStylePosition* aStyle, StyleContentDistribution aAligmentStyleValue,
+    WritingMode aWM, nscoord aContentBoxSize, bool aIsSubgriddedAxis) {
+  const bool isAlign = mAxis == LogicalAxis::Block;
+  if (MOZ_UNLIKELY(aIsSubgriddedAxis)) {
+    auto& gap = isAlign ? aStyle->mRowGap : aStyle->mColumnGap;
+    if (gap.IsNormal()) {
+      return;
+    }
+    auto len = mSizes.Length();
+    if (len <= 1) {
+      return;
+    }
+    nsTArray<nscoord> gapDeltas;
+    const size_t numGaps = len - 1;
+    gapDeltas.SetLength(numGaps);
+    for (size_t i = 0; i < numGaps; ++i) {
+      TrackSize& sz1 = mSizes[i];
+      TrackSize& sz2 = mSizes[i + 1];
+      nscoord currentGap = sz2.mPosition - (sz1.mPosition + sz1.mBase);
+      gapDeltas[i] = mGridGap - currentGap;
+    }
+    nscoord currentPos = mSizes[0].mPosition;
+    nscoord lastHalfDelta(0);
+    for (size_t i = 0; i < numGaps; ++i) {
+      TrackSize& sz = mSizes[i];
+      nscoord delta = gapDeltas[i];
+      nscoord halfDelta;
+      nscoord roundingError = NSCoordDivRem(delta, 2, &halfDelta);
+      auto newSize = sz.mBase - (halfDelta + roundingError) - lastHalfDelta;
+      lastHalfDelta = halfDelta;
+      sz.mBase = std::max(newSize, 0);
+      sz.mPosition = currentPos;
+      currentPos += newSize + mGridGap;
+    }
+    auto& lastTrack = mSizes.LastElement();
+    auto newSize = lastTrack.mBase - lastHalfDelta;
+    lastTrack.mBase = std::max(newSize, 0);
+    lastTrack.mPosition = currentPos;
+    return;
+  }
+
+  if (mSizes.IsEmpty()) {
+    return;
+  }
+
+  bool overflowSafe;
+  auto alignment = ::GetAlignJustifyValue(aAligmentStyleValue.primary, aWM,
+                                          isAlign, &overflowSafe);
+  if (alignment == StyleAlignFlags::NORMAL) {
+    alignment = StyleAlignFlags::STRETCH;
+    aAligmentStyleValue = {alignment};
+  }
+
+  size_t numAutoTracks = 0;
+  nscoord space;
+  if (alignment != StyleAlignFlags::START) {
+    nscoord trackSizeSum = 0;
+    if (aIsSubgriddedAxis) {
+      numAutoTracks = mSizes.Length();
+    } else {
+      for (const TrackSize& sz : mSizes) {
+        trackSizeSum += sz.mBase;
+        if (sz.mState & TrackSize::eAutoMaxSizing) {
+          ++numAutoTracks;
+        }
+      }
+    }
+    space = aContentBoxSize - trackSizeSum - SumOfGridGaps();
+    if (space < 0 ||
+        (alignment == StyleAlignFlags::SPACE_BETWEEN && mSizes.Length() == 1)) {
+      auto fallback = GetAlignJustifyDistributionFallback(aAligmentStyleValue,
+                                                          &overflowSafe);
+      if (fallback) {
+        alignment = *fallback;
+      }
+    }
+    if (space == 0 || (space < 0 && overflowSafe)) {
+      alignment = StyleAlignFlags::START;
+    }
+  }
+
+  nscoord pos = 0;
+  bool distribute = true;
+  if (alignment == StyleAlignFlags::BASELINE ||
+      alignment == StyleAlignFlags::LAST_BASELINE) {
+    NS_WARNING("NYI: 'first/last baseline' (bug 1151204)");  
+    alignment = StyleAlignFlags::START;
+  }
+  if (alignment == StyleAlignFlags::START) {
+    distribute = false;
+  } else if (alignment == StyleAlignFlags::END) {
+    pos = space;
+    distribute = false;
+  } else if (alignment == StyleAlignFlags::CENTER) {
+    pos = space / 2;
+    distribute = false;
+  } else if (alignment == StyleAlignFlags::STRETCH) {
+    distribute = numAutoTracks != 0;
+  }
+  if (!distribute) {
+    for (TrackSize& sz : mSizes) {
+      sz.mPosition = pos;
+      pos += sz.mBase + mGridGap;
+    }
+    return;
+  }
+
+  MOZ_ASSERT(space > 0, "should've handled that on the fallback path above");
+  nscoord between, roundingError;
+  if (alignment == StyleAlignFlags::STRETCH) {
+    MOZ_ASSERT(numAutoTracks > 0, "we handled numAutoTracks == 0 above");
+    while (space) {
+      pos = 0;
+      nscoord spacePerTrack;
+      roundingError = NSCoordDivRem(space, numAutoTracks, &spacePerTrack);
+      space = 0;
+      for (TrackSize& sz : mSizes) {
+        sz.mPosition = pos;
+        if (!(sz.mState & TrackSize::eAutoMaxSizing)) {
+          pos += sz.mBase + mGridGap;
+          continue;
+        }
+        nscoord stretch = spacePerTrack;
+        if (roundingError) {
+          roundingError -= 1;
+          stretch += 1;
+        }
+        nscoord newBase = sz.mBase + stretch;
+        if (mIsMasonry && (sz.mState & TrackSize::eClampToLimit)) {
+          auto clampedSize = std::min(newBase, sz.mLimit);
+          auto sizeOverLimit = newBase - clampedSize;
+          if (sizeOverLimit > 0) {
+            newBase = clampedSize;
+            sz.mState &= ~(sz.mState & TrackSize::eAutoMaxSizing);
+            space += sizeOverLimit;
+            if (--numAutoTracks == 0) {
+              space = 0;
+            }
+          }
+        }
+        sz.mBase = newBase;
+        pos += newBase + mGridGap;
+      }
+    }
+    MOZ_ASSERT(!roundingError, "we didn't distribute all rounding error?");
+    return;
+  }
+  if (alignment == StyleAlignFlags::SPACE_BETWEEN) {
+    MOZ_ASSERT(mSizes.Length() > 1, "should've used a fallback above");
+    roundingError = NSCoordDivRem(space, mSizes.Length() - 1, &between);
+  } else if (alignment == StyleAlignFlags::SPACE_AROUND) {
+    roundingError = NSCoordDivRem(space, mSizes.Length(), &between);
+    pos = between / 2;
+  } else if (alignment == StyleAlignFlags::SPACE_EVENLY) {
+    roundingError = NSCoordDivRem(space, mSizes.Length() + 1, &between);
+    pos = between;
+  } else {
+    MOZ_ASSERT_UNREACHABLE("unknown align-/justify-content value");
+    between = 0;        
+    roundingError = 0;  
+  }
+  between += mGridGap;
+  for (TrackSize& sz : mSizes) {
+    sz.mPosition = pos;
+    nscoord spacing = between;
+    if (roundingError) {
+      roundingError -= 1;
+      spacing += 1;
+    }
+    pos += sz.mBase + spacing;
+  }
+  MOZ_ASSERT(!roundingError, "we didn't distribute all rounding error?");
+}
+
+nscoord nsGridContainerFrame::Tracks::TotalTrackSizeWithoutAlignment(
+    const nsGridContainerFrame* aGridContainerFrame) const {
+  if (aGridContainerFrame->IsSubgrid(mAxis)) {
+    return GridLineEdge(mSizes.Length(), GridLineSide::BeforeGridGap);
+  }
+
+  return SumOfGridTracksAndGaps();
+}
+
+void nsGridContainerFrame::LineRange::ToPositionAndLength(
+    const TrackPlan& aTrackSizes, nscoord* aPos, nscoord* aLength) const {
+  MOZ_ASSERT(mStart != kAutoLine && mEnd != kAutoLine,
+             "expected a definite LineRange");
+  MOZ_ASSERT(mStart < mEnd);
+  nscoord startPos = aTrackSizes[mStart].mPosition;
+  const TrackSize& sz = aTrackSizes[mEnd - 1];
+  *aPos = startPos;
+  *aLength = (sz.mPosition + sz.mBase) - startPos;
+}
+
+nscoord nsGridContainerFrame::LineRange::ToLength(
+    const TrackPlan& aTrackSizes) const {
+  MOZ_ASSERT(mStart != kAutoLine && mEnd != kAutoLine,
+             "expected a definite LineRange");
+  MOZ_ASSERT(mStart < mEnd);
+  nscoord startPos = aTrackSizes[mStart].mPosition;
+  const TrackSize& sz = aTrackSizes[mEnd - 1];
+  return (sz.mPosition + sz.mBase) - startPos;
+}
+
+void nsGridContainerFrame::LineRange::ToPositionAndLengthForAbsPos(
+    const Tracks& aTracks, nscoord aGridOrigin, nscoord* aPos,
+    nscoord* aLength) const {
+  if (mEnd == kAutoLine) {
+    if (mStart == kAutoLine) {
+    } else {
+      const nscoord endPos = *aPos + *aLength;
+      auto side = mStart == aTracks.mSizes.Length()
+                      ? GridLineSide::BeforeGridGap
+                      : GridLineSide::AfterGridGap;
+      nscoord startPos = aTracks.GridLineEdge(mStart, side);
+      *aPos = aGridOrigin + startPos;
+      *aLength = std::max(endPos - *aPos, 0);
+    }
+  } else {
+    if (mStart == kAutoLine) {
+      auto side =
+          mEnd == 0 ? GridLineSide::AfterGridGap : GridLineSide::BeforeGridGap;
+      nscoord endPos = aTracks.GridLineEdge(mEnd, side);
+      *aLength = std::max(aGridOrigin + endPos, 0);
+    } else if (MOZ_LIKELY(mStart != mEnd)) {
+      nscoord pos;
+      ToPositionAndLength(aTracks.mSizes, &pos, aLength);
+      *aPos = aGridOrigin + pos;
+    } else {
+      nscoord pos = aTracks.GridLineEdge(mStart, GridLineSide::BeforeGridGap);
+      *aPos = aGridOrigin + pos;
+      *aLength = nscoord(0);
+    }
+  }
+}
+
+LogicalSize nsGridContainerFrame::GridReflowInput::PercentageBasisFor(
+    LogicalAxis aAxis, const GridItemInfo& aGridItem) const {
+  auto wm = aGridItem.mFrame->GetWritingMode();
+  const auto* itemParent = aGridItem.mFrame->GetParent();
+  if (MOZ_UNLIKELY(itemParent != mFrame)) {
+    MOZ_ASSERT(itemParent->IsGridContainerFrame());
+    auto* subgridFrame = static_cast<const nsGridContainerFrame*>(itemParent);
+    MOZ_ASSERT(subgridFrame->IsSubgrid());
+    if (auto* uts = subgridFrame->GetUsedTrackSizes()) {
+      auto subgridWM = subgridFrame->GetWritingMode();
+      LogicalSize cbSize(subgridWM, NS_UNCONSTRAINEDSIZE, NS_UNCONSTRAINEDSIZE);
+      if (!subgridFrame->IsColSubgrid() &&
+          uts->mCanResolveLineRangeSize[LogicalAxis::Inline]) {
+        const auto subgridIAxisInGridWM =
+            subgridWM.ConvertAxisTo(LogicalAxis::Inline, mWM);
+        const auto& range =
+            aGridItem.mArea.LineRangeForAxis(subgridIAxisInGridWM);
+        cbSize.ISize(subgridWM) =
+            range.ToLength(uts->mTrackPlans[LogicalAxis::Inline]);
+      }
+      if (!subgridFrame->IsRowSubgrid() &&
+          uts->mCanResolveLineRangeSize[LogicalAxis::Block]) {
+        const auto subgridBAxisInGridWM =
+            subgridWM.ConvertAxisTo(LogicalAxis::Block, mWM);
+        const auto& range =
+            aGridItem.mArea.LineRangeForAxis(subgridBAxisInGridWM);
+        cbSize.BSize(subgridWM) =
+            range.ToLength(uts->mTrackPlans[LogicalAxis::Block]);
+      }
+      return cbSize.ConvertTo(wm, subgridWM);
+    }
+
+    return LogicalSize(wm, NS_UNCONSTRAINEDSIZE, NS_UNCONSTRAINEDSIZE);
+  }
+
+  const nscoord colSize = mCols.mCanResolveLineRangeSize
+                              ? mCols.ResolveSize(aGridItem.mArea.mCols)
+                              : NS_UNCONSTRAINEDSIZE;
+  const nscoord rowSize = mRows.mCanResolveLineRangeSize
+                              ? mRows.ResolveSize(aGridItem.mArea.mRows)
+                              : NS_UNCONSTRAINEDSIZE;
+  return !wm.IsOrthogonalTo(mWM) ? LogicalSize(wm, colSize, rowSize)
+                                 : LogicalSize(wm, rowSize, colSize);
+}
+
+LogicalRect nsGridContainerFrame::GridReflowInput::ContainingBlockFor(
+    const GridArea& aArea) const {
+  nscoord i, b, iSize, bSize;
+  MOZ_ASSERT(aArea.mCols.Extent() > 0, "grid items cover at least one track");
+  MOZ_ASSERT(aArea.mRows.Extent() > 0, "grid items cover at least one track");
+  aArea.mCols.ToPositionAndLength(mCols.mSizes, &i, &iSize);
+  aArea.mRows.ToPositionAndLength(mRows.mSizes, &b, &bSize);
+  return LogicalRect(mWM, i, b, iSize, bSize);
+}
+
+LogicalRect nsGridContainerFrame::GridReflowInput::ContainingBlockForAbsPos(
+    const GridArea& aArea, const LogicalPoint& aGridOrigin,
+    const LogicalRect& aGridCB) const {
+  nscoord i = aGridCB.IStart(mWM);
+  nscoord b = aGridCB.BStart(mWM);
+  nscoord iSize = aGridCB.ISize(mWM);
+  nscoord bSize = aGridCB.BSize(mWM);
+  aArea.mCols.ToPositionAndLengthForAbsPos(mCols, aGridOrigin.I(mWM), &i,
+                                           &iSize);
+  aArea.mRows.ToPositionAndLengthForAbsPos(mRows, aGridOrigin.B(mWM), &b,
+                                           &bSize);
+  return LogicalRect(mWM, i, b, iSize, bSize);
+}
+
+void nsGridContainerFrame::GridReflowInput::AlignJustifyContentInMasonryAxis(
+    nscoord aMasonryBoxSize, nscoord aContentBoxSize) {
+  if (aContentBoxSize == NS_UNCONSTRAINEDSIZE) {
+    aContentBoxSize = aMasonryBoxSize;
+  }
+  auto& masonryAxisTracks = mRows.mIsMasonry ? mRows : mCols;
+  MOZ_ASSERT(masonryAxisTracks.mSizes.Length() == 2,
+             "unexpected masonry axis tracks");
+  const auto masonryAxis = masonryAxisTracks.mAxis;
+  const auto contentAlignment = mGridStyle->UsedContentAlignment(masonryAxis);
+  if (contentAlignment.primary == StyleAlignFlags::NORMAL ||
+      contentAlignment.primary == StyleAlignFlags::STRETCH) {
+    nscoord cbSize = std::max(aMasonryBoxSize, aContentBoxSize);
+    for (auto& sz : masonryAxisTracks.mSizes) {
+      sz.mBase = cbSize;
+    }
+    return;
+  }
+
+  auto savedTrackSizes(std::move(masonryAxisTracks.mSizes));
+  masonryAxisTracks.mSizes.AppendElement(savedTrackSizes[0]);
+  masonryAxisTracks.mSizes[0].mBase = aMasonryBoxSize;
+  masonryAxisTracks.AlignJustifyContent(mGridStyle, contentAlignment, mWM,
+                                        aContentBoxSize, false);
+  nscoord masonryBoxOffset = masonryAxisTracks.mSizes[0].mPosition;
+  masonryAxisTracks.mSizes = std::move(savedTrackSizes);
+  for (auto& sz : masonryAxisTracks.mSizes) {
+    sz.mPosition = masonryBoxOffset;
+    sz.mBase = aMasonryBoxSize;
+  }
+}
+
+void nsGridContainerFrame::GridReflowInput::AlignJustifyTracksInMasonryAxis(
+    const LogicalSize& aContentSize, const nsSize& aContainerSize) {
+  auto& masonryAxisTracks = mRows.mIsMasonry ? mRows : mCols;
+  MOZ_ASSERT(masonryAxisTracks.mSizes.Length() == 2,
+             "unexpected masonry axis tracks");
+  const nscoord masonryBoxOffset = masonryAxisTracks.mSizes[0].mPosition;
+  if (masonryBoxOffset == 0) {
+    return;
+  }
+
+  const auto masonryAxis = masonryAxisTracks.mAxis;
+  auto gridAxis = GetOrthogonalAxis(masonryAxis);
+  auto& gridAxisTracks = TracksFor(gridAxis);
+  auto wm = mWM;
+
+  for (auto i : IntegerRange(gridAxisTracks.mSizes.Length())) {
+    auto delta = masonryBoxOffset;
+    LogicalPoint logicalDelta(wm);
+    logicalDelta.Pos(masonryAxis, wm) = delta;
+    for (const auto& item : mGridItems) {
+      if (item.mArea.LineRangeForAxis(gridAxis).mStart != i) {
+        continue;
+      }
+      item.mFrame->MovePositionBy(wm, logicalDelta);
+    }
+  }
+}
+
+Maybe<nsGridContainerFrame::Fragmentainer>
+nsGridContainerFrame::GetNearestFragmentainer(
+    const GridReflowInput& aGridRI) const {
+  Maybe<nsGridContainerFrame::Fragmentainer> data;
+  const ReflowInput* gridRI = aGridRI.mReflowInput;
+  if (!gridRI->IsInFragmentedContext()) {
+    return data;
+  }
+  WritingMode wm = aGridRI.mWM;
+  const ReflowInput* cbRI = gridRI->mCBReflowInput;
+  for (; cbRI; cbRI = cbRI->mCBReflowInput) {
+    ScrollContainerFrame* sf = do_QueryFrame(cbRI->mFrame);
+    if (sf) {
+      break;
+    }
+    if (wm.IsOrthogonalTo(cbRI->GetWritingMode())) {
+      break;
+    }
+    LayoutFrameType frameType = cbRI->mFrame->Type();
+    if ((frameType == LayoutFrameType::Canvas &&
+         PresContext()->IsPaginated()) ||
+        frameType == LayoutFrameType::ColumnSet) {
+      data.emplace();
+      data->mIsTopOfPage = gridRI->mFlags.mIsTopOfPage;
+      if (gridRI->AvailableBSize() != NS_UNCONSTRAINEDSIZE) {
+        data->mToFragmentainerEnd = aGridRI.mFragBStart +
+                                    gridRI->AvailableBSize() -
+                                    aGridRI.mBorderPadding.BStart(wm);
+      } else {
+        data->mToFragmentainerEnd = NS_UNCONSTRAINEDSIZE;
+      }
+      const auto numRows = aGridRI.mRows.mSizes.Length();
+      data->mCanBreakAtStart =
+          numRows > 0 && aGridRI.mRows.mSizes[0].mPosition > 0;
+      nscoord bSize = gridRI->ComputedBSize();
+      data->mIsAutoBSize = bSize == NS_UNCONSTRAINEDSIZE;
+      if (data->mIsAutoBSize) {
+        bSize = gridRI->ComputedMinBSize();
+      } else {
+        bSize = gridRI->ApplyMinMaxBSize(bSize);
+      }
+      nscoord gridEnd =
+          aGridRI.mRows.GridLineEdge(numRows, GridLineSide::BeforeGridGap);
+      data->mCanBreakAtEnd = bSize > gridEnd && bSize > aGridRI.mFragBStart;
+      break;
+    }
+  }
+  return data;
+}
+
+void nsGridContainerFrame::ReflowInFlowChild(
+    nsIFrame* aChild, const GridItemInfo* aGridItemInfo, nsSize aContainerSize,
+    const Maybe<nscoord>& aStretchBSize, const Fragmentainer* aFragmentainer,
+    const GridReflowInput& aGridRI, const LogicalRect& aContentArea,
+    ReflowOutput& aDesiredSize, nsReflowStatus& aStatus) {
+  nsPresContext* pc = PresContext();
+  ComputedStyle* containerSC = Style();
+  WritingMode wm = aGridRI.mReflowInput->GetWritingMode();
+  const bool isGridItem = !!aGridItemInfo;
+  MOZ_ASSERT(isGridItem == !aChild->IsPlaceholderFrame());
+  LogicalRect cb(wm);
+  WritingMode childWM = aChild->GetWritingMode();
+  bool isConstrainedBSize = false;
+  nscoord toFragmentainerEnd;
+  nscoord consumedGridAreaBSize = 0;
+  if (MOZ_LIKELY(isGridItem)) {
+    MOZ_ASSERT(aGridItemInfo->mFrame == aChild);
+    const GridArea& area = aGridItemInfo->mArea;
+    MOZ_ASSERT(area.IsDefinite());
+    cb = aGridRI.ContainingBlockFor(area);
+    if (aFragmentainer && !wm.IsOrthogonalTo(childWM)) {
+      nscoord gridAreaBOffset = cb.BStart(wm) - aGridRI.mFragBStart;
+      consumedGridAreaBSize = std::max(0, -gridAreaBOffset);
+      cb.BStart(wm) = std::max(0, gridAreaBOffset);
+      if (aFragmentainer->mToFragmentainerEnd != NS_UNCONSTRAINEDSIZE) {
+        toFragmentainerEnd = aFragmentainer->mToFragmentainerEnd -
+                             aGridRI.mFragBStart - cb.BStart(wm);
+        toFragmentainerEnd = std::max(toFragmentainerEnd, 0);
+        isConstrainedBSize = true;
+      }
+    }
+    cb += aContentArea.Origin(wm);
+    aGridRI.mRows.AlignBaselineSubtree(*aGridItemInfo);
+    aGridRI.mCols.AlignBaselineSubtree(*aGridItemInfo);
+    typedef const FramePropertyDescriptor<SmallValueHolder<nscoord>>* Prop;
+    auto SetProp = [aGridItemInfo, aChild](LogicalAxis aGridAxis, Prop aProp) {
+      auto state = aGridItemInfo->mState[aGridAxis];
+      auto baselineAdjust = (state & ItemState::eContentBaseline)
+                                ? aGridItemInfo->mBaselineOffset[aGridAxis]
+                                : nscoord(0);
+      if (baselineAdjust < nscoord(0)) {
+        baselineAdjust = nscoord(0);
+      } else if (state & ItemState::eLastBaseline) {
+        baselineAdjust = -baselineAdjust;
+      }
+      if (baselineAdjust != nscoord(0)) {
+        aChild->SetProperty(aProp, baselineAdjust);
+      } else {
+        aChild->RemoveProperty(aProp);
+      }
+    };
+    const bool isOrthogonal = wm.IsOrthogonalTo(childWM);
+    SetProp(LogicalAxis::Block,
+            isOrthogonal ? IBaselinePadProperty() : BBaselinePadProperty());
+    SetProp(LogicalAxis::Inline,
+            isOrthogonal ? BBaselinePadProperty() : IBaselinePadProperty());
+  } else {
+    cb = aContentArea;
+    aChild->AddStateBits(PLACEHOLDER_STATICPOS_NEEDS_CSSALIGN);
+  }
+
+  LogicalSize reflowSize(cb.Size(wm));
+  if (isConstrainedBSize) {
+    reflowSize.BSize(wm) = toFragmentainerEnd;
+  }
+  LogicalSize childCBSize = reflowSize.ConvertTo(childWM, wm);
+
+  ComputeSizeFlags csFlags;
+  if (aGridItemInfo) {
+    const auto childIAxisInWM = childWM.ConvertAxisTo(LogicalAxis::Inline, wm);
+    if (GridItemShouldStretch(aChild, LogicalAxis::Inline)) {
+      if (aGridItemInfo->mState[childIAxisInWM] &
+          ItemState::eClampMarginBoxMinSize) {
+        csFlags += ComputeSizeFlag::IClampMarginBoxMinSize;
+      }
+    } else {
+      csFlags += ComputeSizeFlag::ShrinkWrap;
+    }
+
+    const auto childBAxisInWM = GetOrthogonalAxis(childIAxisInWM);
+    if (GridItemShouldStretch(aChild, LogicalAxis::Block) &&
+        aGridItemInfo->mState[childBAxisInWM] &
+            ItemState::eClampMarginBoxMinSize) {
+      csFlags += ComputeSizeFlag::BClampMarginBoxMinSize;
+      aChild->SetProperty(BClampMarginBoxMinSizeProperty(),
+                          childCBSize.BSize(childWM));
+    } else {
+      aChild->RemoveProperty(BClampMarginBoxMinSizeProperty());
+    }
+
+    if ((aGridItemInfo->mState[childIAxisInWM] &
+         ItemState::eContentBasedAutoMinSize)) {
+      csFlags += ComputeSizeFlag::IApplyAutoMinSize;
+    }
+  }
+
+  if (!isConstrainedBSize) {
+    childCBSize.BSize(childWM) = NS_UNCONSTRAINEDSIZE;
+  }
+  LogicalSize percentBasis(cb.Size(wm).ConvertTo(childWM, wm));
+  ReflowInput childRI(pc, *aGridRI.mReflowInput, aChild, childCBSize,
+                      Some(percentBasis), {}, {}, csFlags);
+  childRI.mFlags.mIsTopOfPage =
+      aFragmentainer ? aFragmentainer->mIsTopOfPage : false;
+
+  childRI.SetBResize(true);
+  childRI.SetBResizeForPercentages(true);
+
+  if (isConstrainedBSize && !wm.IsOrthogonalTo(childWM)) {
+    const bool stretch =
+        childRI.mStylePosition
+            ->BSize(childWM, AnchorPosResolutionParams::From(&childRI))
+            ->IsAuto() &&
+        GridItemShouldStretch(aChild, LogicalAxis::Block);
+    if (stretch) {
+      aChild->SetProperty(FragStretchBSizeProperty(), *aStretchBSize);
+    } else {
+      aChild->RemoveProperty(FragStretchBSizeProperty());
+    }
+  }
+
+  ReflowOutput childSize(childRI);
+  const nsSize dummyContainerSize;
+
+  ReflowChild(aChild, pc, childSize, childRI, childWM, LogicalPoint(childWM),
+              dummyContainerSize, ReflowChildFlags::Default, aStatus);
+
+  LogicalPoint childPos = cb.Origin(wm).ConvertRectOriginTo(
+      childWM, wm, childSize.PhysicalSize(), aContainerSize);
+
+  if (MOZ_LIKELY(isGridItem)) {
+    LogicalSize size = childSize.Size(childWM);  
+    auto applyItemSelfAlignment = [&](LogicalAxis aAxis, nscoord aCBSize) {
+      auto align =
+          childRI.mStylePosition->UsedSelfAlignment(aAxis, containerSC);
+      auto state = aGridItemInfo->mState[aAxis];
+      AlignJustifyFlags flags;
+      if (IsMasonry(aAxis)) {
+        if (MOZ_LIKELY(!(state & ItemState::eSelfBaseline))) {
+          align = {StyleAlignFlags::START};
+        } else {
+          auto group = (state & ItemState::eFirstBaseline)
+                           ? BaselineSharingGroup::First
+                           : BaselineSharingGroup::Last;
+          auto itemStart = aGridItemInfo->mArea.LineRangeForAxis(aAxis).mStart;
+          aCBSize = aGridRI.TracksFor(aAxis)
+                        .mSizes[itemStart]
+                        .mBaselineSubtreeSize[group];
+        }
+        flags += AlignJustifyFlag::IgnoreAutoMargins;
+      } else if (state & ItemState::eContentBaseline) {
+        align = {(state & ItemState::eFirstBaseline)
+                     ? StyleAlignFlags::SELF_START
+                     : StyleAlignFlags::SELF_END};
+      }
+      if (aAxis == LogicalAxis::Block) {
+        AlignSelf(*aGridItemInfo, align, aCBSize, wm, childRI, size, flags,
+                  &childPos);
+      } else {
+        JustifySelf(*aGridItemInfo, align, aCBSize, wm, childRI, size, flags,
+                    &childPos);
+      }
+    };
+    if (aStatus.IsComplete()) {
+      applyItemSelfAlignment(LogicalAxis::Block,
+                             cb.BSize(wm) - consumedGridAreaBSize);
+    }
+    applyItemSelfAlignment(LogicalAxis::Inline, cb.ISize(wm));
+  }  
+
+  FinishReflowChild(aChild, pc, childSize, &childRI, childWM, childPos,
+                    aContainerSize, ReflowChildFlags::ApplyRelativePositioning);
+  ConsiderChildOverflow(aDesiredSize.mOverflowAreas, aChild);
+}
+
+nscoord nsGridContainerFrame::ReflowInFragmentainer(
+    GridReflowInput& aGridRI, const LogicalRect& aContentArea,
+    ReflowOutput& aDesiredSize, nsReflowStatus& aStatus,
+    Fragmentainer& aFragmentainer, const nsSize& aContainerSize) {
+  MOZ_ASSERT(aStatus.IsEmpty());
+  MOZ_ASSERT(aGridRI.mReflowInput);
+
+  nsTArray<const GridItemInfo*> sortedItems(aGridRI.mGridItems.Length());
+  nsTArray<nsIFrame*> placeholders(aGridRI.mAbsPosItems.Length());
+  aGridRI.mIter.Reset(CSSOrderAwareFrameIterator::ChildFilter::IncludeAll);
+  for (; !aGridRI.mIter.AtEnd(); aGridRI.mIter.Next()) {
+    nsIFrame* child = *aGridRI.mIter;
+    if (!child->IsPlaceholderFrame()) {
+      const GridItemInfo* info = &aGridRI.mGridItems[aGridRI.mIter.ItemIndex()];
+      sortedItems.AppendElement(info);
+    } else {
+      placeholders.AppendElement(child);
+    }
+  }
+  if (IsMasonry()) {
+    std::stable_sort(sortedItems.begin(), sortedItems.end(),
+                     GridItemInfo::IsStartRowLessThan);
+  } else {
+    std::sort(sortedItems.begin(), sortedItems.end(),
+              GridItemInfo::IsStartRowLessThan);
+  }
+
+  for (auto child : placeholders) {
+    nsReflowStatus childStatus;
+    ReflowInFlowChild(child, nullptr, aContainerSize, Nothing(),
+                      &aFragmentainer, aGridRI, aContentArea, aDesiredSize,
+                      childStatus);
+    MOZ_ASSERT(childStatus.IsComplete(),
+               "nsPlaceholderFrame should never need to be fragmented");
+  }
+
+  nscoord childAvailableSize = aFragmentainer.mToFragmentainerEnd;
+  const uint32_t startRow = aGridRI.mStartRow;
+  const uint32_t numRows = aGridRI.mRows.mSizes.Length();
+  bool isBDBClone = aGridRI.mReflowInput->mStyleBorder->mBoxDecorationBreak ==
+                    StyleBoxDecorationBreak::Clone;
+  nscoord bpBEnd = aGridRI.mBorderPadding.BEnd(aGridRI.mWM);
+
+  uint32_t endRow = numRows;
+  for (uint32_t row = startRow; row < numRows; ++row) {
+    auto& sz = aGridRI.mRows.mSizes[row];
+    const nscoord bEnd = sz.mPosition + sz.mBase;
+    nscoord remainingAvailableSize = childAvailableSize - bEnd;
+    if (remainingAvailableSize < 0 ||
+        (isBDBClone && remainingAvailableSize < bpBEnd)) {
+      endRow = row;
+      break;
+    }
+  }
+
+  bool isForcedBreak = false;
+  const bool avoidBreakInside = ShouldAvoidBreakInside(*aGridRI.mReflowInput);
+  if (childAvailableSize != NS_UNCONSTRAINEDSIZE) {
+    const bool isTopOfPage = aFragmentainer.mIsTopOfPage;
+    for (const GridItemInfo* info : sortedItems) {
+      uint32_t itemStartRow = info->mArea.mRows.mStart;
+      if (itemStartRow == endRow) {
+        break;
+      }
+      const auto* disp = info->mFrame->StyleDisplay();
+      if (disp->BreakBefore()) {
+        if ((itemStartRow == 0 && !isTopOfPage) || avoidBreakInside) {
+          aStatus.SetInlineLineBreakBeforeAndReset();
+          return aGridRI.mFragBStart;
+        }
+        if ((itemStartRow > startRow ||
+             (itemStartRow == startRow && !isTopOfPage)) &&
+            itemStartRow < endRow) {
+          endRow = itemStartRow;
+          isForcedBreak = true;
+          aStatus.Reset();
+          break;  
+        }
+      }
+      uint32_t itemEndRow = info->mArea.mRows.mEnd;
+      if (disp->BreakAfter()) {
+        if (itemEndRow != numRows) {
+          if (itemEndRow > startRow && itemEndRow < endRow) {
+            endRow = itemEndRow;
+            isForcedBreak = true;
+          }
+        } else {
+          aStatus.SetInlineLineBreakAfter();  
+        }
+      }
+    }
+
+    if (startRow == endRow && startRow != numRows &&
+        (startRow != 0 || !aFragmentainer.mCanBreakAtStart)) {
+      ++endRow;
+    }
+
+    if (avoidBreakInside && endRow < numRows) {
+      aStatus.SetInlineLineBreakBeforeAndReset();
+      return aGridRI.mFragBStart;
+    }
+  }
+
+  nscoord bEndRow =
+      aGridRI.mRows.GridLineEdge(endRow, GridLineSide::BeforeGridGap);
+  nscoord bSize;
+  if (aFragmentainer.mIsAutoBSize) {
+    if (endRow < numRows) {
+      bSize = bEndRow;
+      auto clampedBSize = ClampToCSSMaxBSize(bSize, aGridRI.mReflowInput);
+      if (MOZ_UNLIKELY(clampedBSize != bSize)) {
+        bSize = clampedBSize;
+      } else if (!isBDBClone) {
+        bpBEnd = 0;
+      }
+    } else {
+      bSize = aGridRI.mReflowInput->ApplyMinMaxBSize(bEndRow);
+    }
+  } else {
+    bSize = aGridRI.mReflowInput->ApplyMinMaxBSize(
+        aGridRI.mReflowInput->ComputedBSize());
+  }
+
+  bool overflow = bSize + bpBEnd > childAvailableSize;
+  if (overflow) {
+    if (avoidBreakInside) {
+      aStatus.SetInlineLineBreakBeforeAndReset();
+      return aGridRI.mFragBStart;
+    }
+    bool breakAfterLastRow = endRow == numRows && aFragmentainer.mCanBreakAtEnd;
+    if (breakAfterLastRow) {
+      MOZ_ASSERT(bEndRow < bSize, "bogus aFragmentainer.mCanBreakAtEnd");
+      nscoord availableSize = childAvailableSize;
+      if (isBDBClone) {
+        availableSize -= bpBEnd;
+      }
+      availableSize =
+          std::max(availableSize, aGridRI.mFragBStart + AppUnitsPerCSSPixel());
+      nscoord newBSize = std::min(bSize, availableSize);
+      newBSize = std::max(newBSize, bEndRow);
+      if (newBSize < bSize || !isBDBClone) {
+        aStatus.SetIncomplete();
+      }
+      bSize = newBSize;
+    } else if (bSize <= bEndRow && startRow + 1 < endRow) {
+      if (endRow == numRows) {
+        --endRow;
+        bEndRow =
+            aGridRI.mRows.GridLineEdge(endRow, GridLineSide::BeforeGridGap);
+        bSize = bEndRow;
+        if (aFragmentainer.mIsAutoBSize) {
+          bSize = ClampToCSSMaxBSize(bSize, aGridRI.mReflowInput);
+        }
+      }
+      aStatus.SetIncomplete();
+    } else if (endRow < numRows) {
+      bSize = ClampToCSSMaxBSize(bEndRow, aGridRI.mReflowInput, &aStatus);
+    }  
+  } else {
+    if (endRow < numRows &&
+        (isForcedBreak || (aFragmentainer.mIsAutoBSize && bEndRow == bSize))) {
+      bSize = ClampToCSSMaxBSize(bEndRow, aGridRI.mReflowInput, &aStatus);
+    }
+  }
+
+  if (endRow < numRows) {
+    childAvailableSize = bEndRow;
+    if (aStatus.IsComplete()) {
+      aStatus.SetOverflowIncomplete();
+      aStatus.SetNextInFlowNeedsReflow();
+    }
+  } else {
+    childAvailableSize = std::max(childAvailableSize, bEndRow);
+  }
+
+  return ReflowRowsInFragmentainer(aGridRI, aContentArea, aDesiredSize, aStatus,
+                                   aFragmentainer, aContainerSize, sortedItems,
+                                   startRow, endRow, bSize, childAvailableSize);
+}
+
+nscoord nsGridContainerFrame::ReflowRowsInFragmentainer(
+    GridReflowInput& aGridRI, const LogicalRect& aContentArea,
+    ReflowOutput& aDesiredSize, nsReflowStatus& aStatus,
+    Fragmentainer& aFragmentainer, const nsSize& aContainerSize,
+    const nsTArray<const GridItemInfo*>& aSortedItems, uint32_t aStartRow,
+    uint32_t aEndRow, nscoord aBSize, nscoord aAvailableSize) {
+  FrameHashtable pushedItems;
+  FrameHashtable incompleteItems;
+  FrameHashtable overflowIncompleteItems;
+  Maybe<nsTArray<nscoord>> masonryAxisPos;
+  const auto rowCount = aGridRI.mRows.mSizes.Length();
+  nscoord masonryAxisGap = 0;
+  const auto wm = aGridRI.mWM;
+  const bool isColMasonry = IsColMasonry();
+  if (isColMasonry) {
+    for (auto& sz : aGridRI.mCols.mSizes) {
+      sz.mPosition = 0;
+    }
+    masonryAxisGap = nsLayoutUtils::ResolveGapToLength(
+        aGridRI.mGridStyle->mColumnGap, aContentArea.ISize(wm));
+    aGridRI.mCols.mGridGap = masonryAxisGap;
+    masonryAxisPos.emplace(rowCount);
+    masonryAxisPos->SetLength(rowCount);
+    PodZero(masonryAxisPos->Elements(), rowCount);
+  }
+  bool isBDBClone = aGridRI.mReflowInput->mStyleBorder->mBoxDecorationBreak ==
+                    StyleBoxDecorationBreak::Clone;
+  bool didGrowRow = false;
+  bool isRowTopOfPage = aStartRow != 0 || !aFragmentainer.mCanBreakAtStart;
+  const bool isStartRowTopOfPage = isRowTopOfPage;
+  const nscoord gridAvailableSize = aFragmentainer.mToFragmentainerEnd;
+  aFragmentainer.mToFragmentainerEnd = aAvailableSize;
+  uint32_t row = 0;
+  for (int32_t i = 0, len = aSortedItems.Length(); i < len; ++i) {
+    const GridItemInfo* const info = aSortedItems[i];
+    nsIFrame* child = info->mFrame;
+    row = info->mArea.mRows.mStart;
+    MOZ_ASSERT(child->GetPrevInFlow() ? row < aStartRow : row >= aStartRow,
+               "unexpected child start row");
+    if (row >= aEndRow) {
+      pushedItems.Insert(child);
+      continue;
+    }
+
+    bool rowCanGrow = false;
+    nscoord maxRowSize = 0;
+    if (row >= aStartRow) {
+      if (row > aStartRow) {
+        isRowTopOfPage = false;
+      }
+      rowCanGrow = !didGrowRow && info->mArea.mRows.Extent() == 1;
+      if (rowCanGrow) {
+        auto& sz = aGridRI.mRows.mSizes[row];
+        rowCanGrow = (sz.mState & TrackSize::eMinOrMaxContentMinSizing) ||
+                     ((sz.mState & TrackSize::eFlexMaxSizing) &&
+                      aFragmentainer.mIsAutoBSize);
+        if (rowCanGrow) {
+          if (isBDBClone) {
+            maxRowSize = gridAvailableSize - aGridRI.mBorderPadding.BEnd(wm);
+          } else {
+            maxRowSize = gridAvailableSize;
+          }
+          maxRowSize -= sz.mPosition;
+          rowCanGrow = maxRowSize > sz.mBase;
+        }
+      }
+    }
+
+    if (isColMasonry) {
+      const auto& cols = info->mArea.mCols;
+      MOZ_ASSERT((cols.mStart == 0 || cols.mStart == 1) && cols.Extent() == 1);
+      aGridRI.mCols.mSizes[cols.mStart].mPosition = masonryAxisPos.ref()[row];
+    }
+
+    aFragmentainer.mIsTopOfPage = isRowTopOfPage && !rowCanGrow;
+    nsReflowStatus childStatus;
+    nscoord bSize =
+        aGridRI.mRows.GridLineEdge(std::min(aEndRow, info->mArea.mRows.mEnd),
+                                   GridLineSide::BeforeGridGap) -
+        aGridRI.mRows.GridLineEdge(std::max(aStartRow, row),
+                                   GridLineSide::AfterGridGap);
+    ReflowInFlowChild(child, info, aContainerSize, Some(bSize), &aFragmentainer,
+                      aGridRI, aContentArea, aDesiredSize, childStatus);
+    MOZ_ASSERT(childStatus.IsInlineBreakBefore() ||
+                   !childStatus.IsFullyComplete() || !child->GetNextInFlow(),
+               "fully-complete reflow should destroy any NIFs");
+
+    if (childStatus.IsInlineBreakBefore()) {
+      MOZ_ASSERT(
+          !child->GetPrevInFlow(),
+          "continuations should never report InlineBreak::Before status");
+      MOZ_ASSERT(!aFragmentainer.mIsTopOfPage,
+                 "got IsInlineBreakBefore() at top of page");
+      if (!didGrowRow) {
+        if (rowCanGrow) {
+          aGridRI.mRows.ResizeRow(row, maxRowSize);
+          if (aGridRI.mSharedGridData) {
+            aGridRI.mSharedGridData->mRows.ResizeRow(row, maxRowSize);
+          }
+          didGrowRow = true;
+          aEndRow = row + 1;  
+          i = -1;             
+          isRowTopOfPage = isStartRowTopOfPage;
+          overflowIncompleteItems.Clear();
+          incompleteItems.Clear();
+          nscoord bEndRow =
+              aGridRI.mRows.GridLineEdge(aEndRow, GridLineSide::BeforeGridGap);
+          aFragmentainer.mToFragmentainerEnd = bEndRow;
+          if (aFragmentainer.mIsAutoBSize) {
+            aBSize =
+                ClampToCSSMaxBSize(bEndRow, aGridRI.mReflowInput, &aStatus);
+          } else if (aStatus.IsIncomplete()) {
+            aBSize = aGridRI.mReflowInput->ApplyMinMaxBSize(
+                aGridRI.mReflowInput->ComputedBSize());
+            aBSize = std::min(bEndRow, aBSize);
+          }
+          continue;
+        }
+
+        if (!isRowTopOfPage) {
+          aEndRow = row;
+          aBSize =
+              aGridRI.mRows.GridLineEdge(aEndRow, GridLineSide::BeforeGridGap);
+          i = -1;  
+          isRowTopOfPage = isStartRowTopOfPage;
+          overflowIncompleteItems.Clear();
+          incompleteItems.Clear();
+          aStatus.SetIncomplete();
+          continue;
+        }
+        NS_ERROR("got InlineBreak::Before at top-of-page");
+        childStatus.Reset();
+      } else {
+        childStatus.Reset();
+        if (child->GetNextInFlow()) {
+          childStatus.SetIncomplete();
+        }  
+      }
+    } else if (childStatus.IsInlineBreakAfter()) {
+      MOZ_ASSERT_UNREACHABLE("unexpected child reflow status");
+    }
+
+    MOZ_ASSERT(!childStatus.IsInlineBreakBefore(),
+               "should've handled InlineBreak::Before above");
+    if (childStatus.IsIncomplete()) {
+      incompleteItems.Insert(child);
+    } else if (!childStatus.IsFullyComplete()) {
+      overflowIncompleteItems.Insert(child);
+    }
+    if (isColMasonry) {
+      auto childWM = child->GetWritingMode();
+      const auto childAxis = wm.ConvertAxisTo(LogicalAxis::Inline, childWM);
+      auto normalPos = child->GetLogicalNormalPosition(wm, aContainerSize);
+      auto sz =
+          childAxis == LogicalAxis::Block ? child->BSize() : child->ISize();
+      auto pos = normalPos.Pos(LogicalAxis::Inline, wm) + sz +
+                 child->GetLogicalUsedMargin(childWM).End(childAxis, childWM);
+      masonryAxisPos.ref()[row] =
+          pos + masonryAxisGap - aContentArea.Start(LogicalAxis::Inline, wm);
+    }
+  }
+
+  aGridRI.mNextFragmentStartRow = aEndRow;
+  if (aEndRow < rowCount) {
+    aGridRI.mRows.BreakBeforeRow(aEndRow);
+    if (aGridRI.mSharedGridData) {
+      aGridRI.mSharedGridData->mRows.BreakBeforeRow(aEndRow);
+    }
+  }
+
+  const bool childrenMoved = PushIncompleteChildren(
+      pushedItems, incompleteItems, overflowIncompleteItems);
+  if (childrenMoved && aStatus.IsComplete()) {
+    aStatus.SetOverflowIncomplete();
+    aStatus.SetNextInFlowNeedsReflow();
+  }
+  if (!pushedItems.IsEmpty()) {
+    AddStateBits(NS_STATE_GRID_DID_PUSH_ITEMS);
+    aGridRI.mIter.Invalidate();
+  }
+  if (!incompleteItems.IsEmpty()) {
+    aGridRI.mIter.Invalidate();
+  }
+
+  if (isColMasonry) {
+    nscoord maxSize = 0;
+    for (auto pos : masonryAxisPos.ref()) {
+      maxSize = std::max(maxSize, pos);
+    }
+    maxSize = std::max(nscoord(0), maxSize - masonryAxisGap);
+    aGridRI.AlignJustifyContentInMasonryAxis(maxSize, aContentArea.ISize(wm));
+  }
+
+  return aBSize;
+}
+
+nscoord nsGridContainerFrame::MasonryLayout(GridReflowInput& aGridRI,
+                                            const LogicalRect& aContentArea,
+                                            SizingConstraint aConstraint,
+                                            ReflowOutput& aDesiredSize,
+                                            nsReflowStatus& aStatus,
+                                            Fragmentainer* aFragmentainer,
+                                            const nsSize& aContainerSize) {
+  using BaselineAlignmentSet = Tracks::BaselineAlignmentSet;
+
+  auto recordAutoPlacement = [this, &aGridRI](GridItemInfo* aItem,
+                                              LogicalAxis aGridAxis) {
+    if (MOZ_UNLIKELY(aGridRI.mSharedGridData && GetPrevInFlow()) &&
+        (aItem->mState[aGridAxis] & ItemState::eAutoPlacement)) {
+      auto* child = aItem->mFrame;
+      MOZ_RELEASE_ASSERT(!child->GetPrevInFlow(),
+                         "continuations should never be auto-placed");
+      for (auto& sharedItem : aGridRI.mSharedGridData->mGridItems) {
+        if (sharedItem.mFrame == child) {
+          sharedItem.mArea.LineRangeForAxis(aGridAxis) =
+              aItem->mArea.LineRangeForAxis(aGridAxis);
+          MOZ_ASSERT(sharedItem.mState[aGridAxis] & ItemState::eAutoPlacement);
+          sharedItem.mState[aGridAxis] &= ~ItemState::eAutoPlacement;
+          break;
+        }
+      }
+    }
+    aItem->mState[aGridAxis] &= ~ItemState::eAutoPlacement;
+  };
+
+  nsTArray<GridItemInfo*> sortedItems(aGridRI.mGridItems.Length());
+  aGridRI.mIter.Reset(CSSOrderAwareFrameIterator::ChildFilter::IncludeAll);
+  size_t absposIndex = 0;
+  const LogicalAxis masonryAxis =
+      IsMasonry(LogicalAxis::Block) ? LogicalAxis::Block : LogicalAxis::Inline;
+  const auto wm = aGridRI.mWM;
+  for (; !aGridRI.mIter.AtEnd(); aGridRI.mIter.Next()) {
+    nsIFrame* child = *aGridRI.mIter;
+    if (MOZ_LIKELY(!child->IsPlaceholderFrame())) {
+      GridItemInfo* item = &aGridRI.mGridItems[aGridRI.mIter.ItemIndex()];
+      sortedItems.AppendElement(item);
+    } else if (aConstraint == SizingConstraint::NoConstraint) {
+      GridItemInfo* item = nullptr;
+      auto* ph = static_cast<nsPlaceholderFrame*>(child);
+      if (ph->GetOutOfFlowFrame()->GetParent() == this) {
+        item = &aGridRI.mAbsPosItems[absposIndex++];
+        MOZ_RELEASE_ASSERT(item->mFrame == ph->GetOutOfFlowFrame());
+        auto masonryStart = item->mArea.LineRangeForAxis(masonryAxis).mStart;
+        const auto masonrySide = masonryAxis == LogicalAxis::Inline
+                                     ? LogicalSide::IStart
+                                     : LogicalSide::BStart;
+        if (masonryStart == 0 ||
+            (masonryStart == kAutoLine &&
+             item->mFrame->StylePosition()
+                 ->GetAnchorResolvedInset(
+                     masonrySide, wm,
+                     AnchorPosOffsetResolutionParams::UseCBFrameSize(
+                         AnchorPosResolutionParams::From(item->mFrame)))
+                 ->IsAuto())) {
+          sortedItems.AppendElement(item);
+        } else {
+          item = nullptr;
+        }
+      }
+      if (!item) {
+        nsReflowStatus childStatus;
+        ReflowInFlowChild(child, nullptr, aContainerSize, Nothing(), nullptr,
+                          aGridRI, aContentArea, aDesiredSize, childStatus);
+      }
+    }
+  }
+  const auto masonryAutoFlow = aGridRI.mGridStyle->mMasonryAutoFlow;
+  const bool definiteFirst =
+      masonryAutoFlow.order == StyleMasonryItemOrder::DefiniteFirst;
+  if (masonryAxis == LogicalAxis::Block) {
+    std::stable_sort(sortedItems.begin(), sortedItems.end(),
+                     definiteFirst ? GridItemInfo::RowMasonryDefiniteFirst
+                                   : GridItemInfo::RowMasonryOrdered);
+  } else {
+    std::stable_sort(sortedItems.begin(), sortedItems.end(),
+                     definiteFirst ? GridItemInfo::ColMasonryDefiniteFirst
+                                   : GridItemInfo::ColMasonryOrdered);
+  }
+
+  FrameHashtable pushedItems;
+  FrameHashtable incompleteItems;
+  FrameHashtable overflowIncompleteItems;
+  nscoord toFragmentainerEnd = nscoord_MAX;
+  nscoord fragStartPos = aGridRI.mFragBStart;
+  const bool avoidBreakInside =
+      aFragmentainer && ShouldAvoidBreakInside(*aGridRI.mReflowInput);
+  const bool isTopOfPageAtStart =
+      aFragmentainer && aFragmentainer->mIsTopOfPage;
+  if (aFragmentainer) {
+    toFragmentainerEnd = std::max(0, aFragmentainer->mToFragmentainerEnd);
+  }
+  const LogicalAxis gridAxis = GetOrthogonalAxis(masonryAxis);
+  const auto gridAxisTrackCount = aGridRI.TracksFor(gridAxis).mSizes.Length();
+  auto& masonryTracks = aGridRI.TracksFor(masonryAxis);
+  auto& masonrySizes = masonryTracks.mSizes;
+  MOZ_ASSERT(masonrySizes.Length() == 2);
+  for (auto& sz : masonrySizes) {
+    sz.mPosition = fragStartPos;
+  }
+  nsTArray<nscoord> currentPos(gridAxisTrackCount);
+  currentPos.SetLength(gridAxisTrackCount);
+  for (auto& sz : currentPos) {
+    sz = fragStartPos;
+  }
+  nsTArray<nscoord> lastPos(currentPos.Clone());
+  nsTArray<GridItemInfo*> lastItems(gridAxisTrackCount);
+  lastItems.SetLength(gridAxisTrackCount);
+  PodZero(lastItems.Elements(), gridAxisTrackCount);
+  const nscoord gap = nsLayoutUtils::ResolveGapToLength(
+      masonryAxis == LogicalAxis::Block ? aGridRI.mGridStyle->mRowGap
+                                        : aGridRI.mGridStyle->mColumnGap,
+      masonryTracks.mContentBoxSize);
+  masonryTracks.mGridGap = gap;
+  uint32_t cursor = 0;
+  const auto containerToMasonryBoxOffset =
+      fragStartPos - aContentArea.Start(masonryAxis, wm);
+  const bool isPack = masonryAutoFlow.placement == StyleMasonryPlacement::Pack;
+  bool didAlignStartAlignedFirstItems = false;
+
+  auto lastItemHasBaselineAlignment = [&](const LineRange& aRange) {
+    for (auto i : aRange.Range()) {
+      if (auto* child = lastItems[i] ? lastItems[i]->mFrame : nullptr) {
+        const auto& pos = child->StylePosition();
+        auto selfAlignment = pos->UsedSelfAlignment(masonryAxis, this->Style());
+        if (selfAlignment == StyleAlignFlags::BASELINE ||
+            selfAlignment == StyleAlignFlags::LAST_BASELINE) {
+          return true;
+        }
+        auto childAxis = masonryAxis;
+        if (child->GetWritingMode().IsOrthogonalTo(wm)) {
+          childAxis = gridAxis;
+        }
+        auto contentAlignment = pos->UsedContentAlignment(childAxis).primary;
+        if (contentAlignment == StyleAlignFlags::BASELINE ||
+            contentAlignment == StyleAlignFlags::LAST_BASELINE) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  auto placeItem = [&](GridItemInfo* aItem) -> nscoord {
+    auto& masonryAxisRange = aItem->mArea.LineRangeForAxis(masonryAxis);
+    MOZ_ASSERT(masonryAxisRange.mStart != 0, "item placement is already final");
+    auto& gridAxisRange = aItem->mArea.LineRangeForAxis(gridAxis);
+    bool isAutoPlaced = aItem->mState[gridAxis] & ItemState::eAutoPlacement;
+    uint32_t start = isAutoPlaced ? 0 : gridAxisRange.mStart;
+    if (isAutoPlaced && !isPack) {
+      start = cursor;
+      isAutoPlaced = false;
+    }
+    const uint32_t extent = gridAxisRange.Extent();
+    if (start + extent > gridAxisTrackCount) {
+      start = 0;
+    }
+    nscoord minPos = nscoord_MAX;
+    MOZ_ASSERT(extent <= gridAxisTrackCount);
+    const uint32_t iEnd = gridAxisTrackCount + 1 - extent;
+    for (uint32_t i = start; i < iEnd; ++i) {
+      nscoord maxPosForRange = 0;
+      for (auto j = i, jEnd = j + extent; j < jEnd; ++j) {
+        maxPosForRange = std::max(currentPos[j], maxPosForRange);
+      }
+      if (maxPosForRange < minPos) {
+        minPos = maxPosForRange;
+        start = i;
+      }
+      if (!isAutoPlaced) {
+        break;
+      }
+    }
+    gridAxisRange.mStart = start;
+    gridAxisRange.mEnd = start + extent;
+    bool isFirstItem = true;
+    for (uint32_t i : gridAxisRange.Range()) {
+      if (lastItems[i]) {
+        isFirstItem = false;
+        break;
+      }
+    }
+    masonryAxisRange.mStart = isFirstItem ? 0 : 1;
+    masonryAxisRange.mEnd = masonryAxisRange.mStart + 1;
+    return minPos;
+  };
+
+  auto handleChildStatus = [&](GridItemInfo* aItem,
+                               const nsReflowStatus& aChildStatus) {
+    bool result = false;
+    if (MOZ_UNLIKELY(aFragmentainer)) {
+      auto* child = aItem->mFrame;
+      if (!aChildStatus.IsComplete() || aChildStatus.IsInlineBreakBefore() ||
+          aChildStatus.IsInlineBreakAfter() ||
+          child->StyleDisplay()->BreakAfter()) {
+        if (!isTopOfPageAtStart && avoidBreakInside) {
+          aStatus.SetInlineLineBreakBeforeAndReset();
+          return result;
+        }
+        result = true;
+      }
+      if (aChildStatus.IsInlineBreakBefore()) {
+        aStatus.SetIncomplete();
+        pushedItems.Insert(child);
+      } else if (aChildStatus.IsIncomplete()) {
+        recordAutoPlacement(aItem, gridAxis);
+        aStatus.SetIncomplete();
+        incompleteItems.Insert(child);
+      } else if (!aChildStatus.IsFullyComplete()) {
+        recordAutoPlacement(aItem, gridAxis);
+        overflowIncompleteItems.Insert(child);
+      }
+    }
+    return result;
+  };
+
+  auto offsetToMarginBoxEnd = [&](nsIFrame* aChild) {
+    auto childWM = aChild->GetWritingMode();
+    auto childAxis = !childWM.IsOrthogonalTo(wm) ? masonryAxis : gridAxis;
+    auto normalPos = aChild->GetLogicalNormalPosition(wm, aContainerSize);
+    auto sz =
+        childAxis == LogicalAxis::Block ? aChild->BSize() : aChild->ISize();
+    return containerToMasonryBoxOffset + normalPos.Pos(masonryAxis, wm) + sz +
+           aChild->GetLogicalUsedMargin(childWM).End(childAxis, childWM);
+  };
+
+  nsTArray<Tracks::ItemBaselineData> firstBaselineItems;
+  nsTArray<Tracks::ItemBaselineData> lastBaselineItems;
+  auto applyBaselineAlignment = [&](BaselineAlignmentSet aSet) {
+    firstBaselineItems.ClearAndRetainStorage();
+    lastBaselineItems.ClearAndRetainStorage();
+    masonryTracks.InitializeItemBaselinesInMasonryAxis(
+        aGridRI, aGridRI.mGridItems, aSet, aContainerSize, currentPos,
+        firstBaselineItems, lastBaselineItems);
+
+    bool didBaselineAdjustment = false;
+    nsTArray<Tracks::ItemBaselineData>* baselineItems[] = {&firstBaselineItems,
+                                                           &lastBaselineItems};
+    for (const auto* items : baselineItems) {
+      for (const auto& data : *items) {
+        GridItemInfo* item = data.mGridItem;
+        MOZ_ASSERT((item->mState[masonryAxis] & ItemState::eIsBaselineAligned));
+        nscoord baselineOffset = item->mBaselineOffset[masonryAxis];
+        if (baselineOffset == nscoord(0)) {
+          continue;  
+        }
+        didBaselineAdjustment = true;
+        auto* child = item->mFrame;
+        auto masonryAxisStart =
+            item->mArea.LineRangeForAxis(masonryAxis).mStart;
+        auto gridAxisRange = item->mArea.LineRangeForAxis(gridAxis);
+        masonrySizes[masonryAxisStart].mPosition =
+            aSet.mItemSet == BaselineAlignmentSet::LastItems
+                ? lastPos[gridAxisRange.mStart]
+                : fragStartPos;
+        bool consumeAllSpace = false;
+        const auto state = item->mState[masonryAxis];
+        if ((state & ItemState::eContentBaseline) ||
+            MOZ_UNLIKELY(aFragmentainer)) {
+          if (MOZ_UNLIKELY(aFragmentainer)) {
+            aFragmentainer->mIsTopOfPage =
+                isTopOfPageAtStart &&
+                masonrySizes[masonryAxisStart].mPosition == fragStartPos;
+          }
+          nsReflowStatus childStatus;
+          ReflowInFlowChild(child, item, aContainerSize, Nothing(),
+                            aFragmentainer, aGridRI, aContentArea, aDesiredSize,
+                            childStatus);
+          consumeAllSpace = handleChildStatus(item, childStatus);
+          if (aStatus.IsInlineBreakBefore()) {
+            return false;
+          }
+        } else if (!(state & ItemState::eEndSideBaseline)) {
+          LogicalPoint logicalDelta(wm);
+          logicalDelta.Pos(masonryAxis, wm) = baselineOffset;
+          child->MovePositionBy(wm, logicalDelta);
+        }
+        if ((state & ItemState::eEndSideBaseline) && !consumeAllSpace) {
+          for (uint32_t i : gridAxisRange.Range()) {
+            currentPos[i] += baselineOffset;
+          }
+        } else {
+          nscoord pos = consumeAllSpace ? toFragmentainerEnd
+                                        : offsetToMarginBoxEnd(child);
+          pos += gap;
+          for (uint32_t i : gridAxisRange.Range()) {
+            currentPos[i] = pos;
+          }
+        }
+      }
+    }
+    return didBaselineAdjustment;
+  };
+
+  for (GridItemInfo* item : sortedItems) {
+    auto* child = item->mFrame;
+    auto& masonryRange = item->mArea.LineRangeForAxis(masonryAxis);
+    auto& gridRange = item->mArea.LineRangeForAxis(gridAxis);
+    nsReflowStatus childStatus;
+    if (MOZ_UNLIKELY(child->HasAnyStateBits(NS_FRAME_OUT_OF_FLOW))) {
+      auto contentArea = aContentArea;
+      nscoord pos = nscoord_MAX;
+      if (gridRange.mStart == kAutoLine) {
+        for (auto p : currentPos) {
+          pos = std::min(p, pos);
+        }
+      } else if (gridRange.mStart < currentPos.Length()) {
+        pos = currentPos[gridRange.mStart];
+      } else if (currentPos.Length() > 0) {
+        pos = currentPos.LastElement();
+      }
+      if (pos == nscoord_MAX) {
+        pos = nscoord(0);
+      }
+      contentArea.Start(masonryAxis, wm) = pos;
+      child = child->GetPlaceholderFrame();
+      ReflowInFlowChild(child, nullptr, aContainerSize, Nothing(), nullptr,
+                        aGridRI, contentArea, aDesiredSize, childStatus);
+    } else {
+      MOZ_ASSERT(gridRange.Extent() > 0 &&
+                 gridRange.Extent() <= gridAxisTrackCount);
+      MOZ_ASSERT((masonryRange.mStart == 0 || masonryRange.mStart == 1) &&
+                 masonryRange.Extent() == 1);
+      if (masonryRange.mStart != 0) {
+        masonrySizes[1].mPosition = placeItem(item);
+      }
+
+      if (!didAlignStartAlignedFirstItems &&
+          aConstraint == SizingConstraint::NoConstraint &&
+          masonryRange.mStart != 0 && lastItemHasBaselineAlignment(gridRange)) {
+        didAlignStartAlignedFirstItems = true;
+        if (applyBaselineAlignment({BaselineAlignmentSet::FirstItems,
+                                    BaselineAlignmentSet::StartStretch})) {
+          masonrySizes[1].mPosition = placeItem(item);
+        }
+        if (aStatus.IsInlineBreakBefore()) {
+          return fragStartPos;
+        }
+      }
+
+      for (uint32_t i : gridRange.Range()) {
+        lastItems[i] = item;
+      }
+      cursor = gridRange.mEnd;
+      if (cursor >= gridAxisTrackCount) {
+        cursor = 0;
+      }
+
+      nscoord pos;
+      if (aConstraint == SizingConstraint::NoConstraint) {
+        const auto* disp = child->StyleDisplay();
+        if (MOZ_UNLIKELY(aFragmentainer)) {
+          aFragmentainer->mIsTopOfPage =
+              isTopOfPageAtStart &&
+              masonrySizes[masonryRange.mStart].mPosition == fragStartPos;
+          if (!aFragmentainer->mIsTopOfPage &&
+              (disp->BreakBefore() ||
+               masonrySizes[masonryRange.mStart].mPosition >=
+                   toFragmentainerEnd)) {
+            childStatus.SetInlineLineBreakBeforeAndReset();
+          }
+        }
+        if (!childStatus.IsInlineBreakBefore()) {
+          ReflowInFlowChild(child, item, aContainerSize, Nothing(),
+                            aFragmentainer, aGridRI, aContentArea, aDesiredSize,
+                            childStatus);
+        }
+        bool consumeAllSpace = handleChildStatus(item, childStatus);
+        if (aStatus.IsInlineBreakBefore()) {
+          return fragStartPos;
+        }
+        pos =
+            consumeAllSpace ? toFragmentainerEnd : offsetToMarginBoxEnd(child);
+      } else {
+        LogicalSize percentBasis(
+            aGridRI.PercentageBasisFor(LogicalAxis::Inline, *item));
+        IntrinsicISizeType type = aConstraint == SizingConstraint::MaxContent
+                                      ? IntrinsicISizeType::PrefISize
+                                      : IntrinsicISizeType::MinISize;
+        auto sz = ::ContentContribution(*item, aGridRI, masonryAxis,
+                                        percentBasis, type);
+        pos = sz + masonrySizes[masonryRange.mStart].mPosition;
+      }
+      pos += gap;
+      for (uint32_t i : gridRange.Range()) {
+        lastPos[i] = currentPos[i];
+        currentPos[i] = pos;
+      }
+    }
+  }
+
+  if (aConstraint == SizingConstraint::NoConstraint) {
+    for (auto*& item : lastItems) {
+      if (item) {
+        item->mState[masonryAxis] |= ItemState::eIsLastItemInMasonryTrack;
+      }
+    }
+    BaselineAlignmentSet baselineSets[] = {
+        {BaselineAlignmentSet::FirstItems, BaselineAlignmentSet::StartStretch},
+        {BaselineAlignmentSet::FirstItems, BaselineAlignmentSet::EndStretch},
+        {BaselineAlignmentSet::LastItems, BaselineAlignmentSet::StartStretch},
+        {BaselineAlignmentSet::LastItems, BaselineAlignmentSet::EndStretch},
+    };
+    for (uint32_t i = 0; i < std::size(baselineSets); ++i) {
+      if (i == 0 && didAlignStartAlignedFirstItems) {
+        continue;
+      }
+      applyBaselineAlignment(baselineSets[i]);
+    }
+  }
+
+  const bool childrenMoved = PushIncompleteChildren(
+      pushedItems, incompleteItems, overflowIncompleteItems);
+  if (childrenMoved && aStatus.IsComplete()) {
+    aStatus.SetOverflowIncomplete();
+    aStatus.SetNextInFlowNeedsReflow();
+  }
+  if (!pushedItems.IsEmpty()) {
+    AddStateBits(NS_STATE_GRID_DID_PUSH_ITEMS);
+    aGridRI.mIter.Invalidate();
+  }
+  if (!incompleteItems.IsEmpty()) {
+    aGridRI.mIter.Invalidate();
+  }
+
+  nscoord masonryBoxSize = 0;
+  for (auto pos : currentPos) {
+    masonryBoxSize = std::max(masonryBoxSize, pos);
+  }
+  masonryBoxSize = std::max(nscoord(0), masonryBoxSize - gap);
+  if (aConstraint == SizingConstraint::NoConstraint) {
+    aGridRI.AlignJustifyContentInMasonryAxis(masonryBoxSize,
+                                             masonryTracks.mContentBoxSize);
+  }
+  return masonryBoxSize;
+}
+
+nsGridContainerFrame* nsGridContainerFrame::ParentGridContainerForSubgrid()
+    const {
+  MOZ_ASSERT(IsSubgrid());
+  nsIFrame* p = GetParent();
+  while (p->GetContent() == GetContent()) {
+    p = p->GetParent();
+  }
+  MOZ_ASSERT(p->IsGridContainerFrame());
+  auto* parent = static_cast<nsGridContainerFrame*>(p);
+  MOZ_ASSERT(parent->HasSubgridItems());
+  return parent;
+}
+
+nscoord nsGridContainerFrame::ReflowChildren(GridReflowInput& aGridRI,
+                                             const LogicalRect& aContentArea,
+                                             const nsSize& aContainerSize,
+                                             ReflowOutput& aDesiredSize,
+                                             nsReflowStatus& aStatus) {
+  WritingMode wm = aGridRI.mReflowInput->GetWritingMode();
+  nscoord bSize = aContentArea.BSize(wm);
+  MOZ_ASSERT(aGridRI.mReflowInput);
+  MOZ_ASSERT(aStatus.IsEmpty(), "Caller should pass a fresh reflow status!");
+  if (HidesContentForLayout()) {
+    return bSize;
+  }
+
+  OverflowAreas ocBounds;
+  nsReflowStatus ocStatus;
+  if (GetPrevInFlow()) {
+    ReflowOverflowContainerChildren(PresContext(), *aGridRI.mReflowInput,
+                                    ocBounds, ReflowChildFlags::Default,
+                                    ocStatus, MergeSortedFrameListsFor);
+  }
+
+  Maybe<Fragmentainer> fragmentainer = GetNearestFragmentainer(aGridRI);
+  if (IsMasonry() && !(IsColMasonry() && fragmentainer.isSome())) {
+    aGridRI.mInFragmentainer = fragmentainer.isSome();
+    nscoord sz = MasonryLayout(
+        aGridRI, aContentArea, SizingConstraint::NoConstraint, aDesiredSize,
+        aStatus, fragmentainer.ptrOr(nullptr), aContainerSize);
+    if (IsRowMasonry()) {
+      bSize = aGridRI.mReflowInput->ComputedBSize();
+      if (bSize == NS_UNCONSTRAINEDSIZE) {
+        bSize = aGridRI.mReflowInput->ApplyMinMaxBSize(sz);
+      }
+    }
+  } else if (MOZ_UNLIKELY(fragmentainer.isSome())) {
+    if (IsColMasonry() && !GetPrevInFlow()) {
+      MasonryLayout(aGridRI, aContentArea, SizingConstraint::NoConstraint,
+                    aDesiredSize, aStatus, nullptr, aContainerSize);
+    }
+    aGridRI.mInFragmentainer = true;
+    bSize = ReflowInFragmentainer(aGridRI, aContentArea, aDesiredSize, aStatus,
+                                  *fragmentainer, aContainerSize);
+  } else {
+    aGridRI.mIter.Reset(CSSOrderAwareFrameIterator::ChildFilter::IncludeAll);
+    for (; !aGridRI.mIter.AtEnd(); aGridRI.mIter.Next()) {
+      nsIFrame* child = *aGridRI.mIter;
+      const GridItemInfo* info = nullptr;
+      if (!child->IsPlaceholderFrame()) {
+        info = &aGridRI.mGridItems[aGridRI.mIter.ItemIndex()];
+      }
+      nsReflowStatus childStatus;
+      ReflowInFlowChild(child, info, aContainerSize, Nothing(), nullptr,
+                        aGridRI, aContentArea, aDesiredSize, childStatus);
+      MOZ_ASSERT(childStatus.IsComplete(),
+                 "child should be complete in unconstrained reflow");
+      aStatus.MergeCompletionStatusFrom(childStatus);
+    }
+  }
+
+  aDesiredSize.mOverflowAreas.UnionWith(ocBounds);
+  aStatus.MergeCompletionStatusFrom(ocStatus);
+
+  return bSize;
+}
+
+void nsGridContainerFrame::ReflowAbsoluteChildren(
+    GridReflowInput& aGridRI, const LogicalRect& aContentArea,
+    nscoord aContentBSize, ReflowOutput& aDesiredSize,
+    nsReflowStatus& aStatus) {
+  WritingMode wm = aGridRI.mReflowInput->GetWritingMode();
+  auto* absoluteContainer = GetAbsoluteContainingBlock();
+  if (!absoluteContainer || !absoluteContainer->HasAbsoluteFrames()) {
+    return;
+  }
+  LogicalMargin pad(aGridRI.mReflowInput->ComputedLogicalPadding(wm));
+  const LogicalPoint gridOrigin(wm, pad.IStart(wm), pad.BStart(wm));
+  const nscoord gridContentBSize =
+      (aGridRI.mInFragmentainer && !aGridRI.mRows.mSizes.IsEmpty())
+          ? aGridRI.mRows.GridLineEdge(aGridRI.mRows.mSizes.Length(),
+                                       GridLineSide::BeforeGridGap)
+          : aContentBSize;
+  const LogicalRect gridCB(wm, 0, 0, aContentArea.ISize(wm) + pad.IStartEnd(wm),
+                           gridContentBSize + pad.BStartEnd(wm));
+  const nsSize gridCBPhysicalSize = gridCB.Size(wm).GetPhysicalSize(wm);
+  size_t i = 0;
+  for (nsIFrame* child : absoluteContainer->GetChildList()) {
+    MOZ_ASSERT(i < aGridRI.mAbsPosItems.Length());
+    MOZ_ASSERT(aGridRI.mAbsPosItems[i].mFrame == child);
+    GridArea& area = aGridRI.mAbsPosItems[i].mArea;
+    LogicalRect itemCB =
+        aGridRI.ContainingBlockForAbsPos(area, gridOrigin, gridCB);
+    nsRect* cb =
+        child->GetOrCreateDeletableProperty(GridItemContainingBlockRect());
+    *cb = itemCB.GetPhysicalRect(wm, gridCBPhysicalSize);
+    ++i;
+  }
+  const auto border = aGridRI.mReflowInput->ComputedPhysicalBorder();
+  const nsPoint borderShift{border.left, border.top};
+  const nsRect paddingRect(borderShift, gridCBPhysicalSize);
+  AbsPosReflowFlags flags{
+      AbsPosReflowFlag::AllowFragmentation, AbsPosReflowFlag::CBWidthChanged,
+      AbsPosReflowFlag::CBHeightChanged, AbsPosReflowFlag::IsGridContainerCB};
+  nsReflowStatus absposStatus;
+  absoluteContainer->Reflow(this, PresContext(), *aGridRI.mReflowInput,
+                            absposStatus, paddingRect, flags,
+                            &aDesiredSize.mOverflowAreas);
+  aStatus.MergeCompletionStatusFrom(absposStatus);
+}
+
+nscoord nsGridContainerFrame::ComputeBSizeForResolvingRowSizes(
+    GridReflowInput& aGridRI, nscoord aComputedBSize,
+    const Maybe<nscoord>& aContainIntrinsicBSize) const {
+  if (aComputedBSize != NS_UNCONSTRAINEDSIZE) {
+    return aComputedBSize;
+  }
+
+  if (aContainIntrinsicBSize) {
+    return aGridRI.mReflowInput->ApplyMinMaxBSize(*aContainIntrinsicBSize);
+  }
+
+  return NS_UNCONSTRAINEDSIZE;
+}
+
+nscoord nsGridContainerFrame::ComputeIntrinsicContentBSize(
+    const GridReflowInput& aGridRI, nscoord aComputedBSize,
+    nscoord aBSizeForResolvingRowSizes,
+    const Maybe<nscoord>& aContainIntrinsicBSize) const {
+  MOZ_ASSERT(
+      aComputedBSize == NS_UNCONSTRAINEDSIZE ||
+          aGridRI.mReflowInput->ShouldApplyAutomaticMinimumOnBlockAxis(),
+      "Why call this method when intrinsic content block-size is not needed?");
+
+  if (aComputedBSize == NS_UNCONSTRAINEDSIZE) {
+    return aBSizeForResolvingRowSizes;
+  }
+
+  if (aContainIntrinsicBSize) {
+    return *aContainIntrinsicBSize;
+  }
+
+  if (IsRowMasonry()) {
+    return aBSizeForResolvingRowSizes;
+  }
+
+  return aGridRI.mRows.TotalTrackSizeWithoutAlignment(this);
+}
+
+void nsGridContainerFrame::Reflow(nsPresContext* aPresContext,
+                                  ReflowOutput& aDesiredSize,
+                                  const ReflowInput& aReflowInput,
+                                  nsReflowStatus& aStatus) {
+  NormalizeChildLists();
+
+  if (IsHiddenByContentVisibilityOfInFlowParentForLayout()) {
+    return;
+  }
+
+  MarkInReflow();
+  DO_GLOBAL_REFLOW_COUNT("nsGridContainerFrame");
+  MOZ_ASSERT(aStatus.IsEmpty(), "Caller should pass a fresh reflow status!");
+
+  GRID_LOG("Reflow grid container frame %p", this);
+
+  if (IsFrameTreeTooDeep(aReflowInput, aDesiredSize, aStatus)) {
+    return;
+  }
+
+#ifdef DEBUG
+  mDidPushItemsBitMayLie = false;
+  SanityCheckChildListsBeforeReflow();
+#endif  // DEBUG
+
+  for (auto& perAxisBaseline : mBaseline) {
+    for (auto& baseline : perAxisBaseline) {
+      baseline = NS_INTRINSIC_ISIZE_UNKNOWN;
+    }
+  }
+
+  const nsStylePosition* stylePos = aReflowInput.mStylePosition;
+  auto prevInFlow = static_cast<nsGridContainerFrame*>(GetPrevInFlow());
+  if (MOZ_LIKELY(!prevInFlow)) {
+    InitImplicitNamedAreas(stylePos);
+  } else {
+    MOZ_ASSERT(prevInFlow->HasAnyStateBits(kIsSubgridBits) ==
+                   HasAnyStateBits(kIsSubgridBits),
+               "continuations should have same kIsSubgridBits");
+  }
+  GridReflowInput gridRI(this, aReflowInput);
+  if (gridRI.mIter.ItemsAreAlreadyInOrder()) {
+    AddStateBits(NS_STATE_GRID_NORMAL_FLOW_CHILDREN_IN_CSS_ORDER);
+  } else {
+    RemoveStateBits(NS_STATE_GRID_NORMAL_FLOW_CHILDREN_IN_CSS_ORDER);
+  }
+  if (gridRI.mIter.AtEnd() || aReflowInput.mStyleDisplay->IsContainLayout()) {
+    AddStateBits(NS_STATE_GRID_SYNTHESIZE_BASELINE);
+  } else {
+    RemoveStateBits(NS_STATE_GRID_SYNTHESIZE_BASELINE);
+  }
+  const nscoord computedBSize = aReflowInput.ComputedBSize();
+  const nscoord computedISize = aReflowInput.ComputedISize();
+
+  const Maybe<nscoord> containIntrinsicBSize =
+      aReflowInput.mFrame->ContainIntrinsicBSize();
+  const WritingMode& wm = gridRI.mWM;
+
+  nscoord consumedBSize = 0;
+  nscoord contentBSize = 0;
+  if (MOZ_LIKELY(!prevInFlow)) {
+    Grid grid;
+    if (MOZ_LIKELY(!IsSubgrid())) {
+      RepeatTrackSizingInput repeatSizing(aReflowInput.ComputedMinSize(),
+                                          aReflowInput.ComputedSize(),
+                                          aReflowInput.ComputedMaxSize());
+      grid.PlaceGridItems(gridRI, repeatSizing);
+    } else {
+      auto* subgrid = GetProperty(Subgrid::Prop());
+      MOZ_ASSERT(subgrid, "an ancestor forgot to call PlaceGridItems?");
+      gridRI.mGridItems = subgrid->mGridItems.Clone();
+      gridRI.mAbsPosItems = subgrid->mAbsPosItems.Clone();
+      grid.mGridColEnd = subgrid->mGridColEnd;
+      grid.mGridRowEnd = subgrid->mGridRowEnd;
+    }
+
+    gridRI.CalculateTrackSizesForAxis(LogicalAxis::Inline, grid, computedISize,
+                                      SizingConstraint::NoConstraint);
+
+    nscoord bSizeForResolvingRowSizes = ComputeBSizeForResolvingRowSizes(
+        gridRI, computedBSize, containIntrinsicBSize);
+
+    gridRI.CalculateTrackSizesForAxis(LogicalAxis::Block, grid,
+                                      bSizeForResolvingRowSizes,
+                                      SizingConstraint::NoConstraint);
+
+    gridRI.InvalidateTrackSizesForAxis(LogicalAxis::Inline);
+
+    gridRI.CalculateTrackSizesForAxis(LogicalAxis::Inline, grid, computedISize,
+                                      SizingConstraint::NoConstraint);
+
+    if (bSizeForResolvingRowSizes == NS_UNCONSTRAINEDSIZE && !IsRowMasonry()) {
+      bSizeForResolvingRowSizes =
+          std::max(gridRI.mRows.TotalTrackSizeWithoutAlignment(this),
+                   gridRI.mReflowInput->ComputedMinBSize());
+
+      NS_ASSERTION(bSizeForResolvingRowSizes != NS_UNCONSTRAINEDSIZE,
+                   "The block-size for re-resolving the row sizes should be "
+                   "definite in non-masonry layout!");
+
+      gridRI.InvalidateTrackSizesForAxis(LogicalAxis::Block);
+
+      gridRI.CalculateTrackSizesForAxis(LogicalAxis::Block, grid,
+                                        bSizeForResolvingRowSizes,
+                                        SizingConstraint::NoConstraint);
+    }
+
+    if (computedBSize == NS_UNCONSTRAINEDSIZE ||
+        aReflowInput.ShouldApplyAutomaticMinimumOnBlockAxis()) {
+      contentBSize = ComputeIntrinsicContentBSize(gridRI, computedBSize,
+                                                  bSizeForResolvingRowSizes,
+                                                  containIntrinsicBSize);
+    }
+  } else {
+    consumedBSize = CalcAndCacheConsumedBSize();
+    gridRI.InitializeForContinuation(this, consumedBSize);
+    if (containIntrinsicBSize) {
+      contentBSize = *containIntrinsicBSize;
+    } else {
+      const uint32_t numRows = gridRI.mRows.mSizes.Length();
+      contentBSize =
+          gridRI.mRows.GridLineEdge(numRows, GridLineSide::AfterGridGap);
+    }
+  }
+  if (computedBSize == NS_UNCONSTRAINEDSIZE) {
+    contentBSize = aReflowInput.ApplyMinMaxBSize(contentBSize);
+  } else if (aReflowInput.ShouldApplyAutomaticMinimumOnBlockAxis()) {
+    contentBSize = aReflowInput.ApplyMinMaxBSize(contentBSize);
+    contentBSize = std::max(contentBSize, computedBSize);
+  } else {
+    contentBSize = computedBSize;
+  }
+  if (contentBSize != NS_UNCONSTRAINEDSIZE) {
+    contentBSize = std::max(contentBSize - consumedBSize, 0);
+  }
+  auto& bp = gridRI.mBorderPadding;
+  LogicalRect contentArea(wm, bp.IStart(wm), bp.BStart(wm), computedISize,
+                          contentBSize);
+
+  if (!prevInFlow) {
+    const auto& rowSizes = gridRI.mRows.mSizes;
+    if (!IsRowSubgrid()) {
+      if (!gridRI.mRows.mIsMasonry) {
+        auto alignment = stylePos->mAlignContent;
+        gridRI.mRows.AlignJustifyContent(stylePos, alignment, wm, contentBSize,
+                                         false);
+      }
+    } else {
+      if (computedBSize == NS_UNCONSTRAINEDSIZE) {
+        contentBSize = gridRI.mRows.GridLineEdge(rowSizes.Length(),
+                                                 GridLineSide::BeforeGridGap);
+        contentArea.BSize(wm) = std::max(contentBSize, nscoord(0));
+      }
+    }
+    if (HasSubgridItems() || IsSubgrid()) {
+      StoreUsedTrackSizes(LogicalAxis::Block, rowSizes);
+    }
+  }
+
+  nsSize containerSize = contentArea.Size(wm).GetPhysicalSize(wm);
+  bool repositionChildren = false;
+  if (containerSize.width == NS_UNCONSTRAINEDSIZE && wm.IsVerticalRL()) {
+    repositionChildren = true;
+    containerSize.width = 0;
+  }
+  containerSize.width += bp.LeftRight(wm);
+  containerSize.height += bp.TopBottom(wm);
+
+  contentBSize =
+      ReflowChildren(gridRI, contentArea, containerSize, aDesiredSize, aStatus);
+  if (Style()->GetPseudoType() == PseudoStyleType::MozScrolledContent) {
+
+    const auto numCols = static_cast<int32_t>(gridRI.mCols.mSizes.Length());
+    const auto numRows = static_cast<int32_t>(gridRI.mRows.mSizes.Length());
+    if (numCols > 0 && numRows > 0) {
+      const GridArea gridArea(LineRange(0, numCols), LineRange(0, numRows));
+      const LogicalRect gridAreaRect =
+          gridRI.ContainingBlockFor(gridArea) +
+          LogicalPoint(wm, bp.IStart(wm), bp.BStart(wm));
+
+      MOZ_ASSERT(bp == aReflowInput.ComputedLogicalPadding(wm),
+                 "A scrolled inner frame shouldn't have any border!");
+      const LogicalMargin& padding = bp;
+      nsRect physicalGridAreaRectWithPadding =
+          gridAreaRect.GetPhysicalRect(wm, containerSize);
+      physicalGridAreaRectWithPadding.Inflate(padding.GetPhysicalMargin(wm));
+      aDesiredSize.mOverflowAreas.UnionAllWith(physicalGridAreaRectWithPadding);
+    }
+
+    nsRect gridItemMarginBoxBounds;
+    for (const auto& item : gridRI.mGridItems) {
+      gridItemMarginBoxBounds =
+          gridItemMarginBoxBounds.Union(item.mFrame->GetMarginRect());
+    }
+    aDesiredSize.mOverflowAreas.UnionAllWith(gridItemMarginBoxBounds);
+  }
+  ReflowAbsoluteChildren(gridRI, contentArea, contentBSize, aDesiredSize,
+                         aStatus);
+  contentBSize = std::max(contentBSize - consumedBSize, 0);
+
+  if (!aStatus.IsComplete() && !gridRI.mSkipSides.BEnd() &&
+      StyleBorder()->mBoxDecorationBreak != StyleBoxDecorationBreak::Clone) {
+    bp.BEnd(wm) = nscoord(0);
+  }
+
+  LogicalSize desiredSize(wm, computedISize + bp.IStartEnd(wm),
+                          contentBSize + bp.BStartEnd(wm));
+  aDesiredSize.SetSize(wm, desiredSize);
+  nsRect frameRect(0, 0, aDesiredSize.Width(), aDesiredSize.Height());
+  aDesiredSize.mOverflowAreas.UnionAllWith(frameRect);
+
+  if (repositionChildren) {
+    nsPoint physicalDelta(aDesiredSize.Width() - bp.LeftRight(wm), 0);
+    for (const auto& item : gridRI.mGridItems) {
+      auto* child = item.mFrame;
+      child->MovePositionBy(physicalDelta);
+      ConsiderChildOverflow(aDesiredSize.mOverflowAreas, child);
+    }
+  }
+
+  if ((IsRowMasonry() && !prevInFlow) || IsColMasonry()) {
+    gridRI.AlignJustifyTracksInMasonryAxis(contentArea.Size(wm),
+                                           aDesiredSize.PhysicalSize());
+  }
+
+  if (HasAnyStateBits(NS_FRAME_IS_OVERFLOW_CONTAINER)) {
+    if (!aStatus.IsComplete()) {
+      aStatus.SetOverflowIncomplete();
+      aStatus.SetNextInFlowNeedsReflow();
+    }
+    contentBSize = 0;
+    desiredSize.BSize(wm) = contentBSize + bp.BStartEnd(wm);
+    aDesiredSize.SetSize(wm, desiredSize);
+  }
+
+  if (!gridRI.mInFragmentainer) {
+    MOZ_ASSERT(gridRI.mIter.IsValid());
+    auto sz = frameRect.Size();
+    CalculateBaselines(BaselineSet::eBoth, &gridRI.mIter, &gridRI.mGridItems,
+                       gridRI.mCols, 0, gridRI.mCols.mSizes.Length(), wm, sz,
+                       bp.IStart(wm), bp.IEnd(wm), desiredSize.ISize(wm));
+    CalculateBaselines(BaselineSet::eBoth, &gridRI.mIter, &gridRI.mGridItems,
+                       gridRI.mRows, 0, gridRI.mRows.mSizes.Length(), wm, sz,
+                       bp.BStart(wm), bp.BEnd(wm), desiredSize.BSize(wm));
+  } else {
+    BaselineSet baselines = BaselineSet::eNone;
+    if (gridRI.mStartRow == 0 &&
+        gridRI.mStartRow != gridRI.mNextFragmentStartRow) {
+      baselines = BaselineSet::eFirst;
+    }
+    uint32_t len = gridRI.mRows.mSizes.Length();
+    if (gridRI.mStartRow != len && gridRI.mNextFragmentStartRow == len) {
+      baselines = BaselineSet(baselines | BaselineSet::eLast);
+    }
+    Maybe<CSSOrderAwareFrameIterator> iter;
+    Maybe<nsTArray<GridItemInfo>> gridItems;
+    if (baselines != BaselineSet::eNone) {
+      using Filter = CSSOrderAwareFrameIterator::ChildFilter;
+      using Order = CSSOrderAwareFrameIterator::OrderState;
+      bool ordered = gridRI.mIter.ItemsAreAlreadyInOrder();
+      auto orderState = ordered ? Order::Ordered : Order::Unordered;
+      iter.emplace(this, FrameChildListID::Principal, Filter::SkipPlaceholders,
+                   orderState);
+      gridItems.emplace();
+      for (; !iter->AtEnd(); iter->Next()) {
+        auto child = **iter;
+        for (const auto& info : gridRI.mGridItems) {
+          if (info.mFrame == child) {
+            gridItems->AppendElement(info);
+          }
+        }
+      }
+    }
+    auto sz = frameRect.Size();
+    CalculateBaselines(baselines, iter.ptrOr(nullptr), gridItems.ptrOr(nullptr),
+                       gridRI.mCols, 0, gridRI.mCols.mSizes.Length(), wm, sz,
+                       bp.IStart(wm), bp.IEnd(wm), desiredSize.ISize(wm));
+    CalculateBaselines(baselines, iter.ptrOr(nullptr), gridItems.ptrOr(nullptr),
+                       gridRI.mRows, gridRI.mStartRow,
+                       gridRI.mNextFragmentStartRow, wm, sz, bp.BStart(wm),
+                       bp.BEnd(wm), desiredSize.BSize(wm));
+  }
+
+  if (HasAnyStateBits(NS_STATE_GRID_COMPUTED_INFO)) {
+
+    if (mozilla::dom::Grid* grid = TakeProperty(GridFragmentInfo())) {
+      grid->ForgetFrame();
+    }
+
+
+    const auto* subgrid = GetProperty(Subgrid::Prop());
+    const auto* subgridColRange =
+        subgrid && IsColSubgrid() ? &subgrid->SubgridCols() : nullptr;
+
+    LineNameMap colLineNameMap(gridRI.mGridStyle, GetImplicitNamedAreas(),
+                               gridRI.mColFunctions, nullptr, subgridColRange);
+    uint32_t colTrackCount = gridRI.mCols.mSizes.Length();
+    nsTArray<nscoord> colTrackPositions(colTrackCount);
+    nsTArray<nscoord> colTrackSizes(colTrackCount);
+    nsTArray<uint32_t> colTrackStates(colTrackCount);
+    nsTArray<bool> colRemovedRepeatTracks(
+        gridRI.mColFunctions.mRemovedRepeatTracks.Clone());
+    uint32_t col = 0;
+    for (const TrackSize& sz : gridRI.mCols.mSizes) {
+      colTrackPositions.AppendElement(sz.mPosition);
+      colTrackSizes.AppendElement(sz.mBase);
+      bool isRepeat = ((col >= gridRI.mColFunctions.mRepeatAutoStart) &&
+                       (col < gridRI.mColFunctions.mRepeatAutoEnd));
+      colTrackStates.AppendElement(
+          isRepeat ? (uint32_t)mozilla::dom::GridTrackState::Repeat
+                   : (uint32_t)mozilla::dom::GridTrackState::Static);
+
+      col++;
+    }
+    const uint32_t numColExplicitTracks =
+        IsColSubgrid() ? colTrackSizes.Length()
+                       : gridRI.mColFunctions.NumExplicitTracks();
+    ComputedGridTrackInfo* colInfo = new ComputedGridTrackInfo(
+        gridRI.mColFunctions.mExplicitGridOffset, numColExplicitTracks, 0, col,
+        std::move(colTrackPositions), std::move(colTrackSizes),
+        std::move(colTrackStates), std::move(colRemovedRepeatTracks),
+        gridRI.mColFunctions.mRepeatAutoStart,
+        colLineNameMap.GetResolvedLineNamesForComputedGridTrackInfo(),
+        IsColSubgrid(), IsColMasonry());
+    SetProperty(GridColTrackInfo(), colInfo);
+
+    const auto* subgridRowRange =
+        subgrid && IsRowSubgrid() ? &subgrid->SubgridRows() : nullptr;
+    LineNameMap rowLineNameMap(gridRI.mGridStyle, GetImplicitNamedAreas(),
+                               gridRI.mRowFunctions, nullptr, subgridRowRange);
+    uint32_t rowTrackCount = gridRI.mRows.mSizes.Length();
+    nsTArray<nscoord> rowTrackPositions(rowTrackCount);
+    nsTArray<nscoord> rowTrackSizes(rowTrackCount);
+    nsTArray<uint32_t> rowTrackStates(rowTrackCount);
+    nsTArray<bool> rowRemovedRepeatTracks(
+        gridRI.mRowFunctions.mRemovedRepeatTracks.Clone());
+    uint32_t row = 0;
+    for (const TrackSize& sz : gridRI.mRows.mSizes) {
+      rowTrackPositions.AppendElement(sz.mPosition);
+      rowTrackSizes.AppendElement(sz.mBase);
+      bool isRepeat = ((row >= gridRI.mRowFunctions.mRepeatAutoStart) &&
+                       (row < gridRI.mRowFunctions.mRepeatAutoEnd));
+      rowTrackStates.AppendElement(
+          isRepeat ? (uint32_t)mozilla::dom::GridTrackState::Repeat
+                   : (uint32_t)mozilla::dom::GridTrackState::Static);
+
+      row++;
+    }
+    const uint32_t numRowExplicitTracks =
+        IsRowSubgrid() ? rowTrackSizes.Length()
+                       : gridRI.mRowFunctions.NumExplicitTracks();
+    ComputedGridTrackInfo* rowInfo = new ComputedGridTrackInfo(
+        gridRI.mRowFunctions.mExplicitGridOffset, numRowExplicitTracks,
+        gridRI.mStartRow, row, std::move(rowTrackPositions),
+        std::move(rowTrackSizes), std::move(rowTrackStates),
+        std::move(rowRemovedRepeatTracks),
+        gridRI.mRowFunctions.mRepeatAutoStart,
+        rowLineNameMap.GetResolvedLineNamesForComputedGridTrackInfo(),
+        IsRowSubgrid(), IsRowMasonry());
+    SetProperty(GridRowTrackInfo(), rowInfo);
+
+    if (prevInFlow) {
+
+
+      ComputedGridTrackInfo* priorRowInfo =
+          prevInFlow->GetProperty(GridRowTrackInfo());
+
+      if (priorRowInfo->mPositions.Length() >
+          priorRowInfo->mStartFragmentTrack) {
+        nscoord delta =
+            priorRowInfo->mPositions[priorRowInfo->mStartFragmentTrack];
+        for (nscoord& pos : priorRowInfo->mPositions) {
+          pos -= delta;
+        }
+      }
+
+      ComputedGridTrackInfo* revisedPriorRowInfo = new ComputedGridTrackInfo(
+          priorRowInfo->mNumLeadingImplicitTracks,
+          priorRowInfo->mNumExplicitTracks, priorRowInfo->mStartFragmentTrack,
+          gridRI.mStartRow, std::move(priorRowInfo->mPositions),
+          std::move(priorRowInfo->mSizes), std::move(priorRowInfo->mStates),
+          std::move(priorRowInfo->mRemovedRepeatTracks),
+          priorRowInfo->mRepeatFirstTrack,
+          std::move(priorRowInfo->mResolvedLineNames), priorRowInfo->mIsSubgrid,
+          priorRowInfo->mIsMasonry);
+      prevInFlow->SetProperty(GridRowTrackInfo(), revisedPriorRowInfo);
+    }
+
+
+    auto& colFunctions = gridRI.mColFunctions;
+
+    uint32_t capacity = gridRI.mCols.mSizes.Length();
+    nsTArray<nsTArray<RefPtr<nsAtom>>> columnLineNames(capacity);
+    for (col = 0; col <= gridRI.mCols.mSizes.Length(); col++) {
+      nsTArray<RefPtr<nsAtom>> explicitNames =
+          colLineNameMap.GetExplicitLineNamesAtIndex(
+              col - colFunctions.mExplicitGridOffset);
+
+      columnLineNames.EmplaceBack(std::move(explicitNames));
+    }
+    nsTArray<RefPtr<nsAtom>> colNamesFollowingRepeat;
+    nsTArray<RefPtr<nsAtom>> colBeforeRepeatAuto;
+    nsTArray<RefPtr<nsAtom>> colAfterRepeatAuto;
+    if (colLineNameMap.HasRepeatAuto()) {
+      MOZ_ASSERT(!colFunctions.mTemplate.IsSubgrid());
+      uint32_t repeatAutoEnd = colLineNameMap.RepeatAutoStart() + 1;
+      for (auto* list : colLineNameMap.ExpandedLineNames()[repeatAutoEnd]) {
+        for (auto& name : list->AsSpan()) {
+          colNamesFollowingRepeat.AppendElement(name.AsAtom());
+        }
+      }
+      auto names = colLineNameMap.TrackAutoRepeatLineNames();
+      for (auto& name : names[0].AsSpan()) {
+        colBeforeRepeatAuto.AppendElement(name.AsAtom());
+      }
+      for (auto& name : names[1].AsSpan()) {
+        colAfterRepeatAuto.AppendElement(name.AsAtom());
+      }
+    }
+
+    ComputedGridLineInfo* columnLineInfo = new ComputedGridLineInfo{
+        std::move(columnLineNames), std::move(colBeforeRepeatAuto),
+        std::move(colAfterRepeatAuto), std::move(colNamesFollowingRepeat)};
+    SetProperty(GridColumnLineInfo(), columnLineInfo);
+
+    auto& rowFunctions = gridRI.mRowFunctions;
+    capacity = gridRI.mRows.mSizes.Length();
+    nsTArray<nsTArray<RefPtr<nsAtom>>> rowLineNames(capacity);
+    for (row = 0; row <= gridRI.mRows.mSizes.Length(); row++) {
+      nsTArray<RefPtr<nsAtom>> explicitNames =
+          rowLineNameMap.GetExplicitLineNamesAtIndex(
+              row - rowFunctions.mExplicitGridOffset);
+      rowLineNames.EmplaceBack(std::move(explicitNames));
+    }
+    nsTArray<RefPtr<nsAtom>> rowNamesFollowingRepeat;
+    nsTArray<RefPtr<nsAtom>> rowBeforeRepeatAuto;
+    nsTArray<RefPtr<nsAtom>> rowAfterRepeatAuto;
+    if (rowLineNameMap.HasRepeatAuto()) {
+      MOZ_ASSERT(!rowFunctions.mTemplate.IsSubgrid());
+      uint32_t repeatAutoEnd = rowLineNameMap.RepeatAutoStart() + 1;
+      for (auto* list : rowLineNameMap.ExpandedLineNames()[repeatAutoEnd]) {
+        for (auto& name : list->AsSpan()) {
+          rowNamesFollowingRepeat.AppendElement(name.AsAtom());
+        }
+      }
+      auto names = rowLineNameMap.TrackAutoRepeatLineNames();
+      for (auto& name : names[0].AsSpan()) {
+        rowBeforeRepeatAuto.AppendElement(name.AsAtom());
+      }
+      for (auto& name : names[1].AsSpan()) {
+        rowAfterRepeatAuto.AppendElement(name.AsAtom());
+      }
+    }
+
+    ComputedGridLineInfo* rowLineInfo = new ComputedGridLineInfo{
+        std::move(rowLineNames), std::move(rowBeforeRepeatAuto),
+        std::move(rowAfterRepeatAuto), std::move(rowNamesFollowingRepeat)};
+    SetProperty(GridRowLineInfo(), rowLineInfo);
+
+    if (!gridRI.mGridStyle->mGridTemplateAreas.IsNone()) {
+      auto* areas = new StyleOwnedSlice<NamedArea>(
+          gridRI.mGridStyle->mGridTemplateAreas.AsAreas()->areas);
+      SetProperty(ExplicitNamedAreasProperty(), areas);
+    } else {
+      RemoveProperty(ExplicitNamedAreasProperty());
+    }
+  }
+
+  if (!prevInFlow) {
+    if (!aStatus.IsFullyComplete()) {
+      SharedGridData* sharedGridData =
+          GetOrCreateDeletableProperty(SharedGridData::Prop());
+      sharedGridData->mCols.mSizes = std::move(gridRI.mCols.mSizes);
+      sharedGridData->mCols.mContentBoxSize = gridRI.mCols.mContentBoxSize;
+      sharedGridData->mCols.mBaselineSubtreeAlign =
+          gridRI.mCols.mBaselineSubtreeAlign;
+      sharedGridData->mCols.mIsMasonry = gridRI.mCols.mIsMasonry;
+      sharedGridData->mRows.mSizes = std::move(gridRI.mRows.mSizes);
+      auto& origRowData = sharedGridData->mOriginalRowData;
+      origRowData.ClearAndRetainStorage();
+      origRowData.SetCapacity(sharedGridData->mRows.mSizes.Length());
+      nscoord prevTrackEnd = 0;
+      for (auto& sz : sharedGridData->mRows.mSizes) {
+        SharedGridData::RowData data = {sz.mBase, sz.mPosition - prevTrackEnd};
+        origRowData.AppendElement(data);
+        prevTrackEnd = sz.mPosition + sz.mBase;
+      }
+      sharedGridData->mRows.mContentBoxSize = gridRI.mRows.mContentBoxSize;
+      sharedGridData->mRows.mBaselineSubtreeAlign =
+          gridRI.mRows.mBaselineSubtreeAlign;
+      sharedGridData->mRows.mIsMasonry = gridRI.mRows.mIsMasonry;
+      sharedGridData->mGridItems = std::move(gridRI.mGridItems);
+      sharedGridData->mAbsPosItems = std::move(gridRI.mAbsPosItems);
+
+      sharedGridData->mGenerateComputedGridInfo =
+          HasAnyStateBits(NS_STATE_GRID_COMPUTED_INFO);
+    } else if (!GetNextInFlow()) {
+      RemoveProperty(SharedGridData::Prop());
+    }
+  }
+
+  FinishAndStoreOverflow(&aDesiredSize);
+}
+
+void nsGridContainerFrame::UpdateSubgridFrameState() {
+  nsFrameState oldBits = GetStateBits() & kIsSubgridBits;
+  nsFrameState newBits = ComputeSelfSubgridMasonryBits() & kIsSubgridBits;
+  if (newBits != oldBits) {
+    RemoveStateBits(kIsSubgridBits);
+    if (!newBits) {
+      RemoveProperty(Subgrid::Prop());
+    } else {
+      AddStateBits(newBits);
+    }
+  }
+}
+
+nsFrameState nsGridContainerFrame::ComputeSelfSubgridMasonryBits() const {
+  nsFrameState bits = NS_FRAME_STATE_NONE;
+  const auto* pos = StylePosition();
+
+  if (pos->mGridTemplateRows.IsMasonry()) {
+    bits |= NS_STATE_GRID_IS_ROW_MASONRY;
+  } else if (pos->mGridTemplateColumns.IsMasonry()) {
+    bits |= NS_STATE_GRID_IS_COL_MASONRY;
+  }
+
+
+  if (ShouldInhibitSubgridDueToIFC(this)) {
+    return bits;
+  }
+
+
+  auto* parent = GetParent();
+  while (parent && parent->GetContent() == GetContent()) {
+    if (ShouldInhibitSubgridDueToIFC(parent)) {
+      return bits;
+    }
+    parent = parent->GetParent();
+  }
+  const nsGridContainerFrame* parentGrid = do_QueryFrame(parent);
+  if (parentGrid) {
+    bool isOrthogonal =
+        GetWritingMode().IsOrthogonalTo(parent->GetWritingMode());
+    bool isColSubgrid = pos->mGridTemplateColumns.IsSubgrid();
+    if (isColSubgrid &&
+        parent->HasAnyStateBits(isOrthogonal ? NS_STATE_GRID_IS_ROW_MASONRY
+                                             : NS_STATE_GRID_IS_COL_MASONRY)) {
+      isColSubgrid = false;
+      if (!HasAnyStateBits(NS_STATE_GRID_IS_ROW_MASONRY)) {
+        bits |= NS_STATE_GRID_IS_COL_MASONRY;
+      }
+    }
+    if (isColSubgrid) {
+      bits |= NS_STATE_GRID_IS_COL_SUBGRID;
+    }
+
+    bool isRowSubgrid = pos->mGridTemplateRows.IsSubgrid();
+    if (isRowSubgrid &&
+        parent->HasAnyStateBits(isOrthogonal ? NS_STATE_GRID_IS_COL_MASONRY
+                                             : NS_STATE_GRID_IS_ROW_MASONRY)) {
+      isRowSubgrid = false;
+      if (!HasAnyStateBits(NS_STATE_GRID_IS_COL_MASONRY)) {
+        bits |= NS_STATE_GRID_IS_ROW_MASONRY;
+      }
+    }
+    if (isRowSubgrid) {
+      bits |= NS_STATE_GRID_IS_ROW_SUBGRID;
+    }
+  }
+  return bits;
+}
+
+void nsGridContainerFrame::Init(nsIContent* aContent, nsContainerFrame* aParent,
+                                nsIFrame* aPrevInFlow) {
+  nsContainerFrame::Init(aContent, aParent, aPrevInFlow);
+
+  if (HasAnyStateBits(NS_FRAME_FONT_INFLATION_CONTAINER)) {
+    AddStateBits(NS_FRAME_FONT_INFLATION_FLOW_ROOT);
+  }
+
+  nsFrameState bits = NS_FRAME_STATE_NONE;
+  if (MOZ_LIKELY(!aPrevInFlow)) {
+    bits = ComputeSelfSubgridMasonryBits();
+  } else {
+    bits = aPrevInFlow->GetStateBits() &
+           (NS_STATE_GRID_IS_ROW_MASONRY | NS_STATE_GRID_IS_COL_MASONRY |
+            kIsSubgridBits | NS_STATE_GRID_HAS_COL_SUBGRID_ITEM |
+            NS_STATE_GRID_HAS_ROW_SUBGRID_ITEM);
+  }
+  AddStateBits(bits);
+}
+
+void nsGridContainerFrame::DidSetComputedStyle(ComputedStyle* aOldStyle) {
+  nsContainerFrame::DidSetComputedStyle(aOldStyle);
+
+  if (!aOldStyle) {
+    return;  
+  }
+  UpdateSubgridFrameState();
+}
+
+nscoord nsGridContainerFrame::ComputeIntrinsicISize(
+    const IntrinsicSizeInput& aInput, IntrinsicISizeType aType) {
+  GRID_LOG("Compute %s isize for grid container frame %p",
+           aType == IntrinsicISizeType::MinISize ? "min" : "pref", this);
+
+  if (Maybe<nscoord> containISize = ContainIntrinsicISize()) {
+    return *containISize;
+  }
+
+  NormalizeChildLists();
+  GridReflowInput gridRI(this, *aInput.mContext);
+  gridRI.mIsGridIntrinsicSizing = true;
+  InitImplicitNamedAreas(gridRI.mGridStyle);  
+
+  RepeatTrackSizingInput repeatSizing(gridRI.mWM);
+  if (!IsColSubgrid() && gridRI.mColFunctions.mHasRepeatAuto) {
+    repeatSizing.InitFromStyle(
+        LogicalAxis::Inline, gridRI.mWM, gridRI.mFrame, gridRI.mFrame->Style(),
+        gridRI.mFrame->GetAspectRatio(), aInput.mContainingBlockSize);
+  }
+  if ((!IsRowSubgrid() && gridRI.mRowFunctions.mHasRepeatAuto &&
+       !(gridRI.mGridStyle->mGridAutoFlow & StyleGridAutoFlow::ROW)) ||
+      IsColMasonry()) {
+    repeatSizing.InitFromStyle(
+        LogicalAxis::Block, gridRI.mWM, gridRI.mFrame, gridRI.mFrame->Style(),
+        gridRI.mFrame->GetAspectRatio(), aInput.mContainingBlockSize);
+  }
+
+  Grid grid;
+  if (MOZ_LIKELY(!IsSubgrid())) {
+    grid.PlaceGridItems(gridRI, repeatSizing);  
+  } else {
+    auto* subgrid = GetProperty(Subgrid::Prop());
+    gridRI.mGridItems = subgrid->mGridItems.Clone();
+    gridRI.mAbsPosItems = subgrid->mAbsPosItems.Clone();
+    grid.mGridColEnd = subgrid->mGridColEnd;
+    grid.mGridRowEnd = subgrid->mGridRowEnd;
+  }
+
+  auto constraint = aType == IntrinsicISizeType::MinISize
+                        ? SizingConstraint::MinContent
+                        : SizingConstraint::MaxContent;
+  if (IsColMasonry()) {
+    ReflowOutput desiredSize(gridRI.mWM);
+    nsSize containerSize;
+    LogicalRect contentArea(gridRI.mWM);
+    nsReflowStatus status;
+    gridRI.mRows.mSizes.SetLength(grid.mGridRowEnd);
+    gridRI.CalculateTrackSizesForAxis(LogicalAxis::Inline, grid,
+                                      NS_UNCONSTRAINEDSIZE, constraint);
+    return MasonryLayout(gridRI, contentArea, constraint, desiredSize, status,
+                         nullptr, containerSize);
+  }
+
+  if (grid.mGridColEnd == 0) {
+    return nscoord(0);
+  }
+
+  gridRI.CalculateTrackSizesForAxis(LogicalAxis::Inline, grid,
+                                    NS_UNCONSTRAINEDSIZE, constraint);
+
+  const nscoord contentBoxBSize =
+      aInput.mPercentageBasisForChildren
+          ? aInput.mPercentageBasisForChildren->BSize(gridRI.mWM)
+          : NS_UNCONSTRAINEDSIZE;
+
+  gridRI.CalculateTrackSizesForAxis(LogicalAxis::Block, grid, contentBoxBSize,
+                                    SizingConstraint::NoConstraint);
+
+  gridRI.InvalidateTrackSizesForAxis(LogicalAxis::Inline);
+
+  gridRI.CalculateTrackSizesForAxis(LogicalAxis::Inline, grid,
+                                    NS_UNCONSTRAINEDSIZE, constraint);
+
+  return gridRI.mCols.TotalTrackSizeWithoutAlignment(this);
+}
+
+nscoord nsGridContainerFrame::IntrinsicISize(const IntrinsicSizeInput& aInput,
+                                             IntrinsicISizeType aType) {
+  auto* firstCont = static_cast<nsGridContainerFrame*>(FirstContinuation());
+  if (firstCont != this) {
+    return firstCont->IntrinsicISize(aInput, aType);
+  }
+  return mCachedIntrinsicSizes.GetOrSet(*this, aType, aInput, [&] {
+    return ComputeIntrinsicISize(aInput, aType);
+  });
+}
+
+void nsGridContainerFrame::MarkIntrinsicISizesDirty() {
+  mCachedIntrinsicSizes.Clear();
+  for (auto& perAxisBaseline : mBaseline) {
+    for (auto& baseline : perAxisBaseline) {
+      baseline = NS_INTRINSIC_ISIZE_UNKNOWN;
+    }
+  }
+  nsContainerFrame::MarkIntrinsicISizesDirty();
+}
+
+void nsGridContainerFrame::BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                                            const nsDisplayListSet& aLists) {
+  DisplayBorderBackgroundOutline(aBuilder, aLists);
+  if (HidesContent()) {
+    return;
+  }
+
+  if (GetPrevInFlow()) {
+    DisplayOverflowContainers(aBuilder, aLists);
+  }
+
+  typedef CSSOrderAwareFrameIterator::OrderState OrderState;
+  OrderState order =
+      HasAnyStateBits(NS_STATE_GRID_NORMAL_FLOW_CHILDREN_IN_CSS_ORDER)
+          ? OrderState::Ordered
+          : OrderState::Unordered;
+  CSSOrderAwareFrameIterator iter(
+      this, FrameChildListID::Principal,
+      CSSOrderAwareFrameIterator::ChildFilter::IncludeAll, order);
+  const auto flags = DisplayFlagsForFlexOrGridItem();
+  for (; !iter.AtEnd(); iter.Next()) {
+    nsIFrame* child = *iter;
+    BuildDisplayListForChild(aBuilder, child, aLists, flags);
+  }
+
+  if (GetPrevInFlow() || GetNextInFlow()) {
+    DisplayAbsoluteFramesNotBuiltByPlaceholder(aBuilder, aLists);
+  }
+}
+
+bool nsGridContainerFrame::DrainSelfOverflowList() {
+  return DrainAndMergeSelfOverflowList();
+}
+
+void nsGridContainerFrame::AppendFrames(ChildListID aListID,
+                                        nsFrameList&& aFrameList) {
+  NoteNewChildren(aListID, aFrameList);
+  nsContainerFrame::AppendFrames(aListID, std::move(aFrameList));
+}
+
+void nsGridContainerFrame::InsertFrames(
+    ChildListID aListID, nsIFrame* aPrevFrame,
+    const nsLineList::iterator* aPrevFrameLine, nsFrameList&& aFrameList) {
+  NoteNewChildren(aListID, aFrameList);
+  nsContainerFrame::InsertFrames(aListID, aPrevFrame, aPrevFrameLine,
+                                 std::move(aFrameList));
+}
+
+void nsGridContainerFrame::RemoveFrame(DestroyContext& aContext,
+                                       ChildListID aListID,
+                                       nsIFrame* aOldFrame) {
+  MOZ_ASSERT(aListID == FrameChildListID::Principal, "unexpected child list");
+
+#ifdef DEBUG
+  SetDidPushItemsBitIfNeeded(aListID, aOldFrame);
+#endif
+
+  nsContainerFrame::RemoveFrame(aContext, aListID, aOldFrame);
+}
+
+nscoord nsGridContainerFrame::SynthesizeBaseline(
+    const FindItemInGridOrderResult& aGridOrderItem, LogicalAxis aAxis,
+    BaselineSharingGroup aGroup, const nsSize& aCBPhysicalSize, nscoord aCBSize,
+    WritingMode aCBWM) {
+  if (MOZ_UNLIKELY(!aGridOrderItem.mItem)) {
+    return ::SynthesizeBaselineFromBorderBox(aGroup, aCBWM, aAxis, aCBSize);
+  }
+
+  nsIFrame* child = aGridOrderItem.mItem->mFrame;
+  nsGridContainerFrame* grid = do_QueryFrame(child);
+  auto childWM = child->GetWritingMode();
+  bool isOrthogonal = aCBWM.IsOrthogonalTo(childWM);
+  const LogicalAxis childAxis = aCBWM.ConvertAxisTo(aAxis, childWM);
+  nscoord baseline;
+  nscoord start;
+  nscoord size;
+
+  if (aAxis == LogicalAxis::Block) {
+    start = child->GetLogicalNormalPosition(aCBWM, aCBPhysicalSize).B(aCBWM);
+    size = child->BSize(aCBWM);
+    if (grid && aGridOrderItem.mIsInEdgeTrack) {
+      baseline = isOrthogonal ? grid->GetIBaseline(aGroup)
+                              : grid->GetBBaseline(aGroup);
+    } else if (!isOrthogonal && aGridOrderItem.mIsInEdgeTrack) {
+      MOZ_ASSERT(childAxis == LogicalAxis::Block, "unexpected childAxis");
+      baseline = child
+                     ->GetNaturalBaselineBOffset(childWM, aGroup,
+                                                 BaselineExportContext::Other)
+                     .valueOrFrom([aGroup, child, childWM]() {
+                       return Baseline::SynthesizeBOffsetFromBorderBox(
+                           child, childWM, aGroup);
+                     });
+    } else {
+      baseline =
+          ::SynthesizeBaselineFromBorderBox(aGroup, childWM, childAxis, size);
+    }
+  } else {
+    start = child->GetLogicalNormalPosition(aCBWM, aCBPhysicalSize).I(aCBWM);
+    size = child->ISize(aCBWM);
+    if (grid && aGridOrderItem.mIsInEdgeTrack) {
+      baseline = isOrthogonal ? grid->GetBBaseline(aGroup)
+                              : grid->GetIBaseline(aGroup);
+    } else if (isOrthogonal && aGridOrderItem.mIsInEdgeTrack) {
+      baseline = child
+                     ->GetNaturalBaselineBOffset(childWM, aGroup,
+                                                 BaselineExportContext::Other)
+                     .valueOrFrom([aGroup, childWM, childAxis, size]() {
+                       return ::SynthesizeBaselineFromBorderBox(
+                           aGroup, childWM, childAxis, size);
+                     });
+    } else {
+      baseline =
+          ::SynthesizeBaselineFromBorderBox(aGroup, childWM, childAxis, size);
+    }
+  }
+  return aGroup == BaselineSharingGroup::First
+             ? start + baseline
+             : aCBSize - start - size + baseline;
+}
+
+void nsGridContainerFrame::CalculateBaselines(
+    BaselineSet aBaselineSet, CSSOrderAwareFrameIterator* aIter,
+    const nsTArray<GridItemInfo>* aGridItems, const Tracks& aTracks,
+    uint32_t aFragmentStartTrack, uint32_t aFirstExcludedTrack, WritingMode aWM,
+    const nsSize& aCBPhysicalSize, nscoord aCBBorderPaddingStart,
+    nscoord aCBBorderPaddingEnd, nscoord aCBSize) {
+  const auto axis = aTracks.mAxis;
+
+  auto firstBaseline = aTracks.GetBaseline(0, BaselineSharingGroup::First);
+  if (!(aBaselineSet & BaselineSet::eFirst)) {
+    mBaseline[axis][BaselineSharingGroup::First] =
+        ::SynthesizeBaselineFromBorderBox(BaselineSharingGroup::First, aWM,
+                                          axis, aCBSize);
+  } else if (firstBaseline.isNothing()) {
+    FindItemInGridOrderResult gridOrderFirstItem = FindFirstItemInGridOrder(
+        *aIter, *aGridItems,
+        axis == LogicalAxis::Block ? &GridArea::mRows : &GridArea::mCols,
+        axis == LogicalAxis::Block ? &GridArea::mCols : &GridArea::mRows,
+        aFragmentStartTrack);
+    mBaseline[axis][BaselineSharingGroup::First] = SynthesizeBaseline(
+        gridOrderFirstItem, axis, BaselineSharingGroup::First, aCBPhysicalSize,
+        aCBSize, aWM);
+  } else {
+    MOZ_ASSERT(!aGridItems->IsEmpty());
+    nscoord gapBeforeStartTrack =
+        aFragmentStartTrack == 0
+            ? aTracks.GridLineEdge(aFragmentStartTrack,
+                                   GridLineSide::AfterGridGap)
+            : nscoord(0);  
+    mBaseline[axis][BaselineSharingGroup::First] =
+        aCBBorderPaddingStart + gapBeforeStartTrack + *firstBaseline;
+  }
+
+  auto lastBaseline = aTracks.GetBaseline(aTracks.mBaselines.Length() - 1,
+                                          BaselineSharingGroup::Last);
+  if (!(aBaselineSet & BaselineSet::eLast)) {
+    mBaseline[axis][BaselineSharingGroup::Last] =
+        ::SynthesizeBaselineFromBorderBox(BaselineSharingGroup::Last, aWM, axis,
+                                          aCBSize);
+  } else if (lastBaseline.isNothing()) {
+    using Iter = ReverseCSSOrderAwareFrameIterator;
+    auto orderState = aIter->ItemsAreAlreadyInOrder()
+                          ? Iter::OrderState::Ordered
+                          : Iter::OrderState::Unordered;
+    Iter iter(this, FrameChildListID::Principal,
+              Iter::ChildFilter::SkipPlaceholders, orderState);
+    iter.SetItemCount(aGridItems->Length());
+    FindItemInGridOrderResult gridOrderLastItem = FindLastItemInGridOrder(
+        iter, *aGridItems,
+        axis == LogicalAxis::Block ? &GridArea::mRows : &GridArea::mCols,
+        axis == LogicalAxis::Block ? &GridArea::mCols : &GridArea::mRows,
+        aFragmentStartTrack, aFirstExcludedTrack);
+    mBaseline[axis][BaselineSharingGroup::Last] =
+        SynthesizeBaseline(gridOrderLastItem, axis, BaselineSharingGroup::Last,
+                           aCBPhysicalSize, aCBSize, aWM);
+  } else {
+    MOZ_ASSERT(!aGridItems->IsEmpty());
+    auto borderBoxStartToEndOfEndTrack =
+        aCBBorderPaddingStart +
+        aTracks.GridLineEdge(aFirstExcludedTrack, GridLineSide::BeforeGridGap) -
+        aTracks.GridLineEdge(aFragmentStartTrack, GridLineSide::BeforeGridGap);
+    mBaseline[axis][BaselineSharingGroup::Last] =
+        (aCBSize - borderBoxStartToEndOfEndTrack) + *lastBaseline;
+  }
+}
+
+#ifdef DEBUG_FRAME_DUMP
+nsresult nsGridContainerFrame::GetFrameName(nsAString& aResult) const {
+  return MakeFrameName(u"GridContainer"_ns, aResult);
+}
+
+void nsGridContainerFrame::ExtraContainerFrameInfo(
+    nsACString& aTo, bool aListOnlyDeterministic) const {
+  if (const void* const subgrid = GetProperty(Subgrid::Prop())) {
+    aTo += "[subgrid";
+    ListPtr(aTo, aListOnlyDeterministic, subgrid);
+    aTo += "]";
+  }
+}
+
+#endif
+
+ nsGridContainerFrame::FindItemInGridOrderResult
+nsGridContainerFrame::FindFirstItemInGridOrder(
+    CSSOrderAwareFrameIterator& aIter, const nsTArray<GridItemInfo>& aGridItems,
+    LineRange GridArea::* aMajor, LineRange GridArea::* aMinor,
+    uint32_t aFragmentStartTrack) {
+  FindItemInGridOrderResult result = {nullptr, false};
+  uint32_t minMajor = kTranslatedMaxLine + 1;
+  uint32_t minMinor = kTranslatedMaxLine + 1;
+  aIter.Reset();
+  for (; !aIter.AtEnd(); aIter.Next()) {
+    const GridItemInfo& item = aGridItems[aIter.ItemIndex()];
+    if ((item.mArea.*aMajor).mEnd <= aFragmentStartTrack) {
+      continue;  
+    }
+    uint32_t major = (item.mArea.*aMajor).mStart;
+    uint32_t minor = (item.mArea.*aMinor).mStart;
+    if (major < minMajor || (major == minMajor && minor < minMinor)) {
+      minMajor = major;
+      minMinor = minor;
+      result.mItem = &item;
+      result.mIsInEdgeTrack = major == 0U;
+    }
+  }
+  return result;
+}
+
+ nsGridContainerFrame::FindItemInGridOrderResult
+nsGridContainerFrame::FindLastItemInGridOrder(
+    ReverseCSSOrderAwareFrameIterator& aIter,
+    const nsTArray<GridItemInfo>& aGridItems, LineRange GridArea::* aMajor,
+    LineRange GridArea::* aMinor, uint32_t aFragmentStartTrack,
+    uint32_t aFirstExcludedTrack) {
+  FindItemInGridOrderResult result = {nullptr, false};
+  int32_t maxMajor = -1;
+  int32_t maxMinor = -1;
+  aIter.Reset();
+  int32_t lastMajorTrack = int32_t(aFirstExcludedTrack) - 1;
+  for (; !aIter.AtEnd(); aIter.Next()) {
+    const GridItemInfo& item = aGridItems[aIter.ItemIndex()];
+    int32_t major = (item.mArea.*aMajor).mEnd - 1;
+    MOZ_ASSERT((item.mArea.*aMajor).mStart < aFirstExcludedTrack,
+               "found an item that belongs to some later fragment");
+    if (major < int32_t(aFragmentStartTrack)) {
+      continue;  
+    }
+    int32_t minor = (item.mArea.*aMinor).mEnd - 1;
+    MOZ_ASSERT(minor >= 0 && major >= 0, "grid item must have span >= 1");
+    if (major > maxMajor || (major == maxMajor && minor > maxMinor)) {
+      maxMajor = major;
+      maxMinor = minor;
+      result.mItem = &item;
+      result.mIsInEdgeTrack = major == lastMajorTrack;
+    }
+  }
+  return result;
+}
+
+nsGridContainerFrame::UsedTrackSizes* nsGridContainerFrame::GetUsedTrackSizes()
+    const {
+  return GetProperty(UsedTrackSizes::Prop());
+}
+
+void nsGridContainerFrame::StoreUsedTrackSizes(LogicalAxis aAxis,
+                                               const TrackPlan& aSizes) {
+  auto* uts = GetOrCreateDeletableProperty(UsedTrackSizes::Prop());
+  uts->mTrackPlans[aAxis].Assign(aSizes);
+  uts->mCanResolveLineRangeSize[aAxis] = true;
+  for (auto& sz : uts->mTrackPlans[aAxis]) {
+    sz.mState &= ~(TrackSize::eFrozen | TrackSize::eSkipGrowUnlimited |
+                   TrackSize::eInfinitelyGrowable);
+  }
+}
+
+#ifdef DEBUG
+void nsGridContainerFrame::SetInitialChildList(ChildListID aListID,
+                                               nsFrameList&& aChildList) {
+  ChildListIDs supportedLists = {FrameChildListID::Principal};
+  MOZ_ASSERT(supportedLists.contains(aListID), "unexpected child list");
+  return nsContainerFrame::SetInitialChildList(aListID, std::move(aChildList));
+}
+
+void nsGridContainerFrame::TrackSize::DumpStateBits(StateBits aState) {
+  printf("min:");
+  if (aState & eAutoMinSizing) {
+    printf("auto ");
+  } else if (aState & eMinContentMinSizing) {
+    printf("min-content ");
+  } else if (aState & eMaxContentMinSizing) {
+    printf("max-content ");
+  }
+  printf(" max:");
+  if (aState & eAutoMaxSizing) {
+    printf("auto ");
+  } else if (aState & eMinContentMaxSizing) {
+    printf("min-content ");
+  } else if (aState & eMaxContentMaxSizing) {
+    printf("max-content ");
+  } else if (aState & eFlexMaxSizing) {
+    printf("flex ");
+  }
+  if (aState & eFrozen) {
+    printf("frozen ");
+  }
+  if (aState & eModified) {
+    printf("modified ");
+  }
+  if (aState & eBreakBefore) {
+    printf("break-before ");
+  }
+}
+
+void nsGridContainerFrame::TrackSize::Dump() const {
+  printf("mPosition=%d mBase=%d mLimit=%d ", mPosition, mBase, mLimit);
+  DumpStateBits(mState);
+}
+
+#endif  // DEBUG
+
+bool nsGridContainerFrame::IsMasonry(LogicalAxis aAxis) const {
+  return HasAnyStateBits(aAxis == mozilla::LogicalAxis::Block
+                             ? NS_STATE_GRID_IS_ROW_MASONRY
+                             : NS_STATE_GRID_IS_COL_MASONRY);
+}
+
+bool nsGridContainerFrame::GridItemShouldStretch(const nsIFrame* aChild,
+                                                 LogicalAxis aAxis) const {
+  MOZ_ASSERT(aChild->IsGridItem());
+
+  if (aChild->IsGridContainerFrame()) {
+    const auto* gridContainer =
+        static_cast<const nsGridContainerFrame*>(aChild);
+    if (gridContainer->IsSubgrid(aAxis)) {
+      return true;
+    }
+  }
+
+  const auto wm = aChild->GetWritingMode();
+  if (aChild->StyleMargin()->HasAuto(aAxis, wm,
+                                     AnchorPosResolutionParams::From(aChild))) {
+    return false;
+  }
+
+  const auto cbwm = GetWritingMode();
+  if (IsMasonry(wm, aAxis)) {
+    return false;
+  }
+
+  const auto alignment =
+      aChild->StylePosition()->UsedSelfAlignment(wm, aAxis, cbwm, Style());
+  if (MOZ_LIKELY(alignment == StyleAlignFlags::NORMAL)) {
+    return !aChild->HasReplacedSizing();
+  }
+  return alignment == StyleAlignFlags::STRETCH;
+}
+
+bool nsGridContainerFrame::ShouldInhibitSubgridDueToIFC(
+    const nsIFrame* aFrame) {
+  const auto* display = aFrame->StyleDisplay();
+  return display->IsContainLayout() || display->IsContainPaint() ||
+         display->mContainerType &
+             (StyleContainerType::SIZE | StyleContainerType::INLINE_SIZE) ||
+         display->IsAbsolutelyPositionedStyle();
+}
+
+nsGridContainerFrame* nsGridContainerFrame::GetGridContainerFrame(
+    nsIFrame* aFrame) {
+  nsGridContainerFrame* gridFrame = nullptr;
+
+  if (aFrame) {
+    nsIFrame* inner = aFrame;
+    if (MOZ_UNLIKELY(aFrame->IsFieldSetFrame())) {
+      inner = static_cast<nsFieldSetFrame*>(aFrame)->GetInner();
+    }
+    nsIFrame* insertionFrame =
+        inner ? inner->GetContentInsertionFrame() : nullptr;
+    nsIFrame* possibleGridFrame = insertionFrame ? insertionFrame : aFrame;
+    gridFrame = possibleGridFrame->IsGridContainerFrame()
+                    ? static_cast<nsGridContainerFrame*>(possibleGridFrame)
+                    : nullptr;
+  }
+  return gridFrame;
+}
+
+nsGridContainerFrame* nsGridContainerFrame::GetGridFrameWithComputedInfo(
+    nsIFrame* aFrame) {
+  nsGridContainerFrame* gridFrame = GetGridContainerFrame(aFrame);
+  if (!gridFrame) {
+    return nullptr;
+  }
+
+  auto HasComputedInfo = [](const nsGridContainerFrame& aFrame) -> bool {
+    return aFrame.HasProperty(GridColTrackInfo()) &&
+           aFrame.HasProperty(GridRowTrackInfo()) &&
+           aFrame.HasProperty(GridColumnLineInfo()) &&
+           aFrame.HasProperty(GridRowLineInfo());
+  };
+
+  if (HasComputedInfo(*gridFrame)) {
+    return gridFrame;
+  }
+
+  AutoWeakFrame weakFrameRef(gridFrame);
+
+  RefPtr<mozilla::PresShell> presShell = gridFrame->PresShell();
+  gridFrame->AddStateBits(NS_STATE_GRID_COMPUTED_INFO);
+  presShell->FrameNeedsReflow(gridFrame, IntrinsicDirty::None,
+                              NS_FRAME_IS_DIRTY);
+  presShell->FlushPendingNotifications(FlushType::Layout);
+
+  if (!weakFrameRef.IsAlive()) {
+    return nullptr;
+  }
+
+  if (MOZ_UNLIKELY(!HasComputedInfo(*gridFrame))) {
+    return nullptr;
+  }
+
+  return gridFrame;
+}
+
+void nsGridContainerFrame::MarkCachedGridMeasurementsDirty(
+    nsIFrame* aItemFrame) {
+  MOZ_ASSERT(aItemFrame->IsGridItem());
+  aItemFrame->RemoveProperty(CachedBAxisMeasurement::Prop());
+}
+
+bool nsGridContainerFrame::IsLineIteratorFlowRTL() { return false; }
+
+int32_t nsGridContainerFrame::GetNumLines() const {
+  return mFrames.GetLength();
+}
+
+Result<nsILineIterator::LineInfo, nsresult> nsGridContainerFrame::GetLine(
+    int32_t aLineNumber) {
+  if (aLineNumber < 0 || aLineNumber >= GetNumLines()) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  LineInfo rv;
+  nsIFrame* f = mFrames.FrameAt(aLineNumber);
+  rv.mLineBounds = f->GetRect();
+  rv.mFirstFrameOnLine = f;
+  rv.mNumFramesOnLine = 1;
+  return rv;
+}
+
+int32_t nsGridContainerFrame::FindLineContaining(const nsIFrame* aFrame,
+                                                 int32_t aStartLine) {
+  const int32_t index = mFrames.IndexOf(aFrame);
+  if (index < 0) {
+    return -1;
+  }
+  if (index < aStartLine) {
+    return -1;
+  }
+  return index;
+}
+
+NS_IMETHODIMP
+nsGridContainerFrame::CheckLineOrder(int32_t aLine, bool* aIsReordered,
+                                     nsIFrame** aFirstVisual,
+                                     nsIFrame** aLastVisual) {
+  *aIsReordered = false;
+  *aFirstVisual = nullptr;
+  *aLastVisual = nullptr;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGridContainerFrame::FindFrameAt(int32_t aLineNumber, nsPoint aPos,
+                                  nsIFrame** aFrameFound,
+                                  bool* aPosIsBeforeFirstFrame,
+                                  bool* aPosIsAfterLastFrame) {
+  const auto wm = GetWritingMode();
+  const LogicalPoint pos(wm, aPos, GetSize());
+
+  *aFrameFound = nullptr;
+  *aPosIsBeforeFirstFrame = true;
+  *aPosIsAfterLastFrame = false;
+
+  nsIFrame* f = mFrames.FrameAt(aLineNumber);
+  if (!f) {
+    return NS_OK;
+  }
+
+  auto rect = f->GetLogicalRect(wm, GetSize());
+  *aFrameFound = f;
+  *aPosIsBeforeFirstFrame = pos.I(wm) < rect.IStart(wm);
+  *aPosIsAfterLastFrame = pos.I(wm) > rect.IEnd(wm);
+  return NS_OK;
+}
+
+void nsGridContainerFrame::TrackPlan::Initialize(TrackSizingPhase aPhase,
+                                                 const Tracks& aTracks) {
+  MOZ_ASSERT(mTrackSizes.Length() == aTracks.mSizes.Length());
+  auto plan = mTrackSizes.begin();
+  auto sz = aTracks.mSizes.begin();
+  for (; plan != mTrackSizes.end() && sz != aTracks.mSizes.end();
+       plan++, sz++) {
+    plan->mBase = Tracks::StartSizeInDistribution(aPhase, *sz);
+    MOZ_ASSERT(aPhase == TrackSizingPhase::MaxContentMaximums ||
+                   !(sz->mState & TrackSize::eInfinitelyGrowable),
+               "forgot to reset the eInfinitelyGrowable bit?");
+    plan->mState = sz->mState;
+  }
+}
+
+nscoord nsGridContainerFrame::TrackPlan::DistributeToFlexTrackSizes(
+    nscoord aAvailableSpace, const nsTArray<uint32_t>& aGrowableTracks,
+    const TrackSizingFunctions& aFunctions,
+    const nsGridContainerFrame::Tracks& aTracks) {
+  nscoord space = aAvailableSpace;
+  double totalFr = 0.0;
+  for (uint32_t track : aGrowableTracks) {
+    MOZ_ASSERT(aTracks.mSizes[track].mState & TrackSize::eFlexMaxSizing,
+               "Only flex-sized tracks should be growable during step 4");
+    totalFr += aFunctions.MaxSizingFor(track).AsFlex()._0;
+  }
+  MOZ_ASSERT(totalFr >= 0.0, "flex fractions must be non-negative.");
+
+  double frSize = aAvailableSpace;
+  if (totalFr > 1.0) {
+    frSize /= totalFr;
+  }
+  for (uint32_t track : aGrowableTracks) {
+    TrackSize& sz = mTrackSizes[track];
+    if (sz.IsFrozen()) {
+      continue;
+    }
+    const double trackFr = aFunctions.MaxSizingFor(track).AsFlex()._0;
+    nscoord size = NSToCoordRoundWithClamp(frSize * trackFr);
+    if (MOZ_UNLIKELY(size > space)) {
+      size = space;
+      space = 0;
+    } else {
+      space -= size;
+    }
+    sz.mBase = std::max(sz.mBase, size);
+  }
+  return space;
+}
+
+void nsGridContainerFrame::ItemPlan::Initialize(
+    TrackSizingPhase aPhase, const nsTArray<uint32_t>& aGrowableTracks,
+    const nsGridContainerFrame::Tracks& aTracks) {
+  for (uint32_t track : aGrowableTracks) {
+    auto& plan = mTrackSizes[track];
+    const TrackSize& sz = aTracks.mSizes[track];
+    plan.mBase = Tracks::StartSizeInDistribution(aPhase, sz);
+    bool unlimited = sz.mState & TrackSize::eInfinitelyGrowable;
+    plan.mLimit = unlimited ? NS_UNCONSTRAINEDSIZE : sz.mLimit;
+    plan.mState = sz.mState;
+  }
+}
+
+nscoord nsGridContainerFrame::ItemPlan::GrowTracksToLimit(
+    nscoord aAvailableSpace, const nsTArray<uint32_t>& aGrowableTracks,
+    const FitContentClamper& aFitContentClamper) {
+  MOZ_ASSERT(aAvailableSpace > 0 && aGrowableTracks.Length() > 0);
+  nscoord space = aAvailableSpace;
+  uint32_t numGrowable = aGrowableTracks.Length();
+  while (true) {
+    nscoord spacePerTrack = std::max<nscoord>(space / numGrowable, 1);
+    for (uint32_t track : aGrowableTracks) {
+      TrackSize& sz = mTrackSizes[track];
+      if (sz.IsFrozen()) {
+        continue;
+      }
+      nscoord newBase = sz.mBase + spacePerTrack;
+      nscoord limit = sz.mLimit;
+      if (MOZ_UNLIKELY((sz.mState & TrackSize::eApplyFitContentClamping) &&
+                       aFitContentClamper)) {
+        aFitContentClamper(track, sz.mBase, &limit);
+      }
+      if (newBase > limit) {
+        nscoord consumed = limit - sz.mBase;
+        if (consumed > 0) {
+          space -= consumed;
+          sz.mBase = limit;
+        }
+        sz.mState |= TrackSize::eFrozen;
+        if (--numGrowable == 0) {
+          return space;
+        }
+      } else {
+        sz.mBase = newBase;
+        space -= spacePerTrack;
+      }
+      MOZ_ASSERT(space >= 0);
+      if (space == 0) {
+        return 0;
+      }
+    }
+  }
+  MOZ_ASSERT_UNREACHABLE("we don't exit the loop above except by return");
+  return 0;
+}
+
+uint32_t nsGridContainerFrame::ItemPlan::MarkExcludedTracks(
+    TrackSizingPhase aPhase, const nsTArray<uint32_t>& aGrowableTracks,
+    SizingConstraint aConstraint) {
+  uint32_t numGrowable = aGrowableTracks.Length();
+  if (aPhase == TrackSizingPhase::IntrinsicMaximums ||
+      aPhase == TrackSizingPhase::MaxContentMaximums) {
+    return numGrowable;
+  }
+
+  TrackSize::StateBits selector = Tracks::SelectorForPhase(aPhase, aConstraint);
+  numGrowable = MarkExcludedTracks(
+      numGrowable, aGrowableTracks, TrackSize::eMaxContentMinSizing,
+      TrackSize::eMaxContentMaxSizing, TrackSize::eSkipGrowUnlimited1);
+  if ((selector &= ~TrackSize::eMaxContentMinSizing)) {
+    numGrowable = MarkExcludedTracks(numGrowable, aGrowableTracks, selector,
+                                     TrackSize::eIntrinsicMaxSizing,
+                                     TrackSize::eSkipGrowUnlimited2);
+  }
+  return numGrowable;
+}
+
+uint32_t nsGridContainerFrame::ItemPlan::MarkExcludedTracks(
+    uint32_t aNumGrowable, const nsTArray<uint32_t>& aGrowableTracks,
+    TrackSize::StateBits aMinSizingSelector,
+    TrackSize::StateBits aMaxSizingSelector, TrackSize::StateBits aSkipFlag) {
+  bool foundOneSelected = false;
+  bool foundOneGrowable = false;
+  uint32_t numGrowable = aNumGrowable;
+  for (uint32_t track : aGrowableTracks) {
+    TrackSize& sz = mTrackSizes[track];
+    const auto state = sz.mState;
+    if (state & aMinSizingSelector) {
+      foundOneSelected = true;
+      if (state & aMaxSizingSelector) {
+        foundOneGrowable = true;
+        continue;
+      }
+      sz.mState |= aSkipFlag;
+      MOZ_ASSERT(numGrowable != 0);
+      --numGrowable;
+    }
+  }
+  if (foundOneSelected && !foundOneGrowable) {
+    for (uint32_t track : aGrowableTracks) {
+      mTrackSizes[track].mState &= ~aSkipFlag;
+    }
+    numGrowable = aNumGrowable;
+  }
+  return numGrowable;
+}
+
+void nsGridContainerFrame::ItemPlan::GrowSelectedTracksUnlimited(
+    nscoord aAvailableSpace, const nsTArray<uint32_t>& aGrowableTracks,
+    uint32_t aNumGrowable, const FitContentClamper& aFitContentClamper) {
+  MOZ_ASSERT(aAvailableSpace > 0 && aGrowableTracks.Length() > 0 &&
+             aNumGrowable <= aGrowableTracks.Length());
+  nscoord space = aAvailableSpace;
+  DebugOnly<bool> didClamp = false;
+  while (aNumGrowable) {
+    nscoord spacePerTrack = std::max<nscoord>(space / aNumGrowable, 1);
+    for (uint32_t track : aGrowableTracks) {
+      TrackSize& sz = mTrackSizes[track];
+      if (sz.mState & TrackSize::eSkipGrowUnlimited) {
+        continue;  
+      }
+      nscoord delta = spacePerTrack;
+      nscoord newBase = sz.mBase + delta;
+      if (MOZ_UNLIKELY((sz.mState & TrackSize::eApplyFitContentClamping) &&
+                       aFitContentClamper)) {
+        if (aFitContentClamper(track, sz.mBase, &newBase)) {
+          didClamp = true;
+          delta = newBase - sz.mBase;
+          MOZ_ASSERT(delta >= 0, "track size shouldn't shrink");
+          sz.mState |= TrackSize::eSkipGrowUnlimited1;
+          --aNumGrowable;
+        }
+      }
+      sz.mBase = newBase;
+      space -= delta;
+      MOZ_ASSERT(space >= 0);
+      if (space == 0) {
+        return;
+      }
+    }
+  }
+  MOZ_ASSERT(didClamp,
+             "we don't exit the loop above except by return, "
+             "unless we clamped some track's size");
+}

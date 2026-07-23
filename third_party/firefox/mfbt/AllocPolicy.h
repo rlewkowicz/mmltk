@@ -1,0 +1,111 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_AllocPolicy_h
+#define mozilla_AllocPolicy_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/CheckedArithmetic.h"
+#include "mozilla/Likely.h"
+
+#include <cstddef>
+#include <cstdlib>
+
+namespace mozilla {
+
+
+class MallocAllocPolicy {
+ public:
+  template <typename T>
+  T* maybe_pod_malloc(size_t aNumElems) {
+    size_t size;
+    if (MOZ_UNLIKELY(!mozilla::SafeMul(aNumElems, sizeof(T), &size)))
+      return nullptr;
+    return static_cast<T*>(malloc(size));
+  }
+
+  template <typename T>
+  T* maybe_pod_calloc(size_t aNumElems) {
+    return static_cast<T*>(calloc(aNumElems, sizeof(T)));
+  }
+
+  template <typename T>
+  T* maybe_pod_realloc(T* aPtr, size_t aOldSize, size_t aNewSize) {
+    size_t size;
+    if (MOZ_UNLIKELY(!mozilla::SafeMul(aNewSize, sizeof(T), &size)))
+      return nullptr;
+    return static_cast<T*>(realloc(aPtr, size));
+  }
+
+  template <typename T>
+  T* pod_malloc(size_t aNumElems) {
+    return maybe_pod_malloc<T>(aNumElems);
+  }
+
+  template <typename T>
+  T* pod_calloc(size_t aNumElems) {
+    return maybe_pod_calloc<T>(aNumElems);
+  }
+
+  template <typename T>
+  T* pod_realloc(T* aPtr, size_t aOldSize, size_t aNewSize) {
+    return maybe_pod_realloc<T>(aPtr, aOldSize, aNewSize);
+  }
+
+  template <typename T>
+  void free_(T* aPtr, size_t aNumElems = 0) {
+    free(aPtr);
+  }
+
+  void reportAllocOverflow() const {}
+
+  [[nodiscard]] bool checkSimulatedOOM() const { return true; }
+};
+
+class NeverAllocPolicy {
+ public:
+  template <typename T>
+  T* maybe_pod_malloc(size_t aNumElems) {
+    return nullptr;
+  }
+
+  template <typename T>
+  T* maybe_pod_calloc(size_t aNumElems) {
+    return nullptr;
+  }
+
+  template <typename T>
+  T* maybe_pod_realloc(T* aPtr, size_t aOldSize, size_t aNewSize) {
+    MOZ_CRASH("NeverAllocPolicy::maybe_pod_realloc");
+  }
+
+  template <typename T>
+  T* pod_malloc(size_t aNumElems) {
+    return nullptr;
+  }
+
+  template <typename T>
+  T* pod_calloc(size_t aNumElems) {
+    return nullptr;
+  }
+
+  template <typename T>
+  T* pod_realloc(T* aPtr, size_t aOldSize, size_t aNewSize) {
+    MOZ_CRASH("NeverAllocPolicy::pod_realloc");
+  }
+
+  template <typename T>
+  void free_(T* aPtr, size_t aNumElems = 0) {
+    MOZ_CRASH("NeverAllocPolicy::free_");
+  }
+
+  void reportAllocOverflow() const {}
+
+  [[nodiscard]] bool checkSimulatedOOM() const { return true; }
+};
+
+}  
+
+#endif /* mozilla_AllocPolicy_h */

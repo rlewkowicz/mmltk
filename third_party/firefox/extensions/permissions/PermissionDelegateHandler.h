@@ -1,0 +1,104 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_PermissionDelegateHandler_h
+#define mozilla_PermissionDelegateHandler_h
+
+#include "mozilla/Array.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsISupports.h"
+#include "nsIPermissionDelegateHandler.h"
+#include "nsIPermissionManager.h"
+#include "nsCOMPtr.h"
+
+class nsIPrincipal;
+class nsIContentPermissionRequest;
+
+namespace mozilla {
+namespace dom {
+class Document;
+class WindowContext;
+}  
+
+class PermissionDelegateHandler final : public nsIPermissionDelegateHandler {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS(PermissionDelegateHandler)
+
+  NS_DECL_NSIPERMISSIONDELEGATEHANDLER
+
+  explicit PermissionDelegateHandler() = default;
+  explicit PermissionDelegateHandler(mozilla::dom::Document* aDocument);
+
+  static constexpr size_t DELEGATED_PERMISSION_COUNT = 16;
+
+  typedef struct DelegatedPermissionList {
+    Array<uint32_t, DELEGATED_PERMISSION_COUNT> mPermissions;
+
+    bool operator==(const DelegatedPermissionList& aOther) const {
+      return mPermissions == aOther.mPermissions;
+    }
+  } DelegatedPermissionList;
+
+  bool Initialize();
+
+  bool HasPermissionDelegated(const nsACString& aType) const;
+
+  nsresult GetPermission(const nsACString& aType, uint32_t* aPermission,
+                         bool aExactHostMatch);
+
+  nsresult GetPermissionForPermissionsAPI(const nsACString& aType,
+                                          uint32_t* aPermission);
+
+  enum PermissionDelegatePolicy {
+    eDelegateUseTopOrigin,
+
+    eDelegateUseFeaturePolicy,
+
+    ePersistDeniedCrossOrigin,
+
+    eDelegateUseIframeOrigin,
+  };
+
+  typedef struct {
+    const char* mPermissionName;
+    const char16_t* mFeatureName;
+    PermissionDelegatePolicy mPolicy;
+  } PermissionDelegateInfo;
+
+  void DropDocumentReference() { mDocument = nullptr; }
+
+  static const PermissionDelegateInfo* GetPermissionDelegateInfo(
+      const nsAString& aPermissionName);
+
+  static nsresult GetDelegatePrincipal(const nsACString& aType,
+                                       nsIContentPermissionRequest* aRequest,
+                                       nsIPrincipal** aResult);
+
+  void PopulateAllDelegatedPermissions();
+
+  void UpdateDelegatedPermission(const nsACString& aType);
+
+ private:
+  ~PermissionDelegateHandler() = default;
+
+  bool HasFeaturePolicyAllowed(const PermissionDelegateInfo* info) const;
+
+  bool UpdateDelegatePermissionInternal(
+      PermissionDelegateHandler::DelegatedPermissionList& aList,
+      const nsACString& aType, size_t aIdx,
+      nsresult (NS_STDCALL nsIPermissionManager::*aTestFunc)(nsIPrincipal*,
+                                                             const nsACString&,
+                                                             uint32_t*));
+
+  mozilla::dom::Document* mDocument;
+
+  nsCOMPtr<nsIPrincipal> mPrincipal;
+  RefPtr<nsIPermissionManager> mPermissionManager;
+};
+
+}  
+
+#endif  // mozilla_PermissionDelegateHandler_h

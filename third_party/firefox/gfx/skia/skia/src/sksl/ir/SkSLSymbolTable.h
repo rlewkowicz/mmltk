@@ -1,0 +1,155 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_SYMBOLTABLE)
+#define SKSL_SYMBOLTABLE
+
+#include "include/core/SkTypes.h"
+#include "src/core/SkChecksum.h"
+#include "src/core/SkTHash.h"
+#include "src/sksl/ir/SkSLSymbol.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <forward_list>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace SkSL {
+
+class Context;
+class Expression;
+class Position;
+class Type;
+
+class SymbolTable {
+public:
+    explicit SymbolTable(bool builtin)
+            : fBuiltin(builtin) {}
+
+    explicit SymbolTable(SymbolTable* parent, bool builtin)
+            : fParent(parent)
+            , fBuiltin(builtin) {}
+
+    std::unique_ptr<SymbolTable> insertNewParent();
+
+    const Symbol* find(std::string_view name) const {
+        return this->lookup(MakeSymbolKey(name));
+    }
+
+    const Symbol* findBuiltinSymbol(std::string_view name) const;
+
+    Symbol* findMutable(std::string_view name) const {
+        return this->lookup(MakeSymbolKey(name));
+    }
+
+    std::unique_ptr<Expression> instantiateSymbolRef(const Context& context,
+                                                     std::string_view name,
+                                                     Position pos);
+
+    void renameSymbol(const Context& context, Symbol* symbol, std::string_view newName);
+
+    std::unique_ptr<Symbol> removeSymbol(const Symbol* symbol);
+
+    void moveSymbolTo(SymbolTable* otherTable, Symbol* sym, const Context& context);
+
+    bool isType(std::string_view name) const;
+
+    bool isBuiltinType(std::string_view name) const;
+
+    void addWithoutOwnershipOrDie(Symbol* symbol);
+    void addWithoutOwnership(const Context& context, Symbol* symbol);
+
+    template <typename T>
+    T* add(const Context& context, std::unique_ptr<T> symbol) {
+        T* ptr = symbol.get();
+        this->addWithoutOwnership(context, this->takeOwnershipOfSymbol(std::move(symbol)));
+        return ptr;
+    }
+
+    template <typename T>
+    T* addOrDie(std::unique_ptr<T> symbol) {
+        T* ptr = symbol.get();
+        this->addWithoutOwnershipOrDie(this->takeOwnershipOfSymbol(std::move(symbol)));
+        return ptr;
+    }
+
+    void injectWithoutOwnership(Symbol* symbol);
+
+    template <typename T>
+    T* inject(std::unique_ptr<T> symbol) {
+        T* ptr = symbol.get();
+        this->injectWithoutOwnership(this->takeOwnershipOfSymbol(std::move(symbol)));
+        return ptr;
+    }
+
+    template <typename T>
+    T* takeOwnershipOfSymbol(std::unique_ptr<T> symbol) {
+        T* ptr = symbol.get();
+        fOwnedSymbols.push_back(std::move(symbol));
+        return ptr;
+    }
+
+    const Type* addArrayDimension(const Context& context, const Type* type, int arraySize);
+
+    template <typename Fn>
+    void foreach(Fn&& fn) const {
+        fSymbols.foreach(
+                [&fn](const SymbolKey& key, const Symbol* symbol) { fn(key.fName, symbol); });
+    }
+
+    bool wouldShadowSymbolsFrom(const SymbolTable* other) const;
+
+    size_t count() const {
+        return fSymbols.count();
+    }
+
+    bool isBuiltin() const {
+        return fBuiltin;
+    }
+
+    const std::string* takeOwnershipOfString(std::string n);
+
+    void markModuleBoundary() {
+        fAtModuleBoundary = true;
+    }
+
+    SymbolTable* fParent = nullptr;
+
+    std::vector<std::unique_ptr<Symbol>> fOwnedSymbols;
+
+private:
+    struct SymbolKey {
+        std::string_view fName;
+        uint32_t         fHash;
+
+        bool operator==(const SymbolKey& that) const { return fName == that.fName; }
+        bool operator!=(const SymbolKey& that) const { return fName != that.fName; }
+        struct Hash {
+            uint32_t operator()(const SymbolKey& key) const { return key.fHash; }
+        };
+    };
+
+    static SymbolKey MakeSymbolKey(std::string_view name) {
+        return SymbolKey{name, SkChecksum::Hash32(name.data(), name.size())};
+    }
+
+    Symbol* lookup(const SymbolKey& key) const;
+    bool addWithoutOwnership(Symbol* symbol);
+
+    bool fBuiltin = false;
+    bool fAtModuleBoundary = false;
+    std::forward_list<std::string> fOwnedStrings;
+    skia_private::THashMap<SymbolKey, Symbol*, SymbolKey::Hash> fSymbols;
+};
+
+}  
+
+#endif

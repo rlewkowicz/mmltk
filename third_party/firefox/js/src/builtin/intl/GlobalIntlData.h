@@ -1,0 +1,96 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_intl_GlobalIntlData_h
+#define builtin_intl_GlobalIntlData_h
+
+#include "gc/Barrier.h"
+#include "js/TypeDecls.h"
+#include "util/LanguageId.h"
+#include "vm/JSObject.h"
+#include "vm/StringType.h"
+#include "vm/SymbolType.h"
+
+class JS_PUBLIC_API JSTracer;
+
+namespace js::temporal {
+class TimeZoneObject;
+}
+
+namespace js::intl {
+
+enum class DateTimeFormatKind;
+
+class CollatorObject;
+class DateTimeFormatObject;
+class NumberFormatObject;
+
+class GlobalIntlData {
+  LanguageId realmLocale_ = LanguageId::und();
+
+  LanguageId defaultLocale_ = LanguageId::und();
+
+  GCPtr<JSLinearString*> realmTimeZone_;
+
+  GCPtr<JSLinearString*> defaultTimeZone_;
+
+  GCPtr<JSObject*> defaultTimeZoneObject_;
+
+  GCPtr<JSObject*> timeZoneObject_;
+
+  GCPtr<JSLinearString*> collatorLocale_;
+
+  GCPtr<JSObject*> collator_;
+
+  GCPtr<JSLinearString*> numberFormatLocale_;
+
+  GCPtr<JSObject*> numberFormat_;
+
+  GCPtr<JSLinearString*> dateTimeFormatLocale_;
+
+  GCPtr<JSObject*> dateTimeFormatToLocaleAll_;
+
+  GCPtr<JSObject*> dateTimeFormatToLocaleDate_;
+
+  GCPtr<JSObject*> dateTimeFormatToLocaleTime_;
+
+  GCPtr<JS::Symbol*> fallbackSymbol_;
+
+ public:
+  bool defaultLocale(JSContext* cx, LanguageId* result);
+
+  JSLinearString* defaultTimeZone(JSContext* cx);
+
+  temporal::TimeZoneObject* getOrCreateDefaultTimeZone(JSContext* cx);
+
+  temporal::TimeZoneObject* getOrCreateTimeZone(
+      JSContext* cx, JS::Handle<JSLinearString*> identifier,
+      JS::Handle<JSLinearString*> primaryIdentifier);
+
+  CollatorObject* getOrCreateCollator(JSContext* cx,
+                                      JS::Handle<JSLinearString*> locale);
+
+  NumberFormatObject* getOrCreateNumberFormat(
+      JSContext* cx, JS::Handle<JSLinearString*> locale);
+
+  DateTimeFormatObject* getOrCreateDateTimeFormat(
+      JSContext* cx, DateTimeFormatKind kind,
+      JS::Handle<JSLinearString*> locale);
+
+  JS::Symbol* fallbackSymbol(JSContext* cx);
+
+  void trace(JSTracer* trc);
+
+ private:
+  bool ensureRealmLocale(JSContext* cx);
+  bool ensureRealmTimeZone(JSContext* cx);
+
+  void resetCollator();
+  void resetNumberFormat();
+  void resetDateTimeFormat();
+};
+
+}  
+
+#endif /* builtin_intl_GlobalIntlData_h */

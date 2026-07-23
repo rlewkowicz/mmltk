@@ -1,0 +1,143 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ServiceWorkerRegistrar_h
+#define mozilla_dom_ServiceWorkerRegistrar_h
+
+#include "mozilla/Monitor.h"
+#include "mozilla/dom/ServiceWorkerRegistrarTypes.h"
+#include "nsCOMPtr.h"
+#include "nsClassHashtable.h"
+#include "nsIAsyncShutdown.h"
+#include "nsIObserver.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+#define SERVICEWORKERREGISTRAR_FILE u"serviceworker.txt"
+#define SERVICEWORKERREGISTRAR_VERSION 12
+#define SERVICEWORKERREGISTRAR_TERMINATOR "#"
+#define SERVICEWORKERREGISTRAR_TRUE "true"
+#define SERVICEWORKERREGISTRAR_FALSE "false"
+
+class nsIFile;
+
+namespace mozilla {
+
+namespace ipc {
+class PrincipalInfo;
+}  
+
+}  
+
+namespace mozilla::dom {
+
+class ServiceWorkerRegistrar : public nsIObserver,
+                               public nsIAsyncShutdownBlocker {
+  friend class ServiceWorkerRegistrarSaveDataRunnable;
+
+ public:
+  struct ExpandoHandler {
+    nsCString mKey;
+    void (*mServiceWorkerLoaded)(const ServiceWorkerRegistrationData& aData,
+                                 const nsACString& aValue);
+    void (*mServiceWorkerUpdated)(const ServiceWorkerRegistrationData& aData);
+    void (*mServiceWorkerUnregistered)(
+        const ServiceWorkerRegistrationData& aData);
+  };
+
+  struct ExpandoData {
+    nsCString mKey;
+    nsCString mValue;
+    const ExpandoHandler* mHandler;
+  };
+
+  struct ServiceWorkerData {
+    ServiceWorkerRegistrationData mRegistration;
+    CopyableTArray<ExpandoData> mExpandos;
+  };
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSIASYNCSHUTDOWNBLOCKER
+
+  static void Initialize();
+
+  void Shutdown();
+
+  void DataSaved(uint32_t aFileGeneration);
+
+  static already_AddRefed<ServiceWorkerRegistrar> Get();
+
+  void GetRegistrations(nsTArray<ServiceWorkerRegistrationData>& aValues);
+
+  void RegisterServiceWorker(const ServiceWorkerRegistrationData& aData);
+  void UnregisterServiceWorker(
+      const mozilla::ipc::PrincipalInfo& aPrincipalInfo,
+      const nsACString& aScope);
+
+  void StoreServiceWorkerExpandoOnMainThread(
+      const mozilla::ipc::PrincipalInfo& aPrincipalInfo,
+      const nsACString& aScope, const nsACString& aKey,
+      const nsACString& aValue);
+
+  void UnstoreServiceWorkerExpandoOnMainThread(
+      const mozilla::ipc::PrincipalInfo& aPrincipalInfo,
+      const nsACString& aScope, const nsACString& aKey);
+
+  void RemoveAll();
+
+ protected:
+  void LoadData();
+  nsresult SaveData(const nsTArray<ServiceWorkerData>& aData);
+
+  nsresult ReadData();
+  nsresult WriteData(const nsTArray<ServiceWorkerData>& aData);
+  void DeleteData();
+
+  void RegisterServiceWorkerInternal(const ServiceWorkerRegistrationData& aData)
+      MOZ_REQUIRES(mMonitor);
+
+  ServiceWorkerRegistrar();
+  virtual ~ServiceWorkerRegistrar();
+
+ private:
+  void ProfileStarted();
+  void ProfileStopped();
+
+  void MaybeScheduleSaveData();
+  void ShutdownCompleted();
+  void MaybeScheduleShutdownCompleted();
+
+  uint32_t GetNextGeneration();
+  void MaybeResetGeneration();
+
+  nsCOMPtr<nsIAsyncShutdownClient> GetShutdownPhase() const;
+
+  bool IsSupportedVersion(uint32_t aVersion) const;
+
+  void LoadExpandoCallbacks(const CopyableTArray<ServiceWorkerData>& aData);
+  void UpdateExpandoCallbacks(const ServiceWorkerData& aData);
+  void UnregisterExpandoCallbacks(
+      const CopyableTArray<ServiceWorkerData>& aData);
+
+ protected:
+  mozilla::Monitor mMonitor;
+
+  nsCOMPtr<nsIFile> mProfileDir MOZ_GUARDED_BY(mMonitor);
+  nsTArray<ServiceWorkerData> mData MOZ_GUARDED_BY(mMonitor);
+  bool mDataLoaded MOZ_GUARDED_BY(mMonitor);
+
+  uint32_t mDataGeneration;
+  uint32_t mFileGeneration;
+  uint32_t mRetryCount;
+  bool mShuttingDown;
+  bool mSaveDataRunnableDispatched;
+
+  nsTArray<ExpandoHandler> mExpandoHandlers;
+};
+
+}  
+
+#endif  // mozilla_dom_ServiceWorkerRegistrar_h

@@ -1,0 +1,213 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsXULPopupListener.h"
+
+#include "XULButtonElement.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/EventStateManager.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/ReflowInput.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/Event.h"  // for Event
+#include "mozilla/dom/EventTarget.h"
+#include "mozilla/dom/FragmentOrElement.h"
+#include "mozilla/dom/MouseEvent.h"
+#include "mozilla/dom/MouseEventBinding.h"
+#include "nsCOMPtr.h"
+#include "nsContentUtils.h"
+#include "nsGkAtoms.h"
+#include "nsIObjectLoadingContent.h"
+#include "nsIScriptContext.h"
+#include "nsLayoutUtils.h"
+#include "nsServiceManagerUtils.h"
+#include "nsXULPopupManager.h"
+
+#include "nsError.h"
+#include "nsFocusManager.h"
+#include "nsPIDOMWindow.h"
+#include "nsPresContext.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+
+nsXULPopupListener::nsXULPopupListener(mozilla::dom::Element* aElement,
+                                       bool aIsContext)
+    : mElement(aElement), mPopupContent(nullptr), mIsContext(aIsContext) {}
+
+nsXULPopupListener::~nsXULPopupListener(void) { ClosePopup(); }
+
+NS_IMPL_CYCLE_COLLECTION(nsXULPopupListener, mElement, mPopupContent)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(nsXULPopupListener)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(nsXULPopupListener)
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_BEGIN(nsXULPopupListener)
+  if (tmp->mElement) {
+    return mozilla::dom::FragmentOrElement::CanSkip(tmp->mElement, true);
+  }
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_BEGIN(nsXULPopupListener)
+  if (tmp->mElement) {
+    return mozilla::dom::FragmentOrElement::CanSkipInCC(tmp->mElement);
+  }
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_BEGIN(nsXULPopupListener)
+  if (tmp->mElement) {
+    return mozilla::dom::FragmentOrElement::CanSkipThis(tmp->mElement);
+  }
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsXULPopupListener)
+  NS_INTERFACE_MAP_ENTRY(nsIDOMEventListener)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+
+nsresult nsXULPopupListener::HandleEvent(Event* aEvent) {
+  nsAutoString eventType;
+  aEvent->GetType(eventType);
+
+  if (!((eventType.EqualsLiteral("mousedown") && !mIsContext) ||
+        (eventType.EqualsLiteral("contextmenu") && mIsContext)))
+    return NS_OK;
+
+  MouseEvent* mouseEvent = aEvent->AsMouseEvent();
+  if (!mouseEvent) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIContent> targetContent =
+      nsIContent::FromEventTargetOrNull(mouseEvent->GetTarget());
+  if (!targetContent) {
+    return NS_OK;
+  }
+
+  if (nsIContent* content =
+          nsIContent::FromEventTargetOrNull(mouseEvent->GetOriginalTarget())) {
+    if (EventStateManager::IsTopLevelRemoteTarget(content)) {
+      return NS_OK;
+    }
+  }
+
+  bool preventDefault = mouseEvent->DefaultPrevented();
+  if (preventDefault && mIsContext) {
+    bool eventEnabled =
+        Preferences::GetBool("dom.event.contextmenu.enabled", true);
+    if (!eventEnabled) {
+      if (!targetContent->NodePrincipal()->IsSystemPrincipal()) {
+        preventDefault = false;
+      }
+    }
+  }
+
+  if (preventDefault) {
+    return NS_OK;
+  }
+
+  if (!mIsContext &&
+      targetContent->IsAnyOfXULElements(nsGkAtoms::menu, nsGkAtoms::menuitem)) {
+    return NS_OK;
+  }
+
+  if (!mIsContext && mouseEvent->Button() != 0) {
+    return NS_OK;
+  }
+
+  LaunchPopup(mouseEvent);
+
+  return NS_OK;
+}
+
+void nsXULPopupListener::ClosePopup() {
+  if (mPopupContent) {
+    nsXULPopupManager* pm = nsXULPopupManager::GetInstance();
+    if (pm)
+      pm->HidePopup(mPopupContent,
+                    {HidePopupOption::DeselectMenu, HidePopupOption::Async});
+    mPopupContent = nullptr;  
+  }
+}  
+
+static already_AddRefed<Element> GetImmediateChild(nsIContent* aContent,
+                                                   nsAtom* aTag) {
+  for (nsIContent* child = aContent->GetFirstChild(); child;
+       child = child->GetNextSibling()) {
+    if (child->IsXULElement(aTag)) {
+      RefPtr<Element> ret = child->AsElement();
+      return ret.forget();
+    }
+  }
+
+  return nullptr;
+}
+
+nsresult nsXULPopupListener::LaunchPopup(MouseEvent* aEvent) {
+  nsresult rv = NS_OK;
+
+  nsAutoString identifier;
+  nsAtom* type = mIsContext ? nsGkAtoms::context : nsGkAtoms::popup;
+  bool hasPopupAttr = mElement->GetAttr(type, identifier);
+
+  if (identifier.IsEmpty()) {
+    hasPopupAttr =
+        mElement->GetAttr(mIsContext ? nsGkAtoms::contextmenu : nsGkAtoms::menu,
+                          identifier) ||
+        hasPopupAttr;
+  }
+
+  if (hasPopupAttr) {
+    aEvent->StopPropagation();
+    aEvent->PreventDefault();
+  }
+
+  if (identifier.IsEmpty()) return rv;
+
+  nsCOMPtr<Document> document = mElement->GetComposedDoc();
+  if (!document) {
+    NS_WARNING("No document!");
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<Element> popup;
+  if (identifier.EqualsLiteral("_child")) {
+    popup = GetImmediateChild(mElement, nsGkAtoms::menupopup);
+  } else if (!mElement->IsInUncomposedDoc() ||
+             !(popup = document->GetElementById(identifier))) {
+    NS_WARNING("GetElementById had some kind of spasm.");
+    return rv;
+  }
+
+  if (!popup || popup == mElement) {
+    return NS_OK;
+  }
+
+  if (auto* button = XULButtonElement::FromNodeOrNull(popup->GetParent())) {
+    if (button->IsMenu()) {
+      return NS_OK;
+    }
+  }
+
+  nsXULPopupManager* pm = nsXULPopupManager::GetInstance();
+  if (!pm) return NS_OK;
+
+  mPopupContent = popup;
+  if (!mIsContext && (mPopupContent->HasAttr(nsGkAtoms::position) ||
+                      (mPopupContent->HasAttr(nsGkAtoms::popupanchor) &&
+                       mPopupContent->HasAttr(nsGkAtoms::popupalign)))) {
+    pm->ShowPopup(mPopupContent, mElement, u""_ns, 0, 0, false, true, false,
+                  aEvent);
+  } else {
+    const CSSIntPoint pos =
+        RoundedToInt(aEvent->ScreenPoint(CallerType::System));
+    pm->ShowPopupAtScreen(mPopupContent, pos.x, pos.y, mIsContext, aEvent);
+  }
+
+  return NS_OK;
+}

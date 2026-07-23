@@ -1,0 +1,32 @@
+
+[package]
+edition = "2018"
+name = "extend"
+version = "1.2.0"
+authors = ["David Pedersen <david.pdrsn@gmail.com>"]
+description = "Create extensions for types you don't own with extension traits but without the boilerplate."
+homepage = "https://github.com/davidpdrsn/extend"
+keywords = [
+    "extension",
+    "trait",
+]
+categories = ["rust-patterns"]
+license = "MIT"
+repository = "https://github.com/davidpdrsn/extend"
+
+[lib]
+proc-macro = true
+
+[dependencies.proc-macro2]
+version = "1"
+
+[dependencies.quote]
+version = "1"
+
+[dependencies.syn]
+version = "2"
+features = [
+    "full",
+    "extra-traits",
+    "visit",
+]

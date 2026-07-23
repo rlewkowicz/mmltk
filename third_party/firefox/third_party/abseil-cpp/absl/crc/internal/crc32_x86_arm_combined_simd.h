@@ -1,0 +1,280 @@
+// Copyright 2022 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_CRC_INTERNAL_CRC32_X86_ARM_COMBINED_SIMD_H_
+#define ABSL_CRC_INTERNAL_CRC32_X86_ARM_COMBINED_SIMD_H_
+
+#include <array>
+#include <cstdint>
+
+#include "absl/base/config.h"
+
+
+#if defined(__x86_64__) && defined(__SSE4_2__) && defined(__PCLMUL__)
+
+#include <x86intrin.h>
+#define ABSL_CRC_INTERNAL_HAVE_X86_SIMD
+
+#elif defined(_MSC_VER) && !defined(__clang__) && defined(__AVX__) && \
+    defined(_M_AMD64)
+
+#include <intrin.h>
+#define ABSL_CRC_INTERNAL_HAVE_X86_SIMD
+
+#elif defined(__aarch64__) && defined(__LITTLE_ENDIAN__) &&                 \
+    defined(__ARM_FEATURE_CRC32) && defined(ABSL_INTERNAL_HAVE_ARM_NEON) && \
+    defined(__ARM_FEATURE_CRYPTO)
+
+#include <arm_acle.h>
+#include <arm_neon.h>
+#define ABSL_CRC_INTERNAL_HAVE_ARM_SIMD
+
+#endif
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace crc_internal {
+
+#if defined(ABSL_CRC_INTERNAL_HAVE_ARM_SIMD) || \
+    defined(ABSL_CRC_INTERNAL_HAVE_X86_SIMD)
+
+#if defined(ABSL_CRC_INTERNAL_HAVE_ARM_SIMD)
+using V128 = uint64x2_t;
+#else
+using V128 = __m128i;
+#endif
+
+#if defined(__AVX__)
+using V256 = __m256i;
+#else
+using V256 = std::array<uint64_t, 4>;
+#endif
+
+uint32_t CRC32_u8(uint32_t crc, uint8_t v);
+
+uint32_t CRC32_u16(uint32_t crc, uint16_t v);
+
+uint32_t CRC32_u32(uint32_t crc, uint32_t v);
+
+uint32_t CRC32_u64(uint32_t crc, uint64_t v);
+
+V128 V128_Load(const V128* src);
+
+V128 V128_LoadU(const V128* src);
+
+void V128_Store(V128* dst, V128 data);
+
+V128 V128_PMulHi(const V128 l, const V128 r);
+
+V128 V128_PMulLow(const V128 l, const V128 r);
+
+V128 V128_PMul01(const V128 l, const V128 r);
+
+V128 V128_PMul10(const V128 l, const V128 r);
+
+V128 V128_Xor(const V128 l, const V128 r);
+
+V128 V128_From64WithZeroFill(const uint64_t r);
+
+template <int imm>
+int V128_Extract32(const V128 l);
+
+template <int imm>
+uint64_t V128_Extract64(const V128 l);
+
+int64_t V128_Low64(const V128 l);
+
+V128 V128_Add64(const V128 l, const V128 r);
+
+#if defined(__AVX__)
+inline V256 V256_LoadU(const V256* src);
+inline V256 V256_Broadcast128(const V128* src);
+#else
+template <typename T = V256>
+T V256_LoadU(const T* src);
+
+template <typename T = V256>
+T V256_Broadcast128(const V128* src);
+#endif
+
+#endif
+
+#if defined(ABSL_CRC_INTERNAL_HAVE_X86_SIMD)
+
+inline uint32_t CRC32_u8(uint32_t crc, uint8_t v) {
+  return _mm_crc32_u8(crc, v);
+}
+
+inline uint32_t CRC32_u16(uint32_t crc, uint16_t v) {
+  return _mm_crc32_u16(crc, v);
+}
+
+inline uint32_t CRC32_u32(uint32_t crc, uint32_t v) {
+  return _mm_crc32_u32(crc, v);
+}
+
+inline uint32_t CRC32_u64(uint32_t crc, uint64_t v) {
+  return static_cast<uint32_t>(_mm_crc32_u64(crc, v));
+}
+
+inline V128 V128_Load(const V128* src) { return _mm_load_si128(src); }
+
+inline V128 V128_LoadU(const V128* src) { return _mm_loadu_si128(src); }
+
+inline void V128_Store(V128* dst, V128 data) { _mm_store_si128(dst, data); }
+
+inline V128 V128_PMulHi(const V128 l, const V128 r) {
+  return _mm_clmulepi64_si128(l, r, 0x11);
+}
+
+inline V128 V128_PMulLow(const V128 l, const V128 r) {
+  return _mm_clmulepi64_si128(l, r, 0x00);
+}
+
+inline V128 V128_PMul01(const V128 l, const V128 r) {
+  return _mm_clmulepi64_si128(l, r, 0x01);
+}
+
+inline V128 V128_PMul10(const V128 l, const V128 r) {
+  return _mm_clmulepi64_si128(l, r, 0x10);
+}
+
+inline V128 V128_Xor(const V128 l, const V128 r) { return _mm_xor_si128(l, r); }
+
+inline V128 V128_From64WithZeroFill(const uint64_t r) {
+  return _mm_set_epi64x(static_cast<int64_t>(0), static_cast<int64_t>(r));
+}
+
+template <int imm>
+inline int V128_Extract32(const V128 l) {
+  return _mm_extract_epi32(l, imm);
+}
+
+template <int imm>
+inline uint64_t V128_Extract64(const V128 l) {
+  return static_cast<uint64_t>(_mm_extract_epi64(l, imm));
+}
+
+inline int64_t V128_Low64(const V128 l) { return _mm_cvtsi128_si64(l); }
+
+inline V128 V128_Add64(const V128 l, const V128 r) {
+  return _mm_add_epi64(l, r);
+}
+
+#elif defined(ABSL_CRC_INTERNAL_HAVE_ARM_SIMD)
+
+inline uint32_t CRC32_u8(uint32_t crc, uint8_t v) { return __crc32cb(crc, v); }
+
+inline uint32_t CRC32_u16(uint32_t crc, uint16_t v) {
+  return __crc32ch(crc, v);
+}
+
+inline uint32_t CRC32_u32(uint32_t crc, uint32_t v) {
+  return __crc32cw(crc, v);
+}
+
+inline uint32_t CRC32_u64(uint32_t crc, uint64_t v) {
+  return __crc32cd(crc, v);
+}
+
+inline V128 V128_Load(const V128* src) {
+  return vld1q_u64(reinterpret_cast<const uint64_t*>(src));
+}
+
+inline V128 V128_LoadU(const V128* src) {
+  return vld1q_u64(reinterpret_cast<const uint64_t*>(src));
+}
+
+inline void V128_Store(V128* dst, V128 data) {
+  vst1q_u64(reinterpret_cast<uint64_t*>(dst), data);
+}
+
+inline V128 V128_PMulHi(const V128 l, const V128 r) {
+  uint64x2_t res;
+  __asm__ __volatile__("pmull2 %0.1q, %1.2d, %2.2d \n\t"
+                       : "=w"(res)
+                       : "w"(l), "w"(r));
+  return res;
+}
+
+inline V128 V128_PMulLow(const V128 l, const V128 r) {
+  uint64x2_t res;
+  __asm__ __volatile__("pmull %0.1q, %1.1d, %2.1d \n\t"
+                       : "=w"(res)
+                       : "w"(l), "w"(r));
+  return res;
+}
+
+inline V128 V128_PMul01(const V128 l, const V128 r) {
+  return reinterpret_cast<V128>(vmull_p64(
+      reinterpret_cast<poly64_t>(vget_high_p64(vreinterpretq_p64_u64(l))),
+      reinterpret_cast<poly64_t>(vget_low_p64(vreinterpretq_p64_u64(r)))));
+}
+
+inline V128 V128_PMul10(const V128 l, const V128 r) {
+  return reinterpret_cast<V128>(vmull_p64(
+      reinterpret_cast<poly64_t>(vget_low_p64(vreinterpretq_p64_u64(l))),
+      reinterpret_cast<poly64_t>(vget_high_p64(vreinterpretq_p64_u64(r)))));
+}
+
+inline V128 V128_Xor(const V128 l, const V128 r) { return veorq_u64(l, r); }
+
+inline V128 V128_From64WithZeroFill(const uint64_t r){
+  constexpr uint64x2_t kZero = {0, 0};
+  return vsetq_lane_u64(r, kZero, 0);
+}
+
+
+template <int imm>
+inline int V128_Extract32(const V128 l) {
+  return vgetq_lane_s32(vreinterpretq_s32_u64(l), imm);
+}
+
+template <int imm>
+inline uint64_t V128_Extract64(const V128 l) {
+  return vgetq_lane_u64(l, imm);
+}
+
+inline int64_t V128_Low64(const V128 l) {
+  return vgetq_lane_s64(vreinterpretq_s64_u64(l), 0);
+}
+
+inline V128 V128_Add64(const V128 l, const V128 r) { return vaddq_u64(l, r); }
+
+#endif
+
+#if defined(__AVX__) && defined(ABSL_CRC_INTERNAL_HAVE_X86_SIMD)
+inline V256 V256_LoadU(const V256* src) { return _mm256_loadu_si256(src); }
+
+inline V256 V256_Broadcast128(const V128* src) {
+  return _mm256_castps_si256(
+      _mm256_broadcast_ps(reinterpret_cast<const __m128*>(src)));
+}
+#elif defined(ABSL_CRC_INTERNAL_HAVE_X86_SIMD) || \
+    defined(ABSL_CRC_INTERNAL_HAVE_ARM_SIMD)
+template <typename T>
+inline T V256_LoadU(const T* src) {
+  (void)src;
+  return T{};
+}
+
+template <typename T>
+inline T V256_Broadcast128(const V128* src) {
+  (void)src;
+  return T{};
+}
+#endif
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_CRC_INTERNAL_CRC32_X86_ARM_COMBINED_SIMD_H_

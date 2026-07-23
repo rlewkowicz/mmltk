@@ -1,0 +1,173 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(nsURLHelper_h_)
+#define nsURLHelper_h_
+
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nsASCIIMask.h"
+#include <mozilla/Maybe.h>
+#include <mozilla/CompactPair.h>
+
+class nsIFile;
+class nsIURLParser;
+
+
+void net_ShutdownURLHelper();
+
+already_AddRefed<nsIURLParser> net_GetAuthURLParser();
+already_AddRefed<nsIURLParser> net_GetNoAuthURLParser();
+already_AddRefed<nsIURLParser> net_GetStdURLParser();
+
+nsresult net_GetURLSpecFromFile(nsIFile*, nsACString&);
+nsresult net_GetURLSpecFromDir(nsIFile*, nsACString&);
+nsresult net_GetURLSpecFromActualFile(nsIFile*, nsACString&);
+nsresult net_GetFileFromURLSpec(const nsACString&, nsIFile**);
+
+nsresult net_ParseFileURL(const nsACString& inURL, nsACString& outDirectory,
+                          nsACString& outFileBaseName,
+                          nsACString& outFileExtension);
+
+mozilla::Maybe<mozilla::CompactPair<uint32_t, uint32_t>> net_CoalesceDirs(
+    char* path);
+
+bool net_IsAbsoluteURL(const nsACString& uri);
+
+nsresult net_ExtractURLScheme(const nsACString& inURI, nsACString& scheme);
+
+bool net_IsValidScheme(const nsACString& scheme);
+
+void net_FilterURIString(const nsACString& input, nsACString& result);
+
+nsresult net_FilterAndEscapeURI(const nsACString& aInput, uint32_t aFlags,
+                                const ASCIIMaskArray& aFilterMask,
+                                nsACString& aResult);
+
+
+
+void net_ToLowerCase(char* str, uint32_t length);
+void net_ToLowerCase(char* str);
+
+char* net_FindCharInSet(const char* iter, const char* stop, const char* set);
+
+char* net_FindCharNotInSet(const char* iter, const char* stop, const char* set);
+
+char* net_RFindCharNotInSet(const char* stop, const char* iter,
+                            const char* set);
+
+void net_ParseRequestContentType(const nsACString& aHeaderStr,
+                                 nsACString& aContentType,
+                                 nsACString& aContentCharset,
+                                 bool* aHadCharset);
+
+void net_ParseContentType(const nsACString& aHeaderStr,
+                          nsACString& aContentType, nsACString& aContentCharset,
+                          bool* aHadCharset);
+void net_ParseContentType(const nsACString& aHeaderStr,
+                          nsACString& aContentType, nsACString& aContentCharset,
+                          bool* aHadCharset, int32_t* aCharsetStart,
+                          int32_t* aCharsetEnd);
+
+
+#define NET_MAX_ADDRESS ((char*)UINTPTR_MAX)
+
+inline char* net_FindCharInSet(const char* str, const char* set) {
+  return net_FindCharInSet(str, NET_MAX_ADDRESS, set);
+}
+inline char* net_FindCharNotInSet(const char* str, const char* set) {
+  return net_FindCharNotInSet(str, NET_MAX_ADDRESS, set);
+}
+inline char* net_RFindCharNotInSet(const char* str, const char* set) {
+  return net_RFindCharNotInSet(str, str + strlen(str), set);
+}
+
+bool net_IsValidDNSHost(const nsACString& host);
+
+bool net_IsValidIPv4Addr(const nsACString& aAddr);
+
+bool net_IsValidIPv6Addr(const nsACString& aAddr);
+
+bool net_GetDefaultStatusTextForCode(uint16_t aCode, nsACString& aOutText);
+
+namespace mozilla {
+class URLParams final {
+ public:
+  template <typename ParamHandler>
+  static bool Parse(const nsACString& aInput, bool aShouldDecode,
+                    ParamHandler aParamHandler) {
+    const char* start = aInput.BeginReading();
+    const char* const end = aInput.EndReading();
+
+    while (start != end) {
+      nsAutoCString name;
+      nsAutoCString value;
+
+      if (!ParseNextInternal(start, end, aShouldDecode, &name, &value)) {
+        continue;
+      }
+
+      if (!aParamHandler(std::move(name), std::move(value))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static bool Extract(const nsACString& aInput, const nsACString& aName,
+                      nsACString& aValue);
+
+  void ParseInput(const nsACString& aInput);
+
+  void Serialize(nsACString& aValue, bool aEncode) const;
+
+  static void SerializeString(const nsACString& aInput, nsACString& aValue);
+  void Get(const nsACString& aName, nsACString& aRetval);
+
+  void GetAll(const nsACString& aName, nsTArray<nsCString>& aRetval);
+
+  void Set(const nsACString& aName, const nsACString& aValue);
+
+  void Append(const nsACString& aName, const nsACString& aValue);
+
+  bool Has(const nsACString& aName);
+
+  bool Has(const nsACString& aName, const nsACString& aValue);
+
+  void Delete(const nsACString& aName);
+
+  void Delete(const nsACString& aName, const nsACString& aValue);
+
+  void DeleteAll() { mParams.Clear(); }
+
+  uint32_t Length() const { return mParams.Length(); }
+
+  static void DecodeString(const nsACString& aInput, nsACString& aOutput);
+  const nsACString& GetKeyAtIndex(uint32_t aIndex) const {
+    MOZ_ASSERT(aIndex < mParams.Length());
+    return mParams[aIndex].mKey;
+  }
+
+  const nsACString& GetValueAtIndex(uint32_t aIndex) const {
+    MOZ_ASSERT(aIndex < mParams.Length());
+    return mParams[aIndex].mValue;
+  }
+
+  void Sort();
+
+ private:
+  static bool ParseNextInternal(const char*& aStart, const char* aEnd,
+                                bool aShouldDecode, nsACString* aOutputName,
+                                nsACString* aOutputValue);
+
+  struct Param {
+    nsCString mKey;
+    nsCString mValue;
+  };
+
+  nsTArray<Param> mParams;
+};
+}  
+
+#endif

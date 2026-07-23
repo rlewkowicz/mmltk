@@ -1,0 +1,25 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+XPIDL_SOURCES += [
+    "nsIClearBySiteEntry.idl",
+    "nsIClearDataService.idl",
+]
+
+XPIDL_MODULE = "toolkit_cleardata"
+
+EXTRA_JS_MODULES += [
+    "ClearBySiteEntry.sys.mjs",
+    "ClearDataService.sys.mjs",
+    "PrincipalsCollector.sys.mjs",
+    "ServiceWorkerCleanUp.sys.mjs",
+]
+
+XPCOM_MANIFESTS += [
+    "components.conf",
+]
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+FINAL_LIBRARY = "xul"

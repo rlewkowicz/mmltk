@@ -1,0 +1,14 @@
+[package]
+name = "libcrux-traits"
+description = "Traits for cryptographic algorithms"
+version = "0.0.3"
+license = "Apache-2.0"
+edition = "2021"
+
+[features]
+error-in-core = []
+generic-tests = []
+alloc = []
+
+[dependencies]
+rand = { version = "0.8", default-features = false }

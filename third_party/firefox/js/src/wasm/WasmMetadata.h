@@ -1,0 +1,366 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef wasm_WasmMetadata_h
+#define wasm_WasmMetadata_h
+
+#include "wasm/WasmBinaryTypes.h"
+#include "wasm/WasmHeuristics.h"
+#include "wasm/WasmInstanceData.h"  // various of *InstanceData
+#include "wasm/WasmModuleTypes.h"
+#include "wasm/WasmProcess.h"  // IsHugeMemoryEnabled
+
+namespace js {
+namespace wasm {
+
+using BuiltinModuleFuncIdVector =
+    Vector<BuiltinModuleFuncId, 0, SystemAllocPolicy>;
+
+
+enum class NameContext { Standalone, BeforeLocation };
+
+using ModuleHash = uint8_t[8];
+
+
+struct CodeMetadata : public ShareableBase<CodeMetadata> {
+
+
+  SharedCompileArgs compileArgs;
+
+  uint32_t numFuncImports;
+  BuiltinModuleFuncIdVector knownFuncImports;
+  bool funcImportsAreJS;
+  uint32_t numGlobalImports;
+
+  MutableTypeContext types;
+  FuncDescVector funcs;
+  TableDescVector tables;
+  MemoryDescVector memories;
+  TagDescVector tags;
+  GlobalDescVector globals;
+
+  mozilla::Maybe<uint32_t> startFuncIndex;
+
+  RefTypeVector elemSegmentTypes;
+
+  mozilla::Maybe<uint32_t> dataCount;
+
+  Uint32Vector exportedFuncIndices;
+
+  BranchHintCollection branchHints;
+
+  mozilla::Maybe<NameSection> nameSection;
+
+  CustomSectionRangeVector customSectionRanges;
+
+  MaybeBytecodeRange codeSectionRange;
+
+  uint32_t funcDefsOffsetStart;
+  uint32_t funcImportsOffsetStart;
+  uint32_t funcExportsOffsetStart;
+  uint32_t typeDefsOffsetStart;
+  uint32_t memoriesOffsetStart;
+  uint32_t tablesOffsetStart;
+  uint32_t tagsOffsetStart;
+  uint32_t instanceDataLength;
+
+  explicit CodeMetadata(const CompileArgs* compileArgs = nullptr)
+      : compileArgs(compileArgs),
+        numFuncImports(0),
+        funcImportsAreJS(false),
+        numGlobalImports(0),
+        funcDefsOffsetStart(UINT32_MAX),
+        funcImportsOffsetStart(UINT32_MAX),
+        funcExportsOffsetStart(UINT32_MAX),
+        typeDefsOffsetStart(UINT32_MAX),
+        memoriesOffsetStart(UINT32_MAX),
+        tablesOffsetStart(UINT32_MAX),
+        tagsOffsetStart(UINT32_MAX),
+        instanceDataLength(UINT32_MAX) {}
+
+  [[nodiscard]] bool init() {
+    MOZ_ASSERT(!types);
+    types = js_new<TypeContext>();
+    return types;
+  }
+
+  [[nodiscard]] bool prepareForCompile(CompileMode mode);
+  bool isPreparedForCompile() const { return instanceDataLength != UINT32_MAX; }
+
+  bool isBuiltinModule() const { return features().isBuiltinModule; }
+  bool isSelfHostedModule() const { return scriptedCaller().isSelfHosted(); }
+
+#define WASM_FEATURE(NAME, SHORT_NAME, ...) \
+  bool SHORT_NAME##Enabled() const { return features().SHORT_NAME; }
+  JS_FOR_WASM_FEATURES(WASM_FEATURE)
+#undef WASM_FEATURE
+  bool v128RelaxedEnabled() const { return features().relaxedSimd; }
+  Shareable sharedMemoryEnabled() const { return features().sharedMemory; }
+  bool simdAvailable() const { return features().simd; }
+
+  bool hugeMemoryEnabled(uint32_t memoryIndex) const {
+    return memoryIndex < memories.length() &&
+           IsHugeMemoryEnabled(memories[memoryIndex].addressType(),
+                               memories[memoryIndex].pageSize());
+  }
+  bool usesSharedMemory(uint32_t memoryIndex) const {
+    return memoryIndex < memories.length() && memories[memoryIndex].isShared();
+  }
+
+  const FeatureArgs& features() const { return compileArgs->features; }
+  const ScriptedCaller& scriptedCaller() const {
+    return compileArgs->scriptedCaller;
+  }
+  const UniqueChars& sourceMapURL() const { return compileArgs->sourceMapURL; }
+
+  size_t numTypes() const { return types->length(); }
+  size_t numFuncs() const { return funcs.length(); }
+  size_t numFuncDefs() const { return funcs.length() - numFuncImports; }
+  size_t numTables() const { return tables.length(); }
+  size_t numTags() const { return tags.length(); }
+  size_t numMemories() const { return memories.length(); }
+
+  bool funcIsImport(uint32_t funcIndex) const {
+    return funcIndex < numFuncImports;
+  }
+  const TypeDef& getFuncTypeDef(uint32_t funcIndex) const {
+    return types->type(funcs[funcIndex].typeIndex);
+  }
+  const FuncType& getFuncType(uint32_t funcIndex) const {
+    return getFuncTypeDef(funcIndex).funcType();
+  }
+
+  const TagType& getTagType(uint32_t tagIndex) const {
+    return *tags[tagIndex].type;
+  }
+
+  BuiltinModuleFuncId knownFuncImport(uint32_t funcIndex) const {
+    if (knownFuncImports.empty()) {
+      return BuiltinModuleFuncId::None;
+    }
+    return knownFuncImports[funcIndex];
+  }
+
+  uint32_t findFuncExportIndex(uint32_t funcIndex) const;
+
+  uint32_t numExportedFuncs() const { return exportedFuncIndices.length(); }
+
+  size_t codeSectionSize() const {
+    if (codeSectionRange) {
+      return codeSectionRange->size();
+    }
+    return 0;
+  }
+
+  bool getFuncName(NameContext ctx, uint32_t funcIndex,
+                   const ShareableBytes* nameSectionPayload,
+                   UTF8Bytes* name) const;
+
+  uint32_t offsetOfFuncDefInstanceData(uint32_t funcIndex) const {
+    MOZ_RELEASE_ASSERT(funcIndex >= numFuncImports && funcIndex < numFuncs());
+    return funcDefsOffsetStart +
+           (funcIndex - numFuncImports) * sizeof(FuncDefInstanceData);
+  }
+
+  uint32_t offsetOfFuncImportInstanceData(uint32_t funcIndex) const {
+    MOZ_RELEASE_ASSERT(funcIndex < numFuncImports);
+    return funcImportsOffsetStart + funcIndex * sizeof(FuncImportInstanceData);
+  }
+
+  uint32_t offsetOfFuncExportInstanceData(uint32_t funcExportIndex) const {
+    MOZ_RELEASE_ASSERT(funcExportIndex < exportedFuncIndices.length());
+    return funcExportsOffsetStart +
+           funcExportIndex * sizeof(FuncExportInstanceData);
+  }
+
+  uint32_t offsetOfTypeDefInstanceData(uint32_t typeIndex) const {
+    MOZ_RELEASE_ASSERT(typeIndex < types->length());
+    return typeDefsOffsetStart + typeIndex * sizeof(TypeDefInstanceData);
+  }
+
+  uint32_t offsetOfTypeDef(uint32_t typeIndex) const {
+    return offsetOfTypeDefInstanceData(typeIndex) +
+           offsetof(TypeDefInstanceData, typeDef);
+  }
+  uint32_t offsetOfSuperTypeVector(uint32_t typeIndex) const {
+    return offsetOfTypeDefInstanceData(typeIndex) +
+           offsetof(TypeDefInstanceData, superTypeVector);
+  }
+
+  uint32_t offsetOfMemoryInstanceData(uint32_t memoryIndex) const {
+    MOZ_RELEASE_ASSERT(memoryIndex < memories.length());
+    return memoriesOffsetStart + memoryIndex * sizeof(MemoryInstanceData);
+  }
+  uint32_t offsetOfTableInstanceData(uint32_t tableIndex) const {
+    MOZ_RELEASE_ASSERT(tableIndex < tables.length());
+    return tablesOffsetStart + tableIndex * sizeof(TableInstanceData);
+  }
+
+  uint32_t offsetOfTagInstanceData(uint32_t tagIndex) const {
+    MOZ_RELEASE_ASSERT(tagIndex < tags.length());
+    return tagsOffsetStart + tagIndex * sizeof(TagInstanceData);
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+
+ private:
+  [[nodiscard]] bool allocateInstanceDataBytes(uint32_t bytes, uint32_t align,
+                                               uint32_t* assignedOffset);
+  [[nodiscard]] bool allocateInstanceDataBytesN(uint32_t bytes, uint32_t align,
+                                                uint32_t count,
+                                                uint32_t* assignedOffset);
+};
+
+using MutableCodeMetadata = RefPtr<CodeMetadata>;
+using SharedCodeMetadata = RefPtr<const CodeMetadata>;
+
+using InliningBudget = ExclusiveData<int64_t>;
+
+struct CodeTailMetadata : public ShareableBase<CodeTailMetadata> {
+  CodeTailMetadata();
+
+  explicit CodeTailMetadata(const CodeMetadata& codeMeta);
+
+  SharedCodeMetadata codeMeta;
+
+  SharedBytes codeSectionBytecode;
+
+  bool debugEnabled;
+
+  ModuleHash debugHash;
+
+  BytecodeBuffer debugBytecode;
+
+  mutable InliningBudget inliningBudget;
+
+  BytecodeRangeVector funcDefRanges;
+
+  FeatureUsageVector funcDefFeatureUsages;
+
+  CallRefMetricsRangeVector funcDefCallRefs;
+
+  AllocSitesRangeVector funcDefAllocSites;
+
+  MutableCallRefHints callRefHints;
+
+  SharedBytes nameSectionPayload;
+
+  uint32_t numCallRefMetrics;
+
+  uint32_t numAllocSites;
+
+  uint32_t findFuncIndex(uint32_t bytecodeOffset) const;
+  uint32_t funcBytecodeOffset(uint32_t funcIndex) const {
+    if (funcIndex < codeMeta->numFuncImports) {
+      return 0;
+    }
+    uint32_t funcDefIndex = funcIndex - codeMeta->numFuncImports;
+    return funcDefRanges[funcDefIndex].start;
+  }
+  const BytecodeRange& funcDefRange(uint32_t funcIndex) const {
+    MOZ_RELEASE_ASSERT(funcIndex >= codeMeta->numFuncImports);
+    uint32_t funcDefIndex = funcIndex - codeMeta->numFuncImports;
+    return funcDefRanges[funcDefIndex];
+  }
+  BytecodeSpan funcDefBody(uint32_t funcIndex) const {
+    return funcDefRange(funcIndex)
+        .relativeTo(*codeMeta->codeSectionRange)
+        .toSpan(*codeSectionBytecode);
+  }
+  FeatureUsage funcDefFeatureUsage(uint32_t funcIndex) const {
+    MOZ_RELEASE_ASSERT(funcIndex >= codeMeta->numFuncImports);
+    uint32_t funcDefIndex = funcIndex - codeMeta->numFuncImports;
+    return funcDefFeatureUsages[funcDefIndex];
+  }
+
+  CallRefMetricsRange getFuncDefCallRefs(uint32_t funcIndex) const {
+    MOZ_RELEASE_ASSERT(funcIndex >= codeMeta->numFuncImports);
+    uint32_t funcDefIndex = funcIndex - codeMeta->numFuncImports;
+    return funcDefCallRefs[funcDefIndex];
+  }
+
+  AllocSitesRange getFuncDefAllocSites(uint32_t funcIndex) const {
+    MOZ_RELEASE_ASSERT(funcIndex >= codeMeta->numFuncImports);
+    uint32_t funcDefIndex = funcIndex - codeMeta->numFuncImports;
+    return funcDefAllocSites[funcDefIndex];
+  }
+
+  bool hasFuncDefAllocSites() const { return !funcDefAllocSites.empty(); }
+
+  CallRefHint getCallRefHint(uint32_t callRefIndex) const {
+    if (!callRefHints) {
+      return CallRefHint();
+    }
+    return CallRefHint::fromRepr(callRefHints[callRefIndex]);
+  }
+  void setCallRefHint(uint32_t callRefIndex, CallRefHint hint) const {
+    callRefHints[callRefIndex] = hint.toRepr();
+  }
+};
+
+using MutableCodeTailMetadata = RefPtr<CodeTailMetadata>;
+using SharedCodeTailMetadata = RefPtr<const CodeTailMetadata>;
+
+
+struct ModuleMetadata : public ShareableBase<ModuleMetadata> {
+
+  MutableCodeMetadata codeMeta;
+
+  MutableCodeTailMetadata codeTailMeta;
+
+  ImportVector imports;
+  ExportVector exports;
+
+  ModuleElemSegmentVector elemSegments;
+
+  DataSegmentRangeVector dataSegmentRanges;
+  DataSegmentVector dataSegments;
+
+  CustomSectionVector customSections;
+
+  FeatureUsage featureUsage = FeatureUsage::None;
+
+  explicit ModuleMetadata() = default;
+
+  [[nodiscard]] bool init(const CompileArgs& compileArgs) {
+    codeMeta = js_new<CodeMetadata>(&compileArgs);
+    return !!codeMeta && codeMeta->init();
+  }
+
+  bool addDefinedFunc(ValTypeVector&& params, ValTypeVector&& results,
+                      bool declareForRef = false,
+                      mozilla::Maybe<CacheableName>&& optionalExportedName =
+                          mozilla::Nothing());
+  bool addDefinedFuncWithType(uint32_t funcTypeIndex,
+                              bool declareForRef = false,
+                              mozilla::Maybe<CacheableName>&&
+                                  optionalExportedName = mozilla::Nothing());
+  bool addImportedFunc(ValTypeVector&& params, ValTypeVector&& results,
+                       CacheableName&& importModName,
+                       CacheableName&& importFieldName);
+
+  [[nodiscard]] bool prepareForCompile(CompileMode mode) {
+    return codeMeta->prepareForCompile(mode);
+  }
+  bool isPreparedForCompile() const { return codeMeta->isPreparedForCompile(); }
+
+  mozilla::Maybe<const Export&> getExport(const CacheableName& name) const {
+    for (const Export& exp : exports) {
+      if (exp.fieldName().utf8Bytes() == name.utf8Bytes()) {
+        return mozilla::SomeRef(exp);
+      }
+    }
+    return mozilla::Nothing();
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+};
+
+using MutableModuleMetadata = RefPtr<ModuleMetadata>;
+using SharedModuleMetadata = RefPtr<const ModuleMetadata>;
+
+}  
+}  
+
+#endif /* wasm_WasmMetadata_h */

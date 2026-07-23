@@ -1,0 +1,225 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef gc_Allocator_inl_h
+#define gc_Allocator_inl_h
+
+#include "gc/Allocator.h"
+
+#include "gc/Barrier.h"
+#include "gc/Cell.h"
+#include "gc/Zone.h"
+#include "js/Class.h"
+#include "js/RootingAPI.h"
+
+#include "gc/Nursery-inl.h"
+
+
+namespace js {
+namespace gc {
+
+template <typename T, AllowGC allowGC, typename... Args>
+T* CellAllocator::NewCell(JSContext* cx, Args&&... args) {
+  static_assert(std::is_base_of_v<gc::Cell, T>);
+
+  if constexpr (std::is_base_of_v<JSObject, T>) {
+    return NewObject<T, allowGC>(cx, std::forward<Args>(args)...);
+  }
+
+  else if constexpr (std::is_base_of_v<JS::BigInt, T>) {
+    return NewBigInt<T, allowGC>(cx, std::forward<Args>(args)...);
+  }
+
+  else if constexpr (std::is_base_of_v<js::GetterSetter, T>) {
+    return NewGetterSetter<T, allowGC>(cx, std::forward<Args>(args)...);
+  }
+
+  // external strings will fall through to the generic code below. All other
+  else if constexpr (std::is_base_of_v<JSString, T> &&
+                     !std::is_base_of_v<JSAtom, T> &&
+                     !std::is_base_of_v<JSExternalString, T>) {
+    return NewString<T, allowGC>(cx, std::forward<Args>(args)...);
+  }
+
+  else {
+    return NewTenuredCell<T, allowGC>(cx, std::forward<Args>(args)...);
+  }
+}
+
+template <typename T, AllowGC allowGC, typename... Args>
+T* CellAllocator::NewString(JSContext* cx, gc::Heap heap, Args&&... args) {
+  static_assert(std::is_base_of_v<JSString, T>);
+  gc::AllocKind kind = gc::MapTypeToAllocKind<T>::kind;
+  void* ptr = AllocNurseryOrTenuredCell<JS::TraceKind::String, allowGC>(
+      cx, kind, sizeof(T), heap, nullptr);
+  if (MOZ_UNLIKELY(!ptr)) {
+    return nullptr;
+  }
+  T* string = new (mozilla::KnownNotNull, ptr) T(std::forward<Args>(args)...);
+  MemoryReleaseFence(cx->zone());  
+  return string;
+}
+
+template <typename T, AllowGC allowGC>
+T* CellAllocator::NewBigInt(JSContext* cx, Heap heap) {
+  void* ptr = AllocNurseryOrTenuredCell<JS::TraceKind::BigInt, allowGC>(
+      cx, gc::AllocKind::BIGINT, sizeof(T), heap, nullptr);
+  if (MOZ_UNLIKELY(!ptr)) {
+    return nullptr;
+  }
+  T* bigInt = new (mozilla::KnownNotNull, ptr) T();
+  MemoryReleaseFence(cx->zone());  
+  return bigInt;
+}
+
+template <typename T, AllowGC allowGC, typename... Args>
+T* CellAllocator::NewGetterSetter(JSContext* cx, gc::Heap heap,
+                                  Args&&... args) {
+  static_assert(std::is_base_of_v<js::GetterSetter, T>);
+  void* ptr = AllocNurseryOrTenuredCell<JS::TraceKind::GetterSetter, allowGC>(
+      cx, gc::AllocKind::GETTER_SETTER, sizeof(T), heap, nullptr);
+  if (MOZ_UNLIKELY(!ptr)) {
+    return nullptr;
+  }
+  T* gs = new (mozilla::KnownNotNull, ptr) T(std::forward<Args>(args)...);
+  MemoryReleaseFence(cx->zone());  
+  return gs;
+}
+
+template <typename T, AllowGC allowGC>
+T* CellAllocator::NewObject(JSContext* cx, gc::AllocKind kind, gc::Heap heap,
+                            const JSClass* clasp, gc::AllocSite* site) {
+  MOZ_ASSERT(IsObjectAllocKind(kind));
+  MOZ_ASSERT_IF(heap != gc::Heap::Tenured && clasp->hasFinalize() &&
+                    !clasp->isProxyObject(),
+                CanNurseryAllocateFinalizedClass(clasp));
+  size_t thingSize = JSObject::thingSize(kind);
+  void* cell = AllocNurseryOrTenuredCell<JS::TraceKind::Object, allowGC>(
+      cx, kind, thingSize, heap, site);
+  if (MOZ_UNLIKELY(!cell)) {
+    return nullptr;
+  }
+  T* object = new (mozilla::KnownNotNull, cell) T();
+  MemoryReleaseFence(cx->zone());  
+  return object;
+}
+
+template <typename T, AllowGC allowGC, typename... Args>
+T* CellAllocator::NewTenuredCell(JSContext* cx, Args&&... args) {
+  gc::AllocKind kind = gc::MapTypeToAllocKind<T>::kind;
+  MOZ_ASSERT(Arena::thingSize(kind) == sizeof(T));
+  void* ptr = AllocTenuredCell<allowGC>(cx, kind);
+  if (MOZ_UNLIKELY(!ptr)) {
+    return nullptr;
+  }
+  T* cell = new (mozilla::KnownNotNull, ptr) T(std::forward<Args>(args)...);
+  MemoryReleaseFence(cx->zone());  
+  return cell;
+}
+
+#if defined(DEBUG) || defined(JS_GC_ZEAL) || defined(JS_OOM_BREAKPOINT)
+
+inline void PreAllocGCChecks(JSContext* cx) {
+  if (!cx->suppressGC) {
+    cx->verifyIsSafeToGC();
+  }
+
+#  ifdef JS_GC_ZEAL
+  GCRuntime* gc = &cx->runtime()->gc;
+  if (gc->needZealousGC()) {
+    gc->runDebugGC();
+  }
+#  endif
+}
+
+inline bool CheckForSimulatedFailure(JSContext* cx, AllowGC allowGC) {
+  if (js::oom::ShouldFailWithOOM()) {
+    if (allowGC) {
+      ReportOutOfMemory(cx);
+    }
+    return false;
+  }
+
+  return true;
+}
+#else
+
+inline void PreAllocGCChecks(JSContext* cx) {}
+inline bool CheckForSimulatedFailure(JSContext* cx, AllowGC allowGC) {
+  return true;
+}
+
+#endif  // DEBUG || JS_GC_ZEAL || JS_OOM_BREAKPOINT
+
+template <JS::TraceKind traceKind, AllowGC allowGC>
+void* CellAllocator::AllocNurseryOrTenuredCell(JSContext* cx,
+                                               gc::AllocKind allocKind,
+                                               size_t thingSize, gc::Heap heap,
+                                               AllocSite* site) {
+  MOZ_ASSERT(IsNurseryAllocable(allocKind));
+  MOZ_ASSERT(MapAllocToTraceKind(allocKind) == traceKind);
+  MOZ_ASSERT(thingSize == Arena::thingSize(allocKind));
+  MOZ_ASSERT_IF(site && site->initialHeap() == Heap::Tenured,
+                heap == Heap::Tenured);
+  MOZ_ASSERT(!cx->zone()->isAtomsZone());
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(cx->runtime()));
+
+  if constexpr (allowGC) {
+    PreAllocGCChecks(cx);
+  }
+
+  if (!CheckForSimulatedFailure(cx, allowGC)) {
+    return nullptr;
+  }
+
+  JS::Zone* zone = cx->zone();
+  gc::Heap minHeapToTenure = CheckedHeap(zone->minHeapToTenure(traceKind));
+  if (CheckedHeap(heap) < minHeapToTenure) {
+    if (!site) {
+      site = zone->unknownAllocSite(traceKind);
+    }
+
+#ifdef JS_GC_ZEAL
+    site = MaybeGenerateMissingAllocSite(cx, traceKind, site);
+#endif
+
+    void* ptr = cx->nursery().tryAllocateCell(site, thingSize, traceKind);
+    if (MOZ_LIKELY(ptr)) {
+      return ptr;
+    }
+
+    return RetryNurseryAlloc<allowGC>(cx, traceKind, allocKind, thingSize,
+                                      site);
+  }
+
+  return AllocTenuredCellForNurseryAlloc<allowGC>(cx, allocKind);
+}
+
+MOZ_ALWAYS_INLINE gc::Heap CellAllocator::CheckedHeap(gc::Heap heap) {
+  if (heap > Heap::Tenured) {
+    MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Bad gc::Heap value");
+  }
+
+  return heap;
+}
+
+template <typename T, typename... Args>
+T* NewSizedBuffer(JS::Zone* zone, size_t bytes, bool nurseryOwned,
+                  Args&&... args) {
+  MOZ_ASSERT(sizeof(T) <= bytes);
+  void* ptr = AllocBuffer(zone, bytes, nurseryOwned);
+  if (!ptr) {
+    return nullptr;
+  }
+
+  T* buffer = new (ptr) T(std::forward<Args>(args)...);
+  MemoryReleaseFence(zone);  
+  return buffer;
+}
+
+}  
+}  
+
+#endif  // gc_Allocator_inl_h

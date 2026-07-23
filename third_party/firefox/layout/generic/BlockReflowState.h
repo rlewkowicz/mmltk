@@ -1,0 +1,266 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef BlockReflowState_h
+#define BlockReflowState_h
+
+#include <tuple>
+
+#include "mozilla/ReflowInput.h"
+#include "nsFloatManager.h"
+#include "nsLineBox.h"
+
+class nsBlockFrame;
+class nsFrameList;
+class nsOverflowContinuationTracker;
+
+namespace mozilla {
+
+class BlockReflowState {
+  using BandInfoType = nsFloatManager::BandInfoType;
+  using ShapeType = nsFloatManager::ShapeType;
+
+  struct Flags {
+    Flags()
+        : mIsBStartMarginRoot(false),
+          mIsBEndMarginRoot(false),
+          mShouldApplyBStartMargin(false),
+          mHasLineAdjacentToTop(false),
+          mBlockNeedsFloatManager(false),
+          mIsLineLayoutEmpty(false),
+          mCanHaveOverflowMarkers(false),
+          mShouldApplyTextBoxTrimStart(false),
+          mShouldApplyTextBoxTrimAtBlockEnd(false),
+          mShouldApplyTextBoxTrimAtFragmentEnd(false) {}
+
+    bool mIsBStartMarginRoot : 1;
+
+    bool mIsBEndMarginRoot : 1;
+
+    bool mShouldApplyBStartMargin : 1;
+
+    bool mHasLineAdjacentToTop : 1;
+
+    bool mBlockNeedsFloatManager : 1;
+
+    bool mIsLineLayoutEmpty : 1;
+
+    bool mCanHaveOverflowMarkers : 1;
+
+    bool mShouldApplyTextBoxTrimStart : 1;
+    bool mShouldApplyTextBoxTrimAtBlockEnd : 1;
+    bool mShouldApplyTextBoxTrimAtFragmentEnd : 1;
+  };
+
+ public:
+  BlockReflowState(const ReflowInput& aReflowInput, nsPresContext* aPresContext,
+                   nsBlockFrame* aFrame, bool aBStartMarginRoot,
+                   bool aBEndMarginRoot, bool aBlockNeedsFloatManager,
+                   const nscoord aConsumedBSize,
+                   const nscoord aEffectiveContentBoxBSize,
+                   const nscoord aInset = 0);
+
+  void UndoAlignContentShift();
+
+  nsFlowAreaRect GetFloatAvailableSpace(WritingMode aCBWM) const {
+    return GetFloatAvailableSpace(aCBWM, mBCoord);
+  }
+  nsFlowAreaRect GetFloatAvailableSpaceForPlacingFloat(WritingMode aCBWM,
+                                                       nscoord aBCoord) const {
+    return GetFloatAvailableSpaceWithState(aCBWM, aBCoord, ShapeType::Margin,
+                                           nullptr);
+  }
+  nsFlowAreaRect GetFloatAvailableSpace(WritingMode aCBWM,
+                                        nscoord aBCoord) const {
+    return GetFloatAvailableSpaceWithState(aCBWM, aBCoord,
+                                           ShapeType::ShapeOutside, nullptr);
+  }
+  nsFlowAreaRect GetFloatAvailableSpaceWithState(
+      WritingMode aCBWM, nscoord aBCoord, ShapeType aShapeType,
+      nsFloatManager::SavedState* aState) const;
+  nsFlowAreaRect GetFloatAvailableSpaceForBSize(
+      WritingMode aCBWM, nscoord aBCoord, nscoord aBSize,
+      nsFloatManager::SavedState* aState) const;
+
+  bool AddFloat(nsLineLayout* aLineLayout, nsIFrame* aFloat,
+                nscoord aAvailableISize);
+
+  enum class PlaceFloatResult : uint8_t {
+    Placed,
+    ShouldPlaceBelowCurrentLine,
+    ShouldPlaceInNextContinuation,
+  };
+  PlaceFloatResult FlowAndPlaceFloat(
+      nsIFrame* aFloat, mozilla::Maybe<nscoord> aAvailableISizeInCurrentLine =
+                            mozilla::Nothing());
+
+  void PlaceBelowCurrentLineFloats(nsLineBox* aLine);
+
+  enum class ClearFloatsResult : uint8_t {
+    BCoordNoChange,
+    BCoordAdvanced,
+    FloatsPushedOrSplit,
+  };
+  std::tuple<nscoord, ClearFloatsResult> ClearFloats(
+      nscoord aBCoord, UsedClear aClearType,
+      nsIFrame* aFloatAvoidingBlock = nullptr);
+
+  nsFloatManager* FloatManager() const {
+    MOZ_ASSERT(mReflowInput.mFloatManager,
+               "Float manager should be valid during the lifetime of "
+               "BlockReflowState!");
+    return mReflowInput.mFloatManager;
+  }
+
+  bool AdvanceToNextBand(const LogicalRect& aFloatAvailableSpace,
+                         nscoord* aBCoord) const {
+    WritingMode wm = mReflowInput.GetWritingMode();
+    if (aFloatAvailableSpace.BSize(wm) > 0) {
+      *aBCoord += aFloatAvailableSpace.BSize(wm);
+    } else {
+      if (mReflowInput.AvailableHeight() != NS_UNCONSTRAINEDSIZE) {
+        return false;
+      }
+      MOZ_ASSERT_UNREACHABLE("avail space rect with zero height!");
+      *aBCoord += 1;
+    }
+    return true;
+  }
+
+  bool FloatAvoidingBlockFitsInAvailSpace(
+      nsIFrame* aFloatAvoidingBlock,
+      const nsFlowAreaRect& aFloatAvailableSpace) const;
+
+  bool IsAdjacentWithBStart() const { return mBCoord == ContentBStart(); }
+
+  const LogicalMargin& BorderPadding() const { return mBorderPadding; }
+
+  void ReconstructMarginBefore(nsLineList::iterator aLine);
+
+  void ComputeFloatAvoidingOffsets(nsIFrame* aFloatAvoidingBlock,
+                                   const LogicalRect& aFloatAvailableSpace,
+                                   nscoord& aIStartResult,
+                                   nscoord& aIEndResult) const;
+
+  LogicalRect ComputeBlockAvailSpace(nsIFrame* aFrame,
+                                     const nsFlowAreaRect& aFloatAvailableSpace,
+                                     bool aBlockAvoidsFloats);
+
+  LogicalSize ComputeAvailableSizeForFloat() const;
+
+  void RecoverStateFrom(nsLineList::iterator aLine, nscoord aDeltaBCoord);
+
+  void AdvanceToNextLine() {
+    if (mFlags.mIsLineLayoutEmpty) {
+      mFlags.mIsLineLayoutEmpty = false;
+    } else {
+      mLineNumber++;
+    }
+  }
+
+
+
+  nsBlockFrame* const mBlock;
+
+  nsPresContext* const mPresContext;
+
+  const ReflowInput& mReflowInput;
+
+  nscoord mFloatManagerI, mFloatManagerB;
+
+  nsReflowStatus mReflowStatus;
+
+  nsFloatManager::SavedState mFloatManagerStateBefore;
+
+  LogicalRect mContentArea;
+  nscoord ContentIStart() const {
+    return mContentArea.IStart(mReflowInput.GetWritingMode());
+  }
+  nscoord ContentISize() const {
+    return mContentArea.ISize(mReflowInput.GetWritingMode());
+  }
+  nscoord ContentIEnd() const {
+    return mContentArea.IEnd(mReflowInput.GetWritingMode());
+  }
+  nscoord ContentBStart() const {
+    return mContentArea.BStart(mReflowInput.GetWritingMode());
+  }
+  nscoord ContentBSize() const {
+    return mContentArea.BSize(mReflowInput.GetWritingMode());
+  }
+  nscoord ContentBEnd() const {
+    NS_ASSERTION(
+        ContentBSize() != NS_UNCONSTRAINEDSIZE,
+        "ContentBSize() is unconstrained, so ContentBEnd() may overflow.");
+    return mContentArea.BEnd(mReflowInput.GetWritingMode());
+  }
+  LogicalSize ContentSize(WritingMode aWM) const {
+    WritingMode wm = mReflowInput.GetWritingMode();
+    return mContentArea.Size(wm).ConvertTo(aWM, wm);
+  }
+
+  nscoord mInsetForBalance;
+
+  nsSize mContainerSize;
+  const nsSize& ContainerSize() const { return mContainerSize; }
+
+  void AppendPushedFloatChain(nsIFrame* aFloatCont);
+
+  nsOverflowContinuationTracker* mOverflowTracker;
+
+
+
+  nsLineList::iterator mCurrentLine;
+
+  nsLineList::iterator mLineAdjacentToTop;
+
+  nscoord mBCoord;
+
+  const LogicalMargin mBorderPadding;
+
+  OverflowAreas mFloatOverflowAreas;
+
+  nsIFrame* mPrevChild;
+
+  CollapsingMargin mPrevBEndMargin;
+
+  nsBlockFrame* mNextInFlow;
+
+
+
+  nsTArray<nsIFrame*> mCurrentLineFloats;
+
+  nsTArray<nsIFrame*> mBelowCurrentLineFloats;
+
+  nsTArray<nsIFrame*> mNoWrapFloats;
+
+  const nscoord mMinLineHeight;
+
+  int32_t mLineNumber;
+
+  bool mNeedsTextBoxTrimAtFragmentEndRetry = false;
+
+  Flags mFlags;
+
+  UsedClear mTrailingClearFromPIF;
+
+  const nscoord mConsumedBSize;
+
+  nscoord mAlignContentShift;
+
+  Maybe<nscoord> mLineBSize;
+
+ private:
+  bool CanPlaceFloat(nscoord aFloatISize,
+                     const nsFlowAreaRect& aFloatAvailableSpace);
+
+  void PushFloatPastBreak(nsIFrame* aFloat);
+
+  void RecoverFloats(nsLineList::iterator aLine, nscoord aDeltaBCoord);
+};
+
+};  
+
+#endif  // BlockReflowState_h

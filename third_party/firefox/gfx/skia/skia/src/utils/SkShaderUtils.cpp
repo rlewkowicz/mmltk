@@ -1,0 +1,251 @@
+/*
+ * Copyright 2019 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/utils/SkShaderUtils.h"
+
+#include "include/core/SkString.h"
+#include "include/private/base/SkTArray.h"
+#include "src/core/SkStringUtils.h"
+#include "src/sksl/SkSLProgramSettings.h"
+#include "src/sksl/SkSLString.h"
+
+#include <cstddef>
+#include <iomanip>
+#include <sstream>
+
+using namespace skia_private;
+
+namespace SkShaderUtils {
+
+class GLSLPrettyPrint {
+public:
+    GLSLPrettyPrint() {}
+
+    std::string prettify(const std::string& string) {
+        fTabs = 0;
+        fFreshline = true;
+
+        fInParseUntilNewline = false;
+        fInParseUntil = false;
+
+        int parensDepth = 0;
+
+        fIndex = 0;
+        fLength = string.length();
+        fInput = string.c_str();
+
+        while (fLength > fIndex) {
+            if (fInParseUntilNewline) {
+                this->parseUntilNewline();
+                continue;
+            }
+            if (fInParseUntil) {
+                this->parseUntil(fInParseUntilToken);
+                continue;
+            }
+            if (this->hasToken("#") || this->hasToken("//")) {
+                this->parseUntilNewline();
+                continue;
+            }
+            if (this->hasToken("/*")) {
+                this->parseUntil("*/");
+                continue;
+            }
+            if (fInput[fIndex] == '{') {
+                this->newline();
+                this->appendChar('{');
+                fTabs++;
+                this->newline();
+                continue;
+            }
+            if (fInput[fIndex] == '}') {
+                fTabs--;
+                this->newline();
+                this->appendChar('}');
+                this->newline();
+                continue;
+            }
+            if (fFreshline && fInput[fIndex] == ';') {
+                this->undoNewlineAfter('}');
+                this->appendChar(fInput[fIndex]);
+                this->newline();
+                continue;
+            }
+            if (fFreshline && fInput[fIndex] == ',') {
+                this->undoNewlineAfter('}');
+                this->appendChar(fInput[fIndex]);
+                continue;
+            }
+            if (this->hasToken(")")) {
+                parensDepth--;
+                continue;
+            }
+            if (this->hasToken("(")) {
+                parensDepth++;
+                continue;
+            }
+            if (this->hasToken(")")) {
+                parensDepth--;
+                continue;
+            }
+            if (!parensDepth && this->hasToken(";")) {
+                this->newline();
+                continue;
+            }
+            if (fInput[fIndex] == '\t' || fInput[fIndex] == '\n' ||
+                (fFreshline && fInput[fIndex] == ' ')) {
+                fIndex++;
+                continue;
+            }
+
+            this->appendChar(fInput[fIndex]);
+        }
+
+        return fPretty;
+    }
+
+private:
+    void appendChar(char c) {
+        this->tabString();
+        fPretty += fInput[fIndex++];
+        fFreshline = false;
+    }
+
+    bool hasToken(const char* token) {
+        size_t i = fIndex;
+        for (size_t j = 0; token[j] && fLength > i; i++, j++) {
+            if (token[j] != fInput[i]) {
+                return false;
+            }
+        }
+        this->tabString();
+        fIndex = i;
+        fPretty.append(token);
+        fFreshline = false;
+        return true;
+    }
+
+    void parseUntilNewline() {
+        while (fLength > fIndex) {
+            if (fInput[fIndex] == '\n') {
+                fIndex++;
+                this->newline();
+                fInParseUntilNewline = false;
+                break;
+            }
+            fPretty += fInput[fIndex++];
+            fInParseUntilNewline = true;
+        }
+    }
+
+    void parseUntil(const char* token) {
+        while (fLength > fIndex) {
+            if (fInput[fIndex] == '\n') {
+                this->newline();
+                this->tabString();
+                fIndex++;
+            }
+            if (this->hasToken(token)) {
+                fInParseUntil = false;
+                break;
+            }
+            fFreshline = false;
+            fPretty += fInput[fIndex++];
+            fInParseUntil = true;
+            fInParseUntilToken = token;
+        }
+    }
+
+    void tabString() {
+        if (fFreshline) {
+            for (int t = 0; t < fTabs; t++) {
+                fPretty += '\t';
+            }
+        }
+    }
+
+    void newline() {
+        if (!fFreshline) {
+            fFreshline = true;
+            fPretty += '\n';
+        }
+    }
+
+    void undoNewlineAfter(char c) {
+        if (fFreshline) {
+            if (fPretty.size() >= 2 && fPretty.rbegin()[0] == '\n' && fPretty.rbegin()[1] == c) {
+                fFreshline = false;
+                fPretty.pop_back();
+            }
+        }
+    }
+
+    bool fFreshline;
+    int fTabs;
+    size_t fIndex, fLength;
+    const char* fInput;
+    std::string fPretty;
+
+    bool fInParseUntilNewline;
+    bool fInParseUntil;
+    const char* fInParseUntilToken;
+};
+
+std::string PrettyPrint(const std::string& string) {
+    GLSLPrettyPrint pp;
+    return pp.prettify(string);
+}
+
+void VisitLineByLine(const std::string& text,
+                     const std::function<void(int lineNumber, const char* lineText)>& visitFn) {
+    TArray<SkString> lines;
+    SkStrSplit(text.c_str(), "\n", kStrict_SkStrSplitMode, &lines);
+    for (int i = 0; i < lines.size(); ++i) {
+        visitFn(i + 1, lines[i].c_str());
+    }
+}
+
+std::string SpirvAsHexStream(SkSpan<const uint32_t> spirv) {
+    std::ostringstream result;
+    result << "Paste the following SPIR-V binary in https://www.khronos.org/spir/visualizer/\n";
+    result << "      or pass to `spirv-dis` (optionally with `--comment --nested-indent`)\n";
+
+    constexpr size_t kIndicesPerRow = 10;
+    size_t rowOffset = 0;
+    for (size_t index = 0; index < spirv.size(); ++index, ++rowOffset) {
+        if (rowOffset == kIndicesPerRow) {
+            result << "\n";
+            rowOffset = 0;
+        }
+        result << "0x" << std::uppercase << std::setfill('0') << std::setw(8) << std::hex
+               << spirv[index] << ",";
+    }
+
+    return result.str();
+}
+
+std::string BuildShaderErrorMessage(const char* shader, const char* errors) {
+    std::string abortText{"Shader compilation error\n"
+                          "------------------------\n"};
+    VisitLineByLine(shader, [&](int lineNumber, const char* lineText) {
+        SkSL::String::appendf(&abortText, "%4i\t%s\n", lineNumber, lineText);
+    });
+    SkSL::String::appendf(&abortText, "Errors:\n%s", errors);
+    return abortText;
+}
+
+void PrintShaderBanner(SkSL::ProgramKind programKind) {
+    const char* typeName = "Unknown";
+    if (SkSL::ProgramConfig::IsVertex(programKind)) {
+        typeName = "Vertex";
+    } else if (SkSL::ProgramConfig::IsFragment(programKind)) {
+        typeName = "Fragment";
+    }
+    SkDebugf("---- %s shader ----------------------------------------------------\n", typeName);
+}
+
+}  

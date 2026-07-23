@@ -1,0 +1,164 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkTypes_DEFINED)
+#define SkTypes_DEFINED
+
+// IWYU pragma: begin_exports
+#include "include/private/base/SkFeatures.h"
+
+#include "include/private/base/SkLoadUserConfig.h"
+
+#include "include/private/base/SkAPI.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkAttributes.h"
+#include "include/private/base/SkDebug.h"
+// IWYU pragma: end_exports
+
+#include <cstdint>
+
+#if !defined(SK_GANESH) && !defined(SK_GRAPHITE)
+#  undef SK_GL
+#  undef SK_VULKAN
+#  undef SK_METAL
+#  undef SK_DAWN
+#  undef SK_DIRECT3D
+#endif
+
+#if defined(SK_R32_SHIFT)
+    static_assert(SK_R32_SHIFT == 0 || SK_R32_SHIFT == 16, "");
+#elif defined(SK_BUILD_FOR_WIN)
+    #define SK_R32_SHIFT 16
+#else
+    #define SK_R32_SHIFT 0
+#endif
+
+#if defined(SK_B32_SHIFT)
+    static_assert(SK_B32_SHIFT == (16-SK_R32_SHIFT), "");
+#else
+    #define SK_B32_SHIFT (16-SK_R32_SHIFT)
+#endif
+
+#define SK_G32_SHIFT 8
+#define SK_A32_SHIFT 24
+
+#if defined(SK_CPU_BENDIAN)
+#  define SK_PMCOLOR_BYTE_ORDER(C0, C1, C2, C3)     \
+        (SK_ ## C3 ## 32_SHIFT == 0  &&             \
+         SK_ ## C2 ## 32_SHIFT == 8  &&             \
+         SK_ ## C1 ## 32_SHIFT == 16 &&             \
+         SK_ ## C0 ## 32_SHIFT == 24)
+#else
+#  define SK_PMCOLOR_BYTE_ORDER(C0, C1, C2, C3)     \
+        (SK_ ## C0 ## 32_SHIFT == 0  &&             \
+         SK_ ## C1 ## 32_SHIFT == 8  &&             \
+         SK_ ## C2 ## 32_SHIFT == 16 &&             \
+         SK_ ## C3 ## 32_SHIFT == 24)
+#endif
+
+#if defined SK_DEBUG && defined SK_BUILD_FOR_WIN
+    #if defined(free)
+        #undef free
+    #endif
+    #include <crtdbg.h>
+    #undef free
+#endif
+
+#if !defined(SK_ALLOW_STATIC_GLOBAL_INITIALIZERS)
+    #define SK_ALLOW_STATIC_GLOBAL_INITIALIZERS 0
+#endif
+
+#if !defined(SK_GAMMA_EXPONENT)
+    #define SK_GAMMA_EXPONENT (0.0f)  // SRGB
+#endif
+
+#if !defined(SK_GAMMA_CONTRAST)
+    #define SK_GAMMA_CONTRAST (0.5f)
+#endif
+
+#if defined(SK_HISTOGRAM_ENUMERATION)  || \
+    defined(SK_HISTOGRAM_BOOLEAN)      || \
+    defined(SK_HISTOGRAM_EXACT_LINEAR) || \
+    defined(SK_HISTOGRAM_CUSTOM_EXACT_LINEAR) || \
+    defined(SK_HISTOGRAM_MEMORY_KB)    || \
+    defined(SK_HISTOGRAM_CUSTOM_COUNTS)|| \
+    defined(SK_HISTOGRAM_CUSTOM_MICROSECONDS_TIMES)
+#  define SK_HISTOGRAMS_ENABLED 1
+#else
+#  define SK_HISTOGRAMS_ENABLED 0
+#endif
+
+#if !defined(SK_HISTOGRAM_BOOLEAN)
+#  define SK_HISTOGRAM_BOOLEAN(name, sample)
+#endif
+
+#if !defined(SK_HISTOGRAM_ENUMERATION)
+#  define SK_HISTOGRAM_ENUMERATION(name, sampleEnum, enumSize)
+#endif
+
+#if !defined(SK_HISTOGRAM_EXACT_LINEAR)
+#  define SK_HISTOGRAM_EXACT_LINEAR(name, sample, valueMax)
+#endif
+
+#if !defined(SK_HISTOGRAM_CUSTOM_EXACT_LINEAR)
+#  define SK_HISTOGRAM_CUSTOM_EXACT_LINEAR(name, sample, value_min, \
+                                           value_max, bucket_count)
+#endif
+
+#if !defined(SK_HISTOGRAM_MEMORY_KB)
+#  define SK_HISTOGRAM_MEMORY_KB(name, sample)
+#endif
+
+#if !defined(SK_HISTOGRAM_CUSTOM_COUNTS)
+#  define SK_HISTOGRAM_CUSTOM_COUNTS(name, sample, countMin, countMax, bucketCount)
+#endif
+
+#if !defined(SK_HISTOGRAM_CUSTOM_MICROSECONDS_TIMES)
+#  define SK_HISTOGRAM_CUSTOM_MICROSECONDS_TIMES(name, sampleUSec, minUSec, maxUSec, bucketCount)
+#endif
+
+#define SK_HISTOGRAM_PERCENTAGE(name, percent_as_int) \
+    SK_HISTOGRAM_EXACT_LINEAR(name, percent_as_int, 101)
+
+#if defined(SK_ENABLE_OPTIMIZE_SIZE)
+    #if !defined(SK_FORCE_RASTER_PIPELINE_BLITTER)
+        #define SK_FORCE_RASTER_PIPELINE_BLITTER
+    #endif
+    #define SK_DISABLE_SDF_TEXT
+#endif
+
+#if defined(SK_BUILD_FOR_LIBFUZZER) || defined(SK_BUILD_FOR_AFL_FUZZ)
+    #define SK_BUILD_FOR_FUZZER
+#endif
+
+
+#if !defined(GR_CACHE_STATS)
+  #if defined(SK_DEBUG) || defined(SK_DUMP_STATS)
+      #define GR_CACHE_STATS  1
+  #else
+      #define GR_CACHE_STATS  0
+  #endif
+#endif
+
+#if !defined(GR_GPU_STATS)
+  #if defined(SK_DEBUG) || defined(SK_DUMP_STATS) || defined(GPU_TEST_UTILS)
+      #define GR_GPU_STATS    1
+  #else
+      #define GR_GPU_STATS    0
+  #endif
+#endif
+
+
+typedef int32_t SkUnichar;
+
+typedef uint16_t SkGlyphID;
+
+static constexpr uint32_t SK_InvalidGenID = 0;
+
+static constexpr uint32_t SK_InvalidUniqueID = 0;
+
+#endif

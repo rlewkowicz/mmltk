@@ -1,0 +1,58 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_RemoteWorkerOp_h
+#define mozilla_dom_RemoteWorkerOp_h
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/Variant.h"
+#include "mozilla/dom/WorkerPrivate.h"
+
+namespace mozilla::dom {
+
+class RemoteWorkerChild;
+class RemtoeWorkerNonfLifeCycleOpControllerChild;
+class RemoteWorkerOp;
+
+namespace remoteworker {
+
+struct WorkerPrivateAccessibleState {
+  ~WorkerPrivateAccessibleState();
+  RefPtr<WorkerPrivate> mWorkerPrivate;
+};
+
+struct Pending : WorkerPrivateAccessibleState {
+  nsTArray<RefPtr<RemoteWorkerOp>> mPendingOps;
+};
+
+struct Running : WorkerPrivateAccessibleState {};
+
+struct Canceled {};
+
+struct Killed {};
+
+using RemoteWorkerState = Variant<Pending, Running, Canceled, Killed>;
+
+}  
+
+class RemoteWorkerOp {
+ public:
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  virtual ~RemoteWorkerOp() = default;
+
+  virtual bool MaybeStart(RemoteWorkerChild* aOwner,
+                          remoteworker::RemoteWorkerState& aState) = 0;
+
+  virtual void StartOnMainThread(RefPtr<RemoteWorkerChild>& aOwner) = 0;
+
+  virtual void Start(RemoteWorkerNonLifeCycleOpControllerChild* aOwner,
+                     remoteworker::RemoteWorkerState& aState) = 0;
+
+  virtual void Cancel() = 0;
+};
+
+}  
+
+#endif

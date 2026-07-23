@@ -1,0 +1,76 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef util_TrailingArray_h
+#define util_TrailingArray_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+
+#include <stddef.h>  // size_t
+#include <stdint.h>  // uint32_t, uintptr_t
+
+namespace js {
+
+template <typename Base>
+class TrailingArray {
+ protected:
+  using Offset = uint32_t;
+
+  template <typename T>
+  static constexpr bool isAlignedOffset(Offset offset) {
+    return offset % alignof(T) == 0;
+  }
+  template <size_t N>
+  static constexpr bool isAlignedOffset(Offset offset) {
+    return offset % N == 0;
+  }
+
+  template <typename T>
+  T* offsetToPointer(Offset offset) {
+    uintptr_t base = reinterpret_cast<uintptr_t>(static_cast<Base*>(this));
+    return reinterpret_cast<T*>(base + offset);
+  }
+  template <typename T>
+  const T* offsetToPointer(Offset offset) const {
+    uintptr_t base =
+        reinterpret_cast<uintptr_t>(static_cast<const Base*>(this));
+    return reinterpret_cast<const T*>(base + offset);
+  }
+
+  template <typename T>
+  void initElements(Offset offset, size_t nelem) {
+    MOZ_ASSERT(isAlignedOffset<T>(offset));
+
+    uintptr_t elem =
+        reinterpret_cast<uintptr_t>(static_cast<Base*>(this)) + offset;
+
+    for (size_t i = 0; i < nelem; ++i) {
+      void* raw = reinterpret_cast<void*>(elem);
+      new (raw) T;
+      elem += sizeof(T);
+    }
+  }
+
+  template <typename T>
+  size_t numElements(Offset start, Offset end) const {
+    constexpr size_t ElemSize = sizeof(T);
+    return numElements<ElemSize>(start, end);
+  }
+  template <size_t ElemSize>
+  size_t numElements(Offset start, Offset end) const {
+    MOZ_ASSERT(start <= end);
+    MOZ_ASSERT((end - start) % ElemSize == 0);
+    return (end - start) / ElemSize;
+  }
+
+  TrailingArray() = default;
+
+ public:
+  TrailingArray(const TrailingArray&) = delete;
+  TrailingArray& operator=(const TrailingArray&) = delete;
+};
+
+}  
+
+#endif  // util_TrailingArray_h

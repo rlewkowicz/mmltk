@@ -1,0 +1,13 @@
+
+[package]
+edition = "2018"
+name = "chunky-vec"
+version = "0.1.0"
+authors = ["Dan Glastonbury <dan.glastonbury@gmail.com>"]
+description = "A pin safe, append only vector never moves the backing store for an element.\n"
+keywords = ["data-structure", "vector", "pin"]
+categories = ["data-structures"]
+license = "Apache-2.0/MIT"
+repository = "https://github.com/djg/chunky-vec"
+
+[dependencies]

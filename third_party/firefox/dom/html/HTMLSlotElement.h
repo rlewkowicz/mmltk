@@ -1,0 +1,83 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_HTMLSlotElement_h
+#define mozilla_dom_HTMLSlotElement_h
+
+#include "mozilla/dom/FastFrontRemovableArray.h"
+#include "nsGenericHTMLElement.h"
+#include "nsTArray.h"
+
+namespace mozilla::dom {
+
+struct AssignedNodesOptions;
+class OwningElementOrText;
+
+class HTMLSlotElement final : public nsGenericHTMLElement {
+ public:
+  explicit HTMLSlotElement(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo);
+  NS_IMPL_FROMNODE_HTML_WITH_TAG(HTMLSlotElement, slot)
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(HTMLSlotElement,
+                                           nsGenericHTMLElement)
+  nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
+
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+  void UnbindFromTree(UnbindContext&) override;
+
+  void BeforeSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                     const nsAttrValue* aValue, bool aNotify) override;
+  void AfterSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                    const nsAttrValue* aValue, const nsAttrValue* aOldValue,
+                    nsIPrincipal* aSubjectPrincipal, bool aNotify) override;
+
+  void SetName(const nsAString& aName, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::name, aName, aRv);
+  }
+
+  void GetName(nsAString& aName) { GetHTMLAttr(nsGkAtoms::name, aName); }
+
+  void AssignedNodes(const AssignedNodesOptions& aOptions,
+                     nsTArray<RefPtr<nsINode>>& aNodes);
+
+  void AssignedElements(const AssignedNodesOptions& aOptions,
+                        nsTArray<RefPtr<Element>>& aNodes);
+
+  void Assign(const Sequence<OwningElementOrText>& aNodes);
+
+  Span<const RefPtr<nsINode>> AssignedNodes() const { return mAssignedNodes; }
+  const nsTArray<nsINode*>& ManuallyAssignedNodes() const;
+  void InsertAssignedNode(uint32_t aIndex, nsIContent&);
+  void AppendAssignedNode(nsIContent&);
+  void RemoveAssignedNode(nsIContent&);
+  void ClearAssignedNodes();
+
+  void EnqueueSlotChangeEvent();
+  void RemovedFromSignalSlotList() {
+    MOZ_ASSERT(mInSignalSlotList);
+    mInSignalSlotList = false;
+  }
+
+  void FireSlotChangeEvent();
+
+  void RemoveManuallyAssignedNode(nsIContent&);
+
+  void RecalculateHasSlottedState();
+
+ protected:
+  virtual ~HTMLSlotElement();
+  JSObject* WrapNode(JSContext* aCx, JS::Handle<JSObject*> aGivenProto) final;
+
+  FastFrontRemovableArray<RefPtr<nsINode>> mAssignedNodes;
+  nsTArray<nsINode*> mManuallyAssignedNodes;
+
+  bool mInSignalSlotList = false;
+
+  bool mInManualShadowRoot = false;
+};
+
+}  
+
+#endif  // mozilla_dom_HTMLSlotElement_h

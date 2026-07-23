@@ -1,0 +1,197 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+********************************************************************************
+*   Copyright (C) 1997-2016, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+********************************************************************************
+*
+* File brkiter.h
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   02/18/97    aliu        Added typedef for TextCount.  Made DONE const.
+*   05/07/97    aliu        Fixed DLL declaration.
+*   07/09/97    jfitz       Renamed BreakIterator and interface synced with JDK
+*   08/11/98    helena      Sync-up JDK1.2.
+*   01/13/2000  helena      Added UErrorCode parameter to createXXXInstance methods.
+********************************************************************************
+*/
+
+#ifndef BRKITER_H
+#define BRKITER_H
+
+#include "unicode/utypes.h"
+
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#if UCONFIG_NO_BREAK_ITERATION
+
+U_NAMESPACE_BEGIN
+
+class BreakIterator;
+
+U_NAMESPACE_END
+
+#else
+
+#include "unicode/uobject.h"
+#include "unicode/unistr.h"
+#include "unicode/chariter.h"
+#include "unicode/locid.h"
+#include "unicode/ubrk.h"
+#include "unicode/strenum.h"
+#include "unicode/utext.h"
+#include "unicode/umisc.h"
+
+U_NAMESPACE_BEGIN
+
+class U_COMMON_API_CLASS BreakIterator : public UObject {
+public:
+    U_COMMON_API virtual ~BreakIterator();
+
+    U_COMMON_API virtual bool operator==(const BreakIterator&) const = 0;
+
+    U_COMMON_API bool operator!=(const BreakIterator& rhs) const { return !operator==(rhs); }
+
+    U_COMMON_API virtual BreakIterator* clone() const = 0;
+
+    U_COMMON_API virtual UClassID getDynamicClassID() const override = 0;
+
+    U_COMMON_API virtual CharacterIterator& getText() const = 0;
+
+    U_COMMON_API virtual UText* getUText(UText* fillIn, UErrorCode& status) const = 0;
+
+    U_COMMON_API virtual void setText(const UnicodeString& text) = 0;
+
+    U_COMMON_API virtual void setText(UText* text, UErrorCode& status) = 0;
+
+    U_COMMON_API virtual void adoptText(CharacterIterator* it) = 0;
+
+    enum {
+        DONE = static_cast<int32_t>(-1)
+    };
+
+    U_COMMON_API virtual int32_t first() = 0;
+
+    U_COMMON_API virtual int32_t last() = 0;
+
+    U_COMMON_API virtual int32_t previous() = 0;
+
+    U_COMMON_API virtual int32_t next() = 0;
+
+    U_COMMON_API virtual int32_t current() const = 0;
+
+    U_COMMON_API virtual int32_t following(int32_t offset) = 0;
+
+    U_COMMON_API virtual int32_t preceding(int32_t offset) = 0;
+
+    U_COMMON_API virtual UBool isBoundary(int32_t offset) = 0;
+
+    U_COMMON_API virtual int32_t next(int32_t n) = 0;
+
+    U_COMMON_API virtual int32_t getRuleStatus() const;
+
+    U_COMMON_API virtual int32_t getRuleStatusVec(int32_t* fillInVec,
+                                                  int32_t capacity,
+                                                  UErrorCode& status);
+
+    U_COMMON_API static BreakIterator* U_EXPORT2
+    createWordInstance(const Locale& where, UErrorCode& status);
+
+    U_COMMON_API static BreakIterator* U_EXPORT2
+    createLineInstance(const Locale& where, UErrorCode& status);
+
+    U_COMMON_API static BreakIterator* U_EXPORT2
+    createCharacterInstance(const Locale& where, UErrorCode& status);
+
+    U_COMMON_API static BreakIterator* U_EXPORT2
+    createSentenceInstance(const Locale& where, UErrorCode& status);
+
+#ifndef U_HIDE_DEPRECATED_API
+    U_COMMON_API static BreakIterator* U_EXPORT2
+    createTitleInstance(const Locale& where, UErrorCode& status);
+#endif /* U_HIDE_DEPRECATED_API */
+
+    U_COMMON_API static const Locale* U_EXPORT2 getAvailableLocales(int32_t& count);
+
+    U_COMMON_API static UnicodeString& U_EXPORT2 getDisplayName(const Locale& objectLocale,
+                                                                const Locale& displayLocale,
+                                                                UnicodeString& name);
+
+    U_COMMON_API static UnicodeString& U_EXPORT2 getDisplayName(const Locale& objectLocale,
+                                                                UnicodeString& name);
+
+#ifndef U_FORCE_HIDE_DEPRECATED_API
+    U_COMMON_API virtual BreakIterator* createBufferClone(void* stackBuffer,
+                                                          int32_t& BufferSize,
+                                                          UErrorCode& status) = 0;
+#endif  // U_FORCE_HIDE_DEPRECATED_API
+
+#ifndef U_HIDE_DEPRECATED_API
+
+    U_COMMON_API inline UBool isBufferClone();
+
+#endif /* U_HIDE_DEPRECATED_API */
+
+#if !UCONFIG_NO_SERVICE
+    U_COMMON_API static URegistryKey U_EXPORT2 registerInstance(BreakIterator* toAdopt,
+                                                                const Locale& locale,
+                                                                UBreakIteratorType kind,
+                                                                UErrorCode& status);
+
+    U_COMMON_API static UBool U_EXPORT2 unregister(URegistryKey key, UErrorCode& status);
+
+    U_COMMON_API static StringEnumeration* U_EXPORT2 getAvailableLocales();
+#endif
+
+    U_COMMON_API Locale getLocale(ULocDataLocaleType type, UErrorCode& status) const;
+
+#ifndef U_HIDE_INTERNAL_API
+    U_COMMON_API const char* getLocaleID(ULocDataLocaleType type, UErrorCode& status) const;
+#endif  /* U_HIDE_INTERNAL_API */
+
+    U_COMMON_API virtual BreakIterator& refreshInputText(UText* input, UErrorCode& status) = 0;
+
+ private:
+    static BreakIterator* buildInstance(const Locale& loc, const char *type, UErrorCode& status);
+    static BreakIterator* createInstance(const Locale& loc, int32_t kind, UErrorCode& status);
+    static BreakIterator* makeInstance(const Locale& loc, int32_t kind, UErrorCode& status);
+
+    friend class ICUBreakIteratorFactory;
+    friend class ICUBreakIteratorService;
+
+protected:
+    U_COMMON_API BreakIterator();
+    U_COMMON_API BreakIterator(const BreakIterator& other);
+#ifndef U_HIDE_INTERNAL_API
+    U_COMMON_API BreakIterator(const Locale& valid, const Locale& actual);
+    U_COMMON_API BreakIterator& operator=(const BreakIterator& other);
+#endif  /* U_HIDE_INTERNAL_API */
+
+private:
+
+    Locale actualLocale;
+    Locale validLocale;
+    Locale requestLocale;
+};
+
+#ifndef U_HIDE_DEPRECATED_API
+
+inline UBool BreakIterator::isBufferClone()
+{
+    return false;
+}
+
+#endif /* U_HIDE_DEPRECATED_API */
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_BREAK_ITERATION */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // BRKITER_H

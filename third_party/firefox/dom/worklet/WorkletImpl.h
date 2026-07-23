@@ -1,0 +1,124 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_worklet_WorkletImpl_h
+#define mozilla_dom_worklet_WorkletImpl_h
+
+#include "MainThreadUtils.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/OriginAttributes.h"
+#include "mozilla/OriginTrials.h"
+#include "mozilla/dom/OffThreadCSPContext.h"
+#include "mozilla/ipc/PBackgroundSharedTypes.h"
+#include "nsRFPService.h"
+
+class nsPIDOMWindowInner;
+class nsIPrincipal;
+class nsIRunnable;
+
+namespace mozilla {
+
+namespace dom {
+
+class Worklet;
+class WorkletGlobalScope;
+class WorkletThread;
+
+}  
+
+class WorkletLoadInfo {
+ public:
+  explicit WorkletLoadInfo(nsPIDOMWindowInner* aWindow);
+
+  uint64_t OuterWindowID() const { return mOuterWindowID; }
+  uint64_t InnerWindowID() const { return mInnerWindowID; }
+
+ private:
+  uint64_t mOuterWindowID;
+  const uint64_t mInnerWindowID;
+};
+
+class WorkletImpl {
+  using RFPTarget = mozilla::RFPTarget;
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(WorkletImpl);
+
+
+  virtual JSObject* WrapWorklet(JSContext* aCx, dom::Worklet* aWorklet,
+                                JS::Handle<JSObject*> aGivenProto);
+
+  virtual nsresult SendControlMessage(already_AddRefed<nsIRunnable> aRunnable);
+
+  void NotifyWorkletFinished();
+
+  virtual nsContentPolicyType ContentPolicyType() const = 0;
+
+  dom::WorkletGlobalScope* GetGlobalScope();
+  dom::OffThreadCSPContext* GetCSPContext();
+
+
+  const OriginTrials& Trials() const { return mTrials; }
+  const WorkletLoadInfo& LoadInfo() const { return mWorkletLoadInfo; }
+  const OriginAttributes& OriginAttributesRef() const {
+    return mPrincipal->OriginAttributesRef();
+  }
+  nsIPrincipal* Principal() const { return mPrincipal; }
+  const ipc::PrincipalInfo& PrincipalInfo() const { return mPrincipalInfo; }
+  const Maybe<ipc::PolicyContainerArgs>& PolicyContainer() const {
+    return mPolicyContainer;
+  }
+
+  const Maybe<nsID>& GetAgentClusterId() const { return mAgentClusterId; }
+
+  bool IsSharedMemoryAllowed() const { return mSharedMemoryAllowed; }
+  bool IsSystemPrincipal() const { return mPrincipal->IsSystemPrincipal(); }
+  bool ShouldResistFingerprinting(RFPTarget aTarget) const {
+    return mShouldResistFingerprinting &&
+           nsRFPService::IsRFPEnabledFor(mIsPrivateBrowsing, aTarget,
+                                         mOverriddenFingerprintingSettings);
+  }
+
+  virtual void OnAddModuleStarted() const {
+    MOZ_ASSERT(NS_IsMainThread());
+  }
+
+  virtual void OnAddModulePromiseSettled() const {
+    MOZ_ASSERT(NS_IsMainThread());
+  }
+
+ protected:
+  WorkletImpl(nsPIDOMWindowInner* aWindow, nsIPrincipal* aPrincipal);
+  virtual ~WorkletImpl();
+
+  virtual already_AddRefed<dom::WorkletGlobalScope> ConstructGlobalScope(
+      JSContext* aCx) = 0;
+
+  ipc::PrincipalInfo mPrincipalInfo;
+  nsCOMPtr<nsIPrincipal> mPrincipal;
+  Maybe<ipc::PolicyContainerArgs> mPolicyContainer;
+
+  const WorkletLoadInfo mWorkletLoadInfo;
+
+  RefPtr<dom::WorkletThread> mWorkletThread;
+  bool mTerminated : 1;
+
+  RefPtr<dom::WorkletGlobalScope> mGlobalScope;
+  UniquePtr<dom::OffThreadCSPContext> mCSPContext;
+  bool mFinishedOnExecutionThread : 1;
+
+  Maybe<nsID> mAgentClusterId;
+
+  bool mSharedMemoryAllowed : 1;
+  bool mShouldResistFingerprinting : 1;
+  bool mIsPrivateBrowsing : 1;
+  Maybe<RFPTargetSet> mOverriddenFingerprintingSettings;
+
+  const OriginTrials mTrials;
+};
+
+}  
+
+#endif  // mozilla_dom_worklet_WorkletImpl_h

@@ -1,0 +1,211 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsIScriptElement_h_
+#define nsIScriptElement_h_
+
+#include "js/ColumnNumber.h"  // JS::ColumnNumberOneOrigin
+#include "js/loader/ScriptKind.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/dom/FromParser.h"
+#include "nsCOMPtr.h"
+#include "nsID.h"
+#include "nsIScriptLoaderObserver.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsStringFwd.h"
+#include "nscore.h"
+
+#include "nsIPrincipal.h"
+
+class nsIContent;
+class nsIParser;
+class nsIPrincipal;
+class nsIURI;
+
+namespace mozilla::dom {
+class Document;
+enum class FetchPriority : uint8_t;
+enum class ReferrerPolicy : uint8_t;
+}  
+
+#define NS_ISCRIPTELEMENT_IID \
+  {0xe60fca9b, 0x1b96, 0x4e4e, {0xa9, 0xb4, 0xdc, 0x98, 0x4f, 0x88, 0x3f, 0x9c}}
+
+class nsIScriptElement : public nsIScriptLoaderObserver {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_ISCRIPTELEMENT_IID)
+
+  explicit nsIScriptElement(mozilla::dom::FromParser aFromParser)
+      : mLineNumber(1),
+        mColumnNumber(1),
+        mAlreadyStarted(false),
+        mMalformed(false),
+        mDoneAddingChildren(aFromParser == mozilla::dom::NOT_FROM_PARSER ||
+                            aFromParser == mozilla::dom::FROM_PARSER_FRAGMENT),
+        mForceAsync(aFromParser == mozilla::dom::NOT_FROM_PARSER ||
+                    aFromParser == mozilla::dom::FROM_PARSER_FRAGMENT),
+        mFrozen(false),
+        mDefer(false),
+        mAsync(false),
+        mExternal(false),
+        mIsTrusted(true),
+        mKind(JS::loader::ScriptKind::eClassic),
+        mParserCreated(aFromParser == mozilla::dom::FROM_PARSER_FRAGMENT
+                           ? mozilla::dom::NOT_FROM_PARSER
+                           : aFromParser),
+        mCreatorParser(nullptr) {}
+
+  virtual bool GetScriptType(nsAString& type) = 0;
+
+  nsIURI* GetScriptURI() {
+    MOZ_ASSERT(mFrozen, "Not ready for this call yet!");
+    return mUri;
+  }
+
+  nsIPrincipal* GetScriptURITriggeringPrincipal() {
+    MOZ_ASSERT(mFrozen, "Not ready for this call yet!");
+    return mSrcTriggeringPrincipal;
+  }
+
+  virtual void GetScriptText(nsAString& text) const = 0;
+
+  virtual void GetScriptCharset(nsAString& charset) = 0;
+
+  virtual void FreezeExecutionAttrs(const mozilla::dom::Document*) = 0;
+
+  bool GetScriptIsModule() {
+    MOZ_ASSERT(mFrozen, "Not ready for this call yet!");
+    return mKind == JS::loader::ScriptKind::eModule;
+  }
+
+  bool GetScriptIsImportMap() {
+    MOZ_ASSERT(mFrozen, "Not ready for this call yet!");
+    return mKind == JS::loader::ScriptKind::eImportMap;
+  }
+
+  bool GetScriptIsSpeculationRules() {
+    MOZ_ASSERT(mFrozen, "Not ready for this call yet!");
+    return mKind == JS::loader::ScriptKind::eSpeculationRules;
+  }
+
+  bool GetScriptDeferred() {
+    MOZ_ASSERT(mFrozen, "Not ready for this call yet!");
+    return mDefer;
+  }
+
+  bool GetScriptAsync() {
+    MOZ_ASSERT(mFrozen, "Not ready for this call yet!");
+    return mAsync;
+  }
+
+  bool GetScriptExternal() {
+    MOZ_ASSERT(mFrozen, "Not ready for this call yet!");
+    return mExternal;
+  }
+
+  mozilla::dom::FromParser GetParserCreated() { return mParserCreated; }
+
+  void SetScriptLineNumber(uint32_t aLineNumber) { mLineNumber = aLineNumber; }
+
+  uint32_t GetScriptLineNumber() { return mLineNumber; }
+
+  void SetScriptColumnNumber(JS::ColumnNumberOneOrigin aColumnNumber) {
+    mColumnNumber = aColumnNumber;
+  }
+
+  JS::ColumnNumberOneOrigin GetScriptColumnNumber() { return mColumnNumber; }
+
+  void SetIsMalformed() { mMalformed = true; }
+
+  bool IsMalformed() { return mMalformed; }
+
+  void PreventExecution() { mAlreadyStarted = true; }
+
+  void LoseParserInsertedness() {
+    mUri = nullptr;
+    mCreatorParser = nullptr;
+    mParserCreated = mozilla::dom::NOT_FROM_PARSER;
+    mForceAsync = !GetAsyncState();
+
+    mFrozen = false;
+    mExternal = false;
+    mAsync = false;
+    mDefer = false;
+    mKind = JS::loader::ScriptKind::eClassic;
+  }
+
+  void SetCreatorParser(nsIParser* aParser);
+
+  void UnblockParser();
+
+  void ContinueParserAsync();
+
+  void BeginEvaluating();
+
+  void EndEvaluating();
+
+  already_AddRefed<nsIParser> GetCreatorParser();
+
+  bool AttemptToExecute(nsCOMPtr<nsIParser> aParser);
+
+  virtual mozilla::CORSMode GetCORSMode() const {
+    return mozilla::CORS_NONE;
+  }
+
+  virtual mozilla::dom::FetchPriority GetFetchPriority() const = 0;
+
+  virtual mozilla::dom::ReferrerPolicy GetReferrerPolicy();
+
+  virtual nsresult FireErrorEvent() = 0;
+
+  virtual MOZ_CAN_RUN_SCRIPT nsresult
+  GetTrustedTypesCompliantInlineScriptText(nsString& aSourceText) = 0;
+
+ protected:
+  virtual bool MaybeProcessScript(nsCOMPtr<nsIParser> aParser) = 0;
+
+  virtual bool GetAsyncState() = 0;
+
+  virtual nsIContent* GetAsContent() = 0;
+
+  void DetermineKindFromType(const mozilla::dom::Document* aOwnerDoc);
+
+  bool IsClassicNonAsyncDefer();
+
+  uint32_t mLineNumber;
+
+  JS::ColumnNumberOneOrigin mColumnNumber;
+
+  bool mAlreadyStarted;
+
+  bool mMalformed;
+
+  bool mDoneAddingChildren;
+
+  bool mForceAsync;
+
+  bool mFrozen;
+
+  bool mDefer;
+
+  bool mAsync;
+
+  bool mExternal;
+
+  bool mIsTrusted;
+
+  JS::loader::ScriptKind mKind;
+
+  mozilla::dom::FromParser mParserCreated;
+
+  nsCOMPtr<nsIURI> mUri;
+
+  nsCOMPtr<nsIPrincipal> mSrcTriggeringPrincipal;
+
+  nsWeakPtr mCreatorParser;
+};
+
+#endif  // nsIScriptElement_h_

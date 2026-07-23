@@ -1,0 +1,576 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef MediaInfo_h
+#define MediaInfo_h
+
+#include "AudioConfig.h"
+#include "ImageTypes.h"
+#include "MediaData.h"
+#include "TimeUnits.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/Variant.h"
+#include "mozilla/gfx/Point.h"  // for gfx::IntSize
+#include "mozilla/gfx/Rect.h"   // for gfx::IntRect
+#include "mozilla/gfx/Types.h"  // for gfx::ColorDepth
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nsTHashMap.h"
+
+namespace mozilla {
+
+class AudioInfo;
+class VideoInfo;
+class TextInfo;
+
+class MetadataTag {
+ public:
+  MetadataTag(const nsACString& aKey, const nsACString& aValue)
+      : mKey(aKey), mValue(aValue) {}
+  nsCString mKey;
+  nsCString mValue;
+  bool operator==(const MetadataTag& rhs) const {
+    return mKey == rhs.mKey && mValue == rhs.mValue;
+  }
+};
+
+using MetadataTags = nsTHashMap<nsCStringHashKey, nsCString>;
+
+
+
+struct NoCodecSpecificData {
+  bool operator==(const NoCodecSpecificData& rhs) const { return true; }
+};
+
+struct AudioCodecSpecificBinaryBlob {
+  bool operator==(const AudioCodecSpecificBinaryBlob& rhs) const {
+    return *mBinaryBlob == *rhs.mBinaryBlob;
+  }
+
+  RefPtr<MediaByteBuffer> mBinaryBlob{new MediaByteBuffer};
+};
+
+
+
+struct AacCodecSpecificData {
+  bool operator==(const AacCodecSpecificData& rhs) const {
+    return *mEsDescriptorBinaryBlob == *rhs.mEsDescriptorBinaryBlob &&
+           *mDecoderConfigDescriptorBinaryBlob ==
+               *rhs.mDecoderConfigDescriptorBinaryBlob;
+  }
+
+  uint32_t mEncoderDelayFrames{0};
+
+  uint64_t mMediaFrameCount{0};
+
+  RefPtr<MediaByteBuffer> mEsDescriptorBinaryBlob{new MediaByteBuffer};
+
+  RefPtr<MediaByteBuffer> mDecoderConfigDescriptorBinaryBlob{
+      new MediaByteBuffer};
+};
+
+struct FlacCodecSpecificData {
+  bool operator==(const FlacCodecSpecificData& rhs) const {
+    return *mStreamInfoBinaryBlob == *rhs.mStreamInfoBinaryBlob;
+  }
+
+  RefPtr<MediaByteBuffer> mStreamInfoBinaryBlob{new MediaByteBuffer};
+};
+
+struct Mp3CodecSpecificData final {
+  bool operator==(const Mp3CodecSpecificData& rhs) const {
+    return mEncoderDelayFrames == rhs.mEncoderDelayFrames &&
+           mEncoderPaddingFrames == rhs.mEncoderPaddingFrames;
+  }
+
+  auto MutTiedFields() {
+    return std::tie(mEncoderDelayFrames, mEncoderPaddingFrames);
+  }
+
+  uint32_t mEncoderDelayFrames{0};
+
+  uint32_t mEncoderPaddingFrames{0};
+};
+
+struct OpusCodecSpecificData {
+  bool operator==(const OpusCodecSpecificData& rhs) const {
+    return mContainerCodecDelayFrames == rhs.mContainerCodecDelayFrames &&
+           *mHeadersBinaryBlob == *rhs.mHeadersBinaryBlob;
+  }
+  int64_t mContainerCodecDelayFrames{-1};
+
+  RefPtr<MediaByteBuffer> mHeadersBinaryBlob{new MediaByteBuffer};
+};
+
+struct VorbisCodecSpecificData {
+  bool operator==(const VorbisCodecSpecificData& rhs) const {
+    return *mHeadersBinaryBlob == *rhs.mHeadersBinaryBlob;
+  }
+
+  RefPtr<MediaByteBuffer> mHeadersBinaryBlob{new MediaByteBuffer};
+};
+
+struct WaveCodecSpecificData {
+  bool operator==(const WaveCodecSpecificData& rhs) const { return true; }
+};
+
+using AudioCodecSpecificVariant =
+    mozilla::Variant<NoCodecSpecificData, AudioCodecSpecificBinaryBlob,
+                     AacCodecSpecificData, FlacCodecSpecificData,
+                     Mp3CodecSpecificData, OpusCodecSpecificData,
+                     VorbisCodecSpecificData, WaveCodecSpecificData>;
+
+inline already_AddRefed<MediaByteBuffer> ForceGetAudioCodecSpecificBlob(
+    const AudioCodecSpecificVariant& v) {
+  return v.match(
+      [](const NoCodecSpecificData&) {
+        return RefPtr<MediaByteBuffer>(new MediaByteBuffer).forget();
+      },
+      [](const AudioCodecSpecificBinaryBlob& binaryBlob) {
+        return RefPtr<MediaByteBuffer>(binaryBlob.mBinaryBlob).forget();
+      },
+      [](const AacCodecSpecificData& aacData) {
+        return RefPtr<MediaByteBuffer>(
+                   aacData.mDecoderConfigDescriptorBinaryBlob)
+            .forget();
+      },
+      [](const FlacCodecSpecificData& flacData) {
+        return RefPtr<MediaByteBuffer>(flacData.mStreamInfoBinaryBlob).forget();
+      },
+      [](const Mp3CodecSpecificData&) {
+        return RefPtr<MediaByteBuffer>(new MediaByteBuffer).forget();
+      },
+      [](const OpusCodecSpecificData& opusData) {
+        return RefPtr<MediaByteBuffer>(opusData.mHeadersBinaryBlob).forget();
+      },
+      [](const VorbisCodecSpecificData& vorbisData) {
+        return RefPtr<MediaByteBuffer>(vorbisData.mHeadersBinaryBlob).forget();
+      },
+      [](const WaveCodecSpecificData&) {
+        return RefPtr<MediaByteBuffer>(new MediaByteBuffer).forget();
+      });
+}
+
+inline already_AddRefed<MediaByteBuffer> GetAudioCodecSpecificBlob(
+    const AudioCodecSpecificVariant& v) {
+  return ForceGetAudioCodecSpecificBlob(v);
+}
+
+
+
+class TrackInfo {
+ public:
+  enum TrackType { kUndefinedTrack, kAudioTrack, kVideoTrack, kTextTrack };
+  TrackInfo(TrackType aType, const nsAString& aId, const nsAString& aKind,
+            const nsAString& aLabel, const nsAString& aLanguage, bool aEnabled,
+            uint32_t aTrackId)
+      : mId(aId),
+        mKind(aKind),
+        mLabel(aLabel),
+        mLanguage(aLanguage),
+        mEnabled(aEnabled),
+        mTrackId(aTrackId),
+        mIsRenderedExternally(false),
+        mType(aType) {
+    MOZ_COUNT_CTOR(TrackInfo);
+  }
+
+  void Init(const nsAString& aId, const nsAString& aKind,
+            const nsAString& aLabel, const nsAString& aLanguage,
+            bool aEnabled) {
+    mId = aId;
+    mKind = aKind;
+    mLabel = aLabel;
+    mLanguage = aLanguage;
+    mEnabled = aEnabled;
+  }
+
+  nsString mId;
+  nsString mKind;
+  nsString mLabel;
+  nsString mLanguage;
+  bool mEnabled;
+
+  uint32_t mTrackId;
+
+  nsCString mMimeType;
+  media::TimeUnit mDuration;
+  media::TimeUnit mMediaTime;
+  uint32_t mTimeScale = 0;
+  CryptoTrack mCrypto;
+
+  CopyableTArray<MetadataTag> mTags;
+
+  bool mIsRenderedExternally;
+
+  virtual AudioInfo* GetAsAudioInfo() { return nullptr; }
+  virtual VideoInfo* GetAsVideoInfo() { return nullptr; }
+  virtual TextInfo* GetAsTextInfo() { return nullptr; }
+  virtual const AudioInfo* GetAsAudioInfo() const { return nullptr; }
+  virtual const VideoInfo* GetAsVideoInfo() const { return nullptr; }
+  virtual const TextInfo* GetAsTextInfo() const { return nullptr; }
+
+  bool IsAudio() const { return !!GetAsAudioInfo(); }
+  bool IsVideo() const { return !!GetAsVideoInfo(); }
+  bool IsText() const { return !!GetAsTextInfo(); }
+  TrackType GetType() const { return mType; }
+
+  virtual nsCString ToString() const;
+
+  bool virtual IsValid() const = 0;
+
+  virtual UniquePtr<TrackInfo> Clone() const = 0;
+
+  MOZ_COUNTED_DTOR_VIRTUAL(TrackInfo)
+
+ protected:
+  TrackInfo(const TrackInfo& aOther) {
+    mId = aOther.mId;
+    mKind = aOther.mKind;
+    mLabel = aOther.mLabel;
+    mLanguage = aOther.mLanguage;
+    mEnabled = aOther.mEnabled;
+    mTrackId = aOther.mTrackId;
+    mMimeType = aOther.mMimeType;
+    mDuration = aOther.mDuration;
+    mMediaTime = aOther.mMediaTime;
+    mCrypto = aOther.mCrypto;
+    mIsRenderedExternally = aOther.mIsRenderedExternally;
+    mType = aOther.mType;
+    mTags = aOther.mTags.Clone();
+    MOZ_COUNT_CTOR(TrackInfo);
+  }
+  bool IsEqualTo(const TrackInfo& rhs) const;
+
+ private:
+  TrackType mType;
+};
+
+const char* TrackTypeToStr(TrackInfo::TrackType aTrack);
+
+enum class VideoRotation {
+  kDegree_0 = 0,
+  kDegree_90 = 90,
+  kDegree_180 = 180,
+  kDegree_270 = 270,
+};
+
+class VideoInfo : public TrackInfo {
+ public:
+  VideoInfo() : VideoInfo(-1, -1) {}
+
+  VideoInfo(int32_t aWidth, int32_t aHeight)
+      : VideoInfo(gfx::IntSize(aWidth, aHeight)) {}
+
+  explicit VideoInfo(const gfx::IntSize& aSize)
+      : TrackInfo(kVideoTrack, u"2"_ns, u"main"_ns, u""_ns, u""_ns, true, 2),
+        mDisplay(aSize),
+        mStereoMode(StereoMode::MONO),
+        mImage(aSize),
+        mCodecSpecificConfig(new MediaByteBuffer),
+        mExtraData(new MediaByteBuffer),
+        mRotation(VideoRotation::kDegree_0) {}
+
+  VideoInfo(const VideoInfo& aOther) : TrackInfo(aOther) {
+    if (aOther.mCodecSpecificConfig) {
+      mCodecSpecificConfig = new MediaByteBuffer();
+      mCodecSpecificConfig->AppendElements(
+          reinterpret_cast<uint8_t*>(aOther.mCodecSpecificConfig->Elements()),
+          aOther.mCodecSpecificConfig->Length());
+    }
+    if (aOther.mExtraData) {
+      mExtraData = new MediaByteBuffer();
+      mExtraData->AppendElements(
+          reinterpret_cast<uint8_t*>(aOther.mExtraData->Elements()),
+          aOther.mExtraData->Length());
+    }
+    mDisplay = aOther.mDisplay;
+    mStereoMode = aOther.mStereoMode;
+    mImage = aOther.mImage;
+    mRotation = aOther.mRotation;
+    mColorDepth = aOther.mColorDepth;
+    mColorSpace = aOther.mColorSpace;
+    mColorPrimaries = aOther.mColorPrimaries;
+    mTransferFunction = aOther.mTransferFunction;
+    mHDRMetadata = aOther.mHDRMetadata;
+    mColorRange = aOther.mColorRange;
+    mImageRect = aOther.mImageRect;
+    mAlphaPresent = aOther.mAlphaPresent;
+    mFrameRate = aOther.mFrameRate;
+  };
+
+  bool operator==(const VideoInfo& rhs) const;
+
+  bool IsValid() const override {
+    return mDisplay.width > 0 && mDisplay.height > 0;
+  }
+
+  VideoInfo* GetAsVideoInfo() override { return this; }
+
+  const VideoInfo* GetAsVideoInfo() const override { return this; }
+
+  UniquePtr<TrackInfo> Clone() const override {
+    return MakeUnique<VideoInfo>(*this);
+  }
+
+  void SetAlpha(bool aAlphaPresent) { mAlphaPresent = aAlphaPresent; }
+
+  bool HasAlpha() const { return mAlphaPresent; }
+
+  gfx::IntRect ImageRect() const {
+    if (!mImageRect) {
+      return gfx::IntRect(0, 0, mImage.width, mImage.height);
+    }
+    return *mImageRect;
+  }
+
+  void SetImageRect(const gfx::IntRect& aRect) { mImageRect = Some(aRect); }
+  void ResetImageRect() { mImageRect.reset(); }
+
+  gfx::IntRect ScaledImageRect(int64_t aWidth, int64_t aHeight) const {
+    if ((aWidth == mImage.width && aHeight == mImage.height) || !mImage.width ||
+        !mImage.height) {
+      return ImageRect();
+    }
+
+    gfx::IntRect imageRect = ImageRect();
+    int64_t w = (aWidth * imageRect.Width()) / mImage.width;
+    int64_t h = (aHeight * imageRect.Height()) / mImage.height;
+    if (!w || !h) {
+      return imageRect;
+    }
+
+    imageRect.x = AssertedCast<int>((imageRect.x * aWidth) / mImage.width);
+    imageRect.y = AssertedCast<int>((imageRect.y * aHeight) / mImage.height);
+    imageRect.SetWidth(AssertedCast<int>(w));
+    imageRect.SetHeight(AssertedCast<int>(h));
+    return imageRect;
+  }
+
+  VideoRotation ToSupportedRotation(int32_t aDegree) const {
+    switch (aDegree) {
+      case 90:
+        return VideoRotation::kDegree_90;
+      case 180:
+        return VideoRotation::kDegree_180;
+      case 270:
+        return VideoRotation::kDegree_270;
+      default:
+        NS_WARNING_ASSERTION(aDegree == 0, "Invalid rotation degree, ignored");
+        return VideoRotation::kDegree_0;
+    }
+  }
+
+  nsCString ToString() const override;
+
+  gfx::IntSize mDisplay;
+
+  StereoMode mStereoMode;
+
+  gfx::IntSize mImage;
+
+  RefPtr<MediaByteBuffer> mCodecSpecificConfig;
+  RefPtr<MediaByteBuffer> mExtraData;
+
+  VideoRotation mRotation;
+
+  gfx::ColorDepth mColorDepth = gfx::ColorDepth::COLOR_8;
+
+  Maybe<gfx::YUVColorSpace> mColorSpace;
+
+  Maybe<gfx::ColorSpace2> mColorPrimaries;
+
+  Maybe<gfx::TransferFunction> mTransferFunction;
+
+  Maybe<gfx::HDRMetadata> mHDRMetadata;
+
+  gfx::ColorRange mColorRange = gfx::ColorRange::LIMITED;
+
+  Maybe<int32_t> GetFrameRate() const { return mFrameRate; }
+  void SetFrameRate(int32_t aRate) { mFrameRate = Some(aRate); }
+
+ private:
+  friend struct IPC::ParamTraits<VideoInfo>;
+
+  Maybe<gfx::IntRect> mImageRect;
+
+  bool mAlphaPresent = false;
+
+  Maybe<int32_t> mFrameRate;
+};
+
+class AudioInfo : public TrackInfo {
+ public:
+  AudioInfo()
+      : TrackInfo(kAudioTrack, u"1"_ns, u"main"_ns, u""_ns, u""_ns, true, 1),
+        mRate(0),
+        mChannels(0),
+        mChannelMap(AudioConfig::ChannelLayout::UNKNOWN_MAP),
+        mBitDepth(0),
+        mProfile(0),
+        mExtendedProfile(0) {}
+
+  AudioInfo(const AudioInfo& aOther) = default;
+
+  bool operator==(const AudioInfo& rhs) const;
+
+  static const uint32_t MAX_RATE = 768000;
+  static const uint32_t MAX_CHANNEL_COUNT = 256;
+
+  bool IsValid() const override {
+    return mChannels > 0 && mChannels <= MAX_CHANNEL_COUNT && mRate > 0 &&
+           mRate <= MAX_RATE;
+  }
+
+  AudioInfo* GetAsAudioInfo() override { return this; }
+
+  const AudioInfo* GetAsAudioInfo() const override { return this; }
+
+  nsCString ToString() const override;
+
+  UniquePtr<TrackInfo> Clone() const override {
+    return MakeUnique<AudioInfo>(*this);
+  }
+
+  uint32_t mRate;
+
+  uint32_t mChannels;
+  AudioConfig::ChannelLayout::ChannelMap mChannelMap;
+
+  uint32_t mBitDepth;
+
+  uint8_t mProfile;
+
+  uint8_t mExtendedProfile;
+
+  AudioCodecSpecificVariant mCodecSpecificConfig{NoCodecSpecificData{}};
+};
+
+class EncryptionInfo {
+ public:
+  EncryptionInfo() : mEncrypted(false) {}
+
+  struct InitData {
+    template <typename AInitDatas>
+    InitData(const nsAString& aType, AInitDatas&& aInitData)
+        : mType(aType), mInitData(std::forward<AInitDatas>(aInitData)) {}
+
+    nsString mType;
+
+    CopyableTArray<uint8_t> mInitData;
+  };
+  using InitDatas = CopyableTArray<InitData>;
+
+  bool IsEncrypted() const { return mEncrypted; }
+
+  void Reset() {
+    mEncrypted = false;
+    mInitDatas.Clear();
+  }
+
+  template <typename AInitDatas>
+  void AddInitData(const nsAString& aType, AInitDatas&& aInitData) {
+    mInitDatas.AppendElement(
+        InitData(aType, std::forward<AInitDatas>(aInitData)));
+    mEncrypted = true;
+  }
+
+  void AddInitData(const EncryptionInfo& aInfo) {
+    mInitDatas.AppendElements(aInfo.mInitDatas);
+    mEncrypted = !!mInitDatas.Length();
+  }
+
+  InitDatas mInitDatas;
+
+ private:
+  bool mEncrypted;
+};
+
+class MediaInfo {
+ public:
+  bool HasVideo() const { return mVideo.IsValid(); }
+
+  void EnableVideo() {
+    if (HasVideo()) {
+      return;
+    }
+    mVideo.mDisplay = gfx::IntSize(1, 1);
+  }
+
+  bool HasAudio() const { return mAudio.IsValid(); }
+
+  void EnableAudio() {
+    if (HasAudio()) {
+      return;
+    }
+    mAudio.mChannels = 2;
+    mAudio.mRate = 44100;
+  }
+
+  bool IsEncrypted() const {
+    return (HasAudio() && mAudio.mCrypto.IsEncrypted()) ||
+           (HasVideo() && mVideo.mCrypto.IsEncrypted());
+  }
+
+  bool HasValidMedia() const { return HasVideo() || HasAudio(); }
+
+  VideoInfo mVideo;
+  AudioInfo mAudio;
+
+  media::NullableTimeUnit mMetadataDuration;
+
+  media::NullableTimeUnit mUnadjustedMetadataEndTime;
+
+  bool mMediaSeekable = true;
+
+  bool mMediaSeekableOnlyInBufferedRanges = false;
+
+  EncryptionInfo mCrypto;
+
+  media::TimeUnit mStartTime;
+};
+
+class TrackInfoSharedPtr {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(TrackInfoSharedPtr)
+ public:
+  TrackInfoSharedPtr(const TrackInfo& aOriginal, uint32_t aStreamID)
+      : mInfo(aOriginal.Clone()),
+        mStreamSourceID(aStreamID),
+        mMimeType(mInfo->mMimeType) {}
+
+  uint32_t GetID() const { return mStreamSourceID; }
+
+  operator const TrackInfo*() const { return mInfo.get(); }
+
+  const TrackInfo* operator*() const { return mInfo.get(); }
+
+  const TrackInfo* operator->() const {
+    MOZ_ASSERT(mInfo.get(), "dereferencing a UniquePtr containing nullptr");
+    return mInfo.get();
+  }
+
+  const AudioInfo* GetAsAudioInfo() const {
+    return mInfo ? mInfo->GetAsAudioInfo() : nullptr;
+  }
+
+  const VideoInfo* GetAsVideoInfo() const {
+    return mInfo ? mInfo->GetAsVideoInfo() : nullptr;
+  }
+
+  const TextInfo* GetAsTextInfo() const {
+    return mInfo ? mInfo->GetAsTextInfo() : nullptr;
+  }
+
+ private:
+  ~TrackInfoSharedPtr() = default;
+  UniquePtr<TrackInfo> mInfo;
+  uint32_t mStreamSourceID;
+
+ public:
+  const nsCString& mMimeType;
+};
+
+}  
+
+#endif  // MediaInfo_h

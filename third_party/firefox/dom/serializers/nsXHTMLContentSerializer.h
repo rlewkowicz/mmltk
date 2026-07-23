@@ -1,0 +1,113 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsXHTMLContentSerializer_h_
+#define nsXHTMLContentSerializer_h_
+
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nsXMLContentSerializer.h"
+
+class nsIContent;
+class nsAtom;
+
+namespace mozilla {
+class Encoding;
+}
+
+class nsXHTMLContentSerializer : public nsXMLContentSerializer {
+ public:
+  nsXHTMLContentSerializer();
+  virtual ~nsXHTMLContentSerializer();
+
+  NS_IMETHOD Init(uint32_t flags, uint32_t aWrapColumn,
+                  const mozilla::Encoding* aEncoding, bool aIsCopying,
+                  bool aRewriteEncodingDeclaration,
+                  bool* aNeedsPreformatScanning, nsAString& aOutput) override;
+
+  NS_IMETHOD AppendText(mozilla::dom::Text* aText, int32_t aStartOffset,
+                        int32_t aEndOffset) override;
+
+  NS_IMETHOD AppendDocumentStart(mozilla::dom::Document* aDocument) override;
+
+ protected:
+  virtual bool CheckElementStart(mozilla::dom::Element* aElement,
+                                 bool& aForceFormat, nsAString& aStr,
+                                 nsresult& aResult) override;
+
+  [[nodiscard]] virtual bool AfterElementStart(nsIContent* aContent,
+                                               nsIContent* aOriginalElement,
+                                               nsAString& aStr) override;
+
+  virtual bool CheckElementEnd(mozilla::dom::Element* aContent,
+                               mozilla::dom::Element* aOriginalElement,
+                               bool& aForceFormat, nsAString& aStr) override;
+
+  virtual void AfterElementEnd(nsIContent* aContent, nsAString& aStr) override;
+
+  virtual bool LineBreakBeforeOpen(int32_t aNamespaceID,
+                                   nsAtom* aName) override;
+  virtual bool LineBreakAfterOpen(int32_t aNamespaceID, nsAtom* aName) override;
+  virtual bool LineBreakBeforeClose(int32_t aNamespaceID,
+                                    nsAtom* aName) override;
+  virtual bool LineBreakAfterClose(int32_t aNamespaceID,
+                                   nsAtom* aName) override;
+
+  bool HasLongLines(const nsString& text, int32_t& aLastNewlineOffset);
+
+  virtual void MaybeEnterInPreContent(nsIContent* aNode) override;
+  virtual void MaybeLeaveFromPreContent(nsIContent* aNode) override;
+
+  [[nodiscard]] virtual bool SerializeAttributes(
+      mozilla::dom::Element* aContent, mozilla::dom::Element* aOriginalElement,
+      nsAString& aTagPrefix, const nsAString& aTagNamespaceURI,
+      nsAtom* aTagName, nsAString& aStr, uint32_t aSkipAttr,
+      bool aAddNSAttr) override;
+
+  bool IsFirstChildOfOL(nsIContent* aElement);
+
+  [[nodiscard]] bool SerializeLIValueAttribute(nsIContent* aElement,
+                                               nsAString& aStr);
+  bool IsShorthandAttr(const nsAtom* aAttrName, const nsAtom* aElementName);
+
+  [[nodiscard]] virtual bool AppendAndTranslateEntities(
+      const nsAString& aStr, nsAString& aOutputStr) override;
+
+ private:
+  bool IsElementPreformatted(nsIContent* aNode);
+
+ protected:
+  bool mIsHTMLSerializer;
+
+  bool mIsCopying;  
+
+  int32_t mDisableEntityEncoding;
+
+  bool mRewriteEncodingDeclaration;
+
+  bool mIsFirstChildOfOL;
+
+  struct olState {
+    olState(int32_t aStart, bool aIsFirst)
+        : startVal(aStart), isFirstListItem(aIsFirst) {}
+
+    olState(const olState& aOlState) {
+      startVal = aOlState.startVal;
+      isFirstListItem = aOlState.isFirstListItem;
+    }
+
+    int32_t startVal;
+
+    bool isFirstListItem;
+  };
+
+  AutoTArray<olState, 8> mOLStateStack;
+
+  bool HasNoChildren(nsIContent* aContent);
+};
+
+nsresult NS_NewXHTMLContentSerializer(nsIContentSerializer** aSerializer);
+
+#endif

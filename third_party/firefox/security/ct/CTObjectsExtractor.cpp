@@ -1,0 +1,319 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "CTObjectsExtractor.h"
+
+#include <limits>
+#include <vector>
+
+#include "hasht.h"
+#include "mozpkix/pkixnss.h"
+#include "mozpkix/pkixutil.h"
+
+namespace mozilla {
+namespace ct {
+
+using namespace mozilla::pkix;
+
+class Output {
+ public:
+  Output(uint8_t* buffer, size_t length)
+      : begin(buffer),
+        end(buffer + length),
+        current(begin),
+        overflowed(false) {}
+
+  template <size_t N>
+  explicit Output(uint8_t (&buffer)[N]) : Output(buffer, N) {}
+
+  void Write(Input data) { Write(data.UnsafeGetData(), data.GetLength()); }
+
+  void Write(uint8_t b) { Write(&b, 1); }
+
+  bool IsOverflowed() const { return overflowed; }
+
+  Result GetInput( Input& input) const {
+    if (overflowed || current < begin) {
+      return Result::FATAL_ERROR_INVALID_STATE;
+    }
+    size_t length = static_cast<size_t>(current - begin);
+    return input.Init(begin, length);
+  }
+
+  Output(const Output&) = delete;
+  void operator=(const Output&) = delete;
+
+ private:
+  uint8_t* begin;
+  uint8_t* end;
+  uint8_t* current;
+  bool overflowed;
+
+  void Write(const uint8_t* data, size_t length) {
+    if (end < current) {
+      overflowed = true;
+    }
+    size_t available = static_cast<size_t>(end - current);
+    if (available < length) {
+      overflowed = true;
+    }
+    if (overflowed) {
+      return;
+    }
+    memcpy(current, data, length);
+    current += length;
+  }
+};
+
+
+static const uint8_t EMBEDDED_SCT_LIST_OID[] = {0x2b, 0x06, 0x01, 0x04, 0x01,
+                                                0xd6, 0x79, 0x02, 0x04, 0x02};
+static const size_t MAX_TLV_HEADER_LENGTH = 4;
+static const uint8_t EXTENSIONS_CONTEXT_TAG =
+    der::CONTEXT_SPECIFIC | der::CONSTRUCTED | 3;
+
+Result CheckForInputSizeTypeOverflow(size_t length) {
+  if (length > std::numeric_limits<Input::size_type>::max()) {
+    return Result::FATAL_ERROR_INVALID_STATE;
+  }
+  return Success;
+}
+
+class PrecertTBSExtractor {
+ public:
+  PrecertTBSExtractor(Input der, uint8_t* buffer, size_t bufferLength)
+      : mDER(der), mOutput(buffer, bufferLength) {}
+
+  Result Init() {
+    Reader tbsReader;
+    Result rv = GetTBSCertificate(tbsReader);
+    if (rv != Success) {
+      return rv;
+    }
+
+    rv = ExtractTLVsBeforeExtensions(tbsReader);
+    if (rv != Success) {
+      return rv;
+    }
+
+    rv = ExtractOptionalExtensionsExceptSCTs(tbsReader);
+    if (rv != Success) {
+      return rv;
+    }
+
+    return WriteOutput();
+  }
+
+  Input GetPrecertTBS() { return mPrecertTBS; }
+
+ private:
+  Result GetTBSCertificate(Reader& tbsReader) {
+    Reader certificateReader;
+    Result rv =
+        der::ExpectTagAndGetValueAtEnd(mDER, der::SEQUENCE, certificateReader);
+    if (rv != Success) {
+      return rv;
+    }
+    return ExpectTagAndGetValue(certificateReader, der::SEQUENCE, tbsReader);
+  }
+
+  Result ExtractTLVsBeforeExtensions(Reader& tbsReader) {
+    Reader::Mark tbsBegin = tbsReader.GetMark();
+    while (!tbsReader.AtEnd()) {
+      if (tbsReader.Peek(EXTENSIONS_CONTEXT_TAG)) {
+        break;
+      }
+      uint8_t tag;
+      Input tagValue;
+      Result rv = der::ReadTagAndGetValue(tbsReader, tag, tagValue);
+      if (rv != Success) {
+        return rv;
+      }
+    }
+    return tbsReader.GetInput(tbsBegin, mTLVsBeforeExtensions);
+  }
+
+  Result ExtractOptionalExtensionsExceptSCTs(Reader& tbsReader) {
+    if (!tbsReader.Peek(EXTENSIONS_CONTEXT_TAG)) {
+      return Success;
+    }
+
+    Reader extensionsContextReader;
+    Result rv = der::ExpectTagAndGetValueAtEnd(
+        tbsReader, EXTENSIONS_CONTEXT_TAG, extensionsContextReader);
+    if (rv != Success) {
+      return rv;
+    }
+
+    Reader extensionsReader;
+    rv = der::ExpectTagAndGetValueAtEnd(extensionsContextReader, der::SEQUENCE,
+                                        extensionsReader);
+    if (rv != Success) {
+      return rv;
+    }
+
+    while (!extensionsReader.AtEnd()) {
+      Reader::Mark extensionTLVBegin = extensionsReader.GetMark();
+      Reader extension;
+      rv =
+          der::ExpectTagAndGetValue(extensionsReader, der::SEQUENCE, extension);
+      if (rv != Success) {
+        return rv;
+      }
+      Reader extensionID;
+      rv = der::ExpectTagAndGetValue(extension, der::OIDTag, extensionID);
+      if (rv != Success) {
+        return rv;
+      }
+      if (!extensionID.MatchRest(EMBEDDED_SCT_LIST_OID)) {
+        Input extensionTLV;
+        rv = extensionsReader.GetInput(extensionTLVBegin, extensionTLV);
+        if (rv != Success) {
+          return rv;
+        }
+        mExtensionTLVs.push_back(std::move(extensionTLV));
+      }
+    }
+    return Success;
+  }
+
+  Result WriteOutput() {
+
+    Result rv;
+    if (!mExtensionTLVs.empty()) {
+      uint8_t tbsHeaderBuffer[MAX_TLV_HEADER_LENGTH];
+      uint8_t extensionsContextHeaderBuffer[MAX_TLV_HEADER_LENGTH];
+      uint8_t extensionsHeaderBuffer[MAX_TLV_HEADER_LENGTH];
+
+      Input tbsHeader;
+      Input extensionsContextHeader;
+      Input extensionsHeader;
+
+      Input::size_type extensionsValueLength = 0;
+      for (auto& extensionTLV : mExtensionTLVs) {
+        extensionsValueLength += extensionTLV.GetLength();
+      }
+
+      rv = MakeTLVHeader(der::SEQUENCE, extensionsValueLength,
+                         extensionsHeaderBuffer, extensionsHeader);
+      if (rv != Success) {
+        return rv;
+      }
+      size_t extensionsContextLengthAsSizeT =
+          static_cast<size_t>(extensionsHeader.GetLength()) +
+          static_cast<size_t>(extensionsValueLength);
+      rv = CheckForInputSizeTypeOverflow(extensionsContextLengthAsSizeT);
+      if (rv != Success) {
+        return rv;
+      }
+      Input::size_type extensionsContextLength =
+          static_cast<Input::size_type>(extensionsContextLengthAsSizeT);
+      rv =
+          MakeTLVHeader(EXTENSIONS_CONTEXT_TAG, extensionsContextLength,
+                        extensionsContextHeaderBuffer, extensionsContextHeader);
+      if (rv != Success) {
+        return rv;
+      }
+      size_t tbsLengthAsSizeT =
+          static_cast<size_t>(mTLVsBeforeExtensions.GetLength()) +
+          static_cast<size_t>(extensionsContextHeader.GetLength()) +
+          static_cast<size_t>(extensionsHeader.GetLength()) +
+          static_cast<size_t>(extensionsValueLength);
+      rv = CheckForInputSizeTypeOverflow(tbsLengthAsSizeT);
+      if (rv != Success) {
+        return rv;
+      }
+      Input::size_type tbsLength =
+          static_cast<Input::size_type>(tbsLengthAsSizeT);
+      rv = MakeTLVHeader(der::SEQUENCE, tbsLength, tbsHeaderBuffer, tbsHeader);
+      if (rv != Success) {
+        return rv;
+      }
+
+      mOutput.Write(tbsHeader);
+      mOutput.Write(mTLVsBeforeExtensions);
+      mOutput.Write(extensionsContextHeader);
+      mOutput.Write(extensionsHeader);
+      for (auto& extensionTLV : mExtensionTLVs) {
+        mOutput.Write(extensionTLV);
+      }
+    } else {
+      uint8_t tbsHeaderBuffer[MAX_TLV_HEADER_LENGTH];
+      Input tbsHeader;
+      rv = MakeTLVHeader(der::SEQUENCE, mTLVsBeforeExtensions.GetLength(),
+                         tbsHeaderBuffer, tbsHeader);
+      if (rv != Success) {
+        return rv;
+      }
+      mOutput.Write(tbsHeader);
+      mOutput.Write(mTLVsBeforeExtensions);
+    }
+
+    return mOutput.GetInput(mPrecertTBS);
+  }
+
+  Result MakeTLVHeader(uint8_t tag, size_t length,
+                       uint8_t (&buffer)[MAX_TLV_HEADER_LENGTH],
+                        Input& header) {
+    Output output(buffer);
+    output.Write(tag);
+    if (length < 128) {
+      output.Write(static_cast<uint8_t>(length));
+    } else if (length < 256) {
+      output.Write(0x81u);
+      output.Write(static_cast<uint8_t>(length));
+    } else if (length < 65536) {
+      output.Write(0x82u);
+      output.Write(static_cast<uint8_t>(length / 256));
+      output.Write(static_cast<uint8_t>(length % 256));
+    } else {
+      return Result::FATAL_ERROR_INVALID_ARGS;
+    }
+    return output.GetInput(header);
+  }
+
+  Input mDER;
+  Input mTLVsBeforeExtensions;
+  std::vector<Input> mExtensionTLVs;
+  Output mOutput;
+  Input mPrecertTBS;
+};
+
+Result GetPrecertLogEntry(Input leafCertificate,
+                          Input issuerSubjectPublicKeyInfo, LogEntry& output) {
+  assert(leafCertificate.GetLength() > 0);
+  assert(issuerSubjectPublicKeyInfo.GetLength() > 0);
+  output.Reset();
+
+  Buffer precertTBSBuffer;
+  precertTBSBuffer.resize(leafCertificate.GetLength());
+
+  PrecertTBSExtractor extractor(leafCertificate, precertTBSBuffer.data(),
+                                precertTBSBuffer.size());
+  Result rv = extractor.Init();
+  if (rv != Success) {
+    return rv;
+  }
+  Input precertTBS(extractor.GetPrecertTBS());
+  assert(precertTBS.UnsafeGetData() == precertTBSBuffer.data());
+  assert(precertTBS.GetLength() <= precertTBSBuffer.size());
+  precertTBSBuffer.resize(precertTBS.GetLength());
+
+  output.type = LogEntry::Type::Precert;
+  output.tbsCertificate = std::move(precertTBSBuffer);
+
+  output.issuerKeyHash.resize(SHA256_LENGTH);
+  return DigestBufNSS(issuerSubjectPublicKeyInfo, DigestAlgorithm::sha256,
+                      output.issuerKeyHash.data(), output.issuerKeyHash.size());
+}
+
+void GetX509LogEntry(Input leafCertificate, LogEntry& output) {
+  assert(leafCertificate.GetLength() > 0);
+  output.Reset();
+  output.type = LogEntry::Type::X509;
+  InputToBuffer(leafCertificate, output.leafCertificate);
+}
+
+}  
+}  

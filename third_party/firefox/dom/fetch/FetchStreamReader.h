@@ -1,0 +1,112 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_FetchStreamReader_h
+#define mozilla_dom_FetchStreamReader_h
+
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/dom/FetchBinding.h"
+#include "mozilla/dom/PromiseNativeHandler.h"
+#include "nsIAsyncOutputStream.h"
+#include "nsIGlobalObject.h"
+
+namespace mozilla::dom {
+
+class ReadableStream;
+class ReadableStreamDefaultReader;
+class StrongWorkerRef;
+
+class FetchStreamReader;
+
+class OutputStreamHolder final : public nsIOutputStreamCallback {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOUTPUTSTREAMCALLBACK
+
+  OutputStreamHolder(FetchStreamReader* aReader, nsIAsyncOutputStream* aOutput);
+
+  nsresult Init(JSContext* aCx);
+
+  void Shutdown();
+
+  nsresult AsyncWait(uint32_t aFlags, uint32_t aRequestedCount,
+                     nsIEventTarget* aEventTarget);
+  nsresult Write(char* aBuffer, uint32_t aLength, uint32_t* aWritten) {
+    return mOutput->Write(aBuffer, aLength, aWritten);
+  }
+  nsresult CloseWithStatus(nsresult aStatus) {
+    return mOutput->CloseWithStatus(aStatus);
+  }
+  nsresult StreamStatus() { return mOutput->StreamStatus(); }
+
+  nsIAsyncOutputStream* GetOutputStream() { return mOutput; }
+
+ private:
+  ~OutputStreamHolder();
+
+  RefPtr<FetchStreamReader> mAsyncWaitReader;
+  WeakPtr<FetchStreamReader> mReader;
+  RefPtr<StrongWorkerRef> mAsyncWaitWorkerRef;
+  RefPtr<StrongWorkerRef> mWorkerRef;
+  nsCOMPtr<nsIAsyncOutputStream> mOutput;
+};
+
+class FetchStreamReader final : public nsISupports, public SupportsWeakPtr {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS(FetchStreamReader)
+
+  static nsresult Create(JSContext* aCx, nsIGlobalObject* aGlobal,
+                         FetchStreamReader** aStreamReader,
+                         nsIInputStream** aInputStream);
+
+  bool OnOutputStreamReady();
+
+  MOZ_CAN_RUN_SCRIPT
+  void ChunkSteps(JSContext* aCx, JS::Handle<JS::Value> aChunk,
+                  ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT
+  void CloseSteps(JSContext* aCx, ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT
+  void ErrorSteps(JSContext* aCx, JS::Handle<JS::Value> aError,
+                  ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void CloseAndRelease(JSContext* aCx, nsresult aStatus);
+
+  void StartConsuming(JSContext* aCx, ReadableStream* aStream,
+                      ErrorResult& aRv);
+
+ private:
+  explicit FetchStreamReader(nsIGlobalObject* aGlobal);
+  ~FetchStreamReader();
+
+  nsresult WriteBuffer();
+
+  MOZ_CAN_RUN_SCRIPT
+  bool Process(JSContext* aCx);
+
+  void ReportErrorToConsole(JSContext* aCx, JS::Handle<JS::Value> aValue);
+
+  nsCOMPtr<nsIGlobalObject> mGlobal;
+  nsCOMPtr<nsIEventTarget> mOwningEventTarget;
+
+  RefPtr<OutputStreamHolder> mOutput;
+
+  RefPtr<ReadableStreamDefaultReader> mReader;
+
+  nsTArray<uint8_t> mBuffer;
+  uint32_t mBufferRemaining = 0;
+  uint32_t mBufferOffset = 0;
+
+  bool mHasOutstandingReadRequest = false;
+  bool mStreamClosed = false;
+};
+
+}  
+
+#endif  // mozilla_dom_FetchStreamReader_h

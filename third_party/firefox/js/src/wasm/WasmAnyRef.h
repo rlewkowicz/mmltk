@@ -1,0 +1,324 @@
+/*
+ * Copyright 2023 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_anyref_h
+#define wasm_anyref_h
+
+#include "mozilla/FloatingPoint.h"
+
+#include "js/HeapAPI.h"
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+
+
+class JSObject;
+class JSString;
+
+namespace js {
+namespace gc {
+class Cell;
+};  
+
+namespace wasm {
+
+
+enum class AnyRefKind : uint8_t {
+  Null,
+  Object,
+  String,
+  I31,
+};
+
+enum class AnyRefTag : uint8_t {
+  ObjectOrNull = 0x0,
+  I31 = 0x1,
+  String = 0x2,
+};
+
+class AnyRef {
+  uintptr_t value_;
+
+  AnyRefTag pointerTag() const { return GetUintptrTag(value_); }
+
+  explicit constexpr AnyRef(uintptr_t value) : value_(value) {}
+
+  static constexpr uintptr_t TagUintptr(uintptr_t value, AnyRefTag tag) {
+    MOZ_ASSERT(!(value & TagMask));
+    return value | uintptr_t(tag);
+  }
+  static constexpr uintptr_t UntagUintptr(uintptr_t value) {
+    return value & ~TagMask;
+  }
+  static constexpr AnyRefTag GetUintptrTag(uintptr_t value) {
+    uintptr_t rawTag = value & TagMask;
+    uintptr_t normalizedI31 = rawTag & ~(value << 1);
+    return AnyRefTag(normalizedI31);
+  }
+
+  static AnyRef fromInt32(int32_t value) {
+    MOZ_ASSERT(!int32NeedsBoxing(value));
+    return AnyRef::fromUint32Truncate(uint32_t(value));
+  }
+
+ public:
+  static constexpr uintptr_t TagMask = 0x3;
+  static constexpr uintptr_t TagShift = 2;
+  static_assert(TagShift <= gc::CellAlignShift, "not enough free bits");
+  static constexpr uintptr_t GCThingMask = ~TagMask;
+  static constexpr uintptr_t GCThingChunkMask =
+      GCThingMask & ~js::gc::ChunkMask;
+
+  static constexpr uintptr_t NullRefValue = 0;
+  static constexpr uintptr_t InvalidRefValue = UINTPTR_MAX << TagShift;
+
+  static constexpr int32_t MaxI31Value = (2 << 29) - 1;
+  static constexpr int32_t MinI31Value = -(2 << 29);
+
+  explicit constexpr AnyRef() : value_(NullRefValue) {}
+  MOZ_IMPLICIT constexpr AnyRef(std::nullptr_t) : value_(NullRefValue) {}
+
+  static constexpr AnyRef null() { return AnyRef(NullRefValue); }
+
+  static constexpr AnyRef invalid() { return AnyRef(InvalidRefValue); }
+
+  static AnyRef fromJSObjectOrNull(JSObject* objectOrNull) {
+    MOZ_ASSERT(GetUintptrTag((uintptr_t)objectOrNull) ==
+               AnyRefTag::ObjectOrNull);
+    return AnyRef((uintptr_t)objectOrNull);
+  }
+
+  static AnyRef fromJSObject(JSObject& object) {
+    MOZ_ASSERT(GetUintptrTag((uintptr_t)&object) == AnyRefTag::ObjectOrNull);
+    return AnyRef((uintptr_t)&object);
+  }
+
+  static AnyRef fromJSString(JSString* string) {
+    return AnyRef(TagUintptr((uintptr_t)string, AnyRefTag::String));
+  }
+
+  static AnyRef fromCompiledCode(void* pointer) {
+    return AnyRef((uintptr_t)pointer);
+  }
+
+  static bool fromJSValue(JSContext* cx, JS::HandleValue value,
+                          JS::MutableHandle<AnyRef> result);
+
+  static AnyRef fromUint32Truncate(uint32_t value) {
+#if defined(JS_CODEGEN_NONE) || defined(JS_CODEGEN_X64) || \
+    defined(JS_CODEGEN_ARM64)
+    uintptr_t wideValue = uintptr_t(value & 0x7FFFFFFF);
+#elif defined(JS_CODEGEN_LOONG64) || defined(JS_CODEGEN_MIPS64) || \
+    defined(JS_CODEGEN_RISCV64)
+    uintptr_t wideValue = uintptr_t(int64_t((uint64_t(value) << 33)) >> 33);
+#elif !defined(JS_64BIT)
+    uintptr_t wideValue = (uintptr_t)value;
+#else
+#  error "unknown architecture"
+#endif
+
+    uintptr_t shiftedValue = wideValue << 1;
+    uintptr_t taggedValue = shiftedValue | (uintptr_t)AnyRefTag::I31;
+#ifdef JS_64BIT
+    debugAssertCanonicalInt32(taggedValue);
+#endif
+    return AnyRef(taggedValue);
+  }
+
+#ifdef JS_64BIT
+  static void debugAssertCanonicalInt32(uintptr_t value) {
+#  ifdef DEBUG
+#    if defined(JS_CODEGEN_X64) || defined(JS_CODEGEN_ARM64)
+    MOZ_ASSERT(value <= UINT32_MAX);
+#    endif
+#  endif
+  }
+#endif
+
+  static bool int32NeedsBoxing(int32_t value) {
+    return value < MinI31Value || value > MaxI31Value;
+  }
+
+  static bool doubleNeedsBoxing(double value) {
+    int32_t intValue;
+    if (!mozilla::NumberIsInt32(value, &intValue)) {
+      return true;
+    }
+    return int32NeedsBoxing(intValue);
+  }
+
+  static bool valueNeedsBoxing(JS::HandleValue value) {
+    if (value.isObjectOrNull() || value.isString()) {
+      return false;
+    }
+    if (value.isInt32()) {
+      return int32NeedsBoxing(value.toInt32());
+    }
+    if (value.isDouble()) {
+      return doubleNeedsBoxing(value.toDouble());
+    }
+    return true;
+  }
+
+  static JSObject* boxValue(JSContext* cx, JS::HandleValue value);
+
+  bool operator==(const AnyRef& rhs) const {
+    return this->value_ == rhs.value_;
+  }
+  bool operator!=(const AnyRef& rhs) const { return !(*this == rhs); }
+
+  bool isInvalid() const { return *this == AnyRef::invalid(); }
+
+  AnyRefKind kind() const {
+    if (value_ == NullRefValue) {
+      return AnyRefKind::Null;
+    }
+    switch (pointerTag()) {
+      case AnyRefTag::ObjectOrNull: {
+        MOZ_ASSERT(!isInvalid());
+        return AnyRefKind::Object;
+      }
+      case AnyRefTag::String: {
+        return AnyRefKind::String;
+      }
+      case AnyRefTag::I31: {
+        return AnyRefKind::I31;
+      }
+      default: {
+        MOZ_CRASH("unknown AnyRef tag");
+      }
+    }
+  }
+
+  bool isNull() const { return value_ == NullRefValue; }
+  bool isGCThing() const { return !isNull() && !isI31(); }
+  bool isJSObject() const { return kind() == AnyRefKind::Object; }
+  bool isJSString() const { return kind() == AnyRefKind::String; }
+  bool isI31() const { return kind() == AnyRefKind::I31; }
+
+  gc::Cell* toGCThing() const {
+    MOZ_ASSERT(isGCThing());
+    return (gc::Cell*)UntagUintptr(value_);
+  }
+  JSObject& toJSObject() const {
+    MOZ_ASSERT(isJSObject());
+    return *(JSObject*)value_;
+  }
+  JSObject* toJSObjectOrNull() const {
+    MOZ_ASSERT(!isInvalid());
+    MOZ_ASSERT(pointerTag() == AnyRefTag::ObjectOrNull);
+    return (JSObject*)value_;
+  }
+  JSString* toJSString() const {
+    MOZ_ASSERT(isJSString());
+    return (JSString*)UntagUintptr(value_);
+  }
+  int32_t toI31() const {
+    MOZ_ASSERT(isI31());
+#ifdef JS_64BIT
+    debugAssertCanonicalInt32(value_);
+#endif
+    uint32_t truncatedValue;
+    memcpy(&truncatedValue, &value_, sizeof(uint32_t));
+    uint32_t shiftedValue = value_ >> 1;
+    if ((truncatedValue & (1 << 31)) != 0) {
+      shiftedValue |= (1 << 31);
+    }
+    return mozilla::BitwiseCast<int32_t>(shiftedValue);
+  }
+
+  JS::Value toJSValue() const;
+
+  void* forCompiledCode() const { return (void*)value_; }
+
+  uintptr_t rawValue() const { return value_; }
+
+  AnyRef atomicGet() const {
+    return AnyRef(__atomic_load_n(&value_, __ATOMIC_RELAXED));
+  }
+  void atomicSet(const AnyRef& other) {
+    __atomic_store_n(&value_, other.value_, __ATOMIC_RELAXED);
+  }
+
+  static const JSClass* valueBoxClass();
+  static size_t valueBoxOffsetOfValue();
+};
+
+using RootedAnyRef = JS::Rooted<AnyRef>;
+using HandleAnyRef = JS::Handle<AnyRef>;
+using MutableHandleAnyRef = JS::MutableHandle<AnyRef>;
+
+}  
+
+template <class Wrapper>
+class WrappedPtrOperations<wasm::AnyRef, Wrapper> {
+  const wasm::AnyRef& value() const {
+    return static_cast<const Wrapper*>(this)->get();
+  }
+
+ public:
+  bool isNull() const { return value().isNull(); }
+  bool isI31() const { return value().isI31(); }
+  bool isJSObject() const { return value().isJSObject(); }
+  bool isJSString() const { return value().isJSString(); }
+  JS::Value toJSValue() const { return value().toJSValue(); }
+  JSObject& toJSObject() const { return value().toJSObject(); }
+  JSString* toJSString() const { return value().toJSString(); }
+};
+
+template <typename F>
+inline auto MapGCThingTyped(const wasm::AnyRef& val, F&& f) {
+  switch (val.kind()) {
+    case wasm::AnyRefKind::Object:
+      return mozilla::Some(f(&val.toJSObject()));
+    case wasm::AnyRefKind::String:
+      return mozilla::Some(f(val.toJSString()));
+    case wasm::AnyRefKind::I31:
+    case wasm::AnyRefKind::Null: {
+      using ReturnType = decltype(f(static_cast<JSObject*>(nullptr)));
+      return mozilla::Maybe<ReturnType>();
+    }
+  }
+  MOZ_CRASH();
+}
+
+template <typename F>
+bool ApplyGCThingTyped(const wasm::AnyRef& val, F&& f) {
+  return MapGCThingTyped(val,
+                         [&f](auto t) {
+                           f(t);
+                           return true;
+                         })
+      .isSome();
+}
+
+}  
+
+namespace JS {
+
+template <>
+struct GCPolicy<js::wasm::AnyRef> {
+  static void trace(JSTracer* trc, js::wasm::AnyRef* v, const char* name) {
+    TraceRoot(trc, v, name);
+  }
+  static bool isValid(const js::wasm::AnyRef& v) {
+    return !v.isGCThing() || js::gc::IsCellPointerValid(v.toGCThing());
+  }
+};
+
+}  
+
+#endif  // wasm_anyref_h

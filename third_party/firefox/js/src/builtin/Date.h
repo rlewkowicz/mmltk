@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef builtin_Date_h
+#define builtin_Date_h
+
+#include "js/Date.h"
+
+#include "jstypes.h"
+
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+
+class JSLinearString;
+
+namespace js {
+
+class JSOffThreadAtom;
+
+
+extern JSObject* NewDateObjectMsec(JSContext* cx, JS::ClippedTime t,
+                                   JS::HandleObject proto = nullptr);
+
+JS::ClippedTime DateNow(JSContext* cx);
+
+JS::ClippedTime DateParse(JSContext* cx, const JSLinearString* str);
+
+struct ParsedDate final {
+  int64_t date;
+
+  bool isLocalTime;
+};
+
+bool DateParse(const JSOffThreadAtom* str, ParsedDate* result);
+
+JS::ClippedTime LocalTimeToUTC(JSContext* cx, int64_t localTime);
+
+int64_t UTCToLocalTime(JSContext* cx, int64_t utcTime);
+
+bool date_valueOf(JSContext* cx, unsigned argc, JS::Value* vp);
+
+bool date_toPrimitive(JSContext* cx, unsigned argc, JS::Value* vp);
+
+struct YearMonthDay {
+  int32_t year;
+
+  int32_t month;
+
+  int32_t day;
+};
+
+YearMonthDay ToYearMonthDay(int64_t time);
+
+struct HourMinuteSecond {
+  int32_t hour;
+
+  int32_t minute;
+
+  int32_t second;
+};
+
+HourMinuteSecond ToHourMinuteSecond(int64_t epochMilliseconds);
+
+} 
+
+#endif /* builtin_Date_h */

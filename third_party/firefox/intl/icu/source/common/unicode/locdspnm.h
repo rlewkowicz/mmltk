@@ -1,0 +1,83 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+* Copyright (C) 2010-2016, International Business Machines Corporation and
+* others. All Rights Reserved.
+******************************************************************************
+*/
+
+#ifndef LOCDSPNM_H
+#define LOCDSPNM_H
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/locid.h"
+#include "unicode/strenum.h"
+#include "unicode/uscript.h"
+#include "unicode/uldnames.h"
+#include "unicode/udisplaycontext.h"
+
+U_NAMESPACE_BEGIN
+
+class U_COMMON_API LocaleDisplayNames : public UObject {
+public:
+    virtual ~LocaleDisplayNames();
+
+    inline static LocaleDisplayNames* U_EXPORT2 createInstance(const Locale& locale);
+
+    static LocaleDisplayNames* U_EXPORT2 createInstance(const Locale& locale,
+                            UDialectHandling dialectHandling);
+
+    static LocaleDisplayNames* U_EXPORT2 createInstance(const Locale& locale,
+                            UDisplayContext *contexts, int32_t length);
+
+    virtual const Locale& getLocale() const = 0;
+
+    virtual UDialectHandling getDialectHandling() const = 0;
+
+    virtual UDisplayContext getContext(UDisplayContextType type) const = 0;
+
+    virtual UnicodeString& localeDisplayName(const Locale& locale,
+                         UnicodeString& result) const = 0;
+
+    virtual UnicodeString& localeDisplayName(const char* localeId,
+                         UnicodeString& result) const = 0;
+
+    virtual UnicodeString& languageDisplayName(const char* lang,
+                           UnicodeString& result) const = 0;
+
+    virtual UnicodeString& scriptDisplayName(const char* script,
+                         UnicodeString& result) const = 0;
+
+    virtual UnicodeString& scriptDisplayName(UScriptCode scriptCode,
+                         UnicodeString& result) const = 0;
+
+    virtual UnicodeString& regionDisplayName(const char* region,
+                         UnicodeString& result) const = 0;
+
+    virtual UnicodeString& variantDisplayName(const char* variant,
+                          UnicodeString& result) const = 0;
+
+    virtual UnicodeString& keyDisplayName(const char* key,
+                      UnicodeString& result) const = 0;
+
+    virtual UnicodeString& keyValueDisplayName(const char* key, const char* value,
+                           UnicodeString& result) const = 0;
+};
+
+inline LocaleDisplayNames* LocaleDisplayNames::createInstance(const Locale& locale) {
+  return LocaleDisplayNames::createInstance(locale, ULDN_STANDARD_NAMES);
+}
+
+U_NAMESPACE_END
+
+#endif
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif

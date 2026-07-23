@@ -1,0 +1,112 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "StorageNotifierService.h"
+
+#include "StorageUtils.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/dom/StorageEvent.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla::dom {
+
+namespace {
+
+bool gStorageShuttingDown = false;
+
+StaticRefPtr<StorageNotifierService> gStorageNotifierService;
+
+}  
+
+StorageNotifierService* StorageNotifierService::GetOrCreate() {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (!gStorageNotifierService && !gStorageShuttingDown) {
+    gStorageNotifierService = new StorageNotifierService();
+    ClearOnShutdown(&gStorageNotifierService);
+  }
+
+  return gStorageNotifierService;
+}
+
+StorageNotifierService::StorageNotifierService() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!gStorageNotifierService);
+}
+
+StorageNotifierService::~StorageNotifierService() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!gStorageNotifierService);
+  gStorageShuttingDown = true;
+}
+
+void StorageNotifierService::Broadcast(StorageEvent* aEvent,
+                                       const char16_t* aStorageType,
+                                       bool aPrivateBrowsing,
+                                       bool aImmediateDispatch) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  RefPtr<StorageNotifierService> service = gStorageNotifierService;
+  if (!service) {
+    return;
+  }
+
+  RefPtr<StorageEvent> event = aEvent;
+
+  for (const auto& observer : service->mObservers.ForwardRange()) {
+    if (aPrivateBrowsing != observer->IsPrivateBrowsing()) {
+      continue;
+    }
+
+    if (!StorageUtils::PrincipalsEqual(
+            aEvent->GetPrincipal(), observer->GetEffectiveStoragePrincipal())) {
+      continue;
+    }
+
+    const auto pinnedObserver = observer;
+
+    RefPtr<Runnable> r = NS_NewRunnableFunction(
+        "StorageNotifierService::Broadcast",
+        [pinnedObserver, event, aStorageType, aPrivateBrowsing,
+         aImmediateDispatch]() {
+          if (!aImmediateDispatch &&
+              !StorageUtils::PrincipalsEqual(
+                  event->GetPrincipal(),
+                  pinnedObserver->GetEffectiveStoragePrincipal())) {
+            return;
+          }
+
+          pinnedObserver->ObserveStorageNotification(event, aStorageType,
+                                                     aPrivateBrowsing);
+        });
+
+    if (aImmediateDispatch) {
+      r->Run();
+    } else {
+      nsCOMPtr<nsIEventTarget> et = pinnedObserver->GetEventTarget();
+      if (et) {
+        et->Dispatch(r.forget());
+      }
+    }
+  }
+}
+
+void StorageNotifierService::Register(StorageNotificationObserver* aObserver) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aObserver);
+  MOZ_ASSERT(!mObservers.Contains(aObserver));
+
+  mObservers.AppendElement(aObserver);
+}
+
+void StorageNotifierService::Unregister(
+    StorageNotificationObserver* aObserver) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aObserver);
+
+
+  mObservers.RemoveElement(aObserver);
+}
+
+}  

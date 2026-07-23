@@ -1,0 +1,71 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_FUNCTIONDEFINITION)
+#define SKSL_FUNCTIONDEFINITION
+
+#include "src/sksl/SkSLPosition.h"
+#include "src/sksl/ir/SkSLFunctionDeclaration.h"
+#include "src/sksl/ir/SkSLIRNode.h"
+#include "src/sksl/ir/SkSLProgramElement.h"
+#include "src/sksl/ir/SkSLStatement.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+
+namespace SkSL {
+
+class Context;
+
+class FunctionDefinition final : public ProgramElement {
+public:
+    inline static constexpr Kind kIRNodeKind = Kind::kFunction;
+
+    FunctionDefinition(Position pos,
+                       const FunctionDeclaration* declaration,
+                       std::unique_ptr<Statement> body)
+            : INHERITED(pos, kIRNodeKind)
+            , fDeclaration(declaration)
+            , fBody(std::move(body)) {}
+
+    static std::unique_ptr<FunctionDefinition> Convert(const Context& context,
+                                                       Position pos,
+                                                       const FunctionDeclaration& function,
+                                                       std::unique_ptr<Statement> body);
+
+    static std::unique_ptr<FunctionDefinition> Make(const Context& context,
+                                                    Position pos,
+                                                    const FunctionDeclaration& function,
+                                                    std::unique_ptr<Statement> body);
+
+    const FunctionDeclaration& declaration() const {
+        return *fDeclaration;
+    }
+
+    std::unique_ptr<Statement>& body() {
+        return fBody;
+    }
+
+    const std::unique_ptr<Statement>& body() const {
+        return fBody;
+    }
+
+    std::string description() const override {
+        return this->declaration().description() + " " + this->body()->description();
+    }
+
+private:
+    const FunctionDeclaration* fDeclaration;
+    std::unique_ptr<Statement> fBody;
+
+    using INHERITED = ProgramElement;
+};
+
+}  
+
+#endif

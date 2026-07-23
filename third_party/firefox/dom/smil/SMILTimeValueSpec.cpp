@@ -1,0 +1,333 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/SMILTimeValueSpec.h"
+
+#include <limits>
+
+#include "mozilla/EventListenerManager.h"
+#include "mozilla/SMILInstanceTime.h"
+#include "mozilla/SMILInterval.h"
+#include "mozilla/SMILParserUtils.h"
+#include "mozilla/SMILTimeContainer.h"
+#include "mozilla/SMILTimeValue.h"
+#include "mozilla/SMILTimedElement.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/SVGAnimationElement.h"
+#include "mozilla/dom/TimeEvent.h"
+#include "nsString.h"
+
+using namespace mozilla::dom;
+
+namespace mozilla {
+
+
+NS_IMPL_ISUPPORTS(SMILTimeValueSpec::EventListener, nsIDOMEventListener)
+
+NS_IMETHODIMP
+SMILTimeValueSpec::EventListener::HandleEvent(Event* aEvent) {
+  if (mSpec) {
+    mSpec->HandleEvent(aEvent);
+  }
+  return NS_OK;
+}
+
+
+SMILTimeValueSpec::SMILTimeValueSpec(SMILTimedElement& aOwner, bool aIsBegin)
+    : mOwner(&aOwner), mIsBegin(aIsBegin), mReferencedElement(this) {}
+
+SMILTimeValueSpec::~SMILTimeValueSpec() {
+  UnregisterFromReferencedElement(mReferencedElement.get());
+  if (mEventListener) {
+    mEventListener->Disconnect();
+    mEventListener = nullptr;
+  }
+}
+
+nsresult SMILTimeValueSpec::SetSpec(const nsAString& aStringSpec,
+                                    Element& aContextElement) {
+  SMILTimeValueSpecParams params;
+
+  if (!SMILParserUtils::ParseTimeValueSpecParams(aStringSpec, params))
+    return NS_ERROR_FAILURE;
+
+  mParams = std::move(params);
+
+  if (mParams.mType == SMILTimeValueSpecParams::Type::Offset ||
+      (!mIsBegin &&
+       mParams.mType == SMILTimeValueSpecParams::Type::Indefinite)) {
+    mOwner->AddInstanceTime(new SMILInstanceTime(mParams.mOffset), mIsBegin);
+  }
+
+  if (mParams.mType == SMILTimeValueSpecParams::Type::Repeat) {
+    mParams.mEventSymbol = nsGkAtoms::repeatEvent;
+  }
+
+  ResolveReferences(aContextElement);
+
+  return NS_OK;
+}
+
+void SMILTimeValueSpec::ResolveReferences(Element& aContextElement) {
+  if (mParams.mType != SMILTimeValueSpecParams::Type::Syncbase &&
+      !IsEventBased()) {
+    return;
+  }
+
+  if (!aContextElement.IsInComposedDoc()) return;
+
+  RefPtr<Element> oldReferencedElement = mReferencedElement.get();
+
+  if (mParams.mDependentElemID) {
+    mReferencedElement.ResetToID(aContextElement, mParams.mDependentElemID);
+  } else if (mParams.mType == SMILTimeValueSpecParams::Type::Event) {
+    Element* target = mOwner->GetTargetElement();
+    mReferencedElement.ResetWithElement(target);
+  } else {
+    MOZ_ASSERT(false, "Syncbase or repeat spec without ID");
+  }
+  UpdateReferencedElement(oldReferencedElement, mReferencedElement.get());
+}
+
+bool SMILTimeValueSpec::IsEventBased() const {
+  return mParams.mType == SMILTimeValueSpecParams::Type::Event ||
+         mParams.mType == SMILTimeValueSpecParams::Type::Repeat;
+}
+
+void SMILTimeValueSpec::HandleNewInterval(
+    SMILInterval& aInterval, const SMILTimeContainer* aSrcContainer) {
+  const SMILInstanceTime& baseInstance =
+      mParams.mSyncBegin ? *aInterval.Begin() : *aInterval.End();
+  SMILTimeValue newTime =
+      ConvertBetweenTimeContainers(baseInstance.Time(), aSrcContainer);
+
+  if (!ApplyOffset(newTime)) {
+    NS_WARNING("New time overflows SMILTime, ignoring");
+    return;
+  }
+
+  RefPtr<SMILInstanceTime> newInstance = new SMILInstanceTime(
+      newTime, SMILInstanceTime::SMILInstanceTimeSource::Syncbase, this,
+      &aInterval);
+  mOwner->AddInstanceTime(newInstance, mIsBegin);
+}
+
+void SMILTimeValueSpec::HandleTargetElementChange(Element* aNewTarget) {
+  if (!IsEventBased() || mParams.mDependentElemID) return;
+
+  mReferencedElement.ResetWithElement(aNewTarget);
+}
+
+void SMILTimeValueSpec::HandleChangedInstanceTime(
+    const SMILInstanceTime& aBaseTime, const SMILTimeContainer* aSrcContainer,
+    SMILInstanceTime& aInstanceTimeToUpdate, bool aObjectChanged) {
+  if (aInstanceTimeToUpdate.IsFixedTime()) return;
+
+  SMILTimeValue updatedTime =
+      ConvertBetweenTimeContainers(aBaseTime.Time(), aSrcContainer);
+
+  if (!ApplyOffset(updatedTime)) {
+    NS_WARNING("Updated time overflows SMILTime, ignoring");
+    return;
+  }
+
+  if (aInstanceTimeToUpdate.Time() != updatedTime || aObjectChanged) {
+    mOwner->UpdateInstanceTime(&aInstanceTimeToUpdate, updatedTime, mIsBegin);
+  }
+}
+
+void SMILTimeValueSpec::HandleDeletedInstanceTime(
+    SMILInstanceTime& aInstanceTime) {
+  mOwner->RemoveInstanceTime(&aInstanceTime, mIsBegin);
+}
+
+bool SMILTimeValueSpec::DependsOnBegin() const { return mParams.mSyncBegin; }
+
+void SMILTimeValueSpec::Traverse(
+    nsCycleCollectionTraversalCallback* aCallback) {
+  mReferencedElement.Traverse(aCallback);
+}
+
+void SMILTimeValueSpec::Unlink() {
+  UnregisterFromReferencedElement(mReferencedElement.get());
+  mReferencedElement.Unlink();
+}
+
+
+void SMILTimeValueSpec::UpdateReferencedElement(Element* aFrom, Element* aTo) {
+  if (aFrom == aTo) return;
+
+  UnregisterFromReferencedElement(aFrom);
+
+  switch (mParams.mType) {
+    case SMILTimeValueSpecParams::Type::Syncbase: {
+      SMILTimedElement* to = GetTimedElement(aTo);
+      if (to) {
+        to->AddDependent(*this);
+      }
+    } break;
+
+    case SMILTimeValueSpecParams::Type::Event:
+    case SMILTimeValueSpecParams::Type::Repeat:
+      RegisterEventListener(aTo);
+      break;
+
+    default:
+      break;
+  }
+}
+
+void SMILTimeValueSpec::UnregisterFromReferencedElement(Element* aElement) {
+  if (!aElement) return;
+
+  if (mParams.mType == SMILTimeValueSpecParams::Type::Syncbase) {
+    SMILTimedElement* timedElement = GetTimedElement(aElement);
+    if (timedElement) {
+      timedElement->RemoveDependent(*this);
+    }
+    mOwner->RemoveInstanceTimesForCreator(this, mIsBegin);
+  } else if (IsEventBased()) {
+    UnregisterEventListener(aElement);
+  }
+}
+
+SMILTimedElement* SMILTimeValueSpec::GetTimedElement(Element* aElement) {
+  auto* animationElement = SVGAnimationElement::FromNodeOrNull(aElement);
+  return animationElement ? &animationElement->TimedElement() : nullptr;
+}
+
+bool SMILTimeValueSpec::IsEventAllowedWhenScriptingIsDisabled() {
+  if (mParams.mType == SMILTimeValueSpecParams::Type::Repeat) {
+    return true;
+  }
+
+  if (mParams.mType == SMILTimeValueSpecParams::Type::Event &&
+      (mParams.mEventSymbol == nsGkAtoms::repeat ||
+       mParams.mEventSymbol == nsGkAtoms::repeatEvent ||
+       mParams.mEventSymbol == nsGkAtoms::beginEvent ||
+       mParams.mEventSymbol == nsGkAtoms::endEvent)) {
+    return true;
+  }
+
+  return false;
+}
+
+void SMILTimeValueSpec::RegisterEventListener(Element* aTarget) {
+  MOZ_ASSERT(IsEventBased(),
+             "Attempting to register event-listener for unexpected "
+             "SMILTimeValueSpec type");
+  MOZ_ASSERT(mParams.mEventSymbol,
+             "Attempting to register event-listener but there is no event "
+             "name");
+
+  if (!aTarget) return;
+
+  if (!aTarget->GetOwnerDocument()->IsScriptEnabled() &&
+      !IsEventAllowedWhenScriptingIsDisabled()) {
+    return;
+  }
+
+  if (!mEventListener) {
+    mEventListener = new EventListener(this);
+  }
+
+  EventListenerManager* elm = aTarget->GetOrCreateListenerManager();
+  if (!elm) {
+    return;
+  }
+
+  elm->AddEventListenerByType(mEventListener,
+                              nsDependentAtomString(mParams.mEventSymbol),
+                              AllEventsAtSystemGroupBubble());
+}
+
+void SMILTimeValueSpec::UnregisterEventListener(Element* aTarget) {
+  if (!aTarget || !mEventListener) {
+    return;
+  }
+
+  EventListenerManager* elm = aTarget->GetOrCreateListenerManager();
+  if (!elm) {
+    return;
+  }
+
+  elm->RemoveEventListenerByType(mEventListener,
+                                 nsDependentAtomString(mParams.mEventSymbol),
+                                 AllEventsAtSystemGroupBubble());
+}
+
+void SMILTimeValueSpec::HandleEvent(Event* aEvent) {
+  MOZ_ASSERT(mEventListener, "Got event without an event listener");
+  MOZ_ASSERT(IsEventBased(), "Got event for non-event SMILTimeValueSpec");
+  MOZ_ASSERT(aEvent, "No event supplied");
+
+  SMILTimeContainer* container = mOwner->GetTimeContainer();
+  if (!container) return;
+
+  if (mParams.mType == SMILTimeValueSpecParams::Type::Repeat &&
+      !CheckRepeatEventDetail(aEvent)) {
+    return;
+  }
+
+  SMILTime currentTime = container->GetCurrentTimeAsSMILTime();
+  SMILTimeValue newTime(currentTime);
+  if (!ApplyOffset(newTime)) {
+    NS_WARNING("New time generated from event overflows SMILTime, ignoring");
+    return;
+  }
+
+  RefPtr<SMILInstanceTime> newInstance = new SMILInstanceTime(
+      newTime, SMILInstanceTime::SMILInstanceTimeSource::Event);
+  mOwner->AddInstanceTime(newInstance, mIsBegin);
+}
+
+bool SMILTimeValueSpec::CheckRepeatEventDetail(Event* aEvent) {
+  TimeEvent* timeEvent = aEvent->AsTimeEvent();
+  if (!timeEvent) {
+    NS_WARNING("Received a repeat event that was not a DOMTimeEvent");
+    return false;
+  }
+
+  int32_t detail = timeEvent->Detail();
+  return detail > 0 && (uint32_t)detail == mParams.mRepeatIteration;
+}
+
+SMILTimeValue SMILTimeValueSpec::ConvertBetweenTimeContainers(
+    const SMILTimeValue& aSrcTime, const SMILTimeContainer* aSrcContainer) {
+  if (!aSrcTime.IsDefinite()) return aSrcTime;
+
+  const SMILTimeContainer* dstContainer = mOwner->GetTimeContainer();
+  if (dstContainer == aSrcContainer) return aSrcTime;
+
+  if (!aSrcContainer || !dstContainer) return SMILTimeValue();  
+
+  SMILTimeValue docTime =
+      aSrcContainer->ContainerToParentTime(aSrcTime.GetMillis());
+
+  if (docTime.IsIndefinite())
+    return docTime;
+
+  MOZ_ASSERT(docTime.IsDefinite(),
+             "ContainerToParentTime gave us an unresolved or indefinite time");
+
+  return dstContainer->ParentToContainerTime(docTime.GetMillis());
+}
+
+bool SMILTimeValueSpec::ApplyOffset(SMILTimeValue& aTime) const {
+  if (!aTime.IsDefinite()) {
+    return true;
+  }
+
+  double resultAsDouble =
+      (double)aTime.GetMillis() + mParams.mOffset.GetMillis();
+  if (resultAsDouble > double(std::numeric_limits<SMILTime>::max()) ||
+      resultAsDouble < double(std::numeric_limits<SMILTime>::min())) {
+    return false;
+  }
+  aTime.SetMillis(aTime.GetMillis() + mParams.mOffset.GetMillis());
+  return true;
+}
+
+}  

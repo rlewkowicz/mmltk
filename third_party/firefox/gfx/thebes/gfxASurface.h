@@ -1,0 +1,138 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_ASURFACE_H
+#define GFX_ASURFACE_H
+
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/UniquePtr.h"
+
+#include "gfxPoint.h"
+#include "gfxRect.h"
+#include "gfxTypes.h"
+#include "nscore.h"
+#include "nsSize.h"
+#include "mozilla/gfx/Rect.h"
+
+#include "nsStringFwd.h"
+
+class gfxImageSurface;
+
+template <typename T>
+struct already_AddRefed;
+
+class gfxASurface {
+ public:
+#ifdef MOZILLA_INTERNAL_API
+  nsrefcnt AddRef(void);
+  nsrefcnt Release(void);
+#else
+  virtual nsrefcnt AddRef(void);
+  virtual nsrefcnt Release(void);
+#endif
+
+ public:
+  static already_AddRefed<gfxASurface> Wrap(
+      cairo_surface_t* csurf,
+      const mozilla::gfx::IntSize& aSize = mozilla::gfx::IntSize(-1, -1));
+
+  cairo_surface_t* CairoSurface() { return mSurface; }
+
+  gfxSurfaceType GetType() const;
+
+  gfxContentType GetContentType() const;
+
+  void SetDeviceOffset(const gfxPoint& offset);
+  gfxPoint GetDeviceOffset() const;
+
+  void Flush() const;
+  void MarkDirty();
+  void MarkDirty(const gfxRect& r);
+
+  virtual nsresult BeginPrinting(const nsAString& aTitle,
+                                 const nsAString& aPrintToFileName);
+  virtual nsresult EndPrinting();
+  virtual nsresult AbortPrinting();
+  virtual nsresult BeginPage();
+  virtual nsresult EndPage();
+
+  void SetData(const cairo_user_data_key_t* key, void* user_data,
+               thebes_destroy_func_t destroy);
+  void* GetData(const cairo_user_data_key_t* key);
+
+  virtual void Finish();
+
+  virtual already_AddRefed<gfxImageSurface> GetAsImageSurface();
+
+  int CairoStatus();
+
+  static gfxContentType ContentFromFormat(gfxImageFormat format);
+
+  static void RecordMemoryUsedForSurfaceType(gfxSurfaceType aType,
+                                             int32_t aBytes);
+
+  void RecordMemoryUsed(int32_t aBytes);
+  void RecordMemoryFreed();
+
+  virtual int32_t KnownMemoryUsed() { return mBytesRecorded; }
+
+  virtual size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+  virtual size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+  virtual bool SizeOfIsMeasured() const { return false; }
+
+  static int32_t BytePerPixelFromFormat(gfxImageFormat format);
+
+  virtual const mozilla::gfx::IntSize GetSize() const;
+
+  virtual mozilla::gfx::SurfaceFormat GetSurfaceFormat() const;
+
+  void SetOpaqueRect(const gfxRect& aRect);
+
+  const gfxRect& GetOpaqueRect() {
+    if (!!mOpaqueRect) return *mOpaqueRect;
+    return GetEmptyOpaqueRect();
+  }
+
+  static uint8_t BytesPerPixel(gfxImageFormat aImageFormat);
+
+ protected:
+  gfxASurface();
+
+  static gfxASurface* GetSurfaceWrapper(cairo_surface_t* csurf);
+  static void SetSurfaceWrapper(cairo_surface_t* csurf, gfxASurface* asurf);
+
+  void Init(cairo_surface_t* surface, bool existingSurface = false);
+
+  static const gfxRect& GetEmptyOpaqueRect();
+
+  virtual ~gfxASurface();
+
+  cairo_surface_t* mSurface;
+  mozilla::UniquePtr<gfxRect> mOpaqueRect;
+
+ private:
+  static void SurfaceDestroyFunc(void* data);
+
+  int32_t mFloatingRefs;
+  int32_t mBytesRecorded;
+
+ protected:
+  bool mSurfaceValid;
+};
+
+class gfxUnknownSurface : public gfxASurface {
+ public:
+  gfxUnknownSurface(cairo_surface_t* surf, const mozilla::gfx::IntSize& aSize)
+      : mSize(aSize) {
+    Init(surf, true);
+  }
+
+  virtual ~gfxUnknownSurface() = default;
+  const mozilla::gfx::IntSize GetSize() const override { return mSize; }
+
+ private:
+  mozilla::gfx::IntSize mSize;
+};
+
+#endif /* GFX_ASURFACE_H */

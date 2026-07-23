@@ -1,0 +1,74 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __STATIC_UNICODE_SETS_H__
+#define __STATIC_UNICODE_SETS_H__
+
+#include "unicode/uniset.h"
+#include "unicode/unistr.h"
+
+U_NAMESPACE_BEGIN
+namespace unisets {
+
+enum Key {
+    NONE = -1,
+    EMPTY = 0,
+
+    DEFAULT_IGNORABLES,
+    STRICT_IGNORABLES,
+
+    COMMA,
+    PERIOD,
+    STRICT_COMMA,
+    STRICT_PERIOD,
+    APOSTROPHE_SIGN,
+    OTHER_GROUPING_SEPARATORS,
+    ALL_SEPARATORS,
+    STRICT_ALL_SEPARATORS,
+
+    MINUS_SIGN,
+    PLUS_SIGN,
+    PERCENT_SIGN,
+    PERMILLE_SIGN,
+    INFINITY_SIGN,
+    APPROXIMATELY_SIGN,
+
+    DOLLAR_SIGN,
+    POUND_SIGN,
+    RUPEE_SIGN,
+    YEN_SIGN,
+    WON_SIGN,
+
+    DIGITS,
+
+    DIGITS_OR_ALL_SEPARATORS,
+    DIGITS_OR_STRICT_ALL_SEPARATORS,
+
+    UNISETS_KEY_COUNT
+};
+
+U_COMMON_API const UnicodeSet* get(Key key);
+
+U_COMMON_API Key chooseFrom(UnicodeString str, Key key1);
+
+U_COMMON_API Key chooseFrom(UnicodeString str, Key key1, Key key2);
+
+static const struct {
+    Key key;
+    UChar32 exemplar;
+} kCurrencyEntries[] = {
+    {DOLLAR_SIGN, u'$'},
+    {POUND_SIGN, u'£'},
+    {RUPEE_SIGN, u'₹'},
+    {YEN_SIGN, u'¥'},
+    {WON_SIGN, u'₩'},
+};
+
+} 
+U_NAMESPACE_END
+
+#endif //__STATIC_UNICODE_SETS_H__
+#endif /* #if !UCONFIG_NO_FORMATTING */

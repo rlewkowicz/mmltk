@@ -1,0 +1,400 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MEDIASTREAMTRACK_H_
+#define MEDIASTREAMTRACK_H_
+
+#include "PerformanceRecorder.h"
+#include "PrincipalChangeObserver.h"
+#include "PrincipalHandle.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/dom/MediaStreamTrackBinding.h"
+#include "mozilla/dom/MediaTrackCapabilitiesBinding.h"
+#include "mozilla/dom/MediaTrackSettingsBinding.h"
+#include "mozilla/media/MediaUtils.h"
+#include "nsError.h"
+#include "nsID.h"
+#include "nsIPrincipal.h"
+
+namespace mozilla {
+
+class DOMMediaStream;
+class MediaEnginePhotoCallback;
+class MediaInputPort;
+class MediaTrack;
+class MediaTrackGraph;
+class MediaTrackGraphImpl;
+class MediaTrackListener;
+class DirectMediaTrackListener;
+class PeerConnectionImpl;
+class PeerIdentity;
+class ProcessedMediaTrack;
+class RemoteSourceStreamInfo;
+class SourceStreamInfo;
+
+namespace dom {
+
+class AudioStreamTrack;
+class VideoStreamTrack;
+class RTCStatsTimestampMaker;
+enum class CallerType : uint32_t;
+
+class MediaStreamTrackSource : public nsISupports {
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS(MediaStreamTrackSource)
+
+ public:
+  class Sink : public SupportsWeakPtr {
+   public:
+    virtual bool KeepsSourceAlive() const = 0;
+
+    virtual bool Enabled() const = 0;
+
+    virtual void PrincipalChanged() = 0;
+
+    virtual void MutedChanged(bool aNewState) = 0;
+
+    virtual void ConstraintsChanged(
+        const MediaTrackConstraints& aConstraints) = 0;
+
+    virtual void OverrideEnded() = 0;
+
+   protected:
+    virtual ~Sink() = default;
+  };
+
+  MediaStreamTrackSource(nsIPrincipal* aPrincipal, const nsString& aLabel,
+                         TrackingId aTrackingId)
+      : mPrincipal(aPrincipal),
+        mLabel(aLabel),
+        mTrackingId(std::move(aTrackingId)),
+        mStopped(false) {}
+
+  virtual void Destroy() {}
+
+  struct CloneResult {
+    RefPtr<MediaStreamTrackSource> mSource;
+    RefPtr<mozilla::MediaTrack> mInputTrack;
+  };
+
+  virtual CloneResult Clone();
+
+  virtual MediaSourceEnum GetMediaSource() const = 0;
+
+  nsIPrincipal* GetPrincipal() const { return mPrincipal; }
+
+  virtual const PeerIdentity* GetPeerIdentity() const { return nullptr; }
+
+  virtual const RTCStatsTimestampMaker* GetTimestampMaker() const {
+    return nullptr;
+  }
+
+  void GetLabel(nsAString& aLabel) { aLabel.Assign(mLabel); }
+
+  virtual bool HasAlpha() const { return false; }
+
+  virtual nsresult TakePhoto(MediaEnginePhotoCallback*) const {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  virtual void GetSettings(dom::MediaTrackSettings& aResult) = 0;
+
+  virtual void GetCapabilities(dom::MediaTrackCapabilities& aResult) {};
+
+  virtual void Stop() = 0;
+
+  virtual void Disable() = 0;
+
+  virtual void Enable() = 0;
+
+  void SinkEnabledStateChanged() {
+    if (IsEnabled()) {
+      Enable();
+    } else {
+      Disable();
+    }
+  }
+
+  void RegisterSink(Sink* aSink) {
+    MOZ_ASSERT(NS_IsMainThread());
+    if (mStopped) {
+      return;
+    }
+    mSinks.RemoveElementsBy([](const WeakPtr<Sink>& aElem) {
+      MOZ_ASSERT(aElem, "Sink was not explicitly removed");
+      return !aElem;
+    });
+    mSinks.AppendElement(aSink);
+  }
+
+  void UnregisterSink(Sink* aSink) {
+    MOZ_ASSERT(NS_IsMainThread());
+    mSinks.RemoveElementsBy([](const WeakPtr<Sink>& aElem) {
+      MOZ_ASSERT(aElem, "Sink was not explicitly removed");
+      return !aElem;
+    });
+    if (mSinks.RemoveElement(aSink) && !IsActive()) {
+      MOZ_ASSERT(!aSink->KeepsSourceAlive() || !mStopped,
+                 "When the last sink keeping the source alive is removed, "
+                 "we should still be live");
+      Stop();
+      mStopped = true;
+    }
+    if (!mStopped) {
+      SinkEnabledStateChanged();
+    }
+  }
+
+ protected:
+  virtual ~MediaStreamTrackSource() = default;
+
+  bool IsActive() {
+    for (const WeakPtr<Sink>& sink : mSinks) {
+      if (sink && sink->KeepsSourceAlive()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool IsEnabled() {
+    for (const WeakPtr<Sink>& sink : mSinks) {
+      if (sink && sink->KeepsSourceAlive() && sink->Enabled()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void PrincipalChanged() {
+    MOZ_ASSERT(NS_IsMainThread());
+    mSinks.RemoveElementsBy([](const WeakPtr<Sink>& aElem) {
+      MOZ_ASSERT(aElem, "Sink was not explicitly removed");
+      return !aElem;
+    });
+    for (const auto& sink : mSinks.Clone()) {
+      sink->PrincipalChanged();
+    }
+  }
+
+  void MutedChanged(bool aNewState) {
+    MOZ_ASSERT(NS_IsMainThread());
+    mSinks.RemoveElementsBy([](const WeakPtr<Sink>& aElem) {
+      MOZ_ASSERT(aElem, "Sink was not explicitly removed");
+      return !aElem;
+    });
+    for (const auto& sink : mSinks.Clone()) {
+      sink->MutedChanged(aNewState);
+    }
+  }
+
+  void ConstraintsChanged(const MediaTrackConstraints& aConstraints) {
+    MOZ_ASSERT(NS_IsMainThread());
+    mSinks.RemoveElementsBy([](const WeakPtr<Sink>& aElem) {
+      MOZ_ASSERT(aElem, "Sink was not explicitly removed");
+      return !aElem;
+    });
+    for (const auto& sink : mSinks.Clone()) {
+      sink->ConstraintsChanged(aConstraints);
+    }
+  }
+
+  void OverrideEnded() {
+    MOZ_ASSERT(NS_IsMainThread());
+    mSinks.RemoveElementsBy([](const WeakPtr<Sink>& aElem) {
+      MOZ_ASSERT(aElem, "Sink was not explicitly removed");
+      return !aElem;
+    });
+    for (const auto& sink : mSinks.Clone()) {
+      sink->OverrideEnded();
+    }
+  }
+
+  RefPtr<nsIPrincipal> mPrincipal;
+
+  nsTArray<WeakPtr<Sink>> mSinks;
+
+ public:
+  const nsString mLabel;
+
+  const TrackingId mTrackingId;
+
+ protected:
+  bool mStopped;
+};
+
+class MediaStreamTrackConsumer : public SupportsWeakPtr {
+ public:
+  virtual void NotifyEnded(MediaStreamTrack* aTrack) {};
+
+  virtual void NotifyEnabledChanged(MediaStreamTrack* aTrack, bool aEnabled) {};
+};
+
+// clang-format off
+// clang-format on
+class MediaStreamTrack : public DOMEventTargetHelper, public SupportsWeakPtr {
+  friend class mozilla::PeerConnectionImpl;
+  friend class mozilla::SourceStreamInfo;
+  friend class mozilla::RemoteSourceStreamInfo;
+
+  class MTGListener;
+  class TrackSink;
+
+ public:
+  MediaStreamTrack(
+      nsPIDOMWindowInner* aWindow, mozilla::MediaTrack* aInputTrack,
+      MediaStreamTrackSource* aSource,
+      MediaStreamTrackState aReadyState = MediaStreamTrackState::Live,
+      bool aMuted = false,
+      const MediaTrackConstraints& aConstraints = MediaTrackConstraints());
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(MediaStreamTrack,
+                                           DOMEventTargetHelper)
+
+  nsPIDOMWindowInner* GetParentObject() const { return mWindow; }
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  virtual AudioStreamTrack* AsAudioStreamTrack() { return nullptr; }
+  virtual VideoStreamTrack* AsVideoStreamTrack() { return nullptr; }
+
+  virtual const AudioStreamTrack* AsAudioStreamTrack() const { return nullptr; }
+  virtual const VideoStreamTrack* AsVideoStreamTrack() const { return nullptr; }
+
+  virtual void GetKind(nsAString& aKind) = 0;
+  void GetId(nsAString& aID) const;
+  virtual void GetLabel(nsAString& aLabel, CallerType ) {
+    GetSource().GetLabel(aLabel);
+  }
+  bool Enabled() const { return mEnabled; }
+  void SetEnabled(bool aEnabled);
+  bool Muted() { return mMuted; }
+  void Stop();
+  void GetCapabilities(MediaTrackCapabilities& aResult, CallerType aCallerType);
+  void GetConstraints(dom::MediaTrackConstraints& aResult);
+  void GetSettings(dom::MediaTrackSettings& aResult, CallerType aCallerType);
+
+  virtual already_AddRefed<MediaStreamTrack> Clone() = 0;
+  MediaStreamTrackState ReadyState() { return mReadyState; }
+
+  IMPL_EVENT_HANDLER(mute)
+  IMPL_EVENT_HANDLER(unmute)
+  IMPL_EVENT_HANDLER(ended)
+
+  bool Ended() const { return mReadyState == MediaStreamTrackState::Ended; }
+
+  nsIPrincipal* GetPrincipal() const { return mPrincipal; }
+
+  const PeerIdentity* GetPeerIdentity() const {
+    return GetSource().GetPeerIdentity();
+  }
+
+  const RTCStatsTimestampMaker* GetTimestampMaker() const {
+    return GetSource().GetTimestampMaker();
+  }
+
+  ProcessedMediaTrack* GetTrack() const;
+  MediaTrackGraph* Graph() const;
+  MediaTrackGraphImpl* GraphImpl() const;
+
+  MediaStreamTrackSource& GetSource() const {
+    MOZ_RELEASE_ASSERT(mSource,
+                       "The track source is only removed on destruction");
+    return *mSource;
+  }
+
+  void AssignId(const nsAString& aID) { mID = aID; }
+
+  bool AddPrincipalChangeObserver(
+      PrincipalChangeObserver<MediaStreamTrack>* aObserver);
+
+  bool RemovePrincipalChangeObserver(
+      PrincipalChangeObserver<MediaStreamTrack>* aObserver);
+
+  void AddConsumer(MediaStreamTrackConsumer* aConsumer);
+
+  void RemoveConsumer(MediaStreamTrackConsumer* aConsumer);
+
+  virtual void AddListener(MediaTrackListener* aListener);
+
+  void RemoveListener(MediaTrackListener* aListener);
+
+  virtual void AddDirectListener(DirectMediaTrackListener* aListener);
+  void RemoveDirectListener(DirectMediaTrackListener* aListener);
+
+  already_AddRefed<MediaInputPort> ForwardTrackContentsTo(
+      ProcessedMediaTrack* aTrack);
+
+ protected:
+  virtual ~MediaStreamTrack();
+
+  virtual void SetReadyState(MediaStreamTrackState aState);
+
+  void OverrideEnded();
+
+  void NotifyPrincipalHandleChanged(const PrincipalHandle& aNewPrincipalHandle);
+
+  void NotifyEnded();
+
+  void NotifyEnabledChanged();
+
+  void PrincipalChanged();
+
+  void MutedChanged(bool aNewState);
+
+  void ConstraintsChanged(const MediaTrackConstraints& aConstraints);
+
+  void SetMuted(bool aMuted) { mMuted = aMuted; }
+
+  virtual void Destroy();
+
+  void SetPrincipal(nsIPrincipal* aPrincipal);
+
+
+  template <typename TrackType>
+  already_AddRefed<MediaStreamTrack> CloneInternal() {
+    auto cloneRes = mSource->Clone();
+    MOZ_ASSERT(!!cloneRes.mSource == !!cloneRes.mInputTrack);
+    if (!cloneRes.mSource || !cloneRes.mInputTrack) {
+      cloneRes.mSource = mSource;
+      cloneRes.mInputTrack = mInputTrack;
+    }
+    auto newTrack =
+        MakeRefPtr<TrackType>(mWindow, cloneRes.mInputTrack, cloneRes.mSource,
+                              ReadyState(), Muted(), mConstraints);
+    newTrack->SetEnabled(Enabled());
+    newTrack->SetMuted(Muted());
+    return newTrack.forget();
+  }
+
+  nsTArray<PrincipalChangeObserver<MediaStreamTrack>*>
+      mPrincipalChangeObservers;
+
+  nsTArray<WeakPtr<MediaStreamTrackConsumer>> mConsumers;
+
+  nsCOMPtr<nsPIDOMWindowInner> mWindow;
+
+  const RefPtr<mozilla::MediaTrack> mInputTrack;
+  RefPtr<ProcessedMediaTrack> mTrack;
+  RefPtr<MediaInputPort> mPort;
+  RefPtr<MediaStreamTrackSource> mSource;
+  const UniquePtr<TrackSink> mSink;
+  nsCOMPtr<nsIPrincipal> mPrincipal;
+  nsCOMPtr<nsIPrincipal> mPendingPrincipal;
+  RefPtr<MTGListener> mMTGListener;
+  nsTArray<RefPtr<MediaTrackListener>> mTrackListeners;
+  nsTArray<RefPtr<DirectMediaTrackListener>> mDirectTrackListeners;
+  nsString mID;
+  MediaStreamTrackState mReadyState;
+  bool mEnabled;
+  bool mMuted;
+  dom::MediaTrackConstraints mConstraints;
+};
+
+}  
+}  
+
+#endif /* MEDIASTREAMTRACK_H_ */

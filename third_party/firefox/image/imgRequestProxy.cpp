@@ -1,0 +1,1099 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "imgRequestProxy.h"
+
+#include <utility>
+
+#include "Image.h"
+#include "ImageLogging.h"
+#include "ImageOps.h"
+#include "ImageTypes.h"
+#include "imgINotificationObserver.h"
+#include "imgLoader.h"
+#include "mozilla/dom/DocGroup.h"  // for DocGroup
+#include "mozilla/dom/Document.h"
+#include "nsCRTGlue.h"
+#include "nsError.h"
+
+using namespace mozilla;
+using namespace mozilla::image;
+
+class ProxyBehaviour {
+ public:
+  virtual ~ProxyBehaviour() = default;
+
+  virtual already_AddRefed<mozilla::image::Image> GetImage() const = 0;
+  virtual bool HasImage() const = 0;
+  virtual already_AddRefed<ProgressTracker> GetProgressTracker() const = 0;
+  virtual imgRequest* GetOwner() const = 0;
+  virtual void SetOwner(imgRequest* aOwner) = 0;
+};
+
+class RequestBehaviour : public ProxyBehaviour {
+ public:
+  RequestBehaviour() : mOwner(nullptr), mOwnerHasImage(false) {}
+
+  already_AddRefed<mozilla::image::Image> GetImage() const override;
+  bool HasImage() const override;
+  already_AddRefed<ProgressTracker> GetProgressTracker() const override;
+
+  imgRequest* GetOwner() const override { return mOwner; }
+
+  void SetOwner(imgRequest* aOwner) override {
+    mOwner = aOwner;
+
+    if (mOwner) {
+      RefPtr<ProgressTracker> ownerProgressTracker = GetProgressTracker();
+      mOwnerHasImage = ownerProgressTracker && ownerProgressTracker->HasImage();
+    } else {
+      mOwnerHasImage = false;
+    }
+  }
+
+ private:
+  RefPtr<imgRequest> mOwner;
+
+  bool mOwnerHasImage;
+};
+
+already_AddRefed<mozilla::image::Image> RequestBehaviour::GetImage() const {
+  if (!mOwnerHasImage) {
+    return nullptr;
+  }
+  RefPtr<ProgressTracker> progressTracker = GetProgressTracker();
+  return progressTracker->GetImage();
+}
+
+already_AddRefed<ProgressTracker> RequestBehaviour::GetProgressTracker() const {
+  return mOwner->GetProgressTracker();
+}
+
+NS_IMPL_ADDREF(imgRequestProxy)
+NS_IMPL_RELEASE(imgRequestProxy)
+
+NS_INTERFACE_MAP_BEGIN(imgRequestProxy)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, PreloaderBase)
+  NS_INTERFACE_MAP_ENTRY(imgIRequest)
+  NS_INTERFACE_MAP_ENTRY(nsIRequest)
+  NS_INTERFACE_MAP_ENTRY(nsISupportsPriority)
+  NS_INTERFACE_MAP_ENTRY_CONCRETE(imgRequestProxy)
+  NS_INTERFACE_MAP_ENTRY_CONDITIONAL(nsITimedChannel, TimedChannel() != nullptr)
+NS_INTERFACE_MAP_END
+
+imgRequestProxy::imgRequestProxy()
+    : mBehaviour(new RequestBehaviour),
+      mURI(nullptr),
+      mListener(nullptr),
+      mLoadFlags(nsIRequest::LOAD_NORMAL),
+      mLockCount(0),
+      mAnimationConsumers(0),
+      mCancelable(true),
+      mCanceled(false),
+      mIsInLoadGroup(false),
+      mForceDispatchLoadGroup(false),
+      mListenerIsStrongRef(false),
+      mDecodeRequested(false),
+      mPendingNotify(false),
+      mValidating(false) {
+  LOG_FUNC(gImgLog, "imgRequestProxy::imgRequestProxy");
+}
+
+imgRequestProxy::~imgRequestProxy() {
+  MOZ_ASSERT(!mListener, "Someone forgot to properly cancel this request!");
+  MOZ_RELEASE_ASSERT(!mLockCount, "Someone forgot to unlock on time?");
+
+  ClearAnimationConsumers();
+
+  NullOutListener();
+
+  mCanceled = true;
+  RemoveFromOwner(NS_OK);
+
+  RemoveFromLoadGroup();
+  LOG_FUNC(gImgLog, "imgRequestProxy::~imgRequestProxy");
+}
+
+nsresult imgRequestProxy::Init(imgRequest* aOwner, nsILoadGroup* aLoadGroup,
+                               nsIURI* aURI,
+                               imgINotificationObserver* aObserver) {
+  MOZ_ASSERT(!GetOwner() && !mListener,
+             "imgRequestProxy is already initialized");
+
+  LOG_SCOPE_WITH_PARAM(gImgLog, "imgRequestProxy::Init", "request", aOwner);
+
+  MOZ_ASSERT(mAnimationConsumers == 0, "Cannot have animation before Init");
+
+  mBehaviour->SetOwner(aOwner);
+  mListener = aObserver;
+  if (mListener) {
+    mListenerIsStrongRef = true;
+    NS_ADDREF(mListener);
+  }
+  mLoadGroup = aLoadGroup;
+  mURI = aURI;
+
+  AddToOwner();
+
+  return NS_OK;
+}
+
+nsresult imgRequestProxy::ChangeOwner(imgRequest* aNewOwner) {
+  MOZ_ASSERT(GetOwner(), "Cannot ChangeOwner on a proxy without an owner!");
+
+  if (mCanceled) {
+    SyncNotifyListener();
+  }
+
+  uint32_t oldLockCount = mLockCount;
+  while (mLockCount) {
+    UnlockImage();
+  }
+
+  uint32_t oldAnimationConsumers = mAnimationConsumers;
+  ClearAnimationConsumers();
+
+  GetOwner()->RemoveProxy(this, NS_OK);
+
+  mBehaviour->SetOwner(aNewOwner);
+  MOZ_ASSERT(!GetValidator(), "New owner cannot be validating!");
+
+  for (uint32_t i = 0; i < oldLockCount; i++) {
+    LockImage();
+  }
+
+  for (uint32_t i = 0; i < oldAnimationConsumers; i++) {
+    IncrementAnimationConsumers();
+  }
+
+  AddToOwner();
+  return NS_OK;
+}
+
+NS_IMETHODIMP imgRequestProxy::GetTriggeringPrincipal(
+    nsIPrincipal** aTriggeringPrincipal) {
+  MOZ_ASSERT(GetOwner());
+  nsCOMPtr<nsIPrincipal> triggeringPrincipal =
+      GetOwner()->GetTriggeringPrincipal();
+  triggeringPrincipal.forget(aTriggeringPrincipal);
+  return NS_OK;
+}
+
+void imgRequestProxy::MarkValidating() {
+  MOZ_ASSERT(GetValidator());
+  mValidating = true;
+}
+
+void imgRequestProxy::ClearValidating() {
+  MOZ_ASSERT(mValidating);
+  MOZ_ASSERT(!GetValidator());
+  mValidating = false;
+
+  if (mDecodeRequested) {
+    mDecodeRequested = false;
+    StartDecoding(imgIContainer::FLAG_NONE);
+  }
+}
+
+bool imgRequestProxy::HasDecodedPixels() {
+  if (IsValidating()) {
+    return false;
+  }
+
+  RefPtr<Image> image = GetImage();
+  if (image) {
+    return image->HasDecodedPixels();
+  }
+
+  return false;
+}
+
+nsresult imgRequestProxy::DispatchWithTargetIfAvailable(
+    already_AddRefed<nsIRunnable> aEvent) {
+  LOG_FUNC(gImgLog, "imgRequestProxy::DispatchWithTargetIfAvailable");
+  return NS_DispatchToMainThread(
+      CreateRenderBlockingRunnable(std::move(aEvent)));
+}
+
+void imgRequestProxy::AddToOwner() {
+  imgRequest* owner = GetOwner();
+  if (!owner) {
+    return;
+  }
+
+  owner->AddProxy(this);
+}
+
+void imgRequestProxy::RemoveFromOwner(nsresult aStatus) {
+  imgRequest* owner = GetOwner();
+  if (owner) {
+    if (mValidating) {
+      imgCacheValidator* validator = owner->GetValidator();
+      MOZ_ASSERT(validator);
+      validator->RemoveProxy(this);
+      mValidating = false;
+    }
+
+    owner->RemoveProxy(this, aStatus);
+  }
+}
+
+void imgRequestProxy::AddToLoadGroup() {
+  NS_ASSERTION(!mIsInLoadGroup, "Whaa, we're already in the loadgroup!");
+  MOZ_ASSERT(!mForceDispatchLoadGroup);
+
+  if (!mIsInLoadGroup && mLoadGroup) {
+    LOG_FUNC(gImgLog, "imgRequestProxy::AddToLoadGroup");
+    mLoadGroup->AddRequest(this, nullptr);
+    mIsInLoadGroup = true;
+  }
+}
+
+void imgRequestProxy::RemoveFromLoadGroup() {
+  if (!mIsInLoadGroup || !mLoadGroup) {
+    return;
+  }
+
+  if (mForceDispatchLoadGroup) {
+    LOG_FUNC(gImgLog, "imgRequestProxy::RemoveFromLoadGroup -- dispatch");
+
+    mIsInLoadGroup = false;
+    nsCOMPtr<nsILoadGroup> loadGroup = std::move(mLoadGroup);
+    RefPtr<imgRequestProxy> self(this);
+    DispatchWithTargetIfAvailable(NS_NewRunnableFunction(
+        "imgRequestProxy::RemoveFromLoadGroup", [self, loadGroup]() -> void {
+          loadGroup->RemoveRequest(self, nullptr, NS_OK);
+        }));
+    return;
+  }
+
+  LOG_FUNC(gImgLog, "imgRequestProxy::RemoveFromLoadGroup");
+
+  nsCOMPtr<imgIRequest> kungFuDeathGrip(this);
+  mLoadGroup->RemoveRequest(this, nullptr, NS_OK);
+  mLoadGroup = nullptr;
+  mIsInLoadGroup = false;
+}
+
+void imgRequestProxy::MoveToBackgroundInLoadGroup() {
+  if (!mLoadGroup) {
+    return;
+  }
+
+  if (mIsInLoadGroup && mForceDispatchLoadGroup) {
+    LOG_FUNC(gImgLog,
+             "imgRequestProxy::MoveToBackgroundInLoadGroup -- dispatch");
+
+    RefPtr<imgRequestProxy> self(this);
+    DispatchWithTargetIfAvailable(NS_NewRunnableFunction(
+        "imgRequestProxy::MoveToBackgroundInLoadGroup",
+        [self]() -> void { self->MoveToBackgroundInLoadGroup(); }));
+    return;
+  }
+
+  LOG_FUNC(gImgLog, "imgRequestProxy::MoveToBackgroundInLoadGroup");
+  nsCOMPtr<imgIRequest> kungFuDeathGrip(this);
+  if (mIsInLoadGroup) {
+    mLoadGroup->RemoveRequest(this, nullptr, NS_OK);
+  }
+
+  mLoadFlags |= nsIRequest::LOAD_BACKGROUND;
+  mLoadGroup->AddRequest(this, nullptr);
+}
+
+
+NS_IMETHODIMP
+imgRequestProxy::GetName(nsACString& aName) {
+  aName.Truncate();
+
+  if (mURI) {
+    mURI->GetSpec(aName);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::IsPending(bool* _retval) { return NS_ERROR_NOT_IMPLEMENTED; }
+
+NS_IMETHODIMP
+imgRequestProxy::GetStatus(nsresult* aStatus) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP imgRequestProxy::SetCanceledReason(const nsACString& aReason) {
+  return SetCanceledReasonImpl(aReason);
+}
+
+NS_IMETHODIMP imgRequestProxy::GetCanceledReason(nsACString& aReason) {
+  return GetCanceledReasonImpl(aReason);
+}
+
+NS_IMETHODIMP imgRequestProxy::CancelWithReason(nsresult aStatus,
+                                                const nsACString& aReason) {
+  return CancelWithReasonImpl(aStatus, aReason);
+}
+
+void imgRequestProxy::SetCancelable(bool aCancelable) {
+  MOZ_ASSERT(NS_IsMainThread());
+  mCancelable = aCancelable;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::Cancel(nsresult status) {
+  if (mCanceled) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (NS_WARN_IF(!mCancelable)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  LOG_SCOPE(gImgLog, "imgRequestProxy::Cancel");
+
+  mCanceled = true;
+
+  nsCOMPtr<nsIRunnable> ev = new imgCancelRunnable(this, status);
+  return DispatchWithTargetIfAvailable(ev.forget());
+}
+
+void imgRequestProxy::DoCancel(nsresult status) {
+  RemoveFromOwner(status);
+  RemoveFromLoadGroup();
+  NullOutListener();
+}
+
+NS_IMETHODIMP
+imgRequestProxy::CancelAndForgetObserver(nsresult aStatus) {
+  if (mCanceled && !mListener) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (NS_WARN_IF(!mCancelable)) {
+    MOZ_ASSERT(mCancelable,
+               "Shouldn't try to cancel non-cancelable requests via "
+               "CancelAndForgetObserver");
+    return NS_ERROR_FAILURE;
+  }
+
+  LOG_SCOPE(gImgLog, "imgRequestProxy::CancelAndForgetObserver");
+
+  mCanceled = true;
+  mForceDispatchLoadGroup = true;
+  RemoveFromOwner(aStatus);
+  RemoveFromLoadGroup();
+  mForceDispatchLoadGroup = false;
+
+  NullOutListener();
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::StartDecoding(uint32_t aFlags) {
+  if (IsValidating()) {
+    mDecodeRequested = true;
+    return NS_OK;
+  }
+
+  RefPtr<Image> image = GetImage();
+  if (image) {
+    return image->StartDecoding(aFlags);
+  }
+
+  if (GetOwner()) {
+    GetOwner()->StartDecoding();
+  }
+
+  return NS_OK;
+}
+
+bool imgRequestProxy::StartDecodingWithResult(uint32_t aFlags) {
+  if (IsValidating()) {
+    mDecodeRequested = true;
+    return false;
+  }
+
+  RefPtr<Image> image = GetImage();
+  if (image) {
+    return image->StartDecodingWithResult(aFlags);
+  }
+
+  if (GetOwner()) {
+    GetOwner()->StartDecoding();
+  }
+
+  return false;
+}
+
+imgIContainer::DecodeResult imgRequestProxy::RequestDecodeWithResult(
+    uint32_t aFlags) {
+  if (IsValidating()) {
+    mDecodeRequested = true;
+    return imgIContainer::DECODE_REQUESTED;
+  }
+
+  RefPtr<Image> image = GetImage();
+  if (image) {
+    return image->RequestDecodeWithResult(aFlags);
+  }
+
+  if (GetOwner()) {
+    GetOwner()->StartDecoding();
+  }
+
+  return imgIContainer::DECODE_REQUESTED;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetHasAnimationConsumers(bool* aIsLocked) {
+  *aIsLocked = !!mAnimationConsumers;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::LockImage() {
+  mLockCount++;
+  RefPtr<Image> image =
+      GetOwner() && GetOwner()->ImageAvailable() ? GetImage() : nullptr;
+  if (image) {
+    return image->LockImage();
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::UnlockImage() {
+  MOZ_ASSERT(mLockCount > 0, "calling unlock but no locks!");
+
+  mLockCount--;
+  RefPtr<Image> image =
+      GetOwner() && GetOwner()->ImageAvailable() ? GetImage() : nullptr;
+  if (image) {
+    return image->UnlockImage();
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::RequestDiscard() {
+  RefPtr<Image> image = GetImage();
+  if (image) {
+    return image->RequestDiscard();
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::IncrementAnimationConsumers() {
+  mAnimationConsumers++;
+  RefPtr<Image> image =
+      GetOwner() && GetOwner()->ImageAvailable() ? GetImage() : nullptr;
+  if (image) {
+    image->IncrementAnimationConsumers();
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::DecrementAnimationConsumers() {
+  if (mAnimationConsumers > 0) {
+    mAnimationConsumers--;
+    RefPtr<Image> image =
+        GetOwner() && GetOwner()->ImageAvailable() ? GetImage() : nullptr;
+    if (image) {
+      image->DecrementAnimationConsumers();
+    }
+  }
+  return NS_OK;
+}
+
+void imgRequestProxy::ClearAnimationConsumers() {
+  while (mAnimationConsumers > 0) {
+    DecrementAnimationConsumers();
+  }
+}
+
+NS_IMETHODIMP
+imgRequestProxy::Suspend() { return NS_ERROR_NOT_IMPLEMENTED; }
+
+NS_IMETHODIMP
+imgRequestProxy::Resume() { return NS_ERROR_NOT_IMPLEMENTED; }
+
+NS_IMETHODIMP
+imgRequestProxy::GetLoadGroup(nsILoadGroup** loadGroup) {
+  NS_IF_ADDREF(*loadGroup = mLoadGroup.get());
+  return NS_OK;
+}
+NS_IMETHODIMP
+imgRequestProxy::SetLoadGroup(nsILoadGroup* loadGroup) {
+  if (loadGroup != mLoadGroup) {
+    MOZ_ASSERT_UNREACHABLE("Switching load groups is unsupported!");
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetLoadFlags(nsLoadFlags* flags) {
+  *flags = mLoadFlags;
+  return NS_OK;
+}
+NS_IMETHODIMP
+imgRequestProxy::SetLoadFlags(nsLoadFlags flags) {
+  mLoadFlags = flags;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetTRRMode(nsIRequest::TRRMode* aTRRMode) {
+  return GetTRRModeImpl(aTRRMode);
+}
+
+NS_IMETHODIMP
+imgRequestProxy::SetTRRMode(nsIRequest::TRRMode aTRRMode) {
+  return SetTRRModeImpl(aTRRMode);
+}
+
+
+NS_IMETHODIMP
+imgRequestProxy::GetImage(imgIContainer** aImage) {
+  NS_ENSURE_TRUE(aImage, NS_ERROR_NULL_POINTER);
+  RefPtr<Image> image = GetImage();
+  nsCOMPtr<imgIContainer> imageToReturn;
+  if (image) {
+    imageToReturn = image;
+  }
+  if (!imageToReturn && GetOwner()) {
+    imageToReturn = GetOwner()->GetImage();
+  }
+  if (!imageToReturn) {
+    return NS_ERROR_FAILURE;
+  }
+
+  imageToReturn.swap(*aImage);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetProviderId(uint32_t* aId) {
+  NS_ENSURE_TRUE(aId, NS_ERROR_NULL_POINTER);
+
+  nsCOMPtr<imgIContainer> image;
+  nsresult rv = GetImage(getter_AddRefs(image));
+  if (NS_SUCCEEDED(rv)) {
+    *aId = image->GetProviderId();
+  } else {
+    *aId = 0;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetImageStatus(uint32_t* aStatus) {
+  if (IsValidating()) {
+    *aStatus = imgIRequest::STATUS_NONE;
+  } else {
+    RefPtr<ProgressTracker> progressTracker = GetProgressTracker();
+    *aStatus = progressTracker->GetImageStatus();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetImageErrorCode(nsresult* aStatus) {
+  if (!GetOwner()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  *aStatus = GetOwner()->GetImageErrorCode();
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetURI(nsIURI** aURI) {
+  MOZ_ASSERT(NS_IsMainThread(), "Must be on main thread to convert URI");
+  nsCOMPtr<nsIURI> uri = mURI;
+  uri.forget(aURI);
+  return NS_OK;
+}
+
+nsresult imgRequestProxy::GetFinalURI(nsIURI** aURI) {
+  if (!GetOwner()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  return GetOwner()->GetFinalURI(aURI);
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetNotificationObserver(imgINotificationObserver** aObserver) {
+  *aObserver = mListener;
+  NS_IF_ADDREF(*aObserver);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetMimeType(char** aMimeType) {
+  if (!GetOwner()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  const char* type = GetOwner()->GetMimeType();
+  if (!type) {
+    return NS_ERROR_FAILURE;
+  }
+
+  *aMimeType = NS_xstrdup(type);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetFileName(nsACString& aFileName) {
+  if (!GetOwner()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  GetOwner()->GetFileName(aFileName);
+  return NS_OK;
+}
+
+already_AddRefed<imgRequestProxy> imgRequestProxy::NewClonedProxy() {
+  return mozilla::MakeAndAddRef<imgRequestProxy>();
+}
+
+NS_IMETHODIMP
+imgRequestProxy::Clone(imgINotificationObserver* aObserver,
+                       imgIRequest** aClone) {
+  nsresult result;
+  imgRequestProxy* proxy;
+  result = PerformClone(aObserver, nullptr,  true, &proxy);
+  *aClone = proxy;
+  return result;
+}
+
+nsresult imgRequestProxy::SyncClone(imgINotificationObserver* aObserver,
+                                    Document* aLoadingDocument,
+                                    imgRequestProxy** aClone) {
+  return PerformClone(aObserver, aLoadingDocument,
+                       true, aClone);
+}
+
+nsresult imgRequestProxy::Clone(imgINotificationObserver* aObserver,
+                                Document* aLoadingDocument,
+                                imgRequestProxy** aClone) {
+  return PerformClone(aObserver, aLoadingDocument,
+                       false, aClone);
+}
+
+nsresult imgRequestProxy::PerformClone(imgINotificationObserver* aObserver,
+                                       Document* aLoadingDocument,
+                                       bool aSyncNotify,
+                                       imgRequestProxy** aClone) {
+  MOZ_ASSERT(aClone, "Null out param");
+
+  LOG_SCOPE(gImgLog, "imgRequestProxy::Clone");
+
+  *aClone = nullptr;
+  RefPtr<imgRequestProxy> clone = NewClonedProxy();
+
+  nsCOMPtr<nsILoadGroup> loadGroup;
+  if (aLoadingDocument) {
+    loadGroup = aLoadingDocument->GetDocumentLoadGroup();
+  }
+
+  clone->SetLoadFlags(mLoadFlags);
+  nsresult rv = clone->Init(mBehaviour->GetOwner(), loadGroup, mURI, aObserver);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  NS_ADDREF(*aClone = clone);
+
+  imgCacheValidator* validator = GetValidator();
+  if (validator) {
+    clone->MarkValidating();
+    validator->AddProxy(clone);
+  } else {
+    bool addToLoadGroup = mIsInLoadGroup;
+    if (!addToLoadGroup) {
+      RefPtr<ProgressTracker> tracker = clone->GetProgressTracker();
+      addToLoadGroup =
+          tracker && !(tracker->GetProgress() & FLAG_LOAD_COMPLETE);
+    }
+
+    if (addToLoadGroup) {
+      clone->AddToLoadGroup();
+    }
+
+    if (aSyncNotify) {
+      clone->mForceDispatchLoadGroup = true;
+      clone->SyncNotifyListener();
+      clone->mForceDispatchLoadGroup = false;
+    } else {
+      clone->NotifyListener();
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetImagePrincipal(nsIPrincipal** aPrincipal) {
+  if (!GetOwner()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsIPrincipal> principal = GetOwner()->GetPrincipal();
+  principal.forget(aPrincipal);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetHadCrossOriginRedirects(bool* aHadCrossOriginRedirects) {
+  *aHadCrossOriginRedirects =
+      GetOwner() ? GetOwner()->HadCrossOriginRedirects() : false;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetMultipart(bool* aMultipart) {
+  if (!GetOwner()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  *aMultipart = GetOwner()->GetMultipart();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetCORSMode(int32_t* aCorsMode) {
+  if (!GetOwner()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  *aCorsMode = GetOwner()->GetCORSMode();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetReferrerInfo(nsIReferrerInfo** aReferrerInfo) {
+  if (!GetOwner()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsIReferrerInfo> referrerInfo = GetOwner()->GetReferrerInfo();
+  referrerInfo.forget(aReferrerInfo);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::BoostPriority(uint32_t aCategory) {
+  NS_ENSURE_STATE(GetOwner() && !mCanceled);
+  GetOwner()->BoostPriority(aCategory);
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+imgRequestProxy::GetPriority(int32_t* priority) {
+  NS_ENSURE_STATE(GetOwner());
+  *priority = GetOwner()->Priority();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::SetPriority(int32_t priority) {
+  NS_ENSURE_STATE(GetOwner() && !mCanceled);
+  GetOwner()->AdjustPriority(this, priority - GetOwner()->Priority());
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxy::AdjustPriority(int32_t priority) {
+  NS_ENSURE_STATE(GetOwner());
+  GetOwner()->AdjustPriority(this, priority);
+  return NS_OK;
+}
+
+static const char* NotificationTypeToString(int32_t aType) {
+  switch (aType) {
+    case imgINotificationObserver::SIZE_AVAILABLE:
+      return "SIZE_AVAILABLE";
+    case imgINotificationObserver::FRAME_UPDATE:
+      return "FRAME_UPDATE";
+    case imgINotificationObserver::FRAME_COMPLETE:
+      return "FRAME_COMPLETE";
+    case imgINotificationObserver::LOAD_COMPLETE:
+      return "LOAD_COMPLETE";
+    case imgINotificationObserver::DECODE_COMPLETE:
+      return "DECODE_COMPLETE";
+    case imgINotificationObserver::DISCARD:
+      return "DISCARD";
+    case imgINotificationObserver::UNLOCKED_DRAW:
+      return "UNLOCKED_DRAW";
+    case imgINotificationObserver::IS_ANIMATED:
+      return "IS_ANIMATED";
+    case imgINotificationObserver::HAS_TRANSPARENCY:
+      return "HAS_TRANSPARENCY";
+    default:
+      MOZ_ASSERT_UNREACHABLE("Notification list should be exhaustive");
+      return "(unknown notification)";
+  }
+}
+
+void imgRequestProxy::Notify(int32_t aType,
+                             const mozilla::gfx::IntRect* aRect) {
+  MOZ_ASSERT(aType != imgINotificationObserver::LOAD_COMPLETE,
+             "Should call OnLoadComplete");
+
+  LOG_FUNC_WITH_PARAM(gImgLog, "imgRequestProxy::Notify", "type",
+                      NotificationTypeToString(aType));
+
+  if (!mListener || mCanceled) {
+    return;
+  }
+
+  nsCOMPtr<imgINotificationObserver> listener(mListener);
+
+  listener->Notify(this, aType, aRect);
+}
+
+void imgRequestProxy::OnLoadComplete(bool aLastPart) {
+  LOG_FUNC_WITH_PARAM(gImgLog, "imgRequestProxy::OnLoadComplete", "uri", mURI);
+
+  RefPtr<imgRequestProxy> self(this);
+
+  if (mListener && !mCanceled) {
+    nsCOMPtr<imgINotificationObserver> listener(mListener);
+    listener->Notify(this, imgINotificationObserver::LOAD_COMPLETE, nullptr);
+  }
+
+  if (aLastPart || (mLoadFlags & nsIRequest::LOAD_BACKGROUND) == 0) {
+    if (aLastPart) {
+      RemoveFromLoadGroup();
+
+      nsresult errorCode = NS_OK;
+      imgRequest* request = GetOwner();
+      if (!request || !(request->IsDeniedCrossSiteCORSRequest() ||
+                        request->IsCrossSiteNoCORSRequest())) {
+        uint32_t status = imgIRequest::STATUS_NONE;
+        GetImageStatus(&status);
+        if (status & imgIRequest::STATUS_ERROR) {
+          errorCode = NS_ERROR_FAILURE;
+        }
+      }
+      NotifyStop(errorCode);
+    } else {
+      MoveToBackgroundInLoadGroup();
+    }
+  }
+
+  if (mListenerIsStrongRef && aLastPart) {
+    MOZ_ASSERT(mListener, "How did that happen?");
+    imgINotificationObserver* obs = mListener;
+    mListenerIsStrongRef = false;
+    NS_RELEASE(obs);
+  }
+}
+
+void imgRequestProxy::NullOutListener() {
+  if (mListener) {
+    ClearAnimationConsumers();
+  }
+
+  if (mListenerIsStrongRef) {
+    nsCOMPtr<imgINotificationObserver> obs;
+    obs.swap(mListener);
+    mListenerIsStrongRef = false;
+  } else {
+    mListener = nullptr;
+  }
+}
+
+NS_IMETHODIMP
+imgRequestProxy::GetStaticRequest(imgIRequest** aReturn) {
+  RefPtr<imgRequestProxy> proxy =
+      GetStaticRequest(static_cast<Document*>(nullptr));
+  if (proxy != this) {
+    RefPtr<Image> image = GetImage();
+    if (image && image->HasError()) {
+      return NS_ERROR_FAILURE;
+    }
+  }
+  proxy.forget(aReturn);
+  return NS_OK;
+}
+
+already_AddRefed<imgRequestProxy> imgRequestProxy::GetStaticRequest(
+    Document* aLoadingDocument) {
+  MOZ_DIAGNOSTIC_ASSERT(!aLoadingDocument ||
+                        aLoadingDocument->IsStaticDocument());
+  RefPtr<Image> image = GetImage();
+
+  bool animated;
+  if (!image || (NS_SUCCEEDED(image->GetAnimated(&animated)) && !animated)) {
+    return do_AddRef(this);
+  }
+
+  RefPtr<Image> frozenImage = ImageOps::Freeze(image);
+
+  nsCOMPtr<nsIPrincipal> currentPrincipal;
+  GetImagePrincipal(getter_AddRefs(currentPrincipal));
+  bool hadCrossOriginRedirects = true;
+  GetHadCrossOriginRedirects(&hadCrossOriginRedirects);
+  nsCOMPtr<nsIPrincipal> triggeringPrincipal = GetTriggeringPrincipal();
+  auto req = MakeRefPtr<imgRequestProxyStatic>(frozenImage, currentPrincipal,
+                                               triggeringPrincipal,
+                                               hadCrossOriginRedirects);
+  req->Init(nullptr, nullptr, mURI, nullptr);
+
+  return req.forget();
+}
+
+void imgRequestProxy::NotifyListener() {
+
+  RefPtr<ProgressTracker> progressTracker = GetProgressTracker();
+  if (GetOwner()) {
+    progressTracker->Notify(this);
+  } else {
+    MOZ_ASSERT(HasImage(), "if we have no imgRequest, we should have an Image");
+    progressTracker->NotifyCurrentState(this);
+  }
+}
+
+void imgRequestProxy::SyncNotifyListener() {
+
+  RefPtr<ProgressTracker> progressTracker = GetProgressTracker();
+  progressTracker->SyncNotify(this);
+}
+
+void imgRequestProxy::SetHasImage() {
+  RefPtr<ProgressTracker> progressTracker = GetProgressTracker();
+  MOZ_ASSERT(progressTracker);
+  RefPtr<Image> image = progressTracker->GetImage();
+  MOZ_ASSERT(image);
+
+  mBehaviour->SetOwner(mBehaviour->GetOwner());
+
+  for (uint32_t i = 0; i < mLockCount; ++i) {
+    image->LockImage();
+  }
+
+  for (uint32_t i = 0; i < mAnimationConsumers; i++) {
+    image->IncrementAnimationConsumers();
+  }
+}
+
+already_AddRefed<ProgressTracker> imgRequestProxy::GetProgressTracker() const {
+  return mBehaviour->GetProgressTracker();
+}
+
+already_AddRefed<mozilla::image::Image> imgRequestProxy::GetImage() const {
+  return mBehaviour->GetImage();
+}
+
+bool RequestBehaviour::HasImage() const {
+  if (!mOwnerHasImage) {
+    return false;
+  }
+  RefPtr<ProgressTracker> progressTracker = GetProgressTracker();
+  return progressTracker ? progressTracker->HasImage() : false;
+}
+
+bool imgRequestProxy::HasImage() const { return mBehaviour->HasImage(); }
+
+imgRequest* imgRequestProxy::GetOwner() const { return mBehaviour->GetOwner(); }
+
+imgCacheValidator* imgRequestProxy::GetValidator() const {
+  imgRequest* owner = GetOwner();
+  if (!owner) {
+    return nullptr;
+  }
+  return owner->GetValidator();
+}
+
+nsITimedChannel* imgRequestProxy::TimedChannel() {
+  if (!GetOwner()) {
+    return nullptr;
+  }
+  return GetOwner()->GetTimedChannel();
+}
+
+
+class StaticBehaviour : public ProxyBehaviour {
+ public:
+  explicit StaticBehaviour(mozilla::image::Image* aImage) : mImage(aImage) {}
+
+  already_AddRefed<mozilla::image::Image> GetImage() const override {
+    RefPtr<mozilla::image::Image> image = mImage;
+    return image.forget();
+  }
+
+  bool HasImage() const override { return mImage; }
+
+  already_AddRefed<ProgressTracker> GetProgressTracker() const override {
+    return mImage->GetProgressTracker();
+  }
+
+  imgRequest* GetOwner() const override { return nullptr; }
+
+  void SetOwner(imgRequest* aOwner) override {
+    MOZ_ASSERT(!aOwner,
+               "We shouldn't be giving static requests a non-null owner.");
+  }
+
+ private:
+  RefPtr<mozilla::image::Image> mImage;
+};
+
+imgRequestProxyStatic::imgRequestProxyStatic(mozilla::image::Image* aImage,
+                                             nsIPrincipal* aImagePrincipal,
+                                             nsIPrincipal* aTriggeringPrincipal,
+                                             bool aHadCrossOriginRedirects)
+    : mImagePrincipal(aImagePrincipal),
+      mTriggeringPrincipal(aTriggeringPrincipal),
+      mHadCrossOriginRedirects(aHadCrossOriginRedirects) {
+  mBehaviour = mozilla::MakeUnique<StaticBehaviour>(aImage);
+}
+
+NS_IMETHODIMP
+imgRequestProxyStatic::GetImagePrincipal(nsIPrincipal** aPrincipal) {
+  if (!mImagePrincipal) {
+    return NS_ERROR_FAILURE;
+  }
+  NS_ADDREF(*aPrincipal = mImagePrincipal);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxyStatic::GetTriggeringPrincipal(nsIPrincipal** aPrincipal) {
+  NS_IF_ADDREF(*aPrincipal = mTriggeringPrincipal);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+imgRequestProxyStatic::GetHadCrossOriginRedirects(
+    bool* aHadCrossOriginRedirects) {
+  *aHadCrossOriginRedirects = mHadCrossOriginRedirects;
+  return NS_OK;
+}
+
+already_AddRefed<imgRequestProxy> imgRequestProxyStatic::NewClonedProxy() {
+  nsCOMPtr<nsIPrincipal> currentPrincipal;
+  GetImagePrincipal(getter_AddRefs(currentPrincipal));
+  nsCOMPtr<nsIPrincipal> triggeringPrincipal;
+  GetTriggeringPrincipal(getter_AddRefs(triggeringPrincipal));
+  bool hadCrossOriginRedirects = true;
+  GetHadCrossOriginRedirects(&hadCrossOriginRedirects);
+  RefPtr<mozilla::image::Image> image = GetImage();
+  return mozilla::MakeAndAddRef<imgRequestProxyStatic>(
+      image, currentPrincipal, triggeringPrincipal, hadCrossOriginRedirects);
+}

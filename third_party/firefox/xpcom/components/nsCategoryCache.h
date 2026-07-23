@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsCategoryCache_h_
+#define nsCategoryCache_h_
+
+#include "nsIObserver.h"
+
+#include "nsServiceManagerUtils.h"
+
+#include "nsCOMArray.h"
+#include "nsInterfaceHashtable.h"
+
+#include "nsXPCOM.h"
+#include "MainThreadUtils.h"
+
+class nsCategoryObserver final : public nsIObserver {
+  ~nsCategoryObserver();
+
+ public:
+  explicit nsCategoryObserver(const nsACString& aCategory);
+
+  void ListenerDied();
+  void SetListener(void(aCallback)(void*), void* aClosure);
+  nsInterfaceHashtable<nsCStringHashKey, nsISupports>& GetHash() {
+    return mHash;
+  }
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+ private:
+  void RemoveObservers();
+
+  nsInterfaceHashtable<nsCStringHashKey, nsISupports> mHash;
+  nsCString mCategory;
+  void (*mCallback)(void*);
+  void* mClosure;
+  bool mObserversRemoved;
+};
+
+template <class T>
+class nsCategoryCache final {
+ public:
+  explicit nsCategoryCache(const char* aCategory) : mCategoryName(aCategory) {
+    MOZ_ASSERT(NS_IsMainThread());
+  }
+  ~nsCategoryCache() {
+    MOZ_ASSERT(NS_IsMainThread());
+    if (mObserver) {
+      mObserver->ListenerDied();
+    }
+  }
+
+  nsCategoryCache(const nsCategoryCache<T>&) = delete;
+
+  void GetEntries(nsCOMArray<T>& aResult) {
+    MOZ_ASSERT(NS_IsMainThread());
+    LazyInit();
+
+    AddEntries(aResult);
+  }
+
+  const nsCOMArray<T>& GetCachedEntries() {
+    MOZ_ASSERT(NS_IsMainThread());
+    LazyInit();
+
+    if (mCachedEntries.IsEmpty()) {
+      AddEntries(mCachedEntries);
+    }
+    return mCachedEntries;
+  }
+
+ private:
+  void LazyInit() {
+    if (!mObserver) {
+      mObserver = new nsCategoryObserver(mCategoryName);
+      mObserver->SetListener(nsCategoryCache<T>::OnCategoryChanged, this);
+    }
+  }
+
+  void AddEntries(nsCOMArray<T>& aResult) {
+    for (nsISupports* entry : mObserver->GetHash().Values()) {
+      nsCOMPtr<T> service = do_QueryInterface(entry);
+      if (service) {
+        aResult.AppendElement(service.forget());
+      }
+    }
+  }
+
+  static void OnCategoryChanged(void* aClosure) {
+    MOZ_ASSERT(NS_IsMainThread());
+    auto self = static_cast<nsCategoryCache<T>*>(aClosure);
+    self->mCachedEntries.Clear();
+  }
+
+ private:
+  nsCString mCategoryName;
+  RefPtr<nsCategoryObserver> mObserver;
+  nsCOMArray<T> mCachedEntries;
+};
+
+#endif

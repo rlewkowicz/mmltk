@@ -1,0 +1,339 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+"use strict";
+
+function Calendar(options, context) {
+  this.context = context;
+  this.context.DAYS_IN_A_WEEK = 7;
+  this.state = {
+    days: [],
+    weekHeaders: [],
+    setSelection: options.setSelection,
+    setCalendarMonth: options.setCalendarMonth,
+    getDayString: options.getDayString,
+    getWeekHeaderString: options.getWeekHeaderString,
+    focusedDate: null,
+  };
+  this.elements = {
+    weekHeaders: this._generateNodes(
+      this.context.DAYS_IN_A_WEEK,
+      context.weekHeader
+    ),
+    daysView: this._generateNodes(options.calViewSize, context.daysView),
+  };
+
+  this._attachEventListeners();
+}
+
+Calendar.prototype = {
+  setProps(props) {
+    if (props.isVisible) {
+      const days = props.days.map(
+        ({ dateObj, content, classNames, enabled }) => {
+          return {
+            dateObj,
+            textContent: this.state.getDayString(content),
+            className: classNames.join(" "),
+            enabled,
+          };
+        }
+      );
+      const weekHeaders = props.weekHeaders.map(({ content, classNames }) => {
+        return {
+          textContent: this.state.getWeekHeaderString(content),
+          className: classNames.join(" "),
+        };
+      });
+      this._render({
+        elements: this.elements.daysView,
+        items: days,
+        prevState: this.state.days,
+      });
+      this._render({
+        elements: this.elements.weekHeaders,
+        items: weekHeaders,
+        prevState: this.state.weekHeaders,
+      });
+      this.state.days = days;
+      this.state.weekHeaders = weekHeaders;
+      this.focusDay();
+    }
+  },
+
+  _render({ elements, items, prevState }) {
+    let selected = {};
+    let today = {};
+    let sameDay = {};
+    let firstDay = {};
+
+    for (let i = 0, l = items.length; i < l; i++) {
+      let el = elements[i];
+
+      if (!prevState[i] || prevState[i].textContent != items[i].textContent) {
+        el.textContent = items[i].textContent;
+      }
+      if (!prevState[i] || prevState[i].className != items[i].className) {
+        el.className = items[i].className;
+      }
+
+      if (el.tagName === "td") {
+        el.setAttribute("role", "gridcell");
+
+        el.removeAttribute("tabindex");
+        el.removeAttribute("aria-disabled");
+        el.removeAttribute("aria-selected");
+        el.removeAttribute("aria-current");
+
+        if (
+          this.state.focusedDate &&
+          this._isSameDayOfMonth(items[i].dateObj, this.state.focusedDate) &&
+          !el.classList.contains("outside")
+        ) {
+          sameDay.el = el;
+          sameDay.dateObj = items[i].dateObj;
+        }
+        if (el.classList.contains("today")) {
+          el.setAttribute("aria-current", "date");
+          if (!el.classList.contains("outside")) {
+            today.el = el;
+            today.dateObj = items[i].dateObj;
+          }
+        }
+        if (el.classList.contains("selection")) {
+          el.setAttribute("aria-selected", "true");
+
+          if (!el.classList.contains("outside")) {
+            selected.el = el;
+            selected.dateObj = items[i].dateObj;
+          }
+        } else if (el.classList.contains("out-of-range")) {
+          el.setAttribute("aria-disabled", "true");
+          el.removeAttribute("aria-selected");
+        } else {
+          el.setAttribute("aria-selected", "false");
+        }
+        if (el.textContent === "1" && !firstDay.el) {
+          firstDay.dateObj = items[i].dateObj;
+          firstDay.dateObj.setUTCDate("1");
+
+          if (this._isSameDay(items[i].dateObj, firstDay.dateObj)) {
+            firstDay.el = el;
+            firstDay.dateObj = items[i].dateObj;
+          }
+        }
+      }
+    }
+
+    if (sameDay.el) {
+      sameDay.el.setAttribute("tabindex", "0");
+      this.state.focusedDate = new Date(sameDay.dateObj);
+    } else if (selected.el) {
+      selected.el.setAttribute("tabindex", "0");
+      this.state.focusedDate = new Date(selected.dateObj);
+    } else if (today.el) {
+      today.el.setAttribute("tabindex", "0");
+      this.state.focusedDate = new Date(today.dateObj);
+    } else if (firstDay.el) {
+      firstDay.el.setAttribute("tabindex", "0");
+      this.state.focusedDate = new Date(firstDay.dateObj);
+    }
+  },
+
+  _generateNodes(size, context) {
+    let frag = document.createDocumentFragment();
+    let refs = [];
+
+    let rowEl = document.createElement("tr");
+    for (let i = 0; i < size; i++) {
+      let el;
+      if (context.classList.contains("week-header")) {
+        el = document.createElement("th");
+        el.setAttribute("scope", "col");
+        el.setAttribute("role", "columnheader");
+      } else {
+        el = document.createElement("td");
+      }
+
+      el.dataset.id = i;
+      refs.push(el);
+      rowEl.appendChild(el);
+
+      if ((i + 1) % this.context.DAYS_IN_A_WEEK === 0) {
+        frag.appendChild(rowEl);
+        rowEl = document.createElement("tr");
+      }
+    }
+    context.appendChild(frag);
+
+    return refs;
+  },
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "click": {
+        if (this.context.daysView.contains(event.target)) {
+          let targetId = event.target.dataset.id;
+          let targetObj = this.state.days[targetId];
+          if (targetObj.enabled) {
+            this.state.setSelection(targetObj.dateObj);
+          }
+        }
+        break;
+      }
+
+      case "keydown": {
+        if (this.context.daysView.contains(event.target)) {
+          const direction = Services.locale.isAppLocaleRTL ? -1 : 1;
+
+          switch (event.key) {
+            case "Enter":
+            case " ": {
+              let targetId = event.target.dataset.id;
+              let targetObj = this.state.days[targetId];
+              if (targetObj.enabled) {
+                this.state.setSelection(targetObj.dateObj);
+              }
+              break;
+            }
+
+            case "ArrowRight": {
+              this._handleKeydownEvent(1 * direction);
+              break;
+            }
+            case "ArrowLeft": {
+              this._handleKeydownEvent(-1 * direction);
+              break;
+            }
+            case "ArrowUp": {
+              this._handleKeydownEvent(-1 * this.context.DAYS_IN_A_WEEK);
+              break;
+            }
+            case "ArrowDown": {
+              this._handleKeydownEvent(1 * this.context.DAYS_IN_A_WEEK);
+              break;
+            }
+            case "Home": {
+              if (event.ctrlKey) {
+                this.state.focusedDate.setUTCDate(1);
+                this._updateKeyboardFocus();
+              } else {
+                this._handleKeydownEvent(
+                  this.state.focusedDate.getUTCDay() * -1
+                );
+              }
+              break;
+            }
+            case "End": {
+              if (event.ctrlKey) {
+                let lastDateOfMonth = new Date(
+                  this.state.focusedDate.getUTCFullYear(),
+                  this.state.focusedDate.getUTCMonth() + 1,
+                  0
+                );
+                this.state.focusedDate = lastDateOfMonth;
+                this._updateKeyboardFocus();
+              } else {
+                this._handleKeydownEvent(
+                  this.context.DAYS_IN_A_WEEK -
+                    1 -
+                    this.state.focusedDate.getUTCDay()
+                );
+              }
+              break;
+            }
+            case "PageUp": {
+              if (event.shiftKey) {
+                let prevYear = this.state.focusedDate.getUTCFullYear() - 1;
+                this.state.focusedDate.setUTCFullYear(prevYear);
+              } else {
+                let prevMonth = this.state.focusedDate.getUTCMonth() - 1;
+                this.state.focusedDate.setUTCMonth(prevMonth);
+              }
+              this.state.setCalendarMonth(
+                this.state.focusedDate.getUTCFullYear(),
+                this.state.focusedDate.getUTCMonth()
+              );
+              this._updateKeyboardFocus();
+              break;
+            }
+            case "PageDown": {
+              if (event.shiftKey) {
+                let nextYear = this.state.focusedDate.getUTCFullYear() + 1;
+                this.state.focusedDate.setUTCFullYear(nextYear);
+              } else {
+                let nextMonth = this.state.focusedDate.getUTCMonth() + 1;
+                this.state.focusedDate.setUTCMonth(nextMonth);
+              }
+              this.state.setCalendarMonth(
+                this.state.focusedDate.getUTCFullYear(),
+                this.state.focusedDate.getUTCMonth()
+              );
+              this._updateKeyboardFocus();
+              break;
+            }
+          }
+        }
+        break;
+      }
+    }
+  },
+
+  _attachEventListeners() {
+    this.context.daysView.addEventListener("click", this);
+    this.context.daysView.addEventListener("keydown", this);
+  },
+
+  _calculateNextId(nextDate) {
+    for (let i = 0; i < this.state.days.length; i++) {
+      if (this._isSameDay(this.state.days[i].dateObj, nextDate)) {
+        return i;
+      }
+    }
+    return null;
+  },
+
+  _isSameDay(dateObj1, dateObj2) {
+    return (
+      dateObj1.getUTCFullYear() == dateObj2.getUTCFullYear() &&
+      dateObj1.getUTCMonth() == dateObj2.getUTCMonth() &&
+      dateObj1.getUTCDate() == dateObj2.getUTCDate()
+    );
+  },
+
+  _isSameDayOfMonth(dateObj1, dateObj2) {
+    return dateObj1.getUTCDate() == dateObj2.getUTCDate();
+  },
+
+  _handleKeydownEvent(offsetDays) {
+    let newFocusedDay = this.state.focusedDate.getUTCDate() + offsetDays;
+    let newFocusedDate = new Date(this.state.focusedDate);
+    newFocusedDate.setUTCDate(newFocusedDay);
+
+    if (newFocusedDate.getUTCMonth() !== this.state.focusedDate.getUTCMonth()) {
+      this.state.setCalendarMonth(
+        newFocusedDate.getUTCFullYear(),
+        newFocusedDate.getUTCMonth()
+      );
+    }
+    this.state.focusedDate.setUTCDate(newFocusedDate.getUTCDate());
+    this._updateKeyboardFocus();
+  },
+
+  _updateKeyboardFocus() {
+    this._render({
+      elements: this.elements.daysView,
+      items: this.state.days,
+      prevState: this.state.days,
+    });
+    this.focusDay();
+  },
+
+  focusDay() {
+    const focusable = this.context.daysView.querySelector('[tabindex="0"]');
+    if (focusable) {
+      focusable.focus();
+    }
+  },
+};

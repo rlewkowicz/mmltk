@@ -1,0 +1,48 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsASCIIMask_h_
+#define nsASCIIMask_h_
+
+#include <array>
+#include <cstdint>
+
+#include "mozilla/Attributes.h"
+
+typedef std::array<bool, 128> ASCIIMaskArray;
+
+namespace mozilla {
+
+class ASCIIMask {
+ public:
+
+  static const ASCIIMaskArray& MaskCRLF();
+  static const ASCIIMaskArray& Mask0to9();
+  static const ASCIIMaskArray& MaskCRLFTab();
+  static const ASCIIMaskArray& MaskWhitespace();
+
+  static MOZ_ALWAYS_INLINE bool IsMasked(const ASCIIMaskArray& aMask,
+                                         uint32_t aChar) {
+    return aChar < 128 && aMask[aChar];
+  }
+};
+
+
+namespace asciimask_details {
+template <typename F, size_t... Indices>
+constexpr std::array<bool, 128> CreateASCIIMask(
+    F fun, std::index_sequence<Indices...>) {
+  return {{fun(Indices)...}};
+}
+}  
+
+template <typename F>
+constexpr std::array<bool, 128> CreateASCIIMask(F fun) {
+  return asciimask_details::CreateASCIIMask(fun,
+                                            std::make_index_sequence<128>{});
+}
+
+}  
+
+#endif  // nsASCIIMask_h_

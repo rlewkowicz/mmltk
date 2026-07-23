@@ -1,0 +1,1082 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/MediaKeySystemAccess.h"
+
+#include "DecoderDoctorDiagnostics.h"
+#include "DecoderTraits.h"
+#include "MP4Decoder.h"
+#include "MediaContainerType.h"
+#include "WebMDecoder.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/EMEUtils.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/Services.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/KeySystemNames.h"
+#include "mozilla/dom/MediaKeySession.h"
+#include "mozilla/dom/MediaKeySystemAccessBinding.h"
+#include "mozilla/dom/MediaKeySystemAccessManager.h"
+#include "mozilla/dom/MediaSource.h"
+#include "mozilla/dom/PContent.h"
+#include "nsDOMString.h"
+#include "nsIObserverService.h"
+#include "nsMimeTypes.h"
+#include "nsReadableUtils.h"
+#include "nsServiceManagerUtils.h"
+#include "nsUnicharUtils.h"
+
+
+namespace mozilla::dom {
+
+#if defined(MOZ_WMF_CDM)
+#  include "nsIWindowsMediaFoundationCDMOriginsListService.h"
+
+constinit static nsTArray<IPCOriginStatusEntry> sOriginStatusEntries;
+#endif
+
+#define LOG(msg, ...) \
+  EME_LOG("MediaKeySystemAccess::{} " msg, __func__, ##__VA_ARGS__)
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(MediaKeySystemAccess, mParent)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(MediaKeySystemAccess)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(MediaKeySystemAccess)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(MediaKeySystemAccess)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+MediaKeySystemAccess::MediaKeySystemAccess(
+    nsPIDOMWindowInner* aParent, const nsAString& aKeySystem,
+    const MediaKeySystemConfiguration& aConfig)
+    : mParent(aParent), mKeySystem(aKeySystem), mConfig(aConfig) {
+  LOG("Created MediaKeySystemAccess for keysystem={} config={}",
+      NS_ConvertUTF16toUTF8(mKeySystem).get(), ToCString(mConfig).get());
+}
+
+MediaKeySystemAccess::~MediaKeySystemAccess() = default;
+
+JSObject* MediaKeySystemAccess::WrapObject(JSContext* aCx,
+                                           JS::Handle<JSObject*> aGivenProto) {
+  return MediaKeySystemAccess_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+nsPIDOMWindowInner* MediaKeySystemAccess::GetParentObject() const {
+  return mParent;
+}
+
+void MediaKeySystemAccess::GetKeySystem(nsString& aOutKeySystem) const {
+  aOutKeySystem.Assign(mKeySystem);
+}
+
+void MediaKeySystemAccess::GetConfiguration(
+    MediaKeySystemConfiguration& aConfig) {
+  aConfig = mConfig;
+}
+
+already_AddRefed<Promise> MediaKeySystemAccess::CreateMediaKeys(
+    ErrorResult& aRv) {
+  RefPtr<MediaKeys> keys(new MediaKeys(mParent, mKeySystem, mConfig));
+  return keys->Init(aRv);
+}
+
+enum class SecureLevel {
+  Software,
+  Hardware,
+};
+
+static MediaKeySystemStatus EnsureCDMInstalled(const nsAString& aKeySystem,
+                                               const SecureLevel aSecure,
+                                               nsACString& aOutMessage) {
+  if (aSecure == SecureLevel::Software &&
+      !KeySystemConfig::Supports(aKeySystem)) {
+    aOutMessage = "CDM is not installed"_ns;
+    return MediaKeySystemStatus::Cdm_not_installed;
+  }
+
+#if defined(MOZ_WMF_CDM)
+  if (aSecure == SecureLevel::Hardware) {
+    nsAutoString hardwareKeySystem;
+    if (IsWidevineKeySystem(aKeySystem) ||
+        IsWidevineExperimentKeySystemAndSupported(aKeySystem)) {
+      hardwareKeySystem =
+          NS_ConvertUTF8toUTF16(kWidevineExperimentKeySystemName);
+    } else if (IsPlayReadyKeySystemAndSupported(aKeySystem)) {
+      hardwareKeySystem = NS_ConvertUTF8toUTF16(kPlayReadyKeySystemHardware);
+    } else {
+      MOZ_ASSERT_UNREACHABLE("Not supported key system for HWDRM!");
+    }
+    if (!KeySystemConfig::Supports(hardwareKeySystem)) {
+      aOutMessage = "CDM is not installed"_ns;
+      return MediaKeySystemStatus::Cdm_not_installed;
+    }
+  }
+#endif
+
+  return MediaKeySystemStatus::Available;
+}
+
+MediaKeySystemStatus MediaKeySystemAccess::GetKeySystemStatus(
+    const MediaKeySystemAccessRequest& aRequest, nsACString& aOutMessage) {
+  const nsString& keySystem = aRequest.mKeySystem;
+
+  MOZ_ASSERT(StaticPrefs::media_eme_enabled() ||
+             IsClearkeyKeySystem(keySystem));
+
+  LOG("checking if CDM is installed or disabled for {}",
+      NS_ConvertUTF16toUTF8(keySystem).get());
+  if (IsClearkeyKeySystem(keySystem)) {
+    return EnsureCDMInstalled(keySystem, SecureLevel::Software, aOutMessage);
+  }
+
+  bool shouldCheckL1Installation = false;
+#if defined(MOZ_WMF_CDM)
+  if (StaticPrefs::media_eme_widevine_experiment_enabled()) {
+    shouldCheckL1Installation =
+        CheckIfHarewareDRMConfigExists(aRequest.mConfigs) ||
+        IsWidevineExperimentKeySystemAndSupported(keySystem);
+  }
+#endif
+
+  if (IsWidevineKeySystem(keySystem) && !shouldCheckL1Installation) {
+    if (Preferences::GetBool("media.gmp-widevinecdm.visible", false)) {
+      if (!Preferences::GetBool("media.gmp-widevinecdm.enabled", false)) {
+        aOutMessage = "Widevine EME disabled"_ns;
+        return MediaKeySystemStatus::Cdm_disabled;
+      }
+      return EnsureCDMInstalled(keySystem, SecureLevel::Software, aOutMessage);
+    }
+  }
+
+#if defined(MOZ_WMF_CDM)
+  if (IsPlayReadyKeySystemAndSupported(keySystem) &&
+      KeySystemConfig::Supports(keySystem)) {
+    return MediaKeySystemStatus::Available;
+  }
+
+  if ((IsWidevineExperimentKeySystemAndSupported(keySystem) ||
+       IsWidevineKeySystem(keySystem)) &&
+      shouldCheckL1Installation) {
+    if (!Preferences::GetBool("media.gmp-widevinecdm-l1.enabled", false)) {
+      aOutMessage = "Widevine L1 EME disabled"_ns;
+      return MediaKeySystemStatus::Cdm_disabled;
+    }
+    return EnsureCDMInstalled(keySystem, SecureLevel::Hardware, aOutMessage);
+  }
+#endif
+
+  return MediaKeySystemStatus::Cdm_not_supported;
+}
+
+static KeySystemConfig::EMECodecString ToEMEAPICodecString(
+    const nsString& aCodec) {
+  if (IsAACCodecString(aCodec)) {
+    return KeySystemConfig::EME_CODEC_AAC;
+  }
+  if (aCodec.EqualsLiteral("opus")) {
+    return KeySystemConfig::EME_CODEC_OPUS;
+  }
+  if (aCodec.EqualsLiteral("vorbis")) {
+    return KeySystemConfig::EME_CODEC_VORBIS;
+  }
+  if (aCodec.EqualsLiteral("flac")) {
+    return KeySystemConfig::EME_CODEC_FLAC;
+  }
+  if (IsH264CodecString(aCodec)) {
+    return KeySystemConfig::EME_CODEC_H264;
+  }
+  if (IsAV1CodecString(aCodec)) {
+    return KeySystemConfig::EME_CODEC_AV1;
+  }
+  if (IsVP8CodecString(aCodec)) {
+    return KeySystemConfig::EME_CODEC_VP8;
+  }
+  if (IsVP9CodecString(aCodec)) {
+    return KeySystemConfig::EME_CODEC_VP9;
+  }
+  return ""_ns;
+}
+
+#if defined(MOZ_WMF_CDM)
+void MediaKeySystemAccess::UpdateMFCDMOriginEntries(
+    const nsTArray<IPCOriginStatusEntry>& aEntries) {
+  MOZ_ASSERT(NS_IsMainThread());
+  static bool sXPCOMShutdown = false;
+  if (sXPCOMShutdown) {
+    EME_LOG("XPCOM shutdown detected; entry update aborted");
+    return;
+  }
+  sOriginStatusEntries.Clear();
+  sOriginStatusEntries.AppendElements(aEntries);
+  EME_LOG("UpdateMFCDMOriginEntries");
+  for (const auto& entry : sOriginStatusEntries) {
+    EME_LOG("-- Origin: {}, Status: {}\n", entry.origin().get(),
+            entry.status());
+  }
+  RunOnShutdown([&] {
+    sOriginStatusEntries.Clear();
+    sXPCOMShutdown = true;
+  });
+}
+
+static bool IsMFCDMAllowedByOrigin(const Maybe<nsCString>& aOrigin) {
+  enum Filer : uint32_t {
+    eDisable = 0,
+    eAllowedListEnabled = 1,
+    eBlockedListEnabled = 2,
+    eAllowedByDefaultRemoteSettings = 3,
+    eBlockedByDefaultRemoteSettings = 4,
+  };
+  const auto prefValue = StaticPrefs::media_eme_mfcdm_origin_filter_enabled();
+  if (prefValue == Filer::eDisable || !aOrigin ||
+      !IsMediaFoundationCDMPlaybackEnabled()) {
+    return true;
+  }
+
+  if (prefValue == Filer::eAllowedListEnabled) {
+    static nsTArray<nsCString> kAllowedOrigins({
+        "https://www.netflix.com"_ns,
+    });
+    for (const auto& allowedOrigin : kAllowedOrigins) {
+      if (FindInReadable(allowedOrigin, *aOrigin)) {
+        EME_LOG(
+            "MediaKeySystemAccess::IsMFCDMAllowedByOrigin, origin "
+            "({}) is ALLOWED to use MFCDM",
+            aOrigin->get());
+        return true;
+      }
+    }
+    EME_LOG(
+        "MediaKeySystemAccess::IsMFCDMAllowedByOrigin, origin ({}) is "
+        "not allowed to use MFCDM",
+        aOrigin->get());
+    return false;
+  }
+
+  if (prefValue == Filer::eBlockedListEnabled) {
+    static nsTArray<nsCString> kBlockedOrigins({
+        "https://on.orf.at"_ns,
+        "https://www.hulu.com"_ns,
+    });
+    for (const auto& blockedOrigin : kBlockedOrigins) {
+      if (FindInReadable(blockedOrigin, *aOrigin)) {
+        EME_LOG(
+            "MediaKeySystemAccess::IsMFCDMAllowedByOrigin, origin ({}) "
+            "is BLOCKED to use MFCDM",
+            aOrigin->get());
+        return false;
+      }
+    }
+    EME_LOG(
+        "MediaKeySystemAccess::IsMFCDMAllowedByOrigin, origin ({}) "
+        "is allowed to use MFCDM",
+        aOrigin->get());
+    return true;
+  }
+
+  bool isAllowed = prefValue == Filer::eAllowedByDefaultRemoteSettings;
+  bool isFound = false;
+  for (const auto& entry : sOriginStatusEntries) {
+    if (FindInReadable(entry.origin(), *aOrigin)) {
+      isAllowed =
+          entry.status() ==
+          nsIWindowsMediaFoundationCDMOriginsListService::ORIGIN_ALLOWED;
+      isFound = true;
+      break;
+    }
+  }
+  EME_LOG(
+      "MediaKeySystemAccess::IsMFCDMAllowedByOrigin, origin ({}) "
+      "is {} to use MFCDM {}(Remote)",
+      aOrigin->get(), isAllowed ? "ALLOWED" : "BLOCKED",
+      isFound ? "" : "by default ");
+  return isAllowed;
+}
+#endif
+
+static RefPtr<KeySystemConfig::SupportedConfigsPromise>
+GetSupportedKeySystemConfigs(const nsAString& aKeySystem,
+                             bool aIsHardwareDecryption,
+                             bool aIsPrivateBrowsing,
+                             const Maybe<nsCString>& aOrigin) {
+  using DecryptionInfo = KeySystemConfig::DecryptionInfo;
+  nsTArray<KeySystemConfigRequest> requests;
+
+  if (IsWidevineKeySystem(aKeySystem) || IsClearkeyKeySystem(aKeySystem)) {
+    requests.AppendElement(KeySystemConfigRequest{
+        aKeySystem, DecryptionInfo::Software, aIsPrivateBrowsing});
+  }
+#if defined(MOZ_WMF_CDM)
+  if (IsMFCDMAllowedByOrigin(aOrigin)) {
+    if (IsPlayReadyEnabled()) {
+      if (aKeySystem.EqualsLiteral(kPlayReadyKeySystemName) ||
+          aKeySystem.EqualsLiteral(kPlayReadyKeySystemHardware)) {
+        requests.AppendElement(KeySystemConfigRequest{
+            NS_ConvertUTF8toUTF16(kPlayReadyKeySystemName),
+            DecryptionInfo::Software, aIsPrivateBrowsing});
+        if (aIsHardwareDecryption) {
+          requests.AppendElement(KeySystemConfigRequest{
+              NS_ConvertUTF8toUTF16(kPlayReadyKeySystemName),
+              DecryptionInfo::Hardware, aIsPrivateBrowsing});
+          requests.AppendElement(KeySystemConfigRequest{
+              NS_ConvertUTF8toUTF16(kPlayReadyKeySystemHardware),
+              DecryptionInfo::Hardware, aIsPrivateBrowsing});
+        }
+      }
+      if (aKeySystem.EqualsLiteral(kPlayReadyHardwareClearLeadKeySystemName)) {
+        requests.AppendElement(KeySystemConfigRequest{
+            NS_ConvertUTF8toUTF16(kPlayReadyHardwareClearLeadKeySystemName),
+            DecryptionInfo::Hardware, aIsPrivateBrowsing});
+      }
+    }
+
+    if (IsWidevineHardwareDecryptionEnabled()) {
+      if (aKeySystem.EqualsLiteral(kWidevineExperimentKeySystemName) ||
+          (IsWidevineKeySystem(aKeySystem) && aIsHardwareDecryption)) {
+        requests.AppendElement(KeySystemConfigRequest{
+            NS_ConvertUTF8toUTF16(kWidevineExperimentKeySystemName),
+            DecryptionInfo::Hardware, aIsPrivateBrowsing});
+      }
+      if (aKeySystem.EqualsLiteral(kWidevineExperiment2KeySystemName)) {
+        requests.AppendElement(KeySystemConfigRequest{
+            NS_ConvertUTF8toUTF16(kWidevineExperiment2KeySystemName),
+            DecryptionInfo::Hardware, aIsPrivateBrowsing});
+      }
+    }
+  }
+#endif
+  return KeySystemConfig::CreateKeySystemConfigs(requests);
+}
+
+RefPtr<GenericPromise> MediaKeySystemAccess::KeySystemSupportsInitDataType(
+    const nsAString& aKeySystem, const nsAString& aInitDataType,
+    bool aIsHardwareDecryption, bool aIsPrivateBrowsing) {
+  RefPtr<GenericPromise::Private> promise =
+      new GenericPromise::Private(__func__);
+  GetSupportedKeySystemConfigs(aKeySystem, aIsHardwareDecryption,
+                               aIsPrivateBrowsing, Nothing())
+      ->Then(GetMainThreadSerialEventTarget(), __func__,
+             [promise, initDataType = nsString{std::move(aInitDataType)}](
+                 const KeySystemConfig::SupportedConfigsPromise::
+                     ResolveOrRejectValue& aResult) {
+               if (aResult.IsResolve()) {
+                 for (const auto& config : aResult.ResolveValue()) {
+                   if (config.mInitDataTypes.Contains(initDataType)) {
+                     promise->Resolve(true, __func__);
+                     return;
+                   }
+                 }
+               }
+               promise->Reject(NS_ERROR_DOM_MEDIA_CDM_ERR, __func__);
+             });
+  return promise.forget();
+}
+
+enum CodecType { Audio, Video, Invalid };
+
+static bool CanDecryptAndDecode(
+    const nsString& aKeySystem, const nsString& aContentType,
+    CodecType aCodecType,
+    const KeySystemConfig::ContainerSupport& aContainerSupport,
+    const nsTArray<KeySystemConfig::EMECodecString>& aCodecs,
+    const Maybe<CryptoScheme>& aScheme, DecoderDoctorDiagnostics* aDiagnostics,
+    Maybe<bool> aShouldResistFingerprinting) {
+  MOZ_ASSERT(aCodecType != Invalid);
+  for (const KeySystemConfig::EMECodecString& codec : aCodecs) {
+    MOZ_ASSERT(!codec.IsEmpty());
+
+    if (aContainerSupport.DecryptsAndDecodes(codec, aScheme)) {
+      continue;
+    }
+
+    if (aContainerSupport.Decrypts(codec, aScheme)) {
+      IgnoredErrorResult rv;
+      MediaSource::IsTypeSupported(aContentType, aDiagnostics, rv,
+                                   aShouldResistFingerprinting);
+      if (!rv.Failed()) {
+        continue;
+      }
+    }
+
+
+    return false;
+  }
+  return true;
+}
+
+Maybe<CryptoScheme> ConvertEncryptionSchemeStrToScheme(
+    const nsString& aEncryptionScheme) {
+  if (DOMStringIsNull(aEncryptionScheme)) {
+    return Nothing();
+  }
+  auto scheme = StringToCryptoScheme(aEncryptionScheme);
+  return Some(scheme);
+}
+
+static bool ToSessionType(const nsAString& aSessionType,
+                          MediaKeySessionType& aOutType) {
+  Maybe<MediaKeySessionType> type =
+      StringToEnum<MediaKeySessionType>(aSessionType);
+  if (type.isNothing()) {
+    return false;
+  }
+  aOutType = type.value();
+  return true;
+}
+
+static bool IsPersistentSessionType(MediaKeySessionType aSessionType) {
+  return aSessionType == MediaKeySessionType::Persistent_license;
+}
+
+static bool ContainsSessionType(
+    const nsTArray<KeySystemConfig::SessionType>& aTypes,
+    const MediaKeySessionType& aSessionType) {
+  return (aSessionType == MediaKeySessionType::Persistent_license &&
+          aTypes.Contains(KeySystemConfig::SessionType::PersistentLicense)) ||
+         (aSessionType == MediaKeySessionType::Temporary &&
+          aTypes.Contains(KeySystemConfig::SessionType::Temporary));
+}
+
+CodecType GetMajorType(const MediaMIMEType& aMIMEType) {
+  if (aMIMEType.HasAudioMajorType()) {
+    return Audio;
+  }
+  if (aMIMEType.HasVideoMajorType()) {
+    return Video;
+  }
+  return Invalid;
+}
+
+static CodecType GetCodecType(const KeySystemConfig::EMECodecString& aCodec) {
+  if (aCodec.Equals(KeySystemConfig::EME_CODEC_AAC) ||
+      aCodec.Equals(KeySystemConfig::EME_CODEC_OPUS) ||
+      aCodec.Equals(KeySystemConfig::EME_CODEC_VORBIS) ||
+      aCodec.Equals(KeySystemConfig::EME_CODEC_FLAC)) {
+    return Audio;
+  }
+  if (aCodec.Equals(KeySystemConfig::EME_CODEC_H264) ||
+      aCodec.Equals(KeySystemConfig::EME_CODEC_AV1) ||
+      aCodec.Equals(KeySystemConfig::EME_CODEC_VP8) ||
+      aCodec.Equals(KeySystemConfig::EME_CODEC_VP9) ||
+      aCodec.Equals(KeySystemConfig::EME_CODEC_HEVC)) {
+    return Video;
+  }
+  return Invalid;
+}
+
+static bool AllCodecsOfType(
+    const nsTArray<KeySystemConfig::EMECodecString>& aCodecs,
+    const CodecType aCodecType) {
+  for (const KeySystemConfig::EMECodecString& codec : aCodecs) {
+    if (GetCodecType(codec) != aCodecType) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool IsParameterUnrecognized(const nsAString& aContentType) {
+  nsAutoString contentType(aContentType);
+  contentType.StripWhitespace();
+
+  nsTArray<nsString> params;
+  nsAString::const_iterator start, end, semicolon, equalSign;
+  contentType.BeginReading(start);
+  contentType.EndReading(end);
+  semicolon = start;
+  while (semicolon != end) {
+    if (FindCharInReadable(';', semicolon, end)) {
+      equalSign = ++semicolon;
+      if (FindCharInReadable('=', equalSign, end)) {
+        params.AppendElement(Substring(semicolon, equalSign));
+        semicolon = equalSign;
+      }
+    }
+  }
+
+  for (const auto& param : params) {
+    if (!param.LowerCaseEqualsLiteral("codecs") &&
+        !param.LowerCaseEqualsLiteral("profiles")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static Sequence<MediaKeySystemMediaCapability> GetSupportedCapabilities(
+    const CodecType aCodecType,
+    const nsTArray<MediaKeySystemMediaCapability>& aRequestedCapabilities,
+    const MediaKeySystemConfiguration& aPartialConfig,
+    const KeySystemConfig& aKeySystem, DecoderDoctorDiagnostics* aDiagnostics,
+    const Document* aDocument) {
+
+  Sequence<MediaKeySystemMediaCapability> supportedCapabilities;
+
+  for (const MediaKeySystemMediaCapability& capabilities :
+       aRequestedCapabilities) {
+    const nsString& contentTypeString = capabilities.mContentType;
+    const nsString& robustness = capabilities.mRobustness;
+    const nsString encryptionScheme = capabilities.mEncryptionScheme;
+    if (contentTypeString.IsEmpty()) {
+      EME_LOG(
+          "MediaKeySystemConfiguration (label='{}') "
+          "MediaKeySystemMediaCapability('{}','{}','{}') rejected; "
+          "audio or video capability has empty contentType.",
+          NS_ConvertUTF16toUTF8(aPartialConfig.mLabel).get(),
+          NS_ConvertUTF16toUTF8(contentTypeString).get(),
+          NS_ConvertUTF16toUTF8(robustness).get(),
+          NS_ConvertUTF16toUTF8(encryptionScheme).get());
+      return Sequence<MediaKeySystemMediaCapability>();
+    }
+    Maybe<MediaContainerType> maybeContainerType =
+        MakeMediaContainerType(contentTypeString);
+    if (!maybeContainerType) {
+      EME_LOG(
+          "MediaKeySystemConfiguration (label='{}') "
+          "MediaKeySystemMediaCapability('{}','{}','{}') unsupported; "
+          "failed to parse contentTypeString as MIME type.",
+          NS_ConvertUTF16toUTF8(aPartialConfig.mLabel).get(),
+          NS_ConvertUTF16toUTF8(contentTypeString).get(),
+          NS_ConvertUTF16toUTF8(robustness).get(),
+          NS_ConvertUTF16toUTF8(encryptionScheme).get());
+      continue;
+    }
+    const MediaContainerType& containerType = *maybeContainerType;
+    bool invalid = false;
+    nsTArray<KeySystemConfig::EMECodecString> codecs;
+    for (const auto& codecString :
+         containerType.ExtendedType().Codecs().Range()) {
+      KeySystemConfig::EMECodecString emeCodec =
+          ToEMEAPICodecString(nsString(codecString));
+      if (emeCodec.IsEmpty()) {
+        invalid = true;
+        EME_LOG(
+            "MediaKeySystemConfiguration (label='{}') "
+            "MediaKeySystemMediaCapability('{}','{}','{}') unsupported; "
+            "'{}' is an invalid codec string.",
+            NS_ConvertUTF16toUTF8(aPartialConfig.mLabel).get(),
+            NS_ConvertUTF16toUTF8(contentTypeString).get(),
+            NS_ConvertUTF16toUTF8(robustness).get(),
+            NS_ConvertUTF16toUTF8(encryptionScheme).get(),
+            NS_ConvertUTF16toUTF8(codecString).get());
+        break;
+      }
+      codecs.AppendElement(emeCodec);
+    }
+    if (invalid) {
+      continue;
+    }
+
+    const bool supportedInMP4 =
+        MP4Decoder::IsSupportedType(containerType, aDiagnostics);
+    if (supportedInMP4 && !aKeySystem.mMP4.IsSupported()) {
+      EME_LOG(
+          "MediaKeySystemConfiguration (label='{}') "
+          "MediaKeySystemMediaCapability('{}','{}','{}') unsupported; "
+          "MP4 requested but unsupported.",
+          NS_ConvertUTF16toUTF8(aPartialConfig.mLabel).get(),
+          NS_ConvertUTF16toUTF8(contentTypeString).get(),
+          NS_ConvertUTF16toUTF8(robustness).get(),
+          NS_ConvertUTF16toUTF8(encryptionScheme).get());
+      continue;
+    }
+    const bool isWebM = WebMDecoder::IsSupportedType(containerType);
+    if (isWebM && !aKeySystem.mWebM.IsSupported()) {
+      EME_LOG(
+          "MediaKeySystemConfiguration (label='{}') "
+          "MediaKeySystemMediaCapability('{}','{},'{}') unsupported; "
+          "WebM requested but unsupported.",
+          NS_ConvertUTF16toUTF8(aPartialConfig.mLabel).get(),
+          NS_ConvertUTF16toUTF8(contentTypeString).get(),
+          NS_ConvertUTF16toUTF8(robustness).get(),
+          NS_ConvertUTF16toUTF8(encryptionScheme).get());
+      continue;
+    }
+    if (!supportedInMP4 && !isWebM) {
+      EME_LOG(
+          "MediaKeySystemConfiguration (label='{}') "
+          "MediaKeySystemMediaCapability('{}','{}','{}') unsupported; "
+          "Unsupported or unrecognized container requested.",
+          NS_ConvertUTF16toUTF8(aPartialConfig.mLabel).get(),
+          NS_ConvertUTF16toUTF8(contentTypeString).get(),
+          NS_ConvertUTF16toUTF8(robustness).get(),
+          NS_ConvertUTF16toUTF8(encryptionScheme).get());
+      continue;
+    }
+
+    if (IsParameterUnrecognized(contentTypeString)) {
+      continue;
+    }
+
+
+    if (codecs.IsEmpty()) {
+      DeprecationWarningLog(aDocument, "MediaEMENoCodecsDeprecatedWarning");
+      if (supportedInMP4) {
+        if (aCodecType == Audio) {
+          codecs.AppendElement(KeySystemConfig::EME_CODEC_AAC);
+        } else if (aCodecType == Video) {
+          codecs.AppendElement(KeySystemConfig::EME_CODEC_H264);
+        }
+      } else if (isWebM) {
+        if (aCodecType == Audio) {
+          codecs.AppendElement(KeySystemConfig::EME_CODEC_VORBIS);
+        } else if (aCodecType == Video) {
+          codecs.AppendElement(KeySystemConfig::EME_CODEC_VP8);
+        }
+      }
+    }
+
+    const auto majorType = GetMajorType(containerType.Type());
+    if (majorType == Invalid) {
+      EME_LOG(
+          "MediaKeySystemConfiguration (label='{}') "
+          "MediaKeySystemMediaCapability('{}','{}','{}') unsupported; "
+          "MIME type is not an audio or video MIME type.",
+          NS_ConvertUTF16toUTF8(aPartialConfig.mLabel).get(),
+          NS_ConvertUTF16toUTF8(contentTypeString).get(),
+          NS_ConvertUTF16toUTF8(robustness).get(),
+          NS_ConvertUTF16toUTF8(encryptionScheme).get());
+      continue;
+    }
+    if (majorType != aCodecType || !AllCodecsOfType(codecs, aCodecType)) {
+      EME_LOG(
+          "MediaKeySystemConfiguration (label='{}') "
+          "MediaKeySystemMediaCapability('{}','{}','{}') unsupported; "
+          "MIME type mixes audio codecs in video capabilities "
+          "or video codecs in audio capabilities.",
+          NS_ConvertUTF16toUTF8(aPartialConfig.mLabel).get(),
+          NS_ConvertUTF16toUTF8(contentTypeString).get(),
+          NS_ConvertUTF16toUTF8(robustness).get(),
+          NS_ConvertUTF16toUTF8(encryptionScheme).get());
+      continue;
+    }
+    const auto scheme = ConvertEncryptionSchemeStrToScheme(encryptionScheme);
+    if (scheme && *scheme == CryptoScheme::None) {
+      EME_LOG(
+          "MediaKeySystemConfiguration (label='{}') "
+          "MediaKeySystemMediaCapability('{}','{}','{}') unsupported; "
+          "unsupported scheme string.",
+          NS_ConvertUTF16toUTF8(aPartialConfig.mLabel).get(),
+          NS_ConvertUTF16toUTF8(contentTypeString).get(),
+          NS_ConvertUTF16toUTF8(robustness).get(),
+          NS_ConvertUTF16toUTF8(encryptionScheme).get());
+      continue;
+    }
+    if (!robustness.IsEmpty()) {
+      if (majorType == Audio &&
+          !aKeySystem.mAudioRobustness.Contains(robustness)) {
+        EME_LOG(
+            "MediaKeySystemConfiguration (label='{}') "
+            "MediaKeySystemMediaCapability('{}','{}','{}') unsupported; "
+            "unsupported robustness string.",
+            NS_ConvertUTF16toUTF8(aPartialConfig.mLabel).get(),
+            NS_ConvertUTF16toUTF8(contentTypeString).get(),
+            NS_ConvertUTF16toUTF8(robustness).get(),
+            NS_ConvertUTF16toUTF8(encryptionScheme).get());
+        continue;
+      }
+      if (majorType == Video &&
+          !aKeySystem.mVideoRobustness.Contains(robustness)) {
+        EME_LOG(
+            "MediaKeySystemConfiguration (label='{}') "
+            "MediaKeySystemMediaCapability('{}','{}','{}') unsupported; "
+            "unsupported robustness string.",
+            NS_ConvertUTF16toUTF8(aPartialConfig.mLabel).get(),
+            NS_ConvertUTF16toUTF8(contentTypeString).get(),
+            NS_ConvertUTF16toUTF8(robustness).get(),
+            NS_ConvertUTF16toUTF8(encryptionScheme).get());
+        continue;
+      }
+    }
+
+    const auto& containerSupport =
+        supportedInMP4 ? aKeySystem.mMP4 : aKeySystem.mWebM;
+    Maybe<bool> shouldResistFingerprinting =
+        aDocument ? Some(aDocument->ShouldResistFingerprinting(
+                        RFPTarget::MediaCapabilities))
+                  : Nothing();
+    if (!CanDecryptAndDecode(aKeySystem.mKeySystem, contentTypeString,
+                             majorType, containerSupport, codecs, scheme,
+                             aDiagnostics, shouldResistFingerprinting)) {
+      EME_LOG(
+          "MediaKeySystemConfiguration (label='{}') "
+          "MediaKeySystemMediaCapability('{}','{}','{}') unsupported; "
+          "codec unsupported by CDM requested.",
+          NS_ConvertUTF16toUTF8(aPartialConfig.mLabel).get(),
+          NS_ConvertUTF16toUTF8(contentTypeString).get(),
+          NS_ConvertUTF16toUTF8(robustness).get(),
+          NS_ConvertUTF16toUTF8(encryptionScheme).get());
+      continue;
+    }
+
+    if (!supportedCapabilities.AppendElement(capabilities, mozilla::fallible)) {
+      NS_WARNING("GetSupportedCapabilities: Malloc failure");
+      return Sequence<MediaKeySystemMediaCapability>();
+    }
+
+  }
+  return supportedCapabilities;
+}
+
+static bool CheckRequirement(
+    const MediaKeysRequirement aRequirement,
+    const KeySystemConfig::Requirement aKeySystemRequirement,
+    MediaKeysRequirement& aOutRequirement) {
+  MediaKeysRequirement requirement = aRequirement;
+  if (aRequirement == MediaKeysRequirement::Optional &&
+      aKeySystemRequirement == KeySystemConfig::Requirement::NotAllowed) {
+    requirement = MediaKeysRequirement::Not_allowed;
+  }
+
+  switch (requirement) {
+    case MediaKeysRequirement::Required: {
+      if (aKeySystemRequirement == KeySystemConfig::Requirement::NotAllowed) {
+        return false;
+      }
+      break;
+    }
+    case MediaKeysRequirement::Optional: {
+      break;
+    }
+    case MediaKeysRequirement::Not_allowed: {
+      if (aKeySystemRequirement == KeySystemConfig::Requirement::Required) {
+        return false;
+      }
+      break;
+    }
+    default: {
+      return false;
+    }
+  }
+
+  aOutRequirement = requirement;
+
+  return true;
+}
+
+static Sequence<nsString> UnboxSessionTypes(
+    const Optional<Sequence<nsString>>& aSessionTypes) {
+  Sequence<nsString> sessionTypes;
+  if (aSessionTypes.WasPassed()) {
+    sessionTypes = aSessionTypes.Value();
+  } else {
+    (void)sessionTypes.AppendElement(ToString(MediaKeySessionType::Temporary),
+                                     mozilla::fallible);
+  }
+  return sessionTypes;
+}
+
+static bool GetSupportedConfig(const KeySystemConfig& aKeySystem,
+                               const MediaKeySystemConfiguration& aCandidate,
+                               MediaKeySystemConfiguration& aOutConfig,
+                               DecoderDoctorDiagnostics* aDiagnostics,
+                               const Document* aDocument) {
+  EME_LOG("Compare implementation '{}'\n with request '{}'",
+          NS_ConvertUTF16toUTF8(aKeySystem.GetDebugInfo()).get(),
+          MediaKeySystemAccess::ToCString(aCandidate).get());
+  MediaKeySystemConfiguration config;
+  config.mLabel = aCandidate.mLabel;
+  if (!aCandidate.mInitDataTypes.IsEmpty()) {
+    nsTArray<nsString> supportedTypes;
+    for (const nsString& initDataType : aCandidate.mInitDataTypes) {
+      if (aKeySystem.mInitDataTypes.Contains(initDataType)) {
+        supportedTypes.AppendElement(initDataType);
+      }
+    }
+    if (supportedTypes.IsEmpty()) {
+      EME_LOG(
+          "MediaKeySystemConfiguration (label='{}') rejected; "
+          "no supported initDataTypes provided.",
+          NS_ConvertUTF16toUTF8(aCandidate.mLabel).get());
+      return false;
+    }
+    if (!config.mInitDataTypes.Assign(supportedTypes)) {
+      return false;
+    }
+  }
+
+  if (!CheckRequirement(aCandidate.mDistinctiveIdentifier,
+                        aKeySystem.mDistinctiveIdentifier,
+                        config.mDistinctiveIdentifier)) {
+    EME_LOG(
+        "MediaKeySystemConfiguration (label='{}') rejected; "
+        "distinctiveIdentifier requirement not satisfied.",
+        NS_ConvertUTF16toUTF8(aCandidate.mLabel).get());
+    return false;
+  }
+
+  if (!CheckRequirement(aCandidate.mPersistentState,
+                        aKeySystem.mPersistentState, config.mPersistentState)) {
+    EME_LOG(
+        "MediaKeySystemConfiguration (label='{}') rejected; "
+        "persistentState requirement not satisfied.",
+        NS_ConvertUTF16toUTF8(aCandidate.mLabel).get());
+    return false;
+  }
+
+  Sequence<nsString> sessionTypes(UnboxSessionTypes(aCandidate.mSessionTypes));
+  if (sessionTypes.IsEmpty()) {
+    return false;
+  }
+
+  for (const auto& sessionTypeString : sessionTypes) {
+    MediaKeySessionType sessionType;
+    if (!ToSessionType(sessionTypeString, sessionType)) {
+      EME_LOG(
+          "MediaKeySystemConfiguration (label='{}') rejected; "
+          "invalid session type specified.",
+          NS_ConvertUTF16toUTF8(aCandidate.mLabel).get());
+      return false;
+    }
+    if (config.mPersistentState == MediaKeysRequirement::Not_allowed &&
+        IsPersistentSessionType(sessionType)) {
+      EME_LOG(
+          "MediaKeySystemConfiguration (label='{}') rejected; "
+          "persistent session requested but keysystem doesn't"
+          "support persistent state.",
+          NS_ConvertUTF16toUTF8(aCandidate.mLabel).get());
+      return false;
+    }
+    if (!ContainsSessionType(aKeySystem.mSessionTypes, sessionType)) {
+      EME_LOG(
+          "MediaKeySystemConfiguration (label='{}') rejected; "
+          "session type '{}' unsupported by keySystem.",
+          NS_ConvertUTF16toUTF8(aCandidate.mLabel).get(),
+          NS_ConvertUTF16toUTF8(sessionTypeString).get());
+      return false;
+    }
+    if (config.mPersistentState == MediaKeysRequirement::Optional &&
+        IsPersistentSessionType(sessionType)) {
+      config.mPersistentState = MediaKeysRequirement::Required;
+    }
+  }
+  config.mSessionTypes.Construct(std::move(sessionTypes));
+
+  if (aCandidate.mAudioCapabilities.IsEmpty() &&
+      aCandidate.mVideoCapabilities.IsEmpty()) {
+    DeprecationWarningLog(aDocument, "MediaEMENoCapabilitiesDeprecatedWarning");
+  }
+
+  if (!aCandidate.mVideoCapabilities.IsEmpty()) {
+    Sequence<MediaKeySystemMediaCapability> caps =
+        GetSupportedCapabilities(Video, aCandidate.mVideoCapabilities, config,
+                                 aKeySystem, aDiagnostics, aDocument);
+    if (caps.IsEmpty()) {
+      EME_LOG(
+          "MediaKeySystemConfiguration (label='{}') rejected; "
+          "no supported video capabilities.",
+          NS_ConvertUTF16toUTF8(aCandidate.mLabel).get());
+      return false;
+    }
+    config.mVideoCapabilities = std::move(caps);
+  } else {
+  }
+
+  if (!aCandidate.mAudioCapabilities.IsEmpty()) {
+    Sequence<MediaKeySystemMediaCapability> caps =
+        GetSupportedCapabilities(Audio, aCandidate.mAudioCapabilities, config,
+                                 aKeySystem, aDiagnostics, aDocument);
+    if (caps.IsEmpty()) {
+      EME_LOG(
+          "MediaKeySystemConfiguration (label='{}') rejected; "
+          "no supported audio capabilities.",
+          NS_ConvertUTF16toUTF8(aCandidate.mLabel).get());
+      return false;
+    }
+    config.mAudioCapabilities = std::move(caps);
+  } else {
+  }
+
+  if (config.mDistinctiveIdentifier == MediaKeysRequirement::Optional) {
+    if (aKeySystem.mDistinctiveIdentifier ==
+        KeySystemConfig::Requirement::Required) {
+      config.mDistinctiveIdentifier = MediaKeysRequirement::Required;
+    } else {
+      config.mDistinctiveIdentifier = MediaKeysRequirement::Not_allowed;
+    }
+  }
+
+  if (config.mPersistentState == MediaKeysRequirement::Optional) {
+    if (aKeySystem.mPersistentState == KeySystemConfig::Requirement::Required) {
+      config.mPersistentState = MediaKeysRequirement::Required;
+    } else {
+      config.mPersistentState = MediaKeysRequirement::Not_allowed;
+    }
+  }
+
+
+
+  aOutConfig = config;
+
+  return true;
+}
+
+RefPtr<KeySystemConfig::KeySystemConfigPromise>
+MediaKeySystemAccess::GetSupportedConfig(MediaKeySystemAccessRequest* aRequest,
+                                         bool aIsPrivateBrowsing,
+                                         const Document* aDocument) {
+  nsTArray<KeySystemConfig> implementations;
+  const bool containsHardwareDecryptionConfig =
+      CheckIfHarewareDRMConfigExists(aRequest->mConfigs) ||
+      DoesKeySystemSupportHardwareDecryption(aRequest->mKeySystem);
+
+  RefPtr<KeySystemConfig::KeySystemConfigPromise::Private> promise =
+      new KeySystemConfig::KeySystemConfigPromise::Private(__func__);
+  GetSupportedKeySystemConfigs(aRequest->mKeySystem,
+                               containsHardwareDecryptionConfig,
+                               aIsPrivateBrowsing, GetOrigin(aDocument))
+      ->Then(GetMainThreadSerialEventTarget(), __func__,
+             [promise, aRequest, document = RefPtr<const Document>{aDocument}](
+                 const KeySystemConfig::SupportedConfigsPromise::
+                     ResolveOrRejectValue& aResult) {
+               if (aResult.IsResolve()) {
+                 MediaKeySystemConfiguration outConfig;
+                 for (const auto& implementation : aResult.ResolveValue()) {
+                   for (const MediaKeySystemConfiguration& candidate :
+                        aRequest->mConfigs) {
+                     if (mozilla::dom::GetSupportedConfig(
+                             implementation, candidate, outConfig,
+                             &aRequest->mDiagnostics, document)) {
+                       promise->Resolve(std::move(outConfig), __func__);
+                       return;
+                     }
+                   }
+                 }
+               }
+               promise->Reject(false, __func__);
+             });
+  return promise.forget();
+}
+
+void MediaKeySystemAccess::NotifyObservers(nsPIDOMWindowInner* aWindow,
+                                           const nsAString& aKeySystem,
+                                           MediaKeySystemStatus aStatus) {
+  RequestMediaKeySystemAccessNotification data;
+  data.mKeySystem = aKeySystem;
+  data.mStatus = aStatus;
+  nsAutoString json;
+  data.ToJSON(json);
+  EME_LOG("MediaKeySystemAccess::NotifyObservers() {}",
+          NS_ConvertUTF16toUTF8(json).get());
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  if (obs) {
+    obs->NotifyObservers(aWindow, MediaKeys::kMediaKeysRequestTopic,
+                         json.get());
+  }
+}
+
+static nsCString ToCString(const nsString& aString) {
+  nsCString str("\"");
+  str.Append(NS_ConvertUTF16toUTF8(aString));
+  str.AppendLiteral("\"");
+  return str;
+}
+
+static nsCString ToCString(const MediaKeysRequirement aValue) {
+  nsCString str("\"");
+  str.AppendASCII(GetEnumString(aValue));
+  str.AppendLiteral("\"");
+  return str;
+}
+
+static nsCString ToCString(const MediaKeySystemMediaCapability& aValue) {
+  nsCString str;
+  str.AppendLiteral(R"({"contentType":")");
+  nsString escapedContentType(aValue.mContentType);
+  escapedContentType.ReplaceSubstring(u"\"", u"\\\"");
+  str.Append(NS_ConvertUTF16toUTF8(escapedContentType));
+  str.AppendLiteral(R"(", "robustness":)");
+  str.Append(ToCString(aValue.mRobustness));
+  str.AppendLiteral(R"(, "encryptionScheme":)");
+  str.Append(ToCString(aValue.mEncryptionScheme));
+  str.AppendLiteral("}");
+  return str;
+}
+
+template <class Type>
+nsCString ToCString(const Sequence<Type>& aSequence) {
+  nsCString str;
+  str.AppendLiteral("[");
+  StringJoinAppend(str, ","_ns, aSequence,
+                   [](nsACString& dest, const Type& element) {
+                     dest.Append(ToCString(element));
+                   });
+  str.AppendLiteral("]");
+  return str;
+}
+
+template <>
+nsCString ToCString(const Sequence<MediaKeySystemConfiguration>& aSequence) {
+  nsCString str;
+  str.AppendLiteral("[");
+  StringJoinAppend(
+      str, ","_ns, aSequence,
+      [](nsACString& dest, const MediaKeySystemConfiguration& element) {
+        dest.Append(MediaKeySystemAccess::ToCString(element));
+      });
+  str.AppendLiteral("]");
+  return str;
+}
+
+template <class Type>
+nsCString ToCString(const Optional<Sequence<Type>>& aOptional) {
+  nsCString str;
+  if (aOptional.WasPassed()) {
+    str.Append(ToCString(aOptional.Value()));
+  } else {
+    str.AppendLiteral("[]");
+  }
+  return str;
+}
+
+template <>
+nsCString ToCString(
+    const Optional<Sequence<MediaKeySystemConfiguration>>& aOptional) {
+  nsCString str;
+  if (aOptional.WasPassed()) {
+    str.Append(MediaKeySystemAccess::ToCString(aOptional.Value()));
+  } else {
+    str.AppendLiteral("[]");
+  }
+  return str;
+}
+
+nsCString MediaKeySystemAccess::ToCString(
+    const MediaKeySystemConfiguration& aConfig) {
+  nsCString str;
+  str.AppendLiteral(R"({"label":)");
+  str.Append(mozilla::dom::ToCString(aConfig.mLabel));
+
+  str.AppendLiteral(R"(, "initDataTypes":)");
+  str.Append(mozilla::dom::ToCString(aConfig.mInitDataTypes));
+
+  str.AppendLiteral(R"(, "audioCapabilities":)");
+  str.Append(mozilla::dom::ToCString(aConfig.mAudioCapabilities));
+
+  str.AppendLiteral(R"(, "videoCapabilities":)");
+  str.Append(mozilla::dom::ToCString(aConfig.mVideoCapabilities));
+
+  str.AppendLiteral(R"(, "distinctiveIdentifier":)");
+  str.Append(mozilla::dom::ToCString(aConfig.mDistinctiveIdentifier));
+
+  str.AppendLiteral(R"(, "persistentState":)");
+  str.Append(mozilla::dom::ToCString(aConfig.mPersistentState));
+
+  str.AppendLiteral(R"(, "sessionTypes":)");
+  str.Append(mozilla::dom::ToCString(aConfig.mSessionTypes));
+
+  str.AppendLiteral("}");
+
+  return str;
+}
+
+nsCString MediaKeySystemAccess::ToCString(
+    const Sequence<MediaKeySystemConfiguration>& aConfig) {
+  return mozilla::dom::ToCString(aConfig);
+}
+
+#undef LOG
+
+}  

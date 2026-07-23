@@ -1,0 +1,39 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkDiscardableMemory_DEFINED)
+#define SkDiscardableMemory_DEFINED
+
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkTypes.h"
+
+class SK_SPI SkDiscardableMemory {
+public:
+    static SkDiscardableMemory* Create(size_t bytes);
+
+    class Factory : public SkRefCnt {
+    public:
+        virtual SkDiscardableMemory* create(size_t bytes) = 0;
+    private:
+        using INHERITED = SkRefCnt;
+    };
+
+    virtual ~SkDiscardableMemory() {}
+
+    [[nodiscard]] virtual bool lock() = 0;
+
+    virtual void* data() = 0;
+
+    virtual void unlock() = 0;
+
+protected:
+    SkDiscardableMemory() = default;
+    SkDiscardableMemory(const SkDiscardableMemory&) = delete;
+    SkDiscardableMemory& operator=(const SkDiscardableMemory&) = delete;
+};
+
+#endif

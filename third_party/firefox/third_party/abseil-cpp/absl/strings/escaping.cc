@@ -1,0 +1,974 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "absl/strings/escaping.h"
+
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <string>
+#include <utility>
+
+#include "absl/base/config.h"
+#include "absl/base/internal/endian.h"
+#include "absl/base/internal/raw_logging.h"
+#include "absl/base/internal/unaligned_access.h"
+#include "absl/base/macros.h"
+#include "absl/base/nullability.h"
+#include "absl/base/optimization.h"
+#include "absl/strings/ascii.h"
+#include "absl/strings/charset.h"
+#include "absl/strings/internal/append_and_overwrite.h"
+#include "absl/strings/internal/escaping.h"
+#include "absl/strings/internal/utf8.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/resize_and_overwrite.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace {
+
+constexpr bool kUnescapeNulls = false;
+
+inline bool is_octal_digit(char c) { return ('0' <= c) && (c <= '7'); }
+
+inline unsigned int hex_digit_to_int(char c) {
+  static_assert('0' == 0x30 && 'A' == 0x41 && 'a' == 0x61,
+                "Character set must be ASCII.");
+  assert(absl::ascii_isxdigit(static_cast<unsigned char>(c)));
+  unsigned int x = static_cast<unsigned char>(c);
+  if (x > '9') {
+    x += 9;
+  }
+  return x & 0xf;
+}
+
+inline bool IsSurrogate(char32_t c, absl::string_view src,
+                        std::string* absl_nullable error) {
+  if (c >= 0xD800 && c <= 0xDFFF) {
+    if (error) {
+      *error = absl::StrCat("invalid surrogate character (0xD800-DFFF): \\",
+                            src);
+    }
+    return true;
+  }
+  return false;
+}
+
+
+bool CUnescapeInternal(absl::string_view src, bool leave_nulls_escaped,
+                       char* absl_nonnull dst, size_t* absl_nonnull dst_size,
+                       std::string* absl_nullable error) {
+  absl::string_view::size_type p = 0;  
+  size_t d = 0;                        
+
+  if (src.data() == dst) {
+    while (p < src.size() && src[p] != '\\') p++, d++;
+  }
+
+  while (p < src.size()) {
+    if (src[p] != '\\') {
+      dst[d++] = src[p++];
+    } else {
+      if (++p >= src.size()) {  
+        if (error != nullptr) {
+          *error = "String cannot end with \\";
+        }
+        return false;
+      }
+      switch (src[p]) {
+          // clang-format off
+        case 'a':  dst[d++] = '\a';  break;
+        case 'b':  dst[d++] = '\b';  break;
+        case 'f':  dst[d++] = '\f';  break;
+        case 'n':  dst[d++] = '\n';  break;
+        case 'r':  dst[d++] = '\r';  break;
+        case 't':  dst[d++] = '\t';  break;
+        case 'v':  dst[d++] = '\v';  break;
+        case '\\': dst[d++] = '\\';  break;
+        case '?':  dst[d++] = '\?';  break;
+        case '\'': dst[d++] = '\'';  break;
+        case '"':  dst[d++] = '\"';  break;
+        // clang-format on
+        case '0':
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case '6':
+        case '7': {
+          auto octal_start = p;
+          unsigned int ch = static_cast<unsigned int>(src[p] - '0');  
+          if (p + 1 < src.size() && is_octal_digit(src[p + 1]))
+            ch = ch * 8 + static_cast<unsigned int>(src[++p] - '0');  
+          if (p + 1 < src.size() && is_octal_digit(src[p + 1]))
+            ch = ch * 8 + static_cast<unsigned int>(src[++p] - '0');  
+          if (ch > 0xff) {
+            if (error != nullptr) {
+              *error =
+                  "Value of \\" +
+                  std::string(src.substr(octal_start, p + 1 - octal_start)) +
+                  " exceeds 0xff";
+            }
+            return false;
+          }
+          if ((ch == 0) && leave_nulls_escaped) {
+            dst[d++] = '\\';
+            while (octal_start <= p) {
+              dst[d++] = src[octal_start++];
+            }
+            break;
+          }
+          dst[d++] = static_cast<char>(ch);
+          break;
+        }
+        case 'x':
+        case 'X': {
+          if (p + 1 >= src.size()) {
+            if (error != nullptr) {
+              *error = "String cannot end with \\x";
+            }
+            return false;
+          } else if (!absl::ascii_isxdigit(
+              static_cast<unsigned char>(src[p + 1]))) {
+            if (error != nullptr) {
+              *error = "\\x cannot be followed by a non-hex digit";
+            }
+            return false;
+          }
+          unsigned int ch = 0;
+          auto hex_start = p;
+          while (p + 1 < src.size() &&
+                 absl::ascii_isxdigit(static_cast<unsigned char>(src[p + 1]))) {
+            ch = (ch << 4) + hex_digit_to_int(src[++p]);
+            if (ch > 0xFF) {
+              if (error != nullptr) {
+                *error = "Value of \\" +
+                         std::string(src.substr(hex_start, p + 1 - hex_start)) +
+                         " exceeds 0xff";
+              }
+              return false;
+            }
+          }
+          if ((ch == 0) && leave_nulls_escaped) {
+            dst[d++] = '\\';
+            while (hex_start <= p) {
+              dst[d++] = src[hex_start++];
+            }
+            break;
+          }
+          dst[d++] = static_cast<char>(ch);
+          break;
+        }
+        case 'u': {
+          char32_t rune = 0;
+          auto hex_start = p;
+          if (p + 4 >= src.size()) {
+            if (error != nullptr) {
+              *error = "\\u must be followed by 4 hex digits";
+            }
+            return false;
+          }
+          for (int i = 0; i < 4; ++i) {
+            if (absl::ascii_isxdigit(static_cast<unsigned char>(src[p + 1]))) {
+              rune = (rune << 4) + hex_digit_to_int(src[++p]);
+            } else {
+              if (error != nullptr) {
+                *error = "\\u must be followed by 4 hex digits: \\" +
+                         std::string(src.substr(hex_start, p + 1 - hex_start));
+              }
+              return false;
+            }
+          }
+          if ((rune == 0) && leave_nulls_escaped) {
+            dst[d++] = '\\';
+            while (hex_start <= p) {
+              dst[d++] = src[hex_start++];
+            }
+            break;
+          }
+          if (IsSurrogate(rune, src.substr(hex_start, 5), error)) {
+            return false;
+          }
+          d += strings_internal::EncodeUTF8Char(dst + d, rune);
+          break;
+        }
+        case 'U': {
+          char32_t rune = 0;
+          auto hex_start = p;
+          if (p + 8 >= src.size()) {
+            if (error != nullptr) {
+              *error = "\\U must be followed by 8 hex digits";
+            }
+            return false;
+          }
+          for (int i = 0; i < 8; ++i) {
+            if (absl::ascii_isxdigit(static_cast<unsigned char>(src[p + 1]))) {
+              uint32_t newrune = (rune << 4) + hex_digit_to_int(src[++p]);
+              if (newrune > 0x10FFFF) {
+                if (error != nullptr) {
+                  *error =
+                      "Value of \\" +
+                      std::string(src.substr(hex_start, p + 1 - hex_start)) +
+                      " exceeds Unicode limit (0x10FFFF)";
+                }
+                return false;
+              } else {
+                rune = newrune;
+              }
+            } else {
+              if (error != nullptr) {
+                *error = "\\U must be followed by 8 hex digits: \\" +
+                         std::string(src.substr(hex_start, p + 1 - hex_start));
+              }
+              return false;
+            }
+          }
+          if ((rune == 0) && leave_nulls_escaped) {
+            dst[d++] = '\\';
+            while (hex_start <= p) {
+              dst[d++] = src[hex_start++];
+            }
+            break;
+          }
+          if (IsSurrogate(rune, src.substr(hex_start, 9), error)) {
+            return false;
+          }
+          d += strings_internal::EncodeUTF8Char(dst + d, rune);
+          break;
+        }
+        default: {
+          if (error != nullptr) {
+            *error = std::string("Unknown escape sequence: \\") + src[p];
+          }
+          return false;
+        }
+      }
+      p++;  
+    }
+  }
+
+  *dst_size = d;
+  return true;
+}
+
+std::string CEscapeInternal(absl::string_view src, bool use_hex,
+                            bool utf8_safe) {
+  std::string dest;
+  bool last_hex_escape = false;  
+
+  for (char c : src) {
+    bool is_hex_escape = false;
+    switch (c) {
+      case '\n': dest.append("\\" "n"); break;
+      case '\r': dest.append("\\" "r"); break;
+      case '\t': dest.append("\\" "t"); break;
+      case '\"': dest.append("\\" "\""); break;
+      case '\'': dest.append("\\" "'"); break;
+      case '\\': dest.append("\\" "\\"); break;
+      default: {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if ((!utf8_safe || uc < 0x80) &&
+            (!absl::ascii_isprint(uc) ||
+             (last_hex_escape && absl::ascii_isxdigit(uc)))) {
+          if (use_hex) {
+            dest.append("\\" "x");
+            dest.push_back(numbers_internal::kHexChar[uc / 16]);
+            dest.push_back(numbers_internal::kHexChar[uc % 16]);
+            is_hex_escape = true;
+          } else {
+            dest.append("\\");
+            dest.push_back(numbers_internal::kHexChar[uc / 64]);
+            dest.push_back(numbers_internal::kHexChar[(uc % 64) / 8]);
+            dest.push_back(numbers_internal::kHexChar[uc % 8]);
+          }
+        } else {
+          dest.push_back(c);
+          break;
+        }
+      }
+    }
+    last_hex_escape = is_hex_escape;
+  }
+
+  return dest;
+}
+
+/* clang-format off */
+constexpr std::array<unsigned char, 256> kCEscapedLen = {
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 2, 2, 4, 4, 2, 4, 4,  
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    1, 1, 2, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1,  
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1,  
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4,  
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+};
+/* clang-format on */
+
+constexpr uint32_t MakeCEscapedLittleEndianUint32(size_t c) {
+  size_t char_len = kCEscapedLen[c];
+  if (char_len == 1) {
+    return static_cast<uint32_t>(c);
+  }
+  if (char_len == 2) {
+    switch (c) {
+      case '\n':
+        return '\\' | (static_cast<uint32_t>('n') << 8);
+      case '\r':
+        return '\\' | (static_cast<uint32_t>('r') << 8);
+      case '\t':
+        return '\\' | (static_cast<uint32_t>('t') << 8);
+      case '\"':
+        return '\\' | (static_cast<uint32_t>('\"') << 8);
+      case '\'':
+        return '\\' | (static_cast<uint32_t>('\'') << 8);
+      case '\\':
+        return '\\' | (static_cast<uint32_t>('\\') << 8);
+    }
+  }
+  return static_cast<uint32_t>('\\' | (('0' + (c / 64)) << 8) |
+                               (('0' + ((c % 64) / 8)) << 16) |
+                               (('0' + (c % 8)) << 24));
+}
+
+template <size_t... indexes>
+inline constexpr std::array<uint32_t, sizeof...(indexes)>
+MakeCEscapedLittleEndianUint32Array(std::index_sequence<indexes...>) {
+  return {MakeCEscapedLittleEndianUint32(indexes)...};
+}
+constexpr std::array<uint32_t, 256> kCEscapedLittleEndianUint32Array =
+    MakeCEscapedLittleEndianUint32Array(std::make_index_sequence<256>());
+
+inline size_t CEscapedLength(absl::string_view src) {
+  size_t escaped_len = 0;
+  size_t unchecked_limit =
+      std::min<size_t>(src.size(), std::numeric_limits<size_t>::max() / 4);
+  size_t i = 0;
+  while (i < unchecked_limit) {
+    escaped_len += kCEscapedLen[static_cast<unsigned char>(src[i++])];
+  }
+  while (i < src.size()) {
+    size_t char_len = kCEscapedLen[static_cast<unsigned char>(src[i++])];
+    ABSL_INTERNAL_CHECK(
+        escaped_len <= std::numeric_limits<size_t>::max() - char_len,
+        "escaped_len overflow");
+    escaped_len += char_len;
+  }
+  return escaped_len;
+}
+
+void CEscapeAndAppendInternal(absl::string_view src,
+                              std::string* absl_nonnull dest) {
+  size_t escaped_len = CEscapedLength(src);
+  if (escaped_len == src.size()) {
+    dest->append(src.data(), src.size());
+    return;
+  }
+
+  constexpr size_t kSlopBytes = 3;
+  size_t cur_dest_len = dest->size();
+  size_t append_buf_len = cur_dest_len + escaped_len + kSlopBytes;
+  ABSL_INTERNAL_CHECK(append_buf_len > cur_dest_len,
+                      "std::string size overflow");
+  strings_internal::StringAppendAndOverwrite(
+      *dest, append_buf_len, [src, escaped_len](char* append_ptr, size_t) {
+        for (char c : src) {
+          unsigned char uc = static_cast<unsigned char>(c);
+          size_t char_len = kCEscapedLen[uc];
+          uint32_t little_endian_uint32 = kCEscapedLittleEndianUint32Array[uc];
+          little_endian::Store32(append_ptr, little_endian_uint32);
+          append_ptr += char_len;
+        }
+        return escaped_len;
+      });
+}
+
+constexpr char kBase64Chars[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+constexpr char kWebSafeBase64Chars[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+size_t Base64EscapeInternal(const unsigned char* src, size_t szsrc, char* dest,
+                            size_t szdest, const char* base64,
+                            bool do_padding) {
+  constexpr char kPad64 = '=';
+
+  constexpr size_t kMaxSize = (std::numeric_limits<size_t>::max() - 1) / 4 * 3;
+  if (ABSL_PREDICT_FALSE(szsrc > kMaxSize || szsrc * 4 > szdest * 3)) return 0;
+
+  char* cur_dest = dest;
+  const unsigned char* cur_src = src;
+
+  char* const limit_dest = dest + szdest;
+  const unsigned char* const limit_src = src + szsrc;
+
+
+  if (szsrc >= 3) {                    
+    while (cur_src < limit_src - 3) {  
+      uint32_t in = absl::big_endian::Load32(cur_src) >> 8;
+
+      cur_dest[0] = base64[in >> 18];
+      in &= 0x3FFFF;
+      cur_dest[1] = base64[in >> 12];
+      in &= 0xFFF;
+      cur_dest[2] = base64[in >> 6];
+      in &= 0x3F;
+      cur_dest[3] = base64[in];
+
+      cur_dest += 4;
+      cur_src += 3;
+    }
+  }
+  szdest = static_cast<size_t>(limit_dest - cur_dest);
+  szsrc = static_cast<size_t>(limit_src - cur_src);
+
+  switch (szsrc) {
+    case 0:
+      break;
+    case 1: {
+      if (szdest < 2) return 0;
+      uint32_t in = cur_src[0];
+      cur_dest[0] = base64[in >> 2];
+      in &= 0x3;
+      cur_dest[1] = base64[in << 4];
+      cur_dest += 2;
+      szdest -= 2;
+      if (do_padding) {
+        if (szdest < 2) return 0;
+        cur_dest[0] = kPad64;
+        cur_dest[1] = kPad64;
+        cur_dest += 2;
+        szdest -= 2;
+      }
+      break;
+    }
+    case 2: {
+      if (szdest < 3) return 0;
+      uint32_t in = absl::big_endian::Load16(cur_src);
+      cur_dest[0] = base64[in >> 10];
+      in &= 0x3FF;
+      cur_dest[1] = base64[in >> 4];
+      in &= 0x00F;
+      cur_dest[2] = base64[in << 2];
+      cur_dest += 3;
+      szdest -= 3;
+      if (do_padding) {
+        if (szdest < 1) return 0;
+        cur_dest[0] = kPad64;
+        cur_dest += 1;
+        szdest -= 1;
+      }
+      break;
+    }
+    case 3: {
+      if (szdest < 4) return 0;
+      uint32_t in =
+          (uint32_t{cur_src[0]} << 16) + absl::big_endian::Load16(cur_src + 1);
+      cur_dest[0] = base64[in >> 18];
+      in &= 0x3FFFF;
+      cur_dest[1] = base64[in >> 12];
+      in &= 0xFFF;
+      cur_dest[2] = base64[in >> 6];
+      in &= 0x3F;
+      cur_dest[3] = base64[in];
+      cur_dest += 4;
+      szdest -= 4;
+      break;
+    }
+    default:
+      ABSL_RAW_LOG(FATAL, "Logic problem? szsrc = %zu", szsrc);
+      break;
+  }
+  return static_cast<size_t>(cur_dest - dest);
+}
+
+std::string Base64EscapeToStringInternal(const unsigned char* src, size_t szsrc,
+                                         bool do_padding,
+                                         const char* base64_chars) {
+  std::string escaped;
+  const size_t calc_escaped_size =
+      strings_internal::CalculateBase64EscapedLenInternal(szsrc, do_padding);
+  StringResizeAndOverwrite(
+      escaped, calc_escaped_size,
+      [src, szsrc, base64_chars, do_padding](char* buf, size_t buf_size) {
+        const size_t escaped_len = Base64EscapeInternal(
+            src, szsrc, buf, buf_size, base64_chars, do_padding);
+        assert(escaped_len == buf_size);
+        return escaped_len;
+      });
+  return escaped;
+}
+
+bool Base64UnescapeInternal(const char* absl_nullable src_param, size_t szsrc,
+                            char* absl_nullable dest, size_t szdest,
+                            const std::array<signed char, 256>& unbase64,
+                            size_t* absl_nonnull len) {
+  static const char kPad64Equals = '=';
+  static const char kPad64Dot = '.';
+
+  size_t destidx = 0;
+  int decode = 0;
+  int state = 0;
+  unsigned char ch = 0;
+  unsigned int temp = 0;
+
+  const unsigned char* src = reinterpret_cast<const unsigned char*>(src_param);
+
+#define GET_INPUT(label, remain)                                \
+  label:                                                        \
+  --szsrc;                                                      \
+  ch = *src++;                                                  \
+  decode = unbase64[ch];                                        \
+  if (decode < 0) {                                             \
+    if (absl::ascii_isspace(ch) && szsrc >= remain) goto label; \
+    state = 4 - remain;                                         \
+    break;                                                      \
+  }
+
+
+  if (dest) {
+
+    while (szsrc >= 4) {
+
+      if (!src[0] || !src[1] || !src[2] ||
+          ((temp = ((unsigned(unbase64[src[0]]) << 18) |
+                    (unsigned(unbase64[src[1]]) << 12) |
+                    (unsigned(unbase64[src[2]]) << 6) |
+                    (unsigned(unbase64[src[3]])))) &
+           0x80000000)) {
+
+        GET_INPUT(first, 4);
+        temp = static_cast<unsigned char>(decode);
+        GET_INPUT(second, 3);
+        temp = (temp << 6) | static_cast<unsigned char>(decode);
+        GET_INPUT(third, 2);
+        temp = (temp << 6) | static_cast<unsigned char>(decode);
+        GET_INPUT(fourth, 1);
+        temp = (temp << 6) | static_cast<unsigned char>(decode);
+      } else {
+
+        szsrc -= 4;
+        src += 4;
+      }
+
+
+      if (destidx + 3 > szdest) return false;
+      dest[destidx + 2] = static_cast<char>(temp);
+      temp >>= 8;
+      dest[destidx + 1] = static_cast<char>(temp);
+      temp >>= 8;
+      dest[destidx] = static_cast<char>(temp);
+      destidx += 3;
+    }
+  } else {
+    while (szsrc >= 4) {
+      if (!src[0] || !src[1] || !src[2] ||
+          ((temp = ((unsigned(unbase64[src[0]]) << 18) |
+                    (unsigned(unbase64[src[1]]) << 12) |
+                    (unsigned(unbase64[src[2]]) << 6) |
+                    (unsigned(unbase64[src[3]])))) &
+           0x80000000)) {
+        GET_INPUT(first_no_dest, 4);
+        GET_INPUT(second_no_dest, 3);
+        GET_INPUT(third_no_dest, 2);
+        GET_INPUT(fourth_no_dest, 1);
+      } else {
+        szsrc -= 4;
+        src += 4;
+      }
+      destidx += 3;
+    }
+  }
+
+#undef GET_INPUT
+
+  if (decode < 0 && ch != kPad64Equals && ch != kPad64Dot &&
+      !absl::ascii_isspace(ch))
+    return false;
+
+  if (ch == kPad64Equals || ch == kPad64Dot) {
+    ++szsrc;
+    --src;
+  } else {
+    while (szsrc > 0) {
+      --szsrc;
+      ch = *src++;
+      decode = unbase64[ch];
+      if (decode < 0) {
+        if (absl::ascii_isspace(ch)) {
+          continue;
+        } else if (ch == kPad64Equals || ch == kPad64Dot) {
+          ++szsrc;
+          --src;
+          break;
+        } else {
+          return false;
+        }
+      }
+
+      temp = (temp << 6) | static_cast<unsigned char>(decode);
+      ++state;
+      if (state == 4) {
+        if (dest) {
+          if (destidx + 3 > szdest) return false;
+          dest[destidx + 2] = static_cast<char>(temp);
+          temp >>= 8;
+          dest[destidx + 1] = static_cast<char>(temp);
+          temp >>= 8;
+          dest[destidx] = static_cast<char>(temp);
+        }
+        destidx += 3;
+        state = 0;
+        temp = 0;
+      }
+    }
+  }
+
+  int expected_equals = 0;
+  switch (state) {
+    case 0:
+      break;
+
+    case 1:
+      return false;
+
+    case 2:
+      if (dest) {
+        if (destidx + 1 > szdest) return false;
+        temp >>= 4;
+        dest[destidx] = static_cast<char>(temp);
+      }
+      ++destidx;
+      expected_equals = 2;
+      break;
+
+    case 3:
+      if (dest) {
+        if (destidx + 2 > szdest) return false;
+        temp >>= 2;
+        dest[destidx + 1] = static_cast<char>(temp);
+        temp >>= 8;
+        dest[destidx] = static_cast<char>(temp);
+      }
+      destidx += 2;
+      expected_equals = 1;
+      break;
+
+    default:
+      ABSL_RAW_LOG(FATAL, "This can't happen; base64 decoder state = %d",
+                   state);
+  }
+
+
+  int equals = 0;
+  while (szsrc > 0) {
+    if (*src == kPad64Equals || *src == kPad64Dot)
+      ++equals;
+    else if (!absl::ascii_isspace(*src))
+      return false;
+    --szsrc;
+    ++src;
+  }
+
+  const bool ok = (equals == 0 || equals == expected_equals);
+  if (ok) *len = destidx;
+  return ok;
+}
+
+// These arrays were generated by the following inversion code:
+/* clang-format off */
+constexpr std::array<signed char, 256> kUnBase64 = {
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      62/*+*/, -1,      -1,      -1,      63,
+    52, 53, 54, 55, 56, 57, 58, 59,
+    60, 61, -1,      -1,      -1,      -1,      -1,      -1,
+    -1,       0,  1,  2,  3,  4,  5,  6,
+    07,  8,  9, 10, 11, 12, 13, 14,
+    15, 16, 17, 18, 19, 20, 21, 22,
+    23, 24, 25, -1,      -1,      -1,      -1,      -1,
+    -1,      26, 27, 28, 29, 30, 31, 32,
+    33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 45, 46, 47, 48,
+    49, 50, 51, -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1
+};
+
+constexpr std::array<signed char, 256> kUnWebSafeBase64 = {
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      62, -1,      -1,
+    52, 53, 54, 55, 56, 57, 58, 59,
+    60, 61, -1,      -1,      -1,      -1,      -1,      -1,
+    -1,       0,  1,  2,  3,  4,  5,  6,
+    07,  8,  9, 10, 11, 12, 13, 14,
+    15, 16, 17, 18, 19, 20, 21, 22,
+    23, 24, 25, -1,      -1,      -1,      -1,      63,
+    -1,      26, 27, 28, 29, 30, 31, 32,
+    33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 45, 46, 47, 48,
+    49, 50, 51, -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,
+    -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1
+};
+/* clang-format on */
+
+template <typename String>
+bool Base64UnescapeInternal(const char* absl_nullable src, size_t slen,
+                            String* absl_nonnull dest,
+                            const std::array<signed char, 256>& unbase64) {
+  const size_t dest_len = 3 * (slen / 4) + (slen % 4);
+
+  bool ok;
+  StringResizeAndOverwrite(
+      *dest, dest_len, [src, slen, unbase64, &ok](char* buf, size_t buf_size) {
+        size_t len;
+        ok = Base64UnescapeInternal(src, slen, buf, buf_size, unbase64, &len);
+        if (!ok) {
+          len = 0;
+        }
+        assert(len <= buf_size);  
+        return len;
+      });
+  return ok;
+}
+
+/* clang-format off */
+constexpr std::array<uint8_t, 256> kHexValueLenient = {
+    0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,  1,  2,  3,  4,  5,  6, 7, 8, 9, 0, 0, 0, 0, 0, 0,  
+    0, 10, 11, 12, 13, 14, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0,  
+    0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 10, 11, 12, 13, 14, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0,  
+    0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+};
+
+constexpr std::array<int8_t, 256> kHexValueStrict = {
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, -1, -1, -1, -1, -1, -1,  
+    -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1,  
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1,  
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+};
+/* clang-format on */
+
+template <typename T>
+void HexStringToBytesInternal(const char* absl_nullable from, T to,
+                              size_t num) {
+  for (size_t i = 0; i < num; i++) {
+    to[i] = static_cast<char>(kHexValueLenient[from[i * 2] & 0xFF] << 4) +
+            static_cast<char>(kHexValueLenient[from[i * 2 + 1] & 0xFF]);
+  }
+}
+
+void BytesToHexStringInternal(const unsigned char* absl_nullable src,
+                              char* dest, size_t num) {
+  for (auto src_ptr = src; src_ptr != (src + num); ++src_ptr, dest += 2) {
+    const char* hex_p = &numbers_internal::kHexTable[*src_ptr * 2];
+    std::copy(hex_p, hex_p + 2, dest);
+  }
+}
+
+}  
+
+
+bool CUnescape(absl::string_view source, std::string* absl_nonnull dest,
+               std::string* absl_nullable error) {
+  bool success;
+
+  if (dest->size() >= source.size()) {
+    size_t dest_size = 0;
+    success = CUnescapeInternal(source, kUnescapeNulls, dest->data(),
+                                &dest_size, error);
+    ABSL_ASSERT(dest_size <= dest->size());
+    dest->erase(dest_size);
+  } else {
+    StringResizeAndOverwrite(
+        *dest, source.size(),
+        [source, error, &success](char* buf, size_t buf_size) {
+          size_t dest_size = 0;
+          success =
+              CUnescapeInternal(source, kUnescapeNulls, buf, &dest_size, error);
+          ABSL_ASSERT(dest_size <= buf_size);
+          return dest_size;
+        });
+  }
+  return success;
+}
+
+std::string CEscape(absl::string_view src) {
+  std::string dest;
+  CEscapeAndAppendInternal(src, &dest);
+  return dest;
+}
+
+std::string CHexEscape(absl::string_view src) {
+  return CEscapeInternal(src, true, false);
+}
+
+std::string Utf8SafeCEscape(absl::string_view src) {
+  return CEscapeInternal(src, false, true);
+}
+
+std::string Utf8SafeCHexEscape(absl::string_view src) {
+  return CEscapeInternal(src, true, true);
+}
+
+bool Base64Unescape(absl::string_view src, std::string* absl_nonnull dest) {
+  return Base64UnescapeInternal(src.data(), src.size(), dest, kUnBase64);
+}
+
+bool WebSafeBase64Unescape(absl::string_view src,
+                           std::string* absl_nonnull dest) {
+  return Base64UnescapeInternal(src.data(), src.size(), dest, kUnWebSafeBase64);
+}
+
+std::string Base64Escape(absl::string_view src) {
+  return Base64EscapeToStringInternal(
+      reinterpret_cast<const unsigned char*>(src.data()), src.size(), true,
+      kBase64Chars);
+}
+
+std::string WebSafeBase64Escape(absl::string_view src) {
+  return Base64EscapeToStringInternal(
+      reinterpret_cast<const unsigned char*>(src.data()), src.size(), false,
+      kWebSafeBase64Chars);
+}
+
+bool HexStringToBytes(absl::string_view hex, std::string* absl_nonnull bytes) {
+  std::string output;
+
+  size_t num_bytes = hex.size() / 2;
+  if (hex.size() != num_bytes * 2) {
+    return false;
+  }
+
+  StringResizeAndOverwrite(
+      output, num_bytes, [hex](char* buf, size_t buf_size) {
+        auto hex_p = hex.cbegin();
+        for (size_t i = 0; i < buf_size; ++i) {
+          int h1 = absl::kHexValueStrict[static_cast<size_t>(
+              static_cast<uint8_t>(*hex_p++))];
+          int h2 = absl::kHexValueStrict[static_cast<size_t>(
+              static_cast<uint8_t>(*hex_p++))];
+          if (h1 == -1 || h2 == -1) {
+            return size_t{0};
+          }
+          buf[i] = static_cast<char>((h1 << 4) + h2);
+        }
+        return buf_size;
+      });
+
+  if (output.size() != num_bytes) {
+    return false;
+  }
+  *bytes = std::move(output);
+  return true;
+}
+
+std::string HexStringToBytes(absl::string_view from) {
+  std::string result;
+  const auto num = from.size() / 2;
+  StringResizeAndOverwrite(result, num, [from](char* buf, size_t buf_size) {
+    absl::HexStringToBytesInternal<char*>(from.data(), buf, buf_size);
+    return buf_size;
+  });
+  return result;
+}
+
+std::string BytesToHexString(absl::string_view from) {
+  std::string result;
+  StringResizeAndOverwrite(
+      result, 2 * from.size(), [from](char* buf, size_t buf_size) {
+        absl::BytesToHexStringInternal(
+            reinterpret_cast<const unsigned char*>(from.data()), buf,
+            from.size());
+        return buf_size;
+      });
+  return result;
+}
+
+ABSL_NAMESPACE_END
+}  

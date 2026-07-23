@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_Compression_h
+#define vm_Compression_h
+
+#include <zlib.h>
+
+#include "jstypes.h"
+
+#include "js/AllocPolicy.h"
+#include "js/Vector.h"
+
+namespace js {
+
+struct CompressedDataHeader {
+  uint32_t compressedBytes;
+};
+
+class Compressor {
+ public:
+  static constexpr size_t CHUNK_SIZE = 64 * 1024;
+
+ private:
+  static constexpr size_t MAX_INPUT_SIZE = 2 * 1024;
+
+  z_stream zs;
+  const unsigned char* inp = nullptr;
+  size_t inplen = 0;
+  size_t outbytes = 0;
+  bool finished = false;
+
+  bool initialized = false;
+
+  bool isFirstInput = true;
+
+  uint32_t currentChunkSize = 0;
+
+  js::Vector<uint32_t, 8, SystemAllocPolicy> chunkOffsets;
+
+ public:
+  enum Status { MOREOUTPUT, DONE, CONTINUE, OOM };
+
+  Compressor();
+  ~Compressor();
+
+  Compressor(const Compressor&) = delete;
+  void operator=(const Compressor&) = delete;
+
+  [[nodiscard]] bool init();
+
+  [[nodiscard]] bool setInput(const unsigned char* input, size_t inputLength);
+
+  void setOutput(unsigned char* out, size_t outlen);
+  Status compressMore();
+  size_t sizeOfChunkOffsets() const {
+    return chunkOffsets.length() * sizeof(chunkOffsets[0]);
+  }
+
+  size_t totalBytesNeeded() const;
+
+  void finish(char* dest, size_t destBytes);
+
+  static void rangeToChunkAndOffset(size_t uncompressedStart,
+                                    size_t uncompressedLimit,
+                                    size_t* firstChunk,
+                                    size_t* firstChunkOffset,
+                                    size_t* firstChunkSize, size_t* lastChunk,
+                                    size_t* lastChunkSize) {
+    *firstChunk = uncompressedStart / CHUNK_SIZE;
+    *firstChunkOffset = uncompressedStart % CHUNK_SIZE;
+    *firstChunkSize = CHUNK_SIZE - *firstChunkOffset;
+
+    MOZ_ASSERT(uncompressedStart < uncompressedLimit,
+               "subtraction below requires a non-empty range");
+
+    *lastChunk = (uncompressedLimit - 1) / CHUNK_SIZE;
+    *lastChunkSize = ((uncompressedLimit - 1) % CHUNK_SIZE) + 1;
+  }
+
+  static size_t chunkSize(size_t uncompressedBytes, size_t chunk) {
+    MOZ_ASSERT(uncompressedBytes > 0, "must have uncompressed data to chunk");
+
+    size_t startOfChunkBytes = chunk * CHUNK_SIZE;
+    MOZ_ASSERT(startOfChunkBytes < uncompressedBytes,
+               "chunk must refer to bytes not exceeding "
+               "|uncompressedBytes|");
+
+    size_t remaining = uncompressedBytes - startOfChunkBytes;
+    return remaining < CHUNK_SIZE ? remaining : CHUNK_SIZE;
+  }
+};
+
+bool DecompressString(const unsigned char* inp, size_t inplen,
+                      unsigned char* out, size_t outlen);
+
+bool DecompressStringChunk(const unsigned char* inp, size_t chunk,
+                           unsigned char* out, size_t outlen);
+
+} 
+
+#endif /* vm_Compression_h */

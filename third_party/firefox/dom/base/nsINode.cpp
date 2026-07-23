@@ -1,0 +1,4152 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsINode.h"
+
+#include <algorithm>
+
+#include "AccessCheck.h"
+#include "GeometryUtils.h"
+#include "HTMLLegendElement.h"
+#include "WrapperFactory.h"
+#include "XPathGenerator.h"
+#include "js/ForOfIterator.h"  // JS::ForOfIterator
+#include "js/JSON.h"           // JS_ParseJSON
+#include "jsapi.h"
+#include "mozAutoDocUpdate.h"
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/EventListenerManager.h"
+#include "mozilla/HTMLEditor.h"
+#include "mozilla/Likely.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ServoBindings.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/TextControlElement.h"
+#include "mozilla/TextControlState.h"
+#include "mozilla/TextEditor.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/AncestorIterator.h"
+#include "mozilla/dom/Attr.h"
+#include "mozilla/dom/BindContext.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/CharacterData.h"
+#include "mozilla/dom/ChildIterator.h"
+#include "mozilla/dom/ContentList.h"
+#include "mozilla/dom/CustomElementRegistry.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/DocumentType.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/ElementBinding.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/Exceptions.h"
+#include "mozilla/dom/FeaturePolicyUtils.h"
+#include "mozilla/dom/HTMLButtonElement.h"
+#include "mozilla/dom/HTMLDetailsElement.h"
+#include "mozilla/dom/HTMLDialogElement.h"
+#include "mozilla/dom/HTMLImageElement.h"
+#include "mozilla/dom/HTMLMediaElement.h"
+#include "mozilla/dom/HTMLTemplateElement.h"
+#include "mozilla/dom/L10nOverlays.h"
+#include "mozilla/dom/LifecycleCallbackArgs.h"
+#include "mozilla/dom/Link.h"
+#include "mozilla/dom/MutationObservers.h"
+#include "mozilla/dom/NodeBinding.h"
+#include "mozilla/dom/NodeInfo.h"
+#include "mozilla/dom/NodeInfoInlines.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/dom/SVGUseElement.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/Selection.h"
+#include "mozilla/dom/ShadowRoot.h"
+#include "nsAtom.h"
+#include "nsAttrValueOrString.h"
+#include "nsCCUncollectableMarker.h"
+#include "nsCOMArray.h"
+#include "nsChildContentList.h"
+#include "nsClassHashtable.h"
+#include "nsContentCreatorFunctions.h"
+#include "nsContentUtils.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsDOMAttributeMap.h"
+#include "nsDOMCID.h"
+#include "nsDOMCSSAttrDeclaration.h"
+#include "nsDOMMutationObserver.h"
+#include "nsDOMString.h"
+#include "nsDOMTokenList.h"
+#include "nsError.h"
+#include "nsExpirationTracker.h"
+#include "nsFocusManager.h"
+#include "nsFrameSelection.h"
+#include "nsGenericHTMLElement.h"
+#include "nsGkAtoms.h"
+#include "nsGlobalWindowInner.h"
+#include "nsIAnimationObserver.h"
+#include "nsIAnonymousContentCreator.h"
+#include "nsIContentInlines.h"
+#include "nsIFrameInlines.h"
+#include "nsIScriptGlobalObject.h"
+#include "nsIWidget.h"
+#include "nsLayoutUtils.h"
+#include "nsNameSpaceManager.h"
+#include "nsNodeInfoManager.h"
+#include "nsObjectLoadingContent.h"
+#include "nsPIDOMWindow.h"
+#include "nsPresContext.h"
+#include "nsPrintfCString.h"
+#include "nsRange.h"
+#include "nsString.h"
+#include "nsStyleConsts.h"
+#include "nsTHashMap.h"
+#include "nsTextNode.h"
+#include "nsUnicharUtils.h"
+#include "nsWindowSizes.h"
+#include "nsWrapperCacheInlines.h"
+#include "xpcprivate.h"
+#include "xpcpublic.h"
+
+#ifdef ACCESSIBILITY
+#  include "mozilla/dom/AccessibleNode.h"
+#  include "nsAccessibilityService.h"
+#endif
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+#define STATIC_ASSERT_CONSTANT_EQ(c_) \
+  static_assert(Node_Binding::c_ == nsINode::c_);
+
+STATIC_ASSERT_CONSTANT_EQ(ELEMENT_NODE);
+STATIC_ASSERT_CONSTANT_EQ(ATTRIBUTE_NODE);
+STATIC_ASSERT_CONSTANT_EQ(TEXT_NODE);
+STATIC_ASSERT_CONSTANT_EQ(CDATA_SECTION_NODE);
+STATIC_ASSERT_CONSTANT_EQ(ENTITY_REFERENCE_NODE);
+STATIC_ASSERT_CONSTANT_EQ(ENTITY_NODE);
+STATIC_ASSERT_CONSTANT_EQ(PROCESSING_INSTRUCTION_NODE);
+STATIC_ASSERT_CONSTANT_EQ(COMMENT_NODE);
+STATIC_ASSERT_CONSTANT_EQ(DOCUMENT_NODE);
+STATIC_ASSERT_CONSTANT_EQ(DOCUMENT_TYPE_NODE);
+STATIC_ASSERT_CONSTANT_EQ(DOCUMENT_FRAGMENT_NODE);
+STATIC_ASSERT_CONSTANT_EQ(NOTATION_NODE);
+
+#undef STATIC_ASSERT_CONSTANT_EQ
+
+#ifdef DEBUG
+static bool ShouldUseNACScope(const nsINode* aNode) {
+  return aNode->IsInNativeAnonymousSubtree();
+}
+#endif
+
+static bool ShouldUseUAWidgetScope(const nsINode* aNode) {
+  return aNode->HasBeenInUAWidget();
+}
+
+void* nsINode::operator new(size_t aSize, nsNodeInfoManager* aManager) {
+  MOZ_ASSERT(aManager, "nsNodeInfoManager needs to be initialized");
+  return aManager->Allocate(aSize);
+}
+void nsINode::operator delete(void* aPtr) { free_impl(aPtr); }
+
+bool nsINode::IsInclusiveDescendantOf(const nsINode* aNode) const {
+  MOZ_ASSERT(aNode, "The node is nullptr.");
+
+  if (aNode == this) {
+    return true;
+  }
+
+  if (!aNode->HasFlag(NODE_MAY_HAVE_ELEMENT_CHILDREN)) {
+    return GetParentNode() == aNode;
+  }
+
+  for (nsINode* node : Ancestors(*this)) {
+    if (node == aNode) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool nsINode::IsInclusiveFlatTreeDescendantOf(const nsINode* aNode) const {
+  MOZ_ASSERT(aNode, "The node is nullptr.");
+
+  for (nsINode* node : InclusiveFlatTreeAncestors(*this)) {
+    if (node == aNode) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool nsINode::IsShadowIncludingDescendantOf(const nsINode* aNode) const {
+  MOZ_ASSERT(aNode, "The node is nullptr.");
+
+  const nsINode* node = this;
+  while ((node = node->GetParentOrShadowHostNode())) {
+    if (node == aNode) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool nsINode::IsShadowIncludingInclusiveDescendantOf(
+    const nsINode* aNode) const {
+  MOZ_ASSERT(aNode, "The node is nullptr.");
+
+  if (this->GetComposedDoc() == aNode || this == aNode) {
+    return true;
+  }
+
+  return IsShadowIncludingDescendantOf(aNode);
+}
+
+template Element* nsINode::GetClosestFlatTreeAncestorElementForNonFlatTreeNode<
+    TreeKind::Flat>() const;
+template Element* nsINode::GetClosestFlatTreeAncestorElementForNonFlatTreeNode<
+    TreeKind::FlatForSelection>() const;
+
+template <TreeKind aKind, typename Dummy>
+Element* nsINode::GetClosestFlatTreeAncestorElementForNonFlatTreeNode() const {
+  const ShadowRoot* const asShadowRoot = ShadowRoot::FromNode(this);
+  MOZ_ASSERT_IF(aKind == TreeKind::FlatForSelection && asShadowRoot,
+                !asShadowRoot->IsUAWidget());
+  const nsINode* childNode = IsShadowRoot() ? asShadowRoot->GetHost() : this;
+  if (!childNode || childNode->IsRootOfNativeAnonymousSubtree()) [[unlikely]] {
+    return nullptr;
+  }
+  for (nsIContent* parentContent = childNode->GetParent(); parentContent;
+       childNode = parentContent, parentContent = parentContent->GetParent()) {
+    if (parentContent->IsRootOfNativeAnonymousSubtree()) [[unlikely]] {
+      return nullptr;
+    }
+    if (auto* const shadowRoot = ShadowRoot::FromNode(parentContent)) {
+      Element* const host = shadowRoot->GetHost();
+      if (!host) [[unlikely]] {
+        return nullptr;  
+      }
+      parentContent = host;
+      continue;
+    }
+    if (!parentContent->IsElement()) {
+      return nullptr;  
+    }
+    if (parentContent->GetShadowRoot<aKind>()) {
+      MOZ_ASSERT(childNode->IsContent());
+      if (HTMLSlotElement* slot = childNode->AsContent()->GetAssignedSlot()) {
+        parentContent = slot;
+        continue;
+      }
+      return parentContent->AsElement();
+    }
+    if (auto* const slot = HTMLSlotElement::FromNode(parentContent)) {
+      if (slot->GetContainingShadow<aKind>()) {
+        if (slot->AssignedNodes().IsEmpty()) {
+          continue;
+        }
+        return slot;
+      }
+    }
+  }
+  return nullptr;
+}
+
+template Element*
+nsINode::GetFlatTreeAncestorElementForNonFlatTreeNode<TreeKind::Flat>() const;
+template Element* nsINode::GetFlatTreeAncestorElementForNonFlatTreeNode<
+    TreeKind::FlatForSelection>() const;
+
+template <TreeKind aKind, typename Dummy>
+Element* nsINode::GetFlatTreeAncestorElementForNonFlatTreeNode() const {
+  Element* flattenedAncestorElement = nullptr;
+  for (Element* excluderShadowHostOrSlotElement =
+           GetClosestFlatTreeAncestorElementForNonFlatTreeNode<aKind>();
+       excluderShadowHostOrSlotElement;
+       excluderShadowHostOrSlotElement =
+           excluderShadowHostOrSlotElement
+               ->GetClosestFlatTreeAncestorElementForNonFlatTreeNode<aKind>()) {
+    flattenedAncestorElement = excluderShadowHostOrSlotElement;
+  }
+  return flattenedAncestorElement;
+}
+
+nsINode::nsSlots::nsSlots() : mWeakReference(nullptr) {}
+
+nsINode::nsSlots::~nsSlots() {
+  if (mChildNodes) {
+    mChildNodes->InvalidateCacheIfAvailable();
+  }
+
+  if (mWeakReference) {
+    mWeakReference->NoticeNodeDestruction();
+  }
+}
+
+void nsINode::nsSlots::Traverse(nsCycleCollectionTraversalCallback& cb) {
+  NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(cb, "mSlots->mChildNodes");
+  cb.NoteXPCOMChild(mChildNodes);
+  for (auto& object : mBoundObjects) {
+    NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(cb, "mSlots->mBoundObjects[i]");
+    cb.NoteXPCOMChild(object.mObject);
+  }
+}
+
+static void ClearBoundObjects(nsINode::nsSlots& aSlots, nsINode& aNode) {
+  auto objects = std::move(aSlots.mBoundObjects);
+  for (auto& object : objects) {
+    if (object.mDtor) {
+      object.mDtor(object.mObject, &aNode);
+    }
+  }
+  MOZ_ASSERT(aSlots.mBoundObjects.IsEmpty());
+}
+
+void nsINode::nsSlots::Unlink(nsINode& aNode) {
+  if (mChildNodes) {
+    mChildNodes->InvalidateCacheIfAvailable();
+    ImplCycleCollectionUnlink(mChildNodes);
+  }
+  ClearBoundObjects(*this, aNode);
+}
+
+
+#ifdef MOZILLA_INTERNAL_API
+nsINode::nsINode(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+    : mNodeInfo(std::move(aNodeInfo)),
+      mParent(nullptr)
+#  ifndef BOOL_FLAGS_ON_WRAPPER_CACHE
+      ,
+      mBoolFlags(0)
+#  endif
+      ,
+      mChildCount(0),
+      mPreviousOrLastSibling(nullptr),
+      mSubtreeRoot(this),
+      mSlots(nullptr) {
+  SetIsOnMainThread();
+}
+#endif
+
+void nsINode::SetNamespacePrefix(nsAtom* aPrefix) {
+  MOZ_ASSERT(!GetParentNode(), "Only safe on disconnected nodes");
+  mNodeInfo = mNodeInfo->NodeInfoManager()->GetNodeInfo(
+      mNodeInfo->NameAtom(), aPrefix, mNodeInfo->NamespaceID(),
+      nsINode::ELEMENT_NODE);
+}
+
+class ChildIndexCache {
+ public:
+  static constexpr uint32_t kThreshold = 32;
+  static constexpr uint32_t kHashMapThreshold = 128;
+
+  static nsIContent* GetChildAt(const nsINode* aParent, uint32_t aIndex) {
+    MOZ_ASSERT(aParent->GetChildCount() > aIndex,
+               "Caller should have checked bounds");
+    Entry* entry = GetOrCreateEntry(aParent);
+    return entry->GetChildAt(aParent, aIndex);
+  }
+
+  static Maybe<uint32_t> ComputeIndexOf(const nsINode* aParent,
+                                        const nsIContent* aChild) {
+    Entry* entry = GetOrCreateEntry(aParent);
+    return entry->ComputeIndexOf(aParent, aChild);
+  }
+
+  static void Invalidate(const nsINode* aParent, const nsIContent* aPivot) {
+    MOZ_ASSERT(aParent);
+    if (aParent->GetChildCount() < kThreshold) {
+      return;
+    }
+    if (aParent->GetChildCount() == kThreshold) {
+      if (aParent == sLastAccessedParent) {
+        ForgetMemoizedEntry();
+      }
+      sCache.Remove(aParent);
+      return;
+    }
+
+    if (aParent != sLastAccessedParent) {
+      sLastAccessedParent = aParent;
+      sLastAccessedEntry = sCache.Get(aParent);
+    }
+
+    if (!sLastAccessedEntry) {
+      return;
+    }
+
+    sLastAccessedEntry->Invalidate(aPivot);
+  }
+
+#ifdef DEBUG
+  static bool Contains(const nsINode* aParent) {
+    return sCache.Contains(aParent);
+  }
+
+  static const nsINode* LastAccessedParent() { return sLastAccessedParent; }
+#endif
+
+ private:
+  struct Entry {
+    explicit Entry(uint32_t aChildCount) { mChildren.SetCapacity(aChildCount); }
+
+    void Invalidate(const nsIContent* aPivot) {
+      if (!aPivot) {
+        mValidLength = 0;
+        return;
+      }
+      if (auto index = mIndexMap.MaybeGet(aPivot)) {
+        mValidLength = std::min(mValidLength, *index);
+      } else {
+        mValidLength = std::min(mValidLength, mIndexMap.Count());
+      }
+    }
+
+    nsIContent* GetChildAt(const nsINode* aParent, uint32_t aIndex) {
+      TruncateStaleElements();
+      PopulateTo(aParent, aIndex);
+      return mChildren[aIndex];
+    }
+
+    Maybe<uint32_t> ComputeIndexOf(const nsINode* aParent,
+                                   const nsIContent* aChild) {
+      TruncateStaleElements();
+
+      const bool useHashMap = aParent->GetChildCount() >= kHashMapThreshold;
+
+      if (auto result = mIndexMap.MaybeGet(aChild)) {
+        return result;
+      }
+
+      for (auto index : IntegerRange(mIndexMap.Count(), mChildren.Length())) {
+        if (useHashMap) {
+          mIndexMap.InsertOrUpdate(mChildren[index], index);
+        }
+        if (mChildren[index] == aChild) {
+          return Some(index);
+        }
+      }
+
+      nsIContent* current = mChildren.IsEmpty()
+                                ? aParent->GetFirstChild()
+                                : mChildren.LastElement()->GetNextSibling();
+      while (current) {
+        const uint32_t index = mChildren.Length();
+        mChildren.AppendElement(current);
+        mValidLength = mChildren.Length();
+        if (useHashMap) {
+          mIndexMap.InsertOrUpdate(current, index);
+        }
+        if (current == aChild) {
+          return Some(index);
+        }
+        current = current->GetNextSibling();
+      }
+      return Nothing();
+    }
+
+   private:
+    void TruncateStaleElements() {
+      if (mValidLength == mChildren.Length()) {
+        return;
+      }
+      if (mValidLength == 0) {
+        mChildren.ClearAndRetainStorage();
+        mIndexMap.ClearAndRetainStorage();
+        return;
+      }
+      for (auto* invalidChild :
+           Span(mChildren).Last(mChildren.Length() - mValidLength)) {
+        mIndexMap.Remove(invalidChild);
+      }
+      mChildren.TruncateLength(mValidLength);
+    }
+
+    void PopulateTo(const nsINode* aParent, uint32_t aIndex) {
+      if (aIndex < mChildren.Length()) {
+        return;
+      }
+      if (mChildren.Capacity() < aParent->GetChildCount()) {
+        mChildren.SetCapacity(aParent->GetChildCount());
+      }
+      nsIContent* current = mChildren.IsEmpty()
+                                ? aParent->GetFirstChild()
+                                : mChildren.LastElement()->GetNextSibling();
+      while (current) {
+        mChildren.AppendElement(current);
+        if (mChildren.Length() - 1 == aIndex) {
+          break;
+        }
+        current = current->GetNextSibling();
+      }
+      mValidLength = mChildren.Length();
+    }
+    nsTArray<nsIContent*> mChildren;
+    nsTHashMap<const nsIContent*, uint32_t> mIndexMap;
+    uint32_t mValidLength = 0;
+  };
+
+  static Entry* GetOrCreateEntry(const nsINode* aParent) {
+    if (aParent == sLastAccessedParent && sLastAccessedEntry) {
+      return sLastAccessedEntry;
+    }
+    Entry* entry = sCache.GetOrInsertNew(aParent, aParent->GetChildCount());
+    sLastAccessedParent = aParent;
+    sLastAccessedEntry = entry;
+    return entry;
+  }
+
+  static void ForgetMemoizedEntry() {
+    sLastAccessedParent = nullptr;
+    sLastAccessedEntry = nullptr;
+  }
+
+  static nsClassHashtable<nsPtrHashKey<const nsINode>, Entry> sCache;
+  static const nsINode* sLastAccessedParent;
+  static Entry* sLastAccessedEntry;
+};
+
+nsClassHashtable<nsPtrHashKey<const nsINode>, ChildIndexCache::Entry>
+    ChildIndexCache::sCache;
+const nsINode* ChildIndexCache::sLastAccessedParent = nullptr;
+ChildIndexCache::Entry* ChildIndexCache::sLastAccessedEntry = nullptr;
+
+nsINode::~nsINode() {
+  MOZ_ASSERT(!ChildIndexCache::Contains(this),
+             "Node still in ChildIndexCache at destruction?");
+  MOZ_ASSERT(ChildIndexCache::LastAccessedParent() != this,
+             "ChildIndexCache still memoizing a node being destroyed?");
+  MOZ_ASSERT(!HasSlots(), "LastRelease was not called?");
+  MOZ_ASSERT(mSubtreeRoot == this, "Didn't restore state properly?");
+}
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+void nsINode::AssertInvariantsOnNodeInfoChange() {
+  MOZ_DIAGNOSTIC_ASSERT(!IsInComposedDoc());
+  if (nsCOMPtr<Link> link = do_QueryInterface(this)) {
+    MOZ_DIAGNOSTIC_ASSERT(!link->HasPendingLinkUpdate());
+  }
+}
+#endif
+
+#ifdef DEBUG
+void nsINode::AssertIsRootElementSlow(bool aIsRoot) const {
+  auto* root = OwnerDoc()->GetRootElement();
+  const bool isRootSlow = this == root;
+  MOZ_ASSERT(aIsRoot == isRootSlow || !root);
+}
+#endif
+
+void* nsINode::GetProperty(const nsAtom* aPropertyName,
+                           nsresult* aStatus) const {
+  if (!HasProperties()) {  
+    if (aStatus) {
+      *aStatus = NS_PROPTABLE_PROP_NOT_THERE;
+    }
+    return nullptr;
+  }
+  return OwnerDoc()->PropertyTable().GetProperty(this, aPropertyName, aStatus);
+}
+
+nsresult nsINode::SetProperty(nsAtom* aPropertyName, void* aValue,
+                              NSPropertyDtorFunc aDtor, bool aTransfer) {
+  nsresult rv = OwnerDoc()->PropertyTable().SetProperty(
+      this, aPropertyName, aValue, aDtor, nullptr, aTransfer);
+  if (NS_SUCCEEDED(rv)) {
+    SetFlags(NODE_HAS_PROPERTIES);
+  }
+
+  return rv;
+}
+
+void nsINode::RemoveProperty(const nsAtom* aPropertyName) {
+  OwnerDoc()->PropertyTable().RemoveProperty(this, aPropertyName);
+}
+
+void* nsINode::TakeProperty(const nsAtom* aPropertyName, nsresult* aStatus) {
+  return OwnerDoc()->PropertyTable().TakeProperty(this, aPropertyName, aStatus);
+}
+
+nsIPolicyContainer* nsINode::GetPolicyContainer() const {
+  return OwnerDoc()->GetPolicyContainer();
+}
+
+void* nsINode::AllocateSlots(size_t aSize) {
+  DOMArena* arena = nullptr;
+  if (HasFlag(NODE_KEEPS_DOMARENA)) {
+    arena = nsContentUtils::GetEntryFromDOMArenaTable(this);
+  }
+  if (!arena) {
+    arena = NodeInfo()->NodeInfoManager()->GetArenaAllocator();
+  }
+
+  if (arena) {
+    return arena->Allocate(aSize);
+  }
+  return malloc(aSize);
+}
+
+nsINode::nsSlots* nsINode::CreateSlots() {
+  void* mem = AllocateSlots(sizeof(nsSlots));
+  return new (mem) nsSlots();
+}
+
+static const nsINode* GetClosestCommonInclusiveAncestorForRangeInSelection(
+    const nsINode* aNode) {
+  while (aNode &&
+         !aNode->IsClosestCommonInclusiveAncestorForRangeInSelection()) {
+    const bool isNodeInFlattenedShadowTree =
+        (aNode->IsInShadowTree() ||
+         (aNode->IsContent() && aNode->AsContent()->GetAssignedSlot()));
+
+    if (!aNode
+             ->IsDescendantOfClosestCommonInclusiveAncestorForRangeInSelection() &&
+        !isNodeInFlattenedShadowTree) {
+      return nullptr;
+    }
+
+    if (aNode->IsContent() && aNode->AsContent()->GetAssignedSlot()) {
+      aNode = aNode->AsContent()->GetAssignedSlot();
+    } else {
+      aNode = aNode->GetParentOrShadowHostNode();
+    }
+  }
+  return aNode;
+}
+
+class IsItemInRangeComparator {
+ public:
+  IsItemInRangeComparator(const nsINode& aNode, const uint32_t aStartOffset,
+                          const uint32_t aEndOffset,
+                          nsContentUtils::NodeIndexCache* aCache)
+      : mNode(aNode),
+        mStartOffset(aStartOffset),
+        mEndOffset(aEndOffset),
+        mCache(aCache) {
+    MOZ_ASSERT(aStartOffset <= aEndOffset);
+    MOZ_ASSERT(aStartOffset <= aNode.Length());
+    MOZ_ASSERT(aEndOffset <= aNode.Length());
+  }
+
+  [[nodiscard]] bool Collapsed() const { return mStartOffset == mEndOffset; }
+
+  const ConstRawRangeBoundary& StartRef() const {
+    if (!mStartRef) {
+      const_cast<IsItemInRangeComparator*>(this)->mStartRef.emplace(
+          &mNode, mStartOffset, RangeBoundarySetBy::Offset, TreeKind::DOM);
+      MOZ_ASSERT(mStartRef->IsSetAndValid());
+    }
+    return mStartRef.ref();
+  }
+  const ConstRawRangeBoundary& EndRef() const {
+    if (!mEndRef) {
+      const_cast<IsItemInRangeComparator*>(this)->mEndRef.emplace(
+          &mNode, mEndOffset, RangeBoundarySetBy::Offset, TreeKind::DOM);
+      MOZ_ASSERT(mEndRef->IsSetAndValid());
+    }
+    return mEndRef.ref();
+  }
+
+  int operator()(const AbstractRange* const aRange) const {
+    auto ComparePoints =
+        [](const ConstRawRangeBoundary& aRef1, RangeBoundaryFor aFor1,
+           const ConstRawRangeBoundary& aRef2, RangeBoundaryFor aFor2,
+           nsContentUtils::NodeIndexCache* aCache) {
+          return nsContentUtils::ComparePoints<TreeKind::FlatForSelection>(
+              aRef1.AsRangeBoundaryInFlatTreeOrNonFlattenedNode(aFor1),
+              aRef2.AsRangeBoundaryInFlatTreeOrNonFlattenedNode(aFor2), aCache);
+        };
+
+    Maybe<int32_t> cmp = ComparePoints(
+        EndRef(),
+        Collapsed() ? RangeBoundaryFor::Collapsed : RangeBoundaryFor::End,
+        aRange->MayCrossShadowBoundaryStartRef().AsConstRaw(),
+        aRange->AreNormalRangeAndCrossShadowBoundaryRangeCollapsed()
+            ? RangeBoundaryFor::Collapsed
+            : RangeBoundaryFor::Start,
+        mCache);
+    if (cmp.valueOr(1) == 1) {
+      cmp = ComparePoints(
+          StartRef(),
+          Collapsed() ? RangeBoundaryFor::Collapsed : RangeBoundaryFor::Start,
+          aRange->MayCrossShadowBoundaryEndRef().AsConstRaw(),
+          aRange->AreNormalRangeAndCrossShadowBoundaryRangeCollapsed()
+              ? RangeBoundaryFor::Collapsed
+              : RangeBoundaryFor::End,
+          mCache);
+      if (cmp.valueOr(1) == -1) {
+        return 0;
+      }
+      return 1;
+    }
+    return -1;
+  }
+
+ private:
+  const nsINode& mNode;
+  const uint32_t mStartOffset;
+  const uint32_t mEndOffset;
+  nsContentUtils::NodeIndexCache* mCache;
+  Maybe<ConstRawRangeBoundary> mStartRef;
+  Maybe<ConstRawRangeBoundary> mEndRef;
+};
+
+bool nsINode::IsSelected(const uint32_t aStartOffset, const uint32_t aEndOffset,
+                         SelectionNodeCache* aCache) const {
+  MOZ_ASSERT(aStartOffset <= aEndOffset);
+  MOZ_ASSERT(aStartOffset <= Length());
+  MOZ_ASSERT(aEndOffset <= Length());
+  const nsINode* ancestorForCache =
+      GetClosestCommonInclusiveAncestorForRangeInSelection(this);
+  NS_ASSERTION(ancestorForCache || !IsMaybeSelected(),
+               "A node without a common inclusive ancestor for a range in "
+               "Selection is for sure not selected.");
+
+  AutoTArray<Selection*, 1> ancestorSelections;
+  if (const auto* cached =
+          aCache ? aCache->LastCommonAncestorSelections(ancestorForCache)
+                 : nullptr) {
+    ancestorSelections.AppendElements(*cached);
+  } else {
+    for (const nsINode* n = ancestorForCache; n;
+         n = GetClosestCommonInclusiveAncestorForRangeInSelection(
+             n->GetParentNode())) {
+      const LinkedList<AbstractRange>* ranges =
+          n->GetExistingClosestCommonInclusiveAncestorRanges();
+      if (!ranges) {
+        continue;
+      }
+      for (const AbstractRange* range : *ranges) {
+        MOZ_ASSERT(range->IsInAnySelection(),
+                   "Why is this range registered with a node?");
+        if (range->IsInAnySelection()) {
+          for (const WeakPtr<Selection>& selection : range->GetSelections()) {
+            if (selection && !ancestorSelections.Contains(selection)) {
+              ancestorSelections.AppendElement(selection);
+            }
+          }
+        }
+      }
+    }
+    if (aCache) {
+      aCache->SetLastCommonAncestorSelections(ancestorForCache,
+                                              ancestorSelections);
+    }
+  }
+  if (aCache && aCache->MaybeCollectNodesAndCheckIfFullySelectedInAnyOf(
+                    this, ancestorSelections)) {
+    return true;
+  }
+
+  nsContentUtils::NodeIndexCache cache;
+  const IsItemInRangeComparator comparator{*this, aStartOffset, aEndOffset,
+                                           &cache};
+  const RangeBoundaryFor comparatorStartBoundaryFor =
+      comparator.Collapsed() ? RangeBoundaryFor::Collapsed
+                             : RangeBoundaryFor::Start;
+  const RangeBoundaryFor comparatorEndBoundaryFor =
+      comparator.Collapsed() ? RangeBoundaryFor::Collapsed
+                             : RangeBoundaryFor::End;
+  for (Selection* selection : ancestorSelections) {
+    size_t low = 0;
+    size_t high = selection->RangeCount();
+
+    while (high != low) {
+      size_t middle = low + (high - low) / 2;
+
+      const AbstractRange* const range = selection->GetAbstractRangeAt(middle);
+      int result = comparator(range);
+      if (result == 0) {
+        if (!range->Collapsed()) {
+          return true;
+        }
+
+        if (range->MayCrossShadowBoundary()) {
+          MOZ_ASSERT(range->IsDynamicRange(),
+                     "range->MayCrossShadowBoundary() can only return true for "
+                     "dynamic range");
+          StaticRange* crossBoundaryRange =
+              range->AsDynamicRange()->GetCrossShadowBoundaryRange();
+          MOZ_ASSERT(crossBoundaryRange);
+          if (!crossBoundaryRange->Collapsed()) {
+            return true;
+          }
+        }
+
+        auto ComparePoints = [](const ConstRawRangeBoundary& aBoundary1,
+                                RangeBoundaryFor aFor1,
+                                const RangeBoundary& aBoundary2,
+                                RangeBoundaryFor aFor2,
+                                nsContentUtils::NodeIndexCache* aCache) {
+          MOZ_ASSERT(aBoundary1.GetTreeKind() == TreeKind::DOM);
+          MOZ_ASSERT(aBoundary2.GetTreeKind() == TreeKind::DOM);
+          return nsContentUtils::ComparePoints<TreeKind::FlatForSelection>(
+              aBoundary1.AsRangeBoundaryInFlatTreeOrNonFlattenedNode(aFor1),
+              aBoundary2.AsRaw().AsRangeBoundaryInFlatTreeOrNonFlattenedNode(
+                  aFor2),
+              aCache);
+        };
+
+        const AbstractRange* middlePlus1;
+        const AbstractRange* middleMinus1;
+        if (middle + 1 < high &&
+            (middlePlus1 = selection->GetAbstractRangeAt(middle + 1)) &&
+            ComparePoints(comparator.EndRef(), comparatorEndBoundaryFor,
+                          middlePlus1->StartRef(),
+                          middlePlus1->Collapsed() ? RangeBoundaryFor::Collapsed
+                                                   : RangeBoundaryFor::Start,
+                          &cache)
+                    .valueOr(1) > 0) {
+          result = 1;
+        } else if (middle >= 1 &&
+                   (middleMinus1 = selection->GetAbstractRangeAt(middle - 1)) &&
+                   ComparePoints(
+                       comparator.StartRef(), comparatorStartBoundaryFor,
+                       middleMinus1->EndRef(),
+                       middleMinus1->Collapsed() ? RangeBoundaryFor::Collapsed
+                                                 : RangeBoundaryFor::End,
+                       &cache)
+                           .valueOr(1) < 0) {
+          result = -1;
+        } else {
+          break;
+        }
+      }
+
+      if (result < 0) {
+        high = middle;
+      } else {
+        low = middle + 1;
+      }
+    }
+  }
+
+  return false;
+}
+
+Element* nsINode::GetAnonymousRootElementOfTextEditor() {
+  TextControlElement* textControlElement = nullptr;
+  if (IsInNativeAnonymousSubtree()) {
+    textControlElement = TextControlElement::FromNodeOrNull(
+        GetClosestNativeAnonymousSubtreeRootParentOrHost());
+  } else {
+    textControlElement = TextControlElement::FromNode(this);
+  }
+  if (!textControlElement) {
+    return nullptr;
+  }
+  return textControlElement->GetTextEditorRoot();
+}
+
+void nsINode::QueueDevtoolsAnonymousEvent(bool aIsRemove) {
+  MOZ_ASSERT(IsRootOfNativeAnonymousSubtree());
+  MOZ_ASSERT(OwnerDoc()->DevToolsAnonymousAndShadowEventsEnabled());
+  AsyncEventDispatcher* dispatcher = new AsyncEventDispatcher(
+      this, aIsRemove ? u"anonymousrootremoved"_ns : u"anonymousrootcreated"_ns,
+      CanBubble::eYes, ChromeOnlyDispatch::eYes, Composed::eYes);
+  dispatcher->PostDOMEvent();
+}
+
+nsINode* nsINode::GetRootNode(const GetRootNodeOptions& aOptions) {
+  if (aOptions.mComposed) {
+    if (Document* doc = GetComposedDoc()) {
+      return doc;
+    }
+
+    nsINode* node = this;
+    while (node) {
+      node = node->SubtreeRoot();
+      ShadowRoot* shadow = ShadowRoot::FromNode(node);
+      if (!shadow) {
+        break;
+      }
+      node = shadow->GetHost();
+    }
+
+    return node;
+  }
+
+  return SubtreeRoot();
+}
+
+nsIContent* nsINode::GetFirstChildOfTemplateOrNode() {
+  if (IsTemplateElement()) {
+    DocumentFragment* frag = static_cast<HTMLTemplateElement*>(this)->Content();
+    return frag->GetFirstChild();
+  }
+
+  return GetFirstChild();
+}
+
+#ifdef DEBUG
+void nsINode::AssertSubtreeRootIsInSync() const {
+  auto RootOfNode = [](const nsINode* aStart) -> nsINode* {
+    const nsINode* node = aStart;
+    const nsINode* iter = node;
+    while ((iter = iter->GetParentNode())) {
+      node = iter;
+    }
+    return const_cast<nsINode*>(node);
+  };
+  MOZ_ASSERT(mSubtreeRoot, "Should always have a node here!");
+  MOZ_ASSERT(RootOfNode(this) == mSubtreeRoot,
+             "These should always be in sync!");
+  MOZ_ASSERT(!IsInShadowTree() || mSubtreeRoot->IsShadowRoot(),
+             "Subtree root should be a shadow root if in shadow tree");
+  MOZ_ASSERT(!IsInUncomposedDoc() || mSubtreeRoot == OwnerDoc(),
+             "Subtree root should be doc if in uncomposed doc");
+}
+#endif
+
+static nsIContent* GetRootForContentSubtree(nsIContent* aContent) {
+  NS_ENSURE_TRUE(aContent, nullptr);
+
+  if (ShadowRoot* containingShadow = aContent->GetContainingShadow()) {
+    return containingShadow;
+  }
+  if (nsIContent* nativeAnonRoot =
+          aContent->GetClosestNativeAnonymousSubtreeRoot()) {
+    return nativeAnonRoot;
+  }
+  if (Document* doc = aContent->GetUncomposedDoc()) {
+    return doc->GetRootElement();
+  }
+  return nsIContent::FromNode(aContent->SubtreeRoot());
+}
+
+nsIContent* nsINode::GetSelectionRootContent(
+    PresShell* aPresShell,
+    IgnoreOwnIndependentSelection aIgnoreOwnIndependentSelection,
+    AllowCrossShadowBoundary aAllowCrossShadowBoundary) {
+  NS_ENSURE_TRUE(aPresShell, nullptr);
+
+  const bool isContent = IsContent();
+
+  if (!isContent && !IsDocument()) {
+    return nullptr;
+  }
+
+  if (isContent) {
+    if (GetComposedDoc() != aPresShell->GetDocument()) {
+      return nullptr;
+    }
+
+    const bool computeTextEditorRoot =
+        IsInNativeAnonymousSubtree() ||
+        (aIgnoreOwnIndependentSelection == IgnoreOwnIndependentSelection::No &&
+         AsContent()->HasIndependentSelection());
+    if (computeTextEditorRoot) {
+      if (Element* anonymousDivElement =
+              GetAnonymousRootElementOfTextEditor()) {
+        return anonymousDivElement;
+      }
+    }
+  }
+
+  if (nsPresContext* presContext = aPresShell->GetPresContext()) {
+    if (nsContentUtils::GetHTMLEditor(presContext)) {
+      if (IsContent() && IsInComposedDoc() && !IsInDesignMode()) {
+        if (nsIContent* const editableContent =
+                AsContent()->GetInclusiveEditableAncestor()) {
+          return editableContent->GetEditingHost();
+        }
+      }
+      else if (IsInDesignMode() || !IsInComposedDoc()) {
+        Element* const bodyOrDocumentElement = [&]() -> Element* {
+          if (Element* const bodyElement = OwnerDoc()->GetBodyElement()) {
+            return bodyElement;
+          }
+          return OwnerDoc()->GetDocumentElement();
+        }();
+        NS_ENSURE_TRUE(bodyOrDocumentElement, nullptr);
+        return nsContentUtils::IsInSameAnonymousTree(this,
+                                                     bodyOrDocumentElement)
+                   ? bodyOrDocumentElement
+                   : GetRootForContentSubtree(AsContent());
+      }
+    }
+  }
+
+  if (!isContent) {
+    return nullptr;
+  }
+
+  RefPtr<nsFrameSelection> fs = aPresShell->FrameSelection();
+  nsCOMPtr<nsIContent> content = fs->GetIndependentSelectionRootElement();
+  if (!content) {
+    content = fs->GetAncestorLimiter();
+    if (!content) {
+      Document* doc = aPresShell->GetDocument();
+      NS_ENSURE_TRUE(doc, nullptr);
+      content = doc->GetRootElement();
+      if (!content) {
+        return nullptr;
+      }
+    }
+  }
+
+  NS_ENSURE_TRUE(content, nullptr);
+  if (nsContentUtils::IsInSameAnonymousTree(this, content)) {
+    return content;
+  }
+  content = GetRootForContentSubtree(AsContent());
+  ShadowRoot* const shadowRoot = ShadowRoot::FromNode(content);
+  if (!shadowRoot) {
+    return content;
+  }
+  Element* const hostElement = shadowRoot->GetHost();
+  if (!hostElement) [[unlikely]] {
+    return content;
+  }
+  return bool(aAllowCrossShadowBoundary)
+             ? hostElement->GetSelectionRootContent(
+                   aPresShell, aIgnoreOwnIndependentSelection,
+                   aAllowCrossShadowBoundary)
+             : hostElement;
+}
+
+nsFrameSelection* nsINode::GetFrameSelection() const {
+  if (!IsInComposedDoc()) {
+    return nullptr;
+  }
+  if (IsInNativeAnonymousSubtree()) {
+    auto* const textControlElement = TextControlElement::FromNodeOrNull(
+        GetClosestNativeAnonymousSubtreeRootParentOrHost());
+    if (textControlElement &&
+        textControlElement->IsSingleLineTextControlOrTextArea()) {
+      nsFrameSelection* const independentFrameSelection =
+          textControlElement->GetIndependentFrameSelection();
+      if (!independentFrameSelection) {
+        return nullptr;  
+      }
+      const Element* const anonymousDiv =
+          independentFrameSelection->GetIndependentSelectionRootElement();
+      if (!anonymousDiv || !IsInclusiveDescendantOf(anonymousDiv)) {
+        return nullptr;  
+      }
+      return independentFrameSelection;
+    }
+  }
+  PresShell* const presShell = OwnerDoc()->GetPresShell();
+  if (!presShell) {
+    return nullptr;
+  }
+  return const_cast<nsFrameSelection*>(presShell->ConstFrameSelection());
+}
+
+NodeList* nsINode::ChildNodes() {
+  nsSlots* slots = Slots();
+  if (!slots->mChildNodes) {
+    slots->mChildNodes = IsAttr() ? new nsAttrChildContentList(this)
+                                  : new nsParentNodeChildContentList(this);
+  }
+
+  return slots->mChildNodes;
+}
+
+nsIContent* nsINode::GetLastChild() const {
+  return mFirstChild ? mFirstChild->mPreviousOrLastSibling : nullptr;
+}
+
+void nsINode::InvalidateChildNodes() {
+  MOZ_ASSERT(!IsAttr());
+
+  nsSlots* slots = GetExistingSlots();
+  if (!slots || !slots->mChildNodes) {
+    return;
+  }
+
+  auto childNodes =
+      static_cast<nsParentNodeChildContentList*>(slots->mChildNodes.get());
+  childNodes->InvalidateCache();
+}
+
+void nsINode::GetTextContentInternal(nsAString& aTextContent,
+                                     OOMReporter& aError) {
+  SetDOMStringToNull(aTextContent);
+}
+
+DocumentOrShadowRoot* nsINode::GetContainingDocumentOrShadowRoot() const {
+  if (IsInUncomposedDoc()) {
+    return OwnerDoc();
+  }
+
+  if (IsInShadowTree()) {
+    return AsContent()->GetContainingShadow();
+  }
+
+  return nullptr;
+}
+
+DocumentOrShadowRoot* nsINode::GetUncomposedDocOrConnectedShadowRoot() const {
+  if (IsInUncomposedDoc()) {
+    return OwnerDoc();
+  }
+
+  if (IsInComposedDoc() && IsInShadowTree()) {
+    return AsContent()->GetContainingShadow();
+  }
+
+  return nullptr;
+}
+
+SafeDoublyLinkedList<nsIMutationObserver>* nsINode::GetMutationObservers() {
+  if (auto* slots = GetExistingSlots()) {
+    if (!slots->mMutationObservers.isEmpty()) {
+      return &slots->mMutationObservers;
+    }
+  }
+  return nullptr;
+}
+
+void nsINode::LastRelease() {
+  if (nsSlots* slots = GetExistingSlots()) {
+    if (!slots->mMutationObservers.isEmpty()) {
+      for (auto iter = slots->mMutationObservers.begin();
+           iter != slots->mMutationObservers.end(); ++iter) {
+        iter->NodeWillBeDestroyed(this);
+      }
+    }
+    ClearBoundObjects(*slots, *this);
+    if (IsContent()) {
+      nsIContent* content = AsContent();
+      if (HTMLSlotElement* slot = content->GetManualSlotAssignment()) {
+        content->SetManualSlotAssignment(nullptr);
+        slot->RemoveManuallyAssignedNode(*content);
+      }
+    }
+
+    if (Element* element = Element::FromNode(this)) {
+      if (CustomElementData* data = element->GetCustomElementData()) {
+        data->Unlink();
+      }
+    }
+
+    slots->~nsSlots();
+    mSlots = nullptr;
+    free(slots);
+  }
+
+  if (IsDocument()) {
+    AsDocument()->RemoveAllProperties();
+    AsDocument()->DropStyleSet();
+  } else {
+    if (HasProperties()) {
+      nsCOMPtr<Document> document = OwnerDoc();
+      document->RemoveAllPropertiesFor(this);
+    }
+
+    if (HasFlag(ADDED_TO_FORM)) {
+      if (auto* formControl = nsGenericHTMLFormControlElement::FromNode(this)) {
+        formControl->ClearForm(true, true);
+      } else if (auto* imageElem = HTMLImageElement::FromNode(this)) {
+        imageElem->ClearForm(true);
+      }
+    }
+    if (HasFlag(NODE_HAS_LISTENERMANAGER)) {
+#ifdef DEBUG
+      if (nsContentUtils::IsInitialized()) {
+        EventListenerManager* manager =
+            nsContentUtils::GetExistingListenerManagerForNode(this);
+        if (!manager) {
+          NS_ERROR(
+              "Huh, our bit says we have a listener manager list, "
+              "but there's nothing in the hash!?!!");
+        }
+      }
+#endif
+
+      nsContentUtils::RemoveListenerManager(this);
+      UnsetFlags(NODE_HAS_LISTENERMANAGER);
+    }
+
+    if (Element* element = Element::FromNode(this)) {
+      element->ClearAttributes();
+      if (MOZ_UNLIKELY(element->HasFlag(ELEMENT_HAS_EDIT_CONTEXT))) {
+        element->ClearEditContext();
+      }
+    }
+  }
+
+  UnsetFlags(NODE_HAS_PROPERTIES);
+  ReleaseWrapper(this);
+
+  FragmentOrElement::RemoveBlackMarkedNode(this);
+}
+
+void nsINode::GetDebugDescription(nsACString& aOutput,
+                                  const nsINode* aRoot ) const {
+  aOutput.Truncate();
+
+  const nsINode* prev = nullptr;
+  for (const nsINode* curr = this; curr;
+       prev = curr, curr = curr->GetParentOrShadowHostNode()) {
+    nsAutoString id, cls;
+    if (curr->IsElement()) {
+      curr->AsElement()->GetId(id);
+      if (const nsAttrValue* attrValue = curr->AsElement()->GetClasses()) {
+        attrValue->ToString(cls);
+      }
+    }
+
+    if (!aOutput.IsEmpty()) {
+      aOutput.AppendLiteral(".");
+    }
+
+    if (!curr->LocalName().IsEmpty()) {
+      aOutput.Append(NS_ConvertUTF16toUTF8(curr->LocalName()));
+    } else {
+      aOutput.Append(NS_ConvertUTF16toUTF8(curr->NodeName()));
+    }
+
+    if (!id.IsEmpty()) {
+      aOutput.Append("['"_ns + NS_ConvertUTF16toUTF8(id) + "']"_ns);
+    } else if (!cls.IsEmpty()) {
+      aOutput.Append("[class=\""_ns + NS_ConvertUTF16toUTF8(cls) + "\"]"_ns);
+    }
+
+    if (const Element* const element = Element::FromNode(curr)) {
+      if (element->HasAttr(nsGkAtoms::contenteditable)) {
+        nsAutoString val;
+        element->GetAttr(nsGkAtoms::contenteditable, val);
+        aOutput.Append("[contenteditable=\""_ns + NS_ConvertUTF16toUTF8(val) +
+                       "\"]"_ns);
+      }
+      if (!prev ||
+          (!prev->IsShadowRoot() &&
+           !prev->AsContent()->GetAssignedSlot())) {
+        if (ShadowRoot* const shadowRoot = element->GetShadowRoot()) {
+          aOutput.AppendFmt("(has a {}shadow)",
+                            shadowRoot->IsUAWidget() ||
+                                    !shadowRoot->GetHost() ||
+                                    !shadowRoot->GetHost()->CanAttachShadowDOM()
+                                ? "UA "
+                                : "");
+        }
+      }
+      if (element->HasFlag(ELEMENT_HAS_EDIT_CONTEXT)) {
+        aOutput.AppendLiteral("(has an edit context)");
+      }
+    } else if (curr->IsDocument() && curr->IsInDesignMode()) {
+      aOutput.AppendLiteral("[designMode=\"on\"]");
+    } else if (const ShadowRoot* shadowRoot = ShadowRoot::FromNode(curr)) {
+      aOutput.AppendFmt("({}shadow root)",
+                        shadowRoot->IsUAWidget() || !shadowRoot->GetHost() ||
+                                !shadowRoot->GetHost()->CanAttachShadowDOM()
+                            ? "UA "
+                            : "");
+    } else if (const CharacterData* const charData =
+                   CharacterData::FromNode(curr)) {
+      const TextControlElement* textControlElement =
+          TextControlElement::FromNodeOrNull(
+              charData->GetContainingShadowHost());
+      if (!textControlElement ||
+          !textControlElement->IsSingleLineTextControlOrTextArea()) {
+        nsAutoString data;
+        charData->GetData(data);
+        if (data.Length() > 8) {
+          data.Truncate(5);
+          data.AppendLiteral("...");
+        }
+        data.ReplaceSubstring(u"\\", u"\\\\");
+        data.ReplaceSubstring(u"\n", u"\\n");
+        data.ReplaceSubstring(u"\"", u"\\\"");
+        data.ReplaceSubstring(u"\u00A0", u"&nbsp;");
+        aOutput.Append("(\""_ns + NS_ConvertUTF16toUTF8(data) + "\")"_ns);
+      }
+    }
+
+    if (curr->IsContent()) {
+      if (const HTMLSlotElement* const slot =
+              curr->AsContent()->GetAssignedSlot()) {
+        aOutput.AppendFmt("(Assigned to {})",
+                          slot->FormatAs(slot->GetContainingShadow()));
+      }
+    }
+
+    if (aRoot == curr) {
+      break;
+    }
+  }
+}
+
+nsCString nsINode::FormatAs(const nsINode* aRoot) const {
+  nsCString elemDesc;
+  GetDebugDescription(elemDesc, aRoot);
+  return elemDesc;
+}
+
+std::ostream& operator<<(std::ostream& aStream, const nsINode& aNode) {
+  return aStream << aNode.FormatAs(nullptr);
+}
+
+nsIContent* nsINode::DoGetShadowHost() const {
+  MOZ_ASSERT(IsShadowRoot());
+  return static_cast<const ShadowRoot*>(this)->GetHost();
+}
+
+Element* nsINode::GetContainingShadowHost() const {
+  if (ShadowRoot* shadow = GetContainingShadow()) {
+    return shadow->GetHost();
+  }
+  return nullptr;
+}
+
+SVGUseElement* nsINode::DoGetContainingSVGUseShadowHost() const {
+  MOZ_ASSERT(IsInShadowTree());
+  return SVGUseElement::FromNodeOrNull(GetContainingShadowHost());
+}
+
+void nsINode::GetNodeValueInternal(nsAString& aNodeValue) {
+  SetDOMStringToNull(aNodeValue);
+}
+
+static const char* NodeTypeAsString(nsINode* aNode) {
+  static const char* NodeTypeStrings[] = {
+      "",  
+      "an Element",
+      "an Attribute",
+      "a Text",
+      "a CDATASection",
+      "an EntityReference",
+      "an Entity",
+      "a ProcessingInstruction",
+      "a Comment",
+      "a Document",
+      "a DocumentType",
+      "a DocumentFragment",
+      "a Notation",
+  };
+  static_assert(std::size(NodeTypeStrings) == nsINode::MAX_NODE_TYPE + 1,
+                "Max node type out of range for our array");
+
+  uint16_t nodeType = aNode->NodeType();
+  MOZ_RELEASE_ASSERT(nodeType < std::size(NodeTypeStrings),
+                     "Uknown out-of-range node type");
+  return NodeTypeStrings[nodeType];
+}
+
+nsINode* nsINode::RemoveChildInternal(
+    nsINode& aOldChild, MutationEffectOnScript aMutationEffectOnScript,
+    ErrorResult& aError) {
+  if (!aOldChild.IsContent()) {
+    aError.ThrowNotFoundError(
+        "The node to be removed is not a child of this node");
+    return nullptr;
+  }
+
+  if (aOldChild.GetParentNode() == this) {
+    nsContentUtils::NotifyDevToolsOfNodeRemoval(aOldChild);
+  }
+
+  if (aOldChild.IsRootOfNativeAnonymousSubtree() ||
+      aOldChild.GetParentNode() != this) {
+    aError.ThrowNotFoundError(
+        "The node to be removed is not a child of this node");
+    return nullptr;
+  }
+
+  RemoveChildNode(aOldChild.AsContent(), true, nullptr, nullptr,
+                  aMutationEffectOnScript);
+  return &aOldChild;
+}
+
+void nsINode::Normalize() {
+  AutoTArray<nsCOMPtr<nsIContent>, 50> nodes;
+
+  bool canMerge = false;
+  for (nsIContent* node = this->GetFirstChild(); node;
+       node = node->GetNextNode(this)) {
+    if (node->NodeType() != TEXT_NODE) {
+      canMerge = false;
+      continue;
+    }
+
+    if (canMerge || node->TextLength() == 0) {
+      nodes.AppendElement(node);
+    } else {
+      canMerge = true;
+    }
+
+    canMerge = canMerge && !!node->GetNextSibling();
+  }
+
+  if (nodes.IsEmpty()) {
+    return;
+  }
+
+  const RefPtr<Document> doc = OwnerDoc();
+
+  const bool notifyDevToolsOfNodeRemovals =
+      MaybeNeedsToNotifyDevToolsOfNodeRemovalsInOwnerDoc();
+  if (MOZ_UNLIKELY(notifyDevToolsOfNodeRemovals)) {
+    for (const nsCOMPtr<nsIContent>& node : nodes) {
+      if (node->GetParentNode()) {
+        nsContentUtils::NotifyDevToolsOfNodeRemoval(MOZ_KnownLive(*node));
+      }
+    }
+  }
+
+  mozAutoDocUpdate batch(doc, true);
+
+  nsAutoString tmpStr;
+  for (uint32_t i = 0; i < nodes.Length(); ++i) {
+    nsIContent* node = nodes[i];
+    const CharacterDataBuffer* characterDataBuffer =
+        node->GetCharacterDataBuffer();
+    if (characterDataBuffer->GetLength()) {
+      nsIContent* target = node->GetPreviousSibling();
+      if (target && target->NodeType() == TEXT_NODE) {
+        nsTextNode* t = static_cast<nsTextNode*>(target);
+        if (characterDataBuffer->Is2b()) {
+          t->AppendTextForNormalize(characterDataBuffer->Get2b(),
+                                    characterDataBuffer->GetLength(), true,
+                                    node);
+        } else {
+          tmpStr.Truncate();
+          characterDataBuffer->AppendTo(tmpStr);
+          t->AppendTextForNormalize(tmpStr.get(), tmpStr.Length(), true, node);
+        }
+      }
+    }
+
+    nsCOMPtr<nsINode> parent = node->GetParentNode();
+    NS_ASSERTION(parent || notifyDevToolsOfNodeRemovals,
+                 "Should always have a parent unless "
+                 "mutation events messed us up");
+    if (parent) {
+      parent->RemoveChildNode(node, true, nullptr, nullptr,
+                              MutationEffectOnScript::KeepTrustWorthiness);
+    }
+  }
+}
+
+nsresult nsINode::GetBaseURI(nsAString& aURI) const {
+  nsIURI* baseURI = GetBaseURI();
+
+  nsAutoCString spec;
+  if (baseURI) {
+    nsresult rv = baseURI->GetSpec(spec);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  CopyUTF8toUTF16(spec, aURI);
+  return NS_OK;
+}
+
+void nsINode::GetBaseURIFromJS(nsAString& aURI, CallerType aCallerType,
+                               ErrorResult& aRv) const {
+  nsIURI* baseURI = GetBaseURI(aCallerType == CallerType::System);
+  nsAutoCString spec;
+  if (baseURI) {
+    nsresult res = baseURI->GetSpec(spec);
+    if (NS_FAILED(res)) {
+      aRv.Throw(res);
+      return;
+    }
+  }
+  CopyUTF8toUTF16(spec, aURI);
+}
+
+nsIURI* nsINode::GetBaseURIObject() const { return GetBaseURI(true); }
+
+void nsINode::LookupPrefix(const nsAString& aNamespaceURI, nsAString& aPrefix) {
+  if (Element* nsElement = GetNameSpaceElement()) {
+
+    for (Element* element : nsElement->InclusiveAncestorsOfType<Element>()) {
+      uint32_t attrCount = element->GetAttrCount();
+
+      for (uint32_t i = 0; i < attrCount; ++i) {
+        const nsAttrName* name = element->GetAttrNameAt(i);
+
+        if (name->NamespaceEquals(kNameSpaceID_XMLNS) &&
+            element->AttrValueIs(kNameSpaceID_XMLNS, name->LocalName(),
+                                 aNamespaceURI, eCaseMatters)) {
+          nsAtom* localName = name->LocalName();
+
+          if (localName != nsGkAtoms::xmlns) {
+            localName->ToString(aPrefix);
+          } else {
+            SetDOMStringToNull(aPrefix);
+          }
+          return;
+        }
+      }
+    }
+  }
+
+  SetDOMStringToNull(aPrefix);
+}
+
+uint16_t nsINode::CompareDocumentPosition(const nsINode& aOtherNode) const {
+  if (this == &aOtherNode) {
+    return 0;
+  }
+  if (GetPreviousSibling() == &aOtherNode) {
+    MOZ_ASSERT(GetParentNode() == aOtherNode.GetParentNode());
+    return Node_Binding::DOCUMENT_POSITION_PRECEDING;
+  }
+  if (GetNextSibling() == &aOtherNode) {
+    MOZ_ASSERT(GetParentNode() == aOtherNode.GetParentNode());
+    return Node_Binding::DOCUMENT_POSITION_FOLLOWING;
+  }
+
+  AutoTArray<const nsINode*, 32> parents1, parents2;
+
+  const nsINode* node1 = &aOtherNode;
+  const nsINode* node2 = this;
+
+  const Attr* attr1 = Attr::FromNode(node1);
+  if (attr1) {
+    const Element* elem = attr1->GetElement();
+    if (elem) {
+      node1 = elem;
+      parents1.AppendElement(attr1);
+    }
+  }
+  if (auto* attr2 = Attr::FromNode(node2)) {
+    const Element* elem = attr2->GetElement();
+    if (elem == node1 && attr1) {
+
+      uint32_t i;
+      const nsAttrName* attrName;
+      for (i = 0; elem->GetAttrNameAt(i, &attrName); ++i) {
+        if (attrName->Equals(attr1->NodeInfo())) {
+          NS_ASSERTION(!attrName->Equals(attr2->NodeInfo()),
+                       "Different attrs at same position");
+          return Node_Binding::DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC |
+                 Node_Binding::DOCUMENT_POSITION_PRECEDING;
+        }
+        if (attrName->Equals(attr2->NodeInfo())) {
+          return Node_Binding::DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC |
+                 Node_Binding::DOCUMENT_POSITION_FOLLOWING;
+        }
+      }
+      MOZ_ASSERT_UNREACHABLE("neither attribute in the element");
+      return Node_Binding::DOCUMENT_POSITION_DISCONNECTED;
+    }
+
+    if (elem) {
+      node2 = elem;
+      parents2.AppendElement(attr2);
+    }
+  }
+
+
+  do {
+    parents1.AppendElement(node1);
+    node1 = node1->GetParentNode();
+  } while (node1);
+  do {
+    parents2.AppendElement(node2);
+    node2 = node2->GetParentNode();
+  } while (node2);
+
+  uint32_t pos1 = parents1.Length();
+  uint32_t pos2 = parents2.Length();
+  const nsINode* top1 = parents1.ElementAt(--pos1);
+  const nsINode* top2 = parents2.ElementAt(--pos2);
+  if (top1 != top2) {
+    return top1 < top2
+               ? (Node_Binding::DOCUMENT_POSITION_PRECEDING |
+                  Node_Binding::DOCUMENT_POSITION_DISCONNECTED |
+                  Node_Binding::DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC)
+               : (Node_Binding::DOCUMENT_POSITION_FOLLOWING |
+                  Node_Binding::DOCUMENT_POSITION_DISCONNECTED |
+                  Node_Binding::DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC);
+  }
+
+  const nsINode* parent = top1;
+  uint32_t len;
+  for (len = std::min(pos1, pos2); len > 0; --len) {
+    const nsINode* child1 = parents1.ElementAt(--pos1);
+    const nsINode* child2 = parents2.ElementAt(--pos2);
+    if (child1 != child2) {
+      Maybe<uint32_t> child1Index = parent->ComputeIndexOf(child1);
+      Maybe<uint32_t> child2Index = parent->ComputeIndexOf(child2);
+      return child1Index < child2Index
+                 ? Node_Binding::DOCUMENT_POSITION_PRECEDING
+                 : Node_Binding::DOCUMENT_POSITION_FOLLOWING;
+    }
+    parent = child1;
+  }
+
+  return pos1 < pos2 ? (Node_Binding::DOCUMENT_POSITION_PRECEDING |
+                        Node_Binding::DOCUMENT_POSITION_CONTAINS)
+                     : (Node_Binding::DOCUMENT_POSITION_FOLLOWING |
+                        Node_Binding::DOCUMENT_POSITION_CONTAINED_BY);
+}
+
+bool nsINode::IsSameNode(nsINode* other) { return other == this; }
+
+bool nsINode::IsEqualNode(nsINode* aOther) {
+  if (!aOther) {
+    return false;
+  }
+
+  if (aOther == this) {
+    return true;
+  }
+
+  nsAutoString string1, string2;
+
+  nsINode* node1 = this;
+  nsINode* node2 = aOther;
+  do {
+    uint16_t nodeType = node1->NodeType();
+    if (nodeType != node2->NodeType()) {
+      return false;
+    }
+
+    mozilla::dom::NodeInfo* nodeInfo1 = node1->mNodeInfo;
+    mozilla::dom::NodeInfo* nodeInfo2 = node2->mNodeInfo;
+    if (!nodeInfo1->Equals(nodeInfo2) ||
+        nodeInfo1->GetExtraName() != nodeInfo2->GetExtraName()) {
+      return false;
+    }
+
+    switch (nodeType) {
+      case ELEMENT_NODE: {
+        Element* element1 = node1->AsElement();
+        Element* element2 = node2->AsElement();
+        uint32_t attrCount = element1->GetAttrCount();
+        if (attrCount != element2->GetAttrCount()) {
+          return false;
+        }
+
+        for (uint32_t i = 0; i < attrCount; ++i) {
+          const nsAttrName* attrName = element1->GetAttrNameAt(i);
+#ifdef DEBUG
+          bool hasAttr =
+#endif
+              element1->GetAttr(attrName->NamespaceID(), attrName->LocalName(),
+                                string1);
+          NS_ASSERTION(hasAttr, "Why don't we have an attr?");
+
+          if (!element2->AttrValueIs(attrName->NamespaceID(),
+                                     attrName->LocalName(), string1,
+                                     eCaseMatters)) {
+            return false;
+          }
+        }
+        break;
+      }
+      case TEXT_NODE:
+      case COMMENT_NODE:
+      case CDATA_SECTION_NODE:
+      case PROCESSING_INSTRUCTION_NODE: {
+        MOZ_ASSERT(node1->IsCharacterData());
+        MOZ_ASSERT(node2->IsCharacterData());
+        auto* data1 = static_cast<CharacterData*>(node1);
+        auto* data2 = static_cast<CharacterData*>(node2);
+
+        if (!data1->TextEquals(data2)) {
+          return false;
+        }
+
+        break;
+      }
+      case DOCUMENT_NODE:
+      case DOCUMENT_FRAGMENT_NODE:
+        break;
+      case ATTRIBUTE_NODE: {
+        NS_ASSERTION(node1 == this && node2 == aOther,
+                     "Did we come upon an attribute node while walking a "
+                     "subtree?");
+        node1->GetNodeValue(string1);
+        node2->GetNodeValue(string2);
+
+        return string1.Equals(string2);
+      }
+      case DOCUMENT_TYPE_NODE: {
+        DocumentType* docType1 = static_cast<DocumentType*>(node1);
+        DocumentType* docType2 = static_cast<DocumentType*>(node2);
+
+        docType1->GetPublicId(string1);
+        docType2->GetPublicId(string2);
+        if (!string1.Equals(string2)) {
+          return false;
+        }
+
+        docType1->GetSystemId(string1);
+        docType2->GetSystemId(string2);
+        if (!string1.Equals(string2)) {
+          return false;
+        }
+
+        break;
+      }
+      default:
+        MOZ_ASSERT(false, "Unknown node type");
+    }
+
+    nsINode* nextNode = node1->GetFirstChild();
+    if (nextNode) {
+      node1 = nextNode;
+      node2 = node2->GetFirstChild();
+    } else {
+      if (node2->GetFirstChild()) {
+        return false;
+      }
+
+      while (true) {
+        if (node1 == this) {
+          NS_ASSERTION(node2 == aOther,
+                       "Should have reached the start node "
+                       "for both trees at the same time");
+          return true;
+        }
+
+        nextNode = node1->GetNextSibling();
+        if (nextNode) {
+          node1 = nextNode;
+          node2 = node2->GetNextSibling();
+          break;
+        }
+
+        if (node2->GetNextSibling()) {
+          return false;
+        }
+
+        node1 = node1->GetParentNode();
+        node2 = node2->GetParentNode();
+        NS_ASSERTION(node1 && node2, "no parent while walking subtree");
+      }
+    }
+  } while (node2);
+
+  return false;
+}
+
+void nsINode::LookupNamespaceURI(const nsAString& aNamespacePrefix,
+                                 nsAString& aNamespaceURI) {
+  Element* element = GetNameSpaceElement();
+  if (!element || NS_FAILED(element->LookupNamespaceURIInternal(
+                      aNamespacePrefix, aNamespaceURI))) {
+    SetDOMStringToNull(aNamespaceURI);
+  }
+}
+
+bool nsINode::ComputeDefaultWantsUntrusted(ErrorResult& aRv) {
+  return !nsContentUtils::IsChromeDoc(OwnerDoc());
+}
+
+void nsINode::GetBoxQuads(const BoxQuadOptions& aOptions,
+                          nsTArray<RefPtr<DOMQuad>>& aResult,
+                          CallerType aCallerType, mozilla::ErrorResult& aRv) {
+  mozilla::GetBoxQuads(this, aOptions, aResult, aCallerType, aRv);
+}
+
+void nsINode::GetBoxQuadsFromWindowOrigin(const BoxQuadOptions& aOptions,
+                                          nsTArray<RefPtr<DOMQuad>>& aResult,
+                                          mozilla::ErrorResult& aRv) {
+  mozilla::GetBoxQuadsFromWindowOrigin(this, aOptions, aResult, aRv);
+}
+
+already_AddRefed<DOMQuad> nsINode::ConvertQuadFromNode(
+    DOMQuad& aQuad, const GeometryNode& aFrom,
+    const ConvertCoordinateOptions& aOptions, CallerType aCallerType,
+    ErrorResult& aRv) {
+  return mozilla::ConvertQuadFromNode(this, aQuad, aFrom, aOptions, aCallerType,
+                                      aRv);
+}
+
+already_AddRefed<DOMQuad> nsINode::ConvertRectFromNode(
+    DOMRectReadOnly& aRect, const GeometryNode& aFrom,
+    const ConvertCoordinateOptions& aOptions, CallerType aCallerType,
+    ErrorResult& aRv) {
+  return mozilla::ConvertRectFromNode(this, aRect, aFrom, aOptions, aCallerType,
+                                      aRv);
+}
+
+already_AddRefed<DOMPoint> nsINode::ConvertPointFromNode(
+    const DOMPointInit& aPoint, const GeometryNode& aFrom,
+    const ConvertCoordinateOptions& aOptions, CallerType aCallerType,
+    ErrorResult& aRv) {
+  return mozilla::ConvertPointFromNode(this, aPoint, aFrom, aOptions,
+                                       aCallerType, aRv);
+}
+
+bool nsINode::DispatchEvent(Event& aEvent, CallerType aCallerType,
+                            ErrorResult& aRv) {
+  nsCOMPtr<Document> document = OwnerDoc();
+
+  if (!document) {
+    return true;
+  }
+
+  RefPtr<nsPresContext> context = document->GetPresContext();
+
+  nsEventStatus status = nsEventStatus_eIgnore;
+  nsresult rv = EventDispatcher::DispatchDOMEvent(this, nullptr, &aEvent,
+                                                  context, &status);
+  bool retval = !aEvent.DefaultPrevented(aCallerType);
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+  }
+  return retval;
+}
+
+nsresult nsINode::PostHandleEvent(EventChainPostVisitor& ) {
+  return NS_OK;
+}
+
+EventListenerManager* nsINode::GetOrCreateListenerManager() {
+  return nsContentUtils::GetListenerManagerForNode(this);
+}
+
+EventListenerManager* nsINode::GetExistingListenerManager() const {
+  return nsContentUtils::GetExistingListenerManagerForNode(this);
+}
+
+Nullable<WindowProxyHolder> nsINode::GetDocumentGlobalForBindings() {
+  nsIGlobalObject* global = GetDocumentGlobal();
+  if (!global) {
+    return {};
+  }
+  auto* win = nsGlobalWindowInner::Cast(global->GetAsInnerWindow());
+  if (!win) {
+    return {};
+  }
+  auto* bc = win->GetBrowsingContext();
+  if (!bc) {
+    return {};
+  }
+  return WindowProxyHolder(bc);
+}
+
+nsIGlobalObject* nsINode::GetDocumentGlobal() const {
+  return OwnerDoc()->GetRelevantGlobal();
+}
+
+nsIGlobalObject* nsINode::GetRelevantGlobal() const {
+  if (auto* wrapper = GetWrapperPreserveColor()) {
+    if (auto* global = xpc::NativeGlobal(wrapper);
+        global && global->IsInnerWindow()) {
+      return global;
+    }
+  }
+  bool dummy;
+  return OwnerDoc()->GetScriptHandlingObject(dummy);
+}
+
+bool nsINode::UnoptimizableCCNode() const {
+  return IsInNativeAnonymousSubtree() || IsAttr();
+}
+
+bool nsINode::Traverse(nsINode* tmp, nsCycleCollectionTraversalCallback& cb) {
+  if (MOZ_LIKELY(!cb.WantAllTraces())) {
+    Document* currentDoc = tmp->GetComposedDoc();
+    if (currentDoc && nsCCUncollectableMarker::InGeneration(
+                          currentDoc->GetMarkedCCGeneration())) {
+      return false;
+    }
+
+    if (nsCCUncollectableMarker::sGeneration) {
+      if (tmp->HasKnownLiveWrapper() || tmp->InCCBlackTree()) {
+        return false;
+      }
+
+      if (!tmp->UnoptimizableCCNode()) {
+        if ((currentDoc && currentDoc->HasKnownLiveWrapper())) {
+          return false;
+        }
+        nsIContent* parent = tmp->GetParent();
+        if (parent && !parent->UnoptimizableCCNode() &&
+            parent->HasKnownLiveWrapper()) {
+          MOZ_ASSERT(parent->ComputeIndexOf(tmp).isSome(),
+                     "Parent doesn't own us?");
+          return false;
+        }
+      }
+    }
+  }
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mNodeInfo)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mFirstChild)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mNextSibling)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_RAWPTR(GetParent())
+
+  if (nsSlots* slots = tmp->GetExistingSlots()) {
+    slots->Traverse(cb);
+  }
+
+  if (tmp->HasProperties()) {
+#ifdef ACCESSIBILITY
+    auto* anode = static_cast<AccessibleNode*>(
+        tmp->GetProperty(nsGkAtoms::accessiblenode));
+    if (anode) {
+      cb.NoteXPCOMChild(anode);
+    }
+#endif
+  }
+
+  if (tmp->NodeType() != DOCUMENT_NODE &&
+      tmp->HasFlag(NODE_HAS_LISTENERMANAGER)) {
+    nsContentUtils::TraverseListenerManager(tmp, cb);
+  }
+
+  return true;
+}
+
+void nsINode::Unlink(nsINode* tmp) {
+  tmp->ReleaseWrapper(tmp);
+
+  if (nsSlots* slots = tmp->GetExistingSlots()) {
+    slots->Unlink(*tmp);
+  }
+
+  if (tmp->NodeType() != DOCUMENT_NODE &&
+      tmp->HasFlag(NODE_HAS_LISTENERMANAGER)) {
+    nsContentUtils::RemoveListenerManager(tmp);
+    tmp->UnsetFlags(NODE_HAS_LISTENERMANAGER);
+  }
+
+  if (tmp->HasProperties()) {
+    tmp->RemoveProperty(nsGkAtoms::accessiblenode);
+  }
+}
+
+static void AdoptNodeIntoOwnerDoc(nsINode* aParent, nsINode* aNode,
+                                  ErrorResult& aError) {
+  NS_ASSERTION(!aNode->GetParentNode(),
+               "Should have removed from parent already");
+
+  Document* doc = aParent->OwnerDoc();
+
+  DebugOnly<nsINode*> adoptedNode = doc->AdoptNode(*aNode, aError, true);
+
+#ifdef DEBUG
+  if (!aError.Failed()) {
+    MOZ_ASSERT(aParent->OwnerDoc() == doc, "ownerDoc chainged while adopting");
+    MOZ_ASSERT(adoptedNode == aNode, "Uh, adopt node changed nodes?");
+    MOZ_ASSERT(aParent->OwnerDoc() == aNode->OwnerDoc(),
+               "ownerDocument changed again after adopting!");
+  }
+#endif  // DEBUG
+}
+
+void nsINode::InsertChildBefore(
+    nsIContent* aKid, nsIContent* aBeforeThis, bool aNotify, ErrorResult& aRv,
+    nsINode* aOldParent, MutationEffectOnScript aMutationEffectOnScript) {
+  if (!IsContainerNode()) {
+    aRv.ThrowHierarchyRequestError(
+        "Parent is not a Document, DocumentFragment, or Element node.");
+    return;
+  }
+
+  MOZ_ASSERT(!aKid->GetParentNode(), "Inserting node that already has parent");
+  MOZ_ASSERT(!IsAttr());
+
+  nsMutationGuard::DidMutate();
+
+  mozAutoDocUpdate updateBatch(GetComposedDoc(), aNotify);
+
+  if (OwnerDoc() != aKid->OwnerDoc()) {
+    AdoptNodeIntoOwnerDoc(this, aKid, aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return;
+    }
+  }
+
+  if (!aBeforeThis) {
+    AppendChildToChildList(aKid);
+  } else {
+    InsertChildToChildList(aKid, aBeforeThis);
+  }
+
+  nsIContent* parent = IsContent() ? AsContent() : nullptr;
+
+  BindContext context(*this);
+  context.SetIsMove(aOldParent != nullptr);
+  aRv = aKid->BindToTree(context, *this);
+  if (aRv.Failed()) {
+    DisconnectChild(aKid);
+    aKid->UnbindFromTree();
+    return;
+  }
+
+  InvalidateChildNodes();
+
+  NS_ASSERTION(aKid->GetParentNode() == this,
+               "Did we run script inappropriately?");
+
+  if (aNotify) {
+    if (parent && !aBeforeThis) {
+      ContentAppendInfo info;
+      info.mOldParent = aOldParent;
+      info.mMutationEffectOnScript = aMutationEffectOnScript;
+      MutationObservers::NotifyContentAppended(parent, aKid, info);
+    } else {
+      ContentInsertInfo info;
+      info.mOldParent = aOldParent;
+      info.mMutationEffectOnScript = aMutationEffectOnScript;
+      MutationObservers::NotifyContentInserted(this, aKid, info);
+    }
+  }
+}
+
+nsIContent* nsINode::GetPreviousSibling() const {
+  if (mPreviousOrLastSibling && !mPreviousOrLastSibling->mNextSibling) {
+    return nullptr;
+  }
+  return mPreviousOrLastSibling;
+}
+
+#define CACHE_POINTER_SHIFT 6
+#define CACHE_NUM_SLOTS 128
+#define CACHE_CHILD_LIMIT 10
+
+#define CACHE_GET_INDEX(_parent) \
+  ((NS_PTR_TO_INT32(_parent) >> CACHE_POINTER_SHIFT) & (CACHE_NUM_SLOTS - 1))
+
+struct IndexCacheSlot {
+  const nsINode* mParent;
+  const nsINode* mChild;
+  uint32_t mChildIndex;
+};
+
+static IndexCacheSlot sIndexCache[CACHE_NUM_SLOTS];
+
+static inline void AddChildAndIndexToCache(const nsINode* aParent,
+                                           const nsINode* aChild,
+                                           uint32_t aChildIndex) {
+  MOZ_ASSERT(NS_IsMainThread());
+  uint32_t index = CACHE_GET_INDEX(aParent);
+  sIndexCache[index].mParent = aParent;
+  sIndexCache[index].mChild = aChild;
+  sIndexCache[index].mChildIndex = aChildIndex;
+}
+
+static inline void GetChildAndIndexFromCache(const nsINode* aParent,
+                                             const nsINode** aChild,
+                                             Maybe<uint32_t>* aChildIndex) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  uint32_t index = CACHE_GET_INDEX(aParent);
+  if (sIndexCache[index].mParent == aParent) {
+    *aChild = sIndexCache[index].mChild;
+    *aChildIndex = Some(sIndexCache[index].mChildIndex);
+  } else {
+    *aChild = nullptr;
+    *aChildIndex = Nothing();
+  }
+}
+
+static inline void RemoveFromCache(const nsINode* aParent) {
+  MOZ_ASSERT(NS_IsMainThread());
+  uint32_t index = CACHE_GET_INDEX(aParent);
+  if (sIndexCache[index].mParent == aParent) {
+    sIndexCache[index] = {nullptr, nullptr, UINT32_MAX};
+  }
+}
+
+void nsINode::AppendChildToChildList(nsIContent* aKid) {
+  MOZ_ASSERT(aKid);
+  MOZ_ASSERT(!aKid->mNextSibling);
+
+  RemoveFromCache(this);
+
+  if (mFirstChild) {
+    nsIContent* lastChild = GetLastChild();
+    lastChild->mNextSibling = aKid;
+    aKid->mPreviousOrLastSibling = lastChild;
+  } else {
+    mFirstChild = aKid;
+  }
+
+  mFirstChild->mPreviousOrLastSibling = aKid;
+  ++mChildCount;
+}
+
+void nsINode::InsertChildToChildList(nsIContent* aKid,
+                                     nsIContent* aNextSibling) {
+  MOZ_ASSERT(aKid);
+  MOZ_ASSERT(aNextSibling);
+
+  RemoveFromCache(this);
+  ChildIndexCache::Invalidate(this, aNextSibling);
+
+  nsIContent* previousSibling = aNextSibling->mPreviousOrLastSibling;
+  aNextSibling->mPreviousOrLastSibling = aKid;
+  aKid->mPreviousOrLastSibling = previousSibling;
+  aKid->mNextSibling = aNextSibling;
+
+  if (aNextSibling == mFirstChild) {
+    MOZ_ASSERT(!previousSibling->mNextSibling);
+    mFirstChild = aKid;
+  } else {
+    previousSibling->mNextSibling = aKid;
+  }
+
+  ++mChildCount;
+}
+
+void nsINode::DisconnectChild(nsIContent* aKid) {
+  MOZ_ASSERT(aKid);
+  MOZ_ASSERT(GetChildCount() > 0);
+
+  RemoveFromCache(this);
+  ChildIndexCache::Invalidate(this, aKid);
+
+  nsIContent* previousSibling = aKid->GetPreviousSibling();
+  nsCOMPtr<nsIContent> ref = aKid;
+
+  if (aKid->mNextSibling) {
+    aKid->mNextSibling->mPreviousOrLastSibling = aKid->mPreviousOrLastSibling;
+  } else {
+    mFirstChild->mPreviousOrLastSibling = aKid->mPreviousOrLastSibling;
+  }
+  aKid->mPreviousOrLastSibling = nullptr;
+
+  if (previousSibling) {
+    previousSibling->mNextSibling = std::move(aKid->mNextSibling);
+  } else {
+    mFirstChild = std::move(aKid->mNextSibling);
+  }
+
+  --mChildCount;
+}
+
+nsIContent* nsINode::GetChildAt_Deprecated(uint32_t aIndex) const {
+  if (aIndex >= GetChildCount()) {
+    return nullptr;
+  }
+
+  if (GetChildCount() >= ChildIndexCache::kThreshold && NS_IsMainThread()) {
+    return ChildIndexCache::GetChildAt(this, aIndex);
+  }
+
+  nsIContent* child = mFirstChild;
+  while (aIndex--) {
+    child = child->GetNextSibling();
+  }
+
+  return child;
+}
+
+int32_t nsINode::ComputeIndexOf_Deprecated(
+    const nsINode* aPossibleChild) const {
+  Maybe<uint32_t> maybeIndex = ComputeIndexOf(aPossibleChild);
+  if (!maybeIndex) {
+    return -1;
+  }
+  MOZ_ASSERT(*maybeIndex <= INT32_MAX,
+             "ComputeIndexOf_Deprecated() returns unsupported index value, use "
+             "ComputeIndex() instead");
+  return static_cast<int32_t>(*maybeIndex);
+}
+
+Maybe<uint32_t> nsINode::ComputeIndexOf(const nsINode* aPossibleChild) const {
+  if (!aPossibleChild) {
+    return Nothing();
+  }
+
+  if (aPossibleChild->GetParentNode() != this) {
+    return Nothing();
+  }
+
+  if (aPossibleChild == GetFirstChild()) {
+    return Some(0);
+  }
+
+  if (aPossibleChild == GetLastChild()) {
+    MOZ_ASSERT(GetChildCount());
+    return Some(GetChildCount() - 1);
+  }
+  if (aPossibleChild->IsRootOfNativeAnonymousSubtree()) {
+    return Nothing();
+  }
+  const nsIContent* contentChild = nsIContent::FromNode(aPossibleChild);
+  const bool isMainThread = NS_IsMainThread();
+  if (contentChild && GetChildCount() >= ChildIndexCache::kThreshold &&
+      isMainThread) {
+    return ChildIndexCache::ComputeIndexOf(this, contentChild);
+  }
+
+  if (isMainThread && MaybeCachesComputedIndex()) {
+    const nsINode* child;
+    Maybe<uint32_t> maybeChildIndex;
+    GetChildAndIndexFromCache(this, &child, &maybeChildIndex);
+    if (child) {
+      if (child == aPossibleChild) {
+        return maybeChildIndex;
+      }
+
+      uint32_t nextIndex = *maybeChildIndex;
+      uint32_t prevIndex = *maybeChildIndex;
+      nsINode* prev = child->GetPreviousSibling();
+      nsINode* next = child->GetNextSibling();
+      do {
+        if (next) {
+          MOZ_ASSERT(nextIndex < UINT32_MAX);
+          ++nextIndex;
+          if (next == aPossibleChild) {
+            AddChildAndIndexToCache(this, aPossibleChild, nextIndex);
+            return Some(nextIndex);
+          }
+          next = next->GetNextSibling();
+        }
+        if (prev) {
+          MOZ_ASSERT(prevIndex > 0);
+          --prevIndex;
+          if (prev == aPossibleChild) {
+            AddChildAndIndexToCache(this, aPossibleChild, prevIndex);
+            return Some(prevIndex);
+          }
+          prev = prev->GetPreviousSibling();
+        }
+      } while (prev || next);
+    }
+  }
+
+  uint32_t index = 0u;
+  nsINode* current = mFirstChild;
+  while (current) {
+    MOZ_ASSERT(current->GetParentNode() == this);
+    if (current == aPossibleChild) {
+      if (isMainThread && MaybeCachesComputedIndex()) {
+        AddChildAndIndexToCache(this, current, index);
+      }
+      return Some(index);
+    }
+    current = current->GetNextSibling();
+    MOZ_ASSERT(index < UINT32_MAX);
+    ++index;
+  }
+
+  return Nothing();
+}
+
+bool nsINode::MaybeCachesComputedIndex() const {
+  return mChildCount >= CACHE_CHILD_LIMIT;
+}
+
+Maybe<uint32_t> nsINode::ComputeIndexInParentNode() const {
+  nsINode* parent = GetParentNode();
+  if (MOZ_UNLIKELY(!parent)) {
+    return Nothing();
+  }
+  return parent->ComputeIndexOf(this);
+}
+
+Maybe<uint32_t> nsINode::ComputeIndexInParentContent() const {
+  nsIContent* parent = GetParent();
+  if (MOZ_UNLIKELY(!parent)) {
+    return Nothing();
+  }
+  return parent->ComputeIndexOf(this);
+}
+
+static already_AddRefed<nsINode> GetNodeFromNodeOrString(
+    const OwningNodeOrString& aNode, Document* aDocument) {
+  if (aNode.IsNode()) {
+    nsCOMPtr<nsINode> node = aNode.GetAsNode();
+    return node.forget();
+  }
+
+  if (aNode.IsString()) {
+    RefPtr<nsTextNode> textNode =
+        aDocument->CreateTextNode(aNode.GetAsString());
+    return textNode.forget();
+  }
+
+  MOZ_CRASH("Impossible type");
+}
+
+MOZ_CAN_RUN_SCRIPT static already_AddRefed<nsINode>
+ConvertNodesOrStringsIntoNode(const Sequence<OwningNodeOrString>& aNodes,
+                              Document* aDocument, ErrorResult& aRv) {
+  if (aNodes.Length() == 1) {
+    return GetNodeFromNodeOrString(aNodes[0], aDocument);
+  }
+
+  nsCOMPtr<nsINode> fragment = aDocument->CreateDocumentFragment();
+
+  for (const auto& node : aNodes) {
+    nsCOMPtr<nsINode> childNode = GetNodeFromNodeOrString(node, aDocument);
+    fragment->AppendChild(*childNode, aRv);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+  }
+
+  return fragment.forget();
+}
+
+static void InsertNodesIntoHashset(const Sequence<OwningNodeOrString>& aNodes,
+                                   nsTHashSet<nsINode*>& aHashset) {
+  for (const auto& node : aNodes) {
+    if (node.IsNode()) {
+      aHashset.Insert(node.GetAsNode());
+    }
+  }
+}
+
+static nsINode* FindViablePreviousSibling(
+    const nsINode& aNode, const Sequence<OwningNodeOrString>& aNodes) {
+  nsTHashSet<nsINode*> nodeSet(16);
+  InsertNodesIntoHashset(aNodes, nodeSet);
+
+  nsINode* viablePreviousSibling = nullptr;
+  for (nsINode* sibling = aNode.GetPreviousSibling(); sibling;
+       sibling = sibling->GetPreviousSibling()) {
+    if (!nodeSet.Contains(sibling)) {
+      viablePreviousSibling = sibling;
+      break;
+    }
+  }
+
+  return viablePreviousSibling;
+}
+
+static nsINode* FindViableNextSibling(
+    const nsINode& aNode, const Sequence<OwningNodeOrString>& aNodes) {
+  nsTHashSet<nsINode*> nodeSet(16);
+  InsertNodesIntoHashset(aNodes, nodeSet);
+
+  nsINode* viableNextSibling = nullptr;
+  for (nsINode* sibling = aNode.GetNextSibling(); sibling;
+       sibling = sibling->GetNextSibling()) {
+    if (!nodeSet.Contains(sibling)) {
+      viableNextSibling = sibling;
+      break;
+    }
+  }
+
+  return viableNextSibling;
+}
+
+void nsINode::Before(const Sequence<OwningNodeOrString>& aNodes,
+                     ErrorResult& aRv) {
+  nsCOMPtr<nsINode> parent = GetParentNode();
+  if (!parent) {
+    return;
+  }
+
+  nsCOMPtr<nsINode> viablePreviousSibling =
+      FindViablePreviousSibling(*this, aNodes);
+
+  nsCOMPtr<Document> doc = OwnerDoc();
+  nsCOMPtr<nsINode> node = ConvertNodesOrStringsIntoNode(aNodes, doc, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  viablePreviousSibling = viablePreviousSibling
+                              ? viablePreviousSibling->GetNextSibling()
+                              : parent->GetFirstChild();
+
+  parent->InsertBefore(*node, viablePreviousSibling, aRv);
+}
+
+void nsINode::After(const Sequence<OwningNodeOrString>& aNodes,
+                    ErrorResult& aRv) {
+  nsCOMPtr<nsINode> parent = GetParentNode();
+  if (!parent) {
+    return;
+  }
+
+  nsCOMPtr<nsINode> viableNextSibling = FindViableNextSibling(*this, aNodes);
+
+  nsCOMPtr<Document> doc = OwnerDoc();
+  nsCOMPtr<nsINode> node = ConvertNodesOrStringsIntoNode(aNodes, doc, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  parent->InsertBefore(*node, viableNextSibling, aRv);
+}
+
+void nsINode::ReplaceWith(const Sequence<OwningNodeOrString>& aNodes,
+                          ErrorResult& aRv) {
+  nsCOMPtr<nsINode> parent = GetParentNode();
+  if (!parent) {
+    return;
+  }
+
+  nsCOMPtr<nsINode> viableNextSibling = FindViableNextSibling(*this, aNodes);
+
+  nsCOMPtr<Document> doc = OwnerDoc();
+  nsCOMPtr<nsINode> node = ConvertNodesOrStringsIntoNode(aNodes, doc, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  if (parent == GetParentNode()) {
+    parent->ReplaceChild(*node, *this, aRv);
+  } else {
+    parent->InsertBefore(*node, viableNextSibling, aRv);
+  }
+}
+
+void nsINode::Remove() {
+  nsCOMPtr<nsINode> parent = GetParentNode();
+  if (!parent) {
+    return;
+  }
+
+  parent->RemoveChild(*this, IgnoreErrors());
+}
+
+Element* nsINode::GetFirstElementChild() const {
+  for (nsIContent* child = GetFirstChild(); child;
+       child = child->GetNextSibling()) {
+    if (child->IsElement()) {
+      return child->AsElement();
+    }
+  }
+
+  return nullptr;
+}
+
+Element* nsINode::GetLastElementChild() const {
+  for (nsIContent* child = GetLastChild(); child;
+       child = child->GetPreviousSibling()) {
+    if (child->IsElement()) {
+      return child->AsElement();
+    }
+  }
+
+  return nullptr;
+}
+
+static bool MatchAttribute(Element* aElement, int32_t aNamespaceID,
+                           nsAtom* aAttrName, void* aData) {
+  MOZ_ASSERT(aElement, "Must have content node to work with!");
+  nsString* attrValue = static_cast<nsString*>(aData);
+  if (aNamespaceID != kNameSpaceID_Unknown &&
+      aNamespaceID != kNameSpaceID_Wildcard) {
+    return attrValue->EqualsLiteral("*")
+               ? aElement->HasAttr(aNamespaceID, aAttrName)
+               : aElement->AttrValueIs(aNamespaceID, aAttrName, *attrValue,
+                                       eCaseMatters);
+  }
+
+  uint32_t count = aElement->GetAttrCount();
+  for (uint32_t i = 0; i < count; ++i) {
+    const nsAttrName* name = aElement->GetAttrNameAt(i);
+    bool nameMatch;
+    if (name->IsAtom()) {
+      nameMatch = name->Atom() == aAttrName;
+    } else if (aNamespaceID == kNameSpaceID_Wildcard) {
+      nameMatch = name->NodeInfo()->Equals(aAttrName);
+    } else {
+      nameMatch = name->NodeInfo()->QualifiedNameEquals(aAttrName);
+    }
+
+    if (nameMatch) {
+      return attrValue->EqualsLiteral("*") ||
+             aElement->AttrValueIs(name->NamespaceID(), name->LocalName(),
+                                   *attrValue, eCaseMatters);
+    }
+  }
+
+  return false;
+}
+
+already_AddRefed<HTMLCollection> nsINode::GetElementsByAttribute(
+    const nsAString& aAttribute, const nsAString& aValue) {
+  RefPtr<nsAtom> attrAtom(NS_Atomize(aAttribute));
+  RefPtr<ContentList> list = new ContentList(
+      this, MatchAttribute, nsContentUtils::DestroyMatchString,
+      new nsString(aValue), true, attrAtom, kNameSpaceID_Unknown);
+
+  return list.forget();
+}
+
+already_AddRefed<HTMLCollection> nsINode::GetElementsByAttributeNS(
+    const nsAString& aNamespaceURI, const nsAString& aAttribute,
+    const nsAString& aValue, ErrorResult& aRv) {
+  RefPtr<nsAtom> attrAtom(NS_Atomize(aAttribute));
+
+  int32_t nameSpaceId = kNameSpaceID_Wildcard;
+  if (!aNamespaceURI.EqualsLiteral("*")) {
+    nsresult rv = nsNameSpaceManager::GetInstance()->RegisterNameSpace(
+        aNamespaceURI, nameSpaceId);
+    if (NS_FAILED(rv)) {
+      aRv.Throw(rv);
+      return nullptr;
+    }
+  }
+
+  RefPtr<ContentList> list =
+      new ContentList(this, MatchAttribute, nsContentUtils::DestroyMatchString,
+                      new nsString(aValue), true, attrAtom, nameSpaceId);
+  return list.forget();
+}
+
+void nsINode::Prepend(const Sequence<OwningNodeOrString>& aNodes,
+                      ErrorResult& aRv) {
+  nsCOMPtr<Document> doc = OwnerDoc();
+  nsCOMPtr<nsINode> node = ConvertNodesOrStringsIntoNode(aNodes, doc, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  nsCOMPtr<nsIContent> refNode = mFirstChild;
+  InsertBefore(*node, refNode, aRv);
+}
+
+void nsINode::Append(const Sequence<OwningNodeOrString>& aNodes,
+                     ErrorResult& aRv) {
+  nsCOMPtr<Document> doc = OwnerDoc();
+  nsCOMPtr<nsINode> node = ConvertNodesOrStringsIntoNode(aNodes, doc, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  AppendChild(*node, aRv);
+}
+
+void nsINode::ReplaceChildren(const Sequence<OwningNodeOrString>& aNodes,
+                              ErrorResult& aRv) {
+  nsCOMPtr<Document> doc = OwnerDoc();
+  nsCOMPtr<nsINode> node = ConvertNodesOrStringsIntoNode(aNodes, doc, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+  MOZ_ASSERT(node);
+  return ReplaceChildren(node, aRv);
+}
+
+void nsINode::ReplaceChildren(nsINode* aNode, ErrorResult& aRv,
+                              MutationEffectOnScript aMutationEffectOnScript) {
+  if (aNode) {
+    EnsurePreInsertionValidity(*aNode, nullptr, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+  nsCOMPtr<nsINode> node = aNode;
+  const RefPtr<Document> doc = OwnerDoc();
+
+  if (MOZ_UNLIKELY(MaybeNeedsToNotifyDevToolsOfNodeRemovalsInOwnerDoc())) {
+    NotifyDevToolsOfRemovalsOfChildren();
+    if (node) {
+      if (node->NodeType() == DOCUMENT_FRAGMENT_NODE) {
+        node->NotifyDevToolsOfRemovalsOfChildren();
+      } else if (node->GetParentNode()) {
+        nsContentUtils::NotifyDevToolsOfNodeRemoval(*node);
+      }
+    }
+  }
+
+  mozAutoDocUpdate updateBatch(doc, true);
+
+  nsAutoMutationBatch mb(this, true, true);
+
+  nsAutoScriptBlockerSuppressNodeRemoved scriptBlocker;
+
+  RemoveAllChildren(true);
+  mb.RemovalDone();
+
+  if (aNode) {
+    AppendChildInternal(*aNode, aMutationEffectOnScript, aRv);
+    mb.NodesAdded();
+  }
+}
+
+static bool IsDoctypeOrHasFollowingDoctype(nsINode* aNode) {
+  for (; aNode; aNode = aNode->GetNextSibling()) {
+    if (aNode->NodeType() == nsINode::DOCUMENT_TYPE_NODE) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void nsINode::MoveBefore(nsINode& aNode, nsINode* aChild, ErrorResult& aRv) {
+  const auto ComputeReferenceChild = [&]() -> nsINode* {
+    return &aNode == aChild ? aNode.GetNextSibling() : aChild;
+  };
+  nsINode* referenceChild = ComputeReferenceChild();
+
+  nsINode& newParent = *this;
+  const auto EnsureValidMoveRequest = [&newParent](nsINode& aNode,
+                                                   nsINode* aReferenceChild,
+                                                   ErrorResult& aRv) -> void {
+    GetRootNodeOptions options;
+    options.mComposed = true;
+    if (newParent.GetRootNode(options) != aNode.GetRootNode(options)) {
+      aRv.ThrowHierarchyRequestError("Different root node.");
+      return;
+    }
+
+    if (nsContentUtils::ContentIsHostIncludingDescendantOf(&newParent,
+                                                           &aNode)) {
+      aRv.ThrowHierarchyRequestError("Node is an ancestor of the new parent.");
+      return;
+    }
+
+    if (aReferenceChild && aReferenceChild->GetParentNode() != &newParent) {
+      aRv.ThrowNotFoundError("Wrong reference child.");
+      return;
+    }
+
+    if (!aNode.IsElement() && !aNode.IsCharacterData()) {
+      aRv.ThrowHierarchyRequestError("Wrong type of node.");
+      return;
+    }
+
+    if (aNode.IsText() && newParent.IsDocument()) {
+      aRv.ThrowHierarchyRequestError(
+          "Can't move a text node to be a child of a document.");
+      return;
+    }
+
+    if (newParent.IsDocument() && aNode.IsElement() &&
+        (newParent.AsDocument()->GetRootElement() ||
+         IsDoctypeOrHasFollowingDoctype(aReferenceChild))) {
+      aRv.ThrowHierarchyRequestError(
+          "Can't move an element to be a child of the document.");
+      return;
+    }
+  };
+  EnsureValidMoveRequest(aNode, referenceChild, aRv);
+  if (MOZ_UNLIKELY(aRv.Failed())) {
+    return;
+  }
+
+  nsINode* oldParent = aNode.GetParentNode();
+
+  MOZ_ASSERT(oldParent);
+
+  if (MOZ_UNLIKELY(
+          aNode.MaybeNeedsToNotifyDevToolsOfNodeRemovalsInOwnerDoc())) {
+    nsMutationGuard guard;
+    nsContentUtils::NotifyDevToolsOfNodeRemoval(aNode);
+    if (MOZ_UNLIKELY(guard.Mutated(0))) {
+      referenceChild = ComputeReferenceChild();
+      EnsureValidMoveRequest(aNode, referenceChild, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+      oldParent = aNode.GetParentNode();
+      MOZ_ASSERT(oldParent);
+    }
+  }
+
+  mozAutoDocUpdate updateBatch(GetComposedDoc(), true);
+  {  
+    AutoSuppressNotifyingDevToolsOfNodeRemovals suppressNotifyingDevTools(
+        *OwnerDoc());
+    oldParent->RemoveChildNode(aNode.AsContent(), true, nullptr, &newParent);
+
+    InsertChildBefore(aNode.AsContent(),
+                      referenceChild ? referenceChild->AsContent() : nullptr,
+                      true, aRv, oldParent);
+  }
+}
+
+void nsINode::RemoveChildNode(nsIContent* aKid, bool aNotify,
+                              const BatchRemovalState* aState,
+                              nsINode* aNewParent,
+                              MutationEffectOnScript aMutationEffectOnScript) {
+  MOZ_ASSERT(aKid && aKid->GetParentNode() == this, "Bogus aKid");
+  MOZ_ASSERT(!IsAttr());
+
+  nsMutationGuard::DidMutate();
+  mozAutoDocUpdate updateBatch(GetComposedDoc(), aNotify);
+
+  if (aNotify) {
+    ContentRemoveInfo info;
+    info.mBatchRemovalState = aState;
+    info.mNewParent = aNewParent;
+    info.mMutationEffectOnScript = aMutationEffectOnScript;
+    MutationObservers::NotifyContentWillBeRemoved(this, aKid, info);
+  }
+
+  nsCOMPtr<nsIContent> kungfuDeathGrip = aKid;
+  DisconnectChild(aKid);
+
+  InvalidateChildNodes();
+  aKid->UnbindFromTree(aNewParent, aState);
+}
+
+static void EnsureAllowedAsChild(nsINode* aNewChild, nsINode* aParent,
+                                 bool aIsReplace, nsINode* aRefChild,
+                                 ErrorResult& aRv) {
+  MOZ_ASSERT(aNewChild, "Must have new child");
+  MOZ_ASSERT_IF(aIsReplace, aRefChild);
+  MOZ_ASSERT(aParent);
+  MOZ_ASSERT(aParent->IsDocument() || aParent->IsDocumentFragment() ||
+                 aParent->IsElement(),
+             "Nodes that are not documents, document fragments or elements "
+             "can't be parents!");
+
+  if (aNewChild == aParent ||
+      (((aNewChild->HasFlag(NODE_MAY_HAVE_ELEMENT_CHILDREN) &&
+         aNewChild->GetFirstChild()) ||
+        aNewChild->NodeInfo()->NameAtom() == nsGkAtoms::_template ||
+        (aNewChild->IsElement() && aNewChild->AsElement()->GetShadowRoot())) &&
+       nsContentUtils::ContentIsHostIncludingDescendantOf(aParent,
+                                                          aNewChild))) {
+    aRv.ThrowHierarchyRequestError(
+        "The new child is an ancestor of the parent");
+    return;
+  }
+
+  if (aRefChild && aRefChild->GetParentNode() != aParent) {
+    if (aIsReplace) {
+      if (aNewChild->GetParentNode() == aParent) {
+        aRv.ThrowNotFoundError(
+            "New child already has this parent and old child does not. Please "
+            "check the order of replaceChild's arguments.");
+      } else {
+        aRv.ThrowNotFoundError(
+            "Child to be replaced is not a child of this node");
+      }
+    } else {
+      aRv.ThrowNotFoundError(
+          "Child to insert before is not a child of this node");
+    }
+    return;
+  }
+
+  if (!aNewChild->IsContent()) {
+    aRv.ThrowHierarchyRequestError(nsPrintfCString(
+        "May not add %s as a child", NodeTypeAsString(aNewChild)));
+    return;
+  }
+
+  switch (aNewChild->NodeType()) {
+    case nsINode::COMMENT_NODE:
+    case nsINode::PROCESSING_INSTRUCTION_NODE:
+      return;
+    case nsINode::TEXT_NODE:
+    case nsINode::CDATA_SECTION_NODE:
+    case nsINode::ENTITY_REFERENCE_NODE:
+      if (aParent->NodeType() == nsINode::DOCUMENT_NODE) {
+        aRv.ThrowHierarchyRequestError(
+            nsPrintfCString("Cannot insert %s as a child of a Document",
+                            NodeTypeAsString(aNewChild)));
+      }
+      return;
+    case nsINode::ELEMENT_NODE: {
+      if (!aParent->IsDocument()) {
+        return;
+      }
+
+      Document* parentDocument = aParent->AsDocument();
+      Element* rootElement = parentDocument->GetRootElement();
+      if (rootElement) {
+        if (!aIsReplace || rootElement != aRefChild) {
+          aRv.ThrowHierarchyRequestError(
+              "Cannot have more than one Element child of a Document");
+        }
+        return;
+      }
+
+      if (!aRefChild) {
+        return;
+      }
+
+      nsIContent* docTypeContent = parentDocument->GetDoctype();
+      if (!docTypeContent) {
+        return;
+      }
+
+      const Maybe<uint32_t> doctypeIndex =
+          aParent->ComputeIndexOf(docTypeContent);
+      MOZ_ASSERT(doctypeIndex.isSome());
+      const Maybe<uint32_t> insertIndex = aParent->ComputeIndexOf(aRefChild);
+
+      const bool ok = MOZ_LIKELY(insertIndex.isSome()) &&
+                      (aIsReplace ? *insertIndex >= *doctypeIndex
+                                  : *insertIndex > *doctypeIndex);
+      if (!ok) {
+        aRv.ThrowHierarchyRequestError(
+            "Cannot insert a root element before the doctype");
+      }
+      return;
+    }
+    case nsINode::DOCUMENT_TYPE_NODE: {
+      if (!aParent->IsDocument()) {
+        aRv.ThrowHierarchyRequestError(
+            nsPrintfCString("Cannot insert a DocumentType as a child of %s",
+                            NodeTypeAsString(aParent)));
+        return;
+      }
+
+      Document* parentDocument = aParent->AsDocument();
+      nsIContent* docTypeContent = parentDocument->GetDoctype();
+      if (docTypeContent) {
+        if (!aIsReplace || docTypeContent != aRefChild) {
+          aRv.ThrowHierarchyRequestError(
+              "Cannot have more than one DocumentType child of a Document");
+        }
+        return;
+      }
+
+      Element* rootElement = parentDocument->GetRootElement();
+      if (!rootElement) {
+        return;
+      }
+
+      if (!aRefChild) {
+        aRv.ThrowHierarchyRequestError(
+            "Cannot have a DocumentType node after the root element");
+        return;
+      }
+
+      const Maybe<uint32_t> rootIndex = aParent->ComputeIndexOf(rootElement);
+      MOZ_ASSERT(rootIndex.isSome());
+      const Maybe<uint32_t> insertIndex = aParent->ComputeIndexOf(aRefChild);
+
+      if (MOZ_LIKELY(insertIndex.isSome()) && *insertIndex > *rootIndex) {
+        aRv.ThrowHierarchyRequestError(
+            "Cannot have a DocumentType node after the root element");
+      }
+      return;
+    }
+    case nsINode::DOCUMENT_FRAGMENT_NODE: {
+      if (!aParent->IsDocument()) {
+        return;
+      }
+
+      bool sawElement = false;
+      for (nsIContent* child = aNewChild->GetFirstChild(); child;
+           child = child->GetNextSibling()) {
+        if (child->IsElement()) {
+          if (sawElement) {
+            aRv.ThrowHierarchyRequestError(
+                "Cannot have more than one Element child of a Document");
+            return;
+          }
+          sawElement = true;
+        }
+        EnsureAllowedAsChild(child, aParent, aIsReplace, aRefChild, aRv);
+        if (aRv.Failed()) {
+          return;
+        }
+      }
+
+      return;
+    }
+    default:
+      break;
+  }
+
+  aRv.ThrowHierarchyRequestError(nsPrintfCString("Cannot insert %s inside %s",
+                                                 NodeTypeAsString(aNewChild),
+                                                 NodeTypeAsString(aParent)));
+}
+
+void nsINode::EnsurePreInsertionValidity(nsINode& aNewChild, nsINode* aRefChild,
+                                         ErrorResult& aError) {
+  EnsurePreInsertionValidity1(aError);
+  if (aError.Failed()) {
+    return;
+  }
+  EnsurePreInsertionValidity2(false, aNewChild, aRefChild, aError);
+}
+
+void nsINode::EnsurePreInsertionValidity1(ErrorResult& aError) {
+  if (!IsDocument() && !IsDocumentFragment() && !IsElement()) {
+    aError.ThrowHierarchyRequestError(
+        nsPrintfCString("Cannot add children to %s", NodeTypeAsString(this)));
+    return;
+  }
+}
+
+void nsINode::EnsurePreInsertionValidity2(bool aReplace, nsINode& aNewChild,
+                                          nsINode* aRefChild,
+                                          ErrorResult& aError) {
+  if (aNewChild.IsRootOfNativeAnonymousSubtree()) {
+    aError.ThrowNotSupportedError(
+        "Inserting anonymous content manually is not supported");
+    return;
+  }
+
+  EnsureAllowedAsChild(&aNewChild, this, aReplace, aRefChild, aError);
+}
+
+nsINode* nsINode::ReplaceOrInsertBefore(
+    bool aReplace, nsINode* aNewChild, nsINode* aRefChild,
+    MutationEffectOnScript aMutationEffectOnScript, ErrorResult& aError) {
+  MOZ_ASSERT_IF(aReplace, aRefChild);
+
+  EnsurePreInsertionValidity1(aError);
+  if (aError.Failed()) {
+    return nullptr;
+  }
+
+  EnsurePreInsertionValidity2(aReplace, *aNewChild, aRefChild, aError);
+  if (aError.Failed()) {
+    return nullptr;
+  }
+
+  uint16_t nodeType = aNewChild->NodeType();
+
+  {
+    nsMutationGuard guard;
+
+    if (aReplace && aRefChild != aNewChild) {
+      nsContentUtils::NotifyDevToolsOfNodeRemoval(*aRefChild);
+    }
+
+    if (aNewChild->GetParentNode()) {
+      nsContentUtils::NotifyDevToolsOfNodeRemoval(*aNewChild);
+    }
+
+    if (nodeType == DOCUMENT_FRAGMENT_NODE) {
+      static_cast<FragmentOrElement*>(aNewChild)
+          ->NotifyDevToolsOfRemovalsOfChildren();
+    }
+
+    if (guard.Mutated(0)) {
+      EnsurePreInsertionValidity2(aReplace, *aNewChild, aRefChild, aError);
+      if (aError.Failed()) {
+        return nullptr;
+      }
+    }
+  }
+
+  nsIContent* nodeToInsertBefore;
+  if (aReplace) {
+    nodeToInsertBefore = aRefChild->GetNextSibling();
+  } else {
+    nodeToInsertBefore = aRefChild ? aRefChild->AsContent() : nullptr;
+  }
+  if (nodeToInsertBefore == aNewChild) {
+    nodeToInsertBefore = nodeToInsertBefore->GetNextSibling();
+  }
+
+  Maybe<AutoTArray<nsCOMPtr<nsIContent>, 50>> fragChildren;
+
+  nsIContent* newContent = aNewChild->AsContent();
+  nsCOMPtr<nsINode> oldParent = newContent->GetParentNode();
+  if (oldParent) {
+    nsCOMPtr<nsINode> kungFuDeathGrip = nodeToInsertBefore;
+
+    nsMutationGuard guard;
+
+    {
+      mozAutoDocUpdate batch(newContent->GetComposedDoc(), true);
+      nsAutoMutationBatch mb(oldParent, true, true);
+      nsIContent* previous = aNewChild->GetPreviousSibling();
+      nsIContent* next = aNewChild->GetNextSibling();
+      oldParent->RemoveChildNode(aNewChild->AsContent(), true, nullptr, nullptr,
+                                 aMutationEffectOnScript);
+      if (nsAutoMutationBatch::GetCurrentBatch() == &mb) {
+        mb.RemovalDone();
+        mb.SetPrevSibling(previous);
+        mb.SetNextSibling(next);
+      }
+    }
+
+    if (guard.Mutated(1)) {
+
+      if (newContent->GetParentNode()) {
+        aError.ThrowHierarchyRequestError(
+            "New child was inserted somewhere else");
+        return nullptr;
+      }
+
+      if (aNewChild == aRefChild) {
+        EnsureAllowedAsChild(newContent, this, false, nodeToInsertBefore,
+                             aError);
+        if (aError.Failed()) {
+          return nullptr;
+        }
+      } else {
+        EnsureAllowedAsChild(newContent, this, aReplace, aRefChild, aError);
+        if (aError.Failed()) {
+          return nullptr;
+        }
+
+        if (aReplace) {
+          nodeToInsertBefore = aRefChild->GetNextSibling();
+        } else {
+          nodeToInsertBefore = aRefChild ? aRefChild->AsContent() : nullptr;
+        }
+      }
+    }
+  } else if (nodeType == DOCUMENT_FRAGMENT_NODE) {
+    uint32_t count = newContent->GetChildCount();
+
+    fragChildren.emplace();
+
+    fragChildren->SetCapacity(count);
+    for (nsIContent* child = newContent->GetFirstChild(); child;
+         child = child->GetNextSibling()) {
+      NS_ASSERTION(!child->GetUncomposedDoc(),
+                   "How did we get a child with a current doc?");
+      fragChildren->AppendElement(child);
+    }
+
+    nsCOMPtr<nsINode> kungFuDeathGrip = nodeToInsertBefore;
+
+    nsMutationGuard guard;
+
+    {
+      mozAutoDocUpdate batch(newContent->GetComposedDoc(), true);
+      nsAutoMutationBatch mb(newContent, false, true);
+
+      newContent->RemoveAllChildren<BatchRemovalOrder::BackToFront>(true);
+    }
+
+    if (guard.Mutated(count)) {
+
+      if (nodeToInsertBefore && nodeToInsertBefore->GetParent() != this) {
+        aError.ThrowHierarchyRequestError("Don't know where to insert child");
+        return nullptr;
+      }
+
+      for (uint32_t i = 0; i < count; ++i) {
+        if (fragChildren->ElementAt(i)->GetParentNode()) {
+          aError.ThrowHierarchyRequestError(
+              "New child was inserted somewhere else");
+          return nullptr;
+        }
+      }
+
+
+      if (aRefChild && aRefChild->GetParent() != this) {
+        aError.ThrowHierarchyRequestError("Don't know where to insert child");
+        return nullptr;
+      }
+
+      if (aReplace) {
+        nodeToInsertBefore = aRefChild->GetNextSibling();
+      } else {
+        nodeToInsertBefore = aRefChild ? aRefChild->AsContent() : nullptr;
+      }
+
+      if (IsDocument()) {
+        bool sawElement = false;
+        for (uint32_t i = 0; i < count; ++i) {
+          nsIContent* child = fragChildren->ElementAt(i);
+          if (child->IsElement()) {
+            if (sawElement) {
+              aError.ThrowHierarchyRequestError(
+                  "Cannot have more than one Element child of a Document");
+              return nullptr;
+            }
+            sawElement = true;
+          }
+          EnsureAllowedAsChild(child, this, aReplace, aRefChild, aError);
+          if (aError.Failed()) {
+            return nullptr;
+          }
+        }
+      }
+    }
+  }
+
+  mozAutoDocUpdate batch(GetComposedDoc(), true);
+  nsAutoMutationBatch mb;
+
+  if (aReplace && aRefChild != aNewChild) {
+    mb.Init(this, true, true);
+
+    NS_ASSERTION(aRefChild->GetNextSibling() == nodeToInsertBefore,
+                 "Unexpected nodeToInsertBefore");
+
+    nsIContent* toBeRemoved = nodeToInsertBefore
+                                  ? nodeToInsertBefore->GetPreviousSibling()
+                                  : GetLastChild();
+    MOZ_ASSERT(toBeRemoved);
+
+    RemoveChildNode(toBeRemoved, true, nullptr, nullptr,
+                    aMutationEffectOnScript);
+  }
+
+  Document* doc = OwnerDoc();
+  if (doc != newContent->OwnerDoc() && nodeType != DOCUMENT_FRAGMENT_NODE) {
+    AdoptNodeIntoOwnerDoc(this, aNewChild, aError);
+    if (aError.Failed()) {
+      return nullptr;
+    }
+  }
+
+  nsINode* result = aReplace ? aRefChild : aNewChild;
+  if (nodeType == DOCUMENT_FRAGMENT_NODE) {
+    nsAutoMutationBatch* mutationBatch = nsAutoMutationBatch::GetCurrentBatch();
+    if (mutationBatch && mutationBatch != &mb) {
+      mutationBatch = nullptr;
+    } else if (!aReplace) {
+      mb.Init(this, true, true);
+      mutationBatch = nsAutoMutationBatch::GetCurrentBatch();
+    }
+
+    if (mutationBatch) {
+      mutationBatch->RemovalDone();
+      mutationBatch->SetPrevSibling(
+          nodeToInsertBefore ? nodeToInsertBefore->GetPreviousSibling()
+                             : GetLastChild());
+      mutationBatch->SetNextSibling(nodeToInsertBefore);
+    }
+
+    uint32_t count = fragChildren->Length();
+    if (!count) {
+      return result;
+    }
+
+    bool appending = !IsDocument() && !nodeToInsertBefore;
+    nsIContent* firstInsertedContent = fragChildren->ElementAt(0);
+
+    for (uint32_t i = 0; i < count; ++i) {
+      InsertChildBefore(fragChildren->ElementAt(i), nodeToInsertBefore,
+                        !appending, aError);
+      if (aError.Failed()) {
+        if (appending && i != 0) {
+          ContentAppendInfo info;
+          info.mMutationEffectOnScript = aMutationEffectOnScript;
+          MutationObservers::NotifyContentAppended(
+              static_cast<nsIContent*>(this), firstInsertedContent, info);
+        }
+        return nullptr;
+      }
+    }
+
+    if (mutationBatch && !appending) {
+      mutationBatch->NodesAdded();
+    }
+
+    if (appending) {
+      ContentAppendInfo info;
+      info.mMutationEffectOnScript = aMutationEffectOnScript;
+      MutationObservers::NotifyContentAppended(static_cast<nsIContent*>(this),
+                                               firstInsertedContent, info);
+      if (mutationBatch) {
+        mutationBatch->NodesAdded();
+      }
+    }
+  } else {
+
+    if (nsAutoMutationBatch::GetCurrentBatch() == &mb) {
+      mb.RemovalDone();
+      mb.SetPrevSibling(nodeToInsertBefore
+                            ? nodeToInsertBefore->GetPreviousSibling()
+                            : GetLastChild());
+      mb.SetNextSibling(nodeToInsertBefore);
+    }
+    InsertChildBefore(newContent, nodeToInsertBefore, true, aError, nullptr,
+                      aMutationEffectOnScript);
+    if (aError.Failed()) {
+      return nullptr;
+    }
+  }
+
+  return result;
+}
+
+void nsINode::BindObject(nsISupports* aObject, UnbindCallback aDtor) {
+  Slots()->mBoundObjects.EmplaceBack(aObject, aDtor);
+}
+
+void nsINode::UnbindObject(nsISupports* aObject) {
+  if (auto* slots = GetExistingSlots()) {
+    slots->mBoundObjects.UnorderedRemoveElement(aObject);
+  }
+}
+
+already_AddRefed<AccessibleNode> nsINode::GetAccessibleNode() {
+#ifdef ACCESSIBILITY
+  nsresult rv = NS_OK;
+
+  RefPtr<AccessibleNode> anode =
+      static_cast<AccessibleNode*>(GetProperty(nsGkAtoms::accessiblenode, &rv));
+  if (NS_FAILED(rv)) {
+    anode = new AccessibleNode(this);
+    RefPtr<AccessibleNode> temp = anode;
+    rv = SetProperty(nsGkAtoms::accessiblenode, temp.forget().take(),
+                     nsPropertyTable::SupportsDtorFunc, true);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("SetProperty failed");
+      return nullptr;
+    }
+  }
+  return anode.forget();
+#else
+  return nullptr;
+#endif
+}
+
+void nsINode::AddSizeOfExcludingThis(nsWindowSizes& aSizes,
+                                     size_t* aNodeSize) const {
+  EventListenerManager* elm = GetExistingListenerManager();
+  if (elm) {
+    *aNodeSize += elm->SizeOfIncludingThis(aSizes.mState.mMallocSizeOf);
+  }
+
+}
+
+void nsINode::AddSizeOfIncludingThis(nsWindowSizes& aSizes,
+                                     size_t* aNodeSize) const {
+  *aNodeSize += aSizes.mState.mMallocSizeOf(this);
+  AddSizeOfExcludingThis(aSizes, aNodeSize);
+}
+
+bool nsINode::Contains(const nsINode* aOther) const {
+  if (aOther == this) {
+    return true;
+  }
+
+  if (!aOther || OwnerDoc() != aOther->OwnerDoc() ||
+      IsInUncomposedDoc() != aOther->IsInUncomposedDoc() ||
+      !aOther->IsContent() || !HasChildren()) {
+    return false;
+  }
+
+  if (IsDocument()) {
+    return !aOther->IsInNativeAnonymousSubtree();
+  }
+
+  if (!IsElement() && !IsDocumentFragment()) {
+    return false;
+  }
+
+  if (IsInShadowTree() != aOther->IsInShadowTree() ||
+      IsInNativeAnonymousSubtree() != aOther->IsInNativeAnonymousSubtree()) {
+    return false;
+  }
+
+  if (IsInNativeAnonymousSubtree()) {
+    if (GetClosestNativeAnonymousSubtreeRoot() !=
+        aOther->GetClosestNativeAnonymousSubtreeRoot()) {
+      return false;
+    }
+  }
+
+  if (IsInShadowTree()) {
+    ShadowRoot* otherRoot = aOther->GetContainingShadow();
+    if (IsShadowRoot()) {
+      return otherRoot == this;
+    }
+    if (otherRoot != GetContainingShadow()) {
+      return false;
+    }
+  }
+
+  return aOther->IsInclusiveDescendantOf(this);
+}
+
+uint32_t nsINode::Length() const {
+  switch (NodeType()) {
+    case DOCUMENT_TYPE_NODE:
+      return 0;
+
+    case TEXT_NODE:
+    case CDATA_SECTION_NODE:
+    case PROCESSING_INSTRUCTION_NODE:
+    case COMMENT_NODE:
+      MOZ_ASSERT(IsContent());
+      return AsContent()->TextLength();
+
+    default:
+      return GetChildCount();
+  }
+}
+
+namespace {
+class SelectorCacheKey {
+ public:
+  explicit SelectorCacheKey(const nsACString& aString) : mKey(aString) {
+    MOZ_COUNT_CTOR(SelectorCacheKey);
+  }
+
+  nsCString mKey;
+  nsExpirationState mState;
+
+  nsExpirationState* GetExpirationState() { return &mState; }
+
+  MOZ_COUNTED_DTOR(SelectorCacheKey)
+};
+
+class SelectorCache final : public nsExpirationTracker<SelectorCacheKey, 4> {
+ public:
+  using SelectorList = UniquePtr<StyleSelectorList>;
+  using Table = nsTHashMap<nsCStringHashKey, SelectorList>;
+
+  SelectorCache()
+      : nsExpirationTracker<SelectorCacheKey, 4>(
+            1000, "SelectorCache"_ns, GetMainThreadSerialEventTarget()) {}
+
+  void NotifyExpired(SelectorCacheKey* aSelector) final {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT(aSelector);
+
+    RemoveObject(aSelector);
+    mTable.Remove(aSelector->mKey);
+    delete aSelector;
+  }
+
+  template <typename F>
+  StyleSelectorList* GetListOrInsertFrom(const nsACString& aSelector,
+                                         F&& aFrom) {
+    MOZ_ASSERT(NS_IsMainThread());
+    return mTable.LookupOrInsertWith(aSelector, std::forward<F>(aFrom)).get();
+  }
+
+  ~SelectorCache() { AgeAllGenerations(); }
+
+ private:
+  Table mTable;
+};
+
+SelectorCache& GetSelectorCache(bool aChromeRulesEnabled) {
+  static StaticAutoPtr<SelectorCache> sSelectorCache;
+  static StaticAutoPtr<SelectorCache> sChromeSelectorCache;
+  auto& cache = aChromeRulesEnabled ? sChromeSelectorCache : sSelectorCache;
+  if (!cache) {
+    cache = new SelectorCache();
+    ClearOnShutdown(&cache);
+  }
+  return *cache;
+}
+}  
+
+const StyleSelectorList* nsINode::ParseSelectorList(
+    const nsACString& aSelectorString, ErrorResult& aRv) {
+  Document* doc = OwnerDoc();
+  const bool chromeRulesEnabled = doc->ChromeRulesEnabled();
+
+  SelectorCache& cache = GetSelectorCache(chromeRulesEnabled);
+  StyleSelectorList* list = cache.GetListOrInsertFrom(aSelectorString, [&] {
+    return WrapUnique(
+        Servo_SelectorList_Parse(&aSelectorString, chromeRulesEnabled));
+  });
+
+  if (!list) {
+    aRv.ThrowSyntaxError("'"_ns + aSelectorString +
+                         "' is not a valid selector"_ns);
+  }
+
+  return list;
+}
+
+inline static Element* FindMatchingElementWithId(
+    const nsAString& aId, const Element& aRoot,
+    const DocumentOrShadowRoot& aContainingDocOrShadowRoot) {
+  MOZ_ASSERT(aRoot.SubtreeRoot() == &aContainingDocOrShadowRoot.AsNode());
+  MOZ_ASSERT(
+      aRoot.IsInUncomposedDoc() || aRoot.IsInShadowTree(),
+      "Don't call me if the root is not in the document or in a shadow tree");
+
+  Span elements = aContainingDocOrShadowRoot.GetAllElementsForId(aId);
+
+  for (Element* element : elements) {
+    if (MOZ_UNLIKELY(element == &aRoot)) {
+      continue;
+    }
+
+    if (!element->IsInclusiveDescendantOf(&aRoot)) {
+      continue;
+    }
+
+    return element;
+  }
+
+  return nullptr;
+}
+
+Element* nsINode::QuerySelector(const nsACString& aSelector,
+                                ErrorResult& aResult) {
+
+  const StyleSelectorList* list = ParseSelectorList(aSelector, aResult);
+  if (!list) {
+    return nullptr;
+  }
+  const bool useInvalidation = false;
+  return const_cast<Element*>(
+      Servo_SelectorList_QueryFirst(this, list, useInvalidation));
+}
+
+already_AddRefed<NodeList> nsINode::QuerySelectorAll(
+    const nsACString& aSelector, ErrorResult& aResult) {
+
+  RefPtr<SimpleContentList> contentList = new SimpleContentList(this);
+  const StyleSelectorList* list = ParseSelectorList(aSelector, aResult);
+  if (!list) {
+    return contentList.forget();
+  }
+
+  const bool useInvalidation = false;
+  Servo_SelectorList_QueryAll(this, list, contentList.get(), useInvalidation);
+  return contentList.forget();
+}
+
+Element* nsINode::GetElementById(const nsAString& aId) {
+  MOZ_ASSERT(!IsShadowRoot(), "Should use the faster version");
+  MOZ_ASSERT(IsElement() || IsDocumentFragment(),
+             "Bogus this object for GetElementById call");
+  if (IsInUncomposedDoc()) {
+    MOZ_ASSERT(IsElement(), "Huh? A fragment in a document?");
+    return FindMatchingElementWithId(aId, *AsElement(), *OwnerDoc());
+  }
+
+  if (ShadowRoot* containingShadow = AsContent()->GetContainingShadow()) {
+    MOZ_ASSERT(IsElement(), "Huh? A fragment in a ShadowRoot?");
+    return FindMatchingElementWithId(aId, *AsElement(), *containingShadow);
+  }
+
+  for (nsIContent* kid = GetFirstChild(); kid; kid = kid->GetNextNode(this)) {
+    if (!kid->IsElement()) {
+      continue;
+    }
+    nsAtom* id = kid->AsElement()->GetID();
+    if (id && id->Equals(aId)) {
+      return kid->AsElement();
+    }
+  }
+  return nullptr;
+}
+
+JSObject* nsINode::WrapObject(JSContext* aCx,
+                              JS::Handle<JSObject*> aGivenProto) {
+  bool hasHadScriptHandlingObject = false;
+  if (!OwnerDoc()->GetScriptHandlingObject(hasHadScriptHandlingObject) &&
+      !hasHadScriptHandlingObject && !nsContentUtils::IsSystemCaller(aCx)) {
+    Throw(aCx, NS_ERROR_UNEXPECTED);
+    return nullptr;
+  }
+
+  JS::Rooted<JSObject*> obj(aCx, WrapNode(aCx, aGivenProto));
+  if (obj && ChromeOnlyAccess()) {
+    MOZ_RELEASE_ASSERT(
+        xpc::IsUnprivilegedJunkScope(JS::GetNonCCWObjectGlobal(obj)) ||
+        xpc::IsInUAWidgetScope(obj) || xpc::AccessCheck::isChrome(obj));
+  }
+  return obj;
+}
+
+already_AddRefed<nsINode> nsINode::CloneNode(bool aDeep, ErrorResult& aError) {
+  return Clone(aDeep, nullptr, aError);
+}
+
+nsDOMAttributeMap* nsINode::GetAttributes() {
+  if (!IsElement()) {
+    return nullptr;
+  }
+  return AsElement()->Attributes();
+}
+
+Element* nsINode::GetParentElementCrossingShadowRoot() const {
+  if (!mParent) {
+    return nullptr;
+  }
+
+  if (mParent->IsElement()) {
+    return mParent->AsElement();
+  }
+
+  if (ShadowRoot* shadowRoot = ShadowRoot::FromNode(mParent)) {
+    MOZ_ASSERT(shadowRoot->GetHost(), "ShowRoots should always have a host");
+    return shadowRoot->GetHost();
+  }
+
+  return nullptr;
+}
+
+bool nsINode::HasBoxQuadsSupport(JSContext* aCx, JSObject* ) {
+  return xpc::AccessCheck::isChrome(js::GetContextCompartment(aCx)) ||
+         StaticPrefs::layout_css_getBoxQuads_enabled();
+}
+
+nsINode* nsINode::GetScopeChainParent() const { return nullptr; }
+
+Element* nsINode::GetParentFlexElement() {
+  if (!IsContent()) {
+    return nullptr;
+  }
+
+  nsIFrame* primaryFrame = AsContent()->GetPrimaryFrame(FlushType::Frames);
+
+  for (nsIFrame* f = primaryFrame; f; f = f->GetParent()) {
+    if (f != primaryFrame && !f->Style()->IsAnonBox()) {
+      break;
+    }
+    if (f->IsFlexItem()) {
+      return f->GetParent()->GetContent()->AsElement();
+    }
+  }
+
+  return nullptr;
+}
+
+Element* nsINode::GetNearestInclusiveOpenPopover() const {
+  for (auto* el : InclusiveFlatTreeAncestorsOfType<Element>()) {
+    if (el->IsPopoverOpenedInMode(PopoverAttributeState::Auto) ||
+        el->IsPopoverOpenedInMode(PopoverAttributeState::Hint)) {
+      return el;
+    }
+  }
+  return nullptr;
+}
+
+Element* nsINode::GetNearestInclusiveTargetPopoverForInvoker() const {
+  for (auto* el : InclusiveFlatTreeAncestorsOfType<Element>()) {
+    if (auto* popover = el->GetEffectiveCommandForElement()) {
+      if (popover->IsPopoverOpenedInMode(PopoverAttributeState::Auto) ||
+          popover->IsPopoverOpenedInMode(PopoverAttributeState::Hint)) {
+        return popover;
+      }
+    }
+    if (auto* popover = el->GetEffectivePopoverTargetElement()) {
+      if (popover->IsPopoverOpenedInMode(PopoverAttributeState::Auto) ||
+          popover->IsPopoverOpenedInMode(PopoverAttributeState::Hint)) {
+        return popover;
+      }
+    }
+  }
+  return nullptr;
+}
+
+nsGenericHTMLElement* nsINode::GetEffectiveCommandForElement() const {
+  const auto* formControl =
+      nsGenericHTMLFormControlElementWithState::FromNode(this);
+  if (!formControl || formControl->IsDisabled() ||
+      !formControl->IsButtonControl()) {
+    return nullptr;
+  }
+
+  if (const auto* buttonControl = HTMLButtonElement::FromNodeOrNull(this)) {
+    if (auto* popover = nsGenericHTMLElement::FromNodeOrNull(
+            buttonControl->GetCommandForElementInternal())) {
+      if (popover->GetPopoverAttributeState() != PopoverAttributeState::None) {
+        return popover;
+      }
+    }
+  }
+  return nullptr;
+}
+
+nsGenericHTMLElement* nsINode::GetEffectivePopoverTargetElement() const {
+  const auto* formControl =
+      nsGenericHTMLFormControlElementWithState::FromNode(this);
+  if (!formControl || formControl->IsDisabled() ||
+      !formControl->IsButtonControl()) {
+    return nullptr;
+  }
+  if (auto* popover = nsGenericHTMLElement::FromNodeOrNull(
+          formControl->GetPopoverTargetElementInternal())) {
+    if (popover->GetPopoverAttributeState() != PopoverAttributeState::None) {
+      return popover;
+    }
+  }
+  return nullptr;
+}
+
+Element* nsINode::GetTopmostClickedPopover() const {
+  Element* clickedPopover = GetNearestInclusiveOpenPopover();
+  Element* invokedPopover = GetNearestInclusiveTargetPopoverForInvoker();
+  if (!clickedPopover) {
+    return invokedPopover;
+  }
+  auto hintPopoverList =
+      clickedPopover->OwnerDoc()->PopoverListOf(PopoverAttributeState::Hint);
+
+  for (const RefPtr<Element>& el : Reversed(hintPopoverList)) {
+    if (el == clickedPopover || el == invokedPopover) {
+      return el;
+    }
+  }
+
+  auto autoPopoverList =
+      clickedPopover->OwnerDoc()->PopoverListOf(PopoverAttributeState::Auto);
+
+  for (const RefPtr<Element>& el : Reversed(autoPopoverList)) {
+    if (el == clickedPopover || el == invokedPopover) {
+      return el;
+    }
+  }
+  return nullptr;
+}
+
+HTMLDialogElement* nsINode::NearestClickedDialog(mozilla::WidgetEvent* aEvent) {
+
+  WidgetPointerEvent* pointerEvent = aEvent->AsPointerEvent();
+  if (!pointerEvent) {
+    return nullptr;
+  }
+
+  RefPtr dialogElement = HTMLDialogElement::FromNode(this);
+  if (dialogElement && dialogElement->IsInTopLayer()) {
+    auto* frame = dialogElement->GetPrimaryFrame();
+    if (!frame) {
+      return nullptr;
+    }
+    nsPoint point = nsLayoutUtils::GetEventCoordinatesRelativeTo(
+        aEvent, pointerEvent->mRefPoint, RelativeTo{frame});
+    nsRect frameRect = frame->GetRectRelativeToSelf();
+    if (!frameRect.Contains(point)) {
+      return nullptr;
+    }
+  }
+
+  for (auto* currentNode :
+       InclusiveFlatTreeAncestorsOfType<HTMLDialogElement>()) {
+    if (currentNode->Open()) {
+      return currentNode;
+    }
+  }
+
+  return nullptr;
+}
+
+void nsINode::AddAnimationObserver(nsIAnimationObserver* aAnimationObserver) {
+  AddMutationObserver(aAnimationObserver);
+  OwnerDoc()->SetMayHaveAnimationObservers();
+}
+
+void nsINode::AddAnimationObserverUnlessExists(
+    nsIAnimationObserver* aAnimationObserver) {
+  AddMutationObserverUnlessExists(aAnimationObserver);
+  OwnerDoc()->SetMayHaveAnimationObservers();
+}
+
+already_AddRefed<nsINode> nsINode::CloneAndAdopt(
+    nsINode* aNode, bool aClone, bool aDeep,
+    nsNodeInfoManager* aNewNodeInfoManager, nsIGlobalObject* aNewScope,
+    nsINode* aParent, ErrorResult& aError) {
+  MOZ_ASSERT(!aParent || aNode->IsContent(),
+             "Can't insert document or attribute nodes into a parent");
+
+
+  nsAutoScriptBlocker scriptBlocker;
+
+  nsNodeInfoManager* nodeInfoManager = aNewNodeInfoManager;
+
+  class NodeInfo* nodeInfo = aNode->mNodeInfo;
+  RefPtr<class NodeInfo> newNodeInfo;
+  if (nodeInfoManager) {
+    Document* newDoc = nodeInfoManager->GetDocument();
+    if (NS_WARN_IF(!newDoc)) {
+      aError.Throw(NS_ERROR_UNEXPECTED);
+      return nullptr;
+    }
+    bool hasHadScriptHandlingObject = false;
+    if (!newDoc->GetScriptHandlingObject(hasHadScriptHandlingObject) &&
+        !hasHadScriptHandlingObject) {
+      Document* currentDoc = aNode->OwnerDoc();
+      if (NS_WARN_IF(!nsContentUtils::IsChromeDoc(currentDoc) &&
+                     (currentDoc->GetScriptHandlingObject(
+                          hasHadScriptHandlingObject) ||
+                      hasHadScriptHandlingObject))) {
+        aError.Throw(NS_ERROR_UNEXPECTED);
+        return nullptr;
+      }
+    }
+
+    newNodeInfo = nodeInfoManager->GetNodeInfo(
+        nodeInfo->NameAtom(), nodeInfo->GetPrefixAtom(),
+        nodeInfo->NamespaceID(), nodeInfo->NodeType(),
+        nodeInfo->GetExtraName());
+
+    nodeInfo = newNodeInfo;
+  }
+
+  Element* elem = Element::FromNode(aNode);
+
+  nsCOMPtr<nsINode> clone;
+  if (aClone) {
+    nsresult rv = aNode->Clone(nodeInfo, getter_AddRefs(clone));
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      aError.Throw(rv);
+      return nullptr;
+    }
+
+    if (aParent) {
+      aParent->AppendChildTo(static_cast<nsIContent*>(clone.get()),
+                              true, aError);
+      if (NS_WARN_IF(aError.Failed())) {
+        return nullptr;
+      }
+    } else if (aDeep && clone->IsDocument()) {
+      nodeInfoManager = clone->mNodeInfo->NodeInfoManager();
+    }
+  } else if (nodeInfoManager) {
+    Document* oldDoc = aNode->OwnerDoc();
+
+    DOMArena* domArenaToStore =
+        !aNode->HasFlag(NODE_KEEPS_DOMARENA)
+            ? aNode->NodeInfo()->NodeInfoManager()->GetArenaAllocator()
+            : nullptr;
+
+    Document* newDoc = nodeInfoManager->GetDocument();
+    MOZ_ASSERT(newDoc);
+
+    bool wasRegistered = false;
+    if (elem) {
+      wasRegistered = oldDoc->UnregisterActivityObserver(elem);
+    }
+
+    const bool hadProperties = aNode->HasProperties();
+    if (hadProperties) {
+      (void)oldDoc->PropertyTable().TransferOrRemoveAllPropertiesFor(
+          aNode, newDoc->PropertyTable());
+    }
+
+    aNode->mNodeInfo.swap(newNodeInfo);
+    aNode->NodeInfoChanged(oldDoc);
+
+    MOZ_ASSERT(newDoc != oldDoc);
+    if (elem) {
+      CustomElementData* data = elem->GetCustomElementData();
+      if (data && data->mState == CustomElementData::State::eCustom) {
+        LifecycleCallbackArgs args;
+        args.mOldDocument = oldDoc;
+        args.mNewDocument = newDoc;
+
+        nsContentUtils::EnqueueLifecycleCallback(ElementCallbackType::eAdopted,
+                                                 elem, args);
+      }
+    }
+
+    if (wasRegistered) {
+      newDoc->RegisterActivityObserver(aNode->AsElement());
+    }
+
+    if (nsPIDOMWindowInner* window = newDoc->GetInnerWindow()) {
+      EventListenerManager* elm = aNode->GetExistingListenerManager();
+      if (elm) {
+        if (elm->MayHaveDOMActivateListeners()) {
+          window->SetHasDOMActivateEventListeners();
+        }
+        if (elm->MayHaveTouchEventListener()) {
+          window->SetHasTouchEventListeners();
+        }
+        if (elm->MayHaveMouseEnterLeaveEventListener()) {
+          window->SetHasMouseEnterLeaveEventListeners();
+        }
+        if (elm->MayHavePointerEnterLeaveEventListener()) {
+          window->SetHasPointerEnterLeaveEventListeners();
+        }
+        if (elm->MayHavePointerRawUpdateEventListener()) {
+          window->MaybeSetHasPointerRawUpdateEventListeners();
+        }
+        if (elm->MayHaveSelectionChangeEventListener()) {
+          window->SetHasSelectionChangeEventListeners();
+        }
+        if (elm->MayHaveFormSelectEventListener()) {
+          window->SetHasFormSelectEventListeners();
+        }
+        if (elm->MayHaveTransitionEventListener()) {
+          window->SetHasTransitionEventListeners();
+        }
+        if (elm->MayHaveSMILTimeEventListener()) {
+          window->SetHasSMILTimeEventListeners();
+        }
+      }
+    }
+    if (wasRegistered) {
+      nsIContent* content = aNode->AsContent();
+      if (auto* mediaElem = HTMLMediaElement::FromNodeOrNull(content)) {
+        mediaElem->NotifyOwnerDocumentActivityChanged();
+      }
+      nsCOMPtr<nsIImageLoadingContent> imageLoadingContent =
+          do_QueryInterface(aNode);
+      if (imageLoadingContent) {
+        auto* ilc =
+            static_cast<nsImageLoadingContent*>(imageLoadingContent.get());
+        ilc->NotifyOwnerDocumentActivityChanged();
+      }
+    }
+
+    if (oldDoc->MayHaveDOMMutationObservers()) {
+      newDoc->SetMayHaveDOMMutationObservers();
+    }
+
+    if (oldDoc->MayHaveAnimationObservers()) {
+      newDoc->SetMayHaveAnimationObservers();
+    }
+
+    if (elem) {
+      elem->RecompileScriptEventListeners();
+    }
+
+    if (JSObject* wrapper = aNode->GetWrapper()) {
+      if (xpc::NativeGlobal(wrapper) != aNewScope) {
+        dom::PreserveWrapper(aNode);
+      }
+    }
+
+    if (!newDoc->NodeInfoManager()->HasAllocated()) {
+      if (DocGroup* docGroup = newDoc->GetDocGroup()) {
+        newDoc->NodeInfoManager()->SetArenaAllocator(
+            docGroup->ArenaAllocator());
+      }
+    }
+
+    if (domArenaToStore && newDoc->GetDocGroup() != oldDoc->GetDocGroup()) {
+      nsContentUtils::AddEntryToDOMArenaTable(aNode, domArenaToStore);
+    }
+  }
+
+  if (aDeep && (!aClone || !aNode->IsAttr())) {
+    for (nsIContent* cloneChild = aNode->GetFirstChild(); cloneChild;
+         cloneChild = cloneChild->GetNextSibling()) {
+      nsCOMPtr<nsINode> child = CloneAndAdopt(
+          cloneChild, aClone, true, nodeInfoManager, aNewScope, clone, aError);
+      if (NS_WARN_IF(aError.Failed())) {
+        return nullptr;
+      }
+    }
+  }
+
+  if (aDeep && aNode->IsElement()) {
+    if (aClone) {
+      if (nodeInfo->GetDocument()->IsStaticDocument()) {
+        clone->AsElement()->CloneAnimationsFrom(*aNode->AsElement());
+
+        ShadowRoot* originalShadowRoot = aNode->AsElement()->GetShadowRoot();
+        if (originalShadowRoot) {
+          ShadowRootInit init;
+          init.mMode = originalShadowRoot->Mode();
+          RefPtr<ShadowRoot> newShadowRoot =
+              clone->AsElement()->AttachShadowWithoutNameChecks(
+                  init, Nothing(),
+                  originalShadowRoot->HasCustomSlotDispatch()
+                      ? Element::CustomSlotDispatch::Yes
+                      : Element::CustomSlotDispatch::No,
+                  false);
+          newShadowRoot->CloneInternalDataFrom(originalShadowRoot);
+          for (nsIContent* origChild = originalShadowRoot->GetFirstChild();
+               origChild; origChild = origChild->GetNextSibling()) {
+            nsCOMPtr<nsINode> child =
+                CloneAndAdopt(origChild, aClone, aDeep, nodeInfoManager,
+                              aNewScope, newShadowRoot, aError);
+            if (NS_WARN_IF(aError.Failed())) {
+              return nullptr;
+            }
+          }
+        }
+      }
+    } else {
+      if (ShadowRoot* shadowRoot = aNode->AsElement()->GetShadowRoot()) {
+        nsCOMPtr<nsINode> child =
+            CloneAndAdopt(shadowRoot, aClone, aDeep, nodeInfoManager, aNewScope,
+                          clone, aError);
+        if (NS_WARN_IF(aError.Failed())) {
+          return nullptr;
+        }
+      }
+    }
+  }
+
+  if (aClone && aNode->IsElement() &&
+      !nodeInfo->GetDocument()->IsStaticDocument()) {
+    ShadowRoot* originalShadowRoot = aNode->AsElement()->GetShadowRoot();
+    if (originalShadowRoot && originalShadowRoot->Clonable()) {
+      ShadowRootInit init;
+      init.mMode = originalShadowRoot->Mode();
+      init.mDelegatesFocus = originalShadowRoot->DelegatesFocus();
+      init.mSlotAssignment = originalShadowRoot->SlotAssignment();
+      init.mClonable = true;
+      if (StaticPrefs::dom_scoped_custom_element_registries_enabled() &&
+          originalShadowRoot->HasCustomElementRegistry()) {
+        init.mCustomElementRegistry.Construct(
+            originalShadowRoot->GetCustomElementRegistry());
+      }
+
+      RefPtr<ShadowRoot> newShadowRoot =
+          clone->AsElement()->AttachShadow(init, aError);
+      if (NS_WARN_IF(aError.Failed())) {
+        return nullptr;
+      }
+      newShadowRoot->SetIsDeclarative(originalShadowRoot->IsDeclarative());
+      if (originalShadowRoot->IsAvailableToElementInternals()) {
+        newShadowRoot->SetAvailableToElementInternals();
+      }
+      nsAtom* referenceTarget = originalShadowRoot->ReferenceTarget();
+      newShadowRoot->SetReferenceTarget(referenceTarget);
+
+      for (nsIContent* origChild = originalShadowRoot->GetFirstChild();
+           origChild; origChild = origChild->GetNextSibling()) {
+        nsCOMPtr<nsINode> child =
+            CloneAndAdopt(origChild, aClone, true, nodeInfoManager, aNewScope,
+                          newShadowRoot, aError);
+        if (NS_WARN_IF(aError.Failed())) {
+          return nullptr;
+        }
+      }
+    }
+  }
+
+  if (aDeep && aClone && aNode->IsTemplateElement()) {
+    DocumentFragment* origContent =
+        static_cast<HTMLTemplateElement*>(aNode)->Content();
+    DocumentFragment* cloneContent =
+        static_cast<HTMLTemplateElement*>(clone.get())->Content();
+
+    nsNodeInfoManager* ownerNodeInfoManager =
+        cloneContent->mNodeInfo->NodeInfoManager();
+
+    for (nsIContent* cloneChild = origContent->GetFirstChild(); cloneChild;
+         cloneChild = cloneChild->GetNextSibling()) {
+      nsCOMPtr<nsINode> child =
+          CloneAndAdopt(cloneChild, aClone, aDeep, ownerNodeInfoManager,
+                        aNewScope, cloneContent, aError);
+      if (NS_WARN_IF(aError.Failed())) {
+        return nullptr;
+      }
+    }
+  }
+
+  return clone.forget();
+}
+
+void nsINode::Adopt(nsNodeInfoManager* aNewNodeInfoManager,
+                    mozilla::ErrorResult& aError) {
+  nsIGlobalObject* newScope = nullptr;
+  if (aNewNodeInfoManager) {
+    Document* beforeAdoptDoc = OwnerDoc();
+    Document* afterAdoptDoc = aNewNodeInfoManager->GetDocument();
+
+    MOZ_ASSERT(beforeAdoptDoc);
+    MOZ_ASSERT(afterAdoptDoc);
+    MOZ_ASSERT(beforeAdoptDoc != afterAdoptDoc);
+
+    if (afterAdoptDoc->GetDocGroup() != beforeAdoptDoc->GetDocGroup()) {
+      if (nsContentUtils::IsChromeDoc(afterAdoptDoc) ||
+          nsContentUtils::IsChromeDoc(beforeAdoptDoc)) {
+        return aError.ThrowSecurityError(
+            "Adopting nodes across docgroups in chrome documents "
+            "is unsupported");
+      }
+    }
+
+    newScope = afterAdoptDoc->GetScopeObject();
+  }
+
+  nsCOMPtr<nsINode> node = CloneAndAdopt(this, false, true, aNewNodeInfoManager,
+                                         newScope, nullptr, aError);
+
+  nsMutationGuard::DidMutate();
+}
+
+already_AddRefed<nsINode> nsINode::Clone(bool aDeep,
+                                         nsNodeInfoManager* aNewNodeInfoManager,
+                                         ErrorResult& aError) {
+  return CloneAndAdopt(this, true, aDeep, aNewNodeInfoManager,
+                        nullptr, nullptr, aError);
+}
+
+void nsINode::GenerateXPath(nsAString& aResult) {
+  XPathGenerator::Generate(this, aResult);
+}
+
+bool nsINode::IsApzAware() const { return IsNodeApzAware(); }
+
+bool nsINode::IsNodeApzAwareInternal() const {
+  return EventTarget::IsApzAware();
+}
+
+DocGroup* nsINode::GetDocGroup() const { return OwnerDoc()->GetDocGroup(); }
+
+nsINode* nsINode::GetFlattenedTreeParentNodeNonInline() const {
+  return GetFlattenedTreeParentNode();
+}
+
+ParentObject nsINode::GetParentObject() const {
+  ParentObject p(OwnerDoc());
+  if (IsInNativeAnonymousSubtree()) {
+    if (ShouldUseUAWidgetScope(this)) {
+      p.mReflectionScope = ReflectionScope::UAWidget;
+    } else {
+      MOZ_ASSERT(ShouldUseNACScope(this));
+      p.mReflectionScope = ReflectionScope::NAC;
+    }
+  } else {
+    MOZ_ASSERT(!ShouldUseNACScope(this));
+    MOZ_ASSERT(!ShouldUseUAWidgetScope(this));
+  }
+  return p;
+}
+
+void nsINode::AddMutationObserver(
+    nsMultiMutationObserver* aMultiMutationObserver) {
+  if (aMultiMutationObserver) {
+    NS_ASSERTION(!aMultiMutationObserver->ContainsNode(this),
+                 "Observer already in the list");
+    aMultiMutationObserver->AddMutationObserverToNode(this);
+  }
+}
+
+void nsINode::AddMutationObserverUnlessExists(
+    nsMultiMutationObserver* aMultiMutationObserver) {
+  if (aMultiMutationObserver && !aMultiMutationObserver->ContainsNode(this)) {
+    aMultiMutationObserver->AddMutationObserverToNode(this);
+  }
+}
+
+void nsINode::RemoveMutationObserver(
+    nsMultiMutationObserver* aMultiMutationObserver) {
+  if (aMultiMutationObserver) {
+    aMultiMutationObserver->RemoveMutationObserverFromNode(this);
+  }
+}
+
+bool nsINode::MaybeNeedsToNotifyDevToolsOfNodeRemovalsInOwnerDoc() const {
+  return OwnerDoc()->DevToolsWatchingDOMMutations();
+}
+
+bool nsINode::DevToolsShouldBeNotifiedOfThisRemoval() const {
+  return MOZ_UNLIKELY(MaybeNeedsToNotifyDevToolsOfNodeRemovalsInOwnerDoc()) &&
+         IsInComposedDoc() &&
+         !OwnerDoc()->SuppressedNotifyingDevToolsOfNodeRemovals() &&
+         !ChromeOnlyAccess();
+}
+
+void nsINode::NotifyDevToolsOfRemovalsOfChildren() {
+  if (MOZ_LIKELY(!MaybeNeedsToNotifyDevToolsOfNodeRemovalsInOwnerDoc())) {
+    return;
+  }
+
+  for (nsCOMPtr<nsIContent> child = GetFirstChild();
+       child && child->GetParentNode() == this;
+       child = child->GetNextSibling()) {
+    nsContentUtils::NotifyDevToolsOfNodeRemoval(*child);
+  }
+}
+
+ShadowRoot* nsINode::GetShadowRootForSelection() const {
+  ShadowRoot* shadowRoot = GetShadowRoot();
+  return shadowRoot && !shadowRoot->IsUAWidget() ? shadowRoot : nullptr;
+}
+
+HTMLSlotElement* nsINode::GetAsHTMLSlotElementIfFilled() {
+  return const_cast<HTMLSlotElement*>(
+      static_cast<const nsINode*>(this)->GetAsHTMLSlotElementIfFilled());
+}
+
+const HTMLSlotElement* nsINode::GetAsHTMLSlotElementIfFilled() const {
+  const HTMLSlotElement* slot = HTMLSlotElement::FromNode(this);
+  return !slot || slot->AssignedNodes().IsEmpty() ? nullptr : slot;
+}
+
+HTMLSlotElement* nsINode::GetAsHTMLSlotElementIfFilledForSelection() {
+  return const_cast<HTMLSlotElement*>(
+      static_cast<const nsINode*>(this)
+          ->GetAsHTMLSlotElementIfFilledForSelection());
+}
+
+const HTMLSlotElement* nsINode::GetAsHTMLSlotElementIfFilledForSelection()
+    const {
+  const HTMLSlotElement* const slot = GetAsHTMLSlotElementIfFilled();
+  if (!slot || slot->AssignedNodes().IsEmpty()) {
+    return nullptr;
+  }
+  const ShadowRoot* const shadowRoot = slot->GetContainingShadow();
+  return shadowRoot && !shadowRoot->IsUAWidget() ? slot : nullptr;
+}
+
+void nsINode::QueueAncestorRevealingAlgorithm() {
+  NS_DispatchToMainThread(NS_NewRunnableFunction(
+      "RevealAncestors",
+      [self = RefPtr{this}]() MOZ_CAN_RUN_SCRIPT_BOUNDARY_LAMBDA {
+        self->AncestorRevealingAlgorithm(IgnoreErrors());
+      }));
+}
+
+enum class RevealType : uint8_t {
+  UntilFound,
+  Details,
+};
+void nsINode::AncestorRevealingAlgorithm(ErrorResult& aRv) {
+  AutoTArray<std::pair<RefPtr<nsINode>, RevealType>, 16> ancestorsToReveal;
+  for (nsINode* ancestor : InclusiveFlatTreeAncestors(*this)) {
+    if (Element* currentAsElement = Element::FromNode(ancestor);
+        currentAsElement &&
+        currentAsElement->AttrValueIs(kNameSpaceID_None, nsGkAtoms::hidden,
+                                      nsGkAtoms::untilFound, eIgnoreCase)) {
+      ancestorsToReveal.AppendElement(
+          std::make_pair(ancestor, RevealType::UntilFound));
+    }
+
+    if (HTMLSlotElement* slot = HTMLSlotElement::FromNode(ancestor)) {
+      if (HTMLDetailsElement* details = HTMLDetailsElement::FromNodeOrNull(
+              slot->GetContainingShadowHost());
+          details && !details->Open() && !slot->HasName()) {
+        ancestorsToReveal.AppendElement(
+            std::make_pair(details, RevealType::Details));
+      }
+    }
+
+  }
+
+  for (const auto& [ancestor, revealType] : ancestorsToReveal) {
+    if (!ancestor->IsInComposedDoc()) {
+      return;
+    }
+
+    if (revealType == RevealType::UntilFound) {
+      RefPtr ancestorAsElement = Element::FromNode(ancestor);
+      if (!ancestorAsElement ||
+          !ancestorAsElement->AttrValueIs(kNameSpaceID_None, nsGkAtoms::hidden,
+                                          nsGkAtoms::untilFound, eIgnoreCase)) {
+        return;
+      }
+      ancestorAsElement->FireBeforematchEvent(aRv);
+      if (MOZ_UNLIKELY(aRv.Failed())) {
+        return;
+      }
+      if (!ancestor->IsInComposedDoc()) {
+        return;
+      }
+      ancestorAsElement->UnsetAttr(kNameSpaceID_None, nsGkAtoms::hidden,
+                                   true);
+    } else {  
+      MOZ_ASSERT(revealType == RevealType::Details);
+      RefPtr details = HTMLDetailsElement::FromNode(ancestor);
+      MOZ_ASSERT(details);
+      if (details->Open()) {
+        return;
+      }
+      details->SetOpen(true, aRv);
+      if (MOZ_UNLIKELY(aRv.Failed())) {
+        return;
+      }
+    }
+  }
+}
+
+void nsINode::AriaNotify(const nsAString& aAnnouncement,
+                         const AriaNotificationOptions& aOptions) {
+  if (!FeaturePolicyUtils::IsFeatureAllowed(OwnerDoc(), u"aria-notify"_ns)) {
+    return;
+  }
+#ifdef ACCESSIBILITY
+  if (nsAccessibilityService* accService = GetAccService()) {
+    accService->AriaNotify(this, aAnnouncement, aOptions);
+  }
+#endif
+}
+
+NS_IMPL_ISUPPORTS(nsNodeWeakReference, nsIWeakReference)
+
+nsNodeWeakReference::nsNodeWeakReference(nsINode* aNode)
+    : nsIWeakReference(aNode) {}
+
+nsNodeWeakReference::~nsNodeWeakReference() {
+  nsINode* node = static_cast<nsINode*>(mObject);
+
+  if (node) {
+    NS_ASSERTION(node->Slots()->mWeakReference == this,
+                 "Weak reference has wrong value");
+    node->Slots()->mWeakReference = nullptr;
+  }
+}
+
+NS_IMETHODIMP
+nsNodeWeakReference::QueryReferentFromScript(const nsIID& aIID,
+                                             void** aInstancePtr) {
+  return QueryReferent(aIID, aInstancePtr);
+}
+
+size_t nsNodeWeakReference::SizeOfOnlyThis(
+    mozilla::MallocSizeOf aMallocSizeOf) {
+  return aMallocSizeOf(this);
+}

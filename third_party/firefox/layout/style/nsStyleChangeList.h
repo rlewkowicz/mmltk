@@ -1,0 +1,46 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsStyleChangeList_h_
+#define nsStyleChangeList_h_
+
+#include "nsCOMPtr.h"
+#include "nsChangeHint.h"
+#include "nsTArray.h"
+
+class nsIFrame;
+class nsIContent;
+
+struct nsStyleChangeData {
+  nsIFrame* mFrame;  
+  nsCOMPtr<nsIContent> mContent;
+  nsChangeHint mHint;
+};
+
+class nsStyleChangeList : private AutoTArray<nsStyleChangeData, 10> {
+  typedef AutoTArray<nsStyleChangeData, 10> base_type;
+
+ public:
+  using base_type::begin;
+  using base_type::Clear;
+  using base_type::end;
+  using base_type::IsEmpty;
+  using base_type::Length;
+  using base_type::operator[];
+
+  nsStyleChangeList(const nsStyleChangeList&) = delete;
+
+  MOZ_COUNTED_DEFAULT_CTOR(nsStyleChangeList)
+  MOZ_COUNTED_DTOR(nsStyleChangeList)
+  void AppendChange(nsIFrame* aFrame, nsIContent* aContent, nsChangeHint aHint);
+
+  void PopChangesForContent(nsIContent* aContent) {
+    while (!IsEmpty() && LastElement().mContent == aContent) {
+      RemoveLastElement();
+    }
+  }
+};
+
+#endif /* nsStyleChangeList_h_ */

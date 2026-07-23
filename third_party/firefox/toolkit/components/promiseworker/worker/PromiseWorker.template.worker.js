@@ -1,0 +1,173 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+"use strict";
+
+if (typeof Components != "undefined") {
+  throw new Error("This module is meant to be used from the worker thread");
+}
+if (typeof require == "undefined" || typeof module == "undefined") {
+  throw new Error(
+    "this module is meant to be imported using the implementation of require() at resource://gre/modules/workers/require.js"
+  );
+}
+
+importScripts("resource://gre/modules/workers/require.js");
+
+function Meta(data, meta) {
+  this.data = data;
+  this.meta = meta;
+}
+
+function AbstractWorker(agent) {
+  this._agent = agent;
+  this._deferredJobs = new Map();
+  this._deferredJobId = 0;
+  this._exceptionNames = {
+    EvalError: "EvalError",
+    InternalError: "InternalError",
+    RangeError: "RangeError",
+    ReferenceError: "ReferenceError",
+    SyntaxError: "SyntaxError",
+    TypeError: "TypeError",
+    URIError: "URIError",
+  };
+}
+
+AbstractWorker.prototype = {
+  log() {},
+
+  _generateDeferredJobId() {
+    this._deferredJobId += 1;
+    return "WorkerToThread-" + this._deferredJobId;
+  },
+
+  callMainThread(funcName, args) {
+    const messageId = this._generateDeferredJobId();
+
+    const message = {
+      id: messageId,
+      fun: funcName,
+      args,
+    };
+
+    return new Promise((resolve, reject) => {
+      this._deferredJobs.set(messageId, { resolve, reject });
+      this.postMessage(message);
+    });
+  },
+
+  async handleMessage(msg) {
+    let data = msg.data;
+    let id = data.id;
+
+    if (this._deferredJobs.has(id)) {
+      const { resolve, reject } = this._deferredJobs.get(id);
+
+      if ("ok" in data) {
+        resolve(data);
+      } else if ("fail" in data) {
+        reject(data);
+      }
+      this._deferredJobs.delete(id);
+      return;
+    }
+
+    let start;
+    let options;
+    if (data.args) {
+      options = data.args[data.args.length - 1];
+    }
+    if (
+      options &&
+      typeof options === "object" &&
+      "outExecutionDuration" in options
+    ) {
+      start = Date.now();
+    }
+
+    let result;
+    let exn;
+    let durationMs;
+    let method = data.fun;
+    try {
+      this.log("Calling method", method);
+      result = await this.dispatch(method, data.args);
+      this.log("Method", method, "succeeded");
+    } catch (ex) {
+      exn = ex;
+      this.log(
+        "Error while calling agent method",
+        method,
+        exn,
+        exn.moduleStack || exn.stack || ""
+      );
+    }
+
+    if (start) {
+      durationMs = Date.now() - start;
+      this.log("Method took", durationMs, "ms");
+    }
+
+    if (!exn) {
+      this.log("Sending positive reply", result, "id is", id);
+      if (result instanceof Meta) {
+        if ("transfers" in result.meta) {
+          this.postMessage(
+            { ok: result.data, id, durationMs },
+            result.meta.transfers
+          );
+        } else {
+          this.postMessage({ ok: result.data, id, durationMs });
+        }
+        if (result.meta.shutdown || false) {
+          this.close();
+        }
+      } else {
+        this.postMessage({ ok: result, id, durationMs });
+      }
+    } else if (exn.constructor.name == "DOMException") {
+      this.log("Sending back DOM exception", exn.constructor.name);
+      let error = {
+        exn: exn.constructor.name,
+        message: exn.message,
+      };
+      this.postMessage({ fail: error, id, durationMs });
+    } else if (exn.constructor.name in this._exceptionNames) {
+      this.log("Sending back exception", exn.constructor.name, "id is", id);
+      let error = {
+        exn: exn.constructor.name,
+        message: exn.message,
+        fileName: exn.moduleName || exn.fileName,
+        lineNumber: exn.lineNumber,
+        stack: exn.moduleStack,
+      };
+      this.postMessage({ fail: error, id, durationMs });
+    } else if ("toMsg" in exn) {
+      this.log(
+        "Sending back an error that knows how to serialize itself",
+        exn,
+        "id is",
+        id
+      );
+      this.postMessage({ fail: exn.toMsg(), id, durationMs });
+    } else {
+      this.log(
+        "Sending back regular error",
+        exn,
+        exn.moduleStack || exn.stack,
+        "id is",
+        id
+      );
+
+      try {
+        exn.filename = exn.moduleName;
+        exn.stack = exn.moduleStack;
+      } catch (_) {
+      }
+      throw exn;
+    }
+  },
+};

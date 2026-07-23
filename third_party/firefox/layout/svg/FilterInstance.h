@@ -1,0 +1,208 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_FILTERINSTANCE_H_
+#define LAYOUT_SVG_FILTERINSTANCE_H_
+
+#include "FilterDescription.h"
+#include "gfxMatrix.h"
+#include "gfxPoint.h"
+#include "gfxRect.h"
+#include "mozilla/SVGIntegrationUtils.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "nsCOMPtr.h"
+#include "nsHashKeys.h"
+#include "nsPoint.h"
+#include "nsRect.h"
+#include "nsSize.h"
+#include "nsTArray.h"
+
+class gfxContext;
+class nsIContent;
+class nsIFrame;
+struct WrFiltersHolder;
+
+namespace mozilla {
+class ISVGFilterObserverList;
+class SVGFilterFrame;
+
+namespace dom {
+class UserSpaceMetrics;
+}  
+
+namespace image {
+struct imgDrawingParams;
+}
+
+class FilterInstance {
+  using IntRect = gfx::IntRect;
+  using SourceSurface = gfx::SourceSurface;
+  using DrawTarget = gfx::DrawTarget;
+  using FilterPrimitiveDescription = gfx::FilterPrimitiveDescription;
+  using FilterDescription = gfx::FilterDescription;
+  using UserSpaceMetrics = dom::UserSpaceMetrics;
+  using imgDrawingParams = image::imgDrawingParams;
+  using SVGFilterPaintCallback = SVGIntegrationUtils::SVGFilterPaintCallback;
+
+ public:
+  static FilterDescription GetFilterDescription(
+      nsIContent* aFilteredElement, Span<const StyleFilter> aFilterChain,
+      ISVGFilterObserverList* aFiltersObserverList, bool aFilterInputIsTainted,
+      const UserSpaceMetrics& aMetrics, const gfxRect& aBBox,
+      nsTArray<RefPtr<SourceSurface>>& aOutAdditionalImages);
+
+  static void PaintFilteredFrame(
+      nsIFrame* aFilteredFrame, Span<const StyleFilter> aFilterChain,
+      const nsTArray<SVGFilterFrame*>& aFilterFrames, gfxContext* aCtx,
+      const SVGFilterPaintCallback& aPaintCallback, const nsRegion* aDirtyArea,
+      imgDrawingParams& aImgParams, float aOpacity = 1.0f,
+      const gfxRect* aOverrideBBox = nullptr);
+
+  static nsRegion GetPostFilterDirtyArea(nsIFrame* aFilteredFrame,
+                                         const nsRegion& aPreFilterDirtyRegion);
+
+  static nsRegion GetPreFilterNeededArea(
+      nsIFrame* aFilteredFrame, const nsTArray<SVGFilterFrame*>& aFilterFrames,
+      const nsRegion& aPostFilterDirtyRegion);
+
+  static Maybe<nsRect> GetPostFilterBounds(
+      nsIFrame* aFilteredFrame, const nsTArray<SVGFilterFrame*>& aFilterFrames,
+      const gfxRect* aOverrideBBox = nullptr,
+      const nsRect* aPreFilterBounds = nullptr);
+
+  static WrFiltersStatus BuildWebRenderFilters(
+      nsIFrame* aFilteredFrame,
+      mozilla::Span<const mozilla::StyleFilter> aFilters,
+      StyleFilterType aStyleFilterType, WrFiltersHolder& aWrFilters,
+      const nsPoint& aOffsetForSVGFilters);
+
+  static WrFiltersStatus BuildWebRenderSVGFiltersImpl(
+      nsIFrame* aFilteredFrame,
+      mozilla::Span<const mozilla::StyleFilter> aFilters,
+      StyleFilterType aStyleFilterType, WrFiltersHolder& aWrFilters,
+      const nsPoint& aOffsetForSVGFilters);
+
+ private:
+  FilterInstance(
+      nsIFrame* aTargetFrame, nsIContent* aTargetContent,
+      const UserSpaceMetrics& aMetrics, Span<const StyleFilter> aFilterChain,
+      const nsTArray<SVGFilterFrame*>& aFilterFrames,
+      bool aFilterInputIsTainted,
+      const SVGIntegrationUtils::SVGFilterPaintCallback& aPaintCallback,
+      const gfxMatrix& aPaintTransform,
+      const nsRegion* aPostFilterDirtyRegion = nullptr,
+      const nsRegion* aPreFilterDirtyRegion = nullptr,
+      const nsRect* aPreFilterInkOverflowRectOverride = nullptr,
+      const gfxRect* aOverrideBBox = nullptr,
+      gfxRect* aFilterSpaceBoundsNotSnapped = nullptr);
+
+  static WrFiltersStatus BuildWebRenderFiltersImpl(
+      nsIFrame* aFilteredFrame,
+      mozilla::Span<const mozilla::StyleFilter> aFilters,
+      StyleFilterType aStyleFilterType, WrFiltersHolder& aWrFilters);
+
+  bool IsInitialized() const { return mInitialized; }
+
+  void Render(gfxContext* aCtx, imgDrawingParams& aImgParams,
+              float aOpacity = 1.0f);
+
+  const FilterDescription& ExtractDescriptionAndAdditionalImages(
+      nsTArray<RefPtr<SourceSurface>>& aOutAdditionalImages) {
+    aOutAdditionalImages = std::move(mInputImages);
+    return mFilterDescription;
+  }
+
+  nsRegion ComputePostFilterDirtyRegion();
+
+  nsRect ComputePostFilterExtents();
+
+  nsRect ComputeSourceNeededRect();
+
+  struct SourceInfo {
+    nsIntRect mNeededBounds;
+
+    RefPtr<SourceSurface> mSourceSurface;
+
+    IntRect mSurfaceRect;
+  };
+
+  void BuildSourcePaint(SourceInfo* aSource, imgDrawingParams& aImgParams);
+
+  void BuildSourcePaints(imgDrawingParams& aImgParams);
+
+  void BuildSourceImage(DrawTarget* aDest, imgDrawingParams& aImgParams,
+                        mozilla::gfx::FilterNode* aFilter,
+                        mozilla::gfx::FilterNode* aSource,
+                        const mozilla::gfx::Rect& aSourceRect);
+
+  nsresult BuildPrimitives(Span<const StyleFilter> aFilterChain,
+                           const nsTArray<SVGFilterFrame*>& aFilterFrames,
+                           bool aFilterInputIsTainted);
+
+  nsresult BuildPrimitivesForFilter(
+      const StyleFilter& aFilter, SVGFilterFrame* aFilterFrame,
+      bool aInputIsTainted,
+      nsTArray<FilterPrimitiveDescription>& aPrimitiveDescriptions);
+
+  void ComputeNeededBoxes();
+
+  nsIntRect OutputFilterSpaceBounds() const;
+
+  bool ComputeUserSpaceToFilterSpaceScale();
+
+  gfxRect UserSpaceToFilterSpace(const gfxRect& aUserSpace) const;
+  gfxRect FilterSpaceToUserSpace(const gfxRect& aFilterSpaceRect) const;
+
+  nsIntRect FrameSpaceToFilterSpace(const nsRect* aRect) const;
+  nsIntRegion FrameSpaceToFilterSpace(const nsRegion* aRegion) const;
+
+  nsRect FilterSpaceToFrameSpace(const nsIntRect& aRect) const;
+  nsRegion FilterSpaceToFrameSpace(const nsIntRegion& aRegion) const;
+
+  gfxMatrix GetUserSpaceToFrameSpaceInCSSPxTransform() const;
+
+  bool ComputeTargetBBoxInFilterSpace();
+
+  nsIFrame* mTargetFrame;
+
+  nsIContent* mTargetContent;
+
+  const UserSpaceMetrics& mMetrics;
+
+  const SVGFilterPaintCallback& mPaintCallback;
+
+  gfxRect mTargetBBox;
+
+  nsIntRect mTargetBBoxInFilterSpace;
+
+  gfxRect mFilterSpaceBoundsNotSnapped;
+
+  gfxMatrix mFilterSpaceToFrameSpaceInCSSPxTransform;
+  gfxMatrix mFrameSpaceInCSSPxToFilterSpaceTransform;
+
+  gfx::MatrixScalesDouble mUserSpaceToFilterSpaceScale;
+  gfx::MatrixScalesDouble mFilterSpaceToUserSpaceScale;
+
+  nsIntRect mTargetBounds;
+
+  nsIntRegion mPostFilterDirtyRegion;
+
+  nsIntRegion mPreFilterDirtyRegion;
+
+  SourceInfo mSourceGraphic;
+  SourceInfo mFillPaint;
+  SourceInfo mStrokePaint;
+
+  gfxMatrix mPaintTransform;
+
+  nsTArray<RefPtr<SourceSurface>> mInputImages;
+  FilterDescription mFilterDescription;
+  bool mInitialized;
+};
+
+}  
+
+#endif  // LAYOUT_SVG_FILTERINSTANCE_H_

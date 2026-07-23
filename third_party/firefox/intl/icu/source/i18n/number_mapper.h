@@ -1,0 +1,233 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __NUMBER_MAPPER_H__
+#define __NUMBER_MAPPER_H__
+
+#include "number_types.h"
+#include "unicode/currpinf.h"
+#include "standardplural.h"
+#include "number_patternstring.h"
+#include "number_currencysymbols.h"
+#include "numparse_impl.h"
+
+#ifndef __wasi__
+#include <atomic>
+#endif
+
+U_NAMESPACE_BEGIN
+namespace number::impl {
+
+class AutoAffixPatternProvider;
+class CurrencyPluralInfoAffixProvider;
+
+
+class PropertiesAffixPatternProvider : public AffixPatternProvider, public UMemory {
+  public:
+    bool isBogus() const {
+        return fBogus;
+    }
+
+    void setToBogus() {
+        fBogus = true;
+    }
+
+    void setTo(const DecimalFormatProperties& properties, UErrorCode& status);
+
+
+    char16_t charAt(int32_t flags, int32_t i) const override;
+
+    int32_t length(int32_t flags) const override;
+
+    UnicodeString getString(int32_t flags) const override;
+
+    bool hasCurrencySign() const override;
+
+    bool positiveHasPlusSign() const override;
+
+    bool hasNegativeSubpattern() const override;
+
+    bool negativeHasMinusSign() const override;
+
+    bool containsSymbolType(AffixPatternType, UErrorCode&) const override;
+
+    bool hasBody() const override;
+
+    bool currencyAsDecimal() const override;
+
+  private:
+    UnicodeString posPrefix;
+    UnicodeString posSuffix;
+    UnicodeString negPrefix;
+    UnicodeString negSuffix;
+    bool isCurrencyPattern;
+    bool fCurrencyAsDecimal;
+
+    PropertiesAffixPatternProvider() = default; 
+
+    const UnicodeString& getStringInternal(int32_t flags) const;
+
+    bool fBogus{true};
+
+    friend class AutoAffixPatternProvider;
+    friend class CurrencyPluralInfoAffixProvider;
+};
+
+
+class CurrencyPluralInfoAffixProvider : public AffixPatternProvider, public UMemory {
+  public:
+    bool isBogus() const {
+        return fBogus;
+    }
+
+    void setToBogus() {
+        fBogus = true;
+    }
+
+    void setTo(const CurrencyPluralInfo& cpi, const DecimalFormatProperties& properties,
+               UErrorCode& status);
+
+
+    char16_t charAt(int32_t flags, int32_t i) const override;
+
+    int32_t length(int32_t flags) const override;
+
+    UnicodeString getString(int32_t flags) const override;
+
+    bool hasCurrencySign() const override;
+
+    bool positiveHasPlusSign() const override;
+
+    bool hasNegativeSubpattern() const override;
+
+    bool negativeHasMinusSign() const override;
+
+    bool containsSymbolType(AffixPatternType, UErrorCode&) const override;
+
+    bool hasBody() const override;
+
+    bool currencyAsDecimal() const override;
+
+  private:
+    PropertiesAffixPatternProvider affixesByPlural[StandardPlural::COUNT];
+
+    CurrencyPluralInfoAffixProvider() = default;
+
+    bool fBogus{true};
+
+    friend class AutoAffixPatternProvider;
+};
+
+
+class AutoAffixPatternProvider {
+  public:
+    inline AutoAffixPatternProvider() = default;
+
+    inline AutoAffixPatternProvider(const DecimalFormatProperties& properties, UErrorCode& status) {
+        setTo(properties, status);
+    }
+
+    inline void setTo(const DecimalFormatProperties& properties, UErrorCode& status) {
+        if (properties.currencyPluralInfo.fPtr.isNull()) {
+            propertiesAPP.setTo(properties, status);
+            currencyPluralInfoAPP.setToBogus();
+        } else {
+            propertiesAPP.setToBogus();
+            currencyPluralInfoAPP.setTo(*properties.currencyPluralInfo.fPtr, properties, status);
+        }
+    }
+
+    inline void setTo(const AffixPatternProvider* provider, UErrorCode& status) {
+        if (const auto* ptr = dynamic_cast<const PropertiesAffixPatternProvider*>(provider)) {
+            propertiesAPP = *ptr;
+        } else if (const auto* ptr = dynamic_cast<const CurrencyPluralInfoAffixProvider*>(provider)) {
+            currencyPluralInfoAPP = *ptr;
+        } else {
+            status = U_INTERNAL_PROGRAM_ERROR;
+        }
+    }
+
+    inline const AffixPatternProvider& get() const {
+      if (!currencyPluralInfoAPP.isBogus()) {
+        return currencyPluralInfoAPP;
+      } else {
+        return propertiesAPP;
+      }
+    }
+
+  private:
+    PropertiesAffixPatternProvider propertiesAPP;
+    CurrencyPluralInfoAffixProvider currencyPluralInfoAPP;
+};
+
+
+struct DecimalFormatWarehouse : public UMemory {
+    AutoAffixPatternProvider affixProvider;
+    LocalPointer<PluralRules> rules;
+};
+
+
+struct DecimalFormatFields : public UMemory {
+
+    DecimalFormatFields() {}
+
+    DecimalFormatFields(const DecimalFormatProperties& propsToCopy)
+        : properties(propsToCopy) {}
+
+    DecimalFormatProperties properties;
+
+    LocalPointer<const DecimalFormatSymbols> symbols;
+
+    LocalizedNumberFormatter formatter;
+
+#ifndef __wasi__
+    std::atomic<::icu::numparse::impl::NumberParserImpl*> atomicParser = {};
+#else
+    ::icu::numparse::impl::NumberParserImpl* atomicParser = nullptr;
+#endif
+
+#ifndef __wasi__
+    std::atomic<::icu::numparse::impl::NumberParserImpl*> atomicCurrencyParser = {};
+#else
+    ::icu::numparse::impl::NumberParserImpl* atomicCurrencyParser = {};
+#endif
+
+    DecimalFormatWarehouse warehouse;
+
+    DecimalFormatProperties exportedProperties;
+
+    bool canUseFastFormat = false;
+    struct FastFormatData {
+        char16_t cpZero;
+        char16_t cpGroupingSeparator;
+        char16_t cpMinusSign;
+        int8_t minInt;
+        int8_t maxInt;
+    } fastData;
+};
+
+
+class NumberPropertyMapper {
+  public:
+    static UnlocalizedNumberFormatter create(const DecimalFormatProperties& properties,
+                                             const DecimalFormatSymbols& symbols,
+                                             DecimalFormatWarehouse& warehouse, UErrorCode& status);
+
+    static UnlocalizedNumberFormatter create(const DecimalFormatProperties& properties,
+                                             const DecimalFormatSymbols& symbols,
+                                             DecimalFormatWarehouse& warehouse,
+                                             DecimalFormatProperties& exportedProperties,
+                                             UErrorCode& status);
+
+    static MacroProps oldToNew(const DecimalFormatProperties& properties,
+                               const DecimalFormatSymbols& symbols, DecimalFormatWarehouse& warehouse,
+                               DecimalFormatProperties* exportedProperties, UErrorCode& status);
+};
+
+} 
+U_NAMESPACE_END
+
+#endif //__NUMBER_MAPPER_H__
+#endif /* #if !UCONFIG_NO_FORMATTING */

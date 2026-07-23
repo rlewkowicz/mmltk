@@ -1,0 +1,222 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/JitHints-inl.h"
+
+#include "gc/Pretenuring.h"
+#include "jit/BaselineIC.h"
+#include "jit/JitScript.h"
+
+#include "vm/BytecodeLocation-inl.h"
+#include "vm/JSScript-inl.h"
+
+using namespace js;
+using namespace js::jit;
+
+JitHintsMap::~JitHintsMap() {
+  while (!ionHintQueue_.isEmpty()) {
+    IonHint* e = ionHintQueue_.popFirst();
+    js_delete(e);
+  }
+  ionHintMap_.clear();
+}
+
+JitHintsMap::IonHint* JitHintsMap::addIonHint(ScriptKey key,
+                                              ScriptToHintMap::AddPtr& p) {
+  UniquePtr<IonHint> hint = MakeUnique<IonHint>(key);
+  if (!hint) {
+    return nullptr;
+  }
+
+  if (!ionHintMap_.add(p, key, hint.get())) {
+    return nullptr;
+  }
+
+  ionHintQueue_.insertBack(hint.get());
+
+  if (ionHintMap_.count() > IonHintMaxEntries) {
+    IonHint* h = ionHintQueue_.popFirst();
+    ionHintMap_.remove(h->key());
+    js_delete(h);
+  }
+
+  return hint.release();
+}
+
+void JitHintsMap::updateAsRecentlyUsed(IonHint* hint) {
+  hint->remove();
+  ionHintQueue_.insertBack(hint);
+}
+
+bool JitHintsMap::recordIonCompilation(JSScript* script) {
+  ScriptKey key = getScriptKey(script);
+  if (!key) {
+    return true;
+  }
+
+  if (!baselineHintMap_.mightContain(key)) {
+    return true;
+  }
+
+  auto p = ionHintMap_.lookupForAdd(key);
+  IonHint* hint = nullptr;
+  if (p) {
+    hint = p->value();
+    updateAsRecentlyUsed(hint);
+  } else {
+    hint = addIonHint(key, p);
+    if (!hint) {
+      return false;
+    }
+  }
+
+  uint32_t threshold = IonHintEagerThresholdValue(
+      script->warmUpCountAtLastICStub(),
+      script->jitScript()->hasPretenuredAllocSites());
+
+  if (threshold > hint->threshold() || hint->hasICModeHints()) {
+    hint->setThreshold(threshold);
+    script->jitScript()->setIonThreshold(threshold);
+  }
+
+  uint32_t numEntries = script->jitScript()->numICEntries();
+
+  if (!hint->hasICModeHints()) {
+    uint32_t numToRecord = std::min(numEntries, ICModeHintMaxEntries);
+    for (uint32_t i = 0; i < numToRecord; i++) {
+      if (script->jitScript()->fallbackStub(i)->state().mode() ==
+          ICState::Mode::Megamorphic) {
+        hint->setMegamorphicHint(i);
+      }
+    }
+    hint->numICModeHints_ = numToRecord;
+  }
+  return true;
+}
+
+uint32_t JitHintsMap::IonHintEagerThresholdValue(uint32_t lastStubCounter,
+                                                 bool hasPretenuredAllocSites) {
+  uint32_t eagerThreshold = lastStubCounter;
+
+  if (hasPretenuredAllocSites) {
+    eagerThreshold =
+        std::max(eagerThreshold, uint32_t(gc::NormalSiteAttentionThreshold));
+  }
+
+  eagerThreshold += 10;
+
+  return std::min(eagerThreshold, JitOptions.normalIonWarmUpThreshold);
+}
+
+bool JitHintsMap::getIonThresholdHint(JSScript* script,
+                                      uint32_t& thresholdOut) {
+  ScriptKey key = getScriptKey(script);
+  if (key) {
+    auto p = ionHintMap_.lookup(key);
+    if (p) {
+      IonHint* hint = p->value();
+      if (hint->threshold() != 0) {
+        updateAsRecentlyUsed(hint);
+        thresholdOut = hint->threshold();
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void JitHintsMap::recordInvalidation(JSScript* script) {
+  ScriptKey key = getScriptKey(script);
+  if (key) {
+    auto p = ionHintMap_.lookup(key);
+    if (p) {
+      IonHint* hint = p->value();
+      hint->incThreshold(InvalidationThresholdIncrement);
+      hint->resetICHints();
+      if (script->hasJitScript()) {
+        script->jitScript()->setIonThreshold(hint->threshold());
+      }
+    }
+  }
+}
+
+bool JitHintsMap::addMonomorphicInlineLocation(JSScript* script,
+                                               BytecodeLocation loc) {
+  ScriptKey key = getScriptKey(script);
+  if (!key) {
+    return true;
+  }
+
+  if (!baselineHintMap_.mightContain(key)) {
+    return true;
+  }
+
+  auto p = ionHintMap_.lookupForAdd(key);
+  IonHint* hint = nullptr;
+  if (p) {
+    hint = p->value();
+  } else {
+    hint = addIonHint(key, p);
+    if (!hint) {
+      return false;
+    }
+  }
+
+  if (!hint->hasSpaceForMonomorphicInlineEntry()) {
+    return true;
+  }
+
+  uint32_t offset = loc.bytecodeToOffset(script);
+  return hint->addMonomorphicInlineOffset(offset);
+}
+
+bool JitHintsMap::hasMonomorphicInlineHintAtOffset(JSScript* script,
+                                                   uint32_t offset) {
+  ScriptKey key = getScriptKey(script);
+  if (!key) {
+    return false;
+  }
+
+  auto p = ionHintMap_.lookup(key);
+  if (p) {
+    return p->value()->hasMonomorphicInlineOffset(offset);
+  }
+
+  return false;
+}
+
+bool JitHintsMap::shouldTransitionMegamorphic(JSScript* script,
+                                              ICScript* icScript,
+                                              ICFallbackStub* stub) {
+  ScriptKey key = getScriptKey(script);
+  if (!key) {
+    return false;
+  }
+
+  auto p = ionHintMap_.lookup(key);
+  if (!p) {
+    return false;
+  }
+
+  IonHint* hint = p->value();
+  if (!hint->hasICModeHints()) {
+    return false;
+  }
+
+  ICEntry* icEntry = icScript->icEntryForStub(stub);
+  uint32_t index = icEntry - icScript->icEntries();
+
+  if (index >= hint->numICModeHints()) {
+    return false;
+  }
+
+  if (!hint->isMegamorphicHint(index)) {
+    return false;
+  }
+  if (stub->state().mode() >= ICState::Mode::Megamorphic) {
+    return false;
+  }
+
+  return true;
+}

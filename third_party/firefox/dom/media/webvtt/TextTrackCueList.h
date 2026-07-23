@@ -1,0 +1,66 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_TextTrackCueList_h
+#define mozilla_dom_TextTrackCueList_h
+
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsTArray.h"
+#include "nsTHashSet.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+class TextTrackCue;
+
+class TextTrackCueList final : public nsISupports, public nsWrapperCache {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(TextTrackCueList)
+
+  explicit TextTrackCueList(nsISupports* aParent);
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  nsISupports* GetParentObject() const { return mParent; }
+
+  uint32_t Length() const { return mList.Length(); }
+
+  bool IsEmpty() const { return mList.Length() == 0; }
+
+  TextTrackCue* IndexedGetter(uint32_t aIndex, bool& aFound);
+  TextTrackCue* operator[](uint32_t aIndex);
+  TextTrackCue* GetCueById(const nsAString& aId);
+  TextTrackCueList& operator=(const TextTrackCueList& aOther);
+
+  void AddCue(TextTrackCue& aCue);
+  void RemoveCue(TextTrackCue& aCue);
+  void RemoveCue(TextTrackCue& aCue, ErrorResult& aRv);
+  void GetArray(nsTArray<RefPtr<TextTrackCue>>& aCues);
+
+  void SetCuesInactive();
+
+  void NotifyCueUpdated(TextTrackCue* aCue);
+  bool IsCueExist(TextTrackCue* aCue) const;
+  nsTArray<RefPtr<TextTrackCue>>& GetCuesArray();
+
+ private:
+  ~TextTrackCueList();
+
+  nsCOMPtr<nsISupports> mParent;
+
+  nsTArray<RefPtr<TextTrackCue>> mList;
+
+  nsTHashSet<TextTrackCue*> mCueSet;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_TextTrackCueList_h

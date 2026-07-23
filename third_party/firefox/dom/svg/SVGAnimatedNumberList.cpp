@@ -1,0 +1,124 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SVGAnimatedNumberList.h"
+
+#include <utility>
+
+#include "DOMSVGAnimatedNumberList.h"
+#include "SVGNumberListSMILType.h"
+#include "mozilla/SMILValue.h"
+#include "mozilla/Try.h"
+#include "mozilla/dom/SVGElement.h"
+
+using namespace mozilla::dom;
+
+namespace mozilla {
+
+nsresult SVGAnimatedNumberList::SetBaseValueString(const nsAString& aValue) {
+  SVGNumberList newBaseValue;
+  MOZ_TRY(newBaseValue.SetValueFromString(aValue));
+
+  DOMSVGAnimatedNumberList* domWrapper =
+      DOMSVGAnimatedNumberList::GetDOMWrapperIfExists(this);
+  if (domWrapper) {
+    domWrapper->InternalBaseValListWillChangeTo(newBaseValue);
+  }
+
+
+  mIsBaseSet = true;
+  mBaseVal.SwapWith(newBaseValue);
+  return NS_OK;
+}
+
+void SVGAnimatedNumberList::ClearBaseValue(uint32_t aAttrEnum) {
+  DOMSVGAnimatedNumberList* domWrapper =
+      DOMSVGAnimatedNumberList::GetDOMWrapperIfExists(this);
+  if (domWrapper) {
+    domWrapper->InternalBaseValListWillChangeTo(SVGNumberList());
+  }
+  mBaseVal.Clear();
+  mIsBaseSet = false;
+}
+
+nsresult SVGAnimatedNumberList::SetAnimValue(const SVGNumberList& aNewAnimValue,
+                                             SVGElement* aElement,
+                                             uint32_t aAttrEnum) {
+  DOMSVGAnimatedNumberList* domWrapper =
+      DOMSVGAnimatedNumberList::GetDOMWrapperIfExists(this);
+  if (domWrapper) {
+    domWrapper->InternalAnimValListWillChangeTo(aNewAnimValue);
+  }
+  if (!mAnimVal) {
+    mAnimVal = std::make_unique<SVGNumberList>();
+  }
+  nsresult rv = mAnimVal->CopyFrom(aNewAnimValue);
+  if (NS_FAILED(rv)) {
+    ClearAnimValue(aElement, aAttrEnum);
+    return rv;
+  }
+  aElement->DidAnimateNumberList(aAttrEnum);
+  return NS_OK;
+}
+
+void SVGAnimatedNumberList::ClearAnimValue(SVGElement* aElement,
+                                           uint32_t aAttrEnum) {
+  DOMSVGAnimatedNumberList* domWrapper =
+      DOMSVGAnimatedNumberList::GetDOMWrapperIfExists(this);
+  if (domWrapper) {
+    domWrapper->InternalAnimValListWillChangeTo(mBaseVal);
+  }
+  mAnimVal = nullptr;
+  aElement->DidAnimateNumberList(aAttrEnum);
+}
+
+std::unique_ptr<SMILAttr> SVGAnimatedNumberList::ToSMILAttr(
+    SVGElement* aSVGElement, uint8_t aAttrEnum) {
+  return std::make_unique<SMILAnimatedNumberList>(this, aSVGElement, aAttrEnum);
+}
+
+nsresult SVGAnimatedNumberList::SMILAnimatedNumberList::ValueFromString(
+    const nsAString& aStr, const dom::SVGAnimationElement* ,
+    SMILValue& aValue, bool& aPreventCachingOfSandwich) const {
+  SMILValue val(&SVGNumberListSMILType::sSingleton);
+  SVGNumberListAndInfo* nlai = static_cast<SVGNumberListAndInfo*>(val.mU.mPtr);
+  nsresult rv = nlai->SetValueFromString(aStr);
+  if (NS_SUCCEEDED(rv)) {
+    nlai->SetInfo(mElement);
+    aValue = std::move(val);
+  }
+  return rv;
+}
+
+SMILValue SVGAnimatedNumberList::SMILAnimatedNumberList::GetBaseValue() const {
+  SMILValue val;
+
+  SMILValue tmp(&SVGNumberListSMILType::sSingleton);
+  SVGNumberListAndInfo* nlai = static_cast<SVGNumberListAndInfo*>(tmp.mU.mPtr);
+  nsresult rv = nlai->CopyFrom(mVal->mBaseVal);
+  if (NS_SUCCEEDED(rv)) {
+    nlai->SetInfo(mElement);
+    std::swap(val, tmp);
+  }
+  return val;
+}
+
+nsresult SVGAnimatedNumberList::SMILAnimatedNumberList::SetAnimValue(
+    const SMILValue& aValue) {
+  NS_ASSERTION(aValue.mType == &SVGNumberListSMILType::sSingleton,
+               "Unexpected type to assign animated value");
+  if (aValue.mType == &SVGNumberListSMILType::sSingleton) {
+    mVal->SetAnimValue(*static_cast<SVGNumberListAndInfo*>(aValue.mU.mPtr),
+                       mElement, mAttrEnum);
+  }
+  return NS_OK;
+}
+
+void SVGAnimatedNumberList::SMILAnimatedNumberList::ClearAnimValue() {
+  if (mVal->mAnimVal) {
+    mVal->ClearAnimValue(mElement, mAttrEnum);
+  }
+}
+
+}  

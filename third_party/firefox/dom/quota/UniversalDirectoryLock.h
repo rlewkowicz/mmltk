@@ -1,0 +1,60 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_QUOTA_UNIVERSALDIRECTORYLOCK_H_
+#define DOM_QUOTA_UNIVERSALDIRECTORYLOCK_H_
+
+#include "mozilla/dom/quota/Client.h"
+#include "mozilla/dom/quota/DirectoryLockImpl.h"
+#include "mozilla/dom/quota/PersistenceType.h"
+
+template <class T>
+class RefPtr;
+
+namespace mozilla {
+
+template <typename T>
+class MovingNotNull;
+
+}  
+
+namespace mozilla::dom {
+
+template <typename T>
+struct Nullable;
+
+}  
+
+namespace mozilla::dom::quota {
+
+class ClientDirectoruLock;
+enum class DirectoryLockCategory : uint8_t;
+struct OriginMetadata;
+class OriginScope;
+class PersistenceScope;
+class QuotaManager;
+
+class UniversalDirectoryLock final : public DirectoryLockImpl {
+  friend class QuotaManager;
+
+ public:
+  using DirectoryLockImpl::DirectoryLockImpl;
+
+  RefPtr<ClientDirectoryLock> SpecializeForClient(
+      PersistenceType aPersistenceType,
+      const quota::OriginMetadata& aOriginMetadata,
+      Client::Type aClientType) const;
+
+ private:
+  static RefPtr<UniversalDirectoryLock> CreateInternal(
+      MovingNotNull<RefPtr<QuotaManager>> aQuotaManager,
+      const PersistenceScope& aPersistenceScope,
+      const OriginScope& aOriginScope,
+      const ClientStorageScope& aClientStorageScope, bool aExclusive,
+      DirectoryLockCategory aCategory);
+};
+
+}  
+
+#endif  // DOM_QUOTA_UNIVERSALDIRECTORYLOCK_H_

@@ -1,0 +1,135 @@
+// Copyright 2018 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "compiler/translator/tree_ops/PruneEmptyCases.h"
+
+#include "compiler/translator/Symbol.h"
+#include "compiler/translator/tree_util/IntermTraverse.h"
+
+namespace sh
+{
+
+namespace
+{
+
+bool AreEmptyBlocks(const TIntermSequence *statements);
+
+bool IsEmptyBlock(TIntermNode *node)
+{
+    TIntermBlock *asBlock = node->getAsBlock();
+    if (asBlock)
+    {
+        return AreEmptyBlocks(asBlock->getSequence());
+    }
+    ASSERT(node->getAsDeclarationNode() == nullptr ||
+           !node->getAsDeclarationNode()->getSequence()->empty());
+    ASSERT(node->getAsConstantUnion() == nullptr);
+    return false;
+}
+
+bool AreEmptyBlocks(const TIntermSequence *statements)
+{
+    for (size_t i = 0u; i < statements->size(); ++i)
+    {
+        if (!IsEmptyBlock(statements->at(i)))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+class PruneEmptyCasesTraverser : private TIntermTraverser
+{
+  public:
+    [[nodiscard]] static bool apply(TCompiler *compiler, TIntermBlock *root);
+
+  private:
+    PruneEmptyCasesTraverser();
+    bool visitSwitch(Visit visit, TIntermSwitch *node) override;
+};
+
+bool PruneEmptyCasesTraverser::apply(TCompiler *compiler, TIntermBlock *root)
+{
+    PruneEmptyCasesTraverser prune;
+    root->traverse(&prune);
+    return prune.updateTree(compiler, root);
+}
+
+PruneEmptyCasesTraverser::PruneEmptyCasesTraverser() : TIntermTraverser(true, false, false) {}
+
+bool PruneEmptyCasesTraverser::visitSwitch(Visit visit, TIntermSwitch *node)
+{
+    TIntermBlock *statementList = node->getStatementList();
+    TIntermSequence *statements = statementList->getSequence();
+
+    size_t i                       = statements->size();
+    size_t lastNoOpInStatementList = i;
+
+    while (i > 0)
+    {
+        --i;
+        TIntermNode *statement = statements->at(i);
+
+        if (i + 1 == statements->size() && statement->getAsBranchNode() != nullptr &&
+            statement->getAsBranchNode()->getFlowOp() == EOpBreak)
+        {
+            continue;
+        }
+        if (statement->getAsCaseNode() || IsEmptyBlock(statement))
+        {
+            lastNoOpInStatementList = i;
+        }
+        else
+        {
+            break;
+        }
+    }
+    if (lastNoOpInStatementList == 0)
+    {
+        TIntermTyped *init = node->getInit();
+        if (init->hasSideEffects())
+        {
+            queueReplacement(init, OriginalNode::IS_DROPPED);
+        }
+        else
+        {
+            TIntermSequence emptyReplacement;
+            ASSERT(getParentNode()->getAsBlock());
+            mMultiReplacements.emplace_back(getParentNode()->getAsBlock(), node,
+                                            std::move(emptyReplacement));
+        }
+        return false;
+    }
+    if (lastNoOpInStatementList < statements->size())
+    {
+        bool hasDefault = false;
+        for (i = 0; i < lastNoOpInStatementList; ++i)
+        {
+            TIntermNode *statement = statements->at(i);
+            if (statement->getAsCaseNode() != nullptr &&
+                !statement->getAsCaseNode()->hasCondition())
+            {
+                hasDefault = true;
+                break;
+            }
+        }
+
+        if (!hasDefault)
+        {
+            statements->erase(statements->begin() + lastNoOpInStatementList, statements->end());
+        }
+    }
+
+    return true;
+}
+
+}  
+
+bool PruneEmptyCases(TCompiler *compiler, TIntermBlock *root)
+{
+    return PruneEmptyCasesTraverser::apply(compiler, root);
+}
+
+}  

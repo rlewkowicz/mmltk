@@ -1,0 +1,58 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_GuardFuse_h
+#define vm_GuardFuse_h
+
+#include "mozilla/Assertions.h"
+
+#include <stddef.h>
+
+#include "jstypes.h"
+
+struct JS_PUBLIC_API JSContext;
+
+namespace js {
+
+class GuardFuse {
+ public:
+  GuardFuse() = default;
+  GuardFuse(GuardFuse&&) = delete;
+
+  virtual const char* name() = 0;
+
+  virtual void popFuse(JSContext* cx) {
+    MOZ_ASSERT_IF(fuse_, fuse_ == PoppedFuseValue);
+    fuse_ = PoppedFuseValue;
+  }
+
+  bool intact() {
+    MOZ_ASSERT_IF(fuse_, fuse_ == PoppedFuseValue);
+    return fuse_ == 0;
+  }
+
+  GuardFuse* self() { return this; }
+
+  size_t* fuseRef() { return &fuse_; }
+  static int32_t fuseOffset() { return offsetof(GuardFuse, fuse_); }
+
+  virtual void assertInvariant(JSContext* cx) {
+    if (intact()) {
+      if (!checkInvariant(cx)) {
+        fprintf(stderr, "Fuse %s failed invariant check\n", name());
+        MOZ_CRASH("Failed invariant check");
+      }
+    }
+  }
+
+  virtual bool checkInvariant(JSContext* cx) = 0;
+
+ private:
+  static constexpr size_t PoppedFuseValue = 0x808;
+
+  size_t fuse_ = 0;
+};
+
+}  
+#endif  // vm_GuardFuse_h

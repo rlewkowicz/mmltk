@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_XMLStylesheetProcessingInstruction_h
+#define mozilla_dom_XMLStylesheetProcessingInstruction_h
+
+#include "mozilla/dom/LinkStyle.h"
+#include "mozilla/dom/ProcessingInstruction.h"
+#include "nsIURI.h"
+
+namespace mozilla::dom {
+
+class XMLStylesheetProcessingInstruction final : public ProcessingInstruction,
+                                                 public LinkStyle {
+ public:
+  XMLStylesheetProcessingInstruction(
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,
+      const nsAString& aData)
+      : ProcessingInstruction(std::move(aNodeInfo), aData) {}
+
+  XMLStylesheetProcessingInstruction(nsNodeInfoManager* aNodeInfoManager,
+                                     const nsAString& aData)
+      : ProcessingInstruction(
+            aNodeInfoManager->GetNodeInfo(
+                nsGkAtoms::processingInstructionTagName, nullptr,
+                kNameSpaceID_None, PROCESSING_INSTRUCTION_NODE,
+                nsGkAtoms::xml_stylesheet),
+            aData) {}
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(XMLStylesheetProcessingInstruction,
+                                           ProcessingInstruction)
+
+  virtual void SetNodeValueInternal(
+      const nsAString& aNodeValue, mozilla::ErrorResult& aError,
+      MutationEffectOnScript aMutationEffectOnScript) override;
+
+  virtual nsresult BindToTree(BindContext&, nsINode& aParent) override;
+  virtual void UnbindFromTree(UnbindContext&) override;
+
+  void OverrideBaseURI(nsIURI* aNewBaseURI);
+
+  void GetCharset(nsAString& aCharset) override;
+
+  virtual void SetDataInternal(const nsAString& aData,
+                               MutationEffectOnScript aMutationEffectOnScript,
+                               mozilla::ErrorResult& rv) override;
+
+ protected:
+  virtual ~XMLStylesheetProcessingInstruction();
+
+  nsCOMPtr<nsIURI> mOverriddenBaseURI;
+
+  nsIContent& AsContent() final { return *this; }
+  const LinkStyle* AsLinkStyle() const final { return this; }
+  Maybe<SheetInfo> GetStyleSheetInfo() final;
+
+  already_AddRefed<CharacterData> CloneDataNode(
+      mozilla::dom::NodeInfo* aNodeInfo, bool aCloneText) const final;
+};
+
+}  
+
+#endif  // mozilla_dom_XMLStylesheetProcessingInstruction_h

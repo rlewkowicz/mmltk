@@ -1,0 +1,40 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+*
+*   Copyright (C) 1997-2013, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+******************************************************************************
+*/
+#ifndef MUTEX_H
+#define MUTEX_H
+
+#include "unicode/utypes.h"
+#include "unicode/uobject.h"
+#include "umutex.h"
+
+U_NAMESPACE_BEGIN
+
+
+class U_COMMON_API Mutex : public UMemory {
+public:
+    Mutex(UMutex *mutex = nullptr) : fMutex(mutex) {
+        umtx_lock(fMutex);
+    }
+    ~Mutex() {
+        umtx_unlock(fMutex);
+    }
+
+    Mutex(const Mutex &other) = delete; 
+    Mutex &operator=(const Mutex &other) = delete; 
+    void *operator new(size_t s) = delete;  
+
+private:
+    UMutex   *fMutex;
+};
+
+
+U_NAMESPACE_END
+
+#endif //_MUTEX_

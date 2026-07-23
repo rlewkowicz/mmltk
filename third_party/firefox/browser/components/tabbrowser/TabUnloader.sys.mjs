@@ -1,0 +1,359 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const lazy = {};
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  PrivateBrowsingUtils: "resource://gre/modules/PrivateBrowsingUtils.sys.mjs",
+});
+
+const MIN_TABS_COUNT = 10;
+
+const NEVER_DISCARD = 100000;
+
+const kMinInactiveDurationInMs = Services.prefs.getIntPref(
+  "browser.tabs.min_inactive_duration_before_unload"
+);
+
+let criteriaTypes = [
+  ["isNonDiscardable", NEVER_DISCARD],
+  ["isLoading", 8],
+  ["playingMedia", NEVER_DISCARD],
+  ["isPinned", 2],
+  ["isPrivate", NEVER_DISCARD],
+];
+
+let CRITERIA_METHOD = 0;
+let CRITERIA_WEIGHT = 1;
+
+let DefaultTabUnloaderMethods = {
+  isNonDiscardable(tab, weight) {
+    if (tab.undiscardable || tab.selected) {
+      return weight;
+    }
+
+    return !tab.linkedBrowser.isConnected ? -1 : 0;
+  },
+
+  isPinned(tab, weight) {
+    return tab.pinned ? weight : 0;
+  },
+
+  isLoading() {
+    return 0;
+  },
+
+  playingMedia(tab, weight) {
+    return tab.soundPlaying ? weight : 0;
+  },
+
+  isPrivate(tab, weight) {
+    return lazy.PrivateBrowsingUtils.isBrowserPrivate(tab.linkedBrowser)
+      ? weight
+      : 0;
+  },
+
+  getMinTabCount() {
+    return MIN_TABS_COUNT;
+  },
+
+  getNow() {
+    return Date.now();
+  },
+
+  *iterateTabs() {
+    for (let win of Services.wm.getEnumerator("navigator:browser")) {
+      for (let tab of win.gBrowser.tabs) {
+        yield { tab, gBrowser: win.gBrowser };
+      }
+    }
+  },
+
+  *iterateBrowsingContexts(bc) {
+    yield bc;
+    for (let childBC of bc.children) {
+      yield* this.iterateBrowsingContexts(childBC);
+    }
+  },
+
+  *iterateProcesses(tab) {
+    let bc = tab?.linkedBrowser?.browsingContext;
+    if (!bc) {
+      return;
+    }
+
+    const iter = this.iterateBrowsingContexts(bc);
+    for (let childBC of iter) {
+      if (childBC?.currentWindowGlobal) {
+        yield childBC.currentWindowGlobal.osPid;
+      }
+    }
+  },
+
+  async calculateMemoryUsage(processMap) {
+    let parentProcessInfo = await ChromeUtils.requestProcInfo();
+    let childProcessInfoList = parentProcessInfo.children;
+    for (let childProcInfo of childProcessInfoList) {
+      let processInfo = processMap.get(childProcInfo.pid);
+      if (!processInfo) {
+        processInfo = { count: 0, topCount: 0, tabSet: new Set() };
+        processMap.set(childProcInfo.pid, processInfo);
+      }
+      processInfo.memory = childProcInfo.memory;
+    }
+  },
+};
+
+
+export var TabUnloader = {
+  init() {
+    const watcher = Cc["@mozilla.org/xpcom/memory-watcher;1"].getService(
+      Ci.nsIAvailableMemoryWatcherBase
+    );
+    watcher.registerTabUnloader(this);
+  },
+
+  isDiscardable(tab) {
+    if (!("weight" in tab)) {
+      return false;
+    }
+    return tab.weight < NEVER_DISCARD;
+  },
+
+  async unloadTabAsync(minInactiveDuration = kMinInactiveDurationInMs) {
+    const watcher = Cc["@mozilla.org/xpcom/memory-watcher;1"].getService(
+      Ci.nsIAvailableMemoryWatcherBase
+    );
+
+    if (!Services.prefs.getBoolPref("browser.tabs.unloadOnLowMemory", true)) {
+      watcher.onUnloadAttemptCompleted(Cr.NS_ERROR_NOT_AVAILABLE);
+      return;
+    }
+
+    if (this._isUnloading) {
+      Services.console.logStringMessage("Unloading a tab is in progress.");
+      watcher.onUnloadAttemptCompleted(Cr.NS_ERROR_ABORT);
+      return;
+    }
+
+    this._isUnloading = true;
+    const isTabUnloaded =
+      await this.unloadLeastRecentlyUsedTab(minInactiveDuration);
+    this._isUnloading = false;
+
+    watcher.onUnloadAttemptCompleted(
+      isTabUnloaded ? Cr.NS_OK : Cr.NS_ERROR_NOT_AVAILABLE
+    );
+  },
+
+  async getSortedTabs(
+    minInactiveDuration = kMinInactiveDurationInMs,
+    tabMethods = DefaultTabUnloaderMethods
+  ) {
+    let tabs = [];
+
+    const now = tabMethods.getNow();
+
+    let lowestWeight = 1000;
+    for (let tab of tabMethods.iterateTabs()) {
+      if (
+        typeof minInactiveDuration == "number" &&
+        now - tab.tab.lastAccessed < minInactiveDuration
+      ) {
+        continue;
+      }
+
+      let weight = determineTabBaseWeight(tab, tabMethods);
+
+      if (weight != -1) {
+        tab.weight = weight;
+        tabs.push(tab);
+        if (weight < lowestWeight) {
+          lowestWeight = weight;
+        }
+      }
+    }
+
+    tabs = tabs.sort((a, b) => {
+      if (a.weight != b.weight) {
+        return a.weight - b.weight;
+      }
+
+      return a.tab.lastAccessed - b.tab.lastAccessed;
+    });
+
+    if (!tabs.length || !this.isDiscardable(tabs[0])) {
+      return tabs;
+    }
+
+    let higherWeightedCount = 0;
+    for (let idx = 0; idx < tabs.length; idx++) {
+      if (tabs[idx].weight != lowestWeight) {
+        higherWeightedCount = tabs.length - idx;
+        break;
+      }
+    }
+
+    let minCount = tabMethods.getMinTabCount();
+    if (higherWeightedCount < minCount) {
+      higherWeightedCount = minCount;
+    }
+
+    const lowestWeightedCount = tabs.length - higherWeightedCount;
+    if (lowestWeightedCount > 1) {
+      let processMap = getAllProcesses(tabs, tabMethods);
+
+      let higherWeightedTabs = tabs.splice(-higherWeightedCount);
+
+      await adjustForResourceUse(tabs, processMap, tabMethods);
+      tabs = tabs.concat(higherWeightedTabs);
+    }
+
+    return tabs;
+  },
+
+  async unloadLeastRecentlyUsedTab(
+    minInactiveDuration = kMinInactiveDurationInMs
+  ) {
+    const sortedTabs = await this.getSortedTabs(minInactiveDuration);
+
+    for (let tabInfo of sortedTabs) {
+      if (!this.isDiscardable(tabInfo)) {
+        return false;
+      }
+
+      const remoteType = tabInfo.tab?.linkedBrowser?.remoteType;
+      await tabInfo.gBrowser.prepareDiscardBrowser(tabInfo.tab);
+      if (tabInfo.gBrowser.discardBrowser(tabInfo.tab)) {
+        Services.console.logStringMessage(
+          `TabUnloader discarded <${remoteType}>`
+        );
+        tabInfo.tab.updateLastUnloadedByTabUnloader();
+        return true;
+      }
+    }
+    return false;
+  },
+
+  QueryInterface: ChromeUtils.generateQI([
+    "nsIObserver",
+    "nsISupportsWeakReference",
+  ]),
+};
+
+function determineTabBaseWeight(tab, tabMethods) {
+  let totalWeight = 0;
+
+  for (let criteriaType of criteriaTypes) {
+    let weight = tabMethods[criteriaType[CRITERIA_METHOD]](
+      tab.tab,
+      criteriaType[CRITERIA_WEIGHT]
+    );
+
+    if (weight == -1) {
+      return -1;
+    }
+
+    totalWeight += weight;
+  }
+
+  return totalWeight;
+}
+
+function getAllProcesses(tabs, tabMethods) {
+
+  let processMap = new Map();
+
+  for (let tabIndex = 0; tabIndex < tabs.length; ++tabIndex) {
+    const tab = tabs[tabIndex];
+
+    tab.processes = new Map();
+
+    let topLevel = true;
+    for (let pid of tabMethods.iterateProcesses(tab.tab)) {
+      let processInfo = processMap.get(pid);
+      if (processInfo) {
+        processInfo.count++;
+        processInfo.tabSet.add(tabIndex);
+      } else {
+        processInfo = { count: 1, topCount: 0, tabSet: new Set([tabIndex]) };
+        processMap.set(pid, processInfo);
+      }
+
+      let tabProcessEntry = tab.processes.get(pid);
+      if (tabProcessEntry) {
+        ++tabProcessEntry.frameCount;
+      } else {
+        tabProcessEntry = {
+          isTopLevel: topLevel,
+          frameCount: 1,
+          entryToProcessMap: processInfo,
+        };
+        tab.processes.set(pid, tabProcessEntry);
+      }
+
+      if (topLevel) {
+        topLevel = false;
+        processInfo.topCount = processInfo.topCount
+          ? processInfo.topCount + 1
+          : 1;
+        ++tabProcessEntry.frameCount;
+      }
+    }
+  }
+
+  return processMap;
+}
+
+async function adjustForResourceUse(tabs, processMap, tabMethods) {
+  await tabMethods.calculateMemoryUsage(processMap, tabs);
+
+  let sortWeight = 0;
+  for (let tab of tabs) {
+    tab.sortWeight = ++sortWeight;
+
+    let uniqueCount = 0;
+    let totalMemory = 0;
+    for (const procEntry of tab.processes.values()) {
+      const processInfo = procEntry.entryToProcessMap;
+      if (processInfo.tabSet.size == 1) {
+        uniqueCount++;
+      }
+
+      const perFrameMemory =
+        processInfo.memory /
+        (processInfo.topCount * 2 + (processInfo.count - processInfo.topCount));
+      totalMemory += perFrameMemory * procEntry.frameCount;
+    }
+
+    tab.uniqueCount = uniqueCount;
+    tab.memory = totalMemory;
+  }
+
+  tabs.sort((a, b) => {
+    return b.uniqueCount - a.uniqueCount;
+  });
+  sortWeight = 0;
+  for (let tab of tabs) {
+    tab.sortWeight += ++sortWeight;
+    if (tab.uniqueCount > 1) {
+      tab.sortWeight -= tab.uniqueCount - 1;
+    }
+  }
+
+  tabs.sort((a, b) => {
+    return b.memory - a.memory;
+  });
+  sortWeight = 0;
+  for (let tab of tabs) {
+    tab.sortWeight += ++sortWeight;
+  }
+
+  tabs.sort((a, b) => {
+    if (a.sortWeight != b.sortWeight) {
+      return a.sortWeight - b.sortWeight;
+    }
+    return a.tab.lastAccessed - b.tab.lastAccessed;
+  });
+}

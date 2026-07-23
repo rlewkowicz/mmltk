@@ -1,0 +1,11 @@
+
+[package]
+name = "dirs"
+version = "4.0.0"
+authors = ["Simon Ochsenreither <simon@ochsenreither.de>"]
+description = "XDG standard locations for Linux configuration, cache, and data directories."
+keywords = ["xdg", "basedir", "app_dirs", "path", "folder"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/soc/dirs-rs"
+[dependencies.dirs-sys]
+version = "0.3.6"

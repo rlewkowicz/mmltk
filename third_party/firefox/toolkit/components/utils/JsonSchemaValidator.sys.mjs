@@ -1,0 +1,456 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+const lazy = {};
+
+ChromeUtils.defineLazyGetter(lazy, "log", () => {
+  let { ConsoleAPI } = ChromeUtils.importESModule(
+    "resource://gre/modules/Console.sys.mjs"
+  );
+  return new ConsoleAPI({
+    prefix: "JsonSchemaValidator",
+    maxLogLevel: "error",
+  });
+});
+
+
+export class JsonSchemaValidator {
+  static validate(
+    value,
+    schema,
+    {
+      allowArrayNonMatchingItems = false,
+      allowExplicitUndefinedProperties = false,
+      allowNullAsUndefinedProperties = false,
+      allowAdditionalProperties = false,
+    } = {}
+  ) {
+    let validator = new JsonSchemaValidator({
+      allowArrayNonMatchingItems,
+      allowExplicitUndefinedProperties,
+      allowNullAsUndefinedProperties,
+      allowAdditionalProperties,
+    });
+    return validator.validate(value, schema);
+  }
+
+  constructor({
+    allowArrayNonMatchingItems = false,
+    allowExplicitUndefinedProperties = false,
+    allowNullAsUndefinedProperties = false,
+    allowAdditionalProperties = false,
+  } = {}) {
+    this.allowArrayNonMatchingItems = allowArrayNonMatchingItems;
+    this.allowExplicitUndefinedProperties = allowExplicitUndefinedProperties;
+    this.allowNullAsUndefinedProperties = allowNullAsUndefinedProperties;
+    this.allowAdditionalProperties = allowAdditionalProperties;
+  }
+
+  validate(value, schema) {
+    return this._validateRecursive(value, schema, [], {
+      rootValue: value,
+      rootSchema: schema,
+    });
+  }
+
+  // eslint-disable-next-line complexity
+  _validateRecursive(param, properties, keyPath, state) {
+    lazy.log.debug(`checking @${param}@ for type ${properties.type}`);
+
+    if (Array.isArray(properties.type)) {
+      lazy.log.debug("type is an array");
+      for (const type of properties.type) {
+        let typeProperties = Object.assign({}, properties, { type });
+        lazy.log.debug(`checking subtype ${type}`);
+        let result = this._validateRecursive(
+          param,
+          typeProperties,
+          keyPath,
+          state
+        );
+        if (result.valid) {
+          return result;
+        }
+      }
+      return {
+        valid: false,
+        error: new JsonSchemaValidatorError({
+          message:
+            `The value '${valueToString(param)}' does not match any type in ` +
+            valueToString(properties.type),
+          invalidValue: param,
+          keyPath,
+          state,
+        }),
+      };
+    }
+
+    switch (properties.type) {
+      case "boolean":
+      case "number":
+      case "integer":
+      case "string":
+      case "URL":
+      case "URLorEmpty":
+      case "origin":
+      case "null": {
+        let result = this._validateSimpleParam(
+          param,
+          properties.type,
+          keyPath,
+          state
+        );
+        if (!result.valid) {
+          return result;
+        }
+        if (properties.enum && typeof result.parsedValue !== "boolean") {
+          if (!properties.enum.includes(param)) {
+            return {
+              valid: false,
+              error: new JsonSchemaValidatorError({
+                message:
+                  `The value '${valueToString(param)}' is not one of the ` +
+                  `enumerated values ${valueToString(properties.enum)}`,
+                invalidValue: param,
+                keyPath,
+                state,
+              }),
+            };
+          }
+        }
+        return result;
+      }
+
+      case "array": {
+        if (!Array.isArray(param)) {
+          return {
+            valid: false,
+            error: new JsonSchemaValidatorError({
+              message:
+                `The value '${valueToString(param)}' does not match the ` +
+                `expected type 'array'`,
+              invalidValue: param,
+              keyPath,
+              state,
+            }),
+          };
+        }
+
+        let parsedArray = [];
+        for (let i = 0; i < param.length; i++) {
+          let item = param[i];
+          lazy.log.debug(
+            `in array, checking @${item}@ for type ${properties.items.type}`
+          );
+          let result = this._validateRecursive(
+            item,
+            properties.items,
+            keyPath.concat(i),
+            state
+          );
+          if (!result.valid) {
+            if (
+              ("strict" in properties && properties.strict) ||
+              (!("strict" in properties) && !this.allowArrayNonMatchingItems)
+            ) {
+              return result;
+            }
+            continue;
+          }
+
+          parsedArray.push(result.parsedValue);
+        }
+
+        return { valid: true, parsedValue: parsedArray };
+      }
+
+      case "object": {
+        if (typeof param != "object" || !param) {
+          return {
+            valid: false,
+            error: new JsonSchemaValidatorError({
+              message:
+                `The value '${valueToString(param)}' does not match the ` +
+                `expected type 'object'`,
+              invalidValue: param,
+              keyPath,
+              state,
+            }),
+          };
+        }
+
+        let parsedObj = {};
+        let patternProperties = [];
+        if ("patternProperties" in properties) {
+          for (let prop of Object.keys(properties.patternProperties || {})) {
+            let pattern;
+            try {
+              pattern = new RegExp(prop);
+            } catch (e) {
+              throw new Error(
+                `Internal error: Invalid property pattern ${prop}`
+              );
+            }
+            patternProperties.push({
+              pattern,
+              schema: properties.patternProperties[prop],
+            });
+          }
+        }
+
+        if (properties.required) {
+          for (let required of properties.required) {
+            if (!(required in param)) {
+              lazy.log.error(`Object is missing required property ${required}`);
+              return {
+                valid: false,
+                error: new JsonSchemaValidatorError({
+                  message: `Object is missing required property '${required}'`,
+                  invalidValue: param,
+                  keyPath,
+                  state,
+                }),
+              };
+            }
+          }
+        }
+
+        for (let item of Object.keys(param)) {
+          let schema;
+          if (
+            "properties" in properties &&
+            properties.properties.hasOwnProperty(item)
+          ) {
+            schema = properties.properties[item];
+          } else if (patternProperties.length) {
+            for (let patternProperty of patternProperties) {
+              if (patternProperty.pattern.test(item)) {
+                schema = patternProperty.schema;
+                break;
+              }
+            }
+          }
+          if (!schema) {
+            let allowAdditionalProperties =
+              properties.additionalProperties ||
+              (!properties.strict && this.allowAdditionalProperties);
+            if (allowAdditionalProperties) {
+              continue;
+            }
+            return {
+              valid: false,
+              error: new JsonSchemaValidatorError({
+                message: `Object has unexpected property '${item}'`,
+                invalidValue: param,
+                keyPath,
+                state,
+              }),
+            };
+          }
+          let allowExplicitUndefinedProperties =
+            !properties.strict && this.allowExplicitUndefinedProperties;
+          let allowNullAsUndefinedProperties =
+            !properties.strict && this.allowNullAsUndefinedProperties;
+          let isUndefined =
+            (!allowExplicitUndefinedProperties && !(item in param)) ||
+            (allowExplicitUndefinedProperties && param[item] === undefined) ||
+            (allowNullAsUndefinedProperties && param[item] === null);
+          if (isUndefined) {
+            continue;
+          }
+          let result = this._validateRecursive(
+            param[item],
+            schema,
+            keyPath.concat(item),
+            state
+          );
+          if (!result.valid) {
+            return result;
+          }
+          parsedObj[item] = result.parsedValue;
+        }
+        return { valid: true, parsedValue: parsedObj };
+      }
+
+      case "JSON":
+        if (typeof param == "object") {
+          return { valid: true, parsedValue: param };
+        }
+        try {
+          let json = JSON.parse(param);
+          if (typeof json != "object") {
+            return {
+              valid: false,
+              error: new JsonSchemaValidatorError({
+                message: `JSON was not an object: ${valueToString(param)}`,
+                invalidValue: param,
+                keyPath,
+                state,
+              }),
+            };
+          }
+          return { valid: true, parsedValue: json };
+        } catch (e) {
+          lazy.log.error("JSON string couldn't be parsed");
+          return {
+            valid: false,
+            error: new JsonSchemaValidatorError({
+              message: `JSON string could not be parsed: ${valueToString(
+                param
+              )}`,
+              invalidValue: param,
+              keyPath,
+              state,
+            }),
+          };
+        }
+    }
+
+    return {
+      valid: false,
+      error: new JsonSchemaValidatorError({
+        message: `Invalid schema property type: ${valueToString(
+          properties.type
+        )}`,
+        invalidValue: param,
+        keyPath,
+        state,
+      }),
+    };
+  }
+
+  _validateSimpleParam(param, type, keyPath, state) {
+    let valid = false;
+    let parsedParam = param;
+    let error = undefined;
+
+    switch (type) {
+      case "boolean":
+        if (typeof param == "boolean") {
+          valid = true;
+        } else if (typeof param == "number" && (param == 0 || param == 1)) {
+          valid = true;
+          parsedParam = !!param;
+        }
+        break;
+
+      case "number":
+      case "string":
+        valid = typeof param == type;
+        break;
+
+      case "integer":
+        valid = typeof param == "number";
+        break;
+
+      case "null":
+        valid = param === null;
+        break;
+
+      case "origin":
+        if (typeof param != "string") {
+          break;
+        }
+
+        try {
+          parsedParam = new URL(param);
+
+          if (parsedParam.protocol == "file:") {
+            valid = true;
+          } else {
+            let pathQueryRef = parsedParam.pathname + parsedParam.hash;
+            if (pathQueryRef != "/" && pathQueryRef != "") {
+              lazy.log.error(
+                `Ignoring parameter "${param}" - origin was expected but received full URL.`
+              );
+              valid = false;
+            } else {
+              valid = true;
+            }
+          }
+        } catch (ex) {
+          lazy.log.error(`Ignoring parameter "${param}" - not a valid origin.`);
+          valid = false;
+        }
+        break;
+
+      case "URL":
+      case "URLorEmpty":
+        if (typeof param != "string") {
+          break;
+        }
+
+        if (type == "URLorEmpty" && param === "") {
+          valid = true;
+          break;
+        }
+
+        try {
+          parsedParam = new URL(param);
+          valid = true;
+        } catch (ex) {
+          if (!param.startsWith("http")) {
+            lazy.log.error(
+              `Ignoring parameter "${param}" - scheme (http or https) must be specified.`
+            );
+          }
+          valid = false;
+        }
+        break;
+    }
+
+    if (!valid && !error) {
+      error = new JsonSchemaValidatorError({
+        message:
+          `The value '${valueToString(param)}' does not match the expected ` +
+          `type '${type}'`,
+        invalidValue: param,
+        keyPath,
+        state,
+      });
+    }
+
+    let result = {
+      valid,
+      parsedValue: parsedParam,
+    };
+    if (error) {
+      result.error = error;
+    }
+    return result;
+  }
+}
+
+function valueToString(value) {
+  try {
+    return JSON.stringify(value);
+  } catch (ex) {}
+  return String(value);
+}
+
+class JsonSchemaValidatorError extends Error {
+  rootValue;
+
+  rootSchema;
+
+  invalidValue;
+
+  invalidPropertyNameComponents;
+
+  constructor({ message, invalidValue, keyPath, state }) {
+    if (keyPath.length) {
+      message +=
+        ". " +
+        `The invalid value is property '${keyPath.join(".")}' in ` +
+        JSON.stringify(state.rootValue);
+    }
+    super(message);
+    this.name = "JsonSchemaValidatorError";
+    this.rootValue = state.rootValue;
+    this.rootSchema = state.rootSchema;
+    this.invalidPropertyNameComponents = keyPath;
+    this.invalidValue = invalidValue;
+  }
+}

@@ -1,0 +1,144 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "BaseAlgorithms.h"
+
+#include "mozilla/dom/BufferSourceBinding.h"
+#include "mozilla/dom/BufferSourceBindingFwd.h"
+#include "mozilla/dom/TransformStreamDefaultController.h"
+#include "mozilla/dom/UnionTypes.h"
+
+namespace mozilla::dom::compression {
+
+MOZ_CAN_RUN_SCRIPT
+void CompressionStreamAlgorithms::TransformCallbackImpl(
+    JS::Handle<JS::Value> aChunk, TransformStreamDefaultController& aController,
+    ErrorResult& aRv) {
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(aController.GetParentObject())) {
+    aRv.ThrowUnknownError("Internal error");
+    return;
+  }
+  JSContext* cx = jsapi.cx();
+
+
+  RootedUnion<OwningBufferSource> bufferSource(cx);
+  if (!bufferSource.Init(cx, aChunk)) {
+    aRv.MightThrowJSException();
+    aRv.StealExceptionFromJSContext(cx);
+    return;
+  }
+
+  ProcessTypedArraysFixed(
+      bufferSource,
+      [&](const Span<uint8_t>& aData) MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+        CompressAndEnqueue(cx, aData, Flush::No, aController, aRv);
+      });
+}
+
+MOZ_CAN_RUN_SCRIPT void CompressionStreamAlgorithms::FlushCallbackImpl(
+    TransformStreamDefaultController& aController, ErrorResult& aRv) {
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(aController.GetParentObject())) {
+    aRv.ThrowUnknownError("Internal error");
+    return;
+  }
+  JSContext* cx = jsapi.cx();
+
+
+  CompressAndEnqueue(cx, Span<const uint8_t>(), Flush::Yes, aController, aRv);
+}
+
+MOZ_CAN_RUN_SCRIPT void CompressionStreamAlgorithms::CompressAndEnqueue(
+    JSContext* aCx, Span<const uint8_t> aInput, Flush aFlush,
+    TransformStreamDefaultController& aController, ErrorResult& aRv) {
+  MOZ_ASSERT_IF(aFlush == Flush::Yes, !aInput.Length());
+
+  JS::RootedVector<JSObject*> array(aCx);
+
+  Compress(aCx, aInput, &array, aFlush, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  for (const auto& view : array) {
+    JS::Rooted<JS::Value> value(aCx, JS::ObjectValue(*view));
+    aController.Enqueue(aCx, value, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+}
+
+MOZ_CAN_RUN_SCRIPT
+void DecompressionStreamAlgorithms::TransformCallbackImpl(
+    JS::Handle<JS::Value> aChunk, TransformStreamDefaultController& aController,
+    ErrorResult& aRv) {
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(aController.GetParentObject())) {
+    aRv.ThrowUnknownError("Internal error");
+    return;
+  }
+  JSContext* cx = jsapi.cx();
+
+
+  RootedUnion<OwningBufferSource> bufferSource(cx);
+  if (!bufferSource.Init(cx, aChunk)) {
+    aRv.MightThrowJSException();
+    aRv.StealExceptionFromJSContext(cx);
+    return;
+  }
+
+  ProcessTypedArraysFixed(
+      bufferSource,
+      [&](const Span<uint8_t>& aData) MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+        DecompressAndEnqueue(cx, aData, Flush::No, aController, aRv);
+      });
+}
+
+MOZ_CAN_RUN_SCRIPT void DecompressionStreamAlgorithms::FlushCallbackImpl(
+    TransformStreamDefaultController& aController, ErrorResult& aRv) {
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(aController.GetParentObject())) {
+    aRv.ThrowUnknownError("Internal error");
+    return;
+  }
+  JSContext* cx = jsapi.cx();
+
+
+  DecompressAndEnqueue(cx, Span<const uint8_t>(), Flush::Yes, aController, aRv);
+}
+
+MOZ_CAN_RUN_SCRIPT void DecompressionStreamAlgorithms::DecompressAndEnqueue(
+    JSContext* aCx, Span<const uint8_t> aInput, Flush aFlush,
+    TransformStreamDefaultController& aController, ErrorResult& aRv) {
+  MOZ_ASSERT_IF(aFlush == Flush::Yes, !aInput.Length());
+
+  JS::RootedVector<JSObject*> array(aCx);
+
+  bool fullyConsumed = Decompress(aCx, aInput, &array, aFlush, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  for (const auto& view : array) {
+    JS::Rooted<JS::Value> value(aCx, JS::ObjectValue(*view));
+    aController.Enqueue(aCx, value, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+
+  if (mObservedStreamEnd && !fullyConsumed) {
+    aRv.ThrowTypeError("Unexpected input after the end of stream");
+    return;
+  }
+
+  if (aFlush == Flush::Yes && !mObservedStreamEnd) {
+    aRv.ThrowTypeError("The input is ended without reaching the stream end");
+    return;
+  }
+}
+
+}  

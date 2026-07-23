@@ -1,0 +1,130 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_FunctionRef_h
+#define mozilla_FunctionRef_h
+
+#include "mozilla/OperatorNewExtensions.h"  // mozilla::NotNull, ::operator new
+
+#include <cstddef>      // std::nullptr_t
+#include <type_traits>  // std::{declval,integral_constant}, std::is_{convertible,same,void}_v, std::{enable_if,remove_cvref}_t
+#include <utility>      // std::forward
+
+
+namespace mozilla {
+
+namespace detail {
+
+template <typename Returned, typename Required>
+using CompatibleReturnType =
+    std::integral_constant<bool, std::is_void_v<Required> ||
+                                     std::is_convertible_v<Returned, Required>>;
+
+template <typename Func, typename Ret, typename... Params>
+using EnableMatchingFunction = std::enable_if_t<
+    CompatibleReturnType<
+        decltype(std::declval<Func&>()(std::declval<Params>()...)), Ret>::value,
+    int>;
+
+struct MatchingFunctionPointerTag {};
+struct MatchingFunctorTag {};
+struct InvalidFunctorTag {};
+
+template <typename Callable, typename Ret, typename... Params>
+struct GetCallableTag {
+  template <typename T>
+  static MatchingFunctionPointerTag test(
+      int, T& obj, EnableMatchingFunction<decltype(+obj), Ret, Params...> = 0);
+
+  template <typename T>
+  static MatchingFunctorTag test(short, T& obj,
+                                 EnableMatchingFunction<T, Ret, Params...> = 0);
+
+  static InvalidFunctorTag test(...);
+
+  using Type = decltype(test(0, std::declval<Callable&>()));
+};
+
+template <typename Ret, typename... Params>
+struct GetCallableTag<std::nullptr_t, Ret, Params...> {};
+
+template <typename Result, typename Callable, typename Ret, typename... Params>
+using EnableFunctionTag = std::enable_if_t<
+    std::is_same_v<typename GetCallableTag<Callable, Ret, Params...>::Type,
+                   Result>,
+    int>;
+
+}  
+
+template <typename Fn>
+class MOZ_TEMPORARY_CLASS FunctionRef;
+
+template <typename Ret, typename... Params>
+class MOZ_TEMPORARY_CLASS FunctionRef<Ret(Params...)> {
+  union Payload;
+
+  using Adaptor = Ret (*)(const Payload& aPayload, Params... aParams);
+
+  using FuncPtr = Payload***** (*)(Payload*****);
+
+  const Adaptor mAdaptor;
+
+  union Payload {
+    FuncPtr mFuncPtr;
+
+    void* mObject;
+  } mPayload;
+
+  template <typename RealFuncPtr>
+  static Ret CallFunctionPointer(const Payload& aPayload,
+                                 Params... aParams) noexcept {
+    auto func = reinterpret_cast<RealFuncPtr>(aPayload.mFuncPtr);
+    return static_cast<Ret>(func(std::forward<Params>(aParams)...));
+  }
+
+  template <typename Ret2, typename... Params2>
+  FunctionRef(detail::MatchingFunctionPointerTag, Ret2 (*aFuncPtr)(Params2...))
+      : mAdaptor(&CallFunctionPointer<Ret2 (*)(Params2...)>) {
+    ::new (KnownNotNull, &mPayload.mFuncPtr)
+        FuncPtr(reinterpret_cast<FuncPtr>(aFuncPtr));
+  }
+
+ public:
+  MOZ_IMPLICIT FunctionRef(std::nullptr_t) noexcept : mAdaptor(nullptr) {
+    ::new (KnownNotNull, &mPayload.mObject) void*(nullptr);
+  }
+
+  FunctionRef() : FunctionRef(nullptr) {}
+
+  template <typename Callable,
+            typename = detail::EnableFunctionTag<detail::MatchingFunctorTag,
+                                                 Callable, Ret, Params...>,
+            typename std::enable_if_t<!std::is_same_v<
+                std::remove_cvref_t<Callable>, FunctionRef>>* = nullptr>
+  MOZ_IMPLICIT FunctionRef(Callable&& aCallable MOZ_LIFETIME_BOUND) noexcept
+      : mAdaptor([](const Payload& aPayload, Params... aParams) {
+          auto& func = *static_cast<std::remove_reference_t<Callable>*>(
+              aPayload.mObject);
+          return static_cast<Ret>(func(std::forward<Params>(aParams)...));
+        }) {
+    ::new (KnownNotNull, &mPayload.mObject) void*(&aCallable);
+  }
+
+  template <typename Callable,
+            typename = detail::EnableFunctionTag<
+                detail::MatchingFunctionPointerTag, Callable, Ret, Params...>>
+  MOZ_IMPLICIT FunctionRef(const Callable& aCallable) noexcept
+      : FunctionRef(detail::MatchingFunctionPointerTag{}, +aCallable) {}
+
+  Ret operator()(Params... params) const {
+    return mAdaptor(mPayload, std::forward<Params>(params)...);
+  }
+
+  explicit operator bool() const noexcept { return mAdaptor != nullptr; }
+};
+
+} 
+
+#endif /* mozilla_FunctionRef_h */

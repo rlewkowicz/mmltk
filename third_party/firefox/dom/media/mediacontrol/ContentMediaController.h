@@ -1,0 +1,107 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_MEDIACONTROL_CONTENTMEDIACONTROLLER_H_
+#define DOM_MEDIA_MEDIACONTROL_CONTENTMEDIACONTROLLER_H_
+
+#include "MediaControlKeySource.h"
+#include "MediaStatusManager.h"
+#include "mozilla/DefineEnum.h"
+#include "mozilla/dom/AudioSessionBinding.h"
+
+namespace mozilla::dom {
+
+class BrowsingContext;
+
+MOZ_DEFINE_ENUM_CLASS_WITH_BASE_AND_TOSTRING(AudioFocusInterruptAction, uint8_t,
+                                             (Suspend, Resume));
+
+class ContentMediaControlKeyReceiver {
+ public:
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  static ContentMediaControlKeyReceiver* Get(BrowsingContext* aBC);
+
+  virtual void HandleMediaKey(MediaControlKey aKey,
+                              const MediaControlActionParams& aParams = {}) = 0;
+
+  virtual bool IsPlaying() const = 0;
+
+  virtual void SuspendForInterrupt() {}
+  virtual void ResumeFromInterrupt() {}
+
+  virtual void HandleAudioFocusInterrupt(AudioFocusInterruptAction aAction) {}
+};
+
+class ContentMediaAgent : public IMediaInfoUpdater {
+ public:
+  static ContentMediaAgent* Get(BrowsingContext* aBC);
+
+  void NotifyMediaPlaybackChanged(uint64_t aBrowsingContextId,
+                                  MediaPlaybackState aState) override;
+  void NotifyMediaAudibleChanged(
+      uint64_t aBrowsingContextId, MediaAudibleState aState,
+      ControlType aType = ControlType::eControllable,
+      AudioSessionType aSessionType = AudioSessionType::Playback) override;
+  void SetDeclaredPlaybackState(uint64_t aBrowsingContextId,
+                                MediaSessionPlaybackState aState) override;
+  void NotifySessionCreated(uint64_t aBrowsingContextId) override;
+  void NotifySessionDestroyed(uint64_t aBrowsingContextId) override;
+  void UpdateMetadata(uint64_t aBrowsingContextId,
+                      const Maybe<MediaMetadataBase>& aMetadata) override;
+  void EnableAction(uint64_t aBrowsingContextId,
+                    MediaSessionAction aAction) override;
+  void DisableAction(uint64_t aBrowsingContextId,
+                     MediaSessionAction aAction) override;
+  void NotifyMediaFullScreenState(uint64_t aBrowsingContextId,
+                                  bool aIsInFullScreen) override;
+  void UpdatePositionState(uint64_t aBrowsingContextId,
+                           const Maybe<PositionState>& aState) override;
+  void UpdateGuessedPositionState(uint64_t aBrowsingContextId,
+                                  const nsID& aMediaId,
+                                  const Maybe<PositionState>& aState) override;
+
+  virtual void AddReceiver(ContentMediaControlKeyReceiver* aReceiver,
+                           ControlType aType = ControlType::eControllable) = 0;
+  virtual void RemoveReceiver(
+      ContentMediaControlKeyReceiver* aReceiver,
+      ControlType aType = ControlType::eControllable) = 0;
+};
+
+class ContentMediaController final : public ContentMediaAgent,
+                                     public ContentMediaControlKeyReceiver {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(ContentMediaController, override)
+
+  explicit ContentMediaController(uint64_t aId);
+  void AddReceiver(ContentMediaControlKeyReceiver* aListener,
+                   ControlType aType = ControlType::eControllable) override;
+  void RemoveReceiver(ContentMediaControlKeyReceiver* aListener,
+                      ControlType aType = ControlType::eControllable) override;
+
+  void HandleMediaKey(MediaControlKey aKey,
+                      const MediaControlActionParams& aParams = {}) override;
+
+  void HandleAudioFocusInterrupt(AudioFocusInterruptAction aAction) override;
+
+  bool IsAudioInterruptedByPlatform() const {
+    return mAudioInterruptedByPlatform;
+  }
+
+ private:
+  ~ContentMediaController() = default;
+
+  virtual bool IsPlaying() const override { return false; }
+
+  void PauseOrStopMedia();
+
+  nsTArray<RefPtr<ContentMediaControlKeyReceiver>> mControllableReceivers;
+  nsTArray<RefPtr<ContentMediaControlKeyReceiver>> mUncontrollableReceivers;
+
+  bool mAudioInterruptedByPlatform = false;
+};
+
+}  
+
+#endif  // DOM_MEDIA_MEDIACONTROL_CONTENTMEDIACONTROLLER_H_

@@ -1,0 +1,501 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WidgetUtilsGtk.h"
+#include "mozilla/ScopeExit.h"
+
+#include "MainThreadUtils.h"
+#include "mozilla/StaticPrefs_widget.h"
+#include "mozilla/UniquePtr.h"
+#include "nsReadableUtils.h"
+#include "nsString.h"
+#include "nsStringFwd.h"
+#include "nsWindow.h"
+#include "nsIGfxInfo.h"
+#include "mozilla/Components.h"
+#include "nsCOMPtr.h"
+#include "nsIProperties.h"
+#include "nsIFile.h"
+#include "nsXULAppAPI.h"
+#include "nsXPCOMCID.h"
+#include "nsDirectoryServiceDefs.h"
+#include "nsString.h"
+#include "nsGtkKeyUtils.h"
+#include "nsGtkUtils.h"
+
+#include <gtk/gtk.h>
+#include <dlfcn.h>
+#include <glib.h>
+#include <inttypes.h>
+
+#ifdef MOZ_ENABLE_DBUS
+#  include "mozilla/ClearOnShutdown.h"
+#  include "mozilla/widget/AsyncDBus.h"
+#  include "nsAppShell.h"
+#endif  // MOZ_ENABLE_DBUS
+
+#ifdef MOZ_WAYLAND
+#  include "nsWaylandDisplay.h"
+#endif  // MOZ_WAYLAND
+
+
+#undef LOGW
+#ifdef MOZ_LOGGING
+#  include "mozilla/Logging.h"
+extern mozilla::LazyLogModule gWidgetLog;
+#  define LOGW(...) MOZ_LOG(gWidgetLog, mozilla::LogLevel::Debug, (__VA_ARGS__))
+#else
+#  define LOGW(...)
+#endif /* MOZ_LOGGING */
+
+namespace mozilla::widget {
+
+#ifdef MOZ_ENABLE_DBUS
+constexpr char sXdpServiceName[] = "org.freedesktop.portal.Desktop";
+constexpr char sXdpDBusPath[] = "/org/freedesktop/portal/desktop";
+constexpr char sXdpRegistryInterfaceName[] =
+    "org.freedesktop.host.portal.Registry";
+#endif
+
+int32_t WidgetUtilsGTK::IsTouchDeviceSupportPresent() {
+  int32_t result = 0;
+  GdkDisplay* display = gdk_display_get_default();
+  if (!display) {
+    return 0;
+  }
+
+  GdkDeviceManager* manager = gdk_display_get_device_manager(display);
+  if (!manager) {
+    return 0;
+  }
+
+  GList* devices =
+      gdk_device_manager_list_devices(manager, GDK_DEVICE_TYPE_SLAVE);
+  GList* list = devices;
+
+  while (devices) {
+    GdkDevice* device = static_cast<GdkDevice*>(devices->data);
+    if (gdk_device_get_source(device) == GDK_SOURCE_TOUCHSCREEN) {
+      result = 1;
+      break;
+    }
+    devices = devices->next;
+  }
+
+  if (list) {
+    g_list_free(list);
+  }
+
+  return result;
+}
+
+bool IsMainWindowTransparent() {
+  return nsWindow::IsToplevelWindowTransparent();
+}
+
+
+bool GdkIsWaylandDisplay(GdkDisplay* display) {
+  static auto sGdkWaylandDisplayGetType =
+      (GType (*)())dlsym(RTLD_DEFAULT, "gdk_wayland_display_get_type");
+  return sGdkWaylandDisplayGetType &&
+         G_TYPE_CHECK_INSTANCE_TYPE(display, sGdkWaylandDisplayGetType());
+}
+
+bool GdkIsX11Display(GdkDisplay* display) {
+  static auto sGdkX11DisplayGetType =
+      (GType (*)())dlsym(RTLD_DEFAULT, "gdk_x11_display_get_type");
+  return sGdkX11DisplayGetType &&
+         G_TYPE_CHECK_INSTANCE_TYPE(display, sGdkX11DisplayGetType());
+}
+
+bool IsXWaylandProtocol() {
+  static bool isXwayland = [] {
+    return !GdkIsWaylandDisplay() && !!getenv("WAYLAND_DISPLAY");
+  }();
+  return isXwayland;
+}
+
+bool GdkIsWaylandDisplay() {
+  static bool isWaylandDisplay = gdk_display_get_default() &&
+                                 GdkIsWaylandDisplay(gdk_display_get_default());
+  return isWaylandDisplay;
+}
+
+bool GdkIsX11Display() {
+  static bool isX11Display = gdk_display_get_default()
+                                 ? GdkIsX11Display(gdk_display_get_default())
+                                 : false;
+  return isX11Display;
+}
+
+GdkDevice* GdkGetPointer() {
+  GdkDisplay* display = gdk_display_get_default();
+  GdkDeviceManager* deviceManager = gdk_display_get_device_manager(display);
+  return gdk_device_manager_get_client_pointer(deviceManager);
+}
+
+GdkSeat* GdkDeviceGetSeat(GdkDevice* device) {
+  static auto sGdkDeviceGetSeat =
+      (GdkSeat * (*)(GdkDevice*)) dlsym(RTLD_DEFAULT, "gdk_device_get_seat");
+  if (!sGdkDeviceGetSeat) {
+    return nullptr;
+  }
+  return sGdkDeviceGetSeat(device);
+}
+
+void GdkSeatUngrab(GdkSeat* seat) {
+  static auto sGdkSeatUngrab =
+      (void (*)(GdkSeat*))dlsym(RTLD_DEFAULT, "gdk_seat_ungrab");
+  if (sGdkSeatUngrab) {
+    sGdkSeatUngrab(seat);
+  }
+}
+
+static GdkEvent* sLastPointerDownEvent = nullptr;
+GdkEvent* GetLastPointerDownEvent() { return sLastPointerDownEvent; }
+
+void SetLastPointerDownEvent(GdkEvent* aEvent) {
+  if (sLastPointerDownEvent) {
+    GUniquePtr<GdkEvent> event(sLastPointerDownEvent);
+    sLastPointerDownEvent = nullptr;
+  }
+  if (!aEvent) {
+    return;
+  }
+  GUniquePtr<GdkEvent> event(gdk_event_copy(aEvent));
+  sLastPointerDownEvent = event.release();
+}
+
+bool IsRunningUnderSnap() { return !!GetSnapInstanceName(); }
+
+bool IsRunningUnderFlatpak() {
+  static bool sRunning = [] {
+    return g_file_test("/.flatpak-info", G_FILE_TEST_EXISTS);
+  }();
+  return sRunning;
+}
+
+#ifdef MOZ_ENABLE_DBUS
+static void DoRegisterHostApp() {
+  GUniquePtr<GError> error;
+
+  nsAppShell::DBusConnectionCheck();
+  RefPtr<GDBusProxy> proxy = dont_AddRef(g_dbus_proxy_new_for_bus_sync(
+      G_BUS_TYPE_SESSION, G_DBUS_PROXY_FLAGS_NONE, nullptr, sXdpServiceName,
+      sXdpDBusPath, sXdpRegistryInterfaceName, nullptr ,
+      getter_Transfers(error)));
+  if (error) {
+    NS_WARNING(
+        nsPrintfCString("Failed to create DBus proxy : %s\n", error->message)
+            .get());
+    return;
+  }
+
+  GVariantBuilder builder;
+  g_variant_builder_init(&builder, G_VARIANT_TYPE("(sa{sv})"));
+  g_variant_builder_add(&builder, "s", "org.mozilla.firefox");
+  GVariantBuilder dict_builder;
+  g_variant_builder_init(&dict_builder, G_VARIANT_TYPE("a{sv}"));
+  g_variant_builder_add_value(&builder, g_variant_builder_end(&dict_builder));
+
+  RefPtr<GVariant> args =
+      dont_AddRef(g_variant_ref_sink(g_variant_builder_end(&builder)));
+
+  DBusProxyCall(proxy, "Register", args, G_DBUS_CALL_FLAGS_NONE, -1,
+                 nullptr)
+      ->Then(GetCurrentSerialEventTarget(), __func__,
+             [](const DBusCallPromise::ResolveOrRejectValue& aValue) {
+               if (aValue.IsReject()) {
+                 NS_WARNING("Failed to register host application for portals");
+               }
+             });
+}
+
+void RegisterHostApp() {
+  static bool sInitialized = false;
+
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(XRE_IsParentProcess());
+  MOZ_ASSERT(!sInitialized);
+
+  if (sInitialized || IsRunningUnderFlatpakOrSnap()) {
+    return;
+  }
+
+  sInitialized = true;
+
+  uint32_t DBusID = g_bus_watch_name(
+      G_BUS_TYPE_SESSION, sXdpServiceName, G_BUS_NAME_WATCHER_FLAGS_AUTO_START,
+      [](GDBusConnection*, const gchar*, const gchar*, gpointer data) -> void {
+        DoRegisterHostApp();
+      },
+      nullptr, nullptr, nullptr);
+
+  if (DBusID) {
+    RunOnShutdown([DBusID] { g_bus_unwatch_name(DBusID); });
+  }
+}
+#endif
+
+bool IsPackagedAppFileExists() {
+  static bool sRunning = [] {
+    nsresult rv;
+    nsCString path;
+    nsCOMPtr<nsIFile> file;
+    nsCOMPtr<nsIProperties> directoryService;
+
+    directoryService = do_GetService(NS_DIRECTORY_SERVICE_CONTRACTID);
+    NS_ENSURE_TRUE(directoryService, FALSE);
+
+    rv = directoryService->Get(NS_GRE_DIR, NS_GET_IID(nsIFile),
+                               getter_AddRefs(file));
+    NS_ENSURE_SUCCESS(rv, FALSE);
+
+    rv = file->AppendNative("is-packaged-app"_ns);
+    NS_ENSURE_SUCCESS(rv, FALSE);
+
+    rv = file->GetNativePath(path);
+    NS_ENSURE_SUCCESS(rv, FALSE);
+
+    return g_file_test(path.get(), G_FILE_TEST_EXISTS);
+  }();
+  return sRunning;
+}
+
+const char* GetSnapInstanceName() {
+  static const char* sInstanceName = []() -> const char* {
+    const char* snapName = g_getenv("SNAP_NAME");
+    if (!snapName) {
+      return nullptr;
+    }
+    if (g_strcmp0(snapName, MOZ_APP_NAME) &&
+        g_strcmp0(snapName, MOZ_APP_NAME "-devel")) {
+      return nullptr;
+    }
+    if (const char* instanceName = g_getenv("SNAP_INSTANCE_NAME")) {
+      return g_strdup(instanceName);
+    }
+    return g_strdup(snapName);
+  }();
+  return sInstanceName;
+}
+
+bool ShouldUsePortal(PortalKind aPortalKind) {
+  static bool sPortalEnv = [] {
+    if (IsRunningUnderFlatpakOrSnap()) {
+      return true;
+    }
+    const char* portalEnvString = g_getenv("GTK_USE_PORTAL");
+    return portalEnvString && atoi(portalEnvString) != 0;
+  }();
+
+  bool autoBehavior = sPortalEnv;
+  const int32_t pref = [&] {
+    switch (aPortalKind) {
+      case PortalKind::FilePicker:
+        autoBehavior = true;
+        return StaticPrefs::widget_use_xdg_desktop_portal_file_picker();
+      case PortalKind::MimeHandler:
+        autoBehavior = IsRunningUnderFlatpakOrSnap();
+        return StaticPrefs::widget_use_xdg_desktop_portal_mime_handler();
+      case PortalKind::NativeMessaging:
+        return StaticPrefs::widget_use_xdg_desktop_portal_native_messaging();
+      case PortalKind::Settings:
+        autoBehavior = true;
+        return StaticPrefs::widget_use_xdg_desktop_portal_settings();
+      case PortalKind::Location:
+        return StaticPrefs::widget_use_xdg_desktop_portal_location();
+      case PortalKind::OpenUri:
+        return StaticPrefs::widget_use_xdg_desktop_portal_open_uri();
+    }
+    return 2;
+  }();
+
+  switch (pref) {
+    case 0:
+      return false;
+    case 1:
+      return true;
+    default:
+      return autoBehavior;
+  }
+}
+
+nsTArray<nsCString> ParseTextURIList(const nsACString& aData) {
+  UniquePtr<char[]> data(ToNewCString(aData));
+  gchar** uris = g_uri_list_extract_uris(data.get());
+
+  nsTArray<nsCString> result;
+  for (size_t i = 0; i < g_strv_length(uris); i++) {
+    result.AppendElement(nsCString(uris[i]));
+  }
+
+  g_strfreev(uris);
+  return result;
+}
+
+#ifdef MOZ_WAYLAND
+static gboolean token_failed(gpointer aData);
+
+class XDGTokenRequest {
+ public:
+  void SetTokenID(const char* aTokenID) {
+    LOGW("RequestWaylandFocusPromise() SetTokenID %s", aTokenID);
+    mTransferPromise->Resolve(aTokenID, __func__);
+  }
+  void Cancel() {
+    LOGW("RequestWaylandFocusPromise() canceled");
+    mTransferPromise->Reject(false, __func__);
+    mActivationTimeoutID = 0;
+  }
+
+  XDGTokenRequest(xdg_activation_token_v1* aXdgToken,
+                  RefPtr<FocusRequestPromise::Private> aTransferPromise)
+      : mXdgToken(aXdgToken), mTransferPromise(std::move(aTransferPromise)) {
+    mActivationTimeoutID =
+        g_timeout_add(sActivationTimeout, token_failed, this);
+  }
+  ~XDGTokenRequest() {
+    MozClearPointer(mXdgToken, xdg_activation_token_v1_destroy);
+    if (mActivationTimeoutID) {
+      g_source_remove(mActivationTimeoutID);
+    }
+  }
+
+ private:
+  xdg_activation_token_v1* mXdgToken;
+  RefPtr<FocusRequestPromise::Private> mTransferPromise;
+  guint mActivationTimeoutID;
+  static constexpr int sActivationTimeout = 500;
+};
+
+static gboolean token_failed(gpointer data) {
+  UniquePtr<XDGTokenRequest> request(static_cast<XDGTokenRequest*>(data));
+  request->Cancel();
+  return false;
+}
+
+static void token_done(gpointer data, struct xdg_activation_token_v1* provider,
+                       const char* tokenID) {
+  UniquePtr<XDGTokenRequest> request(static_cast<XDGTokenRequest*>(data));
+  request->SetTokenID(tokenID);
+}
+
+static const struct xdg_activation_token_v1_listener token_listener = {
+    token_done,
+};
+#endif
+
+RefPtr<FocusRequestPromise> RequestWaylandFocusPromise() {
+#ifdef MOZ_WAYLAND
+  if (!GdkIsWaylandDisplay() || !WaylandDisplayGet()->GetSeat()) {
+    LOGW("RequestWaylandFocusPromise() failed.");
+    return nullptr;
+  }
+
+  xdg_activation_v1* xdg_activation = WaylandDisplayGet()->GetXdgActivation();
+  if (!xdg_activation) {
+    LOGW("RequestWaylandFocusPromise() missing xdg_activation");
+    return nullptr;
+  }
+
+  auto transferPromise = MakeRefPtr<FocusRequestPromise::Private>(__func__);
+
+  xdg_activation_token_v1* aXdgToken =
+      xdg_activation_v1_get_activation_token(xdg_activation);
+  xdg_activation_token_v1_add_listener(
+      aXdgToken, &token_listener,
+      new XDGTokenRequest(aXdgToken, transferPromise));
+
+  RefPtr<nsWindow> sourceWindow = nsWindow::GetFocusedWindow();
+  if (sourceWindow && !sourceWindow->IsDestroyed()) {
+    GdkWindow* gdkWindow = sourceWindow->GetToplevelGdkWindow();
+    wl_surface* surface =
+        gdkWindow ? gdk_wayland_window_get_wl_surface(gdkWindow) : nullptr;
+    if (surface) {
+      xdg_activation_token_v1_set_serial(aXdgToken,
+                                         nsWaylandDisplay::GetLastEventSerial(),
+                                         WaylandDisplayGet()->GetSeat());
+      xdg_activation_token_v1_set_surface(aXdgToken, surface);
+    }
+  } else {
+    LOGW(
+        "RequestWaylandFocusPromise() no source window, "
+        "requesting bare token for workspace placement");
+  }
+
+  xdg_activation_token_v1_commit(aXdgToken);
+
+  LOGW("RequestWaylandFocusPromise() XDG Token sent");
+
+  return transferPromise.forget();
+#else  // !defined(MOZ_WAYLAND)
+  return nullptr;
+#endif
+}
+
+static nsCString GetWindowManagerName() {
+  if (!GdkIsX11Display()) {
+    return {};
+  }
+
+  return {};
+}
+
+const nsCString& GetDesktopEnvironmentIdentifier() {
+  static const nsDependentCString sIdentifier = [] {
+    nsCString ident = [] {
+      auto Env = [](const char* aKey) -> const char* {
+        const char* v = getenv(aKey);
+        return v && *v ? v : nullptr;
+      };
+      if (const char* currentDesktop = Env("XDG_CURRENT_DESKTOP")) {
+        return nsCString(currentDesktop);
+      }
+      if (auto wm = GetWindowManagerName(); !wm.IsEmpty()) {
+        return wm;
+      }
+      if (const char* sessionDesktop = Env("XDG_SESSION_DESKTOP")) {
+        return nsCString(sessionDesktop);
+      }
+      if (getenv("GNOME_DESKTOP_SESSION_ID")) {
+        return nsCString("gnome"_ns);
+      }
+      if (getenv("KDE_FULL_SESSION")) {
+        return nsCString("kde"_ns);
+      }
+      if (getenv("MATE_DESKTOP_SESSION_ID")) {
+        return nsCString("mate"_ns);
+      }
+      if (getenv("LXQT_SESSION_CONFIG")) {
+        return nsCString("lxqt"_ns);
+      }
+      if (const char* desktopSession = Env("DESKTOP_SESSION")) {
+        return nsCString(desktopSession);
+      }
+      return nsCString();
+    }();
+    ToLowerCase(ident);
+    return nsDependentCString(ToNewCString(ident), ident.Length());
+  }();
+  return sIdentifier;
+}
+
+bool IsGnomeDesktopEnvironment() {
+  static bool sIsGnome =
+      !!FindInReadable("gnome"_ns, GetDesktopEnvironmentIdentifier());
+  return sIsGnome;
+}
+
+bool IsKdeDesktopEnvironment() {
+  static bool sIsKde = GetDesktopEnvironmentIdentifier().EqualsLiteral("kde");
+  return sIsKde;
+}
+
+bool IsCancelledGError(GError* aGError) {
+  return g_error_matches(aGError, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+}
+
+
+}  

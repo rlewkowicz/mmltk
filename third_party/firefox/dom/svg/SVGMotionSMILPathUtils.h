@@ -1,0 +1,86 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef DOM_SVG_SVGMOTIONSMILPATHUTILS_H_
+#define DOM_SVG_SVGMOTIONSMILPATHUTILS_H_
+
+#include "gfxPlatform.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/SMILParserUtils.h"
+#include "mozilla/gfx/2D.h"
+#include "nsDebug.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+namespace dom {
+class SVGElement;
+}
+
+class SVGMotionSMILPathUtils {
+  using DrawTarget = mozilla::gfx::DrawTarget;
+  using Path = mozilla::gfx::Path;
+  using PathBuilder = mozilla::gfx::PathBuilder;
+
+ public:
+  class PathGenerator {
+   public:
+    explicit PathGenerator(const dom::SVGElement* aSVGElement)
+        : mSVGElement(aSVGElement), mHaveReceivedCommands(false) {
+      RefPtr<DrawTarget> drawTarget =
+          gfxPlatform::GetPlatform()->ScreenReferenceDrawTarget();
+      NS_ASSERTION(
+          gfxPlatform::GetPlatform()->SupportsAzureContentForDrawTarget(
+              drawTarget),
+          "Should support Moz2D content drawing");
+
+      mPathBuilder = drawTarget->CreatePathBuilder();
+    }
+
+    void MoveToOrigin();
+    bool MoveToAbsolute(const nsAString& aCoordPairStr);
+    bool LineToAbsolute(const nsAString& aCoordPairStr,
+                        double& aSegmentDistance);
+    bool LineToRelative(const nsAString& aCoordPairStr,
+                        double& aSegmentDistance);
+
+    inline bool HaveReceivedCommands() { return mHaveReceivedCommands; }
+    already_AddRefed<Path> GetResultingPath();
+
+   protected:
+    bool ParseCoordinatePair(const nsAString& aCoordPairStr, float& aXVal,
+                             float& aYVal);
+
+    const dom::SVGElement* mSVGElement;  
+    RefPtr<PathBuilder> mPathBuilder;
+    bool mHaveReceivedCommands;
+  };
+
+  class MOZ_STACK_CLASS MotionValueParser
+      : public SMILParserUtils::GenericValueParser {
+   public:
+    MotionValueParser(PathGenerator* aPathGenerator,
+                      FallibleTArray<double>* aPointDistances)
+        : mPathGenerator(aPathGenerator),
+          mPointDistances(aPointDistances),
+          mDistanceSoFar(0.0) {
+      MOZ_ASSERT(mPointDistances->IsEmpty(),
+                 "expecting point distances array to start empty");
+    }
+
+    bool Parse(const nsAString& aValueStr) override;
+
+   protected:
+    PathGenerator* mPathGenerator;
+    FallibleTArray<double>* mPointDistances;
+    double mDistanceSoFar;
+  };
+};
+
+}  
+
+#endif  // DOM_SVG_SVGMOTIONSMILPATHUTILS_H_

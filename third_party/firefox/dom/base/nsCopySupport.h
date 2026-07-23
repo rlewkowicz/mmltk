@@ -1,0 +1,72 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsCopySupport_h_
+#define nsCopySupport_h_
+
+#include <cstdint>
+
+#include "ErrorList.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/BasicEvents.h"
+#include "mozilla/Maybe.h"
+#include "nsIClipboard.h"
+#include "nsStringFwd.h"
+
+class nsINode;
+class nsIImageLoadingContent;
+class nsITransferable;
+class nsILoadContext;
+
+namespace mozilla {
+class PresShell;
+namespace dom {
+class DataTransfer;
+class Document;
+class Selection;
+class WindowContext;
+}  
+}  
+
+class nsCopySupport {
+ public:
+  static nsresult ClearSelectionCache();
+
+  enum class UpdateClipboard : bool { No, Yes };
+  static nsresult EncodeDocumentWithContextAndPutToClipboard(
+      mozilla::dom::Selection* aSel, mozilla::dom::Document* aDoc,
+      nsIClipboard::ClipboardType aClipboardID, bool aWithRubyAnnotation,
+      UpdateClipboard = UpdateClipboard::Yes);
+
+  static nsresult GetContents(const nsACString& aMimeType, uint32_t aFlags,
+                              mozilla::dom::Selection* aSel,
+                              mozilla::dom::Document* aDoc, nsAString& outdata);
+
+  static nsresult ImageCopy(nsIImageLoadingContent* aImageElement,
+                            nsILoadContext* aLoadContext, int32_t aCopyFlags,
+                            mozilla::dom::WindowContext* aSettingWindowContext);
+
+  static nsresult GetTransferableForSelection(
+      mozilla::dom::Selection* aSelection, mozilla::dom::Document* aDocument,
+      nsITransferable** aTransferable);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  static nsresult GetTransferableForNode(nsINode* aNode,
+                                         mozilla::dom::Document* aDoc,
+                                         nsITransferable** aTransferable);
+  static already_AddRefed<mozilla::dom::Selection> GetSelectionForCopy(
+      mozilla::dom::Document* aDocument);
+
+  static bool CanCopy(mozilla::dom::Document* aDocument);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  static bool FireClipboardEvent(
+      mozilla::EventMessage aEventMessage,
+      mozilla::Maybe<nsIClipboard::ClipboardType> aClipboardType,
+      mozilla::PresShell* aPresShell, mozilla::dom::Selection* aSelection,
+      mozilla::dom::DataTransfer* aDataTransfer, bool* aActionTaken = nullptr);
+};
+
+#endif

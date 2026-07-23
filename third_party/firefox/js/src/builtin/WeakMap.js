@@ -1,0 +1,53 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+function WeakMapConstructorInit(iterable) {
+  var map = this;
+
+  var adder = map.set;
+
+  if (!IsCallable(adder)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, typeof adder);
+  }
+
+  for (var nextItem of allowContentIter(iterable)) {
+    if (!IsObject(nextItem)) {
+      ThrowTypeError(JSMSG_INVALID_MAP_ITERABLE, "WeakMap");
+    }
+
+    callContentFunction(adder, map, nextItem[0], nextItem[1]);
+  }
+}
+
+function WeakMapGetOrInsertComputed(key, callbackfn) {
+  var M = this;
+
+  if (!IsObject(M) || (M = GuardToWeakMapObject(M)) === null) {
+    return callFunction(
+      CallWeakMapMethodIfWrapped,
+      this,
+      key,
+      callbackfn,
+      "WeakMapGetOrInsertComputed"
+    );
+  }
+
+  if (!IsCallable(callbackfn)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(1, callbackfn));
+  }
+
+  if (!CanBeHeldWeakly(key)) {
+    ThrowTypeError(JSMSG_WEAKMAP_KEY_CANT_BE_HELD_WEAKLY, DecompileArg(0, key));
+  }
+
+  if (callFunction(std_WeakMap_has, M, key)) {
+    return callFunction(std_WeakMap_get, M, key);
+  }
+
+  var value = callContentFunction(callbackfn, undefined, key);
+
+  callFunction(std_WeakMap_set, M, key, value);
+
+  return value;
+}

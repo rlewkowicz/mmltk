@@ -1,0 +1,185 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGCONTENTUTILS_H_
+#define DOM_SVG_SVGCONTENTUTILS_H_
+
+#include <math.h>
+
+#include "gfx2DGlue.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/dom/SVGLength.h"
+#include "mozilla/gfx/2D.h"  // for StrokeOptions
+#include "mozilla/gfx/Matrix.h"
+#include "nsDependentSubstring.h"
+#include "nsError.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+
+class nsIContent;
+
+class nsIFrame;
+class nsPresContext;
+
+namespace mozilla {
+class ComputedStyle;
+class SVGAnimatedTransformList;
+class SVGAnimatedPreserveAspectRatio;
+class SVGContextPaint;
+class SVGPreserveAspectRatio;
+struct StyleLengthPercentage;
+namespace dom {
+class Document;
+class Element;
+class SVGElement;
+class SVGSVGElement;
+class SVGViewportElement;
+}  
+
+#define SVG_ZERO_LENGTH_PATH_FIX_FACTOR 512
+
+class SVGContentUtils {
+ public:
+  using Float = gfx::Float;
+  using Matrix = gfx::Matrix;
+  using Rect = gfx::Rect;
+  using StrokeOptions = gfx::StrokeOptions;
+
+  static dom::SVGSVGElement* GetOuterSVGElement(dom::SVGElement* aSVGElement);
+
+  struct AutoStrokeOptions : public StrokeOptions {
+    AutoStrokeOptions() {
+      MOZ_ASSERT(mDashLength == 0, "InitDashPattern() depends on this");
+    }
+    ~AutoStrokeOptions() {
+      if (mDashPattern && mDashPattern != mSmallArray) {
+        delete[] mDashPattern;
+      }
+    }
+    Float* InitDashPattern(size_t aDashCount) {
+      if (aDashCount <= std::size(mSmallArray)) {
+        mDashPattern = mSmallArray;
+        return mSmallArray;
+      }
+      Float* nonConstArray = new (fallible) Float[aDashCount];
+      mDashPattern = nonConstArray;
+      return nonConstArray;
+    }
+    void DiscardDashPattern() {
+      if (mDashPattern && mDashPattern != mSmallArray) {
+        delete[] mDashPattern;
+      }
+      mDashLength = 0;
+      mDashPattern = nullptr;
+    }
+
+   private:
+    Float mSmallArray[16];
+  };
+
+  enum class StrokeOptionFlag { IgnoreStrokeDashing };
+  using StrokeOptionFlags = EnumSet<StrokeOptionFlag>;
+
+  static void GetStrokeOptions(AutoStrokeOptions* aStrokeOptions,
+                               dom::SVGElement* aElement,
+                               const ComputedStyle* aComputedStyle,
+                               const SVGContextPaint* aContextPaint,
+                               StrokeOptionFlags aFlags = {});
+
+  static Float GetStrokeWidth(const dom::SVGElement* aElement,
+                              const ComputedStyle* aComputedStyle,
+                              const SVGContextPaint* aContextPaint);
+
+  static float GetFontSize(const dom::Element* aElement);
+  static float GetFontSize(const nsIFrame* aFrame);
+  static float GetFontSize(const ComputedStyle*, nsPresContext*);
+  static float GetFontXHeight(const dom::Element* aElement);
+  static float GetFontXHeight(const nsIFrame* aFrame);
+  static float GetFontXHeight(const ComputedStyle*, nsPresContext*);
+
+  static float GetLineHeight(const dom::Element* aElement);
+
+  static nsresult ReportToConsole(const dom::Document* doc,
+                                  const char* aWarning,
+                                  const nsTArray<nsString>& aParams);
+
+  static Matrix GetCTM(dom::SVGElement* aElement);
+
+  static Matrix GetNonScalingStrokeCTM(dom::SVGElement* aElement);
+
+  static Matrix GetScreenCTM(dom::SVGElement* aElement);
+
+  static void RectilinearGetStrokeBounds(const Rect& aRect,
+                                         const Matrix& aToBoundsSpace,
+                                         const Matrix& aToNonScalingStrokeSpace,
+                                         float aStrokeWidth, Rect* aBounds);
+
+  static dom::SVGViewportElement* GetNearestViewportElement(
+      const nsIContent* aContent);
+
+  static double ComputeNormalizedHypotenuse(double aWidth, double aHeight);
+
+  static double AxisLength(const gfxSize& aAxisSize, SVGLength::Axis aAxis);
+
+  static float AngleBisect(float a1, float a2);
+
+
+  static Matrix GetViewBoxTransform(
+      float aViewportWidth, float aViewportHeight, float aViewboxX,
+      float aViewboxY, float aViewboxWidth, float aViewboxHeight,
+      const SVGAnimatedPreserveAspectRatio& aPreserveAspectRatio);
+
+  static Matrix GetViewBoxTransform(
+      float aViewportWidth, float aViewportHeight, float aViewboxX,
+      float aViewboxY, float aViewboxWidth, float aViewboxHeight,
+      const SVGPreserveAspectRatio& aPreserveAspectRatio);
+
+  static inline bool ParseOptionalSign(nsAString::const_iterator& aIter,
+                                       const nsAString::const_iterator& aEnd,
+                                       int32_t& aSignMultiplier) {
+    if (aIter == aEnd) {
+      return false;
+    }
+    aSignMultiplier = *aIter == '-' ? -1 : 1;
+
+    nsAString::const_iterator iter(aIter);
+
+    if (*iter == '-' || *iter == '+') {
+      ++iter;
+      if (iter == aEnd) {
+        return false;
+      }
+    }
+    aIter = iter;
+    return true;
+  }
+
+  template <class floatType>
+  static bool ParseNumber(nsAString::const_iterator& aIter,
+                          const nsAString::const_iterator& aEnd,
+                          floatType& aValue);
+
+  template <class floatType>
+  static bool ParseNumber(const nsAString& aString, floatType& aValue);
+
+  static bool ParseInteger(nsAString::const_iterator& aIter,
+                           const nsAString::const_iterator& aEnd,
+                           int32_t& aValue);
+
+  static bool ParseInteger(const nsAString& aString, int32_t& aValue);
+
+  static float CoordToFloat(const dom::SVGElement* aContent,
+                            const StyleLengthPercentage&,
+                            SVGLength::Axis aAxis = SVGLength::Axis::XY);
+  static already_AddRefed<gfx::Path> GetPath(const nsACString& aPathString);
+
+  static bool ShapeTypeHasNoCorners(const nsIContent* aContent);
+
+  static nsDependentSubstring GetAndEnsureOneToken(const nsAString& aString,
+                                                   bool& aSuccess);
+};
+
+}  
+
+#endif  // DOM_SVG_SVGCONTENTUTILS_H_

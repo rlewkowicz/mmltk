@@ -1,0 +1,2524 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsHtml5StreamParser.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <utility>
+#include "ErrorList.h"
+#include "js/GCAPI.h"
+#include "mozilla/Buffer.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/EncodingDetector.h"
+#include "mozilla/Likely.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/Services.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_html5.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/TextUtils.h"
+
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/DebuggerUtilsBinding.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/Vector.h"
+#include "nsContentSink.h"
+#include "nsContentUtils.h"
+#include "nsCycleCollectionTraversalCallback.h"
+#include "nsHtml5AtomTable.h"
+#include "nsHtml5Highlighter.h"
+#include "nsHtml5Module.h"
+#include "nsHtml5OwningUTF16Buffer.h"
+#include "nsHtml5Parser.h"
+#include "nsHtml5Speculation.h"
+#include "nsHtml5StreamParserPtr.h"
+#include "nsHtml5Tokenizer.h"
+#include "nsHtml5TreeBuilder.h"
+#include "nsHtml5TreeOpExecutor.h"
+#include "nsIChannel.h"
+#include "nsIContentSink.h"
+#include "nsID.h"
+#include "nsIDocShell.h"
+#include "nsIHttpChannel.h"
+#include "nsIInputStream.h"
+#include "nsINestedURI.h"
+#include "nsIObserverService.h"
+#include "nsIRequest.h"
+#include "nsIRunnable.h"
+#include "nsIScriptError.h"
+#include "nsIThread.h"
+#include "nsIThreadRetargetableRequest.h"
+#include "nsITimer.h"
+#include "nsIURI.h"
+#include "nsJSEnvironment.h"
+#include "nsLiteralString.h"
+#include "nsNetUtil.h"
+#include "nsString.h"
+#include "nsTPromiseFlatString.h"
+#include "nsThreadUtils.h"
+#include "nsXULAppAPI.h"
+
+extern "C" {
+const mozilla::Encoding* xmldecl_parse(const uint8_t* buf, size_t buf_len);
+};
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(nsHtml5StreamParser)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(nsHtml5StreamParser)
+
+NS_INTERFACE_TABLE_HEAD(nsHtml5StreamParser)
+  NS_INTERFACE_TABLE(nsHtml5StreamParser, nsISupports)
+  NS_INTERFACE_TABLE_TO_MAP_SEGUE_CYCLE_COLLECTION(nsHtml5StreamParser)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(nsHtml5StreamParser)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsHtml5StreamParser)
+  tmp->DropTimer();
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mRequest)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mOwner)
+  tmp->mExecutorFlusher = nullptr;
+  tmp->mLoadFlusher = nullptr;
+  tmp->mExecutor = nullptr;
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsHtml5StreamParser)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mRequest)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mOwner)
+  if (tmp->mExecutorFlusher) {
+    NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(cb, "mExecutorFlusher->mExecutor");
+    cb.NoteXPCOMChild(static_cast<nsIContentSink*>(tmp->mExecutor));
+  }
+  if (tmp->mLoadFlusher) {
+    NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(cb, "mLoadFlusher->mExecutor");
+    cb.NoteXPCOMChild(static_cast<nsIContentSink*>(tmp->mExecutor));
+  }
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+class nsHtml5ExecutorFlusher : public Runnable {
+ private:
+  RefPtr<nsHtml5TreeOpExecutor> mExecutor;
+
+ public:
+  explicit nsHtml5ExecutorFlusher(nsHtml5TreeOpExecutor* aExecutor)
+      : Runnable("nsHtml5ExecutorFlusher"), mExecutor(aExecutor) {}
+  NS_IMETHOD Run() override {
+    if (!mExecutor->isInList()) {
+      Document* doc = mExecutor->GetDocument();
+      if (XRE_IsContentProcess() &&
+          nsContentUtils::
+              HighPriorityEventPendingForTopLevelDocumentBeforeContentfulPaint(
+                  doc)) {
+        nsCOMPtr<nsIRunnable> flusher = this;
+        if (NS_SUCCEEDED(doc->Dispatch(flusher.forget()))) {
+          return NS_OK;
+        }
+      }
+      mExecutor->RunFlushLoop();
+    }
+    return NS_OK;
+  }
+};
+
+class nsHtml5LoadFlusher : public Runnable {
+ private:
+  RefPtr<nsHtml5TreeOpExecutor> mExecutor;
+
+ public:
+  explicit nsHtml5LoadFlusher(nsHtml5TreeOpExecutor* aExecutor)
+      : Runnable("nsHtml5LoadFlusher"), mExecutor(aExecutor) {}
+  NS_IMETHOD Run() override {
+    if (!mExecutor->IsFlushing()) {
+      mExecutor->FlushSpeculativeLoads();
+    }
+    return NS_OK;
+  }
+};
+
+nsHtml5StreamParser::nsHtml5StreamParser(nsHtml5TreeOpExecutor* aExecutor,
+                                         nsHtml5Parser* aOwner,
+                                         eParserMode aMode)
+    : mBomState(eBomState::BOM_SNIFFING_NOT_STARTED),
+      mCharsetSource(kCharsetUninitialized),
+      mEncodingSwitchSource(kCharsetUninitialized),
+      mEncoding(X_USER_DEFINED_ENCODING),  
+      mNeedsEncodingSwitchTo(nullptr),
+      mSeenEligibleMetaCharset(false),
+      mChardetEof(false),
+#ifdef DEBUG
+      mStartedFeedingDetector(false),
+      mStartedFeedingDevTools(false),
+#endif
+      mReparseForbidden(false),
+      mForceAutoDetection(false),
+      mChannelHadCharset(false),
+      mLookingForMetaCharset(false),
+      mStartsWithLtQuestion(false),
+      mLookingForXmlDeclarationForXmlViewSource(false),
+      mTemplatePushedOrHeadPopped(false),
+      mGtBuffer(nullptr),
+      mGtPos(0),
+      mLastBuffer(nullptr),  
+      mExecutor(aExecutor),
+      mTreeBuilder(new nsHtml5TreeBuilder(
+          (aMode == VIEW_SOURCE_HTML || aMode == VIEW_SOURCE_XML)
+              ? nullptr
+              : mExecutor->GetStage(),
+          mExecutor->GetStage(), aMode == NORMAL)),
+      mTokenizer(
+          new nsHtml5Tokenizer(mTreeBuilder.get(), aMode == VIEW_SOURCE_XML)),
+      mTokenizerMutex("nsHtml5StreamParser mTokenizerMutex"),
+      mOwner(aOwner),
+      mLastWasCR(false),
+      mStreamState(eHtml5StreamState::STREAM_NOT_STARTED),
+      mSpeculating(false),
+      mAtEOF(false),
+      mSpeculationMutex("nsHtml5StreamParser mSpeculationMutex"),
+      mSpeculationFailureCount(0),
+      mNumBytesBuffered(0),
+      mTerminated(false),
+      mInterrupted(false),
+      mEventTarget(nsHtml5Module::GetStreamParserEventTarget()),
+      mExecutorFlusher(new nsHtml5ExecutorFlusher(aExecutor)),
+      mLoadFlusher(new nsHtml5LoadFlusher(aExecutor)),
+      mInitialEncodingWasFromParentFrame(false),
+      mHasHadErrors(false),
+      mDetectorHasSeenNonAscii(false),
+      mDecodingLocalFileWithoutTokenizing(false),
+      mBufferingBytes(false),
+      mFlushTimer(NS_NewTimer(mEventTarget)),
+      mFlushTimerMutex("nsHtml5StreamParser mFlushTimerMutex"),
+      mFlushTimerArmed(false),
+      mFlushTimerEverFired(false),
+      mMode(aMode),
+      mBrowserIdForDevtools(0),
+      mBrowsingContextIDForDevtools(0) {
+  NS_ASSERTION(NS_IsMainThread(), "Wrong thread!");
+#ifdef DEBUG
+  mAtomTable.SetPermittedLookupEventTarget(mEventTarget);
+#endif
+  mTokenizer->setInterner(&mAtomTable);
+  mTokenizer->setEncodingDeclarationHandler(this);
+
+  if (aMode == VIEW_SOURCE_HTML || aMode == VIEW_SOURCE_XML) {
+    nsHtml5Highlighter* highlighter =
+        new nsHtml5Highlighter(mExecutor->GetStage());
+    mTokenizer->EnableViewSource(highlighter);    
+    mTreeBuilder->EnableViewSource(highlighter);  
+  }
+
+}
+
+nsHtml5StreamParser::~nsHtml5StreamParser() {
+  NS_ASSERTION(NS_IsMainThread(), "Wrong thread!");
+  mTokenizer->end();
+#ifdef DEBUG
+  {
+    mozilla::MutexAutoLock flushTimerLock(mFlushTimerMutex);
+    MOZ_ASSERT(!mFlushTimer, "Flush timer was not dropped before dtor!");
+  }
+  mRequest = nullptr;
+  mUnicodeDecoder = nullptr;
+  mFirstBuffer = nullptr;
+  mExecutor = nullptr;
+  mTreeBuilder = nullptr;
+  mTokenizer = nullptr;
+  mOwner = nullptr;
+#endif
+}
+
+nsresult nsHtml5StreamParser::GetChannel(nsIChannel** aChannel) {
+  NS_ASSERTION(NS_IsMainThread(), "Wrong thread!");
+  return mRequest ? CallQueryInterface(mRequest, aChannel)
+                  : NS_ERROR_NOT_AVAILABLE;
+}
+
+std::tuple<NotNull<const Encoding*>, nsCharsetSource>
+nsHtml5StreamParser::GuessEncoding(bool aInitial) {
+  MOZ_ASSERT(
+      mCharsetSource != kCharsetFromFinalUserForcedAutoDetection &&
+      mCharsetSource !=
+          kCharsetFromFinalAutoDetectionWouldHaveBeenUTF8InitialWasASCII &&
+      mCharsetSource !=
+          kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8Generic &&
+      mCharsetSource !=
+          kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8GenericInitialWasASCII &&
+      mCharsetSource !=
+          kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8Content &&
+      mCharsetSource !=
+          kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8ContentInitialWasASCII &&
+      mCharsetSource !=
+          kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8DependedOnTLD &&
+      mCharsetSource !=
+          kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8DependedOnTLDInitialWasASCII &&
+      mCharsetSource != kCharsetFromFinalAutoDetectionFile);
+  auto ifHadBeenForced = mDetector->Guess(EmptyCString(), true);
+  auto encoding =
+      mForceAutoDetection
+          ? ifHadBeenForced
+          : mDetector->Guess(mTLD, mDecodingLocalFileWithoutTokenizing);
+  nsCharsetSource source =
+      aInitial
+          ? (mForceAutoDetection
+                 ? kCharsetFromInitialUserForcedAutoDetection
+                 : (mDecodingLocalFileWithoutTokenizing
+                        ? kCharsetFromFinalAutoDetectionFile
+                        : kCharsetFromInitialAutoDetectionWouldNotHaveBeenUTF8Generic))
+          : (mForceAutoDetection
+                 ? kCharsetFromFinalUserForcedAutoDetection
+                 : (mDecodingLocalFileWithoutTokenizing
+                        ? kCharsetFromFinalAutoDetectionFile
+                        : kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8Generic));
+  if (source == kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8Generic) {
+    if (encoding == ISO_2022_JP_ENCODING) {
+      if (EncodingDetector::TldMayAffectGuess(mTLD)) {
+        source = kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8Content;
+      }
+    } else if (!mDetectorHasSeenNonAscii) {
+      source = kCharsetFromInitialAutoDetectionASCII;  
+    } else if (ifHadBeenForced == UTF_8_ENCODING) {
+      MOZ_ASSERT(mCharsetSource == kCharsetFromInitialAutoDetectionASCII ||
+                 mCharsetSource ==
+                     kCharsetFromInitialAutoDetectionWouldHaveBeenUTF8 ||
+                 mEncoding == ISO_2022_JP_ENCODING);
+      source = kCharsetFromFinalAutoDetectionWouldHaveBeenUTF8InitialWasASCII;
+    } else if (encoding != ifHadBeenForced) {
+      if (mCharsetSource == kCharsetFromInitialAutoDetectionASCII) {
+        source =
+            kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8DependedOnTLDInitialWasASCII;
+      } else {
+        source =
+            kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8DependedOnTLD;
+      }
+    } else if (EncodingDetector::TldMayAffectGuess(mTLD)) {
+      if (mCharsetSource == kCharsetFromInitialAutoDetectionASCII) {
+        source =
+            kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8ContentInitialWasASCII;
+      } else {
+        source = kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8Content;
+      }
+    } else if (mCharsetSource == kCharsetFromInitialAutoDetectionASCII) {
+      source =
+          kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8GenericInitialWasASCII;
+    }
+  } else if (source ==
+             kCharsetFromInitialAutoDetectionWouldNotHaveBeenUTF8Generic) {
+    if (encoding == ISO_2022_JP_ENCODING) {
+      if (EncodingDetector::TldMayAffectGuess(mTLD)) {
+        source = kCharsetFromInitialAutoDetectionWouldNotHaveBeenUTF8Content;
+      }
+    } else if (!mDetectorHasSeenNonAscii) {
+      source = kCharsetFromInitialAutoDetectionASCII;
+    } else if (ifHadBeenForced == UTF_8_ENCODING) {
+      source = kCharsetFromInitialAutoDetectionWouldHaveBeenUTF8;
+    } else if (encoding != ifHadBeenForced) {
+      source =
+          kCharsetFromInitialAutoDetectionWouldNotHaveBeenUTF8DependedOnTLD;
+    } else if (EncodingDetector::TldMayAffectGuess(mTLD)) {
+      source = kCharsetFromInitialAutoDetectionWouldNotHaveBeenUTF8Content;
+    }
+  }
+  return {encoding, source};
+}
+
+void nsHtml5StreamParser::FeedDetector(Span<const uint8_t> aBuffer) {
+#ifdef DEBUG
+  mStartedFeedingDetector = true;
+#endif
+  MOZ_ASSERT(!mChardetEof);
+  mDetectorHasSeenNonAscii = mDetector->Feed(aBuffer, false);
+}
+
+void nsHtml5StreamParser::DetectorEof() {
+#ifdef DEBUG
+  mStartedFeedingDetector = true;
+#endif
+  if (mChardetEof) {
+    return;
+  }
+  mChardetEof = true;
+  mDetectorHasSeenNonAscii = mDetector->Feed(Span<const uint8_t>(), true);
+}
+
+void nsHtml5StreamParser::SetViewSourceTitle(nsIURI* aURL) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  BrowsingContext* browsingContext =
+      mExecutor->GetDocument()->GetBrowsingContext();
+  if (browsingContext && browsingContext->WatchedByDevTools()) {
+    mURIToSendToDevtools = aURL;
+
+    nsID uuid;
+    nsresult rv = nsID::GenerateUUIDInPlace(uuid);
+    if (!NS_FAILED(rv)) {
+      char buffer[NSID_LENGTH];
+      uuid.ToProvidedString(buffer);
+      mUUIDForDevtools = NS_ConvertASCIItoUTF16(buffer);
+    }
+    mBrowserIdForDevtools = browsingContext->BrowserId();
+    mBrowsingContextIDForDevtools = browsingContext->Id();
+  }
+
+  if (aURL) {
+    nsCOMPtr<nsIURI> temp;
+    if (aURL->SchemeIs("view-source")) {
+      nsCOMPtr<nsINestedURI> nested = do_QueryInterface(aURL);
+      nested->GetInnerURI(getter_AddRefs(temp));
+    } else {
+      temp = aURL;
+    }
+    if (temp->SchemeIs("data")) {
+      mViewSourceTitle.AssignLiteral("data:\xE2\x80\xA6");
+    } else {
+      nsresult rv = temp->GetSpec(mViewSourceTitle);
+      if (NS_FAILED(rv)) {
+        mViewSourceTitle.AssignLiteral("\xE2\x80\xA6");
+      }
+    }
+  }
+}
+
+nsresult
+nsHtml5StreamParser::SetupDecodingAndWriteSniffingBufferAndCurrentSegment(
+    Span<const uint8_t> aPrefix, Span<const uint8_t> aFromSegment) {
+  NS_ASSERTION(IsParserThread(), "Wrong thread!");
+  mUnicodeDecoder = mEncoding->NewDecoderWithBOMRemoval();
+  nsresult rv = WriteStreamBytes(aPrefix);
+  NS_ENSURE_SUCCESS(rv, rv);
+  return WriteStreamBytes(aFromSegment);
+}
+
+void nsHtml5StreamParser::SetupDecodingFromBom(
+    NotNull<const Encoding*> aEncoding) {
+  MOZ_ASSERT(IsParserThread(), "Wrong thread!");
+  mEncoding = aEncoding;
+  mDecodingLocalFileWithoutTokenizing = false;
+  mLookingForMetaCharset = false;
+  mBufferingBytes = false;
+  mUnicodeDecoder = mEncoding->NewDecoderWithoutBOMHandling();
+  mCharsetSource = kCharsetFromByteOrderMark;
+  mForceAutoDetection = false;
+  mTreeBuilder->SetDocumentCharset(mEncoding, mCharsetSource, false);
+  mBomState = BOM_SNIFFING_OVER;
+  if (mMode == VIEW_SOURCE_HTML) {
+    mTokenizer->StartViewSourceBodyContents();
+  }
+}
+
+void nsHtml5StreamParser::SetupDecodingFromUtf16BogoXml(
+    NotNull<const Encoding*> aEncoding) {
+  MOZ_ASSERT(IsParserThread(), "Wrong thread!");
+  mEncoding = aEncoding;
+  mDecodingLocalFileWithoutTokenizing = false;
+  mLookingForMetaCharset = false;
+  mBufferingBytes = false;
+  mUnicodeDecoder = mEncoding->NewDecoderWithoutBOMHandling();
+  mCharsetSource = kCharsetFromXmlDeclarationUtf16;
+  mForceAutoDetection = false;
+  mTreeBuilder->SetDocumentCharset(mEncoding, mCharsetSource, false);
+  mBomState = BOM_SNIFFING_OVER;
+  if (mMode == VIEW_SOURCE_HTML) {
+    mTokenizer->StartViewSourceBodyContents();
+  }
+  auto dst = mLastBuffer->TailAsSpan(READ_BUFFER_SIZE);
+  dst[0] = '<';
+  dst[1] = '?';
+  dst[2] = 'x';
+  mLastBuffer->AdvanceEnd(3);
+  MOZ_ASSERT(!mStartedFeedingDevTools);
+  OnNewContent(dst.To(3));
+}
+
+size_t nsHtml5StreamParser::LengthOfLtContainingPrefixInSecondBuffer() {
+  MOZ_ASSERT(mBufferedBytes.Length() <= 2);
+  if (mBufferedBytes.Length() < 2) {
+    return 0;
+  }
+  Buffer<uint8_t>& second = mBufferedBytes[1];
+  const uint8_t* elements = second.Elements();
+  const uint8_t* lt = (const uint8_t*)memchr(elements, '>', second.Length());
+  if (lt) {
+    return (lt - elements) + 1;
+  }
+  return 0;
+}
+
+nsresult nsHtml5StreamParser::SniffStreamBytes(Span<const uint8_t> aFromSegment,
+                                               bool aEof) {
+  MOZ_ASSERT(IsParserThread(), "Wrong thread!");
+  MOZ_ASSERT_IF(aEof, aFromSegment.IsEmpty());
+
+  if (mCharsetSource >=
+          kCharsetFromFinalAutoDetectionWouldHaveBeenUTF8InitialWasASCII &&
+      mCharsetSource <= kCharsetFromFinalUserForcedAutoDetection) {
+    if (mMode == PLAIN_TEXT || mMode == VIEW_SOURCE_PLAIN) {
+      mTreeBuilder->MaybeComplainAboutCharset("EncDetectorReloadPlain", true,
+                                              0);
+    } else {
+      mTreeBuilder->MaybeComplainAboutCharset("EncDetectorReload", true, 0);
+    }
+  }
+
+  static uint8_t utf8[] = {0xEF, 0xBB};
+  static uint8_t utf16le[] = {0xFF};
+  static uint8_t utf16be[] = {0xFE};
+  static uint8_t utf16leXml[] = {'<', 0x00, '?', 0x00, 'x'};
+  static uint8_t utf16beXml[] = {0x00, '<', 0x00, '?', 0x00};
+  const uint8_t* prefix = utf8;
+  size_t prefixLength = 0;
+  if (aEof && mBomState == BOM_SNIFFING_NOT_STARTED) {
+    mBomState = BOM_SNIFFING_OVER;
+  }
+  for (size_t i = 0;
+       (i < aFromSegment.Length() && mBomState != BOM_SNIFFING_OVER) || aEof;
+       i++) {
+    switch (mBomState) {
+      case BOM_SNIFFING_NOT_STARTED:
+        MOZ_ASSERT(i == 0, "Bad BOM sniffing state.");
+        MOZ_ASSERT(!aEof, "Should have checked for aEof above!");
+        switch (aFromSegment[0]) {
+          case 0xEF:
+            mBomState = SEEN_UTF_8_FIRST_BYTE;
+            break;
+          case 0xFF:
+            mBomState = SEEN_UTF_16_LE_FIRST_BYTE;
+            break;
+          case 0xFE:
+            mBomState = SEEN_UTF_16_BE_FIRST_BYTE;
+            break;
+          case 0x00:
+            if (mCharsetSource < kCharsetFromXmlDeclarationUtf16 &&
+                mCharsetSource != kCharsetFromChannel) {
+              mBomState = SEEN_UTF_16_BE_XML_FIRST;
+            } else {
+              mBomState = BOM_SNIFFING_OVER;
+            }
+            break;
+          case '<':
+            if (mCharsetSource < kCharsetFromXmlDeclarationUtf16 &&
+                mCharsetSource != kCharsetFromChannel) {
+              mBomState = SEEN_UTF_16_LE_XML_FIRST;
+            } else {
+              mBomState = BOM_SNIFFING_OVER;
+            }
+            break;
+          default:
+            mBomState = BOM_SNIFFING_OVER;
+            break;
+        }
+        break;
+      case SEEN_UTF_16_LE_FIRST_BYTE:
+        if (!aEof && aFromSegment[i] == 0xFE) {
+          SetupDecodingFromBom(UTF_16LE_ENCODING);
+          return WriteStreamBytes(aFromSegment.From(i + 1));
+        }
+        prefix = utf16le;
+        prefixLength = 1 - i;
+        mBomState = BOM_SNIFFING_OVER;
+        break;
+      case SEEN_UTF_16_BE_FIRST_BYTE:
+        if (!aEof && aFromSegment[i] == 0xFF) {
+          SetupDecodingFromBom(UTF_16BE_ENCODING);
+          return WriteStreamBytes(aFromSegment.From(i + 1));
+        }
+        prefix = utf16be;
+        prefixLength = 1 - i;
+        mBomState = BOM_SNIFFING_OVER;
+        break;
+      case SEEN_UTF_8_FIRST_BYTE:
+        if (!aEof && aFromSegment[i] == 0xBB) {
+          mBomState = SEEN_UTF_8_SECOND_BYTE;
+        } else {
+          prefixLength = 1 - i;
+          mBomState = BOM_SNIFFING_OVER;
+        }
+        break;
+      case SEEN_UTF_8_SECOND_BYTE:
+        if (!aEof && aFromSegment[i] == 0xBF) {
+          SetupDecodingFromBom(UTF_8_ENCODING);
+          return WriteStreamBytes(aFromSegment.From(i + 1));
+        }
+        prefixLength = 2 - i;
+        mBomState = BOM_SNIFFING_OVER;
+        break;
+      case SEEN_UTF_16_BE_XML_FIRST:
+        if (!aEof && aFromSegment[i] == '<') {
+          mBomState = SEEN_UTF_16_BE_XML_SECOND;
+        } else {
+          prefix = utf16beXml;
+          prefixLength = 1 - i;
+          mBomState = BOM_SNIFFING_OVER;
+        }
+        break;
+      case SEEN_UTF_16_BE_XML_SECOND:
+        if (!aEof && aFromSegment[i] == 0x00) {
+          mBomState = SEEN_UTF_16_BE_XML_THIRD;
+        } else {
+          prefix = utf16beXml;
+          prefixLength = 2 - i;
+          mBomState = BOM_SNIFFING_OVER;
+        }
+        break;
+      case SEEN_UTF_16_BE_XML_THIRD:
+        if (!aEof && aFromSegment[i] == '?') {
+          mBomState = SEEN_UTF_16_BE_XML_FOURTH;
+        } else {
+          prefix = utf16beXml;
+          prefixLength = 3 - i;
+          mBomState = BOM_SNIFFING_OVER;
+        }
+        break;
+      case SEEN_UTF_16_BE_XML_FOURTH:
+        if (!aEof && aFromSegment[i] == 0x00) {
+          mBomState = SEEN_UTF_16_BE_XML_FIFTH;
+        } else {
+          prefix = utf16beXml;
+          prefixLength = 4 - i;
+          mBomState = BOM_SNIFFING_OVER;
+        }
+        break;
+      case SEEN_UTF_16_BE_XML_FIFTH:
+        if (!aEof && aFromSegment[i] == 'x') {
+          SetupDecodingFromUtf16BogoXml(UTF_16BE_ENCODING);
+          return WriteStreamBytes(aFromSegment.From(i + 1));
+        }
+        prefix = utf16beXml;
+        prefixLength = 5 - i;
+        mBomState = BOM_SNIFFING_OVER;
+        break;
+      case SEEN_UTF_16_LE_XML_FIRST:
+        if (!aEof && aFromSegment[i] == 0x00) {
+          mBomState = SEEN_UTF_16_LE_XML_SECOND;
+        } else {
+          if (!aEof && aFromSegment[i] == '?' &&
+              !(mMode == PLAIN_TEXT || mMode == VIEW_SOURCE_PLAIN)) {
+            mStartsWithLtQuestion = true;
+          }
+          prefix = utf16leXml;
+          prefixLength = 1 - i;
+          mBomState = BOM_SNIFFING_OVER;
+        }
+        break;
+      case SEEN_UTF_16_LE_XML_SECOND:
+        if (!aEof && aFromSegment[i] == '?') {
+          mBomState = SEEN_UTF_16_LE_XML_THIRD;
+        } else {
+          prefix = utf16leXml;
+          prefixLength = 2 - i;
+          mBomState = BOM_SNIFFING_OVER;
+        }
+        break;
+      case SEEN_UTF_16_LE_XML_THIRD:
+        if (!aEof && aFromSegment[i] == 0x00) {
+          mBomState = SEEN_UTF_16_LE_XML_FOURTH;
+        } else {
+          prefix = utf16leXml;
+          prefixLength = 3 - i;
+          mBomState = BOM_SNIFFING_OVER;
+        }
+        break;
+      case SEEN_UTF_16_LE_XML_FOURTH:
+        if (!aEof && aFromSegment[i] == 'x') {
+          mBomState = SEEN_UTF_16_LE_XML_FIFTH;
+        } else {
+          prefix = utf16leXml;
+          prefixLength = 4 - i;
+          mBomState = BOM_SNIFFING_OVER;
+        }
+        break;
+      case SEEN_UTF_16_LE_XML_FIFTH:
+        if (!aEof && aFromSegment[i] == 0x00) {
+          SetupDecodingFromUtf16BogoXml(UTF_16LE_ENCODING);
+          return WriteStreamBytes(aFromSegment.From(i + 1));
+        }
+        prefix = utf16leXml;
+        prefixLength = 5 - i;
+        mBomState = BOM_SNIFFING_OVER;
+        break;
+      default:
+        mBomState = BOM_SNIFFING_OVER;
+        break;
+    }
+    if (aEof) {
+      break;
+    }
+  }
+
+  MOZ_ASSERT(mCharsetSource != kCharsetFromByteOrderMark,
+             "Should not come here if BOM was found.");
+  MOZ_ASSERT(mCharsetSource != kCharsetFromXmlDeclarationUtf16,
+             "Should not come here if UTF-16 bogo-XML declaration was found.");
+  MOZ_ASSERT(mCharsetSource != kCharsetFromOtherComponent,
+             "kCharsetFromOtherComponent is for XSLT.");
+
+  if (mBomState == BOM_SNIFFING_OVER) {
+    if (mMode == VIEW_SOURCE_XML && mStartsWithLtQuestion &&
+        mCharsetSource < kCharsetFromChannel) {
+      MOZ_ASSERT(!mLookingForXmlDeclarationForXmlViewSource);
+      MOZ_ASSERT(!aEof);
+      MOZ_ASSERT(!mLookingForMetaCharset);
+      MOZ_ASSERT(!mDecodingLocalFileWithoutTokenizing);
+      MOZ_ASSERT(!mBufferedBytes.IsEmpty(),
+                 "How did at least <? not get buffered?");
+      Buffer<uint8_t>& first = mBufferedBytes[0];
+      const Encoding* encoding =
+          xmldecl_parse(first.Elements(), first.Length());
+      if (encoding) {
+        mEncoding = WrapNotNull(encoding);
+        mCharsetSource = kCharsetFromXmlDeclaration;
+      } else if (memchr(first.Elements(), '>', first.Length())) {
+        ;  // fall through to commit to the UTF-8 default.
+      } else if (size_t lengthOfPrefix =
+                     LengthOfLtContainingPrefixInSecondBuffer()) {
+        MOZ_ASSERT(first.Length() == 1);
+        MOZ_ASSERT(mBufferedBytes[1][0] == '?');
+        Vector<uint8_t> contiguous;
+        if (!contiguous.append(first.Elements(), first.Length())) {
+          MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+          return NS_ERROR_OUT_OF_MEMORY;
+        }
+        if (!contiguous.append(mBufferedBytes[1].Elements(), lengthOfPrefix)) {
+          MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+          return NS_ERROR_OUT_OF_MEMORY;
+        }
+        encoding = xmldecl_parse(contiguous.begin(), contiguous.length());
+        if (encoding) {
+          mEncoding = WrapNotNull(encoding);
+          mCharsetSource = kCharsetFromXmlDeclaration;
+        }
+      } else {
+        MOZ_ASSERT(mBufferingBytes);
+        mLookingForXmlDeclarationForXmlViewSource = true;
+        return NS_OK;
+      }
+    } else if (mMode != VIEW_SOURCE_XML &&
+               (mForceAutoDetection || mCharsetSource < kCharsetFromChannel)) {
+      mFirstBufferOfMetaScan = mFirstBuffer;
+      MOZ_ASSERT(mLookingForMetaCharset);
+
+      if (mMode == VIEW_SOURCE_HTML) {
+        auto r = mTokenizer->FlushViewSource();
+        if (r.isErr()) {
+          return r.unwrapErr();
+        }
+      }
+      auto r = mTreeBuilder->Flush();
+      if (r.isErr()) {
+        return r.unwrapErr();
+      }
+
+      mozilla::MutexAutoLock speculationAutoLock(mSpeculationMutex);
+      nsHtml5Speculation* speculation = new nsHtml5Speculation(
+          mFirstBuffer, mFirstBuffer->getStart(), mTokenizer->getLineNumber(),
+          mTokenizer->getColumnNumber(), mTreeBuilder->newSnapshot());
+      MOZ_ASSERT(!mFlushTimerArmed, "How did we end up arming the timer?");
+      if (mMode == VIEW_SOURCE_HTML) {
+        mTokenizer->SetViewSourceOpSink(speculation);
+        mTokenizer->StartViewSourceBodyContents();
+      } else {
+        MOZ_ASSERT(mMode != VIEW_SOURCE_XML);
+        mTreeBuilder->SetOpSink(speculation);
+      }
+      mSpeculations.AppendElement(speculation);  
+      mSpeculating = true;
+    } else {
+      mLookingForMetaCharset = false;
+      mBufferingBytes = false;
+      mDecodingLocalFileWithoutTokenizing = false;
+      if (mMode == VIEW_SOURCE_HTML) {
+        mTokenizer->StartViewSourceBodyContents();
+      }
+    }
+    mTreeBuilder->SetDocumentCharset(mEncoding, mCharsetSource, false);
+    return SetupDecodingAndWriteSniffingBufferAndCurrentSegment(
+        Span(prefix, prefixLength), aFromSegment);
+  }
+
+  return NS_OK;
+}
+
+class AddContentRunnable : public Runnable {
+ public:
+  AddContentRunnable(const nsAString& aParserID, uint64_t aBrowserId,
+                     uint64_t aBrowsingContextID, nsIURI* aURI,
+                     Span<const char16_t> aData, bool aComplete)
+      : Runnable("AddContent") {
+    nsAutoCString spec;
+    aURI->GetSpec(spec);
+    mData.mUri.Construct(NS_ConvertUTF8toUTF16(spec));
+    mData.mParserID.Construct(aParserID);
+    mData.mBrowserId.Construct(aBrowserId);
+    mData.mBrowsingContextID.Construct(aBrowsingContextID);
+    mData.mContents.Construct(aData.Elements(), aData.Length());
+    mData.mComplete.Construct(aComplete);
+  }
+
+  NS_IMETHOD Run() override {
+    nsAutoString json;
+    if (!mData.ToJSON(json)) {
+      return NS_ERROR_FAILURE;
+    }
+
+    nsCOMPtr<nsIObserverService> obsService = services::GetObserverService();
+    if (obsService) {
+      obsService->NotifyObservers(nullptr, "devtools-html-content",
+                                  PromiseFlatString(json).get());
+    }
+
+    return NS_OK;
+  }
+
+  HTMLContent mData;
+};
+
+inline void nsHtml5StreamParser::OnNewContent(Span<const char16_t> aData) {
+#ifdef DEBUG
+  mStartedFeedingDevTools = true;
+#endif
+  if (mURIToSendToDevtools) {
+    if (aData.IsEmpty()) {
+      return;
+    }
+    NS_DispatchToMainThread(new AddContentRunnable(
+        mUUIDForDevtools, mBrowserIdForDevtools, mBrowsingContextIDForDevtools,
+        mURIToSendToDevtools, aData,
+         false));
+  }
+}
+
+inline void nsHtml5StreamParser::OnContentComplete() {
+#ifdef DEBUG
+  mStartedFeedingDevTools = true;
+#endif
+  if (mURIToSendToDevtools) {
+    NS_DispatchToMainThread(new AddContentRunnable(
+        mUUIDForDevtools, mBrowserIdForDevtools, mBrowsingContextIDForDevtools,
+        mURIToSendToDevtools, Span<const char16_t>(),
+         true));
+    mURIToSendToDevtools = nullptr;
+    mBrowserIdForDevtools = 0;
+    mBrowsingContextIDForDevtools = 0;
+  }
+}
+
+nsresult nsHtml5StreamParser::WriteStreamBytes(
+    Span<const uint8_t> aFromSegment) {
+  NS_ASSERTION(IsParserThread(), "Wrong thread!");
+  mTokenizerMutex.AssertCurrentThreadOwns();
+  if (!mLastBuffer) {
+    NS_WARNING("mLastBuffer should not be null!");
+    MarkAsBroken(NS_ERROR_NULL_POINTER);
+    return NS_ERROR_NULL_POINTER;
+  }
+  size_t totalRead = 0;
+  auto src = aFromSegment;
+  for (;;) {
+    auto dst = mLastBuffer->TailAsSpan(READ_BUFFER_SIZE);
+    auto [result, read, written, hadErrors] =
+        mUnicodeDecoder->DecodeToUTF16(src, dst, false);
+    if (!(mLookingForMetaCharset || mDecodingLocalFileWithoutTokenizing)) {
+      OnNewContent(dst.To(written));
+    }
+    if (hadErrors && !mHasHadErrors) {
+      mHasHadErrors = true;
+      if (mEncoding == UTF_8_ENCODING) {
+        mTreeBuilder->TryToEnableEncodingMenu();
+      }
+    }
+    src = src.From(read);
+    totalRead += read;
+    mLastBuffer->AdvanceEnd(written);
+    if (result == kOutputFull) {
+      RefPtr<nsHtml5OwningUTF16Buffer> newBuf =
+          nsHtml5OwningUTF16Buffer::FalliblyCreate(READ_BUFFER_SIZE);
+      if (!newBuf) {
+        MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+        return NS_ERROR_OUT_OF_MEMORY;
+      }
+      mLastBuffer = (mLastBuffer->next = std::move(newBuf));
+    } else {
+      MOZ_ASSERT(totalRead == aFromSegment.Length(),
+                 "The Unicode decoder consumed the wrong number of bytes.");
+      (void)totalRead;
+      if (!mLookingForMetaCharset && mDecodingLocalFileWithoutTokenizing &&
+          mNumBytesBuffered == LOCAL_FILE_UTF_8_BUFFER_SIZE) {
+        MOZ_ASSERT(!mStartedFeedingDetector);
+        for (auto&& buffer : mBufferedBytes) {
+          FeedDetector(buffer);
+        }
+        auto [encoding, source] = GuessEncoding(true);
+        mCharsetSource = source;
+        if (encoding != mEncoding) {
+          mEncoding = encoding;
+          nsresult rv = ReDecodeLocalFile();
+          if (NS_FAILED(rv)) {
+            return rv;
+          }
+        } else {
+          MOZ_ASSERT(mEncoding == UTF_8_ENCODING);
+          nsresult rv = CommitLocalFileToEncoding();
+          if (NS_FAILED(rv)) {
+            return rv;
+          }
+        }
+      }
+      return NS_OK;
+    }
+  }
+}
+
+[[nodiscard]] nsresult nsHtml5StreamParser::ReDecodeLocalFile() {
+  MOZ_ASSERT(mDecodingLocalFileWithoutTokenizing && !mLookingForMetaCharset);
+  MOZ_ASSERT(mFirstBufferOfMetaScan);
+  MOZ_ASSERT(mCharsetSource == kCharsetFromFinalAutoDetectionFile ||
+             (mForceAutoDetection &&
+              mCharsetSource == kCharsetFromInitialUserForcedAutoDetection));
+
+  DiscardMetaSpeculation();
+
+  MOZ_ASSERT(mEncoding != UTF_8_ENCODING);
+
+  mDecodingLocalFileWithoutTokenizing = false;
+
+  mEncoding->NewDecoderWithBOMRemovalInto(*mUnicodeDecoder);
+  mHasHadErrors = false;
+
+  mLastBuffer = mFirstBuffer;
+  mLastBuffer->next = nullptr;
+  mLastBuffer->setStart(0);
+  mLastBuffer->setEnd(0);
+
+  mBufferingBytes = false;
+  mForceAutoDetection = false;  
+  mFirstBufferOfMetaScan = nullptr;
+
+  mTreeBuilder->SetDocumentCharset(mEncoding, mCharsetSource, true);
+
+  for (auto&& buffer : mBufferedBytes) {
+    DoDataAvailable(buffer);
+  }
+
+  if (mMode == VIEW_SOURCE_HTML) {
+    auto r = mTokenizer->FlushViewSource();
+    if (r.isErr()) {
+      return r.unwrapErr();
+    }
+  }
+  auto r = mTreeBuilder->Flush();
+  if (r.isErr()) {
+    return r.unwrapErr();
+  }
+  return NS_OK;
+}
+
+[[nodiscard]] nsresult nsHtml5StreamParser::CommitLocalFileToEncoding() {
+  MOZ_ASSERT(mDecodingLocalFileWithoutTokenizing && !mLookingForMetaCharset);
+  MOZ_ASSERT(mFirstBufferOfMetaScan);
+  mDecodingLocalFileWithoutTokenizing = false;
+  MOZ_ASSERT(mCharsetSource == kCharsetFromFinalAutoDetectionFile ||
+             (mForceAutoDetection &&
+              mCharsetSource == kCharsetFromInitialUserForcedAutoDetection));
+  MOZ_ASSERT(mEncoding == UTF_8_ENCODING);
+
+  MOZ_ASSERT(!mStartedFeedingDevTools);
+  if (mURIToSendToDevtools) {
+    nsHtml5OwningUTF16Buffer* buffer = mFirstBufferOfMetaScan;
+    while (buffer) {
+      Span<const char16_t> data(buffer->getBuffer() + buffer->getStart(),
+                                buffer->getLength());
+      OnNewContent(data);
+      buffer = buffer->next;
+    }
+  }
+
+  mFirstBufferOfMetaScan = nullptr;
+
+  mBufferingBytes = false;
+  mForceAutoDetection = false;  
+  mTreeBuilder->SetDocumentCharset(mEncoding, mCharsetSource, true);
+  if (mMode == VIEW_SOURCE_HTML) {
+    auto r = mTokenizer->FlushViewSource();
+    if (r.isErr()) {
+      return r.unwrapErr();
+    }
+  }
+  auto r = mTreeBuilder->Flush();
+  if (r.isErr()) {
+    return r.unwrapErr();
+  }
+  return NS_OK;
+}
+
+class MaybeRunCollector : public Runnable {
+ public:
+  explicit MaybeRunCollector(nsIDocShell* aDocShell)
+      : Runnable("MaybeRunCollector"), mDocShell(aDocShell) {}
+
+  NS_IMETHOD Run() override {
+    nsJSContext::MaybeRunNextCollectorSlice(mDocShell,
+                                            JS::GCReason::HTML_PARSER);
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIDocShell> mDocShell;
+};
+
+nsresult nsHtml5StreamParser::OnStartRequest(nsIRequest* aRequest) {
+  MOZ_RELEASE_ASSERT(STREAM_NOT_STARTED == mStreamState,
+                     "Got OnStartRequest when the stream had already started.");
+  MOZ_ASSERT(
+      !mExecutor->HasStarted(),
+      "Got OnStartRequest at the wrong stage in the executor life cycle.");
+  MOZ_ASSERT(NS_IsMainThread(), "Wrong thread!");
+
+  auto detectorCreator = MakeScopeExit([&] {
+    if ((mForceAutoDetection || mCharsetSource < kCharsetFromParentFrame) ||
+        !(mMode == LOAD_AS_DATA || mMode == VIEW_SOURCE_XML)) {
+      mDetector = mozilla::EncodingDetector::Create(mMode == PLAIN_TEXT ||
+                                                    mMode == VIEW_SOURCE_PLAIN);
+    }
+  });
+
+  mRequest = aRequest;
+
+  mStreamState = STREAM_BEING_READ;
+
+  bool scriptingEnabled =
+      mMode == LOAD_AS_DATA ? false : mExecutor->IsScriptEnabled();
+  mOwner->StartTokenizer(scriptingEnabled);
+
+  MOZ_ASSERT(!mDecodingLocalFileWithoutTokenizing);
+  bool isSrcdoc = false;
+  nsCOMPtr<nsIChannel> channel;
+  nsresult rv = GetChannel(getter_AddRefs(channel));
+  if (NS_SUCCEEDED(rv)) {
+    isSrcdoc = NS_IsSrcdocChannel(channel);
+    if (!isSrcdoc && mCharsetSource <= kCharsetFromFallback) {
+      nsCOMPtr<nsIURI> originalURI;
+      rv = channel->GetOriginalURI(getter_AddRefs(originalURI));
+      if (NS_SUCCEEDED(rv)) {
+        if (originalURI->SchemeIs("resource")) {
+          mCharsetSource = kCharsetFromBuiltIn;
+          mEncoding = UTF_8_ENCODING;
+          mTreeBuilder->SetDocumentCharset(mEncoding, mCharsetSource, false);
+        } else {
+          nsCOMPtr<nsIURI> currentURI;
+          rv = channel->GetURI(getter_AddRefs(currentURI));
+          if (NS_SUCCEEDED(rv)) {
+            nsCOMPtr<nsIURI> innermost = NS_GetInnermostURI(currentURI);
+            if (innermost->SchemeIs("file")) {
+              MOZ_ASSERT(mEncoding == UTF_8_ENCODING);
+              if (!(mMode == LOAD_AS_DATA || mMode == VIEW_SOURCE_XML)) {
+                mDecodingLocalFileWithoutTokenizing = true;
+              }
+            } else {
+              nsAutoCString host;
+              innermost->GetAsciiHost(host);
+              if (!host.IsEmpty()) {
+                if (host.Last() == '.') {
+                  host.SetLength(host.Length() - 1);
+                }
+                int32_t index = host.RFindChar('.');
+                if (index != kNotFound) {
+                  ToLowerCase(
+                      Substring(host, index + 1, host.Length() - (index + 1)),
+                      mTLD);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  mTreeBuilder->setIsSrcdocDocument(isSrcdoc);
+  mTreeBuilder->setScriptingEnabled(scriptingEnabled);
+  mTreeBuilder->SetPreventScriptExecution(
+      !((mMode == NORMAL) && scriptingEnabled));
+  mTreeBuilder->setAllowDeclarativeShadowRoots(
+      mExecutor->GetDocument()->AllowsDeclarativeShadowRoots());
+  mTokenizer->start();
+  mExecutor->Start();
+  mExecutor->StartReadingFromStage();
+
+  if (mMode == PLAIN_TEXT) {
+    mTreeBuilder->StartPlainText();
+    mTokenizer->StartPlainText();
+    MOZ_ASSERT(
+        mTemplatePushedOrHeadPopped);  
+    auto r = mTreeBuilder->Flush();
+    if (r.isErr()) {
+      return mExecutor->MarkAsBroken(r.unwrapErr());
+    }
+  } else if (mMode == VIEW_SOURCE_PLAIN) {
+    nsAutoString viewSourceTitle;
+    CopyUTF8toUTF16(mViewSourceTitle, viewSourceTitle);
+    mTreeBuilder->EnsureBufferSpace(viewSourceTitle.Length());
+    mTreeBuilder->StartPlainTextViewSource(viewSourceTitle);
+    mTokenizer->StartPlainText();
+    MOZ_ASSERT(
+        mTemplatePushedOrHeadPopped);  
+    auto r = mTreeBuilder->Flush();
+    if (r.isErr()) {
+      return mExecutor->MarkAsBroken(r.unwrapErr());
+    }
+  } else if (mMode == VIEW_SOURCE_HTML || mMode == VIEW_SOURCE_XML) {
+    mTokenizer->StartViewSource(NS_ConvertUTF8toUTF16(mViewSourceTitle));
+    if (mMode == VIEW_SOURCE_XML) {
+      mTokenizer->StartViewSourceBodyContents();
+    }
+    auto r = mTokenizer->FlushViewSource();
+    if (r.isErr()) {
+      return mExecutor->MarkAsBroken(r.unwrapErr());
+    }
+  }
+
+  rv = mExecutor->WillBuildModel();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  RefPtr<nsHtml5OwningUTF16Buffer> newBuf =
+      nsHtml5OwningUTF16Buffer::FalliblyCreate(READ_BUFFER_SIZE);
+  if (!newBuf) {
+    return mExecutor->MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+  }
+  MOZ_ASSERT(!mFirstBuffer, "How come we have the first buffer set?");
+  MOZ_ASSERT(!mLastBuffer, "How come we have the last buffer set?");
+  mFirstBuffer = mLastBuffer = newBuf;
+
+  rv = NS_OK;
+
+  nsCOMPtr<nsIHttpChannel> httpChannel(do_QueryInterface(mRequest, &rv));
+  if (NS_SUCCEEDED(rv)) {
+    nsAutoCString method;
+    (void)httpChannel->GetRequestMethod(method);
+    if (!method.EqualsLiteral("GET")) {
+      mReparseForbidden = true;
+    }
+  }
+
+  nsCOMPtr<nsIThreadRetargetableRequest> threadRetargetableRequest =
+      do_QueryInterface(mRequest, &rv);
+  if (threadRetargetableRequest) {
+    rv = threadRetargetableRequest->RetargetDeliveryTo(mEventTarget);
+    if (NS_SUCCEEDED(rv)) {
+      nsCOMPtr<nsIRunnable> runnable =
+          new MaybeRunCollector(mExecutor->GetDocument()->GetDocShell());
+      mozilla::SchedulerGroup::Dispatch(runnable.forget());
+    }
+  }
+
+  if (NS_FAILED(rv)) {
+    NS_WARNING("Failed to retarget HTML data delivery to the parser thread.");
+  }
+
+  if (mCharsetSource == kCharsetFromParentFrame) {
+    mInitialEncodingWasFromParentFrame = true;
+    MOZ_ASSERT(!mDecodingLocalFileWithoutTokenizing);
+  }
+
+  if (mForceAutoDetection || mCharsetSource < kCharsetFromChannel) {
+    mBufferingBytes = true;
+    if (mMode != VIEW_SOURCE_XML) {
+      mLookingForMetaCharset = true;
+    }
+  }
+
+  if (mCharsetSource < kCharsetFromUtf8OnlyMime) {
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(!(mMode == VIEW_SOURCE_HTML || mMode == VIEW_SOURCE_XML));
+
+  MOZ_ASSERT(mEncoding == UTF_8_ENCODING,
+             "How come UTF-8-only MIME type didn't set encoding to UTF-8?");
+
+  mReparseForbidden = true;
+  mForceAutoDetection = false;
+
+  mDecodingLocalFileWithoutTokenizing = false;
+  mUnicodeDecoder = mEncoding->NewDecoderWithBOMRemoval();
+  return NS_OK;
+}
+
+void nsHtml5StreamParser::DoStopRequest() {
+  MOZ_ASSERT(IsParserThread(), "Wrong thread!");
+  MOZ_RELEASE_ASSERT(STREAM_BEING_READ == mStreamState,
+                     "Stream ended without being open.");
+  mTokenizerMutex.AssertCurrentThreadOwns();
+
+  auto guard = MakeScopeExit([&] { OnContentComplete(); });
+
+  if (IsTerminated()) {
+    return;
+  }
+
+  if (MOZ_UNLIKELY(mLookingForXmlDeclarationForXmlViewSource)) {
+    mLookingForXmlDeclarationForXmlViewSource = false;
+    mBufferingBytes = false;
+    mUnicodeDecoder = mEncoding->NewDecoderWithoutBOMHandling();
+    mTreeBuilder->SetDocumentCharset(mEncoding, mCharsetSource, false);
+
+    for (auto&& buffer : mBufferedBytes) {
+      nsresult rv = WriteStreamBytes(buffer);
+      if (NS_FAILED(rv)) {
+        MarkAsBroken(rv);
+        return;
+      }
+    }
+  } else if (!mUnicodeDecoder) {
+    nsresult rv;
+    if (NS_FAILED(rv = SniffStreamBytes(Span<const uint8_t>(), true))) {
+      MarkAsBroken(rv);
+      return;
+    }
+  }
+
+  MOZ_ASSERT(mUnicodeDecoder,
+             "Should have a decoder after finalizing sniffing.");
+
+  if (!mLastBuffer) {
+    NS_WARNING("mLastBuffer should not be null!");
+    MarkAsBroken(NS_ERROR_NULL_POINTER);
+    return;
+  }
+
+  Span<uint8_t> src;  
+  for (;;) {
+    auto dst = mLastBuffer->TailAsSpan(READ_BUFFER_SIZE);
+    uint32_t result;
+    size_t read;
+    size_t written;
+    bool hadErrors;
+    std::tie(result, read, written, hadErrors) =
+        mUnicodeDecoder->DecodeToUTF16(src, dst, true);
+    if (!(mLookingForMetaCharset || mDecodingLocalFileWithoutTokenizing)) {
+      OnNewContent(dst.To(written));
+    }
+    if (hadErrors) {
+      mHasHadErrors = true;
+    }
+    MOZ_ASSERT(read == 0, "How come an empty span was read form?");
+    mLastBuffer->AdvanceEnd(written);
+    if (result == kOutputFull) {
+      RefPtr<nsHtml5OwningUTF16Buffer> newBuf =
+          nsHtml5OwningUTF16Buffer::FalliblyCreate(READ_BUFFER_SIZE);
+      if (!newBuf) {
+        MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+        return;
+      }
+      mLastBuffer = (mLastBuffer->next = std::move(newBuf));
+    } else {
+      if (!mLookingForMetaCharset && mDecodingLocalFileWithoutTokenizing) {
+        MOZ_ASSERT(mNumBytesBuffered < LOCAL_FILE_UTF_8_BUFFER_SIZE);
+        MOZ_ASSERT(!mStartedFeedingDetector);
+        for (auto&& buffer : mBufferedBytes) {
+          FeedDetector(buffer);
+        }
+        MOZ_ASSERT(!mChardetEof);
+        DetectorEof();
+        auto [encoding, source] = GuessEncoding(true);
+        mCharsetSource = source;
+        if (encoding != mEncoding) {
+          mEncoding = encoding;
+          nsresult rv = ReDecodeLocalFile();
+          if (NS_FAILED(rv)) {
+            MarkAsBroken(rv);
+            return;
+          }
+          DoStopRequest();
+          return;
+        }
+        MOZ_ASSERT(mEncoding == UTF_8_ENCODING);
+        nsresult rv = CommitLocalFileToEncoding();
+        if (NS_FAILED(rv)) {
+          MarkAsBroken(rv);
+          return;
+        }
+      }
+      break;
+    }
+  }
+
+  mStreamState = STREAM_ENDED;
+
+  if (IsTerminatedOrInterrupted()) {
+    return;
+  }
+
+  ParseAvailableData();
+}
+
+class nsHtml5RequestStopper : public Runnable {
+ private:
+  nsHtml5StreamParserPtr mStreamParser;
+
+ public:
+  explicit nsHtml5RequestStopper(nsHtml5StreamParser* aStreamParser)
+      : Runnable("nsHtml5RequestStopper"), mStreamParser(aStreamParser) {}
+  NS_IMETHOD Run() override {
+    mozilla::MutexAutoLock autoLock(mStreamParser->mTokenizerMutex);
+    mStreamParser->DoStopRequest();
+    mStreamParser->PostLoadFlusher();
+    return NS_OK;
+  }
+};
+
+nsresult nsHtml5StreamParser::OnStopRequest(
+    nsIRequest* aRequest, nsresult status,
+    const mozilla::ReentrantMonitorAutoEnter& aProofOfLock) {
+  MOZ_ASSERT_IF(aRequest, mRequest == aRequest);
+  if (mOnStopCalled) {
+    MOZ_ASSERT(NS_IsMainThread(), "Expected to run on main thread");
+  } else {
+    mOnStopCalled = true;
+
+    if (MOZ_UNLIKELY(NS_IsMainThread())) {
+      nsCOMPtr<nsIRunnable> stopper = new nsHtml5RequestStopper(this);
+      if (NS_FAILED(
+              mEventTarget->Dispatch(stopper, nsIThread::DISPATCH_NORMAL))) {
+        NS_WARNING("Dispatching StopRequest event failed.");
+      }
+    } else {
+      if (StaticPrefs::network_send_OnDataFinished_html5parser()) {
+        MOZ_ASSERT(IsParserThread(), "Wrong thread!");
+        mozilla::MutexAutoLock autoLock(mTokenizerMutex);
+        DoStopRequest();
+        PostLoadFlusher();
+      } else {
+        mOnStopCalled = false;
+        return NS_OK;
+      }
+    }
+  }
+  return NS_OK;
+}
+
+void nsHtml5StreamParser::DoDataAvailableBuffer(
+    mozilla::Buffer<uint8_t>&& aBuffer) {
+  if (MOZ_UNLIKELY(!mBufferingBytes)) {
+    DoDataAvailable(aBuffer);
+    return;
+  }
+  if (MOZ_UNLIKELY(mLookingForXmlDeclarationForXmlViewSource)) {
+    const uint8_t* elements = aBuffer.Elements();
+    size_t length = aBuffer.Length();
+    const uint8_t* lt = (const uint8_t*)memchr(elements, '>', length);
+    if (!lt) {
+      mBufferedBytes.AppendElement(std::move(aBuffer));
+      return;
+    }
+
+    length = (lt - elements) + 1;
+    Vector<uint8_t> contiguous;
+    for (auto&& buffer : mBufferedBytes) {
+      if (!contiguous.append(buffer.Elements(), buffer.Length())) {
+        MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+        return;
+      }
+    }
+    if (!contiguous.append(elements, length)) {
+      MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+      return;
+    }
+
+    const Encoding* encoding =
+        xmldecl_parse(contiguous.begin(), contiguous.length());
+    if (encoding) {
+      mEncoding = WrapNotNull(encoding);
+      mCharsetSource = kCharsetFromXmlDeclaration;
+    }
+
+    mLookingForXmlDeclarationForXmlViewSource = false;
+    mBufferingBytes = false;
+    mUnicodeDecoder = mEncoding->NewDecoderWithoutBOMHandling();
+    mTreeBuilder->SetDocumentCharset(mEncoding, mCharsetSource, false);
+
+    for (auto&& buffer : mBufferedBytes) {
+      DoDataAvailable(buffer);
+    }
+    DoDataAvailable(aBuffer);
+    mBufferedBytes.Clear();
+    return;
+  }
+  CheckedInt<size_t> bufferedPlusLength(aBuffer.Length());
+  bufferedPlusLength += mNumBytesBuffered;
+  if (!bufferedPlusLength.isValid()) {
+    MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+    return;
+  }
+  bool metaBoundaryWithinBuffer =
+      mLookingForMetaCharset &&
+      mNumBytesBuffered < UNCONDITIONAL_META_SCAN_BOUNDARY &&
+      bufferedPlusLength.value() > UNCONDITIONAL_META_SCAN_BOUNDARY;
+  bool localFileLimitWithinBuffer =
+      mDecodingLocalFileWithoutTokenizing &&
+      mNumBytesBuffered < LOCAL_FILE_UTF_8_BUFFER_SIZE &&
+      bufferedPlusLength.value() > LOCAL_FILE_UTF_8_BUFFER_SIZE;
+  if (!metaBoundaryWithinBuffer && !localFileLimitWithinBuffer) {
+    mNumBytesBuffered = bufferedPlusLength.value();
+    mBufferedBytes.AppendElement(std::move(aBuffer));
+    DoDataAvailable(mBufferedBytes.LastElement());
+  } else {
+    MOZ_RELEASE_ASSERT(
+        !(metaBoundaryWithinBuffer && localFileLimitWithinBuffer),
+        "How can Necko give us a buffer this large?");
+    size_t boundary = metaBoundaryWithinBuffer
+                          ? UNCONDITIONAL_META_SCAN_BOUNDARY
+                          : LOCAL_FILE_UTF_8_BUFFER_SIZE;
+    size_t overBoundary = bufferedPlusLength.value() - boundary;
+    MOZ_RELEASE_ASSERT(overBoundary < aBuffer.Length());
+    size_t untilBoundary = aBuffer.Length() - overBoundary;
+    auto span = aBuffer.AsSpan();
+    auto head = span.To(untilBoundary);
+    auto tail = span.From(untilBoundary);
+    MOZ_RELEASE_ASSERT(mNumBytesBuffered + untilBoundary == boundary);
+    Maybe<Buffer<uint8_t>> maybeHead = Buffer<uint8_t>::CopyFrom(head);
+    if (maybeHead.isNothing()) {
+      MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+      return;
+    }
+    mNumBytesBuffered = boundary;
+    mBufferedBytes.AppendElement(std::move(*maybeHead));
+    DoDataAvailable(mBufferedBytes.LastElement());
+
+    Maybe<Buffer<uint8_t>> maybeTail = Buffer<uint8_t>::CopyFrom(tail);
+    if (maybeTail.isNothing()) {
+      MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+      return;
+    }
+    mNumBytesBuffered += tail.Length();
+    mBufferedBytes.AppendElement(std::move(*maybeTail));
+    DoDataAvailable(mBufferedBytes.LastElement());
+  }
+  if (!mBufferingBytes) {
+    mBufferedBytes.Clear();
+  }
+}
+
+void nsHtml5StreamParser::DoDataAvailable(Span<const uint8_t> aBuffer) {
+  MOZ_ASSERT(IsParserThread(), "Wrong thread!");
+  MOZ_RELEASE_ASSERT(STREAM_BEING_READ == mStreamState,
+                     "DoDataAvailable called when stream not open.");
+  mTokenizerMutex.AssertCurrentThreadOwns();
+
+  if (IsTerminated()) {
+    return;
+  }
+
+  nsresult rv;
+  if (HasDecoder()) {
+    if ((mForceAutoDetection || mCharsetSource < kCharsetFromParentFrame) &&
+        !mBufferingBytes && !mReparseForbidden &&
+        !(mMode == LOAD_AS_DATA || mMode == VIEW_SOURCE_XML)) {
+      MOZ_ASSERT(!mDecodingLocalFileWithoutTokenizing,
+                 "How is mBufferingBytes false if "
+                 "mDecodingLocalFileWithoutTokenizing is true?");
+      FeedDetector(aBuffer);
+    }
+    rv = WriteStreamBytes(aBuffer);
+  } else {
+    rv = SniffStreamBytes(aBuffer, false);
+  }
+  if (NS_FAILED(rv)) {
+    MarkAsBroken(rv);
+    return;
+  }
+
+  if (IsTerminatedOrInterrupted()) {
+    return;
+  }
+
+  if (!mLookingForMetaCharset && mDecodingLocalFileWithoutTokenizing) {
+    return;
+  }
+
+  ParseAvailableData();
+
+  if (mBomState != BOM_SNIFFING_OVER || mFlushTimerArmed || mSpeculating) {
+    return;
+  }
+
+  {
+    mozilla::MutexAutoLock flushTimerLock(mFlushTimerMutex);
+    mFlushTimer->InitWithNamedFuncCallback(
+        nsHtml5StreamParser::TimerCallback, static_cast<void*>(this),
+        mFlushTimerEverFired ? StaticPrefs::html5_flushtimer_initialdelay()
+                             : StaticPrefs::html5_flushtimer_subsequentdelay(),
+        nsITimer::TYPE_ONE_SHOT, "nsHtml5StreamParser::DoDataAvailable"_ns);
+  }
+  mFlushTimerArmed = true;
+}
+
+class nsHtml5DataAvailable : public Runnable {
+ private:
+  nsHtml5StreamParserPtr mStreamParser;
+  Buffer<uint8_t> mData;
+
+ public:
+  nsHtml5DataAvailable(nsHtml5StreamParser* aStreamParser,
+                       Buffer<uint8_t>&& aData)
+      : Runnable("nsHtml5DataAvailable"),
+        mStreamParser(aStreamParser),
+        mData(std::move(aData)) {}
+  NS_IMETHOD Run() override {
+    mozilla::MutexAutoLock autoLock(mStreamParser->mTokenizerMutex);
+    mStreamParser->DoDataAvailableBuffer(std::move(mData));
+    mStreamParser->PostLoadFlusher();
+    return NS_OK;
+  }
+};
+
+nsresult nsHtml5StreamParser::OnDataAvailable(nsIRequest* aRequest,
+                                              nsIInputStream* aInStream,
+                                              uint64_t aSourceOffset,
+                                              uint32_t aLength) {
+  nsresult rv;
+
+  MOZ_ASSERT(mRequest == aRequest, "Got data on wrong stream.");
+  uint32_t totalRead;
+  if (MOZ_UNLIKELY(NS_IsMainThread())) {
+    if (NS_FAILED(rv = mExecutor->IsBroken())) {
+      return rv;
+    }
+    Maybe<Buffer<uint8_t>> maybe = Buffer<uint8_t>::Alloc(aLength);
+    if (maybe.isNothing()) {
+      return mExecutor->MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+    }
+    Buffer<uint8_t> data(std::move(*maybe));
+    rv = aInStream->Read(reinterpret_cast<char*>(data.Elements()),
+                         data.Length(), &totalRead);
+    NS_ENSURE_SUCCESS(rv, rv);
+    MOZ_ASSERT(totalRead == aLength);
+
+    nsCOMPtr<nsIRunnable> dataAvailable =
+        new nsHtml5DataAvailable(this, std::move(data));
+    if (NS_FAILED(mEventTarget->Dispatch(dataAvailable,
+                                         nsIThread::DISPATCH_NORMAL))) {
+      NS_WARNING("Dispatching DataAvailable event failed.");
+    }
+    return rv;
+  }
+
+  MOZ_ASSERT(IsParserThread(), "Wrong thread!");
+  mozilla::MutexAutoLock autoLock(mTokenizerMutex);
+
+  if (NS_FAILED(rv = mTreeBuilder->IsBroken())) {
+    return rv;
+  }
+
+  {
+    auto speculationFlusher = MakeScopeExit([&] { PostLoadFlusher(); });
+
+    if (mBufferingBytes) {
+      Maybe<Buffer<uint8_t>> maybe = Buffer<uint8_t>::Alloc(aLength);
+      if (maybe.isNothing()) {
+        MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+        return NS_ERROR_OUT_OF_MEMORY;
+      }
+      Buffer<uint8_t> data(std::move(*maybe));
+      rv = aInStream->Read(reinterpret_cast<char*>(data.Elements()),
+                           data.Length(), &totalRead);
+      NS_ENSURE_SUCCESS(rv, rv);
+      MOZ_ASSERT(totalRead == aLength);
+      DoDataAvailableBuffer(std::move(data));
+      return rv;
+    }
+    rv = aInStream->ReadSegments(CopySegmentsToParser, this, aLength,
+                                 &totalRead);
+    NS_ENSURE_SUCCESS(rv, rv);
+    MOZ_ASSERT(totalRead == aLength);
+    return rv;
+  }
+}
+
+nsresult nsHtml5StreamParser::CopySegmentsToParser(
+    nsIInputStream* aInStream, void* aClosure, const char* aFromSegment,
+    uint32_t aToOffset, uint32_t aCount,
+    uint32_t* aWriteCount) MOZ_NO_THREAD_SAFETY_ANALYSIS {
+  nsHtml5StreamParser* parser = static_cast<nsHtml5StreamParser*>(aClosure);
+
+  parser->DoDataAvailable(AsBytes(Span(aFromSegment, aCount)));
+  *aWriteCount = aCount;
+  return NS_OK;
+}
+
+const Encoding* nsHtml5StreamParser::PreferredForInternalEncodingDecl(
+    const nsAString& aEncoding) {
+  const Encoding* newEncoding = Encoding::ForLabel(aEncoding);
+  if (!newEncoding) {
+    mTreeBuilder->MaybeComplainAboutCharset("EncMetaUnsupported", true,
+                                            mTokenizer->getLineNumber());
+    return nullptr;
+  }
+
+  if (newEncoding == UTF_16BE_ENCODING || newEncoding == UTF_16LE_ENCODING) {
+    mTreeBuilder->MaybeComplainAboutCharset("EncMetaUtf16", true,
+                                            mTokenizer->getLineNumber());
+    newEncoding = UTF_8_ENCODING;
+  }
+
+  if (newEncoding == X_USER_DEFINED_ENCODING) {
+    mTreeBuilder->MaybeComplainAboutCharset("EncMetaUserDefined", true,
+                                            mTokenizer->getLineNumber());
+    newEncoding = WINDOWS_1252_ENCODING;
+  }
+
+  if (newEncoding == REPLACEMENT_ENCODING) {
+    mTreeBuilder->MaybeComplainAboutCharset("EncMetaReplacement", true, 0);
+  }
+
+  return newEncoding;
+}
+
+bool nsHtml5StreamParser::internalEncodingDeclaration(nsHtml5String aEncoding) {
+  MOZ_ASSERT(IsParserThread(), "Wrong thread!");
+  if ((mCharsetSource >= kCharsetFromMetaTag &&
+       mCharsetSource != kCharsetFromFinalAutoDetectionFile) ||
+      mSeenEligibleMetaCharset) {
+    return false;
+  }
+
+  nsString newEncoding;  
+  aEncoding.ToString(newEncoding);
+  auto encoding = PreferredForInternalEncodingDecl(newEncoding);
+  if (!encoding) {
+    return false;
+  }
+
+  mSeenEligibleMetaCharset = true;
+
+  if (!mLookingForMetaCharset) {
+    if (mInitialEncodingWasFromParentFrame) {
+      mTreeBuilder->MaybeComplainAboutCharset("EncMetaTooLateFrame", true,
+                                              mTokenizer->getLineNumber());
+    } else {
+      mTreeBuilder->MaybeComplainAboutCharset("EncMetaTooLate", true,
+                                              mTokenizer->getLineNumber());
+    }
+    return false;
+  }
+  if (mTemplatePushedOrHeadPopped) {
+    mTreeBuilder->MaybeComplainAboutCharset("EncMetaAfterHeadInKilobyte", false,
+                                            mTokenizer->getLineNumber());
+  }
+
+  if (mForceAutoDetection && encoding->IsAsciiCompatible()) {
+    return false;
+  }
+
+  mNeedsEncodingSwitchTo = encoding;
+  mEncodingSwitchSource = kCharsetFromMetaTag;
+  return true;
+}
+
+bool nsHtml5StreamParser::TemplatePushedOrHeadPopped() {
+  MOZ_ASSERT(
+      IsParserThread() || mMode == PLAIN_TEXT || mMode == VIEW_SOURCE_PLAIN,
+      "Wrong thread!");
+  mTemplatePushedOrHeadPopped = true;
+  return mNumBytesBuffered >= UNCONDITIONAL_META_SCAN_BOUNDARY;
+}
+
+void nsHtml5StreamParser::RememberGt(int32_t aPos) {
+  if (mLookingForMetaCharset) {
+    mGtBuffer = mFirstBuffer;
+    mGtPos = aPos;
+  }
+}
+
+void nsHtml5StreamParser::PostLoadFlusher() {
+  MOZ_ASSERT(IsParserThread(), "Wrong thread!");
+  mTokenizerMutex.AssertCurrentThreadOwns();
+
+  mTreeBuilder->FlushLoads();
+  nsCOMPtr<nsIRunnable> runnable(mLoadFlusher);
+  if (NS_FAILED(
+          DispatchToMain(CreateRenderBlockingRunnable(runnable.forget())))) {
+    NS_WARNING("failed to dispatch load flush event");
+  }
+
+  if ((mMode == VIEW_SOURCE_HTML || mMode == VIEW_SOURCE_XML) &&
+      mTokenizer->ShouldFlushViewSource()) {
+    auto r = mTreeBuilder->Flush();  
+    MOZ_ASSERT(r.isOk(), "Should have null sink with View Source");
+    r = mTokenizer->FlushViewSource();
+    if (r.isErr()) {
+      MarkAsBroken(r.unwrapErr());
+      return;
+    }
+    if (r.unwrap()) {
+      nsCOMPtr<nsIRunnable> runnable(mExecutorFlusher);
+      if (NS_FAILED(DispatchToMain(runnable.forget()))) {
+        NS_WARNING("failed to dispatch executor flush event");
+      }
+    }
+  }
+}
+
+void nsHtml5StreamParser::FlushTreeOpsAndDisarmTimer() {
+  MOZ_ASSERT(IsParserThread(), "Wrong thread!");
+  if (mFlushTimerArmed) {
+    {
+      mozilla::MutexAutoLock flushTimerLock(mFlushTimerMutex);
+      mFlushTimer->Cancel();
+    }
+    mFlushTimerArmed = false;
+  }
+  if (mMode == VIEW_SOURCE_HTML || mMode == VIEW_SOURCE_XML) {
+    auto r = mTokenizer->FlushViewSource();
+    if (r.isErr()) {
+      MarkAsBroken(r.unwrapErr());
+    }
+  }
+  auto r = mTreeBuilder->Flush();
+  if (r.isErr()) {
+    MarkAsBroken(r.unwrapErr());
+  }
+  nsCOMPtr<nsIRunnable> runnable(mExecutorFlusher);
+  if (NS_FAILED(DispatchToMain(runnable.forget()))) {
+    NS_WARNING("failed to dispatch executor flush event");
+  }
+}
+
+void nsHtml5StreamParser::SwitchDecoderIfAsciiSoFar(
+    NotNull<const Encoding*> aEncoding) {
+  if (mEncoding == aEncoding) {
+    MOZ_ASSERT(!mStartedFeedingDevTools);
+    if (mURIToSendToDevtools) {
+      nsHtml5OwningUTF16Buffer* buffer = mFirstBufferOfMetaScan;
+      while (buffer) {
+        auto s = Span(buffer->getBuffer(), buffer->getEnd());
+        OnNewContent(s);
+        buffer = buffer->next;
+      }
+    }
+    return;
+  }
+  if (!mEncoding->IsAsciiCompatible() || !aEncoding->IsAsciiCompatible()) {
+    return;
+  }
+  size_t numAscii = 0;
+  MOZ_ASSERT(mFirstBufferOfMetaScan,
+             "Why did we come here without starting meta scan?");
+  nsHtml5OwningUTF16Buffer* buffer = mFirstBufferOfMetaScan;
+  while (buffer != mFirstBuffer) {
+    MOZ_ASSERT(buffer, "mFirstBuffer should have acted as sentinel!");
+    MOZ_ASSERT(buffer->getStart() == buffer->getEnd(),
+               "Why wasn't an early buffer fully consumed?");
+    auto s = Span(buffer->getBuffer(), buffer->getStart());
+    if (!IsAscii(s)) {
+      return;
+    }
+    numAscii += s.Length();
+    buffer = buffer->next;
+  }
+  auto s = Span(mFirstBuffer->getBuffer(), mFirstBuffer->getStart());
+  if (!IsAscii(s)) {
+    return;
+  }
+  numAscii += s.Length();
+
+  MOZ_ASSERT(!mStartedFeedingDevTools);
+  if (mURIToSendToDevtools) {
+    buffer = mFirstBufferOfMetaScan;
+    while (buffer != mFirstBuffer) {
+      MOZ_ASSERT(buffer, "mFirstBuffer should have acted as sentinel!");
+      MOZ_ASSERT(buffer->getStart() == buffer->getEnd(),
+                 "Why wasn't an early buffer fully consumed?");
+      auto s = Span(buffer->getBuffer(), buffer->getStart());
+      OnNewContent(s);
+      buffer = buffer->next;
+    }
+    auto s = Span(mFirstBuffer->getBuffer(), mFirstBuffer->getStart());
+    OnNewContent(s);
+  }
+
+  mFirstBuffer->setEnd(mFirstBuffer->getStart());
+  mLastBuffer = mFirstBuffer;
+  mFirstBuffer->next = nullptr;
+
+
+  MOZ_ASSERT(mUnicodeDecoder, "How come we scanned meta without a decoder?");
+  mEncoding = aEncoding;
+  mEncoding->NewDecoderWithoutBOMHandlingInto(*mUnicodeDecoder);
+  mHasHadErrors = false;
+
+  MOZ_ASSERT(!mDecodingLocalFileWithoutTokenizing,
+             "Must have set mDecodingLocalFileWithoutTokenizing to false to "
+             "report data to dev tools below");
+  MOZ_ASSERT(!mLookingForMetaCharset,
+             "Must have set mLookingForMetaCharset to false to report data to "
+             "dev tools below");
+
+  size_t skipped = 0;
+  for (auto&& buffer : mBufferedBytes) {
+    size_t nextSkipped = skipped + buffer.Length();
+    if (nextSkipped <= numAscii) {
+      skipped = nextSkipped;
+      continue;
+    }
+    if (skipped >= numAscii) {
+      WriteStreamBytes(buffer);
+      skipped = nextSkipped;
+      continue;
+    }
+    size_t tailLength = nextSkipped - numAscii;
+    WriteStreamBytes(Span<uint8_t>(buffer).From(buffer.Length() - tailLength));
+    skipped = nextSkipped;
+  }
+}
+
+size_t nsHtml5StreamParser::CountGts() {
+  if (!mGtBuffer) {
+    return 0;
+  }
+  size_t gts = 0;
+  nsHtml5OwningUTF16Buffer* buffer = mFirstBufferOfMetaScan;
+  for (;;) {
+    MOZ_ASSERT(buffer, "How did we walk past mGtBuffer?");
+    char16_t* buf = buffer->getBuffer();
+    if (buffer == mGtBuffer) {
+      for (int32_t i = 0; i <= mGtPos; ++i) {
+        if (buf[i] == u'>') {
+          ++gts;
+        }
+      }
+      break;
+    }
+    for (int32_t i = 0; i < buffer->getEnd(); ++i) {
+      if (buf[i] == u'>') {
+        ++gts;
+      }
+    }
+    buffer = buffer->next;
+  }
+  return gts;
+}
+
+void nsHtml5StreamParser::DiscardMetaSpeculation() {
+  mozilla::MutexAutoLock speculationAutoLock(mSpeculationMutex);
+  MOZ_ASSERT(!mAtEOF, "How did we end up setting this?");
+  mTokenizer->resetToDataState();
+  mTokenizer->setLineNumber(1);
+  mLastWasCR = false;
+
+  if (mMode == PLAIN_TEXT || mMode == VIEW_SOURCE_PLAIN) {
+    mTokenizer->StartPlainText();
+  }
+
+  mFirstBuffer = mLastBuffer;
+  mFirstBuffer->setStart(0);
+  mFirstBuffer->setEnd(0);
+  mFirstBuffer->next = nullptr;
+
+  mTreeBuilder->flushCharacters();  
+  mTreeBuilder->ClearOps();         
+
+  if (mMode == VIEW_SOURCE_HTML) {
+    mTokenizer->RewindViewSource();
+  }
+
+  {
+    const auto& speculation = mSpeculations.ElementAt(0);
+    mTreeBuilder->loadState(speculation->GetSnapshot());
+  }
+
+
+  mSpeculations.Clear();  
+
+
+  nsHtml5Speculation* speculation = new nsHtml5Speculation(
+      mFirstBuffer, mFirstBuffer->getStart(), mTokenizer->getLineNumber(),
+      mTokenizer->getColumnNumber(), mTreeBuilder->newSnapshot());
+  MOZ_ASSERT(!mFlushTimerArmed, "How did we end up arming the timer?");
+  if (mMode == VIEW_SOURCE_HTML) {
+    mTokenizer->SetViewSourceOpSink(speculation);
+    mTokenizer->StartViewSourceBodyContents();
+  } else {
+    MOZ_ASSERT(mMode != VIEW_SOURCE_XML);
+    mTreeBuilder->SetOpSink(speculation);
+  }
+  mSpeculations.AppendElement(speculation);  
+  MOZ_ASSERT(mSpeculating, "How did we end speculating?");
+}
+
+bool nsHtml5StreamParser::ProcessLookingForMetaCharset(bool aEof) {
+  MOZ_ASSERT(mBomState == BOM_SNIFFING_OVER);
+  MOZ_ASSERT(mMode != VIEW_SOURCE_XML);
+  bool rewound = false;
+  MOZ_ASSERT(mForceAutoDetection ||
+                 mCharsetSource < kCharsetFromInitialAutoDetectionASCII ||
+                 mCharsetSource == kCharsetFromParentFrame,
+             "Why are we looking for meta charset if we've seen it?");
+  bool atKilobyte = false;
+  if ((mNumBytesBuffered == UNCONDITIONAL_META_SCAN_BOUNDARY &&
+       mFirstBuffer == mLastBuffer && !mFirstBuffer->hasMore())) {
+    atKilobyte = true;
+    mTokenizer->AtKilobyteBoundary();
+  }
+  if (!mNeedsEncodingSwitchTo &&
+      (aEof || (mTemplatePushedOrHeadPopped &&
+                !mTokenizer->IsInTokenStartedAtKilobyteBoundary() &&
+                (atKilobyte ||
+                 mNumBytesBuffered > UNCONDITIONAL_META_SCAN_BOUNDARY)))) {
+    mLookingForMetaCharset = false;
+    if (mStartsWithLtQuestion && mCharsetSource < kCharsetFromXmlDeclaration) {
+      MOZ_ASSERT(!mBufferedBytes.IsEmpty(),
+                 "How did at least <? not get buffered?");
+      Buffer<uint8_t>& first = mBufferedBytes[0];
+      const Encoding* encoding =
+          xmldecl_parse(first.Elements(), first.Length());
+      if (!encoding) {
+        Vector<uint8_t> contiguous;
+        if (!contiguous.append(first.Elements(), first.Length())) {
+          MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+          return false;
+        }
+        for (size_t i = 1; i < mBufferedBytes.Length(); ++i) {
+          Buffer<uint8_t>& buffer = mBufferedBytes[i];
+          const uint8_t* elements = buffer.Elements();
+          size_t length = buffer.Length();
+          const uint8_t* lt = (const uint8_t*)memchr(elements, '>', length);
+          bool stop = false;
+          if (lt) {
+            length = (lt - elements) + 1;
+            stop = true;
+          }
+          if (!contiguous.append(elements, length)) {
+            MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+            return false;
+          }
+          if (stop) {
+            break;
+          }
+        }
+        encoding = xmldecl_parse(contiguous.begin(), contiguous.length());
+      }
+      if (encoding) {
+        if (!(mForceAutoDetection && encoding->IsAsciiCompatible())) {
+          mForceAutoDetection = false;
+          mNeedsEncodingSwitchTo = encoding;
+          mEncodingSwitchSource = kCharsetFromXmlDeclaration;
+        }
+      }
+    }
+    if (!mNeedsEncodingSwitchTo &&
+        (mForceAutoDetection ||
+         mCharsetSource < kCharsetFromInitialAutoDetectionASCII) &&
+        !(mMode == LOAD_AS_DATA || mMode == VIEW_SOURCE_XML) &&
+        !(mDecodingLocalFileWithoutTokenizing && !aEof &&
+          mNumBytesBuffered <= LOCAL_FILE_UTF_8_BUFFER_SIZE)) {
+      MOZ_ASSERT(!mStartedFeedingDetector);
+      if (mNumBytesBuffered == UNCONDITIONAL_META_SCAN_BOUNDARY || aEof) {
+        for (auto&& buffer : mBufferedBytes) {
+          FeedDetector(buffer);
+        }
+        if (aEof) {
+          MOZ_ASSERT(!mChardetEof);
+          DetectorEof();
+        }
+        auto [encoding, source] = GuessEncoding(true);
+        mNeedsEncodingSwitchTo = encoding;
+        mEncodingSwitchSource = source;
+      } else if (mNumBytesBuffered > UNCONDITIONAL_META_SCAN_BOUNDARY) {
+        size_t gtsLeftToFind = CountGts();
+        size_t bytesSeen = 0;
+        for (auto&& buffer : mBufferedBytes) {
+          if (!mNeedsEncodingSwitchTo) {
+            if (gtsLeftToFind) {
+              auto span = buffer.AsSpan();
+              bool feed = true;
+              for (size_t i = 0; i < span.Length(); ++i) {
+                if (span[i] == uint8_t('>')) {
+                  --gtsLeftToFind;
+                  if (!gtsLeftToFind) {
+                    if (bytesSeen < UNCONDITIONAL_META_SCAN_BOUNDARY) {
+                      break;
+                    }
+                    ++i;  
+                    FeedDetector(span.To(i));
+                    auto [encoding, source] = GuessEncoding(true);
+                    mNeedsEncodingSwitchTo = encoding;
+                    mEncodingSwitchSource = source;
+                    FeedDetector(span.From(i));
+                    bytesSeen += buffer.Length();
+                    feed = false;
+                    break;
+                  }
+                }
+              }
+              if (feed) {
+                FeedDetector(buffer);
+                bytesSeen += buffer.Length();
+              }
+              continue;
+            }
+            if (bytesSeen == UNCONDITIONAL_META_SCAN_BOUNDARY) {
+              auto [encoding, source] = GuessEncoding(true);
+              mNeedsEncodingSwitchTo = encoding;
+              mEncodingSwitchSource = source;
+            }
+          }
+          FeedDetector(buffer);
+          bytesSeen += buffer.Length();
+        }
+      }
+      MOZ_ASSERT(mNeedsEncodingSwitchTo,
+                 "How come we didn't call GuessEncoding()?");
+    }
+  }
+  if (mNeedsEncodingSwitchTo) {
+    mDecodingLocalFileWithoutTokenizing = false;
+    mLookingForMetaCharset = false;
+
+    auto needsEncodingSwitchTo = WrapNotNull(mNeedsEncodingSwitchTo);
+    mNeedsEncodingSwitchTo = nullptr;
+
+    SwitchDecoderIfAsciiSoFar(needsEncodingSwitchTo);
+
+    mCharsetSource = mEncodingSwitchSource;
+
+    if (mMode == VIEW_SOURCE_HTML) {
+      auto r = mTokenizer->FlushViewSource();
+      if (r.isErr()) {
+        MarkAsBroken(r.unwrapErr());
+        return false;
+      }
+    }
+    auto r = mTreeBuilder->Flush();
+    if (r.isErr()) {
+      MarkAsBroken(r.unwrapErr());
+      return false;
+    }
+
+    if (mEncoding != needsEncodingSwitchTo) {
+      rewound = true;
+
+      if (mEncoding == ISO_2022_JP_ENCODING ||
+          needsEncodingSwitchTo == ISO_2022_JP_ENCODING) {
+        mTreeBuilder->MaybeComplainAboutCharset("EncSpeculationFail2022", false,
+                                                mTokenizer->getLineNumber());
+      } else {
+        if (mCharsetSource == kCharsetFromMetaTag) {
+          mTreeBuilder->MaybeComplainAboutCharset(
+              "EncSpeculationFailMeta", false, mTokenizer->getLineNumber());
+        } else if (mCharsetSource == kCharsetFromXmlDeclaration) {
+          mTreeBuilder->MaybeComplainAboutCharset(
+              "EncSpeculationFailXml", false, mTokenizer->getLineNumber());
+        }
+      }
+
+      DiscardMetaSpeculation();
+      mEncoding = needsEncodingSwitchTo;
+      mUnicodeDecoder = mEncoding->NewDecoderWithBOMRemoval();
+      mHasHadErrors = false;
+
+      MOZ_ASSERT(!mDecodingLocalFileWithoutTokenizing,
+                 "Must have set mDecodingLocalFileWithoutTokenizing to false "
+                 "to report data to dev tools below");
+      MOZ_ASSERT(!mLookingForMetaCharset,
+                 "Must have set mLookingForMetaCharset to false to report data "
+                 "to dev tools below");
+      for (auto&& buffer : mBufferedBytes) {
+        nsresult rv = WriteStreamBytes(buffer);
+        if (NS_FAILED(rv)) {
+          MarkAsBroken(rv);
+          return false;
+        }
+      }
+    }
+  } else if (!mLookingForMetaCharset && !mDecodingLocalFileWithoutTokenizing) {
+    MOZ_ASSERT(!mStartedFeedingDevTools);
+    if (mURIToSendToDevtools) {
+      nsHtml5OwningUTF16Buffer* buffer = mFirstBufferOfMetaScan;
+      while (buffer) {
+        auto s = Span(buffer->getBuffer(), buffer->getEnd());
+        OnNewContent(s);
+        buffer = buffer->next;
+      }
+    }
+  }
+  if (!mLookingForMetaCharset) {
+    mGtBuffer = nullptr;
+    mGtPos = 0;
+
+    if (!mDecodingLocalFileWithoutTokenizing) {
+      mFirstBufferOfMetaScan = nullptr;
+      mBufferingBytes = false;
+      mBufferedBytes.Clear();
+      mTreeBuilder->SetDocumentCharset(mEncoding, mCharsetSource, true);
+      if (mMode == VIEW_SOURCE_HTML) {
+        auto r = mTokenizer->FlushViewSource();
+        if (r.isErr()) {
+          MarkAsBroken(r.unwrapErr());
+          return false;
+        }
+      }
+      auto r = mTreeBuilder->Flush();
+      if (r.isErr()) {
+        MarkAsBroken(r.unwrapErr());
+        return false;
+      }
+    }
+  }
+  return rewound;
+}
+
+void nsHtml5StreamParser::ParseAvailableData() {
+  MOZ_ASSERT(IsParserThread(), "Wrong thread!");
+  mTokenizerMutex.AssertCurrentThreadOwns();
+  MOZ_ASSERT(!(mDecodingLocalFileWithoutTokenizing && !mLookingForMetaCharset));
+
+  if (IsTerminatedOrInterrupted()) {
+    return;
+  }
+
+  if (mSpeculating && !IsSpeculationEnabled()) {
+    return;
+  }
+
+  bool requestedReload = false;
+  for (;;) {
+    if (!mFirstBuffer->hasMore()) {
+      if (mFirstBuffer == mLastBuffer) {
+        switch (mStreamState) {
+          case STREAM_BEING_READ:
+            if (!mSpeculating) {
+              mFirstBuffer->setStart(0);
+              mFirstBuffer->setEnd(0);
+            }
+            return;  
+          case STREAM_ENDED:
+            if (mAtEOF) {
+              return;
+            }
+            if (mLookingForMetaCharset) {
+              if (ProcessLookingForMetaCharset(true)) {
+                if (IsTerminatedOrInterrupted()) {
+                  return;
+                }
+                continue;
+              }
+            } else if ((mForceAutoDetection ||
+                        mCharsetSource < kCharsetFromParentFrame) &&
+                       !(mMode == LOAD_AS_DATA || mMode == VIEW_SOURCE_XML) &&
+                       !mReparseForbidden) {
+              DetectorEof();
+              auto [encoding, source] = GuessEncoding(false);
+              if (encoding != mEncoding) {
+                MOZ_ASSERT(
+                    (source >=
+                         kCharsetFromFinalAutoDetectionWouldHaveBeenUTF8InitialWasASCII &&
+                     source <=
+                         kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8DependedOnTLDInitialWasASCII) ||
+                    source == kCharsetFromFinalUserForcedAutoDetection);
+                mTreeBuilder->NeedsCharsetSwitchTo(encoding, source, 0);
+                requestedReload = true;
+              } else if (mCharsetSource ==
+                             kCharsetFromInitialAutoDetectionASCII &&
+                         mDetectorHasSeenNonAscii) {
+                mCharsetSource = source;
+                mTreeBuilder->UpdateCharsetSource(mCharsetSource);
+              }
+            }
+
+            mAtEOF = true;
+            if (!mForceAutoDetection && !requestedReload) {
+              if (mCharsetSource == kCharsetFromParentFrame) {
+                mTreeBuilder->MaybeComplainAboutCharset("EncNoDeclarationFrame",
+                                                        false, 0);
+              } else if (mCharsetSource == kCharsetFromXmlDeclaration) {
+                mTreeBuilder->MaybeComplainAboutCharset("EncXmlDecl", false, 1);
+              } else if (
+                  mCharsetSource >=
+                      kCharsetFromInitialAutoDetectionWouldHaveBeenUTF8 &&
+                  mCharsetSource <=
+                      kCharsetFromInitialAutoDetectionWouldNotHaveBeenUTF8DependedOnTLD) {
+                if (mMode == PLAIN_TEXT || mMode == VIEW_SOURCE_PLAIN) {
+                  mTreeBuilder->MaybeComplainAboutCharset("EncNoDeclPlain",
+                                                          true, 0);
+                } else {
+                  mTreeBuilder->MaybeComplainAboutCharset("EncNoDecl", true, 0);
+                }
+              }
+
+              if (mHasHadErrors && mEncoding != REPLACEMENT_ENCODING) {
+                if (mEncoding == UTF_8_ENCODING) {
+                  mTreeBuilder->TryToEnableEncodingMenu();
+                }
+                if (mCharsetSource == kCharsetFromParentFrame) {
+                  if (mMode == PLAIN_TEXT || mMode == VIEW_SOURCE_PLAIN) {
+                    mTreeBuilder->MaybeComplainAboutCharset(
+                        "EncErrorFramePlain", true, 0);
+                  } else {
+                    mTreeBuilder->MaybeComplainAboutCharset("EncErrorFrame",
+                                                            true, 0);
+                  }
+                } else if (
+                    mCharsetSource >= kCharsetFromXmlDeclaration &&
+                    !(mCharsetSource >=
+                          kCharsetFromFinalAutoDetectionWouldHaveBeenUTF8InitialWasASCII &&
+                      mCharsetSource <=
+                          kCharsetFromFinalUserForcedAutoDetection)) {
+                  mTreeBuilder->MaybeComplainAboutCharset("EncError", true, 0);
+                }
+              }
+            }
+            if (NS_SUCCEEDED(mTreeBuilder->IsBroken())) {
+              mTokenizer->eof();
+              nsresult rv;
+              if (NS_FAILED((rv = mTreeBuilder->IsBroken()))) {
+                MarkAsBroken(rv);
+              } else {
+                mTreeBuilder->StreamEnded();
+                if (mMode == VIEW_SOURCE_HTML || mMode == VIEW_SOURCE_XML) {
+                  if (!mTokenizer->EndViewSource()) {
+                    MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+                  }
+                }
+              }
+            }
+            FlushTreeOpsAndDisarmTimer();
+            return;  
+          default:
+            MOZ_ASSERT_UNREACHABLE("It should be impossible to reach this.");
+            return;
+        }
+      }
+      mFirstBuffer = mFirstBuffer->next;
+      continue;
+    }
+
+    mFirstBuffer->adjust(mLastWasCR);
+    mLastWasCR = false;
+    if (mFirstBuffer->hasMore()) {
+      if (!mTokenizer->EnsureBufferSpace(mFirstBuffer->getLength())) {
+        MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+        return;
+      }
+      mLastWasCR = mTokenizer->tokenizeBuffer(mFirstBuffer);
+      nsresult rv;
+      if (NS_FAILED((rv = mTreeBuilder->IsBroken()))) {
+        MarkAsBroken(rv);
+        return;
+      }
+      if (mTreeBuilder->HasScriptThatMayDocumentWriteOrBlock()) {
+        MOZ_ASSERT(mMode == NORMAL);
+        mozilla::MutexAutoLock speculationAutoLock(mSpeculationMutex);
+        nsHtml5Speculation* speculation = new nsHtml5Speculation(
+            mFirstBuffer, mFirstBuffer->getStart(), mTokenizer->getLineNumber(),
+            mTokenizer->getColumnNumber(), mTreeBuilder->newSnapshot());
+        mTreeBuilder->AddSnapshotToScript(speculation->GetSnapshot(),
+                                          speculation->GetStartLineNumber());
+        if (mLookingForMetaCharset) {
+          if (mMode == VIEW_SOURCE_HTML) {
+            auto r = mTokenizer->FlushViewSource();
+            if (r.isErr()) {
+              MarkAsBroken(r.unwrapErr());
+              return;
+            }
+          }
+          auto r = mTreeBuilder->Flush();
+          if (r.isErr()) {
+            MarkAsBroken(r.unwrapErr());
+            return;
+          }
+        } else {
+          FlushTreeOpsAndDisarmTimer();
+        }
+        mTreeBuilder->SetOpSink(speculation);
+        mSpeculations.AppendElement(speculation);  
+        mSpeculating = true;
+      }
+      if (IsTerminatedOrInterrupted()) {
+        return;
+      }
+    }
+    if (mLookingForMetaCharset) {
+      (void)ProcessLookingForMetaCharset(false);
+    }
+  }
+}
+
+class nsHtml5StreamParserContinuation : public Runnable {
+ private:
+  nsHtml5StreamParserPtr mStreamParser;
+
+ public:
+  explicit nsHtml5StreamParserContinuation(nsHtml5StreamParser* aStreamParser)
+      : Runnable("nsHtml5StreamParserContinuation"),
+        mStreamParser(aStreamParser) {}
+  NS_IMETHOD Run() override {
+    mozilla::MutexAutoLock autoLock(mStreamParser->mTokenizerMutex);
+    mStreamParser->Uninterrupt();
+    mStreamParser->ParseAvailableData();
+    return NS_OK;
+  }
+};
+
+void nsHtml5StreamParser::ContinueAfterScriptsOrEncodingCommitment(
+    nsHtml5Tokenizer* aTokenizer, nsHtml5TreeBuilder* aTreeBuilder,
+    bool aLastWasCR) {
+
+  MOZ_ASSERT(NS_IsMainThread(), "Wrong thread!");
+  MOZ_ASSERT(mMode != VIEW_SOURCE_XML,
+             "ContinueAfterScriptsOrEncodingCommitment called in XML view "
+             "source mode!");
+  MOZ_ASSERT(!(aTokenizer && mMode == VIEW_SOURCE_HTML),
+             "ContinueAfterScriptsOrEncodingCommitment called with non-null "
+             "tokenizer in HTML view "
+             "source mode.");
+  if (NS_FAILED(mExecutor->IsBroken())) {
+    return;
+  }
+  MOZ_ASSERT(!(aTokenizer && mMode != NORMAL),
+             "We should only be executing scripts in the normal mode.");
+  if (!aTokenizer && (mMode == PLAIN_TEXT || mMode == VIEW_SOURCE_PLAIN ||
+                      mMode == VIEW_SOURCE_HTML)) {
+    if (!mExecutor->TakeOpsFromStage()) {
+      mExecutor->MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+      return;
+    }
+  } else {
+#ifdef DEBUG
+    mExecutor->AssertStageEmpty();
+#endif
+  }
+  bool speculationFailed = false;
+  {
+    mozilla::MutexAutoLock speculationAutoLock(mSpeculationMutex);
+    if (mSpeculations.IsEmpty()) {
+      MOZ_ASSERT_UNREACHABLE(
+          "ContinueAfterScriptsOrEncodingCommitment called without "
+          "speculations.");
+      return;
+    }
+
+    const auto& speculation = mSpeculations.ElementAt(0);
+    if (aTokenizer &&
+        (aLastWasCR || !aTokenizer->isInDataState() ||
+         !aTreeBuilder->snapshotMatches(speculation->GetSnapshot()))) {
+      speculationFailed = true;
+      MaybeDisableFutureSpeculation();
+      Interrupt();  
+
+    } else {
+      if (mSpeculations.Length() > 1) {
+        if (!speculation->FlushToSink(mExecutor)) {
+          mExecutor->MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+          return;
+        }
+        MOZ_ASSERT(!mExecutor->IsScriptExecuting(),
+                   "ParseUntilBlocked() was supposed to ensure we don't come "
+                   "here when scripts are executing.");
+        MOZ_ASSERT(!aTokenizer || mExecutor->IsInFlushLoop(),
+                   "How are we here if "
+                   "RunFlushLoop() didn't call ParseUntilBlocked() or we're "
+                   "not committing to an encoding?");
+        mSpeculations.RemoveElementAt(0);
+        return;
+      }
+      Interrupt();  
+
+      // now fall through
+    }
+  }
+  {
+    mozilla::MutexAutoLock tokenizerAutoLock(mTokenizerMutex);
+#ifdef DEBUG
+    {
+      mAtomTable.SetPermittedLookupEventTarget(
+          GetMainThreadSerialEventTarget());
+    }
+#endif
+    if (speculationFailed) {
+      MOZ_ASSERT(mMode == NORMAL);
+      mAtEOF = false;
+      const auto& speculation = mSpeculations.ElementAt(0);
+      mFirstBuffer = speculation->GetBuffer();
+      mFirstBuffer->setStart(speculation->GetStart());
+      mTokenizer->setLineNumber(speculation->GetStartLineNumber());
+      mTokenizer->setColumnNumberAndResetNextLine(
+          speculation->GetStartColumnNumber());
+
+      nsContentUtils::ReportToConsole(
+          nsIScriptError::warningFlag, "DOM Events"_ns,
+          mExecutor->GetDocument(), PropertiesFile::DOM_PROPERTIES,
+          "SpeculationFailed2", nsTArray<nsString>(),
+          SourceLocation(mExecutor->GetDocument()->GetDocumentURI(),
+                         speculation->GetStartLineNumber(),
+                         speculation->GetStartColumnNumber()));
+
+      nsHtml5OwningUTF16Buffer* buffer = mFirstBuffer->next;
+      while (buffer) {
+        buffer->setStart(0);
+        buffer = buffer->next;
+      }
+
+      mSpeculations.Clear();  
+
+      mTreeBuilder->flushCharacters();  
+      mTreeBuilder->ClearOps();         
+
+      mTreeBuilder->SetOpSink(mExecutor->GetStage());
+      mExecutor->StartReadingFromStage();
+      mSpeculating = false;
+
+      mLastWasCR = aLastWasCR;
+      mTokenizer->loadState(aTokenizer);
+      mTreeBuilder->loadState(aTreeBuilder);
+    } else {
+      if (!mSpeculations.ElementAt(0)->FlushToSink(mExecutor)) {
+        mExecutor->MarkAsBroken(NS_ERROR_OUT_OF_MEMORY);
+        return;
+      }
+      MOZ_ASSERT(!mExecutor->IsScriptExecuting(),
+                 "ParseUntilBlocked() was supposed to ensure we don't come "
+                 "here when scripts are executing.");
+      MOZ_ASSERT(!aTokenizer || mExecutor->IsInFlushLoop(),
+                 "How are we here if "
+                 "RunFlushLoop() didn't call ParseUntilBlocked() or we're not "
+                 "committing to an encoding?");
+      mSpeculations.RemoveElementAt(0);
+      if (mSpeculations.IsEmpty()) {
+        if (mMode == VIEW_SOURCE_HTML) {
+          mTokenizer->SetViewSourceOpSink(mExecutor->GetStage());
+        } else {
+          mTreeBuilder->SetOpSink(mExecutor);
+          auto r = mTreeBuilder->Flush(true);
+          if (r.isErr()) {
+            mExecutor->MarkAsBroken(r.unwrapErr());
+            return;
+          }
+          mTreeBuilder->SetOpSink(mExecutor->GetStage());
+        }
+        mExecutor->StartReadingFromStage();
+        mSpeculating = false;
+      }
+    }
+    nsCOMPtr<nsIRunnable> event = new nsHtml5StreamParserContinuation(this);
+    if (NS_FAILED(mEventTarget->Dispatch(event, nsIThread::DISPATCH_NORMAL))) {
+      NS_WARNING("Failed to dispatch nsHtml5StreamParserContinuation");
+    }
+#ifdef DEBUG
+    mAtomTable.SetPermittedLookupEventTarget(mEventTarget);
+#endif
+  }
+}
+
+void nsHtml5StreamParser::ContinueAfterFailedCharsetSwitch() {
+  MOZ_ASSERT(NS_IsMainThread(), "Wrong thread!");
+  nsCOMPtr<nsIRunnable> event = new nsHtml5StreamParserContinuation(this);
+  if (NS_FAILED(mEventTarget->Dispatch(event, nsIThread::DISPATCH_NORMAL))) {
+    NS_WARNING("Failed to dispatch nsHtml5StreamParserContinuation");
+  }
+}
+
+class nsHtml5TimerKungFu : public Runnable {
+ private:
+  nsHtml5StreamParserPtr mStreamParser;
+
+ public:
+  explicit nsHtml5TimerKungFu(nsHtml5StreamParser* aStreamParser)
+      : Runnable("nsHtml5TimerKungFu"), mStreamParser(aStreamParser) {}
+  NS_IMETHOD Run() override {
+    mozilla::MutexAutoLock flushTimerLock(mStreamParser->mFlushTimerMutex);
+    if (mStreamParser->mFlushTimer) {
+      mStreamParser->mFlushTimer->Cancel();
+      mStreamParser->mFlushTimer = nullptr;
+    }
+    return NS_OK;
+  }
+};
+
+void nsHtml5StreamParser::DropTimer() {
+  MOZ_ASSERT(NS_IsMainThread(), "Wrong thread!");
+  mozilla::MutexAutoLock flushTimerLock(mFlushTimerMutex);
+  if (mFlushTimer) {
+    nsCOMPtr<nsIRunnable> event = new nsHtml5TimerKungFu(this);
+    if (NS_FAILED(mEventTarget->Dispatch(event, nsIThread::DISPATCH_NORMAL))) {
+      NS_WARNING("Failed to dispatch TimerKungFu event");
+    }
+  }
+}
+
+void nsHtml5StreamParser::TimerCallback(nsITimer* aTimer, void* aClosure) {
+  (static_cast<nsHtml5StreamParser*>(aClosure))->TimerFlush();
+}
+
+void nsHtml5StreamParser::TimerFlush() {
+  MOZ_ASSERT(IsParserThread(), "Wrong thread!");
+  mozilla::MutexAutoLock autoLock(mTokenizerMutex);
+
+  MOZ_ASSERT(!mSpeculating, "Flush timer fired while speculating.");
+
+  mFlushTimerArmed = false;
+
+  mFlushTimerEverFired = true;
+
+  if (IsTerminatedOrInterrupted()) {
+    return;
+  }
+
+  if (mMode == VIEW_SOURCE_HTML || mMode == VIEW_SOURCE_XML) {
+    auto r = mTreeBuilder->Flush();  
+    if (r.isErr()) {
+      MarkAsBroken(r.unwrapErr());
+      return;
+    }
+    r = mTokenizer->FlushViewSource();
+    if (r.isErr()) {
+      MarkAsBroken(r.unwrapErr());
+      return;
+    }
+    if (r.unwrap()) {
+      nsCOMPtr<nsIRunnable> runnable(mExecutorFlusher);
+      if (NS_FAILED(DispatchToMain(runnable.forget()))) {
+        NS_WARNING("failed to dispatch executor flush event");
+      }
+    }
+  } else {
+    auto r = mTreeBuilder->Flush(true);
+    if (r.isErr()) {
+      MarkAsBroken(r.unwrapErr());
+      return;
+    }
+    if (r.unwrap()) {
+      nsCOMPtr<nsIRunnable> runnable(mExecutorFlusher);
+      if (NS_FAILED(DispatchToMain(runnable.forget()))) {
+        NS_WARNING("failed to dispatch executor flush event");
+      }
+    }
+  }
+}
+
+void nsHtml5StreamParser::MarkAsBroken(nsresult aRv) {
+  MOZ_ASSERT(IsParserThread(), "Wrong thread!");
+  mTokenizerMutex.AssertCurrentThreadOwns();
+
+  Terminate();
+  mTreeBuilder->MarkAsBroken(aRv);
+  auto r = mTreeBuilder->Flush(false);
+  if (r.isOk()) {
+    MOZ_ASSERT(r.unwrap(), "Should have had the markAsBroken op!");
+  } else {
+    MOZ_CRASH("OOM prevents propagation of OOM state");
+  }
+  nsCOMPtr<nsIRunnable> runnable(mExecutorFlusher);
+  if (NS_FAILED(DispatchToMain(runnable.forget()))) {
+    NS_WARNING("failed to dispatch executor flush event");
+  }
+}
+
+nsresult nsHtml5StreamParser::DispatchToMain(
+    already_AddRefed<nsIRunnable> aRunnable) {
+  return SchedulerGroup::Dispatch(std::move(aRunnable));
+}

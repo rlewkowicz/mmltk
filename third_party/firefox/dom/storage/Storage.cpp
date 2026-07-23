@@ -1,0 +1,146 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Storage.h"
+
+#include "StorageNotifierService.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/Services.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StorageAccess.h"
+#include "mozilla/dom/StorageBinding.h"
+#include "mozilla/dom/StorageEvent.h"
+#include "mozilla/dom/StorageEventBinding.h"
+#include "nsIObserverService.h"
+#include "nsPIDOMWindow.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(Storage, mWindow, mPrincipal,
+                                      mStoragePrincipal)
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(Storage)
+NS_IMPL_CYCLE_COLLECTING_RELEASE_WITH_LAST_RELEASE(Storage, LastRelease())
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Storage)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+Storage::Storage(nsPIDOMWindowInner* aWindow, nsIPrincipal* aPrincipal,
+                 nsIPrincipal* aStoragePrincipal)
+    : mWindow(aWindow),
+      mPrincipal(aPrincipal),
+      mStoragePrincipal(aStoragePrincipal),
+      mPrivateBrowsing(false),
+      mPrivateBrowsingOrLess(false) {
+  MOZ_ASSERT(aPrincipal);
+
+  if (mPrincipal->IsSystemPrincipal()) {
+    mPrivateBrowsing = false;
+    mPrivateBrowsingOrLess = false;
+  } else if (mWindow) {
+    uint32_t rejectedReason = 0;
+    StorageAccess access = StorageAllowedForWindow(mWindow, &rejectedReason);
+
+    mPrivateBrowsing = access == StorageAccess::ePrivateBrowsing;
+    mPrivateBrowsingOrLess = access <= StorageAccess::ePrivateBrowsing;
+  }
+}
+
+Storage::~Storage() = default;
+
+bool Storage::StoragePrefIsEnabled() {
+  return StaticPrefs::dom_storage_enabled();
+}
+
+int64_t Storage::GetSnapshotUsage(nsIPrincipal& aSubjectPrincipal,
+                                  ErrorResult& aRv) {
+  aRv.Throw(NS_ERROR_NOT_IMPLEMENTED);
+  return 0;
+}
+
+bool Storage::CanUseStorage(nsIPrincipal& aSubjectPrincipal) {
+  if (!StoragePrefIsEnabled()) {
+    return false;
+  }
+
+  return aSubjectPrincipal.Subsumes(mPrincipal);
+}
+
+JSObject* Storage::WrapObject(JSContext* aCx,
+                              JS::Handle<JSObject*> aGivenProto) {
+  return Storage_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+namespace {
+
+class StorageNotifierRunnable : public Runnable {
+ public:
+  StorageNotifierRunnable(nsISupports* aSubject, const char16_t* aStorageType,
+                          bool aPrivateBrowsing)
+      : Runnable("StorageNotifierRunnable"),
+        mSubject(aSubject),
+        mStorageType(aStorageType),
+        mPrivateBrowsing(aPrivateBrowsing) {}
+
+  NS_IMETHOD
+  Run() override {
+    nsCOMPtr<nsIObserverService> observerService =
+        mozilla::services::GetObserverService();
+    if (observerService) {
+      observerService->NotifyObservers(mSubject,
+                                       mPrivateBrowsing
+                                           ? "dom-private-storage2-changed"
+                                           : "dom-storage2-changed",
+                                       mStorageType);
+    }
+    return NS_OK;
+  }
+
+ private:
+  nsCOMPtr<nsISupports> mSubject;
+  const char16_t* mStorageType;
+  const bool mPrivateBrowsing;
+};
+
+}  
+
+void Storage::NotifyChange(Storage* aStorage, nsIPrincipal* aPrincipal,
+                           const nsAString& aKey, const nsAString& aOldValue,
+                           const nsAString& aNewValue,
+                           const char16_t* aStorageType,
+                           const nsAString& aDocumentURI, bool aIsPrivate,
+                           bool aImmediateDispatch) {
+  StorageEventInit dict;
+  dict.mBubbles = false;
+  dict.mCancelable = false;
+  dict.mKey = aKey;
+  dict.mNewValue = aNewValue;
+  dict.mOldValue = aOldValue;
+  dict.mStorageArea = aStorage;
+  dict.mUrl = aDocumentURI;
+
+  RefPtr<StorageEvent> event =
+      StorageEvent::Constructor(nullptr, u"storage"_ns, dict);
+
+  event->SetPrincipal(aPrincipal);
+
+  StorageNotifierService::Broadcast(event, aStorageType, aIsPrivate,
+                                    aImmediateDispatch);
+
+
+  RefPtr<StorageNotifierRunnable> r =
+      new StorageNotifierRunnable(event, aStorageType, aIsPrivate);
+
+  if (aImmediateDispatch) {
+    (void)r->Run();
+  } else {
+    SchedulerGroup::Dispatch(r.forget());
+  }
+}
+
+}  

@@ -1,0 +1,51 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+*
+*   Copyright (C) 2009-2015, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+******************************************************************************
+*
+*  FILE NAME : icuplugimp.h
+* 
+*  Internal functions for the ICU plugin system
+*
+*   Date         Name        Description
+*   10/29/2009   sl          New.
+******************************************************************************
+*/
+
+
+#ifndef ICUPLUGIMP_H
+#define ICUPLUGIMP_H
+
+#include "unicode/icuplug.h"
+
+#if UCONFIG_ENABLE_PLUGINS
+
+
+U_CAPI void * U_EXPORT2
+uplug_openLibrary(const char *libName, UErrorCode *status);
+
+U_CAPI void U_EXPORT2
+uplug_closeLibrary(void *lib, UErrorCode *status);
+
+U_CAPI  char * U_EXPORT2
+uplug_findLibrary(void *lib, UErrorCode *status);
+
+
+
+U_CAPI void U_EXPORT2
+uplug_init(UErrorCode *status);
+
+U_CAPI UPlugData* U_EXPORT2
+uplug_getPlugInternal(int32_t n);
+
+U_CAPI const char* U_EXPORT2
+uplug_getPluginFile(void);
+
+
+#endif
+
+#endif

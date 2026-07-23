@@ -1,0 +1,207 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsIFormControl_h_
+#define nsIFormControl_h_
+
+#include "mozilla/EventForwards.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "nsISupports.h"
+
+class nsINode;
+namespace mozilla {
+class PresState;
+namespace dom {
+class Element;
+class EventTarget;
+class FormData;
+class HTMLFieldSetElement;
+class HTMLFormElement;
+}  
+}  
+
+constexpr uint8_t kFormControlButtonElementMask = 0x40;  
+constexpr uint8_t kFormControlInputElementMask = 0x80;   
+
+enum class FormControlType : uint8_t {
+  Fieldset = 1,
+  Output,
+  Select,
+  Textarea,
+  Object,
+  FormAssociatedCustomElement,
+
+  LastWithoutSubtypes = FormAssociatedCustomElement,
+
+  ButtonButton = kFormControlButtonElementMask + 1,
+  ButtonReset,
+  ButtonSubmit,
+  LastButtonElement = ButtonSubmit,
+
+  InputButton = kFormControlInputElementMask + 1,
+  InputCheckbox,
+  InputColor,
+  InputDate,
+  InputEmail,
+  InputFile,
+  InputHidden,
+  InputReset,
+  InputImage,
+  InputMonth,
+  InputNumber,
+  InputPassword,
+  InputRadio,
+  InputSearch,
+  InputSubmit,
+  InputTel,
+  InputText,
+  InputTime,
+  InputUrl,
+  InputRange,
+  InputWeek,
+  InputDatetimeLocal,
+  LastInputElement = InputDatetimeLocal,
+};
+
+static_assert(uint8_t(FormControlType::LastWithoutSubtypes) <
+                  kFormControlButtonElementMask,
+              "Too many FormControlsTypes without sub-types");
+static_assert(uint8_t(FormControlType::LastButtonElement) <
+                  kFormControlInputElementMask,
+              "Too many ButtonElementTypes");
+static_assert(uint32_t(FormControlType::LastInputElement) < (1 << 8),
+              "Too many form control types");
+
+#define NS_IFORMCONTROL_IID \
+  {0x4b89980c, 0x4dcd, 0x428f, {0xb7, 0xad, 0x43, 0x5b, 0x93, 0x29, 0x79, 0xec}}
+
+class nsIFormControl : public nsISupports {
+ public:
+  nsIFormControl(FormControlType aType) : mType(aType) {}
+
+  NS_INLINE_DECL_STATIC_IID(NS_IFORMCONTROL_IID)
+
+  static nsIFormControl* FromEventTarget(mozilla::dom::EventTarget* aTarget);
+  static nsIFormControl* FromEventTargetOrNull(
+      mozilla::dom::EventTarget* aTarget);
+  static const nsIFormControl* FromEventTarget(
+      const mozilla::dom::EventTarget* aTarget);
+  static const nsIFormControl* FromEventTargetOrNull(
+      const mozilla::dom::EventTarget* aTarget);
+
+  static nsIFormControl* FromNode(nsINode* aNode);
+  static nsIFormControl* FromNodeOrNull(nsINode* aNode);
+  static const nsIFormControl* FromNode(const nsINode* aNode);
+  static const nsIFormControl* FromNodeOrNull(const nsINode* aNode);
+
+  virtual mozilla::dom::HTMLFieldSetElement* GetFieldSet() = 0;
+
+  virtual mozilla::dom::Element* GetFormForBindings() const = 0;
+
+  virtual mozilla::dom::HTMLFormElement* GetFormInternal() const = 0;
+
+  virtual void SetForm(mozilla::dom::HTMLFormElement* aForm) = 0;
+
+  virtual void ClearForm(bool aRemoveFromForm, bool aUnbindOrDelete) = 0;
+
+  FormControlType ControlType() const { return mType; }
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD Reset() = 0;
+
+  NS_IMETHOD
+  SubmitNamesValues(mozilla::dom::FormData* aFormData) = 0;
+
+  inline bool IsSubmitControl() const;
+
+  inline bool IsTextControl(bool aExcludePassword) const;
+
+  inline bool IsSingleLineTextControl(bool aExcludePassword) const;
+
+  inline bool IsSubmittableControl() const;
+
+  inline bool IsConceptButton() const;
+
+  inline bool IsButtonControl() const;
+
+  inline bool AllowDraggableChildren() const;
+
+  virtual int32_t GetParserInsertedControlNumberForStateKey() const {
+    return -1;
+  };
+
+ protected:
+  inline static bool IsSingleLineTextControl(bool aExcludePassword,
+                                             FormControlType);
+
+  inline static bool IsButtonElement(FormControlType aType) {
+    return uint8_t(aType) & kFormControlButtonElementMask;
+  }
+
+  inline static bool IsInputElement(FormControlType aType) {
+    return uint8_t(aType) & kFormControlInputElementMask;
+  }
+
+  FormControlType mType;
+};
+
+bool nsIFormControl::IsSubmitControl() const {
+  FormControlType type = ControlType();
+  return type == FormControlType::InputSubmit ||
+         type == FormControlType::InputImage ||
+         type == FormControlType::ButtonSubmit;
+}
+
+bool nsIFormControl::IsTextControl(bool aExcludePassword) const {
+  FormControlType type = ControlType();
+  return type == FormControlType::Textarea ||
+         IsSingleLineTextControl(aExcludePassword, type);
+}
+
+bool nsIFormControl::IsSingleLineTextControl(bool aExcludePassword) const {
+  return IsSingleLineTextControl(aExcludePassword, ControlType());
+}
+
+bool nsIFormControl::IsSingleLineTextControl(bool aExcludePassword,
+                                             FormControlType aType) {
+  switch (aType) {
+    case FormControlType::InputText:
+    case FormControlType::InputEmail:
+    case FormControlType::InputSearch:
+    case FormControlType::InputTel:
+    case FormControlType::InputUrl:
+    case FormControlType::InputNumber:
+    case FormControlType::InputMonth:
+    case FormControlType::InputWeek:
+      return true;
+    case FormControlType::InputPassword:
+      return !aExcludePassword;
+    default:
+      return false;
+  }
+}
+
+bool nsIFormControl::IsSubmittableControl() const {
+  auto type = ControlType();
+  return type == FormControlType::Object || type == FormControlType::Textarea ||
+         type == FormControlType::Select || IsButtonElement(type) ||
+         IsInputElement(type);
+}
+
+bool nsIFormControl::IsConceptButton() const {
+  auto type = ControlType();
+  return IsSubmitControl() || type == FormControlType::InputReset ||
+         type == FormControlType::InputButton || IsButtonElement(type);
+}
+
+bool nsIFormControl::IsButtonControl() const {
+  return IsConceptButton() && (!GetFormInternal() || !IsSubmitControl());
+}
+
+bool nsIFormControl::AllowDraggableChildren() const {
+  auto type = ControlType();
+  return type == FormControlType::Object || type == FormControlType::Fieldset ||
+         type == FormControlType::Output ||
+         type == FormControlType::FormAssociatedCustomElement;
+}
+
+#endif /* nsIFormControl_h_ */

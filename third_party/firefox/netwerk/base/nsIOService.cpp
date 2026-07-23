@@ -1,0 +1,2349 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/DebugOnly.h"
+
+#include "nsIOService.h"
+#include "nsIProtocolHandler.h"
+#include "nsIFileProtocolHandler.h"
+#include "nscore.h"
+#include "nsIURI.h"
+#include "prprf.h"
+#include "netCore.h"
+#include "nsIObserverService.h"
+#include "nsXPCOM.h"
+#include "nsIProxiedProtocolHandler.h"
+#include "nsIProxyInfo.h"
+#include "nsDNSService2.h"
+#include "nsEscape.h"
+#include "nsNetUtil.h"
+#include "nsNetCID.h"
+#include "nsCRT.h"
+#include "nsSimpleNestedURI.h"
+#include "nsSocketTransport2.h"
+#include "nsTArray.h"
+#include "nsIUploadChannel2.h"
+#include "nsXULAppAPI.h"
+#include "nsIProtocolProxyCallback.h"
+#include "nsICancelable.h"
+#include "nsINetworkLinkService.h"
+#include "nsAsyncRedirectVerifyHelper.h"
+#include "nsURLHelper.h"
+#include "nsIProtocolProxyService2.h"
+#include "MainThreadUtils.h"
+#include "nsINode.h"
+#include "nsIWebTransport.h"
+#include "nsIWidget.h"
+#include "nsThreadUtils.h"
+#include "WebTransportSessionProxy.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/Components.h"
+#include "mozilla/LoadInfo.h"
+#include "mozilla/net/NeckoCommon.h"
+#include "mozilla/Services.h"
+#include "mozilla/net/DNS.h"
+#include "mozilla/ipc/URIUtils.h"
+#include "mozilla/net/CacheControlParser.h"
+#include "mozilla/net/NeckoChild.h"
+#include "mozilla/net/NeckoParent.h"
+#include "mozilla/dom/ChromeUtilsBinding.h"
+#include "mozilla/dom/ClientInfo.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/nsHTTPSOnlyUtils.h"
+#include "mozilla/dom/ServiceWorkerDescriptor.h"
+#include "mozilla/net/CaptivePortalService.h"
+#include "mozilla/net/NetworkConnectivityService.h"
+#include "mozilla/net/SocketProcessHost.h"
+#include "mozilla/net/SocketProcessParent.h"
+#include "mozilla/net/SSLTokensCache.h"
+#include "mozilla/StoragePrincipalHelper.h"
+#include "SerializedLoadContext.h"
+#include "nsContentSecurityManager.h"
+#include "nsContentUtils.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/StaticPrefs_security.h"
+#include "nsNSSComponent.h"
+#include "IPv4Parser.h"
+#include "ssl.h"
+#include "StaticComponents.h"
+#include "SuspendableChannelWrapper.h"
+
+
+namespace mozilla {
+namespace net {
+
+using mozilla::Maybe;
+using mozilla::dom::ClientInfo;
+using mozilla::dom::ServiceWorkerDescriptor;
+
+#define PORT_PREF_PREFIX "network.security.ports."
+#define PORT_PREF(x) PORT_PREF_PREFIX x
+#define MANAGE_OFFLINE_STATUS_PREF "network.manage-offline-status"
+
+#define NECKO_BUFFER_CACHE_COUNT_PREF "network.buffer.cache.count"
+#define NECKO_BUFFER_CACHE_SIZE_PREF "network.buffer.cache.size"
+#define NETWORK_CAPTIVE_PORTAL_PREF "network.captive-portal-service.enabled"
+#define WEBRTC_PREF_PREFIX "media.peerconnection."
+#define NETWORK_DNS_PREF "network.dns."
+#define FORCE_EXTERNAL_PREF_PREFIX "network.protocol-handler.external."
+#define PREF_LNA_IP_ADDR_SPACE_PUBLIC \
+  "network.lna.address_space.public.override"
+#define PREF_LNA_IP_ADDR_SPACE_PRIVATE \
+  "network.lna.address_space.private.override"
+#define PREF_LNA_IP_ADDR_SPACE_LOCAL "network.lna.address_space.local.override"
+#define PREF_LNA_SKIP_DOMAINS "network.lna.skip-domains"
+
+nsIOService* gIOService;
+static bool gCaptivePortalEnabled = false;
+static LazyLogModule gIOServiceLog("nsIOService");
+#undef LOG
+#define LOG(args) MOZ_LOG(gIOServiceLog, LogLevel::Debug, args)
+
+
+int16_t gBadPortList[] = {
+    1,      
+    7,      
+    9,      
+    11,     
+    13,     
+    15,     
+    17,     
+    19,     
+    20,     
+    21,     
+    22,     
+    23,     
+    25,     
+    37,     
+    42,     
+    43,     
+    53,     
+    69,     
+    77,     
+    79,     
+    87,     
+    95,     
+    101,    
+    102,    
+    103,    
+    104,    
+    109,    
+    110,    
+    111,    
+    113,    
+    115,    
+    117,    
+    119,    
+    123,    
+    135,    
+    137,    
+    139,    
+    143,    
+    161,    
+    179,    
+    389,    
+    427,    
+    465,    
+    512,    
+    513,    
+    514,    
+    515,    
+    526,    
+    530,    
+    531,    
+    532,    
+    540,    
+    548,    
+    554,    
+    556,    
+    563,    
+    587,    
+    601,    
+    636,    
+    989,    
+    990,    
+    993,    
+    995,    
+    1719,   
+    1720,   
+    1723,   
+    2049,   
+    3659,   
+    4045,   
+    4190,   
+    5060,   
+    5061,   
+    6000,   
+    6566,   
+    6665,   
+    6666,   
+    6667,   
+    6668,   
+    6669,   
+    6679,   
+    6697,   
+    10080,  
+    0,      
+};
+
+static const char kProfileChangeNetTeardownTopic[] =
+    "profile-change-net-teardown";
+static const char kProfileChangeNetRestoreTopic[] =
+    "profile-change-net-restore";
+static const char kProfileDoChange[] = "profile-do-change";
+
+uint32_t nsIOService::gDefaultSegmentSize = 4096;
+uint32_t nsIOService::gDefaultSegmentCount = 24;
+
+uint32_t nsIOService::sSocketProcessCrashedCount = 0;
+
+
+nsIOService::nsIOService()
+    : mLastOfflineStateChange(PR_IntervalNow()),
+      mLastConnectivityChange(PR_IntervalNow()),
+      mLastNetworkLinkChange(PR_IntervalNow()) {}
+
+static const char* gCallbackPrefs[] = {
+    PORT_PREF_PREFIX,
+    MANAGE_OFFLINE_STATUS_PREF,
+    NECKO_BUFFER_CACHE_COUNT_PREF,
+    NECKO_BUFFER_CACHE_SIZE_PREF,
+    NETWORK_CAPTIVE_PORTAL_PREF,
+    FORCE_EXTERNAL_PREF_PREFIX,
+    SIMPLE_URI_SCHEMES_PREF,
+    PREF_LNA_IP_ADDR_SPACE_PUBLIC,
+    PREF_LNA_IP_ADDR_SPACE_PRIVATE,
+    PREF_LNA_IP_ADDR_SPACE_LOCAL,
+    PREF_LNA_SKIP_DOMAINS,
+    nullptr,
+};
+
+static const char* gCallbackPrefsForSocketProcess[] = {
+    WEBRTC_PREF_PREFIX,
+    NETWORK_DNS_PREF,
+    "media.webrtc.enable_pq_hybrid_kex",
+    "media.webrtc.send_mlkem_keyshare",
+    "network.send_ODA_to_content_directly",
+    "network.trr.",
+    "doh-rollout.",
+    "network.dns.disableIPv6",
+    "network.offline-mirrors-connectivity",
+    "network.disable-localhost-when-offline",
+    "network.proxy.parse_pac_on_socket_process",
+    "network.proxy.allow_hijacking_localhost",
+    "network.proxy.testing_localhost_is_secure_when_hijacked",
+    "network.connectivity-service.",
+    "network.captive-portal-service.testMode",
+    "network.socket.ip_addr_any.disabled",
+    "network.socket.attach_mock_network_layer",
+    "network.lna.enabled",
+    "network.lna.blocking",
+    "network.lna.address_space.private.override",
+    "network.lna.address_space.public.override",
+    "network.lna.websocket.enabled",
+    "network.lna.local-network-to-localhost.skip-checks",
+    "network.socket.forcePort",
+    nullptr,
+};
+
+static const char* gCallbackSecurityPrefs[] = {
+    "security.tls.version.min",
+    "security.tls.version.max",
+    "security.tls.version.enable-deprecated",
+    "security.tls.hello_downgrade_check",
+    "security.ssl.require_safe_negotiation",
+    "security.ssl.enable_false_start",
+    "security.ssl.enable_alpn",
+    "security.tls.enable_0rtt_data",
+    "security.ssl.disable_session_identifiers",
+    "security.tls.enable_post_handshake_auth",
+    "security.tls.enable_delegated_credentials",
+    nullptr,
+};
+
+nsresult nsIOService::Init() {
+  SSLTokensCache::Init();
+
+  InitializeCaptivePortalService();
+
+  for (int i = 0; gBadPortList[i]; i++) {
+    MOZ_PUSH_IGNORE_THREAD_SAFETY
+    mRestrictedPortList.AppendElement(gBadPortList[i]);
+    MOZ_POP_THREAD_SAFETY
+  }
+
+  Preferences::RegisterPrefixCallbacks(nsIOService::PrefsChanged,
+                                       gCallbackPrefs, this);
+  PrefsChanged();
+
+  mSocketProcessTopicBlockedList.Insert(
+      nsLiteralCString(NS_XPCOM_WILL_SHUTDOWN_OBSERVER_ID));
+  mSocketProcessTopicBlockedList.Insert(
+      nsLiteralCString(NS_XPCOM_SHUTDOWN_OBSERVER_ID));
+  mSocketProcessTopicBlockedList.Insert("xpcom-shutdown-threads"_ns);
+  mSocketProcessTopicBlockedList.Insert("profile-do-change"_ns);
+  mSocketProcessTopicBlockedList.Insert("network:socket-process-crashed"_ns);
+
+  mObserverService = services::GetObserverService();
+  MOZ_ALWAYS_SUCCEEDS(AddObserver(this, kProfileChangeNetTeardownTopic, true));
+  MOZ_ALWAYS_SUCCEEDS(AddObserver(this, kProfileChangeNetRestoreTopic, true));
+  MOZ_ALWAYS_SUCCEEDS(AddObserver(this, kProfileDoChange, true));
+  MOZ_ALWAYS_SUCCEEDS(AddObserver(this, NS_XPCOM_SHUTDOWN_OBSERVER_ID, true));
+  MOZ_ALWAYS_SUCCEEDS(AddObserver(this, NS_NETWORK_LINK_TOPIC, true));
+  MOZ_ALWAYS_SUCCEEDS(AddObserver(this, NS_NETWORK_ID_CHANGED_TOPIC, true));
+  MOZ_ALWAYS_SUCCEEDS(AddObserver(this, NS_WIDGET_WAKE_OBSERVER_TOPIC, true));
+
+  if (XRE_IsParentProcess()) {
+    AddObserver(this, "profile-initial-state", true);
+    AddObserver(this, NS_WIDGET_SLEEP_OBSERVER_TOPIC, true);
+  }
+
+  if (IsSocketProcessChild()) {
+    Preferences::RegisterCallbacks(nsIOService::OnTLSPrefChange,
+                                   gCallbackSecurityPrefs, this);
+  }
+
+  gIOService = this;
+
+  InitializeNetworkLinkService();
+  InitializeProtocolProxyService();
+  SetOffline(false);
+
+  NS_DispatchToCurrentThread(NS_NewRunnableFunction(
+      __func__, []() { RefPtr<nsIDNSService> dns = GetOrInitDNSService(); }));
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::AddObserver(nsIObserver* aObserver, const char* aTopic,
+                         bool aOwnsWeak) {
+  if (!mObserverService) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsresult rv = mObserverService->AddObserver(aObserver, aTopic, aOwnsWeak);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (!XRE_IsParentProcess()) {
+    return NS_OK;
+  }
+
+  nsAutoCString topic(aTopic);
+  if (SameCOMIdentity(aObserver, static_cast<nsIObserver*>(this))) {
+    mIOServiceTopicList.Insert(topic);
+    return NS_OK;
+  }
+
+  if (!UseSocketProcess()) {
+    return NS_OK;
+  }
+
+  if (mSocketProcessTopicBlockedList.Contains(topic)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (mObserverTopicForSocketProcess.Contains(topic)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mObserverTopicForSocketProcess.Insert(topic);
+
+  if (mIOServiceTopicList.Contains(topic)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  return mObserverService->AddObserver(this, aTopic, true);
+}
+
+NS_IMETHODIMP
+nsIOService::RemoveObserver(nsIObserver* aObserver, const char* aTopic) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+nsIOService::EnumerateObservers(const char* aTopic,
+                                nsISimpleEnumerator** anEnumerator) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP nsIOService::NotifyObservers(nsISupports* aSubject,
+                                           const char* aTopic,
+                                           const char16_t* aSomeData) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+nsIOService::~nsIOService() {
+  if (gIOService) {
+    MOZ_ASSERT(gIOService == this);
+    gIOService = nullptr;
+  }
+}
+
+
+void nsIOService::OnTLSPrefChange(const char* aPref, void* aSelf) {
+  MOZ_ASSERT(IsSocketProcessChild());
+
+  if (!EnsureNSSInitializedChromeOrContent()) {
+    LOG(("NSS not initialized."));
+    return;
+  }
+
+  nsAutoCString pref(aPref);
+  if (HandleTLSPrefChange(pref)) {
+    LOG(("HandleTLSPrefChange done"));
+  }
+}
+
+nsresult nsIOService::InitializeCaptivePortalService() {
+  if (XRE_GetProcessType() != GeckoProcessType_Default) {
+    return NS_OK;
+  }
+
+  mCaptivePortalService = mozilla::components::CaptivePortal::Service();
+  if (mCaptivePortalService) {
+    static_cast<CaptivePortalService*>(mCaptivePortalService.get())
+        ->Initialize();
+  }
+
+  RefPtr<NetworkConnectivityService> ncs =
+      NetworkConnectivityService::GetSingleton();
+
+  return NS_OK;
+}
+
+nsresult nsIOService::InitializeSocketTransportService() {
+  nsresult rv = NS_OK;
+
+  if (AppShutdown::IsInOrBeyond(ShutdownPhase::AppShutdownConfirmed)) {
+    LOG(
+        ("nsIOService aborting InitializeSocketTransportService because of app "
+         "shutdown"));
+    return NS_ERROR_ILLEGAL_DURING_SHUTDOWN;
+  }
+
+  if (!mSocketTransportService) {
+    mSocketTransportService =
+        mozilla::components::SocketTransport::Service(&rv);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("failed to get socket transport service");
+    }
+  }
+
+  if (mSocketTransportService) {
+    rv = mSocketTransportService->Init();
+    NS_ASSERTION(NS_SUCCEEDED(rv), "socket transport service init failed");
+    mSocketTransportService->SetOffline(false);
+  }
+
+  return rv;
+}
+
+nsresult nsIOService::InitializeNetworkLinkService() {
+  nsresult rv = NS_OK;
+
+  if (mNetworkLinkServiceInitialized) return rv;
+
+  if (!NS_IsMainThread()) {
+    NS_WARNING("Network link service should be created on main thread");
+    return NS_ERROR_FAILURE;
+  }
+
+  if (!XRE_IsParentProcess()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  mNetworkLinkService = do_GetService(NS_NETWORK_LINK_SERVICE_CONTRACTID, &rv);
+
+  if (mNetworkLinkService) {
+    mNetworkLinkServiceInitialized = true;
+  }
+
+  OnNetworkLinkEvent(NS_NETWORK_LINK_DATA_UNKNOWN);
+
+  return rv;
+}
+
+nsresult nsIOService::InitializeProtocolProxyService() {
+  nsresult rv = NS_OK;
+
+  if (XRE_IsParentProcess()) {
+    (void)mozilla::components::ProtocolProxy::Service(&rv);
+  }
+
+  return rv;
+}
+
+already_AddRefed<nsIOService> nsIOService::GetInstance() {
+  if (!gIOService) {
+    RefPtr<nsIOService> ios = new nsIOService();
+    if (NS_SUCCEEDED(ios->Init())) {
+      MOZ_ASSERT(gIOService == ios.get());
+      return ios.forget();
+    }
+  }
+  return do_AddRef(gIOService);
+}
+
+class SocketProcessListenerProxy : public SocketProcessHost::Listener {
+ public:
+  SocketProcessListenerProxy() = default;
+  void OnProcessLaunchComplete(SocketProcessHost* aHost, bool aSucceeded) {
+    if (!gIOService) {
+      return;
+    }
+
+    gIOService->OnProcessLaunchComplete(aHost, aSucceeded);
+  }
+
+  void OnProcessUnexpectedShutdown(SocketProcessHost* aHost) {
+    if (!gIOService) {
+      return;
+    }
+
+    gIOService->OnProcessUnexpectedShutdown(aHost);
+  }
+};
+
+bool nsIOService::TooManySocketProcessCrash() {
+  return sSocketProcessCrashedCount >=
+         StaticPrefs::network_max_socket_process_failed_count();
+}
+
+void nsIOService::IncreaseSocketProcessCrashCount() {
+  MOZ_ASSERT(IsNeckoChild());
+  sSocketProcessCrashedCount++;
+}
+
+nsresult nsIOService::LaunchSocketProcess() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (XRE_GetProcessType() != GeckoProcessType_Default) {
+    return NS_OK;
+  }
+
+  if (AppShutdown::IsInOrBeyond(ShutdownPhase::AppShutdownConfirmed)) {
+    return NS_OK;
+  }
+
+  if (mSocketProcess) {
+    return NS_OK;
+  }
+
+  if (PR_GetEnv("MOZ_DISABLE_SOCKET_PROCESS")) {
+    LOG(("nsIOService skipping LaunchSocketProcess because of the env"));
+    return NS_OK;
+  }
+
+  if (!StaticPrefs::network_process_enabled()) {
+    LOG(("nsIOService skipping LaunchSocketProcess because of the pref"));
+    return NS_OK;
+  }
+
+  Preferences::RegisterPrefixCallbacks(
+      nsIOService::NotifySocketProcessPrefsChanged,
+      gCallbackPrefsForSocketProcess, this);
+
+  mSocketProcess = new SocketProcessHost(new SocketProcessListenerProxy());
+  LOG(("nsIOService::LaunchSocketProcess"));
+  if (!mSocketProcess->Launch()) {
+    NS_WARNING("Failed to launch socket process!!");
+    DestroySocketProcess();
+    return NS_ERROR_FAILURE;
+  }
+
+  return NS_OK;
+}
+
+void nsIOService::DestroySocketProcess() {
+  LOG(("nsIOService::DestroySocketProcess"));
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (XRE_GetProcessType() != GeckoProcessType_Default || !mSocketProcess) {
+    return;
+  }
+
+  Preferences::UnregisterPrefixCallbacks(
+      nsIOService::NotifySocketProcessPrefsChanged,
+      gCallbackPrefsForSocketProcess, this);
+
+  mSocketProcess->Shutdown();
+  mSocketProcess = nullptr;
+}
+
+bool nsIOService::SocketProcessReady() {
+  return mSocketProcess && mSocketProcess->IsConnected();
+}
+
+static bool sUseSocketProcess = false;
+static bool sUseSocketProcessChecked = false;
+
+bool nsIOService::UseSocketProcess(bool aCheckAgain) {
+  if (sUseSocketProcessChecked && !aCheckAgain) {
+    return sUseSocketProcess;
+  }
+
+  sUseSocketProcessChecked = true;
+  sUseSocketProcess = false;
+
+  if (PR_GetEnv("MOZ_DISABLE_SOCKET_PROCESS")) {
+    return sUseSocketProcess;
+  }
+
+  if (TooManySocketProcessCrash()) {
+    LOG(("TooManySocketProcessCrash"));
+    return sUseSocketProcess;
+  }
+
+  if (PR_GetEnv("MOZ_FORCE_USE_SOCKET_PROCESS")) {
+    sUseSocketProcess = true;
+    return sUseSocketProcess;
+  }
+
+  if (StaticPrefs::network_process_enabled()) {
+    sUseSocketProcess =
+        StaticPrefs::network_http_network_access_on_socket_process_enabled();
+  }
+  return sUseSocketProcess;
+}
+
+void nsIOService::NotifySocketProcessPrefsChanged(const char* aName,
+                                                  void* aSelf) {
+  static_cast<nsIOService*>(aSelf)->NotifySocketProcessPrefsChanged(aName);
+}
+
+void nsIOService::NotifySocketProcessPrefsChanged(const char* aName) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!XRE_IsParentProcess()) {
+    return;
+  }
+
+  if (!StaticPrefs::network_process_enabled()) {
+    return;
+  }
+
+  dom::Pref pref(nsCString(aName),  false,
+                  false, Nothing(), Nothing());
+
+  Preferences::GetPreference(&pref, GeckoProcessType_Socket,
+                              ""_ns);
+  auto sendPrefUpdate = [pref]() {
+    (void)gIOService->mSocketProcess->GetActor()->SendPreferenceUpdate(pref);
+  };
+  CallOrWaitForSocketProcess(sendPrefUpdate);
+}
+
+void nsIOService::OnProcessLaunchComplete(SocketProcessHost* aHost,
+                                          bool aSucceeded) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  LOG(("nsIOService::OnProcessLaunchComplete aSucceeded=%d\n", aSucceeded));
+
+  mSocketProcessLaunchComplete = aSucceeded;
+
+  if (mShutdown || !SocketProcessReady() || !aSucceeded) {
+    mPendingEvents.Clear();
+    return;
+  }
+
+  if (!mPendingEvents.IsEmpty()) {
+    nsTArray<std::function<void()>> pendingEvents = std::move(mPendingEvents);
+    for (auto& func : pendingEvents) {
+      func();
+    }
+  }
+}
+
+void nsIOService::CallOrWaitForSocketProcess(
+    const std::function<void()>& aFunc) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (IsSocketProcessLaunchComplete() && SocketProcessReady()) {
+    aFunc();
+  } else {
+    mPendingEvents.AppendElement(aFunc);  
+    LaunchSocketProcess();
+  }
+}
+
+int32_t nsIOService::SocketProcessPid() {
+  if (!mSocketProcess) {
+    return 0;
+  }
+  if (SocketProcessParent* actor = mSocketProcess->GetActor()) {
+    return (int32_t)actor->OtherPid();
+  }
+  return 0;
+}
+
+bool nsIOService::IsSocketProcessLaunchComplete() {
+  MOZ_ASSERT(NS_IsMainThread());
+  return mSocketProcessLaunchComplete;
+}
+
+void nsIOService::OnProcessUnexpectedShutdown(SocketProcessHost* aHost) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  LOG(("nsIOService::OnProcessUnexpectedShutdown\n"));
+  DestroySocketProcess();
+  mPendingEvents.Clear();
+
+  if (!UseSocketProcess()) {
+    return;
+  }
+
+  sSocketProcessCrashedCount++;
+  if (TooManySocketProcessCrash()) {
+    sUseSocketProcessChecked = false;
+    DNSServiceWrapper::SwitchToBackupDNSService();
+  }
+
+  nsCOMPtr<nsIObserverService> observerService = services::GetObserverService();
+  if (observerService) {
+    (void)observerService->NotifyObservers(
+        nullptr, "network:socket-process-crashed", nullptr);
+  }
+
+  if (UseSocketProcess()) {
+    MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(
+        NewRunnableMethod("nsIOService::LaunchSocketProcess", this,
+                          &nsIOService::LaunchSocketProcess)));
+  }
+}
+
+RefPtr<MemoryReportingProcess> nsIOService::GetSocketProcessMemoryReporter() {
+  if (!StaticPrefs::network_process_enabled() || !SocketProcessReady()) {
+    return nullptr;
+  }
+
+  return new SocketProcessMemoryReporter();
+}
+
+NS_IMETHODIMP
+nsIOService::SocketProcessTelemetryPing() {
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(nsIOService, nsIIOService, nsINetUtil, nsISpeculativeConnect,
+                  nsIObserver, nsIIOServiceInternal, nsISupportsWeakReference,
+                  nsIObserverService)
+
+
+nsresult nsIOService::RecheckCaptivePortal() {
+  MOZ_ASSERT(NS_IsMainThread(), "Must be called on the main thread");
+  if (!mCaptivePortalService) {
+    return NS_OK;
+  }
+  nsCOMPtr<nsIRunnable> task = NewRunnableMethod(
+      "nsIOService::RecheckCaptivePortal", mCaptivePortalService,
+      &nsICaptivePortalService::RecheckCaptivePortal);
+  return NS_DispatchToMainThread(task);
+}
+
+nsresult nsIOService::RecheckCaptivePortalIfLocalRedirect(nsIChannel* newChan) {
+  nsresult rv;
+
+  if (!mCaptivePortalService) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  rv = newChan->GetURI(getter_AddRefs(uri));
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  nsCString host;
+  rv = uri->GetHost(host);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  NetAddr addr;
+  if (NS_SUCCEEDED(addr.InitFromString(host)) && addr.IsIPAddrLocal()) {
+    RecheckCaptivePortal();
+  }
+
+  return NS_OK;
+}
+
+nsresult nsIOService::AsyncOnChannelRedirect(
+    nsIChannel* oldChan, nsIChannel* newChan, uint32_t flags,
+    nsAsyncRedirectVerifyHelper* helper) {
+  RecheckCaptivePortalIfLocalRedirect(newChan);
+
+  nsCOMPtr<nsIChannelEventSink> sink;
+  sink = mozilla::components::ContentSecurityManager::Service();
+  if (sink) {
+    nsresult rv =
+        helper->DelegateOnChannelRedirect(sink, oldChan, newChan, flags);
+    if (NS_FAILED(rv)) return rv;
+  }
+
+  nsCOMArray<nsIChannelEventSink> entries;
+  mChannelEventSinks.GetEntries(entries);
+  int32_t len = entries.Count();
+  for (int32_t i = 0; i < len; ++i) {
+    nsresult rv =
+        helper->DelegateOnChannelRedirect(entries[i], oldChan, newChan, flags);
+    if (NS_FAILED(rv)) return rv;
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChan(do_QueryInterface(oldChan));
+
+  if (httpChan) {
+    MOZ_ASSERT(NS_IsMainThread());
+    nsCOMPtr<nsIURI> newURI;
+    newChan->GetURI(getter_AddRefs(newURI));
+    MOZ_ASSERT(newURI);
+
+    nsAutoCString scheme;
+    newURI->GetScheme(scheme);
+    MOZ_ASSERT(!scheme.IsEmpty());
+
+    if (oldChan->IsDocument()) {
+
+    } else {
+
+    }
+  }
+  return NS_OK;
+}
+
+bool nsIOService::UsesExternalProtocolHandler(const nsACString& aScheme) {
+  if (aScheme == "file"_ns || aScheme == "chrome"_ns ||
+      aScheme == "resource"_ns || aScheme == "moz-src"_ns) {
+    return false;
+  }
+
+  if (aScheme == "place"_ns || aScheme == "fake-favicon-uri"_ns ||
+      aScheme == "favicon"_ns || aScheme == "moz-nullprincipal"_ns) {
+    return true;
+  }
+
+  for (const auto& scheme : mForceExternalSchemes) {
+    if (aScheme == scheme) {
+      return true;
+    }
+  }
+  return false;
+}
+
+ProtocolHandlerInfo nsIOService::LookupProtocolHandler(
+    const nsACString& aScheme) {
+  nsAutoCString scheme(aScheme);
+  ToLowerCase(scheme);
+
+  AutoReadLock lock(mLock);
+  if (!UsesExternalProtocolHandler(scheme)) {
+    if (const xpcom::StaticProtocolHandler* handler =
+            xpcom::StaticProtocolHandler::Lookup(scheme)) {
+      return ProtocolHandlerInfo(*handler);
+    }
+    if (auto handler = mRuntimeProtocolHandlers.Lookup(scheme)) {
+      return ProtocolHandlerInfo(handler.Data());
+    }
+  }
+  return ProtocolHandlerInfo(xpcom::StaticProtocolHandler::Default());
+}
+
+NS_IMETHODIMP
+nsIOService::GetProtocolHandler(const char* scheme,
+                                nsIProtocolHandler** result) {
+  AssertIsOnMainThread();
+  NS_ENSURE_ARG_POINTER(scheme);
+
+  *result = LookupProtocolHandler(nsDependentCString(scheme)).Handler().take();
+  return *result ? NS_OK : NS_ERROR_UNKNOWN_PROTOCOL;
+}
+
+NS_IMETHODIMP
+nsIOService::ExtractScheme(const nsACString& inURI, nsACString& scheme) {
+  return net_ExtractURLScheme(inURI, scheme);
+}
+
+NS_IMETHODIMP
+nsIOService::HostnameIsLocalIPAddress(nsIURI* aURI, bool* aResult) {
+  NS_ENSURE_ARG_POINTER(aURI);
+
+  nsCOMPtr<nsIURI> innerURI = NS_GetInnermostURI(aURI);
+  NS_ENSURE_ARG_POINTER(innerURI);
+
+  nsAutoCString host;
+  nsresult rv = innerURI->GetAsciiHost(host);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  *aResult = false;
+
+  NetAddr addr;
+  if (NS_SUCCEEDED(addr.InitFromString(host)) && addr.IsIPAddrLocal()) {
+    *aResult = true;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::HostnameIsIPAddressAny(nsIURI* aURI, bool* aResult) {
+  NS_ENSURE_ARG_POINTER(aURI);
+
+  nsCOMPtr<nsIURI> innerURI = NS_GetInnermostURI(aURI);
+  NS_ENSURE_ARG_POINTER(innerURI);
+
+  nsAutoCString host;
+  nsresult rv = innerURI->GetAsciiHost(host);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  *aResult = false;
+
+  NetAddr addr;
+  if (NS_SUCCEEDED(addr.InitFromString(host)) && addr.IsIPAddrAny()) {
+    *aResult = true;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::HostnameIsSharedIPAddress(nsIURI* aURI, bool* aResult) {
+  NS_ENSURE_ARG_POINTER(aURI);
+
+  nsCOMPtr<nsIURI> innerURI = NS_GetInnermostURI(aURI);
+  NS_ENSURE_ARG_POINTER(innerURI);
+
+  nsAutoCString host;
+  nsresult rv = innerURI->GetAsciiHost(host);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  *aResult = false;
+
+  NetAddr addr;
+  if (NS_SUCCEEDED(addr.InitFromString(host)) && addr.IsIPAddrShared()) {
+    *aResult = true;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::IsValidHostname(const nsACString& inHostname, bool* aResult) {
+  if (!net_IsValidDNSHost(inHostname)) {
+    *aResult = false;
+    return NS_OK;
+  }
+
+  nsAutoCString host(inHostname);
+  if (IPv4Parser::EndsInANumber(host)) {
+    if (net_IsValidIPv6Addr(host)) {
+      *aResult = true;
+      return NS_OK;
+    }
+
+    nsAutoCString normalized;
+    nsresult rv = IPv4Parser::NormalizeIPv4(host, normalized);
+    if (NS_FAILED(rv)) {
+      *aResult = false;
+      return NS_OK;
+    }
+  }
+  *aResult = true;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::GetProtocolFlags(const char* scheme, uint32_t* flags) {
+  NS_ENSURE_ARG_POINTER(scheme);
+
+  *flags =
+      LookupProtocolHandler(nsDependentCString(scheme)).StaticProtocolFlags();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::GetDynamicProtocolFlags(nsIURI* uri, uint32_t* flags) {
+  AssertIsOnMainThread();
+  NS_ENSURE_ARG(uri);
+
+  nsAutoCString scheme;
+  nsresult rv = uri->GetScheme(scheme);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return LookupProtocolHandler(scheme).DynamicProtocolFlags(uri, flags);
+}
+
+NS_IMETHODIMP
+nsIOService::GetDefaultPort(const char* scheme, int32_t* defaultPort) {
+  NS_ENSURE_ARG_POINTER(scheme);
+
+  *defaultPort =
+      LookupProtocolHandler(nsDependentCString(scheme)).DefaultPort();
+  return NS_OK;
+}
+
+nsresult nsIOService::NewURI(const nsACString& aSpec, const char* aCharset,
+                             nsIURI* aBaseURI, nsIURI** result) {
+  return NS_NewURI(result, aSpec, aCharset, aBaseURI);
+}
+
+NS_IMETHODIMP
+nsIOService::NewFileURI(nsIFile* file, nsIURI** result) {
+  nsresult rv;
+  NS_ENSURE_ARG_POINTER(file);
+
+  nsCOMPtr<nsIProtocolHandler> handler;
+
+  rv = GetProtocolHandler("file", getter_AddRefs(handler));
+  if (NS_FAILED(rv)) return rv;
+
+  nsCOMPtr<nsIFileProtocolHandler> fileHandler(do_QueryInterface(handler, &rv));
+  if (NS_FAILED(rv)) return rv;
+
+  return fileHandler->NewFileURI(file, result);
+}
+
+already_AddRefed<nsIURI> nsIOService::CreateExposableURI(nsIURI* aURI) {
+  MOZ_ASSERT(aURI, "Must have a URI");
+  nsCOMPtr<nsIURI> uri = aURI;
+  bool hasUserPass;
+  if (NS_SUCCEEDED(aURI->GetHasUserPass(&hasUserPass)) && hasUserPass) {
+    DebugOnly<nsresult> rv = NS_MutateURI(uri).SetUserPass(""_ns).Finalize(uri);
+    MOZ_ASSERT(NS_SUCCEEDED(rv) && uri, "Mutating URI should never fail");
+  }
+  return uri.forget();
+}
+
+NS_IMETHODIMP
+nsIOService::CreateExposableURI(nsIURI* aURI, nsIURI** _result) {
+  NS_ENSURE_ARG_POINTER(aURI);
+  NS_ENSURE_ARG_POINTER(_result);
+  nsCOMPtr<nsIURI> exposableURI = CreateExposableURI(aURI);
+  exposableURI.forget(_result);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::NewChannelFromURI(nsIURI* aURI, nsINode* aLoadingNode,
+                               nsIPrincipal* aLoadingPrincipal,
+                               nsIPrincipal* aTriggeringPrincipal,
+                               uint32_t aSecurityFlags,
+                               nsContentPolicyType aContentPolicyType,
+                               nsIChannel** result) {
+  return NewChannelFromURIWithProxyFlags(aURI,
+                                         nullptr,  
+                                         0,        
+                                         aLoadingNode, aLoadingPrincipal,
+                                         aTriggeringPrincipal, aSecurityFlags,
+                                         aContentPolicyType, result);
+}
+nsresult nsIOService::NewChannelFromURIWithClientAndController(
+    nsIURI* aURI, nsINode* aLoadingNode, nsIPrincipal* aLoadingPrincipal,
+    nsIPrincipal* aTriggeringPrincipal,
+    const Maybe<ClientInfo>& aLoadingClientInfo,
+    const Maybe<ServiceWorkerDescriptor>& aController, uint32_t aSecurityFlags,
+    nsContentPolicyType aContentPolicyType, uint32_t aSandboxFlags,
+    nsIChannel** aResult) {
+  return NewChannelFromURIWithProxyFlagsInternal(
+      aURI,
+      nullptr,  
+      0,        
+      aLoadingNode, aLoadingPrincipal, aTriggeringPrincipal, aLoadingClientInfo,
+      aController, aSecurityFlags, aContentPolicyType, aSandboxFlags, aResult);
+}
+
+NS_IMETHODIMP
+nsIOService::NewChannelFromURIWithLoadInfo(nsIURI* aURI, nsILoadInfo* aLoadInfo,
+                                           nsIChannel** result) {
+  return NewChannelFromURIWithProxyFlagsInternal(aURI,
+                                                 nullptr,  
+                                                 0,        
+                                                 aLoadInfo, result);
+}
+
+nsresult nsIOService::NewChannelFromURIWithProxyFlagsInternal(
+    nsIURI* aURI, nsIURI* aProxyURI, uint32_t aProxyFlags,
+    nsINode* aLoadingNode, nsIPrincipal* aLoadingPrincipal,
+    nsIPrincipal* aTriggeringPrincipal,
+    const Maybe<ClientInfo>& aLoadingClientInfo,
+    const Maybe<ServiceWorkerDescriptor>& aController, uint32_t aSecurityFlags,
+    nsContentPolicyType aContentPolicyType, uint32_t aSandboxFlags,
+    nsIChannel** result) {
+  nsCOMPtr<nsILoadInfo> loadInfo = MOZ_TRY(LoadInfo::Create(
+      aLoadingPrincipal, aTriggeringPrincipal, aLoadingNode, aSecurityFlags,
+      aContentPolicyType, aLoadingClientInfo, aController, aSandboxFlags));
+  return NewChannelFromURIWithProxyFlagsInternal(aURI, aProxyURI, aProxyFlags,
+                                                 loadInfo, result);
+}
+
+nsresult nsIOService::NewChannelFromURIWithProxyFlagsInternal(
+    nsIURI* aURI, nsIURI* aProxyURI, uint32_t aProxyFlags,
+    nsILoadInfo* aLoadInfo, nsIChannel** result) {
+  nsresult rv;
+  NS_ENSURE_ARG_POINTER(aURI);
+  MOZ_ASSERT(aLoadInfo, "can not create channel without aLoadInfo");
+  NS_ENSURE_ARG_POINTER(aLoadInfo);
+
+  nsAutoCString scheme;
+  rv = aURI->GetScheme(scheme);
+  if (NS_FAILED(rv)) return rv;
+
+  nsCOMPtr<nsIProtocolHandler> handler;
+  rv = GetProtocolHandler(scheme.get(), getter_AddRefs(handler));
+  if (NS_FAILED(rv)) return rv;
+
+  nsCOMPtr<nsIChannel> channel;
+  nsCOMPtr<nsIProxiedProtocolHandler> pph = do_QueryInterface(handler);
+  if (pph) {
+    rv = pph->NewProxiedChannel(aURI, nullptr, aProxyFlags, aProxyURI,
+                                aLoadInfo, getter_AddRefs(channel));
+  } else {
+    rv = handler->NewChannel(aURI, aLoadInfo, getter_AddRefs(channel));
+  }
+  if (NS_FAILED(rv)) return rv;
+
+  nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+  if (aLoadInfo != loadInfo) {
+    MOZ_ASSERT(false, "newly created channel must have a loadinfo attached");
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  if (loadInfo->GetLoadingSandboxed()) {
+    channel->SetOwner(nullptr);
+  }
+  channel.forget(result);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::NewChannelFromURIWithProxyFlags(
+    nsIURI* aURI, nsIURI* aProxyURI, uint32_t aProxyFlags,
+    nsINode* aLoadingNode, nsIPrincipal* aLoadingPrincipal,
+    nsIPrincipal* aTriggeringPrincipal, uint32_t aSecurityFlags,
+    nsContentPolicyType aContentPolicyType, nsIChannel** result) {
+  return NewChannelFromURIWithProxyFlagsInternal(
+      aURI, aProxyURI, aProxyFlags, aLoadingNode, aLoadingPrincipal,
+      aTriggeringPrincipal, Maybe<ClientInfo>(),
+      Maybe<ServiceWorkerDescriptor>(), aSecurityFlags, aContentPolicyType, 0,
+      result);
+}
+
+NS_IMETHODIMP
+nsIOService::NewChannel(const nsACString& aSpec, const char* aCharset,
+                        nsIURI* aBaseURI, nsINode* aLoadingNode,
+                        nsIPrincipal* aLoadingPrincipal,
+                        nsIPrincipal* aTriggeringPrincipal,
+                        uint32_t aSecurityFlags,
+                        nsContentPolicyType aContentPolicyType,
+                        nsIChannel** result) {
+  nsresult rv;
+  nsCOMPtr<nsIURI> uri;
+  rv = NewURI(aSpec, aCharset, aBaseURI, getter_AddRefs(uri));
+  if (NS_FAILED(rv)) return rv;
+
+  return NewChannelFromURI(uri, aLoadingNode, aLoadingPrincipal,
+                           aTriggeringPrincipal, aSecurityFlags,
+                           aContentPolicyType, result);
+}
+
+NS_IMETHODIMP
+nsIOService::NewSuspendableChannelWrapper(
+    nsIChannel* aInnerChannel, nsISuspendableChannelWrapper** result) {
+  NS_ENSURE_ARG_POINTER(aInnerChannel);
+
+  nsCOMPtr<nsISuspendableChannelWrapper> wrapper =
+      new SuspendableChannelWrapper(aInnerChannel);
+  wrapper.forget(result);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::NewWebTransport(nsIWebTransport** result) {
+  if (!XRE_IsParentProcess()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  nsCOMPtr<nsIWebTransport> webTransport = new WebTransportSessionProxy();
+
+  webTransport.forget(result);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::OriginAttributesForNetworkState(
+    nsIChannel* aChannel, JSContext* cx, JS::MutableHandle<JS::Value> _retval) {
+  OriginAttributes attrs;
+  if (!StoragePrincipalHelper::GetOriginAttributesForNetworkState(aChannel,
+                                                                  attrs)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (NS_WARN_IF(!mozilla::dom::ToJSValue(cx, attrs, _retval))) {
+    return NS_ERROR_FAILURE;
+  }
+
+  return NS_OK;
+}
+
+bool nsIOService::IsLinkUp() {
+  InitializeNetworkLinkService();
+
+  if (!mNetworkLinkService) {
+    return true;
+  }
+
+  bool isLinkUp;
+  nsresult rv;
+  rv = mNetworkLinkService->GetIsLinkUp(&isLinkUp);
+  if (NS_FAILED(rv)) {
+    return true;
+  }
+
+  return isLinkUp;
+}
+
+NS_IMETHODIMP
+nsIOService::GetOffline(bool* offline) {
+  if (StaticPrefs::network_offline_mirrors_connectivity()) {
+    *offline = mOffline || !mConnectivity;
+  } else {
+    *offline = mOffline;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::SetOffline(bool offline) { return SetOfflineInternal(offline); }
+
+nsresult nsIOService::SetOfflineInternal(bool offline,
+                                         bool notifySocketProcess) {
+  LOG(("nsIOService::SetOffline offline=%d\n", offline));
+  if ((mShutdown || mOfflineForProfileChange) && !offline) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  mSetOfflineValue = offline;
+  if (mSettingOffline) {
+    return NS_OK;
+  }
+
+  mSettingOffline = true;
+
+  nsCOMPtr<nsIObserverService> observerService = services::GetObserverService();
+
+  NS_ASSERTION(observerService, "The observer service should not be null");
+
+  if (XRE_IsParentProcess()) {
+    if (observerService) {
+      (void)observerService->NotifyObservers(nullptr,
+                                             NS_IPC_IOSERVICE_SET_OFFLINE_TOPIC,
+                                             offline ? u"true" : u"false");
+    }
+    if (SocketProcessReady() && notifySocketProcess) {
+      (void)mSocketProcess->GetActor()->SendSetOffline(offline);
+    }
+  }
+
+  nsIIOService* subject = static_cast<nsIIOService*>(this);
+  while (mSetOfflineValue != mOffline) {
+    offline = mSetOfflineValue;
+
+    if (offline && !mOffline) {
+      mOffline = true;  
+
+      if (observerService) {
+        observerService->NotifyObservers(subject,
+                                         NS_IOSERVICE_GOING_OFFLINE_TOPIC,
+                                         u"" NS_IOSERVICE_OFFLINE);
+      }
+
+      if (mSocketTransportService) mSocketTransportService->SetOffline(true);
+
+      mLastOfflineStateChange = PR_IntervalNow();
+      if (observerService) {
+        observerService->NotifyObservers(subject,
+                                         NS_IOSERVICE_OFFLINE_STATUS_TOPIC,
+                                         u"" NS_IOSERVICE_OFFLINE);
+      }
+    } else if (!offline && mOffline) {
+      InitializeSocketTransportService();
+      mOffline = false;  
+
+      mLastOfflineStateChange = PR_IntervalNow();
+      if (observerService && mConnectivity) {
+        observerService->NotifyObservers(subject,
+                                         NS_IOSERVICE_OFFLINE_STATUS_TOPIC,
+                                         (u"" NS_IOSERVICE_ONLINE));
+      }
+    }
+  }
+
+  if ((mShutdown || mOfflineForProfileChange) && mOffline) {
+    if (mSocketTransportService) {
+      DebugOnly<nsresult> rv = mSocketTransportService->Shutdown(mShutdown);
+      NS_ASSERTION(NS_SUCCEEDED(rv),
+                   "socket transport service shutdown failed");
+    }
+  }
+
+  mSettingOffline = false;
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::GetConnectivity(bool* aConnectivity) {
+  *aConnectivity = mConnectivity;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::SetConnectivity(bool aConnectivity) {
+  LOG(("nsIOService::SetConnectivity aConnectivity=%d\n", aConnectivity));
+  if (XRE_IsParentProcess()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  return SetConnectivityInternal(aConnectivity);
+}
+
+NS_IMETHODIMP
+nsIOService::SetConnectivityForTesting(bool aConnectivity) {
+  return SetConnectivityInternal(aConnectivity);
+}
+
+nsresult nsIOService::SetConnectivityInternal(bool aConnectivity) {
+  LOG(("nsIOService::SetConnectivityInternal aConnectivity=%d\n",
+       aConnectivity));
+  if (mConnectivity == aConnectivity) {
+    return NS_OK;
+  }
+  mConnectivity = aConnectivity;
+
+  mLastConnectivityChange = PR_IntervalNow();
+
+  if (mCaptivePortalService) {
+    if (aConnectivity && gCaptivePortalEnabled) {
+      static_cast<CaptivePortalService*>(mCaptivePortalService.get())->Start();
+    } else {
+      static_cast<CaptivePortalService*>(mCaptivePortalService.get())->Stop();
+    }
+  }
+
+  nsCOMPtr<nsIObserverService> observerService = services::GetObserverService();
+  if (!observerService) {
+    return NS_OK;
+  }
+  if (XRE_IsParentProcess()) {
+    observerService->NotifyObservers(nullptr,
+                                     NS_IPC_IOSERVICE_SET_CONNECTIVITY_TOPIC,
+                                     aConnectivity ? u"true" : u"false");
+    if (SocketProcessReady()) {
+      (void)mSocketProcess->GetActor()->SendSetConnectivity(aConnectivity);
+    }
+  }
+
+  if (mOffline) {
+    return NS_OK;
+  }
+
+  if (aConnectivity) {
+    observerService->NotifyObservers(static_cast<nsIIOService*>(this),
+                                     NS_IOSERVICE_OFFLINE_STATUS_TOPIC,
+                                     (u"" NS_IOSERVICE_ONLINE));
+  } else {
+    observerService->NotifyObservers(static_cast<nsIIOService*>(this),
+                                     NS_IOSERVICE_GOING_OFFLINE_TOPIC,
+                                     u"" NS_IOSERVICE_OFFLINE);
+    observerService->NotifyObservers(static_cast<nsIIOService*>(this),
+                                     NS_IOSERVICE_OFFLINE_STATUS_TOPIC,
+                                     u"" NS_IOSERVICE_OFFLINE);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::AllowPort(int32_t inPort, const char* scheme, bool* _retval) {
+  int32_t port = inPort;
+  if (port == -1) {
+    *_retval = true;
+    return NS_OK;
+  }
+
+  if (port <= 0 || port > std::numeric_limits<uint16_t>::max()) {
+    *_retval = false;
+    return NS_OK;
+  }
+
+  nsTArray<int32_t> restrictedPortList;
+  {
+    AutoReadLock lock(mLock);
+    restrictedPortList.Assign(mRestrictedPortList);
+  }
+  int32_t badPortListCnt = restrictedPortList.Length();
+  for (int i = 0; i < badPortListCnt; i++) {
+    if (port == restrictedPortList[i]) {
+      *_retval = false;
+
+      if (!scheme) return NS_OK;
+
+      if (!NS_IsMainThread()) {
+        return NS_OK;
+      }
+      nsCOMPtr<nsIProtocolHandler> handler;
+      nsresult rv = GetProtocolHandler(scheme, getter_AddRefs(handler));
+      if (NS_FAILED(rv)) return rv;
+
+      return handler->AllowPort(port, scheme, _retval);
+    }
+  }
+
+  *_retval = true;
+  return NS_OK;
+}
+
+
+void nsIOService::PrefsChanged(const char* pref, void* self) {
+  static_cast<nsIOService*>(self)->PrefsChanged(pref);
+}
+
+void nsIOService::PrefsChanged(const char* pref) {
+  if (!pref || strcmp(pref, PORT_PREF("banned")) == 0) {
+    ParsePortList(PORT_PREF("banned"), false);
+  }
+
+  if (!pref || strcmp(pref, PORT_PREF("banned.override")) == 0) {
+    ParsePortList(PORT_PREF("banned.override"), true);
+  }
+
+  if (!pref || strcmp(pref, MANAGE_OFFLINE_STATUS_PREF) == 0) {
+    bool manage;
+    if (mNetworkLinkServiceInitialized &&
+        NS_SUCCEEDED(
+            Preferences::GetBool(MANAGE_OFFLINE_STATUS_PREF, &manage))) {
+      LOG(("nsIOService::PrefsChanged ManageOfflineStatus manage=%d\n",
+           manage));
+      SetManageOfflineStatus(manage);
+    }
+  }
+
+  if (!pref || strcmp(pref, NECKO_BUFFER_CACHE_COUNT_PREF) == 0) {
+    int32_t count;
+    if (NS_SUCCEEDED(
+            Preferences::GetInt(NECKO_BUFFER_CACHE_COUNT_PREF, &count))) {
+      if (count > 0) gDefaultSegmentCount = count;
+    }
+  }
+
+  if (!pref || strcmp(pref, NECKO_BUFFER_CACHE_SIZE_PREF) == 0) {
+    int32_t size;
+    if (NS_SUCCEEDED(
+            Preferences::GetInt(NECKO_BUFFER_CACHE_SIZE_PREF, &size))) {
+      if (size > 0 && size < 1024 * 1024) gDefaultSegmentSize = size;
+    }
+    NS_WARNING_ASSERTION(!(size & (size - 1)),
+                         "network segment size is not a power of 2!");
+  }
+
+  if (!pref || strcmp(pref, NETWORK_CAPTIVE_PORTAL_PREF) == 0) {
+    nsresult rv = Preferences::GetBool(NETWORK_CAPTIVE_PORTAL_PREF,
+                                       &gCaptivePortalEnabled);
+    if (NS_SUCCEEDED(rv) && mCaptivePortalService) {
+      if (gCaptivePortalEnabled) {
+        static_cast<CaptivePortalService*>(mCaptivePortalService.get())
+            ->Start();
+      } else {
+        static_cast<CaptivePortalService*>(mCaptivePortalService.get())->Stop();
+      }
+    }
+  }
+
+  if (!pref || strncmp(pref, FORCE_EXTERNAL_PREF_PREFIX,
+                       strlen(FORCE_EXTERNAL_PREF_PREFIX)) == 0) {
+    nsTArray<nsCString> prefs;
+    if (nsIPrefBranch* prefRootBranch = Preferences::GetRootBranch()) {
+      prefRootBranch->GetChildList(FORCE_EXTERNAL_PREF_PREFIX, prefs);
+    }
+    nsTArray<nsCString> forceExternalSchemes;
+    for (const auto& pref : prefs) {
+      if (Preferences::GetBool(pref.get(), false)) {
+        forceExternalSchemes.AppendElement(
+            Substring(pref, strlen(FORCE_EXTERNAL_PREF_PREFIX)));
+      }
+    }
+    AutoWriteLock lock(mLock);
+    mForceExternalSchemes = std::move(forceExternalSchemes);
+  }
+
+  if (!pref || strncmp(pref, SIMPLE_URI_SCHEMES_PREF,
+                       strlen(SIMPLE_URI_SCHEMES_PREF)) == 0) {
+    LOG(("simple_uri_unknown_schemes pref changed, updating the scheme list"));
+    mSimpleURIUnknownSchemes.ParseAndMergePrefSchemes();
+  }
+
+  if (!pref || strncmp(pref, PREF_LNA_IP_ADDR_SPACE_PUBLIC,
+                       strlen(PREF_LNA_IP_ADDR_SPACE_PUBLIC)) == 0) {
+    AutoWriteLock lock(mLock);
+    UpdateAddressSpaceOverrideList(PREF_LNA_IP_ADDR_SPACE_PUBLIC,
+                                   mPublicAddressSpaceOverridesList);
+  }
+
+  if (!pref || strncmp(pref, PREF_LNA_IP_ADDR_SPACE_PRIVATE,
+                       strlen(PREF_LNA_IP_ADDR_SPACE_PRIVATE)) == 0) {
+    AutoWriteLock lock(mLock);
+    UpdateAddressSpaceOverrideList(PREF_LNA_IP_ADDR_SPACE_PRIVATE,
+                                   mPrivateAddressSpaceOverridesList);
+  }
+  if (!pref || strncmp(pref, PREF_LNA_IP_ADDR_SPACE_LOCAL,
+                       strlen(PREF_LNA_IP_ADDR_SPACE_LOCAL)) == 0) {
+    AutoWriteLock lock(mLock);
+    UpdateAddressSpaceOverrideList(PREF_LNA_IP_ADDR_SPACE_LOCAL,
+                                   mLocalAddressSpaceOverrideList);
+  }
+  if (!pref || strncmp(pref, PREF_LNA_SKIP_DOMAINS,
+                       strlen(PREF_LNA_SKIP_DOMAINS)) == 0) {
+    UpdateSkipDomainsList();
+  }
+}
+
+void nsIOService::UpdateAddressSpaceOverrideList(
+    const char* aPrefName, nsTArray<nsCString>& aTargetList) {
+  nsAutoCString aAddressSpaceOverrides;
+  Preferences::GetCString(aPrefName, aAddressSpaceOverrides);
+
+  nsTArray<nsCString> addressSpaceOverridesArray;
+  nsCCharSeparatedTokenizer tokenizer(aAddressSpaceOverrides, ',');
+  while (tokenizer.hasMoreTokens()) {
+    nsAutoCString token(tokenizer.nextToken());
+    token.StripWhitespace();
+    addressSpaceOverridesArray.AppendElement(token);
+  }
+
+  aTargetList = std::move(addressSpaceOverridesArray);
+}
+
+void nsIOService::UpdateSkipDomainsList() {
+  nsAutoCString skipDomains;
+  Preferences::GetCString(PREF_LNA_SKIP_DOMAINS, skipDomains);
+
+  nsTArray<nsCString> skipDomainsArray;
+  nsCCharSeparatedTokenizer tokenizer(skipDomains, ',');
+  while (tokenizer.hasMoreTokens()) {
+    nsAutoCString token(tokenizer.nextToken());
+    token.StripWhitespace();
+    if (!token.IsEmpty()) {
+      skipDomainsArray.AppendElement(token);
+    }
+  }
+
+  AutoWriteLock lock(mLock);
+  mLNASkipDomainsList = std::move(skipDomainsArray);
+}
+
+bool nsIOService::ShouldSkipDomainForLNA(const nsACString& aDomain) {
+  AutoReadLock lock(mLock);
+
+  for (const auto& pattern : mLNASkipDomainsList) {
+    if (pattern.Equals("*"_ns)) {
+      return true;
+    }
+
+    if (StringBeginsWith(pattern, "*."_ns)) {
+      nsDependentCSubstring suffix(Substring(pattern, 2));
+      nsDependentCSubstring suffixWithDot(Substring(pattern, 1));
+      if (aDomain == suffix || StringEndsWith(aDomain, suffixWithDot)) {
+        return true;
+      }
+    }
+
+    if (pattern == aDomain) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void nsIOService::ParsePortList(const char* pref, bool remove) {
+  nsAutoCString portList;
+  nsTArray<int32_t> restrictedPortList;
+  {
+    AutoWriteLock lock(mLock);
+    restrictedPortList.Assign(std::move(mRestrictedPortList));
+  }
+  Preferences::GetCString(pref, portList);
+  if (!portList.IsVoid()) {
+    nsTArray<nsCString> portListArray;
+    ParseString(portList, ',', portListArray);
+    uint32_t index;
+    for (index = 0; index < portListArray.Length(); index++) {
+      portListArray[index].StripWhitespace();
+      int32_t portBegin, portEnd;
+
+      if (PR_sscanf(portListArray[index].get(), "%d-%d", &portBegin,
+                    &portEnd) == 2) {
+        if ((portBegin < 65536) && (portEnd < 65536)) {
+          int32_t curPort;
+          if (remove) {
+            for (curPort = portBegin; curPort <= portEnd; curPort++) {
+              restrictedPortList.RemoveElement(curPort);
+            }
+          } else {
+            for (curPort = portBegin; curPort <= portEnd; curPort++) {
+              restrictedPortList.AppendElement(curPort);
+            }
+          }
+        }
+      } else {
+        nsresult aErrorCode;
+        int32_t port = portListArray[index].ToInteger(&aErrorCode);
+        if (NS_SUCCEEDED(aErrorCode) && port < 65536) {
+          if (remove) {
+            restrictedPortList.RemoveElement(port);
+          } else {
+            restrictedPortList.AppendElement(port);
+          }
+        }
+      }
+    }
+  }
+
+  AutoWriteLock lock(mLock);
+  mRestrictedPortList.Assign(std::move(restrictedPortList));
+}
+
+class nsWakeupNotifier : public Runnable {
+ public:
+  explicit nsWakeupNotifier(nsIIOServiceInternal* ioService)
+      : Runnable("net::nsWakeupNotifier"), mIOService(ioService) {}
+
+  NS_IMETHOD Run() override { return mIOService->NotifyWakeup(); }
+
+ private:
+  virtual ~nsWakeupNotifier() = default;
+  nsCOMPtr<nsIIOServiceInternal> mIOService;
+};
+
+NS_IMETHODIMP
+nsIOService::NotifyWakeup() {
+  nsCOMPtr<nsIObserverService> observerService = services::GetObserverService();
+
+  NS_ASSERTION(observerService, "The observer service should not be null");
+
+  if (observerService && StaticPrefs::network_notify_changed()) {
+    (void)observerService->NotifyObservers(nullptr, NS_NETWORK_LINK_TOPIC,
+                                           (u"" NS_NETWORK_LINK_DATA_CHANGED));
+  }
+
+  RecheckCaptivePortal();
+
+  return NS_OK;
+}
+
+void nsIOService::SetHttpHandlerAlreadyShutingDown() {
+  if (!mShutdown && !mOfflineForProfileChange) {
+    mNetTearingDownStarted = PR_IntervalNow();
+    mHttpHandlerAlreadyShutingDown = true;
+  }
+}
+
+NS_IMETHODIMP
+nsIOService::Observe(nsISupports* subject, const char* topic,
+                     const char16_t* data) {
+  if (UseSocketProcess() && SocketProcessReady() &&
+      mObserverTopicForSocketProcess.Contains(nsDependentCString(topic))) {
+    nsCString topicStr(topic);
+    nsString dataStr(data);
+    (void)mSocketProcess->GetActor()->SendNotifyObserver(topicStr, dataStr);
+  }
+
+  if (!strcmp(topic, kProfileChangeNetTeardownTopic)) {
+    if (!mHttpHandlerAlreadyShutingDown) {
+      mNetTearingDownStarted = PR_IntervalNow();
+    }
+    mHttpHandlerAlreadyShutingDown = false;
+    if (!mOffline) {
+      mOfflineForProfileChange = true;
+      SetOfflineInternal(true, false);
+    }
+  } else if (!strcmp(topic, kProfileChangeNetRestoreTopic)) {
+    if (mOfflineForProfileChange) {
+      mOfflineForProfileChange = false;
+      SetOfflineInternal(false, false);
+    }
+  } else if (!strcmp(topic, kProfileDoChange)) {
+    if (data && u"startup"_ns.Equals(data)) {
+      InitializeNetworkLinkService();
+      mNetworkLinkServiceInitialized = true;
+
+      PrefsChanged(MANAGE_OFFLINE_STATUS_PREF);
+
+      nsCOMPtr<nsISupports> cookieServ =
+          do_GetService(NS_COOKIESERVICE_CONTRACTID);
+    }
+  } else if (!strcmp(topic, NS_XPCOM_SHUTDOWN_OBSERVER_ID)) {
+    mShutdown = true;
+
+    if (!mHttpHandlerAlreadyShutingDown && !mOfflineForProfileChange) {
+      mNetTearingDownStarted = PR_IntervalNow();
+    }
+    mHttpHandlerAlreadyShutingDown = false;
+
+    SetOfflineInternal(true, false);
+
+    if (mCaptivePortalService) {
+      static_cast<CaptivePortalService*>(mCaptivePortalService.get())->Stop();
+      mCaptivePortalService = nullptr;
+    }
+
+    SSLTokensCache::Shutdown();
+
+    DestroySocketProcess();
+
+    if (IsSocketProcessChild()) {
+      Preferences::UnregisterCallbacks(nsIOService::OnTLSPrefChange,
+                                       gCallbackSecurityPrefs, this);
+      PrepareForShutdownInSocketProcess();
+    }
+
+    {
+      AutoWriteLock lock(mLock);
+      mRuntimeProtocolHandlers.Clear();
+    }
+  } else if (!strcmp(topic, NS_NETWORK_LINK_TOPIC)) {
+    OnNetworkLinkEvent(NS_ConvertUTF16toUTF8(data).get());
+  } else if (!strcmp(topic, NS_NETWORK_ID_CHANGED_TOPIC)) {
+    LOG(("nsIOService::OnNetworkLinkEvent Network id changed"));
+  } else if (!strcmp(topic, NS_WIDGET_WAKE_OBSERVER_TOPIC)) {
+    nsCOMPtr<nsIRunnable> wakeupNotifier = new nsWakeupNotifier(this);
+    NS_DispatchToMainThread(wakeupNotifier);
+    mInSleepMode = false;
+  } else if (!strcmp(topic, NS_WIDGET_SLEEP_OBSERVER_TOPIC)) {
+    mInSleepMode = true;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::ParseRequestContentType(const nsACString& aTypeHeader,
+                                     nsACString& aCharset, bool* aHadCharset,
+                                     nsACString& aContentType) {
+  net_ParseRequestContentType(aTypeHeader, aContentType, aCharset, aHadCharset);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::ParseResponseContentType(const nsACString& aTypeHeader,
+                                      nsACString& aCharset, bool* aHadCharset,
+                                      nsACString& aContentType) {
+  net_ParseContentType(aTypeHeader, aContentType, aCharset, aHadCharset);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::ProtocolHasFlags(nsIURI* uri, uint32_t flags, bool* result) {
+  NS_ENSURE_ARG(uri);
+
+  *result = false;
+  nsAutoCString scheme;
+  nsresult rv = uri->GetScheme(scheme);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  auto handler = LookupProtocolHandler(scheme);
+
+  uint32_t protocolFlags;
+  if (flags & nsIProtocolHandler::DYNAMIC_URI_FLAGS) {
+    AssertIsOnMainThread();
+    rv = handler.DynamicProtocolFlags(uri, &protocolFlags);
+    NS_ENSURE_SUCCESS(rv, rv);
+  } else {
+    protocolFlags = handler.StaticProtocolFlags();
+  }
+
+  *result = (protocolFlags & flags) == flags;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::URIChainHasFlags(nsIURI* uri, uint32_t flags, bool* result) {
+  nsresult rv = ProtocolHasFlags(uri, flags, result);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (*result) {
+    return rv;
+  }
+
+  nsCOMPtr<nsINestedURI> nestedURI = do_QueryInterface(uri);
+  while (nestedURI) {
+    nsCOMPtr<nsIURI> innerURI;
+    rv = nestedURI->GetInnerURI(getter_AddRefs(innerURI));
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = ProtocolHasFlags(innerURI, flags, result);
+
+    if (*result) {
+      return rv;
+    }
+
+    nestedURI = do_QueryInterface(innerURI);
+  }
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsIOService::SetManageOfflineStatus(bool aManage) {
+  LOG(("nsIOService::SetManageOfflineStatus aManage=%d\n", aManage));
+  mManageLinkStatus = aManage;
+
+  if (!mManageLinkStatus) {
+    SetConnectivityInternal(true);
+    return NS_OK;
+  }
+
+  InitializeNetworkLinkService();
+  OnNetworkLinkEvent(NS_NETWORK_LINK_DATA_UNKNOWN);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::GetManageOfflineStatus(bool* aManage) {
+  *aManage = mManageLinkStatus;
+  return NS_OK;
+}
+
+nsresult nsIOService::OnNetworkLinkEvent(const char* data) {
+  if (IsNeckoChild() || IsSocketProcessChild()) {
+    return NS_OK;
+  }
+
+  if (mShutdown) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  nsCString dataAsString(data);
+  for (auto* cp : mozilla::dom::ContentParent::AllProcesses(
+           mozilla::dom::ContentParent::eLive)) {
+    PNeckoParent* neckoParent = SingleManagedOrNull(cp->ManagedPNeckoParent());
+    if (!neckoParent) {
+      continue;
+    }
+    (void)neckoParent->SendNetworkChangeNotification(dataAsString);
+  }
+
+  LOG(("nsIOService::OnNetworkLinkEvent data:%s\n", data));
+  if (!mNetworkLinkService) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (!mManageLinkStatus) {
+    LOG(("nsIOService::OnNetworkLinkEvent mManageLinkStatus=false\n"));
+    return NS_OK;
+  }
+
+  bool isUp = true;
+  if (!strcmp(data, NS_NETWORK_LINK_DATA_CHANGED)) {
+    mLastNetworkLinkChange = PR_IntervalNow();
+    RecheckCaptivePortal();
+    return NS_OK;
+  }
+  if (!strcmp(data, NS_NETWORK_LINK_DATA_DOWN)) {
+    isUp = false;
+  } else if (!strcmp(data, NS_NETWORK_LINK_DATA_UP)) {
+    isUp = true;
+  } else if (!strcmp(data, NS_NETWORK_LINK_DATA_UNKNOWN)) {
+    nsresult rv = mNetworkLinkService->GetIsLinkUp(&isUp);
+    NS_ENSURE_SUCCESS(rv, rv);
+  } else {
+    NS_WARNING("Unhandled network event!");
+    return NS_OK;
+  }
+
+  return SetConnectivityInternal(isUp);
+}
+
+NS_IMETHODIMP
+nsIOService::EscapeString(const nsACString& aString, uint32_t aEscapeType,
+                          nsACString& aResult) {
+  NS_ENSURE_ARG_MAX(aEscapeType, 4);
+
+  nsAutoCString stringCopy(aString);
+  nsCString result;
+
+  if (!NS_Escape(stringCopy, result, (nsEscapeMask)aEscapeType)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  aResult.Assign(result);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::EscapeURL(const nsACString& aStr, uint32_t aFlags,
+                       nsACString& aResult) {
+  aResult.Truncate();
+  NS_EscapeURL(aStr.BeginReading(), aStr.Length(), aFlags | esc_AlwaysCopy,
+               aResult);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::UnescapeString(const nsACString& aStr, uint32_t aFlags,
+                            nsACString& aResult) {
+  aResult.Truncate();
+  NS_UnescapeURL(aStr.BeginReading(), aStr.Length(), aFlags | esc_AlwaysCopy,
+                 aResult);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::ExtractCharsetFromContentType(const nsACString& aTypeHeader,
+                                           nsACString& aCharset,
+                                           int32_t* aCharsetStart,
+                                           int32_t* aCharsetEnd,
+                                           bool* aHadCharset) {
+  nsAutoCString ignored;
+  net_ParseContentType(aTypeHeader, ignored, aCharset, aHadCharset,
+                       aCharsetStart, aCharsetEnd);
+  if (*aHadCharset && *aCharsetStart == *aCharsetEnd) {
+    *aHadCharset = false;
+  }
+  return NS_OK;
+}
+
+class IOServiceProxyCallback final : public nsIProtocolProxyCallback {
+  ~IOServiceProxyCallback() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIPROTOCOLPROXYCALLBACK
+
+  IOServiceProxyCallback(nsIInterfaceRequestor* aCallbacks,
+                         nsIOService* aIOService,
+                         Maybe<OriginAttributes>&& aOriginAttributes)
+      : mCallbacks(aCallbacks),
+        mIOService(aIOService),
+        mOriginAttributes(std::move(aOriginAttributes)) {}
+
+ private:
+  RefPtr<nsIInterfaceRequestor> mCallbacks;
+  RefPtr<nsIOService> mIOService;
+  Maybe<OriginAttributes> mOriginAttributes;
+};
+
+NS_IMPL_ISUPPORTS(IOServiceProxyCallback, nsIProtocolProxyCallback)
+
+NS_IMETHODIMP
+IOServiceProxyCallback::OnProxyAvailable(nsICancelable* request,
+                                         nsIChannel* channel, nsIProxyInfo* pi,
+                                         nsresult status) {
+  nsAutoCString type;
+  if (NS_SUCCEEDED(status) && pi && NS_SUCCEEDED(pi->GetType(type)) &&
+      !type.EqualsLiteral("direct")) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  nsresult rv = channel->GetURI(getter_AddRefs(uri));
+  if (NS_FAILED(rv)) {
+    return NS_OK;
+  }
+
+  nsAutoCString scheme;
+  rv = uri->GetScheme(scheme);
+  if (NS_FAILED(rv)) return NS_OK;
+
+  nsCOMPtr<nsIProtocolHandler> handler;
+  rv = mIOService->GetProtocolHandler(scheme.get(), getter_AddRefs(handler));
+  if (NS_FAILED(rv)) return NS_OK;
+
+  nsCOMPtr<nsISpeculativeConnect> speculativeHandler =
+      do_QueryInterface(handler);
+  if (!speculativeHandler) return NS_OK;
+
+  nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+  nsCOMPtr<nsIPrincipal> principal = loadInfo->GetLoadingPrincipal();
+
+  nsLoadFlags loadFlags = 0;
+  channel->GetLoadFlags(&loadFlags);
+  bool anonymous = !!(loadFlags & nsIRequest::LOAD_ANONYMOUS);
+  if (mOriginAttributes) {
+    speculativeHandler->SpeculativeConnectWithOriginAttributesNative(
+        uri, std::move(mOriginAttributes.ref()), mCallbacks, anonymous);
+  } else {
+    speculativeHandler->SpeculativeConnect(uri, principal, mCallbacks,
+                                           anonymous);
+  }
+
+  return NS_OK;
+}
+
+nsresult nsIOService::SpeculativeConnectInternal(
+    nsIURI* aURI, nsIPrincipal* aPrincipal,
+    Maybe<OriginAttributes>&& aOriginAttributes,
+    nsIInterfaceRequestor* aCallbacks, bool aAnonymous) {
+  NS_ENSURE_ARG(aURI);
+
+  if (!SchemeIsHttpOrHttps(aURI)) {
+    return NS_OK;
+  }
+
+  if (IsNeckoChild()) {
+    nsCOMPtr<nsILoadContext> loadContext = do_GetInterface(aCallbacks);
+
+    gNeckoChild->SendSpeculativeConnect(
+        nullptr, IPC::SerializedLoadContext(loadContext), aURI, aPrincipal,
+        std::move(aOriginAttributes), aAnonymous);
+    return NS_OK;
+  }
+
+  nsresult rv;
+  nsCOMPtr<nsIProtocolProxyService> pps;
+  pps = mozilla::components::ProtocolProxy::Service(&rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIPrincipal> loadingPrincipal = aPrincipal;
+
+  MOZ_ASSERT(aPrincipal || aOriginAttributes,
+             "We expect passing a principal or OriginAttributes here.");
+
+  if (!aPrincipal && !aOriginAttributes) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (aOriginAttributes) {
+    loadingPrincipal =
+        BasePrincipal::CreateContentPrincipal(aURI, aOriginAttributes.ref());
+  }
+
+  nsCOMPtr<nsIURI> httpsURI;
+  if (aURI->SchemeIs("http")) {
+    nsCOMPtr<nsILoadInfo> httpsOnlyCheckLoadInfo = MOZ_TRY(
+        LoadInfo::Create(loadingPrincipal, loadingPrincipal, nullptr,
+                         nsILoadInfo::SEC_ONLY_FOR_EXPLICIT_CONTENTSEC_CHECK,
+                         nsIContentPolicy::TYPE_SPECULATIVE));
+
+    if (nsHTTPSOnlyUtils::ShouldUpgradeRequest(aURI, httpsOnlyCheckLoadInfo) ||
+        nsHTTPSOnlyUtils::ShouldUpgradeHttpsFirstRequest(
+            aURI, httpsOnlyCheckLoadInfo)) {
+      rv = NS_GetSecureUpgradedURI(aURI, getter_AddRefs(httpsURI));
+      NS_ENSURE_SUCCESS(rv, rv);
+      aURI = httpsURI.get();
+    }
+  }
+
+  nsCOMPtr<nsIChannel> channel;
+  rv = NewChannelFromURI(
+      aURI,
+      nullptr,  
+      loadingPrincipal,
+      nullptr,  
+      nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL,
+      nsIContentPolicy::TYPE_SPECULATIVE, getter_AddRefs(channel));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (aAnonymous) {
+    nsLoadFlags loadFlags = 0;
+    channel->GetLoadFlags(&loadFlags);
+    loadFlags |= nsIRequest::LOAD_ANONYMOUS;
+    channel->SetLoadFlags(loadFlags);
+  }
+
+  if (!aCallbacks) {
+    bool hasProxyFilterRegistered = false;
+    (void)pps->GetHasProxyFilterRegistered(&hasProxyFilterRegistered);
+    if (hasProxyFilterRegistered) {
+      return NS_ERROR_FAILURE;
+    }
+  } else {
+    rv = channel->SetNotificationCallbacks(aCallbacks);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  nsCOMPtr<nsICancelable> cancelable;
+  RefPtr<IOServiceProxyCallback> callback = new IOServiceProxyCallback(
+      aCallbacks, this, std::move(aOriginAttributes));
+  nsCOMPtr<nsIProtocolProxyService2> pps2 = do_QueryInterface(pps);
+  if (pps2) {
+    return pps2->AsyncResolve2(channel, 0, callback, nullptr,
+                               getter_AddRefs(cancelable));
+  }
+  return pps->AsyncResolve(channel, 0, callback, nullptr,
+                           getter_AddRefs(cancelable));
+}
+
+NS_IMETHODIMP
+nsIOService::SpeculativeConnect(nsIURI* aURI, nsIPrincipal* aPrincipal,
+                                nsIInterfaceRequestor* aCallbacks,
+                                bool aAnonymous) {
+  return SpeculativeConnectInternal(aURI, aPrincipal, Nothing(), aCallbacks,
+                                    aAnonymous);
+}
+
+NS_IMETHODIMP nsIOService::SpeculativeConnectWithOriginAttributes(
+    nsIURI* aURI, JS::Handle<JS::Value> aOriginAttributes,
+    nsIInterfaceRequestor* aCallbacks, bool aAnonymous, JSContext* aCx) {
+  OriginAttributes attrs;
+  if (!aOriginAttributes.isObject() || !attrs.Init(aCx, aOriginAttributes)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  SpeculativeConnectWithOriginAttributesNative(aURI, std::move(attrs),
+                                               aCallbacks, aAnonymous);
+  return NS_OK;
+}
+
+NS_IMETHODIMP_(void)
+nsIOService::SpeculativeConnectWithOriginAttributesNative(
+    nsIURI* aURI, OriginAttributes&& aOriginAttributes,
+    nsIInterfaceRequestor* aCallbacks, bool aAnonymous) {
+  Maybe<OriginAttributes> originAttributes;
+  originAttributes.emplace(aOriginAttributes);
+  (void)SpeculativeConnectInternal(aURI, nullptr, std::move(originAttributes),
+                                   aCallbacks, aAnonymous);
+}
+
+NS_IMETHODIMP
+nsIOService::NotImplemented() { return NS_ERROR_NOT_IMPLEMENTED; }
+
+NS_IMETHODIMP
+nsIOService::GetSocketProcessLaunched(bool* aResult) {
+  NS_ENSURE_ARG_POINTER(aResult);
+
+  *aResult = SocketProcessReady();
+  return NS_OK;
+}
+
+bool nsIOService::HasObservers(const char* aTopic) {
+  MOZ_ASSERT(false, "Calling this method is unexpected");
+  return false;
+}
+
+NS_IMETHODIMP
+nsIOService::GetSocketProcessId(uint64_t* aPid) {
+  NS_ENSURE_ARG_POINTER(aPid);
+
+  *aPid = 0;
+  if (!mSocketProcess) {
+    return NS_OK;
+  }
+
+  if (SocketProcessParent* actor = mSocketProcess->GetActor()) {
+    *aPid = (uint64_t)actor->OtherPid();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::RegisterProtocolHandler(const nsACString& aScheme,
+                                     nsIProtocolHandler* aHandler,
+                                     uint32_t aProtocolFlags,
+                                     int32_t aDefaultPort) {
+  if (mShutdown) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  if (aScheme.IsEmpty()) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  nsAutoCString scheme(aScheme);
+  ToLowerCase(scheme);
+
+  AutoWriteLock lock(mLock);
+  return mRuntimeProtocolHandlers.WithEntryHandle(scheme, [&](auto&& entry) {
+    if (entry) {
+      NS_WARNING("Cannot override an existing dynamic protocol handler");
+      return NS_ERROR_FACTORY_EXISTS;
+    }
+    if (xpcom::StaticProtocolHandler::Lookup(scheme)) {
+      NS_WARNING("Cannot override an existing static protocol handler");
+      return NS_ERROR_FACTORY_EXISTS;
+    }
+    nsMainThreadPtrHandle<nsIProtocolHandler> handler(
+        new nsMainThreadPtrHolder<nsIProtocolHandler>("RuntimeProtocolHandler",
+                                                      aHandler));
+    entry.Insert(RuntimeProtocolHandler{
+        .mHandler = std::move(handler),
+        .mProtocolFlags = aProtocolFlags,
+        .mDefaultPort = aDefaultPort,
+    });
+    return NS_OK;
+  });
+}
+
+NS_IMETHODIMP
+nsIOService::UnregisterProtocolHandler(const nsACString& aScheme) {
+  if (mShutdown) {
+    return NS_OK;
+  }
+  if (aScheme.IsEmpty()) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  nsAutoCString scheme(aScheme);
+  ToLowerCase(scheme);
+
+  AutoWriteLock lock(mLock);
+  return mRuntimeProtocolHandlers.Remove(scheme)
+             ? NS_OK
+             : NS_ERROR_FACTORY_NOT_REGISTERED;
+}
+
+NS_IMETHODIMP
+nsIOService::SetSimpleURIUnknownRemoteSchemes(
+    const nsTArray<nsCString>& aRemoteSchemes) {
+  LOG(("nsIOService::SetSimpleUriUnknownRemoteSchemes"));
+  mSimpleURIUnknownSchemes.SetAndMergeRemoteSchemes(aRemoteSchemes);
+
+  if (XRE_IsParentProcess()) {
+    for (auto* cp : mozilla::dom::ContentParent::AllProcesses(
+             mozilla::dom::ContentParent::eLive)) {
+      (void)cp->SendSimpleURIUnknownRemoteSchemes(aRemoteSchemes);
+    }
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::GetOverridenIpAddressSpace(
+    nsILoadInfo::IPAddressSpace* aIpAddressSpace, const NetAddr& aAddr) {
+  nsAutoCString addrPortString;
+
+  if (!StaticPrefs::network_lna_enabled()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  {
+    AutoReadLock lock(mLock);
+    if (mPublicAddressSpaceOverridesList.IsEmpty() &&
+        mPrivateAddressSpaceOverridesList.IsEmpty() &&
+        mLocalAddressSpaceOverrideList.IsEmpty()) {
+      return NS_ERROR_FAILURE;
+    }
+  }
+
+  aAddr.ToAddrPortString(addrPortString);
+  addrPortString.StripWhitespace();
+  AutoReadLock lock(mLock);
+
+  for (const auto& ipAddr : mPublicAddressSpaceOverridesList) {
+    if (addrPortString.Equals(ipAddr)) {
+      *aIpAddressSpace = nsILoadInfo::IPAddressSpace::Public;
+      return NS_OK;
+    }
+  }
+
+  for (const auto& ipAddr : mPrivateAddressSpaceOverridesList) {
+    if (addrPortString.Equals(ipAddr)) {
+      *aIpAddressSpace = nsILoadInfo::IPAddressSpace::Private;
+      return NS_OK;
+    }
+  }
+
+  for (const auto& ipAddr : mLocalAddressSpaceOverrideList) {
+    if (addrPortString.Equals(ipAddr)) {
+      *aIpAddressSpace = nsILoadInfo::IPAddressSpace::Local;
+      return NS_OK;
+    }
+  }
+
+  *aIpAddressSpace = nsILoadInfo::IPAddressSpace::Unknown;
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+nsIOService::IsSimpleURIUnknownScheme(const nsACString& aScheme,
+                                      bool* _retval) {
+  *_retval = mSimpleURIUnknownSchemes.IsSimpleURIUnknownScheme(aScheme);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::GetSimpleURIUnknownRemoteSchemes(nsTArray<nsCString>& _retval) {
+  mSimpleURIUnknownSchemes.GetRemoteSchemes(_retval);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::AddEssentialDomainMapping(const nsACString& aFrom,
+                                       const nsACString& aTo) {
+  MOZ_ASSERT(NS_IsMainThread());
+  mEssentialDomainMapping.InsertOrUpdate(aFrom, aTo);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIOService::ClearEssentialDomainMapping() {
+  MOZ_ASSERT(NS_IsMainThread());
+  mEssentialDomainMapping.Clear();
+  return NS_OK;
+}
+
+bool nsIOService::GetFallbackDomain(const nsACString& aDomain,
+                                    nsACString& aFallbackDomain) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (auto entry = mEssentialDomainMapping.Lookup(aDomain)) {
+    aFallbackDomain = entry.Data();
+    return true;
+  }
+  return false;
+}
+
+NS_IMETHODIMP
+nsIOService::ParseCacheControlHeader(const nsACString& aCacheControlHeader,
+                                     JSContext* cx,
+                                     JS::MutableHandle<JS::Value> _retval) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  mozilla::dom::HTTPCacheControlParseResult result;
+  CacheControlParser parser(aCacheControlHeader);
+
+  bool didParseValue = false;
+
+  uint32_t maxAge = 0;
+  didParseValue = parser.MaxAge(&maxAge);
+  if (didParseValue) {
+    result.mMaxAge = maxAge;
+  }
+
+  uint32_t maxStale = 0;
+  didParseValue = parser.MaxStale(&maxStale);
+  if (didParseValue) {
+    result.mMaxStale = maxStale;
+  }
+
+  uint32_t minFresh = 0;
+  didParseValue = parser.MaxStale(&minFresh);
+  if (didParseValue) {
+    result.mMinFresh = minFresh;
+  }
+
+  uint32_t staleWhileRevalidate = 0;
+  didParseValue = parser.StaleWhileRevalidate(&staleWhileRevalidate);
+  if (didParseValue) {
+    result.mStaleWhileRevalidate = staleWhileRevalidate;
+  }
+
+  result.mNoCache = parser.NoCache();
+  result.mNoStore = parser.NoStore();
+  result.mPublic = parser.Public();
+  result.mPrivate = parser.Private();
+  result.mImmutable = parser.Immutable();
+
+  if (!ToJSValue(cx, result, _retval)) {
+    return NS_ERROR_FAILURE;
+  }
+  return NS_OK;
+}
+
+}  
+}  

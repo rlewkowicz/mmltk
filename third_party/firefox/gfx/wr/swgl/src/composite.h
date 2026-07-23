@@ -1,0 +1,1146 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+template <typename P, typename U>
+static ALWAYS_INLINE P convert_pixel(U src) {
+  return src;
+}
+
+template <>
+ALWAYS_INLINE uint32_t convert_pixel<uint32_t>(uint8_t src) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return (uint32_t(src) << 16) | 0xFF000000;
+#else
+  return (uint32_t(src) << 8) | 0x000000FF;
+#endif
+}
+
+template <>
+ALWAYS_INLINE uint32_t convert_pixel<uint32_t>(uint16_t src) {
+  uint32_t rg = src;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return ((rg & 0x00FF) << 16) | (rg & 0xFF00) | 0xFF000000;
+#else
+  return (rg & 0xFF00) | ((rg & 0x00FF) << 16) | 0x000000FF;
+#endif
+}
+
+template <>
+ALWAYS_INLINE uint8_t convert_pixel<uint8_t>(uint32_t src) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return (src >> 16) & 0xFF;
+#else
+  return (src >> 8) & 0xFF;
+#endif
+}
+
+template <>
+ALWAYS_INLINE uint16_t convert_pixel<uint16_t>(uint32_t src) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return ((src >> 16) & 0x00FF) | (src & 0xFF00);
+#else
+  return (src & 0xFF00) | ((src >> 16) & 0x00FF);
+#endif
+}
+
+template <>
+ALWAYS_INLINE uint16_t convert_pixel<uint16_t>(uint8_t src) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return src;
+#else
+  return uint16_t(src) << 8;
+#endif
+}
+
+template <>
+ALWAYS_INLINE uint8_t convert_pixel<uint8_t>(uint16_t src) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return src & 0xFF;
+#else
+  return src >> 8;
+#endif
+}
+
+static inline void mask_row(uint32_t* dst, const uint8_t* mask, int span) {
+  auto* end = dst + span;
+  while (dst + 4 <= end) {
+    WideRGBA8 maskpx = expand_mask(dst, unpack(unaligned_load<PackedR8>(mask)));
+    WideRGBA8 dstpx = unpack(unaligned_load<PackedRGBA8>(dst));
+    PackedRGBA8 r = pack(muldiv255(dstpx, maskpx));
+    unaligned_store(dst, r);
+    mask += 4;
+    dst += 4;
+  }
+  if (dst < end) {
+    WideRGBA8 maskpx =
+        expand_mask(dst, unpack(partial_load_span<PackedR8>(mask, end - dst)));
+    WideRGBA8 dstpx = unpack(partial_load_span<PackedRGBA8>(dst, end - dst));
+    auto r = pack(maskpx + dstpx - muldiv255(dstpx, maskpx));
+    partial_store_span(dst, r, end - dst);
+  }
+}
+
+static NO_INLINE void mask_blit(Texture& masktex, Texture& dsttex) {
+  int maskStride = masktex.stride();
+  int destStride = dsttex.stride();
+  char* dest = dsttex.sample_ptr(0, 0);
+  char* mask = masktex.sample_ptr(0, 0);
+  int span = dsttex.width;
+
+  for (int rows = dsttex.height; rows > 0; rows--) {
+    mask_row((uint32_t*)dest, (uint8_t*)mask, span);
+    dest += destStride;
+    mask += maskStride;
+  }
+}
+
+template <bool COMPOSITE, typename P>
+static inline void copy_row(P* dst, const P* src, int span) {
+  memcpy(dst, src, span * sizeof(P));
+}
+
+template <>
+void copy_row<true, uint32_t>(uint32_t* dst, const uint32_t* src, int span) {
+  auto* end = dst + span;
+  while (dst + 4 <= end) {
+    WideRGBA8 srcpx = unpack(unaligned_load<PackedRGBA8>(src));
+    WideRGBA8 dstpx = unpack(unaligned_load<PackedRGBA8>(dst));
+    PackedRGBA8 r = pack(srcpx + dstpx - muldiv255(dstpx, alphas(srcpx)));
+    unaligned_store(dst, r);
+    src += 4;
+    dst += 4;
+  }
+  if (dst < end) {
+    WideRGBA8 srcpx = unpack(partial_load_span<PackedRGBA8>(src, end - dst));
+    WideRGBA8 dstpx = unpack(partial_load_span<PackedRGBA8>(dst, end - dst));
+    auto r = pack(srcpx + dstpx - muldiv255(dstpx, alphas(srcpx)));
+    partial_store_span(dst, r, end - dst);
+  }
+}
+
+template <bool COMPOSITE, typename P, typename U>
+static inline void scale_row(P* dst, int dstWidth, const U* src, int srcWidth,
+                             int span, int frac) {
+  for (P* end = dst + span; dst < end; dst++) {
+    *dst = convert_pixel<P>(*src);
+    for (frac += srcWidth; frac >= dstWidth; frac -= dstWidth) {
+      src++;
+    }
+  }
+}
+
+template <>
+void scale_row<true, uint32_t, uint32_t>(uint32_t* dst, int dstWidth,
+                                         const uint32_t* src, int srcWidth,
+                                         int span, int frac) {
+  auto* end = dst + span;
+  for (; dst + 4 <= end; dst += 4) {
+    U32 srcn;
+    srcn.x = *src;
+    for (frac += srcWidth; frac >= dstWidth; frac -= dstWidth) {
+      src++;
+    }
+    srcn.y = *src;
+    for (frac += srcWidth; frac >= dstWidth; frac -= dstWidth) {
+      src++;
+    }
+    srcn.z = *src;
+    for (frac += srcWidth; frac >= dstWidth; frac -= dstWidth) {
+      src++;
+    }
+    srcn.w = *src;
+    for (frac += srcWidth; frac >= dstWidth; frac -= dstWidth) {
+      src++;
+    }
+    WideRGBA8 srcpx = unpack(bit_cast<PackedRGBA8>(srcn));
+    WideRGBA8 dstpx = unpack(unaligned_load<PackedRGBA8>(dst));
+    PackedRGBA8 r = pack(srcpx + dstpx - muldiv255(dstpx, alphas(srcpx)));
+    unaligned_store(dst, r);
+  }
+  if (dst < end) {
+    U32 srcn = {*src, 0, 0, 0};
+    if (end - dst > 1) {
+      for (frac += srcWidth; frac >= dstWidth; frac -= dstWidth) {
+        src++;
+      }
+      srcn.y = *src;
+      if (end - dst > 2) {
+        for (frac += srcWidth; frac >= dstWidth; frac -= dstWidth) {
+          src++;
+        }
+        srcn.z = *src;
+      }
+    }
+    WideRGBA8 srcpx = unpack(bit_cast<PackedRGBA8>(srcn));
+    WideRGBA8 dstpx = unpack(partial_load_span<PackedRGBA8>(dst, end - dst));
+    auto r = pack(srcpx + dstpx - muldiv255(dstpx, alphas(srcpx)));
+    partial_store_span(dst, r, end - dst);
+  }
+}
+
+template <bool COMPOSITE = false>
+static NO_INLINE void scale_blit(Texture& srctex, const IntRect& srcReq,
+                                 Texture& dsttex, const IntRect& dstReq,
+                                 bool invertY, const IntRect& clipRect) {
+  assert(!COMPOSITE || (srctex.internal_format == GL_RGBA8 &&
+                        dsttex.internal_format == GL_RGBA8));
+  int srcWidth = srcReq.width();
+  int srcHeight = srcReq.height();
+  int dstWidth = dstReq.width();
+  int dstHeight = dstReq.height();
+  IntRect dstBounds = dsttex.sample_bounds(dstReq).intersect(clipRect);
+  IntRect srcBounds = srctex.sample_bounds(srcReq, invertY);
+  IntRect srcClip = srctex.bounds() - srcReq.origin();
+  if (invertY) {
+    srcClip.invert_y(srcReq.height());
+  }
+  srcClip.scale(srcWidth, srcHeight, dstWidth, dstHeight, true);
+  dstBounds.intersect(srcClip);
+  if (dstBounds.is_empty()) {
+    return;
+  }
+
+  int srcStride = srctex.stride();
+  int destStride = dsttex.stride();
+  char* dest = dsttex.sample_ptr(dstReq, dstBounds);
+  int fracX = srcWidth * dstBounds.x0;
+  int fracY = srcHeight * dstBounds.y0;
+  srcBounds.x0 = max(fracX / dstWidth, srcBounds.x0);
+  srcBounds.y0 = max(fracY / dstHeight, srcBounds.y0);
+  fracX %= dstWidth;
+  fracY %= dstHeight;
+  char* src = srctex.sample_ptr(srcReq, srcBounds, invertY);
+  if (invertY) {
+    srcStride = -srcStride;
+  }
+  int span = dstBounds.width();
+  for (int rows = dstBounds.height(); rows > 0; rows--) {
+    switch (srctex.bpp()) {
+      case 1:
+        switch (dsttex.bpp()) {
+          case 2:
+            scale_row<COMPOSITE>((uint16_t*)dest, dstWidth, (uint8_t*)src,
+                                 srcWidth, span, fracX);
+            break;
+          case 4:
+            scale_row<COMPOSITE>((uint32_t*)dest, dstWidth, (uint8_t*)src,
+                                 srcWidth, span, fracX);
+            break;
+          default:
+            if (srcWidth == dstWidth)
+              copy_row<COMPOSITE>((uint8_t*)dest, (uint8_t*)src, span);
+            else
+              scale_row<COMPOSITE>((uint8_t*)dest, dstWidth, (uint8_t*)src,
+                                   srcWidth, span, fracX);
+            break;
+        }
+        break;
+      case 2:
+        switch (dsttex.bpp()) {
+          case 1:
+            scale_row<COMPOSITE>((uint8_t*)dest, dstWidth, (uint16_t*)src,
+                                 srcWidth, span, fracX);
+            break;
+          case 4:
+            scale_row<COMPOSITE>((uint32_t*)dest, dstWidth, (uint16_t*)src,
+                                 srcWidth, span, fracX);
+            break;
+          default:
+            if (srcWidth == dstWidth)
+              copy_row<COMPOSITE>((uint16_t*)dest, (uint16_t*)src, span);
+            else
+              scale_row<COMPOSITE>((uint16_t*)dest, dstWidth, (uint16_t*)src,
+                                   srcWidth, span, fracX);
+            break;
+        }
+        break;
+      case 4:
+        switch (dsttex.bpp()) {
+          case 1:
+            scale_row<COMPOSITE>((uint8_t*)dest, dstWidth, (uint32_t*)src,
+                                 srcWidth, span, fracX);
+            break;
+          case 2:
+            scale_row<COMPOSITE>((uint16_t*)dest, dstWidth, (uint32_t*)src,
+                                 srcWidth, span, fracX);
+            break;
+          default:
+            if (srcWidth == dstWidth)
+              copy_row<COMPOSITE>((uint32_t*)dest, (uint32_t*)src, span);
+            else
+              scale_row<COMPOSITE>((uint32_t*)dest, dstWidth, (uint32_t*)src,
+                                   srcWidth, span, fracX);
+            break;
+        }
+        break;
+      default:
+        assert(false);
+        break;
+    }
+    dest += destStride;
+    for (fracY += srcHeight; fracY >= dstHeight; fracY -= dstHeight) {
+      src += srcStride;
+    }
+  }
+}
+
+template <bool COMPOSITE>
+static void linear_row_blit(uint32_t* dest, int span, const vec2_scalar& srcUV,
+                            float srcDU, sampler2D sampler) {
+  vec2 uv = init_interp(srcUV, vec2_scalar(srcDU, 0.0f));
+  for (; span >= 4; span -= 4) {
+    auto srcpx = textureLinearPackedRGBA8(sampler, ivec2(uv));
+    unaligned_store(dest, srcpx);
+    dest += 4;
+    uv.x += 4 * srcDU;
+  }
+  if (span > 0) {
+    auto srcpx = textureLinearPackedRGBA8(sampler, ivec2(uv));
+    partial_store_span(dest, srcpx, span);
+  }
+}
+
+template <>
+void linear_row_blit<true>(uint32_t* dest, int span, const vec2_scalar& srcUV,
+                           float srcDU, sampler2D sampler) {
+  vec2 uv = init_interp(srcUV, vec2_scalar(srcDU, 0.0f));
+  for (; span >= 4; span -= 4) {
+    WideRGBA8 srcpx = textureLinearUnpackedRGBA8(sampler, ivec2(uv));
+    WideRGBA8 dstpx = unpack(unaligned_load<PackedRGBA8>(dest));
+    PackedRGBA8 r = pack(srcpx + dstpx - muldiv255(dstpx, alphas(srcpx)));
+    unaligned_store(dest, r);
+
+    dest += 4;
+    uv.x += 4 * srcDU;
+  }
+  if (span > 0) {
+    WideRGBA8 srcpx = textureLinearUnpackedRGBA8(sampler, ivec2(uv));
+    WideRGBA8 dstpx = unpack(partial_load_span<PackedRGBA8>(dest, span));
+    PackedRGBA8 r = pack(srcpx + dstpx - muldiv255(dstpx, alphas(srcpx)));
+    partial_store_span(dest, r, span);
+  }
+}
+
+template <bool COMPOSITE>
+static void linear_row_blit(uint8_t* dest, int span, const vec2_scalar& srcUV,
+                            float srcDU, sampler2D sampler) {
+  vec2 uv = init_interp(srcUV, vec2_scalar(srcDU, 0.0f));
+  for (; span >= 4; span -= 4) {
+    auto srcpx = textureLinearPackedR8(sampler, ivec2(uv));
+    unaligned_store(dest, srcpx);
+    dest += 4;
+    uv.x += 4 * srcDU;
+  }
+  if (span > 0) {
+    auto srcpx = textureLinearPackedR8(sampler, ivec2(uv));
+    partial_store_span(dest, srcpx, span);
+  }
+}
+
+template <bool COMPOSITE>
+static void linear_row_blit(uint16_t* dest, int span, const vec2_scalar& srcUV,
+                            float srcDU, sampler2D sampler) {
+  vec2 uv = init_interp(srcUV, vec2_scalar(srcDU, 0.0f));
+  for (; span >= 4; span -= 4) {
+    auto srcpx = textureLinearPackedRG8(sampler, ivec2(uv));
+    unaligned_store(dest, srcpx);
+    dest += 4;
+    uv.x += 4 * srcDU;
+  }
+  if (span > 0) {
+    auto srcpx = textureLinearPackedRG8(sampler, ivec2(uv));
+    partial_store_span(dest, srcpx, span);
+  }
+}
+
+template <bool COMPOSITE = false>
+static NO_INLINE void linear_blit(Texture& srctex, const IntRect& srcReq,
+                                  Texture& dsttex, const IntRect& dstReq,
+                                  bool invertX, bool invertY,
+                                  const IntRect& clipRect) {
+  assert(srctex.internal_format == GL_RGBA8 ||
+         srctex.internal_format == GL_R8 || srctex.internal_format == GL_RG8);
+  assert(!COMPOSITE || (srctex.internal_format == GL_RGBA8 &&
+                        dsttex.internal_format == GL_RGBA8));
+  IntRect dstBounds = dsttex.sample_bounds(dstReq);
+  dstBounds.intersect(clipRect);
+  if (dstBounds.is_empty()) {
+    return;
+  }
+  sampler2D_impl sampler;
+  init_sampler(&sampler, srctex);
+  sampler.filter = TextureFilter::LINEAR;
+  vec2_scalar srcUV(srcReq.x0, srcReq.y0);
+  vec2_scalar srcDUV(float(srcReq.width()) / dstReq.width(),
+                     float(srcReq.height()) / dstReq.height());
+  if (invertX) {
+    srcUV.x += srcReq.width();
+    srcDUV.x = -srcDUV.x;
+  }
+  if (invertY) {
+    srcUV.y += srcReq.height();
+    srcDUV.y = -srcDUV.y;
+  }
+  srcUV += srcDUV * (vec2_scalar(dstBounds.x0, dstBounds.y0) + 0.5f);
+  srcUV = linearQuantize(srcUV, 128);
+  srcDUV *= 128.0f;
+  int bpp = dsttex.bpp();
+  int destStride = dsttex.stride();
+  char* dest = dsttex.sample_ptr(dstReq, dstBounds);
+  int span = dstBounds.width();
+  for (int rows = dstBounds.height(); rows > 0; rows--) {
+    switch (bpp) {
+      case 1:
+        linear_row_blit<COMPOSITE>((uint8_t*)dest, span, srcUV, srcDUV.x,
+                                   &sampler);
+        break;
+      case 2:
+        linear_row_blit<COMPOSITE>((uint16_t*)dest, span, srcUV, srcDUV.x,
+                                   &sampler);
+        break;
+      case 4:
+        linear_row_blit<COMPOSITE>((uint32_t*)dest, span, srcUV, srcDUV.x,
+                                   &sampler);
+        break;
+      default:
+        assert(false);
+        break;
+    }
+    dest += destStride;
+    srcUV.y += srcDUV.y;
+  }
+}
+
+static inline bool is_renderable_format(GLenum format) {
+  switch (format) {
+    case GL_R8:
+    case GL_RG8:
+    case GL_RGBA8:
+      return true;
+    default:
+      return false;
+  }
+}
+
+extern "C" {
+
+void BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+                     GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
+                     GLbitfield mask, GLenum filter) {
+  assert(mask == GL_COLOR_BUFFER_BIT);
+  Framebuffer* srcfb = get_framebuffer(GL_READ_FRAMEBUFFER);
+  if (!srcfb) return;
+  Framebuffer* dstfb = get_framebuffer(GL_DRAW_FRAMEBUFFER);
+  if (!dstfb) return;
+  Texture& srctex = ctx->textures[srcfb->color_attachment];
+  if (!srctex.buf) return;
+  Texture& dsttex = ctx->textures[dstfb->color_attachment];
+  if (!dsttex.buf) return;
+  assert(!dsttex.locked);
+  if (srctex.internal_format != dsttex.internal_format &&
+      (!is_renderable_format(srctex.internal_format) ||
+       !is_renderable_format(dsttex.internal_format))) {
+    assert(false);
+    return;
+  }
+  if (srcY1 < srcY0) {
+    swap(srcY0, srcY1);
+    swap(dstY0, dstY1);
+  }
+  bool invertY = dstY1 < dstY0;
+  if (invertY) {
+    swap(dstY0, dstY1);
+  }
+  IntRect srcReq = IntRect{srcX0, srcY0, srcX1, srcY1} - srctex.offset;
+  IntRect dstReq = IntRect{dstX0, dstY0, dstX1, dstY1} - dsttex.offset;
+  if (srcReq.is_empty() || dstReq.is_empty()) {
+    return;
+  }
+  IntRect clipRect = {0, 0, dstReq.width(), dstReq.height()};
+  prepare_texture(srctex);
+  prepare_texture(dsttex, &dstReq);
+  if (!srcReq.same_size(dstReq) && srctex.width >= 2 && filter == GL_LINEAR &&
+      srctex.internal_format == dsttex.internal_format &&
+      is_renderable_format(srctex.internal_format)) {
+    linear_blit(srctex, srcReq, dsttex, dstReq, false, invertY, dstReq);
+  } else {
+    scale_blit(srctex, srcReq, dsttex, dstReq, invertY, clipRect);
+  }
+}
+
+void* GetResourceBuffer(LockedTexture* resource, int32_t* width,
+                        int32_t* height, int32_t* stride) {
+  *width = resource->width;
+  *height = resource->height;
+  *stride = resource->stride();
+  return resource->buf;
+}
+
+void Composite(LockedTexture* lockedDst, LockedTexture* lockedSrc, GLint srcX,
+               GLint srcY, GLsizei srcWidth, GLsizei srcHeight, GLint dstX,
+               GLint dstY, GLsizei dstWidth, GLsizei dstHeight,
+               GLboolean opaque, GLboolean flipX, GLboolean flipY,
+               GLenum filter, GLint clipX, GLint clipY, GLsizei clipWidth,
+               GLsizei clipHeight) {
+  if (!lockedDst || !lockedSrc) {
+    return;
+  }
+  Texture& srctex = *lockedSrc;
+  Texture& dsttex = *lockedDst;
+  assert(srctex.bpp() == 4);
+  assert(dsttex.bpp() == 4);
+
+  IntRect srcReq =
+      IntRect{srcX, srcY, srcX + srcWidth, srcY + srcHeight} - srctex.offset;
+  IntRect dstReq =
+      IntRect{dstX, dstY, dstX + dstWidth, dstY + dstHeight} - dsttex.offset;
+  if (srcReq.is_empty() || dstReq.is_empty()) {
+    return;
+  }
+
+  IntRect clipRect = {clipX - dstX, clipY - dstY, clipX - dstX + clipWidth,
+                      clipY - dstY + clipHeight};
+  bool useLinear =
+      srctex.width >= 2 &&
+      (flipX || (!srcReq.same_size(dstReq) && filter == GL_LINEAR));
+
+  if (opaque) {
+    if (useLinear) {
+      linear_blit<false>(srctex, srcReq, dsttex, dstReq, flipX, flipY,
+                         clipRect);
+    } else {
+      scale_blit<false>(srctex, srcReq, dsttex, dstReq, flipY, clipRect);
+    }
+  } else {
+    if (useLinear) {
+      linear_blit<true>(srctex, srcReq, dsttex, dstReq, flipX, flipY, clipRect);
+    } else {
+      scale_blit<true>(srctex, srcReq, dsttex, dstReq, flipY, clipRect);
+    }
+  }
+}
+
+void ApplyMask(LockedTexture* lockedDst, LockedTexture* lockedMask) {
+  assert(lockedDst);
+  assert(lockedMask);
+
+  Texture& masktex = *lockedMask;
+  Texture& dsttex = *lockedDst;
+
+  assert(masktex.bpp() == 1);
+  assert(dsttex.bpp() == 4);
+
+  assert(masktex.width == dsttex.width);
+  assert(masktex.height == dsttex.height);
+
+  mask_blit(masktex, dsttex);
+}
+
+}  
+
+static inline V8<int16_t> addsat(V8<int16_t> x, V8<int16_t> y) {
+#if USE_SSE2
+  return _mm_adds_epi16(x, y);
+#elif USE_NEON
+  return vqaddq_s16(x, y);
+#else
+  auto r = x + y;
+  auto overflow = (~(x ^ y) & (r ^ x)) >> 15;
+  auto limit = (x >> 15) ^ 0x7FFF;
+  return (~overflow & r) | (overflow & limit);
+#endif
+}
+
+static inline PackedRGBA8 packYUV(V8<int16_t> gg, V8<int16_t> br) {
+  return pack(bit_cast<WideRGBA8>(zip(br, gg))) |
+         PackedRGBA8{0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255};
+}
+
+// clang-format off
+// clang-format on
+struct YUVMatrix {
+
+  V8<int16_t> br_uvCoeffs;  
+  V8<int16_t> gg_uvCoeffs;  
+  V8<uint16_t> yCoeffs;     
+  V8<int16_t> yBias;        
+  V8<int16_t> uvBias;       
+  V8<int16_t> br_yMask;
+
+  static YUVMatrix From(const vec3_scalar& ycbcr_bias,
+                        const mat3_scalar& rgb_from_debiased_ycbcr,
+                        int rescale_factor = 0) {
+    assert(ycbcr_bias.z == ycbcr_bias.y);
+
+    const auto rgb_from_y = rgb_from_debiased_ycbcr[0].y;
+    assert(rgb_from_debiased_ycbcr[0].x == rgb_from_debiased_ycbcr[0].z);
+
+    int16_t br_from_y_mask = -1;
+    if (rgb_from_debiased_ycbcr[0].x == 0.0) {
+      assert(rgb_from_debiased_ycbcr[0].x == 0);
+      assert(rgb_from_debiased_ycbcr[0].y >= 1);
+      assert(rgb_from_debiased_ycbcr[0].z == 0);
+
+      assert(rgb_from_debiased_ycbcr[1].x == 0);
+      assert(rgb_from_debiased_ycbcr[1].y == 0);
+      assert(rgb_from_debiased_ycbcr[1].z >= 1);
+
+      assert(rgb_from_debiased_ycbcr[2].x >= 1);
+      assert(rgb_from_debiased_ycbcr[2].y == 0);
+      assert(rgb_from_debiased_ycbcr[2].z == 0);
+
+      assert(ycbcr_bias.x == 0);
+      assert(ycbcr_bias.y == 0);
+      assert(ycbcr_bias.z == 0);
+
+      br_from_y_mask = 0;
+    } else {
+      assert(rgb_from_debiased_ycbcr[0].x == rgb_from_y);
+    }
+
+    assert(rgb_from_debiased_ycbcr[1].x == 0.0);
+    const auto g_from_u = rgb_from_debiased_ycbcr[1].y;
+    const auto b_from_u = rgb_from_debiased_ycbcr[1].z;
+
+    const auto r_from_v = rgb_from_debiased_ycbcr[2].x;
+    const auto g_from_v = rgb_from_debiased_ycbcr[2].y;
+    assert(rgb_from_debiased_ycbcr[2].z == 0.0);
+
+    return YUVMatrix({ycbcr_bias.x, ycbcr_bias.y}, rgb_from_y, br_from_y_mask,
+                     r_from_v, g_from_u, g_from_v, b_from_u, rescale_factor);
+  }
+
+  YUVMatrix(vec2_scalar yuv_bias, double yCoeff, int16_t br_yMask_, double rv,
+            double gu, double gv, double bu, int rescale_factor = 0)
+      : br_uvCoeffs(zip(I16(int16_t(bu * (1 << (6 - rescale_factor)) + 0.5)),
+                        I16(int16_t(rv * (1 << (6 - rescale_factor)) + 0.5)))),
+        gg_uvCoeffs(
+            zip(I16(-int16_t(-gu * (1 << (6 - rescale_factor)) +
+                             0.5)),  
+                I16(-int16_t(-gv * (1 << (6 - rescale_factor)) + 0.5)))),
+        yCoeffs(uint16_t(yCoeff * (1 << (6 + 1 - rescale_factor)) + 0.5)),
+        yBias(int16_t(((yuv_bias.x * 255 * yCoeff) - 0.5) * (1 << 6))),
+        uvBias(int16_t(yuv_bias.y * (255 << rescale_factor) + 0.5)),
+        br_yMask(br_yMask_) {
+    assert(yuv_bias.x >= 0);
+    assert(yuv_bias.y >= 0);
+    assert(yCoeff > 0);
+    assert(br_yMask_ == 0 || br_yMask_ == -1);
+    assert(bu > 0);
+    assert(rv > 0);
+    assert(gu <= 0);
+    assert(gv <= 0);
+    assert(rescale_factor <= 6);
+  }
+
+  ALWAYS_INLINE PackedRGBA8 convert(V8<int16_t> yy, V8<int16_t> uv) const {
+
+    yy = bit_cast<V8<int16_t>>((bit_cast<V8<uint16_t>>(yy) * yCoeffs) >> 1);
+    yy -= yBias;
+
+    uv -= uvBias;
+    auto br = br_uvCoeffs * uv;
+    br = addsat(yy & br_yMask, br);
+    br >>= 6;
+
+    auto gg = gg_uvCoeffs * uv;
+    gg = addsat(gg, bit_cast<V8<int16_t>>(bit_cast<V4<uint32_t>>(gg) >> 16));
+    gg = addsat(yy, gg);  
+    gg >>= 6;
+
+    return packYUV(gg, br);
+  }
+};
+
+template <typename S>
+static ALWAYS_INLINE V8<int16_t> linearRowTapsR8(S sampler, I32 ix,
+                                                 int32_t offsety,
+                                                 int32_t stridey,
+                                                 int16_t fracy) {
+  uint8_t* buf = (uint8_t*)sampler->buf + offsety;
+  auto a0 = unaligned_load<V2<uint8_t>>(&buf[ix.x]);
+  auto b0 = unaligned_load<V2<uint8_t>>(&buf[ix.y]);
+  auto c0 = unaligned_load<V2<uint8_t>>(&buf[ix.z]);
+  auto d0 = unaligned_load<V2<uint8_t>>(&buf[ix.w]);
+  auto abcd0 = CONVERT(combine(a0, b0, c0, d0), V8<int16_t>);
+  buf += stridey;
+  auto a1 = unaligned_load<V2<uint8_t>>(&buf[ix.x]);
+  auto b1 = unaligned_load<V2<uint8_t>>(&buf[ix.y]);
+  auto c1 = unaligned_load<V2<uint8_t>>(&buf[ix.z]);
+  auto d1 = unaligned_load<V2<uint8_t>>(&buf[ix.w]);
+  auto abcd1 = CONVERT(combine(a1, b1, c1, d1), V8<int16_t>);
+  abcd0 += ((abcd1 - abcd0) * fracy) >> 7;
+  return abcd0;
+}
+
+template <typename S>
+static inline V8<int16_t> textureLinearRowR8(S sampler, I32 ix, int32_t offsety,
+                                             int32_t stridey, int16_t fracy) {
+  assert(sampler->format == TextureFormat::R8);
+
+  I32 fracx = ix;
+  ix >>= 7;
+  fracx = ((fracx & (ix >= 0)) | (ix > int32_t(sampler->width) - 2)) & 0x7F;
+  ix = clampCoord(ix, sampler->width - 1);
+
+  auto abcd = linearRowTapsR8(sampler, ix, offsety, stridey, fracy);
+
+  auto abcdl = SHUFFLE(abcd, abcd, 0, 0, 2, 2, 4, 4, 6, 6);
+  auto abcdh = SHUFFLE(abcd, abcd, 1, 1, 3, 3, 5, 5, 7, 7);
+  abcdl += ((abcdh - abcdl) * CONVERT(fracx, I16).xxyyzzww) >> 7;
+
+  return abcdl;
+}
+
+template <typename S>
+static inline V8<int16_t> textureLinearRowPairedR8(S sampler, S sampler2,
+                                                   I32 ix, int32_t offsety,
+                                                   int32_t stridey,
+                                                   int16_t fracy) {
+  assert(sampler->format == TextureFormat::R8 &&
+         sampler2->format == TextureFormat::R8);
+  assert(sampler->width == sampler2->width &&
+         sampler->height == sampler2->height);
+  assert(sampler->stride == sampler2->stride);
+
+  I32 fracx = ix;
+  ix >>= 7;
+  fracx = ((fracx & (ix >= 0)) | (ix > int32_t(sampler->width) - 2)) & 0x7F;
+  ix = clampCoord(ix, sampler->width - 1);
+
+  auto abcd = linearRowTapsR8(sampler, ix, offsety, stridey, fracy);
+
+  auto xyzw = linearRowTapsR8(sampler2, ix, offsety, stridey, fracy);
+
+  auto abcdxyzwl = SHUFFLE(abcd, xyzw, 0, 8, 2, 10, 4, 12, 6, 14);
+  auto abcdxyzwh = SHUFFLE(abcd, xyzw, 1, 9, 3, 11, 5, 13, 7, 15);
+  abcdxyzwl += ((abcdxyzwh - abcdxyzwl) * CONVERT(fracx, I16).xxyyzzww) >> 7;
+
+  return abcdxyzwl;
+}
+
+const int STEP_BITS = 8;
+
+template <bool BLEND>
+static inline void upscaleYUV42R8(uint32_t* dest, int span, uint8_t* yRow,
+                                  I32 yU, int32_t yDU, int32_t yStrideV,
+                                  int16_t yFracV, uint8_t* cRow1,
+                                  uint8_t* cRow2, I32 cU, int32_t cDU,
+                                  int32_t cStrideV, int16_t cFracV,
+                                  const YUVMatrix& colorSpace) {
+  cU = (cU.xzxz + cU.ywyw) >> 1;
+  auto ycFracX = CONVERT(combine(yU, cU), V8<uint16_t>)
+                 << (16 - (STEP_BITS + 7));
+  auto ycFracDX = combine(I16(yDU), I16(cDU)) << (16 - (STEP_BITS + 7));
+  auto ycFracV = combine(I16(yFracV), I16(cFracV));
+  I32 yI = yU >> (STEP_BITS + 7);
+  I32 cI = cU >> (STEP_BITS + 7);
+  auto ycSrc0 =
+      CONVERT(combine(unaligned_load<V4<uint8_t>>(&yRow[yI.x]),
+                      combine(unaligned_load<V2<uint8_t>>(&cRow1[cI.x]),
+                              unaligned_load<V2<uint8_t>>(&cRow2[cI.x]))),
+              V8<int16_t>);
+  auto ycSrc1 = CONVERT(
+      combine(unaligned_load<V4<uint8_t>>(&yRow[yI.x + yStrideV]),
+              combine(unaligned_load<V2<uint8_t>>(&cRow1[cI.x + cStrideV]),
+                      unaligned_load<V2<uint8_t>>(&cRow2[cI.x + cStrideV]))),
+      V8<int16_t>);
+  auto ycSrc = ycSrc0 + (((ycSrc1 - ycSrc0) * ycFracV) >> 7);
+
+  for (uint32_t* end = dest + span; dest < end; dest += 4) {
+    yU += yDU;
+    I32 yIn = yU >> (STEP_BITS + 7);
+    cU += cDU;
+    I32 cIn = cU >> (STEP_BITS + 7);
+    auto ycSrc0n =
+        CONVERT(combine(unaligned_load<V4<uint8_t>>(&yRow[yIn.x]),
+                        combine(unaligned_load<V2<uint8_t>>(&cRow1[cIn.x]),
+                                unaligned_load<V2<uint8_t>>(&cRow2[cIn.x]))),
+                V8<int16_t>);
+    auto ycSrc1n = CONVERT(
+        combine(unaligned_load<V4<uint8_t>>(&yRow[yIn.x + yStrideV]),
+                combine(unaligned_load<V2<uint8_t>>(&cRow1[cIn.x + cStrideV]),
+                        unaligned_load<V2<uint8_t>>(&cRow2[cIn.x + cStrideV]))),
+        V8<int16_t>);
+    auto ycSrcn = ycSrc0n + (((ycSrc1n - ycSrc0n) * ycFracV) >> 7);
+
+    auto yshuf = lowHalf(ycSrc);
+    auto yshufn =
+        SHUFFLE(yshuf, yIn.x == yI.w ? lowHalf(ycSrcn).yyyy : lowHalf(ycSrcn),
+                1, 2, 3, 4);
+    if (yI.y == yI.x) {
+      yshuf = yshuf.xxyz;
+      yshufn = yshufn.xxyz;
+    }
+    if (yI.z == yI.y) {
+      yshuf = yshuf.xyyz;
+      yshufn = yshufn.xyyz;
+    }
+    if (yI.w == yI.z) {
+      yshuf = yshuf.xyzz;
+      yshufn = yshufn.xyzz;
+    }
+
+    auto cshuf = highHalf(ycSrc);
+    auto cshufn =
+        SHUFFLE(cshuf, cIn.x == cI.y ? highHalf(ycSrcn).yyww : highHalf(ycSrcn),
+                1, 4, 3, 6);
+    if (cI.y == cI.x) {
+      cshuf = cshuf.xxzz;
+      cshufn = cshufn.xxzz;
+    }
+
+    auto yuvPx = combine(yshuf, cshuf);
+    yuvPx += ((combine(yshufn, cshufn) - yuvPx) *
+              bit_cast<V8<int16_t>>(ycFracX >> (16 - 7))) >>
+             7;
+
+    ycSrc = ycSrcn;
+    ycFracX += ycFracDX;
+    yI = yIn;
+    cI = cIn;
+
+    auto yPx = SHUFFLE(yuvPx, yuvPx, 0, 0, 1, 1, 2, 2, 3, 3);
+    auto uvPx = SHUFFLE(yuvPx, yuvPx, 4, 6, 4, 6, 5, 7, 5, 7) +
+                ((SHUFFLE(yuvPx, yuvPx, 4, 6, 5, 7, 4, 6, 5, 7) -
+                  SHUFFLE(yuvPx, yuvPx, 5, 7, 4, 6, 5, 7, 4, 6)) >>
+                 2);
+
+    commit_blend_span<BLEND>(dest, colorSpace.convert(yPx, uvPx));
+  }
+}
+
+template <bool BLEND = false>
+static void linear_row_yuv(uint32_t* dest, int span, sampler2DRect samplerY,
+                           const vec2_scalar& srcUV, float srcDU,
+                           sampler2DRect samplerU, sampler2DRect samplerV,
+                           const vec2_scalar& chromaUV, float chromaDU,
+                           int colorDepth, const YUVMatrix& colorSpace) {
+  I32 yU = cast(init_interp(srcUV.x, srcDU) * (1 << STEP_BITS));
+  int32_t yV = int32_t(srcUV.y);
+
+  I32 cU = cast(init_interp(chromaUV.x, chromaDU) * (1 << STEP_BITS));
+  int32_t cV = int32_t(chromaUV.y);
+
+  int32_t yDU = int32_t((4 << STEP_BITS) * srcDU);
+  int32_t cDU = int32_t((4 << STEP_BITS) * chromaDU);
+
+  if (samplerY->width < 2 || samplerU->width < 2) {
+    Float yuvF = {texelFetch(samplerY, ivec2(srcUV)).x.x,
+                  texelFetch(samplerU, ivec2(chromaUV)).x.x,
+                  texelFetch(samplerV, ivec2(chromaUV)).x.x, 1.0f};
+    if (colorDepth > 8) {
+      int rescaleFactor = 16 - colorDepth;
+      yuvF *= float(1 << rescaleFactor);
+    }
+    I16 yuv = CONVERT(round_pixel(yuvF), I16);
+    commit_solid_span<BLEND>(
+        dest,
+        unpack(colorSpace.convert(V8<int16_t>(yuv.x),
+                                  zip(I16(yuv.y), I16(yuv.z)))),
+        span);
+  } else if (samplerY->format == TextureFormat::R16) {
+    assert(colorDepth > 8);
+    int rescaleBits = (colorDepth - 1) - 8;
+    for (; span >= 4; span -= 4) {
+      auto yPx =
+          textureLinearUnpackedR16(samplerY, ivec2(yU >> STEP_BITS, yV)) >>
+          rescaleBits;
+      auto uPx =
+          textureLinearUnpackedR16(samplerU, ivec2(cU >> STEP_BITS, cV)) >>
+          rescaleBits;
+      auto vPx =
+          textureLinearUnpackedR16(samplerV, ivec2(cU >> STEP_BITS, cV)) >>
+          rescaleBits;
+      commit_blend_span<BLEND>(
+          dest, colorSpace.convert(zip(yPx, yPx), zip(uPx, vPx)));
+      dest += 4;
+      yU += yDU;
+      cU += cDU;
+    }
+    if (span > 0) {
+      auto yPx =
+          textureLinearUnpackedR16(samplerY, ivec2(yU >> STEP_BITS, yV)) >>
+          rescaleBits;
+      auto uPx =
+          textureLinearUnpackedR16(samplerU, ivec2(cU >> STEP_BITS, cV)) >>
+          rescaleBits;
+      auto vPx =
+          textureLinearUnpackedR16(samplerV, ivec2(cU >> STEP_BITS, cV)) >>
+          rescaleBits;
+      commit_blend_span<BLEND>(
+          dest, colorSpace.convert(zip(yPx, yPx), zip(uPx, vPx)), span);
+    }
+  } else {
+    assert(samplerY->format == TextureFormat::R8);
+    assert(colorDepth == 8);
+
+    int16_t yFracV = yV & 0x7F;
+    yV >>= 7;
+    int32_t yOffsetV = clampCoord(yV, samplerY->height) * samplerY->stride;
+    int32_t yStrideV =
+        yV >= 0 && yV < int32_t(samplerY->height) - 1 ? samplerY->stride : 0;
+
+    int16_t cFracV = cV & 0x7F;
+    cV >>= 7;
+    int32_t cOffsetV = clampCoord(cV, samplerU->height) * samplerU->stride;
+    int32_t cStrideV =
+        cV >= 0 && cV < int32_t(samplerU->height) - 1 ? samplerU->stride : 0;
+
+    if (yDU >= cDU && cDU > 0 && yDU <= (4 << (STEP_BITS + 7)) &&
+        cDU <= (2 << (STEP_BITS + 7))) {
+      for (; (yU.x < 0 || cU.x < 0) && span >= 4; span -= 4) {
+        auto yPx = textureLinearRowR8(samplerY, yU >> STEP_BITS, yOffsetV,
+                                      yStrideV, yFracV);
+        auto uvPx = textureLinearRowPairedR8(
+            samplerU, samplerV, cU >> STEP_BITS, cOffsetV, cStrideV, cFracV);
+        commit_blend_span<BLEND>(dest, colorSpace.convert(yPx, uvPx));
+        dest += 4;
+        yU += yDU;
+        cU += cDU;
+      }
+      int inside = min(
+          min((((int(samplerY->width) - 4) << (STEP_BITS + 7)) - yU.x) / yDU,
+              (((int(samplerU->width) - 4) << (STEP_BITS + 7)) - cU.x) / cDU) *
+              4,
+          span & ~3);
+      if (inside > 0) {
+        uint8_t* yRow = (uint8_t*)samplerY->buf + yOffsetV;
+        uint8_t* cRow1 = (uint8_t*)samplerU->buf + cOffsetV;
+        uint8_t* cRow2 = (uint8_t*)samplerV->buf + cOffsetV;
+        upscaleYUV42R8<BLEND>(dest, inside, yRow, yU, yDU, yStrideV, yFracV,
+                              cRow1, cRow2, cU, cDU, cStrideV, cFracV,
+                              colorSpace);
+        span -= inside;
+        dest += inside;
+        yU += (inside / 4) * yDU;
+        cU += (inside / 4) * cDU;
+      }
+    }
+    for (; span >= 4; span -= 4) {
+      auto yPx = textureLinearRowR8(samplerY, yU >> STEP_BITS, yOffsetV,
+                                    yStrideV, yFracV);
+      auto uvPx = textureLinearRowPairedR8(samplerU, samplerV, cU >> STEP_BITS,
+                                           cOffsetV, cStrideV, cFracV);
+      commit_blend_span<BLEND>(dest, colorSpace.convert(yPx, uvPx));
+      dest += 4;
+      yU += yDU;
+      cU += cDU;
+    }
+    if (span > 0) {
+      auto yPx = textureLinearRowR8(samplerY, yU >> STEP_BITS, yOffsetV,
+                                    yStrideV, yFracV);
+      auto uvPx = textureLinearRowPairedR8(samplerU, samplerV, cU >> STEP_BITS,
+                                           cOffsetV, cStrideV, cFracV);
+      commit_blend_span<BLEND>(dest, colorSpace.convert(yPx, uvPx), span);
+    }
+  }
+}
+
+static void linear_convert_yuv(Texture& ytex, Texture& utex, Texture& vtex,
+                               const YUVMatrix& rgbFromYcbcr, int colorDepth,
+                               const IntRect& srcReq, Texture& dsttex,
+                               const IntRect& dstReq, bool invertX,
+                               bool invertY, const IntRect& clipRect) {
+  IntRect dstBounds = dsttex.sample_bounds(dstReq);
+  dstBounds.intersect(clipRect);
+  if (dstBounds.is_empty()) {
+    return;
+  }
+  sampler2DRect_impl sampler[3];
+  init_sampler(&sampler[0], ytex);
+  init_sampler(&sampler[1], utex);
+  init_sampler(&sampler[2], vtex);
+
+  vec2_scalar srcUV(srcReq.x0, srcReq.y0);
+  vec2_scalar srcDUV(float(srcReq.width()) / dstReq.width(),
+                     float(srcReq.height()) / dstReq.height());
+  if (invertX) {
+    srcUV.x += srcReq.width();
+    srcDUV.x = -srcDUV.x;
+  }
+  if (invertY) {
+    srcUV.y += srcReq.height();
+    srcDUV.y = -srcDUV.y;
+  }
+  srcUV += srcDUV * (vec2_scalar(dstBounds.x0, dstBounds.y0) + 0.5f);
+  vec2_scalar chromaScale(float(utex.width) / ytex.width,
+                          float(utex.height) / ytex.height);
+  vec2_scalar chromaUV = srcUV * chromaScale;
+  vec2_scalar chromaDUV = srcDUV * chromaScale;
+  if (ytex.width >= 2 && utex.width >= 2) {
+    srcUV = linearQuantize(srcUV, 128);
+    srcDUV *= 128.0f;
+    chromaUV = linearQuantize(chromaUV, 128);
+    chromaDUV *= 128.0f;
+  }
+  int destStride = dsttex.stride();
+  char* dest = dsttex.sample_ptr(dstReq, dstBounds);
+  int span = dstBounds.width();
+  for (int rows = dstBounds.height(); rows > 0; rows--) {
+    linear_row_yuv((uint32_t*)dest, span, &sampler[0], srcUV, srcDUV.x,
+                   &sampler[1], &sampler[2], chromaUV, chromaDUV.x, colorDepth,
+                   rgbFromYcbcr);
+    dest += destStride;
+    srcUV.y += srcDUV.y;
+    chromaUV.y += chromaDUV.y;
+  }
+}
+
+
+enum class YUVRangedColorSpace : uint8_t {
+  BT601_Narrow = 0,
+  BT601_Full,
+  BT709_Narrow,
+  BT709_Full,
+  BT2020_Narrow,
+  BT2020_Full,
+  GbrIdentity,
+};
+
+
+vec4_scalar get_ycbcr_zeros_ones(const YUVRangedColorSpace color_space,
+                                 const GLuint color_depth) {
+  switch (color_space) {
+    case YUVRangedColorSpace::BT601_Narrow:
+    case YUVRangedColorSpace::BT709_Narrow:
+    case YUVRangedColorSpace::BT2020_Narrow: {
+      auto extra_bit_count = color_depth - 8;
+      vec4_scalar zo = {
+          float(16 << extra_bit_count),
+          float(128 << extra_bit_count),
+          float(235 << extra_bit_count),
+          float(240 << extra_bit_count),
+      };
+      float all_bits = (1 << color_depth) - 1;
+      zo /= all_bits;
+      return zo;
+    }
+
+    case YUVRangedColorSpace::BT601_Full:
+    case YUVRangedColorSpace::BT709_Full:
+    case YUVRangedColorSpace::BT2020_Full: {
+      const auto narrow =
+          get_ycbcr_zeros_ones(YUVRangedColorSpace::BT601_Narrow, color_depth);
+      return {0.0, narrow.y, 1.0, 1.0};
+    }
+
+    case YUVRangedColorSpace::GbrIdentity:
+      break;
+  }
+  return {0.0, 0.0, 1.0, 1.0};
+}
+
+constexpr mat3_scalar RgbFromYuv_Rec601 = {
+    {1.00000, 1.00000, 1.00000},
+    {0.00000, -0.17207, 0.88600},
+    {0.70100, -0.35707, 0.00000},
+};
+constexpr mat3_scalar RgbFromYuv_Rec709 = {
+    {1.00000, 1.00000, 1.00000},
+    {0.00000, -0.09366, 0.92780},
+    {0.78740, -0.23406, 0.00000},
+};
+constexpr mat3_scalar RgbFromYuv_Rec2020 = {
+    {1.00000, 1.00000, 1.00000},
+    {0.00000, -0.08228, 0.94070},
+    {0.73730, -0.28568, 0.00000},
+};
+constexpr mat3_scalar RgbFromYuv_GbrIdentity = {
+    {0, 1, 0},
+    {0, 0, 1},
+    {1, 0, 0},
+};
+
+inline mat3_scalar get_rgb_from_yuv(const YUVRangedColorSpace color_space) {
+  switch (color_space) {
+    case YUVRangedColorSpace::BT601_Narrow:
+    case YUVRangedColorSpace::BT601_Full:
+      return RgbFromYuv_Rec601;
+    case YUVRangedColorSpace::BT709_Narrow:
+    case YUVRangedColorSpace::BT709_Full:
+      return RgbFromYuv_Rec709;
+    case YUVRangedColorSpace::BT2020_Narrow:
+    case YUVRangedColorSpace::BT2020_Full:
+      return RgbFromYuv_Rec2020;
+    case YUVRangedColorSpace::GbrIdentity:
+      break;
+  }
+  return RgbFromYuv_GbrIdentity;
+}
+
+struct YcbcrInfo final {
+  vec3_scalar ycbcr_bias;
+  mat3_scalar rgb_from_debiased_ycbcr;
+};
+
+inline YcbcrInfo get_ycbcr_info(const YUVRangedColorSpace color_space,
+                                GLuint color_depth) {
+  color_depth = 8;
+
+  const auto zeros_ones = get_ycbcr_zeros_ones(color_space, color_depth);
+  const auto zeros = vec2_scalar{zeros_ones.x, zeros_ones.y};
+  const auto ones = vec2_scalar{zeros_ones.z, zeros_ones.w};
+  const auto scale = 1.0f / (ones - zeros);
+
+  const auto rgb_from_yuv = get_rgb_from_yuv(color_space);
+  const mat3_scalar yuv_from_debiased_ycbcr = {
+      {scale.x, 0, 0},
+      {0, scale.y, 0},
+      {0, 0, scale.y},
+  };
+
+  YcbcrInfo ret;
+  ret.ycbcr_bias = {zeros.x, zeros.y, zeros.y};
+  ret.rgb_from_debiased_ycbcr = rgb_from_yuv * yuv_from_debiased_ycbcr;
+  return ret;
+}
+
+
+extern "C" {
+
+void CompositeYUV(LockedTexture* lockedDst, LockedTexture* lockedY,
+                  LockedTexture* lockedU, LockedTexture* lockedV,
+                  YUVRangedColorSpace colorSpace, GLuint colorDepth, GLint srcX,
+                  GLint srcY, GLsizei srcWidth, GLsizei srcHeight, GLint dstX,
+                  GLint dstY, GLsizei dstWidth, GLsizei dstHeight,
+                  GLboolean flipX, GLboolean flipY, GLint clipX, GLint clipY,
+                  GLsizei clipWidth, GLsizei clipHeight) {
+  if (!lockedDst || !lockedY || !lockedU || !lockedV) {
+    return;
+  }
+  if (colorSpace > YUVRangedColorSpace::GbrIdentity) {
+    assert(false);
+    return;
+  }
+  const auto ycbcrInfo = get_ycbcr_info(colorSpace, colorDepth);
+  const auto rgbFromYcbcr =
+      YUVMatrix::From(ycbcrInfo.ycbcr_bias, ycbcrInfo.rgb_from_debiased_ycbcr);
+
+  Texture& ytex = *lockedY;
+  Texture& utex = *lockedU;
+  Texture& vtex = *lockedV;
+  Texture& dsttex = *lockedDst;
+  assert(ytex.bpp() == utex.bpp() && ytex.bpp() == vtex.bpp());
+  assert((ytex.bpp() == 1 && colorDepth == 8) ||
+         (ytex.bpp() == 2 && colorDepth > 8));
+  assert(utex.width == vtex.width && utex.height == vtex.height);
+  assert(ytex.offset == utex.offset && ytex.offset == vtex.offset);
+  assert(dsttex.bpp() == 4);
+
+  IntRect srcReq =
+      IntRect{srcX, srcY, srcX + srcWidth, srcY + srcHeight} - ytex.offset;
+  IntRect dstReq =
+      IntRect{dstX, dstY, dstX + dstWidth, dstY + dstHeight} - dsttex.offset;
+  if (srcReq.is_empty() || dstReq.is_empty()) {
+    return;
+  }
+
+  IntRect clipRect = {clipX - dstX, clipY - dstY, clipX - dstX + clipWidth,
+                      clipY - dstY + clipHeight};
+  linear_convert_yuv(ytex, utex, vtex, rgbFromYcbcr, colorDepth, srcReq, dsttex,
+                     dstReq, flipX, flipY, clipRect);
+}
+
+}  

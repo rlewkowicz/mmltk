@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef SlicedInputStream_h
+#define SlicedInputStream_h
+
+#include "mozilla/Mutex.h"
+#include "nsCOMPtr.h"
+#include "nsIAsyncInputStream.h"
+#include "nsICloneableInputStream.h"
+#include "nsIIPCSerializableInputStream.h"
+#include "nsISeekableStream.h"
+#include "nsIInputStreamLength.h"
+
+namespace mozilla {
+
+
+class SlicedInputStream final : public nsIAsyncInputStream,
+                                public nsICloneableInputStream,
+                                public nsIIPCSerializableInputStream,
+                                public nsISeekableStream,
+                                public nsIInputStreamCallback,
+                                public nsIInputStreamLength,
+                                public nsIAsyncInputStreamLength,
+                                public nsIInputStreamLengthCallback {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIINPUTSTREAM
+  NS_DECL_NSIASYNCINPUTSTREAM
+  NS_DECL_NSICLONEABLEINPUTSTREAM
+  NS_DECL_NSIIPCSERIALIZABLEINPUTSTREAM
+  NS_DECL_NSISEEKABLESTREAM
+  NS_DECL_NSITELLABLESTREAM
+  NS_DECL_NSIINPUTSTREAMCALLBACK
+  NS_DECL_NSIINPUTSTREAMLENGTH
+  NS_DECL_NSIASYNCINPUTSTREAMLENGTH
+  NS_DECL_NSIINPUTSTREAMLENGTHCALLBACK
+
+
+  SlicedInputStream(already_AddRefed<nsIInputStream> aInputStream,
+                    uint64_t aStart, uint64_t aLength);
+
+  SlicedInputStream();
+
+ private:
+  ~SlicedInputStream();
+
+  void SetSourceStream(already_AddRefed<nsIInputStream> aInputStream);
+
+  uint64_t AdjustRange(uint64_t aRange);
+
+  nsCOMPtr<nsIInputStream> mInputStream;
+
+  nsICloneableInputStream* mWeakCloneableInputStream;
+  nsIIPCSerializableInputStream* mWeakIPCSerializableInputStream;
+  nsISeekableStream* mWeakSeekableInputStream;
+  nsITellableStream* mWeakTellableInputStream;
+  nsIAsyncInputStream* mWeakAsyncInputStream;
+  nsIInputStreamLength* mWeakInputStreamLength;
+  nsIAsyncInputStreamLength* mWeakAsyncInputStreamLength;
+
+  uint64_t mStart;
+  uint64_t mLength;
+  uint64_t mCurPos;
+
+  bool mClosed;
+
+  nsCOMPtr<nsIInputStreamCallback> mAsyncWaitCallback MOZ_GUARDED_BY(mMutex);
+  nsCOMPtr<nsIEventTarget> mAsyncWaitEventTarget MOZ_GUARDED_BY(mMutex);
+  uint32_t mAsyncWaitFlags MOZ_GUARDED_BY(mMutex);
+  uint32_t mAsyncWaitRequestedCount MOZ_GUARDED_BY(mMutex);
+
+  nsCOMPtr<nsIInputStreamLengthCallback> mAsyncWaitLengthCallback
+      MOZ_GUARDED_BY(mMutex);
+
+  Mutex mMutex;
+};
+
+}  
+
+#endif  // SlicedInputStream_h

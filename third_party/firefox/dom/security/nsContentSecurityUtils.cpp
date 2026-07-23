@@ -1,0 +1,1679 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsContentSecurityUtils.h"
+
+#include "mozilla/Components.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/WorkerCommon.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "mozilla/dom/nsMixedContentBlocker.h"
+#include "nsComponentManagerUtils.h"
+#include "nsIChannel.h"
+#include "nsIContentSecurityPolicy.h"
+#include "nsIHttpChannel.h"
+#include "nsIMultiPartChannel.h"
+#include "nsITransfer.h"
+#include "nsIURI.h"
+#include "nsNetUtil.h"
+#include "nsSandboxFlags.h"
+
+#include "FramingChecker.h"
+#include "LoadInfo.h"
+#include "js/Array.h"  // JS::GetArrayLength
+#include "js/ContextOptions.h"
+#include "js/PropertyAndElement.h"  // JS_GetElement
+#include "js/RegExp.h"
+#include "js/RegExpFlags.h"           // JS::RegExpFlags
+#include "js/friend/ErrorMessages.h"  // JSMSG_UNSAFE_FILENAME
+#include "mozilla/Logging.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_security.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/nsCSPContext.h"
+#include "nsIConsoleService.h"
+#include "nsIStringBundle.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+extern mozilla::LazyLogModule sCSMLog;
+extern Atomic<bool, mozilla::Relaxed> sJSHacksChecked;
+extern Atomic<bool, mozilla::Relaxed> sJSHacksPresent;
+
+static already_AddRefed<nsIPrincipal> MakeHTTPPrincipalHTTPS(
+    nsIPrincipal* aPrincipal) {
+  nsCOMPtr<nsIPrincipal> principal = aPrincipal;
+  if (!principal->SchemeIs("http")) {
+    return principal.forget();
+  }
+
+  nsAutoCString spec;
+  aPrincipal->GetAsciiSpec(spec);
+  spec.ReplaceLiteral(0, 4, "https");
+
+  nsCOMPtr<nsIURI> newURI;
+  nsresult rv = NS_NewURI(getter_AddRefs(newURI), spec);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return nullptr;
+  }
+
+  mozilla::OriginAttributes OA =
+      BasePrincipal::Cast(aPrincipal)->OriginAttributesRef();
+
+  principal = BasePrincipal::CreateContentPrincipal(newURI, OA);
+  return principal.forget();
+}
+
+bool nsContentSecurityUtils::IsConsideredSameOriginForUIR(
+    nsIPrincipal* aTriggeringPrincipal, nsIPrincipal* aResultPrincipal) {
+  MOZ_ASSERT(aTriggeringPrincipal);
+  MOZ_ASSERT(aResultPrincipal);
+
+  if (aTriggeringPrincipal->Equals(aResultPrincipal)) {
+    return true;
+  }
+
+  nsCOMPtr<nsIPrincipal> compareTriggeringPrincipal =
+      MakeHTTPPrincipalHTTPS(aTriggeringPrincipal);
+
+  nsCOMPtr<nsIPrincipal> compareResultPrincipal =
+      MakeHTTPPrincipalHTTPS(aResultPrincipal);
+
+  return compareTriggeringPrincipal->Equals(compareResultPrincipal);
+}
+
+bool nsContentSecurityUtils::IsTrustedScheme(nsIURI* aURI) {
+  return aURI->SchemeIs("resource") || aURI->SchemeIs("chrome") ||
+         aURI->SchemeIs("moz-src");
+}
+
+nsresult RegexEval(const nsAString& aPattern, const nsAString& aString,
+                   bool aOnlyMatch, bool& aMatchResult,
+                   nsTArray<nsString>* aRegexResults = nullptr) {
+  MOZ_ASSERT(NS_IsMainThread());
+  aMatchResult = false;
+
+  mozilla::dom::AutoJSAPI jsapi;
+  jsapi.Init();
+
+  JSContext* cx = jsapi.cx();
+  mozilla::AutoDisableJSInterruptCallback disabler(cx);
+
+  JSAutoRealm ar(cx, xpc::PrivilegedJunkScope());
+
+  JS::Rooted<JSObject*> regexp(
+      cx, JS::NewUCRegExpObject(cx, aPattern.BeginReading(), aPattern.Length(),
+                                JS::RegExpFlag::Unicode));
+  if (!regexp) {
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
+
+  JS::Rooted<JS::Value> regexResult(cx, JS::NullValue());
+
+  size_t index = 0;
+  if (!JS::ExecuteRegExpNoStatics(cx, regexp, aString.BeginReading(),
+                                  aString.Length(), &index, aOnlyMatch,
+                                  &regexResult)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (regexResult.isNull()) {
+    return NS_OK;
+  }
+  if (aOnlyMatch) {
+    MOZ_ASSERT(regexResult.isBoolean() && regexResult.toBoolean());
+    aMatchResult = true;
+    return NS_OK;
+  }
+  if (aRegexResults == nullptr) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  uint32_t length;
+  JS::Rooted<JSObject*> regexResultObj(cx, &regexResult.toObject());
+  if (!JS::GetArrayLength(cx, regexResultObj, &length)) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  MOZ_LOG(sCSMLog, LogLevel::Verbose, ("Regex Matched %i strings", length));
+
+  for (uint32_t i = 0; i < length; i++) {
+    JS::Rooted<JS::Value> element(cx);
+    if (!JS_GetElement(cx, regexResultObj, i, &element)) {
+      return NS_ERROR_NO_CONTENT;
+    }
+
+    nsAutoJSString value;
+    if (!value.init(cx, element)) {
+      return NS_ERROR_NO_CONTENT;
+    }
+
+    MOZ_LOG(sCSMLog, LogLevel::Verbose,
+            ("Regex Matching: %i: %s", i, NS_ConvertUTF16toUTF8(value).get()));
+    aRegexResults->AppendElement(value);
+  }
+
+  aMatchResult = true;
+  return NS_OK;
+}
+
+
+char* nsContentSecurityUtils::SmartFormatCrashString(const char* str) {
+  return nsContentSecurityUtils::SmartFormatCrashString(strdup(str));
+}
+
+char* nsContentSecurityUtils::SmartFormatCrashString(char* str) {
+  auto str_len = strlen(str);
+
+  if (str_len > sPrintfCrashReasonSize) {
+    str[sPrintfCrashReasonSize - 1] = '\0';
+    str_len = strlen(str);
+  }
+  MOZ_RELEASE_ASSERT(sPrintfCrashReasonSize > str_len);
+
+  return str;
+}
+
+nsCString nsContentSecurityUtils::SmartFormatCrashString(
+    const char* part1, const char* part2, const char* format_string) {
+  return SmartFormatCrashString(strdup(part1), strdup(part2), format_string);
+}
+
+nsCString nsContentSecurityUtils::SmartFormatCrashString(
+    char* part1, char* part2, const char* format_string) {
+  auto part1_len = strlen(part1);
+  auto part2_len = strlen(part2);
+
+  auto constant_len = strlen(format_string) - 4;
+
+  if (part1_len + part2_len + constant_len > sPrintfCrashReasonSize) {
+    if (part2_len > 25) {
+      part2 += (part2_len - 25);
+    }
+    part2_len = strlen(part2);
+
+    part1[sPrintfCrashReasonSize - (constant_len + part2_len + 1)] = '\0';
+    part1_len = strlen(part1);
+  }
+  MOZ_RELEASE_ASSERT(sPrintfCrashReasonSize >
+                     constant_len + part1_len + part2_len);
+
+  auto parts = nsPrintfCString(format_string, part1, part2);
+  return std::move(parts);
+}
+
+nsCString OptimizeFileName(const nsAString& aFileName) {
+  nsCString optimizedName;
+  CopyUTF16toUTF8(aFileName, optimizedName);
+
+  MOZ_LOG(sCSMLog, LogLevel::Verbose,
+          ("Optimizing FileName: %s", optimizedName.get()));
+
+  optimizedName.ReplaceSubstring(".xpi!"_ns, "!"_ns);
+  optimizedName.ReplaceSubstring("shield.mozilla.org!"_ns, "s!"_ns);
+  optimizedName.ReplaceSubstring("mozilla.org!"_ns, "m!"_ns);
+  if (optimizedName.Length() > 80) {
+    optimizedName.Truncate(80);
+  }
+
+  MOZ_LOG(sCSMLog, LogLevel::Verbose,
+          ("Optimized FileName: %s", optimizedName.get()));
+  return optimizedName;
+}
+
+static nsCString StripQueryRef(const nsACString& aFileName) {
+  nsCString stripped(aFileName);
+  int32_t i = stripped.FindCharInSet("#?"_ns);
+  if (i != kNotFound) {
+    stripped.Truncate(i);
+  }
+  return stripped;
+}
+
+FilenameTypeAndDetails nsContentSecurityUtils::FilenameToFilenameType(
+    const nsACString& fileName) {
+  static constexpr auto kChromeURI = "chromeuri"_ns;
+  static constexpr auto kResourceURI = "resourceuri"_ns;
+  static constexpr auto kMozSrcURI = "mozsrcuri"_ns;
+  static constexpr auto kBlobUri = "bloburi"_ns;
+  static constexpr auto kDataUri = "dataurl"_ns;
+  static constexpr auto kAboutUri = "abouturi"_ns;
+  static constexpr auto kDataUriWebExtCStyle =
+      "dataurl-extension-contentstyle"_ns;
+  static constexpr auto kSingleString = "singlestring"_ns;
+  static constexpr auto kMozillaExtensionFile = "mozillaextension_file"_ns;
+  static constexpr auto kOtherExtensionFile = "otherextension_file"_ns;
+  static constexpr auto kSuspectedUserChromeJS = "suspectedUserChromeJS"_ns;
+  static constexpr auto kOther = "other"_ns;
+  static constexpr auto kOtherWorker = "other-on-worker"_ns;
+  static constexpr auto kRegexFailure = "regexfailure"_ns;
+
+  static constexpr auto kUCJSRegex = u"(.+).uc.js\\?*[0-9]*$"_ns;
+  static constexpr auto kExtensionRegex = u"extensions/(.+)@(.+)!(.+)$"_ns;
+  static constexpr auto kSingleFileRegex = u"^[a-zA-Z0-9.?]+$"_ns;
+
+  if (fileName.IsEmpty()) {
+    return FilenameTypeAndDetails(kOther, Nothing());
+  }
+
+  if (StringBeginsWith(fileName, "chrome://"_ns)) {
+    if (StringBeginsWith(fileName, "chrome://userscripts/"_ns) ||
+        StringBeginsWith(fileName, "chrome://userchromejs/"_ns) ||
+        StringBeginsWith(fileName, "chrome://user_chrome_files/"_ns) ||
+        StringBeginsWith(fileName, "chrome://tabmix"_ns) ||
+        StringBeginsWith(fileName, "chrome://searchwp/"_ns) ||
+        StringBeginsWith(fileName, "chrome://custombuttons"_ns) ||
+        StringBeginsWith(fileName, "chrome://tabgroups-resource/"_ns)) {
+      return FilenameTypeAndDetails(kSuspectedUserChromeJS,
+                                    Some(StripQueryRef(fileName)));
+    }
+    return FilenameTypeAndDetails(kChromeURI, Some(StripQueryRef(fileName)));
+  }
+  if (StringBeginsWith(fileName, "resource://"_ns)) {
+    if (StringBeginsWith(fileName, "resource://usl-ucjs/"_ns) ||
+        StringBeginsWith(fileName, "resource://sfm-ucjs/"_ns) ||
+        StringBeginsWith(fileName, "resource://cpmanager-legacy/"_ns) ||
+        StringBeginsWith(fileName, "resource://pwa/utils/"_ns)) {
+      return FilenameTypeAndDetails(kSuspectedUserChromeJS,
+                                    Some(StripQueryRef(fileName)));
+    }
+    return FilenameTypeAndDetails(kResourceURI, Some(StripQueryRef(fileName)));
+  }
+  if (StringBeginsWith(fileName, "moz-src://"_ns)) {
+    return FilenameTypeAndDetails(kMozSrcURI, Some(StripQueryRef(fileName)));
+  }
+
+  if (StringBeginsWith(fileName, "blob:"_ns)) {
+    return FilenameTypeAndDetails(kBlobUri, Nothing());
+  }
+  if (StringBeginsWith(fileName, "data:text/css;extension=style;"_ns)) {
+    return FilenameTypeAndDetails(kDataUriWebExtCStyle, Nothing());
+  }
+  if (StringBeginsWith(fileName, "data:"_ns)) {
+    return FilenameTypeAndDetails(kDataUri, Nothing());
+  }
+
+  if (NS_IsMainThread()) {
+    NS_ConvertUTF8toUTF16 fileNameA(fileName);
+    bool regexMatch;
+    nsTArray<nsString> regexResults;
+    nsresult rv =
+        RegexEval(kExtensionRegex, fileNameA,
+                   false, regexMatch, &regexResults);
+    if (NS_FAILED(rv)) {
+      return FilenameTypeAndDetails(kRegexFailure, Nothing());
+    }
+    if (regexMatch) {
+      nsCString type = StringEndsWith(regexResults[2], u"mozilla.org.xpi"_ns)
+                           ? kMozillaExtensionFile
+                           : kOtherExtensionFile;
+      const auto& extensionNameAndPath =
+          Substring(regexResults[0], std::size("extensions/") - 1);
+      return FilenameTypeAndDetails(
+          type, Some(OptimizeFileName(extensionNameAndPath)));
+    }
+
+    rv = RegexEval(kSingleFileRegex, fileNameA,  true,
+                   regexMatch);
+    if (NS_FAILED(rv)) {
+      return FilenameTypeAndDetails(kRegexFailure, Nothing());
+    }
+    if (regexMatch) {
+      return FilenameTypeAndDetails(kSingleString, Some(nsCString(fileName)));
+    }
+
+    rv = RegexEval(kUCJSRegex, fileNameA,  true, regexMatch);
+    if (NS_FAILED(rv)) {
+      return FilenameTypeAndDetails(kRegexFailure, Nothing());
+    }
+    if (regexMatch) {
+      return FilenameTypeAndDetails(kSuspectedUserChromeJS, Nothing());
+    }
+  }
+
+  if (StringBeginsWith(fileName, "about:"_ns)) {
+    return FilenameTypeAndDetails(kAboutUri, Some(StripQueryRef(fileName)));
+  }
+
+
+  if (!NS_IsMainThread()) {
+    return FilenameTypeAndDetails(kOtherWorker, Nothing());
+  }
+  return FilenameTypeAndDetails(kOther, Nothing());
+}
+
+#if defined(NIGHTLY_BUILD)
+void PossiblyCrash(const char* aPrefSuffix, const char* aUnsafeCrashString,
+                   const nsCString& aSafeCrashString) {
+  if (MOZ_UNLIKELY(!XRE_IsParentProcess())) {
+    return;
+  }
+  if (!NS_IsMainThread()) {
+    return;
+  }
+
+  nsCString previous_crashes("security.crash_tracking.");
+  previous_crashes.Append(aPrefSuffix);
+  previous_crashes.Append(".prevCrashes");
+
+  nsCString max_crashes("security.crash_tracking.");
+  max_crashes.Append(aPrefSuffix);
+  max_crashes.Append(".maxCrashes");
+
+  int32_t numberOfPreviousCrashes = 0;
+  numberOfPreviousCrashes = Preferences::GetInt(previous_crashes.get(), 0);
+
+  int32_t maxAllowableCrashes = 0;
+  maxAllowableCrashes = Preferences::GetInt(max_crashes.get(), 0);
+
+  if (numberOfPreviousCrashes >= maxAllowableCrashes) {
+    return;
+  }
+
+  nsresult rv =
+      Preferences::SetInt(previous_crashes.get(), ++numberOfPreviousCrashes);
+  if (NS_FAILED(rv)) {
+    return;
+  }
+
+  nsCOMPtr<nsIPrefService> prefsCom = Preferences::GetService();
+  Preferences* prefs = static_cast<Preferences*>(prefsCom.get());
+
+  if (!prefs->AllowOffMainThreadSave()) {
+    return;
+  }
+
+  rv = prefs->SavePrefFileBlocking();
+  if (!NS_FAILED(rv)) {
+    MOZ_CRASH_UNSAFE_PRINTF(
+        "%s",
+        nsContentSecurityUtils::SmartFormatCrashString(aSafeCrashString.get()));
+  }
+}
+#endif
+
+class EvalUsageNotificationRunnable final : public Runnable {
+ public:
+  EvalUsageNotificationRunnable(bool aIsSystemPrincipal,
+                                const nsACString& aFileName, uint64_t aWindowID,
+                                uint32_t aLineNumber, uint32_t aColumnNumber)
+      : mozilla::Runnable("EvalUsageNotificationRunnable"),
+        mIsSystemPrincipal(aIsSystemPrincipal),
+        mFileName(aFileName),
+        mWindowID(aWindowID),
+        mLineNumber(aLineNumber),
+        mColumnNumber(aColumnNumber) {}
+
+  NS_IMETHOD Run() override {
+    nsContentSecurityUtils::NotifyEvalUsage(
+        mIsSystemPrincipal, mFileName, mWindowID, mLineNumber, mColumnNumber);
+    return NS_OK;
+  }
+
+  void Revoke() {}
+
+ private:
+  bool mIsSystemPrincipal;
+  nsCString mFileName;
+  uint64_t mWindowID;
+  uint32_t mLineNumber;
+  uint32_t mColumnNumber;
+};
+
+bool nsContentSecurityUtils::IsEvalAllowed(JSContext* cx,
+                                           bool aIsSystemPrincipal,
+                                           const nsAString& aScript) {
+  static nsLiteralCString evalAllowlist[] = {
+      "resource://testing-common/sinon-7.2.7.js"_ns,
+      "resource://testing-common/content-task.js"_ns,
+
+      "resource://gre/modules/translations/cld-worker.js"_ns,
+
+      "resource://gre/modules/workers/require.js"_ns,
+
+  };
+
+  static constexpr auto sAllowedEval1 = u"this"_ns;
+  static constexpr auto sAllowedEval2 =
+      u"function anonymous(\n) {\nreturn this\n}"_ns;
+
+  if (MOZ_LIKELY(!aIsSystemPrincipal && !XRE_IsE10sParentProcess())) {
+    return true;
+  }
+
+  if (JS::ContextOptionsRef(cx).disableEvalSecurityChecks()) {
+    MOZ_LOG(sCSMLog, LogLevel::Debug,
+            ("Allowing eval() because this JSContext was set to allow it"));
+    return true;
+  }
+
+  if (StaticPrefs::
+          security_allow_unsafe_dangerous_privileged_evil_eval_AtStartup()) {
+    MOZ_LOG(
+        sCSMLog, LogLevel::Debug,
+        ("Allowing eval() because "
+         "security.allow_unsafe_dangerous_priviliged_evil_eval is enabled."));
+    return true;
+  }
+
+  if (aIsSystemPrincipal &&
+      StaticPrefs::security_allow_eval_with_system_principal()) {
+    MOZ_LOG(sCSMLog, LogLevel::Debug,
+            ("Allowing eval() with System Principal because allowing pref is "
+             "enabled"));
+    return true;
+  }
+
+  if (XRE_IsE10sParentProcess() &&
+      StaticPrefs::security_allow_eval_in_parent_process()) {
+    MOZ_LOG(sCSMLog, LogLevel::Debug,
+            ("Allowing eval() in parent process because allowing pref is "
+             "enabled"));
+    return true;
+  }
+
+  if (!aScript.IsEmpty() &&
+      (aScript == sAllowedEval1 || aScript == sAllowedEval2)) {
+    MOZ_LOG(
+        sCSMLog, LogLevel::Debug,
+        ("Allowing eval() %s because a key string is "
+         "provided",
+         (aIsSystemPrincipal ? "with System Principal" : "in parent process")));
+    return true;
+  }
+
+  auto location = JSCallingLocation::Get(cx);
+  const nsCString& fileName = location.FileName();
+  for (const nsLiteralCString& allowlistEntry : evalAllowlist) {
+    if (StringBeginsWith(fileName, allowlistEntry)) {
+      MOZ_LOG(sCSMLog, LogLevel::Debug,
+              ("Allowing eval() %s because the containing "
+               "file is in the allowlist",
+               (aIsSystemPrincipal ? "with System Principal"
+                                   : "in parent process")));
+      return true;
+    }
+  }
+
+  uint64_t windowID = nsJSUtils::GetCurrentlyRunningCodeInnerWindowID(cx);
+  if (NS_IsMainThread()) {
+    nsContentSecurityUtils::NotifyEvalUsage(aIsSystemPrincipal, fileName,
+                                            windowID, location.mLine,
+                                            location.mColumn);
+  } else {
+    auto runnable = new EvalUsageNotificationRunnable(
+        aIsSystemPrincipal, fileName, windowID, location.mLine,
+        location.mColumn);
+    NS_DispatchToMainThread(runnable);
+  }
+
+  MOZ_LOG(sCSMLog, LogLevel::Error,
+          ("Blocking eval() %s from file %s and script "
+           "provided %s",
+           (aIsSystemPrincipal ? "with System Principal" : "in parent process"),
+           fileName.get(), NS_ConvertUTF16toUTF8(aScript).get()));
+
+#if defined(DEBUG) || 0
+  auto crashString = nsContentSecurityUtils::SmartFormatCrashString(
+      NS_ConvertUTF16toUTF8(aScript).get(), fileName.get(),
+      (aIsSystemPrincipal
+           ? "Blocking eval() with System Principal with script %s from file %s"
+           : "Blocking eval() in parent process with script %s from file %s"));
+  MOZ_CRASH_UNSAFE_PRINTF("%s", crashString.get());
+#endif
+
+  return false;
+}
+
+void nsContentSecurityUtils::NotifyEvalUsage(bool aIsSystemPrincipal,
+                                             const nsACString& aFileName,
+                                             uint64_t aWindowID,
+                                             uint32_t aLineNumber,
+                                             uint32_t aColumnNumber) {
+  FilenameTypeAndDetails fileNameTypeAndDetails =
+      FilenameToFilenameType(aFileName);
+  auto fileinfo = std::move(fileNameTypeAndDetails.second);
+  auto value = Some(std::move(fileNameTypeAndDetails.first));
+  if (aIsSystemPrincipal) {
+
+
+  } else {
+
+
+  }
+
+  nsCOMPtr<nsIConsoleService> console(
+      do_GetService(NS_CONSOLESERVICE_CONTRACTID));
+  if (!console) {
+    return;
+  }
+  nsCOMPtr<nsIScriptError> error(do_CreateInstance(NS_SCRIPTERROR_CONTRACTID));
+  if (!error) {
+    return;
+  }
+  nsCOMPtr<nsIStringBundle> bundle;
+  nsCOMPtr<nsIStringBundleService> stringService =
+      mozilla::components::StringBundle::Service();
+  if (!stringService) {
+    return;
+  }
+  stringService->CreateBundle(
+      "chrome://global/locale/security/security.properties",
+      getter_AddRefs(bundle));
+  if (!bundle) {
+    return;
+  }
+  nsAutoString message;
+  NS_ConvertUTF8toUTF16 fileNameA(aFileName);
+  AutoTArray<nsString, 1> formatStrings = {std::move(fileNameA)};
+  nsresult rv = bundle->FormatStringFromName("RestrictBrowserEvalUsage",
+                                             formatStrings, message);
+  if (NS_FAILED(rv)) {
+    return;
+  }
+
+  rv = error->InitWithWindowID(message, aFileName, aLineNumber, aColumnNumber,
+                               nsIScriptError::errorFlag, "BrowserEvalUsage",
+                               aWindowID, true );
+  if (NS_FAILED(rv)) {
+    return;
+  }
+  console->LogMessage(error);
+}
+
+class JSHackPrefObserver final {
+ public:
+  JSHackPrefObserver() = default;
+  static void PrefChanged(const char* aPref, void* aData);
+
+ protected:
+  ~JSHackPrefObserver() = default;
+};
+
+void JSHackPrefObserver::PrefChanged(const char* aPref, void* aData) {
+  sJSHacksChecked = false;
+}
+
+static bool sJSHackObserverAdded = false;
+
+void nsContentSecurityUtils::DetectJsHacks() {
+  if (!NS_IsMainThread()) {
+    return;
+  }
+
+  if (!Preferences::IsServiceAvailable()) {
+    return;
+  }
+
+  if (MOZ_LIKELY(sJSHacksChecked || sJSHacksPresent)) {
+    return;
+  }
+
+  static const char* kObservedPrefs[] = {
+      "xpinstall.signatures.required", "general.config.filename",
+      "autoadmin.global_config_url", "autoadmin.failover_to_cached", nullptr};
+  if (MOZ_UNLIKELY(!sJSHackObserverAdded)) {
+    Preferences::RegisterCallbacks(JSHackPrefObserver::PrefChanged,
+                                   kObservedPrefs);
+    sJSHackObserverAdded = true;
+  }
+
+  nsresult rv;
+  sJSHacksChecked = true;
+
+  bool xpinstallSignatures;
+  rv = Preferences::GetBool("xpinstall.signatures.required",
+                            &xpinstallSignatures, PrefValueKind::Default);
+  if (!NS_FAILED(rv) && !xpinstallSignatures) {
+    sJSHacksPresent = true;
+    return;
+  }
+  rv = Preferences::GetBool("xpinstall.signatures.required",
+                            &xpinstallSignatures, PrefValueKind::User);
+  if (!NS_FAILED(rv) && !xpinstallSignatures) {
+    sJSHacksPresent = true;
+    return;
+  }
+
+  if (Preferences::HasDefaultValue("general.config.filename")) {
+    sJSHacksPresent = true;
+    return;
+  }
+  if (Preferences::HasUserValue("general.config.filename")) {
+    sJSHacksPresent = true;
+    return;
+  }
+  if (Preferences::HasDefaultValue("autoadmin.global_config_url")) {
+    sJSHacksPresent = true;
+    return;
+  }
+  if (Preferences::HasUserValue("autoadmin.global_config_url")) {
+    sJSHacksPresent = true;
+    return;
+  }
+
+  bool failOverToCache;
+  rv = Preferences::GetBool("autoadmin.failover_to_cached", &failOverToCache,
+                            PrefValueKind::Default);
+  if (!NS_FAILED(rv) && failOverToCache) {
+    sJSHacksPresent = true;
+    return;
+  }
+  rv = Preferences::GetBool("autoadmin.failover_to_cached", &failOverToCache,
+                            PrefValueKind::User);
+  if (!NS_FAILED(rv) && failOverToCache) {
+    sJSHacksPresent = true;
+  }
+}
+
+nsresult nsContentSecurityUtils::GetHttpChannelFromPotentialMultiPart(
+    nsIChannel* aChannel, nsIHttpChannel** aHttpChannel) {
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(aChannel);
+  if (httpChannel) {
+    httpChannel.forget(aHttpChannel);
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIMultiPartChannel> multipart = do_QueryInterface(aChannel);
+  if (!multipart) {
+    *aHttpChannel = nullptr;
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIChannel> baseChannel;
+  nsresult rv = multipart->GetBaseChannel(getter_AddRefs(baseChannel));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  httpChannel = do_QueryInterface(baseChannel);
+  httpChannel.forget(aHttpChannel);
+
+  return NS_OK;
+}
+
+nsresult CheckCSPFrameAncestorPolicy(nsIChannel* aChannel,
+                                     nsIContentSecurityPolicy** aOutCSP) {
+  MOZ_ASSERT(aChannel);
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  ExtContentPolicyType contentType = loadInfo->GetExternalContentPolicyType();
+  if (contentType != ExtContentPolicy::TYPE_SUBDOCUMENT &&
+      contentType != ExtContentPolicy::TYPE_OBJECT) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChannel;
+  nsresult rv = nsContentSecurityUtils::GetHttpChannelFromPotentialMultiPart(
+      aChannel, getter_AddRefs(httpChannel));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+  if (!httpChannel) {
+    return NS_OK;
+  }
+
+  nsAutoCString tCspHeaderValue, tCspROHeaderValue;
+  if (httpChannel) {
+    (void)httpChannel->GetResponseHeader("content-security-policy"_ns,
+                                         tCspHeaderValue);
+
+    (void)httpChannel->GetResponseHeader(
+        "content-security-policy-report-only"_ns, tCspROHeaderValue);
+
+    if (tCspHeaderValue.IsEmpty() && tCspROHeaderValue.IsEmpty()) {
+      return NS_OK;
+    }
+  }
+
+  nsCOMPtr<nsIPrincipal> resultPrincipal;
+  rv = nsContentUtils::GetSecurityManager()->GetChannelResultPrincipal(
+      aChannel, getter_AddRefs(resultPrincipal));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  RefPtr<nsCSPContext> csp = new nsCSPContext();
+  csp->SuppressParserLogMessages();
+
+  nsCOMPtr<nsIURI> selfURI;
+  nsAutoCString referrerSpec;
+  aChannel->GetURI(getter_AddRefs(selfURI));
+  nsCOMPtr<nsIReferrerInfo> referrerInfo = httpChannel->GetReferrerInfo();
+  if (referrerInfo) {
+    referrerInfo->GetComputedReferrerSpec(referrerSpec);
+  }
+
+  uint64_t innerWindowID = loadInfo->GetInnerWindowID();
+
+  rv = csp->SetRequestContextWithPrincipal(resultPrincipal, selfURI,
+                                           referrerSpec, innerWindowID);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  NS_ConvertASCIItoUTF16 cspHeaderValue(tCspHeaderValue);
+  NS_ConvertASCIItoUTF16 cspROHeaderValue(tCspROHeaderValue);
+
+  if (!cspHeaderValue.IsEmpty()) {
+    rv = CSP_AppendCSPFromHeader(csp, cspHeaderValue, false);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  if (!cspROHeaderValue.IsEmpty()) {
+    rv = CSP_AppendCSPFromHeader(csp, cspROHeaderValue, true);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  bool safeAncestry = false;
+  rv = csp->PermitsAncestry(loadInfo, &safeAncestry);
+
+  if (NS_FAILED(rv) || !safeAncestry) {
+    return NS_ERROR_CSP_FRAME_ANCESTOR_VIOLATION;
+  }
+
+  csp.forget(aOutCSP);
+
+  return NS_OK;
+}
+
+void EnforceCSPFrameAncestorPolicy(nsIChannel* aChannel,
+                                   const nsresult& aError) {
+  if (aError == NS_ERROR_CSP_FRAME_ANCESTOR_VIOLATION) {
+    aChannel->Cancel(NS_ERROR_CSP_FRAME_ANCESTOR_VIOLATION);
+  }
+}
+
+void EnforceXFrameOptionsCheck(nsIChannel* aChannel,
+                               nsIContentSecurityPolicy* aCsp) {
+  MOZ_ASSERT(aChannel);
+  bool isFrameOptionsIgnored = false;
+  if (!FramingChecker::CheckFrameOptions(aChannel, aCsp,
+                                         isFrameOptionsIgnored)) {
+    aChannel->Cancel(NS_ERROR_XFO_VIOLATION);
+  }
+
+  if (isFrameOptionsIgnored) {
+    nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+    uint64_t innerWindowID = loadInfo->GetInnerWindowID();
+    bool privateWindow = loadInfo->GetOriginAttributes().IsPrivateBrowsing();
+    AutoTArray<nsString, 2> params = {u"x-frame-options"_ns,
+                                      u"frame-ancestors"_ns};
+    CSP_LogLocalizedStr("IgnoringSrcBecauseOfDirective", params,
+                        ""_ns,   
+                        u""_ns,  
+                        0,       
+                        1,       
+                        nsIScriptError::warningFlag,
+                        "IgnoringSrcBecauseOfDirective"_ns, innerWindowID,
+                        privateWindow);
+  }
+}
+
+void nsContentSecurityUtils::PerformCSPFrameAncestorAndXFOCheck(
+    nsIChannel* aChannel) {
+  nsCOMPtr<nsIContentSecurityPolicy> csp;
+  nsresult rv = CheckCSPFrameAncestorPolicy(aChannel, getter_AddRefs(csp));
+
+  if (NS_FAILED(rv)) {
+    EnforceCSPFrameAncestorPolicy(aChannel, rv);
+    return;
+  }
+
+  EnforceXFrameOptionsCheck(aChannel, csp);
+}
+bool nsContentSecurityUtils::CheckCSPFrameAncestorAndXFO(nsIChannel* aChannel) {
+  nsCOMPtr<nsIContentSecurityPolicy> csp;
+  nsresult rv = CheckCSPFrameAncestorPolicy(aChannel, getter_AddRefs(csp));
+
+  if (NS_FAILED(rv)) {
+    return false;
+  }
+
+  bool isFrameOptionsIgnored = false;
+
+  return FramingChecker::CheckFrameOptions(aChannel, csp,
+                                           isFrameOptionsIgnored);
+}
+
+nsString nsContentSecurityUtils::GetIsElementNonceableNonce(
+    const Element& aElement) {
+  nsString nonce;
+  if (nsString* cspNonce =
+          static_cast<nsString*>(aElement.GetProperty(nsGkAtoms::nonce))) {
+    nonce = *cspNonce;
+  }
+  if (nonce.IsEmpty()) {
+    return nonce;
+  }
+
+  if (nsCOMPtr<nsIScriptElement> script =
+          do_QueryInterface(const_cast<Element*>(&aElement))) {
+    auto containsScriptOrStyle = [](const nsAString& aStr) {
+      return aStr.LowerCaseFindASCII("<script") != kNotFound ||
+             aStr.LowerCaseFindASCII("<style") != kNotFound;
+    };
+
+    nsString value;
+    uint32_t i = 0;
+    while (BorrowedAttrInfo info = aElement.GetAttrInfoAt(i++)) {
+      const nsAttrName* name = info.mName;
+      if (nsAtom* prefix = name->GetPrefix()) {
+        if (containsScriptOrStyle(nsDependentAtomString(prefix))) {
+          return EmptyString();
+        }
+      }
+      if (containsScriptOrStyle(nsDependentAtomString(name->LocalName()))) {
+        return EmptyString();
+      }
+
+      info.mValue->ToString(value);
+      if (containsScriptOrStyle(value)) {
+        return EmptyString();
+      }
+    }
+  }
+
+  if (aElement.HasFlag(ELEMENT_PARSER_HAD_DUPLICATE_ATTR_ERROR)) {
+    return EmptyString();
+  }
+
+  return nonce;
+}
+
+#if defined(DEBUG)
+
+#  include "mozilla/dom/nsCSPContext.h"
+
+
+static nsLiteralCString sStyleSrcDataAllowList[] = {
+    "about:preferences"_ns,
+    "about:settings"_ns,
+};
+static nsLiteralCString sStyleSrcUnsafeInlineAllowList[] = {
+    "about:preferences"_ns,
+    "about:settings"_ns,
+    "about:addons"_ns,
+    "about:newtab"_ns,
+    "about:welcome"_ns,
+    "about:home"_ns,
+    "chrome://browser/content/pageinfo/pageInfo.xhtml"_ns,
+    "chrome://browser/content/places/bookmarkProperties.xhtml"_ns,
+    "chrome://browser/content/places/bookmarksSidebar.xhtml"_ns,
+    "chrome://browser/content/places/historySidebar.xhtml"_ns,
+    "chrome://browser/content/places/interactionsViewer.html"_ns,
+    "chrome://browser/content/places/places.xhtml"_ns,
+    "chrome://browser/content/preferences/dialogs/applicationManager.xhtml"_ns,
+    "chrome://browser/content/preferences/dialogs/browserLanguages.xhtml"_ns,
+    "chrome://browser/content/preferences/dialogs/colors.xhtml"_ns,
+    "chrome://browser/content/preferences/dialogs/connection.xhtml"_ns,
+    "chrome://browser/content/preferences/dialogs/containers.xhtml"_ns,
+    "chrome://browser/content/preferences/dialogs/dohExceptions.xhtml"_ns,
+    "chrome://browser/content/preferences/dialogs/fonts.xhtml"_ns,
+    "chrome://browser/content/preferences/dialogs/languages.xhtml"_ns,
+    "chrome://browser/content/preferences/dialogs/permissions.xhtml"_ns,
+    "chrome://browser/content/preferences/dialogs/selectBookmark.xhtml"_ns,
+    "chrome://browser/content/preferences/dialogs/siteDataSettings.xhtml"_ns,
+    "chrome://browser/content/preferences/dialogs/sitePermissions.xhtml"_ns,
+    "chrome://browser/content/preferences/dialogs/syncChooseWhatToSync.xhtml"_ns,
+    "chrome://browser/content/preferences/fxaPairDevice.xhtml"_ns,
+    "chrome://browser/content/safeMode.xhtml"_ns,
+    "chrome://browser/content/sanitize_v2.xhtml"_ns,
+    "chrome://browser/content/search/addEngine.xhtml"_ns,
+    "chrome://browser/content/setDesktopBackground.xhtml"_ns,
+    "chrome://browser/content/spotlight.html"_ns,
+    "chrome://formautofill/content/manageAddresses.xhtml"_ns,
+    "chrome://formautofill/content/manageCreditCards.xhtml"_ns,
+    "chrome://gfxsanity/content/sanityparent.html"_ns,
+    "chrome://gfxsanity/content/sanitytest.html"_ns,
+    "chrome://global/content/commonDialog.xhtml"_ns,
+    "chrome://global/content/resetProfileProgress.xhtml"_ns,
+    "chrome://layoutdebug/content/layoutdebug.xhtml"_ns,
+    "chrome://mozapps/content/downloads/unknownContentType.xhtml"_ns,
+    "chrome://mozapps/content/handling/appChooser.xhtml"_ns,
+    "chrome://mozapps/content/preferences/changemp.xhtml"_ns,
+    "chrome://mozapps/content/preferences/removemp.xhtml"_ns,
+    "chrome://mozapps/content/profile/profileDowngrade.xhtml"_ns,
+    "chrome://mozapps/content/profile/profileSelection.xhtml"_ns,
+    "chrome://mozapps/content/profile/createProfileWizard.xhtml"_ns,
+    "chrome://mozapps/content/update/history.xhtml"_ns,
+    "chrome://mozapps/content/update/updateElevation.xhtml"_ns,
+    "chrome://pippki/content/certManager.xhtml"_ns,
+    "chrome://pippki/content/changepassword.xhtml"_ns,
+    "chrome://pippki/content/deletecert.xhtml"_ns,
+    "chrome://pippki/content/device_manager.xhtml"_ns,
+    "chrome://pippki/content/downloadcert.xhtml"_ns,
+    "chrome://pippki/content/editcacert.xhtml"_ns,
+    "chrome://pippki/content/load_device.xhtml"_ns,
+    "chrome://pippki/content/resetpassword.xhtml"_ns,
+    "chrome://pippki/content/setp12password.xhtml"_ns,
+};
+static nsLiteralCString sImgSrcMozRemoteImageAllowList[] = {
+    "about:firefoxview"_ns,
+    "about:preferences"_ns,
+    "about:processes"_ns,
+    "about:settings"_ns,
+    "chrome://browser/content/firefoxview/firefoxview.html"_ns,
+    "chrome://browser/content/preferences/dialogs/applicationManager.xhtml"_ns,
+    "chrome://browser/content/sidebar/sidebar-syncedtabs.html"_ns,
+    "chrome://global/content/aboutProcesses.html"_ns,
+    "chrome://mozapps/content/handling/appChooser.xhtml"_ns,
+};
+static nsLiteralCString sImgSrcDataBlobAllowList[] = {
+    "about:addons"_ns,
+    "about:debugging"_ns,
+    "about:deleteprofile"_ns,
+    "about:devtools-toolbox"_ns,
+    "about:editprofile"_ns,
+    "about:firefoxview"_ns,
+    "about:home"_ns,
+    "about:logins"_ns,
+    "about:newprofile"_ns,
+    "about:newtab"_ns,
+    "about:opentabs"_ns,
+    "about:preferences"_ns,
+    "about:privatebrowsing"_ns,
+    "about:processes"_ns,
+    "about:profilemanager"_ns,
+    "about:protections"_ns,
+    "about:reader"_ns,
+    "about:sessionrestore"_ns,
+    "about:settings"_ns,
+    "about:test-about-content-search-ui"_ns,
+    "about:welcome"_ns,
+    "chrome://browser/content/aboutDialog.xhtml"_ns,
+    "chrome://browser/content/aboutlogins/aboutLogins.html"_ns,
+    "chrome://browser/content/qrcode/qrcode-dialog.html"_ns,
+    "chrome://browser/content/places/bookmarksSidebar.xhtml"_ns,
+    "chrome://browser/content/places/places.xhtml"_ns,
+    "chrome://browser/content/preferences/dialogs/permissions.xhtml"_ns,
+    "chrome://browser/content/preferences/fxaPairDevice.xhtml"_ns,
+    "chrome://browser/content/screenshots/screenshots-preview.html"_ns,
+    "chrome://browser/content/sidebar/sidebar-bookmarks.html"_ns,
+    "chrome://browser/content/sidebar/sidebar-customize.html"_ns,
+    "chrome://browser/content/sidebar/sidebar-history.html"_ns,
+    "chrome://browser/content/sidebar/sidebar-opentabs.html"_ns,
+    "chrome://browser/content/sidebar/sidebar-syncedtabs.html"_ns,
+    "chrome://browser/content/spotlight.html"_ns,
+    "chrome://browser/content/syncedtabs/sidebar.xhtml"_ns,
+    "chrome://global/content/alerts/alert.xhtml"_ns,
+    "chrome://global/content/print.html"_ns,
+};
+static nsLiteralCString sImgSrcHttpsAllowList[] = {
+    "about:addons"_ns,
+    "about:debugging"_ns,
+    "about:home"_ns,
+    "about:newtab"_ns,
+    "about:preferences"_ns,
+    "about:settings"_ns,
+    "about:welcome"_ns,
+};
+static nsLiteralCString sImgSrcHttpAllowList[] = {
+    "about:addons"_ns,
+};
+static nsLiteralCString sImgSrcAddonsAllowList[] = {
+    "about:addons"_ns,
+};
+static nsLiteralCString sImgSrcWildcardAllowList[] = {
+    "about:reader"_ns,
+    "chrome://browser/content/syncedtabs/sidebar.xhtml"_ns,
+};
+static nsLiteralCString sImgSrcHttpsHostAllowList[] = {
+    "about:logins"_ns,
+    "chrome://browser/content/aboutlogins/aboutLogins.html"_ns,
+    "chrome://browser/content/spotlight.html"_ns,
+};
+static nsLiteralCString sMediaSrcWildcardAllowList[] = {
+    "about:reader"_ns,
+};
+static nsLiteralCString sMediaSrcHttpsHostAllowList[] = {"about:welcome"_ns};
+static nsLiteralCString sConnectSrcHttpsAllowList[] = {
+    "about:addons"_ns,
+    "about:home"_ns,
+    "about:newtab"_ns,
+    "about:welcome"_ns,
+};
+static nsLiteralCString sConnectSrcAddonsAllowList[] = {
+    "about:addons"_ns,
+};
+static nsLiteralCString sFrameSrcHttpsHostAllowList[] = {
+    "about:home"_ns,
+    "about:newtab"_ns,
+};
+
+class DisallowingVisitor : public nsCSPSrcVisitor {
+ public:
+  DisallowingVisitor(CSPDirective aDirective, nsACString& aURL)
+      : mDirective(aDirective), mURL(aURL) {}
+
+  bool visit(const nsCSPPolicy* aPolicy) {
+    return aPolicy->visitDirectiveSrcs(mDirective, this);
+  }
+
+  bool visitSchemeSrc(const nsCSPSchemeSrc& src) override {
+    Assert(src);
+    return false;
+  };
+
+  bool visitHostSrc(const nsCSPHostSrc& src) override {
+    Assert(src);
+    return false;
+  };
+
+  bool visitKeywordSrc(const nsCSPKeywordSrc& src) override {
+    if (src.isKeyword(CSPKeyword::CSP_NONE)) {
+      return true;
+    }
+
+    Assert(src);
+    return false;
+  }
+
+  bool visitNonceSrc(const nsCSPNonceSrc& src) override {
+    Assert(src);
+    return false;
+  };
+
+  bool visitHashSrc(const nsCSPHashSrc& src) override {
+    Assert(src);
+    return false;
+  };
+
+ protected:
+  bool CheckAllowList(Span<nsLiteralCString> aList) {
+    for (const nsLiteralCString& entry : aList) {
+      if (StringBeginsWith(mURL, entry)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  void Assert(const nsCSPBaseSrc& aSrc) {
+    nsAutoString srcStr;
+    aSrc.toString(srcStr);
+    NS_ConvertUTF16toUTF8 srcStrUtf8(srcStr);
+
+    MOZ_CRASH_UNSAFE_PRINTF(
+        "Page %s must not contain a CSP with the "
+        "directive %s that includes %s",
+        mURL.get(), CSP_CSPDirectiveToString(mDirective), srcStrUtf8.get());
+  }
+
+  CSPDirective mDirective;
+  nsCString mURL;
+};
+
+class AllowBuiltinSrcVisitor : public DisallowingVisitor {
+ public:
+  AllowBuiltinSrcVisitor(CSPDirective aDirective, nsACString& aURL)
+      : DisallowingVisitor(aDirective, aURL) {}
+
+  bool visitSchemeSrc(const nsCSPSchemeSrc& src) override {
+    nsAutoString scheme;
+    src.getScheme(scheme);
+    if (scheme == u"chrome"_ns || scheme == u"moz-src" ||
+        scheme == u"resource"_ns) {
+      return true;
+    }
+
+    return DisallowingVisitor::visitSchemeSrc(src);
+  }
+
+ protected:
+  bool VisitHostSrcWithWildcardAndHttpsHostAllowLists(
+      const nsCSPHostSrc& aSrc, const Span<nsLiteralCString> aWildcard,
+      const Span<nsLiteralCString> aHttpsHost) {
+    nsAutoString str;
+    aSrc.toString(str);
+
+    if (str.EqualsLiteral("*")) {
+      if (CheckAllowList(aWildcard)) {
+        return true;
+      }
+    } else {
+      MOZ_ASSERT(StringBeginsWith(str, u"https://"_ns),
+                 "Must use https: for host sources!");
+      MOZ_ASSERT(!FindInReadable(u"*"_ns, str),
+                 "Can not include wildcard in host sources!");
+      if (CheckAllowList(aHttpsHost)) {
+        return true;
+      }
+    }
+
+    return DisallowingVisitor::visitHostSrc(aSrc);
+  }
+};
+
+class StyleSrcVisitor : public AllowBuiltinSrcVisitor {
+ public:
+  StyleSrcVisitor(CSPDirective aDirective, nsACString& aURL)
+      : AllowBuiltinSrcVisitor(aDirective, aURL) {
+    MOZ_ASSERT(aDirective == CSPDirective::STYLE_SRC_DIRECTIVE);
+  }
+
+  bool visitSchemeSrc(const nsCSPSchemeSrc& src) override {
+    nsAutoString scheme;
+    src.getScheme(scheme);
+
+    if (scheme == u"data"_ns) {
+      if (CheckAllowList(Span(sStyleSrcDataAllowList))) {
+        return true;
+      }
+    }
+
+    return AllowBuiltinSrcVisitor::visitSchemeSrc(src);
+  }
+
+  bool visitKeywordSrc(const nsCSPKeywordSrc& src) override {
+    if (src.isKeyword(CSPKeyword::CSP_UNSAFE_INLINE)) {
+      if (CheckAllowList(Span(sStyleSrcUnsafeInlineAllowList))) {
+        return true;
+      }
+    }
+
+    return AllowBuiltinSrcVisitor::visitKeywordSrc(src);
+  }
+};
+
+class ImgSrcVisitor : public AllowBuiltinSrcVisitor {
+ public:
+  ImgSrcVisitor(CSPDirective aDirective, nsACString& aURL)
+      : AllowBuiltinSrcVisitor(aDirective, aURL) {
+    MOZ_ASSERT(aDirective == CSPDirective::IMG_SRC_DIRECTIVE);
+  }
+
+  bool visitSchemeSrc(const nsCSPSchemeSrc& src) override {
+    nsAutoString scheme;
+    src.getScheme(scheme);
+
+    if (scheme == u"moz-icon"_ns) {
+      return true;
+    }
+
+    if (scheme == u"page-icon"_ns) {
+      return true;
+    }
+
+    if (scheme == u"moz-remote-image"_ns) {
+      if (CheckAllowList(sImgSrcMozRemoteImageAllowList)) {
+        return true;
+      }
+    }
+
+    if (scheme == u"data"_ns || scheme == u"blob") {
+      if (CheckAllowList(sImgSrcDataBlobAllowList)) {
+        return true;
+      }
+    }
+
+    if (scheme == u"https"_ns) {
+      if (CheckAllowList(Span(sImgSrcHttpsAllowList))) {
+        return true;
+      }
+    }
+
+    if (scheme == u"http"_ns) {
+      if (CheckAllowList(Span(sImgSrcHttpAllowList))) {
+        return true;
+      }
+    }
+
+    if (scheme == u"jar"_ns || scheme == u"file"_ns) {
+      if (CheckAllowList(Span(sImgSrcAddonsAllowList))) {
+        return true;
+      }
+    }
+
+    return AllowBuiltinSrcVisitor::visitSchemeSrc(src);
+  }
+
+  bool visitHostSrc(const nsCSPHostSrc& src) override {
+    return VisitHostSrcWithWildcardAndHttpsHostAllowLists(
+        src, sImgSrcWildcardAllowList, sImgSrcHttpsHostAllowList);
+  }
+};
+
+class MediaSrcVisitor : public AllowBuiltinSrcVisitor {
+ public:
+  MediaSrcVisitor(CSPDirective aDirective, nsACString& aURL)
+      : AllowBuiltinSrcVisitor(aDirective, aURL) {
+    MOZ_ASSERT(aDirective == CSPDirective::MEDIA_SRC_DIRECTIVE);
+  }
+
+  bool visitHostSrc(const nsCSPHostSrc& src) override {
+    return VisitHostSrcWithWildcardAndHttpsHostAllowLists(
+        src, sMediaSrcWildcardAllowList, sMediaSrcHttpsHostAllowList);
+  }
+};
+
+class ConnectSrcVisitor : public AllowBuiltinSrcVisitor {
+ public:
+  ConnectSrcVisitor(CSPDirective aDirective, nsACString& aURL)
+      : AllowBuiltinSrcVisitor(aDirective, aURL) {
+    MOZ_ASSERT(aDirective == CSPDirective::CONNECT_SRC_DIRECTIVE);
+  }
+
+  bool visitSchemeSrc(const nsCSPSchemeSrc& src) override {
+    nsAutoString scheme;
+    src.getScheme(scheme);
+
+    if (scheme == u"https"_ns) {
+      if (CheckAllowList(Span(sConnectSrcHttpsAllowList))) {
+        return true;
+      }
+    }
+
+    if (scheme == u"data"_ns || scheme == u"http") {
+      if (CheckAllowList(Span(sConnectSrcAddonsAllowList))) {
+        return true;
+      }
+    }
+
+    return AllowBuiltinSrcVisitor::visitSchemeSrc(src);
+  }
+
+  bool visitHostSrc(const nsCSPHostSrc& src) override {
+    return AllowBuiltinSrcVisitor::visitHostSrc(src);
+  }
+};
+
+class FrameSrcVisitor : public AllowBuiltinSrcVisitor {
+ public:
+  FrameSrcVisitor(CSPDirective aDirective, nsACString& aURL)
+      : AllowBuiltinSrcVisitor(aDirective, aURL) {
+    MOZ_ASSERT(aDirective == CSPDirective::FRAME_SRC_DIRECTIVE);
+  }
+
+  bool visitHostSrc(const nsCSPHostSrc& src) override {
+    return VisitHostSrcWithWildcardAndHttpsHostAllowLists(
+        src, nullptr, sFrameSrcHttpsHostAllowList);
+  }
+};
+
+#  define CHECK_DIR(DIR, VISITOR)                                           \
+    do {                                                                    \
+      VISITOR visitor(CSPDirective::DIR, spec);                             \
+                                                               \
+      visitor.visit(policy);                                                \
+    } while (false)
+
+void nsContentSecurityUtils::AssertAboutPageHasCSP(Document* aDocument) {
+
+  if (aDocument->IsLoadedAsData()) {
+    return;
+  }
+
+  if (StaticPrefs::dom_security_skip_about_page_has_csp_assert()) {
+    return;
+  }
+
+  nsCOMPtr<nsIURI> documentURI = aDocument->GetDocumentURI();
+  if (!documentURI->SchemeIs("about")) {
+    return;
+  }
+
+  nsCSPContext* csp = nsCSPContext::Cast(
+      PolicyContainer::GetCSP(aDocument->GetPolicyContainer()));
+  bool foundDefaultSrc = false;
+  uint32_t policyCount = 0;
+  if (csp) {
+    csp->GetPolicyCount(&policyCount);
+    for (uint32_t i = 0; i < policyCount; i++) {
+      const nsCSPPolicy* policy = csp->GetPolicy(i);
+
+      foundDefaultSrc =
+          policy->hasDirective(CSPDirective::DEFAULT_SRC_DIRECTIVE);
+      if (foundDefaultSrc) {
+        break;
+      }
+    }
+  }
+
+  if (StaticPrefs::dom_security_skip_about_page_csp_allowlist_and_assert()) {
+    NS_ASSERTION(foundDefaultSrc, "about: page must have a CSP");
+    return;
+  }
+
+  nsAutoCString spec;
+  documentURI->GetSpec(spec);
+  ToLowerCase(spec);
+
+  static nsLiteralCString sAllowedAboutPagesWithNoCSP[] = {
+      "about:blank"_ns,
+      "about:srcdoc"_ns,
+      "about:sync-log"_ns,
+      "about:logo"_ns,
+      "about:sync"_ns,
+  };
+
+  for (const nsLiteralCString& allowlistEntry : sAllowedAboutPagesWithNoCSP) {
+    if (StringBeginsWith(spec, allowlistEntry)) {
+      return;
+    }
+  }
+
+  bool hasBaselineCSP = aDocument->NodePrincipal()->IsSystemPrincipal() &&
+                        StaticPrefs::security_chrome_baseline_csp_enabled();
+
+  if (policyCount != (hasBaselineCSP ? 2 : 1)) {
+    MOZ_CRASH_UNSAFE_PRINTF("Document (%s) does not have a custom CSP!",
+                            spec.get());
+  }
+
+  if (hasBaselineCSP) {
+    nsAutoString baselinePolicy;
+    csp->GetPolicy(0)->toString(baselinePolicy);
+    MOZ_ASSERT(baselinePolicy == kBaselineSystemCSP);
+  }
+
+  const nsCSPPolicy* policy = csp->GetPolicy(hasBaselineCSP ? 1 : 0);
+  {
+    AllowBuiltinSrcVisitor visitor(CSPDirective::DEFAULT_SRC_DIRECTIVE, spec);
+    if (!visitor.visit(policy)) {
+      MOZ_ASSERT(false, "about: page must contain a secure default-src");
+    }
+  }
+
+  {
+    DisallowingVisitor visitor(CSPDirective::OBJECT_SRC_DIRECTIVE, spec);
+    if (!visitor.visit(policy)) {
+      MOZ_ASSERT(
+          false,
+          "about: page must contain a secure object-src 'none'; directive");
+    }
+  }
+
+  CHECK_DIR(SCRIPT_SRC_DIRECTIVE, AllowBuiltinSrcVisitor);
+  CHECK_DIR(STYLE_SRC_DIRECTIVE, StyleSrcVisitor);
+  CHECK_DIR(IMG_SRC_DIRECTIVE, ImgSrcVisitor);
+  CHECK_DIR(MEDIA_SRC_DIRECTIVE, MediaSrcVisitor);
+  CHECK_DIR(CONNECT_SRC_DIRECTIVE, ConnectSrcVisitor);
+  CHECK_DIR(FRAME_SRC_DIRECTIVE, FrameSrcVisitor);
+
+  nsTArray<nsString> directiveNames;
+  policy->getDirectiveNames(directiveNames);
+  for (const nsString& dir : directiveNames) {
+    if (dir.EqualsLiteral("default-src") || dir.EqualsLiteral("object-src") ||
+        dir.EqualsLiteral("script-src") || dir.EqualsLiteral("style-src") ||
+        dir.EqualsLiteral("img-src") || dir.EqualsLiteral("media-src") ||
+        dir.EqualsLiteral("connect-src") || dir.EqualsLiteral("frame-src")) {
+      continue;
+    }
+
+    NS_WARNING(
+        nsPrintfCString(
+            "Page %s must not contain a CSP with the unchecked directive %s",
+            spec.get(), NS_ConvertUTF16toUTF8(dir).get())
+            .get());
+    MOZ_ASSERT(false, "Unchecked CSP directive found on internal page.");
+  }
+}
+
+void nsContentSecurityUtils::AssertChromePageHasCSP(Document* aDocument) {
+#if !defined(MOZ_THUNDERBIRD)
+  nsCOMPtr<nsIURI> documentURI = aDocument->GetDocumentURI();
+  if (!documentURI->SchemeIs("chrome")) {
+    return;
+  }
+
+  if (aDocument->IsResourceDoc() || aDocument->IsLoadedAsData()) {
+    return;
+  }
+
+  nsAutoCString spec;
+  documentURI->GetSpec(spec);
+
+  if (IsExemptedFromBaselineSystemCSP(spec)) {
+    return;
+  }
+
+  nsCOMPtr<nsIContentSecurityPolicy> csp =
+      PolicyContainer::GetCSP(aDocument->GetPolicyContainer());
+  uint32_t count = 0;
+  if (csp) {
+    static_cast<nsCSPContext*>(csp.get())->GetPolicyCount(&count);
+  }
+
+  bool hasBaselineCSP = StaticPrefs::security_chrome_baseline_csp_enabled();
+
+  if (count != (hasBaselineCSP ? 2 : 1)) {
+    MOZ_CRASH_UNSAFE_PRINTF("Document (%s) does not have a custom CSP!",
+                            spec.get());
+  }
+
+  if (hasBaselineCSP) {
+    nsAutoString baselinePolicy;
+    static_cast<nsCSPContext*>(csp.get())->GetPolicy(0)->toString(
+        baselinePolicy);
+    MOZ_ASSERT(baselinePolicy == kBaselineSystemCSP);
+  }
+
+  if (StringBeginsWith(spec, "chrome://browser/content/browser.xhtml"_ns) ||
+      StringBeginsWith(spec,
+                       "chrome://browser/content/hiddenWindowMac.xhtml"_ns)) {
+    return;
+  }
+
+  const nsCSPPolicy* policy =
+      static_cast<nsCSPContext*>(csp.get())->GetPolicy(hasBaselineCSP ? 1 : 0);
+  {
+    AllowBuiltinSrcVisitor visitor(CSPDirective::DEFAULT_SRC_DIRECTIVE, spec);
+    if (!visitor.visit(policy)) {
+      MOZ_CRASH_UNSAFE_PRINTF("Document (%s) CSP does not have a default-src!",
+                              spec.get());
+    }
+  }
+
+  CHECK_DIR(SCRIPT_SRC_DIRECTIVE, AllowBuiltinSrcVisitor);
+  CHECK_DIR(SCRIPT_SRC_ATTR_DIRECTIVE, AllowBuiltinSrcVisitor);
+  CHECK_DIR(STYLE_SRC_DIRECTIVE, StyleSrcVisitor);
+  CHECK_DIR(IMG_SRC_DIRECTIVE, ImgSrcVisitor);
+  CHECK_DIR(MEDIA_SRC_DIRECTIVE, MediaSrcVisitor);
+  CHECK_DIR(OBJECT_SRC_DIRECTIVE, DisallowingVisitor);
+
+  nsTArray<nsString> directiveNames;
+  policy->getDirectiveNames(directiveNames);
+  for (const nsString& dir : directiveNames) {
+    if (dir.EqualsLiteral("default-src") || dir.EqualsLiteral("script-src") ||
+        dir.EqualsLiteral("script-src-attr") ||
+        dir.EqualsLiteral("style-src") || dir.EqualsLiteral("img-src") ||
+        dir.EqualsLiteral("media-src") || dir.EqualsLiteral("object-src")) {
+      continue;
+    }
+
+    MOZ_CRASH_UNSAFE_PRINTF(
+        "Document (%s) must not contain a CSP with the unchecked directive "
+        "%s",
+        spec.get(), NS_ConvertUTF16toUTF8(dir).get());
+  }
+#endif
+  return;
+}
+
+#  undef CHECK_DIR
+
+#endif
+
+bool nsContentSecurityUtils::IsExemptedFromBaselineSystemCSP(
+    nsACString& aSpec) {
+  if (!StaticPrefs::security_browser_xhtml_csp_enabled() &&
+      aSpec.EqualsLiteral("chrome://browser/content/browser.xhtml")) {
+    return true;
+  }
+
+  return false;
+}
+
+bool nsContentSecurityUtils::ValidateScriptFilename(JSContext* cx,
+                                                    const char* aFilename) {
+  if (StaticPrefs::security_allow_parent_unrestricted_js_loads()) {
+    return true;
+  }
+
+  if (!XRE_IsE10sParentProcess()) {
+    return true;
+  }
+
+  nsDependentCString filename(aFilename);
+  if (StaticPrefs::security_allow_eval_with_system_principal() ||
+      StaticPrefs::security_allow_eval_in_parent_process()) {
+    if (StringEndsWith(filename, "> eval"_ns)) {
+      return true;
+    }
+  }
+
+  DetectJsHacks();
+
+  if (MOZ_UNLIKELY(!sJSHacksChecked)) {
+    MOZ_LOG(
+        sCSMLog, LogLevel::Debug,
+        ("Allowing a javascript load of %s because "
+         "we have not yet been able to determine if JS hacks may be present",
+         aFilename));
+    return true;
+  }
+
+  if (MOZ_UNLIKELY(sJSHacksPresent)) {
+    MOZ_LOG(sCSMLog, LogLevel::Debug,
+            ("Allowing a javascript load of %s because "
+             "some JS hacks may be present",
+             aFilename));
+    return true;
+  }
+
+  if (StringBeginsWith(filename, "chrome://"_ns)) {
+    return true;
+  }
+  if (StringBeginsWith(filename, "resource://"_ns)) {
+    return true;
+  }
+  if (StringBeginsWith(filename, "moz-src://"_ns)) {
+    return true;
+  }
+  if (StringBeginsWith(filename, "file://"_ns)) {
+    return true;
+  }
+  if (StringBeginsWith(filename, "jar:file://"_ns)) {
+    return true;
+  }
+  if (filename.Equals("about:sync-log"_ns)) {
+    return true;
+  }
+
+  auto kAllowedFilenamesPrefix = {
+      "about:downloads"_ns,
+      "about:preferences"_ns, "about:settings"_ns,
+      "debugger"_ns};
+
+  for (auto allowedFilenamePrefix : kAllowedFilenamesPrefix) {
+    if (StringBeginsWith(filename, allowedFilenamePrefix)) {
+      return true;
+    }
+  }
+
+  MOZ_LOG(sCSMLog, LogLevel::Error,
+          ("ValidateScriptFilename Failed: %s\n", aFilename));
+
+  FilenameTypeAndDetails fileNameTypeAndDetails =
+      FilenameToFilenameType(filename);
+
+
+
+
+#if defined(DEBUG) || 0
+  auto crashString = nsContentSecurityUtils::SmartFormatCrashString(
+      aFilename,
+      fileNameTypeAndDetails.second.isSome()
+          ? fileNameTypeAndDetails.second.value().get()
+          : "(None)",
+      "Blocking a script load %s from file %s");
+  MOZ_CRASH_UNSAFE_PRINTF("%s", crashString.get());
+#endif
+
+  return false;
+}
+
+void nsContentSecurityUtils::LogMessageToConsole(nsIHttpChannel* aChannel,
+                                                 const char* aMsg) {
+  nsCOMPtr<nsIURI> uri;
+  nsresult rv = aChannel->GetURI(getter_AddRefs(uri));
+  if (NS_FAILED(rv)) {
+    return;
+  }
+
+  uint64_t windowID = 0;
+  rv = aChannel->GetTopLevelContentWindowId(&windowID);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return;
+  }
+  if (!windowID) {
+    nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+    loadInfo->GetInnerWindowID(&windowID);
+  }
+
+  nsAutoString localizedMsg;
+  nsAutoCString spec;
+  uri->GetSpec(spec);
+  AutoTArray<nsString, 1> params = {NS_ConvertUTF8toUTF16(spec)};
+  rv = nsContentUtils::FormatLocalizedString(
+      PropertiesFile::SECURITY_PROPERTIES, aMsg, params, localizedMsg);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return;
+  }
+
+  nsContentUtils::ReportToConsoleByWindowID(
+      localizedMsg, nsIScriptError::warningFlag, "Security"_ns, windowID,
+      SourceLocation{uri.get()});
+}
+
+long nsContentSecurityUtils::ClassifyDownload(nsIChannel* aChannel) {
+  MOZ_ASSERT(aChannel, "IsDownloadAllowed without channel?");
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  if ((loadInfo->GetTriggeringSandboxFlags() & SANDBOXED_DOWNLOADS) ||
+      (loadInfo->GetSandboxFlags() & SANDBOXED_DOWNLOADS)) {
+    if (nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(aChannel)) {
+      LogMessageToConsole(httpChannel, "IframeSandboxBlockedDownload");
+    }
+    return nsITransfer::DOWNLOAD_FORBIDDEN;
+  }
+
+  nsCOMPtr<nsIURI> contentLocation;
+  aChannel->GetURI(getter_AddRefs(contentLocation));
+
+  nsCOMPtr<nsIPrincipal> loadingPrincipal = loadInfo->GetLoadingPrincipal();
+  if (!loadingPrincipal) {
+    loadingPrincipal = loadInfo->TriggeringPrincipal();
+  }
+  Result<RefPtr<net::LoadInfo>, nsresult> maybeLoadInfo = net::LoadInfo::Create(
+      loadingPrincipal, loadInfo->TriggeringPrincipal(), nullptr,
+      nsILoadInfo::SEC_ONLY_FOR_EXPLICIT_CONTENTSEC_CHECK,
+      nsIContentPolicy::TYPE_FETCH);
+  if (maybeLoadInfo.isErr()) {
+    return nsITransfer::DOWNLOAD_FORBIDDEN;
+  }
+  RefPtr<net::LoadInfo> secCheckLoadInfo = maybeLoadInfo.unwrap();
+  secCheckLoadInfo->SetHttpsOnlyStatus(nsILoadInfo::HTTPS_ONLY_EXEMPT);
+
+  int16_t decission = nsIContentPolicy::ACCEPT;
+  nsMixedContentBlocker::ShouldLoad(false,  
+                                    contentLocation,   
+                                    secCheckLoadInfo,  
+                                    false,             
+                                    &decission         
+  );
+
+  if (StaticPrefs::dom_block_download_insecure() &&
+      decission != nsIContentPolicy::ACCEPT) {
+    if (nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(aChannel)) {
+      LogMessageToConsole(httpChannel, "MixedContentBlockedDownload");
+    }
+    return nsITransfer::DOWNLOAD_POTENTIALLY_UNSAFE;
+  }
+
+  return nsITransfer::DOWNLOAD_ACCEPTABLE;
+}

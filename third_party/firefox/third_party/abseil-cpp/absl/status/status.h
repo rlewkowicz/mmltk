@@ -1,0 +1,591 @@
+// Copyright 2019 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#ifndef ABSL_STATUS_STATUS_H_
+#define ABSL_STATUS_STATUS_H_
+
+#include <cassert>
+#include <cstdint>
+#include <optional>
+#include <ostream>
+#include <string>
+#include <utility>
+
+#include "absl/base/attributes.h"
+#include "absl/base/config.h"
+#include "absl/base/macros.h"
+#include "absl/base/nullability.h"
+#include "absl/base/optimization.h"
+#include "absl/functional/function_ref.h"
+#include "absl/status/internal/status_internal.h"
+#include "absl/strings/cord.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/optional.h"
+#include "absl/types/source_location.h"
+#include "absl/types/span.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+enum class StatusCode : int {
+  kOk = 0,
+
+  kCancelled = 1,
+
+  kUnknown = 2,
+
+  kInvalidArgument = 3,
+
+  kDeadlineExceeded = 4,
+
+  kNotFound = 5,
+
+  kAlreadyExists = 6,
+
+  kPermissionDenied = 7,
+
+  kResourceExhausted = 8,
+
+  kFailedPrecondition = 9,
+
+  kAborted = 10,
+
+  kOutOfRange = 11,
+
+  kUnimplemented = 12,
+
+  kInternal = 13,
+
+  kUnavailable = 14,
+
+  kDataLoss = 15,
+
+  kUnauthenticated = 16,
+
+  kDoNotUseReservedForFutureExpansionUseDefaultInSwitchInstead_ = 20
+};
+
+std::string StatusCodeToString(StatusCode code);
+
+absl::string_view StatusCodeToStringView(StatusCode code);
+
+std::ostream& operator<<(std::ostream& os, StatusCode code);
+
+enum class StatusToStringMode : int {
+  kWithNoExtraData = 0,
+  kWithPayload = 1 << 0,
+  kWithSourceLocation = 1 << 1,
+  kWithEverything = ~kWithNoExtraData,
+  kDefault = kWithPayload,
+};
+
+inline constexpr StatusToStringMode operator&(StatusToStringMode lhs,
+                                              StatusToStringMode rhs) {
+  return static_cast<StatusToStringMode>(static_cast<int>(lhs) &
+                                         static_cast<int>(rhs));
+}
+inline constexpr StatusToStringMode operator|(StatusToStringMode lhs,
+                                              StatusToStringMode rhs) {
+  return static_cast<StatusToStringMode>(static_cast<int>(lhs) |
+                                         static_cast<int>(rhs));
+}
+inline constexpr StatusToStringMode operator^(StatusToStringMode lhs,
+                                              StatusToStringMode rhs) {
+  return static_cast<StatusToStringMode>(static_cast<int>(lhs) ^
+                                         static_cast<int>(rhs));
+}
+inline constexpr StatusToStringMode operator~(StatusToStringMode arg) {
+  return static_cast<StatusToStringMode>(~static_cast<int>(arg));
+}
+inline StatusToStringMode& operator&=(StatusToStringMode& lhs,
+                                      StatusToStringMode rhs) {
+  lhs = lhs & rhs;
+  return lhs;
+}
+inline StatusToStringMode& operator|=(StatusToStringMode& lhs,
+                                      StatusToStringMode rhs) {
+  lhs = lhs | rhs;
+  return lhs;
+}
+inline StatusToStringMode& operator^=(StatusToStringMode& lhs,
+                                      StatusToStringMode rhs) {
+  lhs = lhs ^ rhs;
+  return lhs;
+}
+
+class ABSL_ATTRIBUTE_TRIVIAL_ABI Status final {
+ public:
+
+  Status();
+
+  Status(absl::StatusCode code, absl::string_view msg,
+         absl::SourceLocation loc = SourceLocation::current());
+
+  Status(const Status& base_status, absl::SourceLocation loc)
+      : Status(base_status) {
+    AddSourceLocation(loc);
+  }
+  Status(Status&& base_status, absl::SourceLocation loc)
+      : Status(std::move(base_status)) {
+    AddSourceLocation(loc);
+  }
+
+  Status(const Status&);
+  Status& operator=(const Status& x);
+
+
+  Status(Status&&) noexcept;
+  Status& operator=(Status&&) noexcept;
+
+  ~Status();
+
+  void Update(const Status& new_status);
+  void Update(Status&& new_status);
+
+  ABSL_MUST_USE_RESULT bool ok() const;
+
+  absl::StatusCode code() const;
+
+  int raw_code() const;
+
+  absl::string_view message() const;
+
+  friend bool operator==(const Status&, const Status&);
+  friend bool operator!=(const Status&, const Status&);
+
+  std::string ToString(
+      StatusToStringMode mode = StatusToStringMode::kDefault) const;
+
+  template <typename Sink>
+  friend void AbslStringify(Sink& sink, const Status& status) {
+    sink.Append(status.ToString(StatusToStringMode::kWithEverything));
+  }
+
+  void IgnoreError() const;
+
+  friend void swap(Status& a, Status& b) noexcept;
+
+
+
+  std::optional<absl::Cord> GetPayload(absl::string_view type_url) const;
+
+  void SetPayload(absl::string_view type_url, absl::Cord payload);
+
+  bool ErasePayload(absl::string_view type_url);
+
+  void ForEachPayload(
+      absl::FunctionRef<void(absl::string_view, const absl::Cord&)> visitor)
+      const;
+
+  absl::Span<const absl::SourceLocation> GetSourceLocations() const {
+    if (IsInlined(rep_)) return {};
+    return RepToPointer(rep_)->GetSourceLocations();
+  }
+  void AddSourceLocation(
+      absl::SourceLocation loc = absl::SourceLocation::current()) {
+    if (ok()) return;
+    rep_ = AddSourceLocationImpl(rep_, loc);
+    [[maybe_unused]] bool okay = ok();
+    ABSL_ASSUME(!okay);
+  }
+
+  Status WithSourceLocation(
+      absl::SourceLocation loc = absl::SourceLocation::current()) const& {
+    return Status(*this, loc);
+  }
+
+  ABSL_MUST_USE_RESULT Status&& WithSourceLocation(
+      absl::SourceLocation loc = absl::SourceLocation::current()) && {
+    AddSourceLocation(loc);
+    return std::move(*this);
+  }
+
+ private:
+  friend Status CancelledError();
+
+#ifndef SWIG
+  static Status MakeNonOkStatusWithOkCode(absl::string_view message);
+
+  friend class absl::status_internal::StatusPrivateAccessor;
+  friend class absl::status_internal::StatusPrivateAccessorForStatusBuilder;
+#endif  // !SWIG
+
+  explicit Status(absl::StatusCode code);
+
+  static uintptr_t MakeRep(uintptr_t inlined_rep, absl::string_view msg,
+                           absl::SourceLocation loc);
+
+  explicit Status(uintptr_t rep) : rep_(rep) {}
+
+  static uintptr_t AddSourceLocationImpl(uintptr_t rep,
+                                         absl::SourceLocation loc);
+
+  static void Ref(uintptr_t rep);
+  static void Unref(uintptr_t rep);
+
+  static status_internal::StatusRep* absl_nonnull PrepareToModify(
+      uintptr_t rep);
+
+  static constexpr const char kMovedFromString[] =
+      "Status accessed after move.";
+
+  static const std::string* absl_nonnull EmptyString();
+  static const std::string* absl_nonnull MovedFromString();
+
+  static constexpr bool IsInlined(uintptr_t rep);
+
+  static constexpr bool IsMovedFrom(uintptr_t rep);
+  static constexpr uintptr_t MovedFromRep();
+
+  static constexpr uintptr_t CodeToInlinedRep(absl::StatusCode code);
+  static constexpr absl::StatusCode InlinedRepToCode(uintptr_t rep);
+
+  static uintptr_t PointerToRep(status_internal::StatusRep* absl_nonnull r);
+  static const status_internal::StatusRep* absl_nonnull RepToPointer(
+      uintptr_t r);
+
+  static std::string ToStringSlow(uintptr_t rep, StatusToStringMode mode);
+
+  uintptr_t rep_;
+
+  friend class status_internal::StatusRep;
+};
+
+Status OkStatus();
+
+std::ostream& operator<<(std::ostream& os, const Status& x);
+
+ABSL_MUST_USE_RESULT bool IsAborted(const Status& status);
+ABSL_MUST_USE_RESULT bool IsAlreadyExists(const Status& status);
+ABSL_MUST_USE_RESULT bool IsCancelled(const Status& status);
+ABSL_MUST_USE_RESULT bool IsDataLoss(const Status& status);
+ABSL_MUST_USE_RESULT bool IsDeadlineExceeded(const Status& status);
+ABSL_MUST_USE_RESULT bool IsFailedPrecondition(const Status& status);
+ABSL_MUST_USE_RESULT bool IsInternal(const Status& status);
+ABSL_MUST_USE_RESULT bool IsInvalidArgument(const Status& status);
+ABSL_MUST_USE_RESULT bool IsNotFound(const Status& status);
+ABSL_MUST_USE_RESULT bool IsOutOfRange(const Status& status);
+ABSL_MUST_USE_RESULT bool IsPermissionDenied(const Status& status);
+ABSL_MUST_USE_RESULT bool IsResourceExhausted(const Status& status);
+ABSL_MUST_USE_RESULT bool IsUnauthenticated(const Status& status);
+ABSL_MUST_USE_RESULT bool IsUnavailable(const Status& status);
+ABSL_MUST_USE_RESULT bool IsUnimplemented(const Status& status);
+ABSL_MUST_USE_RESULT bool IsUnknown(const Status& status);
+
+Status AbortedError(absl::string_view message,
+                    absl::SourceLocation loc = SourceLocation::current());
+Status AlreadyExistsError(absl::string_view message,
+                          absl::SourceLocation loc = SourceLocation::current());
+Status CancelledError(absl::string_view message,
+                      absl::SourceLocation loc = SourceLocation::current());
+Status DataLossError(absl::string_view message,
+                     absl::SourceLocation loc = SourceLocation::current());
+Status DeadlineExceededError(
+    absl::string_view message,
+    absl::SourceLocation loc = SourceLocation::current());
+Status FailedPreconditionError(
+    absl::string_view message,
+    absl::SourceLocation loc = SourceLocation::current());
+Status InternalError(absl::string_view message,
+                     absl::SourceLocation loc = SourceLocation::current());
+Status InvalidArgumentError(
+    absl::string_view message,
+    absl::SourceLocation loc = SourceLocation::current());
+Status NotFoundError(absl::string_view message,
+                     absl::SourceLocation loc = SourceLocation::current());
+Status OutOfRangeError(absl::string_view message,
+                       absl::SourceLocation loc = SourceLocation::current());
+Status PermissionDeniedError(
+    absl::string_view message,
+    absl::SourceLocation loc = SourceLocation::current());
+Status ResourceExhaustedError(
+    absl::string_view message,
+    absl::SourceLocation loc = SourceLocation::current());
+Status UnauthenticatedError(
+    absl::string_view message,
+    absl::SourceLocation loc = SourceLocation::current());
+Status UnavailableError(absl::string_view message,
+                        absl::SourceLocation loc = SourceLocation::current());
+Status UnimplementedError(absl::string_view message,
+                          absl::SourceLocation loc = SourceLocation::current());
+Status UnknownError(absl::string_view message,
+                    absl::SourceLocation loc = SourceLocation::current());
+
+absl::StatusCode ErrnoToStatusCode(int error_number);
+
+Status ErrnoToStatus(int error_number, absl::string_view message,
+                     absl::SourceLocation loc = SourceLocation::current());
+
+
+inline Status::Status() : Status(absl::StatusCode::kOk) {}
+
+inline Status::Status(absl::StatusCode code) : Status(CodeToInlinedRep(code)) {}
+
+inline Status::Status(absl::StatusCode code, absl::string_view msg,
+                      absl::SourceLocation loc)
+    : Status(MakeRep(CodeToInlinedRep(code), msg, loc)) {}
+
+inline Status::Status(const Status& x) : Status(x.rep_) { Ref(rep_); }
+
+inline Status& Status::operator=(const Status& x) {
+  uintptr_t old_rep = rep_;
+  if (x.rep_ != old_rep) {
+    Ref(x.rep_);
+    rep_ = x.rep_;
+    Unref(old_rep);
+  }
+  return *this;
+}
+
+inline Status::Status(Status&& x) noexcept : Status(x.rep_) {
+  x.rep_ = MovedFromRep();
+}
+
+inline Status& Status::operator=(Status&& x) noexcept {
+  uintptr_t old_rep = rep_;
+  if (x.rep_ != old_rep) {
+    rep_ = x.rep_;
+    x.rep_ = MovedFromRep();
+    Unref(old_rep);
+  }
+  return *this;
+}
+
+inline void Status::Update(const Status& new_status) {
+  if (ok()) {
+    *this = new_status;
+  }
+}
+
+inline void Status::Update(Status&& new_status) {
+  if (ok()) {
+    *this = std::move(new_status);
+  }
+}
+
+inline Status::~Status() { Unref(rep_); }
+
+inline bool Status::ok() const {
+  return rep_ == CodeToInlinedRep(absl::StatusCode::kOk);
+}
+
+inline absl::StatusCode Status::code() const {
+  return status_internal::MapToLocalCode(raw_code());
+}
+
+inline int Status::raw_code() const {
+  if (IsInlined(rep_)) return static_cast<int>(InlinedRepToCode(rep_));
+  return static_cast<int>(RepToPointer(rep_)->code());
+}
+
+inline absl::string_view Status::message() const {
+  return !IsInlined(rep_)
+             ? RepToPointer(rep_)->message()
+             : (IsMovedFrom(rep_) ? absl::string_view(kMovedFromString)
+                                  : absl::string_view());
+}
+
+inline bool operator==(const Status& lhs, const Status& rhs) {
+  if (lhs.rep_ == rhs.rep_) return true;
+  if (Status::IsInlined(lhs.rep_)) return false;
+  if (Status::IsInlined(rhs.rep_)) return false;
+  return *Status::RepToPointer(lhs.rep_) == *Status::RepToPointer(rhs.rep_);
+}
+
+inline bool operator!=(const Status& lhs, const Status& rhs) {
+  return !(lhs == rhs);
+}
+
+inline std::string Status::ToString(StatusToStringMode mode) const {
+  return ok() ? "OK" : ToStringSlow(rep_, mode);
+}
+
+inline void Status::IgnoreError() const {
+}
+
+inline void swap(absl::Status& a, absl::Status& b) noexcept {
+  using std::swap;
+  swap(a.rep_, b.rep_);
+}
+
+inline std::optional<absl::Cord> Status::GetPayload(
+    absl::string_view type_url) const {
+  if (IsInlined(rep_)) return std::nullopt;
+  return RepToPointer(rep_)->GetPayload(type_url);
+}
+
+inline void Status::SetPayload(absl::string_view type_url, absl::Cord payload) {
+  if (ok()) return;
+  status_internal::StatusRep* rep = PrepareToModify(rep_);
+  rep->SetPayload(type_url, std::move(payload));
+  rep_ = PointerToRep(rep);
+}
+
+inline bool Status::ErasePayload(absl::string_view type_url) {
+  if (IsInlined(rep_)) return false;
+  status_internal::StatusRep* rep = PrepareToModify(rep_);
+  auto res = rep->ErasePayload(type_url);
+  rep_ = res.new_rep;
+  return res.erased;
+}
+
+inline void Status::ForEachPayload(
+    absl::FunctionRef<void(absl::string_view, const absl::Cord&)> visitor)
+    const {
+  if (IsInlined(rep_)) return;
+  RepToPointer(rep_)->ForEachPayload(visitor);
+}
+
+constexpr bool Status::IsInlined(uintptr_t rep) { return (rep & 1) != 0; }
+
+constexpr bool Status::IsMovedFrom(uintptr_t rep) { return (rep & 2) != 0; }
+
+constexpr uintptr_t Status::CodeToInlinedRep(absl::StatusCode code) {
+  return (static_cast<uintptr_t>(code) << 2) + 1;
+}
+
+constexpr absl::StatusCode Status::InlinedRepToCode(uintptr_t rep) {
+  ABSL_ASSERT(IsInlined(rep));
+  return static_cast<absl::StatusCode>(rep >> 2);
+}
+
+constexpr uintptr_t Status::MovedFromRep() {
+  return CodeToInlinedRep(absl::StatusCode::kInternal) | 2;
+}
+
+inline const status_internal::StatusRep* absl_nonnull Status::RepToPointer(
+    uintptr_t rep) {
+  assert(!IsInlined(rep));
+  return reinterpret_cast<const status_internal::StatusRep*>(rep);
+}
+
+inline uintptr_t Status::PointerToRep(
+    status_internal::StatusRep* absl_nonnull rep) {
+  return reinterpret_cast<uintptr_t>(rep);
+}
+
+inline void Status::Ref(uintptr_t rep) {
+  if (!IsInlined(rep)) RepToPointer(rep)->Ref();
+}
+
+inline void Status::Unref(uintptr_t rep) {
+  if (!IsInlined(rep)) RepToPointer(rep)->Unref();
+}
+
+inline Status OkStatus() { return Status(); }
+
+inline Status CancelledError() { return Status(absl::StatusCode::kCancelled); }
+
+const char* absl_nonnull StatusMessageAsCStr(
+    const Status& status ABSL_ATTRIBUTE_LIFETIME_BOUND);
+
+namespace status_internal {
+template <int error_code>
+Status MakeErrorImpl(string_view message, SourceLocation loc);
+extern template Status MakeErrorImpl<0>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<1>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<2>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<3>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<4>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<5>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<6>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<7>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<8>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<9>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<10>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<11>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<12>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<13>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<14>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<15>(string_view, SourceLocation);
+extern template Status MakeErrorImpl<16>(string_view, SourceLocation);
+
+template <StatusCode error_code>
+Status MakeError(string_view message, SourceLocation loc) {
+  Status out = MakeErrorImpl<static_cast<int>(error_code)>(message, loc);
+  [[maybe_unused]] bool ok = out.ok();
+  ABSL_ASSUME(!ok);
+  return out;
+}
+}  
+
+inline Status AbortedError(absl::string_view message,
+                           absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kAborted>(message, loc);
+}
+inline Status AlreadyExistsError(absl::string_view message,
+                                 absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kAlreadyExists>(message, loc);
+}
+inline Status CancelledError(absl::string_view message,
+                             absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kCancelled>(message, loc);
+}
+inline Status DataLossError(absl::string_view message,
+                            absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kDataLoss>(message, loc);
+}
+inline Status DeadlineExceededError(absl::string_view message,
+                                    absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kDeadlineExceeded>(message,
+                                                                   loc);
+}
+inline Status FailedPreconditionError(absl::string_view message,
+                                      absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kFailedPrecondition>(message,
+                                                                     loc);
+}
+inline Status InternalError(absl::string_view message,
+                            absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kInternal>(message, loc);
+}
+inline Status InvalidArgumentError(absl::string_view message,
+                                   absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kInvalidArgument>(message, loc);
+}
+inline Status NotFoundError(absl::string_view message,
+                            absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kNotFound>(message, loc);
+}
+inline Status OutOfRangeError(absl::string_view message,
+                              absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kOutOfRange>(message, loc);
+}
+inline Status PermissionDeniedError(absl::string_view message,
+                                    absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kPermissionDenied>(message,
+                                                                   loc);
+}
+inline Status ResourceExhaustedError(absl::string_view message,
+                                     absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kResourceExhausted>(message,
+                                                                    loc);
+}
+inline Status UnauthenticatedError(absl::string_view message,
+                                   absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kUnauthenticated>(message, loc);
+}
+inline Status UnavailableError(absl::string_view message,
+                               absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kUnavailable>(message, loc);
+}
+inline Status UnimplementedError(absl::string_view message,
+                                 absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kUnimplemented>(message, loc);
+}
+inline Status UnknownError(absl::string_view message,
+                           absl::SourceLocation loc) {
+  return status_internal::MakeError<StatusCode::kUnknown>(message, loc);
+}
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_STATUS_STATUS_H_

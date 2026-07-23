@@ -1,0 +1,84 @@
+// Copyright 2019 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(COMMON_POOLALLOC_H_)
+#define COMMON_POOLALLOC_H_
+
+#if defined(UNSAFE_BUFFERS_BUILD)
+#    pragma allow_unsafe_buffers
+#endif
+
+#if !defined(NDEBUG)
+#    define ANGLE_POOL_ALLOC_GUARD_BLOCKS  // define to enable guard block checking
+#endif
+
+
+#include <stdint.h>
+
+#include "common/angleutils.h"
+#include "common/log_utils.h"
+
+#if defined(ANGLE_DISABLE_POOL_ALLOC)
+#    include <memory>
+#    include <vector>
+#endif
+
+namespace angle
+{
+class PageHeader;
+
+class PoolAllocator : angle::NonCopyable
+{
+  public:
+
+    static const int kDefaultAlignment = sizeof(void *);
+    PoolAllocator(int growthIncrement = 8 * 1024, int allocationAlignment = kDefaultAlignment);
+    ~PoolAllocator();
+
+    void reset();
+
+    void *allocate(size_t numBytes);
+
+    ANGLE_INLINE uint8_t *fastAllocate(size_t numBytes)
+    {
+#if defined(ANGLE_DISABLE_POOL_ALLOC)
+        return reinterpret_cast<uint8_t *>(allocate(numBytes));
+#else
+        ASSERT(mAlignment == 1);
+        ASSERT(numBytes <= (mPageSize - mPageHeaderSkip));
+        if (numBytes <= mPageSize - mCurrentPageOffset)
+        {
+            uint8_t *memory = reinterpret_cast<uint8_t *>(mInUseList) + mCurrentPageOffset;
+            mCurrentPageOffset += numBytes;
+            return memory;
+        }
+        return allocateNewPage(numBytes);
+#endif
+    }
+
+
+  private:
+#if !defined(ANGLE_DISABLE_POOL_ALLOC)
+    uint8_t *allocateNewPage(size_t numBytes);
+    void *initializeAllocation(uint8_t *memory, size_t numBytes);
+
+    size_t mPageSize;
+    size_t mPageHeaderSkip;
+    size_t mCurrentPageOffset;
+    PageHeader *mFreeList;
+    PageHeader *mInUseList;
+
+    int mNumCalls;       
+    size_t mTotalBytes;  
+
+#else
+    std::vector<std::unique_ptr<uint8_t[]>> mStack;
+#endif
+
+    size_t mAlignment;  
+};
+
+}  
+
+#endif

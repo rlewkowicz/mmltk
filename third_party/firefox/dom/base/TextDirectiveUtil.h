@@ -1,0 +1,542 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_TEXTDIRECTIVEUTIL_H_
+#define DOM_TEXTDIRECTIVEUTIL_H_
+
+#include "mozilla/Logging.h"
+#include "mozilla/RangeBoundary.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/AbstractRange.h"
+#include "mozilla/dom/Text.h"
+#include "mozilla/intl/WordBreaker.h"
+#include "nsStringFwd.h"
+
+class nsIURI;
+class nsINode;
+class nsFind;
+class nsRange;
+struct TextDirective;
+
+namespace mozilla::dom {
+
+extern LazyLogModule gFragmentDirectiveLog;
+#define TEXT_FRAGMENT_LOG_FN(msg, func, ...)                              \
+  MOZ_LOG_FMT(gFragmentDirectiveLog, LogLevel::Debug, "{}(): " msg, func, \
+              ##__VA_ARGS__)
+
+#define TEXT_FRAGMENT_LOG(msg, ...) \
+  TEXT_FRAGMENT_LOG_FN(msg, __FUNCTION__, ##__VA_ARGS__)
+
+enum class TextScanDirection { Left = -1, Right = 1 };
+
+class TextDirectiveUtil final {
+ public:
+  MOZ_ALWAYS_INLINE static bool ShouldLog() {
+    return MOZ_LOG_TEST(gFragmentDirectiveLog, LogLevel::Debug);
+  }
+
+  static Result<nsString, ErrorResult> RangeContentAsString(
+      AbstractRange* aRange);
+
+  static bool NodeIsVisibleTextNode(const nsINode& aNode);
+
+  static RefPtr<nsRange> FindStringInRange(nsFind* aFinder,
+                                           const RangeBoundary& aSearchStart,
+                                           const RangeBoundary& aSearchEnd,
+                                           const nsAString& aQuery,
+                                           bool aWordStartBounded,
+                                           bool aWordEndBounded);
+
+  static bool IsWhitespaceAtPosition(const Text* aText, uint32_t aPos);
+
+  static bool NodeIsSearchInvisible(nsINode& aNode);
+
+  static bool NodeHasBlockLevelDisplay(nsINode& aNode);
+  static nsINode* GetBlockAncestorForNode(nsINode* aNode);
+
+  static bool NodeIsPartOfNonSearchableSubTree(nsINode& aNode);
+
+  static bool AdvanceStartToNextNonWhitespacePosition(nsRange& aRange);
+
+  static RangeBoundary MoveToNextBoundaryPoint(const RangeBoundary& aPoint);
+
+  template <TextScanDirection direction>
+  static RangeBoundary FindNextBlockBoundary(
+      const RangeBoundary& aRangeBoundary);
+
+  template <TextScanDirection direction>
+  static Maybe<RangeBoundary> FindBlockBoundaryInRange(
+      const AbstractRange& aRange);
+
+  template <TextScanDirection direction>
+  static RangeBoundary FindNextNonWhitespacePosition(
+      const RangeBoundary& aPoint);
+
+  enum class BreakOnPunctuation : bool { No, Yes };
+  template <TextScanDirection direction>
+  static RangeBoundary FindWordBoundary(const RangeBoundary& aRangeBoundary,
+                                        BreakOnPunctuation aBreakOnPunctuation);
+
+  template <TextScanDirection direction>
+  static uint32_t ComputeCommonSubstringLength(
+      const nsAString& aReferenceString, const RangeBoundary& aBoundaryPoint);
+
+  template <TextScanDirection direction>
+  static nsTArray<uint32_t> ComputeWordBoundaryDistances(
+      const nsAString& aString);
+
+  static bool WordIsJustWhitespaceOrPunctuation(const nsAString& aString,
+                                                uint32_t aWordBegin,
+                                                uint32_t aWordEnd);
+
+  template <TextScanDirection direction>
+  static uint32_t RemoveFirstWordFromStringAndDistanceArray(
+      nsAString& aString, nsTArray<uint32_t>& aWordDistances);
+};
+
+class TimeoutWatchdog final {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(TimeoutWatchdog);
+  TimeoutWatchdog()
+      : mStartTime(TimeStamp::Now()),
+        mDuration(TimeDuration::FromSeconds(
+            StaticPrefs::
+                dom_text_fragments_create_text_fragment_timeout_seconds())) {}
+  bool IsDone() const { return TimeStamp::Now() - mStartTime > mDuration; }
+
+ private:
+  ~TimeoutWatchdog() = default;
+  TimeStamp mStartTime;
+  TimeDuration mDuration;
+};
+
+template <TextScanDirection direction>
+class SameBlockVisibleTextNodeIterator final {
+ public:
+  explicit SameBlockVisibleTextNodeIterator(nsINode& aStart)
+      : mCurrent(&aStart),
+        mBlockAncestor(TextDirectiveUtil::GetBlockAncestorForNode(mCurrent)) {
+    while (mCurrent->HasChildNodes()) {
+      nsINode* child = direction == TextScanDirection::Left
+                           ? mCurrent->GetLastChild()
+                           : mCurrent->GetFirstChild();
+      if (TextDirectiveUtil::GetBlockAncestorForNode(child) != mBlockAncestor) {
+        break;
+      }
+      mCurrent = child;
+    }
+  }
+
+  SameBlockVisibleTextNodeIterator& begin() { return *this; }
+
+  std::nullptr_t end() { return nullptr; }
+
+  bool operator!=(std::nullptr_t) const { return !!mCurrent; }
+
+  void operator++() {
+    while (mCurrent) {
+      mCurrent = direction == TextScanDirection::Left ? mCurrent->GetPrevNode()
+                                                      : mCurrent->GetNextNode();
+      if (!mCurrent) {
+        return;
+      }
+      if (TextDirectiveUtil::GetBlockAncestorForNode(mCurrent) !=
+          mBlockAncestor) {
+        mCurrent = nullptr;
+        return;
+      }
+      if (TextDirectiveUtil::NodeIsVisibleTextNode(*mCurrent) &&
+          !TextDirectiveUtil::NodeIsPartOfNonSearchableSubTree(*mCurrent)) {
+        break;
+      }
+    }
+    MOZ_ASSERT_IF(mCurrent, mCurrent->IsText());
+  }
+
+  Text* operator*() { return Text::FromNodeOrNull(mCurrent); }
+
+ private:
+  nsINode* mCurrent = nullptr;
+  nsINode* mBlockAncestor = nullptr;
+};
+
+template <TextScanDirection direction>
+ RangeBoundary TextDirectiveUtil::FindNextBlockBoundary(
+    const RangeBoundary& aRangeBoundary) {
+  MOZ_ASSERT(aRangeBoundary.IsSetAndValid());
+  nsINode* current = aRangeBoundary.GetContainer();
+  uint32_t offset =
+      direction == TextScanDirection::Left ? 0u : current->Length();
+  for (auto* node : SameBlockVisibleTextNodeIterator<direction>(*current)) {
+    if (!node) {
+      continue;
+    }
+    current = node;
+    offset = direction == TextScanDirection::Left ? 0u : current->Length();
+  }
+  return {current, offset};
+}
+
+template <TextScanDirection direction>
+ Maybe<RangeBoundary> TextDirectiveUtil::FindBlockBoundaryInRange(
+    const AbstractRange& aRange) {
+  if (aRange.Collapsed()) {
+    return Nothing{};
+  }
+
+  RangeBoundary boundary = FindNextBlockBoundary<direction>(
+      direction == TextScanDirection::Left ? aRange.EndRef()
+                                           : aRange.StartRef());
+
+  Maybe<int32_t> compare =
+      direction == TextScanDirection::Left
+          ? nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+                aRange.StartRef(), boundary)
+          : nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+                boundary, aRange.EndRef());
+  if (compare && *compare == -1) {
+    return Some(boundary);
+  }
+
+  return Nothing{};
+}
+
+template <TextScanDirection direction>
+ RangeBoundary TextDirectiveUtil::FindNextNonWhitespacePosition(
+    const RangeBoundary& aPoint) {
+  MOZ_ASSERT(aPoint.IsSetAndValid());
+  nsINode* node = aPoint.GetChildAtOffset();
+  uint32_t offset =
+      direction == TextScanDirection::Left && node ? node->Length() : 0;
+  if (!node) {
+    node = aPoint.GetContainer();
+    offset =
+        *aPoint.Offset(RangeBoundary::OffsetFilter::kValidOrInvalidOffsets);
+  }
+  while (node->HasChildNodes()) {
+    if constexpr (direction == TextScanDirection::Left) {
+      node = node->GetLastChild();
+      MOZ_ASSERT(node);
+      offset = node->Length();
+    } else {
+      node = node->GetFirstChild();
+      offset = 0;
+    }
+  }
+
+  while (node) {
+    const bool nodeIsInvisible =
+        !TextDirectiveUtil::NodeIsVisibleTextNode(*node) ||
+        TextDirectiveUtil::NodeIsPartOfNonSearchableSubTree(*node);
+    const bool offsetIsAtEnd =
+        (direction == TextScanDirection::Left && offset == 0) ||
+        (direction == TextScanDirection::Right && offset == node->Length());
+    if (nodeIsInvisible || offsetIsAtEnd) {
+      if constexpr (direction == TextScanDirection::Left) {
+        node = node->GetPrevNode();
+        if (node) {
+          offset = node->Length();
+        }
+      } else {
+        node = node->GetNextNode();
+        offset = 0;
+      }
+      continue;
+    }
+    const Text* text = Text::FromNode(node);
+    MOZ_ASSERT(text);
+
+    if (!TextDirectiveUtil::IsWhitespaceAtPosition(
+            text, direction == TextScanDirection::Left ? offset - 1 : offset)) {
+      return {node, offset};
+    }
+    offset += int(direction);
+  }
+
+  return aPoint;
+}
+
+template <TextScanDirection direction>
+ RangeBoundary TextDirectiveUtil::FindWordBoundary(
+    const RangeBoundary& aRangeBoundary,
+    BreakOnPunctuation aBreakOnPunctuation) {
+  MOZ_ASSERT(aRangeBoundary.IsSetAndValid());
+  nsINode* node = aRangeBoundary.GetContainer();
+  uint32_t offset = *aRangeBoundary.Offset(
+      RangeBoundary::OffsetFilter::kValidOrInvalidOffsets);
+
+  nsString textBuffer;
+  for (Text* textNode : SameBlockVisibleTextNodeIterator<direction>(*node)) {
+    if (!textNode || textNode->Length() == 0) {
+      continue;
+    }
+    nsString data;
+    textNode->GetWholeText(data);
+    const uint32_t bufferLength = textBuffer.Length();
+    if constexpr (direction == TextScanDirection::Left) {
+      textBuffer.Insert(data, 0);
+    } else {
+      textBuffer.Append(data);
+    }
+    if (bufferLength) {
+      auto newOffset =
+          direction == TextScanDirection::Left ? textNode->Length() - 1 : 0u;
+      if (nsContentUtils::IsHTMLWhitespace(data.CharAt(newOffset)) ||
+          mozilla::IsPunctuationForWordSelect(data.CharAt(newOffset))) {
+        break;
+      }
+      offset = newOffset;
+    } else {
+      offset = std::max(std::min(offset, textNode->Length() - 1), 0u);
+    }
+    if constexpr (direction == TextScanDirection::Right) {
+      if (offset &&
+          !(nsContentUtils::IsHTMLWhitespace(data.CharAt(offset - 1)) ||
+            mozilla::IsPunctuationForWordSelect(data.CharAt(offset - 1)))) {
+        --offset;
+      }
+    } else {
+      if (offset &&
+          (nsContentUtils::IsHTMLWhitespace(data.CharAt(offset)) ||
+           mozilla::IsPunctuationForWordSelect(data.CharAt(offset)))) {
+        --offset;
+      }
+    }
+    uint32_t pos =
+        direction == TextScanDirection::Left ? offset : bufferLength + offset;
+    while (true) {
+      const auto [wordStart, wordEnd] =
+          intl::WordBreaker::FindWord(textBuffer, pos);
+      offset = direction == TextScanDirection::Left ? wordStart
+                                                    : wordEnd - bufferLength;
+      node = textNode;
+      if (offset == 0 || offset >= textNode->Length()) {
+        break;
+      }
+      if (aBreakOnPunctuation == BreakOnPunctuation::Yes ||
+          !WordIsJustWhitespaceOrPunctuation(textBuffer, wordStart, wordEnd)) {
+        return {node, offset};
+      }
+      if constexpr (direction == TextScanDirection::Left) {
+        if (wordStart == 0) {
+          break;
+        }
+        pos = wordStart - 1;
+      } else {
+        if (wordEnd == textBuffer.Length()) {
+          break;
+        }
+        pos = wordEnd;
+      }
+    }
+  }
+  return {node, offset};
+}
+
+template <TextScanDirection direction>
+void LogCommonSubstringLengths(const char* aFunc,
+                               const nsAString& aReferenceString,
+                               const nsTArray<nsString>& aTextContentPieces,
+                               uint32_t aCommonLength) {
+  if (!TextDirectiveUtil::ShouldLog()) {
+    return;
+  }
+  nsString concatenatedTextContents;
+  for (const auto& textContent : aTextContentPieces) {
+    concatenatedTextContents.Append(textContent);
+  }
+  concatenatedTextContents.CompressWhitespace();
+  const uint32_t maxLength =
+      std::max(aReferenceString.Length(), concatenatedTextContents.Length());
+  TEXT_FRAGMENT_LOG_FN("Direction: {}.", aFunc,
+                       direction == TextScanDirection::Left ? "left" : "right");
+
+  if constexpr (direction == TextScanDirection::Left) {
+    TEXT_FRAGMENT_LOG_FN("Ref:    {:>{}}", aFunc,
+                         NS_ConvertUTF16toUTF8(aReferenceString), maxLength);
+    TEXT_FRAGMENT_LOG_FN("Other:  {:>{}}", aFunc,
+                         NS_ConvertUTF16toUTF8(concatenatedTextContents),
+                         maxLength);
+    TEXT_FRAGMENT_LOG_FN(
+        "Common: {:>{}} ({} chars)", aFunc,
+        NS_ConvertUTF16toUTF8(Substring(aReferenceString, aCommonLength)),
+        maxLength, aCommonLength);
+  } else {
+    TEXT_FRAGMENT_LOG_FN("Ref:    {:<{}}", aFunc,
+                         NS_ConvertUTF16toUTF8(aReferenceString), maxLength);
+    TEXT_FRAGMENT_LOG_FN("Other:  {:<{}}", aFunc,
+                         NS_ConvertUTF16toUTF8(concatenatedTextContents),
+                         maxLength);
+    TEXT_FRAGMENT_LOG_FN(
+        "Common: {:<{}} ({} chars)", aFunc,
+        NS_ConvertUTF16toUTF8(Substring(aReferenceString, 0, aCommonLength)),
+        maxLength, aCommonLength);
+  }
+}
+
+template <TextScanDirection direction>
+ nsTArray<uint32_t> TextDirectiveUtil::ComputeWordBoundaryDistances(
+    const nsAString& aString) {
+  AutoTArray<uint32_t, 32> wordBoundaryDistances;
+  uint32_t pos =
+      direction == TextScanDirection::Left ? aString.Length() - 1 : 0;
+
+  while (pos < aString.Length()) {
+    auto [wordBegin, wordEnd] = intl::WordBreaker::FindWord(aString, pos);
+    pos = direction == TextScanDirection::Left ? wordBegin - 1 : wordEnd + 1;
+    if (WordIsJustWhitespaceOrPunctuation(aString, wordBegin, wordEnd)) {
+      continue;
+    }
+
+    wordBoundaryDistances.AppendElement(direction == TextScanDirection::Left
+                                            ? aString.Length() - wordBegin
+                                            : wordEnd);
+  }
+  if (wordBoundaryDistances.IsEmpty() ||
+      wordBoundaryDistances.LastElement() != aString.Length()) {
+    wordBoundaryDistances.AppendElement(aString.Length());
+  }
+  return std::move(wordBoundaryDistances);
+}
+
+template <TextScanDirection direction>
+ uint32_t TextDirectiveUtil::ComputeCommonSubstringLength(
+    const nsAString& aReferenceString, const RangeBoundary& aBoundaryPoint) {
+  MOZ_ASSERT(aBoundaryPoint.IsSetAndValid());
+  if (aReferenceString.IsEmpty()) {
+    TEXT_FRAGMENT_LOG("Reference string is empty.");
+    return 0;
+  }
+
+  MOZ_ASSERT(!nsContentUtils::IsHTMLWhitespace(aReferenceString.First()));
+  MOZ_ASSERT(!nsContentUtils::IsHTMLWhitespace(aReferenceString.Last()));
+  uint32_t referenceStringPosition =
+      direction == TextScanDirection::Left ? aReferenceString.Length() - 1 : 0;
+
+  bool foundMismatch = false;
+
+  bool isInWhitespace = true;
+  nsTArray<nsString> textContentForLogging;
+  for (Text* text : SameBlockVisibleTextNodeIterator<direction>(
+           *aBoundaryPoint.GetContainer())) {
+    if (!text || text->Length() == 0) {
+      continue;
+    }
+    uint32_t offset =
+        direction == TextScanDirection::Left ? text->Length() - 1 : 0;
+    if (text == aBoundaryPoint.GetContainer()) {
+      offset = *aBoundaryPoint.Offset(
+          RangeBoundary::OffsetFilter::kValidOrInvalidOffsets);
+      if (offset && direction == TextScanDirection::Left) {
+        --offset;
+      }
+    }
+    if (TextDirectiveUtil::ShouldLog()) {
+      nsString textContent;
+      text->GetWholeText(textContent);
+      if constexpr (direction == TextScanDirection::Left) {
+        if (offset) {
+          textContent = Substring(textContent, 0, offset + 1);
+        } else {
+          textContent.Truncate();
+        }
+      } else {
+        textContent = Substring(textContent, offset);
+      }
+      textContentForLogging.AppendElement(std::move(textContent));
+    }
+    const CharacterDataBuffer* characterDataBuffer =
+        text->GetCharacterDataBuffer();
+    MOZ_DIAGNOSTIC_ASSERT(characterDataBuffer);
+    const uint32_t textLength = characterDataBuffer->GetLength();
+    while (offset < textLength &&
+           referenceStringPosition < aReferenceString.Length()) {
+      char16_t ch = characterDataBuffer->CharAt(offset);
+      char16_t refCh = aReferenceString.CharAt(referenceStringPosition);
+      const bool chIsWhitespace = nsContentUtils::IsHTMLWhitespace(ch);
+      const bool refChIsWhitespace = nsContentUtils::IsHTMLWhitespace(refCh);
+      if (chIsWhitespace) {
+        if (refChIsWhitespace) {
+          offset += int(direction);
+          referenceStringPosition += int(direction);
+          isInWhitespace = true;
+          continue;
+        }
+        if (isInWhitespace) {
+          offset += int(direction);
+          continue;
+        }
+      }
+      isInWhitespace = false;
+      if (refCh == ToFoldedCase(ch)) {
+        offset += int(direction);
+        referenceStringPosition += int(direction);
+        continue;
+      }
+      foundMismatch = true;
+      break;
+    }
+    if (foundMismatch) {
+      break;
+    }
+  }
+  uint32_t commonLength = 0;
+  if constexpr (direction == TextScanDirection::Left) {
+    ++referenceStringPosition;
+    commonLength = aReferenceString.Length() - referenceStringPosition;
+    if (TextDirectiveUtil::ShouldLog()) {
+      textContentForLogging.Reverse();
+    }
+  } else {
+    commonLength = referenceStringPosition;
+  }
+  LogCommonSubstringLengths<direction>(__FUNCTION__, aReferenceString,
+                                       textContentForLogging, commonLength);
+  return commonLength;
+}
+
+template <TextScanDirection direction>
+ uint32_t
+TextDirectiveUtil::RemoveFirstWordFromStringAndDistanceArray(
+    nsAString& aString, nsTArray<uint32_t>& aWordDistances) {
+  MOZ_DIAGNOSTIC_ASSERT(!aString.IsEmpty());
+  MOZ_DIAGNOSTIC_ASSERT(aWordDistances.Length() > 1);
+  auto lengthOfFirstWordPlusWhitespaceAndPunctuation = aWordDistances[0];
+  auto chIsWhitespaceOrPunctuation = [&](uint32_t distance) {
+    const char16_t ch = aString.CharAt(direction == TextScanDirection::Right
+                                           ? distance
+                                           : aString.Length() - distance - 1);
+    return nsContentUtils::IsHTMLWhitespace(ch) ||
+           mozilla::IsPunctuationForWordSelect(ch);
+  };
+  while (lengthOfFirstWordPlusWhitespaceAndPunctuation < aString.Length() &&
+         chIsWhitespaceOrPunctuation(
+             lengthOfFirstWordPlusWhitespaceAndPunctuation)) {
+    ++lengthOfFirstWordPlusWhitespaceAndPunctuation;
+  }
+  if (lengthOfFirstWordPlusWhitespaceAndPunctuation == aString.Length()) {
+    aWordDistances.Clear();
+    return lengthOfFirstWordPlusWhitespaceAndPunctuation;
+  }
+  for (auto& wordDistance : aWordDistances) {
+    wordDistance -= lengthOfFirstWordPlusWhitespaceAndPunctuation;
+  }
+  aWordDistances.RemoveElementsBy([&aString](uint32_t distance) {
+    return distance == 0 || distance > aString.Length();
+  });
+  if constexpr (direction == TextScanDirection::Right) {
+    aString = Substring(aString, lengthOfFirstWordPlusWhitespaceAndPunctuation);
+  } else {
+    aString = Substring(
+        aString, 0,
+        aString.Length() - lengthOfFirstWordPlusWhitespaceAndPunctuation);
+  }
+  return lengthOfFirstWordPlusWhitespaceAndPunctuation;
+}
+}  
+
+#endif

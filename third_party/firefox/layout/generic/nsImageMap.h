@@ -1,0 +1,92 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsImageMap_h
+#define nsImageMap_h
+
+#include "Units.h"
+#include "mozilla/gfx/2D.h"
+#include "nsCOMPtr.h"
+#include "nsCoord.h"
+#include "nsIDOMEventListener.h"
+#include "nsStubMutationObserver.h"
+#include "nsTArray.h"
+
+class Area;
+class nsImageFrame;
+class nsIFrame;
+class nsIContent;
+struct nsRect;
+
+namespace mozilla {
+namespace dom {
+class HTMLAreaElement;
+}
+}  
+
+class nsImageMap final : public nsStubMutationObserver,
+                         public nsIDOMEventListener {
+  typedef mozilla::gfx::DrawTarget DrawTarget;
+  typedef mozilla::gfx::ColorPattern ColorPattern;
+  typedef mozilla::gfx::StrokeOptions StrokeOptions;
+
+ public:
+  nsImageMap();
+
+  void Init(nsImageFrame* aImageFrame, nsIContent* aMap);
+
+  mozilla::dom::HTMLAreaElement* GetArea(const mozilla::CSSIntPoint& aPt) const;
+
+  uint32_t AreaCount() const { return mAreas.Length(); }
+
+  bool HasFocus() const { return mHasFocus; }
+
+  mozilla::dom::HTMLAreaElement* GetAreaAt(uint32_t aIndex) const;
+
+  void DrawFocus(nsIFrame* aFrame, DrawTarget& aDrawTarget,
+                 const ColorPattern& aColor,
+                 const StrokeOptions& aStrokeOptions = StrokeOptions());
+
+  void Destroy();
+
+  NS_DECL_ISUPPORTS
+
+  NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTECHANGED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTAPPENDED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTINSERTED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTREMOVED
+  NS_DECL_NSIMUTATIONOBSERVER_PARENTCHAINCHANGED
+
+  NS_DECL_NSIDOMEVENTLISTENER
+
+  nsresult GetBoundsForAreaContent(nsIContent* aContent, nsRect& aBounds);
+
+  using AreaList = AutoTArray<mozilla::UniquePtr<Area>, 8>;
+
+ protected:
+  virtual ~nsImageMap();
+
+  void FreeAreas();
+
+  void UpdateAreas();
+
+  void SearchForAreas(nsIContent* aParent);
+
+  void AddArea(mozilla::dom::HTMLAreaElement* aArea);
+  void AreaRemoved(mozilla::dom::HTMLAreaElement* aArea);
+
+  void MaybeUpdateAreas(nsIContent* aContent);
+
+  nsImageFrame* mImageFrame = nullptr;  
+  nsCOMPtr<nsIContent> mMap;
+
+  AreaList mAreas;
+
+  bool mConsiderWholeSubtree = false;
+
+  bool mHasFocus = false;
+};
+
+#endif /* nsImageMap_h */

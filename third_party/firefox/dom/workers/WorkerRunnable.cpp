@@ -1,0 +1,634 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WorkerRunnable.h"
+
+#include "WorkerScope.h"
+#include "js/RootingAPI.h"
+#include "jsapi.h"
+#include "jsfriendapi.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/Worker.h"
+#include "mozilla/dom/WorkerCommon.h"
+#include "nsDebug.h"
+#include "nsGlobalWindowInner.h"
+#include "nsID.h"
+#include "nsIEventTarget.h"
+#include "nsIGlobalObject.h"
+#include "nsIRunnable.h"
+#include "nsThreadUtils.h"
+#include "nsWrapperCacheInlines.h"
+
+namespace mozilla::dom {
+
+static mozilla::LazyLogModule sWorkerRunnableLog("WorkerRunnable");
+
+#ifdef LOG
+#  undef LOG
+#endif
+#define LOG(args) MOZ_LOG(sWorkerRunnableLog, LogLevel::Verbose, args);
+
+namespace {
+
+const nsIID kWorkerRunnableIID = {
+    0x320cc0b5,
+    0xef12,
+    0x4084,
+    {0x88, 0x6e, 0xca, 0x6a, 0x81, 0xe4, 0x1d, 0x68}};
+
+}  
+
+#ifdef DEBUG
+WorkerRunnable::WorkerRunnable(const char* aName)
+#  ifdef MOZ_COLLECTING_RUNNABLE_TELEMETRY
+    : mName(aName) {
+  LOG(("WorkerRunnable::WorkerRunnable [%p] (%s)", this, mName));
+}
+#  else
+{
+  LOG(("WorkerRunnable::WorkerRunnable [%p]", this));
+}
+#  endif
+#endif
+
+WorkerRunnable* WorkerRunnable::FromRunnable(nsIRunnable* aRunnable) {
+  MOZ_ASSERT(aRunnable);
+
+  WorkerRunnable* runnable;
+  nsresult rv = aRunnable->QueryInterface(kWorkerRunnableIID,
+                                          reinterpret_cast<void**>(&runnable));
+  if (NS_FAILED(rv)) {
+    return nullptr;
+  }
+
+  MOZ_ASSERT(runnable);
+  return runnable;
+}
+
+bool WorkerRunnable::Dispatch(WorkerPrivate* aWorkerPrivate) {
+  LOG(("WorkerRunnable::Dispatch [%p] aWorkerPrivate: %p", this,
+       aWorkerPrivate));
+  MOZ_DIAGNOSTIC_ASSERT(aWorkerPrivate);
+  bool ok = PreDispatch(aWorkerPrivate);
+  if (ok) {
+    ok = DispatchInternal(aWorkerPrivate);
+  }
+  PostDispatch(aWorkerPrivate, ok);
+  return ok;
+}
+
+NS_IMETHODIMP WorkerRunnable::Run() { return NS_OK; }
+
+NS_IMPL_ADDREF(WorkerRunnable)
+NS_IMPL_RELEASE(WorkerRunnable)
+
+#ifdef MOZ_COLLECTING_RUNNABLE_TELEMETRY
+NS_IMETHODIMP
+WorkerRunnable::GetName(nsACString& aName) {
+  if (mName) {
+    aName.AssignASCII(mName);
+  } else {
+    aName.Truncate();
+  }
+  return NS_OK;
+}
+#endif
+
+NS_INTERFACE_MAP_BEGIN(WorkerRunnable)
+  NS_INTERFACE_MAP_ENTRY(nsIRunnable)
+#ifdef MOZ_COLLECTING_RUNNABLE_TELEMETRY
+  NS_INTERFACE_MAP_ENTRY(nsINamed)
+#endif
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIRunnable)
+  if (aIID.Equals(kWorkerRunnableIID)) {
+    *aInstancePtr = this;
+    return NS_OK;
+  } else
+NS_INTERFACE_MAP_END
+
+WorkerParentThreadRunnable::WorkerParentThreadRunnable(const char* aName)
+    : WorkerRunnable(aName) {
+  LOG(("WorkerParentThreadRunnable::WorkerParentThreadRunnable [%p]", this));
+}
+
+WorkerParentThreadRunnable::~WorkerParentThreadRunnable() = default;
+
+bool WorkerParentThreadRunnable::PreDispatch(WorkerPrivate* aWorkerPrivate) {
+#ifdef DEBUG
+  MOZ_ASSERT(aWorkerPrivate);
+  aWorkerPrivate->AssertIsOnWorkerThread();
+#endif
+  return true;
+}
+
+bool WorkerParentThreadRunnable::DispatchInternal(
+    WorkerPrivate* aWorkerPrivate) {
+  LOG(("WorkerParentThreadRunnable::DispatchInternal [%p]", this));
+  mWorkerParentRef = aWorkerPrivate->GetWorkerParentRef();
+  RefPtr<WorkerParentThreadRunnable> runnable(this);
+  return NS_SUCCEEDED(aWorkerPrivate->DispatchToParent(runnable.forget()));
+}
+
+void WorkerParentThreadRunnable::PostDispatch(WorkerPrivate* aWorkerPrivate,
+                                              bool aDispatchResult) {
+#ifdef DEBUG
+  MOZ_ASSERT(aWorkerPrivate);
+  aWorkerPrivate->AssertIsOnWorkerThread();
+#endif
+}
+
+bool WorkerParentThreadRunnable::PreRun(WorkerPrivate* aWorkerPrivate) {
+  return true;
+}
+
+void WorkerParentThreadRunnable::PostRun(JSContext* aCx,
+                                         WorkerPrivate* aWorkerPrivate,
+                                         bool aRunResult) {
+  MOZ_ASSERT(aCx);
+#ifdef DEBUG
+  MOZ_ASSERT(aWorkerPrivate);
+  aWorkerPrivate->AssertIsOnParentThread();
+#endif
+}
+
+NS_IMETHODIMP
+WorkerParentThreadRunnable::Run() {
+  LOG(("WorkerParentThreadRunnable::Run [%p]", this));
+  RefPtr<WorkerPrivate> workerPrivate;
+  MOZ_ASSERT(mWorkerParentRef);
+  workerPrivate = mWorkerParentRef->Private();
+  if (!workerPrivate) {
+    NS_WARNING("Worker has already shut down!!!");
+    return NS_OK;
+  }
+#ifdef DEBUG
+  workerPrivate->AssertIsOnParentThread();
+#endif
+
+  WorkerPrivate* parent = workerPrivate->GetParent();
+  bool isOnMainThread = !parent;
+  bool result = PreRun(workerPrivate);
+  MOZ_ASSERT(result);
+
+  LOG(("WorkerParentThreadRunnable::Run [%p] WorkerPrivate: %p, parent: %p",
+       this, workerPrivate.get(), parent));
+
+  nsCOMPtr<nsIGlobalObject> globalObject;
+  if (isOnMainThread) {
+    MOZ_ASSERT(isOnMainThread == NS_IsMainThread());
+    globalObject = nsGlobalWindowInner::Cast(workerPrivate->GetWindow());
+  } else {
+    MOZ_ASSERT(parent == GetCurrentThreadWorkerPrivate());
+    globalObject = parent->GlobalScope();
+    MOZ_DIAGNOSTIC_ASSERT(globalObject);
+  }
+  Maybe<mozilla::dom::AutoJSAPI> maybeJSAPI;
+  Maybe<mozilla::dom::AutoEntryScript> aes;
+  JSContext* cx;
+  AutoJSAPI* jsapi;
+
+  if (globalObject) {
+    aes.emplace(globalObject, "Worker parent thread runnable", isOnMainThread);
+    jsapi = aes.ptr();
+    cx = aes->cx();
+  } else {
+    maybeJSAPI.emplace();
+    maybeJSAPI->Init();
+    jsapi = maybeJSAPI.ptr();
+    cx = jsapi->cx();
+  }
+
+
+  MOZ_ASSERT_IF(!isOnMainThread,
+                workerPrivate->IsDedicatedWorker() && globalObject);
+
+  Maybe<JSAutoRealm> ar;
+  if (workerPrivate->IsDedicatedWorker() &&
+      workerPrivate->ParentEventTargetRef() &&
+      workerPrivate->ParentEventTargetRef()->GetWrapper()) {
+    JSObject* wrapper = workerPrivate->ParentEventTargetRef()->GetWrapper();
+
+    MOZ_ASSERT_IF(globalObject,
+                  js::GetNonCCWObjectRealm(wrapper) == js::GetContextRealm(cx));
+    MOZ_ASSERT_IF(globalObject,
+                  js::GetNonCCWObjectRealm(wrapper) ==
+                      js::GetNonCCWObjectRealm(
+                          globalObject->GetGlobalJSObjectPreserveColor()));
+
+    MOZ_ASSERT(!js::GetContextRealm(cx) ||
+                   js::GetNonCCWObjectRealm(wrapper) == js::GetContextRealm(cx),
+               "Must either be in the null compartment or in our reflector "
+               "compartment");
+
+    ar.emplace(cx, wrapper);
+  }
+
+  MOZ_ASSERT(!jsapi->HasException());
+  result = WorkerRun(cx, workerPrivate);
+  jsapi->ReportException();
+
+  PostRun(cx, workerPrivate, result);
+  MOZ_ASSERT(!jsapi->HasException());
+
+  return result ? NS_OK : NS_ERROR_FAILURE;
+}
+
+nsresult WorkerParentThreadRunnable::Cancel() {
+  LOG(("WorkerParentThreadRunnable::Cancel [%p]", this));
+  return NS_OK;
+}
+
+WorkerParentControlRunnable::WorkerParentControlRunnable(const char* aName)
+    : WorkerParentThreadRunnable(aName) {}
+
+WorkerParentControlRunnable::~WorkerParentControlRunnable() = default;
+
+nsresult WorkerParentControlRunnable::Cancel() {
+  LOG(("WorkerParentControlRunnable::Cancel [%p]", this));
+  if (NS_FAILED(Run())) {
+    NS_WARNING("WorkerParentControlRunnable::Run() failed.");
+  }
+  return NS_OK;
+}
+
+WorkerThreadRunnable::WorkerThreadRunnable(const char* aName)
+    : WorkerRunnable(aName), mCallingCancelWithinRun(false) {
+  LOG(("WorkerThreadRunnable::WorkerThreadRunnable [%p]", this));
+}
+
+nsIGlobalObject* WorkerThreadRunnable::DefaultGlobalObject(
+    WorkerPrivate* aWorkerPrivate) const {
+  MOZ_DIAGNOSTIC_ASSERT(aWorkerPrivate);
+  if (IsDebuggerRunnable()) {
+    return aWorkerPrivate->DebuggerGlobalScope();
+  }
+  return aWorkerPrivate->GlobalScope();
+}
+
+bool WorkerThreadRunnable::PreDispatch(WorkerPrivate* aWorkerPrivate) {
+  MOZ_ASSERT(aWorkerPrivate);
+#ifdef DEBUG
+  aWorkerPrivate->AssertIsOnParentThread();
+#endif
+  return true;
+}
+
+bool WorkerThreadRunnable::DispatchInternal(WorkerPrivate* aWorkerPrivate) {
+  LOG(("WorkerThreadRunnable::DispatchInternal [%p]", this));
+  RefPtr<WorkerThreadRunnable> runnable(this);
+  return NS_SUCCEEDED(aWorkerPrivate->Dispatch(runnable.forget()));
+}
+
+void WorkerThreadRunnable::PostDispatch(WorkerPrivate* aWorkerPrivate,
+                                        bool aDispatchResult) {
+  MOZ_ASSERT(aWorkerPrivate);
+#ifdef DEBUG
+  aWorkerPrivate->AssertIsOnParentThread();
+#endif
+}
+
+bool WorkerThreadRunnable::PreRun(WorkerPrivate* aWorkerPrivate) {
+  return true;
+}
+
+void WorkerThreadRunnable::PostRun(JSContext* aCx,
+                                   WorkerPrivate* aWorkerPrivate,
+                                   bool aRunResult) {
+  MOZ_ASSERT(aCx);
+  MOZ_ASSERT(aWorkerPrivate);
+
+#ifdef DEBUG
+  aWorkerPrivate->AssertIsOnWorkerThread();
+#endif
+}
+
+NS_IMETHODIMP
+WorkerThreadRunnable::Run() {
+  LOG(("WorkerThreadRunnable::Run [%p]", this));
+
+  if (mCleanPreStartDispatching) {
+    LOG(("Clean the pre-start dispatched WorkerThreadRunnable [%p]", this));
+    return NS_OK;
+  }
+
+  WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
+  MOZ_ASSERT(workerPrivate);
+#ifdef DEBUG
+  workerPrivate->AssertIsOnWorkerThread();
+#endif
+
+  if (!mCallingCancelWithinRun &&
+      workerPrivate->CancelBeforeWorkerScopeConstructed()) {
+    mCallingCancelWithinRun = true;
+    Cancel();
+    mCallingCancelWithinRun = false;
+    return NS_OK;
+  }
+
+  bool result = PreRun(workerPrivate);
+  if (!result) {
+    workerPrivate->AssertIsOnWorkerThread();
+    MOZ_ASSERT(!JS_IsExceptionPending(workerPrivate->GetJSContext()));
+    PostRun(workerPrivate->GetJSContext(), workerPrivate, false);
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsIGlobalObject> globalObject =
+      workerPrivate->GetCurrentEventLoopGlobal();
+  if (!globalObject) {
+    globalObject = DefaultGlobalObject(workerPrivate);
+    if (NS_WARN_IF(!globalObject && !GetCurrentWorkerThreadJSContext())) {
+      return NS_ERROR_FAILURE;
+    }
+  }
+
+  Maybe<mozilla::dom::AutoJSAPI> maybeJSAPI;
+  Maybe<mozilla::dom::AutoEntryScript> aes;
+  JSContext* cx;
+  AutoJSAPI* jsapi;
+  if (globalObject) {
+    aes.emplace(globalObject, "Worker runnable", false);
+    jsapi = aes.ptr();
+    cx = aes->cx();
+  } else {
+    maybeJSAPI.emplace();
+    maybeJSAPI->Init();
+    jsapi = maybeJSAPI.ptr();
+    cx = jsapi->cx();
+  }
+
+  MOZ_ASSERT(!jsapi->HasException());
+  result = WorkerRun(cx, workerPrivate);
+  jsapi->ReportException();
+
+
+  PostRun(cx, workerPrivate, result);
+  MOZ_ASSERT(!jsapi->HasException());
+
+  return result ? NS_OK : NS_ERROR_FAILURE;
+}
+
+nsresult WorkerThreadRunnable::Cancel() {
+  LOG(("WorkerThreadRunnable::Cancel [%p]", this));
+  return NS_OK;
+}
+
+void WorkerDebuggerRunnable::PostDispatch(WorkerPrivate* aWorkerPrivate,
+                                          bool aDispatchResult) {}
+
+WorkerSyncRunnable::WorkerSyncRunnable(nsIEventTarget* aSyncLoopTarget,
+                                       const char* aName)
+    : WorkerThreadRunnable(aName), mSyncLoopTarget(aSyncLoopTarget) {}
+
+WorkerSyncRunnable::WorkerSyncRunnable(
+    nsCOMPtr<nsIEventTarget>&& aSyncLoopTarget, const char* aName)
+    : WorkerThreadRunnable(aName),
+      mSyncLoopTarget(std::move(aSyncLoopTarget)) {}
+
+WorkerSyncRunnable::~WorkerSyncRunnable() = default;
+
+bool WorkerSyncRunnable::DispatchInternal(WorkerPrivate* aWorkerPrivate) {
+  if (mSyncLoopTarget) {
+#ifdef DEBUG
+    aWorkerPrivate->AssertValidSyncLoop(mSyncLoopTarget);
+#endif
+    RefPtr<WorkerSyncRunnable> runnable(this);
+    return NS_SUCCEEDED(
+        mSyncLoopTarget->Dispatch(runnable.forget(), NS_DISPATCH_NORMAL));
+  }
+
+  return WorkerThreadRunnable::DispatchInternal(aWorkerPrivate);
+}
+
+void MainThreadWorkerSyncRunnable::PostDispatch(WorkerPrivate* aWorkerPrivate,
+                                                bool aDispatchResult) {}
+
+MainThreadStopSyncLoopRunnable::MainThreadStopSyncLoopRunnable(
+    nsCOMPtr<nsIEventTarget>&& aSyncLoopTarget, nsresult aResult)
+    : WorkerSyncRunnable(std::move(aSyncLoopTarget)), mResult(aResult) {
+  LOG(("MainThreadStopSyncLoopRunnable::MainThreadStopSyncLoopRunnable [%p]",
+       this));
+
+  AssertIsOnMainThread();
+}
+
+nsresult MainThreadStopSyncLoopRunnable::Cancel() {
+  LOG(("MainThreadStopSyncLoopRunnable::Cancel [%p]", this));
+  nsresult rv = Run();
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv), "Run() failed");
+
+  return rv;
+}
+
+bool MainThreadStopSyncLoopRunnable::WorkerRun(JSContext* aCx,
+                                               WorkerPrivate* aWorkerPrivate) {
+  aWorkerPrivate->AssertIsOnWorkerThread();
+  MOZ_ASSERT(mSyncLoopTarget);
+
+  nsCOMPtr<nsIEventTarget> syncLoopTarget;
+  mSyncLoopTarget.swap(syncLoopTarget);
+
+  aWorkerPrivate->StopSyncLoop(syncLoopTarget, mResult);
+  return true;
+}
+
+bool MainThreadStopSyncLoopRunnable::DispatchInternal(
+    WorkerPrivate* aWorkerPrivate) {
+  MOZ_ASSERT(mSyncLoopTarget);
+#ifdef DEBUG
+  aWorkerPrivate->AssertValidSyncLoop(mSyncLoopTarget);
+#endif
+  RefPtr<MainThreadStopSyncLoopRunnable> runnable(this);
+  return NS_SUCCEEDED(
+      mSyncLoopTarget->Dispatch(runnable.forget(), NS_DISPATCH_NORMAL));
+}
+
+void MainThreadStopSyncLoopRunnable::PostDispatch(WorkerPrivate* aWorkerPrivate,
+                                                  bool aDispatchResult) {}
+
+WorkerControlRunnable::WorkerControlRunnable(const char* aName)
+    : WorkerThreadRunnable(aName) {}
+
+nsresult WorkerControlRunnable::Cancel() {
+  LOG(("WorkerControlRunnable::Cancel [%p]", this));
+  if (NS_FAILED(Run())) {
+    NS_WARNING("WorkerControlRunnable::Run() failed.");
+  }
+
+  return NS_OK;
+}
+
+WorkerMainThreadRunnable::WorkerMainThreadRunnable(
+    WorkerPrivate* aWorkerPrivate, const nsACString&,
+    const char* const aName)
+    : mozilla::Runnable("dom::WorkerMainThreadRunnable"),
+      mName(aName) {
+  aWorkerPrivate->AssertIsOnWorkerThread();
+}
+
+WorkerMainThreadRunnable::~WorkerMainThreadRunnable() = default;
+
+void WorkerMainThreadRunnable::Dispatch(WorkerPrivate* aWorkerPrivate,
+                                        WorkerStatus aFailStatus,
+                                        mozilla::ErrorResult& aRv) {
+  aWorkerPrivate->AssertIsOnWorkerThread();
+
+  RefPtr<StrongWorkerRef> workerRef;
+  if (aFailStatus < Canceling) {
+    workerRef =
+        StrongWorkerRef::Create(aWorkerPrivate, mName, [self = RefPtr{this}]() {
+          LOG(
+              ("WorkerMainThreadRunnable::Dispatch [%p](%s) Worker starts to "
+               "shutdown while underlying SyncLoop is still running",
+               self.get(), self->mName));
+        });
+  } else {
+    LOG(
+        ("WorkerMainThreadRunnable::Dispatch [%p](%s) Creating a SyncLoop when"
+         "the Worker is shutting down",
+         this, mName));
+    workerRef = StrongWorkerRef::CreateForcibly(aWorkerPrivate, mName);
+  }
+  if (!workerRef) {
+    aRv.ThrowInvalidStateError("The worker has already shut down");
+    return;
+  }
+  mWorkerRef = MakeRefPtr<ThreadSafeWorkerRef>(workerRef);
+
+  AutoSyncLoopHolder syncLoop(aWorkerPrivate, aFailStatus);
+
+  mSyncLoopTarget = syncLoop.GetSerialEventTarget();
+  if (!mSyncLoopTarget) {
+    aRv.ThrowInvalidStateError("The worker is shutting down");
+    return;
+  }
+
+  DebugOnly<nsresult> rv = aWorkerPrivate->DispatchToMainThread(this);
+  MOZ_ASSERT(
+      NS_SUCCEEDED(rv),
+      "Should only fail after xpcom-shutdown-threads and we're gone by then");
+
+  bool success = NS_SUCCEEDED(syncLoop.Run());
+
+  mWorkerRef = nullptr;
+
+  if (!success) {
+    aRv.ThrowUncatchableException();
+  }
+}
+
+NS_IMETHODIMP
+WorkerMainThreadRunnable::Run() {
+  AssertIsOnMainThread();
+
+  bool runResult = MainThreadRun();
+
+  RefPtr<MainThreadStopSyncLoopRunnable> response =
+      new MainThreadStopSyncLoopRunnable(std::move(mSyncLoopTarget),
+                                         runResult ? NS_OK : NS_ERROR_FAILURE);
+
+  MOZ_ASSERT(mWorkerRef);
+  MOZ_ALWAYS_TRUE(response->Dispatch(mWorkerRef->Private()));
+
+  return NS_OK;
+}
+
+bool WorkerSameThreadRunnable::PreDispatch(WorkerPrivate* aWorkerPrivate) {
+  aWorkerPrivate->AssertIsOnWorkerThread();
+  return true;
+}
+
+void WorkerSameThreadRunnable::PostDispatch(WorkerPrivate* aWorkerPrivate,
+                                            bool aDispatchResult) {
+  aWorkerPrivate->AssertIsOnWorkerThread();
+}
+
+WorkerProxyToMainThreadRunnable::WorkerProxyToMainThreadRunnable()
+    : mozilla::Runnable("dom::WorkerProxyToMainThreadRunnable") {}
+
+WorkerProxyToMainThreadRunnable::~WorkerProxyToMainThreadRunnable() = default;
+
+bool WorkerProxyToMainThreadRunnable::Dispatch(WorkerPrivate* aWorkerPrivate) {
+  MOZ_ASSERT(aWorkerPrivate);
+  aWorkerPrivate->AssertIsOnWorkerThread();
+
+  RefPtr<StrongWorkerRef> workerRef = StrongWorkerRef::Create(
+      aWorkerPrivate, "WorkerProxyToMainThreadRunnable");
+  if (NS_WARN_IF(!workerRef)) {
+    RunBackOnWorkerThreadForCleanup(aWorkerPrivate);
+    return false;
+  }
+
+  MOZ_ASSERT(!mWorkerRef);
+  mWorkerRef = new ThreadSafeWorkerRef(workerRef);
+
+  if (ForMessaging()
+          ? NS_WARN_IF(NS_FAILED(
+                aWorkerPrivate->DispatchToMainThreadForMessaging(this)))
+          : NS_WARN_IF(NS_FAILED(aWorkerPrivate->DispatchToMainThread(this)))) {
+    ReleaseWorker();
+    RunBackOnWorkerThreadForCleanup(aWorkerPrivate);
+    return false;
+  }
+
+  return true;
+}
+
+NS_IMETHODIMP
+WorkerProxyToMainThreadRunnable::Run() {
+  AssertIsOnMainThread();
+  RunOnMainThread(mWorkerRef->Private());
+  PostDispatchOnMainThread();
+  return NS_OK;
+}
+
+void WorkerProxyToMainThreadRunnable::PostDispatchOnMainThread() {
+  class ReleaseRunnable final : public MainThreadWorkerControlRunnable {
+    RefPtr<WorkerProxyToMainThreadRunnable> mRunnable;
+
+   public:
+    explicit ReleaseRunnable(WorkerProxyToMainThreadRunnable* aRunnable)
+        : MainThreadWorkerControlRunnable("ReleaseRunnable"),
+          mRunnable(aRunnable) {
+      MOZ_ASSERT(aRunnable);
+    }
+
+    virtual nsresult Cancel() override {
+      MOZ_ASSERT(GetCurrentThreadWorkerPrivate());
+      (void)WorkerRun(nullptr, GetCurrentThreadWorkerPrivate());
+      return NS_OK;
+    }
+
+    virtual bool WorkerRun(JSContext* aCx,
+                           WorkerPrivate* aWorkerPrivate) override {
+      MOZ_ASSERT(aWorkerPrivate);
+      aWorkerPrivate->AssertIsOnWorkerThread();
+
+      if (mRunnable) {
+        mRunnable->RunBackOnWorkerThreadForCleanup(aWorkerPrivate);
+
+        mRunnable->ReleaseWorker();
+        mRunnable = nullptr;
+      }
+
+      return true;
+    }
+
+   private:
+    ~ReleaseRunnable() = default;
+  };
+
+  RefPtr<WorkerControlRunnable> runnable = new ReleaseRunnable(this);
+  (void)NS_WARN_IF(!runnable->Dispatch(mWorkerRef->Private()));
+}
+
+void WorkerProxyToMainThreadRunnable::ReleaseWorker() { mWorkerRef = nullptr; }
+
+}  

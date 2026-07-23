@@ -1,0 +1,175 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "gfxMathTable.h"
+
+#include "harfbuzz/hb.h"
+#include "harfbuzz/hb-ot.h"
+#include "mozilla/StaticPrefs_mathml.h"
+
+#define FloatToFixed(f) (65536 * (f))
+#define FixedToFloat(f) ((f) * (1.0 / 65536.0))
+
+using namespace mozilla;
+
+gfxMathTable::gfxMathTable(hb_face_t* aFace, gfxFloat aSize) {
+  mMathVariantCache.vertical = false;
+  mMathVariantCache.isRTL = false;
+  mHBFont = hb_font_create(aFace);
+  if (mHBFont) {
+    hb_font_set_ppem(mHBFont, aSize, aSize);
+    uint32_t scale = FloatToFixed(aSize);
+    hb_font_set_scale(mHBFont, scale, scale);
+  }
+
+  mMathVariantCache.glyphID = 0;
+  ClearCache();
+}
+
+gfxMathTable::~gfxMathTable() {
+  if (mHBFont) {
+    hb_font_destroy(mHBFont);
+  }
+}
+
+gfxFloat gfxMathTable::Constant(MathConstant aConstant) const {
+  int32_t value = hb_ot_math_get_constant(
+      mHBFont, static_cast<hb_ot_math_constant_t>(aConstant));
+  if (aConstant == ScriptPercentScaleDown ||
+      aConstant == ScriptScriptPercentScaleDown ||
+      aConstant == RadicalDegreeBottomRaisePercent) {
+    return value / 100.0;
+  }
+  return FixedToFloat(value);
+}
+
+gfxFloat gfxMathTable::ItalicsCorrection(uint32_t aGlyphID) const {
+  return FixedToFloat(
+      hb_ot_math_get_glyph_italics_correction(mHBFont, aGlyphID));
+}
+
+uint32_t gfxMathTable::VariantsSize(uint32_t aGlyphID, bool aVertical,
+                                    bool aRTL, uint16_t aSize) const {
+  UpdateMathVariantCache(aGlyphID, aVertical, aRTL);
+  if (aSize < kMaxCachedSizeCount) {
+    return mMathVariantCache.sizes[aSize];
+  }
+
+  hb_direction_t direction = aVertical
+                                 ? HB_DIRECTION_BTT
+                                 : (aRTL ? HB_DIRECTION_RTL : HB_DIRECTION_LTR);
+  hb_ot_math_glyph_variant_t variant;
+  unsigned int count = 1;
+  hb_ot_math_get_glyph_variants(mHBFont, aGlyphID, direction, aSize, &count,
+                                &variant);
+  return count > 0 ? variant.glyph : 0;
+}
+
+bool gfxMathTable::VariantsParts(uint32_t aGlyphID, bool aVertical, bool aRTL,
+                                 uint32_t aGlyphs[4]) const {
+  UpdateMathVariantCache(aGlyphID, aVertical, aRTL);
+  memcpy(aGlyphs, mMathVariantCache.parts, sizeof(mMathVariantCache.parts));
+  return mMathVariantCache.arePartsValid;
+}
+
+void gfxMathTable::ClearCache() const {
+  memset(mMathVariantCache.sizes, 0, sizeof(mMathVariantCache.sizes));
+  memset(mMathVariantCache.parts, 0, sizeof(mMathVariantCache.parts));
+  mMathVariantCache.arePartsValid = false;
+}
+
+void gfxMathTable::UpdateMathVariantCache(uint32_t aGlyphID, bool aVertical,
+                                          bool aRTL) const {
+  if (aGlyphID == mMathVariantCache.glyphID &&
+      aVertical == mMathVariantCache.vertical &&
+      aRTL == mMathVariantCache.isRTL)
+    return;
+
+  mMathVariantCache.glyphID = aGlyphID;
+  mMathVariantCache.vertical = aVertical;
+  mMathVariantCache.isRTL = aRTL;
+  ClearCache();
+
+  hb_direction_t direction = aVertical
+                                 ? HB_DIRECTION_BTT
+                                 : (aRTL ? HB_DIRECTION_RTL : HB_DIRECTION_LTR);
+  hb_ot_math_glyph_variant_t variant[kMaxCachedSizeCount];
+  unsigned int count = kMaxCachedSizeCount;
+  hb_ot_math_get_glyph_variants(mHBFont, aGlyphID, direction, 0, &count,
+                                variant);
+  for (unsigned int i = 0; i < count; i++) {
+    mMathVariantCache.sizes[i] = variant[i].glyph;
+  }
+
+
+  hb_ot_math_glyph_part_t parts[5];
+  count = std::size(parts);
+  unsigned int offset = 0;
+  if (hb_ot_math_get_glyph_assembly(mHBFont, aGlyphID, direction, offset,
+                                    &count, parts, nullptr) > std::size(parts))
+    return;                
+  if (count <= 0) return;  
+
+  uint16_t nonExtenderCount = 0;
+  for (uint16_t i = 0; i < count; i++) {
+    if (!(parts[i].flags & HB_MATH_GLYPH_PART_FLAG_EXTENDER)) {
+      nonExtenderCount++;
+    }
+  }
+  if (nonExtenderCount > 3) {
+    return;
+  }
+
+
+  uint8_t state = 0;
+
+  uint32_t extenderChar = 0;
+
+  for (uint16_t i = 0; i < count; i++) {
+    bool isExtender = parts[i].flags & HB_MATH_GLYPH_PART_FLAG_EXTENDER;
+    uint32_t glyph = parts[i].glyph;
+
+    if ((state == 1 || state == 2) && nonExtenderCount < 3) {
+      state += 2;
+    }
+
+    if (isExtender) {
+      if (!extenderChar) {
+        extenderChar = glyph;
+        mMathVariantCache.parts[3] = extenderChar;
+      } else if (extenderChar != glyph) {
+        return;
+      }
+
+      if (state == 0) {  
+        state = 1;
+      } else if (state == 2) {  
+        state = 3;
+      } else if (state >= 4) {
+        return;
+      }
+
+      continue;
+    }
+
+    if (state == 0) {
+      mMathVariantCache.parts[aVertical ? 2 : 0] = glyph;
+      state = 1;
+      continue;
+    }
+
+    if (state == 1 || state == 2) {
+      mMathVariantCache.parts[1] = glyph;
+      state = 3;
+      continue;
+    }
+
+    if (state == 3 || state == 4) {
+      mMathVariantCache.parts[aVertical ? 0 : 2] = glyph;
+      state = 5;
+    }
+  }
+
+  mMathVariantCache.arePartsValid = true;
+}

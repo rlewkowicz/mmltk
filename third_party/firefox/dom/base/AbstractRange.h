@@ -1,0 +1,246 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_AbstractRange_h
+#define mozilla_dom_AbstractRange_h
+
+#include <cstdint>
+#include <ostream>
+
+#include "ErrorList.h"
+#include "js/RootingAPI.h"
+#include "mozilla/RangeBoundary.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/dom/RangeBinding.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsISupports.h"
+#include "nsWrapperCache.h"
+
+class JSObject;
+class nsIContent;
+class nsINode;
+class nsRange;
+struct JSContext;
+
+namespace mozilla {
+class RectCallback;
+
+namespace dom {
+class Document;
+class Selection;
+class StaticRange;
+class HTMLSlotElement;
+
+enum class AllowRangeCrossShadowBoundary : bool { No, Yes };
+
+class AbstractRange : public nsISupports,
+                      public nsWrapperCache,
+                      public mozilla::LinkedListElement<AbstractRange> {
+  using AllowRangeCrossShadowBoundary =
+      mozilla::dom::AllowRangeCrossShadowBoundary;
+
+ protected:
+  explicit AbstractRange(nsINode* aNode, bool aIsDynamicRange,
+                         TreeKind aBoundaryTreeKind);
+  virtual ~AbstractRange();
+
+  using DOMRect = mozilla::dom::DOMRect;
+  using DOMRectList = mozilla::dom::DOMRectList;
+
+ public:
+  enum class IsUnlinking : bool { No, Yes };
+
+  AbstractRange() = delete;
+  explicit AbstractRange(const AbstractRange& aOther) = delete;
+
+  static void Shutdown();
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(AbstractRange)
+
+  const RangeBoundary& StartRef() const { return mStart; }
+  const RangeBoundary& MayCrossShadowBoundaryStartRef() const;
+
+  const RangeBoundary& EndRef() const { return mEnd; }
+  const RangeBoundary& MayCrossShadowBoundaryEndRef() const;
+
+  nsIContent* GetChildAtStartOffset() const {
+    return mStart.GetChildAtOffset();
+  }
+  nsIContent* GetMayCrossShadowBoundaryChildAtStartOffset() const;
+
+  nsIContent* GetChildAtEndOffset() const { return mEnd.GetChildAtOffset(); }
+  nsIContent* GetMayCrossShadowBoundaryChildAtEndOffset() const;
+
+  bool IsPositioned() const { return mIsPositioned; }
+  nsINode* GetClosestCommonInclusiveAncestor(
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+          AllowRangeCrossShadowBoundary::No) const;
+
+
+
+  nsINode* GetStartContainer() const { return mStart.GetContainer(); }
+  nsINode* GetMayCrossShadowBoundaryStartContainer() const;
+
+  nsINode* GetEndContainer() const { return mEnd.GetContainer(); }
+  nsINode* GetMayCrossShadowBoundaryEndContainer() const;
+
+  [[nodiscard]] bool IsPositionedAndSameContainer() const {
+    return MOZ_LIKELY(mIsPositioned) &&
+           mStart.GetContainer() == mEnd.GetContainer();
+  }
+  [[nodiscard]] bool IsPositionedAndSameContainerMayCrossShadowBoundary()
+      const {
+    return MOZ_LIKELY(mIsPositioned) &&
+           GetMayCrossShadowBoundaryStartContainer() ==
+               GetMayCrossShadowBoundaryEndContainer();
+  }
+
+  bool MayCrossShadowBoundary() const;
+
+  already_AddRefed<DOMRect> GetBoundingClientRect(bool aClampToEdge = true,
+                                                  bool aFlushLayout = true);
+  already_AddRefed<DOMRectList> GetClientRects(bool aClampToEdge = true,
+                                               bool aFlushLayout = true);
+  already_AddRefed<DOMRectList> GetAllowCrossShadowBoundaryClientRects(
+      bool aClampToEdge = true, bool aFlushLayout = true);
+
+  void GetClientRectsAndTexts(mozilla::dom::ClientRectsAndTexts& aResult,
+                              ErrorResult& aErr);
+  void CollectClientRects(mozilla::RectCallback& aCallback,
+                          bool aClampToEdge = true) const;
+
+  static void CollectClientRectsAndText(
+      mozilla::RectCallback* aCollector,
+      mozilla::dom::Sequence<nsString>* aTextList, AbstractRange* aRange,
+      nsINode* aStartContainer, uint32_t aStartOffset, nsINode* aEndContainer,
+      uint32_t aEndOffset, bool aClampToEdge, bool aFlushLayout);
+
+  Document* GetComposedDocOfContainers() const {
+    return mStart.GetComposedDoc();
+  }
+
+  uint32_t StartOffset() const {
+    return static_cast<uint32_t>(
+        *mStart.Offset(RangeBoundary::OffsetFilter::kValidOrInvalidOffsets));
+  }
+  uint32_t MayCrossShadowBoundaryStartOffset() const;
+
+  uint32_t EndOffset() const {
+    return static_cast<uint32_t>(
+        *mEnd.Offset(RangeBoundary::OffsetFilter::kValidOrInvalidOffsets));
+  }
+  uint32_t MayCrossShadowBoundaryEndOffset() const;
+
+  bool Collapsed() const {
+    return !mIsPositioned || (mStart.GetContainer() == mEnd.GetContainer() &&
+                              StartOffset() == EndOffset());
+  }
+
+  bool AreNormalRangeAndCrossShadowBoundaryRangeCollapsed() const;
+
+  nsINode* GetParentObject() const;
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  bool HasEqualBoundaries(const AbstractRange& aOther) const {
+    return (mStart == aOther.mStart) && (mEnd == aOther.mEnd);
+  }
+  bool IsDynamicRange() const { return mIsDynamicRange; }
+  bool IsStaticRange() const { return !mIsDynamicRange; }
+  inline nsRange* AsDynamicRange();
+  inline const nsRange* AsDynamicRange() const;
+  inline StaticRange* AsStaticRange();
+  inline const StaticRange* AsStaticRange() const;
+
+  bool IsInAnySelection() const { return !mSelections.IsEmpty(); }
+
+  [[nodiscard]] nsresult RegisterSelection(mozilla::dom::Selection& aSelection);
+
+  void UnregisterSelection(const mozilla::dom::Selection& aSelection,
+                           IsUnlinking aIsUnlinking = IsUnlinking::No);
+
+  const nsTArray<WeakPtr<Selection>>& GetSelections() const;
+
+  bool IsInSelection(const mozilla::dom::Selection& aSelection) const;
+
+  static bool IsRootUAWidget(const nsINode* aRoot);
+
+  already_AddRefed<StaticRange> GetShrunkenRangeToVisibleLeaves() const;
+
+ protected:
+  template <typename SPT, typename SRT, typename EPT, typename ERT,
+            typename RangeType>
+  static nsresult SetStartAndEndInternal(
+      const RangeBoundaryBase<SPT, SRT>& aStartBoundary,
+      const RangeBoundaryBase<EPT, ERT>& aEndBoundary, RangeType* aRange,
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+          AllowRangeCrossShadowBoundary::No);
+
+  template <class RangeType>
+  static bool MaybeCacheToReuse(RangeType& aInstance);
+
+  void Init(nsINode* aNode);
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const AbstractRange& aRange) {
+    if (aRange.Collapsed()) {
+      aStream << "{ mStart=mEnd=" << aRange.mStart;
+    } else {
+      aStream << "{ mStart=" << aRange.mStart << ", mEnd=" << aRange.mEnd;
+    }
+    return aStream << ", mIsGenerated="
+                   << (aRange.mIsGenerated ? "true" : "false")
+                   << ", mCalledByJS="
+                   << (aRange.mIsPositioned ? "true" : "false")
+                   << ", mIsDynamicRange="
+                   << (aRange.mIsDynamicRange ? "true" : "false") << " }";
+  }
+
+  void RegisterClosestCommonInclusiveAncestor(nsINode* aNode);
+  void UnregisterClosestCommonInclusiveAncestor(
+      IsUnlinking aIsUnlinking = IsUnlinking::No);
+
+  void UpdateCommonAncestorIfNecessary();
+
+  static void MarkDescendants(nsINode& aNode);
+  static void UnmarkDescendants(nsINode& aNode);
+
+  static void UpdateDescendantsInFlattenedTree(nsINode& aNode,
+                                               bool aMarkDescendants);
+  friend void mozilla::SlotAssignedNodeAdded(dom::HTMLSlotElement* aSlot,
+                                             nsIContent& aAssignedNode);
+  friend void mozilla::SlotAssignedNodeRemoved(dom::HTMLSlotElement* aSlot,
+                                               nsIContent& aUnassignedNode);
+
+  already_AddRefed<DOMRectList> GetClientRectsInner(
+      AllowRangeCrossShadowBoundary = AllowRangeCrossShadowBoundary::No,
+      bool aClampToEdge = true, bool aFlushLayout = true);
+
+ private:
+  void ClearForReuse();
+
+ protected:
+  RefPtr<Document> mOwner;
+  RangeBoundary mStart;
+  RangeBoundary mEnd;
+
+  AutoTArray<WeakPtr<Selection>, 1> mSelections;
+  nsCOMPtr<nsINode> mRegisteredClosestCommonInclusiveAncestor;
+
+  bool mIsPositioned;
+
+  bool mIsGenerated;
+  bool mCalledByJS;
+
+  const bool mIsDynamicRange;
+
+  static bool sHasShutDown;
+};
+
+}  
+}  
+
+#endif  // #ifndef mozilla_dom_AbstractRange_h

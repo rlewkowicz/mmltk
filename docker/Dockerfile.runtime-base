@@ -1,0 +1,125 @@
+# syntax=docker/dockerfile:1
+
+ARG MMLTK_PYTORCH_RUNTIME_IMAGE=pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime
+FROM ${MMLTK_PYTORCH_RUNTIME_IMAGE} AS runtime-base
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG MMLTK_CUDA_VERSION=13.0
+ARG MMLTK_FIREFOX_RUNTIME_PACKAGES="libgtk-3-0t64"
+ARG MMLTK_IMAGE_FINGERPRINT=unlabeled
+ARG MMLTK_CUDA_KEYRING_SHA256=d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba
+ARG MMLTK_CUDA_KEYRING_VERSION=1.1-1
+ARG MMLTK_ONNXRUNTIME_VERSION=1.23.2
+ARG MMLTK_ONNXRUNTIME_SHA256=2083e361072a79ce16a90dcd5f5cb3ab92574a82a3ce0ac01e5cfa3158176f53
+ARG MMLTK_TENSORRT_VERSION=10.14.1.48-1+cuda13.0
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN sed -i \
+        -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+        -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
+        /etc/apt/sources.list.d/ubuntu.sources \
+    && printf '%s\n' \
+        'Acquire::Retries "5";' \
+        'Acquire::http::Timeout "30";' \
+        'Acquire::https::Timeout "30";' \
+        'APT::Update::Error-Mode "any";' \
+        >/etc/apt/apt.conf.d/99mmltk-network \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && curl -fsSL \
+        "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_${MMLTK_CUDA_KEYRING_VERSION}_all.deb" \
+        -o /tmp/cuda-keyring.deb \
+    && echo "${MMLTK_CUDA_KEYRING_SHA256}  /tmp/cuda-keyring.deb" | sha256sum -c - \
+    && apt-get install -y --no-install-recommends /tmp/cuda-keyring.deb \
+    && rm -f /tmp/cuda-keyring.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        fonts-liberation \
+        gdb \
+        libatk-bridge2.0-0t64 \
+        libatk1.0-0t64 \
+        libasound2t64 \
+        libatspi2.0-0t64 \
+        libcups2t64 \
+        libcurl4t64 \
+        libdbus-1-3 \
+        libdrm2 \
+        libegl1 \
+        libgbm1 \
+        libgl1 \
+        libgfortran5 \
+        libglib2.0-bin \
+        ${MMLTK_FIREFOX_RUNTIME_PACKAGES} \
+        libnspr4 \
+        libnss3 \
+        libnvinfer10=${MMLTK_TENSORRT_VERSION} \
+        libnvinfer-plugin10=${MMLTK_TENSORRT_VERSION} \
+        libnvonnxparsers10=${MMLTK_TENSORRT_VERSION} \
+        libnvidia-egl-wayland1 \
+        libopenblas0-pthread \
+        libomp5-18 \
+        libopengl0 \
+        libprotobuf32t64 \
+        libu2f-udev \
+        libva2 \
+        libvulkan1 \
+        libwayland-client0 \
+        libwayland-cursor0 \
+        libwayland-egl1 \
+        libxkbcommon0 \
+        vulkan-validationlayers \
+        xdg-utils \
+        zenity \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL \
+        "https://github.com/microsoft/onnxruntime/releases/download/v${MMLTK_ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-gpu-${MMLTK_ONNXRUNTIME_VERSION}.tgz" \
+        -o /tmp/onnxruntime.tgz \
+    && echo "${MMLTK_ONNXRUNTIME_SHA256}  /tmp/onnxruntime.tgz" | sha256sum -c - \
+    && tar -xzf /tmp/onnxruntime.tgz -C /opt \
+    && mv "/opt/onnxruntime-linux-x64-gpu-${MMLTK_ONNXRUNTIME_VERSION}" /opt/onnxruntime \
+    && rm -f /tmp/onnxruntime.tgz
+
+RUN mkdir -p /usr/lib/x86_64-linux-gnu/gbm \
+    && ln -sf /usr/lib64/gbm/nvidia-drm_gbm.so /usr/lib/x86_64-linux-gnu/gbm/nvidia-drm_gbm.so \
+    && command -v zenity >/dev/null
+
+RUN python3 - <<'PY'
+from pathlib import Path
+import torch
+
+torch_root = Path(torch.utils.cmake_prefix_path).resolve().parents[1]
+link_path = Path("/opt/pytorch")
+if link_path.exists() or link_path.is_symlink():
+    link_path.unlink()
+link_path.symlink_to(torch_root)
+print(f"linked /opt/pytorch -> {torch_root}")
+PY
+
+RUN cat <<'EOF' >/usr/local/bin/mmltk-entrypoint
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-mmltk}" in
+    mmltk|mmltk-browser-host)
+        exec "$@"
+        ;;
+    -*)
+        exec mmltk "$@"
+        ;;
+    *)
+        exec mmltk "$@"
+        ;;
+esac
+EOF
+RUN chmod 0755 /usr/local/bin/mmltk-entrypoint
+
+ENV PATH=/opt/mmltk/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/mmltk/lib:/opt/onnxruntime/lib:/opt/pytorch/lib:/opt/pytorch/lib/../../nvidia/cu13/lib:/opt/pytorch/lib/../../nvidia/cudnn/lib:/opt/pytorch/lib/../../nvidia/cusparselt/lib:/opt/pytorch/lib/../../nvidia/nccl/lib:/opt/pytorch/lib/../../nvidia/nvshmem/lib:/usr/local/cuda-${MMLTK_CUDA_VERSION}/lib64
+
+WORKDIR /opt/mmltk
+ENTRYPOINT ["mmltk-entrypoint"]
+CMD ["mmltk"]
+
+LABEL com.mmltk.input-fingerprint="${MMLTK_IMAGE_FINGERPRINT}"

@@ -1,0 +1,279 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+use indexmap::IndexMap;
+use uniffi_pipeline::Node;
+
+/// Root node of the Initial IR
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+pub struct Root {
+    pub namespaces: IndexMap<String, Namespace>,
+    /// The library path the user passed to us, if we're in library mode
+    pub cdylib: Option<String>,
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+pub struct Namespace {
+    pub name: String,
+    pub crate_name: String,
+    /// contents of the `uniffi.toml` file for this module, if present
+    pub config_toml: Option<String>,
+    pub docstring: Option<String>,
+    pub functions: Vec<Function>,
+    pub type_definitions: Vec<TypeDefinition>,
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(FnMetadata))]
+pub struct Function {
+    pub name: String,
+    pub is_async: bool,
+    pub inputs: Vec<Argument>,
+    pub return_type: Option<Type>,
+    pub throws: Option<Type>,
+    pub checksum: Option<u16>,
+    pub docstring: Option<String>,
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+pub enum TypeDefinition {
+    Interface(Interface),
+    CallbackInterface(CallbackInterface),
+    Record(Record),
+    Enum(Enum),
+    Custom(CustomType),
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(ConstructorMetadata))]
+pub struct Constructor {
+    pub name: String,
+    pub is_async: bool,
+    pub inputs: Vec<Argument>,
+    pub throws: Option<Type>,
+    pub checksum: Option<u16>,
+    pub docstring: Option<String>,
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(MethodMetadata))]
+pub struct Method {
+    pub name: String,
+    pub is_async: bool,
+    pub inputs: Vec<Argument>,
+    pub return_type: Option<Type>,
+    pub throws: Option<Type>,
+    pub checksum: Option<u16>,
+    pub docstring: Option<String>,
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(TraitMethodMetadata))]
+pub struct TraitMethod {
+    pub trait_name: String,
+    pub index: u32,
+    pub name: String,
+    pub is_async: bool,
+    pub inputs: Vec<Argument>,
+    pub return_type: Option<Type>,
+    pub throws: Option<Type>,
+    pub checksum: Option<u16>,
+    pub docstring: Option<String>,
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(FnParamMetadata))]
+pub struct Argument {
+    pub name: String,
+    pub ty: Type,
+    pub optional: bool,
+    pub default: Option<DefaultValue>,
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(DefaultValueMetadata))]
+pub enum DefaultValue {
+    Default,
+    Literal(Literal),
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(LiteralMetadata))]
+pub enum Literal {
+    Boolean(bool),
+    String(String),
+    UInt(u64, Radix, Type),
+    Int(i64, Radix, Type),
+    Float(String, Type),
+    Enum(String, Type),
+    EmptySequence,
+    EmptyMap,
+    None,
+    Some { inner: Box<DefaultValue> },
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+pub enum Radix {
+    Decimal = 10,
+    Octal = 8,
+    Hexadecimal = 16,
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(RecordMetadata))]
+pub struct Record {
+    pub name: String,
+    pub fields: Vec<Field>,
+    pub constructors: Vec<Constructor>,
+    pub methods: Vec<Method>,
+    pub uniffi_traits: Vec<UniffiTrait>,
+    pub docstring: Option<String>,
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(FieldMetadata))]
+pub struct Field {
+    pub name: String,
+    pub ty: Type,
+    pub default: Option<DefaultValue>,
+    pub docstring: Option<String>,
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+pub enum EnumShape {
+    Enum,
+    Error { flat: bool },
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(EnumMetadata))]
+pub struct Enum {
+    pub name: String,
+    pub shape: EnumShape,
+    pub variants: Vec<Variant>,
+    pub discr_type: Option<Type>,
+    pub constructors: Vec<Constructor>,
+    pub methods: Vec<Method>,
+    pub uniffi_traits: Vec<UniffiTrait>,
+    pub docstring: Option<String>,
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(VariantMetadata))]
+pub struct Variant {
+    pub name: String,
+    pub discr: Option<Literal>,
+    pub fields: Vec<Field>,
+    pub docstring: Option<String>,
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(ObjectMetadata))]
+pub struct Interface {
+    pub name: String,
+    pub docstring: Option<String>,
+    pub constructors: Vec<Constructor>,
+    pub methods: Vec<Method>,
+    pub uniffi_traits: Vec<UniffiTrait>,
+    pub trait_impls: Vec<ObjectTraitImpl>,
+    pub imp: ObjectImpl,
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(CallbackInterfaceMetadata))]
+pub struct CallbackInterface {
+    pub name: String,
+    pub docstring: Option<String>,
+    pub methods: Vec<Method>,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(UniffiTraitMetadata))]
+pub enum UniffiTrait {
+    Debug { fmt: Method },
+    Display { fmt: Method },
+    Eq { eq: Method, ne: Method },
+    Hash { hash: Method },
+    Ord { cmp: Method },
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(ObjectTraitImplMetadata))]
+pub struct ObjectTraitImpl {
+    pub ty: Type,
+    pub trait_ty: Type,
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+#[node(from(CustomTypeMetadata))]
+pub struct CustomType {
+    pub name: String,
+    pub builtin: Type,
+    pub docstring: Option<String>,
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+pub enum Type {
+    UInt8,
+    Int8,
+    UInt16,
+    Int16,
+    UInt32,
+    Int32,
+    UInt64,
+    Int64,
+    Float32,
+    Float64,
+    Boolean,
+    String,
+    Bytes,
+    Timestamp,
+    Duration,
+    Optional {
+        inner_type: Box<Type>,
+    },
+    Sequence {
+        inner_type: Box<Type>,
+    },
+    Map {
+        key_type: Box<Type>,
+        value_type: Box<Type>,
+    },
+    #[node(from(Object))]
+    Interface {
+        module_path: String, 
+        namespace: String,   
+        name: String,
+        imp: ObjectImpl,
+    },
+    Record {
+        module_path: String,
+        namespace: String,
+        name: String,
+    },
+    Enum {
+        module_path: String,
+        namespace: String,
+        name: String,
+    },
+    CallbackInterface {
+        module_path: String,
+        namespace: String,
+        name: String,
+    },
+    Custom {
+        module_path: String,
+        namespace: String,
+        name: String,
+        builtin: Box<Type>,
+    },
+}
+
+#[derive(Debug, Clone, Node, PartialEq, Eq)]
+pub enum ObjectImpl {
+    Struct,
+    Trait,
+    CallbackTrait,
+}

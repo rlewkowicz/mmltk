@@ -1,0 +1,48 @@
+// Copyright 2023 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+#if !defined(GOOGLE_PROTOBUF_INTERNAL_VISIBILITY_H__)
+#define GOOGLE_PROTOBUF_INTERNAL_VISIBILITY_H__
+
+namespace google {
+namespace protobuf {
+
+class Arena;
+class Message;
+class MessageLite;
+
+namespace internal {
+
+class ExtensionSet;
+class InternalVisibilityForTesting;
+class InternalMetadata;
+class ParseContext;
+
+template <typename T, bool sign>
+const char* VarintParser(void* object, Arena* arena, const char* ptr,
+                         ParseContext* ctx);
+
+class InternalVisibility {
+ private:
+  explicit constexpr InternalVisibility();
+
+  friend class ::google::protobuf::Arena;
+  friend class ::google::protobuf::Message;
+  friend class ::google::protobuf::MessageLite;
+  friend class ::google::protobuf::internal::ExtensionSet;
+  friend class ::google::protobuf::internal::InternalMetadata;
+
+  template <typename T, bool sign>
+  friend const char* internal::VarintParser(void* object, Arena* arena,
+                                            const char* ptr, ParseContext* ctx);
+
+  friend class InternalVisibilityForTesting;
+};
+
+inline constexpr InternalVisibility::InternalVisibility() = default;
+
+}  
+}  
+}  
+
+#endif

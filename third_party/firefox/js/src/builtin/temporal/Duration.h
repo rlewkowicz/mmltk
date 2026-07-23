@@ -1,0 +1,180 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_temporal_Duration_h
+#define builtin_temporal_Duration_h
+
+#include "mozilla/Assertions.h"
+
+#include <stdint.h>
+
+#include "builtin/temporal/TemporalTypes.h"
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "vm/NativeObject.h"
+
+namespace js {
+struct ClassSpec;
+}
+
+namespace js::temporal {
+
+class DurationObject : public NativeObject {
+ public:
+  static const JSClass class_;
+  static const JSClass& protoClass_;
+
+  static constexpr uint32_t YEARS_SLOT = 0;
+  static constexpr uint32_t MONTHS_SLOT = 1;
+  static constexpr uint32_t WEEKS_SLOT = 2;
+  static constexpr uint32_t DAYS_SLOT = 3;
+  static constexpr uint32_t HOURS_SLOT = 4;
+  static constexpr uint32_t MINUTES_SLOT = 5;
+  static constexpr uint32_t SECONDS_SLOT = 6;
+  static constexpr uint32_t MILLISECONDS_SLOT = 7;
+  static constexpr uint32_t MICROSECONDS_SLOT = 8;
+  static constexpr uint32_t NANOSECONDS_SLOT = 9;
+  static constexpr uint32_t SLOT_COUNT = 10;
+
+  double years() const { return getFixedSlot(YEARS_SLOT).toNumber(); }
+  double months() const { return getFixedSlot(MONTHS_SLOT).toNumber(); }
+  double weeks() const { return getFixedSlot(WEEKS_SLOT).toNumber(); }
+  double days() const { return getFixedSlot(DAYS_SLOT).toNumber(); }
+  double hours() const { return getFixedSlot(HOURS_SLOT).toNumber(); }
+  double minutes() const { return getFixedSlot(MINUTES_SLOT).toNumber(); }
+  double seconds() const { return getFixedSlot(SECONDS_SLOT).toNumber(); }
+  double milliseconds() const {
+    return getFixedSlot(MILLISECONDS_SLOT).toNumber();
+  }
+  double microseconds() const {
+    return getFixedSlot(MICROSECONDS_SLOT).toNumber();
+  }
+  double nanoseconds() const {
+    return getFixedSlot(NANOSECONDS_SLOT).toNumber();
+  }
+
+ private:
+  static const ClassSpec classSpec_;
+};
+
+inline Duration ToDuration(const DurationObject* duration) {
+  return {
+      duration->years(),        duration->months(),
+      duration->weeks(),        duration->days(),
+      duration->hours(),        duration->minutes(),
+      duration->seconds(),      duration->milliseconds(),
+      duration->microseconds(), duration->nanoseconds(),
+  };
+}
+
+class Increment;
+class CalendarValue;
+class TimeZoneValue;
+enum class TemporalRoundingMode;
+enum class TemporalUnit;
+
+int32_t DurationSign(const Duration& duration);
+
+int32_t DateDurationSign(const DateDuration& duration);
+
+#ifdef DEBUG
+bool IsValidDuration(const Duration& duration);
+
+bool IsValidDuration(const DateDuration& duration);
+
+bool IsValidDuration(const InternalDuration& duration);
+#endif
+
+bool ThrowIfInvalidDuration(JSContext* cx, const Duration& duration);
+
+inline bool IsValidTimeDuration(const TimeDuration& duration) {
+  MOZ_ASSERT(0 <= duration.nanoseconds && duration.nanoseconds <= 999'999'999);
+
+
+  constexpr auto max = TimeDuration::max() + TimeDuration::fromNanoseconds(1);
+  static_assert(max.nanoseconds == 0);
+
+  constexpr auto min = TimeDuration::min() - TimeDuration::fromNanoseconds(1);
+  static_assert(min.nanoseconds == 0);
+
+  return min < duration && duration < max;
+}
+
+TimeDuration TimeDurationFromComponents(const Duration& duration);
+
+inline int32_t CompareTimeDuration(const TimeDuration& one,
+                                   const TimeDuration& two) {
+  MOZ_ASSERT(IsValidTimeDuration(one));
+  MOZ_ASSERT(IsValidTimeDuration(two));
+
+  if (one > two) {
+    return 1;
+  }
+
+  if (one < two) {
+    return -1;
+  }
+
+  return 0;
+}
+
+inline int32_t TimeDurationSign(const TimeDuration& d) {
+  MOZ_ASSERT(IsValidTimeDuration(d));
+
+  return CompareTimeDuration(d, TimeDuration{});
+}
+
+inline InternalDuration ToInternalDurationRecord(const Duration& duration) {
+  MOZ_ASSERT(IsValidDuration(duration));
+
+  return {duration.toDateDuration(), TimeDurationFromComponents(duration)};
+}
+
+InternalDuration ToInternalDurationRecordWith24HourDays(
+    const Duration& duration);
+
+DateDuration ToDateDurationRecordWithoutTime(const Duration& duration);
+
+bool TemporalDurationFromInternal(JSContext* cx,
+                                  const TimeDuration& timeDuration,
+                                  TemporalUnit largestUnit, Duration* result);
+
+bool TemporalDurationFromInternal(JSContext* cx,
+                                  const InternalDuration& internalDuration,
+                                  TemporalUnit largestUnit, Duration* result);
+
+TimeDuration TimeDurationFromEpochNanosecondsDifference(
+    const EpochNanoseconds& one, const EpochNanoseconds& two);
+
+DurationObject* CreateTemporalDuration(JSContext* cx, const Duration& duration);
+
+bool ToTemporalDuration(JSContext* cx, JS::Handle<JS::Value> item,
+                        Duration* result);
+
+TimeDuration RoundTimeDuration(const TimeDuration& duration,
+                               Increment increment, TemporalUnit unit,
+                               TemporalRoundingMode roundingMode);
+
+bool RoundRelativeDuration(
+    JSContext* cx, const InternalDuration& duration,
+    const EpochNanoseconds& originEpochNs, const EpochNanoseconds& destEpochNs,
+    const ISODateTime& isoDateTime, JS::Handle<TimeZoneValue> timeZone,
+    JS::Handle<CalendarValue> calendar, TemporalUnit largestUnit,
+    Increment increment, TemporalUnit smallestUnit,
+    TemporalRoundingMode roundingMode, InternalDuration* result);
+
+bool TotalRelativeDuration(JSContext* cx, const InternalDuration& duration,
+                           const EpochNanoseconds& originEpochNs,
+                           const EpochNanoseconds& destEpochNs,
+                           const ISODateTime& isoDateTime,
+                           JS::Handle<TimeZoneValue> timeZone,
+                           JS::Handle<CalendarValue> calendar,
+                           TemporalUnit unit, double* result);
+
+double TotalTimeDuration(const TimeDuration& duration, TemporalUnit unit);
+
+} 
+
+#endif /* builtin_temporal_Duration_h */

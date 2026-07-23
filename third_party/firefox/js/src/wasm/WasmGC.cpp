@@ -1,0 +1,402 @@
+/*
+ * Copyright 2019 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "wasm/WasmGC.h"
+#include "wasm/WasmInstance.h"
+#include "jit/MacroAssembler-inl.h"
+
+using namespace js;
+using namespace js::jit;
+using namespace js::wasm;
+
+bool wasm::CreateStackMapForFunctionEntryTrap(
+    const wasm::ArgTypeVector& argTypes, const RegisterOffsets& trapExitLayout,
+    size_t trapExitLayoutWords, size_t nBytesReservedBeforeTrap,
+    size_t nInboundStackArgBytes, wasm::StackMaps& stackMaps,
+    wasm::StackMap** result) {
+  *result = nullptr;
+
+  const size_t nFrameBytes = sizeof(wasm::Frame);
+
+  const size_t trapExitLayoutBytes = trapExitLayoutWords * sizeof(void*);
+
+  MOZ_ASSERT(nInboundStackArgBytes % sizeof(void*) == 0);
+  const size_t nInboundStackArgBytesAligned =
+      AlignStackArgAreaSize(nInboundStackArgBytes);
+  const size_t numStackArgWords = nInboundStackArgBytesAligned / sizeof(void*);
+
+  const size_t nTotalBytes = trapExitLayoutBytes + nBytesReservedBeforeTrap +
+                             nFrameBytes + nInboundStackArgBytesAligned;
+
+#ifndef DEBUG
+  bool hasRefs = false;
+  for (ABIArgIter i(argTypes, ABIKind::Wasm); !i.done(); i++) {
+    if (i.mirType() == MIRType::WasmAnyRef) {
+      hasRefs = true;
+      break;
+    }
+  }
+
+  if (!hasRefs) {
+    return true;
+  }
+#endif
+
+  wasm::StackMap* stackMap = stackMaps.create(nTotalBytes / sizeof(void*));
+  if (!stackMap) {
+    return false;
+  }
+  stackMap->setExitStubWords(trapExitLayoutWords);
+  stackMap->setFrameOffsetFromTop(nFrameBytes / sizeof(void*) +
+                                  numStackArgWords);
+
+  wasm::ExitStubMapVector trapExitExtras;
+  if (!GenerateStackmapEntriesForTrapExit(
+          argTypes, trapExitLayout, trapExitLayoutWords, &trapExitExtras)) {
+    return false;
+  }
+  MOZ_ASSERT(trapExitExtras.length() == trapExitLayoutWords);
+
+  for (size_t i = 0; i < trapExitLayoutWords; i++) {
+    if (trapExitExtras[i]) {
+      stackMap->set(i, wasm::StackMap::AnyRef);
+    }
+  }
+
+  const size_t stackArgOffset =
+      (trapExitLayoutBytes + nBytesReservedBeforeTrap + nFrameBytes) /
+      sizeof(void*);
+  for (ABIArgIter i(argTypes, ABIKind::Wasm); !i.done(); i++) {
+    ABIArg argLoc = *i;
+    if (argLoc.kind() == ABIArg::Stack &&
+        argTypes[i.index()] == MIRType::WasmAnyRef) {
+      uint32_t offset = argLoc.offsetFromArgBase();
+      MOZ_ASSERT(offset < nInboundStackArgBytes);
+      MOZ_ASSERT(offset % sizeof(void*) == 0);
+      stackMap->set(stackArgOffset + offset / sizeof(void*),
+                    wasm::StackMap::AnyRef);
+    }
+  }
+
+#ifdef DEBUG
+  for (uint32_t i = 0; i < nFrameBytes / sizeof(void*); i++) {
+    MOZ_ASSERT(stackMap->get(stackMap->header.numMappedWords -
+                             stackMap->header.frameOffsetFromTop + i) ==
+               StackMap::Kind::POD);
+  }
+#endif
+
+  *result = stackMaps.finalize(stackMap);
+  return true;
+}
+
+#ifdef JS_JITSPEW
+void StackMap::show(uint32_t codeOffset) const {
+  uint32_t nWords = numMappedWords();
+  uint32_t nTotal = nWords + 64;
+  char* str = (char*)js_malloc(nTotal);
+  if (!str) {
+    return;
+  }
+  memset(str, 0, nTotal);
+  snprintf(str, nTotal, "%u words: LO{ ", nWords);
+  uint32_t offs = strlen(str);
+  for (uint32_t i = 0; i < nWords; i++) {
+    char c = '.';
+    switch (get(i)) {
+      case StackMap::Kind::POD:
+        break;
+      case StackMap::Kind::AnyRef:
+        c = 'R';
+        break;
+      case StackMap::Kind::StructDataPointer:
+        c = 'S';
+        break;
+      case StackMap::Kind::ArrayDataPointer:
+        c = 'A';
+        break;
+      case StackMap::Kind::Limit:
+      default:
+        MOZ_CRASH();
+    }
+    MOZ_RELEASE_ASSERT(offs < nTotal);
+    str[offs++] = c;
+  }
+  snprintf(&str[offs], nTotal - offs, " }HI");
+  MOZ_RELEASE_ASSERT(str[nTotal - 1] == 0);
+  JitSpew(jit::JitSpew_Codegen, "%06x  # <-- @ w::StackMap: %s", codeOffset,
+          str);
+  js_free(str);
+}
+
+const char* wasm::NameOfTrap(Trap t) {
+  switch (t) {
+    case Trap::Unreachable:
+      return "Unreachable";
+    case Trap::IntegerOverflow:
+      return "IntegerOverflow";
+    case Trap::InvalidConversionToInteger:
+      return "InvalidConversionToInteger";
+    case Trap::IntegerDivideByZero:
+      return "IntegerDivideByZero";
+    case Trap::OutOfBounds:
+      return "OutOfBounds";
+    case Trap::UnalignedAccess:
+      return "UnalignedAccess";
+    case Trap::IndirectCallToNull:
+      return "IndirectCallToNull";
+    case Trap::IndirectCallBadSig:
+      return "IndirectCallBadSig";
+    case Trap::NullPointerDereference:
+      return "NullPointerDereference";
+    case Trap::BadCast:
+      return "BadCast";
+    case Trap::StackOverflow:
+      return "StackOverflow";
+    case Trap::CheckInterrupt:
+      return "CheckInterrupt";
+    case Trap::ThrowReported:
+      return "ThrowReported";
+    case Trap::Limit:
+      return "Limit";
+    default:
+      MOZ_CRASH();
+  }
+}
+#endif
+
+bool wasm::GenerateStackmapEntriesForTrapExit(
+    const ArgTypeVector& args, const RegisterOffsets& trapExitLayout,
+    const size_t trapExitLayoutNumWords, ExitStubMapVector* extras) {
+  MOZ_ASSERT(extras->empty());
+
+  if (!extras->appendN(false, trapExitLayoutNumWords)) {
+    return false;
+  }
+
+  for (ABIArgIter i(args, ABIKind::Wasm); !i.done(); i++) {
+    if (!i->argInRegister() || i.mirType() != MIRType::WasmAnyRef) {
+      continue;
+    }
+
+    size_t offsetFromTop = trapExitLayout.getOffset(i->gpr());
+
+    MOZ_RELEASE_ASSERT(offsetFromTop < trapExitLayoutNumWords);
+
+    size_t offsetFromBottom = trapExitLayoutNumWords - 1 - offsetFromTop;
+
+    (*extras)[offsetFromBottom] = true;
+  }
+
+  return true;
+}
+
+template <class Addr>
+void wasm::EmitWasmPreBarrierGuard(MacroAssembler& masm, Register instance,
+                                   Register scratch, Addr addr,
+                                   Label* skipBarrier,
+                                   MaybeTrapSiteDesc trapSiteDesc) {
+  masm.loadPtr(
+      Address(instance, Instance::offsetOfAddressOfNeedsMarkingBarrier()),
+      scratch);
+  masm.branchTest32(Assembler::Zero, Address(scratch, 0), Imm32(0x1),
+                    skipBarrier);
+
+  FaultingCodeOffset fco = masm.loadPtr(addr, scratch);
+  masm.branchWasmAnyRefIsGCThing(false, scratch, skipBarrier);
+
+  if (trapSiteDesc) {
+    masm.append(wasm::Trap::NullPointerDereference,
+                TrapMachineInsnForLoadWord(), fco.get(), *trapSiteDesc);
+  }
+}
+
+template void wasm::EmitWasmPreBarrierGuard<Address>(
+    MacroAssembler& masm, Register instance, Register scratch, Address addr,
+    Label* skipBarrier, MaybeTrapSiteDesc trapSiteDesc);
+template void wasm::EmitWasmPreBarrierGuard<BaseIndex>(
+    MacroAssembler& masm, Register instance, Register scratch, BaseIndex addr,
+    Label* skipBarrier, MaybeTrapSiteDesc trapSiteDesc);
+
+void wasm::EmitWasmPreBarrierCallImmediate(MacroAssembler& masm,
+                                           Register instance, Register scratch,
+                                           Register valueAddr,
+                                           size_t valueOffset) {
+  MOZ_ASSERT(valueAddr == PreBarrierReg);
+
+  if (valueOffset != 0) {
+    masm.addPtr(Imm32(valueOffset), valueAddr);
+  }
+
+#if defined(DEBUG) && defined(JS_CODEGEN_ARM64)
+  Label ok;
+  masm.Cmp(sp, vixl::Operand(x20));
+  masm.B(&ok, Assembler::Equal);
+  masm.breakpoint();
+  masm.bind(&ok);
+#endif
+
+  masm.loadPtr(Address(instance, Instance::offsetOfPreBarrierCode()), scratch);
+  masm.call(scratch);
+
+  if (valueOffset != 0) {
+    masm.subPtr(Imm32(valueOffset), valueAddr);
+  }
+}
+
+void wasm::EmitWasmPreBarrierCallIndex(MacroAssembler& masm, Register instance,
+                                       Register scratch1, Register scratch2,
+                                       BaseIndex addr) {
+  MOZ_ASSERT(addr.base == PreBarrierReg);
+
+  masm.movePtr(AsRegister(addr.base), scratch2);
+
+  masm.computeEffectiveAddress(addr, PreBarrierReg);
+
+#if defined(DEBUG) && defined(JS_CODEGEN_ARM64)
+  Label ok;
+  masm.Cmp(sp, vixl::Operand(x20));
+  masm.B(&ok, Assembler::Equal);
+  masm.breakpoint();
+  masm.bind(&ok);
+#endif
+
+  masm.loadPtr(Address(instance, Instance::offsetOfPreBarrierCode()), scratch1);
+  masm.call(scratch1);
+
+  masm.movePtr(scratch2, AsRegister(addr.base));
+}
+
+#ifdef ENABLE_WASM_JSPI
+void wasm::EmitWasmResumeBarrierGuard(MacroAssembler& masm, Register instance,
+                                      Register scratch, Label* enterBarrier) {
+  masm.loadPtr(
+      Address(instance, Instance::offsetOfAddressOfNeedsMarkingBarrier()),
+      scratch);
+  masm.branchTest32(Assembler::NonZero, Address(scratch, 0), Imm32(0x1),
+                    enterBarrier);
+}
+
+void wasm::EmitWasmResumeBarrier(MacroAssembler& masm, Register instance,
+                                 Register cont) {
+  MOZ_ASSERT(instance == InstanceReg);
+
+  unsigned argDecrement;
+  {
+    ABIArgGenerator abi(ABIKind::Wasm);
+    ABIArg arg;
+    arg = abi.next(MIRType::Pointer);
+    argDecrement = StackDecrementForCall(
+        WasmStackAlignment, sizeof(wasm::Frame) + masm.framePushed(),
+        abi.stackBytesConsumedSoFar());
+  }
+  masm.reserveStack(argDecrement);
+  masm.assertStackAlignment(WasmStackAlignment);
+
+  ABIArgGenerator abi(ABIKind::Wasm);
+  ABIArg arg;
+  arg = abi.next(MIRType::Pointer);
+  if (arg.kind() == ABIArg::GPR) {
+    masm.movePtr(cont, arg.gpr());
+  } else {
+    MOZ_ASSERT(arg.kind() == ABIArg::Stack);
+    masm.storePtr(cont,
+                  Address(masm.getStackPointer(), arg.offsetFromArgBase()));
+  }
+
+  masm.storePtr(InstanceReg, Address(masm.getStackPointer(),
+                                     WasmCallerInstanceOffsetBeforeCall));
+
+  masm.call(SymbolicAddress::ResumeBarrier);
+
+  masm.freeStack(argDecrement);
+}
+#endif
+
+void wasm::EmitWasmPostBarrierGuard(MacroAssembler& masm,
+                                    const mozilla::Maybe<Register>& object,
+                                    Register otherScratch, Register setValue,
+                                    Label* skipBarrier) {
+  masm.branchWasmAnyRefIsNurseryCell(false, setValue, otherScratch,
+                                     skipBarrier);
+
+  if (object) {
+    masm.branchPtrInNurseryChunk(Assembler::Equal, *object, otherScratch,
+                                 skipBarrier);
+  }
+}
+
+void wasm::CheckWholeCellLastElementCache(MacroAssembler& masm,
+                                          Register instance, Register object,
+                                          Register temp, Label* skipBarrier) {
+  masm.loadPtr(
+      Address(instance,
+              wasm::Instance::offsetOfAddressOfLastBufferedWholeCell()),
+      temp);
+  masm.branchPtr(Assembler::Equal, Address(temp, 0), object, skipBarrier);
+}
+
+#ifdef DEBUG
+bool wasm::IsPlausibleStackMapKey(const uint8_t* nextPC) {
+#  if defined(JS_CODEGEN_X64) || defined(JS_CODEGEN_X86)
+  const uint8_t* insn = nextPC;
+  return (insn[-2] == 0x0F && insn[-1] == 0x0B) ||           
+         (insn[-2] == 0xFF && (insn[-1] & 0xF8) == 0xD0) ||  
+         insn[-5] == 0xE8;                                   
+
+#  elif defined(JS_CODEGEN_ARM)
+  const uint32_t* insn = (const uint32_t*)nextPC;
+  return ((uintptr_t(insn) & 3) == 0) &&            
+         (insn[-1] == 0xe7f000f0 ||                 
+          (insn[-1] & 0xfffffff0) == 0xe12fff30 ||  
+          (insn[-1] & 0x0f000000) == 0x0b000000);  
+
+#  elif defined(JS_CODEGEN_ARM64)
+  const uint32_t hltInsn = 0xd4a00000;
+  const uint32_t* insn = (const uint32_t*)nextPC;
+  return ((uintptr_t(insn) & 3) == 0) &&
+         (insn[-1] == hltInsn ||                    
+          (insn[-1] & 0xfffffc1f) == 0xd63f0000 ||  
+          (insn[-1] & 0xfc000000) == 0x94000000);   
+
+#  elif defined(JS_CODEGEN_MIPS64)
+  return true;
+#  elif defined(JS_CODEGEN_LOONG64)
+  return true;
+#  elif defined(JS_CODEGEN_RISCV64)
+  const uint32_t* insn = reinterpret_cast<const uint32_t*>(nextPC);
+  return (((uintptr_t(insn) & 3) == 0) &&
+          ((insn[-1] == 0x00006037 && insn[-2] == 0x00100073) ||  
+           ((insn[-1] & kBaseOpcodeMask) == JALR) ||              
+           ((insn[-1] & kBaseOpcodeMask) == JAL) ||               
+           ((insn[-2] & kBaseOpcodeMask) == JAL &&
+            insn[-1] == 0x00000013 ) ||  
+           (insn[-1] == 0x00100073 &&
+            (insn[-2] & kITypeMask) == RO_CSRRWI)));  
+#  else
+  MOZ_CRASH("IsValidStackMapKey: requires implementation on this platform");
+#  endif
+}
+#endif
+
+void StackMaps::checkInvariants(const uint8_t* base) const {
+#ifdef DEBUG
+  for (auto iter = codeOffsetToStackMap_.iter(); !iter.done(); iter.next()) {
+    MOZ_ASSERT(IsPlausibleStackMapKey(base + iter.get().key()),
+               "wasm stackmap does not reference a valid insn");
+  }
+#endif
+}

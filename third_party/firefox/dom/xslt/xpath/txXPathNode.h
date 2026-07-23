@@ -1,0 +1,99 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef txXPathNode_h_
+#define txXPathNode_h_
+
+#include "mozilla/dom/Document.h"
+#include "nsIContent.h"
+#include "nsINode.h"
+#include "nsNameSpaceManager.h"
+
+using txXPathNodeType = nsINode;
+
+class txXPathNode {
+ public:
+  explicit txXPathNode(const txXPathNode& aNode)
+      : mNode(aNode.mNode), mIndex(aNode.mIndex) {
+    MOZ_COUNT_CTOR(txXPathNode);
+  }
+  txXPathNode(txXPathNode&& aNode)
+      : mNode(std::move(aNode.mNode)), mIndex(aNode.mIndex) {
+    MOZ_COUNT_CTOR(txXPathNode);
+  }
+
+  explicit txXPathNode(mozilla::dom::Document* aDocument)
+      : mNode(aDocument), mIndex(eDocument) {
+    MOZ_COUNT_CTOR(txXPathNode);
+  }
+  explicit txXPathNode(nsIContent* aContent)
+      : mNode(aContent), mIndex(eContent) {
+    MOZ_COUNT_CTOR(txXPathNode);
+  }
+
+  txXPathNode& operator=(txXPathNode&& aOther) = default;
+  bool operator==(const txXPathNode& aNode) const;
+  bool operator!=(const txXPathNode& aNode) const { return !(*this == aNode); }
+  ~txXPathNode() { MOZ_COUNT_DTOR(txXPathNode); }
+
+  mozilla::dom::Document* OwnerDoc() const { return mNode->OwnerDoc(); }
+
+ private:
+  friend class txXPathNativeNode;
+  friend class txXPathNodeUtils;
+  friend class txXPathTreeWalker;
+
+  txXPathNode(nsINode* aNode, uint32_t aIndex) : mNode(aNode), mIndex(aIndex) {
+    MOZ_COUNT_CTOR(txXPathNode);
+  }
+
+  static nsINode* RootOf(nsINode* aNode) { return aNode->SubtreeRoot(); }
+  nsINode* Root() const { return RootOf(mNode); }
+
+  bool isDocument() const { return mIndex == eDocument; }
+  bool isContent() const { return mIndex == eContent; }
+  bool isAttribute() const { return mIndex != eDocument && mIndex != eContent; }
+
+  nsIContent* Content() const {
+    NS_ASSERTION(isContent() || isAttribute(), "wrong type");
+    return static_cast<nsIContent*>(mNode.get());
+  }
+  mozilla::dom::Document* Document() const {
+    NS_ASSERTION(isDocument(), "wrong type");
+    return static_cast<mozilla::dom::Document*>(mNode.get());
+  }
+
+  enum PositionType : uint32_t {
+    eDocument = UINT32_MAX,
+    eContent = eDocument - 1
+  };
+
+  nsCOMPtr<nsINode> mNode;
+  uint32_t mIndex;
+};
+
+class txNamespaceManager {
+ public:
+  static int32_t getNamespaceID(const nsAString& aNamespaceURI);
+  static nsresult getNamespaceURI(const int32_t aID, nsAString& aResult);
+};
+
+inline int32_t txNamespaceManager::getNamespaceID(
+    const nsAString& aNamespaceURI) {
+  int32_t namespaceID = kNameSpaceID_Unknown;
+  nsNameSpaceManager::GetInstance()->RegisterNameSpace(aNamespaceURI,
+                                                       namespaceID);
+  return namespaceID;
+}
+
+inline nsresult txNamespaceManager::getNamespaceURI(const int32_t aID,
+                                                    nsAString& aResult) {
+  return nsNameSpaceManager::GetInstance()->GetNameSpaceURI(aID, aResult);
+}
+
+inline bool txXPathNode::operator==(const txXPathNode& aNode) const {
+  return mIndex == aNode.mIndex && mNode == aNode.mNode;
+}
+
+#endif /* txXPathNode_h_ */

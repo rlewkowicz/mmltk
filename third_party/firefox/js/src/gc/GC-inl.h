@@ -1,0 +1,278 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_GC_inl_h
+#define gc_GC_inl_h
+
+#include "gc/GC.h"
+
+#include "mozilla/DebugOnly.h"
+#include "mozilla/Maybe.h"
+
+#include "gc/ChunkPool.h"
+#include "gc/GCRuntime.h"
+#include "gc/IteratorUtils.h"
+#include "gc/Marking.h"
+#include "gc/PublicIterators.h"
+#include "gc/Zone.h"
+#include "vm/Runtime.h"
+
+#include "gc/ArenaList-inl.h"
+
+namespace js::gc {
+
+class AutoAssertEmptyNursery;
+
+class ArenaIterInGC : public ChainedIterator<ArenaList::Iterator, 2> {
+ public:
+  ArenaIterInGC(JS::Zone* zone, AllocKind kind)
+      : ChainedIterator(zone->arenas.arenaList(kind),
+                        zone->arenas.collectingArenaList(kind)) {
+#ifdef DEBUG
+    MOZ_ASSERT(JS::RuntimeHeapIsMajorCollecting());
+    GCRuntime& gc = zone->runtimeFromMainThread()->gc;
+    MOZ_ASSERT(!gc.maybeGetForegroundFinalizedArenas(zone, kind));
+#endif
+  }
+};
+
+class ArenaIter : public AutoGatherSweptArenas,
+                  public ChainedIterator<ArenaList::Iterator, 3> {
+ public:
+  ArenaIter(JS::Zone* zone, AllocKind kind)
+      : AutoGatherSweptArenas(zone, kind),
+        ChainedIterator(zone->arenas.arenaList(kind),
+                        zone->arenas.collectingArenaList(kind), sweptArenas()) {
+  }
+};
+
+class ArenaCellIter {
+  size_t firstThingOffset;
+  size_t thingSize;
+  Arena* arenaAddr;
+  FreeSpan span;
+  uint_fast16_t thing;
+  mozilla::DebugOnly<JS::TraceKind> traceKind;
+
+  void settle() {
+    MOZ_ASSERT(!done());
+    MOZ_ASSERT(thing);
+    if (thing == span.first) {
+      thing = span.last + thingSize;
+      span = *span.nextSpan(arenaAddr);
+    }
+  }
+
+ public:
+  explicit ArenaCellIter(Arena* arena) {
+    MOZ_ASSERT(arena);
+    AllocKind kind = arena->getAllocKind();
+    firstThingOffset = Arena::firstThingOffset(kind);
+    thingSize = Arena::thingSize(kind);
+    traceKind = MapAllocToTraceKind(kind);
+    arenaAddr = arena;
+    span = *arena->getFirstFreeSpan();
+    thing = firstThingOffset;
+    settle();
+  }
+
+  bool done() const {
+    MOZ_ASSERT(thing <= ArenaSize);
+    return thing == ArenaSize;
+  }
+
+  TenuredCell* get() const {
+    MOZ_ASSERT(!done());
+    return reinterpret_cast<TenuredCell*>(uintptr_t(arenaAddr) + thing);
+  }
+
+  template <typename T>
+  T* as() const {
+    MOZ_ASSERT(!done());
+    MOZ_ASSERT(JS::MapTypeToTraceKind<T>::kind == traceKind);
+    return reinterpret_cast<T*>(get());
+  }
+
+  void next() {
+    MOZ_ASSERT(!done());
+    thing += thingSize;
+    if (thing < ArenaSize) {
+      settle();
+    }
+  }
+
+  operator TenuredCell*() const { return get(); }
+  TenuredCell* operator->() const { return get(); }
+};
+
+template <typename T>
+class ZoneAllCellIter;
+
+template <>
+class ZoneAllCellIter<TenuredCell> {
+  mozilla::Maybe<NestedIterator<ArenaIter, ArenaCellIter>> iter;
+  mozilla::Maybe<JS::AutoAssertNoGC> nogc;
+
+ protected:
+  ZoneAllCellIter() = default;
+
+  void init(JS::Zone* zone, AllocKind kind) {
+    MOZ_ASSERT_IF(IsNurseryAllocable(kind),
+                  (zone->isAtomsZone() ||
+                   zone->runtimeFromMainThread()->gc.nursery().isEmpty()));
+    initForTenuredIteration(zone, kind);
+  }
+
+  void initForTenuredIteration(JS::Zone* zone, AllocKind kind) {
+    JSRuntime* rt = zone->runtimeFromAnyThread();
+
+    if (!JS::RuntimeHeapIsBusy()) {
+      nogc.emplace();
+    }
+
+    if (IsBackgroundFinalized(kind)) {
+      ArenaLists& arenas = zone->arenas;
+      if (zone->isGCFinished() && !arenas.doneBackgroundFinalize(kind)) {
+        rt->gc.waitBackgroundSweepEnd();
+      }
+    }
+    iter.emplace(zone, kind);
+  }
+
+ public:
+  ZoneAllCellIter(JS::Zone* zone, AllocKind kind) {
+    if (IsNurseryAllocable(kind)) {
+      zone->runtimeFromMainThread()->gc.evictNursery();
+    }
+
+    init(zone, kind);
+  }
+
+  ZoneAllCellIter(JS::Zone* zone, AllocKind kind,
+                  const js::gc::AutoAssertEmptyNursery&) {
+    init(zone, kind);
+  }
+
+  bool done() const { return iter->done(); }
+
+  template <typename T>
+  T* get() const {
+    return iter->ref().as<T>();
+  }
+
+  TenuredCell* getCell() const { return iter->get(); }
+
+  void next() { iter->next(); }
+};
+
+/* clang-format off */
+/* clang-format on */
+template <typename GCType>
+class ZoneAllCellIter : public ZoneAllCellIter<TenuredCell> {
+ public:
+  explicit ZoneAllCellIter(JS::Zone* zone) : ZoneAllCellIter<TenuredCell>() {
+    init(zone, MapTypeToAllocKind<GCType>::kind);
+  }
+
+  ZoneAllCellIter(JS::Zone* zone, const js::gc::AutoAssertEmptyNursery&)
+      : ZoneAllCellIter(zone) {}
+
+  ZoneAllCellIter(JS::Zone* zone, AllocKind kind)
+      : ZoneAllCellIter<TenuredCell>(zone, kind) {}
+
+  ZoneAllCellIter(JS::Zone* zone, AllocKind kind,
+                  const js::gc::AutoAssertEmptyNursery& empty)
+      : ZoneAllCellIter<TenuredCell>(zone, kind, empty) {}
+
+  GCType* get() const { return ZoneAllCellIter<TenuredCell>::get<GCType>(); }
+  operator GCType*() const { return get(); }
+  GCType* operator->() const { return get(); }
+};
+
+template <typename T>
+class ZoneCellIter : protected ZoneAllCellIter<T> {
+  using Base = ZoneAllCellIter<T>;
+
+ public:
+  explicit ZoneCellIter(JS::Zone* zone) : ZoneAllCellIter<T>(zone) {
+    skipDying();
+  }
+  ZoneCellIter(JS::Zone* zone, const js::gc::AutoAssertEmptyNursery& empty)
+      : ZoneAllCellIter<T>(zone, empty) {
+    skipDying();
+  }
+  ZoneCellIter(JS::Zone* zone, AllocKind kind)
+      : ZoneAllCellIter<T>(zone, kind) {
+    skipDying();
+  }
+  ZoneCellIter(JS::Zone* zone, AllocKind kind,
+               const js::gc::AutoAssertEmptyNursery& empty)
+      : ZoneAllCellIter<T>(zone, kind, empty) {
+    skipDying();
+  }
+
+  using Base::done;
+
+  void next() {
+    ZoneAllCellIter<T>::next();
+    skipDying();
+  }
+
+  TenuredCell* getCell() const {
+    TenuredCell* cell = Base::getCell();
+
+    JSRuntime* rt = cell->runtimeFromAnyThread();
+    if (!JS::RuntimeHeapIsCollecting(rt->heapState())) {
+      JS::TraceKind traceKind = JS::MapTypeToTraceKind<T>::kind;
+      ExposeGCThingToActiveJS(JS::GCCellPtr(cell, traceKind));
+    }
+
+    return cell;
+  }
+
+  T* get() const { return reinterpret_cast<T*>(getCell()); }
+
+  TenuredCell* unbarrieredGetCell() const { return Base::getCell(); }
+  T* unbarrieredGet() const { return Base::get(); }
+  operator T*() const { return get(); }
+  T* operator->() const { return get(); }
+
+ private:
+  void skipDying() {
+    while (!ZoneAllCellIter<T>::done()) {
+      T* current = ZoneAllCellIter<T>::get();
+      if (!IsAboutToBeFinalizedUnbarriered(current)) {
+        return;
+      }
+      ZoneAllCellIter<T>::next();
+    }
+  }
+};
+
+template <typename F>
+inline void GCRuntime::forEachNonEmptyChunk(const AutoLockGC& lock, F&& func) {
+  if (Zone* zone = maybeSharedAtomsZone()) {
+    zone->forEachNonEmptyChunk(this, lock, func);
+  }
+  for (AllZonesIter zone(rt); !zone.done(); zone.next()) {
+    zone->forEachNonEmptyChunk(this, lock, func);
+  }
+}
+
+}  
+
+template <typename F>
+inline void JS::Zone::forEachNonEmptyChunk(js::gc::GCRuntime* gc,
+                                           const js::AutoLockGC& lock,
+                                           F&& func) {
+  gc->clearCurrentChunk(this, lock);
+  for (auto chunk = availableChunks(lock).iter(); !chunk.done(); chunk.next()) {
+    func(chunk.get());
+  }
+  for (auto chunk = fullChunks(lock).iter(); !chunk.done(); chunk.next()) {
+    func(chunk.get());
+  }
+}
+
+#endif /* gc_GC_inl_h */

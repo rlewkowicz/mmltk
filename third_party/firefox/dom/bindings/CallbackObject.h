@@ -1,0 +1,542 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_CallbackObject_h
+#define mozilla_dom_CallbackObject_h
+
+#include <cstddef>
+#include <cstdint>
+
+#include "js/Exception.h"
+#include "js/RootingAPI.h"
+#include "js/Wrapper.h"
+#include "jsapi.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/HoldDropJSObjects.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/AutoEntryScript.h"
+#include "mozilla/dom/BindingCallContext.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsID.h"
+#include "nsIGlobalObject.h"
+#include "nsISupports.h"
+#include "nsISupportsUtils.h"
+#include "nsStringFwd.h"
+
+class JSAutoRealm;
+class JSObject;
+class JSTracer;
+class nsCycleCollectionTraversalCallback;
+struct JSContext;
+
+namespace JS {
+class AutoSetAsyncStackForNewCalls;
+class Realm;
+class Value;
+}  
+
+namespace mozilla {
+
+class CycleCollectedJSContext;
+class ErrorResult;
+class PromiseJobRunnable;
+template <class T>
+class OwningNonNull;
+
+namespace dom {
+
+#define DOM_CALLBACKOBJECT_IID \
+  {0xbe74c190, 0x6d76, 0x4991, {0x84, 0xb9, 0x65, 0x06, 0x99, 0xe6, 0x93, 0x2b}}
+
+class CallbackObjectBase {
+ public:
+  CallbackObjectBase() = default;
+  CallbackObjectBase(JSObject* aCallback, JSObject* aCallbackGlobal,
+                     JSObject* aAsyncStack, nsIGlobalObject* aIncumbentGlobal) {
+    InitNoHold(aCallback, aCallbackGlobal, aAsyncStack, aIncumbentGlobal);
+  }
+
+  JSObject* CallbackOrNull() const {
+    mCallback.exposeToActiveJS();
+    return CallbackPreserveColor();
+  }
+
+  JSObject* CallbackGlobalOrNull() const {
+    mCallbackGlobal.exposeToActiveJS();
+    return mCallbackGlobal;
+  }
+
+  JSObject* Callback(JSContext* aCx);
+
+  JSObject* GetCreationStack() const { return mCreationStack; }
+
+  void MarkForCC() {
+    mCallback.exposeToActiveJS();
+    mCallbackGlobal.exposeToActiveJS();
+    mCreationStack.exposeToActiveJS();
+  }
+
+  JSObject* CallbackPreserveColor() const { return mCallback.unbarrieredGet(); }
+  JSObject* CallbackGlobalPreserveColor() const {
+    return mCallbackGlobal.unbarrieredGet();
+  }
+
+  JSObject* CallbackKnownNotGray() const {
+    JS::AssertObjectIsNotGray(mCallback);
+    return CallbackPreserveColor();
+  }
+
+  nsIGlobalObject* IncumbentGlobalOrNull() const { return mIncumbentGlobal; }
+
+  enum ExceptionHandling {
+    eReportExceptions,
+    eRethrowExceptions,
+    eRethrowContentExceptions
+  };
+
+  // "<functionName> (<sourceURL>:<lineNumber>)"
+  void GetDescription(nsACString& aOutString);
+
+  bool IsBlackForCC() const {
+    return (!mCallback || !JS::ObjectIsMarkedGray(mCallback)) &&
+           (!mCallbackGlobal || !JS::ObjectIsMarkedGray(mCallbackGlobal)) &&
+           (!mCreationStack || !JS::ObjectIsMarkedGray(mCreationStack)) &&
+           (!mIncumbentJSGlobal ||
+            !JS::ObjectIsMarkedGray(mIncumbentJSGlobal)) &&
+           (!mIncumbentGlobal || mIncumbentJSGlobal);
+  }
+
+ protected:
+  virtual ~CallbackObjectBase() = default;
+
+  virtual void Reset() {
+    ClearJSReferences();
+    mIncumbentGlobal = nullptr;
+  }
+
+  friend class mozilla::PromiseJobRunnable;
+
+  inline void ClearJSReferences() {
+    mCallback = nullptr;
+    mCallbackGlobal = nullptr;
+    mCreationStack = nullptr;
+    mIncumbentJSGlobal = nullptr;
+  }
+
+  inline void InitNoHold(JSObject* aCallback, JSObject* aCallbackGlobal,
+                         JSObject* aCreationStack,
+                         nsIGlobalObject* aIncumbentGlobal) {
+    MOZ_ASSERT(aCallback && !mCallback);
+    MOZ_ASSERT(aCallbackGlobal);
+    MOZ_DIAGNOSTIC_ASSERT(JS::GetCompartment(aCallback) ==
+                          JS::GetCompartment(aCallbackGlobal));
+    MOZ_ASSERT(JS_IsGlobalObject(aCallbackGlobal));
+    mCallback = aCallback;
+    mCallbackGlobal = aCallbackGlobal;
+    mCreationStack = aCreationStack;
+    if (aIncumbentGlobal) {
+      mIncumbentGlobal = aIncumbentGlobal;
+      mIncumbentJSGlobal = aIncumbentGlobal->GetGlobalJSObjectPreserveColor();
+    }
+  }
+
+  void ClearJSObjects() {
+    MOZ_ASSERT_IF(mIncumbentJSGlobal, mCallback);
+    if (mCallback) {
+      ClearJSReferences();
+    }
+  }
+
+  void Trace(JSTracer* aTracer);
+
+  JS::Heap<JSObject*> mCallback;
+  JS::Heap<JSObject*> mCallbackGlobal;
+  JS::Heap<JSObject*> mCreationStack;
+  nsCOMPtr<nsIGlobalObject> mIncumbentGlobal;
+  JS::TenuredHeap<JSObject*> mIncumbentJSGlobal;
+};
+
+class MOZ_STACK_CLASS CallSetup {
+ public:
+  CallSetup(CallbackObjectBase* aCallback, ErrorResult& aRv,
+            const char* aExecutionReason,
+            CallbackObjectBase::ExceptionHandling aExceptionHandling,
+            JS::Realm* aRealm = nullptr, bool aIsJSImplementedWebIDL = false);
+
+  CallSetup(JS::Handle<JSObject*> aCallbackGlobal,
+            nsIGlobalObject* aIncumbentGlobal,
+            JS::Handle<JSObject*> aCreationStack, ErrorResult& aRv,
+            const char* aExecutionReason,
+            CallbackObjectBase::ExceptionHandling aExceptionHandling,
+            JS::Realm* aRealm = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT ~CallSetup();
+
+  JSContext* GetContext() const { return mCx; }
+
+  BindingCallContext& GetCallContext() { return *mCallContext; }
+
+  static nsIGlobalObject* GetActiveGlobalObjectForCall(
+      JS::Handle<JSObject*> callbackOrGlobal, bool aIsMainThread,
+      bool aIsJSImplementedWebIDL, ErrorResult& aRv);
+
+ private:
+  CallSetup(CallbackObjectBase* aCallback, ErrorResult& aRv,
+            const char* aExecutionReason,
+            CallbackObjectBase::ExceptionHandling aExceptionHandling,
+            JS::Realm* aRealm, bool aIsJSImplementedWebIDL,
+            CycleCollectedJSContext* aCCJS);
+  CallSetup(ErrorResult& aRv,
+            CallbackObjectBase::ExceptionHandling aExceptionHandling,
+            JS::Realm* aRealm, bool aIsMainThread,
+            CycleCollectedJSContext* aCCJS);
+
+  CallSetup(const CallSetup&) = delete;
+
+  bool ShouldRethrowException(JS::Handle<JS::Value> aException);
+
+  static bool CheckBeforeExecution(nsIGlobalObject* aGlobalObject,
+                                   JSObject* aCallbackOrGlobal,
+                                   bool aIsJSImplementedWebIDL,
+                                   ErrorResult& aRv);
+
+  void SetupForExecution(nsIGlobalObject* aGlobalObject,
+                         nsIGlobalObject* aIncumbentGlobal,
+                         JS::Handle<JSObject*> aCallbackOrGlobal,
+                         JS::Handle<JSObject*> aCallbackGlobal,
+                         JS::Handle<JSObject*> aCreationStack,
+                         nsIPrincipal* aWebIDLCallerPrincipal,
+                         const char* aExecutionReason, ErrorResult& aRv);
+
+  JSContext* mCx;
+
+  JS::Realm* mRealm;
+
+  Maybe<AutoEntryScript> mAutoEntryScript;
+  Maybe<AutoIncumbentScript> mAutoIncumbentScript;
+
+  Maybe<JS::Rooted<JSObject*>> mRootedCallable;
+  Maybe<JS::AutoSetAsyncStackForNewCalls> mAsyncStackSetter;
+
+  Maybe<JSAutoRealm> mAr;
+
+  Maybe<BindingCallContext> mCallContext;
+
+  ErrorResult& mErrorResult;
+  const CallbackObjectBase::ExceptionHandling mExceptionHandling;
+  const bool mIsMainThread;
+};
+
+class CallbackObject : public nsISupports,
+                       public CallbackObjectBase,
+                       public JSHolderBase {
+ public:
+  NS_INLINE_DECL_STATIC_IID(DOM_CALLBACKOBJECT_IID)
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_SKIPPABLE_SCRIPT_HOLDER_CLASS(CallbackObject)
+
+  explicit CallbackObject(JSContext* aCx, JS::Handle<JSObject*> aCallback,
+                          JS::Handle<JSObject*> aCallbackGlobal,
+                          nsIGlobalObject* aIncumbentGlobal) {
+    if (aCx && JS::IsAsyncStackCaptureEnabledForRealm(aCx)) {
+      JS::Rooted<JSObject*> stack(aCx);
+      if (!JS::CaptureCurrentStack(aCx, &stack)) {
+        JS_ClearPendingException(aCx);
+      }
+      Init(aCallback, aCallbackGlobal, stack, aIncumbentGlobal);
+    } else {
+      Init(aCallback, aCallbackGlobal, nullptr, aIncumbentGlobal);
+    }
+  }
+
+  explicit CallbackObject(JSObject* aCallback, JSObject* aCallbackGlobal,
+                          JSObject* aAsyncStack,
+                          nsIGlobalObject* aIncumbentGlobal) {
+    Init(aCallback, aCallbackGlobal, aAsyncStack, aIncumbentGlobal);
+  }
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this);
+  }
+
+  void Reset() final {
+    CallbackObjectBase::Reset();
+    mozilla::DropJSObjectsWithKey(this);
+  }
+
+ protected:
+  virtual ~CallbackObject() { mozilla::DropJSObjectsWithKey(this); }
+
+  explicit CallbackObject(CallbackObject* aCallbackObject) {
+    Init(aCallbackObject->mCallback, aCallbackObject->mCallbackGlobal,
+         aCallbackObject->mCreationStack, aCallbackObject->mIncumbentGlobal);
+  }
+
+  void FinishSlowJSInitIfMoreThanOneOwner(JSContext* aCx);
+
+  struct FastCallbackConstructor {};
+
+  CallbackObject(JSObject* aCallback, JSObject* aCallbackGlobal,
+                 const FastCallbackConstructor&) {
+    InitNoHold(aCallback, aCallbackGlobal, nullptr, nullptr);
+  }
+
+  bool operator==(const CallbackObject& aOther) const {
+    JSObject* wrappedThis = CallbackPreserveColor();
+    JSObject* wrappedOther = aOther.CallbackPreserveColor();
+    if (!wrappedThis || !wrappedOther) {
+      return this == &aOther;
+    }
+
+    JSObject* thisObj = js::UncheckedUnwrap(wrappedThis);
+    JSObject* otherObj = js::UncheckedUnwrap(wrappedOther);
+    return thisObj == otherObj;
+  }
+
+  class JSObjectsDropper final {
+   public:
+    explicit JSObjectsDropper(CallbackObject* aHolder) : mHolder(aHolder) {}
+
+    ~JSObjectsDropper() { mHolder->ClearJSObjects(); }
+
+   private:
+    RefPtr<CallbackObject> mHolder;
+  };
+
+ private:
+  CallbackObject(const CallbackObject&) = delete;
+  CallbackObject& operator=(const CallbackObject&) = delete;
+
+  inline void Init(JSObject* aCallback, JSObject* aCallbackGlobal,
+                   JSObject* aCreationStack,
+                   nsIGlobalObject* aIncumbentGlobal) {
+    InitNoHold(aCallback, aCallbackGlobal, aCreationStack, aIncumbentGlobal);
+    mozilla::HoldJSObjectsWithKey(this);
+  }
+};
+
+template <class WebIDLCallbackT, class XPCOMCallbackT>
+class CallbackObjectHolder;
+
+template <class T, class U>
+void ImplCycleCollectionUnlink(CallbackObjectHolder<T, U>& aField);
+
+class CallbackObjectHolderBase {
+ protected:
+  already_AddRefed<nsISupports> ToXPCOMCallback(CallbackObject* aCallback,
+                                                const nsIID& aIID) const;
+};
+
+template <class WebIDLCallbackT, class XPCOMCallbackT>
+class CallbackObjectHolder : CallbackObjectHolderBase {
+ public:
+  explicit CallbackObjectHolder(WebIDLCallbackT* aCallback)
+      : mPtrBits(reinterpret_cast<uintptr_t>(aCallback)) {
+    NS_IF_ADDREF(aCallback);
+  }
+
+  explicit CallbackObjectHolder(XPCOMCallbackT* aCallback)
+      : mPtrBits(reinterpret_cast<uintptr_t>(aCallback) | XPCOMCallbackFlag) {
+    NS_IF_ADDREF(aCallback);
+  }
+
+  CallbackObjectHolder(CallbackObjectHolder&& aOther)
+      : mPtrBits(aOther.mPtrBits) {
+    aOther.mPtrBits = 0;
+    static_assert(sizeof(CallbackObjectHolder) == sizeof(void*),
+                  "This object is expected to be as small as a pointer, and it "
+                  "is currently passed by value in various places. If it is "
+                  "bloating, we may want to pass it by reference then.");
+  }
+
+  CallbackObjectHolder(const CallbackObjectHolder& aOther) = delete;
+
+  CallbackObjectHolder() : mPtrBits(0) {}
+
+  ~CallbackObjectHolder() { UnlinkSelf(); }
+
+  void operator=(WebIDLCallbackT* aCallback) {
+    UnlinkSelf();
+    mPtrBits = reinterpret_cast<uintptr_t>(aCallback);
+    NS_IF_ADDREF(aCallback);
+  }
+
+  void operator=(XPCOMCallbackT* aCallback) {
+    UnlinkSelf();
+    mPtrBits = reinterpret_cast<uintptr_t>(aCallback) | XPCOMCallbackFlag;
+    NS_IF_ADDREF(aCallback);
+  }
+
+  void operator=(CallbackObjectHolder&& aOther) {
+    UnlinkSelf();
+    mPtrBits = aOther.mPtrBits;
+    aOther.mPtrBits = 0;
+  }
+
+  void operator=(const CallbackObjectHolder& aOther) = delete;
+
+  void Reset() { UnlinkSelf(); }
+
+  nsISupports* GetISupports() const {
+    return reinterpret_cast<nsISupports*>(mPtrBits & ~XPCOMCallbackFlag);
+  }
+
+  already_AddRefed<nsISupports> Forget() {
+    nsISupports* supp = GetISupports();
+    mPtrBits = 0;
+    return dont_AddRef(supp);
+  }
+
+  explicit operator bool() const { return GetISupports(); }
+
+  CallbackObjectHolder Clone() const {
+    CallbackObjectHolder result;
+    result.mPtrBits = mPtrBits;
+    NS_IF_ADDREF(GetISupports());
+    return result;
+  }
+
+  bool HasWebIDLCallback() const { return !(mPtrBits & XPCOMCallbackFlag); }
+
+  WebIDLCallbackT* GetWebIDLCallback() const {
+    MOZ_ASSERT(HasWebIDLCallback());
+    return reinterpret_cast<WebIDLCallbackT*>(mPtrBits);
+  }
+
+  XPCOMCallbackT* GetXPCOMCallback() const {
+    MOZ_ASSERT(!HasWebIDLCallback());
+    return reinterpret_cast<XPCOMCallbackT*>(mPtrBits & ~XPCOMCallbackFlag);
+  }
+
+  bool operator==(WebIDLCallbackT* aOtherCallback) const {
+    if (!aOtherCallback) {
+      return !GetISupports();
+    }
+
+    if (!HasWebIDLCallback() || !GetWebIDLCallback()) {
+      return false;
+    }
+
+    return *GetWebIDLCallback() == *aOtherCallback;
+  }
+
+  bool operator==(XPCOMCallbackT* aOtherCallback) const {
+    return (!aOtherCallback && !GetISupports()) ||
+           (!HasWebIDLCallback() && GetXPCOMCallback() == aOtherCallback);
+  }
+
+  bool operator==(const CallbackObjectHolder& aOtherCallback) const {
+    if (aOtherCallback.HasWebIDLCallback()) {
+      return *this == aOtherCallback.GetWebIDLCallback();
+    }
+
+    return *this == aOtherCallback.GetXPCOMCallback();
+  }
+
+  already_AddRefed<XPCOMCallbackT> ToXPCOMCallback() const {
+    if (!HasWebIDLCallback()) {
+      RefPtr<XPCOMCallbackT> callback = GetXPCOMCallback();
+      return callback.forget();
+    }
+
+    nsCOMPtr<nsISupports> supp = CallbackObjectHolderBase::ToXPCOMCallback(
+        GetWebIDLCallback(), NS_GET_IID(XPCOMCallbackT));
+    if (supp) {
+      return supp.forget().downcast<XPCOMCallbackT>();
+    }
+    return nullptr;
+  }
+
+  already_AddRefed<WebIDLCallbackT> ToWebIDLCallback() const {
+    if (HasWebIDLCallback()) {
+      RefPtr<WebIDLCallbackT> callback = GetWebIDLCallback();
+      return callback.forget();
+    }
+    return nullptr;
+  }
+
+ private:
+  static const uintptr_t XPCOMCallbackFlag = 1u;
+
+  friend void ImplCycleCollectionUnlink<WebIDLCallbackT, XPCOMCallbackT>(
+      CallbackObjectHolder& aField);
+
+  void UnlinkSelf() {
+    nsISupports* ptr = GetISupports();
+    mPtrBits = 0;
+    NS_IF_RELEASE(ptr);
+  }
+
+  uintptr_t mPtrBits;
+};
+
+template <class T, class U>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    CallbackObjectHolder<T, U>& aField, const char* aName,
+    uint32_t aFlags = 0) {
+  if (aField) {
+    CycleCollectionNoteChild(aCallback, aField.GetISupports(), aName, aFlags);
+  }
+}
+
+template <class T, class U>
+void ImplCycleCollectionUnlink(CallbackObjectHolder<T, U>& aField) {
+  aField.UnlinkSelf();
+}
+
+template <typename T>
+class MOZ_RAII MOZ_IS_SMARTPTR_TO_REFCOUNTED RootedCallback
+    : public JS::Rooted<T> {
+ public:
+  explicit RootedCallback(JSContext* cx) : JS::Rooted<T>(cx), mCx(cx) {}
+
+  template <typename S>
+  void operator=(S* arg) {
+    this->get().operator=(arg);
+  }
+
+  void operator=(decltype(nullptr) arg) { this->get().operator=(arg); }
+
+  JSObject* CallbackOrNull() const { return this->get()->CallbackOrNull(); }
+
+  JSObject* Callback(JSContext* aCx) const {
+    return this->get()->Callback(aCx);
+  }
+
+  ~RootedCallback() {
+    if (IsInitialized(this->get())) {
+      this->get()->FinishSlowJSInitIfMoreThanOneOwner(mCx);
+    }
+  }
+
+ private:
+  template <typename U>
+  static bool IsInitialized(U& aArg);  
+
+  template <typename U>
+  static bool IsInitialized(RefPtr<U>& aRefPtr) {
+    return aRefPtr;
+  }
+
+  template <typename U>
+  static bool IsInitialized(OwningNonNull<U>& aOwningNonNull) {
+    return aOwningNonNull.isInitialized();
+  }
+
+  JSContext* mCx;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_CallbackObject_h

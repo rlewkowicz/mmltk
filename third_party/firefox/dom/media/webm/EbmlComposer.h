@@ -1,0 +1,48 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef EbmlComposer_h_
+#define EbmlComposer_h_
+#include "ContainerWriter.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+class EbmlComposer {
+ public:
+  EbmlComposer() = default;
+  void SetVideoConfig(uint32_t aWidth, uint32_t aHeight, uint32_t aDisplayWidth,
+                      uint32_t aDisplayHeight);
+  void SetAudioConfig(uint32_t aSampleFreq, uint32_t aChannels);
+  void SetAudioCodecPrivateData(nsTArray<uint8_t>& aBufs) {
+    mCodecPrivateData.AppendElements(aBufs);
+  }
+  void GenerateHeader();
+  nsresult WriteSimpleBlock(EncodedFrame* aFrame);
+  void ExtractBuffer(nsTArray<nsTArray<uint8_t>>* aDestBufs,
+                     uint32_t aFlag = 0);
+
+ private:
+  bool mHasWrittenCluster = false;
+  uint64_t mCurrentClusterTimecode = 0;
+
+  nsTArray<nsTArray<uint8_t>> mBuffer;
+
+  bool mMetadataFinished = false;
+
+  int mWidth = 0;
+  int mHeight = 0;
+  int mDisplayWidth = 0;
+  int mDisplayHeight = 0;
+  bool mHasVideo = false;
+
+  float mSampleFreq = 0;
+  int mChannels = 0;
+  bool mHasAudio = false;
+  nsTArray<uint8_t> mCodecPrivateData;
+};
+
+}  
+
+#endif

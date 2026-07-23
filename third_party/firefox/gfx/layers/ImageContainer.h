@@ -1,0 +1,693 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(GFX_IMAGECONTAINER_H)
+#define GFX_IMAGECONTAINER_H
+
+#include <stdint.h>      // for int32_t, uint32_t, uint8_t, uint64_t
+#include "ImageTypes.h"  // for ImageFormat, etc
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"      // for MOZ_ASSERT_HELPER2
+#include "mozilla/DataMutex.h"       // for DataMutex
+#include "mozilla/Mutex.h"           // for Mutex
+#include "mozilla/RecursiveMutex.h"  // for RecursiveMutex, etc
+#include "mozilla/ThreadSafeWeakPtr.h"
+#include "mozilla/TimeStamp.h"  // for TimeStamp
+#include "mozilla/gfx/Point.h"  // For IntSize
+#include "mozilla/gfx/Rect.h"
+#include "mozilla/gfx/Types.h"           // For ColorDepth
+#include "mozilla/layers/LayersTypes.h"  // for LayersBackend, etc
+#include "mozilla/layers/CompositorTypes.h"
+#include "mozilla/mozalloc.h"  // for operator delete, etc
+#include "mozilla/TypedEnumBits.h"
+#include "nsDebug.h"          // for NS_ASSERTION
+#include "nsISupportsImpl.h"  // for Image::Release, etc
+#include "nsTArray.h"         // for nsTArray
+#include "nsThreadUtils.h"    // for NS_IsMainThread
+#include "nsProxyRelease.h"   // for NS_ReleaseOnMainThread
+#include "mozilla/Atomics.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/EnumeratedArray.h"
+#include "mozilla/UniquePtr.h"
+#include "nsTHashMap.h"
+#include "TimeUnits.h"
+#include "MediaData.h"
+
+
+typedef void* HANDLE;
+
+namespace mozilla {
+
+enum class VideoRotation;
+
+namespace layers {
+
+class GPUVideoImage;
+class ImageClient;
+class ImageCompositeNotification;
+class ImageContainer;
+class ImageContainerChild;
+class SharedPlanarYCbCrImage;
+class SurfaceDescriptor;
+class PlanarYCbCrImage;
+class TextureClient;
+class TextureClientRecycleAllocator;
+class KnowsCompositor;
+class NVImage;
+class MemoryOrShmem;
+class SurfaceDescriptorBuffer;
+enum class VideoBridgeSource : uint8_t;
+
+struct ImageBackendData {
+  virtual ~ImageBackendData() = default;
+
+ protected:
+  ImageBackendData() = default;
+};
+
+class GLImage;
+class SharedRGBImage;
+#if MOZ_WIDGET_GTK
+class DMABUFSurfaceImage;
+#endif
+
+class Image {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(Image)
+
+ public:
+  ImageFormat GetFormat() const { return mFormat; }
+  void* GetImplData() const { return mImplData; }
+
+  virtual gfx::IntSize GetSize() const = 0;
+  virtual gfx::IntPoint GetOrigin() const { return gfx::IntPoint(0, 0); }
+  virtual gfx::IntRect GetPictureRect() const {
+    return gfx::IntRect(GetOrigin().x, GetOrigin().y, GetSize().width,
+                        GetSize().height);
+  }
+  virtual gfx::ColorDepth GetColorDepth() const {
+    return gfx::ColorDepth::COLOR_8;
+  }
+
+  ImageBackendData* GetBackendData(LayersBackend aBackend) {
+    return mBackendData[aBackend].get();
+  }
+  void SetBackendData(LayersBackend aBackend, ImageBackendData* aData) {
+    mBackendData[aBackend] = mozilla::WrapUnique(aData);
+  }
+
+  int32_t GetSerial() const { return mSerial; }
+
+  bool IsDRM() const { return mIsDRM; }
+  virtual void SetIsDRM(bool aIsDRM) { mIsDRM = aIsDRM; }
+
+  virtual void OnPrepareForwardToHost() {}
+  virtual void OnAbandonForwardToHost() {}
+  virtual void OnSetCurrent() {}
+
+  virtual already_AddRefed<gfx::SourceSurface> GetAsSourceSurface() = 0;
+
+  enum class BuildSdbFlags : uint8_t {
+    Default = 0,
+    RgbOnly = 1 << 0,
+  };
+
+  virtual nsresult BuildSurfaceDescriptorBuffer(
+      SurfaceDescriptorBuffer& aSdBuffer, BuildSdbFlags aFlags,
+      const std::function<MemoryOrShmem(uint32_t)>& aAllocate);
+
+  nsresult BuildSurfaceDescriptorGPUVideoOrBuffer(
+      SurfaceDescriptor& aSd, BuildSdbFlags aFlags,
+      const Maybe<VideoBridgeSource>& aDest,
+      const std::function<MemoryOrShmem(uint32_t)>& aAllocate,
+      const std::function<void(MemoryOrShmem&&)>& aFree);
+
+  virtual bool IsValid() const { return true; }
+
+  virtual TextureClient* GetTextureClient(KnowsCompositor* aKnowsCompositor) {
+    return nullptr;
+  }
+
+  virtual GLImage* AsGLImage() { return nullptr; }
+  virtual GPUVideoImage* AsGPUVideoImage() { return nullptr; }
+  virtual PlanarYCbCrImage* AsPlanarYCbCrImage() { return nullptr; }
+#if defined(MOZ_WIDGET_GTK)
+  virtual DMABUFSurfaceImage* AsDMABUFSurfaceImage() { return nullptr; }
+#endif
+
+  virtual NVImage* AsNVImage() { return nullptr; }
+
+  virtual Maybe<SurfaceDescriptor> GetDesc();
+
+  static nsresult AllocateSurfaceDescriptorBufferRgb(
+      const gfx::IntSize& aSize, gfx::SurfaceFormat aFormat,
+      uint8_t*& aOutBuffer, SurfaceDescriptorBuffer& aSdBuffer,
+      int32_t& aStride,
+      const std::function<layers::MemoryOrShmem(uint32_t)>& aAllocate);
+
+ protected:
+  Maybe<SurfaceDescriptor> GetDescFromTexClient(
+      TextureClient* tcOverride = nullptr);
+
+  Image(void* aImplData, ImageFormat aFormat)
+      : mImplData(aImplData),
+        mSerial(++sSerialCounter),
+        mFormat(aFormat),
+        mIsDRM(false) {}
+
+  virtual ~Image() = default;
+
+  mozilla::EnumeratedArray<mozilla::layers::LayersBackend,
+                           UniquePtr<ImageBackendData>,
+                           size_t(mozilla::layers::LayersBackend::LAYERS_LAST)>
+      mBackendData;
+
+  void* mImplData;
+  int32_t mSerial;
+  ImageFormat mFormat;
+  bool mIsDRM;
+
+  static mozilla::Atomic<int32_t> sSerialCounter;
+};
+
+class CachedSurface final {
+ public:
+  CachedSurface() : mSurface("layers::CachedSurface") {}
+
+  ~CachedSurface() {
+    RefPtr<gfx::DataSourceSurface> surface;
+    {
+      auto guard = mSurface.Lock();
+      surface = guard->forget();
+    }
+    NS_ReleaseOnMainThread("layers::CachedSurface", surface.forget());
+  }
+
+  already_AddRefed<gfx::DataSourceSurface> Get() {
+    auto guard = mSurface.Lock();
+    RefPtr<gfx::DataSourceSurface> surface = *guard;
+    return surface.forget();
+  }
+
+  void Set(gfx::DataSourceSurface* aSurface) {
+    auto guard = mSurface.Lock();
+    if (!*guard) {
+      *guard = aSurface;
+    }
+  }
+
+ private:
+  mozilla::DataMutex<RefPtr<gfx::DataSourceSurface>> mSurface;
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(Image::BuildSdbFlags)
+
+class BufferRecycleBin final {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(BufferRecycleBin)
+
+
+ public:
+  BufferRecycleBin();
+
+  void RecycleBuffer(mozilla::UniquePtr<uint8_t[]> aBuffer, uint32_t aSize);
+  mozilla::UniquePtr<uint8_t[]> GetBuffer(uint32_t aSize);
+  void ClearRecycledBuffers();
+
+ private:
+  typedef mozilla::Mutex Mutex;
+
+  ~BufferRecycleBin() = default;
+
+  Mutex mLock;
+
+  nsTArray<mozilla::UniquePtr<uint8_t[]>> mRecycledBuffers
+      MOZ_GUARDED_BY(mLock);
+  uint32_t mRecycledBufferSize MOZ_GUARDED_BY(mLock);
+};
+
+
+class ImageFactory {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ImageFactory)
+ protected:
+  friend class ImageContainer;
+
+  ImageFactory() = default;
+  virtual ~ImageFactory() = default;
+
+  virtual RefPtr<PlanarYCbCrImage> CreatePlanarYCbCrImage(
+      const gfx::IntSize& aScaleHint, BufferRecycleBin* aRecycleBin);
+};
+
+class ImageContainerListener final {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ImageContainerListener)
+
+ public:
+  explicit ImageContainerListener(ImageContainer* aImageContainer);
+
+  void NotifyComposite(const ImageCompositeNotification& aNotification);
+  void NotifyDropped(uint32_t aDropped);
+  void ClearImageContainer();
+  void DropImageClient();
+
+ private:
+  typedef mozilla::Mutex Mutex;
+
+  ~ImageContainerListener();
+
+  Mutex mLock;
+  ImageContainer* mImageContainer MOZ_GUARDED_BY(mLock);
+};
+
+enum class ClearImagesType { All, CacheOnly };
+
+class ImageContainer final : public SupportsThreadSafeWeakPtr<ImageContainer> {
+  friend class ImageContainerChild;
+
+ public:
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(ImageContainer)
+
+  enum Mode { SYNCHRONOUS = 0x0, ASYNCHRONOUS = 0x01 };
+
+  static const uint64_t sInvalidAsyncContainerId = 0;
+
+  ImageContainer(ImageUsageType aUsageType, ImageContainer::Mode aFlag);
+
+  ~ImageContainer();
+
+  using FrameID = ContainerFrameID;
+  using ProducerID = ContainerProducerID;
+  using CaptureTime = ContainerCaptureTime;
+  using ReceiveTime = ContainerReceiveTime;
+  using RtpTimestamp = ContainerRtpTimestamp;
+
+  RefPtr<PlanarYCbCrImage> CreatePlanarYCbCrImage();
+
+  RefPtr<SharedRGBImage> CreateSharedRGBImage();
+
+  struct NonOwningImage {
+    explicit NonOwningImage(
+        Image* aImage = nullptr, TimeStamp aTimeStamp = TimeStamp(),
+        FrameID aFrameID = 0, ProducerID aProducerID = 0,
+        media::TimeUnit aProcessingDuration = media::TimeUnit::Invalid(),
+        media::TimeUnit aMediaTime = media::TimeUnit::Invalid(),
+        const CaptureTime& aWebrtcCaptureTime = AsVariant(Nothing()),
+        const ReceiveTime& aWebrtcReceiveTime = Nothing(),
+        const RtpTimestamp& aRtpTimestamp = Nothing())
+        : mImage(aImage),
+          mTimeStamp(aTimeStamp),
+          mFrameID(aFrameID),
+          mProducerID(aProducerID),
+          mProcessingDuration(aProcessingDuration),
+          mMediaTime(aMediaTime),
+          mWebrtcCaptureTime(aWebrtcCaptureTime),
+          mWebrtcReceiveTime(aWebrtcReceiveTime),
+          mRtpTimestamp(aRtpTimestamp) {}
+    Image* mImage;
+    TimeStamp mTimeStamp;
+    FrameID mFrameID;
+    ProducerID mProducerID;
+    media::TimeUnit mProcessingDuration = media::TimeUnit::Invalid();
+    media::TimeUnit mMediaTime = media::TimeUnit::Invalid();
+    CaptureTime mWebrtcCaptureTime = AsVariant(Nothing());
+    ReceiveTime mWebrtcReceiveTime;
+    RtpTimestamp mRtpTimestamp;
+  };
+  void SetCurrentImages(const nsTArray<NonOwningImage>& aImages);
+
+  void ClearImagesInHost(ClearImagesType aType) MOZ_EXCLUDES(mRecursiveMutex);
+
+  void ClearCachedResources();
+
+  void ClearImagesFromImageBridge();
+
+  void SetCurrentImageInTransaction(Image* aImage);
+  void SetCurrentImagesInTransaction(const nsTArray<NonOwningImage>& aImages);
+
+  bool IsAsync() const;
+
+  CompositableHandle GetAsyncContainerHandle();
+
+  bool HasCurrentImage();
+
+  struct OwningImage {
+    RefPtr<Image> mImage;
+    TimeStamp mTimeStamp;
+    media::TimeUnit mProcessingDuration = media::TimeUnit::Invalid();
+    media::TimeUnit mMediaTime = media::TimeUnit::Invalid();
+    CaptureTime mWebrtcCaptureTime = AsVariant(Nothing());
+    ReceiveTime mWebrtcReceiveTime;
+    RtpTimestamp mRtpTimestamp;
+    FrameID mFrameID = 0;
+    ProducerID mProducerID = 0;
+    bool mComposited = false;
+  };
+  void GetCurrentImages(nsTArray<OwningImage>* aImages,
+                        uint32_t* aGenerationCounter = nullptr);
+
+  gfx::IntSize GetCurrentSize();
+
+  void SetScaleHint(const gfx::IntSize& aScaleHint) {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    mScaleHint = aScaleHint;
+  }
+
+  const gfx::IntSize GetScaleHint() const {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return mScaleHint;
+  }
+
+  void SetTransformHint(const gfx::Matrix& aTransformHint) {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    mTransformHint = aTransformHint;
+  }
+
+  const gfx::Matrix GetTransformHint() const {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return mTransformHint;
+  }
+
+  void SetRotation(VideoRotation aRotation) {
+    MOZ_ASSERT(NS_IsMainThread());
+    mRotation = aRotation;
+  }
+
+  VideoRotation GetRotation() const {
+    MOZ_ASSERT(NS_IsMainThread());
+    return mRotation;
+  }
+
+  void SetImageFactory(ImageFactory* aFactory) {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    mImageFactory = aFactory ? aFactory : new ImageFactory();
+  }
+
+  already_AddRefed<ImageFactory> GetImageFactory() const {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return do_AddRef(mImageFactory);
+  }
+
+  void EnsureRecycleAllocatorForRDD(KnowsCompositor* aKnowsCompositor);
+
+
+
+  TimeDuration GetPaintDelay() {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return mPaintDelay;
+  }
+
+  uint32_t GetPaintCount() {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return mPaintCount;
+  }
+
+  uint32_t GetDroppedImageCount() { return mDroppedImageCount; }
+
+  void NotifyComposite(const ImageCompositeNotification& aNotification);
+  void NotifyDropped(uint32_t aDropped);
+
+  already_AddRefed<ImageContainerListener> GetImageContainerListener() const;
+
+  already_AddRefed<ImageClient> GetImageClient();
+
+  static ProducerID AllocateProducerID();
+
+  void DropImageClient();
+
+  const ImageUsageType mUsageType;
+  const bool mIsAsync;
+
+ private:
+  typedef mozilla::RecursiveMutex RecursiveMutex;
+
+  void SetCurrentImageInternal(const nsTArray<NonOwningImage>& aImages);
+
+  void EnsureActiveImage();
+
+  void EnsureImageClient() MOZ_REQUIRES(mRecursiveMutex);
+
+  bool HasImageClient() const {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return !!mImageClient;
+  }
+
+  mutable RecursiveMutex mRecursiveMutex;
+
+  RefPtr<TextureClientRecycleAllocator> mRecycleAllocator
+      MOZ_GUARDED_BY(mRecursiveMutex);
+
+
+  nsTArray<OwningImage> mCurrentImages MOZ_GUARDED_BY(mRecursiveMutex);
+
+  uint32_t mGenerationCounter MOZ_GUARDED_BY(mRecursiveMutex);
+
+  uint32_t mPaintCount MOZ_GUARDED_BY(mRecursiveMutex);
+
+  TimeDuration mPaintDelay MOZ_GUARDED_BY(mRecursiveMutex);
+
+  mozilla::Atomic<uint32_t> mDroppedImageCount;
+
+  RefPtr<ImageFactory> mImageFactory MOZ_GUARDED_BY(mRecursiveMutex);
+
+  gfx::IntSize mScaleHint MOZ_GUARDED_BY(mRecursiveMutex);
+
+  gfx::Matrix mTransformHint MOZ_GUARDED_BY(mRecursiveMutex);
+
+  VideoRotation mRotation;
+
+  RefPtr<BufferRecycleBin> mRecycleBin MOZ_GUARDED_BY(mRecursiveMutex);
+
+  RefPtr<ImageClient> mImageClient MOZ_GUARDED_BY(mRecursiveMutex);
+
+  CompositableHandle mAsyncContainerHandle MOZ_GUARDED_BY(mRecursiveMutex);
+
+  ProducerID mCurrentProducerID MOZ_GUARDED_BY(mRecursiveMutex);
+
+  RefPtr<ImageContainerListener> mNotifyCompositeListener;
+
+  static mozilla::Atomic<uint32_t> sGenerationCounter;
+};
+
+class AutoLockImage {
+ public:
+  explicit AutoLockImage(ImageContainer* aContainer) {
+    aContainer->GetCurrentImages(&mImages);
+  }
+
+  bool HasImage() const { return !mImages.IsEmpty(); }
+  Image* GetImage() const {
+    return mImages.IsEmpty() ? nullptr : mImages[0].mImage.get();
+  }
+
+  const ImageContainer::OwningImage* GetOwningImage(
+      TimeStamp aTimeStamp) const {
+    if (mImages.IsEmpty()) {
+      return nullptr;
+    }
+
+    MOZ_ASSERT(!aTimeStamp.IsNull());
+    uint32_t chosenIndex = 0;
+
+    while (chosenIndex + 1 < mImages.Length() &&
+           mImages[chosenIndex + 1].mTimeStamp <= aTimeStamp) {
+      ++chosenIndex;
+    }
+
+    return &mImages[chosenIndex];
+  }
+
+  Image* GetImage(TimeStamp aTimeStamp) const {
+    if (const auto* owningImage = GetOwningImage(aTimeStamp)) {
+      return owningImage->mImage.get();
+    }
+    return nullptr;
+  }
+
+ private:
+  AutoTArray<ImageContainer::OwningImage, 4> mImages;
+};
+
+struct PlanarAlphaData {
+  uint8_t* mChannel = nullptr;
+  gfx::IntSize mSize = gfx::IntSize(0, 0);
+  gfx::ColorDepth mDepth = gfx::ColorDepth::COLOR_8;
+  bool mPremultiplied = false;
+};
+struct PlanarYCbCrData {
+  uint8_t* mYChannel = nullptr;
+  int32_t mYStride = 0;
+  int32_t mYSkip = 0;
+  uint8_t* mCbChannel = nullptr;
+  uint8_t* mCrChannel = nullptr;
+  int32_t mCbCrStride = 0;
+  int32_t mCbSkip = 0;
+  int32_t mCrSkip = 0;
+  Maybe<PlanarAlphaData> mAlpha = Nothing();
+  gfx::IntRect mPictureRect = gfx::IntRect(0, 0, 0, 0);
+  StereoMode mStereoMode = StereoMode::MONO;
+  gfx::ColorDepth mColorDepth = gfx::ColorDepth::COLOR_8;
+  gfx::YUVColorSpace mYUVColorSpace = gfx::YUVColorSpace::Default;
+  gfx::ColorSpace2 mColorPrimaries = gfx::ColorSpace2::UNKNOWN;
+  gfx::TransferFunction mTransferFunction = gfx::TransferFunction::BT709;
+  Maybe<gfx::HDRMetadata> mHDRMetadata;
+  gfx::ColorRange mColorRange = gfx::ColorRange::LIMITED;
+  gfx::ChromaSubsampling mChromaSubsampling = gfx::ChromaSubsampling::FULL;
+
+  gfx::IntSize YPictureSize() const { return mPictureRect.Size(); }
+
+  gfx::IntSize CbCrPictureSize() const {
+    return mCbCrStride > 0 ? gfx::ChromaSize(YPictureSize(), mChromaSubsampling)
+                           : gfx::IntSize(0, 0);
+  }
+
+  gfx::IntSize YDataSize() const {
+    return gfx::IntSize(mPictureRect.XMost(), mPictureRect.YMost());
+  }
+
+  gfx::IntSize CbCrDataSize() const {
+    return mCbCrStride > 0 ? gfx::ChromaSize(YDataSize(), mChromaSubsampling)
+                           : gfx::IntSize(0, 0);
+  }
+
+  static Maybe<PlanarYCbCrData> From(const SurfaceDescriptorBuffer&);
+  static Maybe<PlanarYCbCrData> From(const VideoData::YCbCrBuffer&);
+};
+
+
+class PlanarYCbCrImage : public Image {
+ public:
+  typedef PlanarYCbCrData Data;
+
+  enum { MAX_DIMENSION = 16384 };
+
+  virtual ~PlanarYCbCrImage();
+
+  virtual nsresult CopyData(const Data& aData) = 0;
+
+  virtual nsresult AdoptData(const Data& aData);
+
+  virtual nsresult CreateEmptyBuffer(const Data& aData,
+                                     const gfx::IntSize& aYSize,
+                                     const gfx::IntSize& aCbCrSize) {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  virtual const Data* GetData() const { return &mData; }
+
+  uint32_t GetDataSize() const { return mBufferSize; }
+
+  bool IsValid() const override { return !!mBufferSize; }
+
+  gfx::IntSize GetSize() const override { return mSize; }
+
+  gfx::IntPoint GetOrigin() const override { return mOrigin; }
+
+  PlanarYCbCrImage();
+
+  virtual size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  virtual size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const = 0;
+
+  PlanarYCbCrImage* AsPlanarYCbCrImage() override { return this; }
+
+  nsresult BuildSurfaceDescriptorBuffer(
+      SurfaceDescriptorBuffer& aSdBuffer, BuildSdbFlags aFlags,
+      const std::function<MemoryOrShmem(uint32_t)>& aAllocate) override;
+
+  void SetColorDepth(gfx::ColorDepth aColorDepth) { mColorDepth = aColorDepth; }
+
+  gfx::ColorDepth GetColorDepth() const override { return mColorDepth; }
+
+ protected:
+  already_AddRefed<gfx::SourceSurface> GetAsSourceSurface() override;
+
+  void SetOffscreenFormat(gfxImageFormat aFormat) {
+    mOffscreenFormat = aFormat;
+  }
+  gfxImageFormat GetOffscreenFormat() const;
+
+  Data mData;
+  gfx::IntPoint mOrigin;
+  gfx::IntSize mSize;
+  gfx::ColorDepth mColorDepth = gfx::ColorDepth::COLOR_8;
+  gfxImageFormat mOffscreenFormat;
+  CachedSurface mSourceSurface;
+  uint32_t mBufferSize;
+};
+
+class RecyclingPlanarYCbCrImage : public PlanarYCbCrImage {
+ public:
+  explicit RecyclingPlanarYCbCrImage(BufferRecycleBin* aRecycleBin)
+      : mRecycleBin(aRecycleBin) {}
+  virtual ~RecyclingPlanarYCbCrImage();
+  nsresult CopyData(const Data& aData) override;
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const override;
+
+ protected:
+  mozilla::UniquePtr<uint8_t[]> AllocateBuffer(uint32_t aSize);
+
+  RefPtr<BufferRecycleBin> mRecycleBin;
+  mozilla::UniquePtr<uint8_t[]> mBuffer;
+};
+
+class NVImage final : public Image {
+  typedef PlanarYCbCrData Data;
+
+ public:
+  NVImage();
+  virtual ~NVImage();
+
+  gfx::IntSize GetSize() const override;
+  gfx::IntRect GetPictureRect() const override;
+  already_AddRefed<gfx::SourceSurface> GetAsSourceSurface() override;
+  nsresult BuildSurfaceDescriptorBuffer(
+      SurfaceDescriptorBuffer& aSdBuffer, BuildSdbFlags aFlags,
+      const std::function<MemoryOrShmem(uint32_t)>& aAllocate) override;
+  bool IsValid() const override;
+  NVImage* AsNVImage() override;
+
+  nsresult SetData(const Data& aData);
+  const Data* GetData() const;
+  uint32_t GetBufferSize() const;
+
+ protected:
+  mozilla::UniquePtr<uint8_t[]> AllocateBuffer(uint32_t aSize);
+
+  mozilla::UniquePtr<uint8_t[]> mBuffer;
+  uint32_t mBufferSize;
+  gfx::IntSize mSize;
+  Data mData;
+  CachedSurface mSourceSurface;
+};
+
+class SourceSurfaceImage final : public Image {
+ public:
+  already_AddRefed<gfx::SourceSurface> GetAsSourceSurface() override {
+    RefPtr<gfx::SourceSurface> surface(mSourceSurface);
+    return surface.forget();
+  }
+
+  void SetTextureFlags(TextureFlags aTextureFlags) {
+    mTextureFlags = aTextureFlags;
+  }
+  TextureClient* GetTextureClient(KnowsCompositor* aKnowsCompositor) override;
+
+  gfx::IntSize GetSize() const override { return mSize; }
+
+  SourceSurfaceImage(const gfx::IntSize& aSize,
+                     gfx::SourceSurface* aSourceSurface);
+  explicit SourceSurfaceImage(gfx::SourceSurface* aSourceSurface);
+  virtual ~SourceSurfaceImage();
+
+ private:
+  gfx::IntSize mSize;
+  RefPtr<gfx::SourceSurface> mSourceSurface;
+  nsTHashMap<uint32_t, RefPtr<TextureClient>> mTextureClients;
+  TextureFlags mTextureFlags;
+};
+
+}  
+}  
+
+#endif

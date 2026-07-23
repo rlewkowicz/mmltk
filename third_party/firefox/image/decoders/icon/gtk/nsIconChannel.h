@@ -1,0 +1,42 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_decoders_icon_gtk_nsIconChannel_h
+#define mozilla_image_decoders_icon_gtk_nsIconChannel_h
+
+#include "nsCOMPtr.h"
+#include "nsIChannel.h"
+#include "nsIURI.h"
+
+namespace mozilla {
+namespace ipc {
+class ByteBuf;
+}
+namespace gfx {
+class DataSourceSurface;
+}
+}  
+
+class nsIconChannel final : public nsIChannel {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_FORWARD_NSIREQUEST(mRealChannel->)
+  NS_FORWARD_NSICHANNEL(mRealChannel->)
+
+  nsIconChannel() = default;
+
+  static void Shutdown();
+
+  nsresult Init(nsIURI* aURI, nsILoadInfo* aLoadInfo);
+
+  static nsresult GetIcon(nsIURI* aURI, mozilla::ipc::ByteBuf* aDataOut);
+  static already_AddRefed<mozilla::gfx::DataSourceSurface> GetSymbolicIcon(
+      const nsCString& aName, int aIconSize, int aScale, nscolor aFgColor);
+
+ private:
+  ~nsIconChannel() = default;
+  nsCOMPtr<nsIChannel> mRealChannel;
+};
+
+#endif  // mozilla_image_decoders_icon_gtk_nsIconChannel_h

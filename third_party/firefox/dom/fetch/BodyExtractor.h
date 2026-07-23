@@ -1,0 +1,37 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_BodyExtractor_h
+#define mozilla_dom_BodyExtractor_h
+
+#include "nsString.h"
+
+class nsIInputStream;
+class nsIGlobalObject;
+
+namespace mozilla::dom {
+
+class BodyExtractorBase {
+ public:
+  virtual nsresult GetAsStream(nsIInputStream** aResult,
+                               uint64_t* aContentLength,
+                               nsACString& aContentTypeWithCharset,
+                               nsACString& aCharset) const = 0;
+};
+
+template <typename Type>
+class BodyExtractor final : public BodyExtractorBase {
+  Type* mBody;
+
+ public:
+  explicit BodyExtractor(Type* aBody) : mBody(aBody) {}
+
+  nsresult GetAsStream(nsIInputStream** aResult, uint64_t* aContentLength,
+                       nsACString& aContentTypeWithCharset,
+                       nsACString& aCharset) const override;
+};
+
+}  
+
+#endif  // mozilla_dom_BodyExtractor_h

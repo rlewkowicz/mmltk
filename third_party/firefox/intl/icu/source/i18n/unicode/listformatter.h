@@ -1,0 +1,149 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+*
+*   Copyright (C) 2012-2016, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+*******************************************************************************
+*   file name:  listformatter.h
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+*   created on: 20120426
+*   created by: Umesh P. Nair
+*/
+
+#ifndef __LISTFORMATTER_H__
+#define __LISTFORMATTER_H__
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/unistr.h"
+#include "unicode/locid.h"
+#include "unicode/formattedvalue.h"
+#include "unicode/ulistformatter.h"
+
+U_NAMESPACE_BEGIN
+
+class FieldPositionHandler;
+class FormattedListData;
+class ListFormatter;
+
+class Hashtable;
+
+struct ListFormatInternal;
+
+struct ListFormatData : public UMemory {
+    UnicodeString twoPattern;
+    UnicodeString startPattern;
+    UnicodeString middlePattern;
+    UnicodeString endPattern;
+    Locale locale;
+
+  ListFormatData(const UnicodeString& two, const UnicodeString& start, const UnicodeString& middle, const UnicodeString& end,
+                 const Locale& loc) :
+      twoPattern(two), startPattern(start), middlePattern(middle), endPattern(end), locale(loc) {}
+};
+
+
+
+
+class U_I18N_API FormattedList : public UMemory, public FormattedValue {
+  public:
+    FormattedList() : fData(nullptr), fErrorCode(U_INVALID_STATE_ERROR) {}
+
+    FormattedList(FormattedList&& src) noexcept;
+
+    virtual ~FormattedList() override;
+
+    FormattedList(const FormattedList&) = delete;
+
+    FormattedList& operator=(const FormattedList&) = delete;
+
+    FormattedList& operator=(FormattedList&& src) noexcept;
+
+    UnicodeString toString(UErrorCode& status) const override;
+
+    UnicodeString toTempString(UErrorCode& status) const override;
+
+    Appendable &appendTo(Appendable& appendable, UErrorCode& status) const override;
+
+    UBool nextPosition(ConstrainedFieldPosition& cfpos, UErrorCode& status) const override;
+
+  private:
+    FormattedListData *fData;
+    UErrorCode fErrorCode;
+    explicit FormattedList(FormattedListData *results)
+        : fData(results), fErrorCode(U_ZERO_ERROR) {}
+    explicit FormattedList(UErrorCode errorCode)
+        : fData(nullptr), fErrorCode(errorCode) {}
+    friend class ListFormatter;
+};
+
+
+class U_I18N_API ListFormatter : public UObject{
+
+  public:
+
+    ListFormatter(const ListFormatter&);
+
+    ListFormatter& operator=(const ListFormatter& other);
+
+    static ListFormatter* createInstance(UErrorCode& errorCode);
+
+    static ListFormatter* createInstance(const Locale& locale, UErrorCode& errorCode);
+
+    static ListFormatter* createInstance(
+      const Locale& locale, UListFormatterType type, UListFormatterWidth width, UErrorCode& errorCode);
+
+    virtual ~ListFormatter();
+
+
+    UnicodeString& format(const UnicodeString items[], int32_t n_items,
+        UnicodeString& appendTo, UErrorCode& errorCode) const;
+
+    FormattedList formatStringsToValue(
+        const UnicodeString items[],
+        int32_t n_items,
+        UErrorCode& errorCode) const;
+
+#ifndef U_HIDE_INTERNAL_API
+    UnicodeString& format(
+            const UnicodeString items[],
+            int32_t n_items,
+            UnicodeString& appendTo,
+            int32_t index,
+            int32_t &offset,
+            UErrorCode& errorCode) const;
+    ListFormatter(const ListFormatData &data, UErrorCode &errorCode);
+    ListFormatter(const ListFormatInternal* listFormatterInternal);
+#endif  /* U_HIDE_INTERNAL_API */
+
+  private:
+  
+    static ListFormatter* createInstance(const Locale& locale, const char* style, UErrorCode& errorCode);
+
+    static void initializeHash(UErrorCode& errorCode);
+    static const ListFormatInternal* getListFormatInternal(const Locale& locale, const char *style, UErrorCode& errorCode);
+    struct U_HIDDEN ListPatternsSink;
+    static ListFormatInternal* loadListFormatInternal(const Locale& locale, const char* style, UErrorCode& errorCode);
+
+    ListFormatter() = delete;
+
+    ListFormatInternal* owned;
+    const ListFormatInternal* data;
+};
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // __LISTFORMATTER_H__

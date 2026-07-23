@@ -1,0 +1,72 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkImageFilterCache_DEFINED)
+#define SkImageFilterCache_DEFINED
+
+#include "include/core/SkMatrix.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkDebug.h"
+
+#include <cstddef>
+#include <cstdint>
+
+class SkImageFilter;
+namespace skif { class FilterResult; }
+
+struct SkImageFilterCacheKey {
+    SkImageFilterCacheKey(const uint32_t uniqueID, const SkMatrix& matrix,
+        const SkIRect& clipBounds, uint32_t srcGenID, const SkIRect& srcSubset)
+        : fUniqueID(uniqueID)
+        , fMatrix(matrix)
+        , fClipBounds(clipBounds)
+        , fSrcGenID(srcGenID)
+        , fSrcSubset(srcSubset) {
+        static_assert(sizeof(SkImageFilterCacheKey) == sizeof(uint32_t) + sizeof(SkMatrix) +
+                                     sizeof(SkIRect) + sizeof(uint32_t) + 4 * sizeof(int32_t),
+                                     "image_filter_key_tight_packing");
+        fMatrix.getType();  
+        SkASSERT(fMatrix.isFinite());   
+    }
+
+    uint32_t fUniqueID;
+    SkMatrix fMatrix;
+    SkIRect fClipBounds;
+    uint32_t fSrcGenID;
+    SkIRect fSrcSubset;
+
+    bool operator==(const SkImageFilterCacheKey& other) const {
+        return fUniqueID == other.fUniqueID &&
+               fMatrix == other.fMatrix &&
+               fClipBounds == other.fClipBounds &&
+               fSrcGenID == other.fSrcGenID &&
+               fSrcSubset == other.fSrcSubset;
+    }
+};
+
+class SkImageFilterCache : public SkRefCnt {
+public:
+    static constexpr size_t kDefaultTransientSize = 32 * 1024 * 1024;
+
+    ~SkImageFilterCache() override {}
+    static sk_sp<SkImageFilterCache> Create(size_t maxBytes);
+
+    enum class CreateIfNecessary : bool { kNo, kYes };
+    static sk_sp<SkImageFilterCache> Get(CreateIfNecessary = CreateIfNecessary::kYes);
+
+    virtual bool get(const SkImageFilterCacheKey& key,
+                     skif::FilterResult* result) const = 0;
+    virtual void set(const SkImageFilterCacheKey& key, const SkImageFilter* filter,
+                     const skif::FilterResult& result) = 0;
+    virtual void purge() = 0;
+    virtual void purgeByImageFilter(const SkImageFilter*) = 0;
+    SkDEBUGCODE(virtual int count() const = 0;)
+};
+
+#endif

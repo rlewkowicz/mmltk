@@ -1,0 +1,127 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_places_History_h_
+#define mozilla_places_History_h_
+
+#include "Database.h"
+#include "mozIAsyncHistory.h"
+#include "mozIStorageConnection.h"
+#include "mozilla/BaseHistory.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/dom/Link.h"
+#include "mozilla/dom/PContentChild.h"
+#include "nsTHashMap.h"
+#include "nsIMemoryReporter.h"
+#include "nsIObserver.h"
+#include "nsString.h"
+#include "nsTHashtable.h"
+#include "nsTObserverArray.h"
+#include "nsURIHashKey.h"
+
+namespace mozilla::places {
+
+struct VisitData;
+class VisitedQuery;
+
+#define RECENTLY_VISITED_URIS_SIZE 64
+#define RECENTLY_VISITED_URIS_MAX_AGE (6 * 60 * PR_USEC_PER_SEC)
+#define NOTIFY_VISITS_CHUNK_SIZE 100
+
+class History final : public BaseHistory,
+                      public mozIAsyncHistory,
+                      public nsIObserver,
+                      public nsIMemoryReporter {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZIASYNCHISTORY
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSIMEMORYREPORTER
+
+  NS_IMETHOD VisitURI(nsIWidget*, nsIURI*, nsIURI* aLastVisitedURI,
+                      uint32_t aFlags, uint64_t aBrowserId) final;
+  NS_IMETHOD SetURITitle(nsIURI*, const nsAString&) final;
+
+  void StartPendingVisitedQueries(PendingVisitedQueries&&) final;
+
+  History();
+
+  nsresult QueueVisitedStatement(RefPtr<VisitedQuery>&&);
+
+  nsresult InsertPlace(VisitData& aPlace);
+
+  nsresult UpdatePlace(const VisitData& aPlace);
+
+  nsresult FetchPageInfo(VisitData& _place, bool* _exists);
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf);
+
+  static History* GetService();
+
+  static already_AddRefed<History> GetSingleton();
+
+  template <int N>
+  already_AddRefed<mozIStorageStatement> GetStatement(const char (&aQuery)[N]) {
+    const mozIStorageConnection* dbConn = GetConstDBConn();
+    NS_ENSURE_TRUE(dbConn, nullptr);
+    return mDB->GetStatement(aQuery);
+  }
+
+  already_AddRefed<mozIStorageStatement> GetStatement(
+      const nsACString& aQuery) {
+    const mozIStorageConnection* dbConn = GetConstDBConn();
+    NS_ENSURE_TRUE(dbConn, nullptr);
+    return mDB->GetStatement(aQuery);
+  }
+
+  bool IsShuttingDown() {
+    MutexAutoLock lockedScope(mShuttingDownMutex);
+    return mShuttingDown;
+  }
+
+  void AppendToRecentlyVisitedURIs(nsIURI* aURI, bool aHidden);
+
+ private:
+  virtual ~History();
+
+  void InitMemoryReporter();
+
+  mozIStorageConnection* GetDBConn();
+
+  const mozIStorageConnection* GetConstDBConn();
+
+  RefPtr<mozilla::places::Database> mDB;
+
+  void Shutdown();
+
+  static History* gService;
+
+  bool mShuttingDown;
+  Mutex mShuttingDownMutex MOZ_UNANNOTATED;
+  Mutex mBlockShutdownMutex MOZ_UNANNOTATED;
+
+  friend class InsertVisitedURIs;
+
+  struct RecentURIVisit {
+    PRTime mTime;
+    bool mHidden;
+  };
+
+  nsTHashMap<nsURIHashKey, RecentURIVisit> mRecentlyVisitedURIs;
+
+  struct OriginFloodingRestriction {
+    TimeStamp mLastVisitTimeStamp;
+    uint32_t mExpireIntervalSeconds;
+    uint32_t mAllowedVisitCount;
+  };
+  nsTHashMap<nsCStringHashKey, OriginFloodingRestriction>
+      mOriginFloodingRestrictions;
+  void UpdateOriginFloodingRestriction(nsACString& aOrigin);
+  bool IsRestrictedOrigin(nsACString& aOrigin);
+};
+
+}  
+
+#endif  // mozilla_places_History_h_

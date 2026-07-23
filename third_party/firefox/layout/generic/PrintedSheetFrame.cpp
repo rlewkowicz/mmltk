@@ -1,0 +1,256 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/PrintedSheetFrame.h"
+
+#include "mozilla/PresShell.h"
+#include "mozilla/ReflowInput.h"
+#include "nsCSSFrameConstructor.h"
+#include "nsPageContentFrame.h"
+#include "nsPageFrame.h"
+#include "nsPageSequenceFrame.h"
+
+using namespace mozilla;
+
+PrintedSheetFrame* NS_NewPrintedSheetFrame(PresShell* aPresShell,
+                                           ComputedStyle* aStyle) {
+  return new (aPresShell)
+      PrintedSheetFrame(aStyle, aPresShell->GetPresContext());
+}
+
+namespace mozilla {
+
+NS_QUERYFRAME_HEAD(PrintedSheetFrame)
+  NS_QUERYFRAME_ENTRY(PrintedSheetFrame)
+NS_QUERYFRAME_TAIL_INHERITING(nsContainerFrame)
+
+NS_IMPL_FRAMEARENA_HELPERS(PrintedSheetFrame)
+
+void PrintedSheetFrame::BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                                         const nsDisplayListSet& aLists) {
+  if (PresContext()->IsScreen()) {
+    DisplayBorderBackgroundOutline(aBuilder, aLists);
+  }
+
+  for (auto* frame : mFrames) {
+    if (!frame->HasAnyStateBits(NS_PAGE_SKIPPED_BY_CUSTOM_RANGE)) {
+      BuildDisplayListForChild(aBuilder, frame, aLists);
+    }
+  }
+}
+
+static bool TagIfSkippedByCustomRange(nsPageFrame* aPageFrame, int32_t aPageNum,
+                                      nsSharedPageData* aPD) {
+  MOZ_RELEASE_ASSERT(aPD->mPageRanges.Length() % 2 == 0);
+  bool skipped = !aPD->mPageRanges.IsEmpty();
+  for (size_t i = 0; skipped && i < aPD->mPageRanges.Length(); i += 2) {
+    skipped = aPageNum < aPD->mPageRanges[i] ||
+              aPageNum > aPD->mPageRanges[i + 1];
+  }
+  if (!skipped) {
+    MOZ_ASSERT(!aPageFrame->HasAnyStateBits(NS_PAGE_SKIPPED_BY_CUSTOM_RANGE),
+               "page frames NS_PAGE_SKIPPED_BY_CUSTOM_RANGE state should "
+               "only be set if we actually want to skip the page");
+    return false;
+  }
+
+  aPageFrame->AddStateBits(NS_PAGE_SKIPPED_BY_CUSTOM_RANGE);
+  return true;
+}
+
+void PrintedSheetFrame::ClaimPageFrameFromPrevInFlow() {
+  MoveOverflowToChildList();
+  if (!GetPrevContinuation()) {
+    auto* firstChild = PrincipalChildList().FirstChild();
+    MOZ_ASSERT(firstChild && firstChild->IsPageFrame(),
+               "PrintedSheetFrame only has nsPageFrame children");
+    auto* pageFrame = static_cast<nsPageFrame*>(firstChild);
+    pageFrame->PageContentFrame()->EnsurePageName();
+  }
+}
+
+void PrintedSheetFrame::Reflow(nsPresContext* aPresContext,
+                               ReflowOutput& aReflowOutput,
+                               const ReflowInput& aReflowInput,
+                               nsReflowStatus& aStatus) {
+  MarkInReflow();
+  DO_GLOBAL_REFLOW_COUNT("PrintedSheetFrame");
+  MOZ_ASSERT(aStatus.IsEmpty(), "Caller should pass a fresh reflow status!");
+
+  MoveOverflowToChildList();
+
+  const WritingMode wm = aReflowInput.GetWritingMode();
+
+  mSizeForChildren =
+      nsSize(aReflowInput.AvailableISize(), aReflowInput.AvailableBSize());
+  if (mPD->PagesPerSheetInfo()->mNumPages == 1) {
+    auto* firstChild = PrincipalChildList().FirstChild();
+    MOZ_ASSERT(firstChild && firstChild->IsPageFrame(),
+               "PrintedSheetFrame only has nsPageFrame children");
+    if (static_cast<nsPageFrame*>(firstChild)
+            ->GetPageOrientationRotation(mPD) != 0.0) {
+      std::swap(mSizeForChildren.width, mSizeForChildren.height);
+    }
+  }
+
+  uint32_t numPagesOnThisSheet = 0;
+
+  const uint32_t desiredPagesPerSheet = mPD->PagesPerSheetInfo()->mNumPages;
+
+  if (desiredPagesPerSheet > 1) {
+    ComputePagesPerSheetGridMetrics(mSizeForChildren);
+  }
+
+  for (auto* childFrame = mFrames.FirstChild(); childFrame;
+       childFrame = childFrame->GetNextSibling()) {
+    MOZ_ASSERT(childFrame->IsPageFrame(),
+               "we're only expecting page frames as children");
+    auto* pageFrame = static_cast<nsPageFrame*>(childFrame);
+
+    pageFrame->SetSharedPageData(mPD);
+    pageFrame->DeterminePageNum();
+
+    if (!TagIfSkippedByCustomRange(pageFrame, pageFrame->GetPageNum(), mPD)) {
+      pageFrame->SetIndexOnSheet(numPagesOnThisSheet);
+      numPagesOnThisSheet++;
+    }
+
+    const nsSize physPageSize = pageFrame->ComputePageSize();
+    LogicalSize availSize(wm, physPageSize);
+    if (aReflowInput.mFlags.mIsInFragmentainerMeasuringReflow) {
+      availSize.BSize(wm) = aReflowInput.AvailableBSize();
+    }
+
+    ReflowInput pageReflowInput(aPresContext, aReflowInput, pageFrame,
+                                availSize);
+
+    LogicalPoint pagePos(wm);
+
+    ReflowOutput pageReflowOutput(pageReflowInput);
+    nsReflowStatus status;
+
+    ReflowChild(pageFrame, aPresContext, pageReflowOutput, pageReflowInput, wm,
+                pagePos, physPageSize, ReflowChildFlags::Default, status);
+
+    FinishReflowChild(pageFrame, aPresContext, pageReflowOutput,
+                      &pageReflowInput, wm, pagePos, physPageSize,
+                      ReflowChildFlags::Default);
+
+    NS_ASSERTION(!pageFrame->GetNextInFlow(), "bad child flow list");
+
+    if (status.IsFullyComplete()) {
+      mPD->mRawNumPages = pageFrame->GetPageNum();
+    } else {
+      nsIFrame* continuingPage =
+          PresShell()->FrameConstructor()->CreateContinuingFrame(pageFrame,
+                                                                 this);
+      mFrames.InsertFrame(nullptr, pageFrame, continuingPage);
+      const bool isContinuingPageSkipped =
+          TagIfSkippedByCustomRange(static_cast<nsPageFrame*>(continuingPage),
+                                    pageFrame->GetPageNum() + 1, mPD);
+
+      if (numPagesOnThisSheet >= desiredPagesPerSheet &&
+          !isContinuingPageSkipped) {
+        PushChildrenToOverflow(continuingPage, pageFrame);
+        aStatus.SetIncomplete();
+      }
+    }
+  }
+
+
+  if (!GetPrevContinuation()) {
+    NS_WARNING_ASSERTION(numPagesOnThisSheet > 0,
+                         "Shouldn't create a sheet with no displayable pages "
+                         "on it");
+  } else {
+    MOZ_ASSERT(numPagesOnThisSheet > 0,
+               "Shouldn't create a sheet with no displayable pages on it");
+  }
+
+  MOZ_ASSERT(numPagesOnThisSheet <= desiredPagesPerSheet,
+             "Shouldn't have more than desired number of displayable pages "
+             "on this sheet");
+  mNumPages = numPagesOnThisSheet;
+
+  aReflowOutput.ISize(wm) = aReflowInput.AvailableISize();
+  if (aReflowInput.AvailableBSize() != NS_UNCONSTRAINEDSIZE) {
+    aReflowOutput.BSize(wm) = aReflowInput.AvailableBSize();
+  }
+  aReflowOutput.SetOverflowAreasToDesiredBounds();
+
+  FinishAndStoreOverflow(&aReflowOutput);
+}
+
+nsSize PrintedSheetFrame::ComputeSheetSize(const nsPresContext* aPresContext) {
+  nsSize sheetSize = aPresContext->GetPageSize();
+
+  if (sheetSize.width == sheetSize.height) {
+    return sheetSize;
+  }
+
+  if (mPD->mPrintSettings->HasOrthogonalPagesPerSheet()) {
+    std::swap(sheetSize.width, sheetSize.height);
+  }
+  return sheetSize;
+}
+
+void PrintedSheetFrame::ComputePagesPerSheetGridMetrics(
+    const nsSize& aSheetSize) {
+  MOZ_ASSERT(mPD->PagesPerSheetInfo()->mNumPages > 1,
+             "Unnecessary to call this in a regular 1-page-per-sheet scenario; "
+             "the computed values won't ever be used in that case");
+
+  nsSize availSpaceOnSheet = aSheetSize;
+  nsMargin uwm = mPD->mPrintSettings->GetIgnoreUnwriteableMargins()
+                     ? nsMargin{}
+                     : nsPresContext::CSSTwipsToAppUnits(
+                           mPD->mPrintSettings->GetUnwriteableMarginInTwips());
+
+  if (mPD->mPrintSettings->HasOrthogonalPagesPerSheet()) {
+    nsMargin rotated(uwm.right, uwm.bottom, uwm.left, uwm.top);
+    uwm = rotated;
+  }
+
+  availSpaceOnSheet.width -= uwm.LeftRight();
+  availSpaceOnSheet.height -= uwm.TopBottom();
+
+  if (MOZ_UNLIKELY(availSpaceOnSheet.IsEmpty())) {
+    NS_WARNING("Zero area for pages-per-sheet grid, or zero-sized grid");
+    mGridOrigin = nsPoint(0, 0);
+    mGridNumCols = 1;
+    return;
+  }
+
+  const auto* ppsInfo = mPD->PagesPerSheetInfo();
+  uint32_t smallerNumTracks = ppsInfo->mNumPages / ppsInfo->mLargerNumTracks;
+  bool sheetIsPortraitLike = aSheetSize.width < aSheetSize.height;
+  auto numCols =
+      sheetIsPortraitLike ? smallerNumTracks : ppsInfo->mLargerNumTracks;
+  auto numRows =
+      sheetIsPortraitLike ? ppsInfo->mLargerNumTracks : smallerNumTracks;
+
+  mGridOrigin = nsPoint(uwm.left, uwm.top);
+  mGridNumCols = numCols;
+  mGridCellWidth = availSpaceOnSheet.width / nscoord(numCols);
+  mGridCellHeight = availSpaceOnSheet.height / nscoord(numRows);
+}
+
+gfx::IntSize PrintedSheetFrame::GetPrintTargetSizeInPoints(
+    const int32_t aAppUnitsPerPhysicalInch) const {
+  const auto size = GetSize();
+  MOZ_ASSERT(size.width > 0 && size.height > 0);
+  const float pointsPerAppUnit =
+      POINTS_PER_INCH_FLOAT / float(aAppUnitsPerPhysicalInch);
+  return IntSize::Ceil(float(size.width) * pointsPerAppUnit,
+                       float(size.height) * pointsPerAppUnit);
+}
+
+#ifdef DEBUG_FRAME_DUMP
+nsresult PrintedSheetFrame::GetFrameName(nsAString& aResult) const {
+  return MakeFrameName(u"PrintedSheet"_ns, aResult);
+}
+#endif
+
+}  

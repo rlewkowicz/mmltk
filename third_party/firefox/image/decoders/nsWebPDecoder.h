@@ -1,0 +1,84 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_decoders_nsWebPDecoder_h
+#define mozilla_image_decoders_nsWebPDecoder_h
+
+#include "Decoder.h"
+#include "StreamingLexer.h"
+#include "SurfacePipe.h"
+#include "webp/demux.h"
+
+namespace mozilla {
+namespace image {
+class RasterImage;
+
+class nsWebPDecoder final : public Decoder {
+ public:
+  virtual ~nsWebPDecoder();
+
+  DecoderType GetType() const override { return DecoderType::WEBP; }
+
+ protected:
+  LexerResult DoDecode(SourceBufferIterator& aIterator,
+                       IResumable* aOnResume) override;
+ private:
+  friend class DecoderFactory;
+
+  explicit nsWebPDecoder(RasterImage* aImage);
+
+  void ApplyColorProfile(const char* aProfile, size_t aLength);
+
+  LexerResult UpdateBuffer(SourceBufferIterator& aIterator,
+                           SourceBufferIterator::State aState);
+  LexerResult ReadData();
+  LexerResult ReadHeader(WebPDemuxer* aDemuxer, bool aIsComplete);
+  LexerResult ReadPayload(WebPDemuxer* aDemuxer, bool aIsComplete);
+
+  nsresult CreateFrame(const OrientedIntRect& aFrameRect);
+  void EndFrame();
+
+  LexerResult ReadSingle(const uint8_t* aData, size_t aLength,
+                         const OrientedIntRect& aFrameRect);
+
+  LexerResult ReadMultiple(WebPDemuxer* aDemuxer, bool aIsComplete);
+
+  SurfacePipe mPipe;
+
+  Vector<uint8_t> mBufferedData;
+
+  WebPDecBuffer mBuffer;
+
+  WebPIDecoder* mDecoder;
+
+  BlendMethod mBlend;
+
+  DisposalMethod mDisposal;
+
+  FrameTimeout mTimeout;
+
+  gfx::SurfaceFormat mFormat;
+
+  OrientedIntRect mFrameRect;
+
+  int mLastRow;
+
+  uint32_t mCurrentFrame;
+
+  const uint8_t* mData;
+
+  size_t mLength;
+
+  bool mIteratorComplete;
+
+  bool mNeedDemuxer;
+
+  bool mGotColorProfile;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_decoders_nsWebPDecoder_h

@@ -1,0 +1,240 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_TimingParams_h
+#define mozilla_TimingParams_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/StickyTimeDuration.h"
+#include "mozilla/TimeStamp.h"                   // for TimeDuration
+#include "mozilla/dom/AnimationEffectBinding.h"  // for FillMode
+#include "mozilla/dom/Nullable.h"
+#include "mozilla/dom/UnionTypes.h"  // For OwningUnrestrictedDoubleOrString
+#include "nsPrintfCString.h"
+#include "nsStringFwd.h"
+
+namespace mozilla {
+
+namespace dom {
+class UnrestrictedDoubleOrKeyframeEffectOptions;
+class UnrestrictedDoubleOrKeyframeAnimationOptions;
+}  
+
+struct TimingParams {
+  TimingParams() = default;
+
+  TimingParams(Maybe<float> aDuration, float aDelay, float aIterationCount,
+               dom::PlaybackDirection aDirection, dom::FillMode aFillMode)
+      : mIterations(aIterationCount), mDirection(aDirection), mFill(aFillMode) {
+    if (aDuration) {
+      mDuration.emplace(StickyTimeDuration::FromMilliseconds(*aDuration));
+    }
+    mDelay = TimeDuration::FromMilliseconds(aDelay);
+    Update();
+  }
+
+  TimingParams(const TimeDuration& aDuration, const TimeDuration& aDelay,
+               const TimeDuration& aEndDelay, float aIterations,
+               float aIterationStart, dom::PlaybackDirection aDirection,
+               dom::FillMode aFillMode,
+               const Maybe<StyleComputedTimingFunction>& aFunction)
+      : mDelay(aDelay),
+        mEndDelay(aEndDelay),
+        mIterations(aIterations),
+        mIterationStart(aIterationStart),
+        mDirection(aDirection),
+        mFill(aFillMode),
+        mFunction(aFunction) {
+    mDuration.emplace(aDuration);
+    Update();
+  }
+
+  template <class OptionsType>
+  static TimingParams FromOptionsType(const OptionsType& aOptions,
+                                      ErrorResult& aRv);
+  static TimingParams FromOptionsUnion(
+      const dom::UnrestrictedDoubleOrKeyframeEffectOptions& aOptions,
+      ErrorResult& aRv);
+  static TimingParams FromOptionsUnion(
+      const dom::UnrestrictedDoubleOrKeyframeAnimationOptions& aOptions,
+      ErrorResult& aRv);
+  static TimingParams FromEffectTiming(const dom::EffectTiming& aEffectTiming,
+                                       ErrorResult& aRv);
+  static TimingParams MergeOptionalEffectTiming(
+      const TimingParams& aSource,
+      const dom::OptionalEffectTiming& aEffectTiming, ErrorResult& aRv);
+
+  template <class DoubleOrCSSNumericValueOrString>
+  static Maybe<StickyTimeDuration> CheckedDuration(
+      DoubleOrCSSNumericValueOrString& aDuration, ErrorResult& aRv) {
+    Maybe<StickyTimeDuration> result;
+    if (aDuration.IsUnrestrictedDouble()) {
+      double durationInMs = aDuration.GetAsUnrestrictedDouble();
+      if (durationInMs >= 0) {
+        result.emplace(StickyTimeDuration::FromMilliseconds(durationInMs));
+      } else {
+        nsPrintfCString err("Duration (%g) must be nonnegative", durationInMs);
+        aRv.ThrowTypeError(err);
+      }
+    } else if (aDuration.IsCSSNumericValue()) {
+      aRv.ThrowTypeError("Duration is not settable as a CSSNumericValue.");
+    } else if (!aDuration.GetAsString().EqualsLiteral("auto")) {
+      aRv.ThrowTypeError<dom::MSG_INVALID_DURATION_ERROR>(
+          NS_ConvertUTF16toUTF8(aDuration.GetAsString()));
+    }
+    return result;
+  }
+
+  static void ValidateIterationStart(double aIterationStart, ErrorResult& aRv) {
+    if (aIterationStart < 0) {
+      nsPrintfCString err("Iteration start (%g) must not be negative",
+                          aIterationStart);
+      aRv.ThrowTypeError(err);
+    }
+  }
+
+  static void ValidateIterations(double aIterations, ErrorResult& aRv) {
+    if (std::isnan(aIterations)) {
+      aRv.ThrowTypeError("Iterations must not be NaN");
+      return;
+    }
+
+    if (aIterations < 0) {
+      nsPrintfCString err("Iterations (%g) must not be negative", aIterations);
+      aRv.ThrowTypeError(err);
+    }
+  }
+
+  static Maybe<StyleComputedTimingFunction> ParseEasing(const nsACString&,
+                                                        ErrorResult&);
+
+  static StickyTimeDuration CalcActiveDuration(
+      const Maybe<StickyTimeDuration>& aDuration, double aIterations) {
+    static const StickyTimeDuration zeroDuration;
+    if (!aDuration || aDuration->IsZero() || aIterations == 0.0) {
+      return zeroDuration;
+    }
+
+    MOZ_ASSERT(*aDuration >= zeroDuration && aIterations >= 0.0,
+               "Both animation duration and ieration count should be greater "
+               "than zero");
+
+    StickyTimeDuration result = aDuration->MultDouble(aIterations);
+    if (result < zeroDuration) {
+      return StickyTimeDuration::Forever();
+    }
+    return result;
+  }
+  StickyTimeDuration ActiveDuration() const {
+    MOZ_ASSERT(CalcActiveDuration(mDuration, mIterations) == mActiveDuration,
+               "Cached value of active duration should be up to date");
+    return mActiveDuration;
+  }
+
+  StickyTimeDuration EndTime() const {
+    MOZ_ASSERT(mEndTime == CalcEndTime(),
+               "Cached value of end time should be up to date");
+    return mEndTime;
+  }
+
+  StickyTimeDuration CalcBeforeActiveBoundary() const {
+    static constexpr StickyTimeDuration zeroDuration;
+    return std::clamp(StickyTimeDuration(mDelay), zeroDuration, mEndTime);
+  }
+
+  StickyTimeDuration CalcActiveAfterBoundary() const {
+    if (mActiveDuration == StickyTimeDuration::Forever()) {
+      return StickyTimeDuration::Forever();
+    }
+
+    static constexpr StickyTimeDuration zeroDuration;
+    return std::max(
+        std::min(StickyTimeDuration(mDelay + mActiveDuration), mEndTime),
+        zeroDuration);
+  }
+
+  bool operator==(const TimingParams& aOther) const;
+  bool operator!=(const TimingParams& aOther) const {
+    return !(*this == aOther);
+  }
+
+  void SetDuration(Maybe<StickyTimeDuration>&& aDuration) {
+    mDuration = std::move(aDuration);
+    Update();
+  }
+  void SetDuration(const Maybe<StickyTimeDuration>& aDuration) {
+    mDuration = aDuration;
+    Update();
+  }
+  const Maybe<StickyTimeDuration>& Duration() const { return mDuration; }
+
+  void SetDelay(const TimeDuration& aDelay) {
+    mDelay = aDelay;
+    Update();
+  }
+  const TimeDuration& Delay() const { return mDelay; }
+
+  void SetEndDelay(const TimeDuration& aEndDelay) {
+    mEndDelay = aEndDelay;
+    Update();
+  }
+  const TimeDuration& EndDelay() const { return mEndDelay; }
+
+  void SetIterations(double aIterations) {
+    mIterations = aIterations;
+    Update();
+  }
+  double Iterations() const { return mIterations; }
+
+  void SetIterationStart(double aIterationStart) {
+    mIterationStart = aIterationStart;
+  }
+  double IterationStart() const { return mIterationStart; }
+
+  void SetDirection(dom::PlaybackDirection aDirection) {
+    mDirection = aDirection;
+  }
+  dom::PlaybackDirection Direction() const { return mDirection; }
+
+  void SetFill(dom::FillMode aFill) { mFill = aFill; }
+  dom::FillMode Fill() const { return mFill; }
+
+  void SetTimingFunction(Maybe<StyleComputedTimingFunction>&& aFunction) {
+    mFunction = std::move(aFunction);
+  }
+  const Maybe<StyleComputedTimingFunction>& TimingFunction() const {
+    return mFunction;
+  }
+
+  TimingParams Normalize(const TimeDuration& aTimelineDuration) const;
+
+ private:
+  void Update() {
+    mActiveDuration = CalcActiveDuration(mDuration, mIterations);
+    mEndTime = CalcEndTime();
+  }
+
+  StickyTimeDuration CalcEndTime() const {
+    if (mActiveDuration == StickyTimeDuration::Forever()) {
+      return StickyTimeDuration::Forever();
+    }
+    return std::max(mDelay + mActiveDuration + mEndDelay, StickyTimeDuration());
+  }
+
+  Maybe<StickyTimeDuration> mDuration;
+  TimeDuration mDelay;  
+  TimeDuration mEndDelay;
+  double mIterations = 1.0;  
+  double mIterationStart = 0.0;
+  dom::PlaybackDirection mDirection = dom::PlaybackDirection::Normal;
+  dom::FillMode mFill = dom::FillMode::Auto;
+  Maybe<StyleComputedTimingFunction> mFunction;
+  StickyTimeDuration mActiveDuration = StickyTimeDuration();
+  StickyTimeDuration mEndTime = StickyTimeDuration();
+};
+
+}  
+
+#endif  // mozilla_TimingParams_h

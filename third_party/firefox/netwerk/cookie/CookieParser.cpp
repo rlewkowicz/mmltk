@@ -1,0 +1,556 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "CookieParser.h"
+#include "CookieLogging.h"
+#include "CookieValidation.h"
+
+#include "mozilla/CheckedInt.h"
+#include "mozilla/net/Cookie.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/TextUtils.h"
+#include "nsIConsoleReportCollector.h"
+#include "nsIScriptError.h"
+#include "nsIURI.h"
+#include "nsIURL.h"
+#include "prprf.h"
+
+constexpr char ATTRIBUTE_PATH[] = "path";
+constexpr uint64_t ATTRIBUTE_MAX_LENGTH = 1024;
+
+constexpr auto CONSOLE_INVALID_ATTRIBUTE_CATEGORY = "cookieInvalidAttribute"_ns;
+
+namespace mozilla {
+namespace net {
+
+CookieParser::CookieParser(nsIConsoleReportCollector* aCRC, nsIURI* aHostURI)
+    : mCRC(aCRC), mHostURI(aHostURI) {
+  MOZ_COUNT_CTOR(CookieParser);
+  MOZ_ASSERT(aCRC);
+  MOZ_ASSERT(aHostURI);
+}
+
+CookieParser::~CookieParser() {
+  MOZ_COUNT_DTOR(CookieParser);
+
+  if (mValidation) {
+    mValidation->ReportErrorsAndWarnings(mCRC, mHostURI);
+  }
+
+#define COOKIE_LOGGING_WITH_NAME(category, x)                 \
+  CookieLogging::LogMessageToConsole(                         \
+      mCRC, mHostURI, nsIScriptError::errorFlag, category, x, \
+      AutoTArray<nsString, 1>{NS_ConvertUTF8toUTF16(mCookieData.name())});
+
+  switch (mRejection) {
+    case NoRejection:
+      break;
+
+    case RejectedInvalidCharAttributes:
+      COOKIE_LOGGING_WITH_NAME(CONSOLE_REJECTION_CATEGORY,
+                               "CookieRejectedInvalidCharAttributes"_ns);
+      break;
+
+    case RejectedHttpOnlyButFromScript:
+      COOKIE_LOGGING_WITH_NAME(CONSOLE_REJECTION_CATEGORY,
+                               "CookieRejectedHttpOnlyButFromScript"_ns);
+      break;
+
+    case RejectedForeignNoPartitionedError:
+      COOKIE_LOGGING_WITH_NAME(CONSOLE_CHIPS_CATEGORY,
+                               "CookieForeignNoPartitionedError"_ns);
+      break;
+
+    case RejectedByPermissionManager:
+      COOKIE_LOGGING_WITH_NAME(CONSOLE_REJECTION_CATEGORY,
+                               "CookieRejectedByPermissionManager"_ns);
+      break;
+
+    case RejectedNonsecureOverSecure:
+      COOKIE_LOGGING_WITH_NAME(CONSOLE_REJECTION_CATEGORY,
+                               "CookieRejectedNonsecureOverSecure"_ns);
+      break;
+  }
+
+#undef COOKIE_LOGGING_WITH_NAME
+
+  if (mRejection != NoRejection || !mValidation ||
+      mValidation->Result() != nsICookieValidation::eOK) {
+    return;
+  }
+
+  for (const char* attribute : mWarnings.mAttributeOversize) {
+    AutoTArray<nsString, 3> params = {NS_ConvertUTF8toUTF16(mCookieData.name()),
+                                      NS_ConvertUTF8toUTF16(attribute)};
+
+    nsString size;
+    size.AppendInt(ATTRIBUTE_MAX_LENGTH);
+    params.AppendElement(size);
+
+    CookieLogging::LogMessageToConsole(
+        mCRC, mHostURI, nsIScriptError::warningFlag, CONSOLE_OVERSIZE_CATEGORY,
+        "CookieAttributeIgnored"_ns, params);
+  }
+
+  for (const char* attribute : mWarnings.mAttributeOverwritten) {
+    CookieLogging::LogMessageToConsole(
+        mCRC, mHostURI, nsIScriptError::warningFlag,
+        CONSOLE_INVALID_ATTRIBUTE_CATEGORY, "CookieAttributeOverwritten"_ns,
+        AutoTArray<nsString, 2>{NS_ConvertUTF8toUTF16(mCookieData.name()),
+                                NS_ConvertUTF8toUTF16(attribute)});
+  }
+
+  if (mWarnings.mInvalidSameSiteAttribute) {
+    CookieLogging::LogMessageToConsole(
+        mCRC, mHostURI, nsIScriptError::infoFlag, CONSOLE_SAMESITE_CATEGORY,
+        "CookieSameSiteValueInvalid2"_ns,
+        AutoTArray<nsString, 1>{NS_ConvertUTF8toUTF16(mCookieData.name())});
+  }
+
+  if (mWarnings.mInvalidMaxAgeAttribute) {
+    CookieLogging::LogMessageToConsole(
+        mCRC, mHostURI, nsIScriptError::infoFlag,
+        CONSOLE_INVALID_ATTRIBUTE_CATEGORY, "CookieInvalidMaxAgeAttribute"_ns,
+        AutoTArray<nsString, 1>{NS_ConvertUTF8toUTF16(mCookieData.name())});
+  }
+
+  if (mWarnings.mForeignNoPartitionedWarning) {
+    CookieLogging::LogMessageToConsole(
+        mCRC, mHostURI, nsIScriptError::warningFlag, CONSOLE_CHIPS_CATEGORY,
+        "CookieForeignNoPartitionedWarning"_ns,
+        AutoTArray<nsString, 1>{
+            NS_ConvertUTF8toUTF16(mCookieData.name()),
+        });
+  }
+}
+
+// clang-format off
+// clang-format on
+
+static inline bool iswhitespace(char c) { return c == ' ' || c == '\t'; }
+static inline bool isvalueseparator(char c) { return c == ';'; }
+static inline bool istokenseparator(char c) {
+  return isvalueseparator(c) || c == '=';
+}
+
+void CookieParser::GetTokenValue(nsACString::const_char_iterator& aIter,
+                                 nsACString::const_char_iterator& aEndIter,
+                                 nsDependentCSubstring& aTokenString,
+                                 nsDependentCSubstring& aTokenValue,
+                                 bool& aEqualsFound) {
+  nsACString::const_char_iterator start;
+  nsACString::const_char_iterator lastSpace;
+  aTokenValue.Rebind(aIter, aIter);
+
+  while (aIter != aEndIter && iswhitespace(*aIter)) {
+    ++aIter;
+  }
+  start = aIter;
+  while (aIter != aEndIter && !istokenseparator(*aIter)) {
+    ++aIter;
+  }
+
+  lastSpace = aIter;
+  if (lastSpace != start) {
+    while (--lastSpace != start && iswhitespace(*lastSpace)) {
+    }
+    ++lastSpace;
+  }
+  aTokenString.Rebind(start, lastSpace);
+
+  aEqualsFound = (*aIter == '=');
+  if (aEqualsFound) {
+    while (++aIter != aEndIter && iswhitespace(*aIter)) {
+    }
+
+    start = aIter;
+
+    while (aIter != aEndIter && !isvalueseparator(*aIter)) {
+      ++aIter;
+    }
+
+    if (aIter != start) {
+      lastSpace = aIter;
+      while (--lastSpace != start && iswhitespace(*lastSpace)) {
+      }
+
+      aTokenValue.Rebind(start, ++lastSpace);
+    }
+  }
+
+  if (aIter != aEndIter) {
+    ++aIter;
+  }
+}
+
+static bool ContainsControlChars(const nsACString& aString) {
+  const auto* start = aString.BeginReading();
+  const auto* end = aString.EndReading();
+
+  return std::find_if(start, end, [](unsigned char c) {
+           return (c <= 0x1F && c != 0x09) || c == 0x7F;
+         }) != end;
+}
+
+bool CookieParser::CheckAttributeSize(const nsACString& currentValue,
+                                      const char* aAttribute,
+                                      const nsACString& aValue,
+                                      CookieParser* aParser) {
+  if (aValue.Length() > ATTRIBUTE_MAX_LENGTH) {
+    if (aParser) {
+      aParser->mWarnings.mAttributeOversize.AppendElement(aAttribute);
+    }
+    return false;
+  }
+
+  if (!currentValue.IsEmpty()) {
+    if (aParser) {
+      aParser->mWarnings.mAttributeOverwritten.AppendElement(aAttribute);
+    }
+  }
+
+  return true;
+}
+
+void CookieParser::ParseAttributes(nsCString& aCookieHeader,
+                                   nsACString& aExpires, nsACString& aMaxage,
+                                   bool& aAcceptedByParser) {
+  aAcceptedByParser = false;
+
+  static const char kDomain[] = "domain";
+  static const char kExpires[] = "expires";
+  static const char kMaxage[] = "max-age";
+  static const char kSecure[] = "secure";
+  static const char kHttpOnly[] = "httponly";
+  static const char kSameSite[] = "samesite";
+  static const char kSameSiteLax[] = "lax";
+  static const char kSameSiteNone[] = "none";
+  static const char kSameSiteStrict[] = "strict";
+  static const char kPartitioned[] = "partitioned";
+
+  nsACString::const_char_iterator cookieStart;
+  aCookieHeader.BeginReading(cookieStart);
+
+  nsACString::const_char_iterator cookieEnd;
+  aCookieHeader.EndReading(cookieEnd);
+
+  mCookieData.isSecure() = false;
+  mCookieData.isHttpOnly() = false;
+  mCookieData.isPartitioned() = false;
+  mCookieData.sameSite() = nsICookie::SAMESITE_UNSET;
+
+  nsDependentCSubstring tokenString(cookieStart, cookieStart);
+  nsDependentCSubstring tokenValue(cookieStart, cookieStart);
+  bool equalsFound;
+
+  GetTokenValue(cookieStart, cookieEnd, tokenString, tokenValue, equalsFound);
+  if (equalsFound) {
+    mCookieData.name() = tokenString;
+    mCookieData.value() = tokenValue;
+  } else if (StaticPrefs::network_cookie_valueless_cookie()) {
+    mCookieData.name() = tokenString;
+  } else {
+    mCookieData.value() = tokenString;
+  }
+
+  while (cookieStart != cookieEnd) {
+    GetTokenValue(cookieStart, cookieEnd, tokenString, tokenValue, equalsFound);
+
+    if (ContainsControlChars(tokenString) || ContainsControlChars(tokenValue)) {
+      RejectCookie(RejectedInvalidCharAttributes);
+      return;
+    }
+
+    if (tokenString.LowerCaseEqualsLiteral(ATTRIBUTE_PATH)) {
+      if (CheckAttributeSize(mCookieData.path(), ATTRIBUTE_PATH, tokenValue,
+                             this)) {
+        mCookieData.path() = tokenValue;
+      }
+
+    } else if (tokenString.LowerCaseEqualsLiteral(kDomain)) {
+      if (CheckAttributeSize(mCookieData.host(), kDomain, tokenValue, this)) {
+        mCookieData.host() = tokenValue;
+      }
+
+    } else if (tokenString.LowerCaseEqualsLiteral(kExpires)) {
+      if (CheckAttributeSize(aExpires, kExpires, tokenValue, this)) {
+        aExpires = tokenValue;
+      }
+
+    } else if (tokenString.LowerCaseEqualsLiteral(kMaxage)) {
+      if (CheckAttributeSize(aMaxage, kMaxage, tokenValue, this)) {
+        aMaxage = tokenValue;
+      }
+
+    } else if (tokenString.LowerCaseEqualsLiteral(kSecure)) {
+      mCookieData.isSecure() = true;
+
+    } else if (tokenString.LowerCaseEqualsLiteral(kPartitioned)) {
+      mCookieData.isPartitioned() = true;
+
+    } else if (tokenString.LowerCaseEqualsLiteral(kHttpOnly)) {
+      mCookieData.isHttpOnly() = true;
+
+    } else if (tokenString.LowerCaseEqualsLiteral(kSameSite)) {
+      if (tokenValue.LowerCaseEqualsLiteral(kSameSiteLax)) {
+        mCookieData.sameSite() = nsICookie::SAMESITE_LAX;
+      } else if (tokenValue.LowerCaseEqualsLiteral(kSameSiteStrict)) {
+        mCookieData.sameSite() = nsICookie::SAMESITE_STRICT;
+      } else if (tokenValue.LowerCaseEqualsLiteral(kSameSiteNone)) {
+        mCookieData.sameSite() = nsICookie::SAMESITE_NONE;
+      } else {
+        mCookieData.sameSite() = nsICookie::SAMESITE_UNSET;
+        mWarnings.mInvalidSameSiteAttribute = true;
+      }
+    }
+  }
+
+  aAcceptedByParser = true;
+}
+
+namespace {
+
+nsAutoCString GetPathFromURI(nsIURI* aHostURI) {
+  nsAutoCString path;
+  nsCOMPtr<nsIURL> hostURL = do_QueryInterface(aHostURI);
+  if (hostURL) {
+    hostURL->GetDirectory(path);
+  } else {
+    aHostURI->GetPathQueryRef(path);
+    int32_t slash = path.RFindChar('/');
+    if (slash != kNotFound) {
+      path.Truncate(slash + 1);
+    }
+  }
+
+  int32_t lastSlash = path.RFindChar('/');
+  int32_t firstSlash = path.FindChar('/');
+  if (lastSlash != firstSlash && lastSlash != kNotFound &&
+      lastSlash == static_cast<int32_t>(path.Length() - 1)) {
+    path.Truncate(lastSlash);
+  }
+
+  return path;
+}
+
+}  
+
+void CookieParser::FixPath(CookieStruct& aCookieData, nsIURI* aHostURI) {
+  if (aCookieData.path().IsEmpty() || aCookieData.path().First() != '/') {
+    nsAutoCString path = GetPathFromURI(aHostURI);
+    if (CheckAttributeSize(aCookieData.path(), ATTRIBUTE_PATH, path)) {
+      aCookieData.path() = path;
+    }
+  }
+}
+
+bool CookieParser::ParseMaxAgeAttribute(const nsACString& aMaxage,
+                                        int64_t* aValue) {
+  MOZ_ASSERT(aValue);
+
+  if (aMaxage.IsEmpty()) {
+    return false;
+  }
+
+  nsACString::const_char_iterator iter;
+  aMaxage.BeginReading(iter);
+
+  nsACString::const_char_iterator end;
+  aMaxage.EndReading(end);
+
+  if (*iter == '-') {
+    *aValue = INT64_MIN;
+    return true;
+  }
+
+  CheckedInt<int64_t> value(0);
+
+  for (; iter != end; ++iter) {
+    if (!mozilla::IsAsciiDigit(*iter)) {
+      mWarnings.mInvalidMaxAgeAttribute = true;
+      return false;
+    }
+
+    value *= 10;
+    if (!value.isValid()) {
+      *aValue = INT64_MAX;
+      return true;
+    }
+
+    value += *iter - '0';
+    if (!value.isValid()) {
+      *aValue = INT64_MAX;
+      return true;
+    }
+  }
+
+  *aValue = value.value();
+  return true;
+}
+
+bool CookieParser::GetExpiry(CookieStruct& aCookieData,
+                             const nsACString& aExpires,
+                             const nsACString& aMaxage,
+                             const nsACString& aDateHeader, bool aFromHttp) {
+  int64_t creationTimeInMSec =
+      aCookieData.creationTimeInUSec() / int64_t(PR_USEC_PER_MSEC);
+
+  int64_t maxage = 0;
+  if (ParseMaxAgeAttribute(aMaxage, &maxage)) {
+    if (maxage == INT64_MIN) {
+      aCookieData.expiryInMSec() = maxage;
+    } else {
+      aCookieData.expiryInMSec() =
+          CookieCommons::MaybeCapMaxAge(creationTimeInMSec, maxage);
+    }
+
+    return false;
+  }
+
+  if (!aExpires.IsEmpty()) {
+    PRTime expiresTimeInUSec;
+    if (PR_ParseTimeString(PromiseFlatCString(aExpires).get(), true,
+                           &expiresTimeInUSec) != PR_SUCCESS) {
+      return true;
+    }
+
+    int64_t expiresInMSec = expiresTimeInUSec / int64_t(PR_USEC_PER_MSEC);
+
+    if (!aDateHeader.IsEmpty()) {
+      MOZ_ASSERT(aFromHttp);
+
+      PRTime dateHeaderTimeInUSec;
+      if (PR_ParseTimeString(PromiseFlatCString(aDateHeader).get(), true,
+                             &dateHeaderTimeInUSec) == PR_SUCCESS &&
+          StaticPrefs::network_cookie_useServerTime()) {
+        int64_t serverTimeInMSec =
+            dateHeaderTimeInUSec / int64_t(PR_USEC_PER_MSEC);
+        int64_t delta = creationTimeInMSec - serverTimeInMSec;
+        expiresInMSec += delta;
+      }
+    }
+
+
+    aCookieData.expiryInMSec() =
+        CookieCommons::MaybeCapExpiry(creationTimeInMSec, expiresInMSec);
+    return false;
+  }
+
+  return true;
+}
+
+void CookieParser::FixDomain(CookieStruct& aCookieData, nsIURI* aHostURI,
+                             const nsACString& aBaseDomain,
+                             bool aRequireHostMatch) {
+
+  nsAutoCString hostFromURI;
+  nsContentUtils::GetHostOrIPv6WithBrackets(aHostURI, hostFromURI);
+
+  if (aCookieData.host().IsEmpty()) {
+    aCookieData.host() = hostFromURI;
+    return;
+  }
+
+  nsCString cookieHost = aCookieData.host();
+
+  if (cookieHost.Length() > 1 && cookieHost.First() == '.') {
+    cookieHost.Cut(0, 1);
+  }
+
+  ToLowerCase(cookieHost);
+
+  if (aRequireHostMatch) {
+    if (hostFromURI.Equals(cookieHost)) {
+      aCookieData.host() = cookieHost;
+    }
+
+    return;
+  }
+
+  if (CookieCommons::IsSubdomainOf(cookieHost, aBaseDomain) &&
+      CookieCommons::IsSubdomainOf(hostFromURI, cookieHost)) {
+    cookieHost.InsertLiteral(".", 0);
+    aCookieData.host() = cookieHost;
+  }
+
+}
+
+void CookieParser::Parse(const nsACString& aBaseDomain, bool aRequireHostMatch,
+                         CookieStatus aStatus, nsCString& aCookieHeader,
+                         const nsACString& aDateHeader, bool aFromHttp,
+                         bool aIsForeignAndNotAddon, bool aPartitionedOnly,
+                         bool aIsInPrivateBrowsing, bool aOn3pcbException,
+                         int64_t aCurrentTimeInUSec) {
+  MOZ_ASSERT(!mValidation);
+
+  mCookieData.expiryInMSec() = INT64_MAX;
+  mCookieData.creationTimeInUSec() =
+      Cookie::GenerateUniqueCreationTimeInUSec(aCurrentTimeInUSec);
+  mCookieData.updateTimeInUSec() = mCookieData.creationTimeInUSec();
+
+  mCookieData.schemeMap() = CookieCommons::URIToSchemeType(mHostURI);
+
+  mCookieString.Assign(aCookieHeader);
+
+  nsAutoCString expires;
+  nsAutoCString maxage;
+  bool acceptedByParser = false;
+  ParseAttributes(aCookieHeader, expires, maxage, acceptedByParser);
+  if (!acceptedByParser) {
+    return;
+  }
+
+  mCookieData.isSession() =
+      GetExpiry(mCookieData, expires, maxage, aDateHeader, aFromHttp);
+  if (aStatus == STATUS_ACCEPT_SESSION) {
+    mCookieData.isSession() = true;
+  }
+
+  FixDomain(mCookieData, mHostURI, aBaseDomain, aRequireHostMatch);
+  FixPath(mCookieData, mHostURI);
+
+  if (aOn3pcbException) {
+    if (aPartitionedOnly && !mCookieData.isPartitioned() &&
+        aIsForeignAndNotAddon) {
+      mWarnings.mForeignNoPartitionedWarning = true;
+    }
+
+    mCookieData.isPartitioned() = true;
+  }
+
+  if (aPartitionedOnly && !mCookieData.isPartitioned() &&
+      aIsForeignAndNotAddon) {
+    if (StaticPrefs::network_cookie_cookieBehavior_optInPartitioning() ||
+        (aIsInPrivateBrowsing &&
+         StaticPrefs::
+             network_cookie_cookieBehavior_optInPartitioning_pbmode())) {
+      RejectCookie(RejectedForeignNoPartitionedError);
+      return;
+    }
+
+    mWarnings.mForeignNoPartitionedWarning = true;
+  }
+
+  mValidation = CookieValidation::ValidateInContext(
+      mCookieData, mHostURI, aBaseDomain, aRequireHostMatch, aFromHttp,
+      aIsForeignAndNotAddon, aPartitionedOnly, aIsInPrivateBrowsing);
+  MOZ_ASSERT(mValidation);
+
+  if (mValidation->Result() != nsICookieValidation::eOK) {
+    return;
+  }
+}
+
+void CookieParser::RejectCookie(Rejection aRejection) {
+  MOZ_ASSERT(mRejection == NoRejection);
+  MOZ_ASSERT(aRejection != NoRejection);
+  mRejection = aRejection;
+}
+
+void CookieParser::GetCookieString(nsACString& aCookieString) const {
+  aCookieString.Assign(mCookieString);
+}
+
+}  
+}  

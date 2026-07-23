@@ -1,0 +1,205 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "TimeoutExecutor.h"
+
+#include "mozilla/EventQueue.h"
+#include "mozilla/Logging.h"
+#include "mozilla/dom/TimeoutManager.h"
+#include "nsComponentManagerUtils.h"
+#include "nsIEventTarget.h"
+#include "nsString.h"
+#include "nsThreadUtils.h"
+
+extern mozilla::LazyLogModule gTimeoutLog;
+
+namespace mozilla::dom {
+
+NS_IMPL_ISUPPORTS(TimeoutExecutor, nsIRunnable, nsITimerCallback, nsINamed)
+
+TimeoutExecutor::~TimeoutExecutor() {
+  MOZ_DIAGNOSTIC_ASSERT(mMode == Mode::Shutdown);
+  MOZ_DIAGNOSTIC_ASSERT(!mOwner);
+  MOZ_DIAGNOSTIC_ASSERT(!mTimer);
+}
+
+nsresult TimeoutExecutor::ScheduleImmediate(const TimeStamp& aDeadline,
+                                            const TimeStamp& aNow) {
+  MOZ_DIAGNOSTIC_ASSERT(mDeadline.IsNull());
+  MOZ_DIAGNOSTIC_ASSERT(mMode == Mode::None);
+  MOZ_DIAGNOSTIC_ASSERT(aDeadline <= (aNow + mAllowedEarlyFiringTime));
+
+  nsresult rv;
+  if (mIsIdleQueue) {
+    RefPtr<TimeoutExecutor> runnable(this);
+    MOZ_LOG(gTimeoutLog, LogLevel::Debug, ("Starting IdleDispatch runnable"));
+    rv = NS_DispatchToCurrentThreadQueue(runnable.forget(), mMaxIdleDeferMS,
+                                         EventQueuePriority::DeferredTimers);
+  } else {
+    rv = mOwner->EventTarget()->Dispatch(this, nsIEventTarget::DISPATCH_NORMAL);
+  }
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mMode = Mode::Immediate;
+  mDeadline = aDeadline;
+
+  return NS_OK;
+}
+
+nsresult TimeoutExecutor::ScheduleDelayed(const TimeStamp& aDeadline,
+                                          const TimeStamp& aNow,
+                                          const TimeDuration& aMinDelay) {
+  MOZ_DIAGNOSTIC_ASSERT(mDeadline.IsNull());
+  MOZ_DIAGNOSTIC_ASSERT(mMode == Mode::None);
+  MOZ_DIAGNOSTIC_ASSERT(!aMinDelay.IsZero() ||
+                        aDeadline > (aNow + mAllowedEarlyFiringTime));
+
+  nsresult rv = NS_OK;
+
+  if (mIsIdleQueue) {
+    return ScheduleImmediate(aNow, aNow);
+  }
+
+  if (!mTimer) {
+    mTimer = NS_NewTimer(mOwner->EventTarget());
+    NS_ENSURE_TRUE(mTimer, NS_ERROR_OUT_OF_MEMORY);
+
+    uint32_t earlyMicros = 0;
+    MOZ_ALWAYS_SUCCEEDS(
+        mTimer->GetAllowedEarlyFiringMicroseconds(&earlyMicros));
+    mAllowedEarlyFiringTime = TimeDuration::FromMicroseconds(earlyMicros);
+    if (aDeadline <= (aNow + mAllowedEarlyFiringTime)) {
+      return ScheduleImmediate(aDeadline, aNow);
+    }
+  } else {
+    rv = mTimer->Cancel();
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  TimeDuration delay = TimeDuration::Max(aMinDelay, aDeadline - aNow);
+
+  rv = mTimer->InitHighResolutionWithCallback(this, delay,
+                                              nsITimer::TYPE_ONE_SHOT);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mMode = Mode::Delayed;
+  mDeadline = aDeadline;
+
+  return NS_OK;
+}
+
+nsresult TimeoutExecutor::Schedule(const TimeStamp& aDeadline,
+                                   const TimeDuration& aMinDelay) {
+  TimeStamp now(TimeStamp::Now());
+
+  if (aMinDelay.IsZero() && aDeadline <= (now + mAllowedEarlyFiringTime)) {
+    return ScheduleImmediate(aDeadline, now);
+  }
+
+  return ScheduleDelayed(aDeadline, now, aMinDelay);
+}
+
+nsresult TimeoutExecutor::MaybeReschedule(const TimeStamp& aDeadline,
+                                          const TimeDuration& aMinDelay) {
+  MOZ_DIAGNOSTIC_ASSERT(!mDeadline.IsNull());
+  MOZ_DIAGNOSTIC_ASSERT(mMode == Mode::Immediate || mMode == Mode::Delayed);
+
+  if (aDeadline >= mDeadline) {
+    return NS_OK;
+  }
+
+  if (mMode == Mode::Immediate) {
+    return NS_OK;
+  }
+
+  Cancel();
+  return Schedule(aDeadline, aMinDelay);
+}
+
+void TimeoutExecutor::MaybeExecute() {
+  MOZ_DIAGNOSTIC_ASSERT(mMode != Mode::Shutdown && mMode != Mode::None);
+  MOZ_DIAGNOSTIC_ASSERT(mOwner);
+  MOZ_DIAGNOSTIC_ASSERT(!mDeadline.IsNull());
+
+  TimeStamp deadline(mDeadline);
+
+  TimeStamp now(TimeStamp::Now());
+  TimeStamp limit = now + mAllowedEarlyFiringTime;
+  if (deadline > limit) {
+    deadline = limit;
+  }
+
+  Cancel();
+
+  mOwner->RunTimeout(now, deadline, mIsIdleQueue);
+}
+
+TimeoutExecutor::TimeoutExecutor(TimeoutManager* aOwner, bool aIsIdleQueue,
+                                 uint32_t aMaxIdleDeferMS)
+    : mOwner(aOwner),
+      mIsIdleQueue(aIsIdleQueue),
+      mMaxIdleDeferMS(aMaxIdleDeferMS),
+      mMode(Mode::None) {
+  MOZ_DIAGNOSTIC_ASSERT(mOwner);
+}
+
+void TimeoutExecutor::Shutdown() {
+  mOwner = nullptr;
+
+  if (mTimer) {
+    mTimer->Cancel();
+    mTimer = nullptr;
+  }
+
+  mMode = Mode::Shutdown;
+  mDeadline = TimeStamp();
+}
+
+nsresult TimeoutExecutor::MaybeSchedule(const TimeStamp& aDeadline,
+                                        const TimeDuration& aMinDelay) {
+  MOZ_DIAGNOSTIC_ASSERT(!aDeadline.IsNull());
+
+  if (mMode == Mode::Shutdown) {
+    return NS_OK;
+  }
+
+  if (mMode == Mode::Immediate || mMode == Mode::Delayed) {
+    return MaybeReschedule(aDeadline, aMinDelay);
+  }
+
+  return Schedule(aDeadline, aMinDelay);
+}
+
+void TimeoutExecutor::Cancel() {
+  if (mTimer) {
+    mTimer->Cancel();
+  }
+  mMode = Mode::None;
+  mDeadline = TimeStamp();
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHODIMP TimeoutExecutor::Run() {
+  MOZ_LOG(gTimeoutLog, LogLevel::Debug,
+          ("Running Immediate %stimers", mIsIdleQueue ? "Idle" : ""));
+  if (mMode == Mode::Immediate) {
+    MaybeExecute();
+  }
+  return NS_OK;
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHODIMP
+TimeoutExecutor::Notify(nsITimer* aTimer) {
+  if (mMode == Mode::Delayed) {
+    MaybeExecute();
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+TimeoutExecutor::GetName(nsACString& aNameOut) {
+  aNameOut.AssignLiteral("TimeoutExecutor Runnable");
+  return NS_OK;
+}
+
+}  

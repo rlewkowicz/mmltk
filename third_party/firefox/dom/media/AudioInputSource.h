@@ -1,0 +1,106 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_AudioInputSource_H_
+#define DOM_MEDIA_AudioInputSource_H_
+
+#include <thread>
+
+#include "AudioDriftCorrection.h"
+#include "AudioSegment.h"
+#include "CubebInputStream.h"
+#include "CubebUtils.h"
+#include "TimeUnits.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/SPSCQueue.h"
+#include "mozilla/SharedThreadPool.h"
+#include "mozilla/Variant.h"
+
+namespace mozilla {
+
+class AudioInputSource : public CubebInputStream::Listener {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(AudioInputSource, override);
+
+  using Id = uint32_t;
+
+  class EventListener {
+   public:
+    NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING;
+
+    virtual void AudioDeviceChanged(Id aId) = 0;
+    enum class State { Started, Stopped, Drained, Error };
+    virtual void AudioStateCallback(Id aId, State aState) = 0;
+
+   protected:
+    EventListener() = default;
+    virtual ~EventListener() = default;
+  };
+
+  AudioInputSource(RefPtr<EventListener>&& aListener, Id aSourceId,
+                   CubebUtils::AudioDeviceID aDeviceId, uint32_t aChannelCount,
+                   bool aIsVoice, const PrincipalHandle& aPrincipalHandle,
+                   TrackRate aSourceRate, TrackRate aTargetRate);
+
+  void Init();
+  void Start();
+  void Stop();
+  using SetRequestedProcessingParamsPromise =
+      MozPromise<cubeb_input_processing_params, int, true>;
+  RefPtr<SetRequestedProcessingParamsPromise> SetRequestedProcessingParams(
+      cubeb_input_processing_params aParams);
+  enum class Consumer { Same, Changed };
+  AudioSegment GetAudioSegment(TrackTime aDuration, Consumer aConsumer);
+
+  long DataCallback(const void* aBuffer, long aFrames) override;
+  void StateCallback(cubeb_state aState) override;
+  void DeviceChangedCallback() override;
+
+  const Id mId;
+  const CubebUtils::AudioDeviceID mDeviceId;
+  const uint32_t mChannelCount;
+  const TrackRate mRate;
+  const bool mIsVoice;
+  const PrincipalHandle mPrincipalHandle;
+
+ protected:
+  ~AudioInputSource() = default;
+
+ private:
+  bool CheckThreadIdChanged();
+
+  std::atomic<std::thread::id> mAudioThreadId;
+
+  const RefPtr<EventListener> mEventListener;
+
+  const RefPtr<SharedThreadPool> mTaskThread;
+
+  AudioDriftCorrection mDriftCorrector;
+
+  UniquePtr<CubebInputStream> mStream;
+
+  cubeb_input_processing_params mConfiguredProcessingParams =
+      CUBEB_INPUT_PROCESSING_PARAM_NONE;
+
+  struct Empty {};
+
+  struct LatencyChangeData {
+    media::TimeUnit mLatency;
+  };
+
+  struct Data : public Variant<AudioChunk, LatencyChangeData, Empty> {
+    Data() : Variant(AsVariant(Empty())) {}
+    explicit Data(AudioChunk&& aChunk)
+        : Variant(AsVariant(std::move(aChunk))) {}
+    explicit Data(LatencyChangeData aLatencyChangeData)
+        : Variant(AsVariant(std::move(aLatencyChangeData))) {}
+  };
+
+  SPSCQueue<Data> mSPSCQueue{30};
+};
+
+}  
+
+#endif  // DOM_MEDIA_AudioInputSource_H_

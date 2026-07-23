@@ -1,0 +1,118 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(MediaResource_h_)
+#  define MediaResource_h_
+
+#  include "DecoderDoctorLogger.h"
+#  include "Intervals.h"
+#  include "MediaData.h"
+#  include "mozilla/Attributes.h"
+#  include "mozilla/UniquePtr.h"
+#  include "nsISeekableStream.h"
+#  include "nsThreadUtils.h"
+
+namespace mozilla {
+
+
+typedef media::Interval<int64_t> MediaByteRange;
+typedef media::IntervalSet<int64_t> MediaByteRangeSet;
+
+DDLoggedTypeDeclName(MediaResource);
+
+class MediaResource : public DecoderDoctorLifeLogger<MediaResource> {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING_WITH_DELETE_ON_MAIN_THREAD(
+      MediaResource)
+
+  virtual RefPtr<GenericPromise> Close() {
+    return GenericPromise::CreateAndResolve(true, __func__);
+  }
+
+  virtual nsresult ReadAt(int64_t aOffset, char* aBuffer, uint32_t aCount,
+                          uint32_t* aBytes) = 0;
+  virtual bool ShouldCacheReads() = 0;
+
+  virtual void Pin() = 0;
+  virtual void Unpin() = 0;
+  virtual int64_t GetLength() = 0;
+  virtual int64_t GetNextCachedData(int64_t aOffset) = 0;
+  virtual int64_t GetCachedDataEnd(int64_t aOffset) = 0;
+  virtual bool IsDataCachedToEndOfResource(int64_t aOffset) = 0;
+  virtual nsresult ReadFromCache(char* aBuffer, int64_t aOffset,
+                                 uint32_t aCount) = 0;
+
+  virtual nsresult GetCachedRanges(MediaByteRangeSet& aRanges) = 0;
+
+ protected:
+  virtual ~MediaResource() = default;
+};
+
+template <class T>
+class MOZ_RAII AutoPinned {
+ public:
+  explicit AutoPinned(T* aResource) : mResource(aResource) {
+    MOZ_ASSERT(mResource);
+    mResource->Pin();
+  }
+
+  ~AutoPinned() { mResource->Unpin(); }
+
+  operator T*() const { return mResource; }
+  T* operator->() const MOZ_NO_ADDREF_RELEASE_ON_RETURN { return mResource; }
+
+ private:
+  T* mResource;
+};
+
+DDLoggedTypeDeclName(MediaResourceIndex);
+
+class MediaResourceIndex : public DecoderDoctorLifeLogger<MediaResourceIndex> {
+ public:
+  explicit MediaResourceIndex(MediaResource* aResource);
+
+  nsresult Read(char* aBuffer, uint32_t aCount, uint32_t* aBytes);
+  nsresult Seek(int32_t aWhence, int64_t aOffset);
+  int64_t Tell() const { return mOffset; }
+
+  MediaResource* GetResource() const { return mResource; }
+
+  nsresult ReadAt(int64_t aOffset, char* aBuffer, uint32_t aCount,
+                  uint32_t* aBytes);
+
+  nsresult UncachedReadAt(int64_t aOffset, char* aBuffer, uint32_t aCount,
+                          uint32_t* aBytes) const;
+
+  nsresult UncachedRangedReadAt(int64_t aOffset, char* aBuffer,
+                                uint32_t aRequestedCount, uint32_t aExtraCount,
+                                uint32_t* aBytes) const;
+
+  already_AddRefed<MediaByteBuffer> MediaReadAt(int64_t aOffset,
+                                                uint32_t aCount) const;
+
+  already_AddRefed<MediaByteBuffer> CachedMediaReadAt(int64_t aOffset,
+                                                      uint32_t aCount) const;
+
+  int64_t GetLength() const;
+
+ private:
+  nsresult CacheOrReadAt(int64_t aOffset, char* aBuffer, uint32_t aCount,
+                         uint32_t* aBytes);
+
+  uint32_t IndexInCache(int64_t aOffsetInFile) const;
+
+  int64_t CacheOffsetContaining(int64_t aOffsetInFile) const;
+
+  RefPtr<MediaResource> mResource;
+  int64_t mOffset;
+
+  const uint32_t mCacheBlockSize;
+  int64_t mCachedOffset;
+  uint32_t mCachedBytes;
+  UniquePtr<char[]> mCachedBlock;
+};
+
+}  
+
+#endif

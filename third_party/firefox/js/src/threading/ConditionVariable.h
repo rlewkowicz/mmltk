@@ -1,0 +1,109 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(threading_ConditionVariable_h)
+#define threading_ConditionVariable_h
+
+#include "mozilla/PlatformConditionVariable.h"
+#include "mozilla/TimeStamp.h"
+
+#include <utility>
+#if !0 && !defined(__wasi__)
+#  include <pthread.h>
+#endif
+
+#include "threading/LockGuard.h"
+#include "threading/Mutex.h"
+
+namespace js {
+
+template <class T>
+class ExclusiveData;
+
+enum class CVStatus { NoTimeout, Timeout };
+
+template <typename T>
+using UniqueLock = LockGuard<T>;
+
+class ConditionVariable {
+ public:
+  struct PlatformData;
+
+  ConditionVariable() = default;
+  ~ConditionVariable() = default;
+
+  void notify_one() { impl_.notify_one(); }
+
+  void notify_all() { impl_.notify_all(); }
+
+  void wait(Mutex& lock) {
+#if defined(DEBUG)
+    lock.preUnlockChecks();
+#endif
+    impl_.wait(lock.impl_);
+#if defined(DEBUG)
+    lock.preLockChecks();
+    lock.postLockChecks();
+#endif
+  }
+  void wait(UniqueLock<Mutex>& lock) { wait(lock.mutex); }
+
+  template <typename Predicate>
+  void wait(UniqueLock<Mutex>& lock, Predicate pred) {
+    while (!pred()) {
+      wait(lock);
+    }
+  }
+
+  CVStatus wait_until(UniqueLock<Mutex>& lock,
+                      const mozilla::TimeStamp& abs_time) {
+    return wait_for(lock, abs_time - mozilla::TimeStamp::Now());
+  }
+
+  template <typename Predicate>
+  bool wait_until(UniqueLock<Mutex>& lock, const mozilla::TimeStamp& abs_time,
+                  Predicate pred) {
+    while (!pred()) {
+      if (wait_until(lock, abs_time) == CVStatus::Timeout) {
+        return pred();
+      }
+    }
+    return true;
+  }
+
+  CVStatus wait_for(UniqueLock<Mutex>& lock,
+                    const mozilla::TimeDuration& rel_time) {
+#if defined(DEBUG)
+    lock.mutex.preUnlockChecks();
+#endif
+    CVStatus res =
+        impl_.wait_for(lock.mutex.impl_, rel_time) == mozilla::CVStatus::Timeout
+            ? CVStatus::Timeout
+            : CVStatus::NoTimeout;
+#if defined(DEBUG)
+    lock.mutex.preLockChecks();
+    lock.mutex.postLockChecks();
+#endif
+    return res;
+  }
+
+  template <typename Predicate>
+  bool wait_for(UniqueLock<Mutex>& lock, const mozilla::TimeDuration& rel_time,
+                Predicate pred) {
+    return wait_until(lock, mozilla::TimeStamp::Now() + rel_time,
+                      std::move(pred));
+  }
+
+ private:
+  ConditionVariable(const ConditionVariable&) = delete;
+  ConditionVariable& operator=(const ConditionVariable&) = delete;
+  template <class T>
+  friend class ExclusiveWaitableData;
+
+  mozilla::detail::ConditionVariableImpl impl_;
+};
+
+}  
+
+#endif

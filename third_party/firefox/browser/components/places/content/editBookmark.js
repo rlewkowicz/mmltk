@@ -1,0 +1,1115 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+
+
+var { XPCOMUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/XPCOMUtils.sys.mjs"
+);
+
+ChromeUtils.defineESModuleGetters(this, {
+  CustomizableUI:
+    "moz-src:///browser/components/customizableui/CustomizableUI.sys.mjs",
+  PlacesTransactions: "resource://gre/modules/PlacesTransactions.sys.mjs",
+  PlacesUIUtils: "moz-src:///browser/components/places/PlacesUIUtils.sys.mjs",
+  PlacesUtils: "resource://gre/modules/PlacesUtils.sys.mjs",
+});
+
+const STATIC_MENUITEM_COUNT = 7;
+
+var gEditItemOverlay = {
+  transactionPromises: null,
+  _staticFoldersListBuilt: false,
+  _didChangeFolder: false,
+  _bookmarkState: null,
+  _allTags: null,
+  _initPanelDeferred: null,
+  _updateTagsDeferred: null,
+  _paneInfo: null,
+  _setPaneInfo(aInitInfo) {
+    if (!aInitInfo) {
+      return (this._paneInfo = null);
+    }
+
+    if ("uris" in aInitInfo && "node" in aInitInfo) {
+      throw new Error("ambiguous pane info");
+    }
+    if (!("uris" in aInitInfo) && !("node" in aInitInfo)) {
+      throw new Error("Neither node nor uris set for pane info");
+    }
+
+    let node = "node" in aInitInfo ? aInitInfo.node : null;
+
+    let itemGuid = node ? PlacesUtils.getConcreteItemGuid(node) : null;
+    let isItem = !!itemGuid;
+    let isFolderShortcut =
+      isItem &&
+      node.type == Ci.nsINavHistoryResultNode.RESULT_TYPE_FOLDER_SHORTCUT;
+    let isTag = node && PlacesUtils.nodeIsTagQuery(node);
+    let tag = null;
+    if (isTag) {
+      tag =
+        PlacesUtils.asQuery(node).query.tags.length == 1
+          ? node.query.tags[0]
+          : node.title;
+    }
+
+    let isURI = node && PlacesUtils.nodeIsURI(node);
+    let uri = isURI || isTag ? Services.io.newURI(node.uri) : null;
+    let title = node ? node.title : null;
+    let isBookmark = isItem && isURI;
+
+    let addedMultipleBookmarks = aInitInfo.addedMultipleBookmarks;
+    let bulkTagging = false;
+    let uris = null;
+    if (!node) {
+      bulkTagging = true;
+      uris = aInitInfo.uris;
+    } else if (addedMultipleBookmarks) {
+      bulkTagging = true;
+      uris = node.children.map(c => c.url);
+    }
+
+    let visibleRows = new Set();
+    let isParentReadOnly = false;
+    let postData = aInitInfo.postData;
+    let parentGuid = null;
+
+    if (node && isItem) {
+      if (!node.parent) {
+        throw new Error(
+          "Cannot use an incomplete node to initialize the edit bookmark panel"
+        );
+      }
+      let parent = node.parent;
+      isParentReadOnly = !PlacesUtils.nodeIsFolderOrShortcut(parent);
+      parentGuid = parent.bookmarkGuid;
+    }
+
+    let focusedElement = aInitInfo.focusedElement;
+    let onPanelReady = aInitInfo.onPanelReady;
+
+    return (this._paneInfo = {
+      itemGuid,
+      parentGuid,
+      isItem,
+      isURI,
+      uri,
+      title,
+      isBookmark,
+      isFolderShortcut,
+      addedMultipleBookmarks,
+      isParentReadOnly,
+      bulkTagging,
+      uris,
+      visibleRows,
+      postData,
+      isTag,
+      focusedElement,
+      onPanelReady,
+      tag,
+    });
+  },
+
+  get initialized() {
+    return this._paneInfo != null;
+  },
+
+  get concreteGuid() {
+    if (
+      !this.initialized ||
+      this._paneInfo.isTag ||
+      this._paneInfo.bulkTagging
+    ) {
+      return null;
+    }
+    return this._paneInfo.itemGuid;
+  },
+
+  get uri() {
+    if (!this.initialized) {
+      return null;
+    }
+    if (this._paneInfo.bulkTagging) {
+      return this._paneInfo.uris[0];
+    }
+    return this._paneInfo.uri;
+  },
+
+  get multiEdit() {
+    return this.initialized && this._paneInfo.bulkTagging;
+  },
+
+  get readOnly() {
+    return (
+      !this.initialized ||
+      this._paneInfo.isFolderShortcut ||
+      (!this._paneInfo.isItem && !this._paneInfo.isTag) ||
+      (this._paneInfo.isParentReadOnly &&
+        !this._paneInfo.isBookmark &&
+        !this._paneInfo.isTag)
+    );
+  },
+
+  get didChangeFolder() {
+    return this._didChangeFolder;
+  },
+
+  _firstEditedField: "",
+
+  _initNamePicker() {
+    if (this._paneInfo.bulkTagging && !this._paneInfo.addedMultipleBookmarks) {
+      throw new Error("_initNamePicker called unexpectedly");
+    }
+
+    this._initTextField(
+      this._namePicker,
+      this._paneInfo.title || this._paneInfo.tag || ""
+    );
+  },
+
+  _initLocationField() {
+    if (!this._paneInfo.isURI) {
+      throw new Error("_initLocationField called unexpectedly");
+    }
+    this._initTextField(this._locationField, this._paneInfo.uri.spec);
+  },
+
+  async _initKeywordField(newKeyword = "") {
+    if (!this._paneInfo.isBookmark) {
+      throw new Error("_initKeywordField called unexpectedly");
+    }
+
+    this._keyword = newKeyword;
+    this._initTextField(this._keywordField, newKeyword);
+
+    if (!newKeyword) {
+      let entries = [];
+      await PlacesUtils.keywords.fetch({ url: this._paneInfo.uri.spec }, e =>
+        entries.push(e)
+      );
+      if (entries.length) {
+        let existingKeyword = entries[0].keyword;
+        let postData = this._paneInfo.postData;
+        if (postData) {
+          let sameEntry = entries.find(e => e.postData === postData);
+          existingKeyword = sameEntry ? sameEntry.keyword : "";
+        }
+        if (existingKeyword) {
+          this._keyword = existingKeyword;
+          this._initTextField(this._keywordField, this._keyword);
+        }
+      }
+    }
+  },
+
+  async _initAllTags() {
+    this._allTags = new Map();
+    const fetchedTags = await PlacesUtils.bookmarks.fetchTags();
+    for (const tag of fetchedTags) {
+      this._allTags?.set(tag.name.toLowerCase(), tag.name);
+    }
+  },
+
+  async initPanel(aInfo) {
+    const deferred = (this._initPanelDeferred = Promise.withResolvers());
+    try {
+      if (typeof aInfo != "object" || aInfo === null) {
+        throw new Error("aInfo must be an object.");
+      }
+      if ("node" in aInfo) {
+        try {
+          aInfo.node.type;
+        } catch (e) {
+          return;
+        }
+      }
+
+      if (this.initialized) {
+        this.uninitPanel(false);
+      }
+
+      this._didChangeFolder = false;
+      this.transactionPromises = [];
+
+      let {
+        parentGuid,
+        isItem,
+        isURI,
+        isBookmark,
+        addedMultipleBookmarks,
+        bulkTagging,
+        uris,
+        visibleRows,
+        focusedElement,
+        onPanelReady,
+      } = this._setPaneInfo(aInfo);
+
+      let instance = (this._instance = {});
+
+      if (
+        aInfo.isNewBookmark &&
+        parentGuid == PlacesUtils.bookmarks.toolbarGuid
+      ) {
+        this._autoshowBookmarksToolbar();
+      }
+
+      if (!this._observersAdded) {
+        this.handlePlacesEvents = this.handlePlacesEvents.bind(this);
+        PlacesUtils.observers.addListener(
+          ["bookmark-title-changed"],
+          this.handlePlacesEvents
+        );
+        window.addEventListener("unload", this);
+
+        let panel = document.getElementById("editBookmarkPanelContent");
+        panel.addEventListener("change", this);
+        panel.addEventListener("command", this);
+
+        this._observersAdded = true;
+      }
+
+      let showOrCollapse = (
+        rowId,
+        isAppropriateForInput,
+        nameInHiddenRows = null
+      ) => {
+        let visible = isAppropriateForInput;
+        if (visible && "hiddenRows" in aInfo && nameInHiddenRows) {
+          visible &= !aInfo.hiddenRows.includes(nameInHiddenRows);
+        }
+        if (visible) {
+          visibleRows.add(rowId);
+        }
+        const cells = document.getElementsByClassName("editBMPanel_" + rowId);
+        for (const cell of cells) {
+          cell.hidden = !visible;
+        }
+        return visible;
+      };
+
+      if (
+        showOrCollapse(
+          "nameRow",
+          !bulkTagging || addedMultipleBookmarks,
+          "name"
+        )
+      ) {
+        this._initNamePicker();
+        this._namePicker.readOnly = this.readOnly;
+      }
+
+      showOrCollapse("locationRow", isURI, "location");
+      if (isURI) {
+        this._initLocationField();
+        this._locationField.readOnly = this.readOnly;
+      }
+
+      if (showOrCollapse("keywordRow", isBookmark, "keyword")) {
+        await this._initKeywordField().catch(console.error);
+        if (instance != this._instance || this._paneInfo == null) {
+          return;
+        }
+        this._keywordField.readOnly = this.readOnly;
+      }
+
+      if (showOrCollapse("tagsRow", isBookmark || bulkTagging, "tags")) {
+        this._initTagsField();
+      } else if (!this._element("tagsSelectorRow").hidden) {
+        this.toggleTagsSelector().catch(console.error);
+      }
+
+      if (showOrCollapse("folderRow", isItem, "folderPicker")) {
+        await this._initFolderMenuList(parentGuid).catch(console.error);
+        if (instance != this._instance || this._paneInfo == null) {
+          return;
+        }
+      }
+
+      if (showOrCollapse("selectionCount", bulkTagging)) {
+        document.l10n.setAttributes(
+          this._element("itemsCountText"),
+          "places-details-pane-items-count",
+          { count: uris.length }
+        );
+      }
+
+      let focusElement = () => {
+
+        let elt;
+        if (focusedElement === "preferred") {
+          elt = this._element(
+            Services.prefs.getCharPref(
+              "browser.bookmarks.editDialog.firstEditField"
+            )
+          );
+          if (elt.parentNode.hidden) {
+            focusedElement = "first";
+          }
+        }
+        if (focusedElement === "first") {
+          elt = document
+            .getElementById("editBookmarkPanelContent")
+            .querySelector('input:not([hidden="true"])');
+        }
+
+        if (elt) {
+          elt.focus({ preventScroll: true });
+          elt.select();
+        }
+      };
+
+      if (onPanelReady) {
+        onPanelReady(focusElement);
+      } else {
+        focusElement();
+      }
+
+      if (this._updateTagsDeferred) {
+        await this._updateTagsDeferred.promise;
+      }
+
+      this._bookmarkState = this.makeNewStateObject({
+        children: aInfo.node?.children,
+        index: aInfo.node?.index,
+        isFolder:
+          aInfo.node != null && PlacesUtils.nodeIsFolderOrShortcut(aInfo.node),
+      });
+      if (isBookmark || bulkTagging) {
+        await this._initAllTags();
+        await this._rebuildTagsSelectorList();
+      }
+    } finally {
+      deferred.resolve();
+      if (this._initPanelDeferred === deferred) {
+        this._initPanelDeferred = null;
+      }
+    }
+  },
+
+  _getCommonTags() {
+    if ("_cachedCommonTags" in this._paneInfo) {
+      return this._paneInfo._cachedCommonTags;
+    }
+
+    let uris = [...this._paneInfo.uris];
+    let firstURI = uris.shift();
+    let commonTags = new Set(PlacesUtils.tagging.getTagsForURI(firstURI));
+    if (commonTags.size == 0) {
+      return (this._cachedCommonTags = []);
+    }
+
+    for (let uri of uris) {
+      let curentURITags = PlacesUtils.tagging.getTagsForURI(uri);
+      for (let tag of commonTags) {
+        if (!curentURITags.includes(tag)) {
+          commonTags.delete(tag);
+          if (commonTags.size == 0) {
+            return (this._paneInfo.cachedCommonTags = []);
+          }
+        }
+      }
+    }
+    return (this._paneInfo._cachedCommonTags = [...commonTags]);
+  },
+
+  _initTextField(aElement, aValue) {
+    if (aElement.value != aValue) {
+      aElement.value = aValue;
+
+      aElement.editor?.clearUndoRedo();
+    }
+  },
+
+  _appendFolderItemToMenupopup(aMenupopup, aFolderGuid, aTitle) {
+    this._element("foldersSeparator").hidden = false;
+
+    var folderMenuItem = document.createXULElement("menuitem");
+    folderMenuItem.folderGuid = aFolderGuid;
+    folderMenuItem.setAttribute("label", aTitle);
+    folderMenuItem.className = "menuitem-iconic folder-icon";
+    aMenupopup.appendChild(folderMenuItem);
+    return folderMenuItem;
+  },
+
+  async _initFolderMenuList(aSelectedFolderGuid) {
+    var menupopup = this._folderMenuList.menupopup;
+    while (menupopup.children.length > STATIC_MENUITEM_COUNT) {
+      menupopup.removeChild(menupopup.lastElementChild);
+    }
+
+    let mobileItem = this._element("mobileRootItem");
+    mobileItem.hidden = true;
+
+    if (!this._staticFoldersListBuilt) {
+      mobileItem.label = PlacesUtils.getString("MobileBookmarksFolderTitle");
+      mobileItem.folderGuid = PlacesUtils.bookmarks.mobileGuid;
+      let unfiledItem = this._element("unfiledRootItem");
+      unfiledItem.label = PlacesUtils.getString("OtherBookmarksFolderTitle");
+      unfiledItem.folderGuid = PlacesUtils.bookmarks.unfiledGuid;
+      let bmMenuItem = this._element("bmRootItem");
+      bmMenuItem.label = PlacesUtils.getString("BookmarksMenuFolderTitle");
+      bmMenuItem.folderGuid = PlacesUtils.bookmarks.menuGuid;
+      let toolbarItem = this._element("toolbarFolderItem");
+      toolbarItem.label = PlacesUtils.getString("BookmarksToolbarFolderTitle");
+      toolbarItem.folderGuid = PlacesUtils.bookmarks.toolbarGuid;
+      this._staticFoldersListBuilt = true;
+    }
+
+    let lastUsedFolderGuids = await PlacesUtils.metadata.get(
+      PlacesUIUtils.LAST_USED_FOLDERS_META_KEY,
+      []
+    );
+
+    this._recentFolders = [];
+    for (let guid of lastUsedFolderGuids) {
+      let bm = await PlacesUtils.bookmarks.fetch(guid);
+      if (bm) {
+        let title = PlacesUtils.bookmarks.getLocalizedTitle(bm);
+        this._recentFolders.push({ guid, title });
+      }
+    }
+
+    var numberOfItems = Math.min(
+      PlacesUIUtils.maxRecentFolders,
+      this._recentFolders.length
+    );
+    for (let i = 0; i < numberOfItems; i++) {
+      await this._appendFolderItemToMenupopup(
+        menupopup,
+        this._recentFolders[i].guid,
+        this._recentFolders[i].title
+      );
+    }
+
+    let title = (await PlacesUtils.bookmarks.fetch(aSelectedFolderGuid)).title;
+    var defaultItem = this._getFolderMenuItem(aSelectedFolderGuid, title);
+    this._folderMenuList.selectedItem = defaultItem;
+    this._onFolderListSelected();
+
+    this._folderMenuList.addEventListener("select", this);
+    this._folderMenuList.addEventListener("command", this);
+    this._folderMenuListListenerAdded = true;
+
+    this._element("foldersSeparator").hidden =
+      menupopup.children.length <= STATIC_MENUITEM_COUNT;
+    this._folderMenuList.disabled = this.readOnly;
+  },
+
+  _onFolderListSelected() {
+    let folderGuid = this.selectedFolderGuid;
+    if (folderGuid) {
+      this._folderMenuList.setAttribute("selectedGuid", folderGuid);
+    } else {
+      this._folderMenuList.removeAttribute("selectedGuid");
+    }
+  },
+
+  _element(aID) {
+    return document.getElementById("editBMPanel_" + aID);
+  },
+
+  uninitPanel(aHideCollapsibleElements) {
+    if (aHideCollapsibleElements) {
+      var folderTreeRow = this._element("folderTreeRow");
+      if (!folderTreeRow.hidden) {
+        this.toggleFolderTreeVisibility();
+      }
+
+      var tagsSelectorRow = this._element("tagsSelectorRow");
+      if (!tagsSelectorRow.hidden) {
+        this.toggleTagsSelector().catch(console.error);
+      }
+    }
+
+    if (this._observersAdded) {
+      PlacesUtils.observers.removeListener(
+        ["bookmark-title-changed"],
+        this.handlePlacesEvents
+      );
+      window.removeEventListener("unload", this);
+      let panel = document.getElementById("editBookmarkPanelContent");
+      panel.removeEventListener("change", this);
+      panel.removeEventListener("command", this);
+      this._observersAdded = false;
+    }
+
+    if (this._folderMenuListListenerAdded) {
+      this._folderMenuList.removeEventListener("select", this);
+      this._folderMenuList.removeEventListener("command", this);
+      this._folderMenuListListenerAdded = false;
+    }
+
+    this._setPaneInfo(null);
+    this._firstEditedField = "";
+    this._didChangeFolder = false;
+    this.transactionPromises = [];
+    this._bookmarkState = null;
+    this._allTags = null;
+  },
+
+  get selectedFolderGuid() {
+    return (
+      this._folderMenuList.selectedItem &&
+      this._folderMenuList.selectedItem.folderGuid
+    );
+  },
+
+  makeNewStateObject(extraOptions) {
+    if (
+      this._paneInfo.isItem ||
+      this._paneInfo.isTag ||
+      this._paneInfo.bulkTagging
+    ) {
+      const isLibraryWindow =
+        document.documentElement.getAttribute("windowtype") ===
+        "Places:Organizer";
+      const options = {
+        autosave: isLibraryWindow,
+        info: this._paneInfo,
+        ...extraOptions,
+      };
+
+      if (this._paneInfo.isBookmark) {
+        options.tags = this._element("tagsField").value;
+        options.keyword = this._keyword;
+      }
+
+      if (this._paneInfo.bulkTagging) {
+        options.tags = this._element("tagsField").value;
+      }
+
+      return new PlacesUIUtils.BookmarkState(options);
+    }
+    return null;
+  },
+
+  async onTagsFieldChange() {
+    if (
+      this._paneInfo &&
+      (this._paneInfo.isURI || this._paneInfo.bulkTagging)
+    ) {
+      if (this._initPanelDeferred) {
+        await this._initPanelDeferred.promise;
+      }
+      this._updateTags().then(() => {
+        if (this._paneInfo) {
+          this._mayUpdateFirstEditField("tagsField");
+        }
+      }, console.error);
+    }
+  },
+
+  async _updateTags() {
+    const deferred = (this._updateTagsDeferred = Promise.withResolvers());
+    try {
+      const inputTags = this._getTagsArrayFromTagsInputField();
+      const isLibraryWindow =
+        document.documentElement.getAttribute("windowtype") ===
+        "Places:Organizer";
+      await this._bookmarkState._tagsChanged(inputTags);
+
+      if (isLibraryWindow) {
+        delete this._paneInfo._cachedCommonTags;
+        const currentTags = this._paneInfo.bulkTagging
+          ? this._getCommonTags()
+          : PlacesUtils.tagging.getTagsForURI(this._paneInfo.uri);
+        this._initTextField(this._tagsField, currentTags.join(", "), false);
+        await this._initAllTags();
+      } else {
+        inputTags.forEach(tag => this._allTags?.set(tag.toLowerCase(), tag));
+      }
+      await this._rebuildTagsSelectorList();
+    } finally {
+      deferred.resolve();
+      if (this._updateTagsDeferred === deferred) {
+        this._updateTagsDeferred = null;
+      }
+    }
+  },
+
+  _mayUpdateFirstEditField(aNewField) {
+    if (this._paneInfo.bulkTagging || this._firstEditedField) {
+      return;
+    }
+
+    this._firstEditedField = aNewField;
+
+    Services.prefs.setCharPref(
+      "browser.bookmarks.editDialog.firstEditField",
+      aNewField
+    );
+  },
+
+  async onNamePickerChange() {
+    if (this.readOnly || !(this._paneInfo.isItem || this._paneInfo.isTag)) {
+      return;
+    }
+    if (this._initPanelDeferred) {
+      await this._initPanelDeferred.promise;
+    }
+
+    if (this._paneInfo.isTag) {
+      let tag = this._namePicker.value;
+      if (!tag || tag.includes("&")) {
+        this._initNamePicker();
+        return;
+      }
+
+      this._bookmarkState._titleChanged(tag);
+      return;
+    }
+    this._mayUpdateFirstEditField("namePicker");
+    this._bookmarkState._titleChanged(this._namePicker.value);
+  },
+
+  async onLocationFieldChange() {
+    if (this.readOnly || !this._paneInfo.isBookmark) {
+      return;
+    }
+    if (this._initPanelDeferred) {
+      await this._initPanelDeferred.promise;
+    }
+
+    let newURI;
+    try {
+      newURI = Services.uriFixup.getFixupURIInfo(
+        this._locationField.value
+      ).preferredURI;
+    } catch (ex) {
+      return;
+    }
+
+    if (this._paneInfo.uri.equals(newURI)) {
+      return;
+    }
+    this._bookmarkState._locationChanged(newURI.spec);
+  },
+
+  async onKeywordFieldChange() {
+    if (this.readOnly || !this._paneInfo.isBookmark) {
+      return;
+    }
+    if (this._initPanelDeferred) {
+      await this._initPanelDeferred.promise;
+    }
+    this._bookmarkState._keywordChanged(this._keywordField.value);
+  },
+
+  toggleFolderTreeVisibility() {
+    let expander = this._element("foldersExpander");
+    let folderTreeRow = this._element("folderTreeRow");
+    let wasHidden = folderTreeRow.hidden;
+    expander.classList.toggle("expander-up", wasHidden);
+    expander.classList.toggle("expander-down", !wasHidden);
+    if (!wasHidden) {
+      document.l10n.setAttributes(
+        expander,
+        "bookmark-overlay-folders-expander2"
+      );
+      folderTreeRow.hidden = true;
+      this._element("chooseFolderSeparator").hidden = this._element(
+        "chooseFolderMenuItem"
+      ).hidden = false;
+      this._folderTree.stopEditing(false);
+      this._folderTree.view = null;
+    } else {
+      document.l10n.setAttributes(
+        expander,
+        "bookmark-overlay-folders-expander-hide"
+      );
+      folderTreeRow.hidden = false;
+
+      const FOLDER_TREE_PLACE_URI =
+        "place:excludeItems=1&excludeQueries=1&type=" +
+        Ci.nsINavHistoryQueryOptions.RESULTS_AS_ROOTS_QUERY;
+      this._folderTree.place = FOLDER_TREE_PLACE_URI;
+
+      this._element("chooseFolderSeparator").hidden = this._element(
+        "chooseFolderMenuItem"
+      ).hidden = true;
+      this._folderTree.selectItems([this._bookmarkState.parentGuid]);
+      this._folderTree.focus();
+    }
+  },
+
+  _getFolderMenuItem(aFolderGuid, aTitle) {
+    let menupopup = this._folderMenuList.menupopup;
+    let menuItem = Array.prototype.find.call(
+      menupopup.children,
+      item => item.folderGuid === aFolderGuid
+    );
+    if (menuItem !== undefined) {
+      menuItem.hidden = false;
+      return menuItem;
+    }
+
+    if (
+      menupopup.children.length ==
+      STATIC_MENUITEM_COUNT + PlacesUIUtils.maxRecentFolders
+    ) {
+      menupopup.removeChild(menupopup.lastElementChild);
+    }
+
+    return this._appendFolderItemToMenupopup(menupopup, aFolderGuid, aTitle);
+  },
+
+  async onFolderMenuListCommand(aEvent) {
+    if (!this._paneInfo) {
+      return;
+    }
+
+    if (aEvent.target.id == "editBMPanel_chooseFolderMenuItem") {
+      let item = this._getFolderMenuItem(
+        this._bookmarkState._originalState.parentGuid,
+        this._bookmarkState._originalState.title
+      );
+      this._folderMenuList.selectedItem = item;
+      const menupopup = this._folderMenuList.menupopup;
+      if (menupopup.state == "hiding" || menupopup.isNativeMenu) {
+        if (menupopup.state == "closed") {
+          this.toggleFolderTreeVisibility();
+        } else {
+          menupopup.addEventListener(
+            "popuphidden",
+            () => this.toggleFolderTreeVisibility(),
+            { once: true }
+          );
+        }
+      }
+      return;
+    }
+
+    let containerGuid = this._folderMenuList.selectedItem.folderGuid;
+    if (this._bookmarkState.parentGuid != containerGuid) {
+      this._bookmarkState._parentGuidChanged(containerGuid);
+
+      if (containerGuid == PlacesUtils.bookmarks.toolbarGuid) {
+        this._autoshowBookmarksToolbar();
+      }
+
+      this._didChangeFolder = true;
+    }
+
+    var folderTreeRow = this._element("folderTreeRow");
+    if (!folderTreeRow.hidden) {
+      var selectedNode = this._folderTree.selectedNode;
+      if (
+        !selectedNode ||
+        PlacesUtils.getConcreteItemGuid(selectedNode) != containerGuid
+      ) {
+        this._folderTree.selectItems([containerGuid]);
+      }
+    }
+  },
+
+  _autoshowBookmarksToolbar() {
+    let neverShowToolbar =
+      Services.prefs.getCharPref(
+        "browser.toolbars.bookmarks.visibility",
+        "newtab"
+      ) == "never";
+    let toolbar = document.getElementById("PersonalToolbar");
+    if (!toolbar.collapsed || neverShowToolbar) {
+      return;
+    }
+
+    let placement = CustomizableUI.getPlacementOfWidget("personal-bookmarks");
+    let area = placement && placement.area;
+    if (area != CustomizableUI.AREA_BOOKMARKS) {
+      return;
+    }
+
+    setToolbarVisibility(toolbar, true, false);
+  },
+
+  onFolderTreeSelect() {
+    if (this._element("folderTreeRow").hidden) {
+      return;
+    }
+
+    var selectedNode = this._folderTree.selectedNode;
+
+    this._element("newFolderButton").disabled =
+      !this._folderTree.insertionPoint || !selectedNode;
+
+    if (!selectedNode) {
+      return;
+    }
+
+    var folderGuid = PlacesUtils.getConcreteItemGuid(selectedNode);
+    if (this._folderMenuList.selectedItem.folderGuid == folderGuid) {
+      return;
+    }
+
+    var folderItem = this._getFolderMenuItem(folderGuid, selectedNode.title);
+    this._folderMenuList.selectedItem = folderItem;
+    folderItem.doCommand();
+  },
+
+  async _rebuildTagsSelectorList() {
+    let tagsSelector = this._element("tagsSelector");
+    let tagsSelectorRow = this._element("tagsSelectorRow");
+    if (tagsSelectorRow.hidden) {
+      return;
+    }
+
+    let selectedIndex = tagsSelector.selectedIndex;
+    let selectedTag =
+      selectedIndex >= 0 ? tagsSelector.selectedItem.label : null;
+
+    while (tagsSelector.hasChildNodes()) {
+      tagsSelector.removeChild(tagsSelector.lastElementChild);
+    }
+
+    let tagsInField = this._getTagsArrayFromTagsInputField();
+
+    let fragment = document.createDocumentFragment();
+    let sortedTags = this._allTags ? [...this._allTags.values()].sort() : [];
+
+    for (let i = 0; i < sortedTags.length; i++) {
+      let tag = sortedTags[i];
+      let elt = document.createXULElement("richlistitem");
+      elt.appendChild(document.createXULElement("image"));
+      let label = document.createXULElement("label");
+      label.setAttribute("value", tag);
+      elt.appendChild(label);
+      if (tagsInField.includes(tag)) {
+        elt.setAttribute("checked", "true");
+      }
+      fragment.appendChild(elt);
+      if (selectedTag === tag) {
+        selectedIndex = i;
+      }
+    }
+    tagsSelector.appendChild(fragment);
+
+    if (selectedIndex >= 0 && tagsSelector.itemCount > 0) {
+      selectedIndex = Math.min(selectedIndex, tagsSelector.itemCount - 1);
+      tagsSelector.selectedIndex = selectedIndex;
+      tagsSelector.ensureIndexIsVisible(selectedIndex);
+    }
+    let event = new CustomEvent("BookmarkTagsSelectorUpdated", {
+      bubbles: true,
+    });
+    tagsSelector.dispatchEvent(event);
+  },
+
+  async toggleTagsSelector() {
+    var tagsSelector = this._element("tagsSelector");
+    var tagsSelectorRow = this._element("tagsSelectorRow");
+    var expander = this._element("tagsSelectorExpander");
+    expander.classList.toggle("expander-up", tagsSelectorRow.hidden);
+    expander.classList.toggle("expander-down", !tagsSelectorRow.hidden);
+    if (tagsSelectorRow.hidden) {
+      document.l10n.setAttributes(
+        expander,
+        "bookmark-overlay-tags-expander-hide"
+      );
+      tagsSelectorRow.hidden = false;
+      await this._rebuildTagsSelectorList();
+
+      tagsSelector.addEventListener("command", this);
+    } else {
+      document.l10n.setAttributes(expander, "bookmark-overlay-tags-expander2");
+      tagsSelectorRow.hidden = true;
+
+      tagsSelector.removeEventListener("command", this);
+    }
+  },
+
+  _getTagsArrayFromTagsInputField() {
+    let tags = this._element("tagsField").value;
+    return tags
+      .trim()
+      .split(/\s*,\s*/) 
+      .filter(tag => !!tag.length); 
+  },
+
+  async newFolder() {
+    let ip = this._folderTree.insertionPoint;
+
+    if (!ip) {
+      ip = new PlacesInsertionPoint({
+        parentGuid: PlacesUtils.bookmarks.menuGuid,
+      });
+    }
+
+    let title = this._element("newFolderButton").label;
+    let promise = PlacesTransactions.NewFolder({
+      parentGuid: ip.guid,
+      title,
+      index: await ip.getIndex(),
+    }).transact();
+    this.transactionPromises.push(promise.catch(console.error));
+    let guid = await promise;
+
+    this._folderTree.focus();
+    this._folderTree.selectItems([ip.guid]);
+    PlacesUtils.asContainer(this._folderTree.selectedNode).containerOpen = true;
+    this._folderTree.selectItems([guid]);
+    this._folderTree.startEditing(
+      this._folderTree.view.selection.currentIndex,
+      this._folderTree.columns.getFirstColumn()
+    );
+  },
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "unload":
+        this.uninitPanel(false);
+        break;
+      case "select":
+        this._onFolderListSelected();
+        break;
+      case "change":
+        switch (event.target.id) {
+          case "editBMPanel_namePicker":
+            this.onNamePickerChange().catch(console.error);
+            break;
+
+          case "editBMPanel_locationField":
+            this.onLocationFieldChange();
+            break;
+
+          case "editBMPanel_tagsField":
+            this.onTagsFieldChange();
+            break;
+
+          case "editBMPanel_keywordField":
+            this.onKeywordFieldChange();
+            break;
+        }
+        break;
+      case "command":
+        switch (event.currentTarget.id) {
+          case "editBMPanel_folderMenuList":
+            this.onFolderMenuListCommand(event).catch(console.error);
+            return;
+          case "editBMPanel_tagsSelector":
+            this.toggleTagsSelectorItem(event.target);
+            return;
+        }
+        switch (event.target.id) {
+          case "editBMPanel_foldersExpander":
+            this.toggleFolderTreeVisibility();
+            break;
+          case "editBMPanel_newFolderButton":
+            this.newFolder().catch(console.error);
+            break;
+          case "editBMPanel_tagsSelectorExpander":
+            this.toggleTagsSelector().catch(console.error);
+            break;
+        }
+        break;
+    }
+  },
+
+  async handlePlacesEvents(events) {
+    for (const event of events) {
+      switch (event.type) {
+        case "bookmark-title-changed":
+          if (this._paneInfo.isItem || this._paneInfo.isTag) {
+            this._onItemTitleChange(event.id, event.title, event.guid);
+          }
+          break;
+      }
+    }
+  },
+
+  toggleTagsSelectorItem(item) {
+    let tags = this._getTagsArrayFromTagsInputField();
+    let curTagIndex = tags.indexOf(item.label);
+    if (item.toggleAttribute("checked")) {
+      if (curTagIndex == -1) {
+        tags.push(item.label);
+      }
+    } else if (curTagIndex != -1) {
+      tags.splice(curTagIndex, 1);
+    }
+    this._element("tagsField").value = tags.join(", ");
+    this._updateTags();
+  },
+
+  _initTagsField() {
+    let tags;
+    if (this._paneInfo.isURI) {
+      tags = PlacesUtils.tagging.getTagsForURI(this._paneInfo.uri);
+    } else if (this._paneInfo.bulkTagging) {
+      tags = this._getCommonTags();
+    } else {
+      throw new Error("_promiseTagsStr called unexpectedly");
+    }
+
+    this._initTextField(this._tagsField, tags.join(", "));
+  },
+
+  _onItemTitleChange(aItemId, aNewTitle, aGuid) {
+    if (this._paneInfo.visibleRows.has("folderRow")) {
+      let menupopup = this._folderMenuList.menupopup;
+      for (let menuitem of menupopup.children) {
+        if ("folderGuid" in menuitem && menuitem.folderGuid == aGuid) {
+          menuitem.label = aNewTitle;
+          break;
+        }
+      }
+    }
+    if (this._recentFolders) {
+      for (let folder of this._recentFolders) {
+        if (folder.folderGuid == aGuid) {
+          folder.title = aNewTitle;
+          break;
+        }
+      }
+    }
+  },
+
+  get bookmarkState() {
+    return this._bookmarkState;
+  },
+};
+
+ChromeUtils.defineLazyGetter(gEditItemOverlay, "_folderTree", () => {
+  if (!customElements.get("places-tree")) {
+    Services.scriptloader.loadSubScript(
+      "chrome://browser/content/places/places-tree.js",
+      window
+    );
+  }
+  gEditItemOverlay._element("folderTreeRow").prepend(
+    MozXULElement.parseXULToFragment(`
+    <tree id="editBMPanel_folderTree"
+          class="placesTree"
+          is="places-tree"
+          data-l10n-id="bookmark-overlay-folders-tree"
+          editable="true"
+          disableUserActions="true"
+          hidecolumnpicker="true">
+      <treecols>
+        <treecol anonid="title" flex="1" primary="true" hideheader="true"/>
+      </treecols>
+      <treechildren flex="1"/>
+    </tree>
+  `)
+  );
+  const folderTree = gEditItemOverlay._element("folderTree");
+  folderTree.addEventListener("select", () =>
+    gEditItemOverlay.onFolderTreeSelect()
+  );
+  return folderTree;
+});
+
+for (let elt of [
+  "folderMenuList",
+  "namePicker",
+  "locationField",
+  "keywordField",
+  "tagsField",
+]) {
+  let eltScoped = elt;
+  ChromeUtils.defineLazyGetter(gEditItemOverlay, `_${eltScoped}`, () =>
+    gEditItemOverlay._element(eltScoped)
+  );
+}

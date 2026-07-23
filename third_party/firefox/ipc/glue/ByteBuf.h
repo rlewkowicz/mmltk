@@ -1,0 +1,76 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_ipc_ByteBuf_h
+#define mozilla_ipc_ByteBuf_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Span.h"
+#include <string.h>
+
+namespace IPC {
+template <typename T>
+struct ParamTraits;
+}
+
+namespace mozilla {
+
+namespace ipc {
+
+class ByteBuf final {
+  friend struct IPC::ParamTraits<mozilla::ipc::ByteBuf>;
+
+ public:
+  bool Allocate(size_t aLength) {
+    MOZ_ASSERT(mData == nullptr);
+    mData = (uint8_t*)malloc(aLength);
+    if (!mData) {
+      return false;
+    }
+    mLen = aLength;
+    mCapacity = aLength;
+    return true;
+  }
+
+  ByteBuf() : mData(nullptr), mLen(0), mCapacity(0) {}
+
+  ByteBuf(uint8_t* aData, size_t aLen, size_t aCapacity)
+      : mData(aData), mLen(aLen), mCapacity(aCapacity) {}
+
+  ByteBuf(const ByteBuf& aFrom) = delete;
+
+  ByteBuf(ByteBuf&& aFrom)
+      : mData(aFrom.mData), mLen(aFrom.mLen), mCapacity(aFrom.mCapacity) {
+    aFrom.mData = nullptr;
+    aFrom.mLen = 0;
+    aFrom.mCapacity = 0;
+  }
+
+  ByteBuf& operator=(ByteBuf&& aFrom) {
+    std::swap(mData, aFrom.mData);
+    std::swap(mLen, aFrom.mLen);
+    std::swap(mCapacity, aFrom.mCapacity);
+    return *this;
+  }
+
+  ~ByteBuf() { free(mData); }
+
+  uint8_t* mData;
+  size_t mLen;
+  size_t mCapacity;
+};
+
+inline ByteBuf ByteBufFrom(mozilla::Span<const uint8_t> aData) {
+  ByteBuf buf;
+  if (!aData.IsEmpty() && buf.Allocate(aData.Length())) {
+    memcpy(buf.mData, aData.data(), aData.Length());
+  }
+  return buf;
+}
+
+}  
+}  
+
+#endif  // ifndef mozilla_ipc_ByteBuf_h

@@ -1,0 +1,90 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef intl_components_Calendar_h_
+#define intl_components_Calendar_h_
+
+#include "mozilla/Assertions.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/intl/ICU4CGlue.h"
+#include "mozilla/intl/ICUError.h"
+#include "mozilla/intl/Locale.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Result.h"
+#include "mozilla/Span.h"
+#include "mozilla/UniquePtr.h"
+
+using UCalendar = void*;
+
+namespace mozilla::intl {
+
+enum class Weekday : uint8_t {
+  Monday = 1,
+  Tuesday,
+  Wednesday,
+  Thursday,
+  Friday,
+  Saturday,
+  Sunday,
+};
+
+class Calendar final {
+ public:
+  explicit Calendar(UCalendar* aCalendar) : mCalendar(aCalendar) {
+    MOZ_ASSERT(aCalendar);
+  };
+
+  Calendar(const Calendar&) = delete;
+  Calendar& operator=(const Calendar&) = delete;
+
+  static Result<UniquePtr<Calendar>, ICUError> TryCreate(
+      const char* aLocale,
+      Maybe<Span<const char16_t>> aTimeZoneOverride = Nothing{});
+
+  static Result<UniquePtr<Calendar>, ICUError> TryCreate(
+      const RegionSubtag& aRegion);
+
+  Result<Span<const char>, ICUError> GetBcp47Type();
+
+  Result<EnumSet<Weekday>, ICUError> GetWeekend();
+
+  Weekday GetFirstDayOfWeek();
+
+  int32_t GetMinimalDaysInFirstWeek();
+
+  Result<Ok, ICUError> SetTimeInMs(double aUnixEpoch);
+
+ private:
+  static SpanResult<char> LegacyIdentifierToBcp47(const char* aIdentifier,
+                                                  int32_t aLength);
+
+ public:
+  enum class CommonlyUsed : bool {
+    No,
+
+    Yes,
+  };
+
+  using Bcp47IdentifierEnumeration =
+      Enumeration<char, SpanResult<char>, Calendar::LegacyIdentifierToBcp47>;
+
+  static Result<Bcp47IdentifierEnumeration, ICUError>
+  GetBcp47KeywordValuesForLocale(const char* aLocale,
+                                 CommonlyUsed aCommonlyUsed = CommonlyUsed::No);
+
+  static Result<Bcp47IdentifierEnumeration, ICUError>
+  GetBcp47KeywordValuesForRegion(const RegionSubtag& aRegion,
+                                 CommonlyUsed aCommonlyUsed = CommonlyUsed::No);
+
+  ~Calendar();
+
+ private:
+  friend class DateIntervalFormat;
+  UCalendar* GetUCalendar() const { return mCalendar; }
+
+  UCalendar* mCalendar = nullptr;
+};
+
+}  
+
+#endif

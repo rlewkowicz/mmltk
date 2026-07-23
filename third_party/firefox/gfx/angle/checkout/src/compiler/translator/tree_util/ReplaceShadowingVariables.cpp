@@ -1,0 +1,121 @@
+// Copyright 2019 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "compiler/translator/tree_util/ReplaceShadowingVariables.h"
+#include "compiler/translator/tree_util/ReplaceVariable.h"
+
+#include "compiler/translator/Compiler.h"
+#include "compiler/translator/IntermNode.h"
+#include "compiler/translator/Symbol.h"
+#include "compiler/translator/SymbolTable.h"
+#include "compiler/translator/tree_util/IntermNode_util.h"
+#include "compiler/translator/tree_util/IntermTraverse.h"
+
+#include <unordered_set>
+
+namespace sh
+{
+
+namespace
+{
+
+struct DeferredReplacementBlock
+{
+    const TVariable *originalVariable;  
+    TVariable *replacementVariable;     
+    TIntermBlock *functionBody;         
+};
+
+class ReplaceShadowingVariablesTraverser : public TIntermTraverser
+{
+  public:
+    ReplaceShadowingVariablesTraverser(TSymbolTable *symbolTable)
+        : TIntermTraverser(true, true, true, symbolTable), mParameterNames{}, mFunctionBody(nullptr)
+    {}
+
+    bool visitFunctionDefinition(Visit visit, TIntermFunctionDefinition *node) override
+    {
+        if (visit == PreVisit)
+        {
+            ASSERT(mParameterNames.size() == 0);
+            const TFunction *func = node->getFunctionPrototype()->getFunction();
+            size_t paramCount = func->getParamCount();
+            for (size_t i = 0; i < paramCount; ++i)
+            {
+                mParameterNames.emplace(std::string(func->getParam(i)->name().data()));
+            }
+            if (mParameterNames.size() > 0)
+                mFunctionBody = node->getBody();
+        }
+        else if (visit == PostVisit)
+        {
+            mParameterNames.clear();
+            mFunctionBody = nullptr;
+        }
+        return true;
+    }
+    bool visitDeclaration(Visit visit, TIntermDeclaration *node) override
+    {
+        if (visit == PreVisit && mParameterNames.size() != 0)
+        {
+            TIntermSequence *decls = node->getSequence();
+            for (auto &declVector : *decls)
+            {
+                TIntermSymbol *symNode = declVector->getAsSymbolNode();
+                if (symNode == nullptr)
+                {
+                    TIntermBinary *binaryNode = declVector->getAsBinaryNode();
+                    ASSERT(binaryNode->getOp() == EOpInitialize);
+                    symNode = binaryNode->getLeft()->getAsSymbolNode();
+                }
+                ASSERT(symNode != nullptr);
+                std::string varName = std::string(symNode->variable().name().data());
+                if (mParameterNames.count(varName) > 0)
+                {
+                    mReplacements.emplace_back(DeferredReplacementBlock{
+                        &symNode->variable(),
+                        CreateTempVariable(mSymbolTable, &symNode->variable().getType(),
+                                           EvqTemporary),
+                        mFunctionBody});
+                }
+            }
+        }
+        return true;
+    }
+    [[nodiscard]] bool executeReplacements(TCompiler *compiler)
+    {
+        for (DeferredReplacementBlock &replace : mReplacements)
+        {
+            if (!ReplaceVariable(compiler, replace.functionBody, replace.originalVariable,
+                                 replace.replacementVariable))
+            {
+                return false;
+            }
+        }
+        mReplacements.clear();
+        return true;
+    }
+
+  private:
+    std::unordered_set<std::string> mParameterNames;
+    TIntermBlock *mFunctionBody;
+    std::vector<DeferredReplacementBlock> mReplacements;
+};
+
+}  
+
+[[nodiscard]] bool ReplaceShadowingVariables(TCompiler *compiler,
+                                             TIntermBlock *root,
+                                             TSymbolTable *symbolTable)
+{
+    ReplaceShadowingVariablesTraverser traverser(symbolTable);
+    root->traverse(&traverser);
+    if (!traverser.executeReplacements(compiler))
+    {
+        return false;
+    }
+    return traverser.updateTree(compiler, root);
+}
+
+}  

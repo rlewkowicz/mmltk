@@ -1,0 +1,59 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsNameSpaceManager_h_
+#define nsNameSpaceManager_h_
+
+#include "mozilla/StaticPtr.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "nsTHashMap.h"
+
+
+class nsNameSpaceManager final {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(nsNameSpaceManager)
+
+  nsresult RegisterNameSpace(const nsAString& aURI, int32_t& aNameSpaceID);
+  nsresult RegisterNameSpace(already_AddRefed<nsAtom> aURI,
+                             int32_t& aNameSpaceID);
+
+  nsresult GetNameSpaceURI(int32_t aNameSpaceID, nsAString& aURI);
+
+  nsAtom* NameSpaceURIAtom(int32_t aNameSpaceID) {
+    MOZ_ASSERT(aNameSpaceID > 0);
+    MOZ_ASSERT((int64_t)aNameSpaceID < (int64_t)mURIArray.Length());
+    return mURIArray.ElementAt(aNameSpaceID);
+  }
+
+  int32_t GetNameSpaceID(const nsAString& aURI, bool aInChromeDoc);
+  int32_t GetNameSpaceID(nsAtom* aURI, bool aInChromeDoc);
+
+  static const char* GetNameSpaceDisplayName(uint32_t aNameSpaceID);
+
+  bool HasElementCreator(int32_t aNameSpaceID);
+
+  static nsNameSpaceManager* GetInstance();
+  bool mMathMLDisabled;
+  bool mSVGDisabled;
+
+ private:
+  static void PrefChanged(const char* aPref, void* aSelf);
+  void PrefChanged(const char* aPref);
+
+  bool Init();
+  nsresult AddNameSpace(already_AddRefed<nsAtom> aURI,
+                        const int32_t aNameSpaceID);
+  nsresult AddDisabledNameSpace(already_AddRefed<nsAtom> aURI,
+                                const int32_t aNameSpaceID);
+  ~nsNameSpaceManager() = default;
+
+  nsTHashMap<RefPtr<nsAtom>, int32_t> mURIToIDTable;
+  nsTHashMap<RefPtr<nsAtom>, int32_t> mDisabledURIToIDTable;
+  nsTArray<RefPtr<nsAtom>> mURIArray;
+
+  static mozilla::StaticRefPtr<nsNameSpaceManager> sInstance;
+};
+
+#endif  // nsNameSpaceManager_h_

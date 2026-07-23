@@ -1,0 +1,63 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkRTree_DEFINED)
+#define SkRTree_DEFINED
+
+#include "include/core/SkBBHFactory.h"
+#include "include/core/SkRect.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+class SkRTree : public SkBBoxHierarchy {
+public:
+    SkRTree();
+
+    void insert(const SkRect[], int N) override;
+    void search(const SkRect& query, std::vector<int>* results) const override;
+    size_t bytesUsed() const override;
+
+
+    int getDepth() const { return fCount ? fRoot.fSubtree->fLevel + 1 : 0; }
+    int getCount() const { return fCount; }
+
+    static const int kMinChildren = 6,
+                     kMaxChildren = 11;
+
+private:
+    struct Node;
+
+    struct Branch {
+        union {
+            Node* fSubtree;
+            int fOpIndex;
+        };
+        SkRect fBounds;
+    };
+
+    struct Node {
+        uint16_t fNumChildren;
+        uint16_t fLevel;
+        Branch fChildren[kMaxChildren];
+    };
+
+    void search(Node* root, const SkRect& query, std::vector<int>* results) const;
+
+    Branch bulkLoad(std::vector<Branch>* branches, int level = 0);
+
+    static int CountNodes(int branches);
+
+    Node* allocateNodeAtLevel(uint16_t level);
+
+    int fCount;
+    Branch fRoot;
+    std::vector<Node> fNodes;
+};
+
+#endif

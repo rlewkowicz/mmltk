@@ -1,0 +1,155 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsHTMLDocument_h_
+#define nsHTMLDocument_h_
+
+#include "PLDHashTable.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/HTMLSharedElement.h"
+#include "nsIScriptElement.h"
+#include "nsTArray.h"
+#include "nsThreadUtils.h"
+
+class nsCommandManager;
+class nsIURI;
+class nsIDocShell;
+class nsICachingChannel;
+class nsILoadGroup;
+
+namespace mozilla::dom {
+template <typename T>
+struct Nullable;
+class WindowProxyHolder;
+}  
+
+class nsHTMLDocument : public mozilla::dom::Document {
+ protected:
+  using ReferrerPolicy = mozilla::dom::ReferrerPolicy;
+  using Document = mozilla::dom::Document;
+  using Encoding = mozilla::Encoding;
+  template <typename T>
+  using NotNull = mozilla::NotNull<T>;
+
+ public:
+  using Document::SetDocumentURI;
+
+  explicit nsHTMLDocument(mozilla::dom::LoadedAsData aLoadedAsData);
+  virtual nsresult Init(nsIPrincipal* aPrincipal,
+                        nsIPrincipal* aPartitionedPrincipal) override;
+
+  virtual void Reset(nsIChannel* aChannel, nsILoadGroup* aLoadGroup) override;
+  virtual void ResetToURI(nsIURI* aURI, nsILoadGroup* aLoadGroup,
+                          nsIPrincipal* aPrincipal,
+                          nsIPrincipal* aPartitionedPrincipal) override;
+
+  virtual nsresult StartDocumentLoad(const char* aCommand, nsIChannel* aChannel,
+                                     nsILoadGroup* aLoadGroup,
+                                     nsISupports* aContainer,
+                                     nsIStreamListener** aDocListener,
+                                     bool aReset = true) override;
+
+ protected:
+  virtual bool UseWidthDeviceWidthFallbackViewport() const override;
+
+ public:
+  mozilla::dom::Element* GetUnfocusedKeyEventTarget() override;
+
+  mozilla::dom::ContentList* GetExistingForms() const { return mForms; }
+
+  bool IsPlainText() const { return mIsPlainText; }
+
+  bool IsViewSource() const { return mViewSource; }
+
+  bool ResolveNameForWindow(JSContext* aCx, const nsAString& aName,
+                            JS::MutableHandle<JS::Value> aRetVal,
+                            mozilla::ErrorResult& aError);
+
+  void GetSupportedNamesForWindow(nsTArray<nsString>& aNames);
+
+  void AddedForm();
+  void RemovedForm();
+  int32_t GetNumFormsSynchronous() const;
+  void SetIsXHTML(bool aXHTML) { mType = (aXHTML ? eXHTML : eHTML); }
+
+  virtual nsresult Clone(mozilla::dom::NodeInfo*,
+                         nsINode** aResult) const override;
+
+  using mozilla::dom::DocumentOrShadowRoot::GetElementById;
+
+  virtual void DocAddSizeOfExcludingThis(
+      nsWindowSizes& aWindowSizes) const override;
+
+  bool IsAsciiCompatible(const mozilla::Encoding* aEncoding);
+
+  virtual bool WillIgnoreCharsetOverride() override;
+
+  virtual JSObject* WrapNode(JSContext* aCx,
+                             JS::Handle<JSObject*> aGivenProto) override;
+  bool IsRegistrableDomainSuffixOfOrEqualTo(const nsAString& aHostSuffixString,
+                                            const nsACString& aOrigHost);
+  void NamedGetter(JSContext* aCx, const nsAString& aName, bool& aFound,
+                   JS::MutableHandle<JSObject*> aRetVal,
+                   mozilla::ErrorResult& aRv);
+  void GetSupportedNames(nsTArray<nsString>& aNames);
+  already_AddRefed<mozilla::dom::Location> GetLocation() const {
+    return Document::GetLocation();
+  }
+
+  static bool MatchFormControls(mozilla::dom::Element* aElement,
+                                int32_t aNamespaceID, nsAtom* aAtom,
+                                void* aData);
+
+  void GetFormsAndFormControls(mozilla::dom::ContentList** aFormList,
+                               mozilla::dom::ContentList** aFormControlList);
+
+ protected:
+  ~nsHTMLDocument();
+
+  nsresult GetBodySize(int32_t* aWidth, int32_t* aHeight);
+
+  nsIContent* MatchId(nsIContent* aContent, const nsAString& aId);
+
+  static void DocumentWriteTerminationFunc(nsISupports* aRef);
+
+  class ContentListHolder;
+  friend class ContentListHolder;
+  ContentListHolder* mContentListHolder;
+
+  int32_t mNumForms;
+
+  void TryReloadCharset(nsIDocumentViewer* aViewer, int32_t& aCharsetSource,
+                        NotNull<const Encoding*>& aEncoding);
+  void TryUserForcedCharset(nsIDocumentViewer* aViewer, nsIDocShell* aDocShell,
+                            int32_t& aCharsetSource,
+                            NotNull<const Encoding*>& aEncoding,
+                            bool& aForceAutoDetection);
+  void TryParentCharset(nsIDocShell* aDocShell, int32_t& charsetSource,
+                        NotNull<const Encoding*>& aEncoding,
+                        bool& aForceAutoDetection);
+
+  uint32_t mLoadFlags;
+
+  bool mWarnedWidthHeight;
+
+  bool mIsPlainText;
+
+  bool mViewSource;
+};
+
+namespace mozilla::dom {
+
+inline nsHTMLDocument* Document::AsHTMLDocument() {
+  MOZ_ASSERT(IsHTMLOrXHTML());
+  return static_cast<nsHTMLDocument*>(this);
+}
+
+inline const nsHTMLDocument* Document::AsHTMLDocument() const {
+  MOZ_ASSERT(IsHTMLOrXHTML());
+  return static_cast<const nsHTMLDocument*>(this);
+}
+
+}  
+
+#endif /* nsHTMLDocument_h_ */

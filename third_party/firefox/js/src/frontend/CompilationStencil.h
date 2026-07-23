@@ -1,0 +1,1911 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_CompilationStencil_h
+#define frontend_CompilationStencil_h
+
+#include "mozilla/AlreadyAddRefed.h"  // already_AddRefed
+#include "mozilla/Assertions.h"  // MOZ_ASSERT, MOZ_RELEASE_ASSERT, MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE
+#include "mozilla/Atomics.h"     // mozilla::Atomic
+#include "mozilla/Attributes.h"  // MOZ_RAII, MOZ_STACK_CLASS
+#include "mozilla/HashTable.h"   // mozilla::HashMap, mozilla::DefaultHasher
+#include "mozilla/Maybe.h"       // mozilla::Maybe
+#include "mozilla/MemoryReporting.h"  // mozilla::MallocSizeOf
+#include "mozilla/RefPtr.h"           // RefPtr
+#include "mozilla/Result.h"           // mozilla::Result
+#include "mozilla/ResultVariant.h"
+#include "mozilla/Span.h"     // mozilla::Span
+#include "mozilla/Variant.h"  // mozilla::Variant
+
+#include <algorithm>    // std::swap
+#include <stddef.h>     // size_t
+#include <stdint.h>     // uint32_t, uintptr_t
+#include <type_traits>  // std::is_pointer_v
+#include <utility>      // std::forward, std::move
+
+#include "ds/LifoAlloc.h"                 // LifoAlloc, LifoAllocScope
+#include "frontend/FrontendContext.h"     // FrontendContext
+#include "frontend/FunctionSyntaxKind.h"  // FunctionSyntaxKind
+#include "frontend/NameAnalysisTypes.h"   // NameLocation
+#include "frontend/ParserAtom.h"  // ParserAtomsTable, ParserAtomIndex, TaggedParserAtomIndex, ParserAtomSpan
+#include "frontend/ScopeIndex.h"     // ScopeIndex
+#include "frontend/ScriptIndex.h"    // ScriptIndex
+#include "frontend/SharedContext.h"  // ThisBinding, InheritThis, Directives
+#include "frontend/Stencil.h"  // ScriptStencil, ScriptStencilExtra, ScopeStencil, RegExpStencil, BigIntStencil, ObjLiteralStencil, BaseParserScopeData, StencilModuleMetadata
+#include "frontend/TaggedParserAtomIndexHasher.h"  // TaggedParserAtomIndexHasher
+#include "frontend/UsedNameTracker.h"              // UsedNameTracker
+#include "js/AllocPolicy.h"    // SystemAllocPolicy, ReportOutOfMemory
+#include "js/GCVector.h"       // JS::GCVector
+#include "js/RefCounted.h"     // AtomicRefCounted
+#include "js/RootingAPI.h"     // JS::Handle
+#include "js/Transcoding.h"    // JS::TranscodeBuffer, JS::TranscodeRange
+#include "js/UniquePtr.h"      // js::UniquePtr
+#include "js/Vector.h"         // Vector
+#include "js/WasmModule.h"     // JS::WasmModule
+#include "vm/FunctionFlags.h"  // FunctionFlags
+#include "vm/GlobalObject.h"   // GlobalObject
+#include "vm/JSContext.h"      // JSContext
+#include "vm/JSFunction.h"     // JSFunction
+#include "vm/JSScript.h"       // BaseScript, ScriptSource, SourceExtent
+#include "vm/Realm.h"          // JSContext::global
+#include "vm/Scope.h"          // Scope, ModuleScope
+#include "vm/ScopeKind.h"      // ScopeKind
+#include "vm/SharedStencil.h"  // ImmutableScriptFlags, MemberInitializers, SharedImmutableScriptData, RO_IMMUTABLE_SCRIPT_FLAGS
+
+class JSAtom;
+class JSFunction;
+class JSObject;
+class JSString;
+class JSTracer;
+
+namespace JS {
+class JS_PUBLIC_API ReadOnlyCompileOptions;
+}
+
+namespace js {
+
+class AtomSet;
+class JSONPrinter;
+class ModuleObject;
+
+namespace frontend {
+
+struct InitialStencilAndDelazifications;
+struct CompilationInput;
+struct CompilationStencil;
+struct CompilationGCOutput;
+struct PreallocatedCompilationGCOutput;
+class ScriptStencilIterable;
+struct InputName;
+class ScopeBindingCache;
+struct ScriptStencilRef;
+
+struct FakeStencilGlobalScope {};
+
+struct ScopeStencilRef {
+  const InitialStencilAndDelazifications& stencils_;
+  const ScriptIndex scriptIndex_;
+  const ScopeIndex scopeIndex_;
+
+  inline const ScopeStencil& scope() const;
+
+  inline ScriptStencilRef script() const;
+
+  enum class EnclosingFailure : uint8_t { ModuleScope, GlobalScope };
+
+  Result<ScopeStencilRef, EnclosingFailure> enclosing() const;
+
+  inline const ScriptStencilExtra& functionScriptExtra() const;
+
+  inline const CompilationStencil* context() const;
+};
+
+class InputScope {
+  using InputScopeStorage =
+      mozilla::Variant<Scope*, ScopeStencilRef, FakeStencilGlobalScope>;
+  InputScopeStorage scope_;
+
+ public:
+  explicit InputScope(Scope* ptr) : scope_(ptr) {}
+
+  explicit InputScope(FakeStencilGlobalScope global) : scope_(global) {}
+
+  explicit InputScope(const ScopeStencilRef& ref) : scope_(ref) {}
+  InputScope(const InitialStencilAndDelazifications& stencils,
+             ScriptIndex scriptIndex, ScopeIndex scopeIndex)
+      : scope_(ScopeStencilRef{stencils, scriptIndex, scopeIndex}) {}
+
+  const InputScopeStorage& variant() const { return scope_; }
+  InputScopeStorage& variant() { return scope_; }
+
+  template <typename Matcher>
+  decltype(auto) match(Matcher&& matcher) const& {
+    return scope_.match(std::forward<Matcher>(matcher));
+  }
+  template <typename Matcher>
+  decltype(auto) match(Matcher&& matcher) & {
+    return scope_.match(std::forward<Matcher>(matcher));
+  }
+
+  bool isNull() const {
+    return scope_.match(
+        [](const Scope* ptr) { return !ptr; },
+        [](const ScopeStencilRef& ref) { return !ref.scopeIndex_.isValid(); },
+        [](const FakeStencilGlobalScope&) { return false; });
+  }
+
+  ScopeKind kind() const {
+    return scope_.match(
+        [](const Scope* ptr) { return ptr->kind(); },
+        [](const ScopeStencilRef& ref) { return ref.scope().kind(); },
+        [](const FakeStencilGlobalScope&) { return ScopeKind::Global; });
+  };
+  bool hasEnvironment() const {
+    return scope_.match(
+        [](const Scope* ptr) { return ptr->hasEnvironment(); },
+        [](const ScopeStencilRef& ref) { return ref.scope().hasEnvironment(); },
+        [](const FakeStencilGlobalScope&) {
+          return true;
+        });
+  };
+  inline InputScope enclosing() const;
+  bool hasOnChain(ScopeKind kind) const {
+    return scope_.match([=](const Scope* ptr) { return ptr->hasOnChain(kind); },
+                        [=](const ScopeStencilRef& ref) {
+                          ScopeStencilRef it = ref;
+                          while (true) {
+                            const ScopeStencil& scope = it.scope();
+                            if (scope.kind() == kind) {
+                              return true;
+                            }
+                            if (scope.kind() == ScopeKind::Module &&
+                                kind == ScopeKind::Global) {
+                              return true;
+                            }
+                            auto result = it.enclosing();
+                            if (result.isErr()) {
+                              break;
+                            }
+                            new (&it) ScopeStencilRef(result.unwrap());
+                          }
+                          return false;
+                        },
+                        [=](const FakeStencilGlobalScope&) {
+                          return kind == ScopeKind::Global;
+                        });
+  }
+  uint32_t environmentChainLength() const {
+    return scope_.match(
+        [](const Scope* ptr) { return ptr->environmentChainLength(); },
+        [](const ScopeStencilRef& ref) {
+          uint32_t length = 0;
+          ScopeStencilRef it = ref;
+          while (true) {
+            const ScopeStencil& scope = it.scope();
+            if (scope.hasEnvironment() &&
+                scope.kind() != ScopeKind::NonSyntactic) {
+              length++;
+            }
+            if (scope.kind() == ScopeKind::Module) {
+              MOZ_ASSERT(!scope.hasEnclosing());
+              length += js::ModuleScope::EnclosingEnvironmentChainLength;
+            }
+            auto result = it.enclosing();
+            if (result.isErr()) {
+              break;
+            }
+            new (&it) ScopeStencilRef(result.unwrap());
+          }
+          return length;
+        },
+        [=](const FakeStencilGlobalScope&) {
+          return uint32_t(js::ModuleScope::EnclosingEnvironmentChainLength);
+        });
+  }
+  void trace(JSTracer* trc);
+  bool isStencil() const { return !scope_.is<Scope*>(); };
+
+ private:
+  inline FunctionFlags functionFlags() const;
+  inline ImmutableScriptFlags immutableFlags() const;
+
+ public:
+  inline MemberInitializers getMemberInitializers() const;
+  RO_IMMUTABLE_SCRIPT_FLAGS(immutableFlags())
+  bool isArrow() const { return functionFlags().isArrow(); }
+  bool allowSuperProperty() const {
+    return functionFlags().allowSuperProperty();
+  }
+  bool isClassConstructor() const {
+    return functionFlags().isClassConstructor();
+  }
+};
+
+struct ScriptStencilRef {
+  const InitialStencilAndDelazifications& stencils_;
+  const ScriptIndex scriptIndex_;
+
+  inline ScriptStencilRef topLevelScript() const;
+
+  inline ScriptStencilRef enclosingScript() const;
+
+  inline const ScriptStencil& scriptDataFromEnclosing() const;
+
+  inline const ScriptStencil& scriptDataFromInitial() const;
+
+  inline bool isEagerlyCompiledInInitial() const;
+
+  inline const ScriptStencilExtra& scriptExtra() const;
+
+  inline mozilla::Span<TaggedScriptThingIndex> gcThingsFromInitial() const;
+
+  inline const CompilationStencil* context() const;
+  inline const CompilationStencil* maybeContext() const;
+};
+
+class InputScript {
+  using InputScriptStorage = mozilla::Variant<BaseScript*, ScriptStencilRef>;
+  InputScriptStorage script_;
+
+ public:
+  explicit InputScript(BaseScript* ptr) : script_(ptr) {}
+
+  InputScript(const InitialStencilAndDelazifications& stencils,
+              ScriptIndex scriptIndex)
+      : script_(ScriptStencilRef{stencils, scriptIndex}) {}
+
+  const InputScriptStorage& raw() const { return script_; }
+  InputScriptStorage& raw() { return script_; }
+
+  SourceExtent extent() const {
+    return script_.match(
+        [](const BaseScript* ptr) { return ptr->extent(); },
+        [](const ScriptStencilRef& ref) { return ref.scriptExtra().extent; });
+  }
+  ImmutableScriptFlags immutableFlags() const {
+    return script_.match(
+        [](const BaseScript* ptr) { return ptr->immutableFlags(); },
+        [](const ScriptStencilRef& ref) {
+          return ref.scriptExtra().immutableFlags;
+        });
+  }
+  RO_IMMUTABLE_SCRIPT_FLAGS(immutableFlags())
+  FunctionFlags functionFlags() const {
+    return script_.match(
+        [](const BaseScript* ptr) { return ptr->function()->flags(); },
+        [](const ScriptStencilRef& ref) {
+          auto& scriptData = ref.scriptDataFromEnclosing();
+          return scriptData.functionFlags;
+        });
+  }
+  bool hasPrivateScriptData() const {
+    return script_.match(
+        [](const BaseScript* ptr) { return ptr->hasPrivateScriptData(); },
+        [](const ScriptStencilRef& ref) {
+          auto& scriptData = ref.scriptDataFromEnclosing();
+          return scriptData.hasGCThings() ||
+                 ref.scriptExtra().useMemberInitializers();
+        });
+  }
+  InputScope enclosingScope() const {
+    return script_.match(
+        [](const BaseScript* ptr) {
+          return InputScope(ptr->function()->enclosingScope());
+        },
+        [](const ScriptStencilRef& ref) {
+          auto enclosing = ref.enclosingScript();
+          auto& scriptData = ref.scriptDataFromEnclosing();
+          MOZ_RELEASE_ASSERT(!scriptData.hasSharedData());
+          MOZ_ASSERT(scriptData.hasLazyFunctionEnclosingScopeIndex());
+          auto scopeIndex = scriptData.lazyFunctionEnclosingScopeIndex();
+          return InputScope(ref.stencils_, enclosing.scriptIndex_, scopeIndex);
+        });
+  }
+  MemberInitializers getMemberInitializers() const {
+    return script_.match(
+        [](const BaseScript* ptr) { return ptr->getMemberInitializers(); },
+        [](const ScriptStencilRef& ref) {
+          return ref.scriptExtra().memberInitializers();
+        });
+  }
+
+  InputName displayAtom() const;
+  void trace(JSTracer* trc);
+  bool isNull() const {
+    return script_.match([](const BaseScript* ptr) { return !ptr; },
+                         [](const ScriptStencilRef& ref) { return false; });
+  }
+  bool isStencil() const {
+    return script_.match([](const BaseScript* ptr) { return false; },
+                         [](const ScriptStencilRef&) { return true; });
+  }
+
+  ScriptSourceObject* sourceObject() const {
+    return script_.match(
+        [](const BaseScript* ptr) { return ptr->sourceObject(); },
+        [](const ScriptStencilRef&) {
+          return static_cast<ScriptSourceObject*>(nullptr);
+        });
+  }
+};
+
+class MOZ_STACK_CLASS InputScopeIter {
+  InputScope scope_;
+
+ public:
+  explicit InputScopeIter(const InputScope& scope) : scope_(scope) {}
+
+  InputScope& scope() {
+    MOZ_ASSERT(!done());
+    return scope_;
+  }
+
+  const InputScope& scope() const {
+    MOZ_ASSERT(!done());
+    return scope_;
+  }
+
+  bool done() const { return scope_.isNull(); }
+  explicit operator bool() const { return !done(); }
+  void operator++(int) { scope_ = scope_.enclosing(); }
+  ScopeKind kind() const { return scope_.kind(); }
+
+  bool hasSyntacticEnvironment() const {
+    return scope_.hasEnvironment() && scope_.kind() != ScopeKind::NonSyntactic;
+  }
+
+  void trace(JSTracer* trc) { scope_.trace(trc); }
+};
+
+struct NameStencilRef {
+  const CompilationStencil& context_;
+  const TaggedParserAtomIndex atomIndex_;
+};
+
+struct InputName {
+  using InputNameStorage = mozilla::Variant<JSAtom*, NameStencilRef>;
+  InputNameStorage variant_;
+
+  InputName(Scope*, JSAtom* ptr) : variant_(ptr) {}
+  InputName(const ScopeStencilRef& scope, TaggedParserAtomIndex index)
+      : variant_(NameStencilRef{*scope.context(), index}) {}
+  InputName(BaseScript*, JSAtom* ptr) : variant_(ptr) {}
+  InputName(const ScriptStencilRef& script, TaggedParserAtomIndex index)
+      : variant_(NameStencilRef{*script.context(), index}) {}
+
+  InputName(const FakeStencilGlobalScope&, TaggedParserAtomIndex)
+      : variant_(static_cast<JSAtom*>(nullptr)) {}
+
+  TaggedParserAtomIndex internInto(FrontendContext* fc,
+                                   ParserAtomsTable& parserAtoms,
+                                   CompilationAtomCache& atomCache);
+
+  bool isEqualTo(FrontendContext* fc, ParserAtomsTable& parserAtoms,
+                 CompilationAtomCache& atomCache, TaggedParserAtomIndex other,
+                 JSAtom** otherCached) const;
+
+  bool isNull() const {
+    return variant_.match(
+        [](JSAtom* ptr) { return !ptr; },
+        [](const NameStencilRef& ref) { return !ref.atomIndex_; });
+  }
+};
+
+struct ScopeContext {
+  ScopeBindingCache* scopeCache = nullptr;
+
+  size_t scopeCacheGen = 0;
+
+  mozilla::Maybe<MemberInitializers> memberInitializers = {};
+
+  enum class EnclosingLexicalBindingKind {
+    Let,
+    Const,
+    CatchParameter,
+    Synthetic,
+    PrivateMethod,
+  };
+
+  using EnclosingLexicalBindingCache =
+      mozilla::HashMap<TaggedParserAtomIndex, EnclosingLexicalBindingKind,
+                       TaggedParserAtomIndexHasher>;
+
+  mozilla::Maybe<EnclosingLexicalBindingCache> enclosingLexicalBindingCache_;
+
+  using EffectiveScopePrivateFieldCache =
+      mozilla::HashMap<TaggedParserAtomIndex, NameLocation,
+                       TaggedParserAtomIndexHasher>;
+
+  mozilla::Maybe<EffectiveScopePrivateFieldCache>
+      effectiveScopePrivateFieldCache_;
+
+#ifdef DEBUG
+  bool enclosingEnvironmentIsDebugProxy_ = false;
+#endif
+
+  uint32_t effectiveScopeHops = 0;
+
+  uint32_t enclosingScopeEnvironmentChainLength = 0;
+
+  uint32_t enclosingThisEnvironmentHops = 0;
+
+  ScopeKind enclosingScopeKind = ScopeKind::Global;
+
+  ThisBinding thisBinding = ThisBinding::Global;
+
+  bool allowNewTarget = false;
+  bool allowSuperProperty = false;
+  bool allowSuperCall = false;
+  bool allowArguments = true;
+
+  bool inClass = false;
+  bool inWith = false;
+
+  bool enclosingScopeIsArrow = false;
+
+  bool enclosingScopeHasEnvironment = false;
+
+#ifdef DEBUG
+  bool hasNonSyntacticScopeOnChain = false;
+
+  bool hasFunctionNeedsHomeObjectOnChain = false;
+#endif
+
+  bool init(FrontendContext* fc, CompilationInput& input,
+            ParserAtomsTable& parserAtoms, ScopeBindingCache* scopeCache,
+            InheritThis inheritThis, JSObject* enclosingEnv);
+
+  mozilla::Maybe<EnclosingLexicalBindingKind>
+  lookupLexicalBindingInEnclosingScope(TaggedParserAtomIndex name);
+
+  NameLocation searchInEnclosingScope(FrontendContext* fc,
+                                      CompilationInput& input,
+                                      ParserAtomsTable& parserAtoms,
+                                      TaggedParserAtomIndex name);
+
+  bool effectiveScopePrivateFieldCacheHas(TaggedParserAtomIndex name);
+  mozilla::Maybe<NameLocation> getPrivateFieldLocation(
+      TaggedParserAtomIndex name);
+
+ private:
+  void computeThisBinding(const InputScope& scope);
+  void computeThisEnvironment(const InputScope& enclosingScope);
+  void computeInScope(const InputScope& enclosingScope);
+  void cacheEnclosingScope(const InputScope& enclosingScope);
+  NameLocation searchInEnclosingScopeWithCache(FrontendContext* fc,
+                                               CompilationInput& input,
+                                               ParserAtomsTable& parserAtoms,
+                                               TaggedParserAtomIndex name);
+  NameLocation searchInEnclosingScopeNoCache(FrontendContext* fc,
+                                             CompilationInput& input,
+                                             ParserAtomsTable& parserAtoms,
+                                             TaggedParserAtomIndex name);
+
+  InputScope determineEffectiveScope(InputScope& scope, JSObject* environment);
+
+  bool cachePrivateFieldsForEval(FrontendContext* fc, CompilationInput& input,
+                                 JSObject* enclosingEnvironment,
+                                 const InputScope& effectiveScope,
+                                 ParserAtomsTable& parserAtoms);
+
+  bool cacheEnclosingScopeBindingForEval(FrontendContext* fc,
+                                         CompilationInput& input,
+                                         ParserAtomsTable& parserAtoms);
+
+  bool addToEnclosingLexicalBindingCache(FrontendContext* fc,
+                                         ParserAtomsTable& parserAtoms,
+                                         CompilationAtomCache& atomCache,
+                                         InputName& name,
+                                         EnclosingLexicalBindingKind kind);
+};
+
+struct CompilationAtomCache {
+ public:
+  using AtomCacheVector = JS::GCVector<JSString*, 0, js::SystemAllocPolicy>;
+
+ private:
+  AtomCacheVector atoms_;
+
+ public:
+  JSString* getExistingStringAt(ParserAtomIndex index) const;
+  JSString* getExistingStringAt(JSContext* cx,
+                                TaggedParserAtomIndex taggedIndex) const;
+  JSString* getStringAt(ParserAtomIndex index) const;
+
+  JSAtom* getExistingAtomAt(ParserAtomIndex index) const;
+  JSAtom* getExistingAtomAt(JSContext* cx,
+                            TaggedParserAtomIndex taggedIndex) const;
+  JSAtom* getAtomAt(ParserAtomIndex index) const;
+
+  bool hasAtomAt(ParserAtomIndex index) const;
+  bool setAtomAt(FrontendContext* fc, ParserAtomIndex index, JSString* atom);
+  bool allocate(FrontendContext* fc, size_t length);
+
+  bool empty() const { return atoms_.empty(); }
+  size_t size() const { return atoms_.length(); }
+
+  void stealBuffer(AtomCacheVector& atoms);
+  void releaseBuffer(AtomCacheVector& atoms);
+
+  void trace(JSTracer* trc);
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return atoms_.sizeOfExcludingThis(mallocSizeOf);
+  }
+};
+
+struct ExtraBindingInfo {
+  UniqueChars nameChars;
+
+  TaggedParserAtomIndex nameIndex;
+
+  bool isShadowed = false;
+
+  ExtraBindingInfo(UniqueChars&& nameChars, bool isShadowed)
+      : nameChars(std::move(nameChars)), isShadowed(isShadowed) {}
+};
+
+using ExtraBindingInfoVector =
+    js::Vector<ExtraBindingInfo, 0, js::SystemAllocPolicy>;
+
+struct CompilationInput {
+  enum class CompilationTarget {
+    Global,
+    SelfHosting,
+    StandaloneFunction,
+    StandaloneFunctionInNonSyntacticScope,
+    Eval,
+    Module,
+    Delazification,
+  };
+  CompilationTarget target = CompilationTarget::Global;
+
+  const JS::ReadOnlyCompileOptions& options;
+
+  CompilationAtomCache atomCache;
+
+ private:
+  InputScript lazy_ = InputScript(nullptr);
+
+  ExtraBindingInfoVector* maybeExtraBindings_ = nullptr;
+
+ public:
+  RefPtr<ScriptSource> source;
+
+  InputScope enclosingScope = InputScope(nullptr);
+
+  explicit CompilationInput(const JS::ReadOnlyCompileOptions& options)
+      : options(options) {}
+
+ private:
+  bool initScriptSource(FrontendContext* fc);
+
+ public:
+  bool initForGlobal(FrontendContext* fc) {
+    target = CompilationTarget::Global;
+    return initScriptSource(fc);
+  }
+
+  bool initForGlobalWithExtraBindings(
+      FrontendContext* fc, ExtraBindingInfoVector* maybeExtraBindings) {
+    MOZ_ASSERT(maybeExtraBindings);
+    target = CompilationTarget::Global;
+    maybeExtraBindings_ = maybeExtraBindings;
+    return initScriptSource(fc);
+  }
+
+  bool initForSelfHostingGlobal(FrontendContext* fc) {
+    target = CompilationTarget::SelfHosting;
+    return initScriptSource(fc);
+  }
+
+  bool initForStandaloneFunction(JSContext* cx, FrontendContext* fc) {
+    target = CompilationTarget::StandaloneFunction;
+    if (!initScriptSource(fc)) {
+      return false;
+    }
+    enclosingScope = InputScope(&cx->global()->emptyGlobalScope());
+    return true;
+  }
+
+  bool initForStandaloneFunctionInNonSyntacticScope(
+      FrontendContext* fc, JS::Handle<Scope*> functionEnclosingScope);
+
+  bool initForEval(FrontendContext* fc, JS::Handle<Scope*> evalEnclosingScope) {
+    target = CompilationTarget::Eval;
+    if (!initScriptSource(fc)) {
+      return false;
+    }
+    enclosingScope = InputScope(evalEnclosingScope);
+    return true;
+  }
+
+  bool initForModule(FrontendContext* fc) {
+    target = CompilationTarget::Module;
+    if (!initScriptSource(fc)) {
+      return false;
+    }
+    return true;
+  }
+
+  void initFromLazy(JSContext* cx, BaseScript* lazyScript, ScriptSource* ss) {
+    MOZ_ASSERT(cx->compartment() == lazyScript->compartment());
+
+    MOZ_ASSERT(lazyScript->isReadyForDelazification());
+    target = CompilationTarget::Delazification;
+    lazy_ = InputScript(lazyScript);
+    source = ss;
+    enclosingScope = lazy_.enclosingScope();
+  }
+
+  void initFromStencil(const InitialStencilAndDelazifications& stencils,
+                       ScriptIndex scriptIndex, ScriptSource* ss) {
+    target = CompilationTarget::Delazification;
+    lazy_ = InputScript(stencils, scriptIndex);
+    source = ss;
+    enclosingScope = lazy_.enclosingScope();
+  }
+
+  bool hasNonDefaultEnclosingScope() const {
+    return target == CompilationTarget::StandaloneFunctionInNonSyntacticScope ||
+           target == CompilationTarget::Eval ||
+           target == CompilationTarget::Delazification;
+  }
+
+  InputScope maybeNonDefaultEnclosingScope() const {
+    if (hasNonDefaultEnclosingScope()) {
+      return enclosingScope;
+    }
+    return InputScope(nullptr);
+  }
+
+  InputScript lazyOuterScript() { return lazy_; }
+  BaseScript* lazyOuterBaseScript() { return lazy_.raw().as<BaseScript*>(); }
+
+  JSFunction* function() const {
+    return lazy_.raw().as<BaseScript*>()->function();
+  }
+
+  SourceExtent extent() const { return lazy_.extent(); }
+
+  ImmutableScriptFlags immutableFlags() const { return lazy_.immutableFlags(); }
+
+  RO_IMMUTABLE_SCRIPT_FLAGS(immutableFlags())
+
+  FunctionFlags functionFlags() const { return lazy_.functionFlags(); }
+
+  FunctionSyntaxKind functionSyntaxKind() const;
+
+  bool hasPrivateScriptData() const {
+    return lazy_.hasPrivateScriptData();
+  }
+
+  bool isInitialStencil() { return lazy_.isNull(); }
+
+  bool isDelazifying() { return target == CompilationTarget::Delazification; }
+
+  bool hasExtraBindings() const { return !!maybeExtraBindings_; }
+  ExtraBindingInfoVector& extraBindings() { return *maybeExtraBindings_; }
+  const ExtraBindingInfoVector& extraBindings() const {
+    return *maybeExtraBindings_;
+  }
+  bool internExtraBindings(FrontendContext* fc, ParserAtomsTable& parserAtoms);
+
+  void trace(JSTracer* trc);
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return atomCache.sizeOfExcludingThis(mallocSizeOf);
+  }
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return mallocSizeOf(this) + sizeOfExcludingThis(mallocSizeOf);
+  }
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  void dump() const;
+  void dump(js::JSONPrinter& json) const;
+  void dumpFields(js::JSONPrinter& json) const;
+#endif
+};
+
+// This class contains all information which is generated by the SyntaxParse and
+class CompilationSyntaxParseCache {
+  mozilla::Span<TaggedScriptThingIndex> cachedGCThings_;
+
+  mozilla::Span<ScriptStencil> cachedScriptData_;
+  mozilla::Span<ScriptStencilExtra> cachedScriptExtra_;
+
+  mozilla::Span<TaggedParserAtomIndex> closedOverBindings_;
+
+  TaggedParserAtomIndex displayAtom_;
+
+  ScriptStencilExtra funExtra_;
+
+#ifdef DEBUG
+  bool isInitialized = false;
+#endif
+
+ public:
+  mozilla::Span<TaggedParserAtomIndex> closedOverBindings() const {
+    MOZ_ASSERT(isInitialized);
+    return closedOverBindings_;
+  }
+  const ScriptStencil& scriptData(size_t functionIndex) const {
+    return cachedScriptData_[scriptIndex(functionIndex)];
+  }
+  const ScriptStencilExtra& scriptExtra(size_t functionIndex) const {
+    return cachedScriptExtra_[scriptIndex(functionIndex)];
+  }
+
+  TaggedParserAtomIndex displayAtom() const {
+    MOZ_ASSERT(isInitialized);
+    return displayAtom_;
+  }
+
+  const ScriptStencilExtra& funExtra() const {
+    MOZ_ASSERT(isInitialized);
+    return funExtra_;
+  }
+
+  [[nodiscard]] bool init(FrontendContext* fc, LifoAlloc& alloc,
+                          ParserAtomsTable& parseAtoms,
+                          CompilationAtomCache& atomCache,
+                          const InputScript& lazy);
+
+ private:
+  ScriptIndex scriptIndex(size_t functionIndex) const {
+    MOZ_ASSERT(isInitialized);
+    auto taggedScriptIndex = cachedGCThings_[functionIndex];
+    MOZ_ASSERT(taggedScriptIndex.isFunction());
+    return taggedScriptIndex.toFunction();
+  }
+
+  [[nodiscard]] bool copyFunctionInfo(FrontendContext* fc,
+                                      ParserAtomsTable& parseAtoms,
+                                      CompilationAtomCache& atomCache,
+                                      const InputScript& lazy);
+  [[nodiscard]] bool copyScriptInfo(FrontendContext* fc, LifoAlloc& alloc,
+                                    ParserAtomsTable& parseAtoms,
+                                    CompilationAtomCache& atomCache,
+                                    BaseScript* lazy);
+  [[nodiscard]] bool copyScriptInfo(FrontendContext* fc, LifoAlloc& alloc,
+                                    ParserAtomsTable& parseAtoms,
+                                    CompilationAtomCache& atomCache,
+                                    const ScriptStencilRef& lazy);
+  [[nodiscard]] bool copyClosedOverBindings(FrontendContext* fc,
+                                            LifoAlloc& alloc,
+                                            ParserAtomsTable& parseAtoms,
+                                            CompilationAtomCache& atomCache,
+                                            BaseScript* lazy);
+  [[nodiscard]] bool copyClosedOverBindings(FrontendContext* fc,
+                                            LifoAlloc& alloc,
+                                            ParserAtomsTable& parseAtoms,
+                                            CompilationAtomCache& atomCache,
+                                            const ScriptStencilRef& lazy);
+};
+
+struct SharedDataContainer {
+  using SingleSharedDataPtr = SharedImmutableScriptData*;
+
+  using SharedDataVector =
+      Vector<RefPtr<js::SharedImmutableScriptData>, 0, js::SystemAllocPolicy>;
+  using SharedDataVectorPtr = SharedDataVector*;
+
+  using SharedDataMap =
+      mozilla::HashMap<ScriptIndex, RefPtr<js::SharedImmutableScriptData>,
+                       mozilla::DefaultHasher<ScriptIndex>,
+                       js::SystemAllocPolicy>;
+  using SharedDataMapPtr = SharedDataMap*;
+
+ private:
+  enum {
+    SingleTag = 0,
+    VectorTag = 1,
+    MapTag = 2,
+    BorrowTag = 3,
+
+    TagMask = 3,
+  };
+
+  uintptr_t data_ = 0;
+
+ public:
+  SharedDataContainer() = default;
+
+  SharedDataContainer(const SharedDataContainer&) = delete;
+  SharedDataContainer(SharedDataContainer&& other) noexcept {
+    std::swap(data_, other.data_);
+    MOZ_ASSERT(other.isEmpty());
+  }
+
+  SharedDataContainer& operator=(const SharedDataContainer&) = delete;
+  SharedDataContainer& operator=(SharedDataContainer&& other) noexcept {
+    std::swap(data_, other.data_);
+    MOZ_ASSERT(other.isEmpty());
+    return *this;
+  }
+
+  ~SharedDataContainer();
+
+  [[nodiscard]] bool initVector(FrontendContext* fc);
+  [[nodiscard]] bool initMap(FrontendContext* fc);
+
+ private:
+  [[nodiscard]] bool convertFromSingleToMap(FrontendContext* fc);
+
+ public:
+  bool isEmpty() const { return (data_) == SingleTag; }
+  bool isSingle() const { return (data_ & TagMask) == SingleTag; }
+  bool isVector() const { return (data_ & TagMask) == VectorTag; }
+  bool isMap() const { return (data_ & TagMask) == MapTag; }
+  bool isBorrow() const { return (data_ & TagMask) == BorrowTag; }
+
+  void setSingle(already_AddRefed<SharedImmutableScriptData> data) {
+    MOZ_ASSERT(isEmpty());
+    data_ = reinterpret_cast<uintptr_t>(data.take());
+    MOZ_ASSERT(isSingle());
+    MOZ_ASSERT(!isEmpty());
+  }
+
+  void setBorrow(SharedDataContainer* sharedData) {
+    MOZ_ASSERT(isEmpty());
+    data_ = reinterpret_cast<uintptr_t>(sharedData) | BorrowTag;
+    MOZ_ASSERT(isBorrow());
+  }
+
+  SingleSharedDataPtr asSingle() const {
+    MOZ_ASSERT(isSingle());
+    MOZ_ASSERT(!isEmpty());
+    static_assert(SingleTag == 0);
+    return reinterpret_cast<SingleSharedDataPtr>(data_);
+  }
+  SharedDataVectorPtr asVector() const {
+    MOZ_ASSERT(isVector());
+    return reinterpret_cast<SharedDataVectorPtr>(data_ & ~TagMask);
+  }
+  SharedDataMapPtr asMap() const {
+    MOZ_ASSERT(isMap());
+    return reinterpret_cast<SharedDataMapPtr>(data_ & ~TagMask);
+  }
+  SharedDataContainer* asBorrow() const {
+    MOZ_ASSERT(isBorrow());
+    return reinterpret_cast<SharedDataContainer*>(data_ & ~TagMask);
+  }
+
+  [[nodiscard]] bool prepareStorageFor(FrontendContext* fc,
+                                       size_t nonLazyScriptCount,
+                                       size_t allScriptCount);
+  [[nodiscard]] bool cloneFrom(FrontendContext* fc,
+                               const SharedDataContainer& other);
+
+  js::SharedImmutableScriptData* get(ScriptIndex index) const;
+
+  [[nodiscard]] bool addAndShare(FrontendContext* fc, ScriptIndex index,
+                                 js::SharedImmutableScriptData* data);
+
+  [[nodiscard]] bool addExtraWithoutShare(FrontendContext* fc,
+                                          ScriptIndex index,
+                                          js::SharedImmutableScriptData* data);
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    if (isVector()) {
+      return asVector()->sizeOfIncludingThis(mallocSizeOf);
+    }
+    if (isMap()) {
+      return asMap()->shallowSizeOfIncludingThis(mallocSizeOf);
+    }
+    MOZ_ASSERT(isSingle() || isBorrow());
+    return 0;
+  }
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  void dump() const;
+  void dump(js::JSONPrinter& json) const;
+  void dumpFields(js::JSONPrinter& json) const;
+#endif
+};
+
+struct ExtensibleCompilationStencil;
+
+struct CompilationStencil {
+  friend struct ExtensibleCompilationStencil;
+
+  static constexpr ScriptIndex TopLevelIndex = ScriptIndex(0);
+
+  static constexpr size_t LifoAllocChunkSize = 512;
+
+  mutable mozilla::Atomic<uintptr_t> refCount_{0};
+
+ private:
+  UniquePtr<ExtensibleCompilationStencil> ownedBorrowStencil;
+
+ public:
+  enum class StorageType {
+    Owned,
+
+    Borrowed,
+
+    OwnedExtensible,
+  };
+  StorageType storageType = StorageType::Owned;
+
+  bool canLazilyParse = false;
+
+  using FunctionKey = SourceExtent::FunctionKey;
+  FunctionKey functionKey = SourceExtent::NullFunctionKey;
+
+  LifoAlloc alloc;
+
+  RefPtr<ScriptSource> source;
+
+  mozilla::Span<ScriptStencil> scriptData;
+
+  mozilla::Span<ScriptStencilExtra> scriptExtra;
+
+  mozilla::Span<TaggedScriptThingIndex> gcThingData;
+
+  mozilla::Span<ScopeStencil> scopeData;
+  mozilla::Span<BaseParserScopeData*> scopeNames;
+
+  mozilla::Span<RegExpStencil> regExpData;
+  mozilla::Span<BigIntStencil> bigIntData;
+  mozilla::Span<ObjLiteralStencil> objLiteralData;
+
+  ParserAtomSpan parserAtomData;
+
+  SharedDataContainer sharedData;
+
+  RefPtr<StencilModuleMetadata> moduleMetadata;
+
+
+  explicit CompilationStencil(ScriptSource* source)
+      : alloc(LifoAllocChunkSize, js::BackgroundMallocArena), source(source) {}
+
+  explicit CompilationStencil(
+      UniquePtr<ExtensibleCompilationStencil>&& extensibleStencil);
+
+  void AddRef();
+  void Release();
+
+ protected:
+  void borrowFromExtensibleCompilationStencil(
+      ExtensibleCompilationStencil& extensibleStencil);
+
+#ifdef DEBUG
+  void assertBorrowingFromExtensibleCompilationStencil(
+      const ExtensibleCompilationStencil& extensibleStencil) const;
+#endif
+
+ public:
+  bool isInitialStencil() const {
+    return functionKey == SourceExtent::NullFunctionKey;
+  }
+
+  [[nodiscard]] static bool instantiateStencilAfterPreparation(
+      JSContext* cx, CompilationInput& input, const CompilationStencil& stencil,
+      CompilationGCOutput& gcOutput);
+
+  [[nodiscard]] static bool prepareForInstantiate(
+      FrontendContext* fc, CompilationAtomCache& atomCache,
+      const CompilationStencil& stencil, CompilationGCOutput& gcOutput);
+  [[nodiscard]] static bool prepareForInstantiate(
+      FrontendContext* fc, const CompilationStencil& stencil,
+      PreallocatedCompilationGCOutput& gcOutput);
+
+  [[nodiscard]] static bool instantiateStencils(
+      JSContext* cx, CompilationInput& input, const CompilationStencil& stencil,
+      CompilationGCOutput& gcOutput);
+
+  [[nodiscard]] bool instantiateSelfHostedAtoms(
+      JSContext* cx, AtomSet& atomSet, CompilationAtomCache& atomCache) const;
+  [[nodiscard]] JSScript* instantiateSelfHostedTopLevelForRealm(
+      JSContext* cx, CompilationInput& input);
+  [[nodiscard]] JSFunction* instantiateSelfHostedLazyFunction(
+      JSContext* cx, CompilationAtomCache& atomCache, ScriptIndex index,
+      JS::Handle<JSAtom*> name);
+  [[nodiscard]] bool delazifySelfHostedFunction(JSContext* cx,
+                                                CompilationAtomCache& atomCache,
+                                                ScriptIndexRange range,
+                                                Handle<JSAtom*> name,
+                                                JS::Handle<JSFunction*> fun);
+
+  CompilationStencil(const CompilationStencil&) = delete;
+  CompilationStencil(CompilationStencil&&) = delete;
+  CompilationStencil& operator=(const CompilationStencil&) = delete;
+  CompilationStencil& operator=(CompilationStencil&&) = delete;
+#ifdef DEBUG
+  ~CompilationStencil() {
+    MOZ_ASSERT(!refCount_);
+  }
+#endif
+
+  static inline ScriptStencilIterable functionScriptStencils(
+      const CompilationStencil& stencil, CompilationGCOutput& gcOutput);
+
+  void setFunctionKey(BaseScript* lazy) {
+    functionKey = lazy->extent().toFunctionKey();
+  }
+
+  inline size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return mallocSizeOf(this) + sizeOfExcludingThis(mallocSizeOf);
+  }
+
+  const ParserAtomSpan& parserAtomsSpan() const { return parserAtomData; }
+
+  bool isModule() const;
+
+  bool hasMultipleReference() const { return refCount_ > 1; }
+
+  bool hasOwnedBorrow() const {
+    return storageType == StorageType::OwnedExtensible;
+  }
+
+  ExtensibleCompilationStencil* takeOwnedBorrow() {
+    MOZ_ASSERT(!hasMultipleReference());
+    MOZ_ASSERT(hasOwnedBorrow());
+    return ownedBorrowStencil.release();
+  }
+
+#ifdef DEBUG
+  void assertNoExternalDependency() const;
+#endif
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  void dump() const;
+  void dump(js::JSONPrinter& json) const;
+  void dumpFields(js::JSONPrinter& json) const;
+
+  void dumpAtom(TaggedParserAtomIndex index) const;
+#endif
+};
+
+class FunctionKeyToScriptIndexMap {
+  using FunctionKey = SourceExtent::FunctionKey;
+  mozilla::HashMap<FunctionKey, ScriptIndex,
+                   mozilla::DefaultHasher<FunctionKey>, js::SystemAllocPolicy>
+      map_;
+
+  template <typename T>
+  [[nodiscard]] bool init(FrontendContext* fc, const T& scriptExtra,
+                          size_t scriptExtraSize);
+
+ public:
+  FunctionKeyToScriptIndexMap() = default;
+
+  [[nodiscard]] bool init(FrontendContext* fc,
+                          const CompilationStencil* initial);
+  [[nodiscard]] bool init(FrontendContext* fc,
+                          const ExtensibleCompilationStencil* initial);
+
+  mozilla::Maybe<ScriptIndex> get(FunctionKey key) const;
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return mallocSizeOf(this) + sizeOfExcludingThis(mallocSizeOf);
+  }
+};
+
+struct ScriptIndexes {
+  ScriptIndex enclosingIndexInInitial;
+
+  ScriptIndex indexInEnclosing;
+};
+
+struct RelativeIndexes {
+  ExclusiveData<size_t> consumers_;
+
+  Vector<ScriptIndexes, 0, js::SystemAllocPolicy> indexes_;
+
+  RelativeIndexes() : consumers_(mutexid::StencilCache), indexes_() {}
+
+  ScriptIndexes& operator[](size_t i) { return indexes_[i]; }
+  const ScriptIndexes& operator[](size_t i) const { return indexes_[i]; }
+};
+
+struct InitialStencilAndDelazifications {
+ private:
+  using FunctionKey = SourceExtent::FunctionKey;
+
+  RefPtr<const CompilationStencil> initial_;
+
+  Vector<mozilla::Atomic<CompilationStencil*>, 0, js::SystemAllocPolicy>
+      delazifications_;
+
+  FunctionKeyToScriptIndexMap functionKeyToInitialScriptIndex_;
+
+  RelativeIndexes relativeIndexes_;
+
+  mutable mozilla::Atomic<uintptr_t> refCount_{0};
+
+ public:
+  class RelativeIndexesGuard {
+    friend struct InitialStencilAndDelazifications;
+    RefPtr<InitialStencilAndDelazifications> stencils_;
+
+    explicit RelativeIndexesGuard(InitialStencilAndDelazifications* stencils)
+        : stencils_(stencils) {}
+
+   public:
+    RelativeIndexesGuard() : stencils_(nullptr) {}
+
+    RelativeIndexesGuard(RelativeIndexesGuard&& src)
+        : stencils_(std::move(src.stencils_)) {}
+
+    ~RelativeIndexesGuard() {
+      if (stencils_) {
+        stencils_->decrementRelativeIndexesConsumer();
+        stencils_ = nullptr;
+      }
+    };
+    explicit operator bool() { return bool(stencils_); }
+  };
+
+ private:
+  void decrementRelativeIndexesConsumer();
+  friend class RelativeIndexesGuard;
+
+ public:
+  InitialStencilAndDelazifications() = default;
+  ~InitialStencilAndDelazifications();
+
+  void AddRef();
+  void Release();
+
+  [[nodiscard]] bool init(FrontendContext* fc,
+                          const CompilationStencil* initial);
+
+  [[nodiscard]] RelativeIndexesGuard ensureRelativeIndexes(FrontendContext* fc);
+
+  const CompilationStencil* getInitial() const;
+
+  bool canLazilyParse() const { return initial_->canLazilyParse; }
+
+  const CompilationStencil* getDelazificationAt(size_t functionIndex) const;
+  const CompilationStencil* getDelazificationFor(
+      const SourceExtent& extent) const;
+
+  ScriptIndex getScriptIndexFor(const CompilationStencil* delazification) const;
+
+  const ScriptIndexes& getRelativeIndexesAt(ScriptIndex initialIndex) const;
+
+  ScriptIndex getInitialIndexFor(ScriptIndex enclosingInInitial,
+                                 ScriptIndex enclosedInEnclosing) const;
+
+  const CompilationStencil* storeDelazification(
+      RefPtr<CompilationStencil>&& delazification);
+
+  CompilationStencil* getMerged(FrontendContext* fc) const;
+
+  [[nodiscard]] static bool instantiateStencils(
+      JSContext* cx, CompilationInput& input,
+      InitialStencilAndDelazifications& stencils,
+      CompilationGCOutput& gcOutput);
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return mallocSizeOf(this) + sizeOfExcludingThis(mallocSizeOf);
+  }
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  void dump() const;
+  void dump(js::JSONPrinter& json) const;
+  void dumpFields(js::JSONPrinter& json) const;
+#endif
+};
+
+struct ExtensibleCompilationStencil {
+  bool canLazilyParse = false;
+
+  using FunctionKey = SourceExtent::FunctionKey;
+
+  FunctionKey functionKey = SourceExtent::NullFunctionKey;
+
+  LifoAlloc alloc;
+
+  RefPtr<ScriptSource> source;
+
+
+  Vector<ScriptStencil, 1, js::SystemAllocPolicy> scriptData;
+  Vector<ScriptStencilExtra, 0, js::SystemAllocPolicy> scriptExtra;
+
+  Vector<TaggedScriptThingIndex, 8, js::SystemAllocPolicy> gcThingData;
+
+  Vector<ScopeStencil, 1, js::SystemAllocPolicy> scopeData;
+  Vector<BaseParserScopeData*, 1, js::SystemAllocPolicy> scopeNames;
+
+  Vector<RegExpStencil, 0, js::SystemAllocPolicy> regExpData;
+  BigIntStencilVector bigIntData;
+  Vector<ObjLiteralStencil, 0, js::SystemAllocPolicy> objLiteralData;
+
+  ParserAtomsTable parserAtoms;
+
+  SharedDataContainer sharedData;
+
+  RefPtr<StencilModuleMetadata> moduleMetadata;
+
+  explicit ExtensibleCompilationStencil(ScriptSource* source);
+
+  explicit ExtensibleCompilationStencil(CompilationInput& input);
+  ExtensibleCompilationStencil(const JS::ReadOnlyCompileOptions& options,
+                               RefPtr<ScriptSource> source);
+
+  ExtensibleCompilationStencil(ExtensibleCompilationStencil&& other) noexcept
+      : canLazilyParse(other.canLazilyParse),
+        functionKey(other.functionKey),
+        alloc(CompilationStencil::LifoAllocChunkSize,
+              js::BackgroundMallocArena),
+        source(std::move(other.source)),
+        scriptData(std::move(other.scriptData)),
+        scriptExtra(std::move(other.scriptExtra)),
+        gcThingData(std::move(other.gcThingData)),
+        scopeData(std::move(other.scopeData)),
+        scopeNames(std::move(other.scopeNames)),
+        regExpData(std::move(other.regExpData)),
+        bigIntData(std::move(other.bigIntData)),
+        objLiteralData(std::move(other.objLiteralData)),
+        parserAtoms(std::move(other.parserAtoms)),
+        sharedData(std::move(other.sharedData)),
+        moduleMetadata(std::move(other.moduleMetadata)) {
+    alloc.steal(&other.alloc);
+    parserAtoms.fixupAlloc(alloc);
+  }
+
+  ExtensibleCompilationStencil& operator=(
+      ExtensibleCompilationStencil&& other) noexcept {
+    MOZ_ASSERT(alloc.isEmpty());
+
+    canLazilyParse = other.canLazilyParse;
+    functionKey = other.functionKey;
+    source = std::move(other.source);
+    scriptData = std::move(other.scriptData);
+    scriptExtra = std::move(other.scriptExtra);
+    gcThingData = std::move(other.gcThingData);
+    scopeData = std::move(other.scopeData);
+    scopeNames = std::move(other.scopeNames);
+    regExpData = std::move(other.regExpData);
+    bigIntData = std::move(other.bigIntData);
+    objLiteralData = std::move(other.objLiteralData);
+    parserAtoms = std::move(other.parserAtoms);
+    sharedData = std::move(other.sharedData);
+    moduleMetadata = std::move(other.moduleMetadata);
+
+    alloc.steal(&other.alloc);
+    parserAtoms.fixupAlloc(alloc);
+
+    return *this;
+  }
+
+  void setFunctionKey(const SourceExtent& extent) {
+    functionKey = extent.toFunctionKey();
+  }
+
+  bool isInitialStencil() const {
+    return functionKey == SourceExtent::NullFunctionKey;
+  }
+
+  [[nodiscard]] bool steal(FrontendContext* fc,
+                           RefPtr<CompilationStencil>&& other);
+
+  [[nodiscard]] bool cloneFrom(FrontendContext* fc,
+                               const CompilationStencil& other);
+  [[nodiscard]] bool cloneFrom(FrontendContext* fc,
+                               const ExtensibleCompilationStencil& other);
+
+ private:
+  template <typename Stencil>
+  [[nodiscard]] bool cloneFromImpl(FrontendContext* fc, const Stencil& other);
+
+ public:
+  const ParserAtomVector& parserAtomsSpan() const {
+    return parserAtoms.entries();
+  }
+
+  bool isModule() const;
+
+  inline size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return mallocSizeOf(this) + sizeOfExcludingThis(mallocSizeOf);
+  }
+
+#ifdef DEBUG
+  void assertNoExternalDependency() const;
+#endif
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  void dump();
+  void dump(js::JSONPrinter& json);
+  void dumpFields(js::JSONPrinter& json);
+
+  void dumpAtom(TaggedParserAtomIndex index);
+#endif
+};
+
+struct MOZ_RAII CompilationState : public ExtensibleCompilationStencil {
+  Directives directives;
+
+  ScopeContext scopeContext;
+
+  UsedNameTracker usedNames;
+
+  LifoAllocScope& parserAllocScope;
+
+  CompilationInput& input;
+  CompilationSyntaxParseCache previousParseCache;
+
+  size_t nonLazyFunctionCount = 0;
+
+
+  CompilationState(FrontendContext* fc, LifoAllocScope& parserAllocScope,
+                   CompilationInput& input);
+
+  bool init(FrontendContext* fc, ScopeBindingCache* scopeCache,
+            InheritThis inheritThis = InheritThis::No,
+            JSObject* enclosingEnv = nullptr) {
+    if (!scopeContext.init(fc, input, parserAtoms, scopeCache, inheritThis,
+                           enclosingEnv)) {
+      return false;
+    }
+
+    if (input.isDelazifying()) {
+      InputScript lazy = input.lazyOuterScript();
+      auto& atomCache = input.atomCache;
+      if (!previousParseCache.init(fc, alloc, parserAtoms, atomCache, lazy)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  struct CompilationStatePosition {
+    size_t scriptDataLength = 0;
+  };
+
+  bool prepareSharedDataStorage(FrontendContext* fc);
+
+  CompilationStatePosition getPosition();
+  void rewind(const CompilationStatePosition& pos);
+
+  void markGhost(const CompilationStatePosition& pos);
+
+  bool allocateGCThingsUninitialized(FrontendContext* fc,
+                                     ScriptIndex scriptIndex, size_t length,
+                                     TaggedScriptThingIndex** cursor);
+
+  bool appendScriptStencilAndData(FrontendContext* fc);
+
+  bool appendGCThings(FrontendContext* fc, ScriptIndex scriptIndex,
+                      mozilla::Span<const TaggedScriptThingIndex> things);
+};
+
+class MOZ_STACK_CLASS BorrowingCompilationStencil : public CompilationStencil {
+ public:
+  explicit BorrowingCompilationStencil(
+      ExtensibleCompilationStencil& extensibleStencil);
+};
+
+inline size_t CompilationStencil::sizeOfExcludingThis(
+    mozilla::MallocSizeOf mallocSizeOf) const {
+  if (ownedBorrowStencil) {
+    return ownedBorrowStencil->sizeOfIncludingThis(mallocSizeOf);
+  }
+
+  size_t moduleMetadataSize =
+      moduleMetadata ? moduleMetadata->sizeOfIncludingThis(mallocSizeOf) : 0;
+
+  return alloc.sizeOfExcludingThis(mallocSizeOf) +
+         sharedData.sizeOfExcludingThis(mallocSizeOf) + moduleMetadataSize;
+}
+
+inline size_t ExtensibleCompilationStencil::sizeOfExcludingThis(
+    mozilla::MallocSizeOf mallocSizeOf) const {
+  size_t moduleMetadataSize =
+      moduleMetadata ? moduleMetadata->sizeOfIncludingThis(mallocSizeOf) : 0;
+
+  return alloc.sizeOfExcludingThis(mallocSizeOf) +
+         scriptData.sizeOfExcludingThis(mallocSizeOf) +
+         scriptExtra.sizeOfExcludingThis(mallocSizeOf) +
+         gcThingData.sizeOfExcludingThis(mallocSizeOf) +
+         scopeData.sizeOfExcludingThis(mallocSizeOf) +
+         scopeNames.sizeOfExcludingThis(mallocSizeOf) +
+         regExpData.sizeOfExcludingThis(mallocSizeOf) +
+         bigIntData.sizeOfExcludingThis(mallocSizeOf) +
+         objLiteralData.sizeOfExcludingThis(mallocSizeOf) +
+         parserAtoms.sizeOfExcludingThis(mallocSizeOf) +
+         sharedData.sizeOfExcludingThis(mallocSizeOf) + moduleMetadataSize;
+}
+
+template <typename T>
+struct PreAllocateableGCArray {
+ private:
+  size_t length_ = 0;
+
+  T inlineElem_;
+
+  T* elems_ = nullptr;
+
+ public:
+  struct Preallocated {
+   private:
+    size_t length_ = 0;
+    uintptr_t* elems_ = nullptr;
+
+    friend struct PreAllocateableGCArray<T>;
+
+   public:
+    Preallocated() = default;
+    ~Preallocated();
+
+    bool empty() const { return length_ == 0; }
+
+    size_t length() const { return length_; }
+
+   private:
+    bool isInline() const { return length_ == 1; }
+
+   public:
+    bool allocate(size_t length);
+
+    size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+      return sizeof(uintptr_t) * length_;
+    }
+  };
+
+  PreAllocateableGCArray() {
+    static_assert(std::is_pointer_v<T>,
+                  "PreAllocateableGCArray element must be a pointer");
+  }
+  ~PreAllocateableGCArray();
+
+  bool empty() const { return length_ == 0; }
+
+  size_t length() const { return length_; }
+
+ private:
+  bool isInline() const { return length_ == 1; }
+
+ public:
+  bool allocate(size_t length);
+  bool allocateWith(T init, size_t length);
+
+  void steal(Preallocated&& buffer);
+
+  T& operator[](size_t index) {
+    MOZ_ASSERT(index < length_);
+
+    if (isInline()) {
+      return inlineElem_;
+    }
+
+    return elems_[index];
+  }
+  const T& operator[](size_t index) const {
+    MOZ_ASSERT(index < length_);
+
+    if (isInline()) {
+      return inlineElem_;
+    }
+
+    return elems_[index];
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    if (!elems_) {
+      return 0;
+    }
+
+    return sizeof(T) * length_;
+  }
+
+  void trace(JSTracer* trc);
+};
+
+struct CompilationGCOutput;
+
+struct PreallocatedCompilationGCOutput {
+ private:
+  PreAllocateableGCArray<JSFunction*>::Preallocated functions;
+  PreAllocateableGCArray<js::Scope*>::Preallocated scopes;
+
+  friend struct CompilationGCOutput;
+
+ public:
+  PreallocatedCompilationGCOutput() = default;
+
+  [[nodiscard]] bool allocate(FrontendContext* fc, size_t scriptDataLength,
+                              size_t scopeDataLength) {
+    if (!functions.allocate(scriptDataLength)) {
+      ReportOutOfMemory(fc);
+      return false;
+    }
+    if (!scopes.allocate(scopeDataLength)) {
+      ReportOutOfMemory(fc);
+      return false;
+    }
+    return true;
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return functions.sizeOfExcludingThis(mallocSizeOf) +
+           scopes.sizeOfExcludingThis(mallocSizeOf);
+  }
+};
+
+struct CompilationGCOutput {
+  JSScript* script = nullptr;
+
+  ModuleObject* module = nullptr;
+
+  PreAllocateableGCArray<JSFunction*> functions;
+
+  PreAllocateableGCArray<js::Scope*> scopes;
+
+  ScriptSourceObject* sourceObject = nullptr;
+
+ private:
+  ScriptIndex functionsBaseIndex{};
+  ScopeIndex scopesBaseIndex{};
+
+
+ public:
+  CompilationGCOutput() = default;
+
+  JSFunction*& getFunction(ScriptIndex index) {
+    return functions[index - functionsBaseIndex];
+  }
+  JSFunction*& getFunctionNoBaseIndex(ScriptIndex index) {
+    MOZ_ASSERT(!functionsBaseIndex);
+    return functions[index];
+  }
+
+  js::Scope*& getScope(ScopeIndex index) {
+    return scopes[index - scopesBaseIndex];
+  }
+  js::Scope*& getScopeNoBaseIndex(ScopeIndex index) {
+    MOZ_ASSERT(!scopesBaseIndex);
+    return scopes[index];
+  }
+  js::Scope* getScopeNoBaseIndex(ScopeIndex index) const {
+    MOZ_ASSERT(!scopesBaseIndex);
+    return scopes[index];
+  }
+
+  [[nodiscard]] bool ensureAllocated(FrontendContext* fc,
+                                     size_t scriptDataLength,
+                                     size_t scopeDataLength) {
+    if (functions.empty()) {
+      if (!functions.allocate(scriptDataLength)) {
+        ReportOutOfMemory(fc);
+        return false;
+      }
+    }
+    if (scopes.empty()) {
+      if (!scopes.allocate(scopeDataLength)) {
+        ReportOutOfMemory(fc);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void steal(PreallocatedCompilationGCOutput&& pre) {
+    functions.steal(std::move(pre.functions));
+    scopes.steal(std::move(pre.scopes));
+  }
+
+  [[nodiscard]] bool ensureAllocatedWithBaseIndex(FrontendContext* fc,
+                                                  ScriptIndex scriptStart,
+                                                  ScriptIndex scriptLimit,
+                                                  ScopeIndex scopeStart,
+                                                  ScopeIndex scopeLimit) {
+    this->functionsBaseIndex = scriptStart;
+    this->scopesBaseIndex = scopeStart;
+
+    return ensureAllocated(fc, scriptLimit - scriptStart,
+                           scopeLimit - scopeStart);
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return functions.sizeOfExcludingThis(mallocSizeOf) +
+           scopes.sizeOfExcludingThis(mallocSizeOf);
+  }
+
+  void trace(JSTracer* trc);
+};
+
+class ScriptStencilIterable {
+ public:
+  class ScriptAndFunction {
+   public:
+    const ScriptStencil& script;
+    const ScriptStencilExtra* scriptExtra;
+    JSFunction* function;
+    ScriptIndex index;
+
+    ScriptAndFunction() = delete;
+    ScriptAndFunction(const ScriptStencil& script,
+                      const ScriptStencilExtra* scriptExtra,
+                      JSFunction* function, ScriptIndex index)
+        : script(script),
+          scriptExtra(scriptExtra),
+          function(function),
+          index(index) {}
+  };
+
+  class Iterator {
+    size_t index_ = 0;
+    const CompilationStencil& stencil_;
+    CompilationGCOutput& gcOutput_;
+
+    Iterator(const CompilationStencil& stencil, CompilationGCOutput& gcOutput,
+             size_t index)
+        : index_(index), stencil_(stencil), gcOutput_(gcOutput) {
+      MOZ_ASSERT(index == stencil.scriptData.size());
+    }
+
+   public:
+    explicit Iterator(const CompilationStencil& stencil,
+                      CompilationGCOutput& gcOutput)
+        : stencil_(stencil), gcOutput_(gcOutput) {
+      skipTopLevelNonFunction();
+    }
+
+    Iterator operator++() {
+      next();
+      assertFunction();
+      return *this;
+    }
+
+    void next() {
+      MOZ_ASSERT(index_ < stencil_.scriptData.size());
+      index_++;
+    }
+
+    void assertFunction() {
+      if (index_ < stencil_.scriptData.size()) {
+        MOZ_ASSERT(stencil_.scriptData[index_].isFunction());
+      }
+    }
+
+    void skipTopLevelNonFunction() {
+      MOZ_ASSERT(index_ == 0);
+      if (stencil_.scriptData.size()) {
+        if (!stencil_.scriptData[0].isFunction()) {
+          next();
+          assertFunction();
+        }
+      }
+    }
+
+    bool operator!=(const Iterator& other) const {
+      return index_ != other.index_;
+    }
+
+    ScriptAndFunction operator*() {
+      ScriptIndex index = ScriptIndex(index_);
+      const ScriptStencil& script = stencil_.scriptData[index];
+      const ScriptStencilExtra* scriptExtra = nullptr;
+      if (stencil_.isInitialStencil()) {
+        scriptExtra = &stencil_.scriptExtra[index];
+      }
+      return ScriptAndFunction(script, scriptExtra,
+                               gcOutput_.getFunctionNoBaseIndex(index), index);
+    }
+
+    static Iterator end(const CompilationStencil& stencil,
+                        CompilationGCOutput& gcOutput) {
+      return Iterator(stencil, gcOutput, stencil.scriptData.size());
+    }
+  };
+
+  const CompilationStencil& stencil_;
+  CompilationGCOutput& gcOutput_;
+
+  explicit ScriptStencilIterable(const CompilationStencil& stencil,
+                                 CompilationGCOutput& gcOutput)
+      : stencil_(stencil), gcOutput_(gcOutput) {}
+
+  Iterator begin() const { return Iterator(stencil_, gcOutput_); }
+
+  Iterator end() const { return Iterator::end(stencil_, gcOutput_); }
+};
+
+inline ScriptStencilIterable CompilationStencil::functionScriptStencils(
+    const CompilationStencil& stencil, CompilationGCOutput& gcOutput) {
+  return ScriptStencilIterable(stencil, gcOutput);
+}
+
+struct CompilationStencilMerger {
+ private:
+  using FunctionKey = SourceExtent::FunctionKey;
+
+  UniquePtr<ExtensibleCompilationStencil> initial_;
+
+  FunctionKeyToScriptIndexMap functionKeyToInitialScriptIndex_;
+
+  ScriptIndex getInitialScriptIndexFor(
+      const CompilationStencil& delazification) const;
+
+  using AtomIndexMap = Vector<TaggedParserAtomIndex, 0, js::SystemAllocPolicy>;
+
+  [[nodiscard]] bool buildAtomIndexMap(FrontendContext* fc,
+                                       const CompilationStencil& delazification,
+                                       AtomIndexMap& atomIndexMap);
+
+ public:
+  CompilationStencilMerger() = default;
+
+  [[nodiscard]] bool setInitial(
+      FrontendContext* fc, UniquePtr<ExtensibleCompilationStencil>&& initial);
+
+  [[nodiscard]] bool addDelazification(
+      FrontendContext* fc, const CompilationStencil& delazification);
+
+  [[nodiscard]] bool maybeAddDelazification(
+      FrontendContext* fc, const CompilationStencil& delazification);
+
+  ExtensibleCompilationStencil& getResult() const { return *initial_; }
+  UniquePtr<ExtensibleCompilationStencil> takeResult() {
+    return std::move(initial_);
+  }
+};
+
+ScriptStencilRef ScopeStencilRef::script() const {
+  return ScriptStencilRef{stencils_, scriptIndex_};
+}
+
+const CompilationStencil* ScopeStencilRef::context() const {
+  return script().context();
+}
+
+const ScopeStencil& ScopeStencilRef::scope() const {
+  return context()->scopeData[scopeIndex_];
+}
+
+const ScriptStencilExtra& ScopeStencilRef::functionScriptExtra() const {
+  MOZ_ASSERT(scope().isFunction());
+  ScriptIndex functionIndexInContext = scope().functionIndex();
+  ScriptIndex functionIndexInInitial =
+      stencils_.getInitialIndexFor(scriptIndex_, functionIndexInContext);
+  ScriptStencilRef function{stencils_, functionIndexInInitial};
+  return function.scriptExtra();
+}
+
+InputScope InputScope::enclosing() const {
+  return scope_.match(
+      [](const Scope* ptr) {
+        return InputScope(ptr->enclosing());
+      },
+      [](const ScopeStencilRef& ref) {
+        auto result = ref.enclosing();
+        if (result.isOk()) {
+          return InputScope(result.unwrap());
+        }
+
+        switch (result.unwrapErr()) {
+          case ScopeStencilRef::EnclosingFailure::ModuleScope:
+            return InputScope(FakeStencilGlobalScope{});
+          case ScopeStencilRef::EnclosingFailure::GlobalScope:
+            return InputScope(nullptr);
+        }
+        MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE(
+            "Unknown EnclosingFailure code");
+      },
+      [](const FakeStencilGlobalScope&) { return InputScope(nullptr); });
+}
+
+FunctionFlags InputScope::functionFlags() const {
+  return scope_.match(
+      [](const Scope* ptr) {
+        JSFunction* fun = ptr->as<FunctionScope>().canonicalFunction();
+        return fun->flags();
+      },
+      [](const ScopeStencilRef& ref) {
+        MOZ_ASSERT(ref.scope().isFunction());
+        ScriptIndex functionIndexInContext = ref.scope().functionIndex();
+        ScriptStencil& data = ref.context()->scriptData[functionIndexInContext];
+        return data.functionFlags;
+      },
+      [](const FakeStencilGlobalScope&) -> FunctionFlags {
+        MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("No functionFlags on global.");
+      });
+}
+
+ImmutableScriptFlags InputScope::immutableFlags() const {
+  return scope_.match(
+      [](const Scope* ptr) {
+        JSFunction* fun = ptr->as<FunctionScope>().canonicalFunction();
+        return fun->baseScript()->immutableFlags();
+      },
+      [](const ScopeStencilRef& ref) {
+        return ref.functionScriptExtra().immutableFlags;
+      },
+      [](const FakeStencilGlobalScope&) -> ImmutableScriptFlags {
+        MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("No immutableFlags on global.");
+      });
+}
+
+MemberInitializers InputScope::getMemberInitializers() const {
+  return scope_.match(
+      [](const Scope* ptr) {
+        JSFunction* fun = ptr->as<FunctionScope>().canonicalFunction();
+        return fun->baseScript()->getMemberInitializers();
+      },
+      [](const ScopeStencilRef& ref) {
+        return ref.functionScriptExtra().memberInitializers();
+      },
+      [](const FakeStencilGlobalScope&) -> MemberInitializers {
+        MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE(
+            "No getMemberInitializers on global.");
+      });
+}
+
+ScriptStencilRef ScriptStencilRef::topLevelScript() const {
+  return ScriptStencilRef{stencils_, ScriptIndex(0)};
+}
+
+ScriptStencilRef ScriptStencilRef::enclosingScript() const {
+  auto indexes = stencils_.getRelativeIndexesAt(scriptIndex_);
+  ScriptStencilRef enclosing{stencils_, indexes.enclosingIndexInInitial};
+  return enclosing;
+}
+
+const ScriptStencil& ScriptStencilRef::scriptDataFromInitial() const {
+  return stencils_.getInitial()->scriptData[scriptIndex_];
+}
+
+bool ScriptStencilRef::isEagerlyCompiledInInitial() const {
+  return scriptDataFromInitial().hasSharedData();
+}
+
+const ScriptStencil& ScriptStencilRef::scriptDataFromEnclosing() const {
+  if (scriptIndex_ == 0) {
+    return stencils_.getInitial()->scriptData[0];
+  }
+  auto indexes = stencils_.getRelativeIndexesAt(scriptIndex_);
+  ScriptStencilRef enclosing{stencils_, indexes.enclosingIndexInInitial};
+  return enclosing.context()->scriptData[indexes.indexInEnclosing];
+}
+
+mozilla::Span<TaggedScriptThingIndex> ScriptStencilRef::gcThingsFromInitial()
+    const {
+  return scriptDataFromInitial().gcthings(*stencils_.getInitial());
+}
+
+const ScriptStencilExtra& ScriptStencilRef::scriptExtra() const {
+  return stencils_.getInitial()->scriptExtra[scriptIndex_];
+}
+
+const CompilationStencil* ScriptStencilRef::context() const {
+  if (isEagerlyCompiledInInitial()) {
+    return stencils_.getInitial();
+  }
+  const auto* delazification = stencils_.getDelazificationAt(scriptIndex_);
+  MOZ_ASSERT(delazification);
+  return delazification;
+}
+
+const CompilationStencil* ScriptStencilRef::maybeContext() const {
+  if (isEagerlyCompiledInInitial()) {
+    return stencils_.getInitial();
+  }
+  return stencils_.getDelazificationAt(scriptIndex_);
+}
+
+}  
+}  
+
+namespace mozilla {
+template <>
+struct RefPtrTraits<js::frontend::CompilationStencil> {
+  static void AddRef(js::frontend::CompilationStencil* stencil) {
+    stencil->AddRef();
+  }
+  static void Release(js::frontend::CompilationStencil* stencil) {
+    stencil->Release();
+  }
+};
+}  
+
+#endif  // frontend_CompilationStencil_h

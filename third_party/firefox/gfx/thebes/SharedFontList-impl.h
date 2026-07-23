@@ -1,0 +1,190 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(SharedFontList_impl_h)
+#define SharedFontList_impl_h
+
+#include "SharedFontList.h"
+
+#include "base/process.h"
+#include "gfxFontUtils.h"
+#include "nsClassHashtable.h"
+#include "nsTHashMap.h"
+#include "nsXULAppAPI.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/ipc/SharedMemoryMapping.h"
+
+
+namespace mozilla {
+namespace fontlist {
+
+struct AliasData {
+  nsTArray<Pointer> mFaces;
+  nsCString mBaseFamily;
+  uint32_t mIndex = 0;
+  FontVisibility mVisibility = FontVisibility::Unknown;
+  bool mBundled = false;
+  bool mBadUnderline = false;
+  bool mForceClassic = false;
+
+  void InitFromFamily(const Family* aFamily, const nsCString& aBaseFamily) {
+    mBaseFamily = aBaseFamily;
+    mIndex = aFamily->Index();
+    mVisibility = aFamily->Visibility();
+    mBundled = aFamily->IsBundled();
+    mBadUnderline = aFamily->IsBadUnderlineFamily();
+    mForceClassic = aFamily->IsForceClassic();
+  }
+};
+
+class FontList {
+ public:
+  friend struct Pointer;
+
+  explicit FontList(uint32_t aGeneration);
+  ~FontList();
+
+  void SetFamilyNames(nsTArray<Family::InitData>& aFamilies);
+
+  void SetAliases(nsClassHashtable<nsCStringHashKey, AliasData>& aAliasTable);
+
+  void SetLocalNames(
+      nsTHashMap<nsCStringHashKey, LocalFaceRec::InitData>& aLocalNameTable);
+
+  Family* FindFamily(const nsCString& aName, bool aPrimaryNameOnly = false);
+
+  LocalFaceRec* FindLocalFace(const nsCString& aName);
+
+  void SearchForLocalFace(const nsACString& aName, Family** aFamily,
+                          Face** aFace);
+
+  nsCString LocalizedFamilyName(const Family* aFamily);
+
+  bool Initialized() { return mBlocks.Length() > 0 && NumFamilies() > 0; }
+
+  uint32_t NumFamilies() { return GetHeader().mFamilyCount; }
+  Family* Families() {
+    return GetHeader().mFamilies.ToArray<Family>(this, NumFamilies());
+  }
+
+  uint32_t NumAliases() { return GetHeader().mAliasCount; }
+  Family* AliasFamilies() {
+    return GetHeader().mAliases.ToArray<Family>(this, NumAliases());
+  }
+
+  uint32_t NumLocalFaces() { return GetHeader().mLocalFaceCount; }
+  LocalFaceRec* LocalFaces() {
+    return GetHeader().mLocalFaces.ToArray<LocalFaceRec>(this, NumLocalFaces());
+  }
+
+  void LoadCharMapFor(Face& aFace, const Family* aFamily);
+
+  Pointer Alloc(uint32_t aSize);
+
+  uint32_t GetGeneration() { return GetHeader().mGeneration; }
+
+  struct BlockHeader {
+    std::atomic<uint32_t> mAllocated;  
+    uint32_t mBlockSize;               
+  };
+
+  struct Header {
+    BlockHeader mBlockHeader;
+    uint32_t mGeneration;               
+    uint32_t mFamilyCount;              
+    std::atomic<uint32_t> mBlockCount;  
+    std::atomic<uint32_t> mAliasCount;  
+    std::atomic<uint32_t> mLocalFaceCount;  
+    Pointer mFamilies;    
+    Pointer mAliases;     
+    Pointer mLocalFaces;  
+  };
+
+  void ShareShmBlockToProcess(uint32_t aIndex, base::ProcessId aPid,
+                              ipc::ReadOnlySharedMemoryHandle* aOut) {
+    MOZ_RELEASE_ASSERT(mReadOnlyShmems.Length() == mBlocks.Length());
+    if (aIndex >= mReadOnlyShmems.Length()) {
+      *aOut = nullptr;
+      return;
+    }
+    *aOut = mReadOnlyShmems[aIndex].Clone();
+    if (!*aOut) {
+      MOZ_CRASH("failed to share block");
+    }
+  }
+
+  void ShareBlocksToProcess(nsTArray<ipc::ReadOnlySharedMemoryHandle>* aBlocks,
+                            base::ProcessId aPid);
+
+  ipc::ReadOnlySharedMemoryHandle ShareBlockToProcess(uint32_t aIndex,
+                                                      base::ProcessId aPid);
+
+  void ShmBlockAdded(uint32_t aGeneration, uint32_t aIndex,
+                     ipc::ReadOnlySharedMemoryHandle aHandle);
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+  size_t AllocatedShmemSize() const;
+
+#if XP_LINUX
+  static constexpr uint32_t SHM_BLOCK_SIZE = 1024 * 1024;
+#else
+  static constexpr uint32_t SHM_BLOCK_SIZE = 256 * 1024;
+#endif
+  static_assert(SHM_BLOCK_SIZE <= (1 << Pointer::kBlockShift),
+                "SHM_BLOCK_SIZE too large");
+
+ private:
+  struct ShmBlock {
+    explicit ShmBlock(ipc::ReadOnlySharedMemoryMapping&& aShmem)
+        : mShmem(std::move(aShmem)) {
+      MOZ_ASSERT(!XRE_IsParentProcess());
+    }
+
+    explicit ShmBlock(ipc::SharedMemoryMapping&& aShmem)
+        : mShmem(std::move(aShmem)) {
+      MOZ_ASSERT(XRE_IsParentProcess());
+    }
+
+    void* Memory() const { return mShmem.Address(); }
+
+    void Clear() { mShmem = nullptr; }
+
+    uint32_t Allocated() const {
+      return static_cast<BlockHeader*>(Memory())->mAllocated;
+    }
+
+    void StoreAllocated(uint32_t aSize) {
+      MOZ_ASSERT(XRE_IsParentProcess());
+      static_cast<BlockHeader*>(Memory())->mAllocated.store(aSize);
+    }
+
+    uint32_t& BlockSize() const {
+      MOZ_ASSERT(XRE_IsParentProcess());
+      return static_cast<BlockHeader*>(Memory())->mBlockSize;
+    }
+
+   private:
+    ipc::MutableOrReadOnlySharedMemoryMapping mShmem;
+  };
+
+  Header& GetHeader() const;
+
+  bool AppendShmBlock(uint32_t aSizeNeeded);
+
+  [[nodiscard]] bool UpdateShmBlocks(bool aMustLock);
+
+  ShmBlock* GetBlockFromParent(uint32_t aIndex);
+
+  void DetachShmBlocks();
+
+  nsTArray<mozilla::UniquePtr<ShmBlock>> mBlocks;
+
+  nsTArray<ipc::ReadOnlySharedMemoryHandle> mReadOnlyShmems;
+
+};
+
+}  
+}  
+
+#endif

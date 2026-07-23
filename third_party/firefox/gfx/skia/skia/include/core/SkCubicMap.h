@@ -1,0 +1,39 @@
+/*
+ * Copyright 2018 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkCubicMap_DEFINED)
+#define SkCubicMap_DEFINED
+
+#include "include/core/SkPoint.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+
+class SK_API SkCubicMap {
+public:
+    SkCubicMap(SkPoint p1, SkPoint p2);
+
+    static bool IsLinear(SkPoint p1, SkPoint p2) {
+        return SkScalarNearlyEqual(p1.fX, p1.fY) && SkScalarNearlyEqual(p2.fX, p2.fY);
+    }
+
+    float computeYFromX(float x) const;
+
+    SkPoint computeFromT(float t) const;
+
+private:
+    enum Type {
+        kLine_Type,     
+        kCubeRoot_Type, 
+        kSolver_Type,   
+    };
+
+    SkPoint fCoeff[3];
+    Type    fType;
+};
+
+#endif
+

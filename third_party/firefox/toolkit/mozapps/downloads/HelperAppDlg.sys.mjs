@@ -1,0 +1,1118 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+
+import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
+import { BrowserUtils } from "resource://gre/modules/BrowserUtils.sys.mjs";
+
+const lazy = {};
+ChromeUtils.defineESModuleGetters(lazy, {
+  EnableDelayHelper: "resource://gre/modules/PromptUtils.sys.mjs",
+});
+
+XPCOMUtils.defineLazyServiceGetter(
+  lazy,
+  "gMIMEService",
+  "@mozilla.org/mime;1",
+  Ci.nsIMIMEService
+);
+
+import { Integration } from "resource://gre/modules/Integration.sys.mjs";
+
+Integration.downloads.defineESModuleGetter(
+  lazy,
+  "DownloadIntegration",
+  "resource://gre/modules/DownloadIntegration.sys.mjs"
+);
+
+
+function isUsableDirectory(aDirectory) {
+  return (
+    aDirectory.exists() && aDirectory.isDirectory() && aDirectory.isWritable()
+  );
+}
+
+function nsUnknownContentTypeDialogProgressListener(aHelperAppDialog) {
+  this.helperAppDlg = aHelperAppDialog;
+}
+
+nsUnknownContentTypeDialogProgressListener.prototype = {
+  onStatusChange(aWebProgress, aRequest, aStatus, aMessage) {
+    if (aStatus != Cr.NS_OK) {
+      Services.prompt.alert(
+        this.helperAppDlg.mDialog,
+        this.helperAppDlg.mTitle,
+        aMessage
+      );
+      this.helperAppDlg.onCancel();
+      if (this.helperAppDlg.mDialog) {
+        this.helperAppDlg.mDialog.close();
+      }
+    }
+  },
+
+  onProgressChange() {},
+
+  onProgressChange64() {},
+
+  onStateChange() {},
+
+  onLocationChange() {},
+
+  onSecurityChange() {},
+
+  onContentBlockingEvent() {},
+
+  onRefreshAttempted() {
+    return true;
+  },
+};
+
+
+
+const PREF_BD_USEDOWNLOADDIR = "browser.download.useDownloadDir";
+const nsITimer = Ci.nsITimer;
+
+import * as downloadModule from "resource://gre/modules/DownloadLastDir.sys.mjs";
+import { DownloadPaths } from "resource://gre/modules/DownloadPaths.sys.mjs";
+
+import { DownloadUtils } from "resource://gre/modules/DownloadUtils.sys.mjs";
+import { Downloads } from "resource://gre/modules/Downloads.sys.mjs";
+import { FileUtils } from "resource://gre/modules/FileUtils.sys.mjs";
+
+export class nsUnknownContentTypeDialog {
+  mLauncher = null;
+  mContext = null;
+  mReason = null;
+
+  mDialog = null;
+
+  chosenApp = null;
+  givenDefaultApp = false;
+  updateSelf = true;
+  mTitle = "";
+
+  classID = Components.ID("{F68578EB-6EC2-4169-AE19-8C6243F0ABE1}");
+  QueryInterface = ChromeUtils.generateQI([
+    "nsIHelperAppLauncherDialog",
+    "nsITimerCallback",
+  ]);
+
+
+  show(aLauncher, aContext, aReason) {
+    this.mLauncher = aLauncher;
+    this.mContext = aContext;
+    this.mReason = aReason;
+
+    try {
+      let parent = aContext.getInterface(Ci.nsIDOMWindow);
+      this._mDownloadDir = new downloadModule.DownloadLastDir(parent);
+    } catch (ex) {
+      console.error(
+        "Missing window information when showing nsIHelperAppLauncherDialog:",
+        ex
+      );
+    }
+
+    this._showTimer = Cc["@mozilla.org/timer;1"].createInstance(nsITimer);
+    this._showTimer.initWithCallback(this, 0, nsITimer.TYPE_ONE_SHOT);
+  }
+
+  reallyShow() {
+    try {
+      let docShell = this.mContext.getInterface(Ci.nsIDocShell);
+      let rootWin = docShell.browsingContext.topChromeWindow;
+      this.mDialog = Services.ww.openWindow(
+        rootWin,
+        "chrome://mozapps/content/downloads/unknownContentType.xhtml",
+        null,
+        "chrome,centerscreen,titlebar,dialog=yes,dependent",
+        null
+      );
+      this.mDialog.addEventListener("load", () => this.initDialog());
+    } catch (ex) {
+      this.mLauncher.cancel(Cr.NS_BINDING_ABORTED);
+      return;
+    }
+
+    this.mDialog.dialog = this;
+
+    var progressListener = new nsUnknownContentTypeDialogProgressListener(this);
+    this.mLauncher.setWebProgressListener(progressListener);
+  }
+
+  #log = null;
+  #logprefix = "";
+
+  #debuglog(...args) {
+    if (!this.#log) {
+      this.#log = console.createInstance({
+        maxLogLevelPref: "toolkit.download.loglevel",
+        prefix: "HelperAppService",
+      });
+      let info = this.mLauncher.MIMEInfo;
+      let primaryExtension = info.getFileExtensions().hasMore()
+        ? info.primaryExtension
+        : "";
+      this.#logprefix = `${info.MIMEType} - ${primaryExtension}`;
+    }
+    this.#log.debug(this.#logprefix, ...args);
+  }
+
+  displayBadPermissionAlert() {
+    let bundle = Services.strings.createBundle(
+      "chrome://mozapps/locale/downloads/unknownContentType.properties"
+    );
+
+    Services.prompt.alert(
+      this.mDialog,
+      bundle.GetStringFromName("badPermissions.title"),
+      bundle.GetStringFromName("badPermissions")
+    );
+  }
+
+  promptForSaveToFileAsync(
+    aLauncher,
+    aContext,
+    aDefaultFileName,
+    aSuggestedFileExtension,
+    aForcePrompt
+  ) {
+    var result = null;
+
+    this.mLauncher = aLauncher;
+
+    let bundle = Services.strings.createBundle(
+      "chrome://mozapps/locale/downloads/unknownContentType.properties"
+    );
+
+    let parent;
+    let gDownloadLastDir;
+    try {
+      parent = aContext.getInterface(Ci.nsIDOMWindow);
+    } catch (ex) {}
+
+    if (parent) {
+      gDownloadLastDir = new downloadModule.DownloadLastDir(parent);
+    } else {
+      gDownloadLastDir = this._mDownloadDir;
+      for (let someWin of Services.wm.getEnumerator("")) {
+        if (someWin != this.mDialog) {
+          parent = someWin;
+        }
+      }
+      if (!parent) {
+        console.error(
+          "No candidate parent windows were found for the save filepicker." +
+            "This should never happen."
+        );
+      }
+    }
+
+    (async () => {
+      if (!aForcePrompt) {
+        let autodownload = Services.prefs.getBoolPref(
+          PREF_BD_USEDOWNLOADDIR,
+          false
+        );
+
+        if (autodownload) {
+          let preferredDir = await Downloads.getPreferredDownloadsDirectory();
+          let defaultFolder = new FileUtils.File(preferredDir);
+
+          try {
+            if (aDefaultFileName) {
+              result = this.validateLeafName(
+                defaultFolder,
+                aDefaultFileName,
+                aSuggestedFileExtension
+              );
+            }
+          } catch (ex) {
+          }
+
+          if (result) {
+            aLauncher.saveDestinationAvailable(result);
+            return;
+          }
+        }
+      }
+
+      var nsIFilePicker = Ci.nsIFilePicker;
+      var picker =
+        Cc["@mozilla.org/filepicker;1"].createInstance(nsIFilePicker);
+      var windowTitle = bundle.GetStringFromName("saveDialogTitle");
+      picker.init(parent.browsingContext, windowTitle, nsIFilePicker.modeSave);
+      if (aDefaultFileName) {
+        picker.defaultString = this.getFinalLeafName(aDefaultFileName);
+      }
+
+      if (aSuggestedFileExtension) {
+        picker.defaultExtension = aSuggestedFileExtension.substring(1);
+      } else {
+        try {
+          picker.defaultExtension = this.mLauncher.MIMEInfo.primaryExtension;
+        } catch (ex) {}
+      }
+
+      var wildCardExtension = "*";
+      if (aSuggestedFileExtension) {
+        wildCardExtension += aSuggestedFileExtension;
+        picker.appendFilter(
+          this.mLauncher.MIMEInfo.description,
+          wildCardExtension
+        );
+      }
+
+      picker.appendFilters(nsIFilePicker.filterAll);
+
+      let preferredDir = await Downloads.getPreferredDownloadsDirectory();
+      picker.displayDirectory = new FileUtils.File(preferredDir);
+
+      gDownloadLastDir.getFileAsync(aLauncher.source).then(lastDir => {
+        if (lastDir && isUsableDirectory(lastDir)) {
+          picker.displayDirectory = lastDir;
+        }
+
+        picker.open(returnValue => {
+          if (returnValue == nsIFilePicker.returnCancel) {
+            aLauncher.saveDestinationAvailable(null);
+            return;
+          }
+
+          result = picker.file;
+
+          if (result) {
+            let allowOverwrite = false;
+            try {
+              if (
+                result.exists() &&
+                this.getFinalLeafName(result.leafName, "", true) ==
+                  result.leafName
+              ) {
+                allowOverwrite = true;
+              }
+            } catch (ex) {
+            }
+
+            var newDir = result.parent.QueryInterface(Ci.nsIFile);
+
+            gDownloadLastDir.setFile(aLauncher.source, newDir);
+
+            try {
+              result = this.validateLeafName(
+                newDir,
+                result.leafName,
+                null,
+                allowOverwrite,
+                true
+              );
+            } catch (ex) {
+
+              if (ex.result == Cr.NS_ERROR_FILE_ACCESS_DENIED) {
+                this.displayBadPermissionAlert();
+                aLauncher.saveDestinationAvailable(null);
+                return;
+              }
+            }
+          }
+          aLauncher.saveDestinationAvailable(result, true);
+        });
+      });
+    })().catch(console.error);
+  }
+
+  getFinalLeafName(aLeafName, aFileExt, aAfterFilePicker) {
+    return (
+      DownloadPaths.sanitize(aLeafName, {
+        compressWhitespaces: !aAfterFilePicker,
+        allowInvalidFilenames: aAfterFilePicker,
+      }) || "unnamed" + (aFileExt ? "." + aFileExt : "")
+    );
+  }
+
+  validateLeafName(
+    aLocalFolder,
+    aLeafName,
+    aFileExt,
+    aAllowExisting = false,
+    aAfterFilePicker = false
+  ) {
+    if (!(aLocalFolder && isUsableDirectory(aLocalFolder))) {
+      throw new Components.Exception(
+        "Destination directory non-existing or permission error",
+        Cr.NS_ERROR_FILE_ACCESS_DENIED
+      );
+    }
+
+    aLeafName = this.getFinalLeafName(aLeafName, aFileExt, aAfterFilePicker);
+    aLocalFolder.append(aLeafName);
+
+    if (!aAllowExisting) {
+      var validatedFile = DownloadPaths.createNiceUniqueFile(aLocalFolder);
+    } else {
+      validatedFile = aLocalFolder;
+    }
+
+    return validatedFile;
+  }
+
+
+  initDialog() {
+    var suggestedFileName = this.mLauncher.suggestedFileName;
+
+    this.mDialog.document.addEventListener("dialogaccept", this);
+    this.mDialog.document.addEventListener("dialogcancel", this);
+    this.mDialog.document
+      .getElementById("rememberChoice")
+      .addEventListener("command", event => {
+        this.toggleRememberChoice(event.target);
+      });
+    this.mDialog.document
+      .getElementById("openHandlerPopup")
+      .addEventListener("command", () => this.openHandlerCommand());
+    this.mDialog.document
+      .getElementById("chooseButton")
+      .addEventListener("command", () => this.chooseApp());
+    this.mDialog.addEventListener("unload", () => {
+      this.mDialog.dialog?.onCancel();
+    });
+
+    let url = this.mLauncher.source;
+
+    if (url instanceof Ci.nsINestedURI) {
+      url = url.innermostURI;
+    }
+
+    let iconPath = "goat";
+    let fname = "";
+    if (suggestedFileName) {
+      fname = iconPath = suggestedFileName;
+    } else if (url instanceof Ci.nsIURL) {
+      fname = iconPath = url.fileName;
+    } else if (["data", "blob"].includes(url.scheme)) {
+      let { MIMEType } = this.mLauncher.MIMEInfo;
+      fname = lazy.gMIMEService.getValidFileName(null, MIMEType, url, 0);
+    } else {
+      fname = url.pathQueryRef;
+    }
+
+    this.mSourcePath = url.prePath;
+    if (url instanceof Ci.nsIURL) {
+      this.mSourcePath += url.directory;
+    } else {
+      this.mSourcePath +=
+        url.pathQueryRef.length > 500
+          ? url.pathQueryRef.substring(0, 500) + "\u2026"
+          : url.pathQueryRef;
+    }
+
+    var displayName = fname.replace(/ +/g, " ");
+
+    this.mTitle = this.dialogElement("strings").getFormattedString("title", [
+      displayName,
+    ]);
+    this.mDialog.document.title = this.mTitle;
+
+    this.initIntro(url, displayName);
+
+    var iconString =
+      "moz-icon://" +
+      iconPath +
+      "?size=16&contentType=" +
+      this.mLauncher.MIMEInfo.MIMEType;
+    this.dialogElement("contentTypeImage").setAttribute("src", iconString);
+
+    let dialog = this.mDialog.document.getElementById("unknownContentType");
+
+    var mimeType = this.mLauncher.MIMEInfo.MIMEType;
+    var shouldntRememberChoice =
+      mimeType == "application/octet-stream" ||
+      mimeType == "application/x-msdownload" ||
+      this.mLauncher.targetFileIsExecutable;
+    if (
+      (shouldntRememberChoice && !this.canUseDefaultHandler()) ||
+      Services.prefs.getBoolPref("browser.download.forbid_open_with")
+    ) {
+      this.dialogElement("normalBox").collapsed = true;
+      this.dialogElement("basicBox").collapsed = false;
+      let acceptButton = dialog.getButton("accept");
+      acceptButton.label = this.dialogElement("strings").getString(
+        "unknownAccept.label"
+      );
+      acceptButton.setAttribute("icon", "save");
+      dialog.getButton("cancel").label = this.dialogElement(
+        "strings"
+      ).getString("unknownCancel.label");
+      this.dialogElement("openHandler").collapsed = true;
+      this.dialogElement("mode").selectedItem = this.dialogElement("save");
+    } else {
+      this.initInteractiveControls();
+
+      var rememberChoice = this.dialogElement("rememberChoice");
+
+
+      if (shouldntRememberChoice) {
+        rememberChoice.checked = false;
+        rememberChoice.hidden = true;
+      } else {
+        rememberChoice.checked =
+          !this.mLauncher.MIMEInfo.alwaysAskBeforeHandling &&
+          this.mLauncher.MIMEInfo.preferredAction !=
+            Ci.nsIMIMEInfo.handleInternally;
+      }
+      this.toggleRememberChoice(rememberChoice);
+    }
+
+    this.mDialog.setTimeout(() => {
+      this.postShowCallback();
+    }, 0);
+
+    this.delayHelper = new lazy.EnableDelayHelper({
+      disableDialog: () => {
+        dialog.getButton("accept").disabled = true;
+      },
+      enableDialog: () => {
+        dialog.getButton("accept").disabled = false;
+      },
+      focusTarget: this.mDialog,
+    });
+  }
+
+  notify(aTimer) {
+    if (aTimer == this._showTimer) {
+      if (!this.mDialog) {
+        this.reallyShow();
+      }
+      this._showTimer = null;
+    } else if (aTimer == this._saveToDiskTimer) {
+      this.mLauncher.promptForSaveDestination();
+      this._saveToDiskTimer = null;
+    }
+  }
+
+  postShowCallback() {
+    this.mDialog.sizeToContent();
+
+    this.dialogElement("mode").focus();
+  }
+
+  initIntro(url, displayName) {
+    this.dialogElement("location").value = displayName;
+    this.dialogElement("location").setAttribute("tooltiptext", displayName);
+
+    let pathString;
+    if (url instanceof Ci.nsIFileURL) {
+      try {
+        pathString = url.file.parent.path;
+      } catch (ex) {}
+    }
+
+    if (!pathString) {
+      pathString = BrowserUtils.formatURIForDisplay(url, {
+        showInsecureHTTP: true,
+      });
+    }
+
+    var location = this.dialogElement("source");
+    location.value = pathString;
+    location.setAttribute("tooltiptext", this.mSourcePath);
+
+    var type = this.dialogElement("type");
+    var mimeInfo = this.mLauncher.MIMEInfo;
+
+    var typeString = mimeInfo.description;
+
+    if (typeString == "") {
+      var primaryExtension = "";
+      try {
+        primaryExtension = mimeInfo.primaryExtension;
+      } catch (ex) {}
+      if (primaryExtension != "") {
+        typeString = this.dialogElement("strings").getFormattedString(
+          "fileType",
+          [primaryExtension.toUpperCase()]
+        );
+      }
+      else {
+        typeString = mimeInfo.MIMEType;
+      }
+    }
+    let value = typeString;
+    if (this.mLauncher.contentLength >= 0) {
+      let [size, unit] = DownloadUtils.convertByteUnits(
+        this.mLauncher.contentLength
+      );
+      value = this.dialogElement("strings").getFormattedString(
+        "orderedFileSizeWithType",
+        [typeString, size, unit]
+      );
+    }
+    type.textContent = value;
+  }
+
+  canUseDefaultHandler() {
+    if (AppConstants.platform == "win") {
+
+      return !this.mLauncher.targetFileIsExecutable;
+    }
+    return this.mLauncher.MIMEInfo.hasDefaultHandler;
+  }
+
+  initDefaultApp() {
+    var desc = this.mLauncher.MIMEInfo.defaultDescription;
+    this.#debuglog("Default app description:", desc);
+    if (desc) {
+      var defaultApp = this.dialogElement("strings").getFormattedString(
+        "defaultApp",
+        [desc]
+      );
+      this.dialogElement("defaultHandler").label = defaultApp;
+    } else {
+      this.dialogElement("modeDeck").selectedIndex = 1;
+      this.dialogElement("defaultHandler").hidden = true;
+    }
+  }
+
+  getPath(aFile) {
+    if (AppConstants.platform == "macosx") {
+      return aFile.leafName || aFile.path;
+    }
+    return aFile.path;
+  }
+
+  initInteractiveControls() {
+    var modeGroup = this.dialogElement("mode");
+
+    var canUseDefaultHandler = this.canUseDefaultHandler();
+    var mimeType = this.mLauncher.MIMEInfo.MIMEType;
+    var openHandler = this.dialogElement("openHandler");
+    if (
+      this.mLauncher.targetFileIsExecutable ||
+      ((mimeType == "application/octet-stream" ||
+        mimeType == "application/x-msdos-program" ||
+        mimeType == "application/x-msdownload") &&
+        !canUseDefaultHandler)
+    ) {
+      this.#debuglog(
+        "Showing save-only dialog;",
+        `is executable: ${this.mLauncher.targetFileIsExecutable}`,
+        `can use default handler: ${canUseDefaultHandler}`
+      );
+      this.dialogElement("open").disabled = true;
+      openHandler.disabled = true;
+      openHandler.selectedItem = null;
+      modeGroup.selectedItem = this.dialogElement("save");
+      return;
+    }
+
+    try {
+      this.chosenApp =
+        this.mLauncher.MIMEInfo.preferredApplicationHandler.QueryInterface(
+          Ci.nsILocalHandlerApp
+        );
+    } catch (e) {
+      this.chosenApp = null;
+    }
+    if (!this.chosenApp) {
+      try {
+        this.chosenApp =
+          this.mLauncher.MIMEInfo.preferredApplicationHandler.QueryInterface(
+            Ci.nsIGIOHandlerApp
+          );
+      } catch (e) {
+        this.chosenApp = null;
+      }
+    }
+
+    this.initDefaultApp();
+
+    var otherHandler = this.dialogElement("otherHandler");
+
+    if (
+      this.chosenApp instanceof Ci.nsILocalHandlerApp &&
+      this.chosenApp?.executable?.path
+    ) {
+      otherHandler.setAttribute(
+        "path",
+        this.getPath(this.chosenApp.executable)
+      );
+
+      otherHandler.label = this.getFileDisplayName(this.chosenApp.executable);
+      otherHandler.hidden = false;
+    }
+
+    if (this.chosenApp instanceof Ci.nsIGIOHandlerApp && this.chosenApp?.id) {
+      otherHandler.setAttribute("appid", this.chosenApp.id);
+      otherHandler.label = this.chosenApp.name;
+      otherHandler.hidden = false;
+    }
+
+    openHandler.selectedIndex = 0;
+    var defaultOpenHandler = this.dialogElement("defaultHandler");
+
+    if (this.shouldShowInternalHandlerOption()) {
+      this.dialogElement("handleInternally").hidden = false;
+    }
+
+    if (
+      this.mLauncher.MIMEInfo.preferredAction == Ci.nsIMIMEInfo.useSystemDefault
+    ) {
+      this.#debuglog("Selecting and showing system default handler");
+      modeGroup.selectedItem = this.dialogElement("open");
+    } else if (
+      this.mLauncher.MIMEInfo.preferredAction == Ci.nsIMIMEInfo.useHelperApp
+    ) {
+      this.#debuglog("Selecting and showing helper app");
+      modeGroup.selectedItem = this.dialogElement("open");
+      openHandler.selectedItem =
+        otherHandler && !otherHandler.hidden
+          ? otherHandler
+          : defaultOpenHandler;
+    } else if (
+      !this.dialogElement("handleInternally").hidden &&
+      this.mLauncher.MIMEInfo.preferredAction == Ci.nsIMIMEInfo.handleInternally
+    ) {
+      this.#debuglog("Selecting and showing internal handler");
+      modeGroup.selectedItem = this.dialogElement("handleInternally");
+    } else {
+      this.#debuglog("Selecting and showing save to disk");
+      modeGroup.selectedItem = this.dialogElement("save");
+    }
+
+    if (!canUseDefaultHandler) {
+      this.#debuglog("Disabling 'open with app' choice.");
+      var isSelected = defaultOpenHandler.selected;
+
+      defaultOpenHandler.hidden = true;
+      if (isSelected) {
+        openHandler.selectedIndex = 1;
+        if (this.dialogElement("open").selected) {
+          modeGroup.selectedItem = this.dialogElement("save");
+        }
+      }
+    }
+
+    otherHandler.nextSibling.hidden =
+      otherHandler.nextSibling.nextSibling.hidden = false;
+    this.updateOKButton();
+  }
+
+  helperAppChoice() {
+    return this.chosenApp;
+  }
+
+  get saveToDisk() {
+    return this.dialogElement("save").selected;
+  }
+
+  get useOtherHandler() {
+    return (
+      this.dialogElement("open").selected &&
+      this.dialogElement("openHandler").selectedIndex == 1
+    );
+  }
+
+  get useSystemDefault() {
+    return (
+      this.dialogElement("open").selected &&
+      this.dialogElement("openHandler").selectedIndex == 0
+    );
+  }
+
+  get handleInternally() {
+    return this.dialogElement("handleInternally").selected;
+  }
+
+  toggleRememberChoice(aCheckbox) {
+    this.dialogElement("settingsChange").hidden = !aCheckbox.checked;
+    this.mDialog.sizeToContent();
+  }
+
+  openHandlerCommand() {
+    var openHandler = this.dialogElement("openHandler");
+    if (openHandler.selectedItem.id == "choose") {
+      this.chooseApp();
+    } else {
+      openHandler.setAttribute(
+        "lastSelectedItemID",
+        openHandler.selectedItem.id
+      );
+    }
+  }
+
+  updateOKButton() {
+    var ok = false;
+    if (this.dialogElement("save").selected) {
+      ok = true;
+    } else if (this.dialogElement("open").selected) {
+      switch (this.dialogElement("openHandler").selectedIndex) {
+        case 0:
+          ok = true;
+          break;
+        case 1:
+          ok =
+            this.chosenApp ||
+            /\S/.test(
+              this.dialogElement("otherHandler").getAttribute("path")
+            ) ||
+            /\S/.test(this.dialogElement("otherHandler").getAttribute("appid"));
+          break;
+      }
+    }
+
+    let dialog = this.mDialog.document.getElementById("unknownContentType");
+    dialog.getButton("accept").disabled = !ok;
+  }
+
+  appChanged() {
+    return (
+      this.helperAppChoice() !=
+      this.mLauncher.MIMEInfo.preferredApplicationHandler
+    );
+  }
+
+  updateMIMEInfo() {
+    let { MIMEInfo } = this.mLauncher;
+
+
+    let areAlwaysOpeningInternally =
+      MIMEInfo.preferredAction == Ci.nsIMIMEInfo.handleInternally &&
+      !MIMEInfo.alwaysAskBeforeHandling;
+    let discardUpdate =
+      areAlwaysOpeningInternally &&
+      !this.dialogElement("rememberChoice").checked;
+
+    var needUpdate = false;
+    if (this.saveToDisk) {
+      needUpdate =
+        this.mLauncher.MIMEInfo.preferredAction != Ci.nsIMIMEInfo.saveToDisk;
+      if (needUpdate) {
+        this.mLauncher.MIMEInfo.preferredAction = Ci.nsIMIMEInfo.saveToDisk;
+      }
+    } else if (this.useSystemDefault) {
+      needUpdate =
+        this.mLauncher.MIMEInfo.preferredAction !=
+        Ci.nsIMIMEInfo.useSystemDefault;
+      if (needUpdate) {
+        this.mLauncher.MIMEInfo.preferredAction =
+          Ci.nsIMIMEInfo.useSystemDefault;
+      }
+    } else if (this.useOtherHandler) {
+      needUpdate =
+        this.mLauncher.MIMEInfo.preferredAction !=
+          Ci.nsIMIMEInfo.useHelperApp || this.appChanged();
+      if (needUpdate) {
+        this.mLauncher.MIMEInfo.preferredAction = Ci.nsIMIMEInfo.useHelperApp;
+        var app = this.helperAppChoice();
+        this.mLauncher.MIMEInfo.preferredApplicationHandler = app;
+      }
+    } else if (this.handleInternally) {
+      needUpdate =
+        this.mLauncher.MIMEInfo.preferredAction !=
+        Ci.nsIMIMEInfo.handleInternally;
+      if (needUpdate) {
+        this.mLauncher.MIMEInfo.preferredAction =
+          Ci.nsIMIMEInfo.handleInternally;
+      }
+    }
+    needUpdate =
+      needUpdate ||
+      this.mLauncher.MIMEInfo.alwaysAskBeforeHandling !=
+        !this.dialogElement("rememberChoice").checked;
+
+    needUpdate = needUpdate || !this.mLauncher.MIMEInfo.alwaysAskBeforeHandling;
+
+    this.mLauncher.MIMEInfo.alwaysAskBeforeHandling =
+      !this.dialogElement("rememberChoice").checked;
+
+    return needUpdate && !discardUpdate;
+  }
+
+  updateHelperAppPref() {
+    var handlerInfo = this.mLauncher.MIMEInfo;
+    var hs = Cc["@mozilla.org/uriloader/handler-service;1"].getService(
+      Ci.nsIHandlerService
+    );
+    hs.store(handlerInfo);
+  }
+
+  onOK(aEvent) {
+    if (this.useOtherHandler) {
+      var helperApp = this.helperAppChoice();
+      if (
+        helperApp &&
+        helperApp instanceof Ci.nsILocalHandlerApp &&
+        !helperApp.executable?.exists()
+      ) {
+        var bundle = this.dialogElement("strings");
+        var msg = bundle.getFormattedString("badApp", [
+          this.dialogElement("otherHandler").getAttribute("path"),
+        ]);
+        Services.prompt.alert(
+          this.mDialog,
+          bundle.getString("badApp.title"),
+          msg
+        );
+
+        let dialog = this.mDialog.document.getElementById("unknownContentType");
+        dialog.getButton("accept").disabled = true;
+        this.dialogElement("mode").focus();
+
+        this.chosenApp = null;
+
+        aEvent.preventDefault();
+      }
+    }
+
+    this.mLauncher.setWebProgressListener(null);
+
+    try {
+      var needUpdate = this.updateMIMEInfo();
+
+      if (this.dialogElement("save").selected) {
+        this._saveToDiskTimer =
+          Cc["@mozilla.org/timer;1"].createInstance(nsITimer);
+        this._saveToDiskTimer.initWithCallback(this, 0, nsITimer.TYPE_ONE_SHOT);
+      } else {
+        let uri = this.mLauncher.source;
+        if (uri instanceof Ci.nsIFileURL) {
+          this.mLauncher.launchLocalFile();
+        } else {
+          this.mLauncher.setDownloadToLaunch(this.handleInternally, null);
+        }
+      }
+
+      if (
+        needUpdate &&
+        this.mLauncher.MIMEInfo.MIMEType != "application/octet-stream"
+      ) {
+        this.updateHelperAppPref();
+      }
+    } catch (e) {
+      console.error(e);
+    }
+
+    this.onUnload();
+  }
+
+  onCancel() {
+    this.mLauncher.setWebProgressListener(null);
+
+    try {
+      this.mLauncher.cancel(Cr.NS_BINDING_ABORTED);
+    } catch (e) {
+      console.error(e);
+    }
+
+    this.onUnload();
+  }
+
+  onUnload() {
+    this.mDialog.document.removeEventListener("dialogaccept", this);
+    this.mDialog.document.removeEventListener("dialogcancel", this);
+
+    this.mDialog.dialog = null;
+  }
+
+  handleEvent(aEvent) {
+    switch (aEvent.type) {
+      case "dialogaccept":
+        this.onOK(aEvent);
+        break;
+      case "dialogcancel":
+        this.onCancel();
+        break;
+    }
+  }
+
+  dialogElement(id) {
+    return this.mDialog.document.getElementById(id);
+  }
+
+  getFileDisplayName(file) {
+    if (AppConstants.platform == "win") {
+      if (file instanceof Ci.nsILocalFileWin) {
+        try {
+          return file.getVersionInfoField("FileDescription");
+        } catch (e) {}
+      }
+    } else if (AppConstants.platform == "macosx") {
+      if (file instanceof Ci.nsILocalFileMac) {
+        try {
+          return file.bundleDisplayName;
+        } catch (e) {}
+      }
+    }
+    return file.leafName;
+  }
+
+  finishChooseApp() {
+    if (this.chosenApp) {
+      this.dialogElement("modeDeck").selectedIndex = 0;
+
+      var otherHandler = this.dialogElement("otherHandler");
+      otherHandler.removeAttribute("hidden");
+      if (this.chosenApp instanceof Ci.nsIGIOHandlerApp) {
+        otherHandler.setAttribute("appid", this.chosenApp.id);
+      } else {
+        otherHandler.setAttribute(
+          "path",
+          this.getPath(this.chosenApp.executable)
+        );
+      }
+      if (AppConstants.platform == "win") {
+        otherHandler.label = this.getFileDisplayName(this.chosenApp.executable);
+      } else {
+        otherHandler.label = this.chosenApp.name;
+      }
+      this.dialogElement("openHandler").selectedIndex = 1;
+      this.dialogElement("openHandler").setAttribute(
+        "lastSelectedItemID",
+        "otherHandler"
+      );
+
+      this.dialogElement("mode").selectedItem = this.dialogElement("open");
+    } else {
+      var openHandler = this.dialogElement("openHandler");
+      var lastSelectedID = openHandler.getAttribute("lastSelectedItemID");
+      if (!lastSelectedID) {
+        lastSelectedID = "defaultHandler";
+      }
+      openHandler.selectedItem = this.dialogElement(lastSelectedID);
+    }
+  }
+
+  chooseApp() {
+    if (AppConstants.platform == "win") {
+      var fileExtension = "";
+      try {
+        fileExtension = this.mLauncher.MIMEInfo.primaryExtension;
+      } catch (ex) {}
+
+      var typeString = this.mLauncher.MIMEInfo.description;
+
+      if (!typeString) {
+        if (fileExtension) {
+          typeString = this.dialogElement("strings").getFormattedString(
+            "fileType",
+            [fileExtension.toUpperCase()]
+          );
+        } else {
+          typeString = this.mLauncher.MIMEInfo.MIMEType;
+        }
+      }
+
+      var params = {};
+      params.title = this.dialogElement("strings").getString(
+        "chooseAppFilePickerTitle"
+      );
+      params.description = typeString;
+      params.filename = this.mLauncher.suggestedFileName;
+      params.mimeInfo = this.mLauncher.MIMEInfo;
+      params.handlerApp = null;
+
+      this.mDialog.openDialog(
+        "chrome://global/content/appPicker.xhtml",
+        null,
+        "chrome,modal,centerscreen,titlebar,dialog=yes",
+        params
+      );
+
+      if (
+        params.handlerApp &&
+        params.handlerApp.executable &&
+        params.handlerApp.executable.isFile()
+      ) {
+        this.chosenApp = params.handlerApp;
+      }
+    } else if ("@mozilla.org/applicationchooser;1" in Cc) {
+      var nsIApplicationChooser = Ci.nsIApplicationChooser;
+      var appChooser = Cc["@mozilla.org/applicationchooser;1"].createInstance(
+        nsIApplicationChooser
+      );
+      appChooser.init(
+        this.mDialog,
+        this.dialogElement("strings").getString("chooseAppFilePickerTitle")
+      );
+      var contentTypeDialogObj = this;
+      let appChooserCallback = function appChooserCallback_done(aResult) {
+        if (aResult instanceof Ci.nsILocalHandlerApp) {
+          contentTypeDialogObj.chosenApp = aResult.QueryInterface(
+            Ci.nsILocalHandlerApp
+          );
+        } else if (aResult && aResult instanceof Ci.nsIGIOHandlerApp) {
+          contentTypeDialogObj.chosenApp = aResult.QueryInterface(
+            Ci.nsIGIOHandlerApp
+          );
+        }
+        contentTypeDialogObj.finishChooseApp();
+      };
+      appChooser.open(this.mLauncher.MIMEInfo.MIMEType, appChooserCallback);
+      return;
+    } else {
+      var nsIFilePicker = Ci.nsIFilePicker;
+      var fp = Cc["@mozilla.org/filepicker;1"].createInstance(nsIFilePicker);
+      fp.init(
+        this.mDialog.browsingContext,
+        this.dialogElement("strings").getString("chooseAppFilePickerTitle"),
+        nsIFilePicker.modeOpen
+      );
+
+      fp.appendFilters(nsIFilePicker.filterApps);
+
+      fp.open(aResult => {
+        if (aResult == nsIFilePicker.returnOK && fp.file) {
+          var localHandlerApp = Cc[
+            "@mozilla.org/uriloader/local-handler-app;1"
+          ].createInstance(Ci.nsILocalHandlerApp);
+          localHandlerApp.executable = fp.file;
+          this.chosenApp = localHandlerApp;
+        }
+        this.finishChooseApp();
+      });
+      return;
+    }
+
+    this.finishChooseApp();
+  }
+
+  shouldShowInternalHandlerOption() {
+    let browsingContext = this.mDialog.BrowsingContext.get(
+      this.mLauncher.browsingContextId
+    );
+    let primaryExtension = "";
+    try {
+      primaryExtension = this.mLauncher.MIMEInfo.primaryExtension;
+    } catch (e) {}
+
+    if (primaryExtension == "pdf") {
+      return (
+        !(
+          this.mLauncher.source.schemeIs("blob") ||
+          this.mLauncher.source.equalsExceptRef(
+            browsingContext.currentWindowGlobal.documentURI
+          )
+        ) &&
+        !Services.prefs.getBoolPref("pdfjs.disabled", true) &&
+        Services.prefs.getBoolPref(
+          "browser.helperApps.showOpenOptionForPdfJS",
+          false
+        )
+      );
+    }
+
+    return (
+      Services.prefs.getBoolPref(
+        "browser.helperApps.showOpenOptionForViewableInternally",
+        false
+      ) &&
+      lazy.DownloadIntegration.shouldViewDownloadInternally(
+        this.mLauncher.MIMEInfo.MIMEType,
+        primaryExtension
+      )
+    );
+  }
+}

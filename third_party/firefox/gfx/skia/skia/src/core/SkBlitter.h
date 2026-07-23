@@ -1,0 +1,234 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkBlitter_DEFINED)
+#define SkBlitter_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkPixmap.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkRegion.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkCPUTypes.h"
+#include "include/private/base/SkDebug.h"
+#include "include/private/base/SkTo.h"
+#include "src/base/SkAutoMalloc.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+
+class SkArenaAlloc;
+class SkMatrix;
+class SkPaint;
+class SkShader;
+class SkSurfaceProps;
+struct SkMask;
+enum class SkDrawCoverage : bool;
+
+class SkBlitter {
+public:
+    virtual ~SkBlitter();
+    SkBlitter() = default;
+    SkBlitter(const SkBlitter&) = delete;
+    SkBlitter(SkBlitter&&) = delete;
+    SkBlitter& operator=(const SkBlitter&) = delete;
+    SkBlitter& operator=(SkBlitter&&) = delete;
+
+    virtual void blitH(int x, int y, int width) = 0;
+
+    virtual void blitAntiH(int x, int y, const SkAlpha antialias[], const int16_t runs[]) = 0;
+
+    virtual void blitV(int x, int y, int height, SkAlpha alpha);
+
+    virtual void blitRect(int x, int y, int width, int height);
+
+    virtual void blitAntiRect(int x, int y, int width, int height,
+                              SkAlpha leftAlpha, SkAlpha rightAlpha);
+
+    void blitFatAntiRect(const SkRect& rect);
+
+    virtual void blitMask(const SkMask&, const SkIRect& clip);
+
+    virtual void blitAntiH2(int x, int y, U8CPU a0, U8CPU a1) {
+        int16_t runs[3];
+        uint8_t aa[2];
+
+        runs[0] = 1;
+        runs[1] = 1;
+        runs[2] = 0;
+        aa[0] = SkToU8(a0);
+        aa[1] = SkToU8(a1);
+        this->blitAntiH(x, y, aa, runs);
+    }
+
+    virtual void blitAntiV2(int x, int y, U8CPU a0, U8CPU a1) {
+        int16_t runs[2];
+        uint8_t aa[1];
+
+        runs[0] = 1;
+        runs[1] = 0;
+        aa[0] = SkToU8(a0);
+        this->blitAntiH(x, y, aa, runs);
+        runs[0] = 1;
+        runs[1] = 0;
+        aa[0] = SkToU8(a1);
+        this->blitAntiH(x, y + 1, aa, runs);
+    }
+
+    virtual int requestRowsPreserved() const { return 1; }
+
+
+    struct DirectBlit {
+        SkPixmap pm;
+        uint64_t value; 
+    };
+    virtual std::optional<DirectBlit> canDirectBlit() { return {}; }
+
+    virtual void* allocBlitMemory(size_t sz) {
+        return fBlitMemory.reset(sz, SkAutoMalloc::kReuse_OnShrink);
+    }
+
+    void blitMaskRegion(const SkMask& mask, const SkRegion& clip);
+    void blitRectRegion(const SkIRect& rect, const SkRegion& clip);
+    void blitRegion(const SkRegion& clip);
+
+    static SkBlitter* Choose(const SkPixmap& dst,
+                             const SkMatrix& ctm,
+                             const SkPaint& paint,
+                             SkArenaAlloc*,
+                             SkDrawCoverage,
+                             sk_sp<SkShader> clipShader,
+                             const SkSurfaceProps& props,
+                             const SkRect& devBounds);
+
+    static SkBlitter* ChooseSprite(const SkPixmap& dst,
+                                   const SkPaint&,
+                                   const SkPixmap& src,
+                                   int left, int top,
+                                   SkArenaAlloc*, sk_sp<SkShader> clipShader);
+
+    static bool UseLegacyBlitter(const SkPixmap&, const SkPaint&, const SkMatrix&);
+
+protected:
+    SkAutoMalloc fBlitMemory;
+};
+
+class SkNullBlitter final : public SkBlitter {
+public:
+    void blitH(int x, int y, int width) override {}
+    void blitAntiH(int x, int y, const SkAlpha[], const int16_t runs[]) override {}
+    void blitV(int x, int y, int height, SkAlpha alpha) override {}
+    void blitRect(int x, int y, int width, int height) override {}
+    void blitMask(const SkMask&, const SkIRect& clip) override {}
+};
+
+class SkRectClipBlitter final : public SkBlitter {
+public:
+    void init(SkBlitter* blitter, const SkIRect& clipRect) {
+        SkASSERT(!clipRect.isEmpty());
+        fBlitter = blitter;
+        fClipRect = clipRect;
+    }
+
+    void blitH(int x, int y, int width) override;
+    void blitAntiH(int x, int y, const SkAlpha[], const int16_t runs[]) override;
+    void blitV(int x, int y, int height, SkAlpha alpha) override;
+    void blitRect(int x, int y, int width, int height) override;
+    void blitAntiRect(int x, int y, int width, int height,
+                      SkAlpha leftAlpha, SkAlpha rightAlpha) override;
+    void blitMask(const SkMask&, const SkIRect& clip) override;
+
+    int requestRowsPreserved() const override {
+        return fBlitter->requestRowsPreserved();
+    }
+
+    void* allocBlitMemory(size_t sz) override {
+        return fBlitter->allocBlitMemory(sz);
+    }
+
+private:
+    SkBlitter*  fBlitter;
+    SkIRect     fClipRect;
+};
+
+class SkRgnClipBlitter final : public SkBlitter {
+public:
+    void init(SkBlitter* blitter, const SkRegion* clipRgn) {
+        SkASSERT(clipRgn && !clipRgn->isEmpty());
+        fBlitter = blitter;
+        fRgn = clipRgn;
+    }
+
+    void blitH(int x, int y, int width) override;
+    void blitAntiH(int x, int y, const SkAlpha[], const int16_t runs[]) override;
+    void blitV(int x, int y, int height, SkAlpha alpha) override;
+    void blitRect(int x, int y, int width, int height) override;
+    void blitAntiRect(int x, int y, int width, int height,
+                      SkAlpha leftAlpha, SkAlpha rightAlpha) override;
+    void blitMask(const SkMask&, const SkIRect& clip) override;
+
+    int requestRowsPreserved() const override {
+        return fBlitter->requestRowsPreserved();
+    }
+
+    void* allocBlitMemory(size_t sz) override {
+        return fBlitter->allocBlitMemory(sz);
+    }
+
+private:
+    SkBlitter*      fBlitter;
+    const SkRegion* fRgn;
+};
+
+#if defined(SK_DEBUG)
+class SkRectClipCheckBlitter final : public SkBlitter {
+public:
+    void init(SkBlitter* blitter, const SkIRect& clipRect) {
+        SkASSERT(blitter);
+        SkASSERT(!clipRect.isEmpty());
+        fBlitter = blitter;
+        fClipRect = clipRect;
+    }
+
+    void blitH(int x, int y, int width) override;
+    void blitAntiH(int x, int y, const SkAlpha[], const int16_t runs[]) override;
+    void blitV(int x, int y, int height, SkAlpha alpha) override;
+    void blitRect(int x, int y, int width, int height) override;
+    void blitAntiRect(int x, int y, int width, int height,
+                              SkAlpha leftAlpha, SkAlpha rightAlpha) override;
+    void blitMask(const SkMask&, const SkIRect& clip) override;
+    void blitAntiH2(int x, int y, U8CPU a0, U8CPU a1) override;
+    void blitAntiV2(int x, int y, U8CPU a0, U8CPU a1) override;
+
+    int requestRowsPreserved() const override {
+        return fBlitter->requestRowsPreserved();
+    }
+
+    void* allocBlitMemory(size_t sz) override {
+        return fBlitter->allocBlitMemory(sz);
+    }
+
+private:
+    SkBlitter*  fBlitter;
+    SkIRect     fClipRect;
+};
+#endif
+
+class SkBlitterClipper {
+public:
+    SkBlitter*  apply(SkBlitter* blitter, const SkRegion* clip,
+                      const SkIRect* bounds = nullptr);
+
+private:
+    SkNullBlitter       fNullBlitter;
+    SkRectClipBlitter   fRectBlitter;
+    SkRgnClipBlitter    fRgnBlitter;
+};
+
+#endif

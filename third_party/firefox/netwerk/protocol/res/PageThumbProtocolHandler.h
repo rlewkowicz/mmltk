@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef PageThumbProtocolHandler_h_
+#define PageThumbProtocolHandler_h_
+
+#include "mozilla/Result.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/net/RemoteStreamGetter.h"
+#include "SubstitutingProtocolHandler.h"
+#include "nsIInputStream.h"
+#include "nsWeakReference.h"
+
+namespace mozilla {
+namespace net {
+
+class RemoteStreamGetter;
+
+class PageThumbProtocolHandler final : public nsISubstitutingProtocolHandler,
+                                       public SubstitutingProtocolHandler,
+                                       public nsSupportsWeakReference {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_FORWARD_NSIPROTOCOLHANDLER(SubstitutingProtocolHandler::)
+  NS_FORWARD_NSISUBSTITUTINGPROTOCOLHANDLER(SubstitutingProtocolHandler::)
+
+  static already_AddRefed<PageThumbProtocolHandler> GetSingleton();
+
+  RefPtr<RemoteStreamPromise> NewStream(nsIURI* aChildURI,
+                                        nsILoadInfo* aLoadInfo,
+                                        bool* aTerminateSender);
+
+ protected:
+  ~PageThumbProtocolHandler() = default;
+
+ private:
+  explicit PageThumbProtocolHandler();
+
+  [[nodiscard]] bool ResolveSpecialCases(const nsACString& aHost,
+                                         const nsACString& aPath,
+                                         const nsACString& aPathname,
+                                         nsACString& aResult) override;
+
+  [[nodiscard]] virtual nsresult SubstituteChannel(
+      nsIURI* aURI, nsILoadInfo* aLoadInfo, nsIChannel** aRetVal) override;
+
+  Result<Ok, nsresult> SubstituteRemoteChannel(nsIURI* aURI,
+                                               nsILoadInfo* aLoadInfo,
+                                               nsIChannel** aRetVal);
+
+  nsresult GetThumbnailPath(const nsACString& aPath, const nsACString& aHost,
+                            nsString& aThumbnailPath);
+
+  static StaticRefPtr<PageThumbProtocolHandler> sSingleton;
+
+  static void NewSimpleChannel(nsIURI* aURI, nsILoadInfo* aLoadinfo,
+                               RemoteStreamGetter* aStreamGetter,
+                               nsIChannel** aRetVal);
+};
+
+}  
+}  
+
+#endif /* PageThumbProtocolHandler_h_ */

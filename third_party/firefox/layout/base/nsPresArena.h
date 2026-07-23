@@ -1,0 +1,53 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+
+#ifndef nsPresArena_h_
+#define nsPresArena_h_
+
+#include "mozilla/ArenaAllocator.h"
+#include "mozilla/ArenaObjectID.h"
+#include "mozilla/MemoryChecking.h"  // Note: Do not remove this, needed for MOZ_HAVE_MEM_CHECKS below
+#include "mozilla/MemoryReporting.h"
+#include "nsHashKeys.h"
+#include "nsTArray.h"
+#include "nsTHashtable.h"
+#include "nscore.h"
+
+class nsWindowSizes;
+
+template <size_t ArenaSize, typename ObjectId, size_t ObjectIdCount>
+class nsPresArena {
+ public:
+  nsPresArena() = default;
+  ~nsPresArena();
+
+  void* Allocate(ObjectId aCode, size_t aSize);
+  void Free(ObjectId aCode, void* aPtr);
+
+  enum class ArenaKind { PresShell, DisplayList };
+  void AddSizeOfExcludingThis(nsWindowSizes&, ArenaKind) const;
+
+  void Check() { mPool.Check(); }
+
+ private:
+  class FreeList {
+   public:
+    nsTArray<void*> mEntries;
+    size_t mEntrySize;
+    size_t mEntriesEverAllocated;
+
+    FreeList() : mEntrySize(0), mEntriesEverAllocated(0) {}
+
+    size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+      return mEntries.ShallowSizeOfExcludingThis(aMallocSizeOf);
+    }
+  };
+
+  FreeList mFreeLists[ObjectIdCount];
+  mozilla::ArenaAllocator<ArenaSize, 8> mPool;
+};
+
+#endif

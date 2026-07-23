@@ -1,0 +1,62 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+* Copyright (c) 2004-2006, International Business Machines
+* Corporation and others.  All Rights Reserved.
+**********************************************************************
+* Author: Alan Liu
+* Created: April 26, 2004
+* Since: ICU 3.0
+**********************************************************************
+*/
+#ifndef __CURRENCYAMOUNT_H__
+#define __CURRENCYAMOUNT_H__
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/measure.h"
+#include "unicode/currunit.h"
+
+ 
+U_NAMESPACE_BEGIN
+
+class U_I18N_API CurrencyAmount: public Measure {
+ public:
+    CurrencyAmount(const Formattable& amount, ConstChar16Ptr isoCode,
+                   UErrorCode &ec);
+
+    CurrencyAmount(double amount, ConstChar16Ptr isoCode,
+                   UErrorCode &ec);
+
+    CurrencyAmount(const CurrencyAmount& other);
+ 
+    CurrencyAmount& operator=(const CurrencyAmount& other);
+
+    virtual CurrencyAmount* clone() const override;
+
+    virtual ~CurrencyAmount();
+    
+    virtual UClassID getDynamicClassID() const override;
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    const CurrencyUnit& getCurrency() const;
+
+    inline const char16_t* getISOCurrency() const;
+};
+
+inline const char16_t* CurrencyAmount::getISOCurrency() const {
+    return getCurrency().getISOCurrency();
+}
+
+U_NAMESPACE_END
+
+#endif // !UCONFIG_NO_FORMATTING
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // __CURRENCYAMOUNT_H__

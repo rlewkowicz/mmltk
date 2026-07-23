@@ -1,0 +1,464 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#if !defined(mozilla_Assertions_h)
+#define mozilla_Assertions_h
+
+#if !defined(__cplusplus)
+#if !defined(bool)
+#    include <stdbool.h>
+#endif
+#endif
+
+#if (defined(MOZ_HAS_MOZGLUE) || defined(MOZILLA_INTERNAL_API)) && \
+    !defined(__wasi__)
+#  define MOZ_DUMP_ASSERTION_STACK
+#endif
+
+#if !defined(__wasi__)
+#  include <unistd.h>
+#  define MOZ_GET_PID() getpid()
+#else
+#  define MOZ_GET_PID() -1
+#endif
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Likely.h"
+#include "mozilla/MacroArgs.h"
+#include "mozilla/StaticAnalysisFunctions.h"
+#include "mozilla/Types.h"
+#if defined(MOZ_DUMP_ASSERTION_STACK)
+#  include "mozilla/StackWalk.h"
+#endif
+
+MOZ_BEGIN_EXTERN_C
+extern MFBT_DATA const char* gMozCrashReason;
+MOZ_END_EXTERN_C
+
+#if defined(MOZ_HAS_MOZGLUE) || defined(MOZILLA_INTERNAL_API)
+static inline void AnnotateMozCrashReason(const char* reason) {
+  gMozCrashReason = reason;
+#if defined(__clang__)
+  asm volatile("" : "+r,m"(gMozCrashReason) : : "memory");
+#else
+  asm volatile("" : "+m,r"(gMozCrashReason) : : "memory");
+#endif
+}
+#  define MOZ_CRASH_ANNOTATE(...) AnnotateMozCrashReason(__VA_ARGS__)
+#else
+#  define MOZ_CRASH_ANNOTATE(...) \
+    do {             \
+    } while (false)
+#endif
+
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#if defined(_MSC_VER)
+MOZ_BEGIN_EXTERN_C
+__declspec(dllimport) int __stdcall TerminateProcess(void* hProcess,
+                                                     unsigned int uExitCode);
+__declspec(dllimport) void* __stdcall GetCurrentProcess(void);
+MOZ_END_EXTERN_C
+#endif
+
+MOZ_BEGIN_EXTERN_C
+
+
+static inline const char* MOZ_StripRelativeComponents(const char* aPath) {
+  if (!aPath || *aPath == '/' || *aPath == '\\') {
+    return aPath;
+  }
+  const char* result = aPath;
+  for (const char* cur = aPath; *cur == '.' || *cur == '/' || *cur == '\\';
+       ++cur) {
+    if (*cur != '.') {
+      result = cur + 1;
+    }
+  }
+  return result;
+}
+
+
+[[maybe_unused]] static MOZ_COLD MOZ_NEVER_INLINE void
+MOZ_ReportAssertionFailure(const char* aStr, const char* aFilename,
+                           int aLine) MOZ_PRETEND_NORETURN_FOR_STATIC_ANALYSIS {
+  aFilename = MOZ_StripRelativeComponents(aFilename);
+#if defined(MOZ_BUFFER_STDERR)
+  char msg[1024] = "";
+  snprintf(msg, sizeof(msg) - 1, "[%d] Assertion failure: %s, at %s:%d\n",
+           MOZ_GET_PID(), aStr, aFilename, aLine);
+  fputs(msg, stderr);
+#else
+  fprintf(stderr, "[%d] Assertion failure: %s, at %s:%d\n", MOZ_GET_PID(), aStr,
+          aFilename, aLine);
+#endif
+#if defined(MOZ_DUMP_ASSERTION_STACK)
+  MozWalkTheStack(stderr, CallerPC(),  0);
+#endif
+  fflush(stderr);
+}
+
+[[maybe_unused]] static MOZ_COLD MOZ_NEVER_INLINE void MOZ_ReportCrash(
+    const char* aStr, const char* aFilename,
+    int aLine) MOZ_PRETEND_NORETURN_FOR_STATIC_ANALYSIS {
+  aFilename = MOZ_StripRelativeComponents(aFilename);
+#if defined(MOZ_BUFFER_STDERR)
+  char msg[1024] = "";
+  snprintf(msg, sizeof(msg) - 1, "[%d] Hit MOZ_CRASH(%s) at %s:%d\n",
+           MOZ_GET_PID(), aStr, aFilename, aLine);
+  fputs(msg, stderr);
+#else
+  fprintf(stderr, "[%d] Hit MOZ_CRASH(%s) at %s:%d\n", MOZ_GET_PID(), aStr,
+          aFilename, aLine);
+#endif
+#if defined(MOZ_DUMP_ASSERTION_STACK)
+  MozWalkTheStack(stderr, CallerPC(),  0);
+#endif
+  fflush(stderr);
+}
+
+#define MOZ_ASSUME_UNREACHABLE_MARKER() __builtin_unreachable()
+
+#if defined(_MSC_VER)
+
+[[maybe_unused, noreturn]] static MOZ_COLD MOZ_NEVER_INLINE void MOZ_NoReturn(
+    int aLine) {
+  *((volatile int*)NULL) = aLine;
+  TerminateProcess(GetCurrentProcess(), 3);
+  MOZ_ASSUME_UNREACHABLE_MARKER();
+}
+
+#  define MOZ_REALLY_CRASH(line)  \
+    do {                          \
+      MOZ_NOMERGE __debugbreak(); \
+      MOZ_NoReturn(line);         \
+    } while (false)
+
+#elif __wasi__
+
+#  define MOZ_REALLY_CRASH(line) __builtin_trap()
+
+#else
+
+static inline void MOZ_CrashSequence(void* aAddress, intptr_t aLine) {
+#if defined(__i386__) || defined(__x86_64__)
+  asm volatile(
+      "mov %1, (%0);\n"  
+      :                  
+      : "r"(aAddress), "r"(aLine));
+#elif defined(__arm__) || defined(__aarch64__)
+  asm volatile(
+      "str %1,[%0];\n"  
+      :                 
+      : "r"(aAddress), "r"(aLine));
+#elif (defined(__riscv) && (__riscv_xlen == 64)) || defined(__mips64)
+  asm volatile(
+      "sd %1,0(%0);\n"  
+      :                 
+      : "r"(aAddress), "r"(aLine));
+#elif defined(__sparc__) && defined(__arch64__)
+  asm volatile(
+      "stx %1,[%0];\n"  
+      :                 
+      : "r"(aAddress), "r"(aLine));
+#elif defined(__loongarch64)
+  asm volatile(
+      "st.d %1,%0,0;\n"  
+      :                  
+      : "r"(aAddress), "r"(aLine));
+#else
+#    warning \
+        "Unsupported architecture, replace the code below with assembly suitable to crash the process"
+  asm volatile("" ::: "memory");
+  *((volatile int*)aAddress) = aLine; /* NOLINT */
+#endif
+}
+
+#if defined(MOZ_UBSAN)
+#    define MOZ_CRASH_WRITE_ADDR ((void*)0x1)
+#else
+#    define MOZ_CRASH_WRITE_ADDR NULL
+#endif
+
+#if defined(__cplusplus)
+#    define MOZ_REALLY_CRASH(line)                     \
+      do {                                             \
+        MOZ_CrashSequence(MOZ_CRASH_WRITE_ADDR, line); \
+        MOZ_NOMERGE ::abort();                         \
+      } while (false)
+#else
+#    define MOZ_REALLY_CRASH(line)                     \
+      do {                                             \
+        MOZ_CrashSequence(MOZ_CRASH_WRITE_ADDR, line); \
+        MOZ_NOMERGE abort();                           \
+      } while (false)
+#endif
+#endif
+
+#if !(defined(DEBUG) || defined(MOZ_ASAN) || 0)
+#  define MOZ_CRASH(...)                                                       \
+    do {                                                                       \
+      MOZ_CRASH_ANNOTATE("MOZ_CRASH(" __VA_ARGS__ ")");                        \
+      MOZ_REALLY_CRASH(__LINE__);                                              \
+    } while (false)
+#else
+#  define MOZ_CRASH(...)                                                       \
+    do {                                                                       \
+      MOZ_ReportCrash("" __VA_ARGS__, __FILE__, __LINE__);                     \
+      MOZ_CRASH_ANNOTATE("MOZ_CRASH(" __VA_ARGS__ ")");                        \
+      MOZ_REALLY_CRASH(__LINE__);                                              \
+    } while (false)
+#endif
+
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+#  define MOZ_DIAGNOSTIC_CRASH(...) MOZ_CRASH(__VA_ARGS__)
+#else
+#  define MOZ_DIAGNOSTIC_CRASH(...) \
+    do {               \
+    } while (false)
+#endif
+
+#if defined(__cplusplus)
+[[noreturn]]
+#else
+_Noreturn
+#endif
+static MOZ_ALWAYS_INLINE_EVEN_DEBUG MOZ_COLD void MOZ_Crash(
+    const char* aFilename, int aLine, const char* aReason) {
+  aFilename = MOZ_StripRelativeComponents(aFilename);
+#if defined(DEBUG) || defined(MOZ_ASAN) || 0
+  MOZ_ReportCrash(aReason, aFilename, aLine);
+#endif
+  MOZ_CRASH_ANNOTATE(aReason);
+  MOZ_REALLY_CRASH(aLine);
+}
+#define MOZ_CRASH_UNSAFE(reason) MOZ_Crash(__FILE__, __LINE__, reason)
+
+static const size_t sPrintfMaxArgs = 4;
+static const size_t sPrintfCrashReasonSize = 1024;
+
+MFBT_API MOZ_COLD MOZ_NEVER_INLINE MOZ_FORMAT_PRINTF(1, 2) const
+    char* MOZ_CrashPrintf(const char* aFormat, ...);
+
+#define MOZ_CRASH_UNSAFE_PRINTF(format, ...)                                \
+  do {                                                                      \
+    static_assert(MOZ_ARG_COUNT(__VA_ARGS__) > 0,                           \
+                  "Did you forget arguments to MOZ_CRASH_UNSAFE_PRINTF? "   \
+                  "Or maybe you want MOZ_CRASH instead?");                  \
+    static_assert(MOZ_ARG_COUNT(__VA_ARGS__) <= sPrintfMaxArgs,             \
+                  "Only up to 4 additional arguments are allowed!");        \
+    static_assert(sizeof(format) <= sPrintfCrashReasonSize,                 \
+                  "The supplied format string is too long!");               \
+    MOZ_Crash(__FILE__, __LINE__, MOZ_CrashPrintf("" format, __VA_ARGS__)); \
+  } while (false)
+
+MOZ_END_EXTERN_C
+
+
+
+#if defined(__cplusplus)
+#  include <type_traits>
+namespace mozilla {
+namespace detail {
+
+template <typename T>
+struct AssertionConditionType {
+  using ValueT = std::remove_reference_t<T>;
+  static_assert(!std::is_array_v<ValueT>,
+                "Expected boolean assertion condition, got an array or a "
+                "string!");
+  static_assert(!std::is_function_v<ValueT>,
+                "Expected boolean assertion condition, got a function! Did "
+                "you intend to call that function?");
+  static_assert(!std::is_floating_point_v<ValueT>,
+                "It's often a bad idea to assert that a floating-point number "
+                "is nonzero, because such assertions tend to intermittently "
+                "fail. Shouldn't your code gracefully handle this case instead "
+                "of asserting? Anyway, if you really want to do that, write an "
+                "explicit boolean condition, like !!x or x!=0.");
+
+  static const bool isValid = true;
+};
+
+}  
+}  
+#  define MOZ_VALIDATE_ASSERT_CONDITION_TYPE(x)                        \
+    static_assert(                                                     \
+        mozilla::detail::AssertionConditionType<decltype(x)>::isValid, \
+        "invalid assertion condition")
+#else
+#  define MOZ_VALIDATE_ASSERT_CONDITION_TYPE(x)
+#endif
+
+#if defined(DEBUG) || defined(MOZ_ASAN) || 0
+#  define MOZ_REPORT_ASSERTION_FAILURE(...) \
+    MOZ_ReportAssertionFailure(__VA_ARGS__)
+#else
+#  define MOZ_REPORT_ASSERTION_FAILURE(...) \
+    do {                       \
+    } while (false)
+#endif
+
+#define MOZ_ASSERT_HELPER1(kind, expr)                                   \
+  do {                                                                   \
+    MOZ_VALIDATE_ASSERT_CONDITION_TYPE(expr);                            \
+    if (MOZ_UNLIKELY(!MOZ_CHECK_ASSERT_ASSIGNMENT(expr))) {              \
+      MOZ_REPORT_ASSERTION_FAILURE(#expr, __FILE__, __LINE__);           \
+      MOZ_CRASH_ANNOTATE(kind "(" #expr ")");                            \
+      MOZ_REALLY_CRASH(__LINE__);                                        \
+    }                                                                    \
+  } while (false)
+#define MOZ_ASSERT_HELPER2(kind, expr, explain)                          \
+  do {                                                                   \
+    MOZ_VALIDATE_ASSERT_CONDITION_TYPE(expr);                            \
+    if (MOZ_UNLIKELY(!MOZ_CHECK_ASSERT_ASSIGNMENT(expr))) {              \
+      MOZ_REPORT_ASSERTION_FAILURE(#expr " (" explain ")", __FILE__,     \
+                                   __LINE__);                            \
+      MOZ_CRASH_ANNOTATE(kind "(" #expr ") (" explain ")");              \
+      MOZ_REALLY_CRASH(__LINE__);                                        \
+    }                                                                    \
+  } while (false)
+
+#define MOZ_ASSERT_GLUE(a, b) a b
+#define MOZ_RELEASE_ASSERT(...)                                       \
+  MOZ_ASSERT_GLUE(                                                    \
+      MOZ_PASTE_PREFIX_AND_ARG_COUNT(MOZ_ASSERT_HELPER, __VA_ARGS__), \
+      ("MOZ_RELEASE_ASSERT", __VA_ARGS__))
+
+#if defined(DEBUG)
+#  define MOZ_ASSERT(...)                                               \
+    MOZ_ASSERT_GLUE(                                                    \
+        MOZ_PASTE_PREFIX_AND_ARG_COUNT(MOZ_ASSERT_HELPER, __VA_ARGS__), \
+        ("MOZ_ASSERT", __VA_ARGS__))
+#else
+#  define MOZ_ASSERT(...) \
+    do {     \
+    } while (false)
+#endif
+
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+#  define MOZ_DIAGNOSTIC_ASSERT(...)                                    \
+    MOZ_ASSERT_GLUE(                                                    \
+        MOZ_PASTE_PREFIX_AND_ARG_COUNT(MOZ_ASSERT_HELPER, __VA_ARGS__), \
+        ("MOZ_DIAGNOSTIC_ASSERT", __VA_ARGS__))
+#else
+#  define MOZ_DIAGNOSTIC_ASSERT(...) \
+    do {                \
+    } while (false)
+#endif
+
+#if defined(DEBUG)
+#  define MOZ_ASSERT_IF(cond, expr) \
+    do {                            \
+      if (cond) {                   \
+        MOZ_ASSERT(expr);           \
+      }                             \
+    } while (false)
+#else
+#  define MOZ_ASSERT_IF(cond, expr) \
+    do {               \
+    } while (false)
+#endif
+
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+#  define MOZ_DIAGNOSTIC_ASSERT_IF(cond, expr) \
+    do {                                       \
+      if (cond) {                              \
+        MOZ_DIAGNOSTIC_ASSERT(expr);           \
+      }                                        \
+    } while (false)
+#else
+#  define MOZ_DIAGNOSTIC_ASSERT_IF(cond, expr) \
+    do {                          \
+    } while (false)
+#endif
+
+
+#define MOZ_ASSERT_UNREACHABLE(reason) \
+  MOZ_ASSERT(false, "MOZ_ASSERT_UNREACHABLE: " reason)
+
+#define MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE(reason) \
+  do {                                                  \
+    MOZ_ASSERT_UNREACHABLE(reason);                     \
+    MOZ_ASSUME_UNREACHABLE_MARKER();                    \
+  } while (false)
+
+/**
+ * MOZ_FALLTHROUGH_ASSERT is an annotation to suppress compiler warnings about
+ * switch cases that MOZ_ASSERT(false) (or its alias MOZ_ASSERT_UNREACHABLE) in
+ * debug builds, but intentionally fall through in release builds to handle
+ * unexpected values.
+ *
+ * Why do we need MOZ_FALLTHROUGH_ASSERT in addition to [[fallthrough]]? In
+ * release builds, the MOZ_ASSERT(false) will expand to `do { } while (false)`,
+ * requiring a [[fallthrough]] annotation to suppress a -Wimplicit-fallthrough
+ * warning. In debug builds, the MOZ_ASSERT(false) will expand to something like
+ * `if (true) { MOZ_CRASH(); }` and the [[fallthrough]] annotation will cause
+ * a -Wunreachable-code warning. The MOZ_FALLTHROUGH_ASSERT macro breaks this
+ * warning stalemate.
+ *
+ * // Example before MOZ_FALLTHROUGH_ASSERT:
+ * switch (foo) {
+ *   default:
+ *     // This case wants to assert in debug builds, fall through in release.
+ *     MOZ_ASSERT(false); // -Wimplicit-fallthrough warning in release builds!
+ *     [[fallthrough]];   // but -Wunreachable-code warning in debug builds!
+ *   case 5:
+ *     return 5;
+ * }
+ *
+ * // Example with MOZ_FALLTHROUGH_ASSERT:
+ * switch (foo) {
+ *   default:
+ *     // This case asserts in debug builds, falls through in release.
+ *     MOZ_FALLTHROUGH_ASSERT("Unexpected foo value?!");
+ *   case 5:
+ *     return 5;
+ * }
+ */
+#if defined(DEBUG)
+#  define MOZ_FALLTHROUGH_ASSERT(...) \
+    MOZ_CRASH("MOZ_FALLTHROUGH_ASSERT: " __VA_ARGS__)
+#else
+#  define MOZ_FALLTHROUGH_ASSERT(...) [[fallthrough]]
+#endif
+
+#define MOZ_ALWAYS_TRUE(expr)      \
+  do {                             \
+    if (MOZ_LIKELY(expr)) {        \
+       \
+    } else {                       \
+      MOZ_DIAGNOSTIC_CRASH(#expr); \
+    }                              \
+  } while (false)
+
+#define MOZ_ALWAYS_FALSE(expr) MOZ_ALWAYS_TRUE(!(expr))
+#define MOZ_ALWAYS_OK(expr) MOZ_ALWAYS_TRUE((expr).isOk())
+#define MOZ_ALWAYS_ERR(expr) MOZ_ALWAYS_TRUE((expr).isErr())
+
+#undef MOZ_BUFFER_STDERR
+#undef MOZ_CRASH_CRASHREPORT
+#undef MOZ_DUMP_ASSERTION_STACK
+
+#if defined(__cplusplus)
+namespace mozilla::detail {
+[[noreturn]] MFBT_API MOZ_COLD void InvalidArrayIndex_CRASH(size_t aIndex,
+                                                            size_t aLength);
+}  
+#endif
+
+#if defined(__cplusplus)
+namespace mozilla {
+template <typename T>
+static inline T MakeCompilerAssumeUnreachableFakeValue() {
+  MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE();
+}
+}  
+#endif
+
+#undef MOZ_GET_PID
+
+#endif

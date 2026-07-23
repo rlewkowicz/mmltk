@@ -1,0 +1,539 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/quota/QuotaCommon.h"
+
+#if defined(QM_ERROR_STACKS_ENABLED)
+#  include "base/process_util.h"
+#endif
+#include "mozIStorageConnection.h"
+#include "mozIStorageStatement.h"
+#include "mozilla/ErrorNames.h"
+#include "mozilla/Logging.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/SourcePathLiteral.h"
+#include "mozilla/TextUtils.h"
+#include "mozilla/dom/quota/ResultExtensions.h"
+#include "mozilla/dom/quota/ScopedLogExtraInfo.h"
+#include "nsIConsoleService.h"
+#include "nsIFile.h"
+#include "nsServiceManagerUtils.h"
+#include "nsStringFlags.h"
+#include "nsTStringRepr.h"
+#include "nsUnicharUtils.h"
+#include "nsXPCOM.h"
+#include "nsXULAppAPI.h"
+
+
+namespace mozilla {
+
+RefPtr<BoolPromise> CreateAndRejectBoolPromise(StaticString aFunc,
+                                               nsresult aRv) {
+  return CreateAndRejectMozPromise<BoolPromise>(aFunc, aRv);
+}
+
+RefPtr<Int64Promise> CreateAndRejectInt64Promise(StaticString aFunc,
+                                                 nsresult aRv) {
+  return CreateAndRejectMozPromise<Int64Promise>(aFunc, aRv);
+}
+
+RefPtr<BoolPromise> CreateAndRejectBoolPromiseFromQMResult(
+    StaticString aFunc, const QMResult& aRv) {
+  return CreateAndRejectMozPromise<BoolPromise>(aFunc, aRv);
+}
+
+namespace dom::quota {
+
+namespace {
+
+#if defined(DEBUG)
+constexpr auto kDSStoreFileName = u".DS_Store"_ns;
+constexpr auto kDesktopFileName = u".desktop"_ns;
+constexpr auto kDesktopIniFileName = u"desktop.ini"_ns;
+constexpr auto kThumbsDbFileName = u"thumbs.db"_ns;
+#endif
+
+
+LazyLogModule gLogger("QuotaManager");
+
+void AnonymizeCString(nsACString& aCString, uint32_t aStart) {
+  MOZ_ASSERT(!aCString.IsEmpty());
+  MOZ_ASSERT(aStart < aCString.Length());
+
+  char* iter = aCString.BeginWriting() + aStart;
+  char* end = aCString.EndWriting();
+
+  while (iter != end) {
+    char c = *iter;
+
+    if (IsAsciiAlpha(c)) {
+      *iter = 'a';
+    } else if (IsAsciiDigit(c)) {
+      *iter = 'D';
+    }
+
+    ++iter;
+  }
+}
+
+}  
+
+const char kQuotaGenericDelimiter = '|';
+
+#if defined(NIGHTLY_BUILD)
+const nsLiteralCString kQuotaInternalError = "internal"_ns;
+const nsLiteralCString kQuotaExternalError = "external"_ns;
+#endif
+
+LogModule* GetQuotaManagerLogger() { return gLogger; }
+
+void AnonymizeCString(nsACString& aCString) {
+  if (aCString.IsEmpty()) {
+    return;
+  }
+  AnonymizeCString(aCString,  0);
+}
+
+void AnonymizeOriginString(nsACString& aOriginString) {
+  if (aOriginString.IsEmpty()) {
+    return;
+  }
+
+  int32_t start = aOriginString.FindChar(':');
+  if (start < 0) {
+    start = 0;
+  }
+
+  AnonymizeCString(aOriginString, start);
+}
+
+
+Result<nsCOMPtr<nsIFile>, nsresult> QM_NewLocalFile(const nsAString& aPath) {
+  QM_TRY_UNWRAP(
+      auto file,
+      MOZ_TO_RESULT_INVOKE_TYPED(nsCOMPtr<nsIFile>, NS_NewLocalFile, aPath),
+      QM_PROPAGATE, [&aPath](const nsresult rv) {
+        QM_WARNING("Failed to construct a file for path (%s)",
+                   NS_ConvertUTF16toUTF8(aPath).get());
+      });
+
+
+  return file;
+}
+
+nsDependentCSubstring GetLeafName(const nsACString& aPath) {
+  nsACString::const_iterator start, end;
+  aPath.BeginReading(start);
+  aPath.EndReading(end);
+
+  bool found = RFindInReadable("/"_ns, start, end);
+  if (found) {
+    start = end;
+  }
+
+  aPath.EndReading(end);
+
+  return nsDependentCSubstring(start.get(), end.get());
+}
+
+Result<nsCOMPtr<nsIFile>, nsresult> CloneFileAndAppend(
+    nsIFile& aDirectory, const nsAString& aPathElement) {
+  QM_TRY_UNWRAP(auto resultFile, MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                                     nsCOMPtr<nsIFile>, aDirectory, Clone));
+
+  QM_TRY(MOZ_TO_RESULT(resultFile->Append(aPathElement)));
+
+  return resultFile;
+}
+
+Result<nsIFileKind, nsresult> GetDirEntryKind(nsIFile& aFile) {
+  QM_TRY_RETURN(QM_OR_ELSE_LOG_VERBOSE_IF(
+      MOZ_TO_RESULT_INVOKE_MEMBER(aFile, IsDirectory)
+          .map([](const bool isDirectory) {
+            return isDirectory ? nsIFileKind::ExistsAsDirectory
+                               : nsIFileKind::ExistsAsFile;
+          }),
+      ([](const nsresult rv) {
+        return rv == NS_ERROR_FILE_NOT_FOUND ||
+               rv == NS_ERROR_FILE_FS_CORRUPTED;
+      }),
+      ErrToOk<nsIFileKind::DoesNotExist>));
+}
+
+Result<nsCOMPtr<mozIStorageStatement>, nsresult> CreateStatement(
+    mozIStorageConnection& aConnection, const nsACString& aStatementString) {
+  QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+      nsCOMPtr<mozIStorageStatement>, aConnection, CreateStatement,
+      aStatementString));
+}
+
+template <SingleStepResult ResultHandling>
+Result<SingleStepSuccessType<ResultHandling>, nsresult> ExecuteSingleStep(
+    nsCOMPtr<mozIStorageStatement>&& aStatement) {
+  QM_TRY_INSPECT(const bool& hasResult,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(aStatement, ExecuteStep));
+
+  if constexpr (ResultHandling == SingleStepResult::AssertHasResult) {
+    MOZ_ASSERT(hasResult);
+    (void)hasResult;
+
+    return WrapNotNullUnchecked(std::move(aStatement));
+  } else {
+    return hasResult ? std::move(aStatement) : nullptr;
+  }
+}
+
+template Result<SingleStepSuccessType<SingleStepResult::AssertHasResult>,
+                nsresult>
+ExecuteSingleStep<SingleStepResult::AssertHasResult>(
+    nsCOMPtr<mozIStorageStatement>&&);
+
+template Result<SingleStepSuccessType<SingleStepResult::ReturnNullIfNoResult>,
+                nsresult>
+ExecuteSingleStep<SingleStepResult::ReturnNullIfNoResult>(
+    nsCOMPtr<mozIStorageStatement>&&);
+
+template <SingleStepResult ResultHandling>
+Result<SingleStepSuccessType<ResultHandling>, nsresult>
+CreateAndExecuteSingleStepStatement(mozIStorageConnection& aConnection,
+                                    const nsACString& aStatementString) {
+  QM_TRY_UNWRAP(auto stmt, MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                               nsCOMPtr<mozIStorageStatement>, aConnection,
+                               CreateStatement, aStatementString));
+
+  return ExecuteSingleStep<ResultHandling>(std::move(stmt));
+}
+
+template Result<SingleStepSuccessType<SingleStepResult::AssertHasResult>,
+                nsresult>
+CreateAndExecuteSingleStepStatement<SingleStepResult::AssertHasResult>(
+    mozIStorageConnection& aConnection, const nsACString& aStatementString);
+
+template Result<SingleStepSuccessType<SingleStepResult::ReturnNullIfNoResult>,
+                nsresult>
+CreateAndExecuteSingleStepStatement<SingleStepResult::ReturnNullIfNoResult>(
+    mozIStorageConnection& aConnection, const nsACString& aStatementString);
+
+namespace detail {
+
+nsDependentCSubstring GetTreeBase(const nsLiteralCString& aPath,
+                                  const nsLiteralCString& aRelativePath) {
+  MOZ_ASSERT(StringEndsWith(aPath, aRelativePath));
+  return Substring(aPath, 0, aPath.Length() - aRelativePath.Length());
+}
+
+nsDependentCSubstring GetSourceTreeBase() {
+  static constexpr auto thisSourceFileRelativePath =
+      "/dom/quota/QuotaCommon.cpp"_sp;
+
+  return GetTreeBase(nsLiteralCString(__FILE__), thisSourceFileRelativePath);
+}
+
+nsDependentCSubstring GetObjdirDistIncludeTreeBase(
+    const nsLiteralCString& aQuotaCommonHPath) {
+  static constexpr auto quotaCommonHSourceFileRelativePath =
+      "/mozilla/dom/quota/QuotaCommon.h"_sp;
+
+  return GetTreeBase(aQuotaCommonHPath, quotaCommonHSourceFileRelativePath);
+}
+
+static constexpr auto kSourceFileRelativePathMap =
+    std::array<std::pair<nsLiteralCString, nsLiteralCString>, 1>{
+        {{"mozilla/dom/LocalStorageCommon.h"_sp,
+          "dom/localstorage/LocalStorageCommon.h"_sp}}};
+
+static nsDependentCSubstring StripRelativeComponents(
+    const nsACString& aSourceFilePath) {
+  size_t index = 0;
+  for (char c : Span(aSourceFilePath)) {
+    if (c == '.' || c == '/' || c == '\\') {
+      index++;
+    } else {
+      break;
+    }
+  }
+  return Substring(aSourceFilePath, index);
+}
+
+static nsDependentCSubstring MapDistIncludePathToSource(
+    const nsACString& aDistIncludePath) {
+  const auto foundIt = std::find_if(kSourceFileRelativePathMap.cbegin(),
+                                    kSourceFileRelativePathMap.cend(),
+                                    [&aDistIncludePath](const auto& entry) {
+                                      return entry.first == aDistIncludePath;
+                                    });
+
+  if (MOZ_UNLIKELY(foundIt != kSourceFileRelativePathMap.cend())) {
+    return Substring(foundIt->second, 0);
+  }
+
+  static constexpr auto mozillaRelativeBase = "mozilla/"_sp;
+  if (StringBeginsWith(aDistIncludePath, mozillaRelativeBase)) [[likely]] {
+    return Substring(aDistIncludePath, mozillaRelativeBase.Length());
+  }
+
+  return nsDependentCSubstring(aDistIncludePath);
+}
+
+nsDependentCSubstring MakeSourceFileRelativePath(
+    const nsACString& aSourceFilePath) {
+  static constexpr auto error = "ERROR"_ns;
+  static constexpr auto kDistInclude = "dist/include/"_sp;
+  static constexpr auto kCheckoutsGecko = "checkouts/gecko/"_sp;
+  static constexpr auto kBuildSrc = "build/src/"_sp;
+
+  if (StringBeginsWith(aSourceFilePath, "."_ns)) {
+    nsDependentCSubstring stripped = StripRelativeComponents(aSourceFilePath);
+    if (StringBeginsWith(stripped, kDistInclude)) {
+      return MapDistIncludePathToSource(
+          Substring(stripped, kDistInclude.Length()));
+    }
+    if (StringBeginsWith(stripped, kCheckoutsGecko)) {
+      return Substring(stripped, kCheckoutsGecko.Length());
+    }
+    if (StringBeginsWith(stripped, kBuildSrc)) {
+      return Substring(stripped, kBuildSrc.Length());
+    }
+    return stripped;
+  }
+
+  static const auto sourceTreeBase = GetSourceTreeBase();
+
+  if (MOZ_LIKELY(StringBeginsWith(aSourceFilePath, sourceTreeBase))) {
+    return Substring(aSourceFilePath, sourceTreeBase.Length() + 1);
+  }
+
+  static const auto objdirDistIncludeTreeBase = GetObjdirDistIncludeTreeBase();
+
+  if (MOZ_LIKELY(
+          StringBeginsWith(aSourceFilePath, objdirDistIncludeTreeBase))) {
+    return MapDistIncludePathToSource(
+        Substring(aSourceFilePath, objdirDistIncludeTreeBase.Length() + 1));
+  }
+
+  nsCString::const_iterator begin, end;
+  if (RFindInReadable("/"_sp, aSourceFilePath.BeginReading(begin),
+                      aSourceFilePath.EndReading(end))) {
+    ++begin;
+    return Substring(begin, aSourceFilePath.EndReading(end));
+  }
+
+  return nsDependentCSubstring{Span(static_cast<const nsCString&>(error))};
+}
+
+}  
+
+#if defined(QM_LOG_ERROR_ENABLED)
+#if defined(QM_ERROR_STACKS_ENABLED)
+void LogError(const nsACString& aExpr, const ResultType& aResult,
+              const nsACString& aSourceFilePath, const int32_t aSourceFileLine,
+              const Severity aSeverity)
+#else
+void LogError(const nsACString& aExpr, const Maybe<nsresult> aMaybeRv,
+              const nsACString& aSourceFilePath, const int32_t aSourceFileLine,
+              const Severity aSeverity)
+#endif
+{
+
+  if (aSeverity == Severity::Verbose) {
+    return;
+  }
+
+  const Tainted<nsCString>* contextTaintedPtr = nullptr;
+
+#if defined(QM_SCOPED_LOG_EXTRA_INFO_ENABLED)
+  const auto& extraInfoMap = ScopedLogExtraInfo::GetExtraInfoMap();
+
+  if (const auto contextIt =
+          extraInfoMap.find(ScopedLogExtraInfo::kTagContextTainted);
+      contextIt != extraInfoMap.cend()) {
+    contextTaintedPtr = contextIt->second;
+  }
+#endif
+
+  const auto severityString = [&aSeverity]() -> nsLiteralCString {
+    switch (aSeverity) {
+      case Severity::Error:
+        return "ERROR"_ns;
+      case Severity::Warning:
+        return "WARNING"_ns;
+      case Severity::Info:
+        return "INFO"_ns;
+      case Severity::Verbose:
+        return "VERBOSE"_ns;
+    }
+    MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Bad severity value!");
+  }();
+
+  Maybe<nsresult> maybeRv;
+
+#if defined(QM_ERROR_STACKS_ENABLED)
+  if (aResult.is<QMResult>()) {
+    maybeRv = Some(aResult.as<QMResult>().NSResult());
+  } else if (aResult.is<nsresult>()) {
+    maybeRv = Some(aResult.as<nsresult>());
+  }
+#else
+  maybeRv = aMaybeRv;
+#endif
+
+  nsAutoCString rvCode;
+  nsAutoCString rvName;
+
+  if (maybeRv) {
+    nsresult rv = *maybeRv;
+
+    if (rv == NS_ERROR_DOM_QM_CLIENT_INIT_ORIGIN_UNINITIALIZED) {
+      return;
+    }
+
+    rvCode = nsPrintfCString("0x%" PRIX32, static_cast<uint32_t>(rv));
+
+    if (NS_ERROR_GET_MODULE(rv) == NS_ERROR_MODULE_WIN32) {
+      rvName = nsPrintfCString(
+          "NS_ERROR_GENERATE_FAILURE(NS_ERROR_MODULE_WIN32, 0x%" PRIX16 ")",
+          NS_ERROR_GET_CODE(rv));
+    } else {
+      mozilla::GetErrorName(rv, rvName);
+    }
+  }
+
+#if defined(QM_ERROR_STACKS_ENABLED)
+  nsAutoCString frameIdString;
+  nsAutoCString stackIdString;
+  nsAutoCString processIdString;
+
+  if (aResult.is<QMResult>()) {
+    const QMResult& result = aResult.as<QMResult>();
+    frameIdString = IntToCString(result.FrameId());
+    stackIdString = IntToCString(result.StackId());
+    processIdString =
+        IntToCString(static_cast<uint32_t>(base::GetCurrentProcId()));
+  }
+#endif
+
+  auto extraInfosStringTainted = Tainted<nsAutoCString>([&] {
+    nsAutoCString extraInfosString;
+
+    if (!rvCode.IsEmpty()) {
+      extraInfosString.Append(" failed with resultCode "_ns + rvCode);
+    }
+
+    if (!rvName.IsEmpty()) {
+      extraInfosString.Append(", resultName "_ns + rvName);
+    }
+
+#if defined(QM_ERROR_STACKS_ENABLED)
+    if (!frameIdString.IsEmpty()) {
+      extraInfosString.Append(", frameId "_ns + frameIdString);
+    }
+
+    if (!stackIdString.IsEmpty()) {
+      extraInfosString.Append(", stackId "_ns + stackIdString);
+    }
+
+    if (!processIdString.IsEmpty()) {
+      extraInfosString.Append(", processId "_ns + processIdString);
+    }
+#endif
+
+#if defined(QM_SCOPED_LOG_EXTRA_INFO_ENABLED)
+    for (const auto& item : extraInfoMap) {
+      const auto& valueTainted = *item.second;
+
+      extraInfosString.Append(
+          ", "_ns + nsDependentCString(item.first) + " "_ns +
+          MOZ_NO_VALIDATE(valueTainted,
+                          "It's okay to append any `extraInfoMap` value to "
+                          "`extraInfosString`."));
+    }
+#endif
+
+    return extraInfosString;
+  }());
+
+  const auto sourceFileRelativePath =
+      detail::MakeSourceFileRelativePath(aSourceFilePath);
+
+#if defined(QM_LOG_ERROR_TO_CONSOLE_ENABLED)
+  NS_DebugBreak(
+      NS_DEBUG_WARNING,
+      nsAutoCString("QM_TRY failure ("_ns + severityString + ")"_ns).get(),
+      (MOZ_NO_VALIDATE(extraInfosStringTainted,
+                       "It's okay to check if `extraInfosString` is empty.")
+               .IsEmpty()
+           ? nsPromiseFlatCString(aExpr)
+           : static_cast<const nsCString&>(nsAutoCString(
+                 aExpr + MOZ_NO_VALIDATE(extraInfosStringTainted,
+                                         "It's okay to log `extraInfosString` "
+                                         "to stdout/console."))))
+          .get(),
+      nsPromiseFlatCString(sourceFileRelativePath).get(), aSourceFileLine);
+#endif
+
+#if defined(QM_LOG_ERROR_TO_BROWSER_CONSOLE_ENABLED)
+  if (contextTaintedPtr) {
+    nsCOMPtr<nsIConsoleService> console =
+        do_GetService(NS_CONSOLESERVICE_CONTRACTID);
+    if (console) {
+      NS_ConvertUTF8toUTF16 message(
+          "QM_TRY failure ("_ns + severityString + ")"_ns + ": '"_ns + aExpr +
+          MOZ_NO_VALIDATE(
+              extraInfosStringTainted,
+              "It's okay to log `extraInfosString` to the browser console.") +
+          "', file "_ns + sourceFileRelativePath + ":"_ns +
+          IntToCString(aSourceFileLine));
+
+
+      console->LogStringMessage(message.get());
+    }
+  }
+#endif
+
+}
+#endif
+
+#if defined(DEBUG)
+Result<bool, nsresult> WarnIfFileIsUnknown(nsIFile& aFile,
+                                           const char* aSourceFilePath,
+                                           const int32_t aSourceFileLine) {
+  nsString leafName;
+  nsresult rv = aFile.GetLeafName(leafName);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return Err(rv);
+  }
+
+  bool isDirectory;
+  rv = aFile.IsDirectory(&isDirectory);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return Err(rv);
+  }
+
+  if (!isDirectory) {
+    if (leafName.Equals(kDSStoreFileName) ||
+        leafName.Equals(kDesktopFileName) ||
+        leafName.Equals(kDesktopIniFileName,
+                        nsCaseInsensitiveStringComparator) ||
+        leafName.Equals(kThumbsDbFileName, nsCaseInsensitiveStringComparator)) {
+      return false;
+    }
+
+    if (leafName.First() == char16_t('.')) {
+      return false;
+    }
+  }
+
+  NS_DebugBreak(
+      NS_DEBUG_WARNING,
+      nsPrintfCString("Something (%s) in the directory that doesn't belong!",
+                      NS_ConvertUTF16toUTF8(leafName).get())
+          .get(),
+      nullptr, aSourceFilePath, aSourceFileLine);
+
+  return true;
+}
+#endif
+
+}  
+}  

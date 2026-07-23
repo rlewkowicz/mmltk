@@ -1,0 +1,115 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HttpLog.h"
+
+#include "PendingTransactionInfo.h"
+#include "NullHttpTransaction.h"
+
+#undef LOG
+#define LOG(args) LOG5(args)
+#undef LOG_ENABLED
+#define LOG_ENABLED() LOG5_ENABLED()
+
+namespace mozilla {
+namespace net {
+
+PendingTransactionInfo::~PendingTransactionInfo() {
+  if (mConnectionAttempt) {
+    RefPtr<ConnectionAttempt> conn = do_QueryReferent(mConnectionAttempt);
+    LOG(
+        ("PendingTransactionInfo::~PendingTransactionInfo "
+         "[trans=%p halfOpen=%p]",
+         mTransaction.get(), conn.get()));
+    if (conn) {
+      conn->Unclaim();
+    }
+    mConnectionAttempt = nullptr;
+  } else if (mActiveConn) {
+    RefPtr<HttpConnectionBase> activeConn = do_QueryReferent(mActiveConn);
+    if (activeConn && activeConn->Transaction() &&
+        activeConn->Transaction()->IsNullTransaction()) {
+      NullHttpTransaction* nullTrans =
+          activeConn->Transaction()->QueryNullTransaction();
+      nullTrans->Unclaim();
+      LOG(
+          ("PendingTransactionInfo::~PendingTransactionInfo - mark %p "
+           "unclaimed.",
+           activeConn.get()));
+    }
+  }
+}
+
+bool PendingTransactionInfo::IsAlreadyClaimedInitializingConn() {
+  LOG(
+      ("PendingTransactionInfo::IsAlreadyClaimedInitializingConn "
+       "[trans=%p, halfOpen=%p, activeConn=%p]\n",
+       mTransaction.get(), mConnectionAttempt.get(), mActiveConn.get()));
+
+  bool alreadyDnsAndSockOrWaitingForTLS = false;
+  if (mConnectionAttempt) {
+    MOZ_ASSERT(!mActiveConn);
+    RefPtr<ConnectionAttempt> conn = do_QueryReferent(mConnectionAttempt);
+    LOG(
+        ("PendingTransactionInfo::IsAlreadyClaimedInitializingConn "
+         "[trans=%p, conn=%p]\n",
+         mTransaction.get(), conn.get()));
+    if (conn) {
+      alreadyDnsAndSockOrWaitingForTLS = true;
+    } else {
+      mConnectionAttempt = nullptr;
+    }
+  } else if (mActiveConn) {
+    MOZ_ASSERT(!mConnectionAttempt);
+    RefPtr<HttpConnectionBase> activeConn = do_QueryReferent(mActiveConn);
+    LOG(
+        ("PendingTransactionInfo::IsAlreadyClaimedInitializingConn "
+         "[trans=%p, activeConn=%p]\n",
+         mTransaction.get(), activeConn.get()));
+    if (activeConn &&
+        ((activeConn->Transaction() &&
+          activeConn->Transaction()->IsNullTransaction()) ||
+         (!activeConn->Transaction() && activeConn->CanReuse()))) {
+      alreadyDnsAndSockOrWaitingForTLS = true;
+    } else {
+      mActiveConn = nullptr;
+    }
+  }
+
+  return alreadyDnsAndSockOrWaitingForTLS;
+}
+
+nsWeakPtr PendingTransactionInfo::ForgetConnectionAttemptAndActiveConn() {
+  nsWeakPtr conn = mConnectionAttempt;
+
+  mConnectionAttempt = nullptr;
+  mActiveConn = nullptr;
+  return conn;
+}
+
+void PendingTransactionInfo::RememberConnectionAttempt(
+    ConnectionAttempt* sock) {
+  mConnectionAttempt =
+      do_GetWeakReference(static_cast<nsISupportsWeakReference*>(sock));
+}
+
+bool PendingTransactionInfo::TryClaimingActiveConn(HttpConnectionBase* conn) {
+  nsAHttpTransaction* activeTrans = conn->Transaction();
+  NullHttpTransaction* nullTrans =
+      activeTrans ? activeTrans->QueryNullTransaction() : nullptr;
+  if (nullTrans && nullTrans->Claim()) {
+    mActiveConn =
+        do_GetWeakReference(static_cast<nsISupportsWeakReference*>(conn));
+    nsCOMPtr<nsITLSSocketControl> tlsSocketControl;
+    conn->GetTLSSocketControl(getter_AddRefs(tlsSocketControl));
+    if (tlsSocketControl) {
+      (void)tlsSocketControl->Claim();
+    }
+    return true;
+  }
+  return false;
+}
+
+}  
+}  

@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_ForInEmitter_h
+#define frontend_ForInEmitter_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+
+#include <stdint.h>
+
+#include "frontend/BytecodeControlStructures.h"
+#include "frontend/TDZCheckCache.h"
+
+namespace js {
+namespace frontend {
+
+struct BytecodeEmitter;
+class EmitterScope;
+
+class MOZ_STACK_CLASS ForInEmitter {
+  BytecodeEmitter* bce_;
+
+#ifdef DEBUG
+  int32_t loopDepth_ = 0;
+#endif
+
+  mozilla::Maybe<LoopControl> loopInfo_;
+
+  const EmitterScope* headLexicalEmitterScope_;
+
+  mozilla::Maybe<TDZCheckCache> tdzCacheForIteratedValue_;
+
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    Iterated,
+
+    Initialize,
+
+    Body,
+
+    End
+  };
+  State state_ = State::Start;
+#endif
+
+ public:
+  ForInEmitter(BytecodeEmitter* bce,
+               const EmitterScope* headLexicalEmitterScope);
+
+  [[nodiscard]] bool emitIterated();
+  [[nodiscard]] bool emitInitialize();
+  [[nodiscard]] bool emitBody();
+  [[nodiscard]] bool emitEnd(uint32_t forPos);
+};
+
+} 
+} 
+
+#endif /* frontend_ForInEmitter_h */

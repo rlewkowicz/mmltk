@@ -1,0 +1,93 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ScrollPositionUpdate_h_
+#define mozilla_ScrollPositionUpdate_h_
+
+#include <cstdint>
+#include <iosfwd>
+
+#include "Units.h"
+#include "mozilla/DefineEnum.h"
+#include "mozilla/RelativeTo.h"
+#include "mozilla/ScrollGeneration.h"
+#include "mozilla/ScrollOrigin.h"
+#include "mozilla/ScrollSnapTargetId.h"
+#include "mozilla/ScrollTypes.h"
+#include "nsPoint.h"
+
+namespace IPC {
+template <typename T>
+struct ParamTraits;
+}  
+
+namespace mozilla {
+
+MOZ_DEFINE_ENUM_CLASS_WITH_BASE_AND_TOSTRING(
+    ScrollUpdateType, uint8_t,
+    (
+        Absolute,
+        Relative,
+        PureRelative));
+
+enum class ScrollTriggeredByScript : bool { No, Yes };
+
+class ScrollPositionUpdate {
+  friend struct IPC::ParamTraits<mozilla::ScrollPositionUpdate>;
+
+ public:
+  explicit ScrollPositionUpdate();
+
+  static ScrollPositionUpdate NewScrollframe(nsPoint aInitialPosition);
+  static ScrollPositionUpdate NewScroll(ScrollOrigin aOrigin,
+                                        nsPoint aDestination);
+  static ScrollPositionUpdate NewRelativeScroll(nsPoint aSource,
+                                                nsPoint aDestination);
+  static ScrollPositionUpdate NewSmoothScroll(
+      ScrollMode aMode, ScrollOrigin aOrigin, nsPoint aDestination,
+      ScrollTriggeredByScript aTriggeredByScript,
+      UniquePtr<ScrollSnapTargetIds> aSnapTargetIds,
+      ViewportType aViewportToScroll);
+  static ScrollPositionUpdate NewPureRelativeScroll(ScrollOrigin aOrigin,
+                                                    ScrollMode aMode,
+                                                    const nsPoint& aDelta);
+
+  bool operator==(const ScrollPositionUpdate& aOther) const;
+
+  MainThreadScrollGeneration GetGeneration() const;
+  ScrollUpdateType GetType() const;
+  ScrollMode GetMode() const;
+  ScrollOrigin GetOrigin() const;
+  CSSPoint GetDestination() const;
+  CSSPoint GetSource() const;
+  CSSPoint GetDelta() const;
+
+  ViewportType GetViewportType() const { return mViewportType; }
+  ScrollTriggeredByScript GetScrollTriggeredByScript() const {
+    return mTriggeredByScript;
+  }
+  bool WasTriggeredByScript() const {
+    return mTriggeredByScript == ScrollTriggeredByScript::Yes;
+  }
+  const ScrollSnapTargetIds& GetSnapTargetIds() const { return mSnapTargetIds; }
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const ScrollPositionUpdate& aUpdate);
+
+ private:
+  MainThreadScrollGeneration mScrollGeneration;
+  ScrollUpdateType mType;
+  ScrollMode mScrollMode;
+  ScrollOrigin mScrollOrigin;
+  CSSPoint mDestination;
+  CSSPoint mSource;
+  CSSPoint mDelta;
+  ViewportType mViewportType = ViewportType::Layout;
+  ScrollTriggeredByScript mTriggeredByScript;
+  ScrollSnapTargetIds mSnapTargetIds;
+};
+
+}  
+
+#endif  // mozilla_ScrollPositionUpdate_h_

@@ -1,0 +1,432 @@
+/*
+ * This file contains prototypes for the public SSL functions.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef __sslt_h_
+#define __sslt_h_
+
+#include "certt.h"
+#include "keyhi.h"
+#include "prtypes.h"
+#include "secitem.h"
+
+typedef enum {
+    ssl_hs_hello_request = 0,
+    ssl_hs_client_hello = 1,
+    ssl_hs_server_hello = 2,
+    ssl_hs_hello_verify_request = 3,
+    ssl_hs_new_session_ticket = 4,
+    ssl_hs_end_of_early_data = 5,
+    ssl_hs_hello_retry_request = 6,
+    ssl_hs_encrypted_extensions = 8,
+    ssl_hs_certificate = 11,
+    ssl_hs_server_key_exchange = 12,
+    ssl_hs_certificate_request = 13,
+    ssl_hs_server_hello_done = 14,
+    ssl_hs_certificate_verify = 15,
+    ssl_hs_client_key_exchange = 16,
+    ssl_hs_finished = 20,
+    ssl_hs_certificate_status = 22,
+    ssl_hs_key_update = 24,
+    ssl_hs_compressed_certificate = 25,
+    ssl_hs_next_proto = 67,
+    ssl_hs_message_hash = 254,           
+    ssl_hs_ech_outer_client_hello = 257, 
+} SSLHandshakeType;
+
+typedef enum {
+    ssl_ct_change_cipher_spec = 20,
+    ssl_ct_alert = 21,
+    ssl_ct_handshake = 22,
+    ssl_ct_application_data = 23,
+    ssl_ct_ack = 26
+} SSLContentType;
+
+typedef enum {
+    ssl_secret_read = 1,
+    ssl_secret_write = 2,
+} SSLSecretDirection;
+
+typedef struct SSL3StatisticsStr {
+    long sch_sid_cache_hits;
+    long sch_sid_cache_misses;
+    long sch_sid_cache_not_ok;
+
+    long hsh_sid_cache_hits;
+    long hsh_sid_cache_misses;
+    long hsh_sid_cache_not_ok;
+
+    long hch_sid_cache_hits;
+    long hch_sid_cache_misses;
+    long hch_sid_cache_not_ok;
+
+    long sch_sid_stateless_resumes;
+    long hsh_sid_stateless_resumes;
+    long hch_sid_stateless_resumes;
+    long hch_sid_ticket_parse_failures;
+} SSL3Statistics;
+
+typedef enum {
+    ssl_kea_null = 0,
+    ssl_kea_rsa = 1,
+    ssl_kea_dh = 2,
+    ssl_kea_fortezza = 3, 
+    ssl_kea_ecdh = 4,
+    ssl_kea_ecdh_psk = 5,
+    ssl_kea_dh_psk = 6,
+    ssl_kea_tls13_any = 7,
+    ssl_kea_ecdh_hybrid = 8,
+    ssl_kea_ecdh_hybrid_psk = 9,
+    ssl_kea_kem = 10,     
+    ssl_kea_kem_psk = 11, 
+    ssl_kea_size          
+} SSLKEAType;
+
+#define kt_null ssl_kea_null
+#define kt_rsa ssl_kea_rsa
+#define kt_dh ssl_kea_dh
+#define kt_fortezza ssl_kea_fortezza /* deprecated, now unused */
+#define kt_ecdh ssl_kea_ecdh
+#define kt_kea_size ssl_kea_size
+
+typedef enum {
+    ssl_sign_null = 0, 
+    ssl_sign_rsa = 1,
+    ssl_sign_dsa = 2,
+    ssl_sign_ecdsa = 3
+} SSLSignType;
+
+typedef enum {
+    ssl_hash_none = 0,
+    ssl_hash_md5 = 1,
+    ssl_hash_sha1 = 2,
+    ssl_hash_sha224 = 3,
+    ssl_hash_sha256 = 4,
+    ssl_hash_sha384 = 5,
+    ssl_hash_sha512 = 6
+} SSLHashType;
+
+typedef struct SSLSignatureAndHashAlgStr {
+    SSLHashType hashAlg;
+    SSLSignType sigAlg;
+} SSLSignatureAndHashAlg;
+
+typedef enum {
+    ssl_sig_none = 0,
+    ssl_sig_rsa_pkcs1_sha1 = 0x0201,
+    ssl_sig_rsa_pkcs1_sha256 = 0x0401,
+    ssl_sig_rsa_pkcs1_sha384 = 0x0501,
+    ssl_sig_rsa_pkcs1_sha512 = 0x0601,
+    ssl_sig_ecdsa_secp256r1_sha256 = 0x0403,
+    ssl_sig_ecdsa_secp384r1_sha384 = 0x0503,
+    ssl_sig_ecdsa_secp521r1_sha512 = 0x0603,
+    ssl_sig_rsa_pss_rsae_sha256 = 0x0804,
+    ssl_sig_rsa_pss_rsae_sha384 = 0x0805,
+    ssl_sig_rsa_pss_rsae_sha512 = 0x0806,
+    ssl_sig_ed25519 = 0x0807,
+    ssl_sig_ed448 = 0x0808,
+    ssl_sig_rsa_pss_pss_sha256 = 0x0809,
+    ssl_sig_rsa_pss_pss_sha384 = 0x080a,
+    ssl_sig_rsa_pss_pss_sha512 = 0x080b,
+
+    ssl_sig_dsa_sha1 = 0x0202,
+    ssl_sig_dsa_sha256 = 0x0402,
+    ssl_sig_dsa_sha384 = 0x0502,
+    ssl_sig_dsa_sha512 = 0x0602,
+    ssl_sig_ecdsa_sha1 = 0x0203,
+
+    ssl_sig_rsa_pkcs1_sha1md5 = 0x10101,
+} SSLSignatureScheme;
+
+#define ssl_sig_rsa_pss_sha256 ssl_sig_rsa_pss_rsae_sha256
+#define ssl_sig_rsa_pss_sha384 ssl_sig_rsa_pss_rsae_sha384
+#define ssl_sig_rsa_pss_sha512 ssl_sig_rsa_pss_rsae_sha512
+
+typedef enum {
+    ssl_auth_null = 0,
+    ssl_auth_rsa_decrypt = 1, 
+    ssl_auth_dsa = 2,
+    ssl_auth_kea = 3, 
+    ssl_auth_ecdsa = 4,
+    ssl_auth_ecdh_rsa = 5,   
+    ssl_auth_ecdh_ecdsa = 6, 
+    ssl_auth_rsa_sign = 7,   
+    ssl_auth_rsa_pss = 8,    
+    ssl_auth_psk = 9,
+    ssl_auth_tls13_any = 10,
+    ssl_auth_size 
+} SSLAuthType;
+
+typedef enum {
+    ssl_psk_none = 0,
+    ssl_psk_resume = 1,
+    ssl_psk_external = 2,
+} SSLPskType;
+
+#define ssl_auth_rsa ssl_auth_rsa_decrypt
+
+typedef enum {
+    ssl_calg_null = 0,
+    ssl_calg_rc4 = 1,
+    ssl_calg_rc2 = 2,
+    ssl_calg_des = 3,
+    ssl_calg_3des = 4,
+    ssl_calg_idea = 5,
+    ssl_calg_fortezza = 6, 
+    ssl_calg_aes = 7,
+    ssl_calg_camellia = 8,
+    ssl_calg_seed = 9,
+    ssl_calg_aes_gcm = 10,
+    ssl_calg_chacha20 = 11
+} SSLCipherAlgorithm;
+
+typedef enum {
+    ssl_mac_null = 0,
+    ssl_mac_md5 = 1,
+    ssl_mac_sha = 2,
+    ssl_hmac_md5 = 3, 
+    ssl_hmac_sha = 4, 
+    ssl_hmac_sha256 = 5,
+    ssl_mac_aead = 6,
+    ssl_hmac_sha384 = 7
+} SSLMACAlgorithm;
+
+typedef enum {
+    ssl_compression_null = 0,
+    ssl_compression_deflate = 1 
+} SSLCompressionMethod;
+
+typedef enum {
+    ssl_grp_ec_sect163k1 = 1,
+    ssl_grp_ec_sect163r1 = 2,
+    ssl_grp_ec_sect163r2 = 3,
+    ssl_grp_ec_sect193r1 = 4,
+    ssl_grp_ec_sect193r2 = 5,
+    ssl_grp_ec_sect233k1 = 6,
+    ssl_grp_ec_sect233r1 = 7,
+    ssl_grp_ec_sect239k1 = 8,
+    ssl_grp_ec_sect283k1 = 9,
+    ssl_grp_ec_sect283r1 = 10,
+    ssl_grp_ec_sect409k1 = 11,
+    ssl_grp_ec_sect409r1 = 12,
+    ssl_grp_ec_sect571k1 = 13,
+    ssl_grp_ec_sect571r1 = 14,
+    ssl_grp_ec_secp160k1 = 15,
+    ssl_grp_ec_secp160r1 = 16,
+    ssl_grp_ec_secp160r2 = 17,
+    ssl_grp_ec_secp192k1 = 18,
+    ssl_grp_ec_secp192r1 = 19,
+    ssl_grp_ec_secp224k1 = 20,
+    ssl_grp_ec_secp224r1 = 21,
+    ssl_grp_ec_secp256k1 = 22,
+    ssl_grp_ec_secp256r1 = 23,
+    ssl_grp_ec_secp384r1 = 24,
+    ssl_grp_ec_secp521r1 = 25,
+    ssl_grp_ec_curve25519 = 29, 
+    ssl_grp_ffdhe_2048 = 256,   
+    ssl_grp_ffdhe_3072 = 257,
+    ssl_grp_ffdhe_4096 = 258,
+    ssl_grp_ffdhe_6144 = 259,
+    ssl_grp_ffdhe_8192 = 260,
+    ssl_grp_kem_mlkem1024 = 514, 
+    ssl_grp_kem_secp256r1mlkem768 = 4587,
+    ssl_grp_kem_secp384r1mlkem1024 = 4589,
+    ssl_grp_kem_mlkem768x25519 = 4588,
+    ssl_grp_kem_xyber768d00 = 25497, 
+    ssl_grp_none = 65537,            
+    ssl_grp_ffdhe_custom = 65538     
+} SSLNamedGroup;
+
+typedef struct SSLExtraServerCertDataStr {
+    SSLAuthType authType;
+    const CERTCertificateList* certChain;
+    const SECItemArray* stapledOCSPResponses;
+    const SECItem* signedCertTimestamps;
+
+    const SECItem* delegCred;
+
+    const SECKEYPrivateKey* delegCredPrivKey;
+} SSLExtraServerCertData;
+
+typedef struct SSLChannelInfoStr {
+    PRUint32 length;
+    PRUint16 protocolVersion;
+    PRUint16 cipherSuite;
+
+    PRUint32 authKeyBits;
+
+    PRUint32 keaKeyBits;
+
+    PRUint32 creationTime;    
+    PRUint32 lastAccessTime;  
+    PRUint32 expirationTime;  
+    PRUint32 sessionIDLength; 
+    PRUint8 sessionID[32];
+
+
+    const char* compressionMethodName;
+    SSLCompressionMethod compressionMethod;
+
+    PRBool extendedMasterSecretUsed;
+
+    PRBool earlyDataAccepted;
+
+    SSLKEAType keaType;
+    SSLNamedGroup keaGroup;
+    SSLCipherAlgorithm symCipher;
+    SSLMACAlgorithm macAlgorithm;
+    SSLAuthType authType;
+    SSLSignatureScheme signatureScheme;
+
+    SSLNamedGroup originalKeaGroup;
+    PRBool resumed;
+
+    PRBool peerDelegCred;
+
+    SSLPskType pskType;
+
+    PRBool echAccepted;
+
+    PRBool isFIPS;
+
+} SSLChannelInfo;
+
+#define ssl_preinfo_version (1U << 0)
+#define ssl_preinfo_cipher_suite (1U << 1)
+#define ssl_preinfo_0rtt_cipher_suite (1U << 2)
+#define ssl_preinfo_peer_auth (1U << 3)
+#define ssl_preinfo_ech (1U << 4)
+#define ssl_preinfo_all (ssl_preinfo_version | ssl_preinfo_cipher_suite | ssl_preinfo_ech)
+
+typedef struct SSLPreliminaryChannelInfoStr {
+    PRUint32 length;
+    PRUint32 valuesSet;
+    PRUint16 protocolVersion;
+    PRUint16 cipherSuite;
+
+    PRBool canSendEarlyData;
+
+    PRUint32 maxEarlyDataSize;
+
+    PRUint16 zeroRttCipherSuite;
+
+    PRBool peerDelegCred;
+    PRUint32 authKeyBits;
+    SSLSignatureScheme signatureScheme;
+
+    PRBool echAccepted;
+    const char* echPublicName;
+
+    PRBool ticketSupportsEarlyData;
+
+} SSLPreliminaryChannelInfo;
+
+typedef struct SSLCipherSuiteInfoStr {
+    PRUint16 length;
+    PRUint16 cipherSuite;
+
+    const char* cipherSuiteName;
+
+    const char* authAlgorithmName;
+    SSLAuthType authAlgorithm; 
+
+    const char* keaTypeName;
+    SSLKEAType keaType;
+
+    const char* symCipherName;
+    SSLCipherAlgorithm symCipher;
+    PRUint16 symKeyBits;
+    PRUint16 symKeySpace;
+    PRUint16 effectiveKeyBits;
+
+    const char* macAlgorithmName;
+    SSLMACAlgorithm macAlgorithm;
+    PRUint16 macBits;
+
+    PRUintn isFIPS : 1;
+    PRUintn isExportable : 1; 
+    PRUintn nonStandard : 1;
+    PRUintn reservedBits : 29;
+
+    SSLAuthType authType;
+
+    SSLHashType kdfHash;
+
+} SSLCipherSuiteInfo;
+
+typedef enum {
+    ssl_variant_stream = 0,
+    ssl_variant_datagram = 1
+} SSLProtocolVariant;
+
+typedef struct SSLVersionRangeStr {
+    PRUint16 min;
+    PRUint16 max;
+} SSLVersionRange;
+
+typedef enum {
+    SSL_sni_host_name = 0,
+    SSL_sni_type_total
+} SSLSniNameType;
+
+typedef enum {
+    ssl_server_name_xtn = 0,
+    ssl_cert_status_xtn = 5,
+    ssl_supported_groups_xtn = 10,
+    ssl_ec_point_formats_xtn = 11,
+    ssl_signature_algorithms_xtn = 13,
+    ssl_use_srtp_xtn = 14,
+    ssl_app_layer_protocol_xtn = 16,
+    ssl_signed_cert_timestamp_xtn = 18,
+    ssl_padding_xtn = 21,
+    ssl_extended_master_secret_xtn = 23,
+    ssl_certificate_compression_xtn = 27,
+    ssl_record_size_limit_xtn = 28,
+    ssl_delegated_credentials_xtn = 34,
+    ssl_session_ticket_xtn = 35,
+    ssl_tls13_pre_shared_key_xtn = 41,
+    ssl_tls13_early_data_xtn = 42,
+    ssl_tls13_supported_versions_xtn = 43,
+    ssl_tls13_cookie_xtn = 44,
+    ssl_tls13_psk_key_exchange_modes_xtn = 45,
+    ssl_tls13_ticket_early_data_info_xtn = 46, 
+    ssl_tls13_certificate_authorities_xtn = 47,
+    ssl_tls13_post_handshake_auth_xtn = 49,
+    ssl_signature_algorithms_cert_xtn = 50,
+    ssl_tls13_key_share_xtn = 51,
+    ssl_tls13_grease_xtn = 0x0a0a,
+    ssl_next_proto_nego_xtn = 13172, 
+    ssl_renegotiation_info_xtn = 0xff01,
+    ssl_tls13_short_header_xtn = 0xff03, 
+    ssl_tls13_outer_extensions_xtn = 0xfd00,
+    ssl_tls13_encrypted_client_hello_xtn = 0xfe0d,
+    ssl_tls13_encrypted_sni_xtn = 0xffce, 
+} SSLExtensionType;
+
+#define ssl_elliptic_curves_xtn ssl_supported_groups_xtn
+
+#define SSL_MAX_EXTENSIONS 22
+
+typedef enum {
+    ssl_dhe_group_none = 0,
+    ssl_ff_dhe_2048_group = 1,
+    ssl_ff_dhe_3072_group = 2,
+    ssl_ff_dhe_4096_group = 3,
+    ssl_ff_dhe_6144_group = 4,
+    ssl_ff_dhe_8192_group = 5,
+    ssl_dhe_group_max
+} SSLDHEGroupType;
+
+typedef PRUint16 SSLCertificateCompressionAlgorithmID;
+
+typedef struct SSLCertificateCompressionAlgorithmStr {
+    SSLCertificateCompressionAlgorithmID id;
+    const char* name;
+    SECStatus (*encode)(const SECItem* input, SECItem* output);
+    SECStatus (*decode)(const SECItem* input, unsigned char* output, size_t outputLen, size_t* usedLen);
+} SSLCertificateCompressionAlgorithm;
+
+#endif /* __sslt_h_ */

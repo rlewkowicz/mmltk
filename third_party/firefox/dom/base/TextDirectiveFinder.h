@@ -1,0 +1,48 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_TEXTDIRECTIVEFINDER_H_
+#define DOM_TEXTDIRECTIVEFINDER_H_
+#include "mozilla/RefPtr.h"
+#include "mozilla/TimeStamp.h"
+#include "nsTArray.h"
+
+class nsRange;
+struct TextDirective;
+namespace mozilla::dom {
+
+class Document;
+
+class TextDirectiveFinder final {
+ public:
+  ~TextDirectiveFinder();
+
+  void Traverse(nsCycleCollectionTraversalCallback& aCallback);
+  nsTArray<RefPtr<nsRange>> FindTextDirectivesInDocument();
+
+  bool HasUninvokedDirectives() const;
+
+  RefPtr<nsRange> FindRangeForTextDirective(
+      const TextDirective& aTextDirective);
+
+ private:
+  friend class FragmentDirective;
+  TextDirectiveFinder(Document* aDocument,
+                      nsTArray<TextDirective>&& aTextDirectives);
+  NotNull<RefPtr<Document>> mDocument;
+  nsTArray<TextDirective> mUninvokedTextDirectives;
+
+  TimeStamp::DurationType mFindTextDirectivesDuration{};
+  int64_t mFoundDirectiveCount{0};
+};
+}  
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    mozilla::dom::TextDirectiveFinder& aField, const char* aName,
+    uint32_t aFlags = 0) {
+  aField.Traverse(aCallback);
+}
+
+#endif

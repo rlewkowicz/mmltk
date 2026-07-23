@@ -1,0 +1,33 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_DOMEventDispatch_h
+#define js_DOMEventDispatch_h
+
+#include "js/TypeDecls.h"
+
+namespace JS {
+
+typedef void (*DispatchDOMEventCallback)(JSContext* cx, const char* eventType);
+
+extern JS_PUBLIC_API void SetDispatchDOMEventCallback(
+    JSContext* cx, DispatchDOMEventCallback callback);
+
+} 
+
+namespace js {
+
+extern void TestingDispatchDOMEvent(JSContext* cx, const char* eventType);
+
+extern void TestingDispatchDOMEvent(JSContext* cx, const char* eventType,
+                                    JSScript* script);
+
+} 
+
+#define TRACE_FOR_TEST_DOM(cx, str, ...)                 \
+  do {                                                   \
+    js::TestingDispatchDOMEvent(cx, str, ##__VA_ARGS__); \
+  } while (0)
+
+#endif /* js_DOMEventDispatch_h */

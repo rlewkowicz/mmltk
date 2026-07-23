@@ -1,0 +1,71 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#define UNISTR_FROM_STRING_EXPLICIT
+
+#include "unicode/compactdecimalformat.h"
+#include "number_mapper.h"
+#include "number_decimfmtprops.h"
+
+using namespace icu;
+
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(CompactDecimalFormat)
+
+
+CompactDecimalFormat*
+CompactDecimalFormat::createInstance(const Locale& inLocale, UNumberCompactStyle style,
+                                     UErrorCode& status) {
+    return new CompactDecimalFormat(inLocale, style, status);
+}
+
+CompactDecimalFormat::CompactDecimalFormat(const Locale& inLocale, UNumberCompactStyle style,
+                                           UErrorCode& status)
+        : DecimalFormat(new DecimalFormatSymbols(inLocale, status), status) {
+    if (U_FAILURE(status)) return;
+    fields->properties.compactStyle = style;
+    fields->properties.groupingSize = -2; 
+    fields->properties.minimumGroupingDigits = 2;
+    touch(status);
+}
+
+CompactDecimalFormat::CompactDecimalFormat(const CompactDecimalFormat& source) = default;
+
+CompactDecimalFormat::~CompactDecimalFormat() = default;
+
+CompactDecimalFormat& CompactDecimalFormat::operator=(const CompactDecimalFormat& rhs) {
+    DecimalFormat::operator=(rhs);
+    return *this;
+}
+
+CompactDecimalFormat* CompactDecimalFormat::clone() const {
+    return new CompactDecimalFormat(*this);
+}
+
+void
+CompactDecimalFormat::parse(
+        const UnicodeString& ,
+        Formattable& ,
+        ParsePosition& ) const {
+}
+
+void
+CompactDecimalFormat::parse(
+        const UnicodeString& ,
+        Formattable& ,
+        UErrorCode& status) const {
+    status = U_UNSUPPORTED_ERROR;
+}
+
+CurrencyAmount*
+CompactDecimalFormat::parseCurrency(
+        const UnicodeString& ,
+        ParsePosition& ) const {
+    return nullptr;
+}
+
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

@@ -1,0 +1,476 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsCounterManager.h"
+
+#include "mozilla/AutoRestore.h"
+#include "mozilla/ContainStyleScopeManager.h"
+#include "mozilla/Likely.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/WritingModes.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/Text.h"
+#include "nsContainerFrame.h"
+#include "nsContentUtils.h"
+#include "nsIContent.h"
+#include "nsIContentInlines.h"
+#include "nsIFrame.h"
+#include "nsTArray.h"
+
+using namespace mozilla;
+
+bool nsCounterUseNode::InitTextFrame(nsGenConList* aList,
+                                     nsIFrame* aPseudoFrame,
+                                     nsIFrame* aTextFrame) {
+  nsCounterNode::InitTextFrame(aList, aPseudoFrame, aTextFrame);
+
+  auto* counterList = static_cast<nsCounterList*>(aList);
+  counterList->Insert(this);
+  aPseudoFrame->AddStateBits(NS_FRAME_HAS_CSS_COUNTER_STYLE);
+  if (counterList->IsDirty()) {
+    return false;
+  }
+  if (!counterList->IsLast(this)) {
+    counterList->SetDirty();
+    return true;
+  }
+  Calc(counterList,  false);
+  return false;
+}
+
+void nsCounterUseNode::Calc(nsCounterList* aList, bool aNotify) {
+  NS_ASSERTION(aList->IsRecalculatingAll() || !aList->IsDirty(),
+               "Why are we calculating with a dirty list?");
+
+  mValueAfter = nsCounterList::ValueBefore(this);
+
+  if (mText) {
+    nsAutoString contentString;
+    GetText(contentString);
+    mText->SetText(contentString, aNotify);
+  }
+}
+
+void nsCounterChangeNode::Calc(nsCounterList* aList) {
+  NS_ASSERTION(aList->IsRecalculatingAll() || !aList->IsDirty(),
+               "Why are we calculating with a dirty list?");
+  if (IsContentBasedReset()) {
+  } else if (mType == RESET || mType == SET) {
+    mValueAfter = mChangeValue;
+  } else {
+    NS_ASSERTION(mType == INCREMENT, "invalid type");
+    mValueAfter = nsCounterManager::IncrementCounter(
+        nsCounterList::ValueBefore(this), mChangeValue);
+  }
+}
+
+void nsCounterUseNode::GetText(nsString& aResult) {
+  mPseudoFrame->PresContext()
+      ->CounterStyleManager()
+      ->WithCounterStyleNameOrSymbols(mCounterStyle, [&](CounterStyle* aStyle) {
+        GetText(mPseudoFrame->GetWritingMode(), aStyle, aResult);
+      });
+}
+
+void nsCounterUseNode::GetText(WritingMode aWM, CounterStyle* aStyle,
+                               nsString& aResult) {
+  const bool isBidiRTL = aWM.IsBidiRTL();
+  auto AppendCounterText = [&aResult, isBidiRTL](const nsAutoString& aText,
+                                                 bool aIsRTL) {
+    if (MOZ_LIKELY(isBidiRTL == aIsRTL)) {
+      aResult.Append(aText);
+    } else {
+      const char16_t mark = aIsRTL ? 0x200f : 0x200e;
+      aResult.Append(mark);
+      aResult.Append(aText);
+      aResult.Append(mark);
+    }
+  };
+
+  if (mForLegacyBullet) {
+    nsAutoString prefix;
+    aStyle->GetPrefix(prefix);
+    aResult.Assign(prefix);
+  }
+
+  AutoTArray<nsCounterNode*, 8> stack;
+  stack.AppendElement(static_cast<nsCounterNode*>(this));
+
+  if (mAllCounters && mScopeStart) {
+    for (nsCounterNode* n = mScopeStart; n->mScopePrev; n = n->mScopeStart) {
+      stack.AppendElement(n->mScopePrev);
+    }
+  }
+
+  for (nsCounterNode* n : Reversed(stack)) {
+    nsAutoString text;
+    bool isTextRTL;
+    aStyle->GetCounterText(n->mValueAfter, aWM, text, isTextRTL);
+    if (!mForLegacyBullet || aStyle->IsBullet()) {
+      aResult.Append(text);
+    } else {
+      AppendCounterText(text, isTextRTL);
+    }
+    if (n == this) {
+      break;
+    }
+    aResult.Append(mSeparator);
+  }
+
+  if (mForLegacyBullet) {
+    nsAutoString suffix;
+    aStyle->GetSuffix(suffix);
+    aResult.Append(suffix);
+  }
+}
+
+static const nsIContent* GetParentContentForScope(nsIFrame* frame) {
+  nsIContent* content = frame->GetContent()->GetFlattenedTreeParent();
+  while (content && content->IsElement() &&
+         content->AsElement()->IsDisplayContents()) {
+    content = content->GetFlattenedTreeParent();
+  }
+
+  return content;
+}
+
+bool nsCounterList::IsDirty() const {
+  return mScope->GetScopeManager().CounterDirty(mCounterName);
+}
+
+void nsCounterList::SetDirty() {
+  mScope->GetScopeManager().SetCounterDirty(mCounterName);
+}
+
+void nsCounterList::SetScope(nsCounterNode* aNode) {
+
+  auto setNullScopeFor = [](nsCounterNode* aNode) {
+    aNode->mScopeStart = nullptr;
+    aNode->mScopePrev = nullptr;
+    aNode->mCrossesContainStyleBoundaries = false;
+    if (aNode->IsUnitializedIncrementNode()) {
+      aNode->ChangeNode()->mChangeValue = 1;
+    }
+  };
+
+  if (aNode == First() && aNode->mType != nsCounterNode::USE) {
+    setNullScopeFor(aNode);
+    return;
+  }
+
+  auto didSetScopeFor = [this](nsCounterNode* aNode) {
+    if (aNode->mType == nsCounterNode::USE) {
+      return;
+    }
+    if (aNode->mScopeStart->IsContentBasedReset()) {
+      SetDirty();
+    }
+    if (aNode->IsUnitializedIncrementNode()) {
+      aNode->ChangeNode()->mChangeValue =
+          aNode->mScopeStart->IsReversed() ? -1 : 1;
+    }
+  };
+
+  // Otherwise, fall through to consider scopes created by siblings (and
+  if (mCounterName == nsGkAtoms::list_item &&
+      aNode->mType != nsCounterNode::USE &&
+      StaticPrefs::layout_css_counter_ancestor_scope_enabled()) {
+    for (auto* p = aNode->mPseudoFrame; p; p = p->GetParent()) {
+      auto* counter = GetFirstNodeFor(p);
+      if (!counter || counter->mType != nsCounterNode::RESET) {
+        continue;
+      }
+      if (p == aNode->mPseudoFrame) {
+        break;
+      }
+      aNode->mScopeStart = counter;
+      aNode->mScopePrev = counter;
+      aNode->mCrossesContainStyleBoundaries = false;
+      for (nsCounterNode* prev = Prev(aNode); prev; prev = prev->mScopePrev) {
+        if (prev->mScopeStart == counter) {
+          aNode->mScopePrev =
+              prev->mType == nsCounterNode::RESET ? prev->mScopePrev : prev;
+          break;
+        }
+        if (prev->mType != nsCounterNode::RESET) {
+          prev = prev->mScopeStart;
+          if (!prev) {
+            break;
+          }
+        }
+      }
+      didSetScopeFor(aNode);
+      return;
+    }
+  }
+
+  const nsIContent* nodeContent = GetParentContentForScope(aNode->mPseudoFrame);
+  if (SetScopeByWalkingBackwardThroughList(aNode, nodeContent, Prev(aNode))) {
+    aNode->mCrossesContainStyleBoundaries = false;
+    didSetScopeFor(aNode);
+    return;
+  }
+
+  if (aNode->mType == nsCounterNode::USE && aNode == First()) {
+    for (auto* scope = mScope->GetParent(); scope; scope = scope->GetParent()) {
+      if (auto* counterList =
+              scope->GetCounterManager().GetCounterList(mCounterName)) {
+        if (auto* node = static_cast<nsCounterNode*>(
+                mScope->GetPrecedingElementInGenConList(counterList))) {
+          if (SetScopeByWalkingBackwardThroughList(aNode, nodeContent, node)) {
+            aNode->mCrossesContainStyleBoundaries = true;
+            didSetScopeFor(aNode);
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  setNullScopeFor(aNode);
+}
+
+bool nsCounterList::SetScopeByWalkingBackwardThroughList(
+    nsCounterNode* aNodeToSetScopeFor, const nsIContent* aNodeContent,
+    nsCounterNode* aNodeToBeginLookingAt) {
+  for (nsCounterNode *prev = aNodeToBeginLookingAt, *start; prev;
+       prev = start->mScopePrev) {
+    start =
+        (prev->mType == nsCounterNode::RESET || !prev->mScopeStart ||
+         (prev->mScopePrev && prev->mScopePrev->mCrossesContainStyleBoundaries))
+            ? prev
+            : prev->mScopeStart;
+
+    const nsIContent* startContent =
+        GetParentContentForScope(start->mPseudoFrame);
+    NS_ASSERTION(aNodeContent || !startContent,
+                 "null check on startContent should be sufficient to "
+                 "null check aNodeContent as well, since if aNodeContent "
+                 "is for the root, startContent (which is before it) "
+                 "must be too");
+
+    if (!(aNodeToSetScopeFor->mType == nsCounterNode::RESET &&
+          aNodeContent == startContent) &&
+        (!startContent ||
+         aNodeContent->IsInclusiveFlatTreeDescendantOf(startContent))) {
+      if (aNodeToSetScopeFor->mType == nsCounterNode::USE) {
+        aNodeToSetScopeFor->mCrossesContainStyleBoundaries =
+            prev->mCrossesContainStyleBoundaries;
+      }
+
+      aNodeToSetScopeFor->mScopeStart = start;
+      aNodeToSetScopeFor->mScopePrev = prev;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+#if defined(DEBUG) || 0
+void nsCounterList::Dump() {
+  int32_t i = 0;
+  for (auto* node = First(); node; node = Next(node)) {
+    const char* types[] = {"RESET", "INCREMENT", "SET", "USE"};
+    printf(
+        "  Node #%d @%p frame=%p index=%d type=%s valAfter=%d\n"
+        "       scope-start=%p scope-prev=%p",
+        i++, (void*)node, (void*)node->mPseudoFrame, node->mContentIndex,
+        types[node->mType], node->mValueAfter, (void*)node->mScopeStart,
+        (void*)node->mScopePrev);
+    if (node->mType == nsCounterNode::USE) {
+      nsAutoString text;
+      node->UseNode()->GetText(text);
+      printf(" text=%s", NS_ConvertUTF16toUTF8(text).get());
+    }
+    printf("\n");
+  }
+}
+#endif
+
+void nsCounterList::RecalcAll() {
+  AutoRestore<bool> restoreRecalculatingAll(mRecalculatingAll);
+  mRecalculatingAll = true;
+
+  nsTHashMap<nsPtrHashKey<nsCounterChangeNode>, int32_t> scopes;
+  for (nsCounterNode* node = First(); node; node = Next(node)) {
+    SetScope(node);
+    if (node->IsContentBasedReset()) {
+      node->ChangeNode()->mSeenSetNode = false;
+      node->mValueAfter = 0;
+      scopes.InsertOrUpdate(node->ChangeNode(), 0);
+    } else if (node->mScopeStart && node->mScopeStart->IsContentBasedReset() &&
+               !node->mScopeStart->ChangeNode()->mSeenSetNode) {
+      if (node->mType == nsCounterChangeNode::INCREMENT) {
+        auto incrementNegated = -node->ChangeNode()->mChangeValue;
+        if (auto entry = scopes.Lookup(node->mScopeStart->ChangeNode())) {
+          entry.Data() = incrementNegated;
+        }
+        auto* next = Next(node);
+        if (next && next->mPseudoFrame == node->mPseudoFrame &&
+            next->mType == nsCounterChangeNode::SET) {
+          continue;
+        }
+        node->mScopeStart->mValueAfter += incrementNegated;
+      } else if (node->mType == nsCounterChangeNode::SET) {
+        node->mScopeStart->mValueAfter += node->ChangeNode()->mChangeValue;
+        node->mScopeStart->ChangeNode()->mSeenSetNode = true;
+      }
+    }
+  }
+
+  for (auto iter = scopes.ConstIter(); !iter.Done(); iter.Next()) {
+    iter.Key()->mValueAfter += iter.Data();
+  }
+
+  for (nsCounterNode* node = First(); node; node = Next(node)) {
+    node->Calc(this,  true);
+  }
+}
+
+static bool AddCounterChangeNode(nsCounterManager& aManager, nsIFrame* aFrame,
+                                 int32_t aIndex,
+                                 const nsStyleContent::CounterPair& aPair,
+                                 nsCounterNode::Type aType) {
+  auto* node = new nsCounterChangeNode(aFrame, aType, aPair.value, aIndex,
+                                       aPair.is_reversed);
+  nsCounterList* counterList =
+      aManager.GetOrCreateCounterList(aPair.name.AsAtom());
+  counterList->Insert(node);
+  if (!counterList->IsLast(node)) {
+    counterList->SetDirty();
+    return true;
+  }
+
+  if (MOZ_LIKELY(!counterList->IsDirty())) {
+    node->Calc(counterList);
+  }
+  return counterList->IsDirty();
+}
+
+static bool HasCounters(const nsStyleContent& aStyle) {
+  return !aStyle.mCounterIncrement.IsEmpty() ||
+         !aStyle.mCounterReset.IsEmpty() || !aStyle.mCounterSet.IsEmpty();
+}
+
+bool nsCounterManager::AddCounterChanges(nsIFrame* aFrame) {
+  const bool requiresListItemIncrement =
+      aFrame->StyleDisplay()->IsListItem() && !aFrame->Style()->IsAnonBox();
+
+  const nsStyleContent* styleContent = aFrame->StyleContent();
+
+  if (!requiresListItemIncrement && !HasCounters(*styleContent)) {
+    MOZ_ASSERT(!aFrame->HasAnyStateBits(NS_FRAME_HAS_CSS_COUNTER_STYLE));
+    return false;
+  }
+
+  aFrame->AddStateBits(NS_FRAME_HAS_CSS_COUNTER_STYLE);
+
+  bool dirty = false;
+  {
+    int32_t i = 0;
+    for (const auto& pair : styleContent->mCounterReset.AsSpan()) {
+      dirty |= AddCounterChangeNode(*this, aFrame, i++, pair,
+                                    nsCounterChangeNode::RESET);
+    }
+  }
+  bool hasListItemIncrement = false;
+  {
+    int32_t i = 0;
+    for (const auto& pair : styleContent->mCounterIncrement.AsSpan()) {
+      hasListItemIncrement |= pair.name.AsAtom() == nsGkAtoms::list_item;
+      if (pair.value != 0) {
+        dirty |= AddCounterChangeNode(*this, aFrame, i++, pair,
+                                      nsCounterChangeNode::INCREMENT);
+      }
+    }
+  }
+
+  if (requiresListItemIncrement && !hasListItemIncrement) {
+    RefPtr<nsAtom> atom = nsGkAtoms::list_item;
+    auto listItemIncrement = nsStyleContent::CounterPair{
+        {StyleAtom(atom.forget())}, std::numeric_limits<int32_t>::min()};
+    dirty |= AddCounterChangeNode(
+        *this, aFrame, styleContent->mCounterIncrement.Length(),
+        listItemIncrement, nsCounterChangeNode::INCREMENT);
+  }
+
+  {
+    int32_t i = 0;
+    for (const auto& pair : styleContent->mCounterSet.AsSpan()) {
+      dirty |= AddCounterChangeNode(*this, aFrame, i++, pair,
+                                    nsCounterChangeNode::SET);
+    }
+  }
+  return dirty;
+}
+
+nsCounterList* nsCounterManager::GetOrCreateCounterList(nsAtom* aCounterName) {
+  MOZ_ASSERT(aCounterName);
+  return mNames.GetOrInsertNew(aCounterName, aCounterName, mScope);
+}
+
+nsCounterList* nsCounterManager::GetCounterList(nsAtom* aCounterName) {
+  MOZ_ASSERT(aCounterName);
+  return mNames.Get(aCounterName);
+}
+
+void nsCounterManager::RecalcAll() {
+  for (const auto& list : mNames.Values()) {
+    if (list->IsDirty()) {
+      list->RecalcAll();
+    }
+  }
+}
+
+void nsCounterManager::SetAllDirty() {
+  for (const auto& list : mNames.Values()) {
+    list->SetDirty();
+  }
+}
+
+bool nsCounterManager::DestroyNodesFor(nsIFrame* aFrame) {
+  MOZ_ASSERT(aFrame->HasAnyStateBits(NS_FRAME_HAS_CSS_COUNTER_STYLE),
+             "why call me?");
+  bool destroyedAny = false;
+  for (const auto& list : mNames.Values()) {
+    if (list->DestroyNodesFor(aFrame)) {
+      destroyedAny = true;
+      list->SetDirty();
+    }
+  }
+  return destroyedAny;
+}
+
+#if defined(ACCESSIBILITY)
+bool nsCounterManager::GetFirstCounterValueForFrame(
+    nsIFrame* aFrame, CounterValue& aOrdinal) const {
+  if (const auto* list = mNames.Get(nsGkAtoms::list_item)) {
+    for (nsCounterNode* n = list->GetFirstNodeFor(aFrame);
+         n && n->mPseudoFrame == aFrame; n = list->Next(n)) {
+      if (n->mType == nsCounterNode::USE) {
+        aOrdinal = n->mValueAfter;
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+#endif
+
+#if defined(DEBUG) || 0
+void nsCounterManager::Dump() const {
+  printf("\n\nCounter Manager Lists:\n");
+  for (const auto& entry : mNames) {
+    printf("Counter named \"%s\":\n", nsAtomCString(entry.GetKey()).get());
+
+    nsCounterList* list = entry.GetWeak();
+    list->Dump();
+  }
+  printf("\n\n");
+}
+#endif

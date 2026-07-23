@@ -1,0 +1,207 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "xpcprivate.h"
+#include "jsfriendapi.h"
+#include "js/Object.h"  // JS::GetClass, JS::GetReservedSlot
+#include "js/Wrapper.h"
+#include "nsContentUtils.h"
+
+using namespace mozilla;
+using namespace xpc;
+using namespace JS;
+
+static inline bool IsTearoffClass(const JSClass* clazz) {
+  return clazz == &XPC_WN_Tearoff_JSClass;
+}
+
+XPCCallContext::XPCCallContext(
+    JSContext* cx, HandleObject obj ,
+    HandleObject funobj ,
+    HandleId name , unsigned argc ,
+    Value* argv , Value* rval )
+    : mState(INIT_FAILED),
+      mXPC(nsXPConnect::XPConnect()),
+      mXPCJSContext(nullptr),
+      mJSContext(cx),
+      mWrapper(nullptr),
+      mTearOff(nullptr),
+      mMember(nullptr),
+      mName(cx),
+      mStaticMemberIsLocal(false),
+      mArgc(0),
+      mArgv(nullptr),
+      mRetVal(nullptr) {
+  MOZ_ASSERT(cx);
+  MOZ_ASSERT(cx == nsContentUtils::GetCurrentJSContext());
+
+  if (!mXPC) {
+    return;
+  }
+
+  mXPCJSContext = XPCJSContext::Get();
+
+  mPrevCallContext = mXPCJSContext->SetCallContext(this);
+
+  mState = HAVE_CONTEXT;
+
+  if (!obj) {
+    return;
+  }
+
+  mMethodIndex = 0xDEAD;
+
+  mState = HAVE_OBJECT;
+
+  mTearOff = nullptr;
+
+  JSObject* unwrapped =
+      js::CheckedUnwrapDynamic(obj, cx,  false);
+  if (!unwrapped) {
+    JS_ReportErrorASCII(mJSContext,
+                        "Permission denied to call method on |this|");
+    mState = INIT_FAILED;
+    return;
+  }
+  const JSClass* clasp = JS::GetClass(unwrapped);
+  if (clasp->isWrappedNative()) {
+    mWrapper = XPCWrappedNative::Get(unwrapped);
+  } else if (IsTearoffClass(clasp)) {
+    mTearOff = XPCWrappedNativeTearOff::Get(unwrapped);
+    mWrapper = XPCWrappedNative::Get(
+        &JS::GetReservedSlot(unwrapped, XPCWrappedNativeTearOff::FlatObjectSlot)
+             .toObject());
+  }
+  if (mWrapper && !mTearOff) {
+    mScriptable = mWrapper->GetScriptable();
+  }
+
+  if (!name.isVoid()) {
+    SetName(name);
+  }
+
+  if (argc != NO_ARGS) {
+    SetArgsAndResultPtr(argc, argv, rval);
+  }
+
+  CHECK_STATE(HAVE_OBJECT);
+}
+
+void XPCCallContext::SetName(jsid name) {
+  CHECK_STATE(HAVE_OBJECT);
+
+  mName = name;
+
+  if (mTearOff) {
+    mSet = nullptr;
+    mInterface = mTearOff->GetInterface();
+    mMember = mInterface->FindMember(mName);
+    mStaticMemberIsLocal = true;
+    if (mMember && !mMember->IsConstant()) {
+      mMethodIndex = mMember->GetIndex();
+    }
+  } else {
+    mSet = mWrapper ? mWrapper->GetSet() : nullptr;
+
+    if (mSet &&
+        mSet->FindMember(
+            mName, &mMember, &mInterface,
+            mWrapper->HasProto() ? mWrapper->GetProto()->GetSet() : nullptr,
+            &mStaticMemberIsLocal)) {
+      if (mMember && !mMember->IsConstant()) {
+        mMethodIndex = mMember->GetIndex();
+      }
+    } else {
+      mMember = nullptr;
+      mInterface = nullptr;
+      mStaticMemberIsLocal = false;
+    }
+  }
+
+  mState = HAVE_NAME;
+}
+
+void XPCCallContext::SetCallInfo(XPCNativeInterface* iface,
+                                 XPCNativeMember* member, bool isSetter) {
+  CHECK_STATE(HAVE_CONTEXT);
+
+
+  if (mTearOff && mTearOff->GetInterface() != iface) {
+    mTearOff = nullptr;
+  }
+
+  mSet = nullptr;
+  mInterface = iface;
+  mMember = member;
+  mMethodIndex = mMember->GetIndex() + (isSetter ? 1 : 0);
+  mName = mMember->GetName();
+
+  if (mState < HAVE_NAME) {
+    mState = HAVE_NAME;
+  }
+}
+
+void XPCCallContext::SetArgsAndResultPtr(unsigned argc, Value* argv,
+                                         Value* rval) {
+  CHECK_STATE(HAVE_OBJECT);
+
+  if (mState < HAVE_NAME) {
+    mSet = nullptr;
+    mInterface = nullptr;
+    mMember = nullptr;
+    mStaticMemberIsLocal = false;
+  }
+
+  mArgc = argc;
+  mArgv = argv;
+  mRetVal = rval;
+
+  mState = HAVE_ARGS;
+}
+
+nsresult XPCCallContext::CanCallNow() {
+  nsresult rv;
+
+  if (!HasInterfaceAndMember()) {
+    return NS_ERROR_UNEXPECTED;
+  }
+  if (mState < HAVE_ARGS) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  if (!mTearOff) {
+    mTearOff = mWrapper->FindTearOff(mJSContext, mInterface, false, &rv);
+    if (!mTearOff || mTearOff->GetInterface() != mInterface) {
+      mTearOff = nullptr;
+      return NS_FAILED(rv) ? rv : NS_ERROR_UNEXPECTED;
+    }
+  }
+
+  mSet = mWrapper->GetSet();
+
+  mState = READY_TO_CALL;
+  return NS_OK;
+}
+
+void XPCCallContext::SystemIsBeingShutDown() {
+  NS_WARNING(
+      "Shutting Down XPConnect even through there is a live XPCCallContext");
+  mXPCJSContext = nullptr;
+  mState = SYSTEM_SHUTDOWN;
+  mSet = nullptr;
+  mInterface = nullptr;
+
+  if (mPrevCallContext) {
+    mPrevCallContext->SystemIsBeingShutDown();
+  }
+}
+
+XPCCallContext::~XPCCallContext() {
+  if (mXPCJSContext) {
+    DebugOnly<XPCCallContext*> old =
+        mXPCJSContext->SetCallContext(mPrevCallContext);
+    MOZ_ASSERT(old == this, "bad pop from per thread data");
+  }
+}

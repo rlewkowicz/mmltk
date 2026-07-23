@@ -1,0 +1,511 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_RefPtr_h
+#define mozilla_RefPtr_h
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/DbgMacro.h"  // for mozilla::DebugValue
+
+#include <fmt/ostream.h>
+#include <type_traits>
+
+
+
+class nsQueryReferent;
+class nsCOMPtr_helper;
+class nsISupports;
+
+namespace mozilla {
+template <class T>
+class MovingNotNull;
+template <class T>
+class NotNull;
+template <class T>
+class OwningNonNull;
+template <class T>
+class StaticLocalRefPtr;
+template <class T>
+class StaticRefPtr;
+
+template <class U>
+struct RefPtrTraits {
+  static void AddRef(U* aPtr) { aPtr->AddRef(); }
+  static void Release(U* aPtr) { aPtr->Release(); }
+};
+
+}  
+
+template <class T>
+class MOZ_IS_REFPTR MOZ_NULL_AFTER_MOVE RefPtr {
+ private:
+  void assign_with_AddRef(T* aRawPtr) {
+    if (aRawPtr) {
+      ConstRemovingRefPtrTraits<T>::AddRef(aRawPtr);
+    }
+    assign_assuming_AddRef(aRawPtr);
+  }
+
+  void assign_assuming_AddRef(T* aNewPtr) {
+    T* oldPtr = mRawPtr;
+    mRawPtr = aNewPtr;
+    if (oldPtr) {
+      ConstRemovingRefPtrTraits<T>::Release(oldPtr);
+    }
+  }
+
+ private:
+  T* MOZ_OWNING_REF mRawPtr;
+
+ public:
+  typedef T element_type;
+
+  ~RefPtr() {
+    if (mRawPtr) {
+      ConstRemovingRefPtrTraits<T>::Release(mRawPtr);
+    }
+  }
+
+
+  constexpr RefPtr()
+      : mRawPtr(nullptr)
+  {}
+
+  RefPtr(const RefPtr<T>& aSmartPtr)
+      : mRawPtr(aSmartPtr.mRawPtr)
+  {
+    if (mRawPtr) {
+      ConstRemovingRefPtrTraits<T>::AddRef(mRawPtr);
+    }
+  }
+
+  RefPtr(RefPtr<T>&& aRefPtr) noexcept : mRawPtr(aRefPtr.mRawPtr) {
+    aRefPtr.mRawPtr = nullptr;
+  }
+
+
+  MOZ_IMPLICIT RefPtr(T* aRawPtr) : mRawPtr(aRawPtr) {
+    if (mRawPtr) {
+      ConstRemovingRefPtrTraits<T>::AddRef(mRawPtr);
+    }
+  }
+
+  MOZ_IMPLICIT constexpr RefPtr(std::nullptr_t) : mRawPtr(nullptr) {}
+
+  template <typename I,
+            typename = std::enable_if_t<std::is_convertible_v<I*, T*>>>
+  MOZ_IMPLICIT RefPtr(already_AddRefed<I>& aSmartPtr)
+      : mRawPtr(aSmartPtr.take())
+  {}
+
+  template <typename I,
+            typename = std::enable_if_t<std::is_convertible_v<I*, T*>>>
+  MOZ_IMPLICIT RefPtr(already_AddRefed<I>&& aSmartPtr)
+      : mRawPtr(aSmartPtr.take())
+  {}
+
+  template <typename I,
+            typename = std::enable_if_t<std::is_convertible_v<I*, T*>>>
+  MOZ_IMPLICIT RefPtr(const RefPtr<I>& aSmartPtr)
+      : mRawPtr(aSmartPtr.get())
+  {
+    if (mRawPtr) {
+      ConstRemovingRefPtrTraits<T>::AddRef(mRawPtr);
+    }
+  }
+
+  template <typename I,
+            typename = std::enable_if_t<std::is_convertible_v<I*, T*>>>
+  MOZ_IMPLICIT RefPtr(RefPtr<I>&& aSmartPtr)
+      : mRawPtr(aSmartPtr.forget().take())
+  {}
+
+  template <typename I,
+            typename = std::enable_if_t<!std::is_same_v<I, RefPtr<T>> &&
+                                        std::is_convertible_v<I, RefPtr<T>>>>
+  MOZ_IMPLICIT RefPtr(const mozilla::NotNull<I>& aSmartPtr)
+      : mRawPtr(RefPtr<T>(aSmartPtr.get()).forget().take())
+  {}
+
+  template <typename I,
+            typename = std::enable_if_t<!std::is_same_v<I, RefPtr<T>> &&
+                                        std::is_convertible_v<I, RefPtr<T>>>>
+  MOZ_IMPLICIT RefPtr(mozilla::MovingNotNull<I>&& aSmartPtr)
+      : mRawPtr(RefPtr<T>(std::move(aSmartPtr).unwrapBasePtr()).forget().take())
+  {}
+
+  MOZ_IMPLICIT RefPtr(const nsQueryReferent& aHelper);
+  MOZ_IMPLICIT RefPtr(const nsCOMPtr_helper& aHelper);
+
+  template <class U>
+  MOZ_IMPLICIT RefPtr(const mozilla::OwningNonNull<U>& aOther);
+
+  template <class U>
+  MOZ_IMPLICIT RefPtr(const mozilla::StaticLocalRefPtr<U>& aOther);
+
+  template <class U>
+  MOZ_IMPLICIT RefPtr(const mozilla::StaticRefPtr<U>& aOther);
+
+
+  RefPtr<T>& operator=(decltype(nullptr)) {
+    assign_assuming_AddRef(nullptr);
+    return *this;
+  }
+
+  RefPtr<T>& operator=(const RefPtr<T>& aRhs)
+  {
+    assign_with_AddRef(aRhs.mRawPtr);
+    return *this;
+  }
+
+  template <typename I>
+  RefPtr<T>& operator=(const RefPtr<I>& aRhs)
+  {
+    assign_with_AddRef(aRhs.get());
+    return *this;
+  }
+
+  RefPtr<T>& operator=(T* aRhs)
+  {
+    assign_with_AddRef(aRhs);
+    return *this;
+  }
+
+  template <typename I>
+  RefPtr<T>& operator=(already_AddRefed<I>& aRhs)
+  {
+    assign_assuming_AddRef(aRhs.take());
+    return *this;
+  }
+
+  template <typename I>
+  RefPtr<T>& operator=(already_AddRefed<I>&& aRhs)
+  {
+    assign_assuming_AddRef(aRhs.take());
+    return *this;
+  }
+
+  RefPtr<T>& operator=(const nsQueryReferent& aQueryReferent);
+  RefPtr<T>& operator=(const nsCOMPtr_helper& aHelper);
+
+  template <typename I,
+            typename = std::enable_if_t<std::is_convertible_v<I*, T*>>>
+  RefPtr<T>& operator=(RefPtr<I>&& aRefPtr) noexcept {
+    assign_assuming_AddRef(aRefPtr.forget().take());
+    return *this;
+  }
+
+  template <typename I,
+            typename = std::enable_if_t<std::is_convertible_v<I, RefPtr<T>>>>
+  RefPtr<T>& operator=(const mozilla::NotNull<I>& aSmartPtr)
+  {
+    assign_assuming_AddRef(RefPtr<T>(aSmartPtr.get()).forget().take());
+    return *this;
+  }
+
+  template <typename I,
+            typename = std::enable_if_t<std::is_convertible_v<I, RefPtr<T>>>>
+  RefPtr<T>& operator=(mozilla::MovingNotNull<I>&& aSmartPtr)
+  {
+    assign_assuming_AddRef(
+        RefPtr<T>(std::move(aSmartPtr).unwrapBasePtr()).forget().take());
+    return *this;
+  }
+
+  template <class U>
+  RefPtr<T>& operator=(const mozilla::OwningNonNull<U>& aOther);
+
+  template <class U>
+  RefPtr<T>& operator=(const mozilla::StaticLocalRefPtr<U>& aOther);
+
+  template <class U>
+  RefPtr<T>& operator=(const mozilla::StaticRefPtr<U>& aOther);
+
+
+  void swap(RefPtr<T>& aRhs)
+  {
+    T* temp = aRhs.mRawPtr;
+    aRhs.mRawPtr = mRawPtr;
+    mRawPtr = temp;
+  }
+
+  void swap(T*& aRhs)
+  {
+    T* temp = aRhs;
+    aRhs = mRawPtr;
+    mRawPtr = temp;
+  }
+
+  already_AddRefed<T> MOZ_MAY_CALL_AFTER_MUST_RETURN forget()
+  {
+    T* temp = nullptr;
+    swap(temp);
+    return already_AddRefed<T>(temp);
+  }
+
+  template <typename I>
+  void forget(I** aRhs)
+  {
+    MOZ_ASSERT(aRhs, "Null pointer passed to forget!");
+    *aRhs = mRawPtr;
+    mRawPtr = nullptr;
+  }
+
+  void forget(nsISupports** aRhs) {
+    MOZ_ASSERT(aRhs, "Null pointer passed to forget!");
+    *aRhs = ToSupports(mRawPtr);
+    mRawPtr = nullptr;
+  }
+
+  T* get() const
+  {
+    return const_cast<T*>(mRawPtr);
+  }
+
+  operator T*() const&
+  {
+    return get();
+  }
+
+  operator T*() const&& = delete;
+
+  explicit operator bool() const { return !!mRawPtr; }
+  bool operator!() const { return !mRawPtr; }
+
+  T* operator->() const MOZ_NO_ADDREF_RELEASE_ON_RETURN {
+    MOZ_ASSERT(mRawPtr != nullptr,
+               "You can't dereference a NULL RefPtr with operator->().");
+    return get();
+  }
+
+  template <typename R, typename... Args>
+  class Proxy {
+    typedef R (T::*member_function)(Args...);
+    T* mRawPtr;
+    member_function mFunction;
+
+   public:
+    Proxy(T* aRawPtr, member_function aFunction)
+        : mRawPtr(aRawPtr), mFunction(aFunction) {}
+    template <typename... ActualArgs>
+    R operator()(ActualArgs&&... aArgs) {
+      return ((*mRawPtr).*mFunction)(std::forward<ActualArgs>(aArgs)...);
+    }
+  };
+
+  template <typename R, typename... Args>
+  Proxy<R, Args...> operator->*(R (T::*aFptr)(Args...)) const {
+    MOZ_ASSERT(mRawPtr != nullptr,
+               "You can't dereference a NULL RefPtr with operator->*().");
+    return Proxy<R, Args...>(get(), aFptr);
+  }
+
+  RefPtr<T>* get_address()
+  {
+    return this;
+  }
+
+  const RefPtr<T>* get_address() const
+  {
+    return this;
+  }
+
+ public:
+  T& operator*() const {
+    MOZ_ASSERT(mRawPtr != nullptr,
+               "You can't dereference a NULL RefPtr with operator*().");
+    return *get();
+  }
+
+  T** StartAssignment() {
+    assign_assuming_AddRef(nullptr);
+    return reinterpret_cast<T**>(&mRawPtr);
+  }
+
+ private:
+  template <class U>
+  struct ConstRemovingRefPtrTraits {
+    static void AddRef(U* aPtr) { mozilla::RefPtrTraits<U>::AddRef(aPtr); }
+    static void Release(U* aPtr) { mozilla::RefPtrTraits<U>::Release(aPtr); }
+  };
+  template <class U>
+  struct ConstRemovingRefPtrTraits<const U> {
+    static void AddRef(const U* aPtr) {
+      mozilla::RefPtrTraits<U>::AddRef(const_cast<U*>(aPtr));
+    }
+    static void Release(const U* aPtr) {
+      mozilla::RefPtrTraits<U>::Release(const_cast<U*>(aPtr));
+    }
+  };
+};
+
+class nsCycleCollectionTraversalCallback;
+template <typename T>
+void CycleCollectionNoteChild(nsCycleCollectionTraversalCallback& aCallback,
+                              T* aChild, const char* aName, uint32_t aFlags);
+
+template <typename T>
+inline void ImplCycleCollectionUnlink(RefPtr<T>& aField) {
+  aField = nullptr;
+}
+
+template <typename T>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback, const RefPtr<T>& aField,
+    const char* aName, uint32_t aFlags = 0) {
+  CycleCollectionNoteChild(aCallback, aField.get(), aName, aFlags);
+}
+
+template <class T>
+inline RefPtr<T>* address_of(RefPtr<T>& aPtr) {
+  return aPtr.get_address();
+}
+
+template <class T>
+inline const RefPtr<T>* address_of(const RefPtr<T>& aPtr) {
+  return aPtr.get_address();
+}
+
+template <class T>
+class RefPtrGetterAddRefs
+{
+ public:
+  explicit RefPtrGetterAddRefs(RefPtr<T>& aSmartPtr)
+      : mTargetSmartPtr(aSmartPtr) {
+  }
+
+  operator void**() {
+    return reinterpret_cast<void**>(mTargetSmartPtr.StartAssignment());
+  }
+
+  operator T**() { return mTargetSmartPtr.StartAssignment(); }
+
+  T*& operator*() { return *(mTargetSmartPtr.StartAssignment()); }
+
+ private:
+  RefPtr<T>& mTargetSmartPtr;
+};
+
+template <class T>
+inline RefPtrGetterAddRefs<T> getter_AddRefs(RefPtr<T>& aSmartPtr)
+{
+  return RefPtrGetterAddRefs<T>(aSmartPtr);
+}
+
+
+template <class T, class U>
+inline bool operator==(const RefPtr<T>& aLhs, const RefPtr<U>& aRhs) {
+  return static_cast<const T*>(aLhs.get()) == static_cast<const U*>(aRhs.get());
+}
+
+template <class T, class U>
+inline bool operator!=(const RefPtr<T>& aLhs, const RefPtr<U>& aRhs) {
+  return static_cast<const T*>(aLhs.get()) != static_cast<const U*>(aRhs.get());
+}
+
+
+template <class T, class U>
+inline bool operator==(const RefPtr<T>& aLhs, const U* aRhs) {
+  return static_cast<const T*>(aLhs.get()) == static_cast<const U*>(aRhs);
+}
+
+template <class T, class U>
+inline bool operator==(const U* aLhs, const RefPtr<T>& aRhs) {
+  return static_cast<const U*>(aLhs) == static_cast<const T*>(aRhs.get());
+}
+
+template <class T, class U>
+inline bool operator!=(const RefPtr<T>& aLhs, const U* aRhs) {
+  return static_cast<const T*>(aLhs.get()) != static_cast<const U*>(aRhs);
+}
+
+template <class T, class U>
+inline bool operator!=(const U* aLhs, const RefPtr<T>& aRhs) {
+  return static_cast<const U*>(aLhs) != static_cast<const T*>(aRhs.get());
+}
+
+template <class T, class U>
+inline bool operator==(const RefPtr<T>& aLhs, U* aRhs) {
+  return static_cast<const T*>(aLhs.get()) == const_cast<const U*>(aRhs);
+}
+
+template <class T, class U>
+inline bool operator==(U* aLhs, const RefPtr<T>& aRhs) {
+  return const_cast<const U*>(aLhs) == static_cast<const T*>(aRhs.get());
+}
+
+template <class T, class U>
+inline bool operator!=(const RefPtr<T>& aLhs, U* aRhs) {
+  return static_cast<const T*>(aLhs.get()) != const_cast<const U*>(aRhs);
+}
+
+template <class T, class U>
+inline bool operator!=(U* aLhs, const RefPtr<T>& aRhs) {
+  return const_cast<const U*>(aLhs) != static_cast<const T*>(aRhs.get());
+}
+
+
+template <class T>
+inline bool operator==(const RefPtr<T>& aLhs, decltype(nullptr)) {
+  return aLhs.get() == nullptr;
+}
+
+template <class T>
+inline bool operator==(decltype(nullptr), const RefPtr<T>& aRhs) {
+  return nullptr == aRhs.get();
+}
+
+template <class T>
+inline bool operator!=(const RefPtr<T>& aLhs, decltype(nullptr)) {
+  return aLhs.get() != nullptr;
+}
+
+template <class T>
+inline bool operator!=(decltype(nullptr), const RefPtr<T>& aRhs) {
+  return nullptr != aRhs.get();
+}
+
+
+template <class T>
+std::ostream& operator<<(std::ostream& aOut, const RefPtr<T>& aObj) {
+  return mozilla::DebugValue(aOut, aObj.get());
+}
+
+template <typename T>
+struct fmt::formatter<RefPtr<T>> : fmt::ostream_formatter {};
+
+
+template <class T>
+inline already_AddRefed<T> do_AddRef(T* aObj) {
+  RefPtr<T> ref(aObj);
+  return ref.forget();
+}
+
+template <class T>
+inline already_AddRefed<T> do_AddRef(const RefPtr<T>& aObj) {
+  RefPtr<T> ref(aObj);
+  return ref.forget();
+}
+
+namespace mozilla {
+template <typename T, typename... Args>
+already_AddRefed<T> MakeAndAddRef(Args&&... aArgs) {
+  RefPtr<T> p(new T(std::forward<Args>(aArgs)...));
+  return p.forget();
+}
+
+template <typename T, typename... Args>
+RefPtr<T> MakeRefPtr(Args&&... aArgs) {
+  RefPtr<T> p(new T(std::forward<Args>(aArgs)...));
+  return p;
+}
+
+}  
+
+template <typename T>
+RefPtr(already_AddRefed<T>) -> RefPtr<T>;
+
+#endif /* mozilla_RefPtr_h */

@@ -1,0 +1,132 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const lazy = {};
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  BrowserUtils: "resource://gre/modules/BrowserUtils.sys.mjs",
+  E10SUtils: "resource://gre/modules/E10SUtils.sys.mjs",
+  PlacesUIUtils: "moz-src:///browser/components/places/PlacesUIUtils.sys.mjs",
+  PrivateBrowsingUtils: "resource://gre/modules/PrivateBrowsingUtils.sys.mjs",
+  WebNavigationFrames: "resource://gre/modules/WebNavigationFrames.sys.mjs",
+});
+
+let gContentClickListeners = new Set();
+
+function fillInClickEvent(actor, data) {
+  const wgp = actor.manager;
+  data.frameID = lazy.WebNavigationFrames.getFrameId(wgp.browsingContext);
+  data.triggeringPrincipal = wgp.documentPrincipal;
+  data.originPrincipal = wgp.documentPrincipal;
+  data.originStoragePrincipal = wgp.documentStoragePrincipal;
+  data.originAttributes = wgp.documentPrincipal?.originAttributes ?? {};
+  data.isContentWindowPrivate = wgp.browsingContext.usePrivateBrowsing;
+}
+
+export class MiddleMousePasteHandlerParent extends JSWindowActorParent {
+  receiveMessage(message) {
+    if (message.name == "MiddleClickPaste") {
+      let browser = this.manager.browsingContext.top.embedderElement;
+      if (!browser) {
+        return;
+      }
+      fillInClickEvent(this, message.data);
+      browser.documentGlobal.middleMousePaste(message.data);
+    }
+  }
+}
+
+export class ClickHandlerParent extends JSWindowActorParent {
+  static addContentClickListener(listener) {
+    gContentClickListeners.add(listener);
+  }
+
+  static removeContentClickListener(listener) {
+    gContentClickListeners.delete(listener);
+  }
+
+  receiveMessage(message) {
+    switch (message.name) {
+      case "Content:Click":
+        fillInClickEvent(this, message.data);
+        this.contentAreaClick(message.data);
+        this.notifyClickListeners(message.data);
+        break;
+    }
+  }
+
+  contentAreaClick(data) {
+    let browser = this.manager.browsingContext.top.embedderElement;
+    if (!browser) {
+      return;
+    }
+    let window = browser.documentGlobal;
+
+    if (window.openLinkIn === undefined) {
+      return;
+    }
+
+    try {
+      if (!lazy.PrivateBrowsingUtils.isWindowPrivate(window)) {
+        lazy.PlacesUIUtils.markPageAsFollowedLink(data.href);
+      }
+    } catch (ex) {
+    }
+
+    var where = lazy.BrowserUtils.whereToOpenLink(data);
+    if (where == "current") {
+      return;
+    }
+
+
+    let params = {
+      charset: browser.characterSet,
+      referrerInfo: lazy.E10SUtils.deserializeReferrerInfo(data.referrerInfo),
+      isContentWindowPrivate: data.isContentWindowPrivate,
+      originPrincipal: data.originPrincipal,
+      originStoragePrincipal: data.originStoragePrincipal,
+      triggeringPrincipal: data.triggeringPrincipal,
+      policyContainer: data.policyContainer
+        ? lazy.E10SUtils.deserializePolicyContainer(data.policyContainer)
+        : null,
+      frameID: data.frameID,
+      openerBrowser: browser,
+      hasValidUserGestureActivation: true,
+      textDirectiveUserActivation: true,
+      triggeringRemoteType: this.manager.domProcess?.remoteType,
+    };
+
+    if (data.globalHistoryOptions) {
+      params.globalHistoryOptions = data.globalHistoryOptions;
+    } else {
+      params.globalHistoryOptions = {
+        triggeringSponsoredURL: browser.getAttribute("triggeringSponsoredURL"),
+        triggeringSponsoredURLVisitTimeMS: browser.getAttribute(
+          "triggeringSponsoredURLVisitTimeMS"
+        ),
+        triggeringSource: browser.getAttribute("triggeringSource"),
+      };
+    }
+
+    if (data.originAttributes.userContextId) {
+      params.userContextId = data.originAttributes.userContextId;
+    }
+
+    params.allowInheritPrincipal = true;
+
+    window.openLinkIn(data.href, where, params);
+  }
+
+  notifyClickListeners(data) {
+    for (let listener of gContentClickListeners) {
+      try {
+        let browser = this.browsingContext.top.embedderElement;
+
+        listener.onContentClick(browser, data);
+      } catch (ex) {
+        console.error(ex);
+      }
+    }
+  }
+}

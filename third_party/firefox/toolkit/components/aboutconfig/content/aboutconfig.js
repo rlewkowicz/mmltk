@@ -1,0 +1,643 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const { DeferredTask } = ChromeUtils.importESModule(
+  "resource://gre/modules/DeferredTask.sys.mjs"
+);
+const { Preferences } = ChromeUtils.importESModule(
+  "resource://gre/modules/Preferences.sys.mjs"
+);
+
+const SEARCH_TIMEOUT_MS = 100;
+const SEARCH_AUTO_MIN_CHARACTERS = 3;
+
+const GETTERS_BY_PREF_TYPE = {
+  [Ci.nsIPrefBranch.PREF_BOOL]: "getBoolPref",
+  [Ci.nsIPrefBranch.PREF_INT]: "getIntPref",
+  [Ci.nsIPrefBranch.PREF_STRING]: "getStringPref",
+};
+
+const STRINGS_ADD_BY_TYPE = {
+  Boolean: "about-config-pref-add-type-boolean",
+  Number: "about-config-pref-add-type-number",
+  String: "about-config-pref-add-type-string",
+};
+
+const MAX_PLACEABLE_LENGTH = 2500;
+
+let gDefaultBranch = Services.prefs.getDefaultBranch("");
+let gFilterPrefsTask = new DeferredTask(
+  () => filterPrefs(),
+  SEARCH_TIMEOUT_MS,
+  0
+);
+
+let gExistingPrefs = new Map();
+let gDeletedPrefs = new Map();
+
+let gSortedExistingPrefs = null;
+let gSearchInput = null;
+let gShowOnlyModifiedCheckbox = null;
+let gPrefsTable = null;
+
+let gPrefInEdit = null;
+
+let gFilterString = null;
+
+let gFilterPattern = null;
+
+let gFilterShowAll = false;
+
+class PrefRow {
+  constructor(name, opts) {
+    this.name = name;
+    this.value = true;
+    this.hidden = false;
+    this.odd = false;
+    this.editing = false;
+    this.isAddRow = opts && opts.isAddRow;
+    this.refreshValue();
+  }
+
+  refreshValue() {
+    let prefType = Services.prefs.getPrefType(this.name);
+
+    if (prefType == Ci.nsIPrefBranch.PREF_INVALID) {
+      this.hasDefaultValue = false;
+      this.hasUserValue = false;
+      this.isLocked = false;
+      if (gExistingPrefs.has(this.name)) {
+        gExistingPrefs.delete(this.name);
+        gSortedExistingPrefs = null;
+      }
+      gDeletedPrefs.set(this.name, this);
+      return;
+    }
+
+    if (!gExistingPrefs.has(this.name)) {
+      gExistingPrefs.set(this.name, this);
+      gSortedExistingPrefs = null;
+    }
+    gDeletedPrefs.delete(this.name);
+
+    try {
+      this.value = gDefaultBranch[GETTERS_BY_PREF_TYPE[prefType]](this.name);
+      this.hasDefaultValue = true;
+    } catch (ex) {
+      this.hasDefaultValue = false;
+    }
+    this.hasUserValue = Services.prefs.prefHasUserValue(this.name);
+    this.isLocked = Services.prefs.prefIsLocked(this.name);
+
+    try {
+      if (this.hasUserValue) {
+        this.value = Services.prefs[GETTERS_BY_PREF_TYPE[prefType]](this.name);
+      } else if (/^chrome:\/\/.+\/locale\/.+\.properties/.test(this.value)) {
+        this.value = Services.prefs.getComplexValue(
+          this.name,
+          Ci.nsIPrefLocalizedString
+        ).data;
+      }
+    } catch (ex) {
+      this.value = "";
+    }
+  }
+
+  get type() {
+    return this.value.constructor.name;
+  }
+
+  get exists() {
+    return this.hasDefaultValue || this.hasUserValue;
+  }
+
+  get matchesFilter() {
+    if (!this.matchesModifiedFilter) {
+      return false;
+    }
+
+    return (
+      gFilterShowAll ||
+      (gFilterPattern && gFilterPattern.test(this.name)) ||
+      (gFilterString && this.name.toLowerCase().includes(gFilterString))
+    );
+  }
+
+  get matchesModifiedFilter() {
+    const onlyShowModified = gShowOnlyModifiedCheckbox.checked;
+    return !onlyShowModified || this.hasUserValue;
+  }
+
+  getElement() {
+    if (this._element) {
+      return this._element;
+    }
+
+    this._element = document.createElement("tr");
+    this._element._pref = this;
+
+    let nameCell = document.createElement("th");
+    let nameCellSpan = document.createElement("span");
+    nameCell.appendChild(nameCellSpan);
+    this._element.append(
+      nameCell,
+      (this.valueCell = document.createElement("td")),
+      (this.editCell = document.createElement("td")),
+      (this.resetCell = document.createElement("td"))
+    );
+    this.editCell.appendChild(
+      (this.editButton = document.createElement("button"))
+    );
+    delete this.resetButton;
+
+    nameCell.setAttribute("scope", "row");
+    this.valueCell.className = "cell-value";
+    this.editCell.className = "cell-edit";
+    this.resetCell.className = "cell-reset";
+
+    let parts = this.name.split(".");
+    for (let i = 0; i < parts.length - 1; i++) {
+      nameCellSpan.append(parts[i] + ".", document.createElement("wbr"));
+    }
+    nameCellSpan.append(parts[parts.length - 1]);
+
+    this.refreshElement();
+
+    return this._element;
+  }
+
+  refreshElement() {
+    if (!this._element) {
+      return;
+    }
+
+    if (this.exists && !this.editing) {
+      let span = document.createElement("span");
+      span.textContent = this.value;
+      span.setAttribute("aria-hidden", "true");
+      let outerSpan = document.createElement("span");
+      if (this.type == "String" && this.value.length > MAX_PLACEABLE_LENGTH) {
+        outerSpan.setAttribute("aria-label", this.value);
+      } else {
+        let spanL10nId = this.hasUserValue
+          ? "about-config-pref-accessible-value-custom"
+          : "about-config-pref-accessible-value-default";
+        document.l10n.setAttributes(outerSpan, spanL10nId, {
+          value: "" + this.value,
+        });
+      }
+      outerSpan.appendChild(span);
+      this.valueCell.textContent = "";
+      this.valueCell.append(outerSpan);
+      if (this.type == "Boolean") {
+        document.l10n.setAttributes(
+          this.editButton,
+          "about-config-pref-toggle-button"
+        );
+        this.editButton.className = "button-toggle semi-transparent";
+      } else {
+        document.l10n.setAttributes(
+          this.editButton,
+          "about-config-pref-edit-button"
+        );
+        this.editButton.className = "button-edit semi-transparent";
+      }
+      this.editButton.removeAttribute("form");
+      delete this.inputField;
+    } else {
+      this.valueCell.textContent = "";
+      let form = document.createElement("form");
+      form.addEventListener("submit", event => event.preventDefault());
+      form.id = "form-edit";
+      if (this.editing) {
+        this.inputField = document.createElement("input");
+        this.inputField.value = this.value;
+        this.inputField.ariaLabel = this.name;
+        if (this.type == "Number") {
+          this.inputField.type = "number";
+          this.inputField.required = true;
+          this.inputField.min = -2147483648;
+          this.inputField.max = 2147483647;
+        } else {
+          this.inputField.type = "text";
+        }
+        form.appendChild(this.inputField);
+        document.l10n.setAttributes(
+          this.editButton,
+          "about-config-pref-save-button"
+        );
+        this.editButton.className = "primary button-save semi-transparent";
+      } else {
+        delete this.inputField;
+        for (let type of ["Boolean", "Number", "String"]) {
+          let radio = document.createElement("input");
+          radio.type = "radio";
+          radio.name = "type";
+          radio.value = type;
+          radio.checked = this.type == type;
+          let radioSpan = document.createElement("span");
+          document.l10n.setAttributes(radioSpan, STRINGS_ADD_BY_TYPE[type]);
+          let radioLabel = document.createElement("label");
+          radioLabel.append(radio, radioSpan);
+          form.appendChild(radioLabel);
+        }
+        form.addEventListener("click", event => {
+          if (event.target.name != "type") {
+            return;
+          }
+          let type = event.target.value;
+          if (this.type != type) {
+            if (type == "Boolean") {
+              this.value = true;
+            } else if (type == "Number") {
+              this.value = 0;
+            } else {
+              this.value = "";
+            }
+          }
+        });
+        document.l10n.setAttributes(
+          this.editButton,
+          "about-config-pref-add-button"
+        );
+        this.editButton.className = "button-add semi-transparent";
+      }
+      this.valueCell.appendChild(form);
+      this.editButton.setAttribute("form", "form-edit");
+    }
+    this.editButton.disabled = this.isLocked;
+    if (!this.isLocked && this.hasUserValue) {
+      if (!this.resetButton) {
+        this.resetButton = document.createElement("button");
+        this.resetCell.appendChild(this.resetButton);
+      }
+      if (!this.hasDefaultValue) {
+        document.l10n.setAttributes(
+          this.resetButton,
+          "about-config-pref-delete-button"
+        );
+        this.resetButton.className =
+          "button-delete ghost-button semi-transparent";
+      } else {
+        document.l10n.setAttributes(
+          this.resetButton,
+          "about-config-pref-reset-button"
+        );
+        this.resetButton.className =
+          "button-reset ghost-button semi-transparent";
+      }
+    } else if (this.resetButton) {
+      this.resetButton.remove();
+      delete this.resetButton;
+    }
+
+    this.refreshClass();
+  }
+
+  refreshClass() {
+    if (!this._element) {
+      return;
+    }
+
+    let className;
+    if (this.hidden) {
+      className = "hidden";
+    } else {
+      className =
+        (this.hasUserValue ? "has-user-value " : "") +
+        (this.isLocked ? "locked " : "") +
+        (this.exists || this.isAddRow ? "" : "deleted ") +
+        (this.isAddRow ? "add " : "") +
+        (this.odd ? "odd " : "");
+    }
+
+    if (this._lastClassName !== className) {
+      this._element.className = this._lastClassName = className;
+    }
+  }
+
+  edit() {
+    if (gPrefInEdit) {
+      gPrefInEdit.endEdit();
+    }
+    gPrefInEdit = this;
+    this.editing = true;
+    this.refreshElement();
+    this.inputField.focus();
+    this.inputField.select();
+  }
+
+  toggle() {
+    this.#notifyWillChange();
+    Services.prefs.setBoolPref(this.name, !this.value);
+    this.#notifyChanged();
+  }
+
+  editOrToggle() {
+    if (this.type == "Boolean") {
+      this.toggle();
+    } else {
+      this.edit();
+    }
+  }
+
+  save() {
+    if (this.type == "Number" && !this.inputField.reportValidity()) {
+      return;
+    }
+
+    this.#notifyWillChange();
+
+    if (this.type == "Number") {
+      Services.prefs.setIntPref(this.name, parseInt(this.inputField.value));
+    } else {
+      Services.prefs.setStringPref(this.name, this.inputField.value);
+    }
+
+    this.#notifyChanged();
+
+    this.refreshValue();
+    this.endEdit();
+    this.editButton.focus();
+  }
+
+  endEdit() {
+    this.editing = false;
+    this.refreshElement();
+    gPrefInEdit = null;
+  }
+
+  #notifyWillChange() {
+    Services.obs.notifyObservers(
+      null,
+      "about-config-will-change-pref",
+      this.name
+    );
+  }
+
+  #notifyChanged() {
+    Services.obs.notifyObservers(null, "about-config-changed-pref", this.name);
+  }
+}
+
+let gPrefObserverRegistered = false;
+let gPrefObserver = {
+  observe(subject, topic, data) {
+    let pref = gExistingPrefs.get(data) || gDeletedPrefs.get(data);
+    if (pref) {
+      pref.refreshValue();
+      if (!pref.editing) {
+        pref.refreshElement();
+      }
+      return;
+    }
+
+    let newPref = new PrefRow(data);
+    if (newPref.matchesFilter) {
+      document.getElementById("prefs").appendChild(newPref.getElement());
+    }
+  },
+};
+
+if (!Preferences.get("browser.aboutConfig.showWarning")) {
+  document.addEventListener("DOMContentLoaded", loadPrefs, { once: true });
+  window.addEventListener(
+    "load",
+    () => {
+      if (document.getElementById("about-config-search").value) {
+        filterPrefs();
+      }
+    },
+    { once: true }
+  );
+} else {
+  document.addEventListener("DOMContentLoaded", function () {
+    let warningButton = document.getElementById("warningButton");
+    warningButton.addEventListener("click", onWarningButtonClick);
+    warningButton.focus({ focusVisible: false });
+  });
+}
+
+function onWarningButtonClick() {
+  Services.prefs.setBoolPref(
+    "browser.aboutConfig.showWarning",
+    document.getElementById("showWarningNextTime").checked
+  );
+  loadPrefs();
+}
+
+function loadPrefs() {
+  [...document.styleSheets].find(s => s.title == "infop").disabled = true;
+
+  let { content } = document.getElementById("main");
+  document.body.textContent = "";
+  document.body.appendChild(content);
+
+  let search = (gSearchInput = document.getElementById("about-config-search"));
+  let prefs = (gPrefsTable = document.getElementById("prefs"));
+  let showAll = document.getElementById("show-all");
+  gShowOnlyModifiedCheckbox = document.getElementById(
+    "about-config-show-only-modified"
+  );
+  search.focus();
+  gShowOnlyModifiedCheckbox.checked = false;
+
+  for (let name of Services.prefs.getChildList("")) {
+    new PrefRow(name);
+  }
+
+  search.addEventListener("keypress", event => {
+    if (event.key == "Escape") {
+      search.value = "";
+      gFilterPrefsTask.disarm();
+      filterPrefs();
+    } else if (event.key == "Enter") {
+      gFilterPrefsTask.disarm();
+      filterPrefs({ shortString: true });
+    }
+  });
+
+  search.addEventListener("input", () => {
+    gFilterPrefsTask.disarm();
+    if (search.value.trim().length < SEARCH_AUTO_MIN_CHARACTERS) {
+      filterPrefs();
+    } else {
+      gFilterPrefsTask.arm();
+    }
+  });
+
+  gShowOnlyModifiedCheckbox.addEventListener("change", () => {
+    let tableHidden = !document.body.classList.contains("table-shown");
+    filterPrefs({
+      showAll:
+        gFilterShowAll || (gShowOnlyModifiedCheckbox.checked && tableHidden),
+    });
+  });
+
+  showAll.addEventListener("click", () => {
+    search.focus();
+    search.value = "";
+    gFilterPrefsTask.disarm();
+    filterPrefs({ showAll: true });
+  });
+
+  function shouldBeginEdit(event) {
+    if (
+      event.target.localName != "button" &&
+      event.target.localName != "input"
+    ) {
+      let row = event.target.closest("tr");
+      return row && row._pref.exists && !row._pref.isLocked;
+    }
+    return false;
+  }
+
+  prefs.addEventListener("mousedown", event => {
+    if (event.detail > 1 && shouldBeginEdit(event)) {
+      event.preventDefault();
+    }
+  });
+
+  prefs.addEventListener("click", event => {
+    if (event.detail == 2 && shouldBeginEdit(event)) {
+      event.target.closest("tr")._pref.editOrToggle();
+      return;
+    }
+
+    if (event.target.localName != "button") {
+      return;
+    }
+
+    let pref = event.target.closest("tr")._pref;
+    let button = event.target.closest("button");
+
+    if (button.classList.contains("button-add")) {
+      pref.isAddRow = false;
+      Preferences.set(pref.name, pref.value);
+      if (pref.type == "Boolean") {
+        pref.refreshClass();
+      } else {
+        pref.edit();
+      }
+    } else if (
+      button.classList.contains("button-toggle") ||
+      button.classList.contains("button-edit")
+    ) {
+      pref.editOrToggle();
+    } else if (button.classList.contains("button-save")) {
+      pref.save();
+    } else {
+      pref.editing = false;
+      Services.prefs.clearUserPref(pref.name);
+      pref.editButton.focus();
+    }
+  });
+
+  window.addEventListener("keypress", event => {
+    if (event.target != search && event.key == "Escape" && gPrefInEdit) {
+      gPrefInEdit.endEdit();
+    }
+  });
+}
+
+function filterPrefs(options = {}) {
+  if (gPrefInEdit) {
+    gPrefInEdit.endEdit();
+  }
+  gDeletedPrefs.clear();
+
+  let searchName = gSearchInput.value.trim();
+  if (searchName.length < SEARCH_AUTO_MIN_CHARACTERS && !options.shortString) {
+    searchName = "";
+  }
+
+  gFilterString = searchName.toLowerCase();
+  gFilterShowAll = !!options.showAll;
+
+  gFilterPattern = null;
+  if (gFilterString.includes("*")) {
+    gFilterPattern = new RegExp(gFilterString.replace(/\*+/g, ".*"), "i");
+    gFilterString = "";
+  }
+
+  let showResults = gFilterString || gFilterPattern || gFilterShowAll;
+  document.body.classList.toggle("table-shown", showResults);
+
+  let prefArray = [];
+  if (showResults) {
+    if (!gSortedExistingPrefs) {
+      gSortedExistingPrefs = [...gExistingPrefs.values()];
+      gSortedExistingPrefs.sort((a, b) => a.name > b.name);
+    }
+    prefArray = gSortedExistingPrefs;
+  }
+
+  let fragment = null;
+  let indexInArray = 0;
+  let elementInTable = gPrefsTable.firstElementChild;
+  let odd = false;
+  let hasVisiblePrefs = false;
+  while (indexInArray < prefArray.length || elementInTable) {
+    let prefInArray = prefArray[indexInArray];
+    if (prefInArray) {
+      if (!prefInArray.matchesFilter) {
+        indexInArray++;
+        continue;
+      }
+      prefInArray.hidden = false;
+      prefInArray.odd = odd;
+    }
+
+    let prefInTable = elementInTable && elementInTable._pref;
+    if (!prefInTable) {
+      if (!fragment) {
+        fragment = document.createDocumentFragment();
+      }
+      fragment.appendChild(prefInArray.getElement());
+    } else if (prefInTable == prefInArray) {
+      elementInTable = elementInTable.nextElementSibling;
+    } else if (prefInArray && prefInArray.name < prefInTable.name) {
+      gPrefsTable.insertBefore(prefInArray.getElement(), elementInTable);
+    } else {
+      let nextElementInTable = elementInTable.nextElementSibling;
+      if (!prefInTable.exists) {
+        elementInTable.remove();
+      } else {
+        prefInTable.hidden = true;
+        prefInTable.refreshClass();
+      }
+      elementInTable = nextElementInTable;
+      continue;
+    }
+
+    prefInArray.refreshClass();
+    odd = !odd;
+    indexInArray++;
+    hasVisiblePrefs = true;
+  }
+
+  if (fragment) {
+    gPrefsTable.appendChild(fragment);
+  }
+
+  gPrefsTable.toggleAttribute("has-visible-prefs", hasVisiblePrefs);
+
+  if (searchName && !gExistingPrefs.has(searchName)) {
+    let addPrefRow = new PrefRow(searchName, { isAddRow: true });
+    addPrefRow.odd = odd;
+    gPrefsTable.appendChild(addPrefRow.getElement());
+  }
+
+  if (!gPrefObserverRegistered) {
+    gPrefObserverRegistered = true;
+    Services.prefs.addObserver("", gPrefObserver);
+    window.addEventListener(
+      "unload",
+      () => {
+        Services.prefs.removeObserver("", gPrefObserver);
+      },
+      { once: true }
+    );
+  }
+}

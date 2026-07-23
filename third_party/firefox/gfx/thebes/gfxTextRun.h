@@ -1,0 +1,1103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_TEXTRUN_H
+#define GFX_TEXTRUN_H
+
+#include <stdint.h>
+
+#include "gfxTypes.h"
+#include "gfxPoint.h"
+#include "gfxFont.h"
+#include "gfxFontConstants.h"
+#include "gfxSkipChars.h"
+#include "gfxPlatform.h"
+#include "gfxPlatformFontList.h"
+#include "gfxScriptItemizer.h"
+#include "gfxUserFontSet.h"
+#include "gfxUtils.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/intl/UnicodeScriptCodes.h"
+#include "nsPoint.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nsTHashSet.h"
+#include "nsTextFrameUtils.h"
+#include "DrawMode.h"
+#include "harfbuzz/hb.h"
+#include "nsColor.h"
+#include "nsFrameList.h"
+
+#ifdef DEBUG_FRAME_DUMP
+#  include <stdio.h>
+#endif
+
+class FontVisibilityProvider;
+class gfxContext;
+class gfxFontGroup;
+class nsAtom;
+class nsLanguageAtomService;
+class gfxMissingFontRecorder;
+
+namespace mozilla {
+class LogModule;
+class PostTraversalTask;
+class SVGContextPaint;
+enum class StyleHyphens : uint8_t;
+};  
+
+struct MOZ_STACK_CLASS gfxTextRunDrawCallbacks {
+  explicit gfxTextRunDrawCallbacks(bool aShouldPaintSVGGlyphs = false)
+      : mShouldPaintSVGGlyphs(aShouldPaintSVGGlyphs) {}
+
+  virtual void NotifyGlyphPathEmitted() = 0;
+
+  bool mShouldPaintSVGGlyphs;
+};
+
+class gfxTextRun : public gfxShapedText {
+  NS_INLINE_DECL_REFCOUNTING(gfxTextRun);
+
+ protected:
+  void operator delete(void* p) { free(p); }
+
+  virtual ~gfxTextRun();
+
+ public:
+  typedef gfxFont::RunMetrics Metrics;
+  typedef mozilla::gfx::DrawTarget DrawTarget;
+  using imgDrawingParams = mozilla::image::imgDrawingParams;
+
+
+  bool IsClusterStart(uint32_t aPos) const {
+    MOZ_ASSERT(aPos < GetLength());
+    return mCharacterGlyphs[aPos].IsClusterStart();
+  }
+  bool IsLigatureGroupStart(uint32_t aPos) const {
+    MOZ_ASSERT(aPos < GetLength());
+    return mCharacterGlyphs[aPos].IsLigatureGroupStart();
+  }
+  bool CanBreakLineBefore(uint32_t aPos) const {
+    return CanBreakBefore(aPos) == CompressedGlyph::FLAG_BREAK_TYPE_NORMAL;
+  }
+  bool CanHyphenateBefore(uint32_t aPos) const {
+    return CanBreakBefore(aPos) == CompressedGlyph::FLAG_BREAK_TYPE_HYPHEN;
+  }
+
+  uint8_t CanBreakBefore(uint32_t aPos) const {
+    MOZ_ASSERT(aPos < GetLength());
+    return mCharacterGlyphs[aPos].CanBreakBefore();
+  }
+
+  bool CharIsSpace(uint32_t aPos) const {
+    MOZ_ASSERT(aPos < GetLength());
+    return mCharacterGlyphs[aPos].CharIsSpace();
+  }
+  bool CharIsTab(uint32_t aPos) const {
+    MOZ_ASSERT(aPos < GetLength());
+    return mCharacterGlyphs[aPos].CharIsTab();
+  }
+  bool CharIsNewline(uint32_t aPos) const {
+    MOZ_ASSERT(aPos < GetLength());
+    return mCharacterGlyphs[aPos].CharIsNewline();
+  }
+  bool CharMayHaveEmphasisMark(uint32_t aPos) const {
+    MOZ_ASSERT(aPos < GetLength());
+    return mCharacterGlyphs[aPos].CharMayHaveEmphasisMark();
+  }
+  bool CharIsFormattingControl(uint32_t aPos) const {
+    MOZ_ASSERT(aPos < GetLength());
+    return mCharacterGlyphs[aPos].CharIsFormattingControl();
+  }
+
+
+  struct Range {
+    uint32_t start = 0;
+    uint32_t end = 0;
+    uint32_t Length() const { return end - start; }
+
+    Range() = default;
+    Range(uint32_t aStart, uint32_t aEnd) : start(aStart), end(aEnd) {}
+    explicit Range(const gfxTextRun* aTextRun)
+        : Range(0, aTextRun->GetLength()) {}
+
+    bool Intersects(const Range& aOther) const {
+      return start < aOther.end && end > aOther.start;
+    }
+  };
+
+
+  virtual bool SetPotentialLineBreaks(Range aRange,
+                                      const uint8_t* aBreakBefore);
+
+  enum class HyphenType : uint8_t {
+    None,
+    Explicit,
+    Soft,
+    AutoWithManualInSameWord,
+    AutoWithoutManualInSameWord
+  };
+
+  static bool IsOptionalHyphenBreak(HyphenType aType) {
+    return aType >= HyphenType::Soft;
+  }
+
+  struct HyphenationState {
+    uint32_t mostRecentBoundary = 0;
+    bool hasManualHyphen = false;
+    bool hasExplicitHyphen = false;
+    bool hasAutoHyphen = false;
+  };
+
+  class PropertyProvider {
+   public:
+    virtual void GetHyphenationBreaks(Range aRange,
+                                      HyphenType* aBreakBefore) const = 0;
+
+    virtual mozilla::StyleHyphens GetHyphensOption() const = 0;
+
+    virtual gfxFloat GetHyphenWidth() const = 0;
+
+    virtual mozilla::gfx::ShapedTextFlags GetShapedTextFlags() const = 0;
+
+    typedef gfxFont::Spacing Spacing;
+
+    virtual bool GetSpacing(Range aRange, Spacing* aSpacing) const = 0;
+
+    virtual already_AddRefed<DrawTarget> GetDrawTarget() const = 0;
+
+    virtual uint32_t GetAppUnitsPerDevUnit() const = 0;
+
+    virtual nscoord LetterSpacing() const = 0;
+  };
+
+  struct MOZ_STACK_CLASS DrawParams {
+    gfxContext* context;
+    mozilla::gfx::PaletteCache& paletteCache;
+    DrawMode drawMode = DrawMode::GLYPH_FILL;
+    nscolor textStrokeColor = 0;
+    nsAtom* fontPalette = nullptr;
+    gfxPattern* textStrokePattern = nullptr;
+    const mozilla::gfx::StrokeOptions* strokeOpts = nullptr;
+    const mozilla::gfx::DrawOptions* drawOpts = nullptr;
+    const PropertyProvider* provider = nullptr;
+    gfxFloat* advanceWidth = nullptr;
+    mozilla::SVGContextPaint* contextPaint = nullptr;
+    gfxTextRunDrawCallbacks* callbacks = nullptr;
+    bool allowGDI = true;
+    bool hasTextShadow = false;
+    DrawParams(gfxContext* aContext, mozilla::gfx::PaletteCache& aPaletteCache)
+        : context(aContext), paletteCache(aPaletteCache) {}
+  };
+
+  void Draw(const Range aRange, const mozilla::gfx::Point aPt,
+            const DrawParams& aParams, imgDrawingParams& aImgParams) const;
+
+  void DrawEmphasisMarks(gfxContext* aContext, gfxTextRun* aMark,
+                         gfxFloat aMarkAdvance, mozilla::gfx::Point aPt,
+                         Range aRange, const PropertyProvider* aProvider,
+                         mozilla::gfx::PaletteCache& aPaletteCache,
+                         imgDrawingParams& aImgParams) const;
+
+  Metrics MeasureText(Range aRange, gfxFont::BoundingBoxType aBoundingBoxType,
+                      DrawTarget* aDrawTargetForTightBoundingBox,
+                      const PropertyProvider* aProvider) const;
+
+  Metrics MeasureText(gfxFont::BoundingBoxType aBoundingBoxType,
+                      DrawTarget* aDrawTargetForTightBoundingBox,
+                      const PropertyProvider* aProvider = nullptr) const {
+    return MeasureText(Range(this), aBoundingBoxType,
+                       aDrawTargetForTightBoundingBox, aProvider);
+  }
+
+  void GetLineHeightMetrics(Range aRange, gfxFloat& aAscent,
+                            gfxFloat& aDescent) const;
+  void GetLineHeightMetrics(gfxFloat& aAscent, gfxFloat& aDescent) const {
+    GetLineHeightMetrics(Range(this), aAscent, aDescent);
+  }
+
+  gfxFloat GetAdvanceWidth(Range aRange, const PropertyProvider* aProvider,
+                           PropertyProvider::Spacing* aSpacing = nullptr) const;
+
+  gfxFloat GetAdvanceWidth() const {
+    return GetAdvanceWidth(Range(this), nullptr);
+  }
+
+  gfxFloat GetMinAdvanceWidth(Range aRange, nscoord aLetterSpacing) const;
+
+  virtual bool SetLineBreaks(Range aRange, bool aLineBreakBefore,
+                             bool aLineBreakAfter,
+                             gfxFloat* aAdvanceWidthDelta);
+
+  enum SuppressBreak {
+    eNoSuppressBreak,
+    eSuppressInitialBreak,
+    eSuppressAllBreaks
+  };
+
+  void ClassifyAutoHyphenations(uint32_t aStart, Range aRange,
+                                nsTArray<HyphenType>& aHyphenBuffer,
+                                HyphenationState* aWordState);
+
+  struct TrimmableWS {
+    mozilla::gfx::Float mAdvance = 0;
+    uint32_t mCount = 0;
+  };
+
+  uint32_t BreakAndMeasureText(
+      uint32_t aStart, uint32_t aMaxLength, bool aLineBreakBefore,
+      gfxFloat aWidth, const PropertyProvider& aProvider,
+      SuppressBreak aSuppressBreak, gfxFont::BoundingBoxType aBoundingBoxType,
+      DrawTarget* aRefDrawTarget, bool aCanWordWrap, bool aCanWhitespaceWrap,
+      bool aIsBreakSpaces,
+      TrimmableWS* aOutTrimmableWhitespace,  
+      Metrics& aOutMetrics, bool& aOutUsedHyphenation, uint32_t& aOutLastBreak,
+      gfxBreakPriority& aBreakPriority);
+
+
+  void* GetUserData() const { return mUserData; }
+  void SetUserData(void* aUserData) { mUserData = aUserData; }
+
+  void SetFlagBits(nsTextFrameUtils::Flags aFlags) { mFlags2 |= aFlags; }
+  void ClearFlagBits(nsTextFrameUtils::Flags aFlags) { mFlags2 &= ~aFlags; }
+  const gfxSkipChars& GetSkipChars() const { return mSkipChars; }
+  gfxFontGroup* GetFontGroup() const { return mFontGroup; }
+
+  static already_AddRefed<gfxTextRun> Create(
+      const gfxTextRunFactory::Parameters* aParams, uint32_t aLength,
+      gfxFontGroup* aFontGroup, mozilla::gfx::ShapedTextFlags aFlags,
+      nsTextFrameUtils::Flags aFlags2);
+
+  struct GlyphRun {
+    RefPtr<gfxFont> mFont;      
+    uint32_t mCharacterOffset;  
+    mozilla::gfx::ShapedTextFlags
+        mOrientation;  
+    FontMatchType mMatchType;
+    bool mIsCJK;  
+
+    void SetProperties(gfxFont* aFont,
+                       mozilla::gfx::ShapedTextFlags aOrientation, bool aIsCJK,
+                       FontMatchType aMatchType) {
+      mFont = aFont;
+      mOrientation = aOrientation;
+      mIsCJK = aIsCJK;
+      mMatchType = aMatchType;
+    }
+
+    bool Matches(gfxFont* aFont, mozilla::gfx::ShapedTextFlags aOrientation,
+                 bool aIsCJK, FontMatchType aMatchType) {
+      if (mFont == aFont && mOrientation == aOrientation && mIsCJK == aIsCJK) {
+        mMatchType.kind |= aMatchType.kind;
+        if (mMatchType.generic == mozilla::StyleGenericFontFamily::None) {
+          mMatchType.generic = aMatchType.generic;
+        }
+        return true;
+      }
+      return false;
+    }
+
+    bool IsSidewaysLeft() const {
+      return (mOrientation & mozilla::gfx::ShapedTextFlags::TEXT_ORIENT_MASK) ==
+             mozilla::gfx::ShapedTextFlags::TEXT_ORIENT_VERTICAL_SIDEWAYS_LEFT;
+    }
+
+    bool IsSidewaysRight() const {
+      return (mOrientation & mozilla::gfx::ShapedTextFlags::TEXT_ORIENT_MASK) ==
+             mozilla::gfx::ShapedTextFlags::TEXT_ORIENT_VERTICAL_SIDEWAYS_RIGHT;
+    }
+  };
+
+  static inline bool IsCJKScript(Script aScript) {
+    switch (aScript) {
+      case Script::BOPOMOFO:
+      case Script::HAN:
+      case Script::HANGUL:
+      case Script::HIRAGANA:
+      case Script::KATAKANA:
+      case Script::KATAKANA_OR_HIRAGANA:
+      case Script::SIMPLIFIED_HAN:
+      case Script::TRADITIONAL_HAN:
+      case Script::TRADITIONAL_HAN_WITH_LATIN:
+      case Script::JAPANESE:
+      case Script::KOREAN:
+      case Script::HAN_WITH_BOPOMOFO:
+      case Script::JAMO:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  class MOZ_STACK_CLASS GlyphRunIterator {
+   public:
+    GlyphRunIterator(const gfxTextRun* aTextRun, Range aRange,
+                     bool aReverse = false)
+        : mTextRun(aTextRun),
+          mStartOffset(aRange.start),
+          mEndOffset(aRange.end),
+          mReverse(aReverse) {
+      mGlyphRun = mTextRun->FindFirstGlyphRunContaining(
+          aReverse ? aRange.end - 1 : aRange.start);
+      if (!mGlyphRun) {
+        mStringEnd = mStringStart = mStartOffset;
+        return;
+      }
+      uint32_t glyphRunEndOffset = mGlyphRun == mTextRun->mGlyphRuns.end() - 1
+                                       ? mTextRun->GetLength()
+                                       : (mGlyphRun + 1)->mCharacterOffset;
+      mStringEnd = std::min(mEndOffset, glyphRunEndOffset);
+      mStringStart = std::max(mStartOffset, mGlyphRun->mCharacterOffset);
+    }
+    void NextRun();
+    bool AtEnd() const { return mGlyphRun == nullptr; }
+    const struct GlyphRun* GlyphRun() const { return mGlyphRun; }
+    uint32_t StringStart() const { return mStringStart; }
+    uint32_t StringEnd() const { return mStringEnd; }
+
+   private:
+    const gfxTextRun* mTextRun;
+    const struct GlyphRun* mGlyphRun;
+    uint32_t mStringStart;
+    uint32_t mStringEnd;
+    uint32_t mStartOffset;
+    uint32_t mEndOffset;
+    bool mReverse;
+  };
+
+  class GlyphRunOffsetComparator {
+   public:
+    bool Equals(const GlyphRun& a, const GlyphRun& b) const {
+      return a.mCharacterOffset == b.mCharacterOffset;
+    }
+
+    bool LessThan(const GlyphRun& a, const GlyphRun& b) const {
+      return a.mCharacterOffset < b.mCharacterOffset;
+    }
+  };
+
+  void AddGlyphRun(gfxFont* aFont, FontMatchType aMatchType,
+                   uint32_t aUTF16Offset, bool aForceNewRun,
+                   mozilla::gfx::ShapedTextFlags aOrientation, bool aIsCJK);
+  void ResetGlyphRuns() { mGlyphRuns.Clear(); }
+  void SanitizeGlyphRuns();
+
+  const CompressedGlyph* GetCharacterGlyphs() const final {
+    MOZ_ASSERT(mCharacterGlyphs, "failed to initialize mCharacterGlyphs");
+    return mCharacterGlyphs;
+  }
+  CompressedGlyph* GetCharacterGlyphs() final {
+    MOZ_ASSERT(mCharacterGlyphs, "failed to initialize mCharacterGlyphs");
+    return mCharacterGlyphs;
+  }
+
+  void ClearGlyphsAndCharacters();
+
+  void SetSpaceGlyph(gfxFont* aFont, DrawTarget* aDrawTarget,
+                     uint32_t aCharIndex,
+                     mozilla::gfx::ShapedTextFlags aOrientation);
+
+  bool SetSpaceGlyphIfSimple(gfxFont* aFont, uint32_t aCharIndex,
+                             char16_t aSpaceChar,
+                             mozilla::gfx::ShapedTextFlags aOrientation);
+
+  void SetIsTab(uint32_t aIndex) { EnsureComplexGlyph(aIndex).SetIsTab(); }
+  void SetIsNewline(uint32_t aIndex) {
+    EnsureComplexGlyph(aIndex).SetIsNewline();
+  }
+  void SetNoEmphasisMark(uint32_t aIndex) {
+    EnsureComplexGlyph(aIndex).SetNoEmphasisMark();
+  }
+  void SetIsFormattingControl(uint32_t aIndex) {
+    EnsureComplexGlyph(aIndex).SetIsFormattingControl();
+  }
+
+  void FetchGlyphExtents(DrawTarget* aRefDrawTarget) const;
+
+  const GlyphRun* GetGlyphRuns(uint32_t* aNumGlyphRuns) const {
+    *aNumGlyphRuns = mGlyphRuns.Length();
+    return mGlyphRuns.begin();
+  }
+
+  uint32_t GlyphRunCount() const { return mGlyphRuns.Length(); }
+
+  const GlyphRun* TrailingGlyphRun() const {
+    return mGlyphRuns.IsEmpty() ? nullptr : mGlyphRuns.end() - 1;
+  }
+
+  const GlyphRun* FindFirstGlyphRunContaining(uint32_t aOffset) const;
+
+  void CopyGlyphDataFrom(gfxShapedWord* aSource, uint32_t aStart);
+
+  void CopyGlyphDataFrom(gfxTextRun* aSource, Range aRange, uint32_t aDest);
+
+  void ReleaseFontGroup();
+
+  struct LigatureData {
+    Range mRange;
+    gfxFloat mPartAdvance;
+    gfxFloat mPartWidth;
+
+    bool mClipBeforePart;
+    bool mClipAfterPart;
+  };
+
+  virtual size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf)
+      MOZ_MUST_OVERRIDE;
+  virtual size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf)
+      MOZ_MUST_OVERRIDE;
+
+  nsTextFrameUtils::Flags GetFlags2() const { return mFlags2; }
+
+  size_t MaybeSizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) {
+    if (mFlags2 & nsTextFrameUtils::Flags::RunSizeAccounted) {
+      return 0;
+    }
+    mFlags2 |= nsTextFrameUtils::Flags::RunSizeAccounted;
+    return SizeOfIncludingThis(aMallocSizeOf);
+  }
+  void ResetSizeOfAccountingFlags() {
+    mFlags2 &= ~nsTextFrameUtils::Flags::RunSizeAccounted;
+  }
+
+
+  enum ShapingState : uint8_t {
+    eShapingState_Normal,               
+    eShapingState_ShapingWithFeature,   
+    eShapingState_ShapingWithFallback,  
+    eShapingState_Aborted,              
+    eShapingState_ForceFallbackFeature  
+  };
+
+  ShapingState GetShapingState() const { return mShapingState; }
+  void SetShapingState(ShapingState aShapingState) {
+    mShapingState = aShapingState;
+  }
+
+  nscoord GetAdvanceForGlyph(uint32_t aIndex,
+                             nscoord aLetterSpacing = 0) const {
+    const CompressedGlyph& glyphData = mCharacterGlyphs[aIndex];
+    if (glyphData.IsSimpleGlyph()) {
+      return glyphData.GetSimpleAdvance();
+    }
+    uint32_t glyphCount = glyphData.GetGlyphCount();
+    if (!glyphCount) {
+      return 0;
+    }
+    const DetailedGlyph* details = GetDetailedGlyphs(aIndex);
+    nscoord advance = 0;
+    if (glyphData.ApplyLetterSpacingBetweenDetailedGlyphs()) {
+      advance += (glyphCount - 1) * aLetterSpacing;
+    }
+    while (glyphCount--) {
+      advance += details->mAdvance;
+      ++details;
+    }
+    return advance;
+  }
+
+#ifdef DEBUG_FRAME_DUMP
+  void Dump(FILE* aOutput = stderr);
+#endif
+
+ protected:
+  gfxTextRun(const gfxTextRunFactory::Parameters* aParams, uint32_t aLength,
+             gfxFontGroup* aFontGroup, mozilla::gfx::ShapedTextFlags aFlags,
+             nsTextFrameUtils::Flags aFlags2);
+
+  bool NeedsGlyphExtents() const;
+
+  static void* AllocateStorageForTextRun(size_t aSize, uint32_t aLength);
+
+  CompressedGlyph* mCharacterGlyphs;
+
+ private:
+
+  int32_t GetAdvanceForGlyphs(Range aRange, nscoord aLetterSpacing) const;
+
+  bool GetAdjustedSpacingArray(
+      Range aRange, const PropertyProvider* aProvider, Range aSpacingRange,
+      nsTArray<PropertyProvider::Spacing>* aSpacing) const;
+
+  CompressedGlyph& EnsureComplexGlyph(uint32_t aIndex) {
+    gfxShapedText::EnsureComplexGlyph(aIndex, mCharacterGlyphs[aIndex]);
+    return mCharacterGlyphs[aIndex];
+  }
+
+
+  LigatureData ComputeLigatureData(Range aPartRange,
+                                   const PropertyProvider* aProvider) const;
+  gfxFloat ComputePartialLigatureWidth(Range aPartRange,
+                                       const PropertyProvider* aProvider) const;
+  void DrawPartialLigature(gfxFont* aFont, Range aRange,
+                           mozilla::gfx::Point* aPt,
+                           const PropertyProvider* aProvider,
+                           TextRunDrawParams& aParams,
+                           imgDrawingParams& aImgParams,
+                           mozilla::gfx::ShapedTextFlags aOrientation) const;
+  bool ShrinkToLigatureBoundaries(Range* aRange) const;
+  gfxFloat GetPartialLigatureWidth(Range aRange,
+                                   const PropertyProvider* aProvider) const;
+  void AccumulatePartialLigatureMetrics(
+      gfxFont* aFont, Range aRange, gfxFont::BoundingBoxType aBoundingBoxType,
+      DrawTarget* aRefDrawTarget, const PropertyProvider* aProvider,
+      mozilla::gfx::ShapedTextFlags aOrientation, Metrics* aMetrics) const;
+
+  void AccumulateMetricsForRun(gfxFont* aFont, Range aRange,
+                               gfxFont::BoundingBoxType aBoundingBoxType,
+                               DrawTarget* aRefDrawTarget,
+                               const PropertyProvider* aProvider,
+                               Range aSpacingRange,
+                               mozilla::gfx::ShapedTextFlags aOrientation,
+                               Metrics* aMetrics) const;
+
+  void DrawGlyphs(gfxFont* aFont, Range aRange, mozilla::gfx::Point* aPt,
+                  const PropertyProvider* aProvider, Range aSpacingRange,
+                  TextRunDrawParams& aParams, imgDrawingParams& aImgParams,
+                  mozilla::gfx::ShapedTextFlags aOrientation) const;
+
+  mozilla::ElementOrArray<GlyphRun> mGlyphRuns;
+
+  void* mUserData;
+
+  gfxFontGroup* MOZ_OWNING_REF mFontGroup;
+
+  gfxSkipChars mSkipChars;
+
+  nsTextFrameUtils::Flags
+      mFlags2;  
+
+  bool mDontSkipDrawing;  
+
+  ShapingState mShapingState;
+};
+
+class gfxFontGroup final : public gfxTextRunFactory {
+ public:
+  typedef mozilla::intl::Script Script;
+  typedef gfxShapedText::CompressedGlyph CompressedGlyph;
+  friend class MathMLTextRunFactory;
+  friend class nsCaseTransformTextRunFactory;
+  friend class gfxPlatformFontList;
+
+  static void
+  Shutdown();  
+
+  gfxFontGroup(FontVisibilityProvider* aFontVisibilityProvider,
+               const mozilla::StyleFontFamilyList& aFontFamilyList,
+               const gfxFontStyle* aStyle, nsAtom* aLanguage,
+               bool aExplicitLanguage, gfxTextPerfMetrics* aTextPerf,
+               gfxUserFontSet* aUserFontSet, gfxFloat aDevToCssSize,
+               StyleFontVariantEmoji aVariantEmoji);
+
+  virtual ~gfxFontGroup();
+
+  gfxFontGroup(const gfxFontGroup& aOther) = delete;
+
+  static constexpr uint32_t kCSSFirstAvailableFont = UINT32_MAX;
+  already_AddRefed<gfxFont> GetFirstValidFont(
+      uint32_t aCh = kCSSFirstAvailableFont,
+      mozilla::StyleGenericFontFamily* aGeneric = nullptr,
+      bool* aIsFirst = nullptr);
+
+  already_AddRefed<gfxFont> GetFirstMathFont();
+
+  const gfxFontStyle* GetStyle() const { return &mStyle; }
+
+  FontVisibilityProvider* GetFontVisibilityProvider() const {
+    return mFontVisibilityProvider;
+  }
+
+  static inline bool IsInvalidChar(uint8_t ch) {
+    return (ch & 0x7f) < 0x20 || ch == 0x7f;
+  }
+
+  static inline bool IsInvalidChar(char16_t ch) {
+    if (ch - 0x20u < 0x7fu - 0x20u) {
+      return false;
+    }
+    if (ch <= 0x9f) {
+      return true;
+    }
+    return ((ch & 0xFF00) == 0x2000 &&
+            (ch == 0x200B  ||
+             ch == 0x2028  ||
+             ch == 0x2029  ||
+             ch == 0x2060 )) ||
+           ch == 0xfeff  || IsBidiControl(ch);
+  }
+
+  template <typename T>
+  already_AddRefed<gfxTextRun> MakeTextRun(const T* aString, uint32_t aLength,
+                                           const Parameters* aParams,
+                                           mozilla::gfx::ShapedTextFlags aFlags,
+                                           nsTextFrameUtils::Flags aFlags2,
+                                           gfxMissingFontRecorder* aMFR);
+
+  template <typename T>
+  already_AddRefed<gfxTextRun> MakeTextRun(const T* aString, uint32_t aLength,
+                                           DrawTarget* aRefDrawTarget,
+                                           int32_t aAppUnitsPerDevUnit,
+                                           mozilla::gfx::ShapedTextFlags aFlags,
+                                           nsTextFrameUtils::Flags aFlags2,
+                                           gfxMissingFontRecorder* aMFR) {
+    gfxTextRunFactory::Parameters params = {
+        aRefDrawTarget, nullptr, nullptr, nullptr, 0, aAppUnitsPerDevUnit};
+    return MakeTextRun(aString, aLength, &params, aFlags, aFlags2, aMFR);
+  }
+
+  gfxFloat GetHyphenWidth(const gfxTextRun::PropertyProvider* aProvider);
+
+  already_AddRefed<gfxTextRun> MakeHyphenTextRun(
+      DrawTarget* aDrawTarget, mozilla::gfx::ShapedTextFlags aFlags,
+      uint32_t aAppUnitsPerDevUnit);
+
+  bool HasFont(const gfxFontEntry* aFontEntry);
+
+  static constexpr gfxFloat UNDERLINE_OFFSET_NOT_SET = INT16_MAX;
+  gfxFloat GetUnderlineOffset();
+
+  already_AddRefed<gfxFont> FindFontForChar(uint32_t ch, uint32_t prevCh,
+                                            uint32_t aNextCh, Script aRunScript,
+                                            gfxFont* aPrevMatchedFont,
+                                            FontMatchType* aMatchType);
+
+  gfxUserFontSet* GetUserFontSet();
+
+  uint64_t GetGeneration();
+
+  uint64_t GetRebuildGeneration();
+
+  gfxTextPerfMetrics* GetTextPerfMetrics() const { return mTextPerf; }
+
+  void SetUserFontSet(gfxUserFontSet* aUserFontSet);
+
+  void ClearCachedData() {
+    mUnderlineOffset = UNDERLINE_OFFSET_NOT_SET;
+    mSkipDrawing = false;
+    mHyphenWidth = -1;
+  }
+
+  void UpdateUserFonts();
+
+  bool ContainsUserFont(const gfxUserFontEntry* aUserFont);
+
+  bool ShouldSkipDrawing() const { return mSkipDrawing; }
+
+  already_AddRefed<gfxTextRun> MakeEllipsisTextRun(
+      int32_t aAppUnitsPerDevPixel, mozilla::gfx::ShapedTextFlags aFlags,
+      DrawTarget* aRefDrawTarget);
+
+  nsAtom* Language() const { return mLanguage.get(); }
+
+  gfxFont::Metrics GetMetricsForCSSUnits(
+      gfxFont::Orientation aOrientation,
+      mozilla::StyleQueryFontMetricsFlags aFlags);
+
+ protected:
+  friend class mozilla::PostTraversalTask;
+  friend class DeferredClearResolvedFonts;
+
+  struct TextRange {
+    TextRange(uint32_t aStart, uint32_t aEnd, gfxFont* aFont,
+              FontMatchType aMatchType,
+              mozilla::gfx::ShapedTextFlags aOrientation)
+        : start(aStart),
+          end(aEnd),
+          font(aFont),
+          matchType(aMatchType),
+          orientation(aOrientation) {}
+    uint32_t Length() const { return end - start; }
+    uint32_t start, end;
+    RefPtr<gfxFont> font;
+    FontMatchType matchType;
+    mozilla::gfx::ShapedTextFlags orientation;
+  };
+
+  already_AddRefed<gfxFont> WhichPrefFontSupportsChar(
+      uint32_t aCh, uint32_t aNextCh, FontPresentation aPresentation);
+
+  already_AddRefed<gfxFont> WhichSystemFontSupportsChar(
+      uint32_t aCh, uint32_t aNextCh, Script aRunScript,
+      FontPresentation aPresentation);
+
+  template <typename T>
+  void ComputeRanges(nsTArray<TextRange>& aRanges, const T* aString,
+                     uint32_t aLength, Script aRunScript,
+                     mozilla::gfx::ShapedTextFlags aOrientation);
+
+  class FamilyFace {
+   public:
+    FamilyFace()
+        : mOwnedFamily(nullptr),
+          mFontEntry(nullptr),
+          mGeneric(mozilla::StyleGenericFontFamily::None),
+          mFontCreated(false),
+          mLoading(false),
+          mInvalid(false),
+          mCheckForFallbackFaces(false),
+          mIsSharedFamily(false),
+          mHasFontEntry(false) {}
+
+    FamilyFace(gfxFontFamily* aFamily, gfxFont* aFont,
+               mozilla::StyleGenericFontFamily aGeneric)
+        : mOwnedFamily(aFamily),
+          mGeneric(aGeneric),
+          mFontCreated(true),
+          mLoading(false),
+          mInvalid(false),
+          mCheckForFallbackFaces(false),
+          mIsSharedFamily(false),
+          mHasFontEntry(false) {
+      NS_ASSERTION(aFont, "font pointer must not be null");
+      NS_ASSERTION(!aFamily || aFamily->ContainsFace(aFont->GetFontEntry()),
+                   "font is not a member of the given family");
+      NS_IF_ADDREF(aFamily);
+      mFont = aFont;
+      NS_ADDREF(aFont);
+    }
+
+    FamilyFace(gfxFontFamily* aFamily, gfxFontEntry* aFontEntry,
+               mozilla::StyleGenericFontFamily aGeneric)
+        : mOwnedFamily(aFamily),
+          mGeneric(aGeneric),
+          mFontCreated(false),
+          mLoading(false),
+          mInvalid(false),
+          mCheckForFallbackFaces(false),
+          mIsSharedFamily(false),
+          mHasFontEntry(true) {
+      NS_ASSERTION(aFontEntry, "font entry pointer must not be null");
+      NS_ASSERTION(!aFamily || aFamily->ContainsFace(aFontEntry),
+                   "font is not a member of the given family");
+      NS_IF_ADDREF(aFamily);
+      mFontEntry = aFontEntry;
+      NS_ADDREF(aFontEntry);
+    }
+
+    FamilyFace(mozilla::fontlist::Family* aFamily, gfxFontEntry* aFontEntry,
+               mozilla::StyleGenericFontFamily aGeneric)
+        : mSharedFamily(aFamily),
+          mGeneric(aGeneric),
+          mFontCreated(false),
+          mLoading(false),
+          mInvalid(false),
+          mCheckForFallbackFaces(false),
+          mIsSharedFamily(true),
+          mHasFontEntry(true) {
+      MOZ_ASSERT(aFamily && aFontEntry && aFontEntry->mShmemFace);
+      mFontEntry = aFontEntry;
+      NS_ADDREF(aFontEntry);
+    }
+
+    FamilyFace(const FamilyFace& aOtherFamilyFace)
+        : mGeneric(aOtherFamilyFace.mGeneric),
+          mFontCreated(aOtherFamilyFace.mFontCreated),
+          mLoading(aOtherFamilyFace.mLoading),
+          mInvalid(aOtherFamilyFace.mInvalid),
+          mCheckForFallbackFaces(aOtherFamilyFace.mCheckForFallbackFaces),
+          mIsSharedFamily(aOtherFamilyFace.mIsSharedFamily),
+          mHasFontEntry(aOtherFamilyFace.mHasFontEntry) {
+      if (mIsSharedFamily) {
+        mSharedFamily = aOtherFamilyFace.mSharedFamily;
+        if (mFontCreated) {
+          mFont = aOtherFamilyFace.mFont;
+          NS_ADDREF(mFont);
+        } else if (mHasFontEntry) {
+          mFontEntry = aOtherFamilyFace.mFontEntry;
+          NS_ADDREF(mFontEntry);
+        } else {
+          mSharedFace = aOtherFamilyFace.mSharedFace;
+        }
+      } else {
+        mOwnedFamily = aOtherFamilyFace.mOwnedFamily;
+        NS_IF_ADDREF(mOwnedFamily);
+        if (mFontCreated) {
+          mFont = aOtherFamilyFace.mFont;
+          NS_ADDREF(mFont);
+        } else {
+          mFontEntry = aOtherFamilyFace.mFontEntry;
+          NS_IF_ADDREF(mFontEntry);
+        }
+      }
+    }
+
+    ~FamilyFace() {
+      if (mFontCreated) {
+        NS_RELEASE(mFont);
+      }
+      if (!mIsSharedFamily) {
+        NS_IF_RELEASE(mOwnedFamily);
+      }
+      if (mHasFontEntry) {
+        NS_RELEASE(mFontEntry);
+      }
+    }
+
+    FamilyFace& operator=(const FamilyFace& aOther) {
+      if (mFontCreated) {
+        NS_RELEASE(mFont);
+      }
+      if (!mIsSharedFamily) {
+        NS_IF_RELEASE(mOwnedFamily);
+      }
+      if (mHasFontEntry) {
+        NS_RELEASE(mFontEntry);
+      }
+
+      mGeneric = aOther.mGeneric;
+      mFontCreated = aOther.mFontCreated;
+      mLoading = aOther.mLoading;
+      mInvalid = aOther.mInvalid;
+      mIsSharedFamily = aOther.mIsSharedFamily;
+      mHasFontEntry = aOther.mHasFontEntry;
+
+      if (mIsSharedFamily) {
+        mSharedFamily = aOther.mSharedFamily;
+        if (mFontCreated) {
+          mFont = aOther.mFont;
+          NS_ADDREF(mFont);
+        } else if (mHasFontEntry) {
+          mFontEntry = aOther.mFontEntry;
+          NS_ADDREF(mFontEntry);
+        } else {
+          mSharedFace = aOther.mSharedFace;
+        }
+      } else {
+        mOwnedFamily = aOther.mOwnedFamily;
+        NS_IF_ADDREF(mOwnedFamily);
+        if (mFontCreated) {
+          mFont = aOther.mFont;
+          NS_ADDREF(mFont);
+        } else {
+          mFontEntry = aOther.mFontEntry;
+          NS_IF_ADDREF(mFontEntry);
+        }
+      }
+
+      return *this;
+    }
+
+    gfxFontFamily* OwnedFamily() const {
+      MOZ_ASSERT(!mIsSharedFamily);
+      return mOwnedFamily;
+    }
+    mozilla::fontlist::Family* SharedFamily() const {
+      MOZ_ASSERT(mIsSharedFamily);
+      return mSharedFamily;
+    }
+    gfxFont* Font() const { return mFontCreated ? mFont : nullptr; }
+
+    gfxFontEntry* FontEntry() const {
+      if (mFontCreated) {
+        return mFont->GetFontEntry();
+      }
+      if (mHasFontEntry) {
+        return mFontEntry;
+      }
+      if (mIsSharedFamily) {
+        return gfxPlatformFontList::PlatformFontList()->GetOrCreateFontEntry(
+            mSharedFace, SharedFamily());
+      }
+      return nullptr;
+    }
+
+    mozilla::StyleGenericFontFamily Generic() const { return mGeneric; }
+
+    bool IsSharedFamily() const { return mIsSharedFamily; }
+    bool IsUserFontContainer() const {
+      gfxFontEntry* fe = FontEntry();
+      return fe && fe->mIsUserFontContainer;
+    }
+    bool IsLoading() const { return mLoading; }
+    bool IsInvalid() const { return mInvalid; }
+    void CheckState(bool& aSkipDrawing);
+    void SetLoading(bool aIsLoading) { mLoading = aIsLoading; }
+    void SetInvalid() { mInvalid = true; }
+    bool CheckForFallbackFaces() const { return mCheckForFallbackFaces; }
+    void SetCheckForFallbackFaces() { mCheckForFallbackFaces = true; }
+
+    bool IsLoadingFor(uint32_t aCh) {
+      if (!IsLoading()) {
+        return false;
+      }
+      MOZ_ASSERT(IsUserFontContainer());
+      auto* ufe = static_cast<gfxUserFontEntry*>(FontEntry());
+      return ufe && ufe->CharacterInUnicodeRange(aCh);
+    }
+
+    void SetFont(gfxFont* aFont) {
+      NS_ASSERTION(aFont, "font pointer must not be null");
+      NS_ADDREF(aFont);
+      if (mFontCreated) {
+        NS_RELEASE(mFont);
+      } else if (mHasFontEntry) {
+        NS_RELEASE(mFontEntry);
+        mHasFontEntry = false;
+      }
+      mFont = aFont;
+      mFontCreated = true;
+      mLoading = false;
+    }
+
+    bool EqualsUserFont(const gfxUserFontEntry* aUserFont) const;
+
+   private:
+    union {
+      gfxFontFamily* MOZ_OWNING_REF mOwnedFamily;
+      mozilla::fontlist::Family* MOZ_NON_OWNING_REF mSharedFamily;
+    };
+    union {
+      gfxFont* MOZ_OWNING_REF mFont;
+      gfxFontEntry* MOZ_OWNING_REF mFontEntry;
+      mozilla::fontlist::Face* MOZ_NON_OWNING_REF mSharedFace;
+    };
+    mozilla::StyleGenericFontFamily mGeneric;
+    bool mFontCreated : 1;
+    bool mLoading : 1;
+    bool mInvalid : 1;
+    bool mCheckForFallbackFaces : 1;
+    bool mIsSharedFamily : 1;
+    bool mHasFontEntry : 1;
+  };
+
+  FontVisibilityProvider* mFontVisibilityProvider = nullptr;
+
+  mozilla::StyleFontFamilyList mFamilyList;
+
+  nsTArray<FamilyFace> mFonts;
+
+  RefPtr<gfxFont> mDefaultFont;
+  gfxFontStyle mStyle;
+
+  RefPtr<nsAtom> mLanguage;
+
+  gfxFloat mUnderlineOffset = UNDERLINE_OFFSET_NOT_SET;
+  gfxFloat mHyphenWidth = -1.0;  
+  gfxFloat mDevToCssSize;
+
+  RefPtr<gfxUserFontSet> mUserFontSet;
+  uint64_t mCurrGeneration = 0;  
+
+  gfxTextPerfMetrics* mTextPerf;
+
+  FontFamily mLastPrefFamily;
+  RefPtr<gfxFont> mLastPrefFont;
+  eFontPrefLang mLastPrefLang = eFontPrefLang_Western;  
+  eFontPrefLang mPageLang;
+  bool mLastPrefFirstFont = false;  
+
+  bool mSkipDrawing = false;  
+
+  bool mExplicitLanguage = false;  
+
+  bool mResolvedFonts = false;  
+
+  StyleFontVariantEmoji mFontVariantEmoji = StyleFontVariantEmoji::Normal;
+
+  mozilla::StyleGenericFontFamily mFallbackGeneric =
+      mozilla::StyleGenericFontFamily::None;
+
+  uint32_t mFontListGeneration = 0;  
+
+  already_AddRefed<gfxTextRun> MakeEmptyTextRun(
+      const Parameters* aParams, mozilla::gfx::ShapedTextFlags aFlags,
+      nsTextFrameUtils::Flags aFlags2);
+
+  already_AddRefed<gfxTextRun> MakeSpaceTextRun(
+      const Parameters* aParams, mozilla::gfx::ShapedTextFlags aFlags,
+      nsTextFrameUtils::Flags aFlags2);
+
+  template <typename T>
+  already_AddRefed<gfxTextRun> MakeBlankTextRun(
+      const T* aString, uint32_t aLength, const Parameters* aParams,
+      mozilla::gfx::ShapedTextFlags aFlags, nsTextFrameUtils::Flags aFlags2);
+
+  void EnsureFontList();
+
+  already_AddRefed<gfxFont> GetFontAt(uint32_t i, uint32_t aCh, bool* aLoading);
+
+  already_AddRefed<gfxFont> GetFontAt(uint32_t i, uint32_t aCh = 0x20) {
+    bool loading = false;
+    return GetFontAt(i, aCh, &loading);
+  }
+
+  already_AddRefed<gfxFont> GetDefaultFont();
+
+  void InitMetricsForBadFont(gfxFont* aBadFont);
+
+  template <typename T>
+  void InitTextRun(DrawTarget* aDrawTarget, gfxTextRun* aTextRun,
+                   const T* aString, uint32_t aLength,
+                   gfxMissingFontRecorder* aMFR);
+
+  void InitTextRunLog(mozilla::LogModule* aLog, const uint8_t* aString,
+                      const char16_t* aTextPtr,
+                      const gfxScriptItemizer::Run& aRun);
+
+  template <typename T>
+  void InitScriptRun(DrawTarget* aDrawTarget, gfxTextRun* aTextRun,
+                     const T* aString, uint32_t aScriptRunStart,
+                     uint32_t aScriptRunEnd, Script aRunScript,
+                     gfxMissingFontRecorder* aMFR);
+
+  already_AddRefed<gfxFont> FindFallbackFaceForChar(
+      const FamilyFace& aFamily, uint32_t aCh, uint32_t aNextCh,
+      FontPresentation aPresentation);
+
+  already_AddRefed<gfxFont> FindFallbackFaceForChar(
+      mozilla::fontlist::Family* aFamily, uint32_t aCh, uint32_t aNextCh,
+      FontPresentation aPresentation);
+
+  already_AddRefed<gfxFont> FindFallbackFaceForChar(
+      gfxFontFamily* aFamily, uint32_t aCh, uint32_t aNextCh,
+      FontPresentation aPresentation);
+
+
+  void AddPlatformFont(const nsACString& aName, bool aQuotedName,
+                       nsTArray<FamilyAndGeneric>& aFamilyList);
+
+  void AddFamilyToFontList(gfxFontFamily* aFamily,
+                           mozilla::StyleGenericFontFamily aGeneric);
+  void AddFamilyToFontList(mozilla::fontlist::Family* aFamily,
+                           mozilla::StyleGenericFontFamily aGeneric);
+};
+
+
+#define GFX_MISSING_FONTS_NOTIFY_PREF "gfx.missing_fonts.notify"
+
+class gfxMissingFontRecorder {
+ public:
+  gfxMissingFontRecorder() {
+    MOZ_COUNT_CTOR(gfxMissingFontRecorder);
+    memset(&mMissingFonts, 0, sizeof(mMissingFonts));
+  }
+
+  ~gfxMissingFontRecorder() {
+#ifdef DEBUG
+    for (uint32_t mMissingFont : mMissingFonts) {
+      NS_ASSERTION(mMissingFont == 0,
+                   "failed to flush the missing-font recorder");
+    }
+#endif
+    MOZ_COUNT_DTOR(gfxMissingFontRecorder);
+  }
+
+  void RecordScript(mozilla::intl::Script aScriptCode) {
+    mMissingFonts[static_cast<uint32_t>(aScriptCode) >> 5] |=
+        (1 << (static_cast<uint32_t>(aScriptCode) & 0x1f));
+  }
+
+  void Flush();
+
+  void Clear() { memset(&mMissingFonts, 0, sizeof(mMissingFonts)); }
+
+ private:
+  static const uint32_t kNumScriptBitsWords =
+      ((static_cast<int>(mozilla::intl::Script::NUM_SCRIPT_CODES) + 31) / 32);
+  uint32_t mMissingFonts[kNumScriptBitsWords];
+};
+
+#endif

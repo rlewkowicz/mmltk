@@ -1,0 +1,850 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_MIRGraph_h
+#define jit_MIRGraph_h
+
+
+#include "jit/CompileInfo.h"
+#include "jit/FixedList.h"
+#include "jit/InlineScriptTree.h"
+#include "jit/JitAllocPolicy.h"
+#include "jit/MIR-wasm.h"
+#include "jit/MIR.h"
+
+namespace js {
+namespace jit {
+
+class MBasicBlock;
+class MIRGraph;
+class MStart;
+
+class MDefinitionIterator;
+
+using MInstructionIterator = InlineListIterator<MInstruction>;
+using MInstructionReverseIterator = InlineListReverseIterator<MInstruction>;
+using MPhiIterator = InlineListIterator<MPhi>;
+
+#ifdef DEBUG
+using MResumePointIterator = InlineForwardListIterator<MResumePoint>;
+#endif
+
+class LBlock;
+
+enum class Frequency : uint8_t { Unknown = 0, Likely = 1, Unlikely = 2 };
+
+class MBasicBlock : public TempObject, public InlineListNode<MBasicBlock> {
+ public:
+  enum Kind {
+    NORMAL,
+    PENDING_LOOP_HEADER,
+    LOOP_HEADER,
+    SPLIT_EDGE,
+    FAKE_LOOP_PRED,
+    INTERNAL,
+    DEAD
+  };
+
+ private:
+  MBasicBlock(MIRGraph& graph, const CompileInfo& info, BytecodeSite* site,
+              Kind kind);
+  [[nodiscard]] bool init();
+  void copySlots(MBasicBlock* from);
+  [[nodiscard]] bool inherit(TempAllocator& alloc, size_t stackDepth,
+                             MBasicBlock* maybePred, uint32_t popped);
+
+  bool unreachable_ = false;
+
+  bool alwaysBails_ = false;
+
+  Frequency frequency_ = Frequency::Unknown;
+
+  void pushVariable(uint32_t slot) { push(slots_[slot]); }
+
+  void setVariable(uint32_t slot) {
+    MOZ_ASSERT(stackPosition_ > info_.firstStackSlot());
+    setSlot(slot, slots_[stackPosition_ - 1]);
+  }
+
+  enum ReferencesType {
+    RefType_None = 0,
+
+    RefType_AssertNoUses = 1 << 0,
+
+    RefType_DiscardOperands = 1 << 1,
+    RefType_DiscardResumePoint = 1 << 2,
+    RefType_DiscardInstruction = 1 << 3,
+
+    RefType_DefaultNoAssert = RefType_DiscardOperands |
+                              RefType_DiscardResumePoint |
+                              RefType_DiscardInstruction,
+
+    RefType_Default = RefType_AssertNoUses | RefType_DefaultNoAssert,
+
+    RefType_IgnoreOperands = RefType_AssertNoUses | RefType_DiscardOperands |
+                             RefType_DiscardResumePoint
+  };
+
+  void discardResumePoint(MResumePoint* rp,
+                          ReferencesType refType = RefType_Default);
+  void removeResumePoint(MResumePoint* rp);
+
+  void prepareForDiscard(MInstruction* ins,
+                         ReferencesType refType = RefType_Default);
+
+ public:
+
+  static MBasicBlock* New(MIRGraph& graph, size_t stackDepth,
+                          const CompileInfo& info, MBasicBlock* maybePred,
+                          BytecodeSite* site, Kind kind);
+  static MBasicBlock* New(MIRGraph& graph, const CompileInfo& info,
+                          MBasicBlock* pred, Kind kind);
+  static MBasicBlock* NewPopN(MIRGraph& graph, const CompileInfo& info,
+                              MBasicBlock* pred, BytecodeSite* site, Kind kind,
+                              uint32_t popn);
+  static MBasicBlock* NewPendingLoopHeader(MIRGraph& graph,
+                                           const CompileInfo& info,
+                                           MBasicBlock* pred,
+                                           BytecodeSite* site);
+  static MBasicBlock* NewSplitEdge(MIRGraph& graph, MBasicBlock* pred,
+                                   size_t predEdgeIdx, MBasicBlock* succ);
+  static MBasicBlock* NewFakeLoopPredecessor(MIRGraph& graph,
+                                             MBasicBlock* header);
+
+  static MBasicBlock* NewInternal(MIRGraph& graph, MBasicBlock* orig,
+                                  MResumePoint* activeResumePoint);
+
+  bool dominates(const MBasicBlock* other) const {
+    return other->domIndex() - domIndex() < numDominated();
+  }
+
+  void setId(uint32_t id) { id_ = id; }
+
+  void setUnreachable() {
+    MOZ_ASSERT(!unreachable_);
+    setUnreachableUnchecked();
+  }
+  void setUnreachableUnchecked() { unreachable_ = true; }
+  bool unreachable() const { return unreachable_; }
+
+  void setAlwaysBails() { alwaysBails_ = true; }
+  bool alwaysBails() const { return alwaysBails_; }
+
+  void pick(int32_t depth);
+
+  void unpick(int32_t depth);
+
+  void swapAt(int32_t depth);
+
+
+  MDefinition* peek(int32_t depth) {
+    MOZ_ASSERT(depth < 0);
+    MOZ_ASSERT(stackPosition_ + depth >= info_.firstStackSlot());
+    return peekUnchecked(depth);
+  }
+
+  MDefinition* peekUnchecked(int32_t depth) {
+    MOZ_ASSERT(depth < 0);
+    return getSlot(stackPosition_ + depth);
+  }
+
+  MDefinition* environmentChain();
+  MDefinition* argumentsObject();
+
+  [[nodiscard]] bool increaseSlots(size_t num);
+  [[nodiscard]] bool ensureHasSlots(size_t num);
+
+  void initSlot(uint32_t slot, MDefinition* ins) {
+    slots_[slot] = ins;
+    if (entryResumePoint()) {
+      entryResumePoint()->initOperand(slot, ins);
+    }
+  }
+
+  void setLocal(uint32_t local) { setVariable(info_.localSlot(local)); }
+  void setArg(uint32_t arg) { setVariable(info_.argSlot(arg)); }
+  void setSlot(uint32_t slot, MDefinition* ins) { slots_[slot] = ins; }
+
+  void push(MDefinition* ins) {
+    MOZ_ASSERT(stackPosition_ < nslots());
+    slots_[stackPosition_++] = ins;
+  }
+  void pushArg(uint32_t arg) { pushVariable(info_.argSlot(arg)); }
+  void pushArgUnchecked(uint32_t arg) {
+    pushVariable(info_.argSlotUnchecked(arg));
+  }
+  void pushLocal(uint32_t local) { pushVariable(info_.localSlot(local)); }
+  void pushSlot(uint32_t slot) { pushVariable(slot); }
+  void setEnvironmentChain(MDefinition* ins);
+  void setArgumentsObject(MDefinition* ins);
+
+  MDefinition* pop() {
+    MOZ_ASSERT(stackPosition_ > info_.firstStackSlot());
+    return slots_[--stackPosition_];
+  }
+  void popn(uint32_t n) {
+    MOZ_ASSERT(stackPosition_ - n >= info_.firstStackSlot());
+    MOZ_ASSERT(stackPosition_ >= stackPosition_ - n);
+    stackPosition_ -= n;
+  }
+
+  inline void add(MInstruction* ins);
+
+  void end(MControlInstruction* ins) {
+    MOZ_ASSERT(!hasLastIns());  
+    MOZ_ASSERT(ins);
+    add(ins);
+  }
+
+  void addPhi(MPhi* phi);
+
+  void addResumePoint(MResumePoint* resume) {
+#ifdef DEBUG
+    resumePoints_.pushFront(resume);
+#endif
+  }
+
+  void discardPreAllocatedResumePoint(MResumePoint* resume) {
+    MOZ_ASSERT(!resume->instruction());
+    discardResumePoint(resume);
+  }
+
+  [[nodiscard]] bool addPredecessor(TempAllocator& alloc, MBasicBlock* pred);
+  [[nodiscard]] bool addPredecessorPopN(TempAllocator& alloc, MBasicBlock* pred,
+                                        uint32_t popped);
+
+  [[nodiscard]] bool addPredecessorSameInputsAs(MBasicBlock* pred,
+                                                MBasicBlock* existingPred);
+
+  [[nodiscard]] bool addPredecessorWithoutPhis(MBasicBlock* pred);
+  void inheritSlots(MBasicBlock* parent);
+  [[nodiscard]] bool initEntrySlots(TempAllocator& alloc);
+
+  void replacePredecessor(MBasicBlock* old, MBasicBlock* split);
+  void replaceSuccessor(size_t pos, MBasicBlock* split);
+
+  void removePredecessor(MBasicBlock* pred);
+
+  void removePredecessorWithoutPhiOperands(MBasicBlock* pred, size_t predIndex);
+
+  void clearDominatorInfo();
+
+  [[nodiscard]] bool setBackedge(MBasicBlock* block);
+  [[nodiscard]] bool setBackedgeWasm(MBasicBlock* block, size_t paramCount);
+
+  void clearLoopHeader();
+
+  void setLoopHeader(MBasicBlock* newBackedge);
+
+  void setLoopHeader() {
+    MOZ_ASSERT(!isLoopHeader());
+    kind_ = LOOP_HEADER;
+  }
+
+  [[nodiscard]] bool inheritPhisFromBackedge(MBasicBlock* backedge);
+
+  void insertBefore(MInstruction* at, MInstruction* ins);
+  void insertAfter(MInstruction* at, MInstruction* ins);
+
+  void insertAtEnd(MInstruction* ins);
+
+  void moveBefore(MInstruction* at, MInstruction* ins);
+
+  enum IgnoreTop { IgnoreNone = 0, IgnoreRecover = 1 << 0 };
+
+  MInstruction* safeInsertTop(MDefinition* ins = nullptr,
+                              IgnoreTop ignore = IgnoreNone);
+
+  void discard(MInstruction* ins);
+  void discardLastIns();
+  void discardAllInstructions();
+  void discardAllInstructionsStartingAt(MInstructionIterator iter);
+  void discardAllPhis();
+  void discardAllResumePoints(bool discardEntry = true);
+  void clear();
+
+  bool wrapInstructionInFastpath(MInstruction* ins, MInstruction* fastpath,
+                                 MInstruction* condition);
+
+  void moveOuterResumePointTo(MBasicBlock* dest);
+
+  void moveToNewBlock(MInstruction* ins, MBasicBlock* dst);
+
+  void discardIgnoreOperands(MInstruction* ins);
+
+  void discardPhi(MPhi* phi);
+
+  void flagOperandsOfPrunedBranches(MInstruction* ins);
+
+  void markAsDead() {
+    MOZ_ASSERT(kind_ != DEAD);
+    kind_ = DEAD;
+  }
+
+
+  MIRGraph& graph() { return graph_; }
+  const CompileInfo& info() const { return info_; }
+  jsbytecode* pc() const { return trackedSite_->pc(); }
+  jsbytecode* entryPC() const { return entryResumePoint()->pc(); }
+  uint32_t nslots() const { return slots_.length(); }
+  uint32_t id() const { return id_; }
+  uint32_t numPredecessors() const { return predecessors_.length(); }
+
+  bool isUnknownFrequency() const { return frequency_ == Frequency::Unknown; }
+
+  bool isLikelyFrequency() const { return frequency_ == Frequency::Likely; }
+
+  bool isUnlikelyFrequency() const { return frequency_ == Frequency::Unlikely; }
+
+  Frequency getFrequency() const { return frequency_; }
+  void setFrequency(Frequency value) { frequency_ = value; }
+
+  uint32_t domIndex() const {
+    MOZ_ASSERT(!isDead());
+    return domIndex_;
+  }
+  void setDomIndex(uint32_t d) { domIndex_ = d; }
+
+  MBasicBlock* getPredecessor(uint32_t i) const { return predecessors_[i]; }
+  void setPredecessor(uint32_t i, MBasicBlock* p) { predecessors_[i] = p; }
+  [[nodiscard]]
+  bool appendPredecessor(MBasicBlock* p) {
+    return predecessors_.append(p);
+  }
+  void erasePredecessor(uint32_t i) { predecessors_.erase(&predecessors_[i]); }
+
+  size_t indexForPredecessor(MBasicBlock* block) const {
+    MOZ_ASSERT(!block->successorWithPhis());
+
+    for (size_t i = 0; i < predecessors_.length(); i++) {
+      if (predecessors_[i] == block) {
+        return i;
+      }
+    }
+    MOZ_CRASH();
+  }
+  bool hasAnyIns() const { return !instructions_.empty(); }
+  bool hasLastIns() const {
+    return hasAnyIns() && instructions_.rbegin()->isControlInstruction();
+  }
+  MControlInstruction* lastIns() const {
+    MOZ_ASSERT(hasLastIns());
+    return instructions_.rbegin()->toControlInstruction();
+  }
+  MConstant* optimizedOutConstant(TempAllocator& alloc);
+  MPhiIterator phisBegin() const { return phis_.begin(); }
+  MPhiIterator phisBegin(MPhi* at) const { return phis_.begin(at); }
+  MPhiIterator phisEnd() const { return phis_.end(); }
+  bool phisEmpty() const { return phis_.empty(); }
+#ifdef DEBUG
+  MResumePointIterator resumePointsBegin() const {
+    return resumePoints_.begin();
+  }
+  MResumePointIterator resumePointsEnd() const { return resumePoints_.end(); }
+  bool resumePointsEmpty() const { return resumePoints_.empty(); }
+#endif
+  MInstructionIterator begin() { return instructions_.begin(); }
+  MInstructionIterator begin(const MInstruction* at) {
+    MOZ_ASSERT(at->block() == this);
+    return instructions_.begin(at);
+  }
+  MInstructionIterator end() { return instructions_.end(); }
+  MInstructionReverseIterator rbegin() { return instructions_.rbegin(); }
+  MInstructionReverseIterator rbegin(MInstruction* at) {
+    MOZ_ASSERT(at->block() == this);
+    return instructions_.rbegin(at);
+  }
+  MInstructionReverseIterator rend() { return instructions_.rend(); }
+
+  bool isLoopHeader() const { return kind_ == LOOP_HEADER; }
+  bool isPendingLoopHeader() const { return kind_ == PENDING_LOOP_HEADER; }
+
+  bool hasUniqueBackedge() const {
+    MOZ_ASSERT(isLoopHeader());
+    MOZ_ASSERT(numPredecessors() >= 1);
+    if (numPredecessors() == 1 || numPredecessors() == 2) {
+      return true;
+    }
+    if (numPredecessors() == 3) {
+      return getPredecessor(1)->numPredecessors() == 0;
+    }
+    return false;
+  }
+  MBasicBlock* backedge() const {
+    MOZ_ASSERT(hasUniqueBackedge());
+    return getPredecessor(numPredecessors() - 1);
+  }
+  MBasicBlock* loopHeaderOfBackedge() const {
+    MOZ_ASSERT(isLoopBackedge());
+    return getSuccessor(numSuccessors() - 1);
+  }
+  MBasicBlock* loopPredecessor() const {
+    MOZ_ASSERT(isLoopHeader());
+    return getPredecessor(0);
+  }
+  bool isLoopBackedge() const {
+    if (!numSuccessors()) {
+      return false;
+    }
+    MBasicBlock* lastSuccessor = getSuccessor(numSuccessors() - 1);
+    return lastSuccessor->isLoopHeader() &&
+           lastSuccessor->hasUniqueBackedge() &&
+           lastSuccessor->backedge() == this;
+  }
+  bool isSplitEdge() const { return kind_ == SPLIT_EDGE; }
+  bool isDead() const { return kind_ == DEAD; }
+  bool isFakeLoopPred() const { return kind_ == FAKE_LOOP_PRED; }
+
+  uint32_t stackDepth() const { return stackPosition_; }
+  bool isMarked() const { return mark_; }
+  void mark() {
+    MOZ_ASSERT(!mark_, "Marking already-marked block");
+    markUnchecked();
+  }
+  void markUnchecked() { mark_ = true; }
+  void unmark() {
+    MOZ_ASSERT(mark_, "Unarking unmarked block");
+    unmarkUnchecked();
+  }
+  void unmarkUnchecked() { mark_ = false; }
+
+  MBasicBlock* immediateDominator() const { return immediateDominator_; }
+
+  void setImmediateDominator(MBasicBlock* dom) { immediateDominator_ = dom; }
+
+  MTest* immediateDominatorBranch(BranchDirection* pdirection);
+
+  size_t numImmediatelyDominatedBlocks() const {
+    return immediatelyDominated_.length();
+  }
+
+  MBasicBlock* getImmediatelyDominatedBlock(size_t i) const {
+    return immediatelyDominated_[i];
+  }
+
+  MBasicBlock** immediatelyDominatedBlocksBegin() {
+    return immediatelyDominated_.begin();
+  }
+
+  MBasicBlock** immediatelyDominatedBlocksEnd() {
+    return immediatelyDominated_.end();
+  }
+
+  size_t numDominated() const {
+    MOZ_ASSERT(numDominated_ != 0);
+    return numDominated_;
+  }
+
+  void addNumDominated(size_t n) { numDominated_ += n; }
+
+  bool addImmediatelyDominatedBlock(MBasicBlock* child);
+
+  void removeImmediatelyDominatedBlock(MBasicBlock* child);
+
+  MDefinition* getSlot(uint32_t index) {
+    MOZ_ASSERT(index < stackPosition_);
+    return slots_[index];
+  }
+
+  MResumePoint* entryResumePoint() const { return entryResumePoint_; }
+  void setEntryResumePoint(MResumePoint* rp) { entryResumePoint_ = rp; }
+  void clearEntryResumePoint() {
+    discardResumePoint(entryResumePoint_);
+    entryResumePoint_ = nullptr;
+  }
+  MResumePoint* outerResumePoint() const { return outerResumePoint_; }
+  void setOuterResumePoint(MResumePoint* outer) {
+    MOZ_ASSERT(!outerResumePoint_);
+    outerResumePoint_ = outer;
+  }
+  void clearOuterResumePoint() {
+    discardResumePoint(outerResumePoint_);
+    outerResumePoint_ = nullptr;
+  }
+  MResumePoint* callerResumePoint() const { return callerResumePoint_; }
+  void setCallerResumePoint(MResumePoint* caller) {
+    callerResumePoint_ = caller;
+  }
+
+  LBlock* lir() const { return lir_; }
+  void assignLir(LBlock* lir) {
+    MOZ_ASSERT(!lir_);
+    lir_ = lir;
+  }
+
+  MBasicBlock* successorWithPhis() const { return successorWithPhis_; }
+  uint32_t positionInPhiSuccessor() const {
+    MOZ_ASSERT(successorWithPhis());
+    return positionInPhiSuccessor_;
+  }
+  void setSuccessorWithPhis(MBasicBlock* successor, uint32_t id) {
+    successorWithPhis_ = successor;
+    positionInPhiSuccessor_ = id;
+  }
+  void clearSuccessorWithPhis() { successorWithPhis_ = nullptr; }
+  size_t numSuccessors() const {
+    MOZ_ASSERT(lastIns());
+    return lastIns()->numSuccessors();
+  }
+  MBasicBlock* getSuccessor(size_t index) const {
+    MOZ_ASSERT(lastIns());
+    return lastIns()->getSuccessor(index);
+  }
+  MBasicBlock* getSingleSuccessor() const {
+    MOZ_ASSERT(numSuccessors() == 1);
+    return getSuccessor(0);
+  }
+  size_t getSuccessorIndex(MBasicBlock*) const;
+  size_t getPredecessorIndex(MBasicBlock*) const;
+
+  void setLoopDepth(uint32_t loopDepth) { loopDepth_ = loopDepth; }
+  uint32_t loopDepth() const { return loopDepth_; }
+
+  void dumpStack(GenericPrinter& out);
+  void dumpStack();
+
+  void dump(GenericPrinter& out);
+  void dump();
+
+  void updateTrackedSite(BytecodeSite* site) {
+    MOZ_ASSERT(site->tree() == trackedSite_->tree());
+    trackedSite_ = site;
+  }
+  BytecodeSite* trackedSite() const { return trackedSite_; }
+  InlineScriptTree* trackedTree() const { return trackedSite_->tree(); }
+
+  MResumePoint* activeResumePoint(MInstruction* ins);
+
+#ifdef JS_JITSPEW
+  const char* nameOfKind() const {
+    switch (kind_) {
+      case MBasicBlock::Kind::NORMAL:
+        return "NORMAL";
+      case MBasicBlock::Kind::PENDING_LOOP_HEADER:
+        return "PENDING_LOOP_HEADER";
+      case MBasicBlock::Kind::LOOP_HEADER:
+        return "LOOP_HEADER";
+      case MBasicBlock::Kind::SPLIT_EDGE:
+        return "SPLIT_EDGE";
+      case MBasicBlock::Kind::FAKE_LOOP_PRED:
+        return "FAKE_LOOP_PRED";
+      case MBasicBlock::Kind::INTERNAL:
+        return "INTERNAL";
+      case MBasicBlock::Kind::DEAD:
+        return "DEAD";
+      default:
+        return "MBasicBlock::Kind::???";
+    }
+  }
+#endif
+
+ private:
+  MIRGraph& graph_;
+  const CompileInfo& info_;  
+  InlineList<MInstruction> instructions_;
+  Vector<MBasicBlock*, 1, JitAllocPolicy> predecessors_;
+  InlineList<MPhi> phis_;
+  FixedList<MDefinition*> slots_;
+  uint32_t stackPosition_;
+  uint32_t id_;
+  uint32_t domIndex_;  
+  uint32_t numDominated_;
+  LBlock* lir_;
+
+  MResumePoint* callerResumePoint_;
+
+  MResumePoint* entryResumePoint_;
+
+  MResumePoint* outerResumePoint_;
+
+#ifdef DEBUG
+  InlineForwardList<MResumePoint> resumePoints_;
+#endif
+
+  MBasicBlock* successorWithPhis_;
+  uint32_t positionInPhiSuccessor_;
+  uint32_t loopDepth_;
+  Kind kind_ : 8;
+
+  bool mark_;
+
+  Vector<MBasicBlock*, 1, JitAllocPolicy> immediatelyDominated_;
+  MBasicBlock* immediateDominator_;
+
+  BytecodeSite* trackedSite_;
+};
+
+using MBasicBlockIterator = InlineListIterator<MBasicBlock>;
+using ReversePostorderIterator = InlineListIterator<MBasicBlock>;
+using PostorderIterator = InlineListReverseIterator<MBasicBlock>;
+
+using MIRGraphReturns = Vector<MBasicBlock*, 1, JitAllocPolicy>;
+
+class MIRGraph {
+  InlineList<MBasicBlock> blocks_;
+  TempAllocator* alloc_;
+  MIRGraphReturns* returnAccumulator_;
+  uint32_t blockIdGen_;
+  uint32_t idGen_;
+  MBasicBlock* osrBlock_;
+
+  size_t numBlocks_;
+  bool hasTryBlock_;
+
+  InlineList<MPhi> phiFreeList_;
+  size_t phiFreeListLength_;
+
+ public:
+  explicit MIRGraph(TempAllocator* alloc)
+      : alloc_(alloc),
+        returnAccumulator_(nullptr),
+        blockIdGen_(0),
+        idGen_(0),
+        osrBlock_(nullptr),
+        numBlocks_(0),
+        hasTryBlock_(false),
+        phiFreeListLength_(0) {}
+
+  TempAllocator& alloc() const { return *alloc_; }
+
+  void addBlock(MBasicBlock* block);
+  void insertBlockAfter(MBasicBlock* at, MBasicBlock* block);
+  void insertBlockBefore(MBasicBlock* at, MBasicBlock* block);
+
+  void unmarkBlocks();
+
+  void setReturnAccumulator(MIRGraphReturns* accum) {
+    returnAccumulator_ = accum;
+  }
+  MIRGraphReturns* returnAccumulator() const { return returnAccumulator_; }
+
+  [[nodiscard]] bool addReturn(MBasicBlock* returnBlock) {
+    if (!returnAccumulator_) {
+      return true;
+    }
+
+    return returnAccumulator_->append(returnBlock);
+  }
+
+  MBasicBlock* entryBlock() { return *blocks_.begin(); }
+  MBasicBlockIterator begin() { return blocks_.begin(); }
+  MBasicBlockIterator begin(const MBasicBlock* at) { return blocks_.begin(at); }
+  MBasicBlockIterator end() { return blocks_.end(); }
+  PostorderIterator poBegin() { return blocks_.rbegin(); }
+  PostorderIterator poBegin(const MBasicBlock* at) {
+    return blocks_.rbegin(at);
+  }
+  PostorderIterator poEnd() { return blocks_.rend(); }
+  ReversePostorderIterator rpoBegin() { return blocks_.begin(); }
+  ReversePostorderIterator rpoBegin(const MBasicBlock* at) {
+    return blocks_.begin(at);
+  }
+  ReversePostorderIterator rpoEnd() { return blocks_.end(); }
+  void removeBlock(MBasicBlock* block);
+  void moveBlockToEnd(MBasicBlock* block) {
+    blocks_.remove(block);
+    MOZ_ASSERT_IF(!blocks_.empty(), block->id());
+    blocks_.pushBack(block);
+  }
+  void moveBlockBefore(MBasicBlock* at, MBasicBlock* block) {
+    MOZ_ASSERT(block->id());
+    blocks_.remove(block);
+    blocks_.insertBefore(at, block);
+  }
+  void moveBlockAfter(MBasicBlock* at, MBasicBlock* block) {
+    MOZ_ASSERT(block->id());
+    blocks_.remove(block);
+    blocks_.insertAfter(at, block);
+  }
+  size_t numBlocks() const { return numBlocks_; }
+  uint32_t numBlockIds() const { return blockIdGen_; }
+  void allocDefinitionId(MDefinition* ins) { ins->setId(idGen_++); }
+  uint32_t getNumInstructionIds() { return idGen_; }
+  MResumePoint* entryResumePoint() { return entryBlock()->entryResumePoint(); }
+
+  void setOsrBlock(MBasicBlock* osrBlock) {
+    MOZ_ASSERT(!osrBlock_);
+    osrBlock_ = osrBlock;
+  }
+  MBasicBlock* osrBlock() const { return osrBlock_; }
+
+  MBasicBlock* osrPreHeaderBlock() const {
+    return osrBlock() ? osrBlock()->getSingleSuccessor() : nullptr;
+  }
+
+  bool hasTryBlock() const { return hasTryBlock_; }
+  void setHasTryBlock() { hasTryBlock_ = true; }
+
+  void dump(GenericPrinter& out);
+  void dump();
+
+  void addPhiToFreeList(MPhi* phi) {
+    phiFreeList_.pushBack(phi);
+    phiFreeListLength_++;
+  }
+  size_t phiFreeListLength() const { return phiFreeListLength_; }
+  MPhi* takePhiFromFreeList() {
+    MOZ_ASSERT(phiFreeListLength_ > 0);
+    phiFreeListLength_--;
+    return phiFreeList_.popBack();
+  }
+
+  void removeFakeLoopPredecessors();
+
+#ifdef DEBUG
+ private:
+  bool canBuildDominators_ = true;
+
+ public:
+  bool canBuildDominators() const { return canBuildDominators_; }
+#endif
+};
+
+class MDefinitionIterator {
+  friend class MBasicBlock;
+  friend class MNodeIterator;
+
+ private:
+  MBasicBlock* block_;
+  MPhiIterator phiIter_;
+  MInstructionIterator iter_;
+
+  bool atPhi() const { return phiIter_ != block_->phisEnd(); }
+
+  MDefinition* getIns() {
+    if (atPhi()) {
+      return *phiIter_;
+    }
+    return *iter_;
+  }
+
+  bool more() const { return atPhi() || (*iter_) != block_->lastIns(); }
+
+ public:
+  explicit MDefinitionIterator(MBasicBlock* block)
+      : block_(block), phiIter_(block->phisBegin()), iter_(block->begin()) {}
+
+  MDefinitionIterator operator++() {
+    MOZ_ASSERT(more());
+    if (atPhi()) {
+      ++phiIter_;
+    } else {
+      ++iter_;
+    }
+    return *this;
+  }
+
+  MDefinitionIterator operator++(int) {
+    MDefinitionIterator old(*this);
+    operator++();
+    return old;
+  }
+
+  explicit operator bool() const { return more(); }
+
+  MDefinition* operator*() { return getIns(); }
+
+  MDefinition* operator->() { return getIns(); }
+};
+
+class MNodeIterator {
+ private:
+  MResumePoint* resumePoint_;
+
+  mozilla::DebugOnly<MInstruction*> lastInstruction_ = nullptr;
+
+  MDefinitionIterator defIter_;
+
+  MBasicBlock* block() const { return defIter_.block_; }
+
+  bool atResumePoint() const {
+    MOZ_ASSERT_IF(lastInstruction_ && !lastInstruction_->isDiscarded(),
+                  lastInstruction_->resumePoint() == resumePoint_);
+    return resumePoint_ && !resumePoint_->isDiscarded();
+  }
+
+  MNode* getNode() {
+    if (atResumePoint()) {
+      return resumePoint_;
+    }
+    return *defIter_;
+  }
+
+  void next() {
+    if (!atResumePoint()) {
+      if (defIter_->isInstruction()) {
+        resumePoint_ = defIter_->toInstruction()->resumePoint();
+        lastInstruction_ = defIter_->toInstruction();
+      }
+      defIter_++;
+    } else {
+      resumePoint_ = nullptr;
+      lastInstruction_ = nullptr;
+    }
+  }
+
+  bool more() const { return defIter_ || atResumePoint(); }
+
+ public:
+  explicit MNodeIterator(MBasicBlock* block)
+      : resumePoint_(block->entryResumePoint()), defIter_(block) {
+    MOZ_ASSERT(bool(block->entryResumePoint()) == atResumePoint());
+  }
+
+  MNodeIterator operator++(int) {
+    MNodeIterator old(*this);
+    if (more()) {
+      next();
+    }
+    return old;
+  }
+
+  explicit operator bool() const { return more(); }
+
+  MNode* operator*() { return getNode(); }
+
+  MNode* operator->() { return getNode(); }
+};
+
+void MBasicBlock::add(MInstruction* ins) {
+  MOZ_ASSERT(!hasLastIns());
+  ins->setInstructionBlock(this, trackedSite_);
+  graph().allocDefinitionId(ins);
+  instructions_.pushBack(ins);
+}
+
+void AssertBasicGraphCoherency(MIRGraph& graph, bool force = false);
+
+void AssertGraphCoherency(MIRGraph& graph, bool force = false);
+
+void AssertExtendedGraphCoherency(MIRGraph& graph,
+                                  bool underValueNumberer = false,
+                                  bool force = false);
+
+class CompileInfo;
+
+
+void DumpHashedPointer(GenericPrinter& out, const void* p);
+
+void DumpMIRDefinitionID(GenericPrinter& out, const MDefinition* def,
+                         bool showDetails = false);
+void DumpMIRDefinition(GenericPrinter& out, const MDefinition* def,
+                       bool showDetails = false);
+
+void DumpMIRBlockID(GenericPrinter& out, const MBasicBlock* block,
+                    bool showDetails = false);
+void DumpMIRBlock(GenericPrinter& out, MBasicBlock* block,
+                  bool showDetails = false);
+
+void DumpMIRGraph(GenericPrinter& out, MIRGraph& graph,
+                  bool showDetails = false);
+
+void DumpMIRExpressions(GenericPrinter& out, MIRGraph& graph,
+                        const CompileInfo& info, const char* phase,
+                        bool showDetails = false);
+
+}  
+}  
+
+#endif /* jit_MIRGraph_h */

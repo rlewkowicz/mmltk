@@ -1,0 +1,366 @@
+// Copyright 2019 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(V8_UTIL_ZONE_H_)
+#define V8_UTIL_ZONE_H_
+
+#include <list>
+#include <map>
+#include <memory>
+#include <set>
+#include <stack>
+#include <unordered_map>
+#include <vector>
+
+#include "ds/LifoAlloc.h"
+#include "ds/Sort.h"
+#include "irregexp/util/VectorShim.h"
+
+namespace v8 {
+namespace internal {
+
+class MOZ_STACK_CLASS Zone {
+ public:
+  Zone(js::LifoAlloc* alloc, const char* name = "") : allocScope_(alloc) {}
+
+  template <typename T, typename... Args>
+  T* New(Args&&... args) {
+    js::LifoAlloc::AutoFallibleScope fallible(&inner());
+    js::AutoEnterOOMUnsafeRegion oomUnsafe;
+    void* memory = inner().alloc(sizeof(T));
+    if (!memory) {
+      oomUnsafe.crash("Irregexp Zone::New");
+    }
+    return new (memory) T(std::forward<Args>(args)...);
+  }
+
+  template <typename T>
+  T* AllocateArray(size_t length) {
+    js::LifoAlloc::AutoFallibleScope fallible(&inner());
+    js::AutoEnterOOMUnsafeRegion oomUnsafe;
+    size_t numBytes = length * sizeof(T);
+    if (MOZ_UNLIKELY(numBytes > INT_MAX)) {
+      oomUnsafe.crash("Irregexp Zone::AllocateArray");
+    }
+    void* memory = inner().alloc(length * sizeof(T));
+    if (MOZ_UNLIKELY(!memory)) {
+      oomUnsafe.crash("Irregexp Zone::New");
+    }
+    return static_cast<T*>(memory);
+  }
+
+  template <typename T>
+  base::Vector<T> CloneVector(base::Vector<const T> v) {
+    size_t length = v.size();
+    if (length == 0) {
+      return {};
+    }
+    T* new_array = AllocateArray<T>(length);
+    std::uninitialized_copy(v.begin(), v.end(), new_array);
+    return base::Vector<T>(new_array, length);
+  }
+
+  void DeleteAll() { inner().freeAll(); }
+
+  static const size_t kExcessLimit = 256 * 1024 * 1024;
+  bool excess_allocation() {
+    return inner().computedSizeOfExcludingThis() > kExcessLimit;
+  }
+
+  js::LifoAlloc& inner() { return allocScope_.alloc(); }
+
+ private:
+  js::LifoAllocScope allocScope_;
+};
+
+class ZoneObject {
+ public:
+  void* operator new(size_t size, Zone* zone) = delete;
+
+  void* operator new(size_t size, void* ptr) { return ptr; }
+
+
+  void operator delete(void*, size_t) { MOZ_CRASH("unreachable"); }
+  void operator delete(void* pointer, Zone* zone) { MOZ_CRASH("unreachable"); }
+};
+
+template <typename T>
+class ZoneList final : public ZoneObject {
+ public:
+  ZoneList(int capacity, Zone* zone) : capacity_(capacity) {
+    data_ = (capacity_ > 0) ? zone->AllocateArray<T>(capacity_) : nullptr;
+  }
+  ZoneList(const ZoneList<T>& other, Zone* zone)
+      : ZoneList(other.length(), zone) {
+    AddAll(other, zone);
+  }
+
+  ZoneList(const base::Vector<const T>& other, Zone* zone)
+      : ZoneList(other.length(), zone) {
+    AddAll(other, zone);
+  }
+
+  ZoneList(ZoneList<T>&& other) { *this = std::move(other); }
+
+  ZoneList& operator=(ZoneList&& other) {
+    MOZ_ASSERT(!data_);
+    data_ = other.data_;
+    capacity_ = other.capacity_;
+    length_ = other.length_;
+    other.Clear();
+    return *this;
+  }
+
+  inline T& operator[](int i) const {
+    MOZ_ASSERT(i >= 0);
+    MOZ_ASSERT(static_cast<unsigned>(i) < static_cast<unsigned>(length_));
+    return data_[i];
+  }
+  inline T& at(int i) const { return operator[](i); }
+  inline T& last() const { return at(length_ - 1); }
+  inline T& first() const { return at(0); }
+
+  using iterator = T*;
+  inline iterator begin() const { return &data_[0]; }
+  inline iterator end() const { return &data_[length_]; }
+
+  inline bool is_empty() const { return length_ == 0; }
+  inline int length() const { return length_; }
+  inline int capacity() const { return capacity_; }
+
+  base::Vector<T> ToVector() const { return base::Vector<T>(data_, length_); }
+  base::Vector<T> ToVector(int start, int length) const {
+    return base::Vector<T>(data_ + start, std::min(length_ - start, length));
+  }
+
+  base::Vector<const T> ToConstVector() const {
+    return base::Vector<const T>(data_, length_);
+  }
+
+  void Add(const T& element, Zone* zone) {
+    if (length_ < capacity_) {
+      data_[length_++] = element;
+    } else {
+      ZoneList<T>::ResizeAdd(element, zone);
+    }
+  }
+  void AddAll(const ZoneList<T>& other, Zone* zone) {
+    AddAll(other.ToVector(), zone);
+  }
+  void AddAll(const base::Vector<const T>& other, Zone* zone) {
+    int result_length = length_ + other.length();
+    if (capacity_ < result_length) {
+      Resize(result_length, zone);
+    }
+    if (std::is_fundamental<T>()) {
+      memcpy(data_ + length_, other.begin(), sizeof(*data_) * other.length());
+    } else {
+      for (int i = 0; i < other.length(); i++) {
+        data_[length_ + i] = other.at(i);
+      }
+    }
+    length_ = result_length;
+  }
+
+  void Set(int index, const T& element) {
+    MOZ_ASSERT(index >= 0 && index <= length_);
+    data_[index] = element;
+  }
+
+  T Remove(int i) {
+    T element = at(i);
+    length_--;
+    while (i < length_) {
+      data_[i] = data_[i + 1];
+      i++;
+    }
+    return element;
+  }
+
+  inline T RemoveLast() { return Remove(length_ - 1); }
+
+  inline void Clear() {
+    data_ = nullptr;
+    capacity_ = 0;
+    length_ = 0;
+  }
+
+  inline void Rewind(int pos) {
+    MOZ_ASSERT(0 <= pos && pos <= length_);
+    length_ = pos;
+  }
+
+  inline bool Contains(const T& elm) const {
+    for (int i = 0; i < length_; i++) {
+      if (data_[i] == elm) return true;
+    }
+    return false;
+  }
+
+  template <typename CompareFunction>
+  void StableSort(CompareFunction cmp, size_t start, size_t length) {
+    js::AutoEnterOOMUnsafeRegion oomUnsafe;
+    T* scratch = static_cast<T*>(js_malloc(length * sizeof(T)));
+    if (!scratch) {
+      oomUnsafe.crash("Irregexp stable sort scratch space");
+    }
+    auto comparator = [cmp](const T& a, const T& b, bool* lessOrEqual) {
+      *lessOrEqual = cmp(&a, &b) <= 0;
+      return true;
+    };
+    MOZ_ALWAYS_TRUE(
+        js::MergeSort(begin() + start, length, scratch, comparator));
+    js_free(scratch);
+  }
+
+  void operator delete(void* pointer) { MOZ_CRASH("unreachable"); }
+  void operator delete(void* pointer, Zone* zone) { MOZ_CRASH("unreachable"); }
+
+ private:
+  T* data_ = nullptr;
+  int capacity_ = 0;
+  int length_ = 0;
+
+  void ResizeAdd(const T& element, Zone* zone) {
+    MOZ_ASSERT(length_ >= capacity_);
+    int new_capacity = 1 + 2 * capacity_;
+    T temp = element;
+    Resize(new_capacity, zone);
+    data_[length_++] = temp;
+  }
+
+  void Resize(int new_capacity, Zone* zone) {
+    MOZ_ASSERT(length_ <= new_capacity);
+    static_assert(std::is_trivially_copyable<T>::value);
+    T* new_data = zone->AllocateArray<T>(new_capacity);
+    if (length_ > 0) {
+      memcpy(new_data, data_, length_ * sizeof(T));
+    }
+    data_ = new_data;
+    capacity_ = new_capacity;
+  }
+
+  ZoneList& operator=(const ZoneList&) = delete;
+  ZoneList() = delete;
+  ZoneList(const ZoneList&) = delete;
+};
+
+template <typename T>
+class ZoneAllocator {
+ public:
+  using pointer = T*;
+  using const_pointer = const T*;
+  using reference = T&;
+  using const_reference = const T&;
+  using value_type = T;
+  using size_type = size_t;
+  using difference_type = ptrdiff_t;
+  template <class O>
+  struct rebind {
+    using other = ZoneAllocator<O>;
+  };
+
+  explicit ZoneAllocator(Zone* zone) : zone_(zone) {}
+  template <typename U>
+  ZoneAllocator(const ZoneAllocator<U>& other)
+      : ZoneAllocator<T>(other.zone_) {}
+  template <typename U>
+  friend class ZoneAllocator;
+
+  T* allocate(size_t n) { return zone_->AllocateArray<T>(n); }
+  void deallocate(T* p, size_t) {}  
+
+  bool operator==(ZoneAllocator const& other) const {
+    return zone_ == other.zone_;
+  }
+  bool operator!=(ZoneAllocator const& other) const {
+    return zone_ != other.zone_;
+  }
+
+  using Policy = js::LifoAllocPolicy<js::Fallible>;
+  Policy policy() const {
+    return js::LifoAllocPolicy<js::Fallible>(zone_->inner());
+  }
+
+ private:
+  Zone* zone_;
+};
+
+
+template <typename T>
+class ZoneVector : public std::vector<T, ZoneAllocator<T>> {
+ public:
+  ZoneVector(Zone* zone)
+      : std::vector<T, ZoneAllocator<T>>(ZoneAllocator<T>(zone)) {}
+
+  ZoneVector(size_t size, Zone* zone)
+      : std::vector<T, ZoneAllocator<T>>(size, T(), ZoneAllocator<T>(zone)) {}
+
+  ZoneVector(size_t size, T def, Zone* zone)
+      : std::vector<T, ZoneAllocator<T>>(size, def, ZoneAllocator<T>(zone)) {}
+
+  template <class Iter>
+  ZoneVector(Iter first, Iter last, Zone* zone)
+      : std::vector<T, ZoneAllocator<T>>(first, last, ZoneAllocator<T>(zone)) {}
+};
+
+template <typename T>
+class ZoneLinkedList : public std::list<T, ZoneAllocator<T>> {
+ public:
+  explicit ZoneLinkedList(Zone* zone)
+      : std::list<T, ZoneAllocator<T>>(ZoneAllocator<T>(zone)) {}
+};
+
+template <typename T>
+class ZoneStack : public std::stack<T, ZoneVector<T>> {
+ public:
+  explicit ZoneStack(Zone* zone)
+      : std::stack<T, ZoneVector<T>>(ZoneVector<T>(zone)) {}
+};
+
+template <typename K, typename Compare = std::less<K>>
+class ZoneSet : public std::set<K, Compare, ZoneAllocator<K>> {
+ public:
+  explicit ZoneSet(Zone* zone)
+      : std::set<K, Compare, ZoneAllocator<K>>(Compare(),
+                                               ZoneAllocator<K>(zone)) {}
+};
+
+template <typename K, typename V, typename Compare = std::less<K>>
+class ZoneMap
+    : public std::map<K, V, Compare, ZoneAllocator<std::pair<const K, V>>> {
+ public:
+  explicit ZoneMap(Zone* zone)
+      : std::map<K, V, Compare, ZoneAllocator<std::pair<const K, V>>>(
+            Compare(), ZoneAllocator<std::pair<const K, V>>(zone)) {}
+};
+
+template <typename K, typename V, typename Hash = std::hash<K>,
+          typename KeyEqual = std::equal_to<K>>
+class ZoneUnorderedMap
+    : public std::unordered_map<K, V, Hash, KeyEqual,
+                                ZoneAllocator<std::pair<const K, V>>> {
+ public:
+  explicit ZoneUnorderedMap(Zone* zone, size_t bucket_count = 100)
+      : std::unordered_map<K, V, Hash, KeyEqual,
+                           ZoneAllocator<std::pair<const K, V>>>(
+            bucket_count, Hash(), KeyEqual(),
+            ZoneAllocator<std::pair<const K, V>>(zone)) {}
+};
+
+template <typename T, size_t kSize>
+class SmallZoneVector : public base::SmallVector<T, kSize, ZoneAllocator<T>> {
+ public:
+  explicit SmallZoneVector(Zone* zone)
+      : base::SmallVector<T, kSize, ZoneAllocator<T>>(ZoneAllocator<T>(zone)) {}
+
+  explicit SmallZoneVector(size_t size, Zone* zone)
+      : base::SmallVector<T, kSize, ZoneAllocator<T>>(
+            size, ZoneAllocator<T>(ZoneAllocator<T>(zone))) {}
+};
+
+}  
+}  
+
+#endif

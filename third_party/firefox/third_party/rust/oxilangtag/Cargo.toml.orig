@@ -1,0 +1,23 @@
+[package]
+name = "oxilangtag"
+version = "0.1.3"
+authors = [
+    "Tpt <thomas@pellissier-tanon.fr>"
+]
+license = "MIT"
+keywords = ["language-tag", "BCP47"]
+repository = "https://github.com/oxigraph/oxilangtag"
+description = """
+Simple and fast implementation of language tag normalization and validation
+"""
+edition = "2018"
+
+[features]
+default = []
+serialize = ["serde"]
+
+[dependencies]
+serde = { version = "1", optional = true }
+
+[package.metadata.docs.rs]
+all-features = true

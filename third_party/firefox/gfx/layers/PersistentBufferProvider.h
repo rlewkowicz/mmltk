@@ -1,0 +1,253 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_PersistentBUFFERPROVIDER_H
+#define MOZILLA_GFX_PersistentBUFFERPROVIDER_H
+
+#include "mozilla/Assertions.h"  // for MOZ_ASSERT, etc
+#include "mozilla/RefPtr.h"      // for RefPtr, already_AddRefed, etc
+#include "mozilla/layers/ActiveResource.h"
+#include "mozilla/layers/LayersSurfaces.h"
+#include "mozilla/layers/LayersTypes.h"
+#include "mozilla/RefCounted.h"
+#include "mozilla/gfx/Types.h"
+#include "mozilla/Vector.h"
+#include "mozilla/WeakPtr.h"
+
+namespace mozilla {
+
+class ClientWebGLContext;
+
+namespace gfx {
+class SourceSurface;
+class DrawTarget;
+}  
+
+namespace layers {
+
+class CompositableForwarder;
+class FwdTransactionTracker;
+class KnowsCompositor;
+class TextureClient;
+
+class PersistentBufferProvider : public RefCounted<PersistentBufferProvider>,
+                                 public SupportsWeakPtr {
+ public:
+  MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(PersistentBufferProvider)
+
+  virtual ~PersistentBufferProvider() = default;
+
+  virtual bool IsShared() const { return false; }
+  virtual bool IsAccelerated() const { return false; }
+
+  virtual already_AddRefed<gfx::DrawTarget> BorrowDrawTarget(
+      const gfx::IntRect& aPersistedRect) = 0;
+
+  virtual bool ReturnDrawTarget(already_AddRefed<gfx::DrawTarget> aDT) = 0;
+
+  virtual already_AddRefed<gfx::SourceSurface> BorrowSnapshot(
+      gfx::DrawTarget* aTarget = nullptr) = 0;
+
+  virtual void ReturnSnapshot(
+      already_AddRefed<gfx::SourceSurface> aSnapshot) = 0;
+
+  virtual TextureClient* GetTextureClient() { return nullptr; }
+
+  virtual Maybe<RemoteTextureOwnerId> GetRemoteTextureOwnerId() const {
+    return Nothing();
+  }
+
+  virtual void OnMemoryPressure() {}
+
+  virtual void OnShutdown() {}
+
+  virtual bool SetKnowsCompositor(KnowsCompositor* aKnowsCompositor,
+                                  bool& aOutLostFrontTexture) {
+    return true;
+  }
+
+  virtual void ClearCachedResources() {}
+
+  virtual bool PreservesDrawingState() const = 0;
+
+  virtual bool RequiresRefresh() const { return false; }
+
+  virtual Maybe<SurfaceDescriptor> GetFrontBuffer() { return Nothing(); }
+
+  virtual already_AddRefed<FwdTransactionTracker> UseCompositableForwarder(
+      CompositableForwarder* aForwarder) {
+    return nullptr;
+  }
+};
+
+class PersistentBufferProviderBasic : public PersistentBufferProvider {
+ public:
+  MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(PersistentBufferProviderBasic,
+                                          override)
+
+  static already_AddRefed<PersistentBufferProviderBasic> Create(
+      gfx::IntSize aSize, gfx::SurfaceFormat aFormat,
+      gfx::BackendType aBackend);
+
+  explicit PersistentBufferProviderBasic(gfx::DrawTarget* aTarget);
+
+  already_AddRefed<gfx::DrawTarget> BorrowDrawTarget(
+      const gfx::IntRect& aPersistedRect) override;
+
+  bool ReturnDrawTarget(already_AddRefed<gfx::DrawTarget> aDT) override;
+
+  already_AddRefed<gfx::SourceSurface> BorrowSnapshot(
+      gfx::DrawTarget* aTarget) override;
+
+  void ReturnSnapshot(already_AddRefed<gfx::SourceSurface> aSnapshot) override;
+
+  bool PreservesDrawingState() const override { return true; }
+
+  void OnShutdown() override { Destroy(); }
+
+ protected:
+  void Destroy();
+
+  ~PersistentBufferProviderBasic() override;
+
+  RefPtr<gfx::DrawTarget> mDrawTarget;
+  RefPtr<gfx::SourceSurface> mSnapshot;
+};
+
+class PersistentBufferProviderAccelerated : public PersistentBufferProvider {
+ public:
+  MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(PersistentBufferProviderAccelerated,
+                                          override)
+
+  static already_AddRefed<PersistentBufferProviderAccelerated> Create(
+      gfx::IntSize aSize, gfx::SurfaceFormat aFormat,
+      KnowsCompositor* aKnowsCompositor);
+
+  bool IsAccelerated() const override { return true; }
+
+  already_AddRefed<gfx::DrawTarget> BorrowDrawTarget(
+      const gfx::IntRect& aPersistedRect) override;
+
+  bool ReturnDrawTarget(already_AddRefed<gfx::DrawTarget> aDT) override;
+
+  already_AddRefed<gfx::SourceSurface> BorrowSnapshot(
+      gfx::DrawTarget* aTarget) override;
+
+  void ReturnSnapshot(already_AddRefed<gfx::SourceSurface> aSnapshot) override;
+
+  Maybe<RemoteTextureOwnerId> GetRemoteTextureOwnerId() const override {
+    return Some(mRemoteTextureOwnerId);
+  }
+
+  bool PreservesDrawingState() const override { return true; }
+
+  void OnShutdown() override { Destroy(); }
+
+  Maybe<SurfaceDescriptor> GetFrontBuffer() override;
+
+  bool RequiresRefresh() const override;
+
+  already_AddRefed<FwdTransactionTracker> UseCompositableForwarder(
+      CompositableForwarder* aForwarder) override;
+
+ protected:
+  explicit PersistentBufferProviderAccelerated(
+      RemoteTextureOwnerId aRemoteTextureOwnerId,
+      const RefPtr<TextureClient>& aTexture);
+  ~PersistentBufferProviderAccelerated() override;
+
+  void Destroy();
+
+  RemoteTextureOwnerId mRemoteTextureOwnerId;
+  RefPtr<TextureClient> mTexture;
+
+  RefPtr<gfx::DrawTarget> mDrawTarget;
+  RefPtr<gfx::SourceSurface> mSnapshot;
+};
+
+class PersistentBufferProviderShared : public PersistentBufferProvider,
+                                       public ActiveResource {
+ public:
+  MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(PersistentBufferProviderShared,
+                                          override)
+
+  static already_AddRefed<PersistentBufferProviderShared> Create(
+      gfx::IntSize aSize, gfx::SurfaceFormat aFormat,
+      KnowsCompositor* aKnowsCompositor, bool aWillReadFrequently = false,
+      const Maybe<uint64_t>& aWindowID = Nothing());
+
+  bool IsShared() const override { return true; }
+
+  already_AddRefed<gfx::DrawTarget> BorrowDrawTarget(
+      const gfx::IntRect& aPersistedRect) override;
+
+  bool ReturnDrawTarget(already_AddRefed<gfx::DrawTarget> aDT) override;
+
+  already_AddRefed<gfx::SourceSurface> BorrowSnapshot(
+      gfx::DrawTarget* aTarget) override;
+
+  void ReturnSnapshot(already_AddRefed<gfx::SourceSurface> aSnapshot) override;
+
+  TextureClient* GetTextureClient() override;
+
+  void NotifyInactive() override;
+
+  void OnShutdown() override { Destroy(); }
+
+  bool SetKnowsCompositor(KnowsCompositor* aKnowsCompositor,
+                          bool& aOutLostFrontTexture) override;
+
+  void ClearCachedResources() override;
+
+  bool PreservesDrawingState() const override { return false; }
+
+ protected:
+  PersistentBufferProviderShared(gfx::IntSize aSize, gfx::SurfaceFormat aFormat,
+                                 KnowsCompositor* aKnowsCompositor,
+                                 RefPtr<TextureClient>& aTexture,
+                                 bool aWillReadFrequently,
+                                 const Maybe<uint64_t>& aWindowID);
+
+  ~PersistentBufferProviderShared();
+
+  TextureClient* GetTexture(const Maybe<uint32_t>& aIndex);
+  bool CheckIndex(uint32_t aIndex) { return aIndex < mTextures.length(); }
+
+  void Destroy();
+
+  gfx::IntSize mSize;
+  gfx::SurfaceFormat mFormat;
+  RefPtr<KnowsCompositor> mKnowsCompositor;
+  RefPtr<TextureClient> mPermanentBackBuffer;
+  static const size_t kMaxTexturesAllowed = 5;
+  Vector<RefPtr<TextureClient>, kMaxTexturesAllowed + 2> mTextures;
+  Maybe<uint32_t> mBack;
+  Maybe<uint32_t> mFront;
+  bool mWillReadFrequently = false;
+  Maybe<uint64_t> mWindowID;
+
+  RefPtr<gfx::DrawTarget> mDrawTarget;
+  RefPtr<gfx::SourceSurface> mSnapshot;
+  size_t mMaxAllowedTextures = kMaxTexturesAllowed;
+};
+
+struct AutoReturnSnapshot final {
+  PersistentBufferProvider* mBufferProvider;
+  RefPtr<gfx::SourceSurface>* mSnapshot;
+
+  explicit AutoReturnSnapshot(PersistentBufferProvider* aProvider = nullptr)
+      : mBufferProvider(aProvider), mSnapshot(nullptr) {}
+
+  ~AutoReturnSnapshot() {
+    if (mBufferProvider) {
+      mBufferProvider->ReturnSnapshot(mSnapshot ? mSnapshot->forget()
+                                                : nullptr);
+    }
+  }
+};
+
+}  
+}  
+
+#endif

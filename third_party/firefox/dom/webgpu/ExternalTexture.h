@@ -1,0 +1,180 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(ExternalTexture_H_)
+#define ExternalTexture_H_
+
+#include <array>
+
+#include "ObjectModel.h"
+#include "mozilla/HashTable.h"
+#include "mozilla/Span.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/gfx/Types.h"
+#include "mozilla/webgpu/WebGPUTypes.h"
+#include "mozilla/webgpu/ffi/wgpu.h"
+#include "nsIGlobalObject.h"
+#include "nsTArrayForwardDeclare.h"
+
+namespace mozilla {
+namespace dom {
+struct GPUExternalTextureDescriptor;
+class HTMLVideoElement;
+class OwningHTMLVideoElementOrVideoFrame;
+enum class PredefinedColorSpace : uint8_t;
+class VideoFrame;
+}  
+namespace layers {
+class BufferDescriptor;
+class DXGITextureHostD3D11;
+class DXGIYCbCrTextureHostD3D11;
+class Image;
+class MacIOSurfaceTextureHostOGL;
+}  
+
+namespace webgpu {
+
+class Device;
+class ExternalTextureSourceClient;
+class WebGPUParent;
+
+class ExternalTexture final : public nsWrapperCache,
+                              public ObjectBase,
+                              public ChildOf<Device>,
+                              public SupportsWeakPtr {
+ public:
+  GPU_DECL_CYCLE_COLLECTION(ExternalTexture)
+  GPU_DECL_JS_WRAP(ExternalTexture)
+
+  static already_AddRefed<ExternalTexture> Create(
+      Device* const aParent, const nsString& aLabel,
+      const RefPtr<ExternalTextureSourceClient>& aSource,
+      dom::PredefinedColorSpace aColorSpace);
+
+  void Expire();
+  bool IsExpired() const { return mIsExpired; }
+  void Unexpire();
+  bool IsDestroyed() const { return mIsDestroyed; }
+
+  void OnSubmit(uint64_t aSubmissionIndex);
+  void OnSubmittedWorkDone(uint64_t aSubmissionIndex);
+
+  RefPtr<ExternalTextureSourceClient> Source() { return mSource; }
+
+ private:
+  explicit ExternalTexture(Device* const aParent, RawId aId,
+                           RefPtr<ExternalTextureSourceClient> aSource);
+  virtual ~ExternalTexture();
+
+  void MaybeDestroy();
+
+  RefPtr<ExternalTextureSourceClient> mSource;
+  bool mIsExpired = false;
+  bool mIsDestroyed = false;
+  uint64_t mLastSubmittedIndex = 0;
+  uint64_t mLastSubmittedWorkDoneIndex = 0;
+};
+
+class ExternalTextureCache : public SupportsWeakPtr {
+ public:
+  RefPtr<ExternalTexture> GetOrCreate(
+      Device* aDevice, const dom::GPUExternalTextureDescriptor& aDesc,
+      ErrorResult& aRv);
+
+  void RemoveSource(const ExternalTextureSourceClient* aSource);
+
+ private:
+  RefPtr<ExternalTextureSourceClient> GetOrCreateSource(
+      Device* aDevice, const dom::OwningHTMLVideoElementOrVideoFrame& aSource,
+      ErrorResult& aRv);
+
+  HashMap<uint32_t, ExternalTextureSourceClient*> mSources;
+};
+
+class ExternalTextureSourceClient final : public ObjectBase {
+  NS_INLINE_DECL_REFCOUNTING(ExternalTextureSourceClient)
+
+ public:
+  static already_AddRefed<ExternalTextureSourceClient> Create(
+      Device* aDevice, ExternalTextureCache* aCache,
+      const dom::OwningHTMLVideoElementOrVideoFrame& aSource, ErrorResult& aRv);
+
+  const RefPtr<layers::Image> mImage;
+
+  const std::array<RawId, 3> mTextureIds;
+  const std::array<RawId, 3> mViewIds;
+
+  RefPtr<ExternalTexture> GetOrCreateExternalTexture(
+      Device* aDevice, const dom::GPUExternalTextureDescriptor& aDesc);
+
+ private:
+  ExternalTextureSourceClient(WebGPUChild* aChild, RawId aId,
+                              ExternalTextureCache* aCache,
+                              const RefPtr<layers::Image>& aImage,
+                              const std::array<RawId, 3>& aTextureIds,
+                              const std::array<RawId, 3>& aViewIds);
+  virtual ~ExternalTextureSourceClient();
+
+  const WeakPtr<ExternalTextureCache> mCache;
+
+  HashMap<dom::PredefinedColorSpace, WeakPtr<ExternalTexture>>
+      mExternalTextures;
+};
+
+class ExternalTextureSourceHost {
+ public:
+  static ExternalTextureSourceHost Create(
+      WebGPUParent* aParent, RawId aDeviceId, RawId aQueueId,
+      const ExternalTextureSourceDescriptor& aDesc);
+
+  Span<const RawId> TextureIds() const { return mTextureIds; }
+  Span<const RawId> ViewIds() const { return mViewIds; }
+
+  ffi::WGPUExternalTextureDescriptorFromSource GetExternalTextureDescriptor(
+      ffi::WGPUPredefinedColorSpace aDestColorSpace) const;
+
+  bool OnBeforeQueueSubmit(WebGPUParent* aParent, RawId aDeviceId,
+                           RawId aQueueId);
+
+ private:
+  ExternalTextureSourceHost(Span<const RawId> aTextureIds,
+                            Span<const RawId> aViewIds, gfx::IntSize aSize,
+                            gfx::SurfaceFormat aFormat,
+                            gfx::YUVRangedColorSpace aColorSpace,
+                            const std::array<float, 6>& aSampleTransform,
+                            const std::array<float, 6>& aLoadTransform);
+
+  static ExternalTextureSourceHost CreateFromBufferDesc(
+      WebGPUParent* aParent, RawId aDeviceId, RawId aQueueId,
+      const ExternalTextureSourceDescriptor& aDesc,
+      const layers::BufferDescriptor& aBufferDesc, Span<uint8_t> aBuffer);
+  static ExternalTextureSourceHost CreateFromDXGITextureHost(
+      WebGPUParent* aParent, RawId aDeviceId, RawId aQueueId,
+      const ExternalTextureSourceDescriptor& aDesc,
+      const layers::DXGITextureHostD3D11* aTextureHost);
+  static ExternalTextureSourceHost CreateFromDXGIYCbCrTextureHost(
+      WebGPUParent* aParent, RawId aDeviceId, RawId aQueueId,
+      const ExternalTextureSourceDescriptor& aDesc,
+      const layers::DXGIYCbCrTextureHostD3D11* aTextureHost);
+  static ExternalTextureSourceHost CreateFromMacIOSurfaceTextureHost(
+      WebGPUParent* aParent, RawId aDeviceId,
+      const ExternalTextureSourceDescriptor& aDesc,
+      const layers::MacIOSurfaceTextureHostOGL* aTextureHost);
+
+  static ExternalTextureSourceHost CreateError();
+
+  AutoTArray<RawId, 3> mTextureIds;
+  AutoTArray<RawId, 3> mViewIds;
+  const gfx::IntSize mSize;
+  const gfx::SurfaceFormat mFormat;
+  const gfx::YUVRangedColorSpace mColorSpace;
+  const std::array<float, 6> mSampleTransform;
+  const std::array<float, 6> mLoadTransform;
+
+};
+
+}  
+}  
+
+#endif

@@ -1,0 +1,13 @@
+[package]
+edition = "2015"
+name = "processtools"
+version = "0.1.0"
+authors = ["David Teller <dteller@mozilla.com>"]
+license = "MPL-2.0"
+
+[dependencies]
+nserror = { path = "../../../xpcom/rust/nserror" }
+xpcom = { path = "../../../xpcom/rust/xpcom" }
+
+libc = "0.2"
+log = "0.4"

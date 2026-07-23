@@ -1,0 +1,140 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_CallOrNewEmitter_h
+#define frontend_CallOrNewEmitter_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+
+#include <stdint.h>
+
+#include "frontend/ElemOpEmitter.h"
+#include "frontend/IfEmitter.h"
+#include "frontend/PrivateOpEmitter.h"
+#include "frontend/PropOpEmitter.h"
+#include "frontend/ValueUsage.h"
+#include "vm/BytecodeUtil.h"
+#include "vm/Opcodes.h"
+
+namespace js {
+namespace frontend {
+
+struct BytecodeEmitter;
+class TaggedParserAtomIndex;
+
+class MOZ_STACK_CLASS CallOrNewEmitter {
+ public:
+  enum class ArgumentsKind {
+    Other,
+
+    SingleSpread,
+
+    PassthroughRest,
+  };
+
+ private:
+  BytecodeEmitter* bce_;
+
+  JSOp op_;
+
+  ArgumentsKind argumentsKind_;
+
+  mozilla::Maybe<InternalIfEmitter> ifNotOptimizable_;
+
+  mozilla::Maybe<PropOpEmitter> poe_;
+  mozilla::Maybe<ElemOpEmitter> eoe_;
+  mozilla::Maybe<PrivateOpEmitter> xoe_;
+
+  enum class State {
+    Start,
+
+    NameCallee,
+
+    PropCallee,
+
+    ElemCallee,
+
+    PrivateCallee,
+
+    FunctionCallee,
+
+    SuperCallee,
+
+    OtherCallee,
+
+    This,
+
+    WantSpreadOperand,
+
+    SpreadArgumentsTest,
+
+    SpreadIteration,
+
+    Arguments,
+
+    End
+  };
+  State state_ = State::Start;
+
+ public:
+  CallOrNewEmitter(BytecodeEmitter* bce, JSOp op, ArgumentsKind argumentsKind,
+                   ValueUsage valueUsage);
+
+ private:
+  [[nodiscard]] bool isCall() const {
+    return op_ == JSOp::Call || op_ == JSOp::CallIgnoresRv ||
+           op_ == JSOp::SpreadCall || isEval();
+  }
+
+  [[nodiscard]] bool isNew() const {
+    return op_ == JSOp::New || op_ == JSOp::SpreadNew;
+  }
+
+  [[nodiscard]] bool isSuperCall() const {
+    return op_ == JSOp::SuperCall || op_ == JSOp::SpreadSuperCall;
+  }
+
+  [[nodiscard]] bool isEval() const {
+    return op_ == JSOp::Eval || op_ == JSOp::StrictEval ||
+           op_ == JSOp::SpreadEval || op_ == JSOp::StrictSpreadEval;
+  }
+
+  [[nodiscard]] bool isSpread() const { return IsSpreadOp(op_); }
+
+  [[nodiscard]] bool isSingleSpread() const {
+    return argumentsKind_ == ArgumentsKind::SingleSpread;
+  }
+
+  [[nodiscard]] bool isPassthroughRest() const {
+    return argumentsKind_ == ArgumentsKind::PassthroughRest;
+  }
+
+ public:
+  [[nodiscard]] bool emitNameCallee(TaggedParserAtomIndex name);
+  [[nodiscard]] PropOpEmitter& prepareForPropCallee(bool isSuperProp);
+  [[nodiscard]] ElemOpEmitter& prepareForElemCallee(bool isSuperElem);
+  [[nodiscard]] PrivateOpEmitter& prepareForPrivateCallee(
+      TaggedParserAtomIndex privateName);
+  [[nodiscard]] bool prepareForFunctionCallee();
+  [[nodiscard]] bool emitSuperCallee();
+  [[nodiscard]] bool prepareForOtherCallee();
+
+  [[nodiscard]] bool emitThis();
+
+  [[nodiscard]] bool prepareForNonSpreadArguments();
+  [[nodiscard]] bool prepareForSpreadArguments();
+
+  [[nodiscard]] bool wantSpreadOperand();
+  [[nodiscard]] bool emitSpreadArgumentsTest();
+  [[nodiscard]] bool emitSpreadArgumentsTestEnd();
+  [[nodiscard]] bool wantSpreadIteration();
+
+  [[nodiscard]] bool emitEnd(uint32_t argc, uint32_t beginPos);
+};
+
+} 
+} 
+
+#endif /* frontend_CallOrNewEmitter_h */

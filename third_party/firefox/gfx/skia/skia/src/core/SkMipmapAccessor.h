@@ -1,0 +1,56 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkMipmapAccessor_DEFINED)
+#define SkMipmapAccessor_DEFINED
+
+#include "include/core/SkBitmap.h"
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPixmap.h"
+#include "include/core/SkRefCnt.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkNoncopyable.h"
+#include "src/core/SkMipmap.h"
+
+#include <utility>
+
+class SkArenaAlloc;
+class SkImage;
+class SkImage_Base;
+enum class SkMipmapMode;
+
+class SkMipmapAccessor : ::SkNoncopyable {
+public:
+    static SkMipmapAccessor* Make(SkArenaAlloc*, const SkImage*, const SkMatrix& inv, SkMipmapMode);
+
+    std::pair<SkPixmap, SkMatrix> level() const {
+        SkASSERT(fUpper.addr() != nullptr);
+        return std::make_pair(fUpper, fUpperInv);
+    }
+
+    std::pair<SkPixmap, SkMatrix> lowerLevel() const {
+        SkASSERT(fLower.addr() != nullptr);
+        return std::make_pair(fLower, fLowerInv);
+    }
+
+    float lowerWeight() const { return fLowerWeight; }
+
+private:
+    SkPixmap     fUpper,
+                 fLower; 
+    float        fLowerWeight;   
+    SkMatrix     fUpperInv,
+                 fLowerInv;
+
+    SkBitmap              fBaseStorage;
+    sk_sp<const SkMipmap> fCurrMip;
+
+public:
+    SkMipmapAccessor(const SkImage_Base*, const SkMatrix& inv, SkMipmapMode requestedMode);
+};
+
+#endif

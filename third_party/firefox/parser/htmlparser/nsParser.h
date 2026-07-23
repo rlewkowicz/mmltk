@@ -1,0 +1,158 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef NS_PARSER_
+#define NS_PARSER_
+
+#include "nsIParser.h"
+#include "nsDeque.h"
+#include "CParserContext.h"
+#include "nsHTMLTags.h"
+#include "nsIContentSink.h"
+#include "nsCOMArray.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsWeakReference.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/UniquePtr.h"
+
+class nsExpatDriver;
+class nsIRunnable;
+
+#ifdef _MSC_VER
+#  pragma warning(disable : 4275)
+#endif
+
+class nsParser final : public nsIParser,
+                       public nsIStreamListener,
+                       public nsSupportsWeakReference {
+  virtual ~nsParser();
+
+ public:
+  static nsresult Init();
+
+  static void Shutdown();
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsParser, nsIParser)
+
+  nsParser();
+
+  NS_IMETHOD_(void) SetContentSink(nsIContentSink* aSink) override;
+
+  NS_IMETHOD_(nsIContentSink*) GetContentSink(void) override;
+
+  NS_IMETHOD_(void) GetCommand(nsCString& aCommand) override;
+  NS_IMETHOD_(void) SetCommand(const char* aCommand) override;
+  NS_IMETHOD_(void) SetCommand(eParserCommands aParserCommand) override;
+
+  virtual void SetDocumentCharset(NotNull<const Encoding*> aCharset,
+                                  int32_t aSource,
+                                  bool aForceAutoDetection) override;
+
+  NotNull<const Encoding*> GetDocumentCharset(int32_t& aSource) {
+    aSource = mCharsetSource;
+    return mCharset;
+  }
+
+  NS_IMETHOD Parse(nsIURI* aURL) override;
+
+  nsresult ParseFragment(const nsAString& aSourceBuffer,
+                         nsTArray<nsString>& aTagStack);
+
+  NS_IMETHOD ContinueInterruptedParsing() override;
+  NS_IMETHOD_(void) BlockParser() override;
+  NS_IMETHOD_(void) UnblockParser() override;
+  NS_IMETHOD_(void) ContinueInterruptedParsingAsync() override;
+  NS_IMETHOD Terminate(void) override;
+
+  NS_IMETHOD_(bool) IsParserEnabled() override;
+
+  NS_IMETHOD_(bool) IsComplete() override;
+
+  virtual nsresult ResumeParse(bool allowIteration = true,
+                               bool aIsFinalChunk = false,
+                               bool aCanInterrupt = true);
+
+  NS_DECL_NSIREQUESTOBSERVER
+
+  NS_DECL_NSISTREAMLISTENER
+
+  virtual nsIStreamListener* GetStreamListener() override;
+
+  void SetSinkCharset(NotNull<const Encoding*> aCharset);
+
+  virtual bool IsInsertionPointDefined() override;
+
+  void IncrementScriptNestingLevel() final;
+
+  void DecrementScriptNestingLevel() final;
+
+  bool HasNonzeroScriptNestingLevel() const final;
+
+  virtual bool IsScriptCreated() override;
+
+  virtual bool IsAboutBlankMode() override;
+
+  nsresult PostContinueEvent();
+
+  void HandleParserContinueEvent(class nsParserContinueEvent*);
+
+  void Reset() {
+    Cleanup();
+    mUnusedInput.Truncate();
+    Initialize();
+  }
+
+  bool IsScriptExecuting() { return mSink && mSink->IsScriptExecuting(); }
+
+  void ContinueParsingDocumentAfterCurrentScript() {
+    if (mSink) {
+      mSink->ContinueParsingDocumentAfterCurrentScript();
+    }
+  }
+
+  mozilla::Maybe<bool> IsForParsingXML() {
+    if (!mParserContext || mParserContext->mDTDMode == eDTDMode_autodetect) {
+      return mozilla::Nothing();
+    }
+
+    return mozilla::Some(mParserContext->mDocType == eXML);
+  }
+
+ protected:
+  void Initialize();
+  void Cleanup();
+
+  nsresult WillBuildModel();
+
+  void DidBuildModel();
+
+ private:
+  nsresult Parse(const nsAString& aSourceBuffer, bool aLastCall);
+
+ protected:
+
+  mozilla::UniquePtr<CParserContext> mParserContext;
+  RefPtr<nsExpatDriver> mExpatDriver;
+  nsCOMPtr<nsIContentSink> mSink;
+  nsIRunnable* mContinueEvent;  
+
+  eParserCommands mCommand;
+  nsresult mInternalState;
+  nsresult mStreamStatus;
+  int32_t mCharsetSource;
+
+  uint16_t mFlags;
+  uint32_t mBlocked;
+
+  nsString mUnusedInput;
+  NotNull<const Encoding*> mCharset;
+  nsCString mCommandStr;
+
+  bool mProcessingNetworkData;
+  bool mOnStopPending;
+};
+
+#endif

@@ -1,0 +1,423 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ScriptPreloader_h
+#define ScriptPreloader_h
+
+#include "mozilla/EnumSet.h"
+#include "mozilla/EventTargetAndLockCapability.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MaybeOneOf.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/Range.h"
+#include "mozilla/Result.h"
+#include "mozilla/SPSCQueue.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/Vector.h"
+#include "mozilla/loader/AutoMemMap.h"
+#include "MainThreadUtils.h"
+#include "nsClassHashtable.h"
+#include "nsThreadUtils.h"
+#include "nsIAsyncShutdown.h"
+#include "nsIFile.h"
+#include "nsIMemoryReporter.h"
+#include "nsIObserver.h"
+#include "nsIThread.h"
+#include "nsITimer.h"
+
+#include "js/CompileOptions.h"  // JS::DecodeOptions, JS::ReadOnlyDecodeOptions
+#include "js/experimental/CompileScript.h"  // JS::FrontendContext
+#include "js/experimental/JSStencil.h"      // JS::Stencil
+#include "js/GCAnnotations.h"               // for JS_HAZ_NON_GC_POINTER
+#include "js/RootingAPI.h"                  // for Handle, Heap
+#include "js/Transcoding.h"  // for TranscodeBuffer, TranscodeRange, TranscodeSource
+#include "js/TypeDecls.h"  // for HandleObject, HandleScript
+
+#include <prio.h>
+
+namespace mozilla {
+namespace dom {
+class ContentParent;
+}
+namespace ipc {
+class FileDescriptor;
+}
+namespace loader {
+class InputBuffer;
+class ScriptCacheChild;
+
+enum class ProcessType : uint8_t {
+  Uninitialized,
+  Parent,
+  Web,
+  Extension,
+  PrivilegedAbout,
+};
+
+template <typename T>
+struct Matcher {
+  virtual bool Matches(T) = 0;
+};
+}  
+
+using namespace mozilla::loader;
+
+struct CachedStencilRefAndTime;
+
+class ScriptPreloader : public nsIObserver,
+                        public nsIMemoryReporter,
+                        public nsIRunnable,
+                        public nsINamed,
+                        public nsIAsyncShutdownBlocker {
+  MOZ_DEFINE_MALLOC_SIZE_OF(MallocSizeOf)
+
+  friend class mozilla::loader::ScriptCacheChild;
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSIMEMORYREPORTER
+  NS_DECL_NSIRUNNABLE
+  NS_DECL_NSINAMED
+  NS_DECL_NSIASYNCSHUTDOWNBLOCKER
+
+ private:
+  static StaticRefPtr<ScriptPreloader> gScriptPreloader;
+  static StaticRefPtr<ScriptPreloader> gChildScriptPreloader;
+  static StaticAutoPtr<AutoMemMap> gCacheData;
+  static StaticAutoPtr<AutoMemMap> gChildCacheData;
+
+ public:
+  static ScriptPreloader& GetSingleton();
+  static ScriptPreloader& GetChildSingleton();
+
+  static void DeleteSingleton();
+  static void DeleteCacheDataSingleton();
+
+  static ProcessType GetChildProcessType(const nsACString& remoteType);
+
+  static void FillCompileOptionsForCachedStencil(JS::CompileOptions& options);
+  static void FillDecodeOptionsForCachedStencil(JS::DecodeOptions& options);
+
+  already_AddRefed<JS::Stencil> GetCachedStencil(
+      JSContext* cx, const JS::ReadOnlyDecodeOptions& options,
+      const nsCString& path);
+
+  void NoteStencil(const nsCString& url, const nsCString& cachePath,
+                   JS::Stencil* stencil, bool isRunOnce = false);
+
+  void NoteStencil(const nsCString& url, const nsCString& cachePath,
+                   ProcessType processType, nsTArray<uint8_t>&& xdrData,
+                   TimeStamp loadTime);
+
+  void NoteReceivedAllChildStencilsForProcess(ProcessType processType);
+
+  Result<Ok, nsresult> InitCache(const nsAString& = u"scriptCache"_ns)
+      MOZ_REQUIRES(sMainThreadCapability);
+
+  Result<Ok, nsresult> InitCache(const Maybe<ipc::FileDescriptor>& cacheFile,
+                                 ScriptCacheChild* cacheChild)
+      MOZ_REQUIRES(sMainThreadCapability);
+
+  bool Active() const;
+
+ private:
+  Result<Ok, nsresult> InitCacheInternal(JS::Handle<JSObject*> scope = nullptr);
+  already_AddRefed<JS::Stencil> GetCachedStencilInternal(
+      JSContext* cx, const JS::ReadOnlyDecodeOptions& options,
+      const nsCString& path);
+
+ public:
+  static ProcessType CurrentProcessType() {
+    MOZ_ASSERT(sProcessType != ProcessType::Uninitialized);
+    return sProcessType;
+  }
+
+  static void InitContentChild(dom::ContentParent& parent);
+
+ protected:
+  virtual ~ScriptPreloader();
+
+ private:
+  enum class ScriptStatus {
+    Restored,
+    Saved,
+  };
+
+  class CachedStencil : public LinkedListElement<CachedStencil> {
+   public:
+    CachedStencil(CachedStencil&&) = delete;
+
+    CachedStencil(ScriptPreloader& cache, const nsCString& url,
+                  const nsCString& cachePath, JS::Stencil* stencil)
+        : mCache(cache),
+          mURL(url),
+          mCachePath(cachePath),
+          mStencil(stencil),
+          mReadyToExecute(true),
+          mIsRunOnce(false) {}
+
+    inline CachedStencil(ScriptPreloader& cache, InputBuffer& buf);
+
+    ~CachedStencil() = default;
+
+    ScriptStatus Status() const {
+      return mProcessTypes.isEmpty() ? ScriptStatus::Restored
+                                     : ScriptStatus::Saved;
+    }
+
+    struct StatusMatcher final : public Matcher<CachedStencil*> {
+      explicit StatusMatcher(ScriptStatus status) : mStatus(status) {}
+
+      virtual bool Matches(CachedStencil* script) override {
+        return script->Status() == mStatus;
+      }
+
+      const ScriptStatus mStatus;
+    };
+
+    void FreeData() {
+      if (!IsMemMapped()) {
+        mXDRRange.reset();
+        mXDRData.destroy();
+      }
+    }
+
+    void UpdateLoadTime(const TimeStamp& loadTime) {
+      if (mLoadTime.IsNull() || loadTime < mLoadTime) {
+        mLoadTime = loadTime;
+      }
+    }
+
+    bool MaybeDropStencil() {
+      if (mIsRunOnce && (HasRange() || !mCache.WillWriteScripts())) {
+        mStencil = nullptr;
+        return true;
+      }
+      return false;
+    }
+
+    bool XDREncode(JS::FrontendContext* cx);
+
+    template <typename Buffer>
+    void Code(Buffer& buffer) {
+      buffer.codeString(mURL);
+      buffer.codeString(mCachePath);
+      buffer.codeUint32(mOffset);
+      buffer.codeUint32(mSize);
+      buffer.codeUint8(mProcessTypes);
+    }
+
+    JS::TranscodeBuffer& Buffer() {
+      MOZ_ASSERT(HasBuffer());
+      return mXDRData.ref<JS::TranscodeBuffer>();
+    }
+
+    bool HasBuffer() { return mXDRData.constructed<JS::TranscodeBuffer>(); }
+
+    const JS::TranscodeRange& Range() {
+      MOZ_ASSERT(HasRange());
+      return mXDRRange.ref();
+    }
+
+    bool HasRange() { return mXDRRange.isSome(); }
+
+    bool IsMemMapped() const { return mXDRData.empty(); }
+
+    nsTArray<uint8_t>& Array() {
+      MOZ_ASSERT(HasArray());
+      return mXDRData.ref<nsTArray<uint8_t>>();
+    }
+
+    bool HasArray() { return mXDRData.constructed<nsTArray<uint8_t>>(); }
+
+    already_AddRefed<JS::Stencil> GetStencil(
+        JSContext* cx, const JS::ReadOnlyDecodeOptions& options);
+
+    size_t HeapSizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) {
+      auto size = mallocSizeOf(this);
+
+      if (HasArray()) {
+        size += Array().ShallowSizeOfExcludingThis(mallocSizeOf);
+      } else if (HasBuffer()) {
+        size += Buffer().sizeOfExcludingThis(mallocSizeOf);
+      }
+
+      if (mStencil) {
+        size += JS::SizeOfStencil(mStencil, mallocSizeOf);
+      }
+
+      size += (mURL.SizeOfExcludingThisIfUnshared(mallocSizeOf) +
+               mCachePath.SizeOfExcludingThisEvenIfShared(mallocSizeOf));
+
+      return size;
+    }
+
+    ScriptPreloader& mCache;
+
+    nsCString mURL;
+    nsCString mCachePath;
+
+    uint32_t mOffset = 0;
+    uint32_t mSize = 0;
+
+    TimeStamp mLoadTime{};
+
+    RefPtr<JS::Stencil> mStencil;
+
+    bool mReadyToExecute = false;
+
+    bool mIsRunOnce = false;
+
+    EnumSet<ProcessType> mProcessTypes{};
+
+    EnumSet<ProcessType> mOriginalProcessTypes{};
+
+    // existing cache file, or generated by encoding a script which was
+    Maybe<JS::TranscodeRange> mXDRRange;
+
+    MaybeOneOf<JS::TranscodeBuffer, nsTArray<uint8_t>> mXDRData;
+  } JS_HAZ_NON_GC_POINTER;
+
+  friend struct CachedStencilRefAndTime;
+
+  template <ScriptStatus status>
+  static Matcher<CachedStencil*>* Match() {
+    static CachedStencil::StatusMatcher matcher{status};
+    return &matcher;
+  }
+
+  static constexpr int MAX_MAINTHREAD_DECODE_SIZE = 50 * 1024;
+
+  explicit ScriptPreloader(AutoMemMap* cacheData);
+
+  void Cleanup();
+
+  void FinishPendingParses(MonitorAutoLock& aMal);
+  void InvalidateCache() MOZ_REQUIRES(sMainThreadCapability);
+
+  Result<Ok, nsresult> OpenCache();
+
+  Result<Ok, nsresult> WriteCache() MOZ_REQUIRES(mSaveMonitor.Lock());
+
+  void StartCacheWriteIfReady();
+
+  void StartCacheWrite();
+
+  void PrepareCacheWrite();
+
+  void PrepareCacheWriteInternal();
+
+  void CacheWriteComplete();
+
+  void FinishContentStartup();
+
+  bool WillWriteScripts();
+
+  Result<nsCOMPtr<nsIFile>, nsresult> GetCacheFile(const nsAString& suffix);
+
+  already_AddRefed<JS::Stencil> WaitForCachedStencil(
+      JSContext* cx, const JS::ReadOnlyDecodeOptions& options,
+      CachedStencil* script);
+
+  void StartDecodeTask(JS::Handle<JSObject*> scope);
+
+ private:
+  bool StartDecodeTask(const JS::ReadOnlyDecodeOptions& decodeOptions,
+                       Vector<JS::TranscodeSource>&& decodingSources);
+
+  class DecodeTask : public Runnable {
+    ScriptPreloader* mPreloader;
+    JS::OwningDecodeOptions mDecodeOptions;
+    Vector<JS::TranscodeSource> mDecodingSources;
+
+   public:
+    DecodeTask(ScriptPreloader* preloader,
+               const JS::ReadOnlyDecodeOptions& decodeOptions,
+               Vector<JS::TranscodeSource>&& decodingSources)
+        : Runnable("ScriptPreloaderDecodeTask"),
+          mPreloader(preloader),
+          mDecodingSources(std::move(decodingSources)) {
+      mDecodeOptions.infallibleCopy(decodeOptions);
+    }
+
+    NS_IMETHOD Run() override;
+  };
+
+  friend class DecodeTask;
+
+  void onDecodedStencilQueued();
+  void OnDecodeTaskFinished();
+  void OnDecodeTaskFailed();
+
+ public:
+  void FinishOffThreadDecode();
+  void DoFinishOffThreadDecode();
+
+  already_AddRefed<nsIAsyncShutdownClient> GetShutdownBarrier();
+
+  size_t ShallowHeapSizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) {
+    return (mallocSizeOf(this) +
+            mScripts.ShallowSizeOfExcludingThis(mallocSizeOf) +
+            mallocSizeOf(mSaveThread.get()) + mallocSizeOf(mProfD.get()));
+  }
+
+  using ScriptHash = nsClassHashtable<nsCStringHashKey, CachedStencil>;
+
+  template <ScriptStatus status>
+  static size_t SizeOfHashEntries(ScriptHash& scripts,
+                                  mozilla::MallocSizeOf mallocSizeOf) {
+    size_t size = 0;
+    for (auto elem : IterHash(scripts, Match<status>())) {
+      size += elem->HeapSizeOfIncludingThis(mallocSizeOf);
+    }
+    return size;
+  }
+
+  ScriptHash mScripts;
+
+  bool mStartupFinished = false;
+
+  bool mStartupHasAdvancedToCacheWritingStage = false;
+
+  bool mCacheInitialized = false;
+  bool mSaveComplete = false;
+  bool mDataPrepared = false;
+  bool mCacheInvalidated MOZ_GUARDED_BY(mSaveMonitor) = false;
+
+  LinkedList<CachedStencil> mDecodingScripts;
+
+  Maybe<SPSCQueue<RefPtr<JS::Stencil>>> mDecodedStencils;
+
+  bool mWaitingForDecode MOZ_GUARDED_BY(mMonitor) = false;
+
+  static ProcessType sProcessType;
+
+  EnumSet<ProcessType> mRequiredChildProcessStencils;
+
+  EnumSet<ProcessType> mRequestedChildProcessStencils;
+
+  EnumSet<ProcessType> mReceivedChildProcessStencils;
+
+  RefPtr<ScriptPreloader> mChildCache;
+  ScriptCacheChild* mChildActor = nullptr;
+
+  nsString mBaseName;
+  nsCString mContentStartupFinishedTopic;
+
+  nsCOMPtr<nsIFile> mProfD;
+  nsCOMPtr<nsIThread> mSaveThread;
+  nsCOMPtr<nsITimer> mSaveTimer;
+
+  AutoMemMap* mCacheData;
+
+  Monitor mMonitor MOZ_ACQUIRED_AFTER(mSaveMonitor.Lock());
+  MainThreadAndLockCapability<Monitor> mSaveMonitor;
+};
+
+}  
+
+#endif  // ScriptPreloader_h

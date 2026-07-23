@@ -1,0 +1,69 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_widget_GtkWidgets_h
+#define mozilla_widget_GtkWidgets_h
+
+#include <gtk/gtk.h>
+#include <cstdint>
+
+namespace mozilla::widget::GtkWidgets {
+
+enum class Type : uint32_t {
+  Button = 0,
+
+  Scrollbar,
+  ScrollbarContents,
+  ScrollbarTrough,
+  ScrollbarThumb,
+
+  TextView,
+  TextViewText,
+  TextViewTextSelection,
+
+  Tooltip,
+  TooltipBox,
+  TooltipBoxLabel,
+  Frame,
+  FrameBorder,
+  TreeView,
+  TreeHeaderCell,
+  Menupopup,
+  Menubar,
+  Menuitem,
+  MenubarItem,
+  Window,
+  HeaderBarFixed,
+  WindowContainer,
+  ScrolledWindow,
+  HeaderBar,
+  WindowDecoration,
+
+  Last = WindowDecoration,
+};
+
+static constexpr size_t kTypeCount = size_t(Type::Last) + 1;
+
+void Refresh();
+void Shutdown();
+
+GtkWidget* Get(Type);
+
+struct DrawingParams {
+  Type widget;
+  GdkRectangle rect{};
+  GtkStateFlags state = GTK_STATE_FLAG_NORMAL;
+  gint image_scale = 1;
+};
+void Draw(cairo_t* cr, const DrawingParams*);
+
+GtkStyleContext* GetStyle(Type, int aScale = 1,
+                          GtkStateFlags aStateFlags = GTK_STATE_FLAG_NORMAL);
+
+GtkStyleContext* CreateStyleForWidget(GtkWidget* aWidget,
+                                      GtkStyleContext* aParentStyle);
+
+}  
+
+#endif

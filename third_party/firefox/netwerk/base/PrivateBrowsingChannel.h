@@ -1,0 +1,102 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_PrivateBrowsingChannel_h_
+#define mozilla_net_PrivateBrowsingChannel_h_
+
+#include "nsIPrivateBrowsingChannel.h"
+#include "nsCOMPtr.h"
+#include "nsILoadGroup.h"
+#include "nsILoadContext.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsNetUtil.h"
+
+namespace mozilla {
+namespace net {
+
+template <class Channel>
+class PrivateBrowsingChannel : public nsIPrivateBrowsingChannel {
+ public:
+  PrivateBrowsingChannel()
+      : mPrivateBrowsingOverriden(false), mPrivateBrowsing(false) {}
+
+  NS_IMETHOD SetPrivate(bool aPrivate) override {
+    nsCOMPtr<nsILoadContext> loadContext;
+    NS_QueryNotificationCallbacks(static_cast<Channel*>(this), loadContext);
+    MOZ_ASSERT(!loadContext);
+    if (loadContext) {
+      return NS_ERROR_FAILURE;
+    }
+
+    mPrivateBrowsingOverriden = true;
+    mPrivateBrowsing = aPrivate;
+    return NS_OK;
+  }
+
+  NS_IMETHOD GetIsChannelPrivate(bool* aResult) override {
+    NS_ENSURE_ARG_POINTER(aResult);
+    *aResult = mPrivateBrowsing;
+    return NS_OK;
+  }
+
+  NS_IMETHOD IsPrivateModeOverriden(bool* aValue, bool* aResult) override {
+    NS_ENSURE_ARG_POINTER(aValue);
+    NS_ENSURE_ARG_POINTER(aResult);
+    *aResult = mPrivateBrowsingOverriden;
+    if (mPrivateBrowsingOverriden) {
+      *aValue = mPrivateBrowsing;
+    }
+    return NS_OK;
+  }
+
+  void UpdatePrivateBrowsing() {
+    if (mPrivateBrowsing) {
+      return;
+    }
+
+    auto channel = static_cast<Channel*>(this);
+
+    nsCOMPtr<nsILoadContext> loadContext;
+    NS_QueryNotificationCallbacks(channel, loadContext);
+    if (loadContext) {
+      mPrivateBrowsing = loadContext->UsePrivateBrowsing();
+      return;
+    }
+
+    nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+    OriginAttributes attrs = loadInfo->GetOriginAttributes();
+    mPrivateBrowsing = attrs.IsPrivateBrowsing();
+  }
+
+  bool CanSetCallbacks(nsIInterfaceRequestor* aCallbacks) const {
+    if (!aCallbacks) {
+      return true;
+    }
+    nsCOMPtr<nsILoadContext> loadContext = do_GetInterface(aCallbacks);
+    if (!loadContext) {
+      return true;
+    }
+    MOZ_ASSERT(!mPrivateBrowsingOverriden);
+    return !mPrivateBrowsingOverriden;
+  }
+
+  bool CanSetLoadGroup(nsILoadGroup* aLoadGroup) const {
+    if (!aLoadGroup) {
+      return true;
+    }
+    nsCOMPtr<nsIInterfaceRequestor> callbacks;
+    aLoadGroup->GetNotificationCallbacks(getter_AddRefs(callbacks));
+    return CanSetCallbacks(callbacks);
+  }
+
+ protected:
+  bool mPrivateBrowsingOverriden;
+  bool mPrivateBrowsing;
+};
+
+}  
+}  
+
+#endif

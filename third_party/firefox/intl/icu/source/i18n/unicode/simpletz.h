@@ -1,0 +1,268 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ ********************************************************************************
+ * Copyright (C) 1997-2013, International Business Machines                     *
+ * Corporation and others. All Rights Reserved.                                 *
+ ********************************************************************************
+ *
+ * File SIMPLETZ.H
+ *
+ * Modification History:
+ *
+ *   Date        Name        Description
+ *   04/21/97    aliu        Overhauled header.
+ *   08/10/98    stephen     JDK 1.2 sync
+ *                           Added setStartRule() / setEndRule() overloads
+ *                           Added hasSameRules()
+ *   09/02/98    stephen     Added getOffset(monthLen)
+ *                           Changed getOffset() to take UErrorCode
+ *   07/09/99    stephen     Removed millisPerHour (unused, for HP compiler)
+ *   12/02/99    aliu        Added TimeMode and constructor and setStart/EndRule
+ *                           methods that take TimeMode. Added to docs.
+ ********************************************************************************
+ */
+
+#ifndef SIMPLETZ_H
+#define SIMPLETZ_H
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+ 
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/basictz.h"
+
+U_NAMESPACE_BEGIN
+
+class InitialTimeZoneRule;
+class TimeZoneTransition;
+class AnnualTimeZoneRule;
+
+class U_I18N_API SimpleTimeZone: public BasicTimeZone {
+public:
+
+    enum TimeMode {
+        WALL_TIME = 0,
+        STANDARD_TIME,
+        UTC_TIME
+    };
+
+    SimpleTimeZone(const SimpleTimeZone& source);
+
+    SimpleTimeZone& operator=(const SimpleTimeZone& right);
+
+    virtual ~SimpleTimeZone();
+
+    virtual bool operator==(const TimeZone& that) const override;
+
+    SimpleTimeZone(int32_t rawOffsetGMT, const UnicodeString& ID);
+
+    SimpleTimeZone(int32_t rawOffsetGMT, const UnicodeString& ID,
+        int8_t savingsStartMonth, int8_t savingsStartDayOfWeekInMonth,
+        int8_t savingsStartDayOfWeek, int32_t savingsStartTime,
+        int8_t savingsEndMonth, int8_t savingsEndDayOfWeekInMonth,
+        int8_t savingsEndDayOfWeek, int32_t savingsEndTime,
+        UErrorCode& status);
+    SimpleTimeZone(int32_t rawOffsetGMT, const UnicodeString& ID,
+        int8_t savingsStartMonth, int8_t savingsStartDayOfWeekInMonth,
+        int8_t savingsStartDayOfWeek, int32_t savingsStartTime,
+        int8_t savingsEndMonth, int8_t savingsEndDayOfWeekInMonth,
+        int8_t savingsEndDayOfWeek, int32_t savingsEndTime,
+        int32_t savingsDST, UErrorCode& status);
+
+    SimpleTimeZone(int32_t rawOffsetGMT, const UnicodeString& ID,
+        int8_t savingsStartMonth, int8_t savingsStartDayOfWeekInMonth,
+        int8_t savingsStartDayOfWeek, int32_t savingsStartTime,
+        TimeMode savingsStartTimeMode,
+        int8_t savingsEndMonth, int8_t savingsEndDayOfWeekInMonth,
+        int8_t savingsEndDayOfWeek, int32_t savingsEndTime, TimeMode savingsEndTimeMode,
+        int32_t savingsDST, UErrorCode& status);
+
+    void setStartYear(int32_t year);
+
+    void setStartRule(int32_t month, int32_t dayOfWeekInMonth, int32_t dayOfWeek,
+                      int32_t time, UErrorCode& status);
+    void setStartRule(int32_t month, int32_t dayOfWeekInMonth, int32_t dayOfWeek,
+                      int32_t time, TimeMode mode, UErrorCode& status);
+
+    void setStartRule(int32_t month, int32_t dayOfMonth, int32_t time,
+                      UErrorCode& status);
+    void setStartRule(int32_t month, int32_t dayOfMonth, int32_t time,
+                      TimeMode mode, UErrorCode& status);
+
+    void setStartRule(int32_t month, int32_t dayOfMonth, int32_t dayOfWeek,
+                      int32_t time, UBool after, UErrorCode& status);
+    void setStartRule(int32_t month, int32_t dayOfMonth, int32_t dayOfWeek,
+                      int32_t time, TimeMode mode, UBool after, UErrorCode& status);
+
+    void setEndRule(int32_t month, int32_t dayOfWeekInMonth, int32_t dayOfWeek,
+                    int32_t time, UErrorCode& status);
+
+    void setEndRule(int32_t month, int32_t dayOfWeekInMonth, int32_t dayOfWeek,
+                    int32_t time, TimeMode mode, UErrorCode& status);
+
+    void setEndRule(int32_t month, int32_t dayOfMonth, int32_t time, UErrorCode& status);
+
+    void setEndRule(int32_t month, int32_t dayOfMonth, int32_t time,
+                    TimeMode mode, UErrorCode& status);
+
+    void setEndRule(int32_t month, int32_t dayOfMonth, int32_t dayOfWeek,
+                    int32_t time, UBool after, UErrorCode& status);
+
+    void setEndRule(int32_t month, int32_t dayOfMonth, int32_t dayOfWeek,
+                    int32_t time, TimeMode mode, UBool after, UErrorCode& status);
+
+    virtual int32_t getOffset(uint8_t era, int32_t year, int32_t month, int32_t day,
+                              uint8_t dayOfWeek, int32_t millis, UErrorCode& status) const override;
+
+    virtual int32_t getOffset(uint8_t era, int32_t year, int32_t month, int32_t day,
+                           uint8_t dayOfWeek, int32_t milliseconds,
+                           int32_t monthLength, UErrorCode& status) const override;
+    virtual int32_t getOffset(uint8_t era, int32_t year, int32_t month, int32_t day,
+                              uint8_t dayOfWeek, int32_t milliseconds,
+                              int32_t monthLength, int32_t prevMonthLength,
+                              UErrorCode& status) const;
+
+    virtual void getOffset(UDate date, UBool local, int32_t& rawOffset,
+                           int32_t& dstOffset, UErrorCode& ec) const override;
+
+    virtual void getOffsetFromLocal(
+        UDate date, UTimeZoneLocalOption nonExistingTimeOpt,
+        UTimeZoneLocalOption duplicatedTimeOpt,
+        int32_t& rawOffset, int32_t& dstOffset, UErrorCode& status) const override;
+
+    virtual int32_t getRawOffset() const override;
+
+    virtual void setRawOffset(int32_t offsetMillis) override;
+
+    void setDSTSavings(int32_t millisSavedDuringDST, UErrorCode& status);
+
+    virtual int32_t getDSTSavings() const override;
+
+    virtual UBool useDaylightTime() const override;
+
+#ifndef U_FORCE_HIDE_DEPRECATED_API
+    virtual UBool inDaylightTime(UDate date, UErrorCode& status) const override;
+#endif  // U_FORCE_HIDE_DEPRECATED_API
+
+    UBool hasSameRules(const TimeZone& other) const override;
+
+    virtual SimpleTimeZone* clone() const override;
+
+    virtual UBool getNextTransition(UDate base, UBool inclusive, TimeZoneTransition& result) const override;
+
+    virtual UBool getPreviousTransition(UDate base, UBool inclusive, TimeZoneTransition& result) const override;
+
+    virtual int32_t countTransitionRules(UErrorCode& status) const override;
+
+    virtual void getTimeZoneRules(const InitialTimeZoneRule*& initial,
+        const TimeZoneRule* trsrules[], int32_t& trscount, UErrorCode& status) const override;
+
+
+public:
+
+    virtual UClassID getDynamicClassID() const override;
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+private:
+    enum EMode
+    {
+        DOM_MODE = 1,
+        DOW_IN_MONTH_MODE,
+        DOW_GE_DOM_MODE,
+        DOW_LE_DOM_MODE
+    };
+
+    SimpleTimeZone() = delete; 
+
+    void construct(int32_t rawOffsetGMT,
+                   int8_t startMonth, int8_t startDay, int8_t startDayOfWeek,
+                   int32_t startTime, TimeMode startTimeMode,
+                   int8_t endMonth, int8_t endDay, int8_t endDayOfWeek,
+                   int32_t endTime, TimeMode endTimeMode,
+                   int32_t dstSavings, UErrorCode& status);
+
+    static int32_t compareToRule(int8_t month, int8_t monthLen, int8_t prevMonthLen,
+                                 int8_t dayOfMonth,
+                                 int8_t dayOfWeek, int32_t millis, int32_t millisDelta,
+                                 EMode ruleMode, int8_t ruleMonth, int8_t ruleDayOfWeek,
+                                 int8_t ruleDay, int32_t ruleMillis);
+
+    void decodeRules(UErrorCode& status);
+    void decodeStartRule(UErrorCode& status);
+    void decodeEndRule(UErrorCode& status);
+
+    int8_t startMonth, startDay, startDayOfWeek;   
+    int32_t startTime;
+    TimeMode startTimeMode, endTimeMode; 
+    int8_t endMonth, endDay, endDayOfWeek; 
+    int32_t endTime;
+    int32_t startYear;  
+    int32_t rawOffset;  
+    UBool useDaylight; 
+    static const int8_t STATICMONTHLENGTH[12]; 
+    EMode startMode, endMode;   
+
+    int32_t dstSavings;
+
+    void checkTransitionRules(UErrorCode& status) const;
+    void initTransitionRules(UErrorCode& status);
+    void clearTransitionRules();
+    void deleteTransitionRules();
+    UBool   transitionRulesInitialized;
+    InitialTimeZoneRule*    initialRule;
+    TimeZoneTransition*     firstTransition;
+    AnnualTimeZoneRule*     stdRule;
+    AnnualTimeZoneRule*     dstRule;
+};
+
+inline void SimpleTimeZone::setStartRule(int32_t month, int32_t dayOfWeekInMonth,
+                                         int32_t dayOfWeek,
+                                         int32_t time, UErrorCode& status) {
+    setStartRule(month, dayOfWeekInMonth, dayOfWeek, time, WALL_TIME, status);
+}
+
+inline void SimpleTimeZone::setStartRule(int32_t month, int32_t dayOfMonth,
+                                         int32_t time,
+                                         UErrorCode& status) {
+    setStartRule(month, dayOfMonth, time, WALL_TIME, status);
+}
+
+inline void SimpleTimeZone::setStartRule(int32_t month, int32_t dayOfMonth,
+                                         int32_t dayOfWeek,
+                                         int32_t time, UBool after, UErrorCode& status) {
+    setStartRule(month, dayOfMonth, dayOfWeek, time, WALL_TIME, after, status);
+}
+
+inline void SimpleTimeZone::setEndRule(int32_t month, int32_t dayOfWeekInMonth,
+                                       int32_t dayOfWeek,
+                                       int32_t time, UErrorCode& status) {
+    setEndRule(month, dayOfWeekInMonth, dayOfWeek, time, WALL_TIME, status);
+}
+
+inline void SimpleTimeZone::setEndRule(int32_t month, int32_t dayOfMonth,
+                                       int32_t time, UErrorCode& status) {
+    setEndRule(month, dayOfMonth, time, WALL_TIME, status);
+}
+
+inline void SimpleTimeZone::setEndRule(int32_t month, int32_t dayOfMonth, int32_t dayOfWeek,
+                                       int32_t time, UBool after, UErrorCode& status) {
+    setEndRule(month, dayOfMonth, dayOfWeek, time, WALL_TIME, after, status);
+}
+
+inline void
+SimpleTimeZone::getOffset(UDate date, UBool local, int32_t& rawOffsetRef,
+                          int32_t& dstOffsetRef, UErrorCode& ec) const {
+    TimeZone::getOffset(date, local, rawOffsetRef, dstOffsetRef, ec);
+}
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // _SIMPLETZ

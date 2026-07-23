@@ -1,0 +1,472 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/MathAlgorithms.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/NativeKeyBindingsType.h"
+#include "mozilla/StaticPrefs_ui.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/WritingModes.h"
+
+#include "NativeKeyBindings.h"
+#include "nsString.h"
+#include "nsGtkKeyUtils.h"
+#include "nsWindow.h"
+
+#include <gtk/gtk.h>
+#include <gdk/gdkkeysyms.h>
+#include <gdk/gdkkeysyms-compat.h>
+#include <gdk/gdk.h>
+
+namespace mozilla {
+namespace widget {
+
+static nsTArray<CommandInt>* gCurrentCommands = nullptr;
+static bool gHandled = false;
+
+inline void AddCommand(Command aCommand) {
+  MOZ_ASSERT(gCurrentCommands);
+  gCurrentCommands->AppendElement(static_cast<CommandInt>(aCommand));
+}
+
+static void copy_clipboard_cb(GtkWidget* w, gpointer user_data) {
+  AddCommand(Command::Copy);
+  g_signal_stop_emission_by_name(w, "copy_clipboard");
+  gHandled = true;
+}
+
+static void cut_clipboard_cb(GtkWidget* w, gpointer user_data) {
+  AddCommand(Command::Cut);
+  g_signal_stop_emission_by_name(w, "cut_clipboard");
+  gHandled = true;
+}
+
+
+static const Command sDeleteCommands[][2] = {
+    {Command::DeleteCharBackward, Command::DeleteCharForward},
+    {Command::DeleteWordBackward, Command::DeleteWordForward},
+    {Command::DeleteWordBackward, Command::DeleteWordForward},
+    {Command::DeleteToBeginningOfLine, Command::DeleteToEndOfLine},
+    {Command::DeleteToBeginningOfLine, Command::DeleteToEndOfLine},
+    {Command::DeleteToBeginningOfLine, Command::DeleteToEndOfLine},
+    {Command::DeleteToBeginningOfLine, Command::DeleteToEndOfLine},
+    {Command::DoNothing, Command::DoNothing}  
+};
+
+static void delete_from_cursor_cb(GtkWidget* w, GtkDeleteType del_type,
+                                  gint count, gpointer user_data) {
+  g_signal_stop_emission_by_name(w, "delete_from_cursor");
+  if (count == 0) {
+    return;
+  }
+
+  bool forward = count > 0;
+
+  if (del_type == GTK_DELETE_PARAGRAPH_ENDS && forward && GTK_IS_ENTRY(w) &&
+      !gtk_check_version(3, 14, 1) && gtk_check_version(3, 17, 9)) {
+    GtkStyleContext* context = gtk_widget_get_style_context(w);
+    GtkStateFlags flags = gtk_widget_get_state_flags(w);
+
+    GPtrArray* array;
+    gtk_style_context_get(context, flags, "gtk-key-bindings", &array, nullptr);
+    if (!array) return;
+    g_ptr_array_unref(array);
+  }
+
+  gHandled = true;
+  if (uint32_t(del_type) >= std::size(sDeleteCommands)) {
+    return;
+  }
+
+  if (del_type == GTK_DELETE_WORDS) {
+    if (forward) {
+      AddCommand(Command::WordNext);
+      AddCommand(Command::WordPrevious);
+    } else {
+      AddCommand(Command::WordPrevious);
+      AddCommand(Command::WordNext);
+    }
+  } else if (del_type == GTK_DELETE_DISPLAY_LINES ||
+             del_type == GTK_DELETE_PARAGRAPHS) {
+    if (forward) {
+      AddCommand(Command::BeginLine);
+    } else {
+      AddCommand(Command::EndLine);
+    }
+  }
+
+  Command command = sDeleteCommands[del_type][forward];
+  if (command == Command::DoNothing) {
+    return;
+  }
+
+  unsigned int absCount = Abs(count);
+  for (unsigned int i = 0; i < absCount; ++i) {
+    AddCommand(command);
+  }
+}
+
+static const Command sMoveCommands[][2][2] = {
+    {
+     {Command::CharPrevious, Command::CharNext},
+     {Command::SelectCharPrevious, Command::SelectCharNext}},
+    {
+     {Command::CharPrevious, Command::CharNext},
+     {Command::SelectCharPrevious, Command::SelectCharNext}},
+    {
+     {Command::WordPrevious, Command::WordNext},
+     {Command::SelectLeft2, Command::SelectRight2}},
+    {
+     {Command::LinePrevious, Command::LineNext},
+     {Command::SelectLinePrevious, Command::SelectLineNext}},
+    {
+     {Command::BeginLine, Command::EndLine},
+     {Command::SelectBeginLine, Command::SelectEndLine}},
+    {
+     {Command::LinePrevious, Command::LineNext},
+     {Command::SelectLinePrevious, Command::SelectLineNext}},
+    {
+     {Command::BeginLine, Command::EndLine},
+     {Command::SelectBeginLine, Command::SelectEndLine}},
+    {
+     {Command::MovePageUp, Command::MovePageDown},
+     {Command::SelectPageUp, Command::SelectPageDown}},
+    {
+     {Command::MoveTop, Command::MoveBottom},
+     {Command::SelectTop, Command::SelectBottom}},
+    {
+     {Command::DoNothing, Command::DoNothing},
+     {Command::DoNothing, Command::DoNothing}}};
+
+static void move_cursor_cb(GtkWidget* w, GtkMovementStep step, gint count,
+                           gboolean extend_selection, gpointer user_data) {
+  g_signal_stop_emission_by_name(w, "move_cursor");
+  if (count == 0) {
+    return;
+  }
+
+  gHandled = true;
+  bool forward = count > 0;
+  if (uint32_t(step) >= std::size(sMoveCommands)) {
+    return;
+  }
+
+  Command command = sMoveCommands[step][extend_selection][forward];
+  if (command == Command::DoNothing) {
+    return;
+  }
+
+  unsigned int absCount = Abs(count);
+  for (unsigned int i = 0; i < absCount; ++i) {
+    AddCommand(command);
+  }
+}
+
+static void paste_clipboard_cb(GtkWidget* w, gpointer user_data) {
+  AddCommand(Command::Paste);
+  g_signal_stop_emission_by_name(w, "paste_clipboard");
+  gHandled = true;
+}
+
+static void insert_emoji_cb(GtkWidget* w) {
+  RefPtr<nsWindow> window = nsWindow::GetFocusedWindow();
+  if (!window) {
+    return;
+  }
+  window->InsertEmoji();
+}
+
+static void select_all_cb(GtkWidget* aWidget, gboolean aSelect,
+                          gpointer aUserData) {
+  if (aSelect) {
+    AddCommand(Command::SelectAll);
+  }
+  g_signal_stop_emission_by_name(aWidget, "select_all");
+  gHandled |= aSelect;
+}
+
+NativeKeyBindings* NativeKeyBindings::sInstanceForSingleLineEditor = nullptr;
+NativeKeyBindings* NativeKeyBindings::sInstanceForMultiLineEditor = nullptr;
+
+NativeKeyBindings* NativeKeyBindings::GetInstance(NativeKeyBindingsType aType) {
+  switch (aType) {
+    case NativeKeyBindingsType::SingleLineEditor:
+      if (!sInstanceForSingleLineEditor) {
+        sInstanceForSingleLineEditor = new NativeKeyBindings();
+        sInstanceForSingleLineEditor->Init(aType);
+      }
+      return sInstanceForSingleLineEditor;
+
+    default:
+      MOZ_FALLTHROUGH_ASSERT("aType is invalid or not yet implemented");
+    case NativeKeyBindingsType::MultiLineEditor:
+    case NativeKeyBindingsType::RichTextEditor:
+      if (!sInstanceForMultiLineEditor) {
+        sInstanceForMultiLineEditor = new NativeKeyBindings();
+        sInstanceForMultiLineEditor->Init(aType);
+      }
+      return sInstanceForMultiLineEditor;
+  }
+}
+
+void NativeKeyBindings::Shutdown() {
+  delete sInstanceForSingleLineEditor;
+  sInstanceForSingleLineEditor = nullptr;
+  delete sInstanceForMultiLineEditor;
+  sInstanceForMultiLineEditor = nullptr;
+}
+
+void NativeKeyBindings::Init(NativeKeyBindingsType aType) {
+  switch (aType) {
+    case NativeKeyBindingsType::SingleLineEditor:
+      mNativeTarget = gtk_entry_new();
+      break;
+    default:
+      mNativeTarget = gtk_text_view_new();
+      g_signal_connect(mNativeTarget, "select_all", G_CALLBACK(select_all_cb),
+                       this);
+      break;
+  }
+  g_object_ref_sink(mNativeTarget);
+
+  g_signal_connect(mNativeTarget, "copy_clipboard",
+                   G_CALLBACK(copy_clipboard_cb), this);
+  g_signal_connect(mNativeTarget, "cut_clipboard", G_CALLBACK(cut_clipboard_cb),
+                   this);
+  g_signal_connect(mNativeTarget, "delete_from_cursor",
+                   G_CALLBACK(delete_from_cursor_cb), this);
+  g_signal_connect(mNativeTarget, "move_cursor", G_CALLBACK(move_cursor_cb),
+                   this);
+  g_signal_connect(mNativeTarget, "paste_clipboard",
+                   G_CALLBACK(paste_clipboard_cb), this);
+  g_signal_connect(mNativeTarget, "insert-emoji", G_CALLBACK(insert_emoji_cb),
+                   this);
+}
+
+NativeKeyBindings::~NativeKeyBindings() {
+  gtk_widget_destroy(mNativeTarget);
+  g_object_unref(mNativeTarget);
+}
+
+void NativeKeyBindings::GetEditCommands(const WidgetKeyboardEvent& aEvent,
+                                        const Maybe<WritingMode>& aWritingMode,
+                                        nsTArray<CommandInt>& aCommands) {
+  MOZ_ASSERT(!aEvent.mFlags.mIsSynthesizedForTests);
+  MOZ_ASSERT(aCommands.IsEmpty());
+
+  if (!aEvent.mNativeKeyEvent) {
+    return;
+  }
+
+  guint keyval;
+  if (aEvent.mCharCode) {
+    keyval = gdk_unicode_to_keyval(aEvent.mCharCode);
+  } else if (aWritingMode.isSome() && aEvent.NeedsToRemapNavigationKey() &&
+             aWritingMode.ref().IsVertical()) {
+    uint32_t remappedGeckoKeyCode =
+        aEvent.GetRemappedKeyCode(aWritingMode.ref());
+    switch (remappedGeckoKeyCode) {
+      case NS_VK_UP:
+        keyval = GDK_Up;
+        break;
+      case NS_VK_DOWN:
+        keyval = GDK_Down;
+        break;
+      case NS_VK_LEFT:
+        keyval = GDK_Left;
+        break;
+      case NS_VK_RIGHT:
+        keyval = GDK_Right;
+        break;
+      default:
+        MOZ_ASSERT_UNREACHABLE("Add a case for the new remapped key");
+        return;
+    }
+  } else {
+    keyval = static_cast<GdkEventKey*>(aEvent.mNativeKeyEvent)->keyval;
+  }
+
+  if (GetEditCommandsInternal(aEvent, aCommands, keyval)) {
+    return;
+  }
+
+  for (uint32_t i = 0; i < aEvent.mAlternativeCharCodes.Length(); ++i) {
+    uint32_t ch = aEvent.IsShift()
+                      ? aEvent.mAlternativeCharCodes[i].mShiftedCharCode
+                      : aEvent.mAlternativeCharCodes[i].mUnshiftedCharCode;
+    if (ch && ch != aEvent.mCharCode) {
+      keyval = gdk_unicode_to_keyval(ch);
+      if (GetEditCommandsInternal(aEvent, aCommands, keyval)) {
+        return;
+      }
+    }
+  }
+
+  if (aCommands.IsEmpty() && this == sInstanceForSingleLineEditor &&
+      StaticPrefs::ui_key_use_select_all_in_single_line_editor()) {
+    if (NativeKeyBindings* bindingsForMultilineEditor =
+            GetInstance(NativeKeyBindingsType::MultiLineEditor)) {
+      bindingsForMultilineEditor->GetEditCommands(aEvent, aWritingMode,
+                                                  aCommands);
+      if (aCommands.Length() == 1u &&
+          aCommands[0u] == static_cast<CommandInt>(Command::SelectAll)) {
+        return;
+      }
+      aCommands.Clear();
+    }
+  }
+
+}
+
+bool NativeKeyBindings::GetEditCommandsInternal(
+    const WidgetKeyboardEvent& aEvent, nsTArray<CommandInt>& aCommands,
+    guint aKeyval) {
+  guint modifiers = static_cast<GdkEventKey*>(aEvent.mNativeKeyEvent)->state;
+
+  gCurrentCommands = &aCommands;
+
+  gHandled = false;
+  gtk_bindings_activate(G_OBJECT(mNativeTarget), aKeyval,
+                        GdkModifierType(modifiers));
+
+  gCurrentCommands = nullptr;
+
+  return gHandled;
+}
+
+void NativeKeyBindings::GetEditCommandsForTests(
+    NativeKeyBindingsType aType, const WidgetKeyboardEvent& aEvent,
+    const Maybe<WritingMode>& aWritingMode, nsTArray<CommandInt>& aCommands) {
+  MOZ_DIAGNOSTIC_ASSERT(aEvent.IsTrusted());
+
+  if (aEvent.IsAlt() || aEvent.IsMeta()) {
+    return;
+  }
+
+  static const size_t kBackward = 0;
+  static const size_t kForward = 1;
+  const size_t extentSelection = aEvent.IsShift() ? 1 : 0;
+  Command command = Command::DoNothing;
+  const KeyNameIndex remappedKeyNameIndex =
+      aWritingMode.isSome() ? aEvent.GetRemappedKeyNameIndex(aWritingMode.ref())
+                            : aEvent.mKeyNameIndex;
+  switch (remappedKeyNameIndex) {
+    case KEY_NAME_INDEX_USE_STRING:
+      switch (aEvent.PseudoCharCode()) {
+        case 'a':
+        case 'A':
+          if (aEvent.IsControl()) {
+            command = Command::SelectAll;
+          }
+          break;
+        case 'c':
+        case 'C':
+          if (aEvent.IsControl() && !aEvent.IsShift()) {
+            command = Command::Copy;
+          }
+          break;
+        case 'u':
+        case 'U':
+          if (aType == NativeKeyBindingsType::SingleLineEditor &&
+              aEvent.IsControl() && !aEvent.IsShift()) {
+            command = sDeleteCommands[GTK_DELETE_PARAGRAPH_ENDS][kBackward];
+          }
+          break;
+        case 'v':
+        case 'V':
+          if (aEvent.IsControl() && !aEvent.IsShift()) {
+            command = Command::Paste;
+          }
+          break;
+        case 'x':
+        case 'X':
+          if (aEvent.IsControl() && !aEvent.IsShift()) {
+            command = Command::Cut;
+          }
+          break;
+        case '/':
+          if (aEvent.IsControl() && !aEvent.IsShift()) {
+            command = Command::SelectAll;
+          }
+          break;
+        default:
+          break;
+      }
+      break;
+    case KEY_NAME_INDEX_Insert:
+      if (aEvent.IsControl() && !aEvent.IsShift()) {
+        command = Command::Copy;
+      } else if (aEvent.IsShift() && !aEvent.IsControl()) {
+        command = Command::Paste;
+      }
+      break;
+    case KEY_NAME_INDEX_Delete:
+      if (aEvent.IsShift()) {
+        command = Command::Cut;
+        break;
+      }
+      [[fallthrough]];
+    case KEY_NAME_INDEX_Backspace: {
+      const size_t direction =
+          remappedKeyNameIndex == KEY_NAME_INDEX_Delete ? kForward : kBackward;
+      const GtkDeleteType amount =
+          aEvent.IsControl() && aEvent.IsShift()
+              ? GTK_DELETE_PARAGRAPH_ENDS
+              : (aEvent.IsControl() ? GTK_DELETE_WORD_ENDS : GTK_DELETE_CHARS);
+      command = sDeleteCommands[amount][direction];
+      break;
+    }
+    case KEY_NAME_INDEX_ArrowLeft:
+    case KEY_NAME_INDEX_ArrowRight: {
+      const size_t direction = remappedKeyNameIndex == KEY_NAME_INDEX_ArrowRight
+                                   ? kForward
+                                   : kBackward;
+      const GtkMovementStep amount = aEvent.IsControl()
+                                         ? GTK_MOVEMENT_WORDS
+                                         : GTK_MOVEMENT_VISUAL_POSITIONS;
+      command = sMoveCommands[amount][extentSelection][direction];
+      break;
+    }
+    case KEY_NAME_INDEX_ArrowUp:
+    case KEY_NAME_INDEX_ArrowDown: {
+      const size_t direction = remappedKeyNameIndex == KEY_NAME_INDEX_ArrowDown
+                                   ? kForward
+                                   : kBackward;
+      const GtkMovementStep amount = aEvent.IsControl()
+                                         ? GTK_MOVEMENT_PARAGRAPHS
+                                         : GTK_MOVEMENT_DISPLAY_LINES;
+      command = sMoveCommands[amount][extentSelection][direction];
+      break;
+    }
+    case KEY_NAME_INDEX_Home:
+    case KEY_NAME_INDEX_End: {
+      const size_t direction =
+          remappedKeyNameIndex == KEY_NAME_INDEX_End ? kForward : kBackward;
+      const GtkMovementStep amount = aEvent.IsControl()
+                                         ? GTK_MOVEMENT_BUFFER_ENDS
+                                         : GTK_MOVEMENT_DISPLAY_LINE_ENDS;
+      command = sMoveCommands[amount][extentSelection][direction];
+      break;
+    }
+    case KEY_NAME_INDEX_PageUp:
+    case KEY_NAME_INDEX_PageDown: {
+      const size_t direction = remappedKeyNameIndex == KEY_NAME_INDEX_PageDown
+                                   ? kForward
+                                   : kBackward;
+      const GtkMovementStep amount = aEvent.IsControl()
+                                         ? GTK_MOVEMENT_HORIZONTAL_PAGES
+                                         : GTK_MOVEMENT_PAGES;
+      command = sMoveCommands[amount][extentSelection][direction];
+      break;
+    }
+    default:
+      break;
+  }
+  if (command != Command::DoNothing) {
+    aCommands.AppendElement(static_cast<CommandInt>(command));
+  }
+}
+
+}  
+}  

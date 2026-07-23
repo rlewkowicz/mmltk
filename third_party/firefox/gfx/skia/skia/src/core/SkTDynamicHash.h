@@ -1,0 +1,50 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkTDynamicHash_DEFINED)
+#define SkTDynamicHash_DEFINED
+
+#include "src/core/SkTHash.h"
+
+template <typename T,
+          typename Key,
+          typename Traits = T>
+class SkTDynamicHash {
+public:
+    SkTDynamicHash() {}
+
+
+    template <typename Fn>  
+    void foreach(Fn&& fn) {
+        fTable.foreach([&](T** entry) { fn(*entry); });
+    }
+    template <typename Fn>  
+    void foreach(Fn&& fn) const {
+        fTable.foreach([&](T* entry) { fn(*entry); });
+    }
+
+    int count() const { return fTable.count(); }
+
+    size_t approxBytesUsed() const { return fTable.approxBytesUsed(); }
+
+    T* find(const Key& key) const { return fTable.findOrNull(key); }
+
+    void add(T* entry) { fTable.set(entry); }
+    void remove(const Key& key) { fTable.remove(key); }
+
+    void rewind() { fTable.reset(); }
+    void reset () { fTable.reset(); }
+
+private:
+    struct AdaptedTraits {
+        static const Key& GetKey(T* entry) { return Traits::GetKey(*entry); }
+        static uint32_t Hash(const Key& key) { return Traits::Hash(key); }
+    };
+    skia_private::THashTable<T*, Key, AdaptedTraits> fTable;
+};
+
+#endif

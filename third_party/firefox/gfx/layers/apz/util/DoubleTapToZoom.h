@@ -1,0 +1,54 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_DoubleTapToZoom_h
+#define mozilla_layers_DoubleTapToZoom_h
+
+#include "Units.h"
+#include "mozilla/gfx/Matrix.h"
+
+template <class T>
+class RefPtr;
+
+namespace mozilla {
+namespace dom {
+class Document;
+}
+
+namespace layers {
+
+enum class CantZoomOutBehavior : int8_t { Nothing = 0, ZoomIn };
+
+struct ZoomTarget {
+  CSSRect targetRect;
+
+  CantZoomOutBehavior cantZoomOutBehavior = CantZoomOutBehavior::Nothing;
+
+  Maybe<CSSRect> elementBoundingRect;
+
+  Maybe<CSSPoint> documentRelativePointerPosition;
+};
+
+struct DoubleTapToZoomMetrics {
+  CSSRect mVisualViewport;
+  CSSRect mRootScrollableRect;
+  CSSToCSSMatrix4x4 mTransformMatrix;
+
+  bool operator==(const DoubleTapToZoomMetrics& aOther) const {
+    return mVisualViewport == aOther.mVisualViewport &&
+           mRootScrollableRect == aOther.mRootScrollableRect &&
+           mTransformMatrix == aOther.mTransformMatrix;
+  }
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const DoubleTapToZoomMetrics& aUpdate);
+};
+
+ZoomTarget CalculateRectToZoomTo(
+    const RefPtr<mozilla::dom::Document>& aInProcessRootContentDocument,
+    const CSSPoint& aPoint, const DoubleTapToZoomMetrics& aMetrics);
+
+}  
+}  
+
+#endif /* mozilla_layers_DoubleTapToZoom_h */

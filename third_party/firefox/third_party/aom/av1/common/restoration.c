@@ -1,0 +1,1279 @@
+/*
+ * Copyright (c) 2016, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ *
+ */
+
+#include <math.h>
+#include <stddef.h>
+
+#include "config/aom_config.h"
+#include "config/aom_scale_rtcd.h"
+
+#include "aom/internal/aom_codec_internal.h"
+#include "aom_mem/aom_mem.h"
+#include "aom_dsp/aom_dsp_common.h"
+#include "aom_mem/aom_mem.h"
+#include "aom_ports/mem.h"
+#include "aom_util/aom_pthread.h"
+
+#include "av1/common/av1_common_int.h"
+#include "av1/common/convolve.h"
+#include "av1/common/enums.h"
+#include "av1/common/resize.h"
+#include "av1/common/restoration.h"
+#include "av1/common/thread_common.h"
+
+const sgr_params_type av1_sgr_params[SGRPROJ_PARAMS] = {
+  { { 2, 1 }, { 140, 3236 } }, { { 2, 1 }, { 112, 2158 } },
+  { { 2, 1 }, { 93, 1618 } },  { { 2, 1 }, { 80, 1438 } },
+  { { 2, 1 }, { 70, 1295 } },  { { 2, 1 }, { 58, 1177 } },
+  { { 2, 1 }, { 47, 1079 } },  { { 2, 1 }, { 37, 996 } },
+  { { 2, 1 }, { 30, 925 } },   { { 2, 1 }, { 25, 863 } },
+  { { 0, 1 }, { -1, 2589 } },  { { 0, 1 }, { -1, 1618 } },
+  { { 0, 1 }, { -1, 1177 } },  { { 0, 1 }, { -1, 925 } },
+  { { 2, 0 }, { 56, -1 } },    { { 2, 0 }, { 22, -1 } },
+};
+
+void av1_get_upsampled_plane_size(const AV1_COMMON *cm, int is_uv, int *plane_w,
+                                  int *plane_h) {
+  int ss_x = is_uv && cm->seq_params->subsampling_x;
+  int ss_y = is_uv && cm->seq_params->subsampling_y;
+  *plane_w = ROUND_POWER_OF_TWO(cm->superres_upscaled_width, ss_x);
+  *plane_h = ROUND_POWER_OF_TWO(cm->height, ss_y);
+}
+
+int av1_lr_count_units(int unit_size, int plane_size) {
+  return AOMMAX((plane_size + (unit_size >> 1)) / unit_size, 1);
+}
+
+void av1_alloc_restoration_struct(AV1_COMMON *cm, RestorationInfo *rsi,
+                                  int is_uv) {
+  int plane_w, plane_h;
+  av1_get_upsampled_plane_size(cm, is_uv, &plane_w, &plane_h);
+
+  const int unit_size = rsi->restoration_unit_size;
+  const int horz_units = av1_lr_count_units(unit_size, plane_w);
+  const int vert_units = av1_lr_count_units(unit_size, plane_h);
+
+  rsi->num_rest_units = horz_units * vert_units;
+  rsi->horz_units = horz_units;
+  rsi->vert_units = vert_units;
+
+  aom_free(rsi->unit_info);
+  CHECK_MEM_ERROR(cm, rsi->unit_info,
+                  (RestorationUnitInfo *)aom_memalign(
+                      16, sizeof(*rsi->unit_info) * rsi->num_rest_units));
+}
+
+void av1_free_restoration_struct(RestorationInfo *rst_info) {
+  aom_free(rst_info->unit_info);
+  rst_info->unit_info = NULL;
+}
+
+
+void av1_loop_restoration_precal(void) {
+}
+
+static void extend_frame_lowbd(uint8_t *data, int width, int height,
+                               ptrdiff_t stride, int border_horz,
+                               int border_vert) {
+  uint8_t *data_p;
+  int i;
+  for (i = 0; i < height; ++i) {
+    data_p = data + i * stride;
+    memset(data_p - border_horz, data_p[0], border_horz);
+    memset(data_p + width, data_p[width - 1], border_horz);
+  }
+  data_p = data - border_horz;
+  for (i = -border_vert; i < 0; ++i) {
+    memcpy(data_p + i * stride, data_p, width + 2 * border_horz);
+  }
+  for (i = height; i < height + border_vert; ++i) {
+    memcpy(data_p + i * stride, data_p + (height - 1) * stride,
+           width + 2 * border_horz);
+  }
+}
+
+#if CONFIG_AV1_HIGHBITDEPTH
+static void extend_frame_highbd(uint16_t *data, int width, int height,
+                                ptrdiff_t stride, int border_horz,
+                                int border_vert) {
+  uint16_t *data_p;
+  int i, j;
+  for (i = 0; i < height; ++i) {
+    data_p = data + i * stride;
+    for (j = -border_horz; j < 0; ++j) data_p[j] = data_p[0];
+    for (j = width; j < width + border_horz; ++j) data_p[j] = data_p[width - 1];
+  }
+  data_p = data - border_horz;
+  for (i = -border_vert; i < 0; ++i) {
+    memcpy(data_p + i * stride, data_p,
+           (width + 2 * border_horz) * sizeof(uint16_t));
+  }
+  for (i = height; i < height + border_vert; ++i) {
+    memcpy(data_p + i * stride, data_p + (height - 1) * stride,
+           (width + 2 * border_horz) * sizeof(uint16_t));
+  }
+}
+
+static void copy_rest_unit_highbd(int width, int height, const uint16_t *src,
+                                  int src_stride, uint16_t *dst,
+                                  int dst_stride) {
+  for (int i = 0; i < height; ++i)
+    memcpy(dst + i * dst_stride, src + i * src_stride, width * sizeof(*dst));
+}
+#endif
+
+void av1_extend_frame(uint8_t *data, int width, int height, int stride,
+                      int border_horz, int border_vert, int highbd) {
+#if CONFIG_AV1_HIGHBITDEPTH
+  if (highbd) {
+    extend_frame_highbd(CONVERT_TO_SHORTPTR(data), width, height, stride,
+                        border_horz, border_vert);
+    return;
+  }
+#endif
+  (void)highbd;
+  extend_frame_lowbd(data, width, height, stride, border_horz, border_vert);
+}
+
+static void copy_rest_unit_lowbd(int width, int height, const uint8_t *src,
+                                 int src_stride, uint8_t *dst, int dst_stride) {
+  for (int i = 0; i < height; ++i)
+    memcpy(dst + i * dst_stride, src + i * src_stride, width);
+}
+
+static void copy_rest_unit(int width, int height, const uint8_t *src,
+                           int src_stride, uint8_t *dst, int dst_stride,
+                           int highbd) {
+#if CONFIG_AV1_HIGHBITDEPTH
+  if (highbd) {
+    copy_rest_unit_highbd(width, height, CONVERT_TO_SHORTPTR(src), src_stride,
+                          CONVERT_TO_SHORTPTR(dst), dst_stride);
+    return;
+  }
+#endif
+  (void)highbd;
+  copy_rest_unit_lowbd(width, height, src, src_stride, dst, dst_stride);
+}
+
+#define REAL_PTR(hbd, d) ((hbd) ? (uint8_t *)CONVERT_TO_SHORTPTR(d) : (d))
+
+static void get_stripe_boundary_info(const RestorationTileLimits *limits,
+                                     int plane_w, int plane_h, int ss_y,
+                                     int *copy_above, int *copy_below) {
+  (void)plane_w;
+
+  *copy_above = 1;
+  *copy_below = 1;
+
+  const int full_stripe_height = RESTORATION_PROC_UNIT_SIZE >> ss_y;
+  const int runit_offset = RESTORATION_UNIT_OFFSET >> ss_y;
+
+  const int first_stripe_in_plane = (limits->v_start == 0);
+  const int this_stripe_height =
+      full_stripe_height - (first_stripe_in_plane ? runit_offset : 0);
+  const int last_stripe_in_plane =
+      (limits->v_start + this_stripe_height >= plane_h);
+
+  if (first_stripe_in_plane) *copy_above = 0;
+  if (last_stripe_in_plane) *copy_below = 0;
+}
+
+static void setup_processing_stripe_boundary(
+    const RestorationTileLimits *limits, const RestorationStripeBoundaries *rsb,
+    int rsb_row, int use_highbd, int h, uint8_t *data8, int data_stride,
+    RestorationLineBuffers *rlbs, int copy_above, int copy_below, int opt) {
+  const int buf_stride = rsb->stripe_boundary_stride;
+  const int buf_x0_off = limits->h_start;
+  const int line_width =
+      (limits->h_end - limits->h_start) + 2 * RESTORATION_EXTRA_HORZ;
+  const int line_size = line_width << use_highbd;
+
+  const int data_x0 = limits->h_start - RESTORATION_EXTRA_HORZ;
+
+  if (!opt) {
+    if (copy_above) {
+      uint8_t *data8_tl = data8 + data_x0 + limits->v_start * data_stride;
+
+      for (int i = -RESTORATION_BORDER; i < 0; ++i) {
+        const int buf_row = rsb_row + AOMMAX(i + RESTORATION_CTX_VERT, 0);
+        const int buf_off = buf_x0_off + buf_row * buf_stride;
+        const uint8_t *buf =
+            rsb->stripe_boundary_above + (buf_off << use_highbd);
+        uint8_t *dst8 = data8_tl + i * data_stride;
+        memcpy(rlbs->tmp_save_above[i + RESTORATION_BORDER],
+               REAL_PTR(use_highbd, dst8), line_size);
+        memcpy(REAL_PTR(use_highbd, dst8), buf, line_size);
+      }
+    }
+
+    if (copy_below) {
+      const int stripe_end = limits->v_start + h;
+      uint8_t *data8_bl = data8 + data_x0 + stripe_end * data_stride;
+
+      for (int i = 0; i < RESTORATION_BORDER; ++i) {
+        const int buf_row = rsb_row + AOMMIN(i, RESTORATION_CTX_VERT - 1);
+        const int buf_off = buf_x0_off + buf_row * buf_stride;
+        const uint8_t *src =
+            rsb->stripe_boundary_below + (buf_off << use_highbd);
+
+        uint8_t *dst8 = data8_bl + i * data_stride;
+        memcpy(rlbs->tmp_save_below[i], REAL_PTR(use_highbd, dst8), line_size);
+        memcpy(REAL_PTR(use_highbd, dst8), src, line_size);
+      }
+    }
+  } else {
+    if (copy_above) {
+      uint8_t *data8_tl = data8 + data_x0 + limits->v_start * data_stride;
+
+      uint8_t *dst8 = data8_tl + (-RESTORATION_BORDER) * data_stride;
+      memcpy(rlbs->tmp_save_above[0], REAL_PTR(use_highbd, dst8), line_size);
+      memcpy(REAL_PTR(use_highbd, dst8),
+             REAL_PTR(use_highbd,
+                      data8_tl + (-RESTORATION_BORDER + 1) * data_stride),
+             line_size);
+    }
+
+    if (copy_below) {
+      const int stripe_end = limits->v_start + h;
+      uint8_t *data8_bl = data8 + data_x0 + stripe_end * data_stride;
+
+      uint8_t *dst8 = data8_bl + 2 * data_stride;
+      memcpy(rlbs->tmp_save_below[2], REAL_PTR(use_highbd, dst8), line_size);
+      memcpy(REAL_PTR(use_highbd, dst8),
+             REAL_PTR(use_highbd, data8_bl + (2 - 1) * data_stride), line_size);
+    }
+  }
+}
+
+static void restore_processing_stripe_boundary(
+    const RestorationTileLimits *limits, const RestorationLineBuffers *rlbs,
+    int use_highbd, int h, uint8_t *data8, int data_stride, int copy_above,
+    int copy_below, int opt) {
+  const int line_width =
+      (limits->h_end - limits->h_start) + 2 * RESTORATION_EXTRA_HORZ;
+  const int line_size = line_width << use_highbd;
+
+  const int data_x0 = limits->h_start - RESTORATION_EXTRA_HORZ;
+
+  if (!opt) {
+    if (copy_above) {
+      uint8_t *data8_tl = data8 + data_x0 + limits->v_start * data_stride;
+      for (int i = -RESTORATION_BORDER; i < 0; ++i) {
+        uint8_t *dst8 = data8_tl + i * data_stride;
+        memcpy(REAL_PTR(use_highbd, dst8),
+               rlbs->tmp_save_above[i + RESTORATION_BORDER], line_size);
+      }
+    }
+
+    if (copy_below) {
+      const int stripe_bottom = limits->v_start + h;
+      uint8_t *data8_bl = data8 + data_x0 + stripe_bottom * data_stride;
+
+      for (int i = 0; i < RESTORATION_BORDER; ++i) {
+        if (stripe_bottom + i >= limits->v_end + RESTORATION_BORDER) break;
+
+        uint8_t *dst8 = data8_bl + i * data_stride;
+        memcpy(REAL_PTR(use_highbd, dst8), rlbs->tmp_save_below[i], line_size);
+      }
+    }
+  } else {
+    if (copy_above) {
+      uint8_t *data8_tl = data8 + data_x0 + limits->v_start * data_stride;
+
+      uint8_t *dst8 = data8_tl + (-RESTORATION_BORDER) * data_stride;
+      memcpy(REAL_PTR(use_highbd, dst8), rlbs->tmp_save_above[0], line_size);
+    }
+
+    if (copy_below) {
+      const int stripe_bottom = limits->v_start + h;
+      uint8_t *data8_bl = data8 + data_x0 + stripe_bottom * data_stride;
+
+      if (stripe_bottom + 2 < limits->v_end + RESTORATION_BORDER) {
+        uint8_t *dst8 = data8_bl + 2 * data_stride;
+        memcpy(REAL_PTR(use_highbd, dst8), rlbs->tmp_save_below[2], line_size);
+      }
+    }
+  }
+}
+
+static void wiener_filter_stripe(const RestorationUnitInfo *rui,
+                                 int stripe_width, int stripe_height,
+                                 int procunit_width, const uint8_t *src,
+                                 int src_stride, uint8_t *dst, int dst_stride,
+                                 int32_t *tmpbuf, int bit_depth,
+                                 struct aom_internal_error_info *error_info) {
+  (void)tmpbuf;
+  (void)bit_depth;
+  (void)error_info;
+  assert(bit_depth == 8);
+  const WienerConvolveParams conv_params = get_conv_params_wiener(8);
+
+  for (int j = 0; j < stripe_width; j += procunit_width) {
+    int w = AOMMIN(procunit_width, (stripe_width - j + 15) & ~15);
+    const uint8_t *src_p = src + j;
+    uint8_t *dst_p = dst + j;
+    av1_wiener_convolve_add_src(
+        src_p, src_stride, dst_p, dst_stride, rui->wiener_info.hfilter, 16,
+        rui->wiener_info.vfilter, 16, w, stripe_height, &conv_params);
+  }
+}
+
+static void boxsum1(int32_t *src, int width, int height, int src_stride,
+                    int sqr, int32_t *dst, int dst_stride) {
+  int i, j, a, b, c;
+  assert(width > 2 * SGRPROJ_BORDER_HORZ);
+  assert(height > 2 * SGRPROJ_BORDER_VERT);
+
+  if (!sqr) {
+    for (j = 0; j < width; ++j) {
+      a = src[j];
+      b = src[src_stride + j];
+      c = src[2 * src_stride + j];
+
+      dst[j] = a + b;
+      for (i = 1; i < height - 2; ++i) {
+        dst[i * dst_stride + j] = a + b + c;
+        a = b;
+        b = c;
+        c = src[(i + 2) * src_stride + j];
+      }
+      dst[i * dst_stride + j] = a + b + c;
+      dst[(i + 1) * dst_stride + j] = b + c;
+    }
+  } else {
+    for (j = 0; j < width; ++j) {
+      a = src[j] * src[j];
+      b = src[src_stride + j] * src[src_stride + j];
+      c = src[2 * src_stride + j] * src[2 * src_stride + j];
+
+      dst[j] = a + b;
+      for (i = 1; i < height - 2; ++i) {
+        dst[i * dst_stride + j] = a + b + c;
+        a = b;
+        b = c;
+        c = src[(i + 2) * src_stride + j] * src[(i + 2) * src_stride + j];
+      }
+      dst[i * dst_stride + j] = a + b + c;
+      dst[(i + 1) * dst_stride + j] = b + c;
+    }
+  }
+
+  for (i = 0; i < height; ++i) {
+    a = dst[i * dst_stride];
+    b = dst[i * dst_stride + 1];
+    c = dst[i * dst_stride + 2];
+
+    dst[i * dst_stride] = a + b;
+    for (j = 1; j < width - 2; ++j) {
+      dst[i * dst_stride + j] = a + b + c;
+      a = b;
+      b = c;
+      c = dst[i * dst_stride + (j + 2)];
+    }
+    dst[i * dst_stride + j] = a + b + c;
+    dst[i * dst_stride + (j + 1)] = b + c;
+  }
+}
+
+static void boxsum2(int32_t *src, int width, int height, int src_stride,
+                    int sqr, int32_t *dst, int dst_stride) {
+  int i, j, a, b, c, d, e;
+  assert(width > 2 * SGRPROJ_BORDER_HORZ);
+  assert(height > 2 * SGRPROJ_BORDER_VERT);
+
+  if (!sqr) {
+    for (j = 0; j < width; ++j) {
+      a = src[j];
+      b = src[src_stride + j];
+      c = src[2 * src_stride + j];
+      d = src[3 * src_stride + j];
+      e = src[4 * src_stride + j];
+
+      dst[j] = a + b + c;
+      dst[dst_stride + j] = a + b + c + d;
+      for (i = 2; i < height - 3; ++i) {
+        dst[i * dst_stride + j] = a + b + c + d + e;
+        a = b;
+        b = c;
+        c = d;
+        d = e;
+        e = src[(i + 3) * src_stride + j];
+      }
+      dst[i * dst_stride + j] = a + b + c + d + e;
+      dst[(i + 1) * dst_stride + j] = b + c + d + e;
+      dst[(i + 2) * dst_stride + j] = c + d + e;
+    }
+  } else {
+    for (j = 0; j < width; ++j) {
+      a = src[j] * src[j];
+      b = src[src_stride + j] * src[src_stride + j];
+      c = src[2 * src_stride + j] * src[2 * src_stride + j];
+      d = src[3 * src_stride + j] * src[3 * src_stride + j];
+      e = src[4 * src_stride + j] * src[4 * src_stride + j];
+
+      dst[j] = a + b + c;
+      dst[dst_stride + j] = a + b + c + d;
+      for (i = 2; i < height - 3; ++i) {
+        dst[i * dst_stride + j] = a + b + c + d + e;
+        a = b;
+        b = c;
+        c = d;
+        d = e;
+        e = src[(i + 3) * src_stride + j] * src[(i + 3) * src_stride + j];
+      }
+      dst[i * dst_stride + j] = a + b + c + d + e;
+      dst[(i + 1) * dst_stride + j] = b + c + d + e;
+      dst[(i + 2) * dst_stride + j] = c + d + e;
+    }
+  }
+
+  for (i = 0; i < height; ++i) {
+    a = dst[i * dst_stride];
+    b = dst[i * dst_stride + 1];
+    c = dst[i * dst_stride + 2];
+    d = dst[i * dst_stride + 3];
+    e = dst[i * dst_stride + 4];
+
+    dst[i * dst_stride] = a + b + c;
+    dst[i * dst_stride + 1] = a + b + c + d;
+    for (j = 2; j < width - 3; ++j) {
+      dst[i * dst_stride + j] = a + b + c + d + e;
+      a = b;
+      b = c;
+      c = d;
+      d = e;
+      e = dst[i * dst_stride + (j + 3)];
+    }
+    dst[i * dst_stride + j] = a + b + c + d + e;
+    dst[i * dst_stride + (j + 1)] = b + c + d + e;
+    dst[i * dst_stride + (j + 2)] = c + d + e;
+  }
+}
+
+static void boxsum(int32_t *src, int width, int height, int src_stride, int r,
+                   int sqr, int32_t *dst, int dst_stride) {
+  if (r == 1)
+    boxsum1(src, width, height, src_stride, sqr, dst, dst_stride);
+  else if (r == 2)
+    boxsum2(src, width, height, src_stride, sqr, dst, dst_stride);
+  else
+    assert(0 && "Invalid value of r in self-guided filter");
+}
+
+void av1_decode_xq(const int *xqd, int *xq, const sgr_params_type *params) {
+  if (params->r[0] == 0) {
+    xq[0] = 0;
+    xq[1] = (1 << SGRPROJ_PRJ_BITS) - xqd[1];
+  } else if (params->r[1] == 0) {
+    xq[0] = xqd[0];
+    xq[1] = 0;
+  } else {
+    xq[0] = xqd[0];
+    xq[1] = (1 << SGRPROJ_PRJ_BITS) - xq[0] - xqd[1];
+  }
+}
+
+const int32_t av1_x_by_xplus1[256] = {
+  1,   128, 171, 192, 205, 213, 219, 224, 228, 230, 233, 235, 236, 238, 239,
+  240, 241, 242, 243, 243, 244, 244, 245, 245, 246, 246, 247, 247, 247, 247,
+  248, 248, 248, 248, 249, 249, 249, 249, 249, 250, 250, 250, 250, 250, 250,
+  250, 251, 251, 251, 251, 251, 251, 251, 251, 251, 251, 252, 252, 252, 252,
+  252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 253, 253,
+  253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253,
+  253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 254, 254, 254,
+  254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+  254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+  254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+  254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+  254, 254, 254, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  256,
+};
+
+const int32_t av1_one_by_x[MAX_NELEM] = {
+  4096, 2048, 1365, 1024, 819, 683, 585, 512, 455, 410, 372, 341, 315,
+  293,  273,  256,  241,  228, 216, 205, 195, 186, 178, 171, 164,
+};
+
+static void calculate_intermediate_result(int32_t *dgd, int width, int height,
+                                          int dgd_stride, int bit_depth,
+                                          int sgr_params_idx, int radius_idx,
+                                          int pass, int32_t *A, int32_t *B) {
+  const sgr_params_type *const params = &av1_sgr_params[sgr_params_idx];
+  const int r = params->r[radius_idx];
+  const int width_ext = width + 2 * SGRPROJ_BORDER_HORZ;
+  const int height_ext = height + 2 * SGRPROJ_BORDER_VERT;
+  int buf_stride = ((width_ext + 3) & ~3) + 16;
+  const int step = pass == 0 ? 1 : 2;
+  int i, j;
+
+  assert(r <= MAX_RADIUS && "Need MAX_RADIUS >= r");
+  assert(r <= SGRPROJ_BORDER_VERT - 1 && r <= SGRPROJ_BORDER_HORZ - 1 &&
+         "Need SGRPROJ_BORDER_* >= r+1");
+
+  boxsum(dgd - dgd_stride * SGRPROJ_BORDER_VERT - SGRPROJ_BORDER_HORZ,
+         width_ext, height_ext, dgd_stride, r, 0, B, buf_stride);
+  boxsum(dgd - dgd_stride * SGRPROJ_BORDER_VERT - SGRPROJ_BORDER_HORZ,
+         width_ext, height_ext, dgd_stride, r, 1, A, buf_stride);
+  A += SGRPROJ_BORDER_VERT * buf_stride + SGRPROJ_BORDER_HORZ;
+  B += SGRPROJ_BORDER_VERT * buf_stride + SGRPROJ_BORDER_HORZ;
+  for (i = -1; i < height + 1; i += step) {
+    for (j = -1; j < width + 1; ++j) {
+      const int k = i * buf_stride + j;
+      const int n = (2 * r + 1) * (2 * r + 1);
+
+      uint32_t a = ROUND_POWER_OF_TWO(A[k], 2 * (bit_depth - 8));
+      uint32_t b = ROUND_POWER_OF_TWO(B[k], bit_depth - 8);
+
+      uint32_t p = (a * n < b * b) ? 0 : a * n - b * b;
+
+      const uint32_t s = params->s[radius_idx];
+
+      const uint32_t z = ROUND_POWER_OF_TWO(p * s, SGRPROJ_MTABLE_BITS);
+
+      A[k] = av1_x_by_xplus1[AOMMIN(z, 255)];  
+
+      B[k] = (int32_t)ROUND_POWER_OF_TWO((uint32_t)(SGRPROJ_SGR - A[k]) *
+                                             (uint32_t)B[k] *
+                                             (uint32_t)av1_one_by_x[n - 1],
+                                         SGRPROJ_RECIP_BITS);
+    }
+  }
+}
+
+static void selfguided_restoration_fast_internal(
+    int32_t *dgd, int width, int height, int dgd_stride, int32_t *dst,
+    int dst_stride, int bit_depth, int sgr_params_idx, int radius_idx) {
+  const sgr_params_type *const params = &av1_sgr_params[sgr_params_idx];
+  const int r = params->r[radius_idx];
+  const int width_ext = width + 2 * SGRPROJ_BORDER_HORZ;
+  int buf_stride = ((width_ext + 3) & ~3) + 16;
+  int32_t A_[RESTORATION_PROC_UNIT_PELS];
+  int32_t B_[RESTORATION_PROC_UNIT_PELS];
+  int32_t *A = A_;
+  int32_t *B = B_;
+  int i, j;
+  calculate_intermediate_result(dgd, width, height, dgd_stride, bit_depth,
+                                sgr_params_idx, radius_idx, 1, A, B);
+  A += SGRPROJ_BORDER_VERT * buf_stride + SGRPROJ_BORDER_HORZ;
+  B += SGRPROJ_BORDER_VERT * buf_stride + SGRPROJ_BORDER_HORZ;
+
+  (void)r;
+  assert(r == 2);
+  for (i = 0; i < height; ++i) {
+    if (!(i & 1)) {  
+      for (j = 0; j < width; ++j) {
+        const int k = i * buf_stride + j;
+        const int l = i * dgd_stride + j;
+        const int m = i * dst_stride + j;
+        const int nb = 5;
+        const int32_t a = (A[k - buf_stride] + A[k + buf_stride]) * 6 +
+                          (A[k - 1 - buf_stride] + A[k - 1 + buf_stride] +
+                           A[k + 1 - buf_stride] + A[k + 1 + buf_stride]) *
+                              5;
+        const int32_t b = (B[k - buf_stride] + B[k + buf_stride]) * 6 +
+                          (B[k - 1 - buf_stride] + B[k - 1 + buf_stride] +
+                           B[k + 1 - buf_stride] + B[k + 1 + buf_stride]) *
+                              5;
+        const int32_t v = a * dgd[l] + b;
+        dst[m] =
+            ROUND_POWER_OF_TWO(v, SGRPROJ_SGR_BITS + nb - SGRPROJ_RST_BITS);
+      }
+    } else {  
+      for (j = 0; j < width; ++j) {
+        const int k = i * buf_stride + j;
+        const int l = i * dgd_stride + j;
+        const int m = i * dst_stride + j;
+        const int nb = 4;
+        const int32_t a = A[k] * 6 + (A[k - 1] + A[k + 1]) * 5;
+        const int32_t b = B[k] * 6 + (B[k - 1] + B[k + 1]) * 5;
+        const int32_t v = a * dgd[l] + b;
+        dst[m] =
+            ROUND_POWER_OF_TWO(v, SGRPROJ_SGR_BITS + nb - SGRPROJ_RST_BITS);
+      }
+    }
+  }
+}
+
+static void selfguided_restoration_internal(int32_t *dgd, int width, int height,
+                                            int dgd_stride, int32_t *dst,
+                                            int dst_stride, int bit_depth,
+                                            int sgr_params_idx,
+                                            int radius_idx) {
+  const int width_ext = width + 2 * SGRPROJ_BORDER_HORZ;
+  int buf_stride = ((width_ext + 3) & ~3) + 16;
+  int32_t A_[RESTORATION_PROC_UNIT_PELS];
+  int32_t B_[RESTORATION_PROC_UNIT_PELS];
+  int32_t *A = A_;
+  int32_t *B = B_;
+  int i, j;
+  calculate_intermediate_result(dgd, width, height, dgd_stride, bit_depth,
+                                sgr_params_idx, radius_idx, 0, A, B);
+  A += SGRPROJ_BORDER_VERT * buf_stride + SGRPROJ_BORDER_HORZ;
+  B += SGRPROJ_BORDER_VERT * buf_stride + SGRPROJ_BORDER_HORZ;
+
+  for (i = 0; i < height; ++i) {
+    for (j = 0; j < width; ++j) {
+      const int k = i * buf_stride + j;
+      const int l = i * dgd_stride + j;
+      const int m = i * dst_stride + j;
+      const int nb = 5;
+      const int32_t a =
+          (A[k] + A[k - 1] + A[k + 1] + A[k - buf_stride] + A[k + buf_stride]) *
+              4 +
+          (A[k - 1 - buf_stride] + A[k - 1 + buf_stride] +
+           A[k + 1 - buf_stride] + A[k + 1 + buf_stride]) *
+              3;
+      const int32_t b =
+          (B[k] + B[k - 1] + B[k + 1] + B[k - buf_stride] + B[k + buf_stride]) *
+              4 +
+          (B[k - 1 - buf_stride] + B[k - 1 + buf_stride] +
+           B[k + 1 - buf_stride] + B[k + 1 + buf_stride]) *
+              3;
+      const int32_t v = a * dgd[l] + b;
+      dst[m] = ROUND_POWER_OF_TWO(v, SGRPROJ_SGR_BITS + nb - SGRPROJ_RST_BITS);
+    }
+  }
+}
+
+int av1_selfguided_restoration_c(const uint8_t *dgd8, int width, int height,
+                                 int dgd_stride, int32_t *flt0, int32_t *flt1,
+                                 int flt_stride, int sgr_params_idx,
+                                 int bit_depth, int highbd) {
+  int32_t dgd32_[RESTORATION_PROC_UNIT_PELS];
+  const int dgd32_stride = width + 2 * SGRPROJ_BORDER_HORZ;
+  int32_t *dgd32 =
+      dgd32_ + dgd32_stride * SGRPROJ_BORDER_VERT + SGRPROJ_BORDER_HORZ;
+
+  if (highbd) {
+    const uint16_t *dgd16 = CONVERT_TO_SHORTPTR(dgd8);
+    for (int i = -SGRPROJ_BORDER_VERT; i < height + SGRPROJ_BORDER_VERT; ++i) {
+      for (int j = -SGRPROJ_BORDER_HORZ; j < width + SGRPROJ_BORDER_HORZ; ++j) {
+        dgd32[i * dgd32_stride + j] = dgd16[i * dgd_stride + j];
+      }
+    }
+  } else {
+    for (int i = -SGRPROJ_BORDER_VERT; i < height + SGRPROJ_BORDER_VERT; ++i) {
+      for (int j = -SGRPROJ_BORDER_HORZ; j < width + SGRPROJ_BORDER_HORZ; ++j) {
+        dgd32[i * dgd32_stride + j] = dgd8[i * dgd_stride + j];
+      }
+    }
+  }
+
+  const sgr_params_type *const params = &av1_sgr_params[sgr_params_idx];
+  assert(!(params->r[0] == 0 && params->r[1] == 0));
+
+  if (params->r[0] > 0)
+    selfguided_restoration_fast_internal(dgd32, width, height, dgd32_stride,
+                                         flt0, flt_stride, bit_depth,
+                                         sgr_params_idx, 0);
+  if (params->r[1] > 0)
+    selfguided_restoration_internal(dgd32, width, height, dgd32_stride, flt1,
+                                    flt_stride, bit_depth, sgr_params_idx, 1);
+  return 0;
+}
+
+int av1_apply_selfguided_restoration_c(const uint8_t *dat8, int width,
+                                       int height, int stride, int eps,
+                                       const int *xqd, uint8_t *dst8,
+                                       int dst_stride, int32_t *tmpbuf,
+                                       int bit_depth, int highbd) {
+  int32_t *flt0 = tmpbuf;
+  int32_t *flt1 = flt0 + RESTORATION_UNITPELS_MAX;
+  assert(width * height <= RESTORATION_UNITPELS_MAX);
+
+  const int ret = av1_selfguided_restoration_c(
+      dat8, width, height, stride, flt0, flt1, width, eps, bit_depth, highbd);
+  if (ret != 0) return ret;
+  const sgr_params_type *const params = &av1_sgr_params[eps];
+  int xq[2];
+  av1_decode_xq(xqd, xq, params);
+  for (int i = 0; i < height; ++i) {
+    for (int j = 0; j < width; ++j) {
+      const int k = i * width + j;
+      uint8_t *dst8ij = dst8 + i * dst_stride + j;
+      const uint8_t *dat8ij = dat8 + i * stride + j;
+
+      const uint16_t pre_u = highbd ? *CONVERT_TO_SHORTPTR(dat8ij) : *dat8ij;
+      const int32_t u = (int32_t)pre_u << SGRPROJ_RST_BITS;
+      int32_t v = u << SGRPROJ_PRJ_BITS;
+      if (params->r[0] > 0) v += xq[0] * (flt0[k] - u);
+      if (params->r[1] > 0) v += xq[1] * (flt1[k] - u);
+      const int16_t w =
+          (int16_t)ROUND_POWER_OF_TWO(v, SGRPROJ_PRJ_BITS + SGRPROJ_RST_BITS);
+
+      const uint16_t out = clip_pixel_highbd(w, bit_depth);
+      if (highbd)
+        *CONVERT_TO_SHORTPTR(dst8ij) = out;
+      else
+        *dst8ij = (uint8_t)out;
+    }
+  }
+  return 0;
+}
+
+static void sgrproj_filter_stripe(const RestorationUnitInfo *rui,
+                                  int stripe_width, int stripe_height,
+                                  int procunit_width, const uint8_t *src,
+                                  int src_stride, uint8_t *dst, int dst_stride,
+                                  int32_t *tmpbuf, int bit_depth,
+                                  struct aom_internal_error_info *error_info) {
+  (void)bit_depth;
+  assert(bit_depth == 8);
+
+  for (int j = 0; j < stripe_width; j += procunit_width) {
+    int w = AOMMIN(procunit_width, stripe_width - j);
+    if (av1_apply_selfguided_restoration(
+            src + j, w, stripe_height, src_stride, rui->sgrproj_info.ep,
+            rui->sgrproj_info.xqd, dst + j, dst_stride, tmpbuf, bit_depth,
+            0) != 0) {
+      aom_internal_error(
+          error_info, AOM_CODEC_MEM_ERROR,
+          "Error allocating buffer in av1_apply_selfguided_restoration");
+    }
+  }
+}
+
+#if CONFIG_AV1_HIGHBITDEPTH
+static void wiener_filter_stripe_highbd(
+    const RestorationUnitInfo *rui, int stripe_width, int stripe_height,
+    int procunit_width, const uint8_t *src8, int src_stride, uint8_t *dst8,
+    int dst_stride, int32_t *tmpbuf, int bit_depth,
+    struct aom_internal_error_info *error_info) {
+  (void)tmpbuf;
+  (void)error_info;
+  const WienerConvolveParams conv_params = get_conv_params_wiener(bit_depth);
+
+  for (int j = 0; j < stripe_width; j += procunit_width) {
+    int w = AOMMIN(procunit_width, (stripe_width - j + 15) & ~15);
+    const uint8_t *src8_p = src8 + j;
+    uint8_t *dst8_p = dst8 + j;
+    av1_highbd_wiener_convolve_add_src(src8_p, src_stride, dst8_p, dst_stride,
+                                       rui->wiener_info.hfilter, 16,
+                                       rui->wiener_info.vfilter, 16, w,
+                                       stripe_height, &conv_params, bit_depth);
+  }
+}
+
+static void sgrproj_filter_stripe_highbd(
+    const RestorationUnitInfo *rui, int stripe_width, int stripe_height,
+    int procunit_width, const uint8_t *src8, int src_stride, uint8_t *dst8,
+    int dst_stride, int32_t *tmpbuf, int bit_depth,
+    struct aom_internal_error_info *error_info) {
+  for (int j = 0; j < stripe_width; j += procunit_width) {
+    int w = AOMMIN(procunit_width, stripe_width - j);
+    if (av1_apply_selfguided_restoration(
+            src8 + j, w, stripe_height, src_stride, rui->sgrproj_info.ep,
+            rui->sgrproj_info.xqd, dst8 + j, dst_stride, tmpbuf, bit_depth,
+            1) != 0) {
+      aom_internal_error(
+          error_info, AOM_CODEC_MEM_ERROR,
+          "Error allocating buffer in av1_apply_selfguided_restoration");
+    }
+  }
+}
+#endif
+
+typedef void (*stripe_filter_fun)(const RestorationUnitInfo *rui,
+                                  int stripe_width, int stripe_height,
+                                  int procunit_width, const uint8_t *src,
+                                  int src_stride, uint8_t *dst, int dst_stride,
+                                  int32_t *tmpbuf, int bit_depth,
+                                  struct aom_internal_error_info *error_info);
+
+#if CONFIG_AV1_HIGHBITDEPTH
+#define NUM_STRIPE_FILTERS 4
+static const stripe_filter_fun stripe_filters[NUM_STRIPE_FILTERS] = {
+  wiener_filter_stripe, sgrproj_filter_stripe, wiener_filter_stripe_highbd,
+  sgrproj_filter_stripe_highbd
+};
+#else
+#define NUM_STRIPE_FILTERS 2
+static const stripe_filter_fun stripe_filters[NUM_STRIPE_FILTERS] = {
+  wiener_filter_stripe, sgrproj_filter_stripe
+};
+#endif
+
+void av1_loop_restoration_filter_unit(
+    const RestorationTileLimits *limits, const RestorationUnitInfo *rui,
+    const RestorationStripeBoundaries *rsb, RestorationLineBuffers *rlbs,
+    int plane_w, int plane_h, int ss_x, int ss_y, int highbd, int bit_depth,
+    uint8_t *data8, int stride, uint8_t *dst8, int dst_stride, int32_t *tmpbuf,
+    int optimized_lr, struct aom_internal_error_info *error_info) {
+  RestorationType unit_rtype = rui->restoration_type;
+
+  int unit_h = limits->v_end - limits->v_start;
+  int unit_w = limits->h_end - limits->h_start;
+  uint8_t *data8_tl =
+      data8 + limits->v_start * (ptrdiff_t)stride + limits->h_start;
+  uint8_t *dst8_tl =
+      dst8 + limits->v_start * (ptrdiff_t)dst_stride + limits->h_start;
+
+  if (unit_rtype == RESTORE_NONE) {
+    copy_rest_unit(unit_w, unit_h, data8_tl, stride, dst8_tl, dst_stride,
+                   highbd);
+    return;
+  }
+
+  const int filter_idx = 2 * highbd + (unit_rtype == RESTORE_SGRPROJ);
+  assert(filter_idx < NUM_STRIPE_FILTERS);
+  const stripe_filter_fun stripe_filter = stripe_filters[filter_idx];
+
+  const int procunit_width = RESTORATION_PROC_UNIT_SIZE >> ss_x;
+
+  RestorationTileLimits remaining_stripes = *limits;
+  int i = 0;
+  while (i < unit_h) {
+    int copy_above, copy_below;
+    remaining_stripes.v_start = limits->v_start + i;
+
+    get_stripe_boundary_info(&remaining_stripes, plane_w, plane_h, ss_y,
+                             &copy_above, &copy_below);
+
+    const int full_stripe_height = RESTORATION_PROC_UNIT_SIZE >> ss_y;
+    const int runit_offset = RESTORATION_UNIT_OFFSET >> ss_y;
+
+    const int frame_stripe =
+        (remaining_stripes.v_start + runit_offset) / full_stripe_height;
+    const int rsb_row = RESTORATION_CTX_VERT * frame_stripe;
+
+    const int nominal_stripe_height =
+        full_stripe_height - ((frame_stripe == 0) ? runit_offset : 0);
+    const int h = AOMMIN(nominal_stripe_height,
+                         remaining_stripes.v_end - remaining_stripes.v_start);
+
+    setup_processing_stripe_boundary(&remaining_stripes, rsb, rsb_row, highbd,
+                                     h, data8, stride, rlbs, copy_above,
+                                     copy_below, optimized_lr);
+
+    stripe_filter(rui, unit_w, h, procunit_width, data8_tl + i * stride, stride,
+                  dst8_tl + i * dst_stride, dst_stride, tmpbuf, bit_depth,
+                  error_info);
+
+    restore_processing_stripe_boundary(&remaining_stripes, rlbs, highbd, h,
+                                       data8, stride, copy_above, copy_below,
+                                       optimized_lr);
+
+    i += h;
+  }
+}
+
+static void filter_frame_on_unit(const RestorationTileLimits *limits,
+                                 int rest_unit_idx, void *priv, int32_t *tmpbuf,
+                                 RestorationLineBuffers *rlbs,
+                                 struct aom_internal_error_info *error_info) {
+  FilterFrameCtxt *ctxt = (FilterFrameCtxt *)priv;
+  const RestorationInfo *rsi = ctxt->rsi;
+
+  av1_loop_restoration_filter_unit(
+      limits, &rsi->unit_info[rest_unit_idx], &rsi->boundaries, rlbs,
+      ctxt->plane_w, ctxt->plane_h, ctxt->ss_x, ctxt->ss_y, ctxt->highbd,
+      ctxt->bit_depth, ctxt->data8, ctxt->data_stride, ctxt->dst8,
+      ctxt->dst_stride, tmpbuf, rsi->optimized_lr, error_info);
+}
+
+void av1_loop_restoration_filter_frame_init(AV1LrStruct *lr_ctxt,
+                                            YV12_BUFFER_CONFIG *frame,
+                                            AV1_COMMON *cm, int optimized_lr,
+                                            int num_planes) {
+  const SequenceHeader *const seq_params = cm->seq_params;
+  const int bit_depth = seq_params->bit_depth;
+  const int highbd = seq_params->use_highbitdepth;
+  lr_ctxt->dst = &cm->rst_frame;
+
+  const int frame_width = frame->crop_widths[0];
+  const int frame_height = frame->crop_heights[0];
+  if (aom_realloc_frame_buffer(
+          lr_ctxt->dst, frame_width, frame_height, seq_params->subsampling_x,
+          seq_params->subsampling_y, highbd, AOM_RESTORATION_FRAME_BORDER,
+          cm->features.byte_alignment, NULL, NULL, NULL, false,
+          0) != AOM_CODEC_OK)
+    aom_internal_error(cm->error, AOM_CODEC_MEM_ERROR,
+                       "Failed to allocate restoration dst buffer");
+
+  lr_ctxt->on_rest_unit = filter_frame_on_unit;
+  lr_ctxt->frame = frame;
+  for (int plane = 0; plane < num_planes; ++plane) {
+    RestorationInfo *rsi = &cm->rst_info[plane];
+    RestorationType rtype = rsi->frame_restoration_type;
+    rsi->optimized_lr = optimized_lr;
+    lr_ctxt->ctxt[plane].rsi = rsi;
+
+    if (rtype == RESTORE_NONE) {
+      continue;
+    }
+
+    const int is_uv = plane > 0;
+    int plane_w, plane_h;
+    av1_get_upsampled_plane_size(cm, is_uv, &plane_w, &plane_h);
+    assert(plane_w == frame->crop_widths[is_uv]);
+    assert(plane_h == frame->crop_heights[is_uv]);
+
+    av1_extend_frame(frame->buffers[plane], plane_w, plane_h,
+                     frame->strides[is_uv], RESTORATION_BORDER,
+                     RESTORATION_BORDER, highbd);
+
+    FilterFrameCtxt *lr_plane_ctxt = &lr_ctxt->ctxt[plane];
+    lr_plane_ctxt->ss_x = is_uv && seq_params->subsampling_x;
+    lr_plane_ctxt->ss_y = is_uv && seq_params->subsampling_y;
+    lr_plane_ctxt->plane_w = plane_w;
+    lr_plane_ctxt->plane_h = plane_h;
+    lr_plane_ctxt->highbd = highbd;
+    lr_plane_ctxt->bit_depth = bit_depth;
+    lr_plane_ctxt->data8 = frame->buffers[plane];
+    lr_plane_ctxt->dst8 = lr_ctxt->dst->buffers[plane];
+    lr_plane_ctxt->data_stride = frame->strides[is_uv];
+    lr_plane_ctxt->dst_stride = lr_ctxt->dst->strides[is_uv];
+  }
+}
+
+static void loop_restoration_copy_planes(AV1LrStruct *loop_rest_ctxt,
+                                         AV1_COMMON *cm, int num_planes) {
+  typedef void (*copy_fun)(const YV12_BUFFER_CONFIG *src_ybc,
+                           YV12_BUFFER_CONFIG *dst_ybc, int hstart, int hend,
+                           int vstart, int vend);
+  static const copy_fun copy_funs[3] = { aom_yv12_partial_coloc_copy_y,
+                                         aom_yv12_partial_coloc_copy_u,
+                                         aom_yv12_partial_coloc_copy_v };
+  assert(num_planes <= 3);
+  for (int plane = 0; plane < num_planes; ++plane) {
+    if (cm->rst_info[plane].frame_restoration_type == RESTORE_NONE) continue;
+    FilterFrameCtxt *lr_plane_ctxt = &loop_rest_ctxt->ctxt[plane];
+    copy_funs[plane](loop_rest_ctxt->dst, loop_rest_ctxt->frame, 0,
+                     lr_plane_ctxt->plane_w, 0, lr_plane_ctxt->plane_h);
+  }
+}
+
+static void foreach_rest_unit_in_plane(const struct AV1Common *cm, int plane,
+                                       rest_unit_visitor_t on_rest_unit,
+                                       void *priv, int32_t *tmpbuf,
+                                       RestorationLineBuffers *rlbs) {
+  const RestorationInfo *rsi = &cm->rst_info[plane];
+  const int hnum_rest_units = rsi->horz_units;
+  const int vnum_rest_units = rsi->vert_units;
+  const int unit_size = rsi->restoration_unit_size;
+
+  const int is_uv = plane > 0;
+  const int ss_y = is_uv && cm->seq_params->subsampling_y;
+  const int ext_size = unit_size * 3 / 2;
+  int plane_w, plane_h;
+  av1_get_upsampled_plane_size(cm, is_uv, &plane_w, &plane_h);
+
+  int y0 = 0, i = 0;
+  while (y0 < plane_h) {
+    int remaining_h = plane_h - y0;
+    int h = (remaining_h < ext_size) ? remaining_h : unit_size;
+
+    RestorationTileLimits limits;
+    limits.v_start = y0;
+    limits.v_end = y0 + h;
+    assert(limits.v_end <= plane_h);
+    const int voffset = RESTORATION_UNIT_OFFSET >> ss_y;
+    limits.v_start = AOMMAX(0, limits.v_start - voffset);
+    if (limits.v_end < plane_h) limits.v_end -= voffset;
+
+    av1_foreach_rest_unit_in_row(&limits, plane_w, on_rest_unit, i, unit_size,
+                                 hnum_rest_units, vnum_rest_units, plane, priv,
+                                 tmpbuf, rlbs, av1_lr_sync_read_dummy,
+                                 av1_lr_sync_write_dummy, NULL, cm->error);
+
+    y0 += h;
+    ++i;
+  }
+}
+
+static void foreach_rest_unit_in_planes(AV1LrStruct *lr_ctxt, AV1_COMMON *cm,
+                                        int num_planes) {
+  FilterFrameCtxt *ctxt = lr_ctxt->ctxt;
+
+  for (int plane = 0; plane < num_planes; ++plane) {
+    if (cm->rst_info[plane].frame_restoration_type == RESTORE_NONE) {
+      continue;
+    }
+
+    foreach_rest_unit_in_plane(cm, plane, lr_ctxt->on_rest_unit, &ctxt[plane],
+                               cm->rst_tmpbuf, cm->rlbs);
+  }
+}
+
+void av1_loop_restoration_filter_frame(YV12_BUFFER_CONFIG *frame,
+                                       AV1_COMMON *cm, int optimized_lr,
+                                       void *lr_ctxt) {
+  assert(!cm->features.all_lossless);
+  const int num_planes = av1_num_planes(cm);
+
+  AV1LrStruct *loop_rest_ctxt = (AV1LrStruct *)lr_ctxt;
+
+  av1_loop_restoration_filter_frame_init(loop_rest_ctxt, frame, cm,
+                                         optimized_lr, num_planes);
+
+  foreach_rest_unit_in_planes(loop_rest_ctxt, cm, num_planes);
+
+  loop_restoration_copy_planes(loop_rest_ctxt, cm, num_planes);
+}
+
+void av1_foreach_rest_unit_in_row(
+    RestorationTileLimits *limits, int plane_w,
+    rest_unit_visitor_t on_rest_unit, int row_number, int unit_size,
+    int hnum_rest_units, int vnum_rest_units, int plane, void *priv,
+    int32_t *tmpbuf, RestorationLineBuffers *rlbs, sync_read_fn_t on_sync_read,
+    sync_write_fn_t on_sync_write, struct AV1LrSyncData *const lr_sync,
+    struct aom_internal_error_info *error_info) {
+  const int ext_size = unit_size * 3 / 2;
+  int x0 = 0, j = 0;
+  while (x0 < plane_w) {
+    int remaining_w = plane_w - x0;
+    int w = (remaining_w < ext_size) ? remaining_w : unit_size;
+
+    limits->h_start = x0;
+    limits->h_end = x0 + w;
+    assert(limits->h_end <= plane_w);
+
+    const int unit_idx = row_number * hnum_rest_units + j;
+
+
+    on_sync_read(lr_sync, row_number, j, plane);
+    if ((row_number + 1) < vnum_rest_units)
+      on_sync_read(lr_sync, row_number + 2, j, plane);
+
+#if CONFIG_MULTITHREAD
+    if (lr_sync && lr_sync->num_workers > 1) {
+      pthread_mutex_lock(lr_sync->job_mutex);
+      const bool lr_mt_exit = lr_sync->lr_mt_exit;
+      pthread_mutex_unlock(lr_sync->job_mutex);
+      if (lr_mt_exit) return;
+    }
+#endif
+
+    on_rest_unit(limits, unit_idx, priv, tmpbuf, rlbs, error_info);
+
+    on_sync_write(lr_sync, row_number, j, hnum_rest_units, plane);
+
+    x0 += w;
+    ++j;
+  }
+}
+
+void av1_lr_sync_read_dummy(void *const lr_sync, int r, int c, int plane) {
+  (void)lr_sync;
+  (void)r;
+  (void)c;
+  (void)plane;
+}
+
+void av1_lr_sync_write_dummy(void *const lr_sync, int r, int c,
+                             const int sb_cols, int plane) {
+  (void)lr_sync;
+  (void)r;
+  (void)c;
+  (void)sb_cols;
+  (void)plane;
+}
+
+int av1_loop_restoration_corners_in_sb(const struct AV1Common *cm, int plane,
+                                       int mi_row, int mi_col, BLOCK_SIZE bsize,
+                                       int *rcol0, int *rcol1, int *rrow0,
+                                       int *rrow1) {
+  assert(rcol0 && rcol1 && rrow0 && rrow1);
+
+  if (bsize != cm->seq_params->sb_size) return 0;
+
+  assert(!cm->features.all_lossless);
+
+  const int is_uv = plane > 0;
+
+  const int mi_row0 = mi_row;
+  const int mi_col0 = mi_col;
+  const int mi_row1 = mi_row0 + mi_size_high[bsize];
+  const int mi_col1 = mi_col0 + mi_size_wide[bsize];
+
+  const RestorationInfo *rsi = &cm->rst_info[plane];
+  const int size = rsi->restoration_unit_size;
+  const int horz_units = rsi->horz_units;
+  const int vert_units = rsi->vert_units;
+
+  const int ss_x = is_uv && cm->seq_params->subsampling_x;
+  const int ss_y = is_uv && cm->seq_params->subsampling_y;
+  const int mi_size_x = MI_SIZE >> ss_x;
+  const int mi_size_y = MI_SIZE >> ss_y;
+
+  const int mi_to_num_x = av1_superres_scaled(cm)
+                              ? mi_size_x * cm->superres_scale_denominator
+                              : mi_size_x;
+  const int mi_to_num_y = mi_size_y;
+  const int denom_x = av1_superres_scaled(cm) ? size * SCALE_NUMERATOR : size;
+  const int denom_y = size;
+
+  const int rnd_x = denom_x - 1;
+  const int rnd_y = denom_y - 1;
+
+  *rcol0 = (mi_col0 * mi_to_num_x + rnd_x) / denom_x;
+  *rrow0 = (mi_row0 * mi_to_num_y + rnd_y) / denom_y;
+
+  *rcol1 = AOMMIN((mi_col1 * mi_to_num_x + rnd_x) / denom_x, horz_units);
+  *rrow1 = AOMMIN((mi_row1 * mi_to_num_y + rnd_y) / denom_y, vert_units);
+
+  return *rcol0 < *rcol1 && *rrow0 < *rrow1;
+}
+
+static void extend_lines(uint8_t *buf, int width, int height, int stride,
+                         int extend, int use_highbitdepth) {
+  for (int i = 0; i < height; ++i) {
+    if (use_highbitdepth) {
+      uint16_t *buf16 = (uint16_t *)buf;
+      aom_memset16(buf16 - extend, buf16[0], extend);
+      aom_memset16(buf16 + width, buf16[width - 1], extend);
+    } else {
+      memset(buf - extend, buf[0], extend);
+      memset(buf + width, buf[width - 1], extend);
+    }
+    buf += stride;
+  }
+}
+
+static void save_deblock_boundary_lines(
+    const YV12_BUFFER_CONFIG *frame, const AV1_COMMON *cm, int plane, int row,
+    int stripe, int use_highbd, int is_above,
+    RestorationStripeBoundaries *boundaries) {
+  const int is_uv = plane > 0;
+  const uint8_t *src_buf = REAL_PTR(use_highbd, frame->buffers[plane]);
+  const int src_stride = frame->strides[is_uv] << use_highbd;
+  const uint8_t *src_rows = src_buf + row * (ptrdiff_t)src_stride;
+
+  uint8_t *bdry_buf = is_above ? boundaries->stripe_boundary_above
+                               : boundaries->stripe_boundary_below;
+  uint8_t *bdry_start = bdry_buf + (RESTORATION_EXTRA_HORZ << use_highbd);
+  const int bdry_stride = boundaries->stripe_boundary_stride << use_highbd;
+  uint8_t *bdry_rows = bdry_start + RESTORATION_CTX_VERT * stripe * bdry_stride;
+
+  const int lines_to_save =
+      AOMMIN(RESTORATION_CTX_VERT, frame->crop_heights[is_uv] - row);
+  assert(lines_to_save == 1 || lines_to_save == 2);
+
+  int upscaled_width;
+  int line_bytes;
+  if (av1_superres_scaled(cm)) {
+    const int ss_x = is_uv && cm->seq_params->subsampling_x;
+    upscaled_width = (cm->superres_upscaled_width + ss_x) >> ss_x;
+    line_bytes = upscaled_width << use_highbd;
+    if (use_highbd)
+      av1_upscale_normative_rows(
+          cm, CONVERT_TO_BYTEPTR(src_rows), frame->strides[is_uv],
+          CONVERT_TO_BYTEPTR(bdry_rows), boundaries->stripe_boundary_stride,
+          plane, lines_to_save);
+    else
+      av1_upscale_normative_rows(cm, src_rows, frame->strides[is_uv], bdry_rows,
+                                 boundaries->stripe_boundary_stride, plane,
+                                 lines_to_save);
+  } else {
+    upscaled_width = frame->crop_widths[is_uv];
+    line_bytes = upscaled_width << use_highbd;
+    for (int i = 0; i < lines_to_save; i++) {
+      memcpy(bdry_rows + i * bdry_stride, src_rows + i * src_stride,
+             line_bytes);
+    }
+  }
+  if (lines_to_save == 1)
+    memcpy(bdry_rows + bdry_stride, bdry_rows, line_bytes);
+
+  extend_lines(bdry_rows, upscaled_width, RESTORATION_CTX_VERT, bdry_stride,
+               RESTORATION_EXTRA_HORZ, use_highbd);
+}
+
+static void save_cdef_boundary_lines(const YV12_BUFFER_CONFIG *frame,
+                                     const AV1_COMMON *cm, int plane, int row,
+                                     int stripe, int use_highbd, int is_above,
+                                     RestorationStripeBoundaries *boundaries) {
+  const int is_uv = plane > 0;
+  const uint8_t *src_buf = REAL_PTR(use_highbd, frame->buffers[plane]);
+  const int src_stride = frame->strides[is_uv] << use_highbd;
+  const uint8_t *src_rows = src_buf + row * (ptrdiff_t)src_stride;
+
+  uint8_t *bdry_buf = is_above ? boundaries->stripe_boundary_above
+                               : boundaries->stripe_boundary_below;
+  uint8_t *bdry_start = bdry_buf + (RESTORATION_EXTRA_HORZ << use_highbd);
+  const int bdry_stride = boundaries->stripe_boundary_stride << use_highbd;
+  uint8_t *bdry_rows = bdry_start + RESTORATION_CTX_VERT * stripe * bdry_stride;
+  const int src_width = frame->crop_widths[is_uv];
+
+  const int ss_x = is_uv && cm->seq_params->subsampling_x;
+  const int upscaled_width = av1_superres_scaled(cm)
+                                 ? (cm->superres_upscaled_width + ss_x) >> ss_x
+                                 : src_width;
+  const int line_bytes = upscaled_width << use_highbd;
+  for (int i = 0; i < RESTORATION_CTX_VERT; i++) {
+    memcpy(bdry_rows + i * bdry_stride, src_rows, line_bytes);
+  }
+  extend_lines(bdry_rows, upscaled_width, RESTORATION_CTX_VERT, bdry_stride,
+               RESTORATION_EXTRA_HORZ, use_highbd);
+}
+
+static void save_boundary_lines(const YV12_BUFFER_CONFIG *frame, int use_highbd,
+                                int plane, AV1_COMMON *cm, int after_cdef) {
+  const int is_uv = plane > 0;
+  const int ss_y = is_uv && cm->seq_params->subsampling_y;
+  const int stripe_height = RESTORATION_PROC_UNIT_SIZE >> ss_y;
+  const int stripe_off = RESTORATION_UNIT_OFFSET >> ss_y;
+
+  int plane_w, plane_h;
+  av1_get_upsampled_plane_size(cm, is_uv, &plane_w, &plane_h);
+
+  RestorationStripeBoundaries *boundaries = &cm->rst_info[plane].boundaries;
+
+  const int plane_height = ROUND_POWER_OF_TWO(cm->height, ss_y);
+
+  int stripe_idx;
+  for (stripe_idx = 0;; ++stripe_idx) {
+    const int rel_y0 = AOMMAX(0, stripe_idx * stripe_height - stripe_off);
+    const int y0 = rel_y0;
+    if (y0 >= plane_h) break;
+
+    const int rel_y1 = (stripe_idx + 1) * stripe_height - stripe_off;
+    const int y1 = AOMMIN(rel_y1, plane_h);
+
+    const int use_deblock_above = (stripe_idx > 0);
+    const int use_deblock_below = (y1 < plane_height);
+
+    if (!after_cdef) {
+      if (use_deblock_above) {
+        save_deblock_boundary_lines(frame, cm, plane, y0 - RESTORATION_CTX_VERT,
+                                    stripe_idx, use_highbd, 1, boundaries);
+      }
+      if (use_deblock_below) {
+        save_deblock_boundary_lines(frame, cm, plane, y1, stripe_idx,
+                                    use_highbd, 0, boundaries);
+      }
+    } else {
+      if (!use_deblock_above) {
+        save_cdef_boundary_lines(frame, cm, plane, y0, stripe_idx, use_highbd,
+                                 1, boundaries);
+      }
+      if (!use_deblock_below) {
+        save_cdef_boundary_lines(frame, cm, plane, y1 - 1, stripe_idx,
+                                 use_highbd, 0, boundaries);
+      }
+    }
+  }
+}
+
+void av1_loop_restoration_save_boundary_lines(const YV12_BUFFER_CONFIG *frame,
+                                              AV1_COMMON *cm, int after_cdef) {
+  const int num_planes = av1_num_planes(cm);
+  const int use_highbd = cm->seq_params->use_highbitdepth;
+  for (int p = 0; p < num_planes; ++p) {
+    save_boundary_lines(frame, use_highbd, p, cm, after_cdef);
+  }
+}

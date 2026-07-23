@@ -1,0 +1,154 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_places_Helpers_h_
+#define mozilla_places_Helpers_h_
+
+
+#include "mozilla/storage.h"
+#include "nsIURI.h"
+#include "nsThreadUtils.h"
+#include "nsProxyRelease.h"
+#include "prtime.h"
+#include "mozIStorageStatementCallback.h"
+
+class nsIFile;
+
+namespace mozilla::places {
+
+
+class WeakAsyncStatementCallback : public mozIStorageStatementCallback {
+ public:
+  NS_DECL_MOZISTORAGESTATEMENTCALLBACK
+  WeakAsyncStatementCallback() = default;
+
+ protected:
+  virtual ~WeakAsyncStatementCallback() = default;
+};
+
+class AsyncStatementCallback : public WeakAsyncStatementCallback {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  AsyncStatementCallback() = default;
+
+ protected:
+  virtual ~AsyncStatementCallback() = default;
+};
+
+class PendingStatementCallback : public AsyncStatementCallback {
+ public:
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(PendingStatementCallback,
+                                       AsyncStatementCallback);
+  PendingStatementCallback() = default;
+
+  virtual nsresult BindParams(mozIStorageBindingParamsArray*) MOZ_MUST_OVERRIDE;
+
+ protected:
+  virtual ~PendingStatementCallback() = default;
+};
+
+#define NS_DECL_ASYNCSTATEMENTCALLBACK                     \
+  NS_IMETHOD HandleResult(mozIStorageResultSet*) override; \
+  NS_IMETHOD HandleCompletion(uint16_t) override;
+
+class URIBinder  
+{
+ public:
+  static nsresult Bind(mozIStorageStatement* statement, int32_t index,
+                       nsIURI* aURI);
+  static nsresult Bind(mozIStorageStatement* statement, int32_t index,
+                       const nsACString& aURLString);
+  static nsresult Bind(mozIStorageStatement* statement, const nsACString& aName,
+                       nsIURI* aURI);
+  static nsresult Bind(mozIStorageStatement* statement, const nsACString& aName,
+                       const nsACString& aURLString);
+  static nsresult Bind(mozIStorageBindingParams* aParams, int32_t index,
+                       nsIURI* aURI);
+  static nsresult Bind(mozIStorageBindingParams* aParams, int32_t index,
+                       const nsACString& aURLString);
+  static nsresult Bind(mozIStorageBindingParams* aParams,
+                       const nsACString& aName, nsIURI* aURI);
+  static nsresult Bind(mozIStorageBindingParams* aParams,
+                       const nsACString& aName, const nsACString& aURLString);
+};
+
+nsresult GetReversedHostname(nsIURI* aURI, nsString& aRevHost);
+
+void GetReversedHostname(const nsString& aForward, nsString& aRevHost);
+
+void ReverseString(const nsString& aInput, nsString& aReversed);
+
+nsresult GenerateGUID(nsACString& _guid);
+
+bool IsValidGUID(const nsACString& aGUID);
+
+void TruncateTitle(const nsACString& aTitle, nsACString& aTrimmed);
+
+PRTime RoundToMilliseconds(PRTime aTime);
+
+PRTime RoundedPRNow();
+
+nsresult HashURL(const nsACString& aSpec, const nsACString& aMode,
+                 uint64_t* _hash);
+
+already_AddRefed<nsIURI> GetExposableURI(nsIURI* aURI);
+
+class QueryKeyValuePair final {
+ public:
+  QueryKeyValuePair(const nsACString& aKey, const nsACString& aValue) {
+    key = aKey;
+    value = aValue;
+  };
+
+
+  QueryKeyValuePair(const nsACString& aSource, int32_t aKeyBegin,
+                    int32_t aEquals, int32_t aPastEnd) {
+    if (aEquals == aKeyBegin) aEquals = aPastEnd;
+    key = Substring(aSource, aKeyBegin, aEquals - aKeyBegin);
+    if (aPastEnd - aEquals > 0) {
+      value = Substring(aSource, aEquals + 1, aPastEnd - aEquals - 1);
+    }
+  }
+  nsCString key;
+  nsCString value;
+};
+
+nsresult TokenizeQueryString(const nsACString& aQuery,
+                             nsTArray<QueryKeyValuePair>* aTokens);
+
+void TokensToQueryString(const nsTArray<QueryKeyValuePair>& aTokens,
+                         nsACString& aQuery);
+
+nsresult BackupDatabaseFile(nsIFile* aDBFile, const nsAString& aBackupFileName,
+                            nsIFile* aBackupParentDirectory, nsIFile** backup);
+
+template <typename StatementType>
+class FinalizeStatementCacheProxy : public Runnable {
+ public:
+  FinalizeStatementCacheProxy(
+      mozilla::storage::StatementCache<StatementType>& aStatementCache,
+      nsISupports* aOwner)
+      : Runnable("places::FinalizeStatementCacheProxy"),
+        mStatementCache(aStatementCache),
+        mOwner(aOwner),
+        mCallingThread(do_GetCurrentThread()) {}
+
+  NS_IMETHOD Run() override {
+    mStatementCache.FinalizeStatements();
+    NS_ProxyRelease("FinalizeStatementCacheProxy::mOwner", mCallingThread,
+                    mOwner.forget());
+    return NS_OK;
+  }
+
+ protected:
+  mozilla::storage::StatementCache<StatementType>& mStatementCache;
+  nsCOMPtr<nsISupports> mOwner;
+  nsCOMPtr<nsIThread> mCallingThread;
+};
+
+bool GetHiddenState(bool aIsRedirect, uint32_t aTransitionType);
+
+}  
+
+#endif  // mozilla_places_Helpers_h_

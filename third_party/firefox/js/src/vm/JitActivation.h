@@ -1,0 +1,219 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_JitActivation_h
+#define vm_JitActivation_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+#include "mozilla/Atomics.h"     // mozilla::Atomic, mozilla::Relaxed
+#include "mozilla/Maybe.h"       // mozilla::Maybe
+
+#include <stddef.h>  // size_t
+#include <stdint.h>  // uint8_t, uint32_t, uintptr_t
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "jit/IonTypes.h"        // CHECK_OSIPOINT_REGISTERS
+#include "jit/JSJitFrameIter.h"  // js::jit::{JSJitFrameIter,RInstructionResults}
+#ifdef CHECK_OSIPOINT_REGISTERS
+#  include "jit/Registers.h"  // js::jit::RegisterDump
+#endif
+#include "jit/RematerializedFrame.h"  // js::jit::RematerializedFrame
+#include "js/GCVector.h"              // JS::GCVector
+#include "js/HashTable.h"             // js::HashMap
+#include "js/UniquePtr.h"             // js::UniquePtr
+#include "vm/Activation.h"            // js::Activation
+#include "wasm/WasmCodegenTypes.h"    // js::wasm::TrapData
+#include "wasm/WasmConstants.h"       // js::wasm::Trap
+#include "wasm/WasmFrame.h"           // js::wasm::Frame
+#include "wasm/WasmFrameIter.h"  // js::wasm::{ExitReason,RegisterState,WasmFrameIter}
+
+struct JS_PUBLIC_API JSContext;
+class JS_PUBLIC_API JSTracer;
+
+namespace js {
+
+namespace jit {
+
+class BailoutFrameInfo;
+
+enum class IsLeavingFrame { No, Yes };
+
+class JitActivation : public Activation {
+  uint8_t* packedExitFP_;
+
+  uint32_t encodedWasmExitReason_;
+
+  JitActivation* prevJitActivation_;
+
+  using RematerializedFrameVector =
+      JS::GCVector<js::UniquePtr<RematerializedFrame>>;
+  using RematerializedFrameTable =
+      js::HashMap<uint8_t*, RematerializedFrameVector>;
+  js::UniquePtr<RematerializedFrameTable> rematerializedFrames_;
+
+  using IonRecoveryMap = Vector<RInstructionResults, 1>;
+  IonRecoveryMap ionRecovery_;
+
+  BailoutFrameInfo* bailoutData_;
+
+  mozilla::Atomic<JitFrameLayout*, mozilla::Relaxed> lastProfilingFrame_;
+  mozilla::Atomic<void*, mozilla::Relaxed> lastProfilingCallSite_;
+  static_assert(sizeof(mozilla::Atomic<void*, mozilla::Relaxed>) ==
+                    sizeof(void*),
+                "Atomic should have same memory format as underlying type.");
+
+  mozilla::Maybe<wasm::TrapData> wasmTrapData_;
+
+#ifdef CHECK_OSIPOINT_REGISTERS
+ protected:
+  uint32_t checkRegs_ = 0;
+  RegisterDump regs_;
+#endif
+
+ public:
+  explicit JitActivation(JSContext* cx);
+  ~JitActivation();
+
+  void trace(JSTracer* trc);
+
+  bool isProfiling() const {
+    return true;
+  }
+
+  JitActivation* prevJitActivation() const { return prevJitActivation_; }
+  static size_t offsetOfPrevJitActivation() {
+    return offsetof(JitActivation, prevJitActivation_);
+  }
+
+  bool hasExitFP() const { return !!packedExitFP_; }
+  uint8_t* jsOrWasmExitFP() const {
+    if (hasWasmExitFP()) {
+      return wasm::Frame::untagExitFP(packedExitFP_);
+    }
+    return packedExitFP_;
+  }
+  static size_t offsetOfPackedExitFP() {
+    return offsetof(JitActivation, packedExitFP_);
+  }
+
+  bool hasJSExitFP() const { return !hasWasmExitFP(); }
+
+  uint8_t* jsExitFP() const {
+    MOZ_ASSERT(hasJSExitFP());
+    return packedExitFP_;
+  }
+  void setJSExitFP(uint8_t* fp) { packedExitFP_ = fp; }
+
+  uint8_t* packedExitFP() const { return packedExitFP_; }
+
+#ifdef CHECK_OSIPOINT_REGISTERS
+  void setCheckRegs(bool check) { checkRegs_ = check; }
+  static size_t offsetOfCheckRegs() {
+    return offsetof(JitActivation, checkRegs_);
+  }
+  static size_t offsetOfRegs() { return offsetof(JitActivation, regs_); }
+#endif
+
+  RematerializedFrame* getRematerializedFrame(
+      JSContext* cx, const JSJitFrameIter& iter, size_t inlineDepth = 0,
+      IsLeavingFrame leaving = IsLeavingFrame::No);
+
+  RematerializedFrame* lookupRematerializedFrame(uint8_t* top,
+                                                 size_t inlineDepth = 0);
+
+  void removeRematerializedFramesFromDebugger(JSContext* cx, uint8_t* top);
+
+  bool hasRematerializedFrame(uint8_t* top, size_t inlineDepth = 0) {
+    return !!lookupRematerializedFrame(top, inlineDepth);
+  }
+
+  void removeRematerializedFrame(uint8_t* top);
+
+  bool registerIonFrameRecovery(RInstructionResults&& results);
+
+  RInstructionResults* maybeIonFrameRecovery(JitFrameLayout* fp);
+
+  void removeIonFrameRecovery(JitFrameLayout* fp);
+
+  const BailoutFrameInfo* bailoutData() const { return bailoutData_; }
+
+  void setBailoutData(BailoutFrameInfo* bailoutData);
+
+  void cleanBailoutData();
+
+  static size_t offsetOfLastProfilingFrame() {
+    return offsetof(JitActivation, lastProfilingFrame_);
+  }
+  JitFrameLayout* lastProfilingFrame() { return lastProfilingFrame_; }
+  void setLastProfilingFrame(JitFrameLayout* ptr) { lastProfilingFrame_ = ptr; }
+
+  static size_t offsetOfLastProfilingCallSite() {
+    return offsetof(JitActivation, lastProfilingCallSite_);
+  }
+  void* lastProfilingCallSite() { return lastProfilingCallSite_; }
+  void setLastProfilingCallSite(void* ptr) { lastProfilingCallSite_ = ptr; }
+
+  bool hasWasmExitFP() const { return wasm::Frame::isExitFP(packedExitFP_); }
+  wasm::Frame* wasmExitFP() const {
+    MOZ_ASSERT(hasWasmExitFP());
+    return reinterpret_cast<wasm::Frame*>(
+        wasm::Frame::untagExitFP(packedExitFP_));
+  }
+  wasm::Instance* wasmExitInstance() const {
+    return wasm::GetNearestEffectiveInstance(wasmExitFP());
+  }
+  void setWasmExitFP(const wasm::Frame* fp) {
+    if (fp) {
+      MOZ_ASSERT(!wasm::Frame::isExitFP(fp));
+      packedExitFP_ = wasm::Frame::addExitFPTag(fp);
+      MOZ_ASSERT(hasWasmExitFP());
+    } else {
+      packedExitFP_ = nullptr;
+    }
+  }
+  wasm::ExitReason wasmExitReason() const {
+    MOZ_ASSERT(hasWasmExitFP());
+    return wasm::ExitReason::Decode(encodedWasmExitReason_);
+  }
+  static size_t offsetOfEncodedWasmExitReason() {
+    return offsetof(JitActivation, encodedWasmExitReason_);
+  }
+
+  void startWasmTrap(wasm::Trap trap, const wasm::TrapSite& trapSite,
+                     const wasm::RegisterState& state);
+  void finishWasmTrap();
+  bool isWasmTrapping() const { return !!wasmTrapData_; }
+  const wasm::TrapData& wasmTrapData() { return *wasmTrapData_; }
+  void setWasmTrapFaultInfo(uint32_t memoryIndex, uint64_t offset) {
+    MOZ_ASSERT(isWasmTrapping());
+    wasmTrapData_->faultInfo =
+        mozilla::Some(wasm::TrapData::FaultInfo{memoryIndex, offset});
+  }
+};
+
+class JitActivationIterator : public ActivationIterator {
+  void settle() {
+    while (!done() && !activation_->isJit()) {
+      ActivationIterator::operator++();
+    }
+  }
+
+ public:
+  explicit JitActivationIterator(JSContext* cx) : ActivationIterator(cx) {
+    settle();
+  }
+
+  JitActivationIterator& operator++() {
+    ActivationIterator::operator++();
+    settle();
+    return *this;
+  }
+};
+
+}  
+
+}  
+
+#endif  // vm_JitActivation_h

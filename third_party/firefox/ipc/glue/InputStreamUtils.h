@@ -1,0 +1,38 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ipc_InputStreamUtils_h
+#define mozilla_ipc_InputStreamUtils_h
+
+#include "mozilla/ipc/InputStreamParams.h"
+#include "nsCOMPtr.h"
+#include "nsIInputStream.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+namespace ipc {
+
+class FileDescriptor;
+
+class InputStreamHelper {
+ public:
+  static void SerializedComplexity(nsIInputStream* aInputStream,
+                                   uint32_t aMaxSize, uint32_t* aSizeUsed,
+                                   uint32_t* aPipes, uint32_t* aTransferables);
+
+  static void SerializeInputStream(nsIInputStream* aInputStream,
+                                   InputStreamParams& aParams,
+                                   uint32_t aMaxSize, uint32_t* aSizeUsed);
+
+  static void SerializeInputStreamAsPipe(nsIInputStream* aInputStream,
+                                         InputStreamParams& aParams);
+
+  static already_AddRefed<nsIInputStream> DeserializeInputStream(
+      const InputStreamParams& aParams);
+};
+
+}  
+}  
+
+#endif  // mozilla_ipc_InputStreamUtils_h

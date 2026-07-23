@@ -1,0 +1,97 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_intl_IntlOSPreferences_h_
+#define mozilla_intl_IntlOSPreferences_h_
+
+#include "mozilla/StaticPtr.h"
+#include "nsTHashMap.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+#include "mozIOSPreferences.h"
+
+namespace mozilla {
+namespace intl {
+
+class OSPreferences : public mozIOSPreferences {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZIOSPREFERENCES
+
+  enum class DateTimeFormatStyle {
+    Invalid = -1,
+    None,
+    Short,   
+    Medium,  
+    Long,    
+    Full     
+  };
+
+  OSPreferences();
+
+  static OSPreferences* GetInstance();
+
+  static already_AddRefed<OSPreferences> GetInstanceAddRefed();
+
+  static bool GetPatternForSkeleton(const nsACString& aSkeleton,
+                                    const nsACString& aLocale,
+                                    nsACString& aRetVal);
+
+  static bool GetDateTimeConnectorPattern(const nsACString& aLocale,
+                                          nsACString& aRetVal);
+
+  void Refresh();
+
+  void AssignSysLocales(const nsTArray<nsCString>& aLocales) {
+    mSystemLocales = aLocales.Clone();
+  }
+
+ protected:
+  nsTArray<nsCString> mSystemLocales;
+  nsTArray<nsCString> mRegionalPrefsLocales;
+
+  const size_t kMaxCachedPatterns = 15;
+  nsTHashMap<nsCStringHashKey, nsCString> mPatternCache;
+
+ private:
+  virtual ~OSPreferences();
+
+  static StaticRefPtr<OSPreferences> sInstance;
+
+  static bool CanonicalizeLanguageTag(nsCString& aLoc);
+
+  bool GetDateTimePatternForStyle(DateTimeFormatStyle aDateStyle,
+                                  DateTimeFormatStyle aTimeStyle,
+                                  const nsACString& aLocale,
+                                  nsACString& aRetVal);
+
+  bool GetDateTimeSkeletonForStyle(DateTimeFormatStyle aDateStyle,
+                                   DateTimeFormatStyle aTimeStyle,
+                                   const nsACString& aLocale,
+                                   nsACString& aRetVal);
+
+  bool OverrideDateTimePattern(DateTimeFormatStyle aDateStyle,
+                               DateTimeFormatStyle aTimeStyle,
+                               const nsACString& aLocale, nsACString& aRetVal);
+
+  bool ReadSystemLocales(nsTArray<nsCString>& aRetVal);
+
+  bool ReadRegionalPrefsLocales(nsTArray<nsCString>& aRetVal);
+
+  bool ReadDateTimePattern(DateTimeFormatStyle aDateFormatStyle,
+                           DateTimeFormatStyle aTimeFormatStyle,
+                           const nsACString& aLocale, nsACString& aRetVal);
+
+  void OverrideSkeletonHourCycle(bool aIs24Hour, nsAutoCString& aSkeleton);
+
+  void RemoveObservers();
+
+  static void PreferenceChanged(const char* aPrefName, void* );
+};
+
+}  
+}  
+
+#endif /* mozilla_intl_IntlOSPreferences_h_ */

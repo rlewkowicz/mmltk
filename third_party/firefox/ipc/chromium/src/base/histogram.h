@@ -1,0 +1,301 @@
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+
+
+
+
+#if !defined(BASE_METRICS_HISTOGRAM_H_)
+#define BASE_METRICS_HISTOGRAM_H_
+#pragma once
+
+#include "mozilla/MemoryReporting.h"
+
+#include <map>
+#include <string>
+
+#include "base/time.h"
+
+#include "nsTArray.h"
+
+namespace base {
+
+
+class BooleanHistogram;
+class CustomHistogram;
+class Histogram;
+class LinearHistogram;
+
+class Histogram {
+ public:
+  typedef int Sample;  
+  typedef int Count;   
+  static const Sample kSampleType_MAX = INT_MAX;
+  static const size_t kBucketCount_MAX;
+
+  typedef nsTArray<Count> Counts;
+  typedef const Sample* Ranges;
+
+  enum ClassType {
+    HISTOGRAM,
+    LINEAR_HISTOGRAM,
+    BOOLEAN_HISTOGRAM,
+    FLAG_HISTOGRAM,
+    COUNT_HISTOGRAM,
+    CUSTOM_HISTOGRAM,
+    NOT_VALID_IN_RENDERER
+  };
+
+  enum BucketLayout { EXPONENTIAL, LINEAR, CUSTOM };
+
+  enum Flags {
+    kNoFlags = 0,
+    kUmaTargetedHistogramFlag = 0x1,  
+
+    kHexRangePrintingFlag = 0x8000  
+  };
+
+  enum Inconsistencies {
+    NO_INCONSISTENCIES = 0x0,
+    RANGE_CHECKSUM_ERROR = 0x1,
+    BUCKET_ORDER_ERROR = 0x2,
+    COUNT_HIGH_ERROR = 0x4,
+    COUNT_LOW_ERROR = 0x8,
+
+    NEVER_EXCEEDED_VALUE = 0x10
+  };
+
+  struct DescriptionPair {
+    Sample sample;
+    const char* description;  
+  };
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf);
+
+  bool is_empty() const {
+    return this->sample_.counts(0) == 0 && this->sample_.sum() == 0;
+  }
+
+
+  class SampleSet {
+   public:
+    explicit SampleSet();
+    ~SampleSet();
+    SampleSet(SampleSet&&) = default;
+
+
+    void Resize(const Histogram& histogram);
+
+    void Accumulate(Sample value, Count count, size_t index);
+
+    void Add(const SampleSet& other);
+
+    size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf);
+
+    Count counts(size_t i) const { return counts_[i]; }
+    Count TotalCount() const;
+    int64_t sum() const { return sum_; }
+    int64_t redundant_count() const { return redundant_count_; }
+    size_t size() const { return counts_.Length(); }
+    SampleSet Clone() const {
+      SampleSet result;
+      result.counts_ = counts_.Clone();
+      result.sum_ = sum_;
+      result.redundant_count_ = redundant_count_;
+      return result;
+    }
+    void Clear() {
+      sum_ = 0;
+      redundant_count_ = 0;
+      for (int& i : counts_) {
+        i = 0;
+      }
+    }
+
+   protected:
+    Counts counts_;
+
+    int64_t sum_;  
+
+    int64_t redundant_count_;
+  };
+
+  static Histogram* FactoryGet(Sample minimum, Sample maximum,
+                               size_t bucket_count, Flags flags,
+                               const int* buckets);
+
+  virtual ~Histogram();
+
+  void Add(int value);
+  void Subtract(int value);
+
+  virtual void AddBoolean(bool value);
+
+  void AddTime(TimeDelta time) { Add(static_cast<int>(time.InMilliseconds())); }
+
+  virtual void AddSampleSet(const SampleSet& sample);
+
+  virtual void Clear();
+
+  virtual void SetRangeDescriptions(const DescriptionPair descriptions[]);
+
+  void SetFlags(Flags flags) { flags_ = static_cast<Flags>(flags_ | flags); }
+  void ClearFlags(Flags flags) { flags_ = static_cast<Flags>(flags_ & ~flags); }
+  int flags() const { return flags_; }
+
+  virtual Inconsistencies FindCorruption(const SampleSet& snapshot) const;
+
+  virtual ClassType histogram_type() const;
+  Sample declared_min() const { return declared_min_; }
+  Sample declared_max() const { return declared_max_; }
+  virtual Sample ranges(size_t i) const;
+  uint32_t range_checksum() const { return range_checksum_; }
+  virtual size_t bucket_count() const;
+
+  virtual SampleSet SnapshotSample() const;
+
+  virtual bool HasConstructorArguments(Sample minimum, Sample maximum,
+                                       size_t bucket_count);
+
+  virtual bool HasConstructorTimeDeltaArguments(TimeDelta minimum,
+                                                TimeDelta maximum,
+                                                size_t bucket_count);
+  bool HasValidRangeChecksum() const;
+
+ protected:
+  Histogram(Sample minimum, Sample maximum, size_t bucket_count);
+  Histogram(TimeDelta minimum, TimeDelta maximum, size_t bucket_count);
+
+  void InitializeBucketRangeFromData(const int* buckets);
+
+  virtual bool PrintEmptyBucket(size_t index) const;
+
+  virtual size_t BucketIndex(Sample value) const;
+  virtual double GetBucketSize(Count current, size_t i) const;
+
+  void ResetRangeChecksum();
+
+  virtual const std::string GetAsciiBucketRange(size_t it) const;
+
+  virtual void Accumulate(Sample value, Count count, size_t index);
+
+  bool ValidateBucketRanges() const;
+
+  virtual uint32_t CalculateRangeChecksum() const;
+
+  SampleSet sample_;
+
+ private:
+  void Initialize();
+
+  static uint32_t Crc32(uint32_t sum, Sample range);
+
+
+  double GetPeakBucketSize(const SampleSet& snapshot) const;
+
+  static const uint32_t kCrcTable[256];
+
+  Sample declared_min_;  
+  Sample declared_max_;  
+  size_t bucket_count_;  
+
+  Flags flags_;
+
+  Ranges ranges_;
+
+  uint32_t range_checksum_;
+
+  DISALLOW_COPY_AND_ASSIGN(Histogram);
+};
+
+
+class LinearHistogram : public Histogram {
+ public:
+  virtual ~LinearHistogram();
+
+  static Histogram* FactoryGet(Sample minimum, Sample maximum,
+                               size_t bucket_count, Flags flags,
+                               const int* buckets);
+
+  virtual ClassType histogram_type() const override;
+
+  virtual void Accumulate(Sample value, Count count, size_t index) override;
+
+  virtual void SetRangeDescriptions(
+      const DescriptionPair descriptions[]) override;
+
+ protected:
+  LinearHistogram(Sample minimum, Sample maximum, size_t bucket_count);
+
+  LinearHistogram(TimeDelta minimum, TimeDelta maximum, size_t bucket_count);
+
+  virtual double GetBucketSize(Count current, size_t i) const override;
+
+  virtual const std::string GetAsciiBucketRange(size_t i) const override;
+
+  virtual bool PrintEmptyBucket(size_t index) const override;
+
+ private:
+  typedef std::map<Sample, std::string> BucketDescriptionMap;
+  BucketDescriptionMap bucket_description_;
+
+  DISALLOW_COPY_AND_ASSIGN(LinearHistogram);
+};
+
+
+class BooleanHistogram : public LinearHistogram {
+ public:
+  static Histogram* FactoryGet(Flags flags, const int* buckets);
+
+  virtual ClassType histogram_type() const override;
+
+  virtual void AddBoolean(bool value) override;
+
+  virtual void Accumulate(Sample value, Count count, size_t index) override;
+
+ protected:
+  explicit BooleanHistogram();
+
+  DISALLOW_COPY_AND_ASSIGN(BooleanHistogram);
+};
+
+
+class FlagHistogram : public BooleanHistogram {
+ public:
+  static Histogram* FactoryGet(Flags flags, const int* buckets);
+
+  virtual ClassType histogram_type() const override;
+
+  virtual void Accumulate(Sample value, Count count, size_t index) override;
+
+  virtual void AddSampleSet(const SampleSet& sample) override;
+
+  virtual void Clear() override;
+
+ private:
+  explicit FlagHistogram();
+  bool mSwitched;
+
+  DISALLOW_COPY_AND_ASSIGN(FlagHistogram);
+};
+
+class CountHistogram : public LinearHistogram {
+ public:
+  static Histogram* FactoryGet(Flags flags, const int* buckets);
+
+  virtual ClassType histogram_type() const override;
+
+  virtual void Accumulate(Sample value, Count count, size_t index) override;
+
+  virtual void AddSampleSet(const SampleSet& sample) override;
+
+ private:
+  explicit CountHistogram();
+
+  DISALLOW_COPY_AND_ASSIGN(CountHistogram);
+};
+
+}  
+
+#endif

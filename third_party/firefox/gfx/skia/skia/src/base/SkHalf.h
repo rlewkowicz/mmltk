@@ -1,0 +1,25 @@
+/*
+ * Copyright 2014 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkHalf_DEFINED)
+#define SkHalf_DEFINED
+
+#include <cstdint>
+
+using SkHalf = uint16_t;
+
+static constexpr uint16_t SK_HalfNaN      = 0x7c01; 
+static constexpr uint16_t SK_HalfInfinity = 0x7c00;
+static constexpr uint16_t SK_HalfMin      = 0x0400; 
+static constexpr uint16_t SK_HalfMax      = 0x7bff; 
+static constexpr uint16_t SK_HalfEpsilon  = 0x1400; 
+static constexpr uint16_t SK_Half1        = 0x3C00; 
+
+float SkHalfToFloat(SkHalf h);
+SkHalf SkFloatToHalf(float f);
+
+#endif

@@ -1,0 +1,510 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsCanvasFrame.h"
+
+#include "gfxContext.h"
+#include "gfxPlatform.h"
+#include "gfxUtils.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ReflowInput.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/StaticPrefs_browser.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/dom/AnonymousContent.h"
+#include "mozilla/layers/RenderRootStateManager.h"
+#include "mozilla/layers/StackingContextHelper.h"
+#include "nsCSSFrameConstructor.h"
+#include "nsCSSRendering.h"
+#include "nsContainerFrame.h"
+#include "nsContentCreatorFunctions.h"
+#include "nsDisplayList.h"
+#include "nsFrameManager.h"
+#include "nsGkAtoms.h"
+#include "nsIFrameInlines.h"
+#include "nsPresContext.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using namespace mozilla::layout;
+using namespace mozilla::gfx;
+using namespace mozilla::layers;
+
+nsCanvasFrame* NS_NewCanvasFrame(PresShell* aPresShell, ComputedStyle* aStyle) {
+  return new (aPresShell) nsCanvasFrame(aStyle, aPresShell->GetPresContext());
+}
+
+nsIPopupContainer* nsIPopupContainer::GetPopupContainer(PresShell* aPresShell) {
+  return aPresShell ? aPresShell->GetCanvasFrame() : nullptr;
+}
+
+NS_IMPL_FRAMEARENA_HELPERS(nsCanvasFrame)
+
+NS_QUERYFRAME_HEAD(nsCanvasFrame)
+  NS_QUERYFRAME_ENTRY(nsCanvasFrame)
+  NS_QUERYFRAME_ENTRY(nsIAnonymousContentCreator)
+  NS_QUERYFRAME_ENTRY(nsIPopupContainer)
+NS_QUERYFRAME_TAIL_INHERITING(nsContainerFrame)
+
+nsresult nsCanvasFrame::CreateAnonymousContent(
+    nsTArray<ContentInfo>& aElements) {
+  if (!mContent) {
+    return NS_OK;
+  }
+
+  Document* doc = mContent->OwnerDoc();
+
+  if (XRE_IsParentProcess() && doc->NodePrincipal()->IsSystemPrincipal()) {
+    nsNodeInfoManager* nodeInfoManager = doc->NodeInfoManager();
+    RefPtr<NodeInfo> nodeInfo = nodeInfoManager->GetNodeInfo(
+        nsGkAtoms::tooltip, nullptr, kNameSpaceID_XUL, nsINode::ELEMENT_NODE);
+
+    nsresult rv = NS_NewXULElement(getter_AddRefs(mTooltipContent),
+                                   nodeInfo.forget(), dom::NOT_FROM_PARSER);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    mTooltipContent->SetAttr(kNameSpaceID_None, nsGkAtoms::_default, u"true"_ns,
+                             false);
+    mTooltipContent->SetAttr(kNameSpaceID_None, nsGkAtoms::page, u"true"_ns,
+                             false);
+
+    mTooltipContent->SetProperty(nsGkAtoms::docLevelNativeAnonymousContent,
+                                 reinterpret_cast<void*>(true));
+
+    aElements.AppendElement(mTooltipContent);
+  }
+
+#ifdef DEBUG
+  for (auto& element : aElements) {
+    MOZ_ASSERT(element.mContent->GetProperty(
+                   nsGkAtoms::docLevelNativeAnonymousContent),
+               "NAC from the canvas frame needs to be document-level, otherwise"
+               " it (1) inherits from the document which is unexpected, and (2)"
+               " StyleChildrenIterator won't be able to find it properly");
+  }
+#endif
+  return NS_OK;
+}
+
+void nsCanvasFrame::AppendAnonymousContentTo(nsTArray<nsIContent*>& aElements,
+                                             uint32_t aFilter) {
+  if (mTooltipContent) {
+    aElements.AppendElement(mTooltipContent);
+  }
+}
+
+void nsCanvasFrame::Destroy(DestroyContext& aContext) {
+  if (mTooltipContent) {
+    aContext.AddAnonymousContent(mTooltipContent.forget());
+  }
+  nsContainerFrame::Destroy(aContext);
+}
+
+void nsCanvasFrame::SetInitialChildList(ChildListID aListID,
+                                        nsFrameList&& aChildList) {
+  NS_ASSERTION(aListID != FrameChildListID::Principal || aChildList.IsEmpty() ||
+                   aChildList.OnlyChild() || GetPrevInFlow(),
+               "Principal child list of first-in-flow canvas frame can have at "
+               "most one frame in it!");
+  nsContainerFrame::SetInitialChildList(aListID, std::move(aChildList));
+}
+
+void nsCanvasFrame::AppendFrames(ChildListID aListID,
+                                 nsFrameList&& aFrameList) {
+#ifdef DEBUG
+  MOZ_ASSERT(aListID == FrameChildListID::Principal, "unexpected child list");
+  if (!mFrames.IsEmpty()) {
+    for (nsIFrame* f : aFrameList) {
+      MOZ_ASSERT(f->GetContent()->IsInNativeAnonymousSubtree(),
+                 "invalid child list");
+    }
+  }
+  nsIFrame::VerifyDirtyBitSet(aFrameList);
+#endif
+  nsContainerFrame::AppendFrames(aListID, std::move(aFrameList));
+}
+
+void nsCanvasFrame::InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                                 const nsLineList::iterator* aPrevFrameLine,
+                                 nsFrameList&& aFrameList) {
+  MOZ_ASSERT(!aPrevFrame, "unexpected previous sibling frame");
+  AppendFrames(aListID, std::move(aFrameList));
+}
+
+#ifdef DEBUG
+void nsCanvasFrame::RemoveFrame(DestroyContext& aContext, ChildListID aListID,
+                                nsIFrame* aOldFrame) {
+  MOZ_ASSERT(aListID == FrameChildListID::Principal, "unexpected child list");
+  nsContainerFrame::RemoveFrame(aContext, aListID, aOldFrame);
+}
+#endif
+
+nsRect nsCanvasFrame::CanvasArea() const {
+  nsRect result(InkOverflowRect());
+
+  if (ScrollContainerFrame* scrollContainerFrame = do_QueryFrame(GetParent())) {
+    nsRect portRect = scrollContainerFrame->GetScrollPortRect();
+    result.UnionRect(result, nsRect(nsPoint(0, 0), portRect.Size()));
+  }
+  return result;
+}
+
+Element* nsCanvasFrame::GetDefaultTooltip() { return mTooltipContent; }
+
+void nsDisplayCanvasBackgroundImage::Paint(nsDisplayListBuilder* aBuilder,
+                                           gfxContext* aCtx) {
+  auto* frame = static_cast<nsCanvasFrame*>(mFrame);
+  nsPoint offset = ToReferenceFrame();
+  nsRect bgClipRect = frame->CanvasArea() + offset;
+
+  PaintInternal(aBuilder, aCtx, GetPaintRect(aBuilder, aCtx), &bgClipRect);
+}
+
+bool nsDisplayCanvasBackgroundImage::IsSingleFixedPositionImage(
+    nsDisplayListBuilder* aBuilder, const nsRect& aClipRect,
+    gfxRect* aDestRect) {
+  if (!mBackgroundStyle) {
+    return false;
+  }
+
+  if (mBackgroundStyle->StyleBackground()->mImage.mLayers.Length() != 1) {
+    return false;
+  }
+
+  nsPresContext* presContext = mFrame->PresContext();
+  uint32_t flags = aBuilder->GetBackgroundPaintFlags();
+  nsRect borderArea = nsRect(ToReferenceFrame(), mFrame->GetSize());
+  const nsStyleImageLayers::Layer& layer =
+      mBackgroundStyle->StyleBackground()->mImage.mLayers[mLayer];
+
+  if (layer.mAttachment != StyleImageLayerAttachment::Fixed) {
+    return false;
+  }
+
+  nsBackgroundLayerState state = nsCSSRendering::PrepareImageLayer(
+      presContext, mFrame, flags, borderArea, aClipRect, layer);
+
+  if (!mIsRasterImage) {
+    return false;
+  }
+
+  int32_t appUnitsPerDevPixel = presContext->AppUnitsPerDevPixel();
+  *aDestRect =
+      nsLayoutUtils::RectToGfxRect(state.mFillArea, appUnitsPerDevPixel);
+
+  return true;
+}
+
+void nsCanvasFrame::BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                                     const nsDisplayListSet& aLists) {
+  MOZ_ASSERT(IsVisibleForPainting(),
+             "::-moz-{scrolled-,}canvas doesn't inherit from anything that can "
+             "be invisible, and we don't specify visibility in UA sheets");
+  MOZ_ASSERT(!IsThemed(),
+             "::-moz-{scrolled-,}canvas doesn't have native appearance");
+  if (GetPrevInFlow()) {
+    DisplayOverflowContainers(aBuilder, aLists);
+  }
+
+  ComputedStyle* bg = nullptr;
+  nsIFrame* dependentFrame = nsCSSRendering::FindBackgroundFrame(this);
+  if (dependentFrame) {
+    bg = dependentFrame->Style();
+    if (dependentFrame == this) {
+      dependentFrame = nullptr;
+    }
+  }
+
+  if (!bg) {
+    return;
+  }
+
+  const ActiveScrolledRoot* asr = aBuilder->CurrentActiveScrolledRoot();
+
+  bool needBlendContainerForBackgroundBlendMode = false;
+  nsDisplayListBuilder::AutoContainerASRTracker contASRTracker(aBuilder);
+
+  const bool suppressBackgroundImage = [&] {
+    if (!ComputeShouldPaintBackground().mImage) {
+      return true;
+    }
+    if (PresContext()->ForcingColors() &&
+        StaticPrefs::
+            browser_display_suppress_canvas_background_image_on_forced_colors()) {
+      return true;
+    }
+    return false;
+  }();
+
+  const bool isPage = GetParent()->IsPageContentFrame();
+  const auto& canvasBg = PresShell()->GetCanvasBackground(isPage);
+
+  nsDisplayList list(aBuilder);
+
+  nsDisplaySolidColor* backgroundColorItem = nullptr;
+  if (NS_GET_A(canvasBg.mColor)) {
+    MOZ_ASSERT(
+        canvasBg.mCSSSpecified || NS_GET_A(canvasBg.mColor) == 255,
+        "Default canvas background should either be transparent or opaque");
+    backgroundColorItem = MakeDisplayItem<nsDisplaySolidColor>(
+        aBuilder, this,
+        CanvasArea() + aBuilder->GetCurrentFrameOffsetToReferenceFrame(),
+        canvasBg.mColor);
+    list.AppendToTop(backgroundColorItem);
+  }
+
+  const nsStyleImageLayers& layers = bg->StyleBackground()->mImage;
+  NS_FOR_VISIBLE_IMAGE_LAYERS_BACK_TO_FRONT(i, layers) {
+    if (layers.mLayers[i].mImage.IsNone() || suppressBackgroundImage) {
+      continue;
+    }
+
+    nsRect bgRect = GetRectRelativeToSelf() + aBuilder->ToReferenceFrame(this);
+
+    const ActiveScrolledRoot* thisItemASR = asr;
+    nsDisplayList thisItemList(aBuilder);
+    nsDisplayBackgroundImage::InitData bgData =
+        nsDisplayBackgroundImage::GetInitData(aBuilder, this, i, bgRect, bg);
+
+    if (bgData.shouldFixToViewport) {
+      auto* displayData = aBuilder->GetCurrentFixedBackgroundDisplayData();
+      nsDisplayListBuilder::AutoBuildingDisplayList buildingDisplayList(
+          aBuilder, this, aBuilder->GetVisibleRect(), aBuilder->GetDirtyRect());
+
+      DisplayListClipState::AutoSaveRestore clipState(aBuilder);
+      nsDisplayListBuilder::AutoCurrentActiveScrolledRootSetter asrSetter(
+          aBuilder);
+      if (displayData) {
+        const nsPoint offset = GetOffsetTo(PresShell()->GetRootFrame());
+        aBuilder->SetVisibleRect(displayData->mVisibleRect + offset);
+        aBuilder->SetDirtyRect(displayData->mDirtyRect + offset);
+
+        clipState.SetClipChainForContainingBlockDescendants(
+            displayData->mContainingBlockClipChain);
+        asrSetter.SetCurrentActiveScrolledRoot(
+            displayData->mContainingBlockActiveScrolledRoot);
+        asrSetter.SetCurrentScrollParentId(displayData->mScrollParentId);
+        thisItemASR = displayData->mContainingBlockActiveScrolledRoot;
+      }
+      nsDisplayCanvasBackgroundImage* bgItem = nullptr;
+      {
+        DisplayListClipState::AutoSaveRestore bgImageClip(aBuilder);
+        bgImageClip.Clear();
+        bgItem = MakeDisplayItemWithIndex<nsDisplayCanvasBackgroundImage>(
+            aBuilder, this,  i, bgData);
+        if (bgItem) {
+          bgItem->SetDependentFrame(aBuilder, dependentFrame);
+        }
+      }
+      if (bgItem) {
+        const ActiveScrolledRoot* scrollTargetASR =
+            asr ? asr->GetNearestScrollASR() : nullptr;
+        thisItemList.AppendToTop(
+            nsDisplayFixedPosition::CreateForFixedBackground(
+                aBuilder, this, nullptr, bgItem, i, scrollTargetASR));
+      }
+
+    } else {
+      nsDisplayCanvasBackgroundImage* bgItem =
+          MakeDisplayItemWithIndex<nsDisplayCanvasBackgroundImage>(
+              aBuilder, this,  i, bgData);
+      if (bgItem) {
+        bgItem->SetDependentFrame(aBuilder, dependentFrame);
+        thisItemList.AppendToTop(bgItem);
+      }
+    }
+
+    if (layers.mLayers[i].mBlendMode != StyleBlend::Normal) {
+      DisplayListClipState::AutoSaveRestore blendClip(aBuilder);
+      thisItemList.AppendNewToTopWithIndex<nsDisplayBlendMode>(
+          aBuilder, this, i + 1, &thisItemList, layers.mLayers[i].mBlendMode,
+          thisItemASR, nsDisplayItem::ContainerASRType::Constant, true);
+      needBlendContainerForBackgroundBlendMode = true;
+    }
+    list.AppendToTop(&thisItemList);
+  }
+
+  if (needBlendContainerForBackgroundBlendMode) {
+    const ActiveScrolledRoot* containerASR = contASRTracker.GetContainerASR();
+    DisplayListClipState::AutoSaveRestore blendContainerClip(aBuilder);
+    list.AppendToTop(nsDisplayBlendContainer::CreateForBackgroundBlendMode(
+        aBuilder, this, nullptr, &list, containerASR,
+        nsDisplayItem::ContainerASRType::AncestorOfContained));
+  }
+
+  aLists.BorderBackground()->AppendToTop(&list);
+
+  for (nsIFrame* kid : PrincipalChildList()) {
+    BuildDisplayListForChild(aBuilder, kid, aLists);
+  }
+
+  if (GetPrevInFlow() || GetNextInFlow()) {
+    DisplayAbsoluteFramesNotBuiltByPlaceholder(aBuilder, aLists);
+  }
+
+  if (!canvasBg.mCSSSpecified && backgroundColorItem &&
+      (needBlendContainerForBackgroundBlendMode ||
+       aBuilder->ContainsBlendMode())) {
+    backgroundColorItem->OverrideColor(NS_TRANSPARENT);
+  }
+}
+
+nscoord nsCanvasFrame::IntrinsicISize(const IntrinsicSizeInput& aInput,
+                                      IntrinsicISizeType aType) {
+  return mFrames.IsEmpty()
+             ? 0
+             : mFrames.FirstChild()->IntrinsicISize(aInput, aType);
+}
+
+void nsCanvasFrame::Reflow(nsPresContext* aPresContext,
+                           ReflowOutput& aDesiredSize,
+                           const ReflowInput& aReflowInput,
+                           nsReflowStatus& aStatus) {
+  MarkInReflow();
+  DO_GLOBAL_REFLOW_COUNT("nsCanvasFrame");
+  MOZ_ASSERT(aStatus.IsEmpty(), "Caller should pass a fresh reflow status!");
+  NS_FRAME_TRACE_REFLOW_IN("nsCanvasFrame::Reflow");
+
+  auto* prevCanvasFrame = static_cast<nsCanvasFrame*>(GetPrevInFlow());
+  if (prevCanvasFrame) {
+    AutoFrameListPtr overflow(aPresContext,
+                              prevCanvasFrame->StealOverflowFrames());
+    if (overflow) {
+      NS_ASSERTION(overflow->OnlyChild(),
+                   "must have doc root as canvas frame's only child");
+      mFrames.InsertFrames(this, nullptr, std::move(*overflow));
+    }
+  }
+
+  SetSize(aReflowInput.ComputedPhysicalSize());
+
+  const WritingMode wm = aReflowInput.GetWritingMode();
+  aDesiredSize.SetSize(wm, aReflowInput.ComputedSize());
+  if (aReflowInput.ComputedBSize() == NS_UNCONSTRAINEDSIZE) {
+    aDesiredSize.BSize(wm) = nscoord(0);
+  }
+  aDesiredSize.SetOverflowAreasToDesiredBounds();
+  nsIFrame* nextKid = nullptr;
+  for (auto* kidFrame = mFrames.FirstChild(); kidFrame; kidFrame = nextKid) {
+    nextKid = kidFrame->GetNextSibling();
+    ReflowOutput kidDesiredSize(aReflowInput);
+    bool kidDirty = kidFrame->HasAnyStateBits(NS_FRAME_IS_DIRTY);
+    WritingMode kidWM = kidFrame->GetWritingMode();
+    auto availableSize = aReflowInput.AvailableSize(kidWM);
+    nscoord bOffset = 0;
+    nscoord canvasBSizeSum = 0;
+    if (prevCanvasFrame && availableSize.BSize(kidWM) != NS_UNCONSTRAINEDSIZE &&
+        !kidFrame->IsPlaceholderFrame() &&
+        StaticPrefs::layout_display_list_improve_fragmentation()) {
+      for (auto* pif = prevCanvasFrame; pif;
+           pif = static_cast<nsCanvasFrame*>(pif->GetPrevInFlow())) {
+        canvasBSizeSum += pif->BSize(kidWM);
+        auto* pifChild = pif->PrincipalChildList().FirstChild();
+        if (pifChild) {
+          nscoord layoutOverflow = pifChild->BSize(kidWM) - canvasBSizeSum;
+          if (layoutOverflow < 0) {
+            LogicalRect so(kidWM, pifChild->ScrollableOverflowRect(),
+                           pifChild->GetSize());
+            layoutOverflow = so.BEnd(kidWM) - canvasBSizeSum;
+          }
+          bOffset = std::max(bOffset, layoutOverflow);
+        }
+      }
+      availableSize.BSize(kidWM) -= bOffset;
+    }
+
+    if (MOZ_LIKELY(availableSize.BSize(kidWM) > 0)) {
+      ReflowInput kidReflowInput(aPresContext, aReflowInput, kidFrame,
+                                 availableSize);
+
+      if (aReflowInput.IsBResizeForWM(kidReflowInput.GetWritingMode()) &&
+          kidFrame->HasAnyStateBits(NS_FRAME_CONTAINS_RELATIVE_BSIZE)) {
+        kidReflowInput.SetBResize(true);
+      }
+
+      nsSize containerSize = aReflowInput.ComputedPhysicalSize();
+      LogicalMargin margin = kidReflowInput.ComputedLogicalMargin(kidWM);
+      LogicalPoint kidPt(kidWM, margin.IStart(kidWM), margin.BStart(kidWM));
+      (kidWM.IsOrthogonalTo(wm) ? kidPt.I(kidWM) : kidPt.B(kidWM)) += bOffset;
+
+      nsReflowStatus kidStatus;
+      ReflowChild(kidFrame, aPresContext, kidDesiredSize, kidReflowInput, kidWM,
+                  kidPt, containerSize, ReflowChildFlags::Default, kidStatus);
+
+      FinishReflowChild(kidFrame, aPresContext, kidDesiredSize, &kidReflowInput,
+                        kidWM, kidPt, containerSize,
+                        ReflowChildFlags::ApplyRelativePositioning);
+
+      if (!kidStatus.IsFullyComplete()) {
+        nsIFrame* nextFrame = kidFrame->GetNextInFlow();
+        NS_ASSERTION(nextFrame || kidStatus.NextInFlowNeedsReflow(),
+                     "If it's incomplete and has no nif yet, it must flag a "
+                     "nif reflow.");
+        if (!nextFrame) {
+          nextFrame = aPresContext->PresShell()
+                          ->FrameConstructor()
+                          ->CreateContinuingFrame(kidFrame, this);
+          SetOverflowFrames(nsFrameList(nextFrame, nextFrame));
+        }
+        if (kidStatus.IsOverflowIncomplete()) {
+          nextFrame->AddStateBits(NS_FRAME_IS_OVERFLOW_CONTAINER);
+        }
+      }
+      aStatus.MergeCompletionStatusFrom(kidStatus);
+
+      if (kidDirty) {
+        nsIFrame* viewport = PresShell()->GetRootFrame();
+        viewport->InvalidateFrame();
+      }
+
+      if (aReflowInput.ComputedBSize() == NS_UNCONSTRAINEDSIZE &&
+          !kidFrame->IsPlaceholderFrame()) {
+        LogicalSize finalSize = aReflowInput.ComputedSize();
+        finalSize.BSize(wm) = nsPresContext::RoundUpAppUnitsToCSSPixel(
+            kidFrame->GetLogicalSize(wm).BSize(wm) +
+            kidReflowInput.ComputedLogicalMargin(wm).BStartEnd(wm));
+        aDesiredSize.SetSize(wm, finalSize);
+        aDesiredSize.SetOverflowAreasToDesiredBounds();
+      }
+      aDesiredSize.mOverflowAreas.UnionWith(kidDesiredSize.mOverflowAreas +
+                                            kidFrame->GetPosition());
+    } else if (kidFrame->IsPlaceholderFrame()) {
+    } else {
+      mFrames.RemoveFrame(kidFrame);
+      SetOverflowFrames(nsFrameList(kidFrame, kidFrame));
+      aStatus.SetIncomplete();
+    }
+  }
+
+  if (prevCanvasFrame) {
+    ReflowOverflowContainerChildren(aPresContext, aReflowInput,
+                                    aDesiredSize.mOverflowAreas,
+                                    ReflowChildFlags::Default, aStatus);
+  }
+
+  FinishReflowWithAbsoluteFrames(aPresContext, aDesiredSize, aReflowInput,
+                                 aStatus);
+
+  NS_FRAME_TRACE_REFLOW_OUT("nsCanvasFrame::Reflow", aStatus);
+}
+
+nsIContent* nsCanvasFrame::GetExplicitEventTargetContent(
+    const WidgetEvent* aEvent ) const {
+  if (nsIContent* content = nsIFrame::GetExplicitEventTargetContent(aEvent)) {
+    return content;
+  }
+  if (const nsIFrame* kid = mFrames.FirstChild()) {
+    return kid->GetExplicitEventTargetContent(aEvent);
+  }
+  return nullptr;
+}
+
+#ifdef DEBUG_FRAME_DUMP
+nsresult nsCanvasFrame::GetFrameName(nsAString& aResult) const {
+  return MakeFrameName(u"Canvas"_ns, aResult);
+}
+#endif

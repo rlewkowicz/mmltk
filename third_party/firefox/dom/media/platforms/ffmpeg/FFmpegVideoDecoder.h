@@ -1,0 +1,445 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(FFmpegVideoDecoder_h_)
+#define FFmpegVideoDecoder_h_
+
+#include <atomic>
+
+#include "AndroidSurfaceTexture.h"
+#include "FFmpegDataDecoder.h"
+#include "FFmpegLibWrapper.h"
+#include "ImageContainer.h"
+#include "PerformanceRecorder.h"
+#include "SimpleMap.h"
+#include "nsTHashMap.h"
+#if defined(MOZ_USE_HWDECODE) && defined(MOZ_WIDGET_GTK)
+#  include "FFmpegVideoFramePool.h"
+#if LIBAVCODEC_VERSION_MAJOR >= 60 && !defined(FFVPX_VERSION)
+#    include "VulkanDeviceHolder.h"
+#endif
+#endif
+#include "libavutil/pixfmt.h"
+#if LIBAVCODEC_VERSION_MAJOR < 54
+#  define AVPixelFormat PixelFormat
+#endif
+
+
+#if LIBAVCODEC_VERSION_MAJOR >= 57 && LIBAVUTIL_VERSION_MAJOR >= 56
+#  define CUSTOMIZED_BUFFER_ALLOCATION 1
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+#    define CUSTOMIZED_BUFFER_ALLOCATION_ASSERT_ENABLED
+#endif
+#endif
+
+#if defined(CUSTOMIZED_BUFFER_ALLOCATION)
+#  include "mozilla/layers/TextureClient.h"
+#endif
+
+#if defined(CUSTOMIZED_BUFFER_ALLOCATION_ASSERT_ENABLED)
+#  include "mozilla/DataMutex.h"
+#  include "nsTHashSet.h"
+#endif
+
+#if LIBAVCODEC_VERSION_MAJOR < 58 || 0
+#  define MOZ_FFMPEG_USE_INPUT_INFO_MAP
+#endif
+
+struct _VADRMPRIMESurfaceDescriptor;
+typedef struct _VADRMPRIMESurfaceDescriptor VADRMPRIMESurfaceDescriptor;
+
+struct AVHWFramesContext;
+struct AVFrame;
+#if LIBAVCODEC_VERSION_MAJOR >= 60 && !defined(FFVPX_VERSION)
+#  include <vulkan/vulkan.h>
+#endif
+
+namespace mozilla {
+namespace layers {
+class AndroidImageReader;
+class BufferRecycleBin;
+}  
+
+#if defined(CUSTOMIZED_BUFFER_ALLOCATION_ASSERT_ENABLED)
+class ImageBufferTracker;
+class ImageBufferWrapper;
+#endif
+
+#if defined(MOZ_ENABLE_D3D11VA)
+class DXVA2Manager;
+#endif
+
+template <int V>
+class FFmpegVideoDecoder : public FFmpegDataDecoder<V> {};
+
+template <>
+class FFmpegVideoDecoder<LIBAV_VER>;
+DDLoggedTypeNameAndBase(FFmpegVideoDecoder<LIBAV_VER>,
+                        FFmpegDataDecoder<LIBAV_VER>);
+
+template <>
+class FFmpegVideoDecoder<LIBAV_VER>
+    : public FFmpegDataDecoder<LIBAV_VER>,
+      public DecoderDoctorLifeLogger<FFmpegVideoDecoder<LIBAV_VER>> {
+  typedef mozilla::layers::Image Image;
+  typedef mozilla::layers::ImageContainer ImageContainer;
+  typedef mozilla::layers::KnowsCompositor KnowsCompositor;
+
+ public:
+  FFmpegVideoDecoder(const FFmpegLibWrapper* aLib, const VideoInfo& aConfig,
+                     KnowsCompositor* aAllocator,
+                     ImageContainer* aImageContainer, bool aLowLatency,
+                     bool aDisableHardwareDecoding, bool a8BitOutput,
+                     Maybe<TrackingId> aTrackingId);
+
+  ~FFmpegVideoDecoder();
+
+  RefPtr<InitPromise> Init() override;
+  void InitCodecContext() MOZ_REQUIRES(sMutex) override;
+  nsCString GetDescriptionName() const override {
+#if defined(USING_MOZFFVPX)
+    return "ffvpx video decoder"_ns;
+#else
+    return "ffmpeg video decoder"_ns;
+#endif
+  }
+  nsCString GetCodecName() const override;
+  ConversionRequired NeedsConversion() const override {
+#if LIBAVCODEC_VERSION_MAJOR >= 55
+    if (mCodecID == AV_CODEC_ID_HEVC) {
+      return ConversionRequired::kNeedHVCC;
+    }
+#endif
+    return mCodecID == AV_CODEC_ID_H264 ? ConversionRequired::kNeedAVCC
+                                        : ConversionRequired::kNeedNone;
+  }
+
+
+  static AVCodecID GetCodecId(const nsACString& aMimeType);
+
+#if defined(CUSTOMIZED_BUFFER_ALLOCATION)
+  int GetVideoBuffer(struct AVCodecContext* aCodecContext, AVFrame* aFrame,
+                     int aFlags);
+  int GetVideoBufferDefault(struct AVCodecContext* aCodecContext,
+                            AVFrame* aFrame, int aFlags) {
+    mIsUsingShmemBufferForDecode = Some(false);
+    return mLib->avcodec_default_get_buffer2(aCodecContext, aFrame, aFlags);
+  }
+#endif
+  bool IsHardwareAccelerated() const {
+    nsAutoCString dummy;
+    return IsHardwareAccelerated(dummy);
+  }
+
+ private:
+  RefPtr<FlushPromise> ProcessFlush() override;
+  void ProcessShutdown() override;
+  MediaResult DoDecode(MediaRawData* aSample, uint8_t* aData, int aSize,
+                       bool* aGotFrame, DecodedData& aResults) override;
+  void OutputDelayedFrames();
+  bool NeedParser() const override {
+    return
+#if LIBAVCODEC_VERSION_MAJOR >= 58
+        false;
+#else
+#if LIBAVCODEC_VERSION_MAJOR >= 55
+        mCodecID == AV_CODEC_ID_VP9 ||
+#endif
+        mCodecID == AV_CODEC_ID_VP8;
+#endif
+  }
+  gfx::ColorDepth GetColorDepth(const AVPixelFormat& aFormat) const;
+  gfx::YUVColorSpace GetFrameColorSpace() const;
+  gfx::ColorSpace2 GetFrameColorPrimaries() const;
+  gfx::ColorRange GetFrameColorRange() const;
+  gfx::SurfaceFormat GetSurfaceFormat() const;
+
+  MediaResult CreateImage(int64_t aOffset, int64_t aPts, int64_t aDuration,
+                          MediaDataDecoder::DecodedData& aResults);
+
+  bool IsHardwareAccelerated(nsACString& aFailureReason) const override;
+
+#if defined(CUSTOMIZED_BUFFER_ALLOCATION)
+  layers::TextureClient* AllocateTextureClientForImage(
+      struct AVCodecContext* aCodecContext, layers::PlanarYCbCrImage* aImage);
+
+  gfx::IntSize GetAlignmentVideoFrameSize(struct AVCodecContext* aCodecContext,
+                                          int32_t aWidth,
+                                          int32_t aHeight) const;
+#endif
+
+  RefPtr<KnowsCompositor> mImageAllocator;
+  RefPtr<ImageContainer> mImageContainer;
+  VideoInfo mInfo;
+
+#if defined(MOZ_USE_HWDECODE)
+ public:
+  static AVCodec* FindVideoHardwareAVCodec(
+      const FFmpegLibWrapper* aLib, AVCodecID aCodec,
+      AVHWDeviceType aDeviceType = AV_HWDEVICE_TYPE_NONE);
+
+ private:
+  void InitHWDecoderIfAllowed();
+
+  enum class ContextType {
+    D3D11VA,     
+    MediaCodec,  
+    VAAPI,       
+    V4L2,        
+    Vulkan,      
+  };
+  void InitHWCodecContext(ContextType aType);
+
+  bool ShouldDisableHWDecoding(bool aDisableHardwareDecoding) const;
+
+  const bool mHardwareDecodingDisabled;
+#endif
+
+#if defined(MOZ_ENABLE_D3D11VA)
+  MediaResult InitD3D11VADecoder();
+
+  MediaResult CreateImageD3D11(int64_t aOffset, int64_t aPts, int64_t aDuration,
+                               MediaDataDecoder::DecodedData& aResults);
+  bool CanUseZeroCopyVideoFrame() const;
+
+  AVBufferRef* mD3D11VADeviceContext = nullptr;
+  RefPtr<ID3D11Device> mDevice;
+  UniquePtr<DXVA2Manager> mDXVA2Manager;
+  std::atomic<uint8_t> mNumOfHWTexturesInUse{0};
+#endif
+
+
+#if defined(MOZ_USE_HWDECODE) && defined(MOZ_WIDGET_GTK)
+  bool UploadSWDecodeToDMABuf() const;
+  bool IsLinuxHDR() const;
+  MediaResult InitVAAPIDecoder();
+  MediaResult InitV4L2Decoder();
+#if LIBAVCODEC_VERSION_MAJOR >= 60 && !defined(FFVPX_VERSION)
+  MediaResult InitVulkanDecoder();
+
+#    include "FFmpegVulkanVideoDecoder.h"
+#endif
+  bool CreateVAAPIDeviceContext();
+#if LIBAVCODEC_VERSION_MAJOR >= 60 && !defined(FFVPX_VERSION)
+  bool CreateVulkanDeviceContext(const StaticMutexAutoLock& aProofOfLock);
+  void PrepareVulkanDrmModifiersForSwFormat(int aSwFormat,
+                                            VkImageUsageFlags aImageUsages);
+#endif
+  bool GetVAAPISurfaceDescriptor(VADRMPRIMESurfaceDescriptor* aVaDesc);
+  void AddAcceleratedFormats(nsTArray<AVCodecID>& aCodecList,
+                             AVCodecID aCodecID, AVVAAPIHWConfig* hwconfig);
+  nsTArray<AVCodecID> GetAcceleratedFormats();
+  bool IsFormatAccelerated(AVCodecID aCodecID) const;
+
+  MediaResult CreateImageVAAPI(int64_t aOffset, int64_t aPts, int64_t aDuration,
+                               MediaDataDecoder::DecodedData& aResults);
+  MediaResult CreateImageV4L2(int64_t aOffset, int64_t aPts, int64_t aDuration,
+                              MediaDataDecoder::DecodedData& aResults);
+#if LIBAVCODEC_VERSION_MAJOR >= 60 && !defined(FFVPX_VERSION)
+ public:
+  int ChooseVulkanPixelFormatFromContext(struct AVCodecContext* aCodecContext,
+                                         const int* aFormats);
+
+ private:
+  MediaResult CreateImageVulkan(int64_t aOffset, int64_t aPts,
+                                int64_t aDuration,
+                                MediaDataDecoder::DecodedData& aResults);
+#endif
+  void AdjustHWDecodeLogging();
+
+  AVBufferRef* mVAAPIDeviceContext = nullptr;
+  AVBufferRef* mVulkanDeviceContext = nullptr;
+#if LIBAVCODEC_VERSION_MAJOR >= 60 && !defined(FFVPX_VERSION)
+  RefPtr<VulkanDeviceHolder> mVulkanDeviceHolder;
+  FFmpegVulkanVideoDecoder mVulkanDecoder;
+  VkImageDrmFormatModifierListCreateInfoEXT mVulkanDrmModifierList = {};
+  VkImageFormatListCreateInfo mVulkanImageFormatList = {};
+  VkMemoryDedicatedAllocateInfo mVulkanAllocPnextDedicated[2] = {};
+  bool mVulkanDecodeUsesDrmModifier = false;
+  bool mVulkanTilingSettled = false;
+#endif
+  bool mUsingV4L2 = false;
+  bool mUploadSWDecodeToDMABuf = false;
+  VADisplay mDisplay = nullptr;
+  UniquePtr<VideoFramePool<LIBAV_VER>> mVideoFramePool;
+  static nsTArray<AVCodecID> mAcceleratedFormats;
+#endif
+
+#if LIBAVCODEC_VERSION_MAJOR >= 58
+  class DecodeStats {
+   public:
+    void DecodeStart();
+    void UpdateDecodeTimes(int64_t aDuration);
+    bool IsDecodingSlow() const;
+
+   private:
+    uint32_t mDecodedFrames = 0;
+
+    double mAverageFrameDecodeTime = 0;
+    double mAverageFrameDuration = 0;
+
+    const uint32_t mMaxLateDecodedFrames = 15;
+    uint32_t mDecodedFramesLate = 0;
+
+    const uint32_t mDelayedFrameReset = 3000;
+
+    uint32_t mLastDelayedFrameNum = 0;
+
+    TimeStamp mDecodeStart;
+  };
+
+  DecodeStats mDecodeStats;
+#endif
+
+#if LIBAVCODEC_VERSION_MAJOR >= 58
+  bool mHasSentDrainPacket = false;
+#endif
+
+#if LIBAVCODEC_VERSION_MAJOR < 58
+  class PtsCorrectionContext {
+   public:
+    PtsCorrectionContext();
+    int64_t GuessCorrectPts(int64_t aPts, int64_t aDts);
+    void Reset();
+    int64_t LastDts() const { return mLastDts; }
+
+   private:
+    int64_t mNumFaultyPts;  
+    int64_t mNumFaultyDts;  
+    int64_t mLastPts;       
+    int64_t mLastDts;       
+  };
+
+  PtsCorrectionContext mPtsContext;
+#endif
+
+#if defined(MOZ_FFMPEG_USE_INPUT_INFO_MAP)
+  struct InputInfo {
+    explicit InputInfo(const MediaRawData* aSample)
+        : mDuration(aSample->mDuration.ToMicroseconds())
+    {
+    }
+
+    int64_t mDuration;
+  };
+
+  SimpleMap<int64_t, InputInfo, ThreadSafePolicy> mInputInfo;
+
+  static int64_t GetSampleInputKey(const MediaRawData* aSample) {
+    return aSample->mTimecode.ToMicroseconds();
+  }
+
+  static int64_t GetFrameInputKey(const AVFrame* aFrame) {
+    return aFrame->pkt_dts;
+  }
+
+  void InsertInputInfo(const MediaRawData* aSample) {
+    mInputInfo.Insert(GetSampleInputKey(aSample), InputInfo(aSample));
+  }
+
+  void TakeInputInfo(const AVFrame* aFrame, InputInfo& aEntry) {
+    if (Maybe<InputInfo> v = mInputInfo.Take(GetFrameInputKey(aFrame))) {
+      aEntry = v.extract();
+    } else {
+      NS_WARNING("Unable to retrieve input info from map");
+      mInputInfo.Clear();
+    }
+  }
+#endif
+
+  const bool mLowLatency;
+  const Maybe<TrackingId> mTrackingId;
+
+  void RecordFrame(const MediaRawData* aSample, const MediaData* aData);
+
+  PerformanceRecorderMulti<DecodeStage> mPerformanceRecorder;
+
+  bool MaybeQueueDrain(const MediaDataDecoder::DecodedData& aData);
+
+  Maybe<Atomic<bool>> mIsUsingShmemBufferForDecode;
+
+#if defined(CUSTOMIZED_BUFFER_ALLOCATION_ASSERT_ENABLED)
+  RefPtr<ImageBufferTracker> mImageTracker;
+#endif
+
+  Atomic<bool> m8BitOutput;
+  RefPtr<layers::BufferRecycleBin> m8BitRecycleBin;
+};
+
+#if defined(CUSTOMIZED_BUFFER_ALLOCATION)
+#if defined(CUSTOMIZED_BUFFER_ALLOCATION_ASSERT_ENABLED)
+class ImageBufferTracker {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ImageBufferTracker)
+
+  ImageBufferTracker() = default;
+
+  void Insert(ImageBufferWrapper* aImage) {
+    auto lock = mAllocatedImages.Lock();
+    lock->Insert(aImage);
+  }
+
+  void Remove(ImageBufferWrapper* aImage) {
+    auto lock = mAllocatedImages.Lock();
+    lock->Remove(aImage);
+  }
+
+  bool IsEmpty() const {
+    auto lock = mAllocatedImages.Lock();
+    return lock->IsEmpty();
+  }
+
+ private:
+  ~ImageBufferTracker() = default;
+
+  mutable DataMutex<nsTHashSet<ImageBufferWrapper*>> mAllocatedImages{
+      "ImageBufferTracker::mAllocatedImages"};
+};
+#endif
+
+class ImageBufferWrapper final {
+ public:
+  typedef mozilla::layers::Image Image;
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ImageBufferWrapper)
+
+#if defined(CUSTOMIZED_BUFFER_ALLOCATION_ASSERT_ENABLED)
+  ImageBufferWrapper(RefPtr<Image>&& aImage, ImageBufferTracker* aTracker)
+      : mImage(std::move(aImage)), mTracker(aTracker) {
+    MOZ_ASSERT(mImage);
+    MOZ_ASSERT(mTracker);
+  }
+#else
+  explicit ImageBufferWrapper(RefPtr<Image>&& aImage)
+      : mImage(std::move(aImage)) {
+    MOZ_ASSERT(mImage);
+  }
+#endif
+
+  Image* AsImage() { return mImage; }
+
+  void StartTracking() {
+#if defined(CUSTOMIZED_BUFFER_ALLOCATION_ASSERT_ENABLED)
+    mTracker->Insert(this);
+#endif
+  }
+
+  void StopTracking() {
+#if defined(CUSTOMIZED_BUFFER_ALLOCATION_ASSERT_ENABLED)
+    mTracker->Remove(this);
+#endif
+  }
+
+ private:
+  ~ImageBufferWrapper() = default;
+  const RefPtr<Image> mImage;
+#if defined(CUSTOMIZED_BUFFER_ALLOCATION_ASSERT_ENABLED)
+  const RefPtr<ImageBufferTracker> mTracker;
+#endif
+};
+#endif
+
+}  
+
+#endif

@@ -1,0 +1,104 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsHtml5DocumentBuilder_h
+#define nsHtml5DocumentBuilder_h
+
+#include "mozilla/dom/Document.h"
+#include "nsContentSink.h"
+#include "nsHtml5DocumentMode.h"
+#include "nsIContent.h"
+
+namespace mozilla::dom {
+class Document;
+}
+
+typedef nsIContent* nsIContentPtr;
+
+enum eHtml5FlushState {
+  eNotFlushing = 0,  
+  eInFlush = 1,      
+  eInDocUpdate = 2,  
+};
+
+class nsHtml5DocumentBuilder : public nsContentSink {
+  using Encoding = mozilla::Encoding;
+  template <typename T>
+  using NotNull = mozilla::NotNull<T>;
+
+ public:
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(nsHtml5DocumentBuilder,
+                                           nsContentSink)
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+  inline void HoldElement(already_AddRefed<nsIContent> aContent) {
+    *(mOwnedElements.AppendElement()) = aContent;
+  }
+
+  nsresult Init(Document* aDoc, nsIURI* aURI, nsISupports* aContainer,
+                nsIChannel* aChannel);
+
+  Document* GetDocument() { return mDocument; }
+
+  nsNodeInfoManager* GetNodeInfoManager() { return mNodeInfoManager; }
+
+  virtual nsresult MarkAsBroken(nsresult aReason);
+
+  inline nsresult IsBroken() { return mBroken; }
+
+  inline bool IsComplete() { return !mParser; }
+
+  inline void BeginDocUpdate() {
+    MOZ_RELEASE_ASSERT(IsInFlush(), "Tried to double-open doc update.");
+    MOZ_RELEASE_ASSERT(mParser, "Started doc update without parser.");
+    mFlushState = eInDocUpdate;
+    mDocument->BeginUpdate();
+  }
+
+  inline void EndDocUpdate() {
+    MOZ_RELEASE_ASSERT(IsInDocUpdate(),
+                       "Tried to end doc update without one open.");
+    mFlushState = eInFlush;
+    mDocument->EndUpdate();
+  }
+
+  inline void BeginFlush() {
+    MOZ_RELEASE_ASSERT(mFlushState == eNotFlushing,
+                       "Tried to start a flush when already flushing.");
+    MOZ_RELEASE_ASSERT(mParser, "Started a flush without parser.");
+    mFlushState = eInFlush;
+  }
+
+  inline void EndFlush() {
+    MOZ_RELEASE_ASSERT(IsInFlush(), "Tried to end flush when not flushing.");
+    mFlushState = eNotFlushing;
+  }
+
+  inline bool IsInDocUpdate() { return mFlushState == eInDocUpdate; }
+
+  inline bool IsInFlush() { return mFlushState == eInFlush; }
+
+  void UpdateStyleSheet(nsIContent* aElement);
+
+  void SetDocumentMode(nsHtml5DocumentMode m);
+
+  void SetNodeInfoManager(nsNodeInfoManager* aManager) {
+    mNodeInfoManager = aManager;
+  }
+
+  virtual void UpdateChildCounts() override;
+  virtual nsresult FlushTags() override;
+
+ protected:
+  explicit nsHtml5DocumentBuilder(bool aRunsToCompletion);
+  virtual ~nsHtml5DocumentBuilder();
+
+ protected:
+  nsTArray<nsCOMPtr<nsIContent>> mOwnedElements;
+  nsresult mBroken;
+  eHtml5FlushState mFlushState;
+};
+
+#endif  // nsHtml5DocumentBuilder_h

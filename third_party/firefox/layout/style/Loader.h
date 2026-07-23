@@ -1,0 +1,430 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_css_Loader_h
+#define mozilla_css_Loader_h
+
+#include <tuple>
+#include <utility>
+
+#include "mozilla/Attributes.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/SharedSubResourceCache.h"
+#include "mozilla/css/StylePreloadKind.h"
+#include "mozilla/dom/LinkStyle.h"
+#include "mozilla/dom/SRIMetadata.h"
+#include "nsCompatibility.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "nsTObserverArray.h"
+#include "nsURIHashKey.h"
+
+class nsICSSLoaderObserver;
+class nsIConsoleReportCollector;
+class nsIContent;
+class nsIPrincipal;
+
+namespace mozilla {
+
+class PreloadHashKey;
+class SharedStyleSheetCache;
+class SheetLoadDataHashKey;
+class StyleSheet;
+
+namespace dom {
+class DocGroup;
+class Element;
+class MediaList;
+enum class FetchPriority : uint8_t;
+}  
+
+class SheetLoadDataHashKey : public PLDHashEntryHdr {
+ public:
+  using KeyType = const SheetLoadDataHashKey&;
+  using KeyTypePointer = const SheetLoadDataHashKey*;
+
+  explicit SheetLoadDataHashKey(const SheetLoadDataHashKey* aKey)
+      : mURI(aKey->mURI),
+        mLoaderPrincipal(aKey->mLoaderPrincipal),
+        mPartitionPrincipal(aKey->mPartitionPrincipal),
+        mEncodingGuess(aKey->mEncodingGuess),
+        mCORSMode(aKey->mCORSMode),
+        mOrigin(aKey->mOrigin),
+        mCompatMode(aKey->mCompatMode),
+        mSRIMetadata(aKey->mSRIMetadata),
+        mIsLinkRelPreloadOrEarlyHint(aKey->mIsLinkRelPreloadOrEarlyHint) {
+    MOZ_COUNT_CTOR(SheetLoadDataHashKey);
+  }
+
+  SheetLoadDataHashKey(nsIURI* aURI, nsIPrincipal* aLoaderPrincipal,
+                       nsIPrincipal* aPartitionPrincipal,
+                       NotNull<const Encoding*> aEncodingGuess,
+                       CORSMode aCORSMode, StyleOrigin aOrigin,
+                       nsCompatibility aCompatMode,
+                       const dom::SRIMetadata& aSRIMetadata,
+                       css::StylePreloadKind aPreloadKind)
+      : mURI(aURI),
+        mLoaderPrincipal(aLoaderPrincipal),
+        mPartitionPrincipal(aPartitionPrincipal),
+        mEncodingGuess(aEncodingGuess),
+        mCORSMode(aCORSMode),
+        mOrigin(aOrigin),
+        mCompatMode(aCompatMode),
+        mSRIMetadata(aSRIMetadata),
+        mIsLinkRelPreloadOrEarlyHint(
+            css::IsLinkRelPreloadOrEarlyHint(aPreloadKind)) {
+    MOZ_ASSERT(aURI);
+    MOZ_ASSERT(aLoaderPrincipal);
+    MOZ_COUNT_CTOR(SheetLoadDataHashKey);
+  }
+
+  SheetLoadDataHashKey(SheetLoadDataHashKey&& toMove)
+      : mURI(std::move(toMove.mURI)),
+        mLoaderPrincipal(std::move(toMove.mLoaderPrincipal)),
+        mPartitionPrincipal(std::move(toMove.mPartitionPrincipal)),
+        mEncodingGuess(std::move(toMove.mEncodingGuess)),
+        mCORSMode(std::move(toMove.mCORSMode)),
+        mOrigin(std::move(toMove.mOrigin)),
+        mCompatMode(std::move(toMove.mCompatMode)),
+        mSRIMetadata(std::move(toMove.mSRIMetadata)),
+        mIsLinkRelPreloadOrEarlyHint(
+            std::move(toMove.mIsLinkRelPreloadOrEarlyHint)) {
+    MOZ_COUNT_CTOR(SheetLoadDataHashKey);
+  }
+
+  explicit SheetLoadDataHashKey(const css::SheetLoadData&);
+
+  MOZ_COUNTED_DTOR(SheetLoadDataHashKey)
+
+  const SheetLoadDataHashKey& GetKey() const { return *this; }
+  const SheetLoadDataHashKey* GetKeyPointer() const { return this; }
+
+  bool KeyEquals(const SheetLoadDataHashKey* aKey) const {
+    return KeyEquals(*aKey);
+  }
+
+  bool KeyEquals(const SheetLoadDataHashKey&) const;
+
+  static const SheetLoadDataHashKey* KeyToPointer(
+      const SheetLoadDataHashKey& aKey) {
+    return &aKey;
+  }
+  static PLDHashNumber HashKey(const SheetLoadDataHashKey* aKey) {
+    return nsURIHashKey::HashKey(aKey->mURI);
+  }
+
+  nsIURI* URI() const { return mURI; }
+
+  nsIPrincipal* LoaderPrincipal() const { return mLoaderPrincipal; }
+  nsIPrincipal* PartitionPrincipal() const { return mPartitionPrincipal; }
+
+  StyleOrigin Origin() const { return mOrigin; }
+
+  enum { ALLOW_MEMMOVE = true };
+
+ protected:
+  const nsCOMPtr<nsIURI> mURI;
+  const nsCOMPtr<nsIPrincipal> mLoaderPrincipal;
+  const nsCOMPtr<nsIPrincipal> mPartitionPrincipal;
+  const NotNull<const Encoding*> mEncodingGuess;
+  const CORSMode mCORSMode;
+  const StyleOrigin mOrigin;
+  const nsCompatibility mCompatMode;
+  dom::SRIMetadata mSRIMetadata;
+  const bool mIsLinkRelPreloadOrEarlyHint;
+};
+
+namespace css {
+
+class SheetLoadData;
+using SheetLoadDataHolder = nsMainThreadPtrHolder<SheetLoadData>;
+class ImportRule;
+class MOZ_RAII LoaderReusableStyleSheets {
+ public:
+  LoaderReusableStyleSheets() = default;
+  ~LoaderReusableStyleSheets();
+
+  bool FindReusableStyleSheet(nsIURI* aURL, RefPtr<StyleSheet>& aResult);
+
+  void AddReusableSheet(StyleSheet* aSheet);
+
+  LoaderReusableStyleSheets(const LoaderReusableStyleSheets&) = delete;
+  LoaderReusableStyleSheets& operator=(const LoaderReusableStyleSheets&) =
+      delete;
+
+ private:
+  nsTArray<RefPtr<StyleSheet>> mReusableSheets;
+};
+
+class Loader final {
+  using ReferrerPolicy = dom::ReferrerPolicy;
+
+ public:
+  using Completed = dom::LinkStyle::Completed;
+  using HasAlternateRel = dom::LinkStyle::HasAlternateRel;
+  using IsAlternate = dom::LinkStyle::IsAlternate;
+  using IsInline = dom::LinkStyle::IsInline;
+  using IsExplicitlyEnabled = dom::LinkStyle::IsExplicitlyEnabled;
+  using MediaMatched = dom::LinkStyle::MediaMatched;
+  using LoadSheetResult = dom::LinkStyle::Update;
+  using SheetInfo = dom::LinkStyle::SheetInfo;
+
+  Loader();
+  explicit Loader(dom::DocGroup*);
+  explicit Loader(dom::Document*);
+
+ private:
+  ~Loader();
+
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(Loader)
+  NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(Loader)
+
+  void DropDocumentReference();  
+
+  void DeregisterFromSheetCache();
+  void RegisterInSheetCache();
+
+  void SetCompatibilityMode(nsCompatibility aCompatMode) {
+    mDocumentCompatMode = aCompatMode;
+  }
+
+  using StylePreloadKind = css::StylePreloadKind;
+
+  bool HasLoaded(const SheetLoadDataHashKey& aKey) const {
+    return mLoadsPerformed.Contains(aKey);
+  }
+
+  void WillStartPendingLoad() {
+    MOZ_DIAGNOSTIC_ASSERT(mPendingLoadCount, "Where did this load come from?");
+    mPendingLoadCount--;
+  }
+
+  nsCompatibility CompatMode(StylePreloadKind aPreloadKind) const {
+    if (css::ShouldAssumeStandardsMode(aPreloadKind)) {
+      return eCompatibility_FullStandards;
+    }
+    return mDocumentCompatMode;
+  }
+
+  void DocumentStyleSheetSetChanged();
+
+
+  Result<LoadSheetResult, nsresult> LoadInlineStyle(
+      const SheetInfo&, const nsAString& aBuffer,
+      nsICSSLoaderObserver* aObserver);
+
+  Result<LoadSheetResult, nsresult> LoadStyleLink(
+      const SheetInfo&, nsICSSLoaderObserver* aObserver);
+
+  nsresult LoadChildSheet(StyleSheet& aParentSheet, SheetLoadData* aParentData,
+                          nsIURI* aURL, dom::MediaList* aMedia,
+                          LoaderReusableStyleSheets* aSavedSheets);
+
+  void DidHitCompleteSheetCache(const SheetLoadDataHashKey&,
+                                const StyleUseCounters* aCounters);
+
+  enum class UseSystemPrincipal { No, Yes };
+
+  Result<RefPtr<StyleSheet>, nsresult> LoadSheetSync(nsIURI*, StyleOrigin,
+                                                     UseSystemPrincipal);
+
+  Result<RefPtr<StyleSheet>, nsresult> LoadSheet(
+      nsIURI* aURI, StylePreloadKind, const Encoding* aPreloadEncoding,
+      nsIReferrerInfo* aReferrerInfo, nsICSSLoaderObserver* aObserver,
+      uint64_t aEarlyHintPreloaderId, CORSMode aCORSMode,
+      const nsAString& aNonce, const nsAString& aIntegrity,
+      dom::FetchPriority aFetchPriority);
+
+  Result<RefPtr<StyleSheet>, nsresult> LoadSheet(nsIURI*, StyleOrigin,
+                                                 UseSystemPrincipal,
+                                                 nsICSSLoaderObserver*);
+
+  void Stop();
+
+
+  bool GetEnabled() { return mEnabled; }
+  void SetEnabled(bool aEnabled) { mEnabled = aEnabled; }
+
+  uint32_t ParsedSheetCount() const { return mParsedSheetCount; }
+
+  dom::Document* GetDocument() const { return mDocument; }
+
+  bool IsDocumentAssociated() const { return mIsDocumentAssociated; }
+
+  bool HasPendingLoads();
+
+  void AddObserver(nsICSSLoaderObserver* aObserver);
+
+  void RemoveObserver(nsICSSLoaderObserver* aObserver);
+
+
+  IsAlternate IsAlternateSheet(const nsAString& aTitle, bool aHasAlternateRel);
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const;
+
+  enum class SheetState : uint8_t {
+    NeedsParser = 0,
+    Pending,
+    Loading,
+    Complete
+  };
+
+  nsIPrincipal* LoaderPrincipal() const;
+
+  nsIPrincipal* PartitionedPrincipal() const;
+
+  bool ShouldBypassCache() const;
+
+  void InsertSheetInTree(StyleSheet& aSheet);
+
+  enum class PendingLoad { No, Yes };
+
+ private:
+  friend class mozilla::SharedStyleSheetCache;
+  friend class SheetLoadData;
+  friend class StreamLoader;
+
+  enum class UsePreload : bool { No, Yes };
+  enum class UseLoadGroup : bool { No, Yes };
+
+  nsresult NewStyleSheetChannel(SheetLoadData& aLoadData,
+                                UsePreload aUsePreload,
+                                UseLoadGroup aUseLoadGroup,
+                                nsIChannel** aOutChannel);
+
+  [[nodiscard]] bool MaybeDeferLoad(SheetLoadData& aLoadData,
+                                    SheetState aSheetState,
+                                    PendingLoad aPendingLoad,
+                                    const SheetLoadDataHashKey& aKey);
+
+  bool MaybeCoalesceLoadAndNotifyOpen(SheetLoadData& aLoadData,
+                                      SheetState aSheetState,
+                                      const SheetLoadDataHashKey& aKey,
+                                      const PreloadHashKey& aPreloadKey);
+
+  [[nodiscard]] nsresult LoadSheetSyncInternal(SheetLoadData& aLoadData,
+                                               SheetState aSheetState);
+
+  void AdjustPriority(const SheetLoadData& aLoadData, nsIChannel* aChannel);
+
+  [[nodiscard]] nsresult LoadSheetAsyncInternal(
+      SheetLoadData& aLoadData, uint64_t aEarlyHintPreloaderId,
+      const SheetLoadDataHashKey& aKey);
+
+  void IncrementOngoingLoadCountAndMaybeBlockOnload() {
+    if (!mOngoingLoadCount++) {
+      BlockOnload();
+    }
+  }
+
+  void DecrementOngoingLoadCountAndMaybeUnblockOnload() {
+    MOZ_DIAGNOSTIC_ASSERT(mOngoingLoadCount);
+    MOZ_DIAGNOSTIC_ASSERT(mOngoingLoadCount > mPendingLoadCount);
+    if (!--mOngoingLoadCount) {
+      UnblockOnload(false);
+    }
+  }
+
+  void BlockOnload();
+  void UnblockOnload(bool aFireSync);
+
+  nsresult CheckContentPolicy(nsIPrincipal* aLoadingPrincipal,
+                              nsIPrincipal* aTriggeringPrincipal,
+                              nsIURI* aTargetURI, nsINode* aRequestingNode,
+                              const nsAString& aNonce, StylePreloadKind,
+                              CORSMode aCORSMode, const nsAString& aIntegrity);
+
+  bool MaybePutIntoLoadsPerformed(SheetLoadData& aLoadData);
+
+ private:
+  std::tuple<RefPtr<StyleSheet>, SheetState,
+             RefPtr<SubResourceNetworkMetadataHolder>>
+  CreateSheet(const SheetInfo& aInfo, StyleOrigin aOrigin, bool aSyncLoad,
+              css::StylePreloadKind aPreloadKind);
+
+  std::tuple<RefPtr<StyleSheet>, SheetState,
+             RefPtr<SubResourceNetworkMetadataHolder>>
+  CreateSheet(nsIURI* aURI, nsIContent* aLinkingContent,
+              nsIPrincipal* aTriggeringPrincipal, StyleOrigin, CORSMode,
+              const Encoding* aPreloadOrParentDataEncoding,
+              const nsAString& aIntegrity, bool aSyncLoad, StylePreloadKind);
+
+  MediaMatched PrepareSheet(StyleSheet&, const nsAString& aTitle,
+                            const nsAString& aMediaString, dom::MediaList*,
+                            IsAlternate, IsExplicitlyEnabled);
+
+  void InsertChildSheet(StyleSheet& aSheet, StyleSheet& aParentSheet);
+
+  Result<RefPtr<StyleSheet>, nsresult> InternalLoadNonDocumentSheet(
+      nsIURI* aURL, StylePreloadKind, StyleOrigin aOrigin, UseSystemPrincipal,
+      const Encoding* aPreloadEncoding, nsIReferrerInfo* aReferrerInfo,
+      nsICSSLoaderObserver* aObserver, CORSMode aCORSMode,
+      const nsAString& aNonce, const nsAString& aIntegrity,
+      uint64_t aEarlyHintPreloaderId, dom::FetchPriority aFetchPriority);
+
+  void NotifyOfCachedLoad(RefPtr<SheetLoadData>);
+
+  void NotifyObserversForCachedSheet(SheetLoadData&);
+
+  void AddPerformanceEntryForCachedSheet(SheetLoadData&);
+
+  void StartDeferredLoads();
+
+  nsresult LoadSheet(SheetLoadData&, SheetState, uint64_t aEarlyHintPreloaderId,
+                     PendingLoad = PendingLoad::No);
+
+  enum class AllowAsyncParse {
+    Yes,
+    No,
+  };
+
+  Completed ParseSheet(const nsACString&, const RefPtr<SheetLoadDataHolder>&,
+                       AllowAsyncParse);
+
+  void SheetComplete(SheetLoadData&, nsresult);
+
+  void NotifyObservers(SheetLoadData&, nsresult);
+
+  static void MarkLoadTreeFailed(SheetLoadData&,
+                                 Loader* aOnlyForLoader = nullptr);
+
+  void MaybeNotifyPreloadUsed(SheetLoadData&);
+
+  nsTHashtable<const SheetLoadDataHashKey> mLoadsPerformed;
+
+  RefPtr<SharedStyleSheetCache> mSheets;
+
+  nsTObserverArray<nsCOMPtr<nsICSSLoaderObserver>> mObservers;
+
+  dom::Document* MOZ_NON_OWNING_REF mDocument;  
+
+  RefPtr<dom::DocGroup> mDocGroup;
+
+  nsCompatibility mDocumentCompatMode;
+
+  const nsCOMPtr<nsIConsoleReportCollector> mReporter;
+
+  uint32_t mOngoingLoadCount = 0;
+
+  uint32_t mPendingLoadCount = 0;
+
+  Atomic<uint32_t, MemoryOrdering::Relaxed> mParsedSheetCount{0};
+
+  bool mEnabled = true;
+
+  bool mIsDocumentAssociated = false;
+
+#ifdef DEBUG
+  bool mSyncCallback = false;
+#endif
+};
+
+}  
+}  
+
+#endif /* mozilla_css_Loader_h */

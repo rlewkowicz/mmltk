@@ -1,0 +1,178 @@
+/* pnginfo.h - internal structures for libpng
+ *
+ * Copyright (c) 2018-2025 Cosmin Truta
+ * Copyright (c) 1998-2002,2004,2006-2013,2018 Glenn Randers-Pehrson
+ * Copyright (c) 1996-1997 Andreas Dilger
+ * Copyright (c) 1995-1996 Guy Eric Schalnat, Group 42, Inc.
+ *
+ * This code is released under the libpng license.
+ * For conditions of distribution and use, see the disclaimer
+ * and license in png.h
+ */
+
+#ifndef PNGPRIV_H
+#  error This file must not be included by applications; please include <png.h>
+#endif
+
+#ifndef PNGINFO_H
+#define PNGINFO_H
+
+struct png_info_def
+{
+   png_uint_32 width;       
+   png_uint_32 height;      
+   png_uint_32 valid;       
+   size_t rowbytes;         
+   png_colorp palette;      
+   png_uint_16 num_palette; 
+   png_uint_16 num_trans;   
+   png_byte bit_depth;      
+   png_byte color_type;     
+   png_byte compression_type; 
+   png_byte filter_type;    
+   png_byte interlace_type; 
+
+   png_byte channels;       
+   png_byte pixel_depth;    
+   png_byte spare_byte;     
+
+#ifdef PNG_READ_SUPPORTED
+   png_byte signature[8];   
+#endif
+
+
+#ifdef PNG_cICP_SUPPORTED
+   png_byte cicp_colour_primaries;
+   png_byte cicp_transfer_function;
+   png_byte cicp_matrix_coefficients;
+   png_byte cicp_video_full_range_flag;
+#endif
+
+#ifdef PNG_iCCP_SUPPORTED
+   png_charp iccp_name;     
+   png_bytep iccp_profile;  
+   png_uint_32 iccp_proflen;  
+#endif
+
+#ifdef PNG_cLLI_SUPPORTED
+   png_uint_32 maxCLL;  
+   png_uint_32 maxFALL;
+#endif
+
+#ifdef PNG_mDCV_SUPPORTED
+   png_uint_16 mastering_red_x;  
+   png_uint_16 mastering_red_y;
+   png_uint_16 mastering_green_x;
+   png_uint_16 mastering_green_y;
+   png_uint_16 mastering_blue_x;
+   png_uint_16 mastering_blue_y;
+   png_uint_16 mastering_white_x;
+   png_uint_16 mastering_white_y;
+   png_uint_32 mastering_maxDL; 
+   png_uint_32 mastering_minDL;
+#endif
+
+#ifdef PNG_TEXT_SUPPORTED
+   int num_text; 
+   int max_text; 
+   png_textp text; 
+#endif /* TEXT */
+
+#ifdef PNG_tIME_SUPPORTED
+   png_time mod_time;
+#endif
+
+#ifdef PNG_sBIT_SUPPORTED
+   png_color_8 sig_bit; 
+#endif
+
+#if defined(PNG_tRNS_SUPPORTED) || defined(PNG_READ_EXPAND_SUPPORTED) || \
+defined(PNG_READ_BACKGROUND_SUPPORTED)
+   png_bytep trans_alpha;    
+   png_color_16 trans_color; 
+#endif
+
+#if defined(PNG_bKGD_SUPPORTED) || defined(PNG_READ_BACKGROUND_SUPPORTED)
+   png_color_16 background;
+#endif
+
+#ifdef PNG_oFFs_SUPPORTED
+   png_int_32 x_offset; 
+   png_int_32 y_offset; 
+   png_byte offset_unit_type; 
+#endif
+
+#ifdef PNG_pHYs_SUPPORTED
+   png_uint_32 x_pixels_per_unit; 
+   png_uint_32 y_pixels_per_unit; 
+   png_byte phys_unit_type; 
+#endif
+
+#ifdef PNG_eXIf_SUPPORTED
+   png_uint_32 num_exif;  
+   png_bytep exif;
+#endif
+
+#ifdef PNG_hIST_SUPPORTED
+   png_uint_16p hist;
+#endif
+
+#ifdef PNG_pCAL_SUPPORTED
+   png_charp pcal_purpose;  
+   png_int_32 pcal_X0;      
+   png_int_32 pcal_X1;      
+   png_charp pcal_units;    
+   png_charpp pcal_params;  
+   png_byte pcal_type;      
+   png_byte pcal_nparams;   
+#endif
+
+   png_uint_32 free_me;     
+
+#ifdef PNG_STORE_UNKNOWN_CHUNKS_SUPPORTED
+   png_unknown_chunkp unknown_chunks;
+
+   int                unknown_chunks_num;
+#endif
+
+#ifdef PNG_sPLT_SUPPORTED
+   png_sPLT_tp splt_palettes;
+   int         splt_palettes_num; 
+#endif
+
+#ifdef PNG_sCAL_SUPPORTED
+   png_byte scal_unit;         
+   png_charp scal_s_width;     
+   png_charp scal_s_height;    
+#endif
+
+#ifdef PNG_INFO_IMAGE_SUPPORTED
+   png_bytepp row_pointers;        
+#endif
+
+#ifdef PNG_cHRM_SUPPORTED
+   png_xy cHRM;
+#endif
+
+#ifdef PNG_gAMA_SUPPORTED
+   png_fixed_point gamma;
+#endif
+
+#ifdef PNG_sRGB_SUPPORTED
+   int rendering_intent;
+#endif
+#ifdef PNG_APNG_SUPPORTED
+   png_uint_32 num_frames; 
+   png_uint_32 num_plays;
+   png_uint_32 next_frame_width;
+   png_uint_32 next_frame_height;
+   png_uint_32 next_frame_x_offset;
+   png_uint_32 next_frame_y_offset;
+   png_uint_16 next_frame_delay_num;
+   png_uint_16 next_frame_delay_den;
+   png_byte next_frame_dispose_op;
+   png_byte next_frame_blend_op;
+#endif
+
+};
+#endif /* PNGINFO_H */

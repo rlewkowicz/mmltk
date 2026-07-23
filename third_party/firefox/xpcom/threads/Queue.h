@@ -1,0 +1,217 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_Queue_h
+#define mozilla_Queue_h
+
+#include <algorithm>
+#include <utility>
+#include <stdint.h>
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Assertions.h"
+#include "mozalloc.h"
+
+namespace mozilla {
+
+template <class T, size_t RequestedItemsPerPage = 256>
+class Queue {
+ public:
+  Queue() = default;
+
+  Queue(Queue&& aOther) noexcept
+      : mHead(std::exchange(aOther.mHead, nullptr)),
+        mTail(std::exchange(aOther.mTail, nullptr)),
+        mCount(std::exchange(aOther.mCount, 0)),
+        mOffsetHead(std::exchange(aOther.mOffsetHead, 0)),
+        mHeadLength(std::exchange(aOther.mHeadLength, 0)) {}
+
+  Queue& operator=(Queue&& aOther) noexcept {
+    Clear();
+
+    mHead = std::exchange(aOther.mHead, nullptr);
+    mTail = std::exchange(aOther.mTail, nullptr);
+    mCount = std::exchange(aOther.mCount, 0);
+    mOffsetHead = std::exchange(aOther.mOffsetHead, 0);
+    mHeadLength = std::exchange(aOther.mHeadLength, 0);
+    return *this;
+  }
+
+  ~Queue() { Clear(); }
+
+  void Clear() {
+    while (!IsEmpty()) {
+      Pop();
+    }
+    if (mHead) {
+      MOZ_ASSERT(mHead == mTail);
+      free(mHead);
+      mHead = nullptr;
+      mTail = nullptr;
+    }
+  }
+
+  T& Push(T&& aElement) {
+    MOZ_RELEASE_ASSERT(mCount < std::numeric_limits<uint32_t>::max());
+
+    if (!mHead) {
+      mHead = NewPage();
+      MOZ_ASSERT(mHead);
+
+      mTail = mHead;
+      T* eltPtr = &mTail->mEvents[0];
+      new (eltPtr) T(std::move(aElement));
+      mOffsetHead = 0;
+      mCount = 1;
+      mHeadLength = 1;
+      return *eltPtr;
+    }
+    if (mHead == mTail && mCount < ItemsPerPage) {
+      uint16_t offsetTail = (mOffsetHead + mCount) % ItemsPerPage;
+      T* eltPtr = &mHead->mEvents[offsetTail];
+      new (eltPtr) T(std::move(aElement));
+      ++mCount;
+      ++mHeadLength;
+      MOZ_ASSERT(mCount == mHeadLength);
+      return *eltPtr;
+    }
+
+    uint16_t offsetTail = (mCount - mHeadLength) % ItemsPerPage;
+    if (offsetTail == 0) {
+      Page* page = NewPage();
+      MOZ_ASSERT(page);
+
+      mTail->mNext = page;
+      mTail = page;
+      T* eltPtr = &page->mEvents[0];
+      new (eltPtr) T(std::move(aElement));
+      ++mCount;
+      return *eltPtr;
+    }
+
+    MOZ_ASSERT(mHead != mTail, "can't have a non-circular single buffer");
+    T* eltPtr = &mTail->mEvents[offsetTail];
+    new (eltPtr) T(std::move(aElement));
+    ++mCount;
+    return *eltPtr;
+  }
+
+  bool IsEmpty() const { return !mCount; }
+
+  T Pop() {
+    MOZ_RELEASE_ASSERT(!IsEmpty());
+
+    T result = std::move(mHead->mEvents[mOffsetHead]);
+    mHead->mEvents[mOffsetHead].~T();
+    mOffsetHead = (mOffsetHead + 1) % ItemsPerPage;
+    mCount -= 1;
+    mHeadLength -= 1;
+
+    if (mHead != mTail && mHeadLength == 0) {
+      Page* dead = mHead;
+      mHead = mHead->mNext;
+      free(dead);
+      mOffsetHead = 0;
+      mHeadLength =
+          static_cast<uint16_t>(std::min<uint32_t>(mCount, ItemsPerPage));
+    }
+
+    return result;
+  }
+
+  T& FirstElement() {
+    MOZ_RELEASE_ASSERT(!IsEmpty());
+    return mHead->mEvents[mOffsetHead];
+  }
+
+  const T& FirstElement() const {
+    MOZ_RELEASE_ASSERT(!IsEmpty());
+    return mHead->mEvents[mOffsetHead];
+  }
+
+  size_t Count() const { return mCount; }
+
+  size_t ShallowSizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+    size_t n = 0;
+    for (Page* page = mHead; page != nullptr; page = page->mNext) {
+      n += aMallocSizeOf(page);
+    }
+    return n;
+  }
+
+  size_t ShallowSizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + ShallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  template <typename Callback>
+  void Iterate(Callback&& aCallback) {
+    if (mCount == 0) {
+      return;
+    }
+
+    std::decay_t<Callback> callback = std::forward<Callback>(aCallback);
+
+    uint16_t start = mOffsetHead;
+    uint32_t count = mCount;
+    uint16_t countInPage = mHeadLength;
+    for (Page* page = mHead; page != nullptr; page = page->mNext) {
+      IterateOverPage(page, start, countInPage, callback);
+      start = 0;
+      count -= countInPage;
+      countInPage = std::min(count, static_cast<uint32_t>(ItemsPerPage));
+      MOZ_ASSERT(count < mCount);
+    }
+
+    MOZ_ASSERT(count == 0);
+  }
+
+ private:
+  static_assert(
+      (RequestedItemsPerPage & (RequestedItemsPerPage - 1)) == 0,
+      "RequestedItemsPerPage should be a power of two to avoid heap slop.");
+
+  static constexpr size_t ItemsPerPage = RequestedItemsPerPage - 1;
+
+  struct Page {
+    struct Page* mNext;
+    T mEvents[ItemsPerPage];
+  };
+
+  static Page* NewPage() {
+    return static_cast<Page*>(moz_xcalloc(1, sizeof(Page)));
+  }
+
+  template <typename Callback>
+  void IterateOverPage(Page* aPage, size_t aOffsetStart, size_t aCount,
+                       Callback& aCallback) {
+    size_t aOffsetEnd = aOffsetStart + aCount;
+    MOZ_ASSERT(aCount <= ItemsPerPage);
+    MOZ_ASSERT(aOffsetEnd > aOffsetStart);
+    for (size_t i = aOffsetStart; i < aOffsetEnd; ++i) {
+      aCallback(aPage->mEvents[i % ItemsPerPage]);
+    }
+  }
+
+  Page* mHead = nullptr;
+  Page* mTail = nullptr;
+
+  uint32_t mCount = 0;       
+  uint16_t mOffsetHead = 0;  
+  uint16_t mHeadLength = 0;  
+};
+
+}  
+
+template <class T, size_t RequestedItemsPerPage>
+inline void ImplCycleCollectionUnlink(
+    mozilla::Queue<T, RequestedItemsPerPage>& aField) {
+  aField.Clear();
+}
+
+template <class T, size_t RequestedItemsPerPage, typename Callback>
+inline void ImplCycleCollectionIndexedContainer(
+    mozilla::Queue<T, RequestedItemsPerPage>& aField, Callback&& aCallback) {
+  aField.Iterate(std::forward<Callback>(aCallback));
+}
+
+#endif  // mozilla_Queue_h

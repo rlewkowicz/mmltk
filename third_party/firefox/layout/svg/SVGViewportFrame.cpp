@@ -1,0 +1,211 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SVGViewportFrame.h"
+
+#include "gfx2DGlue.h"
+#include "gfxContext.h"
+#include "mozilla/ISVGDisplayableFrame.h"
+#include "mozilla/SVGContainerFrame.h"
+#include "mozilla/SVGUtils.h"
+#include "mozilla/dom/SVGViewportElement.h"
+#include "nsLayoutUtils.h"
+
+using namespace mozilla::dom;
+using namespace mozilla::gfx;
+using namespace mozilla::image;
+
+namespace mozilla {
+
+
+void SVGViewportFrame::PaintSVG(gfxContext& aContext,
+                                const gfxMatrix& aTransform,
+                                imgDrawingParams& aImgParams) {
+  NS_ASSERTION(HasAnyStateBits(NS_FRAME_IS_NONDISPLAY),
+               "Only painting of non-display SVG should take this code path");
+
+  gfxClipAutoSaveRestore autoSaveClip(&aContext);
+
+  if (StyleDisplay()->IsScrollableOverflow()) {
+    float x, y, width, height;
+    static_cast<SVGViewportElement*>(GetContent())
+        ->GetAnimatedLengthValues(&x, &y, &width, &height, nullptr);
+
+    if (width <= 0 || height <= 0) {
+      return;
+    }
+
+    gfxRect clipRect = SVGUtils::GetClipRectForFrame(this, x, y, width, height);
+    autoSaveClip.TransformedClip(aTransform, clipRect);
+  }
+
+  SVGDisplayContainerFrame::PaintSVG(aContext, aTransform, aImgParams);
+}
+
+void SVGViewportFrame::ReflowSVG() {
+  float x, y, width, height;
+  static_cast<SVGViewportElement*>(GetContent())
+      ->GetAnimatedLengthValues(&x, &y, &width, &height, nullptr);
+  if (width < 0.0f) {
+    width = 0.0f;
+  }
+  if (height < 0.0f) {
+    height = 0.0f;
+  }
+  mRect = nsLayoutUtils::RoundGfxRectToAppRect(gfxRect(x, y, width, height),
+                                               AppUnitsPerCSSPixel());
+
+  if (StyleEffects()->HasFilters()) {
+    InvalidateFrame();
+  }
+
+  SVGDisplayContainerFrame::ReflowSVG();
+}
+
+void SVGViewportFrame::NotifySVGChanged(ChangeFlags aFlags) {
+  MOZ_ASSERT(aFlags.contains(ChangeFlag::TransformChanged) ||
+                 aFlags.contains(ChangeFlag::CoordContextChanged),
+             "Invalidation logic may need adjusting");
+
+  if (aFlags.contains(ChangeFlag::CoordContextChanged)) {
+    SVGViewportElement* svg = static_cast<SVGViewportElement*>(GetContent());
+
+    bool xOrYIsPercentage =
+        svg->mLengthAttributes[SVGViewportElement::ATTR_X].IsPercentage() ||
+        svg->mLengthAttributes[SVGViewportElement::ATTR_Y].IsPercentage();
+    bool widthOrHeightIsPercentage =
+        svg->mLengthAttributes[SVGViewportElement::ATTR_WIDTH].IsPercentage() ||
+        svg->mLengthAttributes[SVGViewportElement::ATTR_HEIGHT].IsPercentage();
+
+    if (xOrYIsPercentage || widthOrHeightIsPercentage) {
+      SVGUtils::ScheduleReflowSVG(this);
+    }
+
+
+    if (!aFlags.contains(ChangeFlag::TransformChanged) &&
+        (xOrYIsPercentage ||
+         (widthOrHeightIsPercentage && svg->HasViewBox()))) {
+      aFlags += ChangeFlag::TransformChanged;
+    }
+
+    if (svg->HasViewBox() || !widthOrHeightIsPercentage) {
+      aFlags -= ChangeFlag::CoordContextChanged;
+
+      if (aFlags.isEmpty()) {
+        return;  
+      }
+    }
+  }
+
+  SVGDisplayContainerFrame::NotifySVGChanged(aFlags);
+}
+
+SVGBBox SVGViewportFrame::GetBBoxContribution(const Matrix& aToBBoxUserspace,
+                                              SVGBBoxFlags aFlags) {
+
+  SVGBBox bbox;
+
+  if (aFlags.contains(SVGBBoxFlag::ForGetClientRects)) {
+    float x, y, w, h;
+    static_cast<SVGViewportElement*>(GetContent())
+        ->GetAnimatedLengthValues(&x, &y, &w, &h, nullptr);
+    if (w < 0.0f) {
+      w = 0.0f;
+    }
+    if (h < 0.0f) {
+      h = 0.0f;
+    }
+    Rect viewport(x, y, w, h);
+    bbox = aToBBoxUserspace.TransformBounds(viewport);
+    if (StyleDisplay()->IsScrollableOverflow()) {
+      return bbox;
+    }
+    // Else we're not clipping to our viewport so we fall through and include
+  }
+
+  SVGBBox descendantsBbox =
+      SVGDisplayContainerFrame::GetBBoxContribution(aToBBoxUserspace, aFlags);
+
+  bbox.UnionEdges(descendantsBbox);
+
+  return bbox;
+}
+
+nsresult SVGViewportFrame::AttributeChanged(int32_t aNameSpaceID,
+                                            nsAtom* aAttribute, AttrModType) {
+  if (aNameSpaceID == kNameSpaceID_None &&
+      !HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+    SVGViewportElement* content =
+        static_cast<SVGViewportElement*>(GetContent());
+
+    if (aAttribute == nsGkAtoms::width || aAttribute == nsGkAtoms::height) {
+      nsLayoutUtils::PostRestyleEvent(
+          mContent->AsElement(), RestyleHint{0},
+          nsChangeHint_InvalidateRenderingObservers);
+      SVGUtils::ScheduleReflowSVG(this);
+
+      if (content->HasViewBoxOrSyntheticViewBox()) {
+        mCanvasTM = nullptr;
+        content->ChildrenOnlyTransformChanged();
+        SVGUtils::NotifyChildrenOfSVGChange(this, ChangeFlag::TransformChanged);
+      } else {
+        ChangeFlags flags(ChangeFlag::CoordContextChanged);
+        if (mCanvasTM && mCanvasTM->IsSingular()) {
+          mCanvasTM = nullptr;
+          flags += ChangeFlag::TransformChanged;
+        }
+        SVGUtils::NotifyChildrenOfSVGChange(this, flags);
+      }
+
+    } else if (aAttribute == nsGkAtoms::preserveAspectRatio ||
+               aAttribute == nsGkAtoms::viewBox || aAttribute == nsGkAtoms::x ||
+               aAttribute == nsGkAtoms::y) {
+      mCanvasTM = nullptr;
+
+      SVGUtils::NotifyChildrenOfSVGChange(
+          this, aAttribute == nsGkAtoms::viewBox
+                    ? ChangeFlags(ChangeFlag::TransformChanged,
+                                  ChangeFlag::CoordContextChanged)
+                    : ChangeFlag::TransformChanged);
+
+      if (aAttribute == nsGkAtoms::x || aAttribute == nsGkAtoms::y) {
+        nsLayoutUtils::PostRestyleEvent(
+            mContent->AsElement(), RestyleHint{0},
+            nsChangeHint_InvalidateRenderingObservers);
+        SVGUtils::ScheduleReflowSVG(this);
+      } else if (aAttribute == nsGkAtoms::viewBox ||
+                 (aAttribute == nsGkAtoms::preserveAspectRatio &&
+                  content->HasViewBoxOrSyntheticViewBox())) {
+        content->ChildrenOnlyTransformChanged();
+        SchedulePaint();
+      }
+    }
+  }
+
+  return NS_OK;
+}
+
+nsIFrame* SVGViewportFrame::GetFrameForPoint(const gfxPoint& aPoint) {
+  MOZ_ASSERT_UNREACHABLE("A clipPath cannot contain svg or symbol elements");
+  return nullptr;
+}
+
+
+void SVGViewportFrame::NotifyViewportOrTransformChanged(ChangeFlags aFlags) {
+  NS_ERROR("Not called for SVGViewportFrame");
+}
+
+
+bool SVGViewportFrame::HasChildrenOnlyTransform(gfx::Matrix* aTransform) const {
+  auto* content = static_cast<SVGViewportElement*>(GetContent());
+  if (!content->HasViewBoxOrSyntheticViewBox()) {
+    return false;
+  }
+  if (aTransform) {
+    *aTransform = content->GetViewBoxTransform();
+  }
+  return true;
+}
+
+}  

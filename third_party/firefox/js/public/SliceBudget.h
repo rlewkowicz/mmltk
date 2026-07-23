@@ -1,0 +1,150 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_SliceBudget_h
+#define js_SliceBudget_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/Variant.h"
+
+#include <stdint.h>
+
+#include "jstypes.h"
+
+namespace js {
+class GCMarker;
+};
+
+namespace JS {
+
+struct JS_PUBLIC_API TimeBudget {
+  const mozilla::TimeDuration budget;
+  mozilla::TimeStamp deadline;  
+
+  explicit TimeBudget(mozilla::TimeDuration duration) : budget(duration) {}
+  explicit TimeBudget(int64_t milliseconds)
+      : budget(mozilla::TimeDuration::FromMilliseconds(milliseconds)) {}
+
+  void setDeadlineFromNow();
+  double progress(mozilla::TimeStamp t) const {
+    return (t - (deadline - budget)) / budget;
+  }
+};
+
+struct JS_PUBLIC_API WorkBudget {
+  const int64_t budget;
+
+  explicit WorkBudget(int64_t work) : budget(work) {}
+  double progress(int64_t work) const { return double(work) / double(budget); }
+};
+
+struct UnlimitedBudget {};
+
+class JS_PUBLIC_API SliceBudget {
+ public:
+  using InterruptRequestFlag = mozilla::Atomic<bool, mozilla::Relaxed>;
+
+ private:
+  static constexpr int64_t UnlimitedCounter = INT64_MAX;
+
+  static constexpr int64_t StepsPerExpensiveCheck = 1000;
+
+  int64_t counter = StepsPerExpensiveCheck;
+
+  InterruptRequestFlag* interruptRequested = nullptr;
+
+  mozilla::Variant<TimeBudget, WorkBudget, UnlimitedBudget> budget;
+
+  bool interrupted = false;
+
+ public:
+  bool idle = false;
+
+  bool extended = false;
+
+  bool keepGoing = false;
+
+ private:
+  bool checkOverBudget();
+
+ public:
+  static SliceBudget unlimited() { return SliceBudget(UnlimitedBudget()); }
+
+  explicit SliceBudget(UnlimitedBudget unlimited,
+                       InterruptRequestFlag* irqPtr = nullptr)
+      : counter(irqPtr ? StepsPerExpensiveCheck : UnlimitedCounter),
+        interruptRequested(irqPtr),
+        budget(unlimited) {}
+
+  explicit SliceBudget(TimeBudget time,
+                       InterruptRequestFlag* interrupt = nullptr);
+
+  explicit SliceBudget(mozilla::TimeDuration duration,
+                       InterruptRequestFlag* interrupt = nullptr)
+      : SliceBudget(TimeBudget(duration.ToMilliseconds()), interrupt) {}
+
+  explicit SliceBudget(WorkBudget work);
+
+  void step(uint64_t steps = 1) {
+    MOZ_ASSERT(steps > 0);
+    counter -= steps;
+  }
+
+  void forceCheck() {
+    if (isTimeBudget()) {
+      counter = 0;
+    }
+  }
+
+  bool isOverBudget() {
+    return counter <= 0 && !keepGoing && checkOverBudget();
+  }
+
+  double progress() const {
+    if (isUnlimited()) {
+      return 0.0;
+    }
+    if (isTimeBudget()) {
+      return budget.as<TimeBudget>().progress(mozilla::TimeStamp::Now());
+    }
+    return budget.as<WorkBudget>().progress(workBudget() - counter);
+  }
+
+  bool isWorkBudget() const { return budget.is<WorkBudget>(); }
+  bool isTimeBudget() const { return budget.is<TimeBudget>(); }
+  bool isUnlimited() const { return budget.is<UnlimitedBudget>(); }
+
+  mozilla::TimeDuration timeBudgetDuration() const {
+    return budget.as<TimeBudget>().budget;
+  }
+  int64_t timeBudget() const { return timeBudgetDuration().ToMilliseconds(); }
+  int64_t workBudget() const { return budget.as<WorkBudget>().budget; }
+
+  mozilla::TimeStamp deadline() const {
+    return budget.as<TimeBudget>().deadline;
+  }
+
+  int64_t workRemaining() const {
+    MOZ_ASSERT(isWorkBudget());
+    return std::max(counter, int64_t(0));
+  }
+
+  InterruptRequestFlag* interruptRequestFlag() const {
+    return interruptRequested;
+  }
+
+  void clearInterrupted() { interrupted = false; }
+
+  int describe(char* buffer, size_t maxlen) const;
+
+ private:
+  void setInterrupted() { interrupted = true; }
+  friend class js::GCMarker;
+};
+
+}  
+
+#endif /* js_SliceBudget_h */

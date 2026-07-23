@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_css_ErrorReporter_h_
+#define mozilla_css_ErrorReporter_h_
+
+#include "nsString.h"
+
+struct nsCSSToken;
+class nsIURI;
+
+namespace mozilla {
+class StyleSheet;
+
+namespace dom {
+class Document;
+}
+
+namespace css {
+
+class Loader;
+
+class MOZ_STACK_CLASS ErrorReporter final {
+ public:
+  explicit ErrorReporter(uint64_t aInnerWindowId);
+  ~ErrorReporter();
+
+  static void ReleaseGlobals();
+  static void EnsureGlobalsInitialized() {
+    if (MOZ_UNLIKELY(!sInitialized)) {
+      InitGlobals();
+    }
+  }
+
+  static bool ShouldReportErrors(const dom::Document&);
+  static bool ShouldReportErrors(const StyleSheet*, const Loader*);
+  static uint64_t FindInnerWindowId(const StyleSheet*, const Loader*);
+
+  void OutputError(const nsACString& aSelectors, uint32_t aLineNumber,
+                   uint32_t aColNumber, nsIURI* aURI);
+  void ClearError();
+
+
+  void ReportUnexpected(const char* aMessage);
+  void ReportUnexpectedUnescaped(const char* aMessage,
+                                 const nsTArray<nsString>& aParam);
+
+ private:
+  void AddToError(const nsString& aErrorText);
+  static void InitGlobals();
+
+  static bool sInitialized;
+  static bool sReportErrors;
+
+  nsString mError;
+  const uint64_t mInnerWindowId;
+};
+
+}  
+}  
+
+#endif  // mozilla_css_ErrorReporter_h_

@@ -1,0 +1,120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsUnknownDecoder_h_
+#define nsUnknownDecoder_h_
+
+#include "nsIStreamConverter.h"
+#include "nsIThreadRetargetableStreamListener.h"
+#include "nsIContentSniffer.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/Atomics.h"
+
+#include "nsCOMPtr.h"
+#include "nsString.h"
+
+#define NS_UNKNOWNDECODER_CID                 \
+  { \
+   0x7d7008a0,                                \
+   0xc49a,                                    \
+   0x11d3,                                    \
+   {0x9b, 0x22, 0x00, 0x80, 0xc7, 0xcb, 0x10, 0x80}}
+
+class nsUnknownDecoder : public nsIStreamConverter, public nsIContentSniffer {
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_DECL_NSISTREAMCONVERTER
+
+  NS_DECL_NSISTREAMLISTENER
+
+  NS_DECL_NSIREQUESTOBSERVER
+
+  NS_DECL_NSICONTENTSNIFFER
+
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+
+  explicit nsUnknownDecoder(nsIStreamListener* aListener = nullptr);
+
+ protected:
+  virtual ~nsUnknownDecoder();
+
+  virtual void DetermineContentType(nsIRequest* aRequest);
+  nsresult FireListenerNotifications(nsIRequest* request, nsISupports* aCtxt);
+
+  class ConvertedStreamListener : public nsIStreamListener {
+   public:
+    explicit ConvertedStreamListener(nsUnknownDecoder* aDecoder);
+
+    NS_DECL_ISUPPORTS
+    NS_DECL_NSIREQUESTOBSERVER
+    NS_DECL_NSISTREAMLISTENER
+
+   private:
+    virtual ~ConvertedStreamListener() = default;
+    static nsresult AppendDataToString(nsIInputStream* inputStream,
+                                       void* closure, const char* rawSegment,
+                                       uint32_t toOffset, uint32_t count,
+                                       uint32_t* writeCount);
+    nsUnknownDecoder* mDecoder;
+  };
+
+ protected:
+  nsCOMPtr<nsIStreamListener> mNextListener MOZ_GUARDED_BY(mMutex);
+
+  bool SniffForHTML(nsIRequest* aRequest);
+  bool SniffForXML(nsIRequest* aRequest);
+
+  bool SniffURI(nsIRequest* aRequest);
+
+  bool SniffBinary(nsIRequest* aRequest);
+
+  struct nsSnifferEntry {
+    using TypeSniffFunc = bool (nsUnknownDecoder::*)(nsIRequest*);
+
+    const char* mBytes;
+    uint32_t mByteLen;
+
+    const char* mMimeType;
+    TypeSniffFunc mContentTypeSniffer;
+  };
+
+#define SNIFFER_ENTRY(_bytes, _type) \
+  {_bytes, sizeof(_bytes) - 1, _type, nullptr}
+
+#define SNIFFER_ENTRY_WITH_FUNC(_bytes, _func) \
+  {                                            \
+    _bytes, sizeof(_bytes) - 1, nullptr, _func \
+  }
+
+  static nsSnifferEntry sSnifferEntries[];
+  static uint32_t sSnifferEntryNum;
+
+  mozilla::Atomic<char*> mBuffer;
+  mozilla::Atomic<uint32_t> mBufferLen;
+
+  nsCString mContentType MOZ_GUARDED_BY(mMutex);
+
+  mutable mozilla::Mutex mMutex;
+
+ protected:
+  nsresult ConvertEncodedData(nsIRequest* request, const char* data,
+                              uint32_t length);
+  nsCString mDecodedData MOZ_GUARDED_BY(
+      mMutex);  
+};
+
+#define NS_BINARYDETECTOR_CID                 \
+  { \
+   0xa2027ec6,                                \
+   0xba0d,                                    \
+   0x4c72,                                    \
+   {0x80, 0x5d, 0x14, 0x82, 0x33, 0xf5, 0xf3, 0x3c}}
+
+class nsBinaryDetector : public nsUnknownDecoder {
+ protected:
+  virtual void DetermineContentType(nsIRequest* aRequest) override;
+};
+
+#endif /* nsUnknownDecoder_h_ */

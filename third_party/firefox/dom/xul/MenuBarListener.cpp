@@ -1,0 +1,390 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MenuBarListener.h"
+
+#include "XULButtonElement.h"
+#include "mozilla/Attributes.h"
+#include "nsISound.h"
+
+#include "mozilla/BasicEvents.h"
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_ui.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/EventBinding.h"
+#include "mozilla/dom/KeyboardEvent.h"
+#include "mozilla/dom/KeyboardEventBinding.h"
+#include "mozilla/dom/XULButtonElement.h"
+#include "mozilla/dom/XULMenuBarElement.h"
+#include "mozilla/dom/XULMenuParentElement.h"
+#include "nsCOMPtr.h"
+#include "nsContentUtils.h"
+#include "nsIFrame.h"
+#include "nsPIWindowRoot.h"
+#include "nsWidgetsCID.h"
+#include "nsXULPopupManager.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_ISUPPORTS(MenuBarListener, nsIDOMEventListener)
+
+MenuBarListener::MenuBarListener(XULMenuBarElement& aElement)
+    : mMenuBar(&aElement),
+      mEventTarget(aElement.GetComposedDoc()),
+      mAccessKeyDown(false),
+      mAccessKeyDownCanceled(false) {
+  MOZ_ASSERT(mEventTarget);
+  MOZ_ASSERT(mMenuBar);
+
+
+
+  mEventTarget->AddSystemEventListener(u"keypress"_ns, this, false);
+  mEventTarget->AddSystemEventListener(u"keydown"_ns, this, false);
+  mEventTarget->AddSystemEventListener(u"keyup"_ns, this, false);
+  mEventTarget->AddSystemEventListener(u"mozaccesskeynotfound"_ns, this, false);
+  mEventTarget->AddEventListener(u"keydown"_ns, this, true);
+
+  mEventTarget->AddEventListener(u"mousedown"_ns, this, true);
+  mEventTarget->AddEventListener(u"mousedown"_ns, this, false);
+  mEventTarget->AddEventListener(u"blur"_ns, this, true);
+
+  mEventTarget->AddEventListener(u"MozDOMFullscreen:Entered"_ns, this, false);
+
+  if (RefPtr<EventTarget> top = nsContentUtils::GetWindowRoot(mEventTarget)) {
+    top->AddSystemEventListener(u"deactivate"_ns, this, true);
+  }
+}
+
+MenuBarListener::~MenuBarListener() {
+  MOZ_ASSERT(!mEventTarget, "Should've detached always");
+}
+
+void MenuBarListener::Detach() {
+  if (!mMenuBar) {
+    MOZ_ASSERT(!mEventTarget);
+    return;
+  }
+  mEventTarget->RemoveSystemEventListener(u"keypress"_ns, this, false);
+  mEventTarget->RemoveSystemEventListener(u"keydown"_ns, this, false);
+  mEventTarget->RemoveSystemEventListener(u"keyup"_ns, this, false);
+  mEventTarget->RemoveSystemEventListener(u"mozaccesskeynotfound"_ns, this,
+                                          false);
+  mEventTarget->RemoveEventListener(u"keydown"_ns, this, true);
+
+  mEventTarget->RemoveEventListener(u"mousedown"_ns, this, true);
+  mEventTarget->RemoveEventListener(u"mousedown"_ns, this, false);
+  mEventTarget->RemoveEventListener(u"blur"_ns, this, true);
+
+  mEventTarget->RemoveEventListener(u"MozDOMFullscreen:Entered"_ns, this,
+                                    false);
+  if (RefPtr<EventTarget> top = nsContentUtils::GetWindowRoot(mEventTarget)) {
+    top->RemoveSystemEventListener(u"deactivate"_ns, this, true);
+  }
+  mMenuBar = nullptr;
+  mEventTarget = nullptr;
+}
+
+void MenuBarListener::ToggleMenuActiveState(ByKeyboard aByKeyboard) {
+  RefPtr menuBar = mMenuBar;
+  if (menuBar->IsActive()) {
+    menuBar->SetActive(false);
+  } else {
+    if (aByKeyboard == ByKeyboard::Yes) {
+      menuBar->SetActiveByKeyboard();
+    }
+    menuBar->SelectFirstItem();
+  }
+}
+
+nsresult MenuBarListener::KeyUp(Event* aKeyEvent) {
+  WidgetKeyboardEvent* nativeKeyEvent =
+      aKeyEvent->WidgetEventPtr()->AsKeyboardEvent();
+  if (!nativeKeyEvent) {
+    return NS_OK;
+  }
+
+  if (!nativeKeyEvent->IsTrusted()) {
+    return NS_OK;
+  }
+
+  const auto accessKey = LookAndFeel::GetMenuAccessKey();
+  if (!accessKey || !StaticPrefs::ui_key_menuAccessKeyFocuses()) {
+    return NS_OK;
+  }
+
+  if (!nativeKeyEvent->DefaultPrevented() && mAccessKeyDown &&
+      !mAccessKeyDownCanceled && nativeKeyEvent->mKeyCode == accessKey) {
+    bool toggleMenuActiveState = true;
+    if (!mMenuBar->IsActive()) {
+      if (nativeKeyEvent->WillBeSentToRemoteProcess()) {
+        nativeKeyEvent->StopImmediatePropagation();
+        nativeKeyEvent->MarkAsWaitingReplyFromRemoteProcess();
+        return NS_OK;
+      }
+      if (nsXULPopupManager* pm = nsXULPopupManager::GetInstance()) {
+        pm->Rollup({});
+      }
+      toggleMenuActiveState = !Destroyed() && !mMenuBar->IsActive();
+    }
+    if (toggleMenuActiveState) {
+      ToggleMenuActiveState(ByKeyboard::Yes);
+    }
+  }
+
+  mAccessKeyDown = false;
+  mAccessKeyDownCanceled = false;
+
+  if (!Destroyed() && mMenuBar->IsActive()) {
+    nativeKeyEvent->StopPropagation();
+    nativeKeyEvent->PreventDefault();
+  }
+
+  return NS_OK;
+}
+
+nsresult MenuBarListener::KeyPress(Event* aKeyEvent) {
+  if (!aKeyEvent || aKeyEvent->DefaultPrevented()) {
+    return NS_OK;  
+  }
+
+  if (!aKeyEvent->IsTrusted()) {
+    return NS_OK;
+  }
+
+  const auto accessKey = LookAndFeel::GetMenuAccessKey();
+  if (!accessKey) {
+    return NS_OK;
+  }
+  WidgetKeyboardEvent* nativeKeyEvent =
+      aKeyEvent->WidgetEventPtr()->AsKeyboardEvent();
+  if (!nativeKeyEvent) {
+    return NS_OK;
+  }
+
+  RefPtr<KeyboardEvent> keyEvent = aKeyEvent->AsKeyboardEvent();
+  uint32_t keyCode = keyEvent->KeyCode();
+
+  if (keyCode != accessKey) {
+    mAccessKeyDownCanceled = true;
+  }
+
+  if (nativeKeyEvent->mMessage == eKeyPress && keyCode == NS_VK_F10) {
+    if ((keyEvent->GetModifiersForMenuAccessKey() & ~MODIFIER_CONTROL) == 0) {
+      if (nativeKeyEvent->WillBeSentToRemoteProcess()) {
+        nativeKeyEvent->StopImmediatePropagation();
+        nativeKeyEvent->MarkAsWaitingReplyFromRemoteProcess();
+        return NS_OK;
+      }
+      ToggleMenuActiveState(ByKeyboard::Yes);
+
+      if (mMenuBar && mMenuBar->IsActive()) {
+#if defined(MOZ_WIDGET_GTK)
+        if (RefPtr child = mMenuBar->GetActiveMenuChild()) {
+          child->OpenMenuPopup(false);
+        }
+#endif
+        aKeyEvent->StopPropagation();
+        aKeyEvent->PreventDefault();
+      }
+    }
+
+    return NS_OK;
+  }
+
+  RefPtr menuForKey = GetMenuForKeyEvent(*keyEvent);
+  if (!menuForKey) {
+    return NS_OK;
+  }
+
+  if (nativeKeyEvent->WillBeSentToRemoteProcess()) {
+    nativeKeyEvent->StopImmediatePropagation();
+    nativeKeyEvent->MarkAsWaitingReplyFromRemoteProcess();
+    return NS_OK;
+  }
+
+  RefPtr menuBar = mMenuBar;
+  menuBar->SetActiveByKeyboard();
+  menuForKey->OpenMenuPopup(true);
+
+  mAccessKeyDown = mAccessKeyDownCanceled = false;
+
+  aKeyEvent->StopPropagation();
+  aKeyEvent->PreventDefault();
+  return NS_OK;
+}
+
+dom::XULButtonElement* MenuBarListener::GetMenuForKeyEvent(
+    KeyboardEvent& aKeyEvent) {
+  if (!aKeyEvent.IsMenuAccessKeyPressed()) {
+    return nullptr;
+  }
+
+  uint32_t charCode = aKeyEvent.CharCode();
+  bool hasAccessKeyCandidates = charCode != 0;
+  if (!hasAccessKeyCandidates) {
+    WidgetKeyboardEvent* nativeKeyEvent =
+        aKeyEvent.WidgetEventPtr()->AsKeyboardEvent();
+    AutoTArray<uint32_t, 10> keys;
+    nativeKeyEvent->GetAccessKeyCandidates(keys);
+    hasAccessKeyCandidates = !keys.IsEmpty();
+  }
+
+  if (!hasAccessKeyCandidates) {
+    return nullptr;
+  }
+  return mMenuBar->FindMenuWithShortcut(aKeyEvent);
+}
+
+void MenuBarListener::ReserveKeyIfNeeded(Event* aKeyEvent) {
+  WidgetKeyboardEvent* nativeKeyEvent =
+      aKeyEvent->WidgetEventPtr()->AsKeyboardEvent();
+  if (nsContentUtils::ShouldBlockReservedKeys(nativeKeyEvent)) {
+    nativeKeyEvent->MarkAsReservedByChrome();
+  }
+}
+
+nsresult MenuBarListener::KeyDown(Event* aKeyEvent) {
+  if (!aKeyEvent || !aKeyEvent->IsTrusted()) {
+    return NS_OK;
+  }
+
+  RefPtr<KeyboardEvent> keyEvent = aKeyEvent->AsKeyboardEvent();
+  if (!keyEvent) {
+    return NS_OK;
+  }
+
+  uint32_t theChar = keyEvent->KeyCode();
+  uint16_t eventPhase = keyEvent->EventPhase();
+  bool capturing = (eventPhase == dom::Event_Binding::CAPTURING_PHASE);
+
+  if (capturing && !mAccessKeyDown && theChar == NS_VK_F10 &&
+      (keyEvent->GetModifiersForMenuAccessKey() & ~MODIFIER_CONTROL) == 0) {
+    ReserveKeyIfNeeded(aKeyEvent);
+  }
+
+  const auto accessKey = LookAndFeel::GetMenuAccessKey();
+  if (accessKey && StaticPrefs::ui_key_menuAccessKeyFocuses()) {
+    bool defaultPrevented = aKeyEvent->DefaultPrevented();
+
+    bool isAccessKeyDownEvent =
+        (theChar == accessKey &&
+         (keyEvent->GetModifiersForMenuAccessKey() &
+          ~LookAndFeel::GetMenuAccessKeyModifiers()) == 0);
+
+    if (!capturing && !mAccessKeyDown) {
+      if (!isAccessKeyDownEvent) {
+        return NS_OK;
+      }
+
+      mAccessKeyDown = true;
+      mAccessKeyDownCanceled = defaultPrevented;
+      return NS_OK;
+    }
+
+    if (mAccessKeyDownCanceled || defaultPrevented) {
+      return NS_OK;
+    }
+
+    mAccessKeyDownCanceled = !isAccessKeyDownEvent;
+  }
+
+  if (capturing && accessKey) {
+    if (GetMenuForKeyEvent(*keyEvent)) {
+      ReserveKeyIfNeeded(aKeyEvent);
+    }
+  }
+
+  return NS_OK;  
+}
+
+
+nsresult MenuBarListener::Blur(Event* aEvent) {
+  if (!IsMenuOpen() && mMenuBar->IsActive()) {
+    ToggleMenuActiveState(ByKeyboard::No);
+    mAccessKeyDown = false;
+    mAccessKeyDownCanceled = false;
+  }
+  return NS_OK;  
+}
+
+
+nsresult MenuBarListener::OnWindowDeactivated(Event* aEvent) {
+  mAccessKeyDown = false;
+  mAccessKeyDownCanceled = false;
+  return NS_OK;  
+}
+
+bool MenuBarListener::IsMenuOpen() const {
+  auto* activeChild = mMenuBar->GetActiveMenuChild();
+  return activeChild && activeChild->IsMenuPopupOpen();
+}
+
+nsresult MenuBarListener::MouseDown(Event* aMouseEvent) {
+
+  if (mAccessKeyDown) {
+    mAccessKeyDownCanceled = true;
+  }
+
+  if (aMouseEvent->EventPhase() == dom::Event_Binding::CAPTURING_PHASE) {
+    return NS_OK;
+  }
+
+  if (!IsMenuOpen() && mMenuBar->IsActive()) {
+    ToggleMenuActiveState(ByKeyboard::No);
+  }
+
+  return NS_OK;  
+}
+
+
+nsresult MenuBarListener::Fullscreen(Event* aEvent) {
+  if (mMenuBar->IsActive()) {
+    ToggleMenuActiveState(ByKeyboard::No);
+  }
+  return NS_OK;
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY nsresult
+MenuBarListener::HandleEvent(Event* aEvent) {
+  if (!mMenuBar || !mMenuBar->GetPrimaryFrame() ||
+      !mMenuBar->GetPrimaryFrame()->StyleVisibility()->IsVisible()) {
+    return NS_OK;
+  }
+
+  nsAutoString eventType;
+  aEvent->GetType(eventType);
+
+  if (eventType.EqualsLiteral("keyup")) {
+    return KeyUp(aEvent);
+  }
+  if (eventType.EqualsLiteral("keydown")) {
+    return KeyDown(aEvent);
+  }
+  if (eventType.EqualsLiteral("keypress")) {
+    return KeyPress(aEvent);
+  }
+  if (eventType.EqualsLiteral("mozaccesskeynotfound")) {
+    return KeyPress(aEvent);
+  }
+  if (eventType.EqualsLiteral("blur")) {
+    return Blur(aEvent);
+  }
+  if (eventType.EqualsLiteral("deactivate")) {
+    return OnWindowDeactivated(aEvent);
+  }
+  if (eventType.EqualsLiteral("mousedown")) {
+    return MouseDown(aEvent);
+  }
+  if (eventType.EqualsLiteral("MozDOMFullscreen:Entered")) {
+    return Fullscreen(aEvent);
+  }
+
+  MOZ_ASSERT_UNREACHABLE("Unexpected eventType");
+  return NS_OK;
+}
+
+}  

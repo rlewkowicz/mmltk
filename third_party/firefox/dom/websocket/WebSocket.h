@@ -1,0 +1,157 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef WebSocket_h_
+#define WebSocket_h_
+
+#include "mozilla/CheckedInt.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/dom/TypedArray.h"
+#include "mozilla/dom/WebSocketBinding.h"  // for BinaryType
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsISupports.h"
+#include "nsISupportsUtils.h"
+#include "nsString.h"
+#include "nsWrapperCache.h"
+
+#define DEFAULT_WS_SCHEME_PORT 80
+#define DEFAULT_WSS_SCHEME_PORT 443
+
+class nsIInputStream;
+class nsITransportProvider;
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+class Blob;
+class StringOrStringSequence;
+class WebSocketImpl;
+
+class WebSocket final : public DOMEventTargetHelper {
+  friend class WebSocketImpl;
+
+ public:
+  enum { CONNECTING = 0, OPEN = 1, CLOSING = 2, CLOSED = 3 };
+
+ public:
+  WebSocket(const WebSocket& x) = delete;  
+  WebSocket& operator=(const WebSocket& x) = delete;
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(WebSocket, DOMEventTargetHelper)
+  virtual bool IsCertainlyAliveForCC() const override;
+
+  using EventTarget::EventListenerAdded;
+  virtual void EventListenerAdded(nsAtom* aType) override;
+
+  using EventTarget::EventListenerRemoved;
+  virtual void EventListenerRemoved(nsAtom* aType) override;
+
+  virtual void DisconnectFromOwner() override;
+
+  virtual JSObject* WrapObject(JSContext* cx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+ public:  
+  static bool PrefEnabled(JSContext* aCx = nullptr,
+                          JSObject* aGlobal = nullptr);
+
+ public:  
+  static already_AddRefed<WebSocket> Constructor(
+      const GlobalObject& aGlobal, const nsAString& aUrl,
+      const StringOrStringSequence& aProtocols, ErrorResult& rv);
+
+  static already_AddRefed<WebSocket> CreateServerWebSocket(
+      const GlobalObject& aGlobal, const nsAString& aUrl,
+      const Sequence<nsString>& aProtocols,
+      nsITransportProvider* aTransportProvider,
+      const nsAString& aNegotiatedExtensions, ErrorResult& rv);
+
+  static already_AddRefed<WebSocket> ConstructorCommon(
+      const GlobalObject& aGlobal, const nsAString& aUrl,
+      const Sequence<nsString>& aProtocols,
+      nsITransportProvider* aTransportProvider,
+      const nsACString& aNegotiatedExtensions, ErrorResult& rv);
+
+  void GetUrl(nsAString& aResult);
+
+  uint16_t ReadyState();
+
+  uint64_t BufferedAmount() const;
+
+  IMPL_EVENT_HANDLER(open)
+
+  IMPL_EVENT_HANDLER(error)
+
+  IMPL_EVENT_HANDLER(close)
+
+  void GetExtensions(nsAString& aResult);
+
+  void GetProtocol(nsAString& aResult);
+
+  void Close(const Optional<uint16_t>& aCode,
+             const Optional<nsAString>& aReason, ErrorResult& aRv);
+
+  IMPL_EVENT_HANDLER(message)
+
+  dom::BinaryType BinaryType() const;
+  void SetBinaryType(dom::BinaryType aData);
+
+  void Send(const nsAString& aData, ErrorResult& aRv);
+  void Send(Blob& aData, ErrorResult& aRv);
+  void Send(const ArrayBuffer& aData, ErrorResult& aRv);
+  void Send(const ArrayBufferView& aData, ErrorResult& aRv);
+
+ private:  
+  explicit WebSocket(nsIGlobalObject* aGlobal);
+  virtual ~WebSocket();
+
+  void SetReadyState(uint16_t aReadyState);
+
+  nsresult CreateAndDispatchSimpleEvent(const nsAString& aName);
+  nsresult CreateAndDispatchMessageEvent(const nsACString& aData,
+                                         bool aIsBinary);
+  nsresult CreateAndDispatchCloseEvent(bool aWasClean, uint16_t aCode,
+                                       const nsAString& aReason);
+
+  static bool IsValidProtocolString(const nsString& aValue);
+
+  void UpdateMustKeepAlive();
+  void DontKeepAliveAnyMore();
+
+ private:
+  void Send(nsIInputStream* aMsgStream, const nsACString& aMsgString,
+            uint32_t aMsgLength, bool aIsBinary, ErrorResult& aRv);
+
+  void AssertIsOnTargetThread() const;
+
+  WebSocketImpl* mImpl;
+
+  bool mIsMainThread;
+
+  bool mKeepingAlive;
+  bool mCheckMustKeepAlive;
+
+  CheckedUint64 mOutgoingBufferedAmount;
+
+  nsString mURI;
+  nsString mEffectiveURL;  
+  nsCString mEstablishedExtensions;
+  nsCString mEstablishedProtocol;
+
+  dom::BinaryType mBinaryType;
+
+  mozilla::Mutex mMutex;
+
+  uint16_t mReadyState MOZ_GUARDED_BY(mMutex);
+};
+
+}  
+}  
+
+#endif

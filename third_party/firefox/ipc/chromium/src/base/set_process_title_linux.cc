@@ -1,0 +1,157 @@
+// Copyright 2009 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+
+#include "base/set_process_title_linux.h"
+
+#include "mozilla/UniquePtrExtensions.h"
+
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <string>
+#include <vector>
+
+extern char** environ;
+
+static const char* g_orig_argv0 = nullptr;
+
+static char* g_argv_start = nullptr;
+static char* g_argv_end = nullptr;
+static char* g_envp_end = nullptr;
+
+void setproctitle(const char* fmt, ...) {
+  va_list ap;
+
+  if (!g_orig_argv0 || !fmt) {
+    return;
+  }
+
+  const size_t avail_size = g_envp_end - g_argv_start - 1;
+
+  static const bool buggy_kernel = [avail_size]() {
+    memset(g_argv_start, 0, avail_size + 1);
+    g_argv_end[-1] = '.';
+
+    mozilla::UniqueFileHandle fd(
+        open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC));
+    if (!fd) {
+      return false;
+    }
+
+    char buf[2];
+    ssize_t total_read = 0;
+    while (total_read < 2) {
+      ssize_t rd = read(fd.get(), buf, 2);
+      if (rd <= 0) {
+        return false;
+      }
+      total_read += rd;
+    }
+    return true;
+  }();
+
+  memset(g_argv_start, 0, avail_size + 1);
+
+  size_t size;
+  va_start(ap, fmt);
+  if (fmt[0] == '-') {
+    size = vsnprintf(g_argv_start, avail_size, &fmt[1], ap);
+  } else {
+    size = snprintf(g_argv_start, avail_size, "%s ", g_orig_argv0);
+    if (size < avail_size) {
+      size += vsnprintf(&g_argv_start[size], avail_size - size, fmt, ap);
+    }
+  }
+  va_end(ap);
+
+  const size_t argv_size = g_argv_end - g_argv_start - 1;
+  if (!buggy_kernel && size < argv_size) {
+    g_argv_end[-1] = '.';
+  }
+
+  const size_t previous_size = g_argv_end - g_argv_start - 1;
+  ssize_t need_to_save = static_cast<ssize_t>(size - previous_size);
+
+  const char* kEnvSkip[] = {"HOME=", "LS_COLORS=", "PATH=", "XDG_DATA_DIRS="};
+  const size_t kEnvElems = sizeof(kEnvSkip) / sizeof(kEnvSkip[0]);
+
+  size_t environ_size = 0;
+  for (size_t i = 0; environ[i]; ++i) {
+    bool skip = false;
+    const size_t var_size = strlen(environ[i]) + 1;
+
+    for (size_t remI = 0; need_to_save > 0 && remI < kEnvElems; ++remI) {
+      const char* thisEnv = kEnvSkip[remI];
+      int diff = strncmp(environ[i], thisEnv, strlen(thisEnv));
+      if (diff == 0) {
+        need_to_save -= static_cast<ssize_t>(var_size);
+        skip = true;
+        break;
+      }
+    }
+
+    if (skip) {
+      continue;
+    }
+
+    char* env_start = g_argv_start + size + 1 + environ_size;
+    if ((env_start + var_size) < g_envp_end) {
+      const size_t var_size_copied =
+          snprintf(env_start, var_size, "%s", environ[i]);
+      environ_size += var_size_copied + 1 ;
+    }
+  }
+}
+
+void setproctitle_init(char** main_argv) {
+  static bool init_called = false;
+  if (init_called) {
+    return;
+  }
+  init_called = true;
+
+  if (!main_argv) {
+    return;
+  }
+
+  char** const argv = main_argv;
+  char* argv_start = argv[0];
+  char* p = argv_start;
+  for (size_t i = 0; argv[i]; ++i) {
+    if (p != argv[i]) {
+      return;
+    }
+    p += strlen(p) + 1;
+  }
+  char* argv_end = p;
+  size_t environ_size = 0;
+  for (size_t i = 0; environ[i]; ++i, ++environ_size) {
+    if (p != environ[i]) {
+      return;
+    }
+    p += strlen(p) + 1;
+  }
+  char* envp_end = p;
+
+  for (size_t i = 0; argv[i]; ++i) {
+    argv[i] = strdup(argv[i]);
+  }
+  for (size_t i = 0; environ[i]; ++i) {
+    environ[i] = strdup(environ[i]);
+  }
+
+  if (!argv[0]) {
+    return;
+  }
+
+  g_orig_argv0 = argv[0];
+  g_argv_start = argv_start;
+  g_argv_end = argv_end;
+  g_envp_end = envp_end;
+}

@@ -1,0 +1,175 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_BytecodeControlStructures_h
+#define frontend_BytecodeControlStructures_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+#include "mozilla/Attributes.h"  // MOZ_STACK_CLASS
+#include "mozilla/Maybe.h"       // mozilla::Maybe
+
+#include <stdint.h>  // int32_t, uint32_t
+
+#include "ds/Nestable.h"              // Nestable
+#include "frontend/BytecodeOffset.h"  // BytecodeOffset
+#include "frontend/JumpList.h"        // JumpList, JumpTarget
+#include "frontend/ParserAtom.h"      // TaggedParserAtomIndex
+#include "frontend/SharedContext.h"  // StatementKind, StatementKindIsLoop, StatementKindIsUnlabeledBreakTarget
+#include "frontend/TDZCheckCache.h"  // TDZCheckCache
+#include "vm/StencilEnums.h"         // TryNoteKind
+
+namespace js {
+namespace frontend {
+
+struct BytecodeEmitter;
+class EmitterScope;
+
+class NestableControl : public Nestable<NestableControl> {
+  StatementKind kind_;
+
+  EmitterScope* emitterScope_;
+
+ protected:
+  NestableControl(BytecodeEmitter* bce, StatementKind kind);
+
+ public:
+  using Nestable<NestableControl>::enclosing;
+  using Nestable<NestableControl>::findNearest;
+
+  StatementKind kind() const { return kind_; }
+
+  EmitterScope* emitterScope() const { return emitterScope_; }
+
+  template <typename T>
+  bool is() const;
+
+  template <typename T>
+  T& as() {
+    MOZ_ASSERT(this->is<T>());
+    return static_cast<T&>(*this);
+  }
+};
+
+class MOZ_STACK_CLASS BreakableControl : public NestableControl {
+ public:
+  JumpList breaks;
+
+  BreakableControl(BytecodeEmitter* bce, StatementKind kind);
+
+  [[nodiscard]] bool patchBreaks(BytecodeEmitter* bce);
+};
+template <>
+inline bool NestableControl::is<BreakableControl>() const {
+  return StatementKindIsUnlabeledBreakTarget(kind_) ||
+         kind_ == StatementKind::Label;
+}
+
+class MOZ_STACK_CLASS LabelControl : public BreakableControl {
+  TaggedParserAtomIndex label_;
+
+  BytecodeOffset startOffset_;
+
+ public:
+  LabelControl(BytecodeEmitter* bce, TaggedParserAtomIndex label,
+               BytecodeOffset startOffset);
+
+  TaggedParserAtomIndex label() const { return label_; }
+
+  BytecodeOffset startOffset() const { return startOffset_; }
+};
+template <>
+inline bool NestableControl::is<LabelControl>() const {
+  return kind_ == StatementKind::Label;
+}
+
+class LoopControl : public BreakableControl {
+  TDZCheckCache tdzCache_;
+
+
+  JumpTarget head_;
+
+  int32_t stackDepth_;
+
+  uint32_t loopDepth_;
+
+ public:
+  JumpList continues;
+
+  LoopControl(BytecodeEmitter* bce, StatementKind loopKind);
+
+  BytecodeOffset headOffset() const { return head_.offset; }
+
+  [[nodiscard]] bool emitContinueTarget(BytecodeEmitter* bce);
+
+  [[nodiscard]] bool emitLoopHead(BytecodeEmitter* bce,
+                                  const mozilla::Maybe<uint32_t>& nextPos);
+
+  [[nodiscard]] bool emitLoopEnd(BytecodeEmitter* bce, JSOp op,
+                                 TryNoteKind tryNoteKind);
+};
+template <>
+inline bool NestableControl::is<LoopControl>() const {
+  return StatementKindIsLoop(kind_);
+}
+
+enum class NonLocalExitKind { Continue, Break, Return };
+
+class TryFinallyContinuation {
+ public:
+  TryFinallyContinuation(NestableControl* target, NonLocalExitKind kind)
+      : target_(target), kind_(kind) {}
+
+  NestableControl* target_;
+  NonLocalExitKind kind_;
+};
+
+class TryFinallyControl : public NestableControl {
+  bool emittingSubroutine_ = false;
+
+ public:
+  JumpList finallyJumps_;
+
+  js::Vector<TryFinallyContinuation, 4, SystemAllocPolicy> continuations_;
+
+  TryFinallyControl(BytecodeEmitter* bce, StatementKind kind);
+
+  void setEmittingSubroutine() { emittingSubroutine_ = true; }
+
+  bool emittingSubroutine() const { return emittingSubroutine_; }
+
+  enum SpecialContinuations { Fallthrough, Count };
+  bool allocateContinuation(NestableControl* target, NonLocalExitKind kind,
+                            uint32_t* idx);
+  bool emitContinuations(BytecodeEmitter* bce);
+};
+template <>
+inline bool NestableControl::is<TryFinallyControl>() const {
+  return kind_ == StatementKind::Try || kind_ == StatementKind::Finally;
+}
+
+class NonLocalExitControl {
+  BytecodeEmitter* bce_;
+  const uint32_t savedScopeNoteIndex_;
+  const int savedDepth_;
+  uint32_t openScopeNoteIndex_;
+  NonLocalExitKind kind_;
+
+  BytecodeOffset setRvalOffset_ = BytecodeOffset::invalidOffset();
+
+  [[nodiscard]] bool leaveScope(EmitterScope* es);
+
+ public:
+  NonLocalExitControl(const NonLocalExitControl&) = delete;
+  NonLocalExitControl(BytecodeEmitter* bce, NonLocalExitKind kind);
+  ~NonLocalExitControl();
+
+  [[nodiscard]] bool emitNonLocalJump(NestableControl* target,
+                                      NestableControl* startingAfter = nullptr);
+  [[nodiscard]] bool emitReturn(BytecodeOffset setRvalOffset);
+};
+
+} 
+} 
+
+#endif /* frontend_BytecodeControlStructures_h */

@@ -1,0 +1,81 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_FRAGMENTDIRECTIVE_H_
+#define DOM_FRAGMENTDIRECTIVE_H_
+
+#include "js/TypeDecls.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/fragmentdirectives_ffi_generated.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsStringFwd.h"
+#include "nsWrapperCache.h"
+
+class nsINode;
+class nsIURI;
+class nsRange;
+namespace mozilla::dom {
+class Document;
+class Promise;
+class Text;
+class TextDirectiveFinder;
+
+class FragmentDirective final : public nsISupports, public nsWrapperCache {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(FragmentDirective)
+
+ public:
+  explicit FragmentDirective(Document* aDocument);
+
+ protected:
+  ~FragmentDirective();
+
+ public:
+  Document* GetParentObject() const { return mDocument; };
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  void SetTextDirectives(nsTArray<TextDirective>&& aTextDirectives);
+
+  bool HasUninvokedDirectives() const;
+
+  void ClearUninvokedDirectives();
+
+  MOZ_CAN_RUN_SCRIPT
+  void HighlightTextDirectives(
+      const nsTArray<RefPtr<nsRange>>& aTextDirectiveRanges);
+
+  nsTArray<RefPtr<nsRange>> FindTextFragmentsInDocument();
+
+  static void ParseAndRemoveFragmentDirectiveFromFragment(
+      nsCOMPtr<nsIURI>& aURI,
+      nsTArray<TextDirective>* aTextDirectives = nullptr);
+
+  static bool ParseAndRemoveFragmentDirectiveFromFragmentString(
+      nsCString& aFragment, nsTArray<TextDirective>* aTextDirectives = nullptr,
+      nsIURI* aURI = nullptr);
+
+  static nsresult GetSpecIgnoringFragmentDirective(
+      nsCOMPtr<nsIURI>& aURI, nsACString& aSpecIgnoringFragmentDirective);
+
+  bool IsTextDirectiveAllowedToBeScrolledTo();
+
+  void GetTextDirectiveRanges(nsTArray<RefPtr<nsRange>>& aRanges) const;
+
+  MOZ_CAN_RUN_SCRIPT void RemoveAllTextDirectives(ErrorResult& aRv);
+
+  already_AddRefed<Promise> CreateTextDirectiveForRanges(
+      const Sequence<OwningNonNull<nsRange>>& aRanges);
+
+ private:
+  RefPtr<Document> mDocument;
+  UniquePtr<TextDirectiveFinder> mFinder;
+};
+
+}  
+
+#endif  // DOM_FRAGMENTDIRECTIVE_H_

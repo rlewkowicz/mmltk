@@ -1,0 +1,627 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/Serial.h"
+
+#include "Navigator.h"
+#include "SerialLogging.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/FeaturePolicyUtils.h"
+#include "mozilla/dom/PSerialPort.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/SerialBinding.h"
+#include "mozilla/dom/SerialManagerChild.h"
+#include "mozilla/dom/SerialPort.h"
+#include "mozilla/dom/SerialPortChild.h"
+#include "mozilla/dom/WindowContext.h"
+#include "mozilla/dom/WindowGlobalChild.h"
+#include "mozilla/dom/WorkerCommon.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "mozilla/dom/WorkerRef.h"
+#include "nsContentUtils.h"
+#include "nsPIDOMWindow.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla::dom {
+
+static bool ResolveBluetoothServiceUUID(const OwningStringOrUnsignedLong& aName,
+                                        nsAutoString& aResult);
+
+static Serial* FindWindowSerialForWorkerPrivate(WorkerPrivate* aWorkerPrivate) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(aWorkerPrivate);
+  nsPIDOMWindowInner* inner = aWorkerPrivate->GetAncestorWindow();
+  if (!inner) {
+    return nullptr;
+  }
+  return inner->Navigator()->GetExistingSerial();
+}
+
+NS_IMPL_CYCLE_COLLECTION_WEAK_PTR_INHERITED(Serial, DOMEventTargetHelper,
+                                            mPorts)
+
+NS_IMPL_ADDREF_INHERITED(Serial, DOMEventTargetHelper)
+NS_IMPL_RELEASE_INHERITED(Serial, DOMEventTargetHelper)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Serial)
+NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
+
+LazyLogModule gWebSerialLog("WebSerial");
+
+Serial::Serial(nsPIDOMWindowInner* aWindow) : DOMEventTargetHelper(aWindow) {
+  MOZ_LOG(gWebSerialLog, LogLevel::Debug,
+          ("Serial[%p] created for window", this));
+  AssertIsOnMainThread();
+}
+
+Serial::Serial(nsIGlobalObject* aGlobal) : DOMEventTargetHelper(aGlobal) {
+  MOZ_LOG(gWebSerialLog, LogLevel::Debug,
+          ("Serial[%p] created for global", this));
+  MOZ_ASSERT(!NS_IsMainThread());
+}
+
+Serial::~Serial() {
+  MOZ_LOG(gWebSerialLog, LogLevel::Debug, ("Serial[%p] destroyed", this));
+  MOZ_ASSERT(mHasShutdown);
+}
+
+void Serial::Shutdown() {
+  if (mHasShutdown) {
+    return;
+  }
+  MOZ_LOG(gWebSerialLog, LogLevel::Debug, ("Serial[%p] shutting down", this));
+  mHasShutdown = true;
+  mManagerChild = nullptr;
+  for (const auto& port : mPorts) {
+    port->Shutdown();
+  }
+  mPorts.Clear();
+}
+
+void Serial::DisconnectFromOwner() {
+  Shutdown();
+  DOMEventTargetHelper::DisconnectFromOwner();
+}
+
+JSObject* Serial::WrapObject(JSContext* aCx,
+                             JS::Handle<JSObject*> aGivenProto) {
+  return Serial_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+SerialManagerChild* Serial::GetOrCreateManagerChild() {
+  if (mManagerChild) {
+    return mManagerChild;
+  }
+
+  AssertIsOnMainThread();
+
+  nsPIDOMWindowInner* window = GetOwnerWindow();
+  if (!window) {
+    return nullptr;
+  }
+
+  WindowGlobalChild* wgc = window->GetWindowGlobalChild();
+  if (!wgc) {
+    return nullptr;
+  }
+
+  auto child = MakeRefPtr<SerialManagerChild>(this);
+  if (!wgc->SendPSerialManagerConstructor(child)) {
+    return nullptr;
+  }
+
+  mManagerChild = child;
+  return mManagerChild;
+}
+
+static bool PortSecurityCheck(Promise& aPromise, nsIGlobalObject* aGlobal,
+                              const nsCString& aFunctionName) {
+  if (nsPIDOMWindowInner* window = aGlobal->GetAsInnerWindow()) {
+    Document* doc = window->GetExtantDoc();
+    if (!doc) {
+      aPromise.MaybeRejectWithSecurityError(
+          aFunctionName + "() is not allowed without a document"_ns);
+      return false;
+    }
+
+    if (doc->NodePrincipal()->GetIsNullPrincipal()) {
+      aPromise.MaybeRejectWithSecurityError(
+          aFunctionName + "() is not allowed for opaque origins"_ns);
+      return false;
+    }
+
+    if (!FeaturePolicyUtils::IsFeatureAllowed(doc, u"serial"_ns)) {
+      nsAutoString message;
+      message.AssignLiteral("WebSerial access request was denied: ");
+      message.Append(NS_ConvertUTF8toUTF16(aFunctionName));
+      message.AppendLiteral("() is not allowed in this context");
+      nsContentUtils::ReportToConsoleNonLocalized(
+          message, nsIScriptError::errorFlag, "Security"_ns, doc);
+      aPromise.MaybeRejectWithSecurityError(
+          aFunctionName + "() is not allowed in this context"_ns);
+      return false;
+    }
+    return true;
+  }
+  WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
+  if (!workerPrivate) {
+    aPromise.MaybeRejectWithSecurityError(
+        aFunctionName + "() is not allowed without a window or worker"_ns);
+    return false;
+  }
+  if (!workerPrivate->SerialAllowed()) {
+    aPromise.MaybeRejectWithSecurityError(
+        aFunctionName + "() is not allowed in this context"_ns);
+    return false;
+  }
+  return true;
+}
+
+bool Serial::ValidatePortFilter(bool aHasUsbVendorId, bool aHasUsbProductId,
+                                bool aHasBluetoothServiceClassId,
+                                nsACString& aFailureReason) {
+  if (aHasBluetoothServiceClassId) {
+    if (aHasUsbVendorId || aHasUsbProductId) {
+      aFailureReason =
+          "A filter cannot specify both bluetoothServiceClassId and "
+          "usbVendorId or usbProductId."_ns;
+      return false;
+    }
+  } else {
+    if (!aHasUsbVendorId) {
+      if (!aHasUsbProductId) {
+        aFailureReason = "A filter must provide a property to filter by."_ns;
+      } else {
+        aFailureReason =
+            "A filter containing a usbProductId must also specify a usbVendorId."_ns;
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+already_AddRefed<Promise> Serial::RequestPort(
+    const SerialPortRequestOptions& aOptions, ErrorResult& aRv) {
+  AssertIsOnMainThread();
+  nsPIDOMWindowInner* window = GetOwnerWindow();
+  if (!window) {
+    MOZ_LOG(gWebSerialLog, LogLevel::Error,
+            ("Serial[%p]::RequestPort failed: no window available", this));
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(window->AsGlobal(), aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  MOZ_LOG(
+      gWebSerialLog, LogLevel::Info,
+      ("Serial[%p]::RequestPort called (filters: %s, allowedBluetoothUUIDs: "
+       "%s)",
+       this, aOptions.mFilters.WasPassed() ? "provided" : "none",
+       aOptions.mAllowedBluetoothServiceClassIds.WasPassed() ? "provided"
+                                                             : "none"));
+
+  if (!PortSecurityCheck(*promise, window->AsGlobal(), "requestPort"_ns)) {
+    MOZ_LOG(gWebSerialLog, LogLevel::Warning,
+            ("Serial[%p]::RequestPort failed security check", this));
+    return promise.forget();
+  }
+
+  WindowContext* context = window->GetWindowContext();
+  if (!context) {
+    MOZ_LOG(
+        gWebSerialLog, LogLevel::Error,
+        ("Serial[%p]::RequestPort failed: no window context available", this));
+    promise->MaybeRejectWithNotSupportedError("No window context available");
+    return promise.forget();
+  }
+  if (!context->HasValidTransientUserGestureActivation()) {
+    MOZ_LOG(gWebSerialLog, LogLevel::Warning,
+            ("Serial[%p]::RequestPort failed: no user activation", this));
+    promise->MaybeRejectWithSecurityError(
+        "requestPort() requires user activation");
+    return promise.forget();
+  }
+
+  if (aOptions.mFilters.WasPassed()) {
+    MOZ_LOG(gWebSerialLog, LogLevel::Debug,
+            ("Serial[%p]::RequestPort validating %zu filters", this,
+             aOptions.mFilters.Value().Length()));
+    nsAutoCString validatePortFailureReason;
+    for (const auto& filter : aOptions.mFilters.Value()) {
+      if (!ValidatePortFilter(filter.mUsbVendorId.WasPassed(),
+                              filter.mUsbProductId.WasPassed(),
+                              filter.mBluetoothServiceClassId.WasPassed(),
+                              validatePortFailureReason)) {
+        promise->MaybeRejectWithTypeError(validatePortFailureReason);
+        MOZ_LOG(gWebSerialLog, LogLevel::Warning,
+                ("Serial[%p]::RequestPort failed filter validation", this));
+        return promise.forget();
+      }
+    }
+  }
+
+  SerialManagerChild* child = GetOrCreateManagerChild();
+  if (!child) {
+    promise->MaybeRejectWithNotSupportedError("Request failed");
+    return promise.forget();
+  }
+
+  nsTArray<IPCSerialPortFilter> ipcFilters;
+  if (aOptions.mFilters.WasPassed()) {
+    for (const auto& filter : aOptions.mFilters.Value()) {
+      IPCSerialPortFilter ipcFilter;
+      if (filter.mUsbVendorId.WasPassed()) {
+        ipcFilter.usbVendorId() = Some(filter.mUsbVendorId.Value());
+      }
+      if (filter.mUsbProductId.WasPassed()) {
+        ipcFilter.usbProductId() = Some(filter.mUsbProductId.Value());
+      }
+      if (filter.mBluetoothServiceClassId.WasPassed()) {
+        nsAutoString uuid;
+        if (!ResolveBluetoothServiceUUID(
+                filter.mBluetoothServiceClassId.Value(), uuid)) {
+          promise->MaybeRejectWithTypeError(
+              "Invalid bluetoothServiceClassId in port filter");
+          return promise.forget();
+        }
+        ipcFilter.bluetoothServiceClassId() = Some(uuid);
+      }
+      ipcFilters.AppendElement(std::move(ipcFilter));
+    }
+  }
+
+  child->SendRequestPort(ipcFilters)
+      ->Then(
+          GetMainThreadSerialEventTarget(), __func__,
+          [promise, self = RefPtr{this}](
+              std::tuple<IPCRequestPortResult,
+                         mozilla::ipc::Endpoint<PSerialPortChild>>&& aTuple) {
+            IPCRequestPortResult& result = std::get<0>(aTuple);
+            mozilla::ipc::Endpoint<PSerialPortChild> endpoint =
+                std::move(std::get<1>(aTuple));
+            switch (result.reason()) {
+              case RequestPortReason::Granted: {
+                if (result.port().isNothing()) {
+                  promise->MaybeRejectWithNotSupportedError(
+                      "Granted port info missing");
+                  return;
+                }
+                RefPtr<SerialPort> port = self->GetOrCreatePort(
+                    result.port().value(), std::move(endpoint));
+                if (!port) {
+                  promise->MaybeRejectWithNotSupportedError(
+                      "Failed to create port actor");
+                  return;
+                }
+                port->MarkPhysicallyPresent();
+                promise->MaybeResolve(port);
+                return;
+              }
+              case RequestPortReason::UserCancelled:
+              case RequestPortReason::AddonDenied:
+                promise->MaybeRejectWithNotFoundError("No port selected");
+                return;
+              case RequestPortReason::InternalError:
+                promise->MaybeRejectWithNotSupportedError("Request failed");
+                return;
+              case RequestPortReason::EndGuard_:
+                MOZ_ASSERT_UNREACHABLE("Bad RequestPortReason");
+                promise->MaybeRejectWithNotSupportedError("Request failed");
+                return;
+            }
+            promise->MaybeRejectWithNotSupportedError("Request failed");
+          },
+          [promise](mozilla::ipc::ResponseRejectReason) {
+            promise->MaybeRejectWithNotSupportedError("Request failed");
+          });
+
+  return promise.forget();
+}
+
+already_AddRefed<Promise> Serial::GetPorts(ErrorResult& aRv) {
+  nsIGlobalObject* global = GetRelevantGlobal();
+  if (!global) {
+    aRv.ThrowInvalidStateError("No global object available");
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(global, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  MOZ_LOG(gWebSerialLog, LogLevel::Debug,
+          ("Serial[%p]::GetPorts called", this));
+
+  if (!PortSecurityCheck(*promise, global, "getPorts"_ns)) {
+    MOZ_LOG(gWebSerialLog, LogLevel::Warning,
+            ("Serial[%p]::GetPorts failed security check", this));
+    return promise.forget();
+  }
+
+  if (NS_IsMainThread()) {
+    nsTArray<RefPtr<SerialPort>> result;
+    for (const auto& port : mPorts) {
+      if (!port->IsForgotten() && port->PhysicallyPresent()) {
+        result.AppendElement(port);
+      }
+    }
+
+    MOZ_LOG(
+        gWebSerialLog, LogLevel::Info,
+        ("Serial[%p]::GetPorts returning %zu ports", this, result.Length()));
+
+    NS_DispatchToCurrentThread(NS_NewRunnableFunction(
+        "Serial::GetPorts resolve",
+        [promise = RefPtr{promise}, result = std::move(result)]() mutable {
+          promise->MaybeResolve(result);
+        }));
+
+    return promise.forget();
+  }
+
+  MOZ_LOG(gWebSerialLog, LogLevel::Debug,
+          ("Serial[%p]::GetPorts called from worker, dispatching to main "
+           "thread",
+           this));
+
+  WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
+  if (!workerPrivate) {
+    MOZ_LOG(gWebSerialLog, LogLevel::Error,
+            ("Serial[%p]::GetPorts failed: no worker private", this));
+    promise->MaybeRejectWithNotSupportedError("Worker context not available");
+    return promise.forget();
+  }
+
+  nsTArray<nsString> knownPortIds;
+  for (const auto& port : mPorts) {
+    knownPortIds.AppendElement(port->Id());
+  }
+
+  RefPtr<StrongWorkerRef> strongRef =
+      StrongWorkerRef::Create(workerPrivate, "Serial::GetPorts");
+  if (!strongRef) {
+    promise->MaybeRejectWithAbortError("Worker is shutting down");
+    return promise.forget();
+  }
+
+  auto tsRef = MakeRefPtr<ThreadSafeWorkerRef>(strongRef);
+
+  struct NewPortData {
+    IPCSerialPortInfo mInfo;
+    mozilla::ipc::Endpoint<PSerialPortChild> mEndpoint;
+  };
+  struct GetPortsData {
+    nsTArray<NewPortData> mNewPorts;
+    nsTArray<nsString> mIdsToForget;
+  };
+  using GetPortsPromise = MozPromise<GetPortsData, nsresult, true>;
+
+  InvokeAsync(
+      GetMainThreadSerialEventTarget(), __func__,
+      [tsRef, knownPortIds = std::move(knownPortIds)]() {
+        Serial* windowSerial =
+            FindWindowSerialForWorkerPrivate(tsRef->Private());
+
+        GetPortsData getPortsData;
+        if (windowSerial) {
+          for (const auto& port : windowSerial->mPorts) {
+            if (port->IsForgotten()) {
+              continue;
+            }
+
+            bool alreadyKnown = false;
+            for (const auto& id : knownPortIds) {
+              if (id == port->Id()) {
+                alreadyKnown = true;
+                break;
+              }
+            }
+            if (alreadyKnown) {
+              continue;
+            }
+
+            RefPtr<SerialPortChild> child = port->GetChild();
+            if (!child || !child->CanSend()) {
+              continue;
+            }
+
+            mozilla::ipc::Endpoint<PSerialPortParent> parentEp;
+            mozilla::ipc::Endpoint<PSerialPortChild> childEp;
+            if (NS_FAILED(PSerialPort::CreateEndpoints(&parentEp, &childEp))) {
+              continue;
+            }
+
+            child->SendClone(std::move(parentEp));
+
+            NewPortData data;
+            data.mInfo = port->GetPortInfo();
+            data.mEndpoint = std::move(childEp);
+            getPortsData.mNewPorts.AppendElement(std::move(data));
+          }
+
+          for (const auto& id : knownPortIds) {
+            bool stillActive = false;
+            for (const auto& port : windowSerial->mPorts) {
+              if (!port->IsForgotten() && port->Id() == id) {
+                stillActive = true;
+                break;
+              }
+            }
+            if (!stillActive) {
+              getPortsData.mIdsToForget.AppendElement(id);
+            }
+          }
+        } else {
+          getPortsData.mIdsToForget = knownPortIds.Clone();
+        }
+
+        return GetPortsPromise::CreateAndResolve(std::move(getPortsData),
+                                                 __func__);
+      })
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [self = RefPtr{this}, tsRef, promise](GetPortsData&& aData) {
+            for (auto& data : aData.mNewPorts) {
+              RefPtr<SerialPort> port =
+                  MakeRefPtr<SerialPort>(data.mInfo, self);
+              auto actor = MakeRefPtr<SerialPortChild>();
+              if (data.mEndpoint.Bind(actor)) {
+                actor->SetPort(port);
+                port->SetChild(actor);
+              }
+              self->mPorts.AppendElement(std::move(port));
+            }
+
+            for (const auto& id : aData.mIdsToForget) {
+              self->ForgetPort(id);
+            }
+
+            nsTArray<RefPtr<SerialPort>> result;
+            for (const auto& port : self->mPorts) {
+              if (!port->IsForgotten() && port->PhysicallyPresent()) {
+                result.AppendElement(port);
+              }
+            }
+            promise->MaybeResolve(result);
+          },
+          [promise](nsresult aRv) {
+            promise->MaybeRejectWithNotSupportedError(
+                "Failed to get ports from main thread");
+          });
+
+  return promise.forget();
+}
+
+static nsAutoString BluetoothCanonicalUUID(uint32_t aAlias) {
+  nsAutoString result;
+  result.AppendPrintf("%08x-0000-1000-8000-00805f9b34fb", aAlias);
+  return result;
+}
+
+bool Serial::IsValidBluetoothUUID(const nsAString& aString) {
+  if (aString.Length() != 36) {
+    return false;
+  }
+  const char16_t* data = aString.BeginReading();
+  for (uint32_t i = 0; i < 36; i++) {
+    if (i == 8 || i == 13 || i == 18 || i == 23) {
+      if (data[i] != '-') {
+        return false;
+      }
+    } else if (!((data[i] >= '0' && data[i] <= '9') ||
+                 (data[i] >= 'a' && data[i] <= 'f'))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool ResolveBluetoothServiceUUID(const OwningStringOrUnsignedLong& aName,
+                                        nsAutoString& aResult) {
+  if (aName.IsUnsignedLong()) {
+    aResult = BluetoothCanonicalUUID(aName.GetAsUnsignedLong());
+    return true;
+  }
+
+  const nsString& name = aName.GetAsString();
+
+  if (Serial::IsValidBluetoothUUID(name)) {
+    aResult = name;
+    return true;
+  }
+
+
+  return false;
+}
+
+void Serial::ForgetAllPorts() {
+  if (mHasShutdown) {
+    return;
+  }
+
+  nsTArray<RefPtr<SerialPort>> portsToForget;
+  for (const auto& port : mPorts) {
+    if (!port->IsForgotten()) {
+      portsToForget.AppendElement(port);
+    }
+  }
+
+  MOZ_LOG(gWebSerialLog, LogLevel::Info,
+          ("Serial[%p]::ForgetAllPorts forgetting %zu ports", this,
+           portsToForget.Length()));
+
+  for (const RefPtr<SerialPort>& port : portsToForget) {
+    RefPtr<SerialPort> strongPort = port;
+    IgnoredErrorResult rv;
+    RefPtr<Promise> promise = strongPort->Forget(rv);
+  }
+}
+
+RefPtr<SerialPort> Serial::GetOrCreatePort(
+    const IPCSerialPortInfo& aInfo,
+    mozilla::ipc::Endpoint<PSerialPortChild>&& aEndpoint) {
+  for (const auto& existing : mPorts) {
+    if (existing->Id() == aInfo.id() && !existing->IsForgotten()) {
+      return existing;
+    }
+  }
+
+  if (!aEndpoint.IsValid()) {
+    return nullptr;
+  }
+
+  auto actor = MakeRefPtr<SerialPortChild>();
+  if (!aEndpoint.Bind(actor)) {
+    return nullptr;
+  }
+  RefPtr<SerialPort> port = MakeRefPtr<SerialPort>(aInfo, this);
+  actor->SetPort(port);
+  port->SetChild(actor);
+
+  mPorts.AppendElement(port);
+  return port;
+}
+
+void Serial::ForgetPort(const nsAString& aPortId) {
+  for (const auto& port : mPorts) {
+    if (port->Id() == aPortId && !port->IsForgotten()) {
+      RefPtr<SerialPort> strongPort(port);
+      strongPort->MarkForgotten();
+    }
+  }
+  mPorts.RemoveElementsBy([&aPortId](const RefPtr<SerialPort>& port) {
+    return port->Id() == aPortId;
+  });
+
+  if (!NS_IsMainThread()) {
+    WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
+    if (workerPrivate) {
+      RefPtr<StrongWorkerRef> strongRef =
+          StrongWorkerRef::Create(workerPrivate, "Serial::ForgetPort");
+      if (strongRef) {
+        auto tsRef = MakeRefPtr<ThreadSafeWorkerRef>(strongRef);
+        nsString portId(aPortId);
+        NS_DispatchToMainThread(NS_NewRunnableFunction(
+            "Serial::ForgetPort cross-context",
+            [tsRef = std::move(tsRef), portId]() {
+              RefPtr<Serial> windowSerial =
+                  FindWindowSerialForWorkerPrivate(tsRef->Private());
+              if (windowSerial) {
+                windowSerial->ForgetPort(portId);
+              }
+            }));
+      }
+    }
+  }
+}
+
+}  

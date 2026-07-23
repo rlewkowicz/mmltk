@@ -1,0 +1,108 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_MaybeDiscarded_h
+#define mozilla_dom_MaybeDiscarded_h
+
+#include "mozilla/RefPtr.h"
+
+namespace mozilla::dom {
+
+template <typename T>
+class MaybeDiscarded {
+ public:
+  MaybeDiscarded() = default;
+  MaybeDiscarded(MaybeDiscarded<T>&&) = default;
+  MaybeDiscarded(const MaybeDiscarded<T>&) = default;
+
+  MOZ_IMPLICIT MaybeDiscarded(T* aRawPtr)
+      : mId(aRawPtr ? aRawPtr->Id() : 0), mPtr(aRawPtr) {}
+  MOZ_IMPLICIT MaybeDiscarded(decltype(nullptr)) {}
+
+  template <typename I,
+            typename = std::enable_if_t<std::is_convertible_v<I*, T*>>>
+  MOZ_IMPLICIT MaybeDiscarded(RefPtr<I>&& aPtr)
+      : mId(aPtr ? aPtr->Id() : 0), mPtr(std::move(aPtr)) {}
+  template <typename I,
+            typename = std::enable_if_t<std::is_convertible_v<I*, T*>>>
+  MOZ_IMPLICIT MaybeDiscarded(const RefPtr<I>& aPtr)
+      : mId(aPtr ? aPtr->Id() : 0), mPtr(aPtr) {}
+
+  MaybeDiscarded<T>& operator=(const MaybeDiscarded<T>&) = default;
+  MaybeDiscarded<T>& operator=(MaybeDiscarded<T>&&) = default;
+  MaybeDiscarded<T>& operator=(decltype(nullptr)) {
+    mId = 0;
+    mPtr = nullptr;
+    return *this;
+  }
+  MaybeDiscarded<T>& operator=(T* aRawPtr) {
+    mId = aRawPtr ? aRawPtr->Id() : 0;
+    mPtr = aRawPtr;
+    return *this;
+  }
+  template <typename I>
+  MaybeDiscarded<T>& operator=(const RefPtr<I>& aRhs) {
+    mId = aRhs ? aRhs->Id() : 0;
+    mPtr = aRhs;
+    return *this;
+  }
+  template <typename I>
+  MaybeDiscarded<T>& operator=(RefPtr<I>&& aRhs) {
+    mId = aRhs ? aRhs->Id() : 0;
+    mPtr = std::move(aRhs);
+    return *this;
+  }
+
+  bool IsNullOrDiscarded() const { return !mPtr || mPtr->IsDiscarded(); }
+  bool IsDiscarded() const { return IsNullOrDiscarded() && !IsNull(); }
+  bool IsNull() const { return mId == 0; }
+
+  explicit operator bool() const { return !IsNullOrDiscarded(); }
+
+  T* get() const {
+    MOZ_DIAGNOSTIC_ASSERT(!IsDiscarded());
+    return mPtr.get();
+  }
+  already_AddRefed<T> forget() {
+    MOZ_DIAGNOSTIC_ASSERT(!IsDiscarded());
+    return mPtr.forget();
+  }
+
+  T* operator->() const {
+    MOZ_ASSERT(!IsNull());
+    return get();
+  }
+
+  auto get_canonical() const -> decltype(get()->Canonical()) {
+    if (get()) {
+      return get()->Canonical();
+    } else {
+      return nullptr;
+    }
+  }
+
+  uint64_t ContextId() const { return mId; }
+
+  T* GetMaybeDiscarded() const { return mPtr.get(); }
+
+  void SetDiscarded(uint64_t aId) {
+    mId = aId;
+    mPtr = nullptr;
+  }
+
+  bool operator==(const MaybeDiscarded<T>& aRhs) const {
+    return mId == aRhs.mId && mPtr == aRhs.mPtr;
+  }
+  bool operator!=(const MaybeDiscarded<T>& aRhs) const {
+    return !operator==(aRhs);
+  }
+
+ private:
+  uint64_t mId = 0;
+  RefPtr<T> mPtr;
+};
+
+}  
+
+#endif  // mozilla_dom_MaybeDiscarded_h

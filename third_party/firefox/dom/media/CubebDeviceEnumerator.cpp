@@ -1,0 +1,313 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "CubebDeviceEnumerator.h"
+
+#include <algorithm>
+
+#include "mozilla/Assertions.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/StaticMutex.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/media/MediaUtils.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla {
+
+using namespace CubebUtils;
+using AudioDeviceSet = CubebDeviceEnumerator::AudioDeviceSet;
+
+static StaticRefPtr<CubebDeviceEnumerator> sInstance;
+static StaticMutex sInstanceMutex MOZ_UNANNOTATED;
+
+already_AddRefed<CubebDeviceEnumerator> CubebDeviceEnumerator::GetInstance() {
+  StaticMutexAutoLock lock(sInstanceMutex);
+  if (!sInstance) {
+    sInstance = new CubebDeviceEnumerator();
+    static bool clearOnShutdownSetup = []() -> bool {
+      auto setClearOnShutdown = []() -> void {
+        ClearOnShutdown(&sInstance, ShutdownPhase::XPCOMShutdownThreads);
+      };
+      if (NS_IsMainThread()) {
+        setClearOnShutdown();
+      } else {
+        SchedulerGroup::Dispatch(
+            NS_NewRunnableFunction("CubebDeviceEnumerator::::GetInstance()",
+                                   std::move(setClearOnShutdown)));
+      }
+      return true;
+    }();
+    (void)clearOnShutdownSetup;
+  }
+  return do_AddRef(sInstance);
+}
+
+CubebDeviceEnumerator::CubebDeviceEnumerator()
+    : mMutex("CubebDeviceListMutex"),
+      mManualInputInvalidation(false),
+      mManualOutputInvalidation(false) {
+    RefPtr<CubebHandle> handle = GetCubeb();
+    if (handle) {
+      int rv = cubeb_register_device_collection_changed(
+          handle->Context(), CUBEB_DEVICE_TYPE_OUTPUT,
+          &OutputAudioDeviceListChanged_s, this);
+      if (rv != CUBEB_OK) {
+        NS_WARNING(
+            "Could not register the audio output"
+            " device collection changed callback.");
+        mManualOutputInvalidation = true;
+      }
+      rv = cubeb_register_device_collection_changed(
+          handle->Context(), CUBEB_DEVICE_TYPE_INPUT,
+          &InputAudioDeviceListChanged_s, this);
+      if (rv != CUBEB_OK) {
+        NS_WARNING(
+            "Could not register the audio input"
+            " device collection changed callback.");
+        mManualInputInvalidation = true;
+      }
+    }
+}
+
+void CubebDeviceEnumerator::Shutdown() {
+  StaticMutexAutoLock lock(sInstanceMutex);
+  if (sInstance) {
+    sInstance = nullptr;
+  }
+}
+
+CubebDeviceEnumerator::~CubebDeviceEnumerator() {
+    RefPtr<CubebHandle> handle = GetCubeb();
+    if (handle) {
+      int rv = cubeb_register_device_collection_changed(
+          handle->Context(), CUBEB_DEVICE_TYPE_OUTPUT, nullptr, this);
+      if (rv != CUBEB_OK) {
+        NS_WARNING(
+            "Could not unregister the audio output"
+            " device collection changed callback.");
+      }
+      rv = cubeb_register_device_collection_changed(
+          handle->Context(), CUBEB_DEVICE_TYPE_INPUT, nullptr, this);
+      if (rv != CUBEB_OK) {
+        NS_WARNING(
+            "Could not unregister the audio input"
+            " device collection changed callback.");
+      }
+    }
+}
+
+RefPtr<const AudioDeviceSet>
+CubebDeviceEnumerator::EnumerateAudioInputDevices() {
+  return EnumerateAudioDevices(Side::INPUT);
+}
+
+RefPtr<const AudioDeviceSet>
+CubebDeviceEnumerator::EnumerateAudioOutputDevices() {
+  return EnumerateAudioDevices(Side::OUTPUT);
+}
+
+static uint16_t ConvertCubebType(cubeb_device_type aType) {
+  uint16_t map[] = {
+      nsIAudioDeviceInfo::TYPE_UNKNOWN,  
+      nsIAudioDeviceInfo::TYPE_INPUT,    
+      nsIAudioDeviceInfo::TYPE_OUTPUT    
+  };
+  return map[aType];
+}
+
+static uint16_t ConvertCubebState(cubeb_device_state aState) {
+  uint16_t map[] = {
+      nsIAudioDeviceInfo::STATE_DISABLED,   
+      nsIAudioDeviceInfo::STATE_UNPLUGGED,  
+      nsIAudioDeviceInfo::STATE_ENABLED     
+  };
+  return map[aState];
+}
+
+static uint16_t ConvertCubebPreferred(cubeb_device_pref aPreferred) {
+  if (aPreferred == CUBEB_DEVICE_PREF_NONE) {
+    return nsIAudioDeviceInfo::PREF_NONE;
+  }
+  if (aPreferred == CUBEB_DEVICE_PREF_ALL) {
+    return nsIAudioDeviceInfo::PREF_ALL;
+  }
+
+  uint16_t preferred = 0;
+  if (aPreferred & CUBEB_DEVICE_PREF_MULTIMEDIA) {
+    preferred |= nsIAudioDeviceInfo::PREF_MULTIMEDIA;
+  }
+  if (aPreferred & CUBEB_DEVICE_PREF_VOICE) {
+    preferred |= nsIAudioDeviceInfo::PREF_VOICE;
+  }
+  if (aPreferred & CUBEB_DEVICE_PREF_NOTIFICATION) {
+    preferred |= nsIAudioDeviceInfo::PREF_NOTIFICATION;
+  }
+  return preferred;
+}
+
+static uint16_t ConvertCubebFormat(cubeb_device_fmt aFormat) {
+  uint16_t format = 0;
+  if (aFormat & CUBEB_DEVICE_FMT_S16LE) {
+    format |= nsIAudioDeviceInfo::FMT_S16LE;
+  }
+  if (aFormat & CUBEB_DEVICE_FMT_S16BE) {
+    format |= nsIAudioDeviceInfo::FMT_S16BE;
+  }
+  if (aFormat & CUBEB_DEVICE_FMT_F32LE) {
+    format |= nsIAudioDeviceInfo::FMT_F32LE;
+  }
+  if (aFormat & CUBEB_DEVICE_FMT_F32BE) {
+    format |= nsIAudioDeviceInfo::FMT_F32BE;
+  }
+  return format;
+}
+
+static int GetDevicePriority(const RefPtr<AudioDeviceInfo>& device) {
+  if (!device->Preferred()) {
+    return 0;
+  }
+
+  uint16_t prefs = 0;
+  device->GetPreferred(&prefs);
+
+  if (prefs & nsIAudioDeviceInfo::PREF_MULTIMEDIA) {
+    return 3;
+  }
+  if (prefs & nsIAudioDeviceInfo::PREF_VOICE) {
+    return 2;
+  }
+  if (prefs & nsIAudioDeviceInfo::PREF_NOTIFICATION) {
+    return 1;
+  }
+  MOZ_ASSERT_UNREACHABLE("Unknown value in Preferred flag");
+  return 0;
+}
+
+static RefPtr<AudioDeviceSet> GetDeviceCollection(CubebUtils::Side aSide) {
+  RefPtr set = MakeRefPtr<AudioDeviceSet>();
+  RefPtr<CubebHandle> handle = GetCubeb();
+  if (handle) {
+    cubeb_device_collection collection = {nullptr, 0};
+      if (cubeb_enumerate_devices(handle->Context(),
+                                  aSide == CubebUtils::Input
+                                      ? CUBEB_DEVICE_TYPE_INPUT
+                                      : CUBEB_DEVICE_TYPE_OUTPUT,
+                                  &collection) == CUBEB_OK) {
+        for (unsigned int i = 0; i < collection.count; ++i) {
+          auto device = collection.device[i];
+          if (device.max_channels == 0) {
+            continue;
+          }
+          RefPtr info = MakeRefPtr<AudioDeviceInfo>(
+              device.devid, NS_ConvertUTF8toUTF16(device.friendly_name),
+              NS_ConvertUTF8toUTF16(device.group_id),
+              NS_ConvertUTF8toUTF16(device.vendor_name),
+              ConvertCubebType(device.type), ConvertCubebState(device.state),
+              ConvertCubebPreferred(device.preferred),
+              ConvertCubebFormat(device.format),
+              ConvertCubebFormat(device.default_format), device.max_channels,
+              device.default_rate, device.max_rate, device.min_rate,
+              device.latency_hi, device.latency_lo);
+
+          set->AppendElement(std::move(info));
+        }
+      }
+      cubeb_device_collection_destroy(handle->Context(), &collection);
+  }
+
+  std::stable_sort(
+      set->begin(), set->end(),
+      [](const RefPtr<AudioDeviceInfo>& a, const RefPtr<AudioDeviceInfo>& b) {
+        return GetDevicePriority(a) > GetDevicePriority(b);
+      });
+
+  return set;
+}
+
+RefPtr<const AudioDeviceSet> CubebDeviceEnumerator::EnumerateAudioDevices(
+    CubebDeviceEnumerator::Side aSide) {
+  MOZ_ASSERT(aSide == Side::INPUT || aSide == Side::OUTPUT);
+
+  RefPtr<const AudioDeviceSet>* devicesCache;
+  bool manualInvalidation = true;
+
+  if (aSide == Side::INPUT) {
+    devicesCache = &mInputDevices;
+    manualInvalidation = mManualInputInvalidation;
+  } else {
+    MOZ_ASSERT(aSide == Side::OUTPUT);
+    devicesCache = &mOutputDevices;
+    manualInvalidation = mManualOutputInvalidation;
+  }
+
+  if (!GetCubeb()) {
+    return MakeRefPtr<AudioDeviceSet>();
+  }
+  if (!manualInvalidation) {
+    MutexAutoLock lock(mMutex);
+    if (*devicesCache) {
+      return *devicesCache;
+    }
+  }
+
+  RefPtr devices = GetDeviceCollection(
+      (aSide == Side::INPUT) ? CubebUtils::Input : CubebUtils::Output);
+  {
+    MutexAutoLock lock(mMutex);
+    *devicesCache = devices;
+  }
+  return devices;
+}
+
+already_AddRefed<AudioDeviceInfo> CubebDeviceEnumerator::DeviceInfoFromName(
+    const nsString& aName, Side aSide) {
+  RefPtr devices = EnumerateAudioDevices(aSide);
+  for (const RefPtr<AudioDeviceInfo>& device : *devices) {
+    if (device->Name().Equals(aName)) {
+      RefPtr<AudioDeviceInfo> other = device;
+      return other.forget();
+    }
+  }
+
+  return nullptr;
+}
+
+RefPtr<AudioDeviceInfo> CubebDeviceEnumerator::DefaultDevice(Side aSide) {
+  RefPtr devices = EnumerateAudioDevices(aSide);
+  for (const RefPtr<AudioDeviceInfo>& device : *devices) {
+    if (device->Preferred()) {
+      RefPtr<AudioDeviceInfo> other = device;
+      return other.forget();
+    }
+  }
+
+  return nullptr;
+}
+
+void CubebDeviceEnumerator::InputAudioDeviceListChanged_s(cubeb* aContext,
+                                                          void* aUser) {
+  CubebDeviceEnumerator* self = reinterpret_cast<CubebDeviceEnumerator*>(aUser);
+  self->AudioDeviceListChanged(CubebDeviceEnumerator::Side::INPUT);
+}
+
+void CubebDeviceEnumerator::OutputAudioDeviceListChanged_s(cubeb* aContext,
+                                                           void* aUser) {
+  CubebDeviceEnumerator* self = reinterpret_cast<CubebDeviceEnumerator*>(aUser);
+  self->AudioDeviceListChanged(CubebDeviceEnumerator::Side::OUTPUT);
+}
+
+void CubebDeviceEnumerator::AudioDeviceListChanged(Side aSide) {
+  MutexAutoLock lock(mMutex);
+  if (aSide == Side::INPUT) {
+    mInputDevices = nullptr;
+    mOnInputDeviceListChange.Notify();
+  } else {
+    MOZ_ASSERT(aSide == Side::OUTPUT);
+    mOutputDevices = nullptr;
+    mOnOutputDeviceListChange.Notify();
+  }
+}
+
+}  

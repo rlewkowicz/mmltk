@@ -1,0 +1,159 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_EditorHelperForwards_h
+#define mozilla_EditorHelperForwards_h
+
+#include "mozilla/EnumSet.h"
+
+#include <cstdint>
+
+class nsIContent;
+class nsINode;
+
+template <typename T>
+class nsCOMPtr;
+
+template <typename T>
+class RefPtr;
+
+namespace mozilla {
+
+template <typename V, typename E>
+class Result;
+
+template <typename T>
+class OwningNonNull;
+
+namespace dom {
+class Element;
+class Text;
+}  
+
+
+enum class BlockInlineCheck : uint8_t;         
+enum class CollectChildrenOption;              
+enum class EditAction;                         
+enum class EditorCommandParamType : uint16_t;  
+enum class EditSubAction : int32_t;            
+enum class PaddingForEmptyBlock;               
+enum class ParagraphSeparator;                 
+enum class SpecifiedStyle : uint8_t;           
+enum class StopTracking : bool;                
+enum class SuggestCaret;                       
+enum class WithTransaction;                    
+
+
+using CollectChildrenOptions = EnumSet<CollectChildrenOption>;
+using SuggestCaretOptions = EnumSet<SuggestCaret>;
+
+
+template <typename PT, typename CT>
+class EditorDOMPointBase;  
+
+using EditorDOMPoint =
+    EditorDOMPointBase<nsCOMPtr<nsINode>, nsCOMPtr<nsIContent>>;
+using EditorRawDOMPoint = EditorDOMPointBase<nsINode*, nsIContent*>;
+using EditorDOMPointInText = EditorDOMPointBase<RefPtr<dom::Text>, nsIContent*>;
+using EditorRawDOMPointInText = EditorDOMPointBase<dom::Text*, nsIContent*>;
+
+template <typename CT>
+class EditorLineBreakBase;  
+
+using EditorLineBreak = EditorLineBreakBase<nsCOMPtr<nsIContent>>;
+using EditorRawLineBreak = EditorLineBreakBase<nsIContent*>;
+
+
+class AutoPendingStyleCacheArray;  
+class EditTransactionBase;         
+class EditorBase;                  
+class HTMLEditor;                  
+class ManualNACPtr;                
+class PendingStyle;                
+class PendingStyleCache;           
+class PendingStyles;               
+class RangeUpdater;                
+class SelectionState;              
+class TextEditor;                  
+
+class AutoClonedRangeArray;               
+class AutoClonedSelectionRangeArray;      
+class AutoDOMAPIWrapperBase;              
+class AutoSelectionRestorer;              
+class AutoSelectionRangeArray;            
+class CaretPoint;                         
+class ChangeAttributeTransaction;         
+class ChangeStyleTransaction;             
+class CompositionInTextNodeTransaction;   
+class CompositionTransaction;             
+class CreateLineBreakResult;              
+class CSSEditUtils;                       
+class DeleteContentTransactionBase;       
+class DeleteMultipleRangesTransaction;    
+class DeleteNodeTransaction;              
+class DeleteRangeResult;                  
+class DeleteRangeTransaction;             
+class DeleteTextFromTextNodeTransaction;  
+class DeleteTextTransaction;              
+class EditActionResult;                   
+class EditAggregateTransaction;           
+class EditorEventListener;                
+class EditResult;                         
+class HTMLEditorEventListener;            
+class InsertNodeTransaction;              
+class InsertTextIntoTextNodeTransaction;  
+class InsertTextResult;                   
+class InsertTextTransaction;              
+class InterCiter;                         
+class JoinNodesResult;                    
+class JoinNodesTransaction;               
+class MoveNodeResult;                     
+class MoveNodeTransaction;                
+class MoveNodeTransactionBase;            
+class MoveSiblingsTransaction;            
+class PlaceholderTransaction;             
+class ReplaceTextInTextNodeTransaction;   
+class ReplaceTextTransaction;             
+class SplitNodeResult;                    
+class SplitNodeTransaction;               
+class SplitRangeOffFromNodeResult;        
+class SplitRangeOffResult;                
+class WhiteSpaceVisibilityKeeper;         
+class WSRunScanner;                       
+class WSScanResult;                       
+
+
+class EditorElementStyle;          
+struct EditorInlineStyle;          
+struct EditorInlineStyleAndValue;  
+struct RangeItem;                  
+
+
+template <typename EditorDOMPointType>
+class EditorDOMRangeBase;  
+
+template <typename NodeType>
+class CreateNodeResultBase;  
+
+template <typename EditorDOMPointType>
+class ReplaceRangeDataBase;  
+
+
+using CreateContentResult = CreateNodeResultBase<nsIContent>;
+using CreateElementResult = CreateNodeResultBase<dom::Element>;
+using CreateTextResult = CreateNodeResultBase<dom::Text>;
+
+using InsertParagraphResult = CreateElementResult;
+
+using EditorDOMRange = EditorDOMRangeBase<EditorDOMPoint>;
+using EditorRawDOMRange = EditorDOMRangeBase<EditorRawDOMPoint>;
+using EditorDOMRangeInTexts = EditorDOMRangeBase<EditorDOMPointInText>;
+using EditorRawDOMRangeInTexts = EditorDOMRangeBase<EditorRawDOMPointInText>;
+
+using ReplaceRangeData = ReplaceRangeDataBase<EditorDOMPoint>;
+using ReplaceRangeInTextsData = ReplaceRangeDataBase<EditorDOMPointInText>;
+
+}  
+
+#endif  // #ifndef mozilla_EditorHelperForwards_h

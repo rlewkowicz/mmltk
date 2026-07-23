@@ -1,0 +1,393 @@
+/*
+ * Copyright 2018 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/core/SkGlyphRunPainter.h"
+
+#include "include/core/SkBitmap.h"
+#include "include/core/SkCanvas.h"
+#include "include/core/SkColorSpace.h"
+#include "include/core/SkColorType.h"
+#include "include/core/SkDrawable.h"
+#include "include/core/SkFont.h"
+#include "include/core/SkImageInfo.h"
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPaint.h"
+#include "include/core/SkPath.h"
+#include "include/core/SkPathBuilder.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkSpan.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkFloatingPoint.h"
+#include "include/private/base/SkTArray.h"
+#include "src/core/SkDraw.h"
+#include "src/core/SkGlyph.h"
+#include "src/core/SkMask.h"
+#include "src/core/SkMipmap.h"
+#include "src/core/SkScalerContext.h"
+#include "src/core/SkStrike.h"
+#include "src/core/SkStrikeSpec.h"
+#include "src/text/GlyphRun.h"
+
+#include <algorithm>
+#include <tuple>
+
+using namespace skia_private;
+
+using namespace skglyph;
+using namespace sktext;
+
+namespace {
+SkScalerContextFlags compute_scaler_context_flags(const SkColorSpace* cs) {
+    if (cs && cs->gammaIsLinear()) {
+        return SkScalerContextFlags::kBoostContrast;
+    } else {
+        return SkScalerContextFlags::kFakeGammaAndBoostContrast;
+    }
+}
+
+std::tuple<SkZip<const SkGlyph*, SkPoint>, SkZip<SkGlyphID, SkPoint>>
+prepare_for_path_drawing(SkStrike* strike,
+                         SkZip<const SkGlyphID, const SkPoint> source,
+                         SkZip<const SkGlyph*, SkPoint> acceptedBuffer,
+                         SkZip<SkGlyphID, SkPoint> rejectedBuffer) {
+    int acceptedSize = 0;
+    int rejectedSize = 0;
+    strike->lock();
+    for (auto [glyphID, pos] : source) {
+        if (!SkIsFinite(pos.x(), pos.y())) {
+            continue;
+        }
+        const SkPackedGlyphID packedID{glyphID};
+        switch (SkGlyphDigest digest = strike->digestFor(kPath, packedID);
+                digest.actionFor(kPath)) {
+            case GlyphAction::kAccept:
+                acceptedBuffer[acceptedSize++] = std::make_tuple(strike->glyph(digest), pos);
+                break;
+            case GlyphAction::kReject:
+                rejectedBuffer[rejectedSize++] = std::make_tuple(glyphID, pos);
+                break;
+            default:
+                break;
+        }
+    }
+    strike->unlock();
+    return {acceptedBuffer.first(acceptedSize), rejectedBuffer.first(rejectedSize)};
+}
+
+std::tuple<SkZip<const SkGlyph*, SkPoint>, SkZip<SkGlyphID, SkPoint>>
+prepare_for_drawable_drawing(SkStrike* strike,
+                             SkZip<const SkGlyphID, const SkPoint> source,
+                             SkZip<const SkGlyph*, SkPoint> acceptedBuffer,
+                             SkZip<SkGlyphID, SkPoint> rejectedBuffer) {
+    int acceptedSize = 0;
+    int rejectedSize = 0;
+    strike->lock();
+    for (auto [glyphID, pos] : source) {
+        if (!SkIsFinite(pos.x(), pos.y())) {
+            continue;
+        }
+        const SkPackedGlyphID packedID{glyphID};
+        switch (SkGlyphDigest digest = strike->digestFor(kDrawable, packedID);
+                digest.actionFor(kDrawable)) {
+            case GlyphAction::kAccept:
+                acceptedBuffer[acceptedSize++] = std::make_tuple(strike->glyph(digest), pos);
+                break;
+            case GlyphAction::kReject:
+                rejectedBuffer[rejectedSize++] = std::make_tuple(glyphID, pos);
+                break;
+            default:
+                break;
+        }
+    }
+    strike->unlock();
+    return {acceptedBuffer.first(acceptedSize), rejectedBuffer.first(rejectedSize)};
+}
+
+std::tuple<SkZip<const SkGlyph*, SkPoint>, SkZip<SkGlyphID, SkPoint>>
+prepare_for_direct_mask_drawing(SkStrike* strike,
+                                const SkMatrix& creationMatrix,
+                                SkZip<const SkGlyphID, const SkPoint> source,
+                                SkZip<const SkGlyph*, SkPoint> acceptedBuffer,
+                                SkZip<SkGlyphID, SkPoint> rejectedBuffer) {
+    const SkIPoint mask = strike->roundingSpec().ignorePositionFieldMask;
+    const SkPoint halfSampleFreq = strike->roundingSpec().halfAxisSampleFreq;
+
+    SkMatrix positionMatrixWithRounding = creationMatrix;
+    positionMatrixWithRounding.postTranslate(halfSampleFreq.x(), halfSampleFreq.y());
+
+    int acceptedSize = 0;
+    int rejectedSize = 0;
+    strike->lock();
+    for (auto [glyphID, pos] : source) {
+        if (!SkIsFinite(pos.x(), pos.y())) {
+            continue;
+        }
+
+        const SkPoint mappedPos = positionMatrixWithRounding.mapPoint(pos);
+        const SkPackedGlyphID packedGlyphID = SkPackedGlyphID{glyphID, mappedPos, mask};
+        switch (SkGlyphDigest digest = strike->digestFor(kDirectMaskCPU, packedGlyphID);
+                digest.actionFor(kDirectMaskCPU)) {
+            case GlyphAction::kAccept: {
+                const SkPoint roundedPos{SkScalarFloorToScalar(mappedPos.x()),
+                                         SkScalarFloorToScalar(mappedPos.y())};
+                acceptedBuffer[acceptedSize++] =
+                        std::make_tuple(strike->glyph(digest), roundedPos);
+                break;
+            }
+            case GlyphAction::kReject:
+                rejectedBuffer[rejectedSize++] = std::make_tuple(glyphID, pos);
+                break;
+            default:
+                break;
+        }
+    }
+    strike->unlock();
+
+    return {acceptedBuffer.first(acceptedSize), rejectedBuffer.first(rejectedSize)};
+}
+
+std::tuple<SkZip<const SkGlyph*, SkPoint>, SkZip<SkGlyphID, SkPoint>>
+prepare_for_direct_bitmap_drawing(SkStrike* strike,
+                                  const SkMatrix& creationMatrix,
+                                  SkZip<const SkGlyphID, const SkPoint> source,
+                                  SkZip<const SkGlyph*, SkPoint> acceptedBuffer,
+                                  SkZip<SkGlyphID, SkPoint> rejectedBuffer) {
+    const SkIPoint mask = strike->roundingSpec().ignorePositionFieldMask;
+    const SkPoint halfSampleFreq = strike->roundingSpec().halfAxisSampleFreq;
+
+    SkMatrix positionMatrixWithRounding = creationMatrix;
+    positionMatrixWithRounding.postTranslate(halfSampleFreq.x(), halfSampleFreq.y());
+
+    int acceptedSize = 0;
+    int rejectedSize = 0;
+    strike->lock();
+    for (auto [glyphID, pos] : source) {
+        if (!SkIsFinite(pos.x(), pos.y())) {
+            continue;
+        }
+
+        const SkPoint mappedPos = positionMatrixWithRounding.mapPoint(pos);
+        const SkPackedGlyphID packedGlyphID = SkPackedGlyphID{glyphID, mappedPos, mask};
+        switch (SkGlyphDigest digest = strike->digestFor(kDirectMaskCPU, packedGlyphID);
+                digest.actionFor(kDirectMaskCPU)) {
+            case GlyphAction::kAccept: {
+                acceptedBuffer[acceptedSize++] =
+                        std::make_tuple(strike->glyph(digest), pos);
+                break;
+            }
+            case GlyphAction::kReject:
+                rejectedBuffer[rejectedSize++] = std::make_tuple(glyphID, pos);
+                break;
+            default:
+                break;
+        }
+    }
+    strike->unlock();
+
+    return {acceptedBuffer.first(acceptedSize), rejectedBuffer.first(rejectedSize)};
+}
+}  
+
+namespace skcpu {
+GlyphRunListPainter::GlyphRunListPainter(const SkSurfaceProps& props,
+                                         SkColorType colorType,
+                                         SkColorSpace* cs)
+        : fDeviceProps{props}
+        , fBitmapFallbackProps{props.cloneWithPixelGeometry(kUnknown_SkPixelGeometry)}
+        , fColorType{colorType}
+        , fScalerContextFlags{compute_scaler_context_flags(cs)} {}
+
+void GlyphRunListPainter::drawForBitmapDevice(SkCanvas* canvas,
+                                              const BitmapDevicePainter* bitmapDevice,
+                                              const sktext::GlyphRunList& glyphRunList,
+                                              const SkPaint& paint,
+                                              const SkMatrix& drawMatrix) {
+    STArray<64, const SkGlyph*> acceptedPackedGlyphIDs;
+    STArray<64, SkPoint> acceptedPositions;
+    STArray<64, SkGlyphID> rejectedGlyphIDs;
+    STArray<64, SkPoint> rejectedPositions;
+    const int maxGlyphRunSize = glyphRunList.maxGlyphRunSize();
+    acceptedPackedGlyphIDs.resize(maxGlyphRunSize);
+    acceptedPositions.resize(maxGlyphRunSize);
+    const auto acceptedBuffer = SkMakeZip(acceptedPackedGlyphIDs, acceptedPositions);
+    rejectedGlyphIDs.resize(maxGlyphRunSize);
+    rejectedPositions.resize(maxGlyphRunSize);
+    const auto rejectedBuffer = SkMakeZip(rejectedGlyphIDs, rejectedPositions);
+
+    auto& props = (kN32_SkColorType == fColorType && paint.isSrcOver())
+                          ? fDeviceProps
+                          : fBitmapFallbackProps;
+
+    SkPoint drawOrigin = glyphRunList.origin();
+    SkMatrix positionMatrix{drawMatrix};
+    positionMatrix.preTranslate(drawOrigin.x(), drawOrigin.y());
+    for (auto& glyphRun : glyphRunList) {
+        const SkFont& runFont = glyphRun.font();
+
+        SkZip<const SkGlyphID, const SkPoint> source = glyphRun.source();
+
+        if (SkStrikeSpec::ShouldDrawAsPath(paint, runFont, positionMatrix)) {
+            auto [strikeSpec, strikeToSourceScale] =
+                    SkStrikeSpec::MakePath(runFont, paint, props, fScalerContextFlags);
+
+            auto strike = strikeSpec.findOrCreateStrike();
+
+            {
+                auto [accepted, rejected] = prepare_for_path_drawing(strike.get(),
+                                                                     source,
+                                                                     acceptedBuffer,
+                                                                     rejectedBuffer);
+
+                source = rejected;
+                SkPaint pathPaint = paint;
+                pathPaint.setAntiAlias(runFont.hasSomeAntiAliasing());
+
+                const bool stroking = pathPaint.getStyle() != SkPaint::kFill_Style;
+                const bool hairline = pathPaint.getStrokeWidth() == 0;
+                const bool needsExactCTM = pathPaint.getShader()     ||
+                                           pathPaint.getPathEffect() ||
+                                           pathPaint.getMaskFilter() ||
+                                           (stroking && !hairline);
+
+                if (!needsExactCTM) {
+                    for (auto [glyph, pos] : accepted) {
+                        const SkPath* path = glyph->path();
+                        SkMatrix m;
+                        SkPoint translate = drawOrigin + pos;
+                        m.setScaleTranslate(strikeToSourceScale, strikeToSourceScale,
+                                            translate.x(), translate.y());
+                        SkAutoCanvasRestore acr(canvas, true);
+                        canvas->concat(m);
+                        canvas->drawPath(*path, pathPaint);
+                    }
+                } else {
+                    for (auto [glyph, pos] : accepted) {
+                        const SkPath* path = glyph->path();
+                        SkMatrix m;
+                        SkPoint translate = drawOrigin + pos;
+                        m.setScaleTranslate(strikeToSourceScale, strikeToSourceScale,
+                                            translate.x(), translate.y());
+
+                        SkPathBuilder builder;
+                        builder.addPath(*path, m);
+                        builder.setIsVolatile(true);
+                        canvas->drawPath(builder.detach(), pathPaint);
+                    }
+                }
+            }
+
+            if (!source.empty()) {
+                auto [accepted, rejected] = prepare_for_drawable_drawing(strike.get(),
+                                                                         source,
+                                                                         acceptedBuffer,
+                                                                         rejectedBuffer);
+                source = rejected;
+
+                for (auto [glyph, pos] : accepted) {
+                    SkDrawable* drawable = glyph->drawable();
+                    SkMatrix m;
+                    SkPoint translate = drawOrigin + pos;
+                    m.setScaleTranslate(strikeToSourceScale, strikeToSourceScale,
+                                        translate.x(), translate.y());
+                    SkAutoCanvasRestore acr(canvas, false);
+                    SkRect drawableBounds = drawable->getBounds();
+                    m.mapRect(&drawableBounds);
+                    canvas->saveLayer(&drawableBounds, &paint);
+                    drawable->draw(canvas, &m);
+                }
+            }
+        }
+        if (!source.empty() && !positionMatrix.hasPerspective()) {
+            SkStrikeSpec strikeSpec = SkStrikeSpec::MakeMask(
+                    runFont, paint, props, fScalerContextFlags, positionMatrix);
+
+            auto strike = strikeSpec.findOrCreateStrike();
+
+            auto [accepted, rejected] = prepare_for_direct_mask_drawing(strike.get(),
+                                                                        positionMatrix,
+                                                                        source,
+                                                                        acceptedBuffer,
+                                                                        rejectedBuffer);
+            source = rejected;
+            bitmapDevice->paintMasks(accepted, paint);
+        }
+        if (!source.empty()) {
+            SkStrikeSpec scaleStrikeSpec = SkStrikeSpec::MakeMask(
+                    runFont, paint, props, fScalerContextFlags, SkMatrix::I());
+            SkBulkGlyphMetrics metrics{scaleStrikeSpec};
+
+            auto glyphIDs = source.get<0>();
+            auto positions = source.get<1>();
+            SkSpan<const SkGlyph*> glyphs = metrics.glyphs(glyphIDs);
+            SkScalar maxScale = SK_ScalarMin;
+
+            for (auto [glyph, pos] : SkMakeZip(glyphs, positions)) {
+                if (glyph->isEmpty()) {
+                    continue;
+                }
+                SkPoint corners[4];
+                SkRect rect = glyph->rect();
+                rect.makeOffset(drawOrigin + pos);
+                positionMatrix.mapRectToQuad(corners, rect);
+                SkScalar scale = (corners[1] - corners[0]).length() / rect.width();
+                maxScale = std::max(maxScale, scale);
+                scale = (corners[2] - corners[1]).length() / rect.height();
+                maxScale = std::max(maxScale, scale);
+                scale = (corners[3] - corners[2]).length() / rect.width();
+                maxScale = std::max(maxScale, scale);
+                scale = (corners[0] - corners[3]).length() / rect.height();
+                maxScale = std::max(maxScale, scale);
+            }
+
+            if (maxScale <= 0) {
+                continue;  
+            }
+
+            if (maxScale * runFont.getSize() > 256) {
+                maxScale = 256.0f / runFont.getSize();
+            }
+
+            SkMatrix cacheScale = SkMatrix::Scale(maxScale, maxScale);
+            SkStrikeSpec strikeSpec = SkStrikeSpec::MakeMask(
+                    runFont, paint, props, fScalerContextFlags, cacheScale);
+
+            auto strike = strikeSpec.findOrCreateStrike();
+
+            auto [accepted, rejected] = prepare_for_direct_bitmap_drawing(strike.get(),
+                                                                          positionMatrix,
+                                                                          source,
+                                                                          acceptedBuffer,
+                                                                          rejectedBuffer);
+            const SkScalar invMaxScale = 1.0f/maxScale;
+            for (auto [glyph, srcPos] : accepted) {
+                SkMask mask = glyph->mask();
+                if (mask.fFormat != SkMask::kARGB32_Format) {
+                    continue;
+                }
+                SkBitmap bm;
+                bm.installPixels(SkImageInfo::MakeN32Premul(mask.fBounds.size()),
+                                 const_cast<uint8_t*>(mask.fImage),
+                                 mask.fRowBytes);
+                bm.setImmutable();
+
+                SkPoint pos = drawOrigin + srcPos
+                            + SkPoint::Make(mask.fBounds.left(), mask.fBounds.top())*invMaxScale;
+
+                SkMatrix translate = SkMatrix::Translate(pos);
+                translate.preScale(invMaxScale, invMaxScale);
+
+                bitmapDevice->drawBitmap(
+                        bm, translate, nullptr, SkFilterMode::kLinear, paint, nullptr);
+            }
+        }
+
+    }
+}
+}  

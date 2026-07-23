@@ -1,0 +1,47 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_VideoTrack_h
+#define mozilla_dom_VideoTrack_h
+
+#include "MediaTrack.h"
+
+namespace mozilla::dom {
+
+class VideoTrackList;
+class VideoStreamTrack;
+
+class VideoTrack : public MediaTrack {
+ public:
+  VideoTrack(nsIGlobalObject* aRelevantGlobal, const nsAString& aId,
+             const nsAString& aKind, const nsAString& aLabel,
+             const nsAString& aLanguage,
+             VideoStreamTrack* aStreamTrack = nullptr);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(VideoTrack, MediaTrack)
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  VideoTrack* AsVideoTrack() override { return this; }
+
+  void SetEnabledInternal(bool aEnabled, int aFlags) override;
+
+  VideoStreamTrack* GetVideoStreamTrack() { return mVideoStreamTrack; }
+
+  bool Selected() const { return mSelected; }
+
+  void SetSelected(bool aSelected);
+
+ private:
+  virtual ~VideoTrack();
+
+  bool mSelected;
+  RefPtr<VideoStreamTrack> mVideoStreamTrack;
+};
+
+}  
+
+#endif  // mozilla_dom_VideoTrack_h

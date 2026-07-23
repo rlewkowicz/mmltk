@@ -1,0 +1,95 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_KeyboardEvent_h_
+#define mozilla_dom_KeyboardEvent_h_
+
+#include "mozilla/EventForwards.h"
+#include "mozilla/dom/KeyboardEventBinding.h"
+#include "mozilla/dom/UIEvent.h"
+
+namespace mozilla::dom {
+
+class KeyboardEvent : public UIEvent {
+ public:
+  KeyboardEvent(EventTarget* aOwner, nsPresContext* aPresContext,
+                WidgetKeyboardEvent* aEvent);
+
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(KeyboardEvent, UIEvent)
+
+  virtual KeyboardEvent* AsKeyboardEvent() override { return this; }
+
+  static already_AddRefed<KeyboardEvent> ConstructorJS(
+      const GlobalObject& aGlobal, const nsAString& aType,
+      const KeyboardEventInit& aParam);
+
+  virtual JSObject* WrapObjectInternal(
+      JSContext* aCx, JS::Handle<JSObject*> aGivenProto) override {
+    return KeyboardEvent_Binding::Wrap(aCx, this, aGivenProto);
+  }
+
+  bool AltKey(CallerType aCallerType = CallerType::System);
+  bool CtrlKey(CallerType aCallerType = CallerType::System);
+  bool ShiftKey(CallerType aCallerType = CallerType::System);
+  bool MetaKey();
+
+  bool IsMenuAccessKeyPressed() const;
+  Modifiers GetModifiersForMenuAccessKey() const;
+
+  bool GetModifierState(const nsAString& aKey,
+                        CallerType aCallerType = CallerType::System) {
+    bool modifierState = GetModifierStateInternal(aKey);
+
+    if (!ShouldResistFingerprinting(aCallerType)) {
+      return modifierState;
+    }
+
+    Modifiers modifier = WidgetInputEvent::GetModifier(aKey);
+    return GetSpoofedModifierStates(modifier, modifierState);
+  }
+
+  bool Repeat();
+  bool IsComposing();
+  void GetKey(nsAString& aKey) const;
+  uint32_t CharCode(CallerType aCallerType = CallerType::System);
+  uint32_t KeyCode(CallerType aCallerType = CallerType::System);
+  virtual uint32_t Which(CallerType aCallerType = CallerType::System) override;
+  uint32_t Location();
+
+  void GetCode(nsAString& aCode, CallerType aCallerType = CallerType::System);
+  void GetInitDict(KeyboardEventInit& aParam);
+
+  void InitKeyboardEventJS(const nsAString& aType, bool aCanBubble,
+                           bool aCancelable, nsGlobalWindowInner* aView,
+                           const nsAString& aKey, uint32_t aLocation,
+                           bool aCtrlKey, bool aAltKey, bool aShiftKey,
+                           bool aMetaKey);
+
+ protected:
+  ~KeyboardEvent() = default;
+
+ private:
+  bool mInitializedByJS;
+  bool mInitializedByCtor;
+
+  uint32_t mInitializedWhichValue;
+
+  bool ShouldResistFingerprinting(CallerType aCallerType);
+
+  bool GetSpoofedModifierStates(const Modifiers aModifierKey,
+                                const bool aRawModifierState);
+
+  uint32_t ComputeTraditionalKeyCode(WidgetKeyboardEvent& aKeyboardEvent,
+                                     CallerType aCallerType);
+  bool ShouldUseSameValueForCharCodeAndKeyCode(
+      const WidgetKeyboardEvent& aKeyboardEvent, CallerType aCallerType) const;
+};
+
+}  
+
+already_AddRefed<mozilla::dom::KeyboardEvent> NS_NewDOMKeyboardEvent(
+    mozilla::dom::EventTarget* aOwner, nsPresContext* aPresContext,
+    mozilla::WidgetKeyboardEvent* aEvent);
+
+#endif  // mozilla_dom_KeyboardEvent_h_

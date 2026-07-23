@@ -1,0 +1,154 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(threading_Thread_h)
+#define threading_Thread_h
+
+#include "mozilla/TimeStamp.h"
+
+#include <type_traits>
+#include <utility>
+
+#include "js/Initialization.h"
+#include "js/Utility.h"
+#include "threading/LockGuard.h"
+#include "threading/Mutex.h"
+#include "threading/ThreadId.h"
+#include "vm/MutexIDs.h"
+
+#  define THREAD_RETURN_TYPE void*
+#  define THREAD_CALL_API
+
+namespace js {
+namespace detail {
+template <typename F, typename... Args>
+class ThreadTrampoline;
+}  
+
+class Thread {
+ public:
+  class Options {
+    size_t stackSize_;
+
+   public:
+    Options() : stackSize_(0) {}
+
+    Options& setStackSize(size_t sz) {
+      stackSize_ = sz;
+      return *this;
+    }
+    size_t stackSize() const { return stackSize_; }
+  };
+
+  template <typename O = Options,
+            typename NonConstO = std::remove_const_t<O>,
+            typename DerefO = std::remove_reference_t<NonConstO>,
+            typename = std::enable_if_t<std::is_same_v<DerefO, Options>>>
+  explicit Thread(O&& options = Options())
+      : options_(std::forward<O>(options)) {
+    MOZ_ASSERT(isInitialized());
+  }
+
+  template <typename F, typename... Args>
+  [[nodiscard]] bool init(F&& f, Args&&... args) {
+    MOZ_RELEASE_ASSERT(id_ == ThreadId());
+    using Trampoline = detail::ThreadTrampoline<F, Args...>;
+    auto trampoline =
+        js_new<Trampoline>(std::forward<F>(f), std::forward<Args>(args)...);
+    if (!trampoline) {
+      return false;
+    }
+
+    bool result;
+    {
+      LockGuard<Mutex> lock(trampoline->createMutex);
+      result = create(Trampoline::Start, trampoline);
+    }
+    if (!result) {
+      js_delete(trampoline);
+      return false;
+    }
+    return true;
+  }
+
+  ~Thread();
+
+  void detach();
+
+  void join();
+
+  bool joinable();
+
+  ThreadId get_id();
+
+  Thread(Thread&& aOther);
+  Thread& operator=(Thread&& aOther);
+  Thread(const Thread&) = delete;
+  void operator=(const Thread&) = delete;
+
+ private:
+  ThreadId id_;
+
+  Options options_;
+
+  [[nodiscard]] bool create(THREAD_RETURN_TYPE(THREAD_CALL_API* aMain)(void*),
+                            void* aArg);
+
+  static inline bool isInitialized() {
+    using namespace JS::detail;
+    return libraryInitState == InitState::Initializing ||
+           libraryInitState == InitState::Running;
+  }
+};
+
+namespace ThisThread {
+
+void SetName(const char* name);
+
+void GetName(char* nameBuffer, size_t len);
+
+void SleepMilliseconds(size_t ms);
+
+}  
+
+namespace detail {
+
+template <typename F, typename... Args>
+class ThreadTrampoline {
+  F f;
+
+  std::tuple<std::decay_t<Args>...> args;
+
+  Mutex createMutex MOZ_UNANNOTATED;
+
+  friend class js::Thread;
+
+ public:
+  template <typename G, typename... ArgsT>
+  explicit ThreadTrampoline(G&& aG, ArgsT&&... aArgsT)
+      : f(std::forward<F>(aG)),
+        args(std::forward<Args>(aArgsT)...),
+        createMutex(mutexid::ThreadId) {}
+
+  static THREAD_RETURN_TYPE THREAD_CALL_API Start(void* aPack) {
+    auto* pack = static_cast<ThreadTrampoline<F, Args...>*>(aPack);
+    pack->callMain(std::index_sequence_for<Args...>{});
+    js_delete(pack);
+    return {};
+  }
+
+  template <size_t... Indices>
+  void callMain(std::index_sequence<Indices...>) {
+    createMutex.lock();
+    createMutex.unlock();
+    f(std::move(std::get<Indices>(args))...);
+  }
+};
+
+}  
+}  
+
+#undef THREAD_RETURN_TYPE
+
+#endif

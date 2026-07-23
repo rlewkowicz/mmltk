@@ -1,0 +1,558 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsMathMLmunderoverFrame.h"
+
+#include <algorithm>
+
+#include "gfxContext.h"
+#include "gfxMathTable.h"
+#include "gfxTextRun.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/StaticPrefs_mathml.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/MathMLElement.h"
+#include "nsIMathMLFrame.h"
+#include "nsLayoutUtils.h"
+#include "nsMathMLmmultiscriptsFrame.h"
+#include "nsPresContext.h"
+
+using namespace mozilla;
+
+
+nsIFrame* NS_NewMathMLmunderoverFrame(PresShell* aPresShell,
+                                      ComputedStyle* aStyle) {
+  return new (aPresShell)
+      nsMathMLmunderoverFrame(aStyle, aPresShell->GetPresContext());
+}
+
+NS_IMPL_FRAMEARENA_HELPERS(nsMathMLmunderoverFrame)
+
+nsMathMLmunderoverFrame::~nsMathMLmunderoverFrame() = default;
+
+nsresult nsMathMLmunderoverFrame::AttributeChanged(int32_t aNameSpaceID,
+                                                   nsAtom* aAttribute,
+                                                   AttrModType aModType) {
+  if (aNameSpaceID == kNameSpaceID_None &&
+      (nsGkAtoms::accent == aAttribute ||
+       nsGkAtoms::accentunder == aAttribute)) {
+    return ReLayoutChildren(GetParent());
+  }
+
+  return nsMathMLContainerFrame::AttributeChanged(aNameSpaceID, aAttribute,
+                                                  aModType);
+}
+
+NS_IMETHODIMP
+nsMathMLmunderoverFrame::UpdatePresentationData(
+    MathMLPresentationFlags aFlagsValues,
+    MathMLPresentationFlags aFlagsToUpdate) {
+  nsMathMLContainerFrame::UpdatePresentationData(aFlagsValues, aFlagsToUpdate);
+  if (mEmbellishData.flags.contains(MathMLEmbellishFlag::MovableLimits) &&
+      StyleFont()->mMathStyle == StyleMathStyle::Compact) {
+    mPresentationData.flags -=
+        MathMLPresentationFlag::StretchAllChildrenHorizontally;
+  } else {
+    mPresentationData.flags +=
+        MathMLPresentationFlag::StretchAllChildrenHorizontally;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsMathMLmunderoverFrame::InheritAutomaticData(nsIFrame* aParent) {
+  nsMathMLContainerFrame::InheritAutomaticData(aParent);
+
+  mPresentationData.flags +=
+      MathMLPresentationFlag::StretchAllChildrenHorizontally;
+
+  return NS_OK;
+}
+
+void nsMathMLmunderoverFrame::Destroy(DestroyContext& aContext) {
+  if (!mPostReflowIncrementScriptLevelCommands.IsEmpty()) {
+    PresShell()->CancelReflowCallback(this);
+  }
+  nsMathMLContainerFrame::Destroy(aContext);
+}
+
+uint8_t nsMathMLmunderoverFrame::ScriptIncrement(nsIFrame* aFrame) {
+  nsIFrame* child = mFrames.FirstChild();
+  if (!aFrame || aFrame == child) {
+    return 0;
+  }
+  child = child->GetNextSibling();
+  if (aFrame == child) {
+    if (mContent->IsMathMLElement(nsGkAtoms::mover)) {
+      return mIncrementOver ? 1 : 0;
+    }
+    return mIncrementUnder ? 1 : 0;
+  }
+  if (child && aFrame == child->GetNextSibling()) {
+    return mIncrementOver ? 1 : 0;
+  }
+  return 0;  
+}
+
+void nsMathMLmunderoverFrame::SetIncrementScriptLevel(uint32_t aChildIndex,
+                                                      bool aIncrement) {
+  nsIFrame* child = PrincipalChildList().FrameAt(aChildIndex);
+  if (!child || !child->GetContent()->IsMathMLElement() ||
+      child->GetContent()->GetPrimaryFrame() != child) {
+    return;
+  }
+
+  auto element = dom::MathMLElement::FromNode(child->GetContent());
+  if (element->GetIncrementScriptLevel() == aIncrement) {
+    return;
+  }
+
+  if (mPostReflowIncrementScriptLevelCommands.IsEmpty()) {
+    PresShell()->PostReflowCallback(this);
+  }
+
+  mPostReflowIncrementScriptLevelCommands.AppendElement(
+      SetIncrementScriptLevelCommand{aChildIndex, aIncrement});
+}
+
+bool nsMathMLmunderoverFrame::ReflowFinished() {
+  SetPendingPostReflowIncrementScriptLevel();
+  return true;
+}
+
+void nsMathMLmunderoverFrame::ReflowCallbackCanceled() {
+  mPostReflowIncrementScriptLevelCommands.Clear();
+}
+
+void nsMathMLmunderoverFrame::SetPendingPostReflowIncrementScriptLevel() {
+  MOZ_ASSERT(!mPostReflowIncrementScriptLevelCommands.IsEmpty());
+
+  nsTArray<SetIncrementScriptLevelCommand> commands =
+      std::move(mPostReflowIncrementScriptLevelCommands);
+
+  for (const auto& command : commands) {
+    nsIFrame* child = PrincipalChildList().FrameAt(command.mChildIndex);
+    if (!child || !child->GetContent()->IsMathMLElement()) {
+      continue;
+    }
+
+    auto element = dom::MathMLElement::FromNode(child->GetContent());
+    element->SetIncrementScriptLevel(command.mDoIncrement, true);
+  }
+}
+
+NS_IMETHODIMP
+nsMathMLmunderoverFrame::TransmitAutomaticData() {
+
+
+  nsIFrame* overscriptFrame = nullptr;
+  nsIFrame* underscriptFrame = nullptr;
+  nsIFrame* baseFrame = mFrames.FirstChild();
+
+  if (baseFrame) {
+    if (mContent->IsAnyOfMathMLElements(nsGkAtoms::munder,
+                                        nsGkAtoms::munderover)) {
+      underscriptFrame = baseFrame->GetNextSibling();
+    } else {
+      NS_ASSERTION(mContent->IsMathMLElement(nsGkAtoms::mover),
+                   "mContent->NodeInfo()->NameAtom() not recognized");
+      overscriptFrame = baseFrame->GetNextSibling();
+    }
+  }
+  if (underscriptFrame && mContent->IsMathMLElement(nsGkAtoms::munderover)) {
+    overscriptFrame = underscriptFrame->GetNextSibling();
+  }
+
+  mPresentationData.baseFrame = baseFrame;
+  GetEmbellishDataFrom(baseFrame, mEmbellishData);
+
+  nsEmbellishData embellishData;
+  nsAutoString value;
+  if (mContent->IsAnyOfMathMLElements(nsGkAtoms::munder,
+                                      nsGkAtoms::munderover)) {
+    GetEmbellishDataFrom(underscriptFrame, embellishData);
+    if (embellishData.flags.contains(MathMLEmbellishFlag::Accent)) {
+      mEmbellishData.flags += MathMLEmbellishFlag::AccentUnder;
+    } else {
+      mEmbellishData.flags -= MathMLEmbellishFlag::AccentUnder;
+    }
+
+    if (mContent->AsElement()->GetAttr(nsGkAtoms::accentunder, value)) {
+      if (value.LowerCaseEqualsLiteral("true")) {
+        mEmbellishData.flags += MathMLEmbellishFlag::AccentUnder;
+      } else if (value.LowerCaseEqualsLiteral("false")) {
+        mEmbellishData.flags -= MathMLEmbellishFlag::AccentUnder;
+      }
+    } else if (mEmbellishData.flags.contains(
+                   MathMLEmbellishFlag::AccentUnder)) {
+      AutoTArray<nsString, 1> params;
+      params.AppendElement(mContent->NodeInfo()->NodeName());
+      PresContext()->Document()->WarnOnceAndReportAbout(
+          dom::DeprecatedOperations::
+              eMathML_DeprecatedMunderNonExplicitAccentunder,
+          false, params);
+    }
+  }
+
+  if (mContent->IsAnyOfMathMLElements(nsGkAtoms::mover,
+                                      nsGkAtoms::munderover)) {
+    GetEmbellishDataFrom(overscriptFrame, embellishData);
+    if (embellishData.flags.contains(MathMLEmbellishFlag::Accent)) {
+      mEmbellishData.flags += MathMLEmbellishFlag::AccentOver;
+    } else {
+      mEmbellishData.flags -= MathMLEmbellishFlag::AccentOver;
+    }
+
+    if (mContent->AsElement()->GetAttr(nsGkAtoms::accent, value)) {
+      if (value.LowerCaseEqualsLiteral("true")) {
+        mEmbellishData.flags += MathMLEmbellishFlag::AccentOver;
+      } else if (value.LowerCaseEqualsLiteral("false")) {
+        mEmbellishData.flags -= MathMLEmbellishFlag::AccentOver;
+      }
+    } else if (mEmbellishData.flags.contains(MathMLEmbellishFlag::AccentOver)) {
+      AutoTArray<nsString, 1> params;
+      params.AppendElement(mContent->NodeInfo()->NodeName());
+      PresContext()->Document()->WarnOnceAndReportAbout(
+          dom::DeprecatedOperations::eMathML_DeprecatedMoverNonExplicitAccent,
+          false, params);
+    }
+  }
+
+  bool subsupDisplay =
+      mEmbellishData.flags.contains(MathMLEmbellishFlag::MovableLimits) &&
+      StyleFont()->mMathStyle == StyleMathStyle::Compact;
+
+  if (subsupDisplay) {
+    mPresentationData.flags -=
+        MathMLPresentationFlag::StretchAllChildrenHorizontally;
+  }
+
+
+  if (mContent->IsAnyOfMathMLElements(nsGkAtoms::mover,
+                                      nsGkAtoms::munderover)) {
+    mIncrementOver =
+        !mEmbellishData.flags.contains(MathMLEmbellishFlag::AccentOver) ||
+        subsupDisplay;
+    SetIncrementScriptLevel(mContent->IsMathMLElement(nsGkAtoms::mover) ? 1 : 2,
+                            mIncrementOver);
+    if (mIncrementOver) {
+      PropagateFrameFlagFor(overscriptFrame, NS_FRAME_MATHML_SCRIPT_DESCENDANT);
+    }
+  }
+  if (mContent->IsAnyOfMathMLElements(nsGkAtoms::munder,
+                                      nsGkAtoms::munderover)) {
+    mIncrementUnder =
+        !mEmbellishData.flags.contains(MathMLEmbellishFlag::AccentUnder) ||
+        subsupDisplay;
+    SetIncrementScriptLevel(1, mIncrementUnder);
+    if (mIncrementUnder) {
+      PropagateFrameFlagFor(underscriptFrame,
+                            NS_FRAME_MATHML_SCRIPT_DESCENDANT);
+    }
+  }
+
+  if (overscriptFrame &&
+      mEmbellishData.flags.contains(MathMLEmbellishFlag::AccentOver) &&
+      !mEmbellishData.flags.contains(MathMLEmbellishFlag::MovableLimits)) {
+    PropagatePresentationDataFor(baseFrame, MathMLPresentationFlag::Dtls,
+                                 MathMLPresentationFlag::Dtls);
+  }
+
+  return NS_OK;
+}
+
+
+void nsMathMLmunderoverFrame::Place(DrawTarget* aDrawTarget,
+                                    const PlaceFlags& aFlags,
+                                    ReflowOutput& aDesiredSize) {
+  float fontSizeInflation = nsLayoutUtils::FontSizeInflationFor(this);
+  if (mEmbellishData.flags.contains(MathMLEmbellishFlag::MovableLimits) &&
+      StyleFont()->mMathStyle == StyleMathStyle::Compact) {
+    if (mContent->IsMathMLElement(nsGkAtoms::munderover)) {
+      return nsMathMLmmultiscriptsFrame::PlaceMultiScript(
+          PresContext(), aDrawTarget, aFlags, aDesiredSize, this, 0, 0,
+          fontSizeInflation);
+    } else if (mContent->IsMathMLElement(nsGkAtoms::munder)) {
+      return nsMathMLmmultiscriptsFrame::PlaceMultiScript(
+          PresContext(), aDrawTarget, aFlags, aDesiredSize, this, 0, 0,
+          fontSizeInflation);
+    } else {
+      NS_ASSERTION(mContent->IsMathMLElement(nsGkAtoms::mover),
+                   "mContent->NodeInfo()->NameAtom() not recognized");
+      return nsMathMLmmultiscriptsFrame::PlaceMultiScript(
+          PresContext(), aDrawTarget, aFlags, aDesiredSize, this, 0, 0,
+          fontSizeInflation);
+    }
+  }
+
+
+  nsBoundingMetrics bmBase, bmUnder, bmOver;
+  ReflowOutput baseSize(aDesiredSize.GetWritingMode());
+  ReflowOutput underSize(aDesiredSize.GetWritingMode());
+  ReflowOutput overSize(aDesiredSize.GetWritingMode());
+  nsIFrame* overFrame = nullptr;
+  nsIFrame* underFrame = nullptr;
+  nsIFrame* baseFrame = mFrames.FirstChild();
+  underSize.SetBlockStartAscent(0);
+  overSize.SetBlockStartAscent(0);
+  bool haveError = false;
+  if (baseFrame) {
+    if (mContent->IsAnyOfMathMLElements(nsGkAtoms::munder,
+                                        nsGkAtoms::munderover)) {
+      underFrame = baseFrame->GetNextSibling();
+    } else if (mContent->IsMathMLElement(nsGkAtoms::mover)) {
+      overFrame = baseFrame->GetNextSibling();
+    }
+  }
+  if (underFrame && mContent->IsMathMLElement(nsGkAtoms::munderover)) {
+    overFrame = underFrame->GetNextSibling();
+  }
+
+  if (mContent->IsMathMLElement(nsGkAtoms::munder)) {
+    if (!baseFrame || !underFrame || underFrame->GetNextSibling()) {
+      haveError = true;
+    }
+  }
+  if (mContent->IsMathMLElement(nsGkAtoms::mover)) {
+    if (!baseFrame || !overFrame || overFrame->GetNextSibling()) {
+      haveError = true;
+    }
+  }
+  if (mContent->IsMathMLElement(nsGkAtoms::munderover)) {
+    if (!baseFrame || !underFrame || !overFrame ||
+        overFrame->GetNextSibling()) {
+      haveError = true;
+    }
+  }
+  if (haveError) {
+    if (!aFlags.contains(PlaceFlag::MeasureOnly)) {
+      ReportChildCountError();
+    }
+    return PlaceAsMrow(aDrawTarget, aFlags, aDesiredSize);
+  }
+  GetReflowAndBoundingMetricsFor(baseFrame, baseSize, bmBase);
+  nsMargin baseMargin = GetMarginForPlace(aFlags, baseFrame);
+  nsMargin underMargin, overMargin;
+  if (underFrame) {
+    GetReflowAndBoundingMetricsFor(underFrame, underSize, bmUnder);
+    underMargin = GetMarginForPlace(aFlags, underFrame);
+  }
+  if (overFrame) {
+    GetReflowAndBoundingMetricsFor(overFrame, overSize, bmOver);
+    overMargin = GetMarginForPlace(aFlags, overFrame);
+  }
+
+  nscoord onePixel = nsPresContext::CSSPixelsToAppUnits(1);
+
+
+  RefPtr<nsFontMetrics> fm =
+      nsLayoutUtils::GetFontMetricsForFrame(this, fontSizeInflation);
+
+  nscoord xHeight = fm->XHeight();
+  nscoord oneDevPixel = fm->AppUnitsPerDevPixel();
+  RefPtr<gfxFont> mathFont = fm->GetThebesFontGroup()->GetFirstMathFont();
+
+  nscoord ruleThickness;
+  GetRuleThickness(aDrawTarget, fm, ruleThickness);
+
+  nscoord correction = 0;
+  GetItalicCorrection(bmBase, correction);
+
+
+  nscoord underDelta1 = 0;  
+  nscoord underDelta2 = 0;  
+
+  if (!mEmbellishData.flags.contains(MathMLEmbellishFlag::AccentUnder)) {
+    nscoord bigOpSpacing2, bigOpSpacing4, bigOpSpacing5, dummy;
+    GetBigOpSpacings(fm, dummy, bigOpSpacing2, dummy, bigOpSpacing4,
+                     bigOpSpacing5);
+    if (mathFont) {
+      bigOpSpacing2 = mathFont->MathTable()->Constant(
+          gfxMathTable::LowerLimitGapMin, oneDevPixel);
+      bigOpSpacing4 = mathFont->MathTable()->Constant(
+          gfxMathTable::LowerLimitBaselineDropMin, oneDevPixel);
+      bigOpSpacing5 = 0;
+    }
+    underDelta1 = std::max(
+        bigOpSpacing2, (bigOpSpacing4 - bmUnder.ascent - underMargin.bottom));
+    underDelta2 = bigOpSpacing5;
+  } else {
+    underDelta1 = ruleThickness + onePixel / 2;
+    underDelta2 = ruleThickness;
+  }
+  if (bmUnder.ascent + bmUnder.descent + underMargin.TopBottom() <= 0) {
+    underDelta1 = 0;
+    underDelta2 = 0;
+  }
+
+  nscoord overDelta1 = 0;  
+  nscoord overDelta2 = 0;  
+
+  if (!mEmbellishData.flags.contains(MathMLEmbellishFlag::AccentOver)) {
+    nscoord bigOpSpacing1, bigOpSpacing3, bigOpSpacing5, dummy;
+    GetBigOpSpacings(fm, bigOpSpacing1, dummy, bigOpSpacing3, dummy,
+                     bigOpSpacing5);
+    if (mathFont) {
+      bigOpSpacing1 = mathFont->MathTable()->Constant(
+          gfxMathTable::UpperLimitGapMin, oneDevPixel);
+      bigOpSpacing3 = mathFont->MathTable()->Constant(
+          gfxMathTable::UpperLimitBaselineRiseMin, oneDevPixel);
+      bigOpSpacing5 = 0;
+    }
+    overDelta1 = std::max(bigOpSpacing1,
+                          (bigOpSpacing3 - bmOver.descent - overMargin.bottom));
+    overDelta2 = bigOpSpacing5;
+
+    if (bmOver.descent + overMargin.bottom < 0) {
+      overDelta1 = std::max(bigOpSpacing1,
+                            (bigOpSpacing3 - (bmOver.ascent + bmOver.descent +
+                                              overMargin.TopBottom())));
+    }
+  } else {
+    overDelta1 = ruleThickness + onePixel / 2;
+    nscoord accentBaseHeight = xHeight;
+    if (mathFont) {
+      accentBaseHeight = mathFont->MathTable()->Constant(
+          gfxMathTable::AccentBaseHeight, oneDevPixel);
+    }
+    if (bmBase.ascent + baseMargin.top < accentBaseHeight) {
+      overDelta1 += accentBaseHeight - bmBase.ascent - baseMargin.top;
+    }
+    overDelta2 = ruleThickness;
+  }
+  if (bmOver.ascent + bmOver.descent + overMargin.TopBottom() <= 0) {
+    overDelta1 = 0;
+    overDelta2 = 0;
+  }
+
+  nscoord dxBase = 0, dxOver = 0, dxUnder = 0;
+  nsAutoString valueAlign;
+
+
+  nscoord overWidth = bmOver.width + overMargin.LeftRight();
+  if (overWidth <= 0 && (bmOver.rightBearing - bmOver.leftBearing > 0)) {
+    overWidth = bmOver.rightBearing - bmOver.leftBearing;
+    dxOver = -bmOver.leftBearing;
+  }
+
+  if (mEmbellishData.flags.contains(MathMLEmbellishFlag::AccentOver)) {
+    mBoundingMetrics.width = bmBase.width + baseMargin.LeftRight();
+    dxOver += correction;
+  } else {
+    mBoundingMetrics.width =
+        std::max(bmBase.width + baseMargin.LeftRight(), overWidth);
+    dxOver += correction / 2;
+  }
+
+  dxOver += (mBoundingMetrics.width - overWidth) / 2;
+  dxBase = (mBoundingMetrics.width - bmBase.width - baseMargin.LeftRight()) / 2;
+
+  mBoundingMetrics.ascent = baseMargin.top + bmBase.ascent + overDelta1 +
+                            bmOver.ascent + bmOver.descent +
+                            overMargin.TopBottom();
+  mBoundingMetrics.descent = bmBase.descent + baseMargin.bottom;
+  mBoundingMetrics.leftBearing =
+      std::min(dxBase + bmBase.leftBearing, dxOver + bmOver.leftBearing);
+  mBoundingMetrics.rightBearing =
+      std::max(dxBase + bmBase.rightBearing + baseMargin.LeftRight(),
+               dxOver + bmOver.rightBearing + overMargin.LeftRight());
+
+
+  nsBoundingMetrics bmAnonymousBase = mBoundingMetrics;
+  nscoord ascentAnonymousBase = std::max(
+      mBoundingMetrics.ascent + overDelta2,
+      overMargin.TopBottom() + overSize.BlockStartAscent() + bmOver.descent +
+          overDelta1 + baseMargin.top + bmBase.ascent);
+  ascentAnonymousBase = std::max(ascentAnonymousBase,
+                                 baseSize.BlockStartAscent() + baseMargin.top);
+
+  nscoord underWidth = bmUnder.width + underMargin.LeftRight();
+  if (underWidth <= 0) {
+    underWidth =
+        bmUnder.rightBearing + underMargin.LeftRight() - bmUnder.leftBearing;
+    dxUnder = -bmUnder.leftBearing;
+  }
+
+  nscoord maxWidth = std::max(bmAnonymousBase.width, underWidth);
+  if (!mEmbellishData.flags.contains(MathMLEmbellishFlag::AccentUnder)) {
+    GetItalicCorrection(bmAnonymousBase, correction);
+    dxUnder += -correction / 2;
+  }
+  nscoord dxAnonymousBase = 0;
+  dxUnder += (maxWidth - underWidth) / 2;
+  dxAnonymousBase = (maxWidth - bmAnonymousBase.width) / 2;
+
+  dxOver += dxAnonymousBase;
+  dxBase += dxAnonymousBase;
+
+  mBoundingMetrics.width =
+      std::max(dxAnonymousBase + bmAnonymousBase.width,
+               dxUnder + bmUnder.width + underMargin.LeftRight());
+  mBoundingMetrics.descent = bmAnonymousBase.descent + underDelta1 +
+                             bmUnder.ascent + bmUnder.descent +
+                             underMargin.TopBottom();
+  mBoundingMetrics.leftBearing =
+      std::min(dxAnonymousBase + bmAnonymousBase.leftBearing,
+               dxUnder + bmUnder.leftBearing);
+  mBoundingMetrics.rightBearing =
+      std::max(dxAnonymousBase + bmAnonymousBase.rightBearing,
+               dxUnder + bmUnder.rightBearing + underMargin.LeftRight());
+
+  aDesiredSize.SetBlockStartAscent(ascentAnonymousBase);
+  aDesiredSize.Height() =
+      aDesiredSize.BlockStartAscent() +
+      std::max(mBoundingMetrics.descent + underDelta2,
+               bmAnonymousBase.descent + underDelta1 + underMargin.top +
+                   bmUnder.ascent + underSize.Height() -
+                   underSize.BlockStartAscent() + underMargin.bottom);
+  aDesiredSize.Height() =
+      std::max(aDesiredSize.Height(),
+               aDesiredSize.BlockStartAscent() + baseSize.Height() -
+                   baseSize.BlockStartAscent() + baseMargin.bottom);
+  aDesiredSize.Width() = mBoundingMetrics.width;
+  aDesiredSize.mBoundingMetrics = mBoundingMetrics;
+
+  auto sizes = GetWidthAndHeightForPlaceAdjustment(aFlags);
+  auto shiftX = ApplyAdjustmentForWidthAndHeight(aFlags, sizes, aDesiredSize,
+                                                 mBoundingMetrics);
+  dxOver += shiftX;
+  dxBase += shiftX;
+  dxUnder += shiftX;
+
+  auto borderPadding = GetBorderPaddingForPlace(aFlags);
+  InflateReflowAndBoundingMetrics(borderPadding, aDesiredSize,
+                                  mBoundingMetrics);
+  dxOver += borderPadding.left + overMargin.left;
+  dxBase += borderPadding.left + baseMargin.left;
+  dxUnder += borderPadding.left + underMargin.left;
+
+  mReference.x = 0;
+  mReference.y = aDesiredSize.BlockStartAscent();
+
+  if (!aFlags.contains(PlaceFlag::MeasureOnly)) {
+    nscoord dy;
+    if (overFrame) {
+      dy = aDesiredSize.BlockStartAscent() - mBoundingMetrics.ascent +
+           overMargin.top + bmOver.ascent - overSize.BlockStartAscent();
+      FinishReflowChild(overFrame, PresContext(), overSize, nullptr, dxOver, dy,
+                        ReflowChildFlags::Default);
+    }
+    dy = aDesiredSize.BlockStartAscent() - baseSize.BlockStartAscent();
+    FinishReflowChild(baseFrame, PresContext(), baseSize, nullptr, dxBase, dy,
+                      ReflowChildFlags::Default);
+    if (underFrame) {
+      dy = aDesiredSize.BlockStartAscent() + mBoundingMetrics.descent -
+           bmUnder.descent - underMargin.bottom - underSize.BlockStartAscent();
+      FinishReflowChild(underFrame, PresContext(), underSize, nullptr, dxUnder,
+                        dy, ReflowChildFlags::Default);
+    }
+  }
+}
+
+bool nsMathMLmunderoverFrame::IsMathContentBoxHorizontallyCentered() const {
+  bool subsupDisplay =
+      mEmbellishData.flags.contains(MathMLEmbellishFlag::MovableLimits) &&
+      StyleFont()->mMathStyle == StyleMathStyle::Compact;
+  return !subsupDisplay;
+}

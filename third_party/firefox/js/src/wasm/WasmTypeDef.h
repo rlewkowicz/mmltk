@@ -1,0 +1,1369 @@
+/*
+ * Copyright 2021 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_type_def_h
+#define wasm_type_def_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/HashTable.h"
+
+#include "js/RefCounted.h"
+
+#include "wasm/WasmCodegenConstants.h"
+#include "wasm/WasmCompileArgs.h"
+#include "wasm/WasmConstants.h"
+#include "wasm/WasmSerialize.h"
+#include "wasm/WasmStructLayout.h"
+#include "wasm/WasmUtility.h"
+#include "wasm/WasmValType.h"
+
+namespace js {
+namespace wasm {
+
+class RecGroup;
+
+
+
+class FuncType {
+  ValTypeVector args_;
+  ValTypeVector results_;
+  uint32_t immediateTypeId_ = NO_IMMEDIATE_TYPE_ID;
+
+  static const uint32_t NO_IMMEDIATE_TYPE_ID = UINT32_MAX;
+
+  bool temporarilyUnsupportedResultCountForJitEntry() const {
+    return results().length() > MaxResultsForJitEntry;
+  }
+  bool temporarilyUnsupportedResultCountForJitExit() const {
+    return results().length() > MaxResultsForJitExit;
+  }
+  bool temporarilyUnsupportedReftypeForEntry() const {
+    for (ValType arg : args()) {
+      if (arg.isRefType() && (!arg.isExternRef() || !arg.isNullable())) {
+        return true;
+      }
+    }
+    for (ValType result : results()) {
+      if (result.isTypeRef()) {
+        return true;
+      }
+    }
+    return false;
+  }
+  bool temporarilyUnsupportedReftypeForExit() const {
+    for (ValType result : results()) {
+      if (result.isRefType() &&
+          (!result.isExternRef() || !result.isNullable())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+ public:
+  FuncType() = default;
+  FuncType(ValTypeVector&& args, ValTypeVector&& results)
+      : args_(std::move(args)), results_(std::move(results)) {
+    MOZ_RELEASE_ASSERT(args_.length() <= MaxParams);
+    MOZ_RELEASE_ASSERT(results_.length() <= MaxResults);
+  }
+
+  FuncType(FuncType&&) = default;
+  FuncType& operator=(FuncType&&) = default;
+
+  [[nodiscard]] bool clone(const FuncType& src) {
+    MOZ_RELEASE_ASSERT(args_.empty());
+    MOZ_RELEASE_ASSERT(results_.empty());
+    immediateTypeId_ = src.immediateTypeId_;
+    return args_.appendAll(src.args_) && results_.appendAll(src.results_);
+  }
+
+  ValType arg(unsigned i) const { return args_[i]; }
+  const ValTypeVector& args() const { return args_; }
+  ValType result(unsigned i) const { return results_[i]; }
+  const ValTypeVector& results() const { return results_; }
+
+  void initImmediateTypeId(bool isFinal, const TypeDef* superTypeDef,
+                           uint32_t recGroupLength);
+  bool hasImmediateTypeId() const {
+    return immediateTypeId_ != NO_IMMEDIATE_TYPE_ID;
+  }
+  uint32_t immediateTypeId() const {
+    MOZ_ASSERT(hasImmediateTypeId());
+    return immediateTypeId_;
+  }
+
+  static const uint32_t ImmediateBit = 0x1;
+
+  HashNumber hash(const RecGroup* recGroup) const {
+    HashNumber hn = 0;
+    for (const ValType& vt : args_) {
+      hn = mozilla::AddToHash(hn, vt.forIsoEquals(recGroup).hash());
+    }
+    for (const ValType& vt : results_) {
+      hn = mozilla::AddToHash(hn, vt.forIsoEquals(recGroup).hash());
+    }
+    return hn;
+  }
+
+  static bool isoEquals(const RecGroup* lhsRecGroup, const FuncType& lhs,
+                        const RecGroup* rhsRecGroup, const FuncType& rhs) {
+    if (lhs.args_.length() != rhs.args_.length() ||
+        lhs.results_.length() != rhs.results_.length()) {
+      return false;
+    }
+    for (uint32_t i = 0; i < lhs.args_.length(); i++) {
+      if (lhs.args_[i].forIsoEquals(lhsRecGroup) !=
+          rhs.args_[i].forIsoEquals(rhsRecGroup)) {
+        return false;
+      }
+    }
+    for (uint32_t i = 0; i < lhs.results_.length(); i++) {
+      if (lhs.results_[i].forIsoEquals(lhsRecGroup) !=
+          rhs.results_[i].forIsoEquals(rhsRecGroup)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static bool strictlyEquals(const FuncType& lhs, const FuncType& rhs) {
+    return EqualContainers(lhs.args(), rhs.args()) &&
+           EqualContainers(lhs.results(), rhs.results());
+  }
+
+  static bool canBeSubTypeOf(const FuncType& subType,
+                             const FuncType& superType) {
+    if (subType.args().length() != superType.args().length()) {
+      return false;
+    }
+
+    if (subType.results().length() != superType.results().length()) {
+      return false;
+    }
+
+    for (uint32_t i = 0; i < superType.results().length(); i++) {
+      if (!ValType::isSubTypeOf(subType.results()[i], superType.results()[i])) {
+        return false;
+      }
+    }
+
+    for (uint32_t i = 0; i < superType.args().length(); i++) {
+      if (!ValType::isSubTypeOf(superType.args()[i], subType.args()[i])) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  bool canHaveJitEntry() const;
+  bool canHaveJitExit() const;
+
+  bool hasInt64Arg() const {
+    for (ValType arg : args()) {
+      if (arg.kind() == ValType::Kind::I64) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool hasUnexposableArgOrRet() const {
+    for (ValType arg : args()) {
+      if (!arg.isExposable()) {
+        return true;
+      }
+    }
+    for (ValType result : results()) {
+      if (!result.isExposable()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool isValidComponentDestructor() const {
+    return args().length() == 1 && results().length() == 0 &&
+           args()[0].valType() == ValType::i32();
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  WASM_DECLARE_FRIEND_SERIALIZE(FuncType);
+};
+
+extern UniqueChars ToString(const FuncType& type, const TypeContext* types);
+
+
+
+struct FieldType {
+  StorageType type;
+  bool isMutable;
+
+  FieldType() : isMutable(false) {}
+  FieldType(StorageType type, bool isMutable)
+      : type(type), isMutable(isMutable) {}
+
+  HashNumber hash(const RecGroup* recGroup) const {
+    HashNumber hn = 0;
+    hn = mozilla::AddToHash(hn, type.forIsoEquals(recGroup).hash());
+    hn = mozilla::AddToHash(hn, HashNumber(isMutable));
+    return hn;
+  }
+
+  static bool isoEquals(const RecGroup* lhsRecGroup, const FieldType& lhs,
+                        const RecGroup* rhsRecGroup, const FieldType& rhs) {
+    return lhs.isMutable == rhs.isMutable &&
+           lhs.type.forIsoEquals(lhsRecGroup) ==
+               rhs.type.forIsoEquals(rhsRecGroup);
+  }
+
+  static bool canBeSubTypeOf(const FieldType& subType,
+                             const FieldType& superType) {
+    if (subType.isMutable && superType.isMutable) {
+      return subType.type == superType.type;
+    }
+
+    if (!subType.isMutable && !superType.isMutable) {
+      return StorageType::isSubTypeOf(subType.type, superType.type);
+    }
+
+    return false;
+  }
+};
+
+using FieldTypeVector = Vector<FieldType, 0, SystemAllocPolicy>;
+
+using FieldAccessPathVector = Vector<FieldAccessPath, 2, SystemAllocPolicy>;
+using InlineTraceOffsetVector = Vector<uint32_t, 2, SystemAllocPolicy>;
+using OutlineTraceOffsetVector = Vector<uint32_t, 0, SystemAllocPolicy>;
+
+class StructType {
+ public:
+  FieldTypeVector fields_;
+  FieldAccessPathVector fieldAccessPaths_;
+
+  InlineTraceOffsetVector inlineTraceOffsets_;
+  OutlineTraceOffsetVector outlineTraceOffsets_;
+
+  uint32_t totalSizeOOL_;
+  uint32_t oolPointerOffset_;
+
+  uint32_t totalSizeIL_;
+  uint8_t payloadOffsetIL_;
+
+  gc::AllocKind allocKind_;
+
+  bool isDefaultable_;
+
+  static const uint32_t InvalidOffset = 0xFFFFFFFF;
+
+  StructType()
+      : totalSizeOOL_(0),
+        oolPointerOffset_(InvalidOffset),
+        totalSizeIL_(0),
+        payloadOffsetIL_(0),
+        allocKind_(gc::AllocKind::INVALID),
+        isDefaultable_(false) {}
+
+  explicit StructType(FieldTypeVector&& fields)
+      : fields_(std::move(fields)),
+        totalSizeOOL_(0),
+        oolPointerOffset_(InvalidOffset),
+        totalSizeIL_(0),
+        payloadOffsetIL_(0),
+        allocKind_(gc::AllocKind::INVALID),
+        isDefaultable_(false) {
+    MOZ_RELEASE_ASSERT(fields_.length() <= MaxStructFields);
+  }
+
+  StructType(StructType&&) = default;
+  StructType& operator=(StructType&&) = default;
+
+  [[nodiscard]] bool init();
+
+  bool isDefaultable() const { return isDefaultable_; }
+
+  bool hasOOL() const { return totalSizeOOL_ > 0; }
+
+  HashNumber hash(const RecGroup* recGroup) const {
+    HashNumber hn = 0;
+    for (const FieldType& field : fields_) {
+      hn = mozilla::AddToHash(hn, field.hash(recGroup));
+    }
+    return hn;
+  }
+
+  static bool isoEquals(const RecGroup* lhsRecGroup, const StructType& lhs,
+                        const RecGroup* rhsRecGroup, const StructType& rhs) {
+    if (lhs.fields_.length() != rhs.fields_.length()) {
+      return false;
+    }
+    for (uint32_t i = 0; i < lhs.fields_.length(); i++) {
+      const FieldType& lhsField = lhs.fields_[i];
+      const FieldType& rhsField = rhs.fields_[i];
+      if (!FieldType::isoEquals(lhsRecGroup, lhsField, rhsRecGroup, rhsField)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static bool canBeSubTypeOf(const StructType& subType,
+                             const StructType& superType) {
+    if (subType.fields_.length() < superType.fields_.length()) {
+      return false;
+    }
+
+    for (uint32_t i = 0; i < superType.fields_.length(); i++) {
+      if (!FieldType::canBeSubTypeOf(subType.fields_[i],
+                                     superType.fields_[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static bool createImmutable(const ValTypeVector& types, StructType* struct_);
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  WASM_DECLARE_FRIEND_SERIALIZE(StructType);
+};
+
+using StructTypeVector = Vector<StructType, 0, SystemAllocPolicy>;
+
+
+class ArrayType {
+ public:
+  FieldType fieldType_;
+
+ public:
+  ArrayType() = default;
+  ArrayType(StorageType elementType, bool isMutable)
+      : fieldType_(FieldType(elementType, isMutable)) {}
+
+  ArrayType(const ArrayType&) = default;
+  ArrayType& operator=(const ArrayType&) = default;
+
+  ArrayType(ArrayType&&) = default;
+  ArrayType& operator=(ArrayType&&) = default;
+
+  StorageType elementType() const { return fieldType_.type; }
+  bool isMutable() const { return fieldType_.isMutable; }
+  bool isDefaultable() const { return elementType().isDefaultable(); }
+
+  HashNumber hash(const RecGroup* recGroup) const {
+    return fieldType_.hash(recGroup);
+  }
+
+  static bool isoEquals(const RecGroup* lhsRecGroup, const ArrayType& lhs,
+                        const RecGroup* rhsRecGroup, const ArrayType& rhs) {
+    return FieldType::isoEquals(lhsRecGroup, lhs.fieldType_, rhsRecGroup,
+                                rhs.fieldType_);
+  }
+
+  static bool canBeSubTypeOf(const ArrayType& subType,
+                             const ArrayType& superType) {
+    return FieldType::canBeSubTypeOf(subType.fieldType_, superType.fieldType_);
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+};
+
+using ArrayTypeVector = Vector<ArrayType, 0, SystemAllocPolicy>;
+
+#ifdef ENABLE_WASM_JSPI
+
+
+class ContType {
+ public:
+  const TypeDef* funcTypeDef_ = nullptr;
+
+ public:
+  ContType() = default;
+  explicit ContType(const TypeDef* funcTypeDef) : funcTypeDef_(funcTypeDef) {
+  }
+
+  ContType(const ContType&) = default;
+  ContType& operator=(const ContType&) = default;
+
+  ContType(ContType&&) = default;
+  ContType& operator=(ContType&&) = default;
+
+  const TypeDef& funcTypeDef() const { return *funcTypeDef_; }
+  const FuncType& funcType() const;
+  const ValTypeVector& args() const { return funcType().args(); }
+  const ValTypeVector& results() const { return funcType().results(); }
+
+  HashNumber hash(const RecGroup* recGroup) const;
+
+  static bool isoEquals(const RecGroup* lhsRecGroup, const ContType& lhs,
+                        const RecGroup* rhsRecGroup, const ContType& rhs);
+
+  static bool canBeSubTypeOf(const ContType& subType,
+                             const ContType& superType);
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+};
+
+using ContTypeVector = Vector<ContType, 0, SystemAllocPolicy>;
+
+#endif  // ENABLE_WASM_JSPI
+
+
+class SuperTypeVector {
+  SuperTypeVector() : typeDef_(nullptr), length_(0) {}
+
+  const TypeDef* typeDef_;
+
+  uint32_t subTypingDepth_;
+
+  uint32_t length_;
+
+ public:
+  const SuperTypeVector* types_[0];
+
+  [[nodiscard]] static const SuperTypeVector* createMultipleForRecGroup(
+      RecGroup* recGroup);
+
+  const TypeDef* typeDef() const { return typeDef_; }
+
+  uint32_t length() const { return length_; }
+
+  const SuperTypeVector* type(size_t index) const {
+    MOZ_RELEASE_ASSERT(index < length_);
+    return types_[index];
+  }
+
+  static size_t lengthForTypeDef(const TypeDef& typeDef);
+  static size_t byteSizeForTypeDef(const TypeDef& typeDef);
+
+  static size_t offsetOfSubTypingDepth() {
+    return offsetof(SuperTypeVector, subTypingDepth_);
+  }
+  static size_t offsetOfLength() { return offsetof(SuperTypeVector, length_); }
+  static size_t offsetOfSelfTypeDef() {
+    return offsetof(SuperTypeVector, typeDef_);
+  };
+  static size_t offsetOfSTVInVector(uint32_t subTypingDepth);
+};
+
+static_assert(offsetof(SuperTypeVector, types_) == sizeof(SuperTypeVector));
+
+
+
+enum class TypeDefKind : uint8_t {
+  None = 0,
+  Func,
+  Struct,
+  Array,
+#ifdef ENABLE_WASM_JSPI
+  Cont,
+#endif
+};
+
+class TypeDef {
+  uint32_t offsetToRecGroup_;
+
+  const SuperTypeVector* superTypeVector_;
+
+  const TypeDef* superTypeDef_;
+  uint16_t subTypingDepth_;
+  bool isFinal_;
+  TypeDefKind kind_;
+  union {
+    FuncType funcType_;
+    StructType structType_;
+    ArrayType arrayType_;
+#ifdef ENABLE_WASM_JSPI
+    ContType contType_;
+#endif
+  };
+
+  void setRecGroup(RecGroup* recGroup) {
+    uintptr_t recGroupAddr = (uintptr_t)recGroup;
+    uintptr_t typeDefAddr = (uintptr_t)this;
+    MOZ_RELEASE_ASSERT(typeDefAddr > recGroupAddr);
+    MOZ_RELEASE_ASSERT(typeDefAddr - recGroupAddr <= UINT32_MAX);
+    offsetToRecGroup_ = typeDefAddr - recGroupAddr;
+  }
+
+ public:
+  explicit TypeDef(RecGroup* recGroup)
+      : offsetToRecGroup_(0),
+        superTypeVector_(nullptr),
+        superTypeDef_(nullptr),
+        subTypingDepth_(0),
+        isFinal_(true),
+        kind_(TypeDefKind::None) {
+    setRecGroup(recGroup);
+  }
+
+  ~TypeDef() {
+    switch (kind_) {
+      case TypeDefKind::Func:
+        funcType_.~FuncType();
+        break;
+      case TypeDefKind::Struct:
+        structType_.~StructType();
+        break;
+      case TypeDefKind::Array:
+        arrayType_.~ArrayType();
+        break;
+#ifdef ENABLE_WASM_JSPI
+      case TypeDefKind::Cont:
+        contType_.~ContType();
+        break;
+#endif
+      case TypeDefKind::None:
+        break;
+    }
+  }
+
+  TypeDef& operator=(FuncType&& that) noexcept {
+    MOZ_RELEASE_ASSERT(isNone());
+    kind_ = TypeDefKind::Func;
+    new (&funcType_) FuncType(std::move(that));
+    return *this;
+  }
+
+  TypeDef& operator=(StructType&& that) noexcept {
+    MOZ_RELEASE_ASSERT(isNone());
+    kind_ = TypeDefKind::Struct;
+    new (&structType_) StructType(std::move(that));
+    return *this;
+  }
+
+  TypeDef& operator=(ArrayType&& that) noexcept {
+    MOZ_RELEASE_ASSERT(isNone());
+    kind_ = TypeDefKind::Array;
+    new (&arrayType_) ArrayType(std::move(that));
+    return *this;
+  }
+
+#ifdef ENABLE_WASM_JSPI
+  TypeDef& operator=(ContType&& that) noexcept {
+    MOZ_RELEASE_ASSERT(isNone());
+    kind_ = TypeDefKind::Cont;
+    new (&contType_) ContType(std::move(that));
+    return *this;
+  }
+#endif
+
+  const SuperTypeVector* superTypeVector() const { return superTypeVector_; }
+
+  void setSuperTypeVector(const SuperTypeVector* superTypeVector) {
+    superTypeVector_ = superTypeVector;
+  }
+
+  static size_t offsetOfKind() { return offsetof(TypeDef, kind_); }
+
+  static size_t offsetOfSuperTypeVector() {
+    return offsetof(TypeDef, superTypeVector_);
+  }
+
+  static size_t offsetOfSubTypingDepth() {
+    return offsetof(TypeDef, subTypingDepth_);
+  }
+
+  const TypeDef* superTypeDef() const { return superTypeDef_; }
+
+  bool isFinal() const { return isFinal_; }
+
+  uint16_t subTypingDepth() const { return subTypingDepth_; }
+
+  const RecGroup& recGroup() const {
+    uintptr_t typeDefAddr = (uintptr_t)this;
+    uintptr_t recGroupAddr = typeDefAddr - offsetToRecGroup_;
+    return *(const RecGroup*)recGroupAddr;
+  }
+
+  TypeDefKind kind() const { return kind_; }
+
+  bool isNone() const { return kind_ == TypeDefKind::None; }
+
+  bool isFuncType() const { return kind_ == TypeDefKind::Func; }
+
+  bool isStructType() const { return kind_ == TypeDefKind::Struct; }
+
+  bool isArrayType() const { return kind_ == TypeDefKind::Array; }
+
+#ifdef ENABLE_WASM_JSPI
+  bool isContType() const { return kind_ == TypeDefKind::Cont; }
+#endif
+
+  const FuncType& funcType() const {
+    MOZ_RELEASE_ASSERT(isFuncType());
+    return funcType_;
+  }
+
+  FuncType& funcType() {
+    MOZ_RELEASE_ASSERT(isFuncType());
+    return funcType_;
+  }
+
+  const StructType& structType() const {
+    MOZ_RELEASE_ASSERT(isStructType());
+    return structType_;
+  }
+
+  StructType& structType() {
+    MOZ_RELEASE_ASSERT(isStructType());
+    return structType_;
+  }
+
+  const ArrayType& arrayType() const {
+    MOZ_RELEASE_ASSERT(isArrayType());
+    return arrayType_;
+  }
+
+  ArrayType& arrayType() {
+    MOZ_RELEASE_ASSERT(isArrayType());
+    return arrayType_;
+  }
+
+#ifdef ENABLE_WASM_JSPI
+  const ContType& contType() const {
+    MOZ_RELEASE_ASSERT(isContType());
+    return contType_;
+  }
+
+  ContType& contType() {
+    MOZ_RELEASE_ASSERT(isContType());
+    return contType_;
+  }
+#endif
+
+  static inline uintptr_t forIsoEquals(const TypeDef* typeDef,
+                                       const RecGroup* recGroup);
+
+  HashNumber hash() const {
+    HashNumber hn = HashNumber(kind_);
+    hn = mozilla::AddToHash(hn,
+                            TypeDef::forIsoEquals(superTypeDef_, &recGroup()));
+    hn = mozilla::AddToHash(hn, isFinal_);
+    switch (kind_) {
+      case TypeDefKind::Func:
+        hn = mozilla::AddToHash(hn, funcType_.hash(&recGroup()));
+        break;
+      case TypeDefKind::Struct:
+        hn = mozilla::AddToHash(hn, structType_.hash(&recGroup()));
+        break;
+      case TypeDefKind::Array:
+        hn = mozilla::AddToHash(hn, arrayType_.hash(&recGroup()));
+        break;
+#ifdef ENABLE_WASM_JSPI
+      case TypeDefKind::Cont:
+        hn = mozilla::AddToHash(hn, contType_.hash(&recGroup()));
+        break;
+#endif
+      case TypeDefKind::None:
+        break;
+    }
+    return hn;
+  }
+
+  static bool isoEquals(const TypeDef& lhs, const TypeDef& rhs) {
+    if (lhs.kind_ != rhs.kind_) {
+      return false;
+    }
+    if (lhs.isFinal_ != rhs.isFinal_) {
+      return false;
+    }
+    if (TypeDef::forIsoEquals(lhs.superTypeDef_, &lhs.recGroup()) !=
+        TypeDef::forIsoEquals(rhs.superTypeDef_, &rhs.recGroup())) {
+      return false;
+    }
+    switch (lhs.kind_) {
+      case TypeDefKind::Func:
+        return FuncType::isoEquals(&lhs.recGroup(), lhs.funcType_,
+                                   &rhs.recGroup(), rhs.funcType_);
+      case TypeDefKind::Struct:
+        return StructType::isoEquals(&lhs.recGroup(), lhs.structType_,
+                                     &rhs.recGroup(), rhs.structType_);
+      case TypeDefKind::Array:
+        return ArrayType::isoEquals(&lhs.recGroup(), lhs.arrayType_,
+                                    &rhs.recGroup(), rhs.arrayType_);
+#ifdef ENABLE_WASM_JSPI
+      case TypeDefKind::Cont:
+        return ContType::isoEquals(&lhs.recGroup(), lhs.contType_,
+                                   &rhs.recGroup(), rhs.contType_);
+#endif
+      case TypeDefKind::None:
+        MOZ_CRASH("can't match TypeDefKind::None");
+    }
+    return false;
+  }
+
+  static bool canBeSubTypeOf(const TypeDef* subType, const TypeDef* superType) {
+    if (subType->kind() != superType->kind()) {
+      return false;
+    }
+
+    if (superType->isFinal()) {
+      return false;
+    }
+
+    switch (subType->kind_) {
+      case TypeDefKind::Func:
+        return FuncType::canBeSubTypeOf(subType->funcType_,
+                                        superType->funcType_);
+      case TypeDefKind::Struct:
+        return StructType::canBeSubTypeOf(subType->structType_,
+                                          superType->structType_);
+      case TypeDefKind::Array:
+        return ArrayType::canBeSubTypeOf(subType->arrayType_,
+                                         superType->arrayType_);
+#ifdef ENABLE_WASM_JSPI
+      case TypeDefKind::Cont:
+        return ContType::canBeSubTypeOf(subType->contType_,
+                                        superType->contType_);
+#endif
+      case TypeDefKind::None:
+        MOZ_CRASH();
+    }
+    return false;
+  }
+
+  void setSuperTypeDef(const TypeDef* superTypeDef) {
+    superTypeDef_ = superTypeDef;
+    subTypingDepth_ = superTypeDef_->subTypingDepth_ + 1;
+  }
+
+  void setFinal(const bool value) { isFinal_ = value; }
+
+  static bool isSubTypeOf(const TypeDef* subTypeDef,
+                          const TypeDef* superTypeDef) {
+    if (MOZ_LIKELY(subTypeDef == superTypeDef)) {
+      return true;
+    }
+    const SuperTypeVector* subSTV = subTypeDef->superTypeVector();
+    const SuperTypeVector* superSTV = superTypeDef->superTypeVector();
+
+    if (!subSTV || !superSTV) {
+      while (subTypeDef) {
+        if (subTypeDef == superTypeDef) {
+          return true;
+        }
+        subTypeDef = subTypeDef->superTypeDef();
+      }
+      return false;
+    }
+
+    MOZ_RELEASE_ASSERT(subSTV && superSTV && subSTV->typeDef() == subTypeDef &&
+                       superSTV->typeDef() == superTypeDef);
+
+    uint32_t subTypingDepth = superTypeDef->subTypingDepth();
+    if (subTypingDepth >= subSTV->length()) {
+      return false;
+    }
+
+    return subSTV->type(subTypingDepth) == superSTV;
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  WASM_DECLARE_FRIEND_SERIALIZE(TypeDef);
+
+  inline void AddRef() const;
+  inline void Release() const;
+};
+
+using SharedTypeDef = RefPtr<const TypeDef>;
+using MutableTypeDef = RefPtr<TypeDef>;
+
+using TypeDefVector = Vector<TypeDef, 0, SystemAllocPolicy>;
+using TypeDefPtrVector = Vector<const TypeDef*, 0, SystemAllocPolicy>;
+
+using TypeDefPtrToIndexMap =
+    HashMap<const TypeDef*, uint32_t, PointerHasher<const TypeDef*>,
+            SystemAllocPolicy>;
+
+
+class RecGroup : public AtomicRefCounted<RecGroup> {
+  bool finalizedTypes_;
+  uint32_t numTypes_;
+  const SuperTypeVector* vectors_;
+  TypeDef types_[0];
+
+  friend class TypeContext;
+
+  explicit RecGroup(uint32_t numTypes)
+      : finalizedTypes_(false), numTypes_(numTypes), vectors_(nullptr) {}
+
+  static constexpr size_t sizeOfRecGroup(uint32_t numTypes) {
+    static_assert(offsetof(RecGroup, types_) + sizeof(TypeDef) * MaxTypes <=
+                  UINT32_MAX);
+    static_assert(MaxTypes <= SIZE_MAX / sizeof(TypeDef));
+    return sizeof(RecGroup) + sizeof(TypeDef) * numTypes;
+  }
+
+  static RefPtr<RecGroup> allocate(uint32_t numTypes) {
+    MOZ_RELEASE_ASSERT(numTypes <= MaxTypes);
+
+    RecGroup* recGroup = (RecGroup*)js_malloc(sizeOfRecGroup(numTypes));
+    if (!recGroup) {
+      return nullptr;
+    }
+
+    new (recGroup) RecGroup(numTypes);
+    for (uint32_t i = 0; i < numTypes; i++) {
+      new (recGroup->types_ + i) TypeDef(recGroup);
+    }
+    return recGroup;
+  }
+
+  [[nodiscard]] bool finalizeDefinitions() {
+    MOZ_ASSERT(!finalizedTypes_);
+    vectors_ = SuperTypeVector::createMultipleForRecGroup(this);
+    if (!vectors_) {
+      return false;
+    }
+    visitReferencedGroups([](const RecGroup* recGroup) { recGroup->AddRef(); });
+    finalizedTypes_ = true;
+    return true;
+  }
+
+  template <typename Visitor>
+  void visitReferencedGroups(Visitor visitor) const {
+    auto visitValType = [this, visitor](ValType type) {
+      if (type.isTypeRef() && &type.typeDef()->recGroup() != this) {
+        visitor(&type.typeDef()->recGroup());
+      }
+    };
+    auto visitStorageType = [this, visitor](StorageType type) {
+      if (type.isTypeRef() && &type.typeDef()->recGroup() != this) {
+        visitor(&type.typeDef()->recGroup());
+      }
+    };
+
+    for (uint32_t i = 0; i < numTypes_; i++) {
+      const TypeDef& typeDef = types_[i];
+
+      if (typeDef.superTypeDef() &&
+          &typeDef.superTypeDef()->recGroup() != this) {
+        visitor(&typeDef.superTypeDef()->recGroup());
+      }
+
+      switch (typeDef.kind()) {
+        case TypeDefKind::Func: {
+          const FuncType& funcType = typeDef.funcType();
+          MOZ_RELEASE_ASSERT(funcType.args().length() <= MaxParams);
+          MOZ_RELEASE_ASSERT(funcType.results().length() <= MaxResults);
+          for (auto type : funcType.args()) {
+            visitValType(type);
+          }
+          for (auto type : funcType.results()) {
+            visitValType(type);
+          }
+          break;
+        }
+        case TypeDefKind::Struct: {
+          const StructType& structType = typeDef.structType();
+          MOZ_RELEASE_ASSERT(structType.fields_.length() <= MaxStructFields);
+          for (const auto& field : structType.fields_) {
+            visitStorageType(field.type);
+          }
+          break;
+        }
+        case TypeDefKind::Array: {
+          const ArrayType& arrayType = typeDef.arrayType();
+          visitStorageType(arrayType.elementType());
+          break;
+        }
+#ifdef ENABLE_WASM_JSPI
+        case TypeDefKind::Cont: {
+          const ContType& contType = typeDef.contType();
+          if (&contType.funcTypeDef().recGroup() != this) {
+            visitor(&contType.funcTypeDef().recGroup());
+          }
+          break;
+        }
+#endif
+        case TypeDefKind::None: {
+          MOZ_CRASH();
+        }
+      }
+    }
+  }
+
+ public:
+  ~RecGroup() {
+    if (finalizedTypes_) {
+      finalizedTypes_ = false;
+      visitReferencedGroups(
+          [](const RecGroup* recGroup) { recGroup->Release(); });
+    }
+
+    if (vectors_) {
+      js_free((void*)vectors_);
+      vectors_ = nullptr;
+    }
+
+    for (uint32_t i = 0; i < numTypes_; i++) {
+      type(i).~TypeDef();
+    }
+  }
+
+  RecGroup& operator=(const RecGroup&) = delete;
+  RecGroup& operator=(RecGroup&&) = delete;
+
+  TypeDef& type(uint32_t groupTypeIndex) {
+    MOZ_ASSERT(!finalizedTypes_);
+    return types_[groupTypeIndex];
+  }
+  const TypeDef& type(uint32_t groupTypeIndex) const {
+    return types_[groupTypeIndex];
+  }
+
+  uint32_t numTypes() const { return numTypes_; }
+
+  uint32_t indexOf(const TypeDef* typeDef) const {
+    MOZ_RELEASE_ASSERT(typeDef >= types_);
+    size_t groupTypeIndex = (size_t)(typeDef - types_);
+    MOZ_RELEASE_ASSERT(groupTypeIndex < numTypes());
+    return (uint32_t)groupTypeIndex;
+  }
+
+  HashNumber hash() const {
+    HashNumber hn = 0;
+    for (uint32_t i = 0; i < numTypes(); i++) {
+      hn = mozilla::AddToHash(hn, types_[i].hash());
+    }
+    return hn;
+  }
+
+  static bool isoEquals(const RecGroup& lhs, const RecGroup& rhs) {
+    if (lhs.numTypes() != rhs.numTypes()) {
+      return false;
+    }
+    for (uint32_t i = 0; i < lhs.numTypes(); i++) {
+      if (!TypeDef::isoEquals(lhs.type(i), rhs.type(i))) {
+        return false;
+      }
+    }
+    return true;
+  }
+};
+
+extern void PurgeCanonicalTypes();
+
+using SharedRecGroup = RefPtr<const RecGroup>;
+using MutableRecGroup = RefPtr<RecGroup>;
+using SharedRecGroupVector = Vector<SharedRecGroup, 0, SystemAllocPolicy>;
+
+
+class TypeContext : public AtomicRefCounted<TypeContext> {
+  MutableRecGroup pendingRecGroup_;
+  SharedRecGroupVector recGroups_;
+  TypeDefPtrVector types_;
+  TypeDefPtrToIndexMap moduleIndices_;
+
+  static SharedRecGroup canonicalizeGroup(SharedRecGroup recGroup);
+
+ public:
+  TypeContext() = default;
+  ~TypeContext();
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return types_.sizeOfExcludingThis(mallocSizeOf) +
+           moduleIndices_.shallowSizeOfExcludingThis(mallocSizeOf);
+  }
+
+  TypeContext(const TypeContext&) = delete;
+  TypeContext& operator=(const TypeContext&) = delete;
+  TypeContext(TypeContext&&) = delete;
+  TypeContext& operator=(TypeContext&&) = delete;
+
+  [[nodiscard]] MutableRecGroup startRecGroup(uint32_t numTypes) {
+    MOZ_ASSERT(!pendingRecGroup_);
+
+    MutableRecGroup recGroup = RecGroup::allocate(numTypes);
+    if (!recGroup || !addRecGroup(recGroup)) {
+      return nullptr;
+    }
+
+    pendingRecGroup_ = recGroup;
+    return recGroup;
+  }
+
+  [[nodiscard]] bool endRecGroup() {
+    MOZ_ASSERT(pendingRecGroup_);
+    MutableRecGroup recGroup = pendingRecGroup_;
+    pendingRecGroup_ = nullptr;
+
+    if (!recGroup->finalizeDefinitions()) {
+      return false;
+    }
+
+    SharedRecGroup canonicalRecGroup = canonicalizeGroup(recGroup);
+    if (!canonicalRecGroup) {
+      return false;
+    }
+
+    if (canonicalRecGroup == recGroup) {
+      return true;
+    }
+
+    recGroups_.back() = canonicalRecGroup;
+
+    MOZ_ASSERT(recGroup->numTypes() == canonicalRecGroup->numTypes());
+    for (uint32_t groupTypeIndex = 0; groupTypeIndex < recGroup->numTypes();
+         groupTypeIndex++) {
+      uint32_t typeIndex = length() - recGroup->numTypes() + groupTypeIndex;
+      const TypeDef* oldTypeDef = types_[typeIndex];
+      const TypeDef* canonTypeDef = &canonicalRecGroup->type(groupTypeIndex);
+
+      types_[typeIndex] = canonTypeDef;
+      moduleIndices_.remove(oldTypeDef);
+
+      auto canonTypeIndexEntry = moduleIndices_.lookupForAdd(canonTypeDef);
+      if (!canonTypeIndexEntry &&
+          !moduleIndices_.add(canonTypeIndexEntry, canonTypeDef, typeIndex)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  [[nodiscard]] bool addRecGroup(SharedRecGroup recGroup) {
+    MOZ_ASSERT(!pendingRecGroup_);
+
+    if (!recGroups_.append(recGroup)) {
+      return false;
+    }
+
+    for (uint32_t groupTypeIndex = 0; groupTypeIndex < recGroup->numTypes();
+         groupTypeIndex++) {
+      const TypeDef* typeDef = &recGroup->type(groupTypeIndex);
+      uint32_t typeIndex = types_.length();
+      if (!types_.append(typeDef) || !moduleIndices_.put(typeDef, typeIndex)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool clone(const TypeContext& other) {
+    for (const SharedRecGroup& rg : other.groups()) {
+      if (!addRecGroup(rg)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  template <typename T>
+  [[nodiscard]] const TypeDef* addType(T&& type) {
+    MutableRecGroup recGroup = startRecGroup(1);
+    if (!recGroup) {
+      return nullptr;
+    }
+    recGroup->type(0) = std::forward<T>(type);
+    if (!endRecGroup()) {
+      return nullptr;
+    }
+    return &this->type(length() - 1);
+  }
+
+  template <typename T>
+  [[nodiscard]] static SharedTypeDef canonicalizeSingleType(T&& type) {
+    MutableRecGroup recGroup = RecGroup::allocate(1);
+    if (!recGroup) {
+      return nullptr;
+    }
+    recGroup->type(0) = std::forward<T>(type);
+    if (!recGroup->finalizeDefinitions()) {
+      return nullptr;
+    }
+
+    SharedRecGroup canonical = canonicalizeGroup(recGroup);
+    if (!canonical) {
+      return nullptr;
+    }
+    return &canonical->type(0);
+  }
+
+  const TypeDef& type(uint32_t index) const { return *types_[index]; }
+  const TypeDef& operator[](uint32_t index) const { return *types_[index]; }
+
+  bool empty() const { return types_.empty(); }
+  uint32_t length() const { return types_.length(); }
+
+  const SharedRecGroupVector& groups() const { return recGroups_; }
+
+
+  uint32_t indexOf(const TypeDef& typeDef) const {
+    auto moduleIndex = moduleIndices_.readonlyThreadsafeLookup(&typeDef);
+    MOZ_RELEASE_ASSERT(moduleIndex.found());
+    return moduleIndex->value();
+  }
+};
+
+using SharedTypeContext = RefPtr<const TypeContext>;
+using MutableTypeContext = RefPtr<TypeContext>;
+
+
+#ifdef ENABLE_WASM_JSPI
+
+inline HashNumber ContType::hash(const RecGroup* recGroup) const {
+  return funcTypeDef_->hash();
+}
+
+inline bool ContType::isoEquals(const RecGroup* lhsRecGroup,
+                                const ContType& lhs,
+                                const RecGroup* rhsRecGroup,
+                                const ContType& rhs) {
+  return TypeDef::forIsoEquals(lhs.funcTypeDef_, lhsRecGroup) ==
+         TypeDef::forIsoEquals(rhs.funcTypeDef_, rhsRecGroup);
+}
+
+inline bool ContType::canBeSubTypeOf(const ContType& subType,
+                                     const ContType& superType) {
+  return TypeDef::isSubTypeOf(subType.funcTypeDef_, superType.funcTypeDef_);
+}
+
+#endif  // ENABLE_WASM_JSPI
+
+inline uintptr_t TypeDef::forIsoEquals(const TypeDef* typeDef,
+                                       const RecGroup* recGroup) {
+  static_assert(alignof(TypeDef) > 1);
+  MOZ_ASSERT((uintptr_t(typeDef) & 0x1) == 0);
+
+  if (typeDef && &typeDef->recGroup() == recGroup) {
+    static_assert(MaxTypes <= 0x7FFFFFFF);
+    return (uintptr_t(recGroup->indexOf(typeDef)) << 1) | 0x1;
+  }
+
+  return uintptr_t(typeDef);
+}
+
+inline IsoEqualsTypeCode IsoEqualsTypeCode::forIsoEquals(
+    PackedTypeCode ptc, const RecGroup* recGroup) {
+  IsoEqualsTypeCode mtc = {};
+  mtc.typeCode = PackedRepr(ptc.typeCode());
+  mtc.typeRef = TypeDef::forIsoEquals(ptc.typeDef(), recGroup);
+  mtc.nullable = ptc.isNullable();
+  return mtc;
+}
+
+template <class T>
+void PackedType<T>::AddRef() const {
+  if (!isRefType()) {
+    return;
+  }
+  refType().AddRef();
+}
+template <class T>
+void PackedType<T>::Release() const {
+  if (!isRefType()) {
+    return;
+  }
+  refType().Release();
+}
+
+void RefType::AddRef() const {
+  if (!isTypeRef()) {
+    return;
+  }
+  typeDef()->AddRef();
+}
+void RefType::Release() const {
+  if (!isTypeRef()) {
+    return;
+  }
+  typeDef()->Release();
+}
+
+void TypeDef::AddRef() const { recGroup().AddRef(); }
+void TypeDef::Release() const { recGroup().Release(); }
+
+inline RefTypeHierarchy RefType::hierarchy() const {
+  switch (kind()) {
+    case RefType::Func:
+    case RefType::NoFunc:
+      return RefTypeHierarchy::Func;
+    case RefType::Extern:
+    case RefType::NoExtern:
+      return RefTypeHierarchy::Extern;
+    case RefType::Exn:
+    case RefType::NoExn:
+      return RefTypeHierarchy::Exn;
+#ifdef ENABLE_WASM_JSPI
+    case RefType::Cont:
+    case RefType::NoCont:
+      return RefTypeHierarchy::Cont;
+#endif
+    case RefType::Any:
+    case RefType::None:
+    case RefType::I31:
+    case RefType::Eq:
+    case RefType::Struct:
+    case RefType::Array:
+      return RefTypeHierarchy::Any;
+    case RefType::TypeRef:
+      switch (typeDef()->kind()) {
+        case TypeDefKind::Struct:
+        case TypeDefKind::Array:
+          return RefTypeHierarchy::Any;
+        case TypeDefKind::Func:
+          return RefTypeHierarchy::Func;
+#ifdef ENABLE_WASM_JSPI
+        case TypeDefKind::Cont:
+          return RefTypeHierarchy::Cont;
+#endif
+        case TypeDefKind::None:
+          MOZ_CRASH();
+      }
+  }
+  MOZ_CRASH("switch is exhaustive");
+}
+
+inline TableRepr RefType::tableRepr() const {
+  switch (hierarchy()) {
+    case RefTypeHierarchy::Any:
+    case RefTypeHierarchy::Extern:
+    case RefTypeHierarchy::Exn:
+#ifdef ENABLE_WASM_JSPI
+    case RefTypeHierarchy::Cont:
+#endif
+      return TableRepr::Ref;
+    case RefTypeHierarchy::Func:
+      return TableRepr::Func;
+  }
+  MOZ_CRASH("switch is exhaustive");
+}
+
+inline bool RefType::isFuncHierarchy() const {
+  return hierarchy() == RefTypeHierarchy::Func;
+}
+inline bool RefType::isExternHierarchy() const {
+  return hierarchy() == RefTypeHierarchy::Extern;
+}
+inline bool RefType::isAnyHierarchy() const {
+  return hierarchy() == RefTypeHierarchy::Any;
+}
+inline bool RefType::isExnHierarchy() const {
+  return hierarchy() == RefTypeHierarchy::Exn;
+}
+#ifdef ENABLE_WASM_JSPI
+inline bool RefType::isContHierarchy() const {
+  return hierarchy() == RefTypeHierarchy::Cont;
+}
+#endif
+inline bool RefType::isInhabitable() const {
+  return !(isRefBottom() && !isNullable());
+}
+
+inline bool RefType::isSubTypeOf(RefType subType, RefType superType) {
+  if (subType == superType) {
+    return true;
+  }
+
+  if (subType.isNullable() && !superType.isNullable()) {
+    return false;
+  }
+
+  if (!subType.isTypeRef() && !superType.isTypeRef() &&
+      subType.kind() == superType.kind()) {
+    return true;
+  }
+
+  if (subType.isEq() && superType.isAny()) {
+    return true;
+  }
+
+  if (subType.isI31() && (superType.isAny() || superType.isEq())) {
+    return true;
+  }
+
+  if ((subType.isStruct() || subType.isArray()) &&
+      (superType.isAny() || superType.isEq())) {
+    return true;
+  }
+
+  if (subType.isTypeRef() && subType.typeDef()->isStructType() &&
+      (superType.isAny() || superType.isEq() || superType.isStruct())) {
+    return true;
+  }
+
+  if (subType.isTypeRef() && subType.typeDef()->isArrayType() &&
+      (superType.isAny() || superType.isEq() || superType.isArray())) {
+    return true;
+  }
+
+  if (subType.isTypeRef() && subType.typeDef()->isFuncType() &&
+      superType.isFunc()) {
+    return true;
+  }
+
+#ifdef ENABLE_WASM_JSPI
+  if (subType.isTypeRef() && subType.typeDef()->isContType() &&
+      superType.isCont()) {
+    return true;
+  }
+#endif
+
+  if (subType.isTypeRef() && superType.isTypeRef()) {
+    return TypeDef::isSubTypeOf(subType.typeDef(), superType.typeDef());
+  }
+
+  if (subType.isNoFunc() && superType.hierarchy() == RefTypeHierarchy::Func) {
+    return true;
+  }
+
+  if (subType.isNoExtern() &&
+      superType.hierarchy() == RefTypeHierarchy::Extern) {
+    return true;
+  }
+
+  if (subType.isNone() && superType.hierarchy() == RefTypeHierarchy::Any) {
+    return true;
+  }
+
+  if (subType.isNoExn() && superType.hierarchy() == RefTypeHierarchy::Exn) {
+    return true;
+  }
+
+#ifdef ENABLE_WASM_JSPI
+  if (subType.isNoCont() && superType.hierarchy() == RefTypeHierarchy::Cont) {
+    return true;
+  }
+#endif
+
+  return false;
+}
+
+inline bool RefType::castPossible(RefType sourceType, RefType destType) {
+  if (sourceType.isNullable() && destType.isNullable()) {
+    return true;
+  }
+
+  if (sourceType.isRefBottom() || destType.isRefBottom()) {
+    return false;
+  }
+
+  RefType sourceNonNull = sourceType.withIsNullable(false);
+  RefType destNonNull = destType.withIsNullable(false);
+  return RefType::isSubTypeOf(sourceNonNull, destNonNull) ||
+         RefType::isSubTypeOf(destNonNull, sourceNonNull);
+}
+
+
+}  
+}  
+
+#endif  // wasm_type_def_h

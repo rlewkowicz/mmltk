@@ -1,0 +1,568 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_ReflowInput_h
+#define mozilla_ReflowInput_h
+
+#include <algorithm>
+
+#include "LayoutConstants.h"
+#include "ReflowOutput.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/LayoutStructs.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/WritingModes.h"
+#include "nsMargin.h"
+#include "nsStyleConsts.h"
+
+class gfxContext;
+class nsFloatManager;
+struct nsHypotheticalPosition;
+class nsIPercentBSizeObserver;
+class nsLineLayout;
+class nsPlaceholderFrame;
+class nsPresContext;
+class nsReflowStatus;
+
+namespace mozilla {
+enum class LayoutFrameType : uint8_t;
+
+template <class NumericType>
+NumericType CSSMinMax(NumericType aValue, NumericType aMinValue,
+                      NumericType aMaxValue) {
+  NumericType result = aValue;
+  if (aMaxValue < result) {
+    result = aMaxValue;
+  }
+  if (aMinValue > result) {
+    result = aMinValue;
+  }
+  return result;
+}
+
+struct SizeComputationInput {
+ public:
+  nsIFrame* const mFrame;
+
+  gfxContext* mRenderingContext;
+
+  AnchorPosResolutionCache* mAnchorPosResolutionCache = nullptr;
+
+  nsMargin ComputedPhysicalMargin() const {
+    return mComputedMargin.GetPhysicalMargin(mWritingMode);
+  }
+  nsMargin ComputedPhysicalBorderPadding() const {
+    return mComputedBorderPadding.GetPhysicalMargin(mWritingMode);
+  }
+  nsMargin ComputedPhysicalBorder() const {
+    return ComputedLogicalBorder(mWritingMode).GetPhysicalMargin(mWritingMode);
+  }
+  nsMargin ComputedPhysicalPadding() const {
+    return mComputedPadding.GetPhysicalMargin(mWritingMode);
+  }
+
+  LogicalMargin ComputedLogicalMargin(WritingMode aWM) const {
+    return mComputedMargin.ConvertTo(aWM, mWritingMode);
+  }
+  LogicalMargin ComputedLogicalBorderPadding(WritingMode aWM) const {
+    return mComputedBorderPadding.ConvertTo(aWM, mWritingMode);
+  }
+  LogicalMargin ComputedLogicalPadding(WritingMode aWM) const {
+    return mComputedPadding.ConvertTo(aWM, mWritingMode);
+  }
+  LogicalMargin ComputedLogicalBorder(WritingMode aWM) const {
+    return (mComputedBorderPadding - mComputedPadding)
+        .ConvertTo(aWM, mWritingMode);
+  }
+
+  void SetComputedLogicalMargin(WritingMode aWM, const LogicalMargin& aMargin) {
+    mComputedMargin = aMargin.ConvertTo(mWritingMode, aWM);
+  }
+  void SetComputedLogicalBorderPadding(WritingMode aWM,
+                                       const LogicalMargin& aBorderPadding) {
+    mComputedBorderPadding = aBorderPadding.ConvertTo(mWritingMode, aWM);
+  }
+  void SetComputedLogicalPadding(WritingMode aWM,
+                                 const LogicalMargin& aPadding) {
+    mComputedPadding = aPadding.ConvertTo(mWritingMode, aWM);
+  }
+
+  WritingMode GetWritingMode() const { return mWritingMode; }
+
+ protected:
+  const WritingMode mWritingMode;
+
+  const bool mIsThemed = false;
+
+  LogicalMargin mComputedMargin;
+
+  LogicalMargin mComputedBorderPadding;
+
+  LogicalMargin mComputedPadding;
+
+ public:
+  SizeComputationInput(
+      nsIFrame* aFrame, gfxContext* aRenderingContext,
+      AnchorPosResolutionCache* aAnchorPosResolutionCache = nullptr);
+
+  SizeComputationInput(nsIFrame* aFrame, gfxContext* aRenderingContext,
+                       WritingMode aContainingBlockWritingMode,
+                       nscoord aContainingBlockISize,
+                       const Maybe<LogicalMargin>& aBorder = Nothing(),
+                       const Maybe<LogicalMargin>& aPadding = Nothing());
+
+ private:
+  bool ComputeMargin(WritingMode aCBWM, nscoord aPercentBasis,
+                     LayoutFrameType aFrameType);
+
+  bool ComputePadding(WritingMode aCBWM, nscoord aPercentBasis,
+                      LayoutFrameType aFrameType);
+
+ protected:
+  void InitOffsets(WritingMode aCBWM, nscoord aPercentBasis,
+                   LayoutFrameType aFrameType, ComputeSizeFlags aFlags,
+                   const Maybe<LogicalMargin>& aBorder,
+                   const Maybe<LogicalMargin>& aPadding,
+                   const nsStyleDisplay* aDisplay = nullptr);
+
+  template <typename SizeOrMaxSize>
+  inline nscoord ComputeISizeValue(const LogicalSize& aContainingBlockSize,
+                                   StyleBoxSizing aBoxSizing,
+                                   const SizeOrMaxSize&) const;
+
+  template <typename SizeOrMaxSize>
+  inline nscoord ComputeBSizeValueHandlingStretch(
+      nscoord aContainingBlockBSize, StyleBoxSizing aBoxSizing,
+      const SizeOrMaxSize& aSize) const;
+
+  nscoord ComputeBSizeValue(nscoord aContainingBlockBSize,
+                            StyleBoxSizing aBoxSizing,
+                            const LengthPercentage& aCoord) const;
+};
+
+struct ReflowInput : public SizeComputationInput {
+  const ReflowInput* mParentReflowInput = nullptr;
+
+  nsFloatManager* mFloatManager = nullptr;
+
+  nsLineLayout* mLineLayout = nullptr;
+
+  const ReflowInput* mCBReflowInput = nullptr;
+
+  nscoord mBlockDelta = 0;
+
+  nscoord AvailableWidth() const { return mAvailableSize.Width(mWritingMode); }
+  nscoord AvailableHeight() const {
+    return mAvailableSize.Height(mWritingMode);
+  }
+  nscoord ComputedWidth() const { return mComputedSize.Width(mWritingMode); }
+  nscoord ComputedHeight() const { return mComputedSize.Height(mWritingMode); }
+  nscoord ComputedMinWidth() const {
+    return mComputedMinSize.Width(mWritingMode);
+  }
+  nscoord ComputedMaxWidth() const {
+    return mComputedMaxSize.Width(mWritingMode);
+  }
+  nscoord ComputedMinHeight() const {
+    return mComputedMinSize.Height(mWritingMode);
+  }
+  nscoord ComputedMaxHeight() const {
+    return mComputedMaxSize.Height(mWritingMode);
+  }
+
+  nscoord AvailableISize() const { return mAvailableSize.ISize(mWritingMode); }
+  nscoord AvailableBSize() const { return mAvailableSize.BSize(mWritingMode); }
+  nscoord ComputedISize() const { return mComputedSize.ISize(mWritingMode); }
+  nscoord ComputedBSize() const { return mComputedSize.BSize(mWritingMode); }
+  nscoord ComputedMinISize() const {
+    return mComputedMinSize.ISize(mWritingMode);
+  }
+  nscoord ComputedMaxISize() const {
+    return mComputedMaxSize.ISize(mWritingMode);
+  }
+  nscoord ComputedMinBSize() const {
+    return mComputedMinSize.BSize(mWritingMode);
+  }
+  nscoord ComputedMaxBSize() const {
+    return mComputedMaxSize.BSize(mWritingMode);
+  }
+
+  void SetAvailableISize(nscoord aAvailableISize) {
+    mAvailableSize.ISize(mWritingMode) = aAvailableISize;
+  }
+  void SetAvailableBSize(nscoord aAvailableBSize) {
+    mAvailableSize.BSize(mWritingMode) = aAvailableBSize;
+  }
+
+  void SetComputedMinISize(nscoord aMinISize) {
+    mComputedMinSize.ISize(mWritingMode) = aMinISize;
+  }
+  void SetComputedMaxISize(nscoord aMaxISize) {
+    mComputedMaxSize.ISize(mWritingMode) = aMaxISize;
+  }
+  void SetComputedMinBSize(nscoord aMinBSize) {
+    mComputedMinSize.BSize(mWritingMode) = aMinBSize;
+  }
+  void SetComputedMaxBSize(nscoord aMaxBSize) {
+    mComputedMaxSize.BSize(mWritingMode) = aMaxBSize;
+  }
+  void SetPercentageBasisInBlockAxis(nscoord aBSize) {
+    mPercentageBasisInBlockAxis = Some(aBSize);
+  }
+
+  LogicalSize AvailableSize() const { return mAvailableSize; }
+  LogicalSize ComputedSize() const { return mComputedSize; }
+
+  template <typename F>
+  LogicalSize ComputedSizeWithBSizeFallback(F&& aFallback) const {
+    auto size = mComputedSize;
+    if (size.BSize(mWritingMode) == NS_UNCONSTRAINEDSIZE) {
+      size.BSize(mWritingMode) = ApplyMinMaxBSize(aFallback());
+    }
+    return size;
+  }
+
+  LogicalSize ComputedMinSize() const { return mComputedMinSize; }
+  LogicalSize ComputedMaxSize() const { return mComputedMaxSize; }
+
+  LogicalSize AvailableSize(WritingMode aWM) const {
+    return AvailableSize().ConvertTo(aWM, mWritingMode);
+  }
+  LogicalSize ComputedSize(WritingMode aWM) const {
+    return ComputedSize().ConvertTo(aWM, mWritingMode);
+  }
+  LogicalSize ComputedMinSize(WritingMode aWM) const {
+    return ComputedMinSize().ConvertTo(aWM, mWritingMode);
+  }
+  LogicalSize ComputedMaxSize(WritingMode aWM) const {
+    return ComputedMaxSize().ConvertTo(aWM, mWritingMode);
+  }
+
+  LogicalSize ComputedSizeWithPadding(WritingMode aWM) const {
+    return ComputedSize(aWM) + ComputedLogicalPadding(aWM).Size(aWM);
+  }
+
+  LogicalSize ComputedSizeWithBorderPadding(WritingMode aWM) const {
+    return ComputedSize(aWM) + ComputedLogicalBorderPadding(aWM).Size(aWM);
+  }
+
+  LogicalSize ComputedSizeWithMarginBorderPadding(WritingMode aWM) const {
+    return ComputedSizeWithBorderPadding(aWM) +
+           ComputedLogicalMargin(aWM).Size(aWM);
+  }
+
+  nsSize ComputedPhysicalSize() const {
+    return mComputedSize.GetPhysicalSize(mWritingMode);
+  }
+
+  nsMargin ComputedPhysicalOffsets() const {
+    return mComputedOffsets.GetPhysicalMargin(mWritingMode);
+  }
+
+  LogicalMargin ComputedLogicalOffsets(WritingMode aWM) const {
+    return mComputedOffsets.ConvertTo(aWM, mWritingMode);
+  }
+
+  void SetComputedLogicalOffsets(WritingMode aWM,
+                                 const LogicalMargin& aOffsets) {
+    mComputedOffsets = aOffsets.ConvertTo(mWritingMode, aWM);
+  }
+
+  nsSize ComputedSizeAsContainerIfConstrained() const;
+
+  nsRect ComputedPhysicalContentBoxRelativeToSelf() const {
+    auto bp = ComputedPhysicalBorderPadding();
+    return nsRect(nsPoint(bp.left, bp.top), ComputedPhysicalSize());
+  }
+
+  WritingMode GetCBWritingMode() const;
+
+  LogicalSize mContainingBlockSize{mWritingMode};
+
+  const nsStyleDisplay* mStyleDisplay = nullptr;
+  const nsStylePosition* mStylePosition = nullptr;
+  const nsStyleBorder* mStyleBorder = nullptr;
+  const nsStyleMargin* mStyleMargin = nullptr;
+
+  BreakType mBreakType = BreakType::Auto;
+
+  nsIPercentBSizeObserver* mPercentBSizeObserver = nullptr;
+
+  nsIFrame** mDiscoveredClearance = nullptr;
+
+  struct Flags {
+    Flags() { memset(this, 0, sizeof(*this)); }
+
+    bool mIsReplaced : 1;
+
+    bool mSpecialBSizeReflow : 1;
+
+    bool mNextInFlowUntouched : 1;
+
+    bool mIsTopOfPage : 1;
+
+    bool mAssumingHScrollbar : 1;
+
+    bool mAssumingVScrollbar : 1;
+
+    bool mIsIResize : 1;
+
+    bool mIsBResize : 1;
+
+    bool mIsBResizeForPercentages : 1;
+
+    bool mTableIsSplittable : 1;
+
+    bool mHeightDependsOnAncestorCell : 1;
+
+    bool mOrthogonalCellFinalReflow : 1;
+
+    bool mIsColumnBalancing : 1;
+
+    bool mIsInLastColumnBalancingReflow : 1;
+
+    bool mIsInFragmentainerMeasuringReflow : 1;
+
+    bool mColumnSetWrapperHasNoBSizeLeft : 1;
+
+    bool mTreatBSizeAsIndefinite : 1;
+
+    bool mDummyParentReflowInput : 1;
+
+    bool mMustReflowPlaceholders : 1;
+
+    bool mStaticPosIsCBOrigin : 1;
+
+    bool mIOffsetsNeedCSSAlign : 1;
+    bool mBOffsetsNeedCSSAlign : 1;
+
+    bool mMovedBlockFragments : 1;
+
+    bool mIsBSizeSetByAspectRatio : 1;
+
+    bool mCanHaveClassABreakpoints : 1;
+
+    bool mShouldApplyTextBoxTrimStart : 1;
+
+    bool mShouldApplyTextBoxTrimAtBlockEnd : 1;
+    bool mShouldApplyTextBoxTrimAtFragmentEnd : 1;
+  };
+  Flags mFlags;
+
+  StyleSizeOverrides mStyleSizeOverrides;
+
+  ComputeSizeFlags mComputeSizeFlags;
+
+  int16_t mReflowDepth = 0;
+
+  bool IsIResize() const { return mFlags.mIsIResize; }
+  bool IsBResize() const { return mFlags.mIsBResize; }
+  bool IsBResizeForWM(WritingMode aWM) const {
+    return aWM.IsOrthogonalTo(mWritingMode) ? mFlags.mIsIResize
+                                            : mFlags.mIsBResize;
+  }
+  bool IsBResizeForPercentagesForWM(WritingMode aWM) const {
+    return !aWM.IsOrthogonalTo(mWritingMode) ? mFlags.mIsBResizeForPercentages
+                                             : IsIResize();
+  }
+  void SetIResize(bool aValue) { mFlags.mIsIResize = aValue; }
+  void SetBResize(bool aValue) { mFlags.mIsBResize = aValue; }
+  void SetBResizeForPercentages(bool aValue) {
+    mFlags.mIsBResizeForPercentages = aValue;
+  }
+
+  enum class InitFlag : uint8_t {
+    DummyParentReflowInput,
+
+    CallerWillInit,
+
+    StaticPosIsCBOrigin,
+  };
+  using InitFlags = EnumSet<InitFlag>;
+
+
+  ReflowInput(nsPresContext* aPresContext, nsIFrame* aFrame,
+              gfxContext* aRenderingContext, const LogicalSize& aAvailableSpace,
+              InitFlags aFlags = {});
+
+  ReflowInput(nsPresContext* aPresContext,
+              const ReflowInput& aParentReflowInput, nsIFrame* aFrame,
+              const LogicalSize& aAvailableSpace,
+              const Maybe<LogicalSize>& aContainingBlockSize = Nothing(),
+              InitFlags aFlags = {},
+              const StyleSizeOverrides& aSizeOverrides = {},
+              ComputeSizeFlags aComputeSizeFlags = {},
+              AnchorPosResolutionCache* aAnchorPosResolutionCache = nullptr);
+
+  void Init(nsPresContext* aPresContext,
+            const Maybe<LogicalSize>& aContainingBlockSize = Nothing(),
+            const Maybe<LogicalMargin>& aBorder = Nothing(),
+            const Maybe<LogicalMargin>& aPadding = Nothing());
+
+  nscoord GetLineHeight() const;
+
+  void SetLineHeight(nscoord aLineHeight);
+
+  static nscoord CalcLineHeight(const ComputedStyle&,
+                                nsPresContext* aPresContext,
+                                const nsIContent* aContent,
+                                float aFontSizeInflation);
+  static nscoord CalcLineHeight(const StyleLineHeight&,
+                                const nsStyleFont& aRelativeToFont,
+                                nsPresContext* aPresContext, bool aIsVertical,
+                                const nsIContent* aContent,
+                                float aFontSizeInflation);
+  static nscoord CalcLineHeightForCanvas(const StyleLineHeight& aLh,
+                                         const nsFont& aRelativeToFont,
+                                         nsAtom* aLanguage,
+                                         bool aExplicitLanguage,
+                                         nsPresContext* aPresContext,
+                                         WritingMode aWM);
+
+  static constexpr float kNormalLineHeightFactor = 1.2f;
+
+  nscoord ApplyMinMaxISize(nscoord aISize) const {
+    if (NS_UNCONSTRAINEDSIZE != ComputedMaxISize()) {
+      aISize = std::min(aISize, ComputedMaxISize());
+    }
+    return std::max(aISize, ComputedMinISize());
+  }
+
+  nscoord ApplyMinMaxBSize(nscoord aBSize, nscoord aConsumed = 0) const {
+    aBSize += aConsumed;
+
+    if (NS_UNCONSTRAINEDSIZE != ComputedMaxBSize()) {
+      aBSize = std::min(aBSize, ComputedMaxBSize());
+    }
+
+    if (NS_UNCONSTRAINEDSIZE != ComputedMinBSize()) {
+      aBSize = std::max(aBSize, ComputedMinBSize());
+    }
+
+    return aBSize - aConsumed;
+  }
+
+  bool ShouldReflowAllKids() const;
+
+  void SetComputedWidth(nscoord aComputedWidth) {
+    if (mWritingMode.IsVertical()) {
+      SetComputedBSize(aComputedWidth);
+    } else {
+      SetComputedISize(aComputedWidth);
+    }
+  }
+
+  void SetComputedHeight(nscoord aComputedHeight) {
+    if (mWritingMode.IsVertical()) {
+      SetComputedISize(aComputedHeight);
+    } else {
+      SetComputedBSize(aComputedHeight);
+    }
+  }
+
+  enum class ResetResizeFlags : bool { No, Yes };
+
+  void SetComputedISize(nscoord aComputedISize,
+                        ResetResizeFlags aFlags = ResetResizeFlags::Yes);
+
+  void SetComputedBSize(nscoord aComputedBSize,
+                        ResetResizeFlags aFlags = ResetResizeFlags::Yes);
+
+  bool WillReflowAgainForClearance() const {
+    return mDiscoveredClearance && *mDiscoveredClearance;
+  }
+
+  bool ShouldApplyAutomaticMinimumOnBlockAxis() const;
+
+  bool IsInFragmentedContext() const;
+
+  static LogicalMargin ComputeRelativeOffsets(WritingMode aWM, nsIFrame* aFrame,
+                                              const LogicalSize& aCBSize);
+
+  static void ApplyRelativePositioning(nsIFrame* aFrame,
+                                       const nsMargin& aComputedOffsets,
+                                       nsPoint* aPosition);
+
+  static void ApplyRelativePositioning(nsIFrame* aFrame,
+                                       WritingMode aWritingMode,
+                                       const LogicalMargin& aComputedOffsets,
+                                       LogicalPoint* aPosition,
+                                       const nsSize& aContainerSize);
+
+  static void ComputeAbsPosBlockAutoMargin(nscoord aAvailMarginSpace,
+                                           WritingMode aContainingBlockWM,
+                                           bool aIsMarginBStartAuto,
+                                           bool aIsMarginBEndAuto,
+                                           LogicalMargin& aMargin);
+
+  static void ComputeAbsPosInlineAutoMargin(nscoord aAvailMarginSpace,
+                                            WritingMode aContainingBlockWM,
+                                            bool aIsMarginIStartAuto,
+                                            bool aIsMarginIEndAuto,
+                                            LogicalMargin& aMargin);
+
+ protected:
+  void InitCBReflowInput();
+  void InitResizeFlags(nsPresContext* aPresContext, LayoutFrameType aFrameType);
+  void InitDynamicReflowRoot();
+
+  void InitConstraints(nsPresContext* aPresContext,
+                       const Maybe<LogicalSize>& aContainingBlockSize,
+                       const Maybe<LogicalMargin>& aBorder,
+                       const Maybe<LogicalMargin>& aPadding,
+                       LayoutFrameType aFrameType);
+
+  LogicalSize ComputeContainingBlockRectangle(
+      nsPresContext* aPresContext, const ReflowInput* aContainingBlockRI) const;
+
+  struct HypotheticalBoxContainerInfo {
+    nsIFrame* mBoxContainer;
+    LogicalMargin mBorderPadding;
+    LogicalSize mContentBoxSize;
+  };
+
+  HypotheticalBoxContainerInfo GetHypotheticalBoxContainer(
+      const nsIFrame* aFrame) const;
+
+  void CalculateHypotheticalPosition(
+      nsPlaceholderFrame* aPlaceholderFrame, const ReflowInput* aCBReflowInput,
+      const LogicalSize& aCBPaddingBoxSize,
+      nsHypotheticalPosition& aHypotheticalPos) const;
+
+  void InitAbsoluteConstraints(const ReflowInput* aCBReflowInput,
+                               const LogicalSize& aCBSize);
+
+  void ComputeMinMaxValues(const LogicalSize& aCBSize);
+
+  void CalculateBorderPaddingMargin(LogicalAxis aAxis,
+                                    nscoord aContainingBlockSize,
+                                    nscoord* aInsideBoxSizing,
+                                    nscoord* aOutsideBoxSizing) const;
+
+  void CalculateBlockSideMargins();
+
+  bool IsInternalTableFrame() const;
+
+ private:
+
+  LogicalSize mAvailableSize{mWritingMode};
+
+  LogicalSize mComputedSize{mWritingMode};
+
+  LogicalMargin mComputedOffsets{mWritingMode};
+
+  LogicalSize mComputedMinSize{mWritingMode};
+
+  LogicalSize mComputedMaxSize{mWritingMode, NS_UNCONSTRAINEDSIZE,
+                               NS_UNCONSTRAINEDSIZE};
+
+  Maybe<nscoord> mPercentageBasisInBlockAxis;
+
+  mutable nscoord mLineHeight = NS_UNCONSTRAINEDSIZE;
+};
+
+}  
+
+#endif  // mozilla_ReflowInput_h

@@ -1,0 +1,51 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SCRIPT_AUTOENTRYSCRIPT_H_
+#define DOM_SCRIPT_AUTOENTRYSCRIPT_H_
+
+#include "MainThreadUtils.h"
+#include "js/Debug.h"
+#include "js/TypeDecls.h"
+#include "jsapi.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/dom/JSExecutionManager.h"
+#include "mozilla/dom/ScriptSettings.h"
+
+class nsIGlobalObject;
+class nsIPrincipal;
+
+namespace xpc {
+class AutoScriptActivity;
+}
+
+namespace mozilla::dom {
+
+class MOZ_STACK_CLASS AutoEntryScript : public AutoJSAPI {
+ public:
+  AutoEntryScript(nsIGlobalObject* aGlobalObject, const char* aReason,
+                  bool aIsMainThread = NS_IsMainThread());
+
+  AutoEntryScript(JSObject* aObject, const char* aReason,
+                  bool aIsMainThread = NS_IsMainThread());
+
+  ~AutoEntryScript();
+
+  void SetWebIDLCallerPrincipal(nsIPrincipal* aPrincipal) {
+    mWebIDLCallerPrincipal = aPrincipal;
+  }
+
+ private:
+  nsIPrincipal* MOZ_NON_OWNING_REF mWebIDLCallerPrincipal;
+  friend nsIPrincipal* GetWebIDLCallerPrincipal();
+
+  Maybe<xpc::AutoScriptActivity> mScriptActivity;
+  JS::AutoHideScriptedCaller mCallerOverride;
+  AutoRequestJSThreadExecution mJSThreadExecution;
+};
+
+}  
+
+#endif  // DOM_SCRIPT_AUTOENTRYSCRIPT_H_

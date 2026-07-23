@@ -1,0 +1,42 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkBlendModePriv_DEFINED)
+#define SkBlendModePriv_DEFINED
+
+#include "include/core/SkBlendMode.h"
+#include "include/core/SkColor.h"
+#include "src/core/SkColorData.h"
+
+class SkBlender;
+class SkRasterPipeline;
+class SkPaint;
+
+constexpr uint8_t kCustom_SkBlendMode = 0xFF;
+
+bool SkBlendMode_SupportsCoverageAsAlpha(SkBlendMode);
+
+static inline bool SkBlendMode_CaresAboutRBOrder(SkBlendMode mode) {
+    return (mode > SkBlendMode::kLastSeparableMode);
+}
+
+bool SkBlendMode_ShouldPreScaleCoverage(SkBlendMode, bool rgb_coverage);
+void SkBlendMode_AppendStages(SkBlendMode, SkRasterPipeline*);
+
+SkPMColor4f SkBlendMode_Apply(SkBlendMode, const SkPMColor4f& src, const SkPMColor4f& dst);
+
+enum class SkBlendFastPath {
+    kNormal,      
+    kSrcOver,     
+    kSkipDrawing  
+};
+
+SkBlendFastPath CheckFastPath(const SkPaint&, bool dstIsOpaque);
+
+const SkBlender* GetBlendModeSingleton(SkBlendMode);
+
+#endif

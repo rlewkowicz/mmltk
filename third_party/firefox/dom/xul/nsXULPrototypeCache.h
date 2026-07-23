@@ -1,0 +1,134 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsXULPrototypeCache_h_
+#define nsXULPrototypeCache_h_
+
+#include "js/experimental/JSStencil.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/scache/StartupCache.h"
+#include "nsBaseHashtable.h"
+#include "nsCOMPtr.h"
+#include "nsIObserver.h"
+#include "nsIStorageStream.h"
+#include "nsInterfaceHashtable.h"
+#include "nsRefPtrHashtable.h"
+#include "nsURIHashKey.h"
+#include "nsXULPrototypeDocument.h"
+
+class nsIHandleReportCallback;
+namespace mozilla {
+class StyleSheet;
+}  
+
+class nsXULPrototypeCache : public nsIObserver {
+ public:
+  enum class CacheType { Prototype, Script };
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  bool IsCached(nsIURI* aURI) { return GetPrototype(aURI) != nullptr; }
+  void AbortCaching();
+
+  bool IsEnabled();
+
+  void Flush();
+
+
+  nsXULPrototypeDocument* GetPrototype(nsIURI* aURI);
+  nsresult PutPrototype(nsXULPrototypeDocument* aDocument);
+  void RemovePrototype(nsIURI* aURI) { mPrototypeTable.Remove(aURI); }
+
+  JS::Stencil* GetStencil(nsIURI* aURI);
+  nsresult PutStencil(nsIURI* aURI, JS::Stencil* aStencil);
+
+  nsresult WritePrototype(nsXULPrototypeDocument* aPrototypeDocument);
+
+
+  inline nsresult GetPrototypeInputStream(nsIURI* aURI,
+                                          nsIObjectInputStream** objectInput) {
+    return GetInputStream(CacheType::Prototype, aURI, objectInput);
+  }
+  inline nsresult GetScriptInputStream(nsIURI* aURI,
+                                       nsIObjectInputStream** objectInput) {
+    return GetInputStream(CacheType::Script, aURI, objectInput);
+  }
+  inline nsresult FinishScriptInputStream(nsIURI* aURI) {
+    return FinishInputStream(aURI);
+  }
+
+  inline nsresult GetPrototypeOutputStream(
+      nsIURI* aURI, nsIObjectOutputStream** objectOutput) {
+    return GetOutputStream(aURI, objectOutput);
+  }
+  inline nsresult GetScriptOutputStream(nsIURI* aURI,
+                                        nsIObjectOutputStream** objectOutput) {
+    return GetOutputStream(aURI, objectOutput);
+  }
+
+  inline nsresult FinishPrototypeOutputStream(nsIURI* aURI) {
+    return FinishOutputStream(CacheType::Prototype, aURI);
+  }
+  inline nsresult FinishScriptOutputStream(nsIURI* aURI) {
+    return FinishOutputStream(CacheType::Script, aURI);
+  }
+
+  inline nsresult HasPrototype(nsIURI* aURI, bool* exists) {
+    return HasData(CacheType::Prototype, aURI, exists);
+  }
+  inline nsresult HasScript(nsIURI* aURI, bool* exists) {
+    return HasData(CacheType::Script, aURI, exists);
+  }
+
+ private:
+  nsresult GetInputStream(CacheType cacheType, nsIURI* uri,
+                          nsIObjectInputStream** stream);
+  nsresult FinishInputStream(nsIURI* aURI);
+
+  nsresult GetOutputStream(nsIURI* aURI, nsIObjectOutputStream** objectOutput);
+  nsresult FinishOutputStream(CacheType cacheType, nsIURI* aURI);
+  nsresult HasData(CacheType cacheType, nsIURI* aURI, bool* exists);
+
+ public:
+  static nsXULPrototypeCache* GetInstance();
+  static nsXULPrototypeCache* MaybeGetInstance() { return sInstance; }
+
+  static void ReleaseGlobals() { NS_IF_RELEASE(sInstance); }
+
+  void MarkInCCGeneration(uint32_t aGeneration);
+
+  static void CollectMemoryReports(nsIHandleReportCallback* aHandleReport,
+                                   nsISupports* aData);
+
+ protected:
+  friend nsresult NS_NewXULPrototypeCache(REFNSIID aIID, void** aResult);
+
+  nsXULPrototypeCache();
+  virtual ~nsXULPrototypeCache() = default;
+
+  static nsXULPrototypeCache* sInstance;
+
+  nsRefPtrHashtable<nsURIHashKey, nsXULPrototypeDocument>
+      mPrototypeTable;  
+
+  class StencilHashKey : public nsURIHashKey {
+   public:
+    explicit StencilHashKey(const nsIURI* aKey) : nsURIHashKey(aKey) {}
+    StencilHashKey(StencilHashKey&&) = default;
+
+    RefPtr<JS::Stencil> mStencil;
+  };
+
+  nsTHashtable<StencilHashKey> mStencilTable;
+
+  nsTHashtable<nsURIHashKey> mStartupCacheURITable;
+
+  nsInterfaceHashtable<nsURIHashKey, nsIStorageStream> mOutputStreamTable;
+  nsInterfaceHashtable<nsURIHashKey, nsIObjectInputStream> mInputStreamTable;
+
+  nsresult BeginCaching(nsIURI* aDocumentURI);
+};
+
+#endif  // nsXULPrototypeCache_h_

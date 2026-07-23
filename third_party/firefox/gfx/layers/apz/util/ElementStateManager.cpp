@@ -1,0 +1,387 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ElementStateManager.h"
+#include "mozilla/EventStateManager.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/StaticPrefs_ui.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/layers/APZEventState.h"
+#include "mozilla/layers/APZUtils.h"
+#include "nsITimer.h"
+
+static mozilla::LazyLogModule sApzAemLog("apz.elementstate");
+#define ESM_LOG(...) MOZ_LOG(sApzAemLog, LogLevel::Debug, (__VA_ARGS__))
+
+namespace mozilla {
+namespace layers {
+
+class DelayedClearElementActivation final : public nsITimerCallback,
+                                            public nsINamed {
+ private:
+  explicit DelayedClearElementActivation(RefPtr<dom::Element>& aTarget,
+                                         const nsCOMPtr<nsITimer>& aTimer)
+      : mTarget(aTarget)
+        ,
+        mTimer(aTimer),
+        mProcessedSingleTap(false) {}
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  static RefPtr<DelayedClearElementActivation> Create(
+      RefPtr<dom::Element>& aTarget);
+
+  NS_IMETHOD Notify(nsITimer*) override;
+
+  NS_IMETHOD GetName(nsACString& aName) override;
+
+  void MarkSingleTapProcessed();
+
+  bool ProcessedSingleTap() const { return mProcessedSingleTap; }
+
+  void StartTimer();
+
+  void ClearGlobalActiveContent();
+
+  void ClearTimer() {
+    if (mTimer) {
+      mTimer->Cancel();
+      mTimer = nullptr;
+    }
+  }
+  dom::Element* GetTarget() const { return mTarget; }
+
+ private:
+  ~DelayedClearElementActivation() = default;
+
+  RefPtr<dom::Element> mTarget;
+  nsCOMPtr<nsITimer> mTimer;
+  bool mProcessedSingleTap;
+};
+
+static nsPresContext* GetPresContextFor(nsIContent* aContent) {
+  if (!aContent) {
+    return nullptr;
+  }
+  PresShell* presShell = aContent->OwnerDoc()->GetPresShell();
+  if (!presShell) {
+    return nullptr;
+  }
+  return presShell->GetPresContext();
+}
+
+RefPtr<DelayedClearElementActivation> DelayedClearElementActivation::Create(
+    RefPtr<dom::Element>& aTarget) {
+  nsCOMPtr<nsITimer> timer = NS_NewTimer();
+  if (!timer) {
+    return nullptr;
+  }
+  RefPtr<DelayedClearElementActivation> event =
+      new DelayedClearElementActivation(aTarget, timer);
+  return event;
+}
+
+NS_IMETHODIMP DelayedClearElementActivation::Notify(nsITimer*) {
+  ESM_LOG("DelayedClearElementActivation notification ready=%d",
+          mProcessedSingleTap);
+  if (mProcessedSingleTap) {
+    ESM_LOG("DelayedClearElementActivation clearing active content");
+    ClearGlobalActiveContent();
+  }
+  mTimer = nullptr;
+  return NS_OK;
+}
+
+NS_IMETHODIMP DelayedClearElementActivation::GetName(nsACString& aName) {
+  aName.AssignLiteral("DelayedClearElementActivation");
+  return NS_OK;
+}
+
+void DelayedClearElementActivation::StartTimer() {
+  MOZ_ASSERT(mTimer);
+  if (!mTimer) {
+    return;
+  }
+  nsresult rv = mTimer->InitWithCallback(
+      this, StaticPrefs::ui_touch_activation_duration_ms(),
+      nsITimer::TYPE_ONE_SHOT);
+  if (NS_FAILED(rv)) {
+    ClearTimer();
+  }
+}
+
+void DelayedClearElementActivation::MarkSingleTapProcessed() {
+  mProcessedSingleTap = true;
+  if (!mTimer) {
+    ESM_LOG("Clear activation immediate!");
+    ClearGlobalActiveContent();
+  }
+}
+
+void DelayedClearElementActivation::ClearGlobalActiveContent() {
+  if (nsPresContext* pc = GetPresContextFor(mTarget)) {
+    EventStateManager::ClearGlobalActiveContent(pc->EventStateManager());
+  }
+  mTarget = nullptr;
+}
+
+NS_IMPL_ISUPPORTS(DelayedClearElementActivation, nsITimerCallback, nsINamed)
+
+ElementStateManager::ElementStateManager()
+    : mCanBePanOrZoom(false),
+      mCanBePanOrZoomSet(false),
+      mSingleTapBeforeActivation(false),
+      mSingleTapState(apz::SingleTapState::NotClick),
+      mSetActiveTask(nullptr),
+      mSetHoverTask(nullptr) {}
+
+ElementStateManager::~ElementStateManager() = default;
+
+void ElementStateManager::SetTargetElement(
+    dom::EventTarget* aTarget, PreventDefault aTouchStartPreventDefault) {
+  if (mTarget) {
+    ESM_LOG("Multiple fingers on-screen, clearing target element");
+    CancelActiveTask();
+    ResetActive();
+    ResetTouchBlockState();
+    return;
+  }
+
+  mTarget = dom::Element::FromEventTargetOrNull(aTarget);
+  ESM_LOG("Setting target element to %p", mTarget.get());
+  TriggerElementActivation();
+  if (mTarget && !bool(aTouchStartPreventDefault)) {
+    ScheduleSetHoverTask();
+  }
+}
+
+void ElementStateManager::HandleTouchStart(bool aCanBePanOrZoom) {
+  ESM_LOG("Touch start, aCanBePanOrZoom: %d", aCanBePanOrZoom);
+  if (mCanBePanOrZoomSet) {
+    ESM_LOG("Multiple fingers on-screen, clearing touch block state");
+    CancelActiveTask();
+    ResetActive();
+    ResetTouchBlockState();
+    return;
+  }
+
+  mCanBePanOrZoom = aCanBePanOrZoom;
+  mCanBePanOrZoomSet = true;
+  TriggerElementActivation();
+}
+
+void ElementStateManager::TriggerElementActivation() {
+  mSingleTapState = apz::SingleTapState::NotClick;
+
+  if (!(mTarget && mCanBePanOrZoomSet)) {
+    return;
+  }
+
+  RefPtr<DelayedClearElementActivation> delayedEvent =
+      DelayedClearElementActivation::Create(mTarget);
+  if (mDelayedClearElementActivation) {
+    mDelayedClearElementActivation->ClearTimer();
+    mDelayedClearElementActivation->ClearGlobalActiveContent();
+  }
+  mDelayedClearElementActivation = delayedEvent;
+
+  if (!mCanBePanOrZoom) {
+    SetActive(mTarget);
+
+    if (mDelayedClearElementActivation) {
+      if (mSingleTapBeforeActivation) {
+        mDelayedClearElementActivation->MarkSingleTapProcessed();
+      }
+      mDelayedClearElementActivation->StartTimer();
+    }
+  } else {
+    CancelActiveTask();  
+    ScheduleSetActiveTask();
+  }
+  ESM_LOG(
+      "Got both touch-end event and end touch notiication, clearing pan "
+      "state");
+  mCanBePanOrZoomSet = false;
+}
+
+void ElementStateManager::ClearActivation() {
+  ESM_LOG("Clearing element activation");
+  CancelActiveTask();
+  ResetActive();
+}
+
+bool ElementStateManager::HandleTouchEndEvent(apz::SingleTapState aState) {
+  ESM_LOG("Touch end event, state: %hhu", static_cast<uint8_t>(aState));
+
+  mTouchEndState += TouchEndState::GotTouchEndEvent;
+  return MaybeChangeActiveState(aState);
+}
+
+bool ElementStateManager::HandleTouchEnd(apz::SingleTapState aState) {
+  ESM_LOG("Touch end");
+
+  mTouchEndState += TouchEndState::GotTouchEndNotification;
+  return MaybeChangeActiveState(aState);
+}
+
+bool ElementStateManager::MaybeChangeActiveState(apz::SingleTapState aState) {
+  if (mTouchEndState !=
+      TouchEndStates(TouchEndState::GotTouchEndEvent,
+                     TouchEndState::GotTouchEndNotification)) {
+    return false;
+  }
+
+  CancelActiveTask();
+
+  mSingleTapState = aState;
+
+  if (aState == apz::SingleTapState::WasClick) {
+    if (mCanBePanOrZoom &&
+        !(mTarget && mTarget->IsXULElement(nsGkAtoms::thumb))) {
+      SetActive(mTarget);
+    }
+  } else {
+    ResetActive();
+  }
+
+  ResetTouchBlockState();
+  return true;
+}
+
+void ElementStateManager::ProcessSingleTap() {
+  if (!mDelayedClearElementActivation) {
+    mSingleTapBeforeActivation = true;
+    return;
+  }
+
+  if (mSingleTapState == apz::SingleTapState::NotYetDetermined) {
+    if (auto* target = mDelayedClearElementActivation->GetTarget()) {
+      SetActive(target);
+    }
+  }
+  mDelayedClearElementActivation->MarkSingleTapProcessed();
+
+  if (mCanBePanOrZoom) {
+    mDelayedClearElementActivation->StartTimer();
+  }
+
+  mDelayedClearElementActivation = nullptr;
+}
+
+void ElementStateManager::Destroy() {
+  if (mDelayedClearElementActivation) {
+    mDelayedClearElementActivation->ClearTimer();
+    mDelayedClearElementActivation = nullptr;
+  }
+  CancelActiveTask();
+  CancelHoverTask();
+}
+
+void ElementStateManager::HandleStartPanning() {
+  ESM_LOG("Start panning");
+  ClearActivation();
+  CancelHoverTask();
+}
+
+void ElementStateManager::SetActive(dom::Element* aTarget) {
+  ESM_LOG("Setting active %p", aTarget);
+
+  if (nsPresContext* pc = GetPresContextFor(aTarget)) {
+    pc->EventStateManager()->SetContentState(aTarget,
+                                             dom::ElementState::ACTIVE);
+  }
+}
+
+void ElementStateManager::SetHover(dom::Element* aTarget) {
+  ESM_LOG("Setting hover %p", aTarget);
+
+  if (nsPresContext* pc = GetPresContextFor(aTarget)) {
+    pc->EventStateManager()->SetContentState(aTarget, dom::ElementState::HOVER);
+  }
+}
+
+void ElementStateManager::ResetActive() {
+  ESM_LOG("Resetting active from %p", mTarget.get());
+
+  if (mTarget) {
+    dom::Element* root = mTarget->OwnerDoc()->GetDocumentElement();
+    if (root) {
+      ESM_LOG("Found root %p, making active", root);
+      SetActive(root);
+    }
+  }
+}
+
+void ElementStateManager::ResetTouchBlockState() {
+  mTarget = nullptr;
+  mCanBePanOrZoomSet = false;
+  mTouchEndState.clear();
+  mSingleTapBeforeActivation = false;
+}
+
+void ElementStateManager::ScheduleSetActiveTask() {
+  MOZ_ASSERT(mSetActiveTask == nullptr);
+
+  RefPtr<CancelableRunnable> task =
+      NewCancelableRunnableMethod<nsCOMPtr<dom::Element>>(
+          "layers::ElementStateManager::SetActiveTask", this,
+          &ElementStateManager::SetActiveTask, mTarget);
+  mSetActiveTask = task;
+  NS_GetCurrentThread()->DelayedDispatch(
+      task.forget(), StaticPrefs::ui_touch_activation_delay_ms());
+  ESM_LOG("Scheduling mSetActiveTask %p\n", mSetActiveTask.get());
+}
+
+void ElementStateManager::SetActiveTask(const nsCOMPtr<dom::Element>& aTarget) {
+  ESM_LOG("mSetActiveTask %p running", mSetActiveTask.get());
+
+  mSetActiveTask = nullptr;
+  SetActive(aTarget);
+}
+
+void ElementStateManager::CancelActiveTask() {
+  ESM_LOG("Cancelling active task %p", mSetActiveTask.get());
+
+  if (mSetActiveTask) {
+    mSetActiveTask->Cancel();
+    mSetActiveTask = nullptr;
+  }
+}
+
+void ElementStateManager::ScheduleSetHoverTask() {
+  CancelHoverTask();
+
+  RefPtr<CancelableRunnable> task =
+      NewCancelableRunnableMethod<nsCOMPtr<dom::Element>>(
+          "layers::ElementStateManager::SetHoverTask", this,
+          &ElementStateManager::SetHoverTask, mTarget);
+  mSetHoverTask = task;
+  int32_t delay = StaticPrefs::ui_touch_hover_delay_ms();
+  if (delay) {
+    NS_GetCurrentThread()->DelayedDispatch(task.forget(), delay);
+  } else {
+    NS_GetCurrentThread()->Dispatch(task.forget());
+  }
+  ESM_LOG("Scheduling mSetHoverTask %p", mSetHoverTask.get());
+}
+
+void ElementStateManager::SetHoverTask(const nsCOMPtr<dom::Element>& aTarget) {
+  ESM_LOG("mSetHoverTask %p running", mSetHoverTask.get());
+
+  mSetHoverTask = nullptr;
+  SetHover(aTarget);
+}
+
+void ElementStateManager::CancelHoverTask() {
+  ESM_LOG("Cancelling task %p", mSetHoverTask.get());
+
+  if (mSetHoverTask) {
+    mSetHoverTask->Cancel();
+    mSetHoverTask = nullptr;
+  }
+}
+}  
+}  

@@ -1,0 +1,682 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_TypedArray_h
+#define mozilla_dom_TypedArray_h
+
+#include <type_traits>
+#include <utility>
+
+#include "js/ArrayBuffer.h"
+#include "js/ArrayBufferMaybeShared.h"
+#include "js/Context.h"
+#include "js/GCAPI.h"       // JS::AutoCheckCannotGC
+#include "js/RootingAPI.h"  // JS::Rooted
+#include "js/ScalarType.h"  // JS::Scalar::Type
+#include "js/SharedArrayBuffer.h"
+#include "js/experimental/TypedData.h"  // js::Unwrap(Ui|I)nt(8|16|32)Array, js::Get(Ui|I)nt(8|16|32)ArrayLengthAndData, js::UnwrapUint8ClampedArray, js::GetUint8ClampedArrayLengthAndData, js::UnwrapFloat(32|64)Array, js::GetFloat(32|64)ArrayLengthAndData, JS_GetArrayBufferViewType
+#include "js/friend/ErrorMessages.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Buffer.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/Vector.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/SpiderMonkeyInterface.h"
+#include "nsIGlobalObject.h"
+#include "nsWrapperCache.h"
+#include "nsWrapperCacheInlines.h"
+
+namespace mozilla::dom {
+
+
+template <class ArrayT>
+struct TypedArray_base : public SpiderMonkeyInterfaceObjectStorage,
+                         AllTypedArraysBase {
+  using element_type = typename ArrayT::DataType;
+
+  TypedArray_base() = default;
+  TypedArray_base(TypedArray_base&& aOther) = default;
+
+ public:
+  inline bool Init(JSObject* obj) {
+    MOZ_ASSERT(!inited());
+    mImplObj = mWrappedObj = ArrayT::unwrap(obj).asObject();
+    return inited();
+  }
+
+
+ public:
+
+  template <typename... Calculator>
+  [[nodiscard]] bool AppendDataTo(nsCString& aResult,
+                                  Calculator&&... aCalculator) const {
+    static_assert(sizeof...(aCalculator) <= 1,
+                  "AppendDataTo takes at most one aCalculator");
+
+    return ProcessDataHelper(
+        [&](const Span<const element_type>& aData, JS::AutoCheckCannotGC&&) {
+          return aResult.Append(aData, fallible);
+        },
+        std::forward<Calculator>(aCalculator)...);
+  }
+
+  template <typename T, typename... Calculator>
+  [[nodiscard]] bool AppendDataTo(nsTArray<T>& aResult,
+                                  Calculator&&... aCalculator) const {
+    static_assert(sizeof...(aCalculator) <= 1,
+                  "AppendDataTo takes at most one aCalculator");
+
+    return ProcessDataHelper(
+        [&](const Span<const element_type>& aData, JS::AutoCheckCannotGC&&) {
+          return aResult.AppendElements(aData, fallible);
+        },
+        std::forward<Calculator>(aCalculator)...);
+  }
+
+  template <typename T, typename... Calculator>
+  [[nodiscard]] bool AppendDataTo(FallibleTArray<T>& aResult,
+                                  Calculator&&... aCalculator) const {
+    static_assert(sizeof...(aCalculator) <= 1,
+                  "AppendDataTo takes at most one aCalculator");
+
+    return ProcessDataHelper(
+        [&](const Span<const element_type>& aData, JS::AutoCheckCannotGC&&) {
+          return aResult.AppendElements(aData, fallible);
+        },
+        std::forward<Calculator>(aCalculator)...);
+  }
+
+  template <typename T, typename... Calculator>
+  [[nodiscard]] bool AppendDataTo(Vector<T>& aResult,
+                                  Calculator&&... aCalculator) const {
+    static_assert(sizeof...(aCalculator) <= 1,
+                  "AppendDataTo takes at most one aCalculator");
+
+    return ProcessDataHelper(
+        [&](const Span<const element_type>& aData, JS::AutoCheckCannotGC&&) {
+          return aResult.append(aData.Elements(), aData.Length());
+        },
+        std::forward<Calculator>(aCalculator)...);
+  }
+
+
+  template <typename T, size_t N, typename... Calculator>
+  [[nodiscard]] bool CopyDataTo(T (&aResult)[N],
+                                Calculator&&... aCalculator) const {
+    static_assert(sizeof...(aCalculator) <= 1,
+                  "CopyDataTo takes at most one aCalculator");
+
+    return ProcessDataHelper(
+        [&](const Span<const element_type>& aData, JS::AutoCheckCannotGC&&) {
+          if (aData.Length() != N) {
+            return false;
+          }
+          for (size_t i = 0; i < N; ++i) {
+            aResult[i] = aData[i];
+          }
+          return true;
+        },
+        std::forward<Calculator>(aCalculator)...);
+  }
+
+  template <typename T, size_t N, typename... Calculator>
+  [[nodiscard]] bool CopyDataTo(std::array<T, N>* const aResult,
+                                Calculator&&... aCalculator) const {
+    static_assert(sizeof...(aCalculator) <= 1,
+                  "CopyDataTo takes at most one aCalculator");
+
+    return ProcessDataHelper(
+        [&](const Span<const element_type>& aData, JS::AutoCheckCannotGC&&) {
+          if (aData.Length() != N) {
+            return false;
+          }
+          for (size_t i = 0; i < N; ++i) {
+            (*aResult).at(i) = aData[i];
+          }
+          return true;
+        },
+        std::forward<Calculator>(aCalculator)...);
+  }
+
+
+  template <typename T, typename... Calculator,
+            typename IsVector =
+                std::enable_if_t<std::is_same_v<Vector<element_type>, T>>>
+  [[nodiscard]] Maybe<Vector<element_type>> CreateFromData(
+      Calculator&&... aCalculator) const {
+    static_assert(sizeof...(aCalculator) <= 1,
+                  "CreateFromData takes at most one aCalculator");
+
+    return CreateFromDataHelper<T>(
+        [&](const Span<const element_type>& aData,
+            Vector<element_type>& aResult) {
+          if (!aResult.initCapacity(aData.Length())) {
+            return false;
+          }
+          aResult.infallibleAppend(aData.Elements(), aData.Length());
+          return true;
+        },
+        std::forward<Calculator>(aCalculator)...);
+  }
+
+  template <typename T, typename... Calculator,
+            typename IsUniquePtr =
+                std::enable_if_t<std::is_same_v<T, UniquePtr<element_type[]>>>>
+  [[nodiscard]] Maybe<UniquePtr<element_type[]>> CreateFromData(
+      Calculator&&... aCalculator) const {
+    static_assert(sizeof...(aCalculator) <= 1,
+                  "CreateFromData takes at most one aCalculator");
+
+    return CreateFromDataHelper<T>(
+        [&](const Span<const element_type>& aData,
+            UniquePtr<element_type[]>& aResult) {
+          aResult =
+              MakeUniqueForOverwriteFallible<element_type[]>(aData.Length());
+          if (!aResult.get()) {
+            return false;
+          }
+          memcpy(aResult.get(), aData.Elements(), aData.LengthBytes());
+          return true;
+        },
+        std::forward<Calculator>(aCalculator)...);
+  }
+
+  template <typename T, typename... Calculator,
+            typename IsBuffer =
+                std::enable_if_t<std::is_same_v<T, Buffer<element_type>>>>
+  [[nodiscard]] Maybe<Buffer<element_type>> CreateFromData(
+      Calculator&&... aCalculator) const {
+    static_assert(sizeof...(aCalculator) <= 1,
+                  "CreateFromData takes at most one aCalculator");
+
+    return CreateFromDataHelper<T>(
+        [&](const Span<const element_type>& aData,
+            Buffer<element_type>& aResult) {
+          Maybe<Buffer<element_type>> buffer =
+              Buffer<element_type>::CopyFrom(aData);
+          if (buffer.isNothing()) {
+            return false;
+          }
+          aResult = buffer.extract();
+          return true;
+        },
+        std::forward<Calculator>(aCalculator)...);
+  }
+
+ private:
+  template <typename Processor, typename R = decltype(std::declval<Processor>()(
+                                    std::declval<Span<element_type>>(),
+                                    std::declval<JS::AutoCheckCannotGC>()))>
+  using ProcessNoGCReturnType = R;
+
+  template <typename Processor>
+  [[nodiscard]] static inline ProcessNoGCReturnType<Processor>
+  CallProcessorNoGC(const Span<element_type>& aData, Processor&& aProcessor,
+                    JS::AutoCheckCannotGC&& nogc) {
+    MOZ_ASSERT(
+        aData.IsEmpty() || aData.Elements(),
+        "We expect a non-null data pointer for typed arrays that aren't empty");
+
+    return aProcessor(aData, std::move(nogc));
+  }
+
+  template <typename Processor, typename R = decltype(std::declval<Processor>()(
+                                    std::declval<Span<element_type>>()))>
+  using ProcessReturnType = R;
+
+  template <typename Processor>
+  [[nodiscard]] static inline ProcessReturnType<Processor> CallProcessor(
+      const Span<element_type>& aData, Processor&& aProcessor) {
+    MOZ_ASSERT(
+        aData.IsEmpty() || aData.Elements(),
+        "We expect a non-null data pointer for typed arrays that aren't empty");
+
+    return aProcessor(aData);
+  }
+
+  struct MOZ_STACK_CLASS LengthPinner {
+    explicit LengthPinner(const TypedArray_base* aTypedArray)
+        : mTypedArray(aTypedArray),
+          mWasPinned(
+              !JS::PinArrayBufferOrViewLength(aTypedArray->Obj(), true)) {}
+    ~LengthPinner() {
+      if (!mWasPinned) {
+        JS::PinArrayBufferOrViewLength(mTypedArray->Obj(), false);
+      }
+    }
+
+   private:
+    const TypedArray_base* mTypedArray;
+    bool mWasPinned;
+  };
+
+  template <typename Processor, typename Calculator>
+  [[nodiscard]] bool ProcessDataHelper(
+      Processor&& aProcessor, Calculator&& aCalculateOffsetAndLength) const {
+    LengthPinner pinner(this);
+
+    JS::AutoCheckCannotGC nogc;  
+    Span<element_type> data = GetCurrentData();
+    const auto& offsetAndLength = aCalculateOffsetAndLength(data.Length());
+    size_t offset, length;
+    if constexpr (std::is_convertible_v<decltype(offsetAndLength),
+                                        std::pair<size_t, size_t>>) {
+      std::tie(offset, length) = offsetAndLength;
+    } else {
+      if (offsetAndLength.isNothing()) {
+        return false;
+      }
+      std::tie(offset, length) = offsetAndLength.value();
+    }
+
+    return CallProcessorNoGC(data.Subspan(offset, length),
+                             std::forward<Processor>(aProcessor),
+                             std::move(nogc));
+  }
+
+  template <bool AllowLargeTypedArrays = false, typename Processor>
+  [[nodiscard]] ProcessNoGCReturnType<Processor> ProcessDataHelper(
+      Processor&& aProcessor) const {
+    LengthPinner pinner(this);
+    JS::AutoCheckCannotGC nogc;
+    return CallProcessorNoGC(GetCurrentData<AllowLargeTypedArrays>(),
+                             std::forward<Processor>(aProcessor),
+                             std::move(nogc));
+  }
+
+ public:
+  template <bool AllowLargeTypedArrays = false, typename Processor>
+  [[nodiscard]] ProcessNoGCReturnType<Processor> ProcessData(
+      Processor&& aProcessor) const {
+    return ProcessDataHelper<AllowLargeTypedArrays>(
+        std::forward<Processor>(aProcessor));
+  }
+
+  template <bool AllowLargeTypedArrays = false, typename Processor>
+  [[nodiscard]] ProcessReturnType<Processor> ProcessFixedData(
+      Processor&& aProcessor) const {
+    mozilla::dom::AutoJSAPI jsapi;
+    if (!jsapi.Init(mImplObj)) {
+#if defined(EARLY_BETA_OR_EARLIER)
+      if constexpr (std::is_same_v<ArrayT, JS::ArrayBufferView>) {
+        if (!mImplObj) {
+          MOZ_CRASH("Null mImplObj");
+        }
+        if (!xpc::NativeGlobal(mImplObj)) {
+          MOZ_CRASH("Null xpc::NativeGlobal(mImplObj)");
+        }
+        if (!xpc::NativeGlobal(mImplObj)->GetGlobalJSObject()) {
+          MOZ_CRASH("Null xpc::NativeGlobal(mImplObj)->GetGlobalJSObject()");
+        }
+      }
+#endif
+      MOZ_CRASH("Failed to get JSContext");
+    }
+#if defined(EARLY_BETA_OR_EARLIER)
+    if constexpr (std::is_same_v<ArrayT, JS::ArrayBufferView>) {
+      JS::Rooted<JSObject*> view(jsapi.cx(),
+                                 js::UnwrapArrayBufferView(mImplObj));
+      if (!view) {
+        if (JSObject* unwrapped = js::CheckedUnwrapStatic(mImplObj)) {
+          if (!js::UnwrapArrayBufferView(unwrapped)) {
+            MOZ_CRASH(
+                "Null "
+                "js::UnwrapArrayBufferView(js::CheckedUnwrapStatic(mImplObj))");
+          }
+          view = unwrapped;
+        } else {
+          MOZ_CRASH("Null js::CheckedUnwrapStatic(mImplObj)");
+        }
+      }
+    }
+#endif
+    JS::AutoBrittleMode abm(jsapi.cx());
+    if (!JS::EnsureNonInlineArrayBufferOrView(jsapi.cx(), mImplObj)) {
+      MOZ_CRASH("small oom when moving inline data out-of-line");
+    }
+    LengthPinner pinner(this);
+
+    return CallProcessor(GetCurrentData<AllowLargeTypedArrays>(),
+                         std::forward<Processor>(aProcessor));
+  }
+
+ private:
+  template <bool AllowLargeTypedArrays = false>
+  Span<element_type> GetCurrentData() const {
+    MOZ_ASSERT(inited());
+    MOZ_RELEASE_ASSERT(
+        !ArrayT::fromObject(mImplObj).isResizable(),
+        "Bindings must have checked ArrayBuffer{View} is non-resizable");
+    MOZ_RELEASE_ASSERT(
+        !ArrayT::fromObject(mImplObj).isImmutable(),
+        "Bindings must have checked ArrayBuffer{View} is mutable");
+
+    JS::AutoCheckCannotGC nogc;
+    bool shared;
+    Span<element_type> span =
+        ArrayT::fromObject(mImplObj).getData(&shared, nogc);
+    if constexpr (!AllowLargeTypedArrays) {
+      MOZ_RELEASE_ASSERT(span.Length() <= INT32_MAX,
+                         "Bindings must have checked ArrayBuffer{View} length");
+    }
+    return span;
+  }
+
+  template <typename T, typename F, typename... Calculator>
+  [[nodiscard]] Maybe<T> CreateFromDataHelper(
+      F&& aCreator, Calculator&&... aCalculator) const {
+    Maybe<T> result;
+    bool ok = ProcessDataHelper(
+        [&](const Span<const element_type>& aData, JS::AutoCheckCannotGC&&) {
+          result.emplace();
+          return aCreator(aData, *result);
+        },
+        std::forward<Calculator>(aCalculator)...);
+
+    if (!ok) {
+      return Nothing();
+    }
+
+    return result;
+  }
+
+  TypedArray_base(const TypedArray_base&) = delete;
+};
+
+template <class ArrayT>
+struct TypedArray : public TypedArray_base<ArrayT> {
+  using Base = TypedArray_base<ArrayT>;
+  using element_type = typename Base::element_type;
+
+  TypedArray() = default;
+
+  TypedArray(TypedArray&& aOther) = default;
+
+  static inline JSObject* Create(JSContext* cx, nsWrapperCache* creator,
+                                 size_t length, ErrorResult& error) {
+    return CreateCommon(cx, creator, length, error).asObject();
+  }
+
+  static inline JSObject* Create(JSContext* cx, size_t length,
+                                 ErrorResult& error) {
+    return CreateCommon(cx, length, error).asObject();
+  }
+
+  static inline JSObject* Create(JSContext* cx, nsWrapperCache* creator,
+                                 Span<const element_type> data,
+                                 ErrorResult& error) {
+    ArrayT array = CreateCommon(cx, creator, data.Length(), error);
+    if (!error.Failed() && !data.IsEmpty()) {
+      CopyFrom(cx, data, array);
+    }
+    return array.asObject();
+  }
+
+  static inline JSObject* Create(JSContext* cx, Span<const element_type> data,
+                                 ErrorResult& error) {
+    ArrayT array = CreateCommon(cx, data.Length(), error);
+    if (!error.Failed() && !data.IsEmpty()) {
+      CopyFrom(cx, data, array);
+    }
+    return array.asObject();
+  }
+
+ private:
+  template <typename>
+  friend class TypedArrayCreator;
+
+  static inline ArrayT CreateCommon(JSContext* cx, nsWrapperCache* creator,
+                                    size_t length, ErrorResult& error) {
+    JS::Rooted<JSObject*> creatorWrapper(cx);
+    Maybe<JSAutoRealm> ar;
+    if (creator && (creatorWrapper = creator->GetWrapperPreserveColor())) {
+      ar.emplace(cx, creatorWrapper);
+    }
+
+    return CreateCommon(cx, length, error);
+  }
+  static inline ArrayT CreateCommon(JSContext* cx, size_t length,
+                                    ErrorResult& error) {
+    error.MightThrowJSException();
+    ArrayT array = CreateCommon(cx, length);
+    if (array) {
+      return array;
+    }
+    error.StealExceptionFromJSContext(cx);
+    return ArrayT::fromObject(nullptr);
+  }
+  static inline ArrayT CreateCommon(JSContext* cx, size_t length) {
+    return ArrayT::create(cx, length);
+  }
+  static inline void CopyFrom(JSContext* cx,
+                              const Span<const element_type>& data,
+                              ArrayT& dest) {
+    JS::AutoCheckCannotGC nogc;
+    bool isShared;
+    mozilla::Span<element_type> span = dest.getData(&isShared, nogc);
+    MOZ_ASSERT(span.size() == data.size(),
+               "Didn't create a large enough typed array object?");
+    MOZ_ASSERT(!isShared);
+    memcpy(span.Elements(), data.Elements(), data.LengthBytes());
+  }
+
+  TypedArray(const TypedArray&) = delete;
+};
+
+template <JS::Scalar::Type GetViewType(JSObject*)>
+struct ArrayBufferView_base : public TypedArray_base<JS::ArrayBufferView> {
+ private:
+  using Base = TypedArray_base<JS::ArrayBufferView>;
+
+ public:
+  ArrayBufferView_base() : Base(), mType(JS::Scalar::MaxTypedArrayViewType) {}
+
+  ArrayBufferView_base(ArrayBufferView_base&& aOther)
+      : Base(std::move(aOther)), mType(aOther.mType) {
+    aOther.mType = JS::Scalar::MaxTypedArrayViewType;
+  }
+
+ private:
+  JS::Scalar::Type mType;
+
+ public:
+  inline bool Init(JSObject* obj) {
+    if (!Base::Init(obj)) {
+      return false;
+    }
+
+    mType = GetViewType(this->Obj());
+    return true;
+  }
+
+  inline JS::Scalar::Type Type() const {
+    MOZ_ASSERT(this->inited());
+    return mType;
+  }
+};
+
+using Int8Array = TypedArray<JS::Int8Array>;
+using Uint8Array = TypedArray<JS::Uint8Array>;
+using Uint8ClampedArray = TypedArray<JS::Uint8ClampedArray>;
+using Int16Array = TypedArray<JS::Int16Array>;
+using Uint16Array = TypedArray<JS::Uint16Array>;
+using Int32Array = TypedArray<JS::Int32Array>;
+using Uint32Array = TypedArray<JS::Uint32Array>;
+using Float32Array = TypedArray<JS::Float32Array>;
+using Float64Array = TypedArray<JS::Float64Array>;
+using BigInt64Array = TypedArray<JS::BigInt64Array>;
+using BigUint64Array = TypedArray<JS::BigUint64Array>;
+using ArrayBufferView = ArrayBufferView_base<JS_GetArrayBufferViewType>;
+using ArrayBuffer = TypedArray<JS::ArrayBuffer>;
+
+template <typename TypedArrayType>
+class MOZ_STACK_CLASS TypedArrayCreator {
+  using ValuesType = typename TypedArrayType::element_type;
+  using ArrayType = nsTArray<ValuesType>;
+
+ public:
+  explicit TypedArrayCreator(const ArrayType& aArray) : mValues(aArray) {}
+  explicit TypedArrayCreator(const nsCString& aString) : mValues(aString) {}
+
+  JSObject* Create(JSContext* aCx) const {
+    auto array = TypedArrayType::CreateCommon(aCx, mValues.Length());
+    if (array) {
+      TypedArrayType::CopyFrom(aCx, mValues, array);
+    }
+    return array.asObject();
+  }
+
+ private:
+  Span<const ValuesType> mValues;
+};
+
+namespace binding_detail {
+
+template <typename Union, typename UnionMemberType, typename = int>
+struct ApplyToTypedArray;
+
+#define APPLY_IMPL(type)                                                       \
+  template <typename Union>                                                    \
+  struct ApplyToTypedArray<Union, type, decltype((void)&Union::Is##type, 0)> { \
+      \
+    template <typename F>                                                      \
+    using FunReturnType = decltype(std::declval<F>()(std::declval<type>()));   \
+                                                                               \
+      \
+                                                          \
+    template <typename F>                                                      \
+    static constexpr bool FunReturnsVoid =                                     \
+        std::is_same_v<FunReturnType<F>, void>;                                \
+                                                                               \
+      \
+      \
+      \
+      \
+      \
+      \
+      \
+      \
+      \
+      \
+    template <typename F>                                                      \
+    using ApplyReturnType =                                                    \
+        std::conditional_t<FunReturnsVoid<F>, bool, Maybe<FunReturnType<F>>>;  \
+                                                                               \
+   public:                                                                     \
+    template <typename F>                                                      \
+    static ApplyReturnType<F> Apply(const Union& aUnion, F&& aFun) {           \
+      if (!aUnion.Is##type()) {                                                \
+        return ApplyReturnType<F>();                   \
+      }                                                                        \
+      if constexpr (FunReturnsVoid<F>) {                                       \
+        std::forward<F>(aFun)(aUnion.GetAs##type());                           \
+        return true;                                                           \
+      } else {                                                                 \
+        return Some(std::forward<F>(aFun)(aUnion.GetAs##type()));              \
+      }                                                                        \
+    }                                                                          \
+  };
+
+APPLY_IMPL(Int8Array)
+APPLY_IMPL(Uint8Array)
+APPLY_IMPL(Uint8ClampedArray)
+APPLY_IMPL(Int16Array)
+APPLY_IMPL(Uint16Array)
+APPLY_IMPL(Int32Array)
+APPLY_IMPL(Uint32Array)
+APPLY_IMPL(Float32Array)
+APPLY_IMPL(Float64Array)
+APPLY_IMPL(BigInt64Array)
+APPLY_IMPL(BigUint64Array)
+APPLY_IMPL(ArrayBufferView)
+APPLY_IMPL(ArrayBuffer)
+
+#undef APPLY_IMPL
+
+template <typename T, bool H, typename FirstUnionMember,
+          typename... UnionMembers>
+struct ApplyToTypedArraysHelper {
+  static constexpr bool HasNonTypedArrayMembers = H;
+  template <typename Fun>
+  static auto Apply(const T& aUnion, Fun&& aFun) {
+    auto result = ApplyToTypedArray<T, FirstUnionMember>::Apply(
+        aUnion, std::forward<Fun>(aFun));
+    if constexpr (sizeof...(UnionMembers) == 0) {
+      return result;
+    } else {
+      if (result) {
+        return result;
+      } else {
+        return ApplyToTypedArraysHelper<T, H, UnionMembers...>::template Apply<
+            Fun>(aUnion, std::forward<Fun>(aFun));
+      }
+    }
+  }
+};
+
+template <typename T, typename Fun>
+auto ApplyToTypedArrays(const T& aUnion, Fun&& aFun) {
+  using ApplyToTypedArrays = typename T::ApplyToTypedArrays;
+
+  auto result =
+      ApplyToTypedArrays::template Apply<Fun>(aUnion, std::forward<Fun>(aFun));
+  if constexpr (ApplyToTypedArrays::HasNonTypedArrayMembers) {
+    return result;
+  } else {
+    MOZ_ASSERT(result, "Didn't expect union members other than typed arrays");
+
+    if constexpr (std::is_same_v<std::remove_cv_t<
+                                     std::remove_reference_t<decltype(result)>>,
+                                 bool>) {
+      return;
+    } else {
+      return result.extract();
+    }
+  }
+}
+
+}  
+
+template <typename T, typename ToType,
+          std::enable_if_t<is_dom_union_with_typedarray_members<T>, int> = 0>
+[[nodiscard]] auto AppendTypedArrayDataTo(const T& aUnion, ToType& aResult) {
+  return binding_detail::ApplyToTypedArrays(
+      aUnion, [&](const auto& aTypedArray) {
+        return aTypedArray.AppendDataTo(aResult);
+      });
+}
+
+template <typename ToType, typename T,
+          std::enable_if_t<is_dom_union_with_typedarray_members<T>, int> = 0>
+[[nodiscard]] auto CreateFromTypedArrayData(const T& aUnion) {
+  return binding_detail::ApplyToTypedArrays(
+      aUnion, [&](const auto& aTypedArray) {
+        return aTypedArray.template CreateFromData<ToType>();
+      });
+}
+
+template <typename T, typename Processor,
+          std::enable_if_t<is_dom_union_with_typedarray_members<T>, int> = 0>
+[[nodiscard]] auto ProcessTypedArrays(const T& aUnion, Processor&& aProcessor) {
+  return binding_detail::ApplyToTypedArrays(
+      aUnion, [&](const auto& aTypedArray) {
+        return aTypedArray.ProcessData(std::forward<Processor>(aProcessor));
+      });
+}
+
+template <typename T, typename Processor,
+          std::enable_if_t<is_dom_union_with_typedarray_members<T>, int> = 0>
+[[nodiscard]] auto ProcessTypedArraysFixed(const T& aUnion,
+                                           Processor&& aProcessor) {
+  return binding_detail::ApplyToTypedArrays(
+      aUnion, [&](const auto& aTypedArray) {
+        return aTypedArray.ProcessFixedData(
+            std::forward<Processor>(aProcessor));
+      });
+}
+
+}  
+
+#endif /* mozilla_dom_TypedArray_h */

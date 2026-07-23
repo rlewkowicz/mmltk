@@ -1,0 +1,35 @@
+
+[package]
+edition = "2021"
+rust-version = "1.60"
+name = "byteorder"
+version = "1.5.0"
+authors = ["Andrew Gallant <jamslam@gmail.com>"]
+description = "Library for reading/writing numbers in big-endian and little-endian."
+homepage = "https://github.com/BurntSushi/byteorder"
+documentation = "https://docs.rs/byteorder"
+keywords = [
+    "byte",
+    "endian",
+    "big-endian",
+    "little-endian",
+    "binary",
+]
+categories = [
+    "encoding",
+    "parsing",
+    "no-std",
+]
+license = "Unlicense OR MIT"
+repository = "https://github.com/BurntSushi/byteorder"
+
+[profile.bench]
+opt-level = 3
+
+[lib]
+name = "byteorder"
+
+[features]
+default = ["std"]
+i128 = []
+std = []

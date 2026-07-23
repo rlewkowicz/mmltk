@@ -1,0 +1,297 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "frontend/TryEmitter.h"
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+
+#include "frontend/BytecodeEmitter.h"  // BytecodeEmitter
+#include "frontend/IfEmitter.h"        // BytecodeEmitter
+#include "frontend/SharedContext.h"    // StatementKind
+#include "vm/Opcodes.h"                // JSOp
+
+using namespace js;
+using namespace js::frontend;
+
+using mozilla::Maybe;
+
+TryEmitter::TryEmitter(BytecodeEmitter* bce, Kind kind, ControlKind controlKind)
+    : bce_(bce),
+      kind_(kind),
+      controlKind_(controlKind),
+      depth_(0),
+      tryOpOffset_(0)
+#ifdef DEBUG
+      ,
+      state_(State::Start)
+#endif
+{
+  MOZ_ASSERT_IF(controlKind_ == ControlKind::Disposal,
+                kind_ == Kind::TryFinally);
+}
+
+#ifdef DEBUG
+bool TryEmitter::hasControlInfo() { return controlInfo_.get() != nullptr; }
+#endif
+
+bool TryEmitter::emitTry() {
+  MOZ_ASSERT(state_ == State::Start);
+
+  if (requiresControlInfo()) {
+    controlInfo_ = bce_->fc->getAllocator()->make_unique<TryFinallyControl>(
+        bce_, hasFinally() ? StatementKind::Finally : StatementKind::Try);
+    if (!controlInfo_) {
+      return false;
+    }
+  }
+
+  depth_ = bce_->bytecodeSection().stackDepth();
+
+  tryOpOffset_ = bce_->bytecodeSection().offset();
+  if (!bce_->emit1(JSOp::Try)) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::Try;
+#endif
+  return true;
+}
+
+bool TryEmitter::emitJumpToFinallyWithFallthrough() {
+  uint32_t stackDepthForNextBlock = bce_->bytecodeSection().stackDepth();
+
+  // The fallthrough continuation is special-cased with index 0.
+  uint32_t idx = TryFinallyControl::SpecialContinuations::Fallthrough;
+  if (!bce_->emitJumpToFinally(&controlInfo_->finallyJumps_, idx)) {
+    return false;
+  }
+
+  bce_->bytecodeSection().setStackDepth(stackDepthForNextBlock);
+  return true;
+}
+
+bool TryEmitter::emitTryEnd() {
+  MOZ_ASSERT(state_ == State::Try);
+  MOZ_ASSERT(depth_ == bce_->bytecodeSection().stackDepth());
+
+  if (hasFinally() && controlInfo_) {
+    if (!emitJumpToFinallyWithFallthrough()) {
+      return false;
+    }
+  } else {
+    if (!bce_->emitJump(JSOp::Goto, &catchAndFinallyJump_)) {
+      return false;
+    }
+  }
+
+  if (!bce_->emitJumpTarget(&tryEnd_)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool TryEmitter::emitCatch(ExceptionStack stack) {
+  MOZ_ASSERT(state_ == State::Try);
+  if (!emitTryEnd()) {
+    return false;
+  }
+
+  MOZ_ASSERT(bce_->bytecodeSection().stackDepth() == depth_);
+
+  if (shouldUpdateRval()) {
+    if (!bce_->emit1(JSOp::Undefined)) {
+      return false;
+    }
+    if (!bce_->emit1(JSOp::SetRval)) {
+      return false;
+    }
+  }
+
+  if (stack == ExceptionStack::No) {
+    if (!bce_->emit1(JSOp::Exception)) {
+      return false;
+    }
+  } else {
+    if (!bce_->emit1(JSOp::ExceptionAndStack)) {
+      return false;
+    }
+  }
+
+#ifdef DEBUG
+  state_ = State::Catch;
+#endif
+  return true;
+}
+
+bool TryEmitter::emitCatchEnd() {
+  MOZ_ASSERT(state_ == State::Catch);
+
+  if (!controlInfo_) {
+    return true;
+  }
+
+  if (hasFinally()) {
+    if (!emitJumpToFinallyWithFallthrough()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool TryEmitter::emitFinally(
+    const Maybe<uint32_t>& finallyPos ) {
+  if (!controlInfo_) {
+    if (kind_ == Kind::TryCatch) {
+      kind_ = Kind::TryCatchFinally;
+    }
+  } else {
+    MOZ_ASSERT(hasFinally());
+  }
+
+  if (!hasCatch()) {
+    MOZ_ASSERT(state_ == State::Try);
+    if (!emitTryEnd()) {
+      return false;
+    }
+  } else {
+    MOZ_ASSERT(state_ == State::Catch);
+    if (!emitCatchEnd()) {
+      return false;
+    }
+  }
+
+  MOZ_ASSERT(bce_->bytecodeSection().stackDepth() == depth_);
+
+  bce_->bytecodeSection().setStackDepth(depth_ + 3);
+
+  if (!bce_->emitJumpTarget(&finallyStart_)) {
+    return false;
+  }
+
+  if (controlInfo_) {
+    bce_->patchJumpsToTarget(controlInfo_->finallyJumps_, finallyStart_);
+
+    controlInfo_->setEmittingSubroutine();
+  }
+  if (finallyPos) {
+    if (!bce_->updateSourceCoordNotes(finallyPos.value())) {
+      return false;
+    }
+  }
+  if (!bce_->emit1(JSOp::Finally)) {
+    return false;
+  }
+
+  if (shouldUpdateRval()) {
+    if (!bce_->emit1(JSOp::GetRval)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::Undefined)) {
+      return false;
+    }
+    if (!bce_->emit1(JSOp::SetRval)) {
+      return false;
+    }
+  }
+
+#ifdef DEBUG
+  state_ = State::Finally;
+#endif
+  return true;
+}
+
+bool TryEmitter::emitFinallyEnd() {
+  MOZ_ASSERT(state_ == State::Finally);
+
+  if (shouldUpdateRval()) {
+    if (!bce_->emit1(JSOp::SetRval)) {
+      return false;
+    }
+  }
+
+
+  InternalIfEmitter ifThrowing(bce_);
+  if (!ifThrowing.emitThenElse()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::ThrowWithStack)) {
+    return false;
+  }
+
+  if (!ifThrowing.emitElse()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  if (controlInfo_ && !controlInfo_->continuations_.empty()) {
+    if (!controlInfo_->emitContinuations(bce_)) {
+      return false;
+    }
+  } else {
+    // and fall through.
+    if (!bce_->emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+  if (!ifThrowing.emitEnd()) {
+    return false;
+  }
+
+  bce_->hasTryFinally = true;
+  return true;
+}
+
+bool TryEmitter::emitEnd() {
+  if (!hasFinally()) {
+    MOZ_ASSERT(state_ == State::Catch);
+    if (!emitCatchEnd()) {
+      return false;
+    }
+  } else {
+    MOZ_ASSERT(state_ == State::Finally);
+    if (!emitFinallyEnd()) {
+      return false;
+    }
+  }
+
+  MOZ_ASSERT(bce_->bytecodeSection().stackDepth() == depth_);
+
+  if (catchAndFinallyJump_.offset.valid()) {
+    if (!bce_->emitJumpTargetAndPatch(catchAndFinallyJump_)) {
+      return false;
+    }
+  }
+
+  if (hasCatch()) {
+    if (!bce_->addTryNote(TryNoteKind::Catch, depth_, offsetAfterTryOp(),
+                          tryEnd_.offset)) {
+      return false;
+    }
+  }
+
+  if (hasFinally()) {
+    if (!bce_->addTryNote(TryNoteKind::Finally, depth_, offsetAfterTryOp(),
+                          finallyStart_.offset)) {
+      return false;
+    }
+  }
+
+#ifdef DEBUG
+  state_ = State::End;
+#endif
+  return true;
+}
+
+bool TryEmitter::shouldUpdateRval() const {
+  return requiresControlInfo() && !bce_->sc->noScriptRval();
+}

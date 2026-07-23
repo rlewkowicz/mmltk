@@ -1,0 +1,88 @@
+/*
+ * Copyright 2008 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPixelRef_DEFINED)
+#define SkPixelRef_DEFINED
+
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkSize.h"
+#include "include/private/SkIDChangeListener.h"
+#include "include/private/SkPixelStorage.h"
+#include "include/private/base/SkAPI.h"
+#include "include/private/base/SkTo.h"
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+
+class SkDiscardableMemory;
+
+class SK_API SkPixelRef : public SkPixelStorage, public SkRefCnt {
+public:
+    SkPixelRef(int width, int height, void* addr, size_t rowBytes);
+    ~SkPixelRef() override;
+
+    Type type() const override;
+
+    SkISize dimensions() const { return {fWidth, fHeight}; }
+    int width() const { return fWidth; }
+    int height() const { return fHeight; }
+    void* pixels() const { return fPixels; }
+    size_t rowBytes() const { return fRowBytes; }
+
+    uint32_t getGenerationID() const;
+
+    void notifyPixelsChanged();
+
+    bool isImmutable() const { return fMutability != kMutable; }
+
+    void setImmutable();
+
+    void addGenIDChangeListener(sk_sp<SkIDChangeListener> listener);
+
+    void notifyAddedToCache() {
+        fAddedToCache.store(true);
+    }
+
+    virtual SkDiscardableMemory* diagnostic_only_getDiscardable() const { return nullptr; }
+
+protected:
+    void android_only_reset(int width, int height, size_t rowBytes);
+
+private:
+    int                 fWidth;
+    int                 fHeight;
+    void*               fPixels;
+    size_t              fRowBytes;
+
+    bool genIDIsUnique() const { return SkToBool(fTaggedGenID.load() & 1); }
+    mutable std::atomic<uint32_t> fTaggedGenID;
+
+    SkIDChangeListener::List fGenIDChangeListeners;
+
+    std::atomic<bool> fAddedToCache;
+
+    enum Mutability {
+        kMutable,               
+        kTemporarilyImmutable,  
+        kImmutable,             
+    } fMutability : 8;          
+
+    void needsNewGenID();
+    void callGenIDChangeListeners();
+
+    void setTemporarilyImmutable();
+    void restoreMutability();
+    friend class SkSurface_Raster;  
+
+    void setImmutableWithID(uint32_t genID);
+    friend void SkBitmapCache_setImmutableWithID(SkPixelRef*, uint32_t);
+
+    using INHERITED = SkRefCnt;
+};
+
+#endif

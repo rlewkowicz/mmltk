@@ -1,0 +1,46 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "AxisPhysicsMSDModel.h"
+#include <math.h>  // for sqrt and fabs
+
+namespace mozilla {
+namespace layers {
+
+AxisPhysicsMSDModel::AxisPhysicsMSDModel(double aInitialPosition,
+                                         double aInitialDestination,
+                                         double aInitialVelocity,
+                                         double aSpringConstant,
+                                         double aDampingRatio)
+    : AxisPhysicsModel(aInitialPosition, aInitialVelocity),
+      mDestination(aInitialDestination),
+      mSpringConstant(aSpringConstant),
+      mSpringConstantSqrtXTwo(sqrt(mSpringConstant) * 2.0),
+      mDampingRatio(aDampingRatio) {}
+
+AxisPhysicsMSDModel::~AxisPhysicsMSDModel() = default;
+
+double AxisPhysicsMSDModel::Acceleration(const State& aState) {
+
+  double spring_force = (mDestination - aState.p) * mSpringConstant;
+  double damp_force = -aState.v * mDampingRatio * mSpringConstantSqrtXTwo;
+
+  return spring_force + damp_force;
+}
+
+double AxisPhysicsMSDModel::GetDestination() const { return mDestination; }
+
+void AxisPhysicsMSDModel::SetDestination(double aDestination) {
+  mDestination = aDestination;
+}
+
+bool AxisPhysicsMSDModel::IsFinished(double aSmallestVisibleIncrement) const {
+  const double finishVelocity = aSmallestVisibleIncrement * 2;
+
+  return fabs(mDestination - GetPosition()) < aSmallestVisibleIncrement &&
+         fabs(GetVelocity()) <= finishVelocity;
+}
+
+}  
+}  

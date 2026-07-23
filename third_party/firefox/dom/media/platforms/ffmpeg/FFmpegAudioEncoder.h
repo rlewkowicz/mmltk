@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_PLATFORMS_FFMPEG_FFMPEGAUDIOENCODER_H_
+#define DOM_MEDIA_PLATFORMS_FFMPEG_FFMPEGAUDIOENCODER_H_
+
+#include "FFmpegDataEncoder.h"
+#include "FFmpegLibWrapper.h"
+#include "PlatformEncoderModule.h"
+#include "TimedPacketizer.h"
+
+#include "FFmpegLibs.h"
+#include "speex/speex_resampler.h"
+
+namespace mozilla {
+
+template <int V>
+class FFmpegAudioEncoder : public FFmpegDataEncoder<V> {};
+
+template <>
+class FFmpegAudioEncoder<LIBAV_VER> : public FFmpegDataEncoder<LIBAV_VER> {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(FFmpegAudioEncoder, final);
+
+  FFmpegAudioEncoder(const FFmpegLibWrapper* aLib, AVCodecID aCodecID,
+                     const RefPtr<TaskQueue>& aTaskQueue,
+                     const EncoderConfig& aConfig);
+
+  RefPtr<InitPromise> Init() override;
+
+  nsCString GetDescriptionName() const override;
+
+ protected:
+  virtual ~FFmpegAudioEncoder() = default;
+  virtual MediaResult InitEncoder() override;
+#if LIBAVCODEC_VERSION_MAJOR >= 58
+  Result<EncodedData, MediaResult> EncodeOnePacket(Span<float> aSamples,
+                                                   media::TimeUnit aPts);
+  Result<EncodedData, MediaResult> EncodeInputWithModernAPIs(
+      RefPtr<const MediaData> aSample) override;
+  Result<MediaDataEncoder::EncodedData, MediaResult> DrainWithModernAPIs()
+      override;
+#endif
+  virtual Result<RefPtr<MediaRawData>, MediaResult> ToMediaRawData(
+      AVPacket* aPacket) override;
+  Result<already_AddRefed<MediaByteBuffer>, MediaResult> GetExtraData(
+      AVPacket* aPacket) override;
+  Maybe<TimedPacketizer<float, float>> mPacketizer;
+  nsTArray<float> mTempBuffer;
+  media::TimeUnit mFirstPacketPts{media::TimeUnit::Invalid()};
+  struct ResamplerDestroy {
+    void operator()(SpeexResamplerState* aResampler);
+  };
+  int mInputSampleRate = 0;
+  UniquePtr<SpeexResamplerState, ResamplerDestroy> mResampler;
+  uint64_t mPacketsDelivered = 0;
+  int mDtxThreshold = 0;
+};
+
+}  
+
+#endif  // DOM_MEDIA_PLATFORMS_FFMPEG_FFMPEGAUDIOENCODER_H_

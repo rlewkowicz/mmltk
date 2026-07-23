@@ -1,0 +1,38 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_quota_stringifyutils_h_
+#define mozilla_dom_quota_stringifyutils_h_
+
+#include "mozilla/ThreadLocal.h"
+#include "nsLiteralString.h"
+#include "nsTHashSet.h"
+
+namespace mozilla {
+
+constexpr auto kStringifyDelimiter = "|"_ns;
+constexpr auto kStringifyStartSet = "["_ns;
+constexpr auto kStringifyEndSet = "]"_ns;
+constexpr auto kStringifyStartInstance = "{"_ns;
+constexpr auto kStringifyEndInstance = "}"_ns;
+
+class Stringifyable {
+ public:
+  void Stringify(nsACString& aData);
+
+  static void InitTLS();
+
+ private:
+  virtual void DoStringify(nsACString& aData) = 0;
+
+  bool IsActive();
+  void SetActive(bool aIsActive);
+
+  static MOZ_THREAD_LOCAL(nsTHashSet<Stringifyable*>*)
+      sActiveStringifyableInstances;
+};
+
+}  
+
+#endif  // mozilla_dom_quota_stringifyutils_h_

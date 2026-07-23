@@ -1,0 +1,145 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_SVGINTEGRATIONUTILS_H_
+#define LAYOUT_SVG_SVGINTEGRATIONUTILS_H_
+
+#include "ImgDrawResult.h"
+#include "gfxMatrix.h"
+#include "gfxRect.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/gfx/Rect.h"
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "nsRegionFwd.h"
+
+class gfxContext;
+class gfxDrawable;
+class nsIFrame;
+struct nsPoint;
+struct nsRect;
+struct nsSize;
+
+#undef UNSUPPORTED
+
+enum class WrFiltersStatus {
+  UNSUPPORTED = 0,
+  DISABLED_FOR_PERFORMANCE = 1,
+  BLOB_FALLBACK = 2,
+  CHAIN = 3,
+  SVGFE = 4,
+};
+
+struct WrFiltersHolder {
+  nsTArray<mozilla::wr::FilterOp> filters;
+  nsTArray<mozilla::wr::WrFilterData> filter_datas;
+  mozilla::Maybe<nsRect> post_filters_clip;
+  nsTArray<nsTArray<float>> values;
+};
+
+namespace mozilla {
+class nsDisplayList;
+class nsDisplayListBuilder;
+
+enum class StyleFilterType : uint8_t { BackdropFilter, Filter };
+
+namespace gfx {
+class DrawTarget;
+}  
+
+class SVGIntegrationUtils final {
+  using DrawTarget = gfx::DrawTarget;
+  using IntRect = gfx::IntRect;
+  using imgDrawingParams = image::imgDrawingParams;
+
+ public:
+  static bool UsingOverflowAffectingEffects(const nsIFrame* aFrame);
+
+  static bool UsingEffectsForFrame(const nsIFrame* aFrame);
+
+  static nsSize GetContinuationUnionSize(nsIFrame* aNonSVGFrame);
+
+  static gfx::Size GetSVGCoordContextForNonSVGFrame(nsIFrame* aNonSVGFrame);
+
+  static gfxRect GetSVGBBoxForNonSVGFrame(nsIFrame* aNonSVGFrame,
+                                          bool aUnionContinuations);
+
+  static nsRect ComputePostEffectsInkOverflowRect(
+      nsIFrame* aFrame, const nsRect& aPreEffectsOverflowRect);
+
+  static nsRect GetRequiredSourceForInvalidArea(nsIFrame* aFrame,
+                                                const nsRect& aDirtyRect);
+
+  static bool HitTestFrameForEffects(nsIFrame* aFrame, const nsPoint& aPt);
+
+  struct MOZ_STACK_CLASS PaintFramesParams {
+    gfxContext& ctx;
+    nsIFrame* frame;
+    nsRect dirtyRect;
+    nsRect borderArea;
+    nsDisplayListBuilder* builder;
+    bool handleOpacity;  
+    Maybe<LayoutDeviceRect> maskRect;
+    imgDrawingParams& imgParams;
+
+    explicit PaintFramesParams(gfxContext& aCtx, nsIFrame* aFrame,
+                               const nsRect& aDirtyRect,
+                               const nsRect& aBorderArea,
+                               nsDisplayListBuilder* aBuilder,
+                               bool aHandleOpacity,
+                               imgDrawingParams& aImgParams)
+        : ctx(aCtx),
+          frame(aFrame),
+          dirtyRect(aDirtyRect),
+          borderArea(aBorderArea),
+          builder(aBuilder),
+          handleOpacity(aHandleOpacity),
+          imgParams(aImgParams) {}
+  };
+
+  static void PaintMaskAndClipPath(const PaintFramesParams& aParams,
+                                   const std::function<void()>& aPaintChild);
+
+  static bool PaintMask(const PaintFramesParams& aParams,
+                        bool& aOutIsMaskComplete);
+
+  using SVGFilterPaintCallback = std::function<void(
+      gfxContext& aContext, imgDrawingParams&, const gfxMatrix* aTransform,
+      const nsIntRect* aDirtyRect)>;
+
+  static void PaintFilter(const PaintFramesParams& aParams,
+                          Span<const StyleFilter> aFilters,
+                          const SVGFilterPaintCallback& aCallback);
+
+  static WrFiltersStatus CreateWebRenderCSSFilters(
+      Span<const StyleFilter> aFilters, nsIFrame* aFrame,
+      WrFiltersHolder& aWrFilters);
+
+  static WrFiltersStatus BuildWebRenderFilters(
+      nsIFrame* aFilteredFrame, Span<const StyleFilter> aFilters,
+      StyleFilterType aStyleFilterType, WrFiltersHolder& aWrFilters,
+      const nsPoint& aOffsetForSVGFilters);
+
+  static bool CanCreateWebRenderFiltersForFrame(nsIFrame* aFrame);
+
+  static bool UsesSVGEffectsNotSupportedInCompositor(nsIFrame* aFrame);
+
+  enum class DecodeFlag {
+    SyncDecodeImages,
+  };
+  using DecodeFlags = EnumSet<DecodeFlag>;
+
+  static already_AddRefed<gfxDrawable> DrawableFromPaintServer(
+      nsIFrame* aFrame, nsIFrame* aTarget, const nsSize& aPaintServerSize,
+      const gfx::IntSize& aRenderSize, const DrawTarget* aDrawTarget,
+      const gfxMatrix& aContextMatrix, DecodeFlags aFlags);
+
+  static nsPoint GetOffsetToBoundingBox(nsIFrame* aFrame);
+
+  static gfxPoint GetOffsetToUserSpaceInDevPx(nsIFrame* aFrame,
+                                              const PaintFramesParams& aParams);
+};
+
+}  
+
+#endif  // LAYOUT_SVG_SVGINTEGRATIONUTILS_H_

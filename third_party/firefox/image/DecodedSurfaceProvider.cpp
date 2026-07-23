@@ -1,0 +1,201 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DecodedSurfaceProvider.h"
+
+#include "Decoder.h"
+#include "mozilla/StaticPrefs_image.h"
+#include "mozilla/layers/SharedSurfacesChild.h"
+#include "nsProxyRelease.h"
+
+using namespace mozilla::gfx;
+using namespace mozilla::layers;
+
+namespace mozilla {
+namespace image {
+
+DecodedSurfaceProvider::DecodedSurfaceProvider(NotNull<RasterImage*> aImage,
+                                               const SurfaceKey& aSurfaceKey,
+                                               NotNull<Decoder*> aDecoder)
+    : ISurfaceProvider(ImageKey(aImage.get()), aSurfaceKey,
+                       AvailabilityState::StartAsPlaceholder()),
+      mImage(aImage.get()),
+      mMutex("mozilla::image::DecodedSurfaceProvider"),
+      mDecoder(aDecoder.get()) {
+  MOZ_ASSERT(!mDecoder->IsMetadataDecode(),
+             "Use MetadataDecodingTask for metadata decodes");
+  MOZ_ASSERT(mDecoder->IsFirstFrameDecode(),
+             "Use AnimationSurfaceProvider for animation decodes");
+}
+
+DecodedSurfaceProvider::~DecodedSurfaceProvider() { DropImageReference(); }
+
+void DecodedSurfaceProvider::DropImageReference() {
+  if (!mImage) {
+    return;  
+  }
+
+  RefPtr<RasterImage> image = mImage;
+  mImage = nullptr;
+  SurfaceCache::ReleaseImageOnMainThread(image.forget(),
+                                          true);
+}
+
+DrawableFrameRef DecodedSurfaceProvider::DrawableRef(size_t aFrame) {
+  MOZ_ASSERT(aFrame == 0,
+             "Requesting an animation frame from a DecodedSurfaceProvider?");
+
+  if (Availability().IsPlaceholder()) {
+    MOZ_ASSERT_UNREACHABLE("Calling DrawableRef() on a placeholder");
+    return DrawableFrameRef();
+  }
+
+  if (!mSurface) {
+    MOZ_ASSERT_UNREACHABLE("Calling DrawableRef() when we have no surface");
+    return DrawableFrameRef();
+  }
+
+  return mSurface->DrawableRef();
+}
+
+bool DecodedSurfaceProvider::IsFinished() const {
+  if (Availability().IsPlaceholder()) {
+    MOZ_ASSERT_UNREACHABLE("Calling IsFinished() on a placeholder");
+    return false;
+  }
+
+  if (!mSurface) {
+    MOZ_ASSERT_UNREACHABLE("Calling IsFinished() when we have no surface");
+    return false;
+  }
+
+  return mSurface->IsFinished();
+}
+
+void DecodedSurfaceProvider::SetLocked(bool aLocked) {
+  if (Availability().IsPlaceholder()) {
+    MOZ_ASSERT_UNREACHABLE("Calling SetLocked() on a placeholder");
+    return;
+  }
+
+  if (!mSurface) {
+    MOZ_ASSERT_UNREACHABLE("Calling SetLocked() when we have no surface");
+    return;
+  }
+
+  if (aLocked == IsLocked()) {
+    return;  
+  }
+
+  mLockRef = aLocked ? mSurface->DrawableRef() : DrawableFrameRef();
+}
+
+size_t DecodedSurfaceProvider::LogicalSizeInBytes() const {
+  IntSize size = GetSurfaceKey().Size();
+  return size_t(size.width) * size_t(size.height) * sizeof(uint32_t);
+}
+
+void DecodedSurfaceProvider::Run() {
+  MutexAutoLock lock(mMutex);
+
+  if (!mDecoder || !mImage) {
+    MOZ_ASSERT_UNREACHABLE("Running after decoding finished?");
+    return;
+  }
+
+  LexerResult result = mDecoder->Decode(WrapNotNull(this));
+
+  CheckForNewSurface();
+
+  if (result.is<TerminalState>()) {
+    FinishDecoding();
+    return;  
+  }
+
+  if (mDecoder->HasProgress()) {
+    NotifyProgress(WrapNotNull(mImage), WrapNotNull(mDecoder));
+  }
+
+  MOZ_ASSERT(result.is<Yield>());
+
+  if (result == LexerResult(Yield::NEED_MORE_DATA)) {
+    return;
+  }
+
+  MOZ_ASSERT_UNREACHABLE("Unexpected yield for single-frame image");
+  mDecoder->TerminateFailure();
+  FinishDecoding();
+}
+
+void DecodedSurfaceProvider::CheckForNewSurface() {
+  mMutex.AssertCurrentThreadOwns();
+  MOZ_ASSERT(mDecoder);
+
+  if (mSurface) {
+    MOZ_ASSERT(mSurface.get() == mDecoder->GetCurrentFrameRef().get(),
+               "DecodedSurfaceProvider and Decoder have different surfaces?");
+    return;
+  }
+
+  mSurface = mDecoder->GetCurrentFrameRef().get();
+  if (!mSurface) {
+    return;  
+  }
+
+  MOZ_ASSERT(mImage);
+  SurfaceCache::SurfaceAvailable(WrapNotNull(this));
+}
+
+void DecodedSurfaceProvider::FinishDecoding() {
+  mMutex.AssertCurrentThreadOwns();
+  MOZ_ASSERT(mImage);
+  MOZ_ASSERT(mDecoder);
+
+  NotifyDecodeComplete(WrapNotNull(mImage), WrapNotNull(mDecoder));
+
+  if (mSurface && mSurface->IsFinished()) {
+    SurfaceCache::PruneImage(ImageKey(mImage));
+  }
+
+  mDecoder = nullptr;
+
+  DropImageReference();
+}
+
+bool DecodedSurfaceProvider::ShouldPreferSyncRun() const {
+  return mDecoder->ShouldSyncDecode(
+      StaticPrefs::image_mem_decode_bytes_at_a_time_AtStartup());
+}
+
+nsresult DecodedSurfaceProvider::UpdateKey(
+    layers::RenderRootStateManager* aManager,
+    wr::IpcResourceUpdateQueue& aResources, wr::ImageKey& aKey) {
+  MOZ_ASSERT(mSurface);
+  RefPtr<SourceSurface> surface = mSurface->GetSourceSurface();
+  if (!surface) {
+    return NS_ERROR_FAILURE;
+  }
+
+  return SharedSurfacesChild::Share(surface, aManager, aResources, aKey);
+}
+
+nsresult SimpleSurfaceProvider::UpdateKey(
+    layers::RenderRootStateManager* aManager,
+    wr::IpcResourceUpdateQueue& aResources, wr::ImageKey& aKey) {
+  if (mDirty) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<SourceSurface> surface = mSurface->GetSourceSurface();
+  if (!surface) {
+    return NS_ERROR_FAILURE;
+  }
+
+  return SharedSurfacesChild::Share(surface, aManager, aResources, aKey);
+}
+
+void SimpleSurfaceProvider::InvalidateSurface() { mDirty = true; }
+
+}  
+}  

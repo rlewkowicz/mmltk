@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_SerializedStackHolder_h
+#define mozilla_dom_SerializedStackHolder_h
+
+#include "mozilla/dom/StructuredCloneHolder.h"
+#include "mozilla/dom/WorkerRef.h"
+
+namespace mozilla::dom {
+
+class SerializedStackHolder {
+  StructuredCloneHolder mHolder;
+
+  RefPtr<ThreadSafeWorkerRef> mWorkerRef;
+
+  void WriteStack(JSContext* aCx, JS::Handle<JSObject*> aStack);
+
+ public:
+  SerializedStackHolder();
+
+  void SerializeMainThreadOrWorkletStack(JSContext* aCx,
+                                         JS::Handle<JSObject*> aStack);
+
+  void SerializeWorkerStack(JSContext* aCx, WorkerPrivate* aWorkerPrivate,
+                            JS::Handle<JSObject*> aStack);
+
+  void SerializeCurrentStack(JSContext* aCx);
+
+  JSObject* ReadStack(JSContext* aCx);
+};
+
+UniquePtr<SerializedStackHolder> GetCurrentStackForNetMonitor(JSContext* aCx);
+
+UniquePtr<SerializedStackHolder> GetCurrentStack(JSContext* aCx);
+
+void NotifyNetworkMonitorAlternateStack(
+    nsISupports* aChannel, UniquePtr<SerializedStackHolder> aStackHolder);
+
+void ConvertSerializedStackToJSON(UniquePtr<SerializedStackHolder> aStackHolder,
+                                  nsAString& aStackString);
+
+void NotifyNetworkMonitorAlternateStack(nsISupports* aChannel,
+                                        const nsAString& aStackJSON);
+
+}  
+
+#endif  // mozilla_dom_SerializedStackHolder_h

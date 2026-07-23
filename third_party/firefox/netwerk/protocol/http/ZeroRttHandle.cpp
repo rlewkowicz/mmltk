@@ -1,0 +1,272 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HttpLog.h"
+
+#include "ZeroRttHandle.h"
+
+#include "HappyEyeballsConnectionAttempt.h"
+#include "HappyEyeballsTransaction.h"
+#include "HttpConnectionBase.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "nsAHttpTransaction.h"
+#include "nsHttpRequestHead.h"
+#include "nsHttpTransaction.h"
+#include "nsIInputStream.h"
+#include "nsISeekableStream.h"
+#include "nsSocketTransportService2.h"
+#include "nsWeakReference.h"
+
+#undef LOG
+#define LOG(args) LOG5(args)
+#undef LOG_ENABLED
+#define LOG_ENABLED() LOG5_ENABLED()
+
+namespace mozilla::net {
+
+ZeroRttHandle::ZeroRttHandle(HappyEyeballsConnectionAttempt* aHet)
+    : mHet(aHet ? do_GetWeakReference(
+                      static_cast<nsSupportsWeakReference*>(aHet))
+                : nullptr) {}
+
+static bool IsUsableRealTxn(nsHttpTransaction* aRealTxn) {
+  return aRealTxn && !aRealTxn->Closed();
+}
+
+static nsHttpTransaction* ResolveRealTxn(const nsWeakPtr& aHet) {
+  if (!aHet) {
+    return nullptr;
+  }
+  RefPtr<HappyEyeballsConnectionAttempt> het = do_QueryReferent(aHet);
+  nsHttpTransaction* realTxn = het ? het->RealHttpTransaction() : nullptr;
+  return IsUsableRealTxn(realTxn) ? realTxn : nullptr;
+}
+
+bool ZeroRttHandle::Do0RTT(HappyEyeballsTransaction* aCaller,
+                           bool aCanSendEarlyData) {
+  LOG(("ZeroRttHandle::Do0RTT %p caller=%p", this, aCaller));
+
+  nsHttpTransaction* realTxn = ResolveRealTxn(mHet);
+  if (!realTxn) {
+    return false;
+  }
+
+  if (!aCanSendEarlyData) {
+    (void)realTxn->Do0RTT(false);
+    return false;
+  }
+
+  if (aCaller->Request0RttStreamOffset().isSome()) {
+    return true;
+  }
+  if (mWinner) {
+    return false;
+  }
+  const nsHttpRequestHead* head = realTxn->RequestHead();
+  if (!head || !head->IsSafeMethod()) {
+    return false;
+  }
+
+  if (!mAny0RttStarted) {
+    RefPtr<HappyEyeballsConnectionAttempt> attempt = do_QueryReferent(mHet);
+    if (!attempt || !attempt->LockInRealTransactionFromPendingQueue()) {
+      LOG(
+          ("ZeroRttHandle::Do0RTT %p caller=%p declining — real txn "
+           "already dispatched elsewhere",
+           this, aCaller));
+      return false;
+    }
+
+    MOZ_ASSERT(mState == State::Open,
+               "Do0RTT locking transaction from queue on a non-Open handle");
+  }
+
+  LOG(("ZeroRttHandle::Do0RTT %p caller=%p accepted, offset=0", this, aCaller));
+  aCaller->Request0RttStreamOffset() = Some(uint64_t(0));
+  mAny0RttStarted = true;
+  return true;
+}
+
+static nsresult ZeroRttForwardReadSegment(nsIInputStream* ,
+                                          void* aClosure, const char* aBuf,
+                                          uint32_t , uint32_t aCount,
+                                          uint32_t* aCountRead) {
+  auto* reader = static_cast<nsAHttpSegmentReader*>(aClosure);
+  return reader->OnReadSegment(aBuf, aCount, aCountRead);
+}
+
+nsresult ZeroRttHandle::ReadSegments(Maybe<uint64_t>& aOffset,
+                                     nsAHttpSegmentReader* aReader,
+                                     uint32_t aCount, uint32_t* aCountRead) {
+  *aCountRead = 0;
+
+  if (aOffset.isNothing()) {
+    return NS_BASE_STREAM_CLOSED;
+  }
+  nsHttpTransaction* realTxn = ResolveRealTxn(mHet);
+  if (!realTxn) {
+    return NS_BASE_STREAM_CLOSED;
+  }
+  if (mWinner) {
+    return NS_BASE_STREAM_CLOSED;
+  }
+  nsCOMPtr<nsIInputStream> stream = realTxn->RequestStream();
+  if (!stream) {
+    return NS_BASE_STREAM_CLOSED;
+  }
+
+  nsCOMPtr<nsISeekableStream> seekable = do_QueryInterface(stream);
+  if (!seekable) {
+    LOG(("ZeroRttHandle::ReadSegments %p stream not seekable", this));
+    return NS_BASE_STREAM_CLOSED;
+  }
+  nsresult rv = seekable->Seek(nsISeekableStream::NS_SEEK_SET,
+                               static_cast<int64_t>(aOffset.value()));
+  if (NS_FAILED(rv)) {
+    LOG(("ZeroRttHandle::ReadSegments %p seek to %" PRIu64 " failed rv=%x",
+         this, aOffset.value(), static_cast<uint32_t>(rv)));
+    return rv;
+  }
+
+  rv = stream->ReadSegments(ZeroRttForwardReadSegment, aReader, aCount,
+                            aCountRead);
+  if (NS_SUCCEEDED(rv) && *aCountRead > 0) {
+    aOffset = Some(aOffset.value() + *aCountRead);
+    LOG(("ZeroRttHandle::ReadSegments %p read=%u newOffset=%" PRIu64, this,
+         *aCountRead, aOffset.value()));
+    realTxn->MarkEarlyDataSent();
+  }
+  return rv;
+}
+
+nsresult ZeroRttHandle::Finish0RTT(HappyEyeballsTransaction* aCaller,
+                                   bool aRestart, bool aAlpnChanged) {
+  LOG(("ZeroRttHandle::Finish0RTT %p caller=%p restart=%d alpnChanged=%d", this,
+       aCaller, aRestart, aAlpnChanged));
+
+  if (aCaller->Request0RttStreamOffset().isNothing()) {
+    MOZ_ASSERT(false, "Caller wasn't in the 0-RTT flow");
+    return NS_OK;
+  }
+
+  if (mState != State::Open) {
+    LOG(("ZeroRttHandle::Finish0RTT %p handle not Open (state=%d); ignoring",
+         this, static_cast<int>(mState)));
+    return NS_OK;
+  }
+
+
+  //   Action: fall through to InvokeCallback(NS_OK) so HE declares the winner
+  //   Action: fall through so HE declares the winner and retries normally.
+  if (aRestart && aAlpnChanged) {
+    bool isH3 = false;
+    if (nsAHttpConnection* conn = aCaller->Connection()) {
+      if (RefPtr<HttpConnectionBase> base = conn->HttpConnection()) {
+        isH3 = base->UsingHttp3();
+      }
+    }
+    if (!isH3) {
+      nsHttpTransaction* realTxn = ResolveRealTxn(mHet);
+      if (realTxn) {
+        realTxn->FinishAdopted0RTT(true);
+      }
+      aCaller->MaybeRemoveSSLTokens();
+      aCaller->Close(NS_ERROR_NET_RESET);
+      return NS_OK;
+    }
+  }
+
+  nsHttpTransaction* realTxn = ResolveRealTxn(mHet);
+  if (!realTxn) {
+    LOG(("ZeroRttHandle::Finish0RTT %p real txn gone; closing caller=%p", this,
+         aCaller));
+    RefPtr<HttpConnectionBase> base;
+    if (nsAHttpConnection* conn = aCaller->Connection()) {
+      base = conn->HttpConnection();
+    }
+    Cleanup();
+
+    aCaller->Close(NS_ERROR_ABORT);
+    if (base) {
+      base->Close(NS_ERROR_ABORT);
+    }
+    return NS_OK;
+  }
+
+  Transition(State::WinnerDeclared, aCaller, aRestart);
+
+  realTxn->FinishAdopted0RTT(aRestart);
+
+  RefPtr<HappyEyeballsConnectionAttempt> het = do_QueryReferent(mHet);
+  if (het) {
+    het->AdoptWinner(aCaller);
+  }
+
+  Cleanup();
+
+  if (!mRejected) {
+    uint64_t seekTo = aCaller->Request0RttStreamOffset().value();
+    nsCOMPtr<nsISeekableStream> seekable =
+        do_QueryInterface(realTxn->RequestStream());
+    if (seekable) {
+      nsresult rv = seekable->Seek(nsISeekableStream::NS_SEEK_SET,
+                                   static_cast<int64_t>(seekTo));
+      LOG(("ZeroRttHandle::Finish0RTT %p seek to %" PRIu64 " rv=%x", this,
+           seekTo, static_cast<uint32_t>(rv)));
+    }
+  }
+
+  aCaller->InvokeCallback();
+  return NS_OK;
+}
+
+bool ZeroRttHandle::ShouldDisqualify(
+    const HappyEyeballsTransaction* aCaller) const {
+  return aCaller->Request0RttStreamOffset().isNothing() && mAny0RttStarted;
+}
+
+void ZeroRttHandle::Cleanup() {
+  MOZ_ASSERT(OnSocketThread(), "ZeroRttHandle::Cleanup off the socket thread");
+  if (mState == State::CleanedUp) {
+    return;
+  }
+  Transition(State::CleanedUp);
+}
+
+void ZeroRttHandle::Transition(State aNext, HappyEyeballsTransaction* aWinner,
+                               bool aRejected) {
+  LOG(("ZeroRttHandle::Transition %p mState=%d aNext=%d", this,
+       static_cast<int>(mState), static_cast<int>(aNext)));
+  switch (aNext) {
+    case State::Open:
+      MOZ_ASSERT_UNREACHABLE(
+          "Open is the constructed state; cannot transition into it");
+      break;
+
+    case State::WinnerDeclared:
+      MOZ_ASSERT(mState == State::Open, "Open -> WinnerDeclared only");
+      MOZ_ASSERT(aWinner, "WinnerDeclared entry requires winner");
+      mState = State::WinnerDeclared;
+      mWinner = aWinner;
+      mHadWinner = true;
+      if (aRejected) {
+        mRejected = true;
+      }
+      break;
+
+    case State::CleanedUp:
+      MOZ_ASSERT(mState == State::Open || mState == State::WinnerDeclared,
+                 "CleanedUp entry from Open or WinnerDeclared only");
+      mState = State::CleanedUp;
+      mHet = nullptr;
+      mWinner = nullptr;  
+      break;
+  }
+}
+
+nsHttpTransaction* ZeroRttHandle::RealTxn() const {
+  return ResolveRealTxn(mHet);
+}
+
+}  

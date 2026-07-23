@@ -1,0 +1,118 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef LAYOUT_GENERIC_ABSOLUTE_CONTAINING_BLOCK_H_
+#define LAYOUT_GENERIC_ABSOLUTE_CONTAINING_BLOCK_H_
+
+#include "nsFrameList.h"
+#include "nsIFrame.h"
+
+class nsContainerFrame;
+class nsPresContext;
+
+namespace mozilla {
+enum class AbsPosReflowFlag : uint8_t {
+  AllowFragmentation,
+  CBWidthChanged,
+  CBHeightChanged,
+  IsGridContainerCB,
+};
+using AbsPosReflowFlags = EnumSet<AbsPosReflowFlag>;
+struct StylePositionArea;
+
+class AbsoluteContainingBlock {
+ public:
+  struct AnchorOffsetInfo {
+    nsPoint mScrollOffset;
+    StylePositionArea mResolvedPositionArea;
+  };
+
+  AbsoluteContainingBlock() = default;
+
+  const nsFrameList& GetChildList() const { return mAbsoluteFrames; }
+  const nsFrameList& GetPushedChildList() const {
+    return mPushedAbsoluteFrames;
+  }
+
+  void SetInitialChildList(nsIFrame* aDelegatingFrame, FrameChildListID aListID,
+                           nsFrameList&& aChildList);
+  void AppendFrames(nsIFrame* aDelegatingFrame, FrameChildListID aListID,
+                    nsFrameList&& aFrameList);
+  void InsertFrames(nsIFrame* aDelegatingFrame, FrameChildListID aListID,
+                    nsIFrame* aPrevFrame, nsFrameList&& aFrameList);
+  void RemoveFrame(FrameDestroyContext&, FrameChildListID, nsIFrame*);
+
+  [[nodiscard]] nsFrameList StealPushedChildList();
+
+  bool PrepareAbsoluteFrames(nsContainerFrame* aDelegatingFrame);
+
+  bool HasAbsoluteFrames() const { return mAbsoluteFrames.NotEmpty(); }
+
+  void Reflow(nsContainerFrame* aDelegatingFrame, nsPresContext* aPresContext,
+              const ReflowInput& aReflowInput, nsReflowStatus& aReflowStatus,
+              const nsRect& aContainingBlock, AbsPosReflowFlags aFlags,
+              OverflowAreas* aOverflowAreas);
+
+  using DestroyContext = nsIFrame::DestroyContext;
+  void DestroyFrames(DestroyContext&);
+
+  void MarkSizeDependentFramesDirty();
+
+  void MarkAllFramesDirty();
+
+  struct ContainingBlockRects {
+    nsRect mLocal;
+    nsRect mScrollable;
+  };
+
+ protected:
+  bool FrameDependsOnContainer(
+      nsIFrame* aFrame, bool aCBWidthChanged, bool aCBHeightChanged,
+      mozilla::AnchorPosResolutionCache* aAnchorPosResolutionCache = nullptr);
+
+  void ResolveSizeDependentOffsets(ReflowInput& aKidReflowInput,
+                                   const LogicalSize& aCBSize,
+                                   const LogicalSize& aKidSize,
+                                   const LogicalMargin& aMargin,
+                                   const AnchorOffsetInfo& aAnchorOffsetInfo,
+                                   LogicalMargin& aOffsets);
+
+  void ResolveAutoMarginsAfterLayout(ReflowInput& aKidReflowInput,
+                                     const LogicalSize& aCBSize,
+                                     const LogicalSize& aKidSize,
+                                     LogicalMargin& aMargin,
+                                     const LogicalMargin& aOffsets);
+
+  void ReflowAbsoluteFrame(
+      nsContainerFrame* aDelegatingFrame, nsPresContext* aPresContext,
+      const ReflowInput& aReflowInput,
+      const ContainingBlockRects& aContainingBlockRects,
+      AbsPosReflowFlags aFlags, nsIFrame* aKidFrame, nsReflowStatus& aStatus,
+      OverflowAreas* aOverflowAreas,
+      const ContainingBlockRects* aFragmentedContainingBlockRects,
+      AnchorPosResolutionCache* aAnchorPosResolutionCache,
+      bool aReuseUnfragmentedAnchorPosReferences);
+
+  void DoMarkFramesDirty(bool aMarkAllDirty);
+
+  void StealFrame(nsIFrame* aFrame);
+
+  void DrainPushedChildList(const nsIFrame* aDelegatingFrame);
+
+  nsFrameList mAbsoluteFrames;
+
+  nsFrameList mPushedAbsoluteFrames;
+
+  nscoord mCumulativeContainingBlockBSize = 0;
+
+#ifdef DEBUG
+  void SanityCheckChildListsBeforeReflow(
+      const nsIFrame* aDelegatingFrame) const;
+#endif
+};
+
+}  
+
+#endif /* LAYOUT_GENERIC_ABSOLUTE_CONTAINING_BLOCK_H_ */

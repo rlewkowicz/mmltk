@@ -1,0 +1,45 @@
+/*
+ * Copyright 2017 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkEncoder_DEFINED)
+#define SkEncoder_DEFINED
+
+#include "include/core/SkPixmap.h"
+#include "include/private/base/SkAPI.h"
+#include "include/private/base/SkNoncopyable.h"
+#include "include/private/base/SkTemplates.h"
+
+#include <cstddef>
+#include <cstdint>
+
+class SK_API SkEncoder : SkNoncopyable {
+public:
+    struct SK_API Frame {
+        SkPixmap pixmap;
+        int duration;
+    };
+
+    bool encodeRows(int numRows);
+
+    virtual ~SkEncoder() {}
+
+protected:
+
+    virtual bool onEncodeRows(int numRows) = 0;
+
+    SkEncoder(const SkPixmap& src, size_t storageBytes)
+        : fSrc(src)
+        , fCurrRow(0)
+        , fStorage(storageBytes)
+    {}
+
+    const SkPixmap&        fSrc;
+    int                    fCurrRow;
+    skia_private::AutoTMalloc<uint8_t> fStorage;
+};
+
+#endif

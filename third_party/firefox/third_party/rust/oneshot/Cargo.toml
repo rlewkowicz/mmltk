@@ -1,0 +1,63 @@
+
+[package]
+edition = "2021"
+rust-version = "1.60.0"
+name = "oneshot"
+version = "0.1.13"
+authors = ["Linus Färnstrand <faern@faern.net>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = """
+Oneshot spsc channel with (potentially) lock-free non-blocking send, and a receiver supporting
+both thread blocking receive operations as well as Future based async polling.
+"""
+keywords = [
+    "oneshot",
+    "spsc",
+    "async",
+    "sync",
+    "channel",
+]
+categories = [
+    "asynchronous",
+    "concurrency",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/faern/oneshot"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
+
+[features]
+async = []
+default = [
+    "std",
+    "async",
+]
+std = []
+
+[lib]
+name = "oneshot"
+path = "src/lib.rs"
+
+[target."cfg(oneshot_loom)".dependencies.loom]
+version = "0.7.2"
+features = ["futures"]
+optional = true
+
+[lints.rust.unexpected_cfgs]
+level = "deny"
+priority = 0
+check-cfg = [
+    "cfg(oneshot_loom)",
+    "cfg(oneshot_test_delay)",
+    "cfg(criterion)",
+]

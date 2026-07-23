@@ -1,0 +1,441 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/Components.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/MemoryReporting.h"
+
+#include "MainThreadUtils.h"
+#include "nsContentUtils.h"
+#include "nsCRT.h"
+#include "nsEffectiveTLDService.h"
+#include "nsIFile.h"
+#include "nsIURI.h"
+#include "nsNetCID.h"
+#include "nsNetUtil.h"
+#include "nsServiceManagerUtils.h"
+#include "mozilla/net/DNS.h"
+
+namespace etld_dafsa {
+
+#include "etld_data.inc"
+
+}  
+
+using namespace mozilla;
+
+NS_IMPL_ISUPPORTS(nsEffectiveTLDService, nsIEffectiveTLDService,
+                  nsIMemoryReporter)
+
+
+static StaticRefPtr<nsEffectiveTLDService> gService;
+
+nsEffectiveTLDService::nsEffectiveTLDService() : mGraph(etld_dafsa::kDafsa) {}
+
+nsresult nsEffectiveTLDService::Init() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (gService) {
+    return NS_ERROR_ALREADY_INITIALIZED;
+  }
+
+  RegisterWeakMemoryReporter(this);
+
+  return NS_OK;
+}
+
+nsEffectiveTLDService::~nsEffectiveTLDService() {
+  UnregisterWeakMemoryReporter(this);
+}
+
+already_AddRefed<nsIEffectiveTLDService>
+nsEffectiveTLDService::GetXPCOMSingleton() {
+  if (gService) {
+    return do_AddRef(gService);
+  }
+  RefPtr<nsEffectiveTLDService> instance = new nsEffectiveTLDService();
+  nsresult rv = instance->Init();
+  if (NS_FAILED(rv)) {
+    return nullptr;
+  }
+  gService = instance;
+  ClearOnShutdown(&gService);
+  return instance.forget();
+}
+
+MOZ_DEFINE_MALLOC_SIZE_OF(EffectiveTLDServiceMallocSizeOf)
+
+NS_IMETHODIMP
+nsEffectiveTLDService::CollectReports(nsIHandleReportCallback* aHandleReport,
+                                      nsISupports* aData, bool aAnonymize) {
+  MOZ_COLLECT_REPORT("explicit/network/effective-TLD-service", KIND_HEAP,
+                     UNITS_BYTES,
+                     SizeOfIncludingThis(EffectiveTLDServiceMallocSizeOf),
+                     "Memory used by the effective TLD service.");
+
+  return NS_OK;
+}
+
+size_t nsEffectiveTLDService::SizeOfIncludingThis(
+    mozilla::MallocSizeOf aMallocSizeOf) {
+  size_t n = aMallocSizeOf(this);
+
+  return n;
+}
+
+NS_IMETHODIMP
+nsEffectiveTLDService::GetPublicSuffix(nsIURI* aURI,
+                                       nsACString& aPublicSuffix) {
+  NS_ENSURE_ARG_POINTER(aURI);
+
+  nsAutoCString host;
+  nsresult rv = NS_GetInnermostURIHost(aURI, host);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  return GetBaseDomainInternal(host, 0, false, aPublicSuffix);
+}
+
+NS_IMETHODIMP
+nsEffectiveTLDService::GetKnownPublicSuffix(nsIURI* aURI,
+                                            nsACString& aPublicSuffix) {
+  NS_ENSURE_ARG_POINTER(aURI);
+
+  nsAutoCString host;
+  nsresult rv = NS_GetInnermostURIHost(aURI, host);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  return GetBaseDomainInternal(host, 0, true, aPublicSuffix);
+}
+
+NS_IMETHODIMP
+nsEffectiveTLDService::GetBaseDomain(nsIURI* aURI, uint32_t aAdditionalParts,
+                                     nsACString& aBaseDomain) {
+  NS_ENSURE_ARG_POINTER(aURI);
+  NS_ENSURE_TRUE(((int32_t)aAdditionalParts) >= 0, NS_ERROR_INVALID_ARG);
+
+  nsAutoCString host;
+  nsresult rv = NS_GetInnermostURIHost(aURI, host);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  return GetBaseDomainInternal(host, aAdditionalParts + 1, false, aBaseDomain);
+}
+
+NS_IMETHODIMP
+nsEffectiveTLDService::GetSchemelessSite(nsIURI* aURI, nsACString& aSite) {
+  NS_ENSURE_ARG_POINTER(aURI);
+
+  nsresult rv = GetBaseDomain(aURI, 0, aSite);
+  if (rv == NS_ERROR_HOST_IS_IP_ADDRESS ||
+      rv == NS_ERROR_INSUFFICIENT_DOMAIN_LEVELS) {
+    rv = nsContentUtils::GetHostOrIPv6WithBrackets(aURI, aSite);
+  }
+  return rv;
+}
+
+NS_IMETHODIMP
+nsEffectiveTLDService::GetSchemelessSiteFromHost(const nsACString& aHostname,
+                                                 nsACString& aSite) {
+  NS_ENSURE_TRUE(!aHostname.IsEmpty(), NS_ERROR_FAILURE);
+
+  nsresult rv = GetBaseDomainFromHost(aHostname, 0, aSite);
+  if (rv == NS_ERROR_HOST_IS_IP_ADDRESS ||
+      rv == NS_ERROR_INSUFFICIENT_DOMAIN_LEVELS) {
+    aSite.Assign(aHostname);
+    nsContentUtils::MaybeFixIPv6Host(aSite);
+
+    return NS_OK;
+  }
+  return rv;
+}
+
+NS_IMETHODIMP
+nsEffectiveTLDService::GetSite(nsIURI* aURI, nsACString& aSite) {
+  NS_ENSURE_ARG_POINTER(aURI);
+
+  nsAutoCString scheme;
+  nsresult rv = aURI->GetScheme(scheme);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString schemeless;
+  rv = GetSchemelessSite(aURI, schemeless);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (schemeless.Length() == 1 && schemeless.Last() == '.') {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (schemeless.IsEmpty() && !aURI->SchemeIs("file")) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  aSite.SetCapacity(scheme.Length() + 3 + schemeless.Length());
+  aSite.Append(scheme);
+  aSite.Append("://"_ns);
+  aSite.Append(schemeless);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsEffectiveTLDService::GetPublicSuffixFromHost(const nsACString& aHostname,
+                                               nsACString& aPublicSuffix) {
+  nsAutoCString normHostname;
+  nsresult rv = NS_DomainToASCIIAllowAnyGlyphfulASCII(aHostname, normHostname);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  return GetBaseDomainInternal(normHostname, 0, false, aPublicSuffix);
+}
+
+NS_IMETHODIMP
+nsEffectiveTLDService::GetKnownPublicSuffixFromHost(const nsACString& aHostname,
+                                                    nsACString& aPublicSuffix) {
+  nsAutoCString normHostname;
+  nsresult rv = NS_DomainToASCIIAllowAnyGlyphfulASCII(aHostname, normHostname);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  return GetBaseDomainInternal(normHostname, 0, true, aPublicSuffix);
+}
+
+NS_IMETHODIMP
+nsEffectiveTLDService::GetBaseDomainFromHost(const nsACString& aHostname,
+                                             uint32_t aAdditionalParts,
+                                             nsACString& aBaseDomain) {
+  NS_ENSURE_TRUE(((int32_t)aAdditionalParts) >= 0, NS_ERROR_INVALID_ARG);
+
+  nsAutoCString normHostname;
+  nsresult rv = NS_DomainToASCIIAllowAnyGlyphfulASCII(aHostname, normHostname);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  return GetBaseDomainInternal(normHostname, aAdditionalParts + 1, false,
+                               aBaseDomain);
+}
+
+NS_IMETHODIMP
+nsEffectiveTLDService::GetNextSubDomain(const nsACString& aHostname,
+                                        nsACString& aBaseDomain) {
+  nsAutoCString normHostname;
+  nsresult rv = NS_DomainToASCIIAllowAnyGlyphfulASCII(aHostname, normHostname);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  return GetBaseDomainInternal(normHostname, -1, false, aBaseDomain);
+}
+
+nsresult nsEffectiveTLDService::GetBaseDomainInternal(
+    nsCString& aHostname, int32_t aAdditionalParts, bool aOnlyKnownPublicSuffix,
+    nsACString& aBaseDomain) {
+  const int kExceptionRule = 1;
+  const int kWildcardRule = 2;
+
+  if (aHostname.IsEmpty()) {
+    return NS_ERROR_INSUFFICIENT_DOMAIN_LEVELS;
+  }
+
+  bool trailingDot = aHostname.Last() == '.';
+  if (trailingDot) {
+    aHostname.Truncate(aHostname.Length() - 1);
+  }
+
+  if (aHostname.IsEmpty() || aHostname.Last() == '.') {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  Maybe<TldCache::Entry> entry;
+  if (aAdditionalParts == 1 && NS_IsMainThread()) {
+    auto p = mMruTable.Lookup(aHostname);
+    if (p) {
+      if (NS_FAILED(p.Data().mResult)) {
+        return p.Data().mResult;
+      }
+
+      aBaseDomain = p.Data().mBaseDomain;
+      if (trailingDot) {
+        aBaseDomain.Append('.');
+      }
+
+      return NS_OK;
+    }
+
+    entry = Some(p);
+  }
+
+  if (mozilla::net::HostIsIPLiteral(aHostname)) {
+    if (entry) {
+      entry->Set(TLDCacheEntry{aHostname, ""_ns, NS_ERROR_HOST_IS_IP_ADDRESS});
+    }
+
+    return NS_ERROR_HOST_IS_IP_ADDRESS;
+  }
+
+  const char* prevDomain = nullptr;
+  const char* currDomain = aHostname.get();
+  const char* nextDot = strchr(currDomain, '.');
+  const char* end = currDomain + aHostname.Length();
+  const char* eTLD = nullptr;
+  bool hasKnownPublicSuffix = false;
+  while (true) {
+    if (*currDomain == '.') {
+      if (entry) {
+        entry->Set(TLDCacheEntry{aHostname, ""_ns, NS_ERROR_INVALID_ARG});
+      }
+
+      return NS_ERROR_INVALID_ARG;
+    }
+
+    const int result = mGraph.Lookup(Substring(currDomain, end));
+
+    if (result != Dafsa::kKeyNotFound) {
+      hasKnownPublicSuffix = true;
+      if (result == kWildcardRule && prevDomain) {
+        eTLD = prevDomain;
+        break;
+      }
+      if (result != kExceptionRule || !nextDot) {
+        eTLD = currDomain;
+        break;
+      }
+      if (result == kExceptionRule) {
+        eTLD = nextDot + 1;
+        break;
+      }
+    }
+
+    if (!nextDot) {
+      eTLD = currDomain;
+      break;
+    }
+
+    prevDomain = currDomain;
+    currDomain = nextDot + 1;
+    nextDot = strchr(currDomain, '.');
+  }
+
+  if (aOnlyKnownPublicSuffix && !hasKnownPublicSuffix) {
+    aBaseDomain.Truncate();
+    return NS_OK;
+  }
+
+  const char *begin, *iter;
+  if (aAdditionalParts < 0) {
+    NS_ASSERTION(aAdditionalParts == -1,
+                 "aAdditionalParts can't be negative and different from -1");
+
+    for (iter = aHostname.get(); iter != eTLD && *iter != '.'; iter++) {
+      ;
+    }
+
+    if (iter != eTLD) {
+      iter++;
+    }
+    if (iter != eTLD) {
+      aAdditionalParts = 0;
+    }
+  } else {
+    begin = aHostname.get();
+    iter = eTLD;
+
+    while (true) {
+      if (iter == begin) {
+        break;
+      }
+
+      if (*(--iter) == '.' && aAdditionalParts-- == 0) {
+        ++iter;
+        ++aAdditionalParts;
+        break;
+      }
+    }
+  }
+
+  if (aAdditionalParts != 0) {
+    if (entry) {
+      entry->Set(
+          TLDCacheEntry{aHostname, ""_ns, NS_ERROR_INSUFFICIENT_DOMAIN_LEVELS});
+    }
+
+    return NS_ERROR_INSUFFICIENT_DOMAIN_LEVELS;
+  }
+
+  aBaseDomain = Substring(iter, end);
+
+  if (entry) {
+    entry->Set(TLDCacheEntry{aHostname, nsCString(aBaseDomain), NS_OK});
+  }
+
+  if (trailingDot) {
+    aBaseDomain.Append('.');
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsEffectiveTLDService::HasRootDomain(const nsACString& aInput,
+                                     const nsACString& aHost, bool* aResult) {
+  return net::HasRootDomain(aInput, aHost, aResult);
+}
+
+NS_IMETHODIMP
+nsEffectiveTLDService::HasKnownPublicSuffix(nsIURI* aURI, bool* aResult) {
+  NS_ENSURE_ARG_POINTER(aURI);
+
+  nsAutoCString host;
+  nsresult rv = NS_GetInnermostURIHost(aURI, host);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  return HasKnownPublicSuffixFromHost(host, aResult);
+}
+
+NS_IMETHODIMP
+nsEffectiveTLDService::HasKnownPublicSuffixFromHost(const nsACString& aHostname,
+                                                    bool* aResult) {
+  nsAutoCString hostname;
+  nsresult rv = NS_DomainToASCIIAllowAnyGlyphfulASCII(aHostname, hostname);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (hostname.IsEmpty() || hostname == ".") {
+    return NS_ERROR_INSUFFICIENT_DOMAIN_LEVELS;
+  }
+
+  if (hostname.Last() == '.') {
+    hostname.Truncate(hostname.Length() - 1);
+  }
+
+  int32_t dotBeforeSuffix = -1;
+  int8_t i = 0;
+  do {
+    dotBeforeSuffix = Substring(hostname, 0, dotBeforeSuffix).RFindChar('.');
+
+    const nsACString& suffix = Substring(
+        hostname, dotBeforeSuffix == kNotFound ? 0 : dotBeforeSuffix + 1);
+
+    if (mGraph.Lookup(suffix) != Dafsa::kKeyNotFound) {
+      *aResult = true;
+      return NS_OK;
+    }
+
+    i++;
+  } while (dotBeforeSuffix != kNotFound && i < 10);
+
+  *aResult = false;
+  return NS_OK;
+}

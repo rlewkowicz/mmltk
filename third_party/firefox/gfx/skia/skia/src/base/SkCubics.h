@@ -1,0 +1,33 @@
+/*
+ * Copyright 2023 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+#if !defined(SkCubics_DEFINED)
+#define SkCubics_DEFINED
+
+#include <cmath>
+
+class SkCubics {
+public:
+    static int RootsReal(double A, double B, double C, double D,
+                         double solution[3]);
+
+    static int RootsValidT(double A, double B, double C, double D,
+                           double solution[3]);
+
+
+    static int BinarySearchRootsValidT(double A, double B, double C, double D,
+                                       double solution[3]);
+
+    static double EvalAt(double A, double B, double C, double D, double t) {
+        return std::fma(t, std::fma(t, std::fma(t, A, B), C), D);
+    }
+
+    static double EvalAt(double coefficients[4], double t) {
+        return EvalAt(coefficients[0], coefficients[1], coefficients[2], coefficients[3], t);
+    }
+};
+
+#endif

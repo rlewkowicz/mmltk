@@ -1,0 +1,125 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "Rule.h"
+
+#include "mozilla/HoldDropJSObjects.h"
+#include "mozilla/ServoBindings.h"
+#include "mozilla/css/GroupRule.h"
+#include "mozilla/dom/CSSImportRule.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentOrShadowRoot.h"
+#include "nsCCUncollectableMarker.h"
+#include "nsWrapperCacheInlines.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+namespace mozilla::css {
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(Rule)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(Rule)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Rule)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_WEAK_PTR(Rule)
+
+bool Rule::IsCCLeaf() const { return !PreservingWrapper(); }
+
+bool Rule::IsKnownLive() const {
+  if (HasKnownLiveWrapper()) {
+    return true;
+  }
+
+  StyleSheet* sheet = GetStyleSheet();
+  if (!sheet) {
+    return false;
+  }
+
+  Document* doc = sheet->GetKeptAliveByDocument();
+  return doc &&
+         nsCCUncollectableMarker::InGeneration(doc->GetMarkedCCGeneration());
+}
+
+void Rule::UnlinkDeclarationWrapper(nsWrapperCache& aDecl) {
+  bool needDrop = PreservingWrapper() || aDecl.PreservingWrapper();
+  ReleaseWrapperWithoutDrop();
+  aDecl.ReleaseWrapperWithoutDrop();
+  if (needDrop) {
+    DropJSObjects(this);
+  }
+}
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_BEGIN(Rule)
+  return tmp->IsCCLeaf() || tmp->IsKnownLive();
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_BEGIN(Rule)
+  return tmp->IsCCLeaf() || (tmp->IsKnownLive() && tmp->HasNothingToTrace(tmp));
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_BEGIN(Rule)
+  return tmp->IsCCLeaf() || tmp->IsKnownLive();
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_END
+
+void Rule::DropSheetReference() { mSheet = nullptr; }
+
+void Rule::SetCssText(const nsACString& aCssText) {
+}
+
+Rule* Rule::GetParentRule() const { return mParentRule; }
+
+#ifdef DEBUG
+void Rule::AssertParentRuleType() {
+  if (mParentRule) {
+    auto type = mParentRule->Type();
+    MOZ_ASSERT(type == StyleCssRuleType::Media ||
+               type == StyleCssRuleType::Style ||
+               type == StyleCssRuleType::Document ||
+               type == StyleCssRuleType::Supports ||
+               type == StyleCssRuleType::Keyframes ||
+               type == StyleCssRuleType::LayerBlock ||
+               type == StyleCssRuleType::Container ||
+               type == StyleCssRuleType::Scope ||
+               type == StyleCssRuleType::StartingStyle ||
+               type == StyleCssRuleType::AppearanceBase ||
+               type == StyleCssRuleType::Page);
+  }
+}
+#endif
+
+bool Rule::IsReadOnly() const {
+  MOZ_ASSERT(!mSheet || !mParentRule ||
+                 mSheet->IsReadOnly() == mParentRule->IsReadOnly(),
+             "a parent rule should be read only iff the owning sheet is "
+             "read only");
+  return mSheet && mSheet->IsReadOnly();
+}
+
+bool Rule::IsIncompleteImportRule() const {
+  if (Type() != StyleCssRuleType::Import) {
+    return false;
+  }
+  auto* sheet = static_cast<const dom::CSSImportRule*>(this)->GetStyleSheet();
+  return !sheet || !sheet->IsComplete();
+}
+
+auto Rule::GetContainingRuleStateForParsing() const -> ContainingRuleState {
+  ContainingRuleState result;
+  for (const auto* rule = this; rule; rule = rule->GetParentRule()) {
+    auto type = rule->Type();
+    result.mContainingTypes |= (1 << UnderlyingValue(type));
+    if (result.mParseRelativeType.isNothing() &&
+        (type == StyleCssRuleType::Style || type == StyleCssRuleType::Scope)) {
+      result.mParseRelativeType.emplace(type);
+    }
+  }
+  return result;
+}
+
+}  

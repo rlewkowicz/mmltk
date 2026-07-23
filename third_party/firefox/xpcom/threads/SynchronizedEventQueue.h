@@ -1,0 +1,80 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_SynchronizedEventQueue_h
+#define mozilla_SynchronizedEventQueue_h
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/EventQueue.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Mutex.h"
+#include "nsIThreadInternal.h"
+#include "nsCOMPtr.h"
+#include "nsTObserverArray.h"
+
+class nsIEventTarget;
+class nsISerialEventTarget;
+class nsIThreadObserver;
+
+namespace mozilla {
+
+
+class ThreadTargetSink {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ThreadTargetSink)
+
+  virtual bool PutEvent(RefPtr<nsIRunnable>& aEvent,
+                        EventQueuePriority aPriority) = 0;
+
+  virtual void Disconnect(const MutexAutoLock& aProofOfLock) = 0;
+
+  virtual nsresult RegisterShutdownTask(nsITargetShutdownTask* aTask) = 0;
+  virtual nsresult UnregisterShutdownTask(nsITargetShutdownTask* aTask) = 0;
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  virtual size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) = 0;
+
+ protected:
+  virtual ~ThreadTargetSink() = default;
+};
+
+class SynchronizedEventQueue : public ThreadTargetSink {
+ public:
+  virtual already_AddRefed<nsIRunnable> GetEvent(
+      bool aMayWait, mozilla::TimeDuration* aLastEventDelay = nullptr) = 0;
+  virtual bool HasPendingEvent() = 0;
+
+  virtual bool ShutdownIfNoPendingEvents() = 0;
+
+  virtual already_AddRefed<nsIThreadObserver> GetObserver() = 0;
+  virtual already_AddRefed<nsIThreadObserver> GetObserverOnThread() = 0;
+  virtual void SetObserver(nsIThreadObserver* aObserver) = 0;
+
+  void AddObserver(nsIThreadObserver* aObserver);
+  void RemoveObserver(nsIThreadObserver* aObserver);
+  const nsTObserverArray<nsCOMPtr<nsIThreadObserver>>& EventObservers();
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) override {
+    return 0;
+  }
+
+  virtual already_AddRefed<nsISerialEventTarget> PushEventQueue() = 0;
+
+  virtual void PopEventQueue(nsIEventTarget* aTarget) = 0;
+
+  virtual void RunShutdownTasks() = 0;
+
+ protected:
+  virtual ~SynchronizedEventQueue() = default;
+
+ private:
+  nsTObserverArray<nsCOMPtr<nsIThreadObserver>> mEventObservers;
+};
+
+}  
+
+#endif  // mozilla_SynchronizedEventQueue_h

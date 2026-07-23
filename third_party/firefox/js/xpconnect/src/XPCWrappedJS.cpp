@@ -1,0 +1,561 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "xpcprivate.h"
+#include "XPCMaps.h"
+#include "mozilla/DeferredFinalize.h"
+#include "mozilla/HoldDropJSObjects.h"
+#include "mozilla/Sprintf.h"
+#include "js/Object.h"  // JS::GetCompartment
+#include "js/RealmIterators.h"
+#include "nsCCUncollectableMarker.h"
+#include "nsContentUtils.h"
+#include "nsThreadUtils.h"
+
+using namespace mozilla;
+
+
+
+bool nsXPCWrappedJS::CanSkip() {
+  if (!nsCCUncollectableMarker::sGeneration) {
+    return false;
+  }
+
+  JSObject* obj = GetJSObjectPreserveColor();
+  if (obj && JS::ObjectIsMarkedGray(obj)) {
+    return false;
+  }
+
+  if (!IsRootWrapper()) {
+    NS_ENSURE_TRUE(mRoot, false);
+    return mRoot->CanSkip();
+  }
+
+
+  if (!IsAggregatedToNative()) {
+    return true;
+  }
+
+  nsISupports* agg = GetAggregatedNativeObject();
+  nsXPCOMCycleCollectionParticipant* cp = nullptr;
+  CallQueryInterface(agg, &cp);
+  nsISupports* canonical = nullptr;
+  agg->QueryInterface(NS_GET_IID(nsCycleCollectionISupports),
+                      reinterpret_cast<void**>(&canonical));
+  return cp && canonical && cp->CanSkipThis(canonical);
+}
+
+NS_IMETHODIMP
+NS_CYCLE_COLLECTION_CLASSNAME(nsXPCWrappedJS)::TraverseNative(
+    void* p, nsCycleCollectionTraversalCallback& cb) {
+  nsISupports* s = static_cast<nsISupports*>(p);
+  MOZ_ASSERT(CheckForRightISupports(s),
+             "not the nsISupports pointer we expect");
+  nsXPCWrappedJS* tmp = Downcast(s);
+
+  nsrefcnt refcnt = tmp->mRefCnt.get();
+  if (cb.WantDebugInfo()) {
+    char name[72];
+    SprintfLiteral(name, "nsXPCWrappedJS (%s)", tmp->mInfo->Name());
+    cb.DescribeRefCountedNode(refcnt, name);
+  } else {
+    NS_IMPL_CYCLE_COLLECTION_DESCRIBE(nsXPCWrappedJS, refcnt)
+  }
+
+  if (tmp->IsSubjectToFinalization()) {
+    cb.NoteWeakMapping(tmp->GetJSObjectPreserveColor(), s,
+                       NS_CYCLE_COLLECTION_PARTICIPANT(nsXPCWrappedJS));
+  }
+
+  NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(cb, "self");
+  cb.NoteXPCOMChild(s);
+
+  if (tmp->IsRootWrapper()) {
+    NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(cb, "aggregated native");
+    cb.NoteXPCOMChild(tmp->GetAggregatedNativeObject());
+  } else {
+    NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(cb, "root");
+    cb.NoteXPCOMChild(ToSupports(tmp->GetRootWrapper()));
+  }
+
+  return NS_OK;
+}
+
+NS_IMPL_CYCLE_COLLECTION_SINGLE_ZONE_SCRIPT_HOLDER_CLASS(nsXPCWrappedJS)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsXPCWrappedJS)
+  tmp->Unlink();
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN(nsXPCWrappedJS)
+  if (!tmp->IsSubjectToFinalization()) {
+    NS_IMPL_CYCLE_COLLECTION_TRACE_JS_MEMBER_CALLBACK(mJSObj)
+  }
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_BEGIN(nsXPCWrappedJS)
+  return true;
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_BEGIN(nsXPCWrappedJS)
+  return tmp->CanSkip();
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_BEGIN(nsXPCWrappedJS)
+  return tmp->CanSkip();
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_END
+
+nsXPCWrappedJS* nsIXPConnectWrappedJS::AsXPCWrappedJS() {
+  return static_cast<nsXPCWrappedJS*>(this);
+}
+
+nsresult nsIXPConnectWrappedJS::AggregatedQueryInterface(REFNSIID aIID,
+                                                         void** aInstancePtr) {
+  MOZ_ASSERT(AsXPCWrappedJS()->IsAggregatedToNative(),
+             "bad AggregatedQueryInterface call");
+  *aInstancePtr = nullptr;
+
+  if (!AsXPCWrappedJS()->IsValid()) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  if (aIID.Equals(NS_GET_IID(nsIXPConnectWrappedJS))) {
+    NS_ADDREF(this);
+    *aInstancePtr = (void*)this;
+    return NS_OK;
+  }
+
+  return AsXPCWrappedJS()->DelegatedQueryInterface(aIID, aInstancePtr);
+}
+
+NS_IMETHODIMP
+nsXPCWrappedJS::QueryInterface(REFNSIID aIID, void** aInstancePtr) {
+  if (nullptr == aInstancePtr) {
+    MOZ_ASSERT(false, "null pointer");
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  *aInstancePtr = nullptr;
+
+  if (aIID.Equals(NS_GET_IID(nsXPCOMCycleCollectionParticipant))) {
+    *aInstancePtr = NS_CYCLE_COLLECTION_PARTICIPANT(nsXPCWrappedJS);
+    return NS_OK;
+  }
+
+  if (aIID.Equals(NS_GET_IID(nsCycleCollectionISupports))) {
+    *aInstancePtr = NS_CYCLE_COLLECTION_CLASSNAME(nsXPCWrappedJS)::Upcast(this);
+    return NS_OK;
+  }
+
+  if (!IsValid()) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  if (aIID.Equals(NS_GET_IID(nsIXPConnectWrappedJSUnmarkGray))) {
+    *aInstancePtr = nullptr;
+
+    mJSObj.exposeToActiveJS();
+
+    return NS_ERROR_FAILURE;
+  }
+
+  if (aIID.Equals(NS_GET_IID(nsIXPConnectWrappedJS))) {
+    NS_ADDREF(this);
+    *aInstancePtr = (void*)static_cast<nsIXPConnectWrappedJS*>(this);
+    return NS_OK;
+  }
+
+  nsISupports* outer = GetAggregatedNativeObject();
+  if (outer) {
+    return outer->QueryInterface(aIID, aInstancePtr);
+  }
+
+
+  return DelegatedQueryInterface(aIID, aInstancePtr);
+}
+
+
+MozExternalRefCountType nsXPCWrappedJS::AddRef(void) {
+  MOZ_RELEASE_ASSERT(NS_IsMainThread(),
+                     "nsXPCWrappedJS::AddRef called off main thread");
+
+  MOZ_ASSERT(int32_t(mRefCnt) >= 0, "illegal refcnt");
+  nsISupports* base =
+      NS_CYCLE_COLLECTION_CLASSNAME(nsXPCWrappedJS)::Upcast(this);
+  nsrefcnt cnt = mRefCnt.incr(base);
+  NS_LOG_ADDREF(this, cnt, "nsXPCWrappedJS", sizeof(*this));
+
+  if (2 == cnt && IsValid()) {
+    GetJSObject();  
+
+    if (isInList()) {
+      remove();
+    }
+  }
+
+  return cnt;
+}
+
+MozExternalRefCountType nsXPCWrappedJS::Release(void) {
+  MOZ_RELEASE_ASSERT(NS_IsMainThread(),
+                     "nsXPCWrappedJS::Release called off main thread");
+  MOZ_ASSERT(int32_t(mRefCnt) > 0, "dup release");
+  NS_ASSERT_OWNINGTHREAD(nsXPCWrappedJS);
+
+  bool shouldDelete = false;
+  nsISupports* base =
+      NS_CYCLE_COLLECTION_CLASSNAME(nsXPCWrappedJS)::Upcast(this);
+  nsrefcnt cnt = mRefCnt.decr(base, &shouldDelete);
+  NS_LOG_RELEASE(this, cnt, "nsXPCWrappedJS");
+
+  if (0 == cnt) {
+    if (MOZ_UNLIKELY(shouldDelete)) {
+      mRefCnt.stabilizeForDeletion();
+      DeleteCycleCollectable();
+    } else {
+      mRefCnt.incr(base);
+      Destroy();
+      mRefCnt.decr(base);
+    }
+  } else if (1 == cnt) {
+    if (!HasWeakReferences()) {
+      return Release();
+    }
+
+    if (IsValid()) {
+      XPCJSRuntime::Get()->AddSubjectToFinalizationWJS(this);
+    }
+
+    MOZ_ASSERT(IsRootWrapper(),
+               "Only root wrappers should have weak references");
+  }
+  return cnt;
+}
+
+NS_IMETHODIMP_(void)
+nsXPCWrappedJS::DeleteCycleCollectable(void) { delete this; }
+
+NS_IMETHODIMP
+nsXPCWrappedJS::GetWeakReference(nsIWeakReference** aInstancePtr) {
+  if (!IsRootWrapper()) {
+    return mRoot->GetWeakReference(aInstancePtr);
+  }
+
+  return nsSupportsWeakReference::GetWeakReference(aInstancePtr);
+}
+
+JSObject* nsXPCWrappedJS::GetJSObject() { return mJSObj; }
+
+JSObject* nsIXPConnectWrappedJS::GetJSObjectGlobal() {
+  JSObject* obj = AsXPCWrappedJS()->mJSObj;
+  if (js::IsCrossCompartmentWrapper(obj)) {
+    JS::Compartment* comp = JS::GetCompartment(obj);
+    return js::GetFirstGlobalInCompartment(comp);
+  }
+  return JS::GetNonCCWObjectGlobal(obj);
+}
+
+nsresult nsXPCWrappedJS::GetNewOrUsed(JSContext* cx, JS::HandleObject jsObj,
+                                      REFNSIID aIID,
+                                      nsXPCWrappedJS** wrapperResult) {
+  MOZ_RELEASE_ASSERT(NS_IsMainThread(),
+                     "nsXPCWrappedJS::GetNewOrUsed called off main thread");
+
+  MOZ_RELEASE_ASSERT(js::GetContextCompartment(cx) ==
+                     JS::GetCompartment(jsObj));
+
+  const nsXPTInterfaceInfo* info = GetInterfaceInfo(aIID);
+  if (!info) {
+    return NS_ERROR_FAILURE;
+  }
+
+  JS::RootedObject rootJSObj(cx, GetRootJSObject(cx, jsObj));
+  if (!rootJSObj) {
+    return NS_ERROR_FAILURE;
+  }
+
+  xpc::CompartmentPrivate* rootComp = xpc::CompartmentPrivate::Get(rootJSObj);
+  MOZ_ASSERT(rootComp);
+
+  RefPtr<nsXPCWrappedJS> root = rootComp->GetWrappedJSMap()->Find(rootJSObj);
+  MOZ_ASSERT_IF(root, !nsXPConnect::GetRuntimeInstance()
+                           ->GetMultiCompartmentWrappedJSMap()
+                           ->Find(rootJSObj));
+  if (!root) {
+    root = nsXPConnect::GetRuntimeInstance()
+               ->GetMultiCompartmentWrappedJSMap()
+               ->Find(rootJSObj);
+  }
+
+  nsresult rv = NS_ERROR_FAILURE;
+  if (root) {
+    RefPtr<nsXPCWrappedJS> wrapper = root->FindOrFindInherited(aIID);
+    if (wrapper) {
+      wrapper.forget(wrapperResult);
+      return NS_OK;
+    }
+  } else if (rootJSObj != jsObj) {
+    const nsXPTInterfaceInfo* rootInfo =
+        GetInterfaceInfo(NS_GET_IID(nsISupports));
+    if (!rootInfo) {
+      return NS_ERROR_FAILURE;
+    }
+
+    root = new nsXPCWrappedJS(cx, rootJSObj, rootInfo, nullptr, &rv);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+  }
+
+  RefPtr<nsXPCWrappedJS> wrapper =
+      new nsXPCWrappedJS(cx, jsObj, info, root, &rv);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  wrapper.forget(wrapperResult);
+  return NS_OK;
+}
+
+nsXPCWrappedJS::nsXPCWrappedJS(JSContext* cx, JSObject* aJSObj,
+                               const nsXPTInterfaceInfo* aInfo,
+                               nsXPCWrappedJS* root, nsresult* rv)
+    : mJSObj(aJSObj), mInfo(aInfo), mRoot(root ? root : this), mNext(nullptr) {
+  *rv = InitStub(mInfo->IID());
+
+  NS_ADDREF_THIS();
+
+  if (IsRootWrapper()) {
+    MOZ_ASSERT(!IsMultiCompartment(), "mNext is always nullptr here");
+    if (!xpc::CompartmentPrivate::Get(mJSObj)->GetWrappedJSMap()->Add(cx,
+                                                                      this)) {
+      *rv = NS_ERROR_OUT_OF_MEMORY;
+    }
+  } else {
+    NS_ADDREF(mRoot);
+    mNext = mRoot->mNext;
+    mRoot->mNext = this;
+
+    if (mRoot->IsMultiCompartment()) {
+      xpc::CompartmentPrivate::Get(mRoot->mJSObj)
+          ->GetWrappedJSMap()
+          ->Remove(mRoot);
+      auto destMap =
+          nsXPConnect::GetRuntimeInstance()->GetMultiCompartmentWrappedJSMap();
+      if (!destMap->Add(cx, mRoot)) {
+        *rv = NS_ERROR_OUT_OF_MEMORY;
+      }
+    }
+  }
+
+  mozilla::HoldJSObjects(this);
+}
+
+nsXPCWrappedJS::~nsXPCWrappedJS() { Destroy(); }
+
+void XPCJSRuntime::RemoveWrappedJS(nsXPCWrappedJS* wrapper) {
+  AssertInvalidWrappedJSNotInTable(wrapper);
+  if (!wrapper->IsValid()) {
+    return;
+  }
+
+  MOZ_ASSERT_IF(
+      wrapper->IsMultiCompartment(),
+      !xpc::CompartmentPrivate::Get(wrapper->GetJSObjectPreserveColor())
+           ->GetWrappedJSMap()
+           ->HasWrapper(wrapper));
+  GetMultiCompartmentWrappedJSMap()->Remove(wrapper);
+  xpc::CompartmentPrivate::Get(wrapper->GetJSObjectPreserveColor())
+      ->GetWrappedJSMap()
+      ->Remove(wrapper);
+}
+
+#ifdef DEBUG
+static JS::CompartmentIterResult NotHasWrapperAssertionCallback(
+    JSContext* cx, void* data, JS::Compartment* comp) {
+  auto wrapper = static_cast<nsXPCWrappedJS*>(data);
+  auto xpcComp = xpc::CompartmentPrivate::Get(comp);
+  MOZ_ASSERT_IF(xpcComp, !xpcComp->GetWrappedJSMap()->HasWrapper(wrapper));
+  return JS::CompartmentIterResult::KeepGoing;
+}
+#endif
+
+void XPCJSRuntime::AssertInvalidWrappedJSNotInTable(
+    nsXPCWrappedJS* wrapper) const {
+#ifdef DEBUG
+  if (!wrapper->IsValid()) {
+    MOZ_ASSERT(!GetMultiCompartmentWrappedJSMap()->HasWrapper(wrapper));
+    if (!mGCIsRunning) {
+      JSContext* cx = XPCJSContext::Get()->Context();
+      JS_IterateCompartments(cx, wrapper, NotHasWrapperAssertionCallback);
+    }
+  }
+#endif
+}
+
+void nsXPCWrappedJS::Destroy() {
+  MOZ_ASSERT(1 == int32_t(mRefCnt), "should be stabilized for deletion");
+
+  if (IsRootWrapper()) {
+    nsXPConnect::GetRuntimeInstance()->RemoveWrappedJS(this);
+  }
+  Unlink();
+}
+
+void nsXPCWrappedJS::Unlink() {
+  nsXPConnect::GetRuntimeInstance()->AssertInvalidWrappedJSNotInTable(this);
+
+  if (IsValid()) {
+    XPCJSRuntime* rt = nsXPConnect::GetRuntimeInstance();
+    if (rt) {
+      if (IsRootWrapper()) {
+        rt->RemoveWrappedJS(this);
+      }
+    }
+
+    mJSObj = nullptr;
+  }
+
+  if (IsRootWrapper()) {
+    if (isInList()) {
+      remove();
+    }
+    ClearWeakReferences();
+  } else if (mRoot) {
+    nsXPCWrappedJS* cur = mRoot;
+    while (true) {
+      if (cur->mNext == this) {
+        cur->mNext = mNext;
+        break;
+      }
+      cur = cur->mNext;
+      MOZ_ASSERT(cur, "failed to find wrapper in its own chain");
+    }
+
+
+    NS_RELEASE(mRoot);
+  }
+
+  if (mOuter) {
+    XPCJSRuntime* rt = nsXPConnect::GetRuntimeInstance();
+    if (rt->GCIsRunning()) {
+      DeferredFinalize(mOuter.forget().take());
+    } else {
+      mOuter = nullptr;
+    }
+  }
+
+  mozilla::DropJSObjects(this);
+}
+
+bool nsXPCWrappedJS::IsMultiCompartment() const {
+  MOZ_ASSERT(IsRootWrapper());
+  JS::Compartment* compartment = Compartment();
+  nsXPCWrappedJS* next = mNext;
+  while (next) {
+    if (next->Compartment() != compartment) {
+      return true;
+    }
+    next = next->mNext;
+  }
+  return false;
+}
+
+nsXPCWrappedJS* nsXPCWrappedJS::Find(REFNSIID aIID) {
+  if (aIID.Equals(NS_GET_IID(nsISupports))) {
+    return mRoot;
+  }
+
+  for (nsXPCWrappedJS* cur = mRoot; cur; cur = cur->mNext) {
+    if (aIID.Equals(cur->GetIID())) {
+      return cur;
+    }
+  }
+
+  return nullptr;
+}
+
+nsXPCWrappedJS* nsXPCWrappedJS::FindInherited(REFNSIID aIID) {
+  MOZ_ASSERT(!aIID.Equals(NS_GET_IID(nsISupports)), "bad call sequence");
+
+  for (nsXPCWrappedJS* cur = mRoot; cur; cur = cur->mNext) {
+    if (cur->mInfo->HasAncestor(aIID)) {
+      return cur;
+    }
+  }
+
+  return nullptr;
+}
+
+nsresult nsIXPConnectWrappedJS::GetInterfaceIID(nsIID** iid) {
+  MOZ_ASSERT(iid, "bad param");
+
+  *iid = AsXPCWrappedJS()->GetIID().Clone();
+  return NS_OK;
+}
+
+void nsXPCWrappedJS::SystemIsBeingShutDown() {
+
+
+  MOZ_ASSERT(!JS::IsIncrementalGCInProgress(xpc_GetSafeJSContext()));
+  mJSObj.unbarrieredSet(nullptr);
+  if (isInList()) {
+    remove();
+  }
+
+  if (mNext) {
+    mNext->SystemIsBeingShutDown();
+  }
+}
+
+size_t nsXPCWrappedJS::SizeOfIncludingThis(
+    mozilla::MallocSizeOf mallocSizeOf) const {
+  size_t n = mallocSizeOf(this);
+  n += nsAutoXPTCStub::SizeOfExcludingThis(mallocSizeOf);
+
+  if (mNext) {
+    n += mNext->SizeOfIncludingThis(mallocSizeOf);
+  }
+
+  return n;
+}
+
+
+nsresult nsIXPConnectWrappedJS::DebugDump(int16_t depth) {
+  return AsXPCWrappedJS()->DebugDump(depth);
+}
+
+nsresult nsXPCWrappedJS::DebugDump(int16_t depth) {
+#ifdef DEBUG
+  XPC_LOG_ALWAYS(
+      ("nsXPCWrappedJS @ %p with mRefCnt = %" PRIuPTR, this, mRefCnt.get()));
+  XPC_LOG_INDENT();
+
+  XPC_LOG_ALWAYS(("%s wrapper around JSObject @ %p",
+                  IsRootWrapper() ? "ROOT" : "non-root", mJSObj.get()));
+  const char* name = mInfo->Name();
+  XPC_LOG_ALWAYS(("interface name is %s", name));
+  auto iid = mInfo->IID().ToString();
+  XPC_LOG_ALWAYS(("IID number is %s", iid.get()));
+  XPC_LOG_ALWAYS(("nsXPTInterfaceInfo @ %p", mInfo));
+
+  if (!IsRootWrapper()) {
+    XPC_LOG_OUTDENT();
+  }
+  if (mNext) {
+    if (IsRootWrapper()) {
+      XPC_LOG_ALWAYS(("Additional wrappers for this object..."));
+      XPC_LOG_INDENT();
+    }
+    mNext->DebugDump(depth);
+    if (IsRootWrapper()) {
+      XPC_LOG_OUTDENT();
+    }
+  }
+  if (IsRootWrapper()) {
+    XPC_LOG_OUTDENT();
+  }
+#endif
+  return NS_OK;
+}

@@ -1,0 +1,78 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ipc_IOThreadParent_h
+#define mozilla_ipc_IOThreadParent_h
+
+#include "base/thread.h"
+#include "chrome/common/ipc_channel.h"
+#include "mozilla/ipc/ScopedPort.h"
+
+namespace mozilla::ipc {
+
+class IOThread : private base::Thread {
+ public:
+  static IOThread* Get() { return sSingleton; }
+
+  static void Startup();
+  static void Shutdown();
+
+  nsISerialEventTarget* GetEventTarget() {
+    return base::Thread::message_loop()->SerialEventTarget();
+  }
+
+ protected:
+  IOThread(const char* aName);
+  ~IOThread();
+
+  void StartThread();
+  void StopThread();
+
+  void Init() override = 0;
+  void CleanUp() override = 0;
+
+ private:
+  static IOThread* sSingleton;
+};
+
+class IOThreadParent : public IOThread {
+ protected:
+  void Init() override;
+  void CleanUp() override;
+
+ private:
+  friend class IOThread;
+
+  IOThreadParent();
+  ~IOThreadParent();
+
+  const IPC::Channel::ChannelKind* mChannelKind;
+};
+
+class IOThreadChild : public IOThread {
+ public:
+  IOThreadChild(IPC::Channel::ChannelHandle aClientHandle,
+                base::ProcessId aParentPid);
+  ~IOThreadChild();
+
+  mozilla::ipc::ScopedPort TakeInitialPort() { return std::move(mInitialPort); }
+
+ protected:
+  void Init() override;
+  void CleanUp() override;
+
+ private:
+  mozilla::ipc::ScopedPort mInitialPort;
+  IPC::Channel::ChannelHandle mClientHandle;
+  base::ProcessId mParentPid;
+};
+
+inline void AssertIOThread() {
+  MOZ_ASSERT(MessageLoop::TYPE_IO == MessageLoop::current()->type(),
+             "should be on the IO thread!");
+}
+
+}  
+
+#endif  // mozilla_ipc_IOThreadParent_h

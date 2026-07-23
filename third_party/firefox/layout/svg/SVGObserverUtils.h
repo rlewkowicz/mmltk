@@ -1,0 +1,209 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_SVGOBSERVERUTILS_H_
+#define LAYOUT_SVG_SVGOBSERVERUTILS_H_
+
+#include "FrameProperties.h"
+#include "mozilla/SVGIntegrationUtils.h"
+#include "mozilla/dom/IDTracker.h"
+#include "mozilla/dom/SVGGeometryElement.h"
+#include "nsID.h"
+#include "nsIFrame.h"  // only for LayoutFrameType
+#include "nsIMutationObserver.h"
+#include "nsIReferrerInfo.h"
+#include "nsISupports.h"
+#include "nsISupportsImpl.h"
+#include "nsStringFwd.h"
+#include "nsStubMutationObserver.h"
+#include "nsStyleStruct.h"
+
+class nsAtom;
+class nsCycleCollectionTraversalCallback;
+class nsIFrame;
+class nsIURI;
+
+namespace mozilla {
+class SVGClipPathFrame;
+class SVGFilterFrame;
+class SVGFilterObserver;
+class SVGMarkerFrame;
+class SVGMaskFrame;
+class SVGPaintServerFrame;
+
+namespace dom {
+class CanvasRenderingContext2D;
+class Element;
+class SVGFEImageElement;
+class SVGGeometryElement;
+class SVGGraphicsElement;
+class SVGMPathElement;
+}  
+}  
+
+#define MOZILLA_ICANVASFILTEROBSERVER_IID \
+  {0xd1c85f93, 0xd1ed, 0x4ea9, {0xa0, 0x39, 0x71, 0x62, 0xe4, 0x41, 0xf1, 0xa1}}
+
+namespace mozilla {
+
+class ISVGFilterObserverList : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(MOZILLA_ICANVASFILTEROBSERVER_IID)
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS(ISVGFilterObserverList)
+
+  virtual const nsTArray<RefPtr<SVGFilterObserver>>& GetObservers() const = 0;
+  virtual void Detach() {}
+
+ protected:
+  virtual ~ISVGFilterObserverList() = default;
+};
+
+class SVGRenderingObserver : public nsStubMutationObserver {
+ protected:
+  virtual ~SVGRenderingObserver() = default;
+
+ public:
+  using Element = dom::Element;
+
+  SVGRenderingObserver(uint32_t aCallbacks = kAttributeChanged |
+                                             kContentAppended |
+                                             kContentInserted |
+                                             kContentWillBeRemoved) {
+    SetEnabledCallbacks(aCallbacks);
+  }
+
+  NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTECHANGED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTAPPENDED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTINSERTED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTREMOVED
+
+  void OnNonDOMMutationRenderingChange();
+
+  void NotifyEvictedFromRenderingObserverSet();
+
+  nsIFrame* GetAndObserveReferencedFrame();
+  nsIFrame* GetAndObserveReferencedFrame(mozilla::LayoutFrameType aFrameType,
+                                         bool* aOK);
+
+  Element* GetAndObserveReferencedElement();
+
+  virtual bool ObservesReflow() const { return false; }
+
+ protected:
+  void StartObserving();
+  void StopObserving();
+
+  virtual void OnRenderingChange() = 0;
+
+  virtual Element* GetReferencedElementWithoutObserving() const = 0;
+
+#ifdef DEBUG
+  void DebugObserverSet() const;
+#endif
+
+  bool mInObserverSet = false;
+};
+
+class SVGObserverUtils {
+ public:
+  using CanvasRenderingContext2D = dom::CanvasRenderingContext2D;
+  using Element = dom::Element;
+  using SVGGeometryElement = dom::SVGGeometryElement;
+  using SVGGraphicsElement = dom::SVGGraphicsElement;
+  using HrefToTemplateCallback = const std::function<void(nsAString&)>&;
+
+  static void InitiateResourceDocLoads(nsIFrame* aFrame);
+
+  static void UpdateEffects(nsIFrame* aFrame);
+
+  static bool SelfOrAncestorHasRenderingObservers(const nsIFrame* aFrame);
+
+  static void AddRenderingObserver(Element* aElement,
+                                   SVGRenderingObserver* aObserver);
+  static void RemoveRenderingObserver(Element* aElement,
+                                      SVGRenderingObserver* aObserver);
+
+  static void RemoveAllRenderingObservers(Element* aElement);
+
+  static void InvalidateRenderingObservers(nsIFrame* aFrame);
+
+  enum class InvalidationFlag {
+    FrameBeingDestroyed
+  };
+  using InvalidationFlags = EnumSet<InvalidationFlag>;
+
+  enum class ReferenceState {
+    HasNoRefs,
+    HasRefsAllValid,
+    HasRefsSomeInvalid,
+  };
+
+  static void InvalidateDirectRenderingObservers(Element* aElement,
+                                                 InvalidationFlags aFlags = {});
+  static void InvalidateDirectRenderingObservers(nsIFrame* aFrame,
+                                                 InvalidationFlags aFlags = {});
+
+  static SVGPaintServerFrame* GetAndObservePaintServer(
+      nsIFrame* aPaintedFrame, mozilla::StyleSVGPaint nsStyleSVG::* aPaint);
+
+  static bool GetAndObserveMarkers(nsIFrame* aMarkedFrame,
+                                   SVGMarkerFrames* aFrames);
+
+  static ReferenceState GetAndObserveFilters(
+      nsIFrame* aFilteredFrame, nsTArray<SVGFilterFrame*>* aFilterFrames,
+      StyleFilterType aStyleFilterType = StyleFilterType::Filter);
+
+  static ReferenceState GetAndObserveFilters(
+      ISVGFilterObserverList* aObserverList,
+      nsTArray<SVGFilterFrame*>* aFilterFrames);
+
+  static ReferenceState GetFiltersIfObserving(
+      nsIFrame* aFilteredFrame, nsTArray<SVGFilterFrame*>* aFilterFrames);
+
+  static already_AddRefed<ISVGFilterObserverList>
+  ObserveFiltersForCanvasContext(CanvasRenderingContext2D* aContext,
+                                 Element* aCanvasElement,
+                                 Span<const StyleFilter> aFilters);
+
+  static ReferenceState GetAndObserveClipPath(
+      nsIFrame* aClippedFrame, SVGClipPathFrame** aClipPathFrame);
+
+  static SVGGeometryElement* GetAndObserveGeometry(nsIFrame* aFrame);
+
+  static ReferenceState GetAndObserveMasks(
+      nsIFrame* aMaskedFrame, nsTArray<SVGMaskFrame*>* aMaskFrames);
+
+  static SVGGeometryElement* GetAndObserveTextPathsPath(
+      nsIFrame* aTextPathFrame);
+
+  static void RemoveTextPathObserver(nsIFrame* aTextPathFrame);
+
+  static SVGGraphicsElement* GetAndObserveFEImageContent(
+      dom::SVGFEImageElement* aSVGFEImagrElement);
+
+  static void TraverseFEImageObserver(
+      dom::SVGFEImageElement* aSVGFEImageElement,
+      nsCycleCollectionTraversalCallback* aCB);
+
+  static SVGGeometryElement* GetAndObserveMPathsPath(
+      dom::SVGMPathElement* aSVGMPathElement);
+
+  static void TraverseMPathObserver(dom::SVGMPathElement* aSVGMPathElement,
+                                    nsCycleCollectionTraversalCallback* aCB);
+
+  static nsIFrame* GetAndObserveTemplate(nsIFrame* aFrame,
+                                         HrefToTemplateCallback aGetHref);
+
+  static void RemoveTemplateObserver(nsIFrame* aFrame);
+
+  static Element* GetAndObserveBackgroundImage(nsIFrame* aFrame,
+                                               const nsAtom* aHref);
+
+  static Element* GetAndObserveBackgroundClip(nsIFrame* aFrame);
+};
+
+}  
+
+#endif  // LAYOUT_SVG_SVGOBSERVERUTILS_H_

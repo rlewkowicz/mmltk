@@ -1,0 +1,233 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_idbdatabase_h_
+#define mozilla_dom_idbdatabase_h_
+
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/IDBTransactionBinding.h"
+#include "mozilla/dom/indexedDB/PBackgroundIDBSharedTypes.h"
+#include "mozilla/dom/quota/PersistenceType.h"
+#include "nsHashKeys.h"
+#include "nsString.h"
+#include "nsTHashMap.h"
+#include "nsTHashSet.h"
+
+class nsIEventTarget;
+class nsIGlobalObject;
+
+namespace mozilla {
+
+struct JSCallingLocation;
+class ErrorResult;
+class EventChainPostVisitor;
+
+namespace dom {
+
+class Blob;
+class DOMStringList;
+class IDBFactory;
+class IDBObjectStore;
+struct IDBObjectStoreParameters;
+class IDBOpenDBRequest;
+class IDBRequest;
+class IDBTransaction;
+template <class>
+class Optional;
+class StringOrStringSequence;
+
+namespace indexedDB {
+class BackgroundDatabaseChild;
+class PBackgroundIDBDatabaseFileChild;
+}  
+
+class IDBDatabase final : public DOMEventTargetHelper {
+  using DatabaseSpec = mozilla::dom::indexedDB::DatabaseSpec;
+  using PersistenceType = mozilla::dom::quota::PersistenceType;
+
+  class Observer;
+  friend class Observer;
+
+  friend class IDBObjectStore;
+  friend class IDBIndex;
+
+  SafeRefPtr<IDBFactory> mFactory;
+
+  UniquePtr<DatabaseSpec> mSpec;
+
+  UniquePtr<DatabaseSpec> mPreviousSpec;
+
+  indexedDB::BackgroundDatabaseChild* mBackgroundActor;
+
+  nsTHashSet<IDBTransaction*> mTransactions;
+
+  nsTHashMap<ThreadSafeWeakPtrHashKey<BlobImpl>,
+             indexedDB::PBackgroundIDBDatabaseFileChild*>
+      mFileActors;
+
+  RefPtr<Observer> mObserver;
+
+  bool mClosed;
+  bool mInvalidated;
+  bool mQuotaExceeded;
+  bool mIncreasedActiveDatabaseCount;
+
+ public:
+  [[nodiscard]] static RefPtr<IDBDatabase> Create(
+      IDBOpenDBRequest* aRequest, SafeRefPtr<IDBFactory> aFactory,
+      indexedDB::BackgroundDatabaseChild* aActor,
+      UniquePtr<DatabaseSpec> aSpec);
+
+  void AssertIsOnOwningThread() const
+#ifdef DEBUG
+      ;
+#else
+  {
+  }
+#endif
+
+  nsIEventTarget* EventTarget() const;
+
+  const nsString& Name() const;
+
+  void GetName(nsAString& aName) const {
+    AssertIsOnOwningThread();
+
+    aName = Name();
+  }
+
+  uint64_t Version() const;
+
+  [[nodiscard]] RefPtr<Document> GetOwnerDocument() const;
+
+  void Close() {
+    AssertIsOnOwningThread();
+
+    CloseInternal();
+  }
+
+  bool IsClosed() const {
+    AssertIsOnOwningThread();
+
+    return mClosed;
+  }
+
+  void Invalidate();
+
+  bool IsInvalidated() const {
+    AssertIsOnOwningThread();
+
+    return mInvalidated;
+  }
+
+  void SetQuotaExceeded() { mQuotaExceeded = true; }
+
+  void EnterSetVersionTransaction(uint64_t aNewVersion);
+
+  void ExitSetVersionTransaction();
+
+  void RevertToPreviousState();
+
+  void RegisterTransaction(IDBTransaction& aTransaction);
+
+  void UnregisterTransaction(IDBTransaction& aTransaction);
+
+  void AbortTransactions(bool aShouldWarn);
+
+  indexedDB::PBackgroundIDBDatabaseFileChild* GetOrCreateFileActorForBlob(
+      Blob& aBlob);
+
+  void NoteFinishedFileActor(
+      indexedDB::PBackgroundIDBDatabaseFileChild* aFileActor);
+
+  void NoteActiveTransaction();
+
+  void NoteInactiveTransaction();
+
+  [[nodiscard]] RefPtr<DOMStringList> ObjectStoreNames() const;
+
+  [[nodiscard]] RefPtr<IDBObjectStore> CreateObjectStore(
+      const nsAString& aName,
+      const IDBObjectStoreParameters& aOptionalParameters, ErrorResult& aRv);
+
+  void DeleteObjectStore(const nsAString& name, ErrorResult& aRv);
+
+  [[nodiscard]] RefPtr<IDBTransaction> Transaction(
+      JSContext* aCx, const StringOrStringSequence& aStoreNames,
+      IDBTransactionMode aMode, const IDBTransactionOptions& aOptions,
+      ErrorResult& aRv);
+
+  IMPL_EVENT_HANDLER(abort)
+  IMPL_EVENT_HANDLER(close)
+  IMPL_EVENT_HANDLER(error)
+  IMPL_EVENT_HANDLER(versionchange)
+
+  void ClearBackgroundActor() {
+    AssertIsOnOwningThread();
+
+    MaybeDecreaseActiveDatabaseCount();
+
+    mBackgroundActor = nullptr;
+  }
+
+  const DatabaseSpec* Spec() const { return mSpec.get(); }
+
+  template <typename Pred>
+  indexedDB::ObjectStoreSpec* LookupModifiableObjectStoreSpec(Pred&& aPred) {
+    auto& objectStores = mSpec->objectStores();
+    const auto foundIt =
+        std::find_if(objectStores.begin(), objectStores.end(), aPred);
+    return foundIt != objectStores.end() ? &*foundIt : nullptr;
+  }
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(IDBDatabase, DOMEventTargetHelper)
+
+  void DisconnectFromOwner() override;
+
+  virtual void LastRelease() override;
+
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+ private:
+  IDBDatabase(IDBOpenDBRequest* aRequest, SafeRefPtr<IDBFactory> aFactory,
+              indexedDB::BackgroundDatabaseChild* aActor,
+              UniquePtr<DatabaseSpec> aSpec);
+
+  ~IDBDatabase();
+
+  void CloseInternal();
+
+  void InvalidateInternal();
+
+  bool RunningVersionChangeTransaction() const {
+    AssertIsOnOwningThread();
+
+    return !!mPreviousSpec;
+  }
+
+  void RefreshSpec(bool aMayDelete);
+
+  void ExpireFileActors(bool aExpireAll);
+
+  void NoteInactiveTransactionDelayed();
+
+  void LogWarning(const char* aMessageName, const JSCallingLocation&);
+
+  nsresult RenameObjectStore(int64_t aObjectStoreId, const nsAString& aName);
+
+  nsresult RenameIndex(int64_t aObjectStoreId, int64_t aIndexId,
+                       const nsAString& aName);
+
+  void IncreaseActiveDatabaseCount();
+
+  void MaybeDecreaseActiveDatabaseCount();
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_idbdatabase_h_

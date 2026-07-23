@@ -1,0 +1,117 @@
+// Copyright (c) 2008 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(CHROME_COMMON_IPC_CHANNEL_POSIX_H_)
+#define CHROME_COMMON_IPC_CHANNEL_POSIX_H_
+
+#include "chrome/common/ipc_channel.h"
+
+#include <sys/socket.h>  // for CMSG macros
+
+#include <vector>
+#include <list>
+
+#include "base/message_loop.h"
+#include "base/process.h"
+#include "base/task.h"
+
+#include "mozilla/EventTargetAndLockCapability.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/Queue.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/UniquePtrExtensions.h"
+#include "nsISupports.h"
+
+namespace IPC {
+
+class ChannelPosix final : public Channel, public MessageLoopForIO::Watcher {
+ public:
+  ChannelPosix(mozilla::UniqueFileHandle pipe, Mode mode,
+               base::ProcessId other_pid);
+
+  bool Connect(Listener* listener) MOZ_EXCLUDES(SendMutex()) override;
+  void Close() MOZ_EXCLUDES(SendMutex()) override;
+
+  bool Send(mozilla::UniquePtr<Message> message)
+      MOZ_EXCLUDES(SendMutex()) override;
+
+  void SetOtherPid(base::ProcessId other_pid) override;
+
+
+  const ChannelKind* GetKind() const override { return &sKind; }
+
+  static const ChannelKind sKind;
+
+ private:
+  ~ChannelPosix() { Close(); }
+
+  static bool CreateRawPipe(ChannelHandle* server, ChannelHandle* client);
+  static uint32_t NumRelayedAttachments(const IPC::Message& message);
+  static bool IsValidHandle(const ChannelHandle& handle);
+
+  void Init(Mode mode) MOZ_REQUIRES(SendMutex(), IOThread());
+  void SetPipe(int fd) MOZ_REQUIRES(SendMutex(), IOThread());
+  bool PipeBufHasSpaceAfter(size_t already_written)
+      MOZ_REQUIRES_SHARED(chan_cap_);
+  bool EnqueueHelloMessage() MOZ_REQUIRES(SendMutex(), IOThread());
+  bool ContinueConnect() MOZ_REQUIRES(SendMutex(), IOThread());
+  void CloseLocked() MOZ_REQUIRES(SendMutex(), IOThread());
+
+  bool ProcessIncomingMessages() MOZ_REQUIRES(IOThread());
+  bool ProcessOutgoingMessages() MOZ_REQUIRES(SendMutex());
+
+  virtual void OnFileCanReadWithoutBlocking(int fd) override;
+  virtual void OnFileCanWriteWithoutBlocking(int fd) override;
+
+
+  void OutputQueuePush(mozilla::UniquePtr<Message> msg)
+      MOZ_REQUIRES(SendMutex());
+  void OutputQueuePop() MOZ_REQUIRES(SendMutex());
+
+  Mode mode_ MOZ_GUARDED_BY(chan_cap_);
+
+  MessageLoopForIO::FileDescriptorWatcher read_watcher_
+      MOZ_GUARDED_BY(IOThread());
+  MessageLoopForIO::FileDescriptorWatcher write_watcher_
+      MOZ_GUARDED_BY(IOThread());
+
+  bool is_blocked_on_write_ MOZ_GUARDED_BY(SendMutex()) = false;
+
+  struct PartialWrite {
+    Pickle::BufferList::IterImpl iter_;
+    mozilla::Span<const mozilla::UniqueFileHandle> handles_;
+  };
+  mozilla::Maybe<PartialWrite> partial_write_ MOZ_GUARDED_BY(SendMutex());
+
+  int pipe_ MOZ_GUARDED_BY(chan_cap_);
+  unsigned pipe_buf_len_ MOZ_GUARDED_BY(chan_cap_);
+
+  Listener* listener_ MOZ_GUARDED_BY(IOThread());
+
+  mozilla::Queue<mozilla::UniquePtr<Message>, 64> output_queue_
+      MOZ_GUARDED_BY(SendMutex());
+
+  size_t input_buf_offset_ MOZ_GUARDED_BY(IOThread());
+  mozilla::UniquePtr<char[]> input_buf_ MOZ_GUARDED_BY(IOThread());
+  mozilla::UniquePtr<char[]> input_cmsg_buf_ MOZ_GUARDED_BY(IOThread());
+
+  static constexpr size_t kControlBufferMaxFds = 200;
+  static constexpr size_t kControlBufferHeaderSize = 32;
+  static constexpr size_t kControlBufferSize =
+      kControlBufferMaxFds * sizeof(int) + kControlBufferHeaderSize;
+
+  mozilla::UniquePtr<Message> incoming_message_ MOZ_GUARDED_BY(IOThread());
+  std::vector<int> input_overflow_fds_ MOZ_GUARDED_BY(IOThread());
+
+  bool waiting_connect_ MOZ_GUARDED_BY(chan_cap_) = true;
+
+  base::ProcessId other_pid_ MOZ_GUARDED_BY(chan_cap_) =
+      base::kInvalidProcessId;
+
+};
+
+}  
+
+#endif

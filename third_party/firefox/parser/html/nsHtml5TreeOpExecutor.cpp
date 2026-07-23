@@ -1,0 +1,1307 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/DebugOnly.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/Likely.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/MediaList.h"
+#include "mozilla/dom/ScriptLoader.h"
+#include "mozilla/dom/nsCSPContext.h"
+#include "mozilla/dom/nsCSPService.h"
+#include "mozilla/dom/PolicyContainer.h"
+
+#include "imgLoader.h"
+#include "mozAutoDocUpdate.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/IdleTaskRunner.h"
+#include "nsIAsyncShutdown.h"
+#include "nsIPropertyBag.h"
+#include "nsIWritablePropertyBag.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_content.h"
+#include "mozilla/StaticPrefs_security.h"
+#include "mozilla/StaticPrefs_view_source.h"
+#include "mozilla/css/Loader.h"
+#include "mozilla/fallible.h"
+#include "nsContentUtils.h"
+#include "nsDocShell.h"
+#include "nsError.h"
+#include "nsHTMLDocument.h"
+#include "nsHtml5AutoPauseUpdate.h"
+#include "nsHtml5Parser.h"
+#include "nsHtml5StreamParser.h"
+#include "nsHtml5Tokenizer.h"
+#include "nsHtml5TreeBuilder.h"
+#include "nsHtml5TreeOpExecutor.h"
+#include "nsIContentSecurityPolicy.h"
+#include "nsIDocShell.h"
+#include "nsIDocShellTreeItem.h"
+#include "nsINestedURI.h"
+#include "nsIHttpChannel.h"
+#include "nsIScriptContext.h"
+#include "nsIScriptError.h"
+#include "nsIScriptGlobalObject.h"
+#include "nsIViewSourceChannel.h"
+#include "nsNetUtil.h"
+#include "xpcpublic.h"
+#include "mozilla/Services.h"
+
+using namespace mozilla;
+
+#ifdef DEBUG
+static LazyLogModule gHtml5TreeOpExecutorLog("Html5TreeOpExecutor");
+#endif  // DEBUG
+static LazyLogModule gCharsetMenuLog("Chardetng");
+
+#define LOG(args) MOZ_LOG(gHtml5TreeOpExecutorLog, LogLevel::Debug, args)
+#define LOGCHARDETNG(args) MOZ_LOG(gCharsetMenuLog, LogLevel::Debug, args)
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED(nsHtml5TreeOpExecutor,
+                                             nsHtml5DocumentBuilder,
+                                             nsIContentSink)
+
+class nsHtml5ExecutorReflusher : public Runnable {
+ private:
+  RefPtr<nsHtml5TreeOpExecutor> mExecutor;
+
+ public:
+  explicit nsHtml5ExecutorReflusher(nsHtml5TreeOpExecutor* aExecutor)
+      : Runnable("nsHtml5ExecutorReflusher"), mExecutor(aExecutor) {}
+  NS_IMETHOD Run() override {
+    dom::Document* doc = mExecutor->GetDocument();
+    if (XRE_IsContentProcess() &&
+        nsContentUtils::
+            HighPriorityEventPendingForTopLevelDocumentBeforeContentfulPaint(
+                doc)) {
+      nsCOMPtr<nsIRunnable> flusher = this;
+      if (NS_SUCCEEDED(doc->Dispatch(flusher.forget()))) {
+        return NS_OK;
+      }
+    }
+    mExecutor->RunFlushLoop();
+    return NS_OK;
+  }
+};
+
+class MOZ_RAII nsHtml5AutoFlush final {
+ private:
+  RefPtr<nsHtml5TreeOpExecutor> mExecutor;
+  size_t mOpsToRemove;
+
+ public:
+  explicit nsHtml5AutoFlush(nsHtml5TreeOpExecutor* aExecutor)
+      : mExecutor(aExecutor), mOpsToRemove(aExecutor->OpQueueLength()) {
+    mExecutor->BeginFlush();
+    mExecutor->BeginDocUpdate();
+  }
+  ~nsHtml5AutoFlush() {
+    if (mExecutor->IsInDocUpdate()) {
+      mExecutor->EndDocUpdate();
+    } else {
+      MOZ_RELEASE_ASSERT(
+          mExecutor->IsComplete(),
+          "How do we have mParser but the doc update isn't open?");
+    }
+    mExecutor->EndFlush();
+    if (mExecutor->IsComplete()) {
+      mOpsToRemove = mExecutor->OpQueueLength();
+    }
+    mExecutor->RemoveFromStartOfOpQueue(mOpsToRemove);
+    mExecutor->FlushSpeculativeLoads();
+  }
+  void SetNumberOfOpsToRemove(size_t aOpsToRemove) {
+    MOZ_ASSERT(aOpsToRemove < mOpsToRemove,
+               "Requested partial clearing of op queue but the number to clear "
+               "wasn't less than the length of the queue.");
+    mOpsToRemove = aOpsToRemove;
+  }
+};
+
+StaticAutoPtr<LinkedList<nsHtml5TreeOpExecutor>> gBackgroundFlushList;
+StaticRefPtr<IdleTaskRunner> gBackgroundFlushRunner;
+static bool sShutdown = false;
+
+class Html5BackgroundFlushShutdownBlocker final
+    : public nsIAsyncShutdownBlocker {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIASYNCSHUTDOWNBLOCKER
+
+  Html5BackgroundFlushShutdownBlocker() = default;
+
+ private:
+  ~Html5BackgroundFlushShutdownBlocker() = default;
+};
+
+NS_IMPL_ISUPPORTS(Html5BackgroundFlushShutdownBlocker, nsIAsyncShutdownBlocker)
+
+NS_IMETHODIMP
+Html5BackgroundFlushShutdownBlocker::GetName(nsAString& aName) {
+  aName.AssignLiteral(
+      "HTML5 Parser: Cancel background flush runner before shutdown");
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+Html5BackgroundFlushShutdownBlocker::BlockShutdown(
+    nsIAsyncShutdownClient* aBarrierClient) {
+  sShutdown = true;
+
+  if (gBackgroundFlushRunner) {
+    gBackgroundFlushRunner->Cancel();
+  }
+
+  ClearOnShutdown(&gBackgroundFlushList);
+  ClearOnShutdown(&gBackgroundFlushRunner);
+
+  aBarrierClient->RemoveBlocker(this);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+Html5BackgroundFlushShutdownBlocker::GetState(nsIPropertyBag** aState) {
+  *aState = nullptr;
+  return NS_OK;
+}
+
+void nsHtml5TreeOpExecutor::InitializeStatics() {
+  MOZ_ASSERT(!sShutdown, "InitializeStatics called after shutdown");
+  nsCOMPtr<nsIAsyncShutdownService> svc = services::GetAsyncShutdownService();
+  if (svc) {
+    nsCOMPtr<nsIAsyncShutdownClient> phase;
+    nsresult rv = svc->GetXpcomWillShutdown(getter_AddRefs(phase));
+    if (NS_SUCCEEDED(rv) && phase) {
+      RefPtr<Html5BackgroundFlushShutdownBlocker> blocker =
+          new Html5BackgroundFlushShutdownBlocker();
+      phase->AddBlocker(blocker, NS_LITERAL_STRING_FROM_CSTRING(__FILE__),
+                        __LINE__, u""_ns);
+    }
+  }
+}
+
+nsHtml5TreeOpExecutor::nsHtml5TreeOpExecutor()
+    : nsHtml5DocumentBuilder(false),
+      mSuppressEOF(false),
+      mReadingFromStage(false),
+      mStreamParser(nullptr),
+      mPreloadedURLs(23),  
+      mStarted(false),
+      mRunFlushLoopOnStack(false),
+      mCallContinueInterruptedParsingIfEnabled(false),
+      mAlreadyComplainedAboutCharset(false),
+      mAlreadyComplainedAboutDeepTree(false) {}
+
+nsHtml5TreeOpExecutor::~nsHtml5TreeOpExecutor() {
+  if (gBackgroundFlushList && isInList()) {
+    ClearOpQueue();
+    removeFrom(*gBackgroundFlushList);
+    if (gBackgroundFlushList->isEmpty()) {
+      if (gBackgroundFlushRunner) {
+        gBackgroundFlushRunner->Cancel();
+        gBackgroundFlushRunner = nullptr;
+      }
+    }
+  }
+  MOZ_ASSERT(NS_FAILED(mBroken) || mOpQueue.IsEmpty(),
+             "Somehow there's stuff in the op queue.");
+}
+
+NS_IMETHODIMP
+nsHtml5TreeOpExecutor::WillParse() {
+  MOZ_ASSERT_UNREACHABLE("No one should call this");
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+nsHtml5TreeOpExecutor::WillBuildModel() {
+  mDocument->AddObserver(this);
+  WillBuildModelImpl();
+  GetDocument()->BeginLoad();
+  if (mDocShell && !GetDocument()->GetWindow() && !IsExternalViewSource()) {
+    return MarkAsBroken(NS_ERROR_DOM_INVALID_STATE_ERR);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsHtml5TreeOpExecutor::DidBuildModel(bool aTerminated) {
+  if (mRunsToCompletion) {
+    return NS_OK;
+  }
+
+  MOZ_RELEASE_ASSERT(!IsInDocUpdate(),
+                     "DidBuildModel from inside a doc update.");
+
+  RefPtr<nsHtml5TreeOpExecutor> pin(this);
+  auto queueClearer = MakeScopeExit([&] {
+    if (aTerminated && (mFlushState == eNotFlushing)) {
+      ClearOpQueue();  
+    }
+  });
+
+  DidBuildModelImpl(aTerminated || NS_FAILED(IsBroken()));
+
+  bool destroying = true;
+  if (mDocShell) {
+    mDocShell->IsBeingDestroyed(&destroying);
+  }
+
+  if (!destroying) {
+    mDocument->OnParsingCompleted();
+
+    if (!mLayoutStarted) {
+
+      nsContentSink::StartLayout(false);
+    }
+  }
+
+  ScrollToRef();
+  mDocument->RemoveObserver(this);
+  if (!mParser) {
+    return NS_OK;
+  }
+
+  if (mStarted) {
+    mDocument->EndLoad();
+
+    bool topLevel = false;
+    if (mozilla::dom::BrowsingContext* bc = mDocument->GetBrowsingContext()) {
+      topLevel = bc->IsTopContent();
+    }
+
+    nsAutoString contentType;
+    mDocument->GetContentType(contentType);
+    bool htmlOrPlain = contentType.EqualsLiteral(u"text/html") ||
+                       contentType.EqualsLiteral(u"text/plain");
+
+    bool httpOk = false;
+    nsCOMPtr<nsIChannel> channel;
+    nsresult rv = GetParser()->GetChannel(getter_AddRefs(channel));
+    if (NS_SUCCEEDED(rv) && channel) {
+      nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(channel);
+      if (httpChannel) {
+        uint32_t httpStatus;
+        rv = httpChannel->GetResponseStatus(&httpStatus);
+        if (NS_SUCCEEDED(rv) && httpStatus == 200) {
+          httpOk = true;
+        }
+      }
+    }
+
+    MOZ_ASSERT(mDocument->IsHTMLDocument());
+    if (httpOk && htmlOrPlain && topLevel && !aTerminated &&
+        !mDocument->AsHTMLDocument()->IsViewSource()) {
+      bool plain = mDocument->AsHTMLDocument()->IsPlainText();
+      int32_t charsetSource = mDocument->GetDocumentCharacterSetSource();
+      switch (charsetSource) {
+        case kCharsetFromInitialAutoDetectionWouldHaveBeenUTF8:
+          if (plain) {
+            LOGCHARDETNG(("TEXT::UtfInitial"));
+          } else {
+            LOGCHARDETNG(("HTML::UtfInitial"));
+          }
+          break;
+        case kCharsetFromInitialAutoDetectionWouldNotHaveBeenUTF8Generic:
+          if (plain) {
+            LOGCHARDETNG(("TEXT::GenericInitial"));
+          } else {
+            LOGCHARDETNG(("HTML::GenericInitial"));
+          }
+          break;
+        case kCharsetFromInitialAutoDetectionWouldNotHaveBeenUTF8Content:
+          if (plain) {
+            LOGCHARDETNG(("TEXT::ContentInitial"));
+          } else {
+            LOGCHARDETNG(("HTML::ContentInitial"));
+          }
+          break;
+        case kCharsetFromInitialAutoDetectionWouldNotHaveBeenUTF8DependedOnTLD:
+          if (plain) {
+            LOGCHARDETNG(("TEXT::TldInitial"));
+          } else {
+            LOGCHARDETNG(("HTML::TldInitial"));
+          }
+          break;
+        case kCharsetFromFinalAutoDetectionWouldHaveBeenUTF8InitialWasASCII:
+          if (plain) {
+            LOGCHARDETNG(("TEXT::UtfFinal"));
+          } else {
+            LOGCHARDETNG(("HTML::UtfFinal"));
+          }
+          break;
+        case kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8Generic:
+          if (plain) {
+            LOGCHARDETNG(("TEXT::GenericFinal"));
+          } else {
+            LOGCHARDETNG(("HTML::GenericFinal"));
+          }
+          break;
+        case kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8GenericInitialWasASCII:
+          if (plain) {
+            LOGCHARDETNG(("TEXT::GenericFinalA"));
+          } else {
+            LOGCHARDETNG(("HTML::GenericFinalA"));
+          }
+          break;
+        case kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8Content:
+          if (plain) {
+            LOGCHARDETNG(("TEXT::ContentFinal"));
+          } else {
+            LOGCHARDETNG(("HTML::ContentFinal"));
+          }
+          break;
+        case kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8ContentInitialWasASCII:
+          if (plain) {
+            LOGCHARDETNG(("TEXT::ContentFinalA"));
+          } else {
+            LOGCHARDETNG(("HTML::ContentFinalA"));
+          }
+          break;
+        case kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8DependedOnTLD:
+          if (plain) {
+            LOGCHARDETNG(("TEXT::TldFinal"));
+          } else {
+            LOGCHARDETNG(("HTML::TldFinal"));
+          }
+          break;
+        case kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8DependedOnTLDInitialWasASCII:
+          if (plain) {
+            LOGCHARDETNG(("TEXT::TldFinalA"));
+          } else {
+            LOGCHARDETNG(("HTML::TldFinalA"));
+          }
+          break;
+        default:
+          break;
+      }
+    }
+  }
+
+  GetParser()->DropStreamParser();
+  DropParserAndPerfHint();
+#ifdef GATHER_DOCWRITE_STATISTICS
+  printf("UNSAFE SCRIPTS: %d\n", sUnsafeDocWrites);
+  printf("TOKENIZER-SAFE SCRIPTS: %d\n", sTokenSafeDocWrites);
+  printf("TREEBUILDER-SAFE SCRIPTS: %d\n", sTreeSafeDocWrites);
+#endif
+#ifdef DEBUG
+  LOG(("MAX NOTIFICATION BATCH LEN: %d\n", sAppendBatchMaxSize));
+  if (sAppendBatchExaminations != 0) {
+    LOG(("AVERAGE SLOTS EXAMINED: %d\n",
+         sAppendBatchSlotsExamined / sAppendBatchExaminations));
+  }
+#endif
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsHtml5TreeOpExecutor::WillInterrupt() {
+  MOZ_ASSERT_UNREACHABLE("Don't call. For interface compat only.");
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+void nsHtml5TreeOpExecutor::WillResume() {
+  MOZ_ASSERT_UNREACHABLE("Don't call. For interface compat only.");
+}
+
+NS_IMETHODIMP
+nsHtml5TreeOpExecutor::SetParser(nsParserBase* aParser) {
+  mParser = aParser;
+  return NS_OK;
+}
+
+void nsHtml5TreeOpExecutor::InitialTranslationCompleted() {
+  nsContentSink::StartLayout(false);
+}
+
+void nsHtml5TreeOpExecutor::FlushPendingNotifications(FlushType aType) {
+  if (aType >= FlushType::EnsurePresShellInitAndFrames) {
+    nsContentSink::StartLayout(true);
+  }
+}
+
+nsISupports* nsHtml5TreeOpExecutor::GetTarget() {
+  return ToSupports(mDocument);
+}
+
+nsresult nsHtml5TreeOpExecutor::MarkAsBroken(nsresult aReason) {
+  MOZ_ASSERT(NS_IsMainThread(), "Wrong thread!");
+  mBroken = aReason;
+  if (mStreamParser) {
+    mStreamParser->Terminate();
+  }
+  if (mParser && mDocument) {  
+    nsCOMPtr<nsIRunnable> terminator = NewRunnableMethod(
+        "nsHtml5Parser::Terminate", GetParser(), &nsHtml5Parser::Terminate);
+    if (NS_FAILED(mDocument->Dispatch(terminator.forget()))) {
+      NS_WARNING("failed to dispatch executor flush event");
+    }
+  }
+  return aReason;
+}
+
+static bool BackgroundFlushCallback(TimeStamp ) {
+  RefPtr<nsHtml5TreeOpExecutor> ex = gBackgroundFlushList->popFirst();
+  if (ex) {
+    ex->RunFlushLoop();
+  }
+  if (gBackgroundFlushList && gBackgroundFlushList->isEmpty()) {
+    if (gBackgroundFlushRunner) {
+      gBackgroundFlushRunner->Cancel();
+      gBackgroundFlushRunner = nullptr;
+    }
+    return true;
+  }
+  return true;
+}
+
+void nsHtml5TreeOpExecutor::ContinueInterruptedParsingAsync() {
+  if (sShutdown) {
+    return;
+  }
+
+  if (mDocument && !mDocument->IsInBackgroundWindow()) {
+    nsCOMPtr<nsIRunnable> flusher = new nsHtml5ExecutorReflusher(this);
+    if (NS_FAILED(mDocument->Dispatch(flusher.forget()))) {
+      NS_WARNING("failed to dispatch executor flush event");
+    }
+  } else {
+    if (!gBackgroundFlushList) {
+      gBackgroundFlushList = new LinkedList<nsHtml5TreeOpExecutor>();
+    }
+    if (!isInList()) {
+      gBackgroundFlushList->insertBack(this);
+    }
+    if (gBackgroundFlushRunner) {
+      return;
+    }
+    gBackgroundFlushRunner = IdleTaskRunner::Create(
+        &BackgroundFlushCallback,
+        "nsHtml5TreeOpExecutor::BackgroundFlushCallback"_ns,
+        nullptr,  
+        TimeDuration::FromMilliseconds(250),  
+        TimeDuration::FromMicroseconds(
+            StaticPrefs::content_sink_interactive_parse_time()),  
+        true,                                                     
+        [] { return false; });  
+  }
+}
+
+void nsHtml5TreeOpExecutor::FlushSpeculativeLoads() {
+  if (sShutdown) {
+    return;
+  }
+
+  nsTArray<nsHtml5SpeculativeLoad> speculativeLoadQueue;
+  mStage.MoveSpeculativeLoadsTo(speculativeLoadQueue);
+  nsHtml5SpeculativeLoad* start = speculativeLoadQueue.Elements();
+  nsHtml5SpeculativeLoad* end = start + speculativeLoadQueue.Length();
+  for (nsHtml5SpeculativeLoad* iter = start; iter < end; ++iter) {
+    if (MOZ_UNLIKELY(!mParser)) {
+      return;
+    }
+    iter->Perform(this);
+  }
+}
+
+class nsHtml5FlushLoopGuard {
+ private:
+  RefPtr<nsHtml5TreeOpExecutor> mExecutor;
+#ifdef DEBUG
+  uint32_t mStartTime;
+#endif
+ public:
+  explicit nsHtml5FlushLoopGuard(nsHtml5TreeOpExecutor* aExecutor)
+      : mExecutor(aExecutor)
+#ifdef DEBUG
+        ,
+        mStartTime(PR_IntervalToMilliseconds(PR_IntervalNow()))
+#endif
+  {
+    mExecutor->mRunFlushLoopOnStack = true;
+  }
+  ~nsHtml5FlushLoopGuard() {
+#ifdef DEBUG
+    uint32_t timeOffTheEventLoop =
+        PR_IntervalToMilliseconds(PR_IntervalNow()) - mStartTime;
+    if (timeOffTheEventLoop >
+        nsHtml5TreeOpExecutor::sLongestTimeOffTheEventLoop) {
+      nsHtml5TreeOpExecutor::sLongestTimeOffTheEventLoop = timeOffTheEventLoop;
+    }
+    LOG(("Longest time off the event loop: %d\n",
+         nsHtml5TreeOpExecutor::sLongestTimeOffTheEventLoop));
+#endif
+
+    mExecutor->mRunFlushLoopOnStack = false;
+  }
+};
+
+void nsHtml5TreeOpExecutor::RunFlushLoop() {
+
+  if (mRunFlushLoopOnStack) {
+    return;
+  }
+
+  nsHtml5FlushLoopGuard guard(this);  
+
+  RefPtr<nsParserBase> parserKungFuDeathGrip(mParser);
+  RefPtr<nsHtml5StreamParser> streamParserGrip;
+  if (mParser) {
+    streamParserGrip = GetParser()->GetStreamParser();
+  }
+  (void)streamParserGrip;  
+
+  (void)nsContentSink::WillParseImpl();
+
+  while (!sShutdown) {
+    if (!mParser) {
+      ClearOpQueue();  
+      return;
+    }
+
+    if (NS_FAILED(IsBroken())) {
+      return;
+    }
+
+    if (!parserKungFuDeathGrip->IsParserEnabled()) {
+      return;
+    }
+
+    if (mFlushState != eNotFlushing) {
+      nsHtml5TreeOpExecutor::ContinueInterruptedParsingAsync();
+      return;
+    }
+
+    if (IsScriptExecuting()) {
+      ContinueParsingDocumentAfterCurrentScript();
+      return;
+    }
+
+    if (mReadingFromStage) {
+      nsTArray<nsHtml5SpeculativeLoad> speculativeLoadQueue;
+      MOZ_RELEASE_ASSERT(mFlushState == eNotFlushing,
+                         "mOpQueue modified during flush.");
+      if (!mStage.MoveOpsAndSpeculativeLoadsTo(mOpQueue,
+                                               speculativeLoadQueue)) {
+        MarkAsBroken(nsresult::NS_ERROR_OUT_OF_MEMORY);
+        return;
+      }
+
+      nsHtml5SpeculativeLoad* start = speculativeLoadQueue.Elements();
+      nsHtml5SpeculativeLoad* end = start + speculativeLoadQueue.Length();
+      for (nsHtml5SpeculativeLoad* iter = start; iter < end; ++iter) {
+        iter->Perform(this);
+        if (MOZ_UNLIKELY(!mParser)) {
+          ClearOpQueue();  
+          return;
+        }
+      }
+    } else {
+      FlushSpeculativeLoads();  
+      if (MOZ_UNLIKELY(!mParser)) {
+        ClearOpQueue();  
+        return;
+      }
+      nsresult rv = GetParser()->ParseUntilBlocked();
+
+      FlushSpeculativeLoads();
+
+      if (NS_FAILED(rv)) {
+        MarkAsBroken(rv);
+        return;
+      }
+    }
+
+    if (mOpQueue.IsEmpty()) {
+      return;
+    }
+
+    nsIContent* scriptElement = nullptr;
+    bool interrupted = false;
+    bool streamEnded = false;
+
+    {
+      nsHtml5AutoFlush autoFlush(this);
+
+      nsHtml5TreeOperation* first = mOpQueue.Elements();
+      nsHtml5TreeOperation* last = first + mOpQueue.Length() - 1;
+      for (nsHtml5TreeOperation* iter = first;; ++iter) {
+        if (MOZ_UNLIKELY(!mParser)) {
+          return;
+        }
+        MOZ_ASSERT(IsInDocUpdate(),
+                   "Tried to perform tree op outside update batch.");
+        nsresult rv =
+            iter->Perform(this, &scriptElement, &interrupted, &streamEnded);
+        if (NS_FAILED(rv)) {
+          MarkAsBroken(rv);
+          break;
+        }
+
+        if (MOZ_UNLIKELY(iter == last)) {
+          break;
+        } else if (MOZ_UNLIKELY(interrupted) ||
+                   MOZ_UNLIKELY(nsContentSink::DidProcessATokenImpl() ==
+                                NS_ERROR_HTMLPARSER_INTERRUPTED)) {
+          autoFlush.SetNumberOfOpsToRemove((iter - first) + 1);
+
+          nsHtml5TreeOpExecutor::ContinueInterruptedParsingAsync();
+          if (!interrupted) {
+          }
+          return;
+        }
+      }
+
+      if (MOZ_UNLIKELY(!mParser)) {
+        return;
+      }
+      if (streamEnded) {
+        GetParser()->PermanentlyUndefineInsertionPoint();
+      }
+    }  
+
+    if (MOZ_UNLIKELY(!mParser)) {
+      return;
+    }
+
+    if (streamEnded) {
+      DidBuildModel(false);
+#ifdef DEBUG
+      if (scriptElement) {
+        nsCOMPtr<nsIScriptElement> sele = do_QueryInterface(scriptElement);
+        if (!sele) {
+          MOZ_ASSERT(nsNameSpaceManager::GetInstance()->mSVGDisabled,
+                     "Node didn't QI to script, but SVG wasn't disabled.");
+        }
+        MOZ_ASSERT(sele->IsMalformed(), "Script wasn't marked as malformed.");
+      }
+#endif
+    } else if (scriptElement) {
+      RunScript(scriptElement, true);
+
+      StopDeflecting();
+      if (nsContentSink::DidProcessATokenImpl() ==
+          NS_ERROR_HTMLPARSER_INTERRUPTED) {
+#ifdef DEBUG
+        LOG(("REFLUSH SCHEDULED (after script): %d\n",
+             ++sTimesFlushLoopInterrupted));
+#endif
+        nsHtml5TreeOpExecutor::ContinueInterruptedParsingAsync();
+        return;
+      }
+    }
+  }
+}
+
+nsresult nsHtml5TreeOpExecutor::FlushDocumentWrite() {
+  if (sShutdown) {
+    return NS_OK;
+  }
+
+  nsresult rv = IsBroken();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  FlushSpeculativeLoads();  
+
+  if (MOZ_UNLIKELY(!mParser)) {
+    ClearOpQueue();  
+    return rv;
+  }
+
+  if (mFlushState != eNotFlushing) {
+    return rv;
+  }
+
+  RefPtr<nsHtml5TreeOpExecutor> kungFuDeathGrip(this);
+  RefPtr<nsParserBase> parserKungFuDeathGrip(mParser);
+  (void)parserKungFuDeathGrip;  
+  RefPtr<nsHtml5StreamParser> streamParserGrip;
+  if (mParser) {
+    streamParserGrip = GetParser()->GetStreamParser();
+  }
+  (void)streamParserGrip;  
+
+  MOZ_RELEASE_ASSERT(!mReadingFromStage,
+                     "Got doc write flush when reading from stage");
+
+#ifdef DEBUG
+  mStage.AssertEmpty();
+#endif
+
+  nsIContent* scriptElement = nullptr;
+  bool interrupted = false;
+  bool streamEnded = false;
+
+  {
+    nsHtml5AutoFlush autoFlush(this);
+
+    nsHtml5TreeOperation* start = mOpQueue.Elements();
+    nsHtml5TreeOperation* end = start + mOpQueue.Length();
+    for (nsHtml5TreeOperation* iter = start; iter < end; ++iter) {
+      if (MOZ_UNLIKELY(!mParser)) {
+        return rv;
+      }
+      NS_ASSERTION(IsInDocUpdate(),
+                   "Tried to perform tree op outside update batch.");
+      rv = iter->Perform(this, &scriptElement, &interrupted, &streamEnded);
+      if (NS_FAILED(rv)) {
+        MarkAsBroken(rv);
+        break;
+      }
+    }
+
+    if (MOZ_UNLIKELY(!mParser)) {
+      return rv;
+    }
+    if (streamEnded) {
+      GetParser()->PermanentlyUndefineInsertionPoint();
+    }
+  }  
+
+  if (MOZ_UNLIKELY(!mParser)) {
+    return rv;
+  }
+
+  if (streamEnded) {
+    DidBuildModel(false);
+#ifdef DEBUG
+    if (scriptElement) {
+      nsCOMPtr<nsIScriptElement> sele = do_QueryInterface(scriptElement);
+      if (!sele) {
+        MOZ_ASSERT(nsNameSpaceManager::GetInstance()->mSVGDisabled,
+                   "Node didn't QI to script, but SVG wasn't disabled.");
+      }
+      MOZ_ASSERT(sele->IsMalformed(), "Script wasn't marked as malformed.");
+    }
+#endif
+  } else if (scriptElement) {
+    RunScript(scriptElement, true);
+  }
+  return rv;
+}
+
+void nsHtml5TreeOpExecutor::CommitToInternalEncoding() {
+  if (MOZ_UNLIKELY(!mParser || !mStreamParser)) {
+    ClearOpQueue();  
+    return;
+  }
+  mStreamParser->ContinueAfterScriptsOrEncodingCommitment(nullptr, nullptr,
+                                                          false);
+  ContinueInterruptedParsingAsync();
+}
+
+[[nodiscard]] bool nsHtml5TreeOpExecutor::TakeOpsFromStage() {
+  return mStage.MoveOpsTo(mOpQueue);
+}
+
+bool nsHtml5TreeOpExecutor::IsScriptEnabled() {
+  if (!mDocument || !mDocShell) {
+    return true;
+  }
+
+  return mDocument->IsScriptEnabled();
+}
+
+void nsHtml5TreeOpExecutor::StartLayout(bool* aInterrupted) {
+  if (mLayoutStarted || !mDocument) {
+    return;
+  }
+
+  nsHtml5AutoPauseUpdate autoPause(this);
+
+  if (MOZ_UNLIKELY(!mParser)) {
+    return;
+  }
+
+  nsContentSink::StartLayout(false);
+
+  if (mParser) {
+    *aInterrupted = !GetParser()->IsParserEnabled();
+  }
+}
+
+void nsHtml5TreeOpExecutor::PauseDocUpdate(bool* aInterrupted) {
+  nsHtml5AutoPauseUpdate autoPause(this);
+
+  if (MOZ_LIKELY(mParser)) {
+    *aInterrupted = !GetParser()->IsParserEnabled();
+  }
+}
+
+void nsHtml5TreeOpExecutor::RunScript(nsIContent* aScriptElement,
+                                      bool aMayDocumentWriteOrBlock) {
+  if (mRunsToCompletion) {
+    return;
+  }
+
+  MOZ_ASSERT(mParser, "Trying to run script with a terminated parser.");
+  MOZ_ASSERT(aScriptElement, "No script to run");
+  nsCOMPtr<nsIScriptElement> sele = do_QueryInterface(aScriptElement);
+  if (!sele) {
+    MOZ_ASSERT(nsNameSpaceManager::GetInstance()->mSVGDisabled,
+               "Node didn't QI to script, but SVG wasn't disabled.");
+    return;
+  }
+
+  sele->SetCreatorParser(GetParser());
+
+  if (!aMayDocumentWriteOrBlock) {
+    MOZ_ASSERT(sele->GetScriptDeferred() || sele->GetScriptAsync() ||
+               sele->GetScriptIsModule() || sele->GetScriptIsImportMap() ||
+               sele->GetScriptIsSpeculationRules() ||
+               aScriptElement->AsElement()->HasAttr(nsGkAtoms::nomodule));
+    sele->AttemptToExecute(nullptr );
+    return;
+  }
+
+  MOZ_RELEASE_ASSERT(
+      mFlushState == eNotFlushing,
+      "Tried to run a potentially-blocking script while flushing.");
+
+  mReadingFromStage = false;
+
+  bool block = sele->AttemptToExecute(GetParser());
+
+  if (!block) {
+
+    nsHtml5TreeOpExecutor::ContinueInterruptedParsingAsync();
+  }
+}
+
+void nsHtml5TreeOpExecutor::Start() {
+  MOZ_ASSERT(!mStarted, "Tried to start when already started.");
+  mStarted = true;
+}
+
+void nsHtml5TreeOpExecutor::UpdateCharsetSource(
+    nsCharsetSource aCharsetSource) {
+  if (mDocument) {
+    mDocument->SetDocumentCharacterSetSource(aCharsetSource);
+  }
+}
+
+void nsHtml5TreeOpExecutor::SetDocumentCharsetAndSource(
+    NotNull<const Encoding*> aEncoding, nsCharsetSource aCharsetSource) {
+  if (mDocument) {
+    mDocument->SetDocumentCharacterSetSource(aCharsetSource);
+    mDocument->SetDocumentCharacterSet(aEncoding);
+  }
+}
+
+void nsHtml5TreeOpExecutor::NeedsCharsetSwitchTo(
+    NotNull<const Encoding*> aEncoding, int32_t aSource, uint32_t aLineNumber) {
+  nsHtml5AutoPauseUpdate autoPause(this);
+  if (MOZ_UNLIKELY(!mParser)) {
+    return;
+  }
+
+  if (!mDocShell) {
+    return;
+  }
+
+  RefPtr<nsDocShell> docShell = static_cast<nsDocShell*>(mDocShell.get());
+
+  if (NS_SUCCEEDED(docShell->CharsetChangeStopDocumentLoad())) {
+    docShell->CharsetChangeReloadDocument(aEncoding, aSource);
+  }
+  if (!mParser) {
+    return;
+  }
+
+  GetParser()->ContinueAfterFailedCharsetSwitch();
+}
+
+void nsHtml5TreeOpExecutor::MaybeComplainAboutCharset(const char* aMsgId,
+                                                      bool aError,
+                                                      uint32_t aLineNumber) {
+  if (!(!strcmp(aMsgId, "EncError") || !strcmp(aMsgId, "EncErrorFrame") ||
+        !strcmp(aMsgId, "EncErrorFramePlain"))) {
+    if (mAlreadyComplainedAboutCharset) {
+      return;
+    }
+    mAlreadyComplainedAboutCharset = true;
+  }
+  nsContentUtils::ReportToConsole(
+      aError ? nsIScriptError::errorFlag : nsIScriptError::warningFlag,
+      "HTML parser"_ns, mDocument, PropertiesFile::HTMLPARSER_PROPERTIES,
+      aMsgId, nsTArray<nsString>(),
+      SourceLocation{mDocument->GetDocumentURI(), aLineNumber});
+}
+
+void nsHtml5TreeOpExecutor::ComplainAboutBogusProtocolCharset(
+    Document* aDoc, bool aUnrecognized) {
+  NS_ASSERTION(!mAlreadyComplainedAboutCharset,
+               "How come we already managed to complain?");
+  mAlreadyComplainedAboutCharset = true;
+  nsContentUtils::ReportToConsole(
+      nsIScriptError::errorFlag, "HTML parser"_ns, aDoc,
+      PropertiesFile::HTMLPARSER_PROPERTIES,
+      aUnrecognized ? "EncProtocolUnsupported" : "EncProtocolReplacement");
+}
+
+void nsHtml5TreeOpExecutor::MaybeComplainAboutDeepTree(uint32_t aLineNumber) {
+  if (mAlreadyComplainedAboutDeepTree) {
+    return;
+  }
+  mAlreadyComplainedAboutDeepTree = true;
+  nsContentUtils::ReportToConsole(
+      nsIScriptError::errorFlag, "HTML parser"_ns, mDocument,
+      PropertiesFile::HTMLPARSER_PROPERTIES, "errDeepTree",
+      nsTArray<nsString>(),
+      SourceLocation{mDocument->GetDocumentURI(), aLineNumber});
+}
+
+nsHtml5Parser* nsHtml5TreeOpExecutor::GetParser() {
+  MOZ_ASSERT(!mRunsToCompletion);
+  return static_cast<nsHtml5Parser*>(mParser.get());
+}
+
+[[nodiscard]] bool nsHtml5TreeOpExecutor::MoveOpsFrom(
+    nsTArray<nsHtml5TreeOperation>& aOpQueue) {
+  MOZ_RELEASE_ASSERT(mFlushState == eNotFlushing,
+                     "Ops added to mOpQueue during tree op execution.");
+  return !!mOpQueue.AppendElements(std::move(aOpQueue), mozilla::fallible_t());
+}
+
+void nsHtml5TreeOpExecutor::ClearOpQueue() {
+  MOZ_RELEASE_ASSERT(mFlushState == eNotFlushing,
+                     "mOpQueue cleared during tree op execution.");
+  mOpQueue.Clear();
+}
+
+void nsHtml5TreeOpExecutor::RemoveFromStartOfOpQueue(
+    size_t aNumberOfOpsToRemove) {
+  MOZ_RELEASE_ASSERT(mFlushState == eNotFlushing,
+                     "Ops removed from mOpQueue during tree op execution.");
+  mOpQueue.RemoveElementsAt(0, aNumberOfOpsToRemove);
+}
+
+void nsHtml5TreeOpExecutor::InitializeDocWriteParserState(
+    nsAHtml5TreeBuilderState* aState, int32_t aLine) {
+  GetParser()->InitializeDocWriteParserState(aState, aLine);
+}
+
+nsIURI* nsHtml5TreeOpExecutor::GetViewSourceBaseURI() {
+  if (!mViewSourceBaseURI) {
+    nsCOMPtr<nsIViewSourceChannel> vsc =
+        do_QueryInterface(mDocument->GetChannel());
+    if (vsc) {
+      nsresult rv = vsc->GetBaseURI(getter_AddRefs(mViewSourceBaseURI));
+      if (NS_SUCCEEDED(rv) && mViewSourceBaseURI) {
+        return mViewSourceBaseURI;
+      }
+    }
+
+    nsCOMPtr<nsIURI> orig = mDocument->GetOriginalURI();
+    if (orig->SchemeIs("view-source")) {
+      nsCOMPtr<nsINestedURI> nested = do_QueryInterface(orig);
+      NS_ASSERTION(nested, "URI with scheme view-source didn't QI to nested!");
+      nested->GetInnerURI(getter_AddRefs(mViewSourceBaseURI));
+    } else {
+      mViewSourceBaseURI = std::move(orig);
+    }
+  }
+  return mViewSourceBaseURI;
+}
+
+bool nsHtml5TreeOpExecutor::IsExternalViewSource() {
+  if (!StaticPrefs::view_source_editor_external()) {
+    return false;
+  }
+  if (mDocumentURI) {
+    return mDocumentURI->SchemeIs("view-source");
+  }
+  return false;
+}
+
+
+nsIURI* nsHtml5TreeOpExecutor::BaseURIForPreload() {
+  nsIURI* documentURI = mDocument->GetDocumentURI();
+  nsIURI* documentBaseURI = mDocument->GetDocBaseURI();
+
+  return (documentURI == documentBaseURI)
+             ? (mSpeculationBaseURI ? mSpeculationBaseURI.get() : documentURI)
+             : documentBaseURI;
+}
+
+already_AddRefed<nsIURI>
+nsHtml5TreeOpExecutor::ConvertIfNotPreloadedYetAndMediaApplies(
+    const nsAString& aURL, const nsAString& aMedia) {
+  nsCOMPtr<nsIURI> uri = ConvertIfNotPreloadedYet(aURL);
+  if (!uri) {
+    return nullptr;
+  }
+
+  if (!MediaApplies(aMedia)) {
+    return nullptr;
+  }
+  return uri.forget();
+}
+
+bool nsHtml5TreeOpExecutor::MediaApplies(const nsAString& aMedia) {
+  using dom::MediaList;
+
+  if (aMedia.IsEmpty()) {
+    return true;
+  }
+  RefPtr<MediaList> media = MediaList::Create(NS_ConvertUTF16toUTF8(aMedia));
+  return media->Matches(*mDocument);
+}
+
+already_AddRefed<nsIURI> nsHtml5TreeOpExecutor::ConvertIfNotPreloadedYet(
+    const nsAString& aURL) {
+  if (aURL.IsEmpty()) {
+    return nullptr;
+  }
+
+  nsIURI* base = BaseURIForPreload();
+  auto encoding = mDocument->GetDocumentCharacterSet();
+  nsCOMPtr<nsIURI> uri;
+  nsresult rv = NS_NewURI(getter_AddRefs(uri), aURL, encoding, base);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("Failed to create a URI");
+    return nullptr;
+  }
+
+  if (ShouldPreloadURI(uri)) {
+    return uri.forget();
+  }
+
+  return nullptr;
+}
+
+bool nsHtml5TreeOpExecutor::ShouldPreloadURI(nsIURI* aURI) {
+  nsAutoCString spec;
+  nsresult rv = aURI->GetSpec(spec);
+  NS_ENSURE_SUCCESS(rv, false);
+  return mPreloadedURLs.EnsureInserted(spec);
+}
+
+bool nsHtml5TreeOpExecutor::ImageTypeSupports(const nsAString& aType) {
+  if (aType.IsEmpty()) {
+    return true;
+  }
+  return imgLoader::SupportImageWithMimeType(
+      NS_ConvertUTF16toUTF8(aType), AcceptedMimeTypes::IMAGES_AND_DOCUMENTS);
+}
+
+dom::ReferrerPolicy nsHtml5TreeOpExecutor::GetPreloadReferrerPolicy(
+    const nsAString& aReferrerPolicy) {
+  dom::ReferrerPolicy referrerPolicy =
+      dom::ReferrerInfo::ReferrerPolicyAttributeFromString(aReferrerPolicy);
+  return GetPreloadReferrerPolicy(referrerPolicy);
+}
+
+dom::ReferrerPolicy nsHtml5TreeOpExecutor::GetPreloadReferrerPolicy(
+    ReferrerPolicy aReferrerPolicy) {
+  if (aReferrerPolicy != dom::ReferrerPolicy::_empty) {
+    return aReferrerPolicy;
+  }
+
+  return mDocument->GetPreloadReferrerInfo()->ReferrerPolicy();
+}
+
+void nsHtml5TreeOpExecutor::PreloadScript(
+    const nsAString& aURL, const nsAString& aCharset, const nsAString& aType,
+    const nsAString& aCrossOrigin, const nsAString& aMedia,
+    const nsAString& aNonce, const nsAString& aFetchPriority,
+    const nsAString& aIntegrity, dom::ReferrerPolicy aReferrerPolicy,
+    bool aScriptFromHead, bool aAsync, bool aDefer, bool aLinkPreload) {
+  dom::ScriptLoader* loader = mDocument->GetScriptLoader();
+  if (!loader) {
+    return;
+  }
+  nsCOMPtr<nsIURI> uri = ConvertIfNotPreloadedYetAndMediaApplies(aURL, aMedia);
+  if (!uri) {
+    return;
+  }
+  auto key = PreloadHashKey::CreateAsScript(uri, aCrossOrigin, aType);
+  if (mDocument->Preloads().PreloadExists(key)) {
+    return;
+  }
+  loader->PreloadURI(uri, aCharset, aType, aCrossOrigin, aNonce, aFetchPriority,
+                     aIntegrity, aScriptFromHead, aAsync, aDefer, aLinkPreload,
+                     GetPreloadReferrerPolicy(aReferrerPolicy), 0);
+}
+
+void nsHtml5TreeOpExecutor::PreloadStyle(
+    const nsAString& aURL, const nsAString& aCharset,
+    const nsAString& aCrossOrigin, const nsAString& aMedia,
+    const nsAString& aReferrerPolicy, const nsAString& aNonce,
+    const nsAString& aIntegrity, bool aLinkPreload,
+    const nsAString& aFetchPriority) {
+  nsCOMPtr<nsIURI> uri = ConvertIfNotPreloadedYetAndMediaApplies(aURL, aMedia);
+  if (!uri) {
+    return;
+  }
+
+  if (aLinkPreload) {
+    auto hashKey = PreloadHashKey::CreateAsStyle(
+        uri, mDocument->NodePrincipal(),
+        dom::Element::StringToCORSMode(aCrossOrigin));
+    if (mDocument->Preloads().PreloadExists(hashKey)) {
+      return;
+    }
+  }
+
+  mDocument->PreloadStyle(
+      uri, Encoding::ForLabel(aCharset), aCrossOrigin,
+      GetPreloadReferrerPolicy(aReferrerPolicy), aNonce, aIntegrity,
+      aLinkPreload ? css::StylePreloadKind::FromLinkRelPreloadElement
+                   : css::StylePreloadKind::FromParser,
+      0, aFetchPriority);
+}
+
+void nsHtml5TreeOpExecutor::PreloadImage(
+    const nsAString& aURL, const nsAString& aCrossOrigin,
+    const nsAString& aMedia, const nsAString& aSrcset, const nsAString& aSizes,
+    const nsAString& aImageReferrerPolicy, bool aLinkPreload,
+    const nsAString& aFetchPriority, const nsAString& aType) {
+  nsCOMPtr<nsIURI> baseURI = BaseURIForPreload();
+  bool isImgSet = false;
+  nsCOMPtr<nsIURI> uri =
+      mDocument->ResolvePreloadImage(baseURI, aURL, aSrcset, aSizes, &isImgSet);
+  if (uri && ShouldPreloadURI(uri) && MediaApplies(aMedia) &&
+      ImageTypeSupports(aType)) {
+    mDocument->MaybePreLoadImage(uri, aCrossOrigin,
+                                 GetPreloadReferrerPolicy(aImageReferrerPolicy),
+                                 isImgSet, aLinkPreload, aFetchPriority);
+  }
+}
+
+void nsHtml5TreeOpExecutor::PreloadPictureSource(const nsAString& aSrcset,
+                                                 const nsAString& aSizes,
+                                                 const nsAString& aType,
+                                                 const nsAString& aMedia) {
+  mDocument->PreloadPictureImageSource(aSrcset, aSizes, aType, aMedia);
+}
+
+void nsHtml5TreeOpExecutor::PreloadFont(const nsAString& aURL,
+                                        const nsAString& aCrossOrigin,
+                                        const nsAString& aMedia,
+                                        const nsAString& aReferrerPolicy,
+                                        const nsAString& aFetchPriority) {
+  nsCOMPtr<nsIURI> uri = ConvertIfNotPreloadedYetAndMediaApplies(aURL, aMedia);
+  if (!uri) {
+    return;
+  }
+
+  mDocument->Preloads().PreloadFont(uri, aCrossOrigin, aReferrerPolicy, 0,
+                                    aFetchPriority);
+}
+
+void nsHtml5TreeOpExecutor::PreloadFetch(const nsAString& aURL,
+                                         const nsAString& aCrossOrigin,
+                                         const nsAString& aMedia,
+                                         const nsAString& aReferrerPolicy,
+                                         const nsAString& aFetchPriority) {
+  nsCOMPtr<nsIURI> uri = ConvertIfNotPreloadedYetAndMediaApplies(aURL, aMedia);
+  if (!uri) {
+    return;
+  }
+
+  mDocument->Preloads().PreloadFetch(uri, aCrossOrigin, aReferrerPolicy, 0,
+                                     aFetchPriority);
+}
+
+void nsHtml5TreeOpExecutor::PreloadOpenPicture() {
+  mDocument->PreloadPictureOpened();
+}
+
+void nsHtml5TreeOpExecutor::PreloadEndPicture() {
+  mDocument->PreloadPictureClosed();
+}
+
+void nsHtml5TreeOpExecutor::AddBase(const nsAString& aURL) {
+  auto encoding = mDocument->GetDocumentCharacterSet();
+  nsresult rv = NS_NewURI(getter_AddRefs(mViewSourceBaseURI), aURL, encoding,
+                          GetViewSourceBaseURI());
+  if (NS_FAILED(rv)) {
+    mViewSourceBaseURI = nullptr;
+  }
+}
+void nsHtml5TreeOpExecutor::SetSpeculationBase(const nsAString& aURL) {
+  if (mSpeculationBaseURI) {
+    return;
+  }
+
+  auto encoding = mDocument->GetDocumentCharacterSet();
+  nsCOMPtr<nsIURI> newBaseURI;
+  DebugOnly<nsresult> rv = NS_NewURI(getter_AddRefs(newBaseURI), aURL, encoding,
+                                     mDocument->GetDocumentURI());
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv), "Failed to create a URI");
+  if (!newBaseURI) {
+    return;
+  }
+
+  if (newBaseURI->SchemeIs("data") || newBaseURI->SchemeIs("javascript")) {
+    return;
+  }
+
+  if (nsCOMPtr<nsIContentSecurityPolicy> csp =
+          PolicyContainer::GetCSP(mDocument->GetPolicyContainer())) {
+    bool cspPermitsBaseURI = true;
+    nsresult rv = csp->Permits(
+        nullptr, nullptr, newBaseURI,
+        nsIContentSecurityPolicy::BASE_URI_DIRECTIVE, true ,
+        false , &cspPermitsBaseURI);
+    if (NS_FAILED(rv) || !cspPermitsBaseURI) {
+      return;
+    }
+  }
+
+  if (nsCOMPtr<nsIContentSecurityPolicy> csp = mDocument->GetPreloadCsp()) {
+    bool cspPermitsBaseURI = true;
+    nsresult rv = csp->Permits(
+        nullptr, nullptr, newBaseURI,
+        nsIContentSecurityPolicy::BASE_URI_DIRECTIVE, true ,
+        false , &cspPermitsBaseURI);
+    if (NS_FAILED(rv) || !cspPermitsBaseURI) {
+      return;
+    }
+  }
+
+  mSpeculationBaseURI = std::move(newBaseURI);
+  mDocument->Preloads().SetSpeculationBase(mSpeculationBaseURI);
+}
+
+void nsHtml5TreeOpExecutor::UpdateReferrerInfoFromMeta(
+    const nsAString& aMetaReferrer) {
+  mDocument->UpdateReferrerInfoFromMeta(aMetaReferrer, true);
+}
+
+void nsHtml5TreeOpExecutor::AddSpeculationCSP(const nsAString& aCSP) {
+  NS_ASSERTION(NS_IsMainThread(), "Wrong thread!");
+
+  nsresult rv = NS_OK;
+  nsCOMPtr<nsIContentSecurityPolicy> preloadCsp = mDocument->GetPreloadCsp();
+  if (!preloadCsp) {
+    RefPtr<nsCSPContext> csp = new nsCSPContext();
+    csp->SuppressParserLogMessages();
+    preloadCsp = csp;
+    rv = preloadCsp->SetRequestContextWithDocument(mDocument);
+    NS_ENSURE_SUCCESS_VOID(rv);
+  }
+
+  rv = preloadCsp->AppendPolicy(
+      aCSP,
+      false,  
+      true);  
+  NS_ENSURE_SUCCESS_VOID(rv);
+
+  nsPIDOMWindowInner* inner = mDocument->GetInnerWindow();
+  if (inner) {
+    inner->SetPreloadCsp(preloadCsp);
+  }
+  mDocument->ApplySettingsFromCSP(true);
+}
+
+#ifdef DEBUG
+uint32_t nsHtml5TreeOpExecutor::sAppendBatchMaxSize = 0;
+uint32_t nsHtml5TreeOpExecutor::sAppendBatchSlotsExamined = 0;
+uint32_t nsHtml5TreeOpExecutor::sAppendBatchExaminations = 0;
+uint32_t nsHtml5TreeOpExecutor::sLongestTimeOffTheEventLoop = 0;
+uint32_t nsHtml5TreeOpExecutor::sTimesFlushLoopInterrupted = 0;
+#endif

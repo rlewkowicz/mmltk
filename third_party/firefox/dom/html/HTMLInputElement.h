@@ -1,0 +1,1100 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(mozilla_dom_HTMLInputElement_h)
+#define mozilla_dom_HTMLInputElement_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Decimal.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/TextControlElement.h"
+#include "mozilla/TextControlState.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/Variant.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/ButtonInputTypes.h"
+#include "mozilla/dom/CheckableInputTypes.h"
+#include "mozilla/dom/ColorInputType.h"
+#include "mozilla/dom/ConstraintValidation.h"
+#include "mozilla/dom/DateTimeInputTypes.h"
+#include "mozilla/dom/FileInputType.h"
+#include "mozilla/dom/HTMLInputElementBinding.h"
+#include "mozilla/dom/HiddenInputType.h"
+#include "mozilla/dom/NumericInputTypes.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/RadioGroupContainer.h"
+#include "mozilla/dom/SingleLineTextInputTypes.h"
+#include "nsCOMPtr.h"
+#include "nsContentUtils.h"
+#include "nsGenericHTMLElement.h"
+#include "nsIContentPrefService2.h"
+#include "nsIFilePicker.h"
+#include "nsImageLoadingContent.h"
+
+class nsIEditor;
+
+namespace mozilla {
+
+class EventChainPostVisitor;
+class EventChainPreVisitor;
+enum class StyleColorSpace : uint8_t;
+
+namespace dom {
+
+class AfterSetFilesOrDirectoriesRunnable;
+class Date;
+class DispatchChangeEventCallback;
+class File;
+class FileList;
+class FileSystemEntry;
+class FormData;
+class GetFilesHelper;
+class InputType;
+class OwningFileOrDirectory;
+
+class UploadLastDir final : public nsIObserver, public nsSupportsWeakReference {
+  ~UploadLastDir() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  nsresult FetchDirectoryAndDisplayPicker(
+      Document* aDoc, nsIFilePicker* aFilePicker,
+      nsIFilePickerShownCallback* aFpCallback);
+
+  nsresult StoreLastUsedDirectory(Document* aDoc, nsIFile* aDir);
+
+  class ContentPrefCallback final : public nsIContentPrefCallback2 {
+    virtual ~ContentPrefCallback() = default;
+
+   public:
+    ContentPrefCallback(nsIFilePicker* aFilePicker,
+                        nsIFilePickerShownCallback* aFpCallback)
+        : mFilePicker(aFilePicker), mFpCallback(aFpCallback) {}
+
+    NS_DECL_ISUPPORTS
+    NS_DECL_NSICONTENTPREFCALLBACK2
+
+    nsCOMPtr<nsIFilePicker> mFilePicker;
+    nsCOMPtr<nsIFilePickerShownCallback> mFpCallback;
+    nsCOMPtr<nsIContentPref> mResult;
+  };
+};
+
+class HTMLInputElement final : public TextControlElement,
+                               public nsImageLoadingContent,
+                               public ConstraintValidation {
+  friend class AfterSetFilesOrDirectoriesCallback;
+  friend class DispatchChangeEventCallback;
+  friend class InputType;
+
+ public:
+  using ConstraintValidation::GetValidationMessage;
+  using nsGenericHTMLFormControlElementWithState::GetFormAction;
+  using nsGenericHTMLFormControlElementWithState::GetFormForBindings;
+  using ValueSetterOption = TextControlState::ValueSetterOption;
+  using ValueSetterOptions = TextControlState::ValueSetterOptions;
+
+  enum class FromClone { No, Yes };
+
+  HTMLInputElement(already_AddRefed<dom::NodeInfo> aNodeInfo,
+                   FromParser aFromParser,
+                   FromClone aFromClone = FromClone::No);
+
+  NS_IMPL_FROMNODE_HTML_WITH_TAG(HTMLInputElement, input)
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+  int32_t TabIndexDefault() override;
+  using nsGenericHTMLElement::Focus;
+
+  bool IsNodeApzAwareInternal() const override;
+
+  bool IsInteractiveHTMLContent() const override;
+
+  bool IsDisabledForEvents(WidgetEvent* aEvent) override;
+
+  void SaveState() override;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY bool RestoreState(PresState* aState) override;
+
+  void AsyncEventRunning(AsyncEventDispatcher* aEvent) override;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  NS_IMETHOD Reset() override;
+  NS_IMETHOD SubmitNamesValues(FormData* aFormData) override;
+
+  void FieldSetDisabledChanged(bool aNotify) override;
+
+  bool IsHTMLFocusable(IsFocusableFlags, bool* aIsFocusable,
+                       int32_t* aTabIndex) override;
+
+  bool ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                      const nsAString& aValue,
+                      nsIPrincipal* aMaybeScriptedPrincipal,
+                      nsAttrValue& aResult) override;
+
+  bool IsDoneCreating() const { return mDoneCreating; }
+
+  bool LastValueChangeWasInteractive() const {
+    return mLastValueChangeWasInteractive;
+  }
+
+  void GetLastInteractiveValue(nsAString&);
+
+  nsChangeHint GetAttributeChangeHint(const nsAtom* aAttribute,
+                                      AttrModType aModType) const override;
+  NS_IMETHOD_(bool) IsAttributeMapped(const nsAtom* aAttribute) const override;
+  nsMapRuleToAttributesFunc GetAttributeMappingFunction() const override;
+
+  void GetEventTargetParent(EventChainPreVisitor& aVisitor) override;
+  void LegacyPreActivationBehavior(EventChainVisitor& aVisitor) override;
+  MOZ_CAN_RUN_SCRIPT
+  void ActivationBehavior(EventChainPostVisitor& aVisitor) override;
+  void LegacyCanceledActivationBehavior(
+      EventChainPostVisitor& aVisitor) override;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsresult PreHandleEvent(EventChainVisitor& aVisitor) override;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsresult PostHandleEvent(EventChainPostVisitor& aVisitor) override;
+  MOZ_CAN_RUN_SCRIPT
+  nsresult MaybeHandleRadioButtonNavigation(EventChainPostVisitor&,
+                                            uint32_t aKeyCode);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void PostHandleEventForRangeThumb(EventChainPostVisitor& aVisitor);
+  MOZ_CAN_RUN_SCRIPT
+  void StartRangeThumbDrag(WidgetGUIEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT
+  void FinishRangeThumbDrag(WidgetGUIEvent* aEvent = nullptr);
+  MOZ_CAN_RUN_SCRIPT
+  void CancelRangeThumbDrag(bool aIsForUserEvent = true);
+  MOZ_CAN_RUN_SCRIPT
+  void MaybeDispatchWillBlur(EventChainVisitor&);
+
+  enum class SnapToTickMarks : bool { No, Yes };
+  MOZ_CAN_RUN_SCRIPT
+  void SetValueOfRangeForUserEvent(Decimal aValue,
+                                   SnapToTickMarks = SnapToTickMarks::No);
+
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+  void UnbindFromTree(UnbindContext&) override;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void DoneCreatingElement() override;
+
+  void DestroyContent() override;
+
+  void SetLastValueChangeWasInteractive(bool);
+
+  void SetValueChanged(bool aValueChanged) override;
+  Maybe<int32_t> GetCols() override;
+  int32_t GetWrapCols() override;
+  int32_t GetRows() override;
+  void GetDefaultValueFromContent(nsAString& aValue, bool aForDisplay) override;
+  bool ValueChanged() const override;
+  void GetTextEditorValue(nsAString& aValue) const override;
+  MOZ_CAN_RUN_SCRIPT TextEditor* GetTextEditor() override;
+  TextEditor* GetExtantTextEditor() const override;
+  nsISelectionController* GetSelectionController() override;
+  nsFrameSelection* GetIndependentFrameSelection() const override;
+  TextControlState* GetTextControlState() const override {
+    return GetEditorState();
+  }
+  void SetAutofillState(const nsAString& aState) override {
+    SetFormAutofillState(aState);
+  }
+  void GetAutofillState(nsAString& aState) override {
+    GetFormAutofillState(aState);
+  }
+  void OnValueChanged(ValueChangeKind, bool aNewValueEmpty,
+                      const nsAString* aKnownNewValue) override;
+  void GetValueFromSetRangeText(nsAString& aValue) override;
+  MOZ_CAN_RUN_SCRIPT nsresult
+  SetValueFromSetRangeText(const nsAString& aValue) override;
+  bool HasCachedSelection() override;
+  MOZ_CAN_RUN_SCRIPT void SetRevealPassword(bool aValue);
+  bool RevealPassword() const;
+
+  uint32_t GetSelectionStartIgnoringType(ErrorResult& aRv);
+  uint32_t GetSelectionEndIgnoringType(ErrorResult& aRv);
+
+  void GetDisplayFileName(nsAString& aFileName) const;
+
+  const nsTArray<OwningFileOrDirectory>& GetFilesOrDirectoriesInternal() const;
+
+  void SetFilesOrDirectories(
+      const nsTArray<OwningFileOrDirectory>& aFilesOrDirectories,
+      bool aSetValueChanged);
+  void SetFiles(FileList* aFiles, bool aSetValueChanged);
+
+  void MozSetDndFilesAndDirectories(
+      const nsTArray<OwningFileOrDirectory>& aSequence);
+
+  void PickerClosed();
+
+  void SetCheckedChangedInternal(bool aCheckedChanged);
+  bool GetCheckedChanged() const { return mCheckedChanged; }
+  void AddToRadioGroup();
+  void RemoveFromRadioGroup();
+  void DisconnectRadioGroupContainer();
+  void UpdateRadioGroupState();
+
+  HTMLInputElement* GetSelectedRadioButton() const;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(HTMLInputElement, TextControlElement)
+
+  static UploadLastDir* gUploadLastDir;
+  static void InitUploadLastDir();
+  static void DestroyUploadLastDir();
+
+  static bool ValueAsDateEnabled(JSContext* cx, JSObject* obj);
+
+  void MaybeLoadImage();
+
+  bool HasPatternAttribute() const { return mHasPatternAttribute; }
+
+  bool IsTooLong();
+  bool IsTooShort();
+  bool IsValueMissing() const;
+  bool HasTypeMismatch() const;
+  Maybe<bool> HasPatternMismatch() const;
+  bool IsRangeOverflow() const;
+  bool IsRangeUnderflow() const;
+  bool ValueIsStepMismatch(const Decimal& aValue) const;
+  bool HasStepMismatch() const;
+  bool HasBadInput() const;
+  void UpdateTooLongValidityState();
+  void UpdateTooShortValidityState();
+  void UpdateValueMissingValidityState();
+  void UpdateTypeMismatchValidityState();
+  void UpdatePatternMismatchValidityState();
+  void UpdateRangeOverflowValidityState();
+  void UpdateRangeUnderflowValidityState();
+  void UpdateStepMismatchValidityState();
+  void UpdateBadInputValidityState();
+  void UpdatePlaceholderShownState();
+  void UpdateCheckedState(bool aNotify);
+  void UpdateIndeterminateState(bool aNotify);
+  void UpdateAllValidityStates(bool aNotify);
+  void UpdateValidityElementStates(bool aNotify);
+  MOZ_CAN_RUN_SCRIPT
+  void MaybeUpdateAllValidityStates(bool aNotify) {
+    if (mType == FormControlType::InputEmail) {
+      UpdateAllValidityStates(aNotify);
+    }
+  }
+
+  void UpdateAllValidityStatesButNotElementState();
+  void UpdateBarredFromConstraintValidation();
+  nsresult GetValidationMessage(nsAString& aValidationMessage,
+                                ValidityStateType aType) override;
+
+  void SetCustomValidity(const nsAString& aError);
+
+  void UpdateValueMissingValidityStateForRadio(bool aIgnoreSelf);
+
+  void SetFilePickerFiltersFromAccept(nsIFilePicker* filePicker);
+
+  void SetUserInteracted(bool) final;
+
+  void FireChangeEventIfNeeded();
+
+  Decimal GetValueAsDecimal() const;
+
+  Decimal GetMinimum() const;
+
+  Decimal GetMaximum() const;
+
+
+  void GetAccept(nsAString& aValue) { GetHTMLAttr(nsGkAtoms::accept, aValue); }
+  void SetAccept(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::accept, aValue, aRv);
+  }
+
+  bool Alpha() const;
+  void SetAlpha(bool aValue, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::alpha, aValue, aRv);
+  }
+
+  void GetAlt(nsAString& aValue) { GetHTMLAttr(nsGkAtoms::alt, aValue); }
+  void SetAlt(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::alt, aValue, aRv);
+  }
+
+  void GetAutocomplete(nsAString& aValue);
+  void SetAutocomplete(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::autocomplete, aValue, aRv);
+  }
+
+  void GetAutocompleteInfo(Nullable<AutocompleteInfo>& aInfo);
+
+  void GetCapture(nsAString& aValue);
+  void SetCapture(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::capture, aValue, aRv);
+  }
+
+  bool DefaultChecked() const { return HasAttr(nsGkAtoms::checked); }
+
+  void SetDefaultChecked(bool aValue, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::checked, aValue, aRv);
+  }
+
+  bool Checked() const { return mChecked; }
+  void SetChecked(bool aChecked);
+
+  void GetColorSpace(nsAString& aValue) const;
+  StyleColorSpace GetColorSpaceEnum() const;
+  void SetColorSpace(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::colorspace, aValue, aRv);
+  }
+
+  bool IsRadioOrCheckbox() const {
+    return mType == FormControlType::InputCheckbox ||
+           mType == FormControlType::InputRadio;
+  }
+
+  bool IsInputColor() const { return mType == FormControlType::InputColor; }
+
+  bool Disabled() const { return GetBoolAttr(nsGkAtoms::disabled); }
+
+  void SetDisabled(bool aValue, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::disabled, aValue, aRv);
+  }
+
+  FileList* GetFiles();
+  void SetFiles(FileList* aFiles);
+
+  void SetFormAction(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::formaction, aValue, aRv);
+  }
+
+  void GetFormEnctype(nsAString& aValue);
+  void SetFormEnctype(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::formenctype, aValue, aRv);
+  }
+
+  void GetFormMethod(nsAString& aValue);
+  void SetFormMethod(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::formmethod, aValue, aRv);
+  }
+
+  bool FormNoValidate() const { return GetBoolAttr(nsGkAtoms::formnovalidate); }
+
+  void SetFormNoValidate(bool aValue, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::formnovalidate, aValue, aRv);
+  }
+
+  void GetFormTarget(nsAString& aValue) {
+    GetHTMLAttr(nsGkAtoms::formtarget, aValue);
+  }
+  void SetFormTarget(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::formtarget, aValue, aRv);
+  }
+
+  MOZ_CAN_RUN_SCRIPT uint32_t Height();
+
+  void SetHeight(uint32_t aValue, ErrorResult& aRv) {
+    SetUnsignedIntAttr(nsGkAtoms::height, aValue, 0, aRv);
+  }
+
+  bool Indeterminate() const { return mIndeterminate; }
+
+  bool IsDraggingRange() const { return mIsDraggingRange; }
+  void SetIndeterminate(bool aValue);
+
+  Element* GetListForBindings() const;
+  HTMLDataListElement* GetListInternal() const;
+
+  void GetMax(nsAString& aValue) { GetHTMLAttr(nsGkAtoms::max, aValue); }
+  void SetMax(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::max, aValue, aRv);
+  }
+
+  int32_t MaxLength() const { return GetIntAttr(nsGkAtoms::maxlength, -1); }
+
+  int32_t UsedMaxLength() const final {
+    if (!mInputType->MinAndMaxLengthApply()) {
+      return -1;
+    }
+    return MaxLength();
+  }
+
+  void SetMaxLength(int32_t aValue, ErrorResult& aRv) {
+    int32_t minLength = MinLength();
+    if (aValue < 0 || (minLength >= 0 && aValue < minLength)) {
+      aRv.Throw(NS_ERROR_DOM_INDEX_SIZE_ERR);
+      return;
+    }
+
+    SetHTMLIntAttr(nsGkAtoms::maxlength, aValue, aRv);
+  }
+
+  int32_t MinLength() const { return GetIntAttr(nsGkAtoms::minlength, -1); }
+
+  void SetMinLength(int32_t aValue, ErrorResult& aRv) {
+    int32_t maxLength = MaxLength();
+    if (aValue < 0 || (maxLength >= 0 && aValue > maxLength)) {
+      aRv.Throw(NS_ERROR_DOM_INDEX_SIZE_ERR);
+      return;
+    }
+
+    SetHTMLIntAttr(nsGkAtoms::minlength, aValue, aRv);
+  }
+
+  void GetMin(nsAString& aValue) { GetHTMLAttr(nsGkAtoms::min, aValue); }
+  void SetMin(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::min, aValue, aRv);
+  }
+
+  bool Multiple() const { return GetBoolAttr(nsGkAtoms::multiple); }
+
+  void SetMultiple(bool aValue, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::multiple, aValue, aRv);
+  }
+
+  void GetName(nsAString& aValue) { GetHTMLAttr(nsGkAtoms::name, aValue); }
+  void SetName(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::name, aValue, aRv);
+  }
+
+  void GetPattern(nsAString& aValue) {
+    GetHTMLAttr(nsGkAtoms::pattern, aValue);
+  }
+  void SetPattern(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::pattern, aValue, aRv);
+  }
+
+  void GetPlaceholder(nsAString& aValue) {
+    GetHTMLAttr(nsGkAtoms::placeholder, aValue);
+  }
+  void SetPlaceholder(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::placeholder, aValue, aRv);
+  }
+
+  bool ReadOnly() const { return GetBoolAttr(nsGkAtoms::readonly); }
+
+  void SetReadOnly(bool aValue, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::readonly, aValue, aRv);
+  }
+
+  bool Required() const { return GetBoolAttr(nsGkAtoms::required); }
+
+  void SetRequired(bool aValue, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::required, aValue, aRv);
+  }
+
+  uint32_t Size() const {
+    return GetUnsignedIntAttr(nsGkAtoms::size, DEFAULT_COLS);
+  }
+
+  void SetSize(uint32_t aValue, ErrorResult& aRv) {
+    if (aValue == 0) {
+      aRv.Throw(NS_ERROR_DOM_INDEX_SIZE_ERR);
+      return;
+    }
+
+    SetUnsignedIntAttr(nsGkAtoms::size, aValue, DEFAULT_COLS, aRv);
+  }
+
+  void GetSrc(nsAString& aValue) {
+    GetURIAttr(nsGkAtoms::src, nullptr, aValue);
+  }
+  void SetSrc(const nsAString& aValue, nsIPrincipal* aTriggeringPrincipal,
+              ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::src, aValue, aTriggeringPrincipal, aRv);
+  }
+
+  void GetStep(nsAString& aValue) { GetHTMLAttr(nsGkAtoms::step, aValue); }
+  void SetStep(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::step, aValue, aRv);
+  }
+
+  void GetType(nsAString& aValue) const;
+  void SetType(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::type, aValue, aRv);
+  }
+
+  void GetDefaultValue(nsAString& aValue) {
+    GetHTMLAttr(nsGkAtoms::value, aValue);
+  }
+  void SetDefaultValue(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::value, aValue, aRv);
+  }
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void SetValue(const nsAString& aValue, CallerType aCallerType,
+                ErrorResult& aRv);
+  void GetValue(nsAString& aValue, CallerType aCallerType);
+
+  void GetValueInternal(nsAString& aValue, CallerType aCallerType) const;
+
+  void GetValueAsDate(JSContext* aCx, JS::MutableHandle<JSObject*> aObj,
+                      ErrorResult& aRv);
+
+  void SetValueAsDate(JSContext* aCx, JS::Handle<JSObject*> aObj,
+                      ErrorResult& aRv);
+
+  double ValueAsNumber() const {
+    return DoesValueAsNumberApply() ? GetValueAsDecimal().toDouble()
+                                    : UnspecifiedNaN<double>();
+  }
+
+  void SetValueAsNumber(double aValue, ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT uint32_t Width();
+
+  void SetWidth(uint32_t aValue, ErrorResult& aRv) {
+    SetUnsignedIntAttr(nsGkAtoms::width, aValue, 0, aRv);
+  }
+
+  void StepUp(int32_t aN, ErrorResult& aRv) { ApplyStep(aN, aRv); }
+  void StepDown(int32_t aN, ErrorResult& aRv) { ApplyStep(-aN, aRv); }
+
+  Decimal GetStep() const;
+
+  bool StepsInputValue(const WidgetKeyboardEvent&) const;
+
+  already_AddRefed<NodeList> GetLabelsForBindings();
+  already_AddRefed<NodeList> GetLabelsInternal();
+
+  MOZ_CAN_RUN_SCRIPT void Select();
+
+  Nullable<uint32_t> GetSelectionStart(ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void SetSelectionStart(const Nullable<uint32_t>& aValue,
+                                            ErrorResult& aRv);
+
+  Nullable<uint32_t> GetSelectionEnd(ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void SetSelectionEnd(const Nullable<uint32_t>& aValue,
+                                          ErrorResult& aRv);
+
+  void GetSelectionDirection(nsAString& aValue, ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void SetSelectionDirection(const nsAString& aValue,
+                                                ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void SetSelectionRange(
+      uint32_t aStart, uint32_t aEnd, const Optional<nsAString>& direction,
+      ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void SetRangeText(const nsAString& aReplacement,
+                                       ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void SetRangeText(const nsAString& aReplacement,
+                                       uint32_t aStart, uint32_t aEnd,
+                                       SelectionMode aSelectMode,
+                                       ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void ShowPicker(ErrorResult& aRv);
+
+  bool WebkitDirectoryAttr() const {
+    return HasAttr(nsGkAtoms::webkitdirectory);
+  }
+
+  void SetWebkitDirectoryAttr(bool aValue, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::webkitdirectory, aValue, aRv);
+  }
+
+  void GetWebkitEntries(nsTArray<RefPtr<FileSystemEntry>>& aSequence);
+
+  already_AddRefed<Promise> GetFilesAndDirectories(ErrorResult& aRv);
+
+  void GetAlign(nsAString& aValue) { GetHTMLAttr(nsGkAtoms::align, aValue); }
+  void SetAlign(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::align, aValue, aRv);
+  }
+
+  void GetUseMap(nsAString& aValue) { GetHTMLAttr(nsGkAtoms::usemap, aValue); }
+  void SetUseMap(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::usemap, aValue, aRv);
+  }
+
+  void GetDirName(nsAString& aValue) {
+    GetHTMLAttr(nsGkAtoms::dirname, aValue);
+  }
+  void SetDirName(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::dirname, aValue, aRv);
+  }
+
+  nsIControllers* GetControllers(ErrorResult& aRv);
+  nsIControllers* GetExtantControllers() const { return mControllers; }
+  nsresult GetControllers(nsIControllers** aResult);
+
+  int32_t InputTextLength(CallerType aCallerType);
+
+  void MozGetFileNameArray(nsTArray<nsString>& aFileNames, ErrorResult& aRv);
+
+  void MozSetFileNameArray(const Sequence<nsString>& aFileNames,
+                           ErrorResult& aRv);
+  void MozSetFileArray(const Sequence<OwningNonNull<File>>& aFiles);
+  void MozSetDirectory(const nsAString& aDirectoryPath, ErrorResult& aRv);
+
+  void GetDateTimeInputBoxValue(DateTimeValue& aValue);
+
+  Element* GetDateTimeBoxElement();
+
+  void OpenDateTimePicker(const DateTimeValue& aInitialValue);
+  void CloseDateTimePicker();
+
+  void SetOpenState(bool aIsOpen);
+
+  void OpenColorPicker();
+
+  void SetFocusState(bool aIsFocused);
+
+  void UpdateValidityState();
+
+  double GetStepAsDouble() { return GetStep().toDouble(); }
+  double GetStepBaseAsDouble() { return GetStepBase().toDouble(); }
+  double GetMinimumAsDouble() { return GetMinimum().toDouble(); }
+  double GetMaximumAsDouble() { return GetMaximum().toDouble(); }
+
+  void GetColor(InputPickerColor& aValue);
+
+  void UpdateColor();
+
+  void SetUserInputColor(const InputPickerColor& aValue);
+
+  void StartNumberControlSpinnerSpin();
+  enum SpinnerStopState { eAllowDispatchingEvents, eDisallowDispatchingEvents };
+  void StopNumberControlSpinnerSpin(
+      SpinnerStopState aState = eAllowDispatchingEvents);
+  MOZ_CAN_RUN_SCRIPT
+  void StepNumberControlForUserEvent(int32_t aDirection);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  static void HandleNumberControlSpin(void* aData);
+
+  bool MozIsTextField(bool aExcludePassword);
+
+  MOZ_CAN_RUN_SCRIPT nsIEditor* GetEditorForBindings();
+  bool HasEditor() const;
+
+  bool IsInputEventTarget() const { return IsSingleLineTextControl(false); }
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void SetUserInput(const nsAString& aInput, nsIPrincipal& aSubjectPrincipal);
+
+  static Decimal StringToDecimal(const nsAString& aValue);
+
+  void UpdateEntries(
+      const nsTArray<OwningFileOrDirectory>& aFilesOrDirectories);
+
+  bool DoesRequiredApply() const;
+
+  bool IsRequired() const { return State().HasState(ElementState::REQUIRED); }
+
+  bool HasBeenTypePassword() const { return mHasBeenTypePassword; }
+
+  bool IsValueEmpty() const {
+    return State().HasState(ElementState::VALUE_EMPTY);
+  }
+
+  static mozilla::Maybe<nscolor> ParseSimpleColor(const nsAString& aColor);
+
+  bool IsAutoDirectionalityAssociated() const {
+    return IsAutoDirectionalityAssociated(mType);
+  }
+
+  using nsGenericHTMLFormControlElementWithState::IsSingleLineTextControl;
+  using TextControlElement::IsSingleLineTextControl;
+
+  ShadowRoot* CreateShadowTreeFromLayoutIfNeeded();
+
+ protected:
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY virtual ~HTMLInputElement();
+
+  JSObject* WrapNode(JSContext* aCx,
+                     JS::Handle<JSObject*> aGivenProto) override;
+
+  enum ValueModeType {
+    VALUE_MODE_VALUE,
+    VALUE_MODE_DEFAULT,
+    VALUE_MODE_DEFAULT_ON,
+    VALUE_MODE_FILENAME
+  };
+
+  static bool DigitSubStringToNumber(const nsAString& aValue, uint32_t aStart,
+                                     uint32_t aLen, uint32_t* aResult);
+
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  SetValueInternal(const nsAString& aValue, const nsAString* aOldValue,
+                   const ValueSetterOptions& aOptions);
+  MOZ_CAN_RUN_SCRIPT nsresult SetValueInternal(
+      const nsAString& aValue, const ValueSetterOptions& aOptions) {
+    return SetValueInternal(aValue, nullptr, aOptions);
+  }
+
+  void GetNonFileValueInternal(nsAString& aValue) const;
+
+  void ClearFiles(bool aSetValueChanged);
+
+  void SetIndeterminateInternal(bool aValue, bool aShouldInvalidate);
+
+  void BeforeSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                     const nsAttrValue* aValue, bool aNotify) override;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void AfterSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                    const nsAttrValue* aValue, const nsAttrValue* aOldValue,
+                    nsIPrincipal* aSubjectPrincipal, bool aNotify) override;
+
+  void BeforeSetForm(HTMLFormElement* aForm, bool aBindToTree) override;
+
+  void AfterClearForm(bool aUnbindOrDelete) override;
+
+  void ResultForDialogSubmit(nsAString& aResult) override;
+
+  bool IsImage() const {
+    return AttrValueIs(kNameSpaceID_None, nsGkAtoms::type, nsGkAtoms::image,
+                       eIgnoreCase);
+  }
+
+  template <typename VisitCallback>
+  void VisitGroup(VisitCallback&& aCallback, bool aSkipThis = true);
+
+  void DoSetChecked(bool aValue, bool aNotify, bool aSetValueChanged,
+                    bool aUpdateOtherElement = true);
+
+  void SetCheckedInternal(bool aChecked, bool aNotify,
+                          bool aUpdateRadioGroup = true);
+
+  void RadioSetChecked(bool aNotify, bool aUpdateOtherElement);
+  void SetCheckedChanged(bool aCheckedChanged);
+
+  MOZ_CAN_RUN_SCRIPT void MaybeSubmitForm(nsPresContext* aPresContext);
+
+  void AfterSetFilesOrDirectories(bool aSetValueChanged);
+
+  void ExploreDirectoryRecursively(bool aSetValuechanged);
+
+  bool NeedToInitializeEditorForEvent(EventChainPreVisitor& aVisitor) const;
+
+  ValueModeType GetValueMode() const;
+
+  bool IsMutable() const;
+
+  bool DoesMinMaxApply() const;
+
+  bool DoesStepApply() const { return DoesMinMaxApply(); }
+
+  bool DoStepDownStepUpApply() const { return DoesStepApply(); }
+
+  bool DoesValueAsNumberApply() const { return DoesMinMaxApply(); }
+
+  bool DoesAutocompleteApply() const;
+
+  enum class TextControlStateDisposition : bool {
+    Destroy,
+    Reuse,
+  };
+
+  MOZ_CAN_RUN_SCRIPT void FreeData(TextControlStateDisposition);
+  TextControlState* GetEditorState() const;
+  void EnsureEditorState();
+
+  MOZ_CAN_RUN_SCRIPT TextEditor* GetTextEditorFromState();
+
+  MOZ_CAN_RUN_SCRIPT
+  void HandleTypeChange(FormControlType aNewType, bool aNotify);
+
+  void MaybeSnapToTickMark(Decimal& aValue);
+
+  enum class SanitizationKind { ForValueGetter, ForValueSetter, ForDisplay };
+  void SanitizeValue(nsAString& aValue, SanitizationKind) const;
+
+  bool PlaceholderApplies() const;
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult SetDefaultValueAsValue();
+
+  RadioGroupContainer* GetCurrentRadioGroupContainer() const;
+  RadioGroupContainer* FindTreeRadioGroupContainer() const;
+
+  bool IsValidWeek(const nsAString& aValue) const;
+
+  bool IsValidMonth(const nsAString& aValue) const;
+
+  bool IsValidDate(const nsAString& aValue) const;
+
+  bool IsValidDateTimeLocal(const nsAString& aValue) const;
+
+  bool ParseYear(const nsAString& aValue, uint32_t* aYear) const;
+
+  bool ParseMonth(const nsAString& aValue, uint32_t* aYear,
+                  uint32_t* aMonth) const;
+
+  bool ParseWeek(const nsAString& aValue, uint32_t* aYear,
+                 uint32_t* aWeek) const;
+  bool ParseDate(const nsAString& aValue, uint32_t* aYear, uint32_t* aMonth,
+                 uint32_t* aDay) const;
+
+  bool ParseDateTimeLocal(const nsAString& aValue, uint32_t* aYear,
+                          uint32_t* aMonth, uint32_t* aDay,
+                          uint32_t* aTime) const;
+
+  void NormalizeDateTimeLocal(nsAString& aValue) const;
+
+  double DaysSinceEpochFromWeek(uint32_t aYear, uint32_t aWeek) const;
+
+  uint32_t NumberOfDaysInMonth(uint32_t aMonth, uint32_t aYear) const;
+
+  int32_t MonthsSinceJan1970(uint32_t aYear, uint32_t aMonth) const;
+
+  uint32_t DayOfWeek(uint32_t aYear, uint32_t aMonth, uint32_t aDay,
+                     bool isoWeek) const;
+
+  uint32_t MaximumWeekInYear(uint32_t aYear) const;
+
+  bool IsLeapYear(uint32_t aYear) const;
+
+  bool IsValidTime(const nsAString& aValue) const;
+
+  static bool ParseTime(const nsAString& aValue, uint32_t* aResult);
+
+  void SetValue(Decimal aValue, CallerType aCallerType);
+
+  void UpdateHasRange(bool aNotify);
+  void UpdateInRange(bool aNotify);
+
+  Decimal GetStepScaleFactor() const;
+
+  Decimal GetStepBase() const;
+
+  Decimal GetDefaultStep() const;
+
+  enum class StepCallerType { ForUserEvent, ForScript };
+
+  Decimal GetValueIfStepped(int32_t aStepCount, StepCallerType, ErrorResult&);
+
+  void ApplyStep(int32_t aStep, ErrorResult&);
+
+  static bool IsDateTimeInputType(FormControlType);
+
+  bool SanitizesOnValueGetter() const;
+
+  bool ShouldPreventDOMActivateDispatch(EventTarget* aOriginalTarget);
+
+  nsresult MaybeInitPickers(EventChainPostVisitor& aVisitor);
+
+  nsTArray<nsString> GetColorsFromList();
+
+  enum FilePickerType { FILE_PICKER_FILE, FILE_PICKER_DIRECTORY };
+  nsresult InitFilePicker(FilePickerType aType);
+  nsresult InitColorPicker();
+
+  GetFilesHelper* GetOrCreateGetFilesHelper(bool aRecursiveFlag,
+                                            ErrorResult& aRv);
+
+  void ClearGetFilesHelpers();
+
+  void UpdateApzAwareFlag();
+
+  void GetSelectionRange(uint32_t* aSelectionStart, uint32_t* aSelectionEnd,
+                         ErrorResult& aRv);
+
+  nsIContent* AsContent() override { return this; }
+
+  void LoadSelectedImage(bool aAlwaysLoad, bool aStopLazyLoading) override {
+    MOZ_ASSERT_UNREACHABLE("LoadSelectedImage not implemented");
+  }
+
+  nsCOMPtr<nsIControllers> mControllers;
+
+  union InputData {
+    char16_t* mValue;
+    TextControlState* mState;
+  } mInputData;
+
+  struct FileData;
+  UniquePtr<FileData> mFileData;
+
+  nsString mFocusedValue;
+
+  Decimal mRangeThumbDragStartValue;
+
+  UniquePtr<DateTimeValue> mDateTimeInputBoxValue;
+
+  nsCOMPtr<nsIPrincipal> mSrcTriggeringPrincipal;
+
+  UniquePtr<InputType, InputType::DoNotDelete> mInputType;
+
+  static constexpr size_t INPUT_TYPE_SIZE =
+      sizeof(Variant<TextInputType, SearchInputType, TelInputType, URLInputType,
+                     EmailInputType, PasswordInputType, NumberInputType,
+                     RangeInputType, RadioInputType, CheckboxInputType,
+                     ButtonInputType, ImageInputType, ResetInputType,
+                     SubmitInputType, DateInputType, TimeInputType,
+                     WeekInputType, MonthInputType, DateTimeLocalInputType,
+                     FileInputType, ColorInputType, HiddenInputType>);
+
+  char mInputTypeMem[INPUT_TYPE_SIZE];
+
+  static const Decimal kStepScaleFactorDate;
+  static const Decimal kStepScaleFactorNumberRange;
+  static const Decimal kStepScaleFactorTime;
+  static const Decimal kStepScaleFactorMonth;
+  static const Decimal kStepScaleFactorWeek;
+
+  static const Decimal kDefaultStepBase;
+  static const Decimal kDefaultStepBaseWeek;
+
+  static const Decimal kDefaultStep;
+  static const Decimal kDefaultStepTime;
+
+  static const Decimal kStepAny;
+
+  static const double kMinimumYear;
+  static const double kMaximumYear;
+  static const double kMaximumWeekInMaximumYear;
+  static const double kMaximumDayInMaximumYear;
+  static const double kMaximumMonthInMaximumYear;
+  static const double kMaximumWeekInYear;
+  static const double kMsPerDay;
+
+  nsContentUtils::AutocompleteAttrState mAutocompleteAttrState;
+  nsContentUtils::AutocompleteAttrState mAutocompleteInfoState;
+  bool mDisabledChanged : 1;
+  bool mValueChanged : 1;
+  bool mUserInteracted : 1;
+  bool mLastValueChangeWasInteractive : 1;
+  bool mCheckedChanged : 1;
+  bool mChecked : 1;
+  bool mShouldInitChecked : 1;
+  bool mDoneCreating : 1;
+  bool mInInternalActivate : 1;
+  bool mCheckedIsToggled : 1;
+  bool mIndeterminate : 1;
+  bool mInhibitRestoration : 1;
+  bool mHasRange : 1;
+  bool mIsDraggingRange : 1;
+  bool mNumberControlSpinnerIsSpinning : 1;
+  bool mNumberControlSpinnerSpinsUp : 1;
+  bool mPickerRunning : 1;
+  bool mIsPreviewEnabled : 1;
+  bool mHasBeenTypePassword : 1;
+  bool mHasPatternAttribute : 1;
+  bool mUserChangedSinceFocus : 1;
+  bool mIsUserInteracting : 1;
+
+ private:
+  Maybe<int32_t> GetNumberInputCols() const;
+  static void ImageInputMapAttributesIntoRule(MappedDeclarationsBuilder&);
+
+  bool MayFireChangeOnBlur() const { return MayFireChangeOnBlur(mType); }
+
+  static bool SupportsTextSelection(FormControlType aType) {
+    switch (aType) {
+      case FormControlType::InputText:
+      case FormControlType::InputSearch:
+      case FormControlType::InputUrl:
+      case FormControlType::InputTel:
+      case FormControlType::InputPassword:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  bool SupportsTextSelection() const { return SupportsTextSelection(mType); }
+
+  static bool IsAutoDirectionalityAssociated(FormControlType aType) {
+    switch (aType) {
+      case FormControlType::InputHidden:
+      case FormControlType::InputText:
+      case FormControlType::InputSearch:
+      case FormControlType::InputTel:
+      case FormControlType::InputUrl:
+      case FormControlType::InputEmail:
+      case FormControlType::InputPassword:
+      case FormControlType::InputSubmit:
+      case FormControlType::InputReset:
+      case FormControlType::InputButton:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  static bool CreatesDateTimeWidget(FormControlType aType) {
+    return aType == FormControlType::InputDate ||
+           aType == FormControlType::InputTime ||
+           aType == FormControlType::InputDatetimeLocal;
+  }
+  bool CreatesDateTimeWidget() const { return CreatesDateTimeWidget(mType); }
+
+  static bool CreatesUAShadowTree(FormControlType aType) {
+    return IsSingleLineTextControl(false, aType) ||
+           CreatesDateTimeWidget(aType);
+  }
+  bool CreatesUAShadowTree() const { return CreatesUAShadowTree(mType); }
+
+  static NotifyUAWidget NotifiesUAWidget(FormControlType aType) {
+    return NotifyUAWidget(CreatesDateTimeWidget(aType));
+  }
+  NotifyUAWidget NotifiesUAWidget() const { return NotifiesUAWidget(mType); }
+
+  static bool MayFireChangeOnBlur(FormControlType aType) {
+    return IsSingleLineTextControl(false, aType) ||
+           CreatesDateTimeWidget(aType) ||
+           aType == FormControlType::InputRange ||
+           aType == FormControlType::InputNumber;
+  }
+  void SetupShadowTree(bool aNotify);
+
+  bool CheckActivationBehaviorPreconditions(EventChainVisitor& aVisitor) const;
+
+  static bool IsDateTimeTypeSupported(FormControlType);
+
+  RadioGroupContainer* mRadioGroupContainer;
+
+  struct nsFilePickerFilter {
+    nsFilePickerFilter() : mFilterMask(0) {}
+
+    explicit nsFilePickerFilter(int32_t aFilterMask)
+        : mFilterMask(aFilterMask) {}
+
+    nsFilePickerFilter(const nsString& aTitle, const nsString& aFilter)
+        : mFilterMask(0), mTitle(aTitle), mFilter(aFilter) {}
+
+    nsFilePickerFilter(const nsFilePickerFilter& other) {
+      mFilterMask = other.mFilterMask;
+      mTitle = other.mTitle;
+      mFilter = other.mFilter;
+    }
+
+    bool operator==(const nsFilePickerFilter& other) const {
+      if ((mFilter == other.mFilter) && (mFilterMask == other.mFilterMask)) {
+        return true;
+      } else {
+        return false;
+      }
+    }
+
+    int32_t mFilterMask;
+    nsString mTitle;
+    nsString mFilter;
+  };
+
+  class nsFilePickerShownCallback : public nsIFilePickerShownCallback {
+    virtual ~nsFilePickerShownCallback() = default;
+
+   public:
+    nsFilePickerShownCallback(HTMLInputElement* aInput,
+                              nsIFilePicker* aFilePicker);
+    NS_DECL_ISUPPORTS
+
+    NS_IMETHOD Done(nsIFilePicker::ResultCode aResult) override;
+
+   private:
+    nsCOMPtr<nsIFilePicker> mFilePicker;
+    const RefPtr<HTMLInputElement> mInput;
+  };
+};
+
+}  
+}  
+
+#endif

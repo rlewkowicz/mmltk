@@ -1,0 +1,111 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsURILoader_h_
+#define nsURILoader_h_
+
+#include "nsCURILoader.h"
+#include "nsISupportsUtils.h"
+#include "nsCOMArray.h"
+#include "nsCOMPtr.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsString.h"
+#include "nsIWeakReference.h"
+#include "nsIStreamListener.h"
+#include "nsIThreadRetargetableStreamListener.h"
+#include "nsIExternalHelperAppService.h"
+
+#include "mozilla/Logging.h"
+
+class nsDocumentOpenInfo;
+
+class nsURILoader final : public nsIURILoader {
+ public:
+  NS_DECL_NSIURILOADER
+  NS_DECL_ISUPPORTS
+
+  nsURILoader();
+
+ protected:
+  ~nsURILoader();
+
+  [[nodiscard]] nsresult OpenChannel(nsIChannel* channel, uint32_t aFlags,
+                                     nsIInterfaceRequestor* aWindowContext,
+                                     bool aChannelOpen,
+                                     nsIStreamListener** aListener);
+
+  nsCOMArray<nsIWeakReference> m_listeners;
+
+  static mozilla::LazyLogModule mLog;
+
+  friend class nsDocumentOpenInfo;
+};
+
+class nsDocumentOpenInfo : public nsIThreadRetargetableStreamListener {
+ public:
+  nsDocumentOpenInfo(nsIInterfaceRequestor* aWindowContext, uint32_t aFlags,
+                     nsURILoader* aURILoader);
+  nsDocumentOpenInfo(uint32_t aFlags, bool aAllowListenerConversions);
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+  nsresult Prepare();
+
+  nsresult CheckContentLengthDiscrepancy(nsIRequest* request);
+
+  nsresult DispatchContent(nsIRequest* request);
+
+  nsresult ConvertData(nsIRequest* request, nsIURIContentListener* aListener,
+                       const nsACString& aSrcContentType,
+                       const nsACString& aOutContentType);
+
+  bool TryContentListener(nsIURIContentListener* aListener,
+                          nsIChannel* aChannel);
+
+
+  virtual nsresult TryStreamConversion(nsIChannel* aChannel);
+
+  virtual bool TryDefaultContentListener(nsIChannel* aChannel);
+
+  virtual nsresult TryExternalHelperApp(
+      nsIExternalHelperAppService* aHelperAppService, nsIChannel* aChannel);
+
+  virtual already_AddRefed<nsDocumentOpenInfo> Clone() {
+    return mozilla::MakeAndAddRef<nsDocumentOpenInfo>(m_originalContext, mFlags,
+                                                      mURILoader);
+  }
+
+  NS_DECL_NSIREQUESTOBSERVER
+
+  NS_DECL_NSISTREAMLISTENER
+
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+
+ protected:
+  virtual ~nsDocumentOpenInfo();
+
+ protected:
+  nsCOMPtr<nsIURIContentListener> m_contentListener;
+
+  nsCOMPtr<nsIStreamListener> m_targetStreamListener;
+
+  nsCOMPtr<nsIInterfaceRequestor> m_originalContext;
+
+  uint32_t mFlags;
+
+  nsCString mContentType;
+
+  RefPtr<nsURILoader> mURILoader;
+
+  uint32_t mDataConversionDepthLimit;
+
+  bool mUsedContentHandler = false;
+
+  bool mAllowListenerConversions = true;
+
+  bool mReceivedData = false;
+};
+
+#endif /* nsURILoader_h_ */

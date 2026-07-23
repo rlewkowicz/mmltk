@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ShutdownTracker.h"
+
+#include "mozilla/Services.h"
+#include "nsIObserver.h"
+#include "nsIObserverService.h"
+
+namespace mozilla {
+namespace image {
+
+class ShutdownTrackerImpl;
+
+
+static bool sShutdownHasStarted = false;
+
+
+struct ShutdownObserver : public nsIObserver {
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD Observe(nsISupports*, const char* aTopic,
+                     const char16_t*) override {
+    if (strcmp(aTopic, "xpcom-will-shutdown") != 0) {
+      return NS_OK;
+    }
+
+    nsCOMPtr<nsIObserverService> os = services::GetObserverService();
+    if (os) {
+      os->RemoveObserver(this, "xpcom-will-shutdown");
+    }
+
+    sShutdownHasStarted = true;
+    return NS_OK;
+  }
+
+ private:
+  virtual ~ShutdownObserver() = default;
+};
+
+NS_IMPL_ISUPPORTS(ShutdownObserver, nsIObserver)
+
+
+void ShutdownTracker::Initialize() {
+  nsCOMPtr<nsIObserverService> os = services::GetObserverService();
+  if (os) {
+    os->AddObserver(new ShutdownObserver, "xpcom-will-shutdown", false);
+  }
+}
+
+bool ShutdownTracker::ShutdownHasStarted() { return sShutdownHasStarted; }
+
+}  
+}  

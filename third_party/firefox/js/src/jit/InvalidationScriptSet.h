@@ -1,0 +1,43 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_InvalidationScriptSet_h
+#define jit_InvalidationScriptSet_h
+
+#include "mozilla/MemoryReporting.h"
+
+#include "gc/Barrier.h"
+#include "jit/Invalidation.h"
+#include "jit/IonTypes.h"
+#include "js/AllocPolicy.h"
+#include "js/GCVector.h"
+#include "js/SweepingAPI.h"
+
+namespace js::jit {
+
+class DependentIonScriptSet {
+  IonScriptKeyVector ionScripts_;
+
+  size_t lengthAfterLastCompaction_ = 0;
+
+ public:
+  [[nodiscard]] bool addToSet(const IonScriptKey& ionScript);
+  void invalidateAndClear(JSContext* cx, const char* reason);
+
+  bool empty() const { return ionScripts_.empty(); }
+
+  bool traceWeak(JSTracer* trc) {
+    bool res = ionScripts_.traceWeak(trc);
+    lengthAfterLastCompaction_ = ionScripts_.length();
+    return res;
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return ionScripts_.sizeOfExcludingThis(mallocSizeOf);
+  }
+};
+
+}  
+
+#endif /* jit_InvalidationScriptSet_h */

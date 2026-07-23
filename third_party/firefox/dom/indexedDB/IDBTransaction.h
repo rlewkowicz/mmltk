@@ -1,0 +1,374 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_idbtransaction_h_
+#define mozilla_dom_idbtransaction_h_
+
+#include "FlippedOnce.h"
+#include "SafeRefPtr.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/SourceLocation.h"
+#include "mozilla/dom/IDBTransactionBinding.h"
+#include "mozilla/dom/quota/CheckedUnsafePtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIRunnable.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+class ErrorResult;
+class EventChainPreVisitor;
+
+namespace dom {
+
+class DOMException;
+class DOMStringList;
+class IDBCursor;
+class IDBDatabase;
+class IDBObjectStore;
+class IDBOpenDBRequest;
+class IDBRequest;
+class StrongWorkerRef;
+
+namespace indexedDB {
+class PBackgroundIDBCursorChild;
+class BackgroundRequestChild;
+class BackgroundTransactionChild;
+class BackgroundVersionChangeTransactionChild;
+class IndexMetadata;
+class ObjectStoreSpec;
+class OpenCursorParams;
+class RequestParams;
+}  
+
+class IDBTransaction final
+    : public DOMEventTargetHelper,
+      public nsIRunnable,
+      public SupportsCheckedUnsafePtr<CheckIf<DiagnosticAssertEnabled>> {
+  friend class indexedDB::BackgroundRequestChild;
+
+ public:
+  enum struct Mode {
+    ReadOnly = 0,
+    ReadWrite,
+    ReadWriteFlush,
+    Cleanup,
+    VersionChange,
+
+    Invalid
+  };
+
+  enum struct Durability {
+    Default = 0,
+    Strict,
+    Relaxed,
+
+    Invalid
+  };
+
+  enum struct ReadyState { Active, Inactive, Committing, Finished };
+
+ private:
+  RefPtr<IDBDatabase> mDatabase;
+  RefPtr<DOMException> mError;
+  const nsTArray<nsString> mObjectStoreNames;
+  nsTArray<RefPtr<IDBObjectStore>> mObjectStores;
+  nsTArray<RefPtr<IDBObjectStore>> mDeletedObjectStores;
+  RefPtr<StrongWorkerRef> mWorkerRef;
+  nsTArray<NotNull<IDBCursor*>> mCursors;
+  nsTArray<nsCOMPtr<nsIRunnable>> mDeferredRunnables;
+
+  union {
+    indexedDB::BackgroundTransactionChild* mNormalBackgroundActor;
+    indexedDB::BackgroundVersionChangeTransactionChild*
+        mVersionChangeBackgroundActor;
+  } mBackgroundActor;
+
+  const int64_t mLoggingSerialNumber;
+
+  int64_t mNextObjectStoreId;
+  int64_t mNextIndexId;
+
+  int64_t mNextRequestId;
+
+  nsresult mAbortCode;  
+  uint32_t mPendingRequestCount;  
+
+  const JSCallingLocation mCallerLocation;
+
+  ReadyState mReadyState = ReadyState::Active;
+  FlippedOnce<false> mStarted;
+  const Mode mMode;
+  const Durability mDurability;
+
+  bool mRegistered;  
+  FlippedOnce<false> mAbortedByScript;
+  bool mNotedActiveTransaction;
+  FlippedOnce<false> mSentCommitOrAbort;
+  bool mDeferralActive = false;
+
+#ifdef DEBUG
+  FlippedOnce<false> mFiredCompleteOrAbort;
+  FlippedOnce<false> mWasExplicitlyCommitted;
+#endif
+
+ public:
+  [[nodiscard]] static SafeRefPtr<IDBTransaction> CreateVersionChange(
+      IDBDatabase* aDatabase,
+      indexedDB::BackgroundVersionChangeTransactionChild* aActor,
+      NotNull<IDBOpenDBRequest*> aOpenRequest, int64_t aNextObjectStoreId,
+      int64_t aNextIndexId);
+
+  [[nodiscard]] static SafeRefPtr<IDBTransaction> Create(
+      JSContext* aCx, IDBDatabase* aDatabase,
+      const nsTArray<nsString>& aObjectStoreNames, Mode aMode,
+      Durability aDurability);
+
+  static Maybe<IDBTransaction&> MaybeCurrent();
+
+  void AssertIsOnOwningThread() const
+#ifdef DEBUG
+      ;
+#else
+  {
+  }
+#endif
+
+  void SetBackgroundActor(
+      indexedDB::BackgroundTransactionChild* aBackgroundActor);
+
+  void ClearBackgroundActor() {
+    AssertIsOnOwningThread();
+
+    if (mMode == Mode::VersionChange) {
+      mBackgroundActor.mVersionChangeBackgroundActor = nullptr;
+    } else {
+      mBackgroundActor.mNormalBackgroundActor = nullptr;
+    }
+
+    MaybeNoteInactiveTransaction();
+  }
+
+  indexedDB::BackgroundRequestChild* StartRequest(
+      MovingNotNull<RefPtr<mozilla::dom::IDBRequest>> aRequest,
+      const indexedDB::RequestParams& aParams);
+
+  void OpenCursor(indexedDB::PBackgroundIDBCursorChild& aBackgroundActor,
+                  const indexedDB::OpenCursorParams& aParams);
+
+  void RefreshSpec(bool aMayDelete);
+
+  bool IsCommittingOrFinished() const {
+    AssertIsOnOwningThread();
+
+    return mReadyState == ReadyState::Committing ||
+           mReadyState == ReadyState::Finished;
+  }
+
+  bool IsActive() const {
+    AssertIsOnOwningThread();
+
+    return mReadyState == ReadyState::Active;
+  }
+
+  bool IsInactive() const {
+    AssertIsOnOwningThread();
+
+    return mReadyState == ReadyState::Inactive;
+  }
+
+  bool IsFinished() const {
+    AssertIsOnOwningThread();
+
+    return mReadyState == ReadyState::Finished;
+  }
+
+  bool IsWriteAllowed() const {
+    AssertIsOnOwningThread();
+    return mMode == Mode::ReadWrite || mMode == Mode::ReadWriteFlush ||
+           mMode == Mode::Cleanup || mMode == Mode::VersionChange;
+  }
+
+  bool IsAborted() const {
+    AssertIsOnOwningThread();
+    return NS_FAILED(mAbortCode);
+  }
+
+#ifdef DEBUG
+  bool WasExplicitlyCommitted() const { return mWasExplicitlyCommitted; }
+#endif
+
+  void TransitionToActive();
+
+  void TransitionToInactiveWithDeferral();
+
+  bool IsDeferralActive() const {
+    AssertIsOnOwningThread();
+    return mDeferralActive;
+  }
+
+  void DeactivateDeferral() {
+    AssertIsOnOwningThread();
+    mDeferralActive = false;
+  }
+
+  void QueueDeferredResponse(already_AddRefed<nsIRunnable> aRunnable);
+
+  void DrainDeferredResponses();
+
+  void TransitionToInactive() {
+    MOZ_ASSERT(mReadyState == ReadyState::Active);
+    mReadyState = ReadyState::Inactive;
+  }
+
+  nsresult AbortCode() const {
+    AssertIsOnOwningThread();
+    return mAbortCode;
+  }
+
+  const JSCallingLocation& GetCallerLocation() const {
+    AssertIsOnOwningThread();
+    return mCallerLocation;
+  }
+
+  Mode GetMode() const {
+    AssertIsOnOwningThread();
+    return mMode;
+  }
+
+  Durability GetDurability() const {
+    AssertIsOnOwningThread();
+    return mDurability;
+  }
+
+  uint32_t GetPendingRequestCount() const { return mPendingRequestCount; }
+
+  IDBDatabase* Database() const {
+    AssertIsOnOwningThread();
+    return mDatabase;
+  }
+
+  const nsTArray<nsString>& ObjectStoreNamesInternal() const {
+    AssertIsOnOwningThread();
+    return mObjectStoreNames;
+  }
+
+  [[nodiscard]] RefPtr<IDBObjectStore> CreateObjectStore(
+      indexedDB::ObjectStoreSpec& aSpec);
+
+  void DeleteObjectStore(int64_t aObjectStoreId);
+
+  void RenameObjectStore(int64_t aObjectStoreId, const nsAString& aName) const;
+
+  void CreateIndex(IDBObjectStore* aObjectStore,
+                   const indexedDB::IndexMetadata& aMetadata) const;
+
+  void DeleteIndex(IDBObjectStore* aObjectStore, int64_t aIndexId) const;
+
+  void RenameIndex(IDBObjectStore* aObjectStore, int64_t aIndexId,
+                   const nsAString& aName) const;
+
+  void Abort(IDBRequest* aRequest);
+
+  void Abort(nsresult aErrorCode);
+
+  int64_t LoggingSerialNumber() const {
+    AssertIsOnOwningThread();
+
+    return mLoggingSerialNumber;
+  }
+
+  nsIGlobalObject* GetParentObject() const;
+
+  void FireCompleteOrAbortEvents(nsresult aResult);
+
+  int64_t NextObjectStoreId();
+
+  int64_t NextIndexId();
+
+  int64_t NextRequestId();
+
+  void InvalidateCursorCaches();
+  void RegisterCursor(IDBCursor& aCursor);
+  void UnregisterCursor(IDBCursor& aCursor);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIRUNNABLE
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(IDBTransaction, DOMEventTargetHelper)
+
+  void CommitIfNotStarted();
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  IDBDatabase* Db() const { return Database(); }
+
+  IDBTransactionMode GetMode(ErrorResult& aRv) const;
+
+  IDBTransactionDurability GetDurability(ErrorResult& aRv) const;
+
+  DOMException* GetError() const;
+
+  [[nodiscard]] RefPtr<IDBObjectStore> ObjectStore(const nsAString& aName,
+                                                   ErrorResult& aRv);
+
+  void Commit(ErrorResult& aRv);
+
+  void Abort(ErrorResult& aRv);
+
+  IMPL_EVENT_HANDLER(abort)
+  IMPL_EVENT_HANDLER(complete)
+  IMPL_EVENT_HANDLER(error)
+
+  [[nodiscard]] RefPtr<DOMStringList> ObjectStoreNames() const;
+
+  void GetEventTargetParent(EventChainPreVisitor& aVisitor) override;
+
+ private:
+  struct CreatedFromFactoryFunction {};
+
+ public:
+  IDBTransaction(IDBDatabase* aDatabase,
+                 const nsTArray<nsString>& aObjectStoreNames, Mode aMode,
+                 Durability aDurability, JSCallingLocation&& aCallerLocation,
+                 CreatedFromFactoryFunction aDummy);
+
+ private:
+  ~IDBTransaction();
+
+  void AbortInternal(nsresult aAbortCode, RefPtr<DOMException> aError);
+
+  void SendCommit(bool aAutoCommit);
+
+  void SendAbort(nsresult aResultCode);
+
+  void NoteActiveTransaction();
+
+  void MaybeNoteInactiveTransaction();
+
+ public:
+  void OnNewRequest();
+
+  void OnRequestFinished(bool aRequestCompletedSuccessfully);
+
+ private:
+  template <typename Func>
+  auto DoWithTransactionChild(const Func& aFunc) const;
+
+  bool HasTransactionChild() const;
+};
+
+inline bool ReferenceEquals(const Maybe<IDBTransaction&>& aLHS,
+                            const Maybe<IDBTransaction&>& aRHS) {
+  if (aLHS.isNothing() != aRHS.isNothing()) {
+    return false;
+  }
+  return aLHS.isNothing() || &aLHS.ref() == &aRHS.ref();
+}
+
+}  
+}  
+
+#endif  // mozilla_dom_idbtransaction_h_

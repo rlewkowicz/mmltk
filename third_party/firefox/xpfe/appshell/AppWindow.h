@@ -1,0 +1,327 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_AppWindow_h_
+#define mozilla_AppWindow_h_
+
+#include "nsChromeTreeOwner.h"
+#include "nsContentTreeOwner.h"
+
+#include "nsCOMPtr.h"
+#include "nsTArray.h"
+#include "nsString.h"
+#include "nsWeakReference.h"
+#include "nsCOMArray.h"
+#include "nsDocShell.h"
+#include "nsRect.h"
+#include "Units.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Mutex.h"
+
+#include "nsIBaseWindow.h"
+#include "nsIDocShellTreeItem.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsIAppWindow.h"
+#include "nsIPrompt.h"
+#include "nsIAuthPrompt.h"
+#include "nsIXULBrowserWindow.h"
+#include "nsIWidgetListener.h"
+#include "nsIRemoteTab.h"
+#include "nsIWebProgressListener.h"
+#include "nsITimer.h"
+#include "nsIXULStore.h"
+
+class nsAtom;
+class nsXULTooltipListener;
+class nsIOpenWindowInfo;
+
+namespace mozilla {
+class PresShell;
+class AppWindowTimerCallback;
+class L10nReadyPromiseHandler;
+namespace dom {
+class Element;
+}  
+namespace widget {
+struct InitData;
+}  
+}  
+
+
+#define NS_APPWINDOW_IMPL_CID                 \
+  { \
+   0x8eaec2f3,                                \
+   0xed02,                                    \
+   0x4be2,                                    \
+   {0x8e, 0x0f, 0x34, 0x27, 0x98, 0x47, 0x72, 0x98}}
+
+class nsContentShellInfo;
+
+namespace mozilla {
+
+class AppWindow final : public nsIBaseWindow,
+                        public nsIInterfaceRequestor,
+                        public nsIAppWindow,
+                        public nsSupportsWeakReference,
+                        public nsIWebProgressListener {
+  friend class ::nsChromeTreeOwner;
+  friend class ::nsContentTreeOwner;
+
+ public:
+  class WidgetListenerDelegate final : public nsIWidgetListener {
+   public:
+    explicit WidgetListenerDelegate(AppWindow* aAppWindow)
+        : mAppWindow(aAppWindow) {}
+
+    MOZ_CAN_RUN_SCRIPT_BOUNDARY
+    nsIAppWindow* GetAppWindow() override;
+    MOZ_CAN_RUN_SCRIPT_BOUNDARY
+    mozilla::PresShell* GetPresShell() override;
+    MOZ_CAN_RUN_SCRIPT_BOUNDARY
+    void WindowMoved(nsIWidget*, const LayoutDeviceIntPoint&,
+                     ByMoveToRect) override;
+    MOZ_CAN_RUN_SCRIPT_BOUNDARY
+    void WindowResized(nsIWidget*, const LayoutDeviceIntSize&) override;
+    MOZ_CAN_RUN_SCRIPT_BOUNDARY
+    bool RequestWindowClose(nsIWidget* aWidget) override;
+    MOZ_CAN_RUN_SCRIPT_BOUNDARY
+    void SizeModeChanged(nsSizeMode sizeMode) override;
+    MOZ_CAN_RUN_SCRIPT_BOUNDARY
+    void MacFullscreenMenubarOverlapChanged(
+        mozilla::DesktopCoord aOverlapAmount) override;
+    MOZ_CAN_RUN_SCRIPT_BOUNDARY
+    void OcclusionStateChanged(bool aIsFullyOccluded) override;
+    MOZ_CAN_RUN_SCRIPT_BOUNDARY
+    void OSToolbarButtonPressed() override;
+    MOZ_CAN_RUN_SCRIPT_BOUNDARY
+    void WindowActivated() override;
+    MOZ_CAN_RUN_SCRIPT_BOUNDARY
+    void WindowDeactivated() override;
+
+   private:
+    AppWindow* mAppWindow;
+  };
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSIAPPWINDOW
+  NS_DECL_NSIBASEWINDOW
+
+  NS_INLINE_DECL_STATIC_IID(NS_APPWINDOW_IMPL_CID)
+
+  void LockUntilChromeLoad() { mLockedUntilChromeLoad = true; }
+  bool IsLocked() const { return mLockedUntilChromeLoad; }
+  void IgnoreXULSizeMode(bool aEnable) { mIgnoreXULSizeMode = aEnable; }
+  void WasRegistered() { mRegistered = true; }
+
+  using nsIBaseWindow::GetPositionAndSize;
+  using nsIBaseWindow::GetSize;
+
+  nsresult Initialize(nsIAppWindow* aParent, nsIAppWindow* aOpener,
+                      int32_t aInitialWidth, int32_t aInitialHeight,
+                      bool aIsHiddenWindow, widget::InitData& widgetInitData,
+                      nsIOpenWindowInfo* aOpenWindowInfo);
+
+  nsDocShell* GetDocShell() { return mDocShell; }
+
+  nsresult Toolbar();
+
+  NS_DECL_NSIWEBPROGRESSLISTENER
+
+  nsIAppWindow* GetAppWindow() { return this; }
+  mozilla::PresShell* GetPresShell();
+  MOZ_CAN_RUN_SCRIPT
+  void WindowMoved(nsIWidget*, const mozilla::LayoutDeviceIntPoint&);
+  MOZ_CAN_RUN_SCRIPT
+  void WindowResized(nsIWidget*, const mozilla::LayoutDeviceIntSize&);
+  MOZ_CAN_RUN_SCRIPT bool RequestWindowClose(nsIWidget* aWidget);
+  MOZ_CAN_RUN_SCRIPT void SizeModeChanged(nsSizeMode aSizeMode);
+  MOZ_CAN_RUN_SCRIPT void FullscreenWillChange(bool aInFullscreen);
+  MOZ_CAN_RUN_SCRIPT void FullscreenChanged(bool aInFullscreen);
+  MOZ_CAN_RUN_SCRIPT void MacFullscreenMenubarOverlapChanged(
+      mozilla::DesktopCoord aOverlapAmount);
+  MOZ_CAN_RUN_SCRIPT void OcclusionStateChanged(bool aIsFullyOccluded);
+  void RecomputeBrowsingContextVisibility();
+  MOZ_CAN_RUN_SCRIPT void OSToolbarButtonPressed();
+  MOZ_CAN_RUN_SCRIPT void WindowActivated();
+  MOZ_CAN_RUN_SCRIPT void WindowDeactivated();
+
+  explicit AppWindow(uint32_t aChromeFlags);
+
+ protected:
+  enum class PersistentAttribute : uint8_t {
+    Position,
+    Size,
+    Misc,
+  };
+  using PersistentAttributes = EnumSet<PersistentAttribute>;
+
+  static PersistentAttributes AllPersistentAttributes() {
+    return {PersistentAttribute::Position, PersistentAttribute::Size,
+            PersistentAttribute::Misc};
+  }
+
+  virtual ~AppWindow();
+
+  friend class mozilla::AppWindowTimerCallback;
+
+  MOZ_CAN_RUN_SCRIPT bool ExecuteCloseHandler();
+  void ConstrainToOpenerScreen(int32_t* aX, int32_t* aY);
+
+  void SetPersistenceTimer(uint32_t aDirtyFlags);
+  void FirePersistenceTimer();
+
+  NS_IMETHOD EnsureChromeTreeOwner();
+  NS_IMETHOD EnsureContentTreeOwner();
+  NS_IMETHOD EnsurePrimaryContentTreeOwner();
+  NS_IMETHOD EnsurePrompter();
+  NS_IMETHOD EnsureAuthPrompter();
+  NS_IMETHOD ForceRoundedDimensions();
+  NS_IMETHOD GetAvailScreenSize(int32_t* aAvailWidth, int32_t* aAvailHeight);
+
+  void FinishFullscreenChange(bool aInFullscreen);
+
+  void ApplyChromeFlags();
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void SizeShell();
+  void OnChromeLoaded();
+  void StaggerPosition(int32_t& aRequestedX, int32_t& aRequestedY,
+                       int32_t aSpecWidth, int32_t aSpecHeight);
+  bool LoadPositionFromXUL(int32_t aSpecWidth, int32_t aSpecHeight);
+  bool LoadSizeFromXUL(int32_t& aSpecWidth, int32_t& aSpecHeight);
+  void SetSpecifiedSize(int32_t aSpecWidth, int32_t aSpecHeight);
+  bool UpdateWindowStateFromMiscXULAttributes();
+  void SyncAttributesToWidget();
+  void SavePersistentAttributes(PersistentAttributes);
+  void MaybeSavePersistentPositionAndSize(PersistentAttributes,
+                                          dom::Element& aRootElement,
+                                          const nsAString& aPersistString,
+                                          bool aShouldPersist);
+  void MaybeSavePersistentMiscAttributes(PersistentAttributes,
+                                         dom::Element& aRootElement,
+                                         const nsAString& aPersistString,
+                                         bool aShouldPersist);
+  void SavePersistentAttributes() {
+    SavePersistentAttributes(mPersistentAttributesDirty);
+  }
+
+  bool NeedsTooltipListener();
+  void AddTooltipSupport();
+  void RemoveTooltipSupport();
+
+  NS_IMETHOD GetWindowDOMWindow(mozIDOMWindowProxy** aDOMWindow);
+  dom::Element* GetWindowDOMElement() const;
+
+  nsresult ContentShellAdded(nsIDocShellTreeItem* aContentShell, bool aPrimary);
+  nsresult ContentShellRemoved(nsIDocShellTreeItem* aContentShell);
+  NS_IMETHOD GetPrimaryContentSize(int32_t* aWidth, int32_t* aHeight);
+  NS_IMETHOD SetPrimaryContentSize(int32_t aWidth, int32_t aHeight);
+  nsresult GetRootShellSize(int32_t* aWidth, int32_t* aHeight);
+  nsresult SetRootShellSize(int32_t aWidth, int32_t aHeight);
+
+  NS_IMETHOD SizeShellTo(nsIDocShellTreeItem* aShellItem, int32_t aCX,
+                         int32_t aCY);
+  NS_IMETHOD ExitModalLoop(nsresult aStatus);
+  NS_IMETHOD CreateNewChromeWindow(int32_t aChromeFlags,
+                                   nsIAppWindow** _retval);
+  NS_IMETHOD CreateNewContentWindow(int32_t aChromeFlags,
+                                    nsIOpenWindowInfo* aOpenWindowInfo,
+                                    nsIAppWindow** _retval);
+  NS_IMETHOD GetHasPrimaryContent(bool* aResult);
+
+  void EnableParent(bool aEnable);
+  void PlaceWindowLayersBehind(uint32_t aLowLevel, uint32_t aHighLevel,
+                               nsIAppWindow* aBehind);
+  void SetContentScrollbarVisibility(bool aVisible);
+
+  enum PersistentAttributeUpdate { Sync, Async };
+  void PersistentAttributesDirty(PersistentAttributes,
+                                 PersistentAttributeUpdate);
+
+  void LoadPersistentWindowState();
+  nsresult GetPersistentValue(const nsAtom* aAttr, nsAString& aValue);
+  nsresult SetPersistentValue(const nsAtom* aAttr, const nsAString& aValue);
+
+  nsresult MaybeSaveEarlyWindowPersistentValues(
+      const LayoutDeviceIntRect& aRect);
+
+  nsresult GetDocXulStoreKeys(nsString& aUriSpec, nsString& aWindowElementId);
+
+  enum class FullscreenChangeState : uint8_t {
+    NotChanging,
+    WillChange,
+    WidgetResized,
+    WidgetEnteredFullscreen,
+    WidgetExitedFullscreen,
+  };
+
+  nsChromeTreeOwner* mChromeTreeOwner;
+  nsContentTreeOwner* mContentTreeOwner;
+  nsContentTreeOwner* mPrimaryContentTreeOwner;
+  nsCOMPtr<nsIWidget> mWindow;
+  RefPtr<nsDocShell> mDocShell;
+  nsCOMPtr<nsPIDOMWindowOuter> mDOMWindow;
+  nsWeakPtr mParentWindow;
+  nsCOMPtr<nsIPrompt> mPrompter;
+  nsCOMPtr<nsIAuthPrompt> mAuthPrompter;
+  nsCOMPtr<nsIXULBrowserWindow> mXULBrowserWindow;
+  nsCOMPtr<nsIDocShellTreeItem> mPrimaryContentShell;
+  nsresult mModalStatus;
+  FullscreenChangeState mFullscreenChangeState;
+  bool mContinueModalLoop;
+  bool mDebuting;            
+  bool mChromeLoaded;        
+  bool mSizingShellFromXUL;  
+  bool mShowAfterLoad;
+  bool mIntrinsicallySized;
+  bool mCenterAfterLoad;
+  bool mIsHiddenWindow;
+  bool mLockedUntilChromeLoad;
+  bool mIgnoreXULSize;
+  bool mIgnoreXULPosition;
+  bool mChromeFlagsFrozen;
+  bool mIgnoreXULSizeMode;
+  bool mDestroying;
+  bool mRegistered;
+  bool mDominantClientSize;
+  PersistentAttributes mPersistentAttributesDirty;
+  PersistentAttributes mPersistentAttributesMask;
+  uint32_t mChromeFlags;
+  nsCOMPtr<nsIOpenWindowInfo> mInitialOpenWindowInfo;
+  nsString mTitle;
+
+  mozilla::DesktopIntRect mOpenerScreenRect;
+
+  nsCOMPtr<nsIRemoteTab> mPrimaryBrowserParent;
+
+  nsCOMPtr<nsITimer> mSPTimer;
+  WidgetListenerDelegate mWidgetListenerDelegate;
+
+ private:
+  MOZ_CAN_RUN_SCRIPT void IntrinsicallySizeShell(const CSSIntSize& aWindowDiff,
+                                                 int32_t& aSpecWidth,
+                                                 int32_t& aSpecHeight);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY nsresult
+  GetPrimaryRemoteTabSize(int32_t* aWidth, int32_t* aHeight);
+  nsresult GetPrimaryContentShellSize(int32_t* aWidth, int32_t* aHeight);
+  nsresult SetPrimaryRemoteTabSize(int32_t aWidth, int32_t aHeight);
+  void SizeShellToWithLimit(int32_t aDesiredWidth, int32_t aDesiredHeight,
+                            int32_t shellItemWidth, int32_t shellItemHeight);
+  nsresult MoveResize(const Maybe<LayoutDeviceIntPoint>& aPosition,
+                      const Maybe<LayoutDeviceIntSize>& aSize, bool aRepaint);
+  nsresult MoveResize(const Maybe<DesktopPoint>& aPosition,
+                      const Maybe<DesktopSize>& aSize, bool aRepaint);
+  nsresult CenterImpl(nsIAppWindow* aRelative, bool aScreen, bool aAlert,
+                      bool aAllowCenteringForSizeChange);
+
+  nsCOMPtr<nsIXULStore> mLocalStore;
+  bool mIsWidgetInFullscreen = false;
+};
+
+}  
+
+#endif /* mozilla_AppWindow_h_ */

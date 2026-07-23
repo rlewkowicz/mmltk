@@ -1,0 +1,44 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_MessagePortChild_h
+#define mozilla_dom_MessagePortChild_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/dom/PMessagePortChild.h"
+#include "nsISupportsImpl.h"
+
+namespace mozilla::dom {
+
+class MessagePort;
+
+class MessagePortChild final : public PMessagePortChild {
+  friend class PMessagePortChild;
+
+ public:
+  NS_INLINE_DECL_REFCOUNTING(MessagePortChild)
+
+  MessagePortChild();
+
+  void SetPort(MessagePort* aPort) { mPort = aPort; }
+
+ private:
+  ~MessagePortChild() { MOZ_ASSERT(!mPort); }
+
+  mozilla::ipc::IPCResult RecvEntangled(
+      nsTArray<NotNull<RefPtr<SharedMessageBody>>>&& aMessages);
+
+  mozilla::ipc::IPCResult RecvReceiveData(
+      nsTArray<NotNull<RefPtr<SharedMessageBody>>>&& aMessages);
+
+  mozilla::ipc::IPCResult RecvStopSendingDataConfirmed();
+
+  virtual void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  MessagePort* mPort;
+};
+
+}  
+
+#endif  // mozilla_dom_MessagePortChild_h

@@ -1,0 +1,83 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MediaSink_h_
+#define MediaSink_h_
+
+#include "MediaInfo.h"
+#include "mozilla/DefineEnum.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/MediaDebugInfoBinding.h"
+#include "nsISupportsImpl.h"
+
+class AudioDeviceInfo;
+
+namespace mozilla {
+
+class TimeStamp;
+class VideoFrameContainer;
+
+class MediaSink {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaSink);
+  typedef mozilla::TrackInfo::TrackType TrackType;
+
+  typedef MozPromise<bool, nsresult,  false> EndedPromise;
+
+  virtual RefPtr<EndedPromise> OnEnded(TrackType aType) = 0;
+
+  virtual media::TimeUnit GetEndTime(TrackType aType) const = 0;
+
+  virtual media::TimeUnit GetPosition(TimeStamp* aTimeStamp = nullptr) = 0;
+
+  virtual bool HasUnplayedFrames(TrackType aType) const = 0;
+
+  virtual media::TimeUnit UnplayedDuration(TrackType aType) const = 0;
+
+  virtual void SetVolume(double aVolume) {}
+
+  virtual void SetStreamName(const nsAString& aStreamName) {}
+
+  virtual void SetPlaybackRate(double aPlaybackRate) {}
+
+  virtual void SetPreservesPitch(bool aPreservesPitch) {}
+
+  virtual void SetPlaying(bool aPlaying) = 0;
+
+  virtual RefPtr<GenericPromise> SetAudioDevice(
+      RefPtr<AudioDeviceInfo> aDevice) = 0;
+
+  virtual double PlaybackRate() const = 0;
+
+  virtual void Redraw(const VideoInfo& aInfo) {};
+
+  MOZ_DEFINE_ENUM_CLASS_WITH_TOSTRING_AT_CLASS_SCOPE(StartType,
+                                                     (Initial, SeekResume));
+
+  virtual nsresult Start(const media::TimeUnit& aStartTime,
+                         const MediaInfo& aInfo,
+                         StartType aStartType = StartType::Initial) = 0;
+
+  virtual void Stop() = 0;
+
+  virtual bool IsStarted() const = 0;
+
+  virtual bool IsPlaying() const = 0;
+
+  virtual void Shutdown() {}
+
+  virtual void SetSecondaryVideoContainer(VideoFrameContainer* aSecondary) {}
+
+  virtual void GetDebugInfo(dom::MediaSinkDebugInfo& aInfo) {}
+
+  virtual void SetVideoQueueSendToCompositorSize(const uint32_t aSize) {}
+
+ protected:
+  virtual ~MediaSink() = default;
+};
+
+}  
+
+#endif  // MediaSink_h_

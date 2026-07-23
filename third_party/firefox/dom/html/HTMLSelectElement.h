@@ -1,0 +1,371 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef mozilla_dom_HTMLSelectElement_h
+#define mozilla_dom_HTMLSelectElement_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/ConstraintValidation.h"
+#include "mozilla/dom/HTMLFormElement.h"
+#include "mozilla/dom/HTMLOptionsCollection.h"
+#include "nsContentUtils.h"
+#include "nsError.h"
+#include "nsGenericHTMLElement.h"
+#include "nsStubMutationObserver.h"
+
+class nsIDOMHTMLOptionElement;
+class nsListControlFrame;
+
+namespace mozilla {
+
+class ErrorResult;
+class EventChainPostVisitor;
+class EventChainPreVisitor;
+class SelectContentData;
+class PresState;
+class WidgetMouseEvent;
+
+namespace dom {
+
+class ContentList;
+class FormData;
+class HTMLButtonElement;
+class HTMLCollection;
+class HTMLElementOrLong;
+class HTMLOptionElementOrHTMLOptGroupElement;
+class HTMLSelectElement;
+class HTMLSelectedContentElement;
+
+class HTMLSelectElement final : public nsGenericHTMLFormControlElementWithState,
+                                public nsStubMutationObserver,
+                                public ConstraintValidation {
+ public:
+  enum class OptionFlag : uint8_t {
+    IsSelected,
+    ClearAll,
+    SetDisabled,
+    Notify,
+    NoReselect,
+    InsertingOptions
+  };
+  using OptionFlags = EnumSet<OptionFlag>;
+
+  using ConstraintValidation::GetValidationMessage;
+
+  explicit HTMLSelectElement(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,
+                             FromParser aFromParser = NOT_FROM_PARSER);
+
+  NS_IMPL_FROMNODE_HTML_WITH_TAG(HTMLSelectElement, select)
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+  NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTECHANGED
+  NS_DECL_NSIMUTATIONOBSERVER_CHARACTERDATACHANGED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTREMOVED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTAPPENDED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTINSERTED
+
+  int32_t TabIndexDefault() override;
+
+  bool IsInteractiveHTMLContent() const override { return true; }
+
+  void GetAutocomplete(DOMString& aValue);
+  void SetAutocomplete(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::autocomplete, aValue, aRv);
+  }
+
+  void GetAutocompleteInfo(AutocompleteInfo& aInfo);
+
+  MOZ_CAN_RUN_SCRIPT void UserFinishedInteracting(bool aChanged);
+
+  bool Disabled() const { return GetBoolAttr(nsGkAtoms::disabled); }
+  void SetDisabled(bool aVal, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::disabled, aVal, aRv);
+  }
+  bool Multiple() const { return GetBoolAttr(nsGkAtoms::multiple); }
+  void SetMultiple(bool aVal, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::multiple, aVal, aRv);
+  }
+
+  void GetName(DOMString& aValue) { GetHTMLAttr(nsGkAtoms::name, aValue); }
+  void SetName(const nsAString& aName, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::name, aName, aRv);
+  }
+  bool Required() const { return State().HasState(ElementState::REQUIRED); }
+  void SetRequired(bool aVal, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::required, aVal, aRv);
+  }
+  uint32_t Size() const { return GetUnsignedIntAttr(nsGkAtoms::size, 0); }
+  void SetSize(uint32_t aSize, ErrorResult& aRv) {
+    SetUnsignedIntAttr(nsGkAtoms::size, aSize, 0, aRv);
+  }
+
+  void GetType(nsAString& aValue);
+
+  HTMLOptionsCollection* Options() const { return mOptions; }
+  uint32_t Length() const { return mOptions->Length(); }
+  void SetLength(uint32_t aLength, ErrorResult& aRv);
+  Element* IndexedGetter(uint32_t aIdx, bool& aFound) const {
+    return mOptions->IndexedGetter(aIdx, aFound);
+  }
+  HTMLOptionElement* Item(uint32_t aIdx) const {
+    return mOptions->ItemAsOption(aIdx);
+  }
+  HTMLOptionElement* NamedItem(const nsAString& aName) const {
+    return static_cast<HTMLOptionElement*>(
+        mOptions->NamedItem(aName,  true));
+  }
+  void Add(const HTMLOptionElementOrHTMLOptGroupElement& aElement,
+           const Nullable<HTMLElementOrLong>& aBefore, ErrorResult& aRv);
+  void Remove(int32_t aIndex) const;
+  void IndexedSetter(uint32_t aIndex, HTMLOptionElement* aOption,
+                     ErrorResult& aRv) {
+    mOptions->IndexedSetter(aIndex, aOption, aRv);
+  }
+
+  static bool MatchSelectedOptions(Element* aElement, int32_t, nsAtom*, void*);
+
+  HTMLCollection* SelectedOptions();
+
+  int32_t SelectedIndex() const;
+  using IgnoredOptionList = Span<RefPtr<HTMLOptionElement>>;
+  HTMLOptionElement* GetSelectedOption(IgnoredOptionList = {}) const;
+  void SetSelectedIndex(int32_t aIdx);
+  void GetValue(nsAString& aValue) const;
+  void SetValue(const nsAString& aValue);
+
+  void SetCustomValidity(const nsAString& aError);
+
+  void ShowPicker(ErrorResult& aRv);
+
+  using nsINode::Remove;
+
+  JSObject* WrapNode(JSContext*, JS::Handle<JSObject*> aGivenProto) override;
+
+  void GetEventTargetParent(EventChainPreVisitor& aVisitor) override;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsresult PostHandleEvent(EventChainPostVisitor& aVisitor) override;
+
+  HTMLOptionElement* GetCurrentOption() const;
+
+  bool IsHTMLFocusable(IsFocusableFlags, bool* aIsFocusable,
+                       int32_t* aTabIndex) override;
+
+  bool IsDisabledForEvents(WidgetEvent* aEvent) override;
+
+  void SaveState() override;
+  bool RestoreState(PresState* aState) override;
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD Reset() override;
+  NS_IMETHOD SubmitNamesValues(FormData* aFormData) override;
+
+  void FieldSetDisabledChanged(bool aNotify) override;
+
+  NS_IMETHOD IsOptionDisabled(int32_t aIndex, bool* aIsDisabled);
+  bool IsOptionDisabled(HTMLOptionElement* aOption) const;
+
+  bool SetOptionsSelectedByIndex(int32_t aStartIndex, int32_t aEndIndex,
+                                 OptionFlags aOptionsMask);
+
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+  void UnbindFromTree(UnbindContext&) override;
+  void BeforeSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                     const nsAttrValue* aValue, bool aNotify) override;
+  void AfterSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                    const nsAttrValue* aValue, const nsAttrValue* aOldValue,
+                    nsIPrincipal* aSubjectPrincipal, bool aNotify) override;
+
+  void DoneAddingChildren(bool aHaveNotified) override;
+  bool IsDoneAddingChildren() const { return mIsDoneAddingChildren; }
+
+  bool ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                      const nsAString& aValue,
+                      nsIPrincipal* aMaybeScriptedPrincipal,
+                      nsAttrValue& aResult) override;
+  nsMapRuleToAttributesFunc GetAttributeMappingFunction() const override;
+  nsChangeHint GetAttributeChangeHint(const nsAtom* aAttribute,
+                                      AttrModType aModType) const override;
+  NS_IMETHOD_(bool) IsAttributeMapped(const nsAtom* aAttribute) const override;
+
+  nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(
+      HTMLSelectElement, nsGenericHTMLFormControlElementWithState)
+
+  HTMLOptionsCollection* GetOptions() { return mOptions; }
+
+  nsresult GetValidationMessage(nsAString& aValidationMessage,
+                                ValidityStateType aType) override;
+
+  void UpdateValueMissingValidityState(IgnoredOptionList = {});
+  void UpdateValidityElementStates(bool aNotify);
+  void Add(nsGenericHTMLElement& aElement, nsGenericHTMLElement* aBefore,
+           ErrorResult& aError);
+  void Add(nsGenericHTMLElement& aElement, int32_t aIndex,
+           ErrorResult& aError) {
+    Element* beforeContent = mOptions->Item(aIndex);
+    return Add(aElement, nsGenericHTMLElement::FromNodeOrNull(beforeContent),
+               aError);
+  }
+
+  bool IsCombobox() const { return !Multiple() && Size() <= 1; }
+
+  bool OpenInParentProcess() const { return mIsOpenInParentProcess; }
+  void SetOpenInParentProcess(bool aVal) {
+    mIsOpenInParentProcess = aVal;
+    SetStates(ElementState::OPEN, aVal);
+  }
+
+  void OnPopoverStateChanged(bool aOpen) {
+    SetStates(ElementState::OPEN, aOpen);
+  }
+
+  void GetPreviewValue(nsAString& aValue) { aValue = mPreviewValue; }
+  void SetPreviewValue(const nsAString& aValue);
+
+  void SetAutofillState(const nsAString& aState) {
+    SetFormAutofillState(aState);
+  }
+  void GetAutofillState(nsAString& aState) { GetFormAutofillState(aState); }
+
+  HTMLButtonElement* GetFirstButton() const;
+
+  void SetupShadowTree();
+  void GetSlotNameFor(const ShadowRoot&, const nsIContent&,
+                      nsAString&) const override;
+  void OnChildBeforeSlotted(ShadowRoot&, nsIContent&) override;
+  void OnChildUnslotted(ShadowRoot&, nsIContent&) override;
+
+  Text* GetSelectedContentText() const;
+  void SelectedContentTextMightHaveChanged(bool aNotify = true,
+                                           IgnoredOptionList = {});
+
+  void RunSelectednessSettingAlgorithm(bool aNotify = true,
+                                       bool aInsertionOrRemovalSteps = false,
+                                       IgnoredOptionList aIgnored = {});
+
+  void ScheduleSelectedContentUpdate();
+  void ScheduleSelectedContentUpdateScriptRunner(bool aForceUpdate = false);
+
+  MOZ_CAN_RUN_SCRIPT void UpdateDescendantSelectedContentElements();
+  MOZ_CAN_RUN_SCRIPT void UpdateSelectedContentElement(
+      HTMLSelectedContentElement* aSelectedContent);
+  MOZ_CAN_RUN_SCRIPT void CloneOptionIntoSelectedContent(
+      HTMLOptionElement* aOption, HTMLSelectedContentElement* aSelectedContent);
+
+  void ScrollToSelectedOption() { return ScrollToOption(SelectedIndex()); }
+
+  void ResetListBoxSelection(bool aAllowScrolling);
+
+ protected:
+  virtual ~HTMLSelectElement();
+
+  bool IsOptionSelectedByIndex(int32_t aIndex) const;
+  void FindSelectedIndex(int32_t aStartIndex, bool aNotify);
+  void OnOptionSelected(int32_t aIndex, bool aSelected, bool aChangeOptionState,
+                        bool aNotify);
+  void RestoreStateTo(const SelectContentData& aNewSelected);
+
+  void UpdateBarredFromConstraintValidation();
+  bool IsValueMissing(IgnoredOptionList = {}) const;
+
+  int32_t GetOptionIndexAt(nsIContent* aOptions);
+  int32_t GetOptionIndexAfter(nsIContent* aOptions);
+  int32_t GetFirstOptionIndex(nsIContent* aOptions);
+  int32_t GetFirstChildOptionIndex(nsIContent* aOptions, int32_t aStartIndex,
+                                   int32_t aEndIndex);
+
+  nsListControlFrame* GetListBoxFrame();
+
+  void SetSelectedIndexInternal(int32_t aIndex, bool aNotify);
+
+  void OnSelectionChanged();
+
+  void UpdateSelectedOptions();
+
+  void SetUserInteracted(bool) final;
+
+  MOZ_CAN_RUN_SCRIPT nsresult HandleKeyDown(EventChainPostVisitor&);
+  MOZ_CAN_RUN_SCRIPT nsresult HandleKeyPress(EventChainPostVisitor&);
+  MOZ_CAN_RUN_SCRIPT nsresult HandleMouseDown(EventChainPostVisitor&);
+  MOZ_CAN_RUN_SCRIPT nsresult HandleMouseUp(EventChainPostVisitor&);
+  MOZ_CAN_RUN_SCRIPT nsresult HandleMouseMove(EventChainPostVisitor&);
+
+  Maybe<int32_t> GetListBoxIndexFromEvent(const WidgetMouseEvent&);
+  void CaptureMouseEvents(bool aGrabMouseEvents);
+
+  MOZ_CAN_RUN_SCRIPT
+  bool PerformListBoxSelection(int32_t aClickedIndex, bool aIsShift,
+                               bool aIsControl);
+  MOZ_CAN_RUN_SCRIPT
+  bool ListBoxSingleSelection(int32_t aClickedIndex, bool aDoToggle);
+  bool ExtendedSelection(int32_t aStartIndex, int32_t aEndIndex,
+                         bool aClearAll);
+  bool ToggleOptionSelected(int32_t aIndex);
+  void InitListBoxSelectionRange(int32_t aClickedIndex);
+  MOZ_CAN_RUN_SCRIPT void UpdateSelection();
+  MOZ_CAN_RUN_SCRIPT
+  void UpdateListBoxSelectionAfterKeyEvent(int32_t aNewIndex,
+                                           uint32_t aCharCode, bool aIsShift,
+                                           bool aIsControlOrMeta);
+  void RemoveOptionFromListBoxSelection(int32_t aIndex);
+  void ScrollToOption(int32_t aIndex);
+  MOZ_CAN_RUN_SCRIPT void DoScrollToOption(int32_t aIndex);
+  void AdjustIndexForDisabledOpt(int32_t aStartIndex, int32_t& aNewIndex,
+                                 int32_t aNumOptions, int32_t aDoAdjustInc,
+                                 int32_t aDoAdjustIncNext);
+  void MaybeFireMenuItemActiveEvent(nsIContent* aPreviousCurrentOption);
+  bool IsOptionInteractivelySelectable(uint32_t aIndex) const;
+  int32_t GetEndSelectionIndex() const;
+  int32_t ItemsPerPage() const;
+
+  MOZ_CAN_RUN_SCRIPT
+  void PostHandleKeyEvent(int32_t aNewIndex, uint32_t aCharCode, bool aIsShift,
+                          bool aIsControlOrMeta);
+
+  HTMLOptionElement* GetNonDisabledOptionFrom(
+      int32_t aFromIndex, int32_t* aFoundIndex = nullptr) const;
+
+  MOZ_CAN_RUN_SCRIPT void FireDropDownEvent(bool aShow,
+                                            bool aIsSourceTouchEvent);
+
+  void ContentAppendedOrInserted(nsIContent* aFirstNewContent, bool aIsAppend);
+
+  RefPtr<HTMLOptionsCollection> mOptions;
+  nsContentUtils::AutocompleteAttrState mAutocompleteAttrState;
+  nsContentUtils::AutocompleteAttrState mAutocompleteInfoState;
+
+  bool mIsDoneAddingChildren : 1;
+  bool mDisabledChanged : 1 = false;
+  bool mInhibitStateRestoration : 1;
+  bool mUserInteracted : 1 = false;
+  bool mDefaultSelectionSet : 1 = false;
+  bool mIsOpenInParentProcess : 1 = false;
+  bool mButtonDown : 1 = false;
+  bool mControlSelectMode : 1 = false;
+  bool mSelectedContentUpdatePending : 1 = false;
+  bool mIsUpdatingSelectedContent : 1 = false;
+  bool mListBoxSelectionChangedSinceDragStart : 1 = false;
+  UniquePtr<SelectContentData> mRestoreState;
+
+  RefPtr<ContentList> mSelectedOptions;
+
+  nsString mPreviewValue;
+  static constexpr int32_t kNothingSelected = -1;
+  struct {
+    int32_t mStart = -1;
+    int32_t mEnd = -1;
+
+    void SetTo(int32_t aIndex) { mStart = mEnd = aIndex; }
+  } mListBoxSelection;
+
+ private:
+  static void MapAttributesIntoRule(MappedDeclarationsBuilder&);
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_HTMLSelectElement_h

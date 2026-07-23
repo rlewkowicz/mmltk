@@ -1,0 +1,43 @@
+# This file is part of ICU4X. For terms of use, please see the file
+# called LICENSE at the top level of the ICU4X source tree
+# (online at: https://github.com/unicode-org/icu4x/blob/main/LICENSE ).
+
+[package]
+name = "icu_casemap"
+description = "Unicode case mapping and folding algorithms"
+
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+homepage.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+icu_collections = { workspace = true, features = ["alloc"] }
+icu_locale_core = { workspace = true, features = ["alloc"] }
+icu_properties = { workspace = true }
+icu_provider = { workspace = true, features = ["alloc"] }
+potential_utf = { workspace = true, features = ["alloc", "zerovec"] }
+writeable = { workspace = true }
+zerovec = { workspace = true, features = ["alloc", "yoke"] }
+
+databake = { workspace = true, features = ["derive"], optional = true}
+serde = { workspace = true, features = ["derive", "alloc"], optional = true }
+
+icu_casemap_data = { workspace = true, optional = true }
+
+[features]
+default = ["compiled_data"]
+serde = ["dep:serde", "zerovec/serde", "icu_collections/serde", "icu_provider/serde", "icu_properties/serde", "potential_utf/serde"]
+datagen = ["serde", "dep:databake", "zerovec/databake", "icu_collections/databake", "icu_provider/export"]
+compiled_data = ["dep:icu_casemap_data", "icu_properties/compiled_data", "icu_provider/baked"]
+
+[package.metadata.cargo-all-features]
+skip_optional_dependencies = true

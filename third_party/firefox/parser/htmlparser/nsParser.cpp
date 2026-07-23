@@ -1,0 +1,784 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsAtom.h"
+#include "nsParser.h"
+#include "nsString.h"
+#include "nsCRT.h"
+#include "nsScanner.h"
+#include "plstr.h"
+#include "nsIChannel.h"
+#include "nsIInputStream.h"
+#include "prenv.h"
+#include "prlock.h"
+#include "prcvar.h"
+#include "nsReadableUtils.h"
+#include "nsCOMPtr.h"
+#include "nsExpatDriver.h"
+#include "nsIFragmentContentSink.h"
+#include "nsStreamUtils.h"
+#include "nsXPCOMCIDInternal.h"
+#include "nsMimeTypes.h"
+#include "nsCharsetSource.h"
+#include "nsThreadUtils.h"
+
+#include "mozilla/CondVar.h"
+#include "mozilla/dom/ScriptLoader.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/Mutex.h"
+
+using namespace mozilla;
+
+#define NS_PARSER_FLAG_PENDING_CONTINUE_EVENT 0x00000001
+#define NS_PARSER_FLAG_CAN_TOKENIZE 0x00000002
+
+
+class nsParserContinueEvent : public Runnable {
+ public:
+  RefPtr<nsParser> mParser;
+
+  explicit nsParserContinueEvent(nsParser* aParser)
+      : mozilla::Runnable("nsParserContinueEvent"), mParser(aParser) {}
+
+  NS_IMETHOD Run() override {
+    mParser->HandleParserContinueEvent(this);
+    return NS_OK;
+  }
+};
+
+
+nsParser::nsParser() : mCharset(WINDOWS_1252_ENCODING) { Initialize(); }
+
+nsParser::~nsParser() { Cleanup(); }
+
+void nsParser::Initialize() {
+  mContinueEvent = nullptr;
+  mCharsetSource = kCharsetUninitialized;
+  mCharset = WINDOWS_1252_ENCODING;
+  mInternalState = NS_OK;
+  mStreamStatus = NS_OK;
+  mCommand = eViewNormal;
+  mBlocked = 0;
+  mFlags = NS_PARSER_FLAG_CAN_TOKENIZE;
+
+  mProcessingNetworkData = false;
+  mOnStopPending = false;
+}
+
+void nsParser::Cleanup() {
+  NS_ASSERTION(!(mFlags & NS_PARSER_FLAG_PENDING_CONTINUE_EVENT), "bad");
+}
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(nsParser)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsParser)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mExpatDriver)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mSink)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_REFERENCE
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsParser)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mExpatDriver)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mSink)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(nsParser)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(nsParser)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsParser)
+  NS_INTERFACE_MAP_ENTRY(nsIStreamListener)
+  NS_INTERFACE_MAP_ENTRY(nsIParser)
+  NS_INTERFACE_MAP_ENTRY(nsIRequestObserver)
+  NS_INTERFACE_MAP_ENTRY(nsISupportsWeakReference)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIParser)
+NS_INTERFACE_MAP_END
+
+
+nsresult nsParser::PostContinueEvent() {
+  if (!(mFlags & NS_PARSER_FLAG_PENDING_CONTINUE_EVENT)) {
+    NS_ASSERTION(!mContinueEvent, "bad");
+
+    nsCOMPtr<nsIRunnable> event = new nsParserContinueEvent(this);
+    if (NS_FAILED(NS_DispatchToCurrentThread(event))) {
+      NS_WARNING("failed to dispatch parser continuation event");
+    } else {
+      mFlags |= NS_PARSER_FLAG_PENDING_CONTINUE_EVENT;
+      mContinueEvent = event;
+    }
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP_(void)
+nsParser::GetCommand(nsCString& aCommand) { aCommand = mCommandStr; }
+
+NS_IMETHODIMP_(void)
+nsParser::SetCommand(const char* aCommand) {
+  mCommandStr.Assign(aCommand);
+  if (mCommandStr.EqualsLiteral("view-source")) {
+    mCommand = eViewSource;
+  } else if (mCommandStr.EqualsLiteral("view-fragment")) {
+    mCommand = eViewFragment;
+  } else {
+    mCommand = eViewNormal;
+  }
+}
+
+NS_IMETHODIMP_(void)
+nsParser::SetCommand(eParserCommands aParserCommand) {
+  mCommand = aParserCommand;
+}
+
+void nsParser::SetDocumentCharset(NotNull<const Encoding*> aCharset,
+                                  int32_t aCharsetSource,
+                                  bool aForceAutoDetection) {
+  mCharset = aCharset;
+  mCharsetSource = aCharsetSource;
+  if (mParserContext) {
+    mParserContext->mScanner.SetDocumentCharset(aCharset, aCharsetSource);
+  }
+}
+
+void nsParser::SetSinkCharset(NotNull<const Encoding*> aCharset) {
+  if (mSink) {
+    mSink->SetDocumentCharset(aCharset);
+  }
+}
+
+NS_IMETHODIMP_(void)
+nsParser::SetContentSink(nsIContentSink* aSink) {
+  MOZ_ASSERT(aSink, "sink cannot be null!");
+  mSink = aSink;
+
+  if (mSink) {
+    mSink->SetParser(this);
+  }
+}
+
+NS_IMETHODIMP_(nsIContentSink*)
+nsParser::GetContentSink() { return mSink; }
+
+
+nsresult nsParser::WillBuildModel() {
+  if (!mParserContext) return NS_ERROR_HTMLPARSER_INVALIDPARSERCONTEXT;
+
+  if (mInternalState == NS_ERROR_OUT_OF_MEMORY) {
+    return mInternalState;
+  }
+
+  if (eUnknownDetect != mParserContext->mAutoDetectStatus) return NS_OK;
+
+  if (eDTDMode_autodetect == mParserContext->mDTDMode) {
+    mParserContext->mDTDMode = eDTDMode_full_standards;
+    mParserContext->mDocType = eXML;
+  }  
+
+  mParserContext->mAutoDetectStatus = ePrimaryDetect;
+
+  MOZ_ASSERT(mParserContext->mParserCommand != eViewSource,
+             "The old parser is not supposed to be used for View Source "
+             "anymore.");
+
+  RefPtr<nsExpatDriver> expat = new nsExpatDriver();
+  nsresult rv = expat->Initialize(mParserContext->mScanner.GetURI(), mSink);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mExpatDriver = expat.forget();
+
+  return mSink->WillBuildModel();
+}
+
+void nsParser::DidBuildModel() {
+  if (IsComplete() && mParserContext) {
+    bool terminated = mInternalState == NS_ERROR_HTMLPARSER_STOPPARSING;
+    if (mExpatDriver && mSink) {
+      mExpatDriver->DidBuildModel();
+      mSink->DidBuildModel(terminated);
+    }
+
+    mParserContext->mRequest = nullptr;
+  }
+}
+
+NS_IMETHODIMP
+nsParser::Terminate(void) {
+  if (mInternalState == NS_ERROR_HTMLPARSER_STOPPARSING) {
+    return NS_OK;
+  }
+
+  nsresult result = NS_OK;
+  nsCOMPtr<nsIParser> kungFuDeathGrip(this);
+  mInternalState = result = NS_ERROR_HTMLPARSER_STOPPARSING;
+
+  if (mFlags & NS_PARSER_FLAG_PENDING_CONTINUE_EVENT) {
+    NS_ASSERTION(mContinueEvent, "mContinueEvent is null");
+    mContinueEvent = nullptr;
+    mFlags &= ~NS_PARSER_FLAG_PENDING_CONTINUE_EVENT;
+  }
+
+  if (mExpatDriver) {
+    mExpatDriver->Terminate();
+    DidBuildModel();
+  } else if (mSink) {
+    result = mSink->DidBuildModel(true);
+    NS_ENSURE_SUCCESS(result, result);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsParser::ContinueInterruptedParsing() {
+  if (mInternalState == NS_ERROR_OUT_OF_MEMORY) {
+    return mInternalState;
+  }
+
+  if (mBlocked) {
+    return NS_OK;
+  }
+
+  if (IsScriptExecuting()) {
+    ContinueParsingDocumentAfterCurrentScript();
+    return NS_OK;
+  }
+
+  if (mProcessingNetworkData) {
+    return NS_OK;
+  }
+
+  nsresult result = NS_OK;
+  nsCOMPtr<nsIParser> kungFuDeathGrip(this);
+  nsCOMPtr<nsIContentSink> sinkDeathGrip(mSink);
+
+  bool isFinalChunk =
+      mParserContext && mParserContext->mStreamListenerState == eOnStop;
+
+  mProcessingNetworkData = true;
+  if (sinkDeathGrip) {
+    sinkDeathGrip->WillParse();
+  }
+  result = ResumeParse(true, isFinalChunk);  
+
+  if ((result == NS_OK) && mOnStopPending) {
+    mOnStopPending = false;
+    mParserContext->mStreamListenerState = eOnStop;
+    mParserContext->mScanner.SetIncremental(false);
+
+    if (sinkDeathGrip) {
+      sinkDeathGrip->WillParse();
+    }
+    result = ResumeParse(true, true);
+  }
+  mProcessingNetworkData = false;
+
+  if (result != NS_OK) {
+    result = mInternalState;
+  }
+
+  return result;
+}
+
+NS_IMETHODIMP_(void)
+nsParser::BlockParser() { mBlocked++; }
+
+NS_IMETHODIMP_(void)
+nsParser::UnblockParser() {
+  MOZ_DIAGNOSTIC_ASSERT(mBlocked > 0);
+  if (MOZ_LIKELY(mBlocked > 0)) {
+    mBlocked--;
+  }
+}
+
+NS_IMETHODIMP_(void)
+nsParser::ContinueInterruptedParsingAsync() {
+  MOZ_ASSERT(mSink);
+  if (MOZ_LIKELY(mSink)) {
+    mSink->ContinueInterruptedParsingAsync();
+  }
+}
+
+NS_IMETHODIMP_(bool)
+nsParser::IsParserEnabled() { return !mBlocked; }
+
+NS_IMETHODIMP_(bool)
+nsParser::IsComplete() {
+  return !(mFlags & NS_PARSER_FLAG_PENDING_CONTINUE_EVENT);
+}
+
+void nsParser::HandleParserContinueEvent(nsParserContinueEvent* ev) {
+  if (mContinueEvent != ev) return;
+
+  mFlags &= ~NS_PARSER_FLAG_PENDING_CONTINUE_EVENT;
+  mContinueEvent = nullptr;
+
+  ContinueInterruptedParsing();
+}
+
+bool nsParser::IsInsertionPointDefined() { return false; }
+
+void nsParser::IncrementScriptNestingLevel() {}
+
+void nsParser::DecrementScriptNestingLevel() {}
+
+bool nsParser::HasNonzeroScriptNestingLevel() const { return false; }
+
+bool nsParser::IsScriptCreated() { return false; }
+
+bool nsParser::IsAboutBlankMode() { return false; }
+
+NS_IMETHODIMP
+nsParser::Parse(nsIURI* aURL) {
+  MOZ_ASSERT(aURL, "Error: Null URL given");
+
+  if (mInternalState == NS_ERROR_OUT_OF_MEMORY) {
+    return mInternalState;
+  }
+
+  if (!aURL) {
+    return NS_ERROR_HTMLPARSER_BADURL;
+  }
+
+  MOZ_ASSERT(!mParserContext, "We expect mParserContext to be null.");
+
+  mParserContext = MakeUnique<CParserContext>(aURL, mCommand);
+
+  return NS_OK;
+}
+
+nsresult nsParser::Parse(const nsAString& aSourceBuffer, bool aLastCall) {
+  if (mInternalState == NS_ERROR_OUT_OF_MEMORY) {
+    return mInternalState;
+  }
+
+  if (mInternalState == NS_ERROR_HTMLPARSER_STOPPARSING) {
+    return NS_OK;
+  }
+
+  if (!aLastCall && aSourceBuffer.IsEmpty()) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIParser> kungFuDeathGrip(this);
+
+  if (!mParserContext) {
+    mParserContext =
+        MakeUnique<CParserContext>(mUnusedInput, mCommand, aLastCall);
+
+    mUnusedInput.Truncate();
+  } else if (aLastCall) {
+    mParserContext->mStreamListenerState = eOnStop;
+    mParserContext->mScanner.SetIncremental(false);
+  }
+
+  mParserContext->mScanner.Append(aSourceBuffer);
+  return ResumeParse(false, false, false);
+}
+
+nsresult nsParser::ParseFragment(const nsAString& aSourceBuffer,
+                                 nsTArray<nsString>& aTagStack) {
+  if (mInternalState == NS_ERROR_OUT_OF_MEMORY) {
+    return mInternalState;
+  }
+
+  nsresult result = NS_OK;
+  nsAutoString theContext;
+  uint32_t theCount = aTagStack.Length();
+  uint32_t theIndex = 0;
+
+  for (theIndex = 0; theIndex < theCount; theIndex++) {
+    theContext.Append('<');
+    theContext.Append(aTagStack[theCount - theIndex - 1]);
+    theContext.Append('>');
+  }
+
+  if (theCount == 0) {
+    theContext.Assign(' ');
+  }
+
+  result = Parse(theContext, false);
+  if (NS_FAILED(result)) {
+    return result;
+  }
+
+  if (!mSink) {
+    return NS_ERROR_HTMLPARSER_STOPPARSING;
+  }
+
+  nsCOMPtr<nsIFragmentContentSink> fragSink = do_QueryInterface(mSink);
+  NS_ASSERTION(fragSink, "ParseFragment requires a fragment content sink");
+
+  fragSink->WillBuildContent();
+  if (theCount == 0) {
+    result = Parse(aSourceBuffer, true);
+    fragSink->DidBuildContent();
+  } else {
+    result = Parse(aSourceBuffer + u"</"_ns, false);
+    fragSink->DidBuildContent();
+
+    if (NS_SUCCEEDED(result)) {
+      nsAutoString endContext;
+      for (theIndex = 0; theIndex < theCount; theIndex++) {
+        if (theIndex > 0) {
+          endContext.AppendLiteral("</");
+        }
+
+        nsString& thisTag = aTagStack[theIndex];
+        int32_t endOfTag = thisTag.FindChar(char16_t(' '));
+        if (endOfTag == -1) {
+          endContext.Append(thisTag);
+        } else {
+          endContext.Append(Substring(thisTag, 0, endOfTag));
+        }
+
+        endContext.Append('>');
+      }
+
+      result = Parse(endContext, true);
+    }
+  }
+
+  mParserContext.reset();
+
+  return result;
+}
+
+nsresult nsParser::ResumeParse(bool allowIteration, bool aIsFinalChunk,
+                               bool aCanInterrupt) {
+  if (mInternalState == NS_ERROR_OUT_OF_MEMORY) {
+    return mInternalState;
+  }
+
+  nsresult result = NS_OK;
+
+  if (!mBlocked && mInternalState != NS_ERROR_HTMLPARSER_STOPPARSING) {
+    result = WillBuildModel();
+    if (NS_FAILED(result)) {
+      mFlags &= ~NS_PARSER_FLAG_CAN_TOKENIZE;
+      return result;
+    }
+
+    if (mExpatDriver) {
+      mSink->WillResume();
+      bool theIterationIsOk = true;
+
+      while (result == NS_OK && theIterationIsOk) {
+        if (!mUnusedInput.IsEmpty()) {
+          mParserContext->mScanner.UngetReadable(mUnusedInput);
+          mUnusedInput.Truncate(0);
+        }
+
+        nsresult theTokenizerResult;
+        if (mFlags & NS_PARSER_FLAG_CAN_TOKENIZE) {
+          mParserContext->mScanner.Mark();
+          if (mParserContext->mDocType == eXML &&
+              mParserContext->mParserCommand != eViewSource) {
+            theTokenizerResult = mExpatDriver->ResumeParse(
+                mParserContext->mScanner, aIsFinalChunk);
+            if (NS_FAILED(theTokenizerResult)) {
+              mParserContext->mScanner.RewindToMark();
+              if (NS_ERROR_HTMLPARSER_STOPPARSING == theTokenizerResult) {
+                theTokenizerResult = Terminate();
+                mSink = nullptr;
+              }
+            }
+          } else {
+            theTokenizerResult = NS_ERROR_HTMLPARSER_EOF;
+          }
+        } else {
+          theTokenizerResult = NS_OK;
+        }
+
+        result = mExpatDriver->BuildModel();
+        if (result == NS_ERROR_HTMLPARSER_INTERRUPTED && aIsFinalChunk) {
+          PostContinueEvent();
+        }
+
+        theIterationIsOk = theTokenizerResult != NS_ERROR_HTMLPARSER_EOF &&
+                           result != NS_ERROR_HTMLPARSER_INTERRUPTED;
+
+
+        if (NS_ERROR_HTMLPARSER_BLOCK == result) {
+          mSink->WillInterrupt();
+          return NS_OK;
+        }
+        if (NS_ERROR_HTMLPARSER_STOPPARSING == result) {
+          if (mInternalState != NS_ERROR_HTMLPARSER_STOPPARSING) {
+            DidBuildModel();
+            mInternalState = result;
+          }
+
+          return NS_OK;
+        }
+        if (((NS_OK == result &&
+              theTokenizerResult == NS_ERROR_HTMLPARSER_EOF) ||
+             result == NS_ERROR_HTMLPARSER_INTERRUPTED) &&
+            mParserContext->mStreamListenerState == eOnStop) {
+          DidBuildModel();
+          return NS_OK;
+        }
+
+        if (theTokenizerResult == NS_ERROR_HTMLPARSER_EOF ||
+            result == NS_ERROR_HTMLPARSER_INTERRUPTED) {
+          result = (result == NS_ERROR_HTMLPARSER_INTERRUPTED) ? NS_OK : result;
+          mSink->WillInterrupt();
+        }
+      }
+    } else {
+      mInternalState = result = NS_ERROR_HTMLPARSER_UNRESOLVEDDTD;
+    }
+  }
+
+  return (result == NS_ERROR_HTMLPARSER_INTERRUPTED) ? NS_OK : result;
+}
+
+
+nsresult nsParser::OnStartRequest(nsIRequest* request) {
+  if (mInternalState == NS_ERROR_OUT_OF_MEMORY) {
+    return mInternalState;
+  }
+
+  MOZ_ASSERT(eNone == mParserContext->mStreamListenerState,
+             "Parser's nsIStreamListener API was not setup "
+             "correctly in constructor.");
+
+  mParserContext->mStreamListenerState = eOnStart;
+  mParserContext->mAutoDetectStatus = eUnknownDetect;
+  mParserContext->mRequest = request;
+
+  mExpatDriver = nullptr;
+
+  nsresult rv;
+  nsAutoCString contentType;
+  nsCOMPtr<nsIChannel> channel = do_QueryInterface(request);
+  if (channel) {
+    rv = channel->GetContentType(contentType);
+    if (NS_SUCCEEDED(rv)) {
+      mParserContext->SetMimeType(contentType);
+    }
+  }
+
+  rv = NS_OK;
+
+  return rv;
+}
+
+static bool ExtractCharsetFromXmlDeclaration(const unsigned char* aBytes,
+                                             int32_t aLen,
+                                             nsCString& oCharset) {
+  oCharset.Truncate();
+  if ((aLen >= 5) && ('<' == aBytes[0]) && ('?' == aBytes[1]) &&
+      ('x' == aBytes[2]) && ('m' == aBytes[3]) && ('l' == aBytes[4])) {
+    int32_t i;
+    bool versionFound = false, encodingFound = false;
+    for (i = 6; i < aLen && !encodingFound; ++i) {
+      if ((((char*)aBytes)[i] == '?') && ((i + 1) < aLen) &&
+          (((char*)aBytes)[i + 1] == '>')) {
+        break;
+      }
+      if (!versionFound) {
+        if ((((char*)aBytes)[i] == 'n') && (i >= 12) &&
+            (0 == strncmp("versio", (char*)(aBytes + i - 6), 6))) {
+          char q = 0;
+          for (++i; i < aLen; ++i) {
+            char qi = ((char*)aBytes)[i];
+            if (qi == '\'' || qi == '"') {
+              if (q && q == qi) {
+                versionFound = true;
+                break;
+              } else {
+                q = qi;
+              }
+            }
+          }
+        }
+      } else {
+        if ((((char*)aBytes)[i] == 'g') && (i >= 25) &&
+            (0 == strncmp("encodin", (char*)(aBytes + i - 7), 7))) {
+          int32_t encStart = 0;
+          char q = 0;
+          for (++i; i < aLen; ++i) {
+            char qi = ((char*)aBytes)[i];
+            if (qi == '\'' || qi == '"') {
+              if (q && q == qi) {
+                int32_t count = i - encStart;
+                if (count > 0 &&
+                    PL_strncasecmp("UTF-16", (char*)(aBytes + encStart),
+                                   count)) {
+                  oCharset.Assign((char*)(aBytes + encStart), count);
+                }
+                encodingFound = true;
+                break;
+              } else {
+                encStart = i + 1;
+                q = qi;
+              }
+            }
+          }
+        }
+      }  
+    }  
+  }
+  return !oCharset.IsEmpty();
+}
+
+inline char GetNextChar(nsACString::const_iterator& aStart,
+                        nsACString::const_iterator& aEnd) {
+  NS_ASSERTION(aStart != aEnd, "end of buffer");
+  return (++aStart != aEnd) ? *aStart : '\0';
+}
+
+typedef struct {
+  bool mNeedCharsetCheck;
+  nsParser* mParser;
+  nsScanner* mScanner;
+  nsIRequest* mRequest;
+} ParserWriteStruct;
+
+static nsresult ParserWriteFunc(nsIInputStream* in, void* closure,
+                                const char* fromRawSegment, uint32_t toOffset,
+                                uint32_t count, uint32_t* writeCount) {
+  nsresult result;
+  ParserWriteStruct* pws = static_cast<ParserWriteStruct*>(closure);
+  const unsigned char* buf =
+      reinterpret_cast<const unsigned char*>(fromRawSegment);
+  uint32_t theNumRead = count;
+
+  if (!pws) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (pws->mNeedCharsetCheck) {
+    pws->mNeedCharsetCheck = false;
+    int32_t source;
+    auto preferred = pws->mParser->GetDocumentCharset(source);
+
+    const Encoding* encoding;
+    std::tie(encoding, std::ignore) = Encoding::ForBOM(Span(buf, count));
+    if (encoding) {
+      preferred = WrapNotNull(encoding);
+      source = kCharsetFromByteOrderMark;
+    } else if (source < kCharsetFromChannel) {
+      nsAutoCString declCharset;
+
+      if (ExtractCharsetFromXmlDeclaration(buf, count, declCharset)) {
+        encoding = Encoding::ForLabel(declCharset);
+        if (encoding) {
+          preferred = WrapNotNull(encoding);
+          source = kCharsetFromMetaTag;
+        }
+      }
+    }
+
+    pws->mParser->SetDocumentCharset(preferred, source, false);
+    pws->mParser->SetSinkCharset(preferred);
+  }
+
+  result = pws->mScanner->Append(fromRawSegment, theNumRead);
+  if (NS_SUCCEEDED(result)) {
+    *writeCount = count;
+  }
+
+  return result;
+}
+
+nsresult nsParser::OnDataAvailable(nsIRequest* request,
+                                   nsIInputStream* pIStream,
+                                   uint64_t sourceOffset, uint32_t aLength) {
+  if (mInternalState == NS_ERROR_OUT_OF_MEMORY) {
+    return mInternalState;
+  }
+
+  MOZ_ASSERT((eOnStart == mParserContext->mStreamListenerState ||
+              eOnDataAvail == mParserContext->mStreamListenerState),
+             "Error: OnStartRequest() must be called before OnDataAvailable()");
+  MOZ_ASSERT(NS_InputStreamIsBuffered(pIStream),
+             "Must have a buffered input stream");
+
+  nsresult rv = NS_OK;
+
+  if (mParserContext->mRequest == request) {
+    mParserContext->mStreamListenerState = eOnDataAvail;
+
+    uint32_t totalRead;
+    ParserWriteStruct pws;
+    pws.mNeedCharsetCheck = true;
+    pws.mParser = this;
+    pws.mScanner = &mParserContext->mScanner;
+    pws.mRequest = request;
+
+    rv = pIStream->ReadSegments(ParserWriteFunc, &pws, aLength, &totalRead);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+
+    if (IsScriptExecuting()) {
+      ContinueParsingDocumentAfterCurrentScript();
+      return rv;
+    }
+
+    if (!mProcessingNetworkData) {
+      nsCOMPtr<nsIParser> kungFuDeathGrip(this);
+      nsCOMPtr<nsIContentSink> sinkDeathGrip(mSink);
+      mProcessingNetworkData = true;
+      if (sinkDeathGrip) {
+        sinkDeathGrip->WillParse();
+      }
+      rv = ResumeParse();
+      if ((mParserContext->mRequest == request) && mOnStopPending) {
+        mOnStopPending = false;
+        mParserContext->mStreamListenerState = eOnStop;
+        mParserContext->mScanner.SetIncremental(false);
+
+        if (sinkDeathGrip) {
+          sinkDeathGrip->WillParse();
+        }
+        rv = ResumeParse(true, true);
+      }
+      mProcessingNetworkData = false;
+    }
+  } else {
+    rv = NS_ERROR_UNEXPECTED;
+  }
+
+  return rv;
+}
+
+nsresult nsParser::OnStopRequest(nsIRequest* request, nsresult status) {
+  if (mInternalState == NS_ERROR_OUT_OF_MEMORY) {
+    return mInternalState;
+  }
+
+  nsresult rv = NS_OK;
+
+  mStreamStatus = status;
+
+  if (status == NS_BINDING_ABORTED) {
+    return Terminate();
+  }
+
+  if (IsScriptExecuting()) {
+    mOnStopPending = true;
+    ContinueParsingDocumentAfterCurrentScript();
+    return rv;
+  }
+
+  if (!mProcessingNetworkData && NS_SUCCEEDED(rv)) {
+    if (mParserContext->mRequest == request) {
+      mParserContext->mStreamListenerState = eOnStop;
+      mParserContext->mScanner.SetIncremental(false);
+    }
+    mProcessingNetworkData = true;
+    if (mSink) {
+      mSink->WillParse();
+    }
+    rv = ResumeParse(true, true);
+    mProcessingNetworkData = false;
+  } else {
+    mOnStopPending = true;
+  }
+
+
+  return rv;
+}
+
+nsIStreamListener* nsParser::GetStreamListener() { return this; }

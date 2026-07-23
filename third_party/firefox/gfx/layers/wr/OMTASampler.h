@@ -1,0 +1,105 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_OMTASampler_h
+#define mozilla_layers_OMTASampler_h
+
+#include <unordered_map>
+#include <queue>
+
+#include "base/platform_thread.h"           // for PlatformThreadId
+#include "mozilla/layers/OMTAController.h"  // for OMTAController
+#include "mozilla/Atomics.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/StaticMutex.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/webrender/WebRenderTypes.h"  // For WrWindowId, WrEpoch, etc.
+
+namespace mozilla {
+
+class TimeStamp;
+
+namespace wr {
+struct Transaction;
+class TransactionWrapper;
+}  
+
+namespace layers {
+class Animation;
+class CompositorAnimationStorage;
+class OMTAValue;
+struct CompositorAnimationIdsForEpoch;
+struct LayersId;
+struct WrAnimations;
+
+class OMTASampler final {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(OMTASampler)
+
+ public:
+  OMTASampler(const RefPtr<CompositorAnimationStorage>& aAnimStorage,
+              LayersId aRootLayersId);
+
+  void Destroy();
+
+  void SetWebRenderWindowId(const wr::WrWindowId& aWindowId);
+
+  static void SetSamplerThread(const wr::WrWindowId& aWindowId);
+
+  static void Sample(const wr::WrWindowId& aWindowId, wr::Transaction* aTxn);
+
+  void Sample(wr::TransactionWrapper& aTxn);
+
+  void SetSampleTime(const TimeStamp& aSampleTime);
+  void ResetPreviousSampleTime();
+  void SetAnimations(uint64_t aId, const LayersId& aLayersId,
+                     const nsTArray<layers::Animation>& aAnimations);
+  bool HasAnimations() const;
+
+  void ClearActiveAnimations(
+      std::unordered_map<uint64_t, wr::Epoch>& aActiveAnimations);
+  void RemoveEpochDataPriorTo(
+      std::queue<CompositorAnimationIdsForEpoch>& aCompositorAnimationsToDelete,
+      std::unordered_map<uint64_t, wr::Epoch>& aActiveAnimations,
+      const wr::Epoch& aRenderedEpoch);
+
+  OMTAValue GetOMTAValue(const uint64_t& aId) const;
+  void SampleForTesting(const Maybe<TimeStamp>& aTestingSampleTime);
+
+  bool IsSamplerThread() const;
+
+  void EnterTestMode() { mIsInTestMode = true; }
+  void LeaveTestMode() { mIsInTestMode = false; }
+
+ protected:
+  ~OMTASampler() = default;
+
+  static already_AddRefed<OMTASampler> GetSampler(
+      const wr::WrWindowId& aWindowId);
+
+ private:
+  WrAnimations SampleAnimations(const TimeStamp& aPreviousSampleTime,
+                                const TimeStamp& aSampleTime);
+
+  RefPtr<OMTAController> mController;
+  RefPtr<CompositorAnimationStorage> mAnimStorage;
+  mutable Mutex mStorageLock MOZ_UNANNOTATED;
+
+  static StaticMutex sWindowIdLock MOZ_UNANNOTATED;
+  static StaticAutoPtr<std::unordered_map<uint64_t, RefPtr<OMTASampler>>>
+      sWindowIdMap;
+  Maybe<wr::WrWindowId> mWindowId;
+
+  mutable Mutex mThreadIdLock MOZ_UNANNOTATED;
+  Maybe<PlatformThreadId> mSamplerThreadId;
+
+  Mutex mSampleTimeLock MOZ_UNANNOTATED;
+  TimeStamp mSampleTime;
+  TimeStamp mPreviousSampleTime;
+  Atomic<bool> mIsInTestMode;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_OMTASampler_h

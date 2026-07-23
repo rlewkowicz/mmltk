@@ -1,0 +1,117 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef AudioParamTimeline_h_
+#define AudioParamTimeline_h_
+
+#include "AudioEventTimeline.h"
+#include "AudioNodeTrack.h"
+#include "AudioSegment.h"
+
+namespace mozilla::dom {
+
+struct AudioParamEvent final : public AudioTimelineEvent {
+  AudioParamEvent(Type aType, double aTime, float aValue,
+                  double aTimeConstant = 0.0)
+      : AudioTimelineEvent(aType, aTime, aValue, aTimeConstant) {}
+  AudioParamEvent(Type aType, const nsTArray<float>& aValues, double aStartTime,
+                  double aDuration)
+      : AudioTimelineEvent(aType, aValues, aStartTime, aDuration) {}
+  explicit AudioParamEvent(AudioNodeTrack* aTrack)
+      : AudioTimelineEvent(Track, 0.0, 0.f), mTrack(aTrack) {}
+
+  RefPtr<AudioNodeTrack> mTrack;
+};
+
+class AudioParamTimeline : public AudioEventTimeline {
+  typedef AudioEventTimeline BaseClass;
+
+ public:
+  explicit AudioParamTimeline(float aDefaultValue) : BaseClass(aDefaultValue) {}
+
+  AudioNodeTrack* Track() const { return mTrack; }
+
+  bool HasSimpleValue() const {
+    return BaseClass::HasSimpleValue() &&
+           (!mTrack || mTrack->LastChunks()[0].IsNull());
+  }
+
+  template <class TimeType>
+  float GetValueAtTime(TimeType aTime);
+
+  float GetComplexValueAtTime(int64_t aTime);
+  float GetComplexValueAtTime(double aTime) = delete;
+
+  template <typename TimeType>
+  void InsertEvent(const AudioParamEvent& aEvent) {
+    if (aEvent.mType == AudioTimelineEvent::Cancel) {
+      CancelScheduledValues(aEvent.Time<TimeType>());
+      return;
+    }
+    if (aEvent.mType == AudioTimelineEvent::Track) {
+      mTrack = aEvent.mTrack;
+      return;
+    }
+    AudioEventTimeline::InsertEvent<TimeType>(aEvent);
+  }
+
+  void GetValuesAtTime(int64_t aTime, float* aBuffer, const size_t aSize);
+  void GetValuesAtTime(double aTime, float* aBuffer,
+                       const size_t aSize) = delete;
+
+  virtual size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+    return mTrack ? mTrack->SizeOfIncludingThis(aMallocSizeOf) : 0;
+  }
+
+  virtual size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+ private:
+  float AudioNodeInputValue(size_t aCounter) const;
+
+ protected:
+  RefPtr<AudioNodeTrack> mTrack;
+};
+
+template <>
+inline float AudioParamTimeline::GetValueAtTime(double aTime) {
+  return BaseClass::GetValueAtTime(aTime);
+}
+
+template <>
+inline float AudioParamTimeline::GetValueAtTime(int64_t aTime) {
+  MOZ_ASSERT(aTime % WEBAUDIO_BLOCK_SIZE == 0);
+  if (HasSimpleValue()) {
+    return GetValue();
+  }
+  return GetComplexValueAtTime(aTime);
+}
+
+inline float AudioParamTimeline::GetComplexValueAtTime(int64_t aTime) {
+  MOZ_ASSERT(aTime % WEBAUDIO_BLOCK_SIZE == 0);
+
+  return BaseClass::GetValueAtTime(aTime) +
+         (mTrack ? AudioNodeInputValue(0) : 0.0f);
+}
+
+inline void AudioParamTimeline::GetValuesAtTime(int64_t aTime, float* aBuffer,
+                                                const size_t aSize) {
+  MOZ_ASSERT(aBuffer);
+  MOZ_ASSERT(aSize <= WEBAUDIO_BLOCK_SIZE);
+  MOZ_ASSERT(aSize == 1 || !HasSimpleValue());
+
+  BaseClass::GetValuesAtTime(aTime, aBuffer, aSize);
+  if (mTrack) {
+    uint32_t blockOffset = aTime % WEBAUDIO_BLOCK_SIZE;
+    MOZ_ASSERT(blockOffset + aSize <= WEBAUDIO_BLOCK_SIZE);
+    for (size_t i = 0; i < aSize; ++i) {
+      aBuffer[i] += AudioNodeInputValue(blockOffset + i);
+    }
+  }
+}
+
+}  
+
+#endif

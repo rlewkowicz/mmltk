@@ -1,0 +1,22 @@
+
+[package]
+name = "mime_guess"
+version = "2.0.4"
+authors = ["Austin Bonander <austin.bonander@gmail.com>"]
+description = "A simple crate for detection of a file's MIME type by its extension."
+documentation = "https://docs.rs/mime_guess/"
+keywords = ["mime", "filesystem", "extension"]
+license = "MIT"
+repository = "https://github.com/abonander/mime_guess"
+
+[dependencies.mime]
+version = "0.3"
+
+[dependencies.unicase]
+version = "2.4.0"
+[build-dependencies.unicase]
+version = "2.4.0"
+
+[features]
+default = ["rev-mappings"]
+rev-mappings = []

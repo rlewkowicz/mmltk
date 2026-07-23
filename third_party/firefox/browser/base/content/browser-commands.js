@@ -1,0 +1,441 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+"use strict";
+
+var kSkipCacheFlags =
+  Ci.nsIWebNavigation.LOAD_FLAGS_BYPASS_PROXY |
+  Ci.nsIWebNavigation.LOAD_FLAGS_BYPASS_CACHE;
+
+var BrowserCommands = {
+  back(aEvent) {
+    const where = BrowserUtils.whereToOpenLink(aEvent, false, true);
+
+    if (where == "current") {
+      try {
+        gBrowser.goBack();
+      } catch (ex) {}
+    } else {
+      duplicateTabIn(gBrowser.selectedTab, where, -1);
+    }
+  },
+
+  forward(aEvent) {
+    const where = BrowserUtils.whereToOpenLink(aEvent, false, true);
+
+    if (where == "current") {
+      try {
+        gBrowser.goForward();
+      } catch (ex) {}
+    } else {
+      duplicateTabIn(gBrowser.selectedTab, where, 1);
+    }
+  },
+
+  handleBackspace() {
+    switch (Services.prefs.getIntPref("browser.backspace_action")) {
+      case 0:
+        this.back();
+        break;
+      case 1:
+        goDoCommand("cmd_scrollPageUp");
+        break;
+    }
+  },
+
+  handleShiftBackspace() {
+    switch (Services.prefs.getIntPref("browser.backspace_action")) {
+      case 0:
+        this.forward();
+        break;
+      case 1:
+        goDoCommand("cmd_scrollPageDown");
+        break;
+    }
+  },
+
+  gotoHistoryIndex(aEvent) {
+    aEvent = BrowserUtils.getRootEvent(aEvent);
+
+    const index = aEvent.target.getAttribute("index");
+    if (!index) {
+      return false;
+    }
+
+    const where = BrowserUtils.whereToOpenLink(aEvent);
+
+    if (where == "current") {
+
+      try {
+        gBrowser.gotoIndex(index);
+      } catch (ex) {
+        return false;
+      }
+      return true;
+    }
+
+    const historyindex = aEvent.target.getAttribute("historyindex");
+    duplicateTabIn(gBrowser.selectedTab, where, Number(historyindex));
+    return true;
+  },
+
+  duplicateTab() {
+    duplicateTabIn(gBrowser.selectedTab, "tab");
+  },
+
+  reloadOrDuplicate(aEvent) {
+    aEvent = BrowserUtils.getRootEvent(aEvent);
+    const accelKeyPressed =
+      AppConstants.platform == "macosx" ? aEvent.metaKey : aEvent.ctrlKey;
+    const backgroundTabModifier = aEvent.button == 1 || accelKeyPressed;
+
+    if (aEvent.shiftKey && !backgroundTabModifier) {
+      this.reloadSkipCache();
+      return;
+    }
+
+    const where = BrowserUtils.whereToOpenLink(aEvent, false, true);
+    if (where == "current") {
+      this.reload();
+    } else {
+      duplicateTabIn(gBrowser.selectedTab, where);
+    }
+  },
+
+  reload() {
+    if (gBrowser.currentURI.schemeIs("view-source")) {
+      this.reloadSkipCache();
+      return;
+    }
+    gBrowser.reloadWithFlags(Ci.nsIWebNavigation.LOAD_FLAGS_NONE);
+  },
+
+  reloadSkipCache() {
+    gBrowser.reloadWithFlags(kSkipCacheFlags);
+  },
+
+  stop() {
+    gBrowser.webNavigation.stop(Ci.nsIWebNavigation.STOP_ALL);
+  },
+
+  home(aEvent) {
+    if (aEvent?.button == 2) {
+      return;
+    }
+
+    const homePage = HomePage.get(window);
+    let where = BrowserUtils.whereToOpenLink(aEvent, false, true);
+
+    if (
+      where == "current" &&
+      (gBrowser?.selectedTab.pinned || gBrowser?.selectedTab.hidden)
+    ) {
+      where = "tab";
+    }
+
+    switch (where) {
+      case "current":
+        if (isInitialPage(homePage)) {
+          gBrowser.selectedBrowser.initialPageLoadedFromUserAction = homePage;
+        }
+        loadOneOrMoreURIs(homePage);
+        if (isBlankPageURL(homePage)) {
+          gURLBar.select();
+        } else {
+          gBrowser.selectedBrowser.focus();
+        }
+        aEvent?.preventDefault();
+        break;
+      case "tabshifted":
+      case "tab": {
+        const urls = homePage.split("|");
+        const loadInBackground = Services.prefs.getBoolPref(
+          "browser.tabs.loadBookmarksInBackground",
+          false
+        );
+        gBrowser.loadTabs(urls, {
+          inBackground: loadInBackground,
+          triggeringPrincipal:
+            Services.scriptSecurityManager.getSystemPrincipal(),
+        });
+        if (!loadInBackground) {
+          if (isBlankPageURL(homePage)) {
+            gURLBar.select();
+          } else {
+            gBrowser.selectedBrowser.focus();
+          }
+        }
+        aEvent?.preventDefault();
+        break;
+      }
+      case "window":
+        OpenBrowserWindow();
+        aEvent?.preventDefault();
+        break;
+    }
+
+  },
+
+  openTab({ event, url } = {}) {
+    let werePassedURL = !!url;
+    url ??= BROWSER_NEW_TAB_URL;
+    let searchClipboard =
+      event?.button == 1 &&
+      Services.prefs.getBoolPref("middlemouse.paste") &&
+      gMiddleClickNewTabUsesPasteboard;
+
+    let relatedToCurrent = false;
+    let where = "tab";
+
+    if (event) {
+      where = BrowserUtils.whereToOpenLink(event, false, true);
+
+      switch (where) {
+        case "tab":
+        case "tabshifted":
+          relatedToCurrent = true;
+          break;
+        case "current":
+          where = "tab";
+          break;
+      }
+    }
+
+    let options = { relatedToCurrent };
+    if (!werePassedURL && searchClipboard) {
+      let clipboard = readFromClipboard();
+      clipboard = UrlbarUtils.stripUnsafeProtocolOnPaste(clipboard).trim();
+      if (clipboard) {
+        url = clipboard;
+        options.allowThirdPartyFixup = true;
+      }
+    }
+    openTrustedLinkIn(url, where, options);
+  },
+
+  openFileWindow() {
+    if (window.location.href != AppConstants.BROWSER_CHROME_URL) {
+      let targetWin = URILoadingHelper.getTargetWindow(window);
+      if (targetWin) {
+        targetWin.focus();
+        targetWin.BrowserCommands.openFileWindow();
+        return;
+      }
+      let newWin = window.openDialog(
+        AppConstants.BROWSER_CHROME_URL,
+        "_blank",
+        "chrome,all,dialog=no",
+        "about:blank"
+      );
+      newWin.addEventListener(
+        "load",
+        () => {
+          newWin.focus();
+          newWin.BrowserCommands.openFileWindow();
+        },
+        { once: true }
+      );
+      return;
+    }
+
+    try {
+      const nsIFilePicker = Ci.nsIFilePicker;
+      const fp = Cc["@mozilla.org/filepicker;1"].createInstance(nsIFilePicker);
+      const fpCallback = function fpCallback_done(aResult) {
+        if (aResult == nsIFilePicker.returnOK) {
+          try {
+            if (fp.file) {
+              gLastOpenDirectory.path = fp.file.parent.QueryInterface(
+                Ci.nsIFile
+              );
+            }
+          } catch (ex) {}
+          openTrustedLinkIn(fp.fileURL.spec, "current");
+        }
+      };
+
+      fp.init(
+        window.browsingContext,
+        gNavigatorBundle.getString("openFile"),
+        nsIFilePicker.modeOpen
+      );
+      fp.appendFilters(
+        nsIFilePicker.filterAll |
+          nsIFilePicker.filterText |
+          nsIFilePicker.filterImages |
+          nsIFilePicker.filterXML |
+          nsIFilePicker.filterHTML
+      );
+      fp.displayDirectory = gLastOpenDirectory.path;
+      fp.open(fpCallback);
+    } catch (ex) {}
+  },
+
+  closeTabOrWindow(event) {
+    if (window.location.href != AppConstants.BROWSER_CHROME_URL) {
+      closeWindow(true);
+      return;
+    }
+
+    if (gBrowser.multiSelectedTabsCount) {
+      let excludePinnedTabs =
+        event && (event.ctrlKey || event.metaKey || event.altKey);
+      gBrowser.removeMultiSelectedTabs({
+        excludePinnedTabs,
+      });
+      return;
+    }
+
+    if (
+      event &&
+      (event.ctrlKey || event.metaKey || event.altKey) &&
+      gBrowser.selectedTab.pinned
+    ) {
+      if (gBrowser.visibleTabs.length > gBrowser.pinnedTabCount) {
+        gBrowser.tabContainer.selectedIndex = gBrowser.pinnedTabCount;
+      }
+      return;
+    }
+
+    gBrowser.removeCurrentTab({ animate: true });
+  },
+
+  tryToCloseWindow(event) {
+    if (WindowIsClosing(event)) {
+      window.close();
+    } 
+  },
+
+  returnToOpenerFromPiP(event) {
+    const openerBC = gBrowser.selectedBrowser.browsingContext.opener;
+    const openerBrowser = openerBC.embedderElement;
+    const openerWindow = openerBrowser.documentGlobal;
+    const openerTab = openerWindow.gBrowser.getTabForBrowser(openerBrowser);
+    openerWindow.gBrowser.selectedTab = openerTab;
+    openerWindow.focus();
+
+    this.tryToCloseWindow(event);
+  },
+
+  async viewSourceOfDocument(args) {
+    if (Services.prefs.getBoolPref("view_source.editor.external")) {
+      try {
+        await top.gViewSourceUtils.openInExternalEditor(args);
+        return;
+      } catch (data) {}
+    }
+
+    let tabBrowser = gBrowser;
+    let preferredRemoteType;
+    let initialBrowsingContextGroupId;
+    if (args.browser) {
+      preferredRemoteType = args.browser.remoteType;
+      initialBrowsingContextGroupId = args.browser.browsingContext.group.id;
+    } else {
+      if (!tabBrowser) {
+        throw new Error(
+          "viewSourceOfDocument should be passed the " +
+            "subject browser if called from a window without " +
+            "gBrowser defined."
+        );
+      }
+      preferredRemoteType = ChromeUtils.predictRemoteTypeForURI(args.URL, {
+        window,
+      });
+    }
+
+    if (!tabBrowser || !window.toolbar.visible) {
+      const browserWindow =
+        BrowserWindowTracker.getTopWindow() ??
+        (await BrowserWindowTracker.promiseOpenWindow());
+      tabBrowser = browserWindow.gBrowser;
+    }
+
+    const inNewWindow = !Services.prefs.getBoolPref("view_source.tab");
+
+    const tab = tabBrowser.addTab("about:blank", {
+      relatedToCurrent: true,
+      inBackground: inNewWindow,
+      skipAnimation: inNewWindow,
+      preferredRemoteType,
+      initialBrowsingContextGroupId,
+      triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
+      skipLoad: true,
+    });
+    args.viewSourceBrowser = tabBrowser.getBrowserForTab(tab);
+    top.gViewSourceUtils.viewSourceInBrowser(args);
+
+    if (inNewWindow) {
+      tabBrowser.hideTab(tab);
+      tabBrowser.replaceTabWithWindow(tab);
+    }
+  },
+
+  viewSource(browser) {
+    this.viewSourceOfDocument({
+      browser,
+      outerWindowID: browser.outerWindowID,
+      URL: browser.currentURI.spec,
+    });
+  },
+
+  pageInfo(documentURL, initialTab, imageElement, browsingContext, browser) {
+    const args = { initialTab, imageElement, browsingContext, browser };
+
+    documentURL =
+      documentURL || window.gBrowser.selectedBrowser.currentURI.spec;
+
+    const isPrivate = PrivateBrowsingUtils.isWindowPrivate(window);
+
+    for (const currentWindow of Services.wm.getEnumerator(
+      "Browser:page-info"
+    )) {
+      if (currentWindow.closed) {
+        continue;
+      }
+      if (
+        currentWindow.document.documentElement.getAttribute("relatedUrl") ==
+          documentURL &&
+        PrivateBrowsingUtils.isWindowPrivate(currentWindow) == isPrivate
+      ) {
+        currentWindow.focus();
+        currentWindow.resetPageInfo(args);
+        return currentWindow;
+      }
+    }
+
+    let options = "chrome,toolbar,dialog=no,resizable";
+
+    if (isPrivate) {
+      options += ",private";
+    }
+    return openDialog(
+      "chrome://browser/content/pageinfo/pageInfo.xhtml",
+      "",
+      options,
+      args
+    );
+  },
+
+  fullScreen() {
+    window.fullScreen = !window.fullScreen || BrowserHandler.kiosk;
+  },
+
+  downloadsUI() {
+    if (PrivateBrowsingUtils.isWindowPrivate(window)) {
+      openTrustedLinkIn("about:downloads", "tab");
+    } else {
+      PlacesCommandHook.showPlacesOrganizer("Downloads");
+    }
+  },
+
+  forceEncodingDetection() {
+    gBrowser.selectedBrowser.forceEncodingDetection();
+    gBrowser.reloadWithFlags(Ci.nsIWebNavigation.LOAD_FLAGS_CHARSET_CHANGE);
+  },
+
+  processCloseRequest() {
+    gBrowser.selectedBrowser.processCloseRequest();
+  },
+};

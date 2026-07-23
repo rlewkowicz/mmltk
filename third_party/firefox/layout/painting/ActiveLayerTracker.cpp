@@ -1,0 +1,347 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ActiveLayerTracker.h"
+
+#include "gfx2DGlue.h"
+#include "mozilla/AnimationUtils.h"
+#include "mozilla/EffectSet.h"
+#include "mozilla/MotionPathUtils.h"
+#include "mozilla/PodOperations.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/gfx/Matrix.h"
+#include "mozilla/gfx/gfxVars.h"
+#include "nsAnimationManager.h"
+#include "nsContainerFrame.h"
+#include "nsDOMCSSDeclaration.h"
+#include "nsDisplayList.h"
+#include "nsExpirationTracker.h"
+#include "nsIContent.h"
+#include "nsLayoutUtils.h"
+#include "nsPIDOMWindow.h"
+#include "nsRefreshDriver.h"
+#include "nsStyleTransformMatrix.h"
+#include "nsTransitionManager.h"
+
+namespace mozilla {
+
+using namespace gfx;
+
+class LayerActivity {
+ public:
+  enum ActivityIndex {
+    ACTIVITY_OPACITY,
+    ACTIVITY_TRANSFORM,
+
+    ACTIVITY_SCALE,
+    ACTIVITY_TRIGGERED_REPAINT,
+
+    ACTIVITY_COUNT
+  };
+
+  explicit LayerActivity(nsIFrame* aFrame) : mFrame(aFrame), mContent(nullptr) {
+    PodArrayZero(mRestyleCounts);
+  }
+  ~LayerActivity();
+  nsExpirationState* GetExpirationState() { return &mState; }
+  uint8_t& RestyleCountForProperty(NonCustomCSSPropertyId aProperty) {
+    return mRestyleCounts[GetActivityIndexForProperty(aProperty)];
+  }
+
+  static ActivityIndex GetActivityIndexForProperty(
+      NonCustomCSSPropertyId aProperty) {
+    switch (aProperty) {
+      case eCSSProperty_opacity:
+        return ACTIVITY_OPACITY;
+      case eCSSProperty_transform:
+      case eCSSProperty_translate:
+      case eCSSProperty_rotate:
+      case eCSSProperty_scale:
+      case eCSSProperty_offset_path:
+      case eCSSProperty_offset_distance:
+      case eCSSProperty_offset_rotate:
+      case eCSSProperty_offset_anchor:
+      case eCSSProperty_offset_position:
+        return ACTIVITY_TRANSFORM;
+      default:
+        MOZ_ASSERT(false);
+        return ACTIVITY_OPACITY;
+    }
+  }
+
+  static ActivityIndex GetActivityIndexForPropertySet(
+      const nsCSSPropertyIDSet& aPropertySet) {
+    if (aPropertySet.IsSubsetOf(
+            nsCSSPropertyIDSet::TransformLikeProperties())) {
+      return ACTIVITY_TRANSFORM;
+    }
+    MOZ_ASSERT(
+        aPropertySet.IsSubsetOf(nsCSSPropertyIDSet::OpacityProperties()));
+    return ACTIVITY_OPACITY;
+  }
+
+  nsIFrame* mFrame;
+  nsIContent* mContent;
+
+  nsExpirationState mState;
+
+  Maybe<MatrixScales> mPreviousTransformScale;
+
+  uint8_t mRestyleCounts[ACTIVITY_COUNT];
+};
+
+class LayerActivityTracker final
+    : public nsExpirationTracker<LayerActivity, 4> {
+ public:
+  enum { GENERATION_MS = 100 };
+
+  explicit LayerActivityTracker(nsIEventTarget* aEventTarget)
+      : nsExpirationTracker<LayerActivity, 4>(
+            GENERATION_MS, "LayerActivityTracker"_ns, aEventTarget) {}
+  ~LayerActivityTracker() override { AgeAllGenerations(); }
+
+  void NotifyExpired(LayerActivity* aObject) override;
+};
+
+static StaticAutoPtr<LayerActivityTracker> gLayerActivityTracker;
+
+LayerActivity::~LayerActivity() {
+  if (mFrame || mContent) {
+    NS_ASSERTION(gLayerActivityTracker, "Should still have a tracker");
+    gLayerActivityTracker->RemoveObject(this);
+  }
+}
+
+NS_DECLARE_FRAME_PROPERTY_DELETABLE(LayerActivityProperty, LayerActivity)
+
+void LayerActivityTracker::NotifyExpired(LayerActivity* aObject) {
+  RemoveObject(aObject);
+
+  nsIFrame* f = aObject->mFrame;
+  nsIContent* c = aObject->mContent;
+  aObject->mFrame = nullptr;
+  aObject->mContent = nullptr;
+
+  MOZ_ASSERT((f == nullptr) != (c == nullptr),
+             "A LayerActivity object should always have a reference to either "
+             "its frame or its content");
+
+  if (f) {
+    f->RemoveStateBits(NS_FRAME_HAS_LAYER_ACTIVITY_PROPERTY);
+    f->RemoveProperty(LayerActivityProperty());
+  } else {
+    c->RemoveProperty(nsGkAtoms::LayerActivity);
+  }
+}
+
+static LayerActivity* GetLayerActivity(nsIFrame* aFrame) {
+  if (!aFrame->HasAnyStateBits(NS_FRAME_HAS_LAYER_ACTIVITY_PROPERTY)) {
+    return nullptr;
+  }
+  return aFrame->GetProperty(LayerActivityProperty());
+}
+
+static LayerActivity* GetLayerActivityForUpdate(nsIFrame* aFrame) {
+  LayerActivity* layerActivity = GetLayerActivity(aFrame);
+  if (layerActivity) {
+    gLayerActivityTracker->MarkUsed(layerActivity);
+  } else {
+    if (!gLayerActivityTracker) {
+      gLayerActivityTracker =
+          new LayerActivityTracker(GetMainThreadSerialEventTarget());
+    }
+    layerActivity = new LayerActivity(aFrame);
+    gLayerActivityTracker->AddObject(layerActivity);
+    aFrame->AddStateBits(NS_FRAME_HAS_LAYER_ACTIVITY_PROPERTY);
+    aFrame->SetProperty(LayerActivityProperty(), layerActivity);
+  }
+  return layerActivity;
+}
+
+static void IncrementMutationCount(uint8_t* aCount) {
+  *aCount = uint8_t(std::min(0xFF, *aCount + 1));
+}
+
+void ActiveLayerTracker::TransferActivityToContent(nsIFrame* aFrame,
+                                                   nsIContent* aContent) {
+  if (!aFrame->HasAnyStateBits(NS_FRAME_HAS_LAYER_ACTIVITY_PROPERTY)) {
+    return;
+  }
+  LayerActivity* layerActivity = aFrame->TakeProperty(LayerActivityProperty());
+  aFrame->RemoveStateBits(NS_FRAME_HAS_LAYER_ACTIVITY_PROPERTY);
+  if (!layerActivity) {
+    return;
+  }
+  layerActivity->mFrame = nullptr;
+  layerActivity->mContent = aContent;
+  aContent->SetProperty(nsGkAtoms::LayerActivity, layerActivity,
+                        nsINode::DeleteProperty<LayerActivity>, true);
+}
+
+void ActiveLayerTracker::TransferActivityToFrame(nsIContent* aContent,
+                                                 nsIFrame* aFrame) {
+  auto* layerActivity = static_cast<LayerActivity*>(
+      aContent->TakeProperty(nsGkAtoms::LayerActivity));
+  if (!layerActivity) {
+    return;
+  }
+  layerActivity->mContent = nullptr;
+  layerActivity->mFrame = aFrame;
+  aFrame->AddStateBits(NS_FRAME_HAS_LAYER_ACTIVITY_PROPERTY);
+  aFrame->SetProperty(LayerActivityProperty(), layerActivity);
+}
+
+static void IncrementScaleRestyleCountIfNeeded(nsIFrame* aFrame,
+                                               LayerActivity* aActivity) {
+
+  Matrix parentsChildrenOnlyTransform;
+  const bool parentHasChildrenOnlyTransform =
+      aFrame->GetParentSVGTransforms(&parentsChildrenOnlyTransform);
+
+  const nsStyleDisplay* display = aFrame->StyleDisplay();
+  if (!aFrame->HasAnyStateBits(NS_FRAME_MAY_BE_TRANSFORMED) ||
+      (!display->HasTransformProperty() && !display->HasIndividualTransform() &&
+       display->mOffsetPath.IsNone() && !parentHasChildrenOnlyTransform)) {
+    if (aActivity->mPreviousTransformScale.isSome()) {
+      aActivity->mPreviousTransformScale = Nothing();
+      IncrementMutationCount(
+          &aActivity->mRestyleCounts[LayerActivity::ACTIVITY_SCALE]);
+    }
+
+    return;
+  }
+
+  Matrix4x4 transform;
+  if (aFrame->IsCSSTransformed()) {
+    nsStyleTransformMatrix::TransformReferenceBox refBox(aFrame);
+    transform = nsStyleTransformMatrix::ReadTransforms(
+        display->mTranslate, display->mRotate, display->mScale, nullptr,
+        display->mTransform, refBox, AppUnitsPerCSSPixel(),
+        aFrame->Style()->EffectiveZoom());
+  }
+
+  if (parentHasChildrenOnlyTransform) {
+    transform *= Matrix4x4::From2D(parentsChildrenOnlyTransform);
+  }
+
+  Matrix transform2D;
+  if (!transform.Is2D(&transform2D)) {
+    aActivity->mPreviousTransformScale = Nothing();
+    IncrementMutationCount(
+        &aActivity->mRestyleCounts[LayerActivity::ACTIVITY_SCALE]);
+    return;
+  }
+
+  MatrixScales scale = transform2D.ScaleFactors();
+  if (aActivity->mPreviousTransformScale == Some(scale)) {
+    return;  
+  }
+
+  aActivity->mPreviousTransformScale = Some(scale);
+  IncrementMutationCount(
+      &aActivity->mRestyleCounts[LayerActivity::ACTIVITY_SCALE]);
+}
+
+void ActiveLayerTracker::NotifyRestyle(nsIFrame* aFrame,
+                                       NonCustomCSSPropertyId aProperty) {
+  LayerActivity* layerActivity = GetLayerActivityForUpdate(aFrame);
+  uint8_t& mutationCount = layerActivity->RestyleCountForProperty(aProperty);
+  IncrementMutationCount(&mutationCount);
+
+  if (nsCSSPropertyIDSet::TransformLikeProperties().HasProperty(aProperty)) {
+    IncrementScaleRestyleCountIfNeeded(aFrame, layerActivity);
+  }
+}
+
+static bool IsPresContextInScriptAnimationCallback(
+    nsPresContext* aPresContext) {
+  if (aPresContext->RefreshDriver()->IsInRefresh()) {
+    return true;
+  }
+  nsGlobalWindowInner* win =
+      nsGlobalWindowInner::Cast(aPresContext->Document()->GetInnerWindow());
+  return win && win->IsRunningTimeout();
+}
+
+void ActiveLayerTracker::NotifyInlineStyleRuleModified(
+    nsIFrame* aFrame, NonCustomCSSPropertyId aProperty) {
+  if (IsPresContextInScriptAnimationCallback(aFrame->PresContext())) {
+    LayerActivity* layerActivity = GetLayerActivityForUpdate(aFrame);
+    layerActivity->RestyleCountForProperty(aProperty) = 0xff;
+  }
+}
+
+void ActiveLayerTracker::NotifyNeedsRepaint(nsIFrame* aFrame) {
+  LayerActivity* layerActivity = GetLayerActivityForUpdate(aFrame);
+  if (IsPresContextInScriptAnimationCallback(aFrame->PresContext())) {
+    layerActivity->mRestyleCounts[LayerActivity::ACTIVITY_TRIGGERED_REPAINT] =
+        0xFF;
+  } else {
+    IncrementMutationCount(
+        &layerActivity
+             ->mRestyleCounts[LayerActivity::ACTIVITY_TRIGGERED_REPAINT]);
+  }
+}
+
+static bool IsStyleAnimated(nsIFrame* aFrame,
+                            const nsCSSPropertyIDSet& aPropertySet) {
+  MOZ_ASSERT(
+      aPropertySet.IsSubsetOf(nsCSSPropertyIDSet::TransformLikeProperties()) ||
+          aPropertySet.IsSubsetOf(nsCSSPropertyIDSet::OpacityProperties()),
+      "Only subset of opacity or transform-like properties set calls this");
+  const nsCSSPropertyIDSet transformSet =
+      nsCSSPropertyIDSet::TransformLikeProperties();
+
+  if (LayerActivity* layerActivity = GetLayerActivity(aFrame)) {
+    LayerActivity::ActivityIndex activityIndex =
+        LayerActivity::GetActivityIndexForPropertySet(aPropertySet);
+    if (layerActivity->mRestyleCounts[activityIndex] >= 2) {
+      if (layerActivity
+                  ->mRestyleCounts[LayerActivity::ACTIVITY_TRIGGERED_REPAINT] <
+              2 ||
+          (aPropertySet.Intersects(transformSet) &&
+           ActiveLayerTracker::IsScaleSubjectToAnimation(aFrame))) {
+        return true;
+      }
+    }
+  }
+
+  if (nsLayoutUtils::HasEffectiveAnimation(aFrame, aPropertySet)) {
+    return true;
+  }
+
+  if (!aPropertySet.Intersects(transformSet) ||
+      !aFrame->Combines3DTransformWithAncestors()) {
+    return false;
+  }
+
+  return IsStyleAnimated(aFrame->GetParent(), aPropertySet);
+}
+
+bool ActiveLayerTracker::IsTransformAnimated(nsIFrame* aFrame) {
+  auto properties = nsCSSPropertyIDSet::CSSTransformProperties();
+  properties.AddProperty(eCSSProperty_offset_path);
+  if (!aFrame->StyleDisplay()->mOffsetPath.IsNone()) {
+    properties |= nsCSSPropertyIDSet::MotionPathProperties();
+  }
+  return IsStyleAnimated(aFrame, properties);
+}
+
+bool ActiveLayerTracker::IsOpacityAnimated(nsIFrame* aFrame) {
+  return IsStyleAnimated(aFrame, nsCSSPropertyIDSet::OpacityProperties());
+}
+
+bool ActiveLayerTracker::IsScaleSubjectToAnimation(nsIFrame* aFrame) {
+  LayerActivity* layerActivity = GetLayerActivity(aFrame);
+  if (layerActivity &&
+      layerActivity->mRestyleCounts[LayerActivity::ACTIVITY_SCALE] >= 2) {
+    return true;
+  }
+  return AnimationUtils::FrameHasAnimatedScale(aFrame);
+}
+
+void ActiveLayerTracker::Shutdown() { gLayerActivityTracker = nullptr; }
+
+}  

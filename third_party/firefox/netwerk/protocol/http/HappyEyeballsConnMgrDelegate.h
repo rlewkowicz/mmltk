@@ -1,0 +1,66 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef HappyEyeballsConnMgrDelegate_h_
+#define HappyEyeballsConnMgrDelegate_h_
+
+#include "nsISupportsImpl.h"
+#include "nsTArray.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/net/DNS.h"
+
+namespace mozilla {
+namespace net {
+
+class ConnectionAttempt;
+class ConnectionEntry;
+class HttpConnectionBase;
+class PendingTransactionInfo;
+class nsAHttpTransaction;
+class nsHttpTransaction;
+
+class HappyEyeballsConnMgrDelegate {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(HappyEyeballsConnMgrDelegate)
+
+  virtual already_AddRefed<PendingTransactionInfo> FindTransaction(
+      bool aRemoveWhenFound, ConnectionEntry* aEntry,
+      nsAHttpTransaction* aTrans) = 0;
+  virtual nsresult DispatchTransaction(ConnectionEntry* aEntry,
+                                       nsHttpTransaction* aTrans,
+                                       HttpConnectionBase* aConn) = 0;
+  virtual void AddTransaction(nsHttpTransaction* aTrans, int32_t aPriority) = 0;
+  virtual void ReportSpdyConnection(HttpConnectionBase* aConn, bool aUsingSpdy,
+                                    bool aDisallowHttp3) = 0;
+  virtual void ReportHttp3Connection(HttpConnectionBase* aConn,
+                                     ConnectionEntry* aEntry) = 0;
+  virtual void ReclaimConnection(HttpConnectionBase* aConn) = 0;
+  virtual void ProcessSpdyPendingQ(ConnectionEntry* aEntry) = 0;
+
+  virtual void InsertIntoActiveConns(ConnectionEntry* aEntry,
+                                     HttpConnectionBase* aConn) = 0;
+  virtual void RemoveConnectionAttempt(ConnectionEntry* aEntry,
+                                       ConnectionAttempt* aAttempt,
+                                       bool aAbandon) = 0;
+  virtual void RecordIPFamilyPreference(ConnectionEntry* aEntry,
+                                        uint16_t aFamily) = 0;
+  virtual void ResetIPFamilyPreference(ConnectionEntry* aEntry) = 0;
+  virtual bool MaybeProcessCoalescingKeys(ConnectionEntry* aEntry,
+                                          const nsTArray<NetAddr>& aAddresses,
+                                          bool aIsHttp3) = 0;
+  virtual bool RemoveTransFromPendingQ(ConnectionEntry* aEntry,
+                                       nsHttpTransaction* aTrans) = 0;
+  virtual nsresult StartRetryWithoutTRR(ConnectionEntry* aEntry,
+                                        nsHttpTransaction* aTrans,
+                                        uint32_t aCaps, bool aSpeculative,
+                                        bool aUrgentStart, bool aAllow1918) = 0;
+
+ protected:
+  virtual ~HappyEyeballsConnMgrDelegate() = default;
+};
+
+}  
+}  
+
+#endif  // HappyEyeballsConnMgrDelegate_h_

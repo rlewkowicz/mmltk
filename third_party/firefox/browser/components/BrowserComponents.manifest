@@ -1,0 +1,110 @@
+# nsBrowserGlue.js
+
+# This component must restrict its registration for the app-startup category
+# to the specific list of apps that use it so it doesn't get loaded in xpcshell.
+# Thus we restrict it to these apps:
+#
+#   browser:        {ec8030f7-c20a-464f-9b0e-13a3a9e97384}
+#   mobile/android: {aa3c5121-dab2-40e2-81ca-7ea25febc110}
+
+category app-startup nsBrowserGlue @mozilla.org/browser/browserglue;1 application={ec8030f7-c20a-464f-9b0e-13a3a9e97384} application={aa3c5121-dab2-40e2-81ca-7ea25febc110}
+
+# Browser global components initializing before UI startup
+category browser-before-ui-startup resource:///modules/sessionstore/SessionStore.sys.mjs SessionStore.init
+category browser-before-ui-startup moz-src:///browser/components/privatebrowsing/ResetPBMPanel.sys.mjs ResetPBMPanel.init
+category browser-before-ui-startup moz-src:///browser/modules/ObserverForwarder.sys.mjs ObserverForwarder.init
+
+# Browser window lifecycle consumers
+category browser-window-before-initial-xul-layout-document-preparation chrome://browser/content/browser-customization.js AutoHideMenubar.init
+
+category browser-window-before-initial-xul-layout moz-src:///browser/themes/ToolbarIconColor.sys.mjs ToolbarIconColor.init
+category browser-window-before-initial-xul-layout chrome://browser/content/browser-customtitlebar.js CustomTitlebar.init
+
+# The two categories below are specific to Tabbrowser creation. For consumers that need to initialize during
+# 'DOMContentLoaded', use 'browser-window-domcontentloaded' instead.
+category browser-window-domcontentloaded-before-tabbrowser resource:///modules/BrowserDOMWindow.sys.mjs BrowserDOMWindow.setupInWindow
+category browser-window-domcontentloaded-tabbrowser chrome://browser/content/tabbrowser/tabbrowser.js Tabbrowser.create
+
+category browser-window-domcontentloaded resource:///modules/BrowserWindowTracker.sys.mjs BrowserWindowTracker.track
+category browser-window-domcontentloaded moz-src:///browser/components/customizableui/CustomizableUI.sys.mjs CustomizableUI.handleNewBrowserWindow
+category browser-window-load-before-sessionstore-init resource:///modules/ZoomUI.sys.mjs ZoomUI.init
+category browser-window-load-before-sessionstore-init chrome://browser/content/downloads/indicator.js DownloadsButton.init
+
+# The category manager uses the entry name (the URL below) as a unique key
+# per category, so consumers sharing the same module need a `#<id>` suffix
+# to avoid overwriting each other. BrowserUtils.callModulesFromCategory
+# strips the suffix before using the URL.
+category browser-window-load chrome://browser/content/browser.js#gUIDensity gUIDensity.init
+category browser-window-load chrome://browser/content/browser.js#CombinedStopReload CombinedStopReload.ensureInitialized
+category browser-window-load moz-src:///browser/modules/PrivateBrowsingUI.sys.mjs PrivateBrowsingUI.init
+category browser-window-load chrome://browser/content/browser-pageActions.js BrowserPageActions.init
+category browser-window-load chrome://browser/content/browser-toolbarKeyNav.js ToolbarKeyboardNavigator.init
+
+category browser-window-delayed-startup resource:///modules/HomePage.sys.mjs HomePage.delayedStartup
+category browser-window-delayed-startup moz-src:///browser/components/search/SearchUIUtils.sys.mjs SearchUIUtils.init
+category browser-window-delayed-startup resource:///modules/ReducedProtectionNotification.sys.mjs ReducedProtectionNotification.observePref
+category browser-window-delayed-startup chrome://browser/content/browser.js#BrowserOffline BrowserOffline.init
+category browser-window-delayed-startup chrome://browser/content/tabbrowser/browser-fullZoom.js FullZoom.init
+category browser-window-delayed-startup chrome://browser/content/customizableui/panelUI.js PanelUI.init
+category browser-window-delayed-startup chrome://browser/content/browser.js#gURLBar gURLBar.delayedStartupInit
+category browser-window-delayed-startup chrome://browser/content/browser-siteProtections.js gProtectionsHandler.init
+category browser-window-delayed-startup chrome://browser/content/browser-trustPanel.js gTrustPanelHandler.init
+category browser-window-delayed-startup chrome://browser/content/tabbrowser/browser-ctrlTab.js ctrlTab.observePref
+# The object handling the downloads indicator is initialized here in the delayed startup function,
+# but the actual indicator element is not loaded unless there are downloads to be displayed.
+category browser-window-delayed-startup chrome://browser/content/downloads/indicator.js DownloadsButton.initializeIndicator
+category browser-window-delayed-startup chrome://browser/content/browser-fullScreenAndPointerLock.js FullScreen.init
+#ifndef MOZILLA_OFFICIAL
+category browser-window-delayed-startup chrome://browser/content/browser-development-helpers.js DevelopmentHelpers.init
+#endif
+
+# browser-window-sessionstore-initialized is fired from the window's delayed startup once SessionStore is initialized.
+category browser-window-sessionstore-initialized chrome://browser/content/browser.js#gRestoreLastSessionObserver gRestoreLastSessionObserver.init
+
+category browser-window-location-change chrome://browser/content/browser-sitePermissionPanel.js gPermissionPanel.onLocationChange
+category browser-window-location-change chrome://browser/content/browser-siteProtections.js gProtectionsHandler.onLocationChange
+category browser-window-location-change chrome://browser/content/browser-pageActions.js BrowserPageActions.onLocationChange
+
+category browser-window-unload-begin chrome://browser/content/browser-customtitlebar.js CustomTitlebar.uninit
+category browser-window-unload-begin moz-src:///browser/themes/ToolbarIconColor.sys.mjs ToolbarIconColor.uninit
+category browser-window-unload-begin chrome://browser/content/browser.js gUIDensity.uninit
+
+category browser-window-unload chrome://browser/content/downloads/indicator.js DownloadsButton.uninit
+category browser-window-unload chrome://browser/content/browser-toolbarKeyNav.js ToolbarKeyboardNavigator.uninit
+# `#<id>` suffix disambiguates multiple consumers in the same module; see
+# the comment in `browser-window-load` above.
+category browser-window-unload chrome://browser/content/browser.js#CombinedStopReload CombinedStopReload.uninit
+category browser-window-unload chrome://browser/content/browser-fullScreenAndPointerLock.js FullScreen.uninit
+# Teardown for `browser-window-delayed-startup` consumers. Fired only when the
+# window's delayed startup actually ran.
+category browser-window-unload-delayed-startup chrome://browser/content/tabbrowser/browser-ctrlTab.js ctrlTab.stopObservingPref
+category browser-window-unload-delayed-startup chrome://browser/content/browser-siteProtections.js gProtectionsHandler.uninit
+category browser-window-unload-delayed-startup chrome://browser/content/browser-trustPanel.js gTrustPanelHandler.uninit
+category browser-window-unload-delayed-startup chrome://browser/content/tabbrowser/browser-fullZoom.js FullZoom.destroy
+category browser-window-unload-delayed-startup chrome://browser/content/browser.js BrowserOffline.uninit
+category browser-window-unload-delayed-startup chrome://browser/content/customizableui/panelUI.js PanelUI.uninit
+
+# The category below is specific to Tabbrowser destruction. For consumers that need to uninitialize during
+# window unload, use 'browser-window-unload' instead.
+category browser-window-unload-tabbrowser chrome://browser/content/tabbrowser/tabbrowser.js Tabbrowser.destroy
+
+category browser-window-final-unload resource:///modules/BrowserDOMWindow.sys.mjs BrowserDOMWindow.teardownInWindow
+
+# App startup consumers
+
+category browser-first-window-ready resource:///modules/PageActions.sys.mjs PageActions.init
+category browser-first-window-ready moz-src:///browser/components/protections/ContentBlockingPrefs.sys.mjs ContentBlockingPrefs.init
+
+#ifdef MOZ_PLACES
+category browser-idle-startup moz-src:///browser/components/places/PlacesUIUtils.sys.mjs PlacesUIUtils.unblockToolbars
+#endif
+category browser-idle-startup resource://gre/modules/RFPHelper.sys.mjs RFPHelper.init
+category browser-idle-startup moz-src:///browser/components/tabbrowser/TabUnloader.sys.mjs TabUnloader.init
+category browser-idle-startup moz-src:///browser/components/urlbar/UrlbarSearchTermsPersistence.sys.mjs UrlbarSearchTermsPersistence.init
+
+# App shutdown consumers
+category browser-quit-application-granted resource://gre/modules/RFPHelper.sys.mjs RFPHelper.uninit
+category browser-quit-application-granted moz-src:///browser/components/urlbar/UrlbarSearchTermsPersistence.sys.mjs UrlbarSearchTermsPersistence.uninit
+category search-service-notification moz-src:///browser/components/search/SearchUIUtils.sys.mjs SearchUIUtils.showSearchServiceNotification
+
+category browser-newtab-external-component moz-src:///browser/components/search/SearchUIUtils.sys.mjs SearchNewTabComponentsRegistrant

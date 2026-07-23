@@ -1,0 +1,145 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SVGAnimatedPointList.h"
+
+#include <utility>
+
+#include "DOMSVGPointList.h"
+#include "SVGPointListSMILType.h"
+#include "mozilla/SMILValue.h"
+#include "mozilla/dom/SVGElement.h"
+
+using namespace mozilla::dom;
+
+
+namespace mozilla {
+
+nsresult SVGAnimatedPointList::SetBaseValueString(const nsAString& aValue) {
+  SVGPointList newBaseValue;
+
+
+  nsresult rv = newBaseValue.SetValueFromString(aValue);
+
+
+  DOMSVGPointList* baseValWrapper =
+      DOMSVGPointList::GetDOMWrapperIfExists(GetBaseValKey());
+  if (baseValWrapper) {
+    baseValWrapper->InternalListWillChangeTo(newBaseValue);
+  }
+
+  DOMSVGPointList* animValWrapper = nullptr;
+  if (!IsAnimating()) {  
+    animValWrapper = DOMSVGPointList::GetDOMWrapperIfExists(GetAnimValKey());
+    if (animValWrapper) {
+      animValWrapper->InternalListWillChangeTo(newBaseValue);
+    }
+  }
+
+
+
+  mBaseVal.SwapWith(newBaseValue);
+  return rv;
+}
+
+void SVGAnimatedPointList::ClearBaseValue() {
+
+  DOMSVGPointList* baseValWrapper =
+      DOMSVGPointList::GetDOMWrapperIfExists(GetBaseValKey());
+  if (baseValWrapper) {
+    baseValWrapper->InternalListWillChangeTo(SVGPointList());
+  }
+
+  if (!IsAnimating()) {  
+    DOMSVGPointList* animValWrapper =
+        DOMSVGPointList::GetDOMWrapperIfExists(GetAnimValKey());
+    if (animValWrapper) {
+      animValWrapper->InternalListWillChangeTo(SVGPointList());
+    }
+  }
+
+  mBaseVal.Clear();
+}
+
+nsresult SVGAnimatedPointList::SetAnimValue(const SVGPointList& aNewAnimValue,
+                                            SVGElement* aElement) {
+
+
+  DOMSVGPointList* domWrapper =
+      DOMSVGPointList::GetDOMWrapperIfExists(GetAnimValKey());
+  if (domWrapper) {
+    domWrapper->InternalListWillChangeTo(aNewAnimValue);
+  }
+  if (!mAnimVal) {
+    mAnimVal = std::make_unique<SVGPointList>();
+  }
+  nsresult rv = mAnimVal->CopyFrom(aNewAnimValue);
+  if (NS_FAILED(rv)) {
+    ClearAnimValue(aElement);
+    return rv;
+  }
+  aElement->DidAnimatePointList();
+  return NS_OK;
+}
+
+void SVGAnimatedPointList::ClearAnimValue(SVGElement* aElement) {
+
+  DOMSVGPointList* domWrapper =
+      DOMSVGPointList::GetDOMWrapperIfExists(GetAnimValKey());
+  if (domWrapper) {
+    domWrapper->InternalListWillChangeTo(mBaseVal);
+  }
+  mAnimVal = nullptr;
+  aElement->DidAnimatePointList();
+}
+
+std::unique_ptr<SMILAttr> SVGAnimatedPointList::ToSMILAttr(
+    SVGElement* aElement) {
+  return std::make_unique<SMILAnimatedPointList>(this, aElement);
+}
+
+nsresult SVGAnimatedPointList::SMILAnimatedPointList::ValueFromString(
+    const nsAString& aStr, const dom::SVGAnimationElement* ,
+    SMILValue& aValue, bool& aPreventCachingOfSandwich) const {
+  SMILValue val(&SVGPointListSMILType::sSingleton);
+  SVGPointListAndInfo* list = static_cast<SVGPointListAndInfo*>(val.mU.mPtr);
+  nsresult rv = list->SetValueFromString(aStr);
+  if (NS_SUCCEEDED(rv)) {
+    list->SetInfo(mElement);
+    aValue = std::move(val);
+  }
+  return rv;
+}
+
+SMILValue SVGAnimatedPointList::SMILAnimatedPointList::GetBaseValue() const {
+  SMILValue val;
+
+  SMILValue tmp(&SVGPointListSMILType::sSingleton);
+  auto* list = static_cast<SVGPointListAndInfo*>(tmp.mU.mPtr);
+  nsresult rv = list->CopyFrom(mVal->mBaseVal);
+  if (NS_SUCCEEDED(rv)) {
+    list->SetInfo(mElement);
+    std::swap(val, tmp);
+  }
+  return val;
+}
+
+nsresult SVGAnimatedPointList::SMILAnimatedPointList::SetAnimValue(
+    const SMILValue& aValue) {
+  NS_ASSERTION(aValue.mType == &SVGPointListSMILType::sSingleton,
+               "Unexpected type to assign animated value");
+  if (aValue.mType == &SVGPointListSMILType::sSingleton) {
+    mVal->SetAnimValue(*static_cast<SVGPointListAndInfo*>(aValue.mU.mPtr),
+                       mElement);
+  }
+  return NS_OK;
+}
+
+void SVGAnimatedPointList::SMILAnimatedPointList::ClearAnimValue() {
+  if (mVal->mAnimVal) {
+    mVal->ClearAnimValue(mElement);
+  }
+}
+
+}  

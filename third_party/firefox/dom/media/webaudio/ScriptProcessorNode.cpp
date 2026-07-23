@@ -1,0 +1,463 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ScriptProcessorNode.h"
+
+#include <deque>
+
+#include "AudioBuffer.h"
+#include "AudioDestinationNode.h"
+#include "AudioNodeEngine.h"
+#include "AudioNodeTrack.h"
+#include "AudioProcessingEvent.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/PodOperations.h"
+#include "mozilla/dom/ScriptProcessorNodeBinding.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "nsGlobalWindowInner.h"
+
+namespace mozilla::dom {
+
+static const float MAX_LATENCY_S = 0.5;
+
+class SharedBuffers final {
+ private:
+  class OutputQueue final {
+   public:
+    explicit OutputQueue(const char* aName) : mMutex(aName) {}
+
+    size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const
+        MOZ_REQUIRES(mMutex) {
+      mMutex.AssertCurrentThreadOwns();
+
+      size_t amount = 0;
+      for (size_t i = 0; i < mBufferList.size(); i++) {
+        amount += mBufferList[i].SizeOfExcludingThis(aMallocSizeOf, false);
+      }
+
+      return amount;
+    }
+
+    Mutex& Lock() const MOZ_RETURN_CAPABILITY(mMutex) {
+      return const_cast<OutputQueue*>(this)->mMutex;
+    }
+
+    size_t ReadyToConsume() const MOZ_REQUIRES(mMutex) {
+      mMutex.AssertCurrentThreadOwns();
+      return mBufferList.size();
+    }
+
+    AudioChunk& Produce() MOZ_REQUIRES(mMutex) {
+      mMutex.AssertCurrentThreadOwns();
+      MOZ_ASSERT(NS_IsMainThread());
+      mBufferList.push_back(AudioChunk());
+      return mBufferList.back();
+    }
+
+    AudioChunk Consume() MOZ_REQUIRES(mMutex) {
+      mMutex.AssertCurrentThreadOwns();
+      MOZ_ASSERT(!NS_IsMainThread());
+      MOZ_ASSERT(ReadyToConsume() > 0);
+      AudioChunk front = mBufferList.front();
+      mBufferList.pop_front();
+      return front;
+    }
+
+    void Clear() MOZ_REQUIRES(mMutex) {
+      mMutex.AssertCurrentThreadOwns();
+      mBufferList.clear();
+    }
+
+   private:
+    typedef std::deque<AudioChunk> BufferList;
+
+    Mutex mMutex MOZ_UNANNOTATED;
+    BufferList mBufferList;
+  };
+
+ public:
+  explicit SharedBuffers(float aSampleRate)
+      : mOutputQueue("SharedBuffers::outputQueue"),
+        mDelaySoFar(TRACK_TIME_MAX),
+        mSampleRate(aSampleRate),
+        mLatency(0.0),
+        mDroppingBuffers(false) {}
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+    size_t amount = aMallocSizeOf(this);
+
+    {
+      MutexAutoLock lock(mOutputQueue.Lock());
+      amount += mOutputQueue.SizeOfExcludingThis(aMallocSizeOf);
+    }
+
+    return amount;
+  }
+
+
+  void NotifyNodeIsConnected(bool aIsConnected) {
+    MOZ_ASSERT(NS_IsMainThread());
+    if (!aIsConnected) {
+      mLatency = 0.0f;
+      mLastEventTime = TimeStamp();
+      mDroppingBuffers = false;
+    }
+    mNodeIsConnected = aIsConnected;
+  }
+
+  void FinishProducingOutputBuffer(const AudioChunk& aBuffer) {
+    MOZ_ASSERT(NS_IsMainThread());
+
+    if (!mNodeIsConnected) {
+      return;
+    }
+
+    TimeStamp now = TimeStamp::Now();
+
+    if (mLastEventTime.IsNull()) {
+      mLastEventTime = now;
+    } else {
+      float latency = (now - mLastEventTime).ToSeconds();
+      float bufferDuration = aBuffer.mDuration / mSampleRate;
+      mLatency += latency - bufferDuration;
+      mLastEventTime = now;
+      if (fabs(mLatency) > MAX_LATENCY_S) {
+        mDroppingBuffers = true;
+      }
+    }
+
+    MutexAutoLock lock(mOutputQueue.Lock());
+    if (mDroppingBuffers) {
+      if (mOutputQueue.ReadyToConsume()) {
+        return;
+      }
+      mDroppingBuffers = false;
+      mLatency = 0;
+    }
+
+    for (uint32_t offset = 0; offset < aBuffer.mDuration;
+         offset += WEBAUDIO_BLOCK_SIZE) {
+      AudioChunk& chunk = mOutputQueue.Produce();
+      chunk = aBuffer;
+      chunk.SliceTo(offset, offset + WEBAUDIO_BLOCK_SIZE);
+    }
+  }
+
+
+  AudioChunk GetOutputBuffer() {
+    MOZ_ASSERT(!NS_IsMainThread());
+    AudioChunk buffer;
+
+    {
+      MutexAutoLock lock(mOutputQueue.Lock());
+      if (mOutputQueue.ReadyToConsume() > 0) {
+        if (mDelaySoFar == TRACK_TIME_MAX) {
+          mDelaySoFar = 0;
+        }
+        buffer = mOutputQueue.Consume();
+      } else {
+        buffer.SetNull(WEBAUDIO_BLOCK_SIZE);
+        if (mDelaySoFar != TRACK_TIME_MAX) {
+          mDelaySoFar += WEBAUDIO_BLOCK_SIZE;
+        }
+      }
+    }
+
+    return buffer;
+  }
+
+  TrackTime DelaySoFar() const {
+    MOZ_ASSERT(!NS_IsMainThread());
+    return mDelaySoFar == TRACK_TIME_MAX ? 0 : mDelaySoFar;
+  }
+
+  void Flush() {
+    MOZ_ASSERT(!NS_IsMainThread());
+    mDelaySoFar = TRACK_TIME_MAX;
+    {
+      MutexAutoLock lock(mOutputQueue.Lock());
+      mOutputQueue.Clear();
+    }
+  }
+
+ private:
+  OutputQueue mOutputQueue;
+  TrackTime mDelaySoFar;
+  const float mSampleRate;
+  float mLatency;
+  TimeStamp mLastEventTime;
+  bool mDroppingBuffers;
+  bool mNodeIsConnected = false;
+};
+
+class ScriptProcessorNodeEngine final : public AudioNodeEngine {
+ public:
+  ScriptProcessorNodeEngine(ScriptProcessorNode* aNode,
+                            AudioDestinationNode* aDestination,
+                            uint32_t aBufferSize,
+                            uint32_t aNumberOfInputChannels)
+      : AudioNodeEngine(aNode),
+        mDestination(aDestination->Track()),
+        mSharedBuffers(new SharedBuffers(mDestination->mSampleRate)),
+        mBufferSize(aBufferSize),
+        mInputChannelCount(aNumberOfInputChannels),
+        mInputWriteIndex(0) {}
+
+  SharedBuffers* GetSharedBuffers() const { return mSharedBuffers.get(); }
+
+  enum {
+    IS_CONNECTED,
+  };
+
+  void SetInt32Parameter(uint32_t aIndex, int32_t aParam) override {
+    switch (aIndex) {
+      case IS_CONNECTED:
+        mIsConnected = aParam;
+        break;
+      default:
+        NS_ERROR("Bad Int32Parameter");
+    }  
+  }
+
+  void ProcessBlock(AudioNodeTrack* aTrack, GraphTime aFrom,
+                    const AudioBlock& aInput, AudioBlock* aOutput,
+                    bool* aFinished) override {
+
+    if (!mIsConnected) {
+      aOutput->SetNull(WEBAUDIO_BLOCK_SIZE);
+      mSharedBuffers->Flush();
+      mInputWriteIndex = 0;
+      return;
+    }
+
+    if (!aInput.IsNull() && !mInputBuffer) {
+      mInputBuffer = ThreadSharedFloatArrayBufferList::Create(
+          mInputChannelCount, mBufferSize, fallible);
+      if (mInputBuffer && mInputWriteIndex) {
+        for (uint32_t i = 0; i < mInputChannelCount; ++i) {
+          float* channelData = mInputBuffer->GetDataForWrite(i);
+          PodZero(channelData, mInputWriteIndex);
+        }
+      }
+    }
+
+    uint32_t inputChannelCount = mInputBuffer ? mInputBuffer->GetChannels() : 0;
+    for (uint32_t i = 0; i < inputChannelCount; ++i) {
+      float* writeData = mInputBuffer->GetDataForWrite(i) + mInputWriteIndex;
+      if (aInput.IsNull()) {
+        PodZero(writeData, aInput.GetDuration());
+      } else {
+        MOZ_ASSERT(aInput.GetDuration() == WEBAUDIO_BLOCK_SIZE, "sanity check");
+        MOZ_ASSERT(aInput.ChannelCount() == inputChannelCount);
+        AudioBlockCopyChannelWithScale(
+            static_cast<const float*>(aInput.mChannelData[i]), aInput.mVolume,
+            writeData);
+      }
+    }
+    mInputWriteIndex += aInput.GetDuration();
+
+    *aOutput = mSharedBuffers->GetOutputBuffer();
+
+    if (mInputWriteIndex >= mBufferSize) {
+      SendBuffersToMainThread(aTrack, aFrom);
+      mInputWriteIndex -= mBufferSize;
+    }
+  }
+
+  bool IsActive() const override {
+    return true;
+  }
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const override {
+    size_t amount = AudioNodeEngine::SizeOfExcludingThis(aMallocSizeOf);
+    amount += mSharedBuffers->SizeOfIncludingThis(aMallocSizeOf);
+    if (mInputBuffer) {
+      amount += mInputBuffer->SizeOfIncludingThis(aMallocSizeOf);
+    }
+
+    return amount;
+  }
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const override {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+ private:
+  void SendBuffersToMainThread(AudioNodeTrack* aTrack, GraphTime aFrom) {
+    MOZ_ASSERT(!NS_IsMainThread());
+
+    TrackTime playbackTick = mDestination->GraphTimeToTrackTime(aFrom);
+    playbackTick += WEBAUDIO_BLOCK_SIZE;
+    playbackTick += mSharedBuffers->DelaySoFar();
+    double playbackTime = mDestination->TrackTimeToSeconds(playbackTick);
+
+    class Command final : public Runnable {
+     public:
+      Command(AudioNodeTrack* aTrack,
+              already_AddRefed<ThreadSharedFloatArrayBufferList> aInputBuffer,
+              double aPlaybackTime)
+          : mozilla::Runnable("Command"),
+            mTrack(aTrack),
+            mInputBuffer(aInputBuffer),
+            mPlaybackTime(aPlaybackTime) {}
+
+      NS_IMETHOD Run() override {
+        auto engine = static_cast<ScriptProcessorNodeEngine*>(mTrack->Engine());
+        AudioChunk output;
+        output.SetNull(engine->mBufferSize);
+        {
+          auto node =
+              static_cast<ScriptProcessorNode*>(engine->NodeMainThread());
+          if (!node) {
+            return NS_OK;
+          }
+
+          if (node->HasListenersFor(nsGkAtoms::onaudioprocess)) {
+            DispatchAudioProcessEvent(node, &output);
+          }
+        }
+
+        engine->GetSharedBuffers()->FinishProducingOutputBuffer(output);
+
+        return NS_OK;
+      }
+
+      void DispatchAudioProcessEvent(ScriptProcessorNode* aNode,
+                                     AudioChunk* aOutput) {
+        AudioContext* context = aNode->Context();
+        if (!context) {
+          return;
+        }
+
+        AutoJSAPI jsapi;
+        if (NS_WARN_IF(!jsapi.Init(aNode->GetOwnerWindow()))) {
+          return;
+        }
+        JSContext* cx = jsapi.cx();
+        uint32_t inputChannelCount = aNode->ChannelCount();
+
+        RefPtr<AudioBuffer> inputBuffer;
+        if (mInputBuffer) {
+          ErrorResult rv;
+          inputBuffer = AudioBuffer::Create(
+              context->GetOwnerWindow(), inputChannelCount, aNode->BufferSize(),
+              context->SampleRate(), mInputBuffer.forget(), rv);
+          if (rv.Failed()) {
+            rv.SuppressException();
+            return;
+          }
+        }
+
+        RefPtr<AudioProcessingEvent> event =
+            new AudioProcessingEvent(aNode, nullptr, nullptr);
+        event->InitEvent(inputBuffer, inputChannelCount, mPlaybackTime);
+        aNode->DispatchTrustedEvent(event);
+
+        if (event->HasOutputBuffer()) {
+          ErrorResult rv;
+          AudioBuffer* buffer = event->GetOutputBuffer(rv);
+          MOZ_ASSERT(!rv.Failed());
+          *aOutput = buffer->GetThreadSharedChannelsForRate(cx);
+          MOZ_ASSERT(aOutput->IsNull() ||
+                         aOutput->mBufferFormat == AUDIO_FORMAT_FLOAT32,
+                     "AudioBuffers initialized from JS have float data");
+        }
+      }
+
+     private:
+      RefPtr<AudioNodeTrack> mTrack;
+      RefPtr<ThreadSharedFloatArrayBufferList> mInputBuffer;
+      double mPlaybackTime;
+    };
+
+    RefPtr<Command> command =
+        new Command(aTrack, mInputBuffer.forget(), playbackTime);
+    AbstractThread::MainThread()->Dispatch(command.forget());
+  }
+
+  friend class ScriptProcessorNode;
+
+  RefPtr<AudioNodeTrack> mDestination;
+  UniquePtr<SharedBuffers> mSharedBuffers;
+  RefPtr<ThreadSharedFloatArrayBufferList> mInputBuffer;
+  const uint32_t mBufferSize;
+  const uint32_t mInputChannelCount;
+  uint32_t mInputWriteIndex;
+  bool mIsConnected = false;
+};
+
+ScriptProcessorNode::ScriptProcessorNode(AudioContext* aContext,
+                                         uint32_t aBufferSize,
+                                         uint32_t aNumberOfInputChannels,
+                                         uint32_t aNumberOfOutputChannels)
+    : AudioNode(aContext, aNumberOfInputChannels,
+                mozilla::dom::ChannelCountMode::Explicit,
+                mozilla::dom::ChannelInterpretation::Speakers),
+      mBufferSize(aBufferSize ? aBufferSize
+                              :  
+                      4096)      
+      ,
+      mNumberOfOutputChannels(aNumberOfOutputChannels) {
+  MOZ_ASSERT(BufferSize() % WEBAUDIO_BLOCK_SIZE == 0, "Invalid buffer size");
+  ScriptProcessorNodeEngine* engine = new ScriptProcessorNodeEngine(
+      this, aContext->Destination(), BufferSize(), aNumberOfInputChannels);
+  mTrack = AudioNodeTrack::Create(
+      aContext, engine, AudioNodeTrack::NO_TRACK_FLAGS, aContext->Graph());
+}
+
+ScriptProcessorNode::~ScriptProcessorNode() = default;
+
+size_t ScriptProcessorNode::SizeOfExcludingThis(
+    MallocSizeOf aMallocSizeOf) const {
+  size_t amount = AudioNode::SizeOfExcludingThis(aMallocSizeOf);
+  return amount;
+}
+
+size_t ScriptProcessorNode::SizeOfIncludingThis(
+    MallocSizeOf aMallocSizeOf) const {
+  return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+}
+
+void ScriptProcessorNode::EventListenerAdded(nsAtom* aType) {
+  AudioNode::EventListenerAdded(aType);
+  if (aType == nsGkAtoms::onaudioprocess) {
+    UpdateConnectedStatus();
+  }
+}
+
+void ScriptProcessorNode::EventListenerRemoved(nsAtom* aType) {
+  AudioNode::EventListenerRemoved(aType);
+  if (aType == nsGkAtoms::onaudioprocess && mTrack) {
+    UpdateConnectedStatus();
+  }
+}
+
+JSObject* ScriptProcessorNode::WrapObject(JSContext* aCx,
+                                          JS::Handle<JSObject*> aGivenProto) {
+  return ScriptProcessorNode_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void ScriptProcessorNode::UpdateConnectedStatus() {
+  bool isConnected =
+      mHasPhantomInput || !(OutputNodes().IsEmpty() &&
+                            OutputParams().IsEmpty() && InputNodes().IsEmpty());
+
+  SendInt32ParameterToTrack(ScriptProcessorNodeEngine::IS_CONNECTED,
+                            isConnected);
+
+  if (isConnected && HasListenersFor(nsGkAtoms::onaudioprocess)) {
+    MarkActive();
+  } else {
+    MarkInactive();
+  }
+
+  if (!mTrack) {
+    return;
+  }
+
+  auto engine = static_cast<ScriptProcessorNodeEngine*>(mTrack->Engine());
+  engine->GetSharedBuffers()->NotifyNodeIsConnected(isConnected);
+}
+
+}  

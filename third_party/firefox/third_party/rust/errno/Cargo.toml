@@ -1,0 +1,41 @@
+
+[package]
+edition = "2018"
+rust-version = "1.56"
+name = "errno"
+version = "0.3.14"
+authors = [
+    "Chris Wong <lambda.fairy@gmail.com>",
+    "Dan Gohman <dev@sunfishcode.online>",
+]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Cross-platform interface to the `errno` variable."
+documentation = "https://docs.rs/errno"
+categories = [
+    "no-std",
+    "os",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lambda-fairy/rust-errno"
+
+[features]
+default = ["std"]
+std = ["libc/std"]
+
+[lib]
+name = "errno"
+path = "src/lib.rs"
+
+[target."cfg(unix)".dependencies.libc]
+version = "0.2"
+default-features = false
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = ['cfg(target_os, values("cygwin"))']

@@ -1,0 +1,67 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_cache_Action_h
+#define mozilla_dom_cache_Action_h
+
+#include "CacheCipherKeyManager.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/dom/SafeRefPtr.h"
+#include "mozilla/dom/cache/Types.h"
+#include "nsISupportsImpl.h"
+
+class mozIStorageConnection;
+
+namespace mozilla::dom::cache {
+
+class Action : public SafeRefCounted<Action> {
+ public:
+  class Resolver {
+   public:
+    Resolver& operator=(const Resolver& aRHS) = delete;
+
+    virtual void Resolve(nsresult aRv) = 0;
+
+    inline SafeRefPtr<Action::Resolver> SafeRefPtrFromThis() {
+      return SafeRefPtr<Action::Resolver>{this, AcquireStrongRefFromRawPtr{}};
+    }
+
+    NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+  };
+
+  class Data {
+   public:
+    virtual mozIStorageConnection* GetConnection() const = 0;
+
+    virtual void SetConnection(mozIStorageConnection* aConn) = 0;
+  };
+
+  virtual ~Action();
+
+  virtual void RunOnTarget(
+      SafeRefPtr<Resolver> aResolver,
+      const Maybe<CacheDirectoryMetadata>& aDirectoryMetadata,
+      Data* aOptionalData, const Maybe<CipherKey>& aMaybeCipherKey) = 0;
+
+  virtual void CancelOnInitiatingThread();
+
+  virtual void CompleteOnInitiatingThread(nsresult aRv) {}
+
+  virtual bool MatchesCacheId(CacheId aCacheId) const { return false; }
+
+  NS_DECL_OWNINGTHREAD
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(cache::Action)
+
+ protected:
+  Action();
+
+  bool IsCanceled() const;
+
+ private:
+  Atomic<bool> mCanceled;
+};
+
+}  
+
+#endif  // mozilla_dom_cache_Action_h

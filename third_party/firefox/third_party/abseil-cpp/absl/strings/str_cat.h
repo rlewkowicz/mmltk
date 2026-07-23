@@ -1,0 +1,449 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_STRINGS_STR_CAT_H_
+#define ABSL_STRINGS_STR_CAT_H_
+
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <initializer_list>
+#include <limits>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "absl/base/attributes.h"
+#include "absl/base/config.h"
+#include "absl/base/nullability.h"
+#include "absl/base/port.h"
+#include "absl/meta/type_traits.h"
+#include "absl/strings/has_absl_stringify.h"
+#include "absl/strings/internal/stringify_sink.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/resize_and_overwrite.h"
+#include "absl/strings/string_view.h"
+
+#if !defined(ABSL_USES_STD_STRING_VIEW)
+#include <string_view>
+#endif
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+namespace strings_internal {
+template <size_t max_size>
+struct AlphaNumBuffer {
+  std::array<char, max_size> data;
+  size_t size;
+};
+
+}  
+
+enum PadSpec : uint8_t {
+  kNoPad = 1,
+  kZeroPad2,
+  kZeroPad3,
+  kZeroPad4,
+  kZeroPad5,
+  kZeroPad6,
+  kZeroPad7,
+  kZeroPad8,
+  kZeroPad9,
+  kZeroPad10,
+  kZeroPad11,
+  kZeroPad12,
+  kZeroPad13,
+  kZeroPad14,
+  kZeroPad15,
+  kZeroPad16,
+  kZeroPad17,
+  kZeroPad18,
+  kZeroPad19,
+  kZeroPad20,
+
+  kSpacePad2 = kZeroPad2 + 64,
+  kSpacePad3,
+  kSpacePad4,
+  kSpacePad5,
+  kSpacePad6,
+  kSpacePad7,
+  kSpacePad8,
+  kSpacePad9,
+  kSpacePad10,
+  kSpacePad11,
+  kSpacePad12,
+  kSpacePad13,
+  kSpacePad14,
+  kSpacePad15,
+  kSpacePad16,
+  kSpacePad17,
+  kSpacePad18,
+  kSpacePad19,
+  kSpacePad20,
+};
+
+struct Hex {
+  uint64_t value;
+  uint8_t width;
+  char fill;
+
+  template <typename Int>
+  explicit Hex(Int v, PadSpec spec = absl::kNoPad,
+               std::enable_if_t<sizeof(Int) == 1 && !std::is_pointer_v<Int>,
+                                bool> = true)
+      : Hex(spec, static_cast<uint8_t>(v)) {}
+  template <typename Int>
+  explicit Hex(Int v, PadSpec spec = absl::kNoPad,
+               std::enable_if_t<sizeof(Int) == 2 && !std::is_pointer_v<Int>,
+                                bool> = true)
+      : Hex(spec, static_cast<uint16_t>(v)) {}
+  template <typename Int>
+  explicit Hex(Int v, PadSpec spec = absl::kNoPad,
+               std::enable_if_t<sizeof(Int) == 4 && !std::is_pointer_v<Int>,
+                                bool> = true)
+      : Hex(spec, static_cast<uint32_t>(v)) {}
+  template <typename Int>
+  explicit Hex(Int v, PadSpec spec = absl::kNoPad,
+               std::enable_if_t<sizeof(Int) == 8 && !std::is_pointer_v<Int>,
+                                bool> = true)
+      : Hex(spec, static_cast<uint64_t>(v)) {}
+  template <typename Pointee>
+  explicit Hex(Pointee* absl_nullable v, PadSpec spec = absl::kNoPad)
+      : Hex(spec, reinterpret_cast<uintptr_t>(v)) {}
+
+  template <typename S>
+  friend void AbslStringify(S& sink, Hex hex) {
+    static_assert(
+        numbers_internal::kFastToBufferSize >= 32,
+        "This function only works when output buffer >= 32 bytes long");
+    char buffer[numbers_internal::kFastToBufferSize];
+    char* const end = &buffer[numbers_internal::kFastToBufferSize];
+    auto real_width =
+        absl::numbers_internal::FastHexToBufferZeroPad16(hex.value, end - 16);
+    if (real_width >= hex.width) {
+      sink.Append(absl::string_view(end - real_width, real_width));
+    } else {
+      std::memset(end - 32, hex.fill, 16);
+      std::memset(end - real_width - 16, hex.fill, 16);
+      sink.Append(absl::string_view(end - hex.width, hex.width));
+    }
+  }
+
+ private:
+  Hex(PadSpec spec, uint64_t v)
+      : value(v),
+        width(spec == absl::kNoPad
+                  ? 1
+                  : spec >= absl::kSpacePad2 ? spec - absl::kSpacePad2 + 2
+                                             : spec - absl::kZeroPad2 + 2),
+        fill(spec >= absl::kSpacePad2 ? ' ' : '0') {}
+};
+
+struct Dec {
+  uint64_t value;
+  uint8_t width;
+  char fill;
+  bool neg;
+
+  template <typename Int>
+  explicit Dec(Int v, PadSpec spec = absl::kNoPad,
+               std::enable_if_t<sizeof(Int) <= 8, bool> = true)
+      : value(v >= 0 ? static_cast<uint64_t>(v)
+                     : uint64_t{0} - static_cast<uint64_t>(v)),
+        width(spec == absl::kNoPad       ? 1
+              : spec >= absl::kSpacePad2 ? spec - absl::kSpacePad2 + 2
+                                         : spec - absl::kZeroPad2 + 2),
+        fill(spec >= absl::kSpacePad2 ? ' ' : '0'),
+        neg(v < 0) {}
+
+  template <typename S>
+  friend void AbslStringify(S& sink, Dec dec) {
+    assert(dec.width <= numbers_internal::kFastToBufferSize);
+    char buffer[numbers_internal::kFastToBufferSize];
+    char* const end = &buffer[numbers_internal::kFastToBufferSize];
+    char* const minfill = end - dec.width;
+    char* writer = end;
+    uint64_t val = dec.value;
+    while (val > 9) {
+      *--writer = '0' + (val % 10);
+      val /= 10;
+    }
+    *--writer = '0' + static_cast<char>(val);
+    if (dec.neg) *--writer = '-';
+
+    ptrdiff_t fillers = writer - minfill;
+    if (fillers > 0) {
+      bool add_sign_again = false;
+      if (dec.neg && dec.fill == '0') {  
+        ++writer;                    
+        add_sign_again = true;       
+      }
+      writer -= fillers;
+      std::fill_n(writer, fillers, dec.fill);
+      if (add_sign_again) *--writer = '-';
+    }
+
+    sink.Append(absl::string_view(writer, static_cast<size_t>(end - writer)));
+  }
+};
+
+
+inline strings_internal::AlphaNumBuffer<numbers_internal::kFastToBufferSize>
+HighPrecision(float f) {
+  strings_internal::AlphaNumBuffer<numbers_internal::kFastToBufferSize> result;
+  result.size =
+      strlen(numbers_internal::RoundTripFloatToBuffer(f, &result.data[0]));
+  return result;
+}
+
+inline strings_internal::AlphaNumBuffer<numbers_internal::kFastToBufferSize>
+HighPrecision(double d) {
+  strings_internal::AlphaNumBuffer<numbers_internal::kFastToBufferSize> result;
+  result.size =
+      strlen(numbers_internal::RoundTripDoubleToBuffer(d, &result.data[0]));
+  return result;
+}
+
+
+class AlphaNum {
+ public:
+
+  template <typename T>
+  AlphaNum(std::initializer_list<T>) = delete;  // NOLINT(runtime/explicit)
+
+  AlphaNum(int x)  // NOLINT(runtime/explicit)
+      : piece_(digits_, static_cast<size_t>(
+                            numbers_internal::FastIntToBuffer(x, digits_) -
+                            &digits_[0])) {}
+  AlphaNum(unsigned int x)  // NOLINT(runtime/explicit)
+      : piece_(digits_, static_cast<size_t>(
+                            numbers_internal::FastIntToBuffer(x, digits_) -
+                            &digits_[0])) {}
+  AlphaNum(long x)  // NOLINT(*)
+      : piece_(digits_, static_cast<size_t>(
+                            numbers_internal::FastIntToBuffer(x, digits_) -
+                            &digits_[0])) {}
+  AlphaNum(unsigned long x)  // NOLINT(*)
+      : piece_(digits_, static_cast<size_t>(
+                            numbers_internal::FastIntToBuffer(x, digits_) -
+                            &digits_[0])) {}
+  AlphaNum(long long x)  // NOLINT(*)
+      : piece_(digits_, static_cast<size_t>(
+                            numbers_internal::FastIntToBuffer(x, digits_) -
+                            &digits_[0])) {}
+  AlphaNum(unsigned long long x)  // NOLINT(*)
+      : piece_(digits_, static_cast<size_t>(
+                            numbers_internal::FastIntToBuffer(x, digits_) -
+                            &digits_[0])) {}
+
+  AlphaNum(float f)  // NOLINT(runtime/explicit)
+      : piece_(digits_, numbers_internal::SixDigitsToBuffer(f, digits_)) {}
+  AlphaNum(double f)  // NOLINT(runtime/explicit)
+      : piece_(digits_, numbers_internal::SixDigitsToBuffer(f, digits_)) {}
+
+  template <size_t size>
+  AlphaNum(  // NOLINT(runtime/explicit)
+      const strings_internal::AlphaNumBuffer<size>& buf
+          ABSL_ATTRIBUTE_LIFETIME_BOUND)
+      : piece_(&buf.data[0], buf.size) {}
+
+  AlphaNum(const char* absl_nullable c_str  // NOLINT(runtime/explicit)
+               ABSL_ATTRIBUTE_LIFETIME_BOUND)
+      : piece_(NullSafeStringView(c_str)) {}
+  AlphaNum(absl::string_view pc  // NOLINT(runtime/explicit)
+               ABSL_ATTRIBUTE_LIFETIME_BOUND)
+      : piece_(pc) {}
+
+#if !defined(ABSL_USES_STD_STRING_VIEW)
+  AlphaNum(std::string_view pc  // NOLINT(runtime/explicit)
+               ABSL_ATTRIBUTE_LIFETIME_BOUND)
+      : piece_(pc.data(), pc.size()) {}
+#endif  // !ABSL_USES_STD_STRING_VIEW
+
+  template <typename T, typename = std::enable_if_t<HasAbslStringify<T>::value>>
+  AlphaNum(  // NOLINT(runtime/explicit)
+      const T& v ABSL_ATTRIBUTE_LIFETIME_BOUND,
+      strings_internal::StringifySink&& sink ABSL_ATTRIBUTE_LIFETIME_BOUND = {})
+      : piece_(strings_internal::ExtractStringification(sink, v)) {}
+
+  template <typename Allocator>
+  AlphaNum(  // NOLINT(runtime/explicit)
+      const std::basic_string<char, std::char_traits<char>, Allocator>& str
+          ABSL_ATTRIBUTE_LIFETIME_BOUND)
+      : piece_(str) {}
+
+  AlphaNum(char c) = delete;  // NOLINT(runtime/explicit)
+
+  AlphaNum(const AlphaNum&) = delete;
+  AlphaNum& operator=(const AlphaNum&) = delete;
+
+  absl::string_view::size_type size() const { return piece_.size(); }
+  const char* absl_nullable data() const { return piece_.data(); }
+  absl::string_view Piece() const { return piece_; }
+
+  template <typename T,
+            typename = std::enable_if_t<std::is_enum<T>{} &&
+                                        std::is_convertible<T, int>{} &&
+                                        !HasAbslStringify<T>::value>>
+  AlphaNum(T e)  // NOLINT(runtime/explicit)
+      : AlphaNum(+e) {}
+
+  template <typename T, std::enable_if_t<std::is_enum<T>{} &&
+                                             !std::is_convertible<T, int>{} &&
+                                             !HasAbslStringify<T>::value,
+                                         char*> = nullptr>
+  AlphaNum(T e)  // NOLINT(runtime/explicit)
+      : AlphaNum(+static_cast<std::underlying_type_t<T>>(e)) {}
+
+  template <
+      typename T,
+      std::enable_if_t<
+          std::is_class_v<T> &&
+          (std::is_same_v<T, std::vector<bool>::reference> ||
+           std::is_same_v<T, std::vector<bool>::const_reference>)>* = nullptr>
+  AlphaNum(T e) : AlphaNum(static_cast<bool>(e)) {}  // NOLINT(runtime/explicit)
+
+ private:
+  absl::string_view piece_;
+  char digits_[numbers_internal::kFastToBufferSize];
+};
+
+
+namespace strings_internal {
+
+std::string CatPieces(std::initializer_list<absl::string_view> pieces);
+void AppendPieces(std::string* absl_nonnull dest,
+                  std::initializer_list<absl::string_view> pieces);
+
+template <typename Integer>
+std::string IntegerToString(Integer i) {
+  constexpr size_t kMaxDigits10 = 22;
+  std::string result;
+  StringResizeAndOverwrite(
+      result, kMaxDigits10, [i](char* start, size_t buf_size) {
+        char* end = numbers_internal::FastIntToBuffer(i, start);
+        auto size = static_cast<size_t>(end - start);
+        ABSL_ASSERT(size < buf_size);
+        return size;
+      });
+  return result;
+}
+
+template <typename Float>
+std::string FloatToString(Float f) {
+  std::string result;
+  StringResizeAndOverwrite(result, numbers_internal::kSixDigitsToBufferSize,
+                           [f](char* start, size_t buf_size) {
+                             size_t size =
+                                 numbers_internal::SixDigitsToBuffer(f, start);
+                             ABSL_ASSERT(size < buf_size);
+                             return size;
+                           });
+  return result;
+}
+
+inline std::string SingleArgStrCat(int x) { return IntegerToString(x); }
+inline std::string SingleArgStrCat(unsigned int x) {
+  return IntegerToString(x);
+}
+// NOLINTNEXTLINE
+inline std::string SingleArgStrCat(long x) { return IntegerToString(x); }
+// NOLINTNEXTLINE
+inline std::string SingleArgStrCat(unsigned long x) {
+  return IntegerToString(x);
+}
+// NOLINTNEXTLINE
+inline std::string SingleArgStrCat(long long x) { return IntegerToString(x); }
+// NOLINTNEXTLINE
+inline std::string SingleArgStrCat(unsigned long long x) {
+  return IntegerToString(x);
+}
+inline std::string SingleArgStrCat(float x) { return FloatToString(x); }
+inline std::string SingleArgStrCat(double x) { return FloatToString(x); }
+
+#ifdef _LIBCPP_VERSION
+#define ABSL_INTERNAL_STRCAT_ENABLE_FAST_CASE true
+#else
+#define ABSL_INTERNAL_STRCAT_ENABLE_FAST_CASE false
+#endif
+
+template <typename T, typename = std::enable_if_t<
+                          ABSL_INTERNAL_STRCAT_ENABLE_FAST_CASE &&
+                          std::is_arithmetic<T>{} && !std::is_same<T, char>{}>>
+using EnableIfFastCase = T;
+
+#undef ABSL_INTERNAL_STRCAT_ENABLE_FAST_CASE
+
+}  
+
+[[nodiscard]] inline std::string StrCat() { return std::string(); }
+
+template <typename T>
+[[nodiscard]] inline std::string StrCat(
+    strings_internal::EnableIfFastCase<T> a) {
+  return strings_internal::SingleArgStrCat(a);
+}
+[[nodiscard]] inline std::string StrCat(const AlphaNum& a) {
+  return std::string(a.data(), a.size());
+}
+
+[[nodiscard]] std::string StrCat(const AlphaNum& a, const AlphaNum& b);
+[[nodiscard]] std::string StrCat(const AlphaNum& a, const AlphaNum& b,
+                                 const AlphaNum& c);
+[[nodiscard]] std::string StrCat(const AlphaNum& a, const AlphaNum& b,
+                                 const AlphaNum& c, const AlphaNum& d);
+
+template <typename... AV>
+[[nodiscard]] inline std::string StrCat(const AlphaNum& a, const AlphaNum& b,
+                                        const AlphaNum& c, const AlphaNum& d,
+                                        const AlphaNum& e, const AV&... args) {
+  return strings_internal::CatPieces(
+      {a.Piece(), b.Piece(), c.Piece(), d.Piece(), e.Piece(),
+       static_cast<const AlphaNum&>(args).Piece()...});
+}
+
+
+inline void StrAppend(std::string* absl_nonnull) {}
+void StrAppend(std::string* absl_nonnull dest, const AlphaNum& a);
+void StrAppend(std::string* absl_nonnull dest, const AlphaNum& a,
+               const AlphaNum& b);
+void StrAppend(std::string* absl_nonnull dest, const AlphaNum& a,
+               const AlphaNum& b, const AlphaNum& c);
+void StrAppend(std::string* absl_nonnull dest, const AlphaNum& a,
+               const AlphaNum& b, const AlphaNum& c, const AlphaNum& d);
+
+template <typename... AV>
+inline void StrAppend(std::string* absl_nonnull dest, const AlphaNum& a,
+                      const AlphaNum& b, const AlphaNum& c, const AlphaNum& d,
+                      const AlphaNum& e, const AV&... args) {
+  strings_internal::AppendPieces(
+      dest, {a.Piece(), b.Piece(), c.Piece(), d.Piece(), e.Piece(),
+             static_cast<const AlphaNum&>(args).Piece()...});
+}
+
+inline strings_internal::AlphaNumBuffer<
+    numbers_internal::kSixDigitsToBufferSize>
+SixDigits(double d) {
+  strings_internal::AlphaNumBuffer<numbers_internal::kSixDigitsToBufferSize>
+      result;
+  result.size = numbers_internal::SixDigitsToBuffer(d, &result.data[0]);
+  return result;
+}
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_STRINGS_STR_CAT_H_

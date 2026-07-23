@@ -1,0 +1,105 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ScreenOrientation_h
+#define mozilla_dom_ScreenOrientation_h
+
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/HalScreenConfiguration.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/ScreenOrientationBinding.h"
+
+class nsScreen;
+
+namespace mozilla::dom {
+
+class Promise;
+
+class ScreenOrientation final : public DOMEventTargetHelper {
+  friend class ::nsScreen;
+
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(ScreenOrientation,
+                                           mozilla::DOMEventTargetHelper)
+
+  IMPL_EVENT_HANDLER(change)
+
+  void MaybeChanged();
+
+  void MaybeDispatchChangeEvent(BrowsingContext* aBrowsingContext);
+
+  void MaybeDispatchEventsForOverride(BrowsingContext* aBrowsingContext,
+                                      bool aOldHasOrientationOverride,
+                                      bool aOverrideIsDifferentThanDevice);
+
+ private:
+  ScreenOrientation(nsPIDOMWindowInner* aWindow, nsScreen* aScreen);
+
+ public:
+  static already_AddRefed<ScreenOrientation> Create(nsPIDOMWindowInner* aWindow,
+                                                    nsScreen* aScreen);
+
+  already_AddRefed<Promise> Lock(OrientationLockType aOrientation,
+                                 ErrorResult& aRv);
+
+  void Unlock(ErrorResult& aRv);
+
+  OrientationType DeviceType(CallerType aCallerType) const;
+  uint16_t DeviceAngle(CallerType aCallerType) const;
+
+  OrientationType GetType(CallerType aCallerType, ErrorResult& aRv) const;
+  uint16_t GetAngle(CallerType aCallerType, ErrorResult& aRv) const;
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  static void UpdateActiveOrientationLock(hal::ScreenOrientation aOrientation);
+  static void AbortInProcessOrientationPromises(
+      BrowsingContext* aBrowsingContext);
+
+  static void DispatchChangeEventToChildren(BrowsingContext* aBrowsingContext);
+
+ private:
+  virtual ~ScreenOrientation();
+
+  class FullscreenEventListener;
+
+  class VisibleEventListener;
+
+  class LockOrientationTask;
+
+  enum LockPermission { LOCK_DENIED, FULLSCREEN_LOCK_ALLOWED, LOCK_ALLOWED };
+
+  RefPtr<GenericNonExclusivePromise> LockDeviceOrientation(
+      hal::ScreenOrientation aOrientation, bool aIsFullscreen);
+
+  void UnlockDeviceOrientation();
+  void CleanupFullscreenListener();
+
+  already_AddRefed<Promise> LockInternal(hal::ScreenOrientation aOrientation,
+                                         ErrorResult& aRv);
+
+  nsCOMPtr<nsIRunnable> DispatchChangeEventAndResolvePromise();
+
+  static bool CommonSafetyChecks(nsPIDOMWindowInner* aOwner,
+                                 Document* aDocument, ErrorResult& aRv);
+
+  static LockPermission GetLockOrientationPermission(nsPIDOMWindowInner* aOwner,
+                                                     Document* aDocument);
+
+  Document* GetResponsibleDocument() const;
+
+  RefPtr<nsScreen> mScreen;
+  RefPtr<FullscreenEventListener> mFullscreenListener;
+  RefPtr<VisibleEventListener> mVisibleListener;
+  OrientationType mType{};
+  uint16_t mAngle{};
+  bool mTriedToLockDeviceOrientation = false;
+};
+
+}  
+
+#endif  // mozilla_dom_ScreenOrientation_h

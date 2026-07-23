@@ -1,0 +1,91 @@
+// Copyright 2015 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(LIBANGLE_STRING_UTILS_H_)
+#define LIBANGLE_STRING_UTILS_H_
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "common/Optional.h"
+
+namespace angle
+{
+
+extern const char kWhitespaceASCII[];
+
+enum WhitespaceHandling
+{
+    KEEP_WHITESPACE,
+    TRIM_WHITESPACE,
+};
+
+enum SplitResult
+{
+    SPLIT_WANT_ALL,
+    SPLIT_WANT_NONEMPTY,
+};
+
+std::vector<std::string> SplitString(const std::string &input,
+                                     const std::string &delimiters,
+                                     WhitespaceHandling whitespace,
+                                     SplitResult resultType);
+
+void SplitStringAlongWhitespace(const std::string &input, std::vector<std::string> *tokensOut);
+
+std::string TrimString(const std::string &input, const std::string &trimChars);
+
+std::string GetPrefix(const std::string &input, size_t offset, const char *delimiter);
+std::string GetPrefix(const std::string &input, size_t offset, char delimiter);
+
+bool HexStringToUInt(const std::string_view &input, unsigned int *uintOut);
+
+bool ReadFileToString(const std::string &path, std::string *stringOut);
+
+bool BeginsWith(const std::string &str, const std::string &prefix);
+
+bool BeginsWith(const std::string &str, const char *prefix);
+
+bool BeginsWith(const char *str, const char *prefix);
+
+bool BeginsWith(const std::string &str, const std::string &prefix, const size_t prefixLength);
+
+bool EndsWith(const std::string &str, const std::string &suffix);
+
+bool EndsWith(const std::string &str, const char *suffix);
+
+bool EndsWith(const char *str, const char *suffix);
+
+bool ContainsToken(const std::string &tokenStr, char delimiter, const std::string &token);
+
+void ToLower(std::string *str);
+
+void ToUpper(std::string *str);
+
+bool ReplaceSubstring(std::string *str,
+                      const std::string &substring,
+                      const std::string &replacement);
+
+int ReplaceAllSubstrings(std::string *str,
+                         const std::string &substring,
+                         const std::string &replacement);
+
+std::string ToCamelCase(const std::string &str);
+
+std::vector<std::string> GetStringsFromEnvironmentVarOrAndroidProperty(const char *varName,
+                                                                       const char *propertyName,
+                                                                       const char *separator);
+
+std::vector<std::string> GetCachedStringsFromEnvironmentVarOrAndroidProperty(
+    const char *varName,
+    const char *propertyName,
+    const char *separator);
+
+bool NamesMatchWithWildcard(const char *glob, const char *name);
+
+std::vector<uint8_t> HexStringToUintVector(const std::string_view &hexStr);
+}  
+
+#endif

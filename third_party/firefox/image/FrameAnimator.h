@@ -1,0 +1,179 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_FrameAnimator_h
+#define mozilla_image_FrameAnimator_h
+
+#include "SurfaceCache.h"
+#include "gfxTypes.h"
+#include "imgFrame.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/StaticPrefs_image.h"
+#include "mozilla/TimeStamp.h"
+#include "nsCOMPtr.h"
+#include "nsRect.h"
+
+namespace mozilla {
+namespace image {
+
+class RasterImage;
+class DrawableSurface;
+
+class AnimationState {
+ public:
+  explicit AnimationState(uint16_t aAnimationMode)
+      : mFrameCount(0),
+        mCurrentAnimationFrameIndex(0),
+        mLoopRemainingCount(-1),
+        mLoopCount(-1),
+        mFirstFrameTimeout(FrameTimeout::FromRawMilliseconds(0)),
+        mAnimationMode(aAnimationMode),
+        mHasBeenDecoded(false),
+        mHasRequestedDecode(false),
+        mIsCurrentlyDecoded(false),
+        mCompositedFrameInvalid(false),
+        mDiscarded(false) {}
+
+  const gfx::IntRect UpdateState(RasterImage* aImage, const gfx::IntSize& aSize,
+                                 bool aAllowInvalidation = true);
+
+ private:
+  const gfx::IntRect UpdateStateInternal(LookupResult& aResult,
+                                         const gfx::IntSize& aSize,
+                                         bool aAllowInvalidation = true);
+
+ public:
+  void NotifyDecodeComplete();
+
+  bool GetHasBeenDecoded() { return mHasBeenDecoded; }
+
+  bool GetHasRequestedDecode() { return mHasRequestedDecode; }
+
+  bool IsDiscarded() { return mDiscarded; }
+
+  void SetCompositedFrameInvalid(bool aInvalid) {
+    MOZ_ASSERT(!aInvalid ||
+               StaticPrefs::image_mem_animated_discardable_AtStartup());
+    mCompositedFrameInvalid = aInvalid;
+  }
+
+  bool GetCompositedFrameInvalid() { return mCompositedFrameInvalid; }
+
+  bool GetIsCurrentlyDecoded() { return mIsCurrentlyDecoded; }
+
+  void ResetAnimation();
+
+  void SetAnimationMode(uint16_t aAnimationMode);
+
+  void UpdateKnownFrameCount(uint32_t aFrameCount);
+
+  uint32_t KnownFrameCount() const { return mFrameCount; }
+
+  Maybe<uint32_t> FrameCount() const;
+
+  void SetFirstFrameRefreshArea(const gfx::IntRect& aRefreshArea);
+  gfx::IntRect FirstFrameRefreshArea() const { return mFirstFrameRefreshArea; }
+
+  void InitAnimationFrameTimeIfNecessary();
+
+  void SetAnimationFrameTime(const TimeStamp& aTime);
+
+  bool MaybeAdvanceAnimationFrameTime(const TimeStamp& aTime);
+
+  uint32_t GetCurrentAnimationFrameIndex() const;
+
+  void SetLoopCount(int32_t aLoopCount) { mLoopCount = aLoopCount; }
+  int32_t LoopCount() const { return mLoopCount; }
+
+  void SetLoopLength(FrameTimeout aLength) { mLoopLength = Some(aLength); }
+
+  FrameTimeout LoopLength() const;
+
+  void SetFirstFrameTimeout(FrameTimeout aTimeout) {
+    mFirstFrameTimeout = aTimeout;
+  }
+  FrameTimeout FirstFrameTimeout() const { return mFirstFrameTimeout; }
+
+ private:
+  friend class FrameAnimator;
+
+  gfx::IntRect mFirstFrameRefreshArea;
+
+  TimeStamp mCurrentAnimationFrameTime;
+
+  uint32_t mFrameCount;
+
+  uint32_t mCurrentAnimationFrameIndex;
+
+  int32_t mLoopRemainingCount;
+
+  int32_t mLoopCount;
+
+  Maybe<FrameTimeout> mLoopLength;
+
+  FrameTimeout mFirstFrameTimeout;
+
+  uint16_t mAnimationMode;
+
+
+  bool mHasBeenDecoded;
+
+  bool mHasRequestedDecode;
+
+  bool mIsCurrentlyDecoded;
+
+  bool mCompositedFrameInvalid;
+
+  bool mDiscarded;
+};
+
+struct RefreshResult {
+  RefreshResult() : mFrameAdvanced(false), mAnimationFinished(false) {}
+
+  void Accumulate(const RefreshResult& aOther) {
+    mFrameAdvanced = mFrameAdvanced || aOther.mFrameAdvanced;
+    mAnimationFinished = mAnimationFinished || aOther.mAnimationFinished;
+    mDirtyRect = mDirtyRect.Union(aOther.mDirtyRect);
+  }
+
+  gfx::IntRect mDirtyRect;
+
+  bool mFrameAdvanced : 1;
+
+  bool mAnimationFinished : 1;
+};
+
+class FrameAnimator {
+ public:
+  FrameAnimator(RasterImage* aImage, const gfx::IntSize& aSize)
+      : mImage(aImage), mSize(aSize) {
+    MOZ_COUNT_CTOR(FrameAnimator);
+  }
+
+  MOZ_COUNTED_DTOR(FrameAnimator)
+
+  void ResetAnimation(AnimationState& aState);
+
+  RefreshResult RequestRefresh(AnimationState& aState, const TimeStamp& aTime);
+
+  LookupResult GetCompositedFrame(AnimationState& aState, bool aMarkUsed);
+
+ private:  
+  RefreshResult AdvanceFrame(AnimationState& aState, DrawableSurface& aFrames,
+                             RefPtr<imgFrame>& aCurrentFrame, TimeStamp aTime);
+
+  TimeStamp GetCurrentImgFrameEndTime(AnimationState& aState,
+                                      FrameTimeout aCurrentTimeout) const;
+
+ private:  
+  RasterImage* mImage;
+
+  gfx::IntSize mSize;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_FrameAnimator_h

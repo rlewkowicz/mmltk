@@ -1,0 +1,123 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef AudioSinkWrapper_h_
+#define AudioSinkWrapper_h_
+
+#include "AudioSink.h"
+#include "MediaSink.h"
+#include "mozilla/AbstractThread.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/EventTargetCapability.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/UniquePtr.h"
+
+namespace mozilla {
+class MediaData;
+template <class T>
+class MediaQueue;
+
+class AudioSinkWrapper : public MediaSink {
+  using PlaybackParams = AudioSink::PlaybackParams;
+  using SinkCreator = std::function<UniquePtr<AudioSink>()>;
+
+ public:
+  AudioSinkWrapper(AbstractThread* aOwnerThread,
+                   MediaQueue<AudioData>& aAudioQueue, SinkCreator aFunc,
+                   double aVolume, double aPlaybackRate, bool aPreservesPitch,
+                   RefPtr<AudioDeviceInfo> aAudioDevice)
+      : mOwnerThread(aOwnerThread),
+        mAsyncInitTaskQueue(CreateAsyncInitTaskQueue()),
+        mSinkCreator(std::move(aFunc)),
+        mAudioDevice(std::move(aAudioDevice)),
+        mParams(aVolume, aPlaybackRate, aPreservesPitch),
+        mAudioQueue(aAudioQueue),
+        mRetrySinkTime(TimeStamp::Now()) {
+    MOZ_ASSERT(mAsyncInitTaskQueue);
+  }
+
+  RefPtr<EndedPromise> OnEnded(TrackType aType) override;
+  media::TimeUnit GetEndTime(TrackType aType) const override;
+  media::TimeUnit GetPosition(TimeStamp* aTimeStamp = nullptr) override;
+  bool HasUnplayedFrames(TrackType aType) const override;
+  media::TimeUnit UnplayedDuration(TrackType aType) const override;
+  void DropAudioPacketsIfNeeded(const media::TimeUnit& aMediaPosition);
+
+  void SetVolume(double aVolume) override;
+  void SetStreamName(const nsAString& aStreamName) override;
+  void SetPlaybackRate(double aPlaybackRate) override;
+  void SetPreservesPitch(bool aPreservesPitch) override;
+  void SetPlaying(bool aPlaying) override;
+  RefPtr<GenericPromise> SetAudioDevice(
+      RefPtr<AudioDeviceInfo> aDevice) override;
+
+  double PlaybackRate() const override;
+
+  nsresult Start(const media::TimeUnit& aStartTime, const MediaInfo& aInfo,
+                 StartType aStartType = StartType::Initial) override;
+  void Stop() override;
+  bool IsStarted() const override;
+  bool IsPlaying() const override;
+
+  void Shutdown() override;
+
+  void GetDebugInfo(dom::MediaSinkDebugInfo& aInfo) override;
+
+ private:
+  enum class ClockSource {
+    AudioStream,
+    SystemClock,
+    Paused
+  } mLastClockSource = ClockSource::Paused;
+  static already_AddRefed<TaskQueue> CreateAsyncInitTaskQueue();
+  bool IsMuted() const;
+  void OnMuted(bool aMuted);
+  virtual ~AudioSinkWrapper();
+
+  void AssertOwnerThread() const MOZ_ASSERT_CAPABILITY(mOwnerThread) {
+    mOwnerThread.AssertOnCurrentThread();
+  }
+
+  bool NeedAudioSink();
+  void StartAudioSink(UniquePtr<AudioSink> aAudioSink,
+                      const media::TimeUnit& aStartTime);
+  void ShutDownAudioSink();
+  nsresult SyncCreateAudioSink(const media::TimeUnit& aStartTime);
+  RefPtr<GenericPromise> MaybeAsyncCreateAudioSink(
+      RefPtr<AudioDeviceInfo> aDevice);
+  void ScheduleRetrySink();
+
+  media::TimeUnit GetSystemClockPosition(TimeStamp aNow) const;
+  bool CheckIfEnded() const;
+
+  void OnAudioEnded(const EndedPromise::ResolveOrRejectValue& aValue);
+
+  bool IsAudioSourceEnded(const MediaInfo& aInfo) const;
+
+  const EventTargetCapability<AbstractThread> mOwnerThread;
+  const RefPtr<TaskQueue> mAsyncInitTaskQueue;
+  SinkCreator mSinkCreator;
+  UniquePtr<AudioSink> mAudioSink;
+  RefPtr<AudioDeviceInfo> mAudioDevice;
+  RefPtr<EndedPromise> mEndedPromise;
+  MozPromiseHolder<EndedPromise> mEndedPromiseHolder;
+  bool mIsStarted = false;
+  PlaybackParams MOZ_GUARDED_BY(mOwnerThread) mParams;
+  TimeStamp mClockStartTime;
+  media::TimeUnit mPositionAtClockStart = media::TimeUnit::Invalid();
+  media::TimeUnit mLastPacketEndTime;
+
+  bool mAudioEnded = true;
+  MozPromiseRequestHolder<EndedPromise> mAudioSinkEndedRequest;
+  MediaQueue<AudioData>& mAudioQueue;
+
+  TimeStamp mRetrySinkTime;
+  uint32_t mAsyncCreateCount = 0;
+  mozilla::Atomic<uint32_t> mAsyncDispatchSeq{0};
+};
+
+}  
+
+#endif  // AudioSinkWrapper_h_

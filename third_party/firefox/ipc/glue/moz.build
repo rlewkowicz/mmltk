@@ -1,0 +1,232 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+EXPORTS += [
+    "nsIIPCSerializableInputStream.h",
+    "nsIIPCSerializableURI.h",
+]
+
+EXPORTS.mozilla.ipc += [
+    "AsyncBlockers.h",
+    "BackgroundChild.h",
+    "BackgroundParent.h",
+    "BackgroundStarterChild.h",
+    "BackgroundStarterParent.h",
+    "BackgroundUtils.h",
+    "BigBuffer.h",
+    "ByteBuf.h",
+    "ByteBufUtils.h",
+    "CrossProcessMutex.h",
+    "CrossProcessSemaphore.h",
+    "DataPipe.h",
+    "EagerIPCStream.h",
+    "Endpoint.h",
+    "EnvironmentMap.h",
+    "FileDescriptor.h",
+    "FileDescriptorUtils.h",
+    "GeckoChildProcessHost.h",
+    "IdleSchedulerChild.h",
+    "IdleSchedulerParent.h",
+    "InputStreamUtils.h",
+    "IOThread.h",
+    "IPCCore.h",
+    "IPCForwards.h",
+    "IPCStreamUtils.h",
+    "IPCTypes.h",
+    "IPDLStructMember.h",
+    "LaunchError.h",
+    "MessageChannel.h",
+    "MessageLink.h",
+    "MessagePump.h",
+    "NodeChannel.h",
+    "NodeController.h",
+    "ProcessChild.h",
+    "ProcessUtils.h",
+    "ProtocolMessageUtils.h",
+    "ProtocolUtils.h",
+    "RandomAccessStreamUtils.h",
+    "RustMessageUtils.h",
+    "ScopedPort.h",
+    "SerializedStructuredCloneBuffer.h",
+    "SerializeToBytesUtil.h",
+    "SharedMemoryCursor.h",
+    "SharedMemoryHandle.h",
+    "SharedMemoryMapping.h",
+    "Shmem.h",
+    "ShmemMessageUtils.h",
+    "SideVariant.h",
+    "TaintingIPCUtils.h",
+    "TaskFactory.h",
+    "TransportSecurityInfoUtils.h",
+    "URIUtils.h",
+    "UtilityMediaService.h",
+    "UtilityMediaServiceChild.h",
+    "UtilityMediaServiceParent.h",
+    "UtilityProcessChild.h",
+    "UtilityProcessHost.h",
+    "UtilityProcessImpl.h",
+    "UtilityProcessManager.h",
+    "UtilityProcessParent.h",
+    "UtilityProcessTypes.h",
+]
+
+
+UNIFIED_SOURCES += [
+    "CrossProcessMutex_posix.cpp",
+]
+
+UNIFIED_SOURCES += [
+    "CrossProcessSemaphore_posix.cpp",
+]
+
+UNIFIED_SOURCES += ["SharedMemoryPlatform_posix.cpp"]
+
+
+UNIFIED_SOURCES += [
+    "ProcessUtils_linux.cpp",
+    "SetProcessTitle.cpp",
+]
+EXPORTS.mozilla.ipc += [
+    "SetProcessTitle.h",
+]
+
+EXPORTS.mozilla.ipc += [
+    "FileDescriptorShuffle.h",
+]
+UNIFIED_SOURCES += [
+    "FileDescriptorShuffle.cpp",
+]
+
+
+EXPORTS.ipc += [
+    "EnumSerializer.h",
+    "IPCMessageUtils.h",
+    "IPCMessageUtilsSpecializations.h",
+]
+
+UNIFIED_SOURCES += [
+    "BackgroundImpl.cpp",
+    "BackgroundUtils.cpp",
+    "BigBuffer.cpp",
+    "DataPipe.cpp",
+    "Endpoint.cpp",
+    "FileDescriptor.cpp",
+    "FileDescriptorUtils.cpp",
+    "IdleSchedulerChild.cpp",
+    "IdleSchedulerParent.cpp",
+    "InputStreamUtils.cpp",
+    "IOThread.cpp",
+    "IPCMessageUtilsSpecializations.cpp",
+    "IPCStreamUtils.cpp",
+    "MessageChannel.cpp",
+    "MessageLink.cpp",
+    "MessagePump.cpp",
+    "NodeChannel.cpp",
+    "NodeController.cpp",
+    "ProcessChild.cpp",
+    "ProcessUtils_common.cpp",
+    "ProtocolUtils.cpp",
+    "RandomAccessStreamUtils.cpp",
+    "ScopedPort.cpp",
+    "SerializedStructuredCloneBuffer.cpp",
+    "SharedMemoryCursor.cpp",
+    "SharedMemoryHandle.cpp",
+    "SharedMemoryMapping.cpp",
+    "Shmem.cpp",
+    "StringUtil.cpp",
+    "TransportSecurityInfoUtils.cpp",
+    "URIUtils.cpp",
+    "UtilityMediaService.cpp",
+    "UtilityMediaServiceChild.cpp",
+    "UtilityMediaServiceParent.cpp",
+    "UtilityProcessChild.cpp",
+    "UtilityProcessHost.cpp",
+    "UtilityProcessImpl.cpp",
+    "UtilityProcessManager.cpp",
+    "UtilityProcessParent.cpp",
+]
+
+SOURCES += [
+    "BackgroundChildImpl.cpp",
+    "BackgroundParentImpl.cpp",
+]
+
+UNIFIED_SOURCES += [
+    "GeckoChildProcessHost.cpp",
+]
+
+
+LOCAL_INCLUDES += [
+    "/caps",
+    "/dom/broadcastchannel",
+    "/dom/indexedDB",
+    "/dom/storage",
+    "/netwerk/base",
+    "/third_party/abseil-cpp",
+    "/xpcom/build",
+]
+
+PREPROCESSED_IPDL_SOURCES = [
+    "PUtilityProcess.ipdl",
+]
+
+IPDL_SOURCES = [
+    "InputStreamParams.ipdlh",
+    "IPCStream.ipdlh",
+    "PBackground.ipdl",
+    "PBackgroundSharedTypes.ipdlh",
+    "PBackgroundStarter.ipdl",
+    "PIdleScheduler.ipdl",
+    "ProtocolTypes.ipdlh",
+    "PUtilityMediaService.ipdl",
+    "RandomAccessStreamParams.ipdlh",
+    "URIParams.ipdlh",
+]
+
+if CONFIG["MOZ_ENABLE_FORKSERVER"]:
+    EXPORTS.mozilla.ipc += [
+        "ForkServer.h",
+        "ForkServiceChild.h",
+        "MiniTransceiver.h",
+    ]
+    UNIFIED_SOURCES += [
+        "ForkServer.cpp",
+        "ForkServiceChild.cpp",
+        "MiniTransceiver.cpp",
+    ]
+    XPCOM_MANIFESTS += [
+        "components.conf",
+    ]
+
+LOCAL_INCLUDES += [
+    "/dom/ipc",
+    "/toolkit/xre",
+    "/xpcom/base",
+    "/xpcom/threads",
+]
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+FINAL_LIBRARY = "xul"
+
+
+extra_vars = ()
+if CONFIG["NIGHTLY_BUILD"] and not CONFIG["MOZ_NO_SMART_CARDS"]:
+    extra_vars = (
+        "MOZ_PKCS11_PROCESS_NAME_BRANDED",
+        "MOZ_PKCS11_PROCESS_BUNDLENAME",
+    )
+
+for var in (
+    "MOZ_CHILD_PROCESS_NAME",
+    "MOZ_CHILD_PROCESS_BUNDLENAME",
+    "MOZ_EME_PROCESS_NAME_BRANDED",
+    "MOZ_EME_PROCESS_BUNDLENAME",
+    "MOZ_GPU_PROCESS_NAME_BRANDED",
+    "MOZ_GPU_PROCESS_BUNDLENAME",
+) + extra_vars:
+    DEFINES[var] = '"%s"' % CONFIG[var]
+
+
+
+# Add libFuzzer configuration directives

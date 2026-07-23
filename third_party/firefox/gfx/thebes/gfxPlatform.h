@@ -1,0 +1,653 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_PLATFORM_H
+#define GFX_PLATFORM_H
+
+#include "mozilla/gfx/Types.h"
+#include "mozilla/intl/UnicodeScriptCodes.h"
+#include "nsTArray.h"
+#include "nsString.h"
+#include "nsCOMPtr.h"
+
+#include "gfxFeatureStatus.h"
+#include "gfxTypes.h"
+#include "gfxSkipChars.h"
+
+#include "qcms.h"
+
+#include "mozilla/RefPtr.h"
+#include "GfxInfoCollector.h"
+
+#include "mozilla/Maybe.h"
+#include "mozilla/layers/CompositorTypes.h"
+#include "mozilla/layers/LayersTypes.h"
+#include "mozilla/layers/MemoryPressureObserver.h"
+#include "mozilla/layers/OverlayInfo.h"
+
+class FontVisibilityProvider;
+class gfxASurface;
+class gfxFont;
+class gfxFontGroup;
+struct gfxFontStyle;
+class gfxUserFontSet;
+class gfxFontEntry;
+class gfxPlatformFontList;
+class gfxTextRun;
+class nsIURI;
+class nsAtom;
+class nsIObserver;
+class SRGBOverrideObserver;
+class gfxTextPerfMetrics;
+typedef struct FT_LibraryRec_* FT_Library;
+
+namespace mozilla {
+struct StyleFontFamilyList;
+struct StyleFontFaceSourceTechFlags;
+enum class StyleFontFaceSourceFormatKeyword : uint8_t;
+class WeightRange;
+class StretchRange;
+class SlantStyleRange;
+class LogModule;
+class VsyncDispatcher;
+namespace layers {
+class FrameStats;
+}
+namespace gfx {
+class DrawTarget;
+class SourceSurface;
+class DataSourceSurface;
+class ScaledFont;
+class VsyncSource;
+class SoftwareVsyncSource;
+class ContentDeviceData;
+class GPUDeviceData;
+class FeatureState;
+
+inline uint32_t BackendTypeBit(BackendType b) { return 1 << uint8_t(b); }
+
+}  
+namespace dom {
+class SystemFontListEntry;
+class SystemFontList;
+}  
+}  
+
+#define MOZ_PERFORMANCE_WARNING(module, ...)      \
+  do {                                            \
+    if (gfxPlatform::PerfWarnings()) {            \
+      printf_stderr("[" module "] " __VA_ARGS__); \
+    }                                             \
+  } while (0)
+
+enum class CMSMode : int32_t {
+  Off = 0,         
+  All = 1,         
+  TaggedOnly = 2,  
+  _ENUM_MAX = TaggedOnly
+};
+
+enum eGfxLog : uint8_t {
+  eGfxLog_fontlist = 0,
+  eGfxLog_fontinit = 1,
+  eGfxLog_textrun = 2,
+  eGfxLog_textrunui = 3,
+  eGfxLog_cmapdata = 4,
+  eGfxLog_textperf = 5,
+  eGfxLog_fontquery = 6
+};
+
+enum class FontPresentation : uint8_t {
+  Any = 0,
+  TextDefault,
+  TextExplicit,
+  EmojiDefault,
+  EmojiExplicit,
+};
+
+inline bool PrefersColor(FontPresentation aPresentation) {
+  return aPresentation >= FontPresentation::EmojiDefault;
+}
+
+inline bool IsExplicitPresentation(FontPresentation aPresentation) {
+  return aPresentation == FontPresentation::TextExplicit ||
+         aPresentation == FontPresentation::EmojiExplicit;
+}
+
+const uint32_t kMaxLenPrefLangList = 32;
+
+#define UNINITIALIZED_VALUE (-1)
+
+inline const char* GetBackendName(mozilla::gfx::BackendType aBackend) {
+  switch (aBackend) {
+    case mozilla::gfx::BackendType::CAIRO:
+      return "cairo";
+    case mozilla::gfx::BackendType::SKIA:
+      return "skia";
+    case mozilla::gfx::BackendType::RECORDING:
+      return "recording";
+    case mozilla::gfx::BackendType::WEBRENDER_TEXT:
+      return "webrender text";
+    case mozilla::gfx::BackendType::NONE:
+      return "none";
+    case mozilla::gfx::BackendType::WEBGL:
+      return "webgl";
+    case mozilla::gfx::BackendType::BACKEND_LAST:
+      return "invalid";
+  }
+  MOZ_CRASH("Incomplete switch");
+}
+
+struct BackendPrefsData {
+  uint32_t mCanvasBitmask = 0;
+  mozilla::gfx::BackendType mCanvasDefault = mozilla::gfx::BackendType::NONE;
+  uint32_t mContentBitmask = 0;
+  mozilla::gfx::BackendType mContentDefault = mozilla::gfx::BackendType::NONE;
+};
+
+class gfxPlatform : public mozilla::layers::MemoryPressureListener {
+  friend class SRGBOverrideObserver;
+
+ public:
+  using WeightRange = mozilla::WeightRange;
+  using StretchRange = mozilla::StretchRange;
+  using SlantStyleRange = mozilla::SlantStyleRange;
+  typedef mozilla::gfx::sRGBColor sRGBColor;
+  typedef mozilla::gfx::DeviceColor DeviceColor;
+  typedef mozilla::gfx::DataSourceSurface DataSourceSurface;
+  typedef mozilla::gfx::DrawTarget DrawTarget;
+  typedef mozilla::gfx::IntSize IntSize;
+  typedef mozilla::gfx::SourceSurface SourceSurface;
+  typedef mozilla::intl::Script Script;
+
+  static gfxPlatform* GetPlatform() {
+    if (MOZ_UNLIKELY(!gPlatform)) {
+      Init();
+    }
+    return gPlatform;
+  }
+
+  static bool Initialized();
+
+  static void Shutdown();
+
+  static void InitChild(const mozilla::gfx::ContentDeviceData& aData);
+
+  static void InitLayersIPC();
+  static void ShutdownLayersIPC();
+
+  static void InitNullMetadata();
+
+  static int32_t MaxTextureSize();
+  static int32_t MaxAllocSize();
+  static void InitMoz2DLogging();
+
+  static void InitMemoryReportersForGPUProcess();
+
+  static bool UseRemoteCanvas();
+
+  static bool UseHDR();
+
+  static bool IsBackendAccelerated(
+      const mozilla::gfx::BackendType aBackendType);
+
+  virtual already_AddRefed<gfxASurface> CreateOffscreenSurface(
+      const IntSize& aSize, gfxImageFormat aFormat) = 0;
+
+  static already_AddRefed<DrawTarget> CreateDrawTargetForSurface(
+      gfxASurface* aSurface, const mozilla::gfx::IntSize& aSize);
+
+  static already_AddRefed<SourceSurface> GetSourceSurfaceForSurface(
+      RefPtr<mozilla::gfx::DrawTarget> aTarget, gfxASurface* aSurface,
+      bool aIsPlugin = false);
+
+  static void ClearSourceSurfaceForSurface(gfxASurface* aSurface);
+
+  static already_AddRefed<DataSourceSurface> GetWrappedDataSourceSurface(
+      gfxASurface* aSurface);
+
+  already_AddRefed<DrawTarget> CreateOffscreenContentDrawTarget(
+      const mozilla::gfx::IntSize& aSize, mozilla::gfx::SurfaceFormat aFormat,
+      bool aFallback = false);
+
+  already_AddRefed<DrawTarget> CreateOffscreenCanvasDrawTarget(
+      const mozilla::gfx::IntSize& aSize, mozilla::gfx::SurfaceFormat aFormat,
+      bool aRequireSoftwareRender = false);
+
+  already_AddRefed<DrawTarget> CreateSimilarSoftwareDrawTarget(
+      DrawTarget* aDT, const IntSize& aSize,
+      mozilla::gfx::SurfaceFormat aFormat);
+
+  static already_AddRefed<DrawTarget> CreateDrawTargetForData(
+      unsigned char* aData, const mozilla::gfx::IntSize& aSize, int32_t aStride,
+      mozilla::gfx::SurfaceFormat aFormat, bool aUninitialized = false,
+      bool aIsClear = false);
+
+  bool SupportsAzureContentForDrawTarget(mozilla::gfx::DrawTarget* aTarget);
+
+  bool SupportsAzureContentForType(mozilla::gfx::BackendType aType) {
+    return BackendTypeBit(aType) & mContentBackendBitmask;
+  }
+
+  static bool AsyncPanZoomEnabled();
+
+  const char* GetAzureCanvasBackend() const;
+  const char* GetAzureContentBackend() const;
+
+  void GetAzureBackendInfo(mozilla::widget::InfoObject& aObj);
+  void GetApzSupportInfo(mozilla::widget::InfoObject& aObj);
+  void GetFrameStats(mozilla::widget::InfoObject& aObj);
+  void GetCMSSupportInfo(mozilla::widget::InfoObject& aObj);
+  void GetDisplayInfo(mozilla::widget::InfoObject& aObj);
+  void GetOverlayInfo(mozilla::widget::InfoObject& aObj);
+  void GetSwapChainInfo(mozilla::widget::InfoObject& aObj);
+
+  mozilla::gfx::BackendType GetDefaultContentBackend() const {
+    return mContentBackend;
+  }
+
+  mozilla::gfx::BackendType GetSoftwareBackend() { return mSoftwareBackend; }
+
+  virtual mozilla::gfx::BackendType GetContentBackendFor(
+      mozilla::layers::LayersBackend aLayers) {
+    return mContentBackend;
+  }
+
+  virtual mozilla::gfx::BackendType GetPreferredCanvasBackend() {
+    return mPreferredCanvasBackend;
+  }
+  mozilla::gfx::BackendType GetFallbackCanvasBackend() {
+    return mFallbackCanvasBackend;
+  }
+
+
+  virtual nsresult GetFontList(nsAtom* aLangGroup,
+                               const nsACString& aGenericFamily,
+                               nsTArray<nsString>& aListOfFonts);
+
+  virtual void ReadSystemFontList(mozilla::dom::SystemFontList*) {};
+
+  nsresult UpdateFontList(bool aFullRebuild = true);
+
+  virtual bool CreatePlatformFontList() = 0;
+
+  void GetStandardFamilyName(const nsCString& aFontName,
+                             nsACString& aFamilyName);
+
+  nsAutoCString GetDefaultFontName(const nsACString& aLangGroup,
+                                   const nsACString& aGenericFamily);
+
+  already_AddRefed<gfxFontEntry> LookupLocalFont(
+      FontVisibilityProvider* aFontVisibilityProvider,
+      const nsACString& aFontName, const WeightRange& aWeightForEntry,
+      const StretchRange& aStretchForEntry,
+      const SlantStyleRange& aStyleForEntry);
+
+  already_AddRefed<gfxFontEntry> MakePlatformFont(
+      const nsACString& aFontName, const WeightRange& aWeightForEntry,
+      const StretchRange& aStretchForEntry,
+      const SlantStyleRange& aStyleForEntry, const uint8_t* aFontData,
+      uint32_t aLength);
+
+  bool DownloadableFontsEnabled();
+
+  virtual bool FontHintingEnabled() { return true; }
+
+  virtual bool RequiresLinearZoom() { return false; }
+
+  virtual bool RespectsFontStyleSmoothing() const { return false; }
+
+  bool UseCmapsDuringSystemFallback();
+
+  bool OpenTypeSVGEnabled();
+
+  uint32_t WordCacheCharLimit();
+
+  uint32_t WordCacheMaxEntries();
+
+  virtual bool IsFontFormatSupported(
+      mozilla::StyleFontFaceSourceFormatKeyword aFormatHint,
+      const mozilla::StyleFontFaceSourceTechFlags& aTechFlags);
+
+  bool IsKnownIconFontFamily(const nsAtom* aFamilyName) const;
+
+  virtual bool DidRenderingDeviceReset(
+      mozilla::gfx::DeviceResetReason* aResetReason = nullptr) {
+    return false;
+  }
+
+  virtual void GetCommonFallbackFonts(uint32_t , Script ,
+                                      FontPresentation ,
+                                      nsTArray<const char*>& ) {
+  }
+
+  static bool InSafeMode();
+
+  static bool OffMainThreadCompositingEnabled();
+
+  inline static void EnsureCMSInitialized() {
+    if (MOZ_UNLIKELY(!gCMSInitialized)) {
+      MaybeInitializeCMS();
+      MOZ_ASSERT(gCMSInitialized);
+    }
+  }
+
+  static CMSMode GetCMSMode() {
+    EnsureCMSInitialized();
+    return gCMSMode;
+  }
+
+  static void SetCMSModeOverride(CMSMode aMode);
+
+  static int GetRenderingIntent();
+
+  static DeviceColor TransformPixel(const sRGBColor& in,
+                                    qcms_transform* transform);
+
+  static qcms_profile* GetCMSOutputProfile() {
+    return GetPlatform()->mCMSOutputProfile;
+  }
+
+  static const mozilla::Maybe<nsTArray<uint8_t>>& GetCMSOutputICCProfileData() {
+    MOZ_ASSERT(qcms_profile_is_sRGB(GetPlatform()->mCMSsRGBProfile));
+    MOZ_ASSERT(GetPlatform()->mCMSsRGBProfile !=
+               GetPlatform()->mCMSOutputProfile);
+    return GetPlatform()->mCMSOutputProfileData;
+  }
+
+  static qcms_profile* GetCMSsRGBProfile() {
+    return GetPlatform()->mCMSsRGBProfile;
+  }
+
+  static qcms_transform* GetCMSRGBTransform() {
+    return GetPlatform()->mCMSRGBTransform;
+  }
+
+  static qcms_transform* GetCMSInverseRGBTransform() {
+    return GetPlatform()->mCMSInverseRGBTransform;
+  }
+
+  static qcms_transform* GetCMSRGBATransform() {
+    return GetPlatform()->mCMSRGBATransform;
+  }
+
+  static qcms_transform* GetCMSBGRATransform() {
+    return GetPlatform()->mCMSBGRATransform;
+  }
+
+  static qcms_transform* GetCMSOSRGBATransform();
+
+  static qcms_data_type GetCMSOSRGBAType();
+
+  virtual void FontsPrefsChanged(const char* aPref);
+
+  uint32_t GetBidiNumeralOption();
+
+  enum class GlobalReflowFlags : uint8_t {
+    None = 0,
+    FontsChanged = (1 << 0),
+    NeedsReframe = (1 << 1),
+    BroadcastToChildren = (1 << 2),
+    ALL_BITS = FontsChanged | NeedsReframe | BroadcastToChildren,
+  };
+  static void ForceGlobalReflow(GlobalReflowFlags aFlags);
+
+  static void FlushFontAndWordCaches();
+
+  RefPtr<mozilla::gfx::DrawTarget> ScreenReferenceDrawTarget();
+
+  static RefPtr<mozilla::gfx::DrawTarget>
+  ThreadLocalScreenReferenceDrawTarget();
+
+  virtual mozilla::gfx::SurfaceFormat Optimal2DFormatForContent(
+      gfxContentType aContent);
+
+  virtual gfxImageFormat OptimalFormatForContent(gfxContentType aContent);
+
+  virtual gfxImageFormat GetOffscreenFormat() {
+    return mozilla::gfx::SurfaceFormat::X8R8G8B8_UINT32;
+  }
+
+  static mozilla::LogModule* GetLog(eGfxLog aWhichLog);
+
+  static void PurgeSkiaFontCache();
+
+  static bool UsesOffMainThreadCompositing();
+
+  RefPtr<mozilla::VsyncDispatcher> GetGlobalVsyncDispatcher();
+
+  static bool IsInLayoutAsapMode();
+
+  static bool ForceSoftwareVsync();
+
+  static int GetSoftwareVsyncRate();
+
+  static int GetDefaultFrameRate();
+
+  static void ReInitFrameRate(const char* aPrefIgnored, void* aDataIgnored);
+
+  static void ResetHardwareVsyncSource();
+
+  void UpdateForceSubpixelAAWherePossible();
+
+  virtual bool SupportsApzWheelInput() const { return false; }
+  bool SupportsApzTouchInput() const;
+  bool SupportsApzDragInput() const;
+  bool SupportsApzKeyboardInput() const;
+  bool SupportsApzAutoscrolling() const;
+  bool SupportsApzZooming() const;
+
+  virtual void SchedulePaintIfDeviceReset() {}
+
+  already_AddRefed<DrawTarget> CreateDrawTargetForBackend(
+      mozilla::gfx::BackendType aBackend, const mozilla::gfx::IntSize& aSize,
+      mozilla::gfx::SurfaceFormat aFormat);
+
+  static bool PerfWarnings();
+
+  static void DisableAcceleratedCanvasForFallback(
+      mozilla::gfx::FeatureStatus aStatus, const char* aMessage,
+      const nsACString& aFailureId);
+
+  static void DisableAllCanvasForFallback(mozilla::gfx::FeatureStatus aStatus,
+                                          const char* aMessage,
+                                          const nsACString& aFailureId);
+  static void DisableGPUProcess();
+
+  void NotifyCompositorCreated(mozilla::layers::LayersBackend aBackend);
+  mozilla::layers::LayersBackend GetCompositorBackend() const {
+    return mCompositorBackend;
+  }
+
+  virtual void CompositorUpdated() {}
+
+  virtual bool SupportsPluginDirectBitmapDrawing() { return false; }
+
+  virtual bool RequiresAcceleratedGLContextForCompositorOGL() const {
+    return false;
+  }
+
+  static bool IsGfxInfoStatusOkay(int32_t aFeature, nsCString* aOutMessage,
+                                  nsCString& aFailureId);
+
+  const gfxSkipChars& EmptySkipChars() const { return kEmptySkipChars; }
+
+  virtual nsTArray<uint8_t> GetPlatformCMSOutputProfileData() {
+    return GetPrefCMSOutputProfileData();
+  }
+
+  virtual void BuildContentDeviceData(mozilla::gfx::ContentDeviceData* aOut);
+
+  virtual void ImportGPUDeviceData(const mozilla::gfx::GPUDeviceData& aData);
+
+  void SetOverlayInfo(const mozilla::layers::OverlayInfo& aInfo) {
+    mOverlayInfo = mozilla::Some(aInfo);
+  }
+
+  void SetSwapChainInfo(const mozilla::layers::SwapChainInfo& aInfo) {
+    mSwapChainInfo = mozilla::Some(aInfo);
+  }
+
+  static void DisableRemoteCanvas();
+
+  static bool HasVariationFontSupport();
+
+  static bool WebRenderPrefEnabled();
+  static bool WebRenderEnvvarEnabled();
+
+  static const char* WebRenderResourcePathOverride();
+
+  static bool FallbackFromAcceleration(mozilla::gfx::FeatureStatus aStatus,
+                                       const char* aMessage,
+                                       const nsACString& aFailureId,
+                                       bool aCrashAfterFinalFallback = false);
+
+  void NotifyFrameStats(nsTArray<mozilla::layers::FrameStats>&& aFrameStats);
+
+  virtual void OnMemoryPressure(
+      mozilla::layers::MemoryPressureReason aWhy) override;
+
+  virtual void EnsureDevicesInitialized() {};
+  virtual bool DevicesInitialized() { return true; };
+
+  virtual bool IsWaylandDisplay() { return false; }
+
+  static uint32_t TargetFrameRate();
+
+  static bool UseDesktopZoomingScrollbars();
+
+ protected:
+  gfxPlatform();
+  virtual ~gfxPlatform();
+
+  virtual void InitAcceleration();
+  virtual void InitWebRenderConfig();
+  void InitHardwareVideoConfig();
+  virtual void InitWebGLConfig();
+  virtual void InitWebGPUConfig();
+  virtual void InitWindowOcclusionConfig();
+  void InitBackdropFilterConfig();
+  void InitAcceleratedCanvas2DConfig();
+
+  virtual void GetPlatformDisplayInfo(mozilla::widget::InfoObject& aObj) {}
+
+  virtual void WillShutdown();
+
+  already_AddRefed<mozilla::gfx::VsyncSource> GetGlobalHardwareVsyncSource();
+
+  already_AddRefed<mozilla::gfx::VsyncSource> GetSoftwareVsyncSource();
+
+  virtual already_AddRefed<mozilla::gfx::VsyncSource>
+  CreateGlobalHardwareVsyncSource() = 0;
+
+  virtual bool AccelerateLayersByDefault();
+
+  virtual BackendPrefsData GetBackendPrefs() const;
+
+  void InitBackendPrefs(BackendPrefsData&& aPrefsData);
+
+  void ImportCachedContentDeviceData();
+  virtual void ImportContentDeviceData(
+      const mozilla::gfx::ContentDeviceData& aData);
+
+ public:
+  static nsTArray<uint8_t> GetPrefCMSOutputProfileData();
+
+ protected:
+  mozilla::Maybe<nsTArray<uint8_t>>& GetCMSOutputProfileData();
+
+  void BumpDeviceCounter();
+
+  static mozilla::gfx::BackendType GetCanvasBackendPref(
+      uint32_t aBackendBitmask);
+
+  static mozilla::gfx::BackendType GetContentBackendPref(
+      uint32_t& aBackendBitmask);
+
+  static mozilla::gfx::BackendType GetBackendPref(const char* aBackendPrefName,
+                                                  uint32_t& aBackendBitmask);
+  static mozilla::gfx::BackendType BackendTypeForName(const nsCString& aName);
+
+  int8_t mAllowDownloadableFonts;
+
+  static std::atomic<int8_t> sHasVariationFontSupport;
+
+  RefPtr<mozilla::VsyncDispatcher> mVsyncDispatcher;
+
+  RefPtr<mozilla::gfx::VsyncSource> mGlobalHardwareVsyncSource;
+
+  RefPtr<mozilla::gfx::SoftwareVsyncSource> mSoftwareVsyncSource;
+
+  RefPtr<mozilla::gfx::DrawTarget> mScreenReferenceDrawTarget;
+
+ private:
+  static void Init();
+
+  static void InitOpenGLConfig();
+
+  static void VideoDecodingFailedChangedCallback(const char* aPref, void*);
+
+  static gfxPlatform* gPlatform;
+
+  void InitializeCMS();
+  void ShutdownCMS();
+
+  void PopulateScreenInfo();
+
+  void InitCompositorAccelerationPrefs();
+  void InitGPUProcessPrefs();
+  virtual void InitPlatformGPUProcessPrefs() {}
+  virtual void InitPlatformHardwareVideoConfig() {}
+
+  static bool IsDXInterop2Blocked();
+  static bool IsDXNV12Blocked();
+  static bool IsDXP010Blocked();
+  static bool IsDXP016Blocked();
+
+  static void MaybeInitializeCMS();
+
+  static mozilla::Atomic<bool, mozilla::ReleaseAcquire> gCMSInitialized;
+  static CMSMode gCMSMode;
+
+  qcms_profile* mCMSOutputProfile = nullptr;
+  qcms_profile* mCMSsRGBProfile = nullptr;
+
+  qcms_transform* mCMSRGBTransform = nullptr;
+  qcms_transform* mCMSInverseRGBTransform = nullptr;
+  qcms_transform* mCMSRGBATransform = nullptr;
+  qcms_transform* mCMSBGRATransform = nullptr;
+  mozilla::Maybe<nsTArray<uint8_t>> mCMSOutputProfileData;
+
+  RefPtr<gfxASurface> mScreenReferenceSurface;
+  RefPtr<mozilla::layers::MemoryPressureObserver> mMemoryPressureObserver;
+
+  mozilla::gfx::BackendType mPreferredCanvasBackend;
+  mozilla::gfx::BackendType mFallbackCanvasBackend;
+  mozilla::gfx::BackendType mContentBackend;
+  mozilla::gfx::BackendType mSoftwareBackend;
+  uint32_t mContentBackendBitmask;
+
+  mozilla::widget::GfxInfoCollector<gfxPlatform> mAzureCanvasBackendCollector;
+  mozilla::widget::GfxInfoCollector<gfxPlatform> mApzSupportCollector;
+  mozilla::widget::GfxInfoCollector<gfxPlatform> mFrameStatsCollector;
+  mozilla::widget::GfxInfoCollector<gfxPlatform> mCMSInfoCollector;
+  mozilla::widget::GfxInfoCollector<gfxPlatform> mDisplayInfoCollector;
+  mozilla::widget::GfxInfoCollector<gfxPlatform> mOverlayInfoCollector;
+  mozilla::widget::GfxInfoCollector<gfxPlatform> mSwapChainInfoCollector;
+
+  nsTArray<mozilla::layers::FrameStats> mFrameStats;
+
+  mozilla::layers::LayersBackend mCompositorBackend;
+
+  mozilla::Maybe<mozilla::layers::OverlayInfo> mOverlayInfo;
+  mozilla::Maybe<mozilla::layers::SwapChainInfo> mSwapChainInfo;
+
+  const gfxSkipChars kEmptySkipChars;
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(gfxPlatform::GlobalReflowFlags)
+
+CMSMode GfxColorManagementMode();
+
+#endif /* GFX_PLATFORM_H */

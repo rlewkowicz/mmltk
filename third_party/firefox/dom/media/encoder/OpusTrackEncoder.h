@@ -1,0 +1,67 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef OpusTrackEncoder_h_
+#define OpusTrackEncoder_h_
+
+#include <speex/speex_resampler.h>
+#include <stdint.h>
+
+#include "TimeUnits.h"
+#include "TrackEncoder.h"
+
+struct OpusEncoder;
+
+namespace mozilla {
+
+class OpusMetadata : public TrackMetadataBase {
+ public:
+  nsTArray<uint8_t> mIdHeader;
+  nsTArray<uint8_t> mCommentHeader;
+  int32_t mChannels;
+  float mSamplingFrequency;
+  MetadataKind GetKind() const override { return METADATA_OPUS; }
+};
+
+class OpusTrackEncoder : public AudioTrackEncoder {
+ public:
+  OpusTrackEncoder(TrackRate aTrackRate,
+                   MediaQueue<EncodedFrame>& aEncodedDataQueue);
+  virtual ~OpusTrackEncoder();
+
+  already_AddRefed<TrackMetadataBase> GetMetadata() override;
+
+  int GetLookahead() const;
+
+ protected:
+  int NumInputFramesPerPacket() const override;
+
+  nsresult Init(int aChannels) override;
+
+  nsresult Encode(AudioSegment* aSegment) override;
+
+  int NumOutputFramesPerPacket() const;
+
+  bool NeedsResampler() const;
+
+ public:
+  const TrackRate mOutputSampleRate;
+
+ private:
+  OpusEncoder* mEncoder;
+
+  int mLookahead;
+
+  int mLookaheadWritten;
+
+  SpeexResamplerState* mResampler;
+
+  nsTArray<AudioDataValue> mResampledLeftover;
+
+  uint64_t mNumOutputFrames;
+};
+
+}  
+
+#endif

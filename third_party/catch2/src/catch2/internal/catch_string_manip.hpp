@@ -1,0 +1,42 @@
+
+
+#ifndef CATCH_STRING_MANIP_HPP_INCLUDED
+#define CATCH_STRING_MANIP_HPP_INCLUDED
+
+#include <catch2/internal/catch_lifetimebound.hpp>
+#include <catch2/internal/catch_stringref.hpp>
+
+#include <cstdint>
+#include <string>
+#include <iosfwd>
+#include <vector>
+
+namespace Catch {
+
+bool startsWith(std::string const& s, std::string const& prefix);
+bool startsWith(StringRef s, char prefix);
+bool endsWith(std::string const& s, std::string const& suffix);
+bool endsWith(std::string const& s, char suffix);
+bool contains(std::string const& s, std::string const& infix);
+void toLowerInPlace(std::string& s);
+std::string toLower(std::string const& s);
+char toLower(char c);
+std::string trim(std::string const& str);
+StringRef trim(StringRef ref CATCH_ATTR_LIFETIMEBOUND);
+
+std::vector<StringRef> splitStringRef(StringRef str CATCH_ATTR_LIFETIMEBOUND, char delimiter);
+bool replaceInPlace(std::string& str, std::string const& replaceThis, std::string const& withThis);
+
+class pluralise {
+    std::uint64_t m_count;
+    StringRef m_label;
+
+   public:
+    constexpr pluralise(std::uint64_t count, StringRef label CATCH_ATTR_LIFETIMEBOUND)
+        : m_count(count), m_label(label) {}
+
+    friend std::ostream& operator<<(std::ostream& os, pluralise const& pluraliser);
+};
+}  
+
+#endif  // CATCH_STRING_MANIP_HPP_INCLUDED

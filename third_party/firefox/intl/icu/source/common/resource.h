@@ -1,0 +1,143 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2015-2016, International Business Machines
+* Corporation and others.  All Rights Reserved.
+*******************************************************************************
+* resource.h
+*
+* created on: 2015nov04
+* created by: Markus W. Scherer
+*/
+
+#ifndef __URESOURCE_H__
+#define __URESOURCE_H__
+
+
+
+
+#include "unicode/utypes.h"
+#include "unicode/unistr.h"
+#include "unicode/ures.h"
+#include "restrace.h"
+
+struct ResourceData;
+
+U_NAMESPACE_BEGIN
+
+class ResourceValue;
+
+
+class U_COMMON_API ResourceArray {
+public:
+    ResourceArray() : items16(nullptr), items32(nullptr), length(0) {}
+
+    ResourceArray(const uint16_t *i16, const uint32_t *i32, int32_t len,
+                  const ResourceTracer& traceInfo) :
+            items16(i16), items32(i32), length(len),
+            fTraceInfo(traceInfo) {}
+
+    int32_t getSize() const { return length; }
+    UBool getValue(int32_t i, ResourceValue &value) const;
+
+    uint32_t internalGetResource(const ResourceData *pResData, int32_t i) const;
+
+private:
+    const uint16_t *items16;
+    const uint32_t *items32;
+    int32_t length;
+    ResourceTracer fTraceInfo;
+};
+
+class U_COMMON_API ResourceTable {
+public:
+    ResourceTable() : keys16(nullptr), keys32(nullptr), items16(nullptr), items32(nullptr), length(0) {}
+
+    ResourceTable(const uint16_t *k16, const int32_t *k32,
+                  const uint16_t *i16, const uint32_t *i32, int32_t len,
+                  const ResourceTracer& traceInfo) :
+            keys16(k16), keys32(k32), items16(i16), items32(i32), length(len),
+            fTraceInfo(traceInfo) {}
+
+    int32_t getSize() const { return length; }
+    UBool getKeyAndValue(int32_t i, const char *&key, ResourceValue &value) const;
+
+    UBool findValue(const char *key, ResourceValue &value) const;
+
+private:
+    const uint16_t *keys16;
+    const int32_t *keys32;
+    const uint16_t *items16;
+    const uint32_t *items32;
+    int32_t length;
+    ResourceTracer fTraceInfo;
+};
+
+class U_COMMON_API ResourceValue : public UObject {
+public:
+    virtual ~ResourceValue();
+
+    virtual UResType getType() const = 0;
+
+    virtual const char16_t *getString(int32_t &length, UErrorCode &errorCode) const = 0;
+
+    inline UnicodeString getUnicodeString(UErrorCode &errorCode) const {
+        int32_t len = 0;
+        const char16_t *r = getString(len, errorCode);
+        return UnicodeString(true, r, len);
+    }
+
+    virtual const char16_t *getAliasString(int32_t &length, UErrorCode &errorCode) const = 0;
+
+    inline UnicodeString getAliasUnicodeString(UErrorCode &errorCode) const {
+        int32_t len = 0;
+        const char16_t *r = getAliasString(len, errorCode);
+        return UnicodeString(true, r, len);
+    }
+
+    virtual int32_t getInt(UErrorCode &errorCode) const = 0;
+
+    virtual uint32_t getUInt(UErrorCode &errorCode) const = 0;
+
+    virtual const int32_t *getIntVector(int32_t &length, UErrorCode &errorCode) const = 0;
+
+    virtual const uint8_t *getBinary(int32_t &length, UErrorCode &errorCode) const = 0;
+
+    virtual ResourceArray getArray(UErrorCode &errorCode) const = 0;
+
+    virtual ResourceTable getTable(UErrorCode &errorCode) const = 0;
+
+    virtual UBool isNoInheritanceMarker() const = 0;
+
+    virtual int32_t getStringArray(UnicodeString *dest, int32_t capacity,
+                                   UErrorCode &errorCode) const = 0;
+
+    virtual int32_t getStringArrayOrStringAsArray(UnicodeString *dest, int32_t capacity,
+                                                  UErrorCode &errorCode) const = 0;
+
+    virtual UnicodeString getStringOrFirstOfArray(UErrorCode &errorCode) const = 0;
+
+protected:
+    ResourceValue() {}
+
+private:
+    ResourceValue(const ResourceValue &);  
+    ResourceValue &operator=(const ResourceValue &);  
+};
+
+class U_COMMON_API ResourceSink : public UObject {
+public:
+    ResourceSink() {}
+    virtual ~ResourceSink();
+
+    virtual void put(const char *key, ResourceValue &value, UBool noFallback,
+                     UErrorCode &errorCode) = 0;
+
+private:
+    ResourceSink(const ResourceSink &) = delete;  
+    ResourceSink &operator=(const ResourceSink &) = delete;  
+};
+
+U_NAMESPACE_END
+
+#endif

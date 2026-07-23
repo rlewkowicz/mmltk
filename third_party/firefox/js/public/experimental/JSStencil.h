@@ -1,0 +1,196 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_experimental_JSStencil_h
+#define js_experimental_JSStencil_h
+
+
+#include "mozilla/MemoryReporting.h"  // mozilla::MallocSizeOf
+#include "mozilla/RefPtr.h"           // RefPtr, already_AddRefed
+#include "mozilla/Utf8.h"             // mozilla::Utf8Unit
+#include "mozilla/Vector.h"           // mozilla::Vector
+
+#include <stddef.h>  // size_t
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "js/CompileOptions.h"  // JS::ReadOnlyCompileOptions, JS::InstantiateOptions, JS::ReadOnlyDecodeOptions
+#include "js/RootingAPI.h"   // JS::MutableHandle
+#include "js/SourceText.h"   // JS::SourceText
+#include "js/Transcoding.h"  // JS::TranscodeBuffer, JS::TranscodeRange
+#include "js/Value.h"        // JS::Value
+
+struct JS_PUBLIC_API JSContext;
+class JS_PUBLIC_API JSTracer;
+
+namespace js {
+class FrontendContext;
+namespace frontend {
+struct CompilationStencil;
+struct CompilationGCOutput;
+struct CompilationInput;
+struct PreallocatedCompilationGCOutput;
+struct InitialStencilAndDelazifications;
+}  
+}  
+
+
+namespace JS {
+
+using Stencil = js::frontend::InitialStencilAndDelazifications;
+using FrontendContext = js::FrontendContext;
+
+struct JS_PUBLIC_API InstantiationStorage {
+ private:
+  js::frontend::PreallocatedCompilationGCOutput* gcOutput_ = nullptr;
+
+  friend JS_PUBLIC_API JSScript* InstantiateGlobalStencil(
+      JSContext* cx, const InstantiateOptions& options, Stencil* stencil,
+      InstantiationStorage* storage);
+
+  friend JS_PUBLIC_API JSObject* InstantiateModuleStencil(
+      JSContext* cx, const InstantiateOptions& options, Stencil* stencil,
+      InstantiationStorage* storage);
+
+  friend JS_PUBLIC_API bool PrepareForInstantiate(
+      JS::FrontendContext* fc, JS::Stencil& stencil,
+      JS::InstantiationStorage& storage);
+
+ public:
+  InstantiationStorage() = default;
+  InstantiationStorage(InstantiationStorage&& other)
+      : gcOutput_(other.gcOutput_) {
+    other.gcOutput_ = nullptr;
+  }
+
+  ~InstantiationStorage();
+
+  void operator=(InstantiationStorage&& other) {
+    gcOutput_ = other.gcOutput_;
+    other.gcOutput_ = nullptr;
+  }
+
+ private:
+  InstantiationStorage(const InstantiationStorage& other) = delete;
+  void operator=(const InstantiationStorage& aOther) = delete;
+
+ public:
+  bool isValid() const { return !!gcOutput_; }
+};
+
+}  
+
+
+namespace JS {
+
+JS_PUBLIC_API void StencilAddRef(Stencil* stencil);
+JS_PUBLIC_API void StencilRelease(Stencil* stencil);
+
+}  
+
+namespace mozilla {
+template <>
+struct RefPtrTraits<JS::Stencil> {
+  static void AddRef(JS::Stencil* stencil) { JS::StencilAddRef(stencil); }
+  static void Release(JS::Stencil* stencil) { JS::StencilRelease(stencil); }
+};
+}  
+
+
+namespace JS {
+
+extern JS_PUBLIC_API bool StencilIsBorrowed(Stencil* stencil);
+
+extern JS_PUBLIC_API size_t SizeOfStencil(Stencil* stencil,
+                                          mozilla::MallocSizeOf mallocSizeOf);
+
+}  
+
+
+namespace JS {
+
+extern JS_PUBLIC_API already_AddRefed<Stencil> CompileGlobalScriptToStencil(
+    JSContext* cx, const ReadOnlyCompileOptions& options,
+    SourceText<mozilla::Utf8Unit>& srcBuf);
+extern JS_PUBLIC_API already_AddRefed<Stencil> CompileGlobalScriptToStencil(
+    JSContext* cx, const ReadOnlyCompileOptions& options,
+    SourceText<char16_t>& srcBuf);
+
+extern JS_PUBLIC_API already_AddRefed<Stencil> CompileModuleScriptToStencil(
+    JSContext* cx, const ReadOnlyCompileOptions& options,
+    SourceText<mozilla::Utf8Unit>& srcBuf);
+extern JS_PUBLIC_API already_AddRefed<Stencil> CompileModuleScriptToStencil(
+    JSContext* cx, const ReadOnlyCompileOptions& options,
+    SourceText<char16_t>& srcBuf);
+
+}  
+
+
+namespace JS {
+
+extern JS_PUBLIC_API JSScript* InstantiateGlobalStencil(
+    JSContext* cx, const InstantiateOptions& options, Stencil* stencil,
+    InstantiationStorage* storage = nullptr);
+
+extern JS_PUBLIC_API JSObject* InstantiateModuleStencil(
+    JSContext* cx, const InstantiateOptions& options, Stencil* stencil,
+    InstantiationStorage* storage = nullptr);
+
+}  
+
+
+namespace JS {
+
+extern JS_PUBLIC_API TranscodeResult EncodeStencil(JSContext* cx,
+                                                   Stencil* stencil,
+                                                   TranscodeBuffer& buffer);
+extern JS_PUBLIC_API TranscodeResult EncodeStencil(JS::FrontendContext* fc,
+                                                   Stencil* stencil,
+                                                   TranscodeBuffer& buffer);
+
+extern JS_PUBLIC_API TranscodeResult
+DecodeStencil(JSContext* cx, const ReadOnlyDecodeOptions& options,
+              const TranscodeRange& range, Stencil** stencilOut);
+extern JS_PUBLIC_API TranscodeResult
+DecodeStencil(JS::FrontendContext* fc, const ReadOnlyDecodeOptions& options,
+              const TranscodeRange& range, Stencil** stencilOut);
+
+
+enum class CollectDelazificationsResult {
+  NewlyStarted,
+
+  AlreadyStarted,
+
+  NotSupported,
+};
+
+extern JS_PUBLIC_API bool StartCollectingDelazifications(
+    JSContext* cx, JS::Handle<JSScript*> script, Stencil* stencil,
+    CollectDelazificationsResult& result);
+
+extern JS_PUBLIC_API bool StartCollectingDelazifications(
+    JSContext* cx, JS::Handle<JSObject*> module, Stencil* stencil,
+    CollectDelazificationsResult& result);
+
+extern JS_PUBLIC_API bool FinishCollectingDelazifications(
+    JSContext* cx, Handle<JSScript*> script, JS::Stencil** stencilOut);
+
+extern JS_PUBLIC_API bool FinishCollectingDelazifications(
+    JSContext* cx, Handle<JSObject*> module, JS::Stencil** stencilOut);
+
+extern JS_PUBLIC_API void AbortCollectingDelazifications(JSScript* script);
+extern JS_PUBLIC_API void AbortCollectingDelazifications(JSObject* module);
+
+
+extern JS_PUBLIC_API bool IsStencilCacheable(JS::Stencil* stencil);
+
+
+extern JS_PUBLIC_API size_t GetScriptSourceLength(JS::Stencil* stencil);
+
+extern JS_PUBLIC_API bool GetScriptSourceText(
+    JSContext* cx, JS::Stencil* stencil, JS::MutableHandle<JS::Value> result);
+
+}  
+
+#endif  // js_experimental_JSStencil_h

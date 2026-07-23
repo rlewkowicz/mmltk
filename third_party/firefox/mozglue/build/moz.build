@@ -1,0 +1,40 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+if CONFIG["JS_STANDALONE"] and not CONFIG["MOZ_MEMORY"]:
+    Library("mozglue")
+Library("mozglue")
+
+
+
+if CONFIG["MOZ_MEMORY"] and FORCE_SHARED_LIB:
+    pass
+    # TODO: SHARED_LIBRARY_LIBS go here
+else:
+    # Temporary, until bug 662814 lands
+    NoVisibilityFlags()
+    SOURCES += [
+        "dummy.cpp",
+    ]
+
+
+EXPORTS.mozilla += [
+    "arm.h",
+    "ppc.h",
+]
+
+
+
+if CONFIG["MOZ_LINKER"]:
+    USE_LIBS += [
+        "zlib",
+    ]
+
+LIBRARY_DEFINES["IMPL_MFBT"] = True
+LIBRARY_DEFINES["MOZ_HAS_MOZGLUE"] = True
+
+
+DIST_INSTALL = True
+
+include("replace_malloc.mozbuild")

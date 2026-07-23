@@ -1,0 +1,153 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "builtin/Boolean-inl.h"
+
+#include "jstypes.h"
+
+#include "jit/InlinableNatives.h"
+#include "js/PropertySpec.h"
+#include "util/StringBuilder.h"
+#include "vm/BigIntType.h"
+#include "vm/GlobalObject.h"
+#include "vm/JSContext.h"
+#include "vm/JSObject.h"
+
+#include "vm/BooleanObject-inl.h"
+
+using namespace js;
+
+const JSClass BooleanObject::class_ = {
+    "Boolean",
+    JSCLASS_HAS_RESERVED_SLOTS(1) | JSCLASS_HAS_CACHED_PROTO(JSProto_Boolean),
+    JS_NULL_CLASS_OPS,
+    &BooleanObject::classSpec_,
+};
+
+MOZ_ALWAYS_INLINE bool IsBoolean(HandleValue v) {
+  return v.isBoolean() || (v.isObject() && v.toObject().is<BooleanObject>());
+}
+
+static MOZ_ALWAYS_INLINE bool ThisBooleanValue(HandleValue val) {
+  MOZ_ASSERT(IsBoolean(val));
+
+  if (val.isBoolean()) {
+    return val.toBoolean();
+  }
+
+  return val.toObject().as<BooleanObject>().unbox();
+}
+
+MOZ_ALWAYS_INLINE bool bool_toSource_impl(JSContext* cx, const CallArgs& args) {
+  bool b = ThisBooleanValue(args.thisv());
+
+  JSStringBuilder sb(cx);
+  if (!sb.append("(new Boolean(") || !BooleanToStringBuilder(b, sb) ||
+      !sb.append("))")) {
+    return false;
+  }
+
+  JSString* str = sb.finishString();
+  if (!str) {
+    return false;
+  }
+  args.rval().setString(str);
+  return true;
+}
+
+static bool bool_toSource(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsBoolean, bool_toSource_impl>(cx, args);
+}
+
+MOZ_ALWAYS_INLINE bool bool_toString_impl(JSContext* cx, const CallArgs& args) {
+  bool b = ThisBooleanValue(args.thisv());
+
+  args.rval().setString(BooleanToString(cx, b));
+  return true;
+}
+
+static bool bool_toString(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsBoolean, bool_toString_impl>(cx, args);
+}
+
+MOZ_ALWAYS_INLINE bool bool_valueOf_impl(JSContext* cx, const CallArgs& args) {
+  args.rval().setBoolean(ThisBooleanValue(args.thisv()));
+  return true;
+}
+
+static bool bool_valueOf(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsBoolean, bool_valueOf_impl>(cx, args);
+}
+
+static const JSFunctionSpec boolean_methods[] = {
+    JS_FN("toSource", bool_toSource, 0, 0),
+    JS_FN("toString", bool_toString, 0, 0),
+    JS_FN("valueOf", bool_valueOf, 0, 0),
+    JS_FS_END,
+};
+
+static bool Boolean(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  bool b = args.length() != 0 ? JS::ToBoolean(args[0]) : false;
+
+  if (args.isConstructing()) {
+    RootedObject proto(cx);
+    if (!GetPrototypeFromBuiltinConstructor(cx, args, JSProto_Boolean,
+                                            &proto)) {
+      return false;
+    }
+
+    JSObject* obj = BooleanObject::create(cx, b, proto);
+    if (!obj) {
+      return false;
+    }
+
+    args.rval().setObject(*obj);
+  } else {
+    args.rval().setBoolean(b);
+  }
+  return true;
+}
+
+JSObject* BooleanObject::createPrototype(JSContext* cx, JSProtoKey key) {
+  BooleanObject* booleanProto =
+      GlobalObject::createBlankPrototype<BooleanObject>(cx, cx->global());
+  if (!booleanProto) {
+    return nullptr;
+  }
+  booleanProto->setFixedSlot(BooleanObject::PRIMITIVE_VALUE_SLOT,
+                             BooleanValue(false));
+  return booleanProto;
+}
+
+const ClassSpec BooleanObject::classSpec_ = {
+    GenericCreateConstructor<Boolean, 1, gc::AllocKind::FUNCTION,
+                             &jit::JitInfo_Boolean>,
+    BooleanObject::createPrototype,
+    nullptr,
+    nullptr,
+    boolean_methods,
+    nullptr,
+};
+
+PropertyName* js::BooleanToString(JSContext* cx, bool b) {
+  return b ? cx->names().true_ : cx->names().false_;
+}
+
+JS_PUBLIC_API bool js::ToBooleanSlow(HandleValue v) {
+  if (v.isString()) {
+    return v.toString()->length() != 0;
+  }
+  if (v.isBigInt()) {
+    return !v.toBigInt()->isZero();
+  }
+
+  MOZ_ASSERT(v.isObject());
+  return !EmulatesUndefined(&v.toObject());
+}

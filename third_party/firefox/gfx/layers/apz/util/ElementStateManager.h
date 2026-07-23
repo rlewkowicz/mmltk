@@ -1,0 +1,90 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_ElementStateManager_h
+#define mozilla_layers_ElementStateManager_h
+
+#include "nsCOMPtr.h"
+#include "nsISupportsImpl.h"
+#include "mozilla/EnumSet.h"
+
+namespace mozilla {
+
+class CancelableRunnable;
+
+namespace dom {
+class Element;
+class EventTarget;
+}  
+
+namespace layers {
+
+class DelayedClearElementActivation;
+
+namespace apz {
+enum class SingleTapState : uint8_t;
+}  
+
+class ElementStateManager final {
+  ~ElementStateManager();
+
+ public:
+  NS_INLINE_DECL_REFCOUNTING(ElementStateManager)
+
+  ElementStateManager();
+
+  enum class PreventDefault : bool { No, Yes };
+  void SetTargetElement(dom::EventTarget* aTarget,
+                        PreventDefault aTouchStartPreventDefault);
+  void HandleTouchStart(bool aCanBePanOrZoom);
+
+  void HandleStartPanning();
+
+  void ClearActivation();
+  bool HandleTouchEndEvent(apz::SingleTapState aState);
+  bool HandleTouchEnd(apz::SingleTapState aState);
+  void ProcessSingleTap();
+  void Destroy();
+
+ private:
+  RefPtr<dom::Element> mTarget;
+  bool mCanBePanOrZoom;
+  bool mCanBePanOrZoomSet;
+
+  bool mSingleTapBeforeActivation;
+
+  enum class TouchEndState : uint8_t {
+    GotTouchEndNotification,
+    GotTouchEndEvent,
+  };
+  using TouchEndStates = EnumSet<TouchEndState>;
+
+  TouchEndStates mTouchEndState;
+
+  apz::SingleTapState mSingleTapState;
+
+  RefPtr<CancelableRunnable> mSetActiveTask;
+
+  RefPtr<CancelableRunnable> mSetHoverTask;
+
+  RefPtr<DelayedClearElementActivation> mDelayedClearElementActivation;
+
+  void TriggerElementActivation();
+  void SetActive(dom::Element* aTarget);
+  void SetHover(dom::Element* aTarget);
+  void ResetActive();
+  void ResetTouchBlockState();
+  void ScheduleSetActiveTask();
+  void SetActiveTask(const nsCOMPtr<dom::Element>& aTarget);
+  void CancelActiveTask();
+  void ScheduleSetHoverTask();
+  void SetHoverTask(const nsCOMPtr<dom::Element>& aTarget);
+  void CancelHoverTask();
+  bool MaybeChangeActiveState(apz::SingleTapState aState);
+};
+
+}  
+}  
+
+#endif /* mozilla_layers_ElementStateManager_h */

@@ -1,0 +1,109 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_HttpBackgroundChannelChild_h
+#define mozilla_net_HttpBackgroundChannelChild_h
+
+#include "mozilla/net/PHttpBackgroundChannelChild.h"
+#include "mozilla/ipc/Endpoint.h"
+#include "nsIRunnable.h"
+#include "nsTArray.h"
+
+using mozilla::ipc::IPCResult;
+
+namespace mozilla {
+namespace net {
+
+class PBackgroundDataBridgeChild;
+class BackgroundDataBridgeChild;
+class HttpChannelChild;
+
+class HttpBackgroundChannelChild final : public PHttpBackgroundChannelChild {
+  friend class BackgroundChannelCreateCallback;
+  friend class PHttpBackgroundChannelChild;
+  friend class HttpChannelChild;
+  friend class BackgroundDataBridgeChild;
+
+ public:
+  explicit HttpBackgroundChannelChild();
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(HttpBackgroundChannelChild, final)
+
+  nsresult Init(HttpChannelChild* aChannelChild);
+
+  void OnChannelClosed();
+
+  bool ChannelClosed();
+
+  void OnStartRequestReceived(Maybe<uint32_t> aMultiPartID);
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  bool IsQueueEmpty() const { return mQueuedRunnables.IsEmpty(); }
+#endif
+
+ protected:
+  IPCResult RecvOnStartRequest(const nsHttpResponseHead& aResponseHead,
+                               const bool& aUseResponseHead,
+                               const nsHttpHeaderArray& aRequestHeaders,
+                               const HttpChannelOnStartRequestArgs& aArgs,
+                               const HttpChannelAltDataStream& aAltData,
+                               const TimeStamp& aOnStartRequestStart);
+
+  IPCResult RecvOnTransportAndData(const nsresult& aChannelStatus,
+                                   const nsresult& aTransportStatus,
+                                   const uint64_t& aOffset,
+                                   const nsACString& aData,
+                                   const bool& aDataFromSocketProcess,
+                                   const TimeStamp& aOnDataAvailableStart);
+
+  IPCResult RecvOnStopRequest(
+      const nsresult& aChannelStatus, const ResourceTimingStructArgs& aTiming,
+      const TimeStamp& aLastActiveTabOptHit,
+      const nsHttpHeaderArray& aResponseTrailers,
+      nsTArray<ConsoleReportCollected>&& aConsoleReports,
+      const bool& aFromSocketProcess, const TimeStamp& aOnStopRequestStart);
+
+  IPCResult RecvOnConsoleReport(
+      nsTArray<ConsoleReportCollected>&& aConsoleReports);
+
+  IPCResult RecvOnAfterLastPart(const nsresult& aStatus);
+
+  IPCResult RecvOnProgress(const int64_t& aProgress,
+                           const int64_t& aProgressMax);
+
+  IPCResult RecvOnStatus(const nsresult& aStatus);
+
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  void CreateDataBridge(Endpoint<PBackgroundDataBridgeChild>&& aEndpoint);
+
+ private:
+  virtual ~HttpBackgroundChannelChild();
+
+  bool CreateBackgroundChannel();
+
+  bool IsWaitingOnStartRequest();
+
+  RefPtr<HttpChannelChild> mChannelChild;
+
+  bool mStartReceived = false;
+
+  nsTArray<nsCOMPtr<nsIRunnable>> mQueuedRunnables;
+
+  enum ODASource {
+    ODA_PENDING = 0,      
+    ODA_FROM_PARENT = 1,  
+    ODA_FROM_SOCKET = 2   
+  };
+  ODASource mFirstODASource = ODA_PENDING;
+
+  bool mOnStopRequestCalled = false;
+
+  std::function<void()> mConsoleReportTask;
+};
+
+}  
+}  
+
+#endif  // mozilla_net_HttpBackgroundChannelChild_h

@@ -1,0 +1,347 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_ColumnNumber_h
+#define js_ColumnNumber_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+#include "mozilla/Attributes.h"  // MOZ_IMPLICIT
+
+#include <limits>    // std::numeric_limits
+#include <stdint.h>  // uint32_t
+
+namespace JS {
+
+struct WasmFunctionIndex {
+  static constexpr uint32_t Limit = std::numeric_limits<int32_t>::max() / 2;
+
+  static constexpr uint32_t DefaultBinarySourceColumnNumberOneOrigin = 1;
+
+ private:
+  uint32_t value_ = 0;
+
+ public:
+  constexpr WasmFunctionIndex() = default;
+  constexpr WasmFunctionIndex(const WasmFunctionIndex& other) = default;
+
+  inline explicit WasmFunctionIndex(uint32_t value) : value_(value) {
+    MOZ_ASSERT(valid());
+  }
+
+  uint32_t value() const { return value_; }
+
+  bool valid() const { return value_ <= Limit; }
+};
+
+struct ColumnNumberOffset {
+ private:
+  int32_t value_ = 0;
+
+ public:
+  constexpr ColumnNumberOffset() = default;
+  constexpr ColumnNumberOffset(const ColumnNumberOffset& other) = default;
+
+  inline explicit ColumnNumberOffset(int32_t value) : value_(value) {}
+
+  static constexpr ColumnNumberOffset zero() { return ColumnNumberOffset(); }
+
+  bool operator==(const ColumnNumberOffset& rhs) const {
+    return value_ == rhs.value_;
+  }
+
+  bool operator!=(const ColumnNumberOffset& rhs) const {
+    return !(*this == rhs);
+  }
+
+  int32_t value() const { return value_; }
+};
+
+struct ColumnNumberUnsignedOffset {
+ private:
+  uint32_t value_ = 0;
+
+ public:
+  constexpr ColumnNumberUnsignedOffset() = default;
+  constexpr ColumnNumberUnsignedOffset(
+      const ColumnNumberUnsignedOffset& other) = default;
+
+  inline explicit ColumnNumberUnsignedOffset(uint32_t value) : value_(value) {}
+
+  static constexpr ColumnNumberUnsignedOffset zero() {
+    return ColumnNumberUnsignedOffset();
+  }
+
+  ColumnNumberUnsignedOffset operator+(
+      const ColumnNumberUnsignedOffset& offset) const {
+    return ColumnNumberUnsignedOffset(value_ + offset.value());
+  }
+
+  ColumnNumberUnsignedOffset& operator+=(
+      const ColumnNumberUnsignedOffset& offset) {
+    value_ += offset.value();
+    return *this;
+  }
+
+  bool operator==(const ColumnNumberUnsignedOffset& rhs) const {
+    return value_ == rhs.value_;
+  }
+
+  bool operator!=(const ColumnNumberUnsignedOffset& rhs) const {
+    return !(*this == rhs);
+  }
+
+  uint32_t value() const { return value_; }
+
+  uint32_t* addressOfValueForTranscode() { return &value_; }
+};
+
+struct TaggedColumnNumberOneOrigin;
+
+namespace detail {
+
+template <uint32_t LimitValue = 0>
+struct MaybeLimitedColumnNumber {
+ public:
+  static constexpr uint32_t OriginValue = 1;
+
+ protected:
+  uint32_t value_ = OriginValue;
+
+  friend struct ::JS::TaggedColumnNumberOneOrigin;
+
+ public:
+  constexpr MaybeLimitedColumnNumber() = default;
+  MaybeLimitedColumnNumber(const MaybeLimitedColumnNumber& other) = default;
+  MaybeLimitedColumnNumber& operator=(const MaybeLimitedColumnNumber& other) =
+      default;
+
+  explicit MaybeLimitedColumnNumber(uint32_t value) : value_(value) {
+    MOZ_ASSERT(valid());
+  }
+
+  bool operator==(const MaybeLimitedColumnNumber<LimitValue>& rhs) const {
+    return value_ == rhs.value_;
+  }
+
+  bool operator!=(const MaybeLimitedColumnNumber<LimitValue>& rhs) const {
+    return !(*this == rhs);
+  }
+
+  MaybeLimitedColumnNumber<LimitValue> operator+(
+      const ColumnNumberOffset& offset) const {
+    MOZ_ASSERT(valid());
+    MOZ_ASSERT(ptrdiff_t(value_) + offset.value() >= 0);
+    return MaybeLimitedColumnNumber<LimitValue>(value_ + offset.value());
+  }
+
+  MaybeLimitedColumnNumber<LimitValue> operator+(
+      const ColumnNumberUnsignedOffset& offset) const {
+    MOZ_ASSERT(valid());
+    MOZ_ASSERT(ptrdiff_t(value_) + offset.value() >= 0);
+    return MaybeLimitedColumnNumber<LimitValue>(value_ + offset.value());
+  }
+
+  MaybeLimitedColumnNumber<LimitValue> operator-(
+      const ColumnNumberOffset& offset) const {
+    MOZ_ASSERT(valid());
+    MOZ_ASSERT(ptrdiff_t(value_) - offset.value() >= 0);
+    return MaybeLimitedColumnNumber<LimitValue>(value_ - offset.value());
+  }
+  ColumnNumberOffset operator-(
+      const MaybeLimitedColumnNumber<LimitValue>& other) const {
+    MOZ_ASSERT(valid());
+    return ColumnNumberOffset(int32_t(value_) - int32_t(other.value_));
+  }
+
+  MaybeLimitedColumnNumber<LimitValue>& operator+=(
+      const ColumnNumberOffset& offset) {
+    MOZ_ASSERT(valid());
+    MOZ_ASSERT(ptrdiff_t(value_) + offset.value() >= 0);
+    value_ += offset.value();
+    MOZ_ASSERT(valid());
+    return *this;
+  }
+  MaybeLimitedColumnNumber<LimitValue>& operator-=(
+      const ColumnNumberOffset& offset) {
+    MOZ_ASSERT(valid());
+    MOZ_ASSERT(ptrdiff_t(value_) - offset.value() >= 0);
+    value_ -= offset.value();
+    MOZ_ASSERT(valid());
+    return *this;
+  }
+
+  bool operator<(const MaybeLimitedColumnNumber<LimitValue>& rhs) const {
+    MOZ_ASSERT(valid());
+    MOZ_ASSERT(rhs.valid());
+    return value_ < rhs.value_;
+  }
+  bool operator<=(const MaybeLimitedColumnNumber<LimitValue>& rhs) const {
+    MOZ_ASSERT(valid());
+    MOZ_ASSERT(rhs.valid());
+    return value_ <= rhs.value_;
+  }
+  bool operator>(const MaybeLimitedColumnNumber<LimitValue>& rhs) const {
+    MOZ_ASSERT(valid());
+    MOZ_ASSERT(rhs.valid());
+    return value_ > rhs.value_;
+  }
+  bool operator>=(const MaybeLimitedColumnNumber<LimitValue>& rhs) const {
+    MOZ_ASSERT(valid());
+    MOZ_ASSERT(rhs.valid());
+    return value_ >= rhs.value_;
+  }
+
+  uint32_t oneOriginValue() const {
+    MOZ_ASSERT(valid());
+
+    return value_;
+  }
+
+  uint32_t* addressOfValueForTranscode() { return &value_; }
+
+  bool valid() const {
+    if constexpr (LimitValue == 0) {
+      return true;
+    }
+
+    MOZ_ASSERT(value_ != 0);
+
+    return value_ <= LimitValue;
+  }
+};
+
+static constexpr uint32_t ColumnNumberOneOriginLimit =
+    std::numeric_limits<int32_t>::max() / 2;
+
+}  
+
+struct LimitedColumnNumberOneOrigin : public detail::MaybeLimitedColumnNumber<
+                                          detail::ColumnNumberOneOriginLimit> {
+ private:
+  using Base =
+      detail::MaybeLimitedColumnNumber<detail::ColumnNumberOneOriginLimit>;
+
+ public:
+  static constexpr uint32_t Limit = detail::ColumnNumberOneOriginLimit;
+
+  static_assert(uint32_t(Limit + Limit) > Limit,
+                "Adding Limit should not overflow");
+
+  using Base::Base;
+
+  LimitedColumnNumberOneOrigin() = default;
+  LimitedColumnNumberOneOrigin(const LimitedColumnNumberOneOrigin& other) =
+      default;
+  MOZ_IMPLICIT LimitedColumnNumberOneOrigin(const Base& other) : Base(other) {}
+
+  static LimitedColumnNumberOneOrigin limit() {
+    return LimitedColumnNumberOneOrigin(Limit);
+  }
+
+  static LimitedColumnNumberOneOrigin fromUnlimited(uint32_t value) {
+    if (value > Limit) {
+      return LimitedColumnNumberOneOrigin(Limit);
+    }
+    return LimitedColumnNumberOneOrigin(value);
+  }
+  static LimitedColumnNumberOneOrigin fromUnlimited(
+      const MaybeLimitedColumnNumber<0>& value) {
+    return fromUnlimited(value.oneOriginValue());
+  }
+
+  static LimitedColumnNumberOneOrigin fromZeroOrigin(uint32_t value) {
+    return LimitedColumnNumberOneOrigin(value + 1);
+  }
+};
+
+struct ColumnNumberOneOrigin : public detail::MaybeLimitedColumnNumber<0> {
+ private:
+  using Base = detail::MaybeLimitedColumnNumber<0>;
+
+ public:
+  using Base::Base;
+  using Base::operator=;
+
+  ColumnNumberOneOrigin() = default;
+  ColumnNumberOneOrigin(const ColumnNumberOneOrigin& other) = default;
+  ColumnNumberOneOrigin& operator=(ColumnNumberOneOrigin&) = default;
+
+  MOZ_IMPLICIT ColumnNumberOneOrigin(const Base& other) : Base(other) {}
+
+  explicit ColumnNumberOneOrigin(const LimitedColumnNumberOneOrigin& other)
+      : Base(other.oneOriginValue()) {}
+
+  static ColumnNumberOneOrigin fromZeroOrigin(uint32_t value) {
+    return ColumnNumberOneOrigin(value + 1);
+  }
+};
+
+struct TaggedColumnNumberOneOrigin {
+  static constexpr uint32_t WasmFunctionTag = 1u << 31;
+
+  static_assert((WasmFunctionIndex::Limit & WasmFunctionTag) == 0);
+  static_assert((LimitedColumnNumberOneOrigin::Limit & WasmFunctionTag) == 0);
+
+ protected:
+  uint32_t value_ = LimitedColumnNumberOneOrigin::OriginValue;
+
+  explicit TaggedColumnNumberOneOrigin(uint32_t value) : value_(value) {}
+
+ public:
+  constexpr TaggedColumnNumberOneOrigin() = default;
+  TaggedColumnNumberOneOrigin(const TaggedColumnNumberOneOrigin& other) =
+      default;
+
+  explicit TaggedColumnNumberOneOrigin(
+      const LimitedColumnNumberOneOrigin& other)
+      : value_(other.value_) {
+    MOZ_ASSERT(isLimitedColumnNumber());
+  }
+  explicit TaggedColumnNumberOneOrigin(const WasmFunctionIndex& other)
+      : value_(other.value() | WasmFunctionTag) {
+    MOZ_ASSERT(isWasmFunctionIndex());
+  }
+
+  static TaggedColumnNumberOneOrigin fromRaw(uint32_t value) {
+    return TaggedColumnNumberOneOrigin(value);
+  }
+
+
+  bool operator==(const TaggedColumnNumberOneOrigin& rhs) const {
+    return value_ == rhs.value_;
+  }
+
+  bool operator!=(const TaggedColumnNumberOneOrigin& rhs) const {
+    return !(*this == rhs);
+  }
+
+  bool isLimitedColumnNumber() const { return !isWasmFunctionIndex(); }
+
+  bool isWasmFunctionIndex() const { return !!(value_ & WasmFunctionTag); }
+
+  LimitedColumnNumberOneOrigin toLimitedColumnNumber() const {
+    MOZ_ASSERT(isLimitedColumnNumber());
+    return LimitedColumnNumberOneOrigin(value_);
+  }
+
+  WasmFunctionIndex toWasmFunctionIndex() const {
+    MOZ_ASSERT(isWasmFunctionIndex());
+    return WasmFunctionIndex(value_ & ~WasmFunctionTag);
+  }
+
+  uint32_t oneOriginValue() const {
+    return isWasmFunctionIndex()
+               ? WasmFunctionIndex::DefaultBinarySourceColumnNumberOneOrigin
+               : toLimitedColumnNumber().oneOriginValue();
+  }
+
+  uint32_t rawValue() const { return value_; }
+
+  uint32_t* addressOfValueForTranscode() { return &value_; }
+};
+
+}  
+
+#endif /* js_ColumnNumber_h */

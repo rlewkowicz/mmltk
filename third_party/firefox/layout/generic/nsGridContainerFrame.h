@@ -1,0 +1,413 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsGridContainerFrame_h_
+#define nsGridContainerFrame_h_
+
+#include "mozilla/CSSOrderAwareFrameIterator.h"
+#include "mozilla/HashTable.h"
+#include "mozilla/IntrinsicISizesCache.h"
+#include "mozilla/Maybe.h"
+#include "nsAtomHashKeys.h"
+#include "nsContainerFrame.h"
+#include "nsILineIterator.h"
+
+namespace mozilla {
+class PresShell;
+namespace dom {
+class Grid;
+}
+}  
+
+nsContainerFrame* NS_NewGridContainerFrame(mozilla::PresShell* aPresShell,
+                                           mozilla::ComputedStyle* aStyle);
+
+namespace mozilla {
+
+struct ComputedGridTrackInfo {
+  ComputedGridTrackInfo(
+      uint32_t aNumLeadingImplicitTracks, uint32_t aNumExplicitTracks,
+      uint32_t aStartFragmentTrack, uint32_t aEndFragmentTrack,
+      nsTArray<nscoord>&& aPositions, nsTArray<nscoord>&& aSizes,
+      nsTArray<uint32_t>&& aStates, nsTArray<bool>&& aRemovedRepeatTracks,
+      uint32_t aRepeatFirstTrack,
+      nsTArray<nsTArray<StyleCustomIdent>>&& aResolvedLineNames,
+      bool aIsSubgrid, bool aIsMasonry)
+      : mNumLeadingImplicitTracks(aNumLeadingImplicitTracks),
+        mNumExplicitTracks(aNumExplicitTracks),
+        mStartFragmentTrack(aStartFragmentTrack),
+        mEndFragmentTrack(aEndFragmentTrack),
+        mPositions(std::move(aPositions)),
+        mSizes(std::move(aSizes)),
+        mStates(std::move(aStates)),
+        mRemovedRepeatTracks(std::move(aRemovedRepeatTracks)),
+        mResolvedLineNames(std::move(aResolvedLineNames)),
+        mRepeatFirstTrack(aRepeatFirstTrack),
+        mIsSubgrid(aIsSubgrid),
+        mIsMasonry(aIsMasonry) {}
+  uint32_t mNumLeadingImplicitTracks;
+  uint32_t mNumExplicitTracks;
+  uint32_t mStartFragmentTrack;
+  uint32_t mEndFragmentTrack;
+  nsTArray<nscoord> mPositions;
+  nsTArray<nscoord> mSizes;
+  nsTArray<uint32_t> mStates;
+  nsTArray<bool> mRemovedRepeatTracks;
+  nsTArray<nsTArray<StyleCustomIdent>> mResolvedLineNames;
+  uint32_t mRepeatFirstTrack;
+  bool mIsSubgrid;
+  bool mIsMasonry;
+};
+
+struct ComputedGridLineInfo {
+  nsTArray<nsTArray<RefPtr<nsAtom>>> mNames;
+  nsTArray<RefPtr<nsAtom>> mNamesBefore;
+  nsTArray<RefPtr<nsAtom>> mNamesAfter;
+  nsTArray<RefPtr<nsAtom>> mNamesFollowingRepeat;
+};
+}  
+
+class nsGridContainerFrame final : public nsContainerFrame,
+                                   public nsILineIterator {
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(nsGridContainerFrame)
+  NS_DECL_QUERYFRAME
+  using ComputedGridTrackInfo = mozilla::ComputedGridTrackInfo;
+  using ComputedGridLineInfo = mozilla::ComputedGridLineInfo;
+  using LogicalAxis = mozilla::LogicalAxis;
+  using BaselineSharingGroup = mozilla::BaselineSharingGroup;
+  using NamedArea = mozilla::StyleNamedArea;
+
+  template <typename T>
+  using PerBaseline = mozilla::EnumeratedArray<BaselineSharingGroup, T, 2>;
+
+  template <typename T>
+  using PerLogicalAxis = mozilla::EnumeratedArray<LogicalAxis, T, 2>;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+  void DidSetComputedStyle(ComputedStyle* aOldStyle) override;
+
+  nscoord IntrinsicISize(const mozilla::IntrinsicSizeInput& aInput,
+                         mozilla::IntrinsicISizeType aType) override;
+
+  void MarkIntrinsicISizesDirty() override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  Maybe<nscoord> GetNaturalBaselineBOffset(
+      mozilla::WritingMode aWM, BaselineSharingGroup aBaselineGroup,
+      BaselineExportContext) const override {
+    if (StyleDisplay()->IsContainLayout() ||
+        HasAnyStateBits(NS_STATE_GRID_SYNTHESIZE_BASELINE)) {
+      return Nothing{};
+    }
+    return mozilla::Some(GetBBaseline(aBaselineGroup));
+  }
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+  void ExtraContainerFrameInfo(nsACString& aTo,
+                               bool aListOnlyDeterministic) const override;
+#endif
+
+  bool DrainSelfOverflowList() override;
+  void AppendFrames(ChildListID aListID, nsFrameList&& aFrameList) override;
+  void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                    const nsLineList::iterator* aPrevFrameLine,
+                    nsFrameList&& aFrameList) override;
+  void RemoveFrame(DestroyContext&, ChildListID, nsIFrame*) override;
+
+#ifdef DEBUG
+  void SetInitialChildList(ChildListID aListID,
+                           nsFrameList&& aChildList) override;
+#endif
+
+  bool CanProvideLineIterator() const final { return true; }
+  nsILineIterator* GetLineIterator() final { return this; }
+  int32_t GetNumLines() const final;
+  bool IsLineIteratorFlowRTL() final;
+  mozilla::Result<LineInfo, nsresult> GetLine(int32_t aLineNumber) final;
+  int32_t FindLineContaining(const nsIFrame* aFrame,
+                             int32_t aStartLine = 0) final;
+  NS_IMETHOD FindFrameAt(int32_t aLineNumber, nsPoint aPos,
+                         nsIFrame** aFrameFound, bool* aPosIsBeforeFirstFrame,
+                         bool* aPosIsAfterLastFrame) final;
+  NS_IMETHOD CheckLineOrder(int32_t aLine, bool* aIsReordered,
+                            nsIFrame** aFirstVisual,
+                            nsIFrame** aLastVisual) final;
+
+  static const nsRect& GridItemCB(nsIFrame* aChild);
+
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(GridItemContainingBlockRect, nsRect)
+
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(GridColTrackInfo, ComputedGridTrackInfo)
+  const ComputedGridTrackInfo* GetComputedTemplateColumns() {
+    const ComputedGridTrackInfo* info = GetProperty(GridColTrackInfo());
+    MOZ_ASSERT(info, "Property generation wasn't requested.");
+    return info;
+  }
+
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(GridRowTrackInfo, ComputedGridTrackInfo)
+  const ComputedGridTrackInfo* GetComputedTemplateRows() {
+    const ComputedGridTrackInfo* info = GetProperty(GridRowTrackInfo());
+    MOZ_ASSERT(info, "Property generation wasn't requested.");
+    return info;
+  }
+
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(GridColumnLineInfo, ComputedGridLineInfo)
+  const ComputedGridLineInfo* GetComputedTemplateColumnLines() {
+    const ComputedGridLineInfo* info = GetProperty(GridColumnLineInfo());
+    MOZ_ASSERT(info, "Property generation wasn't requested.");
+    return info;
+  }
+
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(GridRowLineInfo, ComputedGridLineInfo)
+  const ComputedGridLineInfo* GetComputedTemplateRowLines() {
+    const ComputedGridLineInfo* info = GetProperty(GridRowLineInfo());
+    MOZ_ASSERT(info, "Property generation wasn't requested.");
+    return info;
+  }
+
+  NS_DECLARE_FRAME_PROPERTY_WITHOUT_DTOR(GridFragmentInfo, mozilla::dom::Grid)
+  mozilla::dom::Grid* GetGridFragmentInfo() {
+    return GetProperty(GridFragmentInfo());
+  }
+
+  using ImplicitNamedAreas =
+      mozilla::HashMap<mozilla::AtomHashKey, NamedArea, mozilla::AtomHashKey>;
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(ImplicitNamedAreasProperty,
+                                      ImplicitNamedAreas)
+  ImplicitNamedAreas* GetImplicitNamedAreas() const {
+    return GetProperty(ImplicitNamedAreasProperty());
+  }
+
+  using ExplicitNamedAreas = mozilla::StyleOwnedSlice<NamedArea>;
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(ExplicitNamedAreasProperty,
+                                      ExplicitNamedAreas)
+  ExplicitNamedAreas* GetExplicitNamedAreas() const {
+    return GetProperty(ExplicitNamedAreasProperty());
+  }
+
+  using nsContainerFrame::IsMasonry;
+
+  bool IsMasonry(mozilla::LogicalAxis aAxis) const;
+  bool IsColMasonry() const {
+    return HasAnyStateBits(NS_STATE_GRID_IS_COL_MASONRY);
+  }
+  bool IsRowMasonry() const {
+    return HasAnyStateBits(NS_STATE_GRID_IS_ROW_MASONRY);
+  }
+
+  bool IsMasonry() const {
+    return HasAnyStateBits(NS_STATE_GRID_IS_ROW_MASONRY |
+                           NS_STATE_GRID_IS_COL_MASONRY);
+  }
+
+  bool IsSubgrid(LogicalAxis aAxis) const {
+    return HasAnyStateBits(aAxis == mozilla::LogicalAxis::Block
+                               ? NS_STATE_GRID_IS_ROW_SUBGRID
+                               : NS_STATE_GRID_IS_COL_SUBGRID);
+  }
+  bool IsColSubgrid() const { return IsSubgrid(mozilla::LogicalAxis::Inline); }
+  bool IsRowSubgrid() const { return IsSubgrid(mozilla::LogicalAxis::Block); }
+  bool IsSubgrid() const {
+    return HasAnyStateBits(NS_STATE_GRID_IS_ROW_SUBGRID |
+                           NS_STATE_GRID_IS_COL_SUBGRID);
+  }
+
+  bool HasSubgridItems(LogicalAxis aAxis) const {
+    return HasAnyStateBits(aAxis == mozilla::LogicalAxis::Block
+                               ? NS_STATE_GRID_HAS_ROW_SUBGRID_ITEM
+                               : NS_STATE_GRID_HAS_COL_SUBGRID_ITEM);
+  }
+  bool HasSubgridItems() const {
+    return HasAnyStateBits(NS_STATE_GRID_HAS_ROW_SUBGRID_ITEM |
+                           NS_STATE_GRID_HAS_COL_SUBGRID_ITEM);
+  }
+  bool GridItemShouldStretch(const nsIFrame* aChild, LogicalAxis aAxis) const;
+
+  static bool ShouldInhibitSubgridDueToIFC(const nsIFrame* aFrame);
+
+  static nsGridContainerFrame* GetGridContainerFrame(nsIFrame* aFrame);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  static nsGridContainerFrame* GetGridFrameWithComputedInfo(nsIFrame* aFrame);
+
+  static void MarkCachedGridMeasurementsDirty(nsIFrame* aItemFrame);
+
+  class CachedBAxisMeasurement;
+  struct Subgrid;
+  struct UsedTrackSizes;
+  struct TrackSize;
+  struct GridItemInfo;
+  struct GridReflowInput;
+  struct FindItemInGridOrderResult {
+    const GridItemInfo* mItem;
+    bool mIsInEdgeTrack;
+  };
+  class TrackPlan;
+  class ItemPlan;
+
+  nsGridContainerFrame* ParentGridContainerForSubgrid() const;
+
+  enum class SizingConstraint {
+    MinContent,   
+    MaxContent,   
+    NoConstraint  
+  };
+
+ protected:
+  typedef mozilla::LogicalRect LogicalRect;
+  typedef mozilla::WritingMode WritingMode;
+  struct Grid;
+  struct GridArea;
+  class LineNameMap;
+  struct LineRange;
+  struct SharedGridData;
+  struct SubgridFallbackTrackSizingFunctions;
+  struct TrackSizingFunctions;
+  struct Tracks;
+  struct TranslatedLineRange;
+  friend nsContainerFrame* NS_NewGridContainerFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle);
+  explicit nsGridContainerFrame(ComputedStyle* aStyle,
+                                nsPresContext* aPresContext)
+      : nsContainerFrame(aStyle, aPresContext, kClassID) {
+    for (auto& perAxisBaseline : mBaseline) {
+      for (auto& baseline : perAxisBaseline) {
+        baseline = NS_INTRINSIC_ISIZE_UNKNOWN;
+      }
+    }
+  }
+
+  void InitImplicitNamedAreas(const nsStylePosition* aStyle);
+
+  using LineNameList =
+      const mozilla::StyleOwnedSlice<mozilla::StyleCustomIdent>;
+  void AddImplicitNamedAreas(mozilla::Span<LineNameList>);
+  using StyleLineNameListValue =
+      const mozilla::StyleGenericLineNameListValue<mozilla::StyleInteger>;
+  void AddImplicitNamedAreas(mozilla::Span<StyleLineNameListValue>);
+
+  nscoord ReflowChildren(GridReflowInput& aGridRI,
+                         const LogicalRect& aContentArea,
+                         const nsSize& aContainerSize,
+                         ReflowOutput& aDesiredSize, nsReflowStatus& aStatus);
+  void ReflowAbsoluteChildren(GridReflowInput& aGridRI,
+                              const LogicalRect& aContentArea,
+                              nscoord aContentBSize, ReflowOutput& aDesiredSize,
+                              nsReflowStatus& aStatus);
+
+  nscoord ComputeIntrinsicISize(const mozilla::IntrinsicSizeInput& aInput,
+                                mozilla::IntrinsicISizeType aType);
+
+  nscoord GetBBaseline(BaselineSharingGroup aBaselineGroup) const {
+    return mBaseline[mozilla::LogicalAxis::Block][aBaselineGroup];
+  }
+  nscoord GetIBaseline(BaselineSharingGroup aBaselineGroup) const {
+    return mBaseline[mozilla::LogicalAxis::Inline][aBaselineGroup];
+  }
+
+  enum BaselineSet : uint32_t {
+    eNone = 0x0,
+    eFirst = 0x1,
+    eLast = 0x2,
+    eBoth = eFirst | eLast,
+  };
+  void CalculateBaselines(BaselineSet aBaselineSet,
+                          mozilla::CSSOrderAwareFrameIterator* aIter,
+                          const nsTArray<GridItemInfo>* aGridItems,
+                          const Tracks& aTracks, uint32_t aFragmentStartTrack,
+                          uint32_t aFirstExcludedTrack, WritingMode aWM,
+                          const nsSize& aCBPhysicalSize,
+                          nscoord aCBBorderPaddingStart,
+                          nscoord aCBBorderPaddingStartEnd, nscoord aCBSize);
+
+  nscoord SynthesizeBaseline(const FindItemInGridOrderResult& aGridOrderItem,
+                             LogicalAxis aAxis, BaselineSharingGroup aGroup,
+                             const nsSize& aCBPhysicalSize, nscoord aCBSize,
+                             WritingMode aCBWM);
+  static FindItemInGridOrderResult FindFirstItemInGridOrder(
+      mozilla::CSSOrderAwareFrameIterator& aIter,
+      const nsTArray<GridItemInfo>& aGridItems, LineRange GridArea::* aMajor,
+      LineRange GridArea::* aMinor, uint32_t aFragmentStartTrack);
+  static FindItemInGridOrderResult FindLastItemInGridOrder(
+      mozilla::ReverseCSSOrderAwareFrameIterator& aIter,
+      const nsTArray<GridItemInfo>& aGridItems, LineRange GridArea::* aMajor,
+      LineRange GridArea::* aMinor, uint32_t aFragmentStartTrack,
+      uint32_t aFirstExcludedTrack);
+
+  void UpdateSubgridFrameState();
+
+  nsFrameState ComputeSelfSubgridMasonryBits() const;
+
+ private:
+  struct Fragmentainer {
+    nscoord mToFragmentainerEnd;
+    bool mIsTopOfPage;
+    bool mCanBreakAtStart;
+    bool mCanBreakAtEnd;
+    bool mIsAutoBSize;
+  };
+
+  mozilla::Maybe<nsGridContainerFrame::Fragmentainer> GetNearestFragmentainer(
+      const GridReflowInput& aGridRI) const;
+
+  nscoord ReflowInFragmentainer(GridReflowInput& aGridRI,
+                                const LogicalRect& aContentArea,
+                                ReflowOutput& aDesiredSize,
+                                nsReflowStatus& aStatus,
+                                Fragmentainer& aFragmentainer,
+                                const nsSize& aContainerSize);
+
+  nscoord ReflowRowsInFragmentainer(
+      GridReflowInput& aGridRI, const LogicalRect& aContentArea,
+      ReflowOutput& aDesiredSize, nsReflowStatus& aStatus,
+      Fragmentainer& aFragmentainer, const nsSize& aContainerSize,
+      const nsTArray<const GridItemInfo*>& aItems, uint32_t aStartRow,
+      uint32_t aEndRow, nscoord aBSize, nscoord aAvailableSize);
+
+  void ReflowInFlowChild(nsIFrame* aChild, const GridItemInfo* aGridItemInfo,
+                         nsSize aContainerSize,
+                         const mozilla::Maybe<nscoord>& aStretchBSize,
+                         const Fragmentainer* aFragmentainer,
+                         const GridReflowInput& aGridRI,
+                         const LogicalRect& aContentArea,
+                         ReflowOutput& aDesiredSize, nsReflowStatus& aStatus);
+
+  nscoord ComputeBSizeForResolvingRowSizes(
+      GridReflowInput& aGridRI, nscoord aComputedBSize,
+      const Maybe<nscoord>& aContainIntrinsicBSize) const;
+
+  nscoord ComputeIntrinsicContentBSize(
+      const GridReflowInput& aGridRI, nscoord aComputedBSize,
+      nscoord aBSizeForResolvingRowSizes,
+      const Maybe<nscoord>& aContainIntrinsicBSize) const;
+
+  nscoord MasonryLayout(GridReflowInput& aGridRI,
+                        const LogicalRect& aContentArea,
+                        SizingConstraint aConstraint,
+                        ReflowOutput& aDesiredSize, nsReflowStatus& aStatus,
+                        Fragmentainer* aFragmentainer,
+                        const nsSize& aContainerSize);
+
+  UsedTrackSizes* GetUsedTrackSizes() const;
+
+  void StoreUsedTrackSizes(LogicalAxis aAxis, const TrackPlan& aSizes);
+
+  void AddImplicitNamedAreasInternal(LineNameList& aNameList,
+                                     ImplicitNamedAreas*& aAreas);
+
+  mozilla::IntrinsicISizesCache mCachedIntrinsicSizes;
+
+  PerLogicalAxis<PerBaseline<nscoord>> mBaseline;
+};
+
+#endif /* nsGridContainerFrame_h_ */

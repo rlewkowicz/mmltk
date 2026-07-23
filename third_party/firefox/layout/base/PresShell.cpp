@@ -1,0 +1,10320 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "PresShell.h"
+
+#include <algorithm>
+
+#include "AnchorPositioningUtils.h"
+#include "ChildIterator.h"
+#include "MobileViewportManager.h"
+#include "OverflowChangedTracker.h"
+#include "PLDHashTable.h"
+#include "PositionedEventTargeting.h"
+#include "PresShellWidgetListener.h"
+#include "ScrollSnap.h"
+#include "StickyScrollContainer.h"
+#include "Units.h"
+#include "VisualViewport.h"
+#include "XULTreeElement.h"
+#include "ZoomConstraintsClient.h"
+#include "gfxContext.h"
+#include "gfxPlatform.h"
+#include "gfxUserFontSet.h"
+#include "gfxUtils.h"
+#include "js/GCAPI.h"
+#include "mozilla/AccessibleCaretEventHub.h"
+#include "mozilla/AnimationEventDispatcher.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/CaretAssociationHint.h"
+#include "mozilla/ConnectedAncestorTracker.h"
+#include "mozilla/ContentIterator.h"
+#include "mozilla/DisplayPortUtils.h"
+#include "mozilla/EditorBase.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/EventStateManager.h"
+#include "mozilla/GeckoMVMContext.h"
+#include "mozilla/GlobalStyleSheetCache.h"
+#include "mozilla/IMEStateManager.h"
+#include "mozilla/InputTaskManager.h"
+#include "mozilla/IntegerRange.h"
+#include "mozilla/Likely.h"
+#include "mozilla/Logging.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/PointerLockManager.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/PresShellInlines.h"
+#include "mozilla/RangeUtils.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/ReflowInput.h"
+#include "mozilla/RestyleManager.h"
+#include "mozilla/SMILAnimationController.h"
+#include "mozilla/SVGFragmentIdentifier.h"
+#include "mozilla/SVGObserverUtils.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/ScrollTypes.h"
+#include "mozilla/ServoBindings.h"
+#include "mozilla/ServoStyleSet.h"
+#include "mozilla/Sprintf.h"
+#include "mozilla/StartupTimeline.h"
+#include "mozilla/StaticAnalysisFunctions.h"
+#include "mozilla/StaticPrefs_apz.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_font.h"
+#include "mozilla/StaticPrefs_image.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/StaticPrefs_toolkit.h"
+#include "mozilla/StyleSheet.h"
+#include "mozilla/StyleSheetInlines.h"
+#include "mozilla/TextComposition.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/TouchEvents.h"
+#include "mozilla/Try.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/ViewportFrame.h"
+#include "mozilla/ViewportUtils.h"
+#include "mozilla/css/ImageLoader.h"
+#include "mozilla/dom/AncestorIterator.h"
+#include "mozilla/dom/AnimationTimelinesController.h"
+#include "mozilla/dom/BrowserBridgeChild.h"
+#include "mozilla/dom/BrowserChild.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/CanonicalBrowsingContext.h"
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/dom/ContentList.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/DOMIntersectionObserver.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/DocumentTimeline.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/ElementBinding.h"
+#include "mozilla/dom/ElementInlines.h"
+#include "mozilla/dom/FontFaceSet.h"
+#include "mozilla/dom/FragmentDirective.h"
+#include "mozilla/dom/HTMLAreaElement.h"
+#include "mozilla/dom/HighlightRegistry.h"
+#include "mozilla/dom/LargestContentfulPaint.h"
+#include "mozilla/dom/MouseEventBinding.h"
+#include "mozilla/dom/Performance.h"
+#include "mozilla/dom/PerformanceMainThread.h"
+#include "mozilla/dom/PointerEventBinding.h"
+#include "mozilla/dom/PointerEventHandler.h"
+#include "mozilla/dom/PopupBlocker.h"
+#include "mozilla/dom/SVGAnimationElement.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/Selection.h"
+#include "mozilla/dom/ShadowIncludingTreeIterator.h"
+#include "mozilla/dom/Touch.h"
+#include "mozilla/dom/TouchEvent.h"
+#include "mozilla/dom/UserActivation.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/gfx/Types.h"
+#include "mozilla/glue/Debug.h"
+#include "mozilla/layers/APZPublicUtils.h"
+#include "mozilla/layers/CompositorBridgeChild.h"
+#include "mozilla/layers/FocusTarget.h"
+#include "mozilla/layers/InputAPZContext.h"
+#include "mozilla/layers/ScrollingInteractionContext.h"
+#include "mozilla/layers/WebRenderLayerManager.h"
+#include "mozilla/layers/WebRenderUserData.h"
+#include "mozilla/layout/ScrollAnchorContainer.h"
+#include "nsAnimationManager.h"
+#include "nsAutoLayoutPhase.h"
+#include "nsCOMArray.h"
+#include "nsCOMPtr.h"
+#include "nsCRTGlue.h"
+#include "nsCSSFrameConstructor.h"
+#include "nsCSSRendering.h"
+#include "nsCanvasFrame.h"
+#include "nsCaret.h"
+#include "nsClassHashtable.h"
+#include "nsContainerFrame.h"
+#include "nsDOMNavigationTiming.h"
+#include "nsDisplayList.h"
+#include "nsDocShell.h"  // for reflow observation
+#include "nsError.h"
+#include "nsFlexContainerFrame.h"
+#include "nsFocusManager.h"
+#include "nsFrameSelection.h"
+#include "nsGkAtoms.h"
+#include "nsGlobalWindowOuter.h"
+#include "nsHashKeys.h"
+#include "nsIBaseWindow.h"
+#include "nsIContent.h"
+#include "nsIContentInlines.h"
+#include "nsIDOMXULMenuListElement.h"
+#include "nsIDOMXULMultSelectCntrlEl.h"
+#include "nsIDOMXULSelectCntrlItemEl.h"
+#include "nsIDocShellTreeItem.h"
+#include "nsIDocShellTreeOwner.h"
+#include "nsIDragSession.h"
+#include "nsIFrame.h"
+#include "nsIFrameInlines.h"
+#include "nsILayoutHistoryState.h"
+#include "nsILineIterator.h"  // for ScrollContentIntoView
+#include "nsIMutationObserver.h"
+#include "nsIObserverService.h"
+#include "nsIReflowCallback.h"
+#include "nsIScreen.h"
+#include "nsIScreenManager.h"
+#include "nsITimer.h"
+#include "nsIURI.h"
+#include "nsImageFrame.h"
+#include "nsLayoutUtils.h"
+#include "nsListControlFrame.h"
+#include "nsMenuPopupFrame.h"
+#include "nsNameSpaceManager.h"  // for Pref-related rule management (bugs 22963,20760,31816)
+#include "nsNetUtil.h"
+#include "nsPIDOMWindow.h"
+#include "nsPageSequenceFrame.h"
+#include "nsPlaceholderFrame.h"
+#include "nsPresContext.h"
+#include "nsQueryObject.h"
+#include "nsRange.h"
+#include "nsReadableUtils.h"
+#include "nsRefreshDriver.h"
+#include "nsRegion.h"
+#include "nsStyleChangeList.h"
+#include "nsStyleSheetService.h"
+#include "nsSubDocumentFrame.h"
+#include "nsTArray.h"
+#include "nsThreadUtils.h"
+#include "nsTransitionManager.h"
+#include "nsTreeBodyFrame.h"
+#include "nsTreeColumns.h"
+#include "nsViewportInfo.h"
+#include "nsWindowSizes.h"
+#include "nsXPCOM.h"
+#include "nsXULElement.h"
+#include "prenv.h"
+#include "prinrval.h"
+
+
+
+#if defined(ACCESSIBILITY)
+#  include "mozilla/a11y/DocAccessible.h"
+#if defined(DEBUG)
+#    include "mozilla/a11y/Logging.h"
+#endif
+#endif
+
+#define RELATIVE_SCALEFACTOR 0.0925f
+
+using namespace mozilla;
+using namespace mozilla::css;
+using namespace mozilla::dom;
+using namespace mozilla::gfx;
+using namespace mozilla::layers;
+using namespace mozilla::gfx;
+using namespace mozilla::layout;
+using PaintFrameFlags = nsLayoutUtils::PaintFrameFlags;
+typedef ScrollableLayerGuid::ViewID ViewID;
+
+constinit PresShell::CapturingContentInfo PresShell::sCapturingContentInfo;
+
+struct RangePaintInfo {
+  nsDisplayListBuilder mBuilder;
+  nsDisplayList mList;
+
+  nsPoint mRootOffset;
+
+  float mResolution = 1.0;
+
+  explicit RangePaintInfo(nsIFrame* aFrame)
+      : mBuilder(aFrame, nsDisplayListBuilderMode::Painting, false),
+        mList(&mBuilder) {
+    MOZ_COUNT_CTOR(RangePaintInfo);
+    mBuilder.BeginFrame();
+  }
+
+  ~RangePaintInfo() {
+    mList.DeleteAll(&mBuilder);
+    mBuilder.EndFrame();
+    MOZ_COUNT_DTOR(RangePaintInfo);
+  }
+};
+
+#undef NOISY
+
+
+#define SHOW_CARET
+
+#define NS_MAX_REFLOW_TIME 1000000
+static int32_t gMaxRCProcessingTime = -1;
+
+struct nsCallbackEventRequest {
+  nsIReflowCallback* callback;
+  nsCallbackEventRequest* next;
+};
+
+
+class nsAutoCauseReflowNotifier {
+ public:
+  MOZ_CAN_RUN_SCRIPT explicit nsAutoCauseReflowNotifier(PresShell* aPresShell)
+      : mPresShell(aPresShell) {
+    mPresShell->WillCauseReflow();
+  }
+  MOZ_CAN_RUN_SCRIPT ~nsAutoCauseReflowNotifier() {
+    if (!mPresShell->mHaveShutDown) {
+      RefPtr<PresShell> presShell(mPresShell);
+      presShell->DidCauseReflow();
+    } else {
+      nsContentUtils::RemoveScriptBlocker();
+    }
+  }
+
+  PresShell* mPresShell;
+};
+
+class MOZ_STACK_CLASS nsPresShellEventCB : public EventDispatchingCallback {
+ public:
+  explicit nsPresShellEventCB(PresShell* aPresShell) : mPresShell(aPresShell) {}
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual void HandleEvent(EventChainPostVisitor& aVisitor) override {
+    if (aVisitor.mPresContext && aVisitor.mEvent->mClass != eBasicEventClass) {
+      if (aVisitor.mEvent->mMessage == eMouseDown ||
+          aVisitor.mEvent->mMessage == eMouseUp) {
+        MOZ_KnownLive(mPresShell)->FlushPendingNotifications(FlushType::Layout);
+      } else if (aVisitor.mEvent->mMessage == eWheel &&
+                 aVisitor.mEventStatus != nsEventStatus_eConsumeNoDefault) {
+        nsIFrame* frame = mPresShell->GetCurrentEventFrame();
+        if (frame) {
+          RefPtr<EventStateManager> esm =
+              aVisitor.mPresContext->EventStateManager();
+          esm->DispatchLegacyMouseScrollEvents(
+              frame, aVisitor.mEvent->AsWheelEvent(), &aVisitor.mEventStatus);
+        }
+      }
+      nsIFrame* frame = mPresShell->GetCurrentEventFrame();
+      if (!frame && (aVisitor.mEvent->mMessage == eMouseUp ||
+                     aVisitor.mEvent->mMessage == eTouchEnd)) {
+        frame = mPresShell->GetRootFrame();
+      }
+      if (frame) {
+        frame->HandleEvent(aVisitor.mPresContext, aVisitor.mEvent->AsGUIEvent(),
+                           &aVisitor.mEventStatus);
+      }
+    }
+  }
+
+  RefPtr<PresShell> mPresShell;
+};
+
+class nsBeforeFirstPaintDispatcher : public Runnable {
+ public:
+  explicit nsBeforeFirstPaintDispatcher(Document* aDocument)
+      : mozilla::Runnable("nsBeforeFirstPaintDispatcher"),
+        mDocument(aDocument) {}
+
+  NS_IMETHOD Run() override {
+    nsCOMPtr<nsIObserverService> observerService =
+        mozilla::services::GetObserverService();
+    if (observerService) {
+      observerService->NotifyObservers(ToSupports(mDocument),
+                                       "before-first-paint", nullptr);
+    }
+    return NS_OK;
+  }
+
+ private:
+  RefPtr<Document> mDocument;
+};
+
+class MOZ_RAII AutoPointerEventTargetUpdater final {
+ public:
+  AutoPointerEventTargetUpdater(PresShell* aShell, WidgetEvent* aEvent,
+                                nsIFrame* aFrame, nsIContent* aTargetContent,
+                                nsIContent** aOutTargetContent) {
+    MOZ_ASSERT(aEvent);
+    if (!aOutTargetContent || aEvent->mClass != ePointerEventClass) {
+      mOutTargetContent = nullptr;
+      return;
+    }
+    MOZ_ASSERT(aShell);
+    MOZ_ASSERT_IF(aFrame && aFrame->GetContent(),
+                  aShell->GetDocument() == aFrame->GetContent()->OwnerDoc());
+
+    mShell = aShell;
+    mWeakFrame = aFrame;
+    mOutTargetContent = aOutTargetContent;
+    mFromTouch = aEvent->AsPointerEvent()->mFromTouchEvent;
+    MOZ_ASSERT_IF(!mFromTouch, aFrame);
+    mOriginalPointerEventTarget = [&]() -> nsIContent* {
+      nsIContent* const target =
+          aTargetContent ? aTargetContent
+                         : (aFrame ? aFrame->GetContent() : nullptr);
+      if (MOZ_UNLIKELY(!target)) {
+        return nullptr;
+      }
+      if (target->IsElement() ||
+          !IsForbiddenDispatchingToNonElementContent(aEvent->mMessage)) {
+        return target;
+      }
+      return target->GetInclusiveFlattenedTreeAncestorElement();
+    }();
+    if (mOriginalPointerEventTarget &&
+        mOriginalPointerEventTarget->IsInComposedDoc()) {
+      mPointerEventTargetTracker.emplace(*mOriginalPointerEventTarget);
+    }
+  }
+
+  ~AutoPointerEventTargetUpdater() {
+    if (!mOutTargetContent || !mShell || mWeakFrame.IsAlive()) {
+      return;
+    }
+    if (mFromTouch) {
+      mOriginalPointerEventTarget.swap(*mOutTargetContent);
+    } else {
+      if (!mPointerEventTargetTracker ||
+          !mPointerEventTargetTracker->ContentWasRemoved()) {
+        mOriginalPointerEventTarget.swap(*mOutTargetContent);
+      } else {
+        nsCOMPtr<nsIContent> connectedAncestor =
+            mPointerEventTargetTracker->GetConnectedContent();
+        connectedAncestor.swap(*mOutTargetContent);
+      }
+    }
+  }
+
+ private:
+  RefPtr<PresShell> mShell;
+  nsCOMPtr<nsIContent> mOriginalPointerEventTarget;
+  AutoWeakFrame mWeakFrame;
+  Maybe<AutoConnectedAncestorTracker> mPointerEventTargetTracker;
+  nsIContent** mOutTargetContent;
+  bool mFromTouch = false;
+};
+
+bool PresShell::sDisableNonTestMouseEvents = false;
+
+LazyLogModule PresShell::gLog("PresShell");
+
+StaticRefPtr<Element> PresShell::EventHandler::sLastKeyDownEventTargetElement;
+
+Modifiers PresShell::sCurrentModifiers = MODIFIER_NONE;
+
+void PresShell::AddAutoWeakFrame(AutoWeakFrame* aWeakFrame) {
+  if (aWeakFrame->GetFrame()) {
+    aWeakFrame->GetFrame()->AddStateBits(NS_FRAME_EXTERNAL_REFERENCE);
+  }
+  aWeakFrame->SetPreviousWeakFrame(mAutoWeakFrames);
+  mAutoWeakFrames = aWeakFrame;
+}
+
+void PresShell::AddWeakFrame(WeakFrame* aWeakFrame) {
+  if (aWeakFrame->GetFrame()) {
+    aWeakFrame->GetFrame()->AddStateBits(NS_FRAME_EXTERNAL_REFERENCE);
+  }
+  MOZ_ASSERT(!mWeakFrames.Contains(aWeakFrame));
+  mWeakFrames.Insert(aWeakFrame);
+}
+
+void PresShell::AddConnectedAncestorTracker(
+    AutoConnectedAncestorTracker& aTracker) {
+  aTracker.mPreviousTracker = mLastConnectedAncestorTracker;
+  mLastConnectedAncestorTracker = &aTracker;
+}
+
+void PresShell::RemoveAutoWeakFrame(AutoWeakFrame* aWeakFrame) {
+  if (mAutoWeakFrames == aWeakFrame) {
+    mAutoWeakFrames = aWeakFrame->GetPreviousWeakFrame();
+    return;
+  }
+  AutoWeakFrame* nextWeak = mAutoWeakFrames;
+  while (nextWeak && nextWeak->GetPreviousWeakFrame() != aWeakFrame) {
+    nextWeak = nextWeak->GetPreviousWeakFrame();
+  }
+  if (nextWeak) {
+    nextWeak->SetPreviousWeakFrame(aWeakFrame->GetPreviousWeakFrame());
+  }
+}
+
+void PresShell::RemoveWeakFrame(WeakFrame* aWeakFrame) {
+  MOZ_ASSERT(mWeakFrames.Contains(aWeakFrame));
+  mWeakFrames.Remove(aWeakFrame);
+}
+
+void PresShell::RemoveConnectedAncestorTracker(
+    const AutoConnectedAncestorTracker& aTracker) {
+  if (mLastConnectedAncestorTracker == &aTracker) {
+    mLastConnectedAncestorTracker = aTracker.mPreviousTracker;
+    return;
+  }
+  AutoConnectedAncestorTracker* nextTracker = mLastConnectedAncestorTracker;
+  while (nextTracker && nextTracker->mPreviousTracker != &aTracker) {
+    nextTracker = nextTracker->mPreviousTracker;
+  }
+  if (nextTracker) {
+    nextTracker->mPreviousTracker = aTracker.mPreviousTracker;
+  }
+}
+
+already_AddRefed<nsFrameSelection> PresShell::FrameSelection() {
+  RefPtr<nsFrameSelection> ret = mSelection;
+  return ret.forget();
+}
+
+
+static uint32_t sNextPresShellId = 0;
+
+bool PresShell::AccessibleCaretEnabled(nsIDocShell* aDocShell) {
+  if (StaticPrefs::layout_accessiblecaret_enabled()) {
+    return true;
+  }
+  if (StaticPrefs::layout_accessiblecaret_enabled_on_touch() &&
+      dom::TouchEvent::PrefEnabled(aDocShell)) {
+    return true;
+  }
+  return false;
+}
+
+PresShell::PresShell(Document* aDocument)
+    : mDocument(aDocument),
+      mLastSelectionForToString(nullptr),
+#if defined(ACCESSIBILITY)
+      mDocAccessible(nullptr),
+#endif
+      mLastResolutionChangeOrigin(ResolutionChangeOrigin::Apz),
+      mPaintCount(0),
+      mAPZFocusSequenceNumber(0),
+      mActiveSuppressDisplayport(0),
+      mPresShellId(++sNextPresShellId),
+      mFontSizeInflationEmPerLine(0),
+      mFontSizeInflationMinTwips(0),
+      mFontSizeInflationLineThreshold(0),
+      mSelectionFlags(nsISelectionDisplay::DISPLAY_TEXT |
+                      nsISelectionDisplay::DISPLAY_IMAGES),
+      mChangeNestCount(0),
+      mRenderingStateFlags(RenderingStateFlags::None),
+      mCaretEnabled(false),
+      mNeedLayoutFlush(true),
+      mNeedStyleFlush(true),
+      mNeedThrottledAnimationFlush(true),
+      mVisualViewportSizeSet(false),
+      mDidInitialize(false),
+      mIsDestroying(false),
+      mIsReflowing(false),
+      mIsObservingDocument(false),
+      mForbiddenToFlush(false),
+      mIsDocumentGone(false),
+      mHaveShutDown(false),
+      mPaintingSuppressed(false),
+      mShouldUnsuppressPainting(false),
+      mIgnoreFrameDestruction(false),
+      mIsActive(true),
+      mFrozen(false),
+      mIsFirstPaint(true),
+      mWasLastReflowInterrupted(false),
+      mResizeEventPending(false),
+      mVisualViewportResizeEventPending(false),
+      mFontSizeInflationForceEnabled(false),
+      mFontSizeInflationEnabled(false),
+      mIsNeverPainting(false),
+      mResolutionUpdated(false),
+      mResolutionUpdatedByApz(false),
+      mUnderHiddenEmbedderElement(false),
+      mDocumentLoading(false),
+      mNoDelayedMouseEvents(false),
+      mNoDelayedKeyEvents(false),
+      mNoDelayedSingleTap(false),
+      mApproximateFrameVisibilityVisited(false),
+      mIsLastChromeOnlyEscapeKeyConsumed(false),
+      mHasReceivedPaintMessage(false),
+      mIsLastKeyDownCanceled(false),
+      mHasHandledUserInput(false),
+      mForceDispatchKeyPressEventsForNonPrintableKeys(false),
+      mForceUseLegacyKeyCodeAndCharCodeValues(false),
+      mInitializedWithKeyPressEventDispatchingBlacklist(false),
+      mHasTriedFastUnsuppress(false),
+      mProcessingReflowCommands(false),
+      mPendingDidDoReflow(false),
+      mHasSeenAnchorPos(false),
+      mHasShownFullscreenWarningForCurrentEscapeKeyLongPress(false),
+      mEscapeKeyDownCountForFullscreenKeyboardLockWarning(0) {
+  MOZ_LOG(gLog, LogLevel::Debug, ("PresShell::PresShell this=%p", this));
+  MOZ_ASSERT(aDocument);
+
+  mLoadBegin = TimeStamp::Now();
+}
+
+NS_INTERFACE_TABLE_HEAD(PresShell)
+  NS_INTERFACE_TABLE_BEGIN
+    NS_INTERFACE_TABLE_ENTRY(PresShell, PresShell)
+    NS_INTERFACE_TABLE_ENTRY(PresShell, nsIDocumentObserver)
+    NS_INTERFACE_TABLE_ENTRY(PresShell, nsISelectionController)
+    NS_INTERFACE_TABLE_ENTRY(PresShell, nsISelectionDisplay)
+    NS_INTERFACE_TABLE_ENTRY(PresShell, nsIObserver)
+    NS_INTERFACE_TABLE_ENTRY(PresShell, nsISupportsWeakReference)
+    NS_INTERFACE_TABLE_ENTRY(PresShell, nsIMutationObserver)
+    NS_INTERFACE_TABLE_ENTRY_AMBIGUOUS(PresShell, nsISupports, nsIObserver)
+  NS_INTERFACE_TABLE_END
+  NS_INTERFACE_TABLE_TO_MAP_SEGUE
+NS_INTERFACE_MAP_END
+
+NS_IMPL_ADDREF(PresShell)
+NS_IMPL_RELEASE(PresShell)
+
+PresShell::~PresShell() {
+  MOZ_RELEASE_ASSERT(!mForbiddenToFlush,
+                     "Flag should only be set temporarily, while doing things "
+                     "that shouldn't cause destruction");
+  MOZ_LOG(gLog, LogLevel::Debug, ("PresShell::~PresShell this=%p", this));
+
+  if (!mHaveShutDown) {
+    MOZ_ASSERT_UNREACHABLE("Someone did not call PresShell::Destroy()");
+    Destroy();
+  }
+
+  NS_ASSERTION(mCurrentEventTargetStack.IsEmpty(),
+               "Huh, event content left on the stack in pres shell dtor!");
+  NS_ASSERTION(mFirstCallbackEventRequest == nullptr &&
+                   mLastCallbackEventRequest == nullptr,
+               "post-reflow queues not empty.  This means we're leaking");
+
+  MOZ_ASSERT(!mAllocatedPointers || mAllocatedPointers->IsEmpty(),
+             "Some pres arena objects were not freed");
+
+  mFrameConstructor = nullptr;
+}
+
+void PresShell::Init(nsPresContext* aPresContext) {
+  MOZ_ASSERT(mDocument);
+  MOZ_ASSERT(aPresContext);
+  MOZ_ASSERT(!mWidgetListener, "Already initialized");
+
+  mWidgetListener = MakeUnique<PresShellWidgetListener>(this);
+
+  SetNeedLayoutFlush();
+  SetNeedStyleFlush();
+
+  mFrameConstructor = MakeUnique<nsCSSFrameConstructor>(mDocument, this);
+
+  const_cast<RefPtr<nsPresContext>&>(mPresContext) = aPresContext;
+  mPresContext->AttachPresShell(this);
+
+  mPresContext->InitFontCache();
+
+  EnsureStyleFlush();
+
+  const bool accessibleCaretEnabled =
+      AccessibleCaretEnabled(mDocument->GetDocShell());
+  if (accessibleCaretEnabled) {
+    mAccessibleCaretEventHub = MakeRefPtr<AccessibleCaretEventHub>(this);
+    mAccessibleCaretEventHub->Init();
+  }
+
+  mSelection = MakeRefPtr<nsFrameSelection>(this, accessibleCaretEnabled);
+
+#if defined(SHOW_CARET)
+  mCaret = MakeRefPtr<nsCaret>();
+  mCaret->Init(this);
+  mOriginalCaret = mCaret;
+
+#endif
+  nsPresContext::nsPresContextType type = mPresContext->Type();
+  if (type != nsPresContext::eContext_PrintPreview &&
+      type != nsPresContext::eContext_Print) {
+    SetDisplaySelection(nsISelectionController::SELECTION_DISABLED);
+  }
+
+  if (gMaxRCProcessingTime == -1) {
+    gMaxRCProcessingTime =
+        Preferences::GetInt("layout.reflow.timeslice", NS_MAX_REFLOW_TIME);
+  }
+
+  if (nsStyleSheetService* ss = nsStyleSheetService::GetInstance()) {
+    ss->RegisterPresShell(this);
+  }
+
+  {
+    nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
+    if (os) {
+      os->AddObserver(this, "memory-pressure", false);
+      os->AddObserver(this, "font-info-updated", false);
+      os->AddObserver(this, "internal-look-and-feel-changed", false);
+    }
+  }
+
+
+  mDocument->TimelinesController().UpdateLastRefreshDriverTime();
+
+  ActivenessMaybeChanged();
+
+  mFontSizeInflationEmPerLine = StaticPrefs::font_size_inflation_emPerLine();
+  mFontSizeInflationMinTwips = StaticPrefs::font_size_inflation_minTwips();
+  mFontSizeInflationLineThreshold =
+      StaticPrefs::font_size_inflation_lineThreshold();
+  mFontSizeInflationForceEnabled =
+      StaticPrefs::font_size_inflation_forceEnabled();
+
+  mTouchManager.Init(this, mDocument);
+
+  if (mPresContext->IsRootContentDocumentCrossProcess()) {
+    mZoomConstraintsClient = MakeRefPtr<ZoomConstraintsClient>();
+    mZoomConstraintsClient->Init(this, mDocument);
+
+    MaybeRecreateMobileViewportManager(false);
+  }
+
+  if (nsCOMPtr<nsIDocShell> docShell = mPresContext->GetDocShell()) {
+    if (BrowsingContext* bc = docShell->GetBrowsingContext()) {
+      mUnderHiddenEmbedderElement = bc->IsUnderHiddenEmbedderElement();
+    }
+  }
+}
+
+enum TextPerfLogType { eLog_reflow, eLog_loaddone, eLog_totals };
+
+static void LogTextPerfStats(gfxTextPerfMetrics* aTextPerf,
+                             PresShell* aPresShell,
+                             const gfxTextPerfMetrics::TextCounts& aCounts,
+                             float aTime, TextPerfLogType aLogType,
+                             const char* aURL) {
+  LogModule* tpLog = gfxPlatform::GetLog(eGfxLog_textperf);
+
+  mozilla::LogLevel logLevel = LogLevel::Warning;
+  if (aCounts.numContentTextRuns == 0) {
+    logLevel = LogLevel::Debug;
+  }
+
+  if (!MOZ_LOG_TEST(tpLog, logLevel)) {
+    return;
+  }
+
+  char prefix[256];
+
+  switch (aLogType) {
+    case eLog_reflow:
+      SprintfLiteral(prefix, "(textperf-reflow) %p time-ms: %7.0f", aPresShell,
+                     aTime);
+      break;
+    case eLog_loaddone:
+      SprintfLiteral(prefix, "(textperf-loaddone) %p time-ms: %7.0f",
+                     aPresShell, aTime);
+      break;
+    default:
+      MOZ_ASSERT(aLogType == eLog_totals, "unknown textperf log type");
+      SprintfLiteral(prefix, "(textperf-totals) %p", aPresShell);
+  }
+
+  double hitRatio = 0.0;
+  uint32_t lookups = aCounts.wordCacheHit + aCounts.wordCacheMiss;
+  if (lookups) {
+    hitRatio = double(aCounts.wordCacheHit) / double(lookups);
+  }
+
+  if (aLogType == eLog_loaddone) {
+    MOZ_LOG(
+        tpLog, logLevel,
+        ("%s reflow: %d chars: %d "
+         "[%s] "
+         "content-textruns: %d chrome-textruns: %d "
+         "max-textrun-len: %d "
+         "word-cache-lookups: %d word-cache-hit-ratio: %4.3f "
+         "word-cache-space: %d word-cache-long: %d "
+         "pref-fallbacks: %d system-fallbacks: %d "
+         "textruns-const: %d textruns-destr: %d "
+         "generic-lookups: %d "
+         "cumulative-textruns-destr: %d\n",
+         prefix, aTextPerf->reflowCount, aCounts.numChars, (aURL ? aURL : ""),
+         aCounts.numContentTextRuns, aCounts.numChromeTextRuns,
+         aCounts.maxTextRunLen, lookups, hitRatio, aCounts.wordCacheSpaceRules,
+         aCounts.wordCacheLong, aCounts.fallbackPrefs, aCounts.fallbackSystem,
+         aCounts.textrunConst, aCounts.textrunDestr, aCounts.genericLookups,
+         aTextPerf->cumulative.textrunDestr));
+  } else {
+    MOZ_LOG(
+        tpLog, logLevel,
+        ("%s reflow: %d chars: %d "
+         "content-textruns: %d chrome-textruns: %d "
+         "max-textrun-len: %d "
+         "word-cache-lookups: %d word-cache-hit-ratio: %4.3f "
+         "word-cache-space: %d word-cache-long: %d "
+         "pref-fallbacks: %d system-fallbacks: %d "
+         "textruns-const: %d textruns-destr: %d "
+         "generic-lookups: %d "
+         "cumulative-textruns-destr: %d\n",
+         prefix, aTextPerf->reflowCount, aCounts.numChars,
+         aCounts.numContentTextRuns, aCounts.numChromeTextRuns,
+         aCounts.maxTextRunLen, lookups, hitRatio, aCounts.wordCacheSpaceRules,
+         aCounts.wordCacheLong, aCounts.fallbackPrefs, aCounts.fallbackSystem,
+         aCounts.textrunConst, aCounts.textrunDestr, aCounts.genericLookups,
+         aTextPerf->cumulative.textrunDestr));
+  }
+}
+
+bool PresShell::InRDMPane() {
+  if (Document* doc = GetDocument()) {
+    if (BrowsingContext* bc = doc->GetBrowsingContext()) {
+      return bc->InRDMPane();
+    }
+  }
+  return false;
+}
+
+
+void PresShell::Destroy() {
+  if (mHaveShutDown) {
+    return;
+  }
+
+  NS_ASSERTION(!nsContentUtils::IsSafeToRunScript(),
+               "destroy called on presshell while scripts not blocked");
+
+  gfxTextPerfMetrics* tp;
+  if (mPresContext && (tp = mPresContext->GetTextPerfMetrics())) {
+    tp->Accumulate();
+    if (tp->cumulative.numChars > 0) {
+      LogTextPerfStats(tp, this, tp->cumulative, 0.0, eLog_totals, nullptr);
+    }
+  }
+  if (mPresContext) {
+    if (gfxUserFontSet* fs = mPresContext->GetUserFontSet()) {
+      uint32_t fontCount;
+      uint64_t fontSize;
+      fs->GetLoadStatistics(fontCount, fontSize);
+
+
+    } else {
+
+
+    }
+  }
+
+
+  if (mZoomConstraintsClient) {
+    mZoomConstraintsClient->Destroy();
+    mZoomConstraintsClient = nullptr;
+  }
+  if (mMobileViewportManager) {
+    mMobileViewportManager->Destroy();
+    mMobileViewportManager = nullptr;
+    mMVMContext = nullptr;
+  }
+
+  MaybeReleaseCapturingContent();
+
+  EventHandler::OnPresShellDestroy(mDocument);
+
+  if (mContentToScrollTo) {
+    mContentToScrollTo->RemoveProperty(nsGkAtoms::scrolling);
+    mContentToScrollTo = nullptr;
+  }
+
+  if (mPresContext) {
+    mPresContext->EventStateManager()->NotifyDestroyPresContext(mPresContext);
+  }
+
+  if (nsStyleSheetService* ss = nsStyleSheetService::GetInstance()) {
+    ss->UnregisterPresShell(this);
+  }
+
+  {
+    nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
+    if (os) {
+      os->RemoveObserver(this, "memory-pressure");
+      os->RemoveObserver(this, "font-info-updated");
+      os->RemoveObserver(this, "internal-look-and-feel-changed");
+    }
+  }
+
+  CancelPaintSuppressionTimer();
+
+  mSynthMouseMoveEvent.Revoke();
+
+  mUpdateApproximateFrameVisibilityEvent.Revoke();
+
+  ClearApproximatelyVisibleFramesList(Some(OnNonvisible::DiscardImages));
+
+  if (mOriginalCaret) {
+    mOriginalCaret->Terminate();
+  }
+  if (mCaret && mCaret != mOriginalCaret) {
+    mCaret->Terminate();
+  }
+  mCaret = mOriginalCaret = nullptr;
+
+  mFocusedFrameSelection = nullptr;
+
+  if (mSelection) {
+    RefPtr<nsFrameSelection> frameSelection = mSelection;
+    frameSelection->DisconnectFromPresShell();
+  }
+
+  mIsDestroying = true;
+
+#if defined(ACCESSIBILITY)
+  if (mDocAccessible) {
+#if defined(DEBUG)
+    if (a11y::logging::IsEnabled(a11y::logging::eDocDestroy))
+      a11y::logging::DocDestroy("presshell destroyed", mDocument);
+#endif
+
+    mDocAccessible->Shutdown();
+    mDocAccessible = nullptr;
+  }
+#endif
+
+
+
+  mCurrentEventTarget.ClearFrame();
+
+  for (EventTargetInfo& eventTargetInfo : mCurrentEventTargetStack) {
+    eventTargetInfo.ClearFrame();
+  }
+
+  mFramesToDirty.Clear();
+  mPendingScrollAnchorSelection.Clear();
+  mPendingScrollAnchorAdjustment.Clear();
+  mPendingScrollResnap.Clear();
+
+  if (mDocument) {
+    NS_ASSERTION(mDocument->GetPresShell() == this, "Wrong shell?");
+    mDocument->ClearServoRestyleRoot();
+    mDocument->DeletePresShell();
+  }
+
+  if (mPresContext) {
+    mPresContext->AnimationEventDispatcher()->ClearEventQueue();
+  }
+
+  CancelAllPendingReflows();
+  CancelPostedReflowCallbacks();
+
+  mFrameConstructor->WillDestroyFrameTree();
+
+  NS_WARNING_ASSERTION(!mAutoWeakFrames && mWeakFrames.IsEmpty(),
+                       "Weak frames alive after destroying FrameManager");
+  while (mAutoWeakFrames) {
+    mAutoWeakFrames->Clear(this);
+  }
+  const nsTArray<WeakFrame*> weakFrames = ToArray(mWeakFrames);
+  for (WeakFrame* weakFrame : weakFrames) {
+    weakFrame->Clear(this);
+  }
+
+  if (nsSubDocumentFrame* f = GetInProcessEmbedderFrame()) {
+    f->RemoveEmbeddingPresShell(this);
+  }
+  mEmbedderFrame = nullptr;
+
+  if (mAccessibleCaretEventHub) {
+    mAccessibleCaretEventHub->Terminate();
+    mAccessibleCaretEventHub = nullptr;
+  }
+
+  mWidgetListener = nullptr;
+
+  if (mPresContext) {
+    mPresContext->DetachPresShell();
+  }
+
+  mHaveShutDown = true;
+
+  mTouchManager.Destroy();
+}
+
+void PresShell::StartObservingRefreshDriver() {
+  nsRefreshDriver* rd = mPresContext->RefreshDriver();
+  if (mResizeEventPending || mVisualViewportResizeEventPending) {
+    rd->ScheduleRenderingPhase(mozilla::RenderingPhase::ResizeSteps);
+  }
+  if (mNeedLayoutFlush || mNeedStyleFlush) {
+    rd->ScheduleRenderingPhase(mozilla::RenderingPhase::Layout);
+  }
+}
+
+nsRefreshDriver* PresShell::GetRefreshDriver() const {
+  return mPresContext ? mPresContext->RefreshDriver() : nullptr;
+}
+
+void PresShell::SetInProcessEmbedderFrame(nsSubDocumentFrame* aFrame) {
+  mEmbedderFrame = aFrame;
+}
+
+void PresShell::SetAuthorStyleDisabled(bool aStyleDisabled) {
+  if (aStyleDisabled != StyleSet()->GetAuthorStyleDisabled()) {
+    StyleSet()->SetAuthorStyleDisabled(aStyleDisabled);
+    mDocument->ApplicableStylesChanged();
+
+    nsCOMPtr<nsIObserverService> observerService =
+        mozilla::services::GetObserverService();
+    if (observerService) {
+      observerService->NotifyObservers(
+          ToSupports(mDocument), "author-style-disabled-changed", nullptr);
+    }
+  }
+}
+
+bool PresShell::GetAuthorStyleDisabled() const {
+  return StyleSet()->GetAuthorStyleDisabled();
+}
+
+void PresShell::AddUserSheet(StyleSheet* aSheet) {
+
+  nsStyleSheetService* sheetService = nsStyleSheetService::GetInstance();
+  nsTArray<RefPtr<StyleSheet>>& userSheets = *sheetService->UserStyleSheets();
+
+  MOZ_ASSERT(aSheet);
+  MOZ_ASSERT(userSheets.LastElement() == aSheet);
+
+  size_t index = userSheets.Length() - 1;
+
+  for (size_t i = 0; i < index; ++i) {
+    MOZ_ASSERT(StyleSet()->SheetAt(StyleOrigin::User, i) == userSheets[i]);
+  }
+
+  if (index == static_cast<size_t>(StyleSet()->SheetCount(StyleOrigin::User))) {
+    StyleSet()->AppendStyleSheet(*aSheet);
+  } else {
+    StyleSheet* ref = StyleSet()->SheetAt(StyleOrigin::User, index);
+    StyleSet()->InsertStyleSheetBefore(*aSheet, *ref);
+  }
+
+  mDocument->ApplicableStylesChanged();
+}
+
+void PresShell::AddAgentSheet(StyleSheet* aSheet) {
+  StyleSet()->AppendStyleSheet(*aSheet);
+  mDocument->ApplicableStylesChanged();
+}
+
+void PresShell::AddAuthorSheet(StyleSheet* aSheet) {
+  StyleSheet* firstAuthorSheet = mDocument->GetFirstAdditionalAuthorSheet();
+  if (firstAuthorSheet) {
+    StyleSet()->InsertStyleSheetBefore(*aSheet, *firstAuthorSheet);
+  } else {
+    StyleSet()->AppendStyleSheet(*aSheet);
+  }
+
+  mDocument->ApplicableStylesChanged();
+}
+
+bool PresShell::NeedsFocusFixUp() const {
+  if (NS_WARN_IF(!mDocument)) {
+    return false;
+  }
+
+  nsIContent* currentFocus = mDocument->GetUnretargetedFocusedContent(
+      Document::IncludeChromeOnly::Yes);
+  if (!currentFocus) {
+    return false;
+  }
+
+  if (auto* area = HTMLAreaElement::FromNode(currentFocus)) {
+    if (nsFocusManager::IsAreaElementFocusable(*area)) {
+      return false;
+    }
+  }
+
+  nsIFrame* f = currentFocus->GetPrimaryFrame();
+  if (f && f->IsFocusable()) {
+    return false;
+  }
+
+  if (currentFocus == mDocument->GetBody() ||
+      currentFocus == mDocument->GetRootElement()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool PresShell::FixUpFocus() {
+  if (!NeedsFocusFixUp()) {
+    return false;
+  }
+  RefPtr fm = nsFocusManager::GetFocusManager();
+  nsCOMPtr<nsPIDOMWindowOuter> window = mDocument->GetWindow();
+  if (NS_WARN_IF(!window)) {
+    return false;
+  }
+  if (auto* element = fm->GetFocusedElement()) {
+    element->OwnerDoc()->SetPreviouslyFocusedContent(element);
+  }
+  fm->ClearFocus(window);
+  return true;
+}
+
+void PresShell::SelectionWillTakeFocus() {
+  if (mSelection) {
+    FrameSelectionWillTakeFocus(*mSelection,
+                                CanMoveLastSelectionForToString::No);
+  }
+}
+
+void PresShell::SelectionWillLoseFocus() {
+}
+
+static void RepaintNormalSelectionWhenSafe(nsFrameSelection& aFrameSelection) {
+  if (nsContentUtils::IsSafeToRunScript()) {
+    aFrameSelection.RepaintSelection(SelectionType::eNormal);
+    return;
+  }
+
+  nsContentUtils::AddScriptRunner(NS_NewRunnableFunction(
+      "RepaintNormalSelectionWhenSafe",
+      [sel = RefPtr<nsFrameSelection>(&aFrameSelection)] {
+        sel->RepaintSelection(SelectionType::eNormal);
+      }));
+}
+
+void PresShell::FrameSelectionWillLoseFocus(nsFrameSelection& aFrameSelection) {
+  if (mFocusedFrameSelection != &aFrameSelection) {
+    return;
+  }
+
+  if (&aFrameSelection == mSelection) {
+    return;
+  }
+
+  RefPtr<nsFrameSelection> old = std::move(mFocusedFrameSelection);
+  MOZ_ASSERT(!mFocusedFrameSelection);
+
+  if (old->GetDisplaySelection() != nsISelectionController::SELECTION_HIDDEN) {
+    old->SetDisplaySelection(nsISelectionController::SELECTION_HIDDEN);
+    RepaintNormalSelectionWhenSafe(*old);
+  }
+
+  if (mSelection) {
+    FrameSelectionWillTakeFocus(*mSelection,
+                                CanMoveLastSelectionForToString::No);
+  }
+}
+
+void PresShell::FrameSelectionWillTakeFocus(
+    nsFrameSelection& aFrameSelection,
+    CanMoveLastSelectionForToString aCanMoveLastSelectionForToString) {
+  if (StaticPrefs::dom_selection_mimic_chrome_tostring_enabled()) {
+    if (aCanMoveLastSelectionForToString ==
+        CanMoveLastSelectionForToString::Yes) {
+      UpdateLastSelectionForToString(&aFrameSelection);
+    }
+  }
+  if (mFocusedFrameSelection == &aFrameSelection) {
+    return;
+  }
+
+  RefPtr<nsFrameSelection> old = std::move(mFocusedFrameSelection);
+  mFocusedFrameSelection = &aFrameSelection;
+
+  if (old &&
+      old->GetDisplaySelection() != nsISelectionController::SELECTION_HIDDEN) {
+    old->SetDisplaySelection(nsISelectionController::SELECTION_HIDDEN);
+    RepaintNormalSelectionWhenSafe(*old);
+  }
+
+  if (aFrameSelection.GetDisplaySelection() !=
+      nsISelectionController::SELECTION_ON) {
+    aFrameSelection.SetDisplaySelection(nsISelectionController::SELECTION_ON);
+    RepaintNormalSelectionWhenSafe(aFrameSelection);
+  }
+}
+
+void PresShell::UpdateLastSelectionForToString(
+    const nsFrameSelection* aFrameSelection) {
+  if (mLastSelectionForToString != aFrameSelection) {
+    mLastSelectionForToString = aFrameSelection;
+  }
+}
+
+NS_IMETHODIMP
+PresShell::SetDisplaySelection(int16_t aToggle) {
+  mSelection->SetDisplaySelection(aToggle);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+PresShell::GetDisplaySelection(int16_t* aToggle) {
+  *aToggle = mSelection->GetDisplaySelection();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+PresShell::GetSelectionFromScript(RawSelectionType aRawSelectionType,
+                                  Selection** aSelection) {
+  if (!aSelection || !mSelection) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  RefPtr<Selection> selection =
+      mSelection->GetSelection(ToSelectionType(aRawSelectionType));
+
+  if (!selection) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  selection.forget(aSelection);
+  return NS_OK;
+}
+
+Selection* PresShell::GetSelection(RawSelectionType aRawSelectionType) {
+  if (!mSelection) {
+    return nullptr;
+  }
+
+  return mSelection->GetSelection(ToSelectionType(aRawSelectionType));
+}
+
+Selection* PresShell::GetCurrentSelection(SelectionType aSelectionType) {
+  if (!mSelection) {
+    return nullptr;
+  }
+
+  return mSelection->GetSelection(aSelectionType);
+}
+
+nsFrameSelection* PresShell::GetLastFocusedFrameSelection() {
+  return mFocusedFrameSelection ? mFocusedFrameSelection : mSelection;
+}
+
+NS_IMETHODIMP
+PresShell::ScrollSelectionIntoView(RawSelectionType aRawSelectionType,
+                                   SelectionRegion aRegion,
+                                   ControllerScrollFlags aFlags) {
+  if (!mSelection) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  RefPtr<nsFrameSelection> frameSelection = mSelection;
+  return frameSelection->ScrollSelectionIntoView(
+      ToSelectionType(aRawSelectionType), aRegion, aFlags);
+}
+
+NS_IMETHODIMP
+PresShell::RepaintSelection(RawSelectionType aRawSelectionType) {
+  if (!mSelection) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  if (MOZ_UNLIKELY(mIsDestroying)) {
+    return NS_OK;
+  }
+
+  RefPtr<nsFrameSelection> frameSelection = mSelection;
+  return frameSelection->RepaintSelection(ToSelectionType(aRawSelectionType));
+}
+
+void PresShell::RepaintPseudoElementStyledSelections() {
+  if (MOZ_UNLIKELY(mIsDestroying)) {
+    return;
+  }
+
+  if (RefPtr<nsFrameSelection> frameSelection = mSelection) {
+    frameSelection->RepaintSelection(SelectionType::eNormal);
+    frameSelection->RepaintSelection(SelectionType::eTargetText);
+  }
+
+  mDocument->HighlightRegistry().RepaintAllHighlightSelections();
+}
+
+void PresShell::BeginObservingDocument() {
+  if (mDocument && !mIsDestroying) {
+    mIsObservingDocument = true;
+    if (mIsDocumentGone) {
+      NS_WARNING(
+          "Adding a presshell that was disconnected from the document "
+          "as a document observer?  Sounds wrong...");
+      mIsDocumentGone = false;
+    }
+  }
+}
+
+void PresShell::EndObservingDocument() {
+  mIsDocumentGone = true;
+  mIsObservingDocument = false;
+}
+
+void PresShell::InitPaintSuppressionTimer() {
+  Document* doc = mDocument->GetDisplayDocument()
+                      ? mDocument->GetDisplayDocument()
+                      : mDocument.get();
+  const bool inProcess = !doc->GetBrowsingContext() ||
+                         doc->GetBrowsingContext()->Top()->IsInProcess();
+  int32_t delay = inProcess
+                      ? StaticPrefs::nglayout_initialpaint_delay()
+                      : StaticPrefs::nglayout_initialpaint_delay_in_oopif();
+  mPaintSuppressionTimer->InitWithNamedFuncCallback(
+      [](nsITimer* aTimer, void* aPresShell) {
+        RefPtr<PresShell> self = static_cast<PresShell*>(aPresShell);
+        self->UnsuppressPainting();
+      },
+      this, delay, nsITimer::TYPE_ONE_SHOT,
+      "PresShell::sPaintSuppressionCallback"_ns);
+}
+
+nsresult PresShell::Initialize() {
+  if (mIsDestroying) {
+    return NS_OK;
+  }
+
+  if (!mDocument) {
+    return NS_OK;
+  }
+
+  MOZ_LOG(gLog, LogLevel::Debug, ("PresShell::Initialize this=%p", this));
+
+  NS_ASSERTION(!mDidInitialize, "Why are we being called?");
+
+  RefPtr<PresShell> kungFuDeathGrip(this);
+
+  RecomputeFontSizeInflationEnabled();
+  MOZ_DIAGNOSTIC_ASSERT(!mIsDestroying);
+
+  mPresContext->FlushPendingMediaFeatureValuesChanged();
+  MOZ_DIAGNOSTIC_ASSERT(!mIsDestroying);
+
+  mDidInitialize = true;
+
+  MOZ_ASSERT(!mFrameConstructor->GetRootFrame(),
+             "How did that happen, exactly?");
+  ViewportFrame* rootFrame;
+  {
+    nsAutoScriptBlocker scriptBlocker;
+    rootFrame = mFrameConstructor->ConstructRootFrame();
+    mFrameConstructor->SetRootFrame(rootFrame);
+  }
+
+  NS_ENSURE_STATE(!mHaveShutDown);
+
+  if (!rootFrame) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  if (Element* root = mDocument->GetRootElement()) {
+    {
+      nsAutoCauseReflowNotifier reflowNotifier(this);
+      mFrameConstructor->ContentInserted(
+          root, nsCSSFrameConstructor::InsertionKind::Sync);
+    }
+    NS_ENSURE_STATE(!mHaveShutDown);
+  }
+
+  mDocument->MaybeScheduleRendering();
+
+  NS_ASSERTION(rootFrame, "How did that happen?");
+
+  if (MOZ_LIKELY(rootFrame->HasAnyStateBits(NS_FRAME_IS_DIRTY))) {
+    rootFrame->RemoveStateBits(NS_FRAME_IS_DIRTY | NS_FRAME_HAS_DIRTY_CHILDREN);
+    NS_ASSERTION(!mDirtyRoots.Contains(rootFrame),
+                 "Why is the root in mDirtyRoots already?");
+    FrameNeedsReflow(rootFrame, IntrinsicDirty::None, NS_FRAME_IS_DIRTY);
+    NS_ASSERTION(mDirtyRoots.Contains(rootFrame),
+                 "Should be in mDirtyRoots now");
+    NS_ASSERTION(mNeedStyleFlush || mNeedLayoutFlush,
+                 "Why no reflow scheduled?");
+  }
+
+  if (!mDocumentLoading) {
+    RestoreRootScrollPosition();
+  }
+
+  if (!mPresContext->IsPaginated()) {
+    mPaintingSuppressed = true;
+    nsIDocShell* docShell = mDocument->GetDocShell();
+    if ((docShell &&
+         !nsDocShell::Cast(docShell)
+              ->HasStartedLoadingOtherThanInitialBlankURI() &&
+         mDocument->IsInitialDocument()) ||
+        mDocument->GetReadyStateEnum() != Document::READYSTATE_COMPLETE) {
+      mPaintSuppressionTimer = NS_NewTimer();
+    }
+    if (!mPaintSuppressionTimer) {
+      mPaintingSuppressed = false;
+    } else {
+      mPaintSuppressionTimer->SetTarget(GetMainThreadSerialEventTarget());
+      InitPaintSuppressionTimer();
+      if (mHasTriedFastUnsuppress) {
+        mHasTriedFastUnsuppress = false;
+        TryUnsuppressPaintingSoon();
+        MOZ_ASSERT(mHasTriedFastUnsuppress);
+      }
+    }
+  }
+
+  if (!mPaintingSuppressed) {
+    mShouldUnsuppressPainting = true;
+  }
+
+  return NS_OK;  
+}
+
+void PresShell::TryUnsuppressPaintingSoon() {
+  if (mHasTriedFastUnsuppress) {
+    return;
+  }
+  mHasTriedFastUnsuppress = true;
+
+  if (!mDidInitialize || !IsPaintingSuppressed() || !XRE_IsContentProcess()) {
+    return;
+  }
+
+  if (!mDocument->IsInitialDocument() &&
+      mDocument->DidHitCompleteSheetCache() &&
+      mPresContext->IsRootContentDocumentCrossProcess()) {
+    NS_DispatchToCurrentThreadQueue(
+        NS_NewRunnableFunction("PresShell::TryUnsuppressPaintingSoon",
+                               [self = RefPtr{this}]() -> void {
+                                 if (self->IsPaintingSuppressed()) {
+                                   self->UnsuppressPainting();
+                                 }
+                               }),
+        EventQueuePriority::Control);
+  }
+}
+
+void PresShell::RefreshZoomConstraintsForScreenSizeChange() {
+  if (mZoomConstraintsClient) {
+    mZoomConstraintsClient->ScreenSizeChanged();
+  }
+}
+
+nsSize PresShell::MaybePendingLayoutViewportSize() const {
+  if (mPendingLayoutViewportSize) {
+    return *mPendingLayoutViewportSize;
+  }
+  return mPresContext ? mPresContext->GetVisibleArea().Size() : nsSize();
+}
+
+bool PresShell::ShouldDelayResize() const {
+  if (!IsVisible()) {
+    return true;
+  }
+  nsRefreshDriver* rd = GetRefreshDriver();
+  return rd && rd->IsResizeSuppressed();
+}
+
+void PresShell::FlushDelayedResize() {
+  if (!mPendingLayoutViewportSize) {
+    return;
+  }
+  auto size = mPendingLayoutViewportSize.extract();
+  if (!mPresContext || size == mPresContext->GetVisibleArea().Size()) {
+    return;
+  }
+  ResizeReflow(size);
+}
+
+void PresShell::SetLayoutViewportSize(const nsSize& aSize, bool aDelay) {
+  mPendingLayoutViewportSize = Some(aSize);
+  if (aDelay || ShouldDelayResize()) {
+    SetNeedStyleFlush();
+    SetNeedLayoutFlush();
+    return;
+  }
+  FlushDelayedResize();
+}
+
+void PresShell::ForceResizeReflowWithCurrentDimensions() {
+  ResizeReflow(MaybePendingLayoutViewportSize());
+}
+
+void PresShell::ResizeReflow(const nsSize& aSize,
+                             ResizeReflowOptions aOptions) {
+  if (mZoomConstraintsClient) {
+    mZoomConstraintsClient->ScreenSizeChanged();
+  }
+  if (UsesMobileViewportSizing()) {
+    MOZ_ASSERT(mMobileViewportManager);
+    mMobileViewportManager->RequestReflow(false);
+    return;
+  }
+  ResizeReflowIgnoreOverride(aSize, aOptions);
+}
+
+bool PresShell::SimpleResizeReflow(const nsSize& aSize) {
+  MOZ_ASSERT(aSize.width != NS_UNCONSTRAINEDSIZE);
+  MOZ_ASSERT(aSize.height != NS_UNCONSTRAINEDSIZE);
+  nsSize oldSize = mPresContext->GetVisibleArea().Size();
+  mPresContext->SetVisibleArea(nsRect(nsPoint(), aSize));
+  nsIFrame* rootFrame = GetRootFrame();
+  if (!rootFrame) {
+    return false;
+  }
+  WritingMode wm = rootFrame->GetWritingMode();
+  bool isBSizeChanging = wm.IsVertical() ? oldSize.width != aSize.width
+                                         : oldSize.height != aSize.height;
+  if (isBSizeChanging) {
+    nsLayoutUtils::MarkIntrinsicISizesDirtyIfDependentOnBSize(rootFrame);
+    rootFrame->SetHasBSizeChange(true);
+  }
+  FrameNeedsReflow(rootFrame, IntrinsicDirty::None,
+                   NS_FRAME_HAS_DIRTY_CHILDREN);
+
+  if (mMobileViewportManager) {
+    mMobileViewportManager->UpdateSizesBeforeReflow();
+  }
+  return true;
+}
+
+bool PresShell::CanHandleUserInputEvents(WidgetGUIEvent* aGUIEvent) {
+  if (XRE_IsParentProcess()) {
+    return true;
+  }
+
+  if (aGUIEvent->mFlags.mIsSynthesizedForTests &&
+      !false) {
+    return true;
+  }
+
+  if (!aGUIEvent->IsUserAction()) {
+    return true;
+  }
+
+  if (nsPresContext* rootPresContext = mPresContext->GetRootPresContext()) {
+    return rootPresContext->UserInputEventsAllowed();
+  }
+
+  return true;
+}
+
+void PresShell::PostScrollEvent(Runnable* aEvent) {
+  MOZ_ASSERT(aEvent);
+  mPendingScrollEvents.AppendElement(aEvent);
+
+  mPresContext->RefreshDriver()->ScheduleRenderingPhases(
+      {RenderingPhase::ScrollSteps, RenderingPhase::Layout,
+       RenderingPhase::UpdateIntersectionObservations});
+}
+
+void PresShell::ScheduleResizeEventIfNeeded(ResizeEventKind aKind) {
+  if (mIsDestroying) {
+    return;
+  }
+  if (MOZ_UNLIKELY(mDocument->GetBFCacheEntry())) {
+    return;
+  }
+  if (aKind == ResizeEventKind::Regular) {
+    mResizeEventPending = true;
+  } else {
+    MOZ_ASSERT(aKind == ResizeEventKind::Visual);
+    mVisualViewportResizeEventPending = true;
+  }
+  mPresContext->RefreshDriver()->ScheduleRenderingPhase(
+      RenderingPhase::ResizeSteps);
+}
+
+bool PresShell::ResizeReflowIgnoreOverride(const nsSize& aSize,
+                                           ResizeReflowOptions aOptions) {
+  MOZ_ASSERT(!mIsReflowing, "Shouldn't be in reflow here!");
+
+  const bool initialized = mDidInitialize;
+  RefPtr<PresShell> kungFuDeathGrip(this);
+
+  auto postResizeEventIfNeeded = [this, initialized]() {
+    if (initialized) {
+      ScheduleResizeEventIfNeeded(ResizeEventKind::Regular);
+    }
+  };
+
+  for (auto* frame : mOrthogonalFlows) {
+    FrameNeedsReflow(frame, IntrinsicDirty::None, NS_FRAME_HAS_DIRTY_CHILDREN);
+  }
+  mOrthogonalFlows.Clear();
+
+  if (!(aOptions & ResizeReflowOptions::BSizeLimit)) {
+    nsSize oldSize = mPresContext->GetVisibleArea().Size();
+    if (oldSize == aSize) {
+      return false;
+    }
+
+    bool changed = SimpleResizeReflow(aSize);
+    postResizeEventIfNeeded();
+    return changed;
+  }
+
+  mDocument->FlushPendingNotifications(FlushType::Frames);
+
+  nsIFrame* rootFrame = GetRootFrame();
+  if (mIsDestroying || !rootFrame) {
+    if (aSize.height == NS_UNCONSTRAINEDSIZE ||
+        aSize.width == NS_UNCONSTRAINEDSIZE) {
+      return false;
+    }
+
+    mPresContext->SetVisibleArea(nsRect(nsPoint(), aSize));
+    return true;
+  }
+
+  WritingMode wm = rootFrame->GetWritingMode();
+  MOZ_ASSERT(
+      (wm.IsVertical() ? aSize.height : aSize.width) != NS_UNCONSTRAINEDSIZE,
+      "unconstrained isize not allowed");
+
+  nsSize targetSize = aSize;
+  if (wm.IsVertical()) {
+    targetSize.width = NS_UNCONSTRAINEDSIZE;
+  } else {
+    targetSize.height = NS_UNCONSTRAINEDSIZE;
+  }
+
+  mPresContext->SetVisibleArea(nsRect(nsPoint(), targetSize));
+
+  nsLayoutUtils::MarkIntrinsicISizesDirtyIfDependentOnBSize(rootFrame);
+  rootFrame->SetHasBSizeChange(true);
+  FrameNeedsReflow(rootFrame, IntrinsicDirty::None,
+                   NS_FRAME_HAS_DIRTY_CHILDREN);
+
+  {
+    nsAutoCauseReflowNotifier crNotifier(this);
+    WillDoReflow();
+
+    AUTO_LAYOUT_PHASE_ENTRY_POINT(GetPresContext(), Reflow);
+
+    mDirtyRoots.Remove(rootFrame);
+    DoReflow(rootFrame, true, nullptr);
+
+    const bool reflowAgain =
+        wm.IsVertical() ? mPresContext->GetVisibleArea().width > aSize.width
+                        : mPresContext->GetVisibleArea().height > aSize.height;
+
+    if (reflowAgain) {
+      mPresContext->SetVisibleArea(nsRect(nsPoint(), aSize));
+      rootFrame->SetHasBSizeChange(true);
+      DoReflow(rootFrame, true, nullptr);
+    }
+  }
+
+
+  mPendingDidDoReflow = true;
+  DidDoReflow(true);
+
+  MOZ_DIAGNOSTIC_ASSERT(
+      mPresContext->GetVisibleArea().width != NS_UNCONSTRAINEDSIZE,
+      "width should not be NS_UNCONSTRAINEDSIZE after reflow");
+  MOZ_DIAGNOSTIC_ASSERT(
+      mPresContext->GetVisibleArea().height != NS_UNCONSTRAINEDSIZE,
+      "height should not be NS_UNCONSTRAINEDSIZE after reflow");
+
+  postResizeEventIfNeeded();
+  return true;
+}
+
+void PresShell::RunResizeSteps() {
+  if (!mResizeEventPending && !mVisualViewportResizeEventPending) {
+    return;
+  }
+  if (mIsDocumentGone) {
+    return;
+  }
+
+  RefPtr window = nsGlobalWindowInner::Cast(mDocument->GetInnerWindow());
+  if (!window) {
+    return;
+  }
+
+  if (mResizeEventPending) {
+    mResizeEventPending = false;
+    WidgetEvent event(true, mozilla::eResize);
+    nsEventStatus status = nsEventStatus_eIgnore;
+
+    if (RefPtr<nsPIDOMWindowOuter> outer = window->GetOuterWindow()) {
+      EventDispatcher::Dispatch(MOZ_KnownLive(nsGlobalWindowOuter::Cast(outer)),
+                                mPresContext, &event, nullptr, &status);
+    }
+  }
+
+  if (mVisualViewportResizeEventPending) {
+    mVisualViewportResizeEventPending = false;
+    RefPtr vv = window->VisualViewport();
+    vv->FireResizeEvent();
+  }
+}
+
+void PresShell::RunScrollSteps() {
+  auto events = std::move(mPendingScrollEvents);
+  for (auto& event : events) {
+    event->Run();
+  }
+}
+
+static nsIContent* GetNativeAnonymousSubtreeRoot(nsIContent* aContent) {
+  if (!aContent) {
+    return nullptr;
+  }
+  return aContent->GetClosestNativeAnonymousSubtreeRoot();
+}
+
+void PresShell::NativeAnonymousContentWillBeRemoved(nsIContent* aAnonContent) {
+  MOZ_ASSERT(aAnonContent->IsRootOfNativeAnonymousSubtree());
+  mPresContext->EventStateManager()->NativeAnonymousContentRemoved(
+      aAnonContent);
+#if defined(ACCESSIBILITY)
+  if (nsAccessibilityService* accService = GetAccService()) {
+    accService->ContentRemoved(this, aAnonContent);
+  }
+#endif
+  if (mDocument->DevToolsAnonymousAndShadowEventsEnabled()) {
+    aAnonContent->QueueDevtoolsAnonymousEvent( true);
+  }
+  if (nsIContent* root =
+          GetNativeAnonymousSubtreeRoot(mCurrentEventTarget.mContent)) {
+    if (aAnonContent == root) {
+      mCurrentEventTarget.UpdateFrameAndContent(
+          nullptr, aAnonContent->GetFlattenedTreeParent());
+    }
+  }
+
+  for (EventTargetInfo& eventTargetInfo : mCurrentEventTargetStack) {
+    nsIContent* anon = GetNativeAnonymousSubtreeRoot(eventTargetInfo.mContent);
+    if (aAnonContent == anon) {
+      eventTargetInfo.UpdateFrameAndContent(
+          nullptr, aAnonContent->GetFlattenedTreeParent());
+    }
+  }
+}
+
+void PresShell::SetIgnoreFrameDestruction(bool aIgnore) {
+  if (mDocument) {
+    mDocument->EnsureStyleImageLoader().ClearFrames(mPresContext);
+  }
+  mIgnoreFrameDestruction = aIgnore;
+}
+
+void PresShell::NotifyDestroyingFrame(nsIFrame* aFrame) {
+  aFrame->RemoveDisplayItemDataForDeletion();
+
+  if (!mIgnoreFrameDestruction) {
+    if (aFrame->HasImageRequest()) {
+      mDocument->EnsureStyleImageLoader().DropRequestsForFrame(aFrame);
+    }
+
+    mFrameConstructor->NotifyDestroyingFrame(aFrame);
+
+    mDirtyRoots.Remove(aFrame);
+
+    aFrame->RemoveAllProperties();
+
+    const auto ComputeTargetContent =
+        [&aFrame](const EventTargetInfo& aEventTargetInfo) -> nsIContent* {
+      if (!IsForbiddenDispatchingToNonElementContent(
+              aEventTargetInfo.mEventMessage)) {
+        return aFrame->GetContent();
+      }
+      return aFrame->GetContent()
+                 ? aFrame->GetContent()
+                       ->GetInclusiveFlattenedTreeAncestorElement()
+                 : nullptr;
+    };
+
+    if (aFrame == mCurrentEventTarget.mFrame) {
+      mCurrentEventTarget.UpdateFrameAndContent(
+          nullptr, ComputeTargetContent(mCurrentEventTarget));
+    }
+
+    for (EventTargetInfo& eventTargetInfo : mCurrentEventTargetStack) {
+      if (aFrame == eventTargetInfo.mFrame) {
+        eventTargetInfo.UpdateFrameAndContent(
+            nullptr, ComputeTargetContent(eventTargetInfo));
+      }
+    }
+
+    mFramesToDirty.Remove(aFrame);
+    mOrthogonalFlows.Remove(aFrame);
+
+    if (ScrollContainerFrame* scrollContainerFrame = do_QueryFrame(aFrame)) {
+      mPendingScrollAnchorSelection.Remove(scrollContainerFrame);
+      mPendingScrollAnchorAdjustment.Remove(scrollContainerFrame);
+      mPendingScrollResnap.Remove(scrollContainerFrame);
+    }
+  }
+}
+
+already_AddRefed<nsCaret> PresShell::GetActiveCaret() const {
+  RefPtr<nsCaret> caret = mCaret;
+  return caret.forget();
+}
+
+already_AddRefed<nsCaret> PresShell::GetOriginalCaret() const {
+  RefPtr<nsCaret> caret = mOriginalCaret;
+  return caret.forget();
+}
+
+already_AddRefed<AccessibleCaretEventHub>
+PresShell::GetAccessibleCaretEventHub() const {
+  RefPtr<AccessibleCaretEventHub> eventHub = mAccessibleCaretEventHub;
+  return eventHub.forget();
+}
+
+void PresShell::SetActiveCaret(nsCaret* aNewCaret) {
+  if (mCaret == aNewCaret) {
+    return;
+  }
+  if (mCaret) {
+    mCaret->SchedulePaint();
+  }
+  mCaret = aNewCaret;
+  if (aNewCaret) {
+    aNewCaret->SchedulePaint();
+  }
+}
+
+void PresShell::RestoreOriginalCaret() { SetActiveCaret(mOriginalCaret); }
+
+NS_IMETHODIMP PresShell::SetCaretEnabled(bool aInEnable) {
+  bool oldEnabled = mCaretEnabled;
+
+  mCaretEnabled = aInEnable;
+
+  if (mCaretEnabled != oldEnabled) {
+    MOZ_ASSERT(mOriginalCaret);
+    if (mOriginalCaret) {
+      mOriginalCaret->SetVisible(mCaretEnabled);
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP PresShell::SetCaretReadOnly(bool aReadOnly) {
+  if (mOriginalCaret) {
+    mOriginalCaret->SetCaretReadOnly(aReadOnly);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP PresShell::GetCaretEnabled(bool* aOutEnabled) {
+  NS_ENSURE_ARG_POINTER(aOutEnabled);
+  *aOutEnabled = mCaretEnabled;
+  return NS_OK;
+}
+
+NS_IMETHODIMP PresShell::SetCaretVisibilityDuringSelection(bool aVisibility) {
+  if (mOriginalCaret) {
+    mOriginalCaret->SetVisibilityDuringSelection(aVisibility);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP PresShell::GetCaretVisible(bool* aOutIsVisible) {
+  *aOutIsVisible = false;
+  if (mOriginalCaret) {
+    *aOutIsVisible = mOriginalCaret->IsVisible();
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP PresShell::SetSelectionFlags(int16_t aFlags) {
+  mSelectionFlags = aFlags;
+  return NS_OK;
+}
+
+NS_IMETHODIMP PresShell::GetSelectionFlags(int16_t* aFlags) {
+  if (!aFlags) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  *aFlags = mSelectionFlags;
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+PresShell::PhysicalMove(int16_t aDirection, int16_t aAmount, bool aExtend) {
+  RefPtr<nsFrameSelection> frameSelection = mSelection;
+  return frameSelection->PhysicalMove(aDirection, aAmount, aExtend);
+}
+
+NS_IMETHODIMP
+PresShell::CharacterMove(bool aForward, bool aExtend) {
+  RefPtr<nsFrameSelection> frameSelection = mSelection;
+  return frameSelection->CharacterMove(aForward, aExtend);
+}
+
+NS_IMETHODIMP
+PresShell::WordMove(bool aForward, bool aExtend) {
+  RefPtr<nsFrameSelection> frameSelection = mSelection;
+  nsresult result = frameSelection->WordMove(aForward, aExtend);
+  if (NS_FAILED(result)) {
+    result = CompleteMove(aForward, aExtend);
+  }
+  return result;
+}
+
+NS_IMETHODIMP
+PresShell::LineMove(bool aForward, bool aExtend) {
+  RefPtr<nsFrameSelection> frameSelection = mSelection;
+  nsresult result = frameSelection->LineMove(aForward, aExtend);
+  if (NS_FAILED(result)) {
+    result = CompleteMove(aForward, aExtend);
+  }
+  return result;
+}
+
+NS_IMETHODIMP
+PresShell::IntraLineMove(bool aForward, bool aExtend) {
+  RefPtr<nsFrameSelection> frameSelection = mSelection;
+  return frameSelection->IntraLineMove(aForward, aExtend);
+}
+
+NS_IMETHODIMP
+PresShell::ParagraphMove(bool aForward, bool aExtend) {
+  RefPtr<nsFrameSelection> frameSelection = mSelection;
+  return frameSelection->ParagraphMove(aForward, aExtend);
+}
+
+NS_IMETHODIMP
+PresShell::PageMove(bool aForward, bool aExtend) {
+  nsIFrame* frame = nullptr;
+  if (!aExtend) {
+    frame = GetScrollContainerFrameToScroll(VerticalScrollDirection);
+  }
+  if (!frame || frame->PresContext() != mPresContext) {
+    frame = mSelection->GetFrameToPageSelect();
+    if (!frame) {
+      return NS_OK;
+    }
+  }
+  RefPtr<nsFrameSelection> frameSelection = mSelection;
+  return frameSelection->PageMove(
+      aForward, aExtend, frame, nsFrameSelection::SelectionIntoView::IfChanged);
+}
+
+NS_IMETHODIMP
+PresShell::ScrollPage(bool aForward) {
+  ScrollContainerFrame* scrollContainerFrame =
+      GetScrollContainerFrameToScroll(VerticalScrollDirection);
+  ScrollMode scrollMode = apz::GetScrollModeForOrigin(ScrollOrigin::Pages);
+  if (scrollContainerFrame) {
+    scrollContainerFrame->ScrollBy(nsIntPoint(0, aForward ? 1 : -1),
+                                   ScrollUnit::PAGES, scrollMode, nullptr,
+                                   mozilla::ScrollOrigin::NotSpecified,
+                                   ScrollContainerFrame::NOT_MOMENTUM,
+                                   ScrollSnapFlags::IntendedDirection |
+                                       ScrollSnapFlags::IntendedEndPosition);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+PresShell::ScrollLine(bool aForward) {
+  ScrollContainerFrame* scrollContainerFrame =
+      GetScrollContainerFrameToScroll(VerticalScrollDirection);
+  ScrollMode scrollMode = apz::GetScrollModeForOrigin(ScrollOrigin::Lines);
+  if (scrollContainerFrame) {
+    nsRect scrollPort = scrollContainerFrame->GetScrollPortRect();
+    nsSize lineSize = scrollContainerFrame->GetLineScrollAmount();
+    int32_t lineCount = StaticPrefs::toolkit_scrollbox_verticalScrollDistance();
+    if (lineCount * lineSize.height > scrollPort.Height()) {
+      return ScrollPage(aForward);
+    }
+    scrollContainerFrame->ScrollBy(
+        nsIntPoint(0, aForward ? lineCount : -lineCount), ScrollUnit::LINES,
+        scrollMode, nullptr, mozilla::ScrollOrigin::NotSpecified,
+        ScrollContainerFrame::NOT_MOMENTUM, ScrollSnapFlags::IntendedDirection);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+PresShell::ScrollCharacter(bool aRight) {
+  ScrollContainerFrame* scrollContainerFrame =
+      GetScrollContainerFrameToScroll(HorizontalScrollDirection);
+  ScrollMode scrollMode = apz::GetScrollModeForOrigin(ScrollOrigin::Lines);
+  if (scrollContainerFrame) {
+    int32_t h = StaticPrefs::toolkit_scrollbox_horizontalScrollDistance();
+    scrollContainerFrame->ScrollBy(
+        nsIntPoint(aRight ? h : -h, 0), ScrollUnit::LINES, scrollMode, nullptr,
+        mozilla::ScrollOrigin::NotSpecified, ScrollContainerFrame::NOT_MOMENTUM,
+        ScrollSnapFlags::IntendedDirection);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+PresShell::CompleteScroll(bool aForward) {
+  ScrollContainerFrame* scrollContainerFrame =
+      GetScrollContainerFrameToScroll(VerticalScrollDirection);
+  ScrollMode scrollMode = apz::GetScrollModeForOrigin(ScrollOrigin::Other);
+  if (scrollContainerFrame) {
+    scrollContainerFrame->ScrollBy(nsIntPoint(0, aForward ? 1 : -1),
+                                   ScrollUnit::WHOLE, scrollMode, nullptr,
+                                   mozilla::ScrollOrigin::NotSpecified,
+                                   ScrollContainerFrame::NOT_MOMENTUM,
+                                   ScrollSnapFlags::IntendedEndPosition);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+PresShell::CompleteMove(bool aForward, bool aExtend) {
+  const RefPtr<nsFrameSelection> frameSelection = mSelection;
+  const RefPtr<Element> limiter = frameSelection->GetAncestorLimiter();
+  const auto pos = [&]() -> Maybe<nsIFrame::CaretPosition> {
+    nsIFrame* frame = limiter ? limiter->GetPrimaryFrame()
+                              : FrameConstructor()->GetRootElementFrame();
+    if (!frame) [[unlikely]] {
+      return Nothing{};
+    }
+    return Some(frame->GetExtremeCaretPosition(!aForward));
+  }();
+  if (pos.isNothing()) [[unlikely]] {
+    return NS_ERROR_FAILURE;
+  }
+
+  const nsFrameSelection::FocusMode focusMode =
+      aExtend ? nsFrameSelection::FocusMode::kExtendSelection
+              : nsFrameSelection::FocusMode::kCollapseToNewPoint;
+  frameSelection->HandleClick(
+      MOZ_KnownLive(pos->mResultContent) , pos->mContentOffset,
+      pos->mContentOffset, focusMode,
+      aForward ? CaretAssociationHint::After : CaretAssociationHint::Before);
+  if (IsDestroying()) [[unlikely]] {
+    return NS_OK;
+  }
+  if (limiter && GetDocument() == limiter->GetComposedDoc()) {
+    frameSelection->SetAncestorLimiter(limiter);
+  }
+
+  return ScrollSelectionIntoView(SelectionType::eNormal,
+                                 nsISelectionController::SELECTION_FOCUS_REGION,
+                                 SelectionScrollMode::SyncFlush);
+}
+
+
+ScrollContainerFrame* PresShell::GetRootScrollContainerFrame() const {
+  if (!mFrameConstructor) {
+    return nullptr;
+  }
+  nsIFrame* rootFrame = mFrameConstructor->GetRootFrame();
+  if (!rootFrame) {
+    return nullptr;
+  }
+  nsIFrame* theFrame = rootFrame->PrincipalChildList().FirstChild();
+  if (!theFrame || !theFrame->IsScrollContainerFrame()) {
+    return nullptr;
+  }
+  return static_cast<ScrollContainerFrame*>(theFrame);
+}
+
+nsPageSequenceFrame* PresShell::GetPageSequenceFrame() const {
+  return mFrameConstructor->GetPageSequenceFrame();
+}
+
+nsCanvasFrame* PresShell::GetCanvasFrame() const {
+  return mFrameConstructor->GetCanvasFrame();
+}
+
+void PresShell::RestoreRootScrollPosition() {
+  if (ScrollContainerFrame* sf = GetRootScrollContainerFrame()) {
+    sf->ScrollToRestoredPosition();
+  }
+}
+
+void PresShell::MaybeReleaseCapturingContent() {
+  RefPtr<nsFrameSelection> frameSelection = FrameSelection();
+  if (frameSelection) {
+    frameSelection->SetDragState(false);
+  }
+  if (sCapturingContentInfo.mContent &&
+      sCapturingContentInfo.mContent->OwnerDoc() == mDocument) {
+    PresShell::ReleaseCapturingContent();
+  }
+}
+
+void PresShell::BeginLoad(Document* aDocument) {
+  mDocumentLoading = true;
+
+  SuppressDisplayport(true);
+
+  gfxTextPerfMetrics* tp = nullptr;
+  if (mPresContext) {
+    tp = mPresContext->GetTextPerfMetrics();
+  }
+
+  bool shouldLog = MOZ_LOG_TEST(gLog, LogLevel::Debug);
+  if (shouldLog || tp) {
+    mLoadBegin = TimeStamp::Now();
+  }
+
+  if (shouldLog) {
+    nsIURI* uri = mDocument->GetDocumentURI();
+    MOZ_LOG(gLog, LogLevel::Debug,
+            ("(presshell) %p load begin [%s]\n", this,
+             uri ? uri->GetSpecOrDefault().get() : ""));
+  }
+}
+
+void PresShell::EndLoad(Document* aDocument) {
+  MOZ_ASSERT(aDocument == mDocument, "Wrong document");
+
+  SuppressDisplayport(false);
+  RestoreRootScrollPosition();
+
+  mDocumentLoading = false;
+}
+
+void PresShell::LoadComplete() {
+  gfxTextPerfMetrics* tp = nullptr;
+  if (mPresContext) {
+    tp = mPresContext->GetTextPerfMetrics();
+  }
+
+  bool shouldLog = MOZ_LOG_TEST(gLog, LogLevel::Debug);
+  if (shouldLog || tp) {
+    TimeDuration loadTime = TimeStamp::Now() - mLoadBegin;
+    nsIURI* uri = mDocument->GetDocumentURI();
+    nsAutoCString spec;
+    if (uri) {
+      spec = uri->GetSpecOrDefault();
+    }
+    if (shouldLog) {
+      MOZ_LOG(gLog, LogLevel::Debug,
+              ("(presshell) %p load done time-ms: %9.2f [%s]\n", this,
+               loadTime.ToMilliseconds(), spec.get()));
+    }
+    if (tp) {
+      tp->Accumulate();
+      if (tp->cumulative.numChars > 0) {
+        LogTextPerfStats(tp, this, tp->cumulative, loadTime.ToMilliseconds(),
+                         eLog_loaddone, spec.get());
+      }
+    }
+  }
+}
+
+#if defined(DEBUG)
+void PresShell::VerifyHasDirtyRootAncestor(nsIFrame* aFrame) {
+}
+#endif
+
+void PresShell::PostPendingScrollAnchorSelection(
+    mozilla::layout::ScrollAnchorContainer* aContainer) {
+  mPendingScrollAnchorSelection.Insert(aContainer->ScrollContainer());
+}
+
+void PresShell::FlushPendingScrollAnchorSelections() {
+  for (ScrollContainerFrame* scroll : mPendingScrollAnchorSelection) {
+    scroll->Anchor()->SelectAnchor();
+  }
+  mPendingScrollAnchorSelection.Clear();
+}
+
+void PresShell::PostPendingScrollAnchorAdjustment(
+    ScrollAnchorContainer* aContainer) {
+  mPendingScrollAnchorAdjustment.Insert(aContainer->ScrollContainer());
+}
+
+void PresShell::FlushPendingScrollAnchorAdjustments() {
+  for (ScrollContainerFrame* scroll : mPendingScrollAnchorAdjustment) {
+    scroll->Anchor()->ApplyAdjustments();
+  }
+  mPendingScrollAnchorAdjustment.Clear();
+}
+
+void PresShell::PostPendingScrollResnap(
+    ScrollContainerFrame* aScrollContainerFrame) {
+  mPendingScrollResnap.Insert(aScrollContainerFrame);
+}
+
+void PresShell::FlushPendingScrollResnap() {
+  for (ScrollContainerFrame* scrollContainerFrame : mPendingScrollResnap) {
+    scrollContainerFrame->TryResnap();
+  }
+  mPendingScrollResnap.Clear();
+}
+
+void PresShell::FrameNeedsReflow(nsIFrame* aFrame,
+                                 IntrinsicDirty aIntrinsicDirty,
+                                 nsFrameState aBitToAdd,
+                                 ReflowRootHandling aRootHandling) {
+  MOZ_ASSERT(aBitToAdd == NS_FRAME_IS_DIRTY ||
+                 aBitToAdd == NS_FRAME_HAS_DIRTY_CHILDREN || !aBitToAdd,
+             "Unexpected bits being added");
+
+  NS_ASSERTION(
+      aIntrinsicDirty != IntrinsicDirty::FrameAncestorsAndDescendants ||
+          aBitToAdd != NS_FRAME_HAS_DIRTY_CHILDREN,
+      "bits don't correspond to style change reason");
+
+  NS_ASSERTION(!mIsReflowing, "can't mark frame dirty during reflow");
+
+  if (!mDidInitialize) {
+    return;
+  }
+
+  if (mIsDestroying) {
+    return;
+  }
+
+  AutoTArray<nsIFrame*, 4> subtrees;
+  subtrees.AppendElement(aFrame);
+
+  do {
+    nsIFrame* subtreeRoot = subtrees.PopLastElement();
+
+    bool wasDirty = subtreeRoot->IsSubtreeDirty();
+    subtreeRoot->AddStateBits(aBitToAdd);
+
+    bool targetNeedsReflowFromParent;
+    switch (aRootHandling) {
+      case ReflowRootHandling::PositionOrSizeChange:
+        targetNeedsReflowFromParent = true;
+        break;
+      case ReflowRootHandling::NoPositionOrSizeChange:
+        targetNeedsReflowFromParent = false;
+        break;
+      case ReflowRootHandling::InferFromBitToAdd:
+        targetNeedsReflowFromParent = (aBitToAdd == NS_FRAME_IS_DIRTY);
+        break;
+    }
+
+    auto FrameIsReflowRoot = [](const nsIFrame* aFrame) {
+      return aFrame->HasAnyStateBits(NS_FRAME_REFLOW_ROOT |
+                                     NS_FRAME_DYNAMIC_REFLOW_ROOT);
+    };
+
+    auto CanStopClearingAncestorIntrinsics = [&](const nsIFrame* aFrame) {
+      return FrameIsReflowRoot(aFrame) && aFrame != subtreeRoot;
+    };
+
+    auto IsReflowBoundary = [&](const nsIFrame* aFrame) {
+      return FrameIsReflowRoot(aFrame) &&
+             (aFrame != subtreeRoot || !targetNeedsReflowFromParent);
+    };
+
+
+    if (aIntrinsicDirty != IntrinsicDirty::None) {
+      for (nsIFrame* a = subtreeRoot;
+           a && !CanStopClearingAncestorIntrinsics(a); a = a->GetParent()) {
+        a->MarkIntrinsicISizesDirty();
+        if (a->IsAbsolutelyPositioned()) {
+          break;
+        }
+      }
+    }
+
+    const bool frameAncestorAndDescendantISizesDirty =
+        (aIntrinsicDirty == IntrinsicDirty::FrameAncestorsAndDescendants);
+    const bool dirty = (aBitToAdd == NS_FRAME_IS_DIRTY);
+    if (frameAncestorAndDescendantISizesDirty || dirty) {
+      AutoTArray<nsIFrame*, 32> stack;
+      stack.AppendElement(subtreeRoot);
+
+      do {
+        nsIFrame* f = stack.PopLastElement();
+
+        if (frameAncestorAndDescendantISizesDirty && f->IsPlaceholderFrame()) {
+          if (nsIFrame* oof =
+                  static_cast<nsPlaceholderFrame*>(f)->GetOutOfFlowFrame()) {
+            if (!nsLayoutUtils::IsProperAncestorFrame(subtreeRoot, oof)) {
+              subtrees.AppendElement(oof);
+            }
+          }
+        }
+
+        for (const auto& childList : f->ChildLists()) {
+          for (nsIFrame* kid : childList.mList) {
+            if (frameAncestorAndDescendantISizesDirty) {
+              kid->MarkIntrinsicISizesDirty();
+            }
+            if (dirty) {
+              kid->AddStateBits(NS_FRAME_IS_DIRTY);
+            }
+            stack.AppendElement(kid);
+          }
+        }
+      } while (stack.Length() != 0);
+    }
+
+    if (!aBitToAdd) {
+      continue;
+    }
+
+    nsIFrame* f = subtreeRoot;
+    for (;;) {
+      if (IsReflowBoundary(f) || !f->GetParent()) {
+        if (!wasDirty) {
+          mDirtyRoots.Add(f);
+          SetNeedLayoutFlush();
+        }
+#if defined(DEBUG)
+        else {
+          VerifyHasDirtyRootAncestor(f);
+        }
+#endif
+
+        break;
+      }
+
+      nsIFrame* child = f;
+      f = f->GetParent();
+      wasDirty = f->IsSubtreeDirty();
+      f->ChildIsDirty(child);
+      NS_ASSERTION(f->HasAnyStateBits(NS_FRAME_HAS_DIRTY_CHILDREN),
+                   "ChildIsDirty didn't do its job");
+      if (wasDirty) {
+#if defined(DEBUG)
+        VerifyHasDirtyRootAncestor(f);
+#endif
+        break;
+      }
+    }
+  } while (subtrees.Length() != 0);
+
+  EnsureLayoutFlush();
+}
+
+void PresShell::FrameNeedsToContinueReflow(nsIFrame* aFrame) {
+  NS_ASSERTION(mIsReflowing, "Must be in reflow when marking path dirty.");
+  MOZ_ASSERT(mCurrentReflowRoot, "Must have a current reflow root here");
+  NS_ASSERTION(
+      aFrame == mCurrentReflowRoot ||
+          nsLayoutUtils::IsProperAncestorFrame(mCurrentReflowRoot, aFrame),
+      "Frame passed in is not the descendant of mCurrentReflowRoot");
+  NS_ASSERTION(aFrame->HasAnyStateBits(NS_FRAME_IN_REFLOW),
+               "Frame passed in not in reflow?");
+
+  mFramesToDirty.Insert(aFrame);
+}
+
+already_AddRefed<nsIContent> PresShell::GetContentForScrolling() const {
+  if (nsCOMPtr<nsIContent> focused = GetFocusedContentInOurWindow()) {
+    return focused.forget();
+  }
+  return GetSelectedContentForScrolling();
+}
+
+already_AddRefed<nsIContent> PresShell::GetSelectedContentForScrolling() const {
+  nsCOMPtr<nsIContent> selectedContent;
+  if (mSelection) {
+    Selection& domSelection = mSelection->NormalSelection();
+    selectedContent = nsIContent::FromNodeOrNull(domSelection.GetFocusNode());
+  }
+  return selectedContent.forget();
+}
+
+ScrollContainerFrame* PresShell::GetScrollContainerFrameToScrollForContent(
+    nsIContent* aContent, ScrollDirections aDirections) {
+  ScrollContainerFrame* scrollContainerFrame = nullptr;
+  if (aContent) {
+    nsIFrame* startFrame = aContent->GetPrimaryFrame();
+    if (startFrame) {
+      scrollContainerFrame = startFrame->GetScrollTargetFrame();
+      if (scrollContainerFrame) {
+        startFrame = scrollContainerFrame->GetScrolledFrame();
+      }
+      scrollContainerFrame =
+          nsLayoutUtils::GetNearestScrollableFrameForDirection(startFrame,
+                                                               aDirections);
+    }
+  }
+  if (!scrollContainerFrame) {
+    scrollContainerFrame = GetRootScrollContainerFrame();
+    if (!scrollContainerFrame || !scrollContainerFrame->GetScrolledFrame()) {
+      return nullptr;
+    }
+    scrollContainerFrame = nsLayoutUtils::GetNearestScrollableFrameForDirection(
+        scrollContainerFrame->GetScrolledFrame(), aDirections);
+  }
+  return scrollContainerFrame;
+}
+
+ScrollContainerFrame* PresShell::GetScrollContainerFrameToScroll(
+    ScrollDirections aDirections) {
+  nsCOMPtr<nsIContent> content = GetContentForScrolling();
+  return GetScrollContainerFrameToScrollForContent(content.get(), aDirections);
+}
+
+void PresShell::CancelAllPendingReflows() { mDirtyRoots.Clear(); }
+
+static bool DestroyFramesAndStyleDataFor(
+    Element* aElement, nsPresContext& aPresContext,
+    RestyleManager::IncludeRoot aIncludeRoot) {
+  bool didReconstruct =
+      aPresContext.FrameConstructor()->DestroyFramesFor(aElement);
+  RestyleManager::ClearServoDataFromSubtree(aElement, aIncludeRoot);
+  return didReconstruct;
+}
+
+void PresShell::SlotAssignmentWillChange(Element& aElement,
+                                         HTMLSlotElement* aOldSlot,
+                                         HTMLSlotElement* aNewSlot) {
+  MOZ_ASSERT(aOldSlot != aNewSlot);
+
+  if (MOZ_UNLIKELY(!mDidInitialize)) {
+    return;
+  }
+
+  if (aOldSlot && aOldSlot->AssignedNodes().Length() == 1 &&
+      aOldSlot->HasChildren()) {
+    DestroyFramesForAndRestyle(aOldSlot);
+  }
+
+  DestroyFramesAndStyleDataFor(&aElement, *mPresContext,
+                               RestyleManager::IncludeRoot::Yes);
+
+  if (aNewSlot) {
+    if (aNewSlot->AssignedNodes().IsEmpty() && aNewSlot->HasChildren()) {
+      DestroyFramesForAndRestyle(aNewSlot);
+    } else if (aNewSlot->HasServoData() &&
+               !Servo_Element_IsDisplayNone(aNewSlot)) {
+      aNewSlot->NoteDescendantsNeedFramesForServo();
+      aElement.SetFlags(NODE_NEEDS_FRAME);
+      aNewSlot->SetHasDirtyDescendantsForServo();
+      aNewSlot->NoteDirtySubtreeForServo();
+    }
+  }
+}
+
+#if defined(DEBUG)
+static void AssertNoFramesOrStyleDataInDescendants(Element& aElement) {
+  for (nsINode* node : ShadowIncludingTreeIterator(aElement)) {
+    nsIContent* c = nsIContent::FromNode(node);
+    if (c == &aElement) {
+      continue;
+    }
+    MOZ_ASSERT(!c->GetPrimaryFrame() || c->IsHTMLElement(nsGkAtoms::area));
+    MOZ_ASSERT(!c->IsElement() || !c->AsElement()->HasServoData());
+  }
+}
+#endif
+
+void PresShell::DestroyFramesForAndRestyle(Element* aElement) {
+#if defined(DEBUG)
+  auto postCondition = MakeScopeExit([&]() {
+    MOZ_ASSERT(!aElement->GetPrimaryFrame());
+    AssertNoFramesOrStyleDataInDescendants(*aElement);
+  });
+#endif
+
+  MOZ_ASSERT(aElement);
+  if (!aElement->HasServoData()) {
+    return;
+  }
+
+  nsAutoScriptBlocker scriptBlocker;
+  ++mChangeNestCount;
+
+  const bool didReconstruct = FrameConstructor()->DestroyFramesFor(aElement);
+  RestyleManager::ClearServoDataFromSubtree(aElement,
+                                            RestyleManager::IncludeRoot::No);
+  auto changeHint =
+      didReconstruct ? nsChangeHint(0) : nsChangeHint_ReconstructFrame;
+  mPresContext->RestyleManager()->PostRestyleEvent(
+      aElement, RestyleHint::RestyleSubtree(), changeHint);
+
+  --mChangeNestCount;
+}
+
+void PresShell::ShadowRootWillBeAttached(Element& aElement) {
+#if defined(DEBUG)
+  auto postCondition = MakeScopeExit(
+      [&]() { AssertNoFramesOrStyleDataInDescendants(aElement); });
+#endif
+
+  if (!aElement.HasServoData()) {
+    return;
+  }
+
+  if (!aElement.HasChildren()) {
+    return;
+  }
+
+  nsAutoScriptBlocker scriptBlocker;
+  ++mChangeNestCount;
+
+  FlattenedChildIterator iter(&aElement);
+  nsCSSFrameConstructor* fc = FrameConstructor();
+  for (nsIContent* c = iter.GetNextChild(); c; c = iter.GetNextChild()) {
+    fc->DestroyFramesFor(c);
+    if (c->IsElement()) {
+      RestyleManager::ClearServoDataFromSubtree(c->AsElement());
+    }
+  }
+
+#if defined(ACCESSIBILITY)
+  if (nsAccessibilityService* accService = GetAccService()) {
+    accService->ScheduleAccessibilitySubtreeUpdate(this, &aElement);
+  }
+#endif
+
+  --mChangeNestCount;
+}
+
+void PresShell::PostRecreateFramesFor(Element* aElement) {
+  if (MOZ_UNLIKELY(!mDidInitialize)) {
+    return;
+  }
+
+  mPresContext->RestyleManager()->PostRestyleEvent(
+      aElement, RestyleHint{0}, nsChangeHint_ReconstructFrame);
+}
+
+void PresShell::RestyleForAnimation(Element* aElement, RestyleHint aHint) {
+  mPresContext->RestyleManager()->PostRestyleEvent(aElement, aHint,
+                                                   nsChangeHint(0));
+}
+
+void PresShell::SetForwardingContainer(const WeakPtr<nsDocShell>& aContainer) {
+  mForwardingContainer = aContainer;
+}
+
+void PresShell::ClearFrameRefs(nsIFrame* aFrame) {
+  mPresContext->EventStateManager()->ClearFrameRefs(aFrame);
+
+  AutoWeakFrame* weakFrame = mAutoWeakFrames;
+  while (weakFrame) {
+    AutoWeakFrame* prev = weakFrame->GetPreviousWeakFrame();
+    if (weakFrame->GetFrame() == aFrame) {
+      weakFrame->Clear(this);
+    }
+    weakFrame = prev;
+  }
+
+  AutoTArray<WeakFrame*, 4> toRemove;
+  for (WeakFrame* weakFrame : mWeakFrames) {
+    if (weakFrame->GetFrame() == aFrame) {
+      toRemove.AppendElement(weakFrame);
+    }
+  }
+  for (WeakFrame* weakFrame : toRemove) {
+    weakFrame->Clear(this);
+  }
+}
+
+UniquePtr<gfxContext> PresShell::CreateReferenceRenderingContext() {
+  if (mPresContext->IsScreen()) {
+    return gfxContext::CreateOrNull(
+        gfxPlatform::GetPlatform()->ScreenReferenceDrawTarget().get());
+  }
+
+  nsDeviceContext* devCtx = mPresContext->DeviceContext();
+  return devCtx->CreateReferenceRenderingContext();
+}
+
+nsresult PresShell::GoToAnchor(const nsAString& aAnchorName,
+                               const nsRange* aFirstTextDirective, bool aScroll,
+                               ScrollFlags aAdditionalScrollFlags) {
+  if (!mDocument) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (mDocument->GetSVGRootElement()) {
+    if (SVGFragmentIdentifier::ProcessFragmentIdentifier(mDocument,
+                                                         aAnchorName)) {
+      return NS_OK;
+    }
+  }
+
+  RefPtr<EventStateManager> esm = mPresContext->EventStateManager();
+
+  Element* textFragmentTargetElement = [&aFirstTextDirective]() -> Element* {
+    nsINode* node = aFirstTextDirective
+                        ? aFirstTextDirective->GetStartContainer()
+                        : nullptr;
+    while (node && !node->IsElement()) {
+      node = node->GetParent();
+    }
+    return Element::FromNodeOrNull(node);
+  }();
+  const bool thereIsATextFragment = !!textFragmentTargetElement;
+
+  if (aAnchorName.IsEmpty() && !thereIsATextFragment) {
+    NS_ASSERTION(!aScroll, "can't scroll to empty anchor name");
+    esm->SetContentState(nullptr, ElementState::URLTARGET);
+    return NS_OK;
+  }
+
+
+  RefPtr<Element> target = textFragmentTargetElement;
+  if (!target) {
+    target = nsContentUtils::GetTargetElement(mDocument, aAnchorName);
+  }
+
+  esm->SetContentState(target, ElementState::URLTARGET);
+
+  if (target) {
+    ErrorResult rv;
+    target->AncestorRevealingAlgorithm(rv);
+    if (MOZ_UNLIKELY(rv.Failed())) {
+      return rv.StealNSResult();
+    }
+
+    if (aScroll) {
+      ScrollingInteractionContext scrollToAnchorContext(true);
+      if (thereIsATextFragment) {
+        MOZ_TRY(ScrollSelectionIntoView(
+            SelectionType::eTargetText,
+            nsISelectionController::SELECTION_ANCHOR_REGION,
+            AxisScrollParams(WhereToScroll::Center, WhenToScroll::Always),
+            AxisScrollParams(WhereToScroll::Center, WhenToScroll::Always),
+            ScrollFlags::AnchorScrollFlags | aAdditionalScrollFlags,
+            SelectionScrollMode::SyncFlush));
+      } else {
+        MOZ_TRY(ScrollContentIntoView(
+            target, AxisScrollParams(WhereToScroll::Auto, WhenToScroll::Always),
+            AxisScrollParams(WhereToScroll::Auto),
+            ScrollFlags::AnchorScrollFlags | aAdditionalScrollFlags));
+      }
+      if (ScrollContainerFrame* rootScroll = GetRootScrollContainerFrame()) {
+        mLastAnchorScrolledTo = target;
+        mLastAnchorScrollPositionY = rootScroll->GetScrollPosition().y;
+        mLastAnchorScrollType = thereIsATextFragment
+                                    ? AnchorScrollType::TextDirective
+                                    : AnchorScrollType::Anchor;
+      }
+    }
+
+    {
+      RefPtr<nsRange> jumpToRange = nsRange::Create(mDocument);
+      nsCOMPtr<nsIContent> nodeToSelect = target.get();
+      while (nodeToSelect->GetFirstChild()) {
+        nodeToSelect = nodeToSelect->GetFirstChild();
+      }
+      jumpToRange->SelectNodeContents(*nodeToSelect, IgnoreErrors());
+      RefPtr sel = &mSelection->NormalSelection();
+      MOZ_ASSERT(sel);
+      sel->RemoveAllRanges(IgnoreErrors());
+      sel->AddRangeAndSelectFramesAndNotifyListeners(*jumpToRange,
+                                                     IgnoreErrors());
+      if (!StaticPrefs::layout_selectanchor()) {
+        sel->CollapseToStart(IgnoreErrors());
+      }
+    }
+
+    const bool shouldFocusTarget = [&] {
+      if (!aScroll || thereIsATextFragment) {
+        return false;
+      }
+      nsIFrame* targetFrame = target->GetPrimaryFrame();
+      return targetFrame && targetFrame->IsFocusable();
+    }();
+
+    if (shouldFocusTarget) {
+      FocusOptions options;
+      options.mPreventScroll = true;
+      target->Focus(options, CallerType::NonSystem, IgnoreErrors());
+    } else if (RefPtr<nsIFocusManager> fm = nsFocusManager::GetFocusManager()) {
+      if (nsPIDOMWindowOuter* win = mDocument->GetWindow()) {
+        nsCOMPtr<mozIDOMWindowProxy> focusedWindow;
+        fm->GetFocusedWindow(getter_AddRefs(focusedWindow));
+        if (SameCOMIdentity(win, focusedWindow)) {
+          fm->ClearFocus(focusedWindow);
+        }
+      }
+    }
+    mDocument->SetPreviouslyFocusedContent(nullptr);
+
+    if (auto* animationElement = SVGAnimationElement::FromNode(target.get())) {
+      animationElement->ActivateByHyperlink();
+    }
+
+#if defined(ACCESSIBILITY)
+    if (nsAccessibilityService* accService = GetAccService()) {
+      nsIContent* a11yTarget = target;
+      if (thereIsATextFragment) {
+        a11yTarget = nsIContent::FromNodeOrNull(
+            aFirstTextDirective->GetStartContainer());
+        if (!a11yTarget) {
+          a11yTarget = target;
+        }
+      }
+      accService->NotifyOfAnchorJumpTo(a11yTarget);
+    }
+#endif
+  } else if (nsContentUtils::EqualsIgnoreASCIICase(aAnchorName, u"top"_ns)) {
+    ScrollContainerFrame* sf = GetRootScrollContainerFrame();
+    if (aScroll && sf) {
+      ScrollMode scrollMode = sf->ScrollModeForScrollBehavior();
+      sf->ScrollTo(nsPoint(0, 0), scrollMode);
+    }
+  } else {
+    return NS_ERROR_FAILURE;
+  }
+
+  return NS_OK;
+}
+
+nsresult PresShell::ScrollToAnchor() {
+  NS_ASSERTION(mDidInitialize, "should have done initial reflow by now");
+  if (mLastAnchorScrollType == AnchorScrollType::Anchor) {
+    nsCOMPtr<nsIContent> lastAnchor = std::move(mLastAnchorScrolledTo);
+    if (!lastAnchor) {
+      return NS_OK;
+    }
+
+    ScrollContainerFrame* rootScroll = GetRootScrollContainerFrame();
+    if (!rootScroll ||
+        mLastAnchorScrollPositionY != rootScroll->GetScrollPosition().y) {
+      return NS_OK;
+    }
+    return ScrollContentIntoView(
+        lastAnchor, AxisScrollParams(WhereToScroll::Auto, WhenToScroll::Always),
+        AxisScrollParams(WhereToScroll::Auto), ScrollFlags::AnchorScrollFlags);
+  }
+
+  return ScrollSelectionIntoView(
+      SelectionType::eTargetText,
+      nsISelectionController::SELECTION_ANCHOR_REGION,
+      AxisScrollParams(WhereToScroll::Center, WhenToScroll::Always),
+      AxisScrollParams(WhereToScroll::Center, WhenToScroll::Always),
+      ScrollFlags::AnchorScrollFlags, SelectionScrollMode::SyncFlush);
+}
+
+static void AccumulateFrameBounds(nsIFrame* aContainerFrame, nsIFrame* aFrame,
+                                  bool aUseWholeLineHeightForInlines,
+                                  nsRect& aRect, bool& aHaveRect,
+                                  nsIFrame*& aPrevBlock,
+                                  nsILineIterator*& aLines, int32_t& aCurLine) {
+  nsIFrame* frame = aFrame;
+  nsRect frameBounds = nsRect(nsPoint(0, 0), aFrame->GetSize());
+
+  if (frameBounds.height == 0 || aUseWholeLineHeightForInlines) {
+    nsIFrame* prevFrame = aFrame;
+    nsIFrame* f = aFrame;
+
+    while (f && f->IsLineParticipant() && !f->IsTransformed() &&
+           !f->IsAbsPosContainingBlock()) {
+      prevFrame = f;
+      f = prevFrame->GetParent();
+    }
+
+    if (f != aFrame && f && f->IsBlockFrame()) {
+      if (f != aPrevBlock) {
+        aLines = f->GetLineIterator();
+        aPrevBlock = f;
+        aCurLine = 0;
+      }
+      if (aLines) {
+        int32_t index = aLines->FindLineContaining(prevFrame, aCurLine);
+        if (index >= 0) {
+          auto line = aLines->GetLine(index).unwrap();
+          frameBounds += frame->GetOffsetTo(f);
+          frame = f;
+          if (line.mLineBounds.y < frameBounds.y) {
+            frameBounds.height = frameBounds.YMost() - line.mLineBounds.y;
+            frameBounds.y = line.mLineBounds.y;
+          }
+        }
+      }
+    }
+  }
+
+  nsRect transformedBounds = nsLayoutUtils::TransformFrameRectToAncestor(
+      frame, frameBounds, aContainerFrame);
+
+  if (aHaveRect) {
+    aRect = aRect.UnionEdges(transformedBounds);
+  } else {
+    aHaveRect = true;
+    aRect = transformedBounds;
+  }
+}
+
+static bool ComputeNeedToScroll(WhenToScroll aWhenToScroll, nscoord aLineSize,
+                                nscoord aRectMin, nscoord aRectMax,
+                                nscoord aViewMin, nscoord aViewMax) {
+  switch (aWhenToScroll) {
+    case WhenToScroll::Always:
+      return true;
+    case WhenToScroll::IfNotVisible:
+      if (aLineSize > (aRectMax - aRectMin)) {
+        aLineSize = 0;
+      }
+
+      return aRectMax - aLineSize <= aViewMin ||
+             aRectMin + aLineSize >= aViewMax;
+    case WhenToScroll::IfNotFullyVisible:
+      return !(aRectMin >= aViewMin && aRectMax <= aViewMax) &&
+             std::min(aViewMax, aRectMax) - std::max(aRectMin, aViewMin) <
+                 aViewMax - aViewMin;
+  }
+  return false;
+}
+
+static nscoord ComputeWhereToScroll(WhereToScroll aWhereToScroll,
+                                    nscoord aOriginalCoord, nscoord aRectMin,
+                                    nscoord aRectMax, nscoord aViewSize,
+                                    nscoord aScrollMin, nscoord aScrollMax) {
+  nscoord resultCoord = aOriginalCoord;
+  if (!aWhereToScroll.mPercentage) {
+    nscoord min = std::min(aRectMin, aRectMax - aViewSize);
+    nscoord max = std::max(aRectMin, aRectMax - aViewSize);
+    resultCoord = std::clamp(aOriginalCoord, min, max);
+  } else {
+    float percent = aWhereToScroll.mPercentage.value() / 100.0f;
+    nscoord frameAlignCoord =
+        NSToCoordRound(aRectMin + (aRectMax - aRectMin) * percent);
+    resultCoord = NSToCoordRound(frameAlignCoord - aViewSize * percent);
+  }
+  return std::clamp(resultCoord, aScrollMin, aScrollMax);
+}
+
+static WhereToScroll GetApplicableWhereToScroll(
+    const ScrollContainerFrame* aScrollContainerFrame,
+    const nsIFrame* aScrollableFrame, const nsIFrame* aTarget,
+    ScrollDirection aScrollDirection, WhereToScroll aOriginal,
+    WhereToScroll aAutoDefault) {
+  MOZ_ASSERT(do_QueryFrame(aScrollContainerFrame) == aScrollableFrame);
+
+  if (!aOriginal.mIsAuto) {
+    return aOriginal;
+  }
+
+  if (aTarget == aScrollableFrame) {
+    return aAutoDefault;
+  }
+
+  StyleScrollSnapAlignKeyword align =
+      aScrollDirection == ScrollDirection::eHorizontal
+          ? aScrollContainerFrame->GetScrollSnapAlignFor(aTarget).first
+          : aScrollContainerFrame->GetScrollSnapAlignFor(aTarget).second;
+
+  switch (align) {
+    case StyleScrollSnapAlignKeyword::None:
+      return aAutoDefault;
+    case StyleScrollSnapAlignKeyword::Start:
+      return WhereToScroll::Start;
+    case StyleScrollSnapAlignKeyword::Center:
+      return WhereToScroll::Center;
+    case StyleScrollSnapAlignKeyword::End:
+      return WhereToScroll::End;
+  }
+  return aAutoDefault;
+}
+
+static ScrollMode GetScrollModeForScrollIntoView(
+    const ScrollContainerFrame* aScrollContainerFrame,
+    ScrollFlags aScrollFlags) {
+  ScrollBehavior behavior = ScrollBehavior::Instant;
+  if (aScrollFlags & ScrollFlags::ScrollSmooth) {
+    behavior = ScrollBehavior::Smooth;
+  } else if (aScrollFlags & ScrollFlags::ScrollSmoothAuto) {
+    behavior = ScrollBehavior::Auto;
+  }
+  return aScrollContainerFrame->ScrollModeForScrollBehavior(behavior);
+}
+
+struct ScrollPointRange {
+  nscoord mCoord;
+  nscoord mMin;
+  nscoord mMax;
+};
+
+static ScrollPointRange ComputeWhereToScrollAndRange(
+    WhereToScroll aWhereToScroll, nscoord aOriginalCoord, nscoord aRectMin,
+    nscoord aRectMax, nscoord aViewSize, nscoord aScrollMin,
+    nscoord aScrollMax) {
+  const auto coord =
+      ComputeWhereToScroll(aWhereToScroll, aOriginalCoord, aRectMin, aRectMax,
+                           aViewSize, aScrollMin, aScrollMax);
+
+  const auto min = std::min(coord, aRectMax - aViewSize);
+  const auto max = std::max(coord, aRectMin) - min;
+  return ScrollPointRange{coord, min, max};
+}
+
+static Maybe<nsPoint> ScrollToShowRect(
+    ScrollContainerFrame* aScrollContainerFrame,
+    const nsIFrame* aScrollableFrame, const nsIFrame* aTarget,
+    const nsRect& aRect, const Sides aScrollPaddingSkipSides,
+    const nsMargin& aMargin, AxisScrollParams aVertical,
+    AxisScrollParams aHorizontal, ScrollFlags aScrollFlags,
+    WhereToScroll aVerticalAutoDefault, WhereToScroll aHorizontalAutoDefault) {
+  nsPoint scrollPt = aScrollContainerFrame->GetVisualViewportOffset();
+  const nsPoint originalScrollPt = scrollPt;
+  const nsRect visibleRect(scrollPt,
+                           aScrollContainerFrame->GetVisualViewportSize());
+
+  const nsMargin padding = [&] {
+    nsMargin p = aScrollContainerFrame->GetScrollPadding();
+    p.ApplySkipSides(aScrollPaddingSkipSides);
+    return p + aMargin;
+  }();
+
+  const nsRect rectToScrollIntoView = [&] {
+    nsRect r(aRect);
+    r.Inflate(padding);
+    return r.Intersect(aScrollContainerFrame->GetScrolledRect());
+  }();
+
+  nsSize lineSize;
+  if (aVertical.mWhenToScroll == WhenToScroll::IfNotVisible ||
+      aHorizontal.mWhenToScroll == WhenToScroll::IfNotVisible) {
+    lineSize = aScrollContainerFrame->GetLineScrollAmount();
+  }
+  ScrollStyles ss = aScrollContainerFrame->GetScrollStyles();
+  nsRect scrollRange(scrollPt, nsSize(0, 0));
+  const auto scrollConstraint = aScrollContainerFrame->GetVisualScrollRange();
+  if ((aScrollFlags & ScrollFlags::ScrollOverflowHidden) ||
+      ss.mVertical != StyleOverflow::Hidden) {
+    if (ComputeNeedToScroll(aVertical.mWhenToScroll, lineSize.height, aRect.y,
+                            aRect.YMost(), visibleRect.y + padding.top,
+                            visibleRect.YMost() - padding.bottom)) {
+      WhereToScroll whereToScroll = GetApplicableWhereToScroll(
+          aScrollContainerFrame, aScrollableFrame, aTarget,
+          ScrollDirection::eVertical, aVertical.mWhereToScroll,
+          aVerticalAutoDefault);
+
+      const auto result = ComputeWhereToScrollAndRange(
+          whereToScroll, scrollPt.y, rectToScrollIntoView.y,
+          rectToScrollIntoView.YMost(), visibleRect.height, scrollConstraint.y,
+          scrollConstraint.YMost());
+      scrollPt.y = result.mCoord;
+      scrollRange.y = result.mMin;
+      scrollRange.height = result.mMax;
+    }
+  }
+
+  if ((aScrollFlags & ScrollFlags::ScrollOverflowHidden) ||
+      ss.mHorizontal != StyleOverflow::Hidden) {
+    if (ComputeNeedToScroll(aHorizontal.mWhenToScroll, lineSize.width, aRect.x,
+                            aRect.XMost(), visibleRect.x + padding.left,
+                            visibleRect.XMost() - padding.right)) {
+      WhereToScroll whereToScroll = GetApplicableWhereToScroll(
+          aScrollContainerFrame, aScrollableFrame, aTarget,
+          ScrollDirection::eHorizontal, aHorizontal.mWhereToScroll,
+          aHorizontalAutoDefault);
+
+      const auto result = ComputeWhereToScrollAndRange(
+          whereToScroll, scrollPt.x, rectToScrollIntoView.x,
+          rectToScrollIntoView.XMost(), visibleRect.width, scrollConstraint.x,
+          scrollConstraint.XMost());
+      scrollPt.x = result.mCoord;
+      scrollRange.x = result.mMin;
+      scrollRange.width = result.mMax;
+    }
+  }
+
+  if (scrollPt == originalScrollPt) {
+    return Nothing();
+  }
+
+  ScrollMode scrollMode =
+      GetScrollModeForScrollIntoView(aScrollContainerFrame, aScrollFlags);
+  nsIFrame* frame = do_QueryFrame(aScrollContainerFrame);
+  AutoWeakFrame weakFrame(frame);
+  aScrollContainerFrame->ScrollTo(scrollPt, scrollMode, &scrollRange,
+                                  ScrollSnapFlags::IntendedEndPosition,
+                                  aScrollFlags & ScrollFlags::TriggeredByScript
+                                      ? ScrollTriggeredByScript::Yes
+                                      : ScrollTriggeredByScript::No);
+  return Some(scrollPt);
+}
+
+nsresult PresShell::ScrollContentIntoView(nsIContent* aContent,
+                                          AxisScrollParams aVertical,
+                                          AxisScrollParams aHorizontal,
+                                          ScrollFlags aScrollFlags) {
+  NS_ENSURE_TRUE(aContent, NS_ERROR_NULL_POINTER);
+  RefPtr<Document> composedDoc = aContent->GetComposedDoc();
+  NS_ENSURE_STATE(composedDoc);
+
+  NS_ASSERTION(mDidInitialize, "should have done initial reflow by now");
+
+  if (mContentToScrollTo) {
+    mContentToScrollTo->RemoveProperty(nsGkAtoms::scrolling);
+  }
+  mContentToScrollTo = aContent;
+  ScrollIntoViewData* data = new ScrollIntoViewData();
+  data->mContentScrollVAxis = aVertical;
+  data->mContentScrollHAxis = aHorizontal;
+  data->mContentToScrollToFlags = aScrollFlags;
+  if (NS_FAILED(mContentToScrollTo->SetProperty(
+          nsGkAtoms::scrolling, data,
+          nsINode::DeleteProperty<PresShell::ScrollIntoViewData>))) {
+    mContentToScrollTo = nullptr;
+  }
+
+  bool reflowedForHiddenContent = false;
+  if (mContentToScrollTo) {
+    if (nsIFrame* frame = mContentToScrollTo->GetPrimaryFrame()) {
+      bool hasContentVisibilityAutoAncestor = false;
+      auto* ancestor = frame->GetClosestContentVisibilityAncestor(
+          nsIFrame::IncludeContentVisibility::Auto);
+      while (ancestor) {
+        if (auto* element = Element::FromNodeOrNull(ancestor->GetContent())) {
+          hasContentVisibilityAutoAncestor = true;
+          element->SetTemporarilyVisibleForScrolledIntoViewDescendant(true);
+          element->SetVisibleForContentVisibility(true);
+        }
+        ancestor = ancestor->GetClosestContentVisibilityAncestor(
+            nsIFrame::IncludeContentVisibility::Auto);
+      }
+      if (hasContentVisibilityAutoAncestor) {
+        UpdateHiddenContentInForcedLayout(frame);
+        UpdateContentRelevancyImmediately(ContentRelevancyReason::Visible);
+        reflowedForHiddenContent = ReflowForHiddenContentIfNeeded();
+      }
+    }
+  }
+
+  if (!reflowedForHiddenContent) {
+    if (PresShell* presShell = composedDoc->GetPresShell()) {
+      presShell->SetNeedLayoutFlush();
+    }
+    composedDoc->FlushPendingNotifications(FlushType::InterruptibleLayout);
+  }
+
+  if (mContentToScrollTo) {
+    DoScrollContentIntoView();
+  }
+  return NS_OK;
+}
+
+static nsMargin GetScrollMargin(const nsIFrame* aFrame) {
+  MOZ_ASSERT(aFrame);
+  if (aFrame->GetContent() && aFrame->GetContent()->ChromeOnlyAccess()) {
+    if (const nsIContent* userContent =
+            aFrame->GetContent()
+                ->GetClosestNativeAnonymousSubtreeRootParentOrHost()) {
+      if (const nsIFrame* frame = userContent->GetPrimaryFrame()) {
+        return frame->StyleMargin()->GetScrollMargin();
+      }
+    }
+  }
+  return aFrame->StyleMargin()->GetScrollMargin();
+}
+
+void PresShell::DoScrollContentIntoView() {
+  NS_ASSERTION(mDidInitialize, "should have done initial reflow by now");
+
+  nsIFrame* frame = mContentToScrollTo->GetPrimaryFrame();
+
+  if (!frame || frame->IsHiddenByContentVisibilityOnAnyAncestor(
+                    nsIFrame::IncludeContentVisibility::Hidden)) {
+    mContentToScrollTo->RemoveProperty(nsGkAtoms::scrolling);
+    mContentToScrollTo = nullptr;
+    return;
+  }
+
+  if (frame->HasAnyStateBits(NS_FRAME_FIRST_REFLOW)) {
+    return;
+  }
+
+  auto* data = static_cast<ScrollIntoViewData*>(
+      mContentToScrollTo->GetProperty(nsGkAtoms::scrolling));
+  if (MOZ_UNLIKELY(!data)) {
+    mContentToScrollTo = nullptr;
+    return;
+  }
+
+  ScrollFrameIntoView(frame, Nothing(), data->mContentScrollVAxis,
+                      data->mContentScrollHAxis, data->mContentToScrollToFlags);
+}
+
+static bool NeedToVisuallyScroll(const nsSize& aLayoutViewportSize,
+                                 const nsRect& aPositionFixedRect) {
+  const nsRect layoutViewport = nsRect(nsPoint(), aLayoutViewportSize);
+
+  if (aPositionFixedRect.IsEmpty()) {
+    if (aPositionFixedRect.x > layoutViewport.XMost() ||
+        aPositionFixedRect.XMost() < layoutViewport.x ||
+        aPositionFixedRect.y > layoutViewport.YMost() ||
+        aPositionFixedRect.YMost() < layoutViewport.y) {
+      return false;
+    }
+    return true;
+  }
+
+  if (!layoutViewport.Intersects(aPositionFixedRect)) {
+    return false;
+  }
+  return true;
+}
+
+void PresShell::ScrollFrameIntoVisualViewport(
+    Maybe<nsPoint>& aDestination, const nsRect& aPositionFixedRect,
+    const nsIFrame* aPositionFixedFrame, AxisScrollParams aVertical,
+    AxisScrollParams aHorizontal, ScrollFlags aScrollFlags) {
+  PresShell* root = GetRootPresShell();
+  if (!root) {
+    return;
+  }
+
+  if (!root->GetPresContext()->IsRootContentDocumentCrossProcess()) {
+    return;
+  }
+
+  ScrollContainerFrame* rootScrollContainer =
+      root->GetRootScrollContainerFrame();
+  if (!rootScrollContainer) {
+    return;
+  }
+
+  if (!aDestination) {
+    MOZ_ASSERT(aPositionFixedFrame);
+    if (!StaticPrefs::layout_scroll_fixed_content_into_view_visually()) {
+      return;
+    }
+
+    const nsSize visualViewportSize =
+        rootScrollContainer->GetVisualViewportSize();
+
+    const nsSize layoutViewportSize = root->GetLayoutViewportSize();
+    const nsRect layoutViewport = nsRect(nsPoint(), layoutViewportSize);
+    if (!NeedToVisuallyScroll(layoutViewportSize, aPositionFixedRect)) {
+      return;
+    }
+
+    nsRect clampedPositionFixedRect =
+        aPositionFixedRect.MoveInsideAndClamp(layoutViewport);
+    nsPoint layoutOffset = rootScrollContainer->GetScrollPosition();
+    clampedPositionFixedRect.MoveBy(layoutOffset);
+    const nsRect visualViewport(GetVisualViewportOffset(), visualViewportSize);
+    if (visualViewport.Contains(clampedPositionFixedRect.TopLeft()) &&
+        visualViewport.Contains(clampedPositionFixedRect.BottomRight())) {
+      return;
+    }
+    const auto scrollRange = rootScrollContainer->GetVisualScrollRange();
+
+    const nsRect visibleRect(layoutOffset, visualViewportSize);
+    nscoord x = ComputeWhereToScroll(
+        aScrollFlags & ScrollFlags::ForZoomToFocusedInput
+            ? WhereToScroll::Nearest
+            : aHorizontal.mWhereToScroll,
+        layoutOffset.x, aPositionFixedRect.x, aPositionFixedRect.XMost(),
+        visibleRect.width, scrollRange.x, scrollRange.XMost());
+    nscoord y = ComputeWhereToScroll(
+        aScrollFlags & ScrollFlags::ForZoomToFocusedInput
+            ? WhereToScroll::Nearest
+            : aVertical.mWhereToScroll,
+        layoutOffset.y, aPositionFixedRect.y, aPositionFixedRect.YMost(),
+        visibleRect.height, scrollRange.y, scrollRange.YMost());
+
+    layoutOffset.x += x;
+    layoutOffset.y += y;
+    aDestination = Some(layoutOffset);
+  }
+
+  ScrollMode scrollMode =
+      GetScrollModeForScrollIntoView(rootScrollContainer, aScrollFlags);
+  root->ScrollToVisual(*aDestination, ScrollOffsetUpdateType::MainThread,
+                       scrollMode);
+}
+
+bool PresShell::ScrollFrameIntoView(
+    nsIFrame* aTargetFrame, const Maybe<nsRect>& aKnownRectRelativeToTarget,
+    AxisScrollParams aVertical, AxisScrollParams aHorizontal,
+    ScrollFlags aScrollFlags) {
+
+  WhereToScroll verticalAutoDefault = WhereToScroll::Start;
+  WhereToScroll horizontalAutoDefault = WhereToScroll::Nearest;
+
+  if (aScrollFlags & ScrollFlags::AxesAreLogical) {
+    WritingMode wm = aTargetFrame->GetWritingMode();
+    if (wm.IsVerticalRL()) {
+      if (aVertical.mWhereToScroll.mPercentage) {
+        aVertical.mWhereToScroll.mPercentage =
+            Some(100 - aVertical.mWhereToScroll.mPercentage.value());
+      }
+    }
+    if (wm.IsInlineReversed()) {
+      if (aHorizontal.mWhereToScroll.mPercentage) {
+        aHorizontal.mWhereToScroll.mPercentage =
+            Some(100 - aHorizontal.mWhereToScroll.mPercentage.value());
+      }
+    }
+    if (wm.IsVertical()) {
+      std::swap(aVertical, aHorizontal);
+
+      verticalAutoDefault = WhereToScroll::Nearest;
+      horizontalAutoDefault = wm.IsVerticalRL()
+                                  ? WhereToScroll{WhereToScroll::End}
+                                  : WhereToScroll{WhereToScroll::Start};
+    }
+    aScrollFlags &= ~ScrollFlags::AxesAreLogical;
+  }
+
+  const nsMargin scrollMargin =
+      aKnownRectRelativeToTarget ? nsMargin() : GetScrollMargin(aTargetFrame);
+
+  Sides skipPaddingSides;
+  const auto MaybeSkipPaddingSides = [&](nsIFrame* aFrame) {
+    if (!aFrame->IsStickyPositioned()) {
+      return;
+    }
+    const nsPoint pos = aFrame->GetPosition();
+    const nsPoint normalPos = aFrame->GetNormalPosition();
+    if (pos == normalPos) {
+      return;  
+    }
+    const auto* stylePosition = aFrame->StylePosition();
+    const auto anchorResolutionParams =
+        AnchorPosOffsetResolutionParams::UseCBFrameSize(
+            AnchorPosResolutionParams::From(aFrame));
+    for (auto side : AllPhysicalSides()) {
+      if (stylePosition->GetAnchorResolvedInset(side, anchorResolutionParams)
+              ->IsAuto()) {
+        continue;
+      }
+      const bool yAxis = side == eSideTop || side == eSideBottom;
+      const bool stuck = yAxis ? pos.y != normalPos.y : pos.x != normalPos.x;
+      if (!stuck) {
+        continue;
+      }
+      skipPaddingSides |= SideToSideBit(side);
+    }
+  };
+
+  nsIFrame* container = aTargetFrame;
+
+  const nsIFrame* positionFixedFrame = nullptr;
+  auto isPositionFixed = [&](const nsIFrame* aFrame) -> bool {
+    return aFrame->StyleDisplay()->mPosition == StylePositionProperty::Fixed &&
+           nsLayoutUtils::IsReallyFixedPos(aFrame);
+  };
+  nsRect rect = [&] {
+    if (aKnownRectRelativeToTarget) {
+      return *aKnownRectRelativeToTarget;
+    }
+    MaybeSkipPaddingSides(aTargetFrame);
+    while (nsIFrame* parent = container->GetParent()) {
+      if (isPositionFixed(container)) {
+        positionFixedFrame = container;
+      }
+      container = parent;
+      if (container->IsScrollContainerOrSubclass()) {
+        break;
+      }
+      MaybeSkipPaddingSides(container);
+    }
+    MOZ_DIAGNOSTIC_ASSERT(container);
+
+    nsRect targetFrameBounds;
+    {
+      bool haveRect = false;
+      const bool useWholeLineHeightForInlines =
+          aVertical.mWhenToScroll != WhenToScroll::IfNotFullyVisible;
+      AutoAssertNoDomMutations
+          guard;  
+      nsIFrame* prevBlock = nullptr;
+      nsILineIterator* lines = nullptr;
+      int32_t curLine = 0;
+      nsIFrame* frame = aTargetFrame;
+      do {
+        AccumulateFrameBounds(container, frame, useWholeLineHeightForInlines,
+                              targetFrameBounds, haveRect, prevBlock, lines,
+                              curLine);
+      } while ((frame = frame->GetNextContinuation()));
+    }
+
+    return targetFrameBounds;
+  }();
+  bool didScroll = false;
+  const nsIFrame* target = aTargetFrame;
+  Maybe<nsPoint> rootScrollDestination;
+  do {
+    if (isPositionFixed(container)) {
+      positionFixedFrame = container;
+    }
+
+    if (ScrollContainerFrame* sf = do_QueryFrame(container)) {
+      nsPoint oldPosition = sf->GetScrollPosition();
+      nsRect targetRect = rect - sf->GetScrolledFrame()->GetPosition();
+
+      {
+        AutoWeakFrame wf(container);
+        Maybe<nsPoint> destination = ScrollToShowRect(
+            sf, container, target, targetRect, skipPaddingSides, scrollMargin,
+            aVertical, aHorizontal, aScrollFlags, verticalAutoDefault,
+            horizontalAutoDefault);
+        if (!wf.IsAlive()) {
+          return didScroll;
+        }
+
+        if (sf->IsRootScrollFrameOfDocument() &&
+            sf->PresContext()->IsRootContentDocumentCrossProcess()) {
+          rootScrollDestination = destination;
+        }
+      }
+
+      nsPoint newPosition = sf->LastScrollDestination();
+      rect += oldPosition - newPosition;
+
+      if (oldPosition != newPosition) {
+        didScroll = true;
+      }
+
+      if (aScrollFlags & ScrollFlags::ScrollFirstAncestorOnly) {
+        break;
+      }
+
+      target = container;
+      skipPaddingSides = {};
+    }
+
+    MaybeSkipPaddingSides(container);
+
+    nsIFrame* parent = container->GetParent();
+    NS_ASSERTION(parent || !container->IsTransformed(),
+                 "viewport shouldnt be transformed");
+    if (parent && container->IsTransformed()) {
+      rect =
+          nsLayoutUtils::TransformFrameRectToAncestor(container, rect, parent);
+    } else {
+      rect += container->GetPosition();
+    }
+    if (!parent && !(aScrollFlags & ScrollFlags::ScrollNoParentFrames)) {
+      nsPoint extraOffset(0, 0);
+      int32_t APD = container->PresContext()->AppUnitsPerDevPixel();
+      parent = nsLayoutUtils::GetCrossDocParentFrameInProcess(container,
+                                                              &extraOffset);
+      if (parent) {
+        int32_t parentAPD = parent->PresContext()->AppUnitsPerDevPixel();
+        rect = rect.ScaleToOtherAppUnitsRoundOut(APD, parentAPD);
+        rect += extraOffset;
+      } else {
+        nsCOMPtr<nsIDocShell> docShell =
+            container->PresContext()->GetDocShell();
+        if (BrowserChild* browserChild = BrowserChild::GetFrom(docShell)) {
+          (void)browserChild->SendScrollRectIntoView(
+              rect, aVertical, aHorizontal, aScrollFlags, APD);
+        }
+      }
+    }
+    container = parent;
+  } while (container);
+
+  if (!rootScrollDestination && !positionFixedFrame) {
+    return didScroll;
+  }
+
+  ScrollFrameIntoVisualViewport(rootScrollDestination, rect, positionFixedFrame,
+                                aVertical, aHorizontal, aScrollFlags);
+
+  return didScroll;
+}
+
+void PresShell::SchedulePaint() {
+  if (MOZ_UNLIKELY(mIsDestroying)) {
+    return;
+  }
+  if (nsPresContext* presContext = GetPresContext()) {
+    presContext->RefreshDriver()->SchedulePaint();
+  }
+}
+
+void PresShell::ClearMouseCapture() {
+  ReleaseCapturingContent();
+  AllowMouseCapture(false);
+}
+
+void PresShell::ClearMouseCapture(nsIFrame* aFrame) {
+  MOZ_ASSERT(aFrame);
+
+  nsIContent* capturingContent = GetCapturingContent();
+  if (!capturingContent) {
+    return;
+  }
+
+  nsIFrame* capturingFrame = capturingContent->GetPrimaryFrame();
+  const bool shouldClear =
+      !capturingFrame ||
+      nsLayoutUtils::IsAncestorFrameCrossDocInProcess(aFrame, capturingFrame);
+  if (shouldClear) {
+    ClearMouseCapture();
+  }
+}
+
+nsresult PresShell::CaptureHistoryState(nsILayoutHistoryState** aState) {
+  MOZ_ASSERT(nullptr != aState, "null state pointer");
+
+  nsCOMPtr<nsIDocShell> docShell(mPresContext->GetDocShell());
+  if (!docShell) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsILayoutHistoryState> historyState;
+  docShell->GetLayoutHistoryState(getter_AddRefs(historyState));
+  if (!historyState) {
+    historyState = NS_NewLayoutHistoryState();
+    docShell->SetLayoutHistoryState(historyState);
+  }
+
+  *aState = historyState;
+  NS_IF_ADDREF(*aState);
+
+  nsIFrame* rootFrame = mFrameConstructor->GetRootFrame();
+  if (!rootFrame) {
+    return NS_OK;
+  }
+
+  mFrameConstructor->CaptureFrameState(rootFrame, historyState);
+
+  return NS_OK;
+}
+
+void PresShell::ScheduleBeforeFirstPaint() {
+  if (!mDocument->IsResourceDoc()) {
+    MOZ_LOG(gLog, LogLevel::Debug,
+            ("PresShell::ScheduleBeforeFirstPaint this=%p", this));
+
+    nsContentUtils::AddScriptRunner(
+        MakeAndAddRef<nsBeforeFirstPaintDispatcher>(mDocument));
+  }
+}
+
+void PresShell::UnsuppressAndInvalidate() {
+  if ((!mDocument->IsResourceDoc() && !mPresContext->EnsureVisible()) ||
+      mHaveShutDown) {
+    return;
+  }
+
+  ScheduleBeforeFirstPaint();
+
+  mDocument->MaybeScheduleRenderingPhases({RenderingPhase::Reveal});
+
+
+  mPaintingSuppressed = false;
+  if (nsIFrame* rootFrame = mFrameConstructor->GetRootFrame()) {
+    rootFrame->InvalidateFrame();
+  }
+
+  if (mPresContext->IsRootContentDocumentCrossProcess()) {
+    if (auto* bc = BrowserChild::GetFrom(mDocument->GetDocShell())) {
+      if (mDocument->IsInitialDocument()) {
+        bc->SendDidUnsuppressPaintingNormalPriority();
+      } else {
+        bc->SendDidUnsuppressPainting();
+      }
+    }
+  }
+
+  if (nsPIDOMWindowOuter* win = mDocument->GetWindow()) {
+    win->SetReadyForFocus();
+  }
+
+  if (!mHaveShutDown) {
+    SynthesizeMouseMove(false);
+    ScheduleApproximateFrameVisibilityUpdateNow();
+  }
+}
+
+void PresShell::CancelPaintSuppressionTimer() {
+  if (mPaintSuppressionTimer) {
+    mPaintSuppressionTimer->Cancel();
+    mPaintSuppressionTimer = nullptr;
+  }
+}
+
+void PresShell::UnsuppressPainting() {
+  CancelPaintSuppressionTimer();
+
+  if (mIsDocumentGone || !mPaintingSuppressed) {
+    return;
+  }
+
+  if (!mDirtyRoots.IsEmpty()) {
+    mShouldUnsuppressPainting = true;
+  } else {
+    UnsuppressAndInvalidate();
+  }
+}
+
+nsresult PresShell::PostReflowCallback(nsIReflowCallback* aCallback) {
+  void* result = AllocateByObjectID(eArenaObjectID_nsCallbackEventRequest,
+                                    sizeof(nsCallbackEventRequest));
+  nsCallbackEventRequest* request = (nsCallbackEventRequest*)result;
+
+  request->callback = aCallback;
+  request->next = nullptr;
+
+  if (mLastCallbackEventRequest) {
+    mLastCallbackEventRequest = mLastCallbackEventRequest->next = request;
+  } else {
+    mFirstCallbackEventRequest = request;
+    mLastCallbackEventRequest = request;
+  }
+
+  return NS_OK;
+}
+
+void PresShell::CancelReflowCallback(nsIReflowCallback* aCallback) {
+  nsCallbackEventRequest* before = nullptr;
+  nsCallbackEventRequest* node = mFirstCallbackEventRequest;
+  while (node) {
+    nsIReflowCallback* callback = node->callback;
+
+    if (callback == aCallback) {
+      nsCallbackEventRequest* toFree = node;
+      if (node == mFirstCallbackEventRequest) {
+        node = node->next;
+        mFirstCallbackEventRequest = node;
+        NS_ASSERTION(before == nullptr, "impossible");
+      } else {
+        node = node->next;
+        before->next = node;
+      }
+
+      if (toFree == mLastCallbackEventRequest) {
+        mLastCallbackEventRequest = before;
+      }
+
+      FreeByObjectID(eArenaObjectID_nsCallbackEventRequest, toFree);
+    } else {
+      before = node;
+      node = node->next;
+    }
+  }
+}
+
+void PresShell::CancelPostedReflowCallbacks() {
+  while (mFirstCallbackEventRequest) {
+    nsCallbackEventRequest* node = mFirstCallbackEventRequest;
+    mFirstCallbackEventRequest = node->next;
+    if (!mFirstCallbackEventRequest) {
+      mLastCallbackEventRequest = nullptr;
+    }
+    nsIReflowCallback* callback = node->callback;
+    FreeByObjectID(eArenaObjectID_nsCallbackEventRequest, node);
+    if (callback) {
+      callback->ReflowCallbackCanceled();
+    }
+  }
+}
+
+void PresShell::HandlePostedReflowCallbacks(bool aInterruptible) {
+  while (true) {
+    bool shouldFlush = false;
+    while (mFirstCallbackEventRequest) {
+      nsCallbackEventRequest* node = mFirstCallbackEventRequest;
+      mFirstCallbackEventRequest = node->next;
+      if (!mFirstCallbackEventRequest) {
+        mLastCallbackEventRequest = nullptr;
+      }
+      nsIReflowCallback* callback = node->callback;
+      FreeByObjectID(eArenaObjectID_nsCallbackEventRequest, node);
+      if (callback && callback->ReflowFinished()) {
+        shouldFlush = true;
+      }
+    }
+
+    if (!shouldFlush || mIsDestroying) {
+      return;
+    }
+
+    const auto flushType =
+        aInterruptible ? FlushType::InterruptibleLayout : FlushType::Layout;
+    FlushPendingNotifications(flushType);
+  }
+}
+
+bool PresShell::IsSafeToFlush() const {
+  if (mIsReflowing || mChangeNestCount || mIsDestroying) {
+    return false;
+  }
+  return !mIsPainting;
+}
+
+void PresShell::NotifyFontFaceSetOnRefresh() {
+  if (FontFaceSet* set = mDocument->GetFonts()) {
+    set->DidRefresh();
+  }
+}
+
+void PresShell::DoFlushPendingNotifications(FlushType aType) {
+  mozilla::ChangesToFlush flush(aType, aType >= FlushType::Style,
+                                aType >= FlushType::Layout);
+  FlushPendingNotifications(flush);
+}
+
+#if defined(DEBUG)
+static void AssertFrameSubtreeIsSane(const nsIFrame& aRoot) {
+  if (const nsIContent* content = aRoot.GetContent()) {
+    MOZ_ASSERT(content->GetFlattenedTreeParentNodeForStyle(),
+               "Node not in the flattened tree still has a frame?");
+  }
+
+  for (const auto& childList : aRoot.ChildLists()) {
+    for (const nsIFrame* child : childList.mList) {
+      AssertFrameSubtreeIsSane(*child);
+    }
+  }
+}
+#endif
+
+static inline void AssertFrameTreeIsSane(const PresShell& aPresShell) {
+#if defined(DEBUG)
+  if (const nsIFrame* root = aPresShell.GetRootFrame()) {
+    AssertFrameSubtreeIsSane(*root);
+  }
+#endif
+}
+
+void PresShell::DoFlushPendingNotifications(mozilla::ChangesToFlush aFlush) {
+  MOZ_DIAGNOSTIC_ASSERT(!mForbiddenToFlush, "This is bad!");
+
+  RefPtr<PresShell> kungFuDeathGrip = this;
+
+  FlushType flushType = aFlush.mFlushType;
+
+  if (aFlush.mUpdateRelevancy) {
+    UpdateRelevancyOfContentVisibilityAutoFrames();
+  }
+
+  MOZ_ASSERT(NeedFlush(flushType), "Why did we get called?");
+
+
+#if defined(ACCESSIBILITY)
+#if defined(DEBUG)
+  if (nsAccessibilityService* accService = GetAccService()) {
+    NS_ASSERTION(!accService->IsProcessingRefreshDriverNotification(),
+                 "Flush during accessible tree update!");
+  }
+#endif
+#endif
+
+  NS_ASSERTION(flushType >= FlushType::Style, "Why did we get called?");
+
+  bool isSafeToFlush = IsSafeToFlush();
+
+  bool hasHadScriptObject;
+  if (mDocument->GetScriptHandlingObject(hasHadScriptObject) ||
+      hasHadScriptObject) {
+    isSafeToFlush = isSafeToFlush && nsContentUtils::IsSafeToRunScript();
+  }
+
+  if (MOZ_UNLIKELY(mDocument->GetPresShell() != this)) {
+    MOZ_DIAGNOSTIC_ASSERT(!mDocument->GetPresShell(),
+                          "Where did this shell come from?");
+    isSafeToFlush = false;
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(!mIsDestroying || !isSafeToFlush);
+  MOZ_DIAGNOSTIC_ASSERT(mIsDestroying || mWidgetListener);
+  MOZ_DIAGNOSTIC_ASSERT(mIsDestroying || mDocument->HasShellOrBFCacheEntry());
+
+  if (!isSafeToFlush) {
+    return;
+  }
+
+  mDocument->FlushExternalResources(flushType);
+
+  mDocument->FlushPendingNotifications(FlushType::ContentAndNotify);
+
+  mDocument->UpdateSVGUseElementShadowTrees();
+
+  if (MOZ_LIKELY(!mIsDestroying)) {
+    FlushDelayedResize();
+    mPresContext->FlushPendingMediaFeatureValuesChanged();
+  }
+
+  if (MOZ_LIKELY(!mIsDestroying)) {
+    StyleSet()->UpdateStylistIfNeeded();
+
+    mDocument->FlushUserFontSet();
+
+    mPresContext->FlushCounterStyles();
+
+    mPresContext->FlushFontFeatureValues();
+
+    mPresContext->FlushFontPaletteValues();
+
+    if (mDocument->HasAnimationController()) {
+      mDocument->GetAnimationController()->FlushResampleRequests();
+    }
+  }
+
+  if (MOZ_LIKELY(!mIsDestroying)) {
+    if (aFlush.mFlushAnimations) {
+      mPresContext->EffectCompositor()->PostRestyleForThrottledAnimations();
+      mNeedThrottledAnimationFlush = false;
+    }
+
+    nsAutoScriptBlocker scriptBlocker;
+    mPresContext->RestyleManager()->ProcessPendingRestyles();
+    mNeedStyleFlush = false;
+  }
+
+  AssertFrameTreeIsSane(*this);
+
+  if (flushType >= (SuppressInterruptibleReflows()
+                        ? FlushType::Layout
+                        : FlushType::InterruptibleLayout) &&
+      !mIsDestroying) {
+    if (DoFlushLayout( flushType < FlushType::Layout)) {
+      if (mContentToScrollTo) {
+        DoScrollContentIntoView();
+        if (mContentToScrollTo) {
+          mContentToScrollTo->RemoveProperty(nsGkAtoms::scrolling);
+          mContentToScrollTo = nullptr;
+        }
+      }
+    }
+    if (MOZ_LIKELY(mDirtyRoots.IsEmpty())) {
+      mNeedLayoutFlush = false;
+    }
+  }
+
+  FlushPendingScrollResnap();
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY void PresShell::CharacterDataChanged(
+    nsIContent* aContent, const CharacterDataChangeInfo& aInfo) {
+  MOZ_ASSERT(!nsContentUtils::IsSafeToRunScript());
+  MOZ_ASSERT(!mIsDocumentGone, "Unexpected CharacterDataChanged");
+  MOZ_ASSERT(aContent->OwnerDoc() == mDocument, "Unexpected document");
+
+#if defined(ACCESSIBILITY)
+  if (mDocAccessible) {
+    mDocAccessible->MaybeHandleChangeToHiddenNameOrDescription(aContent);
+  }
+#endif
+
+  nsAutoCauseReflowNotifier crNotifier(this);
+
+  mPresContext->RestyleManager()->CharacterDataChanged(aContent, aInfo);
+  mFrameConstructor->CharacterDataChanged(aContent, aInfo);
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY void PresShell::ElementStateChanged(
+    Document* aDocument, Element* aElement, ElementState aStateMask) {
+  MOZ_ASSERT(!nsContentUtils::IsSafeToRunScript());
+  MOZ_ASSERT(!mIsDocumentGone, "Unexpected ContentStateChanged");
+  MOZ_ASSERT(aDocument == mDocument, "Unexpected aDocument");
+
+#if defined(ACCESSIBILITY)
+  if (mDocAccessible) {
+    mDocAccessible->ElementStateChanged(aDocument, aElement, aStateMask);
+  }
+#endif
+
+  if (mDidInitialize) {
+    nsAutoCauseReflowNotifier crNotifier(this);
+    mPresContext->RestyleManager()->ElementStateChanged(aElement, aStateMask);
+  }
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY void PresShell::CustomStatesWillChange(
+    Element& aElement) {
+  if (MOZ_UNLIKELY(!mDidInitialize)) {
+    return;
+  }
+
+  mPresContext->RestyleManager()->CustomStatesWillChange(aElement);
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY void PresShell::CustomStateChanged(
+    Element& aElement, nsAtom* aState) {
+  MOZ_ASSERT(!mIsDocumentGone, "Unexpected CustomStateChanged");
+  MOZ_ASSERT(aState, "Unexpected empty state");
+
+  if (mDidInitialize) {
+    nsAutoCauseReflowNotifier crNotifier(this);
+    mPresContext->RestyleManager()->CustomStateChanged(aElement, aState);
+  }
+}
+
+void PresShell::DocumentStatesChanged(DocumentState aStateMask) {
+  MOZ_ASSERT(!mIsDocumentGone, "Unexpected DocumentStatesChanged");
+  MOZ_ASSERT(mDocument);
+  MOZ_ASSERT(!aStateMask.IsEmpty());
+
+  if (mDidInitialize) {
+    StyleSet()->InvalidateStyleForDocumentStateChanges(aStateMask);
+  }
+
+  if (aStateMask.HasState(DocumentState::WINDOW_INACTIVE)) {
+    if (nsIFrame* root = mFrameConstructor->GetRootFrame()) {
+      root->SchedulePaint();
+    }
+  }
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY void PresShell::AttributeWillChange(
+    Element* aElement, int32_t aNameSpaceID, nsAtom* aAttribute,
+    AttrModType aModType) {
+  MOZ_ASSERT(!nsContentUtils::IsSafeToRunScript());
+  MOZ_ASSERT(!mIsDocumentGone, "Unexpected AttributeWillChange");
+  MOZ_ASSERT(aElement->OwnerDoc() == mDocument, "Unexpected document");
+
+#if defined(ACCESSIBILITY)
+  if (mDocAccessible) {
+    mDocAccessible->AttributeWillChange(aElement, aNameSpaceID, aAttribute,
+                                        aModType);
+  }
+#endif
+
+  if (mDidInitialize) {
+    nsAutoCauseReflowNotifier crNotifier(this);
+    mPresContext->RestyleManager()->AttributeWillChange(aElement, aNameSpaceID,
+                                                        aAttribute, aModType);
+  }
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY void PresShell::AttributeChanged(
+    Element* aElement, int32_t aNameSpaceID, nsAtom* aAttribute,
+    AttrModType aModType, const nsAttrValue* aOldValue) {
+  MOZ_ASSERT(!nsContentUtils::IsSafeToRunScript());
+  MOZ_ASSERT(!mIsDocumentGone, "Unexpected AttributeChanged");
+  MOZ_ASSERT(aElement->OwnerDoc() == mDocument, "Unexpected document");
+
+#if defined(ACCESSIBILITY)
+  if (mDocAccessible) {
+    mDocAccessible->AttributeChanged(aElement, aNameSpaceID, aAttribute,
+                                     aModType, aOldValue);
+  }
+#endif
+
+  if (mDidInitialize) {
+    nsAutoCauseReflowNotifier crNotifier(this);
+    mPresContext->RestyleManager()->AttributeChanged(
+        aElement, aNameSpaceID, aAttribute, aModType, aOldValue);
+  }
+}
+
+static void MaybeDestroyFramesAndStyles(nsIContent* aContent,
+                                        nsPresContext& aPresContext) {
+  if (!aContent->IsElement()) {
+    return;
+  }
+
+  Element* element = aContent->AsElement();
+  if (!element->HasServoData()) {
+    return;
+  }
+
+  Element* parent =
+      Element::FromNodeOrNull(element->GetFlattenedTreeParentNode());
+  if (!parent || !parent->HasServoData() ||
+      Servo_Element_IsDisplayNone(parent)) {
+    DestroyFramesAndStyleDataFor(element, aPresContext,
+                                 RestyleManager::IncludeRoot::Yes);
+  }
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY void PresShell::ContentAppended(
+    nsIContent* aFirstNewContent, const ContentAppendInfo& aInfo) {
+  MOZ_ASSERT(!nsContentUtils::IsSafeToRunScript());
+  MOZ_ASSERT(!mIsDocumentGone, "Unexpected ContentAppended");
+  MOZ_ASSERT(aFirstNewContent->OwnerDoc() == mDocument, "Unexpected document");
+
+  MOZ_ASSERT(aFirstNewContent->GetParent());
+  MOZ_ASSERT(aFirstNewContent->GetParent()->IsElement() ||
+             aFirstNewContent->GetParent()->IsShadowRoot());
+
+  if (!mDidInitialize) {
+    return;
+  }
+
+#if defined(ACCESSIBILITY)
+  if (mDocAccessible) {
+    mDocAccessible->MaybeHandleChangeToHiddenNameOrDescription(
+        aFirstNewContent);
+  }
+#endif
+
+  mPresContext->EventStateManager()->ContentAppended(aFirstNewContent, aInfo);
+
+  if (aInfo.mOldParent) {
+    MaybeDestroyFramesAndStyles(aFirstNewContent, *mPresContext);
+  }
+
+  nsAutoCauseReflowNotifier crNotifier(this);
+
+  mPresContext->RestyleManager()->ContentAppended(aFirstNewContent);
+
+  mFrameConstructor->ContentAppended(
+      aFirstNewContent, nsCSSFrameConstructor::InsertionKind::Async);
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY void PresShell::ContentInserted(
+    nsIContent* aChild, const ContentInsertInfo& aInfo) {
+  MOZ_ASSERT(!nsContentUtils::IsSafeToRunScript());
+  MOZ_ASSERT(!mIsDocumentGone, "Unexpected ContentInserted");
+  MOZ_ASSERT(aChild->OwnerDoc() == mDocument, "Unexpected document");
+
+  if (!mDidInitialize) {
+    return;
+  }
+
+  mPresContext->EventStateManager()->ContentInserted(aChild, aInfo);
+
+#if defined(ACCESSIBILITY)
+  if (mDocAccessible) {
+    mDocAccessible->MaybeHandleChangeToHiddenNameOrDescription(aChild);
+  }
+#endif
+
+  if (aInfo.mOldParent) {
+    MaybeDestroyFramesAndStyles(aChild, *mPresContext);
+  }
+
+  nsAutoCauseReflowNotifier crNotifier(this);
+
+  mPresContext->RestyleManager()->ContentInserted(aChild);
+
+  mFrameConstructor->ContentInserted(
+      aChild, nsCSSFrameConstructor::InsertionKind::Async);
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY void PresShell::ContentWillBeRemoved(
+    nsIContent* aChild, const ContentRemoveInfo& aInfo) {
+  MOZ_ASSERT(!nsContentUtils::IsSafeToRunScript());
+  MOZ_ASSERT(!mIsDocumentGone, "Unexpected ContentRemoved");
+  MOZ_ASSERT(aChild->OwnerDoc() == mDocument, "Unexpected document");
+
+  mPresContext->EventStateManager()->ContentRemoved(mDocument, aChild, aInfo);
+
+#if defined(ACCESSIBILITY)
+  if (mDocAccessible) {
+    mDocAccessible->ContentRemoved(aChild);
+  }
+#endif
+
+  nsAutoCauseReflowNotifier crNotifier(this);
+
+  for (AutoConnectedAncestorTracker* tracker = mLastConnectedAncestorTracker;
+       tracker; tracker = tracker->mPreviousTracker) {
+    if (tracker->ConnectedNode().IsInclusiveFlatTreeDescendantOf(aChild)) {
+      tracker->mConnectedAncestor = aChild->GetFlattenedTreeParentElement();
+    }
+  }
+
+  if (aInfo.mNewParent && aChild->IsElement()) {
+    if (aInfo.mNewParent->IsElement() &&
+        aInfo.mNewParent->AsElement()->HasServoData() &&
+        !Servo_Element_IsDisplayNone(aInfo.mNewParent->AsElement())) {
+      DestroyFramesForAndRestyle(aChild->AsElement());
+      return;
+    }
+  }
+
+  mFrameConstructor->ContentWillBeRemoved(
+      aChild, nsCSSFrameConstructor::RemovalKind::Dom);
+
+  mPresContext->RestyleManager()->ContentWillBeRemoved(aChild);
+}
+
+void PresShell::NotifyCounterStylesAreDirty() {
+  nsAutoCauseReflowNotifier reflowNotifier(this);
+  mFrameConstructor->NotifyCounterStylesAreDirty();
+}
+
+bool PresShell::FrameIsAncestorOfDirtyRoot(nsIFrame* aFrame) const {
+  return mDirtyRoots.FrameIsAncestorOfAnyElement(aFrame);
+}
+
+void PresShell::ReconstructFrames() {
+  MOZ_ASSERT(!mFrameConstructor->GetRootFrame() || mDidInitialize,
+             "Must not have root frame before initial reflow");
+  if (!mDidInitialize || mIsDestroying) {
+    return;
+  }
+
+  if (Element* root = mDocument->GetRootElement()) {
+    PostRecreateFramesFor(root);
+  }
+
+  mDocument->FlushPendingNotifications(FlushType::Frames);
+}
+
+nsresult PresShell::RenderDocument(const nsRect& aRect,
+                                   RenderDocumentFlags aFlags,
+                                   nscolor aBackgroundColor,
+                                   gfxContext* aThebesContext) {
+  NS_ENSURE_TRUE(!(aFlags & RenderDocumentFlags::IsUntrusted),
+                 NS_ERROR_NOT_IMPLEMENTED);
+
+  nsRootPresContext* rootPresContext = mPresContext->GetRootPresContext();
+  if (rootPresContext) {
+    rootPresContext->FlushWillPaintObservers();
+    if (mIsDestroying) {
+      return NS_OK;
+    }
+  }
+
+  nsAutoScriptBlocker blockScripts;
+
+  gfxRect r(0, 0, nsPresContext::AppUnitsToFloatCSSPixels(aRect.width),
+            nsPresContext::AppUnitsToFloatCSSPixels(aRect.height));
+  aThebesContext->NewPath();
+#if defined(MOZ_GFX_OPTIMIZE_MOBILE)
+  aThebesContext->SnappedRectangle(r);
+#else
+  aThebesContext->Rectangle(r);
+#endif
+
+  nsIFrame* rootFrame = mFrameConstructor->GetRootFrame();
+  if (!rootFrame) {
+    aThebesContext->SetColor(sRGBColor::FromABGR(aBackgroundColor));
+    aThebesContext->Fill();
+    return NS_OK;
+  }
+
+  gfxContextAutoSaveRestore save(aThebesContext);
+
+  MOZ_ASSERT(aThebesContext->CurrentOp() == CompositionOp::OP_OVER);
+
+  aThebesContext->Clip();
+
+  nsDeviceContext* devCtx = mPresContext->DeviceContext();
+
+  gfxPoint offset(-nsPresContext::AppUnitsToFloatCSSPixels(aRect.x),
+                  -nsPresContext::AppUnitsToFloatCSSPixels(aRect.y));
+  gfxFloat scale =
+      gfxFloat(devCtx->AppUnitsPerDevPixel()) / AppUnitsPerCSSPixel();
+
+  gfxMatrix newTM = aThebesContext->CurrentMatrixDouble()
+                        .PreTranslate(offset)
+                        .PreScale(scale, scale)
+                        .NudgeToIntegers();
+  aThebesContext->SetMatrixDouble(newTM);
+
+  AutoSaveRestoreRenderingState _(this);
+
+  bool wouldFlushRetainedLayers = false;
+  PaintFrameFlags flags = PaintFrameFlags::IgnoreSuppression;
+  if (aThebesContext->CurrentMatrix().HasNonIntegerTranslation()) {
+    flags |= PaintFrameFlags::InTransform;
+  }
+  if (!(aFlags & RenderDocumentFlags::AsyncDecodeImages)) {
+    flags |= PaintFrameFlags::SyncDecodeImages;
+  }
+  if (aFlags & RenderDocumentFlags::UseHighQualityScaling) {
+    flags |= PaintFrameFlags::UseHighQualityScaling;
+  }
+  if (aFlags & RenderDocumentFlags::UseWidgetLayers) {
+    nsIWidget* widget = rootFrame->GetOwnWidget();
+    if (widget && nsLayoutUtils::GetDisplayRootFrame(rootFrame) == rootFrame) {
+      WindowRenderer* renderer = widget->GetWindowRenderer();
+      if (renderer &&
+          (!renderer->AsKnowsCompositor() || XRE_IsParentProcess())) {
+        flags |= PaintFrameFlags::WidgetLayers;
+      }
+    }
+  }
+  if (!(aFlags & RenderDocumentFlags::DrawCaret)) {
+    wouldFlushRetainedLayers = true;
+    flags |= PaintFrameFlags::HideCaret;
+  }
+  if (aFlags & RenderDocumentFlags::IgnoreViewportScrolling) {
+    wouldFlushRetainedLayers = !IgnoringViewportScrolling();
+    mRenderingStateFlags |= RenderingStateFlags::IgnoringViewportScrolling;
+  }
+  if (aFlags & RenderDocumentFlags::ResetViewportScrolling) {
+    wouldFlushRetainedLayers = true;
+    flags |= PaintFrameFlags::ResetViewportScrolling;
+  }
+  if (aFlags & RenderDocumentFlags::DrawWindowNotFlushing) {
+    mRenderingStateFlags |= RenderingStateFlags::DrawWindowNotFlushing;
+  }
+  if (aFlags & RenderDocumentFlags::DocumentRelative) {
+    wouldFlushRetainedLayers = true;
+    flags |= PaintFrameFlags::DocumentRelative;
+  }
+
+  if ((flags & PaintFrameFlags::WidgetLayers) && wouldFlushRetainedLayers) {
+    flags &= ~PaintFrameFlags::WidgetLayers;
+  }
+
+  nsLayoutUtils::PaintFrame(aThebesContext, rootFrame, nsRegion(aRect),
+                            aBackgroundColor,
+                            (aFlags & RenderDocumentFlags::ForPrinting)
+                                ? nsDisplayListBuilderMode::PaintForPrinting
+                                : nsDisplayListBuilderMode::Painting,
+                            flags);
+
+  return NS_OK;
+}
+
+nsRect PresShell::ClipListToRange(nsDisplayListBuilder* aBuilder,
+                                  nsDisplayList* aList, nsRange* aRange) {
+  nsRect surfaceRect;
+
+  for (nsDisplayItem* i : aList->TakeItems()) {
+    if (i->GetType() == DisplayItemType::TYPE_CONTAINER) {
+      aList->AppendToTop(i);
+      surfaceRect.UnionRect(
+          surfaceRect, ClipListToRange(aBuilder, i->GetChildren(), aRange));
+      continue;
+    }
+
+    nsDisplayItem* itemToInsert = nullptr;
+    nsIFrame* frame = i->Frame();
+    nsIContent* content = frame->GetContent();
+    if (content) {
+      bool atStart =
+          content == aRange->GetMayCrossShadowBoundaryStartContainer();
+      bool atEnd = content == aRange->GetMayCrossShadowBoundaryEndContainer();
+      if ((atStart || atEnd) && frame->IsTextFrame()) {
+        auto [frameStartOffset, frameEndOffset] = frame->GetOffsets();
+
+        int32_t highlightStart =
+            atStart ? std::max(static_cast<int32_t>(
+                                   aRange->MayCrossShadowBoundaryStartOffset()),
+                               frameStartOffset)
+                    : frameStartOffset;
+        int32_t highlightEnd =
+            atEnd ? std::min(static_cast<int32_t>(
+                                 aRange->MayCrossShadowBoundaryEndOffset()),
+                             frameEndOffset)
+                  : frameEndOffset;
+        if (highlightStart < highlightEnd) {
+          nsPoint startPoint, endPoint;
+          frame->GetPointFromOffset(highlightStart, &startPoint);
+          frame->GetPointFromOffset(highlightEnd, &endPoint);
+
+          nsRect textRect(aBuilder->ToReferenceFrame(frame), frame->GetSize());
+          if (frame->GetWritingMode().IsVertical()) {
+            nscoord y = std::min(startPoint.y, endPoint.y);
+            textRect.y += y;
+            textRect.height = std::max(startPoint.y, endPoint.y) - y;
+          } else {
+            nscoord x = std::min(startPoint.x, endPoint.x);
+            textRect.x += x;
+            textRect.width = std::max(startPoint.x, endPoint.x) - x;
+          }
+          surfaceRect.UnionRect(surfaceRect, textRect);
+
+          const ActiveScrolledRoot* asr = i->GetActiveScrolledRoot();
+
+          DisplayItemClip newClip;
+          newClip.SetTo(textRect);
+
+          const DisplayItemClipChain* newClipChain =
+              aBuilder->AllocateDisplayItemClipChain(newClip, asr, nullptr);
+
+          i->IntersectClip(aBuilder, newClipChain, true);
+          itemToInsert = i;
+        }
+      }
+      else if (content->GetComposedDoc() ==
+               aRange->GetMayCrossShadowBoundaryStartContainer()
+                   ->GetComposedDoc()) {
+        bool before, after;
+        nsresult rv =
+            RangeUtils::CompareNodeToRange<TreeKind::ShadowIncludingDOM>(
+                content, aRange, &before, &after);
+        if (NS_SUCCEEDED(rv) && !before && !after) {
+          itemToInsert = i;
+          bool snap;
+          surfaceRect.UnionRect(surfaceRect, i->GetBounds(aBuilder, &snap));
+        }
+      }
+    }
+
+    nsDisplayList* sublist = i->GetSameCoordinateSystemChildren();
+    if (itemToInsert || sublist) {
+      aList->AppendToTop(itemToInsert ? itemToInsert : i);
+      if (sublist) {
+        surfaceRect.UnionRect(surfaceRect,
+                              ClipListToRange(aBuilder, sublist, aRange));
+      }
+    } else {
+      i->Destroy(aBuilder);
+    }
+  }
+
+  return surfaceRect;
+}
+
+#if defined(DEBUG)
+#  include <stdio.h>
+
+static bool gDumpRangePaintList = false;
+#endif
+
+UniquePtr<RangePaintInfo> PresShell::CreateRangePaintInfo(
+    nsRange* aRange, nsRect& aSurfaceRect, bool aForPrimarySelection) {
+  nsIFrame* ancestorFrame = nullptr;
+  nsIFrame* rootFrame = GetRootFrame();
+
+  nsINode* startContainer = aRange->GetMayCrossShadowBoundaryStartContainer();
+  nsINode* endContainer = aRange->GetMayCrossShadowBoundaryEndContainer();
+  Document* doc = startContainer->GetComposedDoc();
+  if (startContainer == doc || endContainer == doc) {
+    ancestorFrame = rootFrame;
+  } else {
+    nsINode* ancestor =
+        nsContentUtils::GetClosestCommonShadowIncludingInclusiveAncestor(
+            startContainer, endContainer);
+    NS_ASSERTION(!ancestor || ancestor->IsContent(),
+                 "common ancestor is not content");
+
+    while (ancestor && ancestor->IsContent()) {
+      ancestorFrame = ancestor->AsContent()->GetPrimaryFrame();
+      if (ancestorFrame) {
+        break;
+      }
+
+      ancestor = ancestor->GetParentOrShadowHostNode();
+    }
+
+    while (ancestorFrame &&
+           nsLayoutUtils::GetNextContinuationOrIBSplitSibling(ancestorFrame)) {
+      ancestorFrame = ancestorFrame->GetParent();
+    }
+  }
+
+  if (!ancestorFrame) {
+    return nullptr;
+  }
+
+  auto info = MakeUnique<RangePaintInfo>(ancestorFrame);
+  info->mBuilder.SetIncludeAllOutOfFlows();
+  if (aForPrimarySelection) {
+    info->mBuilder.SetSelectedFramesOnly();
+  }
+  info->mBuilder.EnterPresShell(ancestorFrame);
+
+  ContentSubtreeIterator subtreeIter;
+  nsresult rv = subtreeIter.InitWithAllowCrossShadowBoundary(aRange);
+  if (NS_FAILED(rv)) {
+    return nullptr;
+  }
+
+  auto BuildDisplayListForNode = [&](nsINode* aNode) {
+    if (MOZ_UNLIKELY(!aNode->IsContent())) {
+      return;
+    }
+    nsIFrame* frame = aNode->AsContent()->GetPrimaryFrame();
+    for (; frame;
+         frame = nsLayoutUtils::GetNextContinuationOrIBSplitSibling(frame)) {
+      if (frame->HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+        continue;
+      }
+      info->mBuilder.SetVisibleRect(frame->InkOverflowRect());
+      info->mBuilder.SetDirtyRect(frame->InkOverflowRect());
+      frame->BuildDisplayListForStackingContext(&info->mBuilder, &info->mList);
+    }
+  };
+  if (startContainer->NodeType() == nsINode::TEXT_NODE) {
+    BuildDisplayListForNode(startContainer);
+  }
+  for (; !subtreeIter.IsDone(); subtreeIter.Next()) {
+    nsCOMPtr<nsINode> node = subtreeIter.GetCurrentNode();
+    BuildDisplayListForNode(node);
+  }
+  if (endContainer != startContainer &&
+      endContainer->NodeType() == nsINode::TEXT_NODE) {
+    BuildDisplayListForNode(endContainer);
+  }
+
+  for (nsPresContext* ctx = GetPresContext(); ctx;
+       ctx = ctx->GetParentPresContext()) {
+    PresShell* shell = ctx->PresShell();
+    float resolution = shell->GetResolution();
+
+    if (!ctx->GetParentPresContext()) {
+      resolution *= ViewportUtils::TryInferEnclosingResolution(shell).xScale;
+    }
+
+    if (resolution == 1.0) {
+      continue;
+    }
+
+    info->mResolution *= resolution;
+    nsIFrame* rootScrollContainerFrame = shell->GetRootScrollContainerFrame();
+    ViewID zoomedId = nsLayoutUtils::FindOrCreateIDFor(
+        rootScrollContainerFrame->GetContent());
+
+    nsDisplayList wrapped(&info->mBuilder);
+    wrapped.AppendNewToTop<nsDisplayAsyncZoom>(
+        &info->mBuilder, rootScrollContainerFrame, &info->mList, nullptr,
+        nsDisplayItem::ContainerASRType::Constant, zoomedId);
+    info->mList.AppendToTop(&wrapped);
+  }
+
+#if defined(DEBUG)
+  if (gDumpRangePaintList) {
+    fprintf(stderr, "CreateRangePaintInfo --- before ClipListToRange:\n");
+    nsIFrame::PrintDisplayList(&(info->mBuilder), info->mList);
+  }
+#endif
+
+  nsRect rangeRect = ClipListToRange(&info->mBuilder, &info->mList, aRange);
+
+  info->mBuilder.LeavePresShell(ancestorFrame, &info->mList);
+
+#if defined(DEBUG)
+  if (gDumpRangePaintList) {
+    fprintf(stderr, "CreateRangePaintInfo --- after ClipListToRange:\n");
+    nsIFrame::PrintDisplayList(&(info->mBuilder), info->mList);
+  }
+#endif
+
+  info->mRootOffset = ancestorFrame->GetBoundingClientRect().TopLeft();
+  rangeRect.MoveBy(info->mRootOffset);
+  aSurfaceRect.UnionRect(aSurfaceRect, rangeRect);
+
+  return info;
+}
+
+already_AddRefed<SourceSurface> PresShell::PaintRangePaintInfo(
+    const nsTArray<UniquePtr<RangePaintInfo>>& aItems, Selection* aSelection,
+    const Maybe<CSSIntRegion>& aRegion, nsRect aArea,
+    const LayoutDeviceIntPoint aPoint, LayoutDeviceIntRect* aScreenRect,
+    RenderImageFlags aFlags) {
+  nsPresContext* pc = GetPresContext();
+  if (!pc || aArea.width == 0 || aArea.height == 0) {
+    return nullptr;
+  }
+
+  LayoutDeviceIntRect pixelArea = LayoutDeviceIntRect::FromAppUnitsToOutside(
+      aArea, pc->AppUnitsPerDevPixel());
+
+  float scale = 1.0;
+
+  const nsRect maxSize = pc->DeviceContext()->GetClientRect();
+
+  bool resize = !!(aFlags & RenderImageFlags::AutoScale);
+
+  if (resize) {
+    if (aFlags & RenderImageFlags::IsImage) {
+      int32_t maxWidth = pc->AppUnitsToDevPixels(maxSize.width);
+      int32_t maxHeight = pc->AppUnitsToDevPixels(maxSize.height);
+      float bestHeight = float(maxHeight) * RELATIVE_SCALEFACTOR;
+      float bestWidth = float(maxWidth) * RELATIVE_SCALEFACTOR;
+      float adjustedScale = bestWidth / float(pixelArea.width);
+      float worstHeight = float(pixelArea.height) * adjustedScale;
+      float difference = bestHeight - worstHeight;
+      adjustedScale = (worstHeight + difference / 2) / float(pixelArea.height);
+      scale = std::min(scale, adjustedScale);
+    } else {
+      int32_t maxWidth = pc->AppUnitsToDevPixels(maxSize.width >> 1);
+      int32_t maxHeight = pc->AppUnitsToDevPixels(maxSize.height >> 1);
+      if (pixelArea.width > maxWidth || pixelArea.height > maxHeight) {
+        if (pixelArea.width > maxWidth) {
+          scale = std::min(scale, float(maxWidth) / pixelArea.width);
+        }
+        if (pixelArea.height > maxHeight) {
+          scale = std::min(scale, float(maxHeight) / pixelArea.height);
+        }
+      }
+    }
+
+    float resolutionScale = 1.0;
+    for (const UniquePtr<RangePaintInfo>& rangeInfo : aItems) {
+      resolutionScale = std::max(resolutionScale, rangeInfo->mResolution);
+    }
+    float unclampedResolution = resolutionScale;
+    resolutionScale =
+        std::min(resolutionScale, maxSize.width / (scale * pixelArea.width));
+    resolutionScale =
+        std::min(resolutionScale, maxSize.height / (scale * pixelArea.height));
+    MOZ_ASSERT(resolutionScale >= 1.0);
+    resolutionScale = std::max(1.0f, resolutionScale);
+
+    scale *= resolutionScale;
+
+
+    LayoutDevicePoint visualPoint = ViewportUtils::ToScreenRelativeVisual(
+        LayoutDevicePoint(pixelArea.TopLeft()), pc);
+    float scaleRelativeToNormalContent = scale / unclampedResolution;
+    aScreenRect->x =
+        NSToIntFloor(aPoint.x - float(aPoint.x.value - visualPoint.x.value) *
+                                    scaleRelativeToNormalContent);
+    aScreenRect->y =
+        NSToIntFloor(aPoint.y - float(aPoint.y.value - visualPoint.y.value) *
+                                    scaleRelativeToNormalContent);
+
+    pixelArea.width = NSToIntFloor(float(pixelArea.width) * scale);
+    pixelArea.height = NSToIntFloor(float(pixelArea.height) * scale);
+    if (!pixelArea.width || !pixelArea.height) {
+      return nullptr;
+    }
+  } else {
+    LayoutDevicePoint visualPoint = ViewportUtils::ToScreenRelativeVisual(
+        LayoutDevicePoint(pixelArea.TopLeft()), pc);
+    aScreenRect->MoveTo(RoundedToInt(visualPoint));
+  }
+  aScreenRect->width = pixelArea.width;
+  aScreenRect->height = pixelArea.height;
+
+  RefPtr<DrawTarget> dt =
+      gfxPlatform::GetPlatform()->CreateOffscreenContentDrawTarget(
+          IntSize(pixelArea.width, pixelArea.height), SurfaceFormat::B8G8R8A8);
+  if (!dt || !dt->IsValid()) {
+    return nullptr;
+  }
+
+  gfxContext ctx(dt);
+
+  if (aRegion) {
+    RefPtr<PathBuilder> builder = dt->CreatePathBuilder(FillRule::FILL_WINDING);
+
+    nsIntRegion region = aRegion->ToAppUnits(AppUnitsPerCSSPixel())
+                             .ToOutsidePixels(pc->AppUnitsPerDevPixel());
+    for (auto iter = region.RectIter(); !iter.Done(); iter.Next()) {
+      const IntRect& rect = iter.Get();
+
+      builder->MoveTo(rect.TopLeft());
+      builder->LineTo(rect.TopRight());
+      builder->LineTo(rect.BottomRight());
+      builder->LineTo(rect.BottomLeft());
+      builder->LineTo(rect.TopLeft());
+    }
+
+    RefPtr<Path> path = builder->Finish();
+    ctx.Clip(path);
+  }
+
+  gfxMatrix initialTM = ctx.CurrentMatrixDouble();
+
+  if (resize) {
+    initialTM.PreScale(scale, scale);
+  }
+
+  gfxPoint surfaceOffset = nsLayoutUtils::PointToGfxPoint(
+      -aArea.TopLeft(), pc->AppUnitsPerDevPixel());
+  initialTM.PreTranslate(surfaceOffset);
+
+  RefPtr<nsFrameSelection> frameSelection;
+  if (aSelection) {
+    frameSelection = aSelection->GetFrameSelection();
+  } else {
+    frameSelection = FrameSelection();
+  }
+  int16_t oldDisplaySelection = frameSelection->GetDisplaySelection();
+  frameSelection->SetDisplaySelection(nsISelectionController::SELECTION_HIDDEN);
+
+  for (const UniquePtr<RangePaintInfo>& rangeInfo : aItems) {
+    gfxPoint rootOffset = nsLayoutUtils::PointToGfxPoint(
+        rangeInfo->mRootOffset, pc->AppUnitsPerDevPixel());
+    ctx.SetMatrixDouble(initialTM.PreTranslate(rootOffset));
+    aArea.MoveBy(-rangeInfo->mRootOffset.x, -rangeInfo->mRootOffset.y);
+    nsRegion visible(aArea);
+    rangeInfo->mList.PaintRoot(&rangeInfo->mBuilder, &ctx,
+                               nsDisplayList::PAINT_DEFAULT, Nothing());
+    aArea.MoveBy(rangeInfo->mRootOffset.x, rangeInfo->mRootOffset.y);
+  }
+
+  frameSelection->SetDisplaySelection(oldDisplaySelection);
+
+  return dt->Snapshot();
+}
+
+already_AddRefed<SourceSurface> PresShell::RenderNode(
+    nsINode* aNode, const Maybe<CSSIntRegion>& aRegion,
+    const LayoutDeviceIntPoint aPoint, LayoutDeviceIntRect* aScreenRect,
+    RenderImageFlags aFlags) {
+  nsRect area;
+  nsTArray<UniquePtr<RangePaintInfo>> rangeItems;
+
+  if (!aNode->IsInComposedDoc()) {
+    return nullptr;
+  }
+
+  RefPtr<nsRange> range = nsRange::Create(aNode);
+  IgnoredErrorResult rv;
+  range->SelectNode(*aNode, rv);
+  if (rv.Failed()) {
+    return nullptr;
+  }
+
+  UniquePtr<RangePaintInfo> info = CreateRangePaintInfo(range, area, false);
+  if (info) {
+    rangeItems.AppendElement(std::move(info));
+  }
+
+  Maybe<CSSIntRegion> region = aRegion;
+  if (region) {
+    CSSIntRect rrectPixels = region->GetBounds();
+
+    nsRect rrect = ToAppUnits(rrectPixels, AppUnitsPerCSSPixel());
+    area.IntersectRect(area, rrect);
+
+    nsPresContext* pc = GetPresContext();
+    if (!pc) {
+      return nullptr;
+    }
+
+    region->MoveBy(-nsPresContext::AppUnitsToIntCSSPixels(area.x),
+                   -nsPresContext::AppUnitsToIntCSSPixels(area.y));
+  }
+
+  return PaintRangePaintInfo(rangeItems, nullptr, region, area, aPoint,
+                             aScreenRect, aFlags);
+}
+
+already_AddRefed<SourceSurface> PresShell::RenderSelection(
+    Selection* aSelection, const LayoutDeviceIntPoint aPoint,
+    LayoutDeviceIntRect* aScreenRect, RenderImageFlags aFlags) {
+  nsRect area;
+  nsTArray<UniquePtr<RangePaintInfo>> rangeItems;
+
+  const uint32_t rangeCount = aSelection->RangeCount();
+  NS_ASSERTION(rangeCount > 0, "RenderSelection called with no selection");
+  for (const uint32_t r : IntegerRange(rangeCount)) {
+    MOZ_ASSERT(aSelection->RangeCount() == rangeCount);
+    RefPtr<nsRange> range = aSelection->GetRangeAt(r);
+
+    UniquePtr<RangePaintInfo> info = CreateRangePaintInfo(range, area, true);
+    if (info) {
+      rangeItems.AppendElement(std::move(info));
+    }
+  }
+
+  return PaintRangePaintInfo(rangeItems, aSelection, Nothing(), area, aPoint,
+                             aScreenRect, aFlags);
+}
+
+static void AddDisplayItemToBottom(nsDisplayListBuilder* aBuilder,
+                                   nsDisplayList* aList, nsDisplayItem* aItem) {
+  nsDisplayList list(aBuilder);
+  list.AppendToTop(aItem);
+  list.AppendToTop(aList);
+  aList->AppendToTop(&list);
+}
+
+void PresShell::AddCanvasBackgroundColorItem(nsDisplayListBuilder* aBuilder,
+                                             nsDisplayList* aList,
+                                             nsIFrame* aFrame,
+                                             const nsRect& aBounds,
+                                             nscolor aBackstopColor) {
+  if (aBounds.IsEmpty() || !aFrame->IsViewportFrame()) {
+    return;
+  }
+
+  const SingleCanvasBackground& canvasBg = mCanvasBackground.mViewport;
+  const nscolor bgcolor = NS_ComposeColors(aBackstopColor, canvasBg.mColor);
+  if (NS_GET_A(bgcolor) == 0) {
+    return;
+  }
+
+  const bool forceUnscrolledItem =
+      nsLayoutUtils::UsesAsyncScrolling(aFrame) && NS_GET_A(bgcolor) == 255;
+  if (canvasBg.mCSSSpecified && !forceUnscrolledItem) {
+    return;
+  }
+
+  MOZ_ASSERT(NS_GET_A(bgcolor) == 255);
+  const bool isRootContentDocumentCrossProcess =
+      mPresContext->IsRootContentDocumentCrossProcess();
+  MOZ_ASSERT_IF(
+      !aFrame->GetParent() && isRootContentDocumentCrossProcess &&
+          mPresContext->HasDynamicToolbar(),
+      aBounds.Size() ==
+          nsLayoutUtils::ExpandHeightForDynamicToolbar(
+              mPresContext, aFrame->InkOverflowRectRelativeToSelf().Size()));
+
+  nsDisplaySolidColor* item =
+      MakeDisplayItem<nsDisplaySolidColor>(aBuilder, aFrame, aBounds, bgcolor);
+  if (canvasBg.mCSSSpecified && isRootContentDocumentCrossProcess) {
+    item->SetIsCheckerboardBackground();
+  }
+  AddDisplayItemToBottom(aBuilder, aList, item);
+}
+
+bool PresShell::IsTransparentContainerElement() const {
+  if (mDocument->IsInitialDocument()) {
+    switch (StaticPrefs::layout_css_initial_document_transparency()) {
+      case 3:
+        return true;
+      case 2:
+        if (!mDocument->IsTopLevelContentDocument()) {
+          return true;
+        }
+        [[fallthrough]];
+      case 1:
+        if (mDocument->IsLikelyContentInaccessibleTopLevelAboutBlank()) {
+          return true;
+        }
+        [[fallthrough]];
+      default:
+        break;
+    }
+  }
+
+  nsPresContext* pc = GetPresContext();
+  if (!pc->IsRootContentDocumentCrossProcess()) {
+    if (mDocument->IsInChromeDocShell()) {
+      return true;
+    }
+    if (BrowsingContext* bc = mDocument->GetBrowsingContext()) {
+      switch (bc->GetEmbedderColorSchemes().mUsed) {
+        case dom::PrefersColorSchemeOverride::Light:
+          return pc->DefaultBackgroundColorScheme() == ColorScheme::Light;
+        case dom::PrefersColorSchemeOverride::Dark:
+          return pc->DefaultBackgroundColorScheme() == ColorScheme::Dark;
+        case dom::PrefersColorSchemeOverride::None:
+          break;
+      }
+    }
+    return true;
+  }
+
+  nsIDocShell* docShell = pc->GetDocShell();
+  if (!docShell) {
+    return false;
+  }
+  nsPIDOMWindowOuter* pwin = docShell->GetWindow();
+  if (!pwin) {
+    return false;
+  }
+  if (Element* containerElement = pwin->GetFrameElementInternal()) {
+    return containerElement->HasAttr(nsGkAtoms::transparent);
+  }
+  if (BrowserChild* tab = BrowserChild::GetFrom(docShell)) {
+    return this == tab->GetTopLevelPresShell() && tab->IsTransparent();
+  }
+  return false;
+}
+
+nscolor PresShell::GetDefaultBackgroundColorToDraw() const {
+  if (!mPresContext) {
+    return NS_RGB(255, 255, 255);
+  }
+  return mPresContext->DefaultBackgroundColor();
+}
+
+void PresShell::UpdateCanvasBackground() {
+  mCanvasBackground = ComputeCanvasBackground();
+}
+
+static SingleCanvasBackground ComputeSingleCanvasBackground(nsIFrame* aCanvas) {
+  MOZ_ASSERT(aCanvas->IsCanvasFrame());
+  const nsIFrame* bgFrame = nsCSSRendering::FindBackgroundFrame(aCanvas);
+  static constexpr nscolor kTransparent = NS_RGBA(0, 0, 0, 0);
+  if (bgFrame->IsThemed()) {
+    return {kTransparent, false};
+  }
+  bool drawBackgroundImage = false;
+  bool drawBackgroundColor = false;
+  nscolor color = nsCSSRendering::DetermineBackgroundColor(
+      aCanvas->PresContext(), bgFrame->Style(), aCanvas, drawBackgroundImage,
+      drawBackgroundColor);
+  if (!drawBackgroundColor) {
+    return {kTransparent, false};
+  }
+  return {color, true};
+}
+
+PresShell::CanvasBackground PresShell::ComputeCanvasBackground() const {
+  nsIFrame* canvas = GetCanvasFrame();
+  if (!canvas) {
+    nscolor color = GetDefaultBackgroundColorToDraw();
+    return {{color, false}, {color, false}};
+  }
+
+  auto viewportBg = ComputeSingleCanvasBackground(canvas);
+  if (!IsTransparentContainerElement()) {
+    viewportBg.mColor =
+        NS_ComposeColors(GetDefaultBackgroundColorToDraw(), viewportBg.mColor);
+  }
+  auto pageBg = viewportBg;
+  nsCanvasFrame* docElementCb =
+      mFrameConstructor->GetDocElementContainingBlock();
+  if (canvas != docElementCb) {
+    MOZ_ASSERT(mPresContext->IsRootPaginatedDocument());
+    pageBg = ComputeSingleCanvasBackground(docElementCb);
+  }
+  return {viewportBg, pageBg};
+}
+
+nscolor PresShell::ComputeBackstopColor(nsIFrame* aDisplayRoot) {
+  nsIWidget* widget =
+      aDisplayRoot ? aDisplayRoot->GetNearestWidget() : GetNearestWidget();
+  if (widget &&
+      (widget->GetTransparencyMode() != widget::TransparencyMode::Opaque ||
+       widget->WidgetPaintsBackground())) {
+    return NS_RGBA(0, 0, 0, 0);
+  }
+  return GetDefaultBackgroundColorToDraw();
+}
+
+struct PaintParams {
+  nscolor mBackgroundColor;
+};
+
+WindowRenderer* PresShell::GetWindowRenderer() {
+  if (nsIWidget* widget = GetOwnWidget()) {
+    return widget->GetWindowRenderer();
+  }
+  return nullptr;
+}
+
+nsIWidget* PresShell::GetNearestWidget() const {
+  if (auto* widget = GetOwnWidget()) {
+    return widget;
+  }
+  if (auto* embedder = GetInProcessEmbedderFrame()) {
+    return embedder->GetNearestWidget();
+  }
+  return GetRootWidget();
+}
+
+nsIWidget* PresShell::GetOwnWidget() const {
+  return mWidgetListener ? mWidgetListener->GetWidget() : nullptr;
+}
+
+bool PresShell::AsyncPanZoomEnabled() {
+  if (nsIWidget* widget = GetOwnWidget()) {
+    return widget->AsyncPanZoomEnabled();
+  }
+  return gfxPlatform::AsyncPanZoomEnabled();
+}
+
+nsresult PresShell::SetResolutionAndScaleTo(float aResolution,
+                                            ResolutionChangeOrigin aOrigin) {
+  if (!(aResolution > 0.0)) {
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
+  if (aResolution == mResolution.valueOr(0.0)) {
+    MOZ_ASSERT(mResolution.isSome());
+    return NS_OK;
+  }
+
+  bool resolutionUpdated = aResolution != GetResolution();
+
+  mLastResolutionChangeOrigin = aOrigin;
+
+  RenderingState state(this);
+  state.mResolution = Some(aResolution);
+  SetRenderingState(state);
+  if (mMobileViewportManager) {
+    mMobileViewportManager->ResolutionUpdated(aOrigin);
+  }
+  if (IsVisualViewportOffsetSet()) {
+    SetVisualViewportOffset(GetVisualViewportOffset(),
+                            GetLayoutViewportOffset());
+  }
+  if (aOrigin == ResolutionChangeOrigin::Apz) {
+    mResolutionUpdatedByApz = true;
+  } else if (resolutionUpdated) {
+    mResolutionUpdated = true;
+  }
+
+  if (auto* window = nsGlobalWindowInner::Cast(mDocument->GetInnerWindow())) {
+    window->VisualViewport()->PostResizeEvent();
+  }
+
+  return NS_OK;
+}
+
+float PresShell::GetCumulativeResolution() const {
+  float resolution = GetResolution();
+  nsPresContext* parentCtx = GetPresContext()->GetParentPresContext();
+  if (parentCtx) {
+    resolution *= parentCtx->PresShell()->GetCumulativeResolution();
+  }
+  return resolution;
+}
+
+void PresShell::SetRestoreResolution(float aResolution,
+                                     LayoutDeviceIntSize aDisplaySize) {
+  if (mMobileViewportManager) {
+    mMobileViewportManager->SetRestoreResolution(aResolution, aDisplaySize);
+  }
+}
+
+void PresShell::SetRenderingState(const RenderingState& aState) {
+  if (GetResolution() != aState.mResolution.valueOr(1.f)) {
+    if (nsIFrame* frame = GetRootFrame()) {
+      frame->SchedulePaint();
+    }
+  }
+
+  mRenderingStateFlags = aState.mRenderingStateFlags;
+  mResolution = aState.mResolution;
+#if defined(ACCESSIBILITY)
+  if (nsAccessibilityService* accService = GetAccService()) {
+    accService->NotifyOfResolutionChange(this, GetResolution());
+  }
+#endif
+}
+
+void PresShell::SynthesizeMouseMove(bool aFromScroll) {
+  if (!StaticPrefs::layout_reflow_synthMouseMove()) {
+    return;
+  }
+
+  if (mPaintingSuppressed || !mIsActive || !mPresContext) {
+    return;
+  }
+
+  if (!IsRoot()) {
+    if (PresShell* rootPresShell = GetRootPresShell()) {
+      rootPresShell->SynthesizeMouseMove(aFromScroll);
+    }
+    return;
+  }
+
+  if (mLastMousePointerId.isNothing() && mPointerIds.IsEmpty()) {
+    if (Maybe<uint32_t> claimedPointerId =
+            PointerEventHandler::TryClaimOrphanedLastMouseInfo(*this)) {
+      mLastMousePointerId = claimedPointerId;
+    } else {
+      return;
+    }
+  }
+
+  if (!mSynthMouseMoveEvent.IsPending()) {
+    auto ev = MakeRefPtr<nsSynthMouseMoveEvent>(this, aFromScroll);
+
+    GetPresContext()->RefreshDriver()->AddRefreshObserver(
+        ev, FlushType::Display, "Synthetic mouse move event");
+    mSynthMouseMoveEvent = std::move(ev);
+  }
+}
+
+static nsMenuPopupFrame* FindPopupFrame(nsPresContext* aRootPresContext,
+                                        nsIWidget* aRootWidget,
+                                        const LayoutDeviceIntPoint& aPt) {
+  return nsLayoutUtils::GetPopupFrameForPoint(
+      aRootPresContext, aRootWidget, aPt,
+      nsLayoutUtils::GetPopupFrameForPointFlags::OnlyReturnFramesWithWidgets);
+}
+
+void PresShell::ProcessSynthMouseMoveEvent(bool aFromScroll) {
+  auto forgetMouseMove = MakeScopeExit([&]() {
+    mSynthMouseMoveEvent.Forget();
+  });
+  nsIWidget* widget = GetOwnWidget();
+  if (!widget) {
+    return;
+  }
+  nsCOMPtr<nsIDragSession> dragSession = nsContentUtils::GetDragSession(widget);
+  if (dragSession) {
+    forgetMouseMove.release();
+    return;
+  }
+
+  if (!mPresContext) {
+    return;
+  }
+
+  if (aFromScroll) {
+    mSynthMouseMoveEvent.Forget();
+    forgetMouseMove.release();
+  }
+
+  NS_ASSERTION(IsRoot(), "Only a root pres shell should be here");
+
+  if (StaticPrefs::dom_event_pointer_boundary_dispatch_when_layout_change()) {
+    const AutoTArray<uint32_t, 16> pointerIds(mPointerIds.Clone());
+    for (const uint32_t pointerId : pointerIds) {
+      const PointerInfo* const pointerInfo =
+          PointerEventHandler::GetPointerInfo(pointerId);
+      if (MOZ_UNLIKELY(!pointerInfo) || !pointerInfo->HasLastState() ||
+          !pointerInfo->InputSourceSupportsHover()) {
+        continue;
+      }
+      PointerCaptureInfo* const captureInfo =
+          PointerEventHandler::GetPointerCaptureInfo(pointerId);
+      if (captureInfo && captureInfo->mOverrideElement) {
+        continue;
+      }
+      ProcessSynthMouseOrPointerMoveEvent(ePointerMove, pointerId,
+                                          *pointerInfo);
+    }
+  }
+
+  if (mLastMousePointerId.isSome()) {
+    if (const PointerInfo* const lastMouseInfo =
+            PointerEventHandler::GetLastMouseInfo(this)) {
+      if (lastMouseInfo->HasLastState() &&
+          (lastMouseInfo->InputSourceSupportsHover() ||
+           lastMouseInfo->mIsActive)) {
+        ProcessSynthMouseOrPointerMoveEvent(eMouseMove, *mLastMousePointerId,
+                                            *lastMouseInfo);
+      }
+    }
+  }
+}
+
+void PresShell::ProcessSynthMouseOrPointerMoveEvent(
+    EventMessage aMoveMessage, uint32_t aPointerId,
+    const PointerInfo& aPointerInfo) {
+  MOZ_ASSERT(aMoveMessage == eMouseMove || aMoveMessage == ePointerMove);
+  NS_ASSERTION(IsRoot(), "Only a root pres shell should be here");
+
+#if defined(DEBUG)
+  if (aMoveMessage == eMouseMove || aMoveMessage == ePointerMove) {
+    MOZ_LOG(aMoveMessage == eMouseMove
+                ? PointerEventHandler::MouseLocationLogRef()
+                : PointerEventHandler::PointerLocationLogRef(),
+            LogLevel::Info,
+            ("[ps=%p]synthesizing %s to (%d,%d) (pointerId=%u, source=%s)\n",
+             this, ToChar(aMoveMessage), aPointerInfo.mLastRefPointInRootDoc.x,
+             aPointerInfo.mLastRefPointInRootDoc.y, aPointerId,
+             InputSourceToString(aPointerInfo.mInputSource).get()));
+  }
+#endif
+
+  int32_t APD = mPresContext->AppUnitsPerDevPixel();
+
+  nsPoint refpoint(0, 0);
+
+  nsIWidget* ownWidget = GetOwnWidget();
+  if (!ownWidget) {
+    return;
+  }
+  MOZ_ASSERT(!nsCOMPtr{nsContentUtils::GetDragSession(ownWidget)});
+
+  nsCOMPtr<nsIWidget> widget;
+  RefPtr<PresShell> pointShell;
+  int32_t widgetAPD;
+  RefPtr<BrowserBridgeChild> bbc;
+
+  nsMenuPopupFrame* popupFrame =
+      FindPopupFrame(mPresContext, ownWidget,
+                     LayoutDeviceIntPoint::FromAppUnitsToNearest(
+                         aPointerInfo.mLastRefPointInRootDoc, APD));
+  if (popupFrame) {
+    pointShell = popupFrame->PresShell();
+    widget = popupFrame->GetWidget();
+    widgetAPD = popupFrame->PresContext()->AppUnitsPerDevPixel();
+    refpoint = aPointerInfo.mLastRefPointInRootDoc;
+    DebugOnly<nsLayoutUtils::TransformResult> result =
+        nsLayoutUtils::TransformPoint(
+            RelativeTo{GetRootFrame(), ViewportType::Visual},
+            RelativeTo{popupFrame, ViewportType::Layout}, refpoint);
+    MOZ_ASSERT(result == nsLayoutUtils::TRANSFORM_SUCCEEDED);
+  }
+  if (!widget) {
+    widget = ownWidget;
+    widgetAPD = APD;
+    pointShell = this;
+    refpoint = aPointerInfo.mLastRefPointInRootDoc;
+  }
+  NS_ASSERTION(widget, "view should have a widget here");
+  Maybe<WidgetMouseEvent> mouseMoveEvent;
+  Maybe<WidgetPointerEvent> pointerMoveEvent;
+  if (aMoveMessage == eMouseMove) {
+    mouseMoveEvent.emplace(true, eMouseMove, widget,
+                           WidgetMouseEvent::eSynthesized);
+    mouseMoveEvent->mButton = MouseButton::ePrimary;
+    mouseMoveEvent->convertToPointer = false;
+  } else {
+    pointerMoveEvent.emplace(true, ePointerMove, widget);
+    pointerMoveEvent->mButton = MouseButton::eNotPressed;
+    pointerMoveEvent->mReason = WidgetMouseEvent::eSynthesized;
+  }
+  WidgetMouseEvent& event =
+      mouseMoveEvent ? mouseMoveEvent.ref() : pointerMoveEvent.ref();
+
+  event.mFlags.mIsSynthesizedForTests = aPointerInfo.mIsSynthesizedForTests;
+
+  event.mRefPoint =
+      LayoutDeviceIntPoint::FromAppUnitsToNearest(refpoint, widgetAPD);
+  event.mButtons = aPointerInfo.mLastButtons;
+  event.mInputSource = aPointerInfo.mInputSource;
+  event.pointerId = aPointerId;
+  event.mModifiers = PresShell::GetCurrentModifiers();
+
+  MOZ_ASSERT(pointShell);
+  InputAPZContext apzContext(aPointerInfo.mLastTargetGuid, 0,
+                             nsEventStatus_eIgnore);
+  nsEventStatus status = nsEventStatus_eIgnore;
+  if (auto* eventFrame = popupFrame ? popupFrame : GetRootFrame()) {
+    pointShell->HandleEvent(eventFrame, &event, false, &status);
+  }
+}
+
+void PresShell::MarkFramesInListApproximatelyVisible(
+    const nsDisplayList& aList) {
+  for (nsDisplayItem* item : aList) {
+    nsDisplayList* sublist = item->GetChildren();
+    if (sublist) {
+      MarkFramesInListApproximatelyVisible(*sublist);
+      continue;
+    }
+
+    nsIFrame* frame = item->Frame();
+    MOZ_ASSERT(frame);
+
+    if (!frame->TrackingVisibility()) {
+      continue;
+    }
+
+    PresShell* presShell = frame->PresShell();
+    MOZ_ASSERT(!presShell->AssumeAllFramesVisible());
+    if (presShell->mApproximatelyVisibleFrames.EnsureInserted(frame)) {
+      frame->IncApproximateVisibleCount();
+    }
+  }
+}
+
+void PresShell::DecApproximateVisibleCount(
+    VisibleFrames& aFrames, const Maybe<OnNonvisible>& aNonvisibleAction
+    ) {
+  for (nsIFrame* frame : aFrames) {
+    if (frame->TrackingVisibility()) {
+      frame->DecApproximateVisibleCount(aNonvisibleAction);
+    }
+  }
+}
+
+void PresShell::RebuildApproximateFrameVisibilityDisplayList(
+    const nsDisplayList& aList) {
+  MOZ_ASSERT(!mApproximateFrameVisibilityVisited, "already visited?");
+  mApproximateFrameVisibilityVisited = true;
+
+  VisibleFrames oldApproximatelyVisibleFrames =
+      std::move(mApproximatelyVisibleFrames);
+
+  MarkFramesInListApproximatelyVisible(aList);
+
+  DecApproximateVisibleCount(oldApproximatelyVisibleFrames);
+}
+
+void PresShell::ClearApproximateFrameVisibilityVisited() {
+  if (!mApproximateFrameVisibilityVisited) {
+    ClearApproximatelyVisibleFramesList();
+  }
+  mApproximateFrameVisibilityVisited = false;
+  mDocument->EnumerateSubDocuments([](Document& aSubdoc) {
+    if (auto* ps = aSubdoc.GetPresShell()) {
+      ps->ClearApproximateFrameVisibilityVisited();
+    }
+    return CallState::Continue;
+  });
+}
+
+void PresShell::ClearApproximatelyVisibleFramesList(
+    const Maybe<OnNonvisible>& aNonvisibleAction
+    ) {
+  DecApproximateVisibleCount(mApproximatelyVisibleFrames, aNonvisibleAction);
+  mApproximatelyVisibleFrames.Clear();
+}
+
+void PresShell::MarkFramesInSubtreeApproximatelyVisible(
+    nsIFrame* aFrame, const nsRect& aRect, const nsRect& aPreserve3DRect,
+    bool aRemoveOnly ) {
+  MOZ_DIAGNOSTIC_ASSERT(aFrame, "aFrame arg should be a valid frame pointer");
+  MOZ_ASSERT(aFrame->PresShell() == this, "wrong presshell");
+
+  if (aFrame->TrackingVisibility() && aFrame->StyleVisibility()->IsVisible() &&
+      (!aRemoveOnly ||
+       aFrame->GetVisibility() == Visibility::ApproximatelyVisible)) {
+    MOZ_ASSERT(!AssumeAllFramesVisible());
+    if (mApproximatelyVisibleFrames.EnsureInserted(aFrame)) {
+      aFrame->IncApproximateVisibleCount();
+    }
+  }
+
+  nsSubDocumentFrame* subdocFrame = do_QueryFrame(aFrame);
+  if (subdocFrame) {
+    PresShell* presShell = subdocFrame->GetSubdocumentPresShellForPainting(
+        nsSubDocumentFrame::IGNORE_PAINT_SUPPRESSION);
+    if (presShell && !presShell->AssumeAllFramesVisible()) {
+      nsRect rect = aRect;
+      nsIFrame* root = presShell->GetRootFrame();
+      if (root) {
+        rect.MoveBy(aFrame->GetOffsetToCrossDoc(root));
+      } else {
+        rect.MoveBy(-aFrame->GetContentRectRelativeToSelf().TopLeft());
+      }
+      rect = rect.ScaleToOtherAppUnitsRoundOut(
+          aFrame->PresContext()->AppUnitsPerDevPixel(),
+          presShell->GetPresContext()->AppUnitsPerDevPixel());
+
+      presShell->RebuildApproximateFrameVisibility(&rect);
+    }
+    return;
+  }
+
+  nsRect rect = aRect;
+
+  if (ScrollContainerFrame* scrollFrame = do_QueryFrame(aFrame)) {
+    bool ignoreDisplayPort = false;
+    if (DisplayPortUtils::IsMissingDisplayPortBaseRect(aFrame->GetContent())) {
+      nsPresContext* pc = aFrame->PresContext();
+      if (scrollFrame->IsRootScrollFrameOfDocument() &&
+          (pc->IsRootContentDocumentCrossProcess() ||
+           (pc->IsChrome() && !pc->GetParentPresContext()))) {
+        nsRect baseRect(
+            nsPoint(), nsLayoutUtils::CalculateCompositionSizeForFrame(aFrame));
+        DisplayPortUtils::SetDisplayPortBase(aFrame->GetContent(), baseRect);
+      } else {
+        ignoreDisplayPort = true;
+      }
+    }
+
+    nsRect displayPort;
+    bool usingDisplayport =
+        !ignoreDisplayPort &&
+        DisplayPortUtils::GetDisplayPortForVisibilityTesting(
+            aFrame->GetContent(), &displayPort);
+
+    scrollFrame->NotifyApproximateFrameVisibilityUpdate(!usingDisplayport);
+
+    if (usingDisplayport) {
+      rect = displayPort;
+    } else {
+      rect = rect.Intersect(scrollFrame->GetScrollPortRect());
+    }
+    rect = scrollFrame->ExpandRectToNearlyVisible(rect);
+  }
+
+  for (const auto& [list, listID] : aFrame->ChildLists()) {
+    for (nsIFrame* child : list) {
+      MOZ_DIAGNOSTIC_ASSERT(child, "shouldn't have null values in child lists");
+
+      const bool extend3DContext = child->Extend3DContext();
+      const bool combines3DTransformWithAncestors =
+          (extend3DContext || child->IsTransformed()) &&
+          child->Combines3DTransformWithAncestors();
+
+      nsRect r = rect - child->GetPosition();
+      if (!combines3DTransformWithAncestors) {
+        if (!r.IntersectRect(r, child->InkOverflowRect())) {
+          continue;
+        }
+      }
+
+      nsRect newPreserve3DRect = aPreserve3DRect;
+      if (extend3DContext && !combines3DTransformWithAncestors) {
+        newPreserve3DRect = r;
+      }
+
+      if (child->IsTransformed()) {
+        if (combines3DTransformWithAncestors) {
+          r = newPreserve3DRect;
+        }
+        const nsRect overflow = child->InkOverflowRectRelativeToSelf();
+        nsRect out;
+        if (nsDisplayTransform::UntransformRect(r, overflow, child, &out)) {
+          r = out;
+        } else {
+          r.SetEmpty();
+        }
+      }
+      MarkFramesInSubtreeApproximatelyVisible(child, r, newPreserve3DRect,
+                                              aRemoveOnly);
+    }
+  }
+}
+
+void PresShell::RebuildApproximateFrameVisibility(
+    nsRect* aRect, bool aRemoveOnly ) {
+  MOZ_ASSERT(!mApproximateFrameVisibilityVisited, "already visited?");
+  mApproximateFrameVisibilityVisited = true;
+
+  nsIFrame* rootFrame = GetRootFrame();
+  if (!rootFrame) {
+    return;
+  }
+
+  VisibleFrames oldApproximatelyVisibleFrames =
+      std::move(mApproximatelyVisibleFrames);
+
+  nsRect vis(nsPoint(0, 0), rootFrame->GetSize());
+  if (aRect) {
+    vis = *aRect;
+  }
+
+  if (mPresContext->IsRootContentDocumentInProcess() &&
+      !mPresContext->IsRootContentDocumentCrossProcess()) {
+    Maybe<nsRect> visibleRect;
+    if (BrowserChild* browserChild = BrowserChild::GetFrom(this)) {
+      visibleRect = browserChild->GetVisibleRect();
+    }
+    vis = vis.Intersect(visibleRect.valueOr(nsRect()));
+  }
+
+  MarkFramesInSubtreeApproximatelyVisible(rootFrame, vis, vis, aRemoveOnly);
+
+  DecApproximateVisibleCount(oldApproximatelyVisibleFrames);
+}
+
+void PresShell::UpdateApproximateFrameVisibility() {
+  DoUpdateApproximateFrameVisibility( false);
+}
+
+void PresShell::DoUpdateApproximateFrameVisibility(bool aRemoveOnly) {
+  MOZ_ASSERT(
+      !mPresContext || mPresContext->IsRootContentDocumentInProcess(),
+      "Updating approximate frame visibility on a non-root content document?");
+
+  mUpdateApproximateFrameVisibilityEvent.Revoke();
+
+  if (mHaveShutDown || mIsDestroying) {
+    return;
+  }
+
+  nsIFrame* rootFrame = GetRootFrame();
+  if (!rootFrame) {
+    ClearApproximatelyVisibleFramesList(Some(OnNonvisible::DiscardImages));
+    return;
+  }
+
+  RebuildApproximateFrameVisibility( nullptr, aRemoveOnly);
+  ClearApproximateFrameVisibilityVisited();
+
+#if defined(DEBUG_FRAME_VISIBILITY_DISPLAY_LIST)
+  nsDisplayListBuilder builder(
+      rootFrame, nsDisplayListBuilderMode::FRAME_VISIBILITY, false);
+  nsRect updateRect(nsPoint(0, 0), rootFrame->GetSize());
+  nsIFrame* rootScroll = GetRootScrollFrame();
+  if (rootScroll) {
+    nsIContent* content = rootScroll->GetContent();
+    if (content) {
+      (void)nsLayoutUtils::GetDisplayPortForVisibilityTesting(
+          content, &updateRect, RelativeTo::ScrollFrame);
+    }
+
+    if (IgnoringViewportScrolling()) {
+      builder.SetIgnoreScrollFrame(rootScroll);
+    }
+  }
+  builder.IgnorePaintSuppression();
+  builder.EnterPresShell(rootFrame);
+  nsDisplayList list;
+  rootFrame->BuildDisplayListForStackingContext(&builder, updateRect, &list);
+  builder.LeavePresShell(rootFrame, &list);
+
+  RebuildApproximateFrameVisibilityDisplayList(list);
+
+  ClearApproximateFrameVisibilityVisited();
+
+  list.DeleteAll(&builder);
+#endif
+}
+
+bool PresShell::AssumeAllFramesVisible() {
+  if (!StaticPrefs::layout_framevisibility_enabled() || !mPresContext ||
+      !mDocument) {
+    return true;
+  }
+
+  if (mPresContext->Type() == nsPresContext::eContext_PrintPreview ||
+      mPresContext->Type() == nsPresContext::eContext_Print ||
+      mPresContext->IsChrome() || mDocument->IsResourceDoc()) {
+    return true;
+  }
+
+  if (!mHaveShutDown && !mIsDestroying &&
+      !mPresContext->IsRootContentDocumentInProcess()) {
+    nsPresContext* presContext =
+        mPresContext->GetInProcessRootContentDocumentPresContext();
+    if (presContext && presContext->PresShell()->AssumeAllFramesVisible()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void PresShell::ScheduleApproximateFrameVisibilityUpdateSoon() {
+  if (AssumeAllFramesVisible()) {
+    return;
+  }
+
+  if (!mPresContext) {
+    return;
+  }
+
+  nsRefreshDriver* refreshDriver = mPresContext->RefreshDriver();
+  if (!refreshDriver) {
+    return;
+  }
+
+  refreshDriver->ScheduleFrameVisibilityUpdate();
+}
+
+void PresShell::ScheduleApproximateFrameVisibilityUpdateNow() {
+  if (AssumeAllFramesVisible()) {
+    return;
+  }
+
+  if (!mPresContext->IsRootContentDocumentInProcess()) {
+    nsPresContext* presContext =
+        mPresContext->GetInProcessRootContentDocumentPresContext();
+    if (!presContext) {
+      return;
+    }
+    MOZ_ASSERT(presContext->IsRootContentDocumentInProcess(),
+               "Didn't get a root prescontext from "
+               "GetInProcessRootContentDocumentPresContext?");
+    presContext->PresShell()->ScheduleApproximateFrameVisibilityUpdateNow();
+    return;
+  }
+
+  if (mHaveShutDown || mIsDestroying) {
+    return;
+  }
+
+  if (mUpdateApproximateFrameVisibilityEvent.IsPending()) {
+    return;
+  }
+
+  RefPtr<nsRunnableMethod<PresShell>> event =
+      NewRunnableMethod("PresShell::UpdateApproximateFrameVisibility", this,
+                        &PresShell::UpdateApproximateFrameVisibility);
+  nsresult rv = mDocument->Dispatch(do_AddRef(event));
+
+  if (NS_SUCCEEDED(rv)) {
+    mUpdateApproximateFrameVisibilityEvent = std::move(event);
+  }
+}
+
+void PresShell::EnsureFrameInApproximatelyVisibleList(nsIFrame* aFrame) {
+  if (!aFrame->TrackingVisibility()) {
+    return;
+  }
+
+  if (AssumeAllFramesVisible()) {
+    aFrame->IncApproximateVisibleCount();
+    return;
+  }
+
+#if defined(DEBUG)
+  nsCOMPtr<nsIContent> content = aFrame->GetContent();
+  if (content) {
+    PresShell* presShell = content->OwnerDoc()->GetPresShell();
+    MOZ_ASSERT(!presShell || presShell == this, "wrong shell");
+  }
+#endif
+
+  if (mApproximatelyVisibleFrames.EnsureInserted(aFrame)) {
+    aFrame->IncApproximateVisibleCount();
+  }
+}
+
+void PresShell::RemoveFrameFromApproximatelyVisibleList(nsIFrame* aFrame) {
+#if defined(DEBUG)
+  nsCOMPtr<nsIContent> content = aFrame->GetContent();
+  if (content) {
+    PresShell* presShell = content->OwnerDoc()->GetPresShell();
+    MOZ_ASSERT(!presShell || presShell == this, "wrong shell");
+  }
+#endif
+
+  if (AssumeAllFramesVisible()) {
+    MOZ_ASSERT(mApproximatelyVisibleFrames.Count() == 0,
+               "Shouldn't have any frames in the table");
+    return;
+  }
+
+  if (mApproximatelyVisibleFrames.EnsureRemoved(aFrame) &&
+      aFrame->TrackingVisibility()) {
+    aFrame->DecApproximateVisibleCount();
+  }
+}
+
+void PresShell::PaintAndRequestComposite(nsIFrame* aFrame,
+                                         WindowRenderer* aRenderer,
+                                         PaintFlags aFlags) {
+  if (!mIsActive) {
+    return;
+  }
+
+  NS_ASSERTION(aRenderer, "Must be in paint event");
+  if (aRenderer->AsFallback()) {
+    if (nsIWidget* widget = aFrame ? aFrame->GetOwnWidget() : nullptr) {
+      auto bounds = widget->GetBounds();
+      widget->Invalidate(LayoutDeviceIntRect({}, bounds.Size()));
+    }
+    return;
+  }
+
+  PaintInternalFlags flags = PaintInternalFlags::None;
+  if (aFlags & PaintFlags::PaintSyncDecodeImages) {
+    flags |= PaintInternalFlags::PaintSyncDecodeImages;
+  }
+  if (aFlags & PaintFlags::PaintCompositeOffscreen) {
+    flags |= PaintInternalFlags::PaintCompositeOffscreen;
+  }
+  PaintInternal(aFrame, aRenderer, flags);
+}
+
+void PresShell::SyncPaintFallback(nsIFrame* aFrame, WindowRenderer* aRenderer) {
+  if (!mIsActive) {
+    return;
+  }
+
+  NS_ASSERTION(aRenderer->AsFallback(),
+               "Can't do Sync paint for remote renderers");
+  if (!aRenderer->AsFallback()) {
+    return;
+  }
+
+  PaintInternal(aFrame, aRenderer, PaintInternalFlags::PaintComposite);
+  GetPresContext()->NotifyDidPaintForSubtree();
+}
+
+void PresShell::PaintInternal(nsIFrame* aFrame, WindowRenderer* aRenderer,
+                              PaintInternalFlags aFlags) {
+  MOZ_ASSERT_IF(aFrame,
+                aFrame->IsViewportFrame() || aFrame->IsMenuPopupFrame());
+  nsCString url;
+  nsIURI* uri = mDocument->GetDocumentURI();
+  Document* contentRoot = GetPrimaryContentDocument();
+  if (contentRoot) {
+    uri = contentRoot->GetDocumentURI();
+  }
+  url = uri ? uri->GetSpecOrDefault() : "N/A"_ns;
+
+  Maybe<js::AutoAssertNoContentJS> nojs;
+
+  if (!(aFlags & PaintInternalFlags::PaintComposite)) {
+    nojs.emplace(dom::danger::GetJSContext());
+  }
+
+  NS_ASSERTION(!mIsDestroying, "painting a destroyed PresShell");
+  NS_ASSERTION(aRenderer, "null renderer");
+
+  MOZ_ASSERT(!mApproximateFrameVisibilityVisited, "Should have been cleared");
+
+  if (!mIsActive) {
+    return;
+  }
+
+  FocusTarget focusTarget;
+  if (StaticPrefs::apz_keyboard_enabled_AtStartup()) {
+    uint64_t focusSequenceNumber = mAPZFocusSequenceNumber;
+    if (nsMenuPopupFrame* popup = do_QueryFrame(aFrame)) {
+      focusSequenceNumber = popup->GetAPZFocusSequenceNumber();
+    }
+    focusTarget = FocusTarget(this, focusSequenceNumber);
+  }
+
+  nsPresContext* presContext = GetPresContext();
+  AUTO_LAYOUT_PHASE_ENTRY_POINT(presContext, Paint);
+
+  WebRenderLayerManager* layerManager = aRenderer->AsWebRender();
+
+  if (mIsFirstPaint && !mPaintingSuppressed) {
+    MOZ_LOG(gLog, LogLevel::Debug,
+            ("PresShell::Paint, first paint, this=%p", this));
+
+    if (layerManager) {
+      layerManager->SetIsFirstPaint();
+    }
+    mIsFirstPaint = false;
+  }
+
+  const bool offscreen =
+      bool(aFlags & PaintInternalFlags::PaintCompositeOffscreen);
+
+  if (!aRenderer->BeginTransaction(url)) {
+    return;
+  }
+
+  if (layerManager) {
+    layerManager->SetFocusTarget(focusTarget);
+  }
+
+  if (aFrame) {
+    if (!(aFlags & PaintInternalFlags::PaintSyncDecodeImages) &&
+        !aFrame->HasAnyStateBits(NS_FRAME_UPDATE_LAYER_TREE)) {
+      if (layerManager) {
+        layerManager->SetTransactionIdAllocator(presContext->RefreshDriver());
+      }
+
+      if (aRenderer->EndEmptyTransaction(
+              (aFlags & PaintInternalFlags::PaintComposite)
+                  ? WindowRenderer::END_DEFAULT
+                  : WindowRenderer::END_NO_COMPOSITE)) {
+        return;
+      }
+    }
+    aFrame->RemoveStateBits(NS_FRAME_UPDATE_LAYER_TREE);
+  }
+
+  nscolor bgcolor = ComputeBackstopColor(aFrame);
+  PaintFrameFlags flags =
+      PaintFrameFlags::WidgetLayers | PaintFrameFlags::ExistingTransaction;
+
+  if (aFlags & PaintInternalFlags::PaintSyncDecodeImages ||
+      mDocument->IsStaticDocument() ||
+      false) {
+    flags |= PaintFrameFlags::SyncDecodeImages;
+  }
+  if (aFlags & PaintInternalFlags::PaintCompositeOffscreen) {
+    flags |= PaintFrameFlags::CompositeOffscreen;
+  }
+  if (aRenderer->GetBackendType() == layers::LayersBackend::LAYERS_WR) {
+    flags |= PaintFrameFlags::ForWebRender;
+  }
+
+  if (aFrame) {
+    SelectionNodeCache cache(*this);
+    nsLayoutUtils::PaintFrame(nullptr, aFrame, nsRegion(), bgcolor,
+                              nsDisplayListBuilderMode::Painting, flags);
+    return;
+  }
+
+  bgcolor = NS_ComposeColors(bgcolor, mCanvasBackground.mViewport.mColor);
+
+  if (aRenderer->GetBackendType() == layers::LayersBackend::LAYERS_WR) {
+    LayoutDeviceRect bounds = LayoutDeviceRect::FromAppUnits(
+        presContext->GetVisibleArea(), presContext->AppUnitsPerDevPixel());
+    WebRenderBackgroundData data(wr::ToLayoutRect(bounds),
+                                 wr::ToColorF(ToDeviceColor(bgcolor)));
+    WrFiltersHolder wrFilters;
+
+    layerManager->SetTransactionIdAllocator(presContext->RefreshDriver());
+    layerManager->EndTransactionWithoutLayer(
+        nullptr, nullptr, std::move(wrFilters), &data, 0, offscreen);
+    return;
+  }
+
+  FallbackRenderer* fallback = aRenderer->AsFallback();
+  MOZ_ASSERT(fallback);
+
+  if (aFlags & PaintInternalFlags::PaintComposite) {
+    nsIntRect bounds = presContext->GetVisibleArea().ToOutsidePixels(
+        presContext->AppUnitsPerDevPixel());
+    fallback->EndTransactionWithColor(bounds, ToDeviceColor(bgcolor));
+  }
+}
+
+void PresShell::SetCapturingContent(nsIContent* aContent, CaptureFlags aFlags,
+                                    WidgetEvent* aEvent) {
+  if (!aContent && sCapturingContentInfo.mPointerLock &&
+      !(aFlags & CaptureFlags::PointerLock)) {
+    return;
+  }
+
+  sCapturingContentInfo.mContent = nullptr;
+  sCapturingContentInfo.mRemoteTarget = nullptr;
+
+  if ((aFlags & CaptureFlags::IgnoreAllowedState) ||
+      sCapturingContentInfo.mAllowed || (aFlags & CaptureFlags::PointerLock)) {
+    if (aContent) {
+      sCapturingContentInfo.mContent = aContent;
+    }
+    if (aEvent) {
+      MOZ_ASSERT(XRE_IsParentProcess());
+      MOZ_ASSERT(aEvent->mMessage == eMouseDown);
+      MOZ_ASSERT(aEvent->HasBeenPostedToRemoteProcess());
+      sCapturingContentInfo.mRemoteTarget =
+          BrowserParent::GetLastMouseRemoteTarget();
+      MOZ_ASSERT(sCapturingContentInfo.mRemoteTarget);
+    }
+    sCapturingContentInfo.mRetargetToElement =
+        !!(aFlags & CaptureFlags::RetargetToElement) ||
+        !!(aFlags & CaptureFlags::PointerLock);
+    sCapturingContentInfo.mPreventDrag =
+        !!(aFlags & CaptureFlags::PreventDragStart);
+    sCapturingContentInfo.mPointerLock = !!(aFlags & CaptureFlags::PointerLock);
+  }
+}
+
+nsIContent* PresShell::GetCurrentEventContent() {
+  if (mCurrentEventTarget.mContent &&
+      mCurrentEventTarget.mContent->GetComposedDoc() != mDocument) {
+    mCurrentEventTarget.Clear();
+  }
+  return mCurrentEventTarget.mContent;
+}
+
+nsIFrame* PresShell::GetCurrentEventFrame() {
+  if (MOZ_UNLIKELY(mIsDestroying)) {
+    return nullptr;
+  }
+
+  nsIContent* content = GetCurrentEventContent();
+  if (!mCurrentEventTarget.mFrame && content) {
+    mCurrentEventTarget.mFrame = content->GetPrimaryFrame();
+    MOZ_ASSERT_IF(
+        mCurrentEventTarget.mFrame,
+        mCurrentEventTarget.mFrame->PresContext()->GetPresShell() == this);
+  }
+  return mCurrentEventTarget.mFrame;
+}
+
+nsIContent* PresShell::GetExplicitEventTargetContent(
+    const WidgetEvent* aEvent ) {
+  nsIContent* content = GetCurrentEventContent();
+  if (!content) {
+    if (nsIFrame* currentEventFrame = GetCurrentEventFrame()) {
+      content = currentEventFrame->GetExplicitEventTargetContent(aEvent);
+      NS_ASSERTION(!content || content->GetComposedDoc() == mDocument,
+                   "handing out content from a different doc");
+    }
+  }
+  return content;
+}
+
+nsIContent* PresShell::GetEventTargetContent(
+    const WidgetEvent* aEvent ) {
+  return nsContentUtils::GetEventTargetContent(
+      GetExplicitEventTargetContent(aEvent), aEvent);
+}
+
+void PresShell::PushCurrentEventInfo(const EventTargetInfo& aInfo) {
+  if (mCurrentEventTarget.IsSet()) {
+    mCurrentEventTargetStack.InsertElementAt(0, std::move(mCurrentEventTarget));
+  }
+  mCurrentEventTarget = aInfo;
+}
+
+void PresShell::PushCurrentEventInfo(EventTargetInfo&& aInfo) {
+  if (mCurrentEventTarget.IsSet()) {
+    mCurrentEventTargetStack.InsertElementAt(0, std::move(mCurrentEventTarget));
+  }
+  mCurrentEventTarget = std::move(aInfo);
+}
+
+void PresShell::PopCurrentEventInfo() {
+  mCurrentEventTarget.Clear();
+
+  if (!mCurrentEventTargetStack.IsEmpty()) {
+    mCurrentEventTarget = std::move(mCurrentEventTargetStack[0]);
+    mCurrentEventTargetStack.RemoveElementAt(0);
+
+    if (mCurrentEventTarget.mContent &&
+        mCurrentEventTarget.mContent->GetComposedDoc() != mDocument) {
+      mCurrentEventTarget.Clear();
+    }
+  }
+}
+
+bool PresShell::EventHandler::InZombieDocument(nsIContent* aContent) {
+  Document* doc = aContent->GetComposedDoc();
+  return !doc || !doc->GetWindow();
+}
+
+already_AddRefed<nsPIDOMWindowOuter> PresShell::GetRootWindow() {
+  nsCOMPtr<nsPIDOMWindowOuter> window = mDocument->GetWindow();
+  if (window) {
+    nsCOMPtr<nsPIDOMWindowOuter> rootWindow = window->GetPrivateRoot();
+    NS_ASSERTION(rootWindow, "nsPIDOMWindow::GetPrivateRoot() returns NULL");
+    return rootWindow.forget();
+  }
+
+  RefPtr<PresShell> parentPresShell = GetParentPresShellForEventHandling();
+  NS_ENSURE_TRUE(parentPresShell, nullptr);
+  return parentPresShell->GetRootWindow();
+}
+
+already_AddRefed<nsPIDOMWindowOuter>
+PresShell::GetFocusedDOMWindowInOurWindow() {
+  nsCOMPtr<nsPIDOMWindowOuter> rootWindow = GetRootWindow();
+  NS_ENSURE_TRUE(rootWindow, nullptr);
+  nsCOMPtr<nsPIDOMWindowOuter> focusedWindow;
+  nsFocusManager::GetFocusedDescendant(rootWindow,
+                                       nsFocusManager::eIncludeAllDescendants,
+                                       getter_AddRefs(focusedWindow));
+  return focusedWindow.forget();
+}
+
+already_AddRefed<nsIContent> PresShell::GetFocusedContentInOurWindow() const {
+  nsFocusManager* fm = nsFocusManager::GetFocusManager();
+  if (fm && mDocument) {
+    RefPtr<Element> focusedElement;
+    fm->GetFocusedElementForWindow(mDocument->GetWindow(), false, nullptr,
+                                   getter_AddRefs(focusedElement));
+    return focusedElement.forget();
+  }
+  return nullptr;
+}
+
+already_AddRefed<PresShell> PresShell::GetParentPresShellForEventHandling() {
+  if (!mPresContext) {
+    return nullptr;
+  }
+
+  RefPtr<nsDocShell> docShell = mPresContext->GetDocShell();
+  if (!docShell) {
+    docShell = mForwardingContainer.get();
+  }
+
+  if (!docShell) {
+    return nullptr;
+  }
+
+  BrowsingContext* bc = docShell->GetBrowsingContext();
+  if (!bc) {
+    return nullptr;
+  }
+
+  RefPtr<BrowsingContext> parentBC;
+  if (XRE_IsParentProcess()) {
+    parentBC = bc->Canonical()->GetParentCrossChromeBoundary();
+  } else {
+    parentBC = bc->GetParent();
+  }
+
+  RefPtr<nsIDocShell> parentDocShell =
+      parentBC ? parentBC->GetDocShell() : nullptr;
+  if (!parentDocShell) {
+    return nullptr;
+  }
+
+  RefPtr<PresShell> parentPresShell = parentDocShell->GetPresShell();
+  return parentPresShell.forget();
+}
+
+nsresult PresShell::EventHandler::RetargetEventToParent(
+    WidgetGUIEvent* aGUIEvent, nsEventStatus* aEventStatus) {
+
+  RefPtr<PresShell> parentPresShell = GetParentPresShellForEventHandling();
+  NS_ENSURE_TRUE(parentPresShell, NS_ERROR_FAILURE);
+
+  return parentPresShell->HandleEvent(parentPresShell->GetRootFrame(),
+                                      aGUIEvent, true, aEventStatus);
+}
+
+void PresShell::DisableNonTestMouseEvents(bool aDisable) {
+  sDisableNonTestMouseEvents = aDisable;
+}
+
+nsPoint PresShell::GetEventLocation(const WidgetMouseEvent& aEvent) const {
+  nsIFrame* rootFrame = GetRootFrame();
+  if (!rootFrame) {
+    return nsPoint(NS_UNCONSTRAINEDSIZE, NS_UNCONSTRAINEDSIZE);
+  }
+
+  RelativeTo relativeTo{rootFrame};
+  if (rootFrame->PresContext()->IsRootContentDocumentCrossProcess()) {
+    relativeTo.mViewportType = ViewportType::Visual;
+  }
+  return nsLayoutUtils::GetEventCoordinatesRelativeTo(&aEvent, relativeTo);
+}
+
+void PresShell::RecordPointerLocation(WidgetGUIEvent* aEvent) {
+  if (!mPresContext) {
+    return;
+  }
+
+  if (!IsRoot()) {
+    PresShell* rootPresShell = GetRootPresShell();
+    if (rootPresShell) {
+      rootPresShell->RecordPointerLocation(aEvent);
+    }
+    return;
+  }
+
+  const auto StoreMouseLocation = [&](const WidgetMouseEvent& aMouseEvent) {
+    if (aMouseEvent.mMessage == eMouseMove && aMouseEvent.IsSynthesized()) {
+      return false;
+    }
+    PointerEventHandler::RecordMouseState(*this, aMouseEvent);
+    mLastMousePointerId = Some(aMouseEvent.pointerId);
+    return true;
+  };
+
+  const auto ClearMouseLocation = [&](const WidgetMouseEvent& aMouseEvent) {
+    PointerEventHandler::ClearMouseState(*this, aMouseEvent);
+    mLastMousePointerId.reset();
+  };
+
+  const auto ClearMouseLocationIfSetByTouch =
+      [&](const WidgetPointerEvent& aPointerEvent) {
+        const PointerInfo* lastMouseInfo =
+            PointerEventHandler::GetLastMouseInfo(this);
+        if (lastMouseInfo && lastMouseInfo->HasLastState() &&
+            lastMouseInfo->mInputSource ==
+                MouseEvent_Binding::MOZ_SOURCE_TOUCH &&
+            aPointerEvent.mInputSource ==
+                MouseEvent_Binding::MOZ_SOURCE_TOUCH) {
+          ClearMouseLocation(aPointerEvent);
+        }
+      };
+
+  const auto StorePointerLocation =
+      [&](const WidgetMouseEvent& aMouseOrPointerEvent) {
+        if (!mPointerIds.Contains(aMouseOrPointerEvent.pointerId)) {
+          mPointerIds.AppendElement(aMouseOrPointerEvent.pointerId);
+        }
+        PointerEventHandler::RecordPointerState(
+            GetEventLocation(aMouseOrPointerEvent), aMouseOrPointerEvent);
+      };
+
+  const auto ClearPointerLocation =
+      [&](const WidgetMouseEvent& aMouseOrPointerEvent) {
+        mPointerIds.RemoveElement(aMouseOrPointerEvent.pointerId);
+        PointerEventHandler::RecordPointerState(
+            nsPoint(NS_UNCONSTRAINEDSIZE, NS_UNCONSTRAINEDSIZE),
+            aMouseOrPointerEvent);
+      };
+
+  const auto StoreLastPointerEventLocation =
+      [&](const WidgetMouseEvent& aMouseOrPointerEvent) {
+        mLastOverWindowPointerLocation = GetEventLocation(aMouseOrPointerEvent);
+      };
+
+  switch (aEvent->mMessage) {
+    case eMouseMove:
+    case eMouseEnterIntoWidget:
+    case eMouseDown:
+    case eMouseUp:
+    case eDragEnter:
+    case eDragStart:
+    case eDragOver:
+    case eDrop: {
+      const WidgetMouseEvent& mouseEvent = *aEvent->AsMouseEvent();
+      if (StoreMouseLocation(mouseEvent) &&
+          (aEvent->mMessage == eMouseEnterIntoWidget ||
+           aEvent->mClass == eDragEventClass)) {
+        SynthesizeMouseMove(false);
+      }
+      if (aEvent->mMessage == eMouseEnterIntoWidget ||
+          aEvent->mClass == eDragEventClass) {
+        StorePointerLocation(mouseEvent);
+      }
+      break;
+    }
+    case eDragExit: {
+      const WidgetMouseEvent& mouseEvent = *aEvent->AsMouseEvent();
+      if (aEvent->mRelatedTarget) {
+        break;
+      }
+      ClearMouseLocation(mouseEvent);
+      ClearPointerLocation(mouseEvent);
+      break;
+    }
+    case eMouseExitFromWidget: {
+      const WidgetMouseEvent& mouseEvent = *aEvent->AsMouseEvent();
+      ClearMouseLocation(mouseEvent);
+      ClearPointerLocation(mouseEvent);
+      break;
+    }
+    case ePointerMove:
+    case ePointerRawUpdate:
+    case eMouseRawUpdate: {
+      const WidgetMouseEvent& mouseEvent = *aEvent->AsMouseEvent();
+      if (!mouseEvent.IsReal()) {
+        break;
+      }
+      StoreLastPointerEventLocation(mouseEvent);
+      if (const WidgetPointerEvent* const pointerEvent =
+              mouseEvent.AsPointerEvent()) {
+        StorePointerLocation(*pointerEvent);
+      }
+      break;
+    }
+    case ePointerDown: {
+      const WidgetPointerEvent& pointerEvent = *aEvent->AsPointerEvent();
+      StoreLastPointerEventLocation(pointerEvent);
+      StorePointerLocation(pointerEvent);
+      break;
+    }
+    case ePointerUp: {
+      const WidgetPointerEvent& pointerEvent = *aEvent->AsPointerEvent();
+      StoreLastPointerEventLocation(pointerEvent);
+      if (pointerEvent.InputSourceSupportsHover()) {
+        StorePointerLocation(pointerEvent);
+      }
+      else {
+        ClearPointerLocation(pointerEvent);
+      }
+      ClearMouseLocationIfSetByTouch(pointerEvent);
+      break;
+    }
+    case ePointerCancel: {
+      ClearMouseLocationIfSetByTouch(*aEvent->AsPointerEvent());
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+void PresShell::RecordModifiers(WidgetGUIEvent* aEvent) {
+  switch (aEvent->mMessage) {
+    case eKeyPress:
+    case eKeyUp:
+    case eKeyDown:
+    case eMouseMove:
+    case eMouseUp:
+    case eMouseDown:
+    case eMouseEnterIntoWidget:
+    case eMouseExitFromWidget:
+    case eMouseActivate:
+    case eMouseTouchDrag:
+    case eMouseLongTap:
+    case eMouseRawUpdate:
+    case eMouseExploreByTouch:
+    case ePointerCancel:
+    case eContextMenu:
+    case eTouchStart:
+    case eTouchMove:
+    case eTouchEnd:
+    case eTouchCancel:
+    case eTouchPointerCancel:
+    case eTouchRawUpdate:
+    case eWheel:
+      sCurrentModifiers = aEvent->AsInputEvent()->mModifiers;
+      break;
+    default:
+      break;
+  }
+}
+
+void PresShell::nsSynthMouseMoveEvent::Revoke() {
+  if (mPresShell) {
+    mPresShell->GetPresContext()->RefreshDriver()->RemoveRefreshObserver(
+        this, FlushType::Display);
+    mPresShell = nullptr;
+  }
+}
+
+static CallState FlushThrottledStyles(Document& aDocument) {
+  PresShell* presShell = aDocument.GetPresShell();
+  if (presShell && presShell->IsVisible()) {
+    if (nsPresContext* presContext = presShell->GetPresContext()) {
+      presContext->RestyleManager()->UpdateOnlyAnimationStyles();
+    }
+  }
+
+  aDocument.EnumerateSubDocuments(FlushThrottledStyles);
+  return CallState::Continue;
+}
+
+bool PresShell::CanDispatchEvent(const WidgetGUIEvent* aEvent) const {
+  bool rv =
+      mPresContext && !mHaveShutDown && nsContentUtils::IsSafeToRunScript();
+  if (aEvent) {
+    rv &= (aEvent && aEvent->mWidget && !aEvent->mWidget->Destroyed());
+  }
+  return rv;
+}
+
+PresShell* PresShell::GetShellForEventTarget(nsIFrame* aFrame,
+                                             nsIContent* aContent) {
+  if (aFrame) {
+    return aFrame->PresShell();
+  }
+  if (aContent) {
+    Document* doc = aContent->GetComposedDoc();
+    if (!doc) {
+      return nullptr;
+    }
+    return doc->GetPresShell();
+  }
+  return nullptr;
+}
+
+PresShell* PresShell::GetShellForTouchEvent(WidgetGUIEvent* aEvent) {
+  switch (aEvent->mMessage) {
+    case eTouchMove:
+    case eTouchRawUpdate:
+    case eTouchCancel:
+    case eTouchEnd: {
+      WidgetTouchEvent* touchEvent = aEvent->AsTouchEvent();
+      for (dom::Touch* touch : touchEvent->mTouches) {
+        if (!touch) {
+          return nullptr;
+        }
+
+        RefPtr<dom::Touch> oldTouch =
+            TouchManager::GetCapturedTouch(touch->Identifier());
+        if (!oldTouch) {
+          return nullptr;
+        }
+
+        nsIContent* const content =
+            nsIContent::FromEventTargetOrNull(oldTouch->GetTarget());
+        if (!content) {
+          return nullptr;
+        }
+
+        if (PresShell* const presShell = content->OwnerDoc()->GetPresShell()) {
+          return presShell;
+        }
+      }
+      return nullptr;
+    }
+    default:
+      return nullptr;
+  }
+}
+
+nsresult PresShell::HandleEvent(nsIFrame* aFrameForPresShell,
+                                WidgetGUIEvent* aGUIEvent,
+                                bool aDontRetargetEvents,
+                                nsEventStatus* aEventStatus) {
+  MOZ_ASSERT(aGUIEvent);
+
+  RecordModifiers(aGUIEvent);
+
+  AutoWeakFrame weakFrameForPresShell(aFrameForPresShell);
+
+  if (aGUIEvent->CameFromAnotherProcess() && XRE_IsContentProcess() &&
+      !aGUIEvent->mFlags.mIsSynthesizedForTests) {
+    const PointerInfo* const lastMouseInfo =
+        PointerEventHandler::GetLastMouseInfo();
+    if (lastMouseInfo && lastMouseInfo->mIsSynthesizedForTests) {
+      switch (aGUIEvent->mMessage) {
+        case eMouseMove:
+        case eMouseExitFromWidget:
+        case eMouseEnterIntoWidget:
+          if (!aGUIEvent->AsMouseEvent()->IsReal()) {
+            return NS_OK;
+          }
+          break;
+        default:
+          break;
+      }
+    }
+  }
+
+  if (!CanHandleUserInputEvents(aGUIEvent)) {
+    return NS_OK;
+  }
+
+  switch (aGUIEvent->mMessage) {
+    case eMouseDown:
+    case eMouseUp: {
+      nsPIDOMWindowOuter* const focusedWindow =
+          nsFocusManager::GetFocusedWindowStatic();
+      if (!focusedWindow) {
+        break;
+      }
+      Document* const focusedDocument = focusedWindow->GetExtantDoc();
+      if (!focusedDocument) {
+        break;
+      }
+      nsPresContext* const focusedPresContext =
+          focusedDocument->GetPresContext();
+      if (!focusedPresContext) {
+        break;
+      }
+      const RefPtr<TextComposition> textComposition =
+          IMEStateManager::GetTextCompositionFor(focusedPresContext);
+      if (!textComposition) {
+        break;
+      }
+      if (RefPtr<EditorBase> editorBase = textComposition->GetEditorBase()) {
+        MOZ_ASSERT(aGUIEvent->AsMouseEvent());
+        editorBase->WillHandleMouseButtonEvent(*aGUIEvent->AsMouseEvent());
+      }
+      else if (nsCOMPtr<nsIWidget> widget = textComposition->GetWidget()) {
+        textComposition->RequestToCommit(widget, false);
+      }
+      if (!CanHandleUserInputEvents(aGUIEvent)) {
+        return NS_OK;
+      }
+      if (MOZ_UNLIKELY(!weakFrameForPresShell.IsAlive())) {
+        FlushPendingNotifications(FlushType::Layout);
+        if (MOZ_UNLIKELY(IsDestroying())) {
+          return NS_OK;
+        }
+        nsIFrame* const newFrameForPresShell = GetRootFrame();
+        if (MOZ_UNLIKELY(!newFrameForPresShell)) {
+          return NS_OK;
+        }
+        weakFrameForPresShell = newFrameForPresShell;
+      }
+      break;
+    }
+    default:
+      break;
+  }
+
+  if (mPresContext) {
+    switch (aGUIEvent->mMessage) {
+      case eMouseMove:
+      case eMouseRawUpdate:
+        if (!aGUIEvent->AsMouseEvent()->IsReal()) {
+          break;
+        }
+        [[fallthrough]];
+      case eMouseDown:
+      case eMouseUp: {
+        const RefPtr<PresShell> rootPresShell =
+            IsRoot() ? this : GetRootPresShell();
+        if (rootPresShell && rootPresShell->mSynthMouseMoveEvent.IsPending()) {
+          RefPtr<nsSynthMouseMoveEvent> synthMouseMoveEvent =
+              rootPresShell->mSynthMouseMoveEvent.get();
+          synthMouseMoveEvent->Run();
+          if (IsDestroying()) {
+            return NS_OK;
+          }
+          if (MOZ_UNLIKELY(!weakFrameForPresShell.IsAlive())) {
+            return NS_OK;
+          }
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  if (!aDontRetargetEvents &&
+      StaticPrefs::dom_event_pointer_rawupdate_enabled()) {
+    nsresult rv = EnsurePrecedingPointerRawUpdate(
+        weakFrameForPresShell, *aGUIEvent, aDontRetargetEvents);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    if (!CanHandleUserInputEvents(aGUIEvent)) {
+      return NS_OK;
+    }
+  }
+
+  EventHandler eventHandler(*this);
+  return eventHandler.HandleEvent(weakFrameForPresShell, aGUIEvent,
+                                  aDontRetargetEvents, aEventStatus);
+}
+
+nsresult PresShell::EnsurePrecedingPointerRawUpdate(
+    AutoWeakFrame& aWeakFrameForPresShell, const WidgetGUIEvent& aSourceEvent,
+    bool aDontRetargetEvents) {
+  MOZ_ASSERT(StaticPrefs::dom_event_pointer_rawupdate_enabled());
+  if (PointerEventHandler::ToPointerEventMessage(&aSourceEvent) !=
+      ePointerMove) {
+    return NS_OK;
+  }
+
+
+  MOZ_ASSERT(aSourceEvent.mMessage != eMouseRawUpdate);
+  MOZ_ASSERT(aSourceEvent.mMessage != eTouchRawUpdate);
+
+  if (auto* const browserChild = BrowserChild::GetFrom(this)) {
+    if (!browserChild->HasPointerRawUpdateEventListeners()) {
+      return NS_OK;
+    }
+  }
+
+  if (const WidgetMouseEvent* const mouseEvent = aSourceEvent.AsMouseEvent()) {
+    if (mouseEvent->IsSynthesized() || !mouseEvent->convertToPointer ||
+        !mouseEvent->convertToPointerRawUpdate) {
+      return NS_OK;
+    }
+    WidgetMouseEvent mouseRawUpdateEvent(*mouseEvent);
+    mouseRawUpdateEvent.mMessage = eMouseRawUpdate;
+    mouseRawUpdateEvent.mCoalescedWidgetEvents = nullptr;
+    if (mouseEvent->mMessage != eMouseDown &&
+        mouseEvent->mMessage != eMouseUp) {
+      mouseRawUpdateEvent.mButton = MouseButton::eNotPressed;
+    }
+    nsEventStatus rawUpdateStatus = nsEventStatus_eIgnore;
+    EventHandler eventHandler(*this);
+    return eventHandler.HandleEvent(aWeakFrameForPresShell,
+                                    &mouseRawUpdateEvent, aDontRetargetEvents,
+                                    &rawUpdateStatus);
+  }
+  if (const WidgetTouchEvent* const touchEvent = aSourceEvent.AsTouchEvent()) {
+    WidgetTouchEvent touchRawUpdate(*touchEvent,
+                                    WidgetTouchEvent::CloneTouches::No);
+    touchRawUpdate.mMessage = eTouchRawUpdate;
+    touchRawUpdate.mTouches.Clear();
+    for (const RefPtr<Touch>& touch : touchEvent->mTouches) {
+      if (!touch->convertToPointerRawUpdate ||
+          !TouchManager::ShouldConvertTouchToPointer(touch, &touchRawUpdate)) {
+        continue;
+      }
+      auto newTouch = MakeRefPtr<Touch>(*touch);
+      newTouch->mMessage = eTouchRawUpdate;
+      newTouch->mCoalescedWidgetEvents = nullptr;
+      touchRawUpdate.mTouches.AppendElement(std::move(newTouch));
+    }
+    nsEventStatus rawUpdateStatus = nsEventStatus_eIgnore;
+    if (touchRawUpdate.mTouches.IsEmpty()) {
+      return NS_OK;
+    }
+    EventHandler eventHandler(*this);
+    return eventHandler.HandleEvent(aWeakFrameForPresShell, &touchRawUpdate,
+                                    aDontRetargetEvents, &rawUpdateStatus);
+  }
+  MOZ_ASSERT_UNREACHABLE("Handle the event to dispatch ePointerRawUpdate");
+  return NS_OK;
+}
+
+bool PresShell::EventHandler::UpdateFocusSequenceNumber(
+    nsIFrame* aFrameForPresShell, uint64_t aEventFocusSequenceNumber) {
+  uint64_t focusSequenceNumber;
+  nsMenuPopupFrame* popup = do_QueryFrame(aFrameForPresShell);
+  if (popup) {
+    focusSequenceNumber = popup->GetAPZFocusSequenceNumber();
+  } else {
+    focusSequenceNumber = mPresShell->mAPZFocusSequenceNumber;
+  }
+  if (focusSequenceNumber >= aEventFocusSequenceNumber) {
+    return false;
+  }
+
+  if (popup) {
+    popup->UpdateAPZFocusSequenceNumber(aEventFocusSequenceNumber);
+  } else {
+    mPresShell->mAPZFocusSequenceNumber = aEventFocusSequenceNumber;
+  }
+  return true;
+}
+
+nsresult PresShell::EventHandler::HandleEvent(
+    AutoWeakFrame& aWeakFrameForPresShell, WidgetGUIEvent* aGUIEvent,
+    bool aDontRetargetEvents, nsEventStatus* aEventStatus) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_DIAGNOSTIC_ASSERT(aGUIEvent->IsTrusted());
+  MOZ_ASSERT(aEventStatus);
+
+  NS_ASSERTION(aWeakFrameForPresShell.IsAlive(),
+               "aWeakFrameForPresShell should refer a frame");
+
+  if (UpdateFocusSequenceNumber(aWeakFrameForPresShell.GetFrame(),
+                                aGUIEvent->mFocusSequenceNumber)) {
+    if (aWeakFrameForPresShell.IsAlive() &&
+        StaticPrefs::apz_keyboard_focus_optimization()) {
+      aWeakFrameForPresShell->SchedulePaint(nsIFrame::PAINT_COMPOSITE_ONLY);
+    }
+  }
+
+  if (mPresShell->IsDestroying() ||
+      (PresShell::sDisableNonTestMouseEvents &&
+       !aGUIEvent->mFlags.mIsSynthesizedForTests &&
+       aGUIEvent->HasMouseEventMessage())) {
+    return NS_OK;
+  }
+
+  mPresShell->RecordPointerLocation(aGUIEvent);
+
+  const bool wasFrameForPresShellNull = !aWeakFrameForPresShell.GetFrame();
+  if (MaybeHandleEventWithAccessibleCaret(aWeakFrameForPresShell, aGUIEvent,
+                                          aEventStatus)) {
+    return NS_OK;
+  }
+
+  if (MaybeDiscardEvent(aGUIEvent)) {
+    return NS_OK;
+  }
+
+  if (!aDontRetargetEvents) {
+    const DebugOnly<bool> wasFrameForPresShellAlive =
+        aWeakFrameForPresShell.IsAlive();
+    nsresult rv = NS_OK;
+    if (MaybeHandleEventWithAnotherPresShell(aWeakFrameForPresShell, aGUIEvent,
+                                             aEventStatus, &rv)) {
+      return rv;
+    }
+    MOZ_ASSERT_IF(wasFrameForPresShellAlive, aWeakFrameForPresShell.IsAlive());
+  }
+
+  if (MaybeDiscardOrDelayKeyboardEvent(aGUIEvent)) {
+    return NS_OK;
+  }
+
+  if (aGUIEvent->IsUsingCoordinates()) {
+    return HandleEventUsingCoordinates(aWeakFrameForPresShell, aGUIEvent,
+                                       aEventStatus, aDontRetargetEvents);
+  }
+
+  if (MOZ_UNLIKELY(wasFrameForPresShellNull)) {
+    if (!NS_EVENT_NEEDS_FRAME(aGUIEvent)) {
+      AutoCurrentEventInfoSetter eventInfoSetter(*this);
+      return HandleEventWithCurrentEventInfo(aGUIEvent, aEventStatus, true,
+                                             nullptr);
+    }
+
+    if (aGUIEvent->HasKeyEventMessage()) {
+      return RetargetEventToParent(aGUIEvent, aEventStatus);
+    }
+
+    return NS_OK;
+  }
+
+  if (aGUIEvent->IsTargetedAtFocusedContent()) {
+    return HandleEventAtFocusedContent(aGUIEvent, aEventStatus);
+  }
+
+  return HandleEventWithFrameForPresShell(aWeakFrameForPresShell, aGUIEvent,
+                                          aEventStatus);
+}
+
+nsresult PresShell::EventHandler::HandleEventUsingCoordinates(
+    AutoWeakFrame& aWeakFrameForPresShell, WidgetGUIEvent* aGUIEvent,
+    nsEventStatus* aEventStatus, bool aDontRetargetEvents) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(aGUIEvent->IsUsingCoordinates());
+  MOZ_ASSERT(aEventStatus);
+
+  MaybeFlushPendingNotifications(aGUIEvent);
+  if (MOZ_UNLIKELY(!aWeakFrameForPresShell.IsAlive())) {
+    *aEventStatus = nsEventStatus_eIgnore;
+    return NS_OK;
+  }
+
+  if (aGUIEvent->mMessage == eMouseRawUpdate ||
+      aGUIEvent->mMessage == eTouchRawUpdate) {
+    EventTargetDataWithCapture eventTargetData =
+        EventTargetDataWithCapture::QueryEventTargetUsingCoordinates(
+            *this, aWeakFrameForPresShell,
+            EventTargetDataWithCapture::Query::PendingState, aGUIEvent);
+    if (!PointerEventHandler::NeedToDispatchPointerRawUpdate(
+            eventTargetData.GetDocument())) {
+      return NS_OK;
+    }
+  }
+
+  EventTargetDataWithCapture eventTargetData =
+      EventTargetDataWithCapture::QueryEventTargetUsingCoordinates(
+          *this, aWeakFrameForPresShell,
+          EventTargetDataWithCapture::Query::LatestState, aGUIEvent,
+          aEventStatus);
+  if (MOZ_UNLIKELY(!eventTargetData.CanHandleEvent())) {
+    return NS_OK;
+  }
+  if (MOZ_UNLIKELY(!eventTargetData.GetFrame())) {
+    if (eventTargetData.mPointerCapturingElement &&
+        aWeakFrameForPresShell.IsAlive()) {
+      return HandleEventWithPointerCapturingContentWithoutItsFrame(
+          aWeakFrameForPresShell, aGUIEvent,
+          MOZ_KnownLive(eventTargetData.mPointerCapturingElement),
+          aEventStatus);
+    }
+    return NS_OK;
+  }
+
+  if (MaybeDiscardOrDelayMouseEvent(eventTargetData.GetFrame(), aGUIEvent)) {
+    return NS_OK;
+  }
+
+  if (eventTargetData.MaybeRetargetToActiveDocument(aGUIEvent) &&
+      NS_WARN_IF(!eventTargetData.GetFrame())) {
+    return NS_OK;
+  }
+
+  eventTargetData.UpdateWheelEventTarget(aGUIEvent);
+
+  if (!eventTargetData.ComputeElementFromFrame(aGUIEvent)) {
+    return NS_OK;
+  }
+
+  if (!DispatchPrecedingPointerEvent(
+          aWeakFrameForPresShell, aGUIEvent,
+          MOZ_KnownLive(eventTargetData.mPointerCapturingElement),
+          aDontRetargetEvents, &eventTargetData, aEventStatus)) {
+    return NS_OK;
+  }
+
+  EventHandler eventHandler(*eventTargetData.mPresShell);
+  AutoCurrentEventInfoSetter eventInfoSetter(eventHandler, aGUIEvent->mMessage,
+                                             eventTargetData);
+  nsresult rv = eventHandler.HandleEventWithCurrentEventInfo(
+      aGUIEvent, aEventStatus, true,
+      MOZ_KnownLive(eventTargetData.mOverrideClickTarget));
+  if (NS_FAILED(rv) ||
+      MOZ_UNLIKELY(eventTargetData.mPresShell->IsDestroying())) {
+    return rv;
+  }
+
+  if (aGUIEvent->mMessage == eTouchEnd) {
+    MaybeSynthesizeCompatMouseEventsForTouchEnd(aGUIEvent->AsTouchEvent(),
+                                                aEventStatus);
+  }
+
+  return NS_OK;
+}
+
+PresShell::EventHandler::EventTargetDataWithCapture::EventTargetDataWithCapture(
+    EventHandler& aEventHandler, AutoWeakFrame& aWeakFrameForPresShell,
+    Query aQueryState, WidgetGUIEvent* aGUIEvent,
+    nsEventStatus* aEventStatus )
+    : EventTargetData(aWeakFrameForPresShell.GetFrame()) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(aGUIEvent->IsUsingCoordinates());
+  MOZ_ASSERT_IF(aQueryState == Query::PendingState,
+                aGUIEvent->mMessage != eMouseDown);
+  MOZ_ASSERT_IF(aQueryState == Query::PendingState,
+                aGUIEvent->mMessage != eMouseUp);
+
+  const bool queryLatestState = aQueryState == Query::LatestState;
+
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+  nsMutationGuard mutationGuard;
+  const auto assertMutation = MakeScopeExit([&]() {
+    if (!queryLatestState) {
+      MOZ_DIAGNOSTIC_ASSERT(!mutationGuard.Mutated(0));
+    }
+  });
+  Maybe<JS::AutoAssertNoGC> assertNoGC;
+  if (!queryLatestState) {
+    assertNoGC.emplace();
+  }
+#endif
+
+  mCapturingContent = EventHandler::GetCapturingContentFor(aGUIEvent);
+  if (queryLatestState) {
+    if (GetDocument() && aGUIEvent->mClass == eTouchEventClass) {
+      PointerLockManager::Unlock("TouchEvent");
+    }
+    aEventHandler.MaybeFlushThrottledStyles(aWeakFrameForPresShell);
+    if (MOZ_UNLIKELY(!aWeakFrameForPresShell.IsAlive())) {
+      Clear();
+      MOZ_ASSERT(!CanHandleEvent());
+      return;
+    }
+  }
+
+  AutoWeakFrame weakRootFrameToHandleEvent =
+      aEventHandler.ComputeRootFrameToHandleEvent(
+          aWeakFrameForPresShell.GetFrame(), aGUIEvent, mCapturingContent,
+          &mCapturingContentIgnored, &mCaptureRetargeted);
+  if (mCapturingContentIgnored) {
+    mCapturingContent = nullptr;
+  }
+
+
+  if (queryLatestState) {
+    PointerEventHandler::MaybeProcessPointerCapture(aGUIEvent);
+    if (NS_WARN_IF(!weakRootFrameToHandleEvent.IsAlive())) {
+      Clear();
+      MOZ_ASSERT(!CanHandleEvent());
+      return;
+    }
+  }
+
+  mPointerCapturingElement =
+      queryLatestState
+          ? PointerEventHandler::GetPointerCapturingElement(aGUIEvent)
+          : PointerEventHandler::GetPendingPointerCapturingElement(aGUIEvent);
+
+  if (mPointerCapturingElement) {
+    weakRootFrameToHandleEvent = mPointerCapturingElement->GetPrimaryFrame();
+    if (!weakRootFrameToHandleEvent.IsAlive()) {
+      ClearFrameToHandleEvent();
+      MOZ_ASSERT(CanHandleEvent());
+      return;
+    }
+  }
+
+  const WidgetMouseEvent* mouseEvent = aGUIEvent->AsMouseEvent();
+  const bool isWindowLevelMouseExit =
+      (aGUIEvent->mMessage == eMouseExitFromWidget) &&
+      (mouseEvent &&
+       (mouseEvent->mExitFrom.value() == WidgetMouseEvent::ePlatformTopLevel ||
+        mouseEvent->mExitFrom.value() == WidgetMouseEvent::ePuppet));
+
+  SetFrameAndComputePresShell(weakRootFrameToHandleEvent.GetFrame());
+  if (!mCaptureRetargeted && !isWindowLevelMouseExit &&
+      !mPointerCapturingElement) {
+    if (!aEventHandler.ComputeEventTargetFrameAndPresShellAtEventPoint(
+            weakRootFrameToHandleEvent, aGUIEvent, this)) {
+      Clear();
+      MOZ_ASSERT(!CanHandleEvent());
+      if (aEventStatus) {
+        *aEventStatus = nsEventStatus_eIgnore;
+      }
+      return;
+    }
+  }
+
+  if (mCapturingContent && !mPointerCapturingElement &&
+      (PresShell::sCapturingContentInfo.mRetargetToElement ||
+       !GetFrameContent() ||
+       !nsContentUtils::ContentIsCrossDocDescendantOf(GetFrameContent(),
+                                                      mCapturingContent))) {
+    if (nsIFrame* const capturingFrame = mCapturingContent->GetPrimaryFrame()) {
+      SetFrameAndComputePresShell(capturingFrame);
+    }
+  }
+
+  MOZ_ASSERT(CanHandleEvent());
+}
+
+bool PresShell::EventHandler::MaybeFlushPendingNotifications(
+    WidgetGUIEvent* aGUIEvent) {
+  MOZ_ASSERT(aGUIEvent);
+
+  switch (aGUIEvent->mMessage) {
+    case eMouseDown:
+    case eMouseUp:  
+    {
+      if (NS_WARN_IF(!mPresShell->GetPresContext())) {
+        return false;
+      }
+      MOZ_KnownLive(mPresShell)->FlushPendingNotifications(FlushType::Layout);
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+static ViewportType ViewportTypeForInputEventsRelativeToRoot() {
+  return ViewportType::Visual;
+}
+
+nsIFrame* PresShell::EventHandler::GetFrameToHandleNonTouchEvent(
+    AutoWeakFrame& aWeakRootFrameToHandleEvent, WidgetGUIEvent* aGUIEvent) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(aGUIEvent->mClass != eTouchEventClass);
+
+  if (MOZ_UNLIKELY(!aWeakRootFrameToHandleEvent.IsAlive())) {
+    return nullptr;
+  }
+
+  Document* doc = GetDocument();
+  if (MOZ_UNLIKELY(doc && doc->RenderingSuppressedForViewTransitions())) {
+    Element* root = doc->GetRootElement();
+    return root ? root->GetPrimaryFrame() : nullptr;
+  }
+
+  ViewportType viewportType = ViewportType::Layout;
+  if (aWeakRootFrameToHandleEvent->Type() == LayoutFrameType::Viewport) {
+    nsPresContext* pc = aWeakRootFrameToHandleEvent->PresContext();
+    if (pc->IsChrome()) {
+      viewportType = ViewportType::Visual;
+    } else if (pc->IsRootContentDocumentCrossProcess()) {
+      viewportType = ViewportTypeForInputEventsRelativeToRoot();
+    }
+  }
+  RelativeTo relativeTo{aWeakRootFrameToHandleEvent.GetFrame(), viewportType};
+  nsPoint eventPoint =
+      nsLayoutUtils::GetEventCoordinatesRelativeTo(aGUIEvent, relativeTo);
+
+  uint32_t flags = 0;
+  if (aGUIEvent->IsMouseEventClassOrHasClickRelatedPointerEvent()) {
+    WidgetMouseEvent* mouseEvent = aGUIEvent->AsMouseEvent();
+    if (mouseEvent && mouseEvent->mIgnoreRootScrollFrame) {
+      flags |= INPUT_IGNORE_ROOT_SCROLL_FRAME;
+    }
+  }
+
+  nsIFrame* targetFrame =
+      FindFrameTargetedByInputEvent(aGUIEvent, relativeTo, eventPoint, flags);
+  if (!targetFrame) {
+    return aWeakRootFrameToHandleEvent.GetFrame();
+  }
+
+  if (targetFrame->PresShell() == mPresShell) {
+    return targetFrame;
+  }
+
+  PresShell* childPresShell = targetFrame->PresShell();
+  EventHandler childEventHandler(*childPresShell);
+  const AutoWeakFrame targetFrameWeak(targetFrame);
+  const DebugOnly<bool> flushedPendingNotifications =
+      childEventHandler.MaybeFlushPendingNotifications(aGUIEvent);
+  if (!aWeakRootFrameToHandleEvent.IsAlive()) {
+    return nullptr;
+  }
+  if (targetFrameWeak.IsAlive()) {
+    return targetFrame;
+  }
+  MOZ_ASSERT(flushedPendingNotifications);
+
+  targetFrame =
+      FindFrameTargetedByInputEvent(aGUIEvent, relativeTo, eventPoint, flags);
+
+  return targetFrame ? targetFrame : aWeakRootFrameToHandleEvent.GetFrame();
+}
+
+bool PresShell::EventHandler::ComputeEventTargetFrameAndPresShellAtEventPoint(
+    AutoWeakFrame& aWeakRootFrameToHandleEvent, WidgetGUIEvent* aGUIEvent,
+    EventTargetData* aEventTargetData) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(aEventTargetData);
+
+  if (aGUIEvent->mClass == eTouchEventClass) {
+    nsIFrame* targetFrameAtTouchEvent = TouchManager::SetupTarget(
+        aGUIEvent->AsTouchEvent(), aWeakRootFrameToHandleEvent.GetFrame());
+    aEventTargetData->SetFrameAndComputePresShell(targetFrameAtTouchEvent);
+    return true;
+  }
+
+  nsIFrame* targetFrame =
+      GetFrameToHandleNonTouchEvent(aWeakRootFrameToHandleEvent, aGUIEvent);
+  aEventTargetData->SetFrameAndComputePresShell(targetFrame);
+  return !!aEventTargetData->GetFrame();
+}
+
+bool PresShell::EventHandler::DispatchPrecedingPointerEvent(
+    AutoWeakFrame& aWeakFrameForPresShell, WidgetGUIEvent* aGUIEvent,
+    Element* aPointerCapturingElement, bool aDontRetargetEvents,
+    EventTargetData* aEventTargetData, nsEventStatus* aEventStatus) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(aEventTargetData);
+  MOZ_ASSERT(aEventStatus);
+
+  auto targetFrameOrError = [&]() -> Result<nsIFrame*, nsresult> {
+    if (aGUIEvent->mClass == eTouchEventClass) {
+      if (MOZ_UNLIKELY(!aWeakFrameForPresShell.IsAlive())) {
+        return Err(NS_ERROR_FAILURE);
+      }
+      return aWeakFrameForPresShell.GetFrame();
+    }
+    return aEventTargetData->GetFrame();
+  }();
+  if (MOZ_UNLIKELY(targetFrameOrError.isErr())) {
+    return false;
+  }
+  nsIFrame* targetFrame = targetFrameOrError.unwrap();
+
+  if (aPointerCapturingElement) {
+    Result<nsIContent*, nsresult> overrideClickTargetOrError =
+        GetOverrideClickTarget(aGUIEvent, aWeakFrameForPresShell.GetFrame(),
+                               aPointerCapturingElement);
+    if (MOZ_UNLIKELY(overrideClickTargetOrError.isErr())) {
+      return false;
+    }
+    aEventTargetData->mOverrideClickTarget =
+        overrideClickTargetOrError.unwrap();
+    aEventTargetData->mPresShell =
+        PresShell::GetShellForEventTarget(nullptr, aPointerCapturingElement);
+    if (!aEventTargetData->mPresShell) {
+      PointerEventHandler::ReleaseIfCaptureByDescendant(
+          aPointerCapturingElement);
+      return false;
+    }
+
+    targetFrame = aPointerCapturingElement->GetPrimaryFrame();
+    aEventTargetData->SetFrameAndContent(targetFrame, aPointerCapturingElement);
+  }
+
+  AutoWeakFrame weakTargetFrame(targetFrame);
+  AutoWeakFrame weakFrame(aEventTargetData->GetFrame());
+  nsCOMPtr<nsIContent> pointerEventTargetContent(
+      aEventTargetData->GetContent());
+  RefPtr<PresShell> presShell(aEventTargetData->mPresShell);
+  nsCOMPtr<nsIContent> mouseOrTouchEventTargetContent;
+  PointerEventHandler::DispatchPointerFromMouseOrTouch(
+      presShell, aEventTargetData->GetFrame(), pointerEventTargetContent,
+      aPointerCapturingElement, aGUIEvent, aDontRetargetEvents, aEventStatus,
+      getter_AddRefs(mouseOrTouchEventTargetContent));
+
+  const bool maybeCallerCanHandleEvent =
+      aGUIEvent->mMessage != eMouseRawUpdate &&
+      aGUIEvent->mMessage != eTouchRawUpdate;
+
+  if (weakTargetFrame.IsAlive() && weakFrame.IsAlive()) {
+    aEventTargetData->UpdateTouchEventTarget(aGUIEvent);
+    return maybeCallerCanHandleEvent;
+  }
+
+  presShell->FlushPendingNotifications(FlushType::Layout);
+  if (MOZ_UNLIKELY(mPresShell->IsDestroying())) {
+    return false;
+  }
+
+
+  if (!mouseOrTouchEventTargetContent) {
+    MOZ_ASSERT(aGUIEvent->IsMouseEventClassOrHasClickRelatedPointerEvent());
+    return false;
+  }
+
+  aEventTargetData->SetFrameAndContent(
+      mouseOrTouchEventTargetContent->GetPrimaryFrame(),
+      mouseOrTouchEventTargetContent);
+  aEventTargetData->mPresShell =
+      mouseOrTouchEventTargetContent->IsInComposedDoc()
+          ? PresShell::GetShellForEventTarget(aEventTargetData->GetFrame(),
+                                              aEventTargetData->GetContent())
+          : mouseOrTouchEventTargetContent->OwnerDoc()->GetPresShell();
+
+  if (!aEventTargetData->mPresShell) {
+    return false;
+  }
+
+  aEventTargetData->UpdateTouchEventTarget(aGUIEvent);
+  return maybeCallerCanHandleEvent;
+}
+
+class AutoEventTargetPointResetter {
+ public:
+  explicit AutoEventTargetPointResetter(WidgetGUIEvent* aGUIEvent)
+      : mGUIEvent(aGUIEvent),
+        mRefPoint(aGUIEvent->mRefPoint),
+        mHandledByAccessibleCaret(false) {}
+
+  void SetHandledByAccessibleCaret() { mHandledByAccessibleCaret = true; }
+
+  ~AutoEventTargetPointResetter() {
+    if (!mHandledByAccessibleCaret) {
+      mGUIEvent->mRefPoint = mRefPoint;
+    }
+  }
+
+ private:
+  WidgetGUIEvent* mGUIEvent;
+  LayoutDeviceIntPoint mRefPoint;
+  bool mHandledByAccessibleCaret;
+};
+
+bool PresShell::EventHandler::MaybeHandleEventWithAccessibleCaret(
+    AutoWeakFrame& aWeakFrameForPresShell, WidgetGUIEvent* aGUIEvent,
+    nsEventStatus* aEventStatus) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(aEventStatus);
+
+  if (*aEventStatus == nsEventStatus_eConsumeNoDefault) {
+    return false;
+  }
+
+  if (!AccessibleCaretEnabled(GetDocument()->GetDocShell())) {
+    return false;
+  }
+
+  if (!aGUIEvent->IsMouseEventClassOrHasClickRelatedPointerEvent() &&
+      aGUIEvent->mClass != eTouchEventClass &&
+      aGUIEvent->mClass != eKeyboardEventClass) {
+    return false;
+  }
+
+  AccessibleCaretEventHub* alreadyHandledEventHub = nullptr;
+
+  AutoEventTargetPointResetter autoEventTargetPointResetter(aGUIEvent);
+  do {
+    EventTargetData eventTargetData(nullptr);
+    if (!ComputeEventTargetFrameAndPresShellAtEventPoint(
+            aWeakFrameForPresShell, aGUIEvent, &eventTargetData)) {
+      break;
+    }
+
+    if (!eventTargetData.mPresShell) {
+      break;
+    }
+
+    RefPtr<AccessibleCaretEventHub> eventHub =
+        eventTargetData.mPresShell->GetAccessibleCaretEventHub();
+    if (!eventHub) {
+      break;
+    }
+    alreadyHandledEventHub = eventHub.get();
+
+    *aEventStatus = eventHub->HandleEvent(aGUIEvent);
+    if (*aEventStatus != nsEventStatus_eConsumeNoDefault) {
+      break;
+    }
+
+    aGUIEvent->mFlags.mMultipleActionsPrevented = true;
+    autoEventTargetPointResetter.SetHandledByAccessibleCaret();
+    return true;
+  } while (false);
+
+  nsCOMPtr<nsPIDOMWindowOuter> window = GetFocusedDOMWindowInOurWindow();
+  if (!window) {
+    return false;
+  }
+  RefPtr<Document> retargetEventDoc = window->GetExtantDoc();
+  if (!retargetEventDoc) {
+    return false;
+  }
+  RefPtr<PresShell> presShell = retargetEventDoc->GetPresShell();
+  if (!presShell) {
+    return false;
+  }
+
+  RefPtr<AccessibleCaretEventHub> eventHub =
+      presShell->GetAccessibleCaretEventHub();
+  if (!eventHub || eventHub.get() == alreadyHandledEventHub) {
+    return false;
+  }
+  *aEventStatus = eventHub->HandleEvent(aGUIEvent);
+  if (*aEventStatus != nsEventStatus_eConsumeNoDefault) {
+    return false;
+  }
+  aGUIEvent->mFlags.mMultipleActionsPrevented = true;
+  autoEventTargetPointResetter.SetHandledByAccessibleCaret();
+  return true;
+}
+
+void PresShell::EventHandler::MaybeSynthesizeCompatMouseEventsForTouchEnd(
+    const WidgetTouchEvent* aTouchEndEvent,
+    const nsEventStatus* aStatus) const {
+  MOZ_ASSERT(aTouchEndEvent->mMessage == eTouchEnd);
+
+  if (!aTouchEndEvent->mFlags.mIsSynthesizedForTests ||
+      false) {
+    return;
+  }
+
+  auto cleanUpPointerCapturingElementAtLastPointerUp = MakeScopeExit([]() {
+    PointerEventHandler::ReleasePointerCapturingElementAtLastPointerUp();
+  });
+
+  if (*aStatus == nsEventStatus_eConsumeNoDefault ||
+      !TouchManager::IsSingleTapEndToDoDefault(aTouchEndEvent)) {
+    return;
+  }
+
+  if (NS_WARN_IF(!aTouchEndEvent->mWidget)) {
+    return;
+  }
+
+  nsCOMPtr<nsIWidget> widget = aTouchEndEvent->mWidget;
+
+  RefPtr<PresShell> presShell = mPresShell;
+  for (const EventMessage message : {eMouseMove, eMouseDown, eMouseUp}) {
+    if (MOZ_UNLIKELY(presShell->IsDestroying())) {
+      break;
+    }
+    nsIFrame* const frameForPresShell = presShell->GetRootFrame();
+    if (!frameForPresShell) {
+      break;
+    }
+    WidgetMouseEvent event(true, message, widget, WidgetMouseEvent::eReal);
+    event.mFlags.mIsSynthesizedForTests =
+        aTouchEndEvent->mFlags.mIsSynthesizedForTests;
+    event.mRefPoint = aTouchEndEvent->mTouches[0]->mRefPoint;
+    event.mButton = MouseButton::ePrimary;
+    event.mButtons = message == eMouseDown ? MouseButtonsFlag::ePrimaryFlag
+                                           : MouseButtonsFlag::eNoButtons;
+    event.mInputSource = MouseEvent_Binding::MOZ_SOURCE_TOUCH;
+    event.mClickCount = message == eMouseMove ? 0 : 1;
+    event.mModifiers = aTouchEndEvent->mModifiers;
+    event.pointerId = aTouchEndEvent->mTouches[0]->mIdentifier;
+    event.convertToPointer = false;
+    if (TouchManager::IsPrecedingTouchPointerDownConsumedByContent()) {
+      event.PreventDefault(false);
+      event.mFlags.mOnlyChromeDispatch = true;
+    }
+    nsEventStatus mouseEventStatus = nsEventStatus_eIgnore;
+    presShell->HandleEvent(frameForPresShell, &event, false, &mouseEventStatus);
+  }
+}
+
+bool PresShell::EventHandler::MaybeDiscardEvent(WidgetGUIEvent* aGUIEvent) {
+  MOZ_ASSERT(aGUIEvent);
+
+  if (nsContentUtils::IsSafeToRunScript()) {
+    return false;
+  }
+
+  if (!aGUIEvent->IsAllowedToDispatchDOMEvent()) {
+    return false;
+  }
+
+  if (aGUIEvent->mClass == eCompositionEventClass) {
+    IMEStateManager::OnCompositionEventDiscarded(
+        aGUIEvent->AsCompositionEvent());
+  }
+
+#if defined(DEBUG)
+  if (aGUIEvent->IsIMERelatedEvent()) {
+    nsPrintfCString warning("%s event is discarded",
+                            ToChar(aGUIEvent->mMessage));
+    NS_WARNING(warning.get());
+  }
+#endif
+
+  nsContentUtils::WarnScriptWasIgnored(GetDocument());
+  return true;
+}
+
+nsIContent* PresShell::EventHandler::GetCapturingContentFor(
+    WidgetGUIEvent* aGUIEvent) {
+  if (aGUIEvent->mClass != ePointerEventClass &&
+      aGUIEvent->mClass != eWheelEventClass &&
+      !aGUIEvent->HasMouseEventMessage()) {
+    return nullptr;
+  }
+
+  if (aGUIEvent->ShouldIgnoreCapturingContent()) {
+    return nullptr;
+  }
+
+  return PresShell::GetCapturingContent();
+}
+
+bool PresShell::EventHandler::GetRetargetEventDocument(
+    WidgetGUIEvent* aGUIEvent, Document** aRetargetEventDocument) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(aRetargetEventDocument);
+
+  *aRetargetEventDocument = nullptr;
+
+  if (aGUIEvent->IsTargetedAtFocusedWindow()) {
+    nsCOMPtr<nsPIDOMWindowOuter> window = GetFocusedDOMWindowInOurWindow();
+    if (!window) {
+      return false;
+    }
+
+    RefPtr<Document> retargetEventDoc = window->GetExtantDoc();
+    if (!retargetEventDoc) {
+      return false;
+    }
+    retargetEventDoc.forget(aRetargetEventDocument);
+    return true;
+  }
+
+  const nsIContent* const capturingContent =
+      aGUIEvent->ShouldIgnoreCapturingContent()
+          ? nullptr
+          : EventHandler::GetCapturingContentFor(aGUIEvent);
+  if (capturingContent) {
+    RefPtr<Document> retargetEventDoc = capturingContent->GetComposedDoc();
+    retargetEventDoc.forget(aRetargetEventDocument);
+    return true;
+  }
+
+
+  return true;
+}
+
+nsIFrame* PresShell::EventHandler::GetFrameForHandlingEventWith(
+    WidgetGUIEvent* aGUIEvent, Document* aRetargetDocument,
+    nsIFrame* aFrameForPresShell) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(aRetargetDocument);
+
+  RefPtr<PresShell> retargetPresShell = aRetargetDocument->GetPresShell();
+  if (!retargetPresShell) {
+    if (!aGUIEvent->HasKeyEventMessage()) {
+      return nullptr;
+    }
+    Document* retargetEventDoc = aRetargetDocument;
+    while (!retargetPresShell) {
+      retargetEventDoc = retargetEventDoc->GetInProcessParentDocument();
+      if (!retargetEventDoc) {
+        return nullptr;
+      }
+      retargetPresShell = retargetEventDoc->GetPresShell();
+    }
+  }
+
+  if (retargetPresShell == mPresShell) {
+    return aFrameForPresShell;
+  }
+
+  nsIFrame* rootFrame = retargetPresShell->GetRootFrame();
+  if (rootFrame) {
+    return rootFrame;
+  }
+
+  if (aGUIEvent->mMessage == eQueryTextContent ||
+      aGUIEvent->IsContentCommandEvent()) {
+    return nullptr;
+  }
+
+  return retargetPresShell->GetRootFrame();
+}
+
+bool PresShell::EventHandler::MaybeHandleEventWithAnotherPresShell(
+    AutoWeakFrame& aWeakFrameForPresShell, WidgetGUIEvent* aGUIEvent,
+    nsEventStatus* aEventStatus, nsresult* aRv) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(aEventStatus);
+  MOZ_ASSERT(aRv);
+
+  *aRv = NS_OK;
+
+  RefPtr<Document> retargetEventDoc;
+  if (!GetRetargetEventDocument(aGUIEvent, getter_AddRefs(retargetEventDoc))) {
+    return true;
+  }
+
+  if (!retargetEventDoc) {
+    return false;
+  }
+
+  nsIFrame* frame = GetFrameForHandlingEventWith(
+      aGUIEvent, retargetEventDoc, aWeakFrameForPresShell.GetFrame());
+  if (!frame) {
+    return true;
+  }
+
+  if (frame == aWeakFrameForPresShell.GetFrame()) {
+    return false;
+  }
+
+  RefPtr<PresShell> presShell = frame->PresContext()->PresShell();
+  *aRv = presShell->HandleEvent(frame, aGUIEvent, true, aEventStatus);
+  return true;
+}
+
+bool PresShell::EventHandler::MaybeDiscardOrDelayKeyboardEvent(
+    WidgetGUIEvent* aGUIEvent) {
+  MOZ_ASSERT(aGUIEvent);
+
+  if (aGUIEvent->mClass != eKeyboardEventClass) {
+    return false;
+  }
+
+  Document* document = GetDocument();
+  if (!document || !document->EventHandlingSuppressed()) {
+    return false;
+  }
+
+  MOZ_ASSERT_IF(InputTaskManager::CanSuspendInputEvent(),
+                !InputTaskManager::Get()->IsSuspended());
+
+  if (aGUIEvent->mMessage == eKeyDown) {
+    mPresShell->mNoDelayedKeyEvents = true;
+  } else if (!mPresShell->mNoDelayedKeyEvents) {
+    UniquePtr<DelayedKeyEvent> delayedKeyEvent =
+        MakeUnique<DelayedKeyEvent>(aGUIEvent->AsKeyboardEvent());
+    mPresShell->mDelayedEvents.AppendElement(std::move(delayedKeyEvent));
+  }
+  aGUIEvent->mFlags.mIsSuppressedOrDelayed = true;
+  return true;
+}
+
+bool PresShell::EventHandler::MaybeDiscardOrDelayMouseEvent(
+    nsIFrame* aFrameToHandleEvent, WidgetGUIEvent* aGUIEvent) {
+  MOZ_ASSERT(aFrameToHandleEvent);
+  MOZ_ASSERT(aGUIEvent);
+
+  if (aGUIEvent->mMessage == eMouseRawUpdate ||
+      aGUIEvent->mMessage == eTouchRawUpdate ||
+      aGUIEvent->mMessage == ePointerRawUpdate) {
+    return false;
+  }
+
+  if (!aGUIEvent->IsMouseEventClassOrHasClickRelatedPointerEvent() &&
+      aGUIEvent->mMessage != eTouchStart) {
+    return false;
+  }
+
+  if (!aFrameToHandleEvent->PresContext()
+           ->Document()
+           ->EventHandlingSuppressed()) {
+    return false;
+  }
+
+  MOZ_ASSERT_IF(InputTaskManager::CanSuspendInputEvent() &&
+                    aGUIEvent->mMessage != eMouseMove,
+                !InputTaskManager::Get()->IsSuspended());
+
+  RefPtr<PresShell> ps = aFrameToHandleEvent->PresShell();
+
+  switch (aGUIEvent->mMessage) {
+    case eTouchStart: {
+      const WidgetTouchEvent* const touchEvent = aGUIEvent->AsTouchEvent();
+      if (touchEvent->mTouches.Length() == 1) {
+        ps->mNoDelayedSingleTap = true;
+      }
+      return false;
+    }
+    case eMouseDown: {
+      const WidgetMouseEvent* const mouseEvent = aGUIEvent->AsMouseEvent();
+      if (ps->mNoDelayedSingleTap ||
+          mouseEvent->mInputSource != MouseEvent_Binding::MOZ_SOURCE_TOUCH) {
+        ps->mNoDelayedMouseEvents = true;
+        break;
+      }
+      [[fallthrough]];
+    }
+    case eMouseUp:
+    case eMouseExitFromWidget: {
+      if (ps->mNoDelayedMouseEvents) {
+        break;
+      }
+      UniquePtr<DelayedMouseEvent> delayedMouseEvent =
+          MakeUnique<DelayedMouseEvent>(aGUIEvent->AsMouseEvent());
+      ps->mDelayedEvents.AppendElement(std::move(delayedMouseEvent));
+      break;
+    }
+    case eContextMenu: {
+      if (ps->mNoDelayedMouseEvents) {
+        break;
+      }
+      UniquePtr<DelayedPointerEvent> delayedPointerEvent =
+          MakeUnique<DelayedPointerEvent>(aGUIEvent->AsPointerEvent());
+      ps->mDelayedEvents.AppendElement(std::move(delayedPointerEvent));
+      break;
+    }
+    default:
+      break;
+  }
+
+  RefPtr<EventListener> suppressedListener = aFrameToHandleEvent->PresContext()
+                                                 ->Document()
+                                                 ->GetSuppressedEventListener();
+  if (!suppressedListener ||
+      aGUIEvent->AsMouseEvent()->mReason == WidgetMouseEvent::eSynthesized) {
+    return true;
+  }
+
+  if (auto* target = aFrameToHandleEvent->GetEventTargetContent(aGUIEvent)) {
+    aGUIEvent->mTarget = target;
+  }
+
+  nsCOMPtr<EventTarget> eventTarget = aGUIEvent->mTarget;
+  RefPtr<Event> event = EventDispatcher::CreateEvent(
+      eventTarget, aFrameToHandleEvent->PresContext(), aGUIEvent, u""_ns);
+
+  suppressedListener->HandleEvent(*event);
+  return true;
+}
+
+void PresShell::EventHandler::MaybeFlushThrottledStyles(
+    AutoWeakFrame& aWeakFrameForPresShell) {
+  if (!GetDocument()) {
+    return;
+  }
+
+  PresShell* rootPresShell = mPresShell->GetRootPresShell();
+  if (NS_WARN_IF(!rootPresShell)) {
+    return;
+  }
+  Document* rootDocument = rootPresShell->GetDocument();
+  if (NS_WARN_IF(!rootDocument)) {
+    return;
+  }
+
+  {  
+    nsAutoScriptBlocker scriptBlocker;
+    FlushThrottledStyles(*rootDocument);
+  }
+
+  if (MOZ_UNLIKELY(!aWeakFrameForPresShell.IsAlive()) &&
+      MOZ_LIKELY(!mPresShell->IsDestroying())) {
+    aWeakFrameForPresShell = mPresShell->GetRootFrame();
+  }
+}
+
+nsIFrame* PresShell::EventHandler::ComputeRootFrameToHandleEvent(
+    nsIFrame* aFrameForPresShell, WidgetGUIEvent* aGUIEvent,
+    nsIContent* aCapturingContent, bool* aIsCapturingContentIgnored,
+    bool* aIsCaptureRetargeted) {
+  MOZ_ASSERT(aFrameForPresShell);
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(aIsCapturingContentIgnored);
+  MOZ_ASSERT(aIsCaptureRetargeted);
+
+  nsIFrame* rootFrameToHandleEvent = ComputeRootFrameToHandleEventWithPopup(
+      aFrameForPresShell, aGUIEvent, aCapturingContent,
+      aIsCapturingContentIgnored);
+  if (*aIsCapturingContentIgnored) {
+    return rootFrameToHandleEvent;
+  }
+
+  if (!aCapturingContent) {
+    return rootFrameToHandleEvent;
+  }
+
+  *aIsCapturingContentIgnored = false;
+  *aIsCaptureRetargeted = false;
+
+  BrowsingContext* bc = GetPresContext()->Document()->GetBrowsingContext();
+  if (!bc || !bc->IsActive()) {
+    ClearMouseCapture();
+    *aIsCapturingContentIgnored = true;
+    return rootFrameToHandleEvent;
+  }
+
+  *aIsCaptureRetargeted = !!PresShell::sCapturingContentInfo.mRetargetToElement;
+
+  if (nsListControlFrame* lcf =
+          do_QueryFrame(aCapturingContent->GetPrimaryFrame())) {
+    return lcf->GetScrolledFrame();
+  }
+  return rootFrameToHandleEvent;
+}
+
+nsIFrame* PresShell::EventHandler::ComputeRootFrameToHandleEventWithPopup(
+    nsIFrame* aRootFrameToHandleEvent, WidgetGUIEvent* aGUIEvent,
+    nsIContent* aCapturingContent, bool* aIsCapturingContentIgnored) {
+  MOZ_ASSERT(aRootFrameToHandleEvent);
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(aIsCapturingContentIgnored);
+
+  *aIsCapturingContentIgnored = false;
+
+  nsPresContext* framePresContext = aRootFrameToHandleEvent->PresContext();
+  nsPresContext* rootPresContext = framePresContext->GetRootPresContext();
+  NS_ASSERTION(rootPresContext == GetPresContext()->GetRootPresContext(),
+               "How did we end up outside the connected "
+               "prescontext hierarchy?");
+  nsIFrame* popupFrame = nsLayoutUtils::GetPopupFrameForEventCoordinates(
+      rootPresContext, aGUIEvent);
+  if (!popupFrame) {
+    return aRootFrameToHandleEvent;
+  }
+
+  if (aCapturingContent &&
+      EventStateManager::IsTopLevelRemoteTarget(aCapturingContent)) {
+    *aIsCapturingContentIgnored = true;
+  }
+
+  if (nsContentUtils::ContentIsCrossDocDescendantOf(
+          framePresContext->GetPresShell()->GetDocument(),
+          popupFrame->GetContent())) {
+    return aRootFrameToHandleEvent;
+  }
+
+  if (framePresContext == rootPresContext &&
+      aRootFrameToHandleEvent == FrameConstructor()->GetRootFrame()) {
+    return popupFrame;
+  }
+
+  if (aCapturingContent && !*aIsCapturingContentIgnored &&
+      aCapturingContent->IsInclusiveDescendantOf(popupFrame->GetContent())) {
+    return popupFrame;
+  }
+
+  return aRootFrameToHandleEvent;
+}
+
+nsresult
+PresShell::EventHandler::HandleEventWithPointerCapturingContentWithoutItsFrame(
+    AutoWeakFrame& aWeakFrameForPresShell, WidgetGUIEvent* aGUIEvent,
+    Element* aPointerCapturingElement, nsEventStatus* aEventStatus) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(aPointerCapturingElement);
+  MOZ_ASSERT(!aPointerCapturingElement->GetPrimaryFrame(),
+             "Handle the event with frame rather than only with the content");
+  MOZ_ASSERT(aEventStatus);
+
+  RefPtr<PresShell> presShellForCapturingContent =
+      PresShell::GetShellForEventTarget(nullptr, aPointerCapturingElement);
+  if (!presShellForCapturingContent) {
+    PointerEventHandler::ReleaseIfCaptureByDescendant(aPointerCapturingElement);
+    PointerEventHandler::MaybeImplicitlyReleasePointerCapture(aGUIEvent);
+    return NS_OK;
+  }
+
+  Result<nsIContent*, nsresult> overrideClickTargetOrError =
+      GetOverrideClickTarget(aGUIEvent, aWeakFrameForPresShell.GetFrame(),
+                             aPointerCapturingElement);
+  if (MOZ_UNLIKELY(overrideClickTargetOrError.isErr())) {
+    return NS_OK;
+  }
+  nsCOMPtr<nsIContent> overrideClickTarget =
+      overrideClickTargetOrError.unwrap();
+
+  PointerEventHandler::DispatchPointerFromMouseOrTouch(
+      presShellForCapturingContent, nullptr, aPointerCapturingElement,
+      aPointerCapturingElement, aGUIEvent, false, aEventStatus, nullptr);
+
+  if (presShellForCapturingContent == mPresShell) {
+    return HandleEventWithTarget(aGUIEvent, nullptr, aPointerCapturingElement,
+                                 aEventStatus, true, nullptr,
+                                 overrideClickTarget);
+  }
+
+  EventHandler eventHandlerForCapturingContent(
+      std::move(presShellForCapturingContent));
+  return eventHandlerForCapturingContent.HandleEventWithTarget(
+      aGUIEvent, nullptr, aPointerCapturingElement, aEventStatus, true, nullptr,
+      overrideClickTarget);
+}
+
+nsresult PresShell::EventHandler::HandleEventAtFocusedContent(
+    WidgetGUIEvent* aGUIEvent, nsEventStatus* aEventStatus) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(aGUIEvent->IsTargetedAtFocusedContent());
+  MOZ_ASSERT(aEventStatus);
+
+  AutoCurrentEventInfoSetter eventInfoSetter(*this);
+
+  RefPtr<Element> eventTargetElement =
+      ComputeFocusedEventTargetElement(aGUIEvent);
+
+  MOZ_ASSERT(!mPresShell->mCurrentEventTarget.IsSet());
+
+  if (eventTargetElement) {
+    nsresult rv = NS_OK;
+    if (MaybeHandleEventWithAnotherPresShell(eventTargetElement, aGUIEvent,
+                                             aEventStatus, &rv)) {
+      return rv;
+    }
+  }
+
+  mPresShell->mCurrentEventTarget.SetFrameAndContent(
+      aGUIEvent->mMessage, nullptr, eventTargetElement);
+  if (aGUIEvent->mClass != eCompositionEventClass &&
+      aGUIEvent->mClass != eQueryContentEventClass &&
+      aGUIEvent->mClass != eSelectionEventClass &&
+      (!mPresShell->GetCurrentEventContent() ||
+       !mPresShell->GetCurrentEventFrame() ||
+       InZombieDocument(mPresShell->mCurrentEventTarget.mContent))) {
+    return RetargetEventToParent(aGUIEvent, aEventStatus);
+  }
+
+  nsresult rv =
+      HandleEventWithCurrentEventInfo(aGUIEvent, aEventStatus, true, nullptr);
+  return rv;
+}
+
+Element* PresShell::EventHandler::ComputeFocusedEventTargetElement(
+    WidgetGUIEvent* aGUIEvent) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(aGUIEvent->IsTargetedAtFocusedContent());
+
+  nsPIDOMWindowOuter* window = GetDocument()->GetWindow();
+  nsCOMPtr<nsPIDOMWindowOuter> focusedWindow;
+  Element* eventTargetElement = nsFocusManager::GetFocusedDescendant(
+      window, nsFocusManager::eOnlyCurrentWindow,
+      getter_AddRefs(focusedWindow));
+
+  if (!eventTargetElement || !eventTargetElement->GetPrimaryFrame()) {
+    eventTargetElement = GetDocument()->GetUnfocusedKeyEventTarget();
+  }
+
+  switch (aGUIEvent->mMessage) {
+    case eKeyDown:
+      sLastKeyDownEventTargetElement = eventTargetElement;
+      return eventTargetElement;
+    case eKeyPress:
+    case eKeyUp:
+      if (!sLastKeyDownEventTargetElement) {
+        return eventTargetElement;
+      }
+      if (eventTargetElement) {
+        bool keyDownIsChrome = nsContentUtils::IsChromeDoc(
+            sLastKeyDownEventTargetElement->GetComposedDoc());
+        if (keyDownIsChrome != nsContentUtils::IsChromeDoc(
+                                   eventTargetElement->GetComposedDoc()) ||
+            (keyDownIsChrome && BrowserParent::GetFrom(eventTargetElement))) {
+          eventTargetElement = sLastKeyDownEventTargetElement;
+        }
+      }
+
+      if (aGUIEvent->mMessage == eKeyUp) {
+        sLastKeyDownEventTargetElement = nullptr;
+      }
+      [[fallthrough]];
+    default:
+      return eventTargetElement;
+  }
+}
+
+bool PresShell::EventHandler::MaybeHandleEventWithAnotherPresShell(
+    Element* aEventTargetElement, WidgetGUIEvent* aGUIEvent,
+    nsEventStatus* aEventStatus, nsresult* aRv) {
+  MOZ_ASSERT(aEventTargetElement);
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(!aGUIEvent->IsUsingCoordinates());
+  MOZ_ASSERT(aEventStatus);
+  MOZ_ASSERT(aRv);
+
+  Document* eventTargetDocument = aEventTargetElement->OwnerDoc();
+  if (!eventTargetDocument || eventTargetDocument == GetDocument()) {
+    *aRv = NS_OK;
+    return false;
+  }
+
+  RefPtr<PresShell> eventTargetPresShell = eventTargetDocument->GetPresShell();
+  if (!eventTargetPresShell) {
+    *aRv = NS_OK;
+    return true;  
+  }
+
+  EventHandler eventHandler(std::move(eventTargetPresShell));
+  *aRv = eventHandler.HandleRetargetedEvent(aGUIEvent, aEventStatus,
+                                            aEventTargetElement);
+  return true;
+}
+
+nsresult PresShell::EventHandler::HandleEventWithFrameForPresShell(
+    AutoWeakFrame& aWeakFrameForPresShell, WidgetGUIEvent* aGUIEvent,
+    nsEventStatus* aEventStatus) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(!aGUIEvent->IsUsingCoordinates());
+  MOZ_ASSERT(!aGUIEvent->IsTargetedAtFocusedContent());
+  MOZ_ASSERT(aEventStatus);
+
+  AutoCurrentEventInfoSetter eventInfoSetter(
+      *this, EventTargetInfo(aGUIEvent->mMessage,
+                             aWeakFrameForPresShell.GetFrame(), nullptr));
+
+  nsresult rv = NS_OK;
+  if (mPresShell->GetCurrentEventFrame()) {
+    rv =
+        HandleEventWithCurrentEventInfo(aGUIEvent, aEventStatus, true, nullptr);
+  }
+
+  return rv;
+}
+
+Document* PresShell::GetPrimaryContentDocument() {
+  nsPresContext* context = GetPresContext();
+  if (!context || !context->IsRoot()) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIDocShellTreeItem> shellAsTreeItem = context->GetDocShell();
+  if (!shellAsTreeItem) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIDocShellTreeOwner> owner;
+  shellAsTreeItem->GetTreeOwner(getter_AddRefs(owner));
+  if (!owner) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIDocShellTreeItem> item;
+  owner->GetPrimaryContentShell(getter_AddRefs(item));
+  nsCOMPtr<nsIDocShell> childDocShell = do_QueryInterface(item);
+  if (!childDocShell) {
+    return nullptr;
+  }
+
+  return childDocShell->GetExtantDocument();
+}
+
+nsresult PresShell::EventHandler::HandleEventWithTarget(
+    WidgetEvent* aEvent, nsIFrame* aNewEventFrame, nsIContent* aNewEventContent,
+    nsEventStatus* aEventStatus, bool aIsHandlingNativeEvent,
+    nsIContent** aTargetContent, nsIContent* aOverrideClickTarget) {
+  MOZ_ASSERT(aEvent);
+  MOZ_DIAGNOSTIC_ASSERT(aEvent->IsTrusted());
+  MOZ_ASSERT(!aNewEventFrame || aNewEventFrame->PresShell() == mPresShell,
+             "wrong shell");
+  NS_ASSERTION(!aNewEventContent || aNewEventContent->IsInComposedDoc(),
+               "event for content that isn't in a document");
+  NS_ENSURE_STATE(!aNewEventContent ||
+                  aNewEventContent->GetComposedDoc() == GetDocument());
+  if (aEvent->mClass == ePointerEventClass ||
+      aEvent->mClass == eDragEventClass) {
+    mPresShell->RecordPointerLocation(aEvent->AsMouseEvent());
+  }
+  AutoPointerEventTargetUpdater updater(mPresShell, aEvent, aNewEventFrame,
+                                        aNewEventContent, aTargetContent);
+  AutoCurrentEventInfoSetter eventInfoSetter(
+      *this,
+      EventTargetInfo(aEvent->mMessage, aNewEventFrame, aNewEventContent));
+  nsresult rv = HandleEventWithCurrentEventInfo(aEvent, aEventStatus, false,
+                                                aOverrideClickTarget);
+  return rv;
+}
+
+namespace {
+
+class MOZ_RAII AutoEventHandler final {
+ public:
+  AutoEventHandler(WidgetEvent* aEvent, Document* aDocument) : mEvent(aEvent) {
+    MOZ_ASSERT(mEvent);
+    MOZ_ASSERT(mEvent->IsTrusted());
+
+    if (mEvent->mMessage == eMouseDown) {
+      PresShell::ReleaseCapturingContent();
+      PresShell::AllowMouseCapture(true);
+    }
+    if (NeedsToUpdateCurrentMouseBtnState()) {
+      WidgetMouseEvent* mouseEvent = mEvent->AsMouseEvent();
+      if (mouseEvent) {
+        EventStateManager::sCurrentMouseBtn = mouseEvent->mButton;
+      }
+    }
+  }
+
+  ~AutoEventHandler() {
+    if (mEvent->mMessage == eMouseDown) {
+      PresShell::AllowMouseCapture(false);
+    }
+    if (NeedsToUpdateCurrentMouseBtnState()) {
+      EventStateManager::sCurrentMouseBtn = MouseButton::eNotPressed;
+    }
+  }
+
+ protected:
+  bool NeedsToUpdateCurrentMouseBtnState() const {
+    return mEvent->mMessage == eMouseDown || mEvent->mMessage == eMouseUp ||
+           mEvent->mMessage == ePointerDown || mEvent->mMessage == ePointerUp;
+  }
+
+  WidgetEvent* mEvent;
+};
+
+}  
+
+nsresult PresShell::EventHandler::HandleEventWithCurrentEventInfo(
+    WidgetEvent* aEvent, nsEventStatus* aEventStatus,
+    bool aIsHandlingNativeEvent, nsIContent* aOverrideClickTarget) {
+  MOZ_ASSERT(aEvent);
+  MOZ_ASSERT(aEventStatus);
+
+  RefPtr<EventStateManager> manager = GetPresContext()->EventStateManager();
+
+  if (NS_EVENT_NEEDS_FRAME(aEvent) && !mPresShell->GetCurrentEventFrame() &&
+      !mPresShell->GetCurrentEventContent()) {
+    return NS_OK;
+  }
+
+  if (mPresShell->mCurrentEventTarget.mContent &&
+      aEvent->IsTargetedAtFocusedWindow() &&
+      aEvent->AllowFlushingPendingNotifications()) {
+    if (RefPtr<nsFocusManager> fm = nsFocusManager::GetFocusManager()) {
+      nsCOMPtr<nsIContent> currentEventContent =
+          mPresShell->mCurrentEventTarget.mContent;
+      fm->FlushBeforeEventHandlingIfNeeded(currentEventContent);
+    }
+  }
+
+  bool touchIsNew = false;
+  if (!PrepareToDispatchEvent(aEvent, aEventStatus, &touchIsNew)) {
+    return NS_OK;
+  }
+
+  AutoHandlingUserInputStatePusher userInpStatePusher(
+      UserActivation::IsUserInteractionEvent(aEvent), aEvent);
+  AutoEventHandler eventHandler(aEvent, GetDocument());
+  AutoPopupStatePusher popupStatePusher(
+      PopupBlocker::GetEventPopupControlState(aEvent));
+
+  aEvent->mTarget = nullptr;
+
+  nsresult rv = DispatchEvent(manager, aEvent, touchIsNew, aEventStatus,
+                              aOverrideClickTarget);
+
+  if (!mPresShell->IsDestroying() && aIsHandlingNativeEvent &&
+      aEvent->mClass != eQueryContentEventClass) {
+    manager->TryToFlushPendingNotificationsToIME();
+  }
+
+  FinalizeHandlingEvent(aEvent, aEventStatus);
+
+  return rv;  
+}
+
+nsresult PresShell::EventHandler::DispatchEvent(
+    EventStateManager* aEventStateManager, WidgetEvent* aEvent,
+    bool aTouchIsNew, nsEventStatus* aEventStatus,
+    nsIContent* aOverrideClickTarget) {
+  MOZ_ASSERT(aEventStateManager);
+  MOZ_ASSERT(aEvent);
+  MOZ_ASSERT(aEventStatus);
+
+  {  
+    RefPtr<nsPresContext> presContext = GetPresContext();
+    nsCOMPtr<nsIContent> eventContent =
+        mPresShell->mCurrentEventTarget.mContent;
+    nsresult rv = aEventStateManager->PreHandleEvent(
+        presContext, aEvent, mPresShell->mCurrentEventTarget.mFrame,
+        eventContent, aEventStatus, aOverrideClickTarget);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    if (eventContent && aEvent->mMessage == eMouseMove &&
+        (!eventContent->IsInComposedDoc() ||
+         eventContent->OwnerDoc() != mPresShell->GetDocument())) {
+      const OverOutElementsWrapper* const boundaryEventTargets =
+          aEventStateManager->GetExtantMouseBoundaryEventTarget();
+      const nsIContent* outEventTarget =
+          boundaryEventTargets ? boundaryEventTargets->GetOutEventTarget()
+                               : nullptr;
+      nsIContent* const deepestLeaveEventTarget =
+          boundaryEventTargets
+              ? boundaryEventTargets->GetDeepestLeaveEventTarget()
+              : nullptr;
+      if (!outEventTarget && deepestLeaveEventTarget) {
+        nsIFrame* const frame =
+            deepestLeaveEventTarget->GetPrimaryFrame(FlushType::Layout);
+        if (MOZ_UNLIKELY(mPresShell->IsDestroying())) {
+          return NS_OK;
+        }
+        if (frame) {
+          mPresShell->mCurrentEventTarget.mFrame = frame;
+          mPresShell->mCurrentEventTarget.mContent = deepestLeaveEventTarget;
+        }
+      }
+    }
+  }
+
+  bool wasHandlingKeyBoardEvent = nsContentUtils::IsHandlingKeyBoardEvent();
+  if (aEvent->mClass == eKeyboardEventClass) {
+    nsContentUtils::SetIsHandlingKeyBoardEvent(true);
+  }
+  if (aEvent->IsAllowedToDispatchDOMEvent() &&
+      !(aEvent->PropagationStopped() &&
+        aEvent->IsWaitingReplyFromRemoteProcess())) {
+    MOZ_ASSERT(nsContentUtils::IsSafeToRunScript(),
+               "Somebody changed aEvent to cause a DOM event!");
+    nsPresShellEventCB eventCB(mPresShell);
+    if (nsIFrame* target = mPresShell->GetCurrentEventFrame()) {
+      if (target->OnlySystemGroupDispatch(aEvent->mMessage)) {
+        aEvent->StopPropagation();
+      }
+    }
+    if (aEvent->mClass == eTouchEventClass) {
+      DispatchTouchEventToDOM(aEvent, aEventStatus, &eventCB, aTouchIsNew);
+    } else {
+      DispatchEventToDOM(aEvent, aEventStatus, &eventCB);
+    }
+  }
+
+  nsContentUtils::SetIsHandlingKeyBoardEvent(wasHandlingKeyBoardEvent);
+
+  if (mPresShell->IsDestroying()) {
+    return NS_OK;
+  }
+
+  RefPtr<nsPresContext> presContext = GetPresContext();
+  return aEventStateManager->PostHandleEvent(
+      presContext, aEvent, mPresShell->GetCurrentEventFrame(), aEventStatus,
+      aOverrideClickTarget);
+}
+
+bool PresShell::EventHandler::PrepareToDispatchEvent(
+    WidgetEvent* aEvent, nsEventStatus* aEventStatus, bool* aTouchIsNew) {
+  MOZ_ASSERT(aEvent->IsTrusted());
+  MOZ_ASSERT(aEventStatus);
+  MOZ_ASSERT(aTouchIsNew);
+
+  *aTouchIsNew = false;
+  if (aEvent->IsUserAction()) {
+    mPresShell->mHasHandledUserInput = true;
+  }
+
+  switch (aEvent->mMessage) {
+    case eKeyPress:
+    case eKeyDown:
+    case eKeyUp: {
+      WidgetKeyboardEvent* keyboardEvent = aEvent->AsKeyboardEvent();
+      MaybeHandleKeyboardEventBeforeDispatch(keyboardEvent);
+      return true;
+    }
+    case eMouseRawUpdate:
+      MOZ_ASSERT_UNREACHABLE(
+          "eMouseRawUpdate shouldn't be handled as a DOM event");
+      return false;
+
+    case eMouseMove: {
+      bool allowCapture = EventStateManager::GetActiveEventStateManager() &&
+                          GetPresContext() &&
+                          GetPresContext()->EventStateManager() ==
+                              EventStateManager::GetActiveEventStateManager();
+      PresShell::AllowMouseCapture(allowCapture);
+      return true;
+    }
+    case eDrop: {
+      nsCOMPtr<nsIDragSession> session =
+          nsContentUtils::GetDragSession(GetPresContext());
+      if (session) {
+        bool onlyChromeDrop = false;
+        session->GetOnlyChromeDrop(&onlyChromeDrop);
+        if (onlyChromeDrop) {
+          aEvent->mFlags.mOnlyChromeDispatch = true;
+        }
+      }
+      return true;
+    }
+    case eDragExit: {
+      if (!StaticPrefs::dom_event_dragexit_enabled()) {
+        aEvent->mFlags.mOnlyChromeDispatch = true;
+      }
+      return true;
+    }
+    case eContextMenu: {
+      WidgetMouseEvent* mouseEvent = aEvent->AsMouseEvent();
+      if (mouseEvent->IsContextMenuKeyEvent() &&
+          !AdjustContextMenuKeyEvent(mouseEvent)) {
+        return false;
+      }
+
+      if (mouseEvent->IsShift() &&
+          StaticPrefs::dom_event_contextmenu_shift_suppresses_event()) {
+        aEvent->mFlags.mOnlyChromeDispatch = true;
+        aEvent->mFlags.mRetargetToNonNativeAnonymous = true;
+      }
+      return true;
+    }
+    case eTouchStart:
+    case eTouchMove:
+    case eTouchEnd:
+    case eTouchCancel:
+    case eTouchPointerCancel:
+      return mPresShell->mTouchManager.PreHandleEvent(
+          aEvent, aEventStatus, *aTouchIsNew,
+          mPresShell->mCurrentEventTarget.mContent);
+    case eTouchRawUpdate:
+      MOZ_ASSERT_UNREACHABLE(
+          "eTouchRawUpdate shouldn't be handled as a DOM event");
+      return false;
+    default:
+      return true;
+  }
+}
+
+void PresShell::EventHandler::FinalizeHandlingEvent(
+    WidgetEvent* aEvent, const nsEventStatus* aStatus) {
+  switch (aEvent->mMessage) {
+    case eKeyPress:
+    case eKeyDown:
+    case eKeyUp: {
+      if (aEvent->AsKeyboardEvent()->mKeyCode == NS_VK_ESCAPE) {
+        if (aEvent->mMessage == eKeyUp) {
+          mPresShell->mIsLastChromeOnlyEscapeKeyConsumed = false;
+        } else {
+          if (aEvent->mFlags.mOnlyChromeDispatch &&
+              aEvent->mFlags.mDefaultPreventedByChrome) {
+            mPresShell->mIsLastChromeOnlyEscapeKeyConsumed = true;
+          }
+          if (aEvent->mMessage == eKeyDown &&
+              !aEvent->mFlags.mDefaultPrevented) {
+            if (RefPtr<Document> doc = GetDocument()) {
+              if (StaticPrefs::dom_closewatcher_enabled()) {
+                doc->ProcessCloseRequest();
+              } else {
+                doc->HandleEscKey();
+              }
+            }
+          }
+        }
+      }
+      if (aEvent->mMessage == eKeyDown) {
+        mPresShell->mIsLastKeyDownCanceled = aEvent->mFlags.mDefaultPrevented;
+      }
+      break;
+    }
+    case eMouseUp:
+      PresShell::ReleaseCapturingContent();
+      break;
+    case eMouseRawUpdate:
+      MOZ_ASSERT_UNREACHABLE(
+          "eMouseRawUpdate shouldn't be handled as a DOM event");
+      break;
+    case eMouseMove:
+      PresShell::AllowMouseCapture(false);
+      break;
+    case eDrag:
+    case eDragEnd:
+    case eDragEnter:
+    case eDragExit:
+    case eDragLeave:
+    case eDragOver:
+    case eDrop: {
+      DataTransfer* dataTransfer = aEvent->AsDragEvent()->mDataTransfer;
+      if (dataTransfer) {
+        dataTransfer->Disconnect();
+      }
+      break;
+    }
+    case eTouchStart:
+    case eTouchMove:
+    case eTouchEnd:
+    case eTouchCancel:
+    case eTouchPointerCancel:
+    case eMouseLongTap:
+    case eContextMenu: {
+      mPresShell->mTouchManager.PostHandleEvent(aEvent, aStatus);
+      break;
+    }
+    case eTouchRawUpdate:
+      MOZ_ASSERT_UNREACHABLE(
+          "eTouchRawUpdate shouldn't be handled as a DOM event");
+      break;
+    default:
+      break;
+  }
+
+  if (WidgetMouseEvent* mouseEvent = aEvent->AsMouseEvent()) {
+    if (mouseEvent->mSynthesizeMoveAfterDispatch) {
+      PointerEventHandler::SynthesizeMoveToDispatchBoundaryEvents(mouseEvent);
+    }
+  }
+}
+
+void PresShell::MaybeExitKeyboardLockedFullscreen(
+    WidgetKeyboardEvent* aKeyboardEvent, Document* aFullscreenRoot) {
+  if (mFirstUnmatchedEscapeKeyDownForFullscreen.IsNull()) {
+    return;
+  }
+  const bool escapeKeyDeltaLargeEnough =
+      (aKeyboardEvent->mTimeStamp -
+       mFirstUnmatchedEscapeKeyDownForFullscreen) >=
+      TimeDuration::FromMilliseconds(
+          StaticPrefs::dom_fullscreen_keyboard_lock_long_press_interval());
+
+  if (escapeKeyDeltaLargeEnough) {
+    Document::AsyncExitFullscreen(aFullscreenRoot);
+    if (XRE_IsParentProcess() && (PointerLockManager::GetLockedRemoteTarget() ||
+                                  PointerLockManager::IsLocked())) {
+      PointerLockManager::Unlock("EscapeKey");
+    }
+  }
+}
+
+void PresShell::EventHandler::MaybeHandleKeyboardEventBeforeDispatch(
+    WidgetKeyboardEvent* aKeyboardEvent) {
+  MOZ_ASSERT(aKeyboardEvent);
+
+  if (aKeyboardEvent->mKeyCode != NS_VK_ESCAPE) {
+    mPresShell->CleanupFullscreenState();
+    return;
+  }
+
+  Document* doc = mPresShell->GetCurrentEventContent()
+                      ? mPresShell->mCurrentEventTarget.mContent->OwnerDoc()
+                      : nullptr;
+  Document* root = nsContentUtils::GetInProcessSubtreeRootDocument(doc);
+  if (root && root->GetFullscreenElement()) {
+    Document* fullscreenLeaf = Document::GetFullscreenLeaf(root);
+    if (fullscreenLeaf->HasFullscreenKeyboardLockEnabled()) {
+      if (aKeyboardEvent->mMessage == eKeyDown) {
+        if (!aKeyboardEvent->mIsRepeat) {
+          mPresShell->mHasShownFullscreenWarningForCurrentEscapeKeyLongPress =
+              false;
+          mPresShell->mFirstUnmatchedEscapeKeyDownForFullscreen =
+              aKeyboardEvent->mTimeStamp;
+
+          if (mPresShell->ShouldShowFullscreenKeyboardLockWarning(
+                  *aKeyboardEvent)) {
+            nsContentUtils::DispatchEventOnlyToChrome(
+                root, root, u"MozDOMFullscreen:WarnAboutKeyboardLock"_ns,
+                CanBubble::eYes, Cancelable::eNo,  nullptr);
+          }
+          return;
+        }
+
+        MOZ_ASSERT(aKeyboardEvent->mIsRepeat);
+        if (mPresShell->ShouldShowFullscreenKeyboardLockWarning(
+                *aKeyboardEvent)) {
+          nsContentUtils::DispatchEventOnlyToChrome(
+              root, root, u"MozDOMFullscreen:WarnAboutKeyboardLock"_ns,
+              CanBubble::eYes, Cancelable::eNo,  nullptr);
+        }
+
+        mPresShell->MaybeExitKeyboardLockedFullscreen(aKeyboardEvent, root);
+      } else if (aKeyboardEvent->mMessage == eKeyUp) {
+        mPresShell->MaybeExitKeyboardLockedFullscreen(aKeyboardEvent, root);
+      }
+
+      return;
+    }
+
+    aKeyboardEvent->PreventDefaultBeforeDispatch(CrossProcessForwarding::eStop);
+    aKeyboardEvent->mFlags.mOnlyChromeDispatch = true;
+
+    if (aKeyboardEvent->mMessage == eKeyUp) {
+      bool shouldExitFullscreen =
+          !mPresShell->mIsLastChromeOnlyEscapeKeyConsumed;
+      if (!shouldExitFullscreen) {
+        if (mPresShell->mLastConsumedEscapeKeyUpForFullscreen &&
+            (aKeyboardEvent->mTimeStamp -
+             mPresShell->mLastConsumedEscapeKeyUpForFullscreen) <=
+                TimeDuration::FromMilliseconds(
+                    StaticPrefs::
+                        dom_fullscreen_force_exit_on_multiple_escape_interval())) {
+          shouldExitFullscreen = true;
+          mPresShell->mLastConsumedEscapeKeyUpForFullscreen = TimeStamp();
+        } else {
+          mPresShell->mLastConsumedEscapeKeyUpForFullscreen =
+              aKeyboardEvent->mTimeStamp;
+        }
+      }
+
+      if (shouldExitFullscreen) {
+        Document::AsyncExitFullscreen(root);
+      }
+    }
+  }
+
+  if (XRE_IsParentProcess() &&
+      !mPresShell->mIsLastChromeOnlyEscapeKeyConsumed) {
+    if (PointerLockManager::GetLockedRemoteTarget() ||
+        PointerLockManager::IsLocked()) {
+      aKeyboardEvent->PreventDefaultBeforeDispatch(
+          CrossProcessForwarding::eStop);
+      aKeyboardEvent->mFlags.mOnlyChromeDispatch = true;
+      if (aKeyboardEvent->mMessage == eKeyUp) {
+        PointerLockManager::Unlock("EscapeKey");
+      }
+    }
+  }
+}
+
+nsIPrincipal*
+PresShell::EventHandler::GetDocumentPrincipalToCompareWithBlacklist(
+    PresShell& aPresShell) {
+  nsPresContext* presContext = aPresShell.GetPresContext();
+  if (NS_WARN_IF(!presContext)) {
+    return nullptr;
+  }
+  return presContext->Document()->GetPrincipalForPrefBasedHacks();
+}
+
+nsresult PresShell::EventHandler::DispatchEventToDOM(
+    WidgetEvent* aEvent, nsEventStatus* aEventStatus,
+    nsPresShellEventCB* aEventCB) {
+  nsresult rv = NS_OK;
+  nsCOMPtr<nsINode> eventTarget = mPresShell->mCurrentEventTarget.mContent;
+  nsPresShellEventCB* eventCBPtr = aEventCB;
+  if (!eventTarget) {
+    nsCOMPtr<nsIContent> targetContent;
+    if (mPresShell->mCurrentEventTarget.mFrame) {
+      targetContent =
+          mPresShell->mCurrentEventTarget.mFrame->GetEventTargetContent(aEvent);
+    }
+    if (targetContent) {
+      eventTarget = targetContent;
+    } else if (GetDocument()) {
+      eventTarget = GetDocument();
+      eventCBPtr = nullptr;
+    }
+  }
+  if (eventTarget) {
+    if (eventTarget->OwnerDoc()->ShouldResistFingerprinting(
+            RFPTarget::WidgetEvents) &&
+        aEvent->IsBlockedForFingerprintingResistance()) {
+      aEvent->mFlags.mOnlySystemGroupDispatchInContent = true;
+    } else if (aEvent->mMessage == eKeyPress) {
+      if (!mPresShell->mInitializedWithKeyPressEventDispatchingBlacklist) {
+        mPresShell->mInitializedWithKeyPressEventDispatchingBlacklist = true;
+        nsCOMPtr<nsIPrincipal> principal =
+            GetDocumentPrincipalToCompareWithBlacklist(*mPresShell);
+        if (principal) {
+          mPresShell->mForceDispatchKeyPressEventsForNonPrintableKeys =
+              principal->IsURIInPrefList(
+                  "dom.keyboardevent.keypress.hack.dispatch_non_printable_"
+                  "keys") ||
+              principal->IsURIInPrefList(
+                  "dom.keyboardevent.keypress.hack."
+                  "dispatch_non_printable_keys.addl");
+
+          mPresShell->mForceUseLegacyKeyCodeAndCharCodeValues |=
+              principal->IsURIInPrefList(
+                  "dom.keyboardevent.keypress.hack."
+                  "use_legacy_keycode_and_charcode") ||
+              principal->IsURIInPrefList(
+                  "dom.keyboardevent.keypress.hack."
+                  "use_legacy_keycode_and_charcode.addl");
+        }
+      }
+      if (mPresShell->mForceDispatchKeyPressEventsForNonPrintableKeys) {
+        aEvent->mFlags.mOnlySystemGroupDispatchInContent = false;
+      }
+      if (mPresShell->mForceUseLegacyKeyCodeAndCharCodeValues) {
+        aEvent->AsKeyboardEvent()->mUseLegacyKeyCodeAndCharCodeValues = true;
+      }
+    }
+
+    if (aEvent->mClass == eCompositionEventClass) {
+      RefPtr<nsPresContext> presContext = GetPresContext();
+      RefPtr<BrowserParent> browserParent =
+          IMEStateManager::GetActiveBrowserParent();
+      IMEStateManager::DispatchCompositionEvent(
+          eventTarget, presContext, browserParent, aEvent->AsCompositionEvent(),
+          aEventStatus, eventCBPtr);
+    } else {
+      if (aEvent->IsMouseEventClassOrHasClickRelatedPointerEvent()) {
+        PointerEventHandler::RecordMouseButtons(*aEvent->AsMouseEvent());
+#if defined(DEBUG)
+        if (eventTarget->IsContent() && !eventTarget->IsElement()) {
+          NS_WARNING(nsPrintfCString(
+                         "%s (IsReal()=%s) target is not an elemnet content "
+                         "node, %s\n",
+                         ToChar(aEvent->mMessage),
+                         aEvent->AsMouseEvent()->IsReal() ? "true" : "false",
+                         ToString(*eventTarget).c_str())
+                         .get());
+          MOZ_CRASH("MouseEvent target must be an element");
+        }
+#endif
+      }
+      if (aEvent->mClass == eMouseEventClass) {
+        MOZ_ASSERT(aEvent->AsMouseEvent());
+        PointerEventHandler::WillDispatchMouseEventToDOM(
+            *aEvent->AsMouseEvent());
+      }
+      RefPtr<nsPresContext> presContext = GetPresContext();
+      EventDispatcher::Dispatch(eventTarget, presContext, aEvent, nullptr,
+                                aEventStatus, eventCBPtr);
+    }
+  }
+  return rv;
+}
+
+void PresShell::EventHandler::DispatchTouchEventToDOM(
+    WidgetEvent* aEvent, nsEventStatus* aEventStatus,
+    nsPresShellEventCB* aEventCB, bool aTouchIsNew) {
+  MOZ_ASSERT(aEvent->mMessage != eTouchRawUpdate);
+  bool canPrevent = (aEvent->mMessage == eTouchStart) ||
+                    (aEvent->mMessage == eTouchMove && aTouchIsNew) ||
+                    (aEvent->mMessage == eTouchEnd);
+  bool preventDefault = false;
+  nsEventStatus tmpStatus = nsEventStatus_eIgnore;
+  WidgetTouchEvent* touchEvent = aEvent->AsTouchEvent();
+
+  for (dom::Touch* touch : touchEvent->mTouches) {
+    MOZ_ASSERT(!touch->mIsTouchEventSuppressed);
+
+    if (!touch || !touch->mChanged) {
+      continue;
+    }
+
+    nsCOMPtr<EventTarget> targetPtr = touch->mTarget;
+    nsCOMPtr<nsIContent> content = do_QueryInterface(targetPtr);
+    if (!content) {
+      continue;
+    }
+
+    Document* doc = content->OwnerDoc();
+    nsIContent* capturingContent = PresShell::GetCapturingContent();
+    if (capturingContent) {
+      if (capturingContent->OwnerDoc() != doc) {
+        continue;
+      }
+      content = capturingContent;
+    }
+    MOZ_ASSERT(touchEvent->IsTrusted());
+    WidgetTouchEvent newEvent(true, touchEvent->mMessage, touchEvent->mWidget);
+    newEvent.AssignTouchEventData(*touchEvent, false);
+    newEvent.mTarget = targetPtr;
+    newEvent.mFlags.mHandledByAPZ = touchEvent->mFlags.mHandledByAPZ;
+
+    RefPtr<PresShell> contentPresShell;
+    if (doc == GetDocument()) {
+      contentPresShell = doc->GetPresShell();
+      if (contentPresShell) {
+        contentPresShell->PushCurrentEventInfo(EventTargetInfo(
+            newEvent.mMessage, content->GetPrimaryFrame(), content));
+      }
+    }
+
+    RefPtr<nsPresContext> presContext = doc->GetPresContext();
+    if (!presContext) {
+      if (contentPresShell) {
+        contentPresShell->PopCurrentEventInfo();
+      }
+      continue;
+    }
+
+    tmpStatus = nsEventStatus_eIgnore;
+    EventDispatcher::Dispatch(targetPtr, presContext, &newEvent, nullptr,
+                              &tmpStatus, aEventCB);
+    if (nsEventStatus_eConsumeNoDefault == tmpStatus ||
+        newEvent.mFlags.mMultipleActionsPrevented) {
+      preventDefault = true;
+    }
+
+    if (newEvent.mFlags.mMultipleActionsPrevented) {
+      touchEvent->mFlags.mMultipleActionsPrevented = true;
+    }
+
+    if (contentPresShell) {
+      contentPresShell->PopCurrentEventInfo();
+    }
+  }
+
+  if (preventDefault && canPrevent) {
+    *aEventStatus = nsEventStatus_eConsumeNoDefault;
+  } else {
+    *aEventStatus = nsEventStatus_eIgnore;
+  }
+}
+
+nsresult PresShell::HandleDOMEventWithTarget(nsIContent* aTargetContent,
+                                             WidgetEvent* aEvent,
+                                             nsEventStatus* aStatus) {
+  nsresult rv = NS_OK;
+
+  PushCurrentEventInfo(
+      EventTargetInfo(aEvent->mMessage, nullptr, aTargetContent));
+
+  nsCOMPtr<nsISupports> container = mPresContext->GetContainerWeak();
+  if (container) {
+    rv = EventDispatcher::Dispatch(aTargetContent, mPresContext, aEvent,
+                                   nullptr, aStatus);
+  }
+
+  PopCurrentEventInfo();
+  return rv;
+}
+
+nsresult PresShell::HandleDOMEventWithTarget(nsIContent* aTargetContent,
+                                             Event* aEvent,
+                                             nsEventStatus* aStatus) {
+  nsresult rv = NS_OK;
+
+  PushCurrentEventInfo(EventTargetInfo(aEvent->WidgetEventPtr()->mMessage,
+                                       nullptr, aTargetContent));
+  nsCOMPtr<nsISupports> container = mPresContext->GetContainerWeak();
+  if (container) {
+    rv = EventDispatcher::DispatchDOMEvent(aTargetContent, nullptr, aEvent,
+                                           mPresContext, aStatus);
+  }
+
+  PopCurrentEventInfo();
+  return rv;
+}
+
+bool PresShell::EventHandler::AdjustContextMenuKeyEvent(
+    WidgetMouseEvent* aMouseEvent) {
+  if (nsXULPopupManager* pm = nsXULPopupManager::GetInstance()) {
+    nsIFrame* popupFrame = pm->GetTopPopup(widget::PopupType::Menu);
+    if (popupFrame) {
+      nsIFrame* itemFrame = (static_cast<nsMenuPopupFrame*>(popupFrame))
+                                ->GetCurrentMenuItemFrame();
+      if (!itemFrame) {
+        itemFrame = popupFrame;
+      }
+
+      nsCOMPtr<nsIWidget> widget = popupFrame->GetNearestWidget();
+      aMouseEvent->mWidget = widget;
+      LayoutDeviceIntPoint widgetPoint = widget->WidgetToScreenOffset();
+      aMouseEvent->mRefPoint =
+          LayoutDeviceIntPoint::FromAppUnitsToNearest(
+              itemFrame->GetScreenRectInAppUnits().BottomLeft(),
+              itemFrame->PresContext()->AppUnitsPerDevPixel()) -
+          widgetPoint;
+
+      mPresShell->mCurrentEventTarget.SetFrameAndContent(
+          aMouseEvent->mMessage, itemFrame,
+          itemFrame->GetContent()
+              ? itemFrame->GetContent()
+                    ->GetInclusiveFlattenedTreeAncestorElement()
+              : nullptr);
+
+      return true;
+    }
+  }
+
+  nsRootPresContext* rootPC = GetPresContext()->GetRootPresContext();
+  aMouseEvent->mRefPoint = LayoutDeviceIntPoint();
+  if (rootPC) {
+    aMouseEvent->mWidget = rootPC->PresShell()->GetRootWidget();
+    if (aMouseEvent->mWidget) {
+      if (nsIFrame* rootFrame = FrameConstructor()->GetRootFrame()) {
+        auto frameToWidgetOffset =
+            nsLayoutUtils::FrameToWidgetOffset(rootFrame, aMouseEvent->mWidget);
+        MOZ_ASSERT(frameToWidgetOffset, "If rootPC has a widget, so should we");
+        if (frameToWidgetOffset) {
+          aMouseEvent->mRefPoint = LayoutDeviceIntPoint::FromAppUnitsToNearest(
+              *frameToWidgetOffset, GetPresContext()->AppUnitsPerDevPixel());
+        }
+      }
+    }
+  } else {
+    aMouseEvent->mWidget = nullptr;
+  }
+
+  LayoutDeviceIntPoint caretPoint;
+  if (PrepareToUseCaretPosition(MOZ_KnownLive(aMouseEvent->mWidget),
+                                caretPoint)) {
+    int32_t devPixelRatio = GetPresContext()->AppUnitsPerDevPixel();
+    caretPoint = LayoutDeviceIntPoint::FromAppUnitsToNearest(
+        ViewportUtils::LayoutToVisual(
+            LayoutDeviceIntPoint::ToAppUnits(caretPoint, devPixelRatio),
+            GetPresContext()->PresShell()),
+        devPixelRatio);
+    aMouseEvent->mRefPoint = caretPoint;
+    return true;
+  }
+
+  RefPtr<Element> currentFocus = nsFocusManager::GetFocusedElementStatic();
+
+  if (currentFocus) {
+    nsCOMPtr<nsIContent> currentPointElement;
+    GetCurrentItemAndPositionForElement(
+        currentFocus, getter_AddRefs(currentPointElement),
+        aMouseEvent->mRefPoint, MOZ_KnownLive(aMouseEvent->mWidget));
+    if (currentPointElement) {
+      mPresShell->mCurrentEventTarget.SetFrameAndContent(
+          aMouseEvent->mMessage, nullptr, currentPointElement);
+      mPresShell->GetCurrentEventFrame();
+    }
+  }
+
+  return true;
+}
+
+bool PresShell::EventHandler::PrepareToUseCaretPosition(
+    nsIWidget* aEventWidget, LayoutDeviceIntPoint& aTargetPt) {
+  nsresult rv;
+
+  RefPtr<nsCaret> caret = mPresShell->GetActiveCaret();
+  NS_ENSURE_TRUE(caret, false);
+
+  bool caretVisible = caret->IsVisible();
+  if (!caretVisible) {
+    return false;
+  }
+
+  Selection* domSelection = caret->GetSelection();
+  NS_ENSURE_TRUE(domSelection, false);
+
+  nsIFrame* frame = nullptr;  
+  nsINode* node = domSelection->GetFocusNode();
+  NS_ENSURE_TRUE(node, false);
+  nsCOMPtr<nsIContent> content = nsIContent::FromNode(node);
+  if (content) {
+    nsIContent* nonNative = content->FindFirstNonChromeOnlyAccessContent();
+    content = nonNative;
+  }
+
+  if (content) {
+    rv = MOZ_KnownLive(mPresShell)
+             ->ScrollContentIntoView(
+                 content,
+                 AxisScrollParams(WhereToScroll::Nearest,
+                                  WhenToScroll::IfNotVisible),
+                 AxisScrollParams(WhereToScroll::Nearest,
+                                  WhenToScroll::IfNotVisible),
+                 ScrollFlags::ScrollOverflowHidden);
+    NS_ENSURE_SUCCESS(rv, false);
+    frame = content->GetPrimaryFrame();
+    NS_WARNING_ASSERTION(frame, "No frame for focused content?");
+  }
+
+  const nsCOMPtr<nsISelectionController> selCon =
+      frame ? frame->GetSelectionController()
+            : static_cast<nsISelectionController*>(mPresShell);
+  if (selCon) {
+    rv = selCon->ScrollSelectionIntoView(
+        SelectionType::eNormal, nsISelectionController::SELECTION_FOCUS_REGION,
+        SelectionScrollMode::SyncFlush);
+    NS_ENSURE_SUCCESS(rv, false);
+  }
+
+  nsPresContext* presContext = GetPresContext();
+
+  if (!aEventWidget) {
+    return false;
+  }
+  nsRect caretCoords;
+  nsIFrame* caretFrame = caret->GetGeometry(&caretCoords);
+  if (!caretFrame) {
+    return false;
+  }
+
+  if (aEventWidget) {
+    if (auto offset =
+            nsLayoutUtils::FrameToWidgetOffset(caretFrame, aEventWidget)) {
+      caretCoords.MoveBy(*offset);
+    }
+  }
+
+  aTargetPt.x =
+      presContext->AppUnitsToDevPixels(caretCoords.x + caretCoords.width);
+  aTargetPt.y =
+      presContext->AppUnitsToDevPixels(caretCoords.y + caretCoords.height);
+
+  aTargetPt.y -= 1;
+
+  return true;
+}
+
+void PresShell::EventHandler::GetCurrentItemAndPositionForElement(
+    Element* aFocusedElement, nsIContent** aTargetToUse,
+    LayoutDeviceIntPoint& aTargetPt, nsIWidget* aRootWidget) {
+  nsCOMPtr<nsIContent> focusedContent = aFocusedElement;
+  MOZ_KnownLive(mPresShell)
+      ->ScrollContentIntoView(focusedContent, AxisScrollParams(),
+                              AxisScrollParams(),
+                              ScrollFlags::ScrollOverflowHidden);
+
+  nsPresContext* presContext = GetPresContext();
+
+  bool istree = false, checkLineHeight = true;
+  nscoord extraTreeY = 0;
+
+  nsCOMPtr<Element> item;
+  nsCOMPtr<nsIDOMXULMultiSelectControlElement> multiSelect =
+      aFocusedElement->AsXULMultiSelectControl();
+  if (multiSelect) {
+    checkLineHeight = false;
+
+    int32_t currentIndex;
+    multiSelect->GetCurrentIndex(&currentIndex);
+    if (currentIndex >= 0) {
+      RefPtr<XULTreeElement> tree = XULTreeElement::FromNode(focusedContent);
+      if (tree) {
+        tree->EnsureRowIsVisible(currentIndex);
+        int32_t firstVisibleRow = tree->GetFirstVisibleRow();
+        int32_t rowHeight = tree->RowHeight();
+
+        extraTreeY += nsPresContext::CSSPixelsToAppUnits(
+            (currentIndex - firstVisibleRow + 1) * rowHeight);
+        istree = true;
+
+        RefPtr<nsTreeColumns> cols = tree->GetColumns();
+        if (cols) {
+          nsTreeColumn* col = cols->GetFirstColumn();
+          if (col) {
+            RefPtr<Element> colElement = col->Element();
+            nsIFrame* frame = colElement->GetPrimaryFrame();
+            if (frame) {
+              extraTreeY += frame->GetSize().height;
+            }
+          }
+        }
+      } else {
+        multiSelect->GetCurrentItem(getter_AddRefs(item));
+      }
+    }
+  } else {
+    nsCOMPtr<nsIDOMXULMenuListElement> menulist =
+        aFocusedElement->AsXULMenuList();
+    if (!menulist) {
+      nsCOMPtr<nsIDOMXULSelectControlElement> select =
+          aFocusedElement->AsXULSelectControl();
+      if (select) {
+        checkLineHeight = false;
+        select->GetSelectedItem(getter_AddRefs(item));
+      }
+    }
+  }
+
+  if (item) {
+    focusedContent = item;
+  }
+
+  if (nsIFrame* frame = focusedContent->GetPrimaryFrame()) {
+    NS_ASSERTION(
+        frame->PresContext() == GetPresContext(),
+        "handling event for focused content that is not in our document?");
+
+    nsPoint widgetOffset;
+    if (aRootWidget) {
+      if (auto offset =
+              nsLayoutUtils::FrameToWidgetOffset(frame, aRootWidget)) {
+        widgetOffset = *offset;
+      }
+    }
+
+    nscoord extra = 0;
+    if (!istree) {
+      extra = frame->GetSize().height;
+      if (checkLineHeight) {
+        ScrollContainerFrame* scrollContainerFrame =
+            nsLayoutUtils::GetNearestScrollContainerFrame(
+                frame, nsLayoutUtils::SCROLLABLE_INCLUDE_HIDDEN |
+                           nsLayoutUtils::SCROLLABLE_FIXEDPOS_FINDS_ROOT);
+        if (scrollContainerFrame) {
+          nsSize scrollAmount = scrollContainerFrame->GetLineScrollAmount();
+          int32_t APD = presContext->AppUnitsPerDevPixel();
+          int32_t scrollAPD =
+              scrollContainerFrame->PresContext()->AppUnitsPerDevPixel();
+          scrollAmount = scrollAmount.ScaleToOtherAppUnits(scrollAPD, APD);
+          if (extra > scrollAmount.height) {
+            extra = scrollAmount.height;
+          }
+        }
+      }
+    }
+
+    aTargetPt.x = presContext->AppUnitsToDevPixels(widgetOffset.x);
+    aTargetPt.y =
+        presContext->AppUnitsToDevPixels(widgetOffset.y + extra + extraTreeY);
+  }
+
+  NS_IF_ADDREF(*aTargetToUse = focusedContent);
+}
+
+bool PresShell::ShouldIgnoreInvalidation() {
+  return mPaintingSuppressed || !mIsActive || mIsNeverPainting;
+}
+
+void PresShell::WillPaint() {
+  if (!mIsActive || mPaintingSuppressed || !IsVisible()) {
+    return;
+  }
+
+  nsRootPresContext* rootPresContext = mPresContext->GetRootPresContext();
+  if (!rootPresContext) {
+    return;
+  }
+
+  rootPresContext->FlushWillPaintObservers();
+  if (mIsDestroying) {
+    return;
+  }
+
+  FlushPendingNotifications(ChangesToFlush(FlushType::InterruptibleLayout,
+                                            false,
+                                            false));
+  if (mIsDestroying) {
+    return;
+  }
+  mDocument->EnumerateSubDocuments(
+      [](Document& aSubdoc) MOZ_CAN_RUN_SCRIPT_BOUNDARY_LAMBDA {
+        if (RefPtr ps = aSubdoc.GetPresShell()) {
+          if (!ps->IsUnderHiddenEmbedderElement()) {
+            ps->WillPaint();
+          }
+        }
+        return CallState::Continue;
+      });
+}
+
+void PresShell::DidPaintWindow() {
+  if (mHasReceivedPaintMessage) {
+    return;
+  }
+  mHasReceivedPaintMessage = true;
+  nsPIDOMWindowOuter* win = mDocument->GetWindow();
+  if (!win || !nsGlobalWindowOuter::Cast(win)->IsChromeWindow()) {
+    return;
+  }
+  if (nsCOMPtr<nsIObserverService> obsvc = services::GetObserverService()) {
+    obsvc->NotifyObservers(win, "widget-first-paint", nullptr);
+  }
+}
+
+nsSubDocumentFrame* PresShell::GetInProcessEmbedderFrame() const {
+  nsIFrame* f = mEmbedderFrame.GetFrame();
+  MOZ_ASSERT_IF(f, f->IsSubDocumentFrame());
+  return static_cast<nsSubDocumentFrame*>(f);
+}
+
+bool PresShell::IsVisible() const {
+  return mIsActive && !IsUnderHiddenEmbedderElement();
+}
+
+void PresShell::SuppressDisplayport(bool aEnabled) {
+  if (aEnabled) {
+    mActiveSuppressDisplayport++;
+  } else if (mActiveSuppressDisplayport > 0) {
+    bool isSuppressed = IsDisplayportSuppressed();
+    mActiveSuppressDisplayport--;
+    if (isSuppressed && !IsDisplayportSuppressed()) {
+      if (nsIFrame* rootFrame = mFrameConstructor->GetRootFrame()) {
+        rootFrame->SchedulePaint();
+      }
+    }
+  }
+}
+
+static bool sDisplayPortSuppressionRespected = true;
+
+void PresShell::RespectDisplayportSuppression(bool aEnabled) {
+  bool isSuppressed = IsDisplayportSuppressed();
+  sDisplayPortSuppressionRespected = aEnabled;
+  if (isSuppressed && !IsDisplayportSuppressed()) {
+    if (nsIFrame* rootFrame = mFrameConstructor->GetRootFrame()) {
+      rootFrame->SchedulePaint();
+    }
+  }
+}
+
+bool PresShell::IsDisplayportSuppressed() {
+  return sDisplayPortSuppressionRespected && mActiveSuppressDisplayport > 0;
+}
+
+static CallState FreezeSubDocument(Document& aDocument) {
+  if (PresShell* presShell = aDocument.GetPresShell()) {
+    presShell->Freeze();
+  }
+  return CallState::Continue;
+}
+
+void PresShell::Freeze(bool aIncludeSubDocuments) {
+  mUpdateApproximateFrameVisibilityEvent.Revoke();
+
+  MaybeReleaseCapturingContent();
+
+  if (mCaret) {
+    SetCaretEnabled(false);
+  }
+
+  mPaintingSuppressed = true;
+
+  if (aIncludeSubDocuments && mDocument) {
+    mDocument->EnumerateSubDocuments(FreezeSubDocument);
+  }
+
+  nsPresContext* presContext = GetPresContext();
+  if (presContext) {
+    if (presContext->RefreshDriver()->GetPresContext() == presContext) {
+      presContext->RefreshDriver()->Freeze();
+    }
+
+    if (nsPresContext* rootPresContext = presContext->GetRootPresContext()) {
+      rootPresContext->ResetUserInputEventsAllowed();
+    }
+  }
+
+  mFrozen = true;
+  if (mDocument) {
+    UpdateImageLockingState();
+  }
+}
+
+void PresShell::FireOrClearDelayedEvents(bool aFireEvents) {
+  mNoDelayedMouseEvents = false;
+  mNoDelayedKeyEvents = false;
+  mNoDelayedSingleTap = false;
+  if (!aFireEvents) {
+    mDelayedEvents.Clear();
+    return;
+  }
+
+  if (mDocument) {
+    RefPtr<Document> doc = mDocument;
+    while (!mIsDestroying && mDelayedEvents.Length() &&
+           !doc->EventHandlingSuppressed()) {
+      UniquePtr<DelayedEvent> ev = std::move(mDelayedEvents[0]);
+      mDelayedEvents.RemoveElementAt(0);
+      if (ev->IsKeyPressEvent() && mIsLastKeyDownCanceled) {
+        continue;
+      }
+      ev->Dispatch();
+    }
+    if (!doc->EventHandlingSuppressed()) {
+      mDelayedEvents.Clear();
+    }
+  }
+}
+
+void PresShell::Thaw(bool aIncludeSubDocuments) {
+  nsPresContext* presContext = GetPresContext();
+  if (presContext &&
+      presContext->RefreshDriver()->GetPresContext() == presContext) {
+    presContext->RefreshDriver()->Thaw();
+  }
+
+  if (aIncludeSubDocuments && mDocument) {
+    mDocument->EnumerateSubDocuments([](Document& aSubDoc) {
+      if (PresShell* presShell = aSubDoc.GetPresShell()) {
+        presShell->Thaw();
+      }
+      return CallState::Continue;
+    });
+  }
+
+  ActivenessMaybeChanged();
+
+  mFrozen = false;
+  UpdateImageLockingState();
+
+  UnsuppressPainting();
+
+  if (presContext && presContext->IsRoot()) {
+    if (!presContext->RefreshDriver()->HasPendingTick()) {
+      presContext->RefreshDriver()->InitializeTimer();
+    }
+  }
+}
+
+
+void PresShell::WillCauseReflow() {
+  nsContentUtils::AddScriptBlocker();
+  ++mChangeNestCount;
+}
+
+void PresShell::DidCauseReflow() {
+  NS_ASSERTION(mChangeNestCount != 0, "Unexpected call to DidCauseReflow()");
+  --mChangeNestCount;
+  nsContentUtils::RemoveScriptBlocker();
+}
+
+void PresShell::WillDoReflow() {
+  mDocument->FlushUserFontSet();
+
+  mPresContext->FlushCounterStyles();
+
+  mPresContext->FlushFontFeatureValues();
+
+  mPresContext->FlushFontPaletteValues();
+
+  mLastReflowStart = GetPerformanceNowUnclamped();
+}
+
+void PresShell::DidDoReflow(bool aInterruptible) {
+  MOZ_ASSERT(mPendingDidDoReflow);
+  if (!nsContentUtils::IsSafeToRunScript()) {
+    SetNeedLayoutFlush();
+    return;
+  }
+
+  auto clearPendingDidDoReflow =
+      MakeScopeExit([&] { mPendingDidDoReflow = false; });
+
+  mHiddenContentInForcedLayout.Clear();
+
+  HandlePostedReflowCallbacks(aInterruptible);
+
+  if (mIsDestroying) {
+    return;
+  }
+
+  {
+    nsAutoScriptBlocker scriptBlocker;
+    AutoAssertNoFlush noReentrantFlush(*this);
+    if (nsCOMPtr<nsIDocShell> docShell = mPresContext->GetDocShell()) {
+      DOMHighResTimeStamp now = GetPerformanceNowUnclamped();
+      docShell->NotifyReflowObservers(aInterruptible, mLastReflowStart, now);
+    }
+
+    SynthesizeMouseMove(false);
+
+    mPresContext->NotifyMissingFonts();
+  }
+
+  if (mIsDestroying) {
+    return;
+  }
+
+  if (mDirtyRoots.IsEmpty()) {
+    if (mShouldUnsuppressPainting) {
+      mShouldUnsuppressPainting = false;
+      UnsuppressAndInvalidate();
+    }
+  } else {
+    EnsureLayoutFlush();
+  }
+}
+
+DOMHighResTimeStamp PresShell::GetPerformanceNowUnclamped() {
+  DOMHighResTimeStamp now = 0;
+
+  if (nsPIDOMWindowInner* window = mDocument->GetInnerWindow()) {
+    Performance* perf = window->GetPerformance();
+
+    if (perf) {
+      now = perf->NowUnclamped();
+    }
+  }
+
+  return now;
+}
+
+bool PresShell::DoReflow(nsIFrame* target, bool aInterruptible,
+                         OverflowChangedTracker* aOverflowTracker) {
+  gfxTextPerfMetrics* tp = mPresContext->GetTextPerfMetrics();
+  TimeStamp timeStart;
+  if (tp) {
+    tp->Accumulate();
+    tp->reflowCount++;
+    timeStart = TimeStamp::Now();
+  }
+
+  SelectionNodeCache cache(*this);
+
+  target->SchedulePaint(nsIFrame::PAINT_DEFAULT, false);
+
+  FlushPendingScrollAnchorSelections();
+
+  const bool isRoot = target == mFrameConstructor->GetRootFrame();
+
+  MOZ_ASSERT(isRoot || aOverflowTracker,
+             "caller must provide overflow tracker when reflowing "
+             "non-root frames");
+
+  UniquePtr<gfxContext> rcx(CreateReferenceRenderingContext());
+
+#if defined(DEBUG)
+  mCurrentReflowRoot = target;
+#endif
+
+  WritingMode wm = target->GetWritingMode();
+  LogicalSize size(wm);
+  if (isRoot) {
+    size = LogicalSize(wm, mPresContext->GetVisibleArea().Size());
+  } else {
+    size = target->GetLogicalSize();
+  }
+
+  OverflowAreas oldOverflow;  
+  if (!isRoot) {
+    oldOverflow = target->GetOverflowAreas();
+  }
+
+  NS_ASSERTION(!target->GetNextInFlow() && !target->GetPrevInFlow(),
+               "reflow roots should never split");
+
+  LogicalSize reflowSize(wm, size.ISize(wm), NS_UNCONSTRAINEDSIZE);
+  ReflowInput reflowInput(mPresContext, target, rcx.get(), reflowSize,
+                          ReflowInput::InitFlag::CallerWillInit);
+
+  if (isRoot) {
+    reflowInput.Init(mPresContext);
+  } else {
+    reflowInput.Init(mPresContext, Nothing(),
+                     Some(target->GetLogicalUsedBorder(wm)),
+                     Some(target->GetLogicalUsedPadding(wm)));
+  }
+
+  NS_ASSERTION(reflowInput.ComputedPhysicalMargin() == nsMargin(0, 0, 0, 0),
+               "reflow input should not set margin for reflow roots");
+  if (size.BSize(wm) != NS_UNCONSTRAINEDSIZE) {
+    nscoord computedBSize =
+        size.BSize(wm) -
+        reflowInput.ComputedLogicalBorderPadding(wm).BStartEnd(wm);
+    computedBSize = std::max(computedBSize, 0);
+    reflowInput.SetComputedBSize(computedBSize);
+  }
+  NS_ASSERTION(
+      reflowInput.ComputedISize() ==
+          size.ISize(wm) -
+              reflowInput.ComputedLogicalBorderPadding(wm).IStartEnd(wm),
+      "reflow input computed incorrect inline size");
+
+  mPresContext->ReflowStarted(aInterruptible);
+  mIsReflowing = true;
+
+  nsReflowStatus status;
+  ReflowOutput desiredSize(reflowInput);
+  target->Reflow(mPresContext, desiredSize, reflowInput, status);
+
+  nsRect boundsRelativeToTarget =
+      nsRect(0, 0, desiredSize.Width(), desiredSize.Height());
+  const bool isBSizeLimitReflow =
+      isRoot && size.BSize(wm) == NS_UNCONSTRAINEDSIZE;
+  NS_ASSERTION(isBSizeLimitReflow || desiredSize.Size(wm) == size,
+               "non-root frame's desired size changed during an "
+               "incremental reflow");
+  NS_ASSERTION(status.IsEmpty(), "reflow roots should never split");
+
+  target->SetSize(boundsRelativeToTarget.Size());
+  target->DidReflow(mPresContext, nullptr);
+  if (target->IsInScrollAnchorChain()) {
+    ScrollAnchorContainer* container = ScrollAnchorContainer::FindFor(target);
+    PostPendingScrollAnchorAdjustment(container);
+  }
+  if (MOZ_UNLIKELY(isBSizeLimitReflow)) {
+    mPresContext->SetVisibleArea(boundsRelativeToTarget);
+  }
+
+#if defined(DEBUG)
+  mCurrentReflowRoot = nullptr;
+#endif
+
+  if (!isRoot && oldOverflow != target->GetOverflowAreas()) {
+    aOverflowTracker->AddFrame(target->GetParent(),
+                               OverflowChangedTracker::CHILDREN_CHANGED);
+  }
+
+  NS_ASSERTION(
+      mPresContext->HasPendingInterrupt() || mFramesToDirty.Count() == 0,
+      "Why do we need to dirty anything if not interrupted?");
+
+  mIsReflowing = false;
+  bool interrupted = mPresContext->HasPendingInterrupt();
+  if (interrupted) {
+    for (const auto& key : mFramesToDirty) {
+      for (nsIFrame* f = key; f && !f->IsSubtreeDirty(); f = f->GetParent()) {
+        f->AddStateBits(NS_FRAME_HAS_DIRTY_CHILDREN);
+        if (f->IsFlexItem()) {
+          nsFlexContainerFrame::MarkCachedFlexMeasurementsDirty(f);
+        }
+
+        if (f == target) {
+          break;
+        }
+      }
+    }
+
+    NS_ASSERTION(target->IsSubtreeDirty(), "Why is the target not dirty?");
+    mDirtyRoots.Add(target);
+    SetNeedLayoutFlush();
+
+#if defined(NOISY_INTERRUPTIBLE_REFLOW)
+    printf("mFramesToDirty.Count() == %u\n", mFramesToDirty.Count());
+#endif
+    mFramesToDirty.Clear();
+
+    mWasLastReflowInterrupted = true;
+    EnsureLayoutFlush();
+  }
+
+  if (tp) {
+    if (tp->current.numChars > 100) {
+      TimeDuration reflowTime = TimeStamp::Now() - timeStart;
+      LogTextPerfStats(tp, this, tp->current, reflowTime.ToMilliseconds(),
+                       eLog_reflow, nullptr);
+    }
+    tp->Accumulate();
+  }
+
+  return !interrupted;
+}
+
+#define NS_LONG_REFLOW_TIME_MS 5000
+
+bool PresShell::ProcessReflowCommands(bool aInterruptible) {
+  if (mDirtyRoots.IsEmpty() && !mShouldUnsuppressPainting &&
+      !mPendingDidDoReflow) {
+    return true;
+  }
+
+  const bool wasProcessingReflowCommands = mProcessingReflowCommands;
+  auto restoreProcessingReflowCommands = MakeScopeExit(
+      [&] { mProcessingReflowCommands = wasProcessingReflowCommands; });
+  mProcessingReflowCommands = true;
+
+  auto timerStart = mozilla::TimeStamp::Now();
+  bool interrupted = false;
+  if (!mDirtyRoots.IsEmpty()) {
+    const PRIntervalTime deadline =
+        aInterruptible
+            ? PR_IntervalNow() + PR_MicrosecondsToInterval(gMaxRCProcessingTime)
+            : (PRIntervalTime)0;
+
+    nsAutoScriptBlocker scriptBlocker;
+    WillDoReflow();
+    AUTO_LAYOUT_PHASE_ENTRY_POINT(GetPresContext(), Reflow);
+
+    OverflowChangedTracker overflowTracker;
+
+    do {
+      nsIFrame* target = mDirtyRoots.PopShallowestRoot();
+
+      if (!target->IsSubtreeDirty()) {
+        continue;
+      }
+
+      interrupted = !DoReflow(target, aInterruptible, &overflowTracker);
+
+    } while (!interrupted && !mDirtyRoots.IsEmpty() &&
+             (!aInterruptible || PR_IntervalNow() < deadline));
+
+    interrupted = !mDirtyRoots.IsEmpty();
+
+    overflowTracker.Flush();
+
+    if (!interrupted) {
+      FlushPendingScrollAnchorAdjustments();
+    }
+    mPendingDidDoReflow = true;
+  }
+
+  if (!mIsDestroying && mPendingDidDoReflow && !wasProcessingReflowCommands) {
+    DidDoReflow(aInterruptible);
+  }
+
+  {
+    TimeDuration elapsed = TimeStamp::Now() - timerStart;
+    int32_t intElapsed = int32_t(elapsed.ToMilliseconds());
+    if (intElapsed > NS_LONG_REFLOW_TIME_MS) {
+
+    }
+  }
+
+  return !interrupted;
+}
+
+bool PresShell::DoFlushLayout(bool aInterruptible) {
+  mFrameConstructor->RecalcQuotesAndCounters();
+  return ProcessReflowCommands(aInterruptible);
+}
+
+void PresShell::WindowSizeMoveDone() {
+  if (mPresContext) {
+    EventStateManager::ClearGlobalActiveContent(nullptr);
+    ClearMouseCapture();
+  }
+}
+
+NS_IMETHODIMP
+PresShell::Observe(nsISupports* aSubject, const char* aTopic,
+                   const char16_t* aData) {
+  if (mIsDestroying) {
+    NS_WARNING("our observers should have been unregistered by now");
+    return NS_OK;
+  }
+
+  if (!nsCRT::strcmp(aTopic, "memory-pressure")) {
+    if (!AssumeAllFramesVisible() &&
+        mPresContext->IsRootContentDocumentInProcess()) {
+      DoUpdateApproximateFrameVisibility( true);
+    }
+    return NS_OK;
+  }
+
+  if (!nsCRT::strcmp(aTopic, "font-info-updated")) {
+    bool needsReframe = aData && !!aData[0];
+    mPresContext->ForceReflowForFontInfoUpdate(needsReframe);
+    return NS_OK;
+  }
+
+  if (!nsCRT::strcmp(aTopic, "internal-look-and-feel-changed")) {
+    auto kind = widget::ThemeChangeKind(aData[0]);
+    mPresContext->ThemeChanged(kind);
+    return NS_OK;
+  }
+
+  NS_WARNING(nsPrintfCString("unrecognized topic %s", aTopic).get());
+  return NS_ERROR_FAILURE;
+}
+
+bool PresShell::AddRefreshObserver(nsARefreshObserver* aObserver,
+                                   FlushType aFlushType,
+                                   const char* aObserverDescription) {
+  nsPresContext* presContext = GetPresContext();
+  if (MOZ_UNLIKELY(!presContext)) {
+    return false;
+  }
+  presContext->RefreshDriver()->AddRefreshObserver(aObserver, aFlushType,
+                                                   aObserverDescription);
+  return true;
+}
+
+bool PresShell::RemoveRefreshObserver(nsARefreshObserver* aObserver,
+                                      FlushType aFlushType) {
+  nsPresContext* presContext = GetPresContext();
+  return presContext && presContext->RefreshDriver()->RemoveRefreshObserver(
+                            aObserver, aFlushType);
+}
+
+bool PresShell::AddPostRefreshObserver(nsAPostRefreshObserver* aObserver) {
+  nsPresContext* presContext = GetPresContext();
+  if (!presContext) {
+    return false;
+  }
+  presContext->RefreshDriver()->AddPostRefreshObserver(aObserver);
+  return true;
+}
+
+bool PresShell::RemovePostRefreshObserver(nsAPostRefreshObserver* aObserver) {
+  nsPresContext* presContext = GetPresContext();
+  if (!presContext) {
+    return false;
+  }
+  presContext->RefreshDriver()->RemovePostRefreshObserver(aObserver);
+  return true;
+}
+
+void PresShell::ScheduleFlush() {
+  if (MOZ_UNLIKELY(IsDestroying()) ||
+      MOZ_UNLIKELY(mDocument->GetBFCacheEntry())) {
+    return;
+  }
+  mPresContext->RefreshDriver()->ScheduleRenderingPhase(RenderingPhase::Layout);
+}
+
+
+
+PresShell::DelayedInputEvent::DelayedInputEvent()
+    : DelayedEvent(), mEvent(nullptr) {}
+
+PresShell::DelayedInputEvent::~DelayedInputEvent() { delete mEvent; }
+
+void PresShell::DelayedInputEvent::Dispatch() {
+  if (!mEvent || !mEvent->mWidget) {
+    return;
+  }
+  nsCOMPtr<nsIWidget> widget = mEvent->mWidget;
+  widget->DispatchEvent(mEvent);
+}
+
+PresShell::DelayedMouseEvent::DelayedMouseEvent(WidgetMouseEvent* aEvent) {
+  MOZ_DIAGNOSTIC_ASSERT(aEvent->IsTrusted());
+  WidgetMouseEvent* mouseEvent =
+      new WidgetMouseEvent(true, aEvent->mMessage, aEvent->mWidget,
+                           aEvent->mReason, aEvent->mContextMenuTrigger);
+  mouseEvent->AssignMouseEventData(*aEvent, false);
+  mEvent = mouseEvent;
+}
+
+PresShell::DelayedPointerEvent::DelayedPointerEvent(
+    WidgetPointerEvent* aEvent) {
+  MOZ_DIAGNOSTIC_ASSERT(aEvent->IsTrusted());
+  MOZ_ASSERT(aEvent->mMessage == eContextMenu);
+  WidgetPointerEvent* pointerEvent = new WidgetPointerEvent(
+      true, aEvent->mMessage, aEvent->mWidget, aEvent->mContextMenuTrigger);
+  pointerEvent->AssignPointerEventData(*aEvent, false);
+  mEvent = pointerEvent;
+}
+
+PresShell::DelayedKeyEvent::DelayedKeyEvent(WidgetKeyboardEvent* aEvent) {
+  MOZ_DIAGNOSTIC_ASSERT(aEvent->IsTrusted());
+  WidgetKeyboardEvent* keyEvent =
+      new WidgetKeyboardEvent(true, aEvent->mMessage, aEvent->mWidget);
+  keyEvent->AssignKeyEventData(*aEvent, false);
+  keyEvent->mFlags.mIsSynthesizedForTests =
+      aEvent->mFlags.mIsSynthesizedForTests;
+  keyEvent->mFlags.mIsSuppressedOrDelayed = true;
+  mEvent = keyEvent;
+}
+
+bool PresShell::DelayedKeyEvent::IsKeyPressEvent() {
+  return mEvent->mMessage == eKeyPress;
+}
+
+#if defined(DEBUG)
+void PresShell::ListComputedStyles(FILE* out, int32_t aIndent) {
+  nsIFrame* rootFrame = GetRootFrame();
+  if (rootFrame) {
+    rootFrame->Style()->List(out, aIndent);
+  }
+
+  Element* rootElement = mDocument->GetRootElement();
+  if (rootElement) {
+    nsIFrame* rootElementFrame = rootElement->GetPrimaryFrame();
+    if (rootElementFrame) {
+      rootElementFrame->Style()->List(out, aIndent);
+    }
+  }
+}
+#endif
+
+#if defined(DEBUG) || 0
+void PresShell::ListStyleSheets(FILE* out, int32_t aIndent) {
+  auto ListStyleSheetsAtOrigin = [this, out, aIndent](StyleOrigin origin) {
+    int32_t sheetCount = StyleSet()->SheetCount(origin);
+    for (int32_t i = 0; i < sheetCount; ++i) {
+      StyleSet()->SheetAt(origin, i)->List(out, aIndent);
+    }
+  };
+
+  ListStyleSheetsAtOrigin(StyleOrigin::UserAgent);
+  ListStyleSheetsAtOrigin(StyleOrigin::User);
+  ListStyleSheetsAtOrigin(StyleOrigin::Author);
+}
+#endif
+
+
+nsIFrame* PresShell::GetAbsoluteContainingBlock(nsIFrame* aFrame) {
+  return FrameConstructor()->GetAbsoluteContainingBlock(
+      aFrame, nsCSSFrameConstructor::ABS_POS);
+}
+
+nsIFrame* PresShell::GetAnchorPosAnchor(
+    const ScopedNameRef& aName, const nsIFrame* aPositionedFrame) const {
+  MOZ_ASSERT(aName.mName);
+  MOZ_ASSERT(!aName.mName->IsEmpty());
+  MOZ_ASSERT(mLazyAnchorPosAnchorChanges.IsEmpty());
+  if (aName.mName == nsGkAtoms::AnchorPosImplicitAnchor) {
+    return AnchorPositioningUtils::GetAnchorPosImplicitAnchor(aPositionedFrame)
+        .mAnchorFrame;
+  }
+  if (const auto& entry = mAnchorPosAnchors.Lookup(aName.mName)) {
+    return AnchorPositioningUtils::FindFirstAcceptableAnchor(
+        aName, aPositionedFrame, entry.Data());
+  }
+  return nullptr;
+}
+
+void PresShell::CollectAnchorNames(const nsIFrame* aPositionedFrame,
+                                   nsTArray<nsString>& aResult) {
+  const auto* pos = aPositionedFrame->StylePosition();
+  StyleCascadeLevel anchorTreeScope = pos->mPositionAnchor.scope;
+
+  for (auto iter = mAnchorPosAnchors.Iter(); !iter.Done(); iter.Next()) {
+    const auto& name = iter.Key();
+    ScopedNameRef scopedName{name, anchorTreeScope};
+    if (AnchorPositioningUtils::FindFirstAcceptableAnchor(
+            scopedName, aPositionedFrame, iter.Data())) {
+      aResult.AppendElement(nsDependentAtomString(name));
+    }
+  }
+}
+
+void PresShell::AddAnchorPosAnchorImpl(const nsAtom* aName, nsIFrame* aFrame,
+                                       bool aForMerge) {
+  MOZ_ASSERT(aName);
+
+  auto& entry = mAnchorPosAnchors.LookupOrInsertWith(
+      aName, []() { return nsTArray<nsIFrame*>(); });
+
+  if (entry.IsEmpty()) {
+    entry.AppendElement(aFrame);
+    return;
+  }
+
+  struct FrameTreeComparator {
+    nsIFrame* mFrame;
+
+    int32_t operator()(nsIFrame* aOther) const {
+      return nsLayoutUtils::CompareTreePosition(mFrame, aOther, nullptr);
+    }
+  };
+
+  FrameTreeComparator cmp{aFrame};
+
+  size_t matchOrInsertionIdx = entry.Length();
+  if (BinarySearchIf(entry, 0, entry.Length(), cmp, &matchOrInsertionIdx)) {
+    if (entry.ElementAt(matchOrInsertionIdx) == aFrame) {
+      MOZ_ASSERT_UNREACHABLE("Attempt to insert a frame twice was made");
+      return;
+    }
+    MOZ_ASSERT(!entry.Contains(aFrame));
+
+    if (!aForMerge) {
+      mLazyAnchorPosAnchorChanges.AppendElement(
+          AnchorPosAnchorChange{RefPtr<const nsAtom>(aName), aFrame});
+      return;
+    }
+  }
+
+  MOZ_ASSERT(!entry.Contains(aFrame));
+  entry.InsertElementAt(matchOrInsertionIdx, aFrame);
+}
+
+void PresShell::AddAnchorPosAnchor(const nsAtom* aName, nsIFrame* aFrame) {
+  AddAnchorPosAnchorImpl(aName, aFrame,  false);
+}
+
+void PresShell::RemoveAnchorPosAnchor(const nsAtom* aName, nsIFrame* aFrame) {
+  MOZ_ASSERT(aName);
+
+  if (!mLazyAnchorPosAnchorChanges.IsEmpty()) {
+    mLazyAnchorPosAnchorChanges.RemoveElementsBy(
+        [&](const AnchorPosAnchorChange& change) {
+          return change.mFrame == aFrame;
+        });
+  }
+
+  auto entry = mAnchorPosAnchors.Lookup(aName);
+  if (!entry) {
+    return;  
+  }
+
+#if defined(ACCESSIBILITY)
+  if (nsAccessibilityService* accService = GetAccService()) {
+    accService->NotifyAnchorRemoved(this, aFrame);
+  }
+#endif
+
+  auto& anchorArray = entry.Data();
+
+
+  anchorArray.RemoveElement(aFrame);
+  if (anchorArray.IsEmpty()) {
+    entry.Remove();
+  }
+}
+
+void PresShell::MergeAnchorPosAnchorChanges() {
+  for (const auto& [name, frame] : mLazyAnchorPosAnchorChanges) {
+    AddAnchorPosAnchorImpl(name, frame,  true);
+  }
+
+  mLazyAnchorPosAnchorChanges.Clear();
+}
+
+static bool NeedReflowForAnchorPos(
+    const nsIFrame* aAnchor, const nsIFrame* aPositioned,
+    const Maybe<AnchorPosResolutionData>& aData) {
+  const bool validityChanged = (aAnchor && !aData) || (!aAnchor && aData);
+  if (validityChanged) {
+    return true;
+  }
+  if (!aData) {
+    return false;
+  }
+  if (!aAnchor) {
+    MOZ_ASSERT_UNREACHABLE("Anchor is supposed to be valid");
+    return false;
+  }
+  const auto& anchorReference = aData.ref();
+  const auto border = aPositioned->GetParent()->GetUsedBorder();
+  const nsPoint borderTopLeft{border.left, border.top};
+  const auto anchorRect = AnchorPositioningUtils::ReassembleAnchorRect(
+                              aAnchor, aPositioned->GetParent()) -
+                          borderTopLeft;
+  if (anchorReference.mSize != anchorRect.Size()) {
+    return true;
+  }
+  if (!anchorReference.mOffsetData) {
+    return false;
+  }
+
+  const auto nearestScrollFrameInfo =
+      AnchorPositioningUtils::GetNearestScrollFrame(aAnchor);
+  if (anchorReference.mOffsetData->mDistanceToNearestScrollContainer !=
+      nearestScrollFrameInfo.mDistance) {
+    return true;
+  }
+
+  const auto newOrigin = anchorRect.TopLeft();
+  const auto& prevOrigin = anchorReference.mOffsetData.ref().mOrigin;
+  return newOrigin != prevOrigin;
+}
+
+struct DefaultAnchorInfo {
+  const nsAtom* mName;
+  StyleCascadeLevel mTreeScope;
+  const nsIFrame* mAnchor;
+  DistanceToNearestScrollContainer mDistanceToNearestScrollContainer;
+};
+
+PresShell::AnchorPosUpdateResult PresShell::UpdateAnchorPosLayout() {
+  if (mAnchorPosPositioned.IsEmpty()) {
+    return AnchorPosUpdateResult::NotApplicable;
+  }
+
+  DoFlushLayout( false);
+
+  auto result = AnchorPosUpdateResult::Flushed;
+  for (auto* positioned : mAnchorPosPositioned) {
+    MOZ_ASSERT(positioned->IsAbsolutelyPositioned(),
+               "Anchor positioned frame is not absolutely positioned?");
+    const auto* anchorPosReferenceData =
+        positioned->GetProperty(nsIFrame::AnchorPosReferences());
+    if (!anchorPosReferenceData || anchorPosReferenceData->IsEmpty()) {
+      continue;
+    }
+    if (positioned->HasAnyStateBits(NS_FRAME_IS_DIRTY)) {
+      continue;
+    }
+    const auto defaultAnchorInfo = [&]() -> Maybe<DefaultAnchorInfo> {
+      auto usedAnchorName = AnchorPositioningUtils::GetUsedAnchorName(
+          positioned, ScopedNameRef{nullptr, StyleCascadeLevel::Default()});
+      if (!usedAnchorName) {
+        return Nothing{};
+      }
+      const ScopedNameRef& usedName = *usedAnchorName;
+      const auto* anchor = GetAnchorPosAnchor(usedName, positioned);
+      if (!anchor) {
+        return Nothing{};
+      }
+      const auto nearestScrollFrame =
+          AnchorPositioningUtils::GetNearestScrollFrame(anchor);
+      return Some(DefaultAnchorInfo{usedName.mName, usedName.mTreeScope, anchor,
+                                    nearestScrollFrame.mDistance});
+    }();
+    bool shouldReflow = false;
+    if (defaultAnchorInfo &&
+        defaultAnchorInfo->mDistanceToNearestScrollContainer !=
+            anchorPosReferenceData->mDistanceToDefaultScrollContainer) {
+      shouldReflow = true;
+    } else {
+      const auto GetAnchor =
+          [&](const ScopedNameRef& aNameRef,
+              const nsIFrame* aPositioned) -> const nsIFrame* {
+        if (!defaultAnchorInfo) {
+          return GetAnchorPosAnchor(aNameRef, aPositioned);
+        }
+        const auto* defaultAnchorName = defaultAnchorInfo->mName;
+        if (aNameRef.mName != defaultAnchorName) {
+          return GetAnchorPosAnchor(aNameRef, aPositioned);
+        }
+        return defaultAnchorInfo->mAnchor;
+      };
+      for (const auto& kv : *anchorPosReferenceData) {
+        const auto& data = kv.GetData();
+        const auto& anchorKey = kv.GetKey();
+        const auto* anchor = GetAnchor(anchorKey, positioned);
+        if (NeedReflowForAnchorPos(anchor, positioned, data)) {
+          shouldReflow = true;
+          break;
+        }
+      }
+    }
+    if (shouldReflow) {
+      result = AnchorPosUpdateResult::NeedReflow;
+      MarkPositionedFrameForReflow(positioned);
+    }
+  }
+  return result;
+}
+
+void PresShell::ActivenessMaybeChanged() {
+  if (!mDocument) {
+    return;
+  }
+  SetIsActive(ComputeActiveness());
+}
+
+bool PresShell::ComputeActiveness() const {
+  MOZ_LOG(gLog, LogLevel::Debug,
+          ("PresShell::ComputeActiveness(%s, %d)\n",
+           mDocument->GetDocumentURI()
+               ? mDocument->GetDocumentURI()->GetSpecOrDefault().get()
+               : "(no uri)",
+           mIsActive));
+
+  Document* doc = mDocument;
+
+  if (doc->IsBeingUsedAsImage()) {
+    return true;
+  }
+
+  if (Document* displayDoc = doc->GetDisplayDocument()) {
+    MOZ_ASSERT(!doc->GetBrowsingContext(),
+               "external resource doc shouldn't have its own BC");
+    doc = displayDoc;
+  }
+
+  BrowsingContext* bc = doc->GetBrowsingContext();
+  const bool inActiveTab = bc && bc->IsActive();
+
+  MOZ_LOG(gLog, LogLevel::Debug,
+          (" > BrowsingContext %p  active: %d", bc, inActiveTab));
+
+  if (false && bc &&
+      bc->IsTop()) {
+    MOZ_LOG(gLog, LogLevel::Debug, (" > Activeness overridden by pref"));
+    return true;
+  }
+
+  Document* root = nsContentUtils::GetInProcessSubtreeRootDocument(doc);
+  if (auto* browserChild = BrowserChild::GetFrom(root->GetDocShell())) {
+    if (!browserChild->IsVisible()) {
+      MOZ_LOG(gLog, LogLevel::Debug,
+              (" > BrowserChild %p is not visible", browserChild));
+      return false;
+    }
+
+    if (!browserChild->IsPreservingLayers()) {
+      MOZ_LOG(gLog, LogLevel::Debug,
+              (" > BrowserChild %p is visible and not preserving layers",
+               browserChild));
+      return true;
+    }
+    MOZ_LOG(
+        gLog, LogLevel::Debug,
+        (" > BrowserChild %p is visible and preserving layers", browserChild));
+  }
+  return inActiveTab;
+}
+
+void PresShell::SetIsActive(bool aIsActive) {
+  MOZ_ASSERT(mDocument, "should only be called with a document");
+
+  const bool activityChanged = mIsActive != aIsActive;
+
+  mIsActive = aIsActive;
+
+  nsPresContext* presContext = GetPresContext();
+  if (presContext &&
+      presContext->RefreshDriver()->GetPresContext() == presContext) {
+    presContext->RefreshDriver()->SetActivity(aIsActive);
+  }
+
+  if (activityChanged) {
+    auto recurse = [aIsActive](Document& aSubDoc) {
+      if (PresShell* presShell = aSubDoc.GetPresShell()) {
+        presShell->SetIsActive(aIsActive);
+      }
+      return CallState::Continue;
+    };
+    mDocument->EnumerateExternalResources(recurse);
+    mDocument->EnumerateSubDocuments(recurse);
+  }
+
+  UpdateImageLockingState();
+
+  if (activityChanged) {
+  }
+
+  if (aIsActive) {
+#if defined(ACCESSIBILITY)
+    if (nsAccessibilityService* accService = GetAccService()) {
+      accService->PresShellActivated(this);
+    }
+#endif
+    if (nsIFrame* rootFrame = GetRootFrame()) {
+      rootFrame->SchedulePaint();
+    }
+  }
+}
+
+MobileViewportManager* PresShell::GetMobileViewportManager() const {
+  return mMobileViewportManager;
+}
+
+Maybe<MobileViewportManager::ManagerType> UseMobileViewportManager(
+    PresShell* aPresShell, Document* aDocument) {
+  if (nsIWidget* widget = aPresShell->GetNearestWidget()) {
+    if (!widget->AsyncPanZoomEnabled()) {
+      return Nothing();
+    }
+  }
+  if (nsLayoutUtils::ShouldHandleMetaViewport(aDocument)) {
+    return Some(MobileViewportManager::ManagerType::VisualAndMetaViewport);
+  }
+  if (nsLayoutUtils::AllowZoomingForDocument(aDocument)) {
+    return Some(MobileViewportManager::ManagerType::VisualViewportOnly);
+  }
+  return Nothing();
+}
+
+void PresShell::MaybeRecreateMobileViewportManager(bool aAfterInitialization) {
+  Maybe<MobileViewportManager::ManagerType> mvmType =
+      UseMobileViewportManager(this, mDocument);
+
+  if (mvmType.isNothing() && !mMobileViewportManager) {
+    return;
+  }
+  if (mvmType && mMobileViewportManager &&
+      *mvmType == mMobileViewportManager->GetManagerType()) {
+    return;
+  }
+
+  if (!mPresContext->IsRootContentDocumentCrossProcess()) {
+    MOZ_ASSERT(!mMobileViewportManager, "We never create MVMs for subframes");
+    return;
+  }
+
+  if (mMobileViewportManager) {
+    mMobileViewportManager->Destroy();
+    mMobileViewportManager = nullptr;
+    mMVMContext = nullptr;
+
+    ResetVisualViewportSize();
+  }
+
+  if (mvmType) {
+    MOZ_ASSERT(!mMobileViewportManager);
+
+    mMVMContext = MakeRefPtr<GeckoMVMContext>(mDocument, this);
+    mMobileViewportManager =
+        MakeRefPtr<MobileViewportManager>(mMVMContext, *mvmType);
+    if (MOZ_UNLIKELY(
+            MOZ_LOG_TEST(MobileViewportManager::gLog, LogLevel::Debug))) {
+      nsIURI* uri = mDocument->GetDocumentURI();
+      MOZ_LOG(
+          MobileViewportManager::gLog, LogLevel::Debug,
+          ("Created MVM %p (type %d) for URI %s", mMobileViewportManager.get(),
+           (int)*mvmType, uri ? uri->GetSpecOrDefault().get() : "(null)"));
+    }
+    if (BrowserChild* browserChild = BrowserChild::GetFrom(this)) {
+      mMobileViewportManager->UpdateKeyboardHeight(
+          browserChild->GetKeyboardHeight());
+    }
+  }
+
+  if (aAfterInitialization) {
+    if (mMobileViewportManager) {
+      mMobileViewportManager->SetInitialViewport();
+    } else {
+      ForceResizeReflowWithCurrentDimensions();
+    }
+    SetResolutionAndScaleTo(1.0f, ResolutionChangeOrigin::MainThreadRestore);
+  }
+}
+
+bool PresShell::UsesMobileViewportSizing() const {
+  return mMobileViewportManager &&
+         nsLayoutUtils::ShouldHandleMetaViewport(mDocument);
+}
+
+void PresShell::UpdateImageLockingState() {
+  const bool locked = !mFrozen && mIsActive;
+  if (locked == mDocument->GetLockingImages()) {
+    return;
+  }
+  mDocument->SetLockingImages(locked);
+  if (locked) {
+    for (const auto& key : mApproximatelyVisibleFrames) {
+      if (nsImageFrame* imageFrame = do_QueryFrame(key)) {
+        imageFrame->MaybeDecodeForPredictedSize();
+      }
+    }
+  }
+}
+
+nsIWidget* PresShell::GetRootWidget() const {
+  if (!mPresContext) {
+    return nullptr;
+  }
+  for (nsPresContext* pc = mPresContext; pc; pc = pc->GetParentPresContext()) {
+    if (auto* widget = pc->PresShell()->GetOwnWidget()) {
+      return widget;
+    }
+  }
+  return nullptr;
+}
+
+PresShell* PresShell::GetRootPresShell() const {
+  if (mPresContext) {
+    nsPresContext* rootPresContext = mPresContext->GetRootPresContext();
+    if (rootPresContext) {
+      return rootPresContext->PresShell();
+    }
+  }
+  return nullptr;
+}
+
+void PresShell::AddSizeOfIncludingThis(nsWindowSizes& aSizes) const {
+  MallocSizeOf mallocSizeOf = aSizes.mState.mMallocSizeOf;
+  mFrameArena.AddSizeOfExcludingThis(aSizes, Arena::ArenaKind::PresShell);
+  aSizes.mLayoutPresShellSize += mallocSizeOf(this);
+  if (mCaret) {
+    aSizes.mLayoutPresShellSize += mCaret->SizeOfIncludingThis(mallocSizeOf);
+  }
+  aSizes.mLayoutPresShellSize +=
+      mApproximatelyVisibleFrames.ShallowSizeOfExcludingThis(mallocSizeOf) +
+      mFramesToDirty.ShallowSizeOfExcludingThis(mallocSizeOf) +
+      mPendingScrollAnchorSelection.ShallowSizeOfExcludingThis(mallocSizeOf) +
+      mPendingScrollAnchorAdjustment.ShallowSizeOfExcludingThis(mallocSizeOf);
+
+  aSizes.mLayoutTextRunsSize += SizeOfTextRuns(mallocSizeOf);
+
+  aSizes.mLayoutPresContextSize +=
+      mPresContext->SizeOfIncludingThis(mallocSizeOf);
+
+  mFrameConstructor->AddSizeOfIncludingThis(aSizes);
+}
+
+size_t PresShell::SizeOfTextRuns(MallocSizeOf aMallocSizeOf) const {
+  nsIFrame* rootFrame = mFrameConstructor->GetRootFrame();
+  if (!rootFrame) {
+    return 0;
+  }
+
+  nsLayoutUtils::SizeOfTextRunsForFrames(rootFrame, nullptr,
+                                          true);
+
+  return nsLayoutUtils::SizeOfTextRunsForFrames(rootFrame, aMallocSizeOf,
+                                                 false);
+}
+
+void PresShell::MarkPositionedFrameForReflow(nsIFrame* aFrame) {
+  FrameNeedsReflow(aFrame, IntrinsicDirty::None, NS_FRAME_HAS_DIRTY_CHILDREN,
+                   ReflowRootHandling::PositionOrSizeChange);
+}
+
+void PresShell::MarkFixedFramesForReflow() {
+  if (nsIFrame* rootFrame = mFrameConstructor->GetRootFrame()) {
+    const nsFrameList& childList =
+        rootFrame->GetChildList(FrameChildListID::Absolute);
+    for (nsIFrame* childFrame : childList) {
+      MarkPositionedFrameForReflow(childFrame);
+    }
+  }
+}
+
+void PresShell::MarkStickyFramesForReflow() {
+  ScrollContainerFrame* sc = GetRootScrollContainerFrame();
+  if (!sc) {
+    return;
+  }
+
+  StickyScrollContainer* ssc = sc->GetStickyContainer();
+  if (!ssc) {
+    return;
+  }
+
+  ssc->MarkFramesForReflow();
+}
+
+static void AppendSubtree(nsIDocShell* aDocShell,
+                          nsTArray<nsCOMPtr<nsIDocumentViewer>>& aArray) {
+  if (nsCOMPtr<nsIDocumentViewer> viewer = aDocShell->GetDocViewer()) {
+    aArray.AppendElement(viewer);
+  }
+
+  int32_t n = aDocShell->GetInProcessChildCount();
+  for (int32_t i = 0; i < n; i++) {
+    nsCOMPtr<nsIDocShellTreeItem> childItem;
+    aDocShell->GetInProcessChildAt(i, getter_AddRefs(childItem));
+    if (childItem) {
+      nsCOMPtr<nsIDocShell> child(do_QueryInterface(childItem));
+      AppendSubtree(child, aArray);
+    }
+  }
+}
+
+void PresShell::MaybeReflowForInflationScreenSizeChange() {
+  nsPresContext* pc = GetPresContext();
+  const bool fontInflationWasEnabled = FontSizeInflationEnabled();
+  RecomputeFontSizeInflationEnabled();
+  bool changed = false;
+  if (FontSizeInflationEnabled() && FontSizeInflationMinTwips() != 0) {
+    pc->ScreenSizeInchesForFontInflation(&changed);
+  }
+
+  changed = changed || fontInflationWasEnabled != FontSizeInflationEnabled();
+  if (!changed) {
+    return;
+  }
+  if (nsCOMPtr<nsIDocShell> docShell = pc->GetDocShell()) {
+    nsTArray<nsCOMPtr<nsIDocumentViewer>> array;
+    AppendSubtree(docShell, array);
+    for (uint32_t i = 0, iEnd = array.Length(); i < iEnd; ++i) {
+      nsCOMPtr<nsIDocumentViewer> viewer = array[i];
+      if (RefPtr<PresShell> descendantPresShell = viewer->GetPresShell()) {
+        nsIFrame* rootFrame = descendantPresShell->GetRootFrame();
+        if (rootFrame) {
+          descendantPresShell->FrameNeedsReflow(
+              rootFrame, IntrinsicDirty::FrameAncestorsAndDescendants,
+              NS_FRAME_IS_DIRTY);
+        }
+      }
+    }
+  }
+}
+
+void PresShell::CompleteChangeToVisualViewportSize() {
+  if (!mIsReflowing) {
+    if (ScrollContainerFrame* sf = GetRootScrollContainerFrame()) {
+      sf->MarkScrollbarsDirtyForReflow();
+    }
+    MarkFixedFramesForReflow();
+  }
+
+  MaybeReflowForInflationScreenSizeChange();
+
+  if (auto* window = nsGlobalWindowInner::Cast(mDocument->GetInnerWindow())) {
+    window->VisualViewport()->PostResizeEvent();
+  }
+}
+
+void PresShell::SetVisualViewportSize(nscoord aWidth, nscoord aHeight) {
+  MOZ_ASSERT(aWidth >= 0.0 && aHeight >= 0.0);
+
+  if (!mVisualViewportSizeSet || mVisualViewportSize.width != aWidth ||
+      mVisualViewportSize.height != aHeight) {
+    mVisualViewportSizeSet = true;
+    mVisualViewportSize.width = aWidth;
+    mVisualViewportSize.height = aHeight;
+
+    CompleteChangeToVisualViewportSize();
+  }
+}
+
+void PresShell::ResetVisualViewportSize() {
+  if (mVisualViewportSizeSet) {
+    mVisualViewportSizeSet = false;
+    mVisualViewportSize.width = 0;
+    mVisualViewportSize.height = 0;
+
+    CompleteChangeToVisualViewportSize();
+  }
+}
+
+void PresShell::SetNeedsWindowPropertiesSync() {
+  if (XRE_IsContentProcess() || !IsRoot()) {
+    return;
+  }
+  mNeedsWindowPropertiesSync = true;
+  SchedulePaint();
+}
+
+nsSize PresShell::GetVisualViewportSize() const {
+  NS_ASSERTION(mVisualViewportSizeSet,
+               "asking for visual viewport size when its not set?");
+  DynamicToolbarState state = GetDynamicToolbarState();
+  return (state == DynamicToolbarState::InTransition ||
+          state == DynamicToolbarState::Collapsed)
+             ? GetVisualViewportSizeUpdatedByDynamicToolbar()
+             : mVisualViewportSize;
+}
+
+bool PresShell::SetVisualViewportOffset(const nsPoint& aScrollOffset,
+                                        const nsPoint& aPrevLayoutScrollPos) {
+  nsPoint newOffset = aScrollOffset;
+  ScrollContainerFrame* rootScrollContainerFrame =
+      GetRootScrollContainerFrame();
+  if (rootScrollContainerFrame) {
+    nsRect scrollRange =
+        rootScrollContainerFrame->GetScrollRangeForUserInputEvents();
+    if (!scrollRange.Contains(newOffset)) {
+      newOffset.x = std::min(newOffset.x, scrollRange.XMost());
+      newOffset.x = std::max(newOffset.x, scrollRange.x);
+      newOffset.y = std::min(newOffset.y, scrollRange.YMost());
+      newOffset.y = std::max(newOffset.y, scrollRange.y);
+    }
+  }
+
+  nsPoint prevOffset = aPrevLayoutScrollPos;
+  if (mVisualViewportOffset.isSome()) {
+    prevOffset = *mVisualViewportOffset;
+  }
+  if (prevOffset == newOffset) {
+    return false;
+  }
+
+  mVisualViewportOffset = Some(newOffset);
+
+  if (auto* window = nsGlobalWindowInner::Cast(mDocument->GetInnerWindow())) {
+    window->VisualViewport()->PostScrollEvent(prevOffset, aPrevLayoutScrollPos);
+  }
+
+  if (IsVisualViewportSizeSet() && rootScrollContainerFrame) {
+    rootScrollContainerFrame->Anchor()->UserScrolled();
+  }
+
+  if (gfxPlatform::UseDesktopZoomingScrollbars()) {
+    if (rootScrollContainerFrame) {
+      rootScrollContainerFrame->UpdateScrollbarPosition();
+    }
+  }
+
+  return true;
+}
+
+void PresShell::ResetVisualViewportOffset() { mVisualViewportOffset.reset(); }
+
+void PresShell::RefreshViewportSize() {
+  if (mMobileViewportManager) {
+    mMobileViewportManager->RefreshViewportSize(false);
+  }
+}
+
+void PresShell::ScrollToVisual(const nsPoint& aVisualViewportOffset,
+                               ScrollOffsetUpdateType aUpdateType,
+                               ScrollMode aMode) {
+  if (aMode == ScrollMode::Smooth || aMode == ScrollMode::SmoothMsd) {
+    if (ScrollContainerFrame* sf = GetRootScrollContainerFrame()) {
+      if (sf->SmoothScrollVisual(aVisualViewportOffset, aUpdateType, aMode)) {
+        return;
+      }
+    }
+  }
+
+  SetPendingVisualScrollUpdate(aVisualViewportOffset, aUpdateType);
+}
+
+void PresShell::SetPendingVisualScrollUpdate(
+    const nsPoint& aVisualViewportOffset, ScrollOffsetUpdateType aUpdateType) {
+  mPendingVisualScrollUpdate =
+      Some(VisualScrollUpdate{aVisualViewportOffset, aUpdateType});
+
+  if (nsIFrame* rootFrame = GetRootFrame()) {
+    rootFrame->SchedulePaint();
+  }
+}
+
+void PresShell::ClearPendingVisualScrollUpdate() {
+  if (mPendingVisualScrollUpdate && mPendingVisualScrollUpdate->mAcknowledged) {
+    mPendingVisualScrollUpdate = mozilla::Nothing();
+  }
+}
+
+void PresShell::AcknowledgePendingVisualScrollUpdate() {
+  MOZ_ASSERT(mPendingVisualScrollUpdate);
+  mPendingVisualScrollUpdate->mAcknowledged = true;
+}
+
+nsPoint PresShell::GetVisualViewportOffsetRelativeToLayoutViewport() const {
+  return GetVisualViewportOffset() - GetLayoutViewportOffset();
+}
+
+nsPoint PresShell::GetLayoutViewportOffset() const {
+  nsPoint result;
+  if (ScrollContainerFrame* sf = GetRootScrollContainerFrame()) {
+    result = sf->GetScrollPosition();
+  }
+  return result;
+}
+
+nsSize PresShell::GetLayoutViewportSize() const {
+  nsSize result;
+  if (ScrollContainerFrame* sf = GetRootScrollContainerFrame()) {
+    result = sf->GetScrollPortRect().Size();
+  }
+  return result;
+}
+
+nsSize PresShell::GetInnerSize() const {
+  if (ScrollContainerFrame* sf = GetRootScrollContainerFrame()) {
+    return sf->GetSizeForWindowInnerSize();
+  }
+  return mPresContext->GetVisibleArea().Size();
+}
+
+nsSize PresShell::GetVisualViewportSizeUpdatedByDynamicToolbar() const {
+  NS_ASSERTION(mVisualViewportSizeSet,
+               "asking for visual viewport size when its not set?");
+  if (!mMobileViewportManager) {
+    return mVisualViewportSize;
+  }
+
+  MOZ_ASSERT(GetDynamicToolbarState() == DynamicToolbarState::InTransition ||
+             GetDynamicToolbarState() == DynamicToolbarState::Collapsed);
+
+  nsSize sizeUpdatedByDynamicToolbar =
+      mMobileViewportManager->GetVisualViewportSizeUpdatedByDynamicToolbar();
+  return sizeUpdatedByDynamicToolbar == nsSize() ? mVisualViewportSize
+                                                 : sizeUpdatedByDynamicToolbar;
+}
+
+nsSize PresShell::GetFixedViewportSize() const {
+  nsSize layoutViewportSize = GetLayoutViewportSize();
+  if (!mPresContext->IsKeyboardHiddenOrResizesContentMode()) {
+    return layoutViewportSize;
+  }
+  layoutViewportSize.height +=
+      mPresContext->GetBimodalDynamicToolbarHeightForFixedPosInAppUnits();
+  return layoutViewportSize;
+}
+
+void PresShell::RecomputeFontSizeInflationEnabled() {
+  mFontSizeInflationEnabled = DetermineFontSizeInflationState();
+}
+
+bool PresShell::DetermineFontSizeInflationState() {
+  MOZ_ASSERT(mPresContext, "our pres context should not be null");
+  if (mPresContext->IsChrome()) {
+    return false;
+  }
+
+  if (FontSizeInflationEmPerLine() == 0 && FontSizeInflationMinTwips() == 0) {
+    return false;
+  }
+
+  if (!FontSizeInflationForceEnabled()) {
+    if (BrowserChild* tab = BrowserChild::GetFrom(this)) {
+      if (!tab->AsyncPanZoomEnabled()) {
+        return false;
+      }
+    }
+  }
+
+  Maybe<LayoutDeviceIntSize> displaySize;
+  if (mPresContext->IsRootContentDocumentCrossProcess()) {
+    if (mMobileViewportManager) {
+      displaySize = Some(mMobileViewportManager->DisplaySize());
+    }
+  } else if (PresShell* rootPresShell = GetRootPresShell()) {
+    if (auto mvm = rootPresShell->GetMobileViewportManager()) {
+      displaySize = Some(mvm->DisplaySize());
+    }
+  }
+
+  if (!displaySize) {
+
+
+    nsPresContext* topContext =
+        mPresContext->GetInProcessRootContentDocumentPresContext();
+    LayoutDeviceIntSize result;
+    if (!nsLayoutUtils::GetDocumentViewerSize(topContext, result)) {
+      return false;
+    }
+    displaySize = Some(result);
+  }
+
+  ScreenIntSize screenSize = ViewAs<ScreenPixel>(
+      displaySize.value(),
+      PixelCastJustification::LayoutDeviceIsScreenForBounds);
+  nsViewportInfo vInf = GetDocument()->GetViewportInfo(screenSize);
+
+  CSSToScreenScale defaultScale =
+      mPresContext->CSSToDevPixelScale() * LayoutDeviceToScreenScale(1.0);
+
+  if (vInf.GetDefaultZoom() >= defaultScale || vInf.IsAutoSizeEnabled()) {
+    return false;
+  }
+
+  return true;
+}
+
+static nsIWidget* GetPresContextContainerWidget(nsPresContext* aPresContext) {
+  nsCOMPtr<nsISupports> container = aPresContext->Document()->GetContainer();
+  nsCOMPtr<nsIBaseWindow> baseWindow = do_QueryInterface(container);
+  if (!baseWindow) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIWidget> mainWidget;
+  baseWindow->GetMainWidget(getter_AddRefs(mainWidget));
+  return mainWidget;
+}
+
+static bool IsTopLevelWidget(nsIWidget* aWidget) {
+  using WindowType = mozilla::widget::WindowType;
+
+  auto windowType = aWidget->GetWindowType();
+  return windowType == WindowType::TopLevel ||
+         windowType == WindowType::Dialog || windowType == WindowType::Popup;
+}
+
+PresShell::WindowSizeConstraints PresShell::GetWindowSizeConstraints() {
+  nsSize minSize(0, 0);
+  nsSize maxSize(NS_UNCONSTRAINEDSIZE, NS_UNCONSTRAINEDSIZE);
+  nsIFrame* rootFrame = FrameConstructor()->GetRootElementStyleFrame();
+  if (!rootFrame || !mPresContext) {
+    return {minSize, maxSize};
+  }
+  const auto* pos = rootFrame->StylePosition();
+  const auto anchorResolutionParams =
+      AnchorPosResolutionParams::From(rootFrame);
+  if (const auto styleMinWidth = pos->GetMinWidth(anchorResolutionParams);
+      styleMinWidth->ConvertsToLength()) {
+    minSize.width = styleMinWidth->ToLength();
+  }
+  if (const auto styleMinHeight = pos->GetMinHeight(anchorResolutionParams);
+      styleMinHeight->ConvertsToLength()) {
+    minSize.height = styleMinHeight->ToLength();
+  }
+  if (const auto maxWidth = pos->GetMaxWidth(anchorResolutionParams);
+      maxWidth->ConvertsToLength()) {
+    maxSize.width = maxWidth->ToLength();
+  }
+  if (const auto maxHeight = pos->GetMaxHeight(anchorResolutionParams);
+      maxHeight->ConvertsToLength()) {
+    maxSize.height = maxHeight->ToLength();
+  }
+  return {minSize, maxSize};
+}
+
+void PresShell::PaintSynchronously() {
+  MOZ_ASSERT(!mIsPainting, "re-entrant paint?");
+  if (IsNeverPainting() || IsPaintingSuppressed() || !IsVisible() ||
+      MOZ_UNLIKELY(NS_WARN_IF(mIsPainting))) {
+    return;
+  }
+  RefPtr widget = GetOwnWidget();
+  if (!widget) {
+    return;
+  }
+  MOZ_ASSERT(widget->IsTopLevelWidget());
+  if (!widget->NeedsPaint()) {
+    return;
+  }
+
+  WillPaint();
+
+  if (MOZ_UNLIKELY(mIsDestroying)) {
+    return;
+  }
+
+  FlushDelayedResize();
+
+  mIsPainting = true;
+  auto cleanUpPaintingBit = MakeScopeExit([&] { mIsPainting = false; });
+  nsAutoScriptBlocker blocker;
+  RefPtr<WindowRenderer> renderer = widget->GetWindowRenderer();
+  PaintAndRequestComposite(GetRootFrame(), renderer, PaintFlags::None);
+}
+
+void PresShell::SyncWindowPropertiesIfNeeded() {
+  if (!mNeedsWindowPropertiesSync) {
+    return;
+  }
+
+  mNeedsWindowPropertiesSync = false;
+
+  RefPtr pc = mPresContext;
+  if (!pc) {
+    return;
+  }
+
+  nsCOMPtr<nsIWidget> windowWidget = GetPresContextContainerWidget(pc);
+  if (!windowWidget || !IsTopLevelWidget(windowWidget)) {
+    return;
+  }
+
+  nsIFrame* rootFrame = FrameConstructor()->GetRootElementStyleFrame();
+  if (!rootFrame) {
+    return;
+  }
+
+  windowWidget->SetColorScheme(
+      Some(LookAndFeel::ColorSchemeForFrame(rootFrame)));
+
+  AutoWeakFrame weak(rootFrame);
+  auto* canvas = GetCanvasFrame();
+  windowWidget->SetTransparencyMode(nsLayoutUtils::GetFrameTransparency(
+      canvas ? canvas : rootFrame, rootFrame));
+  if (!weak.IsAlive()) {
+    return;
+  }
+
+  const auto& constraints = GetWindowSizeConstraints();
+  nsContainerFrame::SetSizeConstraints(pc, windowWidget, constraints.mMinSize,
+                                       constraints.mMaxSize);
+}
+
+nsresult PresShell::HasRuleProcessorUsedByMultipleStyleSets(uint32_t aSheetType,
+                                                            bool* aRetVal) {
+  *aRetVal = false;
+  return NS_OK;
+}
+
+void PresShell::NotifyStyleSheetServiceSheetAdded(StyleSheet* aSheet,
+                                                  uint32_t aSheetType) {
+  switch (aSheetType) {
+    case nsIStyleSheetService::AGENT_SHEET:
+      AddAgentSheet(aSheet);
+      break;
+    case nsIStyleSheetService::USER_SHEET:
+      AddUserSheet(aSheet);
+      break;
+    case nsIStyleSheetService::AUTHOR_SHEET:
+      AddAuthorSheet(aSheet);
+      break;
+    default:
+      MOZ_ASSERT_UNREACHABLE("unexpected aSheetType value");
+      break;
+  }
+}
+
+void PresShell::NotifyStyleSheetServiceSheetRemoved(StyleSheet* aSheet,
+                                                    uint32_t aSheetType) {
+  StyleSet()->RemoveStyleSheet(*aSheet);
+  mDocument->ApplicableStylesChanged();
+}
+
+Result<nsIContent*, nsresult> PresShell::EventHandler::GetOverrideClickTarget(
+    WidgetGUIEvent* aGUIEvent, nsIFrame* aFrameForPresShell,
+    nsIContent* aPointerCapturingContent) {
+  if (aGUIEvent->mMessage != eMouseUp) {
+    return nullptr;
+  }
+
+  auto overrideClickTargetOrError = [&]() -> Result<nsIContent*, nsresult> {
+    if (PointerEventHandler::ShouldDispatchClickEventOnCapturingElement() &&
+        aPointerCapturingContent) {
+      return aGUIEvent->AsMouseEvent()->mInputSource ==
+                     MouseEvent_Binding::MOZ_SOURCE_TOUCH
+                 ? nullptr
+                 : aPointerCapturingContent;
+    }
+
+    if (MOZ_UNLIKELY(!aFrameForPresShell)) {
+      return Err(NS_ERROR_FAILURE);
+    }
+
+    MOZ_ASSERT(aGUIEvent->mClass == eMouseEventClass);
+    WidgetMouseEvent* mouseEvent = aGUIEvent->AsMouseEvent();
+
+    uint32_t flags = 0;
+    RelativeTo relativeTo{aFrameForPresShell};
+    nsPoint eventPoint =
+        nsLayoutUtils::GetEventCoordinatesRelativeTo(aGUIEvent, relativeTo);
+    if (mouseEvent->mIgnoreRootScrollFrame) {
+      flags |= INPUT_IGNORE_ROOT_SCROLL_FRAME;
+    }
+
+    nsIFrame* target =
+        FindFrameTargetedByInputEvent(aGUIEvent, relativeTo, eventPoint, flags);
+    if (!target) {
+      return nullptr;
+    }
+    return target->GetContent();
+  }();
+  if (MOZ_UNLIKELY(overrideClickTargetOrError.isErr())) {
+    return overrideClickTargetOrError;
+  }
+  return overrideClickTargetOrError.inspect()
+             ? overrideClickTargetOrError.inspect()
+                   ->GetInclusiveFlattenedTreeAncestorElement()
+             : nullptr;
+}
+
+
+void PresShell::EventHandler::EventTargetData::SetFrameAndComputePresShell(
+    nsIFrame* aFrameToHandleEvent) {
+  if (aFrameToHandleEvent) {
+    mFrame = aFrameToHandleEvent;
+    mPresShell = aFrameToHandleEvent->PresShell();
+  } else {
+    mFrame = nullptr;
+    mPresShell = nullptr;
+  }
+}
+
+void PresShell::EventHandler::EventTargetData::
+    SetFrameAndComputePresShellAndContent(nsIFrame* aFrameToHandleEvent,
+                                          WidgetGUIEvent* aGUIEvent) {
+  MOZ_ASSERT(aFrameToHandleEvent);
+  MOZ_ASSERT(aGUIEvent);
+
+  SetFrameAndComputePresShell(aFrameToHandleEvent);
+  SetContentForEventFromFrame(aGUIEvent);
+}
+
+void PresShell::EventHandler::EventTargetData::SetContentForEventFromFrame(
+    WidgetGUIEvent* aGUIEvent) {
+  MOZ_ASSERT(mFrame);
+  mContent = mFrame->GetEventTargetContent(aGUIEvent);
+  AssertIfEventTargetContentAndFrameContentMismatch(aGUIEvent);
+}
+
+nsIContent* PresShell::EventHandler::EventTargetData::GetFrameContent() const {
+  return mFrame ? mFrame->GetContent() : nullptr;
+}
+
+void PresShell::EventHandler::EventTargetData::
+    AssertIfEventTargetContentAndFrameContentMismatch(
+        const WidgetGUIEvent* aGUIEvent) const {
+#if defined(DEBUG)
+  if (!mContent || !mFrame || !mFrame->GetContent()) {
+    return;
+  }
+
+  if (aGUIEvent) {
+    MOZ_ASSERT(mContent == mFrame->GetEventTargetContent(aGUIEvent));
+    return;
+  }
+  if (mContent->IsHTMLElement(nsGkAtoms::area)) {
+    MOZ_ASSERT(mContent->GetPrimaryFrame() == mFrame);
+    return;
+  }
+
+  if (!mContent->IsElement()) {
+    MOZ_ASSERT(mContent == mFrame->GetContent());
+    return;
+  }
+  const Element* const closestInclusiveAncestorElement =
+      mFrame->GetContent()->GetInclusiveFlattenedTreeAncestorElement();
+  if (closestInclusiveAncestorElement == mContent) {
+    return;
+  }
+  if (closestInclusiveAncestorElement->IsInNativeAnonymousSubtree() &&
+      (mContent == closestInclusiveAncestorElement
+                       ->FindFirstNonChromeOnlyAccessContent())) {
+    return;
+  }
+  NS_WARNING(nsPrintfCString("mContent=%s", ToString(*mContent).c_str()).get());
+  NS_WARNING(nsPrintfCString("mFrame->GetContent()=%s",
+                             ToString(*mFrame->GetContent()).c_str())
+                 .get());
+  MOZ_ASSERT(mContent == mFrame->GetContent());
+#endif
+}
+
+bool PresShell::EventHandler::EventTargetData::MaybeRetargetToActiveDocument(
+    WidgetGUIEvent* aGUIEvent) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(mFrame);
+  MOZ_ASSERT(mPresShell);
+  MOZ_ASSERT(!mContent, "Doesn't support to retarget the content");
+
+  EventStateManager* activeESM =
+      EventStateManager::GetActiveEventStateManager();
+  if (!activeESM) {
+    return false;
+  }
+
+  if (aGUIEvent->mClass != ePointerEventClass &&
+      !aGUIEvent->HasMouseEventMessage()) {
+    return false;
+  }
+
+  if (activeESM == GetEventStateManager()) {
+    return false;
+  }
+
+  if (aGUIEvent->ShouldIgnoreCapturingContent()) {
+    return false;
+  }
+
+  nsPresContext* activePresContext = activeESM->GetPresContext();
+  if (!activePresContext) {
+    return false;
+  }
+
+  PresShell* activePresShell = activePresContext->GetPresShell();
+  if (!activePresShell) {
+    return false;
+  }
+
+  if (!nsContentUtils::ContentIsCrossDocDescendantOf(
+          activePresShell->GetDocument(), GetDocument())) {
+    return false;
+  }
+
+  SetFrameAndComputePresShell(activePresShell->GetRootFrame());
+  return true;
+}
+
+bool PresShell::EventHandler::EventTargetData::ComputeElementFromFrame(
+    WidgetGUIEvent* aGUIEvent) {
+  MOZ_ASSERT(aGUIEvent);
+  MOZ_ASSERT(aGUIEvent->IsUsingCoordinates());
+  MOZ_ASSERT(mPresShell);
+  MOZ_ASSERT(mFrame);
+
+  SetContentForEventFromFrame(aGUIEvent);
+
+  if (!mContent) {
+    return true;
+  }
+
+  mContent = mContent->GetInclusiveFlattenedTreeAncestorElement();
+
+  return !!mContent;
+}
+
+void PresShell::EventHandler::EventTargetData::UpdateWheelEventTarget(
+    WidgetGUIEvent* aGUIEvent) {
+  MOZ_ASSERT(aGUIEvent);
+
+  if (aGUIEvent->mMessage != eWheel) {
+    return;
+  }
+
+  nsIFrame* groupFrame = WheelTransaction::GetEventTargetFrame();
+  if (!groupFrame) {
+    return;
+  }
+
+  SetFrameAndComputePresShellAndContent(groupFrame, aGUIEvent);
+}
+
+void PresShell::EventHandler::EventTargetData::UpdateTouchEventTarget(
+    WidgetGUIEvent* aGUIEvent) {
+  MOZ_ASSERT(aGUIEvent);
+
+  if (aGUIEvent->mClass != eTouchEventClass) {
+    return;
+  }
+
+  if (aGUIEvent->mMessage == eTouchStart) {
+    WidgetTouchEvent* touchEvent = aGUIEvent->AsTouchEvent();
+    nsIFrame* newFrame =
+        TouchManager::SuppressInvalidPointsAndGetTargetedFrame(touchEvent);
+    if (!newFrame) {
+      return;
+    }
+    SetFrameAndComputePresShellAndContent(newFrame, aGUIEvent);
+    return;
+  }
+
+  PresShell* newPresShell = PresShell::GetShellForTouchEvent(aGUIEvent);
+  if (!newPresShell) {
+    return;  
+  }
+
+  mPresShell = newPresShell;
+}
+
+void PresShell::EndPaint() {
+  ClearPendingVisualScrollUpdate();
+
+  if (mDocument) {
+    mDocument->EnumerateSubDocuments([](Document& aSubDoc) {
+      if (PresShell* presShell = aSubDoc.GetPresShell()) {
+        presShell->EndPaint();
+      }
+      return CallState::Continue;
+    });
+
+    if (nsPresContext* presContext = GetPresContext()) {
+      if (PerformanceMainThread* perf =
+              presContext->GetPerformanceMainThread()) {
+        perf->FinalizeLCPEntriesForText();
+      }
+    }
+  }
+}
+
+bool PresShell::GetZoomableByAPZ() const {
+  return mZoomConstraintsClient && mZoomConstraintsClient->GetAllowZoom();
+}
+
+bool PresShell::ReflowForHiddenContentIfNeeded() {
+  if (mHiddenContentInForcedLayout.IsEmpty()) {
+    return false;
+  }
+  mDocument->FlushPendingNotifications(FlushType::Layout);
+  mHiddenContentInForcedLayout.Clear();
+  return true;
+}
+
+void PresShell::UpdateHiddenContentInForcedLayout(nsIFrame* aFrame) {
+  if (!aFrame || !aFrame->IsSubtreeDirty()) {
+    return;
+  }
+
+  nsIFrame* topmostFrameWithContentHidden = nullptr;
+  for (nsIFrame* cur = aFrame->GetInFlowParent(); cur;
+       cur = cur->GetInFlowParent()) {
+    if (cur->HidesContent()) {
+      topmostFrameWithContentHidden = cur;
+      mHiddenContentInForcedLayout.Insert(cur->GetContent());
+    }
+  }
+
+  if (mHiddenContentInForcedLayout.IsEmpty()) {
+    return;
+  }
+
+  MOZ_ASSERT(topmostFrameWithContentHidden);
+  FrameNeedsReflow(topmostFrameWithContentHidden, IntrinsicDirty::None,
+                   NS_FRAME_IS_DIRTY);
+}
+
+void PresShell::EnsureReflowIfFrameHasHiddenContent(nsIFrame* aFrame) {
+  MOZ_ASSERT(mHiddenContentInForcedLayout.IsEmpty());
+
+  UpdateHiddenContentInForcedLayout(aFrame);
+  ReflowForHiddenContentIfNeeded();
+}
+
+bool PresShell::IsForcingLayoutForHiddenContent(const nsIFrame* aFrame) const {
+  return mHiddenContentInForcedLayout.Contains(aFrame->GetContent());
+}
+
+void PresShell::UpdateRelevancyOfContentVisibilityAutoFrames() {
+  if (mContentVisibilityRelevancyToUpdate.isEmpty()) {
+    return;
+  }
+
+  for (nsIFrame* frame : mContentVisibilityAutoFrames) {
+    frame->UpdateIsRelevantContent(mContentVisibilityRelevancyToUpdate);
+  }
+
+  if (nsPresContext* presContext = GetPresContext()) {
+    presContext->UpdateHiddenByContentVisibilityForAnimationsIfNeeded();
+  }
+
+  mContentVisibilityRelevancyToUpdate.clear();
+}
+
+void PresShell::ScheduleContentRelevancyUpdate(ContentRelevancyReason aReason) {
+  if (MOZ_UNLIKELY(mIsDestroying)) {
+    return;
+  }
+  mContentVisibilityRelevancyToUpdate += aReason;
+  EnsureLayoutFlush();
+}
+
+PresShell::ProximityToViewportResult PresShell::DetermineProximityToViewport() {
+  ProximityToViewportResult result;
+  if (mContentVisibilityAutoFrames.IsEmpty()) {
+    return result;
+  }
+
+  auto margin = LengthPercentage::FromPercentage(
+      StaticPrefs::layout_css_content_visibility_relevant_content_margin() /
+      100.0f);
+
+  auto rootMargin = StyleRect<LengthPercentage>::WithAllSides(margin);
+
+  auto input = DOMIntersectionObserver::ComputeInput(
+      *mDocument,  nullptr, &rootMargin, nullptr);
+
+  for (nsIFrame* frame : mContentVisibilityAutoFrames) {
+    auto* element = frame->GetContent()->AsElement();
+    result.mAnyScrollIntoViewFlag |=
+        element->TemporarilyVisibleForScrolledIntoViewDescendant();
+
+    Maybe<bool> oldVisibility = element->GetVisibleForContentVisibility();
+    bool checkForInitialDetermination =
+        oldVisibility.isNothing() &&
+        (element->GetContentRelevancy().isNothing() ||
+         element->GetContentRelevancy()->isEmpty());
+
+    bool intersects =
+        DOMIntersectionObserver::Intersect(
+            input, *element, DOMIntersectionObserver::BoxToUse::OverflowClip,
+            DOMIntersectionObserver::IsForProximityToViewport::Yes)
+            .Intersects();
+    element->SetVisibleForContentVisibility(intersects);
+
+    if (checkForInitialDetermination && intersects) {
+      frame->UpdateIsRelevantContent(ContentRelevancyReason::Visible);
+      result.mHadInitialDetermination = true;
+    } else if (oldVisibility.isNothing() || *oldVisibility != intersects) {
+      ScheduleContentRelevancyUpdate(ContentRelevancyReason::Visible);
+    }
+  }
+  if (nsPresContext* presContext = GetPresContext()) {
+    presContext->UpdateHiddenByContentVisibilityForAnimationsIfNeeded();
+  }
+
+  return result;
+}
+
+void PresShell::ClearTemporarilyVisibleForScrolledIntoViewDescendantFlags()
+    const {
+  for (nsIFrame* frame : mContentVisibilityAutoFrames) {
+    frame->GetContent()
+        ->AsElement()
+        ->SetTemporarilyVisibleForScrolledIntoViewDescendant(false);
+  }
+}
+
+void PresShell::UpdateContentRelevancyImmediately(
+    ContentRelevancyReason aReason) {
+  if (MOZ_UNLIKELY(mIsDestroying)) {
+    return;
+  }
+
+  mContentVisibilityRelevancyToUpdate += aReason;
+
+  EnsureLayoutFlush();
+  UpdateRelevancyOfContentVisibilityAutoFrames();
+}
+
+void PresShell::CleanupFullscreenState() {
+  mFirstUnmatchedEscapeKeyDownForFullscreen = TimeStamp();
+  mEscapeKeyDownCountForFullscreenKeyboardLockWarning = 0;
+  mLastEscapeKeyDownTimeForFullscreenKeyboardLockWarning = TimeStamp();
+  mHasShownFullscreenWarningForCurrentEscapeKeyLongPress = false;
+}
+
+bool PresShell::ShouldShowFullscreenKeyboardLockWarning(
+    const WidgetKeyboardEvent& aKeyboardEvent) {
+  MOZ_ASSERT(aKeyboardEvent.mMessage == eKeyDown);
+  MOZ_ASSERT(aKeyboardEvent.mKeyCode == NS_VK_ESCAPE);
+
+  if (!XRE_IsParentProcess()) {
+    return false;
+  }
+
+  if (aKeyboardEvent.mIsRepeat) {
+    if (mFirstUnmatchedEscapeKeyDownForFullscreen &&
+        !mHasShownFullscreenWarningForCurrentEscapeKeyLongPress) {
+      if ((aKeyboardEvent.mTimeStamp -
+           mFirstUnmatchedEscapeKeyDownForFullscreen) >=
+          TimeDuration::FromMilliseconds(
+              StaticPrefs::
+                  dom_fullscreen_keyboard_lock_long_press_warning_interval())) {
+        mHasShownFullscreenWarningForCurrentEscapeKeyLongPress = true;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  MOZ_ASSERT(!aKeyboardEvent.mIsRepeat);
+  const TimeStamp previousEscapeKeyDownTime =
+      mLastEscapeKeyDownTimeForFullscreenKeyboardLockWarning;
+  mLastEscapeKeyDownTimeForFullscreenKeyboardLockWarning =
+      aKeyboardEvent.mTimeStamp;
+
+  const bool escapeKeyDownWithinWarnInterval =
+      previousEscapeKeyDownTime &&
+      (aKeyboardEvent.mTimeStamp - previousEscapeKeyDownTime) <=
+          TimeDuration::FromMilliseconds(
+              StaticPrefs::
+                  dom_fullscreen_keyboard_lock_triple_click_warn_interval());
+  if (!escapeKeyDownWithinWarnInterval) {
+    mEscapeKeyDownCountForFullscreenKeyboardLockWarning = 1;
+    return false;
+  }
+
+  mEscapeKeyDownCountForFullscreenKeyboardLockWarning += 1;
+  if (mEscapeKeyDownCountForFullscreenKeyboardLockWarning < 3) {
+    return false;
+  }
+
+  mEscapeKeyDownCountForFullscreenKeyboardLockWarning = 0;
+  mLastEscapeKeyDownTimeForFullscreenKeyboardLockWarning = TimeStamp();
+  return true;
+}

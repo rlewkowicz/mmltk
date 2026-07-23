@@ -1,0 +1,66 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef CUBEBDEVICEENUMERATOR_H_
+#define CUBEBDEVICEENUMERATOR_H_
+
+#include "AudioDeviceInfo.h"
+#include "MediaEventSource.h"
+#include "cubeb/cubeb.h"
+#include "mozilla/Mutex.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+namespace media {
+template <typename T>
+class Refcountable;
+}
+
+class CubebDeviceEnumerator final {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(CubebDeviceEnumerator)
+
+  static already_AddRefed<CubebDeviceEnumerator> GetInstance();
+  static void Shutdown();
+  using AudioDeviceSet = media::Refcountable<nsTArray<RefPtr<AudioDeviceInfo>>>;
+  RefPtr<const AudioDeviceSet> EnumerateAudioInputDevices();
+  RefPtr<const AudioDeviceSet> EnumerateAudioOutputDevices();
+  enum class Side {
+    INPUT,
+    OUTPUT,
+  };
+  already_AddRefed<AudioDeviceInfo> DeviceInfoFromName(const nsString& aName,
+                                                       Side aSide);
+  MediaEventSource<void>& OnAudioInputDeviceListChange() {
+    return mOnInputDeviceListChange;
+  }
+
+  MediaEventSource<void>& OnAudioOutputDeviceListChange() {
+    return mOnOutputDeviceListChange;
+  }
+
+  RefPtr<AudioDeviceInfo> DefaultDevice(Side aSide);
+
+ private:
+  CubebDeviceEnumerator();
+  ~CubebDeviceEnumerator();
+  static void InputAudioDeviceListChanged_s(cubeb* aContext, void* aUser);
+  static void OutputAudioDeviceListChanged_s(cubeb* aContext, void* aUser);
+  void AudioDeviceListChanged(Side aSide);
+  RefPtr<const AudioDeviceSet> EnumerateAudioDevices(Side aSide);
+  Mutex mMutex MOZ_UNANNOTATED;
+  RefPtr<const AudioDeviceSet> mInputDevices;
+  RefPtr<const AudioDeviceSet> mOutputDevices;
+  bool mManualInputInvalidation;
+  bool mManualOutputInvalidation;
+  MediaEventProducer<void> mOnInputDeviceListChange;
+  MediaEventProducer<void> mOnOutputDeviceListChange;
+};
+
+typedef CubebDeviceEnumerator Enumerator;
+typedef CubebDeviceEnumerator::Side EnumeratorSide;
+}  
+
+#endif  // CUBEBDEVICEENUMERATOR_H_

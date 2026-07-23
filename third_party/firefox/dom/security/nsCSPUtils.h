@@ -1,0 +1,692 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsCSPUtils_h_
+#define nsCSPUtils_h_
+
+#include "mozilla/ErrorResult.h"
+#include "nsCOMPtr.h"
+#include "nsILoadInfo.h"
+#include "nsIURI.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nsUnicharUtils.h"
+
+class nsIChannel;
+
+namespace mozilla::dom {
+struct CSP;
+class Document;
+}  
+
+
+void CSP_LogLocalizedStr(const char* aName, const nsTArray<nsString>& aParams,
+                         const nsACString& aSourceName,
+                         const nsAString& aSourceLine, uint32_t aLineNumber,
+                         uint32_t aColumnNumber, uint32_t aFlags,
+                         const nsACString& aCategory, uint64_t aInnerWindowID,
+                         bool aFromPrivateWindow);
+
+void CSP_GetLocalizedStr(const char* aName, const nsTArray<nsString>& aParams,
+                         nsAString& outResult);
+
+void CSP_LogStrMessage(const nsAString& aMsg);
+
+void CSP_LogMessage(const nsAString& aMessage, const nsACString& aSourceName,
+                    const nsAString& aSourceLine, uint32_t aLineNumber,
+                    uint32_t aColumnNumber, uint32_t aFlags,
+                    const nsACString& aCategory, uint64_t aInnerWindowID,
+                    bool aFromPrivateWindow);
+
+
+#define INLINE_STYLE_VIOLATION_OBSERVER_TOPIC \
+  "violated base restriction: Inline Stylesheets will not apply"
+#define INLINE_SCRIPT_VIOLATION_OBSERVER_TOPIC \
+  "violated base restriction: Inline Scripts will not execute"
+#define EVAL_VIOLATION_OBSERVER_TOPIC \
+  "violated base restriction: Code will not be created from strings"
+#define WASM_EVAL_VIOLATION_OBSERVER_TOPIC                                \
+  "violated base restriction: WebAssembly code will not be created from " \
+  "dynamically"
+#define SCRIPT_NONCE_VIOLATION_OBSERVER_TOPIC "Inline Script had invalid nonce"
+#define STYLE_NONCE_VIOLATION_OBSERVER_TOPIC "Inline Style had invalid nonce"
+#define SCRIPT_HASH_VIOLATION_OBSERVER_TOPIC "Inline Script had invalid hash"
+#define STYLE_HASH_VIOLATION_OBSERVER_TOPIC "Inline Style had invalid hash"
+#define TRUSTED_TYPES_VIOLATION_OBSERVER_TOPIC \
+  "Tried to create a trusted-types policy with a forbidden policy name"
+#define REQUIRE_TRUSTED_TYPES_FOR_SCRIPT_OBSERVER_TOPIC \
+  "Type mismatch for injection sink"
+
+static const char* CSPStrDirectives[] = {
+    "-error-",                    
+    "default-src",                
+    "script-src",                 
+    "object-src",                 
+    "style-src",                  
+    "img-src",                    
+    "media-src",                  
+    "frame-src",                  
+    "font-src",                   
+    "connect-src",                
+    "report-uri",                 
+    "frame-ancestors",            
+    "reflected-xss",              
+    "base-uri",                   
+    "form-action",                
+    "manifest-src",               
+    "upgrade-insecure-requests",  
+    "child-src",                  
+    "block-all-mixed-content",    
+    "sandbox",                    
+    "worker-src",                 
+    "script-src-elem",            
+    "script-src-attr",            
+    "style-src-elem",             
+    "style-src-attr",             
+    "require-trusted-types-for",  
+    "trusted-types",              
+    "report-to",                  
+};
+
+inline const char* CSP_CSPDirectiveToString(CSPDirective aDir) {
+  return CSPStrDirectives[static_cast<uint32_t>(aDir)];
+}
+
+CSPDirective CSP_StringToCSPDirective(const nsAString& aDir);
+
+#define FOR_EACH_CSP_KEYWORD(MACRO)                 \
+  MACRO(CSP_SELF, "'self'")                         \
+  MACRO(CSP_UNSAFE_INLINE, "'unsafe-inline'")       \
+  MACRO(CSP_UNSAFE_EVAL, "'unsafe-eval'")           \
+  MACRO(CSP_UNSAFE_HASHES, "'unsafe-hashes'")       \
+  MACRO(CSP_NONE, "'none'")                         \
+  MACRO(CSP_NONCE, "'nonce-")                       \
+  MACRO(CSP_REPORT_SAMPLE, "'report-sample'")       \
+  MACRO(CSP_STRICT_DYNAMIC, "'strict-dynamic'")     \
+  MACRO(CSP_WASM_UNSAFE_EVAL, "'wasm-unsafe-eval'") \
+  MACRO(CSP_ALLOW_DUPLICATES, "'allow-duplicates'") \
+  MACRO(CSP_TRUSTED_TYPES_EVAL, "'trusted-types-eval'")
+
+enum CSPKeyword {
+#define KEYWORD_ENUM(id_, string_) id_,
+  FOR_EACH_CSP_KEYWORD(KEYWORD_ENUM)
+#undef KEYWORD_ENUM
+
+  CSP_LAST_KEYWORD_VALUE,
+
+  CSP_HASH
+};
+
+static const char* gCSPUTF8Keywords[] = {
+#define KEYWORD_UTF8_LITERAL(id_, string_) string_,
+    FOR_EACH_CSP_KEYWORD(KEYWORD_UTF8_LITERAL)
+#undef KEYWORD_UTF8_LITERAL
+};
+
+static const char16_t* gCSPUTF16Keywords[] = {
+#define KEYWORD_UTF16_LITERAL(id_, string_) u"" string_,
+    FOR_EACH_CSP_KEYWORD(KEYWORD_UTF16_LITERAL)
+#undef KEYWORD_UTF16_LITERAL
+};
+
+#undef FOR_EACH_CSP_KEYWORD
+
+inline const char* CSP_EnumToUTF8Keyword(enum CSPKeyword aKey) {
+  static_assert((sizeof(gCSPUTF8Keywords) / sizeof(gCSPUTF8Keywords[0]) ==
+                 CSP_LAST_KEYWORD_VALUE),
+                "CSP_LAST_KEYWORD_VALUE != length(gCSPUTF8Keywords)");
+
+  if (static_cast<uint32_t>(aKey) <
+      static_cast<uint32_t>(CSP_LAST_KEYWORD_VALUE)) {
+    return gCSPUTF8Keywords[static_cast<uint32_t>(aKey)];
+  }
+  return "error: invalid keyword in CSP_EnumToUTF8Keyword";
+}
+
+inline const char16_t* CSP_EnumToUTF16Keyword(enum CSPKeyword aKey) {
+  static_assert((sizeof(gCSPUTF16Keywords) / sizeof(gCSPUTF16Keywords[0]) ==
+                 CSP_LAST_KEYWORD_VALUE),
+                "CSP_LAST_KEYWORD_VALUE != length(gCSPUTF16Keywords)");
+
+  if (static_cast<uint32_t>(aKey) <
+      static_cast<uint32_t>(CSP_LAST_KEYWORD_VALUE)) {
+    return gCSPUTF16Keywords[static_cast<uint32_t>(aKey)];
+  }
+  return u"error: invalid keyword in CSP_EnumToUTF16Keyword";
+}
+
+inline CSPKeyword CSP_UTF16KeywordToEnum(const nsAString& aKey) {
+  nsString lowerKey = PromiseFlatString(aKey);
+  ToLowerCase(lowerKey);
+
+  for (uint32_t i = 0; i < CSP_LAST_KEYWORD_VALUE; i++) {
+    if (lowerKey.Equals(gCSPUTF16Keywords[i])) {
+      return static_cast<CSPKeyword>(i);
+    }
+  }
+  NS_ASSERTION(false, "Can not convert unknown Keyword to Enum");
+  return CSP_LAST_KEYWORD_VALUE;
+}
+
+nsresult CSP_AppendCSPFromHeader(nsIContentSecurityPolicy* aCsp,
+                                 const nsAString& aHeaderValue,
+                                 bool aReportOnly);
+
+
+already_AddRefed<nsIContentSecurityPolicy> CSP_CreateFromHeader(
+    const nsAString& aHeaderValue, nsIURI* aSelfURI,
+    nsIPrincipal* aLoadingPrincipal, mozilla::ErrorResult& aRv);
+
+class nsCSPHostSrc;
+
+nsCSPHostSrc* CSP_CreateHostSrcFromSelfURI(nsIURI* aSelfURI);
+bool CSP_IsEmptyDirective(const nsAString& aValue, const nsAString& aDir);
+bool CSP_IsInvalidDirectiveValue(mozilla::Span<const char16_t> aValue);
+bool CSP_IsDirective(const nsAString& aValue, CSPDirective aDir);
+bool CSP_IsKeyword(const nsAString& aValue, enum CSPKeyword aKey);
+bool CSP_IsQuotelessKeyword(const nsAString& aKey);
+CSPDirective CSP_ContentTypeToDirective(nsContentPolicyType aType);
+
+class nsCSPSrcVisitor;
+
+void CSP_PercentDecodeStr(const nsAString& aEncStr, nsAString& outDecStr);
+bool CSP_ShouldResponseInheritCSP(nsIChannel* aChannel);
+bool CSP_ShouldURIInheritCSP(nsIURI* aURI);
+
+void CSP_ApplyMetaCSPToDoc(mozilla::dom::Document& aDoc,
+                           const nsAString& aPolicyStr);
+
+bool CSP_IsBrowserXHTML(nsIURI* aURI);
+
+
+class nsCSPBaseSrc {
+ public:
+  nsCSPBaseSrc();
+  virtual ~nsCSPBaseSrc();
+
+  virtual bool permits(nsIURI* aUri, bool aWasRedirected, bool aReportOnly,
+                       bool aUpgradeInsecure) const;
+  virtual bool allows(enum CSPKeyword aKeyword,
+                      const nsAString& aHashOrNonce) const;
+  virtual bool visit(nsCSPSrcVisitor* aVisitor) const = 0;
+  virtual void toString(nsAString& outStr) const = 0;
+
+  virtual bool isReportSample() const { return false; }
+
+  virtual bool isHash() const { return false; }
+  virtual bool isNonce() const { return false; }
+  virtual bool isKeyword(CSPKeyword aKeyword) const { return false; }
+  virtual bool isTrustedTypesDirectivePolicyName() const { return false; }
+};
+
+
+class nsCSPSchemeSrc : public nsCSPBaseSrc {
+ public:
+  explicit nsCSPSchemeSrc(const nsAString& aScheme);
+  virtual ~nsCSPSchemeSrc();
+
+  bool permits(nsIURI* aUri, bool aWasRedirected, bool aReportOnly,
+               bool aUpgradeInsecure) const override;
+  bool visit(nsCSPSrcVisitor* aVisitor) const override;
+  void toString(nsAString& outStr) const override;
+
+  inline void getScheme(nsAString& outStr) const { outStr.Assign(mScheme); };
+
+ private:
+  nsString mScheme;
+};
+
+
+class nsCSPHostSrc : public nsCSPBaseSrc {
+ public:
+  explicit nsCSPHostSrc(const nsAString& aHost);
+  virtual ~nsCSPHostSrc();
+
+  bool permits(nsIURI* aUri, bool aWasRedirected, bool aReportOnly,
+               bool aUpgradeInsecure) const override;
+  bool visit(nsCSPSrcVisitor* aVisitor) const override;
+  void toString(nsAString& outStr) const override;
+
+  void setScheme(const nsAString& aScheme);
+  void setPort(const nsAString& aPort);
+  void appendPath(const nsAString& aPath);
+
+  inline void setGeneratedFromSelfKeyword() const {
+    mGeneratedFromSelfKeyword = true;
+  }
+
+  inline void setIsUniqueOrigin() const { mIsUniqueOrigin = true; }
+
+  inline void setWithinFrameAncestorsDir(bool aValue) const {
+    mWithinFrameAncstorsDir = aValue;
+  }
+
+  inline void getScheme(nsAString& outStr) const { outStr.Assign(mScheme); };
+
+  inline void getHost(nsAString& outStr) const { outStr.Assign(mHost); };
+
+  inline void getPort(nsAString& outStr) const { outStr.Assign(mPort); };
+
+  inline void getPath(nsAString& outStr) const { outStr.Assign(mPath); };
+
+ private:
+  nsString mScheme;
+  nsString mHost;
+  nsString mPort;
+  nsString mPath;
+  mutable bool mGeneratedFromSelfKeyword;
+  mutable bool mIsUniqueOrigin;
+  mutable bool mWithinFrameAncstorsDir;
+};
+
+
+class nsCSPKeywordSrc : public nsCSPBaseSrc {
+ public:
+  explicit nsCSPKeywordSrc(CSPKeyword aKeyword);
+  virtual ~nsCSPKeywordSrc();
+
+  bool allows(enum CSPKeyword aKeyword,
+              const nsAString& aHashOrNonce) const override;
+  bool visit(nsCSPSrcVisitor* aVisitor) const override;
+  void toString(nsAString& outStr) const override;
+
+  inline CSPKeyword getKeyword() const { return mKeyword; };
+
+  bool isReportSample() const override { return mKeyword == CSP_REPORT_SAMPLE; }
+
+  bool isKeyword(CSPKeyword aKeyword) const final {
+    return mKeyword == aKeyword;
+  }
+
+ private:
+  CSPKeyword mKeyword;
+};
+
+
+class nsCSPNonceSrc : public nsCSPBaseSrc {
+ public:
+  explicit nsCSPNonceSrc(const nsAString& aNonce);
+  virtual ~nsCSPNonceSrc();
+
+  bool allows(enum CSPKeyword aKeyword,
+              const nsAString& aHashOrNonce) const override;
+  bool visit(nsCSPSrcVisitor* aVisitor) const override;
+  void toString(nsAString& outStr) const override;
+
+  inline void getNonce(nsAString& outStr) const { outStr.Assign(mNonce); };
+
+  bool isNonce() const final { return true; }
+
+ private:
+  nsString mNonce;
+};
+
+
+class nsCSPHashSrc : public nsCSPBaseSrc {
+ public:
+  nsCSPHashSrc(const nsAString& algo, const nsAString& hash);
+  virtual ~nsCSPHashSrc();
+
+  bool allows(enum CSPKeyword aKeyword,
+              const nsAString& aHashOrNonce) const override;
+  void toString(nsAString& outStr) const override;
+  bool visit(nsCSPSrcVisitor* aVisitor) const override;
+
+  inline void getAlgorithm(nsAString& outStr) const {
+    outStr.Assign(mAlgorithm);
+  };
+
+  inline void getHash(nsAString& outStr) const { outStr.Assign(mHash); };
+
+  bool isHash() const final { return true; }
+
+ private:
+  nsString mAlgorithm;
+  nsString mHash;
+};
+
+
+class nsCSPReportURI : public nsCSPBaseSrc {
+ public:
+  explicit nsCSPReportURI(nsIURI* aURI);
+  virtual ~nsCSPReportURI();
+
+  bool visit(nsCSPSrcVisitor* aVisitor) const override;
+  void toString(nsAString& outStr) const override;
+
+ private:
+  nsCOMPtr<nsIURI> mReportURI;
+};
+
+
+class nsCSPGroup : public nsCSPBaseSrc {
+ public:
+  explicit nsCSPGroup(const nsAString& aGroup);
+  virtual ~nsCSPGroup();
+
+  bool visit(nsCSPSrcVisitor* aVisitor) const override;
+  void toString(nsAString& aOutStr) const override;
+
+ private:
+  nsString mGroup;
+};
+
+
+class nsCSPSandboxFlags : public nsCSPBaseSrc {
+ public:
+  explicit nsCSPSandboxFlags(const nsAString& aFlags);
+  virtual ~nsCSPSandboxFlags();
+
+  bool visit(nsCSPSrcVisitor* aVisitor) const override;
+  void toString(nsAString& outStr) const override;
+
+ private:
+  nsString mFlags;
+};
+
+
+class nsCSPRequireTrustedTypesForDirectiveValue : public nsCSPBaseSrc {
+ public:
+  explicit nsCSPRequireTrustedTypesForDirectiveValue(const nsAString& aValue);
+  virtual ~nsCSPRequireTrustedTypesForDirectiveValue() = default;
+
+  bool visit(nsCSPSrcVisitor* aVisitor) const override;
+  void toString(nsAString& aOutStr) const override;
+
+ private:
+  const nsString mValue;
+};
+
+
+class nsCSPTrustedTypesDirectivePolicyName : public nsCSPBaseSrc {
+ public:
+  explicit nsCSPTrustedTypesDirectivePolicyName(const nsAString& aName);
+  virtual ~nsCSPTrustedTypesDirectivePolicyName() = default;
+
+  bool visit(nsCSPSrcVisitor* aVisitor) const override;
+  void toString(nsAString& aOutStr) const override;
+
+  bool isTrustedTypesDirectivePolicyName() const override { return true; }
+
+  const nsString& GetName() const { return mName; }
+
+ private:
+  const nsString mName;
+};
+
+class nsCSPTrustedTypesDirectiveInvalidToken : public nsCSPBaseSrc {
+ public:
+  explicit nsCSPTrustedTypesDirectiveInvalidToken(
+      const nsAString& aInvalidToken);
+  virtual ~nsCSPTrustedTypesDirectiveInvalidToken() = default;
+
+  bool visit(nsCSPSrcVisitor* aVisitor) const override;
+  void toString(nsAString& aOutStr) const override;
+
+ private:
+  const nsString mInvalidToken;
+};
+
+
+class nsCSPSrcVisitor {
+ public:
+  virtual bool visitSchemeSrc(const nsCSPSchemeSrc& src) = 0;
+
+  virtual bool visitHostSrc(const nsCSPHostSrc& src) = 0;
+
+  virtual bool visitKeywordSrc(const nsCSPKeywordSrc& src) = 0;
+
+  virtual bool visitNonceSrc(const nsCSPNonceSrc& src) = 0;
+
+  virtual bool visitHashSrc(const nsCSPHashSrc& src) = 0;
+
+ protected:
+  explicit nsCSPSrcVisitor() = default;
+  virtual ~nsCSPSrcVisitor() = default;
+};
+
+
+class nsCSPDirective {
+ public:
+  explicit nsCSPDirective(CSPDirective aDirective);
+  virtual ~nsCSPDirective();
+
+  virtual bool permits(CSPDirective aDirective, nsILoadInfo* aLoadInfo,
+                       nsIURI* aUri, bool aWasRedirected, bool aReportOnly,
+                       bool aUpgradeInsecure) const;
+  virtual bool allows(enum CSPKeyword aKeyword,
+                      const nsAString& aHashOrNonce) const;
+  bool allowsAllInlineBehavior(CSPDirective aDir) const;
+
+  bool ShouldCreateViolationForNewTrustedTypesPolicy(
+      const nsAString& aPolicyName,
+      const nsTArray<nsString>& aCreatedPolicyNames) const;
+
+  bool AreTrustedTypesForSinkGroupRequired(const nsAString& aSinkGroup) const;
+
+  virtual void toString(nsAString& outStr) const;
+  void toDomCSPStruct(mozilla::dom::CSP& outCSP) const;
+
+  virtual void addSrcs(const nsTArray<nsCSPBaseSrc*>& aSrcs) {
+    mSrcs = aSrcs.Clone();
+  }
+
+  bool isDefaultDirective() const;
+
+  virtual bool equals(CSPDirective aDirective) const;
+
+  void getReportURIs(nsTArray<nsString>& outReportURIs) const;
+
+  void getReportGroup(nsAString& outReportGroup) const;
+
+  bool visitSrcs(nsCSPSrcVisitor* aVisitor) const;
+
+  virtual void getDirName(nsAString& outStr) const;
+
+  bool hasReportSampleKeyword() const;
+
+ private:
+  bool ContainsTrustedTypesDirectivePolicyName(
+      const nsAString& aPolicyName) const;
+
+ protected:
+  CSPDirective mDirective;
+  nsTArray<nsCSPBaseSrc*> mSrcs;
+};
+
+
+class nsCSPChildSrcDirective : public nsCSPDirective {
+ public:
+  explicit nsCSPChildSrcDirective(CSPDirective aDirective);
+  virtual ~nsCSPChildSrcDirective();
+
+  void setRestrictFrames() { mRestrictFrames = true; }
+
+  void setRestrictWorkers() { mRestrictWorkers = true; }
+
+  virtual bool equals(CSPDirective aDirective) const override;
+
+ private:
+  bool mRestrictFrames;
+  bool mRestrictWorkers;
+};
+
+
+class nsCSPScriptSrcDirective : public nsCSPDirective {
+ public:
+  explicit nsCSPScriptSrcDirective(CSPDirective aDirective);
+  virtual ~nsCSPScriptSrcDirective();
+
+  void setRestrictWorkers() { mRestrictWorkers = true; }
+  void setRestrictScriptElem() { mRestrictScriptElem = true; }
+  void setRestrictScriptAttr() { mRestrictScriptAttr = true; }
+
+  bool equals(CSPDirective aDirective) const override;
+
+ private:
+  bool mRestrictWorkers = false;
+  bool mRestrictScriptElem = false;
+  bool mRestrictScriptAttr = false;
+};
+
+
+class nsCSPStyleSrcDirective : public nsCSPDirective {
+ public:
+  explicit nsCSPStyleSrcDirective(CSPDirective aDirective);
+  virtual ~nsCSPStyleSrcDirective();
+
+  void setRestrictStyleElem() { mRestrictStyleElem = true; }
+  void setRestrictStyleAttr() { mRestrictStyleAttr = true; }
+
+  bool equals(CSPDirective aDirective) const override;
+
+ private:
+  bool mRestrictStyleElem = false;
+  bool mRestrictStyleAttr = false;
+};
+
+
+class nsBlockAllMixedContentDirective : public nsCSPDirective {
+ public:
+  explicit nsBlockAllMixedContentDirective(CSPDirective aDirective);
+  ~nsBlockAllMixedContentDirective();
+
+  bool permits(CSPDirective aDirective, nsILoadInfo* aLoadInfo, nsIURI* aUri,
+               bool aWasRedirected, bool aReportOnly,
+               bool aUpgradeInsecure) const override {
+    return false;
+  }
+
+  bool permits(nsIURI* aUri) const { return false; }
+
+  bool allows(enum CSPKeyword aKeyword,
+              const nsAString& aHashOrNonce) const override {
+    return false;
+  }
+
+  void toString(nsAString& outStr) const override;
+
+  void addSrcs(const nsTArray<nsCSPBaseSrc*>& aSrcs) override {
+    MOZ_ASSERT(false, "block-all-mixed-content does not hold any srcs");
+  }
+
+  void getDirName(nsAString& outStr) const override;
+};
+
+
+class nsUpgradeInsecureDirective : public nsCSPDirective {
+ public:
+  explicit nsUpgradeInsecureDirective(CSPDirective aDirective);
+  ~nsUpgradeInsecureDirective();
+
+  bool permits(CSPDirective aDirective, nsILoadInfo* aLoadInfo, nsIURI* aUri,
+               bool aWasRedirected, bool aReportOnly,
+               bool aUpgradeInsecure) const override {
+    return false;
+  }
+
+  bool permits(nsIURI* aUri) const { return false; }
+
+  bool allows(enum CSPKeyword aKeyword,
+              const nsAString& aHashOrNonce) const override {
+    return false;
+  }
+
+  void toString(nsAString& outStr) const override;
+
+  void addSrcs(const nsTArray<nsCSPBaseSrc*>& aSrcs) override {
+    MOZ_ASSERT(false, "upgrade-insecure-requests does not hold any srcs");
+  }
+
+  void getDirName(nsAString& outStr) const override;
+};
+
+
+class nsCSPPolicy {
+ public:
+  nsCSPPolicy();
+  virtual ~nsCSPPolicy();
+
+  bool permits(CSPDirective aDirective, nsILoadInfo* aLoadInfo, nsIURI* aUri,
+               bool aWasRedirected, bool aSpecific,
+               nsAString& outViolatedDirective,
+               nsAString& outViolatedDirectiveString) const;
+  bool allows(CSPDirective aDirective, enum CSPKeyword aKeyword,
+              const nsAString& aHashOrNonce) const;
+  void toString(nsAString& outStr) const;
+  void toDomCSPStruct(mozilla::dom::CSP& outCSP) const;
+
+  inline void addDirective(nsCSPDirective* aDir) {
+    if (aDir->equals(
+            nsIContentSecurityPolicy::REQUIRE_TRUSTED_TYPES_FOR_DIRECTIVE)) {
+      mHasRequireTrustedTypesForDirective = true;
+    }
+    mDirectives.AppendElement(aDir);
+  }
+
+  inline void addUpgradeInsecDir(nsUpgradeInsecureDirective* aDir) {
+    mUpgradeInsecDir = aDir;
+    addDirective(aDir);
+  }
+
+  bool hasDirective(CSPDirective aDir) const;
+
+  inline void setDeliveredViaMetaTagFlag(bool aFlag) {
+    mDeliveredViaMetaTag = aFlag;
+  }
+
+  inline bool getDeliveredViaMetaTagFlag() const {
+    return mDeliveredViaMetaTag;
+  }
+
+  inline bool hasRequireTrustedTypesForDirective() const {
+    return mHasRequireTrustedTypesForDirective;
+  }
+
+  inline void setReportOnlyFlag(bool aFlag) { mReportOnly = aFlag; }
+
+  inline bool getReportOnlyFlag() const { return mReportOnly; }
+
+  enum class Disposition { Enforce, Report };
+
+  Disposition getDisposition() const {
+    return getReportOnlyFlag() ? Disposition::Report : Disposition::Enforce;
+  }
+
+  void getReportURIs(nsTArray<nsString>& outReportURIs) const;
+
+  void getReportGroup(nsAString& outReportGroup) const;
+
+  void getViolatedDirectiveInformation(CSPDirective aDirective,
+                                       nsAString& aDirectiveName,
+                                       nsAString& aDirectiveNameAndValue,
+                                       bool* aReportSample) const;
+
+  uint32_t getSandboxFlags() const;
+
+  inline uint32_t getNumDirectives() const { return mDirectives.Length(); }
+
+  void getDirectiveNames(nsTArray<nsString>& outDirectives) const;
+
+  bool visitDirectiveSrcs(CSPDirective aDir, nsCSPSrcVisitor* aVisitor) const;
+
+  bool allowsAllInlineBehavior(CSPDirective aDir) const;
+
+  bool ShouldCreateViolationForNewTrustedTypesPolicy(
+      const nsAString& aPolicyName,
+      const nsTArray<nsString>& aCreatedPolicyNames) const;
+
+  bool AreTrustedTypesForSinkGroupRequired(const nsAString& aSinkGroup) const;
+
+ private:
+  nsCSPDirective* matchingOrDefaultDirective(CSPDirective aDirective) const;
+
+  nsUpgradeInsecureDirective* mUpgradeInsecDir;
+  nsTArray<nsCSPDirective*> mDirectives;
+  bool mHasRequireTrustedTypesForDirective = false;
+  bool mReportOnly;
+  bool mDeliveredViaMetaTag;
+};
+
+#endif /* nsCSPUtils_h_ */

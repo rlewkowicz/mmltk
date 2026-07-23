@@ -1,0 +1,433 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "AnimationSurfaceProvider.h"
+
+#include "DecodePool.h"
+#include "Decoder.h"
+#include "mozilla/StaticPrefs_image.h"
+#include "mozilla/gfx/gfxVars.h"
+#include "mozilla/layers/SharedSurfacesChild.h"
+#include "mozilla/layers/SourceSurfaceSharedData.h"
+#include "nsProxyRelease.h"
+
+using namespace mozilla::gfx;
+using namespace mozilla::layers;
+
+namespace mozilla {
+namespace image {
+
+AnimationSurfaceProvider::AnimationSurfaceProvider(
+    NotNull<RasterImage*> aImage, const SurfaceKey& aSurfaceKey,
+    NotNull<Decoder*> aDecoder, size_t aCurrentFrame)
+    : ISurfaceProvider(ImageKey(aImage.get()), aSurfaceKey,
+                       AvailabilityState::StartAsPlaceholder()),
+      mImage(aImage.get()),
+      mDecodingMutex("AnimationSurfaceProvider::mDecoder"),
+      mDecoder(aDecoder.get()),
+      mFramesMutex("AnimationSurfaceProvider::mFrames"),
+      mCompositedFrameRequested(false),
+      mSharedAnimation(MakeRefPtr<SharedSurfacesAnimation>()) {
+  MOZ_ASSERT(!mDecoder->IsMetadataDecode(),
+             "Use MetadataDecodingTask for metadata decodes");
+  MOZ_ASSERT(!mDecoder->IsFirstFrameDecode(),
+             "Use DecodedSurfaceProvider for single-frame image decodes");
+
+  IntSize frameSize = aSurfaceKey.Size();
+  size_t threshold =
+      (size_t(StaticPrefs::image_animated_decode_on_demand_threshold_kb()) *
+       1024) /
+      (sizeof(uint32_t) * frameSize.width * frameSize.height);
+  size_t batch = StaticPrefs::image_animated_decode_on_demand_batch_size();
+
+  mFrames.reset(
+      new AnimationFrameRetainedBuffer(threshold, batch, aCurrentFrame));
+}
+
+AnimationSurfaceProvider::~AnimationSurfaceProvider() {
+  DropImageReference();
+
+  mSharedAnimation->Destroy();
+  if (mDecoder) {
+    mDecoder->SetFrameRecycler(nullptr);
+  }
+}
+
+void AnimationSurfaceProvider::DropImageReference() {
+  if (!mImage) {
+    return;  
+  }
+
+  SurfaceCache::ReleaseImageOnMainThread(mImage.forget());
+}
+
+void AnimationSurfaceProvider::Reset() {
+  bool mayDiscard;
+  bool restartDecoder = false;
+
+  {
+    MutexAutoLock lock(mFramesMutex);
+
+    mayDiscard = mFrames->MayDiscard();
+    if (!mayDiscard) {
+      restartDecoder = mFrames->Reset();
+    }
+  }
+
+  if (mayDiscard) {
+    MutexAutoLock lock(mDecodingMutex);
+
+    if (mDecoder) {
+      mDecoder = DecoderFactory::CloneAnimationDecoder(mDecoder);
+      MOZ_ASSERT(mDecoder);
+
+      MutexAutoLock lock2(mFramesMutex);
+      restartDecoder = mFrames->Reset();
+    } else {
+      MOZ_ASSERT(mFrames->HasRedecodeError());
+    }
+  }
+
+  if (restartDecoder) {
+    DecodePool::Singleton()->AsyncRun(this);
+  }
+}
+
+void AnimationSurfaceProvider::Advance(size_t aFrame) {
+  bool restartDecoder;
+
+  RefPtr<SourceSurface> surface;
+  IntRect dirtyRect;
+  {
+    MutexAutoLock lock(mFramesMutex);
+    restartDecoder = mFrames->AdvanceTo(aFrame);
+
+    imgFrame* frame = mFrames->Get(aFrame,  true);
+    MOZ_ASSERT(frame);
+    if (aFrame != 0) {
+      dirtyRect = frame->GetDirtyRect();
+    } else {
+      MOZ_ASSERT(mFrames->SizeKnown());
+      dirtyRect = mFrames->FirstFrameRefreshArea();
+    }
+    surface = frame->GetSourceSurface();
+    MOZ_ASSERT(surface);
+  }
+
+  if (restartDecoder) {
+    DecodePool::Singleton()->AsyncRun(this);
+  }
+
+  mCompositedFrameRequested = false;
+  auto* sharedSurface = static_cast<SourceSurfaceSharedData*>(surface.get());
+  mSharedAnimation->SetCurrentFrame(sharedSurface, dirtyRect);
+}
+
+DrawableFrameRef AnimationSurfaceProvider::DrawableRef(size_t aFrame) {
+  MutexAutoLock lock(mFramesMutex);
+
+  if (Availability().IsPlaceholder()) {
+    MOZ_ASSERT_UNREACHABLE("Calling DrawableRef() on a placeholder");
+    return DrawableFrameRef();
+  }
+
+  imgFrame* frame = mFrames->Get(aFrame,  true);
+  if (!frame) {
+    return DrawableFrameRef();
+  }
+
+  return frame->DrawableRef();
+}
+
+already_AddRefed<imgFrame> AnimationSurfaceProvider::GetFrame(size_t aFrame) {
+  MutexAutoLock lock(mFramesMutex);
+
+  if (Availability().IsPlaceholder()) {
+    MOZ_ASSERT_UNREACHABLE("Calling GetFrame() on a placeholder");
+    return nullptr;
+  }
+
+  RefPtr<imgFrame> frame = mFrames->Get(aFrame,  false);
+  MOZ_ASSERT_IF(frame, frame->IsFinished());
+  return frame.forget();
+}
+
+bool AnimationSurfaceProvider::IsFinished() const {
+  MutexAutoLock lock(mFramesMutex);
+
+  if (Availability().IsPlaceholder()) {
+    MOZ_ASSERT_UNREACHABLE("Calling IsFinished() on a placeholder");
+    return false;
+  }
+
+  return mFrames->IsFirstFrameFinished();
+}
+
+bool AnimationSurfaceProvider::IsFullyDecoded() const {
+  MutexAutoLock lock(mFramesMutex);
+  return mFrames->SizeKnown() && !mFrames->MayDiscard();
+}
+
+size_t AnimationSurfaceProvider::LogicalSizeInBytes() const {
+  IntSize size = GetSurfaceKey().Size();
+  return 3 * size.width * size.height * sizeof(uint32_t);
+}
+
+void AnimationSurfaceProvider::AddSizeOfExcludingThis(
+    MallocSizeOf aMallocSizeOf, const AddSizeOfCb& aCallback) {
+  MutexAutoLock lock(mFramesMutex);
+  mFrames->AddSizeOfExcludingThis(aMallocSizeOf, aCallback);
+}
+
+void AnimationSurfaceProvider::Run() {
+  MutexAutoLock lock(mDecodingMutex);
+
+  if (!mDecoder) {
+    MOZ_ASSERT_UNREACHABLE("Running after decoding finished?");
+    return;
+  }
+
+  while (true) {
+    LexerResult result = mDecoder->Decode(WrapNotNull(this));
+
+    if (result.is<TerminalState>()) {
+      bool continueDecoding = CheckForNewFrameAtTerminalState();
+      FinishDecoding();
+
+      if (!mDecoder || !continueDecoding || DecodePool::IsShuttingDown()) {
+        return;
+      }
+
+      continue;
+    }
+
+    bool checkForNewFrameAtYieldResult = false;
+    if (result == LexerResult(Yield::OUTPUT_AVAILABLE)) {
+      checkForNewFrameAtYieldResult = CheckForNewFrameAtYield();
+    }
+
+    if (mImage && mDecoder->HasProgress()) {
+      NotifyProgress(WrapNotNull(mImage), WrapNotNull(mDecoder));
+    }
+
+    if (result == LexerResult(Yield::NEED_MORE_DATA)) {
+      return;
+    }
+
+    MOZ_ASSERT(result == LexerResult(Yield::OUTPUT_AVAILABLE));
+    if (!checkForNewFrameAtYieldResult || DecodePool::IsShuttingDown()) {
+      return;
+    }
+  }
+}
+
+bool AnimationSurfaceProvider::CheckForNewFrameAtYield() {
+  mDecodingMutex.AssertCurrentThreadOwns();
+  MOZ_ASSERT(mDecoder);
+
+  bool justGotFirstFrame = false;
+  bool continueDecoding = false;
+
+  {
+    MutexAutoLock lock(mFramesMutex);
+
+    RefPtr<imgFrame> frame = mDecoder->GetCurrentFrame();
+    MOZ_ASSERT(mDecoder->HasFrameToTake());
+    mDecoder->ClearHasFrameToTake();
+
+    if (!frame) {
+      MOZ_ASSERT_UNREACHABLE("Decoder yielded but didn't produce a frame?");
+      return true;
+    }
+
+    MOZ_ASSERT(!mFrames->IsLastInsertedFrame(frame));
+
+    AnimationFrameBuffer::InsertStatus status =
+        mFrames->Insert(std::move(frame));
+
+    if (mFrames->HasRedecodeError()) {
+      mDecoder = nullptr;
+      return false;
+    }
+
+    switch (status) {
+      case AnimationFrameBuffer::InsertStatus::DISCARD_CONTINUE:
+        continueDecoding = true;
+        [[fallthrough]];
+      case AnimationFrameBuffer::InsertStatus::DISCARD_YIELD:
+        RequestFrameDiscarding();
+        break;
+      case AnimationFrameBuffer::InsertStatus::CONTINUE:
+        continueDecoding = true;
+        break;
+      case AnimationFrameBuffer::InsertStatus::YIELD:
+        break;
+      default:
+        MOZ_ASSERT_UNREACHABLE("Unhandled insert status!");
+        break;
+    }
+
+    size_t frameCount = mFrames->Size();
+    if (frameCount == 1 && mImage) {
+      justGotFirstFrame = true;
+    }
+  }
+
+  if (justGotFirstFrame) {
+    AnnounceSurfaceAvailable();
+  }
+
+  return continueDecoding;
+}
+
+bool AnimationSurfaceProvider::CheckForNewFrameAtTerminalState() {
+  mDecodingMutex.AssertCurrentThreadOwns();
+  MOZ_ASSERT(mDecoder);
+
+  bool justGotFirstFrame = false;
+  bool continueDecoding;
+
+  {
+    MutexAutoLock lock(mFramesMutex);
+
+    RefPtr<imgFrame> frame = mDecoder->GetCurrentFrame();
+
+    if (!mDecoder->HasFrameToTake()) {
+      frame = nullptr;
+    } else {
+      MOZ_ASSERT(frame);
+      mDecoder->ClearHasFrameToTake();
+    }
+
+    if (!frame || mFrames->IsLastInsertedFrame(frame)) {
+      return mFrames->MarkComplete(mDecoder->GetFirstFrameRefreshArea());
+    }
+
+    AnimationFrameBuffer::InsertStatus status =
+        mFrames->Insert(std::move(frame));
+
+    if (mFrames->HasRedecodeError()) {
+      return false;
+    }
+
+    switch (status) {
+      case AnimationFrameBuffer::InsertStatus::DISCARD_CONTINUE:
+      case AnimationFrameBuffer::InsertStatus::DISCARD_YIELD:
+        RequestFrameDiscarding();
+        break;
+      case AnimationFrameBuffer::InsertStatus::CONTINUE:
+      case AnimationFrameBuffer::InsertStatus::YIELD:
+        break;
+      default:
+        MOZ_ASSERT_UNREACHABLE("Unhandled insert status!");
+        break;
+    }
+
+    continueDecoding =
+        mFrames->MarkComplete(mDecoder->GetFirstFrameRefreshArea());
+
+    if (mFrames->Size() == 1 && mImage) {
+      justGotFirstFrame = true;
+    }
+  }
+
+  if (justGotFirstFrame) {
+    AnnounceSurfaceAvailable();
+  }
+
+  return continueDecoding;
+}
+
+void AnimationSurfaceProvider::RequestFrameDiscarding() {
+  mDecodingMutex.AssertCurrentThreadOwns();
+  mFramesMutex.AssertCurrentThreadOwns();
+  MOZ_ASSERT(mDecoder);
+
+  if (mFrames->MayDiscard() || mFrames->IsRecycling()) {
+    MOZ_ASSERT_UNREACHABLE("Already replaced frame queue!");
+    return;
+  }
+
+  auto oldFrameQueue =
+      static_cast<AnimationFrameRetainedBuffer*>(mFrames.get());
+
+  MOZ_ASSERT(!mDecoder->GetFrameRecycler());
+  if (StaticPrefs::image_animated_decode_on_demand_recycle_AtStartup()) {
+    mFrames.reset(new AnimationFrameRecyclingQueue(std::move(*oldFrameQueue)));
+    mDecoder->SetFrameRecycler(this);
+  } else {
+    mFrames.reset(new AnimationFrameDiscardingQueue(std::move(*oldFrameQueue)));
+  }
+}
+
+void AnimationSurfaceProvider::AnnounceSurfaceAvailable() {
+  mFramesMutex.AssertNotCurrentThreadOwns();
+  MOZ_ASSERT(mImage);
+
+  SurfaceCache::SurfaceAvailable(WrapNotNull(this));
+}
+
+void AnimationSurfaceProvider::FinishDecoding() {
+  mDecodingMutex.AssertCurrentThreadOwns();
+  MOZ_ASSERT(mDecoder);
+
+  if (mImage) {
+    NotifyDecodeComplete(WrapNotNull(mImage), WrapNotNull(mDecoder));
+  }
+
+  bool recreateDecoder;
+  {
+    MutexAutoLock lock(mFramesMutex);
+    recreateDecoder = !mFrames->HasRedecodeError() && mFrames->MayDiscard();
+  }
+
+  if (recreateDecoder) {
+    mDecoder = DecoderFactory::CloneAnimationDecoder(mDecoder);
+    MOZ_ASSERT(mDecoder);
+  } else {
+    mDecoder = nullptr;
+  }
+
+  DropImageReference();
+}
+
+bool AnimationSurfaceProvider::ShouldPreferSyncRun() const {
+  MutexAutoLock lock(mDecodingMutex);
+  MOZ_ASSERT(mDecoder);
+
+  return mDecoder->ShouldSyncDecode(
+      StaticPrefs::image_mem_decode_bytes_at_a_time_AtStartup());
+}
+
+RawAccessFrameRef AnimationSurfaceProvider::RecycleFrame(
+    gfx::IntRect& aRecycleRect) {
+  MutexAutoLock lock(mFramesMutex);
+  MOZ_ASSERT(mFrames->IsRecycling());
+  return mFrames->RecycleFrame(aRecycleRect);
+}
+
+nsresult AnimationSurfaceProvider::UpdateKey(
+    layers::RenderRootStateManager* aManager,
+    wr::IpcResourceUpdateQueue& aResources, wr::ImageKey& aKey) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  RefPtr<SourceSurface> surface;
+  {
+    MutexAutoLock lock(mFramesMutex);
+    imgFrame* frame =
+        mFrames->Get(mFrames->Displayed(),  true);
+    if (!frame) {
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+
+    surface = frame->GetSourceSurface();
+  }
+
+  mCompositedFrameRequested = true;
+  auto* sharedSurface = static_cast<SourceSurfaceSharedData*>(surface.get());
+  return mSharedAnimation->UpdateKey(sharedSurface, aManager, aResources, aKey);
+}
+
+}  
+}  

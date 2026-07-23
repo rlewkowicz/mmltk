@@ -1,0 +1,87 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+
+[-moz-oof-placeholder]
+inherits = false
+[-moz-hframeset-border]
+inherits = false
+[-moz-vframeset-border]
+inherits = false
+[-moz-frameset-blank]
+inherits = false
+
+[-moz-table-column-group]
+inherits = false
+[-moz-table-column]
+inherits = false
+
+[-moz-page]
+inherits = false
+[-moz-page-break]
+inherits = false
+[-moz-page-content]
+inherits = false
+[-moz-printed-sheet]
+inherits = false
+
+[-moz-column-span-wrapper]
+inherits = false
+
+[-moz-text]
+[-moz-first-letter-continuation]
+
+[-moz-block-inside-inline-wrapper]
+[-moz-mathml-anonymous-block]
+wrapper = true
+[-moz-line-frame]
+
+[-moz-cell-content]
+[-moz-fieldset-content]
+[-moz-html-canvas-content]
+
+[-moz-inline-table]
+wrapper = true
+[-moz-table]
+wrapper = true
+[-moz-table-cell]
+wrapper = true
+[-moz-table-wrapper]
+[-moz-table-row-group]
+wrapper = true
+[-moz-table-row]
+wrapper = true
+
+[-moz-canvas]
+inherits = false
+[-moz-page-sequence]
+[-moz-scrolled-content]
+
+[-moz-column-set]
+[-moz-column-content]
+
+[-moz-viewport]
+inherits = false
+[-moz-viewport-scroll]
+inherits = false
+
+[-moz-anonymous-item]
+wrapper = true
+
+[-moz-block-ruby-content]
+[-moz-ruby]
+wrapper = true
+[-moz-ruby-base]
+wrapper = true
+[-moz-ruby-base-container]
+wrapper = true
+[-moz-ruby-text]
+wrapper = true
+[-moz-ruby-text-container]
+wrapper = true
+
+[-moz-svg-marker-anon-child]
+[-moz-svg-outer-svg-anon-child]
+[-moz-svg-foreign-content]
+[-moz-svg-text]

@@ -1,0 +1,437 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "GlobalStyleSheetCache.h"
+
+#include "MainThreadUtils.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/NeverDestroyed.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/ServoBindings.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/StyleSheet.h"
+#include "mozilla/StyleSheetInlines.h"
+#include "mozilla/css/Loader.h"
+#include "mozilla/dom/ReferrerInfo.h"
+#include "mozilla/dom/SRIMetadata.h"
+#include "mozilla/ipc/SharedMemoryHandle.h"
+#include "mozilla/ipc/SharedMemoryMapping.h"
+#include "nsAppDirectoryServiceDefs.h"
+#include "nsContentUtils.h"
+#include "nsIConsoleService.h"
+#include "nsIFile.h"
+#include "nsIObserverService.h"
+#include "nsIXULRuntime.h"
+#include "nsNetUtil.h"
+#include "nsPrintfCString.h"
+#include "nsServiceManagerUtils.h"
+#include "nsXULAppAPI.h"
+
+namespace mozilla {
+
+
+using namespace mozilla;
+using namespace css;
+
+mozilla::ipc::ReadOnlySharedMemoryHandle& sSharedMemoryHandle() {
+  static NeverDestroyed<mozilla::ipc::ReadOnlySharedMemoryHandle> handle;
+  return *handle;
+}
+
+#define PREF_LEGACY_STYLESHEET_CUSTOMIZATION \
+  "toolkit.legacyUserProfileCustomizations.stylesheets"
+
+NS_IMPL_ISUPPORTS(GlobalStyleSheetCache, nsIObserver, nsIMemoryReporter)
+
+nsresult GlobalStyleSheetCache::Observe(nsISupports* aSubject,
+                                        const char* aTopic,
+                                        const char16_t* aData) {
+  if (!strcmp(aTopic, "profile-before-change")) {
+    mUserContentSheet = nullptr;
+    mUserChromeSheet = nullptr;
+  } else if (!strcmp(aTopic, "profile-do-change")) {
+    InitFromProfile();
+  } else {
+    MOZ_ASSERT_UNREACHABLE("Unexpected observer topic.");
+  }
+  return NS_OK;
+}
+
+static constexpr struct {
+  nsLiteralCString mURL;
+  BuiltInStyleSheetFlags mFlags;
+} kBuiltInSheetInfo[] = {
+#define STYLE_SHEET(identifier_, url_, flags_) \
+  {nsLiteralCString(url_), BuiltInStyleSheetFlags::flags_},
+#include "mozilla/BuiltInStyleSheetList.inc"
+#undef STYLE_SHEET
+};
+
+NotNull<StyleSheet*> GlobalStyleSheetCache::BuiltInSheet(
+    BuiltInStyleSheet aSheet) {
+  auto& slot = mBuiltIns[aSheet];
+  if (!slot) {
+    const auto& info = kBuiltInSheetInfo[size_t(aSheet)];
+    const auto origin = (info.mFlags & BuiltInStyleSheetFlags::UA)
+                            ? StyleOrigin::UserAgent
+                            : StyleOrigin::Author;
+    MOZ_ASSERT(info.mFlags & BuiltInStyleSheetFlags::UA ||
+               info.mFlags & BuiltInStyleSheetFlags::Author);
+    slot = LoadSheetURL(info.mURL, origin, eCrash);
+  }
+  return WrapNotNull(slot);
+}
+
+StyleSheet* GlobalStyleSheetCache::GetUserContentSheet() {
+  return mUserContentSheet;
+}
+
+StyleSheet* GlobalStyleSheetCache::GetUserChromeSheet() {
+  return mUserChromeSheet;
+}
+
+void GlobalStyleSheetCache::Shutdown() {
+  gCSSLoader = nullptr;
+  NS_WARNING_ASSERTION(!gStyleCache || !gUserContentSheetURL,
+                       "Got the URL but never used?");
+  gStyleCache = nullptr;
+  gUserContentSheetURL = nullptr;
+  for (auto& r : URLExtraData::sShared) {
+    r = nullptr;
+  }
+}
+
+void GlobalStyleSheetCache::SetUserContentCSSURL(nsIURI* aURI) {
+  MOZ_ASSERT(XRE_IsContentProcess(), "Only used in content processes.");
+  gUserContentSheetURL = aURI;
+}
+
+MOZ_DEFINE_MALLOC_SIZE_OF(LayoutStylesheetCacheMallocSizeOf)
+
+NS_IMETHODIMP
+GlobalStyleSheetCache::CollectReports(nsIHandleReportCallback* aHandleReport,
+                                      nsISupports* aData, bool aAnonymize) {
+  MOZ_COLLECT_REPORT("explicit/layout/style-sheet-cache/unshared", KIND_HEAP,
+                     UNITS_BYTES,
+                     SizeOfIncludingThis(LayoutStylesheetCacheMallocSizeOf),
+                     "Memory used for built-in style sheets that are not "
+                     "shared between processes.");
+
+  if (XRE_IsParentProcess()) {
+    MOZ_COLLECT_REPORT(
+        "explicit/layout/style-sheet-cache/shared", KIND_NONHEAP, UNITS_BYTES,
+        sSharedMemory.IsEmpty() ? 0 : sUsedSharedMemory,
+        "Memory used for built-in style sheets that are shared to "
+        "child processes.");
+  }
+
+  return NS_OK;
+}
+
+size_t GlobalStyleSheetCache::SizeOfIncludingThis(
+    MallocSizeOf aMallocSizeOf) const {
+  size_t n = aMallocSizeOf(this);
+
+#define MEASURE(s) n += s ? s->SizeOfIncludingThis(aMallocSizeOf) : 0;
+
+  for (const auto& sheet : mBuiltIns) {
+    MEASURE(sheet);
+  }
+
+  MEASURE(mUserChromeSheet);
+  MEASURE(mUserContentSheet);
+
+
+  return n;
+}
+
+GlobalStyleSheetCache::GlobalStyleSheetCache() {
+  nsCOMPtr<nsIObserverService> obsSvc = services::GetObserverService();
+  NS_ASSERTION(obsSvc, "No global observer service?");
+
+  if (obsSvc) {
+    obsSvc->AddObserver(this, "profile-before-change", false);
+    obsSvc->AddObserver(this, "profile-do-change", false);
+  }
+
+  InitFromProfile();
+
+  if (XRE_IsParentProcess()) {
+    XULSheet();
+  }
+
+  if (gUserContentSheetURL) {
+    MOZ_ASSERT(XRE_IsContentProcess(), "Only used in content processes.");
+    mUserContentSheet =
+        LoadSheet(gUserContentSheetURL, StyleOrigin::User, eLogToConsole);
+    gUserContentSheetURL = nullptr;
+  }
+
+  if (StaticPrefs::layout_css_shared_memory_ua_sheets_enabled()) {
+    if (XRE_IsParentProcess()) {
+      InitSharedSheetsInParent();
+    } else if (!sSharedMemory.IsEmpty()) {
+      MOZ_ASSERT(sSharedMemory.data(),
+                 "GlobalStyleSheetCache::SetSharedMemory should have mapped "
+                 "the shared memory");
+    }
+  }
+
+  if (!sSharedMemory.IsEmpty()) {
+    if (const auto* header =
+            reinterpret_cast<const Header*>(sSharedMemory.data())) {
+      MOZ_RELEASE_ASSERT(header->mMagic == Header::kMagic);
+
+      for (auto kind : MakeEnumeratedRange(BuiltInStyleSheet::Count)) {
+        const auto& info = kBuiltInSheetInfo[size_t(kind)];
+        if (info.mFlags & BuiltInStyleSheetFlags::NotShared) {
+          continue;
+        }
+        const auto origin = (info.mFlags & BuiltInStyleSheetFlags::UA)
+                                ? StyleOrigin::UserAgent
+                                : StyleOrigin::Author;
+        LoadSheetFromSharedMemory(info.mURL, &mBuiltIns[kind], origin, header,
+                                  kind);
+      }
+    }
+  }
+}
+
+void GlobalStyleSheetCache::LoadSheetFromSharedMemory(
+    const nsACString& aURL, RefPtr<StyleSheet>* aSheet, StyleOrigin aOrigin,
+    const Header* aHeader, BuiltInStyleSheet aSheetID) {
+  auto i = size_t(aSheetID);
+  auto sheet = MakeRefPtr<StyleSheet>(aOrigin, CORS_NONE, dom::SRIMetadata());
+
+  nsCOMPtr<nsIURI> uri;
+  MOZ_ALWAYS_SUCCEEDS(NS_NewURI(getter_AddRefs(uri), aURL));
+
+  nsCOMPtr<nsIReferrerInfo> referrerInfo =
+      dom::ReferrerInfo::CreateForExternalCSSResources(sheet, uri);
+  sheet->SetURIs(uri, uri, referrerInfo, nsContentUtils::GetSystemPrincipal());
+  sheet->SetSharedContents(aHeader->mSheets[i]);
+  sheet->SetComplete();
+  URLExtraData::sShared[i] = sheet->URLData();
+
+  *aSheet = std::move(sheet);
+}
+
+void GlobalStyleSheetCache::InitSharedSheetsInParent() {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  MOZ_RELEASE_ASSERT(sSharedMemory.IsEmpty());
+
+  auto handle = ipc::shared_memory::CreateFreezable(kSharedMemorySize);
+  if (NS_WARN_IF(!handle)) {
+    return;
+  }
+
+#ifdef HAVE_64BIT_BUILD
+  constexpr size_t kOffset = 0x200000000ULL;  
+#else
+  constexpr size_t kOffset = 0x20000000;  
+#endif
+
+  void* address = nullptr;
+  if (void* p = ipc::shared_memory::FindFreeAddressSpace(2 * kOffset)) {
+    address = reinterpret_cast<void*>(uintptr_t(p) + kOffset);
+  }
+
+  auto mapping = std::move(handle).Map(address);
+  if (!mapping) {
+    auto handle = std::move(mapping).Unmap();
+    mapping = std::move(handle).Map();
+    if (NS_WARN_IF(!mapping)) {
+      return;
+    }
+  }
+  address = mapping.Address();
+
+  auto* header = static_cast<Header*>(address);
+  header->mMagic = Header::kMagic;
+#ifdef DEBUG
+  for (const auto* ptr : header->mSheets) {
+    MOZ_RELEASE_ASSERT(!ptr, "expected shared memory to have been zeroed");
+  }
+#endif
+
+  UniquePtr<StyleSharedMemoryBuilder> builder(Servo_SharedMemoryBuilder_Create(
+      header->mBuffer, kSharedMemorySize - offsetof(Header, mBuffer)));
+
+  nsCString message;
+
+  for (auto kind : MakeEnumeratedRange(BuiltInStyleSheet::Count)) {
+    auto i = size_t(kind);
+    const auto& info = kBuiltInSheetInfo[i];
+    if (info.mFlags & BuiltInStyleSheetFlags::NotShared) {
+      continue;
+    }
+    StyleSheet* sheet = BuiltInSheet(kind);
+    URLExtraData::sShared[i] = sheet->URLData();
+    header->mSheets[i] = sheet->ToShared(builder.get(), message);
+    if (!header->mSheets[i]) {
+      return;
+    }
+  }
+
+  auto readOnlyHandle = std::move(mapping).Freeze();
+  if (NS_WARN_IF(!readOnlyHandle)) {
+    return;
+  }
+
+  auto roMapping = readOnlyHandle.Map(address);
+
+  size_t pageSize = ipc::shared_memory::SystemPageSize();
+  sUsedSharedMemory =
+      (Servo_SharedMemoryBuilder_GetLength(builder.get()) + pageSize - 1) &
+      ~(pageSize - 1);
+
+  sSharedMemory = std::move(roMapping).Release();
+  sSharedMemoryHandle() = std::move(readOnlyHandle);
+}
+
+GlobalStyleSheetCache::~GlobalStyleSheetCache() {
+  UnregisterWeakMemoryReporter(this);
+}
+
+void GlobalStyleSheetCache::InitMemoryReporter() {
+  RegisterWeakMemoryReporter(this);
+}
+
+GlobalStyleSheetCache* GlobalStyleSheetCache::Singleton() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!gStyleCache) {
+    gStyleCache = new GlobalStyleSheetCache;
+    gStyleCache->InitMemoryReporter();
+
+  }
+
+  return gStyleCache;
+}
+
+void GlobalStyleSheetCache::InitFromProfile() {
+  if (!Preferences::GetBool(PREF_LEGACY_STYLESHEET_CUSTOMIZATION)) {
+    return;
+  }
+
+  nsCOMPtr<nsIXULRuntime> appInfo =
+      do_GetService("@mozilla.org/xre/app-info;1");
+  if (appInfo) {
+    bool inSafeMode = false;
+    appInfo->GetInSafeMode(&inSafeMode);
+    if (inSafeMode) {
+      return;
+    }
+  }
+  nsCOMPtr<nsIFile> contentFile;
+  nsCOMPtr<nsIFile> chromeFile;
+
+  NS_GetSpecialDirectory(NS_APP_USER_CHROME_DIR, getter_AddRefs(contentFile));
+  if (!contentFile) {
+    return;
+  }
+
+  contentFile->Clone(getter_AddRefs(chromeFile));
+  if (!chromeFile) {
+    return;
+  }
+
+  contentFile->Append(u"userContent.css"_ns);
+  chromeFile->Append(u"userChrome.css"_ns);
+
+  mUserContentSheet = LoadSheetFile(contentFile, StyleOrigin::User);
+  mUserChromeSheet = LoadSheetFile(chromeFile, StyleOrigin::User);
+}
+
+RefPtr<StyleSheet> GlobalStyleSheetCache::LoadSheetURL(
+    const nsACString& aURL, StyleOrigin aOrigin, FailureAction aFailureAction) {
+  nsCOMPtr<nsIURI> uri;
+  NS_NewURI(getter_AddRefs(uri), aURL);
+  return LoadSheet(uri, aOrigin, aFailureAction);
+}
+
+RefPtr<StyleSheet> GlobalStyleSheetCache::LoadSheetFile(nsIFile* aFile,
+                                                        StyleOrigin aOrigin) {
+  bool exists = false;
+  aFile->Exists(&exists);
+  if (!exists) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  NS_NewFileURI(getter_AddRefs(uri), aFile);
+  return LoadSheet(uri, aOrigin, eLogToConsole);
+}
+
+static void ErrorLoadingSheet(nsIURI* aURI, const char* aMsg,
+                              FailureAction aFailureAction) {
+  nsPrintfCString errorMessage("%s loading built-in stylesheet '%s'", aMsg,
+                               aURI ? aURI->GetSpecOrDefault().get() : "");
+  if (aFailureAction == eLogToConsole) {
+    nsCOMPtr<nsIConsoleService> cs =
+        do_GetService(NS_CONSOLESERVICE_CONTRACTID);
+    if (cs) {
+      cs->LogStringMessage(NS_ConvertUTF8toUTF16(errorMessage).get());
+      return;
+    }
+  }
+
+  MOZ_CRASH_UNSAFE(errorMessage.get());
+}
+
+RefPtr<StyleSheet> GlobalStyleSheetCache::LoadSheet(
+    nsIURI* aURI, StyleOrigin aOrigin, FailureAction aFailureAction) {
+  if (!aURI) {
+    ErrorLoadingSheet(aURI, "null URI", eCrash);
+    return nullptr;
+  }
+
+  if (!gCSSLoader) {
+    gCSSLoader = new Loader;
+  }
+
+  auto result = gCSSLoader->LoadSheetSync(aURI, aOrigin,
+                                          css::Loader::UseSystemPrincipal::Yes);
+  if (MOZ_UNLIKELY(result.isErr())) {
+    ErrorLoadingSheet(
+        aURI,
+        nsPrintfCString("LoadSheetSync failed with error %" PRIx32,
+                        static_cast<uint32_t>(result.unwrapErr()))
+            .get(),
+        aFailureAction);
+  }
+  return result.unwrapOr(nullptr);
+}
+
+ void GlobalStyleSheetCache::SetSharedMemory(
+    ipc::ReadOnlySharedMemoryHandle aHandle, uintptr_t aAddress) {
+  MOZ_ASSERT(!XRE_IsParentProcess());
+  MOZ_ASSERT(!gStyleCache, "Too late, GlobalStyleSheetCache already created!");
+  MOZ_ASSERT(sSharedMemory.IsEmpty(), "Shouldn't call this more than once");
+
+  auto mapping = aHandle.Map(reinterpret_cast<void*>(aAddress));
+  if (!mapping) {
+    return;
+  }
+
+  sSharedMemory = std::move(mapping).Release();
+  sSharedMemoryHandle() = std::move(aHandle);
+}
+
+ipc::ReadOnlySharedMemoryHandle GlobalStyleSheetCache::CloneHandle() {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  if (sSharedMemoryHandle().IsValid()) {
+    return sSharedMemoryHandle().Clone();
+  }
+  return nullptr;
+}
+
+StaticRefPtr<GlobalStyleSheetCache> GlobalStyleSheetCache::gStyleCache;
+StaticRefPtr<css::Loader> GlobalStyleSheetCache::gCSSLoader;
+StaticRefPtr<nsIURI> GlobalStyleSheetCache::gUserContentSheetURL;
+
+ipc::shared_memory::LeakedReadOnlyMapping GlobalStyleSheetCache::sSharedMemory;
+size_t GlobalStyleSheetCache::sUsedSharedMemory;
+
+}  

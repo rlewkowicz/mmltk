@@ -1,0 +1,204 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_media_ChannelMediaResource_h
+#define mozilla_dom_media_ChannelMediaResource_h
+
+#include "BaseMediaResource.h"
+#include "MediaCache.h"
+#include "mozilla/EventTargetAndLockCapability.h"
+#include "mozilla/Mutex.h"
+#include "nsIChannelEventSink.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIThreadRetargetableStreamListener.h"
+
+class nsIHttpChannel;
+
+namespace mozilla {
+
+class ChannelSuspendAgent {
+ public:
+  explicit ChannelSuspendAgent(MediaCacheStream& aCacheStream)
+      : mCacheStream(aCacheStream) {}
+
+  bool IsSuspended();
+
+  bool Suspend();
+
+  bool Resume();
+
+  void Delegate(nsIChannel* aChannel);
+  void Revoke();
+  void RevokeIfManaged(nsIChannel* aChannel);
+
+ private:
+  void SuspendInternal();
+
+  nsIChannel* mChannel = nullptr;
+  MediaCacheStream& mCacheStream;
+  uint32_t mSuspendCount = 0;
+  bool mIsChannelSuspended = false;
+};
+
+DDLoggedTypeDeclNameAndBase(ChannelMediaResource, BaseMediaResource);
+
+class ChannelMediaResource
+    : public BaseMediaResource,
+      public DecoderDoctorLifeLogger<ChannelMediaResource> {
+  struct SharedInfo {
+    NS_INLINE_DECL_REFCOUNTING(SharedInfo);
+
+    nsTArray<ChannelMediaResource*> mResources;
+    nsCOMPtr<nsIPrincipal> mPrincipal;
+    bool mFinalResponsesAreOpaque = false;
+
+    bool mHadCrossOriginRedirects = false;
+
+   private:
+    ~SharedInfo() = default;
+  };
+  RefPtr<SharedInfo> mSharedInfo;
+
+ public:
+  ChannelMediaResource(MediaResourceCallback* aDecoder, nsIChannel* aChannel,
+                       nsIURI* aURI, int64_t aStreamLength,
+                       bool aIsPrivateBrowsing = false);
+  ~ChannelMediaResource();
+
+  void CacheClientNotifyDataReceived();
+  void CacheClientNotifyDataEnded(nsresult aStatus);
+  void CacheClientNotifyPrincipalChanged();
+  void CacheClientNotifySuspendedStatusChanged(bool aSuspended);
+
+  void CacheClientSeek(int64_t aOffset, bool aResume);
+  void CacheClientSuspend();
+  void CacheClientResume();
+
+  bool IsSuspended();
+
+  void ThrottleReadahead(bool bThrottle) override;
+
+  nsresult Open(nsIStreamListener** aStreamListener) override;
+  RefPtr<GenericPromise> Close() override;
+  void Suspend(bool aCloseImmediately) override;
+  void Resume() override;
+  already_AddRefed<nsIPrincipal> GetCurrentPrincipal() override;
+  bool HadCrossOriginRedirects() override;
+  bool CanClone() override;
+  already_AddRefed<BaseMediaResource> CloneData(
+      MediaResourceCallback* aDecoder) override;
+  nsresult ReadFromCache(char* aBuffer, int64_t aOffset,
+                         uint32_t aCount) override;
+
+  void SetReadMode(MediaCacheStream::ReadMode aMode) override;
+  void SetPlaybackRate(uint32_t aBytesPerSecond) override;
+  nsresult ReadAt(int64_t offset, char* aBuffer, uint32_t aCount,
+                  uint32_t* aBytes) override;
+  bool ShouldCacheReads() override { return true; }
+
+  void Pin() override;
+  void Unpin() override;
+  double GetDownloadRate(bool* aIsReliable) override;
+  int64_t GetLength() override;
+  int64_t GetNextCachedData(int64_t aOffset) override;
+  int64_t GetCachedDataEnd(int64_t aOffset) override;
+  bool IsDataCachedToEndOfResource(int64_t aOffset) override;
+  bool IsTransportSeekable() override;
+  bool IsLiveStream() const override { return mIsLiveStream; }
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const override {
+    size_t size = BaseMediaResource::SizeOfExcludingThis(aMallocSizeOf);
+    size += mCacheStream.SizeOfExcludingThis(aMallocSizeOf);
+
+    return size;
+  }
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const override {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  void GetDebugInfo(dom::MediaResourceDebugInfo& aInfo) override;
+
+  class Listener final : public nsIInterfaceRequestor,
+                         public nsIChannelEventSink,
+                         public nsIThreadRetargetableStreamListener {
+    ~Listener() = default;
+
+   public:
+    Listener(ChannelMediaResource* aResource, int64_t aOffset, uint32_t aLoadID)
+        : mLock("Listener.mLock"),
+          mResource(aResource),
+          mOffset(aOffset),
+          mLoadID(aLoadID) {}
+
+    NS_DECL_THREADSAFE_ISUPPORTS
+    NS_DECL_NSIREQUESTOBSERVER
+    NS_DECL_NSISTREAMLISTENER
+    NS_DECL_NSICHANNELEVENTSINK
+    NS_DECL_NSIINTERFACEREQUESTOR
+    NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+
+    void Revoke();
+
+   private:
+    MainThreadAndLockCapability<Mutex> mLock;
+    RefPtr<ChannelMediaResource> mResource MOZ_GUARDED_BY(mLock);
+
+    const int64_t mOffset;
+    const uint32_t mLoadID;
+  };
+  friend class Listener;
+
+  nsresult GetCachedRanges(MediaByteRangeSet& aRanges) override;
+
+ protected:
+  nsresult Seek(int64_t aOffset, bool aResume);
+
+  nsresult OnStartRequest(nsIRequest* aRequest, int64_t aRequestOffset);
+  nsresult OnStopRequest(nsIRequest* aRequest, nsresult aStatus);
+  nsresult OnDataAvailable(uint32_t aLoadID, nsIInputStream* aStream,
+                           uint32_t aCount);
+  nsresult OnChannelRedirect(nsIChannel* aOld, nsIChannel* aNew,
+                             uint32_t aFlags, int64_t aOffset);
+
+  dom::HTMLMediaElement* MediaElement() const;
+  nsresult OpenChannel(int64_t aOffset);
+  nsresult RecreateChannel();
+  nsresult SetupChannelHeaders(int64_t aOffset);
+  void CloseChannel();
+  void UpdatePrincipal();
+
+  nsresult ParseContentRangeHeader(nsIHttpChannel* aHttpChan,
+                                   int64_t& aRangeStart, int64_t& aRangeEnd,
+                                   int64_t& aRangeTotal) const;
+
+  int64_t CalculateStreamLength() const;
+
+  struct Closure {
+    uint32_t mLoadID;
+    ChannelMediaResource* mResource;
+  };
+
+  static nsresult CopySegmentToCache(nsIInputStream* aInStream, void* aClosure,
+                                     const char* aFromSegment,
+                                     uint32_t aToOffset, uint32_t aCount,
+                                     uint32_t* aWriteCount);
+
+  bool mClosed = false;
+  bool mIsTransportSeekable = false;
+  int64_t mFirstReadLength = -1;
+  RefPtr<Listener> mListener;
+  uint32_t mLoadID = 0;
+  bool mIsLiveStream = false;
+
+  MediaCacheStream mCacheStream;
+
+  ChannelSuspendAgent mSuspendAgent;
+
+  const int64_t mKnownStreamLength;
+};
+
+}  
+
+#endif  // mozilla_dom_media_ChannelMediaResource_h

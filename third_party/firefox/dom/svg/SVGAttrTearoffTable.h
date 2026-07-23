@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGATTRTEAROFFTABLE_H_
+#define DOM_SVG_SVGATTRTEAROFFTABLE_H_
+
+#include "mozilla/DebugOnly.h"
+#include "mozilla/StaticPtr.h"
+#include "nsDebug.h"
+#include "nsHashKeys.h"
+#include "nsTHashMap.h"
+
+namespace mozilla {
+
+template <class SimpleType, class TearoffType>
+class SVGAttrTearoffTable {
+ public:
+#ifdef DEBUG
+  ~SVGAttrTearoffTable() {
+    NS_ASSERTION(!mTable, "Tear-off objects remain in hashtable at shutdown.");
+  }
+#endif
+
+  TearoffType* GetTearoff(SimpleType* aSimple);
+
+  void AddTearoff(SimpleType* aSimple, TearoffType* aTearoff);
+
+  void RemoveTearoff(SimpleType* aSimple);
+
+ private:
+  using SimpleTypePtrKey = nsPtrHashKey<SimpleType>;
+  using TearoffTable = nsTHashMap<SimpleTypePtrKey, TearoffType*>;
+
+  StaticAutoPtr<TearoffTable> mTable;
+};
+
+template <class SimpleType, class TearoffType>
+TearoffType* SVGAttrTearoffTable<SimpleType, TearoffType>::GetTearoff(
+    SimpleType* aSimple) {
+  if (!mTable) {
+    return nullptr;
+  }
+
+  TearoffType* tearoff = nullptr;
+
+  DebugOnly<bool> found = mTable->Get(aSimple, &tearoff);
+  MOZ_ASSERT(!found || tearoff,
+             "null pointer stored in attribute tear-off map");
+
+  return tearoff;
+}
+
+template <class SimpleType, class TearoffType>
+void SVGAttrTearoffTable<SimpleType, TearoffType>::AddTearoff(
+    SimpleType* aSimple, TearoffType* aTearoff) {
+  if (!mTable) {
+    mTable = new TearoffTable();
+  }
+
+  if (mTable->Get(aSimple, nullptr)) {
+    MOZ_ASSERT(false, "There is already a tear-off for this object.");
+    return;
+  }
+
+  mTable->InsertOrUpdate(aSimple, aTearoff);
+}
+
+template <class SimpleType, class TearoffType>
+void SVGAttrTearoffTable<SimpleType, TearoffType>::RemoveTearoff(
+    SimpleType* aSimple) {
+  if (!mTable) {
+    return;
+  }
+
+  mTable->Remove(aSimple);
+  if (mTable->Count() == 0) {
+    mTable = nullptr;
+  }
+}
+
+}  
+
+#endif  // DOM_SVG_SVGATTRTEAROFFTABLE_H_

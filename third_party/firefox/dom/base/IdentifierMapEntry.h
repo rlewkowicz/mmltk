@@ -1,0 +1,172 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_IdentifierMapEntry_h
+#define mozilla_IdentifierMapEntry_h
+
+#include <utility>
+
+#include "PLDHashTable.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/TreeOrderedArray.h"
+#include "nsAtom.h"
+#include "nsHashKeys.h"
+#include "nsTArray.h"
+#include "nsTHashtable.h"
+
+class nsIContent;
+class nsINode;
+
+namespace mozilla {
+namespace dom {
+class Document;
+class Element;
+class HTMLCollection;
+class IdentifierMapContentList;
+}  
+
+class IdentifierMapEntry : public PLDHashEntryHdr {
+  typedef dom::Document Document;
+  typedef dom::Element Element;
+
+  typedef bool (*IDTargetObserver)(Element* aOldElement, Element* aNewelement,
+                                   void* aData);
+
+ public:
+  struct DependentAtomOrString final {
+    MOZ_IMPLICIT DependentAtomOrString(nsAtom* aAtom)
+        : mAtom(aAtom), mString(nullptr) {}
+    MOZ_IMPLICIT DependentAtomOrString(const nsAString& aString)
+        : mAtom(nullptr), mString(&aString) {}
+    DependentAtomOrString(const DependentAtomOrString& aOther) = default;
+
+    nsAtom* mAtom;
+    const nsAString* mString;
+  };
+
+  typedef const DependentAtomOrString& KeyType;
+  typedef const DependentAtomOrString* KeyTypePointer;
+
+  explicit IdentifierMapEntry(const DependentAtomOrString* aKey);
+  IdentifierMapEntry(IdentifierMapEntry&& aOther);
+  ~IdentifierMapEntry();
+
+  nsDependentAtomString GetKeyAsString() const {
+    return nsDependentAtomString(mKey);
+  }
+
+  bool KeyEquals(const KeyTypePointer aOtherKey) const {
+    if (aOtherKey->mAtom) {
+      return mKey == aOtherKey->mAtom;
+    }
+
+    return mKey->Equals(*aOtherKey->mString);
+  }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+
+  static PLDHashNumber HashKey(const KeyTypePointer aKey) {
+    return aKey->mAtom ? aKey->mAtom->hash() : HashString(*aKey->mString);
+  }
+
+  enum { ALLOW_MEMMOVE = false };
+
+  bool IsEmpty();
+
+  void AddNameElement(Element* aElement);
+  void RemoveNameElement(Element* aElement);
+  Span<Element* const> GetNameElements() const { return mNameList.AsSpan(); }
+
+  void GetWindowNameElements(nsTArray<Element*>&) const;
+  dom::HTMLCollection* GetWindowNameContentList() const;
+  dom::HTMLCollection& CreateWindowNameContentList(
+      Document*, Span<Element*> aKnownElements);
+  void InvalidateWindowNameContentList();
+  bool HasWindowNameElement() const;
+
+  void GetDocumentNameElements(nsTArray<Element*>&) const;
+  dom::HTMLCollection* GetDocumentNameContentList() const;
+  dom::HTMLCollection& CreateDocumentNameContentList(
+      Document*, Span<Element*> aKnownElements);
+  void InvalidateDocumentNameContentList();
+  bool HasDocumentNameElement() const;
+
+  Element* GetIdElement() const {
+    auto span = mIdList.AsSpan();
+    return span.IsEmpty() ? nullptr : span[0];
+  }
+
+  Span<Element* const> GetIdElements() const { return mIdList.AsSpan(); }
+
+  Element* GetImageIdElement() {
+    return mImageElement ? mImageElement.get() : GetIdElement();
+  }
+
+  void AddIdElement(Element* aElement);
+  void RemoveIdElement(Element* aElement);
+  void SetImageElement(Element* aElement);
+  bool HasIdElementExposedAsHTMLDocumentProperty() const;
+
+  bool HasContentChangeCallback() { return mChangeCallbacks != nullptr; }
+  void AddContentChangeCallback(IDTargetObserver aCallback, void* aData,
+                                bool aForImage);
+  void RemoveContentChangeCallback(IDTargetObserver aCallback, void* aData,
+                                   bool aForImage);
+
+  void ClearAndNotify();
+
+  void Traverse(nsCycleCollectionTraversalCallback* aCallback);
+
+  struct ChangeCallback {
+    IDTargetObserver mCallback;
+    void* mData;
+    bool mForImage;
+  };
+
+  struct ChangeCallbackEntry : public PLDHashEntryHdr {
+    typedef const ChangeCallback KeyType;
+    typedef const ChangeCallback* KeyTypePointer;
+
+    explicit ChangeCallbackEntry(const ChangeCallback* aKey) : mKey(*aKey) {}
+    ChangeCallbackEntry(ChangeCallbackEntry&& aOther)
+        : PLDHashEntryHdr(std::move(aOther)), mKey(std::move(aOther.mKey)) {}
+
+    KeyType GetKey() const { return mKey; }
+    bool KeyEquals(KeyTypePointer aKey) const {
+      return aKey->mCallback == mKey.mCallback && aKey->mData == mKey.mData &&
+             aKey->mForImage == mKey.mForImage;
+    }
+
+    static KeyTypePointer KeyToPointer(KeyType& aKey) { return &aKey; }
+    static PLDHashNumber HashKey(KeyTypePointer aKey) {
+      return HashGeneric(aKey->mCallback, aKey->mData);
+    }
+    enum { ALLOW_MEMMOVE = true };
+
+    ChangeCallback mKey;
+  };
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const;
+
+ private:
+  IdentifierMapEntry(const IdentifierMapEntry& aOther) = delete;
+  IdentifierMapEntry& operator=(const IdentifierMapEntry& aOther) = delete;
+
+  void FireChangeCallbacks(Element* aOldElement, Element* aNewElement,
+                           bool aImageOnly = false);
+
+  RefPtr<nsAtom> mKey;
+  dom::TreeOrderedArray<Element*> mIdList;
+  dom::TreeOrderedArray<Element*> mNameList;
+  RefPtr<dom::IdentifierMapContentList> mWindowNameContentList;
+  RefPtr<dom::IdentifierMapContentList> mDocumentNameContentList;
+  UniquePtr<nsTHashtable<ChangeCallbackEntry>> mChangeCallbacks;
+  RefPtr<Element> mImageElement;
+};
+
+}  
+
+#endif  // #ifndef mozilla_IdentifierMapEntry_h

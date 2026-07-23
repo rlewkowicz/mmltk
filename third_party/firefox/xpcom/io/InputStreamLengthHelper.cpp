@@ -1,0 +1,230 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "InputStreamLengthHelper.h"
+#include "mozilla/dom/WorkerCommon.h"
+#include "nsIAsyncInputStream.h"
+#include "nsIInputStream.h"
+#include "nsNetCID.h"
+#include "nsServiceManagerUtils.h"
+
+namespace mozilla {
+
+namespace {
+
+class AvailableEvent final : public Runnable {
+ public:
+  AvailableEvent(nsIInputStream* stream,
+                 const std::function<void(int64_t aLength)>& aCallback)
+      : Runnable("mozilla::AvailableEvent"),
+        mStream(stream),
+        mCallback(aCallback),
+        mSize(-1) {
+    mCallbackTarget = GetCurrentSerialEventTarget();
+    MOZ_ASSERT(NS_IsMainThread());
+  }
+
+  NS_IMETHOD
+  Run() override {
+    if (!NS_IsMainThread()) {
+      uint64_t size = 0;
+      if (NS_WARN_IF(NS_FAILED(mStream->Available(&size)))) {
+        mSize = -1;
+      } else {
+        mSize = (int64_t)size;
+      }
+
+      mStream = nullptr;
+
+      nsCOMPtr<nsIRunnable> self(this);  
+      mCallbackTarget->Dispatch(self.forget(), NS_DISPATCH_NORMAL);
+      mCallbackTarget = nullptr;
+      return NS_OK;
+    }
+
+    std::function<void(int64_t aLength)> callback;
+    callback.swap(mCallback);
+    callback(mSize);
+    return NS_OK;
+  }
+
+ private:
+  nsCOMPtr<nsIInputStream> mStream;
+  std::function<void(int64_t aLength)> mCallback;
+  nsCOMPtr<nsIEventTarget> mCallbackTarget;
+
+  int64_t mSize;
+};
+
+}  
+
+bool InputStreamLengthHelper::GetSyncLength(nsIInputStream* aStream,
+                                            int64_t* aLength) {
+  MOZ_ASSERT(aStream);
+  MOZ_ASSERT(aLength);
+
+  *aLength = -1;
+
+  nsCOMPtr<nsIInputStreamLength> streamLength = do_QueryInterface(aStream);
+  if (streamLength) {
+    int64_t length = -1;
+    nsresult rv = streamLength->Length(&length);
+
+    if (NS_SUCCEEDED(rv)) {
+      *aLength = length;
+      return true;
+    }
+
+    if (rv == NS_BASE_STREAM_CLOSED ||
+        NS_WARN_IF(rv == NS_ERROR_NOT_AVAILABLE) ||
+        NS_WARN_IF(rv != NS_BASE_STREAM_WOULD_BLOCK)) {
+      return true;
+    }
+  }
+
+  nsCOMPtr<nsIAsyncInputStreamLength> asyncStreamLength =
+      do_QueryInterface(aStream);
+  if (asyncStreamLength) {
+    return false;
+  }
+
+  nsCOMPtr<nsIAsyncInputStream> asyncStream = do_QueryInterface(aStream);
+  if (asyncStream) {
+    return false;
+  }
+
+  if (NS_IsMainThread()) {
+    bool nonBlocking = false;
+    if (NS_WARN_IF(NS_FAILED(aStream->IsNonBlocking(&nonBlocking)))) {
+      return true;
+    }
+
+    if (!nonBlocking) {
+      return false;
+    }
+  }
+
+  uint64_t available = 0;
+  nsresult rv = aStream->Available(&available);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return true;
+  }
+
+  *aLength = (int64_t)available;
+  return true;
+}
+
+void InputStreamLengthHelper::GetAsyncLength(
+    nsIInputStream* aStream,
+    const std::function<void(int64_t aLength)>& aCallback) {
+  MOZ_ASSERT(aStream);
+  MOZ_ASSERT(aCallback);
+
+  MOZ_DIAGNOSTIC_ASSERT(NS_IsMainThread() ||
+                        !dom::IsCurrentThreadRunningWorker());
+
+  RefPtr<InputStreamLengthHelper> helper =
+      new InputStreamLengthHelper(aStream, aCallback);
+
+  if (NS_IsMainThread()) {
+    nsCOMPtr<nsIInputStreamLength> streamLength = do_QueryInterface(aStream);
+    nsCOMPtr<nsIAsyncInputStreamLength> asyncStreamLength =
+        do_QueryInterface(aStream);
+    if (!streamLength && !asyncStreamLength) {
+#ifdef DEBUG
+      nsCOMPtr<nsIAsyncInputStream> asyncStream = do_QueryInterface(aStream);
+      MOZ_DIAGNOSTIC_ASSERT(!asyncStream);
+#endif
+
+      bool nonBlocking = false;
+      if (NS_SUCCEEDED(aStream->IsNonBlocking(&nonBlocking)) && !nonBlocking) {
+        nsCOMPtr<nsIEventTarget> target =
+            do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID);
+        MOZ_ASSERT(target);
+
+        RefPtr event = MakeRefPtr<AvailableEvent>(aStream, aCallback);
+        target->Dispatch(event.forget(), NS_DISPATCH_NORMAL);
+        return;
+      }
+    }
+  }
+
+  GetCurrentSerialEventTarget()->Dispatch(helper, NS_DISPATCH_NORMAL);
+}
+
+InputStreamLengthHelper::InputStreamLengthHelper(
+    nsIInputStream* aStream,
+    const std::function<void(int64_t aLength)>& aCallback)
+    : Runnable("InputStreamLengthHelper"),
+      mStream(aStream),
+      mCallback(aCallback) {
+  MOZ_ASSERT(aStream);
+  MOZ_ASSERT(aCallback);
+}
+
+InputStreamLengthHelper::~InputStreamLengthHelper() = default;
+
+NS_IMETHODIMP
+InputStreamLengthHelper::Run() {
+  nsCOMPtr<nsIInputStreamLength> streamLength = do_QueryInterface(mStream);
+  if (streamLength) {
+    int64_t length = -1;
+    nsresult rv = streamLength->Length(&length);
+
+    if (NS_SUCCEEDED(rv)) {
+      ExecCallback(length);
+      return NS_OK;
+    }
+
+    if (rv == NS_BASE_STREAM_CLOSED ||
+        NS_WARN_IF(rv == NS_ERROR_NOT_AVAILABLE) ||
+        NS_WARN_IF(rv != NS_BASE_STREAM_WOULD_BLOCK)) {
+      ExecCallback(-1);
+      return NS_OK;
+    }
+  }
+
+  nsCOMPtr<nsIAsyncInputStreamLength> asyncStreamLength =
+      do_QueryInterface(mStream);
+  if (asyncStreamLength) {
+    nsresult rv =
+        asyncStreamLength->AsyncLengthWait(this, GetCurrentSerialEventTarget());
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      ExecCallback(-1);
+    }
+
+    return NS_OK;
+  }
+
+  uint64_t available = 0;
+  nsresult rv = mStream->Available(&available);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    ExecCallback(-1);
+    return NS_OK;
+  }
+
+  ExecCallback((int64_t)available);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+InputStreamLengthHelper::OnInputStreamLengthReady(
+    nsIAsyncInputStreamLength* aStream, int64_t aLength) {
+  ExecCallback(aLength);
+  return NS_OK;
+}
+
+void InputStreamLengthHelper::ExecCallback(int64_t aLength) {
+  MOZ_ASSERT(mCallback);
+
+  std::function<void(int64_t aLength)> callback;
+  callback.swap(mCallback);
+
+  callback(aLength);
+}
+
+NS_IMPL_ISUPPORTS_INHERITED(InputStreamLengthHelper, Runnable,
+                            nsIInputStreamLengthCallback)
+
+}  

@@ -1,0 +1,75 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DisplayItemClipChain.h"
+
+#include "nsDisplayList.h"
+
+namespace mozilla {
+
+ const DisplayItemClip* DisplayItemClipChain::ClipForASR(
+    const DisplayItemClipChain* aClipChain, const ActiveScrolledRoot* aASR) {
+  while (aClipChain &&
+         !ActiveScrolledRoot::IsAncestor(aClipChain->mASR, aASR)) {
+    aClipChain = aClipChain->mParent;
+  }
+  return (aClipChain && aClipChain->mASR == aASR) ? &aClipChain->mClip
+                                                  : nullptr;
+}
+
+bool DisplayItemClipChain::Equal(const DisplayItemClipChain* aClip1,
+                                 const DisplayItemClipChain* aClip2) {
+  if (aClip1 == aClip2) {
+    return true;
+  }
+
+  if (!aClip1 || !aClip2) {
+    return false;
+  }
+
+  bool ret = aClip1->mASR == aClip2->mASR && aClip1->mClip == aClip2->mClip &&
+             Equal(aClip1->mParent, aClip2->mParent);
+  MOZ_ASSERT(!ret || (Hash(aClip1) == Hash(aClip2)));
+  return ret;
+}
+
+uint32_t DisplayItemClipChain::Hash(const DisplayItemClipChain* aClip) {
+  if (!aClip) {
+    return 0;
+  }
+
+  uint32_t hash = HashGeneric(aClip->mASR, aClip->mClip.GetRoundedRectCount());
+  if (aClip->mClip.HasClip()) {
+    const nsRect& rect = aClip->mClip.GetClipRect();
+    if (!rect.IsEmpty()) {
+      hash = AddToHash(hash, rect.x, rect.y, rect.width, rect.height);
+    }
+  }
+
+  return hash;
+}
+
+nsCString DisplayItemClipChain::ToString(
+    const DisplayItemClipChain* aClipChain) {
+  nsAutoCString str;
+  for (auto* sc = aClipChain; sc; sc = sc->mParent) {
+    if (sc->mASR) {
+      str.AppendPrintf("0x%p <%s> %s", sc, sc->mClip.ToString().get(),
+                       ActiveScrolledRoot::ToString(sc->mASR).get());
+    } else {
+      str.AppendPrintf("0x%p <%s> [root asr]", sc, sc->mClip.ToString().get());
+    }
+    if (sc->mParent) {
+      str.AppendLiteral(", ");
+    }
+  }
+  return std::move(str);
+}
+
+bool DisplayItemClipChain::HasRoundedCorners() const {
+  return mClip.GetRoundedRectCount() > 0 ||
+         (mParent && mParent->HasRoundedCorners());
+}
+
+}  

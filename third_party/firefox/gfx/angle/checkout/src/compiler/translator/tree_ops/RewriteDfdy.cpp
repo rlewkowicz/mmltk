@@ -1,0 +1,90 @@
+// Copyright 2019 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "compiler/translator/tree_ops/RewriteDfdy.h"
+
+#include "common/angleutils.h"
+#include "compiler/translator/SymbolTable.h"
+#include "compiler/translator/tree_util/DriverUniform.h"
+#include "compiler/translator/tree_util/IntermNode_util.h"
+#include "compiler/translator/tree_util/IntermTraverse.h"
+#include "compiler/translator/tree_util/SpecializationConstant.h"
+
+namespace sh
+{
+
+namespace
+{
+
+class Traverser : public TIntermTraverser
+{
+  public:
+    Traverser(TSymbolTable *symbolTable, const DriverUniform *driverUniforms);
+
+  private:
+    bool visitAggregate(Visit visit, TIntermAggregate *node) override;
+
+    const DriverUniform *mDriverUniforms = nullptr;
+};
+
+Traverser::Traverser(TSymbolTable *symbolTable,
+                     const DriverUniform *driverUniforms)
+    : TIntermTraverser(true, false, false, symbolTable),
+      mDriverUniforms(driverUniforms)
+{}
+
+bool Traverser::visitAggregate(Visit visit, TIntermAggregate *node)
+{
+    if (node->getOp() != EOpDFdx && node->getOp() != EOpDFdy)
+    {
+        return true;
+    }
+
+    const bool isDFdx = node->getOp() == EOpDFdx;
+
+
+    TIntermTyped *operand = node->getChildNode(0)->getAsTyped();
+
+    TIntermTyped *dFdx = CreateBuiltInUnaryFunctionCallNode("dFdx", operand, *mSymbolTable, 300);
+    TIntermTyped *dFdy =
+        CreateBuiltInUnaryFunctionCallNode("dFdy", operand->deepCopy(), *mSymbolTable, 300);
+
+    TIntermTyped *swapXY          = mDriverUniforms->getSwapXY();
+    TIntermTyped *swapXMultiplier = MakeSwapXMultiplier(swapXY);
+    TIntermTyped *swapYMultiplier = MakeSwapYMultiplier(swapXY->deepCopy());
+
+    TIntermTyped *flipXY = mDriverUniforms->getFlipXY(mSymbolTable, DriverUniformFlip::Fragment);
+
+    TIntermTyped *xMultiplier =
+        new TIntermBinary(EOpMul, isDFdx ? swapXMultiplier : swapYMultiplier,
+                          (new TIntermSwizzle(flipXY->deepCopy(), {0}))->fold(nullptr));
+    TIntermTyped *yMultiplier =
+        new TIntermBinary(EOpMul, isDFdx ? swapYMultiplier : swapXMultiplier,
+                          (new TIntermSwizzle(flipXY->deepCopy(), {1}))->fold(nullptr));
+
+    const TOperator mulOp            = dFdx->getType().isVector() ? EOpVectorTimesScalar : EOpMul;
+    TIntermTyped *rotatedFlippedDfdx = new TIntermBinary(mulOp, dFdx, xMultiplier);
+    TIntermTyped *rotatedFlippedDfdy = new TIntermBinary(mulOp, dFdy, yMultiplier);
+
+    TIntermBinary *rotatedFlippedResult =
+        new TIntermBinary(EOpAdd, rotatedFlippedDfdx, rotatedFlippedDfdy);
+
+    queueReplacement(rotatedFlippedResult, OriginalNode::IS_DROPPED);
+
+    return true;
+}
+}  
+
+bool RewriteDfdy(TCompiler *compiler,
+                 TIntermBlock *root,
+                 TSymbolTable *symbolTable,
+                 int shaderVersion,
+                 const DriverUniform *driverUniforms)
+{
+    Traverser traverser(symbolTable, driverUniforms);
+    root->traverse(&traverser);
+    return traverser.updateTree(compiler, root);
+}
+
+}  

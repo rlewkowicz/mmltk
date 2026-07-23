@@ -1,0 +1,146 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+function CreateSegmentDataObject(string, boundaries) {
+  assert(typeof string === "string", "CreateSegmentDataObject");
+  assert(
+    IsPackedArray(boundaries) && boundaries.length === 3,
+    "CreateSegmentDataObject"
+  );
+
+  var startIndex = boundaries[0];
+  assert(
+    typeof startIndex === "number" && (startIndex | 0) === startIndex,
+    "startIndex is an int32-value"
+  );
+
+  var endIndex = boundaries[1];
+  assert(
+    typeof endIndex === "number" && (endIndex | 0) === endIndex,
+    "endIndex is an int32-value"
+  );
+
+  var isWordLike = boundaries[2];
+  assert(
+    typeof isWordLike === "boolean" || isWordLike === undefined,
+    "isWordLike is either a boolean or undefined"
+  );
+
+
+  assert(startIndex >= 0, "startIndex is a positive number");
+
+  assert(
+    endIndex <= string.length,
+    "endIndex is less-than-equals the string length"
+  );
+
+  assert(startIndex < endIndex, "startIndex is strictly less than endIndex");
+
+  var segment = Substring(string, startIndex, endIndex - startIndex);
+
+  if (isWordLike === undefined) {
+    return {
+      segment,
+      index: startIndex,
+      input: string,
+    };
+  }
+
+  return {
+    segment,
+    index: startIndex,
+    input: string,
+    isWordLike,
+  };
+}
+
+function Intl_Segments_containing(index) {
+  var segments = this;
+
+  if (
+    !IsObject(segments) ||
+    (segments = intl_GuardToSegments(segments)) === null
+  ) {
+    return callFunction(
+      intl_CallSegmentsMethodIfWrapped,
+      this,
+      index,
+      "Intl_Segments_containing"
+    );
+  }
+
+
+  var string = UnsafeGetStringFromReservedSlot(
+    segments,
+    INTL_SEGMENTS_STRING_SLOT
+  );
+
+  var len = string.length;
+
+  var n = ToInteger(index);
+
+  if (n < 0 || n >= len) {
+    return undefined;
+  }
+
+  var boundaries = intl_FindSegmentBoundaries(segments, n | 0);
+
+  return CreateSegmentDataObject(string, boundaries);
+}
+
+function Intl_Segments_iterator() {
+  var segments = this;
+
+  if (
+    !IsObject(segments) ||
+    (segments = intl_GuardToSegments(segments)) === null
+  ) {
+    return callFunction(
+      intl_CallSegmentsMethodIfWrapped,
+      this,
+      "Intl_Segments_iterator"
+    );
+  }
+
+  return intl_CreateSegmentIterator(segments);
+}
+
+function Intl_SegmentIterator_next() {
+  var iterator = this;
+
+  if (
+    !IsObject(iterator) ||
+    (iterator = intl_GuardToSegmentIterator(iterator)) === null)
+  {
+    return callFunction(
+      intl_CallSegmentIteratorMethodIfWrapped,
+      this,
+      "Intl_SegmentIterator_next"
+    );
+  }
+
+
+  var string = UnsafeGetStringFromReservedSlot(
+    iterator,
+    INTL_SEGMENT_ITERATOR_STRING_SLOT
+  );
+
+  var index = UnsafeGetInt32FromReservedSlot(
+    iterator,
+    INTL_SEGMENT_ITERATOR_INDEX_SLOT
+  );
+
+  var result = { value: undefined, done: false };
+
+  if (index === string.length) {
+    result.done = true;
+    return result;
+  }
+
+  var boundaries = intl_FindNextSegmentBoundaries(iterator);
+
+  result.value = CreateSegmentDataObject(string, boundaries);
+
+  return result;
+}

@@ -1,0 +1,86 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+* Copyright (c) 2003-2011, International Business Machines
+* Corporation and others.  All Rights Reserved.
+**********************************************************************
+* Author: Alan Liu
+* Created: September 24 2003
+* Since: ICU 2.8
+**********************************************************************
+*/
+#ifndef _RULEITER_H_
+#define _RULEITER_H_
+
+#include "unicode/uobject.h"
+
+U_NAMESPACE_BEGIN
+
+class UnicodeString;
+class ParsePosition;
+class SymbolTable;
+
+class RuleCharacterIterator : public UMemory {
+
+
+private:
+    const UnicodeString& text;
+
+    ParsePosition& pos;
+
+    const SymbolTable* sym;
+    
+    const UnicodeString* buf;
+
+    int32_t bufPos;
+
+public:
+    static constexpr int32_t DONE = -1;
+
+    static constexpr int32_t PARSE_VARIABLES = 1;
+
+    static constexpr int32_t PARSE_ESCAPES   = 2;
+
+    static constexpr int32_t SKIP_WHITESPACE = 4;
+
+    RuleCharacterIterator(const UnicodeString& text, const SymbolTable* sym,
+                          ParsePosition& pos);
+    
+    UBool atEnd() const;
+
+    UChar32 next(int32_t options, UBool& isEscaped, UErrorCode& ec);
+
+    inline UBool inVariable() const;
+
+    struct Pos : public UMemory {
+    private:
+        const UnicodeString* buf;
+        int32_t pos;
+        int32_t bufPos;
+        friend class RuleCharacterIterator;
+    };
+
+    void getPos(Pos& p) const;
+
+    void setPos(const Pos& p);
+
+    void skipIgnored(int32_t options);
+
+    UnicodeString& lookahead(UnicodeString& result, int32_t maxLookAhead = -1) const;
+
+    void jumpahead(int32_t count);
+
+    
+private:
+    UChar32 _current() const;
+    
+    void _advance(int32_t count);
+};
+
+inline UBool RuleCharacterIterator::inVariable() const {
+    return buf != nullptr;
+}
+
+U_NAMESPACE_END
+
+#endif // _RULEITER_H_

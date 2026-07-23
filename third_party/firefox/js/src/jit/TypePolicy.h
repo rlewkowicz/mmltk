@@ -1,0 +1,535 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_TypePolicy_h
+#define jit_TypePolicy_h
+
+#include "jit/IonTypes.h"
+#include "js/ScalarType.h"  // js::Scalar::Type
+
+namespace js {
+namespace jit {
+
+class MInstruction;
+class MDefinition;
+class TempAllocator;
+
+extern MDefinition* BoxAt(TempAllocator& alloc, MInstruction* at,
+                          MDefinition* operand);
+
+class TypePolicy {
+ public:
+  [[nodiscard]] virtual bool adjustInputs(TempAllocator& alloc,
+                                          MInstruction* def) const = 0;
+};
+
+struct TypeSpecializationData {
+ protected:
+  MIRType specialization_;
+
+  MIRType thisTypeSpecialization() { return specialization_; }
+
+ public:
+  MIRType specialization() const { return specialization_; }
+};
+
+#define EMPTY_DATA_                            \
+  struct Data {                                \
+    static const TypePolicy* thisTypePolicy(); \
+  }
+
+#define INHERIT_DATA_(DATA_TYPE)               \
+  struct Data : public DATA_TYPE {             \
+    static const TypePolicy* thisTypePolicy(); \
+  }
+
+#define SPECIALIZATION_DATA_ INHERIT_DATA_(TypeSpecializationData)
+
+class NoTypePolicy {
+ public:
+  struct Data {
+    static const TypePolicy* thisTypePolicy() { return nullptr; }
+  };
+};
+
+class BoxInputsPolicy final : public TypePolicy {
+ public:
+  constexpr BoxInputsPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+class ArithPolicy final : public TypePolicy {
+ public:
+  constexpr ArithPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override;
+};
+
+class BigIntArithPolicy final : public TypePolicy {
+ public:
+  constexpr BigIntArithPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override;
+};
+
+class AllDoublePolicy final : public TypePolicy {
+ public:
+  constexpr AllDoublePolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+class BitwisePolicy final : public TypePolicy {
+ public:
+  constexpr BitwisePolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override;
+};
+
+class ComparePolicy final : public TypePolicy {
+ public:
+  constexpr ComparePolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override;
+};
+
+class TestPolicy final : public TypePolicy {
+ public:
+  constexpr TestPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* ins) const override;
+};
+
+class CallPolicy final : public TypePolicy {
+ public:
+  constexpr CallPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override;
+};
+
+class PowPolicy final : public TypePolicy {
+ public:
+  constexpr PowPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* ins) const override;
+};
+
+class SignPolicy final : public TypePolicy {
+ public:
+  constexpr SignPolicy() = default;
+  SPECIALIZATION_DATA_;
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* ins) const override;
+};
+
+template <unsigned Op>
+class SymbolPolicy final : public TypePolicy {
+ public:
+  constexpr SymbolPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+template <unsigned Op>
+class BooleanPolicy final : public TypePolicy {
+ public:
+  constexpr BooleanPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+template <unsigned Op>
+class StringPolicy final : public TypePolicy {
+ public:
+  constexpr StringPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+template <unsigned Op>
+class ConvertToStringPolicy final : public TypePolicy {
+ public:
+  constexpr ConvertToStringPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+template <unsigned Op>
+class BigIntPolicy final : public TypePolicy {
+ public:
+  constexpr BigIntPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+template <unsigned Op>
+class UnboxedInt32Policy final : private TypePolicy {
+ public:
+  constexpr UnboxedInt32Policy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+template <unsigned Op>
+class Int32OrIntPtrPolicy final : private TypePolicy {
+ public:
+  constexpr Int32OrIntPtrPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+template <unsigned Op>
+class IntPtrPolicy final : private TypePolicy {
+ public:
+  constexpr IntPtrPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+template <unsigned Op>
+class ConvertToInt32Policy final : public TypePolicy {
+ public:
+  constexpr ConvertToInt32Policy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+template <unsigned Op>
+class TruncateToInt32OrToInt64Policy final : public TypePolicy {
+ public:
+  constexpr TruncateToInt32OrToInt64Policy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+template <unsigned Op>
+class DoublePolicy final : public TypePolicy {
+ public:
+  constexpr DoublePolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+template <unsigned Op>
+class Float32Policy final : public TypePolicy {
+ public:
+  constexpr Float32Policy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+template <unsigned Op>
+class FloatingPointPolicy final : public TypePolicy {
+ public:
+  constexpr FloatingPointPolicy() = default;
+  SPECIALIZATION_DATA_;
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override;
+};
+
+template <unsigned Op>
+class NoFloatPolicy final : public TypePolicy {
+ public:
+  constexpr NoFloatPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+template <unsigned FirstOp>
+class NoFloatPolicyAfter final : public TypePolicy {
+ public:
+  constexpr NoFloatPolicyAfter() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* ins) const override {
+    return staticAdjustInputs(alloc, ins);
+  }
+};
+
+class ToDoublePolicy final : public TypePolicy {
+ public:
+  constexpr ToDoublePolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+class ToInt32Policy final : public TypePolicy {
+ public:
+  constexpr ToInt32Policy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+class ToBigIntPolicy final : public TypePolicy {
+ public:
+  constexpr ToBigIntPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+class ToStringPolicy final : public TypePolicy {
+ public:
+  constexpr ToStringPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* def);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override {
+    return staticAdjustInputs(alloc, def);
+  }
+};
+
+class ToInt64Policy final : public TypePolicy {
+ public:
+  constexpr ToInt64Policy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* ins);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* ins) const override {
+    return staticAdjustInputs(alloc, ins);
+  }
+};
+
+template <unsigned Op>
+class ObjectPolicy final : public TypePolicy {
+ public:
+  constexpr ObjectPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* ins);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* ins) const override {
+    return staticAdjustInputs(alloc, ins);
+  }
+};
+
+using SingleObjectPolicy = ObjectPolicy<0>;
+
+template <unsigned Op>
+class BoxPolicy final : public TypePolicy {
+ public:
+  constexpr BoxPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* ins);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* ins) const override {
+    return staticAdjustInputs(alloc, ins);
+  }
+};
+
+template <unsigned Op, MIRType Type>
+class BoxExceptPolicy final : public TypePolicy {
+ public:
+  constexpr BoxExceptPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* ins);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* ins) const override {
+    return staticAdjustInputs(alloc, ins);
+  }
+};
+
+template <unsigned Op>
+using BoxExceptObjectPolicy = BoxExceptPolicy<Op, MIRType::Object>;
+
+template <unsigned Op>
+class CacheIdPolicy final : public TypePolicy {
+ public:
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* ins);
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* ins) const override {
+    return staticAdjustInputs(alloc, ins);
+  }
+};
+
+template <class... Policies>
+class MixPolicy final : public TypePolicy {
+ public:
+  constexpr MixPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] static bool staticAdjustInputs(TempAllocator& alloc,
+                                               MInstruction* ins) {
+    return (Policies::staticAdjustInputs(alloc, ins) && ...);
+  }
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* ins) const override {
+    return staticAdjustInputs(alloc, ins);
+  }
+};
+
+class MegamorphicSetElementPolicy final : public TypePolicy {
+ public:
+  constexpr MegamorphicSetElementPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* def) const override;
+};
+
+class StoreDataViewElementPolicy;
+class StoreTypedArrayHolePolicy;
+
+class StoreUnboxedScalarPolicy : public TypePolicy {
+ private:
+  constexpr StoreUnboxedScalarPolicy() = default;
+  [[nodiscard]] static bool adjustValueInput(TempAllocator& alloc,
+                                             MInstruction* ins,
+                                             Scalar::Type arrayType,
+                                             MDefinition* value,
+                                             int valueOperand);
+
+  friend class StoreDataViewElementPolicy;
+  friend class StoreTypedArrayHolePolicy;
+  friend class TypedArrayFillPolicy;
+
+ public:
+  EMPTY_DATA_;
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* ins) const override;
+};
+
+class StoreDataViewElementPolicy final : public StoreUnboxedScalarPolicy {
+ public:
+  constexpr StoreDataViewElementPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* ins) const override;
+};
+
+class StoreTypedArrayHolePolicy final : public StoreUnboxedScalarPolicy {
+ public:
+  constexpr StoreTypedArrayHolePolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* ins) const override;
+};
+
+class TypedArrayFillPolicy final : public StoreUnboxedScalarPolicy {
+ public:
+  constexpr TypedArrayFillPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* ins) const override;
+};
+
+class ClampPolicy final : public TypePolicy {
+ public:
+  constexpr ClampPolicy() = default;
+  EMPTY_DATA_;
+  [[nodiscard]] bool adjustInputs(TempAllocator& alloc,
+                                  MInstruction* ins) const override;
+};
+
+#undef SPECIALIZATION_DATA_
+#undef INHERIT_DATA_
+#undef EMPTY_DATA_
+
+}  
+}  
+
+#endif /* jit_TypePolicy_h */

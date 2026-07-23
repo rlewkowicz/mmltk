@@ -1,0 +1,46 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+*
+*   Copyright (C) 2002-2011, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+******************************************************************************
+*
+* File uassert.h
+*
+*  Contains the U_ASSERT and UPRV_UNREACHABLE_* macros
+*
+******************************************************************************
+*/
+#ifndef U_ASSERT_H
+#define U_ASSERT_H
+
+#include "unicode/utypes.h"
+#include <stdlib.h>
+
+#if U_DEBUG
+#   include <assert.h>
+#   define U_ASSERT(exp) assert(exp)
+#elif U_CPLUSPLUS_VERSION
+#   define U_ASSERT(exp) (void)0
+#else
+#   define U_ASSERT(exp)
+#endif
+
+#if defined(UPRV_UNREACHABLE_ASSERT)
+#elif U_DEBUG
+#   include <assert.h>
+#   define UPRV_UNREACHABLE_ASSERT assert(false)
+#elif U_CPLUSPLUS_VERSION
+#   define UPRV_UNREACHABLE_ASSERT (void)0
+#else
+#   define UPRV_UNREACHABLE_ASSERT
+#endif
+
+#if defined(UPRV_UNREACHABLE_EXIT)
+#else
+#   define UPRV_UNREACHABLE_EXIT abort()
+#endif
+
+#endif

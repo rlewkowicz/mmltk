@@ -1,0 +1,493 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include "LargestContentfulPaint.h"
+#include "Performance.h"
+#include "PerformanceMainThread.h"
+#include "imgRequest.h"
+#include "mozilla/Logging.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/DOMIntersectionObserver.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/nsVideoFrame.h"
+#include "nsContentUtils.h"
+#include "nsGkAtoms.h"
+#include "nsIContentInlines.h"
+#include "nsLayoutUtils.h"
+#include "nsRFPService.h"
+
+namespace mozilla::dom {
+
+static LazyLogModule gLCPLogging("LargestContentfulPaint");
+
+#define LOG(...) MOZ_LOG(gLCPLogging, LogLevel::Debug, (__VA_ARGS__))
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(LargestContentfulPaint, PerformanceEntry,
+                                   mPerformance, mURI, mElement)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(LargestContentfulPaint)
+NS_INTERFACE_MAP_END_INHERITING(PerformanceEntry)
+
+NS_IMPL_ADDREF_INHERITED(LargestContentfulPaint, PerformanceEntry)
+NS_IMPL_RELEASE_INHERITED(LargestContentfulPaint, PerformanceEntry)
+
+static double GetAreaInDoublePixelsFromAppUnits(const nsSize& aSize) {
+  return NSAppUnitsToDoublePixels(aSize.Width(), AppUnitsPerCSSPixel()) *
+         NSAppUnitsToDoublePixels(aSize.Height(), AppUnitsPerCSSPixel());
+}
+
+static double GetAreaInDoublePixelsFromAppUnits(const nsRect& aRect) {
+  return NSAppUnitsToDoublePixels(aRect.Width(), AppUnitsPerCSSPixel()) *
+         NSAppUnitsToDoublePixels(aRect.Height(), AppUnitsPerCSSPixel());
+}
+
+static DOMHighResTimeStamp GetReducedTimePrecisionDOMHighRes(
+    Performance* aPerformance, const TimeStamp& aRawTimeStamp) {
+  MOZ_ASSERT(aPerformance);
+  DOMHighResTimeStamp rawValue =
+      aPerformance->GetDOMTiming()->TimeStampToDOMHighRes(aRawTimeStamp);
+  return nsRFPService::ReduceTimePrecisionAsMSecs(
+      rawValue, aPerformance->GetRandomTimelineSeed(),
+      aPerformance->GetRTPCallerType());
+}
+
+LargestContentfulPaint::LargestContentfulPaint(
+    PerformanceMainThread* aPerformance, const TimeStamp& aRenderTime,
+    const Maybe<TimeStamp>& aLoadTime, const unsigned long aSize, nsIURI* aURI,
+    Element* aElement, bool aShouldExposeRenderTime)
+    : PerformanceEntry(aPerformance->GetParentObject(), u""_ns,
+                       nsGkAtoms::largestContentfulPaint),
+      mPerformance(aPerformance),
+      mRenderTime(aRenderTime),
+      mLoadTime(aLoadTime),
+      mShouldExposeRenderTime(aShouldExposeRenderTime),
+      mSize(aSize),
+      mURI(aURI) {
+  MOZ_ASSERT(mPerformance);
+  MOZ_ASSERT(aElement);
+  if (aElement->ChromeOnlyAccess()) {
+    mElement = do_GetWeakReference(Element::FromNodeOrNull(
+        aElement->FindFirstNonChromeOnlyAccessContent()));
+  } else {
+    mElement = do_GetWeakReference(aElement);
+  }
+
+  if (const Element* element = GetElement()) {
+    mId = element->GetID();
+  }
+}
+
+JSObject* LargestContentfulPaint::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return LargestContentfulPaint_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+Element* LargestContentfulPaint::GetElement() const {
+  nsCOMPtr<Element> element = do_QueryReferent(mElement);
+  return element ? nsContentUtils::GetAnElementForTiming(
+                       element, element->GetComposedDoc(), nullptr)
+                 : nullptr;
+}
+
+void LargestContentfulPaint::BufferEntryIfNeeded() {
+  mPerformance->BufferLargestContentfulPaintEntryIfNeeded(this);
+}
+
+bool LCPHelpers::IsQualifiedImageRequest(imgRequest* aRequest,
+                                         Element* aContainingElement) {
+  MOZ_ASSERT(aContainingElement);
+  if (!aRequest) {
+    return false;
+  }
+
+  if (aRequest->IsChrome()) {
+    return false;
+  }
+
+  if (!aContainingElement->ChromeOnlyAccess()) {
+    return true;
+  }
+
+  if (nsIContent* parent = aContainingElement->GetParent()) {
+    nsVideoFrame* videoFrame = do_QueryFrame(parent->GetPrimaryFrame());
+    if (videoFrame && videoFrame->GetPosterImage() == aContainingElement) {
+      return true;
+    }
+  }
+
+  if (aContainingElement->IsInNativeAnonymousSubtree()) {
+    if (nsINode* rootParentOrHost =
+            aContainingElement
+                ->GetClosestNativeAnonymousSubtreeRootParentOrHost()) {
+      if (!rootParentOrHost->ChromeOnlyAccess()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+void LargestContentfulPaint::MaybeProcessImageForElementTiming(
+    imgRequestProxy* aRequest, Element* aElement) {
+  if (!StaticPrefs::dom_enable_largest_contentful_paint()) {
+    return;
+  }
+
+  MOZ_ASSERT(aRequest);
+  imgRequest* request = aRequest->GetOwner();
+  if (!LCPHelpers::IsQualifiedImageRequest(request, aElement)) {
+    return;
+  }
+
+  Document* document = aElement->GetComposedDoc();
+  if (!document) {
+    return;
+  }
+
+  nsPresContext* pc = document->GetPresContext();
+  if (!pc || pc->HasStoppedGeneratingLCP()) {
+    return;
+  }
+
+  PerformanceMainThread* performance = pc->GetPerformanceMainThread();
+  if (!performance) {
+    return;
+  }
+
+  if (MOZ_UNLIKELY(MOZ_LOG_TEST(gLCPLogging, LogLevel::Debug))) {
+    nsCOMPtr<nsIURI> uri;
+    aRequest->GetURI(getter_AddRefs(uri));
+    LOG("MaybeProcessImageForElementTiming, Element=%p, URI=%s, "
+        "performance=%p ",
+        aElement, uri ? uri->GetSpecOrDefault().get() : "", performance);
+  }
+
+  aElement->SetFlags(ELEMENT_IN_CONTENT_IDENTIFIER_FOR_LCP);
+
+  nsTArray<WeakPtr<PreloaderBase>>& imageRequestProxiesForElement =
+      document->ContentIdentifiersForLCP().LookupOrInsert(aElement);
+
+  if (imageRequestProxiesForElement.Contains(aRequest)) {
+    LOG("  The content identifier existed for element=%p and request=%p, "
+        "return.",
+        aElement, aRequest);
+    return;
+  }
+
+  imageRequestProxiesForElement.AppendElement(aRequest);
+
+#ifdef DEBUG
+  uint32_t status = imgIRequest::STATUS_NONE;
+  aRequest->GetImageStatus(&status);
+  MOZ_ASSERT(status & imgIRequest::STATUS_LOAD_COMPLETE);
+#endif
+
+  LOG("  Added a pending image rendering");
+  performance->AddImagesPendingRendering(
+      ImagePendingRendering{aElement, aRequest, TimeStamp::Now()});
+}
+
+bool LCPHelpers::CanFinalizeLCPEntry(const nsIFrame* aFrame) {
+  if (!StaticPrefs::dom_enable_largest_contentful_paint()) {
+    return false;
+  }
+
+  if (!aFrame) {
+    return false;
+  }
+
+  nsPresContext* presContext = aFrame->PresContext();
+  return !presContext->HasStoppedGeneratingLCP() &&
+         presContext->GetPerformanceMainThread();
+}
+
+void LCPHelpers::FinalizeLCPEntryForImage(
+    Element* aContainingBlock, imgRequestProxy* aImgRequestProxy,
+    const nsRect& aTargetRectRelativeToSelf) {
+  LOG("FinalizeLCPEntryForImage element=%p image=%p", aContainingBlock,
+      aImgRequestProxy);
+  if (!aImgRequestProxy) {
+    return;
+  }
+
+  if (!IsQualifiedImageRequest(aImgRequestProxy->GetOwner(),
+                               aContainingBlock)) {
+    return;
+  }
+
+  nsIFrame* frame = aContainingBlock->GetPrimaryFrame();
+
+  if (!CanFinalizeLCPEntry(frame)) {
+    return;
+  }
+
+  PerformanceMainThread* performance =
+      frame->PresContext()->GetPerformanceMainThread();
+  MOZ_ASSERT(performance);
+
+  if (performance->HasDispatchedInputEvent() ||
+      performance->HasDispatchedScrollEvent()) {
+    return;
+  }
+
+  if (!performance->IsPendingLCPCandidate(aContainingBlock, aImgRequestProxy)) {
+    return;
+  }
+
+  imgRequestProxy::LCPTimings& lcpTimings = aImgRequestProxy->GetLCPTimings();
+  if (!lcpTimings.AreSet()) {
+    return;
+  }
+
+  imgRequest* request = aImgRequestProxy->GetOwner();
+  MOZ_ASSERT(request);
+
+  nsCOMPtr<nsIURI> requestURI;
+  aImgRequestProxy->GetURI(getter_AddRefs(requestURI));
+
+  const bool taoPassed =
+      request->ShouldReportRenderTimeForLCP() || request->IsData();
+
+  RefPtr<LargestContentfulPaint> entry = new LargestContentfulPaint(
+      performance, lcpTimings.mRenderTime.ref(), lcpTimings.mLoadTime, 0,
+      requestURI, aContainingBlock,
+      taoPassed ||
+          StaticPrefs::
+              dom_performance_largest_contentful_paint_coarsened_rendertime_enabled());
+
+  entry->UpdateSize(aContainingBlock, aTargetRectRelativeToSelf, performance,
+                    true);
+
+  lcpTimings.Reset();
+
+  if (!performance->UpdateLargestContentfulPaintSize(entry->Size())) {
+    LOG(
+
+        "  This paint(%lu) is not greater than the largest paint (%lf)that "
+        "we've "
+        "reported so far, return",
+        entry->Size(), performance->GetLargestContentfulPaintSize());
+    return;
+  }
+
+  entry->QueueEntry();
+}
+
+DOMHighResTimeStamp LargestContentfulPaint::RenderTime() const {
+  if (!mShouldExposeRenderTime) {
+    return 0;
+  }
+  return GetReducedTimePrecisionDOMHighRes(mPerformance, mRenderTime);
+}
+
+DOMHighResTimeStamp LargestContentfulPaint::LoadTime() const {
+  if (mLoadTime.isNothing()) {
+    return 0;
+  }
+
+  return GetReducedTimePrecisionDOMHighRes(mPerformance, mLoadTime.ref());
+}
+
+DOMHighResTimeStamp LargestContentfulPaint::StartTime() const {
+  return mShouldExposeRenderTime ? RenderTime() : LoadTime();
+}
+
+Element* LargestContentfulPaint::GetContainingBlockForTextFrame(
+    const nsTextFrame* aTextFrame) {
+  nsIFrame* containingFrame = aTextFrame->GetContainingBlock();
+  MOZ_ASSERT(containingFrame);
+  return Element::FromNodeOrNull(containingFrame->GetContent());
+}
+
+void LargestContentfulPaint::QueueEntry() {
+  LOG("QueueEntry entry=%p", this);
+  mPerformance->QueueLargestContentfulPaintEntry(this);
+
+  ReportLCPToNavigationTimings();
+}
+
+void LargestContentfulPaint::GetUrl(nsAString& aUrl) {
+  if (mURI) {
+    CopyUTF8toUTF16(mURI->GetSpecOrDefault(), aUrl);
+  }
+}
+
+void LargestContentfulPaint::UpdateSize(
+    const Element* aContainingBlock, const nsRect& aTargetRectRelativeToSelf,
+    const PerformanceMainThread* aPerformance, bool aIsImage) {
+  nsIFrame* frame = aContainingBlock->GetPrimaryFrame();
+  MOZ_ASSERT(frame);
+
+  nsIFrame* rootFrame = frame->PresShell()->GetRootFrame();
+  if (!rootFrame) {
+    return;
+  }
+
+  if (frame->Style()->IsInOpacityZeroSubtree()) {
+    LOG("  Opacity:0 return");
+    return;
+  }
+
+
+  const nsRect& visibleDimensions = aTargetRectRelativeToSelf;
+
+  nsRect clientContentRect = nsLayoutUtils::TransformFrameRectToAncestor(
+      frame, visibleDimensions, rootFrame);
+
+  IntersectionInput input = DOMIntersectionObserver::ComputeInput(
+      *frame->PresContext()->Document(), rootFrame->GetContent(), nullptr,
+      nullptr);
+  const IntersectionOutput output =
+      DOMIntersectionObserver::Intersect(input, *aContainingBlock);
+
+  Maybe<nsRect> intersectionRect = output.mIntersectionRect;
+
+  if (intersectionRect.isNothing()) {
+    LOG("  The intersectionRect is nothing for Element=%p. return.",
+        aContainingBlock);
+    return;
+  }
+
+  Maybe<nsRect> intersectionWithContentRect =
+      clientContentRect.EdgeInclusiveIntersection(intersectionRect.value());
+
+  if (intersectionWithContentRect.isNothing()) {
+    LOG("  The intersectionWithContentRect is nothing for Element=%p. return.",
+        aContainingBlock);
+    return;
+  }
+
+  nsRect renderedRect = intersectionWithContentRect.value();
+
+  double area = GetAreaInDoublePixelsFromAppUnits(renderedRect);
+
+  double viewport = GetAreaInDoublePixelsFromAppUnits(input.mRootRect);
+
+  LOG("  Viewport = %f, RenderRect = %f.", viewport, area);
+  if (area >= viewport) {
+    LOG("  The renderedRect is at least same as the area of the "
+        "viewport for Element=%p, return.",
+        aContainingBlock);
+    return;
+  }
+
+  Maybe<nsSize> intrinsicSize = frame->GetIntrinsicSize().ToSize();
+  const bool hasIntrinsicSize = intrinsicSize && !intrinsicSize->IsEmpty();
+
+  if (aIsImage && hasIntrinsicSize) {
+    double naturalArea =
+        GetAreaInDoublePixelsFromAppUnits(intrinsicSize.value());
+
+    LOG("  naturalArea = %f", naturalArea);
+
+    double boundingClientArea =
+        NSAppUnitsToDoublePixels(clientContentRect.Width(),
+                                 AppUnitsPerCSSPixel()) *
+        NSAppUnitsToDoublePixels(clientContentRect.Height(),
+                                 AppUnitsPerCSSPixel());
+    LOG("  boundingClientArea = %f", boundingClientArea);
+
+    if (boundingClientArea > naturalArea) {
+      LOG("  area before scaled down %f", area);
+      area *= (naturalArea / boundingClientArea);
+    }
+  }
+
+  MOZ_ASSERT(!mSize);
+  mSize = area;
+}
+
+void LCPTextFrameHelper::MaybeUnionTextFrame(
+    nsTextFrame* aTextFrame, const nsRect& aRelativeToSelfRect) {
+  if (!StaticPrefs::dom_enable_largest_contentful_paint() ||
+      aTextFrame->PresContext()->HasStoppedGeneratingLCP()) {
+    return;
+  }
+
+  Element* containingBlock =
+      LargestContentfulPaint::GetContainingBlockForTextFrame(aTextFrame);
+  if (!containingBlock ||
+      containingBlock->HasFlag(ELEMENT_PROCESSED_BY_LCP_FOR_TEXT) ||
+      containingBlock->ChromeOnlyAccess()) {
+    return;
+  }
+
+  MOZ_ASSERT(containingBlock->GetPrimaryFrame());
+
+  PerformanceMainThread* perf =
+      aTextFrame->PresContext()->GetPerformanceMainThread();
+  if (!perf) {
+    return;
+  }
+
+  auto& unionRect = perf->GetTextFrameUnions().LookupOrInsert(containingBlock);
+  unionRect = unionRect.Union(aRelativeToSelfRect);
+}
+
+void LCPHelpers::FinalizeLCPEntryForText(
+    PerformanceMainThread* aPerformance, const TimeStamp& aRenderTime,
+    Element* aContainingBlock, const nsRect& aTargetRectRelativeToSelf,
+    const nsPresContext* aPresContext) {
+  MOZ_ASSERT(aPerformance);
+  LOG("FinalizeLCPEntryForText element=%p", aContainingBlock);
+
+  if (!aContainingBlock->GetPrimaryFrame()) {
+    return;
+  }
+  MOZ_ASSERT(CanFinalizeLCPEntry(aContainingBlock->GetPrimaryFrame()));
+  MOZ_ASSERT(!aContainingBlock->HasFlag(ELEMENT_PROCESSED_BY_LCP_FOR_TEXT));
+  MOZ_ASSERT(!aContainingBlock->ChromeOnlyAccess());
+
+  aContainingBlock->SetFlags(ELEMENT_PROCESSED_BY_LCP_FOR_TEXT);
+
+  RefPtr<LargestContentfulPaint> entry = new LargestContentfulPaint(
+      aPerformance, aRenderTime, Nothing(), 0, nullptr, aContainingBlock, true);
+
+  entry->UpdateSize(aContainingBlock, aTargetRectRelativeToSelf, aPerformance,
+                    false);
+  if (!aPerformance->UpdateLargestContentfulPaintSize(entry->Size())) {
+    LOG("  This paint(%lu) is not greater than the largest paint (%lf)that "
+        "we've "
+        "reported so far, return",
+        entry->Size(), aPerformance->GetLargestContentfulPaintSize());
+    return;
+  }
+  entry->QueueEntry();
+}
+
+void LargestContentfulPaint::ReportLCPToNavigationTimings() {
+  nsCOMPtr<Element> element = do_QueryReferent(mElement);
+  if (!element) {
+    return;
+  }
+
+  const Document* document = element->OwnerDoc();
+
+  MOZ_ASSERT(document);
+
+  nsDOMNavigationTiming* timing = document->GetNavigationTiming();
+
+  if (MOZ_UNLIKELY(!timing)) {
+    return;
+  }
+
+  if (document->IsResourceDoc()) {
+    return;
+  }
+
+  if (BrowsingContext* browsingContext = document->GetBrowsingContext()) {
+    if (browsingContext->GetEmbeddedInContentDocument()) {
+      return;
+    }
+  }
+
+  if (!document->IsTopLevelContentDocument()) {
+    return;
+  }
+
+  timing->NotifyLargestContentfulRenderForRootContentDocument(
+      GetReducedTimePrecisionDOMHighRes(mPerformance, mRenderTime));
+}
+}  

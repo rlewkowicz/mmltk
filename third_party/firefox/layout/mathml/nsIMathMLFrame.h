@@ -1,0 +1,135 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsIMathMLFrame_h_
+#define nsIMathMLFrame_h_
+
+#include "nsMathMLOperators.h"
+#include "nsQueryFrame.h"
+
+struct nsPresentationData;
+struct nsEmbellishData;
+class gfxContext;
+class nsIFrame;
+namespace mozilla {
+class ReflowOutput;
+}  
+
+enum class MathMLFrameType : uint8_t {
+  Ordinary,
+  OperatorOrdinary,
+  OperatorInvisible,
+  OperatorUserDefined,
+  Inner,
+  ItalicIdentifier,
+  UprightIdentifier,
+  Unknown,
+};
+constexpr auto MathMLFrameTypeCount = size_t(MathMLFrameType::Unknown);
+
+enum class MathMLPresentationFlag : uint8_t {
+  StretchAllChildrenVertically,
+
+  StretchAllChildrenHorizontally,
+
+  SpaceLike,
+
+  Dtls,
+
+  StretchDone,
+};
+using MathMLPresentationFlags = mozilla::EnumSet<MathMLPresentationFlag>;
+
+enum class MathMLEmbellishFlag : uint8_t {
+  EmbellishedOperator,
+
+  MovableLimits,
+
+  Accent,
+
+  LargeOp,
+
+  AccentOver,
+
+  AccentUnder,
+
+  Fence,
+
+  Separator,
+};
+using MathMLEmbellishFlags = mozilla::EnumSet<MathMLEmbellishFlag>;
+
+class nsIMathMLFrame {
+ public:
+  NS_DECL_QUERYFRAME_TARGET(nsIMathMLFrame)
+
+  virtual bool IsSpaceLike() = 0;
+
+
+  NS_IMETHOD
+  GetBoundingMetrics(nsBoundingMetrics& aBoundingMetrics) = 0;
+
+  NS_IMETHOD
+  SetBoundingMetrics(const nsBoundingMetrics& aBoundingMetrics) = 0;
+
+  NS_IMETHOD
+  SetReference(const nsPoint& aReference) = 0;
+
+  virtual MathMLFrameType GetMathMLFrameType() = 0;
+
+
+  NS_IMETHOD
+  Stretch(mozilla::gfx::DrawTarget* aDrawTarget,
+          StretchDirection aStretchDirection, nsBoundingMetrics& aContainerSize,
+          mozilla::ReflowOutput& aDesiredStretchSize) = 0;
+
+
+  NS_IMETHOD
+  GetEmbellishData(nsEmbellishData& aEmbellishData) = 0;
+
+
+
+  NS_IMETHOD
+  GetPresentationData(nsPresentationData& aPresentationData) = 0;
+
+
+  NS_IMETHOD
+  InheritAutomaticData(nsIFrame* aParent) = 0;
+
+  NS_IMETHOD
+  TransmitAutomaticData() = 0;
+
+  NS_IMETHOD
+  UpdatePresentationData(MathMLPresentationFlags aFlagsValues,
+                         MathMLPresentationFlags aWhichFlags) = 0;
+
+  NS_IMETHOD
+  UpdatePresentationDataFromChildAt(int32_t aFirstIndex, int32_t aLastIndex,
+                                    MathMLPresentationFlags aFlagsValues,
+                                    MathMLPresentationFlags aWhichFlags) = 0;
+
+  virtual uint8_t ScriptIncrement(nsIFrame* aFrame) = 0;
+
+  virtual bool IsMrowLike() = 0;
+
+  virtual nscoord ItalicCorrection() = 0;
+};
+
+struct nsEmbellishData {
+  MathMLEmbellishFlags flags;
+
+  nsIFrame* coreFrame = nullptr;
+
+  StretchDirection direction = StretchDirection::Unsupported;
+
+  nscoord leadingSpace = 0;
+  nscoord trailingSpace = 0;
+};
+
+struct nsPresentationData {
+  MathMLPresentationFlags flags;
+
+  nsIFrame* baseFrame = nullptr;
+};
+
+#endif /* nsIMathMLFrame_h___ */

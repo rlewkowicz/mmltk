@@ -1,0 +1,811 @@
+/*
+ * Copyright 2021 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_module_types_h
+#define wasm_module_types_h
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/Span.h"
+
+#include "js/AllocPolicy.h"
+#include "js/HashTable.h"
+#include "js/RefCounted.h"
+#include "js/Utility.h"
+#include "js/Vector.h"
+
+#include "wasm/WasmCompileArgs.h"
+#include "wasm/WasmConstants.h"
+#include "wasm/WasmExprType.h"
+#include "wasm/WasmInitExpr.h"
+#include "wasm/WasmMemory.h"
+#include "wasm/WasmSerialize.h"
+#include "wasm/WasmShareable.h"
+#include "wasm/WasmTypeDecls.h"
+#include "wasm/WasmValType.h"
+#include "wasm/WasmValue.h"
+
+namespace js {
+namespace wasm {
+
+class FuncType;
+
+
+struct CacheableChars : UniqueChars {
+  CacheableChars() = default;
+  explicit CacheableChars(char* ptr) : UniqueChars(ptr) {}
+  MOZ_IMPLICIT CacheableChars(UniqueChars&& rhs)
+      : UniqueChars(std::move(rhs)) {}
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+};
+
+using CacheableCharsVector = Vector<CacheableChars, 0, SystemAllocPolicy>;
+
+
+struct CacheableName {
+ private:
+  UTF8Bytes bytes_;
+
+  const char* begin() const { return (const char*)bytes_.begin(); }
+  size_t length() const { return bytes_.length(); }
+
+ public:
+  CacheableName() = default;
+  MOZ_IMPLICIT CacheableName(UTF8Bytes&& rhs) : bytes_(std::move(rhs)) {}
+
+  bool isEmpty() const { return bytes_.length() == 0; }
+
+  mozilla::Span<char> utf8Bytes() { return mozilla::Span<char>(bytes_); }
+  mozilla::Span<const char> utf8Bytes() const {
+    return mozilla::Span<const char>(bytes_);
+  }
+
+  [[nodiscard]] bool clone(CacheableName* name) const {
+    UTF8Bytes bytesCopy;
+    if (!bytesCopy.appendAll(bytes_)) {
+      return false;
+    }
+    *name = CacheableName(std::move(bytesCopy));
+    return true;
+  }
+
+  bool operator==(const CacheableName& other) const {
+    return utf8Bytes() == other.utf8Bytes();
+  }
+
+  static CacheableName fromUTF8Chars(UniqueChars&& utf8Chars);
+  [[nodiscard]] static bool fromUTF8Chars(const char* utf8Chars,
+                                          CacheableName* name);
+  [[nodiscard]] static bool fromUTF8Bytes(mozilla::Span<const char> utf8Bytes,
+                                          CacheableName* name);
+
+  [[nodiscard]] JSString* toJSString(JSContext* cx) const;
+  [[nodiscard]] JSAtom* toAtom(JSContext* cx) const;
+  [[nodiscard]] bool toPropertyKey(JSContext* cx,
+                                   MutableHandleId propertyKey) const;
+  [[nodiscard]] UniqueChars toQuotedString(JSContext* cx) const;
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  WASM_DECLARE_FRIEND_SERIALIZE(CacheableName);
+};
+
+using CacheableNameVector = Vector<CacheableName, 0, SystemAllocPolicy>;
+
+struct NameHasher {
+  using Key = mozilla::Span<const char>;
+  using Lookup = mozilla::Span<const char>;
+
+  static HashNumber hash(const Lookup& aLookup) {
+    return mozilla::HashString(aLookup.data(), aLookup.Length());
+  }
+
+  static bool match(const Key& aKey, const Lookup& aLookup) {
+    return aKey == aLookup;
+  }
+};
+
+struct CacheableNameHasher {
+  using Key = CacheableName;
+  using Lookup = mozilla::Span<const char>;
+
+  static HashNumber hash(const Lookup& aLookup) {
+    return mozilla::HashString(aLookup.data(), aLookup.Length());
+  }
+
+  static bool match(const Key& aKey, const Lookup& aLookup) {
+    return aKey.utf8Bytes() == aLookup;
+  }
+};
+
+
+struct Import {
+  CacheableName module;
+  CacheableName field;
+  DefinitionKind kind;
+
+  Import() = default;
+  Import(CacheableName&& module, CacheableName&& field, DefinitionKind kind)
+      : module(std::move(module)), field(std::move(field)), kind(kind) {}
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+};
+
+using ImportVector = Vector<Import, 0, SystemAllocPolicy>;
+
+
+class Export {
+ public:
+  struct CacheablePod {
+    DefinitionKind kind_;
+    uint32_t index_;
+
+    WASM_CHECK_CACHEABLE_POD(kind_, index_);
+  };
+
+ private:
+  CacheableName fieldName_;
+  CacheablePod pod;
+
+ public:
+  Export() = default;
+  explicit Export(CacheableName&& fieldName, uint32_t index,
+                  DefinitionKind kind);
+
+  const CacheableName& fieldName() const { return fieldName_; }
+
+  DefinitionKind kind() const { return pod.kind_; }
+  uint32_t funcIndex() const;
+  uint32_t tagIndex() const;
+  uint32_t memoryIndex() const;
+  uint32_t globalIndex() const;
+  uint32_t tableIndex() const;
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  WASM_DECLARE_FRIEND_SERIALIZE(Export);
+};
+
+WASM_DECLARE_CACHEABLE_POD(Export::CacheablePod);
+
+using ExportVector = Vector<Export, 0, SystemAllocPolicy>;
+
+
+enum class FuncFlags : uint8_t {
+  None = 0x0,
+  Exported = 0x1,
+  Eager = 0x2,
+  CanRefFunc = 0x4,
+};
+
+
+struct FuncDesc {
+  uint32_t typeIndex : 24;
+  FuncFlags flags : 8;
+
+  WASM_CHECK_CACHEABLE_POD(typeIndex, flags);
+
+  static_assert(MaxTypes <= (1 << 24) - 1);
+  static_assert(sizeof(FuncFlags) == sizeof(uint8_t));
+
+  FuncDesc() = default;
+  explicit FuncDesc(uint32_t typeIndex)
+      : typeIndex(typeIndex), flags(FuncFlags::None) {}
+
+  void declareFuncExported(bool eager, bool canRefFunc) {
+    flags = FuncFlags(uint8_t(flags) | uint8_t(FuncFlags::Exported));
+
+    if (eager) {
+      flags = FuncFlags(uint8_t(flags) | uint8_t(FuncFlags::Eager));
+    }
+    if (canRefFunc) {
+      flags = FuncFlags(uint8_t(flags) | uint8_t(FuncFlags::CanRefFunc));
+    }
+  }
+
+  bool isExported() const {
+    return uint8_t(flags) & uint8_t(FuncFlags::Exported);
+  }
+  bool isEager() const { return uint8_t(flags) & uint8_t(FuncFlags::Eager); }
+  bool canRefFunc() const {
+    return uint8_t(flags) & uint8_t(FuncFlags::CanRefFunc);
+  }
+};
+
+WASM_DECLARE_CACHEABLE_POD(FuncDesc);
+
+using FuncDescVector = Vector<FuncDesc, 0, SystemAllocPolicy>;
+
+struct CallRefMetricsRange {
+  explicit CallRefMetricsRange() = default;
+  explicit CallRefMetricsRange(uint32_t begin, uint32_t length)
+      : begin(begin), length(length) {}
+
+  uint32_t begin = 0;
+  uint32_t length = 0;
+
+  void offsetBy(uint32_t offset) { begin += offset; }
+
+  WASM_CHECK_CACHEABLE_POD(begin, length);
+};
+
+struct AllocSitesRange {
+  explicit AllocSitesRange() = default;
+  explicit AllocSitesRange(uint32_t begin, uint32_t length)
+      : begin(begin), length(length) {}
+
+  uint32_t begin = 0;
+  uint32_t length = 0;
+
+  void offsetBy(uint32_t offset) { begin += offset; }
+
+  WASM_CHECK_CACHEABLE_POD(begin, length);
+};
+
+class CallRefHint {
+ public:
+  using Repr = uint64_t;
+  static constexpr size_t NUM_ENTRIES = 3;
+
+ private:
+  static constexpr uint32_t ElemBits = 20;
+  static constexpr uint32_t LengthBits = 2;
+  static constexpr uint64_t Mask = (uint64_t(1) << ElemBits) - 1;
+  static_assert(js::wasm::MaxFuncs <= Mask);
+  static_assert(3 * ElemBits + LengthBits <= 8 * sizeof(Repr));
+
+  Repr state_ = 0;
+
+  bool valid() const {
+    return (state_ >> (length() * ElemBits + LengthBits)) == 0;
+  }
+
+ public:
+
+  uint32_t length() const { return state_ & 3; }
+  bool empty() const { return length() == 0; }
+  bool full() const { return length() == 3; }
+
+  uint32_t get(uint32_t index) const {
+    MOZ_RELEASE_ASSERT(index < length());
+    uint64_t res = (state_ >> (index * ElemBits + LengthBits)) & Mask;
+    return uint32_t(res);
+  }
+  void set(uint32_t index, uint32_t funcIndex) {
+    MOZ_RELEASE_ASSERT(index < length());
+    MOZ_ASSERT(funcIndex <= Mask);
+    uint32_t shift = index * ElemBits + LengthBits;
+    uint64_t c = uint64_t(Mask) << shift;
+    uint64_t s = uint64_t(funcIndex) << shift;
+    state_ = (state_ & ~c) | s;
+  }
+
+  void append(uint32_t funcIndex) {
+    MOZ_RELEASE_ASSERT(!full());
+    state_++;
+    set(length() - 1, funcIndex);
+  }
+
+  static CallRefHint fromRepr(Repr repr) {
+    CallRefHint res;
+    res.state_ = repr;
+    MOZ_ASSERT(res.valid());
+    return res;
+  }
+  Repr toRepr() const { return state_; }
+};
+
+static_assert(sizeof(CallRefHint) == sizeof(CallRefHint::Repr));
+
+using MutableCallRefHint = mozilla::Atomic<CallRefHint::Repr>;
+using MutableCallRefHints =
+    mozilla::UniquePtr<MutableCallRefHint[], JS::FreePolicy>;
+
+WASM_DECLARE_CACHEABLE_POD(CallRefMetricsRange);
+
+using CallRefMetricsRangeVector =
+    Vector<CallRefMetricsRange, 0, SystemAllocPolicy>;
+
+WASM_DECLARE_CACHEABLE_POD(AllocSitesRange);
+
+using AllocSitesRangeVector = Vector<AllocSitesRange, 0, SystemAllocPolicy>;
+
+enum class BranchHint : uint8_t { Unlikely = 0, Likely = 1, Invalid = 2 };
+
+struct BranchHintEntry {
+  uint32_t branchOffset;
+  BranchHint value;
+
+  BranchHintEntry() = default;
+  BranchHintEntry(uint32_t branchOffset, BranchHint value)
+      : branchOffset(branchOffset), value(value) {}
+};
+
+using BranchHintVector = Vector<BranchHintEntry, 0, SystemAllocPolicy>;
+using BranchHintFuncMap = HashMap<uint32_t, BranchHintVector,
+                                  DefaultHasher<uint32_t>, SystemAllocPolicy>;
+
+struct BranchHintCollection {
+ private:
+  static BranchHintVector invalidVector_;
+
+  BranchHintFuncMap branchHintsMap_;
+  bool failedParse_ = false;
+
+ public:
+  [[nodiscard]] bool addHintsForFunc(uint32_t functionIndex,
+                                     BranchHintVector&& branchHints) {
+    return branchHintsMap_.put(functionIndex, std::move(branchHints));
+  }
+
+  BranchHintVector& getHintVector(uint32_t funcIndex) const {
+    if (auto hintsVector =
+            branchHintsMap_.readonlyThreadsafeLookup(funcIndex)) {
+      return hintsVector->value();
+    }
+
+    return invalidVector_;
+  }
+
+  bool isEmpty() const { return branchHintsMap_.empty(); }
+
+  void setFailedAndClear() {
+    failedParse_ = true;
+    branchHintsMap_.clearAndCompact();
+  }
+  bool failedParse() const { return failedParse_; }
+};
+
+enum class GlobalKind { Import, Constant, Variable };
+
+struct GlobalType {
+  ValType type;
+  bool isMutable = false;
+
+  GlobalType() = default;
+  GlobalType(ValType type, bool isMutable) : type(type), isMutable(isMutable) {}
+};
+
+class GlobalDesc {
+  GlobalKind kind_ = GlobalKind::Constant;
+  InitExpr initial_;
+  unsigned offset_ = 0;
+  bool isMutable_ = false;
+  bool isExport_ = false;
+  uint32_t importIndex_ = 0;
+
+
+  bool isExport() const { return !isConstant() && isExport_; }
+
+ public:
+  GlobalDesc() = default;
+
+  explicit GlobalDesc(InitExpr&& initial, bool isMutable)
+      : kind_((!isMutable && initial.isLiteral()) ? GlobalKind::Constant
+                                                  : GlobalKind::Variable) {
+    initial_ = std::move(initial);
+    if (isVariable()) {
+      isMutable_ = isMutable;
+      isExport_ = false;
+      offset_ = UINT32_MAX;
+    }
+  }
+
+  explicit GlobalDesc(const GlobalType& type, uint32_t importIndex)
+      : kind_(GlobalKind::Import) {
+    initial_ = InitExpr(LitVal(type.type));
+    importIndex_ = importIndex;
+    isMutable_ = type.isMutable;
+    isExport_ = false;
+    offset_ = UINT32_MAX;
+  }
+
+  void setOffset(unsigned offset) {
+    MOZ_ASSERT(!isConstant());
+    MOZ_ASSERT(offset_ == UINT32_MAX);
+    offset_ = offset;
+  }
+  unsigned offset() const {
+    MOZ_ASSERT(!isConstant());
+    MOZ_ASSERT(offset_ != UINT32_MAX);
+    return offset_;
+  }
+
+  void setIsExport() {
+    if (!isConstant()) {
+      isExport_ = true;
+    }
+  }
+
+  GlobalKind kind() const { return kind_; }
+  bool isVariable() const { return kind_ == GlobalKind::Variable; }
+  bool isConstant() const { return kind_ == GlobalKind::Constant; }
+  bool isImport() const { return kind_ == GlobalKind::Import; }
+
+  bool isMutable() const { return !isConstant() && isMutable_; }
+  const InitExpr& initExpr() const {
+    MOZ_ASSERT(!isImport());
+    return initial_;
+  }
+  uint32_t importIndex() const {
+    MOZ_ASSERT(isImport());
+    return importIndex_;
+  }
+
+  LitVal constantValue() const { return initial_.literal(); }
+
+  bool isIndirect() const { return isMutable() && (isImport() || isExport()); }
+
+  ValType type() const { return initial_.type(); }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  WASM_DECLARE_FRIEND_SERIALIZE(GlobalDesc);
+
+  static bool matches(const GlobalDesc& src, const GlobalDesc& dst);
+};
+
+using GlobalDescVector = Vector<GlobalDesc, 0, SystemAllocPolicy>;
+
+
+using TagOffsetVector = Vector<uint32_t, 2, SystemAllocPolicy>;
+
+class TagType : public AtomicRefCounted<TagType> {
+  SharedTypeDef type_;
+  TagOffsetVector exceptionArgOffsets_;
+  uint32_t size_;
+
+ public:
+  TagType() : size_(0) {}
+
+  [[nodiscard]] bool initialize(const SharedTypeDef& funcType);
+
+  const TypeDef& type() const { return *type_; }
+  const ValTypeVector& argTypes() const { return type_->funcType().args(); }
+  const ValTypeVector& resultTypes() const {
+    return type_->funcType().results();
+  }
+
+  const TagOffsetVector& exceptionArgOffsets() const {
+    return exceptionArgOffsets_;
+  }
+
+  ResultType argResultType() const { return ResultType::Vector(argTypes()); }
+
+  uint32_t tagSize() const { return size_; }
+
+  static bool matches(const TagType& a, const TagType& b) {
+    return a.type_ == b.type_;
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  WASM_DECLARE_FRIEND_SERIALIZE(TagType);
+};
+
+using MutableTagType = RefPtr<TagType>;
+using SharedTagType = RefPtr<const TagType>;
+
+struct TagDesc {
+  TagKind kind = TagKind::Exception;
+  SharedTagType type;
+  bool isExport;
+
+  TagDesc() : isExport(false) {}
+  TagDesc(TagKind kind, const SharedTagType& type, bool isExport = false)
+      : kind(kind), type(type), isExport(isExport) {}
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+};
+
+using TagDescVector = Vector<TagDesc, 0, SystemAllocPolicy>;
+
+#ifdef ENABLE_WASM_JSPI
+
+class HandlerExpr {
+  uint32_t tagIndex_;
+  uint32_t labelDepth_;
+
+  static constexpr uint32_t IsSwitch = UINT32_MAX;
+
+ public:
+  explicit HandlerExpr(uint32_t tagIndex)
+      : tagIndex_(tagIndex), labelDepth_(IsSwitch) {
+    MOZ_ASSERT(isSwitch());
+  }
+  HandlerExpr(uint32_t tagIndex, uint32_t labelDepth)
+      : tagIndex_(tagIndex), labelDepth_(labelDepth) {
+    MOZ_ASSERT(!isSwitch());
+  }
+
+  uint32_t tagIndex() const { return tagIndex_; }
+  bool isSwitch() const { return labelDepth_ == IsSwitch; }
+  uint32_t labelDepth() const {
+    MOZ_ASSERT(!isSwitch());
+    return labelDepth_;
+  }
+};
+
+using HandlerExprVector = Vector<HandlerExpr, 2, SystemAllocPolicy>;
+
+#endif  // ENABLE_WASM_JSPI
+
+struct ModuleElemSegment {
+  enum class Kind {
+    Active,
+    Passive,
+    Declared,
+  };
+
+  enum class Encoding {
+    Indices = 1,
+    Expressions,
+  };
+
+  struct Expressions {
+    size_t count = 0;
+    Bytes exprBytes;
+
+    size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  };
+
+  Kind kind;
+  uint32_t tableIndex;
+  RefType elemType;
+  mozilla::Maybe<InitExpr> offsetIfActive;
+
+  Encoding encoding;
+  Uint32Vector elemIndices;
+  Expressions elemExpressions;
+
+  bool active() const { return kind == Kind::Active; }
+
+  const InitExpr& offset() const { return *offsetIfActive; }
+
+  size_t numElements() const {
+    switch (encoding) {
+      case Encoding::Indices:
+        return elemIndices.length();
+      case Encoding::Expressions:
+        return elemExpressions.count;
+      default:
+        MOZ_CRASH("unknown element segment encoding");
+    }
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+};
+
+using ModuleElemSegmentVector = Vector<ModuleElemSegment, 0, SystemAllocPolicy>;
+
+using InstanceElemSegment = GCVector<HeapPtr<AnyRef>, 0, SystemAllocPolicy>;
+using InstanceElemSegmentVector =
+    GCVector<InstanceElemSegment, 0, SystemAllocPolicy>;
+
+
+constexpr uint32_t InvalidMemoryIndex = UINT32_MAX;
+static_assert(InvalidMemoryIndex > MaxMemories, "Invariant");
+
+struct DataSegmentRange {
+  uint32_t memoryIndex;
+  mozilla::Maybe<InitExpr> offsetIfActive;
+  uint32_t bytecodeOffset;
+  uint32_t length;
+};
+
+using DataSegmentRangeVector = Vector<DataSegmentRange, 0, SystemAllocPolicy>;
+
+struct DataSegment : AtomicRefCounted<DataSegment> {
+  uint32_t memoryIndex;
+  mozilla::Maybe<InitExpr> offsetIfActive;
+  Bytes bytes;
+
+  DataSegment() = default;
+
+  bool active() const { return !!offsetIfActive; }
+
+  const InitExpr& offset() const { return *offsetIfActive; }
+
+  [[nodiscard]] bool init(const BytecodeSource& bytecode,
+                          const DataSegmentRange& src) {
+    memoryIndex = src.memoryIndex;
+    if (src.offsetIfActive) {
+      offsetIfActive.emplace();
+      if (!offsetIfActive->clone(*src.offsetIfActive)) {
+        return false;
+      }
+    }
+    MOZ_ASSERT(bytes.length() == 0);
+    BytecodeSpan span =
+        bytecode.getSpan(BytecodeRange(src.bytecodeOffset, src.length));
+    return bytes.append(span.data(), span.size());
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+};
+
+using MutableDataSegment = RefPtr<DataSegment>;
+using SharedDataSegment = RefPtr<const DataSegment>;
+using DataSegmentVector = Vector<SharedDataSegment, 0, SystemAllocPolicy>;
+
+
+struct CustomSectionRange {
+  BytecodeRange name;
+  BytecodeRange payload;
+
+  WASM_CHECK_CACHEABLE_POD(name, payload);
+};
+
+WASM_DECLARE_CACHEABLE_POD(CustomSectionRange);
+
+using CustomSectionRangeVector =
+    Vector<CustomSectionRange, 0, SystemAllocPolicy>;
+
+struct CustomSection {
+  Bytes name;
+  SharedBytes payload;
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+};
+
+using CustomSectionVector = Vector<CustomSection, 0, SystemAllocPolicy>;
+
+
+struct Name {
+  uint32_t offsetInNamePayload;
+  uint32_t length;
+
+  WASM_CHECK_CACHEABLE_POD(offsetInNamePayload, length);
+
+  Name() : offsetInNamePayload(UINT32_MAX), length(0) {}
+};
+
+WASM_DECLARE_CACHEABLE_POD(Name);
+
+using NameVector = Vector<Name, 0, SystemAllocPolicy>;
+
+struct NameSection {
+  Name moduleName;
+  NameVector funcNames;
+  uint32_t customSectionIndex;
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+};
+
+
+enum class LimitsKind {
+  Memory,
+  Table,
+};
+
+extern const char* ToString(LimitsKind kind);
+
+
+struct Limits {
+  AddressType addressType;
+
+  uint64_t initial;
+  mozilla::Maybe<uint64_t> maximum;
+
+  Shareable shared;
+
+  PageSize pageSize = PageSize::Standard;
+
+  WASM_CHECK_CACHEABLE_POD(addressType, initial, maximum, shared, pageSize);
+
+  Limits() = default;
+  Limits(uint64_t initial, const mozilla::Maybe<uint64_t>& maximum,
+         Shareable shared, PageSize pageSize)
+      : addressType(AddressType::I32),
+        initial(initial),
+        maximum(maximum),
+        shared(shared),
+        pageSize(pageSize) {}
+
+  static bool matches(Limits src, Limits dst);
+};
+
+WASM_DECLARE_CACHEABLE_POD(Limits);
+
+
+struct MemoryDesc {
+  Limits limits;
+  mozilla::Maybe<uint32_t> importIndex;
+
+  WASM_CHECK_CACHEABLE_POD(limits, importIndex);
+
+  bool isShared() const { return limits.shared == Shareable::True; }
+
+  bool canMovingGrow() const { return limits.maximum.isNothing(); }
+
+  bool boundsCheckLimitIsAlways32Bits() const {
+    return limits.maximum.isSome() &&
+           limits.maximum.value() < (0x100000000 / PageSizeInBytes(pageSize()));
+  }
+
+  AddressType addressType() const { return limits.addressType; }
+
+  PageSize pageSize() const { return limits.pageSize; }
+
+  Pages initialPages() const {
+    return Pages::fromPageCount(limits.initial, pageSize());
+  }
+
+  mozilla::Maybe<Pages> maximumPages() const {
+    return limits.maximum.map(
+        [&](uint64_t x) { return Pages::fromPageCount(x, pageSize()); });
+  }
+
+  uint64_t initialLength() const {
+    MOZ_ASSERT_IF(addressType() == AddressType::I64,
+                  limits.initial <= UINT64_MAX / PageSizeInBytes(pageSize()));
+    return addressType() == AddressType::I64 ? initialPages().byteLength64()
+                                             : initialPages().byteLength();
+  }
+
+  MemoryDesc() = default;
+  explicit MemoryDesc(Limits limits)
+      : limits(limits), importIndex(mozilla::Nothing()) {}
+
+  static bool matches(const MemoryDesc& src, const MemoryDesc& dst);
+};
+
+WASM_DECLARE_CACHEABLE_POD(MemoryDesc);
+
+using MemoryDescVector = Vector<MemoryDesc, 1, SystemAllocPolicy>;
+
+static_assert(MaxMemory32StandardPagesValidation <=
+              UINT64_MAX / StandardPageSizeBytes);
+#ifdef ENABLE_WASM_CUSTOM_PAGE_SIZES
+static_assert(MaxMemory32TinyPagesValidation <= UINT64_MAX);
+#endif
+
+struct TableType {
+  Limits limits;
+  RefType elemType;
+
+  TableType() = default;
+  TableType(Limits limits, RefType elemType)
+      : limits(limits), elemType(elemType) {}
+
+  static bool matches(TableType src, TableType dst);
+};
+
+struct TableDesc {
+  TableType type;
+
+  bool isImported = false;
+  bool isExported = false;
+  mozilla::Maybe<InitExpr> initExpr;
+
+  TableDesc() = default;
+  TableDesc(const TableType& type, mozilla::Maybe<InitExpr>&& initExpr,
+            bool isImported = false, bool isExported = false)
+      : type(type),
+        isImported(isImported),
+        isExported(isExported),
+        initExpr(std::move(initExpr)) {}
+
+  AddressType addressType() const { return type.limits.addressType; }
+
+  uint64_t initialLength() const { return type.limits.initial; }
+
+  mozilla::Maybe<uint64_t> maximumLength() const { return type.limits.maximum; }
+
+  RefType elemType() const { return type.elemType; }
+};
+
+using TableDescVector = Vector<TableDesc, 0, SystemAllocPolicy>;
+
+}  
+}  
+
+#endif  // wasm_module_types_h

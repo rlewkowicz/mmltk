@@ -1,0 +1,327 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_loader_ScriptLoadRequest_h
+#define js_loader_ScriptLoadRequest_h
+
+#include "js/experimental/JSStencil.h"
+#include "js/RootingAPI.h"
+#include "js/SourceText.h"
+#include "js/TypeDecls.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/dom/CacheExpirationTime.h"
+#include "mozilla/dom/SRIMetadata.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/PreloaderBase.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/SharedSubResourceCache.h"  // mozilla::SubResourceNetworkMetadataHolder
+#include "mozilla/StaticPrefs_dom.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIGlobalObject.h"
+#include "LoadedScript.h"
+#include "ScriptKind.h"
+#include "ScriptFetchOptions.h"
+
+namespace mozilla::dom {
+
+class ScriptLoadContext;
+class WorkerLoadContext;
+class WorkletLoadContext;
+enum class RequestPriority : uint8_t;
+
+}  
+
+namespace mozilla::loader {
+class SyncLoadContext;
+}  
+
+namespace JS::loader {
+
+class LoadContextBase;
+class ModuleLoadRequest;
+class ScriptLoadRequestList;
+
+
+class ScriptLoadRequest : public nsISupports,
+                          private mozilla::LinkedListElement<ScriptLoadRequest>,
+                          public LoadedScriptDelegate<ScriptLoadRequest> {
+  using super = LinkedListElement<ScriptLoadRequest>;
+
+  friend class mozilla::LinkedListElement<ScriptLoadRequest>;
+  friend class ScriptLoadRequestList;
+
+ protected:
+  virtual ~ScriptLoadRequest();
+
+ public:
+  using SRIMetadata = mozilla::dom::SRIMetadata;
+  ScriptLoadRequest(ScriptKind aKind, const SRIMetadata& aIntegrity,
+                    nsIURI* aReferrer, LoadContextBase* aContext);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(ScriptLoadRequest)
+
+  using super::getNext;
+  using super::isInList;
+
+  template <typename T, typename D = DeletePolicy<T>>
+  using UniquePtr = mozilla::UniquePtr<T, D>;
+
+  bool IsModuleRequest() const { return mKind == ScriptKind::eModule; }
+  bool IsImportMapRequest() const { return mKind == ScriptKind::eImportMap; }
+  bool IsSpeculationRulesRequest() const {
+    return mKind == ScriptKind::eSpeculationRules;
+  }
+
+  ModuleLoadRequest* AsModuleRequest();
+  const ModuleLoadRequest* AsModuleRequest() const;
+
+  CacheExpirationTime ExpirationTime() const {
+    MOZ_ASSERT(!IsRetrievedFromMemoryCache());
+    return mExpirationTime;
+  }
+
+  void SetMinimumExpirationTime(const CacheExpirationTime& aExpirationTime) {
+    mExpirationTime.SetMinimum(aExpirationTime);
+  }
+
+  virtual bool IsTopLevel() const { return true; };
+
+  virtual void Cancel();
+
+  virtual void SetReady();
+
+  enum class State : uint8_t {
+    CheckingCache,
+
+    Fetching,
+
+    DelayingReady,
+
+    Compiling,
+
+    Ready,
+
+    Canceled
+  };
+
+  bool IsCheckingCache() const { return mState == State::CheckingCache; }
+
+  bool IsFetching() const { return mState == State::Fetching; }
+  bool IsDelayingReady() const { return mState == State::DelayingReady; }
+  bool IsCompiling() const { return mState == State::Compiling; }
+  bool IsCanceled() const { return mState == State::Canceled; }
+
+  bool IsFinished() const {
+    return mState == State::Ready || mState == State::Canceled;
+  }
+
+  mozilla::dom::ReferrerPolicy ReferrerPolicy() const {
+    return FetchInfo()->ReferrerPolicy();
+  }
+
+  nsIURI* BaseURL() const { return FetchInfo()->BaseURL(); }
+  void SetBaseURL(nsIURI* aBaseURL) { FetchInfo()->SetBaseURL(aBaseURL); }
+  void SetBaseURLFromChannelAndOriginalURI(nsIChannel* aChannel,
+                                           nsIURI* aOriginalURI) {
+    FetchInfo()->SetBaseURLFromChannelAndOriginalURI(aChannel, aOriginalURI);
+  }
+
+  ScriptFetchOptions* FetchOptions() const {
+    return FetchInfo()->FetchOptions();
+  }
+
+  mozilla::dom::RequestPriority FetchPriority() const {
+    return FetchOptions()->mFetchPriority;
+  }
+
+  enum ParserMetadata ParserMetadata() const {
+    return FetchOptions()->mParserMetadata;
+  }
+
+  const nsString& Nonce() const { return FetchOptions()->mNonce; }
+
+  nsIPrincipal* TriggeringPrincipal() const {
+    return FetchOptions()->mTriggeringPrincipal;
+  }
+
+  void CacheEntryFound(LoadedScript* aLoadedScript,
+                       ScriptFetchOptions* aFetchOptions);
+
+  void CacheEntryRevived(LoadedScript* aLoadedScript);
+
+  void NoCacheEntryFound(mozilla::dom::ReferrerPolicy aReferrerPolicy,
+                         ScriptFetchOptions* aFetchOptions, nsIURI* aURI);
+
+ private:
+  void SetCacheEntry(LoadedScript* aLoadedScript,
+                     ScriptFetchOptions* aFetchOptions);
+
+ public:
+  bool PassedConditionForDiskCache() const {
+    return mDiskCachingPlan == CachingPlan::PassedCondition;
+  }
+
+  bool PassedConditionForMemoryCache() const {
+    return mMemoryCachingPlan == CachingPlan::PassedCondition;
+  }
+
+  bool PassedConditionForEitherCache() const {
+    return PassedConditionForDiskCache() || PassedConditionForMemoryCache();
+  }
+
+  void MarkNotCacheable() {
+    mDiskCachingPlan = CachingPlan::NotCacheable;
+    mMemoryCachingPlan = CachingPlan::NotCacheable;
+  }
+
+  bool IsMarkedNotCacheable() const {
+    MOZ_ASSERT_IF(mDiskCachingPlan == CachingPlan::NotCacheable,
+                  mMemoryCachingPlan == CachingPlan::NotCacheable);
+    MOZ_ASSERT_IF(mDiskCachingPlan != CachingPlan::NotCacheable,
+                  mMemoryCachingPlan != CachingPlan::NotCacheable);
+    return mDiskCachingPlan == CachingPlan::NotCacheable;
+  }
+
+  void MarkSkippedDiskCaching() {
+    MOZ_ASSERT(mDiskCachingPlan == CachingPlan::Uninitialized ||
+               mDiskCachingPlan == CachingPlan::PassedCondition);
+    mDiskCachingPlan = CachingPlan::Skipped;
+  }
+
+  void MarkSkippedMemoryCaching() {
+    MOZ_ASSERT(mMemoryCachingPlan == CachingPlan::Uninitialized ||
+               mMemoryCachingPlan == CachingPlan::PassedCondition);
+    mMemoryCachingPlan = CachingPlan::Skipped;
+  }
+
+  void MarkSkippedAllCaching() {
+    MarkSkippedDiskCaching();
+    MarkSkippedMemoryCaching();
+  }
+
+  void MarkPassedConditionForDiskCache() {
+    MOZ_ASSERT(mDiskCachingPlan == CachingPlan::Uninitialized);
+    mDiskCachingPlan = CachingPlan::PassedCondition;
+  }
+
+  void MarkPassedConditionForMemoryCache() {
+    MOZ_ASSERT(mMemoryCachingPlan == CachingPlan::Uninitialized);
+    mMemoryCachingPlan = CachingPlan::PassedCondition;
+  }
+
+  mozilla::CORSMode CORSMode() const { return FetchOptions()->mCORSMode; }
+
+  bool HasLoadContext() const { return mLoadContext; }
+  bool HasScriptLoadContext() const;
+  bool HasWorkerLoadContext() const;
+
+  mozilla::dom::ScriptLoadContext* GetScriptLoadContext();
+  const mozilla::dom::ScriptLoadContext* GetScriptLoadContext() const;
+
+  mozilla::loader::SyncLoadContext* GetSyncLoadContext();
+
+  mozilla::dom::WorkerLoadContext* GetWorkerLoadContext();
+
+  mozilla::dom::WorkletLoadContext* GetWorkletLoadContext();
+
+  const LoadedScript* getLoadedScript() const { return mLoadedScript.get(); }
+  LoadedScript* getLoadedScript() { return mLoadedScript.get(); }
+
+  bool HasStencil() const { return !!mStencil; }
+  JS::Stencil* GetStencil() const { return mStencil; }
+  void SetStencil(JS::Stencil* aStencil) { mStencil = aStencil; }
+  void ClearStencil() { mStencil = nullptr; }
+
+  bool HasSourceMapURL() const { return mHasSourceMapURL_; }
+  const nsString& GetSourceMapURL() const {
+    MOZ_ASSERT(mHasSourceMapURL_);
+    return mMaybeSourceMapURL_;
+  }
+  void SetSourceMapURL(const nsString& aSourceMapURL) {
+    MOZ_ASSERT(!mHasSourceMapURL_);
+    mMaybeSourceMapURL_ = aSourceMapURL;
+    mHasSourceMapURL_ = true;
+  }
+
+  bool HasDirtyCache() const { return mHasDirtyCache_; }
+  void SetHasDirtyCache() { mHasDirtyCache_ = true; }
+
+  bool HadPostponed() const { return mHadPostponed_; }
+  void SetHadPostponed() { mHadPostponed_ = true; }
+
+  const ScriptFetchInfo* FetchInfo() const { return mFetchInfo; }
+  ScriptFetchInfo* FetchInfo() { return mFetchInfo; }
+
+  bool IsRetrievedFromMemoryCache() const {
+    return mIsRetrievedFromMemoryCache;
+  }
+
+  bool IsFetchedAsTextSource() const {
+    MOZ_ASSERT(!IsRetrievedFromMemoryCache());
+    MOZ_ASSERT(!getLoadedScript()->IsCachedStencil());
+    MOZ_ASSERT(!getLoadedScript()->IsInvalidatedCachedStencil());
+    return getLoadedScript()->IsTextSource();
+  }
+  bool IsRetrievedAsSerializedStencil() const {
+    MOZ_ASSERT(!IsRetrievedFromMemoryCache());
+    MOZ_ASSERT(!getLoadedScript()->IsCachedStencil());
+    MOZ_ASSERT(!getLoadedScript()->IsInvalidatedCachedStencil());
+    return getLoadedScript()->IsSerializedStencil();
+  }
+
+ public:
+
+  const ScriptKind mKind;
+
+  State mState;
+
+  bool mFetchSourceOnly : 1;
+
+  bool mHasSourceMapURL_ : 1;
+
+  bool mHasDirtyCache_ : 1;
+
+  bool mHadPostponed_ : 1;
+
+  enum class CachingPlan : uint8_t {
+    Uninitialized,
+
+    NotCacheable,
+
+    Skipped,
+
+    PassedCondition,
+  };
+  CachingPlan mDiskCachingPlan : 2;
+  CachingPlan mMemoryCachingPlan : 2;
+
+  bool mIsRetrievedFromMemoryCache : 1;
+
+  CacheExpirationTime mExpirationTime = CacheExpirationTime::Never();
+
+  RefPtr<mozilla::SubResourceNetworkMetadataHolder> mNetworkMetadata;
+  const SRIMetadata mIntegrity;
+  const nsCOMPtr<nsIURI> mReferrer;
+
+  nsString mMaybeSourceMapURL_;
+
+  nsCOMPtr<nsIPrincipal> mOriginPrincipal;
+
+  nsAutoCString mURL;
+
+  RefPtr<LoadedScript> mLoadedScript;
+
+  RefPtr<JS::Stencil> mStencil;
+
+  RefPtr<ScriptFetchInfo> mFetchInfo;
+
+  RefPtr<LoadContextBase> mLoadContext;
+
+  uint64_t mEarlyHintPreloaderId;
+};
+
+}  
+
+#endif  // js_loader_ScriptLoadRequest_h

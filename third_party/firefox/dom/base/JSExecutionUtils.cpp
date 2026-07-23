@@ -1,0 +1,54 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/dom/JSExecutionUtils.h"
+
+#include <utility>  // std::move
+
+#include "ErrorList.h"  // NS_ERROR_OUT_OF_MEMORY, NS_SUCCESS_DOM_SCRIPT_EVALUATION_THREW, NS_SUCCESS_DOM_SCRIPT_EVALUATION_THREW_UNCATCHABLE
+#include "js/CompilationAndEvaluation.h"  // JS::UpdateDebugMetadata
+#include "js/SourceText.h"                // JS::SourceText, JS::SourceOwnership
+#include "js/experimental/JSStencil.h"  // JS::Stencil, JS::CompileGlobalScriptToStencil
+#include "jsapi.h"                      // JS_IsExceptionPending
+#include "nsTPromiseFlatString.h"  // PromiseFlatString
+
+#if !defined(DEBUG) && !defined(MOZ_ENABLE_JS_DUMP)
+#  include "mozilla/StaticPrefs_browser.h"
+#endif
+
+using namespace mozilla;
+
+namespace mozilla::dom {
+
+nsresult EvaluationExceptionToNSResult(ErrorResult& aRv) {
+  if (aRv.IsJSContextException()) {
+    aRv.SuppressException();
+    return NS_SUCCESS_DOM_SCRIPT_EVALUATION_THREW;
+  }
+  if (aRv.IsUncatchableException()) {
+    aRv.SuppressException();
+    return NS_SUCCESS_DOM_SCRIPT_EVALUATION_THREW_UNCATCHABLE;
+  }
+  return aRv.StealNSResult();
+}
+
+void Compile(JSContext* aCx, JS::CompileOptions& aCompileOptions,
+             const nsAString& aScript, RefPtr<JS::Stencil>& aStencil,
+             ErrorResult& aRv) {
+  const nsPromiseFlatString& flatScript = PromiseFlatString(aScript);
+  JS::SourceText<char16_t> srcBuf;
+  if (!srcBuf.init(aCx, flatScript.get(), flatScript.Length(),
+                   JS::SourceOwnership::Borrowed)) {
+    aRv.NoteJSContextException(aCx);
+    return;
+  }
+
+  aStencil = CompileGlobalScriptToStencil(aCx, aCompileOptions, srcBuf);
+  if (!aStencil) {
+    aRv.NoteJSContextException(aCx);
+  }
+}
+
+}  

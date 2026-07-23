@@ -1,0 +1,1239 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ScriptPreloader-inl.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Monitor.h"
+
+#include "mozilla/ScriptPreloader.h"
+#include "mozilla/loader/ScriptCacheActors.h"
+
+#include "mozilla/URLPreloader.h"
+
+#include "mozilla/Components.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/EndianUtils.h"
+#include "mozilla/FileUtils.h"
+#include "mozilla/IOBuffers.h"
+#include "mozilla/Logging.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/Services.h"
+#include "mozilla/StaticPrefs_javascript.h"
+#include "mozilla/TaskController.h"
+#include "mozilla/Try.h"
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/scache/StartupCache.h"
+#include "mozilla/scache/StartupCacheUtils.h"
+
+#include "crc32c.h"
+#include "js/CompileOptions.h"              // JS::ReadOnlyCompileOptions
+#include "js/experimental/JSStencil.h"      // JS::Stencil, JS::DecodeStencil
+#include "js/experimental/CompileScript.h"  // JS::NewFrontendContext, JS::DestroyFrontendContext, JS::SetNativeStackQuota, JS::ThreadStackQuotaForSize
+#include "js/Transcoding.h"
+#include "MainThreadUtils.h"
+#include "nsDebug.h"
+#include "nsDirectoryServiceUtils.h"
+#include "nsIFile.h"
+#include "nsIObserverService.h"
+#include "nsJSUtils.h"
+#include "nsNetUtil.h"
+#include "nsProxyRelease.h"
+#include "nsThreadUtils.h"
+#include "nsXULAppAPI.h"
+#include "xpcpublic.h"
+
+#if defined(XP_LINUX)
+#  include <sys/mman.h>
+#  ifndef MADV_COLD
+#    define MADV_COLD 20
+#  endif
+#endif
+
+#define STARTUP_COMPLETE_TOPIC "browser-delayed-startup-finished"
+#define CONTENT_DOCUMENT_LOADED_TOPIC "content-document-loaded"
+#define CACHE_WRITE_TOPIC "browser-idle-startup-tasks-finished"
+#define XPCOM_SHUTDOWN_TOPIC "xpcom-shutdown"
+#define CACHE_INVALIDATE_TOPIC "startupcache-invalidate"
+
+constexpr uint32_t CHILD_STARTUP_TIMEOUT_MS = 8000;
+
+namespace mozilla {
+namespace {
+static LazyLogModule gLog("ScriptPreloader");
+
+#define LOG(level, ...) MOZ_LOG(gLog, LogLevel::level, (__VA_ARGS__))
+}  
+
+using mozilla::dom::AutoJSAPI;
+using mozilla::dom::ContentChild;
+using mozilla::dom::ContentParent;
+using namespace mozilla::loader;
+using mozilla::scache::StartupCache;
+
+using namespace JS;
+
+ProcessType ScriptPreloader::sProcessType;
+
+nsresult ScriptPreloader::CollectReports(nsIHandleReportCallback* aHandleReport,
+                                         nsISupports* aData, bool aAnonymize) {
+  MOZ_COLLECT_REPORT(
+      "explicit/script-preloader/heap/saved-scripts", KIND_HEAP, UNITS_BYTES,
+      SizeOfHashEntries<ScriptStatus::Saved>(mScripts, MallocSizeOf),
+      "Memory used to hold the scripts which have been executed in this "
+      "session, and will be written to the startup script cache file.");
+
+  MOZ_COLLECT_REPORT(
+      "explicit/script-preloader/heap/restored-scripts", KIND_HEAP, UNITS_BYTES,
+      SizeOfHashEntries<ScriptStatus::Restored>(mScripts, MallocSizeOf),
+      "Memory used to hold the scripts which have been restored from the "
+      "startup script cache file, but have not been executed in this session.");
+
+  MOZ_COLLECT_REPORT("explicit/script-preloader/heap/other", KIND_HEAP,
+                     UNITS_BYTES, ShallowHeapSizeOfIncludingThis(MallocSizeOf),
+                     "Memory used by the script cache service itself.");
+
+  if (XRE_IsParentProcess()) {
+    MOZ_COLLECT_REPORT("explicit/script-preloader/non-heap/memmapped-cache",
+                       KIND_NONHEAP, UNITS_BYTES,
+                       mCacheData->nonHeapSizeOfExcludingThis(),
+                       "The memory-mapped startup script cache file.");
+  } else {
+    MOZ_COLLECT_REPORT("script-preloader-memmapped-cache", KIND_NONHEAP,
+                       UNITS_BYTES, mCacheData->nonHeapSizeOfExcludingThis(),
+                       "The memory-mapped startup script cache file.");
+  }
+
+  return NS_OK;
+}
+
+StaticRefPtr<ScriptPreloader> ScriptPreloader::gScriptPreloader;
+StaticRefPtr<ScriptPreloader> ScriptPreloader::gChildScriptPreloader;
+StaticAutoPtr<AutoMemMap> ScriptPreloader::gCacheData;
+StaticAutoPtr<AutoMemMap> ScriptPreloader::gChildCacheData;
+
+ScriptPreloader& ScriptPreloader::GetSingleton() {
+  if (!gScriptPreloader) {
+    AssertIsOnMainThread();
+    if (XRE_IsParentProcess()) {
+      gCacheData = new AutoMemMap();
+      gScriptPreloader = new ScriptPreloader(gCacheData.get());
+      gScriptPreloader->mChildCache = &GetChildSingleton();
+      (void)gScriptPreloader->InitCache();
+    } else {
+      gScriptPreloader = &GetChildSingleton();
+    }
+  }
+
+  return *gScriptPreloader;
+}
+
+ScriptPreloader& ScriptPreloader::GetChildSingleton() {
+  if (!gChildScriptPreloader) {
+    AssertIsOnMainThread();
+    gChildCacheData = new AutoMemMap();
+    gChildScriptPreloader = new ScriptPreloader(gChildCacheData.get());
+    if (XRE_IsParentProcess()) {
+      (void)gChildScriptPreloader->InitCache(u"scriptCache-child"_ns);
+    }
+  }
+
+  return *gChildScriptPreloader;
+}
+
+void ScriptPreloader::DeleteSingleton() {
+  gScriptPreloader = nullptr;
+  gChildScriptPreloader = nullptr;
+}
+
+void ScriptPreloader::DeleteCacheDataSingleton() {
+  MOZ_ASSERT(!gScriptPreloader);
+  MOZ_ASSERT(!gChildScriptPreloader);
+
+  gCacheData = nullptr;
+  gChildCacheData = nullptr;
+}
+
+void ScriptPreloader::InitContentChild(ContentParent& parent) {
+  AssertIsOnMainThread();
+
+  auto& cache = GetChildSingleton();
+  cache.mSaveMonitor.NoteOnMainThread();
+
+  auto processType = GetChildProcessType(parent.GetRemoteType());
+  bool wantScriptData =
+      !cache.mRequestedChildProcessStencils.contains(processType);
+  cache.mRequestedChildProcessStencils += processType;
+
+  if (processType == ProcessType::Web) {
+    cache.mRequiredChildProcessStencils += processType;
+  }
+
+  auto fd = cache.mCacheData->cloneFileDescriptor();
+  if (fd.IsValid() && !cache.mCacheInvalidated) {
+    (void)parent.SendPScriptCacheConstructor(fd, wantScriptData);
+  } else {
+    (void)parent.SendPScriptCacheConstructor(NS_ERROR_FILE_NOT_FOUND,
+                                             wantScriptData);
+  }
+}
+
+ProcessType ScriptPreloader::GetChildProcessType(const nsACString& remoteType) {
+  if (remoteType == EXTENSION_REMOTE_TYPE) {
+    return ProcessType::Extension;
+  }
+  if (remoteType == PRIVILEGEDABOUT_REMOTE_TYPE) {
+    return ProcessType::PrivilegedAbout;
+  }
+  return ProcessType::Web;
+}
+
+ScriptPreloader::ScriptPreloader(AutoMemMap* cacheData)
+    : mCacheData(cacheData),
+      mMonitor("[ScriptPreloader.mMonitor]"),
+      mSaveMonitor("[ScriptPreloader.mSaveMonitor]") {
+  if (XRE_IsParentProcess()) {
+    sProcessType = ProcessType::Parent;
+  }
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  MOZ_RELEASE_ASSERT(obs);
+
+  if (XRE_IsParentProcess()) {
+    obs->AddObserver(this, STARTUP_COMPLETE_TOPIC, false);
+    obs->AddObserver(this, CACHE_WRITE_TOPIC, false);
+  }
+
+  obs->AddObserver(this, XPCOM_SHUTDOWN_TOPIC, false);
+  obs->AddObserver(this, CACHE_INVALIDATE_TOPIC, false);
+}
+
+ScriptPreloader::~ScriptPreloader() { Cleanup(); }
+
+void ScriptPreloader::Cleanup() {
+  mScripts.Clear();
+  UnregisterWeakMemoryReporter(this);
+}
+
+void ScriptPreloader::StartCacheWriteIfReady() {
+  if (!mChildCache) {
+    return;
+  }
+
+  if (mSaveComplete || mSaveThread) {
+    return;
+  }
+
+  if (!mStartupHasAdvancedToCacheWritingStage) {
+    return;
+  }
+
+  if (!mChildCache->mReceivedChildProcessStencils.contains(
+          mChildCache->mRequiredChildProcessStencils)) {
+    return;
+  }
+
+  StartCacheWrite();
+}
+
+void ScriptPreloader::StartCacheWrite() {
+  MOZ_DIAGNOSTIC_ASSERT(!mSaveThread);
+
+  (void)NS_NewNamedThread("SaveScripts", getter_AddRefs(mSaveThread), this);
+
+  nsCOMPtr<nsIAsyncShutdownClient> barrier = GetShutdownBarrier();
+  barrier->AddBlocker(this, NS_LITERAL_STRING_FROM_CSTRING(__FILE__), __LINE__,
+                      u""_ns);
+}
+
+void ScriptPreloader::InvalidateCache() {
+  {
+    mMonitor.AssertNotCurrentThreadOwns();
+    MonitorAutoLock mal(mMonitor);
+
+    FinishPendingParses(mal);
+
+    MOZ_ASSERT(mDecodingScripts.isEmpty());
+    MOZ_ASSERT(!mDecodedStencils);
+
+    mScripts.Clear();
+
+    if (mSaveComplete && !mSaveThread && mChildCache) {
+      mSaveComplete = false;
+
+      StartCacheWrite();
+    }
+  }
+
+  {
+    MonitorAutoLock saveMonitorAutoLock(mSaveMonitor.Lock());
+    mSaveMonitor.NoteExclusiveAccess();
+
+    mCacheInvalidated = true;
+  }
+
+  mSaveMonitor.Lock().NotifyAll();
+}
+
+nsresult ScriptPreloader::Observe(nsISupports* subject, const char* topic,
+                                  const char16_t* data) {
+  AssertIsOnMainThread();
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  if (!strcmp(topic, STARTUP_COMPLETE_TOPIC)) {
+    obs->RemoveObserver(this, STARTUP_COMPLETE_TOPIC);
+
+    MOZ_ASSERT(XRE_IsParentProcess());
+
+    mStartupFinished = true;
+    URLPreloader::GetSingleton().SetStartupFinished();
+  } else if (!strcmp(topic, CACHE_WRITE_TOPIC)) {
+    obs->RemoveObserver(this, CACHE_WRITE_TOPIC);
+
+    MOZ_ASSERT(mStartupFinished);
+    MOZ_ASSERT(XRE_IsParentProcess());
+    mStartupHasAdvancedToCacheWritingStage = true;
+
+#if defined(XP_LINUX)
+    if (mCacheData->initialized()) {
+      (void)madvise(mCacheData->get<uint8_t>().get(), mCacheData->size(),
+                    MADV_COLD);
+    }
+#endif
+
+    StartCacheWriteIfReady();
+  } else if (mContentStartupFinishedTopic.Equals(topic)) {
+    if (nsCOMPtr<dom::Document> doc = do_QueryInterface(subject)) {
+      nsCOMPtr<nsIURI> uri = doc->GetDocumentURI();
+
+      if ((NS_IsAboutBlank(uri) &&
+           doc->GetReadyStateEnum() == doc->READYSTATE_UNINITIALIZED) ||
+          uri->SchemeIs("chrome")) {
+        return NS_OK;
+      }
+    }
+    FinishContentStartup();
+  } else if (!strcmp(topic, "timer-callback")) {
+    FinishContentStartup();
+  } else if (!strcmp(topic, XPCOM_SHUTDOWN_TOPIC)) {
+    MonitorAutoLock mal(mMonitor);
+    FinishPendingParses(mal);
+  } else if (!strcmp(topic, CACHE_INVALIDATE_TOPIC)) {
+    InvalidateCache();
+  }
+
+  return NS_OK;
+}
+
+void ScriptPreloader::FinishContentStartup() {
+  MOZ_ASSERT(XRE_IsContentProcess());
+
+#ifdef DEBUG
+  if (mContentStartupFinishedTopic.Equals(CONTENT_DOCUMENT_LOADED_TOPIC)) {
+    MOZ_ASSERT(sProcessType == ProcessType::PrivilegedAbout);
+  } else {
+    MOZ_ASSERT(sProcessType != ProcessType::PrivilegedAbout);
+  }
+#endif /* DEBUG */
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  obs->RemoveObserver(this, mContentStartupFinishedTopic.get());
+
+  mSaveTimer = nullptr;
+
+  mStartupFinished = true;
+
+  if (mChildActor) {
+    mChildActor->SendScriptsAndFinalize(mScripts);
+  }
+
+}
+
+bool ScriptPreloader::WillWriteScripts() {
+  return !mDataPrepared && (XRE_IsParentProcess() || mChildActor);
+}
+
+bool ScriptPreloader::Active() const {
+  if (!mCacheInitialized) {
+    return false;
+  }
+
+  if (!mStartupFinished) {
+    return true;
+  }
+
+  if (StaticPrefs::javascript_options_force_preloader_active() &&
+      false) {
+    return true;
+  }
+
+  return false;
+}
+
+Result<nsCOMPtr<nsIFile>, nsresult> ScriptPreloader::GetCacheFile(
+    const nsAString& suffix) {
+  NS_ENSURE_TRUE(mProfD, Err(NS_ERROR_NOT_INITIALIZED));
+
+  nsCOMPtr<nsIFile> cacheFile;
+  MOZ_TRY(mProfD->Clone(getter_AddRefs(cacheFile)));
+
+  MOZ_TRY(cacheFile->AppendNative("startupCache"_ns));
+  (void)cacheFile->Create(nsIFile::DIRECTORY_TYPE, 0777);
+
+  MOZ_TRY(cacheFile->Append(mBaseName + suffix));
+
+  return std::move(cacheFile);
+}
+
+static const uint8_t MAGIC[] = "mozXDRcachev003";
+
+Result<Ok, nsresult> ScriptPreloader::OpenCache() {
+  if (StartupCache::GetIgnoreDiskCache()) {
+    return Err(NS_ERROR_ABORT);
+  }
+
+  MOZ_TRY(NS_GetSpecialDirectory("ProfLDS", getter_AddRefs(mProfD)));
+
+  nsCOMPtr<nsIFile> cacheFile = MOZ_TRY(GetCacheFile(u".bin"_ns));
+
+  bool exists;
+  MOZ_TRY(cacheFile->Exists(&exists));
+  if (exists) {
+    MOZ_TRY(cacheFile->MoveTo(nullptr, mBaseName + u"-current.bin"_ns));
+  } else {
+    MOZ_TRY(cacheFile->SetLeafName(mBaseName + u"-current.bin"_ns));
+    MOZ_TRY(cacheFile->Exists(&exists));
+    if (!exists) {
+      return Err(NS_ERROR_FILE_NOT_FOUND);
+    }
+  }
+
+  MOZ_TRY(mCacheData->init(cacheFile));
+
+  return Ok();
+}
+
+Result<Ok, nsresult> ScriptPreloader::InitCache(const nsAString& basePath) {
+  mCacheInitialized = true;
+  mBaseName = basePath;
+
+  RegisterWeakMemoryReporter(this);
+
+  if (!XRE_IsParentProcess()) {
+    return Ok();
+  }
+
+  AutoSafeJSAPI jsapi;
+  JS::RootedObject scope(jsapi.cx(), xpc::CompilationScope());
+
+  URLPreloader::AutoBeginReading abr;
+
+  MOZ_TRY(OpenCache());
+
+  return InitCacheInternal(scope);
+}
+
+Result<Ok, nsresult> ScriptPreloader::InitCache(
+    const Maybe<ipc::FileDescriptor>& cacheFile, ScriptCacheChild* cacheChild) {
+  MOZ_ASSERT(XRE_IsContentProcess());
+
+  mCacheInitialized = true;
+  mChildActor = cacheChild;
+  sProcessType =
+      GetChildProcessType(dom::ContentChild::GetSingleton()->GetRemoteType());
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  MOZ_RELEASE_ASSERT(obs);
+
+  if (sProcessType == ProcessType::PrivilegedAbout) {
+    mContentStartupFinishedTopic.AssignLiteral(CONTENT_DOCUMENT_LOADED_TOPIC);
+  } else {
+    mContentStartupFinishedTopic = ContentChild::kBecameUntrustedTopic;
+  }
+  obs->AddObserver(this, mContentStartupFinishedTopic.get(), false);
+
+  RegisterWeakMemoryReporter(this);
+
+  auto cleanup = MakeScopeExit([&] {
+    if (cacheChild) {
+      NS_NewTimerWithObserver(getter_AddRefs(mSaveTimer), this,
+                              CHILD_STARTUP_TIMEOUT_MS,
+                              nsITimer::TYPE_ONE_SHOT);
+    }
+  });
+
+  if (cacheFile.isNothing()) {
+    return Ok();
+  }
+
+  MOZ_TRY(mCacheData->init(cacheFile.ref()));
+
+  return InitCacheInternal();
+}
+
+Result<Ok, nsresult> ScriptPreloader::InitCacheInternal(
+    JS::HandleObject scope) {
+  auto size = mCacheData->size();
+
+  uint32_t headerSize;
+  uint32_t crc;
+  if (size < sizeof(MAGIC) + sizeof(headerSize) + sizeof(crc)) {
+    return Err(NS_ERROR_UNEXPECTED);
+  }
+
+  auto data = mCacheData->get<uint8_t>();
+  MOZ_RELEASE_ASSERT(JS::IsTranscodingBytecodeAligned(data.get()));
+
+  auto end = data + size;
+
+  if (memcmp(MAGIC, data.get(), sizeof(MAGIC))) {
+    return Err(NS_ERROR_UNEXPECTED);
+  }
+  data += sizeof(MAGIC);
+
+  headerSize = LittleEndian::readUint32(data.get());
+  data += sizeof(headerSize);
+
+  crc = LittleEndian::readUint32(data.get());
+  data += sizeof(crc);
+
+  if (data + headerSize > end) {
+    return Err(NS_ERROR_UNEXPECTED);
+  }
+
+  if (crc != ComputeCrc32c(~0, data.get(), headerSize)) {
+    return Err(NS_ERROR_UNEXPECTED);
+  }
+
+  {
+    auto cleanup = MakeScopeExit([&]() { mScripts.Clear(); });
+
+    LinkedList<CachedStencil> scripts;
+
+    Range<const uint8_t> header(data, data + headerSize);
+    data += headerSize;
+
+    size_t currentOffset = data - mCacheData->get<uint8_t>();
+    data += JS::AlignTranscodingBytecodeOffset(currentOffset) - currentOffset;
+
+    InputBuffer buf(header);
+
+    size_t offset = 0;
+    while (!buf.finished()) {
+      auto script = MakeUnique<CachedStencil>(*this, buf);
+      MOZ_RELEASE_ASSERT(script);
+
+      auto scriptData = data + script->mOffset;
+      if (!JS::IsTranscodingBytecodeAligned(scriptData.get())) {
+        return Err(NS_ERROR_UNEXPECTED);
+      }
+
+      if (scriptData + script->mSize > end) {
+        return Err(NS_ERROR_UNEXPECTED);
+      }
+
+      if (script->mOffset != offset) {
+        return Err(NS_ERROR_UNEXPECTED);
+      }
+      offset += script->mSize;
+
+      script->mXDRRange.emplace(scriptData, scriptData + script->mSize);
+
+      if (script->mOriginalProcessTypes.contains(CurrentProcessType())) {
+        scripts.insertBack(script.get());
+      } else {
+        script->mReadyToExecute = true;
+      }
+
+      const auto& cachePath = script->mCachePath;
+      mScripts.InsertOrUpdate(cachePath, std::move(script));
+    }
+
+    if (buf.error()) {
+      return Err(NS_ERROR_UNEXPECTED);
+    }
+
+    mDecodingScripts = std::move(scripts);
+    cleanup.release();
+  }
+
+  StartDecodeTask(scope);
+  return Ok();
+}
+
+void ScriptPreloader::PrepareCacheWriteInternal() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  mMonitor.AssertCurrentThreadOwns();
+
+  auto cleanup = MakeScopeExit([&]() {
+    if (mChildCache) {
+      mChildCache->PrepareCacheWrite();
+    }
+  });
+
+  if (mDataPrepared) {
+    return;
+  }
+
+  JS::FrontendContext* fc = JS::NewFrontendContext();
+  if (!fc) {
+    return;
+  }
+
+  bool found = false;
+  for (auto& script : IterHash(mScripts, Match<ScriptStatus::Saved>())) {
+    CachedStencil* childScript =
+        mChildCache ? mChildCache->mScripts.Get(script->mCachePath) : nullptr;
+    if (childScript && !childScript->mProcessTypes.isEmpty()) {
+      childScript->UpdateLoadTime(script->mLoadTime);
+      childScript->mProcessTypes += script->mProcessTypes;
+      script.Remove();
+      continue;
+    }
+
+    if (!(script->mProcessTypes == script->mOriginalProcessTypes)) {
+      found = true;
+    }
+
+    if (!script->mSize && !script->XDREncode(fc)) {
+      script.Remove();
+    }
+  }
+
+  JS::DestroyFrontendContext(fc);
+
+  if (!found) {
+    mSaveComplete = true;
+    return;
+  }
+
+  mDataPrepared = true;
+}
+
+void ScriptPreloader::PrepareCacheWrite() {
+  MonitorAutoLock mal(mMonitor);
+
+  PrepareCacheWriteInternal();
+}
+
+struct CachedStencilRefAndTime {
+  using CachedStencil = ScriptPreloader::CachedStencil;
+  CachedStencil* mStencil;
+  TimeStamp mLoadTime;
+
+  explicit CachedStencilRefAndTime(CachedStencil* aStencil)
+      : mStencil(aStencil), mLoadTime(aStencil->mLoadTime) {}
+
+  struct Comparator {
+    bool Equals(const CachedStencilRefAndTime& a,
+                const CachedStencilRefAndTime& b) const {
+      return a.mLoadTime == b.mLoadTime;
+    }
+
+    bool LessThan(const CachedStencilRefAndTime& a,
+                  const CachedStencilRefAndTime& b) const {
+      return a.mLoadTime < b.mLoadTime;
+    }
+  };
+} JS_HAZ_NON_GC_POINTER;
+
+Result<Ok, nsresult> ScriptPreloader::WriteCache() {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  if (!mDataPrepared && !mSaveComplete) {
+    MonitorAutoUnlock mau(mSaveMonitor.Lock());
+
+    NS_DispatchAndSpinEventLoopUntilComplete(
+        "ScriptPreloader::PrepareCacheWrite"_ns,
+        GetMainThreadSerialEventTarget(),
+        NewRunnableMethod("ScriptPreloader::PrepareCacheWrite", this,
+                          &ScriptPreloader::PrepareCacheWrite));
+  }
+
+  if (mSaveComplete) {
+    return Ok();
+  }
+
+  nsCOMPtr<nsIFile> cacheFile = MOZ_TRY(GetCacheFile(u"-new.bin"_ns));
+
+  bool exists;
+  MOZ_TRY(cacheFile->Exists(&exists));
+  if (exists) {
+    MOZ_TRY(cacheFile->Remove(false));
+  }
+
+  {
+    AutoFDClose raiiFd;
+    MOZ_TRY(cacheFile->OpenNSPRFileDesc(PR_WRONLY | PR_CREATE_FILE, 0644,
+                                        getter_Transfers(raiiFd)));
+    const auto fd = raiiFd.get();
+
+    mMonitor.AssertNotCurrentThreadOwns();
+    MonitorAutoLock mal(mMonitor);
+
+    nsTArray<CachedStencilRefAndTime> scriptRefs;
+    for (auto& script : IterHash(mScripts, Match<ScriptStatus::Saved>())) {
+      scriptRefs.AppendElement(CachedStencilRefAndTime(script));
+    }
+
+    scriptRefs.Sort(CachedStencilRefAndTime::Comparator());
+
+    OutputBuffer buf;
+    size_t offset = 0;
+    for (auto& scriptRef : scriptRefs) {
+      auto* script = scriptRef.mStencil;
+      script->mOffset = offset;
+      MOZ_DIAGNOSTIC_ASSERT(
+          JS::IsTranscodingBytecodeOffsetAligned(script->mOffset));
+      script->Code(buf);
+
+      offset += script->mSize;
+      MOZ_DIAGNOSTIC_ASSERT(
+          JS::IsTranscodingBytecodeOffsetAligned(script->mSize));
+    }
+
+    uint8_t headerSize[4];
+    LittleEndian::writeUint32(headerSize, buf.cursor());
+
+    uint8_t crc[4];
+    LittleEndian::writeUint32(crc, ComputeCrc32c(~0, buf.Get(), buf.cursor()));
+
+    MOZ_TRY(Write(fd, MAGIC, sizeof(MAGIC)));
+    MOZ_TRY(Write(fd, headerSize, sizeof(headerSize)));
+    MOZ_TRY(Write(fd, crc, sizeof(crc)));
+    MOZ_TRY(Write(fd, buf.Get(), buf.cursor()));
+
+    size_t written = sizeof(MAGIC) + sizeof(headerSize) + buf.cursor();
+    size_t padding = JS::AlignTranscodingBytecodeOffset(written) - written;
+    if (padding) {
+      MOZ_TRY(WritePadding(fd, padding));
+      written += padding;
+    }
+
+    for (auto& scriptRef : scriptRefs) {
+      auto* script = scriptRef.mStencil;
+      MOZ_DIAGNOSTIC_ASSERT(JS::IsTranscodingBytecodeOffsetAligned(written));
+      MOZ_TRY(Write(fd, script->Range().begin().get(), script->mSize));
+
+      written += script->mSize;
+      if (script->mStencil && !JS::StencilIsBorrowed(script->mStencil)) {
+        script->FreeData();
+      }
+    }
+  }
+
+  MOZ_TRY(cacheFile->MoveTo(nullptr, mBaseName + u".bin"_ns));
+
+  return Ok();
+}
+
+nsresult ScriptPreloader::GetName(nsACString& aName) {
+  aName.AssignLiteral("ScriptPreloader");
+  return NS_OK;
+}
+
+nsresult ScriptPreloader::Run() {
+  MonitorAutoLock mal(mSaveMonitor.Lock());
+  mSaveMonitor.NoteLockHeld();
+
+  if (!mCacheInvalidated) {
+    mal.Wait(TimeDuration::FromSeconds(3));
+  }
+
+  auto result = URLPreloader::GetSingleton().WriteCache();
+  (void)NS_WARN_IF(result.isErr());
+
+  result = WriteCache();
+  (void)NS_WARN_IF(result.isErr());
+
+  {
+    MonitorAutoLock lock(mChildCache->mSaveMonitor.Lock());
+    result = mChildCache->WriteCache();
+  }
+  (void)NS_WARN_IF(result.isErr());
+
+  NS_DispatchToMainThread(
+      NewRunnableMethod("ScriptPreloader::CacheWriteComplete", this,
+                        &ScriptPreloader::CacheWriteComplete),
+      NS_DISPATCH_NORMAL);
+  return NS_OK;
+}
+
+void ScriptPreloader::CacheWriteComplete() {
+  mSaveThread->AsyncShutdown();
+  mSaveThread = nullptr;
+  mSaveComplete = true;
+
+  nsCOMPtr<nsIAsyncShutdownClient> barrier = GetShutdownBarrier();
+  barrier->RemoveBlocker(this);
+}
+
+void ScriptPreloader::NoteStencil(const nsCString& url,
+                                  const nsCString& cachePath,
+                                  JS::Stencil* stencil, bool isRunOnce) {
+  if (!Active()) {
+    if (isRunOnce) {
+      if (auto script = mScripts.Get(cachePath)) {
+        script->mIsRunOnce = true;
+        script->MaybeDropStencil();
+      }
+    }
+    return;
+  }
+
+  if (cachePath.FindChar('?') >= 0) {
+    return;
+  }
+
+  constexpr auto mochikitPrefix = "chrome://mochikit/"_ns;
+  if (StringHead(url, mochikitPrefix.Length()) == mochikitPrefix) {
+    return;
+  }
+
+  auto* script =
+      mScripts.GetOrInsertNew(cachePath, *this, url, cachePath, stencil);
+  if (isRunOnce) {
+    script->mIsRunOnce = true;
+  }
+
+  if (!script->MaybeDropStencil() && !script->mStencil) {
+    MOZ_ASSERT(stencil);
+    script->mStencil = stencil;
+    script->mReadyToExecute = true;
+  }
+
+  script->UpdateLoadTime(TimeStamp::Now());
+  script->mProcessTypes += CurrentProcessType();
+}
+
+void ScriptPreloader::NoteStencil(const nsCString& url,
+                                  const nsCString& cachePath,
+                                  ProcessType processType,
+                                  nsTArray<uint8_t>&& xdrData,
+                                  TimeStamp loadTime) {
+  if (mDataPrepared) {
+    return;
+  }
+
+  auto* script =
+      mScripts.GetOrInsertNew(cachePath, *this, url, cachePath, nullptr);
+
+  if (!script->HasRange()) {
+    MOZ_ASSERT(!script->HasArray());
+
+    script->mSize = xdrData.Length();
+    script->mXDRData.construct<nsTArray<uint8_t>>(
+        std::forward<nsTArray<uint8_t>>(xdrData));
+
+    auto& data = script->Array();
+    script->mXDRRange.emplace(data.Elements(), data.Length());
+  }
+
+  if (!script->mSize && !script->mStencil) {
+    mScripts.Remove(cachePath);
+    return;
+  }
+
+  script->UpdateLoadTime(loadTime);
+  script->mProcessTypes += processType;
+}
+
+void ScriptPreloader::NoteReceivedAllChildStencilsForProcess(
+    ProcessType aProcessType) {
+  mReceivedChildProcessStencils += aProcessType;
+
+  GetSingleton().StartCacheWriteIfReady();
+}
+
+void ScriptPreloader::FillCompileOptionsForCachedStencil(
+    JS::CompileOptions& options) {
+  options.setNoScriptRval(true);
+
+  options.setSourceIsLazy(true);
+}
+
+void ScriptPreloader::FillDecodeOptionsForCachedStencil(
+    JS::DecodeOptions& options) {
+  options.borrowBuffer = true;
+}
+
+already_AddRefed<JS::Stencil> ScriptPreloader::GetCachedStencil(
+    JSContext* cx, const JS::ReadOnlyDecodeOptions& options,
+    const nsCString& path) {
+  MOZ_RELEASE_ASSERT(
+      !(XRE_IsContentProcess() && !mCacheInitialized),
+      "ScriptPreloader must be initialized before getting cached "
+      "scripts in the content process.");
+
+#ifdef DEBUG
+  MOZ_ASSERT(path.Find("/resource/gre/"_ns) != kNotFound ||
+                 path.Find("/resource/app/"_ns) != kNotFound,
+             "GetCachedStencil should only be called for omni.ja scripts");
+#endif
+
+  if (mChildCache) {
+    RefPtr<JS::Stencil> stencil =
+        mChildCache->GetCachedStencilInternal(cx, options, path);
+    if (stencil) {
+      return stencil.forget();
+    }
+  }
+
+  RefPtr<JS::Stencil> stencil = GetCachedStencilInternal(cx, options, path);
+  return stencil.forget();
+}
+
+already_AddRefed<JS::Stencil> ScriptPreloader::GetCachedStencilInternal(
+    JSContext* cx, const JS::ReadOnlyDecodeOptions& options,
+    const nsCString& path) {
+  auto* cachedScript = mScripts.Get(path);
+  if (cachedScript) {
+    return WaitForCachedStencil(cx, options, cachedScript);
+  }
+  return nullptr;
+}
+
+already_AddRefed<JS::Stencil> ScriptPreloader::WaitForCachedStencil(
+    JSContext* cx, const JS::ReadOnlyDecodeOptions& options,
+    CachedStencil* script) {
+  if (!script->mReadyToExecute) {
+    MOZ_ASSERT(mDecodedStencils);
+
+    if (mDecodedStencils->AvailableRead() > 0) {
+      FinishOffThreadDecode();
+    }
+
+    if (!script->mReadyToExecute) {
+
+      if (script->mSize < MAX_MAINTHREAD_DECODE_SIZE) {
+        LOG(Info, "Script is small enough to recompile on main thread\n");
+
+        script->mReadyToExecute = true;
+      } else {
+        LOG(Info, "Must wait for async script load: %s\n", script->mURL.get());
+        auto start = TimeStamp::Now();
+
+        MonitorAutoLock mal(mMonitor);
+
+        while (!script->mReadyToExecute) {
+          if (mDecodedStencils->AvailableRead() > 0) {
+            FinishOffThreadDecode();
+          } else {
+            MOZ_ASSERT(!mDecodingScripts.isEmpty());
+            mWaitingForDecode = true;
+            mal.Wait();
+            mWaitingForDecode = false;
+          }
+        }
+
+        TimeDuration waited = TimeStamp::Now() - start;
+        LOG(Debug, "Waited %fms\n", waited.ToMilliseconds());
+      }
+    }
+  }
+
+  return script->GetStencil(cx, options);
+}
+
+void ScriptPreloader::onDecodedStencilQueued() {
+  mMonitor.AssertNotCurrentThreadOwns();
+  MonitorAutoLock mal(mMonitor);
+
+  if (mWaitingForDecode) {
+    mal.Notify();
+  }
+
+}
+
+void ScriptPreloader::OnDecodeTaskFinished() {
+  mMonitor.AssertNotCurrentThreadOwns();
+  MonitorAutoLock mal(mMonitor);
+
+  if (mWaitingForDecode) {
+    mal.Notify();
+  } else {
+    NS_DispatchToMainThread(
+        NewRunnableMethod("ScriptPreloader::DoFinishOffThreadDecode", this,
+                          &ScriptPreloader::DoFinishOffThreadDecode));
+  }
+}
+
+void ScriptPreloader::OnDecodeTaskFailed() {
+  OnDecodeTaskFinished();
+}
+
+void ScriptPreloader::FinishPendingParses(MonitorAutoLock& aMal) {
+  mMonitor.AssertCurrentThreadOwns();
+
+  if (!mDecodedStencils) {
+    return;
+  }
+
+  while (!mDecodingScripts.isEmpty()) {
+    if (mDecodedStencils->AvailableRead() > 0) {
+      FinishOffThreadDecode();
+    } else {
+      mWaitingForDecode = true;
+      aMal.Wait();
+      mWaitingForDecode = false;
+    }
+  }
+}
+
+void ScriptPreloader::DoFinishOffThreadDecode() {
+  if (mDecodedStencils && mDecodedStencils->AvailableRead() > 0) {
+    FinishOffThreadDecode();
+  }
+}
+
+void ScriptPreloader::FinishOffThreadDecode() {
+  MOZ_ASSERT(mDecodedStencils);
+
+  while (mDecodedStencils->AvailableRead() > 0) {
+    RefPtr<JS::Stencil> stencil;
+    DebugOnly<int> reads = mDecodedStencils->Dequeue(&stencil, 1);
+    MOZ_ASSERT(reads == 1);
+
+    if (!stencil) {
+      for (CachedStencil* next = mDecodingScripts.getFirst(); next;) {
+        auto* script = next;
+        next = script->getNext();
+
+        script->mReadyToExecute = true;
+        script->remove();
+      }
+
+      break;
+    }
+
+    CachedStencil* script = mDecodingScripts.getFirst();
+    MOZ_ASSERT(script);
+
+    LOG(Debug, "Finished off-thread decode of %s\n", script->mURL.get());
+    script->mStencil = stencil.forget();
+    script->mReadyToExecute = true;
+    script->remove();
+  }
+
+  if (mDecodingScripts.isEmpty()) {
+    mDecodedStencils.reset();
+  }
+}
+
+void ScriptPreloader::StartDecodeTask(JS::HandleObject scope) {
+  auto start = TimeStamp::Now();
+  LOG(Debug, "Off-thread decoding scripts...\n");
+
+  Vector<JS::TranscodeSource> decodingSources;
+
+  size_t size = 0;
+  for (CachedStencil* next = mDecodingScripts.getFirst(); next;) {
+    auto* script = next;
+    next = script->getNext();
+
+    MOZ_ASSERT(script->IsMemMapped());
+
+    if (script->mReadyToExecute) {
+      script->remove();
+      continue;
+    }
+    if (!decodingSources.emplaceBack(script->Range(), script->mURL.get(), 0)) {
+      break;
+    }
+
+    LOG(Debug, "Beginning off-thread decode of script %s (%u bytes)\n",
+        script->mURL.get(), script->mSize);
+
+    size += script->mSize;
+  }
+
+  MOZ_ASSERT(decodingSources.length() == mDecodingScripts.length());
+
+  if (size == 0 && mDecodingScripts.isEmpty()) {
+    return;
+  }
+
+  AutoSafeJSAPI jsapi;
+  JSContext* cx = jsapi.cx();
+  JSAutoRealm ar(cx, scope ? scope : xpc::CompilationScope());
+
+  JS::CompileOptions options(cx);
+  FillCompileOptionsForCachedStencil(options);
+
+  options.borrowBuffer = true;
+  options.usePinnedBytecode = true;
+
+  JS::DecodeOptions decodeOptions(options);
+
+  size_t decodingSourcesLength = decodingSources.length();
+
+  if (!StaticPrefs::javascript_options_parallel_parsing() ||
+      !StartDecodeTask(decodeOptions, std::move(decodingSources))) {
+    LOG(Info, "Can't decode %lu bytes of scripts off-thread",
+        (unsigned long)size);
+    for (auto* script : mDecodingScripts) {
+      script->mReadyToExecute = true;
+    }
+    return;
+  }
+
+  LOG(Debug, "Initialized decoding of %u scripts (%u bytes) in %fms\n",
+      (unsigned)decodingSourcesLength, (unsigned)size,
+      (TimeStamp::Now() - start).ToMilliseconds());
+}
+
+bool ScriptPreloader::StartDecodeTask(
+    const JS::ReadOnlyDecodeOptions& decodeOptions,
+    Vector<JS::TranscodeSource>&& decodingSources) {
+  mDecodedStencils.emplace(decodingSources.length());
+  MOZ_ASSERT(mDecodedStencils);
+
+  nsCOMPtr<nsIRunnable> task =
+      new DecodeTask(this, decodeOptions, std::move(decodingSources));
+
+  nsresult rv = NS_DispatchBackgroundTask(task.forget());
+
+  return NS_SUCCEEDED(rv);
+}
+
+NS_IMETHODIMP ScriptPreloader::DecodeTask::Run() {
+  auto failure = [&]() {
+    RefPtr<JS::Stencil> stencil;
+    DebugOnly<int> writes = mPreloader->mDecodedStencils->Enqueue(stencil);
+    MOZ_ASSERT(writes == 1);
+    mPreloader->OnDecodeTaskFailed();
+  };
+
+  JS::FrontendContext* fc = JS::NewFrontendContext();
+  if (!fc) {
+    failure();
+    return NS_OK;
+  }
+
+  auto cleanup = MakeScopeExit([&]() { JS::DestroyFrontendContext(fc); });
+
+  size_t stackSize = TaskController::GetThreadStackSize();
+  JS::SetNativeStackQuota(fc, JS::ThreadStackQuotaForSize(stackSize));
+
+  size_t remaining = mDecodingSources.length();
+  for (auto& source : mDecodingSources) {
+    RefPtr<JS::Stencil> stencil;
+    auto result = JS::DecodeStencil(fc, mDecodeOptions, source.range,
+                                    getter_AddRefs(stencil));
+    if (result != JS::TranscodeResult::Ok) {
+      failure();
+      return NS_OK;
+    }
+
+    DebugOnly<int> writes = mPreloader->mDecodedStencils->Enqueue(stencil);
+    MOZ_ASSERT(writes == 1);
+
+    remaining--;
+    if (remaining) {
+      mPreloader->onDecodedStencilQueued();
+    }
+  }
+
+  mPreloader->OnDecodeTaskFinished();
+  return NS_OK;
+}
+
+ScriptPreloader::CachedStencil::CachedStencil(ScriptPreloader& cache,
+                                              InputBuffer& buf)
+    : mCache(cache) {
+  Code(buf);
+
+  mOriginalProcessTypes = mProcessTypes;
+  mProcessTypes = {};
+}
+
+bool ScriptPreloader::CachedStencil::XDREncode(JS::FrontendContext* aFc) {
+  auto cleanup = MakeScopeExit([&]() { MaybeDropStencil(); });
+
+  mXDRData.construct<JS::TranscodeBuffer>();
+
+  JS::TranscodeResult code = JS::EncodeStencil(aFc, mStencil, Buffer());
+
+  if (code == JS::TranscodeResult::Ok) {
+    mXDRRange.emplace(Buffer().begin(), Buffer().length());
+    mSize = Range().length();
+    return true;
+  }
+  mXDRData.destroy();
+  JS::ClearFrontendErrors(aFc);
+  return false;
+}
+
+already_AddRefed<JS::Stencil> ScriptPreloader::CachedStencil::GetStencil(
+    JSContext* cx, const JS::ReadOnlyDecodeOptions& options) {
+  MOZ_ASSERT(mReadyToExecute);
+  if (mStencil) {
+    return do_AddRef(mStencil);
+  }
+
+  if (!HasRange()) {
+    return nullptr;
+  }
+
+
+  auto start = TimeStamp::Now();
+  LOG(Info, "Decoding stencil %s on main thread...\n", mURL.get());
+
+  RefPtr<JS::Stencil> stencil;
+  if (JS::DecodeStencil(cx, options, Range(), getter_AddRefs(stencil)) ==
+      JS::TranscodeResult::Ok) {
+    mCache.mMonitor.AssertNotCurrentThreadOwns();
+    MonitorAutoLock mal(mCache.mMonitor);
+
+    mStencil = stencil.forget();
+
+    if (mCache.mSaveComplete) {
+      if (!JS::StencilIsBorrowed(mStencil)) {
+        FreeData();
+      }
+    }
+  }
+
+  LOG(Debug, "Finished decoding in %fms",
+      (TimeStamp::Now() - start).ToMilliseconds());
+
+  return do_AddRef(mStencil);
+}
+
+
+nsresult ScriptPreloader::GetName(nsAString& aName) {
+  aName.AssignLiteral(u"ScriptPreloader: Saving bytecode cache");
+  return NS_OK;
+}
+
+nsresult ScriptPreloader::GetState(nsIPropertyBag** aState) {
+  *aState = nullptr;
+  return NS_OK;
+}
+
+nsresult ScriptPreloader::BlockShutdown(
+    nsIAsyncShutdownClient* aBarrierClient) {
+  mSaveMonitor.Lock().NotifyAll();
+  return NS_OK;
+}
+
+already_AddRefed<nsIAsyncShutdownClient> ScriptPreloader::GetShutdownBarrier() {
+  nsCOMPtr<nsIAsyncShutdownService> svc = components::AsyncShutdown::Service();
+  MOZ_RELEASE_ASSERT(svc);
+
+  nsCOMPtr<nsIAsyncShutdownClient> barrier;
+  (void)svc->GetXpcomWillShutdown(getter_AddRefs(barrier));
+  MOZ_RELEASE_ASSERT(barrier);
+
+  return barrier.forget();
+}
+
+NS_IMPL_ISUPPORTS(ScriptPreloader, nsIObserver, nsIRunnable, nsIMemoryReporter,
+                  nsINamed, nsIAsyncShutdownBlocker)
+
+#undef LOG
+
+}  

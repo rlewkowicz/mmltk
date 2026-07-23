@@ -1,0 +1,321 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsComputedDOMStyle_h_
+#define nsComputedDOMStyle_h_
+
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/PseudoStyleType.h"
+#include "mozilla/WritingModes.h"
+#include "mozilla/gfx/Types.h"
+#include "nsColor.h"
+#include "nsCoord.h"
+#include "nsDOMCSSDeclaration.h"
+#include "nsStubMutationObserver.h"
+#include "nsStyleStruct.h"
+#include "nsStyleStructList.h"
+#include "nscore.h"
+
+#include "mozilla/dom/Element.h"
+
+namespace mozilla {
+enum class FlushType : uint8_t;
+
+namespace dom {
+class DocGroup;
+class Element;
+}  
+class PresShell;
+struct ComputedGridTrackInfo;
+}  
+
+struct ComputedStyleMap;
+struct nsCSSKTableEntry;
+class nsIFrame;
+class nsDOMCSSValueList;
+struct nsMargin;
+class nsROCSSPrimitiveValue;
+class nsStyleGradient;
+
+class nsComputedDOMStyle final : public nsDOMCSSDeclaration,
+                                 public nsStubMutationObserver {
+ private:
+  template <typename T>
+  using Span = mozilla::Span<T>;
+  using KTableEntry = nsCSSKTableEntry;
+  using CSSValue = mozilla::dom::CSSValue;
+  using StyleGeometryBox = mozilla::StyleGeometryBox;
+  using Element = mozilla::dom::Element;
+  using Document = mozilla::dom::Document;
+  using PseudoStyleRequest = mozilla::PseudoStyleRequest;
+  using LengthPercentage = mozilla::LengthPercentage;
+  using LengthPercentageOrAuto = mozilla::LengthPercentageOrAuto;
+  using ComputedStyle = mozilla::ComputedStyle;
+
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_SKIPPABLE_WRAPPERCACHE_CLASS_AMBIGUOUS(
+      nsComputedDOMStyle, nsICSSDeclaration)
+
+  NS_DECL_NSIDOMCSSSTYLEDECLARATION_HELPER
+
+  void GetPropertyValue(const NonCustomCSSPropertyId aPropId,
+                        nsACString& aValue) override;
+  void SetPropertyValue(const NonCustomCSSPropertyId aPropId,
+                        const nsACString& aValue,
+                        nsIPrincipal* aSubjectPrincipal,
+                        mozilla::ErrorResult& aRv) override;
+
+  void IndexedGetter(uint32_t aIndex, bool& aFound,
+                     nsACString& aPropName) final;
+
+  enum class StyleType : uint8_t {
+    DefaultOnly,  
+    All           
+  };
+
+  enum class AlwaysReturnEmptyStyle : bool { No, Yes };
+
+  nsComputedDOMStyle(Element*, PseudoStyleRequest&&, Document*, StyleType,
+                     AlwaysReturnEmptyStyle = AlwaysReturnEmptyStyle::No);
+
+  nsINode* GetAssociatedNode() const override { return mElement; }
+  nsINode* GetParentObject() const override { return mElement; }
+
+  static already_AddRefed<const ComputedStyle> GetComputedStyle(
+      Element* aElement, const PseudoStyleRequest& aType = {},
+      StyleType = StyleType::All);
+
+  static already_AddRefed<const ComputedStyle> GetComputedStyleNoFlush(
+      const Element* aElement, const PseudoStyleRequest& aPseudo = {},
+      StyleType aStyleType = StyleType::All);
+
+  static already_AddRefed<const ComputedStyle>
+  GetUnanimatedComputedStyleNoFlush(Element*, const PseudoStyleRequest&);
+
+  void SetExposeVisitedStyle(bool aExpose) {
+    NS_ASSERTION(aExpose != mExposeVisitedStyle, "should always be changing");
+    mExposeVisitedStyle = aExpose;
+  }
+
+  float UsedFontSize() final;
+
+  static uint32_t NonCustomPropertyCount();
+  static NonCustomCSSPropertyId NonCustomPropertyAt(uint32_t);
+  static bool HasNonCustomProperty(NonCustomCSSPropertyId);
+
+  void GetCSSImageURLs(const nsACString& aPropertyName,
+                       nsTArray<nsCString>& aImageURLs,
+                       mozilla::ErrorResult& aRv) final;
+
+  Block* GetOrCreateCSSDeclaration(Operation aOperation,
+                                   Block** aCreated) final;
+  virtual nsresult SetCSSDeclaration(Block*,
+                                     mozilla::MutationClosureData*) override;
+  virtual mozilla::dom::Document* DocToUpdate() final;
+
+  nsDOMCSSDeclaration::ParsingEnvironment GetParsingEnvironment(
+      nsIPrincipal* aSubjectPrincipal) const final;
+
+  static already_AddRefed<nsROCSSPrimitiveValue> MatrixToCSSValue(
+      const mozilla::gfx::Matrix4x4& aMatrix);
+
+  static void RegisterPrefChangeCallbacks();
+  static void UnregisterPrefChangeCallbacks();
+
+  NS_DECL_NSIMUTATIONOBSERVER_PARENTCHAINCHANGED
+
+ private:
+  already_AddRefed<nsROCSSPrimitiveValue> AppUnitsToCSSValue(nscoord);
+  already_AddRefed<nsROCSSPrimitiveValue> PixelsToCSSValue(float);
+  void SetValueToPixels(nsROCSSPrimitiveValue*, float);
+
+  void GetPropertyValue(const NonCustomCSSPropertyId aPropId,
+                        const nsACString& aMaybeCustomPropertyNme,
+                        nsACString& aValue);
+  using nsDOMCSSDeclaration::GetPropertyValue;
+
+  virtual ~nsComputedDOMStyle();
+
+  void AssertFlushedPendingReflows() {
+    NS_ASSERTION(mFlushedPendingReflows,
+                 "property getter should have been marked layout-dependent");
+  }
+
+  nsMargin GetAdjustedValuesForBoxSizing();
+
+  void UpdateCurrentStyleSources(NonCustomCSSPropertyId);
+  void ClearCurrentStyleSources();
+
+  void ClearComputedStyle();
+  void SetResolvedComputedStyle(RefPtr<const ComputedStyle>,
+                                uint64_t aGeneration);
+  void SetFrameComputedStyle(RefPtr<const ComputedStyle>, uint64_t aGeneration);
+
+  static already_AddRefed<const ComputedStyle> DoGetComputedStyleNoFlush(
+      const Element*, const PseudoStyleRequest&, mozilla::PresShell*,
+      StyleType);
+
+#define COMPUTED_STYLE_ACCESSOR(name_)         \
+  const nsStyle##name_* Style##name_() const { \
+    return mComputedStyle->Style##name_();     \
+  }
+  FOR_EACH_STYLE_STRUCT(COMPUTED_STYLE_ACCESSOR, COMPUTED_STYLE_ACCESSOR)
+#undef COMPUTED_STYLE_ACCESSOR
+
+  typedef bool (nsComputedDOMStyle::*PercentageBaseGetter)(nscoord&);
+
+  already_AddRefed<CSSValue> GetOffsetWidthFor(mozilla::Side);
+  already_AddRefed<CSSValue> GetAbsoluteOffset(mozilla::Side);
+  nscoord GetUsedAbsoluteOffset(mozilla::Side);
+  already_AddRefed<CSSValue> GetNonStaticPositionOffset(
+      mozilla::Side aSide, bool aResolveAuto, PercentageBaseGetter aWidthGetter,
+      PercentageBaseGetter aHeightGetter);
+
+  already_AddRefed<CSSValue> GetStaticOffset(mozilla::Side aSide);
+
+  already_AddRefed<CSSValue> GetPaddingWidthFor(mozilla::Side aSide);
+
+  already_AddRefed<CSSValue> GetMarginFor(mozilla::Side aSide);
+
+  already_AddRefed<CSSValue> GetTransformValue(const mozilla::StyleTransform&);
+
+  already_AddRefed<nsROCSSPrimitiveValue> GetGridTrackSize(
+      const mozilla::StyleTrackSize&);
+  already_AddRefed<nsROCSSPrimitiveValue> GetGridTrackBreadth(
+      const mozilla::StyleTrackBreadth&);
+  void SetValueToTrackBreadth(nsROCSSPrimitiveValue*,
+                              const mozilla::StyleTrackBreadth&);
+  already_AddRefed<CSSValue> GetGridTemplateColumnsRows(
+      const mozilla::StyleGridTemplateComponent& aTrackList,
+      const mozilla::ComputedGridTrackInfo& aTrackInfo);
+
+  bool GetLineHeightCoord(nscoord& aCoord);
+
+  bool ShouldHonorMinSizeAutoInAxis(mozilla::PhysicalAxis aAxis);
+
+
+
+  already_AddRefed<CSSValue> DoGetWidth();
+  already_AddRefed<CSSValue> DoGetHeight();
+  already_AddRefed<CSSValue> DoGetMaxHeight();
+  already_AddRefed<CSSValue> DoGetMaxWidth();
+  already_AddRefed<CSSValue> DoGetMinHeight();
+  already_AddRefed<CSSValue> DoGetMinWidth();
+  already_AddRefed<CSSValue> DoGetLeft();
+  already_AddRefed<CSSValue> DoGetTop();
+  already_AddRefed<CSSValue> DoGetRight();
+  already_AddRefed<CSSValue> DoGetBottom();
+
+  already_AddRefed<CSSValue> DoGetMozOsxFontSmoothing();
+
+  already_AddRefed<CSSValue> DoGetGridTemplateColumns();
+  already_AddRefed<CSSValue> DoGetGridTemplateRows();
+
+  already_AddRefed<CSSValue> DoGetImageLayerPosition(
+      const nsStyleImageLayers& aLayers);
+
+  already_AddRefed<CSSValue> DoGetPaddingTop();
+  already_AddRefed<CSSValue> DoGetPaddingBottom();
+  already_AddRefed<CSSValue> DoGetPaddingLeft();
+  already_AddRefed<CSSValue> DoGetPaddingRight();
+
+  already_AddRefed<CSSValue> DoGetMarginTop();
+  already_AddRefed<CSSValue> DoGetMarginBottom();
+  already_AddRefed<CSSValue> DoGetMarginLeft();
+  already_AddRefed<CSSValue> DoGetMarginRight();
+
+  already_AddRefed<CSSValue> DoGetTransform();
+  already_AddRefed<CSSValue> DoGetWebkitTransform();
+  already_AddRefed<CSSValue> DoGetTransformOrigin();
+  already_AddRefed<CSSValue> DoGetPerspectiveOrigin();
+
+  already_AddRefed<CSSValue> DummyGetter();
+
+  void SetValueToPosition(const mozilla::Position& aPosition,
+                          nsDOMCSSValueList* aValueList);
+
+  void SetValueFromFitContentFunction(nsROCSSPrimitiveValue* aValue,
+                                      const mozilla::LengthPercentage&);
+
+  void SetValueToSize(nsROCSSPrimitiveValue* aValue, const AnchorResolvedSize&);
+
+  void SetValueToLengthPercentageOrAuto(nsROCSSPrimitiveValue* aValue,
+                                        const LengthPercentageOrAuto&,
+                                        bool aClampNegativeCalc);
+  void SetValueToMargin(nsROCSSPrimitiveValue* aValue,
+                        const mozilla::StyleMargin&);
+
+  void SetValueToLengthPercentage(nsROCSSPrimitiveValue* aValue,
+                                  const LengthPercentage&,
+                                  bool aClampNegativeCalc);
+
+  void SetValueToMaxSize(nsROCSSPrimitiveValue* aValue,
+                         const AnchorResolvedMaxSize&);
+
+  bool GetCBContentWidth(nscoord& aWidth);
+  bool GetCBContentHeight(nscoord& aHeight);
+  bool GetCBPaddingRectWidth(nscoord& aWidth);
+  bool GetCBPaddingRectHeight(nscoord& aHeight);
+  bool GetScrollFrameContentWidth(nscoord& aWidth);
+  bool GetScrollFrameContentHeight(nscoord& aHeight);
+  bool GetFrameBorderRectWidth(nscoord& aWidth);
+  bool GetFrameBorderRectHeight(nscoord& aHeight);
+
+  bool NeedsToFlushStyle(NonCustomCSSPropertyId) const;
+  bool NeedsToFlushLayout(NonCustomCSSPropertyId) const;
+  bool NeedsToFlushLayoutForContainerQuery() const;
+  void Flush(Document&, mozilla::FlushType);
+  nsIFrame* GetOuterFrame() const;
+
+  static ComputedStyleMap* GetComputedStyleMap();
+
+  mozilla::WeakPtr<mozilla::dom::Document> mDocumentWeak;
+  RefPtr<Element> mElement;
+
+  RefPtr<const ComputedStyle> mComputedStyle;
+
+  nsIFrame* mOuterFrame;
+  nsIFrame* mInnerFrame;
+  mozilla::PresShell* mPresShell;
+
+  PseudoStyleRequest mPseudo;
+
+  StyleType mStyleType;
+
+  AlwaysReturnEmptyStyle mAlwaysReturnEmpty;
+
+  uint64_t mComputedStyleGeneration = 0;
+
+  uint32_t mPresShellId = 0;
+
+  bool mExposeVisitedStyle = false;
+
+  bool mResolvedComputedStyle = false;
+
+#ifdef DEBUG
+  bool mFlushedPendingReflows = false;
+#endif
+
+  friend struct ComputedStyleMap;
+  friend AnchorPosResolutionParams AnchorPosResolutionParams::From(
+      const nsComputedDOMStyle*);
+
+  bool HasLonghandProperty(const nsACString& aMaybeCustomPropertyName) final;
+};
+
+already_AddRefed<nsComputedDOMStyle> NS_NewComputedDOMStyle(
+    mozilla::dom::Element*, const nsAString& aPseudoElt,
+    mozilla::dom::Document*, nsComputedDOMStyle::StyleType,
+    mozilla::ErrorResult&);
+
+inline AnchorPosResolutionParams AnchorPosResolutionParams::From(
+    const nsComputedDOMStyle* aComputedDOMStyle) {
+  AutoResolutionOverrideParams overrides{aComputedDOMStyle->mOuterFrame};
+  return {aComputedDOMStyle->mOuterFrame,
+          aComputedDOMStyle->StyleDisplay()->mPosition, nullptr, overrides};
+}
+
+#endif /* nsComputedDOMStyle_h_ */

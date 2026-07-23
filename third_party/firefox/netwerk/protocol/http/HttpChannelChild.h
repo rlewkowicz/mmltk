@@ -1,0 +1,392 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_HttpChannelChild_h
+#define mozilla_net_HttpChannelChild_h
+
+#include "mozilla/Mutex.h"
+#include "mozilla/StaticPrefsBase.h"
+#include "mozilla/net/HttpBaseChannel.h"
+#include "mozilla/net/NeckoTargetHolder.h"
+#include "mozilla/net/PHttpChannelChild.h"
+#include "mozilla/net/ChannelEventQueue.h"
+
+#include "nsIStreamListener.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsIProgressEventSink.h"
+#include "nsICacheEntry.h"
+#include "nsICacheInfoChannel.h"
+#include "nsIResumableChannel.h"
+#include "nsIProxiedChannel.h"
+#include "nsIAsyncVerifyRedirectCallback.h"
+#include "nsIChildChannel.h"
+#include "nsIHttpChannelChild.h"
+#include "nsIMultiPartChannel.h"
+#include "nsIThreadRetargetableRequest.h"
+#include "mozilla/net/DNS.h"
+
+class nsIEventTarget;
+class nsIInterceptedBodyCallback;
+class nsISerialEventTarget;
+class nsITransportSecurityInfo;
+class nsInputStreamPump;
+
+#define HTTP_CHANNEL_CHILD_IID \
+  {0x321bd99e, 0x2242, 0x4dc6, {0xbb, 0xec, 0xd5, 0x06, 0x29, 0x7c, 0x39, 0x83}}
+
+namespace mozilla::net {
+
+class HttpBackgroundChannelChild;
+
+class HttpChannelChild final : public PHttpChannelChild,
+                               public HttpBaseChannel,
+                               public HttpAsyncAborter<HttpChannelChild>,
+                               public nsICacheInfoChannel,
+                               public nsIProxiedChannel,
+                               public nsIAsyncVerifyRedirectCallback,
+                               public nsIChildChannel,
+                               public nsIHttpChannelChild,
+                               public nsIMultiPartChannel,
+                               public nsIThreadRetargetableRequest,
+                               public NeckoTargetHolder {
+  virtual ~HttpChannelChild();
+
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSICACHEINFOCHANNEL
+  NS_DECL_NSIPROXIEDCHANNEL
+  NS_DECL_NSIASYNCVERIFYREDIRECTCALLBACK
+  NS_DECL_NSICHILDCHANNEL
+  NS_DECL_NSIHTTPCHANNELCHILD
+  NS_DECL_NSIMULTIPARTCHANNEL
+  NS_DECL_NSITHREADRETARGETABLEREQUEST
+  NS_INLINE_DECL_STATIC_IID(HTTP_CHANNEL_CHILD_IID)
+
+  HttpChannelChild();
+
+  NS_IMETHOD SetCanceledReason(const nsACString& aReason) override;
+  NS_IMETHOD GetCanceledReason(nsACString& aReason) override;
+  NS_IMETHOD CancelWithReason(nsresult status,
+                              const nsACString& reason) override;
+  NS_IMETHOD Cancel(nsresult status) override;
+  NS_IMETHOD Suspend() override;
+  NS_IMETHOD Resume() override;
+  NS_IMETHOD GetSecurityInfo(nsITransportSecurityInfo** aSecurityInfo) override;
+  NS_IMETHOD AsyncOpen(nsIStreamListener* aListener) override;
+  NS_IMETHOD GetDecompressDictionary(
+      DictionaryCacheEntry** aDictionary) override {
+    *aDictionary = nullptr;
+    return NS_OK;
+  }
+  NS_IMETHOD SetDecompressDictionary(
+      DictionaryCacheEntry* aDictionary) override {
+    return NS_OK;
+  }
+
+  NS_IMETHOD SetRequestHeader(const nsACString& aHeader,
+                              const nsACString& aValue, bool aMerge) override;
+  NS_IMETHOD SetEmptyRequestHeader(const nsACString& aHeader) override;
+  NS_IMETHOD RedirectTo(nsIURI* newURI) override;
+  NS_IMETHOD TransparentRedirectTo(nsIURI* newURI) override;
+  NS_IMETHOD UpgradeToSecure() override;
+  NS_IMETHOD GetProtocolVersion(nsACString& aProtocolVersion) override;
+  void DoDiagnosticAssertWhenOnStopNotCalledOnDestroy() override;
+  NS_IMETHOD GetIsAuthChannel(bool* aIsAuthChannel) override;
+  NS_IMETHOD SetEarlyHintObserver(nsIEarlyHintObserver* aObserver) override;
+  NS_IMETHOD SetWebTransportSessionEventListener(
+      WebTransportSessionEventListener* aListener) override;
+
+  NS_IMETHOD SetResponseOverride(
+      nsIReplacedHttpResponse* aReplacedHttpResponse) override {
+    return NS_OK;
+  }
+
+  NS_IMETHOD SetResponseStatus(uint32_t aStatus,
+                               const nsACString& aStatusText) override {
+    return NS_OK;
+  }
+  NS_IMETHOD SetPriority(int32_t value) override;
+  NS_IMETHOD SetClassFlags(uint32_t inFlags) override;
+  NS_IMETHOD AddClassFlags(uint32_t inFlags) override;
+  NS_IMETHOD ClearClassFlags(uint32_t inFlags) override;
+  NS_IMETHOD SetClassOfService(ClassOfService inCos) override;
+  NS_IMETHOD SetIncremental(bool inIncremental) override;
+  NS_IMETHOD ResumeAt(uint64_t startPos, const nsACString& entityID) override;
+
+  nsresult SetReferrerHeader(const nsACString& aReferrer,
+                             bool aRespectBeforeConnect) override;
+
+  [[nodiscard]] bool IsSuspended();
+
+  void OnBackgroundChildReady(HttpBackgroundChannelChild* aBgChild);
+  void OnBackgroundChildDestroyed(HttpBackgroundChannelChild* aBgChild);
+
+  nsresult CrossProcessRedirectFinished(nsresult aStatus);
+
+  const char* GetCallStack() const {
+    return mCallStack ? mCallStack.get() : nullptr;
+  }
+
+ protected:
+  mozilla::ipc::IPCResult RecvOnStartRequestSent() override;
+  mozilla::ipc::IPCResult RecvFailedAsyncOpen(const nsresult& status) override;
+  mozilla::ipc::IPCResult RecvRedirect1Begin(
+      const uint32_t& registrarId, nsIURI* newOriginalURI,
+      const uint32_t& newLoadFlags, const uint32_t& redirectFlags,
+      const ParentLoadInfoForwarderArgs& loadInfoForwarder,
+      nsHttpResponseHead&& responseHead, nsITransportSecurityInfo* securityInfo,
+      const uint64_t& channelId, const NetAddr& oldPeerAddr,
+      const ResourceTimingStructArgs& aTiming) override;
+  mozilla::ipc::IPCResult RecvRedirect3Complete() override;
+  mozilla::ipc::IPCResult RecvRedirectFailed(const nsresult& status) override;
+  mozilla::ipc::IPCResult RecvDeleteSelf() override;
+
+  mozilla::ipc::IPCResult RecvReportSecurityMessage(
+      const nsAString& messageTag, const nsAString& messageCategory) override;
+
+  mozilla::ipc::IPCResult RecvReportLNAToConsole(
+      const NetAddr& aPeerAddr, const nsACString& aMessageType,
+      const nsACString& aPromptAction,
+      const nsACString& aTopLevelSite) override;
+
+  mozilla::ipc::IPCResult RecvSetPriority(const int16_t& aPriority) override;
+
+  mozilla::ipc::IPCResult RecvOriginalCacheInputStreamAvailable(
+      const Maybe<IPCStream>& aStream) override;
+
+  virtual void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  virtual void DoNotifyListenerCleanup() override;
+
+  virtual void DoAsyncAbort(nsresult aStatus) override;
+
+  nsresult AsyncCall(
+      void (HttpChannelChild::*funcPtr)(),
+      nsRunnableMethod<HttpChannelChild>** retval = nullptr) override {
+    return AsyncCallImpl(funcPtr, retval);
+  };
+
+  already_AddRefed<nsISerialEventTarget> GetNeckoTarget() override;
+
+  virtual mozilla::ipc::IPCResult RecvLogBlockedCORSRequest(
+      const nsAString& aMessage, const nsACString& aCategory,
+      const bool& aIsWarning) override;
+  NS_IMETHOD LogBlockedCORSRequest(const nsAString& aMessage,
+                                   const nsACString& aCategory,
+                                   bool aIsWarning = false) override;
+
+  virtual mozilla::ipc::IPCResult RecvLogMimeTypeMismatch(
+      const nsACString& aMessageName, const bool& aWarning,
+      const nsAString& aURL, const nsAString& aContentType) override;
+  NS_IMETHOD LogMimeTypeMismatch(const nsACString& aMessageName, bool aWarning,
+                                 const nsAString& aURL,
+                                 const nsAString& aContentType) override;
+
+  virtual void ExplicitSetUploadStreamLength(
+      uint64_t aContentLength, bool aSetContentLengthHeader) override;
+
+ private:
+  nsresult AsyncOpenInternal(nsIStreamListener* aListener);
+
+  nsresult AsyncCallImpl(void (HttpChannelChild::*funcPtr)(),
+                         nsRunnableMethod<HttpChannelChild>** retval);
+
+  void SetEventTarget();
+
+  already_AddRefed<nsIEventTarget> GetODATarget();
+
+  [[nodiscard]] nsresult ContinueAsyncOpen();
+  void ProcessOnStartRequest(const nsHttpResponseHead& aResponseHead,
+                             const bool& aUseResponseHead,
+                             const nsHttpHeaderArray& aRequestHeaders,
+                             const HttpChannelOnStartRequestArgs& aArgs,
+                             const HttpChannelAltDataStream& aAltData,
+                             const TimeStamp& aOnStartRequestStartTime);
+
+  void ProcessOnTransportAndData(const nsresult& aChannelStatus,
+                                 const nsresult& aTransportStatus,
+                                 const uint64_t& aOffset,
+                                 const nsACString& aData,
+                                 const TimeStamp& aOnDataAvailableStartTime);
+  void ProcessOnStopRequest(const nsresult& aChannelStatus,
+                            const ResourceTimingStructArgs& aTiming,
+                            const nsHttpHeaderArray& aResponseTrailers,
+                            nsTArray<ConsoleReportCollected>&& aConsoleReports,
+                            bool aFromSocketProcess,
+                            const TimeStamp& aOnStopRequestStartTime);
+  void ProcessOnConsoleReport(
+      nsTArray<ConsoleReportCollected>&& aConsoleReports);
+
+  void ProcessOnAfterLastPart(const nsresult& aStatus);
+  void ProcessOnProgress(const int64_t& aProgress, const int64_t& aProgressMax);
+
+  void ProcessOnStatus(const nsresult& aStatus);
+
+  bool NeedToReportBytesRead();
+  int32_t mUnreportBytesRead = 0;
+
+  void DoOnConsoleReport(nsTArray<ConsoleReportCollected>&& aConsoleReports);
+  void DoOnStartRequest(nsIRequest* aRequest);
+  void DoOnStatus(nsIRequest* aRequest, nsresult status);
+  void DoOnProgress(nsIRequest* aRequest, int64_t progress,
+                    int64_t progressMax);
+  void DoOnDataAvailable(nsIRequest* aRequest, nsIInputStream* aStream,
+                         uint64_t offset, uint32_t count);
+  void DoPreOnStopRequest(nsresult aStatus);
+  void DoOnStopRequest(nsIRequest* aRequest, nsresult aChannelStatus);
+  void ContinueOnStopRequest();
+
+  void TrySendDeletingChannel();
+
+  void CancelOnMainThread(nsresult aRv, const nsACString& aReason);
+
+  nsresult MaybeLogCOEPError(nsresult aStatus);
+
+  void RetargetDeliveryToImpl(nsISerialEventTarget* aNewTarget,
+                              MutexAutoLock& aLockRef);
+
+ private:
+  nsCOMPtr<nsIChildChannel> mRedirectChannelChild;
+
+  void ReleaseMainThreadOnlyReferences();
+
+ private:
+  nsCString mProtocolVersion;
+
+  RequestHeaderTuples mClientSetRequestHeaders;
+  RefPtr<ChannelEventQueue> mEventQ;
+
+  nsCOMPtr<nsIInputStreamReceiver> mOriginalInputStreamReceiver;
+  nsCOMPtr<nsIInputStream> mAltDataInputStream;
+
+  Mutex mBgChildMutex{"HttpChannelChild::BgChildMutex"};
+
+  RefPtr<HttpBackgroundChannelChild> mBgChild MOZ_GUARDED_BY(mBgChildMutex);
+
+  nsCOMPtr<nsIRunnable> mBgInitFailCallback MOZ_GUARDED_BY(mBgChildMutex);
+
+  void CleanupBackgroundChannel();
+
+  nsCOMPtr<nsISerialEventTarget> mODATarget MOZ_GUARDED_BY(mEventTargetMutex);
+  Atomic<bool, mozilla::Relaxed> mGotDataAvailable{false};
+  Mutex mEventTargetMutex{"HttpChannelChild::EventTargetMutex"};
+
+  TimeStamp mLastStatusReported;
+
+  uint64_t mCacheEntryId{0};
+  nsICacheInfoChannel::CacheDisposition mCacheDisposition{
+      nsICacheInfoChannel::kCacheUnknown};
+
+  uint32_t mCacheKey{0};
+  int32_t mCacheFetchCount{0};
+  uint32_t mCacheExpirationTime{
+      static_cast<uint32_t>(nsICacheEntry::NO_EXPIRATION_TIME)};
+
+  Maybe<uint32_t> mMultiPartID;
+
+  Atomic<bool> mDeletingChannelSent{false};
+
+  Atomic<bool, SequentiallyConsistent> mIsFromCache{false};
+  Atomic<bool, SequentiallyConsistent> mCacheNeedToReportBytesReadInitialized{
+      false};
+  Atomic<bool, SequentiallyConsistent> mNeedToReportBytesRead{true};
+  Atomic<uint32_t, mozilla::Relaxed> mOnProgressEventSent{false};
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  bool mDoDiagnosticAssertWhenOnStopNotCalledOnDestroy = false;
+  bool mAsyncOpenSucceeded = false;
+  bool mSuccesfullyRedirected = false;
+  bool mRemoteChannelExistedAtCancel = false;
+  bool mEverHadBgChildAtAsyncOpen = false;
+  bool mEverHadBgChildAtConnectParent = false;
+  bool mCreateBackgroundChannelFailed = false;
+  bool mBgInitFailCallbackTriggered = false;
+  bool mCanSendAtCancel = false;
+  enum BckChildQueueStatus {
+    BCKCHILD_UNKNOWN,
+    BCKCHILD_EMPTY,
+    BCKCHILD_NON_EMPTY
+  };
+  Atomic<BckChildQueueStatus> mBackgroundChildQueueFinalState{BCKCHILD_UNKNOWN};
+  Maybe<ActorDestroyReason> mActorDestroyReason;
+#endif
+
+  uint8_t mCacheEntryAvailable : 1;
+  uint8_t mAltDataCacheEntryAvailable : 1;
+
+  uint8_t mSendResumeAt : 1;
+
+  uint8_t mKeptAlive : 1;  
+
+  uint8_t mIPCActorDeleted : 1;
+
+  uint8_t mSuspendSent : 1;
+
+  uint8_t mIsFirstPartOfMultiPart : 1;
+
+  uint8_t mIsLastPartOfMultiPart : 1;
+
+  uint8_t mSuspendForWaitCompleteRedirectSetup : 1;
+
+  uint8_t mRecvOnStartRequestSentCalled : 1;
+
+  uint8_t mSuspendedByWaitingForCookies : 1;
+
+  uint8_t mAlreadyReleased : 1;
+
+  mozilla::UniquePtr<char[]> mCallStack;
+
+  void CleanupRedirectingChannel(nsresult rv);
+
+  void NotifyOrReleaseListeners(nsresult rv);
+
+  bool RemoteChannelExists() { return CanSend() && !mKeptAlive; }
+
+  void OnStartRequest(const nsHttpResponseHead& aResponseHead,
+                      const bool& aUseResponseHead,
+                      const nsHttpHeaderArray& aRequestHeaders,
+                      const HttpChannelOnStartRequestArgs& aArgs);
+  void OnTransportAndData(const nsresult& channelStatus, const nsresult& status,
+                          const uint64_t& offset, const nsACString& data);
+  void OnStopRequest(const nsresult& channelStatus,
+                     const ResourceTimingStructArgs& timing,
+                     const nsHttpHeaderArray& aResponseTrailers);
+  void FailedAsyncOpen(const nsresult& status);
+  void HandleAsyncAbort();
+  void Redirect1Begin(const uint32_t& registrarId, nsIURI* newOriginalURI,
+                      const uint32_t& newLoadFlags,
+                      const uint32_t& redirectFlags,
+                      const ParentLoadInfoForwarderArgs& loadInfoForwarder,
+                      const nsHttpResponseHead& responseHead,
+                      nsITransportSecurityInfo* securityInfo,
+                      const uint64_t& channelId,
+                      const ResourceTimingStructArgs& timing);
+  void Redirect3Complete();
+  void DeleteSelf();
+  void DoNotifyListener(bool aUseEventQueue = true);
+  void ContinueDoNotifyListener();
+  void OnAfterLastPart(const nsresult& aStatus);
+  void MaybeConnectToSocketProcess();
+  void SendOnDataFinished(const nsresult& aChannelStatus);
+
+  [[nodiscard]] nsresult SetupRedirect(nsIURI* uri,
+                                       const nsHttpResponseHead* responseHead,
+                                       const uint32_t& redirectFlags,
+                                       nsIChannel** outChannel);
+
+
+  friend class HttpAsyncAborter<HttpChannelChild>;
+  friend class InterceptStreamListener;
+  friend class InterceptedChannelContent;
+  friend class HttpBackgroundChannelChild;
+  friend class NeckoTargetChannelFunctionEvent;
+};
+
+
+inline bool HttpChannelChild::IsSuspended() { return mSuspendCount != 0; }
+
+}  
+
+#endif  // mozilla_net_HttpChannelChild_h

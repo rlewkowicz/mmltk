@@ -1,0 +1,1545 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+function IteratorIdentity() {
+  return this;
+}
+
+function IteratorNext(iteratorRecord, value) {
+  var result =
+    ArgumentsLength() < 2
+      ? callContentFunction(iteratorRecord.nextMethod, iteratorRecord.iterator)
+      : callContentFunction(
+        iteratorRecord.nextMethod,
+        iteratorRecord.iterator,
+        value
+      );
+  if (!IsObject(result)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, result);
+  }
+  return result;
+}
+
+function GetIterator(obj, isAsync, method) {
+  if (!method) {
+    if (isAsync) {
+      method = GetMethod(obj, GetBuiltinSymbol("asyncIterator"));
+
+      if (!method) {
+        var syncMethod = GetMethod(obj, GetBuiltinSymbol("iterator"));
+
+        var syncIteratorRecord = GetIterator(obj, false, syncMethod);
+
+        return CreateAsyncFromSyncIterator(syncIteratorRecord.iterator, syncIteratorRecord.nextMethod);
+      }
+    } else {
+      method = GetMethod(obj, GetBuiltinSymbol("iterator"));
+    }
+  }
+
+  var iterator = callContentFunction(method, obj);
+
+  if (!IsObject(iterator)) {
+    ThrowTypeError(JSMSG_NOT_ITERABLE, obj === null ? "null" : typeof obj);
+  }
+
+  var nextMethod = iterator.next;
+
+  var iteratorRecord = {
+    __proto__: null,
+    iterator,
+    nextMethod,
+    done: false,
+  };
+
+  return iteratorRecord;
+}
+
+function GetIteratorFlattenable(obj, rejectStrings) {
+  assert(typeof rejectStrings === "boolean", "rejectStrings is a boolean");
+
+  if (!IsObject(obj)) {
+    if (rejectStrings || typeof obj !== "string") {
+      ThrowTypeError(JSMSG_OBJECT_REQUIRED, obj === null ? "null" : typeof obj);
+    }
+  }
+
+  var method = obj[GetBuiltinSymbol("iterator")];
+
+  var iterator;
+  if (IsNullOrUndefined(method)) {
+    iterator = obj;
+  } else {
+    iterator = callContentFunction(method, obj);
+  }
+
+  if (!IsObject(iterator)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterator === null ? "null" : typeof iterator);
+  }
+
+  return iterator;
+}
+
+function IteratorFrom(O) {
+  var iterator = GetIteratorFlattenable(O,  false);
+  var nextMethod = iterator.next;
+
+  var hasInstance = callFunction(
+    std_Object_isPrototypeOf,
+    GetBuiltinPrototype("Iterator"),
+    iterator
+  );
+
+  if (hasInstance) {
+    return iterator;
+  }
+
+  var wrapper = NewWrapForValidIterator();
+
+  UnsafeSetReservedSlot(
+    wrapper,
+    WRAP_FOR_VALID_ITERATOR_ITERATOR_SLOT,
+    iterator
+  );
+  UnsafeSetReservedSlot(
+    wrapper,
+    WRAP_FOR_VALID_ITERATOR_NEXT_METHOD_SLOT,
+    nextMethod
+  );
+
+  return wrapper;
+}
+
+function WrapForValidIteratorNext() {
+  var O = this;
+  if (!IsObject(O) || (O = GuardToWrapForValidIterator(O)) === null) {
+    return callFunction(
+      CallWrapForValidIteratorMethodIfWrapped,
+      this,
+      "WrapForValidIteratorNext"
+    );
+  }
+
+  var iterator = UnsafeGetReservedSlot(O, WRAP_FOR_VALID_ITERATOR_ITERATOR_SLOT);
+  var nextMethod = UnsafeGetReservedSlot(O, WRAP_FOR_VALID_ITERATOR_NEXT_METHOD_SLOT);
+
+  return callContentFunction(nextMethod, iterator);
+}
+
+function WrapForValidIteratorReturn() {
+  var O = this;
+  if (!IsObject(O) || (O = GuardToWrapForValidIterator(O)) === null) {
+    return callFunction(
+      CallWrapForValidIteratorMethodIfWrapped,
+      this,
+      "WrapForValidIteratorReturn"
+    );
+  }
+
+  var iterator = UnsafeGetReservedSlot(O, WRAP_FOR_VALID_ITERATOR_ITERATOR_SLOT);
+
+  assert(IsObject(iterator), "iterator is an object");
+
+  var returnMethod = iterator.return;
+
+  if (IsNullOrUndefined(returnMethod)) {
+    return {
+      value: undefined,
+      done: true,
+    };
+  }
+
+  return callContentFunction(returnMethod, iterator);
+}
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+function IteratorDispose() {
+  var O = this;
+
+  var returnMethod = GetMethod(O, "return");
+
+  if (returnMethod !== undefined) {
+    callContentFunction(returnMethod, O);
+  }
+
+}
+#endif
+
+function IteratorHelperNext() {
+  var O = this;
+  if (!IsObject(O) || (O = GuardToIteratorHelper(O)) === null) {
+    return callFunction(
+      CallIteratorHelperMethodIfWrapped,
+      this,
+      "IteratorHelperNext"
+    );
+  }
+  var generator = UnsafeGetReservedSlot(O, ITERATOR_HELPER_GENERATOR_SLOT);
+  return callFunction(GeneratorNext, generator, undefined);
+}
+
+function IteratorHelperReturn() {
+  var O = this;
+
+  if (!IsObject(O) || (O = GuardToIteratorHelper(O)) === null) {
+    return callFunction(
+      CallIteratorHelperMethodIfWrapped,
+      this,
+      "IteratorHelperReturn"
+    );
+  }
+
+
+  var generator = UnsafeGetReservedSlot(O, ITERATOR_HELPER_GENERATOR_SLOT);
+  var resumeIndex = UnsafeGetReservedSlot(generator, GENERATOR_RESUME_INDEX_SLOT);
+  assert(
+    resumeIndex === undefined ||
+      resumeIndex === null ||
+      typeof resumeIndex === "number",
+    "unexpected resumeIndex value"
+  );
+
+  var isSuspendedStart = resumeIndex === GENERATOR_RESUME_INDEX_INITIAL_YIELD;
+  assert(
+    !isSuspendedStart || IsSuspendedGenerator(generator),
+    "unexpected 'suspended-start' state for non-suspended generator"
+  );
+
+  var result = callFunction(GeneratorReturn, generator, undefined);
+
+  if (isSuspendedStart) {
+    var underlyingIterator = UnsafeGetReservedSlot(O, ITERATOR_HELPER_UNDERLYING_ITERATOR_SLOT);
+    assert(
+      underlyingIterator === undefined || IsObject(underlyingIterator),
+      "underlyingIterator is undefined or an object"
+    );
+
+    if (IsObject(underlyingIterator)) {
+      IteratorClose(underlyingIterator);
+    }
+  }
+
+  return result;
+}
+
+
+function IteratorMap(mapper) {
+  var iterator = this;
+
+  if (!IsObject(iterator)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterator === null ? "null" : typeof iterator);
+  }
+
+  if (!IsCallable(mapper)) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, mapper));
+  }
+
+  var nextMethod = iterator.next;
+
+  var result = NewIteratorHelper();
+  var generator = IteratorMapGenerator(iterator, nextMethod, mapper);
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_UNDERLYING_ITERATOR_SLOT,
+    iterator
+  );
+
+  return result;
+}
+
+function* IteratorMapGenerator(iterator, nextMethod, mapper) {
+  var counter = 0;
+
+  for (var value of allowContentIterWithNext(iterator, nextMethod)) {
+
+    var mapped = callContentFunction(mapper, undefined, value, counter);
+
+
+    yield mapped;
+
+
+    counter += 1;
+  }
+}
+
+function IteratorFilter(predicate) {
+  var iterator = this;
+
+  if (!IsObject(iterator)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterator === null ? "null" : typeof iterator);
+  }
+
+  if (!IsCallable(predicate)) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, predicate));
+  }
+
+  var nextMethod = iterator.next;
+
+  var result = NewIteratorHelper();
+  var generator = IteratorFilterGenerator(iterator, nextMethod, predicate);
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_UNDERLYING_ITERATOR_SLOT,
+    iterator
+  );
+
+  return result;
+}
+
+function* IteratorFilterGenerator(iterator, nextMethod, predicate) {
+  var counter = 0;
+
+  for (var value of allowContentIterWithNext(iterator, nextMethod)) {
+
+    var selected = callContentFunction(predicate, undefined, value, counter);
+
+
+    if (selected) {
+      yield value;
+
+    }
+
+    counter += 1;
+  }
+}
+
+function IteratorTake(limit) {
+  var iterator = this;
+
+  if (!IsObject(iterator)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterator === null ? "null" : typeof iterator);
+  }
+
+  var numLimit;
+  try {
+    numLimit = +limit;
+  } catch (e) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    throw e;
+  }
+
+  var integerLimit = std_Math_trunc(numLimit);
+  if (!(integerLimit >= 0)) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    ThrowRangeError(JSMSG_NEGATIVE_LIMIT);
+  }
+
+  var nextMethod = iterator.next;
+
+  var result = NewIteratorHelper();
+  var generator = IteratorTakeGenerator(iterator, nextMethod, integerLimit);
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_UNDERLYING_ITERATOR_SLOT,
+    iterator
+  );
+
+  return result;
+}
+
+function* IteratorTakeGenerator(iterator, nextMethod, remaining) {
+
+  if (remaining === 0) {
+    IteratorClose(iterator);
+    return;
+  }
+
+  for (var value of allowContentIterWithNext(iterator, nextMethod)) {
+
+    yield value;
+
+
+    if (--remaining === 0) {
+      break;
+    }
+  }
+}
+
+function IteratorDrop(limit) {
+  var iterator = this;
+
+  if (!IsObject(iterator)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterator === null ? "null" : typeof iterator);
+  }
+
+  var numLimit;
+  try {
+    numLimit = +limit;
+  } catch (e) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    throw e;
+  }
+
+  var integerLimit = std_Math_trunc(numLimit);
+  if (!(integerLimit >= 0)) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    ThrowRangeError(JSMSG_NEGATIVE_LIMIT);
+  }
+
+  var nextMethod = iterator.next;
+
+  var result = NewIteratorHelper();
+  var generator = IteratorDropGenerator(iterator, nextMethod, integerLimit);
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_UNDERLYING_ITERATOR_SLOT,
+    iterator
+  );
+
+  return result;
+}
+
+function* IteratorDropGenerator(iterator, nextMethod, remaining) {
+
+  for (var value of allowContentIterWithNext(iterator, nextMethod)) {
+    if (remaining-- <= 0) {
+
+      yield value;
+
+    }
+  }
+}
+
+function IteratorFlatMap(mapper) {
+  var iterator = this;
+
+  if (!IsObject(iterator)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterator === null ? "null" : typeof iterator);
+  }
+
+  if (!IsCallable(mapper)) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, mapper));
+  }
+
+  var nextMethod = iterator.next;
+
+  var result = NewIteratorHelper();
+  var generator = IteratorFlatMapGenerator(iterator, nextMethod, mapper);
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_UNDERLYING_ITERATOR_SLOT,
+    iterator
+  );
+
+  return result;
+}
+
+function* IteratorFlatMapGenerator(iterator, nextMethod, mapper) {
+  var counter = 0;
+
+  for (var value of allowContentIterWithNext(iterator, nextMethod)) {
+
+    var mapped = callContentFunction(mapper, undefined, value, counter);
+
+
+    var innerIterator = GetIteratorFlattenable(mapped,  true);
+    var innerIteratorNextMethod = innerIterator.next;
+
+
+    for (var innerValue of allowContentIterWithNext(innerIterator, innerIteratorNextMethod)) {
+
+      yield innerValue;
+
+    }
+
+    counter += 1;
+  }
+}
+
+function IteratorReduce(reducer ) {
+  var iterator = this;
+
+  if (!IsObject(iterator)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterator === null ? "null" : typeof iterator);
+  }
+
+  if (!IsCallable(reducer)) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, reducer));
+  }
+
+  var nextMethod = iterator.next;
+
+  var accumulator;
+  var counter;
+  if (ArgumentsLength() === 1) {
+    counter = -1;
+  } else {
+    accumulator = GetArgument(1);
+
+    counter = 0;
+  }
+
+  for (var value of allowContentIterWithNext(iterator, nextMethod)) {
+    if (counter < 0) {
+
+      accumulator = value;
+
+      counter = 1;
+    } else {
+
+      accumulator = callContentFunction(reducer, undefined, accumulator, value, counter++);
+    }
+  }
+
+  if (counter < 0) {
+    ThrowTypeError(JSMSG_EMPTY_ITERATOR_REDUCE);
+  }
+
+  return accumulator;
+}
+
+function IteratorToArray() {
+  var iterator = this;
+
+  if (!IsObject(iterator)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterator === null ? "null" : typeof iterator);
+  }
+
+  var nextMethod = iterator.next;
+
+  return [...allowContentIterWithNext(iterator, nextMethod)];
+}
+
+function IteratorForEach(fn) {
+  var iterator = this;
+
+  if (!IsObject(iterator)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterator === null ? "null" : typeof iterator);
+  }
+
+  if (!IsCallable(fn)) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, fn));
+  }
+
+  var nextMethod = iterator.next;
+
+  var counter = 0;
+
+  for (var value of allowContentIterWithNext(iterator, nextMethod)) {
+
+    callContentFunction(fn, undefined, value, counter++);
+
+  }
+}
+
+function IteratorSome(predicate) {
+  var iterator = this;
+
+  if (!IsObject(iterator)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterator === null ? "null" : typeof iterator);
+  }
+
+  if (!IsCallable(predicate)) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, predicate));
+  }
+
+  var nextMethod = iterator.next;
+
+  var counter = 0;
+
+  for (var value of allowContentIterWithNext(iterator, nextMethod)) {
+
+    if (callContentFunction(predicate, undefined, value, counter++)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function IteratorEvery(predicate) {
+  var iterator = this;
+
+  if (!IsObject(iterator)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterator === null ? "null" : typeof iterator);
+  }
+
+  if (!IsCallable(predicate)) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, predicate));
+  }
+
+  var nextMethod = iterator.next;
+
+  var counter = 0;
+
+  for (var value of allowContentIterWithNext(iterator, nextMethod)) {
+
+    if (!callContentFunction(predicate, undefined, value, counter++)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function IteratorFind(predicate) {
+  var iterator = this;
+
+  if (!IsObject(iterator)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterator === null ? "null" : typeof iterator);
+  }
+
+  if (!IsCallable(predicate)) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, predicate));
+  }
+
+  var nextMethod = iterator.next;
+
+  var counter = 0;
+
+  for (var value of allowContentIterWithNext(iterator, nextMethod)) {
+
+    if (callContentFunction(predicate, undefined, value, counter++)) {
+      return value;
+    }
+  }
+}
+
+function IteratorConcat() {
+  var index = ArgumentsLength() * 2;
+  var iterables = std_Array(index);
+
+  for (var i = 0; i < ArgumentsLength(); i++) {
+    var item = GetArgument(i);
+
+    if (!IsObject(item)) {
+      ThrowTypeError(JSMSG_OBJECT_REQUIRED, typeof item);
+    }
+
+    var method = item[GetBuiltinSymbol("iterator")];
+
+    if (!IsCallable(method)) {
+      ThrowTypeError(JSMSG_NOT_ITERABLE, ToSource(item));
+    }
+
+    DefineDataProperty(iterables, --index, item);
+    DefineDataProperty(iterables, --index, method);
+  }
+  assert(index === 0, "all items stored");
+
+  var result = NewIteratorHelper();
+  var generator = IteratorConcatGenerator(iterables);
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+
+  return result;
+}
+
+function* IteratorConcatGenerator(iterables) {
+  assert(IsArray(iterables), "iterables is an array");
+  assert(iterables.length % 2 === 0, "iterables contains pairs (item, method)");
+
+  for (var i = iterables.length; i > 0;) {
+    var item = iterables[--i];
+    var method = iterables[--i];
+
+    iterables.length -= 2;
+
+    for (var innerValue of allowContentIterWith(item, method)) {
+
+      yield innerValue;
+    }
+  }
+}
+
+function IteratorZip(iterables, options = undefined) {
+  if (!IsObject(iterables)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterables === null ? "null" : typeof iterables);
+  }
+
+  if (options !== undefined) {
+    if (!IsObject(options)) {
+      ThrowTypeError(
+        JSMSG_OBJECT_REQUIRED_ARG, "options", "Iterator.zip", ToSource(options)
+      );
+    }
+
+    var mode = options.mode;
+
+    if (mode === undefined) {
+      mode = "shortest";
+    }
+
+    if (mode !== "shortest" && mode !== "longest" && mode !== "strict") {
+      if (typeof mode !== "string") {
+        ThrowTypeError(
+          JSMSG_ITERATOR_ZIP_INVALID_OPTION_TYPE,
+          "mode",
+          mode === null ? "null" : typeof mode
+        );
+      }
+      ThrowTypeError(
+        JSMSG_ITERATOR_ZIP_INVALID_OPTION_VALUE, "mode", ToSource(mode)
+      );
+    }
+
+    var paddingOption = undefined;
+
+    if (mode === "longest") {
+      paddingOption = options.padding;
+
+      if (paddingOption !== undefined && !IsObject(paddingOption)) {
+        ThrowTypeError(
+          JSMSG_ITERATOR_ZIP_INVALID_OPTION_TYPE,
+          "padding",
+          paddingOption === null ? "null" : typeof paddingOption
+        );
+      }
+    }
+  } else {
+    var mode = "shortest";
+  }
+
+  var iters = [];
+  var nextMethods = [];
+
+  try {
+    var closedIterators = false;
+    for (var iter of allowContentIter(iterables)) {
+
+      try {
+        iter = GetIteratorFlattenable(iter,  true);
+        var nextMethod = iter.next;
+      } catch (e) {
+        closedIterators = true;
+        IteratorCloseAllForException(iters);
+        throw e;
+      }
+
+      DefineDataProperty(iters, iters.length, iter);
+      DefineDataProperty(nextMethods, nextMethods.length, nextMethod);
+    }
+  } catch (e) {
+    if (!closedIterators) {
+      IteratorCloseAllForException(iters);
+    }
+    throw e;
+  }
+
+  if (mode === "longest") {
+    var padding = [];
+
+    var iterCount = iters.length;
+
+    if (paddingOption !== undefined) {
+      try {
+        if (iterCount > 0) {
+          for (var paddingValue of allowContentIter(paddingOption)) {
+            DefineDataProperty(padding, padding.length, paddingValue);
+
+            if (padding.length === iterCount) {
+              break;
+            }
+          }
+        } else {
+          // eslint-disable-next-line no-empty-pattern
+          var [] = allowContentIter(paddingOption);
+        }
+      } catch (e) {
+        IteratorCloseAllForException(iters);
+        throw e;
+      }
+    }
+
+    for (var i = padding.length; i < iterCount; i++) {
+      DefineDataProperty(padding, i, undefined);
+    }
+  }
+
+  var result = NewIteratorHelper();
+  var generator = IteratorZipGenerator(iters, nextMethods, mode, padding);
+  var closeIterator = {
+    return() {
+      IteratorCloseAllForReturn(iters);
+      return {};
+    }
+  };
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_UNDERLYING_ITERATOR_SLOT,
+    closeIterator
+  );
+
+  return result;
+}
+
+function IteratorZipKeyed(iterables, options = undefined) {
+  if (!IsObject(iterables)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterables === null ? "null" : typeof iterables);
+  }
+
+  if (options !== undefined) {
+    if (!IsObject(options)) {
+      ThrowTypeError(
+        JSMSG_OBJECT_REQUIRED_ARG, "options", "Iterator.zipKeyed", ToSource(options)
+      );
+    }
+
+    var mode = options.mode;
+
+    if (mode === undefined) {
+      mode = "shortest";
+    }
+
+    if (mode !== "shortest" && mode !== "longest" && mode !== "strict") {
+      if (typeof mode !== "string") {
+        ThrowTypeError(
+          JSMSG_ITERATOR_ZIP_INVALID_OPTION_TYPE,
+          "mode",
+          mode === null ? "null" : typeof mode
+        );
+      }
+      ThrowTypeError(
+        JSMSG_ITERATOR_ZIP_INVALID_OPTION_VALUE, "mode", ToSource(mode)
+      );
+    }
+
+    var paddingOption = undefined;
+
+    if (mode === "longest") {
+      paddingOption = options.padding;
+
+      if (paddingOption !== undefined && !IsObject(paddingOption)) {
+        ThrowTypeError(
+          JSMSG_ITERATOR_ZIP_INVALID_OPTION_TYPE,
+          "padding",
+          paddingOption === null ? "null" : typeof paddingOption
+        );
+      }
+    }
+  } else {
+    var mode = "shortest";
+  }
+
+  var iters = [];
+  var nextMethods = [];
+
+  var allKeys = std_Reflect_ownKeys(iterables);
+
+  var keys = [];
+
+  try {
+    for (var i = 0; i < allKeys.length; i++) {
+      var key = allKeys[i];
+
+      var desc = ObjectGetOwnPropertyDescriptor(iterables, key);
+
+      if (desc && desc.enumerable) {
+        var value = iterables[key];
+
+        if (value !== undefined) {
+          DefineDataProperty(keys, keys.length, key);
+
+          var iter = GetIteratorFlattenable(value,  true);
+          var nextMethod = iter.next;
+
+          DefineDataProperty(iters, iters.length, iter);
+          DefineDataProperty(nextMethods, nextMethods.length, nextMethod);
+        }
+      }
+    }
+  } catch (e) {
+    IteratorCloseAllForException(iters);
+    throw e;
+  }
+
+  if (mode === "longest") {
+    var padding = [];
+
+    if (paddingOption === undefined) {
+      var iterCount = iters.length;
+
+      for (var i = 0; i < iterCount; i++) {
+        DefineDataProperty(padding, i, undefined);
+      }
+    } else {
+      try {
+        for (var i = 0; i < keys.length; i++) {
+          DefineDataProperty(padding, i, paddingOption[keys[i]]);
+        }
+      } catch (e) {
+        IteratorCloseAllForException(iters);
+        throw e;
+      }
+    }
+  }
+
+  var result = NewIteratorHelper();
+  var generator = IteratorZipGenerator(iters, nextMethods, mode, padding, keys);
+  var closeIterator = {
+    return() {
+      IteratorCloseAllForReturn(iters);
+      return {};
+    }
+  };
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_UNDERLYING_ITERATOR_SLOT,
+    closeIterator
+  );
+
+  return result;
+}
+
+function* IteratorZipGenerator(iters, nextMethods, mode, padding, keys) {
+  assert(
+    iters.length === nextMethods.length,
+    "iters and nextMethods have the same number of entries"
+  );
+  assert(
+    mode === "shortest" || mode === "longest" || mode === "strict",
+    "invalid mode"
+  );
+  assert(
+    mode !== "longest" || (IsArray(padding) && padding.length === iters.length),
+    "iters and padding have the same number of entries"
+  );
+  assert(
+    keys === undefined || (IsArray(keys) && keys.length === iters.length),
+    "keys is undefined or an array with iters.length entries"
+  );
+
+  var iterCount = iters.length;
+
+  var openIterCount = iterCount;
+
+  if (iterCount === 0) {
+    return;
+  }
+
+  while (true) {
+    var results = [];
+
+    assert(openIterCount > 0, "at least one open iterator");
+
+    for (var i = 0; i < iterCount; i++) {
+      var iter = iters[i];
+      var nextMethod = nextMethods[i];
+
+      var result;
+      if (iter === null) {
+        assert(mode === "longest", "padding only applied when mode is longest");
+
+        result = padding[i];
+      } else {
+        try {
+          var iterResult = callContentFunction(nextMethod, iter);
+          if (!IsObject(iterResult)) {
+            ThrowTypeError(JSMSG_ITER_METHOD_RETURNED_PRIMITIVE, "next");
+          }
+          var done = !!iterResult.done;
+          if (!done) {
+            result = iterResult.value;
+          }
+        } catch (e) {
+          iters[i] = null;
+
+          IteratorCloseAllForException(iters);
+          throw e;
+        }
+
+        if (done) {
+          iters[i] = null;
+
+          if (mode === "shortest") {
+            IteratorCloseAllForReturn(iters);
+            return;
+          }
+
+          if (mode === "strict") {
+            if (i !== 0) {
+              IteratorCloseAllForException(iters);
+              ThrowTypeError(JSMSG_ITERATOR_ZIP_STRICT_OPEN_ITERATOR);
+            }
+
+            for (var k = 1; k < iterCount; k++) {
+              assert(iters[k] !== null, "unexpected closed iterator");
+
+              var done;
+              try {
+                var iterResult = callContentFunction(nextMethods[k], iters[k]);
+                if (!IsObject(iterResult)) {
+                  ThrowTypeError(JSMSG_ITER_METHOD_RETURNED_PRIMITIVE, "next");
+                }
+                done = !!iterResult.done;
+              } catch (e) {
+                iters[k] = null;
+
+                IteratorCloseAllForException(iters);
+                throw e;
+              }
+
+              if (done) {
+                iters[k] = null;
+              } else {
+                IteratorCloseAllForException(iters);
+                ThrowTypeError(JSMSG_ITERATOR_ZIP_STRICT_OPEN_ITERATOR);
+              }
+            }
+
+            return;
+          }
+
+          assert(mode === "longest", "unexpected mode");
+
+          assert(openIterCount > 0, "at least one open iterator");
+          if (--openIterCount === 0) {
+            return;
+          }
+
+          iters[i] = null;
+
+          result = padding[i];
+        }
+      }
+
+      DefineDataProperty(results, results.length, result);
+    }
+
+    if (keys) {
+      var obj = std_Object_create(null);
+
+      for (var i = 0; i < keys.length; i++) {
+        DefineDataProperty(obj, keys[i], results[i]);
+      }
+
+      results = obj;
+    }
+
+    var returnCompletion = true;
+    try {
+      yield results;
+
+      returnCompletion = false;
+    } finally {
+      if (returnCompletion) {
+        IteratorCloseAllForReturn(iters);
+      }
+    }
+  }
+}
+
+function IteratorCloseAllForReturn(iters) {
+  assert(IsArray(iters), "iters is an array");
+
+  var exception;
+  var hasException = false;
+
+  for (var i = iters.length - 1; i >= 0; i--) {
+    var iter = iters[i];
+    assert(IsObject(iter) || iter === null, "iter is an object or null");
+
+    if (IsObject(iter)) {
+      try {
+        IteratorClose(iter);
+      } catch (e) {
+        if (!hasException) {
+          hasException = true;
+          exception = e;
+        }
+      }
+    }
+  }
+
+  if (hasException) {
+    throw exception;
+  }
+}
+
+function IteratorCloseAllForException(iters) {
+  assert(IsArray(iters), "iters is an array");
+
+  for (var i = iters.length - 1; i >= 0; i--) {
+    var iter = iters[i];
+    assert(IsObject(iter) || iter === null, "iter is an object or null");
+
+    if (IsObject(iter)) {
+      try {
+        IteratorClose(iter);
+      } catch {
+      }
+    }
+  }
+
+}
+
+#ifdef NIGHTLY_BUILD
+function IteratorRangeNext() {
+  var obj = this;
+
+  if (!IsObject(obj) || (obj = GuardToIteratorRange(obj)) === null) {
+    return callFunction(
+      CallIteratorRangeMethodIfWrapped,
+      this,
+      "IteratorRangeNext"
+    );
+  }
+
+  var start = UnsafeGetReservedSlot(obj, ITERATOR_RANGE_SLOT_START);
+  var end = UnsafeGetReservedSlot(obj, ITERATOR_RANGE_SLOT_END);
+  var step = UnsafeGetReservedSlot(obj, ITERATOR_RANGE_SLOT_STEP);
+  var inclusiveEnd = UnsafeGetReservedSlot(obj, ITERATOR_RANGE_SLOT_INCLUSIVE_END);
+  var zero = UnsafeGetReservedSlot(obj, ITERATOR_RANGE_SLOT_ZERO);
+  var one = UnsafeGetReservedSlot(obj, ITERATOR_RANGE_SLOT_ONE);
+  var currentCount = UnsafeGetReservedSlot(obj, ITERATOR_RANGE_SLOT_CURRENT_COUNT);
+
+  var ifIncrease = end > start;
+
+  var ifStepIncrease = step > zero;
+
+  if (ifIncrease !== ifStepIncrease) {
+    return { value: undefined, done: true };
+  }
+
+  var hitsEnd = false;
+
+
+  var currentYieldingValue = start + (step * currentCount);
+
+  hitsEnd = currentYieldingValue === end && !inclusiveEnd;
+
+
+  currentCount = currentCount + one;
+
+  if (ifIncrease) {
+    if (inclusiveEnd) {
+      if (currentYieldingValue > end) {
+        return { value: undefined, done: true };
+      }
+    } else {
+      if (currentYieldingValue >= end) {
+        return { value: undefined, done: true };
+      }
+    }
+  } else {
+    if (inclusiveEnd) {
+      if (end > currentYieldingValue) {
+        return { value: undefined, done: true };
+      }
+    } else {
+      if (end >= currentYieldingValue) {
+        return { value: undefined, done: true };
+      }
+    }
+  }
+
+  UnsafeSetReservedSlot(obj, ITERATOR_RANGE_SLOT_CURRENT_COUNT, currentCount);
+
+  if (hitsEnd) {
+    return { value: undefined, done: true };
+  }
+
+  return { value: currentYieldingValue, done: false };
+}
+
+
+
+function CreateNumericRangeIterator(start, end, optionOrStep, isNumberRange) {
+
+  if (isNumberRange && Number_isNaN(start)) {
+    ThrowRangeError(JSMSG_ITERATOR_RANGE_INVALID_START_RANGEERR);
+  }
+
+  if (isNumberRange && Number_isNaN(end)) {
+    ThrowRangeError(JSMSG_ITERATOR_RANGE_INVALID_END_RANGEERR);
+  }
+
+  if (isNumberRange) {
+    assert(typeof start === 'number', "The 'start' argument must be a number");
+
+    if (typeof end !== 'number') {
+      ThrowTypeError(JSMSG_ITERATOR_RANGE_INVALID_END);
+    }
+
+    var zero = 0;
+
+    var one = 1;
+  } else {
+    assert(typeof start === 'bigint', "The 'start' argument must be a bigint");
+
+    if (typeof end !== 'bigint' && !(Number_isFinite(end))) {
+      ThrowTypeError(JSMSG_ITERATOR_RANGE_INVALID_END);
+    }
+
+    var zero = 0n;
+
+    var one = 1n;
+  }
+  if (typeof start === 'number' && !Number_isFinite(start)) {
+    ThrowRangeError(JSMSG_ITERATOR_RANGE_START_INFINITY);
+  }
+  var inclusiveEnd = false;
+
+  var step;
+
+  if (optionOrStep !== null && typeof optionOrStep === 'object') {
+    step = optionOrStep.step;
+
+    inclusiveEnd = TO_BOOLEAN(optionOrStep.inclusiveEnd);
+  }
+  else if (isNumberRange && typeof optionOrStep === 'number') {
+    step = optionOrStep;
+  }
+
+  else if (!isNumberRange && typeof optionOrStep === 'bigint') {
+    step = optionOrStep;
+  }
+  else if (optionOrStep !== undefined && optionOrStep !== null) {
+    ThrowTypeError(JSMSG_ITERATOR_RANGE_INVALID_STEP);
+  }
+
+  if (step === undefined || step === null) {
+    step = end > start ? one : -one;
+  }
+
+  if (typeof step === "number" && Number_isNaN(step)) {
+    ThrowRangeError(JSMSG_ITERATOR_RANGE_STEP_NAN);
+  }
+
+  if (isNumberRange && typeof step !== 'number') {
+    ThrowTypeError(JSMSG_ITERATOR_RANGE_STEP_NOT_NUMBER);
+  }
+
+  else if (!isNumberRange && typeof step !== 'bigint') {
+    ThrowTypeError(JSMSG_ITERATOR_RANGE_STEP_NOT_BIGINT);
+  }
+
+  if (typeof step === 'number' && !Number_isFinite(step)) {
+    ThrowRangeError(JSMSG_ITERATOR_RANGE_STEP_NOT_FINITE);
+  }
+
+  if (step === zero && start !== end) {
+    ThrowRangeError(JSMSG_ITERATOR_RANGE_STEP_ZERO);
+  }
+
+  var obj = NewIteratorRange();
+  UnsafeSetReservedSlot(obj, ITERATOR_RANGE_SLOT_START, start);
+  UnsafeSetReservedSlot(obj, ITERATOR_RANGE_SLOT_END, end);
+  UnsafeSetReservedSlot(obj, ITERATOR_RANGE_SLOT_STEP, step);
+  UnsafeSetReservedSlot(obj, ITERATOR_RANGE_SLOT_INCLUSIVE_END, inclusiveEnd);
+  UnsafeSetReservedSlot(obj, ITERATOR_RANGE_SLOT_ZERO, zero);
+  UnsafeSetReservedSlot(obj, ITERATOR_RANGE_SLOT_ONE, one);
+  UnsafeSetReservedSlot(obj, ITERATOR_RANGE_SLOT_CURRENT_COUNT, zero);
+
+  return obj;
+}
+
+
+
+function IteratorRange(start, end, optionOrStep) {
+
+  if (typeof start === 'number') {
+    return CreateNumericRangeIterator(start, end, optionOrStep, true);
+  }
+
+  if (typeof start === 'bigint') {
+    return CreateNumericRangeIterator(start, end, optionOrStep, false);
+  }
+
+  ThrowTypeError(JSMSG_ITERATOR_RANGE_INVALID_START);
+
+}
+
+#endif
+
+function IteratorChunks(chunkSize) {
+  var iterator = this;
+
+  if (!IsObject(iterator)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterator === null ? "null" : typeof iterator);
+  }
+
+
+  if (!Number_isInteger(chunkSize)) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    ThrowTypeError(JSMSG_CHUNK_SIZE_NOT_INTEGER);
+  }
+
+  if (chunkSize < 1 || chunkSize > (2 ** 32) - 1) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    ThrowRangeError(JSMSG_INVALID_CHUNKSIZE);
+  }
+
+  var nextMethod = iterator.next;
+
+
+  var result = NewIteratorHelper();
+  var generator = IteratorChunksGenerator(iterator, nextMethod, chunkSize);
+
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_UNDERLYING_ITERATOR_SLOT,
+    iterator
+  );
+
+  return result;
+}
+
+function* IteratorChunksGenerator(iterator, nextMethod, chunkSize) {
+  var buffer = [];
+
+  for (var value of allowContentIterWithNext(iterator, nextMethod)) {
+    DefineDataProperty(buffer, buffer.length, value);
+
+    if (buffer.length === chunkSize) {
+      yield buffer;
+
+      buffer = [];
+    }
+  }
+
+  if (buffer.length) {
+    yield buffer;
+  }
+
+}
+
+function IteratorWindows(windowSize, undersized = undefined) {
+  var iterator = this;
+
+  if (!IsObject(iterator)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, iterator === null ? "null" : typeof iterator);
+  }
+
+
+  if (!Number_isInteger(windowSize)) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    ThrowTypeError(JSMSG_WINDOW_SIZE_NOT_INTEGER);
+  }
+
+  if (windowSize < 1 || windowSize > (2 ** 32) - 1) {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    ThrowRangeError(JSMSG_INVALID_WINDOWSIZE);
+  }
+
+  if (undersized === undefined) {
+    undersized = "only-full";
+  }
+
+  if (undersized !== "only-full" && undersized !== "allow-partial") {
+    try {
+      IteratorClose(iterator);
+    } catch {}
+    ThrowTypeError(
+      JSMSG_INVALID_UNDERSIZED_OPTION_VALUE, "undersized", ToSource(undersized)
+    );
+  }
+
+  var nextMethod = iterator.next;
+
+
+  var result = NewIteratorHelper();
+  var generator = IteratorWindowsGenerator(iterator, nextMethod, windowSize, undersized);
+
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+  UnsafeSetReservedSlot(
+    result,
+    ITERATOR_HELPER_UNDERLYING_ITERATOR_SLOT,
+    iterator
+  );
+
+  return result;
+}
+
+function* IteratorWindowsGenerator(iterator, nextMethod, windowSize, undersized) {
+
+  var buffer = new_List();
+
+  for (var value of allowContentIterWithNext(iterator, nextMethod)) {
+    if (buffer.length === windowSize) {
+      callFunction(std_Array_shift, buffer);
+    }
+
+    DefineDataProperty(buffer, buffer.length, value);
+
+    if (buffer.length === windowSize) {
+      yield callFunction(std_Array_slice, buffer);
+    }
+  }
+
+  if (undersized === "allow-partial" && buffer.length && buffer.length < windowSize) {
+    yield callFunction(std_Array_slice, buffer);
+  }
+}
+
+function IteratorJoin(separator) {
+  var O = this;
+
+  if (!IsObject(O)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, O === null ? "null" : typeof O);
+  }
+
+
+  var sep;
+  if (separator === undefined) {
+    sep = ",";
+  } else {
+    try {
+      sep = ToString(separator);
+    } catch (e) {
+      try {
+        IteratorClose(O);
+      } catch {}
+      throw e;
+    }
+  }
+
+  var nextMethod = O.next;
+
+  var R = "";
+
+  var first = true;
+
+  for (var value of allowContentIterWithNext(O, nextMethod)) {
+    if (first) {
+      first = false;
+    } else {
+      R += sep;
+    }
+
+    if (value !== undefined && value !== null) {
+      R += ToString(value);
+    }
+  }
+
+  return R;
+}
+
+function IteratorIncludes(searchElement, skippedElements = undefined) {
+  var O = this;
+
+  if (!IsObject(O)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, O === null ? "null" : typeof O);
+  }
+
+
+  var toSkip = 0;
+  if (skippedElements !== undefined) {
+    if (!(Number_isInteger(skippedElements) ||
+          (typeof skippedElements === "number" &&
+           !Number_isFinite(skippedElements) &&
+           !Number_isNaN(skippedElements)))) {
+      try {
+        IteratorClose(O);
+      } catch {}
+      ThrowTypeError(JSMSG_INVALID_SKIP_COUNT);
+    }
+    toSkip = skippedElements;
+  }
+
+  if (toSkip < 0) {
+    try {
+      IteratorClose(O);
+    } catch {}
+    ThrowRangeError(JSMSG_NEGATIVE_LIMIT);
+  }
+
+  if (Number_isFinite(toSkip) && toSkip > (2 ** 53) - 1) {
+    try {
+      IteratorClose(O);
+    } catch {}
+    ThrowRangeError(JSMSG_SKIP_COUNT_TOO_LARGE);
+  }
+
+  var skipped = 0;
+
+  var nextMethod = O.next;
+
+  for (var value of allowContentIterWithNext(O, nextMethod)) {
+    if (skipped < toSkip) {
+      skipped++;
+    } else if (value === searchElement || (Number_isNaN(value) && Number_isNaN(searchElement))) {
+      return true;
+    }
+  }
+
+  return false;
+}

@@ -1,0 +1,116 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+*   Copyright (c) 2001-2015, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+**********************************************************************
+*   Date        Name        Description
+*   11/19/2001  aliu        Creation.
+*   05/19/2010  markus      Rewritten from scratch
+**********************************************************************
+*/
+
+#ifndef CHARSTRING_H
+#define CHARSTRING_H
+
+#include "unicode/utypes.h"
+#include "unicode/unistr.h"
+#include "unicode/uobject.h"
+#include "cmemory.h"
+
+U_NAMESPACE_BEGIN
+
+class U_COMMON_API_CLASS CharString : public UMemory {
+public:
+    U_COMMON_API CharString() : len(0) { buffer[0]=0; }
+    U_COMMON_API CharString(StringPiece s, UErrorCode &errorCode) : len(0) {
+        buffer[0]=0;
+        append(s, errorCode);
+    }
+    U_COMMON_API CharString(const CharString &s, UErrorCode &errorCode) : len(0) {
+        buffer[0]=0;
+        append(s, errorCode);
+    }
+    U_COMMON_API CharString(const char *s, int32_t sLength, UErrorCode &errorCode) : len(0) {
+        buffer[0]=0;
+        append(s, sLength, errorCode);
+    }
+    U_COMMON_API ~CharString() {}
+
+    U_COMMON_API CharString(CharString &&src) noexcept;
+    U_COMMON_API CharString &operator=(CharString &&src) noexcept;
+
+    U_COMMON_API CharString &copyFrom(const CharString &other, UErrorCode &errorCode);
+    U_COMMON_API CharString &copyFrom(StringPiece s, UErrorCode &errorCode);
+
+    U_COMMON_API UBool isEmpty() const { return len==0; }
+    U_COMMON_API int32_t length() const { return len; }
+    U_COMMON_API char operator[](int32_t index) const { return buffer[index]; }
+    U_COMMON_API StringPiece toStringPiece() const { return StringPiece(buffer.getAlias(), len); }
+
+    U_COMMON_API const char *data() const { return buffer.getAlias(); }
+    U_COMMON_API char *data() { return buffer.getAlias(); }
+    U_COMMON_API char *cloneData(UErrorCode &errorCode) const;
+    U_COMMON_API int32_t extract(char *dest, int32_t capacity, UErrorCode &errorCode) const;
+
+    U_COMMON_API bool operator==(const CharString& other) const {
+        return len == other.length() && (len == 0 || uprv_memcmp(data(), other.data(), len) == 0);
+    }
+    U_COMMON_API bool operator!=(const CharString& other) const {
+        return !operator==(other);
+    }
+
+    U_COMMON_API bool operator==(StringPiece other) const {
+        return len == other.length() && (len == 0 || uprv_memcmp(data(), other.data(), len) == 0);
+    }
+    U_COMMON_API bool operator!=(StringPiece other) const {
+        return !operator==(other);
+    }
+
+    U_COMMON_API int32_t lastIndexOf(char c) const;
+
+    U_COMMON_API bool contains(StringPiece s) const;
+
+    U_COMMON_API CharString &clear() { len=0; buffer[0]=0; return *this; }
+    U_COMMON_API CharString &truncate(int32_t newLength);
+
+    U_COMMON_API CharString &append(char c, UErrorCode &errorCode);
+    U_COMMON_API CharString &append(StringPiece s, UErrorCode &errorCode) {
+        return append(s.data(), s.length(), errorCode);
+    }
+    U_COMMON_API CharString &append(const CharString &s, UErrorCode &errorCode) {
+        return append(s.data(), s.length(), errorCode);
+    }
+    U_COMMON_API CharString &append(const char *s, int32_t sLength, UErrorCode &status);
+
+    U_COMMON_API CharString &appendNumber(int64_t number, UErrorCode &status);
+
+    U_COMMON_API char *getAppendBuffer(int32_t minCapacity,
+                                       int32_t desiredCapacityHint,
+                                       int32_t &resultCapacity,
+                                       UErrorCode &errorCode);
+
+    U_COMMON_API CharString &appendInvariantChars(const UnicodeString &s, UErrorCode &errorCode);
+    U_COMMON_API CharString &appendInvariantChars(const char16_t* uchars,
+                                                  int32_t ucharsLen,
+                                                  UErrorCode& errorCode);
+
+    U_COMMON_API CharString &appendPathPart(StringPiece s, UErrorCode &errorCode);
+
+    U_COMMON_API CharString &ensureEndsWithFileSeparator(UErrorCode &errorCode);
+
+private:
+    MaybeStackArray<char, 40> buffer;
+    int32_t len;
+
+    UBool ensureCapacity(int32_t capacity, int32_t desiredCapacityHint, UErrorCode &errorCode);
+
+    CharString(const CharString &other) = delete; 
+    CharString &operator=(const CharString &other) = delete; 
+
+    char getDirSepChar() const;
+};
+
+U_NAMESPACE_END
+
+#endif

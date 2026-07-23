@@ -1,0 +1,52 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_CSSPseudoElement_h
+#define mozilla_dom_CSSPseudoElement_h
+
+#include "PseudoStyleType.h"
+#include "js/TypeDecls.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla::dom {
+
+class Animation;
+class Element;
+class UnrestrictedDoubleOrKeyframeAnimationOptions;
+
+class CSSPseudoElement final : public nsWrapperCache {
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(CSSPseudoElement)
+  NS_DECL_CYCLE_COLLECTION_NATIVE_WRAPPERCACHE_CLASS(CSSPseudoElement)
+
+ protected:
+  virtual ~CSSPseudoElement();
+
+ public:
+  ParentObject GetParentObject() const;
+
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  PseudoStyleType GetType() const { return mPseudoType; }
+  void GetType(nsString& aRetVal) const;
+  dom::Element* Element() const { return mOriginatingElement.get(); }
+
+  static already_AddRefed<CSSPseudoElement> GetCSSPseudoElement(
+      dom::Element* aElement, PseudoStyleType aType);
+
+ private:
+  CSSPseudoElement(dom::Element* aElement, PseudoStyleType aType);
+
+  static nsAtom* GetCSSPseudoElementPropertyAtom(PseudoStyleType aType);
+
+  RefPtr<dom::Element> mOriginatingElement;
+  PseudoStyleType mPseudoType;
+};
+
+}  
+
+#endif  // mozilla_dom_CSSPseudoElement_h

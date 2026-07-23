@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const lazy = {};
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  PlacesUtils: "resource://gre/modules/PlacesUtils.sys.mjs",
+});
+
+export var KeywordUtils = {
+  async parseUrlAndPostData(url, postData, param) {
+    let hasGETParam = /%s/i.test(url);
+    let decodedPostData = postData ? unescape(postData) : "";
+    let hasPOSTParam = /%s/i.test(decodedPostData);
+
+    if (!hasGETParam && !hasPOSTParam) {
+      if (param) {
+        throw new Error(
+          "A param was provided but there's nothing to bind it to"
+        );
+      }
+      return [url, postData];
+    }
+
+    let charset = "";
+    const re = /^(.*)\&mozcharset=([a-zA-Z][_\-a-zA-Z0-9]+)\s*$/;
+    let matches = url.match(re);
+    if (matches) {
+      [, url, charset] = matches;
+    } else {
+      try {
+        let pageInfo = await lazy.PlacesUtils.history.fetch(url, {
+          includeAnnotations: true,
+        });
+        if (
+          pageInfo &&
+          pageInfo.annotations.has(lazy.PlacesUtils.CHARSET_ANNO)
+        ) {
+          charset = pageInfo.annotations.get(lazy.PlacesUtils.CHARSET_ANNO);
+        }
+      } catch (ex) {
+        console.error(ex);
+      }
+    }
+
+    let encodedParam = "";
+    if (charset && charset != "UTF-8") {
+      try {
+        encodedParam = Services.textToSubURI.ConvertAndEscape(charset, param);
+      } catch (ex) {
+        encodedParam = encodeURIComponent(param);
+      }
+    } else {
+      encodedParam = encodeURIComponent(param);
+    }
+
+    url = url.replace(/%s/g, encodedParam).replace(/%S/g, param);
+    if (hasPOSTParam) {
+      postData = decodedPostData
+        .replace(/%s/g, encodedParam)
+        .replace(/%S/g, param);
+    }
+    return [url, postData];
+  },
+
+  async getBindableKeyword(keyword, searchString) {
+    let entry = await lazy.PlacesUtils.keywords.fetch(keyword);
+    if (!entry) {
+      return {};
+    }
+
+    try {
+      let [url, postData] = await this.parseUrlAndPostData(
+        entry.url.href,
+        entry.postData,
+        searchString
+      );
+      return { entry, url, postData };
+    } catch (ex) {
+      return {};
+    }
+  },
+};

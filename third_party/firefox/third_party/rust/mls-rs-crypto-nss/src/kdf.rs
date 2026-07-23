@@ -1,0 +1,110 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright by contributors to this project.
+// SPDX-License-Identifier: (Apache-2.0 OR MIT)
+
+use core::fmt::Debug;
+
+use mls_rs_core::{crypto::CipherSuite, error::IntoAnyError};
+use mls_rs_crypto_traits::{KdfId, KdfType};
+
+use alloc::vec::Vec;
+
+#[derive(Debug)]
+#[cfg_attr(feature = "std", derive(thiserror::Error))]
+pub enum KdfError {
+#[cfg_attr(feature = "std", error("the provided length of the key {0} is shorter than the minimum length {1}"))]
+TooShortKey(usize, usize),
+    #[cfg_attr(feature = "std", error("invalid input"))]
+    InvalidInput,
+    #[cfg_attr(feature = "std", error("internal error"))]
+    InternalError,
+    #[cfg_attr(feature = "std", error("unsupported cipher suite"))]
+    UnsupportedCipherSuite,
+}
+
+impl From<nss_rs::hkdf::HkdfError> for KdfError {
+    fn from(_value: nss_rs::hkdf::HkdfError) -> Self {
+        KdfError::InvalidInput
+    }
+}
+
+impl From<nss_rs::Error> for KdfError {
+    fn from(_value: nss_rs::Error) -> Self {
+        KdfError::InternalError
+    }
+}
+
+impl IntoAnyError for KdfError {
+    #[cfg(feature = "std")]
+    fn into_dyn_error(self) -> Result<Box<dyn std::error::Error + Send + Sync>, Self> {
+        Ok(self.into())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Kdf(KdfId);
+
+impl Kdf {
+    pub fn new(cipher_suite: CipherSuite) -> Option<Self> {
+        KdfId::new(cipher_suite).map(Self)
+    }
+}
+
+#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+#[cfg_attr(mls_build_async, maybe_async::must_be_async)]
+impl KdfType for Kdf {
+    type Error = KdfError;
+
+    async fn expand(&self, prk: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>, KdfError> {
+        if prk.len() < self.extract_size() {
+            return Err(KdfError::TooShortKey(prk.len(), self.extract_size()));
+        }
+
+        nss_rs::init()?;
+
+        let alg = match self.0 {
+            KdfId::HkdfSha256 => Ok(nss_rs::hkdf::HkdfAlgorithm::HKDF_SHA2_256),
+            KdfId::HkdfSha384 => Ok(nss_rs::hkdf::HkdfAlgorithm::HKDF_SHA2_384),
+            KdfId::HkdfSha512 => Ok(nss_rs::hkdf::HkdfAlgorithm::HKDF_SHA2_512),
+            _ => Err(KdfError::UnsupportedCipherSuite),
+        }?;
+
+        let hkdf = nss_rs::hkdf::Hkdf::new(alg);
+        let prk_symkey = hkdf.import_secret(prk).unwrap();
+
+        let r = hkdf
+            .expand_data(&prk_symkey, info, len)
+            .expect("HkdfError::InternalError");
+        Ok(r)
+    }
+
+    async fn extract(&self, salt: &[u8], ikm: &[u8]) -> Result<Vec<u8>, KdfError> {
+        if ikm.is_empty() {
+            return Err(KdfError::TooShortKey(0, 1));
+        }
+
+        nss_rs::init()?;
+
+        let alg = match self.0 {
+            KdfId::HkdfSha256 => Ok(nss_rs::hkdf::HkdfAlgorithm::HKDF_SHA2_256),
+            KdfId::HkdfSha384 => Ok(nss_rs::hkdf::HkdfAlgorithm::HKDF_SHA2_384),
+            KdfId::HkdfSha512 => Ok(nss_rs::hkdf::HkdfAlgorithm::HKDF_SHA2_512),
+            _ => Err(KdfError::UnsupportedCipherSuite),
+        }?;
+
+        let hkdf = nss_rs::hkdf::Hkdf::new(alg);
+        let ikm_symkey = hkdf.import_secret(ikm).unwrap();
+
+        let prk = hkdf.extract(salt, &ikm_symkey).unwrap();
+        let prk_data = prk.key_data().unwrap();
+        Ok(prk_data.to_vec())
+    }
+
+    fn extract_size(&self) -> usize {
+        self.0.extract_size()
+    }
+
+    fn kdf_id(&self) -> u16 {
+        self.0 as u16
+    }
+}

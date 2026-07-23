@@ -1,0 +1,79 @@
+/***************************************************************************
+ * Copyright (c) Johan Mabille, Sylvain Corlay, Wolf Vollprecht and         *
+ * Martin Renou                                                             *
+ * Copyright (c) QuantStack                                                 *
+ * Copyright (c) Serge Guelton                                              *
+ *                                                                          *
+ * Distributed under the terms of the BSD 3-Clause License.                 *
+ *                                                                          *
+ * The full license is in the file LICENSE, distributed with this software. *
+ ***************************************************************************/
+
+#if !defined(XSIMD_CPU_FEATURES_RISCV_HPP)
+#define XSIMD_CPU_FEATURES_RISCV_HPP
+
+#include "./xsimd_config.hpp"
+#include "./xsimd_getauxval.hpp"
+
+#include <cstddef>
+#include <cstdint>
+
+#if XSIMD_TARGET_RISCV && XSIMD_HAVE_LINUX_GETAUXVAL
+#include <asm/hwcap.h>
+#endif
+
+namespace xsimd
+{
+    namespace detail
+    {
+        using riscv_reg64_t = std::uint64_t;
+
+        inline riscv_reg64_t riscv_csrr_unsafe();
+    }
+
+    class riscv_cpu_features : private linux_hwcap_backend_default
+    {
+    public:
+        inline bool rvv() const noexcept;
+        inline std::size_t rvv_size_bytes() const noexcept;
+    };
+
+
+    namespace detail
+    {
+#if XSIMD_TARGET_RISCV && (defined(__GNUC__) || defined(__clang__))
+        __attribute__((target("arch=+v"))) inline riscv_reg64_t riscv_csrr_unsafe()
+        {
+            riscv_reg64_t vlenb;
+            __asm__ volatile("csrr %0, vlenb" : "=r"(vlenb));
+            return vlenb;
+        }
+#else
+        inline riscv_reg64_t riscv_csrr_unsafe() { return 0; }
+#endif
+    }
+
+    inline bool riscv_cpu_features::rvv() const noexcept
+    {
+#if XSIMD_TARGET_RISCV && XSIMD_HAVE_LINUX_GETAUXVAL
+#if defined(HWCAP_V)
+        return hwcap().has_feature(HWCAP_V);
+#else
+        return hwcap().has_feature(1 << ('V' - 'A'));
+#endif
+#else
+        return false;
+#endif
+    }
+
+    inline std::size_t riscv_cpu_features::rvv_size_bytes() const noexcept
+    {
+        if (rvv())
+        {
+            return detail::riscv_csrr_unsafe();
+        }
+        return 0;
+    }
+}
+
+#endif

@@ -1,0 +1,37 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_WorkerEventTarget_h
+#define mozilla_dom_WorkerEventTarget_h
+
+#include "mozilla/Mutex.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "nsISerialEventTarget.h"
+
+namespace mozilla::dom {
+
+class WorkerEventTarget final : public nsISerialEventTarget {
+ public:
+  enum class Behavior : uint8_t { Hybrid, ControlOnly, DebuggerOnly };
+
+ private:
+  mozilla::Mutex mMutex;
+  CheckedUnsafePtr<WorkerPrivate> mWorkerPrivate MOZ_GUARDED_BY(mMutex);
+  const Behavior mBehavior MOZ_GUARDED_BY(mMutex);
+
+  ~WorkerEventTarget() = default;
+
+ public:
+  WorkerEventTarget(WorkerPrivate* aWorkerPrivate, Behavior aBehavior);
+
+  void ForgetWorkerPrivate(WorkerPrivate* aWorkerPrivate);
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIEVENTTARGET
+  NS_DECL_NSISERIALEVENTTARGET
+};
+
+}  
+
+#endif  // mozilla_dom_WorkerEventTarget_h

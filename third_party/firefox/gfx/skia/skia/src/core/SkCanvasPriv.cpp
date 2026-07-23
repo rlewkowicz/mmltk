@@ -1,0 +1,252 @@
+/*
+ * Copyright 2018 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/core/SkCanvasPriv.h"
+
+#include "include/core/SkBlendMode.h"
+#include "include/core/SkColor.h"
+#include "include/core/SkColorFilter.h"
+#include "include/core/SkImageFilter.h"
+#include "include/core/SkMaskFilter.h"
+#include "include/core/SkMatrix.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkShader.h"
+#include "include/private/base/SkAlign.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkTo.h"
+#include "src/base/SkAutoMalloc.h"
+#include "src/core/SkMaskFilterBase.h"
+#include "src/core/SkReadBuffer.h"
+#include "src/core/SkWriteBuffer.h"
+#include "src/core/SkWriter32.h"
+
+#include <limits>
+#include <utility>
+#include <cstdint>
+
+SkAutoCanvasMatrixPaint::SkAutoCanvasMatrixPaint(SkCanvas* canvas, const SkMatrix* matrix,
+                                                 const SkPaint* paint, const SkRect& bounds)
+        : fCanvas(canvas)
+        , fSaveCount(canvas->getSaveCount()) {
+    if (paint) {
+        SkRect newBounds = bounds;
+        if (matrix) {
+            matrix->mapRect(&newBounds);
+        }
+        canvas->saveLayer(&newBounds, paint);
+    } else if (matrix) {
+        canvas->save();
+    }
+
+    if (matrix) {
+        canvas->concat(*matrix);
+    }
+}
+
+SkAutoCanvasMatrixPaint::~SkAutoCanvasMatrixPaint() {
+    fCanvas->restoreToCount(fSaveCount);
+}
+
+
+bool SkCanvasPriv::ReadLattice(SkReadBuffer& buffer, SkCanvas::Lattice* lattice) {
+    lattice->fXCount = buffer.readInt();
+    if (lattice->fXCount < 0) {
+        return false;
+    }
+    lattice->fXDivs = buffer.skipT<int32_t>(lattice->fXCount);
+    lattice->fYCount = buffer.readInt();
+    if (lattice->fYCount < 0) {
+        return false;
+    }
+    lattice->fYDivs = buffer.skipT<int32_t>(lattice->fYCount);
+    int flagCount = buffer.readInt();
+    lattice->fRectTypes = nullptr;
+    lattice->fColors = nullptr;
+    if (flagCount) {
+        if (flagCount < 0 || (uint64_t) flagCount != ((uint64_t) lattice->fXCount + 1) *
+                                                     ((uint64_t) lattice->fYCount + 1)) {
+            return false;
+        }
+        lattice->fRectTypes = buffer.skipT<SkCanvas::Lattice::RectType>(flagCount);
+        lattice->fColors = buffer.skipT<SkColor>(flagCount);
+    }
+    lattice->fBounds = buffer.skipT<SkIRect>();
+    return buffer.isValid();
+}
+
+size_t SkCanvasPriv::WriteLattice(void* buffer, const SkCanvas::Lattice& lattice) {
+    int flagCount = lattice.fRectTypes ? (lattice.fXCount + 1) * (lattice.fYCount + 1) : 0;
+
+    const size_t size = (1 + lattice.fXCount + 1 + lattice.fYCount + 1) * sizeof(int32_t) +
+                        SkAlign4(flagCount * sizeof(SkCanvas::Lattice::RectType)) +
+                        SkAlign4(flagCount * sizeof(SkColor)) +
+                        sizeof(SkIRect);
+
+    if (buffer) {
+        SkWriter32 writer(buffer, size);
+        writer.write32(lattice.fXCount);
+        writer.write(lattice.fXDivs, lattice.fXCount * sizeof(uint32_t));
+        writer.write32(lattice.fYCount);
+        writer.write(lattice.fYDivs, lattice.fYCount * sizeof(uint32_t));
+        writer.write32(flagCount);
+        writer.writePad(lattice.fRectTypes, flagCount * sizeof(uint8_t));
+        writer.write(lattice.fColors, flagCount * sizeof(SkColor));
+        SkASSERT(lattice.fBounds);
+        writer.write(lattice.fBounds, sizeof(SkIRect));
+        SkASSERT(writer.bytesWritten() == size);
+    }
+    return size;
+}
+
+void SkCanvasPriv::WriteLattice(SkWriteBuffer& buffer, const SkCanvas::Lattice& lattice) {
+    const size_t size = WriteLattice(nullptr, lattice);
+    SkAutoSMalloc<1024> storage(size);
+    WriteLattice(storage.get(), lattice);
+    buffer.writePad32(storage.get(), size);
+}
+
+void SkCanvasPriv::GetDstClipAndMatrixCounts(const SkCanvas::ImageSetEntry set[], int count,
+                                             int* totalDstClipCount, int* totalMatrixCount) {
+    int dstClipCount = 0;
+    int maxMatrixIndex = -1;
+    for (int i = 0; i < count; ++i) {
+        dstClipCount += 4 * set[i].fHasClip;
+        if (set[i].fMatrixIndex > maxMatrixIndex) {
+            maxMatrixIndex = set[i].fMatrixIndex;
+        }
+    }
+
+    *totalDstClipCount = dstClipCount;
+    *totalMatrixCount = maxMatrixIndex + 1;
+}
+
+bool SkCanvasPriv::ImageToColorFilter(SkPaint* paint) {
+    SkASSERT(SkToBool(paint) && paint->getImageFilter());
+
+    if (paint->getMaskFilter()) {
+        return false;
+    }
+
+    SkColorFilter* imgCFPtr;
+    if (!paint->getImageFilter()->asAColorFilter(&imgCFPtr)) {
+        return false;
+    }
+    sk_sp<SkColorFilter> imgCF(imgCFPtr);
+
+    SkColorFilter* paintCF = paint->getColorFilter();
+    if (paintCF) {
+        imgCF = imgCF->makeComposed(sk_ref_sp(paintCF));
+    }
+
+    paint->setColorFilter(std::move(imgCF));
+    paint->setImageFilter(nullptr);
+    return true;
+}
+
+AutoLayerForImageFilter::AutoLayerForImageFilter(SkCanvas* canvas,
+                                                 const SkPaint& paint,
+                                                 const SkRect* rawBounds,
+                                                 bool skipMaskFilterLayer)
+            : fPaint(paint)
+            , fCanvas(canvas)
+            , fTempLayersForFilters(0) {
+    SkDEBUGCODE(fSaveCount = canvas->getSaveCount();)
+
+    if (fPaint.getImageFilter() && !SkCanvasPriv::ImageToColorFilter(&fPaint)) {
+        this->addImageFilterLayer(rawBounds);
+    }
+
+    if (fPaint.getMaskFilter() && !skipMaskFilterLayer) {
+        this->addMaskFilterLayer(rawBounds);
+    }
+
+}
+
+AutoLayerForImageFilter::~AutoLayerForImageFilter() {
+    for (int i = 0; i < fTempLayersForFilters; ++i) {
+        fCanvas->fSaveCount -= 1;
+        fCanvas->internalRestore();
+    }
+    SkASSERT(fSaveCount < 0 || fCanvas->getSaveCount() == fSaveCount);
+}
+
+AutoLayerForImageFilter::AutoLayerForImageFilter(AutoLayerForImageFilter&& other) {
+    *this = std::move(other);
+}
+
+AutoLayerForImageFilter& AutoLayerForImageFilter::operator=(AutoLayerForImageFilter&& other) {
+    fPaint = std::move(other.fPaint);
+    fCanvas = other.fCanvas;
+    fTempLayersForFilters = other.fTempLayersForFilters;
+    SkDEBUGCODE(fSaveCount = other.fSaveCount;)
+
+    other.fTempLayersForFilters = 0;
+    SkDEBUGCODE(other.fSaveCount = -1;)
+
+    return *this;
+}
+
+void AutoLayerForImageFilter::addImageFilterLayer(const SkRect* drawBounds) {
+    SkASSERT(fPaint.getImageFilter());
+
+    SkPaint restorePaint;
+    restorePaint.setImageFilter(fPaint.refImageFilter());
+    restorePaint.setBlender(fPaint.refBlender());
+
+    fPaint.setImageFilter(nullptr);
+    fPaint.setBlendMode(SkBlendMode::kSrcOver);
+
+    this->addLayer(restorePaint, drawBounds, false);
+}
+
+void AutoLayerForImageFilter::addMaskFilterLayer(const SkRect* drawBounds) {
+    SkASSERT(fPaint.getMaskFilter());
+
+    SkASSERT(!fPaint.getImageFilter());
+
+    auto [maskFilterAsImageFilter, appliesShading] = as_MFB(
+        fPaint.getMaskFilter())->asImageFilter(fCanvas->getTotalMatrix(), fPaint);
+    if (!maskFilterAsImageFilter) {
+        return;
+    }
+
+    SkPaint restorePaint;
+    if (!appliesShading) {
+        restorePaint.setColor4f(fPaint.getColor4f());
+        restorePaint.setShader(fPaint.refShader());
+        restorePaint.setColorFilter(fPaint.refColorFilter());
+        restorePaint.setDither(fPaint.isDither());
+    }
+    restorePaint.setBlender(fPaint.refBlender());
+    restorePaint.setImageFilter(maskFilterAsImageFilter);
+
+    fPaint.setColor4f(SkColors::kWhite);
+    fPaint.setShader(nullptr);
+    fPaint.setColorFilter(nullptr);
+    fPaint.setMaskFilter(nullptr);
+    fPaint.setDither(false);
+    fPaint.setBlendMode(SkBlendMode::kSrcOver);
+
+    this->addLayer(restorePaint, drawBounds, !appliesShading);
+}
+
+void AutoLayerForImageFilter::addLayer(const SkPaint& restorePaint,
+                                       const SkRect* drawBounds,
+                                       bool coverageOnly) {
+    SkRect storage;
+    const SkRect* contentBounds = nullptr;
+    if (drawBounds && fPaint.canComputeFastBounds()) {
+        contentBounds = &fPaint.computeFastBounds(*drawBounds, &storage);
+    }
+
+    fCanvas->fSaveCount += 1;
+    fCanvas->internalSaveLayer(SkCanvas::SaveLayerRec(contentBounds, &restorePaint),
+                               SkCanvas::kFullLayer_SaveLayerStrategy,
+                               coverageOnly);
+    fTempLayersForFilters += 1;
+}

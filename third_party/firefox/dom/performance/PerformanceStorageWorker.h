@@ -1,0 +1,44 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_PerformanceStorageWorker_h
+#define mozilla_dom_PerformanceStorageWorker_h
+
+#include "PerformanceStorage.h"
+#include "mozilla/Mutex.h"
+
+namespace mozilla::dom {
+
+class WeakWorkerRef;
+class WorkerPrivate;
+
+class PerformanceProxyData;
+
+class PerformanceStorageWorker final : public PerformanceStorage {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(PerformanceStorageWorker, override)
+
+  static already_AddRefed<PerformanceStorageWorker> Create(
+      WorkerPrivate* aWorkerPrivate);
+
+  void ShutdownOnWorker();
+
+  void AddEntry(nsIHttpChannel* aChannel,
+                nsITimedChannel* aTimedChannel) override;
+  void AddEntry(const nsString& aEntryName, const nsString& aInitiatorType,
+                UniquePtr<PerformanceTimingData>&& aData) override;
+  void AddEntryOnWorker(UniquePtr<PerformanceProxyData>&& aData);
+
+ private:
+  PerformanceStorageWorker();
+  ~PerformanceStorageWorker();
+
+  Mutex mMutex;
+
+  RefPtr<WeakWorkerRef> mWorkerRef MOZ_GUARDED_BY(mMutex);
+};
+
+}  
+
+#endif  // mozilla_dom_PerformanceStorageWorker_h

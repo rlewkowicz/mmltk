@@ -1,0 +1,88 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsXULPrototypeDocument_h_
+#define nsXULPrototypeDocument_h_
+
+#include <functional>
+
+#include "js/TracingAPI.h"
+#include "nsCOMArray.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsISerializable.h"
+#include "nsTArray.h"
+
+class nsAtom;
+class nsIPrincipal;
+class nsIURI;
+class nsNodeInfoManager;
+class nsXULPrototypeElement;
+class nsXULPrototypePI;
+
+namespace mozilla::dom {
+class Element;
+}
+
+class nsXULPrototypeDocument final : public nsISerializable {
+ public:
+  using Callback = std::function<void()>;
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+
+  NS_DECL_NSISERIALIZABLE
+
+  nsresult InitPrincipal(nsIURI* aURI, nsIPrincipal* aPrincipal);
+  nsIURI* GetURI();
+
+  nsXULPrototypeElement* GetRootElement();
+  void SetRootElement(nsXULPrototypeElement* aElement);
+
+  nsresult AddProcessingInstruction(nsXULPrototypePI* aPI);
+  const nsTArray<RefPtr<nsXULPrototypePI> >& GetProcessingInstructions() const;
+
+  nsIPrincipal* DocumentPrincipal();
+  void SetDocumentPrincipal(nsIPrincipal* aPrincipal);
+
+  nsresult AwaitLoadDone(Callback&& aCallback, bool* aResult);
+
+  nsresult NotifyLoadDone();
+
+  nsNodeInfoManager* GetNodeInfoManager();
+
+  void MarkInCCGeneration(uint32_t aCCGeneration);
+
+  NS_DECL_CYCLE_COLLECTION_CLASS(nsXULPrototypeDocument)
+
+  bool WasL10nCached() { return mWasL10nCached; };
+
+  void SetIsL10nCached(bool aIsCached);
+  void RebuildPrototypeFromElement(nsXULPrototypeElement* aPrototype,
+                                   mozilla::dom::Element* aElement, bool aDeep);
+  void RebuildL10nPrototype(mozilla::dom::Element* aElement, bool aDeep);
+
+ protected:
+  nsCOMPtr<nsIURI> mURI;
+  RefPtr<nsXULPrototypeElement> mRoot;
+  nsTArray<RefPtr<nsXULPrototypePI> > mProcessingInstructions;
+
+  bool mLoaded;
+  nsTArray<Callback> mPrototypeWaiters;
+
+  RefPtr<nsNodeInfoManager> mNodeInfoManager;
+
+  uint32_t mCCGeneration;
+
+  nsXULPrototypeDocument();
+  virtual ~nsXULPrototypeDocument();
+  nsresult Init();
+
+  friend NS_IMETHODIMP NS_NewXULPrototypeDocument(
+      nsXULPrototypeDocument** aResult);
+
+  static uint32_t gRefCnt;
+  bool mWasL10nCached;
+};
+
+#endif  // nsXULPrototypeDocument_h_

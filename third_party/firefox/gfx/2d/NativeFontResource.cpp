@@ -1,0 +1,45 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "2D.h"
+#include "nsIMemoryReporter.h"
+
+namespace mozilla {
+namespace gfx {
+
+static Atomic<size_t> gTotalNativeFontResourceData;
+
+NativeFontResource::NativeFontResource(size_t aDataLength)
+    : mDataLength(aDataLength) {
+  gTotalNativeFontResourceData += mDataLength;
+}
+
+NativeFontResource::~NativeFontResource() {
+  gTotalNativeFontResourceData -= mDataLength;
+}
+
+class NativeFontResourceDataMemoryReporter final : public nsIMemoryReporter {
+  ~NativeFontResourceDataMemoryReporter() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    MOZ_COLLECT_REPORT("explicit/gfx/native-font-resource-data", KIND_HEAP,
+                       UNITS_BYTES, gTotalNativeFontResourceData,
+                       "Total memory used by native font API resource data.");
+    return NS_OK;
+  }
+};
+
+NS_IMPL_ISUPPORTS(NativeFontResourceDataMemoryReporter, nsIMemoryReporter)
+
+void NativeFontResource::RegisterMemoryReporter() {
+  RegisterStrongMemoryReporter(
+      MakeAndAddRef<NativeFontResourceDataMemoryReporter>());
+}
+
+}  
+}  

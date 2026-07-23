@@ -1,0 +1,101 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_BLUR_H
+#define GFX_BLUR_H
+
+#include "gfxTypes.h"
+#include "gfxRect.h"
+#include "nsSize.h"
+#include "gfxPoint.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/gfx/Blur.h"
+
+class gfxContext;
+
+namespace mozilla {
+namespace gfx {
+struct sRGBColor;
+struct RectCornerRadii;
+class SourceSurface;
+class DrawTarget;
+}  
+}  
+
+class gfxGaussianBlur final {
+  typedef mozilla::gfx::sRGBColor sRGBColor;
+  typedef mozilla::gfx::DrawTarget DrawTarget;
+  typedef mozilla::gfx::RectCornerRadii RectCornerRadii;
+
+ public:
+  gfxGaussianBlur() = default;
+
+  ~gfxGaussianBlur();
+
+  mozilla::UniquePtr<gfxContext> Init(
+      gfxContext* aDestinationCtx, const gfxRect& aRect,
+      const mozilla::gfx::IntSize& aSpreadRadius,
+      const mozilla::gfx::Point& aBlurSigma, const gfxRect* aDirtyRect,
+      const gfxRect* aSkipRect, bool aClamp = false);
+
+  mozilla::UniquePtr<gfxContext> Init(
+      gfxContext* aDestinationCtx, const gfxRect& aRect,
+      const mozilla::gfx::IntSize& aSpreadRadius,
+      const mozilla::gfx::IntSize& aBlurRadius, const gfxRect* aDirtyRect,
+      const gfxRect* aSkipRect, bool aClamp = false);
+
+  already_AddRefed<DrawTarget> InitDrawTarget(
+      const mozilla::gfx::DrawTarget* aReferenceDT,
+      const mozilla::gfx::Rect& aRect,
+      const mozilla::gfx::IntSize& aSpreadRadius,
+      const mozilla::gfx::Point& aBlurSigma,
+      const mozilla::gfx::Rect* aDirtyRect = nullptr,
+      const mozilla::gfx::Rect* aSkipRect = nullptr, bool aClamp = false);
+
+  already_AddRefed<mozilla::gfx::SourceSurface> DoBlur(
+      const mozilla::gfx::sRGBColor* aShadowColor = nullptr,
+      mozilla::gfx::IntPoint* aOutTopLeft = nullptr);
+
+  void Paint(gfxContext* aDestinationCtx);
+
+  static mozilla::gfx::IntSize CalculateBlurRadius(
+      const gfxPoint& aStandardDeviation);
+  static mozilla::gfx::Point CalculateBlurSigma(
+      const mozilla::gfx::IntSize& aBlurRadius);
+
+  static void BlurRectangle(gfxContext* aDestinationCtx, const gfxRect& aRect,
+                            const RectCornerRadii* aCornerRadii,
+                            const gfxPoint& aBlurStdDev,
+                            const sRGBColor& aShadowColor,
+                            const gfxRect& aDirtyRect,
+                            const gfxRect& aSkipRect);
+
+  static void ShutdownBlurCache();
+
+  void BlurInsetBox(gfxContext* aDestinationCtx,
+                    const mozilla::gfx::Rect& aDestinationRect,
+                    const mozilla::gfx::Rect& aShadowClipRect,
+                    const mozilla::gfx::IntSize& aBlurRadius,
+                    const mozilla::gfx::sRGBColor& aShadowColor,
+                    const RectCornerRadii* aInnerClipRadii,
+                    const mozilla::gfx::Rect& aSkipRect,
+                    const mozilla::gfx::Point& aShadowOffset);
+
+ protected:
+  already_AddRefed<mozilla::gfx::SourceSurface> GetInsetBlur(
+      const mozilla::gfx::Rect& aOuterRect,
+      const mozilla::gfx::Rect& aWhitespaceRect, bool aIsDestRect,
+      const mozilla::gfx::sRGBColor& aShadowColor,
+      const mozilla::gfx::IntSize& aBlurRadius,
+      const RectCornerRadii* aInnerClipRadii, DrawTarget* aDestDrawTarget,
+      bool aMirrorCorners);
+
+  RefPtr<DrawTarget> mDrawTarget;
+
+  uint8_t* mData = nullptr;
+
+  mozilla::gfx::GaussianBlur mBlur;
+};
+
+#endif /* GFX_BLUR_H */

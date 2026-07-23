@@ -1,0 +1,132 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsHTTPSOnlyUtils_h_
+#define nsHTTPSOnlyUtils_h_
+
+#include "mozilla/net/DocumentLoadListener.h"
+#include "nsIScriptError.h"
+#include "nsISupports.h"
+
+class nsHTTPSOnlyUtils {
+ public:
+  enum UpgradeMode {
+    NO_UPGRADE_MODE,
+    HTTPS_ONLY_MODE,
+    HTTPS_FIRST_MODE,
+    SCHEMELESS_HTTPS_FIRST_MODE
+  };
+
+  static UpgradeMode GetUpgradeMode(
+      bool aFromPrivateWindow,
+      nsILoadInfo::SchemelessInputType aSchemelessInputType =
+          nsILoadInfo::SchemelessInputTypeUnset);
+
+  static UpgradeMode GetUpgradeMode(nsILoadInfo* aLoadInfo);
+
+  static void PotentiallyFireHttpRequestToShortenTimout(
+      mozilla::net::DocumentLoadListener* aDocumentLoadListener);
+
+  static bool ShouldUpgradeRequest(nsIURI* aURI, nsILoadInfo* aLoadInfo);
+
+  static bool ShouldUpgradeWebSocket(nsIURI* aURI, nsILoadInfo* aLoadInfo);
+
+  enum class UpgradeDowngradeEndlessLoopOptions {
+    EnforceForHTTPSOnlyMode,
+    EnforceForHTTPSFirstMode,
+    EnforceForHTTPSRR,
+  };
+  static bool IsUpgradeDowngradeEndlessLoop(
+      nsIURI* aOldURI, nsIURI* aNewURI, nsILoadInfo* aLoadInfo,
+      const mozilla::EnumSet<UpgradeDowngradeEndlessLoopOptions>& aOptions =
+          {});
+
+  static bool ShouldUpgradeHttpsFirstRequest(nsIURI* aURI,
+                                             nsILoadInfo* aLoadInfo);
+
+  static already_AddRefed<nsIURI> PotentiallyDowngradeHttpsFirstRequest(
+      mozilla::net::DocumentLoadListener* aDocumentLoadListener,
+      nsresult aStatus);
+
+  static bool CouldBeHttpsOnlyError(nsIChannel* aChannel, nsresult aError);
+
+  static void LogLocalizedString(const char* aName,
+                                 const nsTArray<nsString>& aParams,
+                                 uint32_t aFlags, nsILoadInfo* aLoadInfo,
+                                 nsIURI* aURI = nullptr,
+                                 bool aUseHttpsFirst = false);
+
+  static bool TestIfPrincipalIsExempt(nsIPrincipal* aPrincipal,
+                                      UpgradeMode aUpgradeMode);
+
+  static void TestSitePermissionAndPotentiallyAddExemption(
+      nsIChannel* aChannel);
+
+  static bool IsSafeToAcceptCORSOrMixedContent(nsILoadInfo* aLoadInfo);
+
+  static bool IsHttpDowngrade(nsIURI* aFromURI, nsIURI* aToURI);
+
+  static nsresult AddHTTPSFirstException(nsCOMPtr<nsIURI> aURI,
+                                         nsILoadInfo* const aLoadInfo);
+
+  static uint32_t GetStatusForSubresourceLoad(uint32_t aHttpsOnlyStatus);
+
+  static void UpdateLoadStateAfterHTTPSFirstDowngrade(
+      mozilla::net::DocumentLoadListener* aDocumentLoadListener,
+      nsDocShellLoadState* aLoadState);
+
+  static void SubmitHTTPSFirstTelemetry(
+      nsCOMPtr<nsILoadInfo> const& aLoadInfo,
+      RefPtr<HTTPSFirstDowngradeData> const& aHttpsFirstDowngradeData);
+
+ private:
+  static bool HttpsUpgradeUnrelatedErrorCode(nsresult aError);
+  static void LogMessage(const nsAString& aMessage, uint32_t aFlags,
+                         nsILoadInfo* aLoadInfo, nsIURI* aURI = nullptr,
+                         bool aUseHttpsFirst = false);
+
+  static bool OnionException(nsIURI* aURI);
+
+  static bool LoopbackOrLocalException(nsIURI* aURI);
+
+  static bool UnknownPublicSuffixException(nsIURI* aURI);
+
+};
+
+class TestHTTPAnswerRunnable final : public mozilla::Runnable,
+                                     public nsIStreamListener,
+                                     public nsIInterfaceRequestor,
+                                     public nsITimerCallback {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIRUNNABLE
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSITIMERCALLBACK
+
+  explicit TestHTTPAnswerRunnable(
+      nsIURI* aURI, mozilla::net::DocumentLoadListener* aDocumentLoadListener);
+
+ protected:
+  ~TestHTTPAnswerRunnable() = default;
+
+ private:
+  static bool IsBackgroundRequestRedirected(nsIHttpChannel* aChannel);
+
+  RefPtr<nsIURI> mURI;
+  RefPtr<mozilla::net::DocumentLoadListener> mDocumentLoadListener;
+  RefPtr<nsITimer> mTimer;
+  bool mHasHTTPSRR{false};
+};
+
+struct HTTPSFirstDowngradeData
+    : public mozilla::RefCounted<HTTPSFirstDowngradeData> {
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(HTTPSFirstDowngradeData)
+  mozilla::TimeDuration downgradeTime;
+  bool isOnTimer = false;
+  bool isSchemeless = false;
+};
+
+#endif /* nsHTTPSOnlyUtils_h_ */

@@ -1,0 +1,71 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+@namespace url("http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul");
+
+toolbar {
+  min-width: 1px;
+  /* stylelint-disable-next-line stylelint-plugin-mozilla/use-design-tokens */
+  min-height: 20px;
+
+  @media (-moz-platform: linux) {
+    background-color: -moz-headerbar;
+    color: -moz-headerbartext;
+    /* stylelint-disable-next-line stylelint-plugin-mozilla/use-design-tokens */
+    padding: 2px 0;
+
+    &:where(:-moz-window-inactive) {
+      background-color: -moz-headerbarinactive;
+      color: -moz-headerbarinactivetext;
+    }
+
+    &[type="menubar"] {
+      background-color: transparent;
+      padding: 1px 0;
+    }
+  }
+}
+
+toolbarseparator {
+  color: var(--toolbarseparator-color);
+  /* stylelint-disable-next-line stylelint-plugin-mozilla/use-design-tokens */
+  padding: 2px;
+
+  &::before {
+    content: "";
+    flex: 1;
+    display: block;
+    border-inline-start: 0.01px solid;
+  }
+
+  panel &::before {
+    border-inline-start: none;
+    border-block-start: 0.01px solid;
+  }
+}
+
+toolbarspacer {
+  /* stylelint-disable-next-line stylelint-plugin-mozilla/use-design-tokens */
+  width: 15px;
+}
+
+toolbarpaletteitem {
+  cursor: grab;
+}
+
+
+toolbarpaletteitem[place="toolbar"] {
+  /* stylelint-disable-next-line stylelint-plugin-mozilla/use-design-tokens */
+  margin-inline: -2px;
+  border-inline: 2px solid transparent;
+}
+
+toolbarpaletteitem[dragover="left"] {
+  border-left-color: currentColor;
+}
+
+toolbarpaletteitem[dragover="right"] {
+  border-right-color: currentColor;
+}

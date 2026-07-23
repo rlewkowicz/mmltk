@@ -1,0 +1,54 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_BrowserBridgeHost_h
+#define mozilla_dom_BrowserBridgeHost_h
+
+#include "mozilla/dom/BrowserBridgeChild.h"
+#include "mozilla/dom/RemoteBrowser.h"
+
+namespace mozilla::dom {
+
+class BrowserBridgeHost final : public RemoteBrowser {
+ public:
+  typedef mozilla::layers::LayersId LayersId;
+
+  explicit BrowserBridgeHost(BrowserBridgeChild* aChild);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS(BrowserBridgeHost)
+
+  BrowserBridgeChild* GetActor() { return mBridge; }
+
+  BrowserHost* AsBrowserHost() override { return nullptr; }
+  BrowserBridgeHost* AsBrowserBridgeHost() override { return this; }
+
+  TabId GetTabId() const override;
+  LayersId GetLayersId() const override;
+  BrowsingContext* GetBrowsingContext() const override;
+  bool CanSend() const override;
+
+  void LoadURL(nsDocShellLoadState* aLoadState) override;
+  void ResumeLoad(uint64_t aPendingSwitchId) override;
+  void DestroyStart() override;
+  void DestroyComplete() override;
+
+  bool Show(const OwnerShowInfo&) override;
+  void UpdateDimensions(const LayoutDeviceIntRect& aRect,
+                        const LayoutDeviceIntSize& aSize) override;
+
+  void UpdateEffects(EffectsInfo aInfo) override;
+
+ private:
+  virtual ~BrowserBridgeHost() = default;
+
+  already_AddRefed<nsIWidget> GetWidget() const;
+
+  RefPtr<BrowserBridgeChild> mBridge;
+  EffectsInfo mEffectsInfo;
+};
+
+}  
+
+#endif  // mozilla_dom_BrowserBridgeHost_h

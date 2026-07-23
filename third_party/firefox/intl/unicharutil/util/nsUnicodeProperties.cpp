@@ -1,0 +1,159 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsUnicodeProperties.h"
+#include "nsUnicodePropertyData.cpp"
+
+#include "mozilla/intl/Segmenter.h"
+
+#include "BaseChars.h"
+#include "IsCombiningDiacritic.h"
+
+#define UNICODE_BMP_LIMIT 0x10000
+
+namespace mozilla {
+
+namespace unicode {
+
+
+const nsUGenCategory sDetailedToGeneralCategory[] = {
+    // clang-format off
+               nsUGenCategory::kOther,
+                nsUGenCategory::kOther,
+            nsUGenCategory::kOther,
+           nsUGenCategory::kOther,
+             nsUGenCategory::kOther,
+      nsUGenCategory::kLetter,
+       nsUGenCategory::kLetter,
+          nsUGenCategory::kLetter,
+      nsUGenCategory::kLetter,
+      nsUGenCategory::kLetter,
+        nsUGenCategory::kMark,
+        nsUGenCategory::kMark,
+      nsUGenCategory::kMark,
+        nsUGenCategory::kNumber,
+         nsUGenCategory::kNumber,
+          nsUGenCategory::kNumber,
+   nsUGenCategory::kPunctuation,
+      nsUGenCategory::kPunctuation,
+     nsUGenCategory::kPunctuation,
+     nsUGenCategory::kPunctuation,
+   nsUGenCategory::kPunctuation,
+     nsUGenCategory::kPunctuation,
+      nsUGenCategory::kPunctuation,
+       nsUGenCategory::kSymbol,
+       nsUGenCategory::kSymbol,
+           nsUGenCategory::kSymbol,
+          nsUGenCategory::kSymbol,
+        nsUGenCategory::kSeparator,
+   nsUGenCategory::kSeparator,
+       nsUGenCategory::kSeparator
+    // clang-format on
+};
+
+const hb_unicode_general_category_t sICUtoHBcategory[U_CHAR_CATEGORY_COUNT] = {
+    // clang-format off
+  HB_UNICODE_GENERAL_CATEGORY_UNASSIGNED, 
+  HB_UNICODE_GENERAL_CATEGORY_UPPERCASE_LETTER, 
+  HB_UNICODE_GENERAL_CATEGORY_LOWERCASE_LETTER, 
+  HB_UNICODE_GENERAL_CATEGORY_TITLECASE_LETTER, 
+  HB_UNICODE_GENERAL_CATEGORY_MODIFIER_LETTER, 
+  HB_UNICODE_GENERAL_CATEGORY_OTHER_LETTER, 
+  HB_UNICODE_GENERAL_CATEGORY_NON_SPACING_MARK, 
+  HB_UNICODE_GENERAL_CATEGORY_ENCLOSING_MARK, 
+  HB_UNICODE_GENERAL_CATEGORY_SPACING_MARK, 
+  HB_UNICODE_GENERAL_CATEGORY_DECIMAL_NUMBER, 
+  HB_UNICODE_GENERAL_CATEGORY_LETTER_NUMBER, 
+  HB_UNICODE_GENERAL_CATEGORY_OTHER_NUMBER, 
+  HB_UNICODE_GENERAL_CATEGORY_SPACE_SEPARATOR, 
+  HB_UNICODE_GENERAL_CATEGORY_LINE_SEPARATOR, 
+  HB_UNICODE_GENERAL_CATEGORY_PARAGRAPH_SEPARATOR, 
+  HB_UNICODE_GENERAL_CATEGORY_CONTROL, 
+  HB_UNICODE_GENERAL_CATEGORY_FORMAT, 
+  HB_UNICODE_GENERAL_CATEGORY_PRIVATE_USE, 
+  HB_UNICODE_GENERAL_CATEGORY_SURROGATE, 
+  HB_UNICODE_GENERAL_CATEGORY_DASH_PUNCTUATION, 
+  HB_UNICODE_GENERAL_CATEGORY_OPEN_PUNCTUATION, 
+  HB_UNICODE_GENERAL_CATEGORY_CLOSE_PUNCTUATION, 
+  HB_UNICODE_GENERAL_CATEGORY_CONNECT_PUNCTUATION, 
+  HB_UNICODE_GENERAL_CATEGORY_OTHER_PUNCTUATION, 
+  HB_UNICODE_GENERAL_CATEGORY_MATH_SYMBOL, 
+  HB_UNICODE_GENERAL_CATEGORY_CURRENCY_SYMBOL, 
+  HB_UNICODE_GENERAL_CATEGORY_MODIFIER_SYMBOL, 
+  HB_UNICODE_GENERAL_CATEGORY_OTHER_SYMBOL, 
+  HB_UNICODE_GENERAL_CATEGORY_INITIAL_PUNCTUATION, 
+  HB_UNICODE_GENERAL_CATEGORY_FINAL_PUNCTUATION, 
+    // clang-format on
+};
+
+#define DEFINE_BMP_1PLANE_MAPPING_GET_FUNC(prefix_)             \
+  uint32_t Get##prefix_(uint32_t aCh) {                         \
+    if (aCh >= UNICODE_BMP_LIMIT) {                             \
+      return aCh;                                               \
+    }                                                           \
+    auto page = s##prefix_##Pages[aCh >> k##prefix_##CharBits]; \
+    auto index = aCh & ((1 << k##prefix_##CharBits) - 1);       \
+    uint32_t v = s##prefix_##Values[page][index];               \
+    return v ? v : aCh;                                         \
+  }
+
+DEFINE_BMP_1PLANE_MAPPING_GET_FUNC(FullWidth)
+DEFINE_BMP_1PLANE_MAPPING_GET_FUNC(FullWidthInverse)
+
+bool IsClusterExtender(uint32_t aCh, uint8_t aCategory) {
+  return (
+      (aCategory >= HB_UNICODE_GENERAL_CATEGORY_SPACING_MARK &&
+       aCategory <= HB_UNICODE_GENERAL_CATEGORY_NON_SPACING_MARK) ||
+      (aCh >= 0x200c && aCh <= 0x200d) ||    
+      (aCh >= 0xff9e && aCh <= 0xff9f) ||    
+      (aCh >= 0x1F3FB && aCh <= 0x1F3FF) ||  
+      (aCh >= 0xe0020 && aCh <= 0xe007f));   
+}
+
+bool IsClusterExtenderExcludingJoiners(uint32_t aCh, uint8_t aCategory) {
+  return (
+      (aCategory >= HB_UNICODE_GENERAL_CATEGORY_SPACING_MARK &&
+       aCategory <= HB_UNICODE_GENERAL_CATEGORY_NON_SPACING_MARK) ||
+      (aCh >= 0xff9e && aCh <= 0xff9f) ||    
+      (aCh >= 0x1F3FB && aCh <= 0x1F3FF) ||  
+      (aCh >= 0xe0020 && aCh <= 0xe007f));   
+}
+
+uint32_t CountGraphemeClusters(Span<const char16_t> aText) {
+  if (aText.IsEmpty()) {
+    return 0;
+  }
+  intl::GraphemeClusterBreakIteratorUtf16 iter(aText);
+  uint32_t result = 0;
+  while (iter.Next()) {
+    ++result;
+  }
+  return result;
+}
+
+uint32_t GetNaked(uint32_t aCh) {
+  uint32_t index = aCh >> 8;
+  if (index >= std::size(BASE_CHAR_MAPPING_BLOCK_INDEX)) {
+    return aCh;
+  }
+  index = BASE_CHAR_MAPPING_BLOCK_INDEX[index];
+  if (index == 0xff) {
+    return aCh;
+  }
+  const BaseCharMappingBlock& block = BASE_CHAR_MAPPING_BLOCKS[index];
+  uint8_t lo = aCh & 0xff;
+  if (lo < block.mFirst || lo > block.mLast) {
+    return aCh;
+  }
+  return (aCh & 0xffff0000) |
+         BASE_CHAR_MAPPING_LIST[block.mMappingStartOffset + lo - block.mFirst];
+}
+
+bool IsCombiningDiacritic(uint32_t aCh) {
+  return sCombiningDiacriticsSet->test(aCh);
+}
+
+}  
+
+}  

@@ -1,0 +1,105 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef EME_LOG_H_
+#define EME_LOG_H_
+
+#include "mozilla/Logging.h"
+#include "mozilla/dom/BufferSourceBindingFwd.h"
+#include "mozilla/dom/MediaKeyStatusMapBinding.h"
+#include "mozilla/dom/MediaKeySystemAccessBinding.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+enum class CryptoScheme : uint8_t;
+#ifdef MOZ_WMF_CDM
+class MFCDMCapabilitiesIPDL;
+#endif
+struct KeySystemConfig;
+
+namespace dom {
+class Document;
+}  
+
+#ifndef EME_LOG
+LogModule* GetEMELog();
+#  define EME_LOG(...) \
+    MOZ_LOG_FMT(GetEMELog(), mozilla::LogLevel::Debug, __VA_ARGS__)
+#  define EME_LOG_ENABLED() MOZ_LOG_TEST(GetEMELog(), mozilla::LogLevel::Debug)
+#endif
+
+#ifndef EME_VERBOSE_LOG
+LogModule* GetEMEVerboseLog();
+#  define EME_VERBOSE_LOG(...) \
+    MOZ_LOG_FMT(GetEMEVerboseLog(), mozilla::LogLevel::Debug, __VA_ARGS__)
+#else
+#  ifndef EME_LOG
+#    define EME_LOG(...)
+#  endif
+
+#  ifndef EME_VERBOSE_LOG
+#    define EME_VERBOSE_LOG(...)
+#  endif
+#endif
+
+void CopyArrayBufferViewOrArrayBufferData(
+    const dom::BufferSource& aBufferOrView, nsTArray<uint8_t>& aOutData);
+
+nsString KeySystemToProxyName(const nsAString& aKeySystem);
+
+bool IsClearkeyKeySystem(const nsAString& aKeySystem);
+
+bool IsWidevineKeySystem(const nsAString& aKeySystem);
+
+#ifdef MOZ_WMF_CDM
+bool IsMediaFoundationCDMPlaybackEnabled();
+
+bool IsPlayReadyEnabled();
+
+bool IsPlayReadyKeySystemAndSupported(const nsAString& aKeySystem);
+
+bool IsWidevineHardwareDecryptionEnabled();
+
+bool IsWidevineExperimentKeySystemAndSupported(const nsAString& aKeySystem);
+
+bool IsWMFClearKeySystemAndSupported(const nsAString& aKeySystem);
+#endif
+
+enum CDMType {
+  eClearKey = 0,
+  ePrimetime = 1,  
+  eWidevine = 2,
+  eUnknown = 3
+};
+
+CDMType ToCDMTypeTelemetryEnum(const nsString& aKeySystem);
+
+const char* ToMediaKeyStatusStr(dom::MediaKeyStatus aStatus);
+
+bool IsHardwareDecryptionSupported(
+    const dom::MediaKeySystemConfiguration& aConfig);
+bool IsHardwareDecryptionSupported(const KeySystemConfig& aConfig);
+
+#ifdef MOZ_WMF_CDM
+void MFCDMCapabilitiesIPDLToKeySystemConfig(
+    const MFCDMCapabilitiesIPDL& aCDMConfig, KeySystemConfig& aKeySystemConfig);
+#endif
+
+bool DoesKeySystemSupportClearLead(const nsAString& aKeySystem);
+
+bool CheckIfHarewareDRMConfigExists(
+    const nsTArray<dom::MediaKeySystemConfiguration>& aConfigs);
+
+bool DoesKeySystemSupportHardwareDecryption(const nsAString& aKeySystem);
+
+void DeprecationWarningLog(const dom::Document* aDocument,
+                           const char* aMsgName);
+
+Maybe<nsCString> GetOrigin(const dom::Document* aDocument);
+
+}  
+
+#endif  // EME_LOG_H_

@@ -1,0 +1,138 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ServoElementSnapshot_h
+#define mozilla_ServoElementSnapshot_h
+
+#include "AttrArray.h"
+#include "MainThreadUtils.h"
+#include "mozilla/TypedEnumBits.h"
+#include "mozilla/dom/BorrowedAttrInfo.h"
+#include "mozilla/dom/RustTypes.h"
+#include "nsAtom.h"
+#include "nsAttrName.h"
+#include "nsAttrValue.h"
+#include "nsChangeHint.h"
+
+namespace mozilla {
+namespace dom {
+class Element;
+}
+
+enum class ServoElementSnapshotFlags : uint8_t {
+  State = 1 << 0,
+  Attributes = 1 << 1,
+  Id = 1 << 2,
+  MaybeClass = 1 << 3,
+  OtherPseudoClassState = 1 << 4,
+  CustomState = 1 << 5,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(ServoElementSnapshotFlags)
+
+class ServoElementSnapshot {
+  typedef dom::BorrowedAttrInfo BorrowedAttrInfo;
+  typedef dom::Element Element;
+
+  typedef dom::ElementState::InternalType ServoStateType;
+
+ public:
+  typedef ServoElementSnapshotFlags Flags;
+
+  explicit ServoElementSnapshot(const Element&);
+
+  ~ServoElementSnapshot() {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_COUNT_DTOR(ServoElementSnapshot);
+  }
+
+  bool HasAttrs() const { return HasAny(Flags::Attributes); }
+
+  bool HasState() const { return HasAny(Flags::State); }
+
+  bool HasOtherPseudoClassState() const {
+    return HasAny(Flags::OtherPseudoClassState);
+  }
+
+  void AddState(dom::ElementState aState) {
+    if (!HasAny(Flags::State)) {
+      mState = aState.GetInternalValue();
+      mContains |= Flags::State;
+    }
+  }
+
+  void AddAttrs(const Element&, int32_t aNameSpaceID, nsAtom* aAttribute);
+
+  void AddCustomStates(Element&);
+
+  void AddOtherPseudoClassState(const Element&);
+
+  BorrowedAttrInfo GetAttrInfoAt(uint32_t aIndex) const {
+    MOZ_ASSERT(HasAttrs());
+    if (aIndex >= mAttrs.Length()) {
+      return BorrowedAttrInfo(nullptr, nullptr);
+    }
+    return BorrowedAttrInfo(&mAttrs[aIndex].mName, &mAttrs[aIndex].mValue);
+  }
+
+  const nsAttrValue* GetParsedAttr(nsAtom* aLocalName) const {
+    return GetParsedAttr(aLocalName, kNameSpaceID_None);
+  }
+
+  const nsAttrValue* GetParsedAttr(nsAtom* aLocalName,
+                                   int32_t aNamespaceID) const {
+    MOZ_ASSERT(HasAttrs());
+    uint32_t i, len = mAttrs.Length();
+    if (aNamespaceID == kNameSpaceID_None) {
+      for (i = 0; i < len; ++i) {
+        if (mAttrs[i].mName.Equals(aLocalName)) {
+          return &mAttrs[i].mValue;
+        }
+      }
+
+      return nullptr;
+    }
+
+    for (i = 0; i < len; ++i) {
+      if (mAttrs[i].mName.Equals(aLocalName, aNamespaceID)) {
+        return &mAttrs[i].mValue;
+      }
+    }
+
+    return nullptr;
+  }
+
+  bool IsInChromeDocument() const { return mIsInChromeDocument; }
+  bool SupportsLangAttr() const { return mSupportsLangAttr; }
+
+  bool HasAny(Flags aFlags) const { return bool(mContains & aFlags); }
+
+  bool IsTableBorderNonzero() const {
+    MOZ_ASSERT(HasOtherPseudoClassState());
+    return mIsTableBorderNonzero;
+  }
+
+  bool IsSelectListBox() const {
+    MOZ_ASSERT(HasOtherPseudoClassState());
+    return mIsSelectListBox;
+  }
+
+ private:
+  nsTArray<AttrArray::InternalAttr> mAttrs;
+  nsTArray<RefPtr<nsAtom>> mChangedAttrNames;
+  nsTArray<RefPtr<nsAtom>> mCustomStates;
+  nsAttrValue mClass;
+  ServoStateType mState;
+  Flags mContains;
+  bool mIsInChromeDocument : 1;
+  bool mSupportsLangAttr : 1;
+  bool mIsTableBorderNonzero : 1;
+  bool mIsSelectListBox : 1;
+  bool mClassAttributeChanged : 1;
+  bool mIdAttributeChanged : 1;
+};
+
+}  
+
+#endif

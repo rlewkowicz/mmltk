@@ -1,0 +1,61 @@
+
+[package]
+edition = "2021"
+rust-version = "1.56"
+name = "textwrap"
+version = "0.16.1"
+authors = ["Martin Geisler <martin@geisler.net>"]
+exclude = [
+    ".github/",
+    ".gitignore",
+    "benchmarks/",
+    "examples/",
+    "fuzz/",
+    "images/",
+]
+description = "Library for word wrapping, indenting, and dedenting strings. Has optional support for Unicode and emojis as well as machine hyphenation."
+documentation = "https://docs.rs/textwrap/"
+keywords = [
+    "text",
+    "formatting",
+    "wrap",
+    "typesetting",
+    "hyphenation",
+]
+categories = [
+    "text-processing",
+    "command-line-interface",
+]
+license = "MIT"
+repository = "https://github.com/mgeisler/textwrap"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies.hyphenation]
+version = "0.8.4"
+features = ["embed_en-us"]
+optional = true
+
+[dependencies.smawk]
+version = "0.3.1"
+optional = true
+
+[dependencies.terminal_size]
+version = "0.2.1"
+optional = true
+
+[dependencies.unicode-linebreak]
+version = "0.1.4"
+optional = true
+
+[dependencies.unicode-width]
+version = "0.1.10"
+optional = true
+
+[features]
+default = [
+    "unicode-linebreak",
+    "unicode-width",
+    "smawk",
+]

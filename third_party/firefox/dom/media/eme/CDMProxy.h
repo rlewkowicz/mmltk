@@ -1,0 +1,239 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef CDMProxy_h_
+#define CDMProxy_h_
+
+#include "mozilla/CDMCaps.h"
+#include "mozilla/DataMutex.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/dom/MediaKeyMessageEvent.h"
+#include "mozilla/dom/MediaKeySessionBinding.h"
+#include "mozilla/dom/MediaKeys.h"
+#include "nsIThread.h"
+
+namespace mozilla {
+class ErrorResult;
+class MediaRawData;
+class ChromiumCDMProxy;
+class RemoteCDMProxy;
+#ifdef MOZ_WMF_CDM
+class WMFCDMProxy;
+#endif
+
+namespace eme {
+enum DecryptStatus {
+  Ok = 0,
+  GenericErr = 1,
+  NoKeyErr = 2,
+  AbortedErr = 3,
+};
+}
+
+using eme::DecryptStatus;
+
+struct DecryptResult {
+  DecryptResult(DecryptStatus aStatus, MediaRawData* aSample)
+      : mStatus(aStatus), mSample(aSample) {}
+  DecryptStatus mStatus;
+  RefPtr<MediaRawData> mSample;
+};
+
+typedef MozPromise<DecryptResult, DecryptResult,  true>
+    DecryptPromise;
+
+class CDMKeyInfo {
+ public:
+  explicit CDMKeyInfo(const nsTArray<uint8_t>& aKeyId)
+      : mKeyId(aKeyId.Clone()), mStatus() {}
+
+  CDMKeyInfo(const nsTArray<uint8_t>& aKeyId,
+             const dom::Optional<dom::MediaKeyStatus>& aStatus)
+      : mKeyId(aKeyId.Clone()), mStatus(aStatus.Value()) {}
+
+  CDMKeyInfo(const CDMKeyInfo& aKeyInfo) {
+    mKeyId = aKeyInfo.mKeyId.Clone();
+    if (aKeyInfo.mStatus.WasPassed()) {
+      mStatus.Construct(aKeyInfo.mStatus.Value());
+    }
+  }
+
+  CDMKeyInfo() = default;
+
+  nsTArray<uint8_t> mKeyId;
+  dom::Optional<dom::MediaKeyStatus> mStatus;
+};
+
+typedef int64_t UnixTime;
+
+class CDMProxy {
+ protected:
+  typedef dom::PromiseId PromiseId;
+
+ public:
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  virtual void Init(PromiseId aPromiseId, const nsAString& aOrigin,
+                    const nsAString& aTopLevelOrigin,
+                    const nsAString& aName) = 0;
+
+  virtual void CreateSession(uint32_t aCreateSessionToken,
+                             dom::MediaKeySessionType aSessionType,
+                             PromiseId aPromiseId,
+                             const nsAString& aInitDataType,
+                             nsTArray<uint8_t>& aInitData) = 0;
+
+  virtual void LoadSession(PromiseId aPromiseId,
+                           dom::MediaKeySessionType aSessionType,
+                           const nsAString& aSessionId) = 0;
+
+  virtual void SetServerCertificate(PromiseId aPromiseId,
+                                    nsTArray<uint8_t>& aCert) = 0;
+
+  virtual void UpdateSession(const nsAString& aSessionId, PromiseId aPromiseId,
+                             nsTArray<uint8_t>& aResponse) = 0;
+
+  virtual void CloseSession(const nsAString& aSessionId,
+                            PromiseId aPromiseId) = 0;
+
+  virtual void RemoveSession(const nsAString& aSessionId,
+                             PromiseId aPromiseId) = 0;
+
+  virtual void QueryOutputProtectionStatus() = 0;
+
+  enum class OutputProtectionCheckStatus : uint8_t {
+    CheckFailed = 0,
+    CheckSuccessful = 1,
+  };
+
+  enum class OutputProtectionCaptureStatus : uint8_t {
+    CapturePossilbe = 0,
+    CaptureNotPossible = 1,
+    Unused = 2,
+  };
+
+  virtual void NotifyOutputProtectionStatus(
+      OutputProtectionCheckStatus aCheckStatus,
+      OutputProtectionCaptureStatus aCaptureStatus) = 0;
+
+  virtual void Shutdown() = 0;
+
+  virtual void Terminated() = 0;
+
+  const nsCString& GetNodeId() const { return mNodeId; };
+
+  virtual void OnSetSessionId(uint32_t aCreateSessionToken,
+                              const nsAString& aSessionId) = 0;
+
+  virtual void OnResolveLoadSessionPromise(uint32_t aPromiseId,
+                                           bool aSuccess) = 0;
+
+  virtual void OnSessionMessage(const nsAString& aSessionId,
+                                dom::MediaKeyMessageType aMessageType,
+                                const nsTArray<uint8_t>& aMessage) = 0;
+
+  virtual void OnExpirationChange(const nsAString& aSessionId,
+                                  UnixTime aExpiryTime) = 0;
+
+  virtual void OnSessionClosed(const nsAString& aSessionId,
+                               dom::MediaKeySessionClosedReason aReason) = 0;
+
+  virtual void OnSessionError(const nsAString& aSessionId, nsresult aException,
+                              uint32_t aSystemCode, const nsAString& aMsg) = 0;
+
+  virtual void OnRejectPromise(uint32_t aPromiseId, ErrorResult&& aException,
+                               const nsCString& aMsg) = 0;
+
+  virtual RefPtr<DecryptPromise> Decrypt(MediaRawData* aSample) = 0;
+
+  virtual void OnDecrypted(uint32_t aId, DecryptStatus aResult,
+                           const nsTArray<uint8_t>& aDecryptedData) = 0;
+
+  virtual void RejectPromise(PromiseId aId, ErrorResult&& aException,
+                             const nsCString& aReason) = 0;
+
+  virtual void ResolvePromise(PromiseId aId) = 0;
+
+  const nsString& KeySystem() const { return mKeySystem; };
+
+  DataMutex<CDMCaps>& Capabilites() { return mCapabilites; };
+
+  virtual void OnKeyStatusesChange(const nsAString& aSessionId) = 0;
+
+  virtual void GetStatusForPolicy(PromiseId aPromiseId,
+                                  const dom::HDCPVersion& aMinHdcpVersion) = 0;
+
+#ifdef DEBUG
+  virtual bool IsOnOwnerThread() = 0;
+#endif
+
+  virtual ChromiumCDMProxy* AsChromiumCDMProxy() { return nullptr; }
+
+#ifdef MOZ_WMF_CDM
+  virtual WMFCDMProxy* AsWMFCDMProxy() { return nullptr; }
+#endif
+
+  virtual RemoteCDMProxy* AsRemoteCDMProxy() { return nullptr; }
+
+  virtual bool IsHardwareDecryptionSupported() const { return false; }
+
+ protected:
+  CDMProxy(dom::MediaKeys* aKeys, const nsAString& aKeySystem,
+           bool aDistinctiveIdentifierRequired, bool aPersistentStateRequired)
+      : mKeys(aKeys),
+        mKeySystem(aKeySystem),
+        mCapabilites("CDMProxy::mCDMCaps"),
+        mDistinctiveIdentifierRequired(aDistinctiveIdentifierRequired),
+        mPersistentStateRequired(aPersistentStateRequired),
+        mMainThread(GetMainThreadSerialEventTarget()) {
+    MOZ_ASSERT(NS_IsMainThread());
+  }
+
+  virtual ~CDMProxy() {}
+
+  template <class Type>
+  class MainThreadOnlyRawPtr {
+   public:
+    explicit MainThreadOnlyRawPtr(Type* aPtr) : mPtr(aPtr) {
+      MOZ_ASSERT(NS_IsMainThread());
+    }
+
+    bool IsNull() const {
+      MOZ_ASSERT(NS_IsMainThread());
+      return !mPtr;
+    }
+
+    void Clear() {
+      MOZ_ASSERT(NS_IsMainThread());
+      mPtr = nullptr;
+    }
+
+    Type* operator->() const MOZ_NO_ADDREF_RELEASE_ON_RETURN {
+      MOZ_ASSERT(NS_IsMainThread());
+      return mPtr;
+    }
+
+   private:
+    Type* mPtr;
+  };
+
+  MainThreadOnlyRawPtr<dom::MediaKeys> mKeys;
+
+  const nsString mKeySystem;
+
+  RefPtr<nsIThread> mOwnerThread;
+
+  nsCString mNodeId;
+
+  DataMutex<CDMCaps> mCapabilites;
+
+  const bool mDistinctiveIdentifierRequired;
+  const bool mPersistentStateRequired;
+
+  const nsCOMPtr<nsISerialEventTarget> mMainThread;
+};
+
+}  
+
+#endif  // CDMProxy_h_

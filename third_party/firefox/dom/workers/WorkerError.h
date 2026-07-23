@@ -1,0 +1,73 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_workers_WorkerError_h
+#define mozilla_dom_workers_WorkerError_h
+
+#include "jsapi.h"
+#include "mozilla/dom/SerializedStackHolder.h"
+#include "mozilla/dom/WorkerCommon.h"
+
+namespace mozilla {
+
+class DOMEventTargetHelper;
+
+namespace dom {
+
+class ErrorData;
+class WorkerErrorBase {
+ public:
+  nsString mMessage;
+  nsCString mFilename;
+  uint32_t mLineNumber = 0;
+  uint32_t mColumnNumber = 0;
+  uint32_t mErrorNumber = 0;
+
+  WorkerErrorBase() = default;
+
+  void AssignErrorBase(JSErrorBase* aReport);
+};
+
+class WorkerErrorNote : public WorkerErrorBase {
+ public:
+  void AssignErrorNote(JSErrorNotes::Note* aNote);
+};
+
+class WorkerPrivate;
+
+class WorkerErrorReport : public WorkerErrorBase, public SerializedStackHolder {
+ public:
+  bool mIsWarning;
+  JSExnType mExnType;
+  bool mMutedError;
+  nsTArray<WorkerErrorNote> mNotes;
+
+  WorkerErrorReport();
+
+  void AssignErrorReport(JSErrorReport* aReport);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY static void ReportError(
+      JSContext* aCx, WorkerPrivate* aWorkerPrivate, bool aFireAtScope,
+      RefPtr<DOMEventTargetHelper> aTarget,
+      UniquePtr<WorkerErrorReport> aReport, uint64_t aInnerWindowId,
+      JS::Handle<JS::Value> aException = JS::NullHandleValue);
+
+  static void LogErrorToConsole(JSContext* aCx, WorkerErrorReport& aReport,
+                                uint64_t aInnerWindowId);
+
+  static void LogErrorToConsole(const mozilla::dom::ErrorData& aReport,
+                                uint64_t aInnerWindowId,
+                                JS::Handle<JSObject*> aStack = nullptr,
+                                JS::Handle<JSObject*> aStackGlobal = nullptr);
+
+  static void LogErrorToConsole(const nsAString& aMessage);
+
+  static void CreateAndDispatchGenericErrorRunnableToParent(
+      WorkerPrivate* aWorkerPrivate);
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_workers_WorkerError_h

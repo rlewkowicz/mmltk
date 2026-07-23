@@ -1,0 +1,572 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "BlobURLInputStream.h"
+
+#include "BlobURL.h"
+#include "BlobURLChannel.h"
+#include "BlobURLProtocolHandler.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/dom/IPCBlobUtils.h"
+#include "mozilla/net/ContentRange.h"
+#include "nsMimeTypes.h"
+#include "nsStreamUtils.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_ADDREF(BlobURLInputStream);
+NS_IMPL_RELEASE(BlobURLInputStream);
+
+NS_INTERFACE_MAP_BEGIN(BlobURLInputStream)
+  NS_INTERFACE_MAP_ENTRY(nsIInputStream)
+  NS_INTERFACE_MAP_ENTRY(nsIAsyncInputStream)
+  NS_INTERFACE_MAP_ENTRY(nsIInputStreamLength)
+  NS_INTERFACE_MAP_ENTRY(nsIAsyncInputStreamLength)
+  NS_INTERFACE_MAP_ENTRY(nsIInputStreamCallback)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIAsyncInputStream)
+NS_INTERFACE_MAP_END
+
+already_AddRefed<nsIInputStream> BlobURLInputStream::Create(
+    BlobURLChannel* const aChannel, BlobURL* const aBlobURL) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (NS_WARN_IF(!aChannel) || NS_WARN_IF(!aBlobURL)) {
+    return nullptr;
+  }
+
+  nsAutoCString spec;
+
+  nsresult rv = aBlobURL->GetSpec(spec);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return nullptr;
+  }
+
+  return MakeAndAddRef<BlobURLInputStream>(aChannel, spec);
+}
+
+NS_IMETHODIMP BlobURLInputStream::Close() {
+  return CloseWithStatus(NS_BASE_STREAM_CLOSED);
+}
+
+NS_IMETHODIMP BlobURLInputStream::Available(uint64_t* aLength) {
+  MutexAutoLock lock(mStateMachineMutex);
+
+  if (mState == State::ERROR) {
+    MOZ_ASSERT(NS_FAILED(mError));
+    return mError;
+  }
+
+  if (mState == State::CLOSED) {
+    return NS_BASE_STREAM_CLOSED;
+  }
+
+  if (mState == State::READY) {
+    MOZ_ASSERT(mAsyncInputStream);
+    return mAsyncInputStream->Available(aLength);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP BlobURLInputStream::StreamStatus() {
+  MutexAutoLock lock(mStateMachineMutex);
+
+  if (mState == State::ERROR) {
+    MOZ_ASSERT(NS_FAILED(mError));
+    return mError;
+  }
+
+  if (mState == State::CLOSED) {
+    return NS_BASE_STREAM_CLOSED;
+  }
+
+  if (mState == State::READY) {
+    MOZ_ASSERT(mAsyncInputStream);
+    return mAsyncInputStream->StreamStatus();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP BlobURLInputStream::Read(char* aBuffer, uint32_t aCount,
+                                       uint32_t* aReadCount) {
+  MutexAutoLock lock(mStateMachineMutex);
+  if (mState == State::ERROR) {
+    MOZ_ASSERT(NS_FAILED(mError));
+    return mError;
+  }
+
+  if (mState == State::CLOSED) {
+    *aReadCount = 0;
+    return NS_OK;
+  }
+
+  if (mState == State::READY) {
+    MOZ_ASSERT(mAsyncInputStream);
+    nsresult rv = mAsyncInputStream->Read(aBuffer, aCount, aReadCount);
+    if (NS_SUCCEEDED(rv) && aReadCount && !*aReadCount) {
+      mState = State::CLOSED;
+      ReleaseUnderlyingStream(lock);
+    }
+    return rv;
+  }
+
+  return NS_BASE_STREAM_WOULD_BLOCK;
+}
+
+NS_IMETHODIMP BlobURLInputStream::ReadSegments(nsWriteSegmentFun aWriter,
+                                               void* aClosure, uint32_t aCount,
+                                               uint32_t* aResult) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP BlobURLInputStream::IsNonBlocking(bool* aNonBlocking) {
+  *aNonBlocking = true;
+  return NS_OK;
+}
+
+NS_IMETHODIMP BlobURLInputStream::CloseWithStatus(nsresult aStatus) {
+  MutexAutoLock lock(mStateMachineMutex);
+  if (mState == State::READY) {
+    MOZ_ASSERT(mAsyncInputStream);
+    mAsyncInputStream->CloseWithStatus(aStatus);
+  }
+
+  mState = State::CLOSED;
+  ReleaseUnderlyingStream(lock);
+  return NS_OK;
+}
+
+NS_IMETHODIMP BlobURLInputStream::AsyncWait(nsIInputStreamCallback* aCallback,
+                                            uint32_t aFlags,
+                                            uint32_t aRequestedCount,
+                                            nsIEventTarget* aEventTarget) {
+  MutexAutoLock lock(mStateMachineMutex);
+
+  if (mState == State::ERROR) {
+    MOZ_ASSERT(NS_FAILED(mError));
+    return NS_ERROR_FAILURE;
+  }
+
+  if (NS_WARN_IF(mAsyncWaitCallback && aCallback &&
+                 mAsyncWaitCallback != aCallback)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mAsyncWaitTarget = aEventTarget;
+  mAsyncWaitRequestedCount = aRequestedCount;
+  mAsyncWaitFlags = aFlags;
+  mAsyncWaitCallback = aCallback;
+
+  if (mState == State::INITIAL) {
+    mState = State::WAITING;
+    if (NS_IsMainThread()) {
+      RetrieveBlobData(lock);
+      return NS_OK;
+    }
+
+    nsCOMPtr<nsIRunnable> runnable = mozilla::NewRunnableMethod(
+        "BlobURLInputStream::CallRetrieveBlobData", this,
+        &BlobURLInputStream::CallRetrieveBlobData);
+    NS_DispatchToMainThread(runnable.forget(), NS_DISPATCH_NORMAL);
+    return NS_OK;
+  }
+
+  if (mState == State::WAITING) {
+    return NS_OK;
+  }
+
+  if (mState == State::READY) {
+    return mAsyncInputStream->AsyncWait(
+        mAsyncWaitCallback ? this : nullptr, mAsyncWaitFlags,
+        mAsyncWaitRequestedCount, mAsyncWaitTarget);
+  }
+
+  MOZ_ASSERT(mState == State::CLOSED);
+  NotifyWaitTargets(lock);
+  return NS_OK;
+}
+
+NS_IMETHODIMP BlobURLInputStream::Length(int64_t* aLength) {
+  MutexAutoLock lock(mStateMachineMutex);
+
+  if (mState == State::CLOSED) {
+    return NS_BASE_STREAM_CLOSED;
+  }
+
+  if (mState == State::ERROR) {
+    MOZ_ASSERT(NS_FAILED(mError));
+    return NS_ERROR_FAILURE;
+  }
+
+  if (mState == State::READY) {
+    *aLength = mBlobSize;
+    return NS_OK;
+  }
+  return NS_BASE_STREAM_WOULD_BLOCK;
+}
+
+NS_IMETHODIMP BlobURLInputStream::AsyncLengthWait(
+    nsIInputStreamLengthCallback* aCallback, nsIEventTarget* aEventTarget) {
+  MutexAutoLock lock(mStateMachineMutex);
+
+  if (mState == State::ERROR) {
+    MOZ_ASSERT(NS_FAILED(mError));
+    return mError;
+  }
+
+  if (mAsyncLengthWaitCallback && aCallback) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mAsyncLengthWaitTarget = aEventTarget;
+  mAsyncLengthWaitCallback = aCallback;
+
+  if (mState == State::INITIAL) {
+    mState = State::WAITING;
+    if (NS_IsMainThread()) {
+      RetrieveBlobData(lock);
+      return NS_OK;
+    }
+
+    nsCOMPtr<nsIRunnable> runnable = mozilla::NewRunnableMethod(
+        "BlobURLInputStream::CallRetrieveBlobData", this,
+        &BlobURLInputStream::CallRetrieveBlobData);
+    NS_DispatchToMainThread(runnable.forget(), NS_DISPATCH_NORMAL);
+    return NS_OK;
+  }
+
+  if (mState == State::WAITING) {
+    return NS_OK;
+  }
+
+  NotifyWaitTargets(lock);
+  return NS_OK;
+}
+
+NS_IMETHODIMP BlobURLInputStream::OnInputStreamReady(
+    nsIAsyncInputStream* aStream) {
+  nsCOMPtr<nsIInputStreamCallback> callback;
+
+  {
+    MutexAutoLock lock(mStateMachineMutex);
+    MOZ_ASSERT_IF(mAsyncInputStream, aStream == mAsyncInputStream);
+
+    if (!mAsyncWaitCallback) {
+      return NS_OK;
+    }
+
+    mAsyncWaitCallback.swap(callback);
+    mAsyncWaitTarget = nullptr;
+  }
+
+  MOZ_ASSERT(callback);
+  return callback->OnInputStreamReady(this);
+}
+
+NS_IMETHODIMP BlobURLInputStream::OnInputStreamLengthReady(
+    nsIAsyncInputStreamLength* aStream, int64_t aLength) {
+  nsCOMPtr<nsIInputStreamLengthCallback> callback;
+  {
+    MutexAutoLock lock(mStateMachineMutex);
+
+    if (!mAsyncLengthWaitCallback) {
+      return NS_OK;
+    }
+
+    mAsyncLengthWaitCallback.swap(callback);
+    mAsyncLengthWaitCallback = nullptr;
+  }
+
+  return callback->OnInputStreamLengthReady(this, aLength);
+}
+
+BlobURLInputStream::~BlobURLInputStream() {
+  if (mChannel) {
+    NS_ReleaseOnMainThread("BlobURLInputStream::mChannel", mChannel.forget());
+  }
+}
+
+BlobURLInputStream::BlobURLInputStream(BlobURLChannel* const aChannel,
+                                       nsACString& aBlobURLSpec)
+    : mChannel(aChannel),
+      mBlobURLSpec(std::move(aBlobURLSpec)),
+      mStateMachineMutex("BlobURLInputStream::mStateMachineMutex"),
+      mState(State::INITIAL),
+      mError(NS_OK),
+      mBlobSize(-1),
+      mAsyncWaitFlags(),
+      mAsyncWaitRequestedCount() {}
+
+void BlobURLInputStream::WaitOnUnderlyingStream(
+    const MutexAutoLock& aProofOfLock) {
+  if (mAsyncWaitCallback || mAsyncWaitTarget) {
+    mAsyncInputStream->AsyncWait(mAsyncWaitCallback ? this : nullptr,
+                                 mAsyncWaitFlags, mAsyncWaitRequestedCount,
+                                 mAsyncWaitTarget);
+  }
+
+  if (mAsyncLengthWaitCallback || mAsyncLengthWaitTarget) {
+    nsCOMPtr<nsIAsyncInputStreamLength> asyncStreamLength =
+        do_QueryInterface(mAsyncInputStream);
+    if (asyncStreamLength) {
+      asyncStreamLength->AsyncLengthWait(
+          mAsyncLengthWaitCallback ? this : nullptr, mAsyncLengthWaitTarget);
+    }
+  }
+}
+
+void BlobURLInputStream::CallRetrieveBlobData() {
+  MutexAutoLock lock(mStateMachineMutex);
+  RetrieveBlobData(lock);
+}
+
+void BlobURLInputStream::RetrieveBlobData(const MutexAutoLock& aProofOfLock) {
+  MOZ_ASSERT(NS_IsMainThread(), "Only call on main thread");
+
+  MOZ_ASSERT(mState == State::WAITING);
+
+  auto cleanupOnEarlyExit = MakeScopeExit([&] {
+    mState = State::ERROR;
+    if (NS_SUCCEEDED(mError)) {
+      mError = NS_ERROR_FAILURE;
+    }
+    NS_ReleaseOnMainThread("BlobURLInputStream::mChannel", mChannel.forget());
+    NotifyWaitTargets(aProofOfLock);
+  });
+
+  nsCOMPtr<nsILoadInfo> loadInfo = mChannel->LoadInfo();
+  nsCOMPtr<nsIPrincipal> triggeringPrincipal;
+  nsCOMPtr<nsIPrincipal> loadingPrincipal;
+  if (NS_WARN_IF(NS_FAILED(loadInfo->GetTriggeringPrincipal(
+          getter_AddRefs(triggeringPrincipal)))) ||
+      NS_WARN_IF(!triggeringPrincipal)) {
+    NS_WARNING("Failed to get owning channel's triggering principal");
+    return;
+  }
+
+  if (NS_WARN_IF(NS_FAILED(
+          loadInfo->GetLoadingPrincipal(getter_AddRefs(loadingPrincipal))))) {
+    NS_WARNING("Failed to get owning channel's loading principal");
+    return;
+  }
+
+  nsCOMPtr<nsICookieJarSettings> cookieJarSettings;
+  loadInfo->GetCookieJarSettings(getter_AddRefs(cookieJarSettings));
+
+  nsAutoString partKey;
+  cookieJarSettings->GetPartitionKey(partKey);
+
+  if (XRE_IsParentProcess()) {
+    RefPtr<BlobImpl> blobImpl;
+
+    if (!BlobURLProtocolHandler::GetDataEntry(
+            mBlobURLSpec, getter_AddRefs(blobImpl), loadingPrincipal,
+            triggeringPrincipal, loadInfo->GetOriginAttributes(),
+            loadInfo->GetInnerWindowID(), NS_ConvertUTF16toUTF8(partKey),
+            true )) {
+      NS_WARNING("Failed to get data entry principal. URL revoked?");
+      return;
+    }
+
+    mError = StoreBlobImplStream(blobImpl.forget(), aProofOfLock);
+    if (NS_WARN_IF(NS_FAILED(mError))) {
+      return;
+    }
+
+    mState = State::READY;
+
+    WaitOnUnderlyingStream(aProofOfLock);
+
+    cleanupOnEarlyExit.release();
+    return;
+  }
+
+  ContentChild* contentChild{ContentChild::GetSingleton()};
+  MOZ_ASSERT(contentChild);
+
+  const RefPtr<BlobURLInputStream> self = this;
+
+  cleanupOnEarlyExit.release();
+
+  contentChild
+      ->SendBlobURLDataRequest(
+          mBlobURLSpec, WrapNotNull(triggeringPrincipal), loadingPrincipal,
+          loadInfo->GetOriginAttributes(), loadInfo->GetInnerWindowID(),
+          NS_ConvertUTF16toUTF8(partKey))
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [self](const BlobURLDataRequestResult& aResult) {
+            MutexAutoLock lock(self->mStateMachineMutex);
+            if (aResult.type() == BlobURLDataRequestResult::TIPCBlob) {
+              if (self->mState == State::WAITING) {
+                RefPtr<BlobImpl> blobImpl =
+                    IPCBlobUtils::Deserialize(aResult.get_IPCBlob());
+                if (blobImpl) {
+                  self->mError =
+                      self->StoreBlobImplStream(blobImpl.forget(), lock);
+                  if (NS_SUCCEEDED(self->mError)) {
+                    self->mState = State::READY;
+                    self->WaitOnUnderlyingStream(lock);
+                    return;
+                  }
+                }
+              } else {
+                MOZ_ASSERT(self->mState == State::CLOSED);
+                self->NotifyWaitTargets(lock);
+                return;
+              }
+            } else if (aResult.type() == BlobURLDataRequestResult::Tnsresult) {
+              self->mError = aResult.get_nsresult();
+            }
+            NS_WARNING("Blob data was not retrieved!");
+            self->mState = State::ERROR;
+            if (NS_SUCCEEDED(self->mError)) {
+              self->mError = NS_ERROR_FAILURE;
+            }
+            NS_ReleaseOnMainThread("BlobURLInputStream::mChannel",
+                                   self->mChannel.forget());
+            self->NotifyWaitTargets(lock);
+          },
+          [self](mozilla::ipc::ResponseRejectReason aReason) {
+            MutexAutoLock lock(self->mStateMachineMutex);
+            NS_WARNING("IPC call to SendBlobURLDataRequest failed!");
+            self->mState = State::ERROR;
+            self->mError = NS_ERROR_FAILURE;
+            NS_ReleaseOnMainThread("BlobURLInputStream::mChannel",
+                                   self->mChannel.forget());
+            self->NotifyWaitTargets(lock);
+          });
+}
+
+nsresult BlobURLInputStream::StoreBlobImplStream(
+    already_AddRefed<BlobImpl> aBlobImpl, const MutexAutoLock& aProofOfLock) {
+  MOZ_ASSERT(NS_IsMainThread(), "Only call on main thread");
+  RefPtr<BlobImpl> blobImpl = aBlobImpl;
+  nsAutoString blobContentType;
+  nsAutoCString channelContentType;
+
+  blobImpl->GetType(blobContentType);
+
+  if (mChannel->GetRequestContentRange()) {
+    IgnoredErrorResult result;
+    uint64_t size = blobImpl->GetSize(result);
+    if (NS_WARN_IF(result.Failed())) {
+      return NS_ERROR_NO_CONTENT;
+    }
+    auto contentRange = MakeRefPtr<mozilla::net::ContentRange>(
+        *mChannel->GetRequestContentRange(), size);
+    if (NS_WARN_IF(!contentRange->IsValid())) {
+      return NS_ERROR_NET_PARTIAL_TRANSFER;
+    }
+    MOZ_ALWAYS_SUCCEEDS(mChannel->SetResponseContentRange(contentRange));
+
+    uint64_t start = contentRange->Start();
+    uint64_t end = contentRange->End();
+    RefPtr<BlobImpl> slice =
+        blobImpl->CreateSlice(start, end - start + 1, blobContentType, result);
+    if (NS_WARN_IF(result.Failed())) {
+      return NS_ERROR_NET_PARTIAL_TRANSFER;
+    }
+
+    blobImpl = slice;
+  }
+
+  mChannel->GetContentType(channelContentType);
+  if (!blobContentType.IsEmpty() ||
+      channelContentType.EqualsLiteral(UNKNOWN_CONTENT_TYPE)) {
+    mChannel->SetContentType(NS_ConvertUTF16toUTF8(blobContentType));
+  }
+
+  auto cleanupOnExit = MakeScopeExit([&] { mChannel = nullptr; });
+
+  if (blobImpl->IsFile()) {
+    nsAutoString filename;
+    blobImpl->GetName(filename);
+
+    nsString ignored;
+    bool hasName =
+        NS_SUCCEEDED(mChannel->GetContentDispositionFilename(ignored));
+
+    if (!filename.IsEmpty() && !hasName) {
+      mChannel->SetContentDispositionFilename(filename);
+    }
+  }
+
+  mozilla::ErrorResult errorResult;
+
+  mBlobSize = blobImpl->GetSize(errorResult);
+
+  if (NS_WARN_IF(errorResult.Failed())) {
+    return errorResult.StealNSResult();
+  }
+
+  mChannel->SetContentLength(mBlobSize);
+
+  mChannel->SetBackingBlob(blobImpl);
+
+  nsCOMPtr<nsIInputStream> inputStream;
+  blobImpl->CreateInputStream(getter_AddRefs(inputStream), errorResult);
+
+  if (NS_WARN_IF(errorResult.Failed())) {
+    return errorResult.StealNSResult();
+  }
+
+  if (NS_WARN_IF(!inputStream)) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  nsresult rv = NS_MakeAsyncNonBlockingInputStream(
+      inputStream.forget(), getter_AddRefs(mAsyncInputStream));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  if (NS_WARN_IF(!mAsyncInputStream)) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  return NS_OK;
+}
+
+void BlobURLInputStream::NotifyWaitTargets(const MutexAutoLock& aProofOfLock) {
+  if (mAsyncWaitCallback) {
+    auto callback = mAsyncWaitTarget
+                        ? NS_NewInputStreamReadyEvent(
+                              "BlobURLInputStream::OnInputStreamReady",
+                              mAsyncWaitCallback, mAsyncWaitTarget)
+                        : mAsyncWaitCallback;
+
+    mAsyncWaitCallback = nullptr;
+    mAsyncWaitTarget = nullptr;
+    callback->OnInputStreamReady(this);
+  }
+
+  if (mAsyncLengthWaitCallback) {
+    const RefPtr<BlobURLInputStream> self = this;
+    nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableFunction(
+        "BlobURLInputStream::OnInputStreamLengthReady", [self] {
+          self->mAsyncLengthWaitCallback->OnInputStreamLengthReady(
+              self, self->mBlobSize);
+        });
+
+    mAsyncLengthWaitCallback = nullptr;
+
+    if (mAsyncLengthWaitTarget) {
+      mAsyncLengthWaitTarget->Dispatch(runnable, NS_DISPATCH_NORMAL);
+      mAsyncLengthWaitTarget = nullptr;
+    } else {
+      runnable->Run();
+    }
+  }
+}
+
+void BlobURLInputStream::ReleaseUnderlyingStream(
+    const MutexAutoLock& aProofOfLock) {
+  mAsyncInputStream = nullptr;
+  mBlobSize = -1;
+}
+
+}  

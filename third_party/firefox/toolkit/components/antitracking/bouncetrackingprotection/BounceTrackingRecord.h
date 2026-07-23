@@ -1,0 +1,91 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_BounceTrackingRecord_h
+#define mozilla_BounceTrackingRecord_h
+
+#include "nsIBounceTrackingRecord.h"
+#include "mozilla/RefPtr.h"
+#include "nsStringFwd.h"
+#include "nsTHashSet.h"
+#include "fmt/format.h"
+
+namespace mozilla {
+
+namespace dom {
+class CanonicalBrowsingContext;
+}
+
+class BounceTrackingRecord final : public nsIBounceTrackingRecord {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIBOUNCETRACKINGRECORD
+
+  BounceTrackingRecord() = default;
+
+  void SetInitialHost(const nsACString& aHost);
+
+  const nsACString& GetInitialHost() const;
+
+  void SetFinalHost(const nsACString& aHost);
+
+  const nsACString& GetFinalHost() const;
+
+  void AddBounceHost(const nsACString& aHost);
+
+  void AddUserActivationHost(const nsACString& aHost);
+
+  const nsTHashSet<nsCStringHashKey>& GetBounceHosts() const;
+
+  const nsTHashSet<nsCStringHashKey>& GetUserActivationHosts() const;
+
+ private:
+  ~BounceTrackingRecord();
+
+  nsAutoCString mInitialHost;
+
+  nsAutoCString mFinalHost;
+
+  nsTHashSet<nsCStringHashKey> mBounceHosts;
+
+  nsTHashSet<nsCStringHashKey> mUserActivationHosts;
+
+  friend struct fmt::formatter<BounceTrackingRecord>;
+};
+
+inline auto format_as(const nsTHashSet<nsCStringHashKey>& aSet) {
+  return fmt::join(aSet, ",");
+}
+
+}  
+
+template <>
+struct fmt::formatter<mozilla::BounceTrackingRecord>
+    : fmt::formatter<std::string_view> {
+  auto format(const mozilla::BounceTrackingRecord& aRec,
+              fmt::format_context& aCtx) const {
+    auto out = aCtx.out();
+    return fmt::format_to(
+        out,
+        "{{mInitialHost:{}, mFinalHost:{}, mBounceHosts:[{}], "
+        "mUserActivationHosts:[{}]}}",
+        aRec.mInitialHost, aRec.mFinalHost, aRec.mBounceHosts,
+        aRec.mUserActivationHosts);
+  }
+};
+
+template <>
+struct fmt::formatter<RefPtr<mozilla::BounceTrackingRecord>>
+    : fmt::formatter<std::string_view> {
+  auto format(const RefPtr<mozilla::BounceTrackingRecord>& aRec,
+              fmt::format_context& aCtx) const {
+    if (aRec) {
+      return fmt::formatter<mozilla::BounceTrackingRecord>{}.format(*aRec,
+                                                                    aCtx);
+    }
+    return fmt::format_to(aCtx.out(), "null");
+  }
+};
+
+#endif

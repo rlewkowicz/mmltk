@@ -1,0 +1,3337 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsStyleStruct.h"
+
+#include <algorithm>
+
+#include "AnchorPositioningUtils.h"
+#include "CounterStyleManager.h"
+#include "ImageLoader.h"
+#include "imgIContainer.h"
+#include "imgIRequest.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/GeckoBindings.h"
+#include "mozilla/Likely.h"
+#include "mozilla/PreferenceSheet.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/StaticPresData.h"
+#include "mozilla/dom/AnimationEffectBinding.h"    // for PlaybackDirection
+#include "mozilla/dom/BaseKeyframeTypesBinding.h"  // for CompositeOperation
+#include "mozilla/dom/DocGroup.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "nsBidiUtils.h"
+#include "nsCOMPtr.h"
+#include "nsCRTGlue.h"
+#include "nsCSSProps.h"
+#include "nsContainerFrame.h"
+#include "nsDeviceContext.h"
+#include "nsIURI.h"
+#include "nsIURIMutator.h"
+#include "nsIWidget.h"
+#include "nsLayoutUtils.h"
+#include "nsPresContext.h"
+#include "nsString.h"
+#include "nsStyleConsts.h"
+#include "nsStyleStructInlines.h"
+#include "nsStyleStructList.h"
+#include "nsStyleUtil.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+MOZ_RUNINIT static const nscoord kMediumBorderWidth =
+    nsPresContext::CSSPixelsToAppUnits(3);
+
+static constexpr size_t kStyleStructSizeLimit = 504;
+
+template <typename Struct, size_t Actual, size_t Limit>
+struct AssertSizeIsLessThan {
+  static_assert(Actual == sizeof(Struct), "Bogus invocation");
+  static_assert(Actual <= Limit,
+                "Style struct became larger than the size limit");
+  static constexpr bool instantiate = true;
+};
+
+#define ASSERT_SIZE(name_)                                                   \
+  static_assert(AssertSizeIsLessThan<nsStyle##name_, sizeof(nsStyle##name_), \
+                                     kStyleStructSizeLimit>::instantiate,    \
+                "");
+FOR_EACH_STYLE_STRUCT(ASSERT_SIZE, ASSERT_SIZE)
+#undef ASSERT_SIZE
+
+bool StyleCssUrlData::operator==(const StyleCssUrlData& aOther) const {
+  const auto& extra = extra_data.get();
+  const auto& otherExtra = aOther.extra_data.get();
+  if (extra.BaseURI() != otherExtra.BaseURI() ||
+      extra.Principal() != otherExtra.Principal() ||
+      cors_mode != aOther.cors_mode) {
+    return false;
+  }
+  return serialization == aOther.serialization;
+}
+
+StyleLoadData::~StyleLoadData() { Gecko_LoadData_Drop(this); }
+
+void StyleComputedUrl::ResolveImage(Document& aDocument,
+                                    const StyleComputedUrl* aOldImage) {
+  MOZ_DIAGNOSTIC_ASSERT(NS_IsMainThread());
+
+  StyleLoadData& data = MutLoadData();
+
+  MOZ_ASSERT(!(data.flags & StyleLoadDataFlags::TRIED_TO_RESOLVE_IMAGE));
+
+  data.flags |= StyleLoadDataFlags::TRIED_TO_RESOLVE_IMAGE;
+
+  const bool reuseProxy = nsContentUtils::IsChromeDoc(&aDocument) &&
+                          aOldImage && aOldImage->IsImageResolved() &&
+                          *this == *aOldImage;
+
+  RefPtr<imgRequestProxy> request;
+  if (reuseProxy) {
+    request = aOldImage->LoadData().resolved_image;
+    if (request) {
+      css::ImageLoader::NoteSharedLoad(request);
+    }
+  } else {
+    request = css::ImageLoader::LoadImage(*this, aDocument);
+  }
+
+  if (!request) {
+    return;
+  }
+
+  data.resolved_image = request.forget().take();
+
+  data.resolved_image->BoostPriority(imgIRequest::CATEGORY_FRAME_STYLE);
+}
+
+class StyleImageRequestCleanupTask final : public mozilla::Runnable {
+ public:
+  explicit StyleImageRequestCleanupTask(StyleLoadData& aData)
+      : mozilla::Runnable("StyleImageRequestCleanupTask"),
+        mRequestProxy(dont_AddRef(aData.resolved_image)) {
+    MOZ_ASSERT(mRequestProxy);
+    aData.resolved_image = nullptr;
+  }
+
+  NS_IMETHOD Run() final {
+    MOZ_ASSERT(NS_IsMainThread());
+    css::ImageLoader::UnloadImage(mRequestProxy);
+    return NS_OK;
+  }
+
+ protected:
+  virtual ~StyleImageRequestCleanupTask() {
+    MOZ_ASSERT(!mRequestProxy || NS_IsMainThread(),
+               "mRequestProxy destructor need to run on the main thread!");
+  }
+
+ private:
+  RefPtr<imgRequestProxy> mRequestProxy;
+};
+
+void Gecko_LoadData_Drop(StyleLoadData* aData) {
+  if (aData->resolved_image) {
+    auto task = MakeRefPtr<StyleImageRequestCleanupTask>(*aData);
+    SchedulerGroup::Dispatch(task.forget());
+  }
+
+  NS_IF_RELEASE(aData->resolved_uri);
+}
+
+nsStyleFont::nsStyleFont(const nsStyleFont& aSrc)
+    : mFont(aSrc.mFont),
+      mSize(aSrc.mSize),
+      mFontSizeFactor(aSrc.mFontSizeFactor),
+      mFontSizeOffset(aSrc.mFontSizeOffset),
+      mFontSizeKeyword(aSrc.mFontSizeKeyword),
+      mFontPalette(aSrc.mFontPalette),
+      mMathDepth(aSrc.mMathDepth),
+      mLineHeight(aSrc.mLineHeight),
+      mMinFontSizeRatio(aSrc.mMinFontSizeRatio),
+      mMathVariant(aSrc.mMathVariant),
+      mMathStyle(aSrc.mMathStyle),
+      mMathShift(aSrc.mMathShift),
+      mExplicitLanguage(aSrc.mExplicitLanguage),
+      mXTextScale(aSrc.mXTextScale),
+      mScriptUnconstrainedSize(aSrc.mScriptUnconstrainedSize),
+      mScriptMinSize(aSrc.mScriptMinSize),
+      mLanguage(aSrc.mLanguage) {
+  MOZ_COUNT_CTOR(nsStyleFont);
+}
+
+static StyleXTextScale InitialTextScale(const Document& aDoc) {
+  if (nsContentUtils::IsChromeDoc(&aDoc) ||
+      nsContentUtils::IsPDFJS(aDoc.NodePrincipal())) {
+    return StyleXTextScale::ZoomOnly;
+  }
+  return StyleXTextScale::All;
+}
+
+nsStyleFont::nsStyleFont(const Document& aDocument)
+    : mFont(*aDocument.GetFontPrefsForLang(nullptr)->GetDefaultFont(
+          StyleGenericFontFamily::None)),
+      mSize(ZoomText(aDocument, mFont.size)),
+      mFontSizeFactor(1.0),
+      mFontSizeOffset{0},
+      mFontSizeKeyword(StyleFontSizeKeyword::Medium),
+      mFontPalette(StyleFontPalette::Normal()),
+      mMathDepth(0),
+      mLineHeight(StyleLineHeight::Normal()),
+      mMathVariant(StyleMathVariant::None),
+      mMathStyle(StyleMathStyle::Normal),
+      mMathShift(StyleMathShift::Normal),
+      mXTextScale(InitialTextScale(aDocument)),
+      mScriptUnconstrainedSize(mSize),
+      mScriptMinSize(Length::FromPixels(
+          CSSPixel::FromPoints(kMathMLDefaultScriptMinSizePt))),
+      mLanguage(aDocument.GetLanguageForStyle()) {
+  MOZ_COUNT_CTOR(nsStyleFont);
+  MOZ_ASSERT(NS_IsMainThread());
+  mFont.family.is_initial = true;
+  mFont.size = mSize;
+  if (MinFontSizeEnabled()) {
+    const Length minimumFontSize =
+        aDocument.GetFontPrefsForLang(mLanguage)->mMinimumFontSize;
+    mFont.size = Length::FromPixels(
+        std::max(mSize.ToCSSPixels(), minimumFontSize.ToCSSPixels()));
+  }
+}
+
+nsChangeHint nsStyleFont::CalcDifference(const nsStyleFont& aNewData) const {
+  MOZ_ASSERT(mXTextScale == aNewData.mXTextScale,
+             "expected -x-text-scale to be the same on both nsStyleFonts");
+  if (mSize != aNewData.mSize || mLanguage != aNewData.mLanguage ||
+      mExplicitLanguage != aNewData.mExplicitLanguage ||
+      mMathVariant != aNewData.mMathVariant ||
+      mMathStyle != aNewData.mMathStyle || mMathShift != aNewData.mMathShift ||
+      mMinFontSizeRatio != aNewData.mMinFontSizeRatio ||
+      mLineHeight != aNewData.mLineHeight) {
+    return NS_STYLE_HINT_REFLOW;
+  }
+
+  switch (mFont.CalcDifference(aNewData.mFont)) {
+    case nsFont::MaxDifference::eLayoutAffecting:
+      return NS_STYLE_HINT_REFLOW;
+
+    case nsFont::MaxDifference::eVisual:
+      return NS_STYLE_HINT_VISUAL;
+
+    case nsFont::MaxDifference::eNone:
+      break;
+  }
+
+  if (mFontPalette != aNewData.mFontPalette) {
+    return NS_STYLE_HINT_VISUAL;
+  }
+
+  if (mMathDepth != aNewData.mMathDepth ||
+      mScriptUnconstrainedSize != aNewData.mScriptUnconstrainedSize ||
+      mScriptMinSize != aNewData.mScriptMinSize) {
+    return nsChangeHint_NeutralChange;
+  }
+
+  return nsChangeHint(0);
+}
+
+Length nsStyleFont::ZoomText(const Document& aDocument, Length aSize) {
+  if (auto* pc = aDocument.GetPresContext()) {
+    aSize.ScaleBy(pc->TextZoom());
+  }
+  return aSize;
+}
+
+template <typename T>
+static StyleRect<T> StyleRectWithAllSides(const T& aSide) {
+  return {aSide, aSide, aSide, aSide};
+}
+
+bool AnchorPosResolutionParams::AutoResolutionOverrideParams::OverriddenToZero(
+    StylePhysicalAxis aAxis) const {
+  if (mPositionAreaInUse) {
+    return true;
+  }
+
+  if (aAxis == StylePhysicalAxis::Vertical) {
+    return mVAnchorCenter;
+  }
+  MOZ_ASSERT(aAxis == StylePhysicalAxis::Horizontal);
+  return mHAnchorCenter;
+}
+
+static AnchorPosResolutionParams::AutoResolutionOverrideParams
+GetAutoResolutionOverrideParams(const nsIFrame* aFrame,
+                                bool aDefaultAnchorValid) {
+  if (!aFrame) {
+    return {};
+  }
+  nsIFrame* parent = aFrame->GetParent();
+  if (!parent || !aFrame->HasAnyStateBits(NS_FRAME_OUT_OF_FLOW) ||
+      !aDefaultAnchorValid) {
+    return {};
+  }
+
+  const auto* stylePos = aFrame->StylePosition();
+  const auto cbwm = parent->GetWritingMode();
+
+  auto checkAxis = [&](LogicalAxis aAxis) {
+    StyleAlignFlags alignment =
+        stylePos->UsedSelfAlignment(aAxis, parent->Style());
+    return (alignment & ~StyleAlignFlags::FLAG_BITS) ==
+           StyleAlignFlags::ANCHOR_CENTER;
+  };
+
+  const auto horizontalLogicalAxis =
+      cbwm.IsVertical() ? LogicalAxis::Block : LogicalAxis::Inline;
+  AnchorPosResolutionParams::AutoResolutionOverrideParams result;
+  result.mHAnchorCenter = checkAxis(horizontalLogicalAxis);
+  result.mVAnchorCenter = checkAxis(GetOrthogonalAxis(horizontalLogicalAxis));
+  result.mPositionAreaInUse = !stylePos->mPositionArea.IsNone();
+  return result;
+}
+
+AnchorPosResolutionParams::AutoResolutionOverrideParams::
+    AutoResolutionOverrideParams(
+        const nsIFrame* aFrame, const mozilla::AnchorPosResolutionCache* aCache)
+    : AutoResolutionOverrideParams{GetAutoResolutionOverrideParams(
+          aFrame, aCache && aCache->mDefaultAnchorCache.mAnchor)} {}
+
+AnchorPosResolutionParams::AutoResolutionOverrideParams::
+    AutoResolutionOverrideParams(const nsIFrame* aFrame)
+    : AutoResolutionOverrideParams{
+          GetAutoResolutionOverrideParams(aFrame, [&]() {
+            if (!aFrame) {
+              return false;
+            }
+            const auto* references =
+                aFrame->GetProperty(nsIFrame::AnchorPosReferences());
+            if (!references || !references->mDefaultAnchorName) {
+              return false;
+            }
+            const auto* entry = references->Lookup(
+                {references->mDefaultAnchorName, references->mAnchorTreeScope});
+            return entry && entry->isSome();
+          }())} {}
+
+AnchorResolvedMargin AnchorResolvedMarginHelper::ResolveAnchor(
+    const StyleMargin& aValue, StylePhysicalAxis aAxis,
+    const AnchorPosResolutionParams& aParams) {
+  MOZ_ASSERT(aValue.HasAnchorPositioningFunction(),
+             "Calling anchor resolution without using it?");
+  if (aValue.IsAnchorSizeFunction()) {
+    auto resolved = StyleAnchorPositioningFunctionResolution::Invalid();
+    Servo_ResolveAnchorSizeFunctionForMargin(&*aValue.AsAnchorSizeFunction(),
+                                             &aParams, aAxis, &resolved);
+    if (resolved.IsInvalid()) {
+      return Zero();
+    }
+    if (resolved.IsResolvedReference()) {
+      return MakeUniqueOfUniqueOrNonOwning<const StyleMargin>(
+          *resolved.AsResolvedReference());
+    }
+    return MakeUniqueOfUniqueOrNonOwning<const StyleMargin>(
+        resolved.AsResolved());
+  }
+
+  const auto& lp = aValue.AsAnchorContainingCalcFunction();
+  const auto& c = lp.AsCalc();
+  auto result = StyleCalcAnchorPositioningFunctionResolution::Invalid();
+  AnchorPosOffsetResolutionParams params =
+      AnchorPosOffsetResolutionParams::UseCBFrameSize(aParams);
+  const auto allowed =
+      StyleAllowAnchorPosResolutionInCalcPercentage::AnchorSizeOnly(aAxis);
+  Servo_ResolveAnchorFunctionsInCalcPercentage(&c, &allowed, &params, &result);
+  if (result.IsInvalid()) {
+    return Zero();
+  }
+  return MakeUniqueOfUniqueOrNonOwning<const StyleMargin>(result.AsValid());
+}
+
+nsStyleMargin::nsStyleMargin()
+    : mMargin(StyleRectWithAllSides(
+          StyleMargin::LengthPercentage(LengthPercentage::Zero()))),
+      mScrollMargin(StyleRectWithAllSides(StyleLength{0.})),
+      mOverflowClipMargin(
+          {StyleLength::Zero(), StyleOverflowClipMarginBox::PaddingBox}) {
+  MOZ_COUNT_CTOR(nsStyleMargin);
+}
+
+nsStyleMargin::nsStyleMargin(const nsStyleMargin& aSrc)
+    : mMargin(aSrc.mMargin),
+      mScrollMargin(aSrc.mScrollMargin),
+      mOverflowClipMargin(aSrc.mOverflowClipMargin) {
+  MOZ_COUNT_CTOR(nsStyleMargin);
+}
+
+nsChangeHint nsStyleMargin::CalcDifference(
+    const nsStyleMargin& aNewData) const {
+  nsChangeHint hint = nsChangeHint(0);
+
+  if (!MarginEquals(aNewData)) {
+    hint |= nsChangeHint_NeedReflow | nsChangeHint_ReflowChangesSizeOrPosition |
+            nsChangeHint_ClearAncestorIntrinsics;
+  }
+
+  if (mScrollMargin != aNewData.mScrollMargin) {
+    hint |= nsChangeHint_NeutralChange;
+  }
+
+  if (mOverflowClipMargin != aNewData.mOverflowClipMargin) {
+    hint |= nsChangeHint_UpdateOverflow | nsChangeHint_RepaintFrame;
+  }
+
+  return hint;
+}
+
+nsStylePadding::nsStylePadding()
+    : mPadding(StyleRectWithAllSides(LengthPercentage::Zero())),
+      mScrollPadding(StyleRectWithAllSides(LengthPercentageOrAuto::Auto())) {
+  MOZ_COUNT_CTOR(nsStylePadding);
+}
+
+nsStylePadding::nsStylePadding(const nsStylePadding& aSrc)
+    : mPadding(aSrc.mPadding), mScrollPadding(aSrc.mScrollPadding) {
+  MOZ_COUNT_CTOR(nsStylePadding);
+}
+
+nsChangeHint nsStylePadding::CalcDifference(
+    const nsStylePadding& aNewData) const {
+  nsChangeHint hint = nsChangeHint(0);
+
+  if (mPadding != aNewData.mPadding) {
+    hint |= NS_STYLE_HINT_REFLOW & ~nsChangeHint_ClearDescendantIntrinsics;
+  }
+
+  if (mScrollPadding != aNewData.mScrollPadding) {
+    hint |= nsChangeHint_NeutralChange;
+  }
+
+  return hint;
+}
+
+static inline BorderRadius ZeroBorderRadius() {
+  auto zero = LengthPercentage::Zero();
+  return {{{zero, zero}}, {{zero, zero}}, {{zero, zero}}, {{zero, zero}}};
+}
+
+static inline mozilla::StyleCornerShapeRect RoundCornerShapeRect() {
+  mozilla::StyleCornerShape round{1.0f};
+  return {round, round, round, round};
+}
+
+nsStyleBorder::nsStyleBorder()
+    : mBorderRadius(ZeroBorderRadius()),
+      mCornerShape(RoundCornerShapeRect()),
+      mBorderImageSource(StyleImage::None()),
+      mBorderImageWidth(
+          StyleRectWithAllSides(StyleBorderImageSideWidth::Number(1.))),
+      mBorderImageOutset(
+          StyleRectWithAllSides(StyleNonNegativeLengthOrNumber::Number(0.))),
+      mBorderImageSlice(
+          {StyleRectWithAllSides(StyleNumberOrPercentage::Percentage({1.})),
+           false}),
+      mBorderImageRepeat{StyleBorderImageRepeatKeyword::Stretch,
+                         StyleBorderImageRepeatKeyword::Stretch},
+      mFloatEdge(StyleFloatEdge::ContentBox),
+      mBoxDecorationBreak(StyleBoxDecorationBreak::Slice),
+      mBorderStyle(StyleRectWithAllSides(StyleBorderStyle::None)),
+      mBorder(StyleRectWithAllSides(kMediumBorderWidth)),
+      mBorderTopColor(StyleColor::CurrentColor()),
+      mBorderRightColor(StyleColor::CurrentColor()),
+      mBorderBottomColor(StyleColor::CurrentColor()),
+      mBorderLeftColor(StyleColor::CurrentColor()) {
+  MOZ_COUNT_CTOR(nsStyleBorder);
+}
+
+nsStyleBorder::nsStyleBorder(const nsStyleBorder& aSrc)
+    : mBorderRadius(aSrc.mBorderRadius),
+      mCornerShape(aSrc.mCornerShape),
+      mBorderImageSource(aSrc.mBorderImageSource),
+      mBorderImageWidth(aSrc.mBorderImageWidth),
+      mBorderImageOutset(aSrc.mBorderImageOutset),
+      mBorderImageSlice(aSrc.mBorderImageSlice),
+      mBorderImageRepeat(aSrc.mBorderImageRepeat),
+      mFloatEdge(aSrc.mFloatEdge),
+      mBoxDecorationBreak(aSrc.mBoxDecorationBreak),
+      mBorderStyle(aSrc.mBorderStyle),
+      mBorder(aSrc.mBorder),
+      mBorderTopColor(aSrc.mBorderTopColor),
+      mBorderRightColor(aSrc.mBorderRightColor),
+      mBorderBottomColor(aSrc.mBorderBottomColor),
+      mBorderLeftColor(aSrc.mBorderLeftColor) {
+  MOZ_COUNT_CTOR(nsStyleBorder);
+}
+
+void nsStyleBorder::TriggerImageLoads(Document& aDocument,
+                                      const nsStyleBorder* aOldStyle) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  mBorderImageSource.ResolveImage(
+      aDocument, aOldStyle ? &aOldStyle->mBorderImageSource : nullptr);
+}
+
+nsMargin nsStyleBorder::GetImageOutset() const {
+  nsMargin outset;
+  auto computedBorder = GetComputedBorder();
+  for (const auto s : mozilla::AllPhysicalSides()) {
+    const auto& coord = mBorderImageOutset.Get(s);
+    nscoord value;
+    if (coord.IsLength()) {
+      value = coord.AsLength().ToAppUnits();
+    } else {
+      MOZ_ASSERT(coord.IsNumber());
+      value = coord.AsNumber() * computedBorder.Side(s);
+    }
+    outset.Side(s) = value;
+  }
+  return outset;
+}
+
+nsChangeHint nsStyleBorder::CalcDifference(
+    const nsStyleBorder& aNewData) const {
+  if (GetComputedBorder() != aNewData.GetComputedBorder() ||
+      mFloatEdge != aNewData.mFloatEdge ||
+      mBorderImageOutset != aNewData.mBorderImageOutset ||
+      mBoxDecorationBreak != aNewData.mBoxDecorationBreak) {
+    return NS_STYLE_HINT_REFLOW;
+  }
+
+  for (const auto ix : mozilla::AllPhysicalSides()) {
+    if (mBorderStyle.Get(ix) != aNewData.mBorderStyle.Get(ix) ||
+        BorderColorFor(ix) != aNewData.BorderColorFor(ix)) {
+      return nsChangeHint_RepaintFrame;
+    }
+  }
+
+  if (mBorderRadius != aNewData.mBorderRadius) {
+    return nsChangeHint_RepaintFrame;
+  }
+
+  if (mCornerShape != aNewData.mCornerShape) {
+    return nsChangeHint_RepaintFrame;
+  }
+
+  if (!mBorderImageSource.IsNone() || !aNewData.mBorderImageSource.IsNone()) {
+    if (mBorderImageSource != aNewData.mBorderImageSource ||
+        mBorderImageRepeat != aNewData.mBorderImageRepeat ||
+        mBorderImageSlice != aNewData.mBorderImageSlice ||
+        mBorderImageWidth != aNewData.mBorderImageWidth) {
+      return nsChangeHint_RepaintFrame;
+    }
+  }
+
+  if (mBorder != aNewData.mBorder ||
+      mBorderImageSource != aNewData.mBorderImageSource ||
+      mBorderImageRepeat != aNewData.mBorderImageRepeat ||
+      mBorderImageSlice != aNewData.mBorderImageSlice ||
+      mBorderImageWidth != aNewData.mBorderImageWidth) {
+    return nsChangeHint_NeutralChange;
+  }
+
+  return nsChangeHint(0);
+}
+
+nsStyleOutline::nsStyleOutline()
+    : mOutlineWidth(kMediumBorderWidth),
+      mOutlineOffset(0),
+      mOutlineColor(StyleColor::CurrentColor()),
+      mOutlineStyle(StyleOutlineStyle::BorderStyle(StyleBorderStyle::None)) {
+  MOZ_COUNT_CTOR(nsStyleOutline);
+}
+
+nsStyleOutline::nsStyleOutline(const nsStyleOutline& aSrc)
+    : mOutlineWidth(aSrc.mOutlineWidth),
+      mOutlineOffset(aSrc.mOutlineOffset),
+      mOutlineColor(aSrc.mOutlineColor),
+      mOutlineStyle(aSrc.mOutlineStyle) {
+  MOZ_COUNT_CTOR(nsStyleOutline);
+}
+
+nsChangeHint nsStyleOutline::CalcDifference(
+    const nsStyleOutline& aNewData) const {
+  const bool shouldPaintOutline = ShouldPaintOutline();
+  if (shouldPaintOutline != aNewData.ShouldPaintOutline() ||
+      mOutlineWidth != aNewData.mOutlineWidth ||
+      mOutlineStyle.IsAuto() != aNewData.mOutlineStyle.IsAuto() ||
+      (shouldPaintOutline && mOutlineOffset != aNewData.mOutlineOffset)) {
+    return nsChangeHint_UpdateOverflow | nsChangeHint_SchedulePaint |
+           nsChangeHint_RepaintFrame;
+  }
+
+  if (mOutlineStyle != aNewData.mOutlineStyle ||
+      mOutlineColor != aNewData.mOutlineColor) {
+    return shouldPaintOutline ? nsChangeHint_RepaintFrame
+                              : nsChangeHint_NeutralChange;
+  }
+
+  if (mOutlineWidth != aNewData.mOutlineWidth ||
+      mOutlineOffset != aNewData.mOutlineOffset) {
+    return nsChangeHint_NeutralChange;
+  }
+
+  return nsChangeHint(0);
+}
+
+nsSize nsStyleOutline::EffectiveOffsetFor(const nsRect& aRect) const {
+  const nscoord offset = mOutlineOffset;
+  if (offset >= 0) {
+    return nsSize(offset, offset);
+  }
+
+  return nsSize(std::max(offset, -(aRect.Width() / 2)),
+                std::max(offset, -(aRect.Height() / 2)));
+}
+
+nsStyleList::nsStyleList()
+    : mListStylePosition(StyleListStylePosition::Outside),
+      mListStyleType(StyleCounterStyle::Name({StyleAtom(nsGkAtoms::disc)})),
+      mQuotes(StyleQuotes::Auto()),
+      mListStyleImage(StyleImage::None()) {
+  MOZ_COUNT_CTOR(nsStyleList);
+  MOZ_ASSERT(NS_IsMainThread());
+}
+
+nsStyleList::nsStyleList(const nsStyleList& aSource)
+    : mListStylePosition(aSource.mListStylePosition),
+      mListStyleType(aSource.mListStyleType),
+      mQuotes(aSource.mQuotes),
+      mListStyleImage(aSource.mListStyleImage) {
+  MOZ_COUNT_CTOR(nsStyleList);
+}
+
+void nsStyleList::TriggerImageLoads(Document& aDocument,
+                                    const nsStyleList* aOldStyle) {
+  MOZ_ASSERT(NS_IsMainThread());
+  mListStyleImage.ResolveImage(
+      aDocument, aOldStyle ? &aOldStyle->mListStyleImage : nullptr);
+}
+
+nsChangeHint nsStyleList::CalcDifference(const nsStyleList& aNewData,
+                                         const ComputedStyle& aOldStyle) const {
+  if (mQuotes != aNewData.mQuotes) {
+    return nsChangeHint_ReconstructFrame;
+  }
+  nsChangeHint hint = nsChangeHint(0);
+  if (mListStylePosition != aNewData.mListStylePosition ||
+      mListStyleType != aNewData.mListStyleType ||
+      mListStyleImage != aNewData.mListStyleImage) {
+    if (aOldStyle.StyleDisplay()->IsListItem()) {
+      return nsChangeHint_ReconstructFrame;
+    }
+    hint = nsChangeHint_NeutralChange;
+  }
+  return hint;
+}
+
+nsStyleXUL::nsStyleXUL()
+    : mBoxFlex(0.0f),
+      mBoxOrdinal(1),
+      mBoxAlign(StyleBoxAlign::Stretch),
+      mBoxDirection(StyleBoxDirection::Normal),
+      mBoxOrient(StyleBoxOrient::Horizontal),
+      mBoxPack(StyleBoxPack::Start) {
+  MOZ_COUNT_CTOR(nsStyleXUL);
+}
+
+nsStyleXUL::nsStyleXUL(const nsStyleXUL& aSource)
+    : mBoxFlex(aSource.mBoxFlex),
+      mBoxOrdinal(aSource.mBoxOrdinal),
+      mBoxAlign(aSource.mBoxAlign),
+      mBoxDirection(aSource.mBoxDirection),
+      mBoxOrient(aSource.mBoxOrient),
+      mBoxPack(aSource.mBoxPack) {
+  MOZ_COUNT_CTOR(nsStyleXUL);
+}
+
+nsChangeHint nsStyleXUL::CalcDifference(const nsStyleXUL& aNewData) const {
+  if (mBoxAlign == aNewData.mBoxAlign &&
+      mBoxDirection == aNewData.mBoxDirection &&
+      mBoxFlex == aNewData.mBoxFlex && mBoxOrient == aNewData.mBoxOrient &&
+      mBoxPack == aNewData.mBoxPack && mBoxOrdinal == aNewData.mBoxOrdinal) {
+    return nsChangeHint(0);
+  }
+  if (mBoxOrdinal != aNewData.mBoxOrdinal) {
+    return nsChangeHint_ReconstructFrame;
+  }
+  return NS_STYLE_HINT_REFLOW;
+}
+
+
+nsStyleColumn::nsStyleColumn()
+    : mColumnWidth(LengthOrAuto::Auto()),
+      mColumnRuleColor(StyleColor::CurrentColor()),
+      mColumnRuleStyle(StyleBorderStyle::None),
+      mColumnRuleWidth(kMediumBorderWidth) {
+  MOZ_COUNT_CTOR(nsStyleColumn);
+}
+
+nsStyleColumn::nsStyleColumn(const nsStyleColumn& aSource)
+    : mColumnCount(aSource.mColumnCount),
+      mColumnWidth(aSource.mColumnWidth),
+      mColumnRuleColor(aSource.mColumnRuleColor),
+      mColumnRuleStyle(aSource.mColumnRuleStyle),
+      mColumnFill(aSource.mColumnFill),
+      mColumnSpan(aSource.mColumnSpan),
+      mColumnRuleWidth(aSource.mColumnRuleWidth) {
+  MOZ_COUNT_CTOR(nsStyleColumn);
+}
+
+nsChangeHint nsStyleColumn::CalcDifference(
+    const nsStyleColumn& aNewData) const {
+  if (mColumnWidth.IsAuto() != aNewData.mColumnWidth.IsAuto() ||
+      mColumnCount != aNewData.mColumnCount ||
+      mColumnSpan != aNewData.mColumnSpan) {
+    return nsChangeHint_ReconstructFrame;
+  }
+
+  if (mColumnWidth != aNewData.mColumnWidth ||
+      mColumnFill != aNewData.mColumnFill) {
+    return NS_STYLE_HINT_REFLOW;
+  }
+
+  if (mColumnRuleWidth != aNewData.mColumnRuleWidth ||
+      mColumnRuleStyle != aNewData.mColumnRuleStyle ||
+      mColumnRuleColor != aNewData.mColumnRuleColor) {
+    return NS_STYLE_HINT_VISUAL;
+  }
+
+  return nsChangeHint(0);
+}
+
+using SVGPaintFallback = StyleGenericSVGPaintFallback<StyleColor>;
+
+nsStyleSVG::nsStyleSVG()
+    : mFill{StyleSVGPaintKind::Color(StyleColor::Black()),
+            SVGPaintFallback::Unset()},
+      mStroke{StyleSVGPaintKind::None(), SVGPaintFallback::Unset()},
+      mMarkerEnd(StyleUrlOrNone::None()),
+      mMarkerMid(StyleUrlOrNone::None()),
+      mMarkerStart(StyleUrlOrNone::None()),
+      mMozContextProperties{{}, {0}},
+      mStrokeDasharray(StyleSVGStrokeDashArray::Values({})),
+      mStrokeDashoffset(
+          StyleSVGLength::LengthPercentage(LengthPercentage::Zero())),
+      mStrokeWidth(
+          StyleSVGWidth::LengthPercentage(LengthPercentage::FromPixels(1.0f))),
+      mFillOpacity(StyleSVGOpacity::Opacity(1.0f)),
+      mStrokeMiterlimit(4.0f),
+      mStrokeOpacity(StyleSVGOpacity::Opacity(1.0f)),
+      mClipRule(StyleFillRule::Nonzero),
+      mColorInterpolation(StyleColorInterpolation::Srgb),
+      mColorInterpolationFilters(StyleColorInterpolation::Linearrgb),
+      mFillRule(StyleFillRule::Nonzero),
+      mPaintOrder(0),
+      mShapeRendering(StyleShapeRendering::Auto),
+      mStrokeLinecap(StyleStrokeLinecap::Butt),
+      mStrokeLinejoin(StyleStrokeLinejoin::Miter),
+      mTextAnchor(StyleTextAnchor::Start) {
+  MOZ_COUNT_CTOR(nsStyleSVG);
+}
+
+nsStyleSVG::nsStyleSVG(const nsStyleSVG& aSource)
+    : mFill(aSource.mFill),
+      mStroke(aSource.mStroke),
+      mMarkerEnd(aSource.mMarkerEnd),
+      mMarkerMid(aSource.mMarkerMid),
+      mMarkerStart(aSource.mMarkerStart),
+      mMozContextProperties(aSource.mMozContextProperties),
+      mStrokeDasharray(aSource.mStrokeDasharray),
+      mStrokeDashoffset(aSource.mStrokeDashoffset),
+      mStrokeWidth(aSource.mStrokeWidth),
+      mFillOpacity(aSource.mFillOpacity),
+      mStrokeMiterlimit(aSource.mStrokeMiterlimit),
+      mStrokeOpacity(aSource.mStrokeOpacity),
+      mClipRule(aSource.mClipRule),
+      mColorInterpolation(aSource.mColorInterpolation),
+      mColorInterpolationFilters(aSource.mColorInterpolationFilters),
+      mFillRule(aSource.mFillRule),
+      mPaintOrder(aSource.mPaintOrder),
+      mShapeRendering(aSource.mShapeRendering),
+      mStrokeLinecap(aSource.mStrokeLinecap),
+      mStrokeLinejoin(aSource.mStrokeLinejoin),
+      mTextAnchor(aSource.mTextAnchor) {
+  MOZ_COUNT_CTOR(nsStyleSVG);
+}
+
+static bool PaintURIChanged(const StyleSVGPaint& aPaint1,
+                            const StyleSVGPaint& aPaint2) {
+  if (aPaint1.kind.IsPaintServer() != aPaint2.kind.IsPaintServer()) {
+    return true;
+  }
+  return aPaint1.kind.IsPaintServer() &&
+         aPaint1.kind.AsPaintServer() != aPaint2.kind.AsPaintServer();
+}
+
+nsChangeHint nsStyleSVG::CalcDifference(const nsStyleSVG& aNewData) const {
+  nsChangeHint hint = nsChangeHint(0);
+
+  if (mMarkerEnd != aNewData.mMarkerEnd || mMarkerMid != aNewData.mMarkerMid ||
+      mMarkerStart != aNewData.mMarkerStart) {
+    return nsChangeHint_UpdateEffects | nsChangeHint_NeedReflow |
+           nsChangeHint_RepaintFrame;
+  }
+
+  if (mFill != aNewData.mFill || mStroke != aNewData.mStroke ||
+      mFillOpacity != aNewData.mFillOpacity ||
+      mStrokeOpacity != aNewData.mStrokeOpacity) {
+    hint |= nsChangeHint_RepaintFrame;
+    if (HasStroke() != aNewData.HasStroke() ||
+        (!HasStroke() && HasFill() != aNewData.HasFill())) {
+      hint |= nsChangeHint_NeedReflow;
+    }
+    if (PaintURIChanged(mFill, aNewData.mFill) ||
+        PaintURIChanged(mStroke, aNewData.mStroke)) {
+      hint |= nsChangeHint_UpdateEffects;
+    }
+  }
+
+  if (mStrokeWidth != aNewData.mStrokeWidth ||
+      mStrokeMiterlimit != aNewData.mStrokeMiterlimit ||
+      mStrokeLinecap != aNewData.mStrokeLinecap ||
+      mStrokeLinejoin != aNewData.mStrokeLinejoin ||
+      mTextAnchor != aNewData.mTextAnchor) {
+    return hint | nsChangeHint_NeedReflow | nsChangeHint_RepaintFrame;
+  }
+
+  if (hint & nsChangeHint_RepaintFrame) {
+    return hint;  
+  }
+
+  if (mStrokeDashoffset != aNewData.mStrokeDashoffset ||
+      mClipRule != aNewData.mClipRule ||
+      mColorInterpolation != aNewData.mColorInterpolation ||
+      mColorInterpolationFilters != aNewData.mColorInterpolationFilters ||
+      mFillRule != aNewData.mFillRule || mPaintOrder != aNewData.mPaintOrder ||
+      mShapeRendering != aNewData.mShapeRendering ||
+      mStrokeDasharray != aNewData.mStrokeDasharray ||
+      mMozContextProperties.bits != aNewData.mMozContextProperties.bits) {
+    return hint | nsChangeHint_RepaintFrame;
+  }
+
+  if (!hint) {
+    if (mMozContextProperties.idents != aNewData.mMozContextProperties.idents) {
+      hint = nsChangeHint_NeutralChange;
+    }
+  }
+
+  return hint;
+}
+
+nsStyleSVGReset::nsStyleSVGReset()
+    : mX(LengthPercentage::Zero()),
+      mY(LengthPercentage::Zero()),
+      mCx(LengthPercentage::Zero()),
+      mCy(LengthPercentage::Zero()),
+      mRx(NonNegativeLengthPercentageOrAuto::Auto()),
+      mRy(NonNegativeLengthPercentageOrAuto::Auto()),
+      mR(NonNegativeLengthPercentage::Zero()),
+      mMask(nsStyleImageLayers::LayerType::Mask),
+      mClipPath(StyleClipPath::None()),
+      mStopColor(StyleColor::Black()),
+      mFloodColor(StyleColor::Black()),
+      mLightingColor(StyleColor::White()),
+      mStopOpacity(1.0f),
+      mFloodOpacity(1.0f),
+      mVectorEffect(StyleVectorEffect::NONE),
+      mMaskType(StyleMaskType::Luminance),
+      mD(StyleDProperty::None()) {
+  MOZ_COUNT_CTOR(nsStyleSVGReset);
+}
+
+nsStyleSVGReset::nsStyleSVGReset(const nsStyleSVGReset& aSource)
+    : mX(aSource.mX),
+      mY(aSource.mY),
+      mCx(aSource.mCx),
+      mCy(aSource.mCy),
+      mRx(aSource.mRx),
+      mRy(aSource.mRy),
+      mR(aSource.mR),
+      mMask(aSource.mMask),
+      mClipPath(aSource.mClipPath),
+      mStopColor(aSource.mStopColor),
+      mFloodColor(aSource.mFloodColor),
+      mLightingColor(aSource.mLightingColor),
+      mStopOpacity(aSource.mStopOpacity),
+      mFloodOpacity(aSource.mFloodOpacity),
+      mVectorEffect(aSource.mVectorEffect),
+      mMaskType(aSource.mMaskType),
+      mD(aSource.mD) {
+  MOZ_COUNT_CTOR(nsStyleSVGReset);
+}
+
+void nsStyleSVGReset::TriggerImageLoads(Document& aDocument,
+                                        const nsStyleSVGReset* aOldStyle) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  NS_FOR_VISIBLE_IMAGE_LAYERS_BACK_TO_FRONT(i, mMask) {
+    auto& image = mMask.mLayers[i].mImage;
+    if (!image.IsImageRequestType()) {
+      continue;
+    }
+    const auto* url = image.GetImageRequestURLValue();
+    if (url->IsLocalRef()) {
+      continue;
+    }
+#if 0
+    nsIURI* docURI = aPresContext->Document()->GetDocumentURI();
+    if (url->EqualsExceptRef(docURI)) {
+      continue;
+    }
+#endif
+    const auto* oldImage = (aOldStyle && aOldStyle->mMask.mLayers.Length() > i)
+                               ? &aOldStyle->mMask.mLayers[i].mImage
+                               : nullptr;
+
+    image.ResolveImage(aDocument, oldImage);
+  }
+}
+
+nsChangeHint nsStyleSVGReset::CalcDifference(
+    const nsStyleSVGReset& aNewData) const {
+  nsChangeHint hint = nsChangeHint(0);
+
+  if (mX != aNewData.mX || mY != aNewData.mY || mCx != aNewData.mCx ||
+      mCy != aNewData.mCy || mR != aNewData.mR || mRx != aNewData.mRx ||
+      mRy != aNewData.mRy || mD != aNewData.mD) {
+    hint |= nsChangeHint_InvalidateRenderingObservers | nsChangeHint_NeedReflow;
+  }
+
+  if (mClipPath != aNewData.mClipPath) {
+    hint |= nsChangeHint_UpdateEffects | nsChangeHint_RepaintFrame;
+  }
+
+  if (mVectorEffect != aNewData.mVectorEffect) {
+    hint |= nsChangeHint_NeedReflow | nsChangeHint_RepaintFrame;
+  } else if (mStopColor != aNewData.mStopColor ||
+             mFloodColor != aNewData.mFloodColor ||
+             mLightingColor != aNewData.mLightingColor ||
+             mStopOpacity != aNewData.mStopOpacity ||
+             mFloodOpacity != aNewData.mFloodOpacity ||
+             mMaskType != aNewData.mMaskType || mD != aNewData.mD) {
+    hint |= nsChangeHint_RepaintFrame;
+  }
+
+  hint |=
+      mMask.CalcDifference(aNewData.mMask, nsStyleImageLayers::LayerType::Mask);
+
+  return hint;
+}
+
+bool nsStyleSVGReset::HasMask() const {
+  for (uint32_t i = 0; i < mMask.mImageCount; i++) {
+    if (!mMask.mLayers[i].mImage.IsNone()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+
+nsStylePage::nsStylePage(const nsStylePage& aSrc)
+    : mSize(aSrc.mSize),
+      mPage(aSrc.mPage),
+      mPageOrientation(aSrc.mPageOrientation) {
+  MOZ_COUNT_CTOR(nsStylePage);
+}
+
+nsChangeHint nsStylePage::CalcDifference(const nsStylePage& aNewData) const {
+  if (aNewData.mSize != mSize || aNewData.mPage != mPage ||
+      aNewData.mPageOrientation != mPageOrientation) {
+    return nsChangeHint_NeutralChange;
+  }
+  return nsChangeHint_Empty;
+}
+
+nsStylePosition::nsStylePosition()
+    : mObjectPosition(Position::FromPercentage(0.5f)),
+      mOffset(StyleRectWithAllSides(StyleInset::Auto())),
+      mWidth(StyleSize::Auto()),
+      mMinWidth(StyleSize::Auto()),
+      mMaxWidth(StyleMaxSize::None()),
+      mHeight(StyleSize::Auto()),
+      mMinHeight(StyleSize::Auto()),
+      mMaxHeight(StyleMaxSize::None()),
+      mPositionAnchor(StylePositionAnchorKeyword::Normal()),
+      mPositionVisibility(StylePositionVisibility::ANCHORS_VISIBLE),
+      mPositionTryFallbacks(StylePositionTryFallbacks()),
+      mPositionTryOrder(StylePositionTryOrder::Normal),
+      mFlexBasis(StyleFlexBasis::Size(StyleSize::Auto())),
+      mAspectRatio(StyleAspectRatio::Auto()),
+      mGridAutoFlow(StyleGridAutoFlow::ROW),
+      mMasonryAutoFlow(
+          {StyleMasonryPlacement::Pack, StyleMasonryItemOrder::DefiniteFirst}),
+      mAlignContent({StyleAlignFlags::NORMAL}),
+      mAlignItems({StyleAlignFlags::NORMAL}),
+      mAlignSelf({StyleAlignFlags::AUTO}),
+      mJustifyContent({StyleAlignFlags::NORMAL}),
+      mJustifyItems({{StyleAlignFlags::LEGACY}, {StyleAlignFlags::NORMAL}}),
+      mJustifySelf({StyleAlignFlags::AUTO}),
+      mFlexDirection(StyleFlexDirection::Row),
+      mFlexWrap(StyleFlexWrap::Nowrap),
+      mObjectFit(StyleObjectFit::Fill),
+      mBoxSizing(StyleBoxSizing::ContentBox),
+      mOrder(0),
+      mFlexGrow(0.0f),
+      mFlexShrink(1.0f),
+      mZIndex(StyleZIndex::Auto()),
+      mGridTemplateColumns(StyleGridTemplateComponent::None()),
+      mGridTemplateRows(StyleGridTemplateComponent::None()),
+      mGridTemplateAreas(StyleGridTemplateAreas::None()),
+      mColumnGap(NonNegativeLengthPercentageOrNormal::Normal()),
+      mRowGap(NonNegativeLengthPercentageOrNormal::Normal()),
+      mContainIntrinsicWidth(StyleContainIntrinsicSize::None()),
+      mContainIntrinsicHeight(StyleContainIntrinsicSize::None()) {
+  MOZ_COUNT_CTOR(nsStylePosition);
+
+
+}
+
+nsStylePosition::nsStylePosition(const nsStylePosition& aSource)
+    : mObjectPosition(aSource.mObjectPosition),
+      mOffset(aSource.mOffset),
+      mWidth(aSource.mWidth),
+      mMinWidth(aSource.mMinWidth),
+      mMaxWidth(aSource.mMaxWidth),
+      mHeight(aSource.mHeight),
+      mMinHeight(aSource.mMinHeight),
+      mMaxHeight(aSource.mMaxHeight),
+      mPositionAnchor(aSource.mPositionAnchor),
+      mPositionArea(aSource.mPositionArea),
+      mPositionVisibility(aSource.mPositionVisibility),
+      mPositionTryFallbacks(aSource.mPositionTryFallbacks),
+      mPositionTryOrder(aSource.mPositionTryOrder),
+      mFlexBasis(aSource.mFlexBasis),
+      mGridAutoColumns(aSource.mGridAutoColumns),
+      mGridAutoRows(aSource.mGridAutoRows),
+      mAspectRatio(aSource.mAspectRatio),
+      mGridAutoFlow(aSource.mGridAutoFlow),
+      mMasonryAutoFlow(aSource.mMasonryAutoFlow),
+      mAlignContent(aSource.mAlignContent),
+      mAlignItems(aSource.mAlignItems),
+      mAlignSelf(aSource.mAlignSelf),
+      mJustifyContent(aSource.mJustifyContent),
+      mJustifyItems(aSource.mJustifyItems),
+      mJustifySelf(aSource.mJustifySelf),
+      mFlexDirection(aSource.mFlexDirection),
+      mFlexWrap(aSource.mFlexWrap),
+      mObjectFit(aSource.mObjectFit),
+      mBoxSizing(aSource.mBoxSizing),
+      mOrder(aSource.mOrder),
+      mFlexGrow(aSource.mFlexGrow),
+      mFlexShrink(aSource.mFlexShrink),
+      mZIndex(aSource.mZIndex),
+      mGridTemplateColumns(aSource.mGridTemplateColumns),
+      mGridTemplateRows(aSource.mGridTemplateRows),
+      mGridTemplateAreas(aSource.mGridTemplateAreas),
+      mGridColumnStart(aSource.mGridColumnStart),
+      mGridColumnEnd(aSource.mGridColumnEnd),
+      mGridRowStart(aSource.mGridRowStart),
+      mGridRowEnd(aSource.mGridRowEnd),
+      mColumnGap(aSource.mColumnGap),
+      mRowGap(aSource.mRowGap),
+      mContainIntrinsicWidth(aSource.mContainIntrinsicWidth),
+      mContainIntrinsicHeight(aSource.mContainIntrinsicHeight) {
+  MOZ_COUNT_CTOR(nsStylePosition);
+}
+
+static bool IsEqualInsetType(const StyleRect<StyleInset>& aSides1,
+                             const StyleRect<StyleInset>& aSides2) {
+  for (const auto side : mozilla::AllPhysicalSides()) {
+    if (aSides1.Get(side).tag != aSides2.Get(side).tag) {
+      return false;
+    }
+  }
+  return true;
+}
+
+nsChangeHint nsStylePosition::CalcDifference(
+    const nsStylePosition& aNewData, const ComputedStyle& aOldStyle) const {
+  if (mGridTemplateColumns.IsMasonry() !=
+          aNewData.mGridTemplateColumns.IsMasonry() ||
+      mGridTemplateRows.IsMasonry() != aNewData.mGridTemplateRows.IsMasonry()) {
+    return nsChangeHint_ReconstructFrame;
+  }
+
+  nsChangeHint hint = nsChangeHint(0);
+
+  if (mZIndex != aNewData.mZIndex) {
+    hint |= nsChangeHint_RepaintFrame;
+  }
+
+  if (mObjectFit != aNewData.mObjectFit ||
+      mObjectPosition != aNewData.mObjectPosition) {
+    hint |= nsChangeHint_RepaintFrame | nsChangeHint_NeedReflow;
+  }
+
+  if (mContainIntrinsicWidth != aNewData.mContainIntrinsicWidth ||
+      mContainIntrinsicHeight != aNewData.mContainIntrinsicHeight) {
+    hint |= NS_STYLE_HINT_REFLOW;
+  }
+
+  if (mOrder != aNewData.mOrder) {
+    return hint | nsChangeHint_RepaintFrame | nsChangeHint_AllReflowHints;
+  }
+
+  if (mBoxSizing != aNewData.mBoxSizing) {
+    return hint | nsChangeHint_AllReflowHints;
+  }
+
+  if (mAlignItems != aNewData.mAlignItems ||
+      mAlignSelf != aNewData.mAlignSelf) {
+    return hint | nsChangeHint_AllReflowHints;
+  }
+
+  if (mFlexBasis != aNewData.mFlexBasis || mFlexGrow != aNewData.mFlexGrow ||
+      mFlexShrink != aNewData.mFlexShrink) {
+    return hint | nsChangeHint_AllReflowHints;
+  }
+
+  if (mFlexDirection != aNewData.mFlexDirection ||
+      mFlexWrap != aNewData.mFlexWrap) {
+    return hint | nsChangeHint_AllReflowHints;
+  }
+
+  if (mGridTemplateColumns != aNewData.mGridTemplateColumns ||
+      mGridTemplateRows != aNewData.mGridTemplateRows ||
+      mGridTemplateAreas != aNewData.mGridTemplateAreas ||
+      mGridAutoColumns != aNewData.mGridAutoColumns ||
+      mGridAutoRows != aNewData.mGridAutoRows ||
+      mGridAutoFlow != aNewData.mGridAutoFlow ||
+      mMasonryAutoFlow != aNewData.mMasonryAutoFlow) {
+    return hint | nsChangeHint_AllReflowHints;
+  }
+
+  if (mGridColumnStart != aNewData.mGridColumnStart ||
+      mGridColumnEnd != aNewData.mGridColumnEnd ||
+      mGridRowStart != aNewData.mGridRowStart ||
+      mGridRowEnd != aNewData.mGridRowEnd ||
+      mColumnGap != aNewData.mColumnGap || mRowGap != aNewData.mRowGap) {
+    return hint | nsChangeHint_AllReflowHints;
+  }
+
+  if (mJustifyContent != aNewData.mJustifyContent ||
+      mJustifyItems.computed != aNewData.mJustifyItems.computed ||
+      mJustifySelf != aNewData.mJustifySelf) {
+    hint |= nsChangeHint_NeedReflow;
+  }
+
+  if (mJustifyItems.specified != aNewData.mJustifyItems.specified) {
+    hint |= nsChangeHint_NeutralChange;
+  }
+
+  if (mAlignContent != aNewData.mAlignContent) {
+    hint |= nsChangeHint_NeedReflow;
+  }
+
+  bool widthChanged = mWidth != aNewData.mWidth ||
+                      mMinWidth != aNewData.mMinWidth ||
+                      mMaxWidth != aNewData.mMaxWidth;
+  bool heightChanged = mHeight != aNewData.mHeight ||
+                       mMinHeight != aNewData.mMinHeight ||
+                       mMaxHeight != aNewData.mMaxHeight;
+
+  if (widthChanged || heightChanged) {
+    const bool isVertical = aOldStyle.StyleVisibility()->mWritingMode !=
+                            StyleWritingModeProperty::HorizontalTb;
+    if (isVertical ? widthChanged : heightChanged) {
+      hint |= nsChangeHint_ReflowHintsForBSizeChange;
+    }
+    if (isVertical ? heightChanged : widthChanged) {
+      hint |= nsChangeHint_ReflowHintsForISizeChange;
+    }
+  }
+
+  if (mPositionVisibility != aNewData.mPositionVisibility) {
+    hint |= nsChangeHint_RepaintFrame;
+  }
+
+  if (mPositionAnchor != aNewData.mPositionAnchor ||
+      mPositionTryFallbacks != aNewData.mPositionTryFallbacks ||
+      mPositionTryOrder != aNewData.mPositionTryOrder ||
+      mPositionArea != aNewData.mPositionArea) {
+    hint |= nsChangeHint_NeedReflow | nsChangeHint_ReflowChangesSizeOrPosition;
+  }
+
+  if (mAspectRatio != aNewData.mAspectRatio) {
+    hint |= nsChangeHint_ReflowHintsForISizeChange |
+            nsChangeHint_ReflowHintsForBSizeChange;
+  }
+
+  if (mOffset != aNewData.mOffset) {
+    if (IsEqualInsetType(mOffset, aNewData.mOffset) &&
+        aNewData.mOffset.All([](const StyleInset& aInset) {
+          return !aInset.HasAnchorPositioningFunction();
+        })) {
+      hint |=
+          nsChangeHint_RecomputePosition | nsChangeHint_UpdateParentOverflow;
+    } else {
+      hint |=
+          nsChangeHint_NeedReflow | nsChangeHint_ReflowChangesSizeOrPosition;
+    }
+  }
+  return hint;
+}
+
+const StyleContainIntrinsicSize& nsStylePosition::ContainIntrinsicBSize(
+    const WritingMode& aWM) const {
+  return aWM.IsVertical() ? mContainIntrinsicWidth : mContainIntrinsicHeight;
+}
+
+const StyleContainIntrinsicSize& nsStylePosition::ContainIntrinsicISize(
+    const WritingMode& aWM) const {
+  return aWM.IsVertical() ? mContainIntrinsicHeight : mContainIntrinsicWidth;
+}
+
+StyleSelfAlignment nsStylePosition::UsedAlignSelf(
+    const ComputedStyle* aParent) const {
+  if (mAlignSelf._0 != StyleAlignFlags::AUTO) {
+    return mAlignSelf;
+  }
+  if (MOZ_LIKELY(aParent)) {
+    auto parentAlignItems = aParent->StylePosition()->mAlignItems;
+    MOZ_ASSERT(!(parentAlignItems._0 & StyleAlignFlags::LEGACY),
+               "align-items can't have 'legacy'");
+    return {parentAlignItems._0};
+  }
+  return {StyleAlignFlags::NORMAL};
+}
+
+StyleSelfAlignment nsStylePosition::UsedJustifySelf(
+    const ComputedStyle* aParent) const {
+  if (mJustifySelf._0 != StyleAlignFlags::AUTO) {
+    return mJustifySelf;
+  }
+  if (MOZ_LIKELY(aParent)) {
+    const auto& inheritedJustifyItems =
+        aParent->StylePosition()->mJustifyItems.computed._0;
+    return {inheritedJustifyItems._0 & ~StyleAlignFlags::LEGACY};
+  }
+  return {StyleAlignFlags::NORMAL};
+}
+
+AnchorResolvedInset AnchorResolvedInsetHelper::ResolveAnchor(
+    const mozilla::StyleInset& aValue, mozilla::StylePhysicalSide aSide,
+    const AnchorPosOffsetResolutionParams& aParams) {
+  MOZ_ASSERT(aValue.HasAnchorPositioningFunction(),
+             "Calling anchor resolution without using it?");
+  switch (aValue.tag) {
+    case StyleInset::Tag::AnchorContainingCalcFunction: {
+      const auto& lp = aValue.AsAnchorContainingCalcFunction();
+      const auto& c = lp.AsCalc();
+      auto result = StyleCalcAnchorPositioningFunctionResolution::Invalid();
+      const auto allowed =
+          StyleAllowAnchorPosResolutionInCalcPercentage::Both(aSide);
+      Servo_ResolveAnchorFunctionsInCalcPercentage(&c, &allowed, &aParams,
+                                                   &result);
+      if (result.IsInvalid()) {
+        return Auto();
+      }
+      return MakeUniqueOfUniqueOrNonOwning<const StyleInset>(result.AsValid());
+    }
+    case StyleInset::Tag::AnchorFunction: {
+      auto resolved = StyleAnchorPositioningFunctionResolution::Invalid();
+      Servo_ResolveAnchorFunction(&*aValue.AsAnchorFunction(), &aParams, aSide,
+                                  &resolved);
+      if (resolved.IsInvalid()) {
+        return Auto();
+      }
+      if (resolved.IsResolvedReference()) {
+        return MakeUniqueOfUniqueOrNonOwning<const StyleInset>(
+            *resolved.AsResolvedReference());
+      }
+      return AnchorResolvedInset{
+          MakeUniqueOfUniqueOrNonOwning<const StyleInset>(
+              resolved.AsResolved())};
+    }
+    case StyleInset::Tag::AnchorSizeFunction: {
+      auto resolved = StyleAnchorPositioningFunctionResolution::Invalid();
+      Servo_ResolveAnchorSizeFunctionForInset(
+          &*aValue.AsAnchorSizeFunction(), &aParams, ToStylePhysicalAxis(aSide),
+          &resolved);
+      if (resolved.IsInvalid()) {
+        return Auto();
+      }
+      if (resolved.IsResolvedReference()) {
+        return MakeUniqueOfUniqueOrNonOwning<const StyleInset>(
+            *resolved.AsResolvedReference());
+      }
+      return MakeUniqueOfUniqueOrNonOwning<const StyleInset>(
+          resolved.AsResolved());
+    }
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unhandled inset type");
+      return Auto();
+  }
+}
+
+AnchorResolvedSize AnchorResolvedSizeHelper::ResolveAnchor(
+    const mozilla::StyleSize& aValue, StylePhysicalAxis aAxis,
+    const AnchorPosResolutionParams& aParams) {
+  MOZ_ASSERT(aValue.HasAnchorPositioningFunction(),
+             "Calling anchor resolution without using it?");
+  if (aValue.IsAnchorSizeFunction()) {
+    auto resolved = StyleAnchorPositioningFunctionResolution::Invalid();
+    Servo_ResolveAnchorSizeFunctionForSize(&*aValue.AsAnchorSizeFunction(),
+                                           &aParams, aAxis, &resolved);
+    if (resolved.IsInvalid()) {
+      return Auto();
+    }
+    if (resolved.IsResolvedReference()) {
+      return MakeUniqueOfUniqueOrNonOwning<const StyleSize>(
+          *resolved.AsResolvedReference());
+    }
+    return MakeUniqueOfUniqueOrNonOwning<const StyleSize>(
+        resolved.AsResolved());
+  }
+
+  const auto& lp = aValue.AsAnchorContainingCalcFunction();
+  const auto& c = lp.AsCalc();
+  auto result = StyleCalcAnchorPositioningFunctionResolution::Invalid();
+  AnchorPosOffsetResolutionParams params =
+      AnchorPosOffsetResolutionParams::UseCBFrameSize(aParams);
+  const auto allowed =
+      StyleAllowAnchorPosResolutionInCalcPercentage::AnchorSizeOnly(aAxis);
+  Servo_ResolveAnchorFunctionsInCalcPercentage(&c, &allowed, &params, &result);
+  if (result.IsInvalid()) {
+    return Auto();
+  }
+  return MakeUniqueOfUniqueOrNonOwning<const StyleSize>(result.AsValid());
+}
+
+AnchorResolvedMaxSize AnchorResolvedMaxSizeHelper::ResolveAnchor(
+    const mozilla::StyleMaxSize& aValue, StylePhysicalAxis aAxis,
+    const AnchorPosResolutionParams& aParams) {
+  MOZ_ASSERT(aValue.HasAnchorPositioningFunction(),
+             "Calling anchor resolution without using it?");
+  if (aValue.IsAnchorSizeFunction()) {
+    auto resolved = StyleAnchorPositioningFunctionResolution::Invalid();
+    Servo_ResolveAnchorSizeFunctionForMaxSize(&*aValue.AsAnchorSizeFunction(),
+                                              &aParams, aAxis, &resolved);
+    if (resolved.IsInvalid()) {
+      return None();
+    }
+    if (resolved.IsResolvedReference()) {
+      return MakeUniqueOfUniqueOrNonOwning<const StyleMaxSize>(
+          *resolved.AsResolvedReference());
+    }
+    return MakeUniqueOfUniqueOrNonOwning<const StyleMaxSize>(
+        resolved.AsResolved());
+  }
+
+  const auto& lp = aValue.AsAnchorContainingCalcFunction();
+  const auto& c = lp.AsCalc();
+  auto result = StyleCalcAnchorPositioningFunctionResolution::Invalid();
+  AnchorPosOffsetResolutionParams params =
+      AnchorPosOffsetResolutionParams::UseCBFrameSize(aParams);
+  const auto allowed =
+      StyleAllowAnchorPosResolutionInCalcPercentage::AnchorSizeOnly(aAxis);
+  Servo_ResolveAnchorFunctionsInCalcPercentage(&c, &allowed, &params, &result);
+  if (result.IsInvalid()) {
+    return None();
+  }
+  return MakeUniqueOfUniqueOrNonOwning<const StyleMaxSize>(result.AsValid());
+}
+
+
+nsStyleTable::nsStyleTable()
+    : mLayoutStrategy(StyleTableLayout::Auto), mXSpan(1) {
+  MOZ_COUNT_CTOR(nsStyleTable);
+}
+
+nsStyleTable::nsStyleTable(const nsStyleTable& aSource)
+    : mLayoutStrategy(aSource.mLayoutStrategy), mXSpan(aSource.mXSpan) {
+  MOZ_COUNT_CTOR(nsStyleTable);
+}
+
+nsChangeHint nsStyleTable::CalcDifference(const nsStyleTable& aNewData) const {
+  if (mXSpan != aNewData.mXSpan ||
+      mLayoutStrategy != aNewData.mLayoutStrategy) {
+    return nsChangeHint_ReconstructFrame;
+  }
+  return nsChangeHint(0);
+}
+
+
+nsStyleTableBorder::nsStyleTableBorder()
+    : mBorderSpacing{Length::Zero(), Length::Zero()},
+      mBorderCollapse(StyleBorderCollapse::Separate),
+      mCaptionSide(StyleCaptionSide::Top),
+      mEmptyCells(StyleEmptyCells::Show) {
+  MOZ_COUNT_CTOR(nsStyleTableBorder);
+}
+
+nsStyleTableBorder::nsStyleTableBorder(const nsStyleTableBorder& aSource)
+    : mBorderSpacing(aSource.mBorderSpacing),
+      mBorderCollapse(aSource.mBorderCollapse),
+      mCaptionSide(aSource.mCaptionSide),
+      mEmptyCells(aSource.mEmptyCells) {
+  MOZ_COUNT_CTOR(nsStyleTableBorder);
+}
+
+nsChangeHint nsStyleTableBorder::CalcDifference(
+    const nsStyleTableBorder& aNewData) const {
+  if (mBorderCollapse != aNewData.mBorderCollapse) {
+    return nsChangeHint_ReconstructFrame;
+  }
+  if (mCaptionSide != aNewData.mCaptionSide ||
+      mBorderSpacing != aNewData.mBorderSpacing) {
+    return NS_STYLE_HINT_REFLOW;
+  }
+  if (mEmptyCells != aNewData.mEmptyCells) {
+    return NS_STYLE_HINT_VISUAL;
+  }
+  return nsChangeHint(0);
+}
+
+template <typename T>
+static bool GradientItemsAreOpaque(
+    Span<const StyleGenericGradientItem<StyleColor, T>> aItems) {
+  for (auto& stop : aItems) {
+    if (stop.IsInterpolationHint()) {
+      continue;
+    }
+
+    auto& color = stop.IsSimpleColorStop() ? stop.AsSimpleColorStop()
+                                           : stop.AsComplexColorStop().color;
+    if (color.MaybeTransparent()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+template <>
+bool StyleGradient::IsOpaque() const {
+  switch (tag) {
+    case Tag::Linear:
+      return GradientItemsAreOpaque(AsLinear().items.AsSpan());
+    case Tag::Radial:
+      return GradientItemsAreOpaque(AsRadial().items.AsSpan());
+    case Tag::Conic:
+      return GradientItemsAreOpaque(AsConic().items.AsSpan());
+  }
+  MOZ_ASSERT_UNREACHABLE("Unexpected gradient type");
+  return false;
+}
+
+template <>
+bool StyleImage::IsOpaque() const {
+  switch (tag) {
+    case Tag::ImageSet:
+      return FinalImage().IsOpaque();
+    case Tag::Gradient:
+      return AsGradient()->IsOpaque();
+    case Tag::Url: {
+      if (!IsComplete()) {
+        return false;
+      }
+      MOZ_ASSERT(GetImageRequest(), "should've returned earlier above");
+      nsCOMPtr<imgIContainer> imageContainer;
+      GetImageRequest()->GetImage(getter_AddRefs(imageContainer));
+      MOZ_ASSERT(imageContainer, "IsComplete() said image container is ready");
+      return imageContainer->WillDrawOpaqueNow();
+    }
+    case Tag::Image:
+      return !AsImage()->MaybeTransparent();
+    case Tag::CrossFade:
+      for (const auto& el : AsCrossFade()->elements.AsSpan()) {
+        if (el.image.IsColor()) {
+          if (el.image.AsColor().MaybeTransparent()) {
+            return false;
+          }
+          continue;
+        }
+        MOZ_ASSERT(el.image.IsImage());
+        if (!el.image.AsImage().IsOpaque()) {
+          return false;
+        }
+      }
+      return true;
+    case Tag::LightDark:
+      MOZ_FALLTHROUGH_ASSERT("Should be computed already");
+    case Tag::Element:
+    case Tag::MozSymbolicIcon:
+    case Tag::None:
+      break;
+  }
+  return false;
+}
+
+template <>
+bool StyleImage::IsComplete() const {
+  switch (tag) {
+    case Tag::None:
+      return false;
+    case Tag::Gradient:
+    case Tag::Element:
+    case Tag::MozSymbolicIcon:
+    case Tag::Image:
+      return true;
+    case Tag::Url: {
+      if (!IsResolved()) {
+        return false;
+      }
+      imgRequestProxy* req = GetImageRequest();
+      if (!req) {
+        return false;
+      }
+      uint32_t status = imgIRequest::STATUS_ERROR;
+      return NS_SUCCEEDED(req->GetImageStatus(&status)) &&
+             (status & imgIRequest::STATUS_SIZE_AVAILABLE) &&
+             (status & imgIRequest::STATUS_FRAME_COMPLETE);
+    }
+    case Tag::ImageSet:
+      return FinalImage().IsComplete();
+    case Tag::CrossFade:
+      return true;
+    case Tag::LightDark:
+      MOZ_ASSERT_UNREACHABLE("light-dark() should be computed already");
+      break;
+  }
+  MOZ_ASSERT_UNREACHABLE("unexpected image type");
+  return false;
+}
+
+template <>
+bool StyleImage::IsSizeAvailable() const {
+  switch (tag) {
+    case Tag::None:
+      return false;
+    case Tag::Image:
+    case Tag::Gradient:
+    case Tag::Element:
+    case Tag::MozSymbolicIcon:
+      return true;
+    case Tag::Url: {
+      imgRequestProxy* req = GetImageRequest();
+      if (!req) {
+        return false;
+      }
+      uint32_t status = imgIRequest::STATUS_ERROR;
+      return NS_SUCCEEDED(req->GetImageStatus(&status)) &&
+             !(status & imgIRequest::STATUS_ERROR) &&
+             (status & imgIRequest::STATUS_SIZE_AVAILABLE);
+    }
+    case Tag::ImageSet:
+      return FinalImage().IsSizeAvailable();
+    case Tag::CrossFade:
+      return true;
+    case Tag::LightDark:
+      MOZ_ASSERT_UNREACHABLE("light-dark() should be computed already");
+      break;
+  }
+  MOZ_ASSERT_UNREACHABLE("unexpected image type");
+  return false;
+}
+
+template <>
+void StyleImage::ResolveImage(Document& aDoc, const StyleImage* aOld) {
+  if (IsResolved()) {
+    return;
+  }
+  const auto* old = aOld ? aOld->GetImageRequestURLValue() : nullptr;
+  const auto* url = GetImageRequestURLValue();
+  const_cast<StyleComputedUrl*>(url)->ResolveImage(aDoc, old);
+}
+
+template <>
+ImageResolution StyleImage::GetResolution(
+    const ComputedStyle* aStyleForZoom) const {
+  ImageResolution resolution;
+  if (imgRequestProxy* request = GetImageRequest()) {
+    RefPtr<imgIContainer> image;
+    request->GetImage(getter_AddRefs(image));
+    if (image) {
+      resolution = image->GetResolution();
+    }
+  }
+  if (IsImageSet()) {
+    const auto& set = *AsImageSet();
+    auto items = set.items.AsSpan();
+    if (MOZ_LIKELY(set.selected_index < items.Length())) {
+      float r = items[set.selected_index].resolution._0;
+      resolution.ScaleBy(r);
+    }
+  }
+  if (aStyleForZoom && aStyleForZoom->EffectiveZoom() != StyleZoom::ONE) {
+    resolution.ScaleBy(1.0f / aStyleForZoom->EffectiveZoom().ToFloat());
+  }
+  return resolution;
+}
+
+
+const NonCustomCSSPropertyId nsStyleImageLayers::kBackgroundLayerTable[] = {
+    eCSSProperty_background,             
+    eCSSProperty_background_color,       
+    eCSSProperty_background_image,       
+    eCSSProperty_background_repeat,      
+    eCSSProperty_background_position_x,  
+    eCSSProperty_background_position_y,  
+    eCSSProperty_background_clip,        
+    eCSSProperty_background_origin,      
+    eCSSProperty_background_size,        
+    eCSSProperty_background_attachment,  
+    eCSSProperty_UNKNOWN,                
+    eCSSProperty_UNKNOWN                 
+};
+
+const NonCustomCSSPropertyId nsStyleImageLayers::kMaskLayerTable[] = {
+    eCSSProperty_mask,             
+    eCSSProperty_UNKNOWN,          
+    eCSSProperty_mask_image,       
+    eCSSProperty_mask_repeat,      
+    eCSSProperty_mask_position_x,  
+    eCSSProperty_mask_position_y,  
+    eCSSProperty_mask_clip,        
+    eCSSProperty_mask_origin,      
+    eCSSProperty_mask_size,        
+    eCSSProperty_UNKNOWN,          
+    eCSSProperty_mask_mode,        
+    eCSSProperty_mask_composite    
+};
+
+nsStyleImageLayers::nsStyleImageLayers(nsStyleImageLayers::LayerType aType)
+    : mAttachmentCount(1),
+      mClipCount(1),
+      mOriginCount(1),
+      mRepeatCount(1),
+      mPositionXCount(1),
+      mPositionYCount(1),
+      mImageCount(1),
+      mSizeCount(1),
+      mMaskModeCount(1),
+      mBlendModeCount(1),
+      mCompositeCount(1),
+      mLayers(nsStyleAutoArray<Layer>::WITH_SINGLE_INITIAL_ELEMENT) {
+  mLayers[0].Initialize(aType);
+}
+
+nsStyleImageLayers::nsStyleImageLayers(const nsStyleImageLayers& aSource)
+    : mAttachmentCount(aSource.mAttachmentCount),
+      mClipCount(aSource.mClipCount),
+      mOriginCount(aSource.mOriginCount),
+      mRepeatCount(aSource.mRepeatCount),
+      mPositionXCount(aSource.mPositionXCount),
+      mPositionYCount(aSource.mPositionYCount),
+      mImageCount(aSource.mImageCount),
+      mSizeCount(aSource.mSizeCount),
+      mMaskModeCount(aSource.mMaskModeCount),
+      mBlendModeCount(aSource.mBlendModeCount),
+      mCompositeCount(aSource.mCompositeCount),
+      mLayers(aSource.mLayers.Clone()) {}
+
+static bool AnyLayerIsElementImage(const nsStyleImageLayers& aLayers) {
+  NS_FOR_VISIBLE_IMAGE_LAYERS_BACK_TO_FRONT(i, aLayers) {
+    if (aLayers.mLayers[i].mImage.FinalImage().IsElement()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+nsChangeHint nsStyleImageLayers::CalcDifference(
+    const nsStyleImageLayers& aNewLayers, LayerType aType) const {
+  nsChangeHint hint = nsChangeHint(0);
+
+  if (mImageCount != aNewLayers.mImageCount) {
+    hint |= nsChangeHint_RepaintFrame;
+    if (aType == nsStyleImageLayers::LayerType::Mask ||
+        AnyLayerIsElementImage(*this) || AnyLayerIsElementImage(aNewLayers)) {
+      hint |= nsChangeHint_UpdateEffects;
+    }
+    return hint;
+  }
+
+  const nsStyleImageLayers& moreLayers =
+      mLayers.Length() > aNewLayers.mLayers.Length() ? *this : aNewLayers;
+  const nsStyleImageLayers& lessLayers =
+      mLayers.Length() > aNewLayers.mLayers.Length() ? aNewLayers : *this;
+
+  for (size_t i = 0; i < moreLayers.mLayers.Length(); ++i) {
+    const Layer& moreLayersLayer = moreLayers.mLayers[i];
+    if (i < moreLayers.mImageCount) {
+      const Layer& lessLayersLayer = lessLayers.mLayers[i];
+      nsChangeHint layerDifference =
+          moreLayersLayer.CalcDifference(lessLayersLayer);
+      if (layerDifference &&
+          (moreLayersLayer.mImage.FinalImage().IsElement() ||
+           lessLayersLayer.mImage.FinalImage().IsElement())) {
+        layerDifference |=
+            nsChangeHint_UpdateEffects | nsChangeHint_RepaintFrame;
+      }
+      hint |= layerDifference;
+      continue;
+    }
+    if (hint) {
+      return hint;
+    }
+    if (i >= lessLayers.mLayers.Length()) {
+      return nsChangeHint_NeutralChange;
+    }
+
+    const Layer& lessLayersLayer = lessLayers.mLayers[i];
+    MOZ_ASSERT(moreLayersLayer.mImage.IsNone());
+    MOZ_ASSERT(lessLayersLayer.mImage.IsNone());
+    if (moreLayersLayer.CalcDifference(lessLayersLayer)) {
+      return nsChangeHint_NeutralChange;
+    }
+  }
+
+  if (hint) {
+    return hint;
+  }
+
+  if (mAttachmentCount != aNewLayers.mAttachmentCount ||
+      mBlendModeCount != aNewLayers.mBlendModeCount ||
+      mClipCount != aNewLayers.mClipCount ||
+      mCompositeCount != aNewLayers.mCompositeCount ||
+      mMaskModeCount != aNewLayers.mMaskModeCount ||
+      mOriginCount != aNewLayers.mOriginCount ||
+      mRepeatCount != aNewLayers.mRepeatCount ||
+      mPositionXCount != aNewLayers.mPositionXCount ||
+      mPositionYCount != aNewLayers.mPositionYCount ||
+      mSizeCount != aNewLayers.mSizeCount) {
+    hint |= nsChangeHint_NeutralChange;
+  }
+
+  return hint;
+}
+
+nsStyleImageLayers& nsStyleImageLayers::operator=(
+    const nsStyleImageLayers& aOther) {
+  mAttachmentCount = aOther.mAttachmentCount;
+  mClipCount = aOther.mClipCount;
+  mOriginCount = aOther.mOriginCount;
+  mRepeatCount = aOther.mRepeatCount;
+  mPositionXCount = aOther.mPositionXCount;
+  mPositionYCount = aOther.mPositionYCount;
+  mImageCount = aOther.mImageCount;
+  mSizeCount = aOther.mSizeCount;
+  mMaskModeCount = aOther.mMaskModeCount;
+  mBlendModeCount = aOther.mBlendModeCount;
+  mCompositeCount = aOther.mCompositeCount;
+  mLayers = aOther.mLayers.Clone();
+
+  return *this;
+}
+
+bool nsStyleImageLayers::operator==(const nsStyleImageLayers& aOther) const {
+  if (mAttachmentCount != aOther.mAttachmentCount ||
+      mClipCount != aOther.mClipCount || mOriginCount != aOther.mOriginCount ||
+      mRepeatCount != aOther.mRepeatCount ||
+      mPositionXCount != aOther.mPositionXCount ||
+      mPositionYCount != aOther.mPositionYCount ||
+      mImageCount != aOther.mImageCount || mSizeCount != aOther.mSizeCount ||
+      mMaskModeCount != aOther.mMaskModeCount ||
+      mBlendModeCount != aOther.mBlendModeCount) {
+    return false;
+  }
+
+  if (mLayers.Length() != aOther.mLayers.Length()) {
+    return false;
+  }
+
+  for (uint32_t i = 0; i < mLayers.Length(); i++) {
+    if (mLayers[i].mPosition != aOther.mLayers[i].mPosition ||
+        mLayers[i].mImage != aOther.mLayers[i].mImage ||
+        mLayers[i].mSize != aOther.mLayers[i].mSize ||
+        mLayers[i].mClip != aOther.mLayers[i].mClip ||
+        mLayers[i].mOrigin != aOther.mLayers[i].mOrigin ||
+        mLayers[i].mAttachment != aOther.mLayers[i].mAttachment ||
+        mLayers[i].mBlendMode != aOther.mLayers[i].mBlendMode ||
+        mLayers[i].mComposite != aOther.mLayers[i].mComposite ||
+        mLayers[i].mMaskMode != aOther.mLayers[i].mMaskMode ||
+        mLayers[i].mRepeat != aOther.mLayers[i].mRepeat) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool SizeDependsOnPositioningAreaSize(const StyleBackgroundSize& aSize,
+                                             const StyleImage& aImage) {
+  MOZ_ASSERT(!aImage.IsNone(), "caller should have handled this");
+  MOZ_ASSERT(!aImage.IsImageSet(), "caller should have handled this");
+
+  if (aSize.IsCover() || aSize.IsContain()) {
+    return true;
+  }
+
+  MOZ_ASSERT(aSize.IsExplicitSize());
+  const auto& size = aSize.AsExplicitSize();
+
+  if (size.width.HasPercent() || size.height.HasPercent()) {
+    return true;
+  }
+
+  if (!size.width.IsAuto() && !size.height.IsAuto()) {
+    return false;
+  }
+
+  if (aImage.IsGradient() || aImage.IsImage()) {
+    return true;
+  }
+
+  if (aImage.IsElement()) {
+    return true;
+  }
+
+  MOZ_ASSERT(aImage.IsImageRequestType(), "Missed some image");
+  if (auto* request = aImage.GetImageRequest()) {
+    nsCOMPtr<imgIContainer> imgContainer;
+    request->GetImage(getter_AddRefs(imgContainer));
+    if (imgContainer) {
+      CSSIntSize imageSize;
+      AspectRatio imageRatio;
+      bool hasWidth, hasHeight;
+      nsLayoutUtils::ComputeSizeForDrawing(imgContainer, ImageResolution(),
+                                           imageSize, imageRatio, hasWidth,
+                                           hasHeight);
+
+      if (hasWidth && hasHeight) {
+        return false;
+      }
+
+      if (imageRatio) {
+        return size.width.IsAuto() == size.height.IsAuto();
+      }
+
+      return !(hasWidth && size.width.IsLengthPercentage()) &&
+             !(hasHeight && size.height.IsLengthPercentage());
+    }
+  }
+
+  return false;
+}
+
+nsStyleImageLayers::Layer::Layer()
+    : mImage(StyleImage::None()),
+      mSize(StyleBackgroundSize::ExplicitSize(LengthPercentageOrAuto::Auto(),
+                                              LengthPercentageOrAuto::Auto())),
+
+      mClip(StyleBackgroundClip::BorderBox),
+      mAttachment(StyleImageLayerAttachment::Scroll),
+      mBlendMode(StyleBlend::Normal),
+      mComposite(StyleMaskComposite::Add),
+      mMaskMode(StyleMaskMode::MatchSource) {}
+
+nsStyleImageLayers::Layer::~Layer() = default;
+
+void nsStyleImageLayers::Layer::Initialize(
+    nsStyleImageLayers::LayerType aType) {
+  mPosition = Position::FromPercentage(0.);
+
+  if (aType == LayerType::Background) {
+    mOrigin = StyleGeometryBox::PaddingBox;
+  } else {
+    MOZ_ASSERT(aType == LayerType::Mask, "unsupported layer type.");
+    mOrigin = StyleGeometryBox::BorderBox;
+  }
+}
+
+bool nsStyleImageLayers::Layer::
+    RenderingMightDependOnPositioningAreaSizeChange() const {
+  if (mImage.IsNone()) {
+    return false;
+  }
+
+  return mPosition.DependsOnPositioningAreaSize() ||
+         SizeDependsOnPositioningAreaSize(mSize, mImage.FinalImage()) ||
+         mRepeat.DependsOnPositioningAreaSize();
+}
+
+bool nsStyleImageLayers::Layer::operator==(const Layer& aOther) const {
+  return mAttachment == aOther.mAttachment && mClip == aOther.mClip &&
+         mOrigin == aOther.mOrigin && mRepeat == aOther.mRepeat &&
+         mBlendMode == aOther.mBlendMode && mPosition == aOther.mPosition &&
+         mSize == aOther.mSize && mImage == aOther.mImage &&
+         mMaskMode == aOther.mMaskMode && mComposite == aOther.mComposite;
+}
+
+template <class ComputedValueItem>
+static void FillImageLayerList(
+    nsStyleAutoArray<nsStyleImageLayers::Layer>& aLayers,
+    ComputedValueItem nsStyleImageLayers::Layer::* aResultLocation,
+    uint32_t aItemCount, uint32_t aFillCount) {
+  MOZ_ASSERT(aFillCount <= aLayers.Length(), "unexpected array length");
+  for (uint32_t sourceLayer = 0, destLayer = aItemCount; destLayer < aFillCount;
+       ++sourceLayer, ++destLayer) {
+    aLayers[destLayer].*aResultLocation = aLayers[sourceLayer].*aResultLocation;
+  }
+}
+
+static void FillImageLayerPositionCoordList(
+    nsStyleAutoArray<nsStyleImageLayers::Layer>& aLayers,
+    LengthPercentage Position::* aResultLocation, uint32_t aItemCount,
+    uint32_t aFillCount) {
+  MOZ_ASSERT(aFillCount <= aLayers.Length(), "unexpected array length");
+  for (uint32_t sourceLayer = 0, destLayer = aItemCount; destLayer < aFillCount;
+       ++sourceLayer, ++destLayer) {
+    aLayers[destLayer].mPosition.*aResultLocation =
+        aLayers[sourceLayer].mPosition.*aResultLocation;
+  }
+}
+
+void nsStyleImageLayers::FillAllLayers(uint32_t aMaxItemCount) {
+  mLayers.TruncateLengthNonZero(aMaxItemCount);
+
+  uint32_t fillCount = mImageCount;
+  FillImageLayerList(mLayers, &Layer::mImage, mImageCount, fillCount);
+  FillImageLayerList(mLayers, &Layer::mRepeat, mRepeatCount, fillCount);
+  FillImageLayerList(mLayers, &Layer::mAttachment, mAttachmentCount, fillCount);
+  FillImageLayerList(mLayers, &Layer::mClip, mClipCount, fillCount);
+  FillImageLayerList(mLayers, &Layer::mBlendMode, mBlendModeCount, fillCount);
+  FillImageLayerList(mLayers, &Layer::mOrigin, mOriginCount, fillCount);
+  FillImageLayerPositionCoordList(mLayers, &Position::horizontal,
+                                  mPositionXCount, fillCount);
+  FillImageLayerPositionCoordList(mLayers, &Position::vertical, mPositionYCount,
+                                  fillCount);
+  FillImageLayerList(mLayers, &Layer::mSize, mSizeCount, fillCount);
+  FillImageLayerList(mLayers, &Layer::mMaskMode, mMaskModeCount, fillCount);
+  FillImageLayerList(mLayers, &Layer::mComposite, mCompositeCount, fillCount);
+}
+
+static bool UrlValuesEqual(const StyleImage& aImage,
+                           const StyleImage& aOtherImage) {
+  const auto* url = aImage.GetImageRequestURLValue();
+  const auto* other = aOtherImage.GetImageRequestURLValue();
+  return url == other || (url && other && *url == *other);
+}
+
+nsChangeHint nsStyleImageLayers::Layer::CalcDifference(
+    const nsStyleImageLayers::Layer& aNewLayer) const {
+  nsChangeHint hint = nsChangeHint(0);
+  if (!UrlValuesEqual(mImage, aNewLayer.mImage)) {
+    hint |= nsChangeHint_RepaintFrame | nsChangeHint_UpdateEffects;
+  } else if (mAttachment != aNewLayer.mAttachment || mClip != aNewLayer.mClip ||
+             mOrigin != aNewLayer.mOrigin || mRepeat != aNewLayer.mRepeat ||
+             mBlendMode != aNewLayer.mBlendMode || mSize != aNewLayer.mSize ||
+             mImage != aNewLayer.mImage || mMaskMode != aNewLayer.mMaskMode ||
+             mComposite != aNewLayer.mComposite) {
+    hint |= nsChangeHint_RepaintFrame;
+  }
+
+  if (mPosition != aNewLayer.mPosition) {
+    hint |= nsChangeHint_UpdateBackgroundPosition;
+  }
+
+  return hint;
+}
+
+
+nsStyleBackground::nsStyleBackground()
+    : mImage(nsStyleImageLayers::LayerType::Background),
+      mBackgroundColor(StyleColor::Transparent()) {
+  MOZ_COUNT_CTOR(nsStyleBackground);
+}
+
+nsStyleBackground::nsStyleBackground(const nsStyleBackground& aSource)
+    : mImage(aSource.mImage), mBackgroundColor(aSource.mBackgroundColor) {
+  MOZ_COUNT_CTOR(nsStyleBackground);
+}
+
+void nsStyleBackground::TriggerImageLoads(Document& aDocument,
+                                          const nsStyleBackground* aOldStyle) {
+  MOZ_ASSERT(NS_IsMainThread());
+  mImage.ResolveImages(aDocument, aOldStyle ? &aOldStyle->mImage : nullptr);
+}
+
+nsChangeHint nsStyleBackground::CalcDifference(
+    const nsStyleBackground& aNewData) const {
+  nsChangeHint hint = nsChangeHint(0);
+  if (mBackgroundColor != aNewData.mBackgroundColor) {
+    hint |= nsChangeHint_RepaintFrame;
+  }
+
+  hint |= mImage.CalcDifference(aNewData.mImage,
+                                nsStyleImageLayers::LayerType::Background);
+
+  return hint;
+}
+
+bool nsStyleBackground::HasFixedBackground(nsIFrame* aFrame) const {
+  NS_FOR_VISIBLE_IMAGE_LAYERS_BACK_TO_FRONT(i, mImage) {
+    const nsStyleImageLayers::Layer& layer = mImage.mLayers[i];
+    if (layer.mAttachment == StyleImageLayerAttachment::Fixed &&
+        !layer.mImage.IsNone() && !nsLayoutUtils::IsTransformed(aFrame)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+nscolor nsStyleBackground::BackgroundColor(const nsIFrame* aFrame) const {
+  return mBackgroundColor.CalcColor(aFrame);
+}
+
+nscolor nsStyleBackground::BackgroundColor(const ComputedStyle* aStyle) const {
+  return mBackgroundColor.CalcColor(*aStyle);
+}
+
+bool nsStyleBackground::IsTransparent(const nsIFrame* aFrame) const {
+  return IsTransparent(aFrame->Style());
+}
+
+bool nsStyleBackground::IsTransparent(const ComputedStyle* aStyle) const {
+  return BottomLayer().mImage.IsNone() && mImage.mImageCount == 1 &&
+         NS_GET_A(BackgroundColor(aStyle)) == 0;
+}
+
+StyleTransition::StyleTransition(const StyleTransition& aCopy) = default;
+
+bool StyleTransition::operator==(const StyleTransition& aOther) const {
+  return mTimingFunction == aOther.mTimingFunction &&
+         mDuration == aOther.mDuration && mDelay == aOther.mDelay &&
+         mProperty == aOther.mProperty && mBehavior == aOther.mBehavior;
+}
+
+StyleAnimation::StyleAnimation(const StyleAnimation& aCopy) = default;
+
+bool StyleAnimation::operator==(const StyleAnimation& aOther) const {
+  return mTimingFunction == aOther.mTimingFunction &&
+         mDuration == aOther.mDuration && mDelay == aOther.mDelay &&
+         mName == aOther.mName && mDirection == aOther.mDirection &&
+         mFillMode == aOther.mFillMode && mPlayState == aOther.mPlayState &&
+         mIterationCount == aOther.mIterationCount &&
+         mComposition == aOther.mComposition && mTimeline == aOther.mTimeline &&
+         mRangeStart == aOther.mRangeStart && mRangeEnd == aOther.mRangeEnd;
+}
+
+nsStyleDisplay::nsStyleDisplay()
+    : mDisplay(StyleDisplay::Inline),
+      mOriginalDisplay(StyleDisplay::Inline),
+      mContentVisibility(StyleContentVisibility::Visible),
+      mContainerType(StyleContainerType::NORMAL),
+      mAppearance(StyleAppearance::None),
+      mContain(StyleContain::NONE),
+      mEffectiveContainment(StyleContain::NONE),
+      mDefaultAppearance(StyleAppearance::None),
+      mPosition(StylePositionProperty::Static),
+      mFloat(StyleFloat::None),
+      mClear(StyleClear::None),
+      mBreakInside(StyleBreakWithin::Auto),
+      mBreakBefore(StyleBreakBetween::Auto),
+      mBreakAfter(StyleBreakBetween::Auto),
+      mOverflowX(StyleOverflow::Visible),
+      mOverflowY(StyleOverflow::Visible),
+      mScrollbarGutter(StyleScrollbarGutter::AUTO),
+      mResize(StyleResize::None),
+      mOrient(StyleOrient::Inline),
+      mIsolation(StyleIsolation::Auto),
+      mTopLayer(StyleTopLayer::None),
+      mTouchAction(StyleTouchAction::AUTO),
+      mScrollBehavior(StyleScrollBehavior::Auto),
+      mOverscrollBehaviorX(StyleOverscrollBehavior::Auto),
+      mOverscrollBehaviorY(StyleOverscrollBehavior::Auto),
+      mOverflowAnchor(StyleOverflowAnchor::Auto),
+      mScrollSnapAlign{StyleScrollSnapAlignKeyword::None,
+                       StyleScrollSnapAlignKeyword::None},
+      mScrollSnapStop{StyleScrollSnapStop::Normal},
+      mScrollSnapType{StyleScrollSnapAxis::Both,
+                      StyleScrollSnapStrictness::None},
+      mBackfaceVisibility(StyleBackfaceVisibility::Visible),
+      mTransformStyle(StyleTransformStyle::Flat),
+      mTransformBox(StyleTransformBox::ViewBox),
+      mRotate(StyleRotate::None()),
+      mTranslate(StyleTranslate::None()),
+      mScale(StyleScale::None()),
+      mWillChange{{}, {0}},
+      mOffsetPath(StyleOffsetPath::None()),
+      mOffsetDistance(LengthPercentage::Zero()),
+      mOffsetRotate{true, StyleAngle{0.0}},
+      mOffsetAnchor(StylePositionOrAuto::Auto()),
+      mOffsetPosition(StyleOffsetPosition::Normal()),
+      mTransformOrigin{LengthPercentage::FromPercentage(0.5),
+                       LengthPercentage::FromPercentage(0.5),
+                       {0.}},
+      mChildPerspective(StylePerspective::None()),
+      mPerspectiveOrigin(Position::FromPercentage(0.5f)),
+      mAlignmentBaseline(StyleAlignmentBaseline::Baseline),
+      mBaselineShift(StyleBaselineShift::Length(LengthPercentage::Zero())),
+      mBaselineSource(StyleBaselineSource::Auto),
+      mWebkitLineClamp(0),
+      mShapeMargin(LengthPercentage::Zero()),
+      mShapeOutside(StyleShapeOutside::None()) {
+  MOZ_COUNT_CTOR(nsStyleDisplay);
+}
+
+nsStyleDisplay::nsStyleDisplay(const nsStyleDisplay& aSource)
+    : mDisplay(aSource.mDisplay),
+      mOriginalDisplay(aSource.mOriginalDisplay),
+      mContentVisibility(aSource.mContentVisibility),
+      mContainerType(aSource.mContainerType),
+      mAppearance(aSource.mAppearance),
+      mContain(aSource.mContain),
+      mEffectiveContainment(aSource.mEffectiveContainment),
+      mDefaultAppearance(aSource.mDefaultAppearance),
+      mPosition(aSource.mPosition),
+      mFloat(aSource.mFloat),
+      mClear(aSource.mClear),
+      mBreakInside(aSource.mBreakInside),
+      mBreakBefore(aSource.mBreakBefore),
+      mBreakAfter(aSource.mBreakAfter),
+      mOverflowX(aSource.mOverflowX),
+      mOverflowY(aSource.mOverflowY),
+      mScrollbarGutter(aSource.mScrollbarGutter),
+      mResize(aSource.mResize),
+      mOrient(aSource.mOrient),
+      mIsolation(aSource.mIsolation),
+      mTopLayer(aSource.mTopLayer),
+      mTouchAction(aSource.mTouchAction),
+      mScrollBehavior(aSource.mScrollBehavior),
+      mOverscrollBehaviorX(aSource.mOverscrollBehaviorX),
+      mOverscrollBehaviorY(aSource.mOverscrollBehaviorY),
+      mOverflowAnchor(aSource.mOverflowAnchor),
+      mScrollSnapAlign(aSource.mScrollSnapAlign),
+      mScrollSnapStop(aSource.mScrollSnapStop),
+      mScrollSnapType(aSource.mScrollSnapType),
+      mBackfaceVisibility(aSource.mBackfaceVisibility),
+      mTransformStyle(aSource.mTransformStyle),
+      mTransformBox(aSource.mTransformBox),
+      mTransform(aSource.mTransform),
+      mRotate(aSource.mRotate),
+      mTranslate(aSource.mTranslate),
+      mScale(aSource.mScale),
+      mContainerName(aSource.mContainerName),
+      mWillChange(aSource.mWillChange),
+      mOffsetPath(aSource.mOffsetPath),
+      mOffsetDistance(aSource.mOffsetDistance),
+      mOffsetRotate(aSource.mOffsetRotate),
+      mOffsetAnchor(aSource.mOffsetAnchor),
+      mOffsetPosition(aSource.mOffsetPosition),
+      mTransformOrigin(aSource.mTransformOrigin),
+      mChildPerspective(aSource.mChildPerspective),
+      mPerspectiveOrigin(aSource.mPerspectiveOrigin),
+      mAlignmentBaseline(aSource.mAlignmentBaseline),
+      mBaselineShift(aSource.mBaselineShift),
+      mBaselineSource(aSource.mBaselineSource),
+      mWebkitLineClamp(aSource.mWebkitLineClamp),
+      mShapeImageThreshold(aSource.mShapeImageThreshold),
+      mShapeMargin(aSource.mShapeMargin),
+      mShapeOutside(aSource.mShapeOutside),
+      mAnchorName(aSource.mAnchorName),
+      mAnchorScope(aSource.mAnchorScope) {
+  MOZ_COUNT_CTOR(nsStyleDisplay);
+}
+
+void nsStyleDisplay::TriggerImageLoads(Document& aDocument,
+                                       const nsStyleDisplay* aOldStyle) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mShapeOutside.IsImage()) {
+    const auto* old = aOldStyle && aOldStyle->mShapeOutside.IsImage()
+                          ? &aOldStyle->mShapeOutside.AsImage()
+                          : nullptr;
+    const_cast<StyleImage&>(mShapeOutside.AsImage())
+        .ResolveImage(aDocument, old);
+  }
+}
+
+template <typename TransformLike>
+static inline nsChangeHint CompareTransformValues(
+    const TransformLike& aOldTransform, const TransformLike& aNewTransform) {
+  nsChangeHint result = nsChangeHint(0);
+
+  if (aOldTransform != aNewTransform) {
+    result |= nsChangeHint_UpdateTransformLayer;
+    if (!aOldTransform.IsNone() && !aNewTransform.IsNone()) {
+      result |= nsChangeHint_UpdatePostTransformOverflow;
+    } else {
+      result |= nsChangeHint_UpdateOverflow;
+    }
+  }
+
+  return result;
+}
+
+static inline nsChangeHint CompareMotionValues(
+    const nsStyleDisplay& aDisplay, const nsStyleDisplay& aNewDisplay) {
+  if (aDisplay.mOffsetPath == aNewDisplay.mOffsetPath) {
+    if (aDisplay.mOffsetDistance == aNewDisplay.mOffsetDistance &&
+        aDisplay.mOffsetRotate == aNewDisplay.mOffsetRotate &&
+        aDisplay.mOffsetAnchor == aNewDisplay.mOffsetAnchor &&
+        aDisplay.mOffsetPosition == aNewDisplay.mOffsetPosition) {
+      return nsChangeHint(0);
+    }
+
+    if (aDisplay.mOffsetPath.IsNone()) {
+      return nsChangeHint_NeutralChange;
+    }
+  }
+
+  nsChangeHint result = nsChangeHint_UpdateTransformLayer;
+  if (!aDisplay.mOffsetPath.IsNone() && !aNewDisplay.mOffsetPath.IsNone()) {
+    result |= nsChangeHint_UpdatePostTransformOverflow;
+  } else {
+    result |= nsChangeHint_UpdateOverflow;
+  }
+  return result;
+}
+
+static bool ScrollbarGenerationChanged(const nsStyleDisplay& aOld,
+                                       const nsStyleDisplay& aNew) {
+  auto changed = [](StyleOverflow aOld, StyleOverflow aNew) {
+    return aOld != aNew &&
+           (aOld == StyleOverflow::Hidden || aNew == StyleOverflow::Hidden);
+  };
+  return changed(aOld.mOverflowX, aNew.mOverflowX) ||
+         changed(aOld.mOverflowY, aNew.mOverflowY);
+}
+
+static bool AppearanceValueAffectsFrames(StyleAppearance aAppearance,
+                                         StyleAppearance aDefaultAppearance) {
+  switch (aAppearance) {
+    case StyleAppearance::Base:
+      return aDefaultAppearance == StyleAppearance::Menulist ||
+             aDefaultAppearance == StyleAppearance::Listbox ||
+             aDefaultAppearance == StyleAppearance::Checkbox ||
+             aDefaultAppearance == StyleAppearance::Radio;
+    case StyleAppearance::BaseSelect:
+      return aDefaultAppearance == StyleAppearance::Menulist ||
+             aDefaultAppearance == StyleAppearance::Listbox;
+    case StyleAppearance::None:
+      return aDefaultAppearance == StyleAppearance::Checkbox ||
+             aDefaultAppearance == StyleAppearance::Radio;
+    case StyleAppearance::Textfield:
+      return aDefaultAppearance == StyleAppearance::NumberInput ||
+             aDefaultAppearance == StyleAppearance::PasswordInput;
+    case StyleAppearance::Menulist:
+      return aDefaultAppearance == StyleAppearance::Menulist;
+    default:
+      return false;
+  }
+}
+
+nsChangeHint nsStyleDisplay::CalcDifference(
+    const nsStyleDisplay& aNewData, const ComputedStyle& aOldStyle) const {
+  if (mDisplay != aNewData.mDisplay ||
+      (mFloat == StyleFloat::None) != (aNewData.mFloat == StyleFloat::None) ||
+      mTopLayer != aNewData.mTopLayer || mResize != aNewData.mResize) {
+    return nsChangeHint_ReconstructFrame;
+  }
+
+  auto oldAppearance = EffectiveAppearance();
+  auto newAppearance = aNewData.EffectiveAppearance();
+  if (oldAppearance != newAppearance) {
+    if (AppearanceValueAffectsFrames(oldAppearance, mDefaultAppearance) ||
+        AppearanceValueAffectsFrames(newAppearance, mDefaultAppearance)) {
+      return nsChangeHint_ReconstructFrame;
+    }
+  }
+
+  auto hint = nsChangeHint(0);
+  const auto containmentDiff =
+      mEffectiveContainment ^ aNewData.mEffectiveContainment;
+  if (containmentDiff) {
+    if (containmentDiff & StyleContain::STYLE) {
+      return nsChangeHint_ReconstructFrame;
+    }
+    if (containmentDiff & (StyleContain::PAINT | StyleContain::LAYOUT)) {
+      hint |= nsChangeHint_UpdateContainingBlock;
+    }
+    hint |= nsChangeHint_AllReflowHints | nsChangeHint_RepaintFrame;
+  }
+  if (mPosition != aNewData.mPosition) {
+    if (IsAbsolutelyPositionedStyle() ||
+        aNewData.IsAbsolutelyPositionedStyle()) {
+      return nsChangeHint_ReconstructFrame;
+    }
+    if (IsRelativelyOrStickyPositionedStyle() !=
+        aNewData.IsRelativelyOrStickyPositionedStyle()) {
+      hint |= nsChangeHint_UpdateContainingBlock | nsChangeHint_RepaintFrame;
+    }
+    if (IsPositionForcingStackingContext() !=
+        aNewData.IsPositionForcingStackingContext()) {
+      hint |= nsChangeHint_RepaintFrame;
+    }
+    hint |= nsChangeHint_NeedReflow | nsChangeHint_ReflowChangesSizeOrPosition;
+  }
+
+  if (mScrollSnapAlign != aNewData.mScrollSnapAlign ||
+      mScrollSnapType != aNewData.mScrollSnapType ||
+      mScrollSnapStop != aNewData.mScrollSnapStop) {
+    hint |= nsChangeHint_RepaintFrame;
+  }
+  if (mScrollBehavior != aNewData.mScrollBehavior) {
+    hint |= nsChangeHint_NeutralChange;
+  }
+
+  if (mOverflowX != aNewData.mOverflowX || mOverflowY != aNewData.mOverflowY) {
+    const bool isScrollable = IsScrollableOverflow();
+    if (isScrollable != aNewData.IsScrollableOverflow()) {
+      hint |= nsChangeHint_ScrollbarChange | nsChangeHint_UpdateOverflow |
+              nsChangeHint_RepaintFrame;
+    } else if (isScrollable) {
+      if (ScrollbarGenerationChanged(*this, aNewData)) {
+        hint |= nsChangeHint_ScrollbarChange;
+      } else {
+        hint |= nsChangeHint_ReflowHintsForScrollbarChange;
+      }
+    } else {
+      hint |= nsChangeHint_UpdateOverflow | nsChangeHint_RepaintFrame;
+      if (aOldStyle.IsRootElementStyle()) {
+        hint |= nsChangeHint_ScrollbarChange;
+      }
+    }
+  }
+
+  if (mScrollbarGutter != aNewData.mScrollbarGutter) {
+    if (IsScrollableOverflow() || aOldStyle.IsRootElementStyle()) {
+      hint |= nsChangeHint_ReflowHintsForScrollbarChange;
+    } else {
+      hint |= nsChangeHint_NeutralChange;
+    }
+  }
+
+  if (mFloat != aNewData.mFloat) {
+    hint |= nsChangeHint_ReflowHintsForFloatAreaChange;
+  }
+
+  if (mShapeOutside != aNewData.mShapeOutside ||
+      mShapeMargin != aNewData.mShapeMargin ||
+      mShapeImageThreshold != aNewData.mShapeImageThreshold) {
+    if (aNewData.mFloat != StyleFloat::None) {
+      hint |= nsChangeHint_ReflowHintsForFloatAreaChange;
+    } else {
+      hint |= nsChangeHint_NeutralChange;
+    }
+  }
+
+  if (mWebkitLineClamp != aNewData.mWebkitLineClamp ||
+      mAlignmentBaseline != aNewData.mAlignmentBaseline ||
+      mBaselineShift != aNewData.mBaselineShift ||
+      mBaselineSource != aNewData.mBaselineSource) {
+    hint |= NS_STYLE_HINT_REFLOW;
+  }
+
+  if (mClear != aNewData.mClear || mBreakInside != aNewData.mBreakInside ||
+      mBreakBefore != aNewData.mBreakBefore ||
+      mBreakAfter != aNewData.mBreakAfter ||
+      mAppearance != aNewData.mAppearance ||
+      mDefaultAppearance != aNewData.mDefaultAppearance ||
+      mOrient != aNewData.mOrient) {
+    hint |= nsChangeHint_AllReflowHints | nsChangeHint_RepaintFrame;
+  }
+
+  if (mIsolation != aNewData.mIsolation) {
+    hint |= nsChangeHint_RepaintFrame;
+  }
+
+  if (HasTransformStyle() != aNewData.HasTransformStyle()) {
+    hint |= nsChangeHint_ComprehensiveAddOrRemoveTransform;
+  } else {
+    nsChangeHint transformHint = CalcTransformPropertyDifference(aNewData);
+
+    if (transformHint) {
+      if (HasTransformStyle()) {
+        hint |= transformHint;
+      } else {
+        hint |= nsChangeHint_NeutralChange;
+      }
+    }
+  }
+
+  if (HasPerspectiveStyle() != aNewData.HasPerspectiveStyle()) {
+    hint |= nsChangeHint_UpdateContainingBlock | nsChangeHint_UpdateOverflow |
+            nsChangeHint_RepaintFrame;
+  } else if (mChildPerspective != aNewData.mChildPerspective) {
+    hint |= nsChangeHint_UpdateOverflow | nsChangeHint_RepaintFrame;
+  }
+
+  auto willChangeBitsChanged = mWillChange.bits ^ aNewData.mWillChange.bits;
+
+  if (willChangeBitsChanged &
+      (StyleWillChangeBits::STACKING_CONTEXT_UNCONDITIONAL |
+       StyleWillChangeBits::SCROLL | StyleWillChangeBits::OPACITY |
+       StyleWillChangeBits::PERSPECTIVE | StyleWillChangeBits::TRANSFORM |
+       StyleWillChangeBits::Z_INDEX)) {
+    hint |= nsChangeHint_RepaintFrame;
+  }
+
+  if (willChangeBitsChanged &
+      (StyleWillChangeBits::FIXPOS_CB_NON_SVG | StyleWillChangeBits::TRANSFORM |
+       StyleWillChangeBits::PERSPECTIVE | StyleWillChangeBits::POSITION |
+       StyleWillChangeBits::CONTAIN)) {
+    hint |= nsChangeHint_UpdateContainingBlock;
+  }
+
+  if (mTouchAction != aNewData.mTouchAction) {
+    hint |= nsChangeHint_RepaintFrame;
+  }
+
+  if (mOverscrollBehaviorX != aNewData.mOverscrollBehaviorX ||
+      mOverscrollBehaviorY != aNewData.mOverscrollBehaviorY) {
+    hint |= nsChangeHint_SchedulePaint;
+  }
+
+  if (mOriginalDisplay != aNewData.mOriginalDisplay) {
+    if (IsAbsolutelyPositionedStyle() &&
+        aOldStyle.StylePosition()->NeedsHypotheticalPositionIfAbsPos()) {
+      hint |=
+          nsChangeHint_NeedReflow | nsChangeHint_ReflowChangesSizeOrPosition;
+    } else {
+      hint |= nsChangeHint_NeutralChange;
+    }
+  }
+
+
+
+
+  if (!hint && (mWillChange != aNewData.mWillChange ||
+                mOverflowAnchor != aNewData.mOverflowAnchor ||
+                mContentVisibility != aNewData.mContentVisibility ||
+                mContainerType != aNewData.mContainerType ||
+                mContain != aNewData.mContain ||
+                mContainerName != aNewData.mContainerName ||
+                mAnchorName != aNewData.mAnchorName ||
+                mAnchorScope != aNewData.mAnchorScope)) {
+    hint |= nsChangeHint_NeutralChange;
+  }
+
+  return hint;
+}
+
+nsChangeHint nsStyleDisplay::CalcTransformPropertyDifference(
+    const nsStyleDisplay& aNewData) const {
+  nsChangeHint transformHint = nsChangeHint(0);
+
+  transformHint |= CompareTransformValues(mTransform, aNewData.mTransform);
+  transformHint |= CompareTransformValues(mRotate, aNewData.mRotate);
+  transformHint |= CompareTransformValues(mTranslate, aNewData.mTranslate);
+  transformHint |= CompareTransformValues(mScale, aNewData.mScale);
+  transformHint |= CompareMotionValues(*this, aNewData);
+
+  if (mTransformOrigin != aNewData.mTransformOrigin) {
+    transformHint |= nsChangeHint_UpdateTransformLayer |
+                     nsChangeHint_UpdatePostTransformOverflow;
+  }
+
+  if (mPerspectiveOrigin != aNewData.mPerspectiveOrigin ||
+      mTransformStyle != aNewData.mTransformStyle ||
+      mTransformBox != aNewData.mTransformBox) {
+    transformHint |= nsChangeHint_UpdateOverflow | nsChangeHint_RepaintFrame;
+  }
+
+  if (mBackfaceVisibility != aNewData.mBackfaceVisibility) {
+    transformHint |= nsChangeHint_RepaintFrame;
+  }
+
+  return transformHint;
+}
+
+
+nsStyleVisibility::nsStyleVisibility(const Document& aDocument)
+    : mDirection(aDocument.GetBidiOptions() == IBMBIDI_TEXTDIRECTION_RTL
+                     ? StyleDirection::Rtl
+                     : StyleDirection::Ltr),
+      mVisible(StyleVisibility::Visible),
+      mImageRendering(StyleImageRendering::Auto),
+      mImageOrientation(StyleImageOrientation::FromImage),
+      mImageDecoding(StyleImageDecoding::Auto),
+      mWritingMode(StyleWritingModeProperty::HorizontalTb),
+      mTextOrientation(StyleTextOrientation::Mixed),
+      mMozBoxCollapse(StyleBoxCollapse::Flex),
+      mPrintColorAdjust(StylePrintColorAdjust::Economy),
+      mDominantBaseline(StyleDominantBaseline::Auto) {
+  MOZ_COUNT_CTOR(nsStyleVisibility);
+}
+
+nsStyleVisibility::nsStyleVisibility(const nsStyleVisibility& aSource)
+    : mDirection(aSource.mDirection),
+      mVisible(aSource.mVisible),
+      mImageRendering(aSource.mImageRendering),
+      mImageOrientation(aSource.mImageOrientation),
+      mImageDecoding(aSource.mImageDecoding),
+      mWritingMode(aSource.mWritingMode),
+      mTextOrientation(aSource.mTextOrientation),
+      mMozBoxCollapse(aSource.mMozBoxCollapse),
+      mPrintColorAdjust(aSource.mPrintColorAdjust),
+      mDominantBaseline(aSource.mDominantBaseline) {
+  MOZ_COUNT_CTOR(nsStyleVisibility);
+}
+
+nsChangeHint nsStyleVisibility::CalcDifference(
+    const nsStyleVisibility& aNewData) const {
+  nsChangeHint hint = nsChangeHint(0);
+
+  if (mDirection != aNewData.mDirection ||
+      mWritingMode != aNewData.mWritingMode ||
+      mTextOrientation != aNewData.mTextOrientation) {
+    return nsChangeHint_ReconstructFrame;
+  }
+  if (mImageOrientation != aNewData.mImageOrientation) {
+    hint |= nsChangeHint_AllReflowHints | nsChangeHint_RepaintFrame;
+  }
+  if (mVisible != aNewData.mVisible) {
+    if (mVisible == StyleVisibility::Visible ||
+        aNewData.mVisible == StyleVisibility::Visible) {
+      hint |= nsChangeHint_VisibilityChange;
+    }
+    if (mVisible == StyleVisibility::Collapse ||
+        aNewData.mVisible == StyleVisibility::Collapse) {
+      hint |= NS_STYLE_HINT_REFLOW;
+    } else {
+      hint |= NS_STYLE_HINT_VISUAL;
+    }
+  }
+  if (mMozBoxCollapse != aNewData.mMozBoxCollapse ||
+      mDominantBaseline != aNewData.mDominantBaseline) {
+    hint |= NS_STYLE_HINT_REFLOW;
+  }
+  if (mImageRendering != aNewData.mImageRendering ||
+      mImageDecoding != aNewData.mImageDecoding) {
+    hint |= nsChangeHint_RepaintFrame;
+  }
+  if (mPrintColorAdjust != aNewData.mPrintColorAdjust) {
+    hint |= nsChangeHint_NeutralChange;
+  }
+  return hint;
+}
+
+StyleImageOrientation nsStyleVisibility::UsedImageOrientation(
+    imgIRequest* aRequest, StyleImageOrientation aOrientation) {
+  if (aOrientation == StyleImageOrientation::FromImage || !aRequest) {
+    return aOrientation;
+  }
+
+  nsCOMPtr<nsIPrincipal> triggeringPrincipal =
+      aRequest->GetTriggeringPrincipal();
+
+  if (!triggeringPrincipal) {
+    return aOrientation;
+  }
+
+  nsCOMPtr<nsIURI> uri = aRequest->GetURI();
+  bool isSameOrigin =
+      uri->SchemeIs("data") || triggeringPrincipal->IsSameOrigin(uri);
+
+  if (!isSameOrigin && !nsLayoutUtils::ImageRequestUsesCORS(aRequest)) {
+    return StyleImageOrientation::FromImage;
+  }
+
+  return aOrientation;
+}
+
+
+nsStyleContent::nsStyleContent() : mContent(StyleContent::Normal()) {
+  MOZ_COUNT_CTOR(nsStyleContent);
+}
+
+nsStyleContent::nsStyleContent(const nsStyleContent& aSource)
+    : mContent(aSource.mContent),
+      mCounterIncrement(aSource.mCounterIncrement),
+      mCounterReset(aSource.mCounterReset),
+      mCounterSet(aSource.mCounterSet) {
+  MOZ_COUNT_CTOR(nsStyleContent);
+}
+
+nsChangeHint nsStyleContent::CalcDifference(
+    const nsStyleContent& aNewData) const {
+  if (mContent != aNewData.mContent ||
+      mCounterIncrement != aNewData.mCounterIncrement ||
+      mCounterReset != aNewData.mCounterReset ||
+      mCounterSet != aNewData.mCounterSet) {
+    return nsChangeHint_ReconstructFrame;
+  }
+
+  return nsChangeHint(0);
+}
+
+void nsStyleContent::TriggerImageLoads(Document& aDoc,
+                                       const nsStyleContent* aOld) {
+  if (!mContent.IsItems()) {
+    return;
+  }
+
+  Span<const StyleContentItem> oldItems;
+  if (aOld) {
+    oldItems = aOld->NonAltContentItems();
+  }
+
+  auto items = NonAltContentItems();
+  for (size_t i = 0; i < items.Length(); ++i) {
+    const auto& item = items[i];
+    if (!item.IsImage()) {
+      continue;
+    }
+    const auto& image = item.AsImage();
+    const auto* oldImage = i < oldItems.Length() && oldItems[i].IsImage()
+                               ? &oldItems[i].AsImage()
+                               : nullptr;
+    const_cast<StyleImage&>(image).ResolveImage(aDoc, oldImage);
+  }
+}
+
+
+nsStyleTextReset::nsStyleTextReset()
+    : mTextDecorationLine(StyleTextDecorationLine::NONE),
+      mTextDecorationStyle(StyleTextDecorationStyle::Solid),
+      mUnicodeBidi(StyleUnicodeBidi::Normal),
+      mInitialLetter{0, 0},
+      mTextDecorationColor(StyleColor::CurrentColor()),
+      mTextDecorationThickness(StyleTextDecorationLength::Auto()),
+      mTextDecorationInset(StyleTextDecorationInset::LengthPercentage(
+          StyleLengthPercentage::Zero(), StyleLengthPercentage::Zero())),
+      mTextBoxTrim(StyleTextBoxTrim::NONE) {
+  MOZ_COUNT_CTOR(nsStyleTextReset);
+}
+
+nsStyleTextReset::nsStyleTextReset(const nsStyleTextReset& aSource)
+    : mTextOverflow(aSource.mTextOverflow),
+      mTextDecorationLine(aSource.mTextDecorationLine),
+      mTextDecorationStyle(aSource.mTextDecorationStyle),
+      mUnicodeBidi(aSource.mUnicodeBidi),
+      mInitialLetter(aSource.mInitialLetter),
+      mTextDecorationColor(aSource.mTextDecorationColor),
+      mTextDecorationThickness(aSource.mTextDecorationThickness),
+      mTextDecorationInset(aSource.mTextDecorationInset),
+      mTextBoxTrim(aSource.mTextBoxTrim) {
+  MOZ_COUNT_CTOR(nsStyleTextReset);
+}
+
+nsChangeHint nsStyleTextReset::CalcDifference(
+    const nsStyleTextReset& aNewData) const {
+  if (mUnicodeBidi != aNewData.mUnicodeBidi ||
+      mInitialLetter != aNewData.mInitialLetter ||
+      mTextBoxTrim != aNewData.mTextBoxTrim) {
+    return NS_STYLE_HINT_REFLOW;
+  }
+
+  if (mTextDecorationLine != aNewData.mTextDecorationLine ||
+      mTextDecorationStyle != aNewData.mTextDecorationStyle ||
+      mTextDecorationThickness != aNewData.mTextDecorationThickness ||
+      mTextDecorationInset != aNewData.mTextDecorationInset) {
+    return nsChangeHint_RepaintFrame | nsChangeHint_UpdateSubtreeOverflow |
+           nsChangeHint_SchedulePaint;
+  }
+
+  if (mTextDecorationColor != aNewData.mTextDecorationColor ||
+      mTextOverflow != aNewData.mTextOverflow) {
+    return nsChangeHint_RepaintFrame;
+  }
+
+  return nsChangeHint(0);
+}
+
+
+static StyleAbsoluteColor DefaultColor(const Document& aDocument) {
+  return StyleAbsoluteColor::FromColor(
+      PreferenceSheet::PrefsFor(aDocument)
+          .ColorsFor(aDocument.DefaultColorScheme())
+          .mDefault);
+}
+
+nsStyleText::nsStyleText(const Document& aDocument)
+    : mColor(DefaultColor(aDocument)),
+      mForcedColorAdjust(StyleForcedColorAdjust::Auto),
+      mTextTransform(StyleTextTransform::NONE),
+      mTextAlign(StyleTextAlign::Start),
+      mTextAlignLast(StyleTextAlignLast::Auto),
+      mTextJustify(StyleTextJustify::Auto),
+      mHyphens(StyleHyphens::Manual),
+      mRubyAlign(StyleRubyAlign::SpaceAround),
+      mRubyPosition(StyleRubyPosition::AlternateOver),
+      mTextSizeAdjust(StyleTextSizeAdjust::Auto),
+      mTextCombineUpright(StyleTextCombineUpright::None),
+      mMozControlCharacterVisibility(
+          StaticPrefs::layout_css_control_characters_visible()
+              ? StyleMozControlCharacterVisibility::Visible
+              : StyleMozControlCharacterVisibility::Hidden),
+      mTextEmphasisPosition(StyleTextEmphasisPosition::AUTO),
+      mTextRendering(StyleTextRendering::Auto),
+      mTextEmphasisColor(StyleColor::CurrentColor()),
+      mWebkitTextFillColor(StyleColor::CurrentColor()),
+      mWebkitTextStrokeColor(StyleColor::CurrentColor()),
+      mTabSize(StyleNonNegativeLengthOrNumber::Number(8.f)),
+      mWordSpacing(LengthPercentage::Zero()),
+      mLetterSpacing(LengthPercentage::Zero()),
+      mTextBoxEdge(StyleTextBoxEdge::Auto()),
+      mTextUnderlineOffset(LengthPercentageOrAuto::Auto()),
+      mTextDecorationSkipInk(StyleTextDecorationSkipInk::Auto),
+      mTextUnderlinePosition(StyleTextUnderlinePosition::AUTO),
+      mWebkitTextStrokeWidth(0),
+      mTextEmphasisStyle(StyleTextEmphasisStyle::None()) {
+  MOZ_COUNT_CTOR(nsStyleText);
+}
+
+nsStyleText::nsStyleText(const nsStyleText& aSource)
+    : mColor(aSource.mColor),
+      mForcedColorAdjust(aSource.mForcedColorAdjust),
+      mTextTransform(aSource.mTextTransform),
+      mTextAlign(aSource.mTextAlign),
+      mTextAlignLast(aSource.mTextAlignLast),
+      mTextJustify(aSource.mTextJustify),
+      mWhiteSpaceCollapse(aSource.mWhiteSpaceCollapse),
+      mTextWrapMode(aSource.mTextWrapMode),
+      mLineBreak(aSource.mLineBreak),
+      mWordBreak(aSource.mWordBreak),
+      mOverflowWrap(aSource.mOverflowWrap),
+      mTextAutospace(aSource.mTextAutospace),
+      mHyphens(aSource.mHyphens),
+      mRubyAlign(aSource.mRubyAlign),
+      mRubyPosition(aSource.mRubyPosition),
+      mTextSizeAdjust(aSource.mTextSizeAdjust),
+      mTextCombineUpright(aSource.mTextCombineUpright),
+      mMozControlCharacterVisibility(aSource.mMozControlCharacterVisibility),
+      mTextEmphasisPosition(aSource.mTextEmphasisPosition),
+      mTextRendering(aSource.mTextRendering),
+      mTextEmphasisColor(aSource.mTextEmphasisColor),
+      mWebkitTextFillColor(aSource.mWebkitTextFillColor),
+      mWebkitTextStrokeColor(aSource.mWebkitTextStrokeColor),
+      mTabSize(aSource.mTabSize),
+      mWordSpacing(aSource.mWordSpacing),
+      mLetterSpacing(aSource.mLetterSpacing),
+      mTextIndent(aSource.mTextIndent),
+      mTextBoxEdge(aSource.mTextBoxEdge),
+      mTextUnderlineOffset(aSource.mTextUnderlineOffset),
+      mTextDecorationSkipInk(aSource.mTextDecorationSkipInk),
+      mTextUnderlinePosition(aSource.mTextUnderlinePosition),
+      mWebkitTextStrokeWidth(aSource.mWebkitTextStrokeWidth),
+      mTextShadow(aSource.mTextShadow),
+      mTextEmphasisStyle(aSource.mTextEmphasisStyle),
+      mHyphenateCharacter(aSource.mHyphenateCharacter),
+      mHyphenateLimitChars(aSource.mHyphenateLimitChars),
+      mWebkitTextSecurity(aSource.mWebkitTextSecurity),
+      mTextWrapStyle(aSource.mTextWrapStyle) {
+  MOZ_COUNT_CTOR(nsStyleText);
+}
+
+nsChangeHint nsStyleText::CalcDifference(const nsStyleText& aNewData) const {
+  if (WhiteSpaceOrNewlineIsSignificant() !=
+      aNewData.WhiteSpaceOrNewlineIsSignificant()) {
+    return nsChangeHint_ReconstructFrame;
+  }
+
+  if (mTextCombineUpright != aNewData.mTextCombineUpright ||
+      mMozControlCharacterVisibility !=
+          aNewData.mMozControlCharacterVisibility) {
+    return nsChangeHint_ReconstructFrame;
+  }
+
+  if ((mTextAlign != aNewData.mTextAlign) ||
+      (mTextAlignLast != aNewData.mTextAlignLast) ||
+      (mTextTransform != aNewData.mTextTransform) ||
+      (mWhiteSpaceCollapse != aNewData.mWhiteSpaceCollapse) ||
+      (mTextWrapMode != aNewData.mTextWrapMode) ||
+      (mLineBreak != aNewData.mLineBreak) ||
+      (mWordBreak != aNewData.mWordBreak) ||
+      (mOverflowWrap != aNewData.mOverflowWrap) ||
+      (mHyphens != aNewData.mHyphens) || (mRubyAlign != aNewData.mRubyAlign) ||
+      (mRubyPosition != aNewData.mRubyPosition) ||
+      (mTextSizeAdjust != aNewData.mTextSizeAdjust) ||
+      (mLetterSpacing != aNewData.mLetterSpacing) ||
+      (mTextIndent != aNewData.mTextIndent) ||
+      (mTextBoxEdge != aNewData.mTextBoxEdge) ||
+      (mTextJustify != aNewData.mTextJustify) ||
+      (mWordSpacing != aNewData.mWordSpacing) ||
+      (mTabSize != aNewData.mTabSize) ||
+      (mHyphenateCharacter != aNewData.mHyphenateCharacter) ||
+      (mHyphenateLimitChars != aNewData.mHyphenateLimitChars) ||
+      (mWebkitTextSecurity != aNewData.mWebkitTextSecurity) ||
+      (mTextWrapStyle != aNewData.mTextWrapStyle) ||
+      (mTextAutospace != aNewData.mTextAutospace)) {
+    return NS_STYLE_HINT_REFLOW;
+  }
+
+  if (HasEffectiveTextEmphasis() != aNewData.HasEffectiveTextEmphasis() ||
+      (HasEffectiveTextEmphasis() &&
+       mTextEmphasisPosition != aNewData.mTextEmphasisPosition)) {
+    return nsChangeHint_AllReflowHints | nsChangeHint_RepaintFrame;
+  }
+
+  nsChangeHint hint = nsChangeHint(0);
+
+  if (mTextRendering != aNewData.mTextRendering) {
+    hint |= nsChangeHint_NeedReflow | nsChangeHint_RepaintFrame;
+  }
+
+  if (mTextShadow != aNewData.mTextShadow ||
+      mTextEmphasisStyle != aNewData.mTextEmphasisStyle ||
+      mWebkitTextStrokeWidth != aNewData.mWebkitTextStrokeWidth ||
+      mTextUnderlineOffset != aNewData.mTextUnderlineOffset ||
+      mTextDecorationSkipInk != aNewData.mTextDecorationSkipInk ||
+      mTextUnderlinePosition != aNewData.mTextUnderlinePosition) {
+    hint |= nsChangeHint_UpdateSubtreeOverflow | nsChangeHint_SchedulePaint |
+            nsChangeHint_RepaintFrame;
+
+    return hint;
+  }
+
+  if (mColor != aNewData.mColor) {
+    hint |= nsChangeHint_RepaintFrame;
+  }
+
+  if (mTextEmphasisColor != aNewData.mTextEmphasisColor ||
+      mWebkitTextFillColor != aNewData.mWebkitTextFillColor ||
+      mWebkitTextStrokeColor != aNewData.mWebkitTextStrokeColor) {
+    hint |= nsChangeHint_SchedulePaint | nsChangeHint_RepaintFrame;
+  }
+
+  if (hint) {
+    return hint;
+  }
+
+  if (mTextEmphasisPosition != aNewData.mTextEmphasisPosition ||
+      mForcedColorAdjust != aNewData.mForcedColorAdjust) {
+    return nsChangeHint_NeutralChange;
+  }
+
+  return nsChangeHint(0);
+}
+
+LogicalSide nsStyleText::TextEmphasisSide(WritingMode aWM,
+                                          const nsAtom* aLanguage) const {
+  mozilla::Side side;
+  if (mTextEmphasisPosition & StyleTextEmphasisPosition::AUTO) {
+    if (aWM.IsVertical()) {
+      side = eSideRight;
+    } else {
+      if (nsStyleUtil::MatchesLanguagePrefix(aLanguage, u"zh")) {
+        side = eSideBottom;
+      } else {
+        side = eSideTop;
+      }
+    }
+  } else {
+    if (aWM.IsVertical()) {
+      side = mTextEmphasisPosition & StyleTextEmphasisPosition::LEFT
+                 ? eSideLeft
+                 : eSideRight;
+    } else {
+      side = mTextEmphasisPosition & StyleTextEmphasisPosition::OVER
+                 ? eSideTop
+                 : eSideBottom;
+    }
+  }
+
+  LogicalSide result = aWM.LogicalSideForPhysicalSide(side);
+  MOZ_ASSERT(IsBlock(result));
+  return result;
+}
+
+
+nsStyleUI::nsStyleUI()
+    : mInert(StyleInert::None),
+      mMozTheme(StyleMozTheme::Auto),
+      mUserFocus(StyleUserFocus::Normal),
+      mPointerEvents(StylePointerEvents::Auto),
+      mCursor{{}, StyleCursorKind::Auto},
+      mAccentColor(StyleColorOrAuto::Auto()),
+      mCaretColor(StyleColorOrAuto::Auto()),
+      mScrollbarColor(StyleScrollbarColor::Auto()),
+      mColorScheme(StyleColorScheme{{}, {}}) {
+  MOZ_COUNT_CTOR(nsStyleUI);
+}
+
+nsStyleUI::nsStyleUI(const nsStyleUI& aSource)
+    : mInert(aSource.mInert),
+      mMozTheme(aSource.mMozTheme),
+      mUserFocus(aSource.mUserFocus),
+      mPointerEvents(aSource.mPointerEvents),
+      mCursor(aSource.mCursor),
+      mAccentColor(aSource.mAccentColor),
+      mCaretColor(aSource.mCaretColor),
+      mScrollbarColor(aSource.mScrollbarColor),
+      mColorScheme(aSource.mColorScheme) {
+  MOZ_COUNT_CTOR(nsStyleUI);
+}
+
+void nsStyleUI::TriggerImageLoads(Document& aDocument,
+                                  const nsStyleUI* aOldStyle) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  auto cursorImages = mCursor.images.AsSpan();
+  auto oldCursorImages = aOldStyle ? aOldStyle->mCursor.images.AsSpan()
+                                   : Span<const StyleCursorImage>();
+  for (size_t i = 0; i < cursorImages.Length(); ++i) {
+    const auto& cursor = cursorImages[i];
+    const auto* oldCursorImage =
+        oldCursorImages.Length() > i ? &oldCursorImages[i].image : nullptr;
+    const_cast<StyleCursorImage&>(cursor).image.ResolveImage(aDocument,
+                                                             oldCursorImage);
+  }
+}
+
+nsChangeHint nsStyleUI::CalcDifference(const nsStyleUI& aNewData) const {
+  const auto kPointerEventsHint =
+      nsChangeHint_NeedReflow | nsChangeHint_SchedulePaint;
+
+  nsChangeHint hint = nsChangeHint(0);
+  if (mCursor != aNewData.mCursor) {
+    hint |= nsChangeHint_UpdateCursor;
+  }
+
+  if (mPointerEvents != aNewData.mPointerEvents) {
+    hint |= kPointerEventsHint;
+  }
+
+  if (mInert != aNewData.mInert) {
+    hint |= NS_STYLE_HINT_VISUAL | kPointerEventsHint;
+  }
+
+  if (mUserFocus != aNewData.mUserFocus) {
+    hint |= nsChangeHint_NeutralChange;
+  }
+
+  if (mCaretColor != aNewData.mCaretColor ||
+      mAccentColor != aNewData.mAccentColor ||
+      mScrollbarColor != aNewData.mScrollbarColor ||
+      mMozTheme != aNewData.mMozTheme ||
+      mColorScheme != aNewData.mColorScheme) {
+    hint |= nsChangeHint_RepaintFrame;
+  }
+
+  return hint;
+}
+
+
+nsStyleUIReset::nsStyleUIReset()
+    : mUserSelect(StyleUserSelect::Auto),
+      mScrollbarWidth(StyleScrollbarWidth::Auto),
+      mMozForceBrokenImageIcon(false),
+      mMozSubtreeHiddenOnlyVisually(false),
+      mIMEMode(StyleImeMode::Auto),
+      mWindowDragging(StyleWindowDragging::Default),
+      mWindowShadow(StyleWindowShadow::Auto),
+      mFieldSizing(StyleFieldSizing::Fixed),
+      mMozWindowInputRegionMargin(StyleLength::Zero()),
+      mTransitions(
+          nsStyleAutoArray<StyleTransition>::WITH_SINGLE_INITIAL_ELEMENT),
+      mTransitionTimingFunctionCount(1),
+      mTransitionDurationCount(1),
+      mTransitionDelayCount(1),
+      mTransitionPropertyCount(1),
+      mTransitionBehaviorCount(1),
+      mWindowOpacity(1.0),
+      mAnimations(
+          nsStyleAutoArray<StyleAnimation>::WITH_SINGLE_INITIAL_ELEMENT),
+      mAnimationTimingFunctionCount(1),
+      mAnimationDurationCount(1),
+      mAnimationDelayCount(1),
+      mAnimationNameCount(1),
+      mAnimationDirectionCount(1),
+      mAnimationFillModeCount(1),
+      mAnimationPlayStateCount(1),
+      mAnimationIterationCountCount(1),
+      mAnimationCompositionCount(1),
+      mAnimationTimelineCount(1),
+      mAnimationRangeStartCount(1),
+      mAnimationRangeEndCount(1),
+      mScrollTimelines(
+          nsStyleAutoArray<StyleScrollTimeline>::WITH_SINGLE_INITIAL_ELEMENT),
+      mScrollTimelineNameCount(1),
+      mScrollTimelineAxisCount(1),
+      mViewTimelines(
+          nsStyleAutoArray<StyleViewTimeline>::WITH_SINGLE_INITIAL_ELEMENT),
+      mViewTimelineNameCount(1),
+      mViewTimelineAxisCount(1),
+      mViewTimelineInsetCount(1),
+      mViewTransitionName(StyleAtom{nsGkAtoms::none}) {
+  MOZ_COUNT_CTOR(nsStyleUIReset);
+}
+
+nsStyleUIReset::nsStyleUIReset(const nsStyleUIReset& aSource)
+    : mUserSelect(aSource.mUserSelect),
+      mScrollbarWidth(aSource.mScrollbarWidth),
+      mMozForceBrokenImageIcon(aSource.mMozForceBrokenImageIcon),
+      mMozSubtreeHiddenOnlyVisually(aSource.mMozSubtreeHiddenOnlyVisually),
+      mIMEMode(aSource.mIMEMode),
+      mWindowDragging(aSource.mWindowDragging),
+      mWindowShadow(aSource.mWindowShadow),
+      mFieldSizing(aSource.mFieldSizing),
+      mMozWindowInputRegionMargin(aSource.mMozWindowInputRegionMargin),
+      mMozWindowTransform(aSource.mMozWindowTransform),
+      mTransitions(aSource.mTransitions.Clone()),
+      mTransitionTimingFunctionCount(aSource.mTransitionTimingFunctionCount),
+      mTransitionDurationCount(aSource.mTransitionDurationCount),
+      mTransitionDelayCount(aSource.mTransitionDelayCount),
+      mTransitionPropertyCount(aSource.mTransitionPropertyCount),
+      mTransitionBehaviorCount(aSource.mTransitionBehaviorCount),
+      mWindowOpacity(aSource.mWindowOpacity),
+      mAnimations(aSource.mAnimations.Clone()),
+      mAnimationTimingFunctionCount(aSource.mAnimationTimingFunctionCount),
+      mAnimationDurationCount(aSource.mAnimationDurationCount),
+      mAnimationDelayCount(aSource.mAnimationDelayCount),
+      mAnimationNameCount(aSource.mAnimationNameCount),
+      mAnimationDirectionCount(aSource.mAnimationDirectionCount),
+      mAnimationFillModeCount(aSource.mAnimationFillModeCount),
+      mAnimationPlayStateCount(aSource.mAnimationPlayStateCount),
+      mAnimationIterationCountCount(aSource.mAnimationIterationCountCount),
+      mAnimationCompositionCount(aSource.mAnimationCompositionCount),
+      mAnimationTimelineCount(aSource.mAnimationTimelineCount),
+      mAnimationRangeStartCount(aSource.mAnimationRangeStartCount),
+      mAnimationRangeEndCount(aSource.mAnimationRangeEndCount),
+      mScrollTimelines(aSource.mScrollTimelines.Clone()),
+      mScrollTimelineNameCount(aSource.mScrollTimelineNameCount),
+      mScrollTimelineAxisCount(aSource.mScrollTimelineAxisCount),
+      mViewTimelines(aSource.mViewTimelines.Clone()),
+      mViewTimelineNameCount(aSource.mViewTimelineNameCount),
+      mViewTimelineAxisCount(aSource.mViewTimelineAxisCount),
+      mViewTimelineInsetCount(aSource.mViewTimelineInsetCount),
+      mViewTransitionName(aSource.mViewTransitionName),
+      mViewTransitionClass(aSource.mViewTransitionClass),
+      mTimelineScope(aSource.mTimelineScope),
+      mLinkParameters(aSource.mLinkParameters) {
+  MOZ_COUNT_CTOR(nsStyleUIReset);
+}
+
+nsChangeHint nsStyleUIReset::CalcDifference(
+    const nsStyleUIReset& aNewData) const {
+  nsChangeHint hint = nsChangeHint(0);
+
+  if (mMozForceBrokenImageIcon != aNewData.mMozForceBrokenImageIcon) {
+    hint |= nsChangeHint_ReconstructFrame;
+  }
+  if (mMozSubtreeHiddenOnlyVisually != aNewData.mMozSubtreeHiddenOnlyVisually) {
+    hint |= nsChangeHint_RepaintFrame;
+  }
+  if (mFieldSizing != aNewData.mFieldSizing) {
+    hint |= nsChangeHint_AllReflowHints;
+  }
+  if (mScrollbarWidth != aNewData.mScrollbarWidth) {
+    hint |= nsChangeHint_ScrollbarChange;
+  }
+  if (mWindowShadow != aNewData.mWindowShadow) {
+    hint |= NS_STYLE_HINT_REFLOW;
+  }
+  if (mUserSelect != aNewData.mUserSelect) {
+    hint |= NS_STYLE_HINT_VISUAL;
+  }
+
+  if (mWindowDragging != aNewData.mWindowDragging) {
+    hint |= nsChangeHint_SchedulePaint;
+  }
+
+  if (mViewTransitionName.value != aNewData.mViewTransitionName.value) {
+    if (HasViewTransitionName() != aNewData.HasViewTransitionName()) {
+      hint |= nsChangeHint_RepaintFrame;
+    } else {
+      hint |= nsChangeHint_NeutralChange;
+    }
+  }
+
+  if (mViewTransitionClass.value != aNewData.mViewTransitionClass.value) {
+    hint |= nsChangeHint_NeutralChange;
+  }
+
+  if (mLinkParameters != aNewData.mLinkParameters) {
+    hint |= nsChangeHint_RepaintFrame;
+  }
+
+  if (!hint &&
+      (mTransitions != aNewData.mTransitions ||
+       mTransitionTimingFunctionCount !=
+           aNewData.mTransitionTimingFunctionCount ||
+       mTransitionDurationCount != aNewData.mTransitionDurationCount ||
+       mTransitionDelayCount != aNewData.mTransitionDelayCount ||
+       mTransitionPropertyCount != aNewData.mTransitionPropertyCount ||
+       mTransitionBehaviorCount != aNewData.mTransitionBehaviorCount ||
+       mAnimations != aNewData.mAnimations ||
+       mAnimationTimingFunctionCount !=
+           aNewData.mAnimationTimingFunctionCount ||
+       mAnimationDurationCount != aNewData.mAnimationDurationCount ||
+       mAnimationDelayCount != aNewData.mAnimationDelayCount ||
+       mAnimationNameCount != aNewData.mAnimationNameCount ||
+       mAnimationDirectionCount != aNewData.mAnimationDirectionCount ||
+       mAnimationFillModeCount != aNewData.mAnimationFillModeCount ||
+       mAnimationPlayStateCount != aNewData.mAnimationPlayStateCount ||
+       mAnimationIterationCountCount !=
+           aNewData.mAnimationIterationCountCount ||
+       mAnimationCompositionCount != aNewData.mAnimationCompositionCount ||
+       mAnimationTimelineCount != aNewData.mAnimationTimelineCount ||
+       mAnimationRangeStartCount != aNewData.mAnimationRangeStartCount ||
+       mAnimationRangeEndCount != aNewData.mAnimationRangeEndCount ||
+       mIMEMode != aNewData.mIMEMode ||
+       mWindowOpacity != aNewData.mWindowOpacity ||
+       mMozWindowInputRegionMargin != aNewData.mMozWindowInputRegionMargin ||
+       mMozWindowTransform != aNewData.mMozWindowTransform ||
+       mScrollTimelines != aNewData.mScrollTimelines ||
+       mScrollTimelineNameCount != aNewData.mScrollTimelineNameCount ||
+       mScrollTimelineAxisCount != aNewData.mScrollTimelineAxisCount ||
+       mViewTimelines != aNewData.mViewTimelines ||
+       mViewTimelineNameCount != aNewData.mViewTimelineNameCount ||
+       mViewTimelineAxisCount != aNewData.mViewTimelineAxisCount ||
+       mViewTimelineInsetCount != aNewData.mViewTimelineInsetCount ||
+       mTimelineScope != aNewData.mTimelineScope)) {
+    hint |= nsChangeHint_NeutralChange;
+  }
+
+  return hint;
+}
+
+
+nsStyleEffects::nsStyleEffects()
+    : mClip(StyleClipRectOrAuto::Auto()),
+      mOpacity(1.0f),
+      mMixBlendMode(StyleBlend::Normal) {
+  MOZ_COUNT_CTOR(nsStyleEffects);
+}
+
+nsStyleEffects::nsStyleEffects(const nsStyleEffects& aSource)
+    : mFilters(aSource.mFilters),
+      mBoxShadow(aSource.mBoxShadow),
+      mBackdropFilters(aSource.mBackdropFilters),
+      mClip(aSource.mClip),
+      mOpacity(aSource.mOpacity),
+      mMixBlendMode(aSource.mMixBlendMode) {
+  MOZ_COUNT_CTOR(nsStyleEffects);
+}
+
+static bool AnyAutonessChanged(const StyleClipRectOrAuto& aOld,
+                               const StyleClipRectOrAuto& aNew) {
+  if (aOld.IsAuto() != aNew.IsAuto()) {
+    return true;
+  }
+  if (aOld.IsAuto()) {
+    return false;
+  }
+  const auto& oldRect = aOld.AsRect();
+  const auto& newRect = aNew.AsRect();
+  return oldRect.top.IsAuto() != newRect.top.IsAuto() ||
+         oldRect.right.IsAuto() != newRect.right.IsAuto() ||
+         oldRect.bottom.IsAuto() != newRect.bottom.IsAuto() ||
+         oldRect.left.IsAuto() != newRect.left.IsAuto();
+}
+
+nsChangeHint nsStyleEffects::CalcDifference(
+    const nsStyleEffects& aNewData) const {
+  nsChangeHint hint = nsChangeHint(0);
+
+  if (mBoxShadow != aNewData.mBoxShadow) {
+    hint |= nsChangeHint_UpdateOverflow | nsChangeHint_SchedulePaint |
+            nsChangeHint_RepaintFrame;
+  }
+
+  if (AnyAutonessChanged(mClip, aNewData.mClip)) {
+    hint |= nsChangeHint_AllReflowHints | nsChangeHint_RepaintFrame;
+  } else if (mClip != aNewData.mClip) {
+    hint |= nsChangeHint_UpdateOverflow | nsChangeHint_SchedulePaint;
+  }
+
+  if (mOpacity != aNewData.mOpacity) {
+    hint |= nsChangeHint_UpdateOpacityLayer;
+
+    if ((mOpacity >= 0.99f && mOpacity < 1.0f && aNewData.mOpacity == 1.0f) ||
+        (aNewData.mOpacity >= 0.99f && aNewData.mOpacity < 1.0f &&
+         mOpacity == 1.0f)) {
+      hint |= nsChangeHint_RepaintFrame;
+    } else {
+      if ((mOpacity == 1.0f) != (aNewData.mOpacity == 1.0f)) {
+        hint |= nsChangeHint_UpdateUsesOpacity;
+      }
+    }
+  }
+
+  if (HasFilters() != aNewData.HasFilters()) {
+    hint |= nsChangeHint_UpdateContainingBlock;
+  }
+
+  if (mFilters != aNewData.mFilters) {
+    hint |= nsChangeHint_UpdateEffects | nsChangeHint_RepaintFrame |
+            nsChangeHint_UpdateOverflow;
+  }
+
+  if (mMixBlendMode != aNewData.mMixBlendMode) {
+    hint |= nsChangeHint_RepaintFrame;
+  }
+
+  if (HasBackdropFilters() != aNewData.HasBackdropFilters()) {
+    hint |= nsChangeHint_UpdateContainingBlock;
+  }
+
+  if (mBackdropFilters != aNewData.mBackdropFilters) {
+    hint |= nsChangeHint_UpdateEffects | nsChangeHint_RepaintFrame;
+  }
+
+  return hint;
+}
+
+static bool TransformOperationHasPercent(const StyleTransformOperation& aOp) {
+  switch (aOp.tag) {
+    case StyleTransformOperation::Tag::TranslateX:
+      return aOp.AsTranslateX().HasPercent();
+    case StyleTransformOperation::Tag::TranslateY:
+      return aOp.AsTranslateY().HasPercent();
+    case StyleTransformOperation::Tag::TranslateZ:
+      return false;
+    case StyleTransformOperation::Tag::Translate3D: {
+      const auto& translate = aOp.AsTranslate3D();
+      return translate._0.HasPercent() || translate._1.HasPercent();
+    }
+    case StyleTransformOperation::Tag::Translate: {
+      const auto& translate = aOp.AsTranslate();
+      return translate._0.HasPercent() || translate._1.HasPercent();
+    }
+    case StyleTransformOperation::Tag::AccumulateMatrix: {
+      const auto& accum = aOp.AsAccumulateMatrix();
+      return accum.from_list.HasPercent() || accum.to_list.HasPercent();
+    }
+    case StyleTransformOperation::Tag::InterpolateMatrix: {
+      const auto& interpolate = aOp.AsInterpolateMatrix();
+      return interpolate.from_list.HasPercent() ||
+             interpolate.to_list.HasPercent();
+    }
+    case StyleTransformOperation::Tag::Perspective:
+    case StyleTransformOperation::Tag::RotateX:
+    case StyleTransformOperation::Tag::RotateY:
+    case StyleTransformOperation::Tag::RotateZ:
+    case StyleTransformOperation::Tag::Rotate:
+    case StyleTransformOperation::Tag::Rotate3D:
+    case StyleTransformOperation::Tag::SkewX:
+    case StyleTransformOperation::Tag::SkewY:
+    case StyleTransformOperation::Tag::Skew:
+    case StyleTransformOperation::Tag::ScaleX:
+    case StyleTransformOperation::Tag::ScaleY:
+    case StyleTransformOperation::Tag::ScaleZ:
+    case StyleTransformOperation::Tag::Scale:
+    case StyleTransformOperation::Tag::Scale3D:
+    case StyleTransformOperation::Tag::Matrix:
+    case StyleTransformOperation::Tag::Matrix3D:
+      return false;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unknown transform operation");
+      return false;
+  }
+}
+
+template <>
+bool StyleTransform::HasPercent() const {
+  for (const auto& op : Operations()) {
+    if (TransformOperationHasPercent(op)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool nsStyleDisplay::PrecludesSizeContainmentOrContentVisibilityWithFrame(
+    const nsIFrame& aFrame) const {
+  if (aFrame.HasAnyStateBits(NS_FRAME_SVG_LAYOUT)) {
+    return true;
+  }
+
+  bool isNonReplacedInline = aFrame.IsLineParticipant() && !aFrame.IsReplaced();
+  return isNonReplacedInline || IsInternalRubyDisplayType() ||
+         DisplayInside() == mozilla::StyleDisplayInside::Table ||
+         IsInnerTableStyle();
+}
+
+ContainSizeAxes nsStyleDisplay::GetContainSizeAxes(
+    const nsIFrame& aFrame) const {
+  if (MOZ_LIKELY(!mEffectiveContainment)) {
+    return ContainSizeAxes(false, false);
+  }
+
+  if (PrecludesSizeContainmentOrContentVisibilityWithFrame(aFrame)) {
+    return ContainSizeAxes(false, false);
+  }
+
+  if (MOZ_LIKELY(!(mEffectiveContainment & StyleContain::SIZE)) &&
+      MOZ_UNLIKELY(aFrame.HidesContent())) {
+    return ContainSizeAxes(true, true);
+  }
+
+  return ContainSizeAxes(
+      static_cast<bool>(mEffectiveContainment & StyleContain::INLINE_SIZE),
+      static_cast<bool>(mEffectiveContainment & StyleContain::BLOCK_SIZE));
+}
+
+StyleContentVisibility nsStyleDisplay::ContentVisibility(
+    const nsIFrame& aFrame) const {
+  if (MOZ_LIKELY(mContentVisibility == StyleContentVisibility::Visible)) {
+    return StyleContentVisibility::Visible;
+  }
+  if (PrecludesSizeContainmentOrContentVisibilityWithFrame(aFrame)) {
+    return StyleContentVisibility::Visible;
+  }
+  if (mContentVisibility == StyleContentVisibility::Auto &&
+      (aFrame.PresContext()->IsPrintingOrPrintPreview() ||
+       aFrame.PresContext()->Document()->IsBeingUsedAsImage())) {
+    return StyleContentVisibility::Visible;
+  }
+  return mContentVisibility;
+}
+
+static nscoord Resolve(const StyleContainIntrinsicSize& aSize,
+                       nscoord aNoneValue, const nsIFrame& aFrame,
+                       LogicalAxis aAxis) {
+  if (aSize.IsNone()) {
+    return aNoneValue;
+  }
+  if (aSize.IsLength()) {
+    return aSize.AsLength().ToAppUnits();
+  }
+  MOZ_ASSERT(aSize.HasAuto());
+  if (const auto* element = Element::FromNodeOrNull(aFrame.GetContent())) {
+    Maybe<float> lastSize = aAxis == LogicalAxis::Block
+                                ? element->GetLastRememberedBSize()
+                                : element->GetLastRememberedISize();
+    if (lastSize && aFrame.HidesContent()) {
+      return CSSPixel::ToAppUnits(*lastSize);
+    }
+  }
+  if (aSize.IsAutoNone()) {
+    return aNoneValue;
+  }
+  return aSize.AsAutoLength().ToAppUnits();
+}
+
+Maybe<nscoord> ContainSizeAxes::ContainIntrinsicBSize(
+    const nsIFrame& aFrame, nscoord aNoneValue) const {
+  if (!mBContained) {
+    return Nothing();
+  }
+  const StyleContainIntrinsicSize& bSize =
+      aFrame.StylePosition()->ContainIntrinsicBSize(aFrame.GetWritingMode());
+  return Some(Resolve(bSize, aNoneValue, aFrame, LogicalAxis::Block));
+}
+
+Maybe<nscoord> ContainSizeAxes::ContainIntrinsicISize(
+    const nsIFrame& aFrame, nscoord aNoneValue) const {
+  if (!mIContained) {
+    return Nothing();
+  }
+  const StyleContainIntrinsicSize& iSize =
+      aFrame.StylePosition()->ContainIntrinsicISize(aFrame.GetWritingMode());
+  return Some(Resolve(iSize, aNoneValue, aFrame, LogicalAxis::Inline));
+}
+
+nsSize ContainSizeAxes::ContainSize(const nsSize& aUncontainedSize,
+                                    const nsIFrame& aFrame) const {
+  if (!IsAny()) {
+    return aUncontainedSize;
+  }
+  if (aFrame.GetWritingMode().IsVertical()) {
+    return nsSize(
+        ContainIntrinsicBSize(aFrame).valueOr(aUncontainedSize.Width()),
+        ContainIntrinsicISize(aFrame).valueOr(aUncontainedSize.Height()));
+  }
+  return nsSize(
+      ContainIntrinsicISize(aFrame).valueOr(aUncontainedSize.Width()),
+      ContainIntrinsicBSize(aFrame).valueOr(aUncontainedSize.Height()));
+}
+
+IntrinsicSize ContainSizeAxes::ContainIntrinsicSize(
+    const IntrinsicSize& aUncontainedSize, const nsIFrame& aFrame) const {
+  if (!IsAny()) {
+    return aUncontainedSize;
+  }
+  IntrinsicSize result(aUncontainedSize);
+  const auto wm = aFrame.GetWritingMode();
+  if (Maybe<nscoord> containBSize = ContainIntrinsicBSize(aFrame)) {
+    result.BSize(wm) = std::move(containBSize);
+  }
+  if (Maybe<nscoord> containISize = ContainIntrinsicISize(aFrame)) {
+    result.ISize(wm) = std::move(containISize);
+  }
+  return result;
+}

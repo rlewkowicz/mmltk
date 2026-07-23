@@ -1,0 +1,93 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_SmoothScrollAnimation_h_
+#define mozilla_layers_SmoothScrollAnimation_h_
+
+#include "AsyncPanZoomAnimation.h"
+#include "InputData.h"
+#include "ScrollPositionUpdate.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/RelativeTo.h"
+#include "mozilla/ScrollOrigin.h"
+#include "mozilla/layers/APZPublicUtils.h"
+#include "mozilla/layers/KeyboardScrollAction.h"
+
+namespace mozilla {
+
+class ScrollAnimationPhysics;
+
+namespace layers {
+
+class AsyncPanZoomController;
+
+class SmoothScrollAnimation : public AsyncPanZoomAnimation {
+ public:
+  using ScrollAnimationKind = apz::ScrollAnimationKind;
+
+  static already_AddRefed<SmoothScrollAnimation> Create(
+      AsyncPanZoomController& aApzc, ScrollAnimationKind aKind,
+      ViewportType aViewportToScroll, ScrollOrigin aOrigin);
+  static already_AddRefed<SmoothScrollAnimation> CreateForKeyboard(
+      AsyncPanZoomController& aApzc, ScrollOrigin aOrigin);
+  static already_AddRefed<SmoothScrollAnimation> CreateForWheel(
+      AsyncPanZoomController& aApzc,
+      ScrollWheelInput::ScrollDeltaType aDeltaType);
+
+  void UpdateDestinationAndSnapTargets(
+      TimeStamp aTime, const nsPoint& aDestination,
+      const nsSize& aCurrentVelocity, ScrollSnapTargetIds&& aSnapTargetIds,
+      ScrollTriggeredByScript aTriggeredByScript);
+
+  SmoothScrollAnimation* AsSmoothScrollAnimation() override;
+  bool WasTriggeredByScript() const override {
+    return mTriggeredByScript == ScrollTriggeredByScript::Yes;
+  }
+  ScrollAnimationKind Kind() const { return mKind; }
+  ViewportType ViewportToScroll() const { return mViewportToScroll; }
+  ScrollSnapTargetIds TakeSnapTargetIds() { return std::move(mSnapTargetIds); }
+  ScrollOrigin GetScrollOrigin() const;
+  static ScrollOrigin GetScrollOriginForAction(
+      KeyboardScrollAction::KeyboardScrollActionType aAction);
+
+  bool DoSample(FrameMetrics& aFrameMetrics,
+                const TimeDuration& aDelta) override;
+
+  bool HandleScrollOffsetUpdate(const Maybe<CSSPoint>& aRelativeDelta) override;
+
+  void UpdateDelta(TimeStamp aTime, const nsPoint& aDelta,
+                   const nsSize& aCurrentVelocity);
+  void UpdateDestination(TimeStamp aTime, const nsPoint& aDestination,
+                         const nsSize& aCurrentVelocity);
+
+  CSSPoint GetDestination() const {
+    return CSSPoint::FromAppUnits(mFinalDestination);
+  }
+
+  bool CanExtend(ViewportType aViewportToScroll, ScrollOrigin aOrigin) const;
+
+ private:
+  SmoothScrollAnimation(ScrollAnimationKind aKind,
+                        AsyncPanZoomController& aApzc,
+                        ViewportType aViewportToScroll, ScrollOrigin aOrigin);
+
+  void Update(TimeStamp aTime, const nsSize& aCurrentVelocity);
+  CSSPoint GetViewportOffset(const FrameMetrics& aMetrics) const;
+
+  ScrollAnimationKind mKind;
+  ViewportType mViewportToScroll;
+  AsyncPanZoomController& mApzc;
+  UniquePtr<ScrollAnimationPhysics> mAnimationPhysics;
+  nsPoint mFinalDestination;
+  Maybe<ScrollDirection> mDirectionForcedToOverscroll;
+  ScrollOrigin mOrigin;
+
+  ScrollSnapTargetIds mSnapTargetIds;
+  ScrollTriggeredByScript mTriggeredByScript;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_SmoothScrollAnimation_h_

@@ -1,0 +1,211 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_WritableStream_h
+#define mozilla_dom_WritableStream_h
+
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/QueuingStrategyBinding.h"
+#include "mozilla/dom/WritableStreamDefaultController.h"
+#include "mozilla/dom/WritableStreamDefaultWriter.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla::dom {
+
+class Promise;
+class WritableStreamDefaultController;
+class WritableStreamDefaultWriter;
+class UnderlyingSinkAlgorithmsBase;
+class UniqueMessagePortId;
+class MessagePort;
+
+class WritableStream : public nsISupports, public nsWrapperCache {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(WritableStream)
+
+  friend class ReadableStream;
+
+ protected:
+  virtual ~WritableStream();
+
+  virtual void LastRelease() {}
+
+  enum class HoldDropJSObjectsCaller { Implicit, Explicit };
+
+  explicit WritableStream(const GlobalObject& aGlobal,
+                          HoldDropJSObjectsCaller aHoldDropCaller);
+  explicit WritableStream(nsIGlobalObject* aGlobal,
+                          HoldDropJSObjectsCaller aHoldDropCaller);
+
+ public:
+  bool Backpressure() const { return mBackpressure; }
+  void SetBackpressure(bool aBackpressure) { mBackpressure = aBackpressure; }
+
+  Promise* GetCloseRequest() { return mCloseRequest; }
+  void SetCloseRequest(Promise* aRequest) { mCloseRequest = aRequest; }
+
+  MOZ_KNOWN_LIVE WritableStreamDefaultController* Controller() {
+    return mController;
+  }
+  void SetController(WritableStreamDefaultController& aController) {
+    MOZ_ASSERT(!mController);
+    mController = &aController;
+  }
+
+  Promise* GetInFlightWriteRequest() const { return mInFlightWriteRequest; }
+
+  Promise* GetPendingAbortRequestPromise() const {
+    return mPendingAbortRequestPromise;
+  }
+
+  void SetPendingAbortRequest(Promise* aPromise, JS::Handle<JS::Value> aReason,
+                              bool aWasAlreadyErroring) {
+    mPendingAbortRequestPromise = aPromise;
+    mPendingAbortRequestReason = aReason;
+    mPendingAbortRequestWasAlreadyErroring = aWasAlreadyErroring;
+  }
+
+  WritableStreamDefaultWriter* GetWriter() const { return mWriter; }
+  void SetWriter(WritableStreamDefaultWriter* aWriter) { mWriter = aWriter; }
+
+  enum class WriterState { Writable, Closed, Erroring, Errored };
+
+  WriterState State() const { return mState; }
+  void SetState(const WriterState& aState) { mState = aState; }
+
+  void GetStoredError(JSContext* aCx, JS::MutableHandle<JS::Value> aStoredError,
+                      ErrorResult& aRv) const;
+  JS::Value UnsafeStoredError() const { return mStoredError; }
+  void SetStoredError(JS::Handle<JS::Value> aStoredError) {
+    mStoredError = aStoredError;
+  }
+
+  void AppendWriteRequest(RefPtr<Promise>& aRequest) {
+    mWriteRequests.Push(RefPtr<Promise>(aRequest));
+  }
+
+  MOZ_CAN_RUN_SCRIPT static already_AddRefed<WritableStream> CreateAbstract(
+      JSContext* aCx, nsIGlobalObject* aGlobal,
+      UnderlyingSinkAlgorithmsBase* aAlgorithms, double aHighWaterMark,
+      QueuingStrategySize* aSizeAlgorithm, ErrorResult& aRv);
+
+  bool CloseQueuedOrInFlight() const {
+    return mCloseRequest || mInFlightCloseRequest;
+  }
+
+  MOZ_CAN_RUN_SCRIPT void DealWithRejection(JSContext* aCx,
+                                            JS::Handle<JS::Value> aError,
+                                            ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void FinishErroring(JSContext* aCx, ErrorResult& aRv);
+
+  void FinishInFlightClose();
+
+  MOZ_CAN_RUN_SCRIPT void FinishInFlightCloseWithError(
+      JSContext* aCx, JS::Handle<JS::Value> aError, ErrorResult& aRv);
+
+  void FinishInFlightWrite();
+
+  MOZ_CAN_RUN_SCRIPT void FinishInFlightWriteWithError(
+      JSContext* aCX, JS::Handle<JS::Value> aError, ErrorResult& aR);
+
+  bool HasOperationMarkedInFlight() const {
+    return mInFlightWriteRequest || mInFlightCloseRequest;
+  }
+
+  void MarkCloseRequestInFlight();
+
+  void MarkFirstWriteRequestInFlight();
+
+  void RejectCloseAndClosedPromiseIfNeeded();
+
+  MOZ_CAN_RUN_SCRIPT void StartErroring(JSContext* aCx,
+                                        JS::Handle<JS::Value> aReason,
+                                        ErrorResult& aRv);
+
+  void UpdateBackpressure(bool aBackpressure);
+
+  MOZ_CAN_RUN_SCRIPT bool Transfer(JSContext* aCx,
+                                   UniqueMessagePortId& aPortId);
+  MOZ_CAN_RUN_SCRIPT static already_AddRefed<WritableStream>
+  ReceiveTransferImpl(JSContext* aCx, nsIGlobalObject* aGlobal,
+                      MessagePort& aPort);
+  MOZ_CAN_RUN_SCRIPT static bool ReceiveTransfer(
+      JSContext* aCx, nsIGlobalObject* aGlobal, MessagePort& aPort,
+      JS::MutableHandle<JSObject*> aReturnObject);
+
+
+ protected:
+  void SetUpNative(JSContext* aCx, UnderlyingSinkAlgorithmsWrapper& aAlgorithms,
+                   Maybe<double> aHighWaterMark,
+                   QueuingStrategySize* aSizeAlgorithm, ErrorResult& aRv);
+
+ public:
+  static already_AddRefed<WritableStream> CreateNative(
+      JSContext* aCx, nsIGlobalObject& aGlobal,
+      UnderlyingSinkAlgorithmsWrapper& aAlgorithms,
+      Maybe<double> aHighWaterMark, QueuingStrategySize* aSizeAlgorithm,
+      ErrorResult& aRv);
+
+
+  MOZ_CAN_RUN_SCRIPT void ErrorNative(JSContext* aCx,
+                                      JS::Handle<JS::Value> aError,
+                                      ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<Promise> AbortNative(
+      JSContext* aCx, JS::Handle<JS::Value> aReason, ErrorResult& aRv);
+
+
+  nsIGlobalObject* GetParentObject() const { return mGlobal; }
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY static already_AddRefed<WritableStream>
+  Constructor(const GlobalObject& aGlobal,
+              const Optional<JS::Handle<JSObject*>>& aUnderlyingSink,
+              const QueuingStrategy& aStrategy, ErrorResult& aRv);
+
+  bool Locked() const { return !!mWriter; }
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<Promise> Abort(
+      JSContext* cx, JS::Handle<JS::Value> aReason, ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<Promise> Close(JSContext* aCx,
+                                                     ErrorResult& aRv);
+
+  already_AddRefed<WritableStreamDefaultWriter> GetWriter(ErrorResult& aRv);
+
+ protected:
+  nsCOMPtr<nsIGlobalObject> mGlobal;
+
+ private:
+  bool mBackpressure = false;
+  RefPtr<Promise> mCloseRequest;
+  RefPtr<WritableStreamDefaultController> mController;
+  RefPtr<Promise> mInFlightWriteRequest;
+  RefPtr<Promise> mInFlightCloseRequest;
+
+  RefPtr<Promise> mPendingAbortRequestPromise;
+  JS::Heap<JS::Value> mPendingAbortRequestReason;
+  bool mPendingAbortRequestWasAlreadyErroring = false;
+
+  WriterState mState = WriterState::Writable;
+  JS::Heap<JS::Value> mStoredError;
+  RefPtr<WritableStreamDefaultWriter> mWriter;
+  mozilla::Queue<RefPtr<Promise>> mWriteRequests;
+
+  HoldDropJSObjectsCaller mHoldDropCaller;
+};
+
+}  
+
+#endif  // mozilla_dom_WritableStream_h

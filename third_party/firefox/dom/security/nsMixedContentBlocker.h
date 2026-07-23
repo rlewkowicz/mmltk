@@ -1,0 +1,62 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsMixedContentBlocker_h_
+#define nsMixedContentBlocker_h_
+
+#define NS_MIXEDCONTENTBLOCKER_CONTRACTID "@mozilla.org/mixedcontentblocker;1"
+#define NS_MIXEDCONTENTBLOCKER_CID \
+  {0xdaf1461b, 0xbf29, 0x4f88, {0x8d, 0x0e, 0x4b, 0xcd, 0xf3, 0x32, 0xc8, 0x62}}
+
+enum MixedContentTypes {
+  eMixedScript,
+  eMixedDisplay
+};
+
+#include "imgRequest.h"
+#include "nsIChannel.h"
+#include "nsIChannelEventSink.h"
+#include "nsIContentPolicy.h"
+
+using mozilla::OriginAttributes;
+
+class nsILoadInfo;  
+namespace mozilla::net {
+class nsProtocolProxyService;  
+}  
+
+class nsMixedContentBlocker : public nsIContentPolicy,
+                              public nsIChannelEventSink {
+ private:
+  virtual ~nsMixedContentBlocker();
+
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSICONTENTPOLICY
+  NS_DECL_NSICHANNELEVENTSINK
+
+  nsMixedContentBlocker() = default;
+
+  static bool IsPotentiallyTrustworthyLoopbackHost(
+      const nsACString& aAsciiHost);
+  static bool IsPotentiallyTrustworthyLoopbackURL(nsIURI* aURL);
+  static bool IsPotentiallyTrustworthyOnion(nsIURI* aURL);
+  static bool IsPotentiallyTrustworthyOrigin(nsIURI* aURI);
+
+  static bool IsUpgradableContentType(nsContentPolicyType aType);
+
+  static nsresult ShouldLoad(bool aHadInsecureImageRedirect,
+                             nsIURI* aContentLocation, nsILoadInfo* aLoadInfo,
+                             bool aReportError, int16_t* aDecision);
+  static bool URISafeToBeLoadedInSecureContext(nsIURI* aURI);
+
+  static void OnPrefChange(const char* aPref, void* aClosure);
+  static void GetSecureContextAllowList(nsACString& aList);
+  static void Shutdown();
+
+  static bool sSecurecontextAllowlistCached;
+  static nsCString* sSecurecontextAllowlist;
+};
+
+#endif /* nsMixedContentBlocker_h_ */

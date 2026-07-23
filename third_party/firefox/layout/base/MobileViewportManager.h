@@ -1,0 +1,156 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MobileViewportManager_h_
+#define MobileViewportManager_h_
+
+#include "UnitTransforms.h"
+#include "Units.h"
+#include "mozilla/Logging.h"
+#include "mozilla/MVMContext.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/PresShellForwards.h"
+#include "nsCOMPtr.h"
+#include "nsIDOMEventListener.h"
+#include "nsIObserver.h"
+
+class nsViewportInfo;
+
+namespace mozilla {
+class MVMContext;
+namespace dom {
+class Document;
+class EventTarget;
+}  
+}  
+
+class MobileViewportManager final : public nsIDOMEventListener,
+                                    public nsIObserver {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIDOMEVENTLISTENER
+  NS_DECL_NSIOBSERVER
+
+  enum class ManagerType { VisualAndMetaViewport, VisualViewportOnly };
+
+  explicit MobileViewportManager(mozilla::MVMContext* aContext,
+                                 ManagerType aType);
+  void Destroy();
+
+  ManagerType GetManagerType() { return mManagerType; }
+
+  void SetRestoreResolution(float aResolution,
+                            mozilla::LayoutDeviceIntSize aDisplaySize);
+
+  float ComputeIntrinsicResolution() const;
+
+  mozilla::CSSToScreenScale GetIntrinsicScaleForFixedViewport() const;
+
+  void HandleDOMMetaAdded();
+
+ private:
+  void SetRestoreResolution(float aResolution);
+
+ public:
+  void UpdateSizesBeforeReflow();
+
+  void RequestReflow(bool aForceAdjustResolution);
+
+  void ResolutionUpdated(mozilla::ResolutionChangeOrigin aOrigin);
+
+  void SetInitialViewport();
+
+  mozilla::LayoutDeviceIntSize DisplaySize() const {
+    return mozilla::ViewAs<mozilla::LayoutDevicePixel>(
+        GetLayoutDisplaySize(),
+        mozilla::PixelCastJustification::LayoutDeviceIsScreenForBounds);
+  };
+  void ShrinkToDisplaySizeIfNeeded();
+
+  void UpdateVisualViewportSizeByDynamicToolbar(
+      mozilla::ScreenIntCoord aToolbarHeight);
+
+  nsSize GetVisualViewportSizeUpdatedByDynamicToolbar() const {
+    return mVisualViewportSizeUpdatedByDynamicToolbar;
+  }
+
+  void UpdateVisualViewportSizeForPotentialScrollbarChange();
+
+  mozilla::CSSSize GetIntrinsicCompositionSize() const;
+
+  mozilla::ParentLayerSize GetCompositionSizeWithoutDynamicToolbar() const;
+
+  void UpdateKeyboardHeight(mozilla::ScreenIntCoord aKeyboardHeight);
+
+  static mozilla::LazyLogModule gLog;
+
+  mozilla::CSSToScreenScale GetZoom() const;
+
+  void RefreshViewportSize(bool aForceAdjustResolution);
+
+  nsRect InitialVisibleArea();
+
+  mozilla::ScreenIntCoord GetKeyboardHeight() const { return mKeyboardHeight; }
+
+ private:
+  ~MobileViewportManager();
+
+  void RefreshVisualViewportSize();
+
+  mozilla::CSSToScreenScale ClampZoom(
+      const mozilla::CSSToScreenScale& aZoom,
+      const nsViewportInfo& aViewportInfo) const;
+
+  mozilla::CSSToScreenScale ScaleZoomWithDisplayWidth(
+      const mozilla::CSSToScreenScale& aZoom,
+      const float& aDisplayWidthChangeRatio,
+      const mozilla::CSSSize& aNewViewport,
+      const mozilla::CSSSize& aOldViewport);
+
+  mozilla::CSSToScreenScale ResolutionToZoom(
+      const mozilla::LayoutDeviceToLayerScale& aResolution) const;
+  mozilla::LayoutDeviceToLayerScale ZoomToResolution(
+      const mozilla::CSSToScreenScale& aZoom) const;
+
+  void UpdateResolutionForFirstPaint(const mozilla::CSSSize& aViewportSize);
+  void UpdateResolutionForViewportSizeChange(
+      const mozilla::CSSSize& aViewportSize,
+      const mozilla::Maybe<float>& aDisplayWidthChangeRatio);
+  void UpdateResolutionForContentSizeChange(
+      const mozilla::CSSSize& aContentSize);
+
+  void ApplyNewZoom(const mozilla::CSSToScreenScale& aNewZoom);
+
+  void UpdateVisualViewportSize(const mozilla::CSSToScreenScale& aZoom);
+
+  void UpdateDisplayPortMargins();
+
+  mozilla::CSSToScreenScale ComputeIntrinsicScale(
+      const nsViewportInfo& aViewportInfo,
+      const mozilla::ScreenIntSize& aDisplaySize,
+      const mozilla::CSSSize& aViewportOrContentSize) const;
+
+  mozilla::ScreenIntSize GetCompositionSize(
+      const mozilla::ScreenIntSize& aDisplaySize) const;
+
+  mozilla::ScreenIntSize GetLayoutDisplaySize() const;
+
+  mozilla::ScreenIntSize GetDisplaySizeForVisualViewport() const;
+
+  RefPtr<mozilla::MVMContext> mContext;
+  ManagerType mManagerType;
+  bool mIsFirstPaint;
+  bool mPainted;
+  bool mInvalidViewport;
+  mozilla::LayoutDeviceIntSize mDisplaySize;
+  mozilla::CSSSize mMobileViewportSize;
+  mozilla::Maybe<float> mRestoreResolution;
+  mozilla::Maybe<mozilla::ScreenIntSize> mRestoreDisplaySize;
+  nsSize mVisualViewportSizeUpdatedByDynamicToolbar;
+
+  mozilla::ScreenIntCoord mKeyboardHeight;
+  mozilla::Maybe<mozilla::ScreenIntCoord> mPendingKeyboardHeight;
+};
+
+#endif

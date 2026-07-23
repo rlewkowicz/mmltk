@@ -1,0 +1,124 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef GFX_FONT_PROPERTY_TYPES_H
+#define GFX_FONT_PROPERTY_TYPES_H
+
+#include <algorithm>
+#include <cstdint>
+#include <utility>
+
+#include "mozilla/Assertions.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "nsString.h"
+
+
+namespace mozilla {
+
+using FontSlantStyle = StyleFontStyle;
+using FontWeight = StyleFontWeight;
+using FontStretch = StyleFontStretch;
+
+template <class T, class Derived>
+class FontPropertyRange {
+  static_assert(sizeof(T) == 2, "FontPropertyValue should be a 16-bit type!");
+
+ public:
+  FontPropertyRange(T aMin, T aMax) : mValues(aMin, aMax) {
+    MOZ_ASSERT(aMin <= aMax);
+  }
+
+  explicit FontPropertyRange(T aValue) : mValues(aValue, aValue) {}
+
+  explicit FontPropertyRange(const FontPropertyRange& aOther) = default;
+  FontPropertyRange& operator=(const FontPropertyRange& aOther) = default;
+
+  T Min() const { return mValues.first; }
+  T Max() const { return mValues.second; }
+
+  T Clamp(T aValue) const { return std::clamp(aValue, Min(), Max()); }
+
+  bool IsSingle() const { return Min() == Max(); }
+
+  bool operator==(const FontPropertyRange& aOther) const {
+    return mValues == aOther.mValues;
+  }
+  bool operator!=(const FontPropertyRange& aOther) const {
+    return mValues != aOther.mValues;
+  }
+
+  using ScalarType = uint32_t;
+
+  ScalarType AsScalar() const {
+    return (mValues.first.UnsignedRaw() << 16) | mValues.second.UnsignedRaw();
+  }
+
+  static Derived FromScalar(ScalarType aScalar) {
+    static_assert(std::is_base_of_v<FontPropertyRange, Derived>);
+    return Derived(T::FromRaw(aScalar >> 16), T::FromRaw(aScalar & 0xffff));
+  }
+
+ protected:
+  std::pair<T, T> mValues;
+};
+
+class WeightRange : public FontPropertyRange<FontWeight, WeightRange> {
+ public:
+  WeightRange(FontWeight aMin, FontWeight aMax)
+      : FontPropertyRange(aMin, aMax) {}
+
+  explicit WeightRange(FontWeight aWeight) : FontPropertyRange(aWeight) {}
+
+  WeightRange(const WeightRange& aOther) = default;
+
+  void ToString(nsACString& aOutString, const char* aDelim = "..") const {
+    aOutString.AppendFloat(Min().ToFloat());
+    if (!IsSingle()) {
+      aOutString.Append(aDelim);
+      aOutString.AppendFloat(Max().ToFloat());
+    }
+  }
+};
+
+class StretchRange : public FontPropertyRange<FontStretch, StretchRange> {
+ public:
+  StretchRange(FontStretch aMin, FontStretch aMax)
+      : FontPropertyRange(aMin, aMax) {}
+
+  explicit StretchRange(FontStretch aStretch) : FontPropertyRange(aStretch) {}
+
+  StretchRange(const StretchRange& aOther) = default;
+
+  void ToString(nsACString& aOutString, const char* aDelim = "..") const {
+    aOutString.AppendFloat(Min().ToFloat());
+    if (!IsSingle()) {
+      aOutString.Append(aDelim);
+      aOutString.AppendFloat(Max().ToFloat());
+    }
+  }
+};
+
+class SlantStyleRange
+    : public FontPropertyRange<FontSlantStyle, SlantStyleRange> {
+ public:
+  SlantStyleRange(FontSlantStyle aMin, FontSlantStyle aMax)
+      : FontPropertyRange(aMin, aMax) {}
+
+  explicit SlantStyleRange(FontSlantStyle aStyle) : FontPropertyRange(aStyle) {}
+
+  SlantStyleRange(const SlantStyleRange& aOther) = default;
+
+  void ToString(nsACString& aOutString, const char* aDelim = "..") const {
+    Min().ToString(aOutString);
+    if (!IsSingle()) {
+      aOutString.Append(aDelim);
+      Max().ToString(aOutString);
+    }
+  }
+};
+
+}  
+
+#endif  // GFX_FONT_PROPERTY_TYPES_H

@@ -1,0 +1,222 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "LNAPermissionRequest.h"
+#include "mozilla/dom/ClientInfo.h"
+#include "nsGlobalWindowInner.h"
+#include "mozilla/dom/Document.h"
+#include "nsPIDOMWindow.h"
+#include "mozilla/Preferences.h"
+#include "nsContentUtils.h"
+
+#include "mozilla/dom/WindowGlobalParent.h"
+#include "nsIIOService.h"
+#include "nsIOService.h"
+#include "mozilla/dom/CanonicalBrowsingContext.h"
+#include "mozilla/dom/FeaturePolicy.h"
+#include "mozilla/Components.h"
+#include "nsIConsoleService.h"
+#include "nsIPermissionManager.h"
+#include "xpcpublic.h"
+
+namespace mozilla::net {
+
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED_0(LNAPermissionRequest,
+                                               ContentPermissionRequestBase)
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(LNAPermissionRequest,
+                                   ContentPermissionRequestBase,
+                                   mBrowsingContext)
+
+LNAPermissionRequest::LNAPermissionRequest(PermissionPromptCallback&& aCallback,
+                                           nsILoadInfo* aLoadInfo,
+                                           const nsACString& aType)
+    : dom::ContentPermissionRequestBase(
+          aLoadInfo->GetLoadingPrincipal(), nullptr,
+          (aType.Equals(LOOPBACK_NETWORK_PERMISSION_KEY)
+               ? "network.loopback-network"_ns
+               : "network.localnetwork"_ns),
+          aType),
+      mPermissionPromptCallback(std::move(aCallback)) {
+  MOZ_ASSERT(aLoadInfo);
+
+  aLoadInfo->GetTriggeringPrincipal(getter_AddRefs(mPrincipal));
+
+  aLoadInfo->GetBrowsingContext(getter_AddRefs(mBrowsingContext));
+  if (!mBrowsingContext) {
+    Maybe<dom::ClientInfo> clientInfo = aLoadInfo->GetClientInfo();
+    if (clientInfo.isSome() && clientInfo->Type() != dom::ClientType::Window) {
+      aLoadInfo->GetAssociatedBrowsingContext(getter_AddRefs(mBrowsingContext));
+    }
+  }
+  if (mBrowsingContext && mBrowsingContext->Top()) {
+    if (mBrowsingContext->Top()->Canonical()) {
+      RefPtr<mozilla::dom::WindowGlobalParent> topWindowGlobal =
+          mBrowsingContext->Top()->Canonical()->GetCurrentWindowGlobal();
+      if (topWindowGlobal) {
+        mTopLevelPrincipal = topWindowGlobal->DocumentPrincipal();
+      }
+    }
+  }
+
+  if (!mTopLevelPrincipal && false) {
+    mTopLevelPrincipal = mPrincipal;
+  }
+
+  mLoadInfo = aLoadInfo;
+
+  MOZ_ASSERT(mPrincipal);
+}
+
+NS_IMETHODIMP
+LNAPermissionRequest::GetElement(mozilla::dom::Element** aElement) {
+  NS_ENSURE_ARG_POINTER(aElement);
+  if (!mBrowsingContext) {
+    return NS_ERROR_FAILURE;
+  }
+
+  return mBrowsingContext->GetTopFrameElement(aElement);
+}
+
+NS_IMETHODIMP
+LNAPermissionRequest::Cancel() {
+  mPermissionPromptCallback(false, mType, mPromptWasShown);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LNAPermissionRequest::Allow(JS::Handle<JS::Value> aChoices) {
+  mPermissionPromptCallback(true, mType, mPromptWasShown);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LNAPermissionRequest::NotifyShown() {
+  mPromptWasShown = true;
+
+  if (!mPrincipal || !mTopLevelPrincipal) {
+    return NS_OK;
+  }
+
+  bool isCrossOrigin = !mPrincipal->Equals(mTopLevelPrincipal);
+  if (mType.Equals(LOOPBACK_NETWORK_PERMISSION_KEY)) {
+    if (isCrossOrigin) {
+
+    } else {
+
+    }
+  } else if (mType.Equals(LOCAL_NETWORK_PERMISSION_KEY)) {
+    if (isCrossOrigin) {
+
+    } else {
+
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult LNAPermissionRequest::RequestPermission() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!mLoadInfo) {
+    NS_WARNING("LNA permission request without load info");
+    return Cancel();
+  }
+
+  RefPtr<dom::CanonicalBrowsingContext> bc;
+  if (mBrowsingContext) {
+    bc = mBrowsingContext->Canonical();
+  }
+
+  if (!bc) {
+    if (!false) {
+      NS_WARNING("local network access without browsing context");
+      return Cancel();
+    }
+  } else {
+    Maybe<dom::FeaturePolicyInfo> fpInfo = bc->GetContainerFeaturePolicy();
+    if (fpInfo.isSome()) {
+      nsAutoString featureName;
+      if (mType.Equals(LOOPBACK_NETWORK_PERMISSION_KEY)) {
+        featureName = u"loopback-network"_ns;
+      } else {
+        featureName = u"local-network"_ns;
+      }
+
+      if (fpInfo->mInheritedDeniedFeatureNames.Contains(featureName)) {
+        NS_WARNING("Feature policy denying the request");
+        return Cancel();
+      }
+    }
+  }
+
+  if (mPrincipal && gIOService) {
+    nsAutoCString origin;
+    nsresult rv = mPrincipal->GetAsciiHost(origin);
+    if (NS_SUCCEEDED(rv) && !origin.IsEmpty()) {
+      if (gIOService->ShouldSkipDomainForLNA(origin)) {
+        return Allow(JS::UndefinedHandleValue);
+      }
+    }
+  }
+
+  PromptResult pr = CheckPromptPrefs();
+  if (pr == PromptResult::Granted) {
+    return Allow(JS::UndefinedHandleValue);
+  }
+
+  if (pr == PromptResult::Denied) {
+    return Cancel();
+  }
+
+  Maybe<dom::ClientInfo> clientInfo = mLoadInfo->GetClientInfo();
+  if (clientInfo.isSome() &&
+      (clientInfo->Type() == dom::ClientType::Sharedworker ||
+       clientInfo->Type() == dom::ClientType::Serviceworker)) {
+    nsCOMPtr<nsIPermissionManager> permMgr =
+        mozilla::components::PermissionManager::Service();
+    if (!permMgr || !mPrincipal) {
+      NS_WARNING(
+          "LNA worker permission check failed: no permission manager or "
+          "principal");
+      return Cancel();
+    }
+    uint32_t permission = nsIPermissionManager::UNKNOWN_ACTION;
+    nsresult rv =
+        permMgr->TestPermissionFromPrincipal(mPrincipal, mType, &permission);
+    if (NS_SUCCEEDED(rv) && permission == nsIPermissionManager::ALLOW_ACTION) {
+      return Allow(JS::UndefinedHandleValue);
+    }
+    nsCOMPtr<nsIConsoleService> console =
+        do_GetService(NS_CONSOLESERVICE_CONTRACTID);
+    if (console && mPrincipal) {
+      nsAutoCString origin;
+      mPrincipal->GetOrigin(origin);
+      nsAutoString msg;
+      msg.AppendLiteral("Local Network Access blocked: worker from origin ");
+      msg.Append(NS_ConvertUTF8toUTF16(origin));
+      msg.AppendLiteral(" attempted ");
+      msg.Append(NS_ConvertUTF8toUTF16(mType));
+      msg.AppendLiteral(" access but no persistent permission was granted.");
+      console->LogStringMessage(msg.get());
+    }
+    return Cancel();
+  }
+
+  if (!mTopLevelPrincipal) {
+    NS_WARNING("Cannot show permission prompt without top-level principal");
+    return Cancel();
+  }
+
+  if (NS_SUCCEEDED(
+          dom::nsContentPermissionUtils::AskPermission(this, mWindow))) {
+    return NS_OK;
+  }
+
+  return Cancel();
+}
+
+}  

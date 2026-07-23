@@ -1,0 +1,706 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(nsPIDOMWindow_h_)
+#define nsPIDOMWindow_h_
+
+#include "Units.h"
+#include "js/TypeDecls.h"
+#include "mozIDOMWindow.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/dom/EventTarget.h"
+#include "nsCOMPtr.h"
+#include "nsIDOMWindow.h"
+#include "nsILoadInfo.h"
+#include "nsRefPtrHashtable.h"
+#include "nsTArray.h"
+
+class nsDOMCSSDeclaration;
+class nsGlobalWindowInner;
+class nsGlobalWindowOuter;
+class nsIArray;
+class nsIBaseWindow;
+class nsIChannel;
+class nsIContent;
+class nsIContentSecurityPolicy;
+class nsIDocShell;
+class nsIDocShellTreeOwner;
+class nsDocShellLoadState;
+class nsIPolicyContainer;
+class nsIPrincipal;
+class nsIRunnable;
+class nsIScriptTimeoutHandler;
+class nsISerialEventTarget;
+class nsIURI;
+class nsIPrompt;
+class nsIControllers;
+class nsIWebBrowserChrome;
+class nsPIDOMWindowInner;
+class nsPIDOMWindowOuter;
+class nsPIWindowRoot;
+
+using SuspendTypes = uint32_t;
+
+namespace mozilla::dom {
+class AudioContext;
+class BrowsingContext;
+class BrowsingContextGroup;
+class ClientInfo;
+class ClientState;
+class ContentFrameMessageManager;
+class CloseWatcherManager;
+class DocGroup;
+class Document;
+class Element;
+class Location;
+class Navigation;
+class Navigator;
+class Performance;
+class Selection;
+class ServiceWorker;
+class ServiceWorkerDescriptor;
+class Timeout;
+class TimeoutManager;
+class WindowContext;
+class WindowGlobalChild;
+class CustomElementRegistry;
+enum class CallerType : uint32_t;
+}  
+
+enum class FullscreenReason {
+  ForFullscreenMode,
+  ForFullscreenAPI,
+  ForForceExitFullscreen
+};
+
+#define NS_PIDOMWINDOWINNER_IID \
+  {0x775dabc9, 0x8f43, 0x4277, {0x9a, 0xdb, 0xf1, 0x99, 0x0d, 0x77, 0xcf, 0xfb}}
+
+#define NS_PIDOMWINDOWOUTER_IID \
+  {0x769693d4, 0xb009, 0x4fe2, {0xaf, 0x18, 0x7d, 0xc8, 0xdf, 0x74, 0x96, 0xdf}}
+
+class nsPIDOMWindowInner : public mozIDOMWindow {
+ protected:
+  using Document = mozilla::dom::Document;
+  friend nsGlobalWindowInner;
+  friend nsGlobalWindowOuter;
+
+  nsPIDOMWindowInner(nsPIDOMWindowOuter* aOuterWindow,
+                     mozilla::dom::WindowGlobalChild* aActor);
+
+  ~nsPIDOMWindowInner();
+
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_PIDOMWINDOWINNER_IID)
+
+  nsIGlobalObject* AsGlobal();
+  const nsIGlobalObject* AsGlobal() const;
+
+  nsPIDOMWindowOuter* GetOuterWindow() const { return mOuterWindow; }
+
+  static nsPIDOMWindowInner* From(mozIDOMWindow* aFrom) {
+    return static_cast<nsPIDOMWindowInner*>(aFrom);
+  }
+
+  NS_IMPL_FROMEVENTTARGET_HELPER_WITH_GETTER(nsPIDOMWindowInner,
+                                             GetAsInnerWindow())
+
+  bool IsCurrentInnerWindow() const;
+
+  inline bool HasActiveDocument() const;
+
+  bool IsFullyActive() const;
+
+  inline bool IsTopInnerWindow() const;
+
+  virtual bool WasCurrentInnerWindow() const = 0;
+
+  inline bool IsLoading() const;
+  inline bool IsHandlingResizeEvent() const;
+
+  virtual void SetActiveLoadingState(bool aIsActiveLoading) = 0;
+
+  bool AddAudioContext(mozilla::dom::AudioContext* aAudioContext);
+  void RemoveAudioContext(mozilla::dom::AudioContext* aAudioContext);
+  void MuteAudioContexts();
+  void UnmuteAudioContexts();
+
+  void SetAudioCapture(bool aCapture);
+
+  mozilla::dom::Performance* GetPerformance();
+
+  void QueuePerformanceNavigationTiming();
+
+  bool HasMouseEnterLeaveEventListeners() const {
+    return mMayHaveMouseEnterLeaveEventListener;
+  }
+
+  void SetHasMouseEnterLeaveEventListeners() {
+    mMayHaveMouseEnterLeaveEventListener = true;
+  }
+
+  bool HasPointerEnterLeaveEventListeners() const {
+    return mMayHavePointerEnterLeaveEventListener;
+  }
+
+  void SetHasPointerEnterLeaveEventListeners() {
+    mMayHavePointerEnterLeaveEventListener = true;
+  }
+
+  bool HasPointerRawUpdateEventListeners() const {
+    return mMayHavePointerRawUpdateEventListener;
+  }
+
+  void MaybeSetHasPointerRawUpdateEventListeners();
+
+ protected:
+  void ClearHasPointerRawUpdateEventListeners();
+
+ public:
+  bool HasTransitionEventListeners() { return mMayHaveTransitionEventListener; }
+
+  void SetHasTransitionEventListeners() {
+    mMayHaveTransitionEventListener = true;
+  }
+
+  bool HasSMILTimeEventListeners() { return mMayHaveSMILTimeEventListener; }
+
+  void SetHasSMILTimeEventListeners() { mMayHaveSMILTimeEventListener = true; }
+
+  bool HasBeforeInputEventListenersForTelemetry() const {
+    return mMayHaveBeforeInputEventListenerForTelemetry;
+  }
+
+  void SetHasBeforeInputEventListenersForTelemetry() {
+    mMayHaveBeforeInputEventListenerForTelemetry = true;
+  }
+
+  bool MutationObserverHasObservedNodeForTelemetry() const {
+    return mMutationObserverHasObservedNodeForTelemetry;
+  }
+
+  void SetMutationObserverHasObservedNodeForTelemetry() {
+    mMutationObserverHasObservedNodeForTelemetry = true;
+  }
+
+  mozilla::dom::Event* SetEvent(mozilla::dom::Event* aEvent) {
+    mozilla::dom::Event* old = mEvent;
+    mEvent = aEvent;
+    return old;
+  }
+
+  bool IsSecureContext() const;
+  bool IsSecureContextIfOpenerIgnored() const;
+
+  void Suspend(bool aIncludeSubWindows = true);
+  void Resume(bool aIncludeSubWindows = true);
+
+  bool GetWasSuspendedByGroup() const { return mWasSuspendedByGroup; }
+  void SetWasSuspendedByGroup(bool aSuspended) {
+    mWasSuspendedByGroup = aSuspended;
+  }
+
+  void SyncStateFromParentWindow();
+
+  bool IsDocumentLoaded() const;
+
+  void TryToCacheTopInnerWindow();
+
+  mozilla::Maybe<mozilla::dom::ClientInfo> GetClientInfo() const;
+  mozilla::Maybe<mozilla::dom::ClientState> GetClientState() const;
+  mozilla::Maybe<mozilla::dom::ServiceWorkerDescriptor> GetController() const;
+  mozilla::dom::ClientSource* GetClientSource() const;
+
+  void SetPolicyContainer(nsIPolicyContainer* aPolicyContainer);
+  nsIPolicyContainer* GetPolicyContainer();
+
+  void SetPreloadCsp(nsIContentSecurityPolicy* aPreloadCsp);
+
+  void NoteCalledRegisterForServiceWorkerScope(const nsACString& aScope);
+
+  void NoteDOMContentLoaded();
+
+  virtual mozilla::dom::CustomElementRegistry* CustomElements() = 0;
+
+  virtual nsPIDOMWindowOuter* GetInProcessScriptableTop() = 0;
+  virtual nsPIDOMWindowOuter* GetInProcessScriptableParent() = 0;
+  virtual already_AddRefed<nsPIWindowRoot> GetTopWindowRoot() = 0;
+
+  mozilla::dom::EventTarget* GetChromeEventHandler() const {
+    return mChromeEventHandler;
+  }
+
+  mozilla::dom::EventTarget* GetParentTarget() {
+    if (!mParentTarget) {
+      UpdateParentTarget();
+    }
+    return mParentTarget;
+  }
+
+  virtual void MaybeUpdateTouchState() {}
+
+  Document* GetExtantDoc() const { return mDoc; }
+  nsIURI* GetDocumentURI() const;
+  nsIURI* GetDocBaseURI() const;
+
+  Document* GetDoc() {
+    if (!mDoc) {
+      MaybeCreateDoc();
+    }
+    return mDoc;
+  }
+
+  mozilla::dom::WindowContext* GetWindowContext() const;
+  mozilla::dom::WindowGlobalChild* GetWindowGlobalChild() const {
+    return mWindowGlobalChild;
+  }
+
+  bool RemoveFromBFCacheSync();
+
+  virtual nsresult FireDelayedDOMEvents(bool aIncludeSubWindows) = 0;
+
+  inline nsIDocShell* GetDocShell() const;
+
+  inline mozilla::dom::BrowsingContext* GetBrowsingContext() const;
+
+  mozilla::dom::BrowsingContextGroup* GetBrowsingContextGroup() const;
+
+  void SetHasDOMActivateEventListeners() {
+    mMayHaveDOMActivateEventListeners = true;
+  }
+
+  bool HasDOMActivateEventListeners() const {
+    return mMayHaveDOMActivateEventListeners;
+  }
+
+  void SetHasTouchEventListeners() {
+    if (!mMayHaveTouchEventListener) {
+      mMayHaveTouchEventListener = true;
+      MaybeUpdateTouchState();
+    }
+  }
+
+  void SetHasSelectionChangeEventListeners() {
+    mMayHaveSelectionChangeEventListener = true;
+  }
+
+  bool HasSelectionChangeEventListeners() const {
+    return mMayHaveSelectionChangeEventListener;
+  }
+
+  void SetHasFormSelectEventListeners() {
+    mMayHaveFormSelectEventListener = true;
+  }
+
+  bool HasFormSelectEventListeners() const {
+    return mMayHaveFormSelectEventListener;
+  }
+
+  mozilla::dom::Element* GetFocusedElement() const {
+    return mFocusedElement.get();
+  }
+
+  virtual void SetFocusedElement(mozilla::dom::Element* aElement,
+                                 uint32_t aFocusMethod = 0,
+                                 bool aNeedsFocus = false) = 0;
+
+  bool UnknownFocusMethodShouldShowOutline() const {
+    return mUnknownFocusMethodShouldShowOutline;
+  }
+
+  virtual uint32_t GetFocusMethod() = 0;
+
+  virtual bool TakeFocus(bool aFocus, uint32_t aFocusMethod) = 0;
+
+  virtual void SetReadyForFocus() = 0;
+
+  virtual bool ShouldShowFocusRing() = 0;
+
+  virtual void PageHidden(bool aIsEnteringBFCacheInParent) = 0;
+
+  virtual nsresult DispatchAsyncHashchange(nsIURI* aOldURI,
+                                           nsIURI* aNewURI) = 0;
+
+  virtual nsresult DispatchSyncPopState() = 0;
+
+  virtual void EnableDeviceSensor(uint32_t aType) = 0;
+
+  virtual void DisableDeviceSensor(uint32_t aType) = 0;
+
+
+  uint64_t WindowID() const { return mWindowID; }
+
+  void MarkUncollectableForCCGeneration(uint32_t aGeneration) {
+    mMarkedCCGeneration = aGeneration;
+  }
+
+  uint32_t GetMarkedCCGeneration() { return mMarkedCCGeneration; }
+
+  mozilla::dom::Navigation* Navigation();
+  mozilla::dom::Navigator* Navigator();
+  virtual mozilla::dom::Location* Location() = 0;
+
+  virtual nsresult GetControllers(nsIControllers** aControllers) = 0;
+
+  MOZ_CAN_RUN_SCRIPT virtual nsresult GetInnerWidth(double* aWidth) = 0;
+  MOZ_CAN_RUN_SCRIPT virtual nsresult GetInnerHeight(double* aHeight) = 0;
+
+  virtual already_AddRefed<nsDOMCSSDeclaration> GetComputedStyle(
+      mozilla::dom::Element& aElt, const nsAString& aPseudoElt,
+      mozilla::ErrorResult& aError) = 0;
+
+  virtual bool GetFullScreen() = 0;
+
+  virtual nsresult Focus(mozilla::dom::CallerType aCallerType) = 0;
+  virtual nsresult Close() = 0;
+
+  mozilla::dom::DocGroup* GetDocGroup() const;
+
+  RefPtr<mozilla::GenericPromise> SaveStorageAccessPermissionGranted();
+  RefPtr<mozilla::GenericPromise> SaveStorageAccessPermissionRevoked();
+
+  bool UsingStorageAccess();
+
+  uint32_t UpdateLockCount(bool aIncrement) {
+    MOZ_ASSERT_IF(!aIncrement, mLockCount > 0);
+    mLockCount += aIncrement ? 1 : -1;
+    return mLockCount;
+  };
+  bool HasActiveLocks() { return mLockCount > 0; }
+
+  uint32_t UpdateWebTransportCount(bool aIncrement) {
+    MOZ_ASSERT_IF(!aIncrement, mWebTransportCount > 0);
+    mWebTransportCount += aIncrement ? 1 : -1;
+    return mWebTransportCount;
+  };
+  bool HasActiveWebTransports() { return mWebTransportCount > 0; }
+
+  mozilla::dom::CloseWatcherManager* EnsureCloseWatcherManager();
+
+  void NotifyCloseWatcherAdded();
+
+  void NotifyCloseWatcherRemoved();
+
+ protected:
+  void CreatePerformanceObjectIfNeeded();
+
+  void MaybeCreateDoc();
+
+  void SetChromeEventHandlerInternal(
+      mozilla::dom::EventTarget* aChromeEventHandler) {
+    mChromeEventHandler = aChromeEventHandler;
+    mParentTarget = nullptr;
+  }
+
+  virtual void UpdateParentTarget() = 0;
+
+  nsCOMPtr<mozilla::dom::EventTarget> mChromeEventHandler;  
+  RefPtr<Document> mDoc;
+  nsCOMPtr<nsIURI> mDocumentURI;  
+  nsCOMPtr<nsIURI> mDocBaseURI;   
+
+  nsCOMPtr<mozilla::dom::EventTarget> mParentTarget;  
+
+  RefPtr<mozilla::dom::Performance> mPerformance;
+  mozilla::UniquePtr<mozilla::dom::TimeoutManager> mTimeoutManager;
+  RefPtr<mozilla::dom::Navigation> mNavigation;
+
+  RefPtr<mozilla::dom::Navigator> mNavigator;
+
+  bool mIsDocumentLoaded = false;
+  bool mIsHandlingResizeEvent = false;
+  bool mMayHaveDOMActivateEventListeners = false;
+  bool mMayHaveTouchEventListener = false;
+  bool mMayHaveSelectionChangeEventListener = false;
+  bool mMayHaveFormSelectEventListener = false;
+  bool mMayHaveMouseEnterLeaveEventListener = false;
+  bool mMayHavePointerEnterLeaveEventListener = false;
+  bool mMayHavePointerRawUpdateEventListener = false;
+  bool mMayHaveTransitionEventListener = false;
+  bool mMayHaveSMILTimeEventListener = false;
+  bool mMayHaveBeforeInputEventListenerForTelemetry = false;
+  bool mMutationObserverHasObservedNodeForTelemetry = false;
+
+  nsCOMPtr<nsPIDOMWindowOuter> mOuterWindow;
+
+  RefPtr<mozilla::dom::Element> mFocusedElement;
+
+  nsTArray<mozilla::dom::AudioContext*> mAudioContexts;  
+
+  RefPtr<mozilla::dom::BrowsingContext> mBrowsingContext;
+
+  uint64_t mWindowID = 0;
+
+  bool mHasNotifiedGlobalCreated = false;
+
+  bool mUnknownFocusMethodShouldShowOutline = true;
+
+  uint32_t mMarkedCCGeneration = 0;
+
+  nsCOMPtr<nsPIDOMWindowInner> mTopInnerWindow;
+
+  bool mHasTriedToCacheTopInnerWindow = false;
+
+  uint32_t mNumOfIndexedDBDatabases = 0;
+
+  uint32_t mNumOfOpenWebSockets = 0;
+
+  mozilla::dom::Event* mEvent = nullptr;
+
+  RefPtr<mozilla::dom::WindowGlobalChild> mWindowGlobalChild;
+
+  bool mWasSuspendedByGroup = false;
+
+  uint32_t mLockCount = 0;
+  uint32_t mWebTransportCount = 0;
+
+  RefPtr<mozilla::dom::CloseWatcherManager> mCloseWatcherManager;
+};
+
+class nsPIDOMWindowOuter : public mozIDOMWindowProxy {
+ protected:
+  using Document = mozilla::dom::Document;
+
+  explicit nsPIDOMWindowOuter(uint64_t aWindowID);
+
+  ~nsPIDOMWindowOuter();
+
+  void NotifyResumingDelayedMedia();
+
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_PIDOMWINDOWOUTER_IID)
+
+  NS_IMPL_FROMEVENTTARGET_HELPER_WITH_GETTER(nsPIDOMWindowOuter,
+                                             GetAsOuterWindow())
+
+  static nsPIDOMWindowOuter* From(mozIDOMWindowProxy* aFrom) {
+    return static_cast<nsPIDOMWindowOuter*>(aFrom);
+  }
+
+  static nsPIDOMWindowOuter* GetFromCurrentInner(nsPIDOMWindowInner* aInner);
+
+  inline bool IsLoading() const;
+  inline bool IsHandlingResizeEvent() const;
+
+  nsPIDOMWindowInner* GetCurrentInnerWindow() const { return mInnerWindow; }
+
+  nsPIDOMWindowInner* EnsureInnerWindow() {
+    GetDoc();
+    return GetCurrentInnerWindow();
+  }
+
+  bool IsRootOuterWindow() { return mIsRootOuterWindow; }
+
+  mozilla::dom::Element* GetFrameElementInternal() const;
+  void SetFrameElementInternal(mozilla::dom::Element* aFrameElement);
+
+  bool IsBackground() { return mIsBackground; }
+
+  bool GetAudioMuted() const;
+
+  void ActivateMediaComponents();
+  bool ShouldDelayMediaFromStart() const;
+
+  void RefreshMediaElementsVolume();
+
+  virtual nsPIDOMWindowOuter* GetPrivateRoot() = 0;
+
+
+  virtual already_AddRefed<nsPIDOMWindowOuter>
+  GetInProcessTop() = 0;  
+  virtual already_AddRefed<nsPIDOMWindowOuter> GetInProcessParent() = 0;
+  virtual nsPIDOMWindowOuter* GetInProcessScriptableTop() = 0;
+  virtual nsPIDOMWindowOuter* GetInProcessScriptableParent() = 0;
+  virtual already_AddRefed<nsPIWindowRoot> GetTopWindowRoot() = 0;
+
+  virtual nsPIDOMWindowOuter* GetInProcessScriptableParentOrNull() = 0;
+
+  virtual void SetIsBackground(bool aIsBackground) = 0;
+
+  mozilla::dom::EventTarget* GetChromeEventHandler() const {
+    return mChromeEventHandler;
+  }
+
+  virtual void SetChromeEventHandler(
+      mozilla::dom::EventTarget* aChromeEventHandler) = 0;
+
+  mozilla::dom::EventTarget* GetParentTarget() {
+    if (!mParentTarget) {
+      UpdateParentTarget();
+    }
+    return mParentTarget;
+  }
+
+  mozilla::dom::ContentFrameMessageManager* GetMessageManager() {
+    if (!mParentTarget) {
+      UpdateParentTarget();
+    }
+    return mMessageManager;
+  }
+
+  Document* GetExtantDoc() const { return mDoc; }
+  nsIURI* GetDocumentURI() const;
+
+  Document* GetDoc() {
+    if (!mDoc) {
+      MaybeCreateDoc();
+    }
+    return mDoc;
+  }
+
+  MOZ_CAN_RUN_SCRIPT virtual void SetInitialPrincipal(
+      nsIPrincipal* aNewWindowPrincipal) = 0;
+
+  virtual nsresult FireDelayedDOMEvents(bool aIncludeSubWindows) = 0;
+
+  inline nsIDocShell* GetDocShell() const;
+
+  inline mozilla::dom::BrowsingContext* GetBrowsingContext() const;
+
+  mozilla::dom::BrowsingContextGroup* GetBrowsingContextGroup() const;
+
+  virtual nsresult SetNewDocument(
+      Document* aDocument, nsISupports* aState, bool aForceReuseInnerWindow,
+      mozilla::dom::WindowGlobalChild* aActor = nullptr) = 0;
+
+  virtual void EnsureSizeAndPositionUpToDate() = 0;
+
+  virtual void SuppressEventHandling() = 0;
+  virtual void UnsuppressEventHandling() = 0;
+
+  virtual nsPIDOMWindowOuter* EnterModalState() = 0;
+  virtual void LeaveModalState() = 0;
+
+  virtual bool CanClose() = 0;
+  virtual void ForceClose() = 0;
+
+  virtual nsresult SetFullscreenInternal(FullscreenReason aReason,
+                                         bool aIsFullscreen) = 0;
+  virtual void FullscreenWillChange(bool aIsFullscreen) = 0;
+  virtual void FinishFullscreenChange(bool aIsFullscreen) = 0;
+
+  virtual void ForceFullScreenInWidget() = 0;
+
+  virtual void MacFullscreenMenubarOverlapChanged(
+      mozilla::DesktopCoord aOverlapAmount) = 0;
+
+
+  inline mozilla::dom::Element* GetFocusedElement() const;
+
+  virtual void SetFocusedElement(mozilla::dom::Element* aElement,
+                                 uint32_t aFocusMethod = 0,
+                                 bool aNeedsFocus = false) = 0;
+  bool UnknownFocusMethodShouldShowOutline() const;
+
+  virtual uint32_t GetFocusMethod() = 0;
+
+  virtual bool TakeFocus(bool aFocus, uint32_t aFocusMethod) = 0;
+
+  virtual void SetReadyForFocus() = 0;
+
+  virtual bool ShouldShowFocusRing() = 0;
+
+  virtual void PageHidden(bool aIsEnteringBFCacheInParent) = 0;
+
+  uint64_t WindowID() const { return mWindowID; }
+
+  virtual bool DispatchCustomEvent(
+      const nsAString& aEventName,
+      mozilla::ChromeOnlyDispatch aChromeOnlyDispatch =
+          mozilla::ChromeOnlyDispatch::eNo) = 0;
+
+  virtual nsresult OpenNoNavigate(const nsACString& aUrl,
+                                  const nsAString& aName,
+                                  const nsAString& aOptions,
+                                  mozilla::dom::BrowsingContext** _retval) = 0;
+
+  virtual void FirePopupBlockedEvent(nsIURI* aPopupURI,
+                                     const nsAString& aPopupWindowName,
+                                     const nsAString& aPopupWindowFeatures) = 0;
+
+  virtual void FireRedirectBlockedEvent(nsIURI* aRedirectURI) = 0;
+
+  void MarkUncollectableForCCGeneration(uint32_t aGeneration) {
+    mMarkedCCGeneration = aGeneration;
+  }
+
+  uint32_t GetMarkedCCGeneration() { return mMarkedCCGeneration; }
+
+  virtual mozilla::dom::Navigator* GetNavigator() = 0;
+  virtual mozilla::dom::Location* GetLocation() = 0;
+
+  virtual nsresult GetPrompter(nsIPrompt** aPrompt) = 0;
+  virtual nsresult GetControllers(nsIControllers** aControllers) = 0;
+  virtual already_AddRefed<mozilla::dom::Selection> GetSelection() = 0;
+  virtual mozilla::dom::Nullable<mozilla::dom::WindowProxyHolder>
+  GetOpener() = 0;
+
+  virtual nsresult Open(const nsACString& aUrl, const nsAString& aName,
+                        const nsAString& aOptions,
+                        nsDocShellLoadState* aLoadState, bool aForceNoOpener,
+                        mozilla::dom::BrowsingContext** _retval) = 0;
+  virtual nsresult OpenDialog(const nsACString& aUrl, const nsAString& aName,
+                              const nsAString& aOptions, nsIArray* aArguments,
+                              mozilla::dom::BrowsingContext** _retval) = 0;
+
+  MOZ_CAN_RUN_SCRIPT virtual nsresult GetInnerWidth(double* aWidth) = 0;
+  MOZ_CAN_RUN_SCRIPT virtual nsresult GetInnerHeight(double* aHeight) = 0;
+
+  virtual mozilla::dom::Element* GetFrameElement() = 0;
+
+  virtual bool Closed() = 0;
+  virtual bool GetFullScreen() = 0;
+  virtual nsresult SetFullScreen(bool aFullscreen) = 0;
+
+  virtual nsresult Focus(mozilla::dom::CallerType aCallerType) = 0;
+  virtual nsresult Close() = 0;
+
+  virtual nsresult MoveBy(int32_t aXDif, int32_t aYDif) = 0;
+
+  virtual void UpdateCommands(const nsAString& anAction) = 0;
+
+  mozilla::dom::DocGroup* GetDocGroup() const;
+
+  already_AddRefed<nsIDocShellTreeOwner> GetTreeOwner();
+  already_AddRefed<nsIBaseWindow> GetTreeOwnerWindow();
+  already_AddRefed<nsIWebBrowserChrome> GetWebBrowserChrome();
+
+  virtual void UpdateParentTarget() = 0;
+
+ protected:
+  void MaybeCreateDoc();
+
+  void SetChromeEventHandlerInternal(
+      mozilla::dom::EventTarget* aChromeEventHandler);
+
+  nsCOMPtr<mozilla::dom::EventTarget> mChromeEventHandler;  
+  RefPtr<Document> mDoc;
+  nsCOMPtr<nsIURI> mDocumentURI;  
+
+  nsCOMPtr<mozilla::dom::EventTarget> mParentTarget;                 
+  RefPtr<mozilla::dom::ContentFrameMessageManager> mMessageManager;  
+
+  nsCOMPtr<mozilla::dom::Element> mFrameElement;
+
+  nsCOMPtr<nsIDocShell> mDocShell;
+  RefPtr<mozilla::dom::BrowsingContext> mBrowsingContext;
+
+  uint32_t mModalStateDepth;
+
+  uint32_t mSuppressEventHandlingDepth;
+
+  bool mIsBackground;
+
+  bool mIsRootOuterWindow;
+
+  nsPIDOMWindowInner* MOZ_NON_OWNING_REF mInnerWindow;
+
+  uint64_t mWindowID;
+
+  uint32_t mMarkedCCGeneration;
+};
+
+#endif

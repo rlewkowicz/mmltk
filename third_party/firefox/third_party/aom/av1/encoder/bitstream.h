@@ -1,0 +1,130 @@
+/*
+ * Copyright (c) 2016, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ */
+
+#if !defined(AOM_AV1_ENCODER_BITSTREAM_H_)
+#define AOM_AV1_ENCODER_BITSTREAM_H_
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "av1/common/av1_common_int.h"
+#include "av1/common/blockd.h"
+#include "av1/common/enums.h"
+#include "av1/encoder/level.h"
+#include "aom_dsp/bitwriter.h"
+#include "aom_util/aom_pthread.h"
+
+struct aom_write_bit_buffer;
+struct AV1_COMP;
+struct ThreadData;
+
+/*!\cond */
+
+typedef struct {
+  uint8_t *data;
+  size_t size;
+} TileBufferEnc;
+
+typedef struct {
+  uint8_t *frame_header;
+  size_t obu_header_byte_offset;
+  size_t total_length;
+} FrameHeaderInfo;
+
+typedef struct {
+  struct aom_write_bit_buffer *saved_wb;  
+  TileBufferEnc buf;     
+  uint32_t *total_size;  
+  uint8_t *dst;          
+  uint8_t *tile_data_curr;   
+  size_t tile_buf_size;      
+  uint8_t obu_extn_header;   
+  uint32_t obu_header_size;  
+  int curr_tg_hdr_size;      
+  int tile_size_mi;          
+  int tile_row;              
+  int tile_col;              
+  int is_last_tile_in_tg;    
+  int new_tg;                
+} PackBSParams;
+
+typedef struct {
+  uint64_t abs_sum_level;
+  uint16_t tile_idx;
+} PackBSTileOrder;
+
+typedef struct {
+#if CONFIG_MULTITHREAD
+  pthread_mutex_t *mutex_;
+#endif
+  PackBSTileOrder pack_bs_tile_order[MAX_TILES];
+
+  int next_job_idx;
+  bool pack_bs_mt_exit;
+} AV1EncPackBSSync;
+
+/*!\endcond */
+
+uint32_t av1_write_sequence_header_obu(const SequenceHeader *seq_params,
+                                       uint8_t *const dst, size_t dst_size);
+
+uint32_t av1_write_obu_header(AV1LevelParams *const level_params,
+                              int *frame_header_count, OBU_TYPE obu_type,
+                              bool has_nonzero_operating_point_idc,
+                              bool is_layer_specific_obu, int obu_extension,
+                              uint8_t *const dst);
+
+int av1_write_uleb_obu_size(size_t obu_payload_size, uint8_t *dest,
+                            size_t dest_size);
+
+void av1_pack_tile_info(struct AV1_COMP *const cpi, struct ThreadData *const td,
+                        PackBSParams *const pack_bs_params);
+
+void av1_write_last_tile_info(
+    struct AV1_COMP *const cpi, const FrameHeaderInfo *fh_info,
+    struct aom_write_bit_buffer *saved_wb, size_t *curr_tg_data_size,
+    uint8_t *curr_tg_start, uint32_t *const total_size,
+    uint8_t **tile_data_start, int *const largest_tile_id,
+    int *const is_first_tg, uint32_t obu_header_size, uint8_t obu_extn_header);
+
+/*!\brief Pack the bitstream for one frame
+ *
+ * \ingroup high_level_algo
+ * \callgraph
+ */
+int av1_pack_bitstream(struct AV1_COMP *const cpi, uint8_t *dst,
+                       size_t dst_size, size_t *size,
+                       int *const largest_tile_id);
+
+void av1_write_tx_type(const AV1_COMMON *const cm, const MACROBLOCKD *xd,
+                       TX_TYPE tx_type, TX_SIZE tx_size, aom_writer *w);
+
+void av1_reset_pack_bs_thread_data(struct ThreadData *const td);
+
+void av1_accumulate_pack_bs_thread_data(struct AV1_COMP *const cpi,
+                                        struct ThreadData const *td);
+
+void av1_write_obu_tg_tile_headers(struct AV1_COMP *const cpi,
+                                   MACROBLOCKD *const xd,
+                                   PackBSParams *const pack_bs_params,
+                                   const int tile_idx);
+
+int av1_neg_interleave(int x, int ref, int max);
+#if defined(__cplusplus)
+}  
+#endif
+
+#endif

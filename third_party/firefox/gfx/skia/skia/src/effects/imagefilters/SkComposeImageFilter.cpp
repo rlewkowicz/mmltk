@@ -1,0 +1,123 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/effects/SkImageFilters.h"
+
+#include "include/core/SkFlattenable.h"
+#include "include/core/SkImageFilter.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkTypes.h"
+#include "src/core/SkImageFilterTypes.h"
+#include "src/core/SkImageFilter_Base.h"
+
+#include <optional>
+#include <utility>
+
+class SkReadBuffer;
+
+namespace {
+
+class SkComposeImageFilter final : public SkImageFilter_Base {
+    static constexpr int kOuter = 0;
+    static constexpr int kInner = 1;
+
+public:
+    explicit SkComposeImageFilter(sk_sp<SkImageFilter> inputs[2])
+            : SkImageFilter_Base(inputs, 2,
+                                 inputs[kInner] ? as_IFB(inputs[kInner])->usesSource() : false) {
+        SkASSERT(inputs[kOuter].get());
+        SkASSERT(inputs[kInner].get());
+    }
+
+    SkRect computeFastBounds(const SkRect& src) const override;
+
+protected:
+
+private:
+    friend void ::SkRegisterComposeImageFilterFlattenable();
+    SK_FLATTENABLE_HOOKS(SkComposeImageFilter)
+
+    MatrixCapability onGetCTMCapability() const override { return MatrixCapability::kComplex; }
+
+    skif::FilterResult onFilterImage(const skif::Context& context) const override;
+
+    skif::LayerSpace<SkIRect> onGetInputLayerBounds(
+            const skif::Mapping& mapping,
+            const skif::LayerSpace<SkIRect>& desiredOutput,
+            std::optional<skif::LayerSpace<SkIRect>> contentBounds) const override;
+
+    std::optional<skif::LayerSpace<SkIRect>> onGetOutputLayerBounds(
+            const skif::Mapping& mapping,
+            std::optional<skif::LayerSpace<SkIRect>> contentBounds) const override;
+};
+
+} 
+
+sk_sp<SkImageFilter> SkImageFilters::Compose(sk_sp<SkImageFilter> outer,
+                                             sk_sp<SkImageFilter> inner) {
+    if (!outer) {
+        return inner;
+    }
+    if (!inner) {
+        return outer;
+    }
+    sk_sp<SkImageFilter> inputs[2] = { std::move(outer), std::move(inner) };
+    return sk_sp<SkImageFilter>(new SkComposeImageFilter(inputs));
+}
+
+void SkRegisterComposeImageFilterFlattenable() {
+    SK_REGISTER_FLATTENABLE(SkComposeImageFilter);
+    SkFlattenable::Register("SkComposeImageFilterImpl", SkComposeImageFilter::CreateProc);
+}
+
+sk_sp<SkFlattenable> SkComposeImageFilter::CreateProc(SkReadBuffer& buffer) {
+    SK_IMAGEFILTER_UNFLATTEN_COMMON(common, 2);
+    return SkImageFilters::Compose(common.getInput(kOuter), common.getInput(kInner));
+}
+
+
+skif::FilterResult SkComposeImageFilter::onFilterImage(const skif::Context& ctx) const {
+    auto innerOutputBounds =
+            this->getChildOutputLayerBounds(kInner, ctx.mapping(), ctx.source().layerBounds());
+    skif::LayerSpace<SkIRect> outerRequiredInput =
+            this->getChildInputLayerBounds(kOuter,
+                                           ctx.mapping(),
+                                           ctx.desiredOutput(),
+                                           innerOutputBounds);
+
+    skif::FilterResult innerResult =
+            this->getChildOutput(kInner, ctx.withNewDesiredOutput(outerRequiredInput));
+
+    return this->getChildOutput(kOuter, ctx.withNewSource(innerResult));
+}
+
+skif::LayerSpace<SkIRect> SkComposeImageFilter::onGetInputLayerBounds(
+        const skif::Mapping& mapping,
+        const skif::LayerSpace<SkIRect>& desiredOutput,
+        std::optional<skif::LayerSpace<SkIRect>> contentBounds) const {
+    std::optional<skif::LayerSpace<SkIRect>> outerContentBounds;
+    if (contentBounds) {
+        outerContentBounds = this->getChildOutputLayerBounds(kInner, mapping, *contentBounds);
+    } 
+
+    skif::LayerSpace<SkIRect> innerDesiredOutput =
+            this->getChildInputLayerBounds(kOuter, mapping, desiredOutput, outerContentBounds);
+    return this->getChildInputLayerBounds(kInner, mapping, innerDesiredOutput, contentBounds);
+}
+
+std::optional<skif::LayerSpace<SkIRect>> SkComposeImageFilter::onGetOutputLayerBounds(
+        const skif::Mapping& mapping,
+        std::optional<skif::LayerSpace<SkIRect>> contentBounds) const {
+    auto innerBounds = this->getChildOutputLayerBounds(kInner, mapping, contentBounds);
+    return this->getChildOutputLayerBounds(kOuter, mapping, innerBounds);
+}
+
+SkRect SkComposeImageFilter::computeFastBounds(const SkRect& src) const {
+    return this->getInput(kOuter)->computeFastBounds(
+            this->getInput(kInner)->computeFastBounds(src));
+}

@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DelayBuffer_h_
+#define DelayBuffer_h_
+
+#include "AudioBlock.h"
+#include "AudioSegment.h"
+#include "mozilla/dom/AudioNodeBinding.h"  // for ChannelInterpretation
+#include "nsTArray.h"
+
+namespace mozilla {
+
+class DelayBuffer final {
+  typedef dom::ChannelInterpretation ChannelInterpretation;
+
+ public:
+  explicit DelayBuffer(float aMaxDelayTicks)
+      : mMaxDelayTicks(std::ceil(aMaxDelayTicks)),
+        mCurrentChunk(0)
+#ifdef DEBUG
+        ,
+        mHaveWrittenBlock(false)
+#endif
+  {
+    MOZ_ASSERT(aMaxDelayTicks <=
+               float(std::numeric_limits<decltype(mMaxDelayTicks)>::max()));
+  }
+
+  void Write(const AudioBlock& aInputChunk);
+
+  void Read(const float aPerFrameDelays[WEBAUDIO_BLOCK_SIZE],
+            AudioBlock* aOutputChunk,
+            ChannelInterpretation aChannelInterpretation);
+  void Read(float aDelayTicks, AudioBlock* aOutputChunk,
+            ChannelInterpretation aChannelInterpretation);
+
+  void ReadChannel(const float aPerFrameDelays[WEBAUDIO_BLOCK_SIZE],
+                   AudioBlock* aOutputChunk, uint32_t aChannel,
+                   ChannelInterpretation aChannelInterpretation);
+
+  void NextBlock() {
+    mCurrentChunk = (mCurrentChunk + 1) % mChunks.Length();
+#ifdef DEBUG
+    MOZ_ASSERT(mHaveWrittenBlock);
+    mHaveWrittenBlock = false;
+#endif
+  }
+
+  void Reset() { mChunks.Clear(); };
+
+  int MaxDelayTicks() const { return mMaxDelayTicks; }
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const;
+
+ private:
+  void ReadChannels(const float aPerFrameDelays[WEBAUDIO_BLOCK_SIZE],
+                    AudioBlock* aOutputChunk, uint32_t aFirstChannel,
+                    uint32_t aNumChannelsToRead,
+                    ChannelInterpretation aChannelInterpretation);
+  bool EnsureBuffer();
+  int PositionForDelay(int aDelay);
+  int ChunkForPosition(int aPosition);
+  int OffsetForPosition(int aPosition);
+  int ChunkForDelay(int aDelay);
+  void UpdateUpmixChannels(int aNewReadChunk, uint32_t channelCount,
+                           ChannelInterpretation aChannelInterpretation);
+
+  FallibleTArray<AudioChunk> mChunks;
+  CopyableAutoTArray<const float*, GUESS_AUDIO_CHANNELS> mUpmixChannels;
+  int mMaxDelayTicks;
+  int mCurrentChunk;
+  int mLastReadChunk = -1;
+#ifdef DEBUG
+  bool mHaveWrittenBlock;
+#endif
+};
+
+}  
+
+#endif  // DelayBuffer_h_

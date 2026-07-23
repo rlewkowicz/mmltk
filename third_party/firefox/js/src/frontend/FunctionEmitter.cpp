@@ -1,0 +1,818 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "frontend/FunctionEmitter.h"
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+
+#include "frontend/AsyncEmitter.h"         // AsyncEmitter
+#include "frontend/BytecodeEmitter.h"      // BytecodeEmitter
+#include "frontend/FunctionSyntaxKind.h"   // FunctionSyntaxKind
+#include "frontend/ModuleSharedContext.h"  // ModuleSharedContext
+#include "frontend/NameAnalysisTypes.h"    // NameLocation
+#include "frontend/NameOpEmitter.h"        // NameOpEmitter
+#include "frontend/SharedContext.h"        // SharedContext
+#include "vm/ModuleBuilder.h"              // ModuleBuilder
+#include "vm/Opcodes.h"                    // JSOp
+#include "vm/Scope.h"                      // BindingKind
+
+using namespace js;
+using namespace js::frontend;
+
+using mozilla::Maybe;
+using mozilla::Some;
+
+FunctionEmitter::FunctionEmitter(BytecodeEmitter* bce, FunctionBox* funbox,
+                                 FunctionSyntaxKind syntaxKind,
+                                 IsHoisted isHoisted)
+    : bce_(bce),
+      funbox_(funbox),
+      name_(funbox_->explicitName()),
+      syntaxKind_(syntaxKind),
+      isHoisted_(isHoisted) {}
+
+bool FunctionEmitter::prepareForNonLazy() {
+  MOZ_ASSERT(state_ == State::Start);
+
+  MOZ_ASSERT(funbox_->isInterpreted());
+  MOZ_ASSERT(funbox_->emitBytecode);
+  MOZ_ASSERT(!funbox_->wasEmittedByEnclosingScript());
+
+
+  funbox_->setWasEmittedByEnclosingScript(true);
+
+#ifdef DEBUG
+  state_ = State::NonLazy;
+#endif
+  return true;
+}
+
+bool FunctionEmitter::emitNonLazyEnd() {
+  MOZ_ASSERT(state_ == State::NonLazy);
+
+
+  if (!emitFunction()) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::End;
+#endif
+  return true;
+}
+
+bool FunctionEmitter::emitLazy() {
+  MOZ_ASSERT(state_ == State::Start);
+
+  MOZ_ASSERT(funbox_->isInterpreted());
+  MOZ_ASSERT(!funbox_->emitBytecode);
+  MOZ_ASSERT(!funbox_->wasEmittedByEnclosingScript());
+
+
+  funbox_->setWasEmittedByEnclosingScript(true);
+
+  funbox_->setEnclosingScopeForInnerLazyFunction(bce_->innermostScopeIndex());
+
+  if (!emitFunction()) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::End;
+#endif
+  return true;
+}
+
+bool FunctionEmitter::emitAgain() {
+  MOZ_ASSERT(state_ == State::Start);
+  MOZ_ASSERT(funbox_->wasEmittedByEnclosingScript());
+
+
+  if (!funbox_->isAnnexB) {
+#ifdef DEBUG
+    state_ = State::End;
+#endif
+    return true;
+  }
+
+  Maybe<NameLocation> lhsLoc =
+      bce_->locationOfNameBoundInScope(name_, bce_->varEmitterScope);
+
+  if (!lhsLoc && bce_->sc->isFunctionBox() &&
+      bce_->sc->asFunctionBox()->functionHasExtraBodyVarScope()) {
+    lhsLoc = bce_->locationOfNameBoundInScope(
+        name_, bce_->varEmitterScope->enclosingInFrame());
+  }
+
+  if (!lhsLoc) {
+    lhsLoc = Some(NameLocation::DynamicAnnexBVar());
+  } else {
+    MOZ_ASSERT(lhsLoc->bindingKind() == BindingKind::Var ||
+               lhsLoc->bindingKind() == BindingKind::FormalParameter ||
+               (lhsLoc->bindingKind() == BindingKind::Let &&
+                bce_->sc->asFunctionBox()->hasParameterExprs));
+  }
+
+  NameOpEmitter noe(bce_, name_, *lhsLoc,
+                    NameOpEmitter::Kind::SimpleAssignment);
+  if (!noe.prepareForRhs()) {
+    return false;
+  }
+
+  if (!bce_->emitGetName(name_)) {
+    return false;
+  }
+
+  if (!noe.emitAssignment()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::End;
+#endif
+  return true;
+}
+
+bool FunctionEmitter::emitFunction() {
+  GCThingIndex index;
+  if (!bce_->perScriptData().gcThingList().append(funbox_, &index)) {
+    return false;
+  }
+
+
+  if (isHoisted_ == IsHoisted::No) {
+    return emitNonHoisted(index);
+  }
+
+  bool topLevelFunction;
+  if (bce_->sc->isFunctionBox() ||
+      (bce_->sc->isEvalContext() && bce_->sc->strict())) {
+    topLevelFunction = false;
+  } else {
+    NameLocation loc = bce_->lookupName(name_);
+    topLevelFunction = loc.kind() == NameLocation::Kind::Dynamic ||
+                       loc.bindingKind() == BindingKind::Var;
+  }
+
+  if (topLevelFunction) {
+    return emitTopLevelFunction(index);
+  }
+
+  return emitHoisted(index);
+}
+
+bool FunctionEmitter::emitNonHoisted(GCThingIndex index) {
+
+
+  if (syntaxKind_ == FunctionSyntaxKind::DerivedClassConstructor) {
+    if (!bce_->emitGCIndexOp(JSOp::FunWithProto, index)) {
+      return false;
+    }
+    return true;
+  }
+
+  if (!bce_->emitGCIndexOp(JSOp::Lambda, index)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool FunctionEmitter::emitHoisted(GCThingIndex index) {
+  MOZ_ASSERT(syntaxKind_ == FunctionSyntaxKind::Statement);
+
+
+
+  NameOpEmitter noe(bce_, name_, NameOpEmitter::Kind::Initialize);
+  if (!noe.prepareForRhs()) {
+    return false;
+  }
+
+  if (!bce_->emitGCIndexOp(JSOp::Lambda, index)) {
+    return false;
+  }
+
+  if (!noe.emitAssignment()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool FunctionEmitter::emitTopLevelFunction(GCThingIndex index) {
+
+  if (bce_->sc->isModuleContext()) {
+    return bce_->sc->asModuleContext()->builder.noteFunctionDeclaration(
+        bce_->fc, index);
+  }
+
+  MOZ_ASSERT(bce_->sc->isGlobalContext() || bce_->sc->isEvalContext());
+  MOZ_ASSERT(syntaxKind_ == FunctionSyntaxKind::Statement);
+  MOZ_ASSERT(bce_->inPrologue());
+
+  (void)index;
+
+  return true;
+}
+
+bool FunctionScriptEmitter::prepareForParameters() {
+  MOZ_ASSERT(state_ == State::Start);
+  MOZ_ASSERT(bce_->inPrologue());
+
+
+  if (paramStart_) {
+    bce_->setScriptStartOffsetIfUnset(*paramStart_);
+  }
+
+
+  if (funbox_->namedLambdaBindings()) {
+    namedLambdaEmitterScope_.emplace(bce_);
+    if (!namedLambdaEmitterScope_->enterNamedLambda(bce_, funbox_)) {
+      return false;
+    }
+  }
+
+  if (funbox_->needsPromiseResult()) {
+    asyncEmitter_.emplace(bce_);
+  }
+
+  if (bodyEnd_) {
+    bce_->setFunctionBodyEndPos(*bodyEnd_);
+  }
+
+  if (paramStart_) {
+    if (!bce_->updateLineNumberNotes(*paramStart_)) {
+      return false;
+    }
+  }
+
+  tdzCache_.emplace(bce_);
+  functionEmitterScope_.emplace(bce_);
+
+  if (!functionEmitterScope_->enterFunction(bce_, funbox_)) {
+    return false;
+  }
+
+  if (!emitInitializeClosedOverArgumentBindings()) {
+    return false;
+  }
+
+  if (funbox_->hasParameterExprs) {
+    bce_->switchToMain();
+  }
+
+  if (!bce_->emitInitializeFunctionSpecialNames()) {
+    return false;
+  }
+
+  if (!funbox_->hasParameterExprs) {
+    bce_->switchToMain();
+  }
+
+  if (funbox_->needsPromiseResult()) {
+    if (funbox_->hasParameterExprs || funbox_->hasDestructuringArgs) {
+      if (!asyncEmitter_->prepareForParamsWithExpressionOrDestructuring()) {
+        return false;
+      }
+    } else {
+      if (!asyncEmitter_->prepareForParamsWithoutExpressionOrDestructuring()) {
+        return false;
+      }
+    }
+  }
+
+  if (funbox_->isClassConstructor()) {
+    if (!funbox_->isDerivedClassConstructor()) {
+      if (!bce_->emitInitializeInstanceMembers(false)) {
+        return false;
+      }
+    }
+  }
+
+#ifdef DEBUG
+  state_ = State::Parameters;
+#endif
+  return true;
+}
+
+bool FunctionScriptEmitter::emitInitializeClosedOverArgumentBindings() {
+
+  MOZ_ASSERT(bce_->inPrologue());
+
+  auto* bindings = funbox_->functionScopeBindings();
+  if (!bindings) {
+    return true;
+  }
+
+  const bool hasParameterExprs = funbox_->hasParameterExprs;
+
+  bool pushedUninitialized = false;
+  for (ParserPositionalFormalParameterIter fi(*bindings, hasParameterExprs); fi;
+       fi++) {
+    if (!fi.closedOver()) {
+      continue;
+    }
+
+    if (hasParameterExprs) {
+      NameLocation nameLoc = bce_->lookupName(fi.name());
+      if (!pushedUninitialized) {
+        if (!bce_->emit1(JSOp::Uninitialized)) {
+          return false;
+        }
+        pushedUninitialized = true;
+      }
+      if (!bce_->emitEnvCoordOp(JSOp::InitAliasedLexical,
+                                nameLoc.environmentCoordinate())) {
+        return false;
+      }
+    } else {
+      NameOpEmitter noe(bce_, fi.name(), NameOpEmitter::Kind::Initialize);
+      if (!noe.prepareForRhs()) {
+        return false;
+      }
+
+      if (!bce_->emitArgOp(JSOp::GetFrameArg, fi.argumentSlot())) {
+        return false;
+      }
+
+      if (!noe.emitAssignment()) {
+        return false;
+      }
+
+      if (!bce_->emit1(JSOp::Pop)) {
+        return false;
+      }
+    }
+  }
+
+  if (pushedUninitialized) {
+    MOZ_ASSERT(hasParameterExprs);
+    if (!bce_->emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool FunctionScriptEmitter::prepareForBody() {
+  MOZ_ASSERT(state_ == State::Parameters);
+
+
+  if (funbox_->needsPromiseResult()) {
+    if (!asyncEmitter_->emitParamsEpilogue()) {
+      return false;
+    }
+  }
+
+  if (!emitExtraBodyVarScope()) {
+    return false;
+  }
+
+  if (funbox_->needsPromiseResult()) {
+    if (!asyncEmitter_->prepareForBody()) {
+      return false;
+    }
+  }
+
+#ifdef DEBUG
+  state_ = State::Body;
+#endif
+  return true;
+}
+
+bool FunctionScriptEmitter::emitExtraBodyVarScope() {
+
+  if (!funbox_->functionHasExtraBodyVarScope()) {
+    return true;
+  }
+
+  extraBodyVarEmitterScope_.emplace(bce_);
+  if (!extraBodyVarEmitterScope_->enterFunctionExtraBodyVar(bce_, funbox_)) {
+    return false;
+  }
+
+  if (!funbox_->extraVarScopeBindings() || !funbox_->functionScopeBindings()) {
+    return true;
+  }
+
+  for (ParserBindingIter bi(*funbox_->functionScopeBindings(), true); bi;
+       bi++) {
+    auto name = bi.name();
+
+    if (!bce_->locationOfNameBoundInScope(name,
+                                          extraBodyVarEmitterScope_.ptr())) {
+      continue;
+    }
+
+    MOZ_ASSERT(name != TaggedParserAtomIndex::WellKnown::dot_this_() &&
+               name != TaggedParserAtomIndex::WellKnown::dot_newTarget_() &&
+               name != TaggedParserAtomIndex::WellKnown::dot_generator_());
+
+    NameOpEmitter noe(bce_, name, NameOpEmitter::Kind::Initialize);
+    if (!noe.prepareForRhs()) {
+      return false;
+    }
+
+    NameLocation paramLoc =
+        *bce_->locationOfNameBoundInScope(name, functionEmitterScope_.ptr());
+    if (!bce_->emitGetNameAtLocation(name, paramLoc)) {
+      return false;
+    }
+
+    if (!noe.emitAssignment()) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool FunctionScriptEmitter::emitEndBody() {
+  MOZ_ASSERT(state_ == State::Body);
+
+  if (bodyEnd_) {
+    if (!bce_->updateSourceCoordNotes(*bodyEnd_)) {
+      return false;
+    }
+  }
+
+  if (funbox_->needsFinalYield()) {
+    if (!bce_->emit1(JSOp::Undefined)) {
+      return false;
+    }
+    if (!bce_->emit1(JSOp::SetRval)) {
+      return false;
+    }
+
+    if (!bce_->emitJumpTargetAndPatch(bce_->finalYields)) {
+      return false;
+    }
+
+    if (funbox_->needsIteratorResult()) {
+      MOZ_ASSERT(!funbox_->needsPromiseResult());
+      if (!bce_->emitPrepareIteratorResult()) {
+        return false;
+      }
+
+      if (!bce_->emit1(JSOp::GetRval)) {
+        return false;
+      }
+
+      if (!bce_->emitFinishIteratorResult(true)) {
+        return false;
+      }
+
+      if (!bce_->emit1(JSOp::SetRval)) {
+        return false;
+      }
+
+    } else if (funbox_->needsPromiseResult()) {
+      if (!bce_->emit1(JSOp::GetRval)) {
+        return false;
+      }
+
+      if (!bce_->emitGetDotGeneratorInInnermostScope()) {
+        return false;
+      }
+
+      if (!bce_->emit1(JSOp::AsyncResolve)) {
+        return false;
+      }
+
+      if (!bce_->emit1(JSOp::SetRval)) {
+        return false;
+      }
+    }
+
+    if (!bce_->emitGetDotGeneratorInInnermostScope()) {
+      return false;
+    }
+
+    if (!bce_->emitYieldOp(JSOp::FinalYieldRval)) {
+      return false;
+    }
+
+    if (funbox_->needsPromiseResult()) {
+      if (!asyncEmitter_->emitEndFunction()) {
+        return false;
+      }
+    }
+
+  } else {
+    if (bce_->hasTryFinally) {
+      if (!bce_->emit1(JSOp::Undefined)) {
+        return false;
+      }
+      if (!bce_->emit1(JSOp::SetRval)) {
+        return false;
+      }
+    }
+  }
+
+  if (funbox_->isDerivedClassConstructor()) {
+    if (!bce_->emitJumpTargetAndPatch(bce_->endOfDerivedClassConstructorBody)) {
+      return false;
+    }
+
+    if (!bce_->emitCheckDerivedClassConstructorReturn()) {
+      return false;
+    }
+  }
+
+  if (extraBodyVarEmitterScope_) {
+    if (!extraBodyVarEmitterScope_->leave(bce_)) {
+      return false;
+    }
+
+    extraBodyVarEmitterScope_.reset();
+  }
+
+  if (!functionEmitterScope_->leave(bce_)) {
+    return false;
+  }
+  functionEmitterScope_.reset();
+  tdzCache_.reset();
+
+  if (!funbox_->hasExprBody()) {
+    if (!bce_->markSimpleBreakpoint()) {
+      return false;
+    }
+  }
+
+  if (!funbox_->hasExprBody() || funbox_->isAsync()) {
+    if (!bce_->emitReturnRval()) {
+      return false;
+    }
+  }
+
+  if (namedLambdaEmitterScope_) {
+    if (!namedLambdaEmitterScope_->leave(bce_)) {
+      return false;
+    }
+    namedLambdaEmitterScope_.reset();
+  }
+
+#ifdef DEBUG
+  state_ = State::EndBody;
+#endif
+  return true;
+}
+
+bool FunctionScriptEmitter::intoStencil() {
+  MOZ_ASSERT(state_ == State::EndBody);
+
+  if (!bce_->intoScriptStencil(funbox_->index())) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::End;
+#endif
+
+  return true;
+}
+
+FunctionParamsEmitter::FunctionParamsEmitter(BytecodeEmitter* bce,
+                                             FunctionBox* funbox)
+    : bce_(bce),
+      funbox_(funbox),
+      functionEmitterScope_(bce_->innermostEmitterScope()) {}
+
+bool FunctionParamsEmitter::emitSimple(TaggedParserAtomIndex paramName) {
+  MOZ_ASSERT(state_ == State::Start);
+
+
+  if (funbox_->hasParameterExprs) {
+    if (!bce_->emitArgOp(JSOp::GetArg, argSlot_)) {
+      return false;
+    }
+
+    if (!emitAssignment(paramName)) {
+      return false;
+    }
+  }
+
+  argSlot_++;
+  return true;
+}
+
+bool FunctionParamsEmitter::prepareForDefault() {
+  MOZ_ASSERT(state_ == State::Start);
+
+
+  if (!prepareForInitializer()) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::Default;
+#endif
+  return true;
+}
+
+bool FunctionParamsEmitter::emitDefaultEnd(TaggedParserAtomIndex paramName) {
+  MOZ_ASSERT(state_ == State::Default);
+
+
+  if (!emitInitializerEnd()) {
+    return false;
+  }
+  if (!emitAssignment(paramName)) {
+    return false;
+  }
+
+  argSlot_++;
+
+#ifdef DEBUG
+  state_ = State::Start;
+#endif
+  return true;
+}
+
+bool FunctionParamsEmitter::prepareForDestructuring() {
+  MOZ_ASSERT(state_ == State::Start);
+
+
+  if (!bce_->emitArgOp(JSOp::GetArg, argSlot_)) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::Destructuring;
+#endif
+  return true;
+}
+
+bool FunctionParamsEmitter::emitDestructuringEnd() {
+  MOZ_ASSERT(state_ == State::Destructuring);
+
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  argSlot_++;
+
+#ifdef DEBUG
+  state_ = State::Start;
+#endif
+  return true;
+}
+
+bool FunctionParamsEmitter::prepareForDestructuringDefaultInitializer() {
+  MOZ_ASSERT(state_ == State::Start);
+
+
+  if (!prepareForInitializer()) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::DestructuringDefaultInitializer;
+#endif
+  return true;
+}
+
+bool FunctionParamsEmitter::prepareForDestructuringDefault() {
+  MOZ_ASSERT(state_ == State::DestructuringDefaultInitializer);
+
+
+  if (!emitInitializerEnd()) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::DestructuringDefault;
+#endif
+  return true;
+}
+
+bool FunctionParamsEmitter::emitDestructuringDefaultEnd() {
+  MOZ_ASSERT(state_ == State::DestructuringDefault);
+
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  argSlot_++;
+
+#ifdef DEBUG
+  state_ = State::Start;
+#endif
+  return true;
+}
+
+bool FunctionParamsEmitter::emitRest(TaggedParserAtomIndex paramName) {
+  MOZ_ASSERT(state_ == State::Start);
+
+
+  if (!emitRestArray()) {
+    return false;
+  }
+  if (!emitAssignment(paramName)) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::End;
+#endif
+  return true;
+}
+
+bool FunctionParamsEmitter::prepareForDestructuringRest() {
+  MOZ_ASSERT(state_ == State::Start);
+
+
+  if (!emitRestArray()) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::DestructuringRest;
+#endif
+  return true;
+}
+
+bool FunctionParamsEmitter::emitDestructuringRestEnd() {
+  MOZ_ASSERT(state_ == State::DestructuringRest);
+
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::End;
+#endif
+  return true;
+}
+
+bool FunctionParamsEmitter::prepareForInitializer() {
+
+  MOZ_ASSERT(funbox_->hasParameterExprs);
+  if (!bce_->emitArgOp(JSOp::GetArg, argSlot_)) {
+    return false;
+  }
+  default_.emplace(bce_);
+  if (!default_->prepareForDefault()) {
+    return false;
+  }
+  return true;
+}
+
+bool FunctionParamsEmitter::emitInitializerEnd() {
+
+  if (!default_->emitEnd()) {
+    return false;
+  }
+  default_.reset();
+  return true;
+}
+
+bool FunctionParamsEmitter::emitRestArray() {
+
+  if (!bce_->emit1(JSOp::Rest)) {
+    return false;
+  }
+  return true;
+}
+
+bool FunctionParamsEmitter::emitAssignment(TaggedParserAtomIndex paramName) {
+
+  NameLocation paramLoc =
+      *bce_->locationOfNameBoundInScope(paramName, functionEmitterScope_);
+
+  MOZ_ASSERT(paramLoc.kind() == NameLocation::Kind::ArgumentSlot ||
+             paramLoc.kind() == NameLocation::Kind::FrameSlot ||
+             paramLoc.kind() == NameLocation::Kind::EnvironmentCoordinate);
+
+  NameOpEmitter noe(bce_, paramName, paramLoc, NameOpEmitter::Kind::Initialize);
+  if (!noe.prepareForRhs()) {
+    return false;
+  }
+
+  if (!noe.emitAssignment()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  return true;
+}

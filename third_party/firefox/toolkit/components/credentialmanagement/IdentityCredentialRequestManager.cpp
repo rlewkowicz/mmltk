@@ -1,0 +1,132 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "IdentityCredentialRequestManager.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "nsContentUtils.h"
+
+namespace mozilla {
+
+NS_IMPL_ISUPPORTS0(IdentityCredentialRequestManager);
+
+StaticRefPtr<IdentityCredentialRequestManager>
+    IdentityCredentialRequestManager::sSingleton;
+
+IdentityCredentialRequestManager*
+IdentityCredentialRequestManager::GetInstance() {
+  if (!sSingleton) {
+    sSingleton = new IdentityCredentialRequestManager();
+    ClearOnShutdown(&sSingleton);
+  }
+  return sSingleton;
+}
+
+RefPtr<MozPromise<std::tuple<nsCString, Maybe<nsCString>>, nsresult, true>>
+IdentityCredentialRequestManager::GetTokenFromPopup(
+    dom::WebIdentityParent* aRelyingPartyWindow, nsIURI* aURLToOpen) {
+  MOZ_ASSERT(aRelyingPartyWindow);
+  MOZ_ASSERT(aURLToOpen);
+
+  RefPtr<MozPromise<std::tuple<nsCString, Maybe<nsCString>>, nsresult,
+                    true>::Private>
+      result = new MozPromise<std::tuple<nsCString, Maybe<nsCString>>, nsresult,
+                              true>::Private(__func__);
+  NotNull<nsIURI*> uri = WrapNotNull(aURLToOpen);
+  RefPtr<IdentityCredentialRequestManager> self = this;
+
+  aRelyingPartyWindow->SendOpenContinuationWindow(
+      uri,
+      [result, self](const dom::OpenContinuationWindowResponse& response) {
+        if (response.type() == dom::OpenContinuationWindowResponse::Tnsresult) {
+          result->Reject(response.get_nsresult(), __func__);
+          return;
+        }
+        if (response.type() == dom::OpenContinuationWindowResponse::
+                                   TMaybeDiscardedBrowsingContext) {
+          const dom::MaybeDiscardedBrowsingContext& bc =
+              response.get_MaybeDiscardedBrowsingContext();
+          if (bc.IsNullOrDiscarded()) {
+            result->Reject(NS_ERROR_DOM_NETWORK_ERR, __func__);
+            return;
+          }
+          dom::CanonicalBrowsingContext* chromeBC =
+              bc.get_canonical()->TopCrossChromeBoundary();
+          if (!chromeBC) {
+            result->Reject(NS_ERROR_DOM_NETWORK_ERR, __func__);
+            return;
+          }
+
+          MOZ_ASSERT(!self->mPendingTokenRequests.Contains(chromeBC->Id()));
+
+          self->mPendingTokenRequests.InsertOrUpdate(chromeBC->Id(), result);
+
+          chromeBC->AddFinalDiscardListener([self](uint64_t id) {
+            Maybe<RefPtr<MozPromise<std::tuple<nsCString, Maybe<nsCString>>,
+                                    nsresult, true>::Private>>
+                pending = self->mPendingTokenRequests.Extract(id);
+            if (pending.isNothing()) {
+              return;
+            }
+            pending.value()->Reject(NS_ERROR_DOM_NETWORK_ERR, __func__);
+          });
+        }
+      },
+      [result](const ipc::ResponseRejectReason& rejection) {
+        result->Reject(NS_ERROR_DOM_NETWORK_ERR, __func__);
+      });
+  return result.forget();
+}
+
+nsresult IdentityCredentialRequestManager::MaybeResolvePopup(
+    dom::WebIdentityParent* aPopupWindow, const nsCString& aToken,
+    const dom::IdentityResolveOptions& aOptions) {
+  dom::WindowGlobalParent* manager =
+      static_cast<dom::WindowGlobalParent*>(aPopupWindow->Manager());
+  if (!manager) {
+    return NS_ERROR_DOM_NOT_ALLOWED_ERR;
+  }
+  dom::CanonicalBrowsingContext* bc = manager->BrowsingContext();
+  if (!bc) {
+    return NS_ERROR_DOM_NOT_ALLOWED_ERR;
+  }
+  dom::CanonicalBrowsingContext* chromeBC = bc->TopCrossChromeBoundary();
+  if (!chromeBC) {
+    return NS_ERROR_DOM_NOT_ALLOWED_ERR;
+  }
+
+  Maybe<RefPtr<MozPromise<std::tuple<nsCString, Maybe<nsCString>>, nsresult,
+                          true>::Private>>
+      pendingPromise = mPendingTokenRequests.Extract(chromeBC->Id());
+
+  if (!pendingPromise.isSome()) {
+    return NS_ERROR_DOM_NOT_ALLOWED_ERR;
+  }
+  Maybe<nsCString> overrideAccountId = Nothing();
+  if (aOptions.mAccountId.WasPassed()) {
+    overrideAccountId = Some(aOptions.mAccountId.Value());
+  }
+  pendingPromise.value()->Resolve(std::make_tuple(aToken, overrideAccountId),
+                                  __func__);
+  return NS_OK;
+}
+
+bool IdentityCredentialRequestManager::IsActivePopup(
+    dom::WebIdentityParent* aPopupWindow) {
+  dom::WindowGlobalParent* manager =
+      static_cast<dom::WindowGlobalParent*>(aPopupWindow->Manager());
+  if (!manager) {
+    return false;
+  }
+  dom::CanonicalBrowsingContext* bc = manager->BrowsingContext();
+  if (!bc) {
+    return false;
+  }
+  dom::CanonicalBrowsingContext* chromeBC = bc->TopCrossChromeBoundary();
+  if (!chromeBC) {
+    return false;
+  }
+  return mPendingTokenRequests.Contains(chromeBC->Id());
+}
+
+}  

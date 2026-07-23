@@ -1,0 +1,61 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_QUOTA_CLIENTDIRECTORYLOCKHANDLE_H_
+#define DOM_QUOTA_CLIENTDIRECTORYLOCKHANDLE_H_
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/quota/ConditionalCompilation.h"
+#include "nsISupportsImpl.h"
+
+namespace mozilla::dom::quota {
+
+class ClientDirectoryLock;
+
+class ClientDirectoryLockHandle final {
+ public:
+  ClientDirectoryLockHandle();
+
+  explicit ClientDirectoryLockHandle(
+      RefPtr<ClientDirectoryLock> aClientDirectoryLock);
+
+  ClientDirectoryLockHandle(const ClientDirectoryLockHandle&) = delete;
+
+  ClientDirectoryLockHandle(ClientDirectoryLockHandle&& aOther) noexcept;
+
+  ~ClientDirectoryLockHandle();
+
+  void AssertIsOnOwningThread() const;
+
+  ClientDirectoryLockHandle& operator=(const ClientDirectoryLockHandle&) =
+      delete;
+
+  ClientDirectoryLockHandle& operator=(
+      ClientDirectoryLockHandle&& aOther) noexcept;
+
+  explicit operator bool() const;
+
+  ClientDirectoryLock* get() const;
+
+  ClientDirectoryLock& operator*() const;
+
+  ClientDirectoryLock* operator->() const;
+
+  bool IsRegistered() const;
+
+  void SetRegistered(bool aRegistered);
+
+  DIAGNOSTICONLY(bool IsInert() const);
+
+ private:
+  NS_DECL_OWNINGTHREAD
+
+  RefPtr<ClientDirectoryLock> mClientDirectoryLock;
+
+  bool mRegistered = false;
+};
+
+}  
+
+#endif  // DOM_QUOTA_CLIENTDIRECTORYLOCKHANDLE_H_

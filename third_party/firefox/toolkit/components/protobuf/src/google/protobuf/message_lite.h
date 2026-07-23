@@ -1,0 +1,1423 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+
+#if !defined(GOOGLE_PROTOBUF_MESSAGE_LITE_H__)
+#define GOOGLE_PROTOBUF_MESSAGE_LITE_H__
+
+#include <climits>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <iosfwd>
+#include <memory>
+#include <string>
+#include <type_traits>
+#include <utility>
+
+#include "absl/base/attributes.h"
+#include "absl/base/macros.h"
+#include "absl/log/absl_check.h"
+#include "absl/strings/cord.h"
+#include "absl/strings/string_view.h"
+#include "google/protobuf/arena.h"
+#include "google/protobuf/internal_visibility.h"
+#include "google/protobuf/io/coded_stream.h"
+#include "google/protobuf/metadata_lite.h"
+#include "google/protobuf/port.h"
+
+
+// clang-format off
+#include "google/protobuf/port_def.inc"
+// clang-format on
+
+#if defined(SWIG)
+#error "You cannot SWIG proto headers"
+#endif
+
+namespace google {
+namespace protobuf {
+
+template <typename T>
+class RepeatedPtrField;
+
+class FastReflectionMessageMutator;
+class FastReflectionStringSetter;
+class Reflection;
+class Descriptor;
+class AssignDescriptorsHelper;
+class MessageLite;
+
+namespace io {
+
+class CodedInputStream;
+class CodedOutputStream;
+class ZeroCopyInputStream;
+class ZeroCopyOutputStream;
+
+}  
+
+namespace compiler {
+namespace cpp {
+class MessageTableTester;
+}  
+}  
+
+namespace internal {
+
+PROTOBUF_EXPORT void GenericSwap(MessageLite* lhs, MessageLite* rhs);
+PROTOBUF_EXPORT void GenericSwap(Message* lhs, Message* rhs);
+
+struct PrivateAccess;
+
+class MessageCreator {
+ public:
+  using Func = void* (*)(const void*, void*, Arena*);
+
+  enum Tag : int8_t {
+    kFunc = -1,
+    kZeroInit = 0,
+    kMemcpy = 1,
+  };
+
+  constexpr MessageCreator()
+      : allocation_size_(), tag_(), alignment_(), func_(nullptr) {}
+
+  static constexpr MessageCreator ZeroInit(uint32_t allocation_size,
+                                           uint8_t alignment) {
+    MessageCreator out;
+    out.allocation_size_ = allocation_size;
+    out.tag_ = kZeroInit;
+    out.alignment_ = alignment;
+    return out;
+  }
+  static constexpr MessageCreator CopyInit(uint32_t allocation_size,
+                                           uint8_t alignment) {
+    MessageCreator out;
+    out.allocation_size_ = allocation_size;
+    out.tag_ = kMemcpy;
+    out.alignment_ = alignment;
+    return out;
+  }
+  constexpr MessageCreator(Func func, uint32_t allocation_size,
+                           uint8_t alignment)
+      : allocation_size_(allocation_size),
+        tag_(kFunc),
+        alignment_(alignment),
+        func_(func) {}
+
+  template <typename MessageLite>
+  MessageLite* New(const MessageLite* prototype_for_func,
+                   const MessageLite* prototype_for_copy, Arena* arena) const;
+
+  template <typename MessageLite>
+  MessageLite* PlacementNew(const MessageLite* prototype_for_func,
+                            const MessageLite* prototype_for_copy, void* mem,
+                            Arena* arena) const;
+
+  Tag tag() const { return tag_; }
+
+  uint32_t allocation_size() const { return allocation_size_; }
+
+  uint8_t alignment() const { return alignment_; }
+
+ private:
+  uint32_t allocation_size_;
+  Tag tag_;
+  uint8_t alignment_;
+  Func func_;
+};
+
+class PROTOBUF_EXPORT CachedSize {
+ private:
+  using Scalar = int;
+
+ public:
+  constexpr CachedSize() noexcept : atom_(Scalar{}) {}
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  constexpr CachedSize(Scalar desired) noexcept : atom_(desired) {}
+
+#if defined(PROTOBUF_BUILTIN_ATOMIC)
+  constexpr CachedSize(const CachedSize& other) = default;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD Scalar Get() const noexcept {
+    return __atomic_load_n(&atom_, __ATOMIC_RELAXED);
+  }
+
+  void Set(Scalar desired) const noexcept {
+    if (ABSL_PREDICT_FALSE(desired == 0)) {
+      if (Get() == 0) return;
+    }
+    __atomic_store_n(&atom_, desired, __ATOMIC_RELAXED);
+  }
+
+  void SetNonZero(Scalar desired) const noexcept {
+    ABSL_DCHECK_NE(desired, 0);
+    __atomic_store_n(&atom_, desired, __ATOMIC_RELAXED);
+  }
+
+  void SetNoDefaultInstance(Scalar desired) const noexcept {
+    __atomic_store_n(&atom_, desired, __ATOMIC_RELAXED);
+  }
+#else
+  CachedSize(const CachedSize& other) noexcept : atom_(other.Get()) {}
+  CachedSize& operator=(const CachedSize& other) noexcept {
+    Set(other.Get());
+    return *this;
+  }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD Scalar Get() const noexcept {  
+    return atom_.load(std::memory_order_relaxed);
+  }
+
+  void Set(Scalar desired) const noexcept {
+    if (ABSL_PREDICT_FALSE(desired == 0)) {
+      if (Get() == 0) return;
+    }
+    atom_.store(desired, std::memory_order_relaxed);
+  }
+
+  void SetNonZero(Scalar desired) const noexcept {
+    ABSL_DCHECK_NE(desired, 0);
+    atom_.store(desired, std::memory_order_relaxed);
+  }
+
+  void SetNoDefaultInstance(Scalar desired) const noexcept {
+    atom_.store(desired, std::memory_order_relaxed);
+  }
+#endif
+
+ private:
+#if defined(PROTOBUF_BUILTIN_ATOMIC)
+  mutable Scalar atom_;
+#else
+  mutable std::atomic<Scalar> atom_;
+#endif
+};
+
+struct ClassData;
+
+template <typename Type>
+const ClassData* GetClassData(const Type& msg);
+
+template <typename T>
+struct FallbackMessageTraits {
+  static const void* default_instance() { return &T::default_instance(); }
+  static constexpr const auto* class_data() {
+    return GetClassData<MessageLite>(T::default_instance());
+  }
+  static constexpr auto StrongPointer() { return &T::default_instance; }
+};
+
+template <const uint32_t* kValidationData>
+struct EnumTraitsT {
+  static constexpr const uint32_t* validation_data() { return kValidationData; }
+};
+
+struct MessageTraitsImpl {
+  template <typename T>
+  static FallbackMessageTraits<T> value;
+};
+template <typename T>
+using MessageTraits = decltype(MessageTraitsImpl::value<T>);
+
+struct EnumTraitsImpl {
+  struct Undefined;
+  template <typename T>
+  static std::enable_if_t<sizeof(T) != 0, Undefined> value;
+};
+template <typename T>
+using EnumTraits = decltype(EnumTraitsImpl::value<T>);
+
+template <typename T>
+struct LiteEnumFuncs {
+  static constexpr bool kIsDefined = false;
+};
+
+class SwapFieldHelper;
+
+class ParseContext;
+
+struct DescriptorTable;
+class DescriptorPoolExtensionFinder;
+class ExtensionSet;
+class HasBitsTestPeer;
+class InternalMetadataOffset;
+template <typename T, size_t kFieldOffset>
+struct InternalMetadataOffsetHelper;
+class LazyField;
+class RepeatedPtrFieldBase;
+class TcParser;
+struct TcParseTableBase;
+class WireFormatLite;
+class WeakFieldMap;
+class RustMapHelper;
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline int ToCachedSize(size_t size) { return static_cast<int>(size); }
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline size_t FromIntSize(int size) {
+  return static_cast<unsigned int>(size);
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline int ToIntSize(size_t size) {
+  ABSL_DCHECK_LE(size, static_cast<size_t>(INT_MAX));
+  return static_cast<int>(size);
+}
+
+
+PROTOBUF_EXPORT inline const std::string& GetEmptyStringAlreadyInited() {
+  return fixed_address_empty_string.get();
+}
+
+struct ClassDataFull;
+
+
+struct PROTOBUF_EXPORT ClassData {
+#if !defined(PROTOBUF_MESSAGE_GLOBALS)
+  const MessageLite* prototype;
+#endif
+  const internal::TcParseTableBase* tc_table;
+  bool (*is_initialized)(const MessageLite&);
+  void (*merge_to_from)(MessageLite& to, const MessageLite& from_msg);
+  internal::MessageCreator message_creator;
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  void (*destroy_message)(MessageLite& msg);
+  void (MessageLite::*clear)();
+  size_t (*byte_size_long)(const MessageLite&);
+  uint8_t* (*serialize)(const MessageLite& msg, uint8_t* ptr,
+                        io::EpsCopyOutputStream* stream);
+#endif
+
+  uint32_t cached_size_offset;
+  bool is_lite;
+  bool is_dynamic = false;
+
+#if !defined(PROTOBUF_CUSTOM_VTABLE)
+  constexpr ClassData(const MessageLite* prototype,
+                      const internal::TcParseTableBase* tc_table,
+                      bool (*is_initialized)(const MessageLite&),
+                      void (*merge_to_from)(MessageLite& to,
+                                            const MessageLite& from_msg),
+                      internal::MessageCreator message_creator,
+                      uint32_t cached_size_offset, bool is_lite)
+      :
+#if !defined(PROTOBUF_MESSAGE_GLOBALS)
+        prototype(prototype),
+#endif
+        tc_table(tc_table),
+        is_initialized(is_initialized),
+        merge_to_from(merge_to_from),
+        message_creator(message_creator),
+        cached_size_offset(cached_size_offset),
+        is_lite(is_lite) {
+  }
+#endif
+
+  constexpr ClassData(
+      const MessageLite* prototype, const internal::TcParseTableBase* tc_table,
+      bool (*is_initialized)(const MessageLite&),
+      void (*merge_to_from)(MessageLite& to, const MessageLite& from_msg),
+      internal::MessageCreator message_creator,
+      [[maybe_unused]] void (*destroy_message)(MessageLite& msg),  
+      [[maybe_unused]] void (MessageLite::*clear)(),
+      [[maybe_unused]] size_t (*byte_size_long)(const MessageLite&),
+      [[maybe_unused]] uint8_t* (*serialize)(const MessageLite& msg,
+                                             uint8_t* ptr,
+                                             io::EpsCopyOutputStream* stream),
+      uint32_t cached_size_offset, bool is_lite)
+      :
+#if !defined(PROTOBUF_MESSAGE_GLOBALS)
+        prototype(prototype),
+#endif
+        tc_table(tc_table),
+        is_initialized(is_initialized),
+        merge_to_from(merge_to_from),
+        message_creator(message_creator),
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        destroy_message(destroy_message),
+        clear(clear),
+        byte_size_long(byte_size_long),
+        serialize(serialize),
+#endif
+        cached_size_offset(cached_size_offset),
+        is_lite(is_lite) {
+  }
+
+  const ClassDataFull& full() const;
+
+#if !defined(PROTOBUF_MESSAGE_GLOBALS)
+  const MessageLite* default_instance() const { return prototype; }
+#else
+  const MessageLite* default_instance() const;
+#endif
+
+  MessageLite* New(Arena* arena) const {
+    const MessageLite* def = default_instance();
+    return message_creator.New(def, def, arena);
+  }
+
+  MessageLite* PlacementNew(void* mem, Arena* arena) const {
+    const MessageLite* def = default_instance();
+    return message_creator.PlacementNew(def, def, mem, arena);
+  }
+
+  uint32_t allocation_size() const { return message_creator.allocation_size(); }
+
+  uint8_t alignment() const { return message_creator.alignment(); }
+};
+
+#if !defined(PROTOBUF_MESSAGE_GLOBALS)
+struct ClassDataLite : ClassData {
+  constexpr ClassDataLite(ClassData base, const char* type_name)
+      : ClassData(base), type_name_ptr(type_name) {}
+
+  const char* type_name() const { return type_name_ptr; }
+  const char* type_name_ptr;
+
+  constexpr const ClassData* base() const { return this; }
+};
+#else
+using ClassDataLite = ClassDataFull;
+#endif
+
+struct PROTOBUF_EXPORT DescriptorMethods {
+  absl::string_view (*get_type_name)(const ClassData* data);
+  std::string (*initialization_error_string)(const MessageLite&);
+  const internal::TcParseTableBase* (*get_tc_table)(const MessageLite&);
+  size_t (*space_used_long)(const MessageLite&);
+  std::string (*debug_string)(const MessageLite&);
+  void (*verify_lazy_field_consistency)(const LazyField&);
+};
+
+struct PROTOBUF_EXPORT ReflectionData {
+  constexpr ReflectionData(const DescriptorMethods* descriptor_methods,
+                           const internal::DescriptorTable* descriptor_table,
+                           void (*get_metadata_tracker)())
+      : reflection(nullptr),
+        descriptor(nullptr),
+        descriptor_table(descriptor_table),
+        descriptor_methods(descriptor_methods),
+        get_metadata_tracker(get_metadata_tracker) {}
+
+  const Reflection* reflection;
+  const Descriptor* descriptor;
+
+  const internal::DescriptorTable* descriptor_table;
+  const DescriptorMethods* descriptor_methods;
+  void (*get_metadata_tracker)();
+};
+
+#if !defined(PROTOBUF_MESSAGE_GLOBALS)
+struct PROTOBUF_EXPORT ClassDataFull : ClassData {
+  constexpr ClassDataFull(ClassData base,
+                          const DescriptorMethods* descriptor_methods,
+                          const internal::DescriptorTable* descriptor_table,
+                          void (*get_metadata_tracker)())
+      : ClassData(base),
+        reflection_ptr(nullptr),
+        descriptor_ptr(nullptr),
+        descriptor_table_ptr(descriptor_table),
+        descriptor_methods_ptr(descriptor_methods),
+        get_metadata_tracker_func(get_metadata_tracker) {}
+
+  constexpr const ClassData* base() const { return this; }
+
+  const Reflection* reflection() const { return reflection_ptr; }
+  const Descriptor* descriptor() const { return descriptor_ptr; }
+
+  void set_reflection(const Reflection* reflection) const {
+    reflection_ptr = reflection;
+  }
+  void set_descriptor(const Descriptor* descriptor) const {
+    descriptor_ptr = descriptor;
+  }
+
+  const internal::DescriptorTable* descriptor_table() const {
+    return descriptor_table_ptr;
+  }
+  const DescriptorMethods* descriptor_methods() const {
+    return descriptor_methods_ptr;
+  }
+  bool has_get_metadata_tracker() const {
+    return get_metadata_tracker_func != nullptr;
+  }
+  void get_metadata_tracker() const { get_metadata_tracker_func(); }
+
+  mutable const Reflection* reflection_ptr;
+  mutable const Descriptor* descriptor_ptr;
+
+  const internal::DescriptorTable* descriptor_table_ptr;
+  const DescriptorMethods* descriptor_methods_ptr;
+  void (*get_metadata_tracker_func)();
+};
+#else
+struct PROTOBUF_EXPORT ClassDataFull : ClassData {
+  constexpr ClassDataFull(ClassData base, ReflectionData* reflection_data)
+      : ClassData(base), aux_data{.reflection_data = reflection_data} {
+    ABSL_DCHECK(!is_lite);
+  }
+
+  constexpr ClassDataFull(ClassData base, const char* type_name)
+      : ClassData(base), aux_data{.type_name = type_name} {
+    ABSL_DCHECK(is_lite);
+  }
+
+  constexpr const ClassData* base() const { return this; }
+
+  const Reflection* reflection() const { return reflection_data()->reflection; }
+  const Descriptor* descriptor() const { return reflection_data()->descriptor; }
+
+  void set_reflection(const Reflection* reflection) const {
+    reflection_data()->reflection = reflection;
+  }
+  void set_descriptor(const Descriptor* descriptor) const {
+    reflection_data()->descriptor = descriptor;
+  }
+
+  const internal::DescriptorTable* descriptor_table() const {
+    return reflection_data()->descriptor_table;
+  }
+  const DescriptorMethods* descriptor_methods() const {
+    return reflection_data()->descriptor_methods;
+  }
+  bool has_get_metadata_tracker() const {
+    return reflection_data()->get_metadata_tracker != nullptr;
+  }
+  void get_metadata_tracker() const {
+    reflection_data()->get_metadata_tracker();
+  }
+
+  ReflectionData* reflection_data() const {
+    ABSL_DCHECK(!is_lite);
+    return aux_data.reflection_data;
+  }
+
+  const char* type_name() const {
+    ABSL_DCHECK(is_lite);
+    return aux_data.type_name;
+  }
+
+  union ReflectionDataOrTypeName {
+    ReflectionData* reflection_data;
+    const char* type_name;
+  } aux_data;
+};
+#endif
+
+inline const ClassDataFull& ClassData::full() const {
+  ABSL_DCHECK(!is_lite);
+  return *static_cast<const ClassDataFull*>(this);
+}
+
+#if !defined(PROTOBUF_MESSAGE_GLOBALS)
+struct MessageGlobalsBase {
+  template <typename T = MessageLite>
+  static const T* ToDefaultInstance(const void* globals) {
+    return reinterpret_cast<const T*>(globals);
+  }
+
+  static const MessageGlobalsBase* FromDefaultInstance(
+      const void* default_instance) {
+    return reinterpret_cast<const MessageGlobalsBase*>(default_instance);
+  }
+};
+
+template <const auto* kDefault, const auto* kClassData>
+struct GeneratedMessageTraitsT {
+  static constexpr const void* default_instance() { return kDefault; }
+  static constexpr const auto* class_data() { return kClassData->base(); }
+  static constexpr auto StrongPointer() { return default_instance(); }
+};
+#else
+struct MessageGlobalsBase {
+  template <size_t R>
+  static constexpr size_t RoundUpTo(size_t n) {
+    static_assert(absl::has_single_bit(R), "Must be power of two");
+    return (n + (R - 1)) & ~(R - 1);
+  }
+
+  static constexpr size_t OffsetToDefault() {
+    return RoundUpTo<kMaxMessageAlignment>(sizeof(MessageGlobalsBase));
+  }
+  template <typename T = MessageLite>
+  static const T* ToDefaultInstance(const void* globals) {
+    return reinterpret_cast<const T*>(reinterpret_cast<const char*>(globals) +
+                                      OffsetToDefault());
+  }
+
+  static const MessageGlobalsBase* FromDefaultInstance(
+      const void* default_instance) {
+    return reinterpret_cast<const MessageGlobalsBase*>(
+        reinterpret_cast<const char*>(default_instance) - OffsetToDefault());
+  }
+
+  static constexpr const ClassData* GetClassData(const void* globals) {
+    return static_cast<const MessageGlobalsBase*>(globals)->class_data.base();
+  }
+  constexpr const ClassData* GetClassData() const { return class_data.base(); }
+
+  explicit constexpr MessageGlobalsBase(ClassDataFull class_data)
+      : class_data(class_data) {}
+
+  static const TcParseTableBase* ToParseTableBase(const void* g) {
+    const auto* globals = static_cast<const MessageGlobalsBase*>(g);
+    ABSL_DCHECK_NE(globals, nullptr);
+    return globals->class_data.tc_table;
+  }
+
+  ClassDataFull class_data;
+};
+
+template <const auto* kGlobals>
+struct GeneratedMessageTraitsT {
+  static const void* default_instance() {
+    return MessageGlobalsBase::ToDefaultInstance(kGlobals);
+  }
+  static const auto* class_data() {
+    return MessageGlobalsBase::GetClassData(kGlobals);
+  }
+  static constexpr const auto* globals() { return kGlobals; }
+  static constexpr auto StrongPointer() { return kGlobals; }
+};
+
+inline const MessageLite* ClassData::default_instance() const {
+  static_assert(PROTOBUF_FIELD_OFFSET(MessageGlobalsBase, class_data) == 0);
+  return MessageGlobalsBase::ToDefaultInstance(this);
+}
+#endif
+}  
+
+class PROTOBUF_EXPORT MessageLite {
+ public:
+  MessageLite(const MessageLite&) = delete;
+  MessageLite& operator=(const MessageLite&) = delete;
+  PROTOBUF_VIRTUAL ~MessageLite() = default;
+
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD absl::string_view GetTypeName() const;
+
+  [[nodiscard]] MessageLite* New() const { return New(nullptr); }
+
+  [[nodiscard]] MessageLite* New(Arena* arena) const;
+
+  [[nodiscard]] Arena* GetArena() const { return _internal_metadata_.arena(); }
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  void Clear() { (this->*_class_data_->clear)(); }
+#else
+  virtual void Clear() = 0;
+#endif
+
+  [[nodiscard]] bool IsInitialized() const;
+
+  [[nodiscard]] std::string InitializationErrorString() const;
+
+  void CheckTypeAndMergeFrom(const MessageLite& other);
+
+  [[nodiscard]] std::string DebugString() const;
+  [[nodiscard]] std::string ShortDebugString() const { return DebugString(); }
+  [[nodiscard]] std::string Utf8DebugString() const { return DebugString(); }
+
+  template <typename Sink>
+  friend void AbslStringify(Sink& sink, const google::protobuf::MessageLite& msg) {
+    sink.Append(msg.DebugString());
+  }
+
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParseFromCodedStream(io::CodedInputStream* input);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParsePartialFromCodedStream(io::CodedInputStream* input);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParseFromZeroCopyStream(io::ZeroCopyInputStream* input);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParsePartialFromZeroCopyStream(io::ZeroCopyInputStream* input);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParseFromFileDescriptor(int file_descriptor);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParsePartialFromFileDescriptor(int file_descriptor);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParseFromIstream(std::istream* input);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParsePartialFromIstream(std::istream* input);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool
+  MergePartialFromBoundedZeroCopyStream(io::ZeroCopyInputStream* input,
+                                        int size);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool MergeFromBoundedZeroCopyStream(
+      io::ZeroCopyInputStream* input, int size);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParseFromBoundedZeroCopyStream(io::ZeroCopyInputStream* input, int size);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParsePartialFromBoundedZeroCopyStream(io::ZeroCopyInputStream* input,
+                                        int size);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParseFromString(absl::string_view data);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParseFromString(const absl::Cord& data);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParsePartialFromString(absl::string_view data);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParsePartialFromString(const absl::Cord& data);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParseFromArray(const void* data, int size);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParsePartialFromArray(const void* data, int size);
+
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool MergeFromCodedStream(
+      io::CodedInputStream* input);
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool MergePartialFromCodedStream(
+      io::CodedInputStream* input);
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool MergeFromString(
+      absl::string_view data);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool MergeFromString(
+      const absl::Cord& data);
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool MergePartialFromString(
+      absl::string_view data);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool MergePartialFromString(
+      const absl::Cord& data);
+
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializeToCodedStream(
+      io::CodedOutputStream* output) const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializePartialToCodedStream(
+      io::CodedOutputStream* output) const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializeToZeroCopyStream(
+      io::ZeroCopyOutputStream* output) const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializePartialToZeroCopyStream(
+      io::ZeroCopyOutputStream* output) const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializeToString(
+      std::string* output) const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializeToString(
+      absl::Cord* output) const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializePartialToString(
+      std::string* output) const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializePartialToString(
+      absl::Cord* output) const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializeToArray(void* data,
+                                                            int size) const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializePartialToArray(
+      void* data, int size) const;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD std::string SerializeAsString() const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD std::string SerializePartialAsString()
+      const;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializeToFileDescriptor(
+      int file_descriptor) const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializePartialToFileDescriptor(
+      int file_descriptor) const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializeToOstream(
+      std::ostream* output) const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializePartialToOstream(
+      std::ostream* output) const;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool AppendToString(
+      std::string* output) const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool AppendToString(
+      absl::Cord* output) const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool AppendPartialToString(
+      std::string* output) const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool AppendPartialToString(
+      absl::Cord* output) const;
+
+  PROTOBUF_DEPRECATE_AND_INLINE()
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+  bool MergeFromCord(const absl::Cord& data) { return MergeFromString(data); }
+  PROTOBUF_DEPRECATE_AND_INLINE()
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool MergePartialFromCord(
+      const absl::Cord& data) {
+    return MergePartialFromString(data);
+  }
+  PROTOBUF_DEPRECATE_AND_INLINE()
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParseFromCord(const absl::Cord& data) {
+    return ParseFromString(data);
+  }
+  PROTOBUF_DEPRECATE_AND_INLINE()
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ABSL_ATTRIBUTE_REINITIALIZES bool
+  ParsePartialFromCord(const absl::Cord& data) {
+    return ParsePartialFromString(data);
+  }
+
+  PROTOBUF_DEPRECATE_AND_INLINE()
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializeToCord(
+      absl::Cord* output) const {
+    return SerializeToString(output);
+  }
+  PROTOBUF_DEPRECATE_AND_INLINE()
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool SerializePartialToCord(
+      absl::Cord* output) const {
+    return SerializePartialToString(output);
+  }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD absl::Cord SerializeAsCord() const;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD absl::Cord SerializePartialAsCord() const;
+
+  PROTOBUF_DEPRECATE_AND_INLINE()
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+  bool AppendToCord(absl::Cord* output) const { return AppendToString(output); }
+  PROTOBUF_DEPRECATE_AND_INLINE()
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool AppendPartialToCord(
+      absl::Cord* output) const {
+    return AppendPartialToString(output);
+  }
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD size_t ByteSizeLong() const {
+    return _class_data_->byte_size_long(*this);
+  }
+#else
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD virtual size_t ByteSizeLong() const = 0;
+#endif
+
+  [[deprecated(
+      "Please use ByteSizeLong() "
+      "instead")]] PROTOBUF_FUTURE_ADD_EARLY_NODISCARD int
+  ByteSize() const {
+    return internal::ToIntSize(ByteSizeLong());
+  }
+
+  void SerializeWithCachedSizes(io::CodedOutputStream* output) const {
+    output->SetCur(_InternalSerialize(output->Cur(), output->EpsCopy()));
+  }
+
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD uint8_t* SerializeWithCachedSizesToArray(
+      uint8_t* target) const;
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  [[nodiscard]] int GetCachedSize() const { return AccessCachedSize().Get(); }
+#else
+  [[nodiscard]] int GetCachedSize() const;
+#endif
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD const char* _InternalParse(
+      const char* ptr, internal::ParseContext* ctx);
+
+ protected:
+  static constexpr internal::InternalVisibility internal_visibility() {
+    return internal::InternalVisibility{};
+  }
+
+  template <typename T>
+  PROTOBUF_ALWAYS_INLINE static T* DefaultConstruct(Arena* arena) {
+    return static_cast<T*>(Arena::DefaultConstruct<T>(arena));
+  }
+
+  template <typename T>
+  static void* NewImpl(const void*, void* mem, Arena* arena) {
+    return ::new (mem) T(arena);
+  }
+  template <typename T>
+  static constexpr internal::MessageCreator GetNewImpl() {
+    if constexpr (internal::EnableCustomNewFor<T>()) {
+      return T::InternalNewImpl_();
+    } else {
+      return internal::MessageCreator(&T::PlacementNew_, sizeof(T), alignof(T));
+    }
+  }
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  template <typename T>
+  static constexpr auto GetClearImpl() {
+    return static_cast<void (MessageLite::*)()>(&T::Clear);
+  }
+#else
+  template <typename T>
+  using GetClearImpl = std::nullptr_t;
+#endif
+
+  template <typename T>
+  PROTOBUF_ALWAYS_INLINE static T* CopyConstruct(Arena* arena, const T& from) {
+    return static_cast<T*>(Arena::CopyConstruct<T>(arena, &from));
+  }
+
+  static MessageLite* CopyConstruct(Arena* arena, const MessageLite& from);
+
+  PROTOBUF_ALWAYS_INLINE static Message* CopyConstruct(Arena* arena,
+                                                       const Message& from) {
+    return reinterpret_cast<Message*>(
+        CopyConstruct(arena, reinterpret_cast<const MessageLite&>(from)));
+  }
+
+  PROTOBUF_ALWAYS_INLINE void MergeFromWithClassData(
+      const MessageLite& other, const internal::ClassData* data) {
+    ABSL_DCHECK(data != nullptr);
+    ABSL_DCHECK(GetClassData() == data && other.GetClassData() == data)
+        << "Invalid call to " << __func__ << ": this=" << GetTypeName()
+        << " other=" << other.GetTypeName()
+        << " data=" << data->default_instance()->GetTypeName();
+    data->merge_to_from(*this, other);
+  }
+
+  const internal::TcParseTableBase* GetTcParseTable() const {
+    auto* data = GetClassData();
+    ABSL_DCHECK(data != nullptr);
+
+    auto* tc_table = data->tc_table;
+    if (ABSL_PREDICT_FALSE(tc_table == nullptr)) {
+      ABSL_DCHECK(!data->is_lite);
+      return data->full().descriptor_methods()->get_tc_table(*this);
+    }
+    return tc_table;
+  }
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  explicit constexpr MessageLite(const internal::ClassData* data)
+      : _class_data_(data) {}
+  explicit MessageLite(Arena* arena, const internal::ClassData* data)
+      : _internal_metadata_(arena), _class_data_(data) {}
+#else
+  constexpr MessageLite() {}
+  explicit MessageLite(Arena* arena) : _internal_metadata_(arena) {}
+  explicit constexpr MessageLite(const internal::ClassData*) {}
+  explicit MessageLite(Arena* arena, const internal::ClassData*)
+      : _internal_metadata_(arena) {}
+#endif
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  const internal::ClassData* GetClassData() const {
+    ::absl::PrefetchToLocalCache(_class_data_);
+    return _class_data_;
+  }
+#else
+  virtual const internal::ClassData* GetClassData() const = 0;
+#endif
+
+  // NOLINTNEXTLINE(google3-readability-class-member-naming)
+  internal::InternalMetadata _internal_metadata_;
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  const internal::ClassData* _class_data_;
+#endif
+
+  const internal::CachedSize& AccessCachedSize() const {
+    return *reinterpret_cast<const internal::CachedSize*>(
+        reinterpret_cast<const char*>(this) +
+        GetClassData()->cached_size_offset);
+  }
+
+  static PROTOBUF_ALWAYS_INLINE constexpr void SetHasBit(
+      uint32_t& cached_has_bits, uint32_t has_bit_mask) {
+    cached_has_bits |= has_bit_mask;
+  }
+
+  static PROTOBUF_ALWAYS_INLINE constexpr void ClearHasBit(
+      uint32_t& cached_has_bits, uint32_t has_bit_mask) {
+    cached_has_bits &= ~has_bit_mask;
+  }
+
+  static PROTOBUF_ALWAYS_INLINE constexpr bool CheckHasBit(
+      uint32_t cached_has_bits, uint32_t has_bit_mask) {
+    return (cached_has_bits & has_bit_mask) != 0;
+  }
+
+  static PROTOBUF_ALWAYS_INLINE constexpr bool BatchCheckHasBit(
+      uint32_t cached_has_bits, uint32_t batch_has_bits_mask) {
+    return (cached_has_bits & batch_has_bits_mask) != 0;
+  }
+
+  void CheckHasBitConsistency() const;
+
+ public:
+  enum ParseFlags {
+    kMerge = 0,
+    kParse = 1,
+    kMergePartial = 2,
+    kParsePartial = 3,
+    kMergeWithAliasing = 4,
+    kParseWithAliasing = 5,
+    kMergePartialWithAliasing = 6,
+    kParsePartialWithAliasing = 7
+  };
+
+  template <ParseFlags flags, typename T>
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool ParseFrom(const T& input);
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD uint8_t* _InternalSerialize(
+      uint8_t* ptr, io::EpsCopyOutputStream* stream) const {
+    return _class_data_->serialize(*this, ptr, stream);
+  }
+#else
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD virtual uint8_t* _InternalSerialize(
+      uint8_t* ptr, io::EpsCopyOutputStream* stream) const = 0;
+#endif
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool IsInitializedWithErrors() const {
+    if (IsInitialized()) return true;
+    LogInitializationErrorMessage();
+    return false;
+  }
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  void operator delete(MessageLite* msg, std::destroying_delete_t) {
+    msg->DeleteInstance();
+  }
+#endif
+
+ private:
+  friend class FastReflectionMessageMutator;
+  friend class AssignDescriptorsHelper;
+  friend class FastReflectionStringSetter;
+  friend class Message;
+  friend class Reflection;
+  friend class TypeId;
+  friend class compiler::cpp::MessageTableTester;
+  friend class internal::DescriptorPoolExtensionFinder;
+  friend class internal::ExtensionSet;
+  friend class internal::HasBitsTestPeer;
+  friend class internal::InternalMetadataOffset;
+  template <typename T, size_t kFieldOffset>
+  friend struct internal::InternalMetadataOffsetHelper;
+  friend class internal::LazyField;
+  friend class internal::SwapFieldHelper;
+  friend class internal::TcParser;
+  friend struct internal::PrivateAccess;
+  friend struct internal::TcParseTableBase;
+  friend class internal::UntypedMapBase;
+  friend class internal::WeakFieldMap;
+  friend class internal::WireFormatLite;
+  friend class internal::RustMapHelper;
+  friend class internal::MessageCreator;
+  friend class internal::RepeatedPtrFieldBase;
+  template <typename Type>
+  friend class internal::GenericTypeHandler;
+  template <typename Type>
+  friend class Arena::InternalHelper;
+  template <typename Type>
+  friend struct FallbackMessageTraits;
+
+  template <typename Type>
+  friend const internal::ClassData* internal::GetClassData(const Type& msg);
+  friend void internal::GenericSwap(MessageLite* lhs, MessageLite* rhs);
+  friend void internal::GenericSwap(Message* lhs, Message* rhs);
+
+  static bool CheckFieldPresence(const internal::ParseContext& ctx,
+                                 const MessageLite& msg,
+                                 MessageLite::ParseFlags parse_flags);
+
+  void LogInitializationErrorMessage() const;
+
+ private:
+  bool MergeFromImpl(io::CodedInputStream* input, ParseFlags parse_flags);
+
+  void DestroyInstance();
+  void DeleteInstance();
+
+  template <typename T>
+  static uint32_t GetOneofCaseOffsetForTesting() {
+    return offsetof(T, _impl_._oneof_case_);
+  }
+};
+
+class PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED TypeId {
+ public:
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD static TypeId Get(
+      const MessageLite& msg) {
+    return TypeId(msg.GetClassData());
+  }
+
+  template <typename T>
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD static TypeId Get() {
+    return TypeId(internal::MessageTraits<T>::class_data());
+  }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD absl::string_view name() const;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD friend constexpr bool operator==(
+      TypeId a, TypeId b) {
+    return a.data_ == b.data_;
+  }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD friend constexpr bool operator!=(
+      TypeId a, TypeId b) {
+    return !(a == b);
+  }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD friend constexpr bool operator<(
+      TypeId a, TypeId b) {
+    return a.data_ < b.data_;
+  }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD friend constexpr bool operator>(
+      TypeId a, TypeId b) {
+    return a.data_ > b.data_;
+  }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD friend constexpr bool operator<=(
+      TypeId a, TypeId b) {
+    return a.data_ <= b.data_;
+  }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD friend constexpr bool operator>=(
+      TypeId a, TypeId b) {
+    return a.data_ >= b.data_;
+  }
+
+#if defined(__cpp_impl_three_way_comparison) && \
+    __cpp_impl_three_way_comparison >= 201907L
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD friend constexpr auto operator<=>(
+      TypeId a, TypeId b) {
+    return a.data_ <=> b.data_;
+  }
+#endif
+
+  template <typename H>
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD friend H AbslHashValue(H state,
+                                                             TypeId id) {
+    return H::combine(std::move(state), id.data_);
+  }
+
+ private:
+  constexpr explicit TypeId(const internal::ClassData* data) : data_(data) {}
+
+  const internal::ClassData* data_;
+};
+
+namespace internal {
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD PROTOBUF_NDEBUG_INLINE const ClassData*
+GetClassData(const T& msg) {
+  static_assert(std::is_base_of_v<MessageLite, T>);
+  if constexpr (std::is_same_v<T, MessageLite> || std::is_same_v<Message, T>) {
+    PROTOBUF_DEBUG_COUNTER("GetClassData.Virtual").Inc();
+    return msg.GetClassData();
+  } else {
+    PROTOBUF_DEBUG_COUNTER("GetClassData.Constexpr").Inc();
+    return MessageTraits<T>::class_data();
+  }
+}
+
+template <bool alias>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool MergeFromImpl(
+    absl::string_view input, MessageLite* msg,
+    const internal::TcParseTableBase* tc_table,
+    MessageLite::ParseFlags parse_flags);
+extern template PROTOBUF_EXPORT_TEMPLATE_DECLARE bool MergeFromImpl<false>(
+    absl::string_view input, MessageLite* msg,
+    const internal::TcParseTableBase* tc_table,
+    MessageLite::ParseFlags parse_flags);
+extern template PROTOBUF_EXPORT_TEMPLATE_DECLARE bool MergeFromImpl<true>(
+    absl::string_view input, MessageLite* msg,
+    const internal::TcParseTableBase* tc_table,
+    MessageLite::ParseFlags parse_flags);
+
+template <bool alias>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool MergeFromImpl(
+    io::ZeroCopyInputStream* input, MessageLite* msg,
+    const internal::TcParseTableBase* tc_table,
+    MessageLite::ParseFlags parse_flags);
+extern template PROTOBUF_EXPORT_TEMPLATE_DECLARE bool MergeFromImpl<false>(
+    io::ZeroCopyInputStream* input, MessageLite* msg,
+    const internal::TcParseTableBase* tc_table,
+    MessageLite::ParseFlags parse_flags);
+extern template PROTOBUF_EXPORT_TEMPLATE_DECLARE bool MergeFromImpl<true>(
+    io::ZeroCopyInputStream* input, MessageLite* msg,
+    const internal::TcParseTableBase* tc_table,
+    MessageLite::ParseFlags parse_flags);
+
+struct BoundedZCIS {
+  io::ZeroCopyInputStream* zcis;
+  int limit;
+};
+
+template <bool alias>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool MergeFromImpl(
+    BoundedZCIS input, MessageLite* msg,
+    const internal::TcParseTableBase* tc_table,
+    MessageLite::ParseFlags parse_flags);
+extern template PROTOBUF_EXPORT_TEMPLATE_DECLARE bool MergeFromImpl<false>(
+    BoundedZCIS input, MessageLite* msg,
+    const internal::TcParseTableBase* tc_table,
+    MessageLite::ParseFlags parse_flags);
+extern template PROTOBUF_EXPORT_TEMPLATE_DECLARE bool MergeFromImpl<true>(
+    BoundedZCIS input, MessageLite* msg,
+    const internal::TcParseTableBase* tc_table,
+    MessageLite::ParseFlags parse_flags);
+
+template <typename T>
+struct SourceWrapper;
+
+template <bool alias, typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool MergeFromImpl(
+    const SourceWrapper<T>& input, MessageLite* msg,
+    const internal::TcParseTableBase* tc_table,
+    MessageLite::ParseFlags parse_flags) {
+  return input.template MergeInto<alias>(msg, tc_table, parse_flags);
+}
+
+}  
+
+template <MessageLite::ParseFlags flags, typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool MessageLite::ParseFrom(
+    const T& input) {
+  if (flags & kParse) Clear();
+  constexpr bool alias = (flags & kMergeWithAliasing) != 0;
+  const internal::TcParseTableBase* tc_table;
+  PROTOBUF_ALWAYS_INLINE_CALL tc_table = GetTcParseTable();
+  return internal::MergeFromImpl<alias>(input, this, tc_table, flags);
+}
+
+
+
+PROTOBUF_EXPORT void ShutdownProtobufLibrary();
+
+namespace internal {
+
+PROTOBUF_EXPORT void OnShutdown(void (*func)());
+PROTOBUF_EXPORT void OnShutdownRun(void (*f)(const void*), const void* arg);
+
+template <typename T>
+T* OnShutdownDelete(T* p) {
+  OnShutdownRun([](const void* pp) { delete static_cast<const T*>(pp); }, p);
+  return p;
+}
+
+template <typename MessageLite>
+PROTOBUF_ALWAYS_INLINE MessageLite* MessageCreator::PlacementNew(
+    const MessageLite* prototype_for_func,
+    const MessageLite* prototype_for_copy, void* mem, Arena* arena) const {
+  ABSL_DCHECK_EQ(reinterpret_cast<uintptr_t>(mem) % alignment_, 0u);
+  const Tag as_tag = tag();
+  static_assert(kFunc < 0 && !(kZeroInit < 0) && !(kMemcpy < 0),
+                "Only kFunc must be the only negative value");
+  if (ABSL_PREDICT_FALSE(static_cast<int8_t>(as_tag) < 0)) {
+    PROTOBUF_DEBUG_COUNTER("MessageCreator.Func").Inc();
+    return static_cast<MessageLite*>(func_(prototype_for_func, mem, arena));
+  }
+
+  char* dst = static_cast<char*>(mem);
+  const size_t size = allocation_size_;
+  const char* src = reinterpret_cast<const char*>(prototype_for_copy);
+
+  if (as_tag == kZeroInit) {
+    ABSL_DCHECK(std::all_of(src + sizeof(MessageLite), src + size,
+                            [](auto c) { return c == 0; }));
+
+    if (sizeof(MessageLite) != 16) {
+      memset(dst, 0, size);
+    } else if (size <= 32) {
+      memset(dst + size - 16, 0, 16);
+    } else if (size <= 64) {
+      memset(dst + 16, 0, 16);
+      memset(dst + size - 32, 0, 32);
+    } else {
+      for (size_t offset = 16; offset + 64 < size; offset += 64) {
+        absl::PrefetchToLocalCacheForWrite(dst + offset + 64);
+        memset(dst + offset, 0, 64);
+      }
+      memset(dst + size - 64, 0, 64);
+    }
+  } else {
+    ABSL_DCHECK_EQ(+as_tag, +kMemcpy);
+
+    if (sizeof(MessageLite) != 16) {
+      memcpy(dst, src, size);
+    } else if (size <= 32) {
+      memcpy(dst + size - 16, src + size - 16, 16);
+    } else if (size <= 64) {
+      memcpy(dst + 16, src + 16, 16);
+      memcpy(dst + size - 32, src + size - 32, 32);
+    } else {
+      for (size_t offset = 16; offset + 64 < size; offset += 64) {
+        absl::PrefetchToLocalCache(src + offset + 64);
+        absl::PrefetchToLocalCacheForWrite(dst + offset + 64);
+        memcpy(dst + offset, src + offset, 64);
+      }
+      memcpy(dst + size - 64, src + size - 64, 64);
+    }
+  }
+
+  memcpy(dst, static_cast<const void*>(prototype_for_copy),
+         sizeof(MessageLite));
+  memcpy(dst + PROTOBUF_FIELD_OFFSET(MessageLite, _internal_metadata_), &arena,
+         sizeof(arena));
+  return Launder(reinterpret_cast<MessageLite*>(mem));
+}
+
+template <typename MessageLite>
+PROTOBUF_ALWAYS_INLINE MessageLite* MessageCreator::New(
+    const MessageLite* prototype_for_func,
+    const MessageLite* prototype_for_copy, Arena* arena) const {
+  void* mem;
+  if (arena != nullptr) {
+    mem = arena->AllocateAligned(allocation_size_);
+  } else {
+    mem = Allocate(allocation_size_);
+  }
+  return PlacementNew(prototype_for_func, prototype_for_copy, mem, arena);
+}
+
+}  
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+std::string ShortFormat(const MessageLite& message_lite);
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+std::string Utf8Format(const MessageLite& message_lite);
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD const T* DynamicCastMessage(
+    const MessageLite* from) {
+  static_assert(std::is_base_of<MessageLite, T>::value, "");
+
+  if (from == nullptr || TypeId::Get<T>() != TypeId::Get(*from)) {
+    return nullptr;
+  }
+
+  return static_cast<const T*>(from);
+}
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD T* DynamicCastMessage(MessageLite* from) {
+  return const_cast<T*>(
+      DynamicCastMessage<T>(static_cast<const MessageLite*>(from)));
+}
+
+namespace internal {
+[[noreturn]] PROTOBUF_EXPORT void FailDynamicCast(const MessageLite& from,
+                                                  const MessageLite& to);
+}  
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD const T& DynamicCastMessage(
+    const MessageLite& from) {
+  const T* destination_message = DynamicCastMessage<T>(&from);
+  if (ABSL_PREDICT_FALSE(destination_message == nullptr)) {
+#if defined(ABSL_HAVE_EXCEPTIONS)
+    throw std::bad_cast();
+#endif
+    internal::FailDynamicCast(from, T::default_instance());
+  }
+  return *destination_message;
+}
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD T& DynamicCastMessage(MessageLite& from) {
+  return const_cast<T&>(
+      DynamicCastMessage<T>(static_cast<const MessageLite&>(from)));
+}
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD const T* DownCastMessage(
+    const MessageLite* from) {
+  internal::StrongReferenceToType<T>();
+  ABSL_DCHECK(DynamicCastMessage<T>(from) == from)
+      << "Cannot downcast " << from->GetTypeName() << " to "
+      << T::default_instance().GetTypeName();
+  return static_cast<const T*>(from);
+}
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD T* DownCastMessage(MessageLite* from) {
+  return const_cast<T*>(
+      DownCastMessage<T>(static_cast<const MessageLite*>(from)));
+}
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD const T& DownCastMessage(
+    const MessageLite& from) {
+  return *DownCastMessage<T>(&from);
+}
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD T& DownCastMessage(MessageLite& from) {
+  return *DownCastMessage<T>(&from);
+}
+
+template <>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD inline const MessageLite*
+DynamicCastMessage(const MessageLite* from) {
+  return from;
+}
+template <>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD inline const MessageLite* DownCastMessage(
+    const MessageLite* from) {
+  return from;
+}
+
+template <typename T>
+PROTOBUF_DEPRECATE_AND_INLINE()
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD const T* DynamicCastToGenerated(
+    const MessageLite* from) {
+  return DynamicCastMessage<T>(from);
+}
+
+template <typename T>
+PROTOBUF_DEPRECATE_AND_INLINE()
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD T* DynamicCastToGenerated(
+    MessageLite* from) {
+  return DynamicCastMessage<T>(from);
+}
+
+template <typename T>
+PROTOBUF_DEPRECATE_AND_INLINE()
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD const T& DynamicCastToGenerated(
+    const MessageLite& from) {
+  return DynamicCastMessage<T>(from);
+}
+
+template <typename T>
+PROTOBUF_DEPRECATE_AND_INLINE()
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD T& DynamicCastToGenerated(
+    MessageLite& from) {
+  return DynamicCastMessage<T>(from);
+}
+
+template <typename T>
+PROTOBUF_DEPRECATE_AND_INLINE()
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD const T* DownCastToGenerated(
+    const MessageLite* from) {
+  return DownCastMessage<T>(from);
+}
+
+template <typename T>
+PROTOBUF_DEPRECATE_AND_INLINE()
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD T* DownCastToGenerated(MessageLite* from) {
+  return DownCastMessage<T>(from);
+}
+
+template <typename T>
+
+PROTOBUF_DEPRECATE_AND_INLINE()
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD const T& DownCastToGenerated(
+    const MessageLite& from) {
+  return DownCastMessage<T>(from);
+}
+
+template <typename T>
+PROTOBUF_DEPRECATE_AND_INLINE()
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD T& DownCastToGenerated(MessageLite& from) {
+  return DownCastMessage<T>(from);
+}
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD std::shared_ptr<T> DynamicCastMessage(
+    std::shared_ptr<MessageLite> ptr) {
+  if (auto* res = DynamicCastMessage<T>(ptr.get())) {
+    return std::shared_ptr<T>(std::move(ptr), res);
+  } else {
+    return nullptr;
+  }
+}
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD std::shared_ptr<const T> DynamicCastMessage(
+    std::shared_ptr<const MessageLite> ptr) {
+  if (auto* res = DynamicCastMessage<T>(ptr.get())) {
+    return std::shared_ptr<const T>(std::move(ptr), res);
+  } else {
+    return nullptr;
+  }
+}
+
+}  
+}  
+
+#include "google/protobuf/port_undef.inc"
+
+#endif

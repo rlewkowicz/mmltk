@@ -1,0 +1,23 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_Warnings_h
+#define vm_Warnings_h
+
+struct JSContext;
+
+namespace js {
+
+
+bool WarnNumberASCII(JSContext* cx, const unsigned errorNumber, ...);
+
+bool WarnNumberLatin1(JSContext* cx, const unsigned errorNumber, ...);
+
+bool WarnNumberUTF8(JSContext* cx, const unsigned errorNumber, ...);
+
+bool WarnNumberUC(JSContext* cx, const unsigned errorNumber, ...);
+
+}  
+
+#endif /* vm_Warnings_h */

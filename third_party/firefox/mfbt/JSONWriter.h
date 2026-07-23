@@ -1,0 +1,391 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+
+#ifndef mozilla_JSONWriter_h
+#define mozilla_JSONWriter_h
+
+#include "double-conversion/double-conversion.h"  // IWYU pragma: keep(used for double_conversion)
+#include "mozilla/Assertions.h"
+#include "mozilla/Span.h"
+#include "mozilla/Sprintf.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/Vector.h"
+
+#include <utility>
+
+namespace mozilla {
+
+class JSONWriteFunc {
+ public:
+  virtual void Write(const Span<const char>& aStr) = 0;
+  virtual ~JSONWriteFunc() = default;
+};
+
+class JSONWriter {
+  class EscapedString {
+    Span<const char> mStringSpan;
+    UniquePtr<char[]> mOwnedStr;
+
+    void CheckInvariants() const {
+      MOZ_ASSERT(!mOwnedStr || mStringSpan.data() == mOwnedStr.get());
+    }
+
+    static char hexDigitToAsciiChar(uint8_t u) {
+      u = u & 0xf;
+      return u < 10 ? '0' + u : 'a' + (u - 10);
+    }
+
+   public:
+    explicit EscapedString(const Span<const char>& aStr) : mStringSpan(aStr) {
+      // clang-format off
+      #define ___ 0
+      static constexpr char TwoCharEscapes[256] = {
+           ___, ___, ___,  ___, ___, ___, ___, ___, 'b', 't',
+           'n', ___, 'f',  'r', ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, '"', ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, '\\', ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___, ___, ___, ___, ___,
+           ___, ___, ___,  ___, ___, ___};
+      #undef ___
+      // clang-format on
+
+      size_t nExtra = 0;
+      for (const char& c : aStr) {
+        uint8_t u = static_cast<uint8_t>(c);
+        if (u == 0) {
+          mStringSpan = mStringSpan.First(&c - mStringSpan.data());
+          break;
+        }
+        if (TwoCharEscapes[u]) {
+          nExtra += 1;
+        } else if (u <= 0x1f) {
+          nExtra += 5;
+        }
+      }
+
+
+      if (nExtra == 0) {
+        CheckInvariants();
+        return;
+      }
+
+      mOwnedStr = MakeUnique<char[]>(mStringSpan.Length() + nExtra);
+
+      size_t i = 0;
+      for (const char c : mStringSpan) {
+        uint8_t u = static_cast<uint8_t>(c);
+        MOZ_ASSERT(u != 0, "Null terminator should have been handled above");
+        if (TwoCharEscapes[u]) {
+          mOwnedStr[i++] = '\\';
+          mOwnedStr[i++] = TwoCharEscapes[u];
+        } else if (u <= 0x1f) {
+          mOwnedStr[i++] = '\\';
+          mOwnedStr[i++] = 'u';
+          mOwnedStr[i++] = '0';
+          mOwnedStr[i++] = '0';
+          mOwnedStr[i++] = hexDigitToAsciiChar((u & 0x00f0) >> 4);
+          mOwnedStr[i++] = hexDigitToAsciiChar(u & 0x000f);
+        } else {
+          mOwnedStr[i++] = u;
+        }
+      }
+      MOZ_ASSERT(i == mStringSpan.Length() + nExtra);
+      mStringSpan = Span<const char>(mOwnedStr.get(), i);
+      CheckInvariants();
+    }
+
+    explicit EscapedString(const char* aStr) = delete;
+
+    const Span<const char>& SpanRef() const { return mStringSpan; }
+  };
+
+ public:
+  enum CollectionStyle {
+    MultiLineStyle,  
+    SingleLineStyle
+  };
+
+ protected:
+  static constexpr Span<const char> scArrayBeginString = MakeStringSpan("[");
+  static constexpr Span<const char> scArrayEndString = MakeStringSpan("]");
+  static constexpr Span<const char> scCommaString = MakeStringSpan(",");
+  static constexpr Span<const char> scEmptyString = MakeStringSpan("");
+  static constexpr Span<const char> scFalseString = MakeStringSpan("false");
+  static constexpr Span<const char> scNewLineString = MakeStringSpan("\n");
+  static constexpr Span<const char> scNullString = MakeStringSpan("null");
+  static constexpr Span<const char> scObjectBeginString = MakeStringSpan("{");
+  static constexpr Span<const char> scObjectEndString = MakeStringSpan("}");
+  static constexpr Span<const char> scPropertyBeginString =
+      MakeStringSpan("\"");
+  static constexpr Span<const char> scPropertyEndString = MakeStringSpan("\":");
+  static constexpr Span<const char> scQuoteString = MakeStringSpan("\"");
+  static constexpr Span<const char> scSpaceString = MakeStringSpan(" ");
+  static constexpr Span<const char> scTopObjectBeginString =
+      MakeStringSpan("{");
+  static constexpr Span<const char> scTopObjectEndString = MakeStringSpan("}");
+  static constexpr Span<const char> scTrueString = MakeStringSpan("true");
+
+  const UniquePtr<JSONWriteFunc> mMaybeOwnedWriter;
+  JSONWriteFunc& mWriter;
+  Vector<bool, 8> mNeedComma;     
+  Vector<bool, 8> mNeedNewlines;  
+  size_t mDepth;                  
+
+  void Indent() {
+    for (size_t i = 0; i < mDepth; i++) {
+      mWriter.Write(scSpaceString);
+    }
+  }
+
+  void Separator() {
+    if (mNeedComma[mDepth]) {
+      mWriter.Write(scCommaString);
+    }
+    if (mDepth > 0 && mNeedNewlines[mDepth]) {
+      mWriter.Write(scNewLineString);
+      Indent();
+    } else if (mNeedComma[mDepth] && mNeedNewlines[0]) {
+      mWriter.Write(scSpaceString);
+    }
+  }
+
+  void PropertyNameAndColon(const Span<const char>& aName) {
+    mWriter.Write(scPropertyBeginString);
+    mWriter.Write(EscapedString(aName).SpanRef());
+    mWriter.Write(scPropertyEndString);
+    if (mNeedNewlines[0]) {
+      mWriter.Write(scSpaceString);
+    }
+  }
+
+  void Scalar(const Span<const char>& aMaybePropertyName,
+              const Span<const char>& aStringValue) {
+    Separator();
+    if (!aMaybePropertyName.empty()) {
+      PropertyNameAndColon(aMaybePropertyName);
+    }
+    mWriter.Write(aStringValue);
+    mNeedComma[mDepth] = true;
+  }
+
+  void QuotedScalar(const Span<const char>& aMaybePropertyName,
+                    const Span<const char>& aStringValue) {
+    Separator();
+    if (!aMaybePropertyName.empty()) {
+      PropertyNameAndColon(aMaybePropertyName);
+    }
+    mWriter.Write(scQuoteString);
+    mWriter.Write(aStringValue);
+    mWriter.Write(scQuoteString);
+    mNeedComma[mDepth] = true;
+  }
+
+  void NewVectorEntries(bool aNeedNewLines) {
+    MOZ_RELEASE_ASSERT(mNeedComma.resizeUninitialized(mDepth + 1));
+    MOZ_RELEASE_ASSERT(mNeedNewlines.resizeUninitialized(mDepth + 1));
+    mNeedComma[mDepth] = false;
+    mNeedNewlines[mDepth] = aNeedNewLines;
+  }
+
+  void StartCollection(const Span<const char>& aMaybePropertyName,
+                       const Span<const char>& aStartChar,
+                       CollectionStyle aStyle = MultiLineStyle) {
+    Separator();
+    if (!aMaybePropertyName.empty()) {
+      PropertyNameAndColon(aMaybePropertyName);
+    }
+    mWriter.Write(aStartChar);
+    mNeedComma[mDepth] = true;
+    mDepth++;
+    NewVectorEntries(mNeedNewlines[mDepth - 1] && aStyle == MultiLineStyle);
+  }
+
+  void EndCollection(const Span<const char>& aEndChar) {
+    MOZ_ASSERT(mDepth > 0);
+    if (mNeedNewlines[mDepth]) {
+      mWriter.Write(scNewLineString);
+      mDepth--;
+      Indent();
+    } else {
+      mDepth--;
+    }
+    mWriter.Write(aEndChar);
+  }
+
+ public:
+  explicit JSONWriter(JSONWriteFunc& aWriter,
+                      CollectionStyle aStyle = MultiLineStyle)
+      : mWriter(aWriter), mNeedComma(), mNeedNewlines(), mDepth(0) {
+    NewVectorEntries(aStyle == MultiLineStyle);
+  }
+
+  explicit JSONWriter(UniquePtr<JSONWriteFunc> aWriter,
+                      CollectionStyle aStyle = MultiLineStyle)
+      : mMaybeOwnedWriter(std::move(aWriter)),
+        mWriter(*mMaybeOwnedWriter),
+        mNeedComma(),
+        mNeedNewlines(),
+        mDepth(0) {
+    MOZ_RELEASE_ASSERT(
+        mMaybeOwnedWriter,
+        "JSONWriter must be given a non-null UniquePtr<JSONWriteFunc>");
+    NewVectorEntries(aStyle == MultiLineStyle);
+  }
+
+  JSONWriteFunc& WriteFunc() const MOZ_LIFETIME_BOUND { return mWriter; }
+
+
+  void Start(CollectionStyle aStyle = MultiLineStyle) {
+    StartCollection(scEmptyString, scTopObjectBeginString, aStyle);
+  }
+
+  void End() {
+    EndCollection(scTopObjectEndString);
+    if (mNeedNewlines[mDepth]) {
+      mWriter.Write(scNewLineString);
+    }
+  }
+
+  void NullProperty(const Span<const char>& aName) {
+    Scalar(aName, scNullString);
+  }
+
+  template <size_t N>
+  void NullProperty(const char (&aName)[N]) {
+    NullProperty(Span<const char>(aName, N));
+  }
+
+  void NullElement() { NullProperty(scEmptyString); }
+
+  void BoolProperty(const Span<const char>& aName, bool aBool) {
+    Scalar(aName, aBool ? scTrueString : scFalseString);
+  }
+
+  template <size_t N>
+  void BoolProperty(const char (&aName)[N], bool aBool) {
+    BoolProperty(Span<const char>(aName, N), aBool);
+  }
+
+  void BoolElement(bool aBool) { BoolProperty(scEmptyString, aBool); }
+
+  void IntProperty(const Span<const char>& aName, int64_t aInt) {
+    char buf[64];
+    int len = SprintfLiteral(buf, "%" PRId64, aInt);
+    MOZ_RELEASE_ASSERT(len > 0);
+    Scalar(aName, Span<const char>(buf, size_t(len)));
+  }
+
+  template <size_t N>
+  void IntProperty(const char (&aName)[N], int64_t aInt) {
+    IntProperty(Span<const char>(aName, N), aInt);
+  }
+
+  void IntElement(int64_t aInt) { IntProperty(scEmptyString, aInt); }
+
+  void DoubleProperty(const Span<const char>& aName, double aDouble) {
+    static const size_t buflen = 64;
+    char buf[buflen];
+    const double_conversion::DoubleToStringConverter& converter =
+        double_conversion::DoubleToStringConverter::EcmaScriptConverter();
+    double_conversion::StringBuilder builder(buf, buflen);
+    converter.ToShortest(aDouble, &builder);
+    Scalar(aName, MakeStringSpan(builder.Finalize()));
+  }
+
+  template <size_t N>
+  void DoubleProperty(const char (&aName)[N], double aDouble) {
+    DoubleProperty(Span<const char>(aName, N), aDouble);
+  }
+
+  void DoubleElement(double aDouble) { DoubleProperty(scEmptyString, aDouble); }
+
+  void StringProperty(const Span<const char>& aName,
+                      const Span<const char>& aStr) {
+    QuotedScalar(aName, EscapedString(aStr).SpanRef());
+  }
+
+  template <size_t NN>
+  void StringProperty(const char (&aName)[NN], const Span<const char>& aStr) {
+    StringProperty(Span<const char>(aName, NN), aStr);
+  }
+
+  template <size_t SN>
+  void StringProperty(const Span<const char>& aName, const char (&aStr)[SN]) {
+    StringProperty(aName, Span<const char>(aStr, SN));
+  }
+
+  template <size_t NN, size_t SN>
+  void StringProperty(const char (&aName)[NN], const char (&aStr)[SN]) {
+    StringProperty(Span<const char>(aName, NN), Span<const char>(aStr, SN));
+  }
+
+  void StringElement(const Span<const char>& aStr) {
+    StringProperty(scEmptyString, aStr);
+  }
+
+  template <size_t N>
+  void StringElement(const char (&aName)[N]) {
+    StringElement(Span<const char>(aName, N));
+  }
+
+  void StartArrayProperty(const Span<const char>& aName,
+                          CollectionStyle aStyle = MultiLineStyle) {
+    StartCollection(aName, scArrayBeginString, aStyle);
+  }
+
+  template <size_t N>
+  void StartArrayProperty(const char (&aName)[N],
+                          CollectionStyle aStyle = MultiLineStyle) {
+    StartArrayProperty(Span<const char>(aName, N), aStyle);
+  }
+
+  void StartArrayElement(CollectionStyle aStyle = MultiLineStyle) {
+    StartArrayProperty(scEmptyString, aStyle);
+  }
+
+  void EndArray() { EndCollection(scArrayEndString); }
+
+  void StartObjectProperty(const Span<const char>& aName,
+                           CollectionStyle aStyle = MultiLineStyle) {
+    StartCollection(aName, scObjectBeginString, aStyle);
+  }
+
+  template <size_t N>
+  void StartObjectProperty(const char (&aName)[N],
+                           CollectionStyle aStyle = MultiLineStyle) {
+    StartObjectProperty(Span<const char>(aName, N), aStyle);
+  }
+
+  void StartObjectElement(CollectionStyle aStyle = MultiLineStyle) {
+    StartObjectProperty(scEmptyString, aStyle);
+  }
+
+  void EndObject() { EndCollection(scObjectEndString); }
+};
+
+}  
+
+#endif /* mozilla_JSONWriter_h */

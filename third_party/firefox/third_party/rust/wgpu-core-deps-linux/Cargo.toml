@@ -1,0 +1,37 @@
+
+[package]
+edition = "2021"
+rust-version = "1.76"
+name = "wgpu-core-deps-linux"
+version = "30.0.0"
+authors = ["gfx-rs developers"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Feature unification helper crate for Linux"
+homepage = "https://wgpu.rs/"
+keywords = ["graphics"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/gfx-rs/wgpu"
+
+[features]
+drm = ["wgpu-hal/drm"]
+renderdoc = ["wgpu-hal/renderdoc"]
+vulkan = ["wgpu-hal/vulkan"]
+
+[lib]
+name = "wgpu_core_deps_linux"
+path = "src/lib.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies.wgpu-hal]
+version = "30.0.0"
+path = "../wgpu-hal"
+
+[lints.clippy]
+ref_as_ptr = "warn"
+
+[lints.rust]
+missing_debug_implementations = "warn"

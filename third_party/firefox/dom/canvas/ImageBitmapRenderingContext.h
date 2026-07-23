@@ -1,0 +1,108 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ImageBitmapRenderingContext_h
+#define ImageBitmapRenderingContext_h
+
+#include "ImageEncoder.h"
+#include "imgIEncoder.h"
+#include "mozilla/dom/ImageBitmap.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/gfx/DataSurfaceHelpers.h"
+#include "mozilla/gfx/Point.h"
+#include "mozilla/layers/WebRenderUserData.h"
+#include "nsICanvasRenderingContextInternal.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla {
+
+namespace gfx {
+class DataSourceSurface;
+class DrawTarget;
+class SourceSurface;
+}  
+
+namespace layers {
+class Image;
+class ImageContainer;
+}  
+
+namespace dom {
+
+class ImageBitmapRenderingContext final
+    : public nsICanvasRenderingContextInternal,
+      public nsWrapperCache {
+  virtual ~ImageBitmapRenderingContext();
+
+ public:
+  ImageBitmapRenderingContext();
+
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(ImageBitmapRenderingContext)
+
+  void GetCanvas(
+      Nullable<OwningHTMLCanvasElementOrOffscreenCanvas>& retval) const;
+
+  void TransferImageBitmap(ImageBitmap& aImageBitmap, ErrorResult& aRv);
+  void TransferFromImageBitmap(ImageBitmap* aImageBitmap, ErrorResult& aRv);
+
+  virtual int32_t GetWidth() override { return mWidth; }
+  virtual int32_t GetHeight() override { return mHeight; }
+
+  NS_IMETHOD SetDimensions(int32_t aWidth, int32_t aHeight) override;
+
+  NS_IMETHOD InitializeWithDrawTarget(
+      nsIDocShell* aDocShell, NotNull<gfx::DrawTarget*> aTarget) override;
+
+  virtual mozilla::UniquePtr<uint8_t[]> GetImageBuffer(
+      mozilla::CanvasUtils::ImageExtraction aExtractionBehavior,
+      int32_t* out_format, gfx::IntSize* out_imageSize) override;
+  NS_IMETHOD GetInputStream(
+      const char* aMimeType, const nsAString& aEncoderOptions,
+      mozilla::CanvasUtils::ImageExtraction aExtractionBehavior,
+      const nsACString& aRandomizationKey, nsIInputStream** aStream) override;
+
+  virtual already_AddRefed<mozilla::gfx::SourceSurface> GetSurfaceSnapshot(
+      gfxAlphaType* aOutAlphaType) override;
+
+  virtual void SetOpaqueValueFromOpaqueAttr(bool aOpaqueAttrValue) override;
+  virtual bool GetIsOpaque() override;
+  void ResetBitmap() override;
+  virtual already_AddRefed<layers::Image> GetAsImage() override {
+    return ClipToIntrinsicSize();
+  }
+  bool UpdateWebRenderCanvasData(nsDisplayListBuilder* aBuilder,
+                                 WebRenderCanvasData* aCanvasData) override;
+  virtual void MarkContextClean() override;
+
+  NS_IMETHOD Redraw(const gfxRect& aDirty) override;
+
+  virtual void DidRefresh() override;
+
+  void MarkContextCleanForFrameCapture() override {
+    mFrameCaptureState = FrameCaptureState::CLEAN;
+  }
+  Watchable<FrameCaptureState>* GetFrameCaptureState() override {
+    return &mFrameCaptureState;
+  }
+
+ protected:
+  already_AddRefed<gfx::DataSourceSurface> MatchWithIntrinsicSize();
+  already_AddRefed<layers::Image> ClipToIntrinsicSize();
+  int32_t mWidth;
+  int32_t mHeight;
+
+  RefPtr<layers::Image> mImage;
+
+  Watchable<FrameCaptureState> mFrameCaptureState;
+};
+
+}  
+}  
+
+#endif /* ImageBitmapRenderingContext_h */

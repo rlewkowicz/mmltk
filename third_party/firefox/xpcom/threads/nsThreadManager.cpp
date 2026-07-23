@@ -1,0 +1,705 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsThreadManager.h"
+#include "nsThread.h"
+#include "nsThreadPool.h"
+#include "nsThreadUtils.h"
+#include "nsIClassInfoImpl.h"
+#include "nsTArray.h"
+#include "nsXULAppAPI.h"
+#include "mozilla/AbstractThread.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/CycleCollectedJSContext.h"  // nsAutoMicroTask
+#include "mozilla/EventQueue.h"
+#include "mozilla/InputTaskManager.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/NeverDestroyed.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/SpinEventLoopUntil.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/TaskQueue.h"
+#include "mozilla/ThreadEventQueue.h"
+#include "mozilla/ThreadLocal.h"
+#include "mozilla/ipc/SharedMemoryMapping.h"
+#include "TaskController.h"
+#include "ThreadEventTarget.h"
+#ifdef MOZ_CANARY
+#  include <fcntl.h>
+#  include <unistd.h>
+#endif
+
+#include "MainThreadIdlePeriod.h"
+
+using namespace mozilla;
+
+static MOZ_THREAD_LOCAL(bool) sTLSIsMainThread;
+
+bool NS_IsMainThreadTLSInitialized() { return sTLSIsMainThread.initialized(); }
+
+class BackgroundEventTarget final : public nsIEventTarget {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIEVENTTARGET_FULL
+
+  BackgroundEventTarget() = default;
+
+  nsresult Init();
+
+  already_AddRefed<TaskQueue> CreateBackgroundTaskQueue(StaticString aName);
+
+  void Shutdown();
+
+ private:
+  ~BackgroundEventTarget() = default;
+
+  RefPtr<nsThreadPool> mPool;
+  RefPtr<nsThreadPool> mIOPool;
+};
+
+NS_IMPL_ISUPPORTS(BackgroundEventTarget, nsIEventTarget)
+
+nsresult BackgroundEventTarget::Init() {
+  RefPtr pool = MakeRefPtr<nsThreadPool>();
+
+  nsresult rv = pool->SetName("BackgroundThreadPool"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = pool->SetThreadStackSize(nsIThreadManager::kThreadPoolStackSize);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = pool->SetThreadLimit(2);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = pool->SetIdleThreadLimit(1);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = pool->SetIdleThreadMaximumTimeout(300000);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = pool->SetIdleThreadGraceTimeout(1000);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  RefPtr ioPool = MakeRefPtr<nsThreadPool>();
+
+  rv = ioPool->SetQoSForThreads(nsIThread::QOS_PRIORITY_LOW);
+  NS_ENSURE_SUCCESS(
+      rv, rv);  
+
+  rv = ioPool->SetName("BgIOThreadPool"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = ioPool->SetThreadStackSize(nsIThreadManager::kThreadPoolStackSize);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = ioPool->SetThreadLimit(4);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = ioPool->SetIdleThreadLimit(1);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = ioPool->SetIdleThreadMaximumTimeout(300000);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = ioPool->SetIdleThreadGraceTimeout(500);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  pool.swap(mPool);
+  ioPool.swap(mIOPool);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP_(bool)
+BackgroundEventTarget::IsOnCurrentThreadInfallible() {
+  return mPool->IsOnCurrentThread() || mIOPool->IsOnCurrentThread();
+}
+
+NS_IMETHODIMP
+BackgroundEventTarget::IsOnCurrentThread(bool* aValue) {
+  bool value = false;
+  if (NS_SUCCEEDED(mPool->IsOnCurrentThread(&value)) && value) {
+    *aValue = value;
+    return NS_OK;
+  }
+  return mIOPool->IsOnCurrentThread(aValue);
+}
+
+NS_IMETHODIMP
+BackgroundEventTarget::Dispatch(already_AddRefed<nsIRunnable> aRunnable,
+                                DispatchFlags aFlags) {
+  nsCOMPtr<nsIRunnable> runnable(std::move(aRunnable));
+
+  if (aFlags & NS_DISPATCH_EVENT_MAY_BLOCK) {
+    DispatchFlags ioPoolFlags = aFlags | ~NS_DISPATCH_EVENT_MAY_BLOCK;
+    if (ioPoolFlags & NS_DISPATCH_AT_END && !mIOPool->IsOnCurrentThread()) {
+      ioPoolFlags &= ~NS_DISPATCH_AT_END;
+    }
+
+    // shut down, but `mPool` has not, so we'll fall through to dispatching
+    nsresult rv = mIOPool->Dispatch(do_AddRef(runnable),
+                                    ioPoolFlags | NS_DISPATCH_FALLIBLE);
+    if (NS_SUCCEEDED(rv)) {
+      return rv;
+    }
+  }
+
+  DispatchFlags poolFlags = aFlags & ~NS_DISPATCH_EVENT_MAY_BLOCK;
+  if (poolFlags & NS_DISPATCH_AT_END && !mPool->IsOnCurrentThread()) {
+    poolFlags &= ~NS_DISPATCH_AT_END;
+  }
+
+  return mPool->Dispatch(runnable.forget(), poolFlags);
+}
+
+NS_IMETHODIMP
+BackgroundEventTarget::DispatchFromScript(nsIRunnable* aRunnable,
+                                          DispatchFlags aFlags) {
+  nsCOMPtr<nsIRunnable> runnable(aRunnable);
+  return Dispatch(runnable.forget(), aFlags);
+}
+
+NS_IMETHODIMP
+BackgroundEventTarget::DelayedDispatch(already_AddRefed<nsIRunnable> aRunnable,
+                                       uint32_t) {
+  nsCOMPtr<nsIRunnable> dropRunnable(aRunnable);
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+BackgroundEventTarget::RegisterShutdownTask(nsITargetShutdownTask* aTask) {
+  return mPool->RegisterShutdownTask(aTask);
+}
+
+NS_IMETHODIMP
+BackgroundEventTarget::UnregisterShutdownTask(nsITargetShutdownTask* aTask) {
+  return mPool->UnregisterShutdownTask(aTask);
+}
+
+nsIEventTarget::FeatureFlags BackgroundEventTarget::GetFeatures() {
+  return SUPPORTS_SHUTDOWN_TASKS | SUPPORTS_SHUTDOWN_TASK_DISPATCH;
+}
+
+void BackgroundEventTarget::Shutdown() {
+  mIOPool->Shutdown();
+  mPool->Shutdown();
+}
+
+already_AddRefed<TaskQueue> BackgroundEventTarget::CreateBackgroundTaskQueue(
+    StaticString aName) {
+  return TaskQueue::Create(do_AddRef(this), aName).forget();
+}
+
+extern "C" {
+bool NS_IsMainThread() { return sTLSIsMainThread.get(); }
+}
+
+void NS_SetMainThread() {
+  if (!sTLSIsMainThread.init()) {
+    MOZ_CRASH();
+  }
+  sTLSIsMainThread.set(true);
+  MOZ_ASSERT(NS_IsMainThread());
+  SerialEventTargetGuard::InitTLS();
+  nsThreadPool::InitTLS();
+}
+
+#ifdef DEBUG
+
+namespace mozilla {
+
+void AssertIsOnMainThread() { MOZ_ASSERT(NS_IsMainThread(), "Wrong thread!"); }
+
+}  
+
+#endif
+
+
+void nsThreadManager::ReleaseThread(void* aData) {
+  static_cast<nsThread*>(aData)->Release();
+}
+
+NS_IMETHODIMP_(MozExternalRefCountType)
+nsThreadManager::AddRef() { return 2; }
+NS_IMETHODIMP_(MozExternalRefCountType)
+nsThreadManager::Release() { return 1; }
+NS_IMPL_CLASSINFO(nsThreadManager, nullptr,
+                  nsIClassInfo::THREADSAFE | nsIClassInfo::SINGLETON,
+                  NS_THREADMANAGER_CID)
+NS_IMPL_QUERY_INTERFACE_CI(nsThreadManager, nsIThreadManager)
+NS_IMPL_CI_INTERFACE_GETTER(nsThreadManager, nsIThreadManager)
+
+
+ uint32_t nsIThreadManager::LargeStackSize() {
+#if defined(MOZ_ASAN) || defined(MOZ_TSAN)
+  return 4096 * 1024 - 2 * mozilla::ipc::shared_memory::SystemPageSize();
+#else
+  return 2048 * 1024 - 2 * mozilla::ipc::shared_memory::SystemPageSize();
+#endif
+}
+
+ nsThreadManager& nsThreadManager::get() {
+  static NeverDestroyed<nsThreadManager> sInstance;
+  return *sInstance;
+}
+
+nsThreadManager::nsThreadManager()
+    : mCurThreadIndex(0),
+      mMutex("nsThreadManager::mMutex"),
+      mState(State::eUninit) {}
+
+nsThreadManager::~nsThreadManager() = default;
+
+nsresult nsThreadManager::Init() {
+  {
+    OffTheBooksMutexAutoLock lock(mMutex);
+    if (mState > State::eUninit) {
+      return NS_OK;
+    }
+  }
+
+  if (PR_NewThreadPrivateIndex(&mCurThreadIndex, ReleaseThread) == PR_FAILURE) {
+    return NS_ERROR_FAILURE;
+  }
+
+#ifdef MOZ_CANARY
+  const int flags = O_WRONLY | O_APPEND | O_CREAT | O_NONBLOCK;
+  const mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+  char* env_var_flag = getenv("MOZ_KILL_CANARIES");
+  sCanaryOutputFD =
+      env_var_flag
+          ? (env_var_flag[0] ? open(env_var_flag, flags, mode) : STDERR_FILENO)
+          : 0;
+#endif
+
+  TaskController::Initialize();
+
+  RefPtr idlePeriod = MakeRefPtr<MainThreadIdlePeriod>();
+  RefPtr idleManager = MakeRefPtr<IdleTaskManager>(idlePeriod.forget());
+  TaskController::Get()->SetIdleTaskManager(idleManager.forget());
+
+  UniquePtr<EventQueue> queue = MakeUnique<EventQueue>(true);
+
+  RefPtr synchronizedQueue =
+      MakeRefPtr<ThreadEventQueue>(std::move(queue), true);
+
+  mMainThread =
+      new nsThread(WrapNotNull(synchronizedQueue), nsThread::MAIN_THREAD,
+                   {0, false, false, Some(W3_LONGTASK_BUSY_WINDOW_MS)});
+
+  nsresult rv = mMainThread->InitCurrentThread();
+  if (NS_FAILED(rv)) {
+    mMainThread = nullptr;
+    return rv;
+  }
+#ifdef MOZ_MEMORY
+  jemalloc_set_main_thread();
+  jemalloc_thread_local_arena(true);
+#endif
+
+  AbstractThread::InitTLS();
+  AbstractThread::InitMainThread();
+
+  RefPtr<BackgroundEventTarget> target(new BackgroundEventTarget());
+
+  rv = target->Init();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  {
+    OffTheBooksMutexAutoLock lock(mMutex);
+
+    mBackgroundEventTarget = std::move(target);
+
+    mState = State::eActive;
+  }
+
+  return NS_OK;
+}
+
+void nsThreadManager::ShutdownNonMainThreads() {
+  MOZ_ASSERT(NS_IsMainThread(), "shutdown not called from main thread");
+
+  NS_ProcessPendingEvents(mMainThread);
+
+  mMainThread->mEvents->RunShutdownTasks();
+
+  RefPtr<BackgroundEventTarget> backgroundEventTarget;
+  {
+    OffTheBooksMutexAutoLock lock(mMutex);
+    MOZ_ASSERT(mState == State::eActive, "shutdown called multiple times");
+    backgroundEventTarget = mBackgroundEventTarget;
+  }
+
+  backgroundEventTarget->Shutdown();
+
+  {
+    nsTArray<RefPtr<nsThread>> threadsToShutdown;
+    {
+      OffTheBooksMutexAutoLock lock(mMutex);
+      mState = State::eShutdown;
+
+      for (auto* thread : mThreadList) {
+        if (thread->ShutdownRequired()) {
+          threadsToShutdown.AppendElement(thread);
+        }
+      }
+    }
+
+
+    for (const auto& thread : threadsToShutdown) {
+      thread->AsyncShutdown();
+    }
+  }
+
+  mMainThread->WaitForAllAsynchronousShutdowns();
+
+}
+
+void nsThreadManager::ShutdownMainThread() {
+#ifdef DEBUG
+  {
+    OffTheBooksMutexAutoLock lock(mMutex);
+    MOZ_ASSERT(mState == State::eShutdown, "Must have called BeginShutdown");
+  }
+#endif
+
+  while (true) {
+    if (mMainThread->mEvents->ShutdownIfNoPendingEvents()) {
+      break;
+    }
+    NS_ProcessPendingEvents(mMainThread);
+  }
+
+  mMainThread->SetObserver(nullptr);
+
+  OffTheBooksMutexAutoLock lock(mMutex);
+  mBackgroundEventTarget = nullptr;
+}
+
+void nsThreadManager::ReleaseMainThread() {
+#ifdef DEBUG
+  {
+    OffTheBooksMutexAutoLock lock(mMutex);
+    MOZ_ASSERT(mState == State::eShutdown, "Must have called BeginShutdown");
+    MOZ_ASSERT(!mBackgroundEventTarget, "Must have called ShutdownMainThread");
+  }
+#endif
+  MOZ_ASSERT(mMainThread);
+
+  mMainThread = nullptr;
+
+  PR_SetThreadPrivate(mCurThreadIndex, nullptr);
+}
+
+void nsThreadManager::RegisterCurrentThread(nsThread& aThread) {
+  MOZ_ASSERT(aThread.GetPRThread() == PR_GetCurrentThread(), "bad aThread");
+
+  aThread.AddRef();  
+  PR_SetThreadPrivate(mCurThreadIndex, &aThread);
+
+#ifdef DEBUG
+  {
+    OffTheBooksMutexAutoLock lock(mMutex);
+    MOZ_ASSERT(aThread.isInList(),
+               "Thread was not added to the thread list before registering!");
+  }
+#endif
+}
+
+void nsThreadManager::UnregisterCurrentThread(nsThread& aThread) {
+  MOZ_ASSERT(aThread.GetPRThread() == PR_GetCurrentThread(), "bad aThread");
+
+  PR_SetThreadPrivate(mCurThreadIndex, nullptr);
+}
+
+RefPtr<nsThread> nsThreadManager::CreateCurrentThread(
+    SynchronizedEventQueue* aQueue) {
+  MOZ_ASSERT(!PR_GetThreadPrivate(mCurThreadIndex));
+
+  if (!AllowNewXPCOMThreads()) {
+    return nullptr;
+  }
+
+  RefPtr<nsThread> thread = new nsThread(
+      WrapNotNull(aQueue), nsThread::NOT_MAIN_THREAD, {.stackSize = 0});
+  if (NS_FAILED(thread->InitCurrentThread())) {
+    return nullptr;
+  }
+
+  return thread;
+}
+
+nsresult nsThreadManager::DispatchToBackgroundThread(
+    nsIRunnable* aEvent, nsIEventTarget::DispatchFlags aDispatchFlags) {
+  RefPtr<BackgroundEventTarget> backgroundTarget;
+  {
+    OffTheBooksMutexAutoLock lock(mMutex);
+    if (!AllowNewXPCOMThreadsLocked() || !mBackgroundEventTarget) {
+      return NS_ERROR_FAILURE;
+    }
+    backgroundTarget = mBackgroundEventTarget;
+  }
+
+  return backgroundTarget->Dispatch(aEvent, aDispatchFlags);
+}
+
+already_AddRefed<TaskQueue> nsThreadManager::CreateBackgroundTaskQueue(
+    mozilla::StaticString aName) {
+  RefPtr<BackgroundEventTarget> backgroundTarget;
+  {
+    OffTheBooksMutexAutoLock lock(mMutex);
+    if (!AllowNewXPCOMThreadsLocked() || !mBackgroundEventTarget) {
+      return nullptr;
+    }
+    backgroundTarget = mBackgroundEventTarget;
+  }
+
+  return backgroundTarget->CreateBackgroundTaskQueue(aName);
+}
+
+nsThread* nsThreadManager::GetCurrentThread() {
+  void* data = PR_GetThreadPrivate(mCurThreadIndex);
+  if (data) {
+    return static_cast<nsThread*>(data);
+  }
+
+  if (!AllowNewXPCOMThreads() || NS_IsMainThread()) {
+    return nullptr;
+  }
+
+  RefPtr<nsThread> thread = new nsThread();
+  if (NS_FAILED(thread->InitCurrentThread())) {
+    return nullptr;
+  }
+
+  return thread.get();
+}
+
+bool nsThreadManager::IsNSThread() const {
+  {
+    OffTheBooksMutexAutoLock lock(mMutex);
+    if (mState == State::eUninit) {
+      return false;
+    }
+  }
+  if (auto* thread = (nsThread*)PR_GetThreadPrivate(mCurThreadIndex)) {
+    return thread->EventQueue();
+  }
+  return false;
+}
+
+NS_IMETHODIMP
+nsThreadManager::NewNamedThread(
+    const nsACString& aName, nsIThreadManager::ThreadCreationOptions aOptions,
+    nsIThread** aResult) {
+
+
+  RefPtr queue = MakeRefPtr<ThreadEventQueue>(MakeUnique<EventQueue>());
+  RefPtr thr = MakeRefPtr<nsThread>(WrapNotNull(queue),
+                                    nsThread::NOT_MAIN_THREAD, aOptions);
+
+  nsresult rv = thr->Init(aName);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (!NS_IsMainThread()) {
+  }
+
+  thr.forget(aResult);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThreadManager::GetMainThread(nsIThread** aResult) {
+  if (!mMainThread) {
+    if (!NS_IsMainThread()) {
+      NS_WARNING(
+          "Called GetMainThread but there isn't a main thread and "
+          "we're not the main thread.");
+    }
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+  NS_ADDREF(*aResult = mMainThread);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThreadManager::GetCurrentThread(nsIThread** aResult) {
+  if (!mMainThread) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+  *aResult = GetCurrentThread();
+  if (!*aResult) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  NS_ADDREF(*aResult);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThreadManager::SpinEventLoopUntil(const nsACString& aVeryGoodReasonToDoThis,
+                                    nsINestedEventLoopCondition* aCondition) {
+  return SpinEventLoopUntilInternal(aVeryGoodReasonToDoThis, aCondition,
+                                    ShutdownPhase::NotInShutdown);
+}
+
+NS_IMETHODIMP
+nsThreadManager::SpinEventLoopUntilOrQuit(
+    const nsACString& aVeryGoodReasonToDoThis,
+    nsINestedEventLoopCondition* aCondition) {
+  return SpinEventLoopUntilInternal(aVeryGoodReasonToDoThis, aCondition,
+                                    ShutdownPhase::AppShutdownConfirmed);
+}
+
+AutoNestedEventLoopAnnotation* AutoNestedEventLoopAnnotation::sCurrent =
+    nullptr;
+StaticMutex AutoNestedEventLoopAnnotation::sStackMutex;
+
+nsresult nsThreadManager::SpinEventLoopUntilInternal(
+    const nsACString& aVeryGoodReasonToDoThis,
+    nsINestedEventLoopCondition* aCondition,
+    ShutdownPhase aShutdownPhaseToCheck) {
+  nsCOMPtr<nsINestedEventLoopCondition> condition(aCondition);
+  nsresult rv = NS_OK;
+
+  if (!mozilla::SpinEventLoopUntil(aVeryGoodReasonToDoThis, [&]() -> bool {
+        if (aShutdownPhaseToCheck > ShutdownPhase::NotInShutdown &&
+            AppShutdown::GetCurrentShutdownPhase() >= aShutdownPhaseToCheck) {
+          return true;
+        }
+
+        bool isDone = false;
+        rv = condition->IsDone(&isDone);
+        if (NS_FAILED(rv)) {
+          return true;
+        }
+
+        return isDone;
+      })) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsThreadManager::SpinEventLoopUntilEmpty() {
+  nsIThread* thread = NS_GetCurrentThread();
+
+  while (NS_HasPendingEvents(thread)) {
+    (void)NS_ProcessNextEvent(thread, false);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThreadManager::GetMainThreadEventTarget(nsIEventTarget** aTarget) {
+  nsCOMPtr<nsIEventTarget> target = GetMainThreadSerialEventTarget();
+  target.forget(aTarget);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThreadManager::DispatchToMainThread(nsIRunnable* aEvent, uint32_t aPriority,
+                                      uint8_t aArgc) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (NS_WARN_IF(!mMainThread)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+  if (aArgc > 0 && aPriority != nsIRunnablePriority::PRIORITY_NORMAL) {
+    nsCOMPtr<nsIRunnable> event(aEvent);
+    return mMainThread->DispatchFromScript(
+        new PrioritizableRunnable(event.forget(), aPriority),
+        NS_DISPATCH_FALLIBLE);
+  }
+  return mMainThread->DispatchFromScript(aEvent, NS_DISPATCH_FALLIBLE);
+}
+
+class AutoMicroTaskWrapperRunnable final : public Runnable {
+ public:
+  explicit AutoMicroTaskWrapperRunnable(nsIRunnable* aEvent)
+      : Runnable("AutoMicroTaskWrapperRunnable"), mEvent(aEvent) {
+    MOZ_ASSERT(aEvent);
+  }
+
+ private:
+  ~AutoMicroTaskWrapperRunnable() = default;
+
+  NS_IMETHOD Run() override {
+    nsAutoMicroTask mt;
+
+    return mEvent->Run();
+  }
+
+  RefPtr<nsIRunnable> mEvent;
+};
+
+NS_IMETHODIMP
+nsThreadManager::DispatchToMainThreadWithMicroTask(nsIRunnable* aEvent,
+                                                   uint32_t aPriority,
+                                                   uint8_t aArgc) {
+  RefPtr runnable = MakeRefPtr<AutoMicroTaskWrapperRunnable>(aEvent);
+
+  return DispatchToMainThread(runnable, aPriority, aArgc);
+}
+
+void nsThreadManager::EnableMainThreadEventPrioritization() {
+  MOZ_ASSERT(NS_IsMainThread());
+  InputTaskManager::Get()->EnableInputEventPrioritization();
+}
+
+void nsThreadManager::FlushInputEventPrioritization() {
+  MOZ_ASSERT(NS_IsMainThread());
+  InputTaskManager::Get()->FlushInputEventPrioritization();
+}
+
+void nsThreadManager::SuspendInputEventPrioritization() {
+  MOZ_ASSERT(NS_IsMainThread());
+  InputTaskManager::Get()->SuspendInputEventPrioritization();
+}
+
+void nsThreadManager::ResumeInputEventPrioritization() {
+  MOZ_ASSERT(NS_IsMainThread());
+  InputTaskManager::Get()->ResumeInputEventPrioritization();
+}
+
+bool nsThreadManager::MainThreadHasPendingHighPriorityEvents() {
+  MOZ_ASSERT(NS_IsMainThread());
+  bool retVal = false;
+  if (get().mMainThread) {
+    get().mMainThread->HasPendingHighPriorityEvents(&retVal);
+  }
+  return retVal;
+}
+
+NS_IMETHODIMP
+nsThreadManager::IdleDispatchToMainThread(nsIRunnable* aEvent,
+                                          uint32_t aTimeout) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  nsCOMPtr<nsIRunnable> event(aEvent);
+  if (aTimeout) {
+    return NS_DispatchToThreadQueue(event.forget(), aTimeout, mMainThread,
+                                    EventQueuePriority::Idle);
+  }
+
+  return NS_DispatchToThreadQueue(event.forget(), mMainThread,
+                                  EventQueuePriority::Idle);
+}
+
+NS_IMETHODIMP
+nsThreadManager::DispatchDirectTaskToCurrentThread(nsIRunnable* aEvent) {
+  NS_ENSURE_STATE(aEvent);
+  nsCOMPtr<nsIRunnable> runnable = aEvent;
+  return GetCurrentThread()->DispatchDirectTask(runnable.forget());
+}
+
+bool nsThreadManager::AllowNewXPCOMThreads() {
+  mozilla::OffTheBooksMutexAutoLock lock(mMutex);
+  return AllowNewXPCOMThreadsLocked();
+}

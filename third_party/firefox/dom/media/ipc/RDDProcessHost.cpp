@@ -1,0 +1,226 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include "RDDProcessHost.h"
+
+#include "RDDChild.h"
+#include "chrome/common/process_watcher.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/ipc/ProcessUtils.h"
+
+
+namespace mozilla {
+
+using namespace ipc;
+
+
+RDDProcessHost::RDDProcessHost(Listener* aListener)
+    : GeckoChildProcessHost(GeckoProcessType_RDD),
+      mListener(aListener),
+      mLiveToken(new media::Refcountable<bool>(true)) {
+  MOZ_COUNT_CTOR(RDDProcessHost);
+
+}
+
+RDDProcessHost::~RDDProcessHost() { MOZ_COUNT_DTOR(RDDProcessHost); }
+
+bool RDDProcessHost::Launch(geckoargs::ChildProcessArgs aExtraOpts) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  MOZ_ASSERT(mLaunchPhase == LaunchPhase::Unlaunched);
+  MOZ_ASSERT(!mRDDChild);
+
+  mPrefSerializer = MakeUnique<ipc::SharedPreferenceSerializer>();
+  if (!mPrefSerializer->SerializeToSharedMemory(GeckoProcessType_RDD,
+                                                 ""_ns)) {
+    return false;
+  }
+  mPrefSerializer->AddSharedPrefCmdLineArgs(*this, aExtraOpts);
+
+  mLaunchPhase = LaunchPhase::Waiting;
+  mLaunchTime = TimeStamp::Now();
+
+  int32_t timeoutMs = StaticPrefs::media_rdd_process_startup_timeout_ms();
+
+  if (PR_GetEnv("MOZ_DEBUG_CHILD_PROCESS") ||
+      PR_GetEnv("MOZ_DEBUG_CHILD_PAUSE")) {
+    timeoutMs = 0;
+  }
+  if (timeoutMs) {
+    GetMainThreadSerialEventTarget()->DelayedDispatch(
+        NS_NewRunnableFunction(
+            "RDDProcessHost::Launchtimeout",
+            [this, liveToken = mLiveToken]() {
+              if (!*liveToken || mTimerChecked) {
+                return;
+              }
+              InitAfterConnect(false);
+              MOZ_ASSERT(mTimerChecked,
+                         "InitAfterConnect must have acted on the promise");
+            }),
+        timeoutMs);
+  }
+
+  if (!GeckoChildProcessHost::AsyncLaunch(std::move(aExtraOpts))) {
+    mLaunchPhase = LaunchPhase::Complete;
+    mPrefSerializer = nullptr;
+    return false;
+  }
+  return true;
+}
+
+RefPtr<GenericNonExclusivePromise> RDDProcessHost::LaunchPromise() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mLaunchPromise) {
+    return mLaunchPromise;
+  }
+  mLaunchPromise = MakeRefPtr<GenericNonExclusivePromise::Private>(__func__);
+  WhenProcessHandleReady()->Then(
+      GetCurrentSerialEventTarget(), __func__,
+      [this, liveToken = mLiveToken](
+          const ipc::ProcessHandlePromise::ResolveOrRejectValue& aResult) {
+        if (!*liveToken) {
+          return;
+        }
+        if (mTimerChecked) {
+          return;
+        }
+        mTimerChecked = true;
+        if (aResult.IsReject()) {
+          RejectPromise();
+        }
+      });
+  return mLaunchPromise;
+}
+
+void RDDProcessHost::OnChannelConnected(base::ProcessId peer_pid) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  GeckoChildProcessHost::OnChannelConnected(peer_pid);
+
+  NS_DispatchToMainThread(NS_NewRunnableFunction(
+      "RDDProcessHost::OnChannelConnected", [this, liveToken = mLiveToken]() {
+        if (*liveToken && mLaunchPhase == LaunchPhase::Waiting) {
+          InitAfterConnect(true);
+        }
+      }));
+}
+
+static uint64_t sRDDProcessTokenCounter = 0;
+
+void RDDProcessHost::InitAfterConnect(bool aSucceeded) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  MOZ_ASSERT(mLaunchPhase == LaunchPhase::Waiting);
+  MOZ_ASSERT(!mRDDChild);
+
+  mLaunchPhase = LaunchPhase::Complete;
+
+  if (!aSucceeded) {
+    RejectPromise();
+    return;
+  }
+  mProcessToken = ++sRDDProcessTokenCounter;
+  mRDDChild = MakeRefPtr<RDDChild>(this);
+  DebugOnly<bool> rv = TakeInitialEndpoint().Bind(mRDDChild.get());
+  MOZ_ASSERT(rv);
+
+  mPrefSerializer = nullptr;
+
+  if (!mRDDChild->Init()) {
+    mRDDChild->Close();
+    RejectPromise();
+  } else {
+    ResolvePromise();
+  }
+}
+
+void RDDProcessHost::Shutdown() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!mShutdownRequested);
+
+  RejectPromise();
+
+  if (mRDDChild) {
+    mShutdownRequested = true;
+
+    if (!mChannelClosed) {
+      mRDDChild->Close();
+    }
+
+#ifndef NS_FREE_PERMANENT_DATA
+    KillHard("NormalShutdown");
+#endif
+
+    return;
+  }
+
+  DestroyProcess();
+}
+
+void RDDProcessHost::OnChannelClosed() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  mChannelClosed = true;
+  RejectPromise();
+
+  if (!mShutdownRequested && mListener) {
+    mListener->OnProcessUnexpectedShutdown(this);
+  } else {
+    DestroyProcess();
+  }
+
+  RDDChild::Destroy(std::move(mRDDChild));
+}
+
+void RDDProcessHost::KillHard(const char* aReason) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  ProcessHandle handle = GetChildProcessHandle();
+  if (!base::KillProcess(handle, base::PROCESS_END_KILLED_BY_USER)) {
+    NS_WARNING("failed to kill subprocess!");
+  }
+
+  SetAlreadyDead();
+}
+
+uint64_t RDDProcessHost::GetProcessToken() const {
+  MOZ_ASSERT(NS_IsMainThread());
+  return mProcessToken;
+}
+
+void RDDProcessHost::DestroyProcess() {
+  MOZ_ASSERT(NS_IsMainThread());
+  RejectPromise();
+
+  *mLiveToken = false;
+
+  NS_DispatchToMainThread(
+      NS_NewRunnableFunction("DestroyProcessRunnable", [this] { Destroy(); }));
+}
+
+void RDDProcessHost::ResolvePromise() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mLaunchPromise && !mLaunchPromiseSettled) {
+    mLaunchPromise->Resolve(true, __func__);
+    mLaunchPromiseSettled = true;
+  }
+  mTimerChecked = true;
+}
+
+void RDDProcessHost::RejectPromise() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mLaunchPromise && !mLaunchPromiseSettled) {
+    mLaunchPromise->Reject(NS_ERROR_FAILURE, __func__);
+    mLaunchPromiseSettled = true;
+  }
+  mTimerChecked = true;
+}
+
+
+}  

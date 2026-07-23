@@ -1,0 +1,29 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if defined(MOZ_MEMORY) && defined(IMPL_MFBT)
+#  define MOZ_MEMORY_IMPL
+#  include "mozmemory_wrap.h"
+#  define MALLOC_FUNCS MALLOC_FUNCS_MALLOC
+#  define MALLOC_DECL(name, return_type, ...) \
+    MOZ_MEMORY_API return_type name##_impl(__VA_ARGS__);
+#  include "malloc_decls.h"
+#else
+#  include <cstdlib>
+#  define malloc_impl malloc
+#  define free_impl free
+#endif
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Types.h"
+
+extern "C" MFBT_API void* moz_xmalloc(size_t size) MOZ_INFALLIBLE_ALLOCATOR;
+
+namespace std {
+struct nothrow_t;
+}
+
+#define MOZALLOC_EXPORT_NEW MFBT_API
+
+#include "mozilla/cxxalloc.h"

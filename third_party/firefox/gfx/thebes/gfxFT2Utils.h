@@ -1,0 +1,50 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_FT2UTILS_H
+#define GFX_FT2UTILS_H
+
+#include "cairo-ft.h"
+#include "gfxFT2FontBase.h"
+
+#define FLOAT_FROM_26_6(x) ((x) / 64.0)
+#define FLOAT_FROM_16_16(x) ((x) / 65536.0)
+#define ROUND_26_6_TO_INT(x) ((x) >= 0 ? ((32 + (x)) >> 6) : -((32 - (x)) >> 6))
+
+typedef struct FT_FaceRec_* FT_Face;
+
+class MOZ_STACK_CLASS gfxFT2LockedFace {
+ public:
+  explicit gfxFT2LockedFace(const gfxFT2FontBase* aFont)
+      : mGfxFont(aFont), mFace(aFont->LockFTFace()) {}
+  ~gfxFT2LockedFace() { mGfxFont->UnlockFTFace(); }
+
+  FT_Face get() { return mFace; };
+
+  uint32_t GetGlyph(uint32_t aCharCode);
+  uint32_t GetUVSGlyph(uint32_t aCharCode, uint32_t aVariantSelector);
+
+ protected:
+  typedef FT_UInt (*CharVariantFunction)(FT_Face face, FT_ULong charcode,
+                                         FT_ULong variantSelector);
+  CharVariantFunction FindCharVariantFunction();
+
+  const gfxFT2FontBase* MOZ_NON_OWNING_REF mGfxFont;  
+  FT_Face mFace;
+};
+
+
+typedef struct FT_MM_Var_ FT_MM_Var;
+
+class gfxFT2Utils {
+ public:
+  static void GetVariationAxes(const FT_MM_Var* aMMVar,
+                               nsTArray<gfxFontVariationAxis>& aAxes);
+
+  static void GetVariationInstances(
+      gfxFontEntry* aFontEntry, const FT_MM_Var* aMMVar,
+      nsTArray<gfxFontVariationInstance>& aInstances);
+};
+
+#endif /* GFX_FT2UTILS_H */

@@ -1,0 +1,37 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_FileCreatorHelper_h
+#define mozilla_dom_FileCreatorHelper_h
+
+#include "nsISupportsImpl.h"
+
+#ifdef CreateFile
+#  undef CreateFile
+#endif
+
+class nsIFile;
+class nsIGlobalObject;
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+struct ChromeFilePropertyBag;
+class Promise;
+
+class FileCreatorHelper final {
+ public:
+  static already_AddRefed<Promise> CreateFile(nsIGlobalObject* aGlobalObject,
+                                              nsIFile* aFile,
+                                              const ChromeFilePropertyBag& aBag,
+                                              bool aIsFromNsIFile,
+                                              ErrorResult& aRv);
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_FileCreatorHelper_h

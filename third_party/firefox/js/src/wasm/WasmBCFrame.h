@@ -1,0 +1,995 @@
+/*
+ * Copyright 2016 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+
+#ifndef wasm_wasm_baseline_frame_h
+#define wasm_wasm_baseline_frame_h
+
+#include "wasm/WasmBaselineCompile.h"  // For BaseLocalIter
+#include "wasm/WasmBCDefs.h"
+#include "wasm/WasmBCRegDefs.h"
+#include "wasm/WasmBCStk.h"
+#include "wasm/WasmConstants.h"  // For MaxFrameSize
+
+
+namespace js {
+namespace wasm {
+
+using namespace js::jit;
+
+
+class StackHeight {
+  friend class BaseStackFrameAllocator;
+
+  uint32_t height;
+
+ public:
+  explicit StackHeight(uint32_t h) : height(h) {}
+  static StackHeight Invalid() { return StackHeight(UINT32_MAX); }
+  bool isValid() const { return height != UINT32_MAX; }
+  bool operator==(StackHeight rhs) const {
+    MOZ_ASSERT(isValid() && rhs.isValid());
+    return height == rhs.height;
+  }
+  bool operator!=(StackHeight rhs) const { return !(*this == rhs); }
+};
+
+
+class StackResultsLoc {
+  uint32_t bytes_;
+  size_t count_;
+  mozilla::Maybe<uint32_t> height_;
+
+ public:
+  StackResultsLoc() : bytes_(0), count_(0) {};
+  StackResultsLoc(uint32_t bytes, size_t count, uint32_t height)
+      : bytes_(bytes), count_(count), height_(mozilla::Some(height)) {
+    MOZ_ASSERT(bytes != 0);
+    MOZ_ASSERT(count != 0);
+    MOZ_ASSERT(height != 0);
+  }
+
+  uint32_t bytes() const { return bytes_; }
+  uint32_t count() const { return count_; }
+  uint32_t height() const { return height_.value(); }
+
+  bool hasStackResults() const { return bytes() != 0; }
+  StackResults stackResults() const {
+    return hasStackResults() ? StackResults::HasStackResults
+                             : StackResults::NoStackResults;
+  }
+};
+
+
+class BaseStackFrameAllocator {
+  MacroAssembler& masm;
+
+#ifdef RABALDR_CHUNKY_STACK
+
+
+
+  static constexpr uint32_t ChunkSize = 8 * sizeof(void*);
+  static constexpr uint32_t InitialChunk = ChunkSize;
+
+
+  uint32_t currentStackHeight_;
+#endif
+
+
+  uint32_t localSize_;
+
+ protected:
+
+  explicit BaseStackFrameAllocator(MacroAssembler& masm)
+      : masm(masm),
+#ifdef RABALDR_CHUNKY_STACK
+        currentStackHeight_(0),
+#endif
+        localSize_(UINT32_MAX) {
+  }
+
+ protected:
+
+
+  void setLocalSize(uint32_t localSize) {
+    MOZ_ASSERT(localSize == AlignBytes(localSize, sizeof(void*)),
+               "localSize_ should be aligned to at least a pointer");
+    MOZ_ASSERT(localSize_ == UINT32_MAX);
+    localSize_ = localSize;
+  }
+
+
+  void onFixedStackAllocated() {
+    MOZ_ASSERT(localSize_ != UINT32_MAX);
+#ifdef RABALDR_CHUNKY_STACK
+    currentStackHeight_ = localSize_;
+#endif
+  }
+
+ public:
+
+  uint32_t fixedAllocSize() const {
+    MOZ_ASSERT(localSize_ != UINT32_MAX);
+#ifdef RABALDR_CHUNKY_STACK
+    return localSize_ + InitialChunk;
+#else
+    return localSize_;
+#endif
+  }
+
+#ifdef RABALDR_CHUNKY_STACK
+  uint32_t framePushedForHeight(uint32_t logicalHeight) {
+    if (logicalHeight <= fixedAllocSize()) {
+      return fixedAllocSize();
+    }
+    return fixedAllocSize() +
+           AlignBytes(logicalHeight - fixedAllocSize(), ChunkSize);
+  }
+#endif
+
+ protected:
+
+
+  int32_t stackOffset(int32_t offset) {
+    MOZ_ASSERT(offset > 0);
+    return masm.framePushed() - offset;
+  }
+
+  uint32_t computeHeightWithStackResults(StackHeight stackBase,
+                                         uint32_t stackResultBytes) {
+    MOZ_ASSERT(stackResultBytes);
+    MOZ_ASSERT(currentStackHeight() >= stackBase.height);
+    return stackBase.height + stackResultBytes;
+  }
+
+#ifdef RABALDR_CHUNKY_STACK
+  void pushChunkyBytes(uint32_t bytes) {
+    checkChunkyInvariants();
+    uint32_t freeSpace = masm.framePushed() - currentStackHeight_;
+    if (freeSpace < bytes) {
+      uint32_t bytesToReserve = AlignBytes(bytes - freeSpace, ChunkSize);
+      MOZ_ASSERT(bytesToReserve + freeSpace >= bytes);
+      masm.reserveStack(bytesToReserve);
+    }
+    currentStackHeight_ += bytes;
+    checkChunkyInvariants();
+  }
+
+  void popChunkyBytes(uint32_t bytes) {
+    checkChunkyInvariants();
+    currentStackHeight_ -= bytes;
+    uint32_t freeSpace = masm.framePushed() - currentStackHeight_;
+    if (freeSpace >= ChunkSize) {
+      uint32_t targetAllocSize = framePushedForHeight(currentStackHeight_);
+      uint32_t amountToFree = masm.framePushed() - targetAllocSize;
+      MOZ_ASSERT(amountToFree % ChunkSize == 0);
+      if (amountToFree) {
+        masm.freeStack(amountToFree);
+      }
+    }
+    checkChunkyInvariants();
+  }
+#endif
+
+  uint32_t currentStackHeight() const {
+#ifdef RABALDR_CHUNKY_STACK
+    return currentStackHeight_;
+#else
+    return masm.framePushed();
+#endif
+  }
+
+ private:
+#ifdef RABALDR_CHUNKY_STACK
+  void checkChunkyInvariants() {
+    MOZ_ASSERT(masm.framePushed() >= fixedAllocSize());
+    MOZ_ASSERT(masm.framePushed() >= currentStackHeight_);
+    MOZ_ASSERT(masm.framePushed() == fixedAllocSize() ||
+               masm.framePushed() - currentStackHeight_ < ChunkSize);
+    MOZ_ASSERT((masm.framePushed() - localSize_) % ChunkSize == 0);
+  }
+#endif
+
+
+  uint32_t framePushedForHeight(StackHeight stackHeight) {
+#ifdef RABALDR_CHUNKY_STACK
+    return framePushedForHeight(stackHeight.height);
+#else
+    return stackHeight.height;
+#endif
+  }
+
+ public:
+
+  StackHeight stackHeight() const { return StackHeight(currentStackHeight()); }
+
+
+  void setStackHeight(StackHeight amount) {
+#ifdef RABALDR_CHUNKY_STACK
+    currentStackHeight_ = amount.height;
+    masm.setFramePushed(framePushedForHeight(amount));
+    checkChunkyInvariants();
+#else
+    masm.setFramePushed(amount.height);
+#endif
+  }
+
+
+  uint32_t dynamicHeight() const { return currentStackHeight() - localSize_; }
+
+
+  void popStackBeforeBranch(StackHeight destStackHeight,
+                            uint32_t stackResultBytes) {
+    uint32_t framePushedHere = masm.framePushed();
+    StackHeight heightThere =
+        StackHeight(destStackHeight.height + stackResultBytes);
+    uint32_t framePushedThere = framePushedForHeight(heightThere);
+    if (framePushedHere > framePushedThere) {
+      masm.addToStackPtr(Imm32(framePushedHere - framePushedThere));
+    }
+  }
+
+  void popStackBeforeBranch(StackHeight destStackHeight, ResultType type) {
+    popStackBeforeBranch(destStackHeight,
+                         ABIResultIter::MeasureStackBytes(type));
+  }
+
+
+  StackHeight stackResultsBase(uint32_t stackParamSize) {
+    return StackHeight(currentStackHeight() - stackParamSize);
+  }
+
+  // For most of WebAssembly, adjacent instructions have fallthrough control
+
+  void resetStackHeight(StackHeight destStackHeight, ResultType type) {
+    uint32_t height = destStackHeight.height;
+    height += ABIResultIter::MeasureStackBytes(type);
+    setStackHeight(StackHeight(height));
+  }
+
+
+  uint32_t locateStackResult(const ABIResult& result, StackHeight stackBase,
+                             uint32_t stackResultBytes) {
+    MOZ_ASSERT(result.onStack());
+    MOZ_ASSERT(result.stackOffset() + result.size() <= stackResultBytes);
+    uint32_t end = computeHeightWithStackResults(stackBase, stackResultBytes);
+    return end - result.stackOffset();
+  }
+
+ public:
+
+
+  void allocArgArea(size_t argSize) {
+    if (argSize) {
+      masm.reserveStack(argSize);
+    }
+  }
+
+
+  void freeArgAreaAndPopBytes(size_t argSize, size_t dropSize) {
+#ifdef RABALDR_CHUNKY_STACK
+    masm.freeStackTo(masm.framePushed() - argSize);
+    popChunkyBytes(dropSize);
+#else
+    masm.freeStackTo(masm.framePushed() - (argSize + dropSize));
+#endif
+  }
+};
+
+class BaseStackFrame final : public BaseStackFrameAllocator {
+  MacroAssembler& masm;
+
+  uint32_t maxFramePushed_;
+
+  CodeOffset stackAddOffset_;
+
+  mozilla::Maybe<int32_t> stackResultsPtrOffset_;
+
+  uint32_t instancePointerOffset_;
+
+  uint32_t varLow_;
+
+  uint32_t varHigh_;
+
+  RegisterOrSP sp_;
+
+ public:
+  explicit BaseStackFrame(MacroAssembler& masm)
+      : BaseStackFrameAllocator(masm),
+        masm(masm),
+        maxFramePushed_(0),
+        stackAddOffset_(0),
+        instancePointerOffset_(UINT32_MAX),
+        varLow_(UINT32_MAX),
+        varHigh_(UINT32_MAX),
+        sp_(masm.getStackPointer()) {}
+
+
+
+  void onFixedStackAllocated() {
+    maxFramePushed_ = masm.framePushed();
+    BaseStackFrameAllocator::onFixedStackAllocated();
+  }
+
+
+  void checkStack(Register tmp1, Register tmp2, Label* stackOverflowTrap) {
+    masm.loadPtr(Address(InstanceReg, wasm::Instance::offsetOfCx()), tmp2);
+    stackAddOffset_ = masm.sub32FromStackPtrWithPatch(tmp1);
+    masm.branchPtr(Assembler::AboveOrEqual,
+                   Address(tmp2, JSContext::offsetOfWasm() +
+                                     wasm::Context::offsetOfStackLimit()),
+                   tmp1, stackOverflowTrap);
+  }
+
+  void patchCheckStack() {
+    masm.patchSub32FromStackPtr(stackAddOffset_,
+                                Imm32(int32_t(maxFramePushed_)));
+  }
+
+
+  bool checkStackHeight() { return maxFramePushed_ <= MaxFrameSize; }
+
+
+  struct Local {
+    const MIRType type;
+
+    const int32_t offs;
+
+    Local(MIRType type, int32_t offs) : type(type), offs(offs) {}
+
+    bool isStackArgument() const { return offs < 0; }
+  };
+
+  using LocalVector = Vector<Local, 16, SystemAllocPolicy>;
+
+  [[nodiscard]] bool setupLocals(const ValTypeVector& locals,
+                                 const ArgTypeVector& args, bool debugEnabled,
+                                 LocalVector* localInfo) {
+    if (!localInfo->reserve(locals.length())) {
+      return false;
+    }
+
+    mozilla::DebugOnly<uint32_t> index = 0;
+    BaseLocalIter i(locals, args, debugEnabled);
+    for (; !i.done() && i.index() < args.lengthWithoutStackResults(); i++) {
+      MOZ_ASSERT(i.isArg());
+      MOZ_ASSERT(i.index() == index);
+      localInfo->infallibleEmplaceBack(i.mirType(), i.frameOffset());
+      index++;
+    }
+
+    varLow_ = i.frameSize();
+    for (; !i.done(); i++) {
+      MOZ_ASSERT(!i.isArg());
+      MOZ_ASSERT(i.index() == index);
+      localInfo->infallibleEmplaceBack(i.mirType(), i.frameOffset());
+      index++;
+    }
+    varHigh_ = i.frameSize();
+
+    const uint32_t pointerAlignedVarHigh = AlignBytes(varHigh_, sizeof(void*));
+    const uint32_t localSize = pointerAlignedVarHigh + sizeof(void*);
+    instancePointerOffset_ = localSize;
+
+    setLocalSize(AlignBytes(localSize, WasmStackAlignment));
+
+    if (args.hasSyntheticStackResultPointerArg()) {
+      stackResultsPtrOffset_ = mozilla::Some(i.stackResultPointerOffset());
+    }
+
+    return true;
+  }
+
+  void zeroLocals(BaseRegAlloc* ra);
+
+  Address addressOfLocal(const Local& local, uint32_t additionalOffset = 0) {
+    if (local.isStackArgument()) {
+      return Address(FramePointer,
+                     stackArgumentOffsetFromFp(local) + additionalOffset);
+    }
+    return Address(sp_, localOffsetFromSp(local) + additionalOffset);
+  }
+
+  void loadLocalI32(const Local& src, RegI32 dest) {
+    masm.load32(addressOfLocal(src), dest);
+  }
+
+#ifndef JS_PUNBOX64
+  void loadLocalI64Low(const Local& src, RegI32 dest) {
+    masm.load32(addressOfLocal(src, INT64LOW_OFFSET), dest);
+  }
+
+  void loadLocalI64High(const Local& src, RegI32 dest) {
+    masm.load32(addressOfLocal(src, INT64HIGH_OFFSET), dest);
+  }
+#endif
+
+  void loadLocalI64(const Local& src, RegI64 dest) {
+    masm.load64(addressOfLocal(src), dest);
+  }
+
+  void loadLocalRef(const Local& src, RegRef dest) {
+    masm.loadPtr(addressOfLocal(src), dest);
+  }
+
+  void loadLocalF64(const Local& src, RegF64 dest) {
+    masm.loadDouble(addressOfLocal(src), dest);
+  }
+
+  void loadLocalF32(const Local& src, RegF32 dest) {
+    masm.loadFloat32(addressOfLocal(src), dest);
+  }
+
+#ifdef ENABLE_WASM_SIMD
+  void loadLocalV128(const Local& src, RegV128 dest) {
+    masm.loadUnalignedSimd128(addressOfLocal(src), dest);
+  }
+#endif
+
+  void storeLocalI32(RegI32 src, const Local& dest) {
+    masm.store32(src, addressOfLocal(dest));
+  }
+
+  void storeLocalI64(RegI64 src, const Local& dest) {
+    masm.store64(src, addressOfLocal(dest));
+  }
+
+  void storeLocalRef(RegRef src, const Local& dest) {
+    masm.storePtr(src, addressOfLocal(dest));
+  }
+
+  void storeLocalF64(RegF64 src, const Local& dest) {
+    masm.storeDouble(src, addressOfLocal(dest));
+  }
+
+  void storeLocalF32(RegF32 src, const Local& dest) {
+    masm.storeFloat32(src, addressOfLocal(dest));
+  }
+
+#ifdef ENABLE_WASM_SIMD
+  void storeLocalV128(RegV128 src, const Local& dest) {
+    masm.storeUnalignedSimd128(src, addressOfLocal(dest));
+  }
+#endif
+
+  int32_t localOffsetFromSp(const Local& local) {
+    MOZ_ASSERT(!local.isStackArgument());
+    return localOffset(local.offs);
+  }
+
+  int32_t stackArgumentOffsetFromFp(const Local& local) {
+    MOZ_ASSERT(local.isStackArgument());
+    return -local.offs;
+  }
+
+  void loadIncomingStackResultAreaPtr(RegPtr reg) {
+    const int32_t offset = stackResultsPtrOffset_.value();
+    Address src = offset < 0 ? Address(FramePointer, -offset)
+                             : Address(sp_, stackOffset(offset));
+    masm.loadPtr(src, reg);
+  }
+
+  void storeIncomingStackResultAreaPtr(RegPtr reg) {
+    MOZ_ASSERT(stackResultsPtrOffset_.value() > 0);
+    masm.storePtr(reg,
+                  Address(sp_, stackOffset(stackResultsPtrOffset_.value())));
+  }
+
+  void loadInstancePtr(Register dst) {
+    masm.loadPtr(Address(FramePointer, -instancePointerOffset_), dst);
+  }
+
+  void storeInstancePtr(Register instance) {
+    masm.storePtr(instance, Address(sp_, stackOffset(instancePointerOffset_)));
+  }
+
+  int32_t getInstancePtrOffset() { return stackOffset(instancePointerOffset_); }
+
+  void computeOutgoingStackResultAreaPtr(const StackResultsLoc& results,
+                                         RegPtr dest) {
+    MOZ_ASSERT(results.height() <= masm.framePushed());
+    uint32_t offsetFromSP = masm.framePushed() - results.height();
+    masm.moveStackPtrTo(dest);
+    if (offsetFromSP) {
+      masm.addPtr(Imm32(offsetFromSP), dest);
+    }
+  }
+
+ private:
+  int32_t localOffset(int32_t offset) { return masm.framePushed() - offset; }
+
+ public:
+
+  static constexpr size_t StackSizeOfPtr = ABIResult::StackSizeOfPtr;
+  static constexpr size_t StackSizeOfInt64 = ABIResult::StackSizeOfInt64;
+  static constexpr size_t StackSizeOfFloat = ABIResult::StackSizeOfFloat;
+  static constexpr size_t StackSizeOfDouble = ABIResult::StackSizeOfDouble;
+#ifdef ENABLE_WASM_SIMD
+  static constexpr size_t StackSizeOfV128 = ABIResult::StackSizeOfV128;
+#endif
+
+  uint32_t pushGPR(Register r) {
+    mozilla::DebugOnly<uint32_t> stackBefore = currentStackHeight();
+#ifdef RABALDR_CHUNKY_STACK
+    pushChunkyBytes(StackSizeOfPtr);
+    masm.storePtr(r, Address(sp_, stackOffset(currentStackHeight())));
+#else
+    masm.Push(r);
+#endif
+    maxFramePushed_ = std::max(maxFramePushed_, masm.framePushed());
+    MOZ_ASSERT(stackBefore + StackSizeOfPtr == currentStackHeight());
+    return currentStackHeight();
+  }
+
+  uint32_t pushFloat32(FloatRegister r) {
+    mozilla::DebugOnly<uint32_t> stackBefore = currentStackHeight();
+#ifdef RABALDR_CHUNKY_STACK
+    pushChunkyBytes(StackSizeOfFloat);
+    masm.storeFloat32(r, Address(sp_, stackOffset(currentStackHeight())));
+#else
+    masm.Push(r);
+#endif
+    maxFramePushed_ = std::max(maxFramePushed_, masm.framePushed());
+    MOZ_ASSERT(stackBefore + StackSizeOfFloat == currentStackHeight());
+    return currentStackHeight();
+  }
+
+#ifdef ENABLE_WASM_SIMD
+  uint32_t pushV128(RegV128 r) {
+    mozilla::DebugOnly<uint32_t> stackBefore = currentStackHeight();
+#  ifdef RABALDR_CHUNKY_STACK
+    pushChunkyBytes(StackSizeOfV128);
+#  else
+    masm.adjustStack(-(int)StackSizeOfV128);
+#  endif
+    masm.storeUnalignedSimd128(r,
+                               Address(sp_, stackOffset(currentStackHeight())));
+    maxFramePushed_ = std::max(maxFramePushed_, masm.framePushed());
+    MOZ_ASSERT(stackBefore + StackSizeOfV128 == currentStackHeight());
+    return currentStackHeight();
+  }
+#endif
+
+  uint32_t pushDouble(FloatRegister r) {
+    mozilla::DebugOnly<uint32_t> stackBefore = currentStackHeight();
+#ifdef RABALDR_CHUNKY_STACK
+    pushChunkyBytes(StackSizeOfDouble);
+    masm.storeDouble(r, Address(sp_, stackOffset(currentStackHeight())));
+#else
+    masm.Push(r);
+#endif
+    maxFramePushed_ = std::max(maxFramePushed_, masm.framePushed());
+    MOZ_ASSERT(stackBefore + StackSizeOfDouble == currentStackHeight());
+    return currentStackHeight();
+  }
+
+  void popGPR(Register r) {
+    mozilla::DebugOnly<uint32_t> stackBefore = currentStackHeight();
+#ifdef RABALDR_CHUNKY_STACK
+    masm.loadPtr(Address(sp_, stackOffset(currentStackHeight())), r);
+    popChunkyBytes(StackSizeOfPtr);
+#else
+    masm.Pop(r);
+#endif
+    MOZ_ASSERT(stackBefore - StackSizeOfPtr == currentStackHeight());
+  }
+
+  void popFloat32(FloatRegister r) {
+    mozilla::DebugOnly<uint32_t> stackBefore = currentStackHeight();
+#ifdef RABALDR_CHUNKY_STACK
+    masm.loadFloat32(Address(sp_, stackOffset(currentStackHeight())), r);
+    popChunkyBytes(StackSizeOfFloat);
+#else
+    masm.Pop(r);
+#endif
+    MOZ_ASSERT(stackBefore - StackSizeOfFloat == currentStackHeight());
+  }
+
+  void popDouble(FloatRegister r) {
+    mozilla::DebugOnly<uint32_t> stackBefore = currentStackHeight();
+#ifdef RABALDR_CHUNKY_STACK
+    masm.loadDouble(Address(sp_, stackOffset(currentStackHeight())), r);
+    popChunkyBytes(StackSizeOfDouble);
+#else
+    masm.Pop(r);
+#endif
+    MOZ_ASSERT(stackBefore - StackSizeOfDouble == currentStackHeight());
+  }
+
+#ifdef ENABLE_WASM_SIMD
+  void popV128(RegV128 r) {
+    mozilla::DebugOnly<uint32_t> stackBefore = currentStackHeight();
+    masm.loadUnalignedSimd128(Address(sp_, stackOffset(currentStackHeight())),
+                              r);
+#  ifdef RABALDR_CHUNKY_STACK
+    popChunkyBytes(StackSizeOfV128);
+#  else
+    masm.adjustStack((int)StackSizeOfV128);
+#  endif
+    MOZ_ASSERT(stackBefore - StackSizeOfV128 == currentStackHeight());
+  }
+#endif
+
+  void popBytes(size_t bytes) {
+    if (bytes > 0) {
+#ifdef RABALDR_CHUNKY_STACK
+      popChunkyBytes(bytes);
+#else
+      masm.freeStack(bytes);
+#endif
+    }
+  }
+
+  void loadStackI32(int32_t offset, RegI32 dest) {
+    masm.load32(Address(sp_, stackOffset(offset)), dest);
+  }
+
+  void loadStackI64(int32_t offset, RegI64 dest) {
+    masm.load64(Address(sp_, stackOffset(offset)), dest);
+  }
+
+#ifndef JS_PUNBOX64
+  void loadStackI64Low(int32_t offset, RegI32 dest) {
+    masm.load32(Address(sp_, stackOffset(offset - INT64LOW_OFFSET)), dest);
+  }
+
+  void loadStackI64High(int32_t offset, RegI32 dest) {
+    masm.load32(Address(sp_, stackOffset(offset - INT64HIGH_OFFSET)), dest);
+  }
+#endif
+
+  void loadStackRef(int32_t offset, RegRef dest) {
+    masm.loadPtr(Address(sp_, stackOffset(offset)), dest);
+  }
+
+  void loadStackF64(int32_t offset, RegF64 dest) {
+    masm.loadDouble(Address(sp_, stackOffset(offset)), dest);
+  }
+
+  void loadStackF32(int32_t offset, RegF32 dest) {
+    masm.loadFloat32(Address(sp_, stackOffset(offset)), dest);
+  }
+
+#ifdef ENABLE_WASM_SIMD
+  void loadStackV128(int32_t offset, RegV128 dest) {
+    masm.loadUnalignedSimd128(Address(sp_, stackOffset(offset)), dest);
+  }
+#endif
+
+  uint32_t prepareStackResultArea(StackHeight stackBase,
+                                  uint32_t stackResultBytes) {
+    uint32_t end = computeHeightWithStackResults(stackBase, stackResultBytes);
+    if (currentStackHeight() < end) {
+      uint32_t bytes = end - currentStackHeight();
+#ifdef RABALDR_CHUNKY_STACK
+      pushChunkyBytes(bytes);
+#else
+      masm.reserveStack(bytes);
+#endif
+      maxFramePushed_ = std::max(maxFramePushed_, masm.framePushed());
+    }
+    return end;
+  }
+
+  void finishStackResultArea(StackHeight stackBase, uint32_t stackResultBytes) {
+    uint32_t end = computeHeightWithStackResults(stackBase, stackResultBytes);
+    MOZ_ASSERT(currentStackHeight() >= end);
+    popBytes(currentStackHeight() - end);
+  }
+
+  void shuffleStackResultsTowardFP(uint32_t srcHeight, uint32_t destHeight,
+                                   uint32_t bytes, Register temp) {
+    MOZ_ASSERT(destHeight < srcHeight);
+    MOZ_ASSERT(bytes % sizeof(uint32_t) == 0);
+    int32_t destOffset = int32_t(-destHeight + bytes);
+    int32_t srcOffset = int32_t(-srcHeight + bytes);
+    while (bytes >= sizeof(intptr_t)) {
+      destOffset -= sizeof(intptr_t);
+      srcOffset -= sizeof(intptr_t);
+      bytes -= sizeof(intptr_t);
+      masm.loadPtr(Address(FramePointer, srcOffset), temp);
+      masm.storePtr(temp, Address(FramePointer, destOffset));
+    }
+    if (bytes) {
+      MOZ_ASSERT(bytes == sizeof(uint32_t));
+      destOffset -= sizeof(uint32_t);
+      srcOffset -= sizeof(uint32_t);
+      masm.load32(Address(FramePointer, srcOffset), temp);
+      masm.store32(temp, Address(FramePointer, destOffset));
+    }
+  }
+
+  void shuffleStackResultsTowardFP(StackHeight srcHeight,
+                                   StackHeight destHeight, uint32_t bytes,
+                                   Register temp) {
+    MOZ_ASSERT(srcHeight.isValid());
+    MOZ_ASSERT(destHeight.isValid());
+    uint32_t src = computeHeightWithStackResults(srcHeight, bytes);
+    uint32_t dest = computeHeightWithStackResults(destHeight, bytes);
+    MOZ_ASSERT(src <= currentStackHeight());
+    MOZ_ASSERT(dest <= currentStackHeight());
+    shuffleStackResultsTowardFP(src, dest, bytes, temp);
+  }
+
+  void shuffleStackResultsTowardSP(uint32_t srcHeight, uint32_t destHeight,
+                                   uint32_t bytes, Register temp) {
+    MOZ_ASSERT(destHeight > srcHeight);
+    MOZ_ASSERT(bytes % sizeof(uint32_t) == 0);
+    uint32_t destOffset = stackOffset(destHeight);
+    uint32_t srcOffset = stackOffset(srcHeight);
+    while (bytes >= sizeof(intptr_t)) {
+      masm.loadPtr(Address(sp_, srcOffset), temp);
+      masm.storePtr(temp, Address(sp_, destOffset));
+      destOffset += sizeof(intptr_t);
+      srcOffset += sizeof(intptr_t);
+      bytes -= sizeof(intptr_t);
+    }
+    if (bytes) {
+      MOZ_ASSERT(bytes == sizeof(uint32_t));
+      masm.load32(Address(sp_, srcOffset), temp);
+      masm.store32(temp, Address(sp_, destOffset));
+    }
+  }
+
+  void popStackResultsToMemory(Register dest, uint32_t bytes, Register temp) {
+    MOZ_ASSERT(bytes <= currentStackHeight());
+    MOZ_ASSERT(bytes % sizeof(uint32_t) == 0);
+    uint32_t bytesToPop = bytes;
+    uint32_t srcOffset = stackOffset(currentStackHeight());
+    uint32_t destOffset = 0;
+    while (bytes >= sizeof(intptr_t)) {
+      masm.loadPtr(Address(sp_, srcOffset), temp);
+      masm.storePtr(temp, Address(dest, destOffset));
+      destOffset += sizeof(intptr_t);
+      srcOffset += sizeof(intptr_t);
+      bytes -= sizeof(intptr_t);
+    }
+    if (bytes) {
+      MOZ_ASSERT(bytes == sizeof(uint32_t));
+      masm.load32(Address(sp_, srcOffset), temp);
+      masm.store32(temp, Address(dest, destOffset));
+    }
+    popBytes(bytesToPop);
+  }
+
+  void allocArgArea(size_t argSize) {
+    if (argSize) {
+      BaseStackFrameAllocator::allocArgArea(argSize);
+      maxFramePushed_ = std::max(maxFramePushed_, masm.framePushed());
+    }
+  }
+
+ private:
+  void store32BitsToStack(int32_t imm, uint32_t destHeight, Register temp) {
+    masm.move32(Imm32(imm), temp);
+    masm.store32(temp, Address(sp_, stackOffset(destHeight)));
+  }
+
+  void store64BitsToStack(int64_t imm, uint32_t destHeight, Register temp) {
+#ifdef JS_PUNBOX64
+    masm.move64(Imm64(imm), Register64(temp));
+    masm.store64(Register64(temp), Address(sp_, stackOffset(destHeight)));
+#else
+    union {
+      int64_t i64;
+      int32_t i32[2];
+    } bits = {.i64 = imm};
+    static_assert(sizeof(bits) == 8);
+    store32BitsToStack(bits.i32[0], destHeight, temp);
+    store32BitsToStack(bits.i32[1], destHeight - sizeof(int32_t), temp);
+#endif
+  }
+
+ public:
+  void storeImmediatePtrToStack(intptr_t imm, uint32_t destHeight,
+                                Register temp) {
+#ifdef JS_PUNBOX64
+    static_assert(StackSizeOfPtr == 8);
+    store64BitsToStack(imm, destHeight, temp);
+#else
+    static_assert(StackSizeOfPtr == 4);
+    store32BitsToStack(int32_t(imm), destHeight, temp);
+#endif
+  }
+
+  void storeImmediateI64ToStack(int64_t imm, uint32_t destHeight,
+                                Register temp) {
+    store64BitsToStack(imm, destHeight, temp);
+  }
+
+  void storeImmediateF32ToStack(float imm, uint32_t destHeight, Register temp) {
+    union {
+      int32_t i32;
+      float f32;
+    } bits = {.f32 = imm};
+    static_assert(sizeof(bits) == 4);
+    if (StackSizeOfFloat == 4) {
+      store32BitsToStack(bits.i32, destHeight, temp);
+    } else {
+      store64BitsToStack(uint32_t(bits.i32), destHeight, temp);
+    }
+  }
+
+  void storeImmediateF64ToStack(double imm, uint32_t destHeight,
+                                Register temp) {
+    union {
+      int64_t i64;
+      double f64;
+    } bits = {.f64 = imm};
+    static_assert(sizeof(bits) == 8);
+    store64BitsToStack(bits.i64, destHeight, temp);
+  }
+
+#ifdef ENABLE_WASM_SIMD
+  void storeImmediateV128ToStack(V128 imm, uint32_t destHeight, Register temp) {
+    union {
+      int32_t i32[4];
+      uint8_t bytes[16];
+    } bits{};
+    static_assert(sizeof(bits) == 16);
+    memcpy(bits.bytes, imm.bytes, 16);
+    for (unsigned i = 0; i < 4; i++) {
+      store32BitsToStack(bits.i32[i], destHeight - i * sizeof(int32_t), temp);
+    }
+  }
+#endif
+};
+
+
+
+class MachineStackTracker {
+  size_t numPtrs_;
+  Vector<uint8_t, 64, SystemAllocPolicy> vec_;
+
+ public:
+  MachineStackTracker() : numPtrs_(0) {}
+
+  ~MachineStackTracker() {
+#ifdef DEBUG
+    size_t n = 0;
+    for (uint8_t b : vec_) {
+      n += (b ? 1 : 0);
+    }
+    MOZ_ASSERT(n == numPtrs_);
+#endif
+  }
+
+  [[nodiscard]] bool cloneTo(MachineStackTracker* dst);
+
+  [[nodiscard]] bool pushNonGCPointers(size_t n) {
+    return vec_.appendN(uint8_t(false), n);
+  }
+
+  void setGCPointer(size_t offsetFromSP) {
+    MOZ_ASSERT(offsetFromSP < vec_.length());
+
+    size_t offsetFromTop = vec_.length() - 1 - offsetFromSP;
+    numPtrs_ = numPtrs_ + 1 - (vec_[offsetFromTop] ? 1 : 0);
+    vec_[offsetFromTop] = uint8_t(true);
+  }
+
+  bool isGCPointer(size_t offsetFromSP) const {
+    MOZ_ASSERT(offsetFromSP < vec_.length());
+
+    size_t offsetFromTop = vec_.length() - 1 - offsetFromSP;
+    return bool(vec_[offsetFromTop]);
+  }
+
+  size_t length() const { return vec_.length(); }
+
+  size_t numPtrs() const {
+    MOZ_ASSERT(numPtrs_ <= length());
+    return numPtrs_;
+  }
+
+  void clear() {
+    vec_.clear();
+    numPtrs_ = 0;
+  }
+
+  class Iter {
+    const uint8_t* bufU8_;
+    const uint32_t* bufU32_;
+    const size_t nElems_;
+    size_t next_;
+
+   public:
+    explicit Iter(const MachineStackTracker& mst)
+        : bufU8_((uint8_t*)mst.vec_.begin()),
+          bufU32_((uint32_t*)mst.vec_.begin()),
+          nElems_(mst.vec_.length()),
+          next_(mst.vec_.length() - 1) {
+      MOZ_ASSERT(uintptr_t(bufU8_) == uintptr_t(bufU32_));
+      MOZ_ASSERT(0 == (uintptr_t(bufU8_) & 3));
+    }
+
+    ~Iter() { MOZ_ASSERT(uintptr_t(bufU8_) == uintptr_t(bufU32_)); }
+
+    static constexpr size_t FINISHED = ~size_t(0);
+    static_assert(FINISHED == size_t(0) - 1);
+
+    size_t get() {
+      while (next_ != FINISHED) {
+        if (bufU8_[next_]) {
+          next_--;
+          return nElems_ - 1 - (next_ + 1);
+        }
+        if ((next_ & 7) == 0) {
+          while (next_ >= 8 &&
+                 (bufU32_[(next_ - 4) >> 2] | bufU32_[(next_ - 8) >> 2]) == 0) {
+            next_ -= 8;
+          }
+        }
+        next_--;
+      }
+      return FINISHED;
+    }
+  };
+};
+
+
+enum class HasDebugFrameWithLiveRefs { No, Maybe };
+
+struct StackMapGenerator {
+ private:
+
+  const RegisterOffsets& trapExitLayout_;
+  const size_t trapExitLayoutNumWords_;
+
+  StackMaps* stackMaps_;
+
+  const MacroAssembler& masm_;
+
+ public:
+
+  size_t numStackArgBytes;
+
+  MachineStackTracker machineStackTracker;  
+
+  mozilla::Maybe<uint32_t> framePushedAtEntryToBody;
+
+
+  mozilla::Maybe<uint32_t> framePushedExcludingOutboundCallArgs;
+
+  size_t memRefsOnStk;
+
+  MachineStackTracker augmentedMst;
+
+  StackMapGenerator(StackMaps* stackMaps, const RegisterOffsets& trapExitLayout,
+                    const size_t trapExitLayoutNumWords,
+                    const MacroAssembler& masm)
+      : trapExitLayout_(trapExitLayout),
+        trapExitLayoutNumWords_(trapExitLayoutNumWords),
+        stackMaps_(stackMaps),
+        masm_(masm),
+        numStackArgBytes(0),
+        memRefsOnStk(0) {}
+
+  // stub, as generated by GenerateTrapExit().
+  // created for the integer registers as saved by (code generated by)
+  [[nodiscard]] bool generateStackmapEntriesForTrapExit(
+      const ArgTypeVector& args, ExitStubMapVector* extras);
+
+  [[nodiscard]] bool createStackMap(
+      const char* who, const ExitStubMapVector& extras,
+      HasDebugFrameWithLiveRefs debugFrameWithLiveRefs, const StkVector& stk,
+      wasm::StackMap** result);
+};
+
+}  
+}  
+
+#endif  // wasm_wasm_baseline_frame_h

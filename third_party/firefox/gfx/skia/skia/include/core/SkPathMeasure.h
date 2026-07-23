@@ -1,0 +1,63 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPathMeasure_DEFINED)
+#define SkPathMeasure_DEFINED
+
+#include "include/core/SkContourMeasure.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkDebug.h"
+
+class SkMatrix;
+class SkPath;
+class SkPathBuilder;
+
+class SK_API SkPathMeasure {
+public:
+    SkPathMeasure();
+    SkPathMeasure(const SkPath& path, bool forceClosed, SkScalar resScale = 1);
+    ~SkPathMeasure();
+
+    SkPathMeasure(SkPathMeasure&&) = default;
+    SkPathMeasure& operator=(SkPathMeasure&&) = default;
+
+    void setPath(const SkPath*, bool forceClosed);
+
+    SkScalar getLength();
+
+    [[nodiscard]] bool getPosTan(SkScalar distance, SkPoint* position, SkVector* tangent);
+
+    enum MatrixFlags {
+        kGetPosition_MatrixFlag     = 0x01,
+        kGetTangent_MatrixFlag      = 0x02,
+        kGetPosAndTan_MatrixFlag    = kGetPosition_MatrixFlag | kGetTangent_MatrixFlag
+    };
+
+    [[nodiscard]] bool getMatrix(SkScalar distance, SkMatrix* matrix,
+                                 MatrixFlags flags = kGetPosAndTan_MatrixFlag);
+
+    bool getSegment(SkScalar startD, SkScalar stopD, SkPathBuilder* dst, bool startWithMoveTo);
+
+    bool isClosed();
+
+    bool nextContour();
+
+#if defined(SK_DEBUG)
+    void    dump();
+#endif
+
+    const SkContourMeasure* currentMeasure() const { return fContour.get(); }
+
+private:
+    SkContourMeasureIter    fIter;
+    sk_sp<SkContourMeasure> fContour;
+};
+
+#endif

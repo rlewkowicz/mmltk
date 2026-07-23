@@ -1,0 +1,962 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+*   Copyright (C) 1997-2015, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+******************************************************************************
+*   file name:  nfsubs.cpp
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+* Modification history
+* Date        Name      Comments
+* 10/11/2001  Doug      Ported from ICU4J
+*/
+
+#include <stdio.h>
+#include "utypeinfo.h"  // for 'typeid' to work
+
+#include "nfsubs.h"
+#include "fmtableimp.h"
+#include "putilimp.h"
+#include "number_decimalquantity.h"
+
+#if U_HAVE_RBNF
+
+static const char16_t gLessThan = 0x003c;
+static const char16_t gEquals = 0x003d;
+static const char16_t gGreaterThan = 0x003e;
+static const char16_t gPercent = 0x0025;
+static const char16_t gPound = 0x0023;
+static const char16_t gZero = 0x0030;
+static const char16_t gSpace = 0x0020;
+
+static const char16_t gEqualsEquals[] =
+{
+    0x3D, 0x3D, 0
+}; 
+static const char16_t gGreaterGreaterGreaterThan[] =
+{
+    0x3E, 0x3E, 0x3E, 0
+}; 
+static const char16_t gGreaterGreaterThan[] =
+{
+    0x3E, 0x3E, 0
+}; 
+
+U_NAMESPACE_BEGIN
+
+using number::impl::DecimalQuantity;
+
+class SameValueSubstitution : public NFSubstitution {
+public:
+    SameValueSubstitution(int32_t pos,
+        const NFRuleSet* ruleset,
+        const UnicodeString& description,
+        UErrorCode& status);
+    virtual ~SameValueSubstitution();
+
+    virtual int64_t transformNumber(int64_t number) const override { return number; }
+    virtual double transformNumber(double number) const override { return number; }
+    virtual double composeRuleValue(double newRuleValue, double ) const override { return newRuleValue; }
+    virtual double calcUpperBound(double oldUpperBound) const override { return oldUpperBound; }
+    virtual char16_t tokenChar() const override { return static_cast<char16_t>(0x003d); } 
+
+public:
+    static UClassID getStaticClassID();
+    virtual UClassID getDynamicClassID() const override;
+};
+
+SameValueSubstitution::~SameValueSubstitution() {}
+
+class MultiplierSubstitution : public NFSubstitution {
+    int64_t divisor;
+    const NFRule* owningRule;
+
+public:
+    MultiplierSubstitution(int32_t _pos,
+        const NFRule *rule,
+        const NFRuleSet* _ruleSet,
+        const UnicodeString& description,
+        UErrorCode& status)
+        : NFSubstitution(_pos, _ruleSet, description, status), divisor(rule->getDivisor()), owningRule(rule)
+    {
+        if (divisor == 0) {
+            status = U_PARSE_ERROR;
+        }
+    }
+    virtual ~MultiplierSubstitution();
+
+    virtual void setDivisor(int32_t radix, int16_t exponent, UErrorCode& status) override {
+        divisor = util64_pow(radix, exponent);
+
+        if(divisor == 0) {
+            status = U_PARSE_ERROR;
+        }
+    }
+
+    virtual bool operator==(const NFSubstitution& rhs) const override;
+
+    virtual int64_t transformNumber(int64_t number) const override {
+        return number / divisor;
+    }
+
+    virtual double transformNumber(double number) const override {
+        if (getRuleSet() != nullptr || owningRule->hasModulusSubstitution() || owningRule->formatter->getRoundingMode() == NumberFormat::kRoundFloor) {
+            return uprv_floor(number / divisor);
+        } else {
+            return number / divisor;
+        }
+    }
+
+    virtual double composeRuleValue(double newRuleValue, double ) const override {
+        return newRuleValue * divisor;
+    }
+
+    virtual double calcUpperBound(double ) const override { return static_cast<double>(divisor); }
+
+    virtual char16_t tokenChar() const override { return static_cast<char16_t>(0x003c); } 
+
+public:
+    static UClassID getStaticClassID();
+    virtual UClassID getDynamicClassID() const override;
+};
+
+MultiplierSubstitution::~MultiplierSubstitution() {}
+
+class ModulusSubstitution : public NFSubstitution {
+    int64_t  divisor;
+    const NFRule* ruleToUse;
+public:
+    ModulusSubstitution(int32_t pos,
+        const NFRule* rule,
+        const NFRule* rulePredecessor,
+        const NFRuleSet* ruleSet,
+        const UnicodeString& description,
+        UErrorCode& status);
+    virtual ~ModulusSubstitution();
+
+    virtual void setDivisor(int32_t radix, int16_t exponent, UErrorCode& status) override {
+        divisor = util64_pow(radix, exponent);
+
+        if (divisor == 0) {
+            status = U_PARSE_ERROR;
+        }
+    }
+
+    virtual bool operator==(const NFSubstitution& rhs) const override;
+
+    virtual void doSubstitution(int64_t number, UnicodeString& toInsertInto, int32_t pos, int32_t recursionCount, UErrorCode& status) const override;
+    virtual void doSubstitution(double number, UnicodeString& toInsertInto, int32_t pos, int32_t recursionCount, UErrorCode& status) const override;
+
+    virtual int64_t transformNumber(int64_t number) const override { return number % divisor; }
+    virtual double transformNumber(double number) const override { return uprv_fmod(number, static_cast<double>(divisor)); }
+
+    virtual UBool doParse(const UnicodeString& text, 
+        ParsePosition& parsePosition,
+        double baseValue,
+        double upperBound,
+        UBool lenientParse,
+        uint32_t nonNumericalExecutedRuleMask,
+        int32_t recursionCount,
+        Formattable& result) const override;
+
+    virtual double composeRuleValue(double newRuleValue, double oldRuleValue) const override {
+        return oldRuleValue - uprv_fmod(oldRuleValue, static_cast<double>(divisor)) + newRuleValue;
+    }
+
+    virtual double calcUpperBound(double ) const override { return static_cast<double>(divisor); }
+
+    virtual UBool isModulusSubstitution() const override { return true; }
+
+    virtual char16_t tokenChar() const override { return static_cast<char16_t>(0x003e); } 
+
+    virtual void toString(UnicodeString& result) const override;
+
+public:
+    static UClassID getStaticClassID();
+    virtual UClassID getDynamicClassID() const override;
+};
+
+ModulusSubstitution::~ModulusSubstitution() {}
+
+class IntegralPartSubstitution : public NFSubstitution {
+public:
+    IntegralPartSubstitution(int32_t _pos,
+        const NFRuleSet* _ruleSet,
+        const UnicodeString& description,
+        UErrorCode& status)
+        : NFSubstitution(_pos, _ruleSet, description, status) {}
+    virtual ~IntegralPartSubstitution();
+
+    virtual int64_t transformNumber(int64_t number) const override { return number; }
+    virtual double transformNumber(double number) const override { return uprv_floor(number); }
+    virtual double composeRuleValue(double newRuleValue, double oldRuleValue) const override { return newRuleValue + oldRuleValue; }
+    virtual double calcUpperBound(double ) const override { return DBL_MAX; }
+    virtual char16_t tokenChar() const override { return static_cast<char16_t>(0x003c); } 
+
+public:
+    static UClassID getStaticClassID();
+    virtual UClassID getDynamicClassID() const override;
+};
+
+IntegralPartSubstitution::~IntegralPartSubstitution() {}
+
+class FractionalPartSubstitution : public NFSubstitution {
+    UBool byDigits;
+    UBool useSpaces;
+    enum { kMaxDecimalDigits = 8 };
+public:
+    FractionalPartSubstitution(int32_t pos,
+        const NFRuleSet* ruleSet,
+        const UnicodeString& description,
+        UErrorCode& status);
+    virtual ~FractionalPartSubstitution();
+
+    virtual bool operator==(const NFSubstitution& rhs) const override;
+
+    virtual void doSubstitution(double number, UnicodeString& toInsertInto, int32_t pos, int32_t recursionCount, UErrorCode& status) const override;
+    virtual void doSubstitution(int64_t , UnicodeString& , int32_t , int32_t , UErrorCode& ) const override {}
+    virtual int64_t transformNumber(int64_t ) const override { return 0; }
+    virtual double transformNumber(double number) const override { return number - uprv_floor(number); }
+
+    virtual UBool doParse(const UnicodeString& text,
+        ParsePosition& parsePosition,
+        double baseValue,
+        double upperBound,
+        UBool lenientParse,
+        uint32_t nonNumericalExecutedRuleMask,
+        int32_t recursionCount,
+        Formattable& result) const override;
+
+    virtual double composeRuleValue(double newRuleValue, double oldRuleValue) const override { return newRuleValue + oldRuleValue; }
+    virtual double calcUpperBound(double ) const override { return 0.0; }
+    virtual char16_t tokenChar() const override { return static_cast<char16_t>(0x003e); } 
+
+public:
+    static UClassID getStaticClassID();
+    virtual UClassID getDynamicClassID() const override;
+};
+
+FractionalPartSubstitution::~FractionalPartSubstitution() {}
+
+class AbsoluteValueSubstitution : public NFSubstitution {
+public:
+    AbsoluteValueSubstitution(int32_t _pos,
+        const NFRuleSet* _ruleSet,
+        const UnicodeString& description,
+        UErrorCode& status)
+        : NFSubstitution(_pos, _ruleSet, description, status) {}
+    virtual ~AbsoluteValueSubstitution();
+
+    virtual int64_t transformNumber(int64_t number) const override { return number >= 0 ? number : -number; }
+    virtual double transformNumber(double number) const override { return uprv_fabs(number); }
+    virtual double composeRuleValue(double newRuleValue, double ) const override { return -newRuleValue; }
+    virtual double calcUpperBound(double ) const override { return DBL_MAX; }
+    virtual char16_t tokenChar() const override { return static_cast<char16_t>(0x003e); } 
+
+public:
+    static UClassID getStaticClassID();
+    virtual UClassID getDynamicClassID() const override;
+};
+
+AbsoluteValueSubstitution::~AbsoluteValueSubstitution() {}
+
+class NumeratorSubstitution : public NFSubstitution {
+    double denominator;
+    int64_t ldenominator;
+    UBool withZeros;
+public:
+    static inline UnicodeString fixdesc(const UnicodeString& desc) {
+        if (desc.endsWith(LTLT, 2)) {
+            UnicodeString result(desc, 0, desc.length()-1);
+            return result;
+        }
+        return desc;
+    }
+    NumeratorSubstitution(int32_t _pos,
+        double _denominator,
+        NFRuleSet* _ruleSet,
+        const UnicodeString& description,
+        UErrorCode& status)
+        : NFSubstitution(_pos, _ruleSet, fixdesc(description), status), denominator(_denominator) 
+    {
+        ldenominator = util64_fromDouble(denominator);
+        withZeros = description.endsWith(LTLT, 2);
+    }
+    virtual ~NumeratorSubstitution();
+
+    virtual bool operator==(const NFSubstitution& rhs) const override;
+
+    virtual int64_t transformNumber(int64_t number) const override { return number * ldenominator; }
+    virtual double transformNumber(double number) const override { return uprv_round(number * denominator); }
+
+    virtual void doSubstitution(int64_t , UnicodeString& , int32_t , int32_t , UErrorCode& ) const override {}
+    virtual void doSubstitution(double number, UnicodeString& toInsertInto, int32_t pos, int32_t recursionCount, UErrorCode& status) const override;
+    virtual UBool doParse(const UnicodeString& text, 
+        ParsePosition& parsePosition,
+        double baseValue,
+        double upperBound,
+        UBool ,
+        uint32_t nonNumericalExecutedRuleMask,
+        int32_t recursionCount,
+        Formattable& result) const override;
+
+    virtual double composeRuleValue(double newRuleValue, double oldRuleValue) const override { return newRuleValue / oldRuleValue; }
+    virtual double calcUpperBound(double ) const override { return denominator; }
+    virtual char16_t tokenChar() const override { return static_cast<char16_t>(0x003c); } 
+private:
+    static const char16_t LTLT[2];
+
+public:
+    static UClassID getStaticClassID();
+    virtual UClassID getDynamicClassID() const override;
+};
+
+NumeratorSubstitution::~NumeratorSubstitution() {}
+
+NFSubstitution*
+NFSubstitution::makeSubstitution(int32_t pos,
+                                 const NFRule* rule,
+                                 const NFRule* predecessor,
+                                 const NFRuleSet* ruleSet,
+                                 const RuleBasedNumberFormat* formatter,
+                                 const UnicodeString& description,
+                                 UErrorCode& status)
+{
+    if (U_FAILURE(status)) return nullptr;
+    if (description.length() == 0) {
+        return nullptr;
+    }
+
+    switch (description.charAt(0)) {
+    case gLessThan:
+        if (rule->getBaseValue() == NFRule::kNegativeNumberRule) {
+            status = U_PARSE_ERROR;
+            return nullptr;
+        }
+
+        else if (rule->getBaseValue() == NFRule::kImproperFractionRule
+            || rule->getBaseValue() == NFRule::kProperFractionRule
+            || rule->getBaseValue() == NFRule::kDefaultRule) {
+            return new IntegralPartSubstitution(pos, ruleSet, description, status);
+        }
+
+        else if (ruleSet->isFractionRuleSet()) {
+            return new NumeratorSubstitution(pos, static_cast<double>(rule->getBaseValue()),
+                formatter->getDefaultRuleSet(), description, status);
+        }
+
+        else {
+            return new MultiplierSubstitution(pos, rule, ruleSet,
+                description, status);
+        }
+
+    case gGreaterThan:
+        if (rule->getBaseValue() == NFRule::kNegativeNumberRule) {
+            return new AbsoluteValueSubstitution(pos, ruleSet, description, status);
+        }
+
+        else if (rule->getBaseValue() == NFRule::kImproperFractionRule
+            || rule->getBaseValue() == NFRule::kProperFractionRule
+            || rule->getBaseValue() == NFRule::kDefaultRule) {
+            return new FractionalPartSubstitution(pos, ruleSet, description, status);
+        }
+
+        else if (ruleSet->isFractionRuleSet()) {
+            status = U_PARSE_ERROR;
+            return nullptr;
+        }
+
+        else {
+            return new ModulusSubstitution(pos, rule, predecessor,
+                ruleSet, description, status);
+        }
+
+    case gEquals:
+        return new SameValueSubstitution(pos, ruleSet, description, status);
+
+    default:
+        status = U_PARSE_ERROR;
+    }
+    return nullptr;
+}
+
+NFSubstitution::NFSubstitution(int32_t _pos,
+                               const NFRuleSet* _ruleSet,
+                               const UnicodeString& description,
+                               UErrorCode& status)
+                               : pos(_pos), ruleSet(nullptr), numberFormat(nullptr)
+{
+    if (U_FAILURE(status)) return;
+    UnicodeString workingDescription(description);
+    if (description.length() >= 2
+        && description.charAt(0) == description.charAt(description.length() - 1))
+    {
+        workingDescription.remove(description.length() - 1, 1);
+        workingDescription.remove(0, 1);
+    }
+    else if (description.length() != 0) {
+        status = U_PARSE_ERROR;
+        return;
+    }
+
+    if (workingDescription.length() == 0) {
+        this->ruleSet = _ruleSet;
+    }
+    else if (workingDescription.charAt(0) == gPercent) {
+        this->ruleSet = _ruleSet->getOwner()->findRuleSet(workingDescription, status);
+    }
+    else if (workingDescription.charAt(0) == gPound || workingDescription.charAt(0) ==gZero) {
+        const DecimalFormatSymbols* sym = _ruleSet->getOwner()->getDecimalFormatSymbols();
+        if (!sym) {
+            status = U_MISSING_RESOURCE_ERROR;
+            return;
+        }
+        DecimalFormat *tempNumberFormat = new DecimalFormat(workingDescription, *sym, status);
+        if (!tempNumberFormat) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return;
+        }
+        if (U_FAILURE(status)) {
+            delete tempNumberFormat;
+            return;
+        }
+        this->numberFormat = tempNumberFormat;
+    }
+    else if (workingDescription.charAt(0) == gGreaterThan) {
+
+        this->ruleSet = _ruleSet;
+        this->numberFormat = nullptr;
+    }
+    else {
+
+        status = U_PARSE_ERROR;
+    }
+}
+
+NFSubstitution::~NFSubstitution()
+{
+    delete numberFormat;
+    numberFormat = nullptr;
+}
+
+void
+NFSubstitution::setDivisor(int32_t , int16_t , UErrorCode& ) {
+}
+
+void
+NFSubstitution::setDecimalFormatSymbols(const DecimalFormatSymbols &newSymbols, UErrorCode& ) {
+    if (numberFormat != nullptr) {
+        numberFormat->setDecimalFormatSymbols(newSymbols);
+    }
+}
+
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(NFSubstitution)
+
+bool
+NFSubstitution::operator==(const NFSubstitution& rhs) const
+{
+  return typeid(*this) == typeid(rhs)
+  && pos == rhs.pos
+  && (ruleSet == nullptr) == (rhs.ruleSet == nullptr)
+  && (numberFormat == nullptr
+      ? (rhs.numberFormat == nullptr)
+      : (*numberFormat == *rhs.numberFormat));
+}
+
+void
+NFSubstitution::toString(UnicodeString& text) const
+{
+  text.remove();
+  text.append(tokenChar());
+
+  UnicodeString temp;
+  if (ruleSet != nullptr) {
+    ruleSet->getName(temp);
+  } else if (numberFormat != nullptr) {
+    numberFormat->toPattern(temp);
+  }
+  text.append(temp);
+  text.append(tokenChar());
+}
+
+
+void
+NFSubstitution::doSubstitution(int64_t number, UnicodeString& toInsertInto, int32_t _pos, int32_t recursionCount, UErrorCode& status) const
+{
+    if (U_FAILURE(status)) return;
+    if (ruleSet != nullptr) {
+        ruleSet->format(transformNumber(number), toInsertInto, _pos + this->pos, recursionCount, status);
+    } else if (numberFormat != nullptr) {
+        if (number <= MAX_INT64_IN_DOUBLE) {
+            UnicodeString temp;
+            numberFormat->format(transformNumber(static_cast<double>(number)), temp, status);
+            toInsertInto.insert(_pos + this->pos, temp);
+        } 
+        else { 
+            int64_t numberToFormat = transformNumber(number); 
+            UnicodeString temp;
+            numberFormat->format(numberToFormat, temp, status);
+            toInsertInto.insert(_pos + this->pos, temp);
+        } 
+    }
+}
+
+void
+NFSubstitution::doSubstitution(double number, UnicodeString& toInsertInto, int32_t _pos, int32_t recursionCount, UErrorCode& status) const {
+    if (U_FAILURE(status)) return;
+    double numberToFormat = transformNumber(number);
+
+    if (uprv_isInfinite(numberToFormat)) {
+        const NFRule *infiniteRule = ruleSet->findDoubleRule(uprv_getInfinity());
+        infiniteRule->doFormat(numberToFormat, toInsertInto, _pos + this->pos, recursionCount, status);
+        return;
+    }
+
+    if (numberToFormat == uprv_floor(numberToFormat) && ruleSet != nullptr) {
+        ruleSet->format(util64_fromDouble(numberToFormat), toInsertInto, _pos + this->pos, recursionCount, status);
+
+    } else {
+        if (ruleSet != nullptr) {
+            ruleSet->format(numberToFormat, toInsertInto, _pos + this->pos, recursionCount, status);
+        } else if (numberFormat != nullptr) {
+            UnicodeString temp;
+            numberFormat->format(numberToFormat, temp);
+            toInsertInto.insert(_pos + this->pos, temp);
+        }
+    }
+}
+
+
+
+#ifdef RBNF_DEBUG
+#include <stdio.h>
+#endif
+
+UBool
+NFSubstitution::doParse(const UnicodeString& text,
+                        ParsePosition& parsePosition,
+                        double baseValue,
+                        double upperBound,
+                        UBool lenientParse,
+                        uint32_t nonNumericalExecutedRuleMask,
+                        int32_t recursionCount,
+                        Formattable& result) const
+{
+#ifdef RBNF_DEBUG
+    fprintf(stderr, "<nfsubs> %x bv: %g ub: %g\n", this, baseValue, upperBound);
+#endif
+    upperBound = calcUpperBound(upperBound);
+
+    if (ruleSet != nullptr) {
+        ruleSet->parse(text, parsePosition, upperBound, nonNumericalExecutedRuleMask, recursionCount, result);
+        if (lenientParse && !ruleSet->isFractionRuleSet() && parsePosition.getIndex() == 0) {
+            UErrorCode status = U_ZERO_ERROR;
+            NumberFormat* fmt = NumberFormat::createInstance(status);
+            if (U_SUCCESS(status)) {
+                fmt->parse(text, result, parsePosition);
+            }
+            delete fmt;
+        }
+
+    } else if (numberFormat != nullptr) {
+        numberFormat->parse(text, result, parsePosition);
+    }
+
+    if (parsePosition.getIndex() != 0) {
+        UErrorCode status = U_ZERO_ERROR;
+        double tempResult = result.getDouble(status);
+
+        tempResult = composeRuleValue(tempResult, baseValue);
+        result.setDouble(tempResult);
+        return true;
+    } else {
+        result.setLong(0);
+        return false;
+    }
+}
+
+UBool
+NFSubstitution::isModulusSubstitution() const {
+    return false;
+}
+
+
+SameValueSubstitution::SameValueSubstitution(int32_t _pos,
+                        const NFRuleSet* _ruleSet,
+                        const UnicodeString& description,
+                        UErrorCode& status)
+: NFSubstitution(_pos, _ruleSet, description, status)
+{
+    if (0 == description.compare(gEqualsEquals, 2)) {
+        status = U_PARSE_ERROR;
+    }
+}
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(SameValueSubstitution)
+
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(MultiplierSubstitution)
+
+bool MultiplierSubstitution::operator==(const NFSubstitution& rhs) const
+{
+    return NFSubstitution::operator==(rhs) &&
+        divisor == ((const MultiplierSubstitution*)&rhs)->divisor;
+}
+
+
+
+ModulusSubstitution::ModulusSubstitution(int32_t _pos,
+                                         const NFRule* rule,
+                                         const NFRule* predecessor,
+                                         const NFRuleSet* _ruleSet,
+                                         const UnicodeString& description,
+                                         UErrorCode& status)
+ : NFSubstitution(_pos, _ruleSet, description, status)
+ , divisor(rule->getDivisor())
+ , ruleToUse(nullptr)
+{
+  if (U_FAILURE(status)) return;
+
+  if (divisor == 0) {
+      status = U_PARSE_ERROR;
+  }
+
+  if (0 == description.compare(gGreaterGreaterGreaterThan, 3)) {
+    ruleToUse = predecessor;
+  }
+}
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(ModulusSubstitution)
+
+bool ModulusSubstitution::operator==(const NFSubstitution& rhs) const
+{
+  return NFSubstitution::operator==(rhs) &&
+  divisor == ((const ModulusSubstitution*)&rhs)->divisor &&
+  ruleToUse == ((const ModulusSubstitution*)&rhs)->ruleToUse;
+}
+
+
+
+void
+ModulusSubstitution::doSubstitution(int64_t number, UnicodeString& toInsertInto, int32_t _pos, int32_t recursionCount, UErrorCode& status) const
+{
+    if (U_FAILURE(status)) return;
+    if (ruleToUse == nullptr) {
+        NFSubstitution::doSubstitution(number, toInsertInto, _pos, recursionCount, status);
+
+    } else {
+        int64_t numberToFormat = transformNumber(number);
+        ruleToUse->doFormat(numberToFormat, toInsertInto, _pos + getPos(), recursionCount, status);
+    }
+}
+
+void
+ModulusSubstitution::doSubstitution(double number, UnicodeString& toInsertInto, int32_t _pos, int32_t recursionCount, UErrorCode& status) const
+{
+    if (U_FAILURE(status)) return;
+    if (ruleToUse == nullptr) {
+        NFSubstitution::doSubstitution(number, toInsertInto, _pos, recursionCount, status);
+
+    } else {
+        double numberToFormat = transformNumber(number);
+
+        ruleToUse->doFormat(numberToFormat, toInsertInto, _pos + getPos(), recursionCount, status);
+    }
+}
+
+
+UBool
+ModulusSubstitution::doParse(const UnicodeString& text,
+                             ParsePosition& parsePosition,
+                             double baseValue,
+                             double upperBound,
+                             UBool lenientParse,
+                             uint32_t nonNumericalExecutedRuleMask,
+                             int32_t recursionCount,
+                             Formattable& result) const
+{
+    if (ruleToUse == nullptr) {
+        return NFSubstitution::doParse(text, parsePosition, baseValue, upperBound, lenientParse, nonNumericalExecutedRuleMask, recursionCount, result);
+
+    } else {
+        ruleToUse->doParse(text, parsePosition, false, upperBound, nonNumericalExecutedRuleMask, recursionCount, result);
+
+        if (parsePosition.getIndex() != 0) {
+            UErrorCode status = U_ZERO_ERROR;
+            double tempResult = result.getDouble(status);
+            tempResult = composeRuleValue(tempResult, baseValue);
+            result.setDouble(tempResult);
+        }
+
+        return true;
+    }
+}
+void
+ModulusSubstitution::toString(UnicodeString& text) const
+{
+
+  if ( ruleToUse != nullptr ) { 
+      text.remove();
+      text.append(tokenChar());
+      text.append(tokenChar());
+      text.append(tokenChar());
+  } else { 
+	  NFSubstitution::toString(text);
+  }
+}
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(IntegralPartSubstitution)
+
+
+
+
+FractionalPartSubstitution::FractionalPartSubstitution(int32_t _pos,
+                             const NFRuleSet* _ruleSet,
+                             const UnicodeString& description,
+                             UErrorCode& status)
+ : NFSubstitution(_pos, _ruleSet, description, status)
+ , byDigits(false)
+ , useSpaces(true)
+
+{
+    if (U_FAILURE(status)) return;
+    if (0 == description.compare(gGreaterGreaterThan, 2) ||
+        0 == description.compare(gGreaterGreaterGreaterThan, 3) ||
+        _ruleSet == getRuleSet()) {
+        byDigits = true;
+        if (0 == description.compare(gGreaterGreaterGreaterThan, 3)) {
+            useSpaces = false;
+        }
+    } else {
+        NFRuleSet* rs = const_cast<NFRuleSet*>(getRuleSet());
+        if (rs != nullptr) {
+            rs->makeIntoFractionRuleSet();
+        } else {
+            status = U_PARSE_ERROR;
+        }
+    }
+}
+
+
+void
+FractionalPartSubstitution::doSubstitution(double number, UnicodeString& toInsertInto,
+                                           int32_t _pos, int32_t recursionCount, UErrorCode& status) const
+{
+  if (U_FAILURE(status)) return;
+  if (!byDigits) {
+    NFSubstitution::doSubstitution(number, toInsertInto, _pos, recursionCount, status);
+
+  } else {
+
+    DecimalQuantity dl;
+    dl.setToDouble(number);
+    dl.roundToMagnitude(-20, UNUM_ROUND_HALFEVEN, status);     
+    
+    UBool pad = false;
+    for (int32_t didx = dl.getLowerDisplayMagnitude(); didx<0; didx++) {
+      if (pad && useSpaces) {
+        toInsertInto.insert(_pos + getPos(), gSpace);
+      } else {
+        pad = true;
+      }
+      int64_t digit = dl.getDigit(didx);
+      getRuleSet()->format(digit, toInsertInto, _pos + getPos(), recursionCount, status);
+    }
+
+    if (!pad) {
+      getRuleSet()->format(static_cast<int64_t>(0), toInsertInto, _pos + getPos(), recursionCount, status);
+    }
+  }
+}
+
+
+
+UBool
+FractionalPartSubstitution::doParse(const UnicodeString& text,
+                ParsePosition& parsePosition,
+                double baseValue,
+                double ,
+                UBool lenientParse,
+                uint32_t nonNumericalExecutedRuleMask,
+                int32_t recursionCount,
+                Formattable& resVal) const
+{
+    if (!byDigits) {
+        return NFSubstitution::doParse(text, parsePosition, baseValue, 0, lenientParse, nonNumericalExecutedRuleMask, recursionCount, resVal);
+
+    } else {
+        UnicodeString workText(text);
+        ParsePosition workPos(1);
+        double result = 0;
+        int32_t digit;
+
+        DecimalQuantity dl;
+        int32_t totalDigits = 0;
+        NumberFormat* fmt = nullptr;
+        while (workText.length() > 0 && workPos.getIndex() != 0) {
+            workPos.setIndex(0);
+            Formattable temp;
+            getRuleSet()->parse(workText, workPos, 10, nonNumericalExecutedRuleMask, recursionCount, temp);
+            UErrorCode status = U_ZERO_ERROR;
+            digit = temp.getLong(status);
+
+            if (lenientParse && workPos.getIndex() == 0) {
+                if (!fmt) {
+                    status = U_ZERO_ERROR;
+                    fmt = NumberFormat::createInstance(status);
+                    if (U_FAILURE(status)) {
+                        delete fmt;
+                        fmt = nullptr;
+                    }
+                }
+                if (fmt) {
+                    fmt->parse(workText, temp, workPos);
+                    digit = temp.getLong(status);
+                }
+            }
+
+            if (workPos.getIndex() != 0) {
+                dl.appendDigit(static_cast<int8_t>(digit), 0, true);
+                totalDigits++;
+                parsePosition.setIndex(parsePosition.getIndex() + workPos.getIndex());
+                workText.removeBetween(0, workPos.getIndex());
+                while (workText.length() > 0 && workText.charAt(0) == gSpace) {
+                    workText.removeBetween(0, 1);
+                    parsePosition.setIndex(parsePosition.getIndex() + 1);
+                }
+            }
+        }
+        delete fmt;
+
+        dl.adjustMagnitude(-totalDigits);
+        result = dl.toDouble();
+        result = composeRuleValue(result, baseValue);
+        resVal.setDouble(result);
+        return true;
+    }
+}
+
+bool
+FractionalPartSubstitution::operator==(const NFSubstitution& rhs) const
+{
+  return NFSubstitution::operator==(rhs) &&
+  ((const FractionalPartSubstitution*)&rhs)->byDigits == byDigits;
+}
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(FractionalPartSubstitution)
+
+
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(AbsoluteValueSubstitution)
+
+
+void
+NumeratorSubstitution::doSubstitution(double number, UnicodeString& toInsertInto, int32_t apos, int32_t recursionCount, UErrorCode& status) const {
+    if (U_FAILURE(status)) return;
+
+    double numberToFormat = transformNumber(number);
+    int64_t longNF = util64_fromDouble(numberToFormat);
+
+    const NFRuleSet* aruleSet = getRuleSet();
+    if (withZeros && aruleSet != nullptr) {
+        int64_t nf =longNF;
+        int32_t len = toInsertInto.length();
+        while ((nf *= 10) < denominator) {
+            toInsertInto.insert(apos + getPos(), gSpace);
+            aruleSet->format(static_cast<int64_t>(0), toInsertInto, apos + getPos(), recursionCount, status);
+        }
+        apos += toInsertInto.length() - len;
+    }
+
+    if (numberToFormat == longNF && aruleSet != nullptr) {
+        aruleSet->format(longNF, toInsertInto, apos + getPos(), recursionCount, status);
+
+    } else {
+        if (aruleSet != nullptr) {
+            aruleSet->format(numberToFormat, toInsertInto, apos + getPos(), recursionCount, status);
+        } else {
+            UnicodeString temp;
+            getNumberFormat()->format(numberToFormat, temp, status);
+            toInsertInto.insert(apos + getPos(), temp);
+        }
+    }
+}
+
+UBool 
+NumeratorSubstitution::doParse(const UnicodeString& text, 
+                               ParsePosition& parsePosition,
+                               double baseValue,
+                               double upperBound,
+                               UBool ,
+                               uint32_t nonNumericalExecutedRuleMask,
+                               int32_t recursionCount,
+                               Formattable& result) const
+{
+
+    UErrorCode status = U_ZERO_ERROR;
+    int32_t zeroCount = 0;
+    UnicodeString workText(text);
+
+    if (withZeros) {
+        ParsePosition workPos(1);
+        Formattable temp;
+
+        while (workText.length() > 0 && workPos.getIndex() != 0) {
+            workPos.setIndex(0);
+            getRuleSet()->parse(workText, workPos, 1, nonNumericalExecutedRuleMask, recursionCount, temp); 
+            if (workPos.getIndex() == 0) {
+                break;
+            }
+
+            ++zeroCount;
+            parsePosition.setIndex(parsePosition.getIndex() + workPos.getIndex());
+            workText.remove(0, workPos.getIndex());
+            while (workText.length() > 0 && workText.charAt(0) == gSpace) {
+                workText.remove(0, 1);
+                parsePosition.setIndex(parsePosition.getIndex() + 1);
+            }
+        }
+
+        workText = text;
+        workText.remove(0, parsePosition.getIndex());
+        parsePosition.setIndex(0);
+    }
+
+    NFSubstitution::doParse(workText, parsePosition, withZeros ? 1 : baseValue, upperBound, false, nonNumericalExecutedRuleMask, recursionCount, result);
+
+    if (withZeros) {
+
+        int64_t n = result.getLong(status); 
+        int64_t d = 1;
+        while (d <= n) {
+            d *= 10;
+        }
+        while (zeroCount > 0) {
+            d *= 10;
+            --zeroCount;
+        }
+        result.setDouble(static_cast<double>(n) / static_cast<double>(d));
+    }
+
+    return true;
+}
+
+bool
+NumeratorSubstitution::operator==(const NFSubstitution& rhs) const
+{
+    return NFSubstitution::operator==(rhs) &&
+        denominator == ((const NumeratorSubstitution*)&rhs)->denominator;
+}
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(NumeratorSubstitution)
+
+const char16_t NumeratorSubstitution::LTLT[] = { 0x003c, 0x003c };
+        
+U_NAMESPACE_END
+
+#endif
+

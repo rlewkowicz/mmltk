@@ -1,0 +1,152 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsRubyTextContainerFrame.h"
+
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/WritingModes.h"
+#include "nsLayoutUtils.h"
+#include "nsLineLayout.h"
+#include "nsPresContext.h"
+
+using namespace mozilla;
+
+
+
+NS_QUERYFRAME_HEAD(nsRubyTextContainerFrame)
+  NS_QUERYFRAME_ENTRY(nsRubyTextContainerFrame)
+NS_QUERYFRAME_TAIL_INHERITING(nsContainerFrame)
+
+NS_IMPL_FRAMEARENA_HELPERS(nsRubyTextContainerFrame)
+
+nsContainerFrame* NS_NewRubyTextContainerFrame(PresShell* aPresShell,
+                                               ComputedStyle* aStyle) {
+  return new (aPresShell)
+      nsRubyTextContainerFrame(aStyle, aPresShell->GetPresContext());
+}
+
+
+
+#ifdef DEBUG_FRAME_DUMP
+nsresult nsRubyTextContainerFrame::GetFrameName(nsAString& aResult) const {
+  return MakeFrameName(u"RubyTextContainer"_ns, aResult);
+}
+#endif
+
+void nsRubyTextContainerFrame::SetInitialChildList(ChildListID aListID,
+                                                   nsFrameList&& aChildList) {
+  nsContainerFrame::SetInitialChildList(aListID, std::move(aChildList));
+  if (aListID == FrameChildListID::Principal) {
+    UpdateSpanFlag();
+  }
+}
+
+void nsRubyTextContainerFrame::AppendFrames(ChildListID aListID,
+                                            nsFrameList&& aFrameList) {
+  nsContainerFrame::AppendFrames(aListID, std::move(aFrameList));
+  UpdateSpanFlag();
+}
+
+void nsRubyTextContainerFrame::InsertFrames(
+    ChildListID aListID, nsIFrame* aPrevFrame,
+    const nsLineList::iterator* aPrevFrameLine, nsFrameList&& aFrameList) {
+  nsContainerFrame::InsertFrames(aListID, aPrevFrame, aPrevFrameLine,
+                                 std::move(aFrameList));
+  UpdateSpanFlag();
+}
+
+void nsRubyTextContainerFrame::RemoveFrame(DestroyContext& aContext,
+                                           ChildListID aListID,
+                                           nsIFrame* aOldFrame) {
+  nsContainerFrame::RemoveFrame(aContext, aListID, aOldFrame);
+  UpdateSpanFlag();
+}
+
+void nsRubyTextContainerFrame::UpdateSpanFlag() {
+  bool isSpan = false;
+  if (!GetPrevContinuation() && !GetNextContinuation()) {
+    nsIFrame* onlyChild = mFrames.OnlyChild();
+    if (onlyChild && onlyChild->IsPseudoFrame(GetContent())) {
+      isSpan = true;
+    }
+  }
+
+  if (isSpan) {
+    AddStateBits(NS_RUBY_TEXT_CONTAINER_IS_SPAN);
+  } else {
+    RemoveStateBits(NS_RUBY_TEXT_CONTAINER_IS_SPAN);
+  }
+}
+
+void nsRubyTextContainerFrame::Reflow(nsPresContext* aPresContext,
+                                      ReflowOutput& aDesiredSize,
+                                      const ReflowInput& aReflowInput,
+                                      nsReflowStatus& aStatus) {
+  MarkInReflow();
+  DO_GLOBAL_REFLOW_COUNT("nsRubyTextContainerFrame");
+  MOZ_ASSERT(aStatus.IsEmpty(), "Caller should pass a fresh reflow status!");
+
+  WritingMode rtcWM = GetWritingMode();
+
+  nscoord minBCoord = nscoord_MAX;
+  nscoord maxBCoord = nscoord_MIN;
+  const nsSize dummyContainerSize;
+  for (nsIFrame* child : mFrames) {
+    MOZ_ASSERT(child->IsRubyTextFrame());
+    LogicalRect rect = child->GetLogicalRect(rtcWM, dummyContainerSize);
+    LogicalMargin margin = child->GetLogicalUsedMargin(rtcWM);
+    nscoord blockStart = rect.BStart(rtcWM) - margin.BStart(rtcWM);
+    minBCoord = std::min(minBCoord, blockStart);
+    nscoord blockEnd = rect.BEnd(rtcWM) + margin.BEnd(rtcWM);
+    maxBCoord = std::max(maxBCoord, blockEnd);
+  }
+
+  if (!mFrames.IsEmpty()) {
+    if (MOZ_UNLIKELY(minBCoord > maxBCoord)) {
+      NS_WARNING("bad block coord");
+      minBCoord = maxBCoord = 0;
+    }
+    LogicalSize size(rtcWM, mISize, maxBCoord - minBCoord);
+    nsSize containerSize = size.GetPhysicalSize(rtcWM);
+    for (nsIFrame* child : mFrames) {
+      LogicalPoint pos = child->GetLogicalPosition(rtcWM, dummyContainerSize);
+      pos.B(rtcWM) -= minBCoord;
+      child->SetPosition(rtcWM, pos, containerSize);
+    }
+    aDesiredSize.SetSize(rtcWM, size);
+  } else {
+    aDesiredSize.ISize(rtcWM) = mISize;
+    LogicalMargin borderPadding(rtcWM);
+    nsLayoutUtils::SetBSizeFromFontMetrics(this, aDesiredSize, borderPadding,
+                                           rtcWM, rtcWM);
+  }
+}
+
+RubyMetrics nsRubyTextContainerFrame::RubyMetrics(
+    float aRubyMetricsFactor) const {
+  mozilla::RubyMetrics result;
+  WritingMode containerWM = GetWritingMode();
+  bool foundAnyFrames = false;
+  for (const auto* f : mFrames) {
+    WritingMode wm = f->GetWritingMode();
+    if (wm.IsOrthogonalTo(containerWM) || f->IsPlaceholderFrame()) {
+      continue;
+    }
+    mozilla::RubyMetrics m = f->RubyMetrics(aRubyMetricsFactor);
+    const LogicalMargin borderPadding = f->GetLogicalUsedBorderAndPadding(wm);
+    m.mAscent += borderPadding.BStart(wm);
+    m.mDescent += borderPadding.BEnd(wm);
+    const LogicalMargin margin = f->GetLogicalUsedMargin(wm);
+    m.mAscent += margin.BStart(wm);
+    m.mDescent += margin.BEnd(wm);
+    result.CombineWith(m);
+    foundAnyFrames = true;
+  }
+  if (!foundAnyFrames) {
+    result = nsIFrame::RubyMetrics(aRubyMetricsFactor);
+  }
+  return result;
+}

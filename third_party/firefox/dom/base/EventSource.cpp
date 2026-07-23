@@ -1,0 +1,1883 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/EventSource.h"
+
+#include "ReferrerInfo.h"
+#include "mozilla/Components.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/DataMutex.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/GlobalFreezeObserver.h"
+#include "mozilla/LoadInfo.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/Try.h"
+#include "mozilla/dom/ClientInfo.h"
+#include "mozilla/dom/EventSourceBinding.h"
+#include "mozilla/dom/EventSourceEventService.h"
+#include "mozilla/dom/MessageEvent.h"
+#include "mozilla/dom/MessageEventBinding.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/ServiceWorkerDescriptor.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "mozilla/dom/WorkerRef.h"
+#include "mozilla/dom/WorkerRunnable.h"
+#include "mozilla/dom/WorkerScope.h"
+#include "nsComponentManagerUtils.h"
+#include "nsContentUtils.h"
+#include "nsError.h"
+#include "nsGlobalWindowInner.h"
+#include "nsIAsyncVerifyRedirectCallback.h"
+#include "nsIAuthPrompt.h"
+#include "nsIAuthPrompt2.h"
+#include "nsIConsoleService.h"
+#include "nsIHttpChannel.h"
+#include "nsIInputStream.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsIPromptFactory.h"
+#include "nsIScriptError.h"
+#include "nsIScriptObjectPrincipal.h"
+#include "nsIStringBundle.h"
+#include "nsIThreadRetargetableRequest.h"
+#include "nsIThreadRetargetableStreamListener.h"
+#include "nsIWindowWatcher.h"
+#include "nsJSUtils.h"
+#include "nsMimeTypes.h"
+#include "nsNetUtil.h"
+#include "nsPresContext.h"
+#include "nsProxyRelease.h"
+#include "nsWrapperCacheInlines.h"
+#include "xpcpublic.h"
+
+namespace mozilla::dom {
+
+#ifdef DEBUG
+static LazyLogModule gEventSourceLog("EventSource");
+#endif
+
+#define SPACE_CHAR (char16_t)0x0020
+#define CR_CHAR (char16_t)0x000D
+#define LF_CHAR (char16_t)0x000A
+#define COLON_CHAR (char16_t)0x003A
+
+#define MIN_RECONNECTION_TIME_VALUE 500
+#define DEFAULT_RECONNECTION_TIME_VALUE 5000
+#define MAX_RECONNECTION_TIME_VALUE \
+  PR_IntervalToMilliseconds(DELAY_INTERVAL_LIMIT)
+
+class EventSourceImpl final : public nsIChannelEventSink,
+                              public nsIInterfaceRequestor,
+                              public nsISerialEventTarget,
+                              public nsITimerCallback,
+                              public nsINamed,
+                              public nsIThreadRetargetableStreamListener,
+                              public GlobalTeardownObserver,
+                              public GlobalFreezeObserver {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSICHANNELEVENTSINK
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSIEVENTTARGET_FULL
+  NS_DECL_NSITIMERCALLBACK
+  NS_DECL_NSINAMED
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+
+  EventSourceImpl(EventSource* aEventSource,
+                  nsICookieJarSettings* aCookieJarSettings);
+
+  enum { CONNECTING = 0U, OPEN = 1U, CLOSED = 2U };
+
+  void Close();
+
+  void Init(nsIGlobalObject* aWindowGlobal, nsIPrincipal* aPrincipal,
+            const nsAString& aURL, ErrorResult& aRv);
+
+  nsresult GetBaseURI(nsIURI** aBaseURI);
+
+  void SetupHttpChannel();
+  nsresult SetupReferrerInfo(const nsCOMPtr<Document>& aDocument);
+  nsresult InitChannelAndRequestEventSource(bool aEventTargetAccessAllowed);
+  nsresult ResetConnection();
+  void ResetDecoder();
+  nsresult SetReconnectionTimeout();
+
+  void AnnounceConnection();
+  void DispatchAllMessageEvents();
+  nsresult RestartConnection();
+  void ReestablishConnection();
+  void DispatchFailConnection();
+  void FailConnection();
+
+  void DisconnectFromOwner() override {
+    Close();
+    GlobalTeardownObserver::DisconnectFromOwner();
+  }
+  void FrozenCallback(nsIGlobalObject* aGlobal) override {
+    DebugOnly<nsresult> rv = Freeze();
+    MOZ_ASSERT(NS_SUCCEEDED(rv), "Freeze() failed");
+  }
+  void ThawedCallback(nsIGlobalObject* aGlobal) override {
+    DebugOnly<nsresult> rv = Thaw();
+    MOZ_ASSERT(NS_SUCCEEDED(rv), "Thaw() failed");
+  }
+
+  nsresult Thaw();
+  nsresult Freeze();
+
+  nsresult PrintErrorOnConsole(const char* aBundleURI, const char* aError,
+                               const nsTArray<nsString>& aFormatStrings);
+  nsresult ConsoleError();
+
+  static nsresult StreamReaderFunc(nsIInputStream* aInputStream, void* aClosure,
+                                   const char* aFromRawSegment,
+                                   uint32_t aToOffset, uint32_t aCount,
+                                   uint32_t* aWriteCount);
+  void ParseSegment(const char* aBuffer, uint32_t aLength);
+  nsresult SetFieldAndClear();
+  void ClearFields();
+  nsresult ResetEvent();
+  nsresult DispatchCurrentMessageEvent();
+  nsresult ParseCharacter(char16_t aChr);
+  nsresult CheckHealthOfRequestCallback(nsIRequest* aRequestCallback);
+  nsresult OnRedirectVerifyCallback(nsresult result);
+  nsresult ParseURL(const nsAString& aURL);
+  nsresult AddGlobalObservers(nsIGlobalObject* aGlobal);
+  void RemoveWindowObservers();
+
+  void CloseInternal();
+  void CleanupOnMainThread();
+
+  bool CreateWorkerRef(WorkerPrivate* aWorkerPrivate);
+  void ReleaseWorkerRef();
+
+  void AssertIsOnTargetThread() const {
+    MOZ_DIAGNOSTIC_ASSERT(IsTargetThread());
+  }
+
+  bool IsTargetThread() const { return NS_GetCurrentThread() == mTargetThread; }
+
+  uint16_t ReadyState() {
+    auto lock = mSharedData.Lock();
+    if (lock->mEventSource) {
+      return lock->mEventSource->mReadyState;
+    }
+    return CLOSED;
+  }
+
+  void SetReadyState(uint16_t aReadyState) {
+    auto lock = mSharedData.Lock();
+    MOZ_ASSERT(lock->mEventSource);
+    MOZ_ASSERT(!mIsShutDown);
+    lock->mEventSource->mReadyState = aReadyState;
+  }
+
+  bool IsClosed() { return ReadyState() == CLOSED; }
+
+  RefPtr<EventSource> GetEventSource() {
+    AssertIsOnTargetThread();
+    auto lock = mSharedData.Lock();
+    return lock->mEventSource;
+  }
+
+  enum ParserStatus {
+    PARSE_STATE_OFF = 0,
+    PARSE_STATE_BEGIN_OF_STREAM,
+    PARSE_STATE_CR_CHAR,
+    PARSE_STATE_COMMENT,
+    PARSE_STATE_FIELD_NAME,
+    PARSE_STATE_FIRST_CHAR_OF_FIELD_VALUE,
+    PARSE_STATE_FIELD_VALUE,
+    PARSE_STATE_IGNORE_FIELD_VALUE,
+    PARSE_STATE_BEGIN_OF_LINE
+  };
+
+  nsCOMPtr<nsIURI> mSrc;
+  uint32_t mReconnectionTime;  
+  nsCOMPtr<nsIPrincipal> mPrincipal;
+  Maybe<ClientInfo> mClientInfo;
+  Maybe<ServiceWorkerDescriptor> mController;
+  nsString mOrigin;
+  nsCOMPtr<nsITimer> mTimer;
+  nsCOMPtr<nsIHttpChannel> mHttpChannel;
+
+  struct Message {
+    nsString mEventName;
+    Maybe<nsString> mLastEventID;
+    nsString mData;
+  };
+
+  nsString mLastEventID;
+  UniquePtr<Message> mCurrentMessage;
+  nsDeque<Message> mMessagesToDispatch;
+  ParserStatus mStatus;
+  mozilla::UniquePtr<mozilla::Decoder> mUnicodeDecoder;
+  nsString mLastFieldName;
+  nsString mLastFieldValue;
+
+  DataMutex<RefPtr<ThreadSafeWorkerRef>> mWorkerRef;
+
+  Atomic<bool> mFrozen;
+  bool mGoingToDispatchAllMessages;
+  const bool mIsMainThread;
+  Atomic<bool> mIsShutDown;
+
+  class EventSourceServiceNotifier final {
+   public:
+    EventSourceServiceNotifier(RefPtr<EventSourceImpl>&& aEventSourceImpl,
+                               uint64_t aHttpChannelId, uint64_t aInnerWindowID)
+        : mEventSourceImpl(std::move(aEventSourceImpl)),
+          mHttpChannelId(aHttpChannelId),
+          mInnerWindowID(aInnerWindowID),
+          mConnectionOpened(false) {
+      AssertIsOnMainThread();
+      mService = EventSourceEventService::GetOrCreate();
+    }
+
+    void ConnectionOpened() {
+      mEventSourceImpl->AssertIsOnTargetThread();
+      mService->EventSourceConnectionOpened(mHttpChannelId, mInnerWindowID);
+      mConnectionOpened = true;
+    }
+
+    void EventReceived(const nsAString& aEventName,
+                       const nsAString& aLastEventID, const nsAString& aData,
+                       uint32_t aRetry, DOMHighResTimeStamp aTimeStamp) {
+      mEventSourceImpl->AssertIsOnTargetThread();
+      mService->EventReceived(mHttpChannelId, mInnerWindowID, aEventName,
+                              aLastEventID, aData, aRetry, aTimeStamp);
+    }
+
+    ~EventSourceServiceNotifier() {
+      if (mConnectionOpened) {
+        mService->EventSourceConnectionClosed(mHttpChannelId, mInnerWindowID);
+      }
+      NS_ReleaseOnMainThread("EventSourceServiceNotifier::mService",
+                             mService.forget());
+    }
+
+   private:
+    RefPtr<EventSourceEventService> mService;
+    RefPtr<EventSourceImpl> mEventSourceImpl;
+    uint64_t mHttpChannelId;
+    uint64_t mInnerWindowID;
+    bool mConnectionOpened;
+  };
+
+  struct SharedData {
+    RefPtr<EventSource> mEventSource;
+    UniquePtr<EventSourceServiceNotifier> mServiceNotifier;
+  };
+
+  DataMutex<SharedData> mSharedData;
+
+  JSCallingLocation mCallingLocation;
+  uint64_t mInnerWindowID;
+
+  EventSourceImpl(const EventSourceImpl& x) = delete;
+  EventSourceImpl& operator=(const EventSourceImpl& x) = delete;
+
+ private:
+  nsCOMPtr<nsICookieJarSettings> mCookieJarSettings;
+
+  nsIThread* mTargetThread;
+
+  ~EventSourceImpl() {
+    if (IsClosed()) {
+      return;
+    }
+    SetReadyState(CLOSED);
+    CloseInternal();
+  }
+};
+
+NS_IMPL_ISUPPORTS(EventSourceImpl, nsIStreamListener, nsIRequestObserver,
+                  nsIChannelEventSink, nsIInterfaceRequestor,
+                  nsISerialEventTarget, nsIEventTarget,
+                  nsIThreadRetargetableStreamListener, nsITimerCallback,
+                  nsINamed)
+
+EventSourceImpl::EventSourceImpl(EventSource* aEventSource,
+                                 nsICookieJarSettings* aCookieJarSettings)
+    : mReconnectionTime(0),
+      mStatus(PARSE_STATE_OFF),
+      mWorkerRef(nullptr, "EventSourceImpl::mWorkerRef"),
+      mFrozen(false),
+      mGoingToDispatchAllMessages(false),
+      mIsMainThread(NS_IsMainThread()),
+      mIsShutDown(false),
+      mSharedData(SharedData{aEventSource}, "EventSourceImpl::mSharedData"),
+      mInnerWindowID(0),
+      mCookieJarSettings(aCookieJarSettings),
+      mTargetThread(NS_GetCurrentThread()) {
+  MOZ_ASSERT(aEventSource);
+  SetReadyState(CONNECTING);
+}
+
+class CleanupRunnable final : public WorkerMainThreadRunnable {
+ public:
+  explicit CleanupRunnable(RefPtr<EventSourceImpl>&& aEventSourceImpl)
+      : WorkerMainThreadRunnable(GetCurrentThreadWorkerPrivate(),
+                                 "EventSource :: Cleanup"_ns),
+        mESImpl(std::move(aEventSourceImpl)) {
+    MOZ_ASSERT(mESImpl);
+  }
+
+  bool MainThreadRun() override {
+    MOZ_ASSERT(mESImpl);
+    mESImpl->CleanupOnMainThread();
+    mESImpl = nullptr;
+    return true;
+  }
+
+ protected:
+  RefPtr<EventSourceImpl> mESImpl;
+};
+
+void EventSourceImpl::Close() {
+  if (IsClosed()) {
+    return;
+  }
+
+  SetReadyState(CLOSED);
+  CloseInternal();
+}
+
+void EventSourceImpl::CloseInternal() {
+  AssertIsOnTargetThread();
+  MOZ_ASSERT(IsClosed());
+
+  RefPtr<EventSource> myES;
+  {
+    auto lock = mSharedData.Lock();
+    myES = std::move(lock->mEventSource);
+    lock->mEventSource = nullptr;
+    lock->mServiceNotifier = nullptr;
+  }
+
+  MOZ_ASSERT(!mIsShutDown);
+  if (mIsShutDown) {
+    return;
+  }
+
+  if (NS_IsMainThread()) {
+    CleanupOnMainThread();
+  } else {
+    ErrorResult rv;
+    RefPtr<CleanupRunnable> runnable = new CleanupRunnable(this);
+    runnable->Dispatch(GetCurrentThreadWorkerPrivate(), Killing, rv);
+    MOZ_ASSERT(!rv.Failed());
+    ReleaseWorkerRef();
+  }
+
+  while (mMessagesToDispatch.GetSize() != 0) {
+    delete mMessagesToDispatch.PopFront();
+  }
+  mFrozen = false;
+  ResetDecoder();
+  mUnicodeDecoder = nullptr;
+  myES->mESImpl = nullptr;
+}
+
+void EventSourceImpl::CleanupOnMainThread() {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(IsClosed());
+
+  MOZ_ASSERT(!mIsShutDown);
+  mIsShutDown = true;
+
+  if (mIsMainThread) {
+    RemoveWindowObservers();
+  }
+
+  if (mTimer) {
+    mTimer->Cancel();
+    mTimer = nullptr;
+  }
+
+  ResetConnection();
+  mPrincipal = nullptr;
+  mSrc = nullptr;
+}
+
+class ConnectRunnable final : public WorkerMainThreadRunnable {
+ public:
+  explicit ConnectRunnable(WorkerPrivate* aWorkerPrivate,
+                           RefPtr<EventSourceImpl> aEventSourceImpl)
+      : WorkerMainThreadRunnable(aWorkerPrivate, "EventSource :: Connect"_ns),
+        mESImpl(std::move(aEventSourceImpl)) {
+    MOZ_ASSERT(aWorkerPrivate);
+    aWorkerPrivate->AssertIsOnWorkerThread();
+    MOZ_ASSERT(mESImpl);
+  }
+
+  bool MainThreadRun() override {
+    MOZ_ASSERT(mESImpl);
+    mESImpl->InitChannelAndRequestEventSource(true);
+    mESImpl = nullptr;
+    return true;
+  }
+
+ private:
+  RefPtr<EventSourceImpl> mESImpl;
+};
+
+nsresult EventSourceImpl::ParseURL(const nsAString& aURL) {
+  MOZ_ASSERT(!mIsShutDown);
+  nsCOMPtr<nsIURI> baseURI;
+  nsresult rv = GetBaseURI(getter_AddRefs(baseURI));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIURI> srcURI;
+  nsCOMPtr<Document> doc =
+      mIsMainThread ? GetEventSource()->GetDocumentIfCurrent() : nullptr;
+  if (doc) {
+    rv = NS_NewURI(getter_AddRefs(srcURI), aURL, doc->GetDocumentCharacterSet(),
+                   baseURI);
+  } else {
+    rv = NS_NewURI(getter_AddRefs(srcURI), aURL, nullptr, baseURI);
+  }
+
+  NS_ENSURE_SUCCESS(rv, NS_ERROR_DOM_SYNTAX_ERR);
+
+  nsAutoString origin;
+  rv = nsContentUtils::GetWebExposedOriginSerialization(srcURI, origin);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString spec;
+  rv = srcURI->GetSpec(spec);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  {
+    auto lock = mSharedData.Lock();
+    lock->mEventSource->mOriginalURL = NS_ConvertUTF8toUTF16(spec);
+  }
+  mSrc = std::move(srcURI);
+  mOrigin = std::move(origin);
+  return NS_OK;
+}
+
+nsresult EventSourceImpl::AddGlobalObservers(nsIGlobalObject* aGlobal) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(mIsMainThread);
+  MOZ_ASSERT(!mIsShutDown);
+
+  GlobalTeardownObserver::BindToGlobal(aGlobal);
+  GlobalFreezeObserver::BindToGlobal(aGlobal);
+
+  return NS_OK;
+}
+
+void EventSourceImpl::RemoveWindowObservers() {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(mIsMainThread);
+  MOZ_ASSERT(IsClosed());
+  GlobalTeardownObserver::DisconnectFromOwner();
+  DisconnectFreezeObserver();
+}
+
+void EventSourceImpl::Init(nsIGlobalObject* aWindowGlobal,
+                           nsIPrincipal* aPrincipal, const nsAString& aURL,
+                           ErrorResult& aRv) {
+  MOZ_ASSERT_IF(aWindowGlobal, mIsMainThread);
+  MOZ_ASSERT(aPrincipal);
+  MOZ_ASSERT(ReadyState() == CONNECTING);
+  mPrincipal = aPrincipal;
+  aRv = ParseURL(aURL);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return;
+  }
+  if (JSContext* cx = nsContentUtils::GetCurrentJSContext()) {
+    mCallingLocation = JSCallingLocation::Get();
+    if (mIsMainThread) {
+      mInnerWindowID = nsJSUtils::GetCurrentlyRunningCodeInnerWindowID(cx);
+    }
+  }
+
+  if (mIsMainThread) {
+    aRv = AddGlobalObservers(aWindowGlobal);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return;
+    }
+  }
+
+  mReconnectionTime = StaticPrefs::dom_serverEvents_defaultReconnectionTime();
+  if (!mReconnectionTime) {
+    mReconnectionTime = DEFAULT_RECONNECTION_TIME_VALUE;
+  }
+
+  mUnicodeDecoder = UTF_8_ENCODING->NewDecoderWithBOMRemoval();
+}
+
+
+NS_IMETHODIMP
+EventSourceImpl::OnStartRequest(nsIRequest* aRequest) {
+  AssertIsOnMainThread();
+  if (IsClosed()) {
+    return NS_ERROR_ABORT;
+  }
+  nsresult rv = CheckHealthOfRequestCallback(aRequest);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(aRequest, &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsresult status;
+  rv = aRequest->GetStatus(&status);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (NS_FAILED(status)) {
+    return status;
+  }
+
+  uint32_t httpStatus;
+  rv = httpChannel->GetResponseStatus(&httpStatus);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (httpStatus != 200) {
+    DispatchFailConnection();
+    return NS_ERROR_ABORT;
+  }
+
+  nsAutoCString contentType;
+  rv = httpChannel->GetContentType(contentType);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (!contentType.EqualsLiteral(TEXT_EVENT_STREAM)) {
+    DispatchFailConnection();
+    return NS_ERROR_ABORT;
+  }
+
+  if (!mIsMainThread) {
+    nsCOMPtr<nsIThreadRetargetableRequest> rr = do_QueryInterface(httpChannel);
+    if (rr) {
+      rv = rr->RetargetDeliveryTo(this);
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        NS_WARNING("Retargeting failed");
+      }
+    }
+  }
+
+  {
+    auto lock = mSharedData.Lock();
+    lock->mServiceNotifier = MakeUnique<EventSourceServiceNotifier>(
+        this, mHttpChannel->ChannelId(), mInnerWindowID);
+  }
+  rv = Dispatch(NewRunnableMethod("dom::EventSourceImpl::AnnounceConnection",
+                                  this, &EventSourceImpl::AnnounceConnection),
+                NS_DISPATCH_NORMAL);
+  NS_ENSURE_SUCCESS(rv, rv);
+  mStatus = PARSE_STATE_BEGIN_OF_STREAM;
+  return NS_OK;
+}
+
+nsresult EventSourceImpl::StreamReaderFunc(nsIInputStream* aInputStream,
+                                           void* aClosure,
+                                           const char* aFromRawSegment,
+                                           uint32_t aToOffset, uint32_t aCount,
+                                           uint32_t* aWriteCount) {
+  EventSourceImpl* thisObject = static_cast<EventSourceImpl*>(aClosure);
+  if (!thisObject || !aWriteCount) {
+    NS_WARNING(
+        "EventSource cannot read from stream: no aClosure or aWriteCount");
+    return NS_ERROR_FAILURE;
+  }
+  thisObject->AssertIsOnTargetThread();
+  MOZ_ASSERT(!thisObject->mIsShutDown);
+  thisObject->ParseSegment((const char*)aFromRawSegment, aCount);
+  *aWriteCount = aCount;
+  return NS_OK;
+}
+
+void EventSourceImpl::ParseSegment(const char* aBuffer, uint32_t aLength) {
+  AssertIsOnTargetThread();
+  if (IsClosed()) {
+    return;
+  }
+  char16_t buffer[1024];
+  auto dst = Span(buffer);
+  auto src = AsBytes(Span(aBuffer, aLength));
+  for (;;) {
+    uint32_t result;
+    size_t read;
+    size_t written;
+    std::tie(result, read, written, std::ignore) =
+        mUnicodeDecoder->DecodeToUTF16(src, dst, false);
+    for (auto c : dst.To(written)) {
+      nsresult rv = ParseCharacter(c);
+      NS_ENSURE_SUCCESS_VOID(rv);
+    }
+    if (result == kInputEmpty) {
+      return;
+    }
+    src = src.From(read);
+  }
+}
+
+NS_IMETHODIMP
+EventSourceImpl::OnDataAvailable(nsIRequest* aRequest,
+                                 nsIInputStream* aInputStream, uint64_t aOffset,
+                                 uint32_t aCount) {
+  AssertIsOnTargetThread();
+  NS_ENSURE_ARG_POINTER(aInputStream);
+  if (IsClosed()) {
+    return NS_ERROR_ABORT;
+  }
+
+  nsresult rv = CheckHealthOfRequestCallback(aRequest);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  uint32_t totalRead;
+  return aInputStream->ReadSegments(EventSourceImpl::StreamReaderFunc, this,
+                                    aCount, &totalRead);
+}
+
+NS_IMETHODIMP
+EventSourceImpl::OnStopRequest(nsIRequest* aRequest, nsresult aStatusCode) {
+  AssertIsOnMainThread();
+
+  if (IsClosed()) {
+    return NS_ERROR_ABORT;
+  }
+  MOZ_ASSERT(mSrc);
+  if (aStatusCode == NS_BINDING_ABORTED) {
+    nsAutoCString cancelReason;
+    if (mHttpChannel) {
+      mHttpChannel->GetCanceledReason(cancelReason);
+    }
+    if (cancelReason.EqualsLiteral("navigation")) {
+      nsresult rv = Dispatch(NewRunnableMethod("dom::EventSourceImpl::Close",
+                                               this, &EventSourceImpl::Close),
+                             NS_DISPATCH_NORMAL);
+      NS_ENSURE_SUCCESS(rv, rv);
+    } else {
+      nsresult rv =
+          Dispatch(NewRunnableMethod("dom::EventSourceImpl::FailConnection",
+                                     this, &EventSourceImpl::FailConnection),
+                   NS_DISPATCH_NORMAL);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+    return NS_OK;
+  }
+  if (NS_FAILED(aStatusCode) && aStatusCode != NS_ERROR_CONNECTION_REFUSED &&
+      aStatusCode != NS_ERROR_NET_TIMEOUT &&
+      aStatusCode != NS_ERROR_NET_RESET &&
+      aStatusCode != NS_ERROR_NET_INTERRUPT &&
+      aStatusCode != NS_ERROR_NET_PARTIAL_TRANSFER &&
+      aStatusCode != NS_ERROR_NET_TIMEOUT_EXTERNAL &&
+      aStatusCode != NS_ERROR_PROXY_CONNECTION_REFUSED &&
+      aStatusCode != NS_ERROR_DNS_LOOKUP_QUEUE_FULL &&
+      aStatusCode != NS_ERROR_INVALID_CONTENT_ENCODING) {
+    DispatchFailConnection();
+    return NS_ERROR_ABORT;
+  }
+
+  nsresult rv = CheckHealthOfRequestCallback(aRequest);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv =
+      Dispatch(NewRunnableMethod("dom::EventSourceImpl::ReestablishConnection",
+                                 this, &EventSourceImpl::ReestablishConnection),
+               NS_DISPATCH_NORMAL);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+EventSourceImpl::AsyncOnChannelRedirect(
+    nsIChannel* aOldChannel, nsIChannel* aNewChannel, uint32_t aFlags,
+    nsIAsyncVerifyRedirectCallback* aCallback) {
+  AssertIsOnMainThread();
+  if (IsClosed()) {
+    return NS_ERROR_ABORT;
+  }
+  nsCOMPtr<nsIRequest> aOldRequest = aOldChannel;
+  MOZ_ASSERT(aOldRequest, "Redirect from a null request?");
+
+  nsresult rv = CheckHealthOfRequestCallback(aOldRequest);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  MOZ_ASSERT(aNewChannel, "Redirect without a channel?");
+
+  nsCOMPtr<nsIURI> newURI;
+  rv = NS_GetFinalChannelURI(aNewChannel, getter_AddRefs(newURI));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  bool isValidScheme = net::SchemeIsHttpOrHttps(newURI);
+
+  rv =
+      mIsMainThread ? GetEventSource()->CheckCurrentGlobalCorrectness() : NS_OK;
+  if (NS_FAILED(rv) || !isValidScheme) {
+    DispatchFailConnection();
+    return NS_ERROR_DOM_SECURITY_ERR;
+  }
+
+
+  mHttpChannel = do_QueryInterface(aNewChannel);
+  NS_ENSURE_STATE(mHttpChannel);
+
+  SetupHttpChannel();
+
+  if ((aFlags & nsIChannelEventSink::REDIRECT_PERMANENT) != 0) {
+    rv = NS_GetFinalChannelURI(mHttpChannel, getter_AddRefs(mSrc));
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  aCallback->OnRedirectVerifyCallback(NS_OK);
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+EventSourceImpl::GetInterface(const nsIID& aIID, void** aResult) {
+  AssertIsOnMainThread();
+
+  if (IsClosed()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (aIID.Equals(NS_GET_IID(nsIChannelEventSink))) {
+    *aResult = static_cast<nsIChannelEventSink*>(this);
+    NS_ADDREF_THIS();
+    return NS_OK;
+  }
+
+  if (aIID.Equals(NS_GET_IID(nsIAuthPrompt)) ||
+      aIID.Equals(NS_GET_IID(nsIAuthPrompt2))) {
+    nsresult rv;
+    nsCOMPtr<nsIPromptFactory> wwatch =
+        do_GetService(NS_WINDOWWATCHER_CONTRACTID, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    nsCOMPtr<nsPIDOMWindowOuter> window;
+
+    if (mIsMainThread) {
+      auto lock = mSharedData.Lock();
+      rv = lock->mEventSource->CheckCurrentGlobalCorrectness();
+      NS_ENSURE_SUCCESS(rv, NS_ERROR_UNEXPECTED);
+
+      if (nsGlobalWindowInner* win = lock->mEventSource->GetOwnerWindow()) {
+        window = win->GetOuterWindow();
+      }
+    }
+
+
+    return wwatch->GetPrompt(window, aIID, aResult);
+  }
+
+  return QueryInterface(aIID, aResult);
+}
+
+NS_IMETHODIMP
+EventSourceImpl::IsOnCurrentThread(bool* aResult) {
+  *aResult = IsTargetThread();
+  return NS_OK;
+}
+
+NS_IMETHODIMP_(bool)
+EventSourceImpl::IsOnCurrentThreadInfallible() { return IsTargetThread(); }
+
+nsresult EventSourceImpl::GetBaseURI(nsIURI** aBaseURI) {
+  MOZ_ASSERT(!mIsShutDown);
+  NS_ENSURE_ARG_POINTER(aBaseURI);
+
+  *aBaseURI = nullptr;
+
+  nsCOMPtr<nsIURI> baseURI;
+
+  nsCOMPtr<Document> doc =
+      mIsMainThread ? GetEventSource()->GetDocumentIfCurrent() : nullptr;
+  if (doc) {
+    baseURI = doc->GetBaseURI();
+  }
+
+  if (!baseURI) {
+    auto* basePrin = BasePrincipal::Cast(mPrincipal);
+    nsresult rv = basePrin->GetURI(getter_AddRefs(baseURI));
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  NS_ENSURE_STATE(baseURI);
+
+  baseURI.forget(aBaseURI);
+  return NS_OK;
+}
+
+void EventSourceImpl::SetupHttpChannel() {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(!mIsShutDown);
+  nsresult rv = mHttpChannel->SetRequestMethod("GET"_ns);
+  MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+
+  rv = mHttpChannel->SetRequestHeader(
+      "Accept"_ns, nsLiteralCString(TEXT_EVENT_STREAM), false);
+  MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+
+  if (mLastEventID.IsEmpty()) {
+    return;
+  }
+  NS_ConvertUTF16toUTF8 eventId(mLastEventID);
+  rv = mHttpChannel->SetRequestHeader("Last-Event-ID"_ns, eventId, false);
+#ifdef DEBUG
+  if (NS_FAILED(rv)) {
+    MOZ_LOG(gEventSourceLog, LogLevel::Warning,
+            ("SetupHttpChannel. rv=%x (%s)", uint32_t(rv), eventId.get()));
+  }
+#endif
+  (void)rv;
+}
+
+nsresult EventSourceImpl::SetupReferrerInfo(
+    const nsCOMPtr<Document>& aDocument) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(!mIsShutDown);
+
+  if (aDocument) {
+    auto referrerInfo = MakeRefPtr<ReferrerInfo>(*aDocument);
+    nsresult rv = mHttpChannel->SetReferrerInfoWithoutClone(referrerInfo);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  return NS_OK;
+}
+
+nsresult EventSourceImpl::InitChannelAndRequestEventSource(
+    const bool aEventTargetAccessAllowed) {
+  AssertIsOnMainThread();
+  if (IsClosed()) {
+    return NS_ERROR_ABORT;
+  }
+
+  bool isValidScheme = net::SchemeIsHttpOrHttps(mSrc);
+
+  MOZ_ASSERT_IF(mIsMainThread, aEventTargetAccessAllowed);
+
+  nsresult rv = aEventTargetAccessAllowed ? [this]() {
+    auto lock = mSharedData.Lock();
+    return lock->mEventSource->CheckCurrentGlobalCorrectness();
+  }()
+                                          : NS_OK;
+  if (NS_FAILED(rv) || !isValidScheme) {
+    DispatchFailConnection();
+    return NS_ERROR_DOM_SECURITY_ERR;
+  }
+
+  nsCOMPtr<Document> doc;
+  nsSecurityFlags securityFlags =
+      nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT;
+  {
+    auto lock = mSharedData.Lock();
+    doc = aEventTargetAccessAllowed ? lock->mEventSource->GetDocumentIfCurrent()
+                                    : nullptr;
+
+    if (lock->mEventSource->mWithCredentials) {
+      securityFlags |= nsILoadInfo::SEC_COOKIES_INCLUDE;
+    }
+  }
+
+  nsLoadFlags loadFlags;
+  loadFlags = nsIRequest::LOAD_BACKGROUND | nsIRequest::LOAD_BYPASS_CACHE |
+              nsIRequest::INHIBIT_CACHING;
+
+  nsCOMPtr<nsIChannel> channel;
+  if (doc) {
+    MOZ_ASSERT(mCookieJarSettings == doc->CookieJarSettings());
+
+    nsCOMPtr<nsILoadGroup> loadGroup = doc->GetDocumentLoadGroup();
+    rv = NS_NewChannel(getter_AddRefs(channel), mSrc, doc, securityFlags,
+                       nsIContentPolicy::TYPE_INTERNAL_EVENTSOURCE,
+                       nullptr,  
+                       loadGroup,
+                       nullptr,     
+                       loadFlags);  
+  } else if (mClientInfo.isSome()) {
+    rv = NS_NewChannel(getter_AddRefs(channel), mSrc, mPrincipal,
+                       mClientInfo.ref(), mController, securityFlags,
+                       nsIContentPolicy::TYPE_INTERNAL_EVENTSOURCE,
+                       mCookieJarSettings,
+                       nullptr,     
+                       nullptr,     
+                       nullptr,     
+                       loadFlags);  
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    auto workerRef = mWorkerRef.Lock();
+
+    if (*workerRef) {
+      nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+      loadInfo->SetIsInThirdPartyContext(
+          (*workerRef)->Private()->IsThirdPartyContext());
+    }
+  } else {
+    rv = NS_NewChannel(getter_AddRefs(channel), mSrc, mPrincipal, securityFlags,
+                       nsIContentPolicy::TYPE_INTERNAL_EVENTSOURCE,
+                       mCookieJarSettings,
+                       nullptr,     
+                       nullptr,     
+                       nullptr,     
+                       loadFlags);  
+  }
+
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mHttpChannel = do_QueryInterface(channel);
+  NS_ENSURE_TRUE(mHttpChannel, NS_ERROR_NO_INTERFACE);
+
+  SetupHttpChannel();
+  rv = SetupReferrerInfo(doc);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+#ifdef DEBUG
+  {
+    nsCOMPtr<nsIInterfaceRequestor> notificationCallbacks;
+    mHttpChannel->GetNotificationCallbacks(
+        getter_AddRefs(notificationCallbacks));
+    MOZ_ASSERT(!notificationCallbacks);
+  }
+#endif
+
+  mHttpChannel->SetNotificationCallbacks(this);
+
+  rv = mHttpChannel->AsyncOpen(this);
+  if (NS_FAILED(rv)) {
+    DispatchFailConnection();
+    return rv;
+  }
+
+  return rv;
+}
+
+void EventSourceImpl::AnnounceConnection() {
+  AssertIsOnTargetThread();
+  if (ReadyState() != CONNECTING) {
+    NS_WARNING("Unexpected mReadyState!!!");
+    return;
+  }
+
+  {
+    auto lock = mSharedData.Lock();
+    if (lock->mServiceNotifier) {
+      lock->mServiceNotifier->ConnectionOpened();
+    }
+  }
+
+
+  SetReadyState(OPEN);
+
+  nsresult rv = GetEventSource()->CheckCurrentGlobalCorrectness();
+  if (NS_FAILED(rv)) {
+    return;
+  }
+  rv = GetEventSource()->CreateAndDispatchSimpleEvent(u"open"_ns);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("Failed to dispatch the error event!!!");
+    return;
+  }
+}
+
+nsresult EventSourceImpl::ResetConnection() {
+  AssertIsOnMainThread();
+  if (mHttpChannel) {
+    mHttpChannel->Cancel(NS_ERROR_ABORT);
+    mHttpChannel = nullptr;
+  }
+  return NS_OK;
+}
+
+void EventSourceImpl::ResetDecoder() {
+  AssertIsOnTargetThread();
+  if (mUnicodeDecoder) {
+    UTF_8_ENCODING->NewDecoderWithBOMRemovalInto(*mUnicodeDecoder);
+  }
+  mStatus = PARSE_STATE_OFF;
+  ClearFields();
+}
+
+class CallRestartConnection final : public WorkerMainThreadRunnable {
+ public:
+  explicit CallRestartConnection(RefPtr<EventSourceImpl>&& aEventSourceImpl)
+      : WorkerMainThreadRunnable(GetCurrentThreadWorkerPrivate(),
+                                 "EventSource :: RestartConnection"_ns),
+        mESImpl(std::move(aEventSourceImpl)) {
+    MOZ_ASSERT(mESImpl);
+  }
+
+  bool MainThreadRun() override {
+    MOZ_ASSERT(mESImpl);
+    mESImpl->RestartConnection();
+    mESImpl = nullptr;
+    return true;
+  }
+
+ protected:
+  RefPtr<EventSourceImpl> mESImpl;
+};
+
+nsresult EventSourceImpl::RestartConnection() {
+  AssertIsOnMainThread();
+  if (IsClosed()) {
+    return NS_ERROR_ABORT;
+  }
+
+  nsresult rv = ResetConnection();
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = SetReconnectionTimeout();
+  NS_ENSURE_SUCCESS(rv, rv);
+  return NS_OK;
+}
+
+void EventSourceImpl::ReestablishConnection() {
+  AssertIsOnTargetThread();
+  if (IsClosed()) {
+    return;
+  }
+
+  nsresult rv;
+  if (mIsMainThread) {
+    rv = RestartConnection();
+  } else {
+    RefPtr<CallRestartConnection> runnable = new CallRestartConnection(this);
+    ErrorResult result;
+    runnable->Dispatch(GetCurrentThreadWorkerPrivate(), Canceling, result);
+    MOZ_ASSERT(!result.Failed());
+    rv = result.StealNSResult();
+  }
+  if (NS_FAILED(rv)) {
+    return;
+  }
+
+  RefPtr<EventSource> source = GetEventSource();
+  if (!source) {
+    NS_WARNING("Event source is null");
+    return;
+  }
+
+  rv = source->CheckCurrentGlobalCorrectness();
+  if (NS_FAILED(rv)) {
+    return;
+  }
+
+  SetReadyState(CONNECTING);
+  ResetDecoder();
+  rv = source->CreateAndDispatchSimpleEvent(u"error"_ns);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("Failed to dispatch the error event!!!");
+    return;
+  }
+}
+
+nsresult EventSourceImpl::SetReconnectionTimeout() {
+  AssertIsOnMainThread();
+  if (IsClosed()) {
+    return NS_ERROR_ABORT;
+  }
+
+  if (!mTimer) {
+    mTimer = NS_NewTimer();
+    NS_ENSURE_STATE(mTimer);
+  }
+
+  MOZ_TRY(mTimer->InitWithCallback(this, mReconnectionTime,
+                                   nsITimer::TYPE_ONE_SHOT));
+
+  return NS_OK;
+}
+
+nsresult EventSourceImpl::PrintErrorOnConsole(
+    const char* aBundleURI, const char* aError,
+    const nsTArray<nsString>& aFormatStrings) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(!mIsShutDown);
+  nsCOMPtr<nsIStringBundleService> bundleService =
+      mozilla::components::StringBundle::Service();
+  NS_ENSURE_STATE(bundleService);
+
+  nsCOMPtr<nsIStringBundle> strBundle;
+  nsresult rv =
+      bundleService->CreateBundle(aBundleURI, getter_AddRefs(strBundle));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIConsoleService> console(
+      do_GetService(NS_CONSOLESERVICE_CONTRACTID, &rv));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIScriptError> errObj(
+      do_CreateInstance(NS_SCRIPTERROR_CONTRACTID, &rv));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoString message;
+  if (!aFormatStrings.IsEmpty()) {
+    rv = strBundle->FormatStringFromName(aError, aFormatStrings, message);
+  } else {
+    rv = strBundle->GetStringFromName(aError, message);
+  }
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = errObj->InitWithWindowID(
+      message, mCallingLocation.FileName(), mCallingLocation.mLine,
+      mCallingLocation.mColumn, nsIScriptError::errorFlag, "Event Source",
+      mInnerWindowID);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = console->LogMessage(errObj);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult EventSourceImpl::ConsoleError() {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(!mIsShutDown);
+  nsAutoCString targetSpec;
+  nsresult rv = mSrc->GetSpec(targetSpec);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  AutoTArray<nsString, 1> formatStrings;
+  CopyUTF8toUTF16(targetSpec, *formatStrings.AppendElement());
+
+  if (ReadyState() == CONNECTING) {
+    rv = PrintErrorOnConsole("chrome://global/locale/appstrings.properties",
+                             "connectionFailure", formatStrings);
+  } else {
+    rv = PrintErrorOnConsole("chrome://global/locale/appstrings.properties",
+                             "netInterrupt", formatStrings);
+  }
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+void EventSourceImpl::DispatchFailConnection() {
+  AssertIsOnMainThread();
+  if (IsClosed()) {
+    return;
+  }
+  nsresult rv = ConsoleError();
+  if (NS_FAILED(rv)) {
+    NS_WARNING("Failed to print to the console error");
+  }
+  rv = Dispatch(NewRunnableMethod("dom::EventSourceImpl::FailConnection", this,
+                                  &EventSourceImpl::FailConnection),
+                NS_DISPATCH_NORMAL);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return;
+  }
+}
+
+void EventSourceImpl::FailConnection() {
+  AssertIsOnTargetThread();
+  if (IsClosed()) {
+    return;
+  }
+  SetReadyState(CLOSED);
+  nsresult rv = GetEventSource()->CheckCurrentGlobalCorrectness();
+  if (NS_SUCCEEDED(rv)) {
+    rv = GetEventSource()->CreateAndDispatchSimpleEvent(u"error"_ns);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("Failed to dispatch the error event!!!");
+    }
+  }
+  CloseInternal();
+}
+
+NS_IMETHODIMP EventSourceImpl::Notify(nsITimer* aTimer) {
+  AssertIsOnMainThread();
+  if (IsClosed()) {
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(!mHttpChannel, "the channel hasn't been cancelled!!");
+
+  if (!mFrozen) {
+    nsresult rv = InitChannelAndRequestEventSource(mIsMainThread);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("InitChannelAndRequestEventSource() failed");
+    }
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP EventSourceImpl::GetName(nsACString& aName) {
+  aName.AssignLiteral("EventSourceImpl");
+  return NS_OK;
+}
+
+nsresult EventSourceImpl::Thaw() {
+  AssertIsOnMainThread();
+  if (IsClosed() || !mFrozen) {
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(!mHttpChannel, "the connection hasn't been closed!!!");
+
+  mFrozen = false;
+  nsresult rv;
+  if (!mGoingToDispatchAllMessages && mMessagesToDispatch.GetSize() > 0) {
+    nsCOMPtr<nsIRunnable> event =
+        NewRunnableMethod("dom::EventSourceImpl::DispatchAllMessageEvents",
+                          this, &EventSourceImpl::DispatchAllMessageEvents);
+    NS_ENSURE_STATE(event);
+
+    mGoingToDispatchAllMessages = true;
+
+    rv = Dispatch(event.forget(), NS_DISPATCH_NORMAL);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  rv = InitChannelAndRequestEventSource(mIsMainThread);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult EventSourceImpl::Freeze() {
+  AssertIsOnMainThread();
+  if (IsClosed() || mFrozen) {
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(!mHttpChannel, "the connection hasn't been closed!!!");
+  mFrozen = true;
+  return NS_OK;
+}
+
+nsresult EventSourceImpl::DispatchCurrentMessageEvent() {
+  AssertIsOnTargetThread();
+  MOZ_ASSERT(!mIsShutDown);
+  UniquePtr<Message> message(std::move(mCurrentMessage));
+  ClearFields();
+
+  if (!message || message->mData.IsEmpty()) {
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(message->mData.CharAt(message->mData.Length() - 1) == LF_CHAR,
+             "Invalid trailing character! LF was expected instead.");
+  message->mData.SetLength(message->mData.Length() - 1);
+
+  if (message->mEventName.IsEmpty()) {
+    message->mEventName.AssignLiteral("message");
+  }
+
+  mMessagesToDispatch.Push(message.release());
+
+  if (!mGoingToDispatchAllMessages) {
+    nsCOMPtr<nsIRunnable> event =
+        NewRunnableMethod("dom::EventSourceImpl::DispatchAllMessageEvents",
+                          this, &EventSourceImpl::DispatchAllMessageEvents);
+    NS_ENSURE_STATE(event);
+
+    mGoingToDispatchAllMessages = true;
+
+    return Dispatch(event.forget(), NS_DISPATCH_NORMAL);
+  }
+
+  return NS_OK;
+}
+
+void EventSourceImpl::DispatchAllMessageEvents() {
+  AssertIsOnTargetThread();
+  mGoingToDispatchAllMessages = false;
+
+  if (IsClosed() || mFrozen) {
+    return;
+  }
+
+  nsresult rv;
+  AutoJSAPI jsapi;
+  {
+    auto lock = mSharedData.Lock();
+    rv = lock->mEventSource->CheckCurrentGlobalCorrectness();
+    if (NS_FAILED(rv)) {
+      return;
+    }
+
+    if (NS_WARN_IF(!jsapi.Init(lock->mEventSource->GetRelevantGlobal()))) {
+      return;
+    }
+  }
+
+  JSContext* cx = jsapi.cx();
+
+  while (mMessagesToDispatch.GetSize() > 0) {
+    UniquePtr<Message> message(mMessagesToDispatch.PopFront());
+
+    if (message->mLastEventID.isSome()) {
+      mLastEventID.Assign(message->mLastEventID.value());
+    }
+
+    if (message->mLastEventID.isNothing() && !mLastEventID.IsEmpty()) {
+      message->mLastEventID = Some(mLastEventID);
+    }
+
+    {
+      auto lock = mSharedData.Lock();
+      if (lock->mServiceNotifier) {
+        lock->mServiceNotifier->EventReceived(message->mEventName, mLastEventID,
+                                              message->mData, mReconnectionTime,
+                                              PR_Now());
+      }
+    }
+
+    JS::Rooted<JS::Value> jsData(cx);
+    {
+      JSString* jsString;
+      jsString = JS_NewUCStringCopyN(cx, message->mData.get(),
+                                     message->mData.Length());
+      NS_ENSURE_TRUE_VOID(jsString);
+
+      jsData.setString(jsString);
+    }
+
+
+    RefPtr<EventSource> eventSource = GetEventSource();
+    RefPtr<MessageEvent> event =
+        new MessageEvent(eventSource, nullptr, nullptr);
+
+    event->InitMessageEvent(nullptr, message->mEventName, CanBubble::eNo,
+                            Cancelable::eNo, jsData, mOrigin, mLastEventID,
+                            nullptr, Sequence<OwningNonNull<MessagePort>>());
+    event->SetTrusted(true);
+
+    IgnoredErrorResult err;
+    eventSource->DispatchEvent(*event, err);
+    if (err.Failed()) {
+      NS_WARNING("Failed to dispatch the message event!!!");
+      return;
+    }
+
+    if (IsClosed() || mFrozen) {
+      return;
+    }
+  }
+}
+
+void EventSourceImpl::ClearFields() {
+  AssertIsOnTargetThread();
+  mCurrentMessage = nullptr;
+  mLastFieldName.Truncate();
+  mLastFieldValue.Truncate();
+}
+
+nsresult EventSourceImpl::SetFieldAndClear() {
+  MOZ_ASSERT(!mIsShutDown);
+  AssertIsOnTargetThread();
+  if (mLastFieldName.IsEmpty()) {
+    mLastFieldValue.Truncate();
+    return NS_OK;
+  }
+  if (!mCurrentMessage) {
+    mCurrentMessage = MakeUnique<Message>();
+  }
+  char16_t first_char;
+  first_char = mLastFieldName.CharAt(0);
+
+  switch (first_char) {
+    case char16_t('d'):
+      if (mLastFieldName.EqualsLiteral("data")) {
+        mCurrentMessage->mData.Append(mLastFieldValue);
+        mCurrentMessage->mData.Append(LF_CHAR);
+      }
+      break;
+
+    case char16_t('e'):
+      if (mLastFieldName.EqualsLiteral("event")) {
+        mCurrentMessage->mEventName.Assign(mLastFieldValue);
+      }
+      break;
+
+    case char16_t('i'):
+      if (mLastFieldName.EqualsLiteral("id")) {
+        mCurrentMessage->mLastEventID = Some(mLastFieldValue);
+      }
+      break;
+
+    case char16_t('r'):
+      if (mLastFieldName.EqualsLiteral("retry")) {
+        uint32_t newValue = 0;
+        uint32_t i = 0;  
+        bool assign = true;
+        for (i = 0; i < mLastFieldValue.Length(); ++i) {
+          if (mLastFieldValue.CharAt(i) < (char16_t)'0' ||
+              mLastFieldValue.CharAt(i) > (char16_t)'9') {
+            assign = false;
+            break;
+          }
+          newValue = newValue * 10 + (((uint32_t)mLastFieldValue.CharAt(i)) -
+                                      ((uint32_t)((char16_t)'0')));
+        }
+
+        if (assign) {
+          if (newValue < MIN_RECONNECTION_TIME_VALUE) {
+            mReconnectionTime = MIN_RECONNECTION_TIME_VALUE;
+          } else if (newValue > MAX_RECONNECTION_TIME_VALUE) {
+            mReconnectionTime = MAX_RECONNECTION_TIME_VALUE;
+          } else {
+            mReconnectionTime = newValue;
+          }
+        }
+        break;
+      }
+      break;
+  }
+
+  mLastFieldName.Truncate();
+  mLastFieldValue.Truncate();
+
+  return NS_OK;
+}
+
+nsresult EventSourceImpl::CheckHealthOfRequestCallback(
+    nsIRequest* aRequestCallback) {
+
+  if (IsClosed() || mFrozen || !mHttpChannel) {
+    return NS_ERROR_ABORT;
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(aRequestCallback);
+  NS_ENSURE_STATE(httpChannel);
+
+  if (httpChannel != mHttpChannel) {
+    NS_WARNING("wrong channel from request callback");
+    return NS_ERROR_ABORT;
+  }
+
+  return NS_OK;
+}
+
+nsresult EventSourceImpl::ParseCharacter(char16_t aChr) {
+  AssertIsOnTargetThread();
+  nsresult rv;
+
+  if (IsClosed()) {
+    return NS_ERROR_ABORT;
+  }
+
+  switch (mStatus) {
+    case PARSE_STATE_OFF:
+      NS_ERROR("Invalid state");
+      return NS_ERROR_FAILURE;
+      break;
+
+    case PARSE_STATE_BEGIN_OF_STREAM:
+      if (aChr == CR_CHAR) {
+        mStatus = PARSE_STATE_CR_CHAR;
+      } else if (aChr == LF_CHAR) {
+        mStatus = PARSE_STATE_BEGIN_OF_LINE;
+      } else if (aChr == COLON_CHAR) {
+        mStatus = PARSE_STATE_COMMENT;
+      } else {
+        mLastFieldName += aChr;
+        mStatus = PARSE_STATE_FIELD_NAME;
+      }
+      break;
+
+    case PARSE_STATE_CR_CHAR:
+      if (aChr == CR_CHAR) {
+        rv = DispatchCurrentMessageEvent();  
+        NS_ENSURE_SUCCESS(rv, rv);
+      } else if (aChr == LF_CHAR) {
+        mStatus = PARSE_STATE_BEGIN_OF_LINE;
+      } else if (aChr == COLON_CHAR) {
+        mStatus = PARSE_STATE_COMMENT;
+      } else {
+        mLastFieldName += aChr;
+        mStatus = PARSE_STATE_FIELD_NAME;
+      }
+
+      break;
+
+    case PARSE_STATE_COMMENT:
+      if (aChr == CR_CHAR) {
+        mStatus = PARSE_STATE_CR_CHAR;
+      } else if (aChr == LF_CHAR) {
+        mStatus = PARSE_STATE_BEGIN_OF_LINE;
+      }
+
+      break;
+
+    case PARSE_STATE_FIELD_NAME:
+      if (aChr == CR_CHAR) {
+        rv = SetFieldAndClear();
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        mStatus = PARSE_STATE_CR_CHAR;
+      } else if (aChr == LF_CHAR) {
+        rv = SetFieldAndClear();
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        mStatus = PARSE_STATE_BEGIN_OF_LINE;
+      } else if (aChr == COLON_CHAR) {
+        mStatus = PARSE_STATE_FIRST_CHAR_OF_FIELD_VALUE;
+      } else {
+        mLastFieldName += aChr;
+      }
+
+      break;
+
+    case PARSE_STATE_FIRST_CHAR_OF_FIELD_VALUE:
+      if (aChr == CR_CHAR) {
+        rv = SetFieldAndClear();
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        mStatus = PARSE_STATE_CR_CHAR;
+      } else if (aChr == LF_CHAR) {
+        rv = SetFieldAndClear();
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        mStatus = PARSE_STATE_BEGIN_OF_LINE;
+      } else if (aChr == SPACE_CHAR) {
+        mStatus = PARSE_STATE_FIELD_VALUE;
+      } else {
+        mLastFieldValue += aChr;
+        mStatus = PARSE_STATE_FIELD_VALUE;
+      }
+
+      break;
+
+    case PARSE_STATE_FIELD_VALUE:
+      if (aChr == CR_CHAR) {
+        rv = SetFieldAndClear();
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        mStatus = PARSE_STATE_CR_CHAR;
+      } else if (aChr == LF_CHAR) {
+        rv = SetFieldAndClear();
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        mStatus = PARSE_STATE_BEGIN_OF_LINE;
+      } else if (aChr != 0) {
+        mLastFieldValue += aChr;
+      } else if (mLastFieldName.EqualsLiteral("id")) {
+        mStatus = PARSE_STATE_IGNORE_FIELD_VALUE;
+        mLastFieldValue.Truncate();
+      }
+
+      break;
+
+    case PARSE_STATE_IGNORE_FIELD_VALUE:
+      if (aChr == CR_CHAR) {
+        mStatus = PARSE_STATE_CR_CHAR;
+      } else if (aChr == LF_CHAR) {
+        mStatus = PARSE_STATE_BEGIN_OF_LINE;
+      }
+      break;
+
+    case PARSE_STATE_BEGIN_OF_LINE:
+      if (aChr == CR_CHAR) {
+        rv = DispatchCurrentMessageEvent();  
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        mStatus = PARSE_STATE_CR_CHAR;
+      } else if (aChr == LF_CHAR) {
+        rv = DispatchCurrentMessageEvent();  
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        mStatus = PARSE_STATE_BEGIN_OF_LINE;
+      } else if (aChr == COLON_CHAR) {
+        mStatus = PARSE_STATE_COMMENT;
+      } else if (aChr != 0) {
+        mLastFieldName += aChr;
+        mStatus = PARSE_STATE_FIELD_NAME;
+      }
+
+      break;
+  }
+
+  return NS_OK;
+}
+
+namespace {
+
+class WorkerRunnableDispatcher final : public WorkerThreadRunnable {
+  RefPtr<EventSourceImpl> mEventSourceImpl;
+
+ public:
+  WorkerRunnableDispatcher(RefPtr<EventSourceImpl>&& aImpl,
+                           WorkerPrivate* aWorkerPrivate,
+                           already_AddRefed<nsIRunnable> aEvent)
+      : WorkerThreadRunnable("WorkerRunnableDispatcher"),
+        mEventSourceImpl(std::move(aImpl)),
+        mEvent(std::move(aEvent)) {}
+
+  bool WorkerRun(JSContext* aCx, WorkerPrivate* aWorkerPrivate) override {
+    aWorkerPrivate->AssertIsOnWorkerThread();
+    return !NS_FAILED(mEvent->Run());
+  }
+
+  void PostRun(JSContext* aCx, WorkerPrivate* aWorkerPrivate,
+               bool aRunResult) override {
+    mEventSourceImpl = nullptr;
+  }
+
+  bool PreDispatch(WorkerPrivate* aWorkerPrivate) override {
+    return true;
+  }
+
+  void PostDispatch(WorkerPrivate* aWorkerPrivate,
+                    bool aDispatchResult) override {
+  }
+
+ private:
+  nsCOMPtr<nsIRunnable> mEvent;
+};
+
+}  
+
+bool EventSourceImpl::CreateWorkerRef(WorkerPrivate* aWorkerPrivate) {
+  auto tsWorkerRef = mWorkerRef.Lock();
+  MOZ_ASSERT(!*tsWorkerRef);
+  MOZ_ASSERT(aWorkerPrivate);
+  aWorkerPrivate->AssertIsOnWorkerThread();
+
+  if (mIsShutDown) {
+    return false;
+  }
+
+  RefPtr<EventSourceImpl> self = this;
+  RefPtr<StrongWorkerRef> workerRef = StrongWorkerRef::Create(
+      aWorkerPrivate, "EventSource", [self]() { self->Close(); });
+
+  if (NS_WARN_IF(!workerRef)) {
+    return false;
+  }
+
+  *tsWorkerRef = new ThreadSafeWorkerRef(workerRef);
+  return true;
+}
+
+void EventSourceImpl::ReleaseWorkerRef() {
+  MOZ_ASSERT(IsClosed());
+  MOZ_ASSERT(IsCurrentThreadRunningWorker());
+  auto workerRef = mWorkerRef.Lock();
+  *workerRef = nullptr;
+}
+
+NS_IMETHODIMP
+EventSourceImpl::DispatchFromScript(nsIRunnable* aEvent, DispatchFlags aFlags) {
+  nsCOMPtr<nsIRunnable> event(aEvent);
+  return Dispatch(event.forget(), aFlags);
+}
+
+NS_IMETHODIMP
+EventSourceImpl::Dispatch(already_AddRefed<nsIRunnable> aEvent,
+                          DispatchFlags aFlags) {
+  nsCOMPtr<nsIRunnable> event_ref(aEvent);
+  if (mIsMainThread) {
+    return NS_DispatchToMainThread(event_ref.forget(), aFlags);
+  }
+
+  if (mIsShutDown) {
+    return NS_OK;
+  }
+
+  auto workerRef = mWorkerRef.Lock();
+  if (!*workerRef) {
+    return NS_OK;
+  }
+  RefPtr<WorkerRunnableDispatcher> event = new WorkerRunnableDispatcher(
+      this, (*workerRef)->Private(), event_ref.forget());
+
+  if (!event->Dispatch((*workerRef)->Private())) {
+    return NS_ERROR_FAILURE;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+EventSourceImpl::DelayedDispatch(already_AddRefed<nsIRunnable> aEvent,
+                                 uint32_t aDelayMs) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+EventSourceImpl::RegisterShutdownTask(nsITargetShutdownTask*) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+EventSourceImpl::UnregisterShutdownTask(nsITargetShutdownTask*) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+nsIEventTarget::FeatureFlags EventSourceImpl::GetFeatures() {
+  return SUPPORTS_BASE;
+}
+
+NS_IMETHODIMP
+EventSourceImpl::CheckListenerChain() {
+  MOZ_ASSERT(NS_IsMainThread(), "Should be on the main thread!");
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+EventSourceImpl::OnDataFinished(nsresult) { return NS_OK; }
+
+
+EventSource::EventSource(nsIGlobalObject* aGlobal,
+                         nsICookieJarSettings* aCookieJarSettings,
+                         bool aWithCredentials)
+    : DOMEventTargetHelper(aGlobal),
+      mWithCredentials(aWithCredentials),
+      mIsMainThread(NS_IsMainThread()) {
+  MOZ_ASSERT(aGlobal);
+  MOZ_ASSERT(aCookieJarSettings);
+  mESImpl = new EventSourceImpl(this, aCookieJarSettings);
+}
+
+EventSource::~EventSource() = default;
+
+nsresult EventSource::CreateAndDispatchSimpleEvent(const nsAString& aName) {
+  RefPtr<Event> event = NS_NewDOMEvent(this, nullptr, nullptr);
+  event->InitEvent(aName, false, false);
+  event->SetTrusted(true);
+  ErrorResult rv;
+  DispatchEvent(*event, rv);
+  return rv.StealNSResult();
+}
+
+already_AddRefed<EventSource> EventSource::Constructor(
+    const GlobalObject& aGlobal, const nsAString& aURL,
+    const EventSourceInit& aEventSourceInitDict, ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+  if (NS_WARN_IF(!global)) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+
+  nsCOMPtr<nsICookieJarSettings> cookieJarSettings;
+  nsCOMPtr<nsPIDOMWindowInner> ownerWindow = do_QueryInterface(global);
+  if (ownerWindow) {
+    Document* doc = ownerWindow->GetExtantDoc();
+    if (NS_WARN_IF(!doc)) {
+      aRv.Throw(NS_ERROR_FAILURE);
+      return nullptr;
+    }
+
+    cookieJarSettings = doc->CookieJarSettings();
+  } else {
+    WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
+    if (!workerPrivate) {
+      aRv.Throw(NS_ERROR_FAILURE);
+      return nullptr;
+    }
+
+    cookieJarSettings = workerPrivate->CookieJarSettings();
+  }
+
+  RefPtr<EventSource> eventSource = new EventSource(
+      global, cookieJarSettings, aEventSourceInitDict.mWithCredentials);
+
+  if (NS_IsMainThread()) {
+    nsCOMPtr<nsIScriptObjectPrincipal> scriptPrincipal =
+        do_QueryInterface(aGlobal.GetAsSupports());
+    if (!scriptPrincipal) {
+      aRv.Throw(NS_ERROR_FAILURE);
+      return nullptr;
+    }
+    nsCOMPtr<nsIPrincipal> principal = scriptPrincipal->GetPrincipal();
+    if (!principal) {
+      aRv.Throw(NS_ERROR_FAILURE);
+      return nullptr;
+    }
+    eventSource->mESImpl->Init(global, principal, aURL, aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return nullptr;
+    }
+
+    eventSource->mESImpl->InitChannelAndRequestEventSource(true);
+    return eventSource.forget();
+  }
+
+  {
+    auto guardESImpl = MakeScopeExit([&] { eventSource->mESImpl = nullptr; });
+
+    WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
+    MOZ_ASSERT(workerPrivate);
+
+    eventSource->mESImpl->mInnerWindowID = workerPrivate->WindowID();
+    eventSource->mESImpl->mClientInfo =
+        workerPrivate->GlobalScope()->GetClientInfo();
+    eventSource->mESImpl->mController =
+        workerPrivate->GlobalScope()->GetController();
+
+    eventSource->mESImpl->Init(nullptr, workerPrivate->GetPrincipal(), aURL,
+                               aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return nullptr;
+    }
+
+    if (!eventSource->mESImpl->CreateWorkerRef(workerPrivate)) {
+      if (eventSource->mESImpl) {
+        eventSource->mESImpl->Close();
+      }
+      eventSource->mReadyState = EventSourceImpl::CONNECTING;
+
+      guardESImpl.release();
+      return eventSource.forget();
+    }
+
+    RefPtr<ConnectRunnable> connectRunnable =
+        new ConnectRunnable(workerPrivate, eventSource->mESImpl);
+    connectRunnable->Dispatch(workerPrivate, Canceling, aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return nullptr;
+    }
+
+    guardESImpl.release();
+  }
+
+  return eventSource.forget();
+}
+
+JSObject* EventSource::WrapObject(JSContext* aCx,
+                                  JS::Handle<JSObject*> aGivenProto) {
+  return EventSource_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void EventSource::Close() {
+  AssertIsOnTargetThread();
+  if (mESImpl) {
+    mESImpl->Close();
+  }
+}
+
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(EventSource)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(EventSource,
+                                                  DOMEventTargetHelper)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(EventSource,
+                                                DOMEventTargetHelper)
+  if (tmp->mESImpl) {
+    MOZ_ASSERT_UNREACHABLE("Paranoia cleanup that should never happen.");
+    tmp->Close();
+  }
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+bool EventSource::IsCertainlyAliveForCC() const {
+  if (!mESImpl) {
+    return false;
+  }
+  auto lock = mESImpl->mSharedData.Lock();
+  return lock->mEventSource == this;
+}
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(EventSource)
+NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
+
+NS_IMPL_ADDREF_INHERITED(EventSource, DOMEventTargetHelper)
+NS_IMPL_RELEASE_INHERITED(EventSource, DOMEventTargetHelper)
+
+}  

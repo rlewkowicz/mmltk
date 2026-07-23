@@ -1,0 +1,168 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_Promise_h
+#define builtin_Promise_h
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "js/RootingAPI.h"  // JS::{,Mutable}Handle
+#include "js/TypeDecls.h"   // JS::HandleObjectVector
+
+struct JS_PUBLIC_API JSContext;
+class JS_PUBLIC_API JSObject;
+
+namespace JS {
+class CallArgs;
+class Value;
+}  
+
+namespace js {
+
+class AsyncFunctionGeneratorObject;
+class AsyncGeneratorObject;
+class PromiseObject;
+class SavedFrame;
+
+enum class CompletionKind : uint8_t;
+
+enum class PromiseHandler : uint32_t {
+  Identity = 0,
+  Thrower,
+
+  AsyncFunctionAwaitedFulfilled,
+  AsyncFunctionAwaitedRejected,
+
+  AsyncGeneratorAwaitedFulfilled,
+  AsyncGeneratorAwaitedRejected,
+
+  AsyncGeneratorAwaitReturnFulfilled,
+  AsyncGeneratorAwaitReturnRejected,
+
+  AsyncGeneratorYieldReturnAwaitedFulfilled,
+  AsyncGeneratorYieldReturnAwaitedRejected,
+
+  AsyncFromSyncIteratorValueUnwrapDone,
+  AsyncFromSyncIteratorValueUnwrapNotDone,
+
+  AsyncFromSyncIteratorClose,
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  AsyncIteratorDisposeAwaitFulfilled,
+#endif
+
+  Limit
+};
+
+extern bool Promise_then(JSContext* cx, unsigned argc, JS::Value* vp);
+
+extern bool Promise_static_species(JSContext* cx, unsigned argc, JS::Value* vp);
+
+extern bool Promise_static_resolve(JSContext* cx, unsigned argc, JS::Value* vp);
+
+[[nodiscard]] JSObject* GetWaitForAllPromise(JSContext* cx,
+                                             JS::HandleObjectVector promises);
+
+[[nodiscard]] PromiseObject* OriginalPromiseThen(
+    JSContext* cx, JS::Handle<JSObject*> promiseObj,
+    JS::Handle<JSObject*> onFulfilled, JS::Handle<JSObject*> onRejected);
+
+enum class UnhandledRejectionBehavior { Ignore, Report };
+
+[[nodiscard]] extern bool ReactToUnwrappedPromise(
+    JSContext* cx, JS::Handle<PromiseObject*> unwrappedPromise,
+    JS::Handle<JSObject*> onFulfilled_, JS::Handle<JSObject*> onRejected_,
+    UnhandledRejectionBehavior behavior);
+
+[[nodiscard]] JSObject* PromiseResolve(JSContext* cx,
+                                       JS::Handle<JSObject*> constructor,
+                                       JS::Handle<JS::Value> value);
+
+[[nodiscard]] bool RejectPromiseWithPendingError(
+    JSContext* cx, JS::Handle<PromiseObject*> promise);
+
+[[nodiscard]] PromiseObject* CreatePromiseObjectForAsync(JSContext* cx);
+
+[[nodiscard]] bool IsPromiseForAsyncFunctionOrGenerator(JSObject* promise);
+
+[[nodiscard]] bool AsyncFunctionReturned(
+    JSContext* cx, JS::Handle<PromiseObject*> resultPromise,
+    JS::Handle<JS::Value> value);
+
+[[nodiscard]] bool AsyncFunctionThrown(
+    JSContext* cx, JS::Handle<PromiseObject*> resultPromise,
+    JS::Handle<JS::Value> reason,
+    JS::Handle<SavedFrame*> unwrappedRejectionStack = nullptr);
+
+[[nodiscard]] JSObject* AsyncFunctionAwait(
+    JSContext* cx, JS::Handle<AsyncFunctionGeneratorObject*> genObj,
+    JS::Handle<JS::Value> value);
+
+[[nodiscard]] bool CanSkipAwait(JSContext* cx, JS::Handle<JS::Value> val,
+                                bool* canSkip);
+[[nodiscard]] bool ExtractAwaitValue(JSContext* cx, JS::Handle<JS::Value> val,
+                                     JS::MutableHandle<JS::Value> resolved);
+
+bool AsyncFromSyncIteratorMethod(JSContext* cx, JS::CallArgs& args,
+                                 CompletionKind completionKind);
+
+struct PromiseReactionRecordBuilder {
+  [[nodiscard]] virtual bool then(JSContext* cx, JS::Handle<JSObject*> resolve,
+                                  JS::Handle<JSObject*> reject,
+                                  JS::Handle<JSObject*> result) = 0;
+
+  [[nodiscard]] virtual bool direct(
+      JSContext* cx, JS::Handle<PromiseObject*> unwrappedPromise) = 0;
+
+  [[nodiscard]] virtual bool asyncFunction(
+      JSContext* cx,
+      JS::Handle<AsyncFunctionGeneratorObject*> unwrappedGenerator) = 0;
+
+  [[nodiscard]] virtual bool asyncGenerator(
+      JSContext* cx, JS::Handle<AsyncGeneratorObject*> unwrappedGenerator) = 0;
+};
+
+[[nodiscard]] PromiseObject* CreatePromiseObjectForAsyncGenerator(
+    JSContext* cx);
+
+[[nodiscard]] PromiseObject* CreatePromiseObjectWithoutResolutionFunctions(
+    JSContext* cx, int32_t extraFlags = 0);
+
+[[nodiscard]] bool ResolvePromiseInternal(JSContext* cx,
+                                          JS::Handle<JSObject*> promise,
+                                          JS::Handle<JS::Value> resolutionVal);
+[[nodiscard]] bool RejectPromiseInternal(
+    JSContext* cx, JS::Handle<PromiseObject*> promise,
+    JS::Handle<JS::Value> reason,
+    JS::Handle<SavedFrame*> unwrappedRejectionStack = nullptr);
+
+#ifdef NIGHTLY_BUILD
+[[nodiscard]] bool SafeResolvePromise(JSContext* cx,
+                                      JS::Handle<PromiseObject*> promise,
+                                      JS::Handle<JS::Value> resolution);
+#endif  // NIGHTLY_BUILD
+
+[[nodiscard]] bool InternalAsyncGeneratorAwait(
+    JSContext* cx, JS::Handle<AsyncGeneratorObject*> generator,
+    JS::Handle<JS::Value> value, PromiseHandler onFulfilled,
+    PromiseHandler onRejected);
+
+bool IsPromiseWithDefaultResolvingFunction(PromiseObject* promise);
+void SetAlreadyResolvedPromiseWithDefaultResolvingFunction(
+    PromiseObject* promise);
+
+bool IsPromiseConstructor(const JSObject* obj);
+
+bool AbruptRejectPromise(JSContext* cx, JS::CallArgs& args,
+                         JS::Handle<JSObject*> promiseObj,
+                         JS::Handle<JSObject*> reject);
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+[[nodiscard]] bool InternalAsyncIteratorDisposeAwait(
+    JSContext* cx, JS::Handle<JS::Value> value,
+    JS::Handle<JSObject*> resultPromise);
+#endif
+}  
+
+#endif  // builtin_Promise_h

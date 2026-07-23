@@ -1,0 +1,321 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "CSSTransition.h"
+
+#include "mozilla/AnimationEventDispatcher.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/CSSTransitionBinding.h"
+#include "mozilla/dom/KeyframeEffect.h"
+#include "mozilla/dom/KeyframeEffectBinding.h"
+#include "nsPresContext.h"
+
+namespace mozilla::dom {
+
+JSObject* CSSTransition::WrapObject(JSContext* aCx,
+                                    JS::Handle<JSObject*> aGivenProto) {
+  return dom::CSSTransition_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void CSSTransition::GetTransitionProperty(nsString& aRetVal) const {
+  MOZ_ASSERT(mTransitionProperty.IsValid(),
+             "Transition Property should be initialized");
+  mTransitionProperty.ToString(aRetVal);
+}
+
+AnimationPlayState CSSTransition::PlayStateFromJS() const {
+  FlushUnanimatedStyle();
+  return Animation::PlayStateFromJS();
+}
+
+bool CSSTransition::PendingFromJS() const {
+  if (Pending()) {
+    FlushUnanimatedStyle();
+  }
+  return Animation::PendingFromJS();
+}
+
+void CSSTransition::PlayFromJS(ErrorResult& aRv) {
+  FlushUnanimatedStyle();
+  Animation::PlayFromJS(aRv);
+}
+
+void CSSTransition::UpdateTiming(SeekFlag aSeekFlag,
+                                 SyncNotifyFlag aSyncNotifyFlag) {
+  if (mNeedsNewAnimationIndexWhenRun &&
+      PlayState() != AnimationPlayState::Idle) {
+    mAnimationIndex = sNextAnimationIndex++;
+    mNeedsNewAnimationIndexWhenRun = false;
+  }
+
+  Animation::UpdateTiming(aSeekFlag, aSyncNotifyFlag);
+}
+
+void CSSTransition::QueueEvents(const StickyTimeDuration& aActiveTime) {
+  if (!mOwningElement.ShouldFireEvents()) {
+    return;
+  }
+
+  nsPresContext* presContext = mOwningElement.GetPresContext();
+  if (!presContext) {
+    return;
+  }
+
+  static constexpr StickyTimeDuration zeroDuration = StickyTimeDuration();
+
+  TransitionPhase currentPhase;
+  StickyTimeDuration intervalStartTime;
+  StickyTimeDuration intervalEndTime;
+
+  if (!mEffect) {
+    currentPhase = GetAnimationPhaseWithoutEffect<TransitionPhase>(*this);
+  } else {
+    ComputedTiming computedTiming = mEffect->GetComputedTiming();
+
+    currentPhase = static_cast<TransitionPhase>(computedTiming.mPhase);
+    intervalStartTime = IntervalStartTime(computedTiming.mActiveDuration);
+    intervalEndTime = IntervalEndTime(computedTiming.mActiveDuration);
+  }
+
+  if (mPendingState != PendingState::NotPending &&
+      (mPreviousTransitionPhase == TransitionPhase::Idle ||
+       mPreviousTransitionPhase == TransitionPhase::Pending)) {
+    currentPhase = TransitionPhase::Pending;
+  }
+
+  if (currentPhase == mPreviousTransitionPhase) {
+    return;
+  }
+
+  TimeStamp zeroTimeStamp = AnimationTimeToTimeStamp(zeroDuration);
+  TimeStamp startTimeStamp = ElapsedTimeToTimeStamp(intervalStartTime);
+  TimeStamp endTimeStamp = ElapsedTimeToTimeStamp(intervalEndTime);
+
+  AutoTArray<AnimationEventInfo, 3> events;
+
+  auto appendTransitionEvent = [&](EventMessage aMessage,
+                                   const StickyTimeDuration& aElapsedTime,
+                                   const TimeStamp& aScheduledEventTimeStamp) {
+    double elapsedTime = aElapsedTime.ToSeconds();
+    if (aMessage == eTransitionCancel) {
+      elapsedTime = nsRFPService::ReduceTimePrecisionAsSecsRFPOnly(
+          elapsedTime, 0, mRTPCallerType);
+    }
+    events.AppendElement(AnimationEventInfo(
+        TransitionProperty(), mOwningElement.Target(), aMessage, elapsedTime,
+        mAnimationIndex, aScheduledEventTimeStamp, this));
+  };
+
+  if ((mPreviousTransitionPhase != TransitionPhase::Idle &&
+       mPreviousTransitionPhase != TransitionPhase::After) &&
+      currentPhase == TransitionPhase::Idle) {
+    appendTransitionEvent(eTransitionCancel, aActiveTime,
+                          GetTimelineCurrentTimeAsTimeStamp());
+  }
+
+  switch (mPreviousTransitionPhase) {
+    case TransitionPhase::Idle:
+      if (currentPhase == TransitionPhase::Pending ||
+          currentPhase == TransitionPhase::Before) {
+        appendTransitionEvent(eTransitionRun, intervalStartTime,
+                              zeroTimeStamp.IsNull()
+                                  ? GetTimelineCurrentTimeAsTimeStamp()
+                                  : zeroTimeStamp);
+      } else if (currentPhase == TransitionPhase::Active) {
+        appendTransitionEvent(eTransitionRun, intervalStartTime, zeroTimeStamp);
+        appendTransitionEvent(eTransitionStart, intervalStartTime,
+                              startTimeStamp);
+      } else if (currentPhase == TransitionPhase::After) {
+        appendTransitionEvent(eTransitionRun, intervalStartTime, zeroTimeStamp);
+        appendTransitionEvent(eTransitionStart, intervalStartTime,
+                              startTimeStamp);
+        appendTransitionEvent(eTransitionEnd, intervalEndTime, endTimeStamp);
+      }
+      break;
+
+    case TransitionPhase::Pending:
+    case TransitionPhase::Before:
+      if (currentPhase == TransitionPhase::Active) {
+        appendTransitionEvent(eTransitionStart, intervalStartTime,
+                              startTimeStamp);
+      } else if (currentPhase == TransitionPhase::After) {
+        appendTransitionEvent(eTransitionStart, intervalStartTime,
+                              startTimeStamp);
+        appendTransitionEvent(eTransitionEnd, intervalEndTime, endTimeStamp);
+      }
+      break;
+
+    case TransitionPhase::Active:
+      if (currentPhase == TransitionPhase::After) {
+        appendTransitionEvent(eTransitionEnd, intervalEndTime, endTimeStamp);
+      } else if (currentPhase == TransitionPhase::Before) {
+        appendTransitionEvent(eTransitionEnd, intervalStartTime,
+                              startTimeStamp);
+      }
+      break;
+
+    case TransitionPhase::After:
+      if (currentPhase == TransitionPhase::Active) {
+        appendTransitionEvent(eTransitionStart, intervalEndTime,
+                              startTimeStamp);
+      } else if (currentPhase == TransitionPhase::Before) {
+        appendTransitionEvent(eTransitionStart, intervalEndTime,
+                              startTimeStamp);
+        appendTransitionEvent(eTransitionEnd, intervalStartTime, endTimeStamp);
+      }
+      break;
+  }
+  mPreviousTransitionPhase = currentPhase;
+
+  if (!events.IsEmpty()) {
+    presContext->AnimationEventDispatcher()->QueueEvents(std::move(events));
+  }
+}
+
+void CSSTransition::Tick(TickState& aState) {
+  Animation::Tick(aState);
+  QueueEvents();
+}
+
+const CSSPropertyId& CSSTransition::TransitionProperty() const {
+  MOZ_ASSERT(mTransitionProperty.IsValid(),
+             "Transition property should be initialized");
+  return mTransitionProperty;
+}
+
+AnimationValue CSSTransition::ToValue() const {
+  MOZ_ASSERT(!mTransitionToValue.IsNull(),
+             "Transition ToValue should be initialized");
+  return mTransitionToValue;
+}
+
+int32_t CSSTransition::CompareCompositeOrder(
+    const Maybe<EventContext>& aContext, const CSSTransition& aOther,
+    const Maybe<EventContext>& aOtherContext,
+    nsContentUtils::NodeIndexCache& aCache) const {
+  MOZ_ASSERT((IsTiedToMarkup() || aContext) &&
+                 (aOther.IsTiedToMarkup() || aOtherContext),
+             "Should only be called for CSS transitions that are sorted "
+             "as CSS transitions (i.e. tied to CSS markup) or with overridden "
+             "target and animation index");
+
+  if (&aOther == this) {
+    return 0;
+  }
+
+  const OwningElementRef& owningElement1 =
+      IsTiedToMarkup() ? mOwningElement : OwningElementRef(aContext->mTarget);
+  const OwningElementRef& owningElement2 =
+      aOther.IsTiedToMarkup() ? aOther.mOwningElement
+                              : OwningElementRef(aOtherContext->mTarget);
+  if (!owningElement1.Equals(owningElement2)) {
+    return owningElement1.Compare(owningElement2, aCache);
+  }
+
+  const uint64_t index1 = IsTiedToMarkup() ? mAnimationIndex : aContext->mIndex;
+  const uint64_t index2 =
+      aOther.IsTiedToMarkup() ? aOther.mAnimationIndex : aOtherContext->mIndex;
+  if (index1 != index2) {
+    return index1 < index2 ? -1 : 1;
+  }
+
+  if (mTransitionProperty == aOther.mTransitionProperty) {
+    return 0;
+  }
+  nsAutoString name, otherName;
+  GetTransitionProperty(name);
+  aOther.GetTransitionProperty(otherName);
+  return name < otherName ? -1 : 1;
+}
+
+Nullable<TimeDuration> CSSTransition::GetCurrentTimeAt(
+    const AnimationTimeline& aTimeline, const TimeStamp& aBaseTime,
+    const TimeDuration& aStartTime, double aPlaybackRate) {
+  Nullable<TimeDuration> result;
+
+  Nullable<TimeDuration> timelineTime = aTimeline.ToTimelineTime(aBaseTime);
+  if (!timelineTime.IsNull()) {
+    result.SetValue(
+        (timelineTime.Value() - aStartTime).MultDouble(aPlaybackRate));
+  }
+
+  return result;
+}
+
+double CSSTransition::CurrentValuePortion() const {
+  if (!GetEffect()) {
+    return 0.0;
+  }
+
+  TimingParams timingToUse = GetEffect()->SpecifiedTiming();
+  timingToUse.SetFill(dom::FillMode::Both);
+  ComputedTiming computedTiming = GetEffect()->GetComputedTiming(&timingToUse);
+
+  if (computedTiming.mProgress.IsNull()) {
+    return 0.0;
+  }
+
+  return computedTiming.mProgress.Value();
+}
+
+bool CSSTransition::UpdateStartValueFromReplacedTransition() {
+  MOZ_ASSERT(mEffect && mEffect->AsKeyframeEffect() &&
+                 mEffect->AsKeyframeEffect()->HasAnimationOfPropertySet(
+                     nsCSSPropertyIDSet::CompositorAnimatables()),
+             "Should be called for compositor-runnable transitions");
+
+  if (!mReplacedTransition) {
+    return false;
+  }
+
+  MOZ_ASSERT(mTimeline,
+             "Should have a timeline if we are replacing transition start "
+             "values");
+
+  if (Maybe<double> valuePosition =
+          ComputeTransformedProgress(*mTimeline, *mReplacedTransition)) {
+    const AnimationValue& replacedFrom = mReplacedTransition->mFromValue;
+    const AnimationValue& replacedTo = mReplacedTransition->mToValue;
+    AnimationValue startValue;
+    startValue.mServo =
+        Servo_AnimationValues_Interpolate(replacedFrom.mServo,
+                                          replacedTo.mServo, *valuePosition)
+            .Consume();
+
+    mEffect->AsKeyframeEffect()->ReplaceTransitionStartValue(
+        std::move(startValue));
+  }
+
+  mReplacedTransition.reset();
+
+  return true;
+}
+
+Maybe<double> CSSTransition::ComputeTransformedProgress(
+    const AnimationTimeline& aTimeline,
+    const ReplacedTransitionProperties& aProperties) {
+  ComputedTiming computedTiming = AnimationEffect::GetComputedTimingAt(
+      CSSTransition::GetCurrentTimeAt(aTimeline, TimeStamp::Now(),
+                                      aProperties.mStartTime,
+                                      aProperties.mPlaybackRate),
+      aProperties.mTiming, aProperties.mPlaybackRate,
+      Animation::ProgressTimelinePosition::NotBoundary);
+  if (computedTiming.mProgress.IsNull()) {
+    return Nothing();
+  }
+
+  return Some(StyleComputedTimingFunction::GetPortion(
+      aProperties.mTimingFunction, computedTiming.mProgress.Value(),
+      computedTiming.mBeforeFlag));
+}
+
+void CSSTransition::SetEffectFromStyle(KeyframeEffect* aEffect) {
+  MOZ_ASSERT(aEffect->IsValidTransition());
+
+  Animation::SetEffectNoUpdate(aEffect);
+  mTransitionProperty = aEffect->Properties()[0].mProperty;
+  mTransitionToValue = aEffect->Properties()[0].mSegments[0].mToValue;
+}
+
+}  

@@ -1,0 +1,332 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include "mar_private.h"
+#include "mar.h"
+#include "cryptox.h"
+
+static bool CryptoX_Failed(CryptoX_Result status) {
+  return status != CryptoX_Success;
+}
+
+int mar_read_entire_file(const char* filePath, uint32_t maxSize,
+                          const uint8_t** data,
+                          uint32_t* size) {
+  int result;
+  FILE* f;
+
+  if (!filePath || !data || !size) {
+    return -1;
+  }
+
+  f = fopen(filePath, "rb");
+  if (!f) {
+    return -1;
+  }
+
+  result = -1;
+  if (!fseeko(f, 0, SEEK_END)) {
+    int64_t fileSize = ftello(f);
+    if (fileSize > 0 && fileSize <= maxSize && !fseeko(f, 0, SEEK_SET)) {
+      unsigned char* fileData;
+
+      *size = (unsigned int)fileSize;
+      fileData = malloc(*size);
+      if (fileData) {
+        if (fread(fileData, *size, 1, f) == 1) {
+          *data = fileData;
+          result = 0;
+        } else {
+          free(fileData);
+        }
+      }
+    }
+  }
+
+  fclose(f);
+
+  return result;
+}
+
+int mar_extract_and_verify_signatures(MarFile* mar,
+                                      CryptoX_ProviderHandle provider,
+                                      CryptoX_PublicKey* keys,
+                                      uint32_t keyCount);
+int mar_verify_extracted_signatures(MarFile* mar,
+                                    CryptoX_ProviderHandle provider,
+                                    CryptoX_PublicKey* keys,
+                                    const uint8_t* const* extractedSignatures,
+                                    uint32_t keyCount, uint32_t* numVerified);
+
+CryptoX_Result ReadAndUpdateVerifyContext(MarFile* mar, size_t* mar_position,
+                                          void* buffer, uint32_t size,
+                                          CryptoX_SignatureHandle* ctxs,
+                                          uint32_t count, const char* err) {
+  uint32_t k;
+  if (!mar || !mar_position || !buffer || !ctxs || count == 0 || !err) {
+    fprintf(stderr, "ERROR: Invalid parameter specified.\n");
+    return CryptoX_Error;
+  }
+
+  if (!size) {
+    return CryptoX_Success;
+  }
+
+  if (mar_read_buffer(mar, buffer, mar_position, size) != 0) {
+    fprintf(stderr, "ERROR: Could not read %s\n", err);
+    return CryptoX_Error;
+  }
+
+  for (k = 0; k < count; k++) {
+    if (CryptoX_Failed(CryptoX_VerifyUpdate(&ctxs[k], buffer, size))) {
+      fprintf(stderr, "ERROR: Could not update verify context for %s\n", err);
+      return CryptoX_Error;
+    }
+  }
+  return CryptoX_Success;
+}
+
+int mar_verify_signatures(MarFile* mar, const uint8_t* const* certData,
+                          const uint32_t* certDataSizes, uint32_t certCount) {
+  int rv = -1;
+  CryptoX_ProviderHandle provider = CryptoX_InvalidHandleValue;
+  CryptoX_PublicKey keys[MAX_SIGNATURES];
+  uint32_t k;
+
+  memset(keys, 0, sizeof(keys));
+
+  if (!mar || !certData || !certDataSizes || certCount == 0) {
+    fprintf(stderr, "ERROR: Invalid parameter specified.\n");
+    goto failure;
+  }
+
+  if (CryptoX_Failed(CryptoX_InitCryptoProvider(&provider))) {
+    fprintf(stderr, "ERROR: Could not init crypto library.\n");
+    goto failure;
+  }
+
+  for (k = 0; k < certCount; ++k) {
+    if (CryptoX_Failed(CryptoX_LoadPublicKey(provider, certData[k],
+                                             certDataSizes[k], &keys[k]))) {
+      fprintf(stderr, "ERROR: Could not load public key.\n");
+      goto failure;
+    }
+  }
+
+  rv = mar_extract_and_verify_signatures(mar, provider, keys, certCount);
+
+failure:
+
+  for (k = 0; k < certCount; ++k) {
+    if (keys[k]) {
+      CryptoX_FreePublicKey(&keys[k]);
+    }
+  }
+
+  return rv;
+}
+
+int mar_extract_and_verify_signatures(MarFile* mar,
+                                      CryptoX_ProviderHandle provider,
+                                      CryptoX_PublicKey* keys,
+                                      uint32_t keyCount) {
+  uint32_t signatureCount, signatureLen, numVerified = 0;
+  uint32_t signatureAlgorithmIDs[MAX_SIGNATURES];
+  uint8_t* extractedSignatures[MAX_SIGNATURES];
+  uint32_t i;
+  size_t mar_position = 0;
+
+  memset(signatureAlgorithmIDs, 0, sizeof(signatureAlgorithmIDs));
+  memset(extractedSignatures, 0, sizeof(extractedSignatures));
+
+  if (!mar) {
+    fprintf(stderr, "ERROR: Invalid file pointer passed.\n");
+    return CryptoX_Error;
+  }
+
+  if (mar_buffer_seek(mar, &mar_position, SIGNATURE_BLOCK_OFFSET) != 0) {
+    fprintf(stderr, "ERROR: Could not seek to the signature block.\n");
+    return CryptoX_Error;
+  }
+
+  if (mar_read_buffer(mar, &signatureCount, &mar_position,
+                      sizeof(signatureCount)) != 0) {
+    fprintf(stderr, "ERROR: Could not read number of signatures.\n");
+    return CryptoX_Error;
+  }
+  signatureCount = ntohl(signatureCount);
+
+  if (signatureCount > MAX_SIGNATURES) {
+    fprintf(stderr, "ERROR: At most %d signatures can be specified.\n",
+            MAX_SIGNATURES);
+    return CryptoX_Error;
+  }
+
+  for (i = 0; i < signatureCount; i++) {
+    if (mar_read_buffer(mar, &signatureAlgorithmIDs[i], &mar_position,
+                        sizeof(uint32_t)) != 0) {
+      fprintf(stderr, "ERROR: Could not read signatures algorithm ID.\n");
+      return CryptoX_Error;
+    }
+    signatureAlgorithmIDs[i] = ntohl(signatureAlgorithmIDs[i]);
+
+    if (mar_read_buffer(mar, &signatureLen, &mar_position, sizeof(uint32_t)) !=
+        0) {
+      fprintf(stderr, "ERROR: Could not read signatures length.\n");
+      return CryptoX_Error;
+    }
+    signatureLen = ntohl(signatureLen);
+
+    if (signatureLen > MAX_SIGNATURE_LENGTH) {
+      fprintf(stderr, "ERROR: Signature length is too large to verify.\n");
+      return CryptoX_Error;
+    }
+
+    extractedSignatures[i] = malloc(signatureLen);
+    if (!extractedSignatures[i]) {
+      fprintf(stderr, "ERROR: Could not allocate buffer for signature.\n");
+      return CryptoX_Error;
+    }
+    if (mar_read_buffer(mar, extractedSignatures[i], &mar_position,
+                        signatureLen) != 0) {
+      fprintf(stderr, "ERROR: Could not read extracted signature.\n");
+      for (i = 0; i < signatureCount; ++i) {
+        free(extractedSignatures[i]);
+      }
+      return CryptoX_Error;
+    }
+
+    if (signatureAlgorithmIDs[i] != 2) {
+      fprintf(stderr, "ERROR: Unknown signature algorithm ID.\n");
+      for (i = 0; i < signatureCount; ++i) {
+        free(extractedSignatures[i]);
+      }
+      return CryptoX_Error;
+    }
+  }
+
+  if (mar_verify_extracted_signatures(
+          mar, provider, keys, (const uint8_t* const*)extractedSignatures,
+          signatureCount, &numVerified) == CryptoX_Error) {
+    return CryptoX_Error;
+  }
+  for (i = 0; i < signatureCount; ++i) {
+    free(extractedSignatures[i]);
+  }
+
+  if (numVerified == signatureCount && keyCount == numVerified) {
+    return CryptoX_Success;
+  }
+
+  if (numVerified == 0) {
+    fprintf(stderr, "ERROR: Not all signatures were verified.\n");
+  } else {
+    fprintf(stderr, "ERROR: Only %d of %d signatures were verified.\n",
+            numVerified, signatureCount);
+  }
+  return CryptoX_Error;
+}
+
+CryptoX_Result mar_verify_extracted_signatures(
+    MarFile* mar, CryptoX_ProviderHandle provider, CryptoX_PublicKey* keys,
+    const uint8_t* const* extractedSignatures, uint32_t signatureCount,
+    uint32_t* numVerified) {
+  CryptoX_SignatureHandle signatureHandles[MAX_SIGNATURES];
+  char buf[BLOCKSIZE];
+  uint32_t signatureLengths[MAX_SIGNATURES];
+  uint32_t i;
+  int rv = CryptoX_Error;
+  size_t mar_position = 0;
+
+  memset(signatureHandles, 0, sizeof(signatureHandles));
+  memset(signatureLengths, 0, sizeof(signatureLengths));
+
+  if (!extractedSignatures || !numVerified) {
+    fprintf(stderr, "ERROR: Invalid parameter specified.\n");
+    goto failure;
+  }
+
+  *numVerified = 0;
+
+  if (!signatureCount) {
+    fprintf(stderr, "ERROR: There must be at least one signature.\n");
+    goto failure;
+  }
+
+  for (i = 0; i < signatureCount; i++) {
+    if (CryptoX_Failed(
+            CryptoX_VerifyBegin(provider, &signatureHandles[i], &keys[i]))) {
+      fprintf(stderr, "ERROR: Could not initialize signature handle.\n");
+      goto failure;
+    }
+  }
+
+  if (CryptoX_Failed(ReadAndUpdateVerifyContext(
+          mar, &mar_position, buf, SIGNATURE_BLOCK_OFFSET + sizeof(uint32_t),
+          signatureHandles, signatureCount, "signature block"))) {
+    goto failure;
+  }
+
+  for (i = 0; i < signatureCount; i++) {
+    if (CryptoX_Failed(ReadAndUpdateVerifyContext(
+            mar, &mar_position, &buf, sizeof(uint32_t), signatureHandles,
+            signatureCount, "signature algorithm ID"))) {
+      goto failure;
+    }
+
+    if (CryptoX_Failed(ReadAndUpdateVerifyContext(
+            mar, &mar_position, &signatureLengths[i], sizeof(uint32_t),
+            signatureHandles, signatureCount, "signature length"))) {
+      goto failure;
+    }
+    signatureLengths[i] = ntohl(signatureLengths[i]);
+    if (signatureLengths[i] > MAX_SIGNATURE_LENGTH) {
+      fprintf(stderr, "ERROR: Embedded signature length is too large.\n");
+      goto failure;
+    }
+
+    if (mar_buffer_seek(mar, &mar_position, signatureLengths[i]) != 0) {
+      fprintf(stderr, "ERROR: Could not seek past signature.\n");
+      goto failure;
+    }
+  }
+
+  while (mar_position < mar->data_len) {
+    int numRead = mar_read_buffer_max(mar, buf, &mar_position, BLOCKSIZE);
+    for (i = 0; i < signatureCount; i++) {
+      if (CryptoX_Failed(
+              CryptoX_VerifyUpdate(&signatureHandles[i], buf, numRead))) {
+        fprintf(stderr,
+                "ERROR: Error updating verify context with"
+                " data block.\n");
+        goto failure;
+      }
+    }
+  }
+
+  for (i = 0; i < signatureCount; i++) {
+    if (CryptoX_Failed(CryptoX_VerifySignature(&signatureHandles[i], &keys[i],
+                                               extractedSignatures[i],
+                                               signatureLengths[i]))) {
+      fprintf(stderr, "ERROR: Error verifying signature.\n");
+      goto failure;
+    }
+    ++*numVerified;
+  }
+
+  rv = CryptoX_Success;
+failure:
+  for (i = 0; i < signatureCount; i++) {
+    CryptoX_FreeSignatureHandle(&signatureHandles[i]);
+  }
+
+  return rv;
+}

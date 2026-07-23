@@ -1,0 +1,93 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_loader_ImportMap_h
+#define js_loader_ImportMap_h
+
+#include <functional>
+#include <map>
+
+#include "js/SourceText.h"
+#include "mozilla/Logging.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "ResolveResult.h"
+
+struct JSContext;
+class nsIScriptElement;
+class nsIURI;
+
+namespace JS::loader {
+class ModuleLoaderBase;
+class ScriptFetchInfo;
+class ScriptLoadRequest;
+class ScriptLoaderInterface;
+
+class ReportWarningHelper {
+ public:
+  ReportWarningHelper(ScriptLoaderInterface* aLoader,
+                      ScriptLoadRequest* aRequest)
+      : mLoader(aLoader), mRequest(aRequest) {}
+
+  template <typename... Args>
+  void Report(const char* aMessageName, Args&&... aArgs) const;
+
+ private:
+  RefPtr<ScriptLoaderInterface> mLoader;
+  ScriptLoadRequest* mRequest;
+};
+
+using SpecifierMap = std::map<nsString, nsCOMPtr<nsIURI>, std::greater<>>;
+
+using ScopeMap =
+    std::map<nsCString, mozilla::UniquePtr<SpecifierMap>, std::greater<>>;
+
+using IntegrityMap = std::map<nsCString, nsString, std::greater<>>;
+
+class ImportMap {
+ public:
+  ImportMap(mozilla::UniquePtr<SpecifierMap> aImports,
+            mozilla::UniquePtr<ScopeMap> aScopes,
+            mozilla::UniquePtr<IntegrityMap> aIntegrity)
+      : mImports(aImports ? std::move(aImports)
+                          : mozilla::MakeUnique<SpecifierMap>()),
+        mScopes(aScopes ? std::move(aScopes) : mozilla::MakeUnique<ScopeMap>()),
+        mIntegrity(aIntegrity ? std::move(aIntegrity)
+                              : mozilla::MakeUnique<IntegrityMap>()) {}
+
+  static mozilla::UniquePtr<ImportMap> CreateEmpty() {
+    return mozilla::MakeUnique<ImportMap>(nullptr, nullptr, nullptr);
+  }
+
+  static bool IsMultipleImportMapsSupported();
+
+  static mozilla::UniquePtr<ImportMap> ParseString(
+      JSContext* aCx, SourceText<char16_t>& aInput, nsIURI* aBaseURL,
+      const ReportWarningHelper& aWarning);
+
+  static ResolveResult ResolveModuleSpecifier(ImportMap* aImportMap,
+                                              ScriptLoaderInterface* aLoader,
+                                              ScriptFetchInfo* aFetchInfo,
+                                              const nsAString& aSpecifier);
+
+  static mozilla::Maybe<nsString> LookupIntegrity(ImportMap* aImportMap,
+                                                  nsIURI* aURL);
+
+  static void Merge(ModuleLoaderBase* aModuleLoader,
+                    mozilla::UniquePtr<ImportMap> aNewMap,
+                    const ReportWarningHelper& aWarning);
+
+  static mozilla::LazyLogModule gImportMapLog;
+
+ private:
+  mozilla::UniquePtr<SpecifierMap> mImports;
+  mozilla::UniquePtr<ScopeMap> mScopes;
+  mozilla::UniquePtr<IntegrityMap> mIntegrity;
+};
+
+}  
+
+#endif  // js_loader_ImportMap_h

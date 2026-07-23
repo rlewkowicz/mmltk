@@ -1,0 +1,246 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(nsIOService_h_)
+#define nsIOService_h_
+
+#include "nsStringFwd.h"
+#include "nsIIOService.h"
+#include "nsTArray.h"
+#include "nsCOMPtr.h"
+#include "nsIObserver.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsILoadInfo.h"
+#include "nsINetUtil.h"
+#include "nsIChannelEventSink.h"
+#include "nsCategoryCache.h"
+#include "nsISpeculativeConnect.h"
+#include "nsWeakReference.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/RWLock.h"
+#include "mozilla/net/ProtocolHandlerInfo.h"
+#include "prtime.h"
+#include "nsICaptivePortalService.h"
+#include "nsIObserverService.h"
+#include "nsTHashSet.h"
+#include "nsWeakReference.h"
+#include "nsNetCID.h"
+#include "SimpleURIUnknownSchemes.h"
+
+#define NS_IPC_IOSERVICE_SET_OFFLINE_TOPIC "ipc:network:set-offline"
+#define NS_IPC_IOSERVICE_SET_CONNECTIVITY_TOPIC "ipc:network:set-connectivity"
+
+class nsINetworkLinkService;
+class nsIPrefBranch;
+class nsIProtocolProxyService2;
+class nsIProxyInfo;
+class nsPISocketTransportService;
+namespace mozilla {
+class MemoryReportingProcess;
+namespace net {
+class NeckoChild;
+class nsAsyncRedirectVerifyHelper;
+class SocketProcessHost;
+class SocketProcessMemoryReporter;
+union NetAddr;
+
+class nsIOService final : public nsIIOService,
+                          public nsIObserver,
+                          public nsINetUtil,
+                          public nsISpeculativeConnect,
+                          public nsSupportsWeakReference,
+                          public nsIIOServiceInternal,
+                          public nsIObserverService {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIIOSERVICE
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSINETUTIL
+  NS_DECL_NSISPECULATIVECONNECT
+  NS_DECL_NSIIOSERVICEINTERNAL
+  NS_DECL_NSIOBSERVERSERVICE
+
+  static already_AddRefed<nsIOService> GetInstance();
+
+  nsresult Init();
+  nsresult NewURI(const char* aSpec, nsIURI* aBaseURI, nsIURI** result,
+                  nsIProtocolHandler** hdlrResult);
+
+  nsresult AsyncOnChannelRedirect(nsIChannel* oldChan, nsIChannel* newChan,
+                                  uint32_t flags,
+                                  nsAsyncRedirectVerifyHelper* helper);
+
+  bool IsOffline() { return mOffline; }
+  bool InSleepMode() { return mInSleepMode; }
+  PRIntervalTime LastOfflineStateChange() { return mLastOfflineStateChange; }
+  PRIntervalTime LastConnectivityChange() { return mLastConnectivityChange; }
+  PRIntervalTime LastNetworkLinkChange() { return mLastNetworkLinkChange; }
+  bool IsNetTearingDown() {
+    return mShutdown || mOfflineForProfileChange ||
+           mHttpHandlerAlreadyShutingDown;
+  }
+  PRIntervalTime NetTearingDownStarted() { return mNetTearingDownStarted; }
+
+  void SetHttpHandlerAlreadyShutingDown();
+
+  bool IsLinkUp();
+
+  static already_AddRefed<nsIURI> CreateExposableURI(nsIURI*);
+
+  nsresult RecheckCaptivePortal();
+
+  void OnProcessLaunchComplete(SocketProcessHost* aHost, bool aSucceeded);
+  void OnProcessUnexpectedShutdown(SocketProcessHost* aHost);
+  bool SocketProcessReady();
+  static void NotifySocketProcessPrefsChanged(const char* aName, void* aSelf);
+  void NotifySocketProcessPrefsChanged(const char* aName);
+  static bool UseSocketProcess(bool aCheckAgain = false);
+
+  bool IsSocketProcessLaunchComplete();
+
+  void CallOrWaitForSocketProcess(const std::function<void()>& aFunc);
+
+  int32_t SocketProcessPid();
+  SocketProcessHost* SocketProcess() { return mSocketProcess; }
+
+  friend SocketProcessMemoryReporter;
+  RefPtr<MemoryReportingProcess> GetSocketProcessMemoryReporter();
+
+  ProtocolHandlerInfo LookupProtocolHandler(const nsACString& aScheme);
+
+  static void OnTLSPrefChange(const char* aPref, void* aSelf);
+
+  nsresult LaunchSocketProcess();
+
+  static bool TooManySocketProcessCrash();
+  static void IncreaseSocketProcessCrashCount();
+
+  bool GetFallbackDomain(const nsACString& aDomain,
+                         nsACString& aFallbackDomain);
+
+  NS_IMETHODIMP GetOverridenIpAddressSpace(
+      nsILoadInfo::IPAddressSpace* aIpAddressSpace, const NetAddr& aAddr);
+
+  bool ShouldSkipDomainForLNA(const nsACString& aDomain);
+
+ private:
+  nsIOService();
+  ~nsIOService();
+  nsresult SetConnectivityInternal(bool aConnectivity);
+
+  nsresult OnNetworkLinkEvent(const char* data);
+
+  nsresult InitializeCaptivePortalService();
+  nsresult RecheckCaptivePortalIfLocalRedirect(nsIChannel* newChan);
+
+  static void PrefsChanged(const char* pref, void* self);
+  void PrefsChanged(const char* pref = nullptr);
+  void ParsePortList(const char* pref, bool remove);
+
+  nsresult InitializeSocketTransportService();
+  nsresult InitializeNetworkLinkService();
+  nsresult InitializeProtocolProxyService();
+
+  void LookupProxyInfo(nsIURI* aURI, nsIURI* aProxyURI, uint32_t aProxyFlags,
+                       nsCString* aScheme, nsIProxyInfo** outPI);
+
+  nsresult NewChannelFromURIWithProxyFlagsInternal(
+      nsIURI* aURI, nsIURI* aProxyURI, uint32_t aProxyFlags,
+      nsINode* aLoadingNode, nsIPrincipal* aLoadingPrincipal,
+      nsIPrincipal* aTriggeringPrincipal,
+      const mozilla::Maybe<mozilla::dom::ClientInfo>& aLoadingClientInfo,
+      const mozilla::Maybe<mozilla::dom::ServiceWorkerDescriptor>& aController,
+      uint32_t aSecurityFlags, nsContentPolicyType aContentPolicyType,
+      uint32_t aSandboxFlags, nsIChannel** result);
+
+  nsresult NewChannelFromURIWithProxyFlagsInternal(nsIURI* aURI,
+                                                   nsIURI* aProxyURI,
+                                                   uint32_t aProxyFlags,
+                                                   nsILoadInfo* aLoadInfo,
+                                                   nsIChannel** result);
+
+  nsresult SpeculativeConnectInternal(
+      nsIURI* aURI, nsIPrincipal* aPrincipal,
+      Maybe<OriginAttributes>&& aOriginAttributes,
+      nsIInterfaceRequestor* aCallbacks, bool aAnonymous);
+
+  void DestroySocketProcess();
+
+  nsresult SetOfflineInternal(bool offline, bool notifySocketProcess = true);
+
+  bool UsesExternalProtocolHandler(const nsACString& aScheme)
+      MOZ_REQUIRES_SHARED(mLock);
+
+  void UpdateAddressSpaceOverrideList(const char* aPrefName,
+                                      nsTArray<nsCString>& aTargetList);
+  void UpdateSkipDomainsList();
+
+ private:
+  mozilla::Atomic<bool, mozilla::Relaxed> mOffline{true};
+  mozilla::Atomic<bool, mozilla::Relaxed> mOfflineForProfileChange{false};
+  bool mManageLinkStatus{false};
+  mozilla::Atomic<bool, mozilla::Relaxed> mConnectivity{true};
+
+  bool mSettingOffline{false};
+  bool mSetOfflineValue{false};
+
+  bool mSocketProcessLaunchComplete{false};
+
+  mozilla::Atomic<bool, mozilla::Relaxed> mShutdown{false};
+  mozilla::Atomic<bool, mozilla::Relaxed> mHttpHandlerAlreadyShutingDown{false};
+  mozilla::Atomic<bool, mozilla::Relaxed> mInSleepMode{false};
+
+  nsCOMPtr<nsPISocketTransportService> mSocketTransportService;
+  nsCOMPtr<nsICaptivePortalService> mCaptivePortalService;
+  nsCOMPtr<nsINetworkLinkService> mNetworkLinkService;
+  bool mNetworkLinkServiceInitialized{false};
+
+  nsCategoryCache<nsIChannelEventSink> mChannelEventSinks{
+      NS_CHANNEL_EVENT_SINK_CATEGORY};
+
+  RWLock mLock{"nsIOService::mLock"};
+  nsTArray<int32_t> mRestrictedPortList MOZ_GUARDED_BY(mLock);
+  nsTArray<nsCString> mForceExternalSchemes MOZ_GUARDED_BY(mLock);
+
+  nsTArray<nsCString> mPublicAddressSpaceOverridesList MOZ_GUARDED_BY(mLock);
+  nsTArray<nsCString> mPrivateAddressSpaceOverridesList MOZ_GUARDED_BY(mLock);
+  nsTArray<nsCString> mLocalAddressSpaceOverrideList MOZ_GUARDED_BY(mLock);
+  nsTArray<nsCString> mLNASkipDomainsList MOZ_GUARDED_BY(mLock);
+
+  nsTHashMap<nsCString, RuntimeProtocolHandler> mRuntimeProtocolHandlers
+      MOZ_GUARDED_BY(mLock);
+
+  static uint32_t sSocketProcessCrashedCount;
+
+  mozilla::Atomic<PRIntervalTime> mLastOfflineStateChange;
+  mozilla::Atomic<PRIntervalTime> mLastConnectivityChange;
+  mozilla::Atomic<PRIntervalTime> mLastNetworkLinkChange;
+
+  mozilla::Atomic<PRIntervalTime> mNetTearingDownStarted{0};
+
+  SocketProcessHost* mSocketProcess{nullptr};
+
+  nsTArray<std::function<void()>> mPendingEvents;
+
+  nsTHashSet<nsCString> mObserverTopicForSocketProcess;
+  nsTHashSet<nsCString> mSocketProcessTopicBlockedList;
+  nsTHashSet<nsCString> mIOServiceTopicList;
+
+  nsCOMPtr<nsIObserverService> mObserverService;
+
+  SimpleURIUnknownSchemes mSimpleURIUnknownSchemes;
+
+  nsTHashMap<nsCStringHashKey, nsCString> mEssentialDomainMapping;
+
+ public:
+  static uint32_t gDefaultSegmentSize;
+  static uint32_t gDefaultSegmentCount;
+};
+
+extern nsIOService* gIOService;
+
+}  
+}  
+
+#endif

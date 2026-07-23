@@ -1,0 +1,85 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HTMLSelectedContentElement.h"
+
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/BindContext.h"
+#include "mozilla/dom/HTMLOptionElement.h"
+#include "mozilla/dom/HTMLSelectElement.h"
+#include "mozilla/dom/HTMLSelectedContentElementBinding.h"
+#include "nsGenericHTMLElement.h"
+
+nsGenericHTMLElement* NS_NewHTMLSelectedContentElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,
+    mozilla::dom::FromParser aFromParser) {
+  if (!mozilla::StaticPrefs::dom_select_customizable_select_enabled()) {
+    return NS_NewHTMLElement(std::move(aNodeInfo), aFromParser);
+  }
+  RefPtr<mozilla::dom::NodeInfo> nodeInfo(aNodeInfo);
+  auto* nim = nodeInfo->NodeInfoManager();
+  MOZ_ASSERT(nim);
+  return new (nim) mozilla::dom::HTMLSelectedContentElement(nodeInfo.forget());
+}
+
+namespace mozilla::dom {
+
+HTMLSelectedContentElement::HTMLSelectedContentElement(
+    already_AddRefed<class NodeInfo> aNodeInfo)
+    : nsGenericHTMLElement(std::move(aNodeInfo)) {}
+
+HTMLSelectedContentElement::~HTMLSelectedContentElement() = default;
+
+NS_IMPL_ELEMENT_CLONE(HTMLSelectedContentElement)
+
+JSObject* HTMLSelectedContentElement::WrapNode(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return HTMLSelectedContentElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void HTMLSelectedContentElement::ClearContent() {
+  if (mDisabled) {
+    return;
+  }
+  ReplaceChildren(nullptr, IgnoreErrors());
+}
+
+nsresult HTMLSelectedContentElement::BindToTree(BindContext& aContext,
+                                                nsINode& aParent) {
+  nsresult rv = nsGenericHTMLElement::BindToTree(aContext, aParent);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+
+  HTMLSelectElement* nearestSelectAncestor = nullptr;
+
+  SetDisabled(false);
+
+  for (nsINode* ancestor = &aParent; ancestor;
+       ancestor = ancestor->GetParent()) {
+    if (auto* select = HTMLSelectElement::FromNode(ancestor)) {
+      if (!nearestSelectAncestor) {
+        nearestSelectAncestor = select;
+        continue;
+      }
+      SetDisabled(true);
+      break;
+    }
+
+    if (ancestor->IsAnyOfHTMLElements(nsGkAtoms::option,
+                                      nsGkAtoms::selectedcontent)) {
+      SetDisabled(true);
+      break;
+    }
+  }
+
+
+  if (aContext.InComposedDoc() && nearestSelectAncestor && !mDisabled &&
+      !nearestSelectAncestor->Multiple()) {
+    nearestSelectAncestor->ScheduleSelectedContentUpdateScriptRunner();
+  }
+
+  return NS_OK;
+}
+
+}  

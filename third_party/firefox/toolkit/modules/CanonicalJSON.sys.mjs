@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+export var CanonicalJSON = {
+  stringify: function stringify(source, jsescFn) {
+    if (typeof jsescFn != "function") {
+      const { jsesc } = ChromeUtils.importESModule(
+        "resource://gre/modules/third_party/jsesc/jsesc.mjs"
+      );
+      jsescFn = jsesc;
+    }
+    if (Array.isArray(source)) {
+      const jsonArray = source.map(x => (typeof x === "undefined" ? null : x));
+      return (
+        "[" + jsonArray.map(item => stringify(item, jsescFn)).join(",") + "]"
+      );
+    }
+
+    if (typeof source === "number") {
+      if (source === 0) {
+        return Object.is(source, -0) ? "-0" : "0";
+      }
+    }
+
+    const toJSON = input => jsescFn(input, { lowercaseHex: true, json: true });
+
+    if (typeof source !== "object" || source === null) {
+      return toJSON(source);
+    }
+
+    const sortedKeys = Object.keys(source).sort();
+    const lastIndex = sortedKeys.length - 1;
+    return (
+      sortedKeys.reduce((serial, key, index) => {
+        const value = source[key];
+        if (typeof value === "undefined") {
+          return serial;
+        }
+        const jsonValue = value && value.toJSON ? value.toJSON() : value;
+        const suffix = index !== lastIndex ? "," : "";
+        const escapedKey = toJSON(key);
+        return (
+          serial + escapedKey + ":" + stringify(jsonValue, jsescFn) + suffix
+        );
+      }, "{") + "}"
+    );
+  },
+};

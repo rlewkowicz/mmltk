@@ -1,0 +1,214 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/AppShutdown.h"
+#include "mozilla/IdlePeriodState.h"
+#include "mozilla/StaticPrefs_idle_period.h"
+#include "mozilla/ipc/IdleSchedulerChild.h"
+#include "mozilla/dom/ContentChild.h"
+#include "nsIIdlePeriod.h"
+#include "nsThreadManager.h"
+#include "nsXPCOM.h"
+#include "nsXULAppAPI.h"
+
+static uint64_t sIdleRequestCounter = 0;
+
+namespace mozilla {
+
+IdlePeriodState::IdlePeriodState(already_AddRefed<nsIIdlePeriod> aIdlePeriod)
+    : mIdlePeriod(aIdlePeriod) {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "Why are we touching idle state off the main thread?");
+}
+
+IdlePeriodState::~IdlePeriodState() {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "Why are we touching idle state off the main thread?");
+  if (mIdleScheduler) {
+    mIdleScheduler->Disconnect();
+  }
+}
+
+size_t IdlePeriodState::SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+  size_t n = 0;
+  if (mIdlePeriod) {
+    n += aMallocSizeOf(mIdlePeriod);
+  }
+
+  return n;
+}
+
+void IdlePeriodState::FlagNotIdle() {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "Why are we touching idle state off the main thread?");
+
+  EnsureIsActive();
+  if (mIdleToken && mIdleToken < TimeStamp::Now()) {
+    ClearIdleToken();
+  }
+}
+
+void IdlePeriodState::RanOutOfTasks(const MutexAutoUnlock& aProofOfUnlock) {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "Why are we touching idle state off the main thread?");
+  MOZ_ASSERT(!mHasPendingEventsPromisedIdleEvent);
+  EnsureIsPaused(aProofOfUnlock);
+  ClearIdleToken();
+}
+
+TimeStamp IdlePeriodState::GetIdleDeadlineInternal(
+    bool aIsPeek, const MutexAutoUnlock& aProofOfUnlock) {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "Why are we touching idle state off the main thread?");
+
+  bool shuttingDown;
+  TimeStamp localIdleDeadline =
+      GetLocalIdleDeadline(shuttingDown, aProofOfUnlock);
+  if (!localIdleDeadline) {
+    if (!aIsPeek) {
+      EnsureIsPaused(aProofOfUnlock);
+      ClearIdleToken();
+    }
+    return TimeStamp();
+  }
+
+  TimeStamp idleDeadline =
+      mHasPendingEventsPromisedIdleEvent || shuttingDown
+          ? localIdleDeadline
+          : GetIdleToken(localIdleDeadline, aProofOfUnlock);
+  if (!idleDeadline) {
+    if (!aIsPeek) {
+      EnsureIsPaused(aProofOfUnlock);
+
+      RequestIdleToken(localIdleDeadline);
+    }
+    return TimeStamp();
+  }
+
+  if (!aIsPeek) {
+    EnsureIsActive();
+  }
+  return idleDeadline;
+}
+
+TimeStamp IdlePeriodState::GetLocalIdleDeadline(
+    bool& aShuttingDown, const MutexAutoUnlock& aProofOfUnlock) {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "Why are we touching idle state off the main thread?");
+  if (AppShutdown::IsInOrBeyond(ShutdownPhase::XPCOMShutdownThreads) ||
+      nsThreadManager::get().GetCurrentThread()->ShuttingDown()) {
+    aShuttingDown = true;
+    return TimeStamp::Now();
+  }
+
+  aShuttingDown = false;
+  TimeStamp idleDeadline;
+  mIdlePeriod->GetIdlePeriodHint(&idleDeadline);
+
+  if (!mHasPendingEventsPromisedIdleEvent &&
+      (!idleDeadline || idleDeadline < TimeStamp::Now())) {
+    return TimeStamp();
+  }
+  if (mHasPendingEventsPromisedIdleEvent && !idleDeadline) {
+    return TimeStamp::Now();
+  }
+  return idleDeadline;
+}
+
+TimeStamp IdlePeriodState::GetIdleToken(TimeStamp aLocalIdlePeriodHint,
+                                        const MutexAutoUnlock& aProofOfUnlock) {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "Why are we touching idle state off the main thread?");
+
+  if (!ShouldGetIdleToken()) {
+    ClearIdleToken();
+    return aLocalIdlePeriodHint;
+  }
+
+  if (mIdleToken) {
+    TimeStamp now = TimeStamp::Now();
+    if (mIdleToken < now) {
+      ClearIdleToken();
+      return mIdleToken;
+    }
+    return mIdleToken < aLocalIdlePeriodHint ? mIdleToken
+                                             : aLocalIdlePeriodHint;
+  }
+  return TimeStamp();
+}
+
+void IdlePeriodState::RequestIdleToken(TimeStamp aLocalIdlePeriodHint) {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "Why are we touching idle state off the main thread?");
+  MOZ_ASSERT(!mActive);
+
+  if (!mIdleScheduler && ShouldGetIdleToken()) {
+    mIdleScheduler = ipc::IdleSchedulerChild::GetMainThreadIdleScheduler();
+    if (mIdleScheduler) {
+      mIdleScheduler->Init(this);
+    }
+  }
+
+  if (mIdleScheduler && !mIdleRequestId) {
+    TimeStamp now = TimeStamp::Now();
+    if (aLocalIdlePeriodHint <= now) {
+      return;
+    }
+
+    mIdleRequestId = ++sIdleRequestCounter;
+    mIdleScheduler->SendRequestIdleTime(mIdleRequestId,
+                                        aLocalIdlePeriodHint - now);
+  }
+}
+
+void IdlePeriodState::SetIdleToken(uint64_t aId, TimeDuration aDuration) {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "Why are we touching idle state off the main thread?");
+
+  if (mIdleRequestId == aId) {
+    mIdleToken = TimeStamp::Now() + aDuration;
+  }
+}
+
+void IdlePeriodState::SetActive() {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "Why are we touching idle state off the main thread?");
+  MOZ_ASSERT(!mActive);
+  if (mIdleScheduler) {
+    mIdleScheduler->SetActive();
+  }
+  mActive = true;
+}
+
+void IdlePeriodState::SetPaused(const MutexAutoUnlock& aProofOfUnlock) {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "Why are we touching idle state off the main thread?");
+  MOZ_ASSERT(mActive);
+  if (mIdleScheduler && mIdleScheduler->SetPaused()) {
+
+    mIdleScheduler->SendSchedule();
+  }
+  mActive = false;
+}
+
+void IdlePeriodState::ClearIdleToken() {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "Why are we touching idle state off the main thread?");
+
+  if (mIdleRequestId) {
+    if (mIdleScheduler) {
+      mIdleScheduler->SendIdleTimeUsed(mIdleRequestId);
+    }
+    mIdleRequestId = 0;
+    mIdleToken = TimeStamp();
+  }
+}
+
+bool IdlePeriodState::ShouldGetIdleToken() {
+  return StaticPrefs::idle_period_cross_process_scheduling() &&
+         dom::ContentChild::GetSingleton() &&
+         dom::ContentChild::GetSingleton()->GetProcessPriority() <
+             hal::ProcessPriority::PROCESS_PRIORITY_FOREGROUND;
+}
+}  

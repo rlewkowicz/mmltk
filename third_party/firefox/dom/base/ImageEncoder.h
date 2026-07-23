@@ -1,0 +1,92 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ImageEncoder_h
+#define ImageEncoder_h
+
+#include "imgIEncoder.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/CanvasUtils.h"
+#include "mozilla/dom/File.h"
+#include "mozilla/dom/HTMLCanvasElementBinding.h"
+#include "nsError.h"
+#include "nsSize.h"
+
+class nsICanvasRenderingContextInternal;
+
+namespace mozilla {
+
+namespace layers {
+class Image;
+}  
+
+namespace dom {
+
+class EncodeCompleteCallback;
+class EncodingRunnable;
+class OffscreenCanvasDisplayHelper;
+
+class ImageEncoder {
+ public:
+  static nsresult ExtractData(nsAString& aType, const nsAString& aOptions,
+                              const CSSIntSize aSize,
+                              CanvasUtils::ImageExtraction aExtractionBehavior,
+                              const nsCString& aRandomizationKey,
+                              nsICanvasRenderingContextInternal* aContext,
+                              OffscreenCanvasDisplayHelper* aOffscreenDisplay,
+                              nsIInputStream** aStream);
+
+  static nsresult ExtractDataAsync(
+      nsAString& aType, const nsAString& aOptions, bool aUsingCustomOptions,
+      UniquePtr<uint8_t[]> aImageBuffer, int32_t aFormat,
+      const CSSIntSize aSize, CanvasUtils::ImageExtraction aExtractionBehavior,
+      const nsCString& aRandomizationKey,
+      EncodeCompleteCallback* aEncodeCallback);
+
+  static nsresult ExtractDataFromLayersImageAsync(
+      nsAString& aType, const nsAString& aOptions, bool aUsingCustomOptions,
+      layers::Image* aImage, CanvasUtils::ImageExtraction aExtractionBehavior,
+      const nsCString& aRandomizationKey,
+      EncodeCompleteCallback* aEncodeCallback);
+
+  static nsresult GetInputStream(int32_t aWidth, int32_t aHeight,
+                                 uint8_t* aImageBuffer, int32_t aFormat,
+                                 imgIEncoder* aEncoder,
+                                 const nsAString& aEncoderOptions,
+                                 const nsACString& aRandomizationKey,
+                                 nsIInputStream** aStream);
+
+ private:
+  static nsresult ExtractDataInternal(
+      const nsAString& aType, const nsAString& aOptions, uint8_t* aImageBuffer,
+      int32_t aFormat, const CSSIntSize aSize,
+      CanvasUtils::ImageExtraction aExtractionBehavior,
+      const nsCString& aRandomizationKey, layers::Image* aImage,
+      nsICanvasRenderingContextInternal* aContext,
+      OffscreenCanvasDisplayHelper* aOffscreenDisplay, nsIInputStream** aStream,
+      imgIEncoder* aEncoder);
+
+  static already_AddRefed<imgIEncoder> GetImageEncoder(nsAString& aType);
+
+  friend class EncodingRunnable;
+  friend class EncoderThreadPoolTerminator;
+};
+
+class EncodeCompleteCallback {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(EncodeCompleteCallback)
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual nsresult ReceiveBlobImpl(already_AddRefed<BlobImpl> aBlobImpl) = 0;
+
+  virtual bool CanBeDeletedOnAnyThread() = 0;
+
+ protected:
+  virtual ~EncodeCompleteCallback() = default;
+};
+
+}  
+}  
+
+#endif  // ImageEncoder_h

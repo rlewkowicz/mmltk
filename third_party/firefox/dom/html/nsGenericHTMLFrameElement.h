@@ -1,0 +1,106 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsGenericHTMLFrameElement_h
+#define nsGenericHTMLFrameElement_h
+
+#include "nsFrameLoader.h"
+#include "nsFrameLoaderOwner.h"
+#include "nsGenericHTMLElement.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+class BrowserParent;
+template <typename>
+struct Nullable;
+class WindowProxyHolder;
+class XULFrameElement;
+}  
+}  
+
+#define NS_GENERICHTMLFRAMEELEMENT_IID \
+  {0x8190db72, 0xdab0, 0x4d72, {0x94, 0x26, 0x87, 0x5f, 0x5a, 0x8a, 0x2a, 0xe5}}
+
+class nsGenericHTMLFrameElement : public nsGenericHTMLElement,
+                                  public nsFrameLoaderOwner {
+ public:
+  nsGenericHTMLFrameElement(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,
+                            mozilla::dom::FromParser aFromParser)
+      : nsGenericHTMLElement(std::move(aNodeInfo)),
+        mSrcLoadHappened(false),
+        mNetworkCreated(aFromParser == mozilla::dom::FROM_PARSER_NETWORK) {}
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+  NS_INLINE_DECL_STATIC_IID(NS_GENERICHTMLFRAMEELEMENT_IID)
+
+  bool IsHTMLFocusable(mozilla::IsFocusableFlags, bool* aIsFocusable,
+                       int32_t* aTabIndex) override;
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+  void UnbindFromTree(UnbindContext&) override;
+  void DestroyContent() override;
+
+  nsresult CopyInnerTo(mozilla::dom::Element* aDest);
+
+  int32_t TabIndexDefault() override;
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(nsGenericHTMLFrameElement,
+                                           nsGenericHTMLElement)
+
+  void SwapFrameLoaders(mozilla::dom::HTMLIFrameElement& aOtherLoaderOwner,
+                        mozilla::ErrorResult& aError);
+
+  void SwapFrameLoaders(mozilla::dom::XULFrameElement& aOtherLoaderOwner,
+                        mozilla::ErrorResult& aError);
+
+  void SwapFrameLoaders(nsFrameLoaderOwner* aOtherLoaderOwner,
+                        mozilla::ErrorResult& rv);
+
+  static mozilla::ScrollbarPreference MapScrollingAttribute(const nsAttrValue*);
+
+  nsIPrincipal* GetSrcTriggeringPrincipal() const {
+    return mSrcTriggeringPrincipal;
+  }
+
+ protected:
+  virtual ~nsGenericHTMLFrameElement();
+
+  void EnsureFrameLoader();
+  void LoadSrc();
+  Document* GetContentDocument(nsIPrincipal& aSubjectPrincipal);
+  mozilla::dom::Nullable<mozilla::dom::WindowProxyHolder> GetContentWindow();
+
+  virtual void AfterSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                            const nsAttrValue* aValue,
+                            const nsAttrValue* aOldValue,
+                            nsIPrincipal* aSubjectPrincipal,
+                            bool aNotify) override;
+  virtual void OnAttrSetButNotChanged(int32_t aNamespaceID, nsAtom* aName,
+                                      const nsAttrValueOrString& aValue,
+                                      bool aNotify) override;
+
+  nsCOMPtr<nsIPrincipal> mSrcTriggeringPrincipal;
+
+  bool mSrcLoadHappened;
+
+  bool mNetworkCreated;
+
+  bool mFullscreenFlag = false;
+
+  bool mLazyLoading = false;
+
+ private:
+  void GetManifestURL(nsAString& aOut);
+
+  void AfterMaybeChangeAttr(int32_t aNamespaceID, nsAtom* aName,
+                            const nsAttrValueOrString* aValue,
+                            nsIPrincipal* aMaybeScriptedPrincipal,
+                            bool aNotify);
+
+  mozilla::dom::BrowsingContext* GetContentWindowInternal();
+};
+
+#endif  // nsGenericHTMLFrameElement_h

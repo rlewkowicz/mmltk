@@ -1,0 +1,144 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/BlobURL.h"
+
+#include "mozilla/dom/BlobURLProtocolHandler.h"
+#include "mozilla/ipc/BackgroundUtils.h"
+#include "mozilla/ipc/URIUtils.h"
+#include "nsIClassInfoImpl.h"
+#include "nsIObjectInputStream.h"
+#include "nsIObjectOutputStream.h"
+#include "nsQueryObject.h"
+
+using namespace mozilla::dom;
+
+NS_IMPL_ADDREF_INHERITED(BlobURL, mozilla::net::nsSimpleURI)
+NS_IMPL_RELEASE_INHERITED(BlobURL, mozilla::net::nsSimpleURI)
+
+NS_IMPL_CLASSINFO(BlobURL, nullptr, nsIClassInfo::THREADSAFE,
+                  NS_HOSTOBJECTURI_CID);
+NS_IMPL_CI_INTERFACE_GETTER0(BlobURL)
+
+NS_INTERFACE_MAP_BEGIN(BlobURL)
+  if (aIID.Equals(NS_GET_IID(nsSimpleURI))) {
+    *aInstancePtr = nullptr;
+    return NS_NOINTERFACE;
+  }
+
+  NS_IMPL_QUERY_CLASSINFO(BlobURL)
+  NS_INTERFACE_MAP_ENTRY_CONCRETE(BlobURL)
+NS_INTERFACE_MAP_END_INHERITING(mozilla::net::nsSimpleURI)
+
+BlobURL::BlobURL() : mRevoked(false) {}
+
+
+NS_IMETHODIMP
+BlobURL::Read(nsIObjectInputStream* aStream) {
+  MOZ_ASSERT_UNREACHABLE("Use nsIURIMutator.read() instead");
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+nsresult BlobURL::ReadPrivate(nsIObjectInputStream* aStream) {
+  nsresult rv = mozilla::net::nsSimpleURI::ReadPrivate(aStream);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = aStream->ReadBoolean(&mRevoked);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+BlobURL::Write(nsIObjectOutputStream* aStream) {
+  nsresult rv = mozilla::net::nsSimpleURI::Write(aStream);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = aStream->WriteBoolean(mRevoked);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+
+  return NS_OK;
+}
+
+void BlobURL::Serialize(mozilla::ipc::URIParams& aParams) {
+  using namespace mozilla::ipc;
+
+  HostObjectURIParams hostParams;
+  URIParams simpleParams;
+
+  mozilla::net::nsSimpleURI::Serialize(simpleParams);
+  hostParams.simpleParams() = simpleParams;
+
+  hostParams.revoked() = mRevoked;
+
+  hostParams.nullPrincipal() = mNullPrincipal;
+
+  aParams = std::move(hostParams);
+}
+
+bool BlobURL::Deserialize(const mozilla::ipc::URIParams& aParams) {
+  using namespace mozilla::ipc;
+
+  if (aParams.type() != URIParams::THostObjectURIParams) {
+    NS_ERROR("Received unknown parameters from the other process!");
+    return false;
+  }
+
+  const HostObjectURIParams& hostParams = aParams.get_HostObjectURIParams();
+
+  if (!mozilla::net::nsSimpleURI::Deserialize(hostParams.simpleParams())) {
+    return false;
+  }
+
+  if (OriginPart() != "null"_ns && hostParams.nullPrincipal()) {
+    NS_ERROR("Received nullPrincipal for non-null BlobURL");
+    return false;
+  }
+
+  mRevoked = hostParams.revoked();
+
+  mNullPrincipal = hostParams.nullPrincipal();
+
+  return true;
+}
+
+nsresult BlobURL::SetScheme(const nsACString& aScheme) {
+  return NS_ERROR_FAILURE;
+}
+
+nsresult BlobURL::EqualsInternal(
+    nsIURI* aOther, mozilla::net::nsSimpleURI::RefHandlingEnum aRefHandlingMode,
+    bool* aResult) {
+  if (!aOther) {
+    *aResult = false;
+    return NS_OK;
+  }
+
+  RefPtr<BlobURL> otherUri = do_QueryObject(aOther);
+  if (!otherUri) {
+    *aResult = false;
+    return NS_OK;
+  }
+
+  *aResult =
+      mozilla::net::nsSimpleURI::EqualsInternal(otherUri, aRefHandlingMode);
+
+  return NS_OK;
+}
+
+NS_IMPL_NSIURIMUTATOR_ISUPPORTS(BlobURL::Mutator, nsIURISetters, nsIURIMutator,
+                                nsISerializable, nsIBlobURLMutator)
+
+NS_IMETHODIMP
+BlobURL::Mutate(nsIURIMutator** aMutator) {
+  RefPtr<BlobURL::Mutator> mutator = new BlobURL::Mutator();
+  nsresult rv = mutator->InitFromURI(this);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  mutator.forget(aMutator);
+  return NS_OK;
+}

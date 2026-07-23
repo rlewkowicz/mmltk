@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_CoalescedInputData_h
+#define mozilla_dom_CoalescedInputData_h
+
+#include "mozilla/UniquePtr.h"
+#include "mozilla/layers/ScrollableLayerGuid.h"
+#include "nsRefreshObservers.h"
+
+class nsRefreshDriver;
+
+namespace mozilla::dom {
+
+class BrowserChild;
+
+template <class InputEventType>
+class CoalescedInputData {
+ protected:
+  using ScrollableLayerGuid = mozilla::layers::ScrollableLayerGuid;
+
+  UniquePtr<InputEventType> mCoalescedInputEvent;
+  ScrollableLayerGuid mGuid;
+  uint64_t mInputBlockId = 0;
+  uint32_t mGeneration = 0;
+
+  void AdvanceGeneration() {
+    if (!IsEmpty()) {
+      mGeneration++;
+    }
+  }
+
+ public:
+  CoalescedInputData() = default;
+
+  void RetrieveDataFrom(CoalescedInputData& aSource) {
+    aSource.AdvanceGeneration();
+    AdvanceGeneration();
+    mCoalescedInputEvent = std::move(aSource.mCoalescedInputEvent);
+    mGuid = aSource.mGuid;
+    mInputBlockId = aSource.mInputBlockId;
+  }
+
+  bool IsEmpty() { return !mCoalescedInputEvent; }
+
+  bool CanCoalesce(const InputEventType& aEvent,
+                   const ScrollableLayerGuid& aGuid,
+                   const uint64_t& aInputBlockId);
+
+  UniquePtr<InputEventType> TakeCoalescedEvent() {
+    AdvanceGeneration();
+    return std::move(mCoalescedInputEvent);
+  }
+
+  ScrollableLayerGuid GetScrollableLayerGuid() { return mGuid; }
+
+  uint64_t GetInputBlockId() { return mInputBlockId; }
+
+  [[nodiscard]] uint32_t Generation() const { return mGeneration; }
+};
+
+class CoalescedInputFlusher : public nsARefreshObserver {
+ public:
+  explicit CoalescedInputFlusher(BrowserChild* aBrowserChild);
+
+  virtual void WillRefresh(mozilla::TimeStamp aTime) override = 0;
+
+  NS_INLINE_DECL_REFCOUNTING(CoalescedInputFlusher, override)
+
+  void StartObserver();
+  void RemoveObserver();
+
+  [[nodiscard]] nsRefreshDriver* GetRefreshDriver();
+
+ protected:
+  virtual ~CoalescedInputFlusher();
+
+  BrowserChild* mBrowserChild;
+  RefPtr<nsRefreshDriver> mRefreshDriver;
+};
+}  
+
+#endif  // mozilla_dom_CoalescedInputData_h

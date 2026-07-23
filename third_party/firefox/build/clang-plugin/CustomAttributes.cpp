@@ -1,0 +1,108 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "CustomAttributes.h"
+#include "plugin.h"
+#include "clang/Frontend/FrontendPluginRegistry.h"
+
+
+using namespace clang;
+using namespace llvm;
+
+static DenseMap<const Decl *, CustomAttributesSet> AttributesCache;
+
+static CustomAttributesSet CacheAttributes(const Decl *D) {
+  CustomAttributesSet attrs = {};
+  for (auto Attr : D->specific_attrs<AnnotateAttr>()) {
+    auto annotation = Attr->getAnnotation();
+#define ATTR(a)                                                                \
+  if (annotation == #a) {                                                      \
+    attrs.has_##a = true;                                                      \
+  } else
+#include "CustomAttributes.inc"
+#include "external/CustomAttributes.inc"
+#undef ATTR
+    {}
+  }
+  const_cast<Decl *>(D)->dropAttr<AnnotateAttr>();
+  AttributesCache.insert(std::make_pair(D, attrs));
+  return attrs;
+}
+
+#ifndef CLANG_TIDY
+static void Report(const Decl *D, const char *message) {
+  ASTContext &Context = D->getASTContext();
+  DiagnosticsEngine &Diag = Context.getDiagnostics();
+  unsigned ID =
+      Diag.getDiagnosticIDs()->getCustomDiagID(DiagnosticIDs::Warning, message);
+  Diag.Report(D->getBeginLoc(), ID);
+}
+
+class CustomAttributesMatcher
+    : public ast_matchers::MatchFinder::MatchCallback {
+public:
+  void run(const ast_matchers::MatchFinder::MatchResult &Result) final {
+    if (auto D = Result.Nodes.getNodeAs<Decl>("decl")) {
+      CacheAttributes(D);
+    } else if (auto L = Result.Nodes.getNodeAs<LambdaExpr>("lambda")) {
+      CacheAttributes(L->getCallOperator());
+      CacheAttributes(L->getLambdaClass());
+    }
+  }
+};
+
+class CustomAttributesAction : public PluginASTAction {
+public:
+  ASTConsumerPtr CreateASTConsumer(CompilerInstance &CI,
+                                   StringRef FileName) override {
+    auto &Context = CI.getASTContext();
+    auto AstMatcher = new (Context.Allocate<MatchFinder>()) MatchFinder();
+    auto Matcher = new (Context.Allocate<CustomAttributesMatcher>())
+        CustomAttributesMatcher();
+    AstMatcher->addMatcher(decl().bind("decl"), Matcher);
+    AstMatcher->addMatcher(lambdaExpr().bind("lambda"), Matcher);
+    return AstMatcher->newASTConsumer();
+  }
+
+  bool ParseArgs(const CompilerInstance &CI,
+                 const std::vector<std::string> &Args) override {
+    return true;
+  }
+
+  ActionType getActionType() override { return AddBeforeMainAction; }
+};
+
+static FrontendPluginRegistry::Add<CustomAttributesAction>
+    X("moz-custom-attributes", "prepare custom attributes for moz-check");
+#endif
+
+CustomAttributesSet GetAttributes(const Decl *D) {
+  CustomAttributesSet attrs = {};
+  if (D->hasAttr<AnnotateAttr>()) {
+// If we are not in clang-tidy env push warnings, most likely we are in the
+#ifndef CLANG_TIDY
+    Report(D, "Declaration has unhandled annotations.");
+#endif
+    attrs = CacheAttributes(D);
+  } else {
+    auto attributes = AttributesCache.find(D);
+    if (attributes != AttributesCache.end()) {
+      attrs = attributes->second;
+    }
+  }
+  return attrs;
+}
+
+bool hasCustomAttribute(const clang::Decl *D, CustomAttributes A) {
+  CustomAttributesSet attrs = GetAttributes(D);
+  switch (A) {
+#define ATTR(a)                                                                \
+  case a:                                                                      \
+    return attrs.has_##a;
+#include "CustomAttributes.inc"
+#include "external/CustomAttributes.inc"
+#undef ATTR
+  }
+  return false;
+}

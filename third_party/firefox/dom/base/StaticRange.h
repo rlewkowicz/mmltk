@@ -1,0 +1,121 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_StaticRange_h
+#define mozilla_dom_StaticRange_h
+
+#include "mozilla/RangeBoundary.h"
+#include "mozilla/RangeUtils.h"
+#include "mozilla/dom/AbstractRange.h"
+#include "mozilla/dom/StaticRangeBinding.h"
+#include "nsTArray.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+class CrossShadowBoundaryRange;
+
+class StaticRange : public AbstractRange {
+ public:
+  enum class MutationObserved : bool { No, Yes };
+
+  StaticRange() = delete;
+  explicit StaticRange(const StaticRange& aOther) = delete;
+
+  static already_AddRefed<StaticRange> Constructor(const GlobalObject& global,
+                                                   const StaticRangeInit& init,
+                                                   ErrorResult& aRv);
+
+  static already_AddRefed<StaticRange> Create(nsINode* aNode);
+
+  static already_AddRefed<StaticRange> Create(
+      const AbstractRange* aAbstractRange, ErrorResult& aRv) {
+    MOZ_ASSERT(aAbstractRange);
+    return StaticRange::Create(aAbstractRange->StartRef(),
+                               aAbstractRange->EndRef(), aRv);
+  }
+  static already_AddRefed<StaticRange> Create(nsINode* aStartContainer,
+                                              uint32_t aStartOffset,
+                                              nsINode* aEndContainer,
+                                              uint32_t aEndOffset,
+                                              ErrorResult& aRv) {
+    return StaticRange::Create(
+        RawRangeBoundary(aStartContainer, aStartOffset,
+                         RangeBoundarySetBy::Offset),
+        RawRangeBoundary(aEndContainer, aEndOffset, RangeBoundarySetBy::Offset),
+        aRv);
+  }
+  template <typename SPT, typename SRT, typename EPT, typename ERT>
+  static already_AddRefed<StaticRange> Create(
+      const RangeBoundaryBase<SPT, SRT>& aStartBoundary,
+      const RangeBoundaryBase<EPT, ERT>& aEndBoundary, ErrorResult& aRv);
+
+  bool IsValid() const;
+
+  bool IsCrossShadowBoundaryRange() const {
+    return mIsMutationObserved == MutationObserved::Yes;
+  }
+  inline CrossShadowBoundaryRange* AsCrossShadowBoundaryRange();
+
+ private:
+  bool mAreStartAndEndInSameTree = false;
+
+  MutationObserved mIsMutationObserved = MutationObserved::No;
+
+ protected:
+  explicit StaticRange(nsINode* aNode, MutationObserved aIsMutationObserved,
+                       TreeKind aBoundaryTreeKind = TreeKind::DOM)
+      : AbstractRange(aNode,  false, aBoundaryTreeKind),
+        mIsMutationObserved(aIsMutationObserved) {}
+  virtual ~StaticRange();
+
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_IMETHODIMP_(void) DeleteCycleCollectable(void) override;
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_INHERITED(StaticRange,
+                                                         AbstractRange)
+
+  JSObject* WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto) final;
+
+  nsresult SetStartAndEnd(nsINode* aStartContainer, uint32_t aStartOffset,
+                          nsINode* aEndContainer, uint32_t aEndOffset) {
+    return SetStartAndEnd(RawRangeBoundary(aStartContainer, aStartOffset,
+                                           RangeBoundarySetBy::Offset),
+                          RawRangeBoundary(aEndContainer, aEndOffset,
+                                           RangeBoundarySetBy::Offset));
+  }
+  template <typename SPT, typename SRT, typename EPT, typename ERT>
+  nsresult SetStartAndEnd(const RangeBoundaryBase<SPT, SRT>& aStartBoundary,
+                          const RangeBoundaryBase<EPT, ERT>& aEndBoundary) {
+    return AbstractRange::SetStartAndEndInternal(aStartBoundary, aEndBoundary,
+                                                 this);
+  }
+
+ protected:
+  template <typename SPT, typename SRT, typename EPT, typename ERT>
+  void DoSetRange(const RangeBoundaryBase<SPT, SRT>& aStartBoundary,
+                  const RangeBoundaryBase<EPT, ERT>& aEndBoundary,
+                  nsINode* aRootNode);
+
+  static nsTArray<RefPtr<StaticRange>>* sCachedRanges;
+
+  friend class AbstractRange;
+};
+
+inline StaticRange* AbstractRange::AsStaticRange() {
+  MOZ_ASSERT(IsStaticRange());
+  return static_cast<StaticRange*>(this);
+}
+inline const StaticRange* AbstractRange::AsStaticRange() const {
+  MOZ_ASSERT(IsStaticRange());
+  return static_cast<const StaticRange*>(this);
+}
+
+}  
+}  
+
+#endif  // #ifndef mozilla_dom_StaticRange_h

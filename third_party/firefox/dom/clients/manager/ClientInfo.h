@@ -1,0 +1,92 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _mozilla_dom_ClientInfo_h
+#define _mozilla_dom_ClientInfo_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/UniquePtr.h"
+#include "nsCOMPtr.h"
+#include "nsString.h"
+
+class nsIPrincipal;
+struct nsID;
+
+namespace mozilla {
+
+namespace ipc {
+class CSPInfo;
+class PolicyContainerArgs;
+class PrincipalInfo;
+}  
+
+namespace dom {
+
+class IPCClientInfo;
+enum class FrameType : uint8_t;
+enum class ClientType : uint8_t;
+
+class ClientInfo final {
+  UniquePtr<IPCClientInfo> mData;
+
+ public:
+  ClientInfo(const nsID& aId, const Maybe<nsID>& aAgentClusterId,
+             ClientType aType,
+             const mozilla::ipc::PrincipalInfo& aPrincipalInfo,
+             const TimeStamp& aCreationTime, const nsCString& aURL,
+             mozilla::dom::FrameType aFrameType);
+
+  ClientInfo(const ClientInfo& aRight);
+
+  ClientInfo& operator=(const ClientInfo& aRight);
+
+  ClientInfo(ClientInfo&& aRight) noexcept;
+
+  ClientInfo& operator=(ClientInfo&& aRight) noexcept;
+
+  explicit ClientInfo(const IPCClientInfo& aData);
+
+  ~ClientInfo();
+
+  bool operator==(const ClientInfo& aRight) const;
+  bool operator!=(const ClientInfo& aRight) const;
+
+  const nsID& Id() const;
+
+  void SetAgentClusterId(const nsID& aId);
+  const Maybe<nsID>& AgentClusterId() const;
+
+  ClientType Type() const;
+
+  const mozilla::ipc::PrincipalInfo& PrincipalInfo() const;
+
+  const TimeStamp& CreationTime() const;
+
+  const nsCString& URL() const;
+
+  void SetURL(const nsACString& aURL);
+
+  mozilla::dom::FrameType FrameType() const;
+
+  void SetFrameType(mozilla::dom::FrameType aFrameType);
+
+  const IPCClientInfo& ToIPC() const;
+
+  bool IsPrivateBrowsing() const;
+
+  Result<nsCOMPtr<nsIPrincipal>, nsresult> GetPrincipal() const;
+
+  const Maybe<mozilla::ipc::PolicyContainerArgs>& GetPolicyContainerArgs()
+      const;
+  void SetPolicyContainerArgs(const mozilla::ipc::PolicyContainerArgs& aPolicy);
+
+  const Maybe<mozilla::ipc::CSPInfo>& GetPreloadCspInfo() const;
+  void SetPreloadCspInfo(const mozilla::ipc::CSPInfo& aPreloadCSPInfo);
+};
+
+}  
+}  
+
+#endif  // _mozilla_dom_ClientInfo_h

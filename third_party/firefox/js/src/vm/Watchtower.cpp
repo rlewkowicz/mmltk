@@ -1,0 +1,707 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "vm/Watchtower.h"
+
+#include "js/CallAndConstruct.h"
+#include "js/experimental/TypedData.h"
+#include "vm/Compartment.h"
+#include "vm/JSContext.h"
+#include "vm/JSObject.h"
+#include "vm/NativeObject.h"
+#include "vm/PlainObject.h"
+#include "vm/Realm.h"
+#include "vm/TypedArrayObject.h"
+
+#include "vm/Compartment-inl.h"
+#include "vm/JSObject-inl.h"
+#include "vm/NativeObject-inl.h"
+#include "vm/Realm-inl.h"
+#include "vm/Shape-inl.h"
+
+using namespace js;
+
+static bool AddToWatchtowerLog(JSContext* cx, const char* kind,
+                               HandleObject obj, HandleValue extra) {
+
+  MOZ_ASSERT(obj->useWatchtowerTestingLog());
+
+  RootedString kindString(cx, NewStringCopyZ<CanGC>(cx, kind));
+  if (!kindString) {
+    return false;
+  }
+
+  Rooted<PlainObject*> logObj(cx, NewPlainObjectWithProto(cx, nullptr));
+  if (!logObj) {
+    return false;
+  }
+  if (!JS_DefineProperty(cx, logObj, "kind", kindString, JSPROP_ENUMERATE)) {
+    return false;
+  }
+  if (!JS_DefineProperty(cx, logObj, "object", obj, JSPROP_ENUMERATE)) {
+    return false;
+  }
+  if (!JS_DefineProperty(cx, logObj, "extra", extra, JSPROP_ENUMERATE)) {
+    return false;
+  }
+
+  if (!cx->runtime()->watchtowerTestingLog->append(logObj)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  return true;
+}
+
+static bool ReshapeForShadowedProp(JSContext* cx, Handle<NativeObject*> obj,
+                                   HandleId id) {
+
+  MOZ_ASSERT(obj->isUsedAsPrototype());
+
+  if (id.isInt()) {
+    return true;
+  }
+
+  bool useDictionaryTeleporting =
+      cx->zone()->shapeZone().useDictionaryModeTeleportation();
+
+  RootedObject proto(cx, obj->staticPrototype());
+  while (proto) {
+    if (!proto->is<NativeObject>()) {
+      break;
+    }
+
+    Handle<NativeObject*> nproto = proto.as<NativeObject>();
+
+    if (mozilla::Maybe<PropertyInfo> propInfo = nproto->lookup(cx, id)) {
+      if (proto->hasObjectFuse()) {
+        MOZ_ASSERT(ObjectFuse::tracksPropertyKey(id));
+        if (auto* objFuse = cx->zone()->objectFuses.get(nproto)) {
+          objFuse->handleTeleportingShadowedProperty(cx, *propInfo);
+        }
+      }
+      if (useDictionaryTeleporting) {
+        JS_LOG(teleporting, Debug,
+               "Shadowed Prop: Dictionary Reshape for Teleporting");
+
+        return JSObject::reshapeForTeleporting(cx, proto);
+      }
+
+      JS_LOG(teleporting, Info,
+             "Shadowed Prop: Invalidating Reshape for Teleporting");
+      return JSObject::setInvalidatedTeleporting(cx, proto);
+    }
+
+    proto = proto->staticPrototype();
+  }
+
+  return true;
+}
+
+static void InvalidateMegamorphicCache(JSContext* cx, Handle<NativeObject*> obj,
+                                       bool invalidateGetPropCache = true) {
+
+  MOZ_ASSERT(obj->isUsedAsPrototype());
+
+  if (invalidateGetPropCache) {
+    cx->caches().megamorphicCache.bumpGeneration();
+  }
+  cx->caches().megamorphicSetPropCache->bumpGeneration();
+}
+
+void MaybePopReturnFuses(JSContext* cx, Handle<NativeObject*> nobj) {
+  GlobalObject* global = &nobj->global();
+  JSObject* objectProto = &global->getObjectPrototype();
+  if (nobj == objectProto) {
+    nobj->realm()->realmFuses.objectPrototypeHasNoReturnProperty.popFuse(
+        cx, nobj->realm()->realmFuses);
+    return;
+  }
+
+  JSObject* iteratorProto = global->maybeGetIteratorPrototype();
+  if (nobj == iteratorProto) {
+    nobj->realm()->realmFuses.iteratorPrototypeHasNoReturnProperty.popFuse(
+        cx, nobj->realm()->realmFuses);
+    return;
+  }
+
+  JSObject* arrayIterProto = global->maybeGetArrayIteratorPrototype();
+  if (nobj == arrayIterProto) {
+    nobj->realm()->realmFuses.arrayIteratorPrototypeHasNoReturnProperty.popFuse(
+        cx, nobj->realm()->realmFuses);
+    return;
+  }
+}
+
+void MaybePopTypedArrayConstructorSpeciesFuses(JSContext* cx,
+                                               NativeObject* nobj) {
+  MOZ_ASSERT(nobj->hasRealmFuseProperty());
+
+  if (IsTypedArrayConstructor(nobj)) {
+    nobj->realm()->realmFuses.optimizeTypedArraySpeciesFuse.popFuse(
+        cx, nobj->realm()->realmFuses);
+  }
+}
+
+bool Watchtower::watchPropertyAddSlow(JSContext* cx, Handle<NativeObject*> obj,
+                                      HandleId id) {
+  MOZ_ASSERT(watchesPropertyAdd(obj));
+
+  if (obj->isUsedAsPrototype()) {
+    if (!ReshapeForShadowedProp(cx, obj, id)) {
+      return false;
+    }
+    if (!id.isInt()) {
+      InvalidateMegamorphicCache(cx, obj);
+    }
+
+    if (id == NameToId(cx->names().return_)) {
+      MaybePopReturnFuses(cx, obj);
+    }
+  }
+  if (MOZ_UNLIKELY(obj->hasRealmFuseProperty())) {
+    if (id.isWellKnownSymbol(JS::SymbolCode::species)) {
+      MaybePopTypedArrayConstructorSpeciesFuses(cx, obj);
+    }
+  }
+
+  if (MOZ_UNLIKELY(obj->useWatchtowerTestingLog())) {
+    RootedValue val(cx, IdToValue(id));
+    if (!AddToWatchtowerLog(cx, "add-prop", obj, val)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool ReshapeForProtoMutation(JSContext* cx, Handle<NativeObject*> obj) {
+
+  MOZ_ASSERT(obj->isUsedAsPrototype());
+
+  RootedObject pobj(cx, obj);
+
+  bool useDictionaryTeleporting =
+      cx->zone()->shapeZone().useDictionaryModeTeleportation();
+
+  while (pobj && pobj->is<NativeObject>()) {
+    if (pobj->hasObjectFuse()) {
+      if (auto* objFuse =
+              cx->zone()->objectFuses.get(pobj.as<NativeObject>())) {
+        objFuse->handleTeleportingProtoMutation(cx);
+      }
+    }
+    if (useDictionaryTeleporting) {
+      MOZ_ASSERT(!pobj->hasInvalidatedTeleporting(),
+                 "Once we start using invalidation shouldn't do any more "
+                 "dictionary mode teleportation");
+      JS_LOG(teleporting, Debug,
+             "Proto Mutation: Dictionary Reshape for Teleporting");
+
+      if (!JSObject::reshapeForTeleporting(cx, pobj)) {
+        return false;
+      }
+    } else if (!pobj->hasInvalidatedTeleporting()) {
+      JS_LOG(teleporting, Info,
+             "Proto Mutation: Invalidating Reshape for Teleporting");
+
+      if (!JSObject::setInvalidatedTeleporting(cx, pobj)) {
+        return false;
+      }
+    }
+    pobj = pobj->staticPrototype();
+  }
+
+  return true;
+}
+
+static constexpr bool IsTypedArrayProtoKey(JSProtoKey protoKey) {
+  switch (protoKey) {
+#define PROTO_KEY(_, T, N) \
+  case JSProto_##N##Array: \
+    return true;
+    JS_FOR_EACH_TYPED_ARRAY(PROTO_KEY)
+#undef PROTO_KEY
+    default:
+      return false;
+  }
+}
+
+static_assert(
+    !IsTypedArrayProtoKey(JSProto_TypedArray),
+    "IsTypedArrayProtoKey(JSProto_TypedArray) is expected to return false");
+
+static bool WatchProtoChangeImpl(JSContext* cx, HandleObject obj) {
+  if (!obj->is<NativeObject>()) {
+    return true;
+  }
+  auto nobj = obj.as<NativeObject>();
+
+  if (nobj->isUsedAsPrototype()) {
+    if (!ReshapeForProtoMutation(cx, nobj)) {
+      return false;
+    }
+
+    InvalidateMegamorphicCache(cx, nobj);
+
+    if (nobj == nobj->global().maybeGetArrayIteratorPrototype()) {
+      nobj->realm()->realmFuses.arrayIteratorPrototypeHasIteratorProto.popFuse(
+          cx, nobj->realm()->realmFuses);
+    }
+
+    if (nobj == nobj->global().maybeGetIteratorPrototype()) {
+      nobj->realm()->realmFuses.iteratorPrototypeHasObjectProto.popFuse(
+          cx, nobj->realm()->realmFuses);
+    }
+
+    auto protoKey = StandardProtoKeyOrNull(nobj);
+    if (IsTypedArrayProtoKey(protoKey) &&
+        nobj == nobj->global().maybeGetPrototype(protoKey)) {
+      nobj->realm()->realmFuses.optimizeTypedArraySpeciesFuse.popFuse(
+          cx, nobj->realm()->realmFuses);
+    }
+  }
+
+  if (MOZ_UNLIKELY(nobj->hasRealmFuseProperty())) {
+    MaybePopTypedArrayConstructorSpeciesFuses(cx, nobj);
+  }
+
+  return true;
+}
+
+bool Watchtower::watchProtoChangeSlow(JSContext* cx, HandleObject obj) {
+  MOZ_ASSERT(watchesProtoChange(obj));
+
+  if (!WatchProtoChangeImpl(cx, obj)) {
+    return false;
+  }
+
+  if (MOZ_UNLIKELY(obj->useWatchtowerTestingLog())) {
+    if (!AddToWatchtowerLog(cx, "proto-change", obj,
+                            JS::UndefinedHandleValue)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static void MaybePopArrayConstructorFuses(JSContext* cx, NativeObject* obj,
+                                          jsid id) {
+  if (obj != obj->global().maybeGetConstructor(JSProto_Array)) {
+    return;
+  }
+  if (id.isWellKnownSymbol(JS::SymbolCode::species)) {
+    obj->realm()->realmFuses.optimizeArraySpeciesFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopArrayPrototypeFuses(JSContext* cx, NativeObject* obj,
+                                        jsid id) {
+  if (obj != obj->global().maybeGetArrayPrototype()) {
+    return;
+  }
+  if (id.isWellKnownSymbol(JS::SymbolCode::iterator)) {
+    obj->realm()->realmFuses.arrayPrototypeIteratorFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+  if (id.isAtom(cx->names().constructor)) {
+    obj->realm()->realmFuses.optimizeArraySpeciesFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopArrayIteratorPrototypeFuses(JSContext* cx,
+                                                NativeObject* obj, jsid id) {
+  if (obj != obj->global().maybeGetArrayIteratorPrototype()) {
+    return;
+  }
+  if (id.isAtom(cx->names().next)) {
+    obj->realm()->realmFuses.arrayPrototypeIteratorNextFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopMapPrototypeFuses(JSContext* cx, NativeObject* obj,
+                                      jsid id) {
+  if (obj != obj->global().maybeGetPrototype(JSProto_Map)) {
+    return;
+  }
+  if (id.isWellKnownSymbol(JS::SymbolCode::iterator)) {
+    obj->realm()->realmFuses.optimizeMapObjectIteratorFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+  if (id.isAtom(cx->names().set)) {
+    obj->realm()->realmFuses.optimizeMapPrototypeSetFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopMapIteratorPrototypeFuses(JSContext* cx, NativeObject* obj,
+                                              jsid id) {
+  if (obj != obj->global().maybeBuiltinProto(
+                 GlobalObject::ProtoKind::MapIteratorProto)) {
+    return;
+  }
+  if (id.isAtom(cx->names().next)) {
+    obj->realm()->realmFuses.optimizeMapObjectIteratorFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopSetPrototypeFuses(JSContext* cx, NativeObject* obj,
+                                      jsid id) {
+  if (obj != obj->global().maybeGetPrototype(JSProto_Set)) {
+    return;
+  }
+  if (id.isWellKnownSymbol(JS::SymbolCode::iterator)) {
+    obj->realm()->realmFuses.optimizeSetObjectIteratorFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+  if (id.isAtom(cx->names().add)) {
+    obj->realm()->realmFuses.optimizeSetPrototypeAddFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopSetIteratorPrototypeFuses(JSContext* cx, NativeObject* obj,
+                                              jsid id) {
+  if (obj != obj->global().maybeBuiltinProto(
+                 GlobalObject::ProtoKind::SetIteratorProto)) {
+    return;
+  }
+  if (id.isAtom(cx->names().next)) {
+    obj->realm()->realmFuses.optimizeSetObjectIteratorFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopWeakMapPrototypeFuses(JSContext* cx, NativeObject* obj,
+                                          jsid id) {
+  if (obj != obj->global().maybeGetPrototype(JSProto_WeakMap)) {
+    return;
+  }
+  if (id.isAtom(cx->names().set)) {
+    obj->realm()->realmFuses.optimizeWeakMapPrototypeSetFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopWeakSetPrototypeFuses(JSContext* cx, NativeObject* obj,
+                                          jsid id) {
+  if (obj != obj->global().maybeGetPrototype(JSProto_WeakSet)) {
+    return;
+  }
+  if (id.isAtom(cx->names().add)) {
+    obj->realm()->realmFuses.optimizeWeakSetPrototypeAddFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopPromiseConstructorFuses(JSContext* cx, NativeObject* obj,
+                                            jsid id) {
+  if (obj != obj->global().maybeGetConstructor(JSProto_Promise)) {
+    return;
+  }
+  if (id.isWellKnownSymbol(JS::SymbolCode::species) ||
+      id.isAtom(cx->names().resolve)) {
+    obj->realm()->realmFuses.optimizePromiseLookupFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopPromisePrototypeFuses(JSContext* cx, NativeObject* obj,
+                                          jsid id) {
+  if (obj != obj->global().maybeGetPrototype(JSProto_Promise)) {
+    return;
+  }
+  if (id.isAtom(cx->names().constructor) || id.isAtom(cx->names().then)) {
+    obj->realm()->realmFuses.optimizePromiseLookupFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopRegExpPrototypeFuses(JSContext* cx, NativeObject* obj,
+                                         jsid id) {
+  if (obj != obj->global().maybeGetPrototype(JSProto_RegExp)) {
+    return;
+  }
+  if (id.isAtom(cx->names().flags) || id.isAtom(cx->names().global) ||
+      id.isAtom(cx->names().hasIndices) || id.isAtom(cx->names().ignoreCase) ||
+      id.isAtom(cx->names().multiline) || id.isAtom(cx->names().sticky) ||
+      id.isAtom(cx->names().unicode) || id.isAtom(cx->names().unicodeSets) ||
+      id.isAtom(cx->names().dotAll) || id.isAtom(cx->names().exec) ||
+      id.isWellKnownSymbol(JS::SymbolCode::match) ||
+      id.isWellKnownSymbol(JS::SymbolCode::matchAll) ||
+      id.isWellKnownSymbol(JS::SymbolCode::replace) ||
+      id.isWellKnownSymbol(JS::SymbolCode::search) ||
+      id.isWellKnownSymbol(JS::SymbolCode::split)) {
+    obj->realm()->realmFuses.optimizeRegExpPrototypeFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopArrayBufferConstructorFuses(JSContext* cx,
+                                                NativeObject* obj, jsid id) {
+  if (obj != obj->global().maybeGetConstructor(JSProto_ArrayBuffer)) {
+    return;
+  }
+  if (id.isWellKnownSymbol(JS::SymbolCode::species)) {
+    obj->realm()->realmFuses.optimizeArrayBufferSpeciesFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopArrayBufferPrototypeFuses(JSContext* cx, NativeObject* obj,
+                                              jsid id) {
+  if (obj != obj->global().maybeGetPrototype(JSProto_ArrayBuffer)) {
+    return;
+  }
+  if (id.isAtom(cx->names().constructor)) {
+    obj->realm()->realmFuses.optimizeArrayBufferSpeciesFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopSharedArrayBufferConstructorFuses(JSContext* cx,
+                                                      NativeObject* obj,
+                                                      jsid id) {
+  if (obj != obj->global().maybeGetConstructor(JSProto_SharedArrayBuffer)) {
+    return;
+  }
+  if (id.isWellKnownSymbol(JS::SymbolCode::species)) {
+    obj->realm()->realmFuses.optimizeSharedArrayBufferSpeciesFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopSharedArrayBufferPrototypeFuses(JSContext* cx,
+                                                    NativeObject* obj,
+                                                    jsid id) {
+  if (obj != obj->global().maybeGetPrototype(JSProto_SharedArrayBuffer)) {
+    return;
+  }
+  if (id.isAtom(cx->names().constructor)) {
+    obj->realm()->realmFuses.optimizeSharedArrayBufferSpeciesFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopTypedArrayConstructorFuses(JSContext* cx, NativeObject* obj,
+                                               jsid id) {
+  if (obj != obj->global().maybeGetConstructor(JSProto_TypedArray)) {
+    return;
+  }
+  if (id.isWellKnownSymbol(JS::SymbolCode::species)) {
+    obj->realm()->realmFuses.optimizeTypedArraySpeciesFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopTypedArrayPrototypeFuses(JSContext* cx, NativeObject* obj,
+                                             jsid id) {
+  auto protoKey = StandardProtoKeyOrNull(obj);
+  if (protoKey != JSProto_TypedArray && !IsTypedArrayProtoKey(protoKey)) {
+    return;
+  }
+  if (obj != obj->global().maybeGetPrototype(protoKey)) {
+    return;
+  }
+  if (id.isAtom(cx->names().constructor)) {
+    obj->realm()->realmFuses.optimizeTypedArraySpeciesFuse.popFuse(
+        cx, obj->realm()->realmFuses);
+  }
+}
+
+static void MaybePopRealmFuses(JSContext* cx, NativeObject* obj, jsid id) {
+  MaybePopArrayConstructorFuses(cx, obj, id);
+
+  MaybePopArrayPrototypeFuses(cx, obj, id);
+
+  MaybePopArrayIteratorPrototypeFuses(cx, obj, id);
+
+  MaybePopMapPrototypeFuses(cx, obj, id);
+
+  MaybePopMapIteratorPrototypeFuses(cx, obj, id);
+
+  MaybePopSetPrototypeFuses(cx, obj, id);
+
+  MaybePopSetIteratorPrototypeFuses(cx, obj, id);
+
+  MaybePopWeakMapPrototypeFuses(cx, obj, id);
+
+  MaybePopWeakSetPrototypeFuses(cx, obj, id);
+
+  MaybePopPromiseConstructorFuses(cx, obj, id);
+
+  MaybePopPromisePrototypeFuses(cx, obj, id);
+
+  MaybePopRegExpPrototypeFuses(cx, obj, id);
+
+  MaybePopArrayBufferConstructorFuses(cx, obj, id);
+
+  MaybePopArrayBufferPrototypeFuses(cx, obj, id);
+
+  MaybePopSharedArrayBufferConstructorFuses(cx, obj, id);
+
+  MaybePopSharedArrayBufferPrototypeFuses(cx, obj, id);
+
+  MaybePopTypedArrayConstructorFuses(cx, obj, id);
+
+  MaybePopTypedArrayPrototypeFuses(cx, obj, id);
+}
+
+bool Watchtower::watchPropertyRemoveSlow(JSContext* cx,
+                                         Handle<NativeObject*> obj, HandleId id,
+                                         PropertyInfo propInfo,
+                                         bool* wasTrackedObjectFuseProp) {
+  MOZ_ASSERT(watchesPropertyRemove(obj));
+
+  if (obj->isUsedAsPrototype() && !id.isInt()) {
+    InvalidateMegamorphicCache(cx, obj);
+  }
+
+  if (obj->isGenerationCountedGlobal()) {
+    obj->as<GlobalObject>().bumpGenerationCount();
+  }
+
+  if (MOZ_UNLIKELY(obj->hasRealmFuseProperty())) {
+    MaybePopRealmFuses(cx, obj, id);
+  }
+  if (obj->hasObjectFuse() && ObjectFuse::tracksPropertyKey(id)) {
+    if (auto* objFuse = cx->zone()->objectFuses.get(obj)) {
+      objFuse->handlePropertyRemove(cx, propInfo, wasTrackedObjectFuseProp);
+    }
+  }
+
+  if (MOZ_UNLIKELY(obj->useWatchtowerTestingLog())) {
+    RootedValue val(cx, IdToValue(id));
+    if (!AddToWatchtowerLog(cx, "remove-prop", obj, val)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool Watchtower::watchPropertyFlagsChangeSlow(JSContext* cx,
+                                              Handle<NativeObject*> obj,
+                                              HandleId id,
+                                              PropertyInfo propInfo,
+                                              PropertyFlags newFlags) {
+  MOZ_ASSERT(watchesPropertyFlagsChange(obj));
+  MOZ_ASSERT(obj->lookupPure(id).ref() == propInfo);
+  MOZ_ASSERT(propInfo.flags() != newFlags);
+
+  if (obj->isUsedAsPrototype() && !id.isInt()) {
+    InvalidateMegamorphicCache(cx, obj);
+  }
+
+  if (obj->isGenerationCountedGlobal()) {
+    bool wasAccessor = propInfo.isAccessorProperty();
+    bool isAccessor = newFlags.isAccessorProperty();
+    if (wasAccessor != isAccessor) {
+      obj->as<GlobalObject>().bumpGenerationCount();
+    }
+  }
+
+  if (MOZ_UNLIKELY(obj->useWatchtowerTestingLog())) {
+    RootedValue val(cx, IdToValue(id));
+    if (!AddToWatchtowerLog(cx, "change-prop-flags", obj, val)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+template <AllowGC allowGC>
+void Watchtower::watchPropertyValueChangeSlow(
+    JSContext* cx, typename MaybeRooted<NativeObject*, allowGC>::HandleType obj,
+    typename MaybeRooted<PropertyKey, allowGC>::HandleType id,
+    typename MaybeRooted<Value, allowGC>::HandleType value,
+    PropertyInfo propInfo) {
+  MOZ_ASSERT(watchesPropertyValueChange(obj));
+
+
+  if (id.isInt()) {
+    return;
+  }
+
+  if (obj->hasObjectFuse()) {
+    MOZ_ASSERT(ObjectFuse::tracksPropertyKey(id));
+    if (auto* objFuse = cx->zone()->objectFuses.get(obj)) {
+      objFuse->handlePropertyValueChange(cx, propInfo);
+    }
+  }
+
+  if (propInfo.hasSlot() && obj->getSlot(propInfo.slot()) == value) {
+    return;
+  }
+
+  if (MOZ_UNLIKELY(obj->hasRealmFuseProperty())) {
+    MaybePopRealmFuses(cx, obj, id);
+  }
+
+  if constexpr (allowGC == AllowGC::CanGC) {
+    if (MOZ_UNLIKELY(obj->useWatchtowerTestingLog())) {
+      RootedValue val(cx, IdToValue(id));
+      if (!AddToWatchtowerLog(cx, "change-prop-value", obj, val)) {
+        cx->clearPendingException();
+      }
+    }
+  }
+}
+
+template void Watchtower::watchPropertyValueChangeSlow<AllowGC::CanGC>(
+    JSContext* cx,
+    typename MaybeRooted<NativeObject*, AllowGC::CanGC>::HandleType obj,
+    typename MaybeRooted<PropertyKey, AllowGC::CanGC>::HandleType id,
+    typename MaybeRooted<Value, AllowGC::CanGC>::HandleType value,
+    PropertyInfo propInfo);
+template void Watchtower::watchPropertyValueChangeSlow<AllowGC::NoGC>(
+    JSContext* cx,
+    typename MaybeRooted<NativeObject*, AllowGC::NoGC>::HandleType obj,
+    typename MaybeRooted<PropertyKey, AllowGC::NoGC>::HandleType id,
+    typename MaybeRooted<Value, AllowGC::NoGC>::HandleType value,
+    PropertyInfo propInfo);
+
+SetSlotOptimizable Watchtower::canOptimizeSetSlotSlow(JSContext* cx,
+                                                      NativeObject* obj,
+                                                      PropertyKey key,
+                                                      PropertyInfo prop) {
+  MOZ_ASSERT(obj->hasObjectFuse());
+  MOZ_ASSERT(ObjectFuse::tracksPropertyKey(key));
+
+  ObjectFuse* objFuse = cx->zone()->objectFuses.getOrCreate(cx, obj);
+  if (!objFuse) {
+    cx->recoverFromOutOfMemory();
+    return SetSlotOptimizable::No;
+  }
+
+  if (objFuse->canOptimizeSetSlot(prop)) {
+    return SetSlotOptimizable::Yes;
+  }
+
+  return SetSlotOptimizable::NotYet;
+}
+
+bool Watchtower::watchFreezeOrSealSlow(JSContext* cx, Handle<NativeObject*> obj,
+                                       IntegrityLevel level) {
+  MOZ_ASSERT(watchesFreezeOrSeal(obj));
+
+  if (level == IntegrityLevel::Frozen && obj->isUsedAsPrototype()) {
+    InvalidateMegamorphicCache(cx, obj,  false);
+  }
+
+  if (MOZ_UNLIKELY(obj->useWatchtowerTestingLog())) {
+    if (!AddToWatchtowerLog(cx, "freeze-or-seal", obj,
+                            JS::UndefinedHandleValue)) {
+      return false;
+    }
+  }
+
+  return true;
+}

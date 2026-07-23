@@ -1,0 +1,224 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Box.h"
+
+#include <algorithm>
+
+#include "ByteStream.h"
+#include "mozilla/EndianUtils.h"
+
+namespace mozilla {
+
+const uint64_t Box::kMAX_BOX_READ = 32 * 1024 * 1024;
+
+static uint32_t BoxOffset(AtomType aType) {
+  const uint32_t FULLBOX_OFFSET = 4;
+
+  if (aType == AtomType("mp4a") || aType == AtomType("enca")) {
+    return 28;
+  } else if (aType == AtomType("mp4v") || aType == AtomType("encv")) {
+    return 78;
+  } else if (aType == AtomType("stsd")) {
+    return FULLBOX_OFFSET + 4;
+  }
+
+  return 0;
+}
+
+Box::Box(BoxContext* aContext, uint64_t aOffset, const Box* aParent)
+    : mContext(aContext), mParent(aParent) {
+  mInitStatus = NS_ERROR_DOM_MEDIA_RANGE_ERR;
+  mRange = MediaByteRange(aOffset, aOffset);
+
+  uint8_t header[8];
+  if (aOffset > INT64_MAX - sizeof(header)) {
+    return;
+  }
+
+  MediaByteRange headerRange(aOffset, aOffset + sizeof(header));
+  if (mParent && !mParent->mRange.Contains(headerRange)) {
+    return;
+  }
+
+  const MediaByteRange* byteRange;
+  for (int i = 0;; i++) {
+    if (i == mContext->mByteRanges.Length()) {
+      return;
+    }
+
+    byteRange = static_cast<const MediaByteRange*>(&mContext->mByteRanges[i]);
+    if (byteRange->Contains(headerRange)) {
+      break;
+    }
+  }
+
+  size_t bytes;
+  nsresult rv =
+      mContext->mSource->CachedReadAt(aOffset, header, sizeof(header), &bytes);
+  if (NS_FAILED(rv)) {
+    mInitStatus = rv;
+    return;
+  }
+  if (bytes != sizeof(header)) {
+    return;
+  }
+
+  uint64_t size = BigEndian::readUint32(header);
+  if (size == 1) {
+    uint8_t bigLength[8];
+    if (aOffset > INT64_MAX - sizeof(header) - sizeof(bigLength)) {
+      return;
+    }
+    MediaByteRange bigLengthRange(headerRange.mEnd,
+                                  headerRange.mEnd + sizeof(bigLength));
+    if ((mParent && !mParent->mRange.Contains(bigLengthRange)) ||
+        !byteRange->Contains(bigLengthRange)) {
+      return;
+    }
+    rv = mContext->mSource->CachedReadAt(aOffset + sizeof(header), bigLength,
+                                         sizeof(bigLength), &bytes);
+    if (NS_FAILED(rv)) {
+      mInitStatus = rv;
+      return;
+    }
+    if (bytes != sizeof(bigLength)) {
+      return;
+    }
+    size = BigEndian::readUint64(bigLength);
+    mBodyOffset = bigLengthRange.mEnd;
+  } else if (size == 0) {
+    size = mContext->mByteRanges.LastInterval().mEnd - aOffset;
+    mBodyOffset = headerRange.mEnd;
+  } else {
+    mBodyOffset = headerRange.mEnd;
+  }
+
+  if (size > INT64_MAX) {
+    return;
+  }
+  int64_t end = static_cast<int64_t>(aOffset) + static_cast<int64_t>(size);
+  if (end < static_cast<int64_t>(aOffset)) {
+    return;
+  }
+
+  mType = BigEndian::readUint32(&header[4]);
+  mChildOffset = mBodyOffset + BoxOffset(mType);
+
+  MediaByteRange boxRange(aOffset, end);
+  if (mChildOffset > boxRange.mEnd ||
+      (mParent && !mParent->mRange.Contains(boxRange)) ||
+      !byteRange->Contains(boxRange)) {
+    return;
+  }
+
+  mInitStatus = NS_OK;
+  mRange = boxRange;
+}
+
+Box::Box()
+    : mContext(nullptr), mBodyOffset(0), mChildOffset(0), mParent(nullptr) {}
+
+Box Box::Next() const {
+  MOZ_ASSERT(IsAvailable());
+  return Box(mContext, mRange.mEnd, mParent);
+}
+
+Box Box::FirstChild() const {
+  MOZ_ASSERT(IsAvailable());
+  if (mChildOffset == mRange.mEnd) {
+    return Box();
+  }
+  return Box(mContext, mChildOffset, this);
+}
+
+nsTArray<uint8_t> Box::ReadCompleteBox() const {
+  const size_t length = mRange.mEnd - mRange.mStart;
+  nsTArray<uint8_t> out(length);
+  out.SetLength(length);
+  size_t bytesRead = 0;
+  if (NS_FAILED(mContext->mSource->CachedReadAt(mRange.mStart, out.Elements(),
+                                                length, &bytesRead)) ||
+      bytesRead != length) {
+    NS_WARNING("Read failed in mozilla::Box::ReadCompleteBox()");
+    return nsTArray<uint8_t>(0);
+  }
+  return out;
+}
+
+nsTArray<uint8_t> Box::Read() const {
+  nsTArray<uint8_t> out;
+  (void)Read(&out, mRange);
+  return out;
+}
+
+bool Box::Read(nsTArray<uint8_t>* aDest, const MediaByteRange& aRange) const {
+  int64_t length;
+  if (!mContext->mSource->Length(&length)) {
+    length = std::min(aRange.mEnd - mChildOffset, kMAX_BOX_READ);
+  } else {
+    length = aRange.mEnd - mChildOffset;
+  }
+  aDest->SetLength(length);
+  size_t bytes;
+  if (NS_FAILED(mContext->mSource->CachedReadAt(mChildOffset, aDest->Elements(),
+                                                aDest->Length(), &bytes)) ||
+      bytes != aDest->Length()) {
+    NS_WARNING("Read failed in mozilla::Box::Read()");
+    aDest->Clear();
+    return false;
+  }
+  return true;
+}
+
+ByteSlice Box::ReadAsSlice() const {
+  if (!mContext || mRange.IsEmpty()) {
+    return ByteSlice{nullptr, 0};
+  }
+
+  int64_t length;
+  if (!mContext->mSource->Length(&length)) {
+    length = std::min(mRange.mEnd - mChildOffset, kMAX_BOX_READ);
+  } else {
+    length = mRange.mEnd - mChildOffset;
+  }
+
+  const uint8_t* data =
+      mContext->mSource->GetContiguousAccess(mChildOffset, length);
+  if (data) {
+    return ByteSlice{data, size_t(length)};
+  }
+
+  uint8_t* p = mContext->mAllocator.Allocate(size_t(length));
+  size_t bytes;
+  if (NS_FAILED(
+          mContext->mSource->CachedReadAt(mChildOffset, p, length, &bytes)) ||
+      bytes != length) {
+    NS_WARNING("Read failed in mozilla::Box::ReadAsSlice()");
+    return ByteSlice{nullptr, 0};
+  }
+  return ByteSlice{p, size_t(length)};
+}
+
+const size_t BLOCK_CAPACITY = 16 * 1024;
+
+uint8_t* BumpAllocator::Allocate(size_t aNumBytes) {
+  if (aNumBytes > BLOCK_CAPACITY) {
+    mBuffers.AppendElement(nsTArray<uint8_t>(aNumBytes));
+    mBuffers.LastElement().SetLength(aNumBytes);
+    return mBuffers.LastElement().Elements();
+  }
+  for (nsTArray<uint8_t>& buffer : mBuffers) {
+    if (buffer.Length() + aNumBytes < BLOCK_CAPACITY) {
+      size_t offset = buffer.Length();
+      buffer.SetLength(buffer.Length() + aNumBytes);
+      return buffer.Elements() + offset;
+    }
+  }
+  mBuffers.AppendElement(nsTArray<uint8_t>(BLOCK_CAPACITY));
+  mBuffers.LastElement().SetLength(aNumBytes);
+  return mBuffers.LastElement().Elements();
+}
+
+}  

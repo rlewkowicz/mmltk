@@ -1,0 +1,43 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_AltDataOutputStreamChild_h
+#define mozilla_net_AltDataOutputStreamChild_h
+
+#include "mozilla/net/PAltDataOutputStreamChild.h"
+#include "nsIAsyncOutputStream.h"
+
+namespace mozilla {
+namespace net {
+
+class AltDataOutputStreamChild : public PAltDataOutputStreamChild,
+                                 public nsIAsyncOutputStream {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIASYNCOUTPUTSTREAM
+  NS_DECL_NSIOUTPUTSTREAM
+  explicit AltDataOutputStreamChild();
+
+  void AddIPDLReference();
+  void ReleaseIPDLReference();
+  virtual mozilla::ipc::IPCResult RecvError(const nsresult& err);
+  virtual mozilla::ipc::IPCResult RecvDeleteSelf();
+
+ private:
+  virtual ~AltDataOutputStreamChild() = default;
+  bool WriteDataInChunks(const nsDependentCSubstring& data);
+  void NotifyListener();
+
+  bool mIPCOpen;
+  nsresult mError;
+
+  nsCOMPtr<nsIOutputStreamCallback> mCallback;
+  uint32_t mCallbackFlags;
+  nsCOMPtr<nsIEventTarget> mCallbackTarget;
+};
+
+}  
+}  
+
+#endif  // mozilla_net_AltDataOutputStreamChild_h

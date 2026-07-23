@@ -1,0 +1,205 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_StableCellHasher_inl_h
+#define gc_StableCellHasher_inl_h
+
+#include "gc/StableCellHasher.h"
+
+#include "mozilla/HashFunctions.h"
+
+#include "gc/Cell.h"
+#include "gc/Marking.h"
+#include "gc/Zone.h"
+#include "vm/JSObject.h"
+#include "vm/NativeObject.h"
+#include "vm/Runtime.h"
+
+namespace js {
+namespace gc {
+
+extern uint64_t NextCellUniqueId(JSRuntime* rt);
+
+inline bool MaybeGetUniqueId(Cell* cell, uint64_t* uidp) {
+  MOZ_ASSERT(uidp);
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(cell->runtimeFromAnyThread()) ||
+             CurrentThreadIsPerformingGC());
+
+  if (cell->is<JSObject>()) {
+    JSObject* obj = cell->as<JSObject>();
+    if (obj->is<NativeObject>()) {
+      auto* nobj = &obj->as<NativeObject>();
+      if (!nobj->hasUniqueId()) {
+        return false;
+      }
+
+      *uidp = nobj->uniqueId();
+      return true;
+    }
+  }
+
+  auto p = cell->zone()->uniqueIds().readonlyThreadsafeLookup(cell);
+  if (!p) {
+    return false;
+  }
+
+  *uidp = p->value();
+
+  return true;
+}
+
+extern bool CreateUniqueIdForNativeObject(NativeObject* obj, uint64_t* uidp);
+extern bool CreateUniqueIdForNonNativeObject(Cell* cell, UniqueIdMap::AddPtr,
+                                             uint64_t* uidp);
+
+inline bool GetOrCreateUniqueId(Cell* cell, uint64_t* uidp) {
+  MOZ_ASSERT(uidp);
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(cell->runtimeFromAnyThread()) ||
+             CurrentThreadIsPerformingGC());
+
+  if (cell->is<JSObject>()) {
+    JSObject* obj = cell->as<JSObject>();
+    if (obj->is<NativeObject>()) {
+      auto* nobj = &obj->as<NativeObject>();
+      if (nobj->hasUniqueId()) {
+        *uidp = nobj->uniqueId();
+        return true;
+      }
+
+      return CreateUniqueIdForNativeObject(nobj, uidp);
+    }
+  }
+
+  auto p = cell->zone()->uniqueIds().lookupForAdd(cell);
+  if (p) {
+    *uidp = p->value();
+    return true;
+  }
+
+  return CreateUniqueIdForNonNativeObject(cell, p, uidp);
+}
+
+inline uint64_t GetUniqueIdInfallible(Cell* cell) {
+  uint64_t uid;
+  AutoEnterOOMUnsafeRegion oomUnsafe;
+  if (!GetOrCreateUniqueId(cell, &uid)) {
+    oomUnsafe.crash("failed to allocate uid");
+  }
+  return uid;
+}
+
+inline bool HasUniqueId(Cell* cell) {
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(cell->runtimeFromAnyThread()) ||
+             CurrentThreadIsPerformingGC());
+
+  if (cell->is<JSObject>()) {
+    JSObject* obj = cell->as<JSObject>();
+    if (obj->is<NativeObject>()) {
+      return obj->as<NativeObject>().hasUniqueId();
+    }
+  }
+
+  return cell->zone()->uniqueIds().has(cell);
+}
+
+inline void TransferUniqueId(Cell* tgt, Cell* src) {
+  MOZ_ASSERT(src != tgt);
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(tgt->runtimeFromAnyThread()));
+  MOZ_ASSERT(src->zone() == tgt->zone());
+
+  Zone* zone = tgt->zone();
+  MOZ_ASSERT_IF(zone->uniqueIds().has(src), !zone->uniqueIds().has(tgt));
+  zone->uniqueIds().rekeyIfMoved(src, tgt);
+}
+
+inline void RemoveUniqueId(Cell* cell) {
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(cell->runtimeFromAnyThread()));
+  cell->zone()->uniqueIds().remove(cell);
+}
+
+}  
+
+static inline js::HashNumber UniqueIdToHash(uint64_t uid) {
+  return DefaultHasher<uint64_t>::hash(uid);
+}
+
+template <typename T>
+ bool StableCellHasher<T>::maybeGetHash(const Lookup& l,
+                                                    HashNumber* hashOut) {
+  if (!l) {
+    *hashOut = 0;
+    return true;
+  }
+
+  uint64_t uid;
+  if (!gc::MaybeGetUniqueId(l, &uid)) {
+    return false;
+  }
+
+  *hashOut = UniqueIdToHash(uid);
+  return true;
+}
+
+template <typename T>
+ bool StableCellHasher<T>::ensureHash(const Lookup& l,
+                                                  HashNumber* hashOut) {
+  if (!l) {
+    *hashOut = 0;
+    return true;
+  }
+
+  uint64_t uid;
+  if (!gc::GetOrCreateUniqueId(l, &uid)) {
+    return false;
+  }
+
+  *hashOut = UniqueIdToHash(uid);
+  return true;
+}
+
+template <typename T>
+ HashNumber StableCellHasher<T>::hash(const Lookup& l) {
+  if (!l) {
+    return 0;
+  }
+
+  MOZ_ASSERT(CurrentThreadCanAccessZone(l->zoneFromAnyThread()) ||
+             CurrentThreadIsPerformingGC());
+
+  return UniqueIdToHash(gc::GetUniqueIdInfallible(l));
+}
+
+template <typename T>
+ bool StableCellHasher<T>::match(const Key& k, const Lookup& l) {
+  if (k == l) {
+    return true;
+  }
+
+  if (!k || !l) {
+    return false;
+  }
+
+  MOZ_ASSERT(CurrentThreadCanAccessZone(l->zoneFromAnyThread()) ||
+             CurrentThreadIsPerformingGC());
+
+#ifdef DEBUG
+  if (!gc::HasUniqueId(k)) {
+    Key key = k;
+    MOZ_ASSERT(key->zoneFromAnyThread()->needsMarkingBarrier() &&
+               !key->isMarkedAny());
+  }
+  MOZ_ASSERT(gc::HasUniqueId(l));
+#endif
+
+  uint64_t keyId;
+  if (!gc::MaybeGetUniqueId(k, &keyId)) {
+    return false;
+  }
+
+  return keyId == gc::GetUniqueIdInfallible(l);
+}
+
+}  
+
+#endif  // gc_StableCellHasher_inl_h

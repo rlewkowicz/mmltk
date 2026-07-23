@@ -1,0 +1,69 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_MediaFeatureChange_h_
+#define mozilla_MediaFeatureChange_h_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/TypedEnumBits.h"
+#include "nsChangeHint.h"
+
+namespace mozilla {
+
+enum class MediaFeatureChangeReason : uint8_t {
+  ViewportChange = 1 << 0,
+  ZoomChange = 1 << 1,
+  ResolutionChange = 1 << 2,
+  MediumChange = 1 << 3,
+  SizeModeChange = 1 << 4,
+  SystemMetricsChange = 1 << 5,
+  DisplayModeChange = 1 << 6,
+  PreferenceChange = 1 << 7,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(MediaFeatureChangeReason)
+
+enum class MediaFeatureChangePropagation : uint8_t {
+  JustThisDocument = 0,
+  SubDocuments = 1 << 0,
+  Images = 1 << 1,
+  All = Images | SubDocuments,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(MediaFeatureChangePropagation)
+
+struct MediaFeatureChange {
+  static const auto kAllChanges = static_cast<MediaFeatureChangeReason>(~0);
+
+  RestyleHint mRestyleHint;
+  nsChangeHint mChangeHint;
+  MediaFeatureChangeReason mReason;
+
+  MOZ_IMPLICIT MediaFeatureChange(MediaFeatureChangeReason aReason)
+      : MediaFeatureChange(RestyleHint{0}, nsChangeHint(0), aReason) {}
+
+  MediaFeatureChange(RestyleHint aRestyleHint, nsChangeHint aChangeHint,
+                     MediaFeatureChangeReason aReason)
+      : mRestyleHint(aRestyleHint),
+        mChangeHint(aChangeHint),
+        mReason(aReason) {}
+
+  inline MediaFeatureChange& operator|=(const MediaFeatureChange& aOther) {
+    mRestyleHint |= aOther.mRestyleHint;
+    mChangeHint |= aOther.mChangeHint;
+    mReason |= aOther.mReason;
+    return *this;
+  }
+
+  static MediaFeatureChange ForPreferredColorSchemeOrForcedColorsChange() {
+    return {RestyleHint::RecascadeSubtree(), nsChangeHint(0),
+            MediaFeatureChangeReason::SystemMetricsChange};
+  }
+};
+
+}  
+
+#endif

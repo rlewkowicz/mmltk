@@ -1,0 +1,40 @@
+
+//! Utilities to calculate exponents.
+
+/// Convert usize into i32 without overflow.
+///
+/// This is needed to ensure when adjusting the exponent relative to
+/// the mantissa we do not overflow for comically-long exponents.
+#[inline]
+fn into_i32(value: usize) -> i32 {
+    if value > i32::MAX as usize {
+        i32::MAX
+    } else {
+        value as i32
+    }
+}
+
+
+#[inline]
+pub(crate) fn scientific_exponent(
+    exponent: i32,
+    integer_digits: usize,
+    fraction_start: usize,
+) -> i32 {
+    if integer_digits == 0 {
+        let fraction_start = into_i32(fraction_start);
+        exponent.saturating_sub(fraction_start).saturating_sub(1)
+    } else {
+        let integer_shift = into_i32(integer_digits - 1);
+        exponent.saturating_add(integer_shift)
+    }
+}
+
+#[inline]
+pub(crate) fn mantissa_exponent(exponent: i32, fraction_digits: usize, truncated: usize) -> i32 {
+    if fraction_digits > truncated {
+        exponent.saturating_sub(into_i32(fraction_digits - truncated))
+    } else {
+        exponent.saturating_add(into_i32(truncated - fraction_digits))
+    }
+}

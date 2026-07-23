@@ -1,0 +1,80 @@
+// Copyright (c) 2009-2017 The OTS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(OTS_CMAP_H_)
+#define OTS_CMAP_H_
+
+#include <vector>
+
+#include "ots.h"
+
+namespace ots {
+
+struct OpenTypeCMAPSubtableRange {
+  uint32_t start_range;
+  uint32_t end_range;
+  uint32_t start_glyph_id;
+};
+
+struct OpenTypeCMAPSubtableVSRange {
+  uint32_t unicode_value;
+  uint8_t additional_count;
+};
+
+struct OpenTypeCMAPSubtableVSMapping {
+  uint32_t unicode_value;
+  uint16_t glyph_id;
+};
+
+struct OpenTypeCMAPSubtableVSRecord {
+  uint32_t var_selector;
+  uint32_t default_offset;
+  uint32_t non_default_offset;
+  std::vector<OpenTypeCMAPSubtableVSRange> ranges;
+  std::vector<OpenTypeCMAPSubtableVSMapping> mappings;
+};
+
+class OpenTypeCMAP : public Table {
+ public:
+  explicit OpenTypeCMAP(Font *font, uint32_t tag)
+      : Table(font, tag, tag),
+        subtable_0_3_4_data(NULL),
+        subtable_0_3_4_length(0),
+        subtable_0_5_14_length(0),
+        subtable_3_0_4_data(NULL),
+        subtable_3_0_4_length(0),
+        subtable_3_1_4_data(NULL),
+        subtable_3_1_4_length(0) {
+  }
+
+  bool Parse(const uint8_t *data, size_t length);
+  bool Serialize(OTSStream *out);
+
+ private:
+  const uint8_t *subtable_0_3_4_data;
+  size_t subtable_0_3_4_length;
+
+  size_t subtable_0_5_14_length;
+  std::vector<OpenTypeCMAPSubtableVSRecord> subtable_0_5_14;
+
+  const uint8_t *subtable_3_0_4_data;
+  size_t subtable_3_0_4_length;
+  const uint8_t *subtable_3_1_4_data;
+  size_t subtable_3_1_4_length;
+
+  std::vector<OpenTypeCMAPSubtableRange> subtable_3_10_12;
+  std::vector<OpenTypeCMAPSubtableRange> subtable_3_10_13;
+  std::vector<uint8_t> subtable_1_0_0;
+
+  bool ParseFormat4(int platform, int encoding, const uint8_t *data,
+                    size_t length, uint16_t num_glyphs);
+  bool Parse31012(const uint8_t *data, size_t length, uint16_t num_glyphs);
+  bool Parse31013(const uint8_t *data, size_t length, uint16_t num_glyphs);
+  bool Parse0514(const uint8_t *data, size_t length);
+  bool Parse100(const uint8_t *data, size_t length);
+};
+
+}  
+
+#endif

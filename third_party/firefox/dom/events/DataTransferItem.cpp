@@ -1,0 +1,524 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DataTransferItem.h"
+
+#include "DataTransferItemList.h"
+#include "imgIContainer.h"
+#include "imgITools.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/ContentEvents.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/BlobImpl.h"
+#include "mozilla/dom/DataTransferItemBinding.h"
+#include "mozilla/dom/Directory.h"
+#include "mozilla/dom/FileSystem.h"
+#include "mozilla/dom/FileSystemDirectoryEntry.h"
+#include "mozilla/dom/FileSystemFileEntry.h"
+#include "nsComponentManagerUtils.h"
+#include "nsContentUtils.h"
+#include "nsGlobalWindowInner.h"
+#include "nsIClipboard.h"
+#include "nsIFile.h"
+#include "nsIInputStream.h"
+#include "nsIScriptObjectPrincipal.h"
+#include "nsISupportsPrimitives.h"
+#include "nsNetUtil.h"
+#include "nsQueryObject.h"
+#include "nsThreadUtils.h"
+#include "nsVariant.h"
+
+namespace {
+
+struct FileMimeNameData {
+  const char* mMimeName;
+  const char* mFileName;
+};
+
+FileMimeNameData kFileMimeNameMap[] = {
+    {kFileMime, "GenericFileName"},
+    {kPNGImageMime, "GenericImageNamePNG"},
+};
+
+}  
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(DataTransferItem, mData, mPrincipal,
+                                      mDataTransfer, mCachedFile)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(DataTransferItem)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(DataTransferItem)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(DataTransferItem)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+JSObject* DataTransferItem::WrapObject(JSContext* aCx,
+                                       JS::Handle<JSObject*> aGivenProto) {
+  return DataTransferItem_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+already_AddRefed<DataTransferItem> DataTransferItem::Clone(
+    DataTransfer* aDataTransfer) const {
+  MOZ_ASSERT(aDataTransfer);
+
+  RefPtr<DataTransferItem> it = new DataTransferItem(aDataTransfer, mType);
+
+  it->mKind = mKind;
+  it->mIndex = mIndex;
+  it->mData = mData;
+  it->mPrincipal = mPrincipal;
+  it->mChromeOnly = mChromeOnly;
+  it->mDoNotAttemptToLoadData = mDoNotAttemptToLoadData;
+
+  return it.forget();
+}
+
+void DataTransferItem::SetData(nsIVariant* aData) {
+  mCachedFile = nullptr;
+
+  if (!aData) {
+    MOZ_ASSERT(!mType.IsEmpty());
+    MOZ_ASSERT(!mType.EqualsASCII(kNativeImageMime));
+
+    mKind = KIND_STRING;
+    for (const auto& entry : kFileMimeNameMap) {
+      if (mType.EqualsASCII(entry.mMimeName)) {
+        mKind = KIND_FILE;
+        break;
+      }
+    }
+
+    mData = nullptr;
+    return;
+  }
+
+  mData = aData;
+  mKind = KindFromData(mData);
+}
+
+ DataTransferItem::eKind DataTransferItem::KindFromData(
+    nsIVariant* aData) {
+  nsCOMPtr<nsISupports> supports;
+  nsresult rv = aData->GetAsISupports(getter_AddRefs(supports));
+  if (NS_SUCCEEDED(rv) && supports) {
+    if (RefPtr<Blob>(do_QueryObject(supports)) ||
+        nsCOMPtr<BlobImpl>(do_QueryInterface(supports)) ||
+        nsCOMPtr<nsIFile>(do_QueryInterface(supports))) {
+      return KIND_FILE;
+    }
+
+    if (StaticPrefs::dom_events_dataTransfer_imageAsFile_enabled()) {
+      if (nsCOMPtr<imgIContainer>(do_QueryInterface(supports))) {
+        return KIND_FILE;
+      }
+    }
+  }
+
+  nsAutoString string;
+  rv = aData->GetAsAString(string);
+  if (NS_SUCCEEDED(rv)) {
+    return KIND_STRING;
+  }
+
+  return KIND_OTHER;
+}
+
+void DataTransferItem::FillInExternalData() {
+  if (mData || mDoNotAttemptToLoadData) {
+    return;
+  }
+
+  NS_ConvertUTF16toUTF8 utf8format(mType);
+  const char* format = utf8format.get();
+  if (strcmp(format, "text/uri-list") == 0) {
+    format = kURLDataMime;
+  }
+
+  nsCOMPtr<nsITransferable> trans = mDataTransfer->GetTransferable();
+  if (!trans) {
+    trans = do_CreateInstance("@mozilla.org/widget/transferable;1");
+    if (NS_WARN_IF(!trans)) {
+      return;
+    }
+
+    trans->Init(nullptr);
+    trans->AddDataFlavor(format);
+
+    if (mDataTransfer->GetEventMessage() == ePaste) {
+      MOZ_ASSERT(mIndex == 0, "index in clipboard must be 0");
+
+      if (mDataTransfer->ClipboardType().isNothing()) {
+        return;
+      }
+
+      nsCOMPtr<nsIClipboardDataSnapshot> clipboardDataSnapshot =
+          mDataTransfer->GetClipboardDataSnapshot();
+      if (!clipboardDataSnapshot) {
+        return;
+      }
+      nsresult rv = clipboardDataSnapshot->GetDataSync(trans);
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        if (rv == NS_ERROR_CONTENT_BLOCKED) {
+          mDoNotAttemptToLoadData = true;
+        }
+        return;
+      }
+    } else {
+      nsCOMPtr<nsIDragSession> dragSession =
+          mDataTransfer->GetOwnerDragSession();
+      if (!dragSession) {
+        return;
+      }
+
+      nsresult rv = dragSession->GetData(trans, mIndex);
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        return;
+      }
+    }
+  }
+
+  nsCOMPtr<nsISupports> data;
+  nsresult rv = trans->GetTransferData(format, getter_AddRefs(data));
+  if (NS_WARN_IF(NS_FAILED(rv) || !data)) {
+    return;
+  }
+
+  RefPtr<nsVariantCC> variant = new nsVariantCC();
+
+  eKind oldKind = Kind();
+  if (oldKind == KIND_FILE) {
+    if (nsCOMPtr<nsIInputStream> istream = do_QueryInterface(data)) {
+      RefPtr<File> file = CreateFileFromInputStream(istream);
+      if (NS_WARN_IF(!file)) {
+        return;
+      }
+      data = do_QueryObject(file);
+    }
+    variant->SetAsISupports(data);
+  } else {
+    MOZ_ASSERT(oldKind == KIND_STRING);
+
+    nsCOMPtr<nsISupportsString> supportsstr = do_QueryInterface(data);
+    if (supportsstr) {
+      nsAutoString str;
+      supportsstr->GetData(str);
+      variant->SetAsAString(str);
+    } else {
+      nsCOMPtr<nsISupportsCString> supportscstr = do_QueryInterface(data);
+      if (supportscstr) {
+        nsAutoCString str;
+        supportscstr->GetData(str);
+        variant->SetAsACString(str);
+      }
+    }
+  }
+
+  SetData(variant);
+
+  if (oldKind != Kind()) {
+    NS_WARNING(
+        "Clipboard data provided by the OS does not match predicted kind");
+    mDataTransfer->TypesListMayHaveChanged();
+  }
+}
+
+void DataTransferItem::GetType(nsAString& aType) {
+  if (Kind() != KIND_FILE) {
+    aType = mType;
+    return;
+  }
+
+  ErrorResult rv;
+  RefPtr<File> file = GetAsFile(*nsContentUtils::GetSystemPrincipal(), rv);
+  MOZ_ASSERT(!rv.Failed(), "Failed to get file data with system principal");
+
+  if (NS_WARN_IF(!file)) {
+    aType = mType;
+    return;
+  }
+
+  file->GetType(aType);
+}
+
+already_AddRefed<File> DataTransferItem::GetAsFile(
+    nsIPrincipal& aSubjectPrincipal, ErrorResult& aRv) {
+  nsCOMPtr<nsIVariant> data = Data(&aSubjectPrincipal, aRv);
+  if (NS_WARN_IF(!data || aRv.Failed())) {
+    return nullptr;
+  }
+
+  if (NS_WARN_IF(mKind != KIND_FILE)) {
+    return nullptr;
+  }
+
+  if (!mCachedFile) {
+    nsCOMPtr<nsISupports> supports;
+    aRv = data->GetAsISupports(getter_AddRefs(supports));
+    MOZ_ASSERT(!aRv.Failed() && supports,
+               "File objects should be stored as nsISupports variants");
+    if (aRv.Failed() || !supports) {
+      return nullptr;
+    }
+
+    if (RefPtr<Blob> blob = do_QueryObject(supports)) {
+      mCachedFile = blob->ToFile();
+    } else {
+      nsCOMPtr<nsIGlobalObject> global = mDataTransfer->GetGlobal();
+      if (NS_WARN_IF(!global)) {
+        return nullptr;
+      }
+
+      if (nsCOMPtr<BlobImpl> blobImpl = do_QueryInterface(supports)) {
+        MOZ_ASSERT(blobImpl->IsFile());
+        mCachedFile = File::Create(global, blobImpl);
+        if (NS_WARN_IF(!mCachedFile)) {
+          return nullptr;
+        }
+      } else if (nsCOMPtr<nsIFile> ifile = do_QueryInterface(supports)) {
+        mCachedFile = File::CreateFromFile(global, ifile);
+        if (NS_WARN_IF(!mCachedFile)) {
+          return nullptr;
+        }
+      } else if (nsCOMPtr<imgIContainer> img = do_QueryInterface(supports)) {
+        nsCOMPtr<imgITools> imgTools =
+            do_CreateInstance("@mozilla.org/image/tools;1");
+
+        nsCOMPtr<nsIInputStream> inputStream;
+        nsresult rv = imgTools->EncodeImage(img, "image/png"_ns, u""_ns,
+                                            getter_AddRefs(inputStream));
+        if (NS_WARN_IF(NS_FAILED(rv))) {
+          return nullptr;
+        }
+
+        mCachedFile = CreateFileFromInputStream(
+            inputStream, "GenericImageNamePNG", u"image/png"_ns);
+        if (NS_WARN_IF(!mCachedFile)) {
+          return nullptr;
+        }
+      } else {
+        MOZ_ASSERT(false, "One of the above code paths should be taken");
+        return nullptr;
+      }
+    }
+  }
+
+  RefPtr<File> file = mCachedFile;
+  return file.forget();
+}
+
+already_AddRefed<FileSystemEntry> DataTransferItem::GetAsEntry(
+    nsIPrincipal& aSubjectPrincipal, ErrorResult& aRv) {
+  RefPtr<File> file = GetAsFile(aSubjectPrincipal, aRv);
+  if (NS_WARN_IF(aRv.Failed()) || !file) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIGlobalObject> global = mDataTransfer->GetGlobal();
+  if (NS_WARN_IF(!global)) {
+    return nullptr;
+  }
+
+  RefPtr<FileSystem> fs = FileSystem::Create(global);
+  RefPtr<FileSystemEntry> entry;
+  BlobImpl* impl = file->Impl();
+  MOZ_ASSERT(impl);
+
+  if (impl->IsDirectory()) {
+    nsAutoString fullpath;
+    impl->GetMozFullPathInternal(fullpath, aRv);
+    if (aRv.Failed()) {
+      aRv.SuppressException();
+      return nullptr;
+    }
+
+    nsCOMPtr<nsIFile> directoryFile;
+    nsresult rv = NS_NewLocalFile(fullpath, getter_AddRefs(directoryFile));
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return nullptr;
+    }
+
+    RefPtr<Directory> directory = Directory::Create(global, directoryFile);
+    entry = new FileSystemDirectoryEntry(global, directory, nullptr, fs);
+  } else {
+    entry = new FileSystemFileEntry(global, file, nullptr, fs);
+  }
+
+  Sequence<RefPtr<FileSystemEntry>> entries;
+  if (!entries.AppendElement(entry, fallible)) {
+    return nullptr;
+  }
+
+  fs->CreateRoot(entries);
+  return entry.forget();
+}
+
+already_AddRefed<File> DataTransferItem::CreateFileFromInputStream(
+    nsIInputStream* aStream) {
+  const char* key = nullptr;
+  for (const auto& enrty : kFileMimeNameMap) {
+    if (mType.EqualsASCII(enrty.mMimeName)) {
+      key = enrty.mFileName;
+      break;
+    }
+  }
+  if (!key) {
+    MOZ_ASSERT_UNREACHABLE("Unsupported mime type");
+    key = "GenericFileName";
+  }
+
+  return CreateFileFromInputStream(aStream, key, mType);
+}
+
+already_AddRefed<File> DataTransferItem::CreateFileFromInputStream(
+    nsIInputStream* aStream, const char* aFileNameKey,
+    const nsAString& aContentType) {
+  nsAutoString fileName;
+  nsresult rv = nsContentUtils::GetLocalizedString(
+      PropertiesFile::DOM_PROPERTIES, aFileNameKey, fileName);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return nullptr;
+  }
+
+  uint64_t available;
+  void* data = nullptr;
+  rv = NS_ReadInputStreamToBuffer(aStream, &data, -1, &available);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIGlobalObject> global = mDataTransfer->GetGlobal();
+  if (NS_WARN_IF(!global)) {
+    return nullptr;
+  }
+
+  return File::CreateMemoryFileWithLastModifiedNow(global, data, available,
+                                                   fileName, aContentType);
+}
+
+void DataTransferItem::GetAsString(FunctionStringCallback* aCallback,
+                                   nsIPrincipal& aSubjectPrincipal,
+                                   ErrorResult& aRv) {
+  if (!aCallback) {
+    return;
+  }
+
+  nsCOMPtr<nsIVariant> data = Data(&aSubjectPrincipal, aRv);
+  if (NS_WARN_IF(!data || aRv.Failed())) {
+    return;
+  }
+
+  if (NS_WARN_IF(mKind != KIND_STRING)) {
+    return;
+  }
+
+  nsAutoString stringData;
+  nsresult rv = data->GetAsAString(stringData);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return;
+  }
+
+  class GASRunnable final : public Runnable {
+   public:
+    GASRunnable(FunctionStringCallback* aCallback, const nsAString& aStringData)
+        : mozilla::Runnable("GASRunnable"),
+          mCallback(aCallback),
+          mStringData(aStringData) {}
+
+    MOZ_CAN_RUN_SCRIPT_BOUNDARY
+    NS_IMETHOD Run() override {
+      ErrorResult rv;
+      mCallback->Call(mStringData, rv);
+      NS_WARNING_ASSERTION(!rv.Failed(), "callback failed");
+      return rv.StealNSResult();
+    }
+
+   private:
+    const RefPtr<FunctionStringCallback> mCallback;
+    nsString mStringData;
+  };
+
+  RefPtr<GASRunnable> runnable = new GASRunnable(aCallback, stringData);
+
+  if (nsCOMPtr<nsIGlobalObject> global = mDataTransfer->GetGlobal()) {
+    rv = global->Dispatch(runnable.forget());
+  } else {
+    rv = NS_DispatchToMainThread(runnable);
+  }
+  if (NS_FAILED(rv)) {
+    NS_WARNING(
+        "Dispatch to main thread Failed in "
+        "DataTransferItem::GetAsString!");
+  }
+}
+
+already_AddRefed<nsIVariant> DataTransferItem::DataNoSecurityCheck() {
+  if (!mData) {
+    FillInExternalData();
+  }
+  nsCOMPtr<nsIVariant> data = mData;
+  return data.forget();
+}
+
+already_AddRefed<nsIVariant> DataTransferItem::Data(nsIPrincipal* aPrincipal,
+                                                    ErrorResult& aRv) {
+  MOZ_ASSERT(aPrincipal);
+
+  if (aPrincipal->IsSystemPrincipal()) {
+    return DataNoSecurityCheck();
+  }
+
+  if (mDataTransfer->IsProtected()) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIVariant> variant = DataNoSecurityCheck();
+
+  MOZ_ASSERT(!ChromeOnly(),
+             "Non-chrome code shouldn't see a ChromeOnly DataTransferItem");
+  if (ChromeOnly()) {
+    aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return nullptr;
+  }
+
+  bool checkItemPrincipal = mDataTransfer->IsCrossDomainSubFrameDrop() ||
+                            (mDataTransfer->GetEventMessage() != eDrop &&
+                             mDataTransfer->GetEventMessage() != ePaste &&
+                             mDataTransfer->GetEventMessage() != eEditorInput);
+
+  if (Principal() && checkItemPrincipal && !aPrincipal->Subsumes(Principal())) {
+    return nullptr;
+  }
+
+  if (!variant) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsISupports> data;
+  nsresult rv = variant->GetAsISupports(getter_AddRefs(data));
+  if (NS_SUCCEEDED(rv) && data) {
+    nsCOMPtr<EventTarget> pt = do_QueryInterface(data);
+    if (pt) {
+      nsIGlobalObject* go = pt->GetRelevantGlobal();
+      if (NS_WARN_IF(!go)) {
+        return nullptr;
+      }
+
+      nsCOMPtr<nsIScriptObjectPrincipal> sp = do_QueryInterface(go);
+      MOZ_ASSERT(sp, "This cannot fail on the main thread.");
+
+      nsIPrincipal* dataPrincipal = sp->GetPrincipal();
+      if (NS_WARN_IF(!dataPrincipal || !aPrincipal->Equals(dataPrincipal))) {
+        return nullptr;
+      }
+    }
+  }
+
+  return variant.forget();
+}
+
+}  

@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ViewportUtils_h
+#define mozilla_ViewportUtils_h
+
+#include "Units.h"
+#include "mozilla/layers/ScrollableLayerGuid.h"
+
+class nsIFrame;
+class nsIContent;
+class nsPresContext;
+
+namespace mozilla {
+
+class PresShell;
+
+class ViewportUtils {
+ public:
+  template <typename Units = CSSPixel>
+  static gfx::Matrix4x4TypedFlagged<Units, Units> GetVisualToLayoutTransform(
+      nsIContent* aContent);
+
+  static nsPoint VisualToLayout(const nsPoint& aPt, PresShell* aContext);
+  static nsRect VisualToLayout(const nsRect& aRect, PresShell* aContext);
+  static nsPoint LayoutToVisual(const nsPoint& aPt, PresShell* aContext);
+
+  static LayoutDevicePoint DocumentRelativeLayoutToVisual(
+      const LayoutDevicePoint& aPoint, PresShell* aShell);
+  static LayoutDeviceRect DocumentRelativeLayoutToVisual(
+      const LayoutDeviceRect& aRect, PresShell* aShell);
+  static LayoutDeviceRect DocumentRelativeLayoutToVisual(
+      const LayoutDeviceIntRect& aRect, PresShell* aShell);
+  static CSSRect DocumentRelativeLayoutToVisual(const CSSRect& aRect,
+                                                PresShell* aShell);
+
+  static LayoutDevicePoint ToScreenRelativeVisual(const LayoutDevicePoint& aPt,
+                                                  nsPresContext* aCtx);
+  static LayoutDeviceRect ToScreenRelativeVisual(const LayoutDeviceRect& aRect,
+                                                 nsPresContext* aCtx);
+
+  static const nsIFrame* IsZoomedContentRoot(const nsIFrame* aFrame);
+
+  static Scale2D TryInferEnclosingResolution(PresShell* aShell);
+};
+
+extern template CSSToCSSMatrix4x4Flagged
+ViewportUtils::GetVisualToLayoutTransform<CSSPixel>(nsIContent*);
+extern template LayoutDeviceToLayoutDeviceMatrix4x4Flagged
+ViewportUtils::GetVisualToLayoutTransform<LayoutDevicePixel>(nsIContent*);
+
+}  
+
+#endif /* mozilla_ViewportUtils_h */

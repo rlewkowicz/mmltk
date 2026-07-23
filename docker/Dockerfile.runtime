@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+
+ARG MMLTK_RUNTIME_BASE_IMAGE=mmltk-runtime-base:latest
+FROM ${MMLTK_RUNTIME_BASE_IMAGE}
+
+ARG MMLTK_RELEASE_FINGERPRINT=unlabeled
+ARG MMLTK_RUNTIME_BASE_IDENTITY=unknown
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+COPY --link bin/ /opt/mmltk/bin/
+COPY --link lib/*.so* /opt/mmltk/lib/
+COPY --link share/mmltk/python/ /opt/mmltk/share/mmltk/python/
+COPY --link lib/mmltk/firefox/ /opt/mmltk/lib/mmltk/firefox/
+COPY --link share/mmltk/browser-app/ /opt/mmltk/share/mmltk/browser-app/
+
+RUN for required_path in \
+        /opt/mmltk/bin/mmltk \
+        /opt/mmltk/bin/mmltk-browser-host \
+        /opt/mmltk/lib/mmltk/firefox/firefox \
+        /opt/mmltk/lib/mmltk/firefox/firefox-bin \
+        /opt/mmltk/lib/mmltk/firefox/libxul.so \
+        /opt/mmltk/lib/mmltk/firefox/libmozgtk.so \
+        /opt/mmltk/lib/mmltk/firefox/libmozwayland.so \
+        /opt/mmltk/lib/mmltk/firefox/application.ini \
+        /opt/mmltk/lib/mmltk/firefox/platform.ini \
+        /opt/mmltk/lib/mmltk/firefox/omni.ja \
+        /opt/mmltk/lib/mmltk/firefox/browser/omni.ja \
+        /opt/mmltk/share/mmltk/browser-app/index.html; do \
+        if [[ ! -e "${required_path}" ]]; then \
+            echo "Packaged release is incomplete: ${required_path}" >&2; \
+            exit 1; \
+        fi; \
+    done \
+    && if find /opt/mmltk/bin -maxdepth 1 -type f -name 'mmltk_tests_*' -print -quit | grep -q .; then \
+        echo "Production release contains test executables" >&2; \
+        exit 1; \
+    fi
+
+LABEL com.mmltk.release-fingerprint="${MMLTK_RELEASE_FINGERPRINT}" \
+      com.mmltk.runtime-base-identity="${MMLTK_RUNTIME_BASE_IDENTITY}"

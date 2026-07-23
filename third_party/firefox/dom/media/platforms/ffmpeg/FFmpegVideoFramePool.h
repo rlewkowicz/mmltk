@@ -1,0 +1,133 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef FFmpegVideoFramePool_h_
+#define FFmpegVideoFramePool_h_
+
+#include "FFmpegLibWrapper.h"
+#include "FFmpegLibs.h"
+#include "FFmpegLog.h"
+#include "mozilla/layers/DMABUFSurfaceImage.h"
+#include "mozilla/widget/DMABufDevice.h"
+#include "mozilla/widget/DMABufSurface.h"
+
+namespace mozilla::layers {
+class PlanarYCbCrImage;
+}
+
+namespace mozilla {
+
+template <int V>
+class VideoFrameSurface {};
+template <>
+class VideoFrameSurface<LIBAV_VER>;
+
+template <int V>
+class VideoFramePool {};
+template <>
+class VideoFramePool<LIBAV_VER>;
+
+template <>
+class VideoFrameSurface<LIBAV_VER> {
+  friend class VideoFramePool<LIBAV_VER>;
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(VideoFrameSurface)
+
+  explicit VideoFrameSurface(DMABufSurface* aSurface,
+                             VASurfaceID aFFMPEGSurfaceID);
+
+  void SetYUVColorSpace(mozilla::gfx::YUVColorSpace aColorSpace) {
+    mSurface->GetAsDMABufSurfaceYUV()->SetYUVColorSpace(aColorSpace);
+  }
+  void SetColorRange(mozilla::gfx::ColorRange aColorRange) {
+    mSurface->GetAsDMABufSurfaceYUV()->SetColorRange(aColorRange);
+  }
+  void SetColorPrimaries(mozilla::gfx::ColorSpace2 aColorPrimaries) {
+    mSurface->GetAsDMABufSurfaceYUV()->SetColorPrimaries(aColorPrimaries);
+  }
+  void SetTransferFunction(mozilla::gfx::TransferFunction aTransferFunction) {
+    mSurface->GetAsDMABufSurfaceYUV()->SetTransferFunction(aTransferFunction);
+  }
+  void SetWPChromaLocation(uint32_t aWPChromaLocation) {
+    mSurface->GetAsDMABufSurfaceYUV()->SetWPChromaLocation(aWPChromaLocation);
+  }
+  void SetVulkanCopySlotIndex(int32_t aSlotIndex) {
+    mVulkanCopySlotIndex = aSlotIndex;
+  }
+
+  RefPtr<DMABufSurfaceYUV> GetDMABufSurface() {
+    return mSurface->GetAsDMABufSurfaceYUV();
+  };
+
+  RefPtr<layers::Image> GetAsImage();
+
+  VideoFrameSurface(const VideoFrameSurface&) = delete;
+  const VideoFrameSurface& operator=(VideoFrameSurface const&) = delete;
+
+  void DisableRecycle();
+
+ protected:
+  void LockVAAPIData(AVCodecContext* aAVCodecContext, AVFrame* aAVFrame,
+                     const FFmpegLibWrapper* aLib);
+  void ReleaseVAAPIData(bool aForFrameRecycle = true);
+
+  bool IsUsedByRenderer() const { return mSurface->IsGlobalRefSet(); }
+
+  bool IsFFMPEGSurface() const { return !!mLib; }
+
+ private:
+  virtual ~VideoFrameSurface();
+
+  const RefPtr<DMABufSurface> mSurface;
+  const FFmpegLibWrapper* mLib;
+  AVBufferRef* mAVHWFrameContext;
+  AVBufferRef* mHWAVBuffer;
+  VASurfaceID mFFMPEGSurfaceID;
+  bool mHoldByFFmpeg;
+  int32_t mVulkanCopySlotIndex = -1;
+};
+
+template <>
+class VideoFramePool<LIBAV_VER> {
+ public:
+  explicit VideoFramePool(int aFFMPEGPoolSize);
+  ~VideoFramePool();
+
+  RefPtr<VideoFrameSurface<LIBAV_VER>> GetVideoFrameSurface(
+      VADRMPRIMESurfaceDescriptor& aVaDesc, int aWidth, int aHeight,
+      AVCodecContext* aAVCodecContext, AVFrame* aAVFrame,
+      const FFmpegLibWrapper* aLib);
+  RefPtr<VideoFrameSurface<LIBAV_VER>> GetVideoFrameSurface(
+      AVDRMFrameDescriptor& aDesc, int aWidth, int aHeight,
+      AVCodecContext* aAVCodecContext, AVFrame* aAVFrame,
+      const FFmpegLibWrapper* aLib);
+  RefPtr<VideoFrameSurface<LIBAV_VER>> GetVideoFrameSurface(
+      const layers::PlanarYCbCrData& aData, AVCodecContext* aAVCodecContext);
+
+  void ReleaseUnusedVAAPIFrames();
+  void FlushFFmpegFrames();
+  bool IsVulkanFrameSlotInUseByRenderer(int32_t aSlotIndex);
+
+ private:
+  RefPtr<VideoFrameSurface<LIBAV_VER>> GetTargetVideoFrameSurfaceLocked(
+      const MutexAutoLock& aProofOfLock, VASurfaceID aFFmpegSurfaceID,
+      bool aRecycleSurface);
+  RefPtr<VideoFrameSurface<LIBAV_VER>> GetFFmpegVideoFrameSurfaceLocked(
+      const MutexAutoLock& aProofOfLock, VASurfaceID aFFMPEGSurfaceID);
+  RefPtr<VideoFrameSurface<LIBAV_VER>> GetFreeVideoFrameSurfaceLocked(
+      const MutexAutoLock& aProofOfLock);
+  bool ShouldCopySurface();
+
+ private:
+  Mutex mSurfaceLock MOZ_UNANNOTATED;
+  nsTArray<RefPtr<VideoFrameSurface<LIBAV_VER>>> mDMABufSurfaces;
+  int mMaxFFMPEGPoolSize;
+  Maybe<bool> mTextureCreationWorks;
+  bool mTextureCopyWorks = true;
+};
+
+}  
+
+#endif  // FFmpegVideoFramePool_h_

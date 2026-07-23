@@ -1,0 +1,403 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ContentMediaController.h"
+
+#include "MediaControlUtils.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/ToString.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/CanonicalBrowsingContext.h"
+#include "mozilla/dom/ContentChild.h"
+#include "nsGlobalWindowInner.h"
+
+namespace mozilla::dom {
+
+#undef LOG
+#define LOG(msg, ...)                                            \
+  MOZ_LOG_FMT(gMediaControlLog, LogLevel::Debug,                 \
+              "ContentMediaController={}, " msg, fmt::ptr(this), \
+              ##__VA_ARGS__)
+
+static Maybe<bool> sXPCOMShutdown;
+
+static void InitXPCOMShutdownMonitor() {
+  if (sXPCOMShutdown) {
+    return;
+  }
+  sXPCOMShutdown.emplace(false);
+  RunOnShutdown([&] { sXPCOMShutdown = Some(true); });
+}
+
+static ContentMediaController* GetContentMediaControllerFromBrowsingContext(
+    BrowsingContext* aBrowsingContext) {
+  MOZ_ASSERT(NS_IsMainThread());
+  InitXPCOMShutdownMonitor();
+  if (!aBrowsingContext || aBrowsingContext->IsDiscarded()) {
+    return nullptr;
+  }
+
+  nsPIDOMWindowOuter* outer = aBrowsingContext->GetDOMWindow();
+  if (!outer) {
+    return nullptr;
+  }
+
+  nsGlobalWindowInner* inner =
+      nsGlobalWindowInner::Cast(outer->GetCurrentInnerWindow());
+  return inner ? inner->GetContentMediaController() : nullptr;
+}
+
+static already_AddRefed<BrowsingContext> GetBrowsingContextForAgent(
+    uint64_t aBrowsingContextId) {
+  if (sXPCOMShutdown && *sXPCOMShutdown) {
+    return nullptr;
+  }
+  return BrowsingContext::Get(aBrowsingContextId);
+}
+
+ContentMediaControlKeyReceiver* ContentMediaControlKeyReceiver::Get(
+    BrowsingContext* aBC) {
+  MOZ_ASSERT(NS_IsMainThread());
+  return GetContentMediaControllerFromBrowsingContext(aBC);
+}
+
+ContentMediaAgent* ContentMediaAgent::Get(BrowsingContext* aBC) {
+  MOZ_ASSERT(NS_IsMainThread());
+  return GetContentMediaControllerFromBrowsingContext(aBC);
+}
+
+void ContentMediaAgent::NotifyMediaPlaybackChanged(uint64_t aBrowsingContextId,
+                                                   MediaPlaybackState aState) {
+  MOZ_ASSERT(NS_IsMainThread());
+  RefPtr<BrowsingContext> bc = GetBrowsingContextForAgent(aBrowsingContextId);
+  if (!bc || bc->IsDiscarded()) {
+    return;
+  }
+
+  LOG("Notify media {} in BC {}", ToString(aState).c_str(), bc->Id());
+  if (XRE_IsContentProcess()) {
+    ContentChild* contentChild = ContentChild::GetSingleton();
+    (void)contentChild->SendNotifyMediaPlaybackChanged(bc, aState);
+  } else {
+    if (RefPtr<IMediaInfoUpdater> updater =
+            bc->Canonical()->GetMediaController()) {
+      updater->NotifyMediaPlaybackChanged(bc->Id(), aState);
+    }
+  }
+}
+
+void ContentMediaAgent::NotifyMediaAudibleChanged(
+    uint64_t aBrowsingContextId, MediaAudibleState aState, ControlType aType,
+    AudioSessionType aSessionType) {
+  MOZ_ASSERT(NS_IsMainThread());
+  RefPtr<BrowsingContext> bc = GetBrowsingContextForAgent(aBrowsingContextId);
+  if (!bc || bc->IsDiscarded()) {
+    return;
+  }
+
+  LOG("Notify media became {} in BC {}",
+      aState == MediaAudibleState::eAudible ? "audible" : "inaudible",
+      bc->Id());
+  if (XRE_IsContentProcess()) {
+    ContentChild* contentChild = ContentChild::GetSingleton();
+    (void)contentChild->SendNotifyMediaAudibleChanged(bc, aState, aType,
+                                                      aSessionType);
+  } else {
+    if (RefPtr<IMediaInfoUpdater> updater =
+            bc->Canonical()->GetMediaController()) {
+      updater->NotifyMediaAudibleChanged(bc->Id(), aState, aType, aSessionType);
+    }
+  }
+}
+
+void ContentMediaAgent::SetDeclaredPlaybackState(
+    uint64_t aBrowsingContextId, MediaSessionPlaybackState aState) {
+  RefPtr<BrowsingContext> bc = GetBrowsingContextForAgent(aBrowsingContextId);
+  if (!bc || bc->IsDiscarded()) {
+    return;
+  }
+
+  LOG("Notify declared playback state  '{}' in BC {}",
+      ToMediaSessionPlaybackStateStr(aState), bc->Id());
+  if (XRE_IsContentProcess()) {
+    ContentChild* contentChild = ContentChild::GetSingleton();
+    (void)contentChild->SendNotifyMediaSessionPlaybackStateChanged(bc, aState);
+    return;
+  }
+  if (RefPtr<IMediaInfoUpdater> updater =
+          bc->Canonical()->GetMediaController()) {
+    updater->SetDeclaredPlaybackState(bc->Id(), aState);
+  }
+}
+
+void ContentMediaAgent::NotifySessionCreated(uint64_t aBrowsingContextId) {
+  RefPtr<BrowsingContext> bc = GetBrowsingContextForAgent(aBrowsingContextId);
+  if (!bc || bc->IsDiscarded()) {
+    return;
+  }
+
+  LOG("Notify media session being created in BC {}", bc->Id());
+  if (XRE_IsContentProcess()) {
+    ContentChild* contentChild = ContentChild::GetSingleton();
+    (void)contentChild->SendNotifyMediaSessionUpdated(bc, true);
+    return;
+  }
+  if (RefPtr<IMediaInfoUpdater> updater =
+          bc->Canonical()->GetMediaController()) {
+    updater->NotifySessionCreated(bc->Id());
+  }
+}
+
+void ContentMediaAgent::NotifySessionDestroyed(uint64_t aBrowsingContextId) {
+  RefPtr<BrowsingContext> bc = GetBrowsingContextForAgent(aBrowsingContextId);
+  if (!bc || bc->IsDiscarded()) {
+    return;
+  }
+
+  LOG("Notify media session being destroyed in BC {}", bc->Id());
+  if (XRE_IsContentProcess()) {
+    ContentChild* contentChild = ContentChild::GetSingleton();
+    (void)contentChild->SendNotifyMediaSessionUpdated(bc, false);
+    return;
+  }
+  if (RefPtr<IMediaInfoUpdater> updater =
+          bc->Canonical()->GetMediaController()) {
+    updater->NotifySessionDestroyed(bc->Id());
+  }
+}
+
+void ContentMediaAgent::UpdateMetadata(
+    uint64_t aBrowsingContextId, const Maybe<MediaMetadataBase>& aMetadata) {
+  RefPtr<BrowsingContext> bc = GetBrowsingContextForAgent(aBrowsingContextId);
+  if (!bc || bc->IsDiscarded()) {
+    return;
+  }
+
+  LOG("Notify media session metadata change in BC {}", bc->Id());
+  if (XRE_IsContentProcess()) {
+    ContentChild* contentChild = ContentChild::GetSingleton();
+    (void)contentChild->SendNotifyUpdateMediaMetadata(bc, aMetadata);
+    return;
+  }
+  if (RefPtr<IMediaInfoUpdater> updater =
+          bc->Canonical()->GetMediaController()) {
+    updater->UpdateMetadata(bc->Id(), aMetadata);
+  }
+}
+
+void ContentMediaAgent::EnableAction(uint64_t aBrowsingContextId,
+                                     MediaSessionAction aAction) {
+  RefPtr<BrowsingContext> bc = GetBrowsingContextForAgent(aBrowsingContextId);
+  if (!bc || bc->IsDiscarded()) {
+    return;
+  }
+
+  LOG("Notify to enable action '{}' in BC {}", GetEnumString(aAction).get(),
+      bc->Id());
+  if (XRE_IsContentProcess()) {
+    ContentChild* contentChild = ContentChild::GetSingleton();
+    (void)contentChild->SendNotifyMediaSessionSupportedActionChanged(
+        bc, aAction, true);
+    return;
+  }
+  if (RefPtr<IMediaInfoUpdater> updater =
+          bc->Canonical()->GetMediaController()) {
+    updater->EnableAction(bc->Id(), aAction);
+  }
+}
+
+void ContentMediaAgent::DisableAction(uint64_t aBrowsingContextId,
+                                      MediaSessionAction aAction) {
+  RefPtr<BrowsingContext> bc = GetBrowsingContextForAgent(aBrowsingContextId);
+  if (!bc || bc->IsDiscarded()) {
+    return;
+  }
+
+  LOG("Notify to disable action '{}' in BC {}", GetEnumString(aAction).get(),
+      bc->Id());
+  if (XRE_IsContentProcess()) {
+    ContentChild* contentChild = ContentChild::GetSingleton();
+    (void)contentChild->SendNotifyMediaSessionSupportedActionChanged(
+        bc, aAction, false);
+    return;
+  }
+  if (RefPtr<IMediaInfoUpdater> updater =
+          bc->Canonical()->GetMediaController()) {
+    updater->DisableAction(bc->Id(), aAction);
+  }
+}
+
+void ContentMediaAgent::NotifyMediaFullScreenState(uint64_t aBrowsingContextId,
+                                                   bool aIsInFullScreen) {
+  RefPtr<BrowsingContext> bc = GetBrowsingContextForAgent(aBrowsingContextId);
+  if (!bc || bc->IsDiscarded()) {
+    return;
+  }
+
+  LOG("Notify {} fullscreen in BC {}", aIsInFullScreen ? "entered" : "left",
+      bc->Id());
+  if (XRE_IsContentProcess()) {
+    ContentChild* contentChild = ContentChild::GetSingleton();
+    (void)contentChild->SendNotifyMediaFullScreenState(bc, aIsInFullScreen);
+    return;
+  }
+  if (RefPtr<IMediaInfoUpdater> updater =
+          bc->Canonical()->GetMediaController()) {
+    updater->NotifyMediaFullScreenState(bc->Id(), aIsInFullScreen);
+  }
+}
+
+void ContentMediaAgent::UpdatePositionState(
+    uint64_t aBrowsingContextId, const Maybe<PositionState>& aState) {
+  RefPtr<BrowsingContext> bc = GetBrowsingContextForAgent(aBrowsingContextId);
+  if (!bc || bc->IsDiscarded()) {
+    return;
+  }
+  if (XRE_IsContentProcess()) {
+    ContentChild* contentChild = ContentChild::GetSingleton();
+    (void)contentChild->SendNotifyPositionStateChanged(bc, aState);
+    return;
+  }
+  if (RefPtr<IMediaInfoUpdater> updater =
+          bc->Canonical()->GetMediaController()) {
+    updater->UpdatePositionState(bc->Id(), aState);
+  }
+}
+
+void ContentMediaAgent::UpdateGuessedPositionState(
+    uint64_t aBrowsingContextId, const nsID& aMediaId,
+    const Maybe<PositionState>& aState) {
+  RefPtr<BrowsingContext> bc = GetBrowsingContextForAgent(aBrowsingContextId);
+  if (!bc || bc->IsDiscarded()) {
+    return;
+  }
+
+  if (aState) {
+    LOG("Update guessed position state for BC {} media id {} (duration={}, "
+        "playbackRate={}, position={})",
+        bc->Id(), aMediaId.ToString().get(), aState->mDuration,
+        aState->mPlaybackRate, aState->mLastReportedPlaybackPosition);
+  } else {
+    LOG("Clear guessed position state for BC {} media id {}", bc->Id(),
+        aMediaId.ToString().get());
+  }
+
+  if (XRE_IsContentProcess()) {
+    ContentChild* contentChild = ContentChild::GetSingleton();
+    (void)contentChild->SendNotifyGuessedPositionStateChanged(bc, aMediaId,
+                                                              aState);
+    return;
+  }
+  if (RefPtr<IMediaInfoUpdater> updater =
+          bc->Canonical()->GetMediaController()) {
+    updater->UpdateGuessedPositionState(bc->Id(), aMediaId, aState);
+  }
+}
+
+ContentMediaController::ContentMediaController(uint64_t aId) {
+  LOG("Create content media controller for BC {}", aId);
+}
+
+void ContentMediaController::AddReceiver(
+    ContentMediaControlKeyReceiver* aListener, ControlType aType) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (aType == ControlType::eControllable) {
+    mControllableReceivers.AppendElement(aListener);
+  } else {
+    mUncontrollableReceivers.AppendElement(aListener);
+  }
+}
+
+void ContentMediaController::RemoveReceiver(
+    ContentMediaControlKeyReceiver* aListener, ControlType aType) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (aType == ControlType::eControllable) {
+    mControllableReceivers.RemoveElement(aListener);
+  } else {
+    mUncontrollableReceivers.RemoveElement(aListener);
+  }
+}
+
+void ContentMediaController::HandleMediaKey(
+    MediaControlKey aKey, const MediaControlActionParams& aParams) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (mControllableReceivers.IsEmpty() && mUncontrollableReceivers.IsEmpty()) {
+    return;
+  }
+  LOG("Handle '{}' event, controllable num={}, uncontrollable num={}",
+      GetEnumString(aKey).get(), mControllableReceivers.Length(),
+      mUncontrollableReceivers.Length());
+  switch (aKey) {
+    case MediaControlKey::Pause:
+      PauseOrStopMedia();
+      return;
+    case MediaControlKey::Play:
+    case MediaControlKey::Seekto:
+    case MediaControlKey::Seekforward:
+    case MediaControlKey::Seekbackward:
+      for (auto& receiver : Reversed(mControllableReceivers)) {
+        receiver->HandleMediaKey(aKey, aParams);
+      }
+      return;
+    case MediaControlKey::Stop:
+    case MediaControlKey::Setvolume:
+    case MediaControlKey::Mute:
+    case MediaControlKey::Unmute:
+      for (auto& receiver : Reversed(mControllableReceivers)) {
+        receiver->HandleMediaKey(aKey, aParams);
+      }
+      for (auto& receiver : Reversed(mUncontrollableReceivers)) {
+        receiver->HandleMediaKey(aKey, aParams);
+      }
+      return;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Not supported media key for default handler");
+  }
+}
+
+void ContentMediaController::HandleAudioFocusInterrupt(
+    AudioFocusInterruptAction aAction) {
+  MOZ_ASSERT(NS_IsMainThread());
+  const bool suspend = aAction == AudioFocusInterruptAction::Suspend;
+  LOG("Handle audio-focus interrupt {}, controllable num={}, uncontrollable "
+      "num={}",
+      EnumValueToString(aAction), mControllableReceivers.Length(),
+      mUncontrollableReceivers.Length());
+  mAudioInterruptedByPlatform = suspend;
+  for (auto& receiver : Reversed(mControllableReceivers)) {
+    if (suspend) {
+      receiver->SuspendForInterrupt();
+    } else {
+      receiver->ResumeFromInterrupt();
+    }
+  }
+  for (auto& receiver : Reversed(mUncontrollableReceivers)) {
+    if (suspend) {
+      receiver->SuspendForInterrupt();
+    } else {
+      receiver->ResumeFromInterrupt();
+    }
+  }
+}
+
+void ContentMediaController::PauseOrStopMedia() {
+  bool isAnyMediaPlaying = false;
+  for (const auto& receiver : mControllableReceivers) {
+    if (receiver->IsPlaying()) {
+      isAnyMediaPlaying = true;
+      break;
+    }
+  }
+
+  for (auto& receiver : Reversed(mControllableReceivers)) {
+    if (isAnyMediaPlaying && !receiver->IsPlaying()) {
+      receiver->HandleMediaKey(MediaControlKey::Stop);
+    } else {
+      receiver->HandleMediaKey(MediaControlKey::Pause);
+    }
+  }
+}
+
+}  

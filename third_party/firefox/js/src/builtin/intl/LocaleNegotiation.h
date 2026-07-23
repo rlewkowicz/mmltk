@@ -1,0 +1,221 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_intl_LocaleNegotiation_h
+#define builtin_intl_LocaleNegotiation_h
+
+#include "mozilla/EnumeratedArray.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/EnumTypeTraits.h"
+
+#include <stdint.h>
+
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "util/LanguageId.h"
+
+class JSLinearString;
+
+namespace js {
+class ArrayObject;
+}
+
+namespace js::intl {
+enum class UnicodeExtensionKey : uint8_t {
+  Calendar ,
+  Collation ,
+  CollationCaseFirst ,
+  CollationNumeric ,
+  FirstDayOfWeek ,
+  HourCycle ,
+  NumberingSystem ,
+};
+}
+
+namespace mozilla {
+template <>
+struct MaxContiguousEnumValue<js::intl::UnicodeExtensionKey> {
+  static constexpr auto value = js::intl::UnicodeExtensionKey::NumberingSystem;
+};
+}  
+
+namespace js::intl {
+
+enum class AvailableLocaleKind;
+
+using LocalesList = JS::StackGCVector<JSLinearString*>;
+
+bool CanonicalizeLocaleList(JSContext* cx, JS::Handle<JS::Value> locales,
+                            JS::MutableHandle<LocalesList> result);
+
+ArrayObject* CanonicalizeLocaleList(JSContext* cx,
+                                    JS::Handle<JS::Value> locales);
+
+mozilla::Maybe<LanguageId> ToLanguageId(JSContext* cx,
+                                        const JSLinearString* locale);
+
+bool LookupMatcher(JSContext* cx, AvailableLocaleKind availableLocales,
+                   LanguageId locale, mozilla::Maybe<LanguageId>* result);
+
+enum class LocaleData {
+  Default,
+
+  CollatorSearch,
+};
+
+class LocaleOptions final {
+  mozilla::EnumeratedArray<UnicodeExtensionKey, JSLinearString*> extensions_{};
+  mozilla::EnumSet<UnicodeExtensionKey> set_{};
+
+ public:
+  LocaleOptions() = default;
+
+  bool hasUnicodeExtension(UnicodeExtensionKey key) const {
+    return set_.contains(key);
+  }
+
+  auto* getUnicodeExtension(UnicodeExtensionKey key) const {
+    return extensions_[key];
+  }
+
+  void setUnicodeExtension(UnicodeExtensionKey key, JSLinearString* extension) {
+    extensions_[key] = extension;
+    set_ += key;
+  }
+
+  auto extensionDoNotUse(UnicodeExtensionKey key) const {
+    return &extensions_[key];
+  }
+
+  void trace(JSTracer* trc);
+};
+
+class ResolvedLocale final {
+  LanguageId dataLocale_ = LanguageId::und();
+  mozilla::EnumeratedArray<UnicodeExtensionKey, JSLinearString*> extensions_{};
+  mozilla::EnumSet<UnicodeExtensionKey> keywords_{};
+
+ public:
+  ResolvedLocale() = default;
+
+  auto dataLocale() const { return dataLocale_; }
+
+  auto* extension(UnicodeExtensionKey key) const { return extensions_[key]; }
+
+  auto keywords() const { return keywords_; }
+
+  JSLinearString* toLocale(JSContext* cx) const;
+
+  void setDataLocale(LanguageId dataLocale) { dataLocale_ = dataLocale; }
+  void setUnicodeExtension(UnicodeExtensionKey key, JSLinearString* extension) {
+    extensions_[key] = extension;
+  }
+  void setUnicodeKeywords(mozilla::EnumSet<UnicodeExtensionKey> keywords) {
+    keywords_ = keywords;
+  }
+
+  auto extensionDoNotUse(UnicodeExtensionKey key) const {
+    return &extensions_[key];
+  }
+
+  void trace(JSTracer* trc);
+};
+
+bool ResolveLocale(JSContext* cx, AvailableLocaleKind availableLocales,
+                   JS::Handle<ArrayObject*> requestedLocales,
+                   JS::Handle<LocaleOptions> options,
+                   mozilla::EnumSet<UnicodeExtensionKey> relevantExtensionKeys,
+                   LocaleData localeData,
+                   JS::MutableHandle<ResolvedLocale> result);
+
+bool DefaultLocale(JSContext* cx, LanguageId* result);
+
+JSLinearString* DefaultCalendar(JSContext* cx, const JSLinearString* locale);
+
+JSLinearString* DefaultNumberingSystem(JSContext* cx, LanguageId locale);
+
+JSLinearString* DefaultNumberingSystem(JSContext* cx,
+                                       const JSLinearString* locale);
+
+ArrayObject* SupportedLocalesOf(JSContext* cx,
+                                AvailableLocaleKind availableLocales,
+                                JS::Handle<JS::Value> locales,
+                                JS::Handle<JS::Value> options);
+
+bool ComputeDefaultLocale(JSContext* cx, LanguageId* result);
+
+}  
+
+namespace js {
+
+template <typename Wrapper>
+class WrappedPtrOperations<intl::LocaleOptions, Wrapper> {
+  const auto& container() const {
+    return static_cast<const Wrapper*>(this)->get();
+  }
+
+ public:
+  bool hasUnicodeExtension(intl::UnicodeExtensionKey key) const {
+    return container().hasUnicodeExtension(key);
+  }
+
+  JS::Handle<JSLinearString*> getUnicodeExtension(
+      intl::UnicodeExtensionKey key) const {
+    return JS::Handle<JSLinearString*>::fromMarkedLocation(
+        container().extensionDoNotUse(key));
+  }
+};
+
+template <typename Wrapper>
+class MutableWrappedPtrOperations<intl::LocaleOptions, Wrapper>
+    : public WrappedPtrOperations<intl::LocaleOptions, Wrapper> {
+  auto& container() { return static_cast<Wrapper*>(this)->get(); }
+
+ public:
+  void setUnicodeExtension(intl::UnicodeExtensionKey key,
+                           JSLinearString* extension) {
+    container().setUnicodeExtension(key, extension);
+  }
+};
+
+template <typename Wrapper>
+class WrappedPtrOperations<intl::ResolvedLocale, Wrapper> {
+  const auto& container() const {
+    return static_cast<const Wrapper*>(this)->get();
+  }
+
+ public:
+  LanguageId dataLocale() const { return container().dataLocale(); }
+  JS::Handle<JSLinearString*> extension(intl::UnicodeExtensionKey key) const {
+    return JS::Handle<JSLinearString*>::fromMarkedLocation(
+        container().extensionDoNotUse(key));
+  }
+  mozilla::EnumSet<intl::UnicodeExtensionKey> keywords() const {
+    return container().keywords();
+  }
+  JSLinearString* toLocale(JSContext* cx) const {
+    return container().toLocale(cx);
+  }
+};
+
+template <typename Wrapper>
+class MutableWrappedPtrOperations<intl::ResolvedLocale, Wrapper>
+    : public WrappedPtrOperations<intl::ResolvedLocale, Wrapper> {
+  auto& container() { return static_cast<Wrapper*>(this)->get(); }
+
+ public:
+  void setDataLocale(LanguageId locale) { container().setDataLocale(locale); }
+  void setUnicodeExtension(intl::UnicodeExtensionKey key,
+                           JSLinearString* extension) {
+    container().setUnicodeExtension(key, extension);
+  }
+  void setUnicodeKeywords(
+      mozilla::EnumSet<intl::UnicodeExtensionKey> keywords) {
+    container().setUnicodeKeywords(keywords);
+  }
+};
+
+}  
+
+#endif /* builtin_intl_LocaleNegotiation_h */

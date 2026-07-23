@@ -1,0 +1,521 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#include "TouchManager.h"
+
+#include "PositionedEventTargeting.h"
+#include "Units.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/StaticPrefs_apz.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/EventTarget.h"
+#include "mozilla/dom/PointerEventHandler.h"
+#include "mozilla/layers/InputAPZContext.h"
+#include "nsIContent.h"
+#include "nsIFrame.h"
+#include "nsLayoutUtils.h"
+
+using namespace mozilla::dom;
+
+namespace mozilla {
+
+StaticAutoPtr<nsTHashMap<nsUint32HashKey, TouchManager::TouchInfo>>
+    TouchManager::sCaptureTouchList;
+layers::LayersId TouchManager::sCaptureTouchLayersId;
+TimeStamp TouchManager::sSingleTouchStartTimeStamp;
+LayoutDeviceIntPoint TouchManager::sSingleTouchStartPoint;
+bool TouchManager::sPrecedingTouchPointerDownConsumedByContent = false;
+
+void TouchManager::InitializeStatics() {
+  NS_ASSERTION(!sCaptureTouchList, "InitializeStatics called multiple times!");
+  sCaptureTouchList = new nsTHashMap<nsUint32HashKey, TouchManager::TouchInfo>;
+  sCaptureTouchLayersId = layers::LayersId{0};
+}
+
+void TouchManager::ReleaseStatics() {
+  NS_ASSERTION(sCaptureTouchList, "ReleaseStatics called without Initialize!");
+  sCaptureTouchList = nullptr;
+}
+
+void TouchManager::Init(PresShell* aPresShell, Document* aDocument) {
+  mPresShell = aPresShell;
+  mDocument = aDocument;
+}
+
+void TouchManager::Destroy() {
+  EvictTouches(mDocument);
+  mDocument = nullptr;
+  mPresShell = nullptr;
+}
+
+static nsIContent* GetNonAnonymousAncestor(EventTarget* aTarget) {
+  nsIContent* content = nsIContent::FromEventTargetOrNull(aTarget);
+  if (content && content->IsInNativeAnonymousSubtree()) {
+    content = content->FindFirstNonChromeOnlyAccessContent();
+  }
+  return content;
+}
+
+void TouchManager::EvictTouchPoint(RefPtr<Touch>& aTouch,
+                                   Document* aLimitToDocument) {
+  nsCOMPtr<nsINode> node(
+      nsINode::FromEventTargetOrNull(aTouch->mOriginalTarget));
+  if (node) {
+    Document* doc = node->GetComposedDoc();
+    if (doc && (!aLimitToDocument || aLimitToDocument == doc)) {
+      if (PresShell* presShell = doc->GetPresShell()) {
+        if (nsIFrame* frame = presShell->GetRootFrame()) {
+          if (nsCOMPtr<nsIWidget> widget = frame->GetNearestWidget()) {
+            WidgetTouchEvent event(true, eTouchEnd, widget);
+            event.mTouches.AppendElement(aTouch);
+            widget->DispatchEvent(&event);
+          }
+        }
+      }
+    }
+  }
+  if (!node || !aLimitToDocument || node->OwnerDoc() == aLimitToDocument) {
+    sCaptureTouchList->Remove(aTouch->Identifier());
+  }
+}
+
+void TouchManager::AppendToTouchList(
+    WidgetTouchEvent::TouchArrayBase* aTouchList) {
+  for (const auto& data : sCaptureTouchList->Values()) {
+    const RefPtr<Touch>& touch = data.mTouch;
+    touch->mChanged = false;
+    aTouchList->AppendElement(touch);
+  }
+}
+
+void TouchManager::EvictTouches(Document* aLimitToDocument) {
+  WidgetTouchEvent::AutoTouchArray touches;
+  AppendToTouchList(&touches);
+  for (uint32_t i = 0; i < touches.Length(); ++i) {
+    EvictTouchPoint(touches[i], aLimitToDocument);
+  }
+  sCaptureTouchLayersId = layers::LayersId{0};
+}
+
+nsIFrame* TouchManager::SetupTarget(WidgetTouchEvent* aEvent,
+                                    nsIFrame* aFrame) {
+  MOZ_ASSERT(aEvent);
+
+  if (!aEvent || aEvent->mMessage != eTouchStart) {
+    return aFrame;
+  }
+
+  Document* doc = aFrame->PresShell()->GetDocument();
+  const bool renderBlocked =
+      doc && doc->RenderingSuppressedForViewTransitions();
+
+  nsIFrame* target = aFrame;
+  for (int32_t i = aEvent->mTouches.Length(); i;) {
+    --i;
+    dom::Touch* touch = aEvent->mTouches[i];
+
+    int32_t id = touch->Identifier();
+    if (TouchManager::HasCapturedTouch(id)) {
+      touch->mChanged = false;
+      RefPtr<dom::Touch> oldTouch = TouchManager::GetCapturedTouch(id);
+      if (oldTouch) {
+        touch->SetTouchTarget(oldTouch->mOriginalTarget);
+      }
+    } else if (MOZ_UNLIKELY(renderBlocked)) {
+      touch->SetTouchTarget(doc->GetRootElement());
+    } else {
+      RelativeTo relativeTo{aFrame};
+      nsPoint eventPoint = nsLayoutUtils::GetEventCoordinatesRelativeTo(
+          aEvent, touch->mRefPoint, relativeTo);
+      target = FindFrameTargetedByInputEvent(aEvent, relativeTo, eventPoint);
+      if (target) {
+        touch->SetTouchTarget(target->GetEventTargetContent(aEvent));
+      } else {
+        aEvent->mTouches.RemoveElementAt(i);
+      }
+    }
+  }
+  return target;
+}
+
+nsIFrame* TouchManager::SuppressInvalidPointsAndGetTargetedFrame(
+    WidgetTouchEvent* aEvent) {
+  MOZ_ASSERT(aEvent);
+
+  if (!aEvent || aEvent->mMessage != eTouchStart) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIContent> anyTarget;
+  if (aEvent->mTouches.Length() > 1) {
+    anyTarget = TouchManager::GetAnyCapturedTouchTarget();
+  }
+
+  nsIFrame* frame = nullptr;
+  for (uint32_t i = aEvent->mTouches.Length(); i;) {
+    --i;
+    dom::Touch* touch = aEvent->mTouches[i];
+    if (TouchManager::HasCapturedTouch(touch->Identifier())) {
+      continue;
+    }
+
+    MOZ_ASSERT(touch->mOriginalTarget);
+    nsIContent* const targetContent =
+        nsIContent::FromEventTargetOrNull(touch->GetTarget());
+    if (MOZ_UNLIKELY(!targetContent)) {
+      touch->mIsTouchEventSuppressed = true;
+      continue;
+    }
+
+    if (MOZ_UNLIKELY(!targetContent->IsInComposedDoc())) {
+      if (anyTarget && anyTarget->OwnerDoc() != targetContent->OwnerDoc()) {
+        touch->mIsTouchEventSuppressed = true;
+        continue;
+      }
+      if (!anyTarget) {
+        anyTarget = targetContent;
+      }
+      touch->SetTouchTarget(targetContent->GetAsElementOrParentElement());
+      if (PresShell* const presShell =
+              targetContent->OwnerDoc()->GetPresShell()) {
+        if (nsIFrame* rootFrame = presShell->GetRootFrame()) {
+          frame = rootFrame;
+        }
+      }
+      continue;
+    }
+
+    nsIFrame* targetFrame = targetContent->GetPrimaryFrame();
+    if (targetFrame && !anyTarget) {
+      anyTarget = targetContent;
+    } else {
+      nsIFrame* newTargetFrame = nullptr;
+      for (nsIFrame* f = targetFrame; f;
+           f = nsLayoutUtils::GetParentOrPlaceholderForCrossDoc(f)) {
+        if (f->PresContext()->Document() == anyTarget->OwnerDoc()) {
+          newTargetFrame = f;
+          break;
+        }
+        f = f->PresShell()->GetRootFrame();
+      }
+      if (!newTargetFrame) {
+        touch->mIsTouchEventSuppressed = true;
+      } else {
+        targetFrame = newTargetFrame;
+        touch->SetTouchTarget(targetFrame->GetEventTargetContent(aEvent));
+      }
+    }
+    if (targetFrame) {
+      frame = targetFrame;
+    }
+  }
+  return frame;
+}
+
+bool TouchManager::PreHandleEvent(WidgetEvent* aEvent, nsEventStatus* aStatus,
+                                  bool& aTouchIsNew,
+                                  nsCOMPtr<nsIContent>& aCurrentEventContent) {
+  MOZ_DIAGNOSTIC_ASSERT(aEvent->IsTrusted());
+
+  switch (aEvent->mMessage) {
+    case eTouchStart: {
+      WidgetTouchEvent* touchEvent = aEvent->AsTouchEvent();
+      if (touchEvent->mTouches.Length() == 1) {
+        EvictTouches();
+        sCaptureTouchLayersId = aEvent->mLayersId;
+        sSingleTouchStartTimeStamp = aEvent->mTimeStamp;
+        sSingleTouchStartPoint = touchEvent->mTouches[0]->mRefPoint;
+        const PointerInfo* pointerInfo = PointerEventHandler::GetPointerInfo(
+            touchEvent->mTouches[0]->Identifier());
+        sPrecedingTouchPointerDownConsumedByContent =
+            pointerInfo && pointerInfo->mPreventMouseEventByContent;
+      } else {
+        touchEvent->mLayersId = sCaptureTouchLayersId;
+        sSingleTouchStartTimeStamp = TimeStamp();
+      }
+      WidgetTouchEvent::TouchArray& touches = touchEvent->mTouches;
+      for (int32_t i = touches.Length(); i;) {
+        --i;
+        Touch* touch = touches[i];
+        int32_t id = touch->Identifier();
+        if (!sCaptureTouchList->Get(id, nullptr)) {
+          touch->mChanged = true;
+        }
+        touch->mMessage = aEvent->mMessage;
+        TouchInfo info = {
+            touch, GetNonAnonymousAncestor(touch->mOriginalTarget), true};
+        sCaptureTouchList->InsertOrUpdate(id, info);
+        if (touch->mIsTouchEventSuppressed) {
+          touches.RemoveElementAt(i);
+          continue;
+        }
+      }
+      break;
+    }
+    case eTouchRawUpdate:
+      MOZ_ASSERT_UNREACHABLE("eTouchRawUpdate shouldn't be handled as a touch");
+      break;
+    case eTouchMove: {
+      WidgetTouchEvent* touchEvent = aEvent->AsTouchEvent();
+      WidgetTouchEvent::TouchArray& touches = touchEvent->mTouches;
+      touchEvent->mLayersId = sCaptureTouchLayersId;
+      bool haveChanged = false;
+      for (int32_t i = touches.Length(); i;) {
+        --i;
+        Touch* touch = touches[i];
+        if (!touch) {
+          continue;
+        }
+        int32_t id = touch->Identifier();
+        touch->mMessage = aEvent->mMessage;
+
+        TouchInfo info;
+        if (!sCaptureTouchList->Get(id, &info)) {
+          touches.RemoveElementAt(i);
+          continue;
+        }
+        const RefPtr<Touch> oldTouch = info.mTouch;
+        if (!oldTouch->Equals(touch)) {
+          touch->mChanged = true;
+          haveChanged = true;
+        }
+
+        nsCOMPtr<EventTarget> targetPtr = oldTouch->mOriginalTarget;
+        if (!targetPtr) {
+          touches.RemoveElementAt(i);
+          continue;
+        }
+        nsCOMPtr<nsINode> targetNode(do_QueryInterface(targetPtr));
+        if (!targetNode->IsInComposedDoc()) {
+          targetPtr = info.mNonAnonymousTarget;
+        }
+        touch->SetTouchTarget(targetPtr);
+
+        info.mTouch = touch;
+        sCaptureTouchList->InsertOrUpdate(id, info);
+        if (oldTouch->mMessage != touch->mMessage) {
+          aTouchIsNew = true;
+        }
+        if (oldTouch->mIsTouchEventSuppressed) {
+          touch->mIsTouchEventSuppressed = true;
+          touches.RemoveElementAt(i);
+          continue;
+        }
+      }
+      if (!haveChanged) {
+        if (aTouchIsNew) {
+          for (uint32_t i = 0; i < touchEvent->mTouches.Length(); ++i) {
+            if (touchEvent->mTouches[i]) {
+              touchEvent->mTouches[i]->mChanged = true;
+              break;
+            }
+          }
+        } else {
+          layers::InputAPZContext::SetDropped();
+          return false;
+        }
+      }
+      break;
+    }
+    case eTouchEnd:
+    case eTouchCancel: {
+      WidgetTouchEvent* touchEvent = aEvent->AsTouchEvent();
+      WidgetTouchEvent::TouchArray& touches = touchEvent->mTouches;
+      touchEvent->mLayersId = sCaptureTouchLayersId;
+      for (int32_t i = touches.Length(); i;) {
+        --i;
+        Touch* touch = touches[i];
+        if (!touch) {
+          continue;
+        }
+        touch->mMessage = aEvent->mMessage;
+        touch->mChanged = true;
+
+        int32_t id = touch->Identifier();
+        TouchInfo info;
+        if (!sCaptureTouchList->Get(id, &info)) {
+          continue;
+        }
+        nsCOMPtr<EventTarget> targetPtr = info.mTouch->mOriginalTarget;
+        nsCOMPtr<nsINode> targetNode(do_QueryInterface(targetPtr));
+        if (targetNode && !targetNode->IsInComposedDoc()) {
+          targetPtr = info.mNonAnonymousTarget;
+        }
+
+        aCurrentEventContent = do_QueryInterface(targetPtr);
+        touch->SetTouchTarget(targetPtr);
+        sCaptureTouchList->Remove(id);
+        if (info.mTouch->mIsTouchEventSuppressed) {
+          touches.RemoveElementAt(i);
+          continue;
+        }
+      }
+      AppendToTouchList(&touches);
+      break;
+    }
+    case eTouchPointerCancel: {
+      WidgetTouchEvent* touchEvent = aEvent->AsTouchEvent();
+      WidgetTouchEvent::TouchArray& touches = touchEvent->mTouches;
+      touchEvent->mLayersId = sCaptureTouchLayersId;
+      for (uint32_t i = 0; i < touches.Length(); ++i) {
+        Touch* touch = touches[i];
+        if (!touch) {
+          continue;
+        }
+        int32_t id = touch->Identifier();
+        TouchInfo info;
+        if (!sCaptureTouchList->Get(id, &info)) {
+          continue;
+        }
+        info.mConvertToPointer = false;
+        sCaptureTouchList->InsertOrUpdate(id, info);
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return true;
+}
+
+void TouchManager::PostHandleEvent(const WidgetEvent* aEvent,
+                                   const nsEventStatus* aStatus) {
+  switch (aEvent->mMessage) {
+    case eTouchRawUpdate:
+      MOZ_ASSERT_UNREACHABLE("eTouchRawUpdate shouldn't be handled as a touch");
+      break;
+    case eTouchMove: {
+      if (sSingleTouchStartTimeStamp.IsNull()) {
+        break;
+      }
+      if (*aStatus == nsEventStatus_eConsumeNoDefault) {
+        sSingleTouchStartTimeStamp = TimeStamp();
+        break;
+      }
+      const WidgetTouchEvent* touchEvent = aEvent->AsTouchEvent();
+      if (touchEvent->mTouches.Length() > 1) {
+        sSingleTouchStartTimeStamp = TimeStamp();
+        break;
+      }
+      if (touchEvent->mTouches.Length() == 1) {
+        const float distance =
+            static_cast<float>((sSingleTouchStartPoint -
+                                aEvent->AsTouchEvent()->mTouches[0]->mRefPoint)
+                                   .Length());
+        const float maxDistance =
+            StaticPrefs::apz_touch_start_tolerance() *
+            (MOZ_LIKELY(touchEvent->mWidget) ? touchEvent->mWidget->GetDPI()
+                                             : 96.0f);
+        if (distance > maxDistance) {
+          sSingleTouchStartTimeStamp = TimeStamp();
+        }
+      }
+      break;
+    }
+    case eTouchStart:
+    case eTouchEnd:
+      if (*aStatus == nsEventStatus_eConsumeNoDefault &&
+          !sSingleTouchStartTimeStamp.IsNull()) {
+        sSingleTouchStartTimeStamp = TimeStamp();
+      }
+      break;
+    case eTouchCancel:
+    case eTouchPointerCancel:
+    case eMouseLongTap:
+    case eContextMenu: {
+      if (!sSingleTouchStartTimeStamp.IsNull()) {
+        sSingleTouchStartTimeStamp = TimeStamp();
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+already_AddRefed<nsIContent> TouchManager::GetAnyCapturedTouchTarget() {
+  nsCOMPtr<nsIContent> result = nullptr;
+  if (sCaptureTouchList->Count() == 0) {
+    return result.forget();
+  }
+  for (const auto& data : sCaptureTouchList->Values()) {
+    const RefPtr<Touch>& touch = data.mTouch;
+    if (touch) {
+      EventTarget* target = touch->GetTarget();
+      if (target) {
+        result = nsIContent::FromEventTargetOrNull(target);
+        break;
+      }
+    }
+  }
+  return result.forget();
+}
+
+bool TouchManager::HasCapturedTouch(int32_t aId) {
+  return sCaptureTouchList->Contains(aId);
+}
+
+already_AddRefed<Touch> TouchManager::GetCapturedTouch(int32_t aId) {
+  RefPtr<Touch> touch;
+  TouchInfo info;
+  if (sCaptureTouchList->Get(aId, &info)) {
+    touch = info.mTouch;
+  }
+  return touch.forget();
+}
+
+bool TouchManager::ShouldConvertTouchToPointer(const Touch* aTouch,
+                                               const WidgetTouchEvent* aEvent) {
+  if (!aTouch || !aTouch->convertToPointer) {
+    return false;
+  }
+  TouchInfo info;
+  if (!sCaptureTouchList->Get(aTouch->Identifier(), &info)) {
+    return aEvent->mMessage == eTouchStart;
+  }
+
+  if (!info.mConvertToPointer) {
+    return false;
+  }
+
+  switch (aEvent->mMessage) {
+    case eTouchStart: {
+      return false;
+    }
+    case eTouchMove:
+    case eTouchRawUpdate: {
+      return !aTouch->Equals(info.mTouch);
+    }
+    default:
+      break;
+  }
+  return true;
+}
+
+bool TouchManager::IsSingleTapEndToDoDefault(
+    const WidgetTouchEvent* aTouchEndEvent) {
+  MOZ_ASSERT(aTouchEndEvent);
+  MOZ_ASSERT(aTouchEndEvent->mFlags.mIsSynthesizedForTests);
+  MOZ_ASSERT(!false);
+  if (sSingleTouchStartTimeStamp.IsNull() ||
+      aTouchEndEvent->mTouches.Length() != 1) {
+    return false;
+  }
+  if ((aTouchEndEvent->mTimeStamp - sSingleTouchStartTimeStamp)
+          .ToMilliseconds() > StaticPrefs::apz_max_tap_time()) {
+    return false;
+  }
+  NS_WARNING_ASSERTION(aTouchEndEvent->mTouches[0]->mChanged,
+                       "The single tap end should be changed");
+  return true;
+}
+
+bool TouchManager::IsPrecedingTouchPointerDownConsumedByContent() {
+  return sPrecedingTouchPointerDownConsumedByContent;
+}
+
+}  

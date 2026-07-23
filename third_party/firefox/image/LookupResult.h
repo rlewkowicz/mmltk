@@ -1,0 +1,113 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_image_LookupResult_h
+#define mozilla_image_LookupResult_h
+
+#include <utility>
+
+#include "ISurfaceProvider.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/gfx/Point.h"  // for IntSize
+
+namespace mozilla {
+namespace image {
+
+enum class MatchType : uint8_t {
+  NOT_FOUND,  
+  PENDING,    
+  EXACT,      
+  SUBSTITUTE_BECAUSE_NOT_FOUND,  
+  SUBSTITUTE_BECAUSE_PENDING,    
+
+  SUBSTITUTE_BECAUSE_BEST
+};
+
+class MOZ_STACK_CLASS LookupResult {
+ public:
+  explicit LookupResult(MatchType aMatchType)
+      : mMatchType(aMatchType), mFailedToRequestDecode(false) {
+    MOZ_ASSERT(
+        mMatchType == MatchType::NOT_FOUND || mMatchType == MatchType::PENDING,
+        "Only NOT_FOUND or PENDING make sense with no surface");
+  }
+
+  LookupResult(LookupResult&& aOther)
+      : mSurface(std::move(aOther.mSurface)),
+        mMatchType(aOther.mMatchType),
+        mSuggestedSize(aOther.mSuggestedSize),
+        mFailedToRequestDecode(aOther.mFailedToRequestDecode) {}
+
+  LookupResult(DrawableSurface&& aSurface, MatchType aMatchType)
+      : mSurface(std::move(aSurface)),
+        mMatchType(aMatchType),
+        mFailedToRequestDecode(false) {
+    MOZ_ASSERT(!mSurface || !(mMatchType == MatchType::NOT_FOUND ||
+                              mMatchType == MatchType::PENDING),
+               "Only NOT_FOUND or PENDING make sense with no surface");
+    MOZ_ASSERT(mSurface || mMatchType == MatchType::NOT_FOUND ||
+                   mMatchType == MatchType::PENDING,
+               "NOT_FOUND or PENDING do not make sense with a surface");
+  }
+
+  LookupResult(MatchType aMatchType, const gfx::IntSize& aSuggestedSize)
+      : mMatchType(aMatchType),
+        mSuggestedSize(aSuggestedSize),
+        mFailedToRequestDecode(false) {
+    MOZ_ASSERT(
+        mMatchType == MatchType::NOT_FOUND || mMatchType == MatchType::PENDING,
+        "Only NOT_FOUND or PENDING make sense with no surface");
+  }
+
+  LookupResult(DrawableSurface&& aSurface, MatchType aMatchType,
+               const gfx::IntSize& aSuggestedSize)
+      : mSurface(std::move(aSurface)),
+        mMatchType(aMatchType),
+        mSuggestedSize(aSuggestedSize),
+        mFailedToRequestDecode(false) {
+    MOZ_ASSERT(!mSurface || !(mMatchType == MatchType::NOT_FOUND ||
+                              mMatchType == MatchType::PENDING),
+               "Only NOT_FOUND or PENDING make sense with no surface");
+    MOZ_ASSERT(mSurface || mMatchType == MatchType::NOT_FOUND ||
+                   mMatchType == MatchType::PENDING,
+               "NOT_FOUND or PENDING do not make sense with a surface");
+  }
+
+  LookupResult& operator=(LookupResult&& aOther) {
+    MOZ_ASSERT(&aOther != this, "Self-move-assignment is not supported");
+    mSurface = std::move(aOther.mSurface);
+    mMatchType = aOther.mMatchType;
+    mSuggestedSize = aOther.mSuggestedSize;
+    mFailedToRequestDecode = aOther.mFailedToRequestDecode;
+    return *this;
+  }
+
+  DrawableSurface& Surface() { return mSurface; }
+  const DrawableSurface& Surface() const { return mSurface; }
+  const gfx::IntSize& SuggestedSize() const { return mSuggestedSize; }
+
+  explicit operator bool() const { return bool(mSurface); }
+
+  MatchType Type() const { return mMatchType; }
+
+  void SetFailedToRequestDecode() { mFailedToRequestDecode = true; }
+  bool GetFailedToRequestDecode() { return mFailedToRequestDecode; }
+
+ private:
+  LookupResult(const LookupResult&) = delete;
+  LookupResult& operator=(const LookupResult& aOther) = delete;
+
+  DrawableSurface mSurface;
+  MatchType mMatchType;
+
+  gfx::IntSize mSuggestedSize;
+
+  bool mFailedToRequestDecode;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_LookupResult_h

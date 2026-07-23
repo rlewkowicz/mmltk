@@ -1,0 +1,146 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WindowFeatures.h"
+
+#include "nsContentUtils.h"        // nsContentUtils
+#include "nsDependentSubstring.h"  // Substring
+#include "nsINode.h"               // IsSpaceCharacter
+#include "nsReadableUtils.h"       // ToLowerCase
+
+using mozilla::dom::IsSpaceCharacter;
+using mozilla::dom::WindowFeatures;
+
+#ifdef DEBUG
+bool WindowFeatures::IsLowerCase(const char* text) {
+  nsAutoCString before(text);
+  nsAutoCString after;
+  ToLowerCase(before, after);
+  return before == after;
+}
+#endif
+
+static bool IsFeatureSeparator(char aChar) {
+  return IsSpaceCharacter(aChar) || aChar == '=' || aChar == ',';
+}
+
+template <class IterT, class CondT>
+void AdvanceWhile(IterT& aPosition, const IterT& aEnd, CondT aCondition) {
+  while (aCondition(*aPosition) && aPosition < aEnd) {
+
+    ++aPosition;
+  }
+}
+
+template <class IterT, class CondT>
+nsTDependentSubstring<char> CollectSequence(IterT& aPosition, const IterT& aEnd,
+                                            CondT aCondition) {
+
+  auto start = aPosition;
+
+  AdvanceWhile(aPosition, aEnd, aCondition);
+
+  return Substring(start, aPosition);
+}
+
+static void NormalizeName(nsAutoCString& aName) {
+  if (aName == "screenx") {
+    aName = "left";
+  } else if (aName == "screeny") {
+    aName = "top";
+  } else if (aName == "innerwidth") {
+    aName = "width";
+  } else if (aName == "innerheight") {
+    aName = "height";
+  }
+}
+
+int32_t WindowFeatures::ParseIntegerWithFallback(const nsCString& aValue) {
+  nsContentUtils::ParseHTMLIntegerResultFlags parseResult;
+  int32_t parsed = nsContentUtils::ParseHTMLInteger(aValue, &parseResult);
+
+  if (parseResult & nsContentUtils::eParseHTMLInteger_Error) {
+    parsed = 0;
+  }
+
+  return parsed;
+}
+
+bool WindowFeatures::ParseBool(const nsCString& aValue) {
+
+  if (aValue.IsEmpty()) {
+    return true;
+  }
+
+  if (aValue == "yes") {
+    return true;
+  }
+
+  if (aValue == "true") {
+    return true;
+  }
+
+  int32_t parsed = ParseIntegerWithFallback(aValue);
+
+  return parsed != 0;
+}
+
+bool WindowFeatures::Tokenize(const nsACString& aFeatures) {
+
+
+  auto position = aFeatures.BeginReading();
+
+  auto end = aFeatures.EndReading();
+  while (position < end) {
+
+    nsAutoCString value;
+
+    AdvanceWhile(position, end, IsFeatureSeparator);
+
+    nsAutoCString name(CollectSequence(
+        position, end, [](char c) { return !IsFeatureSeparator(c); }));
+    ToLowerCase(name);
+
+    NormalizeName(name);
+
+    AdvanceWhile(position, end, [](char c) { return IsSpaceCharacter(c); });
+
+    if (position < end && IsFeatureSeparator(*position)) {
+      AdvanceWhile(position, end,
+                   [](char c) { return IsFeatureSeparator(c) && c != ','; });
+
+      value = CollectSequence(position, end,
+                              [](char c) { return !IsFeatureSeparator(c); });
+      ToLowerCase(value);
+    }
+
+    if (!name.IsEmpty()) {
+      if (!tokenizedFeatures_.put(name, value)) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+void WindowFeatures::Stringify(nsAutoCString& aOutput) {
+  MOZ_ASSERT(aOutput.IsEmpty());
+
+  for (auto iter = tokenizedFeatures_.iter(); !iter.done(); iter.next()) {
+    if (!aOutput.IsEmpty()) {
+      aOutput.Append(',');
+    }
+
+    const nsCString& name = iter.get().key();
+    const nsCString& value = iter.get().value();
+
+    aOutput.Append(name);
+
+    if (!value.IsEmpty()) {
+      aOutput.Append('=');
+      aOutput.Append(value);
+    }
+  }
+}

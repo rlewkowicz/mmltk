@@ -1,0 +1,25 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkMatrixUtils_DEFINED)
+#define SkMatrixUtils_DEFINED
+
+#include "include/core/SkPoint.h"
+#include "include/core/SkSize.h"
+
+class SkMatrix;
+struct SkSamplingOptions;
+
+bool SkTreatAsSprite(const SkMatrix&, const SkISize& size, const SkSamplingOptions&,
+                     bool isAntiAlias);
+
+bool SkDecomposeUpper2x2(const SkMatrix& matrix,
+                         SkPoint* rotation1,
+                         SkPoint* scale,
+                         SkPoint* rotation2);
+
+#endif

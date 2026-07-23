@@ -1,0 +1,116 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef dom_ipc_SharedStringMap_h
+#define dom_ipc_SharedStringMap_h
+
+#include "mozilla/Result.h"
+#include "mozilla/dom/ipc/StringTable.h"
+#include "mozilla/ipc/SharedMemoryHandle.h"
+#include "mozilla/ipc/SharedMemoryMapping.h"
+#include "nsTHashMap.h"
+
+namespace mozilla::dom::ipc {
+
+class SharedStringMapBuilder;
+
+class SharedStringMap {
+ public:
+  struct Header {
+    uint32_t mMagic;
+    uint32_t mEntryCount;
+
+    size_t mKeyStringsOffset;
+    size_t mKeyStringsSize;
+
+    size_t mValueStringsOffset;
+    size_t mValueStringsSize;
+  };
+
+  struct Entry {
+    StringTableEntry mKey;
+    StringTableEntry mValue;
+  };
+
+  NS_INLINE_DECL_REFCOUNTING(SharedStringMap)
+
+  explicit SharedStringMap(const mozilla::ipc::ReadOnlySharedMemoryHandle&);
+  explicit SharedStringMap(SharedStringMapBuilder&&);
+
+  bool Has(const nsCString& aKey);
+
+  bool Get(const nsCString& aKey, nsAString& aValue);
+
+ private:
+  bool Find(const nsCString& aKey, size_t* aIndex);
+
+ public:
+  uint32_t Count() const { return EntryCount(); }
+
+  nsCString GetKeyAt(uint32_t aIndex) const {
+    MOZ_ASSERT(aIndex < Count());
+    return KeyTable().Get(Entries()[aIndex].mKey);
+  }
+
+  nsString GetValueAt(uint32_t aIndex) const {
+    MOZ_ASSERT(aIndex < Count());
+    return ValueTable().Get(Entries()[aIndex].mValue);
+  }
+
+  mozilla::ipc::ReadOnlySharedMemoryHandle CloneHandle() const;
+
+  size_t MapSize() const { return mMappedMemory.size(); }
+
+ protected:
+  ~SharedStringMap() = default;
+
+ private:
+  const Header& GetHeader() const {
+    return *reinterpret_cast<const Header*>(mMappedMemory.data());
+  }
+
+  RangedPtr<const Entry> Entries() const {
+    return {reinterpret_cast<const Entry*>(&GetHeader() + 1), EntryCount()};
+  }
+
+  uint32_t EntryCount() const { return GetHeader().mEntryCount; }
+
+  StringTable<nsCString> KeyTable() const {
+    const auto& header = GetHeader();
+    return {
+        {const_cast<uint8_t*>(&mMappedMemory.data()[header.mKeyStringsOffset]),
+         header.mKeyStringsSize}};
+  }
+
+  StringTable<nsString> ValueTable() const {
+    const auto& header = GetHeader();
+    return {{const_cast<uint8_t*>(
+                 &mMappedMemory.data()[header.mValueStringsOffset]),
+             header.mValueStringsSize}};
+  }
+
+  mozilla::ipc::ReadOnlySharedMemoryHandle mHandle;
+  mozilla::ipc::shared_memory::LeakedReadOnlyMapping mMappedMemory;
+};
+
+class MOZ_RAII SharedStringMapBuilder {
+ public:
+  SharedStringMapBuilder() = default;
+
+  void Add(const nsCString& aKey, const nsString& aValue);
+
+  Result<mozilla::ipc::ReadOnlySharedMemoryHandle, nsresult> Finalize();
+
+ private:
+  using Entry = SharedStringMap::Entry;
+
+  StringTableBuilder<nsCStringHashKey, nsCString> mKeyTable;
+  StringTableBuilder<nsStringHashKey, nsString> mValueTable;
+
+  nsTHashMap<nsCStringHashKey, Entry> mEntries;
+};
+
+}  
+
+#endif  // dom_ipc_SharedStringMap_h

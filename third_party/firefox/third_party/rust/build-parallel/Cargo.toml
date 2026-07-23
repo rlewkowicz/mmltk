@@ -1,0 +1,20 @@
+
+[package]
+edition = "2018"
+name = "build-parallel"
+version = "0.1.2"
+authors = ["Jeff Muizelaar <jrmuizel@gmail.com>"]
+description = "A helper library to let you parallelize work in build.rs\nusing the jobserver\n"
+documentation = "https://doc.rs/build-parallel"
+keywords = ["build-dependencies"]
+categories = ["development-tools::build-utils"]
+license = "MIT/Apache-2.0"
+repository = "https://github.com/jrmuizel/build-parallel"
+[dependencies.crossbeam-utils]
+version = "0.8"
+
+[dependencies.jobserver]
+version = "0.1.19"
+
+[dependencies.num_cpus]
+version = "1.0"

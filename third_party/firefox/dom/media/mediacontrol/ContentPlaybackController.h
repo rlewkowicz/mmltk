@@ -1,0 +1,59 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_MEDIACONTROL_CONTENTPLAYBACKCONTROLLER_H_
+#define DOM_MEDIA_MEDIACONTROL_CONTENTPLAYBACKCONTROLLER_H_
+
+#include "MediaControlKeySource.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "nsPIDOMWindow.h"
+
+namespace mozilla::dom {
+
+class MediaSession;
+enum class AudioFocusInterruptAction : uint8_t;
+
+class MOZ_STACK_CLASS ContentPlaybackController {
+ public:
+  explicit ContentPlaybackController(BrowsingContext* aContext);
+  ~ContentPlaybackController() = default;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void Focus();
+  void Play();
+  void Pause();
+  void SeekBackward(double aSeekOffset);
+  void SeekForward(double aSeekOffset);
+  void PreviousTrack();
+  void NextTrack();
+  void SkipAd();
+  void Stop();
+  void SeekTo(double aSeekTime, bool aFastSeek);
+  void SetVolume(double aVolume);
+  void Mute();
+  void Unmute();
+
+ private:
+  void NotifyContentMediaControlKeyReceiver(
+      MediaControlKey aKey, const MediaControlActionParams& aParams = {});
+  void NotifyMediaSession(MediaSessionAction aAction);
+  void NotifyMediaSession(const MediaSessionActionDetails& aParams);
+  void NotifyMediaSessionWhenActionIsSupported(MediaSessionAction aAction);
+  bool IsMediaSessionActionSupported(MediaSessionAction aAction) const;
+  Maybe<uint64_t> GetActiveMediaSessionId() const;
+  MediaSession* GetMediaSession() const;
+
+  RefPtr<BrowsingContext> mBC;
+};
+
+class ContentMediaControlKeyHandler {
+ public:
+  static void HandleMediaControlAction(BrowsingContext* aContext,
+                                       const MediaControlAction& aAction);
+  static void HandleAudioFocusInterrupt(BrowsingContext* aContext,
+                                        AudioFocusInterruptAction aAction);
+};
+
+}  
+
+#endif

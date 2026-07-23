@@ -1,0 +1,95 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_workers_WorkerThread_h_
+#define mozilla_dom_workers_WorkerThread_h_
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/CondVar.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/SafeRefPtr.h"
+#include "nsISupports.h"
+#include "nsThread.h"
+#include "nscore.h"
+
+class nsIRunnable;
+
+namespace mozilla {
+class Runnable;
+
+namespace dom {
+
+class WorkerRunnable;
+class WorkerPrivate;
+namespace workerinternals {
+class RuntimeService;
+}
+
+class WorkerThreadFriendKey {
+  friend class workerinternals::RuntimeService;
+  friend class WorkerPrivate;
+
+  WorkerThreadFriendKey();
+  ~WorkerThreadFriendKey();
+};
+
+class WorkerThread final : public nsThread {
+  class Observer;
+
+  Mutex mLock MOZ_UNANNOTATED;
+  CondVar mWorkerPrivateCondVar;
+
+  WorkerPrivate* mWorkerPrivate;
+
+  RefPtr<Observer> mObserver;
+
+  uint32_t mOtherThreadsDispatchingViaEventTarget;
+
+#ifdef DEBUG
+  bool mAcceptingNonWorkerRunnables;
+#endif
+
+  struct ConstructorKey {};
+
+ public:
+  explicit WorkerThread(ConstructorKey);
+
+  static SafeRefPtr<WorkerThread> Create(const WorkerThreadFriendKey& aKey);
+
+  void SetWorker(const WorkerThreadFriendKey& aKey,
+                 WorkerPrivate* aWorkerPrivate);
+
+  void ClearEventQueueAndWorker(const WorkerThreadFriendKey& aKey);
+
+  nsresult DispatchPrimaryRunnable(const WorkerThreadFriendKey& aKey,
+                                   already_AddRefed<nsIRunnable> aRunnable);
+
+  nsresult DispatchAnyThread(const WorkerThreadFriendKey& aKey,
+                             RefPtr<WorkerRunnable> aWorkerRunnable);
+
+  uint32_t RecursionDepth(const WorkerThreadFriendKey& aKey) const;
+
+  NS_IMETHOD HasPendingEvents(bool* aHasPendingEvents) override;
+
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(WorkerThread, nsThread)
+
+ private:
+  ~WorkerThread();
+
+  NS_IMETHOD
+  Dispatch(already_AddRefed<nsIRunnable> aRunnable,
+           DispatchFlags aFlags) override;
+
+  NS_IMETHOD
+  DispatchFromScript(nsIRunnable* aRunnable, DispatchFlags aFlags) override;
+
+  NS_IMETHOD
+  DelayedDispatch(already_AddRefed<nsIRunnable>, uint32_t) override;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_workers_WorkerThread_h_

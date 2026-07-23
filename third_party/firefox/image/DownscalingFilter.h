@@ -1,0 +1,268 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_image_DownscalingFilter_h
+#define mozilla_image_DownscalingFilter_h
+
+#include <stdint.h>
+
+#include <algorithm>
+#include <ctime>
+
+#include "SurfacePipe.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/gfx/ConvolutionFilter.h"
+
+namespace mozilla {
+namespace image {
+
+
+template <typename Next>
+class DownscalingFilter;
+
+struct DownscalingConfig {
+  template <typename Next>
+  using Filter = DownscalingFilter<Next>;
+  gfx::IntSize mInputSize;     
+  gfx::SurfaceFormat mFormat;  
+};
+
+template <typename Next>
+class DownscalingFilter final : public SurfaceFilter {
+ public:
+  DownscalingFilter()
+      : mWindowCapacity(0),
+        mRowsInWindow(0),
+        mInputRow(0),
+        mOutputRow(0),
+        mFormat(gfx::SurfaceFormat::UNKNOWN) {}
+
+  ~DownscalingFilter() { ReleaseWindow(); }
+
+  template <typename... Rest>
+  nsresult Configure(const DownscalingConfig& aConfig, const Rest&... aRest) {
+    nsresult rv = mNext.Configure(aRest...);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+
+    if (mNext.InputSize() == aConfig.mInputSize) {
+      NS_WARNING("Created a downscaler, but not downscaling?");
+      return NS_ERROR_INVALID_ARG;
+    }
+    if (mNext.InputSize().width > aConfig.mInputSize.width) {
+      NS_WARNING("Created a downscaler, but width is larger");
+      return NS_ERROR_INVALID_ARG;
+    }
+    if (mNext.InputSize().height > aConfig.mInputSize.height) {
+      NS_WARNING("Created a downscaler, but height is larger");
+      return NS_ERROR_INVALID_ARG;
+    }
+    if (aConfig.mInputSize.width <= 0 || aConfig.mInputSize.height <= 0) {
+      NS_WARNING("Invalid input size for DownscalingFilter");
+      return NS_ERROR_INVALID_ARG;
+    }
+
+    mInputSize = aConfig.mInputSize;
+    gfx::IntSize outputSize = mNext.InputSize();
+    mScale =
+        gfx::MatrixScalesDouble(double(mInputSize.width) / outputSize.width,
+                                double(mInputSize.height) / outputSize.height);
+    mFormat = aConfig.mFormat;
+
+    ReleaseWindow();
+
+    auto resizeMethod = gfx::ConvolutionFilter::ResizeMethod::LANCZOS3;
+    if (!mXFilter.ComputeResizeFilter(resizeMethod, mInputSize.width,
+                                      outputSize.width) ||
+        !mYFilter.ComputeResizeFilter(resizeMethod, mInputSize.height,
+                                      outputSize.height)) {
+      NS_WARNING("Failed to compute filters for image downscaling");
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    mRowBuffer.reset(new (fallible)
+                         uint8_t[PaddedWidthInBytes(mInputSize.width)]);
+    if (MOZ_UNLIKELY(!mRowBuffer)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    memset(mRowBuffer.get(), 0, PaddedWidthInBytes(mInputSize.width));
+
+    mWindowCapacity = mYFilter.MaxFilter();
+    mWindow.reset(new (fallible) uint8_t*[mWindowCapacity]);
+    if (MOZ_UNLIKELY(!mWindow)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    bool anyAllocationFailed = false;
+    const size_t windowRowSizeInBytes = PaddedWidthInBytes(outputSize.width);
+    for (int32_t i = 0; i < mWindowCapacity; ++i) {
+      mWindow[i] = new (fallible) uint8_t[windowRowSizeInBytes];
+      anyAllocationFailed = anyAllocationFailed || mWindow[i] == nullptr;
+    }
+
+    if (MOZ_UNLIKELY(anyAllocationFailed)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    ConfigureFilter(mInputSize, sizeof(uint32_t));
+    return NS_OK;
+  }
+
+  Maybe<SurfaceInvalidRect> TakeInvalidRect() override {
+    Maybe<SurfaceInvalidRect> invalidRect = mNext.TakeInvalidRect();
+
+    if (invalidRect) {
+      invalidRect->mInputSpaceRect.ScaleRoundOut(mScale.xScale, mScale.yScale);
+    }
+
+    return invalidRect;
+  }
+
+ protected:
+  uint8_t* DoResetToFirstRow() override {
+    mNext.ResetToFirstRow();
+
+    mInputRow = 0;
+    mOutputRow = 0;
+    mRowsInWindow = 0;
+
+    return GetRowPointer();
+  }
+
+  uint8_t* DoAdvanceRowFromBuffer(const uint8_t* aInputRow) override {
+    if (mInputRow >= mInputSize.height) {
+      NS_WARNING("Advancing DownscalingFilter past the end of the input");
+      return nullptr;
+    }
+
+    if (mOutputRow >= mNext.InputSize().height) {
+      NS_WARNING("Advancing DownscalingFilter past the end of the output");
+      return nullptr;
+    }
+
+    int32_t filterOffset = 0;
+    int32_t filterLength = 0;
+    mYFilter.GetFilterOffsetAndLength(mOutputRow, &filterOffset, &filterLength);
+
+    int32_t inputRowToRead = filterOffset + mRowsInWindow;
+    MOZ_ASSERT(mInputRow <= inputRowToRead, "Reading past end of input");
+    if (mInputRow == inputRowToRead) {
+      MOZ_RELEASE_ASSERT(mRowsInWindow < mWindowCapacity,
+                         "Need more rows than capacity!");
+      mXFilter.ConvolveHorizontally(aInputRow, mWindow[mRowsInWindow++],
+                                    mFormat);
+    }
+
+    MOZ_ASSERT(mOutputRow < mNext.InputSize().height,
+               "Writing past end of output");
+
+    while (mRowsInWindow >= filterLength) {
+      DownscaleInputRow();
+
+      if (mOutputRow == mNext.InputSize().height) {
+        break;  
+      }
+
+      mYFilter.GetFilterOffsetAndLength(mOutputRow, &filterOffset,
+                                        &filterLength);
+    }
+
+    mInputRow++;
+
+    return mInputRow < mInputSize.height ? GetRowPointer() : nullptr;
+  }
+
+  uint8_t* DoAdvanceRow() override {
+    return DoAdvanceRowFromBuffer(mRowBuffer.get());
+  }
+
+ private:
+  uint8_t* GetRowPointer() const { return mRowBuffer.get(); }
+
+  static size_t PaddedWidthInBytes(size_t aLogicalWidth) {
+    return gfx::ConvolutionFilter::PadBytesForSIMD(aLogicalWidth *
+                                                   sizeof(uint32_t));
+  }
+
+  void DownscaleInputRow() {
+    MOZ_ASSERT(mOutputRow < mNext.InputSize().height,
+               "Writing past end of output");
+
+    int32_t filterOffset = 0;
+    int32_t filterLength = 0;
+    mYFilter.GetFilterOffsetAndLength(mOutputRow, &filterOffset, &filterLength);
+
+    mNext.template WriteUnsafeComputedRow<uint32_t>([&](uint32_t* aRow,
+                                                        uint32_t aLength) {
+      mYFilter.ConvolveVertically(mWindow.get(),
+                                  reinterpret_cast<uint8_t*>(aRow), mOutputRow,
+                                  mXFilter.NumValues(), mFormat);
+    });
+
+    mOutputRow++;
+
+    if (mOutputRow == mNext.InputSize().height) {
+      return;  
+    }
+
+    int32_t newFilterOffset = 0;
+    int32_t newFilterLength = 0;
+    mYFilter.GetFilterOffsetAndLength(mOutputRow, &newFilterOffset,
+                                      &newFilterLength);
+
+    int diff = newFilterOffset - filterOffset;
+    MOZ_ASSERT(diff >= 0, "Moving backwards in the filter?");
+
+    mRowsInWindow -= diff;
+    mRowsInWindow = std::clamp(mRowsInWindow, 0, mWindowCapacity);
+
+    if (filterLength > mRowsInWindow) {
+      for (int32_t i = 0; i < mRowsInWindow; ++i) {
+        std::swap(mWindow[i], mWindow[filterLength - mRowsInWindow + i]);
+      }
+    }
+  }
+
+  void ReleaseWindow() {
+    if (!mWindow) {
+      return;
+    }
+
+    for (int32_t i = 0; i < mWindowCapacity; ++i) {
+      delete[] mWindow[i];
+    }
+
+    mWindow = nullptr;
+    mWindowCapacity = 0;
+  }
+
+  Next mNext;  
+
+  gfx::IntSize mInputSize;         
+  gfx::MatrixScalesDouble mScale;  
+
+  UniquePtr<uint8_t[]> mRowBuffer;  
+  UniquePtr<uint8_t*[]> mWindow;    
+
+  gfx::ConvolutionFilter mXFilter;  
+  gfx::ConvolutionFilter mYFilter;  
+
+  int32_t mWindowCapacity;  
+
+  int32_t mRowsInWindow;  
+  int32_t mInputRow;      
+  int32_t mOutputRow;     
+
+  gfx::SurfaceFormat mFormat;  
+};
+
+}  
+}  
+
+#endif  // mozilla_image_DownscalingFilter_h

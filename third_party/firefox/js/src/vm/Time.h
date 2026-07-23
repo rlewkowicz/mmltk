@@ -1,0 +1,60 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_Time_h
+#define vm_Time_h
+
+#include "mozilla/TimeStamp.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+namespace js {
+
+#if !JS_HAS_INTL_API
+struct PRMJTime {
+  int32_t tm_usec; 
+  int8_t tm_sec;   
+  int8_t tm_min;   
+  int8_t tm_hour;  
+  int8_t tm_mday;  
+  int8_t tm_mon;   
+  int8_t tm_wday;  
+  int32_t tm_year; 
+  int16_t tm_yday; 
+  int8_t tm_isdst; 
+};
+#endif
+
+constexpr inline int64_t PRMJ_USEC_PER_SEC = 1000000;
+constexpr inline int64_t PRMJ_USEC_PER_MSEC = 1000;
+constexpr inline int64_t PRMJ_NSEC_PER_USEC = 1000;
+
+extern int64_t PRMJ_Now();
+
+#if !JS_HAS_INTL_API
+extern size_t PRMJ_FormatTime(char* buf, size_t buflen, const char* fmt,
+                              const PRMJTime* tm, int timeZoneYear,
+                              int offsetInSeconds);
+#endif
+
+class MOZ_RAII AutoIncrementalTimer {
+  mozilla::TimeStamp startTime;
+  mozilla::TimeDuration& output;
+
+ public:
+  AutoIncrementalTimer(const AutoIncrementalTimer&) = delete;
+  AutoIncrementalTimer& operator=(const AutoIncrementalTimer&) = delete;
+
+  explicit AutoIncrementalTimer(mozilla::TimeDuration& output_)
+      : output(output_) {
+    startTime = mozilla::TimeStamp::Now();
+  }
+
+  ~AutoIncrementalTimer() { output += mozilla::TimeStamp::Now() - startTime; }
+};
+
+}  
+
+#endif /* vm_Time_h */

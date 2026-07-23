@@ -1,0 +1,1294 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/storage.h"
+#include "mozilla/StaticPrefs_places.h"
+#include "nsString.h"
+#include "nsFaviconService.h"
+#include "nsNavBookmarks.h"
+#include "nsUnicharUtils.h"
+#include "nsWhitespaceTokenizer.h"
+#include "nsEscape.h"
+#include "mozIPlacesAutoComplete.h"
+#include "SQLFunctions.h"
+#include "nsMathUtils.h"
+#include "nsUnicodeProperties.h"
+#include "nsUTF8Utils.h"
+#include "nsINavHistoryService.h"
+#include "nsPrintfCString.h"
+#include "nsNavHistory.h"
+#include "mozilla/Services.h"
+#include "mozilla/Utf8.h"
+#include "nsURLHelper.h"
+#include "nsVariant.h"
+#include "nsICryptoHash.h"
+
+#define MAX_CHARS_TO_SEARCH_THROUGH 255
+
+#define SECONDS_PER_DAY 86400
+
+using namespace mozilla::storage;
+
+
+namespace {
+
+using const_char_iterator = nsACString::const_char_iterator;
+using size_type = nsACString::size_type;
+using char_type = nsACString::char_type;
+
+static MOZ_ALWAYS_INLINE void goToNextSearchCandidate(
+    const_char_iterator& aStart, const const_char_iterator& aEnd,
+    uint32_t aSearchFor) {
+  if (aSearchFor < 128) {
+    unsigned char target = (unsigned char)(aSearchFor | 0x20);
+    unsigned char special = 0xff;
+    if (target == 'i' || target == 'k') {
+      special = (target == 'i' ? 0xc4 : 0xe2);
+    }
+
+    while (aStart < aEnd && (unsigned char)(*aStart | 0x20) != target &&
+           (unsigned char)*aStart != special) {
+      aStart++;
+    }
+  } else {
+    while (aStart < aEnd && (unsigned char)(*aStart) < 128) {
+      aStart++;
+    }
+  }
+}
+
+static MOZ_ALWAYS_INLINE bool isOnBoundary(const_char_iterator aPos) {
+  if ('a' <= *aPos && *aPos <= 'z') {
+    char prev = static_cast<char>(*(aPos - 1) | 0x20);
+    return !('a' <= prev && prev <= 'z');
+  }
+  return true;
+}
+
+static MOZ_ALWAYS_INLINE bool stringMatch(const_char_iterator aTokenStart,
+                                          const_char_iterator aTokenEnd,
+                                          const_char_iterator aSourceStart,
+                                          const_char_iterator aSourceEnd,
+                                          bool aMatchDiacritics) {
+  const_char_iterator tokenCur = aTokenStart, sourceCur = aSourceStart;
+
+  while (tokenCur < aTokenEnd) {
+    if (sourceCur >= aSourceEnd) {
+      return false;
+    }
+
+    bool error;
+    if (!CaseInsensitiveUTF8CharsEqual(sourceCur, tokenCur, aSourceEnd,
+                                       aTokenEnd, &sourceCur, &tokenCur, &error,
+                                       aMatchDiacritics)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+enum FindInStringBehavior { eFindOnBoundary, eFindAnywhere };
+
+static bool findInString(const nsDependentCSubstring& aToken,
+                         const nsACString& aSourceString,
+                         FindInStringBehavior aBehavior) {
+  MOZ_ASSERT(!aToken.IsEmpty(), "Don't search for an empty token!");
+
+  if (aSourceString.IsEmpty()) {
+    return false;
+  }
+
+  const nsNavHistory* history = nsNavHistory::GetConstHistoryService();
+  bool matchDiacritics = history && history->MatchDiacritics();
+
+  const_char_iterator tokenStart(aToken.BeginReading()),
+      tokenEnd(aToken.EndReading()), tokenNext,
+      sourceStart(aSourceString.BeginReading()),
+      sourceEnd(aSourceString.EndReading()), sourceCur(sourceStart), sourceNext;
+
+  uint32_t tokenFirstChar =
+      GetLowerUTF8Codepoint(tokenStart, tokenEnd, &tokenNext);
+  if (tokenFirstChar == uint32_t(-1)) {
+    return false;
+  }
+  if (!matchDiacritics) {
+    tokenFirstChar = ToNaked(tokenFirstChar);
+  }
+
+  for (;;) {
+    if (matchDiacritics) {
+      goToNextSearchCandidate(sourceCur, sourceEnd, tokenFirstChar);
+    }
+    if (sourceCur == sourceEnd) {
+      break;
+    }
+
+    uint32_t sourceFirstChar =
+        GetLowerUTF8Codepoint(sourceCur, sourceEnd, &sourceNext);
+    if (sourceFirstChar == uint32_t(-1)) {
+      return false;
+    }
+    if (!matchDiacritics) {
+      sourceFirstChar = ToNaked(sourceFirstChar);
+    }
+
+    if (sourceFirstChar == tokenFirstChar &&
+        (aBehavior != eFindOnBoundary || sourceCur == sourceStart ||
+         isOnBoundary(sourceCur)) &&
+        stringMatch(tokenNext, tokenEnd, sourceNext, sourceEnd,
+                    matchDiacritics)) {
+      return true;
+    }
+
+    sourceCur = sourceNext;
+  }
+
+  return false;
+}
+
+static MOZ_ALWAYS_INLINE nsDependentCString
+getSharedUTF8String(mozIStorageValueArray* aValues, uint32_t aIndex) {
+  uint32_t len;
+  const char* str = aValues->AsSharedUTF8String(aIndex, &len);
+  if (!str) {
+    return nsDependentCString("", (size_t)0);
+  }
+  return nsDependentCString(str, len);
+}
+
+static MOZ_ALWAYS_INLINE size_type getPrefixLength(const nsACString& aSpec) {
+  size_type length = std::min(static_cast<size_type>(64), aSpec.Length());
+  for (size_type i = 0; i < length; ++i) {
+    if (aSpec[i] == static_cast<char_type>(':')) {
+      if (i + 2 < aSpec.Length() &&
+          aSpec[i + 1] == static_cast<char_type>('/') &&
+          aSpec[i + 2] == static_cast<char_type>('/')) {
+        i += 2;
+      }
+      return i + 1;
+    }
+  }
+  return 0;
+}
+
+static MOZ_ALWAYS_INLINE size_type
+indexOfHostAndPort(const nsACString& aSpec, size_type* _hostAndPortLength) {
+  size_type index = getPrefixLength(aSpec);
+  size_type i = index;
+  for (; i < aSpec.Length(); ++i) {
+    if (aSpec[i] == static_cast<char_type>('/') ||
+        aSpec[i] == static_cast<char_type>('?') ||
+        aSpec[i] == static_cast<char_type>('#')) {
+      break;
+    }
+    if (aSpec[i] == static_cast<char_type>('@')) {
+      index = i + 1;
+    }
+  }
+  if (_hostAndPortLength) {
+    *_hostAndPortLength = i - index;
+  }
+  return index;
+}
+
+}  
+
+namespace mozilla::places {
+
+
+nsresult MatchAutoCompleteFunction::create(mozIStorageConnection* aDBConn) {
+  RefPtr<MatchAutoCompleteFunction> function = new MatchAutoCompleteFunction();
+
+  nsresult rv = aDBConn->CreateFunction("autocomplete_match"_ns,
+                                        kArgIndexLength, function);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsDependentCSubstring MatchAutoCompleteFunction::fixupURISpec(
+    const nsACString& aURISpec, int32_t aMatchBehavior, nsACString& aSpecBuf) {
+  nsDependentCSubstring fixedSpec;
+
+  bool unescaped =
+      NS_UnescapeURL(aURISpec.BeginReading(), (int32_t)aURISpec.Length(),
+                     esc_SkipControl, aSpecBuf);
+  if (unescaped && IsUtf8(aSpecBuf)) {
+    fixedSpec.Rebind(aSpecBuf, 0);
+  } else {
+    fixedSpec.Rebind(aURISpec, 0);
+  }
+
+  if (aMatchBehavior == mozIPlacesAutoComplete::MATCH_ANYWHERE_UNMODIFIED) {
+    return fixedSpec;
+  }
+
+  if (StringBeginsWith(fixedSpec, "http://"_ns)) {
+    fixedSpec.Rebind(fixedSpec, 7);
+  } else if (StringBeginsWith(fixedSpec, "https://"_ns)) {
+    fixedSpec.Rebind(fixedSpec, 8);
+  } else if (StringBeginsWith(fixedSpec, "ftp://"_ns)) {
+    fixedSpec.Rebind(fixedSpec, 6);
+  }
+
+  return fixedSpec;
+}
+
+bool MatchAutoCompleteFunction::findAnywhere(
+    const nsDependentCSubstring& aToken, const nsACString& aSourceString) {
+
+  return findInString(aToken, aSourceString, eFindAnywhere);
+}
+
+bool MatchAutoCompleteFunction::findOnBoundary(
+    const nsDependentCSubstring& aToken, const nsACString& aSourceString) {
+  return findInString(aToken, aSourceString, eFindOnBoundary);
+}
+
+MatchAutoCompleteFunction::searchFunctionPtr
+MatchAutoCompleteFunction::getSearchFunction(int32_t aBehavior) {
+  switch (aBehavior) {
+    case mozIPlacesAutoComplete::MATCH_ANYWHERE:
+    case mozIPlacesAutoComplete::MATCH_ANYWHERE_UNMODIFIED:
+      return findAnywhere;
+    case mozIPlacesAutoComplete::MATCH_BOUNDARY:
+    default:
+      return findOnBoundary;
+  };
+}
+
+NS_IMPL_ISUPPORTS(MatchAutoCompleteFunction, mozIStorageFunction)
+
+MatchAutoCompleteFunction::MatchAutoCompleteFunction()
+    : mCachedZero(new IntegerVariant(0)), mCachedOne(new IntegerVariant(1)) {
+  static_assert(IntegerVariant::HasThreadSafeRefCnt::value,
+                "Caching assumes that variants have thread-safe refcounting");
+}
+
+NS_IMETHODIMP
+MatchAutoCompleteFunction::OnFunctionCall(mozIStorageValueArray* aArguments,
+                                          nsIVariant** _result) {
+  int32_t searchBehavior = aArguments->AsInt32(kArgIndexSearchBehavior);
+#define HAS_BEHAVIOR(aBitName) \
+  (searchBehavior & mozIPlacesAutoComplete::BEHAVIOR_##aBitName)
+
+  nsDependentCString searchString =
+      getSharedUTF8String(aArguments, kArgSearchString);
+  nsDependentCString url = getSharedUTF8String(aArguments, kArgIndexURL);
+
+  int32_t matchBehavior = aArguments->AsInt32(kArgIndexMatchBehavior);
+
+  if (matchBehavior != mozIPlacesAutoComplete::MATCH_ANYWHERE_UNMODIFIED &&
+      StringBeginsWith(url, "javascript:"_ns) && !HAS_BEHAVIOR(JAVASCRIPT) &&
+      !StringBeginsWith(searchString, "javascript:"_ns)) {
+    *_result = do_AddRef(mCachedZero).take();
+    return NS_OK;
+  }
+
+  int32_t visitCount = aArguments->AsInt32(kArgIndexVisitCount);
+  bool typed = aArguments->AsInt32(kArgIndexTyped) != 0;
+  bool bookmark = aArguments->AsInt32(kArgIndexBookmark) != 0;
+  nsDependentCString tags = getSharedUTF8String(aArguments, kArgIndexTags);
+  int32_t openPageCount = aArguments->AsInt32(kArgIndexOpenPageCount);
+  bool matches = false;
+  if (HAS_BEHAVIOR(RESTRICT)) {
+    matches = (!HAS_BEHAVIOR(HISTORY) || visitCount > 0) &&
+              (!HAS_BEHAVIOR(TYPED) || typed) &&
+              (!HAS_BEHAVIOR(BOOKMARK) || bookmark) &&
+              (!HAS_BEHAVIOR(TAG) || !tags.IsVoid()) &&
+              (!HAS_BEHAVIOR(OPENPAGE) || openPageCount > 0);
+  } else {
+    matches = (HAS_BEHAVIOR(HISTORY) && visitCount > 0) ||
+              (HAS_BEHAVIOR(TYPED) && typed) ||
+              (HAS_BEHAVIOR(BOOKMARK) && bookmark) ||
+              (HAS_BEHAVIOR(TAG) && !tags.IsVoid()) ||
+              (HAS_BEHAVIOR(OPENPAGE) && openPageCount > 0);
+  }
+
+  if (!matches) {
+    *_result = do_AddRef(mCachedZero).take();
+    return NS_OK;
+  }
+
+  searchFunctionPtr searchFunction = getSearchFunction(matchBehavior);
+
+  nsCString fixedUrlBuf;
+  nsDependentCSubstring fixedUrl =
+      fixupURISpec(url, matchBehavior, fixedUrlBuf);
+  const nsDependentCSubstring& trimmedUrl =
+      Substring(fixedUrl, 0, MAX_CHARS_TO_SEARCH_THROUGH);
+
+  nsDependentCString title = getSharedUTF8String(aArguments, kArgIndexTitle);
+  const nsDependentCSubstring& trimmedTitle =
+      Substring(title, 0, MAX_CHARS_TO_SEARCH_THROUGH);
+
+  nsDependentCString fallbackTitle =
+      getSharedUTF8String(aArguments, kArgIndexFallbackTitle);
+  const nsDependentCSubstring& trimmedFallbackTitle =
+      Substring(fallbackTitle, 0, MAX_CHARS_TO_SEARCH_THROUGH);
+
+  nsCWhitespaceTokenizer tokenizer(searchString);
+  while (matches && tokenizer.hasMoreTokens()) {
+    const nsDependentCSubstring& token = tokenizer.nextToken();
+
+    if (HAS_BEHAVIOR(TITLE) && HAS_BEHAVIOR(URL)) {
+      matches = (searchFunction(token, trimmedTitle) ||
+                 searchFunction(token, trimmedFallbackTitle) ||
+                 searchFunction(token, tags)) &&
+                searchFunction(token, trimmedUrl);
+    } else if (HAS_BEHAVIOR(TITLE)) {
+      matches = searchFunction(token, trimmedTitle) ||
+                searchFunction(token, trimmedFallbackTitle) ||
+                searchFunction(token, tags);
+    } else if (HAS_BEHAVIOR(URL)) {
+      matches = searchFunction(token, trimmedUrl);
+    } else {
+      matches = searchFunction(token, trimmedTitle) ||
+                searchFunction(token, trimmedFallbackTitle) ||
+                searchFunction(token, tags) ||
+                searchFunction(token, trimmedUrl);
+    }
+  }
+
+  *_result = do_AddRef(matches ? mCachedOne : mCachedZero).take();
+  return NS_OK;
+#undef HAS_BEHAVIOR
+}
+
+
+nsresult CalculateFrecencyFunction::create(mozIStorageConnection* aDBConn) {
+  RefPtr<CalculateFrecencyFunction> function = new CalculateFrecencyFunction();
+
+  nsresult rv = aDBConn->CreateFunction("calculate_frecency"_ns, -1, function);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(CalculateFrecencyFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+CalculateFrecencyFunction::OnFunctionCall(mozIStorageValueArray* aArguments,
+                                          nsIVariant** _result) {
+  uint32_t numEntries;
+  nsresult rv = aArguments->GetNumEntries(&numEntries);
+  NS_ENSURE_SUCCESS(rv, rv);
+  MOZ_ASSERT(numEntries <= 2, "unexpected number of arguments");
+
+  int64_t pageId = aArguments->AsInt64(0);
+  MOZ_ASSERT(pageId > 0, "Should always pass a valid page id");
+  if (pageId <= 0) {
+    *_result = MakeAndAddRef<IntegerVariant>(0).take();
+    return NS_OK;
+  }
+
+  int32_t isRedirect = 0;
+  if (numEntries > 1) {
+    isRedirect = aArguments->AsInt32(1);
+  }
+  const nsNavHistory* history = nsNavHistory::GetConstHistoryService();
+  NS_ENSURE_STATE(history);
+  RefPtr<Database> DB = Database::GetDatabase();
+  NS_ENSURE_STATE(DB);
+
+  nsCOMPtr<mozIStorageStatement> stmt = DB->GetStatement(
+      "WITH "
+      "lambda (lambda) AS ( "
+      "  SELECT ln(2) / :halfLifeDays "
+      "), "
+      "interactions AS ( "
+      "  SELECT "
+      "    place_id, "
+      "    created_at * 1000 AS visit_date "
+      "  FROM "
+      "    moz_places_metadata "
+      "  WHERE "
+      "    place_id = :pageId "
+      "      AND (total_view_time >= :viewTimeSeconds * 1000 "
+      "        OR (total_view_time >= :viewTimeIfManyKeypressesSeconds * 1000 "
+      "          AND key_presses >= :manyKeypresses)) "
+      "  ORDER BY created_at DESC "
+      "  LIMIT :numSampledVisits "
+      "), "
+      "sampled_visits AS ( "
+      "  SELECT "
+      "    vs.id, "
+      "    vs.from_visit, "
+      "    vs.place_id, "
+      "    vs.visit_date, "
+      "    vs.visit_type, "
+      "    vs.source, "
+      "    ( "
+      "      SELECT EXISTS ( "
+      "        SELECT 1 "
+      "        FROM interactions i "
+      "        WHERE vs.visit_date BETWEEN "
+      "          i.visit_date - :maxVisitGapSeconds * 1000000 "
+      "            AND i.visit_date + :maxVisitGapSeconds * 1000000 "
+      "      ) "
+      "    ) AS is_interesting "
+      "  FROM moz_historyvisits vs "
+      "  WHERE place_id = :pageId "
+      "    AND vs.visit_type NOT IN (7, 8, 9) "
+      "  ORDER BY visit_date DESC "
+      "  LIMIT :numSampledVisits "
+      "), "
+      "virtual_visits AS ( "
+      "  SELECT "
+      "    NULL AS id, "
+      "    0 AS from_visit, "
+      "    i.place_id, "
+      "    i.visit_date, "
+      "    1 AS visit_type, "
+      "    0 AS source, "
+      "    1 AS is_interesting "
+      "  FROM interactions i "
+      "  WHERE NOT EXISTS ( "
+      "    SELECT 1 FROM moz_historyvisits vs "
+      "    WHERE place_id = :pageId "
+      "      AND vs.visit_date BETWEEN "
+      "        i.visit_date - :maxVisitGapSeconds * 1000000 "
+      "        AND i.visit_date + :maxVisitGapSeconds * 1000000 "
+      "  ) "
+      "), "
+      "visit_interaction AS ( "
+      "  SELECT * FROM sampled_visits "
+      "  UNION ALL "
+      "  SELECT * FROM virtual_visits "
+      "  ORDER BY visit_date DESC "
+      "  LIMIT :numSampledVisits "
+      "), "
+      "visits (days, weight) AS ( "
+      "  SELECT "
+      "    v.visit_date / 86400000000, "
+      "    (SELECT CASE "
+      "      WHEN IFNULL(s.visit_type, v.visit_type) = 3 "  
+      "        OR v.source = 2 "                            
+      "        OR  ( IFNULL(s.visit_type, v.visit_type) = 2 "  
+      "          AND v.source NOT IN (1, 3) "  
+      "          AND t.id IS NULL AND NOT :isRedirect "  
+      "        ) "
+      "      THEN "
+      "        CASE "
+      "          WHEN v.is_interesting = 1 THEN :veryHighWeight "
+      "          ELSE :highWeight "
+      "        END "
+      "      WHEN t.id IS NULL AND NOT :isRedirect "  
+      "       AND IFNULL(s.visit_type, v.visit_type) NOT IN (4, 8, 9) "
+      "       AND v.source <> 1 "  
+      "      THEN "
+      "        CASE "
+      "          WHEN v.is_interesting = 1 THEN :highWeight "
+      "          ELSE :mediumWeight "
+      "         END "
+      "      ELSE :lowWeight "
+      "     END) "
+      "  FROM visit_interaction v "
+      "  LEFT JOIN moz_historyvisits s ON s.id = v.from_visit "
+      "                               AND v.visit_type IN (5,6) "
+      "  LEFT JOIN moz_historyvisits t ON t.from_visit = v.id "
+      "                               AND t.visit_type IN (5,6) "
+      "), "
+      "bookmark (days, weight) AS ( "
+      "  SELECT dateAdded / 86400000000, :highWeight "
+      "  FROM moz_bookmarks "
+      "  WHERE fk = :pageId "
+      "  ORDER BY dateAdded DESC "
+      "  LIMIT 1 "
+      "), "
+      "samples (days, weight) AS ( "
+      "  SELECT * FROM bookmark WHERE (SELECT count(*) FROM visits) = 0 "
+      "  UNION ALL "
+      "  SELECT * FROM visits "
+      "), "
+      "reference (days, samples_count) AS ( "
+      "  SELECT max(samples.days), count(*) FROM samples "
+      "), "
+      "scores (score) AS ( "
+      "  SELECT (weight * exp(-lambda * (reference.days - samples.days))) "
+      "  FROM samples, reference, lambda "
+      ") "
+      "SELECT CASE "
+      "WHEN (substr(url, 0, 7) = 'place:') THEN 0 "
+      "ELSE "
+      "  reference.days + CAST (( "
+      "    ln( "
+      "      sum(score) / samples_count * MAX(visit_count, samples_count) "
+      "    ) / lambda "
+      "  ) AS INTEGER) "
+      "END "
+      "FROM moz_places h, reference, lambda, scores "
+      "WHERE h.id = :pageId");
+  NS_ENSURE_STATE(stmt);
+  mozStorageStatementScoper infoScoper(stmt);
+
+  rv = stmt->BindInt64ByName("pageId"_ns, pageId);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName("isRedirect"_ns, isRedirect);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "halfLifeDays"_ns,
+      StaticPrefs::places_frecency_pages_halfLifeDays_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "numSampledVisits"_ns,
+      StaticPrefs::places_frecency_pages_numSampledVisits_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "lowWeight"_ns, StaticPrefs::places_frecency_pages_lowWeight_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "mediumWeight"_ns,
+      StaticPrefs::places_frecency_pages_mediumWeight_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "highWeight"_ns,
+      StaticPrefs::places_frecency_pages_highWeight_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "veryHighWeight"_ns,
+      StaticPrefs::places_frecency_pages_veryHighWeight_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "maxVisitGapSeconds"_ns,
+      StaticPrefs::
+          places_frecency_pages_interactions_maxVisitGapSeconds_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "viewTimeSeconds"_ns,
+      StaticPrefs::
+          places_frecency_pages_interactions_viewTimeSeconds_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "manyKeypresses"_ns,
+      StaticPrefs::
+          places_frecency_pages_interactions_manyKeypresses_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "viewTimeIfManyKeypressesSeconds"_ns,
+      StaticPrefs::
+          places_frecency_pages_interactions_viewTimeIfManyKeypressesSeconds_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  bool hasResult = false;
+  rv = stmt->ExecuteStep(&hasResult);
+  NS_ENSURE_TRUE(NS_SUCCEEDED(rv) && hasResult, NS_ERROR_UNEXPECTED);
+
+  bool isNull;
+  if (NS_SUCCEEDED(stmt->GetIsNull(0, &isNull)) && isNull) {
+    *_result = MakeAndAddRef<IntegerVariant>(0).take();
+  } else {
+    int32_t score;
+    rv = stmt->GetInt32(0, &score);
+    NS_ENSURE_SUCCESS(rv, rv);
+    *_result = MakeAndAddRef<IntegerVariant>(score).take();
+  }
+  return NS_OK;
+}
+
+
+nsresult CalculateAltFrecencyFunction::create(mozIStorageConnection* aDBConn) {
+  RefPtr<CalculateAltFrecencyFunction> function =
+      new CalculateAltFrecencyFunction();
+
+  nsresult rv =
+      aDBConn->CreateFunction("calculate_alt_frecency"_ns, -1, function);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(CalculateAltFrecencyFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+CalculateAltFrecencyFunction::OnFunctionCall(mozIStorageValueArray* aArguments,
+                                             nsIVariant** _result) {
+  uint32_t numEntries;
+  nsresult rv = aArguments->GetNumEntries(&numEntries);
+  NS_ENSURE_SUCCESS(rv, rv);
+  MOZ_ASSERT(numEntries <= 2, "unexpected number of arguments");
+
+  int64_t pageId = aArguments->AsInt64(0);
+  MOZ_ASSERT(pageId > 0, "Should always pass a valid page id");
+  if (pageId <= 0) {
+    *_result = MakeAndAddRef<IntegerVariant>(0).take();
+    return NS_OK;
+  }
+
+  int32_t isRedirect = 0;
+  if (numEntries > 1) {
+    isRedirect = aArguments->AsInt32(1);
+  }
+  const nsNavHistory* history = nsNavHistory::GetConstHistoryService();
+  NS_ENSURE_STATE(history);
+  RefPtr<Database> DB = Database::GetDatabase();
+  NS_ENSURE_STATE(DB);
+
+  nsCOMPtr<mozIStorageStatement> stmt = DB->GetStatement(
+      "WITH "
+      "lambda (lambda) AS ( "
+      "  SELECT ln(2) / :halfLifeDays "
+      "), "
+      "interactions AS ( "
+      "  SELECT "
+      "    place_id, "
+      "    created_at * 1000 AS visit_date "
+      "  FROM "
+      "    moz_places_metadata "
+      "  WHERE "
+      "    place_id = :pageId "
+      "      AND (total_view_time >= :viewTimeSeconds * 1000 "
+      "        OR (total_view_time >= :viewTimeIfManyKeypressesSeconds * 1000 "
+      "          AND key_presses >= :manyKeypresses)) "
+      "  ORDER BY created_at DESC "
+      "  LIMIT :numSampledVisits "
+      "), "
+      "sampled_visits AS ( "
+      "  SELECT "
+      "    vs.id, "
+      "    vs.from_visit, "
+      "    vs.place_id, "
+      "    vs.visit_date, "
+      "    vs.visit_type, "
+      "    vs.source, "
+      "    ( "
+      "      SELECT EXISTS ( "
+      "        SELECT 1 "
+      "        FROM interactions i "
+      "        WHERE vs.visit_date BETWEEN "
+      "          i.visit_date - :maxVisitGapSeconds * 1000000 "
+      "            AND i.visit_date + :maxVisitGapSeconds * 1000000 "
+      "      ) "
+      "    ) AS is_interesting "
+      "  FROM moz_historyvisits vs "
+      "  WHERE place_id = :pageId "
+      "  ORDER BY visit_date DESC "
+      "  LIMIT :numSampledVisits "
+      "), "
+      "virtual_visits AS ( "
+      "  SELECT "
+      "    NULL AS id, "
+      "    0 AS from_visit, "
+      "    i.place_id, "
+      "    i.visit_date, "
+      "    1 AS visit_type, "
+      "    0 AS source, "
+      "    1 AS is_interesting "
+      "  FROM interactions i "
+      "  WHERE NOT EXISTS ( "
+      "    SELECT 1 FROM moz_historyvisits vs "
+      "    WHERE  place_id = :pageId "
+      "      AND vs.visit_date BETWEEN "
+      "        i.visit_date - :maxVisitGapSeconds * 1000000 "
+      "        AND i.visit_date + :maxVisitGapSeconds * 1000000 "
+      "  ) "
+      "), "
+      "visit_interaction AS ( "
+      "  SELECT * FROM sampled_visits "
+      "  UNION ALL "
+      "  SELECT * FROM virtual_visits "
+      "  ORDER BY visit_date DESC "
+      "  LIMIT :numSampledVisits "
+      "), "
+      "visits (days, weight) AS ( "
+      "  SELECT "
+      "    v.visit_date / 86400000000, "
+      "    (SELECT CASE "
+      "      WHEN IFNULL(s.visit_type, v.visit_type) = 3 "  
+      "        OR v.source = 2 "                            
+      "        OR  ( IFNULL(s.visit_type, v.visit_type) = 2 "  
+      "          AND v.source <> 3 "                           
+      "          AND t.id IS NULL AND NOT :isRedirect "        
+      "        ) "
+      "      THEN "
+      "        CASE "
+      "          WHEN v.is_interesting = 1 THEN :veryHighWeight "
+      "          ELSE :highWeight "
+      "        END "
+      "      WHEN t.id IS NULL AND NOT :isRedirect "  
+      "       AND IFNULL(s.visit_type, v.visit_type) NOT IN (4, 8, 9) "
+      "      THEN "
+      "        CASE "
+      "          WHEN v.is_interesting = 1 THEN :highWeight "
+      "          ELSE :mediumWeight "
+      "         END "
+      "      ELSE :lowWeight "
+      "     END) "
+      "  FROM visit_interaction v "
+      "  LEFT JOIN moz_historyvisits s ON s.id = v.from_visit "
+      "                               AND v.visit_type IN (5,6) "
+      "  LEFT JOIN moz_historyvisits t ON t.from_visit = v.id "
+      "                               AND t.visit_type IN (5,6) "
+      "), "
+      "bookmark (days, weight) AS ( "
+      "  SELECT dateAdded / 86400000000, 100 "
+      "  FROM moz_bookmarks "
+      "  WHERE fk = :pageId "
+      "  ORDER BY dateAdded DESC "
+      "  LIMIT 1 "
+      "), "
+      "samples (days, weight) AS ( "
+      "  SELECT * FROM bookmark WHERE (SELECT count(*) FROM visits) = 0 "
+      "  UNION ALL "
+      "  SELECT * FROM visits "
+      "), "
+      "reference (days, samples_count) AS ( "
+      "  SELECT max(samples.days), count(*) FROM samples "
+      "), "
+      "scores (score) AS ( "
+      "  SELECT (weight * exp(-lambda * (reference.days - samples.days))) "
+      "  FROM samples, reference, lambda "
+      ") "
+      "SELECT CASE "
+      "WHEN (substr(url, 0, 7) = 'place:') THEN 0 "
+      "ELSE "
+      "  reference.days + CAST (( "
+      "    ln( "
+      "      sum(score) / samples_count * MAX(visit_count, samples_count) "
+      "    ) / lambda "
+      "  ) AS INTEGER) "
+      "END "
+      "FROM moz_places h, reference, lambda, scores "
+      "WHERE h.id = :pageId");
+  NS_ENSURE_STATE(stmt);
+  mozStorageStatementScoper infoScoper(stmt);
+
+  rv = stmt->BindInt64ByName("pageId"_ns, pageId);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName("isRedirect"_ns, isRedirect);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "halfLifeDays"_ns,
+      StaticPrefs::places_frecency_pages_alternative_halfLifeDays_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "numSampledVisits"_ns,
+      StaticPrefs::
+          places_frecency_pages_alternative_numSampledVisits_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "lowWeight"_ns,
+      StaticPrefs::places_frecency_pages_alternative_lowWeight_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "mediumWeight"_ns,
+      StaticPrefs::places_frecency_pages_alternative_mediumWeight_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "highWeight"_ns,
+      StaticPrefs::places_frecency_pages_alternative_highWeight_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "veryHighWeight"_ns,
+      StaticPrefs::
+          places_frecency_pages_alternative_veryHighWeight_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "maxVisitGapSeconds"_ns,
+      StaticPrefs::
+          places_frecency_pages_alternative_interactions_maxVisitGapSeconds_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "viewTimeSeconds"_ns,
+      StaticPrefs::
+          places_frecency_pages_alternative_interactions_viewTimeSeconds_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "manyKeypresses"_ns,
+      StaticPrefs::
+          places_frecency_pages_alternative_interactions_manyKeypresses_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt64ByName(
+      "viewTimeIfManyKeypressesSeconds"_ns,
+      StaticPrefs::
+          places_frecency_pages_alternative_interactions_viewTimeIfManyKeypressesSeconds_AtStartup());
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  bool hasResult = false;
+  rv = stmt->ExecuteStep(&hasResult);
+  NS_ENSURE_TRUE(NS_SUCCEEDED(rv) && hasResult, NS_ERROR_UNEXPECTED);
+
+  bool isNull;
+  if (NS_SUCCEEDED(stmt->GetIsNull(0, &isNull)) && isNull) {
+    *_result = MakeAndAddRef<NullVariant>().take();
+  } else {
+    int32_t score;
+    rv = stmt->GetInt32(0, &score);
+    NS_ENSURE_SUCCESS(rv, rv);
+    *_result = MakeAndAddRef<IntegerVariant>(score).take();
+  }
+  return NS_OK;
+}
+
+
+nsresult GenerateGUIDFunction::create(mozIStorageConnection* aDBConn) {
+  RefPtr<GenerateGUIDFunction> function = new GenerateGUIDFunction();
+  nsresult rv = aDBConn->CreateFunction("generate_guid"_ns, 0, function);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(GenerateGUIDFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+GenerateGUIDFunction::OnFunctionCall(mozIStorageValueArray* aArguments,
+                                     nsIVariant** _result) {
+  nsAutoCString guid;
+  nsresult rv = GenerateGUID(guid);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  *_result = MakeAndAddRef<UTF8TextVariant>(guid).take();
+  return NS_OK;
+}
+
+
+nsresult IsValidGUIDFunction::create(mozIStorageConnection* aDBConn) {
+  RefPtr<IsValidGUIDFunction> function = new IsValidGUIDFunction();
+  return aDBConn->CreateFunction("is_valid_guid"_ns, 1, function);
+}
+
+NS_IMPL_ISUPPORTS(IsValidGUIDFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+IsValidGUIDFunction::OnFunctionCall(mozIStorageValueArray* aArguments,
+                                    nsIVariant** _result) {
+  MOZ_ASSERT(aArguments);
+
+  nsAutoCString guid;
+  aArguments->GetUTF8String(0, guid);
+
+  RefPtr<nsVariant> result = new nsVariant();
+  result->SetAsBool(IsValidGUID(guid));
+  result.forget(_result);
+  return NS_OK;
+}
+
+
+nsresult GetUnreversedHostFunction::create(mozIStorageConnection* aDBConn) {
+  RefPtr<GetUnreversedHostFunction> function = new GetUnreversedHostFunction();
+  nsresult rv = aDBConn->CreateFunction("get_unreversed_host"_ns, 1, function);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(GetUnreversedHostFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+GetUnreversedHostFunction::OnFunctionCall(mozIStorageValueArray* aArguments,
+                                          nsIVariant** _result) {
+  MOZ_ASSERT(aArguments);
+
+  nsAutoString src;
+  aArguments->GetString(0, src);
+
+  RefPtr<nsVariant> result = new nsVariant();
+
+  if (src.Length() > 1) {
+    src.Truncate(src.Length() - 1);
+    nsAutoString dest;
+    ReverseString(src, dest);
+    result->SetAsAString(dest);
+  } else {
+    result->SetAsAString(u""_ns);
+  }
+  result.forget(_result);
+  return NS_OK;
+}
+
+
+nsresult FixupURLFunction::create(mozIStorageConnection* aDBConn) {
+  RefPtr<FixupURLFunction> function = new FixupURLFunction();
+  nsresult rv = aDBConn->CreateFunction("fixup_url"_ns, 1, function);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(FixupURLFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+FixupURLFunction::OnFunctionCall(mozIStorageValueArray* aArguments,
+                                 nsIVariant** _result) {
+  MOZ_ASSERT(aArguments);
+
+  nsAutoString src;
+  aArguments->GetString(0, src);
+
+  RefPtr<nsVariant> result = new nsVariant();
+
+  if (StringBeginsWith(src, u"http://"_ns)) {
+    src.Cut(0, 7);
+  } else if (StringBeginsWith(src, u"https://"_ns)) {
+    src.Cut(0, 8);
+  } else if (StringBeginsWith(src, u"ftp://"_ns)) {
+    src.Cut(0, 6);
+  }
+
+  if (StringBeginsWith(src, u"www."_ns)) {
+    src.Cut(0, 4);
+  }
+
+  result->SetAsAString(src);
+  result.forget(_result);
+  return NS_OK;
+}
+
+
+nsresult StoreLastInsertedIdFunction::create(mozIStorageConnection* aDBConn) {
+  RefPtr<StoreLastInsertedIdFunction> function =
+      new StoreLastInsertedIdFunction();
+  nsresult rv =
+      aDBConn->CreateFunction("store_last_inserted_id"_ns, 2, function);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(StoreLastInsertedIdFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+StoreLastInsertedIdFunction::OnFunctionCall(mozIStorageValueArray* aArgs,
+                                            nsIVariant** _result) {
+  uint32_t numArgs;
+  nsresult rv = aArgs->GetNumEntries(&numArgs);
+  NS_ENSURE_SUCCESS(rv, rv);
+  MOZ_ASSERT(numArgs == 2);
+
+  nsAutoCString table;
+  rv = aArgs->GetUTF8String(0, table);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  int64_t lastInsertedId = aArgs->AsInt64(1);
+
+  MOZ_ASSERT(table.EqualsLiteral("moz_places") ||
+             table.EqualsLiteral("moz_historyvisits") ||
+             table.EqualsLiteral("moz_bookmarks") ||
+             table.EqualsLiteral("moz_icons"));
+
+  if (table.EqualsLiteral("moz_bookmarks")) {
+    nsNavBookmarks::StoreLastInsertedId(table, lastInsertedId);
+  } else if (table.EqualsLiteral("moz_icons")) {
+    nsFaviconService::StoreLastInsertedId(table, lastInsertedId);
+  } else {
+    nsNavHistory::StoreLastInsertedId(table, lastInsertedId);
+  }
+
+  RefPtr<nsVariant> result = new nsVariant();
+  rv = result->SetAsInt64(lastInsertedId);
+  NS_ENSURE_SUCCESS(rv, rv);
+  result.forget(_result);
+  return NS_OK;
+}
+
+
+nsresult GetQueryParamFunction::create(mozIStorageConnection* aDBConn) {
+  RefPtr<GetQueryParamFunction> function = new GetQueryParamFunction();
+  return aDBConn->CreateFunction("get_query_param"_ns, 2, function);
+}
+
+NS_IMPL_ISUPPORTS(GetQueryParamFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+GetQueryParamFunction::OnFunctionCall(mozIStorageValueArray* aArguments,
+                                      nsIVariant** _result) {
+  MOZ_ASSERT(aArguments);
+
+  nsDependentCString queryString = getSharedUTF8String(aArguments, 0);
+  nsDependentCString paramName = getSharedUTF8String(aArguments, 1);
+
+  RefPtr<nsVariant> result = new nsVariant();
+  if (!queryString.IsEmpty() && !paramName.IsEmpty()) {
+    URLParams::Parse(queryString, true,
+                     [&paramName, &result](const nsACString& aName,
+                                           const nsACString& aValue) {
+                       if (!paramName.Equals(aName)) {
+                         return true;
+                       }
+                       result->SetAsACString(aValue);
+                       return false;
+                     });
+  }
+
+  result.forget(_result);
+  return NS_OK;
+}
+
+
+nsresult HashFunction::create(mozIStorageConnection* aDBConn) {
+  RefPtr<HashFunction> function = new HashFunction();
+  return aDBConn->CreateFunction("hash"_ns, -1, function);
+}
+
+NS_IMPL_ISUPPORTS(HashFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+HashFunction::OnFunctionCall(mozIStorageValueArray* aArguments,
+                             nsIVariant** _result) {
+  MOZ_ASSERT(aArguments);
+
+  uint32_t numEntries;
+  nsresult rv = aArguments->GetNumEntries(&numEntries);
+  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_TRUE(numEntries >= 1 && numEntries <= 2, NS_ERROR_FAILURE);
+
+  nsDependentCString str = getSharedUTF8String(aArguments, 0);
+  nsAutoCString mode;
+  if (numEntries > 1) {
+    aArguments->GetUTF8String(1, mode);
+  }
+
+  RefPtr<nsVariant> result = new nsVariant();
+  uint64_t hash;
+  rv = mozilla::places::HashURL(str, mode, &hash);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = result->SetAsInt64((int64_t)hash);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  result.forget(_result);
+  return NS_OK;
+}
+
+
+nsresult SHA256HexFunction::create(mozIStorageConnection* aDBConn) {
+  RefPtr<SHA256HexFunction> function = new SHA256HexFunction();
+  return aDBConn->CreateFunction("sha256hex"_ns, -1, function);
+}
+
+NS_IMPL_ISUPPORTS(SHA256HexFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+SHA256HexFunction::OnFunctionCall(mozIStorageValueArray* aArguments,
+                                  nsIVariant** _result) {
+  MOZ_ASSERT(aArguments);
+
+  uint32_t numEntries;
+  nsresult rv = aArguments->GetNumEntries(&numEntries);
+  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_TRUE(numEntries == 1, NS_ERROR_FAILURE);
+  nsDependentCString str = getSharedUTF8String(aArguments, 0);
+
+  nsCOMPtr<nsICryptoHash> hasher =
+      do_CreateInstance(NS_CRYPTO_HASH_CONTRACTID, &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = hasher->Init(nsICryptoHash::SHA256);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = hasher->Update(reinterpret_cast<const uint8_t*>(str.BeginReading()),
+                      str.Length());
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsAutoCString binaryHash, hashString;
+  rv = hasher->Finish(false, binaryHash);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  static const char* const hex = "0123456789abcdef";
+  hashString.SetCapacity(2 * binaryHash.Length());
+  for (size_t i = 0; i < binaryHash.Length(); ++i) {
+    auto c = static_cast<unsigned char>(binaryHash[i]);
+    hashString.Append(hex[(c >> 4) & 0x0F]);
+    hashString.Append(hex[c & 0x0F]);
+  }
+
+  RefPtr<nsVariant> result = new nsVariant();
+  result->SetAsACString(hashString);
+  result.forget(_result);
+  return NS_OK;
+}
+
+
+nsresult GetPrefixFunction::create(mozIStorageConnection* aDBConn) {
+  RefPtr<GetPrefixFunction> function = new GetPrefixFunction();
+  nsresult rv = aDBConn->CreateFunction("get_prefix"_ns, 1, function);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(GetPrefixFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+GetPrefixFunction::OnFunctionCall(mozIStorageValueArray* aArgs,
+                                  nsIVariant** _result) {
+  MOZ_ASSERT(aArgs);
+
+  uint32_t numArgs;
+  nsresult rv = aArgs->GetNumEntries(&numArgs);
+  NS_ENSURE_SUCCESS(rv, rv);
+  MOZ_ASSERT(numArgs == 1);
+
+  nsDependentCString spec(getSharedUTF8String(aArgs, 0));
+
+  RefPtr<nsVariant> result = new nsVariant();
+  result->SetAsACString(Substring(spec, 0, getPrefixLength(spec)));
+  result.forget(_result);
+  return NS_OK;
+}
+
+
+nsresult GetHostAndPortFunction::create(mozIStorageConnection* aDBConn) {
+  RefPtr<GetHostAndPortFunction> function = new GetHostAndPortFunction();
+  nsresult rv = aDBConn->CreateFunction("get_host_and_port"_ns, 1, function);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(GetHostAndPortFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+GetHostAndPortFunction::OnFunctionCall(mozIStorageValueArray* aArgs,
+                                       nsIVariant** _result) {
+  MOZ_ASSERT(aArgs);
+
+  uint32_t numArgs;
+  nsresult rv = aArgs->GetNumEntries(&numArgs);
+  NS_ENSURE_SUCCESS(rv, rv);
+  MOZ_ASSERT(numArgs == 1);
+
+  nsDependentCString spec(getSharedUTF8String(aArgs, 0));
+
+  RefPtr<nsVariant> result = new nsVariant();
+
+  size_type length;
+  size_type index = indexOfHostAndPort(spec, &length);
+  result->SetAsACString(Substring(spec, index, length));
+  result.forget(_result);
+  return NS_OK;
+}
+
+
+nsresult StripPrefixAndUserinfoFunction::create(
+    mozIStorageConnection* aDBConn) {
+  RefPtr<StripPrefixAndUserinfoFunction> function =
+      new StripPrefixAndUserinfoFunction();
+  nsresult rv =
+      aDBConn->CreateFunction("strip_prefix_and_userinfo"_ns, 1, function);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(StripPrefixAndUserinfoFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+StripPrefixAndUserinfoFunction::OnFunctionCall(mozIStorageValueArray* aArgs,
+                                               nsIVariant** _result) {
+  MOZ_ASSERT(aArgs);
+
+  uint32_t numArgs;
+  nsresult rv = aArgs->GetNumEntries(&numArgs);
+  NS_ENSURE_SUCCESS(rv, rv);
+  MOZ_ASSERT(numArgs == 1);
+
+  nsDependentCString spec(getSharedUTF8String(aArgs, 0));
+
+  RefPtr<nsVariant> result = new nsVariant();
+
+  size_type index = indexOfHostAndPort(spec, nullptr);
+  result->SetAsACString(Substring(spec, index, spec.Length() - index));
+  result.forget(_result);
+  return NS_OK;
+}
+
+
+nsresult SetShouldStartFrecencyRecalculationFunction::create(
+    mozIStorageConnection* aDBConn) {
+  RefPtr<SetShouldStartFrecencyRecalculationFunction> function =
+      new SetShouldStartFrecencyRecalculationFunction();
+  nsresult rv = aDBConn->CreateFunction(
+      "set_should_start_frecency_recalculation"_ns, 0, function);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(SetShouldStartFrecencyRecalculationFunction,
+                  mozIStorageFunction)
+
+NS_IMETHODIMP
+SetShouldStartFrecencyRecalculationFunction::OnFunctionCall(
+    mozIStorageValueArray* aArgs, nsIVariant** _result) {
+  MOZ_ASSERT(aArgs);
+
+#ifdef DEBUG
+  uint32_t numArgs;
+  MOZ_ASSERT(NS_SUCCEEDED(aArgs->GetNumEntries(&numArgs)) && numArgs == 0);
+#endif
+
+  if (!nsNavHistory::sShouldStartFrecencyRecalculation.exchange(true)) {
+    (void)NS_DispatchToMainThread(NS_NewRunnableFunction(
+        "SetShouldStartFrecencyRecalculationFunction::Notify", [] {
+          nsCOMPtr<nsIObserverService> os = services::GetObserverService();
+          if (os) {
+            (void)os->NotifyObservers(nullptr, "frecency-recalculation-needed",
+                                      nullptr);
+          }
+        }));
+  }
+
+  RefPtr<nsVariant> result = new nsVariant();
+  nsresult rv = result->SetAsBool(true);
+  NS_ENSURE_SUCCESS(rv, rv);
+  result.forget(_result);
+  return NS_OK;
+}
+
+
+nsresult InvalidateDaysOfHistoryFunction::create(
+    mozIStorageConnection* aDBConn) {
+  RefPtr<InvalidateDaysOfHistoryFunction> function =
+      new InvalidateDaysOfHistoryFunction();
+  nsresult rv =
+      aDBConn->CreateFunction("invalidate_days_of_history"_ns, 0, function);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(InvalidateDaysOfHistoryFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+InvalidateDaysOfHistoryFunction::OnFunctionCall(mozIStorageValueArray* aArgs,
+                                                nsIVariant** _result) {
+  nsNavHistory::InvalidateDaysOfHistory();
+  return NS_OK;
+}
+
+
+nsresult TargetFolderGuidFunction::create(mozIStorageConnection* aDBConn) {
+  RefPtr<TargetFolderGuidFunction> function = new TargetFolderGuidFunction();
+  nsresult rv = aDBConn->CreateFunction("target_folder_guid"_ns, 1, function);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(TargetFolderGuidFunction, mozIStorageFunction)
+
+NS_IMETHODIMP
+TargetFolderGuidFunction::OnFunctionCall(mozIStorageValueArray* aArguments,
+                                         nsIVariant** _result) {
+  MOZ_ASSERT(aArguments);
+  DebugOnly<uint32_t> numArgs = 0;
+  MOZ_ASSERT(NS_SUCCEEDED(aArguments->GetNumEntries(&numArgs)) && numArgs == 1,
+             "unexpected number of arguments");
+
+  nsDependentCString queryURI = getSharedUTF8String(aArguments, 0);
+  Maybe<nsCString> targetFolderGuid =
+      nsNavHistory::GetTargetFolderGuid(queryURI);
+
+  if (targetFolderGuid.isSome()) {
+    RefPtr<nsVariant> result = new nsVariant();
+    result->SetAsACString(*targetFolderGuid);
+    result.forget(_result);
+  } else {
+    *_result = MakeAndAddRef<NullVariant>().take();
+  }
+
+  return NS_OK;
+}
+
+}  

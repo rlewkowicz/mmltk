@@ -1,0 +1,462 @@
+// Copyright 2002 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(COMPILER_TRANSLATOR_TYPES_H_)
+#define COMPILER_TRANSLATOR_TYPES_H_
+
+#include "common/angleutils.h"
+#include "common/debug.h"
+#include "common/span.h"
+
+#include "compiler/translator/BaseTypes.h"
+#include "compiler/translator/Common.h"
+#include "compiler/translator/ImmutableString.h"
+#include "compiler/translator/SymbolUniqueId.h"
+#include "compiler/translator/ir/src/builder.h"
+
+namespace sh
+{
+
+struct TPublicType;
+class TType;
+class TInterfaceBlock;
+class TStructure;
+class TSymbol;
+class TVariable;
+class TIntermSymbol;
+class TSymbolTable;
+
+class TField : angle::NonCopyable
+{
+  public:
+    POOL_ALLOCATOR_NEW_DELETE
+    TField(TType *type, const ImmutableString &name, const TSourceLoc &line, SymbolType symbolType)
+        : mType(type), mName(name), mLine(line), mSymbolType(symbolType)
+    {
+        ASSERT(mSymbolType != SymbolType::Empty);
+    }
+
+    TType *type() { return mType; }
+    const TType *type() const { return mType; }
+    const ImmutableString &name() const { return mName; }
+    const TSourceLoc &line() const { return mLine; }
+    SymbolType symbolType() const { return mSymbolType; }
+
+  private:
+    TType *mType;
+    const ImmutableString mName;
+    const TSourceLoc mLine;
+    const SymbolType mSymbolType;
+};
+
+typedef TVector<TField *> TFieldList;
+
+class TFieldListCollection : angle::NonCopyable
+{
+  public:
+    const TFieldList &fields() const { return *mFields; }
+
+    bool containsArrays() const;
+    bool containsMatrices() const;
+    bool containsType(TBasicType t) const;
+    bool containsSamplers() const;
+    bool containsOnlySamplers() const;
+
+    size_t objectSize() const;
+    int getLocationCount() const;
+    int deepestNesting() const;
+    const TString &mangledFieldList() const;
+
+  protected:
+    TFieldListCollection(const TFieldList *fields);
+
+    const TFieldList *mFields;
+
+  private:
+    size_t calculateObjectSize() const;
+    int calculateDeepestNesting() const;
+    TString buildMangledFieldList() const;
+
+    mutable size_t mObjectSize;
+    mutable int mDeepestNesting;
+    mutable TString mMangledFieldList;
+};
+
+class TType
+{
+  public:
+    POOL_ALLOCATOR_NEW_DELETE
+    TType();
+    explicit TType(TBasicType t, uint8_t ps = 1, uint8_t ss = 1);
+    TType(TBasicType t, TPrecision p, TQualifier q = EvqTemporary, uint8_t ps = 1, uint8_t ss = 1);
+    explicit TType(const TPublicType &p);
+    TType(const TStructure *userDef, bool isStructSpecifier);
+    TType(const TInterfaceBlock *interfaceBlockIn,
+          TQualifier qualifierIn,
+          TLayoutQualifier layoutQualifierIn);
+    TType(const TType &t);
+    TType &operator=(const TType &t);
+
+    constexpr TType(TBasicType t,
+                    TPrecision p,
+                    TQualifier q,
+                    uint8_t ps,
+                    uint8_t ss,
+                    const angle::Span<const unsigned int> arraySizes,
+                    const char *mangledName)
+        : type(t),
+          precision(p),
+          qualifier(q),
+          invariant(false),
+          precise(false),
+          interpolant(false),
+          memoryQualifier(TMemoryQualifier::Create()),
+          layoutQualifier(TLayoutQualifier::Create()),
+          primarySize(ps),
+          secondarySize(ss),
+          mArraySizes(arraySizes),
+          mArraySizesStorage(nullptr),
+          mInterfaceBlock(nullptr),
+          mStructure(nullptr),
+          mIsStructSpecifier(false),
+          mInterfaceBlockFieldIndex(0),
+          mMangledName(mangledName)
+    {}
+
+    constexpr TType(TType &&t)
+        : type(t.type),
+          precision(t.precision),
+          qualifier(t.qualifier),
+          invariant(t.invariant),
+          precise(t.precise),
+          interpolant(t.interpolant),
+          memoryQualifier(t.memoryQualifier),
+          layoutQualifier(t.layoutQualifier),
+          primarySize(t.primarySize),
+          secondarySize(t.secondarySize),
+          mArraySizes(t.mArraySizes),
+          mArraySizesStorage(t.mArraySizesStorage),
+          mInterfaceBlock(t.mInterfaceBlock),
+          mStructure(t.mStructure),
+          mIsStructSpecifier(t.mIsStructSpecifier),
+          mInterfaceBlockFieldIndex(0),
+          mMangledName(t.mMangledName)
+    {
+        t.mArraySizesStorage = nullptr;
+    }
+
+    constexpr TBasicType getBasicType() const { return type; }
+    void setBasicType(TBasicType t);
+
+    TPrecision getPrecision() const { return precision; }
+    void setPrecision(TPrecision p) { precision = p; }
+
+    constexpr TQualifier getQualifier() const { return qualifier; }
+    void setQualifier(TQualifier q) { qualifier = q; }
+
+    bool isInvariant() const { return invariant; }
+    void setInvariant(bool i) { invariant = i; }
+
+    bool isPrecise() const { return precise; }
+    void setPrecise(bool i) { precise = i; }
+
+    bool isInterpolant() const { return interpolant; }
+    void setInterpolant(bool i) { interpolant = i; }
+
+    const TMemoryQualifier &getMemoryQualifier() const { return memoryQualifier; }
+    void setMemoryQualifier(const TMemoryQualifier &mq) { memoryQualifier = mq; }
+
+    const TLayoutQualifier &getLayoutQualifier() const { return layoutQualifier; }
+    void setLayoutQualifier(const TLayoutQualifier &lq) { layoutQualifier = lq; }
+
+    uint8_t getNominalSize() const { return primarySize; }
+    uint8_t getSecondarySize() const { return secondarySize; }
+    uint8_t getCols() const
+    {
+        ASSERT(isMatrix());
+        return primarySize;
+    }
+    uint8_t getRows() const
+    {
+        ASSERT(isMatrix());
+        return secondarySize;
+    }
+    void setPrimarySize(uint8_t ps);
+    void setSecondarySize(uint8_t ss);
+
+    size_t getObjectSize() const;
+
+    int getLocationCount() const;
+
+    bool isMatrix() const { return primarySize > 1 && secondarySize > 1; }
+    bool isNonSquareMatrix() const { return isMatrix() && primarySize != secondarySize; }
+    bool isArray() const { return !mArraySizes.empty(); }
+    bool isArrayOfArrays() const { return mArraySizes.size() > 1u; }
+    size_t getNumArraySizes() const { return mArraySizes.size(); }
+    const angle::Span<const unsigned int> &getArraySizes() const { return mArraySizes; }
+    unsigned int getArraySizeProduct() const;
+    bool isUnsizedArray() const;
+    unsigned int getOutermostArraySize() const
+    {
+        ASSERT(isArray());
+        return mArraySizes.back();
+    }
+    void makeArray(unsigned int s);
+
+    void makeArrays(const angle::Span<const unsigned int> &sizes);
+    void setArraySize(size_t arrayDimension, unsigned int s);
+
+    void sizeUnsizedArrays(const angle::Span<const unsigned int> &newArraySizes);
+
+    void sizeOutermostUnsizedArray(unsigned int arraySize);
+
+    void toArrayElementType();
+    void toArrayBaseType();
+    void toMatrixColumnType();
+    void toComponentType();
+
+    const TInterfaceBlock *getInterfaceBlock() const { return mInterfaceBlock; }
+    void setInterfaceBlock(const TInterfaceBlock *interfaceBlockIn);
+    bool isInterfaceBlock() const { return type == EbtInterfaceBlock; }
+
+    void setInterfaceBlockField(const TInterfaceBlock *interfaceBlockIn, size_t fieldIndex);
+    size_t getInterfaceBlockFieldIndex() const { return mInterfaceBlockFieldIndex; }
+
+    bool isVector() const { return primarySize > 1 && secondarySize == 1; }
+    bool isVectorArray() const { return primarySize > 1 && secondarySize == 1 && isArray(); }
+    bool isRank0() const { return primarySize == 1 && secondarySize == 1; }
+    bool isScalar() const
+    {
+        return primarySize == 1 && secondarySize == 1 && !mStructure && !isArray();
+    }
+    bool isScalarArray() const
+    {
+        return primarySize == 1 && secondarySize == 1 && !mStructure && isArray();
+    }
+    bool isScalarBool() const { return isScalar() && type == EbtBool; }
+    bool isScalarFloat() const { return isScalar() && type == EbtFloat; }
+    bool isScalarInt() const { return isScalar() && (type == EbtInt || type == EbtUInt); }
+
+    bool canBeConstructed() const;
+
+    const TStructure *getStruct() const { return mStructure; }
+
+    static constexpr char GetSizeMangledName(uint8_t primarySize, uint8_t secondarySize)
+    {
+        unsigned int sizeKey = (secondarySize - 1u) * 4u + primarySize - 1u;
+        if (sizeKey < 10u)
+        {
+            return static_cast<char>('0' + sizeKey);
+        }
+        return static_cast<char>('A' + sizeKey - 10);
+    }
+    const char *getMangledName() const;
+
+    bool sameNonArrayType(const TType &right) const;
+
+    bool isElementTypeOf(const TType &arrayType) const;
+
+    bool operator==(const TType &right) const
+    {
+        size_t numArraySizesL = getNumArraySizes();
+        size_t numArraySizesR = right.getNumArraySizes();
+        bool arraySizesEqual  = numArraySizesL == numArraySizesR &&
+                               (numArraySizesL == 0 || mArraySizes == right.mArraySizes);
+        return type == right.type && primarySize == right.primarySize &&
+               secondarySize == right.secondarySize && arraySizesEqual &&
+               mStructure == right.mStructure;
+    }
+    bool operator!=(const TType &right) const { return !operator==(right); }
+    bool operator<(const TType &right) const
+    {
+        if (type != right.type)
+            return type < right.type;
+        if (primarySize != right.primarySize)
+            return primarySize < right.primarySize;
+        if (secondarySize != right.secondarySize)
+            return secondarySize < right.secondarySize;
+        size_t numArraySizesL = getNumArraySizes();
+        size_t numArraySizesR = right.getNumArraySizes();
+        if (numArraySizesL != numArraySizesR)
+            return numArraySizesL < numArraySizesR;
+        for (size_t i = 0; i < numArraySizesL; ++i)
+        {
+            if (mArraySizes[i] != right.mArraySizes[i])
+                return mArraySizes[i] < right.mArraySizes[i];
+        }
+        if (mStructure != right.mStructure)
+            return mStructure < right.mStructure;
+
+        return false;
+    }
+
+    const char *getBasicString() const { return sh::getBasicString(type); }
+
+    const char *getPrecisionString() const { return sh::getPrecisionString(precision); }
+    const char *getQualifierString() const { return sh::getQualifierString(qualifier); }
+
+    const char *getBuiltInTypeNameString() const;
+
+    int getDeepestStructNesting() const;
+
+    bool isStructureContainingArrays() const;
+    bool isStructureContainingMatrices() const;
+    bool isStructureContainingType(TBasicType t) const;
+    bool isStructureContainingSamplers() const;
+    bool isStructureContainingOnlySamplers() const;
+    bool isInterfaceBlockContainingType(TBasicType t) const;
+
+    bool isStructSpecifier() const { return mIsStructSpecifier; }
+
+    bool canReplaceWithConstantUnion() const;
+
+    void createSamplerSymbols(const ImmutableString &namePrefix,
+                              const TString &apiNamePrefix,
+                              TVector<const TVariable *> *outputSymbols,
+                              TMap<const TVariable *, TString> *outputSymbolsToAPINames,
+                              TSymbolTable *symbolTable) const;
+
+    void realize();
+
+    bool isSampler() const { return IsSampler(type); }
+    bool isSamplerCube() const { return type == EbtSamplerCube; }
+    bool isAtomicCounter() const { return IsAtomicCounter(type); }
+    bool isSamplerVideoWEBGL() const { return type == EbtSamplerVideoWEBGL; }
+    bool isImage() const { return IsImage(type); }
+    bool isPixelLocal() const { return IsPixelLocal(type); }
+
+    void setTypeId(ir::TypeId typeId) { mTypeId = typeId; }
+    ir::TypeId typeId() const { return mTypeId; }
+    bool isTypeIdSet() const { return ir::IsTypeIdValid(mTypeId); }
+
+  private:
+    constexpr void invalidateMangledName() { mMangledName = nullptr; }
+    const char *buildMangledName() const;
+    constexpr void onArrayDimensionsChange(const angle::Span<const unsigned int> &sizes)
+    {
+        mArraySizes = sizes;
+        invalidateMangledName();
+    }
+
+    TBasicType type;
+    TPrecision precision;
+    TQualifier qualifier;
+    bool invariant;
+    bool precise;
+    bool interpolant;
+
+    TMemoryQualifier memoryQualifier;
+    TLayoutQualifier layoutQualifier;
+    uint8_t primarySize;    
+    uint8_t secondarySize;  
+
+    angle::Span<const unsigned int> mArraySizes;
+    TVector<unsigned int> *mArraySizesStorage;
+
+    const TInterfaceBlock *mInterfaceBlock;
+
+    const TStructure *mStructure;
+    bool mIsStructSpecifier;
+
+    size_t mInterfaceBlockFieldIndex;
+
+    mutable const char *mMangledName;
+
+    ir::TypeId mTypeId = ir::kInvalidTypeId;
+};
+
+struct TTypeSpecifierNonArray
+{
+    TBasicType type;
+    uint8_t primarySize;    
+    uint8_t secondarySize;  
+    const TStructure *userDef;
+    TSourceLoc line;
+
+    bool isStructSpecifier;
+
+    void initialize(TBasicType aType, const TSourceLoc &aLine)
+    {
+        ASSERT(aType != EbtStruct);
+        type              = aType;
+        primarySize       = 1;
+        secondarySize     = 1;
+        userDef           = nullptr;
+        line              = aLine;
+        isStructSpecifier = false;
+    }
+
+    void initializeStruct(const TStructure *aUserDef,
+                          bool aIsStructSpecifier,
+                          const TSourceLoc &aLine)
+    {
+        type              = EbtStruct;
+        primarySize       = 1;
+        secondarySize     = 1;
+        userDef           = aUserDef;
+        line              = aLine;
+        isStructSpecifier = aIsStructSpecifier;
+    }
+
+    void setAggregate(uint8_t size) { primarySize = size; }
+
+    void setMatrix(uint8_t columns, uint8_t rows)
+    {
+        ASSERT(columns > 1 && rows > 1 && columns <= 4 && rows <= 4);
+        primarySize   = columns;
+        secondarySize = rows;
+    }
+
+    bool isMatrix() const { return primarySize > 1 && secondarySize > 1; }
+
+    bool isVector() const { return primarySize > 1 && secondarySize == 1; }
+};
+
+struct TPublicType
+{
+    TPublicType() = default;
+
+    void initialize(const TTypeSpecifierNonArray &typeSpecifier, TQualifier q);
+    void initializeBasicType(TBasicType basicType);
+    const char *getBasicString() const { return sh::getBasicString(getBasicType()); }
+
+    TBasicType getBasicType() const { return typeSpecifierNonArray.type; }
+    void setBasicType(TBasicType basicType) { typeSpecifierNonArray.type = basicType; }
+    void setQualifier(TQualifier value) { qualifier = value; }
+    void setPrecision(TPrecision value) { precision = value; }
+    void setMemoryQualifier(const TMemoryQualifier &value) { memoryQualifier = value; }
+    void setPrecise(bool value) { precise = value; }
+
+    uint8_t getPrimarySize() const { return typeSpecifierNonArray.primarySize; }
+    uint8_t getSecondarySize() const { return typeSpecifierNonArray.secondarySize; }
+
+    const TStructure *getUserDef() const { return typeSpecifierNonArray.userDef; }
+    const TSourceLoc &getLine() const { return typeSpecifierNonArray.line; }
+
+    bool isStructSpecifier() const { return typeSpecifierNonArray.isStructSpecifier; }
+
+    bool isStructureContainingArrays() const;
+    bool isStructureContainingType(TBasicType t) const;
+    void setArraySizes(TVector<unsigned int> *sizes);
+    bool isArray() const;
+    void clearArrayness();
+    bool isAggregate() const;
+    bool isUnsizedArray() const;
+    void sizeUnsizedArrays();
+    void makeArrays(TVector<unsigned int> *sizes);
+
+    TTypeSpecifierNonArray typeSpecifierNonArray;
+    TLayoutQualifier layoutQualifier;
+    TMemoryQualifier memoryQualifier;
+    TQualifier qualifier;
+    bool invariant;
+    bool precise;
+    TPrecision precision;
+
+    const TVector<unsigned int> *arraySizes;
+};
+
+}  
+
+#endif

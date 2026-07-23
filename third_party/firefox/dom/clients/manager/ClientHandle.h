@@ -1,0 +1,74 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#if !defined(_mozilla_dom_ClientHandle_h)
+#define _mozilla_dom_ClientHandle_h
+
+#include "mozilla/MozPromise.h"
+#include "mozilla/dom/ClientInfo.h"
+#include "mozilla/dom/ClientOpPromise.h"
+#include "mozilla/dom/ClientThing.h"
+
+
+namespace mozilla::dom {
+
+class ClientManager;
+class ClientHandleChild;
+class ClientOpConstructorArgs;
+class PClientManagerChild;
+class ServiceWorkerDescriptor;
+enum class CallerType : uint32_t;
+
+namespace ipc {
+class StructuredCloneData;
+}
+
+class ClientHandle final : public ClientThing<ClientHandleChild> {
+  friend class ClientManager;
+  friend class ClientHandleChild;
+
+  RefPtr<ClientManager> mManager;
+  nsCOMPtr<nsISerialEventTarget> mSerialEventTarget;
+  RefPtr<GenericPromise::Private> mDetachPromise;
+  ClientInfo mClientInfo;
+
+  ~ClientHandle();
+
+  void Shutdown();
+
+  void StartOp(const ClientOpConstructorArgs& aArgs,
+               const ClientOpCallback&& aResolveCallback,
+               const ClientOpCallback&& aRejectCallback);
+
+  void OnShutdownThing() override;
+
+  void ExecutionReady(const ClientInfo& aClientInfo);
+
+  ClientHandle(ClientManager* aManager,
+               nsISerialEventTarget* aSerialEventTarget,
+               const ClientInfo& aClientInfo);
+
+  void Activate(PClientManagerChild* aActor);
+
+ public:
+  const ClientInfo& Info() const;
+
+  RefPtr<GenericErrorResultPromise> Control(
+      const ServiceWorkerDescriptor& aServiceWorker);
+
+  RefPtr<ClientStatePromise> Focus(CallerType aCallerType);
+
+  RefPtr<GenericErrorResultPromise> PostMessage(
+      NotNull<ipc::StructuredCloneData*> aData,
+      const ServiceWorkerDescriptor& aSource);
+
+  RefPtr<GenericPromise> OnDetach();
+
+  void EvictFromBFCache();
+
+  NS_INLINE_DECL_REFCOUNTING(ClientHandle);
+};
+
+}  
+
+#endif

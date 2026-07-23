@@ -1,0 +1,524 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(mozilla_dom_IOUtils_)
+#define mozilla_dom_IOUtils_
+
+#include "js/Utility.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/DataMutex.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/Result.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/IOUtilsBinding.h"
+#include "mozilla/dom/TypedArray.h"
+#include "nsIAsyncShutdown.h"
+#include "nsIFile.h"
+#include "nsISerialEventTarget.h"
+#include "nsPrintfCString.h"
+#include "nsProxyRelease.h"
+#include "nsString.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "prio.h"
+
+class nsFileRandomAccessStream;
+
+namespace mozilla {
+
+class PR_CloseDelete {
+ public:
+  constexpr PR_CloseDelete() = default;
+  PR_CloseDelete(const PR_CloseDelete& aOther) = default;
+  PR_CloseDelete(PR_CloseDelete&& aOther) = default;
+  PR_CloseDelete& operator=(const PR_CloseDelete& aOther) = default;
+  PR_CloseDelete& operator=(PR_CloseDelete&& aOther) = default;
+
+  void operator()(PRFileDesc* aPtr) const { PR_Close(aPtr); }
+};
+
+class IOUtils final {
+ public:
+  class IOError;
+
+  enum class ShutdownPhase : uint8_t {
+    ProfileBeforeChange,
+    SendTelemetry,
+    XpcomWillShutdown,
+    Count,
+  };
+
+  template <typename T>
+  using PhaseArray = EnumeratedArray<IOUtils::ShutdownPhase, T,
+                                     size_t(IOUtils::ShutdownPhase::Count)>;
+
+  static already_AddRefed<dom::Promise> Read(dom::GlobalObject& aGlobal,
+
+                                             const nsAString& aPath,
+                                             const dom::ReadOptions& aOptions,
+                                             ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> ReadUTF8(
+      dom::GlobalObject& aGlobal, const nsAString& aPath,
+      const dom::ReadUTF8Options& aOptions, ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> ReadJSON(
+      dom::GlobalObject& aGlobal, const nsAString& aPath,
+      const dom::ReadUTF8Options& aOptions, ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> Write(dom::GlobalObject& aGlobal,
+                                              const nsAString& aPath,
+                                              const dom::Uint8Array& aData,
+                                              const dom::WriteOptions& aOptions,
+                                              ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> WriteUTF8(
+      dom::GlobalObject& aGlobal, const nsAString& aPath,
+      const nsACString& aString, const dom::WriteOptions& aOptions,
+      ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> WriteJSON(
+      dom::GlobalObject& aGlobal, const nsAString& aPath,
+      JS::Handle<JS::Value> aValue, const dom::WriteJSONOptions& aOptions,
+      ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> Move(dom::GlobalObject& aGlobal,
+                                             const nsAString& aSourcePath,
+                                             const nsAString& aDestPath,
+                                             const dom::MoveOptions& aOptions,
+                                             ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> Remove(
+      dom::GlobalObject& aGlobal, const nsAString& aPath,
+      const dom::RemoveOptions& aOptions, ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> MakeDirectory(
+      dom::GlobalObject& aGlobal, const nsAString& aPath,
+      const dom::MakeDirectoryOptions& aOptions, ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> Stat(dom::GlobalObject& aGlobal,
+                                             const nsAString& aPath,
+                                             ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> Copy(dom::GlobalObject& aGlobal,
+                                             const nsAString& aSourcePath,
+                                             const nsAString& aDestPath,
+                                             const dom::CopyOptions& aOptions,
+                                             ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> SetAccessTime(
+      dom::GlobalObject& aGlobal, const nsAString& aPath,
+      const dom::Optional<int64_t>& aAccess, ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> SetModificationTime(
+      dom::GlobalObject& aGlobal, const nsAString& aPath,
+      const dom::Optional<int64_t>& aModification, ErrorResult& aError);
+
+ private:
+  using SetTimeFn = decltype(&nsIFile::SetLastAccessedTime);
+
+  static_assert(
+      std::is_same_v<SetTimeFn, decltype(&nsIFile::SetLastModifiedTime)>);
+
+  static already_AddRefed<dom::Promise> SetTime(
+      dom::GlobalObject& aGlobal, const nsAString& aPath,
+      const dom::Optional<int64_t>& aNewTime, SetTimeFn aSetTimeFn,
+      const char* const aTimeKind, ErrorResult& aError);
+
+ public:
+  static already_AddRefed<dom::Promise> HasChildren(
+      dom::GlobalObject& aGlobal, const nsAString& aPath,
+      const dom::HasChildrenOptions& aOptions, ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> GetChildren(
+      dom::GlobalObject& aGlobal, const nsAString& aPath,
+      const dom::GetChildrenOptions& aOptions, ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> SetPermissions(
+      dom::GlobalObject& aGlobal, const nsAString& aPath, uint32_t aPermissions,
+      const bool aHonorUmask, ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> Exists(dom::GlobalObject& aGlobal,
+                                               const nsAString& aPath,
+                                               ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> CreateUniqueFile(
+      dom::GlobalObject& aGlobal, const nsAString& aParent,
+      const nsAString& aPrefix, const uint32_t aPermissions,
+      ErrorResult& aError);
+  static already_AddRefed<dom::Promise> CreateUniqueDirectory(
+      dom::GlobalObject& aGlobal, const nsAString& aParent,
+      const nsAString& aPrefix, const uint32_t aPermissions,
+      ErrorResult& aError);
+
+ private:
+  static already_AddRefed<dom::Promise> CreateUnique(
+      dom::GlobalObject& aGlobal, const nsAString& aParent,
+      const nsAString& aPrefix, const uint32_t aFileType,
+      const uint32_t aPermissions, ErrorResult& aError);
+
+ public:
+  static already_AddRefed<dom::Promise> ComputeHexDigest(
+      dom::GlobalObject& aGlobal, const nsAString& aPath,
+      const dom::HashAlgorithm aAlgorithm, ErrorResult& aError);
+
+
+#if defined(XP_UNIX)
+  using UnixString = dom::OwningUTF8StringOrUint8Array;
+  static uint32_t LaunchProcess(dom::GlobalObject& aGlobal,
+                                const dom::Sequence<UnixString>& aArgv,
+                                const dom::LaunchOptions& aOptions,
+                                ErrorResult& aRv);
+#endif
+
+  static already_AddRefed<dom::Promise> GetFile(
+      dom::GlobalObject& aGlobal, const dom::Sequence<nsString>& aComponents,
+      ErrorResult& aError);
+
+  static already_AddRefed<dom::Promise> GetDirectory(
+      dom::GlobalObject& aGlobal, const dom::Sequence<nsString>& aComponents,
+      ErrorResult& aError);
+
+  static void GetProfileBeforeChange(dom::GlobalObject& aGlobal,
+                                     JS::MutableHandle<JS::Value>,
+                                     ErrorResult& aRv);
+
+  static void GetSendTelemetry(dom::GlobalObject& aGlobal,
+                               JS::MutableHandle<JS::Value>, ErrorResult& aRv);
+
+  static RefPtr<SyncReadFile> OpenFileForSyncReading(dom::GlobalObject& aGlobal,
+                                                     const nsAString& aPath,
+                                                     ErrorResult& aRv);
+
+  class JsBuffer;
+
+  enum class BufferKind {
+    String,
+    Uint8Array,
+  };
+
+ private:
+  ~IOUtils() = default;
+
+  template <typename T>
+  using IOPromise = MozPromise<T, IOError, true>;
+
+  friend class IOUtilsShutdownBlocker;
+  struct InternalFileInfo;
+  struct InternalWriteOpts;
+  class MozLZ4;
+  class EventQueue;
+  class State;
+
+  template <typename Fn>
+  static already_AddRefed<dom::Promise> WithPromiseAndState(
+      dom::GlobalObject& aGlobal, ErrorResult& aError, Fn aFn);
+
+  template <typename OkT, typename Fn>
+  static void DispatchAndResolve(EventQueue* aQueue, dom::Promise* aPromise,
+                                 Fn aFunc);
+
+  static already_AddRefed<dom::Promise> CreateJSPromise(
+      dom::GlobalObject& aGlobal, ErrorResult& aError);
+
+  friend bool ToJSValue(JSContext* aCx,
+                        const InternalFileInfo& aInternalFileInfo,
+                        JS::MutableHandle<JS::Value> aValue);
+
+  static Result<JsBuffer, IOError> ReadSync(nsIFile* aFile,
+                                            const uint64_t aOffset,
+                                            const Maybe<uint32_t> aMaxBytes,
+                                            const bool aDecompress,
+                                            BufferKind aBufferKind);
+
+  static Result<JsBuffer, IOError> ReadUTF8Sync(nsIFile* aFile,
+                                                const bool aDecompress);
+
+  static Result<uint32_t, IOError> WriteSync(
+      nsIFile* aFile, const Span<const uint8_t>& aByteArray,
+      const InternalWriteOpts& aOptions);
+
+  static Result<Ok, IOError> MoveSync(nsIFile* aSourceFile, nsIFile* aDestFile,
+                                      bool aNoOverwrite);
+
+  static Result<Ok, IOError> CopySync(nsIFile* aSourceFile, nsIFile* aDestFile,
+                                      bool aNoOverWrite, bool aRecursive);
+
+  template <typename CopyOrMoveFn>
+  static Result<Ok, IOError> CopyOrMoveSync(CopyOrMoveFn aMethod,
+                                            const char* aMethodName,
+                                            nsIFile* aSource, nsIFile* aDest,
+                                            bool aNoOverwrite);
+
+  static Result<Ok, IOError> RemoveSync(nsIFile* aFile, bool aIgnoreAbsent,
+                                        bool aRecursive, bool aRetryReadonly);
+
+  static Result<Ok, IOError> MakeDirectorySync(nsIFile* aFile,
+                                               bool aCreateAncestors,
+                                               bool aIgnoreExisting,
+                                               int32_t aMode = 0777);
+
+  static Result<IOUtils::InternalFileInfo, IOError> StatSync(nsIFile* aFile);
+
+  static Result<int64_t, IOError> SetTimeSync(nsIFile* aFile,
+                                              SetTimeFn aSetTimeFn,
+                                              int64_t aNewTime);
+
+  static Result<bool, IOError> HasChildrenSync(nsIFile* aFile,
+                                               bool aIgnoreAbsent);
+
+  static Result<nsTArray<nsString>, IOError> GetChildrenSync(
+      nsIFile* aFile, bool aIgnoreAbsent);
+
+  static Result<Ok, IOError> SetPermissionsSync(nsIFile* aFile,
+                                                const uint32_t aPermissions);
+
+  static Result<bool, IOError> ExistsSync(nsIFile* aFile);
+
+  static Result<nsString, IOError> CreateUniqueSync(
+      nsIFile* aFile, const uint32_t aFileType, const uint32_t aPermissions);
+
+  static Result<nsCString, IOError> ComputeHexDigestSync(
+      nsIFile* aFile, const dom::HashAlgorithm aAlgorithm);
+
+
+  static void GetShutdownClient(dom::GlobalObject& aGlobal,
+                                JS::MutableHandle<JS::Value> aClient,
+                                ErrorResult& aRv, const ShutdownPhase aPhase);
+
+  enum class EventQueueStatus {
+    Uninitialized,
+    Initialized,
+    Shutdown,
+  };
+
+  enum class ShutdownBlockerStatus {
+    Uninitialized,
+    Initialized,
+    Failed,
+  };
+
+  class State {
+   public:
+    StaticAutoPtr<EventQueue> mEventQueue;
+    EventQueueStatus mQueueStatus = EventQueueStatus::Uninitialized;
+    ShutdownBlockerStatus mBlockerStatus = ShutdownBlockerStatus::Uninitialized;
+
+    void SetShutdownHooks();
+  };
+
+  using StateMutex = StaticDataMutex<State>;
+
+  static Maybe<StateMutex::AutoLock> GetState();
+
+  static StateMutex sState;
+};
+
+class IOUtils::EventQueue final {
+  friend void IOUtils::State::SetShutdownHooks();
+
+ public:
+  EventQueue();
+
+  EventQueue(const EventQueue&) = delete;
+  EventQueue(EventQueue&&) = delete;
+  EventQueue& operator=(const EventQueue&) = delete;
+  EventQueue& operator=(EventQueue&&) = delete;
+
+  template <typename OkT, typename Fn>
+  RefPtr<IOPromise<OkT>> Dispatch(Fn aFunc);
+
+  Result<already_AddRefed<nsIAsyncShutdownBarrier>, nsresult>
+  GetShutdownBarrier(const ShutdownPhase aPhase);
+  Result<already_AddRefed<nsIAsyncShutdownClient>, nsresult> GetShutdownClient(
+      const ShutdownPhase aPhase);
+
+ private:
+  nsresult SetShutdownHooks();
+
+  nsCOMPtr<nsISerialEventTarget> mBackgroundEventTarget;
+  IOUtils::PhaseArray<nsCOMPtr<nsIAsyncShutdownBarrier>> mBarriers;
+};
+
+class IOUtils::IOError {
+ public:
+  IOError(nsresult aCode, const nsCString& aMsg)
+      : mCode(aCode), mMessage(aMsg) {}
+
+  IOError(nsresult aCode, const char* const aFmt, ...) MOZ_FORMAT_PRINTF(3, 4)
+      : mCode(aCode) {
+    va_list ap;
+    va_start(ap, aFmt);
+    mMessage.AppendVprintf(aFmt, ap);
+    va_end(ap);
+  }
+
+  static IOError WithCause(const IOError& aCause, const nsCString& aMsg) {
+    IOError e(aCause.mCode, aMsg);
+    e.mMessage.AppendPrintf(": %s", aCause.mMessage.get());
+    return e;
+  }
+
+  static IOError WithCause(const IOError& aCause, const char* const aFmt, ...)
+      MOZ_FORMAT_PRINTF(2, 3) {
+    va_list ap;
+    va_start(ap, aFmt);
+
+    IOError e(aCause.mCode, EmptyCString());
+    e.mMessage.AppendVprintf(aFmt, ap);
+    e.mMessage.AppendPrintf(": %s", aCause.mMessage.get());
+
+    va_end(ap);
+    return e;
+  }
+
+  nsresult Code() const { return mCode; }
+
+  const nsCString& Message() const { return mMessage; }
+
+ private:
+  nsresult mCode;
+  nsCString mMessage;
+};
+
+struct IOUtils::InternalFileInfo {
+  nsString mPath;
+  dom::FileType mType = dom::FileType::Other;
+  uint64_t mSize = 0;
+  Maybe<PRTime> mCreationTime;  
+  PRTime mLastAccessed = 0;     
+  PRTime mLastModified = 0;     
+  uint32_t mPermissions = 0;
+};
+
+struct IOUtils::InternalWriteOpts {
+  RefPtr<nsIFile> mBackupFile;
+  RefPtr<nsIFile> mTmpFile;
+  dom::WriteMode mMode;
+  bool mFlush = false;
+  bool mCompress = false;
+  size_t mLengthHint = 0;
+
+  static Result<InternalWriteOpts, IOUtils::IOError> FromBinding(
+      const dom::WriteOptions& aOptions);
+  static Result<InternalWriteOpts, IOUtils::IOError> FromBinding(
+      const dom::WriteJSONOptions& aOptions);
+};
+
+class IOUtils::MozLZ4 {
+ public:
+  static constexpr std::array<uint8_t, 8> MAGIC_NUMBER{
+      {'m', 'o', 'z', 'L', 'z', '4', '0', '\0'}};
+
+  static const uint32_t HEADER_SIZE = 8 + sizeof(uint32_t);
+
+  static Result<nsTArray<uint8_t>, IOError> Compress(
+      Span<const uint8_t> aUncompressed);
+
+  static Result<IOUtils::JsBuffer, IOError> Decompress(
+      Span<const uint8_t> aFileContents, IOUtils::BufferKind);
+};
+
+class IOUtilsShutdownBlocker : public nsIAsyncShutdownBlocker,
+                               public nsIAsyncShutdownCompletionCallback {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIASYNCSHUTDOWNBLOCKER
+  NS_DECL_NSIASYNCSHUTDOWNCOMPLETIONCALLBACK
+
+  explicit IOUtilsShutdownBlocker(const IOUtils::ShutdownPhase aPhase)
+      : mPhase(aPhase) {}
+
+ private:
+  virtual ~IOUtilsShutdownBlocker() = default;
+
+  void OnFlush();
+
+  static constexpr IOUtils::PhaseArray<const char16_t*> PHASE_NAMES{
+      u"profile-before-change",
+      u"profile-before-change-telemetry",
+      u"xpcom-will-shutdown",
+  };
+
+  static constexpr auto LAST_IO_PHASE = IOUtils::ShutdownPhase::SendTelemetry;
+
+  IOUtils::ShutdownPhase mPhase;
+  nsCOMPtr<nsIAsyncShutdownClient> mParentClient;
+};
+
+class IOUtils::JsBuffer final {
+ public:
+  static Result<JsBuffer, IOUtils::IOError> Create(
+      IOUtils::BufferKind aBufferKind, size_t aCapacity);
+
+  static JsBuffer CreateEmpty(IOUtils::BufferKind aBufferKind);
+
+  JsBuffer(const JsBuffer&) = delete;
+  JsBuffer(JsBuffer&& aOther) noexcept;
+  JsBuffer& operator=(const JsBuffer&) = delete;
+  JsBuffer& operator=(JsBuffer&& aOther) noexcept;
+
+  size_t Length() { return mLength; }
+  char* Elements() { return mBuffer.get(); }
+  void SetLength(size_t aNewLength) {
+    MOZ_RELEASE_ASSERT(aNewLength <= mCapacity);
+    mLength = aNewLength;
+  }
+
+  Span<char> BeginWriting() {
+    MOZ_RELEASE_ASSERT(mBuffer.get());
+    return Span(mBuffer.get(), mCapacity);
+  }
+
+  Span<const char> BeginReading() const {
+    MOZ_RELEASE_ASSERT(mBuffer.get() || mLength == 0);
+    return Span(mBuffer.get(), mLength);
+  }
+
+  static JSString* IntoString(JSContext* aCx, JsBuffer aBuffer);
+
+  static JSObject* IntoUint8Array(JSContext* aCx, JsBuffer aBuffer);
+
+  friend bool ToJSValue(JSContext* aCx, JsBuffer&& aBuffer,
+                        JS::MutableHandle<JS::Value> aValue);
+
+ private:
+  IOUtils::BufferKind mBufferKind;
+  size_t mCapacity;
+  size_t mLength;
+  JS::UniqueChars mBuffer;
+
+  JsBuffer(BufferKind aBufferKind, size_t aCapacity);
+};
+
+class SyncReadFile : public nsISupports, public nsWrapperCache {
+ public:
+  SyncReadFile(nsISupports* aParent, RefPtr<nsFileRandomAccessStream>&& aStream,
+               int64_t aSize);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(SyncReadFile)
+
+  nsISupports* GetParentObject() const { return mParent; }
+
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  int64_t Size() const { return mSize; }
+  void ReadBytesInto(const dom::Uint8Array&, const int64_t, ErrorResult& aRv);
+  void Close();
+
+ private:
+  virtual ~SyncReadFile();
+
+  nsCOMPtr<nsISupports> mParent;
+  RefPtr<nsFileRandomAccessStream> mStream;
+  int64_t mSize = 0;
+};
+
+}  
+
+#endif

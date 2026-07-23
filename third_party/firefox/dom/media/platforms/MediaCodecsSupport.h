@@ -1,0 +1,157 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef DOM_MEDIA_PLATFORMS_MEDIACODECSSUPPORT_H_
+#define DOM_MEDIA_PLATFORMS_MEDIACODECSSUPPORT_H_
+#include <array>
+
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/StaticMutex.h"
+#include "nsString.h"
+#include "nsTHashMap.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla::media {
+#define CODEC_LIST \
+  X(H264)          \
+  X(VP8)           \
+  X(VP9)           \
+  X(AV1)           \
+  X(HEVC)          \
+  X(AAC)           \
+  X(FLAC)          \
+  X(MP3)           \
+  X(Opus)          \
+  X(Vorbis)        \
+  X(Wave)
+
+enum class MediaCodec : int {
+#define X(name) name,
+  CODEC_LIST
+#undef X
+      SENTINEL
+};
+using MediaCodecSet = EnumSet<MediaCodec, uint64_t>;
+
+#define SW_DECODE(codec) codec##SoftwareDecode
+#define HW_DECODE(codec) codec##HardwareDecode
+#define SW_ENCODE(codec) codec##SoftwareEncode
+#define HW_ENCODE(codec) codec##HardwareEncode
+
+#define LACK_HW_EXTENSION(codec) codec##LackOfExtension
+
+enum class MediaCodecsSupport : int {
+#define X(name)                                                       \
+  SW_DECODE(name), HW_DECODE(name), SW_ENCODE(name), HW_ENCODE(name), \
+      LACK_HW_EXTENSION(name),
+  CODEC_LIST
+#undef X
+      SENTINEL
+};
+#undef SW_DECODE
+#undef HW_DECODE
+#undef SW_ENCODE
+#undef HW_ENCODE
+#undef CODEC_LIST  // end of macros!
+
+using MediaCodecsSupported = EnumSet<MediaCodecsSupport, uint64_t>;
+
+enum class DecodeSupport : int {
+  SoftwareDecode,
+  HardwareDecode,
+  UnsureDueToLackOfExtension,
+};
+using DecodeSupportSet = EnumSet<DecodeSupport, uint64_t>;
+
+enum class EncodeSupport : int {
+  SoftwareEncode,
+  HardwareEncode,
+  UnsureDueToLackOfExtension,
+};
+using EncodeSupportSet = EnumSet<EncodeSupport, uint64_t>;
+
+struct CodecDefinition {
+  MediaCodec codec = MediaCodec::SENTINEL;
+  const char* commonName = "Undefined codec name";
+  const char* mimeTypeString = "Undefined MIME type string";
+  MediaCodecsSupport swDecodeSupport = MediaCodecsSupport::SENTINEL;
+  MediaCodecsSupport hwDecodeSupport = MediaCodecsSupport::SENTINEL;
+  MediaCodecsSupport swEncodeSupport = MediaCodecsSupport::SENTINEL;
+  MediaCodecsSupport hwEncodeSupport = MediaCodecsSupport::SENTINEL;
+  MediaCodecsSupport lackOfHWExtenstion = MediaCodecsSupport::SENTINEL;
+};
+
+class MCSInfo final {
+ public:
+  static MediaCodecsSupported GetSupportFromFactory(bool aForceRefresh = false);
+
+  static void AddSupport(const MediaCodecsSupported& aSupport);
+
+  static MediaCodecsSupported GetSupport();
+
+  static void ResetSupport();
+
+  static DecodeSupportSet GetDecodeSupportSet(
+      const MediaCodec& aCodec, const MediaCodecsSupported& aSupported);
+  static EncodeSupportSet GetEncodeSupportSet(
+      const MediaCodec& aCodec, const MediaCodecsSupported& aSupported);
+
+  static MediaCodecsSupported GetDecodeMediaCodecsSupported(
+      const MediaCodec& aCodec, const DecodeSupportSet& aSupportSet);
+  static MediaCodecsSupported GetEncodeMediaCodecsSupported(
+      const MediaCodec& aCodec, const EncodeSupportSet& aSupportSet);
+
+  static void GetMediaCodecsSupportedString(
+      nsCString& aSupportString, const MediaCodecsSupported& aSupportedCodecs);
+
+  static MediaCodec GetMediaCodecFromMimeType(const nsACString& aMimeType);
+
+  static std::array<CodecDefinition, 13> GetAllCodecDefinitions();
+
+  static MediaCodecSet GetMediaCodecSetFromMimeTypes(
+      const nsTArray<nsCString>& aCodecStrings);
+
+  static MediaCodecsSupport GetMediaCodecsSupportEnum(
+      const MediaCodec& aCodec, const DecodeSupport& aSupport);
+  static MediaCodecsSupport GetMediaCodecsSupportEnum(
+      const MediaCodec& aCodec, const EncodeSupport& aSupport);
+
+  static bool SupportsSoftwareDecode(
+      const MediaCodecsSupported& aSupportedCodecs, const MediaCodec& aCodec);
+  static bool SupportsHardwareDecode(
+      const MediaCodecsSupported& aSupportedCodecs, const MediaCodec& aCodec);
+
+  static bool SupportsSoftwareEncode(
+      const MediaCodecsSupported& aSupportedCodecs, const MediaCodec& aCodec);
+  static bool SupportsHardwareEncode(
+      const MediaCodecsSupported& aSupportedCodecs, const MediaCodec& aCodec);
+
+  MCSInfo(MCSInfo const&) = delete;
+  void operator=(MCSInfo const&) = delete;
+  ~MCSInfo() = default;
+
+ private:
+  MCSInfo();
+  static MCSInfo* GetInstance(const StaticMutexAutoLock& );
+
+  static CodecDefinition GetCodecDefinition(const MediaCodec& aCodec);
+
+  UniquePtr<nsTHashMap<MediaCodecsSupport, CodecDefinition>> mHashTableMCS;
+  UniquePtr<nsTHashMap<const char*, CodecDefinition>> mHashTableString;
+  UniquePtr<nsTHashMap<MediaCodec, CodecDefinition>> mHashTableCodec;
+  MediaCodecsSupported mSupport;
+};
+}  
+
+namespace mozilla {
+template <typename T>
+struct MaxEnumValue;
+template <>
+struct MaxEnumValue<media::MediaCodecsSupport> {
+  static constexpr unsigned int value =
+      static_cast<unsigned int>(media::MediaCodecsSupport::SENTINEL);
+};
+}  
+
+#endif /* MediaCodecsSupport_h_ */

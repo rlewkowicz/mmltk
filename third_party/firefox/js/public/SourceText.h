@@ -1,0 +1,200 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_SourceText_h
+#define js_SourceText_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+#include "mozilla/Attributes.h"  // MOZ_COLD, MOZ_IS_CLASS_INIT
+#include "mozilla/Likely.h"      // MOZ_UNLIKELY
+
+#include <stddef.h>     // size_t
+#include <stdint.h>     // UINT32_MAX
+#include <type_traits>  // std::conditional_t, std::is_same_v
+
+#include "js/UniquePtr.h"  // js::UniquePtr
+#include "js/Utility.h"    // JS::FreePolicy
+
+namespace mozilla {
+union Utf8Unit;
+}
+
+namespace js {
+class FrontendContext;
+}  
+
+namespace JS {
+
+class JS_PUBLIC_API AutoStableStringChars;
+using FrontendContext = js::FrontendContext;
+
+namespace detail {
+
+MOZ_COLD extern JS_PUBLIC_API void ReportSourceTooLong(JSContext* cx);
+MOZ_COLD extern JS_PUBLIC_API void ReportSourceTooLong(JS::FrontendContext* fc);
+
+}  
+
+enum class SourceOwnership {
+  Borrowed,
+  TakeOwnership,
+};
+
+template <typename Unit>
+class SourceText final {
+ private:
+  static_assert(std::is_same_v<Unit, mozilla::Utf8Unit> ||
+                    std::is_same_v<Unit, char16_t>,
+                "Unit must be either char16_t or Utf8Unit for "
+                "SourceText<Unit>");
+
+  const Unit* units_ = nullptr;
+
+  uint32_t length_ = 0;
+
+  bool ownsUnits_ = false;
+
+ public:
+  using CharT =
+      std::conditional_t<std::is_same_v<Unit, char16_t>, char16_t, char>;
+
+ public:
+  SourceText() = default;
+
+  SourceText(SourceText&& other)
+      : units_(other.units_),
+        length_(other.length_),
+        ownsUnits_(other.ownsUnits_) {
+    other.units_ = nullptr;
+    other.length_ = 0;
+    other.ownsUnits_ = false;
+  }
+
+  ~SourceText() {
+    if (ownsUnits_) {
+      js_free(const_cast<Unit*>(units_));
+    }
+  }
+
+ private:
+  template <typename ContextT>
+  [[nodiscard]] MOZ_IS_CLASS_INIT bool initImpl(ContextT* context,
+                                                const Unit* units,
+                                                size_t unitsLength,
+                                                SourceOwnership ownership) {
+    MOZ_ASSERT_IF(units == nullptr, unitsLength == 0);
+
+    static const CharT emptyString[] = {'\0'};
+
+    if (units) {
+      units_ = units;
+      length_ = static_cast<uint32_t>(unitsLength);
+      ownsUnits_ = ownership == SourceOwnership::TakeOwnership;
+    } else {
+      units_ = reinterpret_cast<const Unit*>(emptyString);
+      length_ = 0;
+      ownsUnits_ = false;
+    }
+
+    if (MOZ_UNLIKELY(unitsLength > UINT32_MAX)) {
+      detail::ReportSourceTooLong(context);
+      return false;
+    }
+
+    return true;
+  }
+
+ public:
+  [[nodiscard]] MOZ_IS_CLASS_INIT bool init(JSContext* cx, const Unit* units,
+                                            size_t unitsLength,
+                                            SourceOwnership ownership) {
+    return initImpl(cx, units, unitsLength, ownership);
+  }
+  [[nodiscard]] MOZ_IS_CLASS_INIT bool init(JS::FrontendContext* fc,
+                                            const Unit* units,
+                                            size_t unitsLength,
+                                            SourceOwnership ownership) {
+    return initImpl(fc, units, unitsLength, ownership);
+  }
+
+  template <typename Char,
+            typename = std::enable_if_t<std::is_same_v<Char, CharT> &&
+                                        !std::is_same_v<Char, Unit>>>
+  [[nodiscard]] MOZ_IS_CLASS_INIT bool init(JSContext* cx, const Char* chars,
+                                            size_t charsLength,
+                                            SourceOwnership ownership) {
+    return initImpl(cx, reinterpret_cast<const Unit*>(chars), charsLength,
+                    ownership);
+  }
+  template <typename Char,
+            typename = std::enable_if_t<std::is_same_v<Char, CharT> &&
+                                        !std::is_same_v<Char, Unit>>>
+  [[nodiscard]] MOZ_IS_CLASS_INIT bool init(JS::FrontendContext* fc,
+                                            const Char* chars,
+                                            size_t charsLength,
+                                            SourceOwnership ownership) {
+    return initImpl(fc, reinterpret_cast<const Unit*>(chars), charsLength,
+                    ownership);
+  }
+
+  [[nodiscard]] bool init(JSContext* cx,
+                          js::UniquePtr<Unit[], JS::FreePolicy> data,
+                          size_t dataLength) {
+    return initImpl(cx, data.release(), dataLength,
+                    SourceOwnership::TakeOwnership);
+  }
+  [[nodiscard]] bool init(JS::FrontendContext* fc,
+                          js::UniquePtr<Unit[], JS::FreePolicy> data,
+                          size_t dataLength) {
+    return initImpl(fc, data.release(), dataLength,
+                    SourceOwnership::TakeOwnership);
+  }
+
+  template <typename Char,
+            typename = std::enable_if_t<std::is_same_v<Char, CharT> &&
+                                        !std::is_same_v<Char, Unit>>>
+  [[nodiscard]] bool init(JSContext* cx,
+                          js::UniquePtr<Char[], JS::FreePolicy> data,
+                          size_t dataLength) {
+    return init(cx, data.release(), dataLength, SourceOwnership::TakeOwnership);
+  }
+  template <typename Char,
+            typename = std::enable_if_t<std::is_same_v<Char, CharT> &&
+                                        !std::is_same_v<Char, Unit>>>
+  [[nodiscard]] bool init(JS::FrontendContext* fc,
+                          js::UniquePtr<Char[], JS::FreePolicy> data,
+                          size_t dataLength) {
+    return init(fc, data.release(), dataLength, SourceOwnership::TakeOwnership);
+  }
+
+  [[nodiscard]] bool initMaybeBorrowed(JSContext* cx,
+                                       AutoStableStringChars& linearChars);
+  [[nodiscard]] bool initMaybeBorrowed(JS::FrontendContext* fc,
+                                       AutoStableStringChars& linearChars);
+
+  const Unit* units() const { return units_; }
+
+  const CharT* get() const { return reinterpret_cast<const CharT*>(units_); }
+
+  bool ownsUnits() const { return ownsUnits_; }
+
+  uint32_t length() const { return length_; }
+
+  Unit* takeUnits() {
+    MOZ_ASSERT(ownsUnits_);
+    ownsUnits_ = false;
+    return const_cast<Unit*>(units_);
+  }
+
+  CharT* takeChars() { return reinterpret_cast<CharT*>(takeUnits()); }
+
+ private:
+  SourceText(const SourceText&) = delete;
+  void operator=(const SourceText&) = delete;
+};
+
+}  
+
+#endif /* js_SourceText_h */

@@ -1,0 +1,171 @@
+/*
+ * Copyright 2022 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_serialize_h
+#define wasm_serialize_h
+
+#include "mozilla/CheckedInt.h"
+#include "mozilla/MacroForEach.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Result.h"
+
+#include <cstdint>
+#include <type_traits>
+
+namespace js {
+namespace wasm {
+
+class TypeContext;
+
+
+struct OutOfMemory {};
+
+using CoderResult = mozilla::Result<mozilla::Ok, OutOfMemory>;
+
+enum CoderMode {
+  MODE_SIZE,
+  MODE_ENCODE,
+  MODE_DECODE,
+};
+
+template <CoderMode mode, typename V>
+struct CoderArgT;
+
+template <typename V>
+struct CoderArgT<MODE_SIZE, V> {
+  using T = const V*;
+};
+
+template <typename V>
+struct CoderArgT<MODE_DECODE, V> {
+  using T = V*;
+};
+
+template <typename V>
+struct CoderArgT<MODE_ENCODE, V> {
+  using T = const V*;
+};
+
+template <CoderMode mode, typename T>
+using CoderArg = typename CoderArgT<mode, T>::T;
+
+template <CoderMode mode>
+struct Coder;
+
+template <>
+struct Coder<MODE_SIZE> {
+  explicit Coder(const TypeContext* types) : types_(types), size_(0) {}
+
+  const TypeContext* types_;
+
+  mozilla::CheckedInt<size_t> size_;
+
+  CoderResult writeBytes(const void* unusedSrc, size_t length);
+};
+
+template <>
+struct Coder<MODE_ENCODE> {
+  Coder(const TypeContext* types, uint8_t* start, size_t length)
+      : types_(types), buffer_(start), end_(start + length) {}
+
+  const TypeContext* types_;
+
+  uint8_t* buffer_;
+  const uint8_t* end_;
+
+  CoderResult writeBytes(const void* src, size_t length);
+};
+
+template <>
+struct Coder<MODE_DECODE> {
+  Coder(const uint8_t* start, size_t length)
+      : types_(nullptr), buffer_(start), end_(start + length) {}
+
+  const TypeContext* types_;
+
+  const uint8_t* buffer_;
+  const uint8_t* end_;
+
+  CoderResult readBytes(void* dest, size_t length);
+  CoderResult readBytesRef(size_t length, const uint8_t** bytesBegin);
+};
+
+
+#define WASM_DECLARE_FRIEND_SERIALIZE(TYPE) \
+  template <CoderMode mode>                 \
+  friend CoderResult Code##TYPE(Coder<mode>&, CoderArg<mode, TYPE>);
+
+#define WASM_DECLARE_FRIEND_SERIALIZE_ARGS(TYPE, ARGS...) \
+  template <CoderMode mode>                               \
+  friend CoderResult Code##TYPE(Coder<mode>&, CoderArg<mode, TYPE>, ARGS);
+
+
+template <typename T>
+struct IsCacheablePod
+    : public std::conditional_t<std::is_arithmetic_v<T> || std::is_enum_v<T>,
+                                std::true_type, std::false_type> {};
+
+template <typename T>
+struct IsCacheablePod<mozilla::Maybe<T>>
+    : public std::conditional_t<IsCacheablePod<T>::value, std::true_type,
+                                std::false_type> {};
+
+template <typename T, size_t N>
+struct IsCacheablePod<T[N]>
+    : public std::conditional_t<IsCacheablePod<T>::value, std::true_type,
+                                std::false_type> {};
+
+template <class T>
+inline constexpr bool is_cacheable_pod = IsCacheablePod<T>::value;
+
+#define WASM_CHECK_CACHEABLE_POD_PADDING(Type)                \
+  class __CHECK_PADING_##Type : public Type {                 \
+   public:                                                    \
+    char c;                                                   \
+  };                                                          \
+  static_assert(sizeof(__CHECK_PADING_##Type) > sizeof(Type), \
+                #Type " will overlap with next field if inherited");
+
+#define WASM_DECLARE_CACHEABLE_POD(Type)                                      \
+  static_assert(!std::is_polymorphic_v<Type>,                                 \
+                #Type "must not have virtual methods");                       \
+  }                                                       \
+  }                                                         \
+  template <>                                                                 \
+  struct js::wasm::IsCacheablePod<js::wasm::Type> : public std::true_type {}; \
+  namespace js {                                                              \
+  namespace wasm {
+
+#define WASM_CHECK_CACHEABLE_POD_FIELD_(Field)                    \
+  static_assert(js::wasm::IsCacheablePod<decltype(Field)>::value, \
+                #Field " must be cacheable pod");
+
+#define WASM_CHECK_CACHEABLE_POD(Fields...) \
+  MOZ_FOR_EACH(WASM_CHECK_CACHEABLE_POD_FIELD_, (), (Fields))
+
+#define WASM_CHECK_CACHEABLE_POD_WITH_PARENT(Parent, Fields...) \
+  static_assert(js::wasm::IsCacheablePod<Parent>::value,        \
+                #Parent " must be cacheable pod");              \
+  MOZ_FOR_EACH(WASM_CHECK_CACHEABLE_POD_FIELD_, (), (Fields))
+
+#define WASM_ALLOW_NON_CACHEABLE_POD_FIELD(Field, Reason)          \
+  static_assert(!js::wasm::IsCacheablePod<decltype(Field)>::value, \
+                #Field " is not cacheable due to " Reason);
+
+}  
+}  
+
+#endif  // wasm_serialize_h

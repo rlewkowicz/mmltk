@@ -1,0 +1,152 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef WIDGET_GTK_MPRIS_SERVICE_HANDLER_H_
+#define WIDGET_GTK_MPRIS_SERVICE_HANDLER_H_
+
+#include <gio/gio.h>
+#include "mozilla/dom/MediaControlKeySource.h"
+#include "nsIFile.h"
+#include "nsMimeTypes.h"
+#include "nsString.h"
+
+#define DBUS_MPRIS_SERVICE_NAME "org.mpris.MediaPlayer2.firefox"
+#define DBUS_MPRIS_OBJECT_PATH "/org/mpris/MediaPlayer2"
+#define DBUS_MPRIS_INTERFACE "org.mpris.MediaPlayer2"
+#define DBUS_MPRIS_PLAYER_INTERFACE "org.mpris.MediaPlayer2.Player"
+#define DBUS_MPRIS_TRACK_PATH "/org/mpris/MediaPlayer2/firefox"
+
+namespace mozilla {
+namespace widget {
+
+class MPRISServiceHandler final : public dom::MediaControlKeySource {
+  NS_INLINE_DECL_REFCOUNTING(MPRISServiceHandler, override)
+ public:
+
+  MPRISServiceHandler();
+  bool Open() override;
+  void Close() override;
+  bool IsOpened() const override;
+
+  void SetPlaybackState(dom::MediaSessionPlaybackState aState) override;
+
+  GVariant* GetPlaybackStatus() const;
+
+  const char* Identity() const;
+  const char* DesktopEntry() const;
+  bool PressKey(const dom::MediaControlAction& aAction) const;
+
+  void SetMediaMetadata(const dom::MediaMetadataBase& aMetadata) override;
+  GVariant* GetMetadataAsGVariant() const;
+
+  void SetSupportedMediaKeys(const MediaKeysArray& aSupportedKeys) override;
+
+  void SetPositionState(const Maybe<dom::PositionState>& aState) override;
+  double GetPositionSeconds() const;
+  double GetPlaybackRate() const;
+
+  void SetVolume(double aVolume);
+  double GetVolume() const;
+
+  bool IsMediaKeySupported(dom::MediaControlKey aKey) const;
+
+  void OwnName(GDBusConnection* aConnection);
+
+ private:
+  ~MPRISServiceHandler();
+
+
+  guint mOwnerId = 0;
+  guint mRootRegistrationId = 0;
+  guint mPlayerRegistrationId = 0;
+  RefPtr<GDBusNodeInfo> mIntrospectionData;
+  GDBusConnection* mConnection = nullptr;
+  bool mInitialized = false;
+  nsAutoCString mIdentity;
+  nsAutoCString mDesktopEntry;
+
+  nsCString mMimeType{IMAGE_PNG};
+
+  uint32_t mSupportedKeys = 0;
+
+  Maybe<dom::PositionState> mPositionState;
+  double mVolume = 1.0;
+
+  class MPRISMetadata : public dom::MediaMetadataBase {
+   public:
+    MPRISMetadata() = default;
+    ~MPRISMetadata() = default;
+
+    void UpdateFromMetadataBase(const dom::MediaMetadataBase& aMetadata) {
+      mTitle = aMetadata.mTitle;
+      mArtist = aMetadata.mArtist;
+      mAlbum = aMetadata.mAlbum;
+      mUrl = aMetadata.mUrl;
+      mArtwork = aMetadata.mArtwork;
+    }
+    void Clear() {
+      UpdateFromMetadataBase(MediaMetadataBase::EmptyData());
+      mArtUrl.Truncate();
+    }
+
+    nsCString mArtUrl;
+  };
+  MPRISMetadata mMPRISMetadata;
+
+  nsCOMPtr<nsIFile> mLocalImageFile;
+  nsCOMPtr<nsIFile> mLocalImageFolder;
+
+  nsString mCurrentImageUrl;
+
+  bool SetImageToDisplay(const char* aImageData, uint32_t aDataSize);
+
+  bool RenewLocalImageFile(const char* aImageData, uint32_t aDataSize);
+  bool InitLocalImageFile();
+  bool InitLocalImageFolder();
+  void RemoveAllLocalImages();
+  bool LocalImageFolderExists();
+
+  void InitIdentity();
+
+  void OnNameAcquired(GDBusConnection* aConnection, const gchar* aName);
+  void OnNameLost(GDBusConnection* aConnection, const gchar* aName);
+  void OnBusAcquired(GDBusConnection* aConnection, const gchar* aName);
+
+  static void OnNameAcquiredStatic(GDBusConnection* aConnection,
+                                   const gchar* aName, gpointer aUserData);
+  static void OnNameLostStatic(GDBusConnection* aConnection, const gchar* aName,
+                               gpointer aUserData);
+  static void OnBusAcquiredStatic(GDBusConnection* aConnection,
+                                  const gchar* aName, gpointer aUserData);
+
+  void EmitEvent(const dom::MediaControlAction& aAction) const;
+
+  bool EmitMetadataChanged() const;
+
+  void SetMediaMetadataInternal(const dom::MediaMetadataBase& aMetadata,
+                                bool aClearArtUrl = true);
+
+  bool EmitSupportedKeyChanged(dom::MediaControlKey aKey,
+                               bool aSupported) const;
+
+  bool EmitPositionStateChanges(bool aRateChanged, bool aDurationChanged) const;
+
+  bool EmitPropertiesChangedSignal(GVariant* aParameters) const;
+
+  bool EmitSeekedSignal() const;
+
+  void ClearMetadata();
+
+  RefPtr<GCancellable> mDBusGetCancellable;
+
+  nsCString mServiceName;
+  void SetServiceName(const char* aName);
+  const char* GetServiceName();
+};
+
+}  
+}  
+
+#endif  // WIDGET_GTK_MPRIS_SERVICE_HANDLER_H_

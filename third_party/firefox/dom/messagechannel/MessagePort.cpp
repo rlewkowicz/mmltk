@@ -1,0 +1,719 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MessagePort.h"
+
+#include "MessageEvent.h"
+#include "MessagePortChild.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/dom/BlobBinding.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/File.h"
+#include "mozilla/dom/MessageChannel.h"
+#include "mozilla/dom/MessageEventBinding.h"
+#include "mozilla/dom/MessagePortBinding.h"
+#include "mozilla/dom/MessagePortChild.h"
+#include "mozilla/dom/PMessagePort.h"
+#include "mozilla/dom/RefMessageBodyService.h"
+#include "mozilla/dom/RootedDictionary.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/SharedMessageBody.h"
+#include "mozilla/dom/StructuredCloneTags.h"
+#include "mozilla/dom/WorkerCommon.h"
+#include "mozilla/dom/WorkerRef.h"
+#include "mozilla/dom/WorkerScope.h"
+#include "mozilla/ipc/BackgroundChild.h"
+#include "mozilla/ipc/PBackgroundChild.h"
+#include "nsContentUtils.h"
+#include "nsGlobalWindowInner.h"
+#include "nsPresContext.h"
+
+
+namespace mozilla::dom {
+
+void UniqueMessagePortId::ForceClose() {
+  if (!mIdentifier.neutered()) {
+    MessagePort::ForceClose(mIdentifier);
+    mIdentifier.neutered() = true;
+  }
+}
+
+class PostMessageRunnable final : public CancelableRunnable {
+  friend class MessagePort;
+
+ public:
+  PostMessageRunnable(MessagePort* aPort, SharedMessageBody* aData)
+      : CancelableRunnable("dom::PostMessageRunnable"),
+        mPort(aPort),
+        mData(aData) {
+    MOZ_ASSERT(aPort);
+    MOZ_ASSERT(aData);
+  }
+
+  NS_IMETHOD
+  Run() override {
+    NS_ASSERT_OWNINGTHREAD(Runnable);
+
+    if (!mPort) {
+      return NS_OK;
+    }
+
+    MOZ_ASSERT(mPort->mPostMessageRunnable == this);
+
+    DispatchMessage();
+
+    mPort->UpdateMustKeepAlive();
+
+    mPort->mPostMessageRunnable = nullptr;
+    mPort->Dispatch();
+
+    return NS_OK;
+  }
+
+  nsresult Cancel() override {
+    NS_ASSERT_OWNINGTHREAD(Runnable);
+
+    mPort = nullptr;
+    mData = nullptr;
+    return NS_OK;
+  }
+
+ private:
+  void DispatchMessage() const {
+    NS_ASSERT_OWNINGTHREAD(Runnable);
+
+    if (NS_FAILED(mPort->CheckCurrentGlobalCorrectness())) {
+      return;
+    }
+
+    nsCOMPtr<nsIGlobalObject> globalObject = mPort->GetParentObject();
+
+    AutoJSAPI jsapi;
+    if (!globalObject || !jsapi.Init(globalObject)) {
+      NS_WARNING("Failed to initialize AutoJSAPI object.");
+      return;
+    }
+
+    JSContext* cx = jsapi.cx();
+
+    IgnoredErrorResult rv;
+    JS::Rooted<JS::Value> value(cx);
+
+    mData->Read(cx, &value, mPort->mRefMessageBodyService,
+                SharedMessageBody::ReadMethod::StealRefMessageBody, rv);
+
+    if (NS_WARN_IF(rv.Failed())) {
+      JS_ClearPendingException(cx);
+      mPort->DispatchError();
+      return;
+    }
+
+    RefPtr<MessageEvent> event = new MessageEvent(mPort, nullptr, nullptr);
+
+    Sequence<OwningNonNull<MessagePort>> ports;
+    if (!mData->TakeTransferredPortsAsSequence(ports)) {
+      mPort->DispatchError();
+      return;
+    }
+
+    event->InitMessageEvent(nullptr, u"message"_ns, CanBubble::eNo,
+                            Cancelable::eNo, value, u""_ns, u""_ns, nullptr,
+                            ports);
+    event->SetTrusted(true);
+
+    mPort->DispatchEvent(*event);
+  }
+
+ private:
+  ~PostMessageRunnable() = default;
+
+  RefPtr<MessagePort> mPort;
+  RefPtr<SharedMessageBody> mData;
+};
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(MessagePort)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(MessagePort,
+                                                DOMEventTargetHelper)
+  if (tmp->mPostMessageRunnable) {
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(mPostMessageRunnable->mPort);
+  }
+
+  tmp->CloseForced();
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(MessagePort,
+                                                  DOMEventTargetHelper)
+  if (tmp->mPostMessageRunnable) {
+    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPostMessageRunnable->mPort);
+  }
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mUnshippedEntangledPort);
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(MessagePort)
+NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
+
+NS_IMPL_ADDREF_INHERITED(MessagePort, DOMEventTargetHelper)
+NS_IMPL_RELEASE_INHERITED(MessagePort, DOMEventTargetHelper)
+
+MessagePort::MessagePort(nsIGlobalObject* aGlobal, State aState)
+    : DOMEventTargetHelper(aGlobal),
+      mRefMessageBodyService(RefMessageBodyService::GetOrCreate()),
+      mState(aState),
+      mMessageQueueEnabled(false),
+      mIsKeptAlive(false),
+      mHasBeenTransferredOrClosed(false) {
+  MOZ_ASSERT(aGlobal);
+
+  mIdentifier = MakeUnique<MessagePortIdentifier>();
+  mIdentifier->neutered() = true;
+  mIdentifier->sequenceId() = 0;
+}
+
+MessagePort::~MessagePort() {
+  CloseForced();
+  MOZ_ASSERT(!mActor);
+  if (mActor) {
+    mActor->SetPort(nullptr);
+    mActor = nullptr;
+  }
+  MOZ_ASSERT(!mWorkerRef);
+}
+
+already_AddRefed<MessagePort> MessagePort::Create(nsIGlobalObject* aGlobal,
+                                                  const nsID& aUUID,
+                                                  const nsID& aDestinationUUID,
+                                                  ErrorResult& aRv) {
+  MOZ_ASSERT(aGlobal);
+
+  RefPtr<MessagePort> mp =
+      new MessagePort(aGlobal, eStateInitializingUnshippedEntangled);
+  mp->Initialize(aUUID, aDestinationUUID, 1 ,
+                 false , aRv);
+  return mp.forget();
+}
+
+already_AddRefed<MessagePort> MessagePort::Create(
+    nsIGlobalObject* aGlobal, UniqueMessagePortId& aIdentifier,
+    ErrorResult& aRv) {
+  MOZ_ASSERT(aGlobal);
+
+  RefPtr<MessagePort> mp = new MessagePort(aGlobal, eStateEntangling);
+  mp->Initialize(aIdentifier.uuid(), aIdentifier.destinationUuid(),
+                 aIdentifier.sequenceId(), aIdentifier.neutered(), aRv);
+  aIdentifier.neutered() = true;
+  return mp.forget();
+}
+
+void MessagePort::UnshippedEntangle(RefPtr<MessagePort>& aEntangledPort) {
+  MOZ_DIAGNOSTIC_ASSERT(aEntangledPort);
+  MOZ_DIAGNOSTIC_ASSERT(!mUnshippedEntangledPort);
+
+  if (mState == eStateInitializingUnshippedEntangled) {
+    mUnshippedEntangledPort = aEntangledPort;
+    mState = eStateUnshippedEntangled;
+  } else {
+    MOZ_ASSERT_UNREACHABLE("Should not have been called.");
+  }
+}
+
+void MessagePort::Initialize(const nsID& aUUID, const nsID& aDestinationUUID,
+                             uint32_t aSequenceID, bool aNeutered,
+                             ErrorResult& aRv) {
+  MOZ_ASSERT(mIdentifier);
+  mIdentifier->uuid() = aUUID;
+  mIdentifier->destinationUuid() = aDestinationUUID;
+  mIdentifier->sequenceId() = aSequenceID;
+
+  if (aNeutered) {
+    mState = eStateDisentangled;
+    return;
+  }
+
+  if (mState == eStateEntangling) {
+    if (!ConnectToPBackground()) {
+      aRv.Throw(NS_ERROR_FAILURE);
+      return;
+    }
+  } else {
+    MOZ_ASSERT(mState == eStateInitializingUnshippedEntangled);
+  }
+
+  UpdateMustKeepAlive();
+
+  if (WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate()) {
+    RefPtr<MessagePort> self = this;
+
+    RefPtr<StrongWorkerRef> strongWorkerRef = StrongWorkerRef::Create(
+        workerPrivate, "MessagePort", [self]() { self->CloseForced(); });
+    if (NS_WARN_IF(!strongWorkerRef)) {
+      CloseForced();
+      aRv.Throw(NS_ERROR_FAILURE);
+      return;
+    }
+
+    MOZ_ASSERT(!mWorkerRef);
+    mWorkerRef = std::move(strongWorkerRef);
+  }
+}
+
+JSObject* MessagePort::WrapObject(JSContext* aCx,
+                                  JS::Handle<JSObject*> aGivenProto) {
+  return MessagePort_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void MessagePort::PostMessage(JSContext* aCx, JS::Handle<JS::Value> aMessage,
+                              const Sequence<JSObject*>& aTransferable,
+                              ErrorResult& aRv) {
+
+  for (uint32_t i = 0; i < aTransferable.Length(); ++i) {
+    JS::Rooted<JSObject*> object(aCx, aTransferable[i]);
+    if (!object) {
+      continue;
+    }
+
+    MessagePort* port = nullptr;
+    nsresult rv = UNWRAP_OBJECT(MessagePort, &object, port);
+    if (NS_SUCCEEDED(rv) && port == this) {
+      aRv.Throw(NS_ERROR_DOM_DATA_CLONE_ERR);
+      return;
+    }
+  }
+
+  JS::Rooted<JS::Value> transferable(aCx, JS::UndefinedValue());
+
+  aRv = nsContentUtils::CreateJSValueFromSequenceOfObject(aCx, aTransferable,
+                                                          &transferable);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return;
+  }
+
+  Maybe<nsID> agentClusterId;
+  nsCOMPtr<nsIGlobalObject> global = GetRelevantGlobal();
+  if (global) {
+    agentClusterId = global->GetAgentClusterId();
+  }
+
+  auto data = MakeNotNull<RefPtr<SharedMessageBody>>(
+      StructuredCloneHolder::TransferringSupported, agentClusterId);
+
+  data->Write(aCx, aMessage, transferable, mIdentifier->uuid(),
+              mRefMessageBodyService, aRv);
+
+  if (NS_WARN_IF(aRv.Failed())) {
+    return;
+  }
+
+  if (mState > eStateEntangled) {
+    return;
+  }
+
+  if (mState == eStateInitializingUnshippedEntangled) {
+    MOZ_ASSERT_UNREACHABLE(
+        "Should be eStateUnshippedEntangled or eStateDisentangled by now.");
+    return;
+  }
+
+  if (mState == eStateUnshippedEntangled) {
+    MOZ_DIAGNOSTIC_ASSERT(mUnshippedEntangledPort);
+    mUnshippedEntangledPort->mMessages.AppendElement(data);
+    mUnshippedEntangledPort->Dispatch();
+    return;
+  }
+
+  if (mState == eStateEntanglingForDisentangle ||
+      mState == eStateEntanglingForClose) {
+    return;
+  }
+
+  RemoveDocFromBFCache();
+
+  if (mState == eStateEntangling) {
+    MOZ_ASSERT(mActor);
+    AutoTArray<NotNull<RefPtr<SharedMessageBody>>, 1> messages;
+    messages.AppendElement(data);
+    mActor->SendPostMessages(messages);
+    return;
+  }
+
+  MOZ_ASSERT(mActor);
+
+  AutoTArray<NotNull<RefPtr<SharedMessageBody>>, 1> messages;
+  messages.AppendElement(data);
+
+  mActor->SendPostMessages(messages);
+}
+
+void MessagePort::PostMessage(JSContext* aCx, JS::Handle<JS::Value> aMessage,
+                              const StructuredSerializeOptions& aOptions,
+                              ErrorResult& aRv) {
+  PostMessage(aCx, aMessage, aOptions.mTransfer, aRv);
+}
+
+void MessagePort::Start() {
+  if (mMessageQueueEnabled) {
+    return;
+  }
+
+  mMessageQueueEnabled = true;
+  Dispatch();
+}
+
+void MessagePort::Dispatch() {
+  if (!mMessageQueueEnabled || mMessages.IsEmpty() || mPostMessageRunnable) {
+    return;
+  }
+
+  switch (mState) {
+    case eStateInitializingUnshippedEntangled:
+      MOZ_ASSERT_UNREACHABLE(
+          "Should be eStateUnshippedEntangled or eStateDisentangled by now.");
+      break;
+
+    case eStateUnshippedEntangled:
+      break;
+
+    case eStateEntangling:
+      break;
+
+    case eStateEntanglingForDisentangle:
+      return;
+
+    case eStateEntanglingForClose:
+      break;
+
+    case eStateEntangled:
+      break;
+
+    case eStateDisentangling:
+      return;
+
+    case eStateDisentangled:
+      MOZ_CRASH("This cannot happen.");
+      break;
+
+    case eStateDisentangledForClose:
+      break;
+  }
+
+  RefPtr<SharedMessageBody> data = mMessages.ElementAt(0);
+  mMessages.RemoveElementAt(0);
+
+  mPostMessageRunnable = new PostMessageRunnable(this, data);
+  MOZ_ALWAYS_SUCCEEDS(NS_DispatchToCurrentThread(mPostMessageRunnable));
+}
+
+void MessagePort::Close() {
+  mHasBeenTransferredOrClosed = true;
+  CloseInternal(true );
+}
+
+void MessagePort::CloseForced() { CloseInternal(false ); }
+
+void MessagePort::CloseInternal(bool aSoftly) {
+  if (!aSoftly) {
+    mMessages.Clear();
+  }
+
+  mRefMessageBodyService->ForgetPort(mIdentifier->uuid());
+
+  if (mState == eStateInitializingUnshippedEntangled) {
+    mState = eStateDisentangledForClose;
+
+    UpdateMustKeepAlive();
+    return;
+  }
+
+  if (mState == eStateUnshippedEntangled) {
+    MOZ_DIAGNOSTIC_ASSERT(mUnshippedEntangledPort);
+
+    RefPtr<MessagePort> port = std::move(mUnshippedEntangledPort);
+
+    mState = eStateDisentangledForClose;
+    port->CloseInternal(aSoftly);
+
+    UpdateMustKeepAlive();
+    return;
+  }
+
+  if (mState == eStateEntangling) {
+    mState = eStateEntanglingForClose;
+    return;
+  }
+
+  if (mState == eStateEntanglingForDisentangle ||
+      mState == eStateEntanglingForClose) {
+    return;
+  }
+
+  if (mState == eStateDisentangledForClose && !aSoftly) {
+    UpdateMustKeepAlive();
+    return;
+  }
+
+  if (mState > eStateEntangled) {
+    return;
+  }
+
+  mState = eStateDisentangledForClose;
+
+  MOZ_ASSERT(mActor);
+
+  mActor->SendClose();
+  mActor->SetPort(nullptr);
+  mActor = nullptr;
+
+  UpdateMustKeepAlive();
+}
+
+EventHandlerNonNull* MessagePort::GetOnmessage() {
+  return GetEventHandler(nsGkAtoms::onmessage);
+}
+
+void MessagePort::SetOnmessage(EventHandlerNonNull* aCallback) {
+  SetEventHandler(nsGkAtoms::onmessage, aCallback);
+
+  Start();
+}
+
+void MessagePort::Entangled(
+    nsTArray<NotNull<RefPtr<SharedMessageBody>>>& aMessages) {
+  MOZ_ASSERT(mState == eStateEntangling ||
+             mState == eStateEntanglingForDisentangle ||
+             mState == eStateEntanglingForClose);
+
+  State oldState = mState;
+  mState = eStateEntangled;
+
+  if (oldState == eStateEntanglingForClose) {
+    CloseForced();
+    return;
+  }
+
+  mMessages.AppendElements(aMessages);
+
+  if (oldState == eStateEntanglingForDisentangle) {
+    StartDisentangling();
+    return;
+  }
+
+  Dispatch();
+}
+
+void MessagePort::StartDisentangling() {
+  MOZ_ASSERT(mActor);
+  MOZ_ASSERT(mState == eStateEntangled);
+
+  mState = eStateDisentangling;
+
+  mActor->SendStopSendingData();
+}
+
+void MessagePort::MessagesReceived(
+    nsTArray<NotNull<RefPtr<SharedMessageBody>>>& aMessages) {
+  MOZ_ASSERT(mState == eStateEntangled || mState == eStateDisentangling ||
+             mState == eStateDisentangledForClose);
+
+  RemoveDocFromBFCache();
+
+  mMessages.AppendElements(aMessages);
+
+  if (mState == eStateEntangled) {
+    Dispatch();
+  }
+}
+
+void MessagePort::StopSendingDataConfirmed() {
+  MOZ_ASSERT(mState == eStateDisentangling);
+  MOZ_ASSERT(mActor);
+
+  Disentangle();
+}
+
+void MessagePort::Disentangle() {
+  MOZ_ASSERT(mState == eStateDisentangling);
+  MOZ_ASSERT(mActor);
+
+  mState = eStateDisentangled;
+
+  mActor->SendDisentangle(mMessages);
+
+  mRefMessageBodyService->ForgetPort(mIdentifier->uuid());
+
+  mMessages.Clear();
+
+  mActor->SetPort(nullptr);
+  mActor = nullptr;
+
+  UpdateMustKeepAlive();
+}
+
+void MessagePort::CloneAndDisentangle(UniqueMessagePortId& aIdentifier) {
+  MOZ_ASSERT(mIdentifier);
+  MOZ_ASSERT(!mHasBeenTransferredOrClosed);
+
+  mHasBeenTransferredOrClosed = true;
+
+  aIdentifier.neutered() = true;
+
+  if (mState > eStateEntangled) {
+    return;
+  }
+
+  if (mState == eStateEntanglingForDisentangle ||
+      mState == eStateEntanglingForClose) {
+    return;
+  }
+
+  aIdentifier.uuid() = mIdentifier->uuid();
+  aIdentifier.destinationUuid() = mIdentifier->destinationUuid();
+  aIdentifier.sequenceId() = mIdentifier->sequenceId() + 1;
+  aIdentifier.neutered() = false;
+
+  if (mState == eStateUnshippedEntangled) {
+    MOZ_ASSERT(mUnshippedEntangledPort);
+
+    RefPtr<MessagePort> port = std::move(mUnshippedEntangledPort);
+
+    if (!port->ConnectToPBackground()) {
+      mState = eStateDisentangled;
+      UpdateMustKeepAlive();
+      return;
+    }
+
+    if (mMessages.IsEmpty()) {
+      aIdentifier.sequenceId() = mIdentifier->sequenceId();
+
+      mState = eStateDisentangled;
+      UpdateMustKeepAlive();
+      return;
+    }
+
+    if (!ConnectToPBackground()) {
+      return;
+    }
+
+    mState = eStateEntanglingForDisentangle;
+    return;
+  }
+
+  if (mState == eStateEntangling) {
+    mState = eStateEntanglingForDisentangle;
+    return;
+  }
+
+  MOZ_ASSERT(mState == eStateEntangled);
+  StartDisentangling();
+}
+
+void MessagePort::Closed() {
+  if (mState >= eStateDisentangled) {
+    return;
+  }
+
+  mState = eStateDisentangledForClose;
+
+  if (mActor) {
+    mActor->SetPort(nullptr);
+    mActor = nullptr;
+  }
+
+  UpdateMustKeepAlive();
+}
+
+bool MessagePort::ConnectToPBackground() {
+  RefPtr<MessagePort> self = this;
+  auto raii = MakeScopeExit([self] {
+    self->mState = eStateDisentangled;
+    self->UpdateMustKeepAlive();
+  });
+
+  mozilla::ipc::PBackgroundChild* actorChild =
+      mozilla::ipc::BackgroundChild::GetOrCreateForCurrentThread();
+  if (NS_WARN_IF(!actorChild)) {
+    return false;
+  }
+
+  PMessagePortChild* actor = actorChild->SendPMessagePortConstructor(
+      mIdentifier->uuid(), mIdentifier->destinationUuid(),
+      mIdentifier->sequenceId());
+  if (NS_WARN_IF(!actor)) {
+    return false;
+  }
+
+  mActor = static_cast<MessagePortChild*>(actor);
+  MOZ_ASSERT(mActor);
+
+  mActor->SetPort(this);
+  mState = eStateEntangling;
+
+  raii.release();
+  return true;
+}
+
+void MessagePort::UpdateMustKeepAlive() {
+  if (mState >= eStateDisentangled && mMessages.IsEmpty() && mIsKeptAlive) {
+    mIsKeptAlive = false;
+
+    mWorkerRef = nullptr;
+
+    Release();
+    return;
+  }
+
+  if (mState < eStateDisentangled && !mIsKeptAlive) {
+    mIsKeptAlive = true;
+    AddRef();
+  }
+}
+
+void MessagePort::DisconnectFromOwner() {
+  CloseForced();
+  DOMEventTargetHelper::DisconnectFromOwner();
+}
+
+void MessagePort::RemoveDocFromBFCache() {
+  if (!NS_IsMainThread()) {
+    return;
+  }
+
+  if (nsPIDOMWindowInner* window = GetOwnerWindow()) {
+    window->RemoveFromBFCacheSync();
+  }
+}
+
+void MessagePort::ForceClose(const MessagePortIdentifier& aIdentifier) {
+  mozilla::ipc::PBackgroundChild* actorChild =
+      mozilla::ipc::BackgroundChild::GetOrCreateForCurrentThread();
+  if (NS_WARN_IF(!actorChild)) {
+    return;
+  }
+
+  (void)actorChild->SendMessagePortForceClose(aIdentifier.uuid(),
+                                              aIdentifier.destinationUuid(),
+                                              aIdentifier.sequenceId());
+}
+
+void MessagePort::DispatchError() {
+  nsCOMPtr<nsIGlobalObject> globalObject = GetParentObject();
+
+  AutoJSAPI jsapi;
+  if (!globalObject || !jsapi.Init(globalObject)) {
+    NS_WARNING("Failed to initialize AutoJSAPI object.");
+    return;
+  }
+
+  RootedDictionary<MessageEventInit> init(jsapi.cx());
+  init.mBubbles = false;
+  init.mCancelable = false;
+
+  RefPtr<Event> event =
+      MessageEvent::Constructor(this, u"messageerror"_ns, init);
+  event->SetTrusted(true);
+
+  DispatchEvent(*event);
+}
+
+}  

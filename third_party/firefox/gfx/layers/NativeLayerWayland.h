@@ -1,0 +1,373 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_NativeLayerWayland_h
+#define mozilla_layers_NativeLayerWayland_h
+
+#include "mozilla/Atomics.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/layers/NativeLayer.h"
+#include "mozilla/layers/SurfacePoolWayland.h"
+#include "mozilla/widget/DMABufFormats.h"
+#include "nsRegion.h"
+#include "nsTArray.h"
+
+namespace mozilla::wr {
+class RenderDMABUFTextureHost;
+}  
+
+namespace mozilla::widget {
+class WaylandSurfaceLock;
+}  
+
+namespace mozilla::layers {
+class NativeLayerWaylandExternal;
+class NativeLayerWaylandRender;
+
+struct LayerState {
+  bool mIsVisible : 1;
+  bool mIsRendered : 1;
+
+  bool mMutatedVisibility : 1;
+  bool mMutatedStackingOrder : 1;
+  bool mMutatedPlacement : 1;
+  bool mMutatedFrontBuffer : 1;
+
+  bool mRenderedLastCycle : 1;
+
+  void InvalidateAll() {
+    mIsVisible = false;
+    mIsRendered = false;
+
+    mMutatedVisibility = true;
+    mMutatedStackingOrder = true;
+    mMutatedPlacement = true;
+    mMutatedFrontBuffer = true;
+    mRenderedLastCycle = false;
+  }
+};
+
+class NativeLayerRootWayland final : public NativeLayerRoot {
+ public:
+  static already_AddRefed<NativeLayerRootWayland> Create(
+      RefPtr<widget::WaylandSurface> aWaylandSurface);
+
+  NativeLayerRootWayland* AsNativeLayerRootWayland() override { return this; }
+  already_AddRefed<NativeLayer> CreateLayer(
+      const gfx::IntSize& aSize, bool aIsOpaque,
+      SurfacePoolHandle* aSurfacePoolHandle) override;
+  already_AddRefed<NativeLayer> CreateLayerForExternalTexture(
+      bool aIsOpaque) override;
+  UniquePtr<NativeLayerRootSnapshotter> CreateSnapshotter() override;
+
+  void AppendLayer(NativeLayer* aLayer) override;
+  void RemoveLayer(NativeLayer* aLayer) override;
+  void SetLayers(const nsTArray<RefPtr<NativeLayer>>& aLayers) override;
+
+  void PrepareForCommit() override { mFrameInProcess = true; };
+  bool CommitToScreen() override;
+
+  GdkWindow* GetGdkWindow() const;
+
+  RefPtr<widget::WaylandSurface> GetRootWaylandSurface() {
+    return mRootSurface;
+  }
+
+  already_AddRefed<widget::DRMFormat> GetDRMFormat() {
+    return do_AddRef(static_cast<widget::DRMFormat*>(mDRMFormat));
+  }
+  void SetDRMFormat(widget::DRMFormat* aFormat);
+
+  void VSyncCallbackHandler(uint32_t aTime, bool aEmulated);
+
+  RefPtr<widget::WaylandBuffer> BorrowExternalBuffer(
+      RefPtr<DMABufSurface> aDMABufSurface);
+
+#ifdef MOZ_LOGGING
+  nsAutoCString GetDebugTag() const;
+  void* GetLoggingWidget() const;
+#endif
+
+  void Init();
+  void Shutdown();
+
+  void UpdateLayersOnMainThread();
+  void RequestUpdateOnMainThreadLocked(
+      const widget::WaylandSurfaceLock& aProofOfLock);
+
+  explicit NativeLayerRootWayland(
+      RefPtr<widget::WaylandSurface> aWaylandSurface);
+
+  void NotifyFullscreenChanged(bool aIsFullscreen) {
+    mIsFullscreen = aIsFullscreen;
+  }
+
+  NativeLayerWaylandRender* GetLayerForSnapshot();
+
+  void SetGLContext(gl::GLContext* aGL) { mGL = aGL; }
+
+ private:
+  ~NativeLayerRootWayland();
+
+  bool MapLocked(const widget::WaylandSurfaceLock& aProofOfLock);
+  bool IsEmptyLocked(const widget::WaylandSurfaceLock& aProofOfLock);
+  void ClearLayersLocked(const widget::WaylandSurfaceLock& aProofOfLock);
+
+  bool CommitToScreenLocked(widget::WaylandSurfaceLock& aLock);
+  void ConfigureScaleLocked(widget::WaylandSurfaceLock& aProofOfLock);
+
+#ifdef MOZ_LOGGING
+  void LogStatsLocked(const widget::WaylandSurfaceLock& aProofOfLock);
+#endif
+
+#ifdef MOZ_LOGGING
+  void* mLoggingWidget = nullptr;
+#endif
+
+  RefPtr<gl::GLContext> mGL;
+
+  RefPtr<widget::WaylandSurface> mRootSurface;
+
+  Atomic<widget::DRMFormat*> mDRMFormat{nullptr};
+
+  RefPtr<widget::WaylandBufferSHM> mTmpBuffer;
+
+  nsTArray<RefPtr<NativeLayerWayland>> mSublayers;
+
+  nsTArray<RefPtr<NativeLayerWayland>> mMainThreadUpdateSublayers;
+
+  nsTArray<RefPtr<NativeLayerWayland>> mRemovedSublayers;
+
+  nsTArray<widget::WaylandBufferDMABUFHolder> mExternalBuffers;
+
+  mozilla::Atomic<bool, mozilla::Relaxed> mFrameInProcess{false};
+
+  uint32_t mLastFrameCallbackTime = 0;
+
+  bool mRootMutatedStackingOrder = false;
+  bool mRootAllLayersRendered = false;
+  bool mMainThreadUpdateQueued = false;
+  bool mIsFullscreen = false;
+  bool mMissingRootCommit = false;
+};
+
+class NativeLayerWayland : public NativeLayer {
+ public:
+  NativeLayerWayland* AsNativeLayerWayland() override { return this; }
+  virtual NativeLayerWaylandExternal* AsNativeLayerWaylandExternal() {
+    return nullptr;
+  }
+  virtual NativeLayerWaylandRender* AsNativeLayerWaylandRender() {
+    return nullptr;
+  }
+
+  gfx::IntSize GetSize() override;
+  void SetPosition(const gfx::IntPoint& aPosition) override;
+  gfx::IntPoint GetPosition() override;
+  void SetTransform(const gfx::Matrix4x4& aTransform) override;
+  gfx::Matrix4x4 GetTransform() override;
+  gfx::IntRect GetRect() override;
+  void SetSamplingFilter(gfx::SamplingFilter aSamplingFilter) override;
+
+  bool IsOpaque() override;
+  void SetClipRect(const Maybe<gfx::IntRect>& aClipRect) override;
+  Maybe<gfx::IntRect> ClipRect() override;
+  void SetRoundedClipRect(const Maybe<gfx::RoundedRect>& aClip) override;
+  Maybe<gfx::RoundedRect> RoundedClipRect() override;
+  gfx::IntRect CurrentSurfaceDisplayRect() override;
+  void SetSurfaceIsFlipped(bool aIsFlipped) override;
+  bool SurfaceIsFlipped() override;
+
+  void RenderLayer(double aScale);
+  GpuFence* GetGpuFence() override { return nullptr; }
+
+  RefPtr<widget::WaylandSurface> GetWaylandSurface() { return mSurface; }
+
+  bool IsMapped();
+  bool IsVisible();
+  bool Map(widget::WaylandSurfaceLock& aParentWaylandSurfaceLock);
+  void Unmap();
+
+  void UpdateOnMainThread();
+  void MainThreadMap();
+  void MainThreadUnmap();
+
+  void ForceCommit();
+
+  void PlaceAbove(NativeLayerWayland* aLowerLayer);
+  void SetCoordinatesScale(uint32_t aCoordinatesScale);
+#ifdef MOZ_LOGGING
+  nsAutoCString GetDebugTag() const;
+#endif
+
+  void SetFrameCallbackState(bool aState);
+
+  virtual void DiscardBackbuffersLocked(
+      const widget::WaylandSurfaceLock& aProofOfLock, bool aForce = false) = 0;
+  void DiscardBackbuffers() override;
+
+  NativeLayerWayland(NativeLayerRootWayland* aRootLayer,
+                     const gfx::IntSize& aSize, bool aIsOpaque);
+
+  constexpr static int sLayerClear = 0;
+  constexpr static int sLayerRemoved = 1;
+  constexpr static int sLayerAdded = 2;
+
+  void MarkClear() { mUsageCount = sLayerClear; }
+  void MarkRemoved() { mUsageCount = sLayerRemoved; }
+  void MarkAdded() { mUsageCount += sLayerAdded; }
+
+  bool IsRemoved() const { return mUsageCount == sLayerRemoved; }
+  bool IsNew() const { return mUsageCount == sLayerAdded; }
+
+  LayerState* State() { return &mState; }
+
+ protected:
+  void SetScalelocked(const widget::WaylandSurfaceLock& aProofOfLock,
+                      double aScale);
+  void UpdateLayerPlacementLocked(
+      const widget::WaylandSurfaceLock& aProofOfLock);
+  virtual bool CommitFrontBufferToScreenLocked(
+      const widget::WaylandSurfaceLock& aProofOfLock) = 0;
+  virtual bool IsFrontBufferChanged() = 0;
+
+ protected:
+  ~NativeLayerWayland();
+
+  RefPtr<NativeLayerRootWayland> mRootLayer;
+
+  RefPtr<widget::WaylandSurface> mSurface;
+
+  RefPtr<widget::WaylandBuffer> mFrontBuffer;
+
+  const bool mIsOpaque = false;
+
+  int mUsageCount = 0;
+
+  gfx::IntSize mSize;
+  gfx::IntPoint mPosition;
+  gfx::Matrix4x4 mTransform;
+  gfx::IntRect mDisplayRect;
+  Maybe<gfx::IntRect> mClipRect;
+  Maybe<gfx::RoundedRect> mRoundedClipRect;
+  gfx::SamplingFilter mSamplingFilter = gfx::SamplingFilter::POINT;
+  double mScale = 1.0f;
+  LayerState mState{};
+  bool mSurfaceIsFlipped = false;
+  bool mIsHDR = false;
+
+  enum class MainThreadUpdate {
+    None,
+    Map,
+    Unmap,
+  };
+
+  Atomic<MainThreadUpdate, mozilla::Relaxed> mNeedsMainThreadUpdate{
+      MainThreadUpdate::None};
+};
+
+class NativeLayerWaylandRender final : public NativeLayerWayland {
+ public:
+  NativeLayerWaylandRender* AsNativeLayerWaylandRender() override {
+    return this;
+  }
+
+  RefPtr<gfx::DrawTarget> NextSurfaceAsDrawTarget(
+      const gfx::IntRect& aDisplayRect, const gfx::IntRegion& aUpdateRegion,
+      gfx::BackendType aBackendType) override;
+  Maybe<GLuint> NextSurfaceAsFramebuffer(const gfx::IntRect& aDisplayRect,
+                                         const gfx::IntRegion& aUpdateRegion,
+                                         bool aNeedsDepth) override;
+  void NotifySurfaceReady() override;
+  void AttachExternalImage(wr::RenderTextureHost* aExternalImage) override;
+  bool IsFrontBufferChanged() override;
+
+  NativeLayerWaylandRender(NativeLayerRootWayland* aRootLayer,
+                           const gfx::IntSize& aSize, bool aIsOpaque,
+                           SurfacePoolHandleWayland* aSurfacePoolHandle);
+
+  void CopyFrontBufferToFrameBuffer(GLuint aFB);
+  gl::GLContext* gl();
+
+ private:
+  ~NativeLayerWaylandRender() override;
+
+  void DiscardBackbuffersLocked(const widget::WaylandSurfaceLock& aProofOfLock,
+                                bool aForce) override;
+  void ReadBackFrontBuffer(const widget::WaylandSurfaceLock& aProofOfLock);
+  bool CommitFrontBufferToScreenLocked(
+      const widget::WaylandSurfaceLock& aProofOfLock) override;
+
+  const RefPtr<SurfacePoolHandleWayland> mSurfacePoolHandle;
+  RefPtr<widget::WaylandBuffer> mInProgressBuffer;
+  gfx::IntRegion mDirtyRegion;
+};
+
+class NativeLayerWaylandExternal final : public NativeLayerWayland {
+ public:
+  NativeLayerWaylandExternal* AsNativeLayerWaylandExternal() override {
+    return this;
+  }
+  RefPtr<gfx::DrawTarget> NextSurfaceAsDrawTarget(
+      const gfx::IntRect& aDisplayRect, const gfx::IntRegion& aUpdateRegion,
+      gfx::BackendType aBackendType) override;
+  Maybe<GLuint> NextSurfaceAsFramebuffer(const gfx::IntRect& aDisplayRect,
+                                         const gfx::IntRegion& aUpdateRegion,
+                                         bool aNeedsDepth) override;
+  void NotifySurfaceReady() override {};
+  void AttachExternalImage(wr::RenderTextureHost* aExternalImage) override;
+  bool IsFrontBufferChanged() override;
+  RefPtr<DMABufSurface> GetSurface();
+
+  NativeLayerWaylandExternal(NativeLayerRootWayland* aRootLayer,
+                             bool aIsOpaque);
+
+ private:
+  ~NativeLayerWaylandExternal() override;
+
+  void DiscardBackbuffersLocked(const widget::WaylandSurfaceLock& aProofOfLock,
+                                bool aForce) override;
+  void FreeUnusedBackBuffers();
+  bool CommitFrontBufferToScreenLocked(
+      const widget::WaylandSurfaceLock& aProofOfLock) override;
+
+  RefPtr<wr::RenderDMABUFTextureHost> mTextureHost;
+};
+
+class NativeLayerRootSnapshotterWayland final
+    : public NativeLayerRootSnapshotter {
+ public:
+  static UniquePtr<NativeLayerRootSnapshotterWayland> Create(
+      NativeLayerRootWayland* aRootLayer, gl::GLContext* aGL);
+  virtual ~NativeLayerRootSnapshotterWayland();
+
+  bool ReadbackPixels(const gfx::IntSize& aReadbackSize,
+                      gfx::SurfaceFormat aReadbackFormat,
+                      const Range<uint8_t>& aReadbackBuffer) override;
+  already_AddRefed<frame_capture::RenderSource> GetWindowContents(
+      const gfx::IntSize& aWindowSize) override;
+  already_AddRefed<frame_capture::DownscaleTarget> CreateDownscaleTarget(
+      const gfx::IntSize& aSize) override;
+  already_AddRefed<frame_capture::AsyncReadbackBuffer>
+  CreateAsyncReadbackBuffer(const gfx::IntSize& aSize) override;
+
+#ifdef MOZ_LOGGING
+  nsAutoCString GetDebugTag() const;
+#endif
+
+ protected:
+  NativeLayerRootSnapshotterWayland(NativeLayerRootWayland* aRootLayer,
+                                    gl::GLContext* aGL);
+  void UpdateSnapshot(const gfx::IntSize& aSize);
+
+  RefPtr<NativeLayerRootWayland> mRootLayer;
+  RefPtr<NativeLayerWaylandRender> mLayerForSnapshot;
+  RefPtr<gl::GLContext> mGL;
+
+  RefPtr<RenderSourceNLRS> mSnapshot;
+};
+
+}  
+
+#endif  // mozilla_layers_NativeLayerWayland_h

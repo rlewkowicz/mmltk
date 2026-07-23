@@ -1,0 +1,65 @@
+/*
+ * Copyright 2019 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPathTypes_DEFINED)
+#define SkPathTypes_DEFINED
+
+#include "include/core/SkTypes.h"
+
+#include <cstdint>
+
+enum class SkPathFillType : uint8_t {
+    kWinding,
+    kEvenOdd,
+    kInverseWinding,
+    kInverseEvenOdd,
+
+    kDefault = kWinding,
+};
+
+static inline bool SkPathFillType_IsEvenOdd(SkPathFillType ft) {
+    return (static_cast<int>(ft) & 1) != 0;
+}
+
+static inline bool SkPathFillType_IsInverse(SkPathFillType ft) {
+    return (static_cast<int>(ft) & 2) != 0;
+}
+
+static inline SkPathFillType SkPathFillType_ToggleInverse(SkPathFillType ft) {
+    return static_cast<SkPathFillType>(static_cast<int>(ft) ^ 2);
+}
+
+static inline SkPathFillType SkPathFillType_ConvertToNonInverse(SkPathFillType ft) {
+    return static_cast<SkPathFillType>(static_cast<int>(ft) & 1);
+}
+
+enum class SkPathDirection : uint8_t {
+    kCW,
+    kCCW,
+
+    kDefault = kCW,
+};
+
+enum SkPathSegmentMask {
+    kLine_SkPathSegmentMask   = 1 << 0,
+    kQuad_SkPathSegmentMask   = 1 << 1,
+    kConic_SkPathSegmentMask  = 1 << 2,
+    kCubic_SkPathSegmentMask  = 1 << 3,
+};
+
+enum class SkPathVerb : uint8_t {
+    kMove,   
+    kLine,   
+    kQuad,   
+    kConic,  
+    kCubic,  
+    kClose,  
+
+    kLast_Verb = kClose,
+};
+
+#endif

@@ -1,0 +1,533 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Adapter.h"
+
+#include <algorithm>
+#include <bit>
+
+#include "Device.h"
+#include "Instance.h"
+#include "SupportedFeatures.h"
+#include "SupportedLimits.h"
+#include "ipc/WebGPUChild.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/WebGPUBinding.h"
+#include "mozilla/webgpu/ffi/wgpu.h"
+
+namespace mozilla::webgpu {
+
+GPU_IMPL_CYCLE_COLLECTION(AdapterInfo, mParent)
+GPU_IMPL_JS_WRAP(AdapterInfo)
+
+uint32_t AdapterInfo::SubgroupMinSize() const {
+
+  if (GetParentObject()->ShouldResistFingerprinting(
+          RFPTarget::WebGPUSubgroupSizes)) {
+    return 4;
+  }
+
+  return 4;
+}
+
+uint32_t AdapterInfo::SubgroupMaxSize() const {
+
+  if (GetParentObject()->ShouldResistFingerprinting(
+          RFPTarget::WebGPUSubgroupSizes)) {
+    return 128;
+  }
+
+  return 128;
+}
+
+bool AdapterInfo::IsFallbackAdapter() const {
+  if (GetParentObject()->ShouldResistFingerprinting(
+          RFPTarget::WebGPUIsFallbackAdapter)) {
+    return false;
+  }
+
+  return mAboutSupportInfo->device_type ==
+         ffi::WGPUDeviceType::WGPUDeviceType_Cpu;
+}
+
+void AdapterInfo::GetWgpuName(nsString& s) const {
+  s = mAboutSupportInfo->name;
+}
+
+uint32_t AdapterInfo::WgpuVendor() const { return mAboutSupportInfo->vendor; }
+
+uint32_t AdapterInfo::WgpuDevice() const { return mAboutSupportInfo->device; }
+
+void AdapterInfo::GetWgpuDeviceType(nsString& s) const {
+  switch (mAboutSupportInfo->device_type) {
+    case ffi::WGPUDeviceType_Cpu:
+      s.AssignLiteral("Cpu");
+      return;
+    case ffi::WGPUDeviceType_DiscreteGpu:
+      s.AssignLiteral("DiscreteGpu");
+      return;
+    case ffi::WGPUDeviceType_IntegratedGpu:
+      s.AssignLiteral("IntegratedGpu");
+      return;
+    case ffi::WGPUDeviceType_VirtualGpu:
+      s.AssignLiteral("VirtualGpu");
+      return;
+    case ffi::WGPUDeviceType_Other:
+      s.AssignLiteral("Other");
+      return;
+    case ffi::WGPUDeviceType_Sentinel:
+      break;
+  }
+  MOZ_CRASH("Bad `ffi::WGPUDeviceType`");
+}
+
+void AdapterInfo::GetWgpuDriver(nsString& s) const {
+  s = mAboutSupportInfo->driver;
+}
+
+void AdapterInfo::GetWgpuDriverInfo(nsString& s) const {
+  s = mAboutSupportInfo->driver_info;
+}
+
+void AdapterInfo::GetWgpuBackend(nsString& s) const {
+  switch (mAboutSupportInfo->backend) {
+    case ffi::WGPUBackend_Noop:
+      s.AssignLiteral("No-op");
+      return;
+    case ffi::WGPUBackend_Vulkan:
+      s.AssignLiteral("Vulkan");
+      return;
+    default:
+      break;
+  }
+  MOZ_CRASH("Bad `ffi::WGPUBackend`");
+}
+
+
+GPU_IMPL_CYCLE_COLLECTION(Adapter, mParent, mFeatures, mLimits, mInfo)
+GPU_IMPL_JS_WRAP(Adapter)
+
+enum class FeatureImplementationStatusTag {
+  Implemented,
+  NotImplemented,
+};
+
+struct FeatureImplementationStatus {
+  FeatureImplementationStatusTag tag =
+      FeatureImplementationStatusTag::NotImplemented;
+  union {
+    struct {
+      ffi::WGPUFeaturesWebGPU wgpuBit;
+    } implemented;
+    struct {
+      const char* bugzillaUrlAscii;
+    } unimplemented;
+  } value = {
+      .unimplemented = {
+          .bugzillaUrlAscii =
+              "https://bugzilla.mozilla.org/"
+              "enter_bug.cgi?product=Core&component=Graphics%3A+WebGPU"}};
+
+  static FeatureImplementationStatus fromDomFeature(
+      const dom::GPUFeatureName aFeature) {
+    auto implemented = [](const ffi::WGPUFeaturesWebGPU aBit) {
+      FeatureImplementationStatus feat;
+      feat.tag = FeatureImplementationStatusTag::Implemented;
+      feat.value.implemented.wgpuBit = aBit;
+      return feat;
+    };
+    auto unimplemented = [](const char* aBugzillaUrl) {
+      FeatureImplementationStatus feat;
+      feat.tag = FeatureImplementationStatusTag::NotImplemented;
+      feat.value.unimplemented.bugzillaUrlAscii = aBugzillaUrl;
+      return feat;
+    };
+    switch (aFeature) {
+      case dom::GPUFeatureName::Depth_clip_control:
+        return implemented(WGPUWEBGPU_FEATURE_DEPTH_CLIP_CONTROL);
+
+      case dom::GPUFeatureName::Depth32float_stencil8:
+        return implemented(WGPUWEBGPU_FEATURE_DEPTH32FLOAT_STENCIL8);
+
+      case dom::GPUFeatureName::Texture_compression_bc:
+        return implemented(WGPUWEBGPU_FEATURE_TEXTURE_COMPRESSION_BC);
+
+      case dom::GPUFeatureName::Texture_compression_bc_sliced_3d:
+        return implemented(WGPUWEBGPU_FEATURE_TEXTURE_COMPRESSION_BC_SLICED_3D);
+
+      case dom::GPUFeatureName::Texture_compression_etc2:
+        return implemented(WGPUWEBGPU_FEATURE_TEXTURE_COMPRESSION_ETC2);
+
+      case dom::GPUFeatureName::Texture_compression_astc:
+        return implemented(WGPUWEBGPU_FEATURE_TEXTURE_COMPRESSION_ASTC);
+
+      case dom::GPUFeatureName::Texture_compression_astc_sliced_3d:
+        return implemented(
+            WGPUWEBGPU_FEATURE_TEXTURE_COMPRESSION_ASTC_SLICED_3D);
+
+      case dom::GPUFeatureName::Timestamp_query:
+        return implemented(WGPUWEBGPU_FEATURE_TIMESTAMP_QUERY);
+
+      case dom::GPUFeatureName::Indirect_first_instance:
+        return implemented(WGPUWEBGPU_FEATURE_INDIRECT_FIRST_INSTANCE);
+
+      case dom::GPUFeatureName::Shader_f16:
+        return implemented(WGPUWEBGPU_FEATURE_SHADER_F16);
+
+      case dom::GPUFeatureName::Rg11b10ufloat_renderable:
+        return implemented(WGPUWEBGPU_FEATURE_RG11B10UFLOAT_RENDERABLE);
+
+      case dom::GPUFeatureName::Bgra8unorm_storage:
+        return implemented(WGPUWEBGPU_FEATURE_BGRA8UNORM_STORAGE);
+
+      case dom::GPUFeatureName::Float32_filterable:
+        return implemented(WGPUWEBGPU_FEATURE_FLOAT32_FILTERABLE);
+
+      case dom::GPUFeatureName::Float32_blendable:
+        return unimplemented(
+            "https://bugzilla.mozilla.org/show_bug.cgi?id=1931630");
+
+      case dom::GPUFeatureName::Clip_distances:
+        return unimplemented(
+            "https://bugzilla.mozilla.org/show_bug.cgi?id=1931629");
+
+      case dom::GPUFeatureName::Dual_source_blending:
+        return unimplemented(
+            "https://bugzilla.mozilla.org/show_bug.cgi?id=1924328");
+
+      case dom::GPUFeatureName::Subgroups:
+        return unimplemented(
+            "https://bugzilla.mozilla.org/show_bug.cgi?id=1955417");
+
+      case dom::GPUFeatureName::Primitive_index:
+        return unimplemented(
+            "https://bugzilla.mozilla.org/show_bug.cgi?id=1989116");
+
+      case dom::GPUFeatureName::Core_features_and_limits:
+        return implemented(0);
+    }
+    MOZ_CRASH("Bad GPUFeatureName.");
+  }
+};
+
+Adapter::Adapter(Instance* const aParent, WebGPUChild* const aChild,
+                 const std::shared_ptr<ffi::WGPUAdapterInformation>& aInfo)
+    : ObjectBase(aChild, aInfo->id, ffi::wgpu_client_drop_adapter),
+      ChildOf(aParent),
+      mFeatures(new SupportedFeatures(this)),
+      mLimits(new SupportedLimits(this, aInfo->limits)),
+      mInfo(new AdapterInfo(this, aInfo)),
+      mInfoInner(aInfo) {
+  ErrorResult ignoredRv;  
+
+  static const auto FEATURE_BY_BIT = []() {
+    auto ret =
+        std::unordered_map<ffi::WGPUFeaturesWebGPU, dom::GPUFeatureName>{};
+
+    for (const auto feature :
+         dom::MakeWebIDLEnumeratedRange<dom::GPUFeatureName>()) {
+      const auto status = FeatureImplementationStatus::fromDomFeature(feature);
+      switch (status.tag) {
+        case FeatureImplementationStatusTag::Implemented:
+          ret[status.value.implemented.wgpuBit] = feature;
+          break;
+        case FeatureImplementationStatusTag::NotImplemented:
+          break;
+      }
+    }
+
+    return ret;
+  }();
+
+  auto remainingFeatureBits = aInfo->features;
+  auto bitMask = decltype(remainingFeatureBits){0};
+  while (remainingFeatureBits) {
+    if (bitMask) {
+      bitMask <<= 1;
+    } else {
+      bitMask = 1;
+    }
+    const auto bit = remainingFeatureBits & bitMask;
+    remainingFeatureBits &= ~bitMask;  
+    if (!bit) {
+      continue;
+    }
+
+    const auto featureForBit = FEATURE_BY_BIT.find(bit);
+    if (featureForBit != FEATURE_BY_BIT.end()) {
+      mFeatures->Add(featureForBit->second, ignoredRv);
+    } else {
+    }
+  }
+  mFeatures->Add(dom::GPUFeatureName::Core_features_and_limits, ignoredRv);
+
+  if (GetParentObject()->ShouldResistFingerprinting(RFPTarget::WebGPULimits)) {
+    ffi::wgpu_client_fill_default_limits(mLimits->mFfi.get());
+  }
+}
+
+Adapter::~Adapter() = default;
+
+const RefPtr<SupportedFeatures>& Adapter::Features() const { return mFeatures; }
+const RefPtr<SupportedLimits>& Adapter::Limits() const { return mLimits; }
+const RefPtr<AdapterInfo>& Adapter::Info() const { return mInfo; }
+
+bool Adapter::SupportSharedTextureInSwapChain() const {
+  return mInfoInner->support_use_shared_texture_in_swap_chain;
+}
+
+static std::string_view ToJsKey(const Limit limit) {
+  switch (limit) {
+    case Limit::MaxTextureDimension1D:
+      return "maxTextureDimension1D";
+    case Limit::MaxTextureDimension2D:
+      return "maxTextureDimension2D";
+    case Limit::MaxTextureDimension3D:
+      return "maxTextureDimension3D";
+    case Limit::MaxTextureArrayLayers:
+      return "maxTextureArrayLayers";
+    case Limit::MaxBindGroups:
+      return "maxBindGroups";
+    case Limit::MaxBindGroupsPlusVertexBuffers:
+      return "maxBindGroupsPlusVertexBuffers";
+    case Limit::MaxBindingsPerBindGroup:
+      return "maxBindingsPerBindGroup";
+    case Limit::MaxDynamicUniformBuffersPerPipelineLayout:
+      return "maxDynamicUniformBuffersPerPipelineLayout";
+    case Limit::MaxDynamicStorageBuffersPerPipelineLayout:
+      return "maxDynamicStorageBuffersPerPipelineLayout";
+    case Limit::MaxSampledTexturesPerShaderStage:
+      return "maxSampledTexturesPerShaderStage";
+    case Limit::MaxSamplersPerShaderStage:
+      return "maxSamplersPerShaderStage";
+    case Limit::MaxStorageBuffersInVertexStage:
+      return "maxStorageBuffersInVertexStage";
+    case Limit::MaxStorageBuffersInFragmentStage:
+      return "maxStorageBuffersInFragmentStage";
+    case Limit::MaxStorageBuffersPerShaderStage:
+      return "maxStorageBuffersPerShaderStage";
+    case Limit::MaxStorageTexturesInVertexStage:
+      return "maxStorageTexturesInVertexStage";
+    case Limit::MaxStorageTexturesInFragmentStage:
+      return "maxStorageTexturesInFragmentStage";
+    case Limit::MaxStorageTexturesPerShaderStage:
+      return "maxStorageTexturesPerShaderStage";
+    case Limit::MaxUniformBuffersPerShaderStage:
+      return "maxUniformBuffersPerShaderStage";
+    case Limit::MaxUniformBufferBindingSize:
+      return "maxUniformBufferBindingSize";
+    case Limit::MaxStorageBufferBindingSize:
+      return "maxStorageBufferBindingSize";
+    case Limit::MinUniformBufferOffsetAlignment:
+      return "minUniformBufferOffsetAlignment";
+    case Limit::MinStorageBufferOffsetAlignment:
+      return "minStorageBufferOffsetAlignment";
+    case Limit::MaxVertexBuffers:
+      return "maxVertexBuffers";
+    case Limit::MaxBufferSize:
+      return "maxBufferSize";
+    case Limit::MaxVertexAttributes:
+      return "maxVertexAttributes";
+    case Limit::MaxVertexBufferArrayStride:
+      return "maxVertexBufferArrayStride";
+    case Limit::MaxInterStageShaderVariables:
+      return "maxInterStageShaderVariables";
+    case Limit::MaxColorAttachments:
+      return "maxColorAttachments";
+    case Limit::MaxColorAttachmentBytesPerSample:
+      return "maxColorAttachmentBytesPerSample";
+    case Limit::MaxComputeWorkgroupStorageSize:
+      return "maxComputeWorkgroupStorageSize";
+    case Limit::MaxComputeInvocationsPerWorkgroup:
+      return "maxComputeInvocationsPerWorkgroup";
+    case Limit::MaxComputeWorkgroupSizeX:
+      return "maxComputeWorkgroupSizeX";
+    case Limit::MaxComputeWorkgroupSizeY:
+      return "maxComputeWorkgroupSizeY";
+    case Limit::MaxComputeWorkgroupSizeZ:
+      return "maxComputeWorkgroupSizeZ";
+    case Limit::MaxComputeWorkgroupsPerDimension:
+      return "maxComputeWorkgroupsPerDimension";
+  }
+  MOZ_CRASH("Bad Limit");
+}
+
+uint64_t Adapter::MissingFeatures() const {
+  uint64_t missingFeatures = 0;
+
+  for (const auto feature :
+       dom::MakeWebIDLEnumeratedRange<dom::GPUFeatureName>()) {
+    const auto status = FeatureImplementationStatus::fromDomFeature(feature);
+    switch (status.tag) {
+      case FeatureImplementationStatusTag::Implemented:
+        missingFeatures |= status.value.implemented.wgpuBit;
+        break;
+      case FeatureImplementationStatusTag::NotImplemented:
+        break;
+    }
+  }
+
+  for (auto feature : mFeatures->Features()) {
+    const auto status = FeatureImplementationStatus::fromDomFeature(feature);
+    switch (status.tag) {
+      case FeatureImplementationStatusTag::Implemented:
+        missingFeatures &= ~status.value.implemented.wgpuBit;
+        break;
+      case FeatureImplementationStatusTag::NotImplemented:
+        break;
+    }
+  }
+
+  return missingFeatures;
+}
+
+
+static auto ToACString(const nsAString& s) { return NS_ConvertUTF16toUTF8(s); }
+
+
+already_AddRefed<dom::Promise> Adapter::RequestDevice(
+    const dom::GPUDeviceDescriptor& aDesc, ErrorResult& aRv) {
+  RefPtr<dom::Promise> promise = dom::Promise::Create(GetParentObject(), aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+  RefPtr<dom::Promise> lost_promise =
+      dom::Promise::Create(GetParentObject(), aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  ffi::WGPULimits deviceLimits = {};
+  ffi::wgpu_client_fill_default_limits(&deviceLimits);
+
+
+  [&]() {  
+
+    ffi::WGPUFeaturesWebGPU featureBits = 0;
+    for (const auto requested : aDesc.mRequiredFeatures) {
+      auto status = FeatureImplementationStatus::fromDomFeature(requested);
+      switch (status.tag) {
+        case FeatureImplementationStatusTag::Implemented:
+          featureBits |= status.value.implemented.wgpuBit;
+          break;
+        case FeatureImplementationStatusTag::NotImplemented: {
+          const auto featureStr = dom::GetEnumString(requested);
+          (void)featureStr;
+          nsPrintfCString msg(
+              "`GPUAdapter.requestDevice`: '%s' was requested in "
+              "`requiredFeatures`, but it is not supported by Firefox. "
+              "Follow <%s> for updates.",
+              featureStr.get(), status.value.unimplemented.bugzillaUrlAscii);
+          promise->MaybeRejectWithTypeError(msg);
+          return;
+        }
+      }
+
+      const bool supportedByAdapter = mFeatures->Features().count(requested);
+      if (!supportedByAdapter) {
+        const auto fstr = dom::GetEnumString(requested);
+        const auto astr = this->LabelOrId();
+        nsPrintfCString msg(
+            "`GPUAdapter.requestDevice`: '%s' was requested in "
+            "`requiredFeatures`, but it is not supported by adapter %s.",
+            fstr.get(), astr.get());
+        promise->MaybeRejectWithTypeError(msg);
+        return;
+      }
+    }
+
+
+    if (aDesc.mRequiredLimits.WasPassed()) {
+      static const auto LIMIT_BY_JS_KEY = []() {
+        std::unordered_map<std::string_view, Limit> ret;
+        for (const auto limit : MakeInclusiveEnumeratedRange(Limit::_LAST)) {
+          const auto jsKeyU8 = ToJsKey(limit);
+          ret[jsKeyU8] = limit;
+        }
+        return ret;
+      }();
+
+      for (const auto& entry : aDesc.mRequiredLimits.Value().Entries()) {
+        const auto& keyU16 = entry.mKey;
+        const nsCString keyU8 = ToACString(keyU16);
+        const auto itr = LIMIT_BY_JS_KEY.find(keyU8.get());
+        if (itr == LIMIT_BY_JS_KEY.end()) {
+          nsPrintfCString msg("requestDevice: Limit '%s' not recognized.",
+                              keyU8.get());
+          promise->MaybeRejectWithOperationError(msg);
+          return;
+        }
+
+        const auto& limit = itr->second;
+        uint64_t requestedValue = entry.mValue;
+        const auto supportedValue = GetLimit(*mLimits->mFfi, limit);
+        if (StringBeginsWith(keyU8, "max"_ns)) {
+          if (requestedValue > supportedValue) {
+            nsPrintfCString msg(
+                "requestDevice: Request for limit '%s' must be <= supported "
+                "%s, was %s.",
+                keyU8.get(), std::to_string(supportedValue).c_str(),
+                std::to_string(requestedValue).c_str());
+            promise->MaybeRejectWithOperationError(msg);
+            return;
+          }
+          requestedValue =
+              std::max(requestedValue, GetLimit(deviceLimits, limit));
+        } else {
+          MOZ_ASSERT(StringBeginsWith(keyU8, "min"_ns));
+          if (requestedValue < supportedValue) {
+            nsPrintfCString msg(
+                "requestDevice: Request for limit '%s' must be >= supported "
+                "%s, was %s.",
+                keyU8.get(), std::to_string(supportedValue).c_str(),
+                std::to_string(requestedValue).c_str());
+            promise->MaybeRejectWithOperationError(msg);
+            return;
+          }
+          if (StringEndsWith(keyU8, "Alignment"_ns)) {
+            if (!std::has_single_bit(requestedValue)) {
+              nsPrintfCString msg(
+                  "requestDevice: Request for limit '%s' must be a power of "
+                  "two, "
+                  "was %s.",
+                  keyU8.get(), std::to_string(requestedValue).c_str());
+              promise->MaybeRejectWithOperationError(msg);
+              return;
+            }
+          }
+          requestedValue =
+              std::min(requestedValue, GetLimit(deviceLimits, limit));
+        }
+
+        SetLimit(&deviceLimits, limit, requestedValue);
+      }
+    }
+
+
+    RefPtr<SupportedFeatures> features = new SupportedFeatures(this);
+    for (const auto& feature : aDesc.mRequiredFeatures) {
+      features->Add(feature, aRv);
+    }
+    features->Add(dom::GPUFeatureName::Core_features_and_limits, aRv);
+
+    RefPtr<SupportedLimits> limits = new SupportedLimits(this, deviceLimits);
+
+    ffi::WGPUFfiDeviceDescriptor ffiDesc = {};
+    ffiDesc.required_features = featureBits;
+    ffiDesc.required_limits = deviceLimits;
+
+    ffi::WGPUDeviceQueueId ids =
+        ffi::wgpu_client_request_device(GetClient(), GetId(), &ffiDesc);
+
+    GetChild()->EnqueueRequestDevicePromise(PendingRequestDevicePromise{
+        promise, ids.device, ids.queue, aDesc.mLabel, this, std::move(features),
+        std::move(limits), mInfo, std::move(lost_promise)});
+
+  }();
+
+  return promise.forget();
+}
+
+}  

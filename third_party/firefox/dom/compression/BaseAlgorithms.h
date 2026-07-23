@@ -1,0 +1,69 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_COMPRESSION_BASEALGORITHMS_H_
+#define DOM_COMPRESSION_BASEALGORITHMS_H_
+
+#include "js/TypeDecls.h"
+#include "mozilla/dom/TransformerCallbackHelpers.h"
+
+namespace mozilla::dom::compression {
+
+enum class Flush : bool { No, Yes };
+
+class CompressionStreamAlgorithms : public TransformerAlgorithmsWrapper {
+ public:
+  MOZ_CAN_RUN_SCRIPT
+  void TransformCallbackImpl(JS::Handle<JS::Value> aChunk,
+                             TransformStreamDefaultController& aController,
+                             ErrorResult& aRv) override;
+
+  MOZ_CAN_RUN_SCRIPT void FlushCallbackImpl(
+      TransformStreamDefaultController& aController, ErrorResult& aRv) override;
+
+ protected:
+  static const uint16_t kBufferSize = 16384;
+
+  ~CompressionStreamAlgorithms() = default;
+
+  virtual void Compress(JSContext* aCx, Span<const uint8_t> aInput,
+                        JS::MutableHandleVector<JSObject*> aOutput,
+                        Flush aFlush, ErrorResult& aRv) = 0;
+
+ private:
+  MOZ_CAN_RUN_SCRIPT void CompressAndEnqueue(
+      JSContext* aCx, Span<const uint8_t> aInput, Flush aFlush,
+      TransformStreamDefaultController& aController, ErrorResult& aRv);
+};
+
+class DecompressionStreamAlgorithms : public TransformerAlgorithmsWrapper {
+ public:
+  MOZ_CAN_RUN_SCRIPT
+  void TransformCallbackImpl(JS::Handle<JS::Value> aChunk,
+                             TransformStreamDefaultController& aController,
+                             ErrorResult& aRv) override;
+
+  MOZ_CAN_RUN_SCRIPT void FlushCallbackImpl(
+      TransformStreamDefaultController& aController, ErrorResult& aRv) override;
+
+ protected:
+  static const uint16_t kBufferSize = 16384;
+
+  ~DecompressionStreamAlgorithms() = default;
+
+  virtual bool Decompress(JSContext* aCx, Span<const uint8_t> aInput,
+                          JS::MutableHandleVector<JSObject*> aOutput,
+                          Flush aFlush, ErrorResult& aRv) = 0;
+
+  bool mObservedStreamEnd = false;
+
+ private:
+  MOZ_CAN_RUN_SCRIPT void DecompressAndEnqueue(
+      JSContext* aCx, Span<const uint8_t> aInput, Flush aFlush,
+      TransformStreamDefaultController& aController, ErrorResult& aRv);
+};
+
+}  
+
+#endif  // DOM_COMPRESSION_BASEALGORITHMS_H_

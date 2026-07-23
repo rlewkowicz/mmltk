@@ -1,0 +1,443 @@
+/*
+ * Copyright 2016 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "wasm/WasmBCFrame.h"
+
+#include "mozilla/Likely.h"
+#include "wasm/WasmBaselineCompile.h"  // For BaseLocalIter
+#include "wasm/WasmBCClass.h"
+
+#include "jit/MacroAssembler-inl.h"
+#include "wasm/WasmBCClass-inl.h"
+#include "wasm/WasmBCCodegen-inl.h"
+#include "wasm/WasmBCRegDefs-inl.h"
+#include "wasm/WasmBCRegMgmt-inl.h"
+#include "wasm/WasmBCStkMgmt-inl.h"
+
+namespace js {
+namespace wasm {
+
+using mozilla::Maybe;
+using mozilla::Some;
+
+
+BaseLocalIter::BaseLocalIter(const ValTypeVector& locals,
+                             const ArgTypeVector& args, bool debugEnabled)
+    : locals_(locals),
+      args_(args),
+      argsIter_(args_, ABIKind::Wasm),
+      index_(0),
+      frameSize_(0),
+      nextFrameSize_(debugEnabled ? DebugFrame::offsetOfFrame() : 0),
+      frameOffset_(INT32_MAX),
+      stackResultPointerOffset_(INT32_MAX),
+      mirType_(MIRType::Undefined),
+      done_(false) {
+  MOZ_ASSERT(args.lengthWithoutStackResults() <= locals.length());
+  settle();
+}
+
+int32_t BaseLocalIter::pushLocal(size_t nbytes) {
+  MOZ_ASSERT(nbytes % 4 == 0 && nbytes <= 16);
+  nextFrameSize_ = AlignBytes(frameSize_, nbytes) + nbytes;
+  return nextFrameSize_;  
+}
+
+void BaseLocalIter::settle() {
+  MOZ_ASSERT(!done_);
+  frameSize_ = nextFrameSize_;
+
+  if (!argsIter_.done()) {
+    mirType_ = argsIter_.mirType();
+    MIRType concreteType = mirType_;
+    switch (mirType_) {
+      case MIRType::StackResults:
+        MOZ_ASSERT(args_.isSyntheticStackResultPointerArg(index_));
+        concreteType = MIRType::Pointer;
+        [[fallthrough]];
+      case MIRType::Int32:
+      case MIRType::Int64:
+      case MIRType::Double:
+      case MIRType::Float32:
+      case MIRType::WasmAnyRef:
+#ifdef ENABLE_WASM_SIMD
+      case MIRType::Simd128:
+#endif
+        if (argsIter_->argInRegister()) {
+          frameOffset_ = pushLocal(MIRTypeToSize(concreteType));
+        } else {
+          frameOffset_ = -(argsIter_->offsetFromArgBase() + sizeof(Frame));
+        }
+        break;
+      default:
+        MOZ_CRASH("Argument type");
+    }
+    if (mirType_ == MIRType::StackResults) {
+      stackResultPointerOffset_ = frameOffset();
+      argsIter_++;
+      frameSize_ = nextFrameSize_;
+      MOZ_ASSERT(argsIter_.done());
+    } else {
+      return;
+    }
+  }
+
+  if (index_ < locals_.length()) {
+    switch (locals_[index_].kind()) {
+      case ValType::I32:
+      case ValType::I64:
+      case ValType::F32:
+      case ValType::F64:
+#ifdef ENABLE_WASM_SIMD
+      case ValType::V128:
+#endif
+      case ValType::Ref:
+        mirType_ = locals_[index_].toMIRType();
+        frameOffset_ = pushLocal(MIRTypeToSize(mirType_));
+        break;
+      default:
+        MOZ_CRASH("Compiler bug: Unexpected local type");
+    }
+    return;
+  }
+
+  done_ = true;
+}
+
+void BaseLocalIter::operator++(int) {
+  MOZ_ASSERT(!done_);
+  index_++;
+  if (!argsIter_.done()) {
+    argsIter_++;
+  }
+  settle();
+}
+
+
+bool BaseCompiler::createStackMap(const char* who) {
+  const ExitStubMapVector noExtras;
+  StackMap* stackMap;
+  return stackMapGenerator_.createStackMap(
+             who, noExtras, HasDebugFrameWithLiveRefs::No, stk_, &stackMap) &&
+         (!stackMap || stackMaps_->add(masm.currentOffset(), stackMap));
+}
+
+bool BaseCompiler::createStackMap(const char* who, CodeOffset assemblerOffset) {
+  const ExitStubMapVector noExtras;
+  StackMap* stackMap;
+  return stackMapGenerator_.createStackMap(
+             who, noExtras, HasDebugFrameWithLiveRefs::No, stk_, &stackMap) &&
+         (!stackMap || stackMaps_->add(assemblerOffset.offset(), stackMap));
+}
+
+bool BaseCompiler::createStackMap(
+    const char* who, HasDebugFrameWithLiveRefs debugFrameWithLiveRefs) {
+  const ExitStubMapVector noExtras;
+  StackMap* stackMap;
+  return stackMapGenerator_.createStackMap(
+             who, noExtras, debugFrameWithLiveRefs, stk_, &stackMap) &&
+         (!stackMap || stackMaps_->add(masm.currentOffset(), stackMap));
+}
+
+[[nodiscard]] bool BaseCompiler::createAbortingOutOfLineTrapStackMap(
+    StackMap** result) {
+  if (MOZ_LIKELY(!compilerEnv_.debugEnabled())) {
+    *result = nullptr;
+    return true;
+  }
+
+  ExitStubMapVector extras;
+  return stackMapGenerator_.createStackMap(
+      "OutOfLineTrap", extras, HasDebugFrameWithLiveRefs::Maybe, stk_, result);
+}
+
+bool MachineStackTracker::cloneTo(MachineStackTracker* dst) {
+  MOZ_ASSERT(dst->vec_.empty());
+  if (!dst->vec_.appendAll(vec_)) {
+    return false;
+  }
+  dst->numPtrs_ = numPtrs_;
+  return true;
+}
+
+bool StackMapGenerator::generateStackmapEntriesForTrapExit(
+    const ArgTypeVector& args, ExitStubMapVector* extras) {
+  return GenerateStackmapEntriesForTrapExit(args, trapExitLayout_,
+                                            trapExitLayoutNumWords_, extras);
+}
+
+bool StackMapGenerator::createStackMap(
+    const char* who, const ExitStubMapVector& extras,
+    HasDebugFrameWithLiveRefs debugFrameWithLiveRefs, const StkVector& stk,
+    wasm::StackMap** result) {
+  *result = nullptr;
+
+  size_t countedPointers = machineStackTracker.numPtrs() + memRefsOnStk;
+#ifndef DEBUG
+  if (countedPointers == 0 &&
+      debugFrameWithLiveRefs == HasDebugFrameWithLiveRefs::No) {
+    bool extrasHasRef = false;
+    for (bool b : extras) {
+      if (b) {
+        extrasHasRef = true;
+        break;
+      }
+    }
+    if (!extrasHasRef) {
+      return true;
+    }
+  }
+#else
+  for (bool b : extras) {
+    countedPointers += (b ? 1 : 0);
+  }
+#endif
+
+  augmentedMst.clear();
+  if (!machineStackTracker.cloneTo(&augmentedMst)) {
+    return false;
+  }
+
+  Maybe<uint32_t> framePushedExcludingArgs;
+  if (framePushedAtEntryToBody.isNothing()) {
+    MOZ_ASSERT(framePushedExcludingOutboundCallArgs.isNothing());
+  } else {
+    MOZ_ASSERT(masm_.framePushed() >= framePushedAtEntryToBody.value());
+    if (framePushedExcludingOutboundCallArgs.isSome()) {
+      MOZ_ASSERT(masm_.framePushed() >=
+                 framePushedExcludingOutboundCallArgs.value());
+      MOZ_ASSERT(framePushedExcludingOutboundCallArgs.value() >=
+                 framePushedAtEntryToBody.value());
+      framePushedExcludingArgs =
+          Some(framePushedExcludingOutboundCallArgs.value());
+    } else {
+      framePushedExcludingArgs = Some(masm_.framePushed());
+    }
+  }
+
+  if (framePushedExcludingArgs.isSome()) {
+    uint32_t bodyPushedBytes =
+        framePushedExcludingArgs.value() - framePushedAtEntryToBody.value();
+    MOZ_ASSERT(0 == bodyPushedBytes % sizeof(void*));
+    if (!augmentedMst.pushNonGCPointers(bodyPushedBytes / sizeof(void*))) {
+      return false;
+    }
+  }
+
+  MOZ_ASSERT_IF(framePushedAtEntryToBody.isNothing(), stk.empty());
+  MOZ_ASSERT_IF(framePushedExcludingArgs.isNothing(), stk.empty());
+
+  for (const Stk& v : stk) {
+#ifndef DEBUG
+    MOZ_RELEASE_ASSERT(v.kind() != Stk::RegisterRef);
+    if (v.kind() != Stk::MemRef) {
+      continue;
+    }
+#else
+    switch (v.kind()) {
+      case Stk::MemI32:
+      case Stk::MemI64:
+      case Stk::MemF32:
+      case Stk::MemF64:
+      case Stk::ConstI32:
+      case Stk::ConstI64:
+      case Stk::ConstF32:
+      case Stk::ConstF64:
+#  ifdef ENABLE_WASM_SIMD
+      case Stk::MemV128:
+      case Stk::ConstV128:
+#  endif
+        continue;
+      case Stk::LocalI32:
+      case Stk::LocalI64:
+      case Stk::LocalF32:
+      case Stk::LocalF64:
+#  ifdef ENABLE_WASM_SIMD
+      case Stk::LocalV128:
+#  endif
+        MOZ_ASSERT(v.offs() <= framePushedAtEntryToBody.value());
+        continue;
+      case Stk::RegisterI32:
+      case Stk::RegisterI64:
+      case Stk::RegisterF32:
+      case Stk::RegisterF64:
+#  ifdef ENABLE_WASM_SIMD
+      case Stk::RegisterV128:
+#  endif
+        MOZ_CRASH("createStackMap: operand stack has Register-non-Ref");
+      case Stk::MemRef:
+        break;
+      case Stk::LocalRef:
+        MOZ_ASSERT(v.offs() <= framePushedAtEntryToBody.value());
+        continue;
+      case Stk::ConstRef:
+        MOZ_ASSERT(v.refval() == 0);
+        continue;
+      case Stk::RegisterRef:
+        MOZ_CRASH("createStackMap: operand stack contains RegisterRef");
+      default:
+        MOZ_CRASH("createStackMap: unknown operand stack element");
+    }
+#endif
+    MOZ_ASSERT(v.offs() <= framePushedExcludingArgs.value());
+    uint32_t offsFromMapLowest = framePushedExcludingArgs.value() - v.offs();
+    MOZ_ASSERT(0 == offsFromMapLowest % sizeof(void*));
+    augmentedMst.setGCPointer(offsFromMapLowest / sizeof(void*));
+  }
+
+  MOZ_ASSERT(numStackArgBytes % sizeof(void*) == 0);
+  const size_t numStackArgWords = numStackArgBytes / sizeof(void*);
+  const size_t numStackArgPaddingBytes =
+      AlignStackArgAreaSize(numStackArgBytes) - numStackArgBytes;
+  const size_t numStackArgPaddingWords =
+      numStackArgPaddingBytes / sizeof(void*);
+
+  const uint32_t extraWords = extras.length();
+  const uint32_t augmentedMstWords = augmentedMst.length();
+  const uint32_t numMappedWords =
+      numStackArgPaddingWords + extraWords + augmentedMstWords;
+  StackMap* stackMap = stackMaps_->create(numMappedWords);
+  if (!stackMap) {
+    return false;
+  }
+
+  {
+    uint32_t i = 0;
+    for (bool b : extras) {
+      if (b) {
+        stackMap->set(i, StackMap::Kind::AnyRef);
+      }
+      i++;
+    }
+  }
+  {
+    MachineStackTracker::Iter iter(augmentedMst);
+    while (true) {
+      size_t i = iter.get();
+      if (i == MachineStackTracker::Iter::FINISHED) {
+        break;
+      }
+      stackMap->set(extraWords + i, StackMap::Kind::AnyRef);
+    }
+  }
+
+  stackMap->setExitStubWords(extraWords);
+
+  stackMap->setFrameOffsetFromTop(numStackArgPaddingWords + numStackArgWords +
+                                  sizeof(Frame) / sizeof(void*));
+#ifdef DEBUG
+  for (uint32_t i = 0; i < sizeof(Frame) / sizeof(void*); i++) {
+    MOZ_ASSERT(stackMap->get(stackMap->header.numMappedWords -
+                             stackMap->header.frameOffsetFromTop + i) ==
+               StackMap::Kind::POD);
+  }
+#endif
+
+  if (debugFrameWithLiveRefs != HasDebugFrameWithLiveRefs::No) {
+    stackMap->setHasDebugFrameWithLiveRefs();
+  }
+
+#ifdef DEBUG
+  {
+    uint32_t nw = stackMap->header.numMappedWords;
+    uint32_t np = 0;
+    for (uint32_t i = 0; i < nw; i++) {
+      if (stackMap->get(i) == StackMap::Kind::AnyRef) {
+        np += 1;
+      }
+    }
+    MOZ_ASSERT(size_t(np) == countedPointers);
+  }
+#endif
+
+  *result = stackMaps_->finalize(stackMap);
+  return true;
+}
+
+
+void BaseStackFrame::zeroLocals(BaseRegAlloc* ra) {
+  MOZ_ASSERT(varLow_ != UINT32_MAX);
+
+  if (varLow_ == varHigh_) {
+    return;
+  }
+
+  static const uint32_t wordSize = sizeof(void*);
+
+
+
+  uint32_t low = varLow_;
+  if (low % wordSize) {
+    masm.store32(Imm32(0), Address(sp_, localOffset(low + 4)));
+    low += 4;
+  }
+  MOZ_ASSERT(low % wordSize == 0);
+
+  const uint32_t high = AlignBytes(varHigh_, wordSize);
+
+
+  const uint32_t UNROLL_LIMIT = 16;
+  const uint32_t initWords = (high - low) / wordSize;
+  const uint32_t tailWords = initWords % UNROLL_LIMIT;
+  const uint32_t loopHigh = high - (tailWords * wordSize);
+
+
+  if (initWords == 1) {
+    masm.storePtr(ImmWord(0), Address(sp_, localOffset(low + wordSize)));
+    return;
+  }
+
+
+  RegI32 zero = ra->needI32();
+  masm.mov(ImmWord(0), zero);
+
+
+
+  if (initWords < 2 * UNROLL_LIMIT) {
+    for (uint32_t i = low; i < high; i += wordSize) {
+      masm.storePtr(zero, Address(sp_, localOffset(i + wordSize)));
+    }
+    ra->freeI32(zero);
+    return;
+  }
+
+
+  RegI32 p = ra->needI32();
+  masm.computeEffectiveAddress(Address(sp_, localOffset(low + wordSize)), p);
+
+  RegI32 lim = ra->needI32();
+  masm.computeEffectiveAddress(Address(sp_, localOffset(loopHigh + wordSize)),
+                               lim);
+
+  Label again;
+  masm.bind(&again);
+  for (uint32_t i = 0; i < UNROLL_LIMIT; ++i) {
+    masm.storePtr(zero, Address(p, -(wordSize * i)));
+  }
+  masm.subPtr(Imm32(UNROLL_LIMIT * wordSize), p);
+  masm.branchPtr(Assembler::LessThan, lim, p, &again);
+
+  for (uint32_t i = 0; i < tailWords; ++i) {
+    masm.storePtr(zero, Address(p, -(wordSize * i)));
+  }
+
+  ra->freeI32(p);
+  ra->freeI32(lim);
+  ra->freeI32(zero);
+}
+
+}  
+}  

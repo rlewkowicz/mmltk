@@ -1,0 +1,149 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_Tenuring_h
+#define gc_Tenuring_h
+
+#include "mozilla/HashTable.h"
+#include "mozilla/Maybe.h"
+
+#include "gc/AllocKind.h"
+#include "js/GCAPI.h"
+#include "js/TracingAPI.h"
+#include "js/UniquePtr.h"
+#include "util/Text.h"
+
+namespace js {
+
+class NativeObject;
+class Nursery;
+class PlainObject;
+
+namespace wasm {
+class AnyRef;
+}  
+
+namespace gc {
+
+class AllocSite;
+class ArenaCellSet;
+class RelocationOverlay;
+class StringRelocationOverlay;
+#ifdef JS_GC_ZEAL
+class PromotionStats;
+#endif
+
+template <typename Key>
+struct DeduplicationStringHasher {
+  using Lookup = Key;
+  static inline HashNumber hash(const Lookup& lookup);
+  static MOZ_ALWAYS_INLINE bool match(const Key& key, const Lookup& lookup);
+};
+
+class TenuringTracer final : public JSTracer {
+  Nursery& nursery_;
+
+  size_t promotedSize = 0;
+  size_t promotedCells = 0;
+
+  gc::RelocationOverlay* objHead = nullptr;
+  gc::StringRelocationOverlay* stringHead = nullptr;
+
+  using StringDeDupSet =
+      HashSet<JSString*, DeduplicationStringHasher<JSString*>,
+              SystemAllocPolicy>;
+
+  mozilla::Maybe<StringDeDupSet> stringDeDupSet;
+
+  mozilla::Maybe<bool> sourceIsInNursery;
+  friend class BufferAllocator;
+
+  bool tenureEverything;
+
+  bool promotedToNursery = false;
+
+#ifdef JS_GC_ZEAL
+  UniquePtr<PromotionStats> promotionStats;
+#endif
+
+ public:
+  static TenuringTracer* From(JSTracer* trc);
+
+  TenuringTracer(JSRuntime* rt, Nursery* nursery, bool tenureEverything);
+  ~TenuringTracer();
+
+  Nursery& nursery() { return nursery_; }
+
+#ifdef JS_GC_ZEAL
+  void initPromotionReport();
+  void printPromotionReport(JSContext* cx, JS::GCReason reason,
+                            const JS::AutoRequireNoGC& nogc) const;
+#endif
+
+  void collectToObjectFixedPoint();
+
+  void collectToStringFixedPoint();
+
+  size_t getPromotedSize() const;
+  size_t getPromotedCells() const;
+
+  void traverse(JS::Value* thingp);
+  void traverse(wasm::AnyRef* thingp);
+
+  void traceObject(JSObject* obj);
+  void traceObjectSlots(NativeObject* nobj, uint32_t start, uint32_t end);
+  void traceObjectElements(JS::Value* vp, uint32_t count);
+  void traceString(JSString* str);
+
+  JSObject* promoteOrForward(JSObject* obj);
+  JSString* promoteOrForward(JSString* str);
+  JS::BigInt* promoteOrForward(JS::BigInt* bip);
+  GetterSetter* promoteOrForward(GetterSetter* gs);
+
+  template <typename T>
+  void traceBufferedCells(Arena* arena, ArenaCellSet* cells);
+
+  class AutoPromotedAnyToNursery;
+  class AutoSetSourceHeap;
+
+ private:
+#define DEFINE_ON_EDGE_METHOD(name, type, _1, _2) \
+  bool on##name##Edge(type** thingp, const char* name) override;
+  JS_FOR_EACH_TRACEKIND(DEFINE_ON_EDGE_METHOD)
+#undef DEFINE_ON_EDGE_METHOD
+
+  inline void insertIntoObjectFixupList(gc::RelocationOverlay* entry);
+  inline void insertIntoStringFixupList(gc::StringRelocationOverlay* entry);
+
+  template <typename T>
+  T* alloc(JS::Zone* zone, gc::AllocKind kind, gc::Cell* src);
+  template <JS::TraceKind traceKind>
+  void* allocCell(JS::Zone* zone, gc::AllocKind allocKind, gc::AllocSite* site,
+                  gc::Cell* src);
+  JSString* allocString(JSString* src, JS::Zone* zone, gc::AllocKind dstKind);
+
+  bool shouldTenure(Zone* zone, JS::TraceKind traceKind, Cell* cell);
+
+  MOZ_ALWAYS_INLINE JSObject* promoteObject(JSObject* obj);
+  inline JSObject* promotePlainObject(PlainObject* src);
+  JSObject* promoteObjectSlow(JSObject* src);
+  JSString* promoteString(JSString* src);
+  JS::BigInt* promoteBigInt(JS::BigInt* src);
+  GetterSetter* promoteGetterSetter(GetterSetter* src);
+
+  size_t moveElements(NativeObject* dst, NativeObject* src,
+                      gc::AllocKind dstKind);
+  size_t moveSlots(NativeObject* dst, NativeObject* src);
+  size_t moveString(JSString* dst, JSString* src, gc::AllocKind dstKind);
+  size_t moveBigInt(JS::BigInt* dst, JS::BigInt* src, gc::AllocKind dstKind);
+  size_t moveGetterSetter(GetterSetter* dst, GetterSetter* src,
+                          gc::AllocKind dstKind);
+
+  void traceSlots(JS::Value* vp, JS::Value* end);
+};
+
+}  
+}  
+
+#endif  // gc_Tenuring_h

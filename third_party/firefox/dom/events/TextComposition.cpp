@@ -1,0 +1,912 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "TextComposition.h"
+
+#include "ContentEventHandler.h"
+#include "IMEContentObserver.h"
+#include "IMEStateManager.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/EditorBase.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/IMEStateManager.h"
+#include "mozilla/IntegerRange.h"
+#include "mozilla/MiscEvents.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/RangeBoundary.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_intl.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/dom/BrowserParent.h"
+#include "mozilla/dom/EditContext.h"
+#include "nsContentUtils.h"
+#include "nsIContent.h"
+#include "nsIMutationObserver.h"
+#include "nsPresContext.h"
+
+
+
+using namespace mozilla::widget;
+
+namespace mozilla {
+
+#define IDEOGRAPHIC_SPACE (u"\x3000"_ns)
+
+static uint32_t GetOrCreateCompositionId(WidgetCompositionEvent* aEvent) {
+  if (XRE_IsParentProcess()) {
+    static uint32_t sNextCompositionId = 1u;
+    if (MOZ_UNLIKELY(sNextCompositionId == UINT32_MAX)) {
+      sNextCompositionId = 1u;
+    }
+    return sNextCompositionId++;
+  }
+  return aEvent->mCompositionId;
+}
+
+
+bool TextComposition::sHandlingSelectionEvent = false;
+
+TextComposition::TextComposition(nsPresContext* aPresContext, nsINode* aNode,
+                                 BrowserParent* aBrowserParent,
+                                 WidgetCompositionEvent* aCompositionEvent)
+    : mPresContext(aPresContext),
+      mNode(aNode),
+      mBrowserParent(aBrowserParent),
+      mNativeContext(aCompositionEvent->mNativeIMEContext),
+      mCompositionId(GetOrCreateCompositionId(aCompositionEvent)),
+      mCompositionStartOffset(0),
+      mTargetClauseOffsetInComposition(0),
+      mCompositionStartOffsetInTextNode(UINT32_MAX),
+      mCompositionLengthInTextNode(UINT32_MAX),
+      mIsSynthesizedForTests(aCompositionEvent->mFlags.mIsSynthesizedForTests),
+      mIsComposing(false),
+      mIsRequestingCommit(false),
+      mIsRequestingCancel(false),
+      mRequestedToCommitOrCancel(false),
+      mHasDispatchedDOMTextEvent(false),
+      mHasReceivedCommitEvent(false),
+      mWasNativeCompositionEndEventDiscarded(false),
+      mAllowControlCharacters(
+          StaticPrefs::dom_compositionevent_allow_control_characters()),
+      mWasCompositionStringEmpty(true) {
+  MOZ_ASSERT(aCompositionEvent->mNativeIMEContext.IsValid());
+}
+
+void TextComposition::Destroy() {
+  mPresContext = nullptr;
+  mNode = nullptr;
+  mBrowserParent = nullptr;
+  mContainerTextNode = nullptr;
+  mCompositionStartOffsetInTextNode = UINT32_MAX;
+  mCompositionLengthInTextNode = UINT32_MAX;
+}
+
+void TextComposition::OnCharacterDataChanged(
+    Text& aText, const CharacterDataChangeInfo& aInfo) {
+  if (mContainerTextNode != &aText ||
+      mCompositionStartOffsetInTextNode == UINT32_MAX ||
+      mCompositionLengthInTextNode == UINT32_MAX) {
+    return;
+  }
+
+  if (aInfo.mChangeStart >=
+      mCompositionStartOffsetInTextNode + mCompositionLengthInTextNode) {
+    return;
+  }
+
+  if (aInfo.mChangeEnd <= mCompositionStartOffsetInTextNode) {
+    MOZ_ASSERT(aInfo.LengthOfRemovedText() <=
+               mCompositionStartOffsetInTextNode);
+    mCompositionStartOffsetInTextNode -= aInfo.LengthOfRemovedText();
+    mCompositionStartOffsetInTextNode += aInfo.mReplaceLength;
+    return;
+  }
+
+  if (aInfo.mDetails &&
+      aInfo.mDetails->mType == CharacterDataChangeInfo::Details::eSplit) {
+    return;
+  }
+
+  if (aInfo.mChangeEnd >=
+      mCompositionStartOffsetInTextNode + mCompositionLengthInTextNode) {
+    if (aInfo.mChangeStart <= mCompositionStartOffsetInTextNode) {
+      mCompositionStartOffsetInTextNode = aInfo.mChangeStart;
+      mCompositionLengthInTextNode = 0u;
+      return;
+    }
+    MOZ_ASSERT(aInfo.mChangeStart > mCompositionStartOffsetInTextNode);
+    mCompositionLengthInTextNode =
+        aInfo.mChangeStart - mCompositionStartOffsetInTextNode;
+    return;
+  }
+
+  if (aInfo.mChangeStart >= mCompositionStartOffsetInTextNode) {
+    if (!mCompositionLengthInTextNode) {
+      return;
+    }
+    MOZ_ASSERT(aInfo.LengthOfRemovedText() <= mCompositionLengthInTextNode);
+    mCompositionLengthInTextNode -= aInfo.LengthOfRemovedText();
+    mCompositionLengthInTextNode += aInfo.mReplaceLength;
+    return;
+  }
+
+  const uint32_t removedLengthInCompositionString =
+      aInfo.mChangeEnd - mCompositionStartOffsetInTextNode;
+  mCompositionStartOffsetInTextNode = aInfo.mChangeStart;
+  if (!mCompositionLengthInTextNode) {
+    return;
+  }
+  mCompositionLengthInTextNode -= removedLengthInCompositionString;
+  mCompositionLengthInTextNode += aInfo.mReplaceLength;
+}
+
+bool TextComposition::IsValidStateForComposition(nsIWidget* aWidget) const {
+  return !Destroyed() && aWidget && !aWidget->Destroyed() &&
+         mPresContext->GetPresShell() &&
+         !mPresContext->PresShell()->IsDestroying();
+}
+
+bool TextComposition::MaybeDispatchCompositionUpdate(
+    const WidgetCompositionEvent* aCompositionEvent) {
+  MOZ_RELEASE_ASSERT(!mBrowserParent);
+
+  if (!IsValidStateForComposition(aCompositionEvent->mWidget)) {
+    return false;
+  }
+
+  if (mLastData == aCompositionEvent->mData) {
+    mLastRanges = aCompositionEvent->mRanges;
+    return true;
+  }
+  CloneAndDispatchAs(aCompositionEvent, eCompositionUpdate);
+  return IsValidStateForComposition(aCompositionEvent->mWidget);
+}
+
+BaseEventFlags TextComposition::CloneAndDispatchAs(
+    const WidgetCompositionEvent* aCompositionEvent, EventMessage aMessage,
+    nsEventStatus* aStatus, EventDispatchingCallback* aCallBack) {
+  MOZ_RELEASE_ASSERT(!mBrowserParent);
+
+  MOZ_ASSERT(IsValidStateForComposition(aCompositionEvent->mWidget),
+             "Should be called only when it's safe to dispatch an event");
+
+  WidgetCompositionEvent compositionEvent(aCompositionEvent->IsTrusted(),
+                                          aMessage, aCompositionEvent->mWidget);
+  compositionEvent.mTimeStamp = aCompositionEvent->mTimeStamp;
+  compositionEvent.mData = aCompositionEvent->mData;
+  compositionEvent.mNativeIMEContext = aCompositionEvent->mNativeIMEContext;
+  compositionEvent.mOriginalMessage = aCompositionEvent->mMessage;
+  compositionEvent.mFlags.mIsSynthesizedForTests =
+      aCompositionEvent->mFlags.mIsSynthesizedForTests;
+
+  nsEventStatus dummyStatus = nsEventStatus_eConsumeNoDefault;
+  nsEventStatus* status = aStatus ? aStatus : &dummyStatus;
+  if (aMessage == eCompositionUpdate) {
+    mLastData = compositionEvent.mData;
+    mLastRanges = aCompositionEvent->mRanges;
+  }
+
+  DispatchEvent(&compositionEvent, status, aCallBack, aCompositionEvent);
+  return compositionEvent.mFlags;
+}
+
+void TextComposition::DispatchEvent(
+    WidgetCompositionEvent* aDispatchEvent, nsEventStatus* aStatus,
+    EventDispatchingCallback* aCallBack,
+    const WidgetCompositionEvent* aOriginalEvent) {
+  if (aDispatchEvent->mMessage == eCompositionChange) {
+    aDispatchEvent->mFlags.mOnlySystemGroupDispatchInContent = true;
+  }
+  RefPtr<nsINode> node = mNode;
+  RefPtr<nsPresContext> presContext = mPresContext;
+  if (auto* element = nsGenericHTMLElement::FromNode(node)) {
+    if (RefPtr<dom::EditContext> editContext = element->GetEditContext()) {
+      if (aDispatchEvent->mMessage == eCompositionStart) {
+        editContext->StartComposition(*aDispatchEvent);
+      } else if (aDispatchEvent->mMessage == eCompositionEnd) {
+        editContext->EndComposition(*aDispatchEvent);
+      }
+      aDispatchEvent->mFlags.mOnlySystemGroupDispatch = true;
+    }
+  }
+  EventDispatcher::Dispatch(node, presContext, aDispatchEvent, nullptr, aStatus,
+                            aCallBack);
+
+  OnCompositionEventDispatched(aDispatchEvent);
+}
+
+void TextComposition::OnCompositionEventDiscarded(
+    WidgetCompositionEvent* aCompositionEvent) {
+
+  MOZ_ASSERT(aCompositionEvent->IsTrusted(),
+             "Shouldn't be called with untrusted event");
+
+  if (mBrowserParent) {
+    (void)mBrowserParent->SendCompositionEvent(*aCompositionEvent,
+                                               mCompositionId);
+  }
+
+  if (!aCompositionEvent->CausesDOMCompositionEndEvent()) {
+    return;
+  }
+
+  mWasNativeCompositionEndEventDiscarded = true;
+}
+
+static inline bool IsControlChar(uint32_t aCharCode) {
+  return aCharCode < ' ' || aCharCode == 0x7F;
+}
+
+static size_t FindFirstControlCharacter(const nsAString& aStr) {
+  const char16_t* sourceBegin = aStr.BeginReading();
+  const char16_t* sourceEnd = aStr.EndReading();
+
+  for (const char16_t* source = sourceBegin; source < sourceEnd; ++source) {
+    if (*source != '\t' && IsControlChar(*source)) {
+      return source - sourceBegin;
+    }
+  }
+
+  return -1;
+}
+
+static void RemoveControlCharactersFrom(nsAString& aStr,
+                                        TextRangeArray* aRanges) {
+  size_t firstControlCharOffset = FindFirstControlCharacter(aStr);
+  if (firstControlCharOffset == (size_t)-1) {
+    return;
+  }
+
+  nsAutoString copy(aStr);
+  const char16_t* sourceBegin = copy.BeginReading();
+  const char16_t* sourceEnd = copy.EndReading();
+
+  char16_t* dest = aStr.BeginWriting();
+  if (NS_WARN_IF(!dest)) {
+    return;
+  }
+
+  char16_t* curDest = dest + firstControlCharOffset;
+  size_t i = firstControlCharOffset;
+  for (const char16_t* source = sourceBegin + firstControlCharOffset;
+       source < sourceEnd; ++source) {
+    if (*source == '\t' || *source == '\n' || !IsControlChar(*source)) {
+      *curDest = *source;
+      ++curDest;
+      ++i;
+    } else if (aRanges) {
+      aRanges->RemoveCharacter(i);
+    }
+  }
+
+  aStr.SetLength(curDest - dest);
+}
+
+nsString TextComposition::CommitStringIfCommittedAsIs() const {
+  nsString result(mLastData);
+  if (!mAllowControlCharacters) {
+    RemoveControlCharactersFrom(result, nullptr);
+  }
+  if (StaticPrefs::intl_ime_remove_placeholder_character_at_commit() &&
+      mLastData == IDEOGRAPHIC_SPACE) {
+    return EmptyString();
+  }
+  return result;
+}
+
+void TextComposition::DispatchCompositionEvent(
+    WidgetCompositionEvent* aCompositionEvent, nsEventStatus* aStatus,
+    EventDispatchingCallback* aCallBack, bool aIsSynthesized) {
+  mWasCompositionStringEmpty = mString.IsEmpty();
+
+  if (aCompositionEvent->IsFollowedByCompositionEnd()) {
+    mHasReceivedCommitEvent = true;
+  }
+
+  if (mRequestedToCommitOrCancel && !aIsSynthesized) {
+    *aStatus = nsEventStatus_eConsumeNoDefault;
+    return;
+  }
+
+  if (mBrowserParent) {
+    (void)mBrowserParent->SendCompositionEvent(*aCompositionEvent,
+                                               mCompositionId);
+    aCompositionEvent->StopPropagation();
+    if (aCompositionEvent->CausesDOMTextEvent()) {
+      mLastData = aCompositionEvent->mData;
+      mLastRanges = aCompositionEvent->mRanges;
+      EditorWillHandleCompositionChangeEvent(aCompositionEvent);
+      EditorDidHandleCompositionChangeEvent();
+    }
+    return;
+  }
+
+  if (!mAllowControlCharacters) {
+    RemoveControlCharactersFrom(aCompositionEvent->mData,
+                                aCompositionEvent->mRanges);
+  }
+  if (aCompositionEvent->mMessage == eCompositionCommitAsIs) {
+    NS_ASSERTION(!aCompositionEvent->mRanges,
+                 "mRanges of eCompositionCommitAsIs should be null");
+    aCompositionEvent->mRanges = nullptr;
+    NS_ASSERTION(aCompositionEvent->mData.IsEmpty(),
+                 "mData of eCompositionCommitAsIs should be empty string");
+    if (StaticPrefs::intl_ime_remove_placeholder_character_at_commit() &&
+        mLastData == IDEOGRAPHIC_SPACE) {
+      aCompositionEvent->mData.Truncate();
+    } else {
+      aCompositionEvent->mData = mLastData;
+    }
+  } else if (aCompositionEvent->mMessage == eCompositionCommit) {
+    NS_ASSERTION(!aCompositionEvent->mRanges,
+                 "mRanges of eCompositionCommit should be null");
+    aCompositionEvent->mRanges = nullptr;
+  }
+
+  if (!IsValidStateForComposition(aCompositionEvent->mWidget)) {
+    *aStatus = nsEventStatus_eConsumeNoDefault;
+    return;
+  }
+
+  if (!aIsSynthesized && (mIsRequestingCommit || mIsRequestingCancel)) {
+    nsString* committingData = nullptr;
+    switch (aCompositionEvent->mMessage) {
+      case eCompositionEnd:
+      case eCompositionChange:
+      case eCompositionCommitAsIs:
+      case eCompositionCommit:
+        committingData = &aCompositionEvent->mData;
+        break;
+      default:
+        NS_WARNING(
+            "Unexpected event comes during committing or "
+            "canceling composition");
+        break;
+    }
+    if (committingData) {
+      if (mIsRequestingCommit && committingData->IsEmpty() &&
+          mLastData != IDEOGRAPHIC_SPACE) {
+        committingData->Assign(mLastData);
+      } else if (mIsRequestingCancel && !committingData->IsEmpty()) {
+        committingData->Truncate();
+      }
+    }
+  }
+
+  bool dispatchEvent = true;
+  bool dispatchDOMTextEvent = aCompositionEvent->CausesDOMTextEvent();
+
+  if (dispatchDOMTextEvent &&
+      aCompositionEvent->mMessage != eCompositionChange && !mIsComposing &&
+      mHasDispatchedDOMTextEvent && mLastData == aCompositionEvent->mData) {
+    dispatchEvent = dispatchDOMTextEvent = false;
+  }
+
+  if (dispatchDOMTextEvent &&
+      aCompositionEvent->mMessage == eCompositionChange &&
+      mLastData == aCompositionEvent->mData && mRanges &&
+      aCompositionEvent->mRanges &&
+      mRanges->Equals(*aCompositionEvent->mRanges)) {
+    dispatchEvent = dispatchDOMTextEvent = false;
+  }
+
+  if (dispatchDOMTextEvent) {
+    if (!MaybeDispatchCompositionUpdate(aCompositionEvent)) {
+      return;
+    }
+  }
+
+  if (dispatchEvent) {
+    if (dispatchDOMTextEvent &&
+        aCompositionEvent->mMessage != eCompositionChange) {
+      mHasDispatchedDOMTextEvent = true;
+      aCompositionEvent->mFlags = CloneAndDispatchAs(
+          aCompositionEvent, eCompositionChange, aStatus, aCallBack);
+    } else {
+      if (aCompositionEvent->mMessage == eCompositionChange) {
+        mHasDispatchedDOMTextEvent = true;
+      }
+      DispatchEvent(aCompositionEvent, aStatus, aCallBack);
+    }
+  } else {
+    *aStatus = nsEventStatus_eConsumeNoDefault;
+  }
+
+  if (!IsValidStateForComposition(aCompositionEvent->mWidget)) {
+    return;
+  }
+
+  if (dispatchDOMTextEvent && !HasEditor()) {
+    EditorWillHandleCompositionChangeEvent(aCompositionEvent);
+    EditorDidHandleCompositionChangeEvent();
+  }
+
+  if (aCompositionEvent->CausesDOMCompositionEndEvent()) {
+    if (aCompositionEvent->mMessage != eCompositionEnd) {
+      CloneAndDispatchAs(aCompositionEvent, eCompositionEnd);
+    }
+    MOZ_ASSERT(!mIsComposing, "Why is the editor still composing?");
+    MOZ_ASSERT(!HasEditor(), "Why does the editor still keep to hold this?");
+  }
+
+  MaybeNotifyIMEOfCompositionEventHandled(aCompositionEvent);
+}
+
+void TextComposition::HandleSelectionEvent(
+    nsPresContext* aPresContext, BrowserParent* aBrowserParent,
+    WidgetSelectionEvent* aSelectionEvent) {
+  if (aBrowserParent) {
+    (void)aBrowserParent->SendSelectionEvent(*aSelectionEvent);
+    aSelectionEvent->StopPropagation();
+    return;
+  }
+
+  AutoRestore<bool> saveHandlingSelectionEvent(sHandlingSelectionEvent);
+  sHandlingSelectionEvent = true;
+
+  if (RefPtr<IMEContentObserver> contentObserver =
+          IMEStateManager::GetActiveContentObserver()) {
+    contentObserver->MaybeHandleSelectionEvent(aPresContext, aSelectionEvent);
+    return;
+  }
+
+  ContentEventHandler handler(aPresContext);
+  handler.OnSelectionEvent(aSelectionEvent);
+}
+
+uint32_t TextComposition::GetSelectionStartOffset() {
+  nsCOMPtr<nsIWidget> widget = mPresContext->GetRootWidget();
+  WidgetQueryContentEvent querySelectedTextEvent(true, eQuerySelectedText,
+                                                 widget);
+  if (!mLastData.IsEmpty() && mRanges && mRanges->HasClauses()) {
+    querySelectedTextEvent.InitForQuerySelectedText(
+        ToSelectionType(mRanges->GetFirstClause()->mRangeType));
+  } else {
+    NS_WARNING_ASSERTION(
+        !mLastData.IsEmpty() || !mRanges || !mRanges->HasClauses(),
+        "Shouldn't have empty clause info when composition string is empty");
+    querySelectedTextEvent.InitForQuerySelectedText(SelectionType::eNormal);
+  }
+
+  RefPtr<IMEContentObserver> contentObserver =
+      IMEStateManager::GetActiveContentObserver();
+  bool doQuerySelection = true;
+  if (contentObserver) {
+    if (contentObserver->IsObserving(*this)) {
+      doQuerySelection = false;
+      contentObserver->HandleQueryContentEvent(&querySelectedTextEvent);
+    }
+    else if (NS_WARN_IF(contentObserver->GetPresContext() == mPresContext)) {
+      return 0;  
+    }
+  }
+
+  if (doQuerySelection) {
+    ContentEventHandler handler(mPresContext);
+    handler.HandleQueryContentEvent(&querySelectedTextEvent);
+  }
+
+  if (NS_WARN_IF(querySelectedTextEvent.DidNotFindSelection())) {
+    return 0;  
+  }
+  return querySelectedTextEvent.mReply->AnchorOffset();
+}
+
+void TextComposition::OnCompositionEventDispatched(
+    const WidgetCompositionEvent* aCompositionEvent) {
+  MOZ_RELEASE_ASSERT(!mBrowserParent);
+
+  if (!IsValidStateForComposition(aCompositionEvent->mWidget)) {
+    return;
+  }
+
+
+  MOZ_ASSERT(aCompositionEvent->mMessage != eCompositionStart ||
+                 mWasCompositionStringEmpty,
+             "mWasCompositionStringEmpty should be true if the dispatched "
+             "event is eCompositionStart");
+
+  if (mWasCompositionStringEmpty &&
+      !aCompositionEvent->CausesDOMCompositionEndEvent()) {
+    mCompositionStartOffset = GetSelectionStartOffset();
+    mTargetClauseOffsetInComposition = 0;
+  }
+
+  if (aCompositionEvent->CausesDOMTextEvent()) {
+    mTargetClauseOffsetInComposition = aCompositionEvent->TargetClauseOffset();
+  }
+}
+
+void TextComposition::OnStartOffsetUpdatedInChild(uint32_t aStartOffset) {
+  mCompositionStartOffset = aStartOffset;
+}
+
+void TextComposition::MaybeNotifyIMEOfCompositionEventHandled(
+    const WidgetCompositionEvent* aCompositionEvent) {
+  if (aCompositionEvent->mMessage != eCompositionStart &&
+      !aCompositionEvent->CausesDOMTextEvent()) {
+    return;
+  }
+
+  RefPtr<IMEContentObserver> contentObserver =
+      IMEStateManager::GetActiveContentObserver();
+  if (contentObserver && contentObserver->IsObserving(*this)) {
+    contentObserver->MaybeNotifyCompositionEventHandled();
+    return;
+  }
+  NotifyIME(NOTIFY_IME_OF_COMPOSITION_EVENT_HANDLED);
+}
+
+void TextComposition::DispatchCompositionEventRunnable(
+    EventMessage aEventMessage, const nsAString& aData,
+    bool aIsSynthesizingCommit) {
+  nsContentUtils::AddScriptRunner(MakeAndAddRef<CompositionEventDispatcher>(
+      this, mNode, aEventMessage, aData, aIsSynthesizingCommit));
+}
+
+nsresult TextComposition::RequestToCommit(nsIWidget* aWidget, bool aDiscard) {
+  MOZ_ASSERT(this == IMEStateManager::GetTextCompositionFor(aWidget));
+  if (!CanRequsetIMEToCommitOrCancelComposition()) {
+    return NS_OK;
+  }
+
+  RefPtr<TextComposition> kungFuDeathGrip(this);
+  const nsAutoString lastData(mLastData);
+
+  if (IMEStateManager::CanSendNotificationToWidget()) {
+    AutoRestore<bool> saveRequestingCancel(mIsRequestingCancel);
+    AutoRestore<bool> saveRequestingCommit(mIsRequestingCommit);
+    if (aDiscard) {
+      mIsRequestingCancel = true;
+      mIsRequestingCommit = false;
+    } else {
+      mIsRequestingCancel = false;
+      mIsRequestingCommit = true;
+    }
+    nsresult rv = aWidget->NotifyIME(
+        IMENotification(aDiscard ? REQUEST_TO_CANCEL_COMPOSITION
+                                 : REQUEST_TO_COMMIT_COMPOSITION));
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+  }
+
+  mRequestedToCommitOrCancel = true;
+
+  if (Destroyed()) {
+    return NS_OK;
+  }
+
+  nsAutoString data(aDiscard ? EmptyString() : lastData);
+  if (data == mLastData) {
+    DispatchCompositionEventRunnable(eCompositionCommitAsIs, u""_ns, true);
+  } else {
+    DispatchCompositionEventRunnable(eCompositionCommit, data, true);
+  }
+  return NS_OK;
+}
+
+nsresult TextComposition::NotifyIME(IMEMessage aMessage) {
+  NS_ENSURE_TRUE(mPresContext, NS_ERROR_NOT_AVAILABLE);
+  return IMEStateManager::NotifyIME(aMessage, mPresContext, mBrowserParent);
+}
+
+void TextComposition::EditorWillHandleCompositionChangeEvent(
+    const WidgetCompositionEvent* aCompositionChangeEvent) {
+  mIsComposing = aCompositionChangeEvent->IsComposing();
+  mRanges = aCompositionChangeEvent->mRanges;
+  mEditorIsHandlingEvent = true;
+
+  MOZ_ASSERT(
+      mLastData == aCompositionChangeEvent->mData,
+      "The text of a compositionchange event must be same as previous data "
+      "attribute value of the latest compositionupdate event");
+}
+
+void TextComposition::OnEditorDestroyed() {
+  MOZ_RELEASE_ASSERT(!mBrowserParent);
+
+  MOZ_ASSERT(!mEditorIsHandlingEvent,
+             "The editor should have stopped listening events");
+  nsCOMPtr<nsIWidget> widget = GetWidget();
+  if (NS_WARN_IF(!widget)) {
+    return;
+  }
+
+  RequestToCommit(widget, true);
+}
+
+void TextComposition::EditorDidHandleCompositionChangeEvent() {
+  mString = mLastData;
+  mEditorIsHandlingEvent = false;
+}
+
+void TextComposition::StartHandlingComposition(EditorBase* aEditorBase) {
+  MOZ_RELEASE_ASSERT(!mBrowserParent);
+
+  MOZ_ASSERT(!HasEditor(), "There is a handling editor already");
+  mEditorBaseWeak = do_GetWeakReference(static_cast<nsIEditor*>(aEditorBase));
+}
+
+void TextComposition::EndHandlingComposition(EditorBase* aEditorBase) {
+  MOZ_RELEASE_ASSERT(!mBrowserParent);
+
+#if defined(DEBUG)
+  RefPtr<EditorBase> editorBase = GetEditorBase();
+  MOZ_ASSERT(!editorBase || editorBase == aEditorBase,
+             "Another editor handled the composition?");
+#endif
+  mEditorBaseWeak = nullptr;
+}
+
+already_AddRefed<EditorBase> TextComposition::GetEditorBase() const {
+  nsCOMPtr<nsIEditor> editor = do_QueryReferent(mEditorBaseWeak);
+  RefPtr<EditorBase> editorBase = static_cast<EditorBase*>(editor.get());
+  return editorBase.forget();
+}
+
+bool TextComposition::HasEditor() const {
+  return mEditorBaseWeak && mEditorBaseWeak->IsAlive();
+}
+
+RawRangeBoundary TextComposition::FirstIMESelectionStartRef() const {
+  RefPtr<EditorBase> editorBase = GetEditorBase();
+  if (!editorBase) {
+    return RawRangeBoundary();
+  }
+
+  nsISelectionController* selectionController =
+      editorBase->GetSelectionController();
+  if (NS_WARN_IF(!selectionController)) {
+    return RawRangeBoundary();
+  }
+
+  const nsRange* firstRange = nullptr;
+  static const SelectionType kIMESelectionTypes[] = {
+      SelectionType::eIMERawClause, SelectionType::eIMESelectedRawClause,
+      SelectionType::eIMEConvertedClause, SelectionType::eIMESelectedClause};
+  for (auto selectionType : kIMESelectionTypes) {
+    dom::Selection* selection =
+        selectionController->GetSelection(ToRawSelectionType(selectionType));
+    if (!selection) {
+      continue;
+    }
+    const uint32_t rangeCount = selection->RangeCount();
+    for (const uint32_t i : IntegerRange(rangeCount)) {
+      MOZ_ASSERT(selection->RangeCount() == rangeCount);
+      const nsRange* range = selection->GetRangeAt(i);
+      MOZ_ASSERT(range);
+      if (MOZ_UNLIKELY(NS_WARN_IF(!range)) ||
+          MOZ_UNLIKELY(NS_WARN_IF(!range->GetStartContainer()))) {
+        continue;
+      }
+      if (!firstRange) {
+        firstRange = range;
+        continue;
+      }
+      if (firstRange->GetStartContainer() == range->GetStartContainer()) {
+        if (firstRange->StartOffset() > range->StartOffset()) {
+          firstRange = range;
+        }
+        continue;
+      }
+      if (firstRange->GetStartContainer()->GetNextSibling() ==
+          range->GetStartContainer()) {
+        firstRange = range;
+        continue;
+      }
+      if (*nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+              range->StartRef(), firstRange->StartRef()) == -1) {
+        firstRange = range;
+      }
+    }
+  }
+  return firstRange ? firstRange->StartRef().AsRaw() : RawRangeBoundary();
+}
+
+RawRangeBoundary TextComposition::LastIMESelectionEndRef() const {
+  RefPtr<EditorBase> editorBase = GetEditorBase();
+  if (!editorBase) {
+    return RawRangeBoundary();
+  }
+
+  nsISelectionController* selectionController =
+      editorBase->GetSelectionController();
+  if (NS_WARN_IF(!selectionController)) {
+    return RawRangeBoundary();
+  }
+
+  const nsRange* lastRange = nullptr;
+  static const SelectionType kIMESelectionTypes[] = {
+      SelectionType::eIMERawClause, SelectionType::eIMESelectedRawClause,
+      SelectionType::eIMEConvertedClause, SelectionType::eIMESelectedClause};
+  for (auto selectionType : kIMESelectionTypes) {
+    dom::Selection* selection =
+        selectionController->GetSelection(ToRawSelectionType(selectionType));
+    if (!selection) {
+      continue;
+    }
+    const uint32_t rangeCount = selection->RangeCount();
+    for (const uint32_t i : IntegerRange(rangeCount)) {
+      MOZ_ASSERT(selection->RangeCount() == rangeCount);
+      const nsRange* range = selection->GetRangeAt(i);
+      MOZ_ASSERT(range);
+      if (MOZ_UNLIKELY(NS_WARN_IF(!range)) ||
+          MOZ_UNLIKELY(NS_WARN_IF(!range->GetEndContainer()))) {
+        continue;
+      }
+      if (!lastRange) {
+        lastRange = range;
+        continue;
+      }
+      if (lastRange->GetEndContainer() == range->GetEndContainer()) {
+        if (lastRange->EndOffset() < range->EndOffset()) {
+          lastRange = range;
+        }
+        continue;
+      }
+      if (lastRange->GetEndContainer() ==
+          range->GetEndContainer()->GetNextSibling()) {
+        lastRange = range;
+        continue;
+      }
+      if (*nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+              lastRange->EndRef(), range->EndRef()) == -1) {
+        lastRange = range;
+      }
+    }
+  }
+  return lastRange ? lastRange->EndRef().AsRaw() : RawRangeBoundary();
+}
+
+
+TextComposition::CompositionEventDispatcher::CompositionEventDispatcher(
+    TextComposition* aTextComposition, nsINode* aEventTarget,
+    EventMessage aEventMessage, const nsAString& aData,
+    bool aIsSynthesizedEvent)
+    : Runnable("TextComposition::CompositionEventDispatcher"),
+      mTextComposition(aTextComposition),
+      mEventTarget(aEventTarget),
+      mData(aData),
+      mEventMessage(aEventMessage),
+      mIsSynthesizedEvent(aIsSynthesizedEvent) {}
+
+NS_IMETHODIMP
+TextComposition::CompositionEventDispatcher::Run() {
+  nsCOMPtr<nsIWidget> widget(mTextComposition->GetWidget());
+  if (!mTextComposition->IsValidStateForComposition(widget)) {
+    return NS_OK;  
+  }
+
+  RefPtr<nsPresContext> presContext = mTextComposition->mPresContext;
+  nsCOMPtr<nsINode> eventTarget = mEventTarget;
+  RefPtr<BrowserParent> browserParent = mTextComposition->mBrowserParent;
+  nsEventStatus status = nsEventStatus_eIgnore;
+  switch (mEventMessage) {
+    case eCompositionStart: {
+      WidgetCompositionEvent compStart(true, eCompositionStart, widget);
+      compStart.mNativeIMEContext = mTextComposition->mNativeContext;
+      WidgetQueryContentEvent querySelectedTextEvent(true, eQuerySelectedText,
+                                                     widget);
+      ContentEventHandler handler(presContext);
+      handler.OnQuerySelectedText(&querySelectedTextEvent);
+      NS_ASSERTION(querySelectedTextEvent.Succeeded(),
+                   "Failed to get selected text");
+      if (querySelectedTextEvent.FoundSelection()) {
+        compStart.mData = querySelectedTextEvent.mReply->DataRef();
+      }
+      compStart.mFlags.mIsSynthesizedForTests =
+          mTextComposition->IsSynthesizedForTests();
+      IMEStateManager::DispatchCompositionEvent(
+          eventTarget, presContext, browserParent, &compStart, &status, nullptr,
+          mIsSynthesizedEvent);
+      break;
+    }
+    case eCompositionChange:
+    case eCompositionCommitAsIs:
+    case eCompositionCommit: {
+      WidgetCompositionEvent compEvent(true, mEventMessage, widget);
+      compEvent.mNativeIMEContext = mTextComposition->mNativeContext;
+      if (mEventMessage != eCompositionCommitAsIs) {
+        compEvent.mData = mData;
+      }
+      compEvent.mFlags.mIsSynthesizedForTests =
+          mTextComposition->IsSynthesizedForTests();
+      IMEStateManager::DispatchCompositionEvent(
+          eventTarget, presContext, browserParent, &compEvent, &status, nullptr,
+          mIsSynthesizedEvent);
+      break;
+    }
+    default:
+      MOZ_CRASH("Unsupported event");
+  }
+  return NS_OK;
+}
+
+
+TextCompositionArray::index_type TextCompositionArray::IndexOf(
+    const NativeIMEContext& aNativeIMEContext) {
+  if (!aNativeIMEContext.IsValid()) {
+    return NoIndex;
+  }
+  for (index_type i = Length(); i > 0; --i) {
+    if (ElementAt(i - 1)->GetNativeIMEContext() == aNativeIMEContext) {
+      return i - 1;
+    }
+  }
+  return NoIndex;
+}
+
+TextCompositionArray::index_type TextCompositionArray::IndexOf(
+    nsIWidget* aWidget) {
+  return IndexOf(aWidget->GetNativeIMEContext());
+}
+
+TextCompositionArray::index_type TextCompositionArray::IndexOf(
+    nsPresContext* aPresContext) {
+  for (index_type i = Length(); i > 0; --i) {
+    if (ElementAt(i - 1)->GetPresContext() == aPresContext) {
+      return i - 1;
+    }
+  }
+  return NoIndex;
+}
+
+TextCompositionArray::index_type TextCompositionArray::IndexOf(
+    nsPresContext* aPresContext, nsINode* aNode) {
+  index_type index = IndexOf(aPresContext);
+  if (index == NoIndex) {
+    return NoIndex;
+  }
+  nsINode* node = ElementAt(index)->GetEventTargetNode();
+  return node == aNode ? index : NoIndex;
+}
+
+TextComposition* TextCompositionArray::GetCompositionFor(nsIWidget* aWidget) {
+  index_type i = IndexOf(aWidget);
+  if (i == NoIndex) {
+    return nullptr;
+  }
+  return ElementAt(i);
+}
+
+TextComposition* TextCompositionArray::GetCompositionFor(
+    const WidgetCompositionEvent* aCompositionEvent) {
+  index_type i = IndexOf(aCompositionEvent->mNativeIMEContext);
+  if (i == NoIndex) {
+    return nullptr;
+  }
+  return ElementAt(i);
+}
+
+TextComposition* TextCompositionArray::GetCompositionFor(
+    nsPresContext* aPresContext) {
+  index_type i = IndexOf(aPresContext);
+  if (i == NoIndex) {
+    return nullptr;
+  }
+  return ElementAt(i);
+}
+
+TextComposition* TextCompositionArray::GetCompositionFor(
+    nsPresContext* aPresContext, nsINode* aNode) {
+  index_type i = IndexOf(aPresContext, aNode);
+  if (i == NoIndex) {
+    return nullptr;
+  }
+  return ElementAt(i);
+}
+
+TextComposition* TextCompositionArray::GetCompositionInContent(
+    nsPresContext* aPresContext, nsIContent* aContent) {
+  for (TextComposition* const composition : Reversed(*this)) {
+    nsINode* node = composition->GetEventTargetNode();
+    if (node && node->IsInclusiveFlatTreeDescendantOf(aContent)) {
+      return composition;
+    }
+  }
+  return nullptr;
+}
+
+}  

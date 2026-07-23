@@ -1,0 +1,61 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsRubyTextContainerFrame_h_
+#define nsRubyTextContainerFrame_h_
+
+#include "nsBlockFrame.h"
+
+namespace mozilla {
+class PresShell;
+}  
+
+nsContainerFrame* NS_NewRubyTextContainerFrame(mozilla::PresShell* aPresShell,
+                                               mozilla::ComputedStyle* aStyle);
+
+class nsRubyTextContainerFrame final : public nsContainerFrame {
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(nsRubyTextContainerFrame)
+  NS_DECL_QUERYFRAME
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+  void SetInitialChildList(ChildListID aListID,
+                           nsFrameList&& aChildList) override;
+  void AppendFrames(ChildListID aListID, nsFrameList&& aFrameList) override;
+  void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                    const nsLineList::iterator* aPrevFrameLine,
+                    nsFrameList&& aFrameList) override;
+  void RemoveFrame(DestroyContext&, ChildListID, nsIFrame*) override;
+
+  bool IsSpanContainer() const {
+    return HasAnyStateBits(NS_RUBY_TEXT_CONTAINER_IS_SPAN);
+  }
+
+  mozilla::RubyMetrics RubyMetrics(float aRubyMetricsFactor) const override;
+
+ protected:
+  friend nsContainerFrame* NS_NewRubyTextContainerFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle);
+
+  explicit nsRubyTextContainerFrame(ComputedStyle* aStyle,
+                                    nsPresContext* aPresContext)
+      : nsContainerFrame(aStyle, aPresContext, kClassID), mISize(0) {}
+
+  void UpdateSpanFlag();
+
+  friend class nsRubyBaseContainerFrame;
+  void SetISize(nscoord aISize) { mISize = aISize; }
+
+  nscoord mISize;
+};
+
+#endif /* nsRubyTextContainerFrame_h_ */

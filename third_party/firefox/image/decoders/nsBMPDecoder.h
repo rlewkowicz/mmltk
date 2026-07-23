@@ -1,0 +1,236 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_decoders_nsBMPDecoder_h
+#define mozilla_image_decoders_nsBMPDecoder_h
+
+#include "BMPHeaders.h"
+#include "Decoder.h"
+#include "StreamingLexer.h"
+#include "SurfacePipe.h"
+#include "gfxColor.h"
+#include "mozilla/UniquePtr.h"
+
+namespace mozilla {
+namespace image {
+
+namespace bmp {
+
+struct CalRgbEndpoint {
+  uint32_t mGamma;
+  uint32_t mX;
+  uint32_t mY;
+  uint32_t mZ;
+};
+
+struct Header {
+  uint32_t mDataOffset;       
+  uint32_t mBIHSize;          
+  int32_t mWidth;             
+  int32_t mHeight;            
+  uint16_t mBpp;              
+  uint32_t mCompression;      
+  uint32_t mImageSize;        
+  uint32_t mNumColors;        
+  InfoColorSpace mCsType;     
+  InfoColorIntent mCsIntent;  
+
+  union {
+    struct {
+      CalRgbEndpoint mRed;
+      CalRgbEndpoint mGreen;
+      CalRgbEndpoint mBlue;
+    } mCalibrated;
+
+    struct {
+      uint32_t mOffset;
+      uint32_t mLength;
+    } mProfile;
+  } mColorSpace;
+
+  Header()
+      : mDataOffset(0),
+        mBIHSize(0),
+        mWidth(0),
+        mHeight(0),
+        mBpp(0),
+        mCompression(0),
+        mImageSize(0),
+        mNumColors(0),
+        mCsType(InfoColorSpace::SRGB),
+        mCsIntent(InfoColorIntent::IMAGES) {}
+};
+
+struct ColorTableEntry {
+  uint8_t mRed;
+  uint8_t mGreen;
+  uint8_t mBlue;
+};
+
+class BitFields {
+  class Value {
+    friend class BitFields;
+
+    uint32_t mMask;       
+    uint8_t mRightShift;  
+    uint8_t mBitWidth;    
+
+    void Set(uint32_t aMask);
+
+   public:
+    Value() {
+      mMask = 0;
+      mRightShift = 0;
+      mBitWidth = 0;
+    }
+
+    bool IsPresent() const { return mMask != 0x0; }
+
+    uint8_t Get(uint32_t aVal) const;
+
+    uint8_t GetAlpha(uint32_t aVal, bool& aHasAlphaOut) const;
+
+    uint8_t Get5(uint32_t aVal) const;
+    uint8_t Get8(uint32_t aVal) const;
+  };
+
+ public:
+  Value mRed;
+  Value mGreen;
+  Value mBlue;
+  Value mAlpha;
+
+  void SetR5G5B5();
+
+  void SetR8G8B8();
+
+  bool IsR5G5B5() const;
+
+  bool IsR8G8B8() const;
+
+  void ReadFromHeader(const char* aData, bool aReadAlpha);
+
+  static const size_t LENGTH = 12;
+};
+
+}  
+
+class RasterImage;
+
+
+class nsBMPDecoder : public Decoder {
+ public:
+  ~nsBMPDecoder();
+
+  DecoderType GetType() const override { return DecoderType::BMP; }
+
+  bool IsValidICOResource() const override { return true; }
+
+  uint32_t* GetImageData() { return reinterpret_cast<uint32_t*>(mImageData); }
+
+  size_t GetImageDataLength() const { return mImageDataLength; }
+
+  uint32_t GetCompressedImageSize() const;
+
+  void SetIsWithinICO() { mIsWithinICO = true; }
+
+  bool HasTransparency() const { return mDoesHaveTransparency; }
+
+  LexerResult DoDecode(SourceBufferIterator& aIterator,
+                       IResumable* aOnResume) override;
+  nsresult BeforeFinishInternal() override;
+  nsresult FinishInternal() override;
+
+ private:
+  friend class DecoderFactory;
+
+  enum class State {
+    FILE_HEADER,
+    INFO_HEADER_SIZE,
+    INFO_HEADER_REST,
+    BITFIELDS,
+    SKIP_TO_COLOR_PROFILE,
+    FOUND_COLOR_PROFILE,
+    COLOR_PROFILE,
+    ALLOCATE_SURFACE,
+    COLOR_TABLE,
+    GAP,
+    AFTER_GAP,
+    PIXEL_ROW,
+    RLE_SEGMENT,
+    RLE_DELTA,
+    RLE_ABSOLUTE
+  };
+
+  explicit nsBMPDecoder(RasterImage* aImage, bool aForClipboard = false);
+
+  nsBMPDecoder(RasterImage* aImage, uint32_t aDataOffset);
+
+  nsBMPDecoder(RasterImage* aImage, State aState, size_t aLength,
+               bool aForClipboard);
+
+  uint32_t AbsoluteHeight() const { return abs(mH.mHeight); }
+
+  uint32_t* RowBuffer();
+  void ClearRowBufferRemainder();
+
+  void FinishRow();
+
+  void PrepareCalibratedColorProfile();
+  void PrepareColorProfileTransform();
+
+  LexerTransition<State> ReadFileHeader(const char* aData, size_t aLength);
+  LexerTransition<State> ReadInfoHeaderSize(const char* aData, size_t aLength);
+  LexerTransition<State> ReadInfoHeaderRest(const char* aData, size_t aLength);
+  LexerTransition<State> ReadBitfields(const char* aData, size_t aLength);
+  LexerTransition<State> SeekColorProfile(size_t aLength);
+  LexerTransition<State> ReadColorProfile(const char* aData, size_t aLength);
+  LexerTransition<State> AllocateSurface();
+  LexerTransition<State> ReadColorTable(const char* aData, size_t aLength);
+  LexerTransition<State> SkipGap();
+  LexerTransition<State> AfterGap();
+  LexerTransition<State> ReadPixelRow(const char* aData);
+  LexerTransition<State> ReadRLESegment(const char* aData);
+  LexerTransition<State> ReadRLEDelta(const char* aData);
+  LexerTransition<State> ReadRLEAbsolute(const char* aData, size_t aLength);
+
+  SurfacePipe mPipe;
+
+  StreamingLexer<State> mLexer;
+
+  Maybe<SourceBufferIterator> mReturnIterator;
+
+  UniquePtr<uint32_t[]> mRowBuffer;
+
+  bmp::Header mH;
+
+  bool mIsWithinICO;
+
+  bool mIsForClipboard;
+
+  bmp::BitFields mBitFields;
+
+  bool mMayHaveTransparency;
+
+  bool mDoesHaveTransparency;
+
+  uint32_t mNumColors;  
+  UniquePtr<bmp::ColorTableEntry[]>
+      mColors;              
+  uint32_t mBytesPerColor;  
+
+  uint32_t mPreGapLength;
+
+  uint32_t mPixelRowSize;  
+
+  int32_t mCurrentRow;  
+  int32_t mCurrentPos;  
+
+  uint32_t mAbsoluteModeNumPixels;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_decoders_nsBMPDecoder_h

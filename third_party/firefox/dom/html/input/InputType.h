@@ -1,0 +1,123 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_InputType_h_
+#define mozilla_dom_InputType_h_
+
+#include <stdint.h>
+
+#include "mozilla/Decimal.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/TextControlState.h"
+#include "mozilla/UniquePtr.h"
+#include "nsError.h"
+#include "nsIConstraintValidation.h"
+#include "nsString.h"
+
+inline mozilla::Decimal NS_floorModulo(mozilla::Decimal x, mozilla::Decimal y) {
+  return (x - y * (x / y).floor());
+}
+
+class nsIFrame;
+
+namespace mozilla::dom {
+class HTMLInputElement;
+
+class InputType {
+ public:
+  using ValueSetterOption = TextControlState::ValueSetterOption;
+  using ValueSetterOptions = TextControlState::ValueSetterOptions;
+
+  struct DoNotDelete {
+    void operator()(InputType* p) { p->~InputType(); }
+  };
+
+  static UniquePtr<InputType, DoNotDelete> Create(
+      HTMLInputElement* aInputElement, FormControlType, void* aMemory);
+
+  virtual ~InputType() = default;
+
+  static constexpr Decimal kStepAny = Decimal(0_d);
+
+  void DropReference();
+
+  virtual bool MinAndMaxLengthApply() const { return false; }
+  virtual bool IsTooLong() const;
+  virtual bool IsTooShort() const;
+  virtual bool IsValueMissing() const;
+  virtual bool HasTypeMismatch() const;
+  virtual Maybe<bool> HasPatternMismatch() const;
+  virtual bool IsRangeOverflow() const;
+  virtual bool IsRangeUnderflow() const;
+  virtual bool HasStepMismatch() const;
+  virtual bool HasBadInput() const;
+
+  nsresult GetValidationMessage(
+      nsAString& aValidationMessage,
+      nsIConstraintValidation::ValidityStateType aType);
+  virtual nsresult GetValueMissingMessage(nsAString& aMessage);
+  virtual nsresult GetTypeMismatchMessage(nsAString& aMessage);
+  virtual nsresult GetRangeOverflowMessage(nsAString& aMessage);
+  virtual nsresult GetRangeUnderflowMessage(nsAString& aMessage);
+  virtual nsresult GetBadInputMessage(nsAString& aMessage);
+
+  MOZ_CAN_RUN_SCRIPT virtual void MinMaxStepAttrChanged() {}
+
+  enum class Localized : bool { No = false, Yes };
+
+  struct StringToNumberResult {
+    Decimal mResult = Decimal::nan();
+    bool mLocalized = false;
+  };
+  virtual StringToNumberResult ConvertStringToNumber(const nsAString& aValue,
+                                                     Localized) const;
+
+  virtual bool ConvertNumberToString(Decimal aValue, Localized,
+                                     nsAString& aResultString) const;
+
+ protected:
+  explicit InputType(HTMLInputElement* aInputElement)
+      : mInputElement(aInputElement) {}
+
+  virtual bool IsMutable() const;
+
+  bool IsValueEmpty() const;
+
+  void GetNonFileValueInternal(nsAString& aValue) const;
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  SetValueInternal(const nsAString& aValue, const ValueSetterOptions& aOptions);
+
+  nsIFrame* GetPrimaryFrame() const;
+
+  bool ParseDate(const nsAString& aValue, uint32_t* aYear, uint32_t* aMonth,
+                 uint32_t* aDay) const;
+
+  bool ParseTime(const nsAString& aValue, uint32_t* aResult) const;
+
+  bool ParseMonth(const nsAString& aValue, uint32_t* aYear,
+                  uint32_t* aMonth) const;
+
+  bool ParseWeek(const nsAString& aValue, uint32_t* aYear,
+                 uint32_t* aWeek) const;
+
+  bool ParseDateTimeLocal(const nsAString& aValue, uint32_t* aYear,
+                          uint32_t* aMonth, uint32_t* aDay,
+                          uint32_t* aTime) const;
+
+  int32_t MonthsSinceJan1970(uint32_t aYear, uint32_t aMonth) const;
+
+  double DaysSinceEpochFromWeek(uint32_t aYear, uint32_t aWeek) const;
+
+  uint32_t DayOfWeek(uint32_t aYear, uint32_t aMonth, uint32_t aDay,
+                     bool isoWeek) const;
+
+  uint32_t MaximumWeekInYear(uint32_t aYear) const;
+
+  HTMLInputElement* mInputElement;
+};
+
+}  
+
+#endif /* mozilla_dom_InputType_h_ */

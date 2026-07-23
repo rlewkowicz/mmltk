@@ -1,0 +1,328 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+*
+*   Copyright (C) 2002-2016, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+*******************************************************************************
+*   file name:  uprops.h
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+*   created on: 2002feb24
+*   created by: Markus W. Scherer
+*
+*   Constants for mostly non-core Unicode character properties
+*   stored in uprops.icu.
+*/
+
+#ifndef __UPROPS_H__
+#define __UPROPS_H__
+
+#include "unicode/utypes.h"
+#include "unicode/uset.h"
+#include "uset_imp.h"
+#include "udataswp.h"
+
+enum {
+    UPROPS_PROPS32_INDEX,
+    UPROPS_EXCEPTIONS_INDEX,
+    UPROPS_EXCEPTIONS_TOP_INDEX,
+
+    UPROPS_ADDITIONAL_TRIE_INDEX,
+    UPROPS_ADDITIONAL_VECTORS_INDEX,
+    UPROPS_ADDITIONAL_VECTORS_COLUMNS_INDEX,
+
+    UPROPS_SCRIPT_EXTENSIONS_INDEX,
+
+    UPROPS_BLOCK_TRIE_INDEX,
+    UPROPS_RESERVED_INDEX_8,
+
+    UPROPS_DATA_TOP_INDEX,
+
+    UPROPS_MAX_VALUES_INDEX=10,
+    UPROPS_MAX_VALUES_2_INDEX,
+    UPROPS_MAX_VALUES_OTHER_INDEX,
+
+    UPROPS_INDEX_COUNT=16
+};
+
+enum {
+    UPROPS_NUMERIC_TYPE_VALUE_SHIFT=6                       
+};
+
+#define GET_CATEGORY(props) ((props)&0x1f)
+#define CAT_MASK(props) U_MASK(GET_CATEGORY(props))
+
+#define GET_NUMERIC_TYPE_VALUE(props) ((props)>>UPROPS_NUMERIC_TYPE_VALUE_SHIFT)
+
+enum {
+    UPROPS_NTV_NONE=0,
+    UPROPS_NTV_DECIMAL_START=1,
+    UPROPS_NTV_DIGIT_START=11,
+    UPROPS_NTV_NUMERIC_START=21,
+    UPROPS_NTV_FRACTION_START=0xb0,
+    UPROPS_NTV_LARGE_START=0x1e0,
+    UPROPS_NTV_BASE60_START=0x300,
+    UPROPS_NTV_FRACTION20_START=UPROPS_NTV_BASE60_START+36,  
+    UPROPS_NTV_FRACTION32_START=UPROPS_NTV_FRACTION20_START+24,  
+    UPROPS_NTV_RESERVED_START=UPROPS_NTV_FRACTION32_START+16,  
+
+    UPROPS_NTV_MAX_SMALL_INT=UPROPS_NTV_FRACTION_START-UPROPS_NTV_NUMERIC_START-1
+};
+
+#define UPROPS_NTV_GET_TYPE(ntv) \
+    ((ntv==UPROPS_NTV_NONE) ? U_NT_NONE : \
+    (ntv<UPROPS_NTV_DIGIT_START) ?  U_NT_DECIMAL : \
+    (ntv<UPROPS_NTV_NUMERIC_START) ? U_NT_DIGIT : \
+    U_NT_NUMERIC)
+
+#define UPROPS_VECTOR_WORDS     3
+
+#ifdef __cplusplus
+
+namespace {
+
+
+
+inline constexpr uint32_t UPROPS_AGE_MASK = 0xff000000;
+inline constexpr int32_t UPROPS_AGE_SHIFT = 24;
+
+inline constexpr uint8_t UPROPS_AGE_MAJOR_MAX = 63;
+inline constexpr uint8_t UPROPS_AGE_MINOR_MAX = 3;
+
+inline constexpr uint32_t UPROPS_EA_MASK = 0x00007000;
+inline constexpr int32_t UPROPS_EA_SHIFT = 12;
+
+inline constexpr uint32_t UPROPS_INCB_MASK = 0x00018000;
+inline constexpr int32_t UPROPS_INCB_SHIFT = 15;
+
+inline constexpr uint32_t UPROPS_SCRIPT_X_MASK = 0x00000fff;
+
+inline constexpr uint32_t UPROPS_SCRIPT_X_WITH_OTHER = 0xc00;
+inline constexpr uint32_t UPROPS_SCRIPT_X_WITH_INHERITED = 0x800;
+inline constexpr uint32_t UPROPS_SCRIPT_X_WITH_COMMON = 0x400;
+inline constexpr int32_t UPROPS_MAX_SCRIPT = 0x3ff;
+
+enum {
+    UPROPS_WHITE_SPACE,
+    UPROPS_DASH,
+    UPROPS_HYPHEN,
+    UPROPS_QUOTATION_MARK,
+    UPROPS_TERMINAL_PUNCTUATION,
+    UPROPS_MATH,
+    UPROPS_HEX_DIGIT,
+    UPROPS_ASCII_HEX_DIGIT,
+    UPROPS_ALPHABETIC,
+    UPROPS_IDEOGRAPHIC,
+    UPROPS_DIACRITIC,
+    UPROPS_EXTENDER,
+    UPROPS_NONCHARACTER_CODE_POINT,
+    UPROPS_GRAPHEME_EXTEND,
+    UPROPS_GRAPHEME_LINK,
+    UPROPS_IDS_BINARY_OPERATOR,
+    UPROPS_IDS_TRINARY_OPERATOR,
+    UPROPS_RADICAL,
+    UPROPS_UNIFIED_IDEOGRAPH,
+    UPROPS_DEFAULT_IGNORABLE_CODE_POINT,
+    UPROPS_DEPRECATED,
+    UPROPS_LOGICAL_ORDER_EXCEPTION,
+    UPROPS_XID_START,
+    UPROPS_XID_CONTINUE,
+    UPROPS_ID_START,                            
+    UPROPS_ID_CONTINUE,
+    UPROPS_GRAPHEME_BASE,
+    UPROPS_S_TERM,                              
+    UPROPS_VARIATION_SELECTOR,
+    UPROPS_PATTERN_SYNTAX,                      
+    UPROPS_PATTERN_WHITE_SPACE,
+    UPROPS_PREPENDED_CONCATENATION_MARK,        
+    UPROPS_BINARY_1_TOP                         
+};
+
+
+
+inline constexpr uint32_t UPROPS_2_ID_TYPE_MASK = 0xfc000000;
+inline constexpr int32_t UPROPS_2_ID_TYPE_SHIFT = 26;
+
+enum {
+    UPROPS_ID_TYPE_BIT = 0x80,
+
+    UPROPS_ID_TYPE_EXCLUSION = 0x20,
+    UPROPS_ID_TYPE_LIMITED_USE = 0x10,
+    UPROPS_ID_TYPE_UNCOMMON_USE = 8,
+    UPROPS_ID_TYPE_TECHNICAL = 4,
+    UPROPS_ID_TYPE_OBSOLETE = 2,
+    UPROPS_ID_TYPE_NOT_XID = 1,
+
+    UPROPS_ID_TYPE_NOT_CHARACTER = 0,
+
+    UPROPS_ID_TYPE_FORBIDDEN = UPROPS_ID_TYPE_EXCLUSION | UPROPS_ID_TYPE_LIMITED_USE, 
+    UPROPS_ID_TYPE_DEPRECATED = UPROPS_ID_TYPE_FORBIDDEN, 
+    UPROPS_ID_TYPE_DEFAULT_IGNORABLE, 
+    UPROPS_ID_TYPE_NOT_NFKC, 
+
+    UPROPS_ID_TYPE_ALLOWED_MIN = UPROPS_ID_TYPE_FORBIDDEN + 0xc, 
+    UPROPS_ID_TYPE_INCLUSION = UPROPS_ID_TYPE_FORBIDDEN + 0xe, 
+    UPROPS_ID_TYPE_RECOMMENDED = UPROPS_ID_TYPE_FORBIDDEN + 0xf, 
+};
+
+inline constexpr uint8_t uprops_idTypeToEncoded[] = {
+    UPROPS_ID_TYPE_NOT_CHARACTER,
+    UPROPS_ID_TYPE_DEPRECATED,
+    UPROPS_ID_TYPE_DEFAULT_IGNORABLE,
+    UPROPS_ID_TYPE_NOT_NFKC,
+    UPROPS_ID_TYPE_BIT | UPROPS_ID_TYPE_NOT_XID,
+    UPROPS_ID_TYPE_BIT | UPROPS_ID_TYPE_EXCLUSION,
+    UPROPS_ID_TYPE_BIT | UPROPS_ID_TYPE_OBSOLETE,
+    UPROPS_ID_TYPE_BIT | UPROPS_ID_TYPE_TECHNICAL,
+    UPROPS_ID_TYPE_BIT | UPROPS_ID_TYPE_UNCOMMON_USE,
+    UPROPS_ID_TYPE_BIT | UPROPS_ID_TYPE_LIMITED_USE,
+    UPROPS_ID_TYPE_INCLUSION,
+    UPROPS_ID_TYPE_RECOMMENDED
+};
+
+}  
+
+#endif  // __cplusplus
+
+#define UPROPS_LB_MASK          0x03f00000
+#define UPROPS_LB_SHIFT         20
+
+#define UPROPS_SB_MASK          0x000f8000
+#define UPROPS_SB_SHIFT         15
+
+#define UPROPS_WB_MASK          0x00007c00
+#define UPROPS_WB_SHIFT         10
+
+#define UPROPS_GCB_MASK         0x000003e0
+#define UPROPS_GCB_SHIFT        5
+
+#define UPROPS_DT_MASK          0x0000001f
+
+#ifdef __cplusplus
+
+namespace {
+
+inline constexpr uint32_t UPROPS_MAX_BLOCK = 0x3ff;
+
+}  
+
+#endif  // __cplusplus
+
+U_CFUNC uint32_t
+u_getMainProperties(UChar32 c);
+
+U_CFUNC uint32_t
+u_getUnicodeProperties(UChar32 c, int32_t column);
+
+U_CFUNC int32_t
+uprv_getMaxValues(int32_t column);
+
+U_CFUNC UBool
+u_isalnumPOSIX(UChar32 c);
+
+U_CFUNC UBool
+u_isgraphPOSIX(UChar32 c);
+
+U_CFUNC UBool
+u_isprintPOSIX(UChar32 c);
+
+enum {
+    TAB     =0x0009,
+    LF      =0x000a,
+    FF      =0x000c,
+    CR      =0x000d,
+    NBSP    =0x00a0,
+    CGJ     =0x034f,
+    FIGURESP=0x2007,
+    HAIRSP  =0x200a,
+    ZWNJ    =0x200c,
+    ZWJ     =0x200d,
+    RLM     =0x200f,
+    NNBSP   =0x202f,
+    ZWNBSP  =0xfeff
+};
+
+U_CAPI int32_t U_EXPORT2
+uprv_getMaxCharNameLength(void);
+
+U_CAPI void U_EXPORT2
+uprv_getCharNameCharacters(const USetAdder *sa);
+
+enum UPropertySource {
+    UPROPS_SRC_NONE,
+    UPROPS_SRC_CHAR,
+    UPROPS_SRC_PROPSVEC,
+    UPROPS_SRC_NAMES,
+    UPROPS_SRC_CASE,
+    UPROPS_SRC_BIDI,
+    UPROPS_SRC_CHAR_AND_PROPSVEC,
+    UPROPS_SRC_CASE_AND_NORM,
+    UPROPS_SRC_NFC,
+    UPROPS_SRC_NFKC,
+    UPROPS_SRC_NFKC_CF,
+    UPROPS_SRC_NFC_CANON_ITER,
+    UPROPS_SRC_INPC,
+    UPROPS_SRC_INSC,
+    UPROPS_SRC_VO,
+    UPROPS_SRC_EMOJI,
+    UPROPS_SRC_IDSU,
+    UPROPS_SRC_ID_COMPAT_MATH,
+    UPROPS_SRC_BLOCK,
+    UPROPS_SRC_MCM,
+    UPROPS_SRC_COUNT
+};
+typedef enum UPropertySource UPropertySource;
+
+U_CFUNC UPropertySource U_EXPORT2
+uprops_getSource(UProperty which);
+
+U_CFUNC void U_EXPORT2
+uchar_addPropertyStarts(const USetAdder *sa, UErrorCode *pErrorCode);
+
+U_CFUNC void U_EXPORT2
+upropsvec_addPropertyStarts(const USetAdder *sa, UErrorCode *pErrorCode);
+
+U_CFUNC void U_EXPORT2
+uprops_addPropertyStarts(UPropertySource src, const USetAdder *sa, UErrorCode *pErrorCode);
+
+#ifdef __cplusplus
+
+U_CFUNC void U_EXPORT2
+ublock_addPropertyStarts(const USetAdder *sa, UErrorCode &errorCode);
+
+#endif  // __cplusplus
+
+
+U_CAPI void U_EXPORT2
+uprv_addScriptExtensionsCodePoints(const USetAdder *sa, UErrorCode *pErrorCode);
+
+U_CAPI int32_t U_EXPORT2
+uchar_swapNames(const UDataSwapper *ds,
+                const void *inData, int32_t length, void *outData,
+                UErrorCode *pErrorCode);
+
+#ifdef __cplusplus
+
+U_NAMESPACE_BEGIN
+
+class UnicodeSet;
+
+class CharacterProperties {
+public:
+    CharacterProperties() = delete;
+    static const UnicodeSet *getInclusionsForProperty(UProperty prop, UErrorCode &errorCode);
+    static const UnicodeSet *getBinaryPropertySet(UProperty property, UErrorCode &errorCode);
+};
+
+U_CFUNC UnicodeSet *
+uniset_getUnicode32Instance(UErrorCode &errorCode);
+
+U_NAMESPACE_END
+
+#endif
+
+#endif

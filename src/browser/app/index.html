@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>mmltk</title>
+    <base data-trunk-public-url />
+    <style>
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <link
+      data-trunk
+      rel="rust"
+      href="Cargo.toml"
+      data-bin="mmltk-browser-app"
+      data-wasm-opt="z"
+    />
+  </body>
+</html>

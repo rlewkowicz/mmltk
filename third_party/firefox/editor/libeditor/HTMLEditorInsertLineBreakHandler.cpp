@@ -1,0 +1,392 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "EditorBase.h"
+#include "HTMLEditor.h"
+#include "HTMLEditorInlines.h"
+#include "HTMLEditorNestedClasses.h"
+
+#include "CSSEditUtils.h"
+#include "EditAction.h"
+#include "EditorDOMPoint.h"
+#include "EditorLineBreak.h"
+#include "EditorUtils.h"
+#include "HTMLEditHelpers.h"
+#include "HTMLEditUtils.h"
+#include "PendingStyles.h"  // for SpecifiedStyle
+#include "WhiteSpaceVisibilityKeeper.h"
+#include "WSRunScanner.h"
+
+#include "ErrorList.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/ContentIterator.h"
+#include "mozilla/EditorForwards.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/TextComposition.h"
+#include "mozilla/dom/RangeBinding.h"
+#include "mozilla/dom/Selection.h"
+#include "nsContentUtils.h"
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsFrameSelection.h"
+#include "nsGkAtoms.h"
+#include "nsIContent.h"
+#include "nsINode.h"
+#include "nsRange.h"
+#include "nsTArray.h"
+#include "nsTextNode.h"
+
+class nsISupports;
+
+namespace mozilla {
+
+using namespace dom;
+using EmptyCheckOption = HTMLEditUtils::EmptyCheckOption;
+using EmptyCheckOptions = HTMLEditUtils::EmptyCheckOptions;
+
+nsresult HTMLEditor::InsertLineBreakAsSubAction() {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+  MOZ_ASSERT(!IsSelectionRangeContainerNotContent());
+
+  if (NS_WARN_IF(!mInitSucceeded)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  {
+    Result<EditActionResult, nsresult> result =
+        CanHandleHTMLEditSubAction(CheckSelectionInReplacedElement::No);
+    if (MOZ_UNLIKELY(result.isErr())) {
+      NS_WARNING("HTMLEditor::CanHandleHTMLEditSubAction() failed");
+      return result.unwrapErr();
+    }
+    if (result.inspect().Canceled()) {
+      return NS_OK;
+    }
+  }
+
+  if (GetEditActionEditContext()) {
+    return NS_OK;
+  }
+
+  AutoPlaceholderBatch treatAsOneTransaction(*this, *nsGkAtoms::TypingTxnName,
+                                             ScrollSelectionIntoView::Yes,
+                                             __FUNCTION__);
+
+  IgnoredErrorResult ignoredError;
+  AutoEditSubActionNotifier startToHandleEditSubAction(
+      *this, EditSubAction::eInsertText, nsIEditor::eNext, ignoredError);
+  if (NS_WARN_IF(ignoredError.ErrorCodeIs(NS_ERROR_EDITOR_DESTROYED))) {
+    return ignoredError.StealNSResult();
+  }
+  NS_WARNING_ASSERTION(
+      !ignoredError.Failed(),
+      "HTMLEditor::OnStartToHandleTopLevelEditSubAction() failed, but ignored");
+
+  UndefineCaretBidiLevel();
+
+  if (!SelectionRef().IsCollapsed()) {
+    nsresult rv =
+        DeleteSelectionAsSubAction(nsIEditor::eNone, nsIEditor::eStrip);
+    if (NS_FAILED(rv)) {
+      NS_WARNING(
+          "EditorBase::DeleteSelectionAsSubAction(eNone, eStrip) failed");
+      return rv;
+    }
+  }
+
+  const RefPtr<Element> editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (NS_WARN_IF(!editingHost)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  AutoInsertLineBreakHandler handler(*this, *editingHost);
+  nsresult rv = handler.Run();
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "AutoInsertLineBreakHandler::Run() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::AutoInsertLineBreakHandler::Run() {
+  MOZ_ASSERT(mHTMLEditor.IsEditActionDataAvailable());
+
+  const auto atStartOfSelection =
+      mHTMLEditor.GetFirstSelectionStartPoint<EditorDOMPoint>();
+  if (NS_WARN_IF(!atStartOfSelection.IsInContentNode())) {
+    return NS_ERROR_FAILURE;
+  }
+  MOZ_ASSERT(atStartOfSelection.IsSetAndValidInComposedDoc());
+
+  const Maybe<LineBreakType> lineBreakType =
+      mHTMLEditor.GetPreferredLineBreakType(
+          *atStartOfSelection.ContainerAs<nsIContent>(), mEditingHost);
+  if (MOZ_UNLIKELY(!lineBreakType)) {
+    return NS_SUCCESS_DOM_NO_OPERATION;  
+  }
+  if (lineBreakType.value() == LineBreakType::BRElement) {
+    nsresult rv = HandleInsertBRElement();
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "AutoInsertLineBreakHandler::HandleInsertBRElement()");
+    return rv;
+  }
+
+  nsresult rv = HandleInsertLinefeed();
+  NS_WARNING_ASSERTION(
+      NS_SUCCEEDED(rv),
+      "AutoInsertLineBreakHandler::HandleInsertLinefeed() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::AutoInsertLineBreakHandler::HandleInsertBRElement() {
+  const EditorDOMPoint pointToInsert = [&]() {
+    const auto atStartOfSelection =
+        mHTMLEditor.GetFirstSelectionStartPoint<EditorDOMPoint>();
+    MOZ_ASSERT(atStartOfSelection.IsInContentNode());
+    return HTMLEditUtils::GetPossiblePointToInsert(
+        atStartOfSelection, *nsGkAtoms::br, mEditingHost);
+  }();
+  if (NS_WARN_IF(!pointToInsert.IsSet())) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  MOZ_ASSERT(pointToInsert.IsInContentNode());
+
+
+  Result<CreateLineBreakResult, nsresult> insertLineBreakResultOrError =
+      mHTMLEditor.InsertLineBreak(WithTransaction::Yes,
+                                  LineBreakType::BRElement, pointToInsert,
+                                  nsIEditor::eNext);
+  if (MOZ_UNLIKELY(insertLineBreakResultOrError.isErr())) {
+    NS_WARNING(
+        "HTMLEditor::InsertLineBreak(WithTransaction::Yes, "
+        "LineBreakType::BRElement, eNext) failed");
+    return insertLineBreakResultOrError.unwrapErr();
+  }
+  CreateLineBreakResult insertLineBreakResult =
+      insertLineBreakResultOrError.unwrap();
+  MOZ_ASSERT(insertLineBreakResult.Handled());
+  insertLineBreakResult.IgnoreCaretPointSuggestion();
+
+  auto pointToPutCaret = insertLineBreakResult.UnwrapCaretPoint();
+  if (MOZ_UNLIKELY(!pointToPutCaret.IsSet())) {
+    NS_WARNING("Inserted <br> was unexpectedly removed");
+    return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+  }
+  {
+    AutoTrackDOMPoint trackPointToPutCaret(mHTMLEditor.RangeUpdaterRef(),
+                                           &pointToPutCaret);
+    Result<CreateLineBreakResult, nsresult> insertPaddingBRResultOrError =
+        mHTMLEditor.InsertPaddingBRElementToMakeEmptyLineVisibleIfNeeded(
+            insertLineBreakResult.AfterLineBreak<EditorDOMPoint>(),
+            mEditingHost);
+    if (insertPaddingBRResultOrError.isErr()) [[unlikely]] {
+      NS_WARNING(
+          "HTMLEditor::InsertPaddingBRElementToMakeEmptyLineVisibleIfNeeded() "
+          "failed");
+      return insertPaddingBRResultOrError.propagateErr();
+    }
+    CreateLineBreakResult insertPaddingBRResult =
+        insertPaddingBRResultOrError.unwrap();
+    insertPaddingBRResult.IgnoreCaretPointSuggestion();
+    trackPointToPutCaret.Flush(StopTracking::Yes);
+    if (!insertPaddingBRResult.Handled()) {
+      const WSScanResult nextThingOfBR =
+          WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+              {WSRunScanner::Option::OnlyEditableNodes,
+               WSRunScanner::Option::StopAtAnyEmptyInlineContainers},
+              insertLineBreakResult.AfterLineBreak<EditorRawDOMPoint>());
+      if (nextThingOfBR.InVisibleOrCollapsibleCharacters() ||
+          nextThingOfBR.ReachedSpecialContent()) {
+        pointToPutCaret = nextThingOfBR.PointAtReachedContent<EditorDOMPoint>();
+      } else if (nextThingOfBR.ReachedEmptyInlineContainerElement()) {
+        pointToPutCaret = EditorDOMPoint(nextThingOfBR.ElementPtr(), 0u);
+      }
+    }
+  }
+
+  nsresult rv = mHTMLEditor.CollapseSelectionTo(pointToPutCaret);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::CollapseSelectionTo() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::AutoInsertLineBreakHandler::HandleInsertLinefeed() {
+  nsresult rv = mHTMLEditor.EnsureNoPaddingBRElementForEmptyEditor();
+  if (NS_WARN_IF(rv == NS_ERROR_EDITOR_DESTROYED)) {
+    return NS_ERROR_EDITOR_DESTROYED;
+  }
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::EnsureNoPaddingBRElementForEmptyEditor() "
+                       "failed, but ignored");
+
+  if (NS_SUCCEEDED(rv) && mHTMLEditor.SelectionRef().IsCollapsed()) {
+    nsresult rv =
+        mHTMLEditor.EnsureCaretNotAfterInvisibleBRElement(mEditingHost);
+    if (NS_WARN_IF(rv == NS_ERROR_EDITOR_DESTROYED)) {
+      return NS_ERROR_EDITOR_DESTROYED;
+    }
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "HTMLEditor::EnsureCaretNotAfterInvisibleBRElement() "
+                         "failed, but ignored");
+    if (NS_SUCCEEDED(rv)) {
+      nsresult rv = mHTMLEditor.PrepareInlineStylesForCaret();
+      if (NS_WARN_IF(rv == NS_ERROR_EDITOR_DESTROYED)) {
+        return NS_ERROR_EDITOR_DESTROYED;
+      }
+      NS_WARNING_ASSERTION(
+          NS_SUCCEEDED(rv),
+          "HTMLEditor::PrepareInlineStylesForCaret() failed, but ignored");
+    }
+  }
+
+  const EditorDOMPoint atStartOfSelection =
+      mHTMLEditor.GetFirstSelectionStartPoint<EditorDOMPoint>();
+  if (NS_WARN_IF(!atStartOfSelection.IsInContentNode())) {
+    return NS_ERROR_FAILURE;
+  }
+  MOZ_ASSERT(atStartOfSelection.IsSetAndValidInComposedDoc());
+
+  if (!HTMLEditUtils::IsSimplyEditableNode(
+          *atStartOfSelection.GetContainer())) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  Result<EditorDOMPoint, nsresult> insertLineFeedResult =
+      AutoInsertLineBreakHandler::InsertLinefeed(
+          mHTMLEditor, atStartOfSelection, mEditingHost);
+  if (MOZ_UNLIKELY(insertLineFeedResult.isErr())) {
+    NS_WARNING("AutoInsertLineBreakHandler::InsertLinefeed() failed");
+    return insertLineFeedResult.unwrapErr();
+  }
+  EditorDOMPoint pointToPutCaret = insertLineFeedResult.unwrap();
+  const WSScanResult nextThingOfLinefeed =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+          {WSRunScanner::Option::OnlyEditableNodes,
+           WSRunScanner::Option::StopAtAnyEmptyInlineContainers},
+          pointToPutCaret);
+  if (nextThingOfLinefeed.InVisibleOrCollapsibleCharacters() ||
+      nextThingOfLinefeed.ReachedSpecialContent()) {
+    pointToPutCaret =
+        nextThingOfLinefeed.PointAtReachedContent<EditorDOMPoint>();
+  } else if (nextThingOfLinefeed.ReachedEmptyInlineContainerElement()) {
+    pointToPutCaret = EditorDOMPoint(nextThingOfLinefeed.ElementPtr(), 0u);
+  }
+  rv = mHTMLEditor.CollapseSelectionTo(pointToPutCaret);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::CollapseSelectionTo() failed");
+  return rv;
+}
+
+Result<EditorDOMPoint, nsresult>
+HTMLEditor::AutoInsertLineBreakHandler::InsertLinefeed(
+    HTMLEditor& aHTMLEditor, const EditorDOMPoint& aPointToBreak,
+    const Element& aEditingHost) {
+  if (NS_WARN_IF(!aPointToBreak.IsSet())) {
+    return Err(NS_ERROR_INVALID_ARG);
+  }
+
+  const RefPtr<Document> document = aHTMLEditor.GetDocument();
+  MOZ_DIAGNOSTIC_ASSERT(document);
+  if (NS_WARN_IF(!document)) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+
+  Result<EditorDOMPoint, nsresult> setStyleResult =
+      aHTMLEditor.CreateStyleForInsertText(aPointToBreak, aEditingHost);
+  if (MOZ_UNLIKELY(setStyleResult.isErr())) {
+    NS_WARNING("HTMLEditor::CreateStyleForInsertText() failed");
+    return setStyleResult.propagateErr();
+  }
+
+  EditorDOMPoint pointToInsert = setStyleResult.inspect().IsSet()
+                                     ? setStyleResult.inspect()
+                                     : aPointToBreak;
+  if (NS_WARN_IF(!pointToInsert.IsSetAndValid()) ||
+      NS_WARN_IF(!pointToInsert.IsInContentNode())) {
+    return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+  }
+  MOZ_ASSERT(pointToInsert.IsSetAndValid());
+
+  pointToInsert = HTMLEditUtils::GetPossiblePointToInsert(
+      pointToInsert, *nsGkAtoms::textTagName, aEditingHost);
+  if (NS_WARN_IF(!pointToInsert.IsSet())) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  MOZ_ASSERT(pointToInsert.IsInContentNode());
+
+
+  AutoRestore<bool> disableListener(
+      aHTMLEditor.EditSubActionDataRef().mAdjustChangedRangeFromListener);
+  aHTMLEditor.EditSubActionDataRef().mAdjustChangedRangeFromListener = false;
+
+  AutoTransactionsConserveSelection dontChangeMySelection(aHTMLEditor);
+
+  AutoTrackDOMPoint trackingInsertingPosition(aHTMLEditor.RangeUpdaterRef(),
+                                              &pointToInsert);
+  Result<CreateLineBreakResult, nsresult> insertLinefeedResultOrError =
+      aHTMLEditor.InsertLineBreak(WithTransaction::Yes, LineBreakType::Linefeed,
+                                  pointToInsert, eNext);
+  if (MOZ_UNLIKELY(insertLinefeedResultOrError.isErr())) {
+    NS_WARNING(
+        "HTMLEditor::InsertLineBreak(WithTransaction::Yes, "
+        "LineBreakType::Linefeed, eNext) failed");
+    return insertLinefeedResultOrError.propagateErr();
+  }
+  trackingInsertingPosition.Flush(StopTracking::Yes);
+  CreateLineBreakResult insertLinefeedResult =
+      insertLinefeedResultOrError.unwrap();
+  EditorDOMPoint pointToPutCaret = insertLinefeedResult.UnwrapCaretPoint();
+
+  if (pointToPutCaret.IsInContentNode() && pointToPutCaret.IsEndOfContainer()) {
+    AutoTrackDOMPoint trackingInsertedPosition(aHTMLEditor.RangeUpdaterRef(),
+                                               &pointToInsert);
+    AutoTrackDOMPoint trackingNewCaretPosition(aHTMLEditor.RangeUpdaterRef(),
+                                               &pointToPutCaret);
+    Result<CreateLineBreakResult, nsresult> insertPaddingBRResultOrError =
+        aHTMLEditor.InsertPaddingBRElementToMakeEmptyLineVisibleIfNeeded(
+            insertLinefeedResult.AfterLineBreak<EditorDOMPoint>(),
+            aEditingHost);
+    if (insertPaddingBRResultOrError.isErr()) [[unlikely]] {
+      NS_WARNING(
+          "HTMLEditor::InsertPaddingBRElementToMakeEmptyLineVisibleIfNeeded() "
+          "failed");
+      return insertPaddingBRResultOrError.propagateErr();
+    }
+    insertPaddingBRResultOrError.unwrap().IgnoreCaretPointSuggestion();
+  }
+
+  MOZ_ASSERT(pointToPutCaret.IsSet());
+  if (NS_WARN_IF(!pointToPutCaret.IsSet())) {
+    DebugOnly<nsresult> rvIgnored =
+        aHTMLEditor.SelectionRef().SetInterlinePosition(
+            InterlinePosition::EndOfLine);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                         "Selection::SetInterlinePosition(InterlinePosition::"
+                         "EndOfLine) failed, but ignored");
+    if (NS_FAILED(aHTMLEditor.TopLevelEditSubActionDataRef()
+                      .mChangedRange->CollapseTo(pointToInsert))) {
+      NS_WARNING("nsRange::CollapseTo() failed");
+      return Err(NS_ERROR_FAILURE);
+    }
+    NS_WARNING(
+        "We always return NS_ERROR_FAILURE here because of a failure of "
+        "updating mChangedRange");
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  if (NS_FAILED(aHTMLEditor.TopLevelEditSubActionDataRef()
+                    .mChangedRange->SetStartAndEnd(
+                        pointToInsert.ToRawRangeBoundary(),
+                        pointToPutCaret.ToRawRangeBoundary()))) {
+    NS_WARNING("nsRange::SetStartAndEnd() failed");
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  pointToPutCaret.SetInterlinePosition(InterlinePosition::EndOfLine);
+  return pointToPutCaret;
+}
+
+}  

@@ -1,0 +1,178 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkMaskGamma_DEFINED)
+#define SkMaskGamma_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkCPUTypes.h"
+#include "include/private/base/SkNoncopyable.h"
+#include "include/private/base/SkTo.h"
+#include "src/core/SkColorData.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
+class SkColorSpaceLuminance : SkNoncopyable {
+public:
+    virtual ~SkColorSpaceLuminance() { }
+
+    virtual SkScalar toLuma(SkScalar gamma, SkScalar luminance) const = 0;
+    virtual SkScalar fromLuma(SkScalar gamma, SkScalar luma) const = 0;
+
+    static U8CPU computeLuminance(SkScalar gamma, SkColor c) {
+        const SkColorSpaceLuminance& luminance = Fetch(gamma);
+        SkScalar r = luminance.toLuma(gamma, SkIntToScalar(SkColorGetR(c)) / 255);
+        SkScalar g = luminance.toLuma(gamma, SkIntToScalar(SkColorGetG(c)) / 255);
+        SkScalar b = luminance.toLuma(gamma, SkIntToScalar(SkColorGetB(c)) / 255);
+        SkScalar luma = r * SK_LUM_COEFF_R +
+                        g * SK_LUM_COEFF_G +
+                        b * SK_LUM_COEFF_B;
+        SkASSERT(luma <= SK_Scalar1);
+        return SkScalarRoundToInt(luminance.fromLuma(gamma, luma) * 255);
+    }
+
+    static const SkColorSpaceLuminance& Fetch(SkScalar gamma);
+};
+
+template<U8CPU N> static inline U8CPU sk_t_scale255(U8CPU base) {
+    base <<= (8 - N);
+    U8CPU lum = base;
+    for (unsigned int i = N; i < 8; i += N) {
+        lum |= base >> i;
+    }
+    return lum;
+}
+template<>  inline U8CPU sk_t_scale255<1>(U8CPU base) {
+    return base * 0xFF;
+}
+template<>  inline U8CPU sk_t_scale255<2>(U8CPU base) {
+    return base * 0x55;
+}
+template<>  inline U8CPU sk_t_scale255<4>(U8CPU base) {
+    return base * 0x11;
+}
+template<>  inline U8CPU sk_t_scale255<8>(U8CPU base) {
+    return base;
+}
+
+template <int R_LUM_BITS, int G_LUM_BITS, int B_LUM_BITS> class SkTMaskPreBlend;
+
+void SkTMaskGamma_build_correcting_lut(uint8_t* table, U8CPU srcI, SkScalar contrast,
+                                       const SkColorSpaceLuminance& dstConvert, SkScalar dstGamma);
+
+template <int R_LUM_BITS, int G_LUM_BITS, int B_LUM_BITS> class SkTMaskGamma : public SkRefCnt {
+
+public:
+
+    constexpr SkTMaskGamma() {}
+
+    SkTMaskGamma(SkScalar contrast, SkScalar deviceGamma)
+        : fGammaTables(std::make_unique<uint8_t[]>(kTableNumElements))
+    {
+        const SkColorSpaceLuminance& deviceConvert = SkColorSpaceLuminance::Fetch(deviceGamma);
+        for (U8CPU i = 0; i < kNumTables; ++i) {
+            U8CPU lum = sk_t_scale255<kMaxLumBits>(i);
+            SkTMaskGamma_build_correcting_lut(&fGammaTables[i * kTableWidth], lum, contrast,
+                                              deviceConvert, deviceGamma);
+        }
+    }
+
+    static SkColor CanonicalColor(SkColor color) {
+        return SkColorSetRGB(
+                   sk_t_scale255<R_LUM_BITS>(SkColorGetR(color) >> (8 - R_LUM_BITS)),
+                   sk_t_scale255<G_LUM_BITS>(SkColorGetG(color) >> (8 - G_LUM_BITS)),
+                   sk_t_scale255<B_LUM_BITS>(SkColorGetB(color) >> (8 - B_LUM_BITS)));
+    }
+
+    typedef SkTMaskPreBlend<R_LUM_BITS, G_LUM_BITS, B_LUM_BITS> PreBlend;
+
+    PreBlend preBlend(SkColor color) const;
+
+    void getGammaTableDimensions(int* tableWidth, int* numTables) const {
+        *tableWidth = kTableWidth;
+        *numTables = kNumTables;
+    }
+
+    constexpr size_t getGammaTableSizeInBytes() const {
+        return kTableNumElements * sizeof(uint8_t);
+    }
+
+    const uint8_t* getGammaTables() const {
+        return fGammaTables.get();
+    }
+
+private:
+    static constexpr int kMaxLumBits = std::max({B_LUM_BITS, R_LUM_BITS, G_LUM_BITS});
+    static constexpr size_t kNumTables = 1 << kMaxLumBits;
+    static constexpr size_t kTableWidth = 256;
+    static constexpr size_t kTableNumElements = kNumTables * kTableWidth;
+
+    constexpr bool isLinear() const {
+        return fGammaTables == nullptr;
+    }
+
+    std::unique_ptr<uint8_t[]> fGammaTables;
+
+    using INHERITED = SkRefCnt;
+};
+
+template <int R_LUM_BITS, int G_LUM_BITS, int B_LUM_BITS> class SkTMaskPreBlend {
+private:
+    SkTMaskPreBlend(sk_sp<const SkTMaskGamma<R_LUM_BITS, G_LUM_BITS, B_LUM_BITS>> parent,
+                    const uint8_t* r, const uint8_t* g, const uint8_t* b)
+    : fParent(std::move(parent)), fR(r), fG(g), fB(b) { }
+
+    sk_sp<const SkTMaskGamma<R_LUM_BITS, G_LUM_BITS, B_LUM_BITS>> fParent;
+    friend class SkTMaskGamma<R_LUM_BITS, G_LUM_BITS, B_LUM_BITS>;
+public:
+    SkTMaskPreBlend() : fParent(), fR(nullptr), fG(nullptr), fB(nullptr) { }
+
+    SkTMaskPreBlend(const SkTMaskPreBlend<R_LUM_BITS, G_LUM_BITS, B_LUM_BITS>& that)
+    : fParent(that.fParent), fR(that.fR), fG(that.fG), fB(that.fB) { }
+
+    ~SkTMaskPreBlend() { }
+
+    bool isApplicable() const { return SkToBool(this->fG); }
+
+    const uint8_t* fR;
+    const uint8_t* fG;
+    const uint8_t* fB;
+};
+
+template <int R_LUM_BITS, int G_LUM_BITS, int B_LUM_BITS>
+SkTMaskPreBlend<R_LUM_BITS, G_LUM_BITS, B_LUM_BITS>
+SkTMaskGamma<R_LUM_BITS, G_LUM_BITS, B_LUM_BITS>::preBlend(SkColor color) const {
+    if (isLinear()) {
+        return SkTMaskPreBlend<R_LUM_BITS, G_LUM_BITS, B_LUM_BITS>();
+    }
+    constexpr size_t lum_shift = 8 - kMaxLumBits;
+    const size_t r_index = (SkColorGetR(color) >> lum_shift) * kTableWidth;
+    const size_t g_index = (SkColorGetG(color) >> lum_shift) * kTableWidth;
+    const size_t b_index = (SkColorGetB(color) >> lum_shift) * kTableWidth;
+    SkASSERT(r_index < kTableNumElements &&
+             g_index < kTableNumElements &&
+             b_index < kTableNumElements);
+    return SkTMaskPreBlend<R_LUM_BITS, G_LUM_BITS, B_LUM_BITS>(sk_ref_sp(this),
+                         &fGammaTables[r_index],
+                         &fGammaTables[g_index],
+                         &fGammaTables[b_index]);
+}
+
+template<bool APPLY_LUT> static inline U8CPU sk_apply_lut_if(U8CPU component, const uint8_t*) {
+    return component;
+}
+template<>  inline U8CPU sk_apply_lut_if<true>(U8CPU component, const uint8_t* lut) {
+    return lut[component];
+}
+
+#endif

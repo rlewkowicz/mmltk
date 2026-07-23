@@ -1,0 +1,310 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef NSDEQUE
+#define NSDEQUE
+#include <cstddef>
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/fallible.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/RefPtr.h"
+#include "nsCOMPtr.h"
+#include "nsDebug.h"
+#include "nsISupports.h"
+
+namespace mozilla {
+
+namespace detail {
+class nsDequeBase {
+ public:
+  nsDequeBase& operator=(const nsDequeBase& aOther) = delete;
+  nsDequeBase(const nsDequeBase& aOther) = delete;
+
+  inline size_t GetSize() const { return mSize; }
+
+ protected:
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+  explicit nsDequeBase();
+
+  ~nsDequeBase();
+
+  [[nodiscard]] bool Push(void* aItem, const fallible_t&);
+
+  [[nodiscard]] bool PushFront(void* aItem, const fallible_t&);
+
+  void* Pop();
+
+  void* PopFront();
+
+  void* Peek() const;
+
+  void* PeekFront() const;
+
+  void* ObjectAt(size_t aIndex) const;
+
+  bool GrowCapacity();
+
+  void Empty();
+
+  size_t mSize;
+  size_t mCapacity;
+  size_t mOrigin;
+  void* mBuffer[8];
+  void** mData;
+};
+
+template <typename Deque>
+class ConstDequeIterator {
+ public:
+  ConstDequeIterator(const Deque& aDeque, size_t aIndex)
+      : mDeque(aDeque), mIndex(aIndex) {}
+  ConstDequeIterator& operator++() {
+    ++mIndex;
+    return *this;
+  }
+  bool operator==(const ConstDequeIterator& aOther) const {
+    return mIndex == aOther.mIndex;
+  }
+  bool operator!=(const ConstDequeIterator& aOther) const {
+    return mIndex != aOther.mIndex;
+  }
+  typename Deque::PointerType operator*() const {
+    MOZ_RELEASE_ASSERT(mIndex < mDeque.GetSize());
+    return mDeque.ObjectAt(mIndex);
+  }
+
+ private:
+  const Deque& mDeque;
+  size_t mIndex;
+};
+
+template <typename Deque>
+class ConstIterator {
+ public:
+  static const size_t EndIteratorIndex = size_t(-1);
+
+  ConstIterator(const Deque& aDeque, size_t aIndex)
+      : mDeque(aDeque), mIndex(aIndex) {}
+  ConstIterator& operator++() {
+    MOZ_ASSERT(mIndex != EndIteratorIndex);
+    ++mIndex;
+    return *this;
+  }
+  bool operator==(const ConstIterator& aOther) const {
+    return EffectiveIndex() == aOther.EffectiveIndex();
+  }
+  bool operator!=(const ConstIterator& aOther) const {
+    return EffectiveIndex() != aOther.EffectiveIndex();
+  }
+  typename Deque::PointerType operator*() const {
+    MOZ_RELEASE_ASSERT(mIndex < mDeque.GetSize());
+    return mDeque.ObjectAt(mIndex);
+  }
+
+ private:
+  size_t EffectiveIndex() const {
+    return (mIndex < mDeque.GetSize()) ? mIndex : mDeque.GetSize();
+  }
+
+  const Deque& mDeque;
+  size_t mIndex;  
+};
+
+}  
+}  
+
+template <typename T>
+class nsDequeFunctor {
+ public:
+  virtual void operator()(T* aObject) = 0;
+  virtual ~nsDequeFunctor() = default;
+};
+
+
+template <typename T>
+class nsDeque : public mozilla::detail::nsDequeBase {
+  typedef mozilla::fallible_t fallible_t;
+
+ public:
+  using PointerType = T*;
+  using ConstDequeIterator = mozilla::detail::ConstDequeIterator<nsDeque<T>>;
+  using ConstIterator = mozilla::detail::ConstIterator<nsDeque<T>>;
+
+  explicit nsDeque(nsDequeFunctor<T>* aDeallocator = nullptr) {
+    MOZ_COUNT_CTOR(nsDeque);
+    mDeallocator = aDeallocator;
+  }
+
+  ~nsDeque() {
+    MOZ_COUNT_DTOR(nsDeque);
+
+    Erase();
+    SetDeallocator(nullptr);
+  }
+
+  nsDeque(const nsDeque& aOther) = delete;
+  nsDeque& operator=(const nsDeque& aOther) = delete;
+
+  inline void Push(T* aItem) {
+    if (!nsDequeBase::Push(aItem, mozilla::fallible)) {
+      NS_ABORT_OOM(mSize * sizeof(T*));
+    }
+  }
+
+  [[nodiscard]] inline bool Push(T* aItem, const fallible_t& aFaillible) {
+    return nsDequeBase::Push(aItem, aFaillible);
+  }
+
+  inline void PushFront(T* aItem) {
+    if (!nsDequeBase::PushFront(aItem, mozilla::fallible)) {
+      NS_ABORT_OOM(mSize * sizeof(T*));
+    }
+  }
+
+  [[nodiscard]] bool PushFront(T* aItem, const fallible_t& aFallible) {
+    return nsDequeBase::PushFront(aItem, aFallible);
+  }
+
+  inline T* Pop() { return static_cast<T*>(nsDequeBase::Pop()); }
+
+  inline T* PopFront() { return static_cast<T*>(nsDequeBase::PopFront()); }
+
+  inline T* Peek() const { return static_cast<T*>(nsDequeBase::Peek()); }
+
+  inline T* PeekFront() const {
+    return static_cast<T*>(nsDequeBase::PeekFront());
+  }
+
+  inline T* ObjectAt(size_t aIndex) const {
+    if (NS_WARN_IF(aIndex >= GetSize())) {
+      return nullptr;
+    }
+    return static_cast<T*>(nsDequeBase::ObjectAt(aIndex));
+  }
+
+  void Erase() {
+    if (mDeallocator && mSize) {
+      ForEach(*mDeallocator);
+    }
+    Empty();
+  }
+
+  void ForEach(nsDequeFunctor<T>& aFunctor) const {
+    for (size_t i = 0; i < mSize; ++i) {
+      aFunctor(ObjectAt(i));
+    }
+  }
+
+  ConstDequeIterator begin() const { return ConstDequeIterator(*this, 0); }
+  ConstDequeIterator end() const { return ConstDequeIterator(*this, mSize); }
+
+  ConstIterator begin() { return ConstIterator(*this, 0); }
+  ConstIterator end() {
+    return ConstIterator(*this, ConstIterator::EndIteratorIndex);
+  }
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    size_t size = nsDequeBase::SizeOfExcludingThis(aMallocSizeOf);
+    if (mDeallocator) {
+      size += aMallocSizeOf(mDeallocator);
+    }
+    return size;
+  }
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+ protected:
+  nsDequeFunctor<T>* mDeallocator;
+
+ private:
+  void SetDeallocator(nsDequeFunctor<T>* aDeallocator) {
+    delete mDeallocator;
+    mDeallocator = aDeallocator;
+  }
+};
+
+template <typename T>
+class nsRefPtrDeque : private nsDeque<T> {
+  typedef mozilla::fallible_t fallible_t;
+
+  class RefPtrDeallocator : public nsDequeFunctor<T> {
+   public:
+    virtual void operator()(T* aObject) override {
+      RefPtr<T> releaseMe = dont_AddRef(aObject);
+    }
+  };
+
+ public:
+  using PointerType = RefPtr<T>;
+  using ConstDequeIterator =
+      mozilla::detail::ConstDequeIterator<nsRefPtrDeque<T>>;
+  using ConstIterator = mozilla::detail::ConstIterator<nsRefPtrDeque<T>>;
+
+  explicit nsRefPtrDeque() : nsDeque<T>(new RefPtrDeallocator()) {}
+
+  inline void PushFront(already_AddRefed<T> aItem) {
+    T* item = aItem.take();
+    nsDeque<T>::PushFront(item);
+  }
+
+  inline void PushFront(T* aItem) { PushFront(do_AddRef(aItem)); }
+
+  inline void Push(T* aItem) { Push(do_AddRef(aItem)); }
+
+  inline void Push(already_AddRefed<T> aItem) {
+    T* item = aItem.take();
+    nsDeque<T>::Push(item);
+  }
+
+  inline already_AddRefed<T> PopFront() {
+    return dont_AddRef(nsDeque<T>::PopFront());
+  }
+
+  inline already_AddRefed<T> Pop() { return dont_AddRef(nsDeque<T>::Pop()); }
+
+  inline T* PeekFront() const { return nsDeque<T>::PeekFront(); }
+
+  inline T* Peek() const { return nsDeque<T>::Peek(); }
+
+  inline T* ObjectAt(size_t aIndex) const {
+    return nsDeque<T>::ObjectAt(aIndex);
+  }
+
+  inline void Erase() { nsDeque<T>::Erase(); }
+
+  ConstDequeIterator begin() const { return ConstDequeIterator(*this, 0); }
+  ConstDequeIterator end() const {
+    return ConstDequeIterator(*this, GetSize());
+  }
+
+  ConstIterator begin() { return ConstIterator(*this, 0); }
+  ConstIterator end() {
+    return ConstIterator(*this, ConstIterator::EndIteratorIndex);
+  }
+
+  inline size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return nsDeque<T>::SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  inline size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return nsDeque<T>::SizeOfIncludingThis(aMallocSizeOf);
+  }
+
+  inline size_t GetSize() const { return nsDeque<T>::GetSize(); }
+
+  void ForEach(nsDequeFunctor<T>& aFunctor) const {
+    size_t size = GetSize();
+    for (size_t i = 0; i < size; ++i) {
+      aFunctor(ObjectAt(i));
+    }
+  }
+};
+
+#endif

@@ -1,0 +1,117 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPoint3_DEFINED)
+#define SkPoint3_DEFINED
+
+#include "include/core/SkScalar.h"
+#include "include/private/base/SkAPI.h"
+#include "include/private/base/SkFloatingPoint.h"
+
+struct SK_API SkPoint3 {
+    SkScalar fX, fY, fZ;
+
+    static SkPoint3 Make(SkScalar x, SkScalar y, SkScalar z) {
+        SkPoint3 pt;
+        pt.set(x, y, z);
+        return pt;
+    }
+
+    SkScalar x() const { return fX; }
+    SkScalar y() const { return fY; }
+    SkScalar z() const { return fZ; }
+
+    void set(SkScalar x, SkScalar y, SkScalar z) { fX = x; fY = y; fZ = z; }
+
+    friend bool operator==(const SkPoint3& a, const SkPoint3& b) {
+        return a.fX == b.fX && a.fY == b.fY && a.fZ == b.fZ;
+    }
+
+    friend bool operator!=(const SkPoint3& a, const SkPoint3& b) {
+        return !(a == b);
+    }
+
+    static SkScalar Length(SkScalar x, SkScalar y, SkScalar z);
+
+    SkScalar length() const { return SkPoint3::Length(fX, fY, fZ); }
+
+    bool normalize();
+
+    SkPoint3 makeScale(SkScalar scale) const {
+        SkPoint3 p;
+        p.set(scale * fX, scale * fY, scale * fZ);
+        return p;
+    }
+
+    void scale(SkScalar value) {
+        fX *= value;
+        fY *= value;
+        fZ *= value;
+    }
+
+    SkPoint3 operator-() const {
+        SkPoint3 neg;
+        neg.fX = -fX;
+        neg.fY = -fY;
+        neg.fZ = -fZ;
+        return neg;
+    }
+
+    friend SkPoint3 operator-(const SkPoint3& a, const SkPoint3& b) {
+        return { a.fX - b.fX, a.fY - b.fY, a.fZ - b.fZ };
+    }
+
+    friend SkPoint3 operator+(const SkPoint3& a, const SkPoint3& b) {
+        return { a.fX + b.fX, a.fY + b.fY, a.fZ + b.fZ };
+    }
+
+    void operator+=(const SkPoint3& v) {
+        fX += v.fX;
+        fY += v.fY;
+        fZ += v.fZ;
+    }
+
+    void operator-=(const SkPoint3& v) {
+        fX -= v.fX;
+        fY -= v.fY;
+        fZ -= v.fZ;
+    }
+
+    friend SkPoint3 operator*(SkScalar t, SkPoint3 p) {
+        return { t * p.fX, t * p.fY, t * p.fZ };
+    }
+
+    bool isFinite() const {
+        return SkIsFinite(fX, fY, fZ);
+    }
+
+    static SkScalar DotProduct(const SkPoint3& a, const SkPoint3& b) {
+        return a.fX * b.fX + a.fY * b.fY + a.fZ * b.fZ;
+    }
+
+    SkScalar dot(const SkPoint3& vec) const {
+        return DotProduct(*this, vec);
+    }
+
+    static SkPoint3 CrossProduct(const SkPoint3& a, const SkPoint3& b) {
+        SkPoint3 result;
+        result.fX = a.fY*b.fZ - a.fZ*b.fY;
+        result.fY = a.fZ*b.fX - a.fX*b.fZ;
+        result.fZ = a.fX*b.fY - a.fY*b.fX;
+
+        return result;
+    }
+
+    SkPoint3 cross(const SkPoint3& vec) const {
+        return CrossProduct(*this, vec);
+    }
+};
+
+typedef SkPoint3 SkVector3;
+typedef SkPoint3 SkColor3f;
+
+#endif

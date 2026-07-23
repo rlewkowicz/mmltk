@@ -1,0 +1,147 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_PathUtils_
+#define mozilla_dom_PathUtils_
+
+#include "mozilla/DataMutex.h"
+#include "mozilla/EnumeratedArray.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/Result.h"
+#include "mozilla/dom/PathUtilsBinding.h"
+#include "mozilla/dom/Promise.h"
+#include "nsAppDirectoryServiceDefs.h"
+#include "nsDirectoryServiceDefs.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+class ErrorResult;
+
+class PathUtils final {
+ public:
+  static nsresult InitFileWithPath(nsIFile* aFile, const nsAString& aPath);
+
+  static void Filename(const dom::GlobalObject&, const nsAString& aPath,
+                       nsString& aResult, ErrorResult& aErr);
+
+  static void Parent(const dom::GlobalObject&, const nsAString& aPath,
+                     const int32_t aDepth, nsString& aResult,
+                     ErrorResult& aErr);
+
+  static void Join(const dom::GlobalObject&,
+                   const dom::Sequence<nsString>& aComponents,
+                   nsString& aResult, ErrorResult& aErr);
+
+  static already_AddRefed<nsIFile> Join(const Span<const nsString>& aComponents,
+                                        ErrorResult& aErr);
+
+  static void JoinRelative(const dom::GlobalObject&, const nsAString& aBasePath,
+                           const nsAString& aRelativePath, nsString& aResult,
+                           ErrorResult& aErr);
+
+  static void ToExtendedWindowsPath(const dom::GlobalObject&,
+                                    const nsAString& aPath, nsString& aResult,
+                                    ErrorResult& aErr);
+
+  static void Normalize(const dom::GlobalObject&, const nsAString& aPath,
+                        nsString& aResult, ErrorResult& aErr);
+
+  static void Split(const dom::GlobalObject&, const nsAString& aPath,
+                    nsTArray<nsString>& aResult, ErrorResult& aErr);
+
+  static void SplitRelative(const dom::GlobalObject& aGlobal,
+                            const nsAString& aPath,
+                            const dom::SplitRelativeOptions& aOptions,
+                            nsTArray<nsString>& aResult, ErrorResult& aErr);
+
+  static void ToFileURI(const dom::GlobalObject&, const nsAString& aPath,
+                        nsCString& aResult, ErrorResult& aErr);
+
+  static bool IsAbsolute(const dom::GlobalObject&, const nsAString& aPath);
+
+  static void GetProfileDirSync(const dom::GlobalObject&, nsString& aResult,
+                                ErrorResult& aErr);
+  static void GetLocalProfileDirSync(const dom::GlobalObject&,
+                                     nsString& aResult, ErrorResult& aErr);
+  static void GetTempDirSync(const dom::GlobalObject&, nsString& aResult,
+                             ErrorResult& aErr);
+  static void GetXulLibraryPathSync(const dom::GlobalObject&, nsString& aResult,
+                                    ErrorResult& aErr);
+
+  static already_AddRefed<dom::Promise> GetProfileDirAsync(
+      const dom::GlobalObject& aGlobal, ErrorResult& aErr);
+  static already_AddRefed<dom::Promise> GetLocalProfileDirAsync(
+      const dom::GlobalObject& aGlobal, ErrorResult& aErr);
+  static already_AddRefed<dom::Promise> GetTempDirAsync(
+      const dom::GlobalObject& aGlobal, ErrorResult& aErr);
+  static already_AddRefed<dom::Promise> GetXulLibraryPathAsync(
+      const dom::GlobalObject& aGlobal, ErrorResult& aErr);
+
+ private:
+  class DirectoryCache;
+  friend class DirectoryCache;
+
+  static StaticDataMutex<Maybe<DirectoryCache>> sDirCache;
+};
+
+class PathUtils::DirectoryCache final {
+ public:
+  enum class Directory {
+    Profile,
+    LocalProfile,
+    Temp,
+    XulLibrary,
+    Count,
+  };
+
+  DirectoryCache();
+  DirectoryCache(const DirectoryCache&) = delete;
+  DirectoryCache(DirectoryCache&&) = delete;
+  DirectoryCache& operator=(const DirectoryCache&) = delete;
+  DirectoryCache& operator=(DirectoryCache&&) = delete;
+
+  static DirectoryCache& Ensure(Maybe<DirectoryCache>& aCache);
+
+  void GetDirectorySync(nsString& aResult, ErrorResult& aErr,
+                        const Directory aRequestedDir);
+
+  already_AddRefed<dom::Promise> GetDirectoryAsync(
+      const dom::GlobalObject& aGlobalObject, ErrorResult& aErr,
+      const Directory aRequestedDir);
+
+ private:
+  using PopulateDirectoriesPromise = MozPromise<Ok, nsresult, false>;
+
+  already_AddRefed<PopulateDirectoriesPromise> PopulateDirectories(
+      const Directory aRequestedDir);
+
+  nsresult PopulateDirectoriesImpl(const Directory aRequestedDir);
+
+  void ResolvePopulateDirectoriesPromise(nsresult aRv,
+                                         const Directory aRequestedDir);
+
+  void ResolveWithDirectory(dom::Promise* aPromise,
+                            const Directory aRequestedDir);
+
+  template <typename T>
+  using DirectoryArray =
+      EnumeratedArray<Directory, T, size_t(Directory::Count)>;
+
+  DirectoryArray<nsString> mDirectories;
+  DirectoryArray<MozPromiseHolder<PopulateDirectoriesPromise>> mPromises;
+
+  static constexpr DirectoryArray<const char*> kDirectoryNames{
+      NS_APP_USER_PROFILE_50_DIR,
+      NS_APP_USER_PROFILE_LOCAL_50_DIR,
+      NS_OS_TEMP_DIR,
+      NS_XPCOM_LIBRARY_FILE,
+  };
+};
+
+}  
+
+#endif

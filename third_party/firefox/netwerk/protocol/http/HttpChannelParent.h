@@ -1,0 +1,262 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_HttpChannelParent_h
+#define mozilla_net_HttpChannelParent_h
+
+#include "HttpBaseChannel.h"
+#include "nsHttp.h"
+#include "mozilla/net/PHttpChannelParent.h"
+#include "mozilla/net/NeckoCommon.h"
+#include "mozilla/net/NeckoParent.h"
+#include "mozilla/MozPromise.h"
+#include "nsIParentRedirectingChannel.h"
+#include "nsIProgressEventSink.h"
+#include "nsIChannelEventSink.h"
+#include "nsIRedirectResultListener.h"
+#include "nsHttpChannel.h"
+#include "mozilla/dom/ipc/IdType.h"
+#include "nsIMultiPartChannel.h"
+#include "nsIURI.h"
+
+class nsICacheEntry;
+
+#define HTTP_CHANNEL_PARENT_IID \
+  {0x982b2372, 0x7aa5, 0x4e8a, {0xbd, 0x9f, 0x89, 0x74, 0xd7, 0xf0, 0x58, 0xeb}}
+
+namespace mozilla {
+
+namespace dom {
+class BrowserParent;
+}  
+
+namespace net {
+
+class HttpBackgroundChannelParent;
+class ParentChannelListener;
+class ChannelEventQueue;
+class CacheEntryWriteHandleParent;
+
+class HttpChannelParent final : public nsIInterfaceRequestor,
+                                public PHttpChannelParent,
+                                public nsIParentRedirectingChannel,
+                                public nsIProgressEventSink,
+                                public HttpChannelSecurityWarningReporter,
+                                public nsIAsyncVerifyRedirectReadyCallback,
+                                public nsIChannelEventSink,
+                                public nsIRedirectResultListener,
+                                public nsIMultiPartChannelListener {
+  virtual ~HttpChannelParent();
+
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSIPARENTCHANNEL
+  NS_DECL_NSIPARENTREDIRECTINGCHANNEL
+  NS_DECL_NSIPROGRESSEVENTSINK
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSIASYNCVERIFYREDIRECTREADYCALLBACK
+  NS_DECL_NSICHANNELEVENTSINK
+  NS_DECL_NSIREDIRECTRESULTLISTENER
+  NS_DECL_NSIMULTIPARTCHANNELLISTENER
+
+  NS_INLINE_DECL_STATIC_IID(HTTP_CHANNEL_PARENT_IID)
+
+  HttpChannelParent(dom::BrowserParent* iframeEmbedding,
+                    nsILoadContext* aLoadContext,
+                    PBOverrideStatus aOverrideStatus);
+
+  [[nodiscard]] bool Init(const HttpChannelCreationArgs& aArgs);
+
+  void SetApplyConversion(bool aApplyConversion) {
+    if (mChannel) {
+      mChannel->SetApplyConversion(aApplyConversion);
+    }
+  }
+
+  [[nodiscard]] nsresult OpenAlternativeOutputStream(
+      const nsACString& type, int64_t predictedSize,
+      nsIAsyncOutputStream** _retval);
+
+  [[nodiscard]] CacheEntryWriteHandleParent* AllocCacheEntryWriteHandle();
+
+  void TryInvokeAsyncOpen(nsresult aRv);
+
+  void InvokeAsyncOpen(nsresult rv);
+
+  void InvokeEarlyHintPreloader(nsresult rv, uint64_t aEarlyHintPreloaderId);
+
+  void DoSendSetPriority(int16_t aValue);
+
+  void DoSendReportLNAToConsole(const NetAddr& aPeerAddr,
+                                const nsACString& aMessageType,
+                                const nsACString& aPromptAction,
+                                const nsACString& aTopLevelSite);
+
+  dom::ContentParentId GetContentParentId() const;
+
+  void OnBackgroundParentReady(HttpBackgroundChannelParent* aBgParent);
+  void OnBackgroundParentDestroyed();
+
+  base::ProcessId OtherPid() const;
+
+  void OverrideReferrerInfoDuringBeginConnect(nsIReferrerInfo* aReferrerInfo);
+
+  void SetCookieChanges(nsTArray<CookieChange>&& aCookieChanges);
+
+  void SetHttpChannelFromEarlyHintPreloader(HttpBaseChannel* aChannel);
+
+ protected:
+  [[nodiscard]] bool ConnectChannel(const uint32_t& registrarId);
+
+  [[nodiscard]] bool DoAsyncOpen(
+      nsIURI* uri, nsIURI* originalUri, nsIURI* docUri,
+      nsIReferrerInfo* aReferrerInfo, nsIURI* aAPIRedirectToURI,
+      nsIURI* topWindowUri, const uint32_t& loadFlags,
+      const RequestHeaderTuples& requestHeaders, const nsCString& requestMethod,
+      const Maybe<IPCStream>& uploadStream, const int16_t& priority,
+      const ClassOfService& classOfService, const uint8_t& redirectionLimit,
+      const bool& allowSTS, const uint32_t& thirdPartyFlags,
+      const bool& doResumeAt, const uint64_t& startPos,
+      const nsCString& entityID, const bool& allowSpdy, const bool& allowHttp3,
+      const bool& allowAltSvc, const bool& beConservative,
+      const bool& bypassProxy, const uint32_t& tlsFlags,
+      const LoadInfoArgs& aLoadInfoArgs, const uint32_t& aCacheKey,
+      const uint64_t& aRequestContextID,
+      const Maybe<CorsPreflightArgs>& aCorsPreflightArgs,
+      const uint32_t& aInitialRwin, const bool& aBlockAuthPrompt,
+      const bool& aAllowStaleCacheContent,
+      const bool& aPreferCacheLoadOverBypass, const nsCString& aContentTypeHint,
+      const dom::RequestMode& aRequestMode, const uint32_t& aRedirectMode,
+      const uint64_t& aChannelId, const uint64_t& aContentWindowId,
+      const nsTArray<PreferredAlternativeDataTypeParams>&
+          aPreferredAlternativeTypes,
+      const uint64_t& aBrowserId, const TimeStamp& aLaunchServiceWorkerStart,
+      const TimeStamp& aLaunchServiceWorkerEnd,
+      const TimeStamp& aDispatchFetchEventStart,
+      const TimeStamp& aDispatchFetchEventEnd,
+      const TimeStamp& aHandleFetchEventStart,
+      const TimeStamp& aHandleFetchEventEnd,
+      const bool& aForceMainDocumentChannel,
+      const TimeStamp& aNavigationStartTimeStamp,
+      const uint64_t& aEarlyHintPreloaderId,
+      const nsAString& aClassicScriptHintCharset,
+      const nsAString& aDocumentCharacterSet,
+      const bool& aIsUserAgentHeaderModified, const nsString& aInitiatorType);
+
+  virtual mozilla::ipc::IPCResult RecvSetPriority(
+      const int16_t& priority) override;
+  virtual mozilla::ipc::IPCResult RecvSetClassOfService(
+      const ClassOfService& cos) override;
+  virtual mozilla::ipc::IPCResult RecvSuspend() override;
+  virtual mozilla::ipc::IPCResult RecvResume() override;
+  virtual mozilla::ipc::IPCResult RecvCancel(
+      const nsresult& status, const uint32_t& requestBlockingReason,
+      const nsACString& reason,
+      const mozilla::Maybe<nsCString>& logString) override;
+  virtual mozilla::ipc::IPCResult RecvRedirect2Verify(
+      const nsresult& result, const RequestHeaderTuples& changedHeaders,
+      const uint32_t& aSourceRequestBlockingReason,
+      const Maybe<ChildLoadInfoForwarderArgs>& aTargetLoadInfoForwarder,
+      const uint32_t& loadFlags, nsIReferrerInfo* aReferrerInfo,
+      nsIURI* apiRedirectUri,
+      const Maybe<CorsPreflightArgs>& aCorsPreflightArgs) override;
+  virtual mozilla::ipc::IPCResult RecvDocumentChannelCleanup(
+      const bool& clearCacheEntry) override;
+  virtual mozilla::ipc::IPCResult RecvRemoveCorsPreflightCacheEntry(
+      nsIURI* uri, const mozilla::ipc::PrincipalInfo& requestingPrincipal,
+      const OriginAttributes& originAttributes) override;
+  virtual mozilla::ipc::IPCResult RecvBytesRead(const int32_t& aCount) override;
+  virtual mozilla::ipc::IPCResult RecvOpenOriginalCacheInputStream() override;
+  virtual void ActorDestroy(ActorDestroyReason why) override;
+
+  friend class ParentChannelListener;
+  RefPtr<mozilla::dom::BrowserParent> mBrowserParent;
+
+  [[nodiscard]] nsresult ReportSecurityMessage(
+      const nsAString& aMessageTag, const nsAString& aMessageCategory) override;
+  nsresult LogBlockedCORSRequest(const nsAString& aMessage,
+                                 const nsACString& aCategory,
+                                 bool aIsWarning = false) override;
+  nsresult LogMimeTypeMismatch(const nsACString& aMessageName, bool aWarning,
+                               const nsAString& aURL,
+                               const nsAString& aContentType) override;
+
+  [[nodiscard]] bool DoSendDeleteSelf();
+  virtual mozilla::ipc::IPCResult RecvDeletingChannel() override;
+
+ private:
+  already_AddRefed<nsITransportSecurityInfo> SecurityInfo();
+
+  void ContinueRedirect2Verify(const nsresult& aResult);
+
+  void AsyncOpenFailed(nsresult aRv);
+
+  [[nodiscard]] RefPtr<GenericNonExclusivePromise> WaitForBgParent(
+      uint64_t aChannelId);
+
+  void CleanupBackgroundChannel();
+
+  bool NeedFlowControl();
+
+  nsCOMPtr<nsISerialEventTarget> GetEventTargetForBgParentWait();
+
+  bool IsRedirectDueToAuthRetry(uint32_t redirectFlags);
+
+  int32_t mSendWindowSize;
+
+  friend class HttpBackgroundChannelParent;
+
+  uint64_t mEarlyHintPreloaderId{};
+
+  RefPtr<HttpBaseChannel> mChannel;
+  nsCOMPtr<nsICacheEntry> mCacheEntry;
+
+  nsCOMPtr<nsIChannel> mRedirectChannel;
+  nsCOMPtr<nsIAsyncVerifyRedirectCallback> mRedirectCallback;
+
+  nsCOMPtr<nsILoadContext> mLoadContext;
+  RefPtr<nsHttpHandler> mHttpHandler;
+
+  RefPtr<ParentChannelListener> mParentListener;
+
+  RefPtr<ChannelEventQueue> mEventQ;
+
+  RefPtr<HttpBackgroundChannelParent> mBgParent;
+
+  MozPromiseHolder<GenericNonExclusivePromise> mPromise;
+  MozPromiseRequestHolder<GenericNonExclusivePromise> mRequest;
+
+
+  Atomic<bool> mIPCClosed;  
+
+  uint64_t mRedirectChannelId = 0;
+
+  PBOverrideStatus mPBOverride;
+
+  nsresult mStatus;
+
+  nsCOMPtr<nsIReferrerInfo> mOverrideReferrerInfo;
+
+  nsTArray<CookieChange> mCookieChanges;
+
+  uint8_t mIgnoreProgress : 1;
+
+
+  uint8_t mCacheNeedFlowControlInitialized : 1;
+  uint8_t mNeedFlowControl : 1;
+  uint8_t mSuspendedForFlowControl : 1;
+
+  uint8_t mAfterOnStartRequestBegun : 1;
+
+  uint8_t mAsyncOpenBarrier = 0;
+
+  uint8_t mDataSentToChildProcess : 1;
+};
+
+}  
+}  
+
+#endif  // mozilla_net_HttpChannelParent_h

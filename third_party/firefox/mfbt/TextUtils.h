@@ -1,0 +1,186 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_TextUtils_h
+#define mozilla_TextUtils_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Latin1.h"
+#include "mozilla/Span.h"
+
+#include <cstdint>
+
+#ifdef MOZ_HAS_JSRUST
+extern "C" {
+size_t encoding_ascii_valid_up_to(uint8_t const* buffer, size_t buffer_len);
+}
+#endif
+
+namespace mozilla {
+
+
+
+inline constexpr bool IsAscii(unsigned char aChar) { return aChar < 0x80; }
+
+inline constexpr bool IsAscii(signed char aChar) {
+  return IsAscii(static_cast<unsigned char>(aChar));
+}
+
+inline constexpr bool IsAscii(char aChar) {
+  return IsAscii(static_cast<unsigned char>(aChar));
+}
+
+inline constexpr bool IsAscii(char8_t aChar) {
+  return IsAscii(static_cast<unsigned char>(aChar));
+}
+
+inline constexpr bool IsAscii(char16_t aChar) { return aChar < 0x80; }
+
+inline constexpr bool IsAscii(char32_t aChar) { return aChar < 0x80; }
+
+inline bool IsAscii(mozilla::Span<const char> aString) {
+#if MOZ_HAS_JSRUST()
+  size_t length = aString.Length();
+  const char* ptr = aString.Elements();
+  if (length < mozilla::detail::kShortStringLimitForInlinePaths) {
+    const uint8_t* uptr = reinterpret_cast<const uint8_t*>(ptr);
+    uint8_t accu = 0;
+    for (size_t i = 0; i < length; i++) {
+      accu |= uptr[i];
+    }
+    return accu < 0x80;
+  }
+  return encoding_mem_is_ascii(ptr, length);
+#else
+  for (char c : aString) {
+    if (!IsAscii(c)) {
+      return false;
+    }
+  }
+  return true;
+#endif
+}
+
+inline bool IsAscii(mozilla::Span<const char16_t> aString) {
+#if MOZ_HAS_JSRUST()
+  size_t length = aString.Length();
+  const char16_t* ptr = aString.Elements();
+  if (length < mozilla::detail::kShortStringLimitForInlinePaths) {
+    char16_t accu = 0;
+    for (size_t i = 0; i < length; i++) {
+      accu |= ptr[i];
+    }
+    return accu < 0x80;
+  }
+  return encoding_mem_is_basic_latin(ptr, length);
+#else
+  for (char16_t c : aString) {
+    if (!IsAscii(c)) {
+      return false;
+    }
+  }
+  return true;
+#endif
+}
+
+template <typename Char>
+constexpr bool IsAsciiNullTerminated(const Char* aChar) {
+  while (Char c = *aChar++) {
+    if (!IsAscii(c)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+#if MOZ_HAS_JSRUST()
+inline size_t AsciiValidUpTo(mozilla::Span<const char> aString) {
+  return encoding_ascii_valid_up_to(
+      reinterpret_cast<const uint8_t*>(aString.Elements()), aString.Length());
+}
+
+inline size_t Utf16ValidUpTo(mozilla::Span<const char16_t> aString) {
+  return encoding_mem_utf16_valid_up_to(aString.Elements(), aString.Length());
+}
+
+inline void EnsureUtf16ValiditySpan(mozilla::Span<char16_t> aString) {
+  encoding_mem_ensure_utf16_validity(aString.Elements(), aString.Length());
+}
+
+inline void ConvertAsciitoUtf16(mozilla::Span<const char> aSource,
+                                mozilla::Span<char16_t> aDest) {
+  MOZ_ASSERT(IsAscii(aSource));
+  ConvertLatin1toUtf16(aSource, aDest);
+}
+
+#endif  // MOZ_HAS_JSRUST
+
+template <typename Char>
+constexpr bool IsAsciiWhitespace(Char aChar) {
+  using UnsignedChar = typename detail::MakeUnsignedChar<Char>::Type;
+  auto uc = static_cast<UnsignedChar>(aChar);
+  return uc == 0x9 || uc == 0xA || uc == 0xC || uc == 0xD || uc == 0x20;
+}
+
+template <typename Char>
+constexpr bool IsAsciiLowercaseAlpha(Char aChar) {
+  using UnsignedChar = typename detail::MakeUnsignedChar<Char>::Type;
+  auto uc = static_cast<UnsignedChar>(aChar);
+  return 'a' <= uc && uc <= 'z';
+}
+
+template <typename Char>
+constexpr bool IsAsciiUppercaseAlpha(Char aChar) {
+  using UnsignedChar = typename detail::MakeUnsignedChar<Char>::Type;
+  auto uc = static_cast<UnsignedChar>(aChar);
+  return 'A' <= uc && uc <= 'Z';
+}
+
+template <typename Char>
+constexpr bool IsAsciiAlpha(Char aChar) {
+  return IsAsciiLowercaseAlpha(aChar) || IsAsciiUppercaseAlpha(aChar);
+}
+
+template <typename Char>
+constexpr bool IsAsciiDigit(Char aChar) {
+  using UnsignedChar = typename detail::MakeUnsignedChar<Char>::Type;
+  auto uc = static_cast<UnsignedChar>(aChar);
+  return '0' <= uc && uc <= '9';
+}
+
+template <typename Char>
+constexpr bool IsAsciiHexDigit(Char aChar) {
+  using UnsignedChar = typename detail::MakeUnsignedChar<Char>::Type;
+  auto uc = static_cast<UnsignedChar>(aChar);
+  return ('0' <= uc && uc <= '9') || ('a' <= uc && uc <= 'f') ||
+         ('A' <= uc && uc <= 'F');
+}
+
+template <typename Char>
+constexpr bool IsAsciiAlphanumeric(Char aChar) {
+  return IsAsciiDigit(aChar) || IsAsciiAlpha(aChar);
+}
+
+template <typename Char>
+constexpr uint8_t AsciiAlphanumericToNumber(Char aChar) {
+  using UnsignedChar = typename detail::MakeUnsignedChar<Char>::Type;
+  auto uc = static_cast<UnsignedChar>(aChar);
+
+  if ('0' <= uc && uc <= '9') {
+    return uc - '0';
+  }
+
+  if ('A' <= uc && uc <= 'Z') {
+    return uc - 'A' + 10;
+  }
+
+  MOZ_ASSERT(IsAsciiLowercaseAlpha(aChar),
+             "non-ASCII alphanumeric character can't be converted to number");
+  return uc - 'a' + 10;
+}
+
+}  
+
+#endif /* mozilla_TextUtils_h */

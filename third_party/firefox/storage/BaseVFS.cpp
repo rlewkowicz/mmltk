@@ -1,0 +1,222 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "BaseVFS.h"
+
+#include <string.h>
+#include "sqlite3.h"
+
+#include "mozilla/Assertions.h"
+
+namespace {
+
+constexpr int kLastKnowVfsVersion = 3;
+
+constexpr int kLastKnownIOMethodsVersion = 3;
+
+using namespace mozilla;
+
+struct BaseFile {
+  sqlite3_file base;
+  sqlite3_file pReal[1];
+};
+
+int BaseClose(sqlite3_file* pFile) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xClose(p->pReal);
+}
+
+int BaseRead(sqlite3_file* pFile, void* zBuf, int iAmt, sqlite_int64 iOfst) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xRead(p->pReal, zBuf, iAmt, iOfst);
+}
+
+int BaseWrite(sqlite3_file* pFile, const void* zBuf, int iAmt,
+              sqlite_int64 iOfst) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xWrite(p->pReal, zBuf, iAmt, iOfst);
+}
+
+int BaseTruncate(sqlite3_file* pFile, sqlite_int64 size) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xTruncate(p->pReal, size);
+}
+
+int BaseSync(sqlite3_file* pFile, int flags) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xSync(p->pReal, flags);
+}
+
+int BaseFileSize(sqlite3_file* pFile, sqlite_int64* pSize) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xFileSize(p->pReal, pSize);
+}
+
+int BaseLock(sqlite3_file* pFile, int eLock) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xLock(p->pReal, eLock);
+}
+
+int BaseUnlock(sqlite3_file* pFile, int eLock) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xUnlock(p->pReal, eLock);
+}
+
+int BaseCheckReservedLock(sqlite3_file* pFile, int* pResOut) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xCheckReservedLock(p->pReal, pResOut);
+}
+
+int BaseFileControl(sqlite3_file* pFile, int op, void* pArg) {
+#if defined(MOZ_SQLITE_PERSIST_AUXILIARY_FILES)
+  MOZ_ASSERT(
+      ::sqlite3_compileoption_used("DEFAULT_JOURNAL_SIZE_LIMIT"),
+      "A journal size limit ensures the journal is truncated on shutdown");
+  if (op == SQLITE_FCNTL_PERSIST_WAL) {
+    *static_cast<int*>(pArg) = 1;
+    return SQLITE_OK;
+  }
+#endif
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xFileControl(p->pReal, op, pArg);
+}
+
+int BaseSectorSize(sqlite3_file* pFile) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xSectorSize(p->pReal);
+}
+
+int BaseDeviceCharacteristics(sqlite3_file* pFile) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xDeviceCharacteristics(p->pReal);
+}
+
+int BaseShmMap(sqlite3_file* pFile, int iPg, int pgsz, int bExtend,
+               void volatile** pp) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xShmMap(p->pReal, iPg, pgsz, bExtend, pp);
+}
+
+int BaseShmLock(sqlite3_file* pFile, int offset, int n, int flags) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xShmLock(p->pReal, offset, n, flags);
+}
+
+void BaseShmBarrier(sqlite3_file* pFile) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xShmBarrier(p->pReal);
+}
+
+int BaseShmUnmap(sqlite3_file* pFile, int deleteFlag) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xShmUnmap(p->pReal, deleteFlag);
+}
+
+int BaseFetch(sqlite3_file* pFile, sqlite3_int64 iOfst, int iAmt, void** pp) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xFetch(p->pReal, iOfst, iAmt, pp);
+}
+
+int BaseUnfetch(sqlite3_file* pFile, sqlite3_int64 iOfst, void* pPage) {
+  BaseFile* p = (BaseFile*)pFile;
+  return p->pReal->pMethods->xUnfetch(p->pReal, iOfst, pPage);
+}
+
+int BaseOpen(sqlite3_vfs* vfs, const char* zName, sqlite3_file* pFile,
+             int flags, int* pOutFlags) {
+  BaseFile* p = (BaseFile*)pFile;
+  sqlite3_vfs* origVfs = (sqlite3_vfs*)(vfs->pAppData);
+  int rc = origVfs->xOpen(origVfs, zName, p->pReal, flags, pOutFlags);
+  if (rc) {
+    return rc;
+  }
+  if (p->pReal->pMethods) {
+    MOZ_ASSERT(p->pReal->pMethods->iVersion == kLastKnownIOMethodsVersion);
+    static const sqlite3_io_methods IOmethods = {
+        kLastKnownIOMethodsVersion, 
+        BaseClose,                  
+        BaseRead,                   
+        BaseWrite,                  
+        BaseTruncate,               
+        BaseSync,                   
+        BaseFileSize,               
+        BaseLock,                   
+        BaseUnlock,                 
+        BaseCheckReservedLock,      
+        BaseFileControl,            
+        BaseSectorSize,             
+        BaseDeviceCharacteristics,  
+        BaseShmMap,                 
+        BaseShmLock,                
+        BaseShmBarrier,             
+        BaseShmUnmap,               
+        BaseFetch,                  
+        BaseUnfetch                 
+    };
+    pFile->pMethods = &IOmethods;
+  }
+
+  return SQLITE_OK;
+}
+
+}  
+
+namespace mozilla::storage::basevfs {
+
+const char* GetVFSName(bool exclusive) {
+  return exclusive ? "base-vfs-excl" : "base-vfs";
+}
+
+UniquePtr<sqlite3_vfs> ConstructVFS(bool exclusive) {
+#  define EXPECTED_VFS "unix"
+#  define EXPECTED_VFS_EXCL "unix-excl"
+
+  if (sqlite3_vfs_find(GetVFSName(exclusive))) {
+    return nullptr;
+  }
+
+  bool found;
+  sqlite3_vfs* origVfs;
+  if (!exclusive) {
+    origVfs = sqlite3_vfs_find(nullptr);
+    found = origVfs && origVfs->zName && !strcmp(origVfs->zName, EXPECTED_VFS);
+  } else {
+    origVfs = sqlite3_vfs_find(EXPECTED_VFS_EXCL);
+    found = (origVfs != nullptr);
+  }
+  if (!found) {
+    return nullptr;
+  }
+
+  MOZ_ASSERT(origVfs->iVersion == kLastKnowVfsVersion);
+
+  sqlite3_vfs vfs = {
+      kLastKnowVfsVersion,                                    
+      origVfs->szOsFile + static_cast<int>(sizeof(BaseFile)), 
+      origVfs->mxPathname,                                    
+      nullptr,                                                
+      GetVFSName(exclusive),                                  
+      origVfs,                                                
+      BaseOpen,                                               
+      origVfs->xDelete,                                       
+      origVfs->xAccess,                                       
+      origVfs->xFullPathname,     
+      origVfs->xDlOpen,           
+      origVfs->xDlError,          
+      origVfs->xDlSym,            
+      origVfs->xDlClose,          
+      origVfs->xRandomness,       
+      origVfs->xSleep,            
+      origVfs->xCurrentTime,      
+      origVfs->xGetLastError,     
+      origVfs->xCurrentTimeInt64, 
+      origVfs->xSetSystemCall,    
+      origVfs->xGetSystemCall,    
+      origVfs->xNextSystemCall    
+  };
+
+  return MakeUnique<sqlite3_vfs>(vfs);
+}
+
+}  

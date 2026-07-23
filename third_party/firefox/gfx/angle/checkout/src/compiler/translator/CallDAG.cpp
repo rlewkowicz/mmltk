@@ -1,0 +1,227 @@
+// Copyright 2002 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+
+#include "compiler/translator/CallDAG.h"
+
+#include "compiler/translator/SymbolTable.h"
+#include "compiler/translator/tree_util/IntermTraverse.h"
+
+namespace sh
+{
+
+class CallDAG::CallDAGCreator : public TIntermTraverser
+{
+  public:
+    CallDAGCreator()
+        : TIntermTraverser(true, false, false), mCurrentFunction(nullptr), mCurrentIndex(0)
+    {}
+
+    void assignIndices()
+    {
+        int skipped = 0;
+        for (auto &it : mFunctions)
+        {
+            if (it.second.definitionNode)
+            {
+                assignIndicesInternal(&it.second);
+            }
+            else
+            {
+                skipped++;
+            }
+        }
+
+        ASSERT(mFunctions.size() == mCurrentIndex + skipped);
+    }
+
+    void fillDataStructures(std::vector<Record> *records, std::map<int, int> *idToIndex)
+    {
+        ASSERT(records->empty());
+        ASSERT(idToIndex->empty());
+
+        records->resize(mCurrentIndex);
+
+        for (auto &it : mFunctions)
+        {
+            CreatorFunctionData &data = it.second;
+            if (!data.definitionNode)
+            {
+                continue;
+            }
+            ASSERT(data.index < records->size());
+            Record &record = (*records)[data.index];
+
+            record.node = data.definitionNode;
+
+            record.callees.reserve(data.callees.size());
+            for (auto &callee : data.callees)
+            {
+                record.callees.push_back(static_cast<int>(callee->index));
+            }
+
+            (*idToIndex)[it.first] = static_cast<int>(data.index);
+        }
+    }
+
+  private:
+    struct CreatorFunctionData
+    {
+        CreatorFunctionData()
+            : definitionNode(nullptr), name(""), index(0), indexAssigned(false), visiting(false)
+        {}
+
+        std::set<CreatorFunctionData *> callees;
+        TIntermFunctionDefinition *definitionNode;
+        ImmutableString name;
+        size_t index;
+        bool indexAssigned;
+        bool visiting;
+    };
+
+    bool visitFunctionDefinition(Visit visit, TIntermFunctionDefinition *node) override
+    {
+        mCurrentFunction = &mFunctions[node->getFunction()->uniqueId().get()];
+        ASSERT(mCurrentFunction->name == "" ||
+               mCurrentFunction->name == node->getFunction()->name());
+        mCurrentFunction->name           = node->getFunction()->name();
+        mCurrentFunction->definitionNode = node;
+
+        node->getBody()->traverse(this);
+        mCurrentFunction = nullptr;
+        return false;
+    }
+
+    void visitFunctionPrototype(TIntermFunctionPrototype *node) override
+    {
+        ASSERT(mCurrentFunction == nullptr);
+
+        auto &record = mFunctions[node->getFunction()->uniqueId().get()];
+        record.name  = node->getFunction()->name();
+    }
+
+    bool visitAggregate(Visit visit, TIntermAggregate *node) override
+    {
+        if (node->getOp() == EOpCallFunctionInAST)
+        {
+            auto it = mFunctions.find(node->getFunction()->uniqueId().get());
+            ASSERT(it != mFunctions.end());
+
+            if (mCurrentFunction)
+            {
+                mCurrentFunction->callees.insert(&it->second);
+            }
+        }
+        return true;
+    }
+
+    void assignIndicesInternal(CreatorFunctionData *root)
+    {
+
+        ASSERT(root);
+
+        if (root->indexAssigned)
+        {
+            return;
+        }
+
+        TVector<CreatorFunctionData *> functionsToProcess;
+        functionsToProcess.push_back(root);
+
+        while (!functionsToProcess.empty())
+        {
+            CreatorFunctionData *function = functionsToProcess.back();
+
+            if (function->visiting)
+            {
+                function->visiting      = false;
+                function->index         = mCurrentIndex++;
+                function->indexAssigned = true;
+
+                functionsToProcess.pop_back();
+                continue;
+            }
+
+            if (!function->definitionNode)
+            {
+                ASSERT(false);
+                break;
+            }
+
+            if (function->indexAssigned)
+            {
+                functionsToProcess.pop_back();
+                continue;
+            }
+
+            function->visiting = true;
+
+            for (auto callee : function->callees)
+            {
+                functionsToProcess.push_back(callee);
+
+                if (callee->visiting)
+                {
+                    ASSERT(false);
+                    break;
+                }
+            }
+        }
+    }
+
+    std::map<int, CreatorFunctionData> mFunctions;
+    CreatorFunctionData *mCurrentFunction;
+    size_t mCurrentIndex;
+};
+
+
+CallDAG::CallDAG() {}
+
+CallDAG::~CallDAG() {}
+
+const size_t CallDAG::InvalidIndex = std::numeric_limits<size_t>::max();
+
+size_t CallDAG::findIndex(const TSymbolUniqueId &id) const
+{
+    auto it = mFunctionIdToIndex.find(id.get());
+
+    if (it == mFunctionIdToIndex.end())
+    {
+        return InvalidIndex;
+    }
+    else
+    {
+        return it->second;
+    }
+}
+
+const CallDAG::Record &CallDAG::getRecordFromIndex(size_t index) const
+{
+    ASSERT(index != InvalidIndex && index < mRecords.size());
+    return mRecords[index];
+}
+
+size_t CallDAG::size() const
+{
+    return mRecords.size();
+}
+
+void CallDAG::clear()
+{
+    mRecords.clear();
+    mFunctionIdToIndex.clear();
+}
+
+void CallDAG::init(TIntermNode *root)
+{
+    CallDAGCreator creator;
+
+    root->traverse(&creator);
+
+    creator.assignIndices();
+
+    creator.fillDataStructures(&mRecords, &mFunctionIdToIndex);
+}
+
+}  

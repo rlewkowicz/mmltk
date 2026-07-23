@@ -1,0 +1,84 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2008-2009, International Business Machines Corporation and
+* others. All Rights Reserved.
+*******************************************************************************
+*
+* File DTINTRV.H 
+*
+*******************************************************************************
+*/
+
+#ifndef __DTINTRV_H__
+#define __DTINTRV_H__
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/uobject.h"
+
+
+U_NAMESPACE_BEGIN
+
+
+class U_COMMON_API DateInterval : public UObject {
+public:
+
+    DateInterval(UDate fromDate, UDate toDate);
+
+    virtual ~DateInterval();
+ 
+    inline UDate getFromDate() const;
+
+    inline UDate getToDate() const;
+
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual UClassID getDynamicClassID() const override;
+
+    DateInterval(const DateInterval& other);
+
+    DateInterval& operator=(const DateInterval&);
+
+    virtual bool operator==(const DateInterval& other) const;
+
+    inline bool operator!=(const DateInterval& other) const;
+
+
+     virtual DateInterval* clone() const;
+
+private:
+    DateInterval() = delete;
+
+    UDate fromDate;
+    UDate toDate;
+
+} ;
+
+
+inline UDate 
+DateInterval::getFromDate() const { 
+    return fromDate; 
+}
+
+
+inline UDate 
+DateInterval::getToDate() const { 
+    return toDate; 
+}
+
+
+inline bool
+DateInterval::operator!=(const DateInterval& other) const { 
+    return ( !operator==(other) );
+}
+
+
+U_NAMESPACE_END
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif

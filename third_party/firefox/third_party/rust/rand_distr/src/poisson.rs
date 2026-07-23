@@ -1,0 +1,126 @@
+// Copyright 2018 Developers of the Rand project.
+// Copyright 2016-2017 The Rust Project Developers.
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+//! The Poisson distribution.
+
+use num_traits::{Float, FloatConst};
+use crate::{Cauchy, Distribution, Standard};
+use rand::Rng;
+use core::fmt;
+
+/// The Poisson distribution `Poisson(lambda)`.
+///
+/// This distribution has a density function:
+/// `f(k) = lambda^k * exp(-lambda) / k!` for `k >= 0`.
+///
+/// # Example
+///
+/// ```
+/// use rand_distr::{Poisson, Distribution};
+///
+/// let poi = Poisson::new(2.0).unwrap();
+/// let v = poi.sample(&mut rand::thread_rng());
+/// println!("{} is from a Poisson(2) distribution", v);
+/// ```
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde1", derive(serde::Serialize, serde::Deserialize))]
+pub struct Poisson<F>
+where F: Float + FloatConst, Standard: Distribution<F>
+{
+    lambda: F,
+    exp_lambda: F,
+    log_lambda: F,
+    sqrt_2lambda: F,
+    magic_val: F,
+}
+
+/// Error type returned from `Poisson::new`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// `lambda <= 0` or `nan`.
+    ShapeTooSmall,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Error::ShapeTooSmall => "lambda is not positive in Poisson distribution",
+        })
+    }
+}
+
+#[cfg(feature = "std")]
+#[cfg_attr(doc_cfg, doc(cfg(feature = "std")))]
+impl std::error::Error for Error {}
+
+impl<F> Poisson<F>
+where F: Float + FloatConst, Standard: Distribution<F>
+{
+    /// Construct a new `Poisson` with the given shape parameter
+    /// `lambda`.
+    pub fn new(lambda: F) -> Result<Poisson<F>, Error> {
+        if !(lambda > F::zero()) {
+            return Err(Error::ShapeTooSmall);
+        }
+        let log_lambda = lambda.ln();
+        Ok(Poisson {
+            lambda,
+            exp_lambda: (-lambda).exp(),
+            log_lambda,
+            sqrt_2lambda: (F::from(2.0).unwrap() * lambda).sqrt(),
+            magic_val: lambda * log_lambda - crate::utils::log_gamma(F::one() + lambda),
+        })
+    }
+}
+
+impl<F> Distribution<F> for Poisson<F>
+where F: Float + FloatConst, Standard: Distribution<F>
+{
+    #[inline]
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> F {
+
+        if self.lambda < F::from(12.0).unwrap() {
+            let mut result = F::zero();
+            let mut p = F::one();
+            while p > self.exp_lambda {
+                p = p*rng.gen::<F>();
+                result = result + F::one();
+            }
+            result - F::one()
+        }
+        else {
+            let cauchy = Cauchy::new(F::zero(), F::one()).unwrap();
+            let mut result;
+
+            loop {
+                let mut comp_dev;
+
+                loop {
+                    comp_dev = rng.sample(cauchy);
+                    result = self.sqrt_2lambda * comp_dev + self.lambda;
+                    if result >= F::zero() {
+                        break;
+                    }
+                }
+                result = result.floor();
+
+                let check = F::from(0.9).unwrap()
+                    * (F::one() + comp_dev * comp_dev)
+                    * (result * self.log_lambda
+                        - crate::utils::log_gamma(F::one() + result)
+                        - self.magic_val)
+                        .exp();
+
+                if rng.gen::<F>() <= check {
+                    break;
+                }
+            }
+            result
+        }
+    }
+}

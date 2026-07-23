@@ -1,0 +1,143 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+
+#if !defined(nsPlaceholderFrame_h_)
+#define nsPlaceholderFrame_h_
+
+#include "nsIFrame.h"
+
+namespace mozilla {
+class PresShell;
+}  
+
+class nsPlaceholderFrame;
+nsPlaceholderFrame* NS_NewPlaceholderFrame(mozilla::PresShell* aPresShell,
+                                           mozilla::ComputedStyle* aStyle,
+                                           nsFrameState aTypeBits);
+
+#define PLACEHOLDER_TYPE_MASK                                                  \
+  (PLACEHOLDER_FOR_FLOAT | PLACEHOLDER_FOR_ABSPOS | PLACEHOLDER_FOR_FIXEDPOS | \
+   PLACEHOLDER_FOR_TOPLAYER)
+
+class nsPlaceholderFrame final : public nsIFrame {
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(nsPlaceholderFrame)
+#if defined(DEBUG)
+  NS_DECL_QUERYFRAME
+#endif
+
+  friend nsPlaceholderFrame* NS_NewPlaceholderFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle,
+      nsFrameState aTypeBits);
+
+  nsPlaceholderFrame(ComputedStyle* aStyle, nsPresContext* aPresContext,
+                     nsFrameState aTypeBits)
+      : nsIFrame(aStyle, aPresContext, kClassID), mOutOfFlowFrame(nullptr) {
+    MOZ_ASSERT(
+        aTypeBits == PLACEHOLDER_FOR_FLOAT ||
+            aTypeBits == PLACEHOLDER_FOR_ABSPOS ||
+            aTypeBits == PLACEHOLDER_FOR_FIXEDPOS ||
+            aTypeBits == (PLACEHOLDER_FOR_TOPLAYER | PLACEHOLDER_FOR_ABSPOS) ||
+            aTypeBits == (PLACEHOLDER_FOR_TOPLAYER | PLACEHOLDER_FOR_FIXEDPOS),
+        "Unexpected type bit");
+    AddStateBits(aTypeBits);
+  }
+
+  nsIFrame* GetOutOfFlowFrame() const { return mOutOfFlowFrame; }
+  void SetOutOfFlowFrame(nsIFrame* aFrame) {
+    NS_ASSERTION(!aFrame || !aFrame->GetPrevContinuation(),
+                 "OOF must be first continuation");
+    mOutOfFlowFrame = aFrame;
+  }
+
+  void AddInlineMinISize(const mozilla::IntrinsicSizeInput& aInput,
+                         InlineMinISizeData* aData) override;
+  void AddInlinePrefISize(const mozilla::IntrinsicSizeInput& aInput,
+                          InlinePrefISizeData* aData) override;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  void Destroy(DestroyContext&) override;
+
+#if defined(DEBUG) || (0 && 0)
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+#endif
+
+#if defined(DEBUG_FRAME_DUMP)
+  void List(FILE* out = stderr, const char* aPrefix = "",
+            ListFlags aFlags = ListFlags()) const override;
+  nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+  bool IsEmpty() override { return true; }
+  bool IsSelfEmpty() override { return true; }
+
+  bool CanContinueTextRun() const override;
+
+  void SetLineIsEmptySoFar(bool aValue) {
+    AddOrRemoveStateBits(PLACEHOLDER_LINE_IS_EMPTY_SO_FAR, aValue);
+    AddStateBits(PLACEHOLDER_HAVE_LINE_IS_EMPTY_SO_FAR);
+  }
+  bool GetLineIsEmptySoFar(bool* aResult) const {
+    bool haveValue = HasAnyStateBits(PLACEHOLDER_HAVE_LINE_IS_EMPTY_SO_FAR);
+    if (haveValue) {
+      *aResult = HasAnyStateBits(PLACEHOLDER_LINE_IS_EMPTY_SO_FAR);
+    }
+    return haveValue;
+  }
+  void ForgetLineIsEmptySoFar() {
+    RemoveStateBits(PLACEHOLDER_HAVE_LINE_IS_EMPTY_SO_FAR);
+  }
+
+#if defined(ACCESSIBILITY)
+  mozilla::a11y::AccType AccessibleType() override {
+    nsIFrame* realFrame = GetRealFrameForPlaceholder(this);
+    return realFrame ? realFrame->AccessibleType() : nsIFrame::AccessibleType();
+  }
+#endif
+
+  ComputedStyle* GetParentComputedStyleForOutOfFlow(
+      nsIFrame** aProviderFrame) const;
+
+  ComputedStyle* GetLayoutParentStyleForOutOfFlow(
+      nsIFrame** aProviderFrame) const;
+
+  bool RenumberFrameAndDescendants(int32_t* aOrdinal, int32_t aDepth,
+                                   int32_t aIncrement,
+                                   bool aForCounting) override {
+    return mOutOfFlowFrame->RenumberFrameAndDescendants(
+        aOrdinal, aDepth, aIncrement, aForCounting);
+  }
+
+  static nsIFrame* GetRealFrameFor(nsIFrame* aFrame) {
+    MOZ_ASSERT(aFrame, "Must have a frame to work with");
+    if (aFrame->IsPlaceholderFrame()) {
+      return GetRealFrameForPlaceholder(aFrame);
+    }
+    return aFrame;
+  }
+
+  static nsIFrame* GetRealFrameForPlaceholder(const nsIFrame* aFrame) {
+    MOZ_ASSERT(aFrame->IsPlaceholderFrame(),
+               "Must have placeholder frame as input");
+    nsIFrame* outOfFlow =
+        static_cast<const nsPlaceholderFrame*>(aFrame)->GetOutOfFlowFrame();
+    NS_ASSERTION(outOfFlow, "Null out-of-flow for placeholder?");
+    return outOfFlow;
+  }
+
+ protected:
+  void AddFloatToIntrinsicISizeData(const mozilla::IntrinsicSizeInput& aInput,
+                                    mozilla::IntrinsicISizeType aType,
+                                    InlineIntrinsicISizeData* aData) const;
+
+  nsIFrame* mOutOfFlowFrame;
+};
+
+#endif

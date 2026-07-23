@@ -1,0 +1,154 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#ifndef __UFORMATTEDVALUE_H__
+#define __UFORMATTEDVALUE_H__
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/ufieldpositer.h"
+
+
+
+typedef enum UFieldCategory {
+    UFIELD_CATEGORY_UNDEFINED = 0,
+
+    UFIELD_CATEGORY_DATE,
+
+    UFIELD_CATEGORY_NUMBER,
+
+    UFIELD_CATEGORY_LIST,
+
+    UFIELD_CATEGORY_RELATIVE_DATETIME,
+
+    UFIELD_CATEGORY_DATE_INTERVAL,
+
+#ifndef U_HIDE_INTERNAL_API
+    UFIELD_CATEGORY_COUNT,
+#endif  /* U_HIDE_INTERNAL_API */
+
+    UFIELD_CATEGORY_LIST_SPAN = 0x1000 + UFIELD_CATEGORY_LIST,
+
+    UFIELD_CATEGORY_DATE_INTERVAL_SPAN = 0x1000 + UFIELD_CATEGORY_DATE_INTERVAL,
+
+    UFIELD_CATEGORY_NUMBER_RANGE_SPAN = 0x1000 + UFIELD_CATEGORY_NUMBER,
+
+} UFieldCategory;
+
+
+struct UConstrainedFieldPosition;
+typedef struct UConstrainedFieldPosition UConstrainedFieldPosition;
+
+
+U_CAPI UConstrainedFieldPosition* U_EXPORT2
+ucfpos_open(UErrorCode* ec);
+
+
+U_CAPI void U_EXPORT2
+ucfpos_reset(
+    UConstrainedFieldPosition* ucfpos,
+    UErrorCode* ec);
+
+
+U_CAPI void U_EXPORT2
+ucfpos_close(UConstrainedFieldPosition* ucfpos);
+
+
+U_CAPI void U_EXPORT2
+ucfpos_constrainCategory(
+    UConstrainedFieldPosition* ucfpos,
+    int32_t category,
+    UErrorCode* ec);
+
+
+U_CAPI void U_EXPORT2
+ucfpos_constrainField(
+    UConstrainedFieldPosition* ucfpos,
+    int32_t category,
+    int32_t field,
+    UErrorCode* ec);
+
+
+U_CAPI int32_t U_EXPORT2
+ucfpos_getCategory(
+    const UConstrainedFieldPosition* ucfpos,
+    UErrorCode* ec);
+
+
+U_CAPI int32_t U_EXPORT2
+ucfpos_getField(
+    const UConstrainedFieldPosition* ucfpos,
+    UErrorCode* ec);
+
+
+U_CAPI void U_EXPORT2
+ucfpos_getIndexes(
+    const UConstrainedFieldPosition* ucfpos,
+    int32_t* pStart,
+    int32_t* pLimit,
+    UErrorCode* ec);
+
+
+U_CAPI int64_t U_EXPORT2
+ucfpos_getInt64IterationContext(
+    const UConstrainedFieldPosition* ucfpos,
+    UErrorCode* ec);
+
+
+U_CAPI void U_EXPORT2
+ucfpos_setInt64IterationContext(
+    UConstrainedFieldPosition* ucfpos,
+    int64_t context,
+    UErrorCode* ec);
+
+
+U_CAPI UBool U_EXPORT2
+ucfpos_matchesField(
+    const UConstrainedFieldPosition* ucfpos,
+    int32_t category,
+    int32_t field,
+    UErrorCode* ec);
+
+
+U_CAPI void U_EXPORT2
+ucfpos_setState(
+    UConstrainedFieldPosition* ucfpos,
+    int32_t category,
+    int32_t field,
+    int32_t start,
+    int32_t limit,
+    UErrorCode* ec);
+
+
+struct UFormattedValue;
+typedef struct UFormattedValue UFormattedValue;
+
+
+U_CAPI const UChar* U_EXPORT2
+ufmtval_getString(
+    const UFormattedValue* ufmtval,
+    int32_t* pLength,
+    UErrorCode* ec);
+
+
+U_CAPI UBool U_EXPORT2
+ufmtval_nextPosition(
+    const UFormattedValue* ufmtval,
+    UConstrainedFieldPosition* ucfpos,
+    UErrorCode* ec);
+
+
+#if U_SHOW_CPLUSPLUS_API
+U_NAMESPACE_BEGIN
+
+U_DEFINE_LOCAL_OPEN_POINTER(LocalUConstrainedFieldPositionPointer,
+    UConstrainedFieldPosition,
+    ucfpos_close);
+
+U_NAMESPACE_END
+#endif // U_SHOW_CPLUSPLUS_API
+
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+#endif // __UFORMATTEDVALUE_H__

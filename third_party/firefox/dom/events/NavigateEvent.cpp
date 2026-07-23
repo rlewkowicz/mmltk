@@ -1,0 +1,473 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/NavigateEvent.h"
+
+#include "mozilla/HoldDropJSObjects.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/dom/AbortController.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/ElementBinding.h"
+#include "mozilla/dom/NavigateEventBinding.h"
+#include "mozilla/dom/Navigation.h"
+#include "mozilla/dom/NavigationHistoryEntry.h"
+#include "mozilla/dom/SessionHistoryEntry.h"
+#include "nsDocShell.h"
+#include "nsFocusManager.h"
+#include "nsGlobalWindowInner.h"
+
+extern mozilla::LazyLogModule gNavigationAPILog;
+
+#define LOG_FMTI(format, ...) \
+  MOZ_LOG_FMT(gNavigationAPILog, LogLevel::Info, format, ##__VA_ARGS__);
+
+#define LOG_FMT(format, ...) \
+  MOZ_LOG_FMT(gNavigationAPILog, LogLevel::Debug, format, ##__VA_ARGS__);
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED_WITH_JS_MEMBERS(
+    NavigateEvent, Event,
+    (mDestination, mSignal, mFormData, mSourceElement, mNavigationHandlerList,
+     mAbortController, mNavigationPrecommitHandlerList),
+    (mInfo))
+
+NS_IMPL_ADDREF_INHERITED(NavigateEvent, Event)
+NS_IMPL_RELEASE_INHERITED(NavigateEvent, Event)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(NavigateEvent)
+NS_INTERFACE_MAP_END_INHERITING(Event)
+
+JSObject* NavigateEvent::WrapObjectInternal(JSContext* aCx,
+                                            JS::Handle<JSObject*> aGivenProto) {
+  return NavigateEvent_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+already_AddRefed<NavigateEvent> NavigateEvent::Constructor(
+    const GlobalObject& aGlobal, const nsAString& aType,
+    const NavigateEventInit& aEventInitDict) {
+  nsCOMPtr<mozilla::dom::EventTarget> eventTarget =
+      do_QueryInterface(aGlobal.GetAsSupports());
+  return Constructor(eventTarget, aType, aEventInitDict);
+}
+
+already_AddRefed<NavigateEvent> NavigateEvent::Constructor(
+    EventTarget* aEventTarget, const nsAString& aType,
+    const NavigateEventInit& aEventInitDict) {
+  RefPtr<NavigateEvent> event = new NavigateEvent(aEventTarget);
+  bool trusted = event->Init(aEventTarget);
+  event->InitEvent(
+      aType, aEventInitDict.mBubbles ? CanBubble::eYes : CanBubble::eNo,
+      aEventInitDict.mCancelable ? Cancelable::eYes : Cancelable::eNo,
+      aEventInitDict.mComposed ? Composed::eYes : Composed::eNo);
+  event->InitNavigateEvent(aEventInitDict);
+  event->SetTrusted(trusted);
+  return event.forget();
+}
+
+already_AddRefed<NavigateEvent> NavigateEvent::Constructor(
+    EventTarget* aEventTarget, const nsAString& aType,
+    const NavigateEventInit& aEventInitDict,
+    nsIStructuredCloneContainer* aClassicHistoryAPIState,
+    class AbortController* aAbortController) {
+  RefPtr<NavigateEvent> event =
+      Constructor(aEventTarget, aType, aEventInitDict);
+
+  event->mAbortController = aAbortController;
+  MOZ_DIAGNOSTIC_ASSERT(event->mSignal == aAbortController->Signal());
+
+  event->mClassicHistoryAPIState = aClassicHistoryAPIState;
+
+  return event.forget();
+}
+
+NavigationType NavigateEvent::NavigationType() const { return mNavigationType; }
+
+void NavigateEvent::SetNavigationType(enum NavigationType aNavigationType) {
+  mNavigationType = aNavigationType;
+}
+
+already_AddRefed<NavigationDestination> NavigateEvent::Destination() const {
+  return do_AddRef(mDestination);
+}
+
+bool NavigateEvent::CanIntercept() const { return mCanIntercept; }
+
+bool NavigateEvent::UserInitiated() const { return mUserInitiated; }
+
+bool NavigateEvent::HashChange() const { return mHashChange; }
+
+AbortSignal* NavigateEvent::Signal() const { return mSignal; }
+
+already_AddRefed<FormData> NavigateEvent::GetFormData() const {
+  return do_AddRef(mFormData);
+}
+
+void NavigateEvent::GetDownloadRequest(nsAString& aDownloadRequest) const {
+  aDownloadRequest = mDownloadRequest;
+}
+
+void NavigateEvent::GetInfo(JSContext* aCx,
+                            JS::MutableHandle<JS::Value> aInfo) const {
+  aInfo.set(mInfo);
+}
+
+bool NavigateEvent::HasUAVisualTransition() const {
+  return mHasUAVisualTransition;
+}
+
+Element* NavigateEvent::GetSourceElement() const { return mSourceElement; }
+
+template <typename OptionEnum>
+static void MaybeReportWarningToConsole(Document* aDocument,
+                                        const nsString& aOption,
+                                        OptionEnum aPrevious, OptionEnum aNew) {
+  if (!aDocument) {
+    return;
+  }
+
+  nsTArray<nsString> params = {aOption,
+                               NS_ConvertUTF8toUTF16(GetEnumString(aNew)),
+                               NS_ConvertUTF8toUTF16(GetEnumString(aPrevious))};
+  nsContentUtils::ReportToConsole(
+      nsIScriptError::warningFlag, "DOM"_ns, aDocument,
+      PropertiesFile::DOM_PROPERTIES,
+      "PreviousInterceptCallOptionOverriddenWarning", params);
+}
+
+void NavigateEvent::Intercept(const NavigationInterceptOptions& aOptions,
+                              ErrorResult& aRv) {
+  LOG_FMTI("Called NavigateEvent.intercept()");
+
+  if (PerformSharedChecks(aRv); aRv.Failed()) {
+    return;
+  }
+
+  if (!mCanIntercept) {
+    aRv.ThrowSecurityError("Event's canIntercept was initialized to false");
+    return;
+  }
+
+  if (!IsBeingDispatched()) {
+    aRv.ThrowInvalidStateError("Event has never been dispatched");
+    return;
+  }
+
+  if (aOptions.mPrecommitHandler.WasPassed()) {
+    if (!Cancelable()) {
+      aRv.ThrowInvalidStateError("Event is not cancelable");
+      return;
+    }
+
+    mNavigationPrecommitHandlerList.AppendElement(
+        aOptions.mPrecommitHandler.InternalValue().get());
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(mInterceptionState == InterceptionState::None ||
+                        mInterceptionState == InterceptionState::Intercepted);
+
+  mInterceptionState = InterceptionState::Intercepted;
+
+  if (aOptions.mHandler.WasPassed()) {
+    mNavigationHandlerList.AppendElement(
+        aOptions.mHandler.InternalValue().get());
+  }
+
+  if (aOptions.mFocusReset.WasPassed()) {
+    if (mFocusResetBehavior &&
+        *mFocusResetBehavior != aOptions.mFocusReset.Value()) {
+      RefPtr<Document> document = GetAssociatedDocument();
+      MaybeReportWarningToConsole(document, u"focusReset"_ns,
+                                  *mFocusResetBehavior,
+                                  aOptions.mFocusReset.Value());
+    }
+
+    mFocusResetBehavior = Some(aOptions.mFocusReset.Value());
+  }
+
+  if (aOptions.mScroll.WasPassed()) {
+    if (mScrollBehavior && *mScrollBehavior != aOptions.mScroll.Value()) {
+      RefPtr<Document> document = GetAssociatedDocument();
+      MaybeReportWarningToConsole(document, u"scroll"_ns, *mScrollBehavior,
+                                  aOptions.mScroll.Value());
+    }
+
+    mScrollBehavior = Some(aOptions.mScroll.Value());
+  }
+}
+
+void NavigateEvent::Scroll(ErrorResult& aRv) {
+  LOG_FMTI("Called NavigateEvent.scroll()");
+
+  if (PerformSharedChecks(aRv); aRv.Failed()) {
+    return;
+  }
+
+  if (mInterceptionState != InterceptionState::Committed) {
+    aRv.ThrowInvalidStateError("NavigateEvent was not committed");
+    return;
+  }
+
+  ProcessScrollBehavior();
+}
+
+NavigateEvent::NavigateEvent(EventTarget* aOwner)
+    : Event(aOwner, nullptr, nullptr) {
+  mozilla::HoldJSObjects(this);
+}
+
+NavigateEvent::~NavigateEvent() { DropJSObjects(this); }
+
+void NavigateEvent::InitNavigateEvent(const NavigateEventInit& aEventInitDict) {
+  mNavigationType = aEventInitDict.mNavigationType;
+  mDestination = aEventInitDict.mDestination;
+  mCanIntercept = aEventInitDict.mCanIntercept;
+  mUserInitiated = aEventInitDict.mUserInitiated;
+  mHashChange = aEventInitDict.mHashChange;
+  mSignal = aEventInitDict.mSignal;
+  mFormData = aEventInitDict.mFormData;
+  mDownloadRequest = aEventInitDict.mDownloadRequest;
+  mInfo = aEventInitDict.mInfo;
+  mHasUAVisualTransition = aEventInitDict.mHasUAVisualTransition;
+  mSourceElement = aEventInitDict.mSourceElement;
+  if (RefPtr document = GetAssociatedDocument()) {
+    mLastScrollGeneration = document->LastScrollGeneration();
+  }
+}
+
+void NavigateEvent::SetCanIntercept(bool aCanIntercept) {
+  mCanIntercept = aCanIntercept;
+}
+
+enum NavigateEvent::InterceptionState NavigateEvent::InterceptionState() const {
+  return mInterceptionState;
+}
+
+void NavigateEvent::SetInterceptionState(
+    enum InterceptionState aInterceptionState) {
+  mInterceptionState = aInterceptionState;
+}
+
+nsIStructuredCloneContainer* NavigateEvent::ClassicHistoryAPIState() const {
+  return mClassicHistoryAPIState;
+}
+
+nsTArray<RefPtr<NavigationInterceptHandler>>&
+NavigateEvent::NavigationHandlerList() {
+  return mNavigationHandlerList;
+}
+
+AbortController* NavigateEvent::AbortController() const {
+  return mAbortController;
+}
+
+bool NavigateEvent::IsBeingDispatched() const {
+  return mEvent->mFlags.mIsBeingDispatched;
+}
+
+void NavigateEvent::Finish(bool aDidFulfill) {
+  MOZ_DIAGNOSTIC_ASSERT(mInterceptionState != InterceptionState::Finished);
+
+  if (mInterceptionState == InterceptionState::Intercepted) {
+    MOZ_DIAGNOSTIC_ASSERT(!aDidFulfill);
+
+    MOZ_DIAGNOSTIC_ASSERT(!mNavigationPrecommitHandlerList.IsEmpty());
+
+    mInterceptionState = InterceptionState::Finished;
+
+    return;
+  }
+
+  if (mInterceptionState == InterceptionState::None) {
+    return;
+  }
+
+  PotentiallyResetFocus();
+
+  if (aDidFulfill) {
+    PotentiallyProcessScrollBehavior();
+  }
+
+  mInterceptionState = InterceptionState::Finished;
+}
+
+void NavigateEvent::PerformSharedChecks(ErrorResult& aRv) {
+  if (RefPtr document = GetAssociatedDocument();
+      !document || !document->IsFullyActive()) {
+    aRv.ThrowInvalidStateError("Document isn't fully active");
+    return;
+  }
+
+  if (!IsTrusted()) {
+    aRv.ThrowSecurityError("Event is untrusted");
+    return;
+  }
+
+  if (DefaultPrevented()) {
+    aRv.ThrowInvalidStateError("Event was canceled");
+  }
+}
+
+void NavigateEvent::PotentiallyResetFocus() {
+  MOZ_DIAGNOSTIC_ASSERT(mInterceptionState == InterceptionState::Committed ||
+                        mInterceptionState == InterceptionState::Scrolled);
+
+  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(GetParentObject());
+
+  if (NS_WARN_IF(!window)) {
+    return;
+  }
+
+  Navigation* navigation = window->Navigation();
+
+  bool focusChanged = navigation->FocusedChangedDuringOngoingNavigation();
+
+  navigation->SetFocusedChangedDuringOngoingNavigation(false);
+
+  if (focusChanged) {
+    return;
+  }
+
+  if (mFocusResetBehavior &&
+      *mFocusResetBehavior == NavigationFocusReset::Manual) {
+    return;
+  }
+
+  RefPtr<Document> document = window->GetExtantDoc();
+
+  if (NS_WARN_IF(!document)) {
+    return;
+  }
+
+  RefPtr<Element> focusTarget = document->GetDocumentElement();
+  if (focusTarget) {
+    focusTarget =
+        focusTarget->GetAutofocusDelegate(mozilla::IsFocusableFlags(0));
+  }
+
+  if (!focusTarget) {
+    focusTarget = document->GetBody();
+  }
+
+  if (!focusTarget) {
+    focusTarget = document->GetDocumentElement();
+  }
+
+  FocusOptions options;
+  options.mPreventScroll = true;
+  if (focusTarget) {
+    focusTarget = nsFocusManager::GetTheFocusableArea(
+        focusTarget, nsFocusManager::ProgrammaticFocusFlags(options));
+  }
+
+  if (focusTarget) {
+    LOG_FMT("Reset focus to {}", *focusTarget->AsNode());
+    focusTarget->Focus(options, CallerType::NonSystem, IgnoredErrorResult());
+  } else if (RefPtr<nsIFocusManager> focusManager =
+                 nsFocusManager::GetFocusManager()) {
+    if (nsPIDOMWindowOuter* window = document->GetWindow()) {
+      nsCOMPtr<mozIDOMWindowProxy> focusedWindow;
+      focusManager->GetFocusedWindow(getter_AddRefs(focusedWindow));
+      if (SameCOMIdentity(window, focusedWindow)) {
+        LOG_FMT("Reset focus to document viewport");
+        focusManager->ClearFocus(focusedWindow);
+      }
+    }
+    document->SetPreviouslyFocusedContent(nullptr);
+  }
+}
+
+void NavigateEvent::PotentiallyProcessScrollBehavior() {
+  MOZ_DIAGNOSTIC_ASSERT(mInterceptionState == InterceptionState::Committed ||
+                        mInterceptionState == InterceptionState::Scrolled);
+
+  if (mInterceptionState == InterceptionState::Scrolled) {
+    return;
+  }
+
+  if (mScrollBehavior && *mScrollBehavior == NavigationScrollBehavior::Manual) {
+    return;
+  }
+
+  ProcessScrollBehavior();
+}
+
+MOZ_CAN_RUN_SCRIPT
+static void ScrollToBeginningOfDocument(Document& aDocument) {
+  RefPtr<PresShell> presShell = aDocument.GetPresShell();
+  if (!presShell) {
+    return;
+  }
+
+  RefPtr<Element> rootElement = aDocument.GetRootElement();
+  AxisScrollParams vertical(WhereToScroll::Start, WhenToScroll::Always);
+  presShell->ScrollContentIntoView(rootElement, vertical, AxisScrollParams(),
+                                   ScrollFlags::TriggeredByScript);
+}
+
+static void RestoreScrollPositionData(Document* aDocument,
+                                      const uint32_t& aLastScrollGeneration,
+                                      SessionHistoryInfo* aHistoryEntry) {
+  if (!aDocument || aDocument->HasBeenScrolledSince(aLastScrollGeneration)) {
+    return;
+  }
+
+  RefPtr<nsDocShell> docShell = nsDocShell::Cast(aDocument->GetDocShell());
+  if (!docShell) {
+    return;
+  }
+
+  docShell->RestoreScrollPositionFromTargetSessionHistoryInfo(aHistoryEntry);
+}
+
+void NavigateEvent::ProcessScrollBehavior() {
+  MOZ_DIAGNOSTIC_ASSERT(mInterceptionState == InterceptionState::Committed);
+
+  mInterceptionState = InterceptionState::Scrolled;
+
+  if (mNavigationType == NavigationType::Traverse ||
+      mNavigationType == NavigationType::Reload) {
+    RefPtr<Document> document = GetAssociatedDocument();
+    RestoreScrollPositionData(
+        document, mLastScrollGeneration,
+        mDestination->GetEntry()
+            ? mDestination->GetEntry()->SessionHistoryInfo()
+            : nullptr);
+    return;
+  }
+
+  RefPtr<Document> document = GetAssociatedDocument();
+  if (!document) {
+    return;
+  }
+
+  nsAutoCString ref;
+  if (nsIURI* uri = document->GetDocumentURI();
+      NS_SUCCEEDED(uri->GetRef(ref)) &&
+      !nsContentUtils::GetTargetElement(document, NS_ConvertUTF8toUTF16(ref))) {
+    ScrollToBeginningOfDocument(*document);
+    return;
+  }
+
+  document->SetScrollToRef(document->GetDocumentURI());
+  document->ScrollToRef();
+}
+
+Document* NavigateEvent::GetAssociatedDocument() const {
+  if (nsCOMPtr<nsPIDOMWindowInner> globalWindow =
+          do_QueryInterface(GetParentObject())) {
+    return globalWindow->GetExtantDoc();
+  }
+  return nullptr;
+}
+
+void NavigateEvent::Cancel() {
+  mEvent->mFlags.mDefaultPrevented = true;
+  mEvent->mFlags.mDefaultPreventedByContent = true;
+}
+
+}  
+
+#undef LOG_FMTI
+#undef LOG_FMT

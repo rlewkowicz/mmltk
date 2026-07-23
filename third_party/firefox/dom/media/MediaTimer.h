@@ -1,0 +1,144 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(MediaTimer_h_)
+#  define MediaTimer_h_
+
+#  include <cstdint>
+#  include <queue>
+
+#  include "mozilla/AbstractThread.h"
+#  include "mozilla/AwakeTimeStamp.h"
+#  include "mozilla/Monitor.h"
+#  include "mozilla/MozPromise.h"
+#  include "mozilla/RefPtr.h"
+#  include "mozilla/SharedThreadPool.h"
+#  include "mozilla/TimeStamp.h"
+#  include "nsITimer.h"
+
+namespace mozilla {
+
+extern LazyLogModule gMediaTimerLog;
+
+#  define TIMER_LOG(x, ...)                                        \
+    MOZ_ASSERT(gMediaTimerLog);                                    \
+    MOZ_LOG_FMT(gMediaTimerLog, LogLevel::Debug,                   \
+                "[MediaTimer={} relative_t={}]" x, fmt::ptr(this), \
+                RelativeMicroseconds(T::Now()), ##__VA_ARGS__)
+
+using MediaTimerPromise = MozPromise<bool, bool, true>;
+
+template <typename T>
+class MediaTimer {
+ public:
+  explicit MediaTimer(bool aFuzzy = false);
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING_WITH_DESTROY(MediaTimer,
+                                                     DispatchDestroy());
+
+  RefPtr<MediaTimerPromise> WaitFor(const typename T::DurationType& aDuration,
+                                    StaticString aCallSite);
+
+  RefPtr<MediaTimerPromise> WaitUntil(const T& aTimeStamp,
+                                      StaticString aCallSite);
+
+  void Cancel();
+
+ private:
+  virtual ~MediaTimer() { MOZ_ASSERT(OnMediaTimerThread()); }
+
+  void DispatchDestroy();
+  void Destroy();
+  bool OnMediaTimerThread();
+  void ScheduleUpdate();
+  void Update();
+  void UpdateLocked();
+  bool IsExpired(const T& aTarget, const T& aNow);
+  void Reject();
+  static void TimerCallback(nsITimer* aTimer, void* aClosure);
+  void TimerFired();
+  void ArmTimer(const T& aTarget, const T& aNow);
+
+  bool TimerIsArmed();
+  void CancelTimerIfArmed();
+
+  struct Entry {
+    T mTimeStamp;
+    RefPtr<MediaTimerPromise::Private> mPromise;
+
+    explicit Entry(const T& aTimeStamp, StaticString aCallSite)
+        : mTimeStamp(aTimeStamp),
+          mPromise(new MediaTimerPromise::Private(aCallSite)) {}
+
+    bool operator<(const Entry& aOther) const {
+      return mTimeStamp > aOther.mTimeStamp;
+    }
+  };
+
+  nsCOMPtr<nsIEventTarget> mThread;
+  std::priority_queue<Entry> mEntries;
+  Monitor mMonitor MOZ_UNANNOTATED;
+  nsCOMPtr<nsITimer> mTimer;
+  Maybe<T> mCurrentTimerTarget;
+
+  T mCreationTimeStamp;
+  int64_t RelativeMicroseconds(const T& aTimeStamp) {
+    return (int64_t)(aTimeStamp - mCreationTimeStamp).ToMicroseconds();
+  }
+
+  bool mUpdateScheduled;
+  const bool mFuzzy;
+};
+
+template <typename T>
+class DelayedScheduler {
+ public:
+  explicit DelayedScheduler(nsISerialEventTarget* aTargetThread,
+                            bool aFuzzy = false)
+      : mTargetThread(aTargetThread), mMediaTimer(new MediaTimer<T>(aFuzzy)) {
+    MOZ_ASSERT(mTargetThread);
+  }
+
+  bool IsScheduled() const { return mTarget.isSome(); }
+
+  void Reset() {
+    MOZ_ASSERT(mTargetThread->IsOnCurrentThread(),
+               "Must be on target thread to disconnect");
+    mRequest.DisconnectIfExists();
+    mTarget = Nothing();
+  }
+
+  template <typename ResolveFunc, typename RejectFunc>
+  void Ensure(T& aTarget, ResolveFunc&& aResolver, RejectFunc&& aRejector) {
+    MOZ_ASSERT(mTargetThread->IsOnCurrentThread());
+    if (IsScheduled() && mTarget.value() <= aTarget) {
+      return;
+    }
+    Reset();
+    mTarget.emplace(aTarget);
+    mMediaTimer->WaitUntil(mTarget.value(), __func__)
+        ->Then(mTargetThread, __func__, std::forward<ResolveFunc>(aResolver),
+               std::forward<RejectFunc>(aRejector))
+        ->Track(mRequest);
+  }
+
+  void CompleteRequest() {
+    MOZ_ASSERT(mTargetThread->IsOnCurrentThread());
+    mRequest.Complete();
+    mTarget = Nothing();
+  }
+
+ private:
+  nsCOMPtr<nsISerialEventTarget> mTargetThread;
+  RefPtr<MediaTimer<T>> mMediaTimer;
+  Maybe<T> mTarget;
+  MozPromiseRequestHolder<mozilla::MediaTimerPromise> mRequest;
+};
+
+using MediaTimerTimeStamp = MediaTimer<TimeStamp>;
+using MediaTimerAwakeTimeStamp = MediaTimer<AwakeTimeStamp>;
+
+}  
+
+#endif

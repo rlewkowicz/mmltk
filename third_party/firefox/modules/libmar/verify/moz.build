@@ -1,0 +1,29 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+Library("verifymar")
+
+UNIFIED_SOURCES += [
+    "cryptox.c",
+    "mar_verify.c",
+]
+
+FORCE_STATIC_LIB = True
+
+USE_LIBS += [
+    "nspr",
+    "nss",
+    "signmar",
+]
+OS_LIBS += [
+    "-Wl,-rpath=\\$$ORIGIN",
+]
+
+LOCAL_INCLUDES += [
+    "../src",
+]
+
+if CONFIG["MOZ_USE_NSS_FOR_MAR"]:
+    LOCAL_INCLUDES += ["../sign"]
+    DEFINES["MAR_NSS"] = True

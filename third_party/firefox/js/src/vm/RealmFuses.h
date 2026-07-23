@@ -1,0 +1,281 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_RealmFuses_h
+#define vm_RealmFuses_h
+
+#include "vm/GuardFuse.h"
+#include "vm/InvalidatingFuse.h"
+
+namespace js {
+
+class NativeObject;
+struct RealmFuses;
+
+class RealmFuse : public GuardFuse {
+ public:
+  virtual void popFuse(JSContext* cx, RealmFuses& realmFuses) { popFuse(cx); }
+
+ protected:
+  virtual void popFuse(JSContext* cx) override { GuardFuse::popFuse(cx); }
+};
+
+class InvalidatingRealmFuse : public InvalidatingFuse {
+ public:
+  virtual void popFuse(JSContext* cx, RealmFuses& realmFuses);
+  virtual bool addFuseDependency(JSContext* cx,
+                                 const jit::IonScriptKey& ionScript) override;
+
+ protected:
+  virtual void popFuse(JSContext* cx) override {
+    InvalidatingFuse::popFuse(cx);
+  }
+};
+
+struct OptimizeGetIteratorFuse final : public RealmFuse {
+  virtual const char* name() override { return "OptimizeGetIteratorFuse"; }
+  virtual bool checkInvariant(JSContext* cx) override;
+  virtual void popFuse(JSContext* cx, RealmFuses& realmFuses) override;
+};
+
+struct OptimizeGetIteratorBytecodeFuse final : public InvalidatingRealmFuse {
+  virtual const char* name() override {
+    return "OptimizeGetIteratorBytecodeFuse";
+  }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct PopsOptimizedGetIteratorFuse : public RealmFuse {
+  virtual void popFuse(JSContext* cx, RealmFuses& realmFuses) override;
+};
+
+struct OptimizeArrayIteratorPrototypeFuse final
+    : public PopsOptimizedGetIteratorFuse {
+  virtual const char* name() override {
+    return "OptimizeArrayIteratorPrototypeFuse";
+  }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct PopsOptimizedArrayIteratorPrototypeFuse : public RealmFuse {
+  virtual void popFuse(JSContext* cx, RealmFuses& realmFuses) override;
+};
+
+struct ArrayPrototypeIteratorFuse final : public PopsOptimizedGetIteratorFuse {
+  virtual const char* name() override { return "ArrayPrototypeIteratorFuse"; }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct ArrayPrototypeIteratorNextFuse final
+    : public PopsOptimizedArrayIteratorPrototypeFuse {
+  virtual const char* name() override {
+    return "ArrayPrototypeIteratorNextFuse";
+  }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct ArrayIteratorPrototypeHasNoReturnProperty final
+    : public PopsOptimizedArrayIteratorPrototypeFuse {
+  virtual const char* name() override {
+    return "ArrayIteratorPrototypeHasNoReturnProperty";
+  }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct IteratorPrototypeHasNoReturnProperty final
+    : public PopsOptimizedArrayIteratorPrototypeFuse {
+  virtual const char* name() override {
+    return "IteratorPrototypeHasNoReturnProperty";
+  }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct ArrayIteratorPrototypeHasIteratorProto final
+    : public PopsOptimizedArrayIteratorPrototypeFuse {
+  virtual const char* name() override {
+    return "ArrayIteratorPrototypeHasIteratorProto";
+  }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct IteratorPrototypeHasObjectProto final
+    : public PopsOptimizedArrayIteratorPrototypeFuse {
+  virtual const char* name() override {
+    return "IteratorPrototypeHasObjectProto";
+  }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct ObjectPrototypeHasNoReturnProperty final
+    : public PopsOptimizedArrayIteratorPrototypeFuse {
+  virtual const char* name() override {
+    return "ObjectPrototypeHasNoReturnProperty";
+  }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct OptimizeArraySpeciesFuse final : public InvalidatingRealmFuse {
+  virtual const char* name() override { return "OptimizeArraySpeciesFuse"; }
+  virtual bool checkInvariant(JSContext* cx) override;
+  virtual void popFuse(JSContext* cx, RealmFuses& realmFuses) override;
+};
+
+struct OptimizeArrayBufferSpeciesFuse final : public RealmFuse {
+  virtual const char* name() override {
+    return "OptimizeArrayBufferSpeciesFuse";
+  }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct OptimizeSharedArrayBufferSpeciesFuse final : public RealmFuse {
+  virtual const char* name() override {
+    return "OptimizeSharedArrayBufferSpeciesFuse";
+  }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct OptimizeTypedArraySpeciesFuse final : public InvalidatingRealmFuse {
+  virtual const char* name() override {
+    return "OptimizeTypedArraySpeciesFuse";
+  }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct OptimizePromiseLookupFuse final : public RealmFuse {
+  virtual const char* name() override { return "OptimizePromiseLookupFuse"; }
+  virtual bool checkInvariant(JSContext* cx) override;
+  virtual void popFuse(JSContext* cx, RealmFuses& realmFuses) override;
+};
+
+struct OptimizeRegExpPrototypeFuse final : public InvalidatingRealmFuse {
+  virtual const char* name() override { return "OptimizeRegExpPrototypeFuse"; }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct OptimizeMapObjectIteratorFuse final : public RealmFuse {
+  virtual const char* name() override {
+    return "OptimizeMapObjectIteratorFuse";
+  }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct OptimizeSetObjectIteratorFuse final : public RealmFuse {
+  virtual const char* name() override {
+    return "OptimizeSetObjectIteratorFuse";
+  }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct OptimizeMapPrototypeSetFuse final : public RealmFuse {
+  virtual const char* name() override { return "OptimizeMapPrototypeSetFuse"; }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct OptimizeSetPrototypeAddFuse final : public RealmFuse {
+  virtual const char* name() override { return "OptimizeSetPrototypeAddFuse"; }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct OptimizeWeakMapPrototypeSetFuse final : public RealmFuse {
+  virtual const char* name() override {
+    return "OptimizeWeakMapPrototypeSetFuse";
+  }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+struct OptimizeWeakSetPrototypeAddFuse final : public RealmFuse {
+  virtual const char* name() override {
+    return "OptimizeWeakSetPrototypeAddFuse";
+  }
+  virtual bool checkInvariant(JSContext* cx) override;
+};
+
+#define FOR_EACH_REALM_FUSE(FUSE)                                              \
+  FUSE(OptimizeGetIteratorFuse, optimizeGetIteratorFuse)                       \
+  FUSE(OptimizeGetIteratorBytecodeFuse, optimizeGetIteratorBytecodeFuse)       \
+  FUSE(OptimizeArrayIteratorPrototypeFuse, optimizeArrayIteratorPrototypeFuse) \
+  FUSE(ArrayPrototypeIteratorFuse, arrayPrototypeIteratorFuse)                 \
+  FUSE(ArrayPrototypeIteratorNextFuse, arrayPrototypeIteratorNextFuse)         \
+  FUSE(ArrayIteratorPrototypeHasNoReturnProperty,                              \
+       arrayIteratorPrototypeHasNoReturnProperty)                              \
+  FUSE(IteratorPrototypeHasNoReturnProperty,                                   \
+       iteratorPrototypeHasNoReturnProperty)                                   \
+  FUSE(ArrayIteratorPrototypeHasIteratorProto,                                 \
+       arrayIteratorPrototypeHasIteratorProto)                                 \
+  FUSE(IteratorPrototypeHasObjectProto, iteratorPrototypeHasObjectProto)       \
+  FUSE(ObjectPrototypeHasNoReturnProperty, objectPrototypeHasNoReturnProperty) \
+  FUSE(OptimizeArraySpeciesFuse, optimizeArraySpeciesFuse)                     \
+  FUSE(OptimizeArrayBufferSpeciesFuse, optimizeArrayBufferSpeciesFuse)         \
+  FUSE(OptimizeSharedArrayBufferSpeciesFuse,                                   \
+       optimizeSharedArrayBufferSpeciesFuse)                                   \
+  FUSE(OptimizeTypedArraySpeciesFuse, optimizeTypedArraySpeciesFuse)           \
+  FUSE(OptimizePromiseLookupFuse, optimizePromiseLookupFuse)                   \
+  FUSE(OptimizeRegExpPrototypeFuse, optimizeRegExpPrototypeFuse)               \
+  FUSE(OptimizeMapObjectIteratorFuse, optimizeMapObjectIteratorFuse)           \
+  FUSE(OptimizeSetObjectIteratorFuse, optimizeSetObjectIteratorFuse)           \
+  FUSE(OptimizeMapPrototypeSetFuse, optimizeMapPrototypeSetFuse)               \
+  FUSE(OptimizeSetPrototypeAddFuse, optimizeSetPrototypeAddFuse)               \
+  FUSE(OptimizeWeakMapPrototypeSetFuse, optimizeWeakMapPrototypeSetFuse)       \
+  FUSE(OptimizeWeakSetPrototypeAddFuse, optimizeWeakSetPrototypeAddFuse)
+
+struct RealmFuses {
+  RealmFuses() = default;
+
+#define FUSE(Name, LowerName) Name LowerName{};
+  FOR_EACH_REALM_FUSE(FUSE)
+#undef FUSE
+
+  void assertInvariants(JSContext* cx) {
+#define FUSE(Name, LowerName) LowerName.assertInvariant(cx);
+    FOR_EACH_REALM_FUSE(FUSE)
+#undef FUSE
+  }
+
+  enum class FuseIndex : uint8_t {
+#define FUSE(Name, LowerName) Name,
+    FOR_EACH_REALM_FUSE(FUSE)
+#undef FUSE
+        LastFuseIndex
+  };
+
+  GuardFuse* getFuseByIndex(FuseIndex index) {
+    switch (index) {
+#define FUSE(Name, LowerName) \
+  case FuseIndex::Name:       \
+    return &this->LowerName;
+      FOR_EACH_REALM_FUSE(FUSE)
+#undef FUSE
+      default:
+        break;
+    }
+    MOZ_CRASH("Fuse Not Found");
+  }
+
+  DependentIonScriptGroup fuseDependencies;
+
+  static int32_t fuseOffsets[];
+  static const char* fuseNames[];
+
+  static int32_t offsetOfFuseWordRelativeToRealm(FuseIndex index);
+  static const char* getFuseName(FuseIndex index);
+
+  static bool isInvalidatingFuse(FuseIndex index) {
+    switch (index) {
+#define FUSE(Name, LowerName)                                      \
+  case FuseIndex::Name:                                            \
+    static_assert(std::is_base_of_v<RealmFuse, Name> ||            \
+                  std::is_base_of_v<InvalidatingRealmFuse, Name>); \
+    return std::is_base_of_v<InvalidatingRealmFuse, Name>;
+      FOR_EACH_REALM_FUSE(FUSE)
+#undef FUSE
+      default:
+        break;
+    }
+    MOZ_CRASH("Fuse Not Found");
+  }
+};
+
+}  
+
+#endif

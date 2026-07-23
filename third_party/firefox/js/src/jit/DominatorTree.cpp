@@ -1,0 +1,249 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/DominatorTree.h"
+
+#include <utility>
+
+#include "jit/MIRGenerator.h"
+#include "jit/MIRGraph.h"
+
+using namespace js;
+using namespace js::jit;
+
+namespace js::jit {
+
+class MOZ_RAII SemiNCA {
+  const MIRGenerator* mir_;
+  MIRGraph& graph_;
+
+  struct BlockState {
+    MBasicBlock* block = nullptr;
+    uint32_t ancestor = 0;
+    uint32_t label = 0;
+    uint32_t semi = 0;
+    uint32_t idom = 0;
+  };
+  using BlockStateVector = Vector<BlockState, 8, BackgroundSystemAllocPolicy>;
+  BlockStateVector state_;
+
+  using CompressStack = Vector<uint32_t, 16, BackgroundSystemAllocPolicy>;
+  CompressStack compressStack_;
+
+  [[nodiscard]] bool initStateAndRenumberBlocks();
+  [[nodiscard]] bool compress(uint32_t v, uint32_t lastLinked);
+
+ public:
+  SemiNCA(const MIRGenerator* mir, MIRGraph& graph)
+      : mir_(mir), graph_(graph) {}
+
+  [[nodiscard]] bool computeDominators();
+};
+
+}  
+
+bool SemiNCA::initStateAndRenumberBlocks() {
+  MOZ_ASSERT(state_.empty());
+
+  size_t nblocks = 1  + graph_.numBlocks();
+  if (!state_.growBy(nblocks)) {
+    return false;
+  }
+
+  using BlockAndParent = std::pair<MBasicBlock*, uint32_t>;
+  Vector<BlockAndParent, 16, BackgroundSystemAllocPolicy> worklist;
+
+  constexpr size_t RootId = 0;
+  if (!worklist.emplaceBack(graph_.entryBlock(), RootId)) {
+    return false;
+  }
+
+  if (MBasicBlock* osrBlock = graph_.osrBlock()) {
+    if (!worklist.emplaceBack(osrBlock, RootId)) {
+      return false;
+    }
+
+    for (MBasicBlock* block : graph_) {
+      if (block->unreachable()) {
+        if (!worklist.emplaceBack(block, RootId)) {
+          return false;
+        }
+      }
+    }
+  }
+
+  uint32_t id = 1;
+  while (!worklist.empty()) {
+    auto [block, parent] = worklist.popCopy();
+    block->mark();
+    block->setId(id);
+    state_[id] = {
+        .block = block, .ancestor = parent, .label = id, .idom = parent};
+
+    for (size_t i = 0, n = block->numSuccessors(); i < n; i++) {
+      MBasicBlock* succ = block->getSuccessor(i);
+      if (succ->isMarked()) {
+        continue;
+      }
+      if (!worklist.emplaceBack(succ, id)) {
+        return false;
+      }
+    }
+
+    id++;
+  }
+
+  MOZ_ASSERT(id == nblocks, "should have visited all blocks");
+  return true;
+}
+
+bool SemiNCA::compress(uint32_t v, uint32_t lastLinked) {
+
+  if (state_[v].ancestor < lastLinked) {
+    return true;
+  }
+
+  MOZ_ASSERT(compressStack_.empty());
+  do {
+    if (!compressStack_.append(v)) {
+      return false;
+    }
+    v = state_[v].ancestor;
+  } while (state_[v].ancestor >= lastLinked);
+
+  uint32_t root = state_[v].ancestor;
+  do {
+    uint32_t u = v;
+    v = compressStack_.popCopy();
+    MOZ_ASSERT(u < v);
+    MOZ_ASSERT(state_[v].ancestor == u);
+    MOZ_ASSERT(u >= lastLinked);
+
+    if (state_[u].label < state_[v].label) {
+      state_[v].label = state_[u].label;
+    }
+    state_[v].ancestor = root;
+  } while (!compressStack_.empty());
+
+  return true;
+}
+
+bool SemiNCA::computeDominators() {
+  if (!initStateAndRenumberBlocks()) {
+    return false;
+  }
+
+  size_t nblocks = state_.length();
+
+
+  for (size_t w = nblocks - 1; w > 0; w--) {
+    if (mir_->shouldCancel("SemiNCA computeDominators")) {
+      return false;
+    }
+
+    MBasicBlock* block = state_[w].block;
+    uint32_t semiW = state_[w].ancestor;
+
+    uint32_t lastLinked = w + 1;
+
+    for (size_t i = 0, n = block->numPredecessors(); i < n; i++) {
+      MBasicBlock* pred = block->getPredecessor(i);
+      uint32_t v = pred->id();
+      if (v >= lastLinked) {
+        if (!compress(v, lastLinked)) {
+          return false;
+        }
+      }
+      semiW = std::min(semiW, state_[v].label);
+    }
+
+    state_[w].semi = semiW;
+    state_[w].label = semiW;
+  }
+
+  for (size_t v = 1; v < nblocks; v++) {
+    auto& blockState = state_[v];
+    uint32_t idom = blockState.idom;
+    while (idom > blockState.semi) {
+      idom = state_[idom].idom;
+    }
+    blockState.idom = idom;
+  }
+
+  uint32_t id = 0;
+  for (ReversePostorderIterator block(graph_.rpoBegin());
+       block != graph_.rpoEnd(); block++) {
+    auto& state = state_[block->id()];
+    if (state.idom == 0) {
+      block->setImmediateDominator(*block);
+    } else {
+      block->setImmediateDominator(state_[state.idom].block);
+    }
+    block->unmark();
+    block->setId(id++);
+  }
+
+  return true;
+}
+
+static bool ComputeImmediateDominators(const MIRGenerator* mir,
+                                       MIRGraph& graph) {
+  SemiNCA semiNCA(mir, graph);
+  return semiNCA.computeDominators();
+}
+
+bool jit::BuildDominatorTree(const MIRGenerator* mir, MIRGraph& graph) {
+  MOZ_ASSERT(graph.canBuildDominators());
+
+  if (!ComputeImmediateDominators(mir, graph)) {
+    return false;
+  }
+
+  Vector<MBasicBlock*, 4, JitAllocPolicy> worklist(graph.alloc());
+
+  for (PostorderIterator i(graph.poBegin()); i != graph.poEnd(); i++) {
+    MBasicBlock* child = *i;
+    MBasicBlock* parent = child->immediateDominator();
+
+    child->addNumDominated(1);
+
+    if (child == parent) {
+      if (!worklist.append(child)) {
+        return false;
+      }
+      continue;
+    }
+
+    if (!parent->addImmediatelyDominatedBlock(child)) {
+      return false;
+    }
+
+    parent->addNumDominated(child->numDominated());
+  }
+
+#ifdef DEBUG
+  if (!graph.osrBlock()) {
+    MOZ_ASSERT(graph.entryBlock()->numDominated() == graph.numBlocks());
+  }
+#endif
+  size_t index = 0;
+  while (!worklist.empty()) {
+    MBasicBlock* block = worklist.popCopy();
+    block->setDomIndex(index);
+
+    if (!worklist.append(block->immediatelyDominatedBlocksBegin(),
+                         block->immediatelyDominatedBlocksEnd())) {
+      return false;
+    }
+    index++;
+  }
+
+  return true;
+}
+
+void jit::ClearDominatorTree(MIRGraph& graph) {
+  for (MBasicBlockIterator iter = graph.begin(); iter != graph.end(); iter++) {
+    iter->clearDominatorInfo();
+  }
+}

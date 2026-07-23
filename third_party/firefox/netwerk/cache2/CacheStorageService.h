@@ -1,0 +1,330 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef CacheStorageService_h_
+#define CacheStorageService_h_
+
+#include "mozilla/LinkedList.h"
+#include "nsICacheStorageService.h"
+#include "nsIMemoryReporter.h"
+#include "nsINamed.h"
+#include "nsITimer.h"
+
+#include "nsClassHashtable.h"
+#include "nsTHashMap.h"
+#include "nsString.h"
+#include "nsThreadUtils.h"
+#include "nsProxyRelease.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/StaticMutex.h"
+#include "mozilla/AtomicBitfields.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/TimeStamp.h"
+#include "nsTArray.h"
+
+class nsICacheEntry;
+class nsIURI;
+class nsICacheEntryDoomCallback;
+class nsICacheStorageVisitor;
+class nsIRunnable;
+class nsIThread;
+class nsIEventTarget;
+
+namespace mozilla {
+
+class OriginAttributes;
+
+namespace net {
+
+class CacheStorageService;
+class CacheStorage;
+class CacheEntry;
+class CacheEntryHandle;
+class CacheEntryTable;
+
+class CacheMemoryConsumer {
+ public:
+  CacheMemoryConsumer() = delete;
+
+ private:
+  friend class CacheStorageService;
+  // clang-format off
+  MOZ_ATOMIC_BITFIELDS(mAtomicBitfields, 32, (
+    (uint32_t, ReportedMemoryConsumption, 30),
+    (uint32_t, Flags, 2)
+  ))
+  // clang-format on
+
+ protected:
+  enum {
+    NORMAL = 0,
+    MEMORY_ONLY = 1 << 0,
+    DONT_REPORT = 1 << 1
+  };
+
+  explicit CacheMemoryConsumer(uint32_t aFlags);
+  ~CacheMemoryConsumer() { DoMemoryReport(0); }
+  void DoMemoryReport(uint32_t aCurrentSize);
+};
+
+using GlobalEntryTables = nsClassHashtable<nsCStringHashKey, CacheEntryTable>;
+class WalkMemoryCacheRunnable;
+
+namespace CacheStorageServiceInternal {
+class WalkMemoryCacheRunnable;
+class WalkDiskCacheRunnable;
+}  
+
+class CacheStorageService final : public nsICacheStorageService,
+                                  public nsIMemoryReporter,
+                                  public nsITimerCallback,
+                                  public nsINamed {
+  friend class CacheStorageServiceInternal::WalkMemoryCacheRunnable;
+  friend class CacheStorageServiceInternal::WalkDiskCacheRunnable;
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSICACHESTORAGESERVICE
+  NS_DECL_NSIMEMORYREPORTER
+  NS_DECL_NSITIMERCALLBACK
+  NS_DECL_NSINAMED
+
+  CacheStorageService();
+
+  void Shutdown();
+  void DropPrivateBrowsingEntries();
+
+  static CacheStorageService* Self() { return sSelf; }
+  static nsISupports* SelfISupports() {
+    return static_cast<nsICacheStorageService*>(Self());
+  }
+  nsresult Dispatch(nsIRunnable* aEvent);
+  static bool IsRunning() { return sSelf && !sSelf->mShutdown; }
+  static bool IsOnManagementThread();
+  already_AddRefed<nsIEventTarget> Thread() const;
+  StaticMutex& Lock() { return sLock; }
+
+  struct ForcedValidData {
+    TimeStamp validUntil;
+    bool viewed = false;
+  };
+  nsTHashMap<nsCStringHashKey, ForcedValidData> mForcedValidEntries;
+  void ForcedValidEntriesPrune(TimeStamp& now);
+
+  class EntryInfoCallback {
+   public:
+    virtual void OnEntryInfo(const nsACString& aURISpec,
+                             const nsACString& aIdEnhance, int64_t aDataSize,
+                             int64_t aAltDataSize, uint32_t aFetchCount,
+                             uint32_t aLastModifiedTime,
+                             uint32_t aExpirationTime, bool aPinned,
+                             nsILoadContextInfo* aInfo) = 0;
+  };
+
+  static void GetCacheEntryInfo(CacheEntry* aEntry,
+                                EntryInfoCallback* aCallback);
+
+  nsresult GetCacheIndexEntryAttrs(CacheStorage const* aStorage,
+                                   const nsACString& aURI,
+                                   const nsACString& aIdExtension,
+                                   bool* aHasAltData, uint32_t* aFileSizeKb);
+
+  static uint32_t CacheQueueSize(bool highPriority);
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  MOZ_DEFINE_MALLOC_SIZE_OF(MallocSizeOf)
+
+  void NoteNoVarySearchEntry(const nsACString& aContextKey,
+                             const nsACString& aBasePath,
+                             const nsACString& aFullKey);
+  void NoteNoVarySearchEntry(nsICacheEntry* aEntry, nsIURI* aURI);
+
+ private:
+  virtual ~CacheStorageService();
+  void ShutdownBackground();
+
+  static GlobalEntryTables* sGlobalEntryTables MOZ_GUARDED_BY(sLock);
+
+ private:
+  friend class CacheEntry;
+
+  void RegisterEntry(CacheEntry* aEntry);
+
+  void UnregisterEntry(CacheEntry* aEntry);
+
+  bool RemoveEntry(CacheEntry* aEntry, bool aOnlyUnreferenced = false);
+
+  void RecordMemoryOnlyEntry(CacheEntry* aEntry, bool aOnlyInMemory,
+                             bool aOverwrite);
+
+  void ForceEntryValidFor(nsACString const& aContextKey,
+                          nsACString const& aEntryKey,
+                          uint32_t aSecondsToTheFuture);
+
+  void RemoveEntryForceValid(nsACString const& aContextKey,
+                             nsACString const& aEntryKey);
+
+  bool IsForcedValidEntry(nsACString const& aContextKey,
+                          nsACString const& aEntryKey);
+
+  void MarkForcedValidEntryUse(nsACString const& aContextKey,
+                               nsACString const& aEntryKey);
+
+ private:
+  friend class CacheIndex;
+
+  bool IsForcedValidEntry(nsACString const& aContextEntryKey);
+
+ private:
+  friend class CacheStorage;
+
+  nsresult AddStorageEntry(CacheStorage const* aStorage, const nsACString& aURI,
+                           const nsACString& aIdExtension, uint32_t aFlags,
+                           CacheEntryHandle** aResult);
+
+  nsresult CheckStorageEntry(CacheStorage const* aStorage,
+                             const nsACString& aURI,
+                             const nsACString& aIdExtension, bool* aResult);
+
+  nsresult DoomStorageEntry(CacheStorage const* aStorage,
+                            const nsACString& aURI,
+                            const nsACString& aIdExtension,
+                            nsICacheEntryDoomCallback* aCallback);
+
+  nsresult DoomStorageEntries(CacheStorage const* aStorage,
+                              nsICacheEntryDoomCallback* aCallback);
+
+  nsresult WalkStorageEntries(CacheStorage const* aStorage, bool aVisitEntries,
+                              nsICacheStorageVisitor* aVisitor);
+
+ private:
+  friend class CacheFileIOManager;
+
+  void CacheFileDoomed(const nsACString& aKey,
+                       nsILoadContextInfo* aLoadContextInfo,
+                       const nsACString& aIdExtension,
+                       const nsACString& aURISpec);
+
+  bool GetCacheEntryInfo(nsILoadContextInfo* aLoadContextInfo,
+                         const nsACString& aIdExtension,
+                         const nsACString& aURISpec,
+                         EntryInfoCallback* aCallback);
+
+ private:
+  friend class CacheMemoryConsumer;
+
+  void OnMemoryConsumptionChange(CacheMemoryConsumer* aConsumer,
+                                 uint32_t aCurrentMemoryConsumption);
+
+  void SchedulePurgeOverMemoryLimit();
+
+  void PurgeExpiredOrOverMemoryLimit();
+
+ private:
+  nsresult DoomStorageEntries(const nsACString& aContextKey,
+                              nsILoadContextInfo* aContext, bool aDiskStorage,
+                              bool aPin, nsICacheEntryDoomCallback* aCallback);
+  nsresult AddStorageEntry(const nsACString& aContextKey,
+                           const nsACString& aURI,
+                           const nsACString& aIdExtension, bool aWriteToDisk,
+                           bool aSkipSizeCheck, bool aPin, uint32_t aFlags,
+                           CacheEntryHandle** aResult);
+
+  nsresult ClearOriginInternal(
+      const nsAString& aOrigin,
+      const mozilla::OriginAttributes& aOriginAttributes, bool aAnonymous);
+
+  static CacheStorageService* sSelf;
+
+  static StaticMutex sLock;
+  mozilla::Mutex mForcedValidEntriesLock{
+      "CacheStorageService.mForcedValidEntriesLock"};
+
+  Atomic<bool, Relaxed> mShutdown{false};
+
+  class MemoryPool {
+   public:
+    enum EType {
+      DISK,
+      MEMORY,
+    } mType;
+
+    explicit MemoryPool(EType aType);
+    ~MemoryPool();
+
+    MemoryPool() = delete;
+
+    LinkedList<RefPtr<CacheEntry>> mManagedEntries;
+    Atomic<uint32_t, Relaxed> mMemorySize{0};
+
+    bool OnMemoryConsumptionChange(uint32_t aSavedMemorySize,
+                                   uint32_t aCurrentMemoryConsumption);
+    void PurgeExpiredOrOverMemoryLimit();
+    size_t PurgeExpired(size_t minprogress);
+    Result<size_t, nsresult> PurgeByFrecency(size_t minprogress);
+    size_t PurgeAll(uint32_t aWhat, size_t minprogress);
+
+   private:
+    uint32_t Limit() const;
+  };
+
+  MemoryPool mDiskPool{MemoryPool::DISK};
+  MemoryPool mMemoryPool{MemoryPool::MEMORY};
+  TimeStamp mLastPurgeTime;
+  MemoryPool& Pool(bool aUsingDisk) {
+    return aUsingDisk ? mDiskPool : mMemoryPool;
+  }
+  MemoryPool const& Pool(bool aUsingDisk) const {
+    return aUsingDisk ? mDiskPool : mMemoryPool;
+  }
+
+  nsCOMPtr<nsITimer> mPurgeTimer;
+#ifdef MOZ_TSAN
+  Atomic<bool, Relaxed> mPurgeTimerActive{false};
+#endif
+
+  class PurgeFromMemoryRunnable : public Runnable {
+   public:
+    PurgeFromMemoryRunnable(CacheStorageService* aService, uint32_t aWhat)
+        : Runnable("net::CacheStorageService::PurgeFromMemoryRunnable"),
+          mService(aService),
+          mWhat(aWhat) {}
+
+   private:
+    virtual ~PurgeFromMemoryRunnable() = default;
+
+    NS_IMETHOD Run() override;
+
+    RefPtr<CacheStorageService> mService;
+    uint32_t mWhat;
+  };
+
+};
+
+template <class T>
+void ProxyRelease(const char* aName, nsCOMPtr<T>& object,
+                  nsIEventTarget* target) {
+  NS_ProxyRelease(aName, target, object.forget());
+}
+
+template <class T>
+void ProxyReleaseMainThread(const char* aName, nsCOMPtr<T>& object) {
+  ProxyRelease(aName, object, GetMainThreadSerialEventTarget());
+}
+
+}  
+}  
+
+#define NS_CACHE_STORAGE_SERVICE_CID \
+  {0xea70b098, 0x5014, 0x4e21, {0xae, 0xe1, 0x75, 0xe6, 0xb2, 0xc4, 0xb8, 0xe0}}
+
+#define NS_CACHE_STORAGE_SERVICE_CONTRACTID \
+  "@mozilla.org/netwerk/cache-storage-service;1"
+
+#define NS_CACHE_STORAGE_SERVICE_CONTRACTID2 \
+  "@mozilla.org/network/cache-storage-service;1"
+
+#endif

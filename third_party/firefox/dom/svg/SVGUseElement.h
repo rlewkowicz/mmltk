@@ -1,0 +1,146 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGUSEELEMENT_H_
+#define DOM_SVG_SVGUSEELEMENT_H_
+
+#include "SVGAnimatedLength.h"
+#include "SVGAnimatedString.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/FromParser.h"
+#include "mozilla/dom/IDTracker.h"
+#include "mozilla/dom/SVGGraphicsElement.h"
+#include "nsCOMPtr.h"
+#include "nsStubMutationObserver.h"
+#include "nsTArray.h"
+
+class nsIContent;
+
+nsresult NS_NewSVGSVGElement(nsIContent** aResult,
+                             already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,
+                             mozilla::dom::FromParser aFromParser);
+nsresult NS_NewSVGUseElement(
+    nsIContent** aResult, already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo);
+
+namespace mozilla {
+class Encoding;
+class SVGUseFrame;
+struct URLExtraData;
+
+namespace dom {
+
+using SVGUseElementBase = SVGGraphicsElement;
+
+class SVGUseElement final : public SVGUseElementBase,
+                            public nsStubMutationObserver {
+  friend class mozilla::SVGUseFrame;
+
+ protected:
+  friend nsresult(::NS_NewSVGUseElement(
+      nsIContent** aResult,
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo));
+  explicit SVGUseElement(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo);
+  virtual ~SVGUseElement();
+  JSObject* WrapNode(JSContext* cx, JS::Handle<JSObject*> aGivenProto) override;
+
+ public:
+  NS_IMPL_FROMNODE_WITH_TAG(SVGUseElement, kNameSpaceID_SVG, use)
+
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+  void UnbindFromTree(UnbindContext&) override;
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(SVGUseElement, SVGUseElementBase)
+
+  NS_DECL_NSIMUTATIONOBSERVER_CHARACTERDATACHANGED
+  NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTECHANGED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTAPPENDED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTINSERTED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTREMOVED
+  NS_DECL_NSIMUTATIONOBSERVER_NODEWILLBEDESTROYED
+
+  gfxMatrix ChildToUserSpaceTransform() const override;
+  bool HasValidDimensions() const override;
+
+  nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
+  NS_IMETHOD_(bool) IsAttributeMapped(const nsAtom* aAttribute) const override;
+
+  static NonCustomCSSPropertyId GetCSSPropertyIdForAttrEnum(uint8_t aAttrEnum);
+
+  already_AddRefed<DOMSVGAnimatedString> Href();
+  already_AddRefed<DOMSVGAnimatedLength> X();
+  already_AddRefed<DOMSVGAnimatedLength> Y();
+  already_AddRefed<DOMSVGAnimatedLength> Width();
+  already_AddRefed<DOMSVGAnimatedLength> Height();
+
+  Document* GetSourceDocument() const;
+  nsIURI* GetSourceDocURI() const;
+  const Encoding* GetSourceDocCharacterSet() const;
+  URLExtraData* GetContentURLData() const { return mContentURLData; }
+
+  void UpdateShadowTree();
+
+  void ProcessAttributeChange(int32_t aNamespaceID, nsAtom* aAttribute);
+
+  void AfterSetAttr(int32_t aNamespaceID, nsAtom* aAttribute,
+                    const nsAttrValue* aValue, const nsAttrValue* aOldValue,
+                    nsIPrincipal* aSubjectPrincipal, bool aNotify) final;
+
+ protected:
+  enum class ScanResult {
+    Ok,
+    Invisible,
+    CyclicReference,
+    TooDeep,
+  };
+  ScanResult ScanAncestors(const Element& aTarget) const;
+  ScanResult ScanAncestorsInternal(const Element& aTarget,
+                                   uint32_t& aCount) const;
+
+  class ElementTracker final : public IDTracker {
+   public:
+    explicit ElementTracker(SVGUseElement* aOwningUseElement)
+        : mOwningUseElement(aOwningUseElement) {}
+
+   private:
+    void ElementChanged(Element* aFrom, Element* aTo) override {
+      IDTracker::ElementChanged(aFrom, aTo);
+      if (aFrom) {
+        aFrom->RemoveMutationObserver(mOwningUseElement);
+      }
+      mOwningUseElement->TriggerReclone();
+    }
+
+    SVGUseElement* mOwningUseElement;
+  };
+
+  void DidAnimateAttribute(int32_t aNameSpaceID, nsAtom* aAttribute) override;
+  SVGUseFrame* GetFrame() const;
+
+  LengthAttributesInfo GetLengthInfo() override;
+  StringAttributesInfo GetStringInfo() override;
+
+  bool OurWidthAndHeightAreUsed() const;
+  void SyncWidthOrHeight(nsAtom* aName);
+  void LookupHref();
+  void TriggerReclone();
+  void UnlinkSource();
+
+  RefPtr<SVGUseElement> mOriginal;  
+  ElementTracker mReferencedElementTracker;
+  RefPtr<URLExtraData> mContentURLData;  
+
+  enum { HREF, XLINK_HREF };
+  SVGAnimatedString mStringAttributes[2];
+  static StringInfo sStringInfo[2];
+
+  enum { ATTR_X, ATTR_Y, ATTR_WIDTH, ATTR_HEIGHT };
+  SVGAnimatedLength mLengthAttributes[4];
+  static LengthInfo sLengthInfo[4];
+};
+
+}  
+}  
+
+#endif  // DOM_SVG_SVGUSEELEMENT_H_

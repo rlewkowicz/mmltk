@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef NS_FONTCACHE_H_
+#define NS_FONTCACHE_H_
+
+#include <stdint.h>
+#include <sys/types.h>
+#include "mozilla/RefPtr.h"
+#include "nsCOMPtr.h"
+#include "nsFontMetrics.h"
+#include "nsIObserver.h"
+#include "nsISupports.h"
+#include "nsTArray.h"
+#include "nsThreadUtils.h"
+#include "prtime.h"
+
+class gfxUserFontSet;
+class nsAtom;
+class nsPresContext;
+struct nsFont;
+
+class nsFontCache final : public nsIObserver {
+ public:
+  nsFontCache()
+      : mContext(nullptr), mMissedFontFamilyNames("MissedFontFamilyNames") {}
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  void Init(nsPresContext* aContext);
+  void Destroy();
+
+  already_AddRefed<nsFontMetrics> GetMetricsFor(
+      const nsFont& aFont, const nsFontMetrics::Params& aParams);
+
+  void FontMetricsDeleted(const nsFontMetrics* aFontMetrics);
+  void Compact();
+
+  void Flush(int32_t aFlushCount = -1);
+
+  void UpdateUserFonts(gfxUserFontSet* aUserFontSet);
+
+ protected:
+  static constexpr int32_t kMaxCacheEntries = 128;
+
+  static constexpr int32_t kFingerprintingCacheMissThreshold = 10;
+  static constexpr PRTime kFingerprintingLastNSec =
+      PRTime(PR_USEC_PER_SEC) * 6;  
+
+  static_assert(kFingerprintingCacheMissThreshold < kMaxCacheEntries);
+
+  ~nsFontCache() = default;
+
+  nsPresContext* mContext;  
+  RefPtr<nsAtom> mLocaleLanguage;
+
+  AutoTArray<nsFontMetrics*, kMaxCacheEntries * 2> mFontMetrics;
+
+  bool mFlushPending = false;
+
+  class FlushFontMetricsTask : public mozilla::Runnable {
+   public:
+    explicit FlushFontMetricsTask(nsFontCache* aCache)
+        : mozilla::Runnable("FlushFontMetricsTask"), mCache(aCache) {}
+    NS_IMETHOD Run() override {
+      mCache->Flush(mCache->mFontMetrics.Length() - kMaxCacheEntries / 2);
+      mCache->mFlushPending = false;
+      return NS_OK;
+    }
+
+   private:
+    RefPtr<nsFontCache> mCache;
+  };
+
+  void DetectFontFingerprinting(const nsFont& aFont);
+
+  mozilla::DataMutex<nsTHashMap<nsStringHashKey, PRTime>>
+      mMissedFontFamilyNames;
+  bool mReportedProbableFingerprinting = false;
+};
+
+#endif /* NS_FONTCACHE_H_ */

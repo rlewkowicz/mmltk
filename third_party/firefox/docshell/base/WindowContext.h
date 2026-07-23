@@ -1,0 +1,369 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_WindowContext_h
+#define mozilla_dom_WindowContext_h
+
+#include "mozilla/PermissionDelegateHandler.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/Span.h"
+#include "mozilla/dom/MaybeDiscarded.h"
+#include "mozilla/dom/SyncedContext.h"
+#include "mozilla/dom/UserActivation.h"
+#include "nsDOMNavigationTiming.h"
+#include "nsILoadInfo.h"
+#include "nsWrapperCache.h"
+
+class nsIGlobalObject;
+
+class nsGlobalWindowInner;
+
+namespace mozilla {
+class LogModule;
+class nsRFPTargetSetIDL;
+
+namespace dom {
+
+class WindowGlobalChild;
+class WindowGlobalParent;
+class WindowGlobalInit;
+class BrowsingContext;
+class BrowsingContextGroup;
+
+#define MOZ_EACH_WC_FIELD(FIELD)                                         \
+                       \
+  FIELD(SHEntryHasUserInteraction, bool)                                 \
+  FIELD(CookieBehavior, Maybe<uint32_t>)                                 \
+  FIELD(IsOnContentBlockingAllowList, bool)                              \
+                     \
+  FIELD(IsThirdPartyWindow, bool)                                        \
+                                                  \
+  FIELD(IsThirdPartyTrackingResourceWindow, bool)                        \
+                                             \
+  FIELD(UsingStorageAccess, bool)                                        \
+  FIELD(ShouldResistFingerprinting, bool)                                \
+  FIELD(OverriddenFingerprintingSettings, Maybe<RFPTargetSet>)           \
+  FIELD(IsSecureContext, bool)                                           \
+  FIELD(IsOriginalFrameSource, bool)                                     \
+                                            \
+  FIELD(IsSecure, bool)                                                  \
+                                                            \
+  FIELD(NeedsBeforeUnload, bool)                                         \
+                                   \
+  FIELD(NeedsTraverse, bool)                                             \
+                                             \
+  FIELD(UserActivationStateAndModifiers,                                 \
+        UserActivation::StateAndModifiers::DataT)                        \
+  FIELD(EmbedderPolicy, nsILoadInfo::CrossOriginEmbedderPolicy)          \
+                      \
+  FIELD(DocTreeHadMedia, bool)                                           \
+  FIELD(AutoplayPermission, uint32_t)                                    \
+  FIELD(ShortcutsPermission, uint32_t)                                   \
+                             \
+  FIELD(ActiveMediaSessionContextId, Maybe<uint64_t>)                    \
+                   \
+  FIELD(PopupPermission, uint32_t)                                       \
+  FIELD(DelegatedPermissions,                                            \
+        PermissionDelegateHandler::DelegatedPermissionList)              \
+  FIELD(DelegatedExactHostMatchPermissions,                              \
+        PermissionDelegateHandler::DelegatedPermissionList)              \
+  FIELD(HasReportedShadowDOMUsage, bool)                                 \
+                                                         \
+  FIELD(IsLocalIP, bool)                                                 \
+            \
+  FIELD(AllowJavascript, bool)                                           \
+           \
+  FIELD(HasActiveCloseWatcher, bool)                                     \
+                                          \
+  FIELD(IsFramebustingAllowed, bool)
+
+class WindowContext : public nsISupports, public nsWrapperCache {
+  MOZ_DECL_SYNCED_CONTEXT(WindowContext, MOZ_EACH_WC_FIELD)
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(WindowContext)
+
+ public:
+  static already_AddRefed<WindowContext> GetById(uint64_t aInnerWindowId);
+  static LogModule* GetLog();
+  static LogModule* GetSyncLog();
+
+  BrowsingContext* GetBrowsingContext() const { return mBrowsingContext; }
+  BrowsingContextGroup* Group() const;
+  uint64_t Id() const { return InnerWindowId(); }
+  uint64_t InnerWindowId() const { return mInnerWindowId; }
+  uint64_t OuterWindowId() const { return mOuterWindowId; }
+  bool IsDiscarded() const { return mIsDiscarded; }
+
+  bool IsCurrent() const;
+
+  bool IsInBFCache();
+
+  bool IsInProcess() const { return mIsInProcess; }
+
+  bool NeedsBeforeUnload() const { return GetNeedsBeforeUnload(); }
+
+  bool HasBeforeUnload() const { return NeedsBeforeUnload(); }
+
+  bool IsLocalIP() const { return GetIsLocalIP(); }
+
+  bool ShouldResistFingerprinting() const {
+    return GetShouldResistFingerprinting();
+  }
+
+  bool UsingStorageAccess() const { return GetUsingStorageAccess(); }
+
+  already_AddRefed<nsIRFPTargetSetIDL>
+  GetOverriddenFingerprintingSettingsWebIDL() const;
+
+  nsGlobalWindowInner* GetInnerWindow() const;
+  Document* GetDocument() const;
+  Document* GetExtantDoc() const;
+
+  WindowGlobalChild* GetWindowGlobalChild() const;
+
+  WindowContext* GetParentWindowContext();
+  WindowContext* TopWindowContext();
+
+  bool SameOriginWithTop() const;
+
+  bool IsTop() const;
+
+  Span<RefPtr<BrowsingContext>> Children() { return mChildren; }
+
+  Span<RefPtr<BrowsingContext>> NonSyntheticChildren() {
+    return mNonSyntheticChildren;
+  }
+
+  BrowsingContext* NonSyntheticLightDOMChildAt(uint32_t aIndex);
+  uint32_t NonSyntheticLightDOMChildrenCount();
+
+  WindowGlobalParent* Canonical();
+
+  nsIGlobalObject* GetParentObject() const;
+  JSObject* WrapObject(JSContext* cx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  void Discard();
+
+  struct IPCInitializer {
+    uint64_t mInnerWindowId;
+    uint64_t mOuterWindowId;
+    uint64_t mBrowsingContextId;
+
+    FieldValues mFields;
+  };
+  IPCInitializer GetIPCInitializer();
+
+  static void CreateFromIPC(IPCInitializer&& aInit);
+
+  void AddSecurityState(uint32_t aStateFlags);
+
+  UserActivation::State GetUserActivationState() const {
+    return UserActivation::StateAndModifiers(
+               GetUserActivationStateAndModifiers())
+        .GetState();
+  }
+
+  void NotifyUserGestureActivation(
+      UserActivation::Modifiers aModifiers = UserActivation::Modifiers::None());
+
+  void NotifyResetUserGestureActivation();
+
+  bool HasBeenUserGestureActivated();
+
+  bool HasValidTransientUserGestureActivation();
+
+  const TimeStamp& GetUserGestureStart() const;
+
+  bool ConsumeTransientUserGestureActivation();
+
+  bool HasValidHistoryActivation() const;
+
+  void ConsumeHistoryActivation();
+
+  void UpdateLastHistoryActivation();
+
+  bool GetTransientUserGestureActivationModifiers(
+      UserActivation::Modifiers* aModifiers);
+
+  bool CanShowPopup();
+  bool CanFramebust();
+
+  bool AllowJavascript() const { return GetAllowJavascript(); }
+  bool CanExecuteScripts() const { return mCanExecuteScripts; }
+
+  bool HasActiveCloseWatcher() const { return GetHasActiveCloseWatcher(); }
+
+  void ProcessCloseRequest();
+
+ protected:
+  WindowContext(BrowsingContext* aBrowsingContext, uint64_t aInnerWindowId,
+                uint64_t aOuterWindowId, FieldValues&& aFields);
+  virtual ~WindowContext();
+
+  virtual void Init();
+
+ private:
+  friend class BrowsingContext;
+  friend class WindowGlobalChild;
+  friend class WindowGlobalActor;
+
+  void AppendChildBrowsingContext(BrowsingContext* aBrowsingContext);
+  void RemoveChildBrowsingContext(BrowsingContext* aBrowsingContext);
+
+  void UpdateChildSynthetic(BrowsingContext* aBrowsingContext,
+                            bool aIsSynthetic);
+
+  void SendCommitTransaction(ContentParent* aParent,
+                             const BaseTransaction& aTxn, uint64_t aEpoch);
+  void SendCommitTransaction(ContentChild* aChild, const BaseTransaction& aTxn,
+                             uint64_t aEpoch);
+
+  bool CheckOnlyOwningProcessCanSet(ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_IsSecure>, const bool& aIsSecure,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_NeedsBeforeUnload>, const bool& aHasBeforeUnload,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_NeedsTraverse>, const bool& aNeedsTraverse,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_CookieBehavior>, const Maybe<uint32_t>& aValue,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_IsOnContentBlockingAllowList>, const bool& aValue,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_EmbedderPolicy>, const bool& aValue,
+              ContentParent* aSource) {
+    return true;
+  }
+
+  bool CanSet(FieldIndex<IDX_IsThirdPartyWindow>,
+              const bool& IsThirdPartyWindow, ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_IsThirdPartyTrackingResourceWindow>,
+              const bool& aIsThirdPartyTrackingResourceWindow,
+              ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_UsingStorageAccess>,
+              const bool& aUsingStorageAccess, ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_ShouldResistFingerprinting>,
+              const bool& aShouldResistFingerprinting, ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_OverriddenFingerprintingSettings>,
+              const Maybe<RFPTargetSet>& aValue, ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_IsSecureContext>, const bool& aIsSecureContext,
+              ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_IsOriginalFrameSource>,
+              const bool& aIsOriginalFrameSource, ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_DocTreeHadMedia>, const bool& aValue,
+              ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_AutoplayPermission>, const uint32_t& aValue,
+              ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_ShortcutsPermission>, const uint32_t& aValue,
+              ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_ActiveMediaSessionContextId>,
+              const Maybe<uint64_t>& aValue, ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_PopupPermission>, const uint32_t&,
+              ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_SHEntryHasUserInteraction>,
+              const bool& aSHEntryHasUserInteraction, ContentParent* aSource) {
+    return true;
+  }
+  bool CanSet(FieldIndex<IDX_DelegatedPermissions>,
+              const PermissionDelegateHandler::DelegatedPermissionList& aValue,
+              ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_DelegatedExactHostMatchPermissions>,
+              const PermissionDelegateHandler::DelegatedPermissionList& aValue,
+              ContentParent* aSource);
+  bool CanSet(FieldIndex<IDX_UserActivationStateAndModifiers>,
+              const UserActivation::StateAndModifiers::DataT&
+                  aUserActivationStateAndModifiers,
+              ContentParent* aSource) {
+    return true;
+  }
+
+  bool CanSet(FieldIndex<IDX_HasReportedShadowDOMUsage>, const bool& aValue,
+              ContentParent* aSource) {
+    return true;
+  }
+
+  bool CanSet(FieldIndex<IDX_IsLocalIP>, const bool& aValue,
+              ContentParent* aSource);
+
+  bool CanSet(FieldIndex<IDX_AllowJavascript>, bool aValue,
+              ContentParent* aSource);
+  void DidSet(FieldIndex<IDX_AllowJavascript>, bool aOldValue);
+
+  void DidSet(FieldIndex<IDX_HasReportedShadowDOMUsage>, bool aOldValue);
+
+  void DidSet(FieldIndex<IDX_SHEntryHasUserInteraction>, bool aOldValue);
+
+  bool CanSet(FieldIndex<IDX_HasActiveCloseWatcher>, bool, ContentParent*) {
+    return true;
+  }
+
+  bool CanSet(FieldIndex<IDX_IsFramebustingAllowed>, const bool& aValue,
+              ContentParent* aSource);
+
+  template <size_t I>
+  void DidSet(FieldIndex<I>) {}
+  template <size_t I, typename T>
+  void DidSet(FieldIndex<I>, T&& aOldValue) {}
+  void DidSet(FieldIndex<IDX_UserActivationStateAndModifiers>);
+
+  void RecomputeCanExecuteScripts(bool aApplyChanges = true);
+
+  void ClearLightDOMChildren();
+
+  void EnsureLightDOMChildren();
+
+  const uint64_t mInnerWindowId;
+  const uint64_t mOuterWindowId;
+  RefPtr<BrowsingContext> mBrowsingContext;
+  WeakPtr<WindowGlobalChild> mWindowGlobalChild;
+
+  nsTArray<RefPtr<BrowsingContext>> mChildren;
+
+  nsTArray<RefPtr<BrowsingContext>> mNonSyntheticChildren;
+
+  Maybe<nsTArray<RefPtr<BrowsingContext>>> mNonSyntheticLightDOMChildren;
+
+  bool mIsDiscarded = false;
+  bool mIsInProcess = false;
+
+  bool mCanExecuteScripts = true;
+
+  TimeStamp mLastActivationTimestamp;
+
+  TimeStamp mHistoryActivation;
+};
+
+using WindowContextTransaction = WindowContext::BaseTransaction;
+using WindowContextInitializer = WindowContext::IPCInitializer;
+using MaybeDiscardedWindowContext = MaybeDiscarded<WindowContext>;
+
+extern template class syncedcontext::Transaction<WindowContext>;
+
+}  
+}  
+
+namespace IPC {
+template <>
+struct ParamTraits<mozilla::dom::MaybeDiscarded<mozilla::dom::WindowContext>> {
+  using paramType = mozilla::dom::MaybeDiscarded<mozilla::dom::WindowContext>;
+  static void Write(MessageWriter* aWriter, const paramType& aParam);
+  static bool Read(MessageReader* aReader, paramType* aResult);
+};
+
+template <>
+struct ParamTraits<mozilla::dom::WindowContext::IPCInitializer> {
+  using paramType = mozilla::dom::WindowContext::IPCInitializer;
+  static void Write(MessageWriter* aWriter, const paramType& aInitializer);
+  static bool Read(MessageReader* aReader, paramType* aInitializer);
+};
+}  
+
+#endif  // !defined(mozilla_dom_WindowContext_h)

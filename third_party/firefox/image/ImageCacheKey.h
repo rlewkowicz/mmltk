@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_image_src_ImageCacheKey_h
+#define mozilla_image_src_ImageCacheKey_h
+
+#include "PLDHashTable.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/Maybe.h"
+#include "nsIDocShell.h"
+
+class nsIURI;
+
+namespace mozilla {
+
+enum CORSMode : uint8_t;
+
+namespace image {
+
+class ImageCacheKey final {
+ public:
+  ImageCacheKey(nsIURI*, CORSMode, dom::Document*);
+
+  ImageCacheKey(const ImageCacheKey& aOther);
+  ImageCacheKey(ImageCacheKey&& aOther);
+
+  bool operator==(const ImageCacheKey& aOther) const;
+  PLDHashNumber Hash() const {
+    if (MOZ_UNLIKELY(mHash.isNothing())) {
+      EnsureHash();
+    }
+    return mHash.value();
+  }
+
+  nsIURI* URI() const { return mURI; }
+
+  nsIPrincipal* PartitionPrincipal() const { return mPartitionPrincipal; }
+  nsIPrincipal* LoaderPrincipal() const { return mLoaderPrincipal; }
+
+  CORSMode GetCORSMode() const { return mCORSMode; }
+
+  void* ControlledDocument() const { return mControlledDocument; }
+
+ private:
+  static void* GetSpecialCaseDocumentToken(dom::Document* aDocument);
+
+  static nsIDocShell::AppType GetAppType(dom::Document* aDocument);
+
+  void EnsureHash() const;
+
+  nsCOMPtr<nsIURI> mURI;
+  void* mControlledDocument;
+  nsCOMPtr<nsIPrincipal> mLoaderPrincipal;
+  nsCOMPtr<nsIPrincipal> mPartitionPrincipal;
+  mutable Maybe<PLDHashNumber> mHash;
+  const CORSMode mCORSMode;
+  const nsIDocShell::AppType mAppType;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_src_ImageCacheKey_h

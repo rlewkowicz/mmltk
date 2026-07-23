@@ -1,0 +1,283 @@
+/*
+ * Copyright (C) 2010, Google Inc. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1.  Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2.  Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY APPLE INC. AND ITS CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL APPLE INC. OR ITS CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include "HRTFPanner.h"
+
+#include "AudioBlock.h"
+#include "FFTConvolver.h"
+#include "HRTFDatabase.h"
+#include "HRTFDatabaseLoader.h"
+
+using namespace mozilla;
+using dom::ChannelInterpretation;
+
+namespace WebCore {
+
+const float MaxDelayTimeSeconds = 0.002f;
+
+const int UninitializedAzimuth = -1;
+
+HRTFPanner::HRTFPanner(float sampleRate,
+                       already_AddRefed<HRTFDatabaseLoader> databaseLoader)
+    : m_databaseLoader(databaseLoader),
+      m_sampleRate(sampleRate),
+      m_crossfadeSelection(CrossfadeSelection1),
+      m_azimuthIndex1(UninitializedAzimuth),
+      m_azimuthIndex2(UninitializedAzimuth)
+      ,
+      m_crossfadeX(0),
+      m_crossfadeIncr(0),
+      m_convolverL1(HRTFElevation::fftSizeForSampleRate(sampleRate)),
+      m_convolverR1(m_convolverL1.fftSize()),
+      m_convolverL2(m_convolverL1.fftSize()),
+      m_convolverR2(m_convolverL1.fftSize()),
+      m_delayLine(MaxDelayTimeSeconds * sampleRate) {
+  MOZ_ASSERT(m_databaseLoader);
+  MOZ_COUNT_CTOR(HRTFPanner);
+}
+
+HRTFPanner::~HRTFPanner() { MOZ_COUNT_DTOR(HRTFPanner); }
+
+size_t HRTFPanner::sizeOfIncludingThis(
+    mozilla::MallocSizeOf aMallocSizeOf) const {
+  size_t amount = aMallocSizeOf(this);
+
+  amount += m_convolverL1.sizeOfExcludingThis(aMallocSizeOf);
+  amount += m_convolverR1.sizeOfExcludingThis(aMallocSizeOf);
+  amount += m_convolverL2.sizeOfExcludingThis(aMallocSizeOf);
+  amount += m_convolverR2.sizeOfExcludingThis(aMallocSizeOf);
+  amount += m_delayLine.SizeOfExcludingThis(aMallocSizeOf);
+
+  return amount;
+}
+
+void HRTFPanner::reset() {
+  m_azimuthIndex1 = UninitializedAzimuth;
+  m_azimuthIndex2 = UninitializedAzimuth;
+  m_crossfadeSelection = CrossfadeSelection1;
+  m_crossfadeX = 0.0f;
+  m_crossfadeIncr = 0.0f;
+  m_convolverL1.reset();
+  m_convolverR1.reset();
+  m_convolverL2.reset();
+  m_convolverR2.reset();
+  m_delayLine.Reset();
+}
+
+int HRTFPanner::calculateDesiredAzimuthIndexAndBlend(double azimuth,
+                                                     double& azimuthBlend) {
+  if (azimuth < 0) azimuth += 360.0;
+
+  int numberOfAzimuths = HRTFDatabase::numberOfAzimuths();
+  const double angleBetweenAzimuths = 360.0 / numberOfAzimuths;
+
+  double desiredAzimuthIndexFloat = azimuth / angleBetweenAzimuths;
+  int desiredAzimuthIndex = static_cast<int>(desiredAzimuthIndexFloat);
+  azimuthBlend =
+      desiredAzimuthIndexFloat - static_cast<double>(desiredAzimuthIndex);
+
+  desiredAzimuthIndex = std::max(0, desiredAzimuthIndex);
+  desiredAzimuthIndex = std::min(numberOfAzimuths - 1, desiredAzimuthIndex);
+  return desiredAzimuthIndex;
+}
+
+void HRTFPanner::pan(double desiredAzimuth, double elevation,
+                     const AudioBlock* inputBus, AudioBlock* outputBus) {
+#ifdef DEBUG
+  unsigned numInputChannels = inputBus->IsNull() ? 0 : inputBus->ChannelCount();
+
+  MOZ_ASSERT(numInputChannels <= 2);
+  MOZ_ASSERT(inputBus->GetDuration() == WEBAUDIO_BLOCK_SIZE);
+#endif
+
+  bool isOutputGood = outputBus && outputBus->ChannelCount() == 2 &&
+                      outputBus->GetDuration() == WEBAUDIO_BLOCK_SIZE;
+  MOZ_ASSERT(isOutputGood);
+
+  if (!isOutputGood) {
+    if (outputBus) outputBus->SetNull(outputBus->GetDuration());
+    return;
+  }
+
+  HRTFDatabase* database = m_databaseLoader->database();
+  if (!database) {  
+    outputBus->SetNull(outputBus->GetDuration());
+    return;
+  }
+
+  double azimuth = -desiredAzimuth;
+
+  bool isAzimuthGood = azimuth >= -180.0 && azimuth <= 180.0;
+  MOZ_ASSERT(isAzimuthGood);
+  if (!isAzimuthGood) {
+    outputBus->SetNull(outputBus->GetDuration());
+    return;
+  }
+
+
+  float* destinationL =
+      static_cast<float*>(const_cast<void*>(outputBus->mChannelData[0]));
+  float* destinationR =
+      static_cast<float*>(const_cast<void*>(outputBus->mChannelData[1]));
+
+  double azimuthBlend;
+  int desiredAzimuthIndex =
+      calculateDesiredAzimuthIndexAndBlend(azimuth, azimuthBlend);
+
+  if (m_azimuthIndex1 == UninitializedAzimuth) {
+    m_azimuthIndex1 = desiredAzimuthIndex;
+    m_elevation1 = elevation;
+  }
+  if (m_azimuthIndex2 == UninitializedAzimuth) {
+    m_azimuthIndex2 = desiredAzimuthIndex;
+    m_elevation2 = elevation;
+  }
+
+  const double fadeFrames = sampleRate() <= 48000 ? 2048 : 4096;
+
+  if (!m_crossfadeX && m_crossfadeSelection == CrossfadeSelection1) {
+    if (desiredAzimuthIndex != m_azimuthIndex1 || elevation != m_elevation1) {
+      m_crossfadeIncr = 1 / fadeFrames;
+      m_azimuthIndex2 = desiredAzimuthIndex;
+      m_elevation2 = elevation;
+    }
+  }
+  if (m_crossfadeX == 1 && m_crossfadeSelection == CrossfadeSelection2) {
+    if (desiredAzimuthIndex != m_azimuthIndex2 || elevation != m_elevation2) {
+      m_crossfadeIncr = -1 / fadeFrames;
+      m_azimuthIndex1 = desiredAzimuthIndex;
+      m_elevation1 = elevation;
+    }
+  }
+
+  HRTFKernel* kernelL1;
+  HRTFKernel* kernelR1;
+  HRTFKernel* kernelL2;
+  HRTFKernel* kernelR2;
+  double frameDelayL1;
+  double frameDelayR1;
+  double frameDelayL2;
+  double frameDelayR2;
+  database->getKernelsFromAzimuthElevation(azimuthBlend, m_azimuthIndex1,
+                                           m_elevation1, kernelL1, kernelR1,
+                                           frameDelayL1, frameDelayR1);
+  database->getKernelsFromAzimuthElevation(azimuthBlend, m_azimuthIndex2,
+                                           m_elevation2, kernelL2, kernelR2,
+                                           frameDelayL2, frameDelayR2);
+
+  bool areKernelsGood = kernelL1 && kernelR1 && kernelL2 && kernelR2;
+  MOZ_ASSERT(areKernelsGood);
+  if (!areKernelsGood) {
+    outputBus->SetNull(outputBus->GetDuration());
+    return;
+  }
+
+  MOZ_ASSERT(frameDelayL1 / sampleRate() < MaxDelayTimeSeconds &&
+             frameDelayR1 / sampleRate() < MaxDelayTimeSeconds);
+  MOZ_ASSERT(frameDelayL2 / sampleRate() < MaxDelayTimeSeconds &&
+             frameDelayR2 / sampleRate() < MaxDelayTimeSeconds);
+
+  float frameDelaysL[WEBAUDIO_BLOCK_SIZE];
+  float frameDelaysR[WEBAUDIO_BLOCK_SIZE];
+  {
+    float x = m_crossfadeX;
+    float incr = m_crossfadeIncr;
+    for (unsigned i = 0; i < WEBAUDIO_BLOCK_SIZE; ++i) {
+      frameDelaysL[i] = (1 - x) * frameDelayL1 + x * frameDelayL2;
+      frameDelaysR[i] = (1 - x) * frameDelayR1 + x * frameDelayR2;
+      x += incr;
+    }
+  }
+
+  m_delayLine.Write(*inputBus);
+  m_delayLine.ReadChannel(frameDelaysL, outputBus, 0,
+                          ChannelInterpretation::Speakers);
+  m_delayLine.ReadChannel(frameDelaysR, outputBus, 1,
+                          ChannelInterpretation::Speakers);
+  m_delayLine.NextBlock();
+
+  bool needsCrossfading = m_crossfadeIncr;
+
+  const float* convolutionDestinationL1;
+  const float* convolutionDestinationR1;
+  const float* convolutionDestinationL2;
+  const float* convolutionDestinationR2;
+
+
+  if (m_crossfadeSelection == CrossfadeSelection1 || needsCrossfading) {
+    convolutionDestinationL1 =
+        m_convolverL1.process(kernelL1->fftFrame(), destinationL);
+    convolutionDestinationR1 =
+        m_convolverR1.process(kernelR1->fftFrame(), destinationR);
+  }
+
+  if (m_crossfadeSelection == CrossfadeSelection2 || needsCrossfading) {
+    convolutionDestinationL2 =
+        m_convolverL2.process(kernelL2->fftFrame(), destinationL);
+    convolutionDestinationR2 =
+        m_convolverR2.process(kernelR2->fftFrame(), destinationR);
+  }
+
+  if (needsCrossfading) {
+    float x = m_crossfadeX;
+    float incr = m_crossfadeIncr;
+    for (unsigned i = 0; i < WEBAUDIO_BLOCK_SIZE; ++i) {
+      destinationL[i] = (1 - x) * convolutionDestinationL1[i] +
+                        x * convolutionDestinationL2[i];
+      destinationR[i] = (1 - x) * convolutionDestinationR1[i] +
+                        x * convolutionDestinationR2[i];
+      x += incr;
+    }
+    m_crossfadeX = x;
+
+    if (m_crossfadeIncr > 0 && fabs(m_crossfadeX - 1) < m_crossfadeIncr) {
+      m_crossfadeSelection = CrossfadeSelection2;
+      m_crossfadeX = 1;
+      m_crossfadeIncr = 0;
+    } else if (m_crossfadeIncr < 0 && fabs(m_crossfadeX) < -m_crossfadeIncr) {
+      m_crossfadeSelection = CrossfadeSelection1;
+      m_crossfadeX = 0;
+      m_crossfadeIncr = 0;
+    }
+  } else {
+    const float* sourceL;
+    const float* sourceR;
+    if (m_crossfadeSelection == CrossfadeSelection1) {
+      sourceL = convolutionDestinationL1;
+      sourceR = convolutionDestinationR1;
+    } else {
+      sourceL = convolutionDestinationL2;
+      sourceR = convolutionDestinationR2;
+    }
+    PodCopy(destinationL, sourceL, WEBAUDIO_BLOCK_SIZE);
+    PodCopy(destinationR, sourceR, WEBAUDIO_BLOCK_SIZE);
+  }
+}
+
+int HRTFPanner::maxTailFrames() const {
+  return m_delayLine.MaxDelayTicks() + m_convolverL1.fftSize() / 2 +
+         m_convolverL1.latencyFrames();
+}
+
+}  

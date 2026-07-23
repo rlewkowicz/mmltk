@@ -1,0 +1,176 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsIncrementalStreamLoader.h"
+#include "nsIInputStream.h"
+#include "nsIChannel.h"
+#include "nsError.h"
+#include <limits>
+
+nsIncrementalStreamLoader::nsIncrementalStreamLoader() = default;
+
+NS_IMETHODIMP
+nsIncrementalStreamLoader::Init(nsIIncrementalStreamLoaderObserver* observer) {
+  NS_ENSURE_ARG_POINTER(observer);
+  mObserver = observer;
+  return NS_OK;
+}
+
+nsresult nsIncrementalStreamLoader::Create(REFNSIID aIID, void** aResult) {
+  RefPtr<nsIncrementalStreamLoader> it = new nsIncrementalStreamLoader();
+  return it->QueryInterface(aIID, aResult);
+}
+
+NS_IMPL_ISUPPORTS(nsIncrementalStreamLoader, nsIIncrementalStreamLoader,
+                  nsIRequestObserver, nsIStreamListener,
+                  nsIThreadRetargetableStreamListener)
+
+NS_IMETHODIMP
+nsIncrementalStreamLoader::GetNumBytesRead(uint32_t* aNumBytes) {
+  *aNumBytes = mBytesRead;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIncrementalStreamLoader::GetRequest(nsIRequest** aRequest) {
+  *aRequest = do_AddRef(mRequest).take();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIncrementalStreamLoader::OnStartRequest(nsIRequest* request) {
+  nsCOMPtr<nsIIncrementalStreamLoaderObserver> observer = mObserver;
+  nsresult rv = observer->OnStartRequest(request);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  nsCOMPtr<nsIChannel> chan(do_QueryInterface(request));
+  if (chan) {
+    int64_t contentLength = -1;
+    chan->GetContentLength(&contentLength);
+    if (contentLength >= 0) {
+      if (static_cast<uint64_t>(contentLength) >
+          std::min(std::numeric_limits<size_t>::max(),
+                   static_cast<size_t>(std::numeric_limits<int64_t>::max()))) {
+        return NS_ERROR_OUT_OF_MEMORY;
+      }
+
+      if (!mData.initCapacity(contentLength)) {
+        return NS_ERROR_OUT_OF_MEMORY;
+      }
+    }
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIncrementalStreamLoader::OnStopRequest(nsIRequest* request,
+                                         nsresult aStatus) {
+
+  if (mObserver) {
+    mRequest = request;
+    size_t length = mData.length();
+    uint8_t* elems = mData.extractOrCopyRawBuffer();
+    nsresult rv =
+        mObserver->OnStreamComplete(this, mContext, aStatus, length, elems);
+    if (rv != NS_SUCCESS_ADOPTED_DATA) {
+      mData.replaceRawBuffer(elems, length);
+    }
+    ReleaseData();
+    mRequest = nullptr;
+    mObserver = nullptr;
+  }
+  return NS_OK;
+}
+
+nsresult nsIncrementalStreamLoader::WriteSegmentFun(
+    nsIInputStream* inStr, void* closure, const char* fromSegment,
+    uint32_t toOffset, uint32_t count, uint32_t* writeCount) {
+  nsIncrementalStreamLoader* self = (nsIncrementalStreamLoader*)closure;
+
+  const uint8_t* data = reinterpret_cast<const uint8_t*>(fromSegment);
+  uint32_t consumedCount = 0;
+  nsresult rv;
+  if (self->mData.empty()) {
+    rv = self->mObserver->OnIncrementalData(self, self->mContext, count, data,
+                                            &consumedCount);
+
+    if (rv != NS_OK) {
+      return rv;
+    }
+
+    if (consumedCount > count) {
+      return NS_ERROR_INVALID_ARG;
+    }
+
+    if (consumedCount < count) {
+      if (!self->mData.append(fromSegment + consumedCount,
+                              count - consumedCount)) {
+        self->mData.clearAndFree();
+        return NS_ERROR_OUT_OF_MEMORY;
+      }
+    }
+  } else {
+    if (!self->mData.append(fromSegment, count)) {
+      self->mData.clearAndFree();
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    size_t length = self->mData.length();
+    uint32_t reportCount = length > UINT32_MAX ? UINT32_MAX : (uint32_t)length;
+    uint8_t* elems = self->mData.extractOrCopyRawBuffer();
+
+    rv = self->mObserver->OnIncrementalData(self, self->mContext, reportCount,
+                                            elems, &consumedCount);
+
+    if (rv != NS_OK) {
+      free(elems);
+      return rv;
+    }
+
+    if (consumedCount > reportCount) {
+      free(elems);
+      return NS_ERROR_INVALID_ARG;
+    }
+
+    if (consumedCount == length) {
+      free(elems);  
+    } else {
+      self->mData.replaceRawBuffer(elems, length);
+      if (consumedCount > 0) {
+        self->mData.erase(self->mData.begin(),
+                          self->mData.begin() + consumedCount);
+      }
+    }
+  }
+
+  *writeCount = count;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsIncrementalStreamLoader::OnDataAvailable(nsIRequest* request,
+                                           nsIInputStream* inStr,
+                                           uint64_t sourceOffset,
+                                           uint32_t count) {
+  if (mObserver) {
+    mRequest = request;
+  }
+  uint32_t countRead;
+  nsresult rv = inStr->ReadSegments(WriteSegmentFun, this, count, &countRead);
+  mRequest = nullptr;
+  NS_ENSURE_SUCCESS(rv, rv);
+  mBytesRead += countRead;
+  return rv;
+}
+
+void nsIncrementalStreamLoader::ReleaseData() { mData.clearAndFree(); }
+
+NS_IMETHODIMP
+nsIncrementalStreamLoader::CheckListenerChain() {
+  return NS_ERROR_NO_INTERFACE;
+}
+
+NS_IMETHODIMP
+nsIncrementalStreamLoader::OnDataFinished(nsresult aStatus) { return NS_OK; }

@@ -1,0 +1,144 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_ParallelWork_h
+#define gc_ParallelWork_h
+
+#include "mozilla/Maybe.h"
+
+#include <algorithm>
+
+#include "gc/GCParallelTask.h"
+#include "gc/GCRuntime.h"
+#include "js/SliceBudget.h"
+#include "vm/HelperThreads.h"
+
+namespace js {
+
+namespace gcstats {
+enum class PhaseKind : uint8_t;
+}
+
+namespace gc {
+
+template <typename WorkItem>
+using ParallelWorkFunc = size_t (*)(GCRuntime*, const WorkItem&);
+
+template <typename WorkItem, typename WorkItemIterator>
+class ParallelWorker : public GCParallelTask {
+ public:
+  using WorkFunc = ParallelWorkFunc<WorkItem>;
+
+  ParallelWorker(GCRuntime* gc, gcstats::PhaseKind phaseKind, GCUse use,
+                 WorkFunc func, WorkItemIterator& work,
+                 const JS::SliceBudget& budget, AutoLockHelperThreadState& lock)
+      : GCParallelTask(gc, phaseKind, use),
+        func_(func),
+        work_(work),
+        budget_(budget),
+        item_(work.get()) {
+    work.next();
+  }
+
+  void run(AutoLockHelperThreadState& lock) {
+    AutoUnlockHelperThreadState unlock(lock);
+
+    for (;;) {
+      size_t steps = func_(gc, item_);
+      budget_.step(std::max(steps, size_t(1)));
+      if (budget_.isOverBudget()) {
+        break;
+      }
+
+      AutoLockHelperThreadState lock;
+      if (work().done()) {
+        break;
+      }
+
+      item_ = work().get();
+      work().next();
+    }
+  }
+
+ private:
+  WorkItemIterator& work() { return work_.ref(); }
+
+  WorkFunc func_;
+
+  HelperThreadLockData<WorkItemIterator&> work_;
+
+  JS::SliceBudget budget_;
+
+  WorkItem item_;
+};
+
+template <typename WorkItem, typename WorkItemIterator>
+class MOZ_RAII AutoRunParallelWork {
+ public:
+  using Worker = ParallelWorker<WorkItem, WorkItemIterator>;
+  using WorkFunc = ParallelWorkFunc<WorkItem>;
+
+  AutoRunParallelWork(GCRuntime* gc, WorkFunc func,
+                      gcstats::PhaseKind phaseKind, GCUse use,
+                      WorkItemIterator& work, const JS::SliceBudget& budget,
+                      AutoLockHelperThreadState& lock)
+      : gc(gc), phaseKind(phaseKind), lock(lock), tasksStarted(0) {
+    size_t workerCount = gc->parallelWorkerCount();
+    MOZ_ASSERT(workerCount <= MaxParallelWorkers);
+    MOZ_ASSERT_IF(workerCount == 0, work.done());
+
+    for (size_t i = 0; i < workerCount && !work.done(); i++) {
+      tasks[i].emplace(gc, phaseKind, use, func, work, budget, lock);
+      gc->startTask(*tasks[i], lock);
+      tasksStarted++;
+    }
+  }
+
+  ~AutoRunParallelWork() {
+    gHelperThreadLock.assertOwnedByCurrentThread();
+
+    for (size_t i = 0; i < tasksStarted; i++) {
+      gc->joinTask(*tasks[i], lock);
+    }
+    for (size_t i = tasksStarted; i < MaxParallelWorkers; i++) {
+      MOZ_ASSERT(tasks[i].isNothing());
+    }
+  }
+
+ private:
+  GCRuntime* gc;
+  gcstats::PhaseKind phaseKind;
+  AutoLockHelperThreadState& lock;
+  size_t tasksStarted;
+  mozilla::Maybe<Worker> tasks[MaxParallelWorkers];
+};
+
+template <typename Vec>
+class MOZ_RAII VectorIterator {
+  Vec& items_;
+  size_t index_ = 0;
+
+ public:
+  explicit VectorIterator(Vec& items) : items_(items) {}
+
+  VectorIterator(const VectorIterator&) = delete;
+  VectorIterator& operator=(const VectorIterator&) = delete;
+
+  bool done() const { return index_ >= items_.length(); }
+
+  auto get() const {
+    MOZ_ASSERT(!done());
+    return items_[index_];
+  }
+
+  void next() {
+    MOZ_ASSERT(!done());
+    index_++;
+  }
+};
+
+} 
+} 
+
+#endif /* gc_ParallelWork_h */

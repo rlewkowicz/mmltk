@@ -1,0 +1,118 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_PodOperations_h
+#define mozilla_PodOperations_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+
+#include <cstring>
+#include <limits>
+#include <type_traits>
+
+namespace mozilla {
+
+template <typename T, size_t Length>
+class Array;
+
+template <typename T>
+class NotNull;
+
+template <typename T>
+static MOZ_ALWAYS_INLINE void PodZero(T* aT) {
+  static_assert(std::is_trivially_copyable_v<T>,
+                "PodZero requires trivially copyable types");
+  memset(aT, 0, sizeof(T));
+}
+
+template <typename T>
+static MOZ_ALWAYS_INLINE void PodZero(T* aT, size_t aNElem) {
+  static_assert(std::is_trivially_copyable_v<T>,
+                "PodZero requires trivially copyable types");
+  MOZ_ASSERT(aNElem <= std::numeric_limits<size_t>::max() / sizeof(T),
+             "trying to zero an impossible number of elements");
+  memset(aT, 0, sizeof(T) * aNElem);
+}
+
+template <typename T>
+static MOZ_ALWAYS_INLINE void PodZero(NotNull<T*> aT, size_t aNElem) {
+  PodZero(aT.get(), aNElem);
+}
+
+template <typename T, size_t N>
+static void PodZero(T (&aT)[N]) = delete;
+template <typename T, size_t N>
+static void PodZero(T (&aT)[N], size_t aNElem) = delete;
+
+template <class T, size_t N>
+static MOZ_ALWAYS_INLINE void PodArrayZero(T (&aT)[N]) {
+  static_assert(std::is_trivially_copyable_v<T>,
+                "PodArrayZero requires trivially copyable types");
+  static_assert(N < std::numeric_limits<size_t>::max() / sizeof(T));
+  memset(aT, 0, N * sizeof(T));
+}
+
+template <typename T, size_t N>
+static MOZ_ALWAYS_INLINE void PodArrayZero(Array<T, N>& aArr) {
+  static_assert(std::is_trivially_copyable_v<T>,
+                "PodArrayZero requires trivially copyable types");
+  static_assert(N < std::numeric_limits<size_t>::max() / sizeof(T));
+  memset(&aArr[0], 0, N * sizeof(T));
+}
+
+template <typename T>
+static MOZ_ALWAYS_INLINE void PodCopy(T* aDst, const T* aSrc, size_t aNElem) {
+  static_assert(std::is_trivially_copyable_v<T>,
+                "PodCopy requires trivially copyable types");
+  MOZ_ASSERT(aDst + aNElem <= aSrc || aSrc + aNElem <= aDst,
+             "destination and source must not overlap");
+  MOZ_ASSERT(aNElem <= std::numeric_limits<size_t>::max() / sizeof(T),
+             "trying to copy an impossible number of elements");
+
+#if defined(XP_LINUX)
+  if (aNElem < 128) {
+    for (const T* srcend = aSrc + aNElem; aSrc < srcend; aSrc++, aDst++) {
+      *aDst = *aSrc;
+    }
+    return;
+  }
+#endif
+
+  memcpy(aDst, aSrc, aNElem * sizeof(T));
+}
+
+template <typename T>
+static MOZ_ALWAYS_INLINE void PodCopy(volatile T* aDst, const volatile T* aSrc,
+                                      size_t aNElem) {
+  static_assert(std::is_trivially_copyable_v<T>,
+                "PodCopy requires trivially copyable types");
+  MOZ_ASSERT(aDst + aNElem <= aSrc || aSrc + aNElem <= aDst,
+             "destination and source must not overlap");
+
+  for (const volatile T* srcend = aSrc + aNElem; aSrc < srcend;
+       aSrc++, aDst++) {
+    *aDst = *aSrc;
+  }
+}
+
+template <class T, size_t N>
+static MOZ_ALWAYS_INLINE void PodArrayCopy(T (&aDst)[N], const T (&aSrc)[N]) {
+  PodCopy(aDst, aSrc, N);
+}
+
+template <typename T>
+static MOZ_ALWAYS_INLINE void PodMove(T* aDst, const T* aSrc, size_t aNElem) {
+  static_assert(std::is_trivially_copyable_v<T>,
+                "PodMove requires trivially copyable types");
+  MOZ_ASSERT(aNElem <= std::numeric_limits<size_t>::max() / sizeof(T),
+             "trying to move an impossible number of elements");
+  memmove(aDst, aSrc, aNElem * sizeof(T));
+}
+
+
+}  
+
+#endif /* mozilla_PodOperations_h */

@@ -1,0 +1,300 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_DRAWTARGETRECORDING_H_
+#define MOZILLA_GFX_DRAWTARGETRECORDING_H_
+
+#include "2D.h"
+#include "DrawEventRecorder.h"
+
+class nsICanvasRenderingContextInternal;
+
+namespace mozilla {
+
+namespace ipc {
+class IProtocol;
+}  
+
+namespace layers {
+class CanvasChild;
+class CanvasDrawEventRecorder;
+class RecordedTextureData;
+struct RemoteTextureOwnerId;
+}  
+
+namespace gfx {
+
+class DrawTargetRecording final : public DrawTarget {
+ public:
+  MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(DrawTargetRecording, override)
+  DrawTargetRecording(DrawEventRecorder* aRecorder, DrawTarget* aDT,
+                      IntRect aRect, bool aHasData = false);
+  DrawTargetRecording(layers::CanvasDrawEventRecorder* aRecorder,
+                      const layers::RemoteTextureOwnerId& aTextureOwnerId,
+                      DrawTarget* aDT, const IntSize& aSize);
+
+  ~DrawTargetRecording();
+
+  virtual DrawTargetType GetType() const override {
+    return mFinalDT->GetType();
+  }
+  virtual BackendType GetBackendType() const override {
+    return BackendType::RECORDING;
+  }
+  virtual bool IsRecording() const override { return true; }
+
+  virtual void Link(const char* aLocalDest, const char* aURI,
+                    const Rect& aRect) override;
+  virtual void Destination(const char* aDestination,
+                           const Point& aPoint) override;
+
+  virtual void AccessibleId(uint64_t aBrowsingContextId, uint64_t aAccId) final;
+
+  virtual already_AddRefed<SourceSurface> Snapshot() override;
+  virtual already_AddRefed<SourceSurface> IntoLuminanceSource(
+      LuminanceType aLuminanceType, float aOpacity) override;
+
+  virtual void DetachAllSnapshots() override;
+
+  virtual IntSize GetSize() const override { return mRect.Size(); }
+  virtual IntRect GetRect() const override { return mRect; }
+
+  virtual void Flush() override;
+
+  virtual void FlushItem(const IntRect& aBounds) override;
+
+  virtual void DrawSurface(
+      SourceSurface* aSurface, const Rect& aDest, const Rect& aSource,
+      const DrawSurfaceOptions& aSurfOptions = DrawSurfaceOptions(),
+      const DrawOptions& aOptions = DrawOptions()) override;
+
+  virtual void DrawSurfaceDescriptor(
+      const layers::SurfaceDescriptor& aDesc,
+      const RefPtr<layers::Image>& aImageOfSurfaceDescriptor, const Rect& aDest,
+      const Rect& aSource,
+      const DrawSurfaceOptions& aSurfOptions = DrawSurfaceOptions(),
+      const DrawOptions& aOptions = DrawOptions()) override;
+
+  virtual void DrawDependentSurface(uint64_t aId, const Rect& aDest) override;
+
+  virtual void DrawFilter(FilterNode* aNode, const Rect& aSourceRect,
+                          const Point& aDestPoint,
+                          const DrawOptions& aOptions = DrawOptions()) override;
+
+  virtual void DrawSurfaceWithShadow(SourceSurface* aSurface,
+                                     const Point& aDest,
+                                     const ShadowOptions& aShadow,
+                                     CompositionOp aOperator) override;
+
+  virtual void DrawShadow(const Path* aPath, const Pattern& aPattern,
+                          const ShadowOptions& aShadow,
+                          const DrawOptions& aOptions,
+                          const StrokeOptions* aStrokeOptions) override;
+
+  virtual void ClearRect(const Rect& aRect) override;
+
+  virtual void CopySurface(SourceSurface* aSurface, const IntRect& aSourceRect,
+                           const IntPoint& aDestination) override;
+
+  virtual void FillRect(const Rect& aRect, const Pattern& aPattern,
+                        const DrawOptions& aOptions = DrawOptions()) override;
+
+  virtual void StrokeRect(const Rect& aRect, const Pattern& aPattern,
+                          const StrokeOptions& aStrokeOptions = StrokeOptions(),
+                          const DrawOptions& aOptions = DrawOptions()) override;
+
+  virtual void StrokeLine(const Point& aStart, const Point& aEnd,
+                          const Pattern& aPattern,
+                          const StrokeOptions& aStrokeOptions = StrokeOptions(),
+                          const DrawOptions& aOptions = DrawOptions()) override;
+
+  virtual void Stroke(const Path* aPath, const Pattern& aPattern,
+                      const StrokeOptions& aStrokeOptions = StrokeOptions(),
+                      const DrawOptions& aOptions = DrawOptions()) override;
+
+  virtual void Fill(const Path* aPath, const Pattern& aPattern,
+                    const DrawOptions& aOptions = DrawOptions()) override;
+
+  virtual void FillGlyphs(ScaledFont* aFont, const GlyphBuffer& aBuffer,
+                          const Pattern& aPattern,
+                          const DrawOptions& aOptions = DrawOptions()) override;
+
+  virtual void StrokeGlyphs(
+      ScaledFont* aFont, const GlyphBuffer& aBuffer, const Pattern& aPattern,
+      const StrokeOptions& aStrokeOptions = StrokeOptions(),
+      const DrawOptions& aOptions = DrawOptions()) override;
+
+  virtual void Mask(const Pattern& aSource, const Pattern& aMask,
+                    const DrawOptions& aOptions = DrawOptions()) override;
+
+  virtual void MaskSurface(
+      const Pattern& aSource, SourceSurface* aMask, Point aOffset,
+      const DrawOptions& aOptions = DrawOptions()) override;
+
+  virtual void PushClip(const Path* aPath) override;
+
+  virtual void PushClipRect(const Rect& aRect) override;
+
+  virtual void PopClip() override;
+
+  virtual bool RemoveAllClips() override;
+
+  virtual void PushLayer(bool aOpaque, Float aOpacity, SourceSurface* aMask,
+                         const Matrix& aMaskTransform,
+                         const IntRect& aBounds = IntRect(),
+                         bool aCopyBackground = false) override;
+
+  virtual void PushLayerWithBlend(
+      bool aOpaque, Float aOpacity, SourceSurface* aMask,
+      const Matrix& aMaskTransform, const IntRect& aBounds = IntRect(),
+      bool aCopyBackground = false,
+      CompositionOp aCompositionOp = CompositionOp::OP_OVER) override;
+
+  virtual void PopLayer() override;
+
+  virtual already_AddRefed<SourceSurface> CreateSourceSurfaceFromData(
+      unsigned char* aData, const IntSize& aSize, int32_t aStride,
+      SurfaceFormat aFormat) const override;
+
+  virtual already_AddRefed<SourceSurface> OptimizeSourceSurface(
+      SourceSurface* aSurface) const override;
+
+  virtual already_AddRefed<SourceSurface> CreateSourceSurfaceFromNativeSurface(
+      const NativeSurface& aSurface) const override;
+
+  virtual already_AddRefed<DrawTarget> CreateSimilarDrawTarget(
+      const IntSize& aSize, SurfaceFormat aFormat) const override;
+
+  virtual already_AddRefed<DrawTarget> CreateSimilarDrawTargetWithBacking(
+      const IntSize& aSize, SurfaceFormat aFormat) const override;
+
+  bool CanCreateSimilarDrawTarget(const IntSize& aSize,
+                                  SurfaceFormat aFormat) const override;
+  virtual RefPtr<DrawTarget> CreateClippedDrawTarget(
+      const Rect& aBounds, SurfaceFormat aFormat) override;
+
+  virtual already_AddRefed<DrawTarget> CreateSimilarDrawTargetForFilter(
+      const IntSize& aSize, SurfaceFormat aFormat, FilterNode* aFilter,
+      FilterNode* aSource, const Rect& aSourceRect,
+      const Point& aDestPoint) override;
+  virtual already_AddRefed<PathBuilder> CreatePathBuilder(
+      FillRule aFillRule = FillRule::FILL_WINDING) const override;
+
+  virtual already_AddRefed<GradientStops> CreateGradientStops(
+      GradientStop* aStops, uint32_t aNumStops,
+      ExtendMode aExtendMode = ExtendMode::CLAMP) const override;
+
+  virtual already_AddRefed<FilterNode> CreateFilter(FilterType aType) override;
+
+  virtual already_AddRefed<FilterNode> DeferFilterInput(
+      const Path* aPath, const Pattern& aPattern, const IntRect& aSourceRect,
+      const IntPoint& aDestOffset, const DrawOptions& aOptions = DrawOptions(),
+      const StrokeOptions* aStrokeOptions = nullptr) override;
+
+  virtual void SetTransform(const Matrix& aTransform) override;
+
+  virtual void SetPermitSubpixelAA(bool aPermitSubpixelAA) override;
+
+  virtual void* GetNativeSurface(NativeSurfaceType aType) override {
+    return mFinalDT->GetNativeSurface(aType);
+  }
+
+  virtual bool IsCurrentGroupOpaque() override {
+    return mFinalDT->IsCurrentGroupOpaque();
+  }
+
+  void SetOptimizeTransform(bool aOptimizeTransform) {
+    mOptimizeTransform = aOptimizeTransform;
+  }
+
+ protected:
+  friend class layers::RecordedTextureData;
+
+  void AttachTextureData(layers::RecordedTextureData* aTextureData) {
+    mTextureData = aTextureData;
+  }
+  void DetachTextureData(layers::RecordedTextureData*) {
+    mTextureData = nullptr;
+  }
+
+  layers::RecordedTextureData* mTextureData = nullptr;
+
+  friend class layers::CanvasChild;
+
+  already_AddRefed<SourceSurface> CreateExternalSourceSurface(
+      const IntSize& aSize, SurfaceFormat aFormat);
+
+  friend class ::nsICanvasRenderingContextInternal;
+
+  already_AddRefed<SourceSurface> SnapshotExternalCanvas(
+      nsICanvasRenderingContextInternal* aCanvas,
+      mozilla::ipc::IProtocol* aActor);
+
+ private:
+  DrawTargetRecording(const DrawTargetRecording* aDT, IntRect aRect,
+                      SurfaceFormat aFormat);
+
+  void RecordTransform(const Matrix& aTransform) const;
+
+  void FlushTransform() const {
+    if (mTransformDirty) {
+      if (!mRecordedTransform.ExactlyEquals(mTransform)) {
+        RecordTransform(mTransform);
+      }
+      mTransformDirty = false;
+    }
+  }
+
+  void RecordEvent(const RecordedEvent& aEvent) const {
+    FlushTransform();
+    mRecorder->RecordEvent(aEvent);
+  }
+
+  void RecordEventSelf(const RecordedEvent& aEvent) const {
+    FlushTransform();
+    mRecorder->RecordEvent(this, aEvent);
+  }
+
+  void RecordEventSkipFlushTransform(const RecordedEvent& aEvent) const {
+    mRecorder->RecordEvent(aEvent);
+  }
+
+  void RecordEventSelfSkipFlushTransform(const RecordedEvent& aEvent) const {
+    mRecorder->RecordEvent(this, aEvent);
+  }
+
+  Path* GetPathForPathRecording(const Path* aPath) const;
+  already_AddRefed<PathRecording> EnsurePathStored(const Path* aPath);
+  void EnsurePatternDependenciesStored(const Pattern& aPattern);
+
+  void DrawGlyphs(ScaledFont* aFont, const GlyphBuffer& aBuffer,
+                  const Pattern& aPattern,
+                  const DrawOptions& aOptions = DrawOptions(),
+                  const StrokeOptions* aStrokeOptions = nullptr);
+
+  bool TryToReplaySurface(SourceSurface* aSurface, const Rect& aDest,
+                          const Rect& aSource) override;
+
+  void MarkChanged();
+
+  RefPtr<DrawEventRecorderPrivate> mRecorder;
+  RefPtr<DrawTarget> mFinalDT;
+  IntRect mRect;
+
+  struct PushedLayer {
+    explicit PushedLayer(bool aOldPermitSubpixelAA)
+        : mOldPermitSubpixelAA(aOldPermitSubpixelAA) {}
+    bool mOldPermitSubpixelAA;
+  };
+  std::vector<PushedLayer> mPushedLayers;
+
+  bool mOptimizeTransform = false;
+
+  mutable Matrix mRecordedTransform;
+};
+
+}  
+}  
+
+#endif /* MOZILLA_GFX_DRAWTARGETRECORDING_H_ */

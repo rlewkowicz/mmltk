@@ -1,0 +1,225 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_css_SheetLoadData_h
+#define mozilla_css_SheetLoadData_h
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/NotNull.h"
+#include "mozilla/PreloaderBase.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/SharedSubResourceCache.h"
+#include "mozilla/css/Loader.h"
+#include "mozilla/dom/CacheExpirationTime.h"
+#include "nsProxyRelease.h"
+
+namespace mozilla {
+namespace dom {
+enum class FetchPriority : uint8_t;
+}  
+class AsyncEventDispatcher;
+class StyleSheet;
+}  
+class nsICSSLoaderObserver;
+class nsINode;
+class nsIPrincipal;
+class nsIURI;
+class nsIReferrerInfo;
+
+namespace mozilla::css {
+
+
+enum class SyncLoad : bool { No, Yes };
+
+class SheetLoadData final
+    : public PreloaderBase,
+      public SharedSubResourceCacheLoadingValueBase<SheetLoadData> {
+  using MediaMatched = dom::LinkStyle::MediaMatched;
+  using IsAlternate = dom::LinkStyle::IsAlternate;
+  using UseSystemPrincipal = css::Loader::UseSystemPrincipal;
+
+ protected:
+  virtual ~SheetLoadData();
+
+ public:
+  static void PrioritizeAsPreload(nsIChannel* aChannel);
+
+  void StartPendingLoad();
+
+  SheetLoadData(
+      css::Loader*, const nsAString& aTitle, nsIURI*, StyleSheet*, SyncLoad,
+      nsINode* aOwningNode, IsAlternate, MediaMatched, StylePreloadKind,
+      nsICSSLoaderObserver* aObserver, nsIPrincipal* aTriggeringPrincipal,
+      nsIReferrerInfo*, const nsAString& aNonce,
+      dom::FetchPriority aFetchPriority,
+      already_AddRefed<SubResourceNetworkMetadataHolder> aNetworkMetadata);
+
+  SheetLoadData(
+      css::Loader*, nsIURI*, StyleSheet*, SheetLoadData* aParentData,
+      nsICSSLoaderObserver* aObserver, nsIPrincipal* aTriggeringPrincipal,
+      nsIReferrerInfo*,
+      already_AddRefed<SubResourceNetworkMetadataHolder> aNetworkMetadata);
+
+  SheetLoadData(
+      css::Loader*, nsIURI*, StyleSheet*, SyncLoad, UseSystemPrincipal,
+      StylePreloadKind, const Encoding* aPreloadEncoding,
+      nsICSSLoaderObserver* aObserver, nsIPrincipal* aTriggeringPrincipal,
+      nsIReferrerInfo*, const nsAString& aNonce,
+      dom::FetchPriority aFetchPriority,
+      already_AddRefed<SubResourceNetworkMetadataHolder> aNetworkMetadata);
+
+  nsIReferrerInfo* ReferrerInfo() const { return mReferrerInfo; }
+
+  const nsString& Nonce() const { return mNonce; }
+
+  already_AddRefed<AsyncEventDispatcher> PrepareLoadEventIfNeeded();
+
+  NotNull<const Encoding*> DetermineNonBOMEncoding(const nsACString& aSegment,
+                                                   nsIChannel*) const;
+
+  void OnStartRequest(nsIRequest*);
+
+  nsresult VerifySheetReadyToParse(nsresult aStatus, const nsACString& aBytes1,
+                                   const nsACString& aBytes2, nsIChannel*);
+
+  NS_DECL_ISUPPORTS
+
+  css::Loader& Loader() { return *mLoader; }
+  const css::Loader& Loader() const { return *mLoader; }
+
+  void DidCancelLoad() { mIsCancelled = true; }
+
+  const RefPtr<css::Loader> mLoader;
+
+  const nsString mTitle;
+
+  const Encoding* mEncoding;
+
+  nsCOMPtr<nsIURI> mURI;
+
+  const RefPtr<StyleSheet> mSheet;
+
+  const RefPtr<SheetLoadData> mParentData;
+
+  CacheExpirationTime mExpirationTime = CacheExpirationTime::Never();
+
+  LoadTainting mTainting{LoadTainting::Basic};
+
+  uint32_t mPendingChildren;
+
+  const bool mSyncLoad : 1;
+
+  const bool mIsNonDocumentSheet : 1;
+
+  const bool mIsChildSheet : 1;
+
+  bool mIsBeingParsed : 1;
+
+  bool mIsLoading : 1;
+
+  bool mIsCancelled : 1;
+
+  bool mMustNotify : 1;
+
+  const bool mHadOwnerNode : 1;
+
+  const bool mWasAlternate : 1;
+
+  const bool mMediaMatched : 1;
+
+  const bool mUseSystemPrincipal : 1;
+
+  bool mSheetAlreadyComplete : 1;
+
+  bool mLoadFailed : 1;
+
+  bool mShouldEmulateNotificationsForCachedLoad : 1;
+
+  const StylePreloadKind mPreloadKind;
+
+  nsINode* GetRequestingNode() const;
+
+  nsCOMPtr<nsICSSLoaderObserver> mObserver;
+
+  const nsCOMPtr<nsIPrincipal> mTriggeringPrincipal;
+
+  const nsCOMPtr<nsIReferrerInfo> mReferrerInfo;
+
+  const nsString mNonce;
+
+  const dom::FetchPriority mFetchPriority;
+
+  const NotNull<const Encoding*> mGuessedEncoding;
+
+  const nsCompatibility mCompatMode;
+
+  bool mSheetCompleteCalled = false;
+
+  bool mIntentionallyDropped = false;
+
+  TimeStamp mLoadStart;
+
+  const bool mRecordErrors;
+
+  RefPtr<SubResourceNetworkMetadataHolder> mNetworkMetadata;
+
+  bool ShouldDefer() const { return mWasAlternate || !mMediaMatched; }
+
+  RefPtr<StyleSheet> ValueForCache() const;
+  CacheExpirationTime ExpirationTime() const { return mExpirationTime; }
+
+  void SheetFinishedParsingAsync() {
+    MOZ_ASSERT(mIsBeingParsed);
+    mIsBeingParsed = false;
+    if (!mPendingChildren) {
+      mLoader->SheetComplete(*this, NS_OK);
+    }
+  }
+
+  bool IsPreload() const { return mPreloadKind != StylePreloadKind::None; }
+  bool IsLinkRelPreloadOrEarlyHint() const {
+    return css::IsLinkRelPreloadOrEarlyHint(mPreloadKind);
+  }
+
+  bool BlocksLoadEvent() const {
+    const auto& root = RootLoadData();
+    return !root.IsLinkRelPreloadOrEarlyHint() && !root.IsSyncLoad();
+  }
+
+  bool IsSyncLoad() const override { return mSyncLoad; }
+  bool IsLoading() const override { return mIsLoading; }
+  bool IsCancelled() const override { return mIsCancelled; }
+
+  SubResourceNetworkMetadataHolder* GetNetworkMetadata() const override {
+    return mNetworkMetadata.get();
+  }
+
+  void StartLoading() override;
+  void SetLoadCompleted() override;
+  void OnCoalescedTo(const SheetLoadData& aExistingLoad) override;
+
+  void Cancel() override { mIsCancelled = true; }
+
+  void SetMinimumExpirationTime(const CacheExpirationTime& aExpirationTime) {
+    mExpirationTime.SetMinimum(aExpirationTime);
+  }
+
+  nsLiteralString InitiatorTypeString();
+
+ private:
+  const SheetLoadData& RootLoadData() const {
+    const auto* top = this;
+    while (top->mParentData) {
+      top = top->mParentData;
+    }
+    return *top;
+  }
+};
+
+using SheetLoadDataHolder = nsMainThreadPtrHolder<SheetLoadData>;
+
+}  
+
+#endif  // mozilla_css_SheetLoadData_h

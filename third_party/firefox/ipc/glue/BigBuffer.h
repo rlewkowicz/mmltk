@@ -1,0 +1,107 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ipc_BigBuffer_h
+#define mozilla_ipc_BigBuffer_h
+
+#include <stdlib.h>
+#include "nsDebug.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Span.h"
+#include "mozilla/Variant.h"
+#include "mozilla/ipc/SharedMemoryMapping.h"
+
+namespace mozilla::ipc {
+
+class BigBuffer {
+ public:
+  static constexpr size_t kShmemThreshold = 64 * 1024;
+
+  static BigBuffer TryAlloc(const size_t aSize) {
+    auto ret = BigBuffer{};
+    auto data = TryAllocBuffer(aSize);
+    if (data) {
+      ret.mSize = aSize;
+      ret.mData = std::move(data.ref());
+    }
+    return ret;
+  }
+
+  BigBuffer() : mSize(0), mData(NoData()) {}
+
+  BigBuffer(const BigBuffer&) = delete;
+  BigBuffer& operator=(const BigBuffer&) = delete;
+
+  BigBuffer(BigBuffer&& aOther) noexcept
+      : mSize(std::exchange(aOther.mSize, 0)),
+        mData(std::exchange(aOther.mData, NoData())) {}
+
+  BigBuffer& operator=(BigBuffer&& aOther) noexcept {
+    mSize = std::exchange(aOther.mSize, 0);
+    mData = std::exchange(aOther.mData, NoData());
+    return *this;
+  }
+
+  explicit BigBuffer(size_t aSize) : mSize(aSize), mData(AllocBuffer(aSize)) {}
+
+  explicit BigBuffer(Span<const uint8_t> aData) : BigBuffer(aData.Length()) {
+    memcpy(Data(), aData.Elements(), aData.Length());
+  }
+
+  struct Adopt {};
+
+  BigBuffer(Adopt, SharedMemoryMappingWithHandle&& aSharedMemory, size_t aSize);
+
+  BigBuffer(Adopt, uint8_t* aData, size_t aSize);
+
+  ~BigBuffer() = default;
+
+  uint8_t* Data();
+  const uint8_t* Data() const;
+
+  size_t Size() const { return mSize; }
+
+  Span<uint8_t> AsSpan() { return Span{Data(), Size()}; }
+  Span<const uint8_t> AsSpan() const { return Span{Data(), Size()}; }
+
+  const SharedMemoryMappingWithHandle* GetSharedMemory() const {
+    return mData.is<1>() ? &mData.as<1>() : nullptr;
+  }
+
+ private:
+  friend struct IPC::ParamTraits<mozilla::ipc::BigBuffer>;
+
+  using Storage =
+      Variant<UniqueFreePtr<uint8_t[]>, SharedMemoryMappingWithHandle>;
+
+  static Storage NoData() { return AsVariant(UniqueFreePtr<uint8_t[]>{}); }
+
+  static Maybe<Storage> TryAllocBuffer(size_t aSize);
+
+  static Storage AllocBuffer(size_t aSize) {
+    auto ret = TryAllocBuffer(aSize);
+    if (!ret) {
+      NS_ABORT_OOM(aSize);
+    }
+    return std::move(ret.ref());
+  }
+
+  size_t mSize;
+  Storage mData;
+};
+
+}  
+
+namespace IPC {
+
+template <>
+struct ParamTraits<mozilla::ipc::BigBuffer> {
+  using paramType = mozilla::ipc::BigBuffer;
+  static void Write(MessageWriter* aWriter, paramType&& aParam);
+  static bool Read(MessageReader* aReader, paramType* aResult);
+};
+
+}  
+
+#endif  // mozilla_BigBuffer_h

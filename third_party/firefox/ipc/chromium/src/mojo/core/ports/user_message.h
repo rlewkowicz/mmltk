@@ -1,0 +1,40 @@
+// Copyright 2017 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(MOJO_CORE_PORTS_USER_MESSAGE_H_)
+#define MOJO_CORE_PORTS_USER_MESSAGE_H_
+
+#include <stddef.h>
+
+namespace mojo {
+namespace core {
+namespace ports {
+
+class UserMessageEvent;
+
+class UserMessage {
+ public:
+  struct TypeInfo {};
+
+  explicit UserMessage(const TypeInfo* type_info);
+  virtual ~UserMessage();
+
+  UserMessage(const UserMessage&) = delete;
+  void operator=(const UserMessage&) = delete;
+
+  const TypeInfo* type_info() const { return type_info_; }
+
+  virtual bool WillBeRoutedExternally(UserMessageEvent& event);
+
+  virtual size_t GetSizeIfSerialized() const;
+
+ private:
+  const TypeInfo* const type_info_;
+};
+
+}  
+}  
+}  
+
+#endif

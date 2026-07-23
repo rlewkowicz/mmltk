@@ -1,0 +1,1322 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+*
+*   Copyright (C) 1998-2016, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+******************************************************************************
+*
+* File ustring.cpp
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   12/07/98    bertrand    Creation.
+******************************************************************************
+*/
+
+#include "unicode/utypes.h"
+#include "unicode/putil.h"
+#include "unicode/uchar.h"
+#include "unicode/ustring.h"
+#include "unicode/utf16.h"
+#include "cstring.h"
+#include "cwchar.h"
+#include "cmemory.h"
+#include "ustr_imp.h"
+
+
+#define U_BMP_MAX 0xffff
+
+
+static inline UBool
+isMatchAtCPBoundary(const char16_t *start, const char16_t *match, const char16_t *matchLimit, const char16_t *limit) {
+    if(U16_IS_TRAIL(*match) && start!=match && U16_IS_LEAD(*(match-1))) {
+        return false;
+    }
+    if(U16_IS_LEAD(*(matchLimit-1)) && matchLimit!=limit && U16_IS_TRAIL(*matchLimit)) {
+        return false;
+    }
+    return true;
+}
+
+U_CAPI char16_t * U_EXPORT2
+u_strFindFirst(const char16_t *s, int32_t length,
+               const char16_t *sub, int32_t subLength) {
+    const char16_t *start, *p, *q, *subLimit;
+    char16_t c, cs, cq;
+
+    if(sub==nullptr || subLength<-1) {
+        return (char16_t *)s;
+    }
+    if(s==nullptr || length<-1) {
+        return nullptr;
+    }
+
+    start=s;
+
+    if(length<0 && subLength<0) {
+        if((cs=*sub++)==0) {
+            return (char16_t *)s;
+        }
+        if(*sub==0 && !U16_IS_SURROGATE(cs)) {
+            return u_strchr(s, cs);
+        }
+
+        while((c=*s++)!=0) {
+            if(c==cs) {
+                p=s;
+                q=sub;
+                for(;;) {
+                    if((cq=*q)==0) {
+                        if(isMatchAtCPBoundary(start, s-1, p, nullptr)) {
+                            return (char16_t *)(s-1); 
+                        } else {
+                            break; 
+                        }
+                    }
+                    if((c=*p)==0) {
+                        return nullptr; 
+                    }
+                    if(c!=cq) {
+                        break; 
+                    }
+                    ++p;
+                    ++q;
+                }
+            }
+        }
+
+        return nullptr;
+    }
+
+    if(subLength<0) {
+        subLength=u_strlen(sub);
+    }
+    if(subLength==0) {
+        return (char16_t *)s;
+    }
+
+    cs=*sub++;
+    --subLength;
+    subLimit=sub+subLength;
+
+    if(subLength==0 && !U16_IS_SURROGATE(cs)) {
+        return length<0 ? u_strchr(s, cs) : u_memchr(s, cs, length);
+    }
+
+    if(length<0) {
+        while((c=*s++)!=0) {
+            if(c==cs) {
+                p=s;
+                q=sub;
+                for(;;) {
+                    if(q==subLimit) {
+                        if(isMatchAtCPBoundary(start, s-1, p, nullptr)) {
+                            return (char16_t *)(s-1); 
+                        } else {
+                            break; 
+                        }
+                    }
+                    if((c=*p)==0) {
+                        return nullptr; 
+                    }
+                    if(c!=*q) {
+                        break; 
+                    }
+                    ++p;
+                    ++q;
+                }
+            }
+        }
+    } else {
+        const char16_t *limit, *preLimit;
+
+        if(length<=subLength) {
+            return nullptr; 
+        }
+
+        limit=s+length;
+
+        preLimit=limit-subLength;
+
+        while(s!=preLimit) {
+            c=*s++;
+            if(c==cs) {
+                p=s;
+                q=sub;
+                for(;;) {
+                    if(q==subLimit) {
+                        if(isMatchAtCPBoundary(start, s-1, p, limit)) {
+                            return (char16_t *)(s-1); 
+                        } else {
+                            break; 
+                        }
+                    }
+                    if(*p!=*q) {
+                        break; 
+                    }
+                    ++p;
+                    ++q;
+                }
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+U_CAPI char16_t * U_EXPORT2
+u_strstr(const char16_t *s, const char16_t *substring) {
+    return u_strFindFirst(s, -1, substring, -1);
+}
+
+U_CAPI char16_t * U_EXPORT2
+u_strchr(const char16_t *s, char16_t c) {
+    if(U16_IS_SURROGATE(c)) {
+        return u_strFindFirst(s, -1, &c, 1);
+    } else {
+        char16_t cs;
+
+        for(;;) {
+            if((cs=*s)==c) {
+                return (char16_t *)s;
+            }
+            if(cs==0) {
+                return nullptr;
+            }
+            ++s;
+        }
+    }
+}
+
+U_CAPI char16_t * U_EXPORT2
+u_strchr32(const char16_t *s, UChar32 c) {
+    if((uint32_t)c<=U_BMP_MAX) {
+        return u_strchr(s, (char16_t)c);
+    } else if((uint32_t)c<=UCHAR_MAX_VALUE) {
+        char16_t cs, lead=U16_LEAD(c), trail=U16_TRAIL(c);
+
+        while((cs=*s++)!=0) {
+            if(cs==lead && *s==trail) {
+                return (char16_t *)(s-1);
+            }
+        }
+        return nullptr;
+    } else {
+        return nullptr;
+    }
+}
+
+U_CAPI char16_t * U_EXPORT2
+u_memchr(const char16_t *s, char16_t c, int32_t count) {
+    if(count<=0) {
+        return nullptr; 
+    } else if(U16_IS_SURROGATE(c)) {
+        return u_strFindFirst(s, count, &c, 1);
+    } else {
+        const char16_t *limit=s+count;
+        do {
+            if(*s==c) {
+                return (char16_t *)s;
+            }
+        } while(++s!=limit);
+        return nullptr;
+    }
+}
+
+U_CAPI char16_t * U_EXPORT2
+u_memchr32(const char16_t *s, UChar32 c, int32_t count) {
+    if((uint32_t)c<=U_BMP_MAX) {
+        return u_memchr(s, (char16_t)c, count);
+    } else if(count<2) {
+        return nullptr;
+    } else if((uint32_t)c<=UCHAR_MAX_VALUE) {
+        const char16_t *limit=s+count-1; 
+        char16_t lead=U16_LEAD(c), trail=U16_TRAIL(c);
+
+        do {
+            if(*s==lead && *(s+1)==trail) {
+                return (char16_t *)s;
+            }
+        } while(++s!=limit);
+        return nullptr;
+    } else {
+        return nullptr;
+    }
+}
+
+
+U_CAPI char16_t * U_EXPORT2
+u_strFindLast(const char16_t *s, int32_t length,
+              const char16_t *sub, int32_t subLength) {
+    const char16_t *start, *limit, *p, *q, *subLimit;
+    char16_t c, cs;
+
+    if(sub==nullptr || subLength<-1) {
+        return (char16_t *)s;
+    }
+    if(s==nullptr || length<-1) {
+        return nullptr;
+    }
+
+
+    if(subLength<0) {
+        subLength=u_strlen(sub);
+    }
+    if(subLength==0) {
+        return (char16_t *)s;
+    }
+
+    subLimit=sub+subLength;
+    cs=*(--subLimit);
+    --subLength;
+
+    if(subLength==0 && !U16_IS_SURROGATE(cs)) {
+        return length<0 ? u_strrchr(s, cs) : u_memrchr(s, cs, length);
+    }
+
+    if(length<0) {
+        length=u_strlen(s);
+    }
+
+    if(length<=subLength) {
+        return nullptr; 
+    }
+
+    start=s;
+    limit=s+length;
+
+    s+=subLength;
+
+    while(s!=limit) {
+        c=*(--limit);
+        if(c==cs) {
+            p=limit;
+            q=subLimit;
+            for(;;) {
+                if(q==sub) {
+                    if(isMatchAtCPBoundary(start, p, limit+1, start+length)) {
+                        return (char16_t *)p; 
+                    } else {
+                        break; 
+                    }
+                }
+                if(*(--p)!=*(--q)) {
+                    break; 
+                }
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+U_CAPI char16_t * U_EXPORT2
+u_strrstr(const char16_t *s, const char16_t *substring) {
+    return u_strFindLast(s, -1, substring, -1);
+}
+
+U_CAPI char16_t * U_EXPORT2
+u_strrchr(const char16_t *s, char16_t c) {
+    if(U16_IS_SURROGATE(c)) {
+        return u_strFindLast(s, -1, &c, 1);
+    } else {
+        const char16_t *result=nullptr;
+        char16_t cs;
+
+        for(;;) {
+            if((cs=*s)==c) {
+                result=s;
+            }
+            if(cs==0) {
+                return (char16_t *)result;
+            }
+            ++s;
+        }
+    }
+}
+
+U_CAPI char16_t * U_EXPORT2
+u_strrchr32(const char16_t *s, UChar32 c) {
+    if((uint32_t)c<=U_BMP_MAX) {
+        return u_strrchr(s, (char16_t)c);
+    } else if((uint32_t)c<=UCHAR_MAX_VALUE) {
+        const char16_t *result=nullptr;
+        char16_t cs, lead=U16_LEAD(c), trail=U16_TRAIL(c);
+
+        while((cs=*s++)!=0) {
+            if(cs==lead && *s==trail) {
+                result=s-1;
+            }
+        }
+        return (char16_t *)result;
+    } else {
+        return nullptr;
+    }
+}
+
+U_CAPI char16_t * U_EXPORT2
+u_memrchr(const char16_t *s, char16_t c, int32_t count) {
+    if(count<=0) {
+        return nullptr; 
+    } else if(U16_IS_SURROGATE(c)) {
+        return u_strFindLast(s, count, &c, 1);
+    } else {
+        const char16_t *limit=s+count;
+        do {
+            if(*(--limit)==c) {
+                return (char16_t *)limit;
+            }
+        } while(s!=limit);
+        return nullptr;
+    }
+}
+
+U_CAPI char16_t * U_EXPORT2
+u_memrchr32(const char16_t *s, UChar32 c, int32_t count) {
+    if((uint32_t)c<=U_BMP_MAX) {
+        return u_memrchr(s, (char16_t)c, count);
+    } else if(count<2) {
+        return nullptr;
+    } else if((uint32_t)c<=UCHAR_MAX_VALUE) {
+        const char16_t *limit=s+count-1;
+        char16_t lead=U16_LEAD(c), trail=U16_TRAIL(c);
+
+        do {
+            if(*limit==trail && *(limit-1)==lead) {
+                return (char16_t *)(limit-1);
+            }
+        } while(s!=--limit);
+        return nullptr;
+    } else {
+        return nullptr;
+    }
+}
+
+
+static int32_t
+_matchFromSet(const char16_t *string, const char16_t *matchSet, UBool polarity) {
+    int32_t matchLen, matchBMPLen, strItr, matchItr;
+    UChar32 stringCh, matchCh;
+    char16_t c, c2;
+
+    matchBMPLen = 0;
+    while((c = matchSet[matchBMPLen]) != 0 && U16_IS_SINGLE(c)) {
+        ++matchBMPLen;
+    }
+
+    matchLen = matchBMPLen;
+    while(matchSet[matchLen] != 0) {
+        ++matchLen;
+    }
+
+    for(strItr = 0; (c = string[strItr]) != 0;) {
+        ++strItr;
+        if(U16_IS_SINGLE(c)) {
+            if(polarity) {
+                for(matchItr = 0; matchItr < matchLen; ++matchItr) {
+                    if(c == matchSet[matchItr]) {
+                        return strItr - 1; 
+                    }
+                }
+            } else {
+                for(matchItr = 0; matchItr < matchLen; ++matchItr) {
+                    if(c == matchSet[matchItr]) {
+                        goto endloop;
+                    }
+                }
+                return strItr - 1; 
+            }
+        } else {
+            if(U16_IS_SURROGATE_LEAD(c) && U16_IS_TRAIL(c2 = string[strItr])) {
+                ++strItr;
+                stringCh = U16_GET_SUPPLEMENTARY(c, c2);
+            } else {
+                stringCh = c; 
+            }
+
+            if(polarity) {
+                for(matchItr = matchBMPLen; matchItr < matchLen;) {
+                    U16_NEXT(matchSet, matchItr, matchLen, matchCh);
+                    if(stringCh == matchCh) {
+                        return strItr - U16_LENGTH(stringCh); 
+                    }
+                }
+            } else {
+                for(matchItr = matchBMPLen; matchItr < matchLen;) {
+                    U16_NEXT(matchSet, matchItr, matchLen, matchCh);
+                    if(stringCh == matchCh) {
+                        goto endloop;
+                    }
+                }
+                return strItr - U16_LENGTH(stringCh); 
+            }
+        }
+endloop:
+        ;
+    }
+
+    return -strItr-1;
+}
+
+U_CAPI char16_t * U_EXPORT2
+u_strpbrk(const char16_t *string, const char16_t *matchSet)
+{
+    int32_t idx = _matchFromSet(string, matchSet, true);
+    if(idx >= 0) {
+        return (char16_t *)string + idx;
+    } else {
+        return nullptr;
+    }
+}
+
+U_CAPI int32_t U_EXPORT2
+u_strcspn(const char16_t *string, const char16_t *matchSet)
+{
+    int32_t idx = _matchFromSet(string, matchSet, true);
+    if(idx >= 0) {
+        return idx;
+    } else {
+        return -idx - 1; 
+    }
+}
+
+U_CAPI int32_t U_EXPORT2
+u_strspn(const char16_t *string, const char16_t *matchSet)
+{
+    int32_t idx = _matchFromSet(string, matchSet, false);
+    if(idx >= 0) {
+        return idx;
+    } else {
+        return -idx - 1; 
+    }
+}
+
+
+U_CAPI char16_t* U_EXPORT2
+u_strtok_r(char16_t *src,
+     const char16_t *delim,
+           char16_t   **saveState)
+{
+    char16_t *tokSource;
+    char16_t *nextToken;
+    uint32_t nonDelimIdx;
+
+    if (src != nullptr) {
+        tokSource = src;
+        *saveState = src; 
+    }
+    else if (*saveState) {
+        tokSource = *saveState;
+    }
+    else {
+        return nullptr;
+    }
+
+    nonDelimIdx = u_strspn(tokSource, delim);
+    tokSource = &tokSource[nonDelimIdx];
+
+    if (*tokSource) {
+        nextToken = u_strpbrk(tokSource, delim);
+        if (nextToken != nullptr) {
+            *(nextToken++) = 0;
+            *saveState = nextToken;
+            return tokSource;
+        }
+        else if (*saveState) {
+            *saveState = nullptr;
+            return tokSource;
+        }
+    }
+    else {
+        *saveState = nullptr;
+    }
+    return nullptr;
+}
+
+
+U_CAPI char16_t* U_EXPORT2
+u_strcat(char16_t  *dst,
+    const char16_t  *src)
+{
+    char16_t *anchor = dst;            
+
+    while(*dst != 0) {              
+        ++dst;
+    }
+    while((*(dst++) = *(src++)) != 0) {     
+    }
+
+    return anchor;
+}
+
+U_CAPI char16_t*  U_EXPORT2
+u_strncat(char16_t  *dst,
+     const char16_t  *src,
+     int32_t     n ) 
+{
+    if(n > 0) {
+        char16_t *anchor = dst;            
+
+        while(*dst != 0) {              
+            ++dst;
+        }
+        while((*dst = *src) != 0) {     
+            ++dst;
+            if(--n == 0) {
+                *dst = 0;
+                break;
+            }
+            ++src;
+        }
+
+        return anchor;
+    } else {
+        return dst;
+    }
+}
+
+
+U_CAPI int32_t   U_EXPORT2
+u_strcmp(const char16_t *s1,
+    const char16_t *s2)
+{
+    char16_t  c1, c2;
+
+    for(;;) {
+        c1=*s1++;
+        c2=*s2++;
+        if (c1 != c2 || c1 == 0) {
+            break;
+        }
+    }
+    return (int32_t)c1 - (int32_t)c2;
+}
+
+U_CFUNC int32_t U_EXPORT2
+uprv_strCompare(const char16_t *s1, int32_t length1,
+                const char16_t *s2, int32_t length2,
+                UBool strncmpStyle, UBool codePointOrder) {
+    const char16_t *start1, *start2, *limit1, *limit2;
+    char16_t c1, c2;
+
+    start1=s1;
+    start2=s2;
+
+    if(length1<0 && length2<0) {
+        if(s1==s2) {
+            return 0;
+        }
+
+        for(;;) {
+            c1=*s1;
+            c2=*s2;
+            if(c1!=c2) {
+                break;
+            }
+            if(c1==0) {
+                return 0;
+            }
+            ++s1;
+            ++s2;
+        }
+
+        limit1=limit2=nullptr;
+    } else if(strncmpStyle) {
+        if(s1==s2) {
+            return 0;
+        }
+
+        limit1=start1+length1;
+
+        for(;;) {
+            if(s1==limit1) {
+                return 0;
+            }
+
+            c1=*s1;
+            c2=*s2;
+            if(c1!=c2) {
+                break;
+            }
+            if(c1==0) {
+                return 0;
+            }
+            ++s1;
+            ++s2;
+        }
+
+        limit2=start2+length1; 
+    } else {
+        int32_t lengthResult;
+
+        if(length1<0) {
+            length1=u_strlen(s1);
+        }
+        if(length2<0) {
+            length2=u_strlen(s2);
+        }
+
+        if(length1<length2) {
+            lengthResult=-1;
+            limit1=start1+length1;
+        } else if(length1==length2) {
+            lengthResult=0;
+            limit1=start1+length1;
+        } else  {
+            lengthResult=1;
+            limit1=start1+length2;
+        }
+
+        if(s1==s2) {
+            return lengthResult;
+        }
+
+        for(;;) {
+            if(s1==limit1) {
+                return lengthResult;
+            }
+
+            c1=*s1;
+            c2=*s2;
+            if(c1!=c2) {
+                break;
+            }
+            ++s1;
+            ++s2;
+        }
+
+        limit1=start1+length1;
+        limit2=start2+length2;
+    }
+
+    if(c1>=0xd800 && c2>=0xd800 && codePointOrder) {
+        if(
+            (c1<=0xdbff && (s1+1)!=limit1 && U16_IS_TRAIL(*(s1+1))) ||
+            (U16_IS_TRAIL(c1) && start1!=s1 && U16_IS_LEAD(*(s1-1)))
+        ) {
+        } else {
+            c1-=0x2800;
+        }
+
+        if(
+            (c2<=0xdbff && (s2+1)!=limit2 && U16_IS_TRAIL(*(s2+1))) ||
+            (U16_IS_TRAIL(c2) && start2!=s2 && U16_IS_LEAD(*(s2-1)))
+        ) {
+        } else {
+            c2-=0x2800;
+        }
+    }
+
+    return (int32_t)c1-(int32_t)c2;
+}
+
+U_CAPI int32_t U_EXPORT2
+u_strCompareIter(UCharIterator *iter1, UCharIterator *iter2, UBool codePointOrder) {
+    UChar32 c1, c2;
+
+    if(iter1==nullptr || iter2==nullptr) {
+        return 0; 
+    }
+    if(iter1==iter2) {
+        return 0; 
+    }
+
+    iter1->move(iter1, 0, UITER_START);
+    iter2->move(iter2, 0, UITER_START);
+
+    for(;;) {
+        c1=iter1->next(iter1);
+        c2=iter2->next(iter2);
+        if(c1!=c2) {
+            break;
+        }
+        if(c1==-1) {
+            return 0;
+        }
+    }
+
+    if(c1>=0xd800 && c2>=0xd800 && codePointOrder) {
+        if(
+            (c1<=0xdbff && U16_IS_TRAIL(iter1->current(iter1))) ||
+            (U16_IS_TRAIL(c1) && (iter1->previous(iter1), U16_IS_LEAD(iter1->previous(iter1))))
+        ) {
+        } else {
+            c1-=0x2800;
+        }
+
+        if(
+            (c2<=0xdbff && U16_IS_TRAIL(iter2->current(iter2))) ||
+            (U16_IS_TRAIL(c2) && (iter2->previous(iter2), U16_IS_LEAD(iter2->previous(iter2))))
+        ) {
+        } else {
+            c2-=0x2800;
+        }
+    }
+
+    return (int32_t)c1-(int32_t)c2;
+}
+
+#if 0
+void fragment {
+        if(c1<=0xdbff) {
+            if(!U16_IS_TRAIL(iter1->current(iter1))) {
+                c1-=0x2800;
+            }
+        } else if(c1<=0xdfff) {
+            int32_t idx=iter1->getIndex(iter1, UITER_CURRENT);
+            iter1->previous(iter1); 
+            if(!U16_IS_LEAD(iter1->previous(iter1))) {
+                c1-=0x2800;
+            }
+            iter1->move(iter1, idx, UITER_ZERO);
+        } else  {
+            c1-=0x2800;
+        }
+}
+#endif
+
+U_CAPI int32_t U_EXPORT2
+u_strCompare(const char16_t *s1, int32_t length1,
+             const char16_t *s2, int32_t length2,
+             UBool codePointOrder) {
+    if(s1==nullptr || length1<-1 || s2==nullptr || length2<-1) {
+        return 0;
+    }
+    return uprv_strCompare(s1, length1, s2, length2, false, codePointOrder);
+}
+
+U_CAPI int32_t U_EXPORT2
+u_strcmpCodePointOrder(const char16_t *s1, const char16_t *s2) {
+    return uprv_strCompare(s1, -1, s2, -1, false, true);
+}
+
+U_CAPI int32_t   U_EXPORT2
+u_strncmp(const char16_t  *s1,
+     const char16_t  *s2,
+     int32_t     n) 
+{
+    if(n > 0) {
+        int32_t rc;
+        for(;;) {
+            rc = (int32_t)*s1 - (int32_t)*s2;
+            if(rc != 0 || *s1 == 0 || --n == 0) {
+                return rc;
+            }
+            ++s1;
+            ++s2;
+        }
+    } else {
+        return 0;
+    }
+}
+
+U_CAPI int32_t U_EXPORT2
+u_strncmpCodePointOrder(const char16_t *s1, const char16_t *s2, int32_t n) {
+    return uprv_strCompare(s1, n, s2, n, true, true);
+}
+
+U_CAPI char16_t* U_EXPORT2
+u_strcpy(char16_t  *dst,
+    const char16_t  *src)
+{
+    char16_t *anchor = dst;            
+
+    while((*(dst++) = *(src++)) != 0) {     
+    }
+
+    return anchor;
+}
+
+U_CAPI char16_t*  U_EXPORT2
+u_strncpy(char16_t  *dst,
+     const char16_t  *src,
+     int32_t     n) 
+{
+    char16_t *anchor = dst;            
+
+    while(n > 0 && (*(dst++) = *(src++)) != 0) {
+        --n;
+    }
+
+    return anchor;
+}
+
+U_CAPI int32_t   U_EXPORT2
+u_strlen(const char16_t *s)
+{
+#if U_SIZEOF_WCHAR_T == U_SIZEOF_UCHAR
+    return (int32_t)uprv_wcslen((const wchar_t *)s);
+#else
+    const char16_t *t = s;
+    while(*t != 0) {
+      ++t;
+    }
+    return t - s;
+#endif
+}
+
+U_CAPI int32_t U_EXPORT2
+u_countChar32(const char16_t *s, int32_t length) {
+    int32_t count;
+
+    if(s==nullptr || length<-1) {
+        return 0;
+    }
+
+    count=0;
+    if(length>=0) {
+        while(length>0) {
+            ++count;
+            if(U16_IS_LEAD(*s) && length>=2 && U16_IS_TRAIL(*(s+1))) {
+                s+=2;
+                length-=2;
+            } else {
+                ++s;
+                --length;
+            }
+        }
+    } else  {
+        char16_t c;
+
+        for(;;) {
+            if((c=*s++)==0) {
+                break;
+            }
+            ++count;
+
+            if(U16_IS_LEAD(c) && U16_IS_TRAIL(*s)) {
+                ++s;
+            }
+        }
+    }
+    return count;
+}
+
+U_CAPI UBool U_EXPORT2
+u_strHasMoreChar32Than(const char16_t *s, int32_t length, int32_t number) {
+
+    if(number<0) {
+        return true;
+    }
+    if(s==nullptr || length<-1) {
+        return false;
+    }
+
+    if(length==-1) {
+        char16_t c;
+
+        for(;;) {
+            if((c=*s++)==0) {
+                return false;
+            }
+            if(number==0) {
+                return true;
+            }
+            if(U16_IS_LEAD(c) && U16_IS_TRAIL(*s)) {
+                ++s;
+            }
+            --number;
+        }
+    } else {
+        const char16_t *limit;
+        int32_t maxSupplementary;
+
+        if(((length+1)/2)>number) {
+            return true;
+        }
+
+        maxSupplementary=length-number;
+        if(maxSupplementary<=0) {
+            return false;
+        }
+
+        limit=s+length;
+        for(;;) {
+            if(s==limit) {
+                return false;
+            }
+            if(number==0) {
+                return true;
+            }
+            if(U16_IS_LEAD(*s++) && s!=limit && U16_IS_TRAIL(*s)) {
+                ++s;
+                if(--maxSupplementary<=0) {
+                    return false;
+                }
+            }
+            --number;
+        }
+    }
+}
+
+U_CAPI char16_t * U_EXPORT2
+u_memcpy(char16_t *dest, const char16_t *src, int32_t count) {
+    if(count > 0) {
+        uprv_memcpy(dest, src, (size_t)count*U_SIZEOF_UCHAR);
+    }
+    return dest;
+}
+
+U_CAPI char16_t * U_EXPORT2
+u_memmove(char16_t *dest, const char16_t *src, int32_t count) {
+    if(count > 0) {
+        uprv_memmove(dest, src, (size_t)count*U_SIZEOF_UCHAR);
+    }
+    return dest;
+}
+
+U_CAPI char16_t * U_EXPORT2
+u_memset(char16_t *dest, char16_t c, int32_t count) {
+    if(count > 0) {
+        char16_t *ptr = dest;
+        char16_t *limit = dest + count;
+
+        while (ptr < limit) {
+            *(ptr++) = c;
+        }
+    }
+    return dest;
+}
+
+U_CAPI int32_t U_EXPORT2
+u_memcmp(const char16_t *buf1, const char16_t *buf2, int32_t count) {
+    if(count > 0) {
+        const char16_t *limit = buf1 + count;
+        int32_t result;
+
+        while (buf1 < limit) {
+            result = (int32_t)(uint16_t)*buf1 - (int32_t)(uint16_t)*buf2;
+            if (result != 0) {
+                return result;
+            }
+            buf1++;
+            buf2++;
+        }
+    }
+    return 0;
+}
+
+U_CAPI int32_t U_EXPORT2
+u_memcmpCodePointOrder(const char16_t *s1, const char16_t *s2, int32_t count) {
+    return uprv_strCompare(s1, count, s2, count, false, true);
+}
+
+
+static const char16_t UNESCAPE_MAP[] = {
+     0x61, 0x07,
+     0x62, 0x08,
+     0x65, 0x1b,
+     0x66, 0x0c,
+     0x6E, 0x0a,
+     0x72, 0x0d,
+     0x74, 0x09,
+     0x76, 0x0b
+};
+enum { UNESCAPE_MAP_LENGTH = UPRV_LENGTHOF(UNESCAPE_MAP) };
+
+static int32_t _digit8(char16_t c) {
+    if (c >= u'0' && c <= u'7') {
+        return c - u'0';
+    }
+    return -1;
+}
+
+static int32_t _digit16(char16_t c) {
+    if (c >= u'0' && c <= u'9') {
+        return c - u'0';
+    }
+    if (c >= u'A' && c <= u'F') {
+        return c - (u'A' - 10);
+    }
+    if (c >= u'a' && c <= u'f') {
+        return c - (u'a' - 10);
+    }
+    return -1;
+}
+
+U_CAPI UChar32 U_EXPORT2
+u_unescapeAt(UNESCAPE_CHAR_AT charAt,
+             int32_t *offset,
+             int32_t length,
+             void *context) {
+
+    int32_t start = *offset;
+    UChar32 c;
+    UChar32 result = 0;
+    int8_t n = 0;
+    int8_t minDig = 0;
+    int8_t maxDig = 0;
+    int8_t bitsPerDigit = 4; 
+    int32_t dig;
+    UBool braces = false;
+
+    if (*offset < 0 || *offset >= length) {
+        goto err;
+    }
+
+    c = charAt((*offset)++, context);
+
+    switch (c) {
+    case u'u':
+        minDig = maxDig = 4;
+        break;
+    case u'U':
+        minDig = maxDig = 8;
+        break;
+    case u'x':
+        minDig = 1;
+        if (*offset < length && charAt(*offset, context) == u'{') {
+            ++(*offset);
+            braces = true;
+            maxDig = 8;
+        } else {
+            maxDig = 2;
+        }
+        break;
+    default:
+        dig = _digit8(c);
+        if (dig >= 0) {
+            minDig = 1;
+            maxDig = 3;
+            n = 1; 
+            bitsPerDigit = 3;
+            result = dig;
+        }
+        break;
+    }
+    if (minDig != 0) {
+        while (*offset < length && n < maxDig) {
+            c = charAt(*offset, context);
+            dig = (bitsPerDigit == 3) ? _digit8(c) : _digit16(c);
+            if (dig < 0) {
+                break;
+            }
+            result = (result << bitsPerDigit) | dig;
+            ++(*offset);
+            ++n;
+        }
+        if (n < minDig) {
+            goto err;
+        }
+        if (braces) {
+            if (c != u'}') {
+                goto err;
+            }
+            ++(*offset);
+        }
+        if (result < 0 || result >= 0x110000) {
+            goto err;
+        }
+        if (*offset < length && U16_IS_LEAD(result)) {
+            int32_t ahead = *offset + 1;
+            c = charAt(*offset, context);
+            if (c == u'\\' && ahead < length) {
+                int32_t tailLimit = ahead + 11;
+                if (tailLimit > length) {
+                    tailLimit = length;
+                }
+                c = u_unescapeAt(charAt, &ahead, tailLimit, context);
+            }
+            if (U16_IS_TRAIL(c)) {
+                *offset = ahead;
+                result = U16_GET_SUPPLEMENTARY(result, c);
+            }
+        }
+        return result;
+    }
+
+    for (int32_t i=0; i<UNESCAPE_MAP_LENGTH; i+=2) {
+        if (c == UNESCAPE_MAP[i]) {
+            return UNESCAPE_MAP[i+1];
+        } else if (c < UNESCAPE_MAP[i]) {
+            break;
+        }
+    }
+
+    if (c == u'c' && *offset < length) {
+        c = charAt((*offset)++, context);
+        if (U16_IS_LEAD(c) && *offset < length) {
+            char16_t c2 = charAt(*offset, context);
+            if (U16_IS_TRAIL(c2)) {
+                ++(*offset);
+                c = U16_GET_SUPPLEMENTARY(c, c2);
+            }
+        }
+        return 0x1F & c;
+    }
+
+    if (U16_IS_LEAD(c) && *offset < length) {
+        char16_t c2 = charAt(*offset, context);
+        if (U16_IS_TRAIL(c2)) {
+            ++(*offset);
+            return U16_GET_SUPPLEMENTARY(c, c2);
+        }
+    }
+    return c;
+
+ err:
+    *offset = start; 
+    return (UChar32)0xFFFFFFFF;
+}
+
+static char16_t U_CALLCONV
+_charPtr_charAt(int32_t offset, void *context) {
+    char16_t c16;
+    u_charsToUChars(static_cast<char*>(context) + offset, &c16, 1);
+    return c16;
+}
+
+static void _appendUChars(char16_t *dest, int32_t destCapacity,
+                          const char *src, int32_t srcLen) {
+    if (destCapacity < 0) {
+        destCapacity = 0;
+    }
+    if (srcLen > destCapacity) {
+        srcLen = destCapacity;
+    }
+    u_charsToUChars(src, dest, srcLen);
+}
+
+U_CAPI int32_t U_EXPORT2
+u_unescape(const char *src, char16_t *dest, int32_t destCapacity) {
+    const char *segment = src;
+    int32_t i = 0;
+    char c;
+
+    while ((c=*src) != 0) {
+        if (c == '\\') {
+            int32_t lenParsed = 0;
+            UChar32 c32;
+            if (src != segment) {
+                if (dest != nullptr) {
+                    _appendUChars(dest + i, destCapacity - i,
+                                  segment, (int32_t)(src - segment));
+                }
+                i += (int32_t)(src - segment);
+            }
+            ++src; 
+            c32 = u_unescapeAt(_charPtr_charAt, &lenParsed, (int32_t)uprv_strlen(src), const_cast<char*>(src));
+            if (lenParsed == 0) {
+                goto err;
+            }
+            src += lenParsed; 
+            if (dest != nullptr && U16_LENGTH(c32) <= (destCapacity - i)) {
+                U16_APPEND_UNSAFE(dest, i, c32);
+            } else {
+                i += U16_LENGTH(c32);
+            }
+            segment = src;
+        } else {
+            ++src;
+        }
+    }
+    if (src != segment) {
+        if (dest != nullptr) {
+            _appendUChars(dest + i, destCapacity - i,
+                          segment, (int32_t)(src - segment));
+        }
+        i += (int32_t)(src - segment);
+    }
+    if (dest != nullptr && i < destCapacity) {
+        dest[i] = 0;
+    }
+    return i;
+
+ err:
+    if (dest != nullptr && destCapacity > 0) {
+        *dest = 0;
+    }
+    return 0;
+}
+
+
+#define __TERMINATE_STRING(dest, destCapacity, length, pErrorCode) UPRV_BLOCK_MACRO_BEGIN { \
+    if(pErrorCode!=nullptr && U_SUCCESS(*pErrorCode)) {                    \
+           \
+                                                                        \
+        if(length<0) {                                                  \
+                               \
+        } else if(length<destCapacity) {                                \
+                            \
+            dest[length]=0;                                             \
+             \
+            if(*pErrorCode==U_STRING_NOT_TERMINATED_WARNING) {          \
+                *pErrorCode=U_ZERO_ERROR;                               \
+            }                                                           \
+        } else if(length==destCapacity) {                               \
+             \
+            *pErrorCode=U_STRING_NOT_TERMINATED_WARNING;                \
+        } else  {                              \
+             \
+            *pErrorCode=U_BUFFER_OVERFLOW_ERROR;                        \
+        }                                                               \
+    } \
+} UPRV_BLOCK_MACRO_END
+
+U_CAPI char16_t U_EXPORT2
+u_asciiToUpper(char16_t c) {
+    if (u'a' <= c && c <= u'z') {
+        c = c + u'A' - u'a';
+    }
+    return c;
+}
+
+U_CAPI int32_t U_EXPORT2
+u_terminateUChars(char16_t *dest, int32_t destCapacity, int32_t length, UErrorCode *pErrorCode) {
+    __TERMINATE_STRING(dest, destCapacity, length, pErrorCode);
+    return length;
+}
+
+U_CAPI int32_t U_EXPORT2
+u_terminateChars(char *dest, int32_t destCapacity, int32_t length, UErrorCode *pErrorCode) {
+    __TERMINATE_STRING(dest, destCapacity, length, pErrorCode);
+    return length;
+}
+
+U_CAPI int32_t U_EXPORT2
+u_terminateUChar32s(UChar32 *dest, int32_t destCapacity, int32_t length, UErrorCode *pErrorCode) {
+    __TERMINATE_STRING(dest, destCapacity, length, pErrorCode);
+    return length;
+}
+
+U_CAPI int32_t U_EXPORT2
+u_terminateWChars(wchar_t *dest, int32_t destCapacity, int32_t length, UErrorCode *pErrorCode) {
+    __TERMINATE_STRING(dest, destCapacity, length, pErrorCode);
+    return length;
+}
+
+
+
+
+#define STRING_HASH(TYPE, STR, STRLEN, DEREF) UPRV_BLOCK_MACRO_BEGIN { \
+    uint32_t hash = 0;                        \
+    const TYPE *p = (const TYPE*) STR;        \
+    if (p != nullptr) {                          \
+        int32_t len = (int32_t)(STRLEN);      \
+        int32_t inc = ((len - 32) / 32) + 1;  \
+        const TYPE *limit = p + len;          \
+        while (p<limit) {                     \
+            hash = (hash * 37) + DEREF;       \
+            p += inc;                         \
+        }                                     \
+    }                                         \
+    return static_cast<int32_t>(hash);        \
+} UPRV_BLOCK_MACRO_END
+
+U_CAPI int32_t U_EXPORT2
+ustr_hashUCharsN(const char16_t *str, int32_t length) {
+    STRING_HASH(char16_t, str, length, *p);
+}
+
+U_CAPI int32_t U_EXPORT2
+ustr_hashCharsN(const char *str, int32_t length) {
+    STRING_HASH(uint8_t, str, length, *p);
+}
+
+U_CAPI int32_t U_EXPORT2
+ustr_hashICharsN(const char *str, int32_t length) {
+    STRING_HASH(char, str, length, (uint8_t)uprv_tolower(*p));
+}

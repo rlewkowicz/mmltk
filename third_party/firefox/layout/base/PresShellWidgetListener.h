@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_PresShellWidgetListener_h_
+#define mozilla_PresShellWidgetListener_h_
+
+#include "Units.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/CallState.h"
+#include "nsCOMPtr.h"
+#include "nsIWidgetListener.h"
+
+class nsIWidget;
+
+namespace mozilla {
+class PresShell;
+namespace dom {
+class BrowserParent;
+}  
+namespace widget {
+struct InitData;
+enum class TransparencyMode : uint8_t;
+enum class WindowType : uint8_t;
+}  
+
+class PresShellWidgetListener final : public nsIWidgetListener {
+ public:
+  void DetachWidget();
+
+  void AttachToTopLevelWidget(nsIWidget* aWidget);
+  void DetachFromTopLevelWidget();
+
+  static uint32_t GetLastUserEventTime();
+
+  nsIWidget* GetWidget() const { return mWindow; }
+  bool HasWidget() const { return !!mWindow; }
+
+  mozilla::PresShell* GetPresShell() override;
+  PresShellWidgetListener* GetAsPresShellWidgetListener() override {
+    return this;
+  }
+  bool IsPaintSuppressed() const override {
+    return IsPrimaryFramePaintSuppressed();
+  }
+  void WindowResized(nsIWidget*, const LayoutDeviceIntSize&) override;
+  void DynamicToolbarMaxHeightChanged(mozilla::ScreenIntCoord aHeight) override;
+  void DynamicToolbarOffsetChanged(mozilla::ScreenIntCoord aOffset) override;
+  void KeyboardHeightChanged(mozilla::ScreenIntCoord aHeight) override;
+  void AndroidPipModeChanged(bool) override;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void PaintWindow(nsIWidget* aWidget) override;
+  void DidCompositeWindow(mozilla::layers::TransactionId aTransactionId,
+                          const mozilla::TimeStamp& aCompositeStart,
+                          const mozilla::TimeStamp& aCompositeEnd) override;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsEventStatus HandleEvent(mozilla::WidgetGUIEvent*) override;
+  void SafeAreaInsetsChanged(const mozilla::LayoutDeviceIntMargin&) override;
+
+  explicit PresShellWidgetListener(mozilla::PresShell*);
+  virtual ~PresShellWidgetListener();
+
+  bool IsPrimaryFramePaintSuppressed() const;
+
+ private:
+  void CallOnAllRemoteChildren(
+      const std::function<mozilla::CallState(mozilla::dom::BrowserParent*)>&
+          aCallback);
+
+  mozilla::PresShell* mPresShell = nullptr;
+  nsCOMPtr<nsIWidget> mWindow;
+  nsCOMPtr<nsIWidget> mPreviousWindow;
+};
+
+}  
+
+#endif

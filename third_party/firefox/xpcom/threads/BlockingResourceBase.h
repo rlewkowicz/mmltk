@@ -1,0 +1,168 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_BlockingResourceBase_h
+#define mozilla_BlockingResourceBase_h
+
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/ThreadLocal.h"
+
+#include "nscore.h"
+#include "nsDebug.h"
+
+#include "prtypes.h"
+
+#ifdef DEBUG
+
+#  define MOZ_CALLSTACK_DISABLED
+
+#  include "prinit.h"
+
+#  ifndef MOZ_CALLSTACK_DISABLED
+#    include "mozilla/Maybe.h"
+#    include "nsTArray.h"
+#  endif
+
+#endif
+
+
+namespace mozilla {
+
+#ifdef DEBUG
+template <class T>
+class DeadlockDetector;
+#endif
+
+class BlockingResourceBase {
+ public:
+  enum BlockingResourceType {
+    eMutex,
+    eReentrantMonitor,
+    eCondVar,
+    eRecursiveMutex
+  };
+
+  static const char* const kResourceTypeName[];
+
+#ifdef DEBUG
+
+  static void AssertSafeToProcessEventLoop();
+
+  static size_t SizeOfDeadlockDetector(MallocSizeOf aMallocSizeOf);
+
+  bool Print(nsACString& aOut) const;
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+    size_t n = aMallocSizeOf(this);
+    return n;
+  }
+
+  typedef DeadlockDetector<BlockingResourceBase> DDT;
+
+ protected:
+#  ifdef MOZ_CALLSTACK_DISABLED
+  typedef bool AcquisitionState;
+#  else
+  static size_t const kAcquisitionStateStackSize = 24;
+  typedef Maybe<AutoTArray<void*, kAcquisitionStateStackSize> >
+      AcquisitionState;
+#  endif
+
+  BlockingResourceBase(const char* aName, BlockingResourceType aType);
+
+  ~BlockingResourceBase();
+
+  void CheckAcquire();
+
+  void Acquire();  
+
+  void Release();  
+
+  static BlockingResourceBase* ResourceChainFront() {
+    return sResourceAcqnChainFront.get();
+  }
+
+  static BlockingResourceBase* ResourceChainPrev(
+      const BlockingResourceBase* aResource) {
+    return aResource->mChainPrev;
+  }  
+
+  void ResourceChainAppend(BlockingResourceBase* aPrev) {
+    mChainPrev = aPrev;
+    sResourceAcqnChainFront.set(this);
+  }  
+
+  void ResourceChainRemove() {
+    NS_ASSERTION(this == ResourceChainFront(), "not at chain front");
+    sResourceAcqnChainFront.set(mChainPrev);
+  }  
+
+  AcquisitionState TakeAcquisitionState() {
+#  ifdef MOZ_CALLSTACK_DISABLED
+    bool acquired = mAcquired;
+    ClearAcquisitionState();
+    return acquired;
+#  else
+    return mAcquired.take();
+#  endif
+  }
+
+  void SetAcquisitionState(AcquisitionState&& aAcquisitionState) {
+    mAcquired = std::move(aAcquisitionState);
+  }
+
+  void ClearAcquisitionState() {
+#  ifdef MOZ_CALLSTACK_DISABLED
+    mAcquired = false;
+#  else
+    mAcquired.reset();
+#  endif
+  }
+
+  bool IsAcquired() const { return (bool)mAcquired; }
+
+  BlockingResourceBase* mChainPrev;
+
+ private:
+  const char* mName;
+
+  BlockingResourceType mType;
+
+  AcquisitionState mAcquired;
+
+#  ifndef MOZ_CALLSTACK_DISABLED
+  AcquisitionState mFirstSeen;
+#  endif
+
+  static PRCallOnceType sCallOnce;
+
+  static MOZ_THREAD_LOCAL(BlockingResourceBase*) sResourceAcqnChainFront;
+
+  static DDT* sDeadlockDetector;
+
+  static PRStatus InitStatics();
+
+  static void Shutdown();
+
+  static void StackWalkCallback(uint32_t aFrameNumber, void* aPc, void* aSp,
+                                void* aClosure);
+  static void GetStackTrace(AcquisitionState& aState,
+                            const void* aFirstFramePC);
+
+#  ifdef MOZILLA_INTERNAL_API
+  friend void LogTerm();
+#  endif  // ifdef MOZILLA_INTERNAL_API
+
+#else  // non-DEBUG implementation
+
+  BlockingResourceBase(const char* aName, BlockingResourceType aType) {}
+
+  ~BlockingResourceBase() {}
+
+#endif
+};
+
+}  
+
+#endif  // mozilla_BlockingResourceBase_h

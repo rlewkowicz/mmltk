@@ -1,0 +1,169 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_OTS_UTILS_H
+#define GFX_OTS_UTILS_H
+
+#include "gfxFontUtils.h"
+
+#include "opentype-sanitiser.h"
+
+struct gfxOTSMozAlloc {
+  void* Grow(void* aPtr, size_t aLength) { return moz_xrealloc(aPtr, aLength); }
+  void* ShrinkToFit(void* aPtr, size_t aLength) {
+    return moz_xrealloc(aPtr, aLength);
+  }
+  void Free(void* aPtr) { free(aPtr); }
+};
+
+template <typename AllocT = gfxOTSMozAlloc>
+class gfxOTSExpandingMemoryStream : public ots::OTSStream {
+ public:
+  enum { DEFAULT_LIMIT = 256 * 1024 * 1024 };
+
+  explicit gfxOTSExpandingMemoryStream(size_t initial,
+                                       size_t limit = DEFAULT_LIMIT)
+      : mLength(initial), mLimit(limit), mOff(0) {
+    mPtr = mAlloc.Grow(nullptr, mLength);
+  }
+
+  ~gfxOTSExpandingMemoryStream() { mAlloc.Free(mPtr); }
+
+  size_t size() override { return mLimit; }
+
+  auto forget() {
+    auto p = mAlloc.ShrinkToFit(mPtr, mOff);
+    mPtr = nullptr;
+    return p;
+  }
+
+  bool WriteRaw(const void* data, size_t length) override {
+    if ((mOff + length > mLength) ||
+        (mLength > std::numeric_limits<size_t>::max() - mOff)) {
+      if (mLength == mLimit) {
+        return false;
+      }
+      size_t newLength = (mLength + 1) * 2;
+      if (newLength < mLength) {
+        return false;
+      }
+      if (newLength > mLimit) {
+        newLength = mLimit;
+      }
+      mPtr = mAlloc.Grow(mPtr, newLength);
+      mLength = newLength;
+      return WriteRaw(data, length);
+    }
+    std::memcpy(static_cast<char*>(mPtr) + mOff, data, length);
+    mOff += length;
+    return true;
+  }
+
+  bool Seek(off_t position) override {
+    if (position < 0) {
+      return false;
+    }
+    if (static_cast<size_t>(position) > mLength) {
+      return false;
+    }
+    mOff = position;
+    return true;
+  }
+
+  off_t Tell() const override { return mOff; }
+
+ private:
+  AllocT mAlloc;
+  void* mPtr;
+  size_t mLength;
+  const size_t mLimit;
+  off_t mOff;
+};
+
+class MOZ_STACK_CLASS gfxOTSContext : public ots::OTSContext {
+ public:
+  gfxOTSContext() {
+    using namespace mozilla;
+
+    mCheckOTLTables = StaticPrefs::gfx_downloadable_fonts_otl_validation();
+    mCheckVariationTables =
+        StaticPrefs::gfx_downloadable_fonts_validate_variation_tables();
+    mKeepColorBitmaps =
+        StaticPrefs::gfx_downloadable_fonts_keep_color_bitmaps();
+    mKeepSVG = StaticPrefs::gfx_font_rendering_opentype_svg_enabled();
+  }
+
+  virtual ots::TableAction GetTableAction(uint32_t aTag) override {
+    if (aTag == TRUETYPE_TAG('G', 'D', 'E', 'F') ||
+        aTag == TRUETYPE_TAG('G', 'P', 'O', 'S') ||
+        aTag == TRUETYPE_TAG('G', 'S', 'U', 'B')) {
+      switch (mCheckOTLTables) {
+        case 0:  
+          return ots::TABLE_ACTION_PASSTHRU;
+        case 1:  
+          return ots::TABLE_ACTION_SANITIZE_SOFT;
+        case 2:  
+        default:
+          return ots::TABLE_ACTION_SANITIZE;
+      }
+    }
+    auto isVariationTable = [](uint32_t aTag) -> bool {
+      return aTag == TRUETYPE_TAG('a', 'v', 'a', 'r') ||
+             aTag == TRUETYPE_TAG('c', 'v', 'a', 'r') ||
+             aTag == TRUETYPE_TAG('f', 'v', 'a', 'r') ||
+             aTag == TRUETYPE_TAG('g', 'v', 'a', 'r') ||
+             aTag == TRUETYPE_TAG('H', 'V', 'A', 'R') ||
+             aTag == TRUETYPE_TAG('M', 'V', 'A', 'R') ||
+             aTag == TRUETYPE_TAG('S', 'T', 'A', 'T') ||
+             aTag == TRUETYPE_TAG('V', 'V', 'A', 'R');
+    };
+    if (!mCheckVariationTables && isVariationTable(aTag)) {
+      return ots::TABLE_ACTION_PASSTHRU;
+    }
+    if (!gfxPlatform::HasVariationFontSupport() && isVariationTable(aTag)) {
+      return ots::TABLE_ACTION_DROP;
+    }
+    if (aTag == TRUETYPE_TAG('S', 'V', 'G', ' ')) {
+      return mKeepSVG ? ots::TABLE_ACTION_PASSTHRU : ots::TABLE_ACTION_DROP;
+    }
+    if (aTag == TRUETYPE_TAG('B', 'A', 'S', 'E')) {
+      return ots::TABLE_ACTION_PASSTHRU;
+    }
+    if (mKeepColorBitmaps && (aTag == TRUETYPE_TAG('C', 'B', 'D', 'T') ||
+                              aTag == TRUETYPE_TAG('C', 'B', 'L', 'C'))) {
+      return ots::TABLE_ACTION_PASSTHRU;
+    }
+    return ots::TABLE_ACTION_DEFAULT;
+  }
+
+  static size_t GuessSanitizedFontSize(size_t aLength,
+                                       gfxUserFontType aFontType,
+                                       bool aStrict = true) {
+    switch (aFontType) {
+      case GFX_USERFONT_UNKNOWN:
+        return aStrict || !aLength ? 0 : (aLength * 3) / 2;
+      case GFX_USERFONT_WOFF:
+        return aLength * 2;
+      case GFX_USERFONT_WOFF2:
+        return aLength * 3;
+      default:
+        return aLength;
+    }
+  }
+
+  static size_t GuessSanitizedFontSize(const uint8_t* aData, size_t aLength,
+                                       bool aStrict = true) {
+    gfxUserFontType fontType =
+        gfxFontUtils::DetermineFontDataType(aData, aLength);
+    return GuessSanitizedFontSize(aLength, fontType, aStrict);
+  }
+
+ private:
+  uint8_t mCheckOTLTables;
+  bool mCheckVariationTables;
+  bool mKeepColorBitmaps;
+  bool mKeepSVG;
+};
+
+#endif /* GFX_OTS_UTILS_H */

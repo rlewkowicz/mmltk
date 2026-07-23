@@ -1,0 +1,580 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_Result_h
+#define mozilla_Result_h
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <type_traits>
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/CompactPair.h"
+#include "mozilla/MaybeStorageBase.h"
+
+namespace mozilla {
+
+struct Ok {};
+
+struct ErrorPropagationTag {};
+
+template <typename E>
+class GenericErrorResult;
+template <typename V, typename E>
+class Result;
+
+namespace detail {
+
+enum class PackingStrategy {
+  Variant,
+  NullIsOk,
+  LowBitTagIsError,
+  PackedVariant,
+  ZeroIsEmptyError,
+};
+
+template <typename T>
+struct UnusedZero;
+
+template <typename V, typename E, PackingStrategy Strategy>
+class ResultImplementation;
+
+template <typename V>
+struct EmptyWrapper : V {
+  constexpr EmptyWrapper() = default;
+  explicit constexpr EmptyWrapper(const V&) {}
+  explicit constexpr EmptyWrapper(std::in_place_t) {}
+
+  constexpr V* addr() { return this; }
+  constexpr const V* addr() const { return this; }
+};
+
+template <typename V>
+using AlignedStorageOrEmpty =
+    std::conditional_t<std::is_empty_v<V>, EmptyWrapper<V>,
+                       MaybeStorageBase<V>>;
+
+template <typename V, typename E>
+class ResultImplementationNullIsOkBase {
+ protected:
+  using ErrorStorageType = typename UnusedZero<E>::StorageType;
+
+  static constexpr auto kNullValue = UnusedZero<E>::nullValue;
+
+  static_assert(std::is_trivially_copyable_v<ErrorStorageType>);
+
+
+  CompactPair<AlignedStorageOrEmpty<V>, ErrorStorageType> mValue;
+
+ public:
+  explicit constexpr ResultImplementationNullIsOkBase(const V& aSuccessValue)
+      : mValue(aSuccessValue, kNullValue) {}
+  explicit constexpr ResultImplementationNullIsOkBase(V&& aSuccessValue)
+      : mValue(std::move(aSuccessValue), kNullValue) {}
+  template <typename... Args>
+  explicit constexpr ResultImplementationNullIsOkBase(std::in_place_t,
+                                                      Args&&... aArgs)
+      : mValue(std::piecewise_construct,
+               std::tuple(std::in_place, std::forward<Args>(aArgs)...),
+               std::tuple(kNullValue)) {}
+  explicit constexpr ResultImplementationNullIsOkBase(E aErrorValue)
+      : mValue(std::piecewise_construct, std::tuple<>(),
+               std::tuple(UnusedZero<E>::Store(std::move(aErrorValue)))) {
+    MOZ_ASSERT(mValue.second() != kNullValue);
+  }
+
+  constexpr ResultImplementationNullIsOkBase(
+      ResultImplementationNullIsOkBase&& aOther)
+      : mValue(std::piecewise_construct, std::tuple<>(),
+               std::tuple(aOther.mValue.second())) {
+    if constexpr (!std::is_empty_v<V>) {
+      if (isOk()) {
+        new (mValue.first().addr()) V(std::move(*aOther.mValue.first().addr()));
+      }
+    }
+  }
+  ResultImplementationNullIsOkBase& operator=(
+      ResultImplementationNullIsOkBase&& aOther) {
+    if constexpr (!std::is_empty_v<V>) {
+      if (isOk()) {
+        mValue.first().addr()->~V();
+      }
+    }
+    mValue.second() = std::move(aOther.mValue.second());
+    if constexpr (!std::is_empty_v<V>) {
+      if (isOk()) {
+        new (mValue.first().addr()) V(std::move(*aOther.mValue.first().addr()));
+      }
+    }
+    return *this;
+  }
+
+  constexpr bool isOk() const { return mValue.second() == kNullValue; }
+
+  constexpr const V& inspect() const { return *mValue.first().addr(); }
+  constexpr V unwrap() { return std::move(*mValue.first().addr()); }
+  constexpr void updateAfterTracing(V&& aValue) {
+    MOZ_ASSERT(isOk());
+    if (!std::is_empty_v<V>) {
+      mValue.first().addr()->~V();
+      new (mValue.first().addr()) V(std::move(aValue));
+    }
+  }
+
+  constexpr decltype(auto) inspectErr() const {
+    return UnusedZero<E>::Inspect(mValue.second());
+  }
+  constexpr E unwrapErr() { return UnusedZero<E>::Unwrap(mValue.second()); }
+  constexpr void updateErrorAfterTracing(E&& aErrorValue) {
+    mValue.second() = UnusedZero<E>::Store(std::move(aErrorValue));
+  }
+};
+
+template <typename V, typename E,
+          bool IsVTriviallyDestructible = std::is_trivially_destructible_v<V>>
+class ResultImplementationNullIsOk;
+
+template <typename V, typename E>
+class ResultImplementationNullIsOk<V, E, true>
+    : public ResultImplementationNullIsOkBase<V, E> {
+ public:
+  using ResultImplementationNullIsOkBase<V,
+                                         E>::ResultImplementationNullIsOkBase;
+};
+
+template <typename V, typename E>
+class ResultImplementationNullIsOk<V, E, false>
+    : public ResultImplementationNullIsOkBase<V, E> {
+ public:
+  using ResultImplementationNullIsOkBase<V,
+                                         E>::ResultImplementationNullIsOkBase;
+
+  ResultImplementationNullIsOk(ResultImplementationNullIsOk&&) = default;
+  ResultImplementationNullIsOk& operator=(ResultImplementationNullIsOk&&) =
+      default;
+
+  ~ResultImplementationNullIsOk() {
+    if (this->isOk()) {
+      this->mValue.first().addr()->~V();
+    }
+  }
+};
+
+template <typename V, typename E>
+class ResultImplementation<V, E, PackingStrategy::ZeroIsEmptyError> {
+  static_assert(std::is_integral_v<V> || std::is_pointer_v<V> ||
+                std::is_enum_v<V>);
+  static_assert(std::is_empty_v<E>);
+
+  V mValue;
+
+ public:
+  static constexpr PackingStrategy Strategy = PackingStrategy::ZeroIsEmptyError;
+
+  explicit constexpr ResultImplementation(V aValue) : mValue(aValue) {}
+  explicit constexpr ResultImplementation(E aErrorValue) : mValue(V(0)) {}
+
+  constexpr bool isOk() const { return mValue != V(0); }
+
+  constexpr V inspect() const { return mValue; }
+  constexpr V unwrap() { return inspect(); }
+
+  constexpr E inspectErr() const { return E(); }
+  constexpr E unwrapErr() { return inspectErr(); }
+
+  constexpr void updateAfterTracing(V&& aValue) {
+    this->~ResultImplementation();
+    new (this) ResultImplementation(std::move(aValue));
+  }
+  constexpr void updateErrorAfterTracing(E&& aErrorValue) {
+    this->~ResultImplementation();
+    new (this) ResultImplementation(std::move(aErrorValue));
+  }
+};
+
+template <typename V, typename E>
+class ResultImplementation<V, E, PackingStrategy::NullIsOk>
+    : public ResultImplementationNullIsOk<V, E> {
+ public:
+  static constexpr PackingStrategy Strategy = PackingStrategy::NullIsOk;
+  using ResultImplementationNullIsOk<V, E>::ResultImplementationNullIsOk;
+};
+
+template <size_t S>
+using UnsignedIntType = std::conditional_t<
+    S == 1, std::uint8_t,
+    std::conditional_t<
+        S == 2, std::uint16_t,
+        std::conditional_t<S == 3 || S == 4, std::uint32_t,
+                           std::conditional_t<S <= 8, std::uint64_t, void>>>>;
+
+template <typename V, typename E>
+class ResultImplementation<V, E, PackingStrategy::LowBitTagIsError> {
+  static_assert(std::is_trivially_copyable_v<V> &&
+                std::is_trivially_destructible_v<V>);
+  static_assert(std::is_trivially_copyable_v<E> &&
+                std::is_trivially_destructible_v<E>);
+
+  static constexpr size_t kRequiredSize = std::max(sizeof(V), sizeof(E));
+
+  using StorageType = UnsignedIntType<kRequiredSize>;
+
+#if defined(__clang__)
+  alignas(std::max(alignof(V), alignof(E))) StorageType mBits;
+#else
+  alignas(alignof(V) > alignof(E) ? alignof(V) : alignof(E)) StorageType mBits;
+#endif
+
+ public:
+  static constexpr PackingStrategy Strategy = PackingStrategy::LowBitTagIsError;
+
+  explicit constexpr ResultImplementation(V aValue) : mBits(0) {
+    if constexpr (!std::is_empty_v<V>) {
+      std::memcpy(&mBits, &aValue, sizeof(V));
+      MOZ_ASSERT((mBits & 1) == 0);
+    } else {
+      (void)aValue;
+    }
+  }
+  explicit constexpr ResultImplementation(E aErrorValue) : mBits(1) {
+    if constexpr (!std::is_empty_v<E>) {
+      std::memcpy(&mBits, &aErrorValue, sizeof(E));
+      MOZ_ASSERT((mBits & 1) == 0);
+      mBits |= 1;
+    } else {
+      (void)aErrorValue;
+    }
+  }
+
+  constexpr bool isOk() const { return (mBits & 1) == 0; }
+
+  constexpr V inspect() const {
+    V res;
+    std::memcpy(&res, &mBits, sizeof(V));
+    return res;
+  }
+  constexpr V unwrap() { return inspect(); }
+
+  constexpr E inspectErr() const {
+    const auto bits = mBits ^ 1;
+    E res;
+    std::memcpy(&res, &bits, sizeof(E));
+    return res;
+  }
+  constexpr E unwrapErr() { return inspectErr(); }
+
+  constexpr void updateAfterTracing(V&& aValue) {
+    this->~ResultImplementation();
+    new (this) ResultImplementation(std::move(aValue));
+  }
+  constexpr void updateErrorAfterTracing(E&& aErrorValue) {
+    this->~ResultImplementation();
+    new (this) ResultImplementation(std::move(aErrorValue));
+  }
+};
+
+template <typename V, typename E>
+struct IsPackableVariant {
+  struct VEbool {
+    explicit constexpr VEbool(V&& aValue) : v(std::move(aValue)), ok(true) {}
+    explicit constexpr VEbool(E&& aErrorValue)
+        : e(std::move(aErrorValue)), ok(false) {}
+    V v;
+    E e;
+    bool ok;
+  };
+  struct EVbool {
+    explicit constexpr EVbool(V&& aValue) : v(std::move(aValue)), ok(true) {}
+    explicit constexpr EVbool(E&& aErrorValue)
+        : e(std::move(aErrorValue)), ok(false) {}
+    E e;
+    V v;
+    bool ok;
+  };
+
+  using Impl =
+      std::conditional_t<sizeof(VEbool) <= sizeof(EVbool), VEbool, EVbool>;
+
+  static const bool value = sizeof(Impl) <= sizeof(uintptr_t);
+};
+
+template <typename V, typename E>
+class ResultImplementation<V, E, PackingStrategy::PackedVariant> {
+  using Impl = typename IsPackableVariant<V, E>::Impl;
+  Impl data;
+
+ public:
+  static constexpr PackingStrategy Strategy = PackingStrategy::PackedVariant;
+
+  explicit constexpr ResultImplementation(V aValue) : data(std::move(aValue)) {}
+  explicit constexpr ResultImplementation(E aErrorValue)
+      : data(std::move(aErrorValue)) {}
+
+  constexpr bool isOk() const { return data.ok; }
+
+  constexpr const V& inspect() const { return data.v; }
+  constexpr V unwrap() { return std::move(data.v); }
+
+  constexpr const E& inspectErr() const { return data.e; }
+  constexpr E unwrapErr() { return std::move(data.e); }
+
+  constexpr void updateAfterTracing(V&& aValue) {
+    MOZ_ASSERT(data.ok);
+    this->~ResultImplementation();
+    new (this) ResultImplementation(std::move(aValue));
+  }
+  constexpr void updateErrorAfterTracing(E&& aErrorValue) {
+    MOZ_ASSERT(!data.ok);
+    this->~ResultImplementation();
+    new (this) ResultImplementation(std::move(aErrorValue));
+  }
+};
+
+template <typename T>
+struct UnusedZero {
+  static const bool value = false;
+};
+
+template <typename T>
+struct UnusedZeroEnum {
+  using StorageType = std::underlying_type_t<T>;
+
+  static constexpr bool value = true;
+  static constexpr StorageType nullValue = 0;
+
+  static constexpr T Inspect(const StorageType& aValue) {
+    return static_cast<T>(aValue);
+  }
+  static constexpr T Unwrap(StorageType aValue) {
+    return static_cast<T>(aValue);
+  }
+  static constexpr StorageType Store(T aValue) {
+    return static_cast<StorageType>(aValue);
+  }
+};
+
+template <typename T>
+struct HasFreeLSB {
+  static const bool value = std::is_empty_v<T>;
+};
+
+template <>
+struct HasFreeLSB<void*> {
+  static const bool value = false;
+};
+
+template <typename T>
+struct HasFreeLSB<T*> {
+  static const bool value = (alignof(T) & 1) == 0;
+};
+
+template <typename V, typename E>
+struct SelectResultImpl {
+  static const PackingStrategy value =
+      (UnusedZero<V>::value && std::is_empty_v<E>)
+          ? PackingStrategy::ZeroIsEmptyError
+      : (HasFreeLSB<V>::value && HasFreeLSB<E>::value)
+          ? PackingStrategy::LowBitTagIsError
+      : (UnusedZero<E>::value && sizeof(E) <= sizeof(uintptr_t))
+          ? PackingStrategy::NullIsOk
+      : (std::is_default_constructible_v<V> &&
+         std::is_default_constructible_v<E> && IsPackableVariant<V, E>::value)
+          ? PackingStrategy::PackedVariant
+          : PackingStrategy::Variant;
+
+  using Type = ResultImplementation<V, E, value>;
+};
+
+template <typename T>
+struct IsResult : std::false_type {};
+
+template <typename V, typename E>
+struct IsResult<Result<V, E>> : std::true_type {};
+
+}  
+
+template <typename V, typename E>
+constexpr auto ToResult(Result<V, E>&& aValue)
+    -> decltype(std::forward<Result<V, E>>(aValue)) {
+  return std::forward<Result<V, E>>(aValue);
+}
+
+template <typename V, typename E>
+class [[nodiscard]] Result final {
+  static_assert(!std::is_const_v<V>);
+  static_assert(!std::is_const_v<E>);
+  static_assert(!std::is_reference_v<V>);
+  static_assert(!std::is_reference_v<E>);
+
+  using Impl = typename detail::SelectResultImpl<V, E>::Type;
+
+  Impl mImpl;
+
+ public:
+  static constexpr detail::PackingStrategy Strategy = Impl::Strategy;
+  using ok_type = V;
+  using err_type = E;
+
+  MOZ_IMPLICIT constexpr Result(V&& aValue) : mImpl(std::move(aValue)) {
+    MOZ_ASSERT(isOk());
+  }
+
+  MOZ_IMPLICIT constexpr Result(const V& aValue) : mImpl(aValue) {
+    MOZ_ASSERT(isOk());
+  }
+
+  template <typename... Args>
+  explicit constexpr Result(std::in_place_t, Args&&... aArgs)
+      : mImpl(std::in_place, std::forward<Args>(aArgs)...) {
+    MOZ_ASSERT(isOk());
+  }
+
+  explicit constexpr Result(const E& aErrorValue) : mImpl(aErrorValue) {
+    MOZ_ASSERT(isErr());
+  }
+  explicit constexpr Result(E&& aErrorValue) : mImpl(std::move(aErrorValue)) {
+    MOZ_ASSERT(isErr());
+  }
+
+  template <typename V2, typename E2,
+            typename = std::enable_if_t<std::is_convertible_v<V2, V> &&
+                                        std::is_convertible_v<E2, E>>>
+  MOZ_IMPLICIT constexpr Result(Result<V2, E2>&& aOther)
+      : mImpl(aOther.isOk() ? Impl{aOther.unwrap()}
+                            : Impl{aOther.unwrapErr()}) {}
+
+  template <typename E2>
+  MOZ_IMPLICIT constexpr Result(GenericErrorResult<E2>&& aErrorResult)
+      : mImpl(std::move(aErrorResult.mErrorValue)) {
+    static_assert(std::is_convertible_v<E2, E>, "E2 must be convertible to E");
+    MOZ_ASSERT(isErr());
+  }
+
+  template <typename E2>
+  MOZ_IMPLICIT constexpr Result(const GenericErrorResult<E2>& aErrorResult)
+      : mImpl(aErrorResult.mErrorValue) {
+    static_assert(std::is_convertible_v<E2, E>, "E2 must be convertible to E");
+    MOZ_ASSERT(isErr());
+  }
+
+  Result(const Result&) = delete;
+  Result(Result&&) = default;
+  Result& operator=(const Result&) = delete;
+  Result& operator=(Result&&) = default;
+
+  constexpr bool isOk() const { return mImpl.isOk(); }
+
+  constexpr bool isErr() const { return !mImpl.isOk(); }
+
+  constexpr V unwrap() {
+    MOZ_ASSERT(isOk());
+    return mImpl.unwrap();
+  }
+
+  constexpr V unwrapOr(V aValue) {
+    return MOZ_LIKELY(isOk()) ? mImpl.unwrap() : std::move(aValue);
+  }
+
+  constexpr E unwrapErr() {
+    MOZ_ASSERT(isErr());
+    return mImpl.unwrapErr();
+  }
+
+  constexpr void updateAfterTracing(V&& aValue) {
+    mImpl.updateAfterTracing(std::move(aValue));
+  }
+
+  constexpr void updateErrorAfterTracing(E&& aErrorValue) {
+    mImpl.updateErrorAfterTracing(std::move(aErrorValue));
+  }
+
+  constexpr decltype(auto) inspect() const {
+    static_assert(!std::is_reference_v<
+                      std::invoke_result_t<decltype(&Impl::inspect), Impl>> ||
+                  std::is_const_v<std::remove_reference_t<
+                      std::invoke_result_t<decltype(&Impl::inspect), Impl>>>);
+    MOZ_ASSERT(isOk());
+    return mImpl.inspect();
+  }
+
+  constexpr decltype(auto) inspectErr() const {
+    static_assert(
+        !std::is_reference_v<
+            std::invoke_result_t<decltype(&Impl::inspectErr), Impl>> ||
+        std::is_const_v<std::remove_reference_t<
+            std::invoke_result_t<decltype(&Impl::inspectErr), Impl>>>);
+    MOZ_ASSERT(isErr());
+    return mImpl.inspectErr();
+  }
+
+  constexpr GenericErrorResult<E> propagateErr() {
+    MOZ_ASSERT(isErr());
+    return GenericErrorResult<E>{mImpl.unwrapErr(), ErrorPropagationTag{}};
+  }
+
+  template <typename F>
+  constexpr auto map(F f) -> Result<std::invoke_result_t<F, V>, E> {
+    using RetResult = Result<std::invoke_result_t<F, V>, E>;
+    return MOZ_LIKELY(isOk()) ? RetResult(f(unwrap())) : RetResult(unwrapErr());
+  }
+
+  template <typename F>
+  constexpr auto mapErr(F f) {
+    using RetResult = Result<V, std::invoke_result_t<F, E>>;
+    return MOZ_UNLIKELY(isErr()) ? RetResult(f(unwrapErr()))
+                                 : RetResult(unwrap());
+  }
+
+  template <typename F>
+  auto orElse(F f) -> Result<V, typename std::invoke_result_t<F, E>::err_type> {
+    return MOZ_UNLIKELY(isErr()) ? f(unwrapErr()) : unwrap();
+  }
+
+  template <typename F, typename = std::enable_if_t<detail::IsResult<
+                            std::invoke_result_t<F, V&&>>::value>>
+  constexpr auto andThen(F f) -> std::invoke_result_t<F, V&&> {
+    return MOZ_LIKELY(isOk()) ? f(unwrap()) : propagateErr();
+  }
+
+  bool operator==(const Result<V, E>& aOther) const {
+    return (isOk() && aOther.isOk() && inspect() == aOther.inspect()) ||
+           (isErr() && aOther.isErr() && inspectErr() == aOther.inspectErr());
+  }
+
+  bool operator!=(const Result<V, E>& aOther) const {
+    return !(*this == aOther);
+  }
+};
+
+template <typename E>
+class [[nodiscard]] GenericErrorResult {
+  E mErrorValue;
+
+  template <typename V, typename E2>
+  friend class Result;
+
+ public:
+  explicit constexpr GenericErrorResult(const E& aErrorValue)
+      : mErrorValue(aErrorValue) {}
+
+  explicit constexpr GenericErrorResult(E&& aErrorValue)
+      : mErrorValue(std::move(aErrorValue)) {}
+
+  constexpr GenericErrorResult(const E& aErrorValue, const ErrorPropagationTag&)
+      : GenericErrorResult(aErrorValue) {}
+
+  constexpr GenericErrorResult(E&& aErrorValue, const ErrorPropagationTag&)
+      : GenericErrorResult(std::move(aErrorValue)) {}
+};
+
+template <typename E>
+inline constexpr auto Err(E&& aErrorValue) {
+  return GenericErrorResult<std::decay_t<E>>(std::forward<E>(aErrorValue));
+}
+
+}  
+
+#endif  // mozilla_Result_h

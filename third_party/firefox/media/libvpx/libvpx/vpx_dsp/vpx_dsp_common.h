@@ -1,0 +1,85 @@
+/*
+ *  Copyright (c) 2015 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+#if !defined(VPX_VPX_DSP_VPX_DSP_COMMON_H_)
+#define VPX_VPX_DSP_VPX_DSP_COMMON_H_
+
+#include <limits.h>
+
+#include "./vpx_config.h"
+#include "vpx/vpx_integer.h"
+#include "vpx_ports/mem.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#define VPXMIN(x, y) (((x) < (y)) ? (x) : (y))
+#define VPXMAX(x, y) (((x) > (y)) ? (x) : (y))
+
+#define VPX_SWAP(type, a, b) \
+  do {                       \
+    type c = (b);            \
+    (b) = a;                 \
+    (a) = c;                 \
+  } while (0)
+
+#if CONFIG_VP9_HIGHBITDEPTH
+typedef int64_t tran_high_t;
+typedef int32_t tran_low_t;
+#else
+typedef int32_t tran_high_t;
+typedef int16_t tran_low_t;
+#endif
+
+typedef int16_t tran_coef_t;
+
+#if defined(_MSC_VER) && _MSC_VER < 1937 && defined(_M_ARM64) && \
+    !defined(__clang__)
+static INLINE int clip_pixel(int val) {
+  return (val > 255) ? 255 : (val < 0) ? 0 : val;
+}
+#else
+static INLINE uint8_t clip_pixel(int val) {
+  return (val > 255) ? 255 : (val < 0) ? 0 : val;
+}
+#endif
+
+static INLINE int clamp(int value, int low, int high) {
+  return value < low ? low : (value > high ? high : value);
+}
+
+static INLINE double fclamp(double value, double low, double high) {
+  return value < low ? low : (value > high ? high : value);
+}
+
+static INLINE int64_t lclamp(int64_t value, int64_t low, int64_t high) {
+  return value < low ? low : (value > high ? high : value);
+}
+
+static INLINE uint16_t clip_pixel_highbd(int val, int bd) {
+  switch (bd) {
+    case 8:
+    default: return (uint16_t)clamp(val, 0, 255);
+    case 10: return (uint16_t)clamp(val, 0, 1023);
+    case 12: return (uint16_t)clamp(val, 0, 4095);
+  }
+}
+
+static INLINE int saturate_cast_double_to_int(double d) {
+  if (d > INT_MAX) return INT_MAX;
+  return (int)d;
+}
+
+#if defined(__cplusplus)
+}  
+#endif
+
+#endif

@@ -1,0 +1,87 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+* Copyright (C) 2014-2016, International Business Machines
+* Corporation and others.  All Rights Reserved.
+******************************************************************************
+* quantityformatter.h
+*/
+
+#ifndef __QUANTITY_FORMATTER_H__
+#define __QUANTITY_FORMATTER_H__
+
+#include "unicode/utypes.h"
+#include "unicode/uobject.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "standardplural.h"
+
+U_NAMESPACE_BEGIN
+
+class SimpleFormatter;
+class UnicodeString;
+class PluralRules;
+class NumberFormat;
+class Formattable;
+class FieldPosition;
+class FormattedStringBuilder;
+
+class U_I18N_API QuantityFormatter : public UMemory {
+public:
+    QuantityFormatter();
+
+    QuantityFormatter(const QuantityFormatter& other);
+
+    QuantityFormatter &operator=(const QuantityFormatter& other);
+
+    ~QuantityFormatter();
+
+    void reset();
+
+    UBool addIfAbsent(const char *variant, const UnicodeString &rawPattern, UErrorCode &status);
+
+    UBool isValid() const;
+
+    const SimpleFormatter *getByVariant(const char *variant) const;
+
+    UnicodeString &format(
+            const Formattable &number,
+            const NumberFormat &fmt,
+            const PluralRules &rules,
+            UnicodeString &appendTo,
+            FieldPosition &pos,
+            UErrorCode &status) const;
+
+    static StandardPlural::Form selectPlural(
+            const Formattable &number,
+            const NumberFormat &fmt,
+            const PluralRules &rules,
+            UnicodeString &formattedNumber,
+            FieldPosition &pos,
+            UErrorCode &status);
+
+    static void formatAndSelect(
+            double quantity,
+            const NumberFormat& fmt,
+            const PluralRules& rules,
+            FormattedStringBuilder& output,
+            StandardPlural::Form& pluralForm,
+            UErrorCode& status);
+
+    static UnicodeString &format(
+            const SimpleFormatter &pattern,
+            const UnicodeString &value,
+            UnicodeString &appendTo,
+            FieldPosition &pos,
+            UErrorCode &status);
+
+private:
+    SimpleFormatter *formatters[StandardPlural::COUNT];
+};
+
+U_NAMESPACE_END
+
+#endif
+
+#endif

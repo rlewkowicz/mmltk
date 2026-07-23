@@ -1,0 +1,441 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsTransitionManager.h"
+
+#include "AnimatedPropertyIDSet.h"
+#include "CSSPropertyId.h"
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/EffectSet.h"
+#include "mozilla/ElementAnimationData.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/RestyleManager.h"
+#include "mozilla/ServoBindings.h"
+#include "mozilla/StyleAnimationValue.h"
+#include "mozilla/dom/CSSTransition.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentTimeline.h"
+#include "mozilla/dom/Element.h"
+#include "nsAnimationManager.h"
+#include "nsCSSPropertyIDSet.h"
+#include "nsCSSProps.h"
+#include "nsDisplayList.h"
+#include "nsIContent.h"
+#include "nsIFrame.h"
+#include "nsRFPService.h"
+#include "nsStyleChangeList.h"
+
+using mozilla::dom::CSSTransition;
+using mozilla::dom::DocumentTimeline;
+using mozilla::dom::KeyframeEffect;
+
+using namespace mozilla;
+using namespace mozilla::css;
+
+bool nsTransitionManager::UpdateTransitions(
+    dom::Element* aElement, const PseudoStyleRequest& aPseudoRequest,
+    const ComputedStyle& aOldStyle, const ComputedStyle& aNewStyle) {
+  if (mPresContext->Medium() == nsGkAtoms::print) {
+    return false;
+  }
+
+  MOZ_ASSERT(mPresContext->IsDynamic());
+  if (aNewStyle.StyleDisplay()->mDisplay == StyleDisplay::None) {
+    StopAnimationsForElement(aElement, aPseudoRequest);
+    return false;
+  }
+
+  auto* collection = CSSTransitionCollection::Get(aElement, aPseudoRequest);
+  return DoUpdateTransitions(*aNewStyle.StyleUIReset(), aElement,
+                             aPseudoRequest, collection, aOldStyle, aNewStyle);
+}
+
+template <typename T>
+static void ExpandTransitionProperty(const StyleTransitionProperty& aProperty,
+                                     T aHandler) {
+  switch (aProperty.tag) {
+    case StyleTransitionProperty::Tag::Unsupported:
+      break;
+    case StyleTransitionProperty::Tag::Custom: {
+      auto property =
+          CSSPropertyId::FromCustomName(aProperty.AsCustom().AsAtom());
+      aHandler(property);
+      break;
+    }
+    case StyleTransitionProperty::Tag::NonCustom: {
+      NonCustomCSSPropertyId id =
+          NonCustomCSSPropertyId(aProperty.AsNonCustom()._0);
+      if (nsCSSProps::IsShorthand(id)) {
+        CSSPROPS_FOR_SHORTHAND_SUBPROPERTIES(subprop, id,
+                                             CSSEnabledState::ForAllContent) {
+          CSSPropertyId property(*subprop);
+          aHandler(property);
+        }
+      } else {
+        CSSPropertyId property(id);
+        aHandler(property);
+      }
+      break;
+    }
+  }
+}
+
+bool nsTransitionManager::DoUpdateTransitions(
+    const nsStyleUIReset& aStyle, dom::Element* aElement,
+    const PseudoStyleRequest& aPseudoRequest,
+    CSSTransitionCollection*& aElementTransitions,
+    const ComputedStyle& aOldStyle, const ComputedStyle& aNewStyle) {
+  MOZ_ASSERT(!aElementTransitions || &aElementTransitions->mElement == aElement,
+             "Element mismatch");
+
+  bool startedAny = false;
+  AnimatedPropertyIDSet propertiesChecked;
+  for (uint32_t i = aStyle.mTransitionPropertyCount; i--;) {
+    const float delay = aStyle.GetTransitionDelay(i).ToMilliseconds();
+
+    const float duration =
+        std::max(aStyle.GetTransitionDuration(i).ToMilliseconds(), 0.0f);
+
+    if (i == 0 && delay + duration <= 0.0f) {
+      continue;
+    }
+
+    const auto behavior = aStyle.GetTransitionBehavior(i);
+    ExpandTransitionProperty(
+        aStyle.GetTransitionProperty(i), [&](const CSSPropertyId& aProperty) {
+          startedAny |= ConsiderInitiatingTransition(
+              aProperty, aStyle, i, delay, duration, behavior, aElement,
+              aPseudoRequest, aElementTransitions, aOldStyle, aNewStyle,
+              propertiesChecked);
+        });
+  }
+
+  if (aElementTransitions) {
+    const bool checkProperties = !aStyle.GetTransitionProperty(0).IsAll();
+    AnimatedPropertyIDSet allTransitionProperties;
+    if (checkProperties) {
+      for (uint32_t i = aStyle.mTransitionPropertyCount; i-- != 0;) {
+        ExpandTransitionProperty(aStyle.GetTransitionProperty(i),
+                                 [&](const CSSPropertyId& aProperty) {
+                                   allTransitionProperties.AddProperty(
+                                       aProperty.ToPhysical(aNewStyle));
+                                 });
+      }
+    }
+
+    OwningCSSTransitionPtrArray& animations = aElementTransitions->mAnimations;
+    size_t i = animations.Length();
+    MOZ_ASSERT(i != 0, "empty transitions list?");
+    AnimationValue currentValue;
+    do {
+      --i;
+      CSSTransition* anim = animations[i];
+      const CSSPropertyId& property = anim->TransitionProperty();
+      if (
+          (checkProperties && !allTransitionProperties.HasProperty(property)) ||
+          !Servo_ComputedValues_TransitionValueMatches(
+              &aNewStyle, &property, anim->ToValue().mServo.get())) {
+        DoCancelTransition(aElement, aPseudoRequest, aElementTransitions, i);
+      }
+    } while (i != 0);
+  }
+
+  return startedAny;
+}
+
+static Keyframe& AppendKeyframe(double aOffset, const CSSPropertyId& aProperty,
+                                AnimationValue&& aValue,
+                                nsTArray<Keyframe>& aKeyframes) {
+  Keyframe& frame = *aKeyframes.AppendElement();
+  frame.mOffset.emplace(Keyframe::OffsetType::PercentageOffset(aOffset));
+  MOZ_ASSERT(aValue.mServo);
+  RefPtr<StyleLockedDeclarationBlock> decl =
+      Servo_AnimationValue_Uncompute(aValue.mServo).Consume();
+  frame.mPropertyValues.AppendElement(
+      PropertyValuePair(aProperty, std::move(decl)));
+  return frame;
+}
+
+static nsTArray<Keyframe> GetTransitionKeyframes(const CSSPropertyId& aProperty,
+                                                 AnimationValue&& aStartValue,
+                                                 AnimationValue&& aEndValue) {
+  nsTArray<Keyframe> keyframes(2);
+
+  AppendKeyframe(0.0, aProperty, std::move(aStartValue), keyframes);
+  AppendKeyframe(1.0, aProperty, std::move(aEndValue), keyframes);
+
+  return keyframes;
+}
+
+using ReplacedTransitionProperties =
+    CSSTransition::ReplacedTransitionProperties;
+static Maybe<ReplacedTransitionProperties> GetReplacedTransitionProperties(
+    const CSSTransition& aTransition,
+    const DocumentTimeline* aTimelineToMatch) {
+  Maybe<ReplacedTransitionProperties> result;
+
+  if (!aTransition.HasCurrentEffect()) {
+    return result;
+  }
+
+  if (aTransition.GetTimeline() != aTimelineToMatch) {
+    return result;
+  }
+
+  auto startTime = aTransition.GetStartTime();
+  if (startTime.IsNull() && !aTransition.GetPendingReadyTime().IsNull()) {
+    startTime =
+        aTimelineToMatch->ToTimelineTime(aTransition.GetPendingReadyTime());
+  }
+
+  if (startTime.IsNull()) {
+    return result;
+  }
+
+  const KeyframeEffect* keyframeEffect =
+      aTransition.GetEffect() ? aTransition.GetEffect()->AsKeyframeEffect()
+                              : nullptr;
+  if (!keyframeEffect) {
+    return result;
+  }
+
+  if (keyframeEffect->Properties().Length() != 1 ||
+      keyframeEffect->Properties()[0].mSegments.Length() != 1 ||
+      keyframeEffect->Properties()[0].mProperty !=
+          aTransition.TransitionProperty()) {
+    return result;
+  }
+
+  const AnimationPropertySegment& segment =
+      keyframeEffect->Properties()[0].mSegments[0];
+
+  result.emplace(ReplacedTransitionProperties(
+      {startTime.Value(), aTransition.PlaybackRateInternal(),
+       keyframeEffect->SpecifiedTiming(), segment.mTimingFunction,
+       segment.mFromValue, segment.mToValue}));
+
+  return result;
+}
+
+bool nsTransitionManager::ConsiderInitiatingTransition(
+    const CSSPropertyId& aProperty, const nsStyleUIReset& aStyle,
+    uint32_t aTransitionIndex, float aDelay, float aDuration,
+    mozilla::StyleTransitionBehavior aBehavior, dom::Element* aElement,
+    const PseudoStyleRequest& aPseudoRequest,
+    CSSTransitionCollection*& aElementTransitions,
+    const ComputedStyle& aOldStyle, const ComputedStyle& aNewStyle,
+    AnimatedPropertyIDSet& aPropertiesChecked) {
+  MOZ_ASSERT(aProperty.IsCustom() || !nsCSSProps::IsShorthand(aProperty.mId),
+             "property out of range");
+  NS_ASSERTION(
+      !aElementTransitions || &aElementTransitions->mElement == aElement,
+      "Element mismatch");
+
+  CSSPropertyId property = aProperty.ToPhysical(aNewStyle);
+
+  if (aPropertiesChecked.HasProperty(property)) {
+    return false;
+  }
+
+  aPropertiesChecked.AddProperty(property);
+
+  if (aDuration + aDelay <= 0.0f) {
+    return false;
+  }
+
+  size_t currentIndex = nsTArray<KeyframeEffect>::NoIndex;
+  const auto* oldTransition = [&]() -> const CSSTransition* {
+    if (!aElementTransitions) {
+      return nullptr;
+    }
+    const OwningCSSTransitionPtrArray& animations =
+        aElementTransitions->mAnimations;
+    for (size_t i = 0, i_end = animations.Length(); i < i_end; ++i) {
+      if (animations[i]->TransitionProperty() == property) {
+        currentIndex = i;
+        return animations[i];
+      }
+    }
+    return nullptr;
+  }();
+
+  Maybe<ReplacedTransitionProperties> replacedTransitionProperties;
+  Maybe<double> progress;
+  if (oldTransition) {
+    const dom::DocumentTimeline* timeline = aElement->OwnerDoc()->Timeline();
+    replacedTransitionProperties =
+        GetReplacedTransitionProperties(*oldTransition, timeline);
+    progress = replacedTransitionProperties.andThen(
+        [&](const ReplacedTransitionProperties& aProperties) {
+          const dom::AnimationTimeline* timeline = oldTransition->GetTimeline();
+          MOZ_ASSERT(timeline);
+          return CSSTransition::ComputeTransformedProgress(*timeline,
+                                                           aProperties);
+        });
+  }
+
+  AnimationValue startValue, endValue;
+  const StyleShouldTransitionResult result =
+      Servo_ComputedValues_ShouldTransition(
+          &aOldStyle, &aNewStyle, &property, aBehavior,
+          oldTransition ? oldTransition->ToValue().mServo.get() : nullptr,
+          replacedTransitionProperties
+              ? replacedTransitionProperties->mFromValue.mServo.get()
+              : nullptr,
+          replacedTransitionProperties
+              ? replacedTransitionProperties->mToValue.mServo.get()
+              : nullptr,
+          progress.ptrOr(nullptr), &startValue.mServo, &endValue.mServo);
+
+  if (result.old_transition_value_matches) {
+    return false;
+  }
+
+  if (!result.should_animate) {
+    if (oldTransition) {
+      DoCancelTransition(aElement, aPseudoRequest, aElementTransitions,
+                         currentIndex);
+    }
+    return false;
+  }
+
+  AnimationValue startForReversingTest = startValue;
+  double reversePortion = 1.0;
+
+  if (oldTransition && oldTransition->HasCurrentEffect() &&
+      oldTransition->StartForReversingTest() == endValue) {
+    double valuePortion =
+        oldTransition->CurrentValuePortion() * oldTransition->ReversePortion() +
+        (1.0 - oldTransition->ReversePortion());
+    if (valuePortion < 0.0) {
+      valuePortion = -valuePortion;
+    }
+    if (valuePortion > 1.0) {
+      valuePortion = 1.0;
+    }
+
+    if (aDelay < 0.0f && std::isfinite(aDelay)) {
+      aDelay *= valuePortion;
+    }
+
+    if (std::isfinite(aDuration)) {
+      aDuration *= valuePortion;
+    }
+
+    startForReversingTest = oldTransition->ToValue();
+    reversePortion = valuePortion;
+  }
+
+  TimingParams timing = TimingParamsFromCSSParams(
+      Some(aDuration), aDelay, 1.0 ,
+      StyleAnimationDirection::Normal, StyleAnimationFillMode::Backwards);
+
+  const StyleComputedTimingFunction& tf =
+      aStyle.GetTransitionTimingFunction(aTransitionIndex);
+  if (!tf.IsLinearKeyword()) {
+    timing.SetTimingFunction(Some(tf));
+  }
+
+  RefPtr<CSSTransition> transition = DoCreateTransition(
+      property, aElement, aPseudoRequest, aNewStyle, aElementTransitions,
+      std::move(timing), std::move(startValue), std::move(endValue),
+      std::move(startForReversingTest), reversePortion);
+  if (!transition) {
+    return false;
+  }
+
+  OwningCSSTransitionPtrArray& transitions = aElementTransitions->mAnimations;
+#ifdef DEBUG
+  for (size_t i = 0, i_end = transitions.Length(); i < i_end; ++i) {
+    MOZ_ASSERT(
+        i == currentIndex || transitions[i]->TransitionProperty() != property,
+        "duplicate transitions for property");
+  }
+#endif
+  if (oldTransition) {
+    if (replacedTransitionProperties) {
+      transition->SetReplacedTransition(
+          std::move(replacedTransitionProperties.ref()));
+    }
+
+    transitions[currentIndex]->CancelFromStyle(PostRestyleMode::IfNeeded);
+    oldTransition = nullptr;  
+    transitions[currentIndex] = transition;
+  } else {
+    transitions.AppendElement(transition);
+  }
+
+  if (auto* effectSet = EffectSet::Get(aElement, aPseudoRequest)) {
+    effectSet->UpdateAnimationGeneration(mPresContext);
+  }
+
+  return true;
+}
+
+already_AddRefed<CSSTransition> nsTransitionManager::DoCreateTransition(
+    const CSSPropertyId& aProperty, dom::Element* aElement,
+    const PseudoStyleRequest& aPseudoRequest,
+    const mozilla::ComputedStyle& aNewStyle,
+    CSSTransitionCollection*& aElementTransitions, TimingParams&& aTiming,
+    AnimationValue&& aStartValue, AnimationValue&& aEndValue,
+    AnimationValue&& aStartForReversingTest, double aReversePortion) {
+  dom::DocumentTimeline* timeline = aElement->OwnerDoc()->Timeline();
+  KeyframeEffectParams effectOptions;
+  auto keyframeEffect = MakeRefPtr<KeyframeEffect>(
+      aElement->OwnerDoc(), OwningAnimationTarget(aElement, aPseudoRequest),
+      std::move(aTiming), effectOptions);
+
+  keyframeEffect->SetKeyframes(
+      GetTransitionKeyframes(aProperty, std::move(aStartValue),
+                             std::move(aEndValue)),
+      &aNewStyle, timeline, nullptr );
+
+  if (NS_WARN_IF(MOZ_UNLIKELY(!keyframeEffect->IsValidTransition()))) {
+    return nullptr;
+  }
+
+  auto animation = MakeRefPtr<CSSTransition>(
+      mPresContext->Document()->GetScopeObject(), aProperty);
+  animation->SetOwningElement(OwningElementRef(*aElement, aPseudoRequest));
+  animation->SetTimelineNoUpdate(timeline, nullptr,
+                                 mozilla::dom::Animation::FromJS::No);
+  animation->SetCreationSequence(
+      mPresContext->RestyleManager()->GetAnimationGeneration());
+  animation->SetEffectFromStyle(keyframeEffect);
+  animation->SetReverseParameters(std::move(aStartForReversingTest),
+                                  aReversePortion);
+  animation->PlayFromStyle();
+
+  if (!aElementTransitions) {
+    aElementTransitions =
+        &aElement->EnsureAnimationData().EnsureTransitionCollection(
+            *aElement, aPseudoRequest);
+    if (!aElementTransitions->isInList()) {
+      AddElementCollection(aElementTransitions);
+    }
+  }
+  return animation.forget();
+}
+
+void nsTransitionManager::DoCancelTransition(
+    dom::Element* aElement, const PseudoStyleRequest& aPseudoRequest,
+    CSSTransitionCollection*& aElementTransitions, size_t aIndex) {
+  MOZ_ASSERT(aElementTransitions);
+  OwningCSSTransitionPtrArray& transitions = aElementTransitions->mAnimations;
+  CSSTransition* transition = transitions[aIndex];
+
+  if (transition->HasCurrentEffect()) {
+    if (auto* effectSet = EffectSet::Get(aElement, aPseudoRequest)) {
+      effectSet->UpdateAnimationGeneration(mPresContext);
+    }
+  }
+  transition->CancelFromStyle(PostRestyleMode::IfNeeded);
+  transitions.RemoveElementAt(aIndex);
+
+  if (transitions.IsEmpty()) {
+    aElementTransitions->Destroy();
+    aElementTransitions = nullptr;
+  }
+}

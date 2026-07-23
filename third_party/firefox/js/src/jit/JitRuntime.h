@@ -1,0 +1,454 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_JitRuntime_h
+#define jit_JitRuntime_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/EnumeratedArray.h"
+#include "mozilla/LinkedList.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "jstypes.h"
+
+#include "jit/ABIFunctions.h"
+#include "jit/BaselineICList.h"
+#include "jit/BaselineJIT.h"
+#include "jit/CalleeToken.h"
+#include "jit/IonCompileTask.h"
+#include "jit/IonTypes.h"
+#include "jit/JitCode.h"
+#include "jit/JitHints.h"
+#include "jit/shared/Assembler-shared.h"
+#include "jit/TrampolineNatives.h"
+#include "js/AllocPolicy.h"
+#include "js/ProfilingFrameIterator.h"
+#include "js/TypeDecls.h"
+#include "js/UniquePtr.h"
+#include "js/Vector.h"
+#include "threading/ProtectedData.h"
+#include "vm/GeckoProfiler.h"
+#include "vm/Runtime.h"
+
+class JS_PUBLIC_API JSTracer;
+
+namespace js {
+
+class AutoLockHelperThreadState;
+class GCMarker;
+enum class ArraySortKind;
+
+namespace jit {
+
+class FrameSizeClass;
+class Label;
+class MacroAssembler;
+struct VMFunctionData;
+
+enum class VMFunctionId;
+
+enum class BaselineICFallbackKind : uint8_t {
+#define DEF_ENUM_KIND(kind) kind,
+  IC_BASELINE_FALLBACK_CODE_KIND_LIST(DEF_ENUM_KIND)
+#undef DEF_ENUM_KIND
+      Count
+};
+
+enum class BailoutReturnKind {
+  GetProp,
+  GetPropSuper,
+  SetProp,
+  GetElem,
+  GetElemSuper,
+  Call,
+  New,
+  Count
+};
+
+class BaselineICFallbackCode {
+  JitCode* code_ = nullptr;
+  using OffsetArray =
+      mozilla::EnumeratedArray<BaselineICFallbackKind, uint32_t,
+                               size_t(BaselineICFallbackKind::Count)>;
+  OffsetArray offsets_ = {};
+
+  using BailoutReturnArray =
+      mozilla::EnumeratedArray<BailoutReturnKind, uint32_t,
+                               size_t(BailoutReturnKind::Count)>;
+  BailoutReturnArray bailoutReturnOffsets_ = {};
+
+ public:
+  BaselineICFallbackCode() = default;
+  BaselineICFallbackCode(const BaselineICFallbackCode&) = delete;
+  void operator=(const BaselineICFallbackCode&) = delete;
+
+  void initOffset(BaselineICFallbackKind kind, uint32_t offset) {
+    offsets_[kind] = offset;
+  }
+  void initCode(JitCode* code) { code_ = code; }
+  void initBailoutReturnOffset(BailoutReturnKind kind, uint32_t offset) {
+    bailoutReturnOffsets_[kind] = offset;
+  }
+  TrampolinePtr addr(BaselineICFallbackKind kind) const {
+    return TrampolinePtr(code_->raw() + offsets_[kind]);
+  }
+  uint8_t* bailoutReturnAddr(BailoutReturnKind kind) const {
+    return code_->raw() + bailoutReturnOffsets_[kind];
+  }
+};
+
+enum class DebugTrapHandlerKind { Interpreter, Compiler, Count };
+
+enum class IonGenericCallKind { Call, Construct, Count };
+
+using EnterJitCode = void (*)(void*, unsigned int, Value*, InterpreterFrame*,
+                              CalleeToken, JSObject*, size_t, Value*);
+
+class JitcodeGlobalTable;
+class PerfSpewerRangeRecorder;
+
+class JitRuntime {
+ private:
+  MainThreadData<uint64_t> nextCompilationId_{0};
+
+  MainThreadData<js::UniquePtr<uint8_t>> ionOsrTempData_{nullptr};
+  MainThreadData<uint32_t> ionOsrTempDataSize_{0};
+
+  MainThreadData<IonFreeCompileTasks> ionFreeTaskBatch_;
+
+  WriteOnceData<uint32_t> exceptionTailOffset_{0};
+  WriteOnceData<uint32_t> exceptionTailReturnValueCheckOffset_{0};
+
+  WriteOnceData<uint32_t> profilerExitFrameTailOffset_{0};
+
+  WriteOnceData<uint32_t> enterJITOffset_{0};
+
+  WriteOnceData<uint32_t> bailoutHandlerOffset_{0};
+
+  WriteOnceData<uint32_t> invalidatorOffset_{0};
+
+  WriteOnceData<uint32_t> valuePreBarrierOffset_{0};
+  WriteOnceData<uint32_t> stringPreBarrierOffset_{0};
+  WriteOnceData<uint32_t> objectPreBarrierOffset_{0};
+  WriteOnceData<uint32_t> shapePreBarrierOffset_{0};
+  WriteOnceData<uint32_t> wasmAnyRefPreBarrierOffset_{0};
+
+  WriteOnceData<uint32_t> lazyLinkStubOffset_{0};
+
+  WriteOnceData<uint32_t> interpreterStubOffset_{0};
+
+  WriteOnceData<uint32_t> doubleToInt32ValueStubOffset_{0};
+
+  mozilla::EnumeratedArray<IonGenericCallKind, WriteOnceData<uint32_t>,
+                           size_t(IonGenericCallKind::Count)>
+      ionGenericCallStubOffset_;
+
+  WriteOnceData<uint32_t> megamorphicLoadStubOffset_{0};
+  WriteOnceData<uint32_t> megamorphicLoadStubPermissiveOffset_{0};
+
+  mozilla::EnumeratedArray<DebugTrapHandlerKind, WriteOnceData<JitCode*>,
+                           size_t(DebugTrapHandlerKind::Count)>
+      debugTrapHandlers_;
+
+  BaselineInterpreter baselineInterpreter_;
+
+  WriteOnceData<JitCode*> trampolineCode_{nullptr};
+
+  WriteOnceData<uint32_t> vmInterpreterEntryOffset_{0};
+
+  using VMWrapperOffsets = Vector<uint32_t, 0, SystemAllocPolicy>;
+  VMWrapperOffsets functionWrapperOffsets_;
+
+  MainThreadData<BaselineICFallbackCode> baselineICFallbackCode_;
+
+  UnprotectedData<JitcodeGlobalTable*> jitcodeGlobalTable_{nullptr};
+
+  MainThreadData<JitHintsMap*> jitHintsMap_{nullptr};
+
+#ifdef DEBUG
+  MainThreadData<uint32_t> ionBailAfterCounter_{0};
+
+  MainThreadData<bool> ionBailAfterEnabled_{false};
+#endif
+
+  using NumFinishedOffThreadTasksType =
+      mozilla::Atomic<size_t, mozilla::SequentiallyConsistent>;
+  NumFinishedOffThreadTasksType numFinishedOffThreadTasks_{0};
+
+  using IonCompileTaskList = mozilla::LinkedList<js::jit::IonCompileTask>;
+  MainThreadData<IonCompileTaskList> ionLazyLinkList_;
+  MainThreadData<size_t> ionLazyLinkListSize_{0};
+
+  using TrampolineNativeJitEntryArray =
+      mozilla::EnumeratedArray<TrampolineNative, void*,
+                               size_t(TrampolineNative::Count)>;
+  TrampolineNativeJitEntryArray trampolineNativeJitEntries_{};
+
+#ifdef DEBUG
+  MainThreadData<uint32_t> disallowArbitraryCode_{false};
+#endif
+
+  bool generateTrampolines(JSContext* cx);
+  bool generateBaselineICFallbackCode(JSContext* cx);
+
+  void generateLazyLinkStub(MacroAssembler& masm);
+  void generateInterpreterStub(MacroAssembler& masm);
+  void generateDoubleToInt32ValueStub(MacroAssembler& masm);
+  void generateProfilerExitFrameTailStub(MacroAssembler& masm,
+                                         Label* profilerExitTail);
+  void generateExceptionTailStub(MacroAssembler& masm, Label* profilerExitTail,
+                                 Label* bailoutTail);
+  void generateBailoutTailStub(MacroAssembler& masm, Label* bailoutTail);
+  void generateEnterJIT(JSContext* cx, MacroAssembler& masm);
+  void generateEnterJitShared(MacroAssembler& masm, Register argcReg,
+                              Register argvReg, Register calleeTokenReg,
+                              Register scratch, Register scratch2,
+                              Register scratch3);
+  void generateBailoutHandler(MacroAssembler& masm, Label* bailoutTail);
+  void generateInvalidator(MacroAssembler& masm, Label* bailoutTail);
+  uint32_t generatePreBarrier(JSContext* cx, MacroAssembler& masm,
+                              MIRType type);
+  void generateIonGenericCallStub(MacroAssembler& masm,
+                                  IonGenericCallKind kind);
+
+  void generateIonGenericCallBoundFunction(MacroAssembler& masm, Label* entry,
+                                           Label* vmCall);
+  void generateIonGenericCallNativeFunction(MacroAssembler& masm,
+                                            bool isConstructing);
+  void generateIonGenericCallFunCall(MacroAssembler& masm, Label* entry,
+                                     Label* vmCall);
+  void generateIonGenericCallArgumentsShift(MacroAssembler& masm, Register argc,
+                                            Register curr, Register end,
+                                            Register scratch, Label* done);
+  void generateIonGenericHandleUnderflow(MacroAssembler& masm,
+                                         bool isConstructing, Label* vmCall);
+  void generateMegamorphicLoadStub(MacroAssembler& masm);
+  void generateMegamorphicLoadStubPermissive(MacroAssembler& masm);
+
+  JitCode* generateDebugTrapHandler(JSContext* cx, DebugTrapHandlerKind kind);
+
+  bool generateVMWrapper(JSContext* cx, MacroAssembler& masm, VMFunctionId id,
+                         const VMFunctionData& f, DynFn nativeFun,
+                         uint32_t* wrapperOffset);
+
+  bool generateVMWrappers(JSContext* cx, MacroAssembler& masm,
+                          PerfSpewerRangeRecorder& rangeRecorder);
+
+  uint32_t startTrampolineCode(MacroAssembler& masm);
+
+  TrampolinePtr trampolineCode(uint32_t offset) const {
+    MOZ_ASSERT(offset > 0);
+    MOZ_ASSERT(offset < trampolineCode_->instructionsSize());
+    return TrampolinePtr(trampolineCode_->raw() + offset);
+  }
+
+  void generateBaselineInterpreterEntryTrampoline(MacroAssembler& masm);
+  void generateInterpreterEntryTrampoline(MacroAssembler& masm);
+
+  using TrampolineNativeJitEntryOffsets =
+      mozilla::EnumeratedArray<TrampolineNative, uint32_t,
+                               size_t(TrampolineNative::Count)>;
+  void generateTrampolineNatives(MacroAssembler& masm,
+                                 TrampolineNativeJitEntryOffsets& offsets,
+                                 PerfSpewerRangeRecorder& rangeRecorder);
+  uint32_t generateArraySortTrampoline(MacroAssembler& masm,
+                                       ArraySortKind kind);
+
+  void bindLabelToOffset(Label* label, uint32_t offset) {
+    MOZ_ASSERT(!trampolineCode_);
+    label->bind(offset);
+  }
+
+ public:
+  static constexpr size_t MegamorphicLoadStubCacheHit = 1;
+  static constexpr size_t MegamorphicLoadStubCacheHitGetter = 2;
+
+  JitCode* generateEntryTrampolineForScript(JSContext* cx, JSScript* script);
+
+  JitRuntime() = default;
+  ~JitRuntime();
+  [[nodiscard]] bool initialize(JSContext* cx);
+
+  static void TraceAtomZoneRoots(JSTracer* trc);
+  static void TraceWeakJitcodeGlobalTable(JSRuntime* rt, JSTracer* trc);
+
+  const BaselineICFallbackCode& baselineICFallbackCode() const {
+    return baselineICFallbackCode_.ref();
+  }
+
+  IonCompilationId nextCompilationId() {
+    return IonCompilationId(nextCompilationId_++);
+  }
+
+  [[nodiscard]] bool addIonCompileToFreeTaskBatch(IonCompileTask* task) {
+    return ionFreeTaskBatch_.ref().append(task);
+  }
+  void maybeStartIonFreeTask(bool force);
+
+  UniquePtr<LifoAlloc> tryReuseIonLifoAlloc();
+
+#ifdef DEBUG
+  bool disallowArbitraryCode() const { return disallowArbitraryCode_; }
+  void clearDisallowArbitraryCode() { disallowArbitraryCode_ = false; }
+  const void* addressOfDisallowArbitraryCode() const {
+    return &disallowArbitraryCode_.refNoCheck();
+  }
+  static size_t offsetOfDisallowArbitraryCode() {
+    return offsetof(JitRuntime, disallowArbitraryCode_);
+  }
+#endif
+
+  uint8_t* allocateIonOsrTempData(size_t size);
+  void freeIonOsrTempData();
+
+  TrampolinePtr getVMWrapper(VMFunctionId funId) const {
+    MOZ_ASSERT(trampolineCode_);
+    return trampolineCode(functionWrapperOffsets_[size_t(funId)]);
+  }
+
+  bool ensureDebugTrapHandler(JSContext* cx, DebugTrapHandlerKind kind);
+  JitCode* debugTrapHandler(DebugTrapHandlerKind kind) const {
+    MOZ_ASSERT(debugTrapHandlers_[kind]);
+    return debugTrapHandlers_[kind];
+  }
+
+  BaselineInterpreter& baselineInterpreter() { return baselineInterpreter_; }
+  const BaselineInterpreter& baselineInterpreter() const {
+    return baselineInterpreter_;
+  }
+
+  TrampolinePtr getGenericBailoutHandler() const {
+    return trampolineCode(bailoutHandlerOffset_);
+  }
+
+  TrampolinePtr getExceptionTail() const {
+    return trampolineCode(exceptionTailOffset_);
+  }
+  TrampolinePtr getExceptionTailReturnValueCheck() const {
+    return trampolineCode(exceptionTailReturnValueCheckOffset_);
+  }
+
+  TrampolinePtr getProfilerExitFrameTail() const {
+    return trampolineCode(profilerExitFrameTailOffset_);
+  }
+
+  uint32_t vmInterpreterEntryOffset() { return vmInterpreterEntryOffset_; }
+
+  TrampolinePtr getInvalidationThunk() const {
+    return trampolineCode(invalidatorOffset_);
+  }
+
+  EnterJitCode enterJit() const {
+    return JS_DATA_TO_FUNC_PTR(EnterJitCode,
+                               trampolineCode(enterJITOffset_).value);
+  }
+
+  static mozilla::Maybe<::JS::ProfilingFrameIterator::RegisterState>
+  getCppEntryRegisters(JitFrameLayout* frameStackAddress);
+
+  TrampolinePtr preBarrier(MIRType type) const {
+    switch (type) {
+      case MIRType::Value:
+        return trampolineCode(valuePreBarrierOffset_);
+      case MIRType::String:
+        return trampolineCode(stringPreBarrierOffset_);
+      case MIRType::Object:
+        return trampolineCode(objectPreBarrierOffset_);
+      case MIRType::Shape:
+        return trampolineCode(shapePreBarrierOffset_);
+      case MIRType::WasmAnyRef:
+        return trampolineCode(wasmAnyRefPreBarrierOffset_);
+      default:
+        MOZ_CRASH();
+    }
+  }
+
+  TrampolinePtr lazyLinkStub() const {
+    return trampolineCode(lazyLinkStubOffset_);
+  }
+  TrampolinePtr megamorphicLoadStub() const {
+    return trampolineCode(megamorphicLoadStubOffset_);
+  }
+  TrampolinePtr megamorphicLoadStubPermissive() const {
+    return trampolineCode(megamorphicLoadStubPermissiveOffset_);
+  }
+  TrampolinePtr interpreterStub() const {
+    return trampolineCode(interpreterStubOffset_);
+  }
+
+  TrampolinePtr getDoubleToInt32ValueStub() const {
+    return trampolineCode(doubleToInt32ValueStubOffset_);
+  }
+
+  TrampolinePtr getIonGenericCallStub(IonGenericCallKind kind) const {
+    return trampolineCode(ionGenericCallStubOffset_[kind]);
+  }
+
+  void** trampolineNativeJitEntry(TrampolineNative native) {
+    void** jitEntry = &trampolineNativeJitEntries_[native];
+    MOZ_ASSERT(*jitEntry >= trampolineCode_->raw());
+    MOZ_ASSERT(*jitEntry <
+               trampolineCode_->raw() + trampolineCode_->instructionsSize());
+    return jitEntry;
+  }
+  TrampolineNative trampolineNativeForJitEntry(void** entry) {
+    MOZ_RELEASE_ASSERT(entry >= trampolineNativeJitEntries_.begin());
+    size_t index = entry - trampolineNativeJitEntries_.begin();
+    MOZ_RELEASE_ASSERT(index < size_t(TrampolineNative::Count));
+    return TrampolineNative(index);
+  }
+
+  bool hasJitcodeGlobalTable() const { return jitcodeGlobalTable_ != nullptr; }
+
+  JitcodeGlobalTable* getJitcodeGlobalTable() {
+    MOZ_ASSERT(hasJitcodeGlobalTable());
+    return jitcodeGlobalTable_;
+  }
+
+  bool hasJitHintsMap() const { return jitHintsMap_ != nullptr; }
+
+  JitHintsMap* getJitHintsMap() {
+    MOZ_ASSERT(hasJitHintsMap());
+    return jitHintsMap_;
+  }
+
+  bool isProfilerInstrumentationEnabled(JSRuntime* rt) {
+    return rt->geckoProfiler().enabled();
+  }
+
+  bool isOptimizationTrackingEnabled(JSRuntime* rt) {
+    return isProfilerInstrumentationEnabled(rt);
+  }
+
+#ifdef DEBUG
+  void* addressOfIonBailAfterCounter() { return &ionBailAfterCounter_; }
+
+  void setIonBailAfterCounter(uint32_t after) { ionBailAfterCounter_ = after; }
+  bool ionBailAfterEnabled() const { return ionBailAfterEnabled_; }
+  void setIonBailAfterEnabled(bool enabled) { ionBailAfterEnabled_ = enabled; }
+#endif
+
+  size_t numFinishedOffThreadTasks() const {
+    return numFinishedOffThreadTasks_;
+  }
+  NumFinishedOffThreadTasksType& numFinishedOffThreadTasksRef(
+      const AutoLockHelperThreadState& locked) {
+    return numFinishedOffThreadTasks_;
+  }
+
+  IonCompileTaskList& ionLazyLinkList(JSRuntime* rt);
+
+  size_t ionLazyLinkListSize() const { return ionLazyLinkListSize_; }
+
+  void ionLazyLinkListRemove(JSRuntime* rt, js::jit::IonCompileTask* task);
+  void ionLazyLinkListAdd(JSRuntime* rt, js::jit::IonCompileTask* task);
+};
+
+}  
+}  
+
+#endif /* jit_JitRuntime_h */

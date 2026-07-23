@@ -1,0 +1,66 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef LAYOUT_BASE_NSREFRESHOBSERVERS_H_
+#define LAYOUT_BASE_NSREFRESHOBSERVERS_H_
+
+#include <functional>
+
+#include "mozilla/Attributes.h"
+#include "mozilla/TimeStamp.h"
+#include "nsISupports.h"
+
+class nsPresContext;
+
+namespace mozilla {
+class AnimationEventDispatcher;
+class PendingFullscreenEvent;
+class PresShell;
+class RefreshDriverTimer;
+}  
+
+class nsARefreshObserver {
+ public:
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  MOZ_CAN_RUN_SCRIPT virtual void WillRefresh(mozilla::TimeStamp aTime) = 0;
+
+#ifdef DEBUG
+  int32_t mRegistrationCount = 0;
+
+  virtual ~nsARefreshObserver() {
+    MOZ_ASSERT(mRegistrationCount == 0,
+               "Refresh observer AddRefreshObserver/RemoveRefreshObserver "
+               "calls should have balanced out to zero");
+  }
+#endif  // DEBUG
+};
+
+class nsAPostRefreshObserver {
+ public:
+  virtual void DidRefresh() = 0;
+};
+
+namespace mozilla {
+
+class ManagedPostRefreshObserver : public nsAPostRefreshObserver {
+ public:
+  enum class Unregister : bool { No, Yes };
+  using Action = std::function<Unregister(bool aWasCanceled)>;
+  NS_INLINE_DECL_REFCOUNTING(ManagedPostRefreshObserver)
+  ManagedPostRefreshObserver(nsPresContext*, Action&&);
+  explicit ManagedPostRefreshObserver(nsPresContext*);
+  void DidRefresh() override;
+  void Cancel();
+
+ protected:
+  virtual ~ManagedPostRefreshObserver();
+  RefPtr<nsPresContext> mPresContext;
+  Action mAction;
+};
+
+}  
+
+#endif

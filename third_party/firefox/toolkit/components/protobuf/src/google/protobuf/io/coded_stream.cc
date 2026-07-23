@@ -1,0 +1,913 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+
+#include "google/protobuf/io/coded_stream.h"
+
+#include <limits.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <string>
+#include <utility>
+
+#include "absl/base/optimization.h"
+#include "absl/log/absl_check.h"
+#include "absl/log/absl_log.h"
+#include "absl/strings/cord.h"
+#include "absl/strings/internal/resize_uninitialized.h"
+#include "absl/strings/string_view.h"
+#include "google/protobuf/arena.h"
+#include "google/protobuf/io/zero_copy_stream.h"
+#include "google/protobuf/io/zero_copy_stream_impl_lite.h"
+
+
+#include "google/protobuf/port_def.inc"
+
+namespace google {
+namespace protobuf {
+namespace io {
+
+namespace {
+
+static const int kMaxVarintBytes = 10;
+static const int kMaxVarint32Bytes = 5;
+
+static const int kMaxCordBytesToCopy = 512;
+
+inline bool NextNonEmpty(ZeroCopyInputStream* input, const void** data,
+                         int* size) {
+  bool success;
+  do {
+    success = input->Next(data, size);
+  } while (success && *size == 0);
+  return success;
+}
+
+inline uint8_t* CopyCordToArray(const absl::Cord& cord, uint8_t* target) {
+  for (absl::string_view sv : cord.Chunks()) {
+    memcpy(target, sv.data(), sv.size());
+    target += sv.size();
+  }
+  return target;
+}
+
+}  
+
+
+CodedInputStream::~CodedInputStream() {
+  if (input_ != nullptr) {
+    BackUpInputToCurrentPosition();
+  }
+}
+
+int CodedInputStream::default_recursion_limit_ = 100;
+
+
+void CodedInputStream::BackUpInputToCurrentPosition() {
+  int backup_bytes = BufferSize() + buffer_size_after_limit_ + overflow_bytes_;
+  if (backup_bytes > 0) {
+    input_->BackUp(backup_bytes);
+
+    total_bytes_read_ -= BufferSize() + buffer_size_after_limit_;
+    buffer_end_ = buffer_;
+    buffer_size_after_limit_ = 0;
+    overflow_bytes_ = 0;
+  }
+}
+
+inline void CodedInputStream::RecomputeBufferLimits() {
+  buffer_end_ += buffer_size_after_limit_;
+  int closest_limit = std::min(current_limit_, total_bytes_limit_);
+  if (closest_limit < total_bytes_read_) {
+    buffer_size_after_limit_ = total_bytes_read_ - closest_limit;
+    buffer_end_ -= buffer_size_after_limit_;
+  } else {
+    buffer_size_after_limit_ = 0;
+  }
+}
+
+CodedInputStream::Limit CodedInputStream::PushLimit(int byte_limit) {
+  int current_position = CurrentPosition();
+
+  Limit old_limit = current_limit_;
+
+  if (ABSL_PREDICT_TRUE(byte_limit >= 0 &&
+                        byte_limit <= INT_MAX - current_position &&
+                        byte_limit < current_limit_ - current_position)) {
+    current_limit_ = current_position + byte_limit;
+    RecomputeBufferLimits();
+  }
+
+  return old_limit;
+}
+
+void CodedInputStream::PopLimit(Limit limit) {
+  current_limit_ = limit;
+  RecomputeBufferLimits();
+
+  legitimate_message_end_ = false;
+}
+
+std::pair<CodedInputStream::Limit, int>
+CodedInputStream::IncrementRecursionDepthAndPushLimit(int byte_limit) {
+  return std::make_pair(PushLimit(byte_limit), --recursion_budget_);
+}
+
+CodedInputStream::Limit CodedInputStream::ReadLengthAndPushLimit() {
+  uint32_t length;
+  return PushLimit(ReadVarint32(&length) ? length : 0);
+}
+
+bool CodedInputStream::DecrementRecursionDepthAndPopLimit(Limit limit) {
+  bool result = ConsumedEntireMessage();
+  PopLimit(limit);
+  ABSL_DCHECK_LT(recursion_budget_, recursion_limit_);
+  ++recursion_budget_;
+  return result;
+}
+
+bool CodedInputStream::CheckEntireMessageConsumedAndPopLimit(Limit limit) {
+  bool result = ConsumedEntireMessage();
+  PopLimit(limit);
+  return result;
+}
+
+int CodedInputStream::BytesUntilLimit() const {
+  if (current_limit_ == INT_MAX) return -1;
+  int current_position = CurrentPosition();
+
+  return current_limit_ - current_position;
+}
+
+void CodedInputStream::SetTotalBytesLimit(int total_bytes_limit) {
+  int current_position = CurrentPosition();
+  total_bytes_limit_ = std::max(current_position, total_bytes_limit);
+  RecomputeBufferLimits();
+}
+
+int CodedInputStream::BytesUntilTotalBytesLimit() const {
+  if (total_bytes_limit_ == INT_MAX) return -1;
+  return total_bytes_limit_ - CurrentPosition();
+}
+
+void CodedInputStream::PrintTotalBytesLimitError() {
+  ABSL_LOG(ERROR) << "A protocol message was rejected because it was too "
+                     "big (more than "
+                  << total_bytes_limit_
+                  << " bytes).  To increase the limit (or to disable these "
+                     "warnings), see CodedInputStream::SetTotalBytesLimit() "
+                     "in third_party/protobuf/io/coded_stream.h.";
+}
+
+bool CodedInputStream::SkipFallback(int count, int original_buffer_size) {
+  if (buffer_size_after_limit_ > 0) {
+    Advance(original_buffer_size);
+    return false;
+  }
+
+  count -= original_buffer_size;
+  buffer_ = nullptr;
+  buffer_end_ = buffer_;
+
+  int closest_limit = std::min(current_limit_, total_bytes_limit_);
+  int bytes_until_limit = closest_limit - total_bytes_read_;
+  if (bytes_until_limit < count) {
+    if (bytes_until_limit > 0) {
+      total_bytes_read_ = closest_limit;
+      (void)input_->Skip(bytes_until_limit);
+    }
+    return false;
+  }
+
+  if (!input_->Skip(count)) {
+    total_bytes_read_ = input_->ByteCount();
+    return false;
+  }
+  total_bytes_read_ += count;
+  return true;
+}
+
+bool CodedInputStream::GetDirectBufferPointer(const void** data, int* size) {
+  if (BufferSize() == 0 && !Refresh()) return false;
+
+  *data = buffer_;
+  *size = BufferSize();
+  return true;
+}
+
+bool CodedInputStream::ReadRaw(void* buffer, int size) {
+  if (size < 0) return false;
+  if (size == 0) return true;
+
+  int current_buffer_size;
+  while ((current_buffer_size = BufferSize()) < size) {
+    if (current_buffer_size > 0) {
+      memcpy(buffer, buffer_, current_buffer_size);
+      buffer = reinterpret_cast<uint8_t*>(buffer) + current_buffer_size;
+      size -= current_buffer_size;
+      Advance(current_buffer_size);
+    }
+    if (!Refresh()) return false;
+  }
+
+  memcpy(buffer, buffer_, size);
+  Advance(size);
+
+  return true;
+}
+
+bool CodedInputStream::ReadString(std::string* buffer, int size) {
+  if (size < 0) return false;  
+
+  if (BufferSize() >= size) {
+    absl::strings_internal::STLStringResizeUninitialized(buffer, size);
+    std::pair<char*, bool> z = as_string_data(buffer);
+    if (z.second) {
+      ABSL_DCHECK(z.first != nullptr);
+      memcpy(z.first, buffer_, size);
+      Advance(size);
+    }
+    return true;
+  }
+
+  return ReadStringFallback(buffer, size);
+}
+
+bool CodedInputStream::ReadStringFallback(std::string* buffer, int size) {
+  if (!buffer->empty()) {
+    buffer->clear();
+  }
+
+  int closest_limit = std::min(current_limit_, total_bytes_limit_);
+  if (closest_limit != INT_MAX) {
+    int bytes_to_limit = closest_limit - CurrentPosition();
+    if (bytes_to_limit > 0 && size > 0 && size <= bytes_to_limit) {
+      buffer->reserve(size);
+    }
+  }
+
+  int current_buffer_size;
+  while ((current_buffer_size = BufferSize()) < size) {
+    if (current_buffer_size != 0) {
+      buffer->append(reinterpret_cast<const char*>(buffer_),
+                     current_buffer_size);
+    }
+    size -= current_buffer_size;
+    Advance(current_buffer_size);
+    if (!Refresh()) return false;
+  }
+
+  buffer->append(reinterpret_cast<const char*>(buffer_), size);
+  Advance(size);
+
+  return true;
+}
+
+bool CodedInputStream::ReadCord(absl::Cord* output, int size) {
+  ABSL_DCHECK_NE(output, nullptr);
+
+  if (size < 0) {
+    output->Clear();
+    return false;  
+  }
+
+  if (input_ == nullptr || size < kMaxCordBytesToCopy) {
+    absl::string_view buffer(reinterpret_cast<const char*>(buffer_),
+                             static_cast<size_t>(std::min(size, BufferSize())));
+    *output = buffer;
+    Advance(static_cast<int>(buffer.size()));
+    size -= static_cast<int>(buffer.size());
+    if (size == 0) return true;
+    if (input_ == nullptr || buffer_size_after_limit_ + overflow_bytes_ > 0) {
+      return false;
+    }
+  } else {
+    output->Clear();
+    BackUpInputToCurrentPosition();
+  }
+
+  const int closest_limit = std::min(current_limit_, total_bytes_limit_);
+  const int available = closest_limit - total_bytes_read_;
+  if (ABSL_PREDICT_FALSE(size > available)) {
+    total_bytes_read_ = closest_limit;
+    (void)input_->ReadCord(output, available);
+    return false;
+  }
+  total_bytes_read_ += size;
+  return input_->ReadCord(output, size);
+}
+
+
+bool CodedInputStream::ReadLittleEndian16Fallback(uint16_t* value) {
+  constexpr size_t kSize = sizeof(*value);
+  uint8_t bytes[kSize];
+
+  const uint8_t* ptr;
+  if (BufferSize() >= static_cast<int64_t>(kSize)) {
+    ptr = buffer_;
+    Advance(kSize);
+  } else {
+    if (!ReadRaw(bytes, kSize)) return false;
+    ptr = bytes;
+  }
+  (void)ReadLittleEndian16FromArray(ptr, value);
+  return true;
+}
+
+bool CodedInputStream::ReadLittleEndian32Fallback(uint32_t* value) {
+  constexpr size_t kSize = sizeof(*value);
+  uint8_t bytes[kSize];
+
+  const uint8_t* ptr;
+  if (BufferSize() >= static_cast<int64_t>(kSize)) {
+    ptr = buffer_;
+    Advance(kSize);
+  } else {
+    if (!ReadRaw(bytes, kSize)) return false;
+    ptr = bytes;
+  }
+  (void)ReadLittleEndian32FromArray(ptr, value);
+  return true;
+}
+
+bool CodedInputStream::ReadLittleEndian64Fallback(uint64_t* value) {
+  constexpr size_t kSize = sizeof(*value);
+  uint8_t bytes[kSize];
+
+  const uint8_t* ptr;
+  if (BufferSize() >= static_cast<int64_t>(kSize)) {
+    ptr = buffer_;
+    Advance(kSize);
+  } else {
+    if (!ReadRaw(bytes, kSize)) return false;
+    ptr = bytes;
+  }
+  (void)ReadLittleEndian64FromArray(ptr, value);
+  return true;
+}
+
+namespace {
+
+template <size_t N>
+const uint8_t* DecodeVarint64KnownSize(const uint8_t* buffer, uint64_t* value) {
+  ABSL_DCHECK_GT(N, 0);
+  uint64_t result = static_cast<uint64_t>(buffer[N - 1]) << (7 * (N - 1));
+  for (size_t i = 0, offset = 0; i < N - 1; i++, offset += 7) {
+    result += static_cast<uint64_t>(buffer[i] - 0x80) << offset;
+  }
+  *value = result;
+  return buffer + N;
+}
+
+PROTOBUF_ALWAYS_INLINE
+::std::pair<bool, const uint8_t*> ReadVarint32FromArray(uint32_t first_byte,
+                                                        const uint8_t* buffer,
+                                                        uint32_t* value);
+inline ::std::pair<bool, const uint8_t*> ReadVarint32FromArray(
+    uint32_t first_byte, const uint8_t* buffer, uint32_t* value) {
+  ABSL_DCHECK_EQ(*buffer, first_byte);
+  ABSL_DCHECK_EQ(first_byte & 0x80, 0x80) << first_byte;
+  const uint8_t* ptr = buffer;
+  uint32_t b;
+  uint32_t result = first_byte - 0x80;
+  ++ptr;  
+  b = *(ptr++);
+  result += b << 7;
+  if (!(b & 0x80)) goto done;
+  result -= 0x80 << 7;
+  b = *(ptr++);
+  result += b << 14;
+  if (!(b & 0x80)) goto done;
+  result -= 0x80 << 14;
+  b = *(ptr++);
+  result += b << 21;
+  if (!(b & 0x80)) goto done;
+  result -= 0x80 << 21;
+  b = *(ptr++);
+  result += b << 28;
+  if (!(b & 0x80)) goto done;
+
+  for (int i = 0; i < kMaxVarintBytes - kMaxVarint32Bytes; i++) {
+    b = *(ptr++);
+    if (!(b & 0x80)) goto done;
+  }
+
+  return std::make_pair(false, ptr);
+
+done:
+  *value = result;
+  return std::make_pair(true, ptr);
+}
+
+PROTOBUF_ALWAYS_INLINE::std::pair<bool, const uint8_t*> ReadVarint64FromArray(
+    const uint8_t* buffer, uint64_t* value);
+inline ::std::pair<bool, const uint8_t*> ReadVarint64FromArray(
+    const uint8_t* buffer, uint64_t* value) {
+  ABSL_DCHECK_GE(buffer[0], 128);
+
+  const uint8_t* next;
+  if (buffer[1] < 128) {
+    next = DecodeVarint64KnownSize<2>(buffer, value);
+  } else if (buffer[2] < 128) {
+    next = DecodeVarint64KnownSize<3>(buffer, value);
+  } else if (buffer[3] < 128) {
+    next = DecodeVarint64KnownSize<4>(buffer, value);
+  } else if (buffer[4] < 128) {
+    next = DecodeVarint64KnownSize<5>(buffer, value);
+  } else if (buffer[5] < 128) {
+    next = DecodeVarint64KnownSize<6>(buffer, value);
+  } else if (buffer[6] < 128) {
+    next = DecodeVarint64KnownSize<7>(buffer, value);
+  } else if (buffer[7] < 128) {
+    next = DecodeVarint64KnownSize<8>(buffer, value);
+  } else if (buffer[8] < 128) {
+    next = DecodeVarint64KnownSize<9>(buffer, value);
+  } else if (buffer[9] < 128) {
+    next = DecodeVarint64KnownSize<10>(buffer, value);
+  } else {
+    return std::make_pair(false, buffer + 11);
+  }
+
+  return std::make_pair(true, next);
+}
+
+}  
+
+bool CodedInputStream::ReadVarint32Slow(uint32_t* value) {
+  std::pair<uint64_t, bool> p = ReadVarint64Fallback();
+  *value = static_cast<uint32_t>(p.first);
+  return p.second;
+}
+
+int64_t CodedInputStream::ReadVarint32Fallback(uint32_t first_byte_or_zero) {
+  if (BufferSize() >= kMaxVarintBytes ||
+      (buffer_end_ > buffer_ && !(buffer_end_[-1] & 0x80))) {
+    ABSL_DCHECK_NE(first_byte_or_zero, 0)
+        << "Caller should provide us with *buffer_ when buffer is non-empty";
+    uint32_t temp;
+    ::std::pair<bool, const uint8_t*> p =
+        ReadVarint32FromArray(first_byte_or_zero, buffer_, &temp);
+    if (!p.first) return -1;
+    buffer_ = p.second;
+    return temp;
+  } else {
+    uint32_t temp;
+    return ReadVarint32Slow(&temp) ? static_cast<int64_t>(temp) : -1;
+  }
+}
+
+int CodedInputStream::ReadVarintSizeAsIntSlow() {
+  std::pair<uint64_t, bool> p = ReadVarint64Fallback();
+  if (!p.second || p.first > static_cast<uint64_t>(INT_MAX)) return -1;
+  return p.first;
+}
+
+int CodedInputStream::ReadVarintSizeAsIntFallback() {
+  if (BufferSize() >= kMaxVarintBytes ||
+      (buffer_end_ > buffer_ && !(buffer_end_[-1] & 0x80))) {
+    uint64_t temp;
+    ::std::pair<bool, const uint8_t*> p = ReadVarint64FromArray(buffer_, &temp);
+    if (!p.first || temp > static_cast<uint64_t>(INT_MAX)) return -1;
+    buffer_ = p.second;
+    return temp;
+  } else {
+    return ReadVarintSizeAsIntSlow();
+  }
+}
+
+uint32_t CodedInputStream::ReadTagSlow() {
+  if (buffer_ == buffer_end_) {
+    if (!Refresh()) {
+      int current_position = total_bytes_read_ - buffer_size_after_limit_;
+      if (current_position >= total_bytes_limit_) {
+        legitimate_message_end_ = current_limit_ == total_bytes_limit_;
+      } else {
+        legitimate_message_end_ = true;
+      }
+      return 0;
+    }
+  }
+
+  uint64_t result = 0;
+  if (!ReadVarint64(&result)) return 0;
+  return static_cast<uint32_t>(result);
+}
+
+uint32_t CodedInputStream::ReadTagFallback(uint32_t first_byte_or_zero) {
+  const int buf_size = BufferSize();
+  if (buf_size >= kMaxVarintBytes ||
+      (buf_size > 0 && !(buffer_end_[-1] & 0x80))) {
+    ABSL_DCHECK_EQ(first_byte_or_zero, buffer_[0]);
+    if (first_byte_or_zero == 0) {
+      ++buffer_;
+      return 0;
+    }
+    uint32_t tag;
+    ::std::pair<bool, const uint8_t*> p =
+        ReadVarint32FromArray(first_byte_or_zero, buffer_, &tag);
+    if (!p.first) {
+      return 0;
+    }
+    buffer_ = p.second;
+    return tag;
+  } else {
+    if ((buf_size == 0) &&
+        ((buffer_size_after_limit_ > 0) ||
+         (total_bytes_read_ == current_limit_)) &&
+        total_bytes_read_ - buffer_size_after_limit_ < total_bytes_limit_) {
+      legitimate_message_end_ = true;
+      return 0;
+    }
+    return ReadTagSlow();
+  }
+}
+
+bool CodedInputStream::ReadVarint64Slow(uint64_t* value) {
+
+  uint64_t result = 0;
+  int count = 0;
+  uint32_t b;
+
+  do {
+    if (count == kMaxVarintBytes) {
+      *value = 0;
+      return false;
+    }
+    while (buffer_ == buffer_end_) {
+      if (!Refresh()) {
+        *value = 0;
+        return false;
+      }
+    }
+    b = *buffer_;
+    result |= static_cast<uint64_t>(b & 0x7F) << (7 * count);
+    Advance(1);
+    ++count;
+  } while (b & 0x80);
+
+  *value = result;
+  return true;
+}
+
+std::pair<uint64_t, bool> CodedInputStream::ReadVarint64Fallback() {
+  if (BufferSize() >= kMaxVarintBytes ||
+      (buffer_end_ > buffer_ && !(buffer_end_[-1] & 0x80))) {
+    uint64_t temp;
+    ::std::pair<bool, const uint8_t*> p = ReadVarint64FromArray(buffer_, &temp);
+    if (!p.first) {
+      return std::make_pair(0, false);
+    }
+    buffer_ = p.second;
+    return std::make_pair(temp, true);
+  } else {
+    uint64_t temp;
+    bool success = ReadVarint64Slow(&temp);
+    return std::make_pair(temp, success);
+  }
+}
+
+bool CodedInputStream::Refresh() {
+  ABSL_DCHECK_EQ(0, BufferSize());
+
+  if (buffer_size_after_limit_ > 0 || overflow_bytes_ > 0 ||
+      total_bytes_read_ == current_limit_) {
+    int current_position = total_bytes_read_ - buffer_size_after_limit_;
+
+    if (current_position >= total_bytes_limit_ &&
+        total_bytes_limit_ != current_limit_) {
+      PrintTotalBytesLimitError();
+    }
+
+    return false;
+  }
+
+  const void* void_buffer;
+  int buffer_size;
+  if (NextNonEmpty(input_, &void_buffer, &buffer_size)) {
+    buffer_ = reinterpret_cast<const uint8_t*>(void_buffer);
+    buffer_end_ = buffer_ + buffer_size;
+    ABSL_CHECK_GE(buffer_size, 0);
+
+    if (total_bytes_read_ <= INT_MAX - buffer_size) {
+      total_bytes_read_ += buffer_size;
+    } else {
+
+      overflow_bytes_ = total_bytes_read_ - (INT_MAX - buffer_size);
+      buffer_end_ -= overflow_bytes_;
+      total_bytes_read_ = INT_MAX;
+    }
+
+    RecomputeBufferLimits();
+    return true;
+  } else {
+    buffer_ = nullptr;
+    buffer_end_ = nullptr;
+    return false;
+  }
+}
+
+
+void EpsCopyOutputStream::EnableAliasing(bool enabled) {
+  aliasing_enabled_ = enabled && stream_->AllowsAliasing();
+}
+
+int64_t EpsCopyOutputStream::ByteCount(uint8_t* ptr) const {
+  int delta = (end_ - ptr) + (buffer_end_ ? 0 : kSlopBytes);
+  return stream_->ByteCount() - delta;
+}
+
+int EpsCopyOutputStream::Flush(uint8_t* ptr) {
+  while (buffer_end_ && ptr > end_) {
+    int overrun = ptr - end_;
+    ABSL_DCHECK(!had_error_);
+    ABSL_DCHECK(overrun <= kSlopBytes);  // NOLINT
+    ptr = Next() + overrun;
+    if (had_error_) return 0;
+  }
+  int s;
+  if (buffer_end_) {
+    std::memcpy(buffer_end_, buffer_, ptr - buffer_);
+    buffer_end_ += ptr - buffer_;
+    s = end_ - ptr;
+  } else {
+    s = end_ + kSlopBytes - ptr;
+    buffer_end_ = ptr;
+  }
+  ABSL_DCHECK(s >= 0);  // NOLINT
+  return s;
+}
+
+uint8_t* EpsCopyOutputStream::Trim(uint8_t* ptr) {
+  if (had_error_) return ptr;
+  int s = Flush(ptr);
+  stream_->BackUp(s);
+  buffer_end_ = end_ = buffer_;
+  return buffer_;
+}
+
+
+uint8_t* EpsCopyOutputStream::FlushAndResetBuffer(uint8_t* ptr) {
+  if (had_error_) return buffer_;
+  int s = Flush(ptr);
+  if (had_error_) return buffer_;
+  return SetInitialBuffer(buffer_end_, s);
+}
+
+bool EpsCopyOutputStream::Skip(int count, uint8_t** pp) {
+  if (count < 0) return false;
+  if (had_error_) {
+    *pp = buffer_;
+    return false;
+  }
+  int size = Flush(*pp);
+  if (had_error_) {
+    *pp = buffer_;
+    return false;
+  }
+  void* data = buffer_end_;
+  while (count > size) {
+    count -= size;
+    if (!stream_->Next(&data, &size)) {
+      *pp = Error();
+      return false;
+    }
+  }
+  *pp = SetInitialBuffer(static_cast<uint8_t*>(data) + count, size - count);
+  return true;
+}
+
+bool EpsCopyOutputStream::GetDirectBufferPointer(void** data, int* size,
+                                                 uint8_t** pp) {
+  if (had_error_) {
+    *pp = buffer_;
+    return false;
+  }
+  *size = Flush(*pp);
+  if (had_error_) {
+    *pp = buffer_;
+    return false;
+  }
+  *data = buffer_end_;
+  while (*size == 0) {
+    if (!stream_->Next(data, size)) {
+      *pp = Error();
+      return false;
+    }
+  }
+  *pp = SetInitialBuffer(*data, *size);
+  return true;
+}
+
+uint8_t* EpsCopyOutputStream::GetDirectBufferForNBytesAndAdvance(int size,
+                                                                 uint8_t** pp) {
+  if (had_error_) {
+    *pp = buffer_;
+    return nullptr;
+  }
+  int s = Flush(*pp);
+  if (had_error_) {
+    *pp = buffer_;
+    return nullptr;
+  }
+  if (s >= size) {
+    auto res = buffer_end_;
+    *pp = SetInitialBuffer(buffer_end_ + size, s - size);
+    return res;
+  } else {
+    *pp = SetInitialBuffer(buffer_end_, s);
+    return nullptr;
+  }
+}
+
+uint8_t* EpsCopyOutputStream::Next() {
+  ABSL_DCHECK(!had_error_);  // NOLINT
+  if (ABSL_PREDICT_FALSE(stream_ == nullptr)) return Error();
+  if (buffer_end_) {
+    std::memcpy(buffer_end_, buffer_, end_ - buffer_);
+    uint8_t* ptr;
+    int size;
+    do {
+      void* data;
+      if (ABSL_PREDICT_FALSE(!stream_->Next(&data, &size))) {
+        return Error();
+      }
+      ptr = static_cast<uint8_t*>(data);
+    } while (size == 0);
+    if (ABSL_PREDICT_TRUE(size > kSlopBytes)) {
+      std::memcpy(ptr, end_, kSlopBytes);
+      end_ = ptr + size - kSlopBytes;
+      buffer_end_ = nullptr;
+      return ptr;
+    } else {
+      ABSL_DCHECK(size > 0);  // NOLINT
+      std::memmove(buffer_, end_, kSlopBytes);
+      buffer_end_ = ptr;
+      end_ = buffer_ + size;
+      return buffer_;
+    }
+  } else {
+    std::memcpy(buffer_, end_, kSlopBytes);
+    buffer_end_ = end_;
+    end_ = buffer_ + kSlopBytes;
+    return buffer_;
+  }
+}
+
+uint8_t* EpsCopyOutputStream::EnsureSpaceFallback(uint8_t* ptr) {
+  do {
+    if (ABSL_PREDICT_FALSE(had_error_)) return buffer_;
+    int overrun = ptr - end_;
+    ABSL_DCHECK(overrun >= 0);           // NOLINT
+    ABSL_DCHECK(overrun <= kSlopBytes);  // NOLINT
+    ptr = Next() + overrun;
+  } while (ptr >= end_);
+  ABSL_DCHECK(ptr < end_);  // NOLINT
+  return ptr;
+}
+
+uint8_t* EpsCopyOutputStream::WriteRawFallback(const void* data, int size,
+                                               uint8_t* ptr) {
+  int s = GetSize(ptr);
+  while (s < size) {
+    std::memcpy(ptr, data, s);
+    size -= s;
+    data = static_cast<const uint8_t*>(data) + s;
+    ptr = EnsureSpaceFallback(ptr + s);
+    s = GetSize(ptr);
+  }
+  std::memcpy(ptr, data, size);
+  return ptr + size;
+}
+
+uint8_t* EpsCopyOutputStream::WriteAliasedRaw(const void* data, int size,
+                                              uint8_t* ptr) {
+  if (size < GetSize(ptr)
+  ) {
+    return WriteRaw(data, size, ptr);
+  } else {
+    ptr = Trim(ptr);
+    if (stream_->WriteAliasedRaw(data, size)) return ptr;
+    return Error();
+  }
+}
+
+#if !defined(ABSL_IS_LITTLE_ENDIAN)
+uint8_t* EpsCopyOutputStream::WriteRawLittleEndian32(const void* data, int size,
+                                                     uint8_t* ptr) {
+  auto p = static_cast<const uint8_t*>(data);
+  auto end = p + size;
+  while (end - p >= kSlopBytes) {
+    ptr = EnsureSpace(ptr);
+    uint32_t buffer[4];
+    static_assert(sizeof(buffer) == kSlopBytes, "Buffer must be kSlopBytes");
+    std::memcpy(buffer, p, kSlopBytes);
+    p += kSlopBytes;
+    for (auto x : buffer)
+      ptr = CodedOutputStream::WriteLittleEndian32ToArray(x, ptr);
+  }
+  while (p < end) {
+    ptr = EnsureSpace(ptr);
+    uint32_t buffer;
+    std::memcpy(&buffer, p, 4);
+    p += 4;
+    ptr = CodedOutputStream::WriteLittleEndian32ToArray(buffer, ptr);
+  }
+  return ptr;
+}
+
+uint8_t* EpsCopyOutputStream::WriteRawLittleEndian64(const void* data, int size,
+                                                     uint8_t* ptr) {
+  auto p = static_cast<const uint8_t*>(data);
+  auto end = p + size;
+  while (end - p >= kSlopBytes) {
+    ptr = EnsureSpace(ptr);
+    uint64_t buffer[2];
+    static_assert(sizeof(buffer) == kSlopBytes, "Buffer must be kSlopBytes");
+    std::memcpy(buffer, p, kSlopBytes);
+    p += kSlopBytes;
+    for (auto x : buffer)
+      ptr = CodedOutputStream::WriteLittleEndian64ToArray(x, ptr);
+  }
+  while (p < end) {
+    ptr = EnsureSpace(ptr);
+    uint64_t buffer;
+    std::memcpy(&buffer, p, 8);
+    p += 8;
+    ptr = CodedOutputStream::WriteLittleEndian64ToArray(buffer, ptr);
+  }
+  return ptr;
+}
+#endif
+
+uint8_t* EpsCopyOutputStream::WriteCord(const absl::Cord& cord, uint8_t* ptr) {
+  int s = GetSize(ptr);
+  if (stream_ == nullptr) {
+    if (static_cast<int64_t>(cord.size()) <= s) {
+      return CopyCordToArray(cord, ptr);
+    } else {
+      return Error();
+    }
+  } else if (static_cast<int64_t>(cord.size()) <= s &&
+             static_cast<int64_t>(cord.size()) < kMaxCordBytesToCopy) {
+    return CopyCordToArray(cord, ptr);
+  } else {
+    ptr = Trim(ptr);
+    if (!stream_->WriteCord(cord)) return Error();
+    return ptr;
+  }
+}
+
+uint8_t* EpsCopyOutputStream::WriteStringMaybeAliasedOutline(
+    uint32_t num, absl::string_view s, uint8_t* ptr) {
+  ptr = EnsureSpace(ptr);
+  uint32_t size = s.size();
+  ptr = WriteLengthDelim(num, size, ptr);
+  return WriteRawMaybeAliased(s.data(), size, ptr);
+}
+
+uint8_t* EpsCopyOutputStream::WriteStringOutline(uint32_t num,
+                                                 absl::string_view s,
+                                                 uint8_t* ptr) {
+  ptr = EnsureSpace(ptr);
+  uint32_t size = s.size();
+  ptr = WriteLengthDelim(num, size, ptr);
+  return WriteRaw(s.data(), size, ptr);
+}
+
+uint8_t* EpsCopyOutputStream::WriteCordOutline(const absl::Cord& c,
+                                               uint8_t* ptr) {
+  uint32_t size = c.size();
+  ptr = UnsafeWriteSize(size, ptr);
+  return WriteCord(c, ptr);
+}
+
+std::atomic<bool> CodedOutputStream::default_serialization_deterministic_{
+    false};
+
+CodedOutputStream::~CodedOutputStream() { Trim(); }
+
+uint8_t* CodedOutputStream::WriteCordToArray(const absl::Cord& cord,
+                                             uint8_t* target) {
+  return CopyCordToArray(cord, target);
+}
+
+
+uint8_t* CodedOutputStream::WriteStringWithSizeToArray(absl::string_view str,
+                                                       uint8_t* target) {
+  ABSL_DCHECK_LE(str.size(), std::numeric_limits<uint32_t>::max());
+  target = WriteVarint32ToArray(str.size(), target);
+  return WriteStringToArray(str, target);
+}
+
+}  
+}  
+}  
+
+#include "google/protobuf/port_undef.inc"

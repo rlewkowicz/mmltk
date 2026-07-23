@@ -1,0 +1,160 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+@namespace url("http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul");
+
+scrollcorner,
+resizer,
+scrollbar {
+  @media -moz-pref("layout.css.cached-scrollbar-styles.enabled") {
+    all: initial;
+    visibility: inherit;
+    pointer-events: inherit;
+
+    -moz-context-properties: initial;
+    -moz-control-character-visibility: initial;
+    -moz-min-font-size-ratio: initial;
+    -moz-box-collapse: initial;
+    -moz-theme: initial;
+
+    zoom: document;
+
+    math-depth: initial;
+    -moz-inert: initial;
+
+
+    font: 16px sans-serif;
+
+    justify-items: start;
+  }
+
+  display: block;
+  box-sizing: border-box;
+
+  direction: ltr;
+  writing-mode: initial;
+
+  -moz-user-focus: ignore;
+  user-select: none;
+}
+
+
+resizer {
+  position: relative;
+  z-index: 2147483647;
+
+  background: url("chrome://global/skin/icons/resizer.svg") no-repeat;
+  background-size: 100% 100%;
+  cursor: se-resize;
+  width: 15px;
+  height: 15px;
+
+  @media (-moz-platform: android) {
+    pointer-events: none;
+  }
+
+  &[dir="left"],
+  &[dir="bottom"][flip],
+  &[dir="bottomleft"] {
+    transform: scaleX(-1);
+  }
+
+  &[dir="bottomleft"] {
+    cursor: sw-resize;
+  }
+
+  &[dir="top"],
+  &[dir="bottom"] {
+    cursor: ns-resize;
+  }
+
+  &[dir="left"],
+  &[dir="right"] {
+    cursor: ew-resize;
+  }
+
+  &[dir="topleft"] {
+    cursor: nw-resize;
+  }
+
+  &[dir="topright"] {
+    cursor: ne-resize;
+  }
+}
+
+thumb {
+  appearance: auto;
+  -moz-default-appearance: scrollbarthumb-horizontal;
+
+  scrollbar[vertical] & {
+    -moz-default-appearance: scrollbarthumb-vertical;
+  }
+
+  scrollbar:disabled & {
+    visibility: hidden;
+  }
+}
+
+scrollbar {
+  appearance: auto;
+  -moz-default-appearance: scrollbar-horizontal;
+  cursor: default;
+
+  @media -moz-pref("layout.testing.scrollbars.always-hidden") {
+    opacity: 0 !important;
+  }
+
+  @media (-moz-platform: android) {
+    pointer-events: none;
+  }
+
+  @media (-moz-overlay-scrollbars) {
+    will-change: opacity;
+    transition-property: opacity;
+    transition-duration: env(-moz-overlay-scrollbar-fade-duration);
+
+    &:not([active]),
+    &:disabled {
+      pointer-events: none;
+      opacity: 0;
+    }
+  }
+
+  &[vertical] {
+    -moz-default-appearance: scrollbar-vertical;
+  }
+
+  &[root] {
+    position: relative;
+    z-index: 2147483647; 
+  }
+}
+
+scrollbarbutton {
+  appearance: auto;
+  -moz-default-appearance: scrollbarbutton-right;
+
+  scrollbar[vertical] > & {
+    -moz-default-appearance: scrollbarbutton-down;
+  }
+
+  &[type="decrement"] {
+    -moz-default-appearance: scrollbarbutton-left;
+
+    scrollbar[vertical] > & {
+      -moz-default-appearance: scrollbarbutton-up;
+    }
+  }
+}
+
+scrollcorner {
+  appearance: auto;
+  -moz-default-appearance: scrollcorner;
+  width: 16px;
+  cursor: default;
+
+  @media (-moz-overlay-scrollbars) {
+    pointer-events: none;
+  }
+}

@@ -1,0 +1,111 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_PromiseWorkerProxy_h
+#define mozilla_dom_PromiseWorkerProxy_h
+
+#include <cstdint>
+
+#include "js/TypeDecls.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/PromiseNativeHandler.h"
+#include "mozilla/dom/StructuredCloneHolder.h"
+#include "nsISupports.h"
+
+struct JSStructuredCloneReader;
+struct JSStructuredCloneWriter;
+
+namespace JS {
+class CloneDataPolicy;
+}  
+
+namespace mozilla::dom {
+
+class ThreadSafeWorkerRef;
+class WorkerPrivate;
+
+
+class PromiseWorkerProxy : public PromiseNativeHandler,
+                           public StructuredCloneHolderBase {
+  friend class PromiseWorkerProxyRunnable;
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+ public:
+  typedef JSObject* (*ReadCallbackOp)(JSContext* aCx,
+                                      JSStructuredCloneReader* aReader,
+                                      const PromiseWorkerProxy* aProxy,
+                                      uint32_t aTag, uint32_t aData);
+  typedef bool (*WriteCallbackOp)(JSContext* aCx,
+                                  JSStructuredCloneWriter* aWorker,
+                                  PromiseWorkerProxy* aProxy,
+                                  JS::Handle<JSObject*> aObj);
+
+  struct PromiseWorkerProxyStructuredCloneCallbacks {
+    ReadCallbackOp Read;
+    WriteCallbackOp Write;
+  };
+
+  static already_AddRefed<PromiseWorkerProxy> Create(
+      WorkerPrivate* aWorkerPrivate, Promise* aWorkerPromise,
+      const PromiseWorkerProxyStructuredCloneCallbacks* aCallbacks = nullptr);
+
+  WorkerPrivate* GetWorkerPrivate() const MOZ_NO_THREAD_SAFETY_ANALYSIS;
+
+  Promise* GetWorkerPromise() const;
+
+  void CleanUp();
+
+  Mutex& Lock() MOZ_RETURN_CAPABILITY(mCleanUpLock) { return mCleanUpLock; }
+
+  bool CleanedUp() const MOZ_REQUIRES(mCleanUpLock) {
+    mCleanUpLock.AssertCurrentThreadOwns();
+    return mCleanedUp;
+  }
+
+
+  JSObject* CustomReadHandler(JSContext* aCx, JSStructuredCloneReader* aReader,
+                              const JS::CloneDataPolicy& aCloneDataPolicy,
+                              uint32_t aTag, uint32_t aIndex) override;
+
+  bool CustomWriteHandler(JSContext* aCx, JSStructuredCloneWriter* aWriter,
+                          JS::Handle<JSObject*> aObj,
+                          bool* aSameProcessScopeRequired) override;
+
+ protected:
+  virtual void ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                                ErrorResult& aRv) override;
+
+  virtual void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                                ErrorResult& aRv) override;
+
+ private:
+  explicit PromiseWorkerProxy(
+      Promise* aWorkerPromise,
+      const PromiseWorkerProxyStructuredCloneCallbacks* aCallbacks = nullptr);
+
+  virtual ~PromiseWorkerProxy();
+
+  typedef void (Promise::*RunCallbackFunc)(JSContext*, JS::Handle<JS::Value>);
+
+  void RunCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                   RunCallbackFunc aFunc);
+
+  RefPtr<ThreadSafeWorkerRef> mWorkerRef;
+
+  RefPtr<Promise> mWorkerPromise;
+
+  bool mCleanedUp MOZ_GUARDED_BY(
+      mCleanUpLock);  
+
+  const PromiseWorkerProxyStructuredCloneCallbacks* mCallbacks;
+
+  Mutex mCleanUpLock;
+};
+}  
+
+#endif  // mozilla_dom_PromiseWorkerProxy_h

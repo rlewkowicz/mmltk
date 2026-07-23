@@ -1,0 +1,85 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_WEBCODECS_DECODERAGENT_H
+#define DOM_MEDIA_WEBCODECS_DECODERAGENT_H
+
+#include "MediaResult.h"
+#include "PlatformDecoderModule.h"
+#include "mozilla/DefineEnum.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/TaskQueue.h"
+#include "mozilla/UniquePtr.h"
+
+class nsISerialEventTarget;
+
+namespace mozilla {
+
+class PDMFactory;
+class TrackInfo;
+
+namespace layers {
+class ImageContainer;
+}  
+
+class DecoderAgent final {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(DecoderAgent);
+
+  using Id = uint32_t;
+  DecoderAgent(Id aId, UniquePtr<TrackInfo>&& aInfo);
+
+
+  using ConfigurePromise = MozPromise<bool, MediaResult, true >;
+  RefPtr<ConfigurePromise> Configure(bool aPreferSoftwareDecoder,
+                                     bool aLowLatency);
+  RefPtr<ShutdownPromise> Shutdown();
+  using DecodePromise = MediaDataDecoder::DecodePromise;
+  RefPtr<DecodePromise> Decode(MediaRawData* aSample);
+  RefPtr<DecodePromise> DrainAndFlush();
+
+  const Id mId;  
+  const UniquePtr<TrackInfo> mInfo;
+
+ private:
+  ~DecoderAgent();
+
+  RefPtr<DecodePromise> Dry();
+  void DrainUntilDry();
+
+  MOZ_DEFINE_ENUM_CLASS_WITH_TOSTRING_AT_CLASS_SCOPE(
+      State, (Unconfigured, Configuring, Configured, Decoding, Flushing,
+              ShuttingDown, Error));
+  void SetState(State aState);
+
+  const RefPtr<nsISerialEventTarget> mOwnerThread;
+  const RefPtr<PDMFactory> mPDMFactory;
+  const RefPtr<layers::ImageContainer> mImageContainer;
+  RefPtr<MediaDataDecoder> mDecoder;
+  State mState;
+
+  MozPromiseHolder<ConfigurePromise> mConfigurePromise;
+  using CreateDecoderPromise = PlatformDecoderModule::CreateDecoderPromise;
+  MozPromiseRequestHolder<CreateDecoderPromise> mCreateRequest;
+  using InitPromise = MediaDataDecoder::InitPromise;
+  MozPromiseRequestHolder<InitPromise> mInitRequest;
+
+  MozPromiseHolder<ShutdownPromise> mShutdownWhileCreationPromise;
+
+  MozPromiseHolder<DecodePromise> mDecodePromise;
+  MozPromiseRequestHolder<DecodePromise> mDecodeRequest;
+
+  MozPromiseHolder<DecodePromise> mDrainAndFlushPromise;
+  MediaDataDecoder::DecodedData mDrainAndFlushData;
+  MozPromiseRequestHolder<DecodePromise> mDryRequest;
+  MozPromiseHolder<DecodePromise> mDryPromise;
+  MediaDataDecoder::DecodedData mDryData;
+  MozPromiseRequestHolder<DecodePromise> mDrainRequest;
+  using FlushPromise = MediaDataDecoder::FlushPromise;
+  MozPromiseRequestHolder<FlushPromise> mFlushRequest;
+};
+
+}  
+
+#endif  // DOM_MEDIA_WEBCODECS_DECODERAGENT_H

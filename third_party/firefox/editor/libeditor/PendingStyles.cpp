@@ -1,0 +1,423 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "PendingStyles.h"
+
+#include <stddef.h>
+
+#include "EditAction.h"
+#include "EditorBase.h"
+#include "HTMLEditHelpers.h"  // for EditorInlineStyle, EditorInlineStyleAndValue
+#include "HTMLEditor.h"
+#include "HTMLEditUtils.h"
+
+#include "mozilla/mozalloc.h"
+#include "mozilla/dom/AncestorIterator.h"
+#include "mozilla/dom/MouseEvent.h"
+#include "mozilla/dom/Selection.h"
+
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsGkAtoms.h"
+#include "nsINode.h"
+#include "nsISupports.h"
+#include "nsISupportsImpl.h"
+#include "nsReadableUtils.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+#ifdef small
+#  undef small
+#endif
+
+namespace mozilla {
+
+using namespace dom;
+
+
+EditorInlineStyle PendingStyle::ToInlineStyle() const {
+  return mTag ? EditorInlineStyle(*mTag, mAttribute)
+              : EditorInlineStyle::RemoveAllStyles();
+}
+
+EditorInlineStyleAndValue PendingStyle::ToInlineStyleAndValue() const {
+  MOZ_ASSERT(mTag);
+  return mAttribute ? EditorInlineStyleAndValue(*mTag, *mAttribute,
+                                                mAttributeValueOrCSSValue)
+                    : EditorInlineStyleAndValue(*mTag);
+}
+
+
+EditorInlineStyle PendingStyleCache::ToInlineStyle() const {
+  return EditorInlineStyle(mTag, mAttribute);
+}
+
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(PendingStyles)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(PendingStyles)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mLastSelectionPoint)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(PendingStyles)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mLastSelectionPoint)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+nsresult PendingStyles::UpdateSelState(const HTMLEditor& aHTMLEditor) {
+  if (!aHTMLEditor.SelectionRef().IsCollapsed()) {
+    return NS_OK;
+  }
+
+  mLastSelectionPoint =
+      aHTMLEditor.GetFirstSelectionStartPoint<EditorDOMPoint>();
+  if (!mLastSelectionPoint.IsSet()) {
+    return NS_ERROR_FAILURE;
+  }
+  AutoEditorDOMPointChildInvalidator saveOnlyOffset(mLastSelectionPoint);
+  return NS_OK;
+}
+
+void PendingStyles::PreHandleMouseEvent(const MouseEvent& aMouseDownOrUpEvent) {
+  MOZ_ASSERT(aMouseDownOrUpEvent.WidgetEventPtr()->mMessage == eMouseDown ||
+             aMouseDownOrUpEvent.WidgetEventPtr()->mMessage == eMouseUp);
+  bool& eventFiredInLinkElement =
+      aMouseDownOrUpEvent.WidgetEventPtr()->mMessage == eMouseDown
+          ? mMouseDownFiredInLinkElement
+          : mMouseUpFiredInLinkElement;
+  eventFiredInLinkElement = false;
+  if (aMouseDownOrUpEvent.DefaultPrevented()) {
+    return;
+  }
+  EventTarget* target = aMouseDownOrUpEvent.GetExplicitOriginalTarget();
+  if (NS_WARN_IF(!target)) {
+    return;
+  }
+  nsIContent* targetContent = nsIContent::FromEventTarget(target);
+  if (NS_WARN_IF(!targetContent)) {
+    return;
+  }
+  eventFiredInLinkElement =
+      HTMLEditUtils::IsContentInclusiveDescendantOfLink(*targetContent);
+}
+
+void PendingStyles::PreHandleSelectionChangeCommand(Command aCommand) {
+  mLastSelectionCommand = aCommand;
+}
+
+void PendingStyles::PostHandleSelectionChangeCommand(
+    const HTMLEditor& aHTMLEditor, Command aCommand) {
+  if (mLastSelectionCommand != aCommand) {
+    return;
+  }
+
+  if (!aHTMLEditor.SelectionRef().IsCollapsed() ||
+      !aHTMLEditor.SelectionRef().RangeCount()) {
+    return;
+  }
+
+  const auto caretPoint =
+      aHTMLEditor.GetFirstSelectionStartPoint<EditorRawDOMPoint>();
+  if (NS_WARN_IF(!caretPoint.IsSet())) {
+    return;
+  }
+
+  if (!HTMLEditUtils::IsPointAtEdgeOfLink(caretPoint)) {
+    return;
+  }
+
+  if (AreAllStylesCleared() || IsLinkStyleSet()) {
+    return;
+  }
+  if (AreSomeStylesSet() ||
+      (AreSomeStylesCleared() && !IsOnlyLinkStyleCleared())) {
+    ClearLinkAndItsSpecifiedStyle();
+    return;
+  }
+
+  Reset();
+  ClearLinkAndItsSpecifiedStyle();
+}
+
+void PendingStyles::OnSelectionChange(const HTMLEditor& aHTMLEditor,
+                                      int16_t aReason) {
+
+  const bool causedByFrameSelectionMoveCaret =
+      (aReason & (nsISelectionListener::KEYPRESS_REASON |
+                  nsISelectionListener::COLLAPSETOSTART_REASON |
+                  nsISelectionListener::COLLAPSETOEND_REASON)) &&
+      !(aReason & nsISelectionListener::JS_REASON);
+
+  Command lastSelectionCommand = mLastSelectionCommand;
+  if (causedByFrameSelectionMoveCaret) {
+    mLastSelectionCommand = Command::DoNothing;
+  }
+
+  bool mouseEventFiredInLinkElement = false;
+  if (aReason & (nsISelectionListener::MOUSEDOWN_REASON |
+                 nsISelectionListener::MOUSEUP_REASON)) {
+    MOZ_ASSERT((aReason & (nsISelectionListener::MOUSEDOWN_REASON |
+                           nsISelectionListener::MOUSEUP_REASON)) !=
+               (nsISelectionListener::MOUSEDOWN_REASON |
+                nsISelectionListener::MOUSEUP_REASON));
+    bool& eventFiredInLinkElement =
+        aReason & nsISelectionListener::MOUSEDOWN_REASON
+            ? mMouseDownFiredInLinkElement
+            : mMouseUpFiredInLinkElement;
+    mouseEventFiredInLinkElement = eventFiredInLinkElement;
+    eventFiredInLinkElement = false;
+  }
+
+  bool unlink = false;
+  bool resetAllStyles = true;
+  if (aHTMLEditor.SelectionRef().IsCollapsed() &&
+      aHTMLEditor.SelectionRef().RangeCount()) {
+    const auto selectionStartPoint =
+        aHTMLEditor.GetFirstSelectionStartPoint<EditorDOMPoint>();
+    if (MOZ_UNLIKELY(NS_WARN_IF(!selectionStartPoint.IsSet()))) {
+      return;
+    }
+
+    if (mLastSelectionPoint == selectionStartPoint) {
+      if (AreAllStylesCleared() || IsLinkStyleSet()) {
+        return;
+      }
+      if (AreSomeStylesSet() ||
+          (AreSomeStylesCleared() && !IsOnlyLinkStyleCleared())) {
+        resetAllStyles = false;
+      }
+    }
+
+    RefPtr<Element> linkElement;
+    if (HTMLEditUtils::IsPointAtEdgeOfLink(selectionStartPoint,
+                                           getter_AddRefs(linkElement))) {
+      if (causedByFrameSelectionMoveCaret) {
+        MOZ_ASSERT(!(aReason & (nsISelectionListener::MOUSEDOWN_REASON |
+                                nsISelectionListener::MOUSEUP_REASON)));
+        switch (lastSelectionCommand) {
+          case Command::CharNext:
+          case Command::CharPrevious:
+          case Command::MoveLeft:
+          case Command::MoveLeft2:
+          case Command::MoveRight:
+          case Command::MoveRight2:
+            if (!mLastSelectionPoint.IsSet()) {
+              unlink = true;
+              break;
+            }
+            if (mLastSelectionPoint == selectionStartPoint) {
+              unlink = true;
+              break;
+            }
+            unlink =
+                !mLastSelectionPoint.GetContainer()->IsInclusiveDescendantOf(
+                    linkElement);
+            break;
+          default:
+            unlink = true;
+            break;
+        }
+      } else if (aReason & (nsISelectionListener::MOUSEDOWN_REASON |
+                            nsISelectionListener::MOUSEUP_REASON)) {
+        unlink = !mouseEventFiredInLinkElement;
+      } else if (aReason & nsISelectionListener::JS_REASON) {
+        unlink = true;
+      } else {
+        switch (aHTMLEditor.GetEditAction()) {
+          case EditAction::eDeleteBackward:
+          case EditAction::eDeleteForward:
+          case EditAction::eDeleteSelection:
+          case EditAction::eDeleteToBeginningOfSoftLine:
+          case EditAction::eDeleteToEndOfSoftLine:
+          case EditAction::eDeleteWordBackward:
+          case EditAction::eDeleteWordForward:
+            unlink = true;
+            break;
+          default:
+            break;
+        }
+      }
+    } else if (mLastSelectionPoint == selectionStartPoint) {
+      return;
+    }
+
+    mLastSelectionPoint = selectionStartPoint;
+    AutoEditorDOMPointChildInvalidator saveOnlyOffset(mLastSelectionPoint);
+  } else {
+    if (aHTMLEditor.SelectionRef().RangeCount()) {
+      EditorRawDOMRange firstRange(*aHTMLEditor.SelectionRef().GetRangeAt(0));
+      if (firstRange.StartRef().IsInContentNode() &&
+          HTMLEditUtils::IsContentInclusiveDescendantOfLink(
+              *firstRange.StartRef().ContainerAs<nsIContent>())) {
+        unlink = !HTMLEditUtils::IsRangeEntirelyInLink(firstRange);
+      }
+    }
+    mLastSelectionPoint.Clear();
+  }
+
+  if (resetAllStyles) {
+    Reset();
+    if (unlink) {
+      ClearLinkAndItsSpecifiedStyle();
+    }
+    return;
+  }
+
+  if (unlink == IsExplicitlyLinkStyleCleared()) {
+    return;
+  }
+
+  if (unlink) {
+    ClearLinkAndItsSpecifiedStyle();
+    return;
+  }
+  CancelClearingStyle(*nsGkAtoms::a, nullptr);
+}
+
+void PendingStyles::PreserveStyles(
+    const nsTArray<EditorInlineStyleAndValue>& aStylesToPreserve) {
+  for (const EditorInlineStyleAndValue& styleToPreserve : aStylesToPreserve) {
+    PreserveStyle(styleToPreserve.HTMLPropertyRef(), styleToPreserve.mAttribute,
+                  styleToPreserve.mAttributeValue);
+  }
+}
+
+void PendingStyles::PreserveStyle(nsStaticAtom& aHTMLProperty,
+                                  nsAtom* aAttribute,
+                                  const nsAString& aAttributeValueOrCSSValue) {
+  if (nsGkAtoms::big == &aHTMLProperty) {
+    mRelativeFontSize++;
+    return;
+  }
+  if (nsGkAtoms::small == &aHTMLProperty) {
+    mRelativeFontSize--;
+    return;
+  }
+
+  Maybe<size_t> index = IndexOfPreservingStyle(aHTMLProperty, aAttribute);
+  if (index.isSome()) {
+    mPreservingStyles[index.value()]->UpdateAttributeValueOrCSSValue(
+        aAttributeValueOrCSSValue);
+    return;
+  }
+
+  UniquePtr<PendingStyle> style = MakeUnique<PendingStyle>(
+      &aHTMLProperty, aAttribute, aAttributeValueOrCSSValue);
+  if (&aHTMLProperty == nsGkAtoms::font && aAttribute != nsGkAtoms::bgcolor) {
+    MOZ_ASSERT(aAttribute == nsGkAtoms::color ||
+               aAttribute == nsGkAtoms::face || aAttribute == nsGkAtoms::size);
+    mPreservingStyles.InsertElementAt(0, std::move(style));
+  } else {
+    mPreservingStyles.AppendElement(std::move(style));
+  }
+
+  CancelClearingStyle(aHTMLProperty, aAttribute);
+}
+
+void PendingStyles::ClearStyles(
+    const nsTArray<EditorInlineStyle>& aStylesToClear) {
+  for (const EditorInlineStyle& styleToClear : aStylesToClear) {
+    if (styleToClear.IsStyleToClearAllInlineStyles()) {
+      ClearAllStyles();
+      return;
+    }
+    if (styleToClear.mHTMLProperty == nsGkAtoms::href ||
+        styleToClear.mHTMLProperty == nsGkAtoms::name) {
+      ClearStyleInternal(nsGkAtoms::a, nullptr);
+    } else {
+      ClearStyleInternal(styleToClear.mHTMLProperty, styleToClear.mAttribute);
+    }
+  }
+}
+
+void PendingStyles::ClearStyleInternal(
+    nsStaticAtom* aHTMLProperty, nsAtom* aAttribute,
+    SpecifiedStyle aSpecifiedStyle ) {
+  if (IsStyleCleared(aHTMLProperty, aAttribute)) {
+    return;
+  }
+
+  CancelPreservingStyle(aHTMLProperty, aAttribute);
+
+  mClearingStyles.AppendElement(MakeUnique<PendingStyle>(
+      aHTMLProperty, aAttribute, u""_ns, aSpecifiedStyle));
+}
+
+void PendingStyles::TakeAllPreservedStyles(
+    nsTArray<EditorInlineStyleAndValue>& aOutStylesAndValues) {
+  aOutStylesAndValues.SetCapacity(aOutStylesAndValues.Length() +
+                                  mPreservingStyles.Length());
+  for (const UniquePtr<PendingStyle>& preservedStyle : mPreservingStyles) {
+    aOutStylesAndValues.AppendElement(
+        preservedStyle->GetAttribute()
+            ? EditorInlineStyleAndValue(
+                  *preservedStyle->GetTag(), *preservedStyle->GetAttribute(),
+                  preservedStyle->AttributeValueOrCSSValueRef())
+            : EditorInlineStyleAndValue(*preservedStyle->GetTag()));
+  }
+  mPreservingStyles.Clear();
+}
+
+int32_t PendingStyles::TakeRelativeFontSize() {
+  int32_t relSize = mRelativeFontSize;
+  mRelativeFontSize = 0;
+  return relSize;
+}
+
+PendingStyleState PendingStyles::GetStyleState(
+    nsStaticAtom& aHTMLProperty, nsAtom* aAttribute ,
+    nsString* aOutNewAttributeValueOrCSSValue ) const {
+  if (IndexOfPreservingStyle(aHTMLProperty, aAttribute,
+                             aOutNewAttributeValueOrCSSValue)
+          .isSome()) {
+    return PendingStyleState::BeingPreserved;
+  }
+
+  if (IsStyleCleared(&aHTMLProperty, aAttribute)) {
+    return PendingStyleState::BeingCleared;
+  }
+
+  return PendingStyleState::NotUpdated;
+}
+
+void PendingStyles::CancelPreservingStyle(nsStaticAtom* aHTMLProperty,
+                                          nsAtom* aAttribute) {
+  if (!aHTMLProperty) {
+    mPreservingStyles.Clear();
+    mRelativeFontSize = 0;
+    return;
+  }
+  Maybe<size_t> index = IndexOfPreservingStyle(*aHTMLProperty, aAttribute);
+  if (index.isSome()) {
+    mPreservingStyles.RemoveElementAt(index.value());
+  }
+}
+
+void PendingStyles::CancelClearingStyle(nsStaticAtom& aHTMLProperty,
+                                        nsAtom* aAttribute) {
+  Maybe<size_t> index =
+      IndexOfStyleInArray(&aHTMLProperty, aAttribute, nullptr, mClearingStyles);
+  if (index.isSome()) {
+    mClearingStyles.RemoveElementAt(index.value());
+  }
+}
+
+Maybe<size_t> PendingStyles::IndexOfStyleInArray(
+    nsStaticAtom* aHTMLProperty, nsAtom* aAttribute, nsAString* aOutValue,
+    const nsTArray<UniquePtr<PendingStyle>>& aArray) {
+  if (aAttribute == nsGkAtoms::_empty) {
+    aAttribute = nullptr;
+  }
+  for (size_t i : IntegerRange(aArray.Length())) {
+    const UniquePtr<PendingStyle>& item = aArray[i];
+    if (item->GetTag() == aHTMLProperty && item->GetAttribute() == aAttribute) {
+      if (aOutValue) {
+        *aOutValue = item->AttributeValueOrCSSValueRef();
+      }
+      return Some(i);
+    }
+  }
+  return Nothing();
+}
+
+}  

@@ -1,0 +1,978 @@
+/*
+ *  Copyright 2011 The LibYuv Project Authors. All rights reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS. All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+#if !defined(INCLUDE_LIBYUV_PLANAR_FUNCTIONS_H_)
+#define INCLUDE_LIBYUV_PLANAR_FUNCTIONS_H_
+
+#include "libyuv/basic_types.h"
+
+#include "libyuv/convert.h"
+#include "libyuv/convert_argb.h"
+
+#if defined(__cplusplus)
+namespace libyuv {
+extern "C" {
+#endif
+
+LIBYUV_API
+void CopyPlane(const uint8_t* src_y,
+               int src_stride_y,
+               uint8_t* dst_y,
+               int dst_stride_y,
+               int width,
+               int height);
+
+LIBYUV_API
+void CopyPlane_16(const uint16_t* src_y,
+                  int src_stride_y,
+                  uint16_t* dst_y,
+                  int dst_stride_y,
+                  int width,
+                  int height);
+
+LIBYUV_API
+void Convert16To8Plane(const uint16_t* src_y,
+                       int src_stride_y,
+                       uint8_t* dst_y,
+                       int dst_stride_y,
+                       int scale,  
+                       int width,
+                       int height);
+
+LIBYUV_API
+void Convert8To16Plane(const uint8_t* src_y,
+                       int src_stride_y,
+                       uint16_t* dst_y,
+                       int dst_stride_y,
+                       int scale,  
+                       int width,
+                       int height);
+
+LIBYUV_API
+void Convert8To8Plane(const uint8_t* src_y,
+                      int src_stride_y,
+                      uint8_t* dst_y,
+                      int dst_stride_y,
+                      int scale,  
+                      int bias,   
+                      int width,
+                      int height);
+
+LIBYUV_API
+void SetPlane(uint8_t* dst_y,
+              int dst_stride_y,
+              int width,
+              int height,
+              uint32_t value);
+
+LIBYUV_API
+int DetilePlane(const uint8_t* src_y,
+                int src_stride_y,
+                uint8_t* dst_y,
+                int dst_stride_y,
+                int width,
+                int height,
+                int tile_height);
+
+LIBYUV_API
+int DetilePlane_16(const uint16_t* src_y,
+                   int src_stride_y,
+                   uint16_t* dst_y,
+                   int dst_stride_y,
+                   int width,
+                   int height,
+                   int tile_height);
+
+LIBYUV_API
+void DetileSplitUVPlane(const uint8_t* src_uv,
+                        int src_stride_uv,
+                        uint8_t* dst_u,
+                        int dst_stride_u,
+                        uint8_t* dst_v,
+                        int dst_stride_v,
+                        int width,
+                        int height,
+                        int tile_height);
+
+LIBYUV_API
+void DetileToYUY2(const uint8_t* src_y,
+                  int src_stride_y,
+                  const uint8_t* src_uv,
+                  int src_stride_uv,
+                  uint8_t* dst_yuy2,
+                  int dst_stride_yuy2,
+                  int width,
+                  int height,
+                  int tile_height);
+
+LIBYUV_API
+void SplitUVPlane(const uint8_t* src_uv,
+                  int src_stride_uv,
+                  uint8_t* dst_u,
+                  int dst_stride_u,
+                  uint8_t* dst_v,
+                  int dst_stride_v,
+                  int width,
+                  int height);
+
+LIBYUV_API
+void MergeUVPlane(const uint8_t* src_u,
+                  int src_stride_u,
+                  const uint8_t* src_v,
+                  int src_stride_v,
+                  uint8_t* dst_uv,
+                  int dst_stride_uv,
+                  int width,
+                  int height);
+
+LIBYUV_API
+void SplitUVPlane_16(const uint16_t* src_uv,
+                     int src_stride_uv,
+                     uint16_t* dst_u,
+                     int dst_stride_u,
+                     uint16_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     int depth);
+
+LIBYUV_API
+void MergeUVPlane_16(const uint16_t* src_u,
+                     int src_stride_u,
+                     const uint16_t* src_v,
+                     int src_stride_v,
+                     uint16_t* dst_uv,
+                     int dst_stride_uv,
+                     int width,
+                     int height,
+                     int depth);
+
+LIBYUV_API
+void ConvertToMSBPlane_16(const uint16_t* src_y,
+                          int src_stride_y,
+                          uint16_t* dst_y,
+                          int dst_stride_y,
+                          int width,
+                          int height,
+                          int depth);
+
+LIBYUV_API
+void ConvertToLSBPlane_16(const uint16_t* src_y,
+                          int src_stride_y,
+                          uint16_t* dst_y,
+                          int dst_stride_y,
+                          int width,
+                          int height,
+                          int depth);
+
+LIBYUV_API
+void HalfMergeUVPlane(const uint8_t* src_u,
+                      int src_stride_u,
+                      const uint8_t* src_v,
+                      int src_stride_v,
+                      uint8_t* dst_uv,
+                      int dst_stride_uv,
+                      int width,
+                      int height);
+
+LIBYUV_API
+void SwapUVPlane(const uint8_t* src_uv,
+                 int src_stride_uv,
+                 uint8_t* dst_vu,
+                 int dst_stride_vu,
+                 int width,
+                 int height);
+
+LIBYUV_API
+void SplitRGBPlane(const uint8_t* src_rgb,
+                   int src_stride_rgb,
+                   uint8_t* dst_r,
+                   int dst_stride_r,
+                   uint8_t* dst_g,
+                   int dst_stride_g,
+                   uint8_t* dst_b,
+                   int dst_stride_b,
+                   int width,
+                   int height);
+
+LIBYUV_API
+void MergeRGBPlane(const uint8_t* src_r,
+                   int src_stride_r,
+                   const uint8_t* src_g,
+                   int src_stride_g,
+                   const uint8_t* src_b,
+                   int src_stride_b,
+                   uint8_t* dst_rgb,
+                   int dst_stride_rgb,
+                   int width,
+                   int height);
+
+LIBYUV_API
+void SplitARGBPlane(const uint8_t* src_argb,
+                    int src_stride_argb,
+                    uint8_t* dst_r,
+                    int dst_stride_r,
+                    uint8_t* dst_g,
+                    int dst_stride_g,
+                    uint8_t* dst_b,
+                    int dst_stride_b,
+                    uint8_t* dst_a,
+                    int dst_stride_a,
+                    int width,
+                    int height);
+
+LIBYUV_API
+void MergeARGBPlane(const uint8_t* src_r,
+                    int src_stride_r,
+                    const uint8_t* src_g,
+                    int src_stride_g,
+                    const uint8_t* src_b,
+                    int src_stride_b,
+                    const uint8_t* src_a,
+                    int src_stride_a,
+                    uint8_t* dst_argb,
+                    int dst_stride_argb,
+                    int width,
+                    int height);
+
+LIBYUV_API
+void MergeXR30Plane(const uint16_t* src_r,
+                    int src_stride_r,
+                    const uint16_t* src_g,
+                    int src_stride_g,
+                    const uint16_t* src_b,
+                    int src_stride_b,
+                    uint8_t* dst_ar30,
+                    int dst_stride_ar30,
+                    int width,
+                    int height,
+                    int depth);
+
+LIBYUV_API
+void MergeAR64Plane(const uint16_t* src_r,
+                    int src_stride_r,
+                    const uint16_t* src_g,
+                    int src_stride_g,
+                    const uint16_t* src_b,
+                    int src_stride_b,
+                    const uint16_t* src_a,
+                    int src_stride_a,
+                    uint16_t* dst_ar64,
+                    int dst_stride_ar64,
+                    int width,
+                    int height,
+                    int depth);
+
+LIBYUV_API
+void MergeARGB16To8Plane(const uint16_t* src_r,
+                         int src_stride_r,
+                         const uint16_t* src_g,
+                         int src_stride_g,
+                         const uint16_t* src_b,
+                         int src_stride_b,
+                         const uint16_t* src_a,
+                         int src_stride_a,
+                         uint8_t* dst_argb,
+                         int dst_stride_argb,
+                         int width,
+                         int height,
+                         int depth);
+
+LIBYUV_API
+int I400ToI400(const uint8_t* src_y,
+               int src_stride_y,
+               uint8_t* dst_y,
+               int dst_stride_y,
+               int width,
+               int height);
+
+#define J400ToJ400 I400ToI400
+
+#define I422ToI422 I422Copy
+LIBYUV_API
+int I422Copy(const uint8_t* src_y,
+             int src_stride_y,
+             const uint8_t* src_u,
+             int src_stride_u,
+             const uint8_t* src_v,
+             int src_stride_v,
+             uint8_t* dst_y,
+             int dst_stride_y,
+             uint8_t* dst_u,
+             int dst_stride_u,
+             uint8_t* dst_v,
+             int dst_stride_v,
+             int width,
+             int height);
+
+#define I444ToI444 I444Copy
+LIBYUV_API
+int I444Copy(const uint8_t* src_y,
+             int src_stride_y,
+             const uint8_t* src_u,
+             int src_stride_u,
+             const uint8_t* src_v,
+             int src_stride_v,
+             uint8_t* dst_y,
+             int dst_stride_y,
+             uint8_t* dst_u,
+             int dst_stride_u,
+             uint8_t* dst_v,
+             int dst_stride_v,
+             int width,
+             int height);
+
+#define I210ToI210 I210Copy
+LIBYUV_API
+int I210Copy(const uint16_t* src_y,
+             int src_stride_y,
+             const uint16_t* src_u,
+             int src_stride_u,
+             const uint16_t* src_v,
+             int src_stride_v,
+             uint16_t* dst_y,
+             int dst_stride_y,
+             uint16_t* dst_u,
+             int dst_stride_u,
+             uint16_t* dst_v,
+             int dst_stride_v,
+             int width,
+             int height);
+
+#define I410ToI410 I410Copy
+LIBYUV_API
+int I410Copy(const uint16_t* src_y,
+             int src_stride_y,
+             const uint16_t* src_u,
+             int src_stride_u,
+             const uint16_t* src_v,
+             int src_stride_v,
+             uint16_t* dst_y,
+             int dst_stride_y,
+             uint16_t* dst_u,
+             int dst_stride_u,
+             uint16_t* dst_v,
+             int dst_stride_v,
+             int width,
+             int height);
+
+LIBYUV_API
+int NV12Copy(const uint8_t* src_y,
+             int src_stride_y,
+             const uint8_t* src_uv,
+             int src_stride_uv,
+             uint8_t* dst_y,
+             int dst_stride_y,
+             uint8_t* dst_uv,
+             int dst_stride_uv,
+             int width,
+             int height);
+
+LIBYUV_API
+int NV21Copy(const uint8_t* src_y,
+             int src_stride_y,
+             const uint8_t* src_vu,
+             int src_stride_vu,
+             uint8_t* dst_y,
+             int dst_stride_y,
+             uint8_t* dst_vu,
+             int dst_stride_vu,
+             int width,
+             int height);
+
+LIBYUV_API
+int YUY2ToI422(const uint8_t* src_yuy2,
+               int src_stride_yuy2,
+               uint8_t* dst_y,
+               int dst_stride_y,
+               uint8_t* dst_u,
+               int dst_stride_u,
+               uint8_t* dst_v,
+               int dst_stride_v,
+               int width,
+               int height);
+
+LIBYUV_API
+int UYVYToI422(const uint8_t* src_uyvy,
+               int src_stride_uyvy,
+               uint8_t* dst_y,
+               int dst_stride_y,
+               uint8_t* dst_u,
+               int dst_stride_u,
+               uint8_t* dst_v,
+               int dst_stride_v,
+               int width,
+               int height);
+
+LIBYUV_API
+int YUY2ToNV12(const uint8_t* src_yuy2,
+               int src_stride_yuy2,
+               uint8_t* dst_y,
+               int dst_stride_y,
+               uint8_t* dst_uv,
+               int dst_stride_uv,
+               int width,
+               int height);
+
+LIBYUV_API
+int UYVYToNV12(const uint8_t* src_uyvy,
+               int src_stride_uyvy,
+               uint8_t* dst_y,
+               int dst_stride_y,
+               uint8_t* dst_uv,
+               int dst_stride_uv,
+               int width,
+               int height);
+
+LIBYUV_API
+int NV21ToNV12(const uint8_t* src_y,
+               int src_stride_y,
+               const uint8_t* src_vu,
+               int src_stride_vu,
+               uint8_t* dst_y,
+               int dst_stride_y,
+               uint8_t* dst_uv,
+               int dst_stride_uv,
+               int width,
+               int height);
+
+#define NV12ToNV21 NV21ToNV12
+
+LIBYUV_API
+int YUY2ToY(const uint8_t* src_yuy2,
+            int src_stride_yuy2,
+            uint8_t* dst_y,
+            int dst_stride_y,
+            int width,
+            int height);
+
+LIBYUV_API
+int UYVYToY(const uint8_t* src_uyvy,
+            int src_stride_uyvy,
+            uint8_t* dst_y,
+            int dst_stride_y,
+            int width,
+            int height);
+
+LIBYUV_API
+int I420ToI400(const uint8_t* src_y,
+               int src_stride_y,
+               const uint8_t* src_u,
+               int src_stride_u,
+               const uint8_t* src_v,
+               int src_stride_v,
+               uint8_t* dst_y,
+               int dst_stride_y,
+               int width,
+               int height);
+
+#define J420ToJ400 I420ToI400
+#define I420ToI420Mirror I420Mirror
+
+LIBYUV_API
+int I420Mirror(const uint8_t* src_y,
+               int src_stride_y,
+               const uint8_t* src_u,
+               int src_stride_u,
+               const uint8_t* src_v,
+               int src_stride_v,
+               uint8_t* dst_y,
+               int dst_stride_y,
+               uint8_t* dst_u,
+               int dst_stride_u,
+               uint8_t* dst_v,
+               int dst_stride_v,
+               int width,
+               int height);
+
+#define I400ToI400Mirror I400Mirror
+
+LIBYUV_API
+int I400Mirror(const uint8_t* src_y,
+               int src_stride_y,
+               uint8_t* dst_y,
+               int dst_stride_y,
+               int width,
+               int height);
+
+#define NV12ToNV12Mirror NV12Mirror
+
+LIBYUV_API
+int NV12Mirror(const uint8_t* src_y,
+               int src_stride_y,
+               const uint8_t* src_uv,
+               int src_stride_uv,
+               uint8_t* dst_y,
+               int dst_stride_y,
+               uint8_t* dst_uv,
+               int dst_stride_uv,
+               int width,
+               int height);
+
+#define ARGBToARGBMirror ARGBMirror
+
+LIBYUV_API
+int ARGBMirror(const uint8_t* src_argb,
+               int src_stride_argb,
+               uint8_t* dst_argb,
+               int dst_stride_argb,
+               int width,
+               int height);
+
+#define RGB24ToRGB24Mirror RGB24Mirror
+
+LIBYUV_API
+int RGB24Mirror(const uint8_t* src_rgb24,
+                int src_stride_rgb24,
+                uint8_t* dst_rgb24,
+                int dst_stride_rgb24,
+                int width,
+                int height);
+
+LIBYUV_API
+void MirrorPlane(const uint8_t* src_y,
+                 int src_stride_y,
+                 uint8_t* dst_y,
+                 int dst_stride_y,
+                 int width,
+                 int height);
+
+LIBYUV_API
+void MirrorUVPlane(const uint8_t* src_uv,
+                   int src_stride_uv,
+                   uint8_t* dst_uv,
+                   int dst_stride_uv,
+                   int width,
+                   int height);
+
+#define RGB24ToRAW RAWToRGB24
+
+LIBYUV_API
+int RAWToRGB24(const uint8_t* src_raw,
+               int src_stride_raw,
+               uint8_t* dst_rgb24,
+               int dst_stride_rgb24,
+               int width,
+               int height);
+
+LIBYUV_API
+int I420Rect(uint8_t* dst_y,
+             int dst_stride_y,
+             uint8_t* dst_u,
+             int dst_stride_u,
+             uint8_t* dst_v,
+             int dst_stride_v,
+             int x,
+             int y,
+             int width,
+             int height,
+             int value_y,
+             int value_u,
+             int value_v);
+
+LIBYUV_API
+int ARGBRect(uint8_t* dst_argb,
+             int dst_stride_argb,
+             int dst_x,
+             int dst_y,
+             int width,
+             int height,
+             uint32_t value);
+
+LIBYUV_API
+int ARGBGrayTo(const uint8_t* src_argb,
+               int src_stride_argb,
+               uint8_t* dst_argb,
+               int dst_stride_argb,
+               int width,
+               int height);
+
+LIBYUV_API
+int ARGBGray(uint8_t* dst_argb,
+             int dst_stride_argb,
+             int dst_x,
+             int dst_y,
+             int width,
+             int height);
+
+LIBYUV_API
+int ARGBSepia(uint8_t* dst_argb,
+              int dst_stride_argb,
+              int dst_x,
+              int dst_y,
+              int width,
+              int height);
+
+LIBYUV_API
+int ARGBColorMatrix(const uint8_t* src_argb,
+                    int src_stride_argb,
+                    uint8_t* dst_argb,
+                    int dst_stride_argb,
+                    const int8_t* matrix_argb,
+                    int width,
+                    int height);
+
+LIBYUV_API
+int RGBColorMatrix(uint8_t* dst_argb,
+                   int dst_stride_argb,
+                   const int8_t* matrix_rgb,
+                   int dst_x,
+                   int dst_y,
+                   int width,
+                   int height);
+
+LIBYUV_API
+int ARGBColorTable(uint8_t* dst_argb,
+                   int dst_stride_argb,
+                   const uint8_t* table_argb,
+                   int dst_x,
+                   int dst_y,
+                   int width,
+                   int height);
+
+LIBYUV_API
+int RGBColorTable(uint8_t* dst_argb,
+                  int dst_stride_argb,
+                  const uint8_t* table_argb,
+                  int dst_x,
+                  int dst_y,
+                  int width,
+                  int height);
+
+LIBYUV_API
+int ARGBLumaColorTable(const uint8_t* src_argb,
+                       int src_stride_argb,
+                       uint8_t* dst_argb,
+                       int dst_stride_argb,
+                       const uint8_t* luma,
+                       int width,
+                       int height);
+
+
+LIBYUV_API
+int ARGBPolynomial(const uint8_t* src_argb,
+                   int src_stride_argb,
+                   uint8_t* dst_argb,
+                   int dst_stride_argb,
+                   const float* poly,
+                   int width,
+                   int height);
+
+LIBYUV_API
+int HalfFloatPlane(const uint16_t* src_y,
+                   int src_stride_y,
+                   uint16_t* dst_y,
+                   int dst_stride_y,
+                   float scale,
+                   int width,
+                   int height);
+
+LIBYUV_API
+int ByteToFloat(const uint8_t* src_y, float* dst_y, float scale, int width);
+
+LIBYUV_API
+int ARGBQuantize(uint8_t* dst_argb,
+                 int dst_stride_argb,
+                 int scale,
+                 int interval_size,
+                 int interval_offset,
+                 int dst_x,
+                 int dst_y,
+                 int width,
+                 int height);
+
+LIBYUV_API
+int ARGBCopy(const uint8_t* src_argb,
+             int src_stride_argb,
+             uint8_t* dst_argb,
+             int dst_stride_argb,
+             int width,
+             int height);
+
+LIBYUV_API
+int ARGBCopyAlpha(const uint8_t* src_argb,
+                  int src_stride_argb,
+                  uint8_t* dst_argb,
+                  int dst_stride_argb,
+                  int width,
+                  int height);
+
+LIBYUV_API
+int ARGBExtractAlpha(const uint8_t* src_argb,
+                     int src_stride_argb,
+                     uint8_t* dst_a,
+                     int dst_stride_a,
+                     int width,
+                     int height);
+
+LIBYUV_API
+int ARGBCopyYToAlpha(const uint8_t* src_y,
+                     int src_stride_y,
+                     uint8_t* dst_argb,
+                     int dst_stride_argb,
+                     int width,
+                     int height);
+
+LIBYUV_API
+int ARGBBlend(const uint8_t* src_argb0,
+              int src_stride_argb0,
+              const uint8_t* src_argb1,
+              int src_stride_argb1,
+              uint8_t* dst_argb,
+              int dst_stride_argb,
+              int width,
+              int height);
+
+LIBYUV_API
+int BlendPlane(const uint8_t* src_y0,
+               int src_stride_y0,
+               const uint8_t* src_y1,
+               int src_stride_y1,
+               const uint8_t* alpha,
+               int alpha_stride,
+               uint8_t* dst_y,
+               int dst_stride_y,
+               int width,
+               int height);
+
+LIBYUV_API
+int I420Blend(const uint8_t* src_y0,
+              int src_stride_y0,
+              const uint8_t* src_u0,
+              int src_stride_u0,
+              const uint8_t* src_v0,
+              int src_stride_v0,
+              const uint8_t* src_y1,
+              int src_stride_y1,
+              const uint8_t* src_u1,
+              int src_stride_u1,
+              const uint8_t* src_v1,
+              int src_stride_v1,
+              const uint8_t* alpha,
+              int alpha_stride,
+              uint8_t* dst_y,
+              int dst_stride_y,
+              uint8_t* dst_u,
+              int dst_stride_u,
+              uint8_t* dst_v,
+              int dst_stride_v,
+              int width,
+              int height);
+
+LIBYUV_API
+int ARGBMultiply(const uint8_t* src_argb0,
+                 int src_stride_argb0,
+                 const uint8_t* src_argb1,
+                 int src_stride_argb1,
+                 uint8_t* dst_argb,
+                 int dst_stride_argb,
+                 int width,
+                 int height);
+
+LIBYUV_API
+int ARGBAdd(const uint8_t* src_argb0,
+            int src_stride_argb0,
+            const uint8_t* src_argb1,
+            int src_stride_argb1,
+            uint8_t* dst_argb,
+            int dst_stride_argb,
+            int width,
+            int height);
+
+LIBYUV_API
+int ARGBSubtract(const uint8_t* src_argb0,
+                 int src_stride_argb0,
+                 const uint8_t* src_argb1,
+                 int src_stride_argb1,
+                 uint8_t* dst_argb,
+                 int dst_stride_argb,
+                 int width,
+                 int height);
+
+LIBYUV_API
+int I422ToYUY2(const uint8_t* src_y,
+               int src_stride_y,
+               const uint8_t* src_u,
+               int src_stride_u,
+               const uint8_t* src_v,
+               int src_stride_v,
+               uint8_t* dst_yuy2,
+               int dst_stride_yuy2,
+               int width,
+               int height);
+
+LIBYUV_API
+int I422ToUYVY(const uint8_t* src_y,
+               int src_stride_y,
+               const uint8_t* src_u,
+               int src_stride_u,
+               const uint8_t* src_v,
+               int src_stride_v,
+               uint8_t* dst_uyvy,
+               int dst_stride_uyvy,
+               int width,
+               int height);
+
+LIBYUV_API
+int ARGBAttenuate(const uint8_t* src_argb,
+                  int src_stride_argb,
+                  uint8_t* dst_argb,
+                  int dst_stride_argb,
+                  int width,
+                  int height);
+
+LIBYUV_API
+int ARGBUnattenuate(const uint8_t* src_argb,
+                    int src_stride_argb,
+                    uint8_t* dst_argb,
+                    int dst_stride_argb,
+                    int width,
+                    int height);
+
+LIBYUV_API
+int ARGBComputeCumulativeSum(const uint8_t* src_argb,
+                             int src_stride_argb,
+                             int32_t* dst_cumsum,
+                             int dst_stride32_cumsum,
+                             int width,
+                             int height);
+
+LIBYUV_API
+int ARGBBlur(const uint8_t* src_argb,
+             int src_stride_argb,
+             uint8_t* dst_argb,
+             int dst_stride_argb,
+             int32_t* dst_cumsum,
+             int dst_stride32_cumsum,
+             int width,
+             int height,
+             int radius);
+
+LIBYUV_API
+int GaussPlane_F32(const float* src,
+                   int src_stride,
+                   float* dst,
+                   int dst_stride,
+                   int width,
+                   int height);
+
+LIBYUV_API
+int ARGBShade(const uint8_t* src_argb,
+              int src_stride_argb,
+              uint8_t* dst_argb,
+              int dst_stride_argb,
+              int width,
+              int height,
+              uint32_t value);
+
+LIBYUV_API
+int InterpolatePlane(const uint8_t* src0,
+                     int src_stride0,
+                     const uint8_t* src1,
+                     int src_stride1,
+                     uint8_t* dst,
+                     int dst_stride,
+                     int width,
+                     int height,
+                     int interpolation);
+
+LIBYUV_API
+int InterpolatePlane_16(const uint16_t* src0,
+                        int src_stride0,  
+                        const uint16_t* src1,
+                        int src_stride1,
+                        uint16_t* dst,
+                        int dst_stride,
+                        int width,
+                        int height,
+                        int interpolation);
+
+LIBYUV_API
+int ARGBInterpolate(const uint8_t* src_argb0,
+                    int src_stride_argb0,
+                    const uint8_t* src_argb1,
+                    int src_stride_argb1,
+                    uint8_t* dst_argb,
+                    int dst_stride_argb,
+                    int width,
+                    int height,
+                    int interpolation);
+
+LIBYUV_API
+int I420Interpolate(const uint8_t* src0_y,
+                    int src0_stride_y,
+                    const uint8_t* src0_u,
+                    int src0_stride_u,
+                    const uint8_t* src0_v,
+                    int src0_stride_v,
+                    const uint8_t* src1_y,
+                    int src1_stride_y,
+                    const uint8_t* src1_u,
+                    int src1_stride_u,
+                    const uint8_t* src1_v,
+                    int src1_stride_v,
+                    uint8_t* dst_y,
+                    int dst_stride_y,
+                    uint8_t* dst_u,
+                    int dst_stride_u,
+                    uint8_t* dst_v,
+                    int dst_stride_v,
+                    int width,
+                    int height,
+                    int interpolation);
+
+LIBYUV_API
+int ARGBShuffle(const uint8_t* src_argb,
+                int src_stride_argb,
+                uint8_t* dst_argb,
+                int dst_stride_argb,
+                const uint8_t* shuffler,
+                int width,
+                int height);
+
+LIBYUV_API
+int AR64Shuffle(const uint16_t* src_ar64,
+                int src_stride_ar64,
+                uint16_t* dst_ar64,
+                int dst_stride_ar64,
+                const uint8_t* shuffler,
+                int width,
+                int height);
+
+LIBYUV_API
+int ARGBSobelToPlane(const uint8_t* src_argb,
+                     int src_stride_argb,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     int width,
+                     int height);
+
+LIBYUV_API
+int ARGBSobel(const uint8_t* src_argb,
+              int src_stride_argb,
+              uint8_t* dst_argb,
+              int dst_stride_argb,
+              int width,
+              int height);
+
+LIBYUV_API
+int ARGBSobelXY(const uint8_t* src_argb,
+                int src_stride_argb,
+                uint8_t* dst_argb,
+                int dst_stride_argb,
+                int width,
+                int height);
+
+#if defined(__cplusplus)
+}  
+}  
+#endif
+
+#endif

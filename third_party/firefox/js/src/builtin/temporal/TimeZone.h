@@ -1,0 +1,287 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_temporal_TimeZone_h
+#define builtin_temporal_TimeZone_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+
+#include <array>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "builtin/temporal/TemporalTypes.h"
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "vm/JSObject.h"
+#include "vm/NativeObject.h"
+#include "vm/StringType.h"
+
+class JS_PUBLIC_API JSTracer;
+struct JSClassOps;
+
+namespace mozilla::intl {
+class TimeZone;
+}
+
+namespace js::temporal {
+
+class TimeZoneObject : public NativeObject {
+ public:
+  static const JSClass class_;
+
+  static constexpr uint32_t IDENTIFIER_SLOT = 0;
+  static constexpr uint32_t PRIMARY_IDENTIFIER_SLOT = 1;
+  static constexpr uint32_t OFFSET_MINUTES_SLOT = 2;
+  static constexpr uint32_t INTL_TIMEZONE_SLOT = 3;
+  static constexpr uint32_t SLOT_COUNT = 4;
+
+  static constexpr size_t EstimatedMemoryUse = 6840;
+
+  bool isOffset() const { return getFixedSlot(OFFSET_MINUTES_SLOT).isInt32(); }
+
+  JSLinearString* identifier() const {
+    return &getFixedSlot(IDENTIFIER_SLOT).toString()->asLinear();
+  }
+
+  JSLinearString* primaryIdentifier() const {
+    MOZ_ASSERT(!isOffset());
+    return &getFixedSlot(PRIMARY_IDENTIFIER_SLOT).toString()->asLinear();
+  }
+
+  int32_t offsetMinutes() const {
+    MOZ_ASSERT(isOffset());
+    return getFixedSlot(OFFSET_MINUTES_SLOT).toInt32();
+  }
+
+  mozilla::intl::TimeZone* getTimeZone() const {
+    const auto& slot = getFixedSlot(INTL_TIMEZONE_SLOT);
+    if (slot.isUndefined()) {
+      return nullptr;
+    }
+    return static_cast<mozilla::intl::TimeZone*>(slot.toPrivate());
+  }
+
+  void setTimeZone(mozilla::intl::TimeZone* timeZone) {
+    setFixedSlot(INTL_TIMEZONE_SLOT, JS::PrivateValue(timeZone));
+  }
+
+ private:
+  static const JSClassOps classOps_;
+
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+};
+
+} 
+
+namespace js::temporal {
+
+class MOZ_STACK_CLASS TimeZoneValue final {
+  TimeZoneObject* object_ = nullptr;
+
+ public:
+  TimeZoneValue() = default;
+
+  explicit TimeZoneValue(TimeZoneObject* timeZone) : object_(timeZone) {
+    MOZ_ASSERT(object_);
+  }
+
+  explicit TimeZoneValue(const JS::Value& value)
+      : object_(&value.toObject().as<TimeZoneObject>()) {}
+
+  explicit operator bool() const { return !!object_; }
+
+  bool isOffset() const {
+    MOZ_ASSERT(object_);
+    return object_->isOffset();
+  }
+
+  auto offsetMinutes() const {
+    MOZ_ASSERT(object_);
+    return object_->offsetMinutes();
+  }
+
+  auto* identifier() const {
+    MOZ_ASSERT(object_);
+    return object_->identifier();
+  }
+
+  auto* primaryIdentifier() const {
+    MOZ_ASSERT(object_);
+    return object_->primaryIdentifier();
+  }
+
+  auto* getTimeZone() const {
+    MOZ_ASSERT(object_);
+    return object_->getTimeZone();
+  }
+
+  auto* toTimeZoneObject() const {
+    MOZ_ASSERT(object_);
+    return object_;
+  }
+
+  JS::Value toSlotValue() const {
+    MOZ_ASSERT(object_);
+    return JS::ObjectValue(*object_);
+  }
+
+  auto address() { return &object_; }
+  auto address() const { return &object_; }
+
+  void trace(JSTracer* trc);
+};
+
+class PossibleEpochNanoseconds final {
+  static constexpr size_t MaxLength = 2;
+
+  std::array<EpochNanoseconds, MaxLength> array_ = {};
+  size_t length_ = 0;
+
+  void append(const EpochNanoseconds& epochNs) { array_[length_++] = epochNs; }
+
+ public:
+  PossibleEpochNanoseconds() = default;
+
+  explicit PossibleEpochNanoseconds(const EpochNanoseconds& epochNs) {
+    append(epochNs);
+  }
+
+  explicit PossibleEpochNanoseconds(const EpochNanoseconds& earlier,
+                                    const EpochNanoseconds& later) {
+    MOZ_ASSERT(earlier <= later);
+    append(earlier);
+    append(later);
+  }
+
+  size_t length() const { return length_; }
+  bool empty() const { return length_ == 0; }
+
+  const auto& operator[](size_t i) const { return array_[i]; }
+
+  auto begin() const { return array_.begin(); }
+  auto end() const { return array_.begin() + length_; }
+
+  const auto& front() const {
+    MOZ_ASSERT(length_ > 0);
+    return array_[0];
+  }
+  const auto& back() const {
+    MOZ_ASSERT(length_ > 0);
+    return array_[length_ - 1];
+  }
+};
+
+struct ParsedTimeZone;
+enum class TemporalDisambiguation;
+
+TimeZoneObject* CreateTimeZoneObject(
+    JSContext* cx, JS::Handle<JSLinearString*> identifier,
+    JS::Handle<JSLinearString*> primaryIdentifier);
+
+JSLinearString* ComputeSystemTimeZoneIdentifier(JSContext* cx);
+
+JSLinearString* SystemTimeZoneIdentifier(JSContext* cx);
+
+bool SystemTimeZone(JSContext* cx, JS::MutableHandle<TimeZoneValue> result);
+
+bool ToTemporalTimeZone(JSContext* cx,
+                        JS::Handle<JS::Value> temporalTimeZoneLike,
+                        JS::MutableHandle<TimeZoneValue> result);
+
+bool ToTemporalTimeZone(JSContext* cx, JS::Handle<ParsedTimeZone> string,
+                        JS::MutableHandle<TimeZoneValue> result);
+
+JSLinearString* ToValidCanonicalTimeZoneIdentifier(
+    JSContext* cx, JS::Handle<JSString*> timeZone);
+
+bool TimeZoneEquals(const TimeZoneValue& one, const TimeZoneValue& two);
+
+ISODateTime GetISODateTimeFor(const EpochNanoseconds& epochNs,
+                              int64_t offsetNanoseconds);
+
+bool GetISODateTimeFor(JSContext* cx, JS::Handle<TimeZoneValue> timeZone,
+                       const EpochNanoseconds& epochNs, ISODateTime* result);
+
+bool GetEpochNanosecondsFor(JSContext* cx, JS::Handle<TimeZoneValue> timeZone,
+                            const ISODateTime& isoDateTime,
+                            TemporalDisambiguation disambiguation,
+                            EpochNanoseconds* result);
+
+bool GetOffsetNanosecondsFor(JSContext* cx, JS::Handle<TimeZoneValue> timeZone,
+                             const EpochNanoseconds& epochNs,
+                             int64_t* offsetNanoseconds);
+
+bool GetPossibleEpochNanoseconds(JSContext* cx,
+                                 JS::Handle<TimeZoneValue> timeZone,
+                                 const ISODateTime& isoDateTime,
+                                 PossibleEpochNanoseconds* result);
+
+bool DisambiguatePossibleEpochNanoseconds(
+    JSContext* cx, const PossibleEpochNanoseconds& possibleEpochNs,
+    JS::Handle<TimeZoneValue> timeZone, const ISODateTime& isoDateTime,
+    TemporalDisambiguation disambiguation, EpochNanoseconds* result);
+
+bool GetNamedTimeZoneNextTransition(JSContext* cx,
+                                    JS::Handle<TimeZoneValue> timeZone,
+                                    const EpochNanoseconds& epochNanoseconds,
+                                    mozilla::Maybe<EpochNanoseconds>* result);
+
+bool GetNamedTimeZonePreviousTransition(
+    JSContext* cx, JS::Handle<TimeZoneValue> timeZone,
+    const EpochNanoseconds& epochNanoseconds,
+    mozilla::Maybe<EpochNanoseconds>* result);
+
+bool GetStartOfDay(JSContext* cx, JS::Handle<TimeZoneValue> timeZone,
+                   const ISODate& isoDate, EpochNanoseconds* result);
+
+bool WrapTimeZoneValueObject(JSContext* cx,
+                             JS::MutableHandle<TimeZoneObject*> timeZone);
+
+} 
+
+namespace js {
+
+template <typename Wrapper>
+class WrappedPtrOperations<temporal::TimeZoneValue, Wrapper> {
+  const auto& container() const {
+    return static_cast<const Wrapper*>(this)->get();
+  }
+
+ public:
+  explicit operator bool() const { return !!container(); }
+
+  bool isOffset() const { return container().isOffset(); }
+
+  auto offsetMinutes() const { return container().offsetMinutes(); }
+
+  auto* identifier() const { return container().identifier(); }
+
+  auto* primaryIdentifier() const { return container().primaryIdentifier(); }
+
+  auto* getTimeZone() const { return container().getTimeZone(); }
+
+  JS::Value toSlotValue() const { return container().toSlotValue(); }
+};
+
+template <typename Wrapper>
+class MutableWrappedPtrOperations<temporal::TimeZoneValue, Wrapper>
+    : public WrappedPtrOperations<temporal::TimeZoneValue, Wrapper> {
+  auto& container() { return static_cast<Wrapper*>(this)->get(); }
+
+ public:
+  bool wrap(JSContext* cx) {
+    MOZ_ASSERT(container());
+    auto mh = JS::MutableHandle<temporal::TimeZoneObject*>::fromMarkedLocation(
+        container().address());
+    return temporal::WrapTimeZoneValueObject(cx, mh);
+  }
+};
+
+} 
+
+#endif /* builtin_temporal_TimeZone_h */

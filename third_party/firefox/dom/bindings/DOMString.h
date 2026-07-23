@@ -1,0 +1,71 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_DOMString_h
+#define mozilla_dom_DOMString_h
+
+#include "nsAtom.h"
+#include "nsDOMString.h"
+#include "nsString.h"
+
+namespace mozilla::dom {
+
+class DOMString final : public nsAutoString {
+ public:
+  enum NullHandling { eTreatNullAsNull, eTreatNullAsEmpty, eNullNotExpected };
+
+  void SetKnownLiveAtom(nsAtom* aAtom, NullHandling aNullHandling) {
+    AssertSetKnownLivePrecondition();
+    MOZ_ASSERT(aAtom || aNullHandling != eNullNotExpected);
+    if (aNullHandling == eNullNotExpected || aAtom) {
+      DataFlags flags = DataFlags::TERMINATED;
+      const char_type* data;
+      if (aAtom->IsStatic()) {
+        data = aAtom->AsStatic()->String();
+        flags |= DataFlags::LITERAL;
+      } else {
+        MOZ_ASSERT(aAtom->AsDynamic()->StringBuffer());
+        data = aAtom->AsDynamic()->String();
+        flags |= DataFlags::STRINGBUFFER;
+      }
+      SetData(const_cast<char_type*>(data), aAtom->GetLength(), flags);
+      AssertValid();
+    } else if (aNullHandling == eTreatNullAsNull) {
+      SetNull();
+    }
+  }
+
+  void SetKnownLiveString(const nsAString& aString) {
+    AssertSetKnownLivePrecondition();
+    MOZ_ASSERT(aString.IsTerminated(),
+               "If we are not terminated, then we need copying or so");
+    const char_type* data = aString.Data();
+    SetData(
+        const_cast<char_type*>(data), aString.Length(),
+        aString.GetDataFlags() & (DataFlags::TERMINATED | DataFlags::LITERAL |
+                                  DataFlags::STRINGBUFFER | DataFlags::VOIDED));
+    AssertValid();
+  }
+
+  void SetKnownLiveStringBuffer(StringBuffer* aBuffer, LengthStorage aLen) {
+    AssertSetKnownLivePrecondition();
+    MOZ_ASSERT(aBuffer);
+    SetData(static_cast<char_type*>(aBuffer->Data()), aLen,
+            DataFlags::STRINGBUFFER | DataFlags::TERMINATED);
+    AssertValid();
+  }
+
+  void SetNull() { SetIsVoid(true); }
+  bool IsNull() const { return IsVoid(); }
+
+ private:
+  void AssertSetKnownLivePrecondition() {
+    MOZ_ASSERT(IsEmpty(), "We rely on this being called only on empty strings");
+    MOZ_ASSERT(!(mDataFlags & DataFlags::OWNED), "Would leak");
+  }
+};
+
+}  
+
+#endif  // mozilla_dom_DOMString_h

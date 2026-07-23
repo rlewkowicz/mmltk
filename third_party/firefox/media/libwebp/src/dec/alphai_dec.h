@@ -1,0 +1,41 @@
+// Copyright 2013 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#if !defined(WEBP_DEC_ALPHAI_DEC_H_)
+#define WEBP_DEC_ALPHAI_DEC_H_
+
+#include "src/dec/vp8_dec.h"
+#include "src/webp/types.h"
+#include "src/dec/webpi_dec.h"
+#include "src/dsp/dsp.h"
+#include "src/utils/filters_utils.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+struct VP8LDecoder;  
+
+typedef struct ALPHDecoder ALPHDecoder;
+struct ALPHDecoder {
+  int width;
+  int height;
+  int method;
+  WEBP_FILTER_TYPE filter;
+  int pre_processing;
+  struct VP8LDecoder* vp8l_dec;
+  VP8Io io;
+  int use_8b_decode;   
+  uint8_t* output;
+  const uint8_t* prev_line;   
+};
+
+
+void WebPDeallocateAlphaMemory(VP8Decoder* const dec);
+
+
+#if defined(__cplusplus)
+}    
+#endif
+
+#endif

@@ -1,0 +1,367 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZ_WAYLAND_SURFACE_H_
+#define MOZ_WAYLAND_SURFACE_H_
+
+#include "nsWaylandDisplay.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/Atomics.h"
+#include "WaylandSurfaceLock.h"
+#include "mozilla/GRefPtr.h"
+
+struct wl_surface;
+struct wl_subsurface;
+struct wl_egl_window;
+
+class MessageLoop;
+
+namespace mozilla::widget {
+
+class WaylandBuffer;
+class BufferTransaction;
+
+class WaylandSurface final {
+  friend WaylandSurfaceLock;
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(WaylandSurface);
+
+  WaylandSurface();
+
+  void Init(RefPtr<WaylandSurface> aRootLayer = nullptr);
+
+#ifdef MOZ_LOGGING
+  nsAutoCString GetDebugTag() const;
+  void* GetLoggingWidget() const { return mLoggingWidget; };
+  void SetLoggingWidget(void* aWidget) { mLoggingWidget = aWidget; }
+#endif
+
+  void VSyncCallbackHandler(struct wl_callback* aCallback, uint32_t aTime,
+                            bool aEmulated, bool aRoutedFromChildSurface);
+
+  void SetVSyncCallbackHandlerLocked(
+      const WaylandSurfaceLock& aProofOfLock,
+      const std::function<void(wl_callback*, uint32_t, bool)>&
+          aVSyncCallbackHandler,
+      bool aEmulateVSyncCallback = false);
+
+  void ClearVSyncCallbackHandlerLocked(const WaylandSurfaceLock& aProofOfLock);
+
+  void SetVSyncCallbackStateLocked(const WaylandSurfaceLock& aProofOfLock,
+                                   bool aEnabled);
+  void SetVSyncCallbackStateHandlerLocked(
+      const WaylandSurfaceLock& aProofOfLock,
+      const std::function<void(bool)>& aVSyncCallbackStateHandler);
+
+  void SetVSyncEmulateCheckLocked(
+      const WaylandSurfaceLock& aProofOfLock,
+      const std::function<bool(void)>& aVSyncEmulateCheck, bool aForce = false);
+
+  wl_egl_window* GetEGLWindow(DesktopIntSize aSize);
+  bool HasEGLWindow() const { return !!mEGLWindow; }
+
+  void SetSize(DesktopIntSize aSize);
+
+  void ApplyEGLWindowSize(LayoutDeviceIntSize aEGLWindowSize);
+
+  bool IsMapped() const { return mIsMapped; }
+
+  bool IsVisible() const { return mIsVisible; }
+
+  bool IsToplevelSurface() const { return !mParent; }
+
+  void VisibleCallbackHandler();
+
+  bool IsPendingGdkCleanup() const { return mIsPendingGdkCleanup; }
+
+  bool IsOpaqueSurfaceHandlerSet() const { return mIsOpaqueSurfaceHandlerSet; }
+
+  bool HasBufferAttached() const { return mBufferAttached; }
+
+  bool MapLocked(const WaylandSurfaceLock& aProofOfLock,
+                 wl_surface* aParentWLSurface,
+                 DesktopIntPoint aSubsurfacePosition);
+  bool MapLocked(const WaylandSurfaceLock& aProofOfLock,
+                 WaylandSurfaceLock* aParentWaylandSurfaceLock,
+                 DesktopIntPoint aSubsurfacePosition);
+  void UnmapLocked(WaylandSurfaceLock& aSurfaceLock);
+
+  void GdkCleanUpLocked(const WaylandSurfaceLock& aProofOfLock);
+
+  void SetMapCallbackLocked(
+      const WaylandSurfaceLock& aProofOfLock,
+      const std::function<void(WaylandSurfaceLock& aProofOfLock)>& aMapCB);
+  void ClearMapCallbackLocked(const WaylandSurfaceLock& aProofOfLock);
+  void RunMapCallbackLocked(WaylandSurfaceLock& aProofOfLock);
+
+  void SetUnmapCallbackLocked(const WaylandSurfaceLock& aProofOfLock,
+                              const std::function<void(void)>& aUnmapCB);
+  void ClearUnmapCallbackLocked(const WaylandSurfaceLock& aProofOfLock);
+  void RunUnmapCallback();
+
+  bool AttachLocked(const WaylandSurfaceLock& aSurfaceLock,
+                    RefPtr<WaylandBuffer> aBuffer);
+  bool IsBufferAttached(WaylandBuffer* aBuffer);
+
+  void RemoveAttachedBufferLocked(const WaylandSurfaceLock& aProofOfLock);
+
+  void RemoveTransactionLocked(const WaylandSurfaceLock& aSurfaceLock,
+                               RefPtr<BufferTransaction> aTransaction);
+
+
+
+  void CommitLocked(const WaylandSurfaceLock& aProofOfLock,
+                    bool aForceCommit = false, bool aForceDisplayFlush = false);
+
+  void EnableDMABufFormatsLocked(
+      const WaylandSurfaceLock& aProofOfLock,
+      const std::function<void(DMABufFormats*)>& aFormatRefreshCB);
+  void DisableDMABufFormatsLocked(const WaylandSurfaceLock& aProofOfLock);
+
+  void PlaceAboveLocked(const WaylandSurfaceLock& aProofOfLock,
+                        WaylandSurfaceLock& aLowerSurfaceLock);
+  void MoveLocked(const WaylandSurfaceLock& aProofOfLock,
+                  DesktopIntPoint aPosition);
+  void SetViewportFollowsSizeChangesLocked(
+      const WaylandSurfaceLock& aProofOfLock);
+  void SetViewPortSourceRectLocked(const WaylandSurfaceLock& aProofOfLock,
+                                   const DesktopRect& aRect);
+  void SetViewPortDestLocked(const WaylandSurfaceLock& aProofOfLock,
+                             const DesktopIntSize& aDestSize);
+  void SetTransformFlippedLocked(const WaylandSurfaceLock& aProofOfLock,
+                                 bool aFlippedX, bool aFlippedY);
+
+  void SetOpaqueRegion(const gfx::IntRegion& aRegion);
+  void SetOpaqueRegionLocked(const WaylandSurfaceLock& aProofOfLock,
+                             const gfx::IntRegion& aRegion);
+  void SetOpaqueLocked(const WaylandSurfaceLock& aProofOfLock);
+  void ClearOpaqueRegionLocked(const WaylandSurfaceLock& aProofOfLock);
+  void OpaqueCallbackHandler();
+
+  void ClearOpaqueCallbackLocked(const WaylandSurfaceLock& aProofOfLock);
+  void SetOpaqueCallbackLocked(const WaylandSurfaceLock& aProofOfLock);
+
+  bool DisableUserInputLocked(const WaylandSurfaceLock& aProofOfLock);
+  void InvalidateRegionLocked(const WaylandSurfaceLock& aProofOfLock,
+                              const gfx::IntRegion& aInvalidRegion);
+  void InvalidateLocked(const WaylandSurfaceLock& aProofOfLock);
+
+  enum ScaleType {
+    Disabled = 0,
+    Ceiled = 1,
+    Fractional = 2,
+    Coordinates = 3,
+  };
+
+  void SetScaleTypeLocked(const WaylandSurfaceLock& aProofOfLock,
+                          ScaleType aScaleType, bool aSetHandler);
+  bool IsCoordinatesScaleLocked(const WaylandSurfaceLock& aProofOfLock) const {
+    MOZ_DIAGNOSTIC_ASSERT(&aProofOfLock == mSurfaceLock);
+    return mScaleType == ScaleType::Coordinates;
+  }
+
+  enum ScaleCallbackType {
+    Widget = 0,
+    Layers = 1,
+    CallbackNum = 2,
+  };
+  void SetScaleCallbackLocked(const WaylandSurfaceLock& aProofOfLock,
+                              ScaleCallbackType aCallbackType,
+                              std::function<void(void)> aScaleCallback);
+  bool HasScaleCallbacksLocked(const WaylandSurfaceLock& aProofOfLock);
+  void ClearScaleCallbacksLocked(const WaylandSurfaceLock& aProofOfLock);
+
+  static constexpr const double sNoScale = -1;
+  double GetScale() const;
+  uint32_t GetCoordinatesScale() const { return mCoordinatesScale; }
+  double GetCoordinatesScaleRounded() const {
+    return ((double)mCoordinatesScale) / (1 << 24);
+  }
+  bool HasCoordinatesScaleLocked(const WaylandSurfaceLock& aProofOfLock) const {
+    return !!mCoordinatesScaleManager;
+  }
+
+  void SetCeiledScaleLocked(const WaylandSurfaceLock& aProofOfLock,
+                            int aScreenCeiledScale);
+  bool SetCoordinatesScaleLocked(const WaylandSurfaceLock& aProofOfLock,
+                                 uint32_t scale_8_24);
+
+  static void AfterPaintHandler(GdkFrameClock* aClock, void* aData);
+
+  bool AddOpaqueSurfaceHandlerLocked(const WaylandSurfaceLock& aProofOfLock,
+                                     GdkWindow* aGdkWindow,
+                                     bool aRegisterCommitHandler);
+  bool RemoveOpaqueSurfaceHandlerLocked(const WaylandSurfaceLock& aProofOfLock);
+
+  void SetGdkCommitCallbackLocked(
+      const WaylandSurfaceLock& aProofOfLock,
+      const std::function<void(void)>& aGdkCommitCB);
+  void ClearGdkCommitCallbackLocked(const WaylandSurfaceLock& aProofOfLock);
+
+  RefPtr<DMABufFormats> GetDMABufFormats() const { return mFormats; }
+
+  GdkWindow* GetGdkWindow() const;
+
+  static bool IsOpaqueRegionEnabled();
+
+  void SetParentLocked(const WaylandSurfaceLock& aProofOfLock,
+                       RefPtr<WaylandSurface> aParent);
+
+  bool EnableColorManagementLocked(const WaylandSurfaceLock& aProofOfLock,
+                                   mozilla::gfx::YUVColorSpace aColorSpace,
+                                   gfx::TransferFunction aTransferFunction);
+  void SetColorRepresentationLocked(const WaylandSurfaceLock& aProofOfLock,
+                                    mozilla::gfx::YUVColorSpace aColorSpace,
+                                    bool aFullRange,
+                                    uint32_t aWPChromaLocation);
+
+  static void ImageDescriptionFailed(
+      void* aData, struct wp_image_description_v1* aImageDescription,
+      uint32_t aCause, const char* aMsg);
+  static void ImageDescriptionReady(
+      void* aData, struct wp_image_description_v1* aImageDescription,
+      uint32_t aIdentity);
+
+  void AssertCurrentThreadOwnsMutex();
+
+  void ForceCommit() { mSurfaceNeedsCommit = true; }
+  void SetCommitStateLocked(const WaylandSurfaceLock& aProofOfLock,
+                            bool aCommitAllowed) {
+    mCommitAllowed = aCommitAllowed;
+  }
+
+ private:
+  ~WaylandSurface();
+
+  bool MapLocked(const WaylandSurfaceLock& aProofOfLock,
+                 wl_surface* aParentWLSurface,
+                 WaylandSurfaceLock* aParentWaylandSurfaceLock,
+                 DesktopIntPoint aSubsurfacePosition, bool aSubsurfaceDesync);
+
+  wl_surface* Lock(WaylandSurfaceLock* aWaylandSurfaceLock);
+  void Unlock(struct wl_surface** aSurface,
+              WaylandSurfaceLock* aWaylandSurfaceLock);
+  void Commit(WaylandSurfaceLock* aProofOfLock, bool aForceCommit,
+              bool aForceDisplayFlush);
+
+  BufferTransaction* GetNextTransactionLocked(
+      const WaylandSurfaceLock& aSurfaceLock, WaylandBuffer* aBuffer);
+  void ReleaseAllWaylandTransactionsLocked(WaylandSurfaceLock& aSurfaceLock);
+
+  void SetVSyncCallbackLocked(const WaylandSurfaceLock& aProofOfLock);
+  void ClearVSyncCallbackLocked(const WaylandSurfaceLock& aProofOfLock);
+  bool HasEmulatedVSyncCallbackLocked(
+      const WaylandSurfaceLock& aProofOfLock) const;
+  bool IsEmulatedVSyncEnabledLocked(const WaylandSurfaceLock& aProofOfLock);
+  void RequestEmulatedVSyncLocked(const WaylandSurfaceLock& aProofOfLock);
+
+  bool ConfigureScaleLocked(const WaylandSurfaceLock& aProofOfLock,
+                            ScaleType aScaleType, bool aSetProtocolHandler);
+  bool ConfigureCoordinateScaleLocked(const WaylandSurfaceLock& aProofOfLock,
+                                      bool aSetProtocolHandler);
+  bool ConfigureFractionalScaleLocked(const WaylandSurfaceLock& aProofOfLock,
+                                      bool aSetProtocolHandler);
+
+  LayoutDeviceIntSize GetScaledSize(const DesktopIntSize& aSize) const;
+
+  void* mLoggingWidget = nullptr;
+
+  mozilla::Atomic<bool, mozilla::Relaxed> mIsMapped{false};
+
+  mozilla::Atomic<bool, mozilla::Relaxed> mIsVisible{false};
+
+  mozilla::Atomic<bool, mozilla::Relaxed> mIsPendingGdkCleanup{false};
+
+  std::function<void(void)> mGdkCommitCallback;
+  std::function<void(WaylandSurfaceLock& aProofOfLock)> mMapCallback;
+  std::function<void(void)> mUnmapCallback;
+
+  DesktopIntSize mSize;
+
+  RefPtr<GdkWindow> mGdkWindow;
+
+  wl_surface* mParentSurface = nullptr;
+
+  RefPtr<WaylandSurface> mParent;
+
+  wl_surface* mSurface = nullptr;
+  mozilla::Atomic<bool, mozilla::Relaxed> mSurfaceNeedsCommit{false};
+  bool mCommitAllowed = true;
+
+  bool mSubsurfaceDesync = true;
+
+  wl_subsurface* mSubsurface = nullptr;
+  DesktopIntPoint mSubsurfacePosition;
+
+  AutoTArray<RefPtr<BufferTransaction>, 3> mBufferTransactions;
+  uintptr_t mLatestAttachedBuffer = 0;
+
+  mozilla::Atomic<bool, mozilla::Relaxed> mBufferAttached{false};
+
+  mozilla::Atomic<wl_egl_window*, mozilla::Relaxed> mEGLWindow{nullptr};
+
+  bool mViewportFollowsSizeChanges = false;
+  wp_viewport* mViewport = nullptr;
+  DesktopRect mViewportSourceRect{-1, -1, -1, -1};
+  DesktopIntSize mViewportDestinationSize{-1, -1};
+
+  bool mBufferTransformFlippedX = false;
+  bool mBufferTransformFlippedY = false;
+
+  wl_callback* mVisibleFrameCallback = nullptr;
+
+  struct VSyncCallback {
+    std::function<void(wl_callback*, uint32_t, bool)> mCb = nullptr;
+    bool mEmulated = false;
+    bool IsSet() const { return !!mCb; }
+  };
+  VSyncCallback mVSyncCallbackHandler;
+
+  wl_callback* mVSyncFrameCallback = nullptr;
+
+  bool mVSyncCallbackEnabled = true;
+  std::function<void(bool)> mVSyncCallbackStateHandler = nullptr;
+  std::function<bool(void)> mVSyncEmulateCheck = nullptr;
+
+  guint mEmulatedVSyncCallbackTimerID = 0;
+  constexpr static int sEmulatedVSyncCallbackTimeoutMs = (int)(1000.0 / 60.0);
+
+  wl_region* mPendingOpaqueRegion = nullptr;
+  wl_callback* mOpaqueRegionFrameCallback = nullptr;
+
+  mozilla::Mutex mMutex{"WaylandSurface"};
+  WaylandSurfaceLock* mSurfaceLock = nullptr;
+
+  mozilla::Atomic<bool, mozilla::Relaxed> mIsOpaqueSurfaceHandlerSet{false};
+  gulong mGdkAfterPaintId = 0;
+  static bool sIsOpaqueRegionEnabled;
+  static void (*sGdkWaylandWindowAddCallbackSurface)(GdkWindow*,
+                                                     struct wl_surface*);
+  static void (*sGdkWaylandWindowRemoveCallbackSurface)(GdkWindow*,
+                                                        struct wl_surface*);
+
+  ScaleType mScaleType = ScaleType::Disabled;
+
+  mozilla::Atomic<double, mozilla::Relaxed> mScreenScale{sNoScale};
+  mozilla::Atomic<uint32_t, mozilla::Relaxed> mCoordinatesScale{1 << 24};
+
+  wp_fractional_scale_v1* mFractionalScaleListener = nullptr;
+  xx_fractional_scale_v2* mCoordinatesScaleManager = nullptr;
+
+  std::function<void(void)> mScaleCallbacks[ScaleCallbackType::CallbackNum] = {
+      nullptr, nullptr};
+
+  bool mUseDMABufFormats = false;
+  std::function<void(DMABufFormats*)> mDMABufFormatRefreshCallback;
+  RefPtr<DMABufFormats> mFormats;
+
+  bool mHDRSet = false;
+  wp_color_management_surface_v1* mColorSurface = nullptr;
+  wp_color_representation_surface_v1* mColorRepresentationSurface = nullptr;
+  wp_image_description_v1* mImageDescription = nullptr;
+};
+
+}  
+
+#endif /* MOZ_WAYLAND_SURFACE_H_ */

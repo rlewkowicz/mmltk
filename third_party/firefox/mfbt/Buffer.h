@@ -1,0 +1,129 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_Buffer_h
+#define mozilla_Buffer_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Span.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/UniquePtrExtensions.h"
+
+#include <cstddef>
+#include <iterator>
+#include <utility>
+
+namespace mozilla {
+
+template <typename T>
+class Buffer final {
+ private:
+  mozilla::UniquePtr<T[]> mData;
+  size_t mLength;
+
+ public:
+  Buffer(const Buffer<T>& aOther) = delete;
+  Buffer<T>& operator=(const Buffer<T>& aOther) = delete;
+
+  Buffer() : mData(nullptr), mLength(0) {};
+
+  Buffer(mozilla::UniquePtr<T[]>&& aData, size_t aLength)
+      : mData(std::move(aData)), mLength(aLength) {}
+
+  Buffer(Buffer<T>&& aOther)
+      : mData(std::move(aOther.mData)), mLength(aOther.mLength) {
+    aOther.mLength = 0;
+  }
+
+  Buffer<T>& operator=(Buffer<T>&& aOther) {
+    mData = std::move(aOther.mData);
+    mLength = aOther.mLength;
+    aOther.mLength = 0;
+    return *this;
+  }
+
+  explicit Buffer(mozilla::Span<const T> aSpan)
+      : mData(mozilla::MakeUniqueForOverwrite<T[]>(aSpan.Length())),
+        mLength(aSpan.Length()) {
+    std::copy(aSpan.cbegin(), aSpan.cend(), mData.get());
+  }
+
+  static mozilla::Maybe<Buffer<T>> CopyFrom(mozilla::Span<const T> aSpan) {
+    if (aSpan.IsEmpty()) {
+      return Some(Buffer());
+    }
+
+    auto data = mozilla::MakeUniqueForOverwriteFallible<T[]>(aSpan.Length());
+    if (!data) {
+      return mozilla::Nothing();
+    }
+    std::copy(aSpan.cbegin(), aSpan.cend(), data.get());
+    return mozilla::Some(Buffer(std::move(data), aSpan.Length()));
+  }
+
+  explicit Buffer(size_t aLength)
+      : mData(mozilla::MakeUnique<T[]>(aLength)), mLength(aLength) {}
+
+  static mozilla::Maybe<Buffer<T>> Alloc(size_t aLength) {
+    auto data = mozilla::MakeUniqueFallible<T[]>(aLength);
+    if (!data) {
+      return mozilla::Nothing();
+    }
+    return mozilla::Some(Buffer(std::move(data), aLength));
+  }
+
+  static Maybe<Buffer<T>> AllocForOverwrite(size_t aLength) {
+    auto data = MakeUniqueForOverwriteFallible<T[]>(aLength);
+    if (!data) {
+      return Nothing();
+    }
+    return Some(Buffer(std::move(data), aLength));
+  }
+
+  auto AsSpan() const { return mozilla::Span<const T>{mData.get(), mLength}; }
+  auto AsWritableSpan() { return mozilla::Span<T>{mData.get(), mLength}; }
+  operator mozilla::Span<const T>() const { return AsSpan(); }
+  operator mozilla::Span<T>() { return AsWritableSpan(); }
+
+  T* Elements() { return AsWritableSpan().Elements(); }
+  size_t Length() const { return mLength; }
+
+  T& operator[](size_t aIndex) {
+    MOZ_ASSERT(aIndex < mLength);
+    return mData.get()[aIndex];
+  }
+
+  const T& operator[](size_t aIndex) const {
+    MOZ_ASSERT(aIndex < mLength);
+    return mData.get()[aIndex];
+  }
+
+  typedef T* iterator;
+  typedef const T* const_iterator;
+  typedef std::reverse_iterator<T*> reverse_iterator;
+  typedef std::reverse_iterator<const T*> const_reverse_iterator;
+
+  iterator begin() { return mData.get(); }
+  const_iterator begin() const { return mData.get(); }
+  const_iterator cbegin() const { return begin(); }
+  iterator end() { return mData.get() + mLength; }
+  const_iterator end() const { return mData.get() + mLength; }
+  const_iterator cend() const { return end(); }
+
+  reverse_iterator rbegin() { return reverse_iterator(end()); }
+  const_reverse_iterator rbegin() const {
+    return const_reverse_iterator(end());
+  }
+  const_reverse_iterator crbegin() const { return rbegin(); }
+  reverse_iterator rend() { return reverse_iterator(begin()); }
+  const_reverse_iterator rend() const {
+    return const_reverse_iterator(begin());
+  }
+  const_reverse_iterator crend() const { return rend(); }
+};
+
+} 
+
+#endif /* mozilla_Buffer_h */

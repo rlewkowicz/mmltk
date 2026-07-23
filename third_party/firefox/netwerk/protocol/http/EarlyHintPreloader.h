@@ -1,0 +1,157 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_EarlyHintPreloader_h
+#define mozilla_net_EarlyHintPreloader_h
+
+#include "mozilla/dom/ipc/IdType.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/PreloadHashKey.h"
+#include "NeckoCommon.h"
+#include "mozilla/net/NeckoChannelParams.h"
+#include "nsHashtablesFwd.h"
+#include "nsIChannelEventSink.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIMultiPartChannel.h"
+#include "nsIRedirectResultListener.h"
+#include "nsIStreamListener.h"
+#include "nsITimer.h"
+#include "nsNetUtil.h"
+
+class nsAttrValue;
+class nsICookieJarSettings;
+class nsILoadContext;
+class nsIPrincipal;
+class nsIReferrerInfo;
+
+namespace mozilla::dom {
+class CanonicalBrowsingContext;
+}
+
+namespace mozilla::net {
+
+class EarlyHintPreloader;
+class EarlyHintConnectArgs;
+class ParentChannelListener;
+struct LinkHeader;
+
+class OngoingEarlyHints final {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(OngoingEarlyHints)
+
+  OngoingEarlyHints() = default;
+
+  bool Contains(const PreloadHashKey& aKey);
+  bool Add(const PreloadHashKey& aKey, RefPtr<EarlyHintPreloader> aPreloader);
+
+  void CancelAll(const nsACString& aReason);
+
+  void RegisterLinksAndGetConnectArgs(
+      dom::ContentParentId aCpId, nsTArray<EarlyHintConnectArgs>& aOutLinks);
+
+ private:
+  ~OngoingEarlyHints() = default;
+
+  nsTHashSet<PreloadHashKey> mStartedPreloads;
+  nsTArray<RefPtr<EarlyHintPreloader>> mPreloaders;
+};
+
+class EarlyHintPreloader final : public nsIStreamListener,
+                                 public nsIChannelEventSink,
+                                 public nsIRedirectResultListener,
+                                 public nsIInterfaceRequestor,
+                                 public nsIMultiPartChannelListener,
+                                 public nsINamed,
+                                 public nsITimerCallback {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSICHANNELEVENTSINK
+  NS_DECL_NSIREDIRECTRESULTLISTENER
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSIMULTIPARTCHANNELLISTENER
+  NS_DECL_NSINAMED
+  NS_DECL_NSITIMERCALLBACK
+
+ public:
+  static void MaybeCreateAndInsertPreload(
+      OngoingEarlyHints* aOngoingEarlyHints, const LinkHeader& aHeader,
+      nsIURI* aBaseURI, nsIPrincipal* aPrincipal,
+      nsICookieJarSettings* aCookieJarSettings,
+      const nsACString& aReferrerPolicy, const nsACString& aCSPHeader,
+      uint64_t aBrowsingContextID,
+      dom::CanonicalBrowsingContext* aLoadingBrowsingContext,
+      bool aIsModulepreload);
+
+  bool Register(dom::ContentParentId aCpId, EarlyHintConnectArgs& aOut);
+
+  bool IsFromContentParent(dom::ContentParentId aCpId) const;
+
+  nsresult CancelChannel(nsresult aStatus, const nsACString& aReason,
+                         bool aDeleteEntry);
+
+  void OnParentReady(nsIParentChannel* aParent);
+
+ private:
+  void SetParentChannel();
+  void InvokeStreamListenerFunctions();
+
+  EarlyHintPreloader();
+  ~EarlyHintPreloader();
+
+  static Maybe<PreloadHashKey> GenerateHashKey(ASDestination aAs, nsIURI* aURI,
+                                               nsIPrincipal* aPrincipal,
+                                               CORSMode corsMode,
+                                               bool aIsModulepreload);
+
+  static nsSecurityFlags ComputeSecurityFlags(CORSMode aCORSMode,
+                                              ASDestination aAs);
+
+  nsresult OpenChannel(nsIURI* aURI, nsIPrincipal* aPrincipal,
+                       nsSecurityFlags aSecurityFlags,
+                       nsContentPolicyType aContentPolicyType,
+                       nsIReferrerInfo* aReferrerInfo,
+                       nsICookieJarSettings* aCookieJarSettings,
+                       uint64_t aBrowsingContextID);
+  void PriorizeAsPreload();
+  void SetLinkHeader(const LinkHeader& aLinkHeader);
+
+  nsCOMPtr<nsIChannel> mChannel;
+  nsCOMPtr<nsIChannel> mRedirectChannel;
+
+  dom::ContentParentId mCpId;
+  EarlyHintConnectArgs mConnectArgs;
+
+  nsTArray<StreamListenerFunction> mStreamListenerFunctions;
+
+  bool mOnStartRequestCalled = false;
+  bool mSuspended = false;
+  nsCOMPtr<nsIParentChannel> mParent;
+  bool mIsFinished = false;
+
+  RefPtr<ParentChannelListener> mParentListener;
+  nsCOMPtr<nsITimer> mTimer;
+
+  nsCOMPtr<nsILoadContext> mLoadContext;
+
+ private:
+  enum EHPreloaderState : uint32_t {
+    ePreloaderCreated = 0,
+    ePreloaderOpened,
+    ePreloaderUsed,
+    ePreloaderCancelled,
+    ePreloaderTimeout,
+  };
+  EHPreloaderState mState = ePreloaderCreated;
+  void SetState(EHPreloaderState aState) { mState = aState; }
+};
+
+inline nsISupports* ToSupports(EarlyHintPreloader* aObj) {
+  return static_cast<nsIInterfaceRequestor*>(aObj);
+}
+
+}  
+
+#endif  // mozilla_net_EarlyHintPreloader_h

@@ -1,0 +1,145 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_IDENTITYCREDENTIALSTORAGESERVICE_H_
+#define MOZILLA_IDENTITYCREDENTIALSTORAGESERVICE_H_
+
+#include "ErrorList.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/dom/FlippedOnce.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/OriginAttributes.h"
+#include "mozIStorageConnection.h"
+#include "mozIStorageFunction.h"
+#include "nsIAsyncShutdown.h"
+#include "nsIFile.h"
+#include "nsIIdentityCredentialStorageService.h"
+#include "nsIObserver.h"
+#include "nsISupports.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla {
+
+class IdentityCredentialStorageService final
+    : public nsIIdentityCredentialStorageService,
+      public nsIObserver,
+      public nsIAsyncShutdownBlocker {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIIDENTITYCREDENTIALSTORAGESERVICE
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSIASYNCSHUTDOWNBLOCKER
+
+  static already_AddRefed<IdentityCredentialStorageService> GetSingleton();
+
+  IdentityCredentialStorageService(const IdentityCredentialStorageService&) =
+      delete;
+  IdentityCredentialStorageService& operator=(
+      const IdentityCredentialStorageService&) = delete;
+
+ private:
+  IdentityCredentialStorageService()
+      : mMonitor("mozilla::IdentityCredentialStorageService::mMonitor"),
+        mPendingWrites(0) {};
+  ~IdentityCredentialStorageService() = default;
+
+  nsresult Init();
+
+  nsresult WaitForInitialization();
+
+  already_AddRefed<nsIAsyncShutdownClient> GetAsyncShutdownBarrier() const;
+
+  void Finalize();
+
+  static nsresult ValidatePrincipal(nsIPrincipal* aPrincipal);
+
+  nsresult GetMemoryDatabaseConnection();
+  nsresult GetDiskDatabaseConnection();
+  static nsresult GetDatabaseConnectionInternal(
+      mozIStorageConnection** aDatabase, nsIFile* aFile, bool aRetry);
+
+  static nsresult EnsureTable(mozIStorageConnection* aDatabase);
+
+  nsresult LoadMemoryTableFromDisk();
+
+  void IncrementPendingWrites();
+  void DecrementPendingWrites();
+
+
+  static nsresult UpsertData(mozIStorageConnection* aDatabaseConnection,
+                             nsIPrincipal* aRPPrincipal,
+                             nsIPrincipal* aIDPPrincipal,
+                             nsACString const& aCredentialID, bool aRegistered,
+                             bool aAllowLogout);
+
+  static nsresult DeleteData(mozIStorageConnection* aDatabaseConnection,
+                             nsIPrincipal* aRPPrincipal,
+                             nsIPrincipal* aIDPPrincipal,
+                             nsACString const& aCredentialID);
+
+  static nsresult DisconnectData(mozIStorageConnection* aDatabaseConnection,
+                                 nsIPrincipal* aRPPrincipal,
+                                 nsIPrincipal* aIDPPrincipal);
+
+  static nsresult ClearData(mozIStorageConnection* aDatabaseConnection);
+
+  static nsresult DeleteDataFromOriginAttributesPattern(
+      mozIStorageConnection* aDatabaseConnection,
+      OriginAttributesPattern const& aOriginAttributesPattern);
+
+  static nsresult DeleteDataFromTimeRange(
+      mozIStorageConnection* aDatabaseConnection, int64_t aStart, int64_t aEnd);
+
+  static nsresult DeleteDataFromPrincipal(
+      mozIStorageConnection* aDatabaseConnection, nsIPrincipal* aPrincipal);
+
+  static nsresult DeleteDataFromBaseDomain(
+      mozIStorageConnection* aDatabaseConnection,
+      nsACString const& aBaseDomain);
+
+  RefPtr<mozIStorageConnection> mDiskDatabaseConnection;  
+  RefPtr<mozIStorageConnection>
+      mMemoryDatabaseConnection;  
+
+  nsCOMPtr<nsISerialEventTarget> mBackgroundThread;  
+
+  RefPtr<nsIFile> mDatabaseFile;  
+
+  Monitor mMonitor;
+  FlippedOnce<false> mInitialized MOZ_GUARDED_BY(mMonitor);
+  FlippedOnce<false> mErrored MOZ_GUARDED_BY(mMonitor);
+  FlippedOnce<false> mShuttingDown MOZ_GUARDED_BY(mMonitor);
+  FlippedOnce<false> mFinalized MOZ_GUARDED_BY(mMonitor);
+  uint32_t mPendingWrites MOZ_GUARDED_BY(mMonitor);
+};
+
+class OriginAttrsPatternMatchOriginSQLFunction final
+    : public mozIStorageFunction {
+  NS_DECL_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  explicit OriginAttrsPatternMatchOriginSQLFunction(
+      OriginAttributesPattern const& aPattern)
+      : mPattern(aPattern) {}
+  OriginAttrsPatternMatchOriginSQLFunction() = delete;
+
+ private:
+  ~OriginAttrsPatternMatchOriginSQLFunction() = default;
+
+  OriginAttributesPattern mPattern;
+};
+
+class PrivateBrowsingOriginSQLFunction final : public mozIStorageFunction {
+  NS_DECL_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  PrivateBrowsingOriginSQLFunction() = default;
+
+ private:
+  ~PrivateBrowsingOriginSQLFunction() = default;
+};
+
+}  
+
+#endif /* MOZILLA_IDENTITYCREDENTIALSTORAGESERVICE_H_ */

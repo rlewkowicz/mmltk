@@ -1,0 +1,191 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(nsMemoryReporterManager_h_)
+#define nsMemoryReporterManager_h_
+
+#include "mozilla/Mutex.h"
+#include "nsTHashMap.h"
+#include "nsHashKeys.h"
+#include "nsIMemoryReporter.h"
+#include "nsISupports.h"
+#include "nsServiceManagerUtils.h"
+
+
+#if defined(MOZ_MEMORY)
+#  define HAVE_JEMALLOC_STATS 1
+#  include "mozmemory.h"
+#endif
+
+namespace mozilla {
+class MemoryReportingProcess;
+namespace dom {
+class MemoryReport;
+}  
+}  
+
+class mozIDOMWindowProxy;
+class nsIEventTarget;
+class nsIRunnable;
+class nsITimer;
+
+class nsMemoryReporterManager final : public nsIMemoryReporterManager,
+                                      public nsIMemoryReporter {
+  virtual ~nsMemoryReporterManager();
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIMEMORYREPORTERMANAGER
+  NS_DECL_NSIMEMORYREPORTER
+
+  MOZ_DEFINE_MALLOC_SIZE_OF(MallocSizeOf)
+
+  nsMemoryReporterManager();
+
+  static already_AddRefed<nsMemoryReporterManager> GetOrCreate() {
+    nsCOMPtr<nsIMemoryReporterManager> imgr =
+        do_GetService("@mozilla.org/memory-reporter-manager;1");
+    return imgr.forget().downcast<nsMemoryReporterManager>();
+  }
+
+  typedef AutoTArray<nsCOMPtr<nsIMemoryReporter>, 32> StrongReportersArray;
+
+  typedef nsTHashMap<nsRefPtrHashKey<nsIMemoryReporter>, bool>
+      StrongReportersTable;
+  typedef nsTHashMap<nsPtrHashKey<nsIMemoryReporter>, bool> WeakReportersTable;
+
+  void HandleChildReport(uint32_t aGeneration,
+                         const mozilla::dom::MemoryReport& aChildReport);
+  void EndProcessReport(uint32_t aGeneration, bool aSuccess);
+
+  struct AmountFns {
+    mozilla::InfallibleAmountFn mJSMainRuntimeGCHeap = nullptr;
+    mozilla::InfallibleAmountFn mJSMainRuntimeTemporaryPeak = nullptr;
+    mozilla::InfallibleAmountFn mJSMainRuntimeCompartmentsSystem = nullptr;
+    mozilla::InfallibleAmountFn mJSMainRuntimeCompartmentsUser = nullptr;
+    mozilla::InfallibleAmountFn mJSMainRuntimeRealmsSystem = nullptr;
+    mozilla::InfallibleAmountFn mJSMainRuntimeRealmsUser = nullptr;
+
+    mozilla::InfallibleAmountFn mImagesContentUsedUncompressed = nullptr;
+
+    mozilla::InfallibleAmountFn mStorageSQLite = nullptr;
+
+    mozilla::InfallibleAmountFn mLowMemoryEventsPhysical = nullptr;
+
+    mozilla::InfallibleAmountFn mGhostWindows = nullptr;
+  };
+  AmountFns mAmountFns;
+
+  static int64_t ResidentFast();
+
+  static int64_t ResidentPeak();
+
+  static int64_t ResidentUnique(pid_t aPid = 0);
+
+
+  struct SizeOfTabFns {
+    mozilla::JSSizeOfTabFn mJS = nullptr;
+    mozilla::NonJSSizeOfTabFn mNonJS = nullptr;
+  };
+  SizeOfTabFns mSizeOfTabFns;
+
+#if defined(HAVE_JEMALLOC_STATS)
+  static size_t HeapAllocated(const jemalloc_stats_t& stats);
+  static int64_t HeapOverheadFraction(const jemalloc_stats_t& stats);
+#endif
+
+ private:
+  bool IsRegistrationBlocked() MOZ_EXCLUDES(mMutex) {
+    mozilla::MutexAutoLock lock(mMutex);
+    return mIsRegistrationBlocked;
+  }
+
+  [[nodiscard]] nsresult RegisterReporterHelper(nsIMemoryReporter* aReporter,
+                                                bool aForce, bool aStrongRef,
+                                                bool aIsAsync);
+
+  [[nodiscard]] nsresult StartGettingReports();
+  nsresult FinishReporting();
+
+  void DispatchReporter(nsIMemoryReporter* aReporter, bool aIsAsync,
+                        nsIHandleReportCallback* aHandleReport,
+                        nsISupports* aHandleReportData, bool aAnonymize);
+
+  static void TimeoutCallback(nsITimer* aTimer, void* aData);
+
+  mozilla::Mutex mMutex;
+  bool mIsRegistrationBlocked MOZ_GUARDED_BY(mMutex);
+
+  mozilla::UniquePtr<StrongReportersArray> mStrongEternalReporters
+      MOZ_GUARDED_BY(mMutex);
+
+  mozilla::UniquePtr<StrongReportersTable> mStrongReporters
+      MOZ_GUARDED_BY(mMutex);
+  mozilla::UniquePtr<WeakReportersTable> mWeakReporters MOZ_GUARDED_BY(mMutex);
+
+  mozilla::UniquePtr<StrongReportersArray> mSavedStrongEternalReporters
+      MOZ_GUARDED_BY(mMutex);
+  mozilla::UniquePtr<StrongReportersTable> mSavedStrongReporters
+      MOZ_GUARDED_BY(mMutex);
+  mozilla::UniquePtr<WeakReportersTable> mSavedWeakReporters
+      MOZ_GUARDED_BY(mMutex);
+
+  uint32_t mNextGeneration;  
+
+  struct PendingProcessesState {
+    uint32_t mGeneration;
+    bool mAnonymize;
+    bool mMinimize;
+    nsCOMPtr<nsITimer> mTimer;
+    nsTArray<RefPtr<mozilla::MemoryReportingProcess>> mChildrenPending;
+    uint32_t mNumProcessesRunning;
+    uint32_t mNumProcessesCompleted;
+    uint32_t mConcurrencyLimit;
+    nsCOMPtr<nsIHandleReportCallback> mHandleReport;
+    nsCOMPtr<nsISupports> mHandleReportData;
+    nsCOMPtr<nsIFinishReportingCallback> mFinishReporting;
+    nsCOMPtr<nsISupports> mFinishReportingData;
+    nsString mDMDDumpIdent;
+
+    PendingProcessesState(uint32_t aGeneration, bool aAnonymize, bool aMinimize,
+                          uint32_t aConcurrencyLimit,
+                          nsIHandleReportCallback* aHandleReport,
+                          nsISupports* aHandleReportData,
+                          nsIFinishReportingCallback* aFinishReporting,
+                          nsISupports* aFinishReportingData,
+                          const nsAString& aDMDDumpIdent);
+  };
+
+  struct PendingReportersState {
+    uint32_t mReportsPending;
+
+    nsCOMPtr<nsIFinishReportingCallback> mFinishReporting;
+    nsCOMPtr<nsISupports> mFinishReportingData;
+
+    FILE* mDMDFile;
+
+    PendingReportersState(nsIFinishReportingCallback* aFinishReporting,
+                          nsISupports* aFinishReportingData, FILE* aDMDFile)
+        : mReportsPending(0),
+          mFinishReporting(aFinishReporting),
+          mFinishReportingData(aFinishReportingData),
+          mDMDFile(aDMDFile) {}
+  };
+
+  PendingProcessesState* mPendingProcessesState;  
+
+  PendingReportersState* mPendingReportersState;  
+
+  nsCOMPtr<nsIEventTarget> mThreadPool MOZ_GUARDED_BY(mMutex);
+
+  PendingProcessesState* GetStateForGeneration(uint32_t aGeneration);
+  [[nodiscard]] static bool StartChildReport(
+      mozilla::MemoryReportingProcess* aChild,
+      const PendingProcessesState* aState);
+};
+
+#define NS_MEMORY_REPORTER_MANAGER_CID \
+  {0xfb97e4f5, 0x32dd, 0x497a, {0xba, 0xa2, 0x7d, 0x1e, 0x55, 0x7, 0x99, 0x10}}
+
+#endif

@@ -1,0 +1,149 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "AccessCheck.h"
+#include "js/Proxy.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/ProxyHandlerUtils.h"
+#include "mozilla/dom/RemoteObjectProxy.h"
+#include "mozilla/dom/WindowBinding.h"
+#include "mozilla/dom/WindowProxyHolder.h"
+#include "xpcprivate.h"
+
+namespace mozilla::dom {
+
+
+class RemoteOuterWindowProxy
+    : public RemoteObjectProxy<BrowsingContext,
+                               Window_Binding::sCrossOriginProperties> {
+ public:
+  using Base = RemoteObjectProxy;
+
+  constexpr RemoteOuterWindowProxy()
+      : RemoteObjectProxy(prototypes::id::Window) {}
+
+  bool getOwnPropertyDescriptor(
+      JSContext* aCx, JS::Handle<JSObject*> aProxy, JS::Handle<jsid> aId,
+      JS::MutableHandle<Maybe<JS::PropertyDescriptor>> aDesc) const final;
+  bool ownPropertyKeys(JSContext* aCx, JS::Handle<JSObject*> aProxy,
+                       JS::MutableHandleVector<jsid> aProps) const final;
+
+  bool getOwnEnumerablePropertyKeys(
+      JSContext* cx, JS::Handle<JSObject*> proxy,
+      JS::MutableHandleVector<jsid> props) const final;
+
+  void NoteChildren(JSObject* aProxy,
+                    nsCycleCollectionTraversalCallback& aCb) const override {
+    CycleCollectionNoteChild(aCb,
+                             static_cast<BrowsingContext*>(GetNative(aProxy)),
+                             "JS::GetPrivate(obj)");
+  }
+};
+
+static const RemoteOuterWindowProxy sSingleton;
+
+template <>
+const JSClass RemoteOuterWindowProxy::Base::sClass = PROXY_CLASS_DEF(
+    "Proxy", JSCLASS_HAS_RESERVED_SLOTS(js::SwappableProxyReservedSlots));
+
+bool GetRemoteOuterWindowProxy(JSContext* aCx, BrowsingContext* aContext,
+                               JS::Handle<JSObject*> aTransplantTo,
+                               JS::MutableHandle<JSObject*> aRetVal) {
+  MOZ_ASSERT(!aContext->GetDocShell(),
+             "Why are we creating a RemoteOuterWindowProxy?");
+
+  sSingleton.GetProxyObject(aCx, aContext, aTransplantTo, aRetVal);
+  return !!aRetVal;
+}
+
+BrowsingContext* GetBrowsingContext(JSObject* aProxy) {
+  MOZ_ASSERT(IsRemoteObjectProxy(aProxy, prototypes::id::Window));
+  return static_cast<BrowsingContext*>(
+      RemoteObjectProxyBase::GetNative(aProxy));
+}
+
+static bool WrapResult(JSContext* aCx, JS::Handle<JSObject*> aProxy,
+                       BrowsingContext* aResult, JS::PropertyAttributes attrs,
+                       JS::MutableHandle<Maybe<JS::PropertyDescriptor>> aDesc) {
+  JS::Rooted<JS::Value> v(aCx);
+  if (!ToJSValue(aCx, WindowProxyHolder(aResult), &v)) {
+    return false;
+  }
+
+  aDesc.set(Some(JS::PropertyDescriptor::Data(v, attrs)));
+  return true;
+}
+
+bool RemoteOuterWindowProxy::getOwnPropertyDescriptor(
+    JSContext* aCx, JS::Handle<JSObject*> aProxy, JS::Handle<jsid> aId,
+    JS::MutableHandle<Maybe<JS::PropertyDescriptor>> aDesc) const {
+  BrowsingContext* bc = GetBrowsingContext(aProxy);
+  uint32_t index = GetArrayIndexFromId(aId);
+  if (IsArrayIndex(index)) {
+    Span<RefPtr<BrowsingContext>> children = bc->Children();
+    if (index < children.Length()) {
+      return WrapResult(aCx, aProxy, children[index],
+                        {JS::PropertyAttribute::Configurable,
+                         JS::PropertyAttribute::Enumerable},
+                        aDesc);
+    }
+    return ReportCrossOriginDenial(aCx, aId, "access"_ns);
+  }
+
+  bool ok = CrossOriginGetOwnPropertyHelper(aCx, aProxy, aId, aDesc);
+  if (!ok || aDesc.isSome()) {
+    return ok;
+  }
+
+
+  if (aId.isString()) {
+    nsAutoJSString str;
+    if (!str.init(aCx, aId.toString())) {
+      return false;
+    }
+
+    for (BrowsingContext* child : bc->Children()) {
+      if (child->NameEquals(str)) {
+        return WrapResult(aCx, aProxy, child,
+                          {JS::PropertyAttribute::Configurable}, aDesc);
+      }
+    }
+  }
+
+  return CrossOriginPropertyFallback(aCx, aProxy, aId, aDesc);
+}
+
+bool AppendIndexedPropertyNames(JSContext* aCx, BrowsingContext* aContext,
+                                JS::MutableHandleVector<jsid> aIndexedProps) {
+  int32_t length = aContext->Children().Length();
+  if (!aIndexedProps.reserve(aIndexedProps.length() + length)) {
+    return false;
+  }
+
+  for (int32_t i = 0; i < length; ++i) {
+    aIndexedProps.infallibleAppend(JS::PropertyKey::Int(i));
+  }
+  return true;
+}
+
+bool RemoteOuterWindowProxy::ownPropertyKeys(
+    JSContext* aCx, JS::Handle<JSObject*> aProxy,
+    JS::MutableHandleVector<jsid> aProps) const {
+  BrowsingContext* bc = GetBrowsingContext(aProxy);
+
+  if (!AppendIndexedPropertyNames(aCx, bc, aProps)) {
+    return false;
+  }
+
+  return RemoteObjectProxy::ownPropertyKeys(aCx, aProxy, aProps);
+}
+
+bool RemoteOuterWindowProxy::getOwnEnumerablePropertyKeys(
+    JSContext* aCx, JS::Handle<JSObject*> aProxy,
+    JS::MutableHandleVector<jsid> aProps) const {
+  return AppendIndexedPropertyNames(aCx, GetBrowsingContext(aProxy), aProps);
+}
+
+}  

@@ -1,0 +1,462 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_Animation_h
+#define mozilla_dom_Animation_h
+
+#include "mozilla/AnimatedPropertyIDSet.h"
+#include "mozilla/AnimationPerformanceWarning.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/EffectCompositor.h"  // For EffectCompositor::CascadeLevel
+#include "mozilla/LinkedList.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/PostRestyleMode.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/StickyTimeDuration.h"
+#include "mozilla/TimeStamp.h"             // for TimeStamp, TimeDuration
+#include "mozilla/dom/AnimationBinding.h"  // for AnimationPlayState
+#include "mozilla/dom/AnimationTimeline.h"
+#include "mozilla/dom/CSSNumericValueBindingFwd.h"
+#include "nsCycleCollectionParticipant.h"
+
+struct JSContext;
+class nsCSSPropertyIDSet;
+class nsIFrame;
+class nsIGlobalObject;
+class nsAtom;
+
+namespace mozilla {
+
+struct AnimationRule;
+class MicroTaskRunnable;
+
+namespace dom {
+
+class AnimationEffect;
+class AsyncFinishNotification;
+class CSSAnimation;
+class CSSTransition;
+class Document;
+class Promise;
+
+struct AnimationRange {
+  StyleAnimationRangeStart mStart = StyleAnimationRangeStart::DefaultStart();
+  StyleAnimationRangeEnd mEnd = StyleAnimationRangeEnd::DefaultEnd();
+  bool operator==(const AnimationRange& aOther) const {
+    return mStart == aOther.mStart && mEnd == aOther.mEnd;
+  }
+  bool IsNormal() const {
+    return mStart.name == StyleTimelineRangeName::Normal &&
+           mEnd.name == StyleTimelineRangeName::Normal;
+  }
+};
+
+class Animation : public DOMEventTargetHelper,
+                  public LinkedListElement<Animation> {
+ protected:
+  virtual ~Animation();
+
+ public:
+  enum class FromJS : bool {
+    No,
+    Yes,
+  };
+
+  explicit Animation(nsIGlobalObject* aGlobal);
+
+  static already_AddRefed<Animation> ClonePausedAnimation(
+      nsIGlobalObject* aGlobal, const Animation& aOther,
+      AnimationEffect& aEffect, AnimationTimeline& aTimeline);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(Animation, DOMEventTargetHelper)
+
+  nsIGlobalObject* GetParentObject() const { return GetRelevantGlobal(); }
+
+  NonOwningAnimationTarget GetTargetForAnimation() const;
+
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  virtual CSSAnimation* AsCSSAnimation() { return nullptr; }
+  virtual const CSSAnimation* AsCSSAnimation() const { return nullptr; }
+  virtual CSSTransition* AsCSSTransition() { return nullptr; }
+  virtual const CSSTransition* AsCSSTransition() const { return nullptr; }
+
+  enum class LimitBehavior { AutoRewind, Continue };
+
+  static already_AddRefed<Animation> Constructor(
+      const GlobalObject& aGlobal, AnimationEffect* aEffect,
+      const Optional<AnimationTimeline*>& aTimeline, ErrorResult& aRv);
+
+  void GetId(nsAString& aResult) const { aResult = mId; }
+  void SetId(const nsAString& aId);
+
+  AnimationEffect* GetEffect() const { return mEffect; }
+  virtual void SetEffect(AnimationEffect* aEffect);
+  void SetEffectNoUpdate(AnimationEffect* aEffect);
+
+  void RemovedNamedTimelineReferenceFromJS(const nsAtom* aName);
+
+  AnimationTimeline* GetTimelineFromJS() const {
+    auto* timeline = GetTimeline();
+    if (timeline && timeline->IsInactiveTimeline()) {
+      return nullptr;
+    }
+    return timeline;
+  }
+
+  virtual void TimelineWillSetFromJS() {}
+  virtual bool TimelineOverridenByJS() const { return false; }
+  void SetTimelineFromJS(AnimationTimeline* aTimeline);
+  AnimationTimeline* GetTimeline() const { return mTimeline; }
+  bool SetTimeline(AnimationTimeline* aTimeline, const nsAtom* aTimelineName,
+                   FromJS aFromJS);
+  bool SetTimelineNoUpdate(AnimationTimeline* aTimeline,
+                           const nsAtom* aTimelineName, FromJS aFromJS);
+
+  const AnimationRange& GetTimelineRange() const { return mTimelineRange; }
+  void SetTimelineRange(AnimationRange&& aRange);
+  void SetTimelineRangeNoUpdate(AnimationRange&& aRange);
+
+  Nullable<TimeDuration> GetStartTime() const { return mStartTime; }
+  void SetStartTime(const Nullable<TimeDuration>& aNewStartTime);
+  const TimeStamp& GetPendingReadyTime() const { return mPendingReadyTime; }
+  void SetPendingReadyTime(const TimeStamp& aReadyTime) {
+    mPendingReadyTime = aReadyTime;
+  }
+
+  void GetStartTime(Nullable<OwningCSSNumberish>& aRetVal) const;
+  virtual void SetStartTime(const Nullable<CSSNumberish>& aStartTime,
+                            ErrorResult& aRv);
+
+  void GetCurrentTime(Nullable<OwningCSSNumberish>& aRetVal) const;
+  void SetCurrentTime(const Nullable<CSSNumberish>& aCurrentTime,
+                      ErrorResult& aRv);
+
+  Nullable<TimeDuration> GetCurrentTimeAsDuration() const {
+    return GetCurrentTimeForHoldTime(mHoldTime);
+  }
+  void SetCurrentTime(const TimeDuration& aSeekTime);
+  void SetCurrentTimeNoUpdate(const TimeDuration& aSeekTime);
+
+  Nullable<double> GetOverallProgress() const;
+
+  double PlaybackRate() const { return mPlaybackRate; }
+  void SetPlaybackRate(double aPlaybackRate);
+  double PlaybackRateInternal() const;
+
+  AnimationPlayState PlayState() const;
+  virtual AnimationPlayState PlayStateFromJS() const { return PlayState(); }
+
+  bool Pending() const { return mPendingState != PendingState::NotPending; }
+  virtual bool PendingFromJS() const { return Pending(); }
+  AnimationReplaceState ReplaceState() const { return mReplaceState; }
+
+  virtual Promise* GetReady(ErrorResult& aRv);
+  Promise* GetFinished(ErrorResult& aRv);
+
+  IMPL_EVENT_HANDLER(finish);
+  IMPL_EVENT_HANDLER(cancel);
+  IMPL_EVENT_HANDLER(remove);
+
+  void Cancel(PostRestyleMode aPostRestyle = PostRestyleMode::IfNeeded);
+
+  void Finish(ErrorResult& aRv);
+
+  void Play(ErrorResult& aRv, LimitBehavior aLimitBehavior);
+  virtual void PlayFromJS(ErrorResult& aRv) {
+    Play(aRv, LimitBehavior::AutoRewind);
+  }
+
+  void Pause(ErrorResult& aRv);
+  virtual void PauseFromJS(ErrorResult& aRv) { Pause(aRv); }
+
+  void UpdatePlaybackRate(double aPlaybackRate);
+  virtual void Reverse(ErrorResult& aRv);
+
+  void Persist();
+  MOZ_CAN_RUN_SCRIPT void CommitStyles(ErrorResult& aRv);
+
+  bool IsRunningOnCompositor() const;
+
+  using TickState = AnimationTimeline::TickState;
+  virtual void Tick(TickState&);
+  bool NeedsTicks() const {
+    return Pending() ||
+           (PlayState() == AnimationPlayState::Running &&
+            PlaybackRateInternal() != 0.0) ||
+           (mTimeline && !mTimeline->IsMonotonicallyIncreasing() &&
+            PlayState() != AnimationPlayState::Idle);
+  }
+  bool TryTriggerNow();
+  double CurrentOrPendingPlaybackRate() const;
+  bool HasPendingPlaybackRate() const { return mPendingPlaybackRate.isSome(); }
+
+  static TimeDuration CurrentTimeFromTimelineTime(
+      const TimeDuration& aTimelineTime, const TimeDuration& aStartTime,
+      double aPlaybackRate) {
+    return (aTimelineTime - aStartTime).MultDouble(aPlaybackRate);
+  }
+
+  static TimeDuration StartTimeFromTimelineTime(
+      const TimeDuration& aTimelineTime, const TimeDuration& aCurrentTime,
+      double aPlaybackRate) {
+    TimeDuration result = aTimelineTime;
+    if (aPlaybackRate == 0) {
+      return result;
+    }
+
+    result -= aCurrentTime.MultDouble(1.0 / aPlaybackRate);
+    return result;
+  }
+
+  TimeStamp AnimationTimeToTimeStamp(const StickyTimeDuration& aTime) const;
+
+  TimeStamp ElapsedTimeToTimeStamp(
+      const StickyTimeDuration& aElapsedTime) const;
+
+  bool IsPausedOrPausing() const {
+    return PlayState() == AnimationPlayState::Paused;
+  }
+
+  bool HasCurrentEffect() const;
+  bool IsInEffect() const;
+
+  bool IsPlaying() const {
+    return PlaybackRateInternal() != 0.0 && mTimeline &&
+           !mTimeline->GetCurrentTimeAsDuration().IsNull() &&
+           PlayState() == AnimationPlayState::Running;
+  }
+
+  bool ShouldBeSynchronizedWithMainThread(
+      const nsCSSPropertyIDSet& aPropertySet, const nsIFrame* aFrame,
+      AnimationPerformanceWarning::Type& aPerformanceWarning ) const;
+
+  bool IsRelevant() const { return mIsRelevant; }
+  void UpdateRelevance();
+
+  bool IsReplaceable() const;
+
+  bool IsRemovable() const;
+
+  void Remove();
+
+  struct EventContext {
+    NonOwningAnimationTarget mTarget;
+    uint64_t mIndex;
+  };
+  int32_t CompareCompositeOrder(const Maybe<EventContext>& aContext,
+                                const Animation& aOther,
+                                const Maybe<EventContext>& aOtherContext,
+                                nsContentUtils::NodeIndexCache&) const;
+  int32_t CompareCompositeOrder(const Animation& aOther,
+                                nsContentUtils::NodeIndexCache& aCache) const {
+    return CompareCompositeOrder(Nothing(), aOther, Nothing(), aCache);
+  }
+
+  virtual EffectCompositor::CascadeLevel CascadeLevel() const {
+    return EffectCompositor::CascadeLevel::Animations;
+  }
+
+  bool CanThrottle() const;
+
+  void WillComposeStyle();
+
+  void ComposeStyle(
+      StyleAnimationValueMap& aComposeResult,
+      const InvertibleAnimatedPropertyIDSet& aPropertiesToSkip,
+      EndpointBehavior aEndpointBehavior = EndpointBehavior::Exclusive);
+
+  void NotifyEffectTimingUpdated();
+  void NotifyEffectPropertiesUpdated();
+  void NotifyEffectTargetUpdated();
+
+  virtual void MaybeQueueCancelEvent(const StickyTimeDuration& aActiveTime) {};
+
+  void SetPartialPrerendered(uint64_t aIdOnCompositor) {
+    mIdOnCompositor = aIdOnCompositor;
+    mIsPartialPrerendered = true;
+  }
+  bool IsPartialPrerendered() const { return mIsPartialPrerendered; }
+  uint64_t IdOnCompositor() const { return mIdOnCompositor; }
+  void ResetPartialPrerendered() {
+    MOZ_ASSERT(mIsPartialPrerendered);
+    mIsPartialPrerendered = false;
+    mIdOnCompositor = 0;
+  }
+  void UpdatePartialPrerendered() {
+    ResetPartialPrerendered();
+    PostUpdate();
+  }
+
+  bool UsingScrollTimeline() const {
+    return mTimeline && mTimeline->IsScrollTimeline();
+  }
+
+  enum class ProgressTimelinePosition : uint8_t { Boundary, NotBoundary };
+  static ProgressTimelinePosition AtProgressTimelineBoundary(
+      const Nullable<TimeDuration>& aTimelineDuration,
+      const Nullable<TimeDuration>& aCurrentTime,
+      const TimeDuration& aEffectStartTime, const double aPlaybackRate);
+  ProgressTimelinePosition AtProgressTimelineBoundary() const {
+    Nullable<TimeDuration> currentTime = GetUnconstrainedCurrentTime();
+    return AtProgressTimelineBoundary(
+        mTimeline ? mTimeline->TimelineDuration(mTimelineRange) : nullptr,
+        !currentTime.IsNull() ? currentTime : GetCurrentTimeAsDuration(),
+        mStartTime.IsNull() ? TimeDuration() : mStartTime.Value(),
+        PlaybackRateInternal());
+  }
+
+  void UpdateNormalizedTimingForTimelineDataChange();
+  void MaybeUpdateKeyframeComputedOffsets();
+
+  void SetHiddenByContentVisibility(bool hidden);
+  bool IsHiddenByContentVisibility() const {
+    return mHiddenByContentVisibility;
+  }
+  void UpdateHiddenByContentVisibility();
+
+  DocGroup* GetDocGroup();
+
+  void PostUpdate();
+  bool MakeReadyAndMaybeTrigger();
+
+  void AutoAlignStartTime();
+
+  const nsAtom* GetTimelineName() const { return mTimelineName; }
+
+  bool HasFiniteTimeline() const {
+    return mTimeline && !mTimeline->IsMonotonicallyIncreasing();
+  }
+
+  bool AcceptsPercentageBasedTime() const;
+
+ protected:
+  void SilentlySetCurrentTime(const TimeDuration& aNewCurrentTime);
+  void CancelNoUpdate();
+  void PlayNoUpdate(ErrorResult& aRv, LimitBehavior aLimitBehavior);
+  void ResumeAt(const TimeDuration& aReadyTime);
+  void PauseAt(const TimeDuration& aReadyTime);
+  void FinishPendingAt(const TimeDuration& aReadyTime) {
+    if (mPendingState == PendingState::PlayPending) {
+      ResumeAt(aReadyTime);
+    } else if (mPendingState == PendingState::PausePending) {
+      PauseAt(aReadyTime);
+    } else {
+      MOZ_ASSERT_UNREACHABLE(
+          "Can't finish pending if we're not in a pending state");
+    }
+  }
+  void ApplyPendingPlaybackRate() {
+    if (mPendingPlaybackRate) {
+      mPlaybackRate = mPendingPlaybackRate.extract();
+    }
+  }
+
+  enum class SeekFlag { NoSeek, DidSeek };
+
+  enum class SyncNotifyFlag { Sync, Async };
+
+  virtual void UpdateTiming(SeekFlag aSeekFlag, SyncNotifyFlag aSyncNotifyFlag);
+  void UpdateFinishedState(SeekFlag aSeekFlag, SyncNotifyFlag aSyncNotifyFlag);
+  void UpdateEffect(PostRestyleMode aPostRestyle);
+  void FlushUnanimatedStyle() const;
+  void ResetFinishedPromise();
+  void MaybeResolveFinishedPromise();
+  void DoFinishNotification(SyncNotifyFlag aSyncNotifyFlag);
+  friend class AsyncFinishNotification;
+  void DoFinishNotificationImmediately(MicroTaskRunnable* aAsync = nullptr);
+  void QueuePlaybackEvent(nsAtom* aOnEvent, TimeStamp&& aScheduledEventTime);
+  void MaybeResolvePromiseWithThis(Promise*);
+
+  void CancelPendingTasks();
+
+  void ResetPendingTasks();
+  StickyTimeDuration EffectEnd() const;
+
+  Nullable<TimeDuration> GetCurrentTimeForHoldTime(
+      const Nullable<TimeDuration>& aHoldTime) const;
+  Nullable<TimeDuration> GetUnconstrainedCurrentTime() const {
+    return GetCurrentTimeForHoldTime(Nullable<TimeDuration>());
+  }
+
+  void ScheduleReplacementCheck();
+  void MaybeScheduleReplacementCheck();
+
+  StickyTimeDuration IntervalStartTime(
+      const StickyTimeDuration& aActiveDuration) const;
+
+  StickyTimeDuration IntervalEndTime(
+      const StickyTimeDuration& aActiveDuration) const;
+
+  TimeStamp GetTimelineCurrentTimeAsTimeStamp() const {
+    return mTimeline ? mTimeline->GetCurrentTimeAsTimeStamp() : TimeStamp();
+  }
+
+  Document* GetRenderedDocument() const;
+  Document* GetTimelineDocument() const;
+
+  bool HasFiniteActiveTimeline() const {
+    return mTimeline && !mTimeline->IsMonotonicallyIncreasing() &&
+           !mTimeline->IsInactiveTimeline();
+  }
+
+  RefPtr<AnimationTimeline> mTimeline;
+  RefPtr<AnimationEffect> mEffect;
+  Nullable<TimeDuration> mStartTime;            
+  Nullable<TimeDuration> mHoldTime;             
+  Nullable<TimeDuration> mPreviousCurrentTime;  
+  double mPlaybackRate = 1.0;
+  Maybe<double> mPendingPlaybackRate;
+
+  AnimationRange mTimelineRange;
+
+  RefPtr<Promise> mReady;
+
+  RefPtr<Promise> mFinished;
+
+  static uint64_t sNextAnimationIndex;
+
+  uint64_t mAnimationIndex;
+
+  enum class PendingState : uint8_t { NotPending, PlayPending, PausePending };
+  PendingState mPendingState = PendingState::NotPending;
+
+  AnimationReplaceState mReplaceState = AnimationReplaceState::Active;
+
+  bool mFinishedAtLastComposeStyle = false;
+  bool mWasReplaceableAtLastTick = false;
+
+  bool mHiddenByContentVisibility = false;
+
+  bool mIsRelevant = false;
+
+  bool mFinishedIsResolved = false;
+
+  RefPtr<MicroTaskRunnable> mFinishNotificationTask;
+
+  nsString mId;
+
+  RTPCallerType mRTPCallerType;
+
+  TimeStamp mPendingReadyTime;
+
+ private:
+  double AnimationsPlayBackRateMultiplier() const;
+
+  uint64_t mIdOnCompositor = 0;
+  bool mIsPartialPrerendered = false;
+
+  bool mAutoAlignStartTime = false;
+
+  RefPtr<const nsAtom> mTimelineName;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_Animation_h

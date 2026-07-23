@@ -1,0 +1,301 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _nsPlacesTriggers_h_
+#define _nsPlacesTriggers_h_
+#include "nsPlacesTables.h"
+
+#define VISIT_COUNT_INC(field) \
+  "(CASE WHEN " field " IN (0, 4, 7, 8, 9) THEN 0 ELSE 1 END) "
+
+#define CREATE_HISTORYVISITS_AFTERINSERT_TRIGGER \
+  nsLiteralCString(                                                         \
+        "CREATE TEMP TRIGGER moz_historyvisits_afterinsert_v2_trigger "       \
+        "AFTER INSERT ON moz_historyvisits FOR EACH ROW "                     \
+        "BEGIN "                                                              \
+        "SELECT invalidate_days_of_history();"                                \
+        "SELECT store_last_inserted_id('moz_historyvisits', NEW.id); "        \
+        "UPDATE moz_places SET "                                              \
+        "visit_count = visit_count + " VISIT_COUNT_INC("NEW.visit_type") ", " \
+        "recalc_frecency = 1, "                                               \
+        "recalc_alt_frecency = 1, "                                           \
+        "last_visit_date = MAX(IFNULL(last_visit_date, 0), NEW.visit_date) "  \
+        "WHERE id = NEW.place_id;"                                            \
+        "END")
+
+#define CREATE_HISTORYVISITS_AFTERDELETE_TRIGGER \
+  nsLiteralCString(                                                         \
+        "CREATE TEMP TRIGGER moz_historyvisits_afterdelete_v2_trigger "       \
+        "AFTER DELETE ON moz_historyvisits FOR EACH ROW "                     \
+        "BEGIN "                                                              \
+        "SELECT invalidate_days_of_history();"                                \
+        "UPDATE moz_places SET "                                              \
+        "visit_count = visit_count - " VISIT_COUNT_INC("OLD.visit_type") ", " \
+        "recalc_frecency = (frecency <> 0), "                                 \
+        "recalc_alt_frecency = (frecency <> 0), "                             \
+        "last_visit_date = (SELECT visit_date FROM moz_historyvisits "        \
+        "WHERE place_id = OLD.place_id "                                      \
+        "ORDER BY visit_date DESC LIMIT 1) "                                  \
+        "WHERE id = OLD.place_id;"                                            \
+        "END")
+
+#define CREATE_PLACES_AFTERINSERT_TRIGGER                                 \
+  nsLiteralCString(                                                       \
+      "CREATE TEMP TRIGGER moz_places_afterinsert_trigger "               \
+      "AFTER INSERT ON moz_places FOR EACH ROW "                          \
+      "BEGIN "                                                            \
+      "SELECT store_last_inserted_id('moz_places', NEW.id); "             \
+      "INSERT INTO moz_origins "                                          \
+      "  (prefix, host, frecency, recalc_frecency, recalc_alt_frecency) " \
+      "VALUES (get_prefix(NEW.url), get_host_and_port(NEW.url), "         \
+      "        NEW.frecency, 1, 1)  "                                     \
+      "ON CONFLICT(prefix, host) DO UPDATE "                              \
+      "  SET recalc_frecency = 1, recalc_alt_frecency = 1 "               \
+      "  WHERE EXCLUDED.recalc_frecency = 0 OR "                          \
+      "        EXCLUDED.recalc_alt_frecency = 0; "                        \
+      "UPDATE moz_places SET origin_id = ( "                              \
+      "  SELECT id "                                                      \
+      "  FROM moz_origins "                                               \
+      "  WHERE prefix = get_prefix(NEW.url) "                             \
+      "    AND host = get_host_and_port(NEW.url) "                        \
+      ") "                                                                \
+      "WHERE id = NEW.id; "                                               \
+      "END")
+
+#define CREATE_PLACES_AFTERDELETE_TRIGGER                                    \
+  nsLiteralCString(                                                          \
+      "CREATE TEMP TRIGGER moz_places_afterdelete_trigger "                  \
+      "AFTER DELETE ON moz_places FOR EACH ROW "                             \
+      "BEGIN "                                                               \
+      "INSERT OR IGNORE INTO moz_updateoriginsdelete_temp (prefix, host) "   \
+      "VALUES (get_prefix(OLD.url), get_host_and_port(OLD.url)); "           \
+      "UPDATE moz_origins SET recalc_frecency = 1, recalc_alt_frecency = 1 " \
+      "WHERE id = OLD.origin_id; "                                           \
+      "END ")
+
+#define CREATE_PLACES_AFTERDELETE_WPREVIEWS_TRIGGER                          \
+  nsLiteralCString(                                                          \
+      "CREATE TEMP TRIGGER moz_places_afterdelete_wpreviews_trigger "        \
+      "AFTER DELETE ON moz_places FOR EACH ROW "                             \
+      "BEGIN "                                                               \
+      "INSERT OR IGNORE INTO moz_updateoriginsdelete_temp (prefix, host) "   \
+      "VALUES (get_prefix(OLD.url), get_host_and_port(OLD.url)); "           \
+      "UPDATE moz_origins SET recalc_frecency = 1, recalc_alt_frecency = 1 " \
+      "WHERE id = OLD.origin_id; "                                           \
+      "INSERT OR IGNORE INTO moz_previews_tombstones VALUES "                \
+      "(sha256hex(OLD.url));"                                                \
+      "END ")
+
+#define CREATE_UPDATEORIGINSDELETE_AFTERDELETE_TRIGGER                   \
+  nsLiteralCString(                                                      \
+      "CREATE TEMP TRIGGER moz_updateoriginsdelete_afterdelete_trigger " \
+      "AFTER DELETE ON moz_updateoriginsdelete_temp FOR EACH ROW "       \
+      "BEGIN "                                                           \
+      "DELETE FROM moz_origins "                                         \
+      "WHERE prefix = OLD.prefix AND host = OLD.host "                   \
+      "AND NOT EXISTS ( "                                                \
+      "    SELECT id FROM moz_places "                                   \
+      "    WHERE origin_id = moz_origins.id "                            \
+      "); "                                                              \
+      "END")
+
+#define CREATE_PLACES_AFTERUPDATE_FRECENCY_TRIGGER                           \
+  nsLiteralCString(                                                          \
+      "CREATE TEMP TRIGGER moz_places_afterupdate_frecency_trigger "         \
+      "AFTER UPDATE OF frecency ON moz_places FOR EACH ROW "                 \
+      "BEGIN "                                                               \
+      "UPDATE moz_places SET recalc_frecency = 0 WHERE id = NEW.id; "        \
+      "UPDATE moz_origins SET recalc_frecency = 1, recalc_alt_frecency = 1 " \
+      "WHERE id = NEW.origin_id; "                                           \
+      "END ")
+
+#define CREATE_PLACES_AFTERUPDATE_RECALC_FRECENCY_TRIGGER                   \
+  nsLiteralCString(                                                         \
+      "CREATE TEMP TRIGGER moz_places_afterupdate_recalc_frecency_trigger " \
+      "AFTER UPDATE OF recalc_frecency ON moz_places FOR EACH ROW "         \
+      "WHEN NEW.recalc_frecency = 1 "                                       \
+      "BEGIN "                                                              \
+      "  SELECT set_should_start_frecency_recalculation();"                 \
+      "END")
+#define CREATE_ORIGINS_AFTERUPDATE_RECALC_FRECENCY_TRIGGER                   \
+  nsLiteralCString(                                                          \
+      "CREATE TEMP TRIGGER moz_origins_afterupdate_recalc_frecency_trigger " \
+      "AFTER UPDATE OF recalc_frecency ON moz_origins FOR EACH ROW "         \
+      "WHEN NEW.recalc_frecency = 1 "                                        \
+      "BEGIN "                                                               \
+      "  SELECT set_should_start_frecency_recalculation();"                  \
+      "END")
+
+#define CREATE_ORIGINS_AFTERUPDATE_FRECENCY_TRIGGER                   \
+  nsLiteralCString(                                                   \
+      "CREATE TEMP TRIGGER moz_origins_afterupdate_frecency_trigger " \
+      "AFTER UPDATE OF recalc_frecency ON moz_origins FOR EACH ROW "  \
+      "WHEN NEW.frecency = 0 AND OLD.frecency > 0 "                   \
+      "BEGIN "                                                        \
+      "DELETE FROM moz_origins "                                      \
+      "WHERE id = NEW.id AND NOT EXISTS ( "                           \
+      "  SELECT id FROM moz_places WHERE origin_id = NEW.id "         \
+      "); "                                                           \
+      "END")
+
+#define CREATE_REMOVEOPENPAGE_CLEANUP_TRIGGER                            \
+  nsLiteralCString(                                                      \
+      "CREATE TEMPORARY TRIGGER moz_openpages_temp_afterupdate_trigger " \
+      "AFTER UPDATE OF open_count ON moz_openpages_temp FOR EACH ROW "   \
+      "WHEN NEW.open_count = 0 "                                         \
+      "BEGIN "                                                           \
+      "DELETE FROM moz_openpages_temp "                                  \
+      "WHERE url = NEW.url "                                             \
+      "AND userContextId = NEW.userContextId "                           \
+      "AND groupId = NEW.groupId;"                                       \
+      "END")
+
+#define IS_PLACE_QUERY                            \
+  " url_hash BETWEEN hash('place', 'prefix_lo') " \
+  "              AND hash('place', 'prefix_hi') "
+
+#define CREATE_BOOKMARKS_FOREIGNCOUNT_AFTERDELETE_TRIGGER                    \
+  nsLiteralCString(                                                          \
+      "CREATE TEMP TRIGGER moz_bookmarks_foreign_count_afterdelete_trigger " \
+      "AFTER DELETE ON moz_bookmarks FOR EACH ROW "                          \
+      "BEGIN "                                                               \
+      "UPDATE moz_places "                                                   \
+      "SET foreign_count = foreign_count - 1 "                               \
+      ",   recalc_frecency = NOT " IS_PLACE_QUERY                            \
+      ",   recalc_alt_frecency = NOT " IS_PLACE_QUERY                        \
+      "WHERE id = OLD.fk;"                                                   \
+      "END")
+
+#define CREATE_BOOKMARKS_FOREIGNCOUNT_AFTERINSERT_TRIGGER                    \
+  nsLiteralCString(                                                          \
+      "CREATE TEMP TRIGGER moz_bookmarks_foreign_count_afterinsert_trigger " \
+      "AFTER INSERT ON moz_bookmarks FOR EACH ROW "                          \
+      "BEGIN "                                                               \
+      "SELECT store_last_inserted_id('moz_bookmarks', NEW.id); "             \
+      "UPDATE moz_places "                                                   \
+      "SET frecency = (CASE WHEN " IS_PLACE_QUERY                            \
+      "                THEN 0 ELSE 1 END) "                                  \
+      "WHERE frecency = -1 AND id = NEW.fk;"                                 \
+      "UPDATE moz_places "                                                   \
+      "SET foreign_count = foreign_count + 1 "                               \
+      ",   hidden = " IS_PLACE_QUERY                                         \
+      ",   recalc_frecency = NOT " IS_PLACE_QUERY                            \
+      ",   recalc_alt_frecency = NOT " IS_PLACE_QUERY                        \
+      "WHERE id = NEW.fk;"                                                   \
+      "END")
+
+#define CREATE_BOOKMARKS_FOREIGNCOUNT_AFTERUPDATE_TRIGGER                    \
+  nsLiteralCString(                                                          \
+      "CREATE TEMP TRIGGER moz_bookmarks_foreign_count_afterupdate_trigger " \
+      "AFTER UPDATE OF fk ON moz_bookmarks FOR EACH ROW "                    \
+      "BEGIN "                                                               \
+      "UPDATE moz_places "                                                   \
+      "SET foreign_count = foreign_count + 1 "                               \
+      ",   hidden = " IS_PLACE_QUERY                                         \
+      ",   recalc_frecency = NOT " IS_PLACE_QUERY                            \
+      ",   recalc_alt_frecency = NOT " IS_PLACE_QUERY                        \
+      "WHERE OLD.fk <> NEW.fk AND id = NEW.fk;"                              \
+      "UPDATE moz_places "                                                   \
+      "SET foreign_count = foreign_count - 1 "                               \
+      ",   recalc_frecency = NOT " IS_PLACE_QUERY                            \
+      ",   recalc_alt_frecency = NOT " IS_PLACE_QUERY                        \
+      "WHERE OLD.fk <> NEW.fk AND id = OLD.fk;"                              \
+      "END")
+
+#define CREATE_KEYWORDS_FOREIGNCOUNT_AFTERDELETE_TRIGGER                    \
+  nsLiteralCString(                                                         \
+      "CREATE TEMP TRIGGER moz_keywords_foreign_count_afterdelete_trigger " \
+      "AFTER DELETE ON moz_keywords FOR EACH ROW "                          \
+      "BEGIN "                                                              \
+      "UPDATE moz_places "                                                  \
+      "SET foreign_count = foreign_count - 1 "                              \
+      "WHERE id = OLD.place_id;"                                            \
+      "END")
+
+#define CREATE_KEYWORDS_FOREIGNCOUNT_AFTERINSERT_TRIGGER                    \
+  nsLiteralCString(                                                         \
+      "CREATE TEMP TRIGGER moz_keywords_foreign_count_afterinsert_trigger " \
+      "AFTER INSERT ON moz_keywords FOR EACH ROW "                          \
+      "BEGIN "                                                              \
+      "UPDATE moz_places "                                                  \
+      "SET foreign_count = foreign_count + 1 "                              \
+      "WHERE id = NEW.place_id;"                                            \
+      "END")
+
+#define CREATE_KEYWORDS_FOREIGNCOUNT_AFTERUPDATE_TRIGGER                    \
+  nsLiteralCString(                                                         \
+      "CREATE TEMP TRIGGER moz_keywords_foreign_count_afterupdate_trigger " \
+      "AFTER UPDATE OF place_id ON moz_keywords FOR EACH ROW "              \
+      "BEGIN "                                                              \
+      "UPDATE moz_places "                                                  \
+      "SET foreign_count = foreign_count + 1 "                              \
+      "WHERE id = NEW.place_id; "                                           \
+      "UPDATE moz_places "                                                  \
+      "SET foreign_count = foreign_count - 1 "                              \
+      "WHERE id = OLD.place_id; "                                           \
+      "END")
+
+#define CREATE_ICONS_AFTERINSERT_TRIGGER                      \
+  nsLiteralCString(                                           \
+      "CREATE TEMP TRIGGER moz_icons_afterinsert_v1_trigger " \
+      "AFTER INSERT ON moz_icons FOR EACH ROW "               \
+      "BEGIN "                                                \
+      "SELECT store_last_inserted_id('moz_icons', NEW.id); "  \
+      "END")
+
+#define CREATE_PLACES_METADATA_AFTERDELETE_TRIGGER                   \
+  nsLiteralCString(                                                  \
+      "CREATE TEMP TRIGGER moz_places_metadata_afterdelete_trigger " \
+      "AFTER DELETE ON moz_places_metadata "                         \
+      "FOR EACH ROW "                                                \
+      "BEGIN "                                                       \
+      "DELETE FROM moz_places_metadata_search_queries "              \
+      "WHERE id = OLD.search_query_id AND NOT EXISTS ("              \
+      "SELECT id FROM moz_places_metadata "                          \
+      "WHERE search_query_id = OLD.search_query_id "                 \
+      "); "                                                          \
+      "END")
+
+#define CREATE_PLACES_METADATA_AFTERINSERT_TRIGGER(                        \
+    TOTAL_VIEW_TIME, TOTAL_VIEW_TIME_IF_MANY_KEYPRESSES, MANY_KEY_PRESSES) \
+  nsPrintfCString(                                                         \
+      "CREATE TEMP TRIGGER moz_places_metadata_afterinsert_trigger "       \
+      "AFTER INSERT ON moz_places_metadata "                               \
+      "FOR EACH ROW "                                                      \
+      "WHEN NEW.total_view_time >= %d "                                    \
+      "OR (NEW.total_view_time >= %d "                                     \
+      "AND NEW.key_presses >= %d) "                                        \
+      "BEGIN "                                                             \
+      "UPDATE moz_places "                                                 \
+      "SET recalc_frecency = 1, recalc_alt_frecency = 1 "                  \
+      "WHERE id = NEW.place_id AND frecency > 0; "                         \
+      "END",                                                               \
+      TOTAL_VIEW_TIME, TOTAL_VIEW_TIME_IF_MANY_KEYPRESSES, MANY_KEY_PRESSES)
+
+#define CREATE_PLACES_METADATA_AFTERUPDATE_TRIGGER(                           \
+    TOTAL_VIEW_TIME, TOTAL_VIEW_TIME_IF_MANY_KEYPRESSES, MANY_KEY_PRESSES)    \
+  nsPrintfCString(                                                            \
+      "CREATE TEMP TRIGGER moz_places_metadata_afterupdate_trigger "          \
+      "AFTER UPDATE ON moz_places_metadata "                                  \
+      "FOR EACH ROW "                                                         \
+      "WHEN "                                                                 \
+      "  (OLD.total_view_time < %d AND NEW.total_view_time >= %d) "           \
+      "  OR (OLD.total_view_time < %d AND NEW.total_view_time >= %d "         \
+      "    AND OLD.key_presses >= %d) "                                       \
+      "  OR (OLD.total_view_time >= %d "                                      \
+      "    AND OLD.key_presses < %d AND NEW.key_presses >= %d) "              \
+      "  OR (OLD.total_view_time < %d AND NEW.total_view_time >= %d "         \
+      "    AND OLD.key_presses < %d AND NEW.key_presses >= %d) "              \
+      "BEGIN "                                                                \
+      "UPDATE moz_places "                                                    \
+      "SET recalc_frecency = 1, recalc_alt_frecency = 1 "                     \
+      "WHERE id = NEW.place_id AND frecency > 0; "                            \
+      "END",                                                                  \
+      TOTAL_VIEW_TIME, TOTAL_VIEW_TIME, TOTAL_VIEW_TIME_IF_MANY_KEYPRESSES,   \
+      TOTAL_VIEW_TIME_IF_MANY_KEYPRESSES, MANY_KEY_PRESSES,                   \
+      TOTAL_VIEW_TIME_IF_MANY_KEYPRESSES, MANY_KEY_PRESSES, MANY_KEY_PRESSES, \
+      TOTAL_VIEW_TIME_IF_MANY_KEYPRESSES, TOTAL_VIEW_TIME_IF_MANY_KEYPRESSES, \
+      MANY_KEY_PRESSES, MANY_KEY_PRESSES)
+
+#endif  // _nsPlacesTriggers_h_

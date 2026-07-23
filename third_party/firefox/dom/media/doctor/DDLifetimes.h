@@ -1,0 +1,105 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DDLifetimes_h_
+#define DDLifetimes_h_
+
+#include <type_traits>
+
+#include "DDLifetime.h"
+#include "DDLoggedTypeTraits.h"
+#include "nsClassHashtable.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+class DDLifetimes {
+ public:
+  DDLifetime* FindLifetime(const DDLogObject& aObject,
+                           const DDMessageIndex& aIndex);
+
+  const DDLifetime* FindLifetime(const DDLogObject& aObject,
+                                 const DDMessageIndex& aIndex) const;
+
+  DDLifetime& CreateLifetime(const DDLogObject& aObject, DDMessageIndex aIndex,
+                             const DDTimeStamp& aConstructionTimeStamp);
+
+  void RemoveLifetime(const DDLifetime* aLifetime);
+
+  void RemoveLifetimesFor(const dom::HTMLMediaElement* aMediaElement);
+
+  void Clear();
+
+  template <typename F>
+  void Visit(const dom::HTMLMediaElement* aMediaElement, F&& aF,
+             bool aOnlyHTMLMediaElement = false) const {
+    for (const auto& lifetimes : mLifetimes.Values()) {
+      for (const DDLifetime& lifetime : *lifetimes) {
+        if (lifetime.mMediaElement == aMediaElement) {
+          if (aOnlyHTMLMediaElement) {
+            if (lifetime.mObject.Pointer() == aMediaElement &&
+                lifetime.mObject.TypeName() ==
+                    DDLoggedTypeTraits<dom::HTMLMediaElement>::Name()) {
+              aF(lifetime);
+              break;
+            }
+            continue;
+          }
+          static_assert(std::is_same_v<decltype(aF(lifetime)), void>, "");
+          aF(lifetime);
+        }
+      }
+    }
+  }
+
+  template <typename F>
+  bool VisitBreakable(const dom::HTMLMediaElement* aMediaElement,
+                      F&& aF) const {
+    for (const auto& lifetimes : mLifetimes.Values()) {
+      for (const DDLifetime& lifetime : *lifetimes) {
+        if (lifetime.mMediaElement == aMediaElement) {
+          static_assert(std::is_same_v<decltype(aF(lifetime)), bool>, "");
+          if (aF(lifetime)) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const;
+
+ private:
+  class DDLogObjectHashKey : public PLDHashEntryHdr {
+   public:
+    typedef const DDLogObject& KeyType;
+    typedef const DDLogObject* KeyTypePointer;
+
+    explicit DDLogObjectHashKey(KeyTypePointer aKey) : mValue(*aKey) {}
+    DDLogObjectHashKey(const DDLogObjectHashKey& aToCopy)
+        : mValue(aToCopy.mValue) {}
+    ~DDLogObjectHashKey() = default;
+
+    KeyType GetKey() const { return mValue; }
+    bool KeyEquals(KeyTypePointer aKey) const { return *aKey == mValue; }
+
+    static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+    static PLDHashNumber HashKey(KeyTypePointer aKey) {
+      return HashBytes(aKey, sizeof(DDLogObject));
+    }
+    enum { ALLOW_MEMMOVE = true };
+
+   private:
+    const DDLogObject mValue;
+  };
+
+  using LifetimesForObject = nsTArray<DDLifetime>;
+
+  nsClassHashtable<DDLogObjectHashKey, LifetimesForObject> mLifetimes;
+};
+
+}  
+
+#endif  // DDLifetimes_h_

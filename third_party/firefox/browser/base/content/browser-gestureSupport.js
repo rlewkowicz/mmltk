@@ -1,0 +1,706 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+var gGestureSupport = {
+  _currentRotation: 0,
+  _lastRotateDelta: 0,
+  _rotateMomentumThreshold: 0.75,
+
+  init: function GS_init(aAddListener) {
+    const gestureEvents = [
+      "SwipeGestureMayStart",
+      "SwipeGestureStart",
+      "SwipeGestureUpdate",
+      "SwipeGestureEnd",
+      "SwipeGesture",
+      "MagnifyGestureStart",
+      "MagnifyGestureUpdate",
+      "MagnifyGesture",
+      "RotateGestureStart",
+      "RotateGestureUpdate",
+      "RotateGesture",
+      "TapGesture",
+      "PressTapGesture",
+    ];
+
+    for (let event of gestureEvents) {
+      if (aAddListener) {
+        gBrowser.tabbox.addEventListener("Moz" + event, this, true);
+      } else {
+        gBrowser.tabbox.removeEventListener("Moz" + event, this, true);
+      }
+    }
+  },
+
+  handleEvent: function GS_handleEvent(aEvent) {
+    if (
+      !Services.prefs.getBoolPref(
+        "dom.debug.propagate_gesture_events_through_content"
+      )
+    ) {
+      aEvent.stopPropagation();
+    }
+
+    let def = (aThreshold, aLatched) => ({
+      threshold: aThreshold,
+      latched: !!aLatched,
+    });
+
+    switch (aEvent.type) {
+      case "MozSwipeGestureMayStart":
+        if (this._shouldDoSwipeGesture(aEvent)) {
+          aEvent.preventDefault();
+        }
+        break;
+      case "MozSwipeGestureStart":
+        aEvent.preventDefault();
+        this._setupSwipeGesture();
+        break;
+      case "MozSwipeGestureUpdate":
+        aEvent.preventDefault();
+        this._doUpdate(aEvent);
+        break;
+      case "MozSwipeGestureEnd":
+        aEvent.preventDefault();
+        this._doEnd(aEvent);
+        break;
+      case "MozSwipeGesture":
+        aEvent.preventDefault();
+        this.onSwipe(aEvent);
+        break;
+      case "MozMagnifyGestureStart":
+        aEvent.preventDefault();
+        this._setupGesture(aEvent, "pinch", def(25, 0), "out", "in");
+        break;
+      case "MozRotateGestureStart":
+        aEvent.preventDefault();
+        this._setupGesture(aEvent, "twist", def(25, 0), "right", "left");
+        break;
+      case "MozMagnifyGestureUpdate":
+      case "MozRotateGestureUpdate":
+        aEvent.preventDefault();
+        this._doUpdate(aEvent);
+        break;
+      case "MozTapGesture":
+        aEvent.preventDefault();
+        this._doAction(aEvent, ["tap"]);
+        break;
+      case "MozRotateGesture":
+        aEvent.preventDefault();
+        this._doAction(aEvent, ["twist", "end"]);
+        break;
+    }
+  },
+
+  _setupGesture: function GS__setupGesture(
+    aEvent,
+    aGesture,
+    aPref,
+    aInc,
+    aDec
+  ) {
+    for (let [pref, def] of Object.entries(aPref)) {
+      aPref[pref] = this._getPref(aGesture + "." + pref, def);
+    }
+
+    let offset = 0;
+    let latchDir = aEvent.delta > 0 ? 1 : -1;
+    let isLatched = false;
+
+    this._doUpdate = function GS__doUpdate(updateEvent) {
+      offset += updateEvent.delta;
+
+      if (Math.abs(offset) > aPref.threshold) {
+        let sameDir = (latchDir ^ offset) >= 0;
+        if (!aPref.latched || isLatched ^ sameDir) {
+          this._doAction(updateEvent, [aGesture, offset > 0 ? aInc : aDec]);
+
+          isLatched = !isLatched;
+        }
+
+        offset = 0;
+      }
+    };
+
+    this._doUpdate(aEvent);
+  },
+
+  _swipeNavigatesHistory: function GS__swipeNavigatesHistory(aEvent) {
+    return (
+      this._getCommand(aEvent, ["swipe", "left"]) ==
+        "Browser:BackOrBackDuplicate" &&
+      this._getCommand(aEvent, ["swipe", "right"]) ==
+        "Browser:ForwardOrForwardDuplicate"
+    );
+  },
+
+  _shouldDoSwipeGesture: function GS__shouldDoSwipeGesture(aEvent) {
+    if (!this._swipeNavigatesHistory(aEvent)) {
+      return false;
+    }
+
+    let isVerticalSwipe = false;
+    if (aEvent.direction == aEvent.DIRECTION_UP) {
+      if (gMultiProcessBrowser || window.content.pageYOffset > 0) {
+        return false;
+      }
+      isVerticalSwipe = true;
+    } else if (aEvent.direction == aEvent.DIRECTION_DOWN) {
+      if (
+        gMultiProcessBrowser ||
+        window.content.pageYOffset < window.content.scrollMaxY
+      ) {
+        return false;
+      }
+      isVerticalSwipe = true;
+    }
+    if (isVerticalSwipe) {
+      return false;
+    }
+
+    let canGoBack = gHistorySwipeAnimation.canGoBack();
+    let canGoForward = gHistorySwipeAnimation.canGoForward();
+    let isLTR = gHistorySwipeAnimation.isLTR;
+
+    if (canGoBack) {
+      aEvent.allowedDirections |= isLTR
+        ? aEvent.DIRECTION_LEFT
+        : aEvent.DIRECTION_RIGHT;
+    }
+    if (canGoForward) {
+      aEvent.allowedDirections |= isLTR
+        ? aEvent.DIRECTION_RIGHT
+        : aEvent.DIRECTION_LEFT;
+    }
+
+    return canGoBack || canGoForward;
+  },
+
+  _setupSwipeGesture: function GS__setupSwipeGesture() {
+    gHistorySwipeAnimation.startAnimation();
+
+    this._doUpdate = function GS__doUpdate(aEvent) {
+      gHistorySwipeAnimation.updateAnimation(aEvent.delta);
+    };
+
+    this._doEnd = function GS__doEnd() {
+      gHistorySwipeAnimation.swipeEndEventReceived();
+
+      this._doUpdate = function () {};
+      this._doEnd = function () {};
+    };
+  },
+
+  _power: function* GS__power(aArray) {
+    let num = 1 << aArray.length;
+    while (--num >= 0) {
+      yield aArray.reduce(function (aPrev, aCurr, aIndex) {
+        if (num & (1 << aIndex)) {
+          aPrev.push(aCurr);
+        }
+        return aPrev;
+      }, []);
+    }
+  },
+
+  _doAction: function GS__doAction(aEvent, aGesture) {
+    let command = this._getCommand(aEvent, aGesture);
+    return command && this._doCommand(aEvent, command);
+  },
+
+  _getCommand: function GS__getCommand(aEvent, aGesture) {
+    let keyCombos = [];
+    for (let key of ["shift", "alt", "ctrl", "meta"]) {
+      if (aEvent[key + "Key"]) {
+        keyCombos.push(key);
+      }
+    }
+
+    for (let subCombo of this._power(keyCombos)) {
+      let command;
+      try {
+        command = this._getPref(aGesture.concat(subCombo).join("."));
+      } catch (e) {}
+
+      if (command) {
+        return command;
+      }
+    }
+    return null;
+  },
+
+  _doCommand: function GS__doCommand(aEvent, aCommand) {
+    let node = document.getElementById(aCommand);
+    if (node) {
+      if (node.getAttribute("disabled") != "true") {
+        let cmdEvent = document.createEvent("xulcommandevent");
+        cmdEvent.initCommandEvent(
+          "command",
+          true,
+          true,
+          window,
+          0,
+          aEvent.ctrlKey,
+          aEvent.altKey,
+          aEvent.shiftKey,
+          aEvent.metaKey,
+          0,
+          aEvent,
+          aEvent.inputSource
+        );
+        node.dispatchEvent(cmdEvent);
+      }
+    } else {
+      goDoCommand(aCommand);
+    }
+  },
+
+  _doUpdate() {},
+
+  _doEnd() {},
+
+  onSwipe: function GS_onSwipe(aEvent) {
+    for (let dir of ["UP", "RIGHT", "DOWN", "LEFT"]) {
+      if (aEvent.direction == aEvent["DIRECTION_" + dir]) {
+        this._coordinateSwipeEventWithAnimation(aEvent, dir);
+        break;
+      }
+    }
+  },
+
+  processSwipeEvent: function GS_processSwipeEvent(aEvent, aDir) {
+    let dir = aDir.toLowerCase();
+    if (!gHistorySwipeAnimation.isLTR) {
+      if (dir == "right") {
+        dir = "left";
+      } else if (dir == "left") {
+        dir = "right";
+      }
+    }
+    this._doAction(aEvent, ["swipe", dir]);
+  },
+
+  _coordinateSwipeEventWithAnimation:
+    function GS__coordinateSwipeEventWithAnimation(aEvent, aDir) {
+      gHistorySwipeAnimation.stopAnimation();
+      this.processSwipeEvent(aEvent, aDir);
+    },
+
+  _getPref: function GS__getPref(aPref, aDef) {
+    const branch = "browser.gesture.";
+
+    try {
+      let type = typeof aDef;
+      let getFunc = "Char";
+      if (type == "boolean") {
+        getFunc = "Bool";
+      } else if (type == "number") {
+        getFunc = "Int";
+      }
+      return Services.prefs["get" + getFunc + "Pref"](branch + aPref);
+    } catch (e) {
+      return aDef;
+    }
+  },
+
+  rotate(aEvent) {
+    if (!ImageDocument.isInstance(window.content.document)) {
+      return;
+    }
+
+    let contentElement = window.content.document.body.firstElementChild;
+    if (!contentElement) {
+      return;
+    }
+    if (contentElement.classList.contains("completeRotation")) {
+      this._clearCompleteRotation();
+    }
+
+    this.rotation = Math.round(this.rotation + aEvent.delta);
+    contentElement.style.transform = "rotate(" + this.rotation + "deg)";
+    this._lastRotateDelta = aEvent.delta;
+  },
+
+  rotateEnd() {
+    if (!ImageDocument.isInstance(window.content.document)) {
+      return;
+    }
+
+    let contentElement = window.content.document.body.firstElementChild;
+    if (!contentElement) {
+      return;
+    }
+
+    let transitionRotation = 0;
+
+    if (this.rotation <= 45) {
+      transitionRotation = 0;
+    } else if (this.rotation > 45 && this.rotation <= 135) {
+      transitionRotation = 90;
+    } else if (this.rotation > 135 && this.rotation <= 225) {
+      transitionRotation = 180;
+    } else if (this.rotation > 225 && this.rotation <= 315) {
+      transitionRotation = 270;
+    } else {
+      transitionRotation = 360;
+    }
+
+    if (
+      this._lastRotateDelta > this._rotateMomentumThreshold &&
+      this.rotation > transitionRotation
+    ) {
+      transitionRotation += 90;
+    } else if (
+      this._lastRotateDelta < -1 * this._rotateMomentumThreshold &&
+      this.rotation < transitionRotation
+    ) {
+      transitionRotation -= 90;
+    }
+
+    if (transitionRotation != this.rotation) {
+      contentElement.classList.add("completeRotation");
+      contentElement.addEventListener(
+        "transitionend",
+        this._clearCompleteRotation
+      );
+    }
+
+    contentElement.style.transform = "rotate(" + transitionRotation + "deg)";
+    this.rotation = transitionRotation;
+  },
+
+  get rotation() {
+    return this._currentRotation;
+  },
+
+  set rotation(aVal) {
+    this._currentRotation = aVal % 360;
+    if (this._currentRotation < 0) {
+      this._currentRotation += 360;
+    }
+  },
+
+  restoreRotationState() {
+    if (gMultiProcessBrowser) {
+      return;
+    }
+
+    if (!ImageDocument.isInstance(window.content.document)) {
+      return;
+    }
+
+    let contentElement = window.content.document.body.firstElementChild;
+    let transformValue =
+      window.content.window.getComputedStyle(contentElement).transform;
+
+    if (transformValue == "none") {
+      this.rotation = 0;
+      return;
+    }
+
+    transformValue = transformValue.split("(")[1].split(")")[0].split(",");
+    this.rotation = Math.round(
+      Math.atan2(transformValue[1], transformValue[0]) * (180 / Math.PI)
+    );
+  },
+
+  _clearCompleteRotation() {
+    let contentElement =
+      window.content.document &&
+      ImageDocument.isInstance(window.content.document) &&
+      window.content.document.body &&
+      window.content.document.body.firstElementChild;
+    if (!contentElement) {
+      return;
+    }
+    contentElement.classList.remove("completeRotation");
+    contentElement.removeEventListener(
+      "transitionend",
+      this._clearCompleteRotation
+    );
+  },
+};
+
+var gHistorySwipeAnimation = {
+  active: false,
+  isLTR: false,
+
+  init: function HSA_init() {
+    this.isLTR = document.documentElement.matches(":-moz-locale-dir(ltr)");
+    this._isStoppingAnimation = false;
+
+    if (!this._isSupported()) {
+      return;
+    }
+
+    if (
+      Services.prefs.getBoolPref(
+        "browser.history_swipe_animation.disabled",
+        false
+      )
+    ) {
+      return;
+    }
+
+    this._icon = document.getElementById("swipe-nav-icon");
+    this._initPrefValues();
+    this._addPrefObserver();
+    this.active = true;
+  },
+
+  uninit: function HSA_uninit() {
+    this._removePrefObserver();
+    this.active = false;
+    this.isLTR = false;
+    this._icon = null;
+    this._removeBoxes();
+  },
+
+  startAnimation: function HSA_startAnimation() {
+    this._removeBoxes();
+    this._isStoppingAnimation = false;
+    this._canGoBack = this.canGoBack();
+    this._canGoForward = this.canGoForward();
+    if (this.active) {
+      this._addBoxes();
+    }
+    this.updateAnimation(0);
+  },
+
+  stopAnimation: function HSA_stopAnimation() {
+    if (!this.isAnimationRunning() || this._isStoppingAnimation) {
+      return;
+    }
+
+    let box = null;
+    let isCancelPath = false;
+    if (!this._prevBox.collapsed) {
+      box = this._prevBox;
+    } else if (!this._nextBox.collapsed) {
+      box = this._nextBox;
+    } else if (this._lastVisibleBox) {
+      box = this._lastVisibleBox;
+      box.collapsed = false;
+      box.style.translate = this._lastVisibleTranslate;
+      isCancelPath = true;
+    }
+    if (box != null) {
+      this._isStoppingAnimation = true;
+      box.style.transition = isCancelPath
+        ? "opacity 0.2s linear"
+        : "opacity 0.35s 0.35s cubic-bezier(.25,.1,0.25,1)";
+      box.addEventListener("transitionend", this, true);
+      box.style.opacity = 0;
+      window.getComputedStyle(box).opacity;
+    } else {
+      this._isStoppingAnimation = false;
+      this._removeBoxes();
+    }
+  },
+
+  _willGoBack: function HSA_willGoBack(aVal) {
+    return (
+      ((aVal > 0 && this.isLTR) || (aVal < 0 && !this.isLTR)) && this._canGoBack
+    );
+  },
+
+  _willGoForward: function HSA_willGoForward(aVal) {
+    return (
+      ((aVal > 0 && !this.isLTR) || (aVal < 0 && this.isLTR)) &&
+      this._canGoForward
+    );
+  },
+
+  updateAnimation: function HSA_updateAnimation(aVal) {
+    if (!this.isAnimationRunning() || this._isStoppingAnimation) {
+      return;
+    }
+
+    const progress = Math.min(Math.abs(aVal) * 4, 1.0);
+
+    let translate =
+      this.translateStartPosition +
+      progress * (this.translateEndPosition - this.translateStartPosition);
+    if (!this.isLTR) {
+      translate = -translate;
+    }
+
+    const radius =
+      this.minRadius + progress * (this.maxRadius - this.minRadius);
+    if (this._willGoBack(aVal)) {
+      this._prevBox.collapsed = false;
+      this._nextBox.collapsed = true;
+      this._prevBox.style.translate = `${translate}px 0px`;
+      if (radius >= 0) {
+        this._prevBox
+          .querySelectorAll("circle")[1]
+          .setAttribute("r", `${radius}`);
+      }
+
+      if (Math.abs(aVal) >= 0.25) {
+        this._prevBox.querySelector("svg").classList.add("will-navigate");
+      } else {
+        this._prevBox.querySelector("svg").classList.remove("will-navigate");
+      }
+    } else if (this._willGoForward(aVal)) {
+      this._nextBox.collapsed = false;
+      this._prevBox.collapsed = true;
+      this._nextBox.style.translate = `${-translate}px 0px`;
+      if (radius >= 0) {
+        this._nextBox
+          .querySelectorAll("circle")[1]
+          .setAttribute("r", `${radius}`);
+      }
+
+      if (Math.abs(aVal) >= 0.25) {
+        this._nextBox.querySelector("svg").classList.add("will-navigate");
+      } else {
+        this._nextBox.querySelector("svg").classList.remove("will-navigate");
+      }
+    } else {
+      if (!this._prevBox.collapsed) {
+        this._lastVisibleBox = this._prevBox;
+        this._lastVisibleTranslate = this._prevBox.style.translate;
+      } else if (!this._nextBox.collapsed) {
+        this._lastVisibleBox = this._nextBox;
+        this._lastVisibleTranslate = this._nextBox.style.translate;
+      }
+      this._prevBox.collapsed = true;
+      this._nextBox.collapsed = true;
+      this._prevBox.style.translate = "none";
+      this._nextBox.style.translate = "none";
+    }
+  },
+
+  isAnimationRunning: function HSA_isAnimationRunning() {
+    return !!this._container;
+  },
+
+  canGoBack: function HSA_canGoBack() {
+    return gBrowser.webNavigation.canGoBack;
+  },
+
+  canGoForward: function HSA_canGoForward() {
+    return gBrowser.webNavigation.canGoForward;
+  },
+
+  swipeEndEventReceived: function HSA_swipeEndEventReceived() {
+    this.stopAnimation();
+  },
+
+  _isSupported: function HSA__isSupported() {
+    return window.matchMedia("(-moz-swipe-animation-enabled)").matches;
+  },
+
+  handleEvent: function HSA_handleEvent(aEvent) {
+    switch (aEvent.type) {
+      case "transitionend":
+        this._completeFadeOut();
+        break;
+    }
+  },
+
+  _completeFadeOut: function HSA__completeFadeOut() {
+    if (!this._isStoppingAnimation) {
+      return;
+    }
+    this._isStoppingAnimation = false;
+    gHistorySwipeAnimation._removeBoxes();
+  },
+
+  _addBoxes: function HSA__addBoxes() {
+    let browserStack = gBrowser.getPanel().querySelector(".browserStack");
+    this._container = this._createElement(
+      "historySwipeAnimationContainer",
+      "stack"
+    );
+    browserStack.appendChild(this._container);
+
+    this._prevBox = this._createElement(
+      "historySwipeAnimationPreviousArrow",
+      "box"
+    );
+    this._prevBox.collapsed = true;
+    this._container.appendChild(this._prevBox);
+    let icon = this._icon.cloneNode(true);
+    icon.classList.add("swipe-nav-icon");
+    this._prevBox.appendChild(icon);
+
+    this._nextBox = this._createElement(
+      "historySwipeAnimationNextArrow",
+      "box"
+    );
+    this._nextBox.collapsed = true;
+    this._container.appendChild(this._nextBox);
+    icon = this._icon.cloneNode(true);
+    icon.classList.add("swipe-nav-icon");
+    this._nextBox.appendChild(icon);
+  },
+
+  _removeBoxes: function HSA__removeBoxes() {
+    this._prevBox = null;
+    this._nextBox = null;
+    this._lastVisibleBox = null;
+    this._lastVisibleTranslate = "";
+    if (this._container) {
+      this._container.remove();
+    }
+    this._container = null;
+  },
+
+  _createElement: function HSA__createElement(aID, aTagName) {
+    let element = document.createXULElement(aTagName);
+    element.id = aID;
+    return element;
+  },
+
+  observe(subj, topic) {
+    switch (topic) {
+      case "nsPref:changed":
+        this._initPrefValues();
+    }
+  },
+
+  _initPrefValues: function HSA__initPrefValues() {
+    this.translateStartPosition = Services.prefs.getIntPref(
+      "browser.swipe.navigation-icon-start-position",
+      0
+    );
+    this.translateEndPosition = Services.prefs.getIntPref(
+      "browser.swipe.navigation-icon-end-position",
+      0
+    );
+    this.minRadius = Services.prefs.getIntPref(
+      "browser.swipe.navigation-icon-min-radius",
+      -1
+    );
+    this.maxRadius = Services.prefs.getIntPref(
+      "browser.swipe.navigation-icon-max-radius",
+      -1
+    );
+  },
+
+  _addPrefObserver: function HSA__addPrefObserver() {
+    [
+      "browser.swipe.navigation-icon-start-position",
+      "browser.swipe.navigation-icon-end-position",
+      "browser.swipe.navigation-icon-min-radius",
+      "browser.swipe.navigation-icon-max-radius",
+    ].forEach(pref => {
+      Services.prefs.addObserver(pref, this);
+    });
+  },
+
+  _removePrefObserver: function HSA__removePrefObserver() {
+    [
+      "browser.swipe.navigation-icon-start-position",
+      "browser.swipe.navigation-icon-end-position",
+      "browser.swipe.navigation-icon-min-radius",
+      "browser.swipe.navigation-icon-max-radius",
+    ].forEach(pref => {
+      Services.prefs.removeObserver(pref, this);
+    });
+  },
+};

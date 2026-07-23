@@ -1,0 +1,456 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(PlatformDecoderModule_h_)
+#  define PlatformDecoderModule_h_
+
+#  include "DecoderDoctorLogger.h"
+#  include "MediaCodecsSupport.h"
+#  include "MediaEventSource.h"
+#  include "MediaInfo.h"
+#  include "MediaResult.h"
+#  include "PerformanceRecorder.h"
+#  include "mozilla/EnumSet.h"
+#  include "mozilla/EnumTypeTraits.h"
+#  include "mozilla/MozPromise.h"
+#  include "mozilla/RefPtr.h"
+#  include "mozilla/TaskQueue.h"
+#  include "mozilla/ipc/UtilityMediaService.h"
+#  include "mozilla/layers/KnowsCompositor.h"
+#  include "mozilla/layers/LayersTypes.h"
+#  include "nsTArray.h"
+
+namespace mozilla {
+class TrackInfo;
+class AudioInfo;
+class VideoInfo;
+class MediaRawData;
+class DecoderDoctorDiagnostics;
+
+namespace layers {
+class ImageContainer;
+}  
+
+class MediaDataDecoder;
+class RemoteDecoderModule;
+class CDMProxy;
+
+static LazyLogModule sPDMLog("PlatformDecoderModule");
+
+namespace media {
+
+template <typename T>
+static nsCString EnumSetToString(const EnumSet<T>& aSet) {
+  nsCString str;
+  for (const auto e : aSet) {
+    if (!str.IsEmpty()) {
+      str.AppendLiteral("|");
+    }
+    str.AppendPrintf("%s", EnumValueToString(e));
+  }
+  if (str.IsEmpty()) {
+    str.AppendLiteral("Empty");
+  }
+  return str;
+}
+
+MOZ_DEFINE_ENUM_CLASS_WITH_TOSTRING(
+    Option,
+    (Default, LowLatency, HardwareDecoderNotAllowed, FullH264Parsing,
+     ErrorIfNoInitializationData,  
+     DefaultPlaybackDeviceMono,  
+     KeepOriginalPts,  
+     Output8BitPerChannel,  
+
+     SENTINEL  
+     ));
+
+using OptionSet = EnumSet<Option>;
+
+struct UseNullDecoder {
+  UseNullDecoder() = default;
+  explicit UseNullDecoder(bool aUseNullDecoder) : mUse(aUseNullDecoder) {}
+  bool mUse = false;
+};
+
+MOZ_DEFINE_ENUM_CLASS_WITH_BASE_AND_TOSTRING(Wrapper, uint8_t,
+                                             (AudioTrimmer,
+                                              MediaChangeMonitor));
+using WrapperSet = EnumSet<Wrapper>;
+static WrapperSet GetDefaultWrapperSet(const TrackInfo& aInfo) {
+  WrapperSet set;
+  if (aInfo.IsVideo()) {
+    set += Wrapper::MediaChangeMonitor;
+  }
+  if (aInfo.IsAudio()) {
+    set += Wrapper::AudioTrimmer;
+  }
+  return set;
+}
+
+struct VideoFrameRate {
+  VideoFrameRate() = default;
+  explicit VideoFrameRate(float aFramerate) : mValue(aFramerate) {}
+  float mValue = 0.0f;
+};
+
+}  
+
+struct CreateDecoderParams;
+struct CreateDecoderParamsForAsync {
+  using Option = media::Option;
+  using OptionSet = media::OptionSet;
+  explicit CreateDecoderParamsForAsync(const CreateDecoderParams& aParams);
+  CreateDecoderParamsForAsync(CreateDecoderParamsForAsync&& aParams);
+
+  const VideoInfo& VideoConfig() const {
+    MOZ_ASSERT(mConfig->IsVideo());
+    return *mConfig->GetAsVideoInfo();
+  }
+
+  const AudioInfo& AudioConfig() const {
+    MOZ_ASSERT(mConfig->IsAudio());
+    return *mConfig->GetAsAudioInfo();
+  }
+
+  UniquePtr<TrackInfo> mConfig;
+  const RefPtr<layers::ImageContainer> mImageContainer;
+  const RefPtr<layers::KnowsCompositor> mKnowsCompositor;
+  const media::UseNullDecoder mUseNullDecoder;
+  const media::WrapperSet mWrappers;
+  const TrackInfo::TrackType mType = TrackInfo::kUndefinedTrack;
+  const OptionSet mOptions = OptionSet(Option::Default);
+  const media::VideoFrameRate mRate;
+  const Maybe<TrackingId> mTrackingId;
+};
+
+struct MOZ_STACK_CLASS CreateDecoderParams final {
+  using Option = media::Option;
+  using OptionSet = media::OptionSet;
+  using UseNullDecoder = media::UseNullDecoder;
+  using WrapperSet = media::WrapperSet;
+  using VideoFrameRate = media::VideoFrameRate;
+  explicit CreateDecoderParams(const TrackInfo& aConfig)
+      : mConfig(aConfig), mWrappers(media::GetDefaultWrapperSet(aConfig)) {}
+  CreateDecoderParams(const CreateDecoderParams& aParams) = default;
+
+  MOZ_IMPLICIT CreateDecoderParams(const CreateDecoderParamsForAsync& aParams)
+      : mConfig(*aParams.mConfig),
+        mImageContainer(aParams.mImageContainer),
+        mKnowsCompositor(aParams.mKnowsCompositor),
+        mUseNullDecoder(aParams.mUseNullDecoder),
+        mWrappers(aParams.mWrappers),
+        mType(aParams.mType),
+        mOptions(aParams.mOptions),
+        mRate(aParams.mRate),
+        mTrackingId(aParams.mTrackingId) {}
+
+  template <typename T1, typename... Ts>
+  CreateDecoderParams(const TrackInfo& aConfig, T1&& a1, Ts&&... args)
+      : mConfig(aConfig), mWrappers(media::GetDefaultWrapperSet(aConfig)) {
+    Set(std::forward<T1>(a1), std::forward<Ts>(args)...);
+  }
+
+  template <typename T1, typename... Ts>
+  CreateDecoderParams(const CreateDecoderParams& aParams, T1&& a1, Ts&&... args)
+      : CreateDecoderParams(aParams) {
+    Set(std::forward<T1>(a1), std::forward<Ts>(args)...);
+  }
+
+  const VideoInfo& VideoConfig() const {
+    MOZ_ASSERT(mConfig.IsVideo());
+    return *mConfig.GetAsVideoInfo();
+  }
+
+  const AudioInfo& AudioConfig() const {
+    MOZ_ASSERT(mConfig.IsAudio());
+    return *mConfig.GetAsAudioInfo();
+  }
+
+  bool IsVideo() const { return mConfig.IsVideo(); }
+
+  bool IsAudio() const { return mConfig.IsAudio(); }
+
+  layers::LayersBackend GetLayersBackend() const {
+    if (mKnowsCompositor) {
+      return mKnowsCompositor->GetCompositorBackendType();
+    }
+    return layers::LayersBackend::LAYERS_NONE;
+  }
+
+  nsCString ToString() const {
+    nsPrintfCString str("CreateDecoderParams @ %p: ", this);
+    str.AppendPrintf("mConfig = %s", mConfig.ToString().get());
+    str.AppendPrintf(", mImageContainer = %p", mImageContainer);
+    str.AppendPrintf(", mError = %s",
+                     mError ? mError->Description().get() : "null");
+    str.AppendPrintf(", mKnowsCompositor = %p", mKnowsCompositor);
+    str.AppendPrintf(", mUseNullDecoder = %s",
+                     mUseNullDecoder.mUse ? "yes" : "no");
+    str.AppendPrintf(", mWrappers = %s", EnumSetToString(mWrappers).get());
+    str.AppendPrintf(", mType = %d", static_cast<int32_t>(mType));
+    str.AppendPrintf(", mOptions = %s", EnumSetToString(mOptions).get());
+    str.AppendPrintf(", mRate = %f", mRate.mValue);
+    str.AppendPrintf(", mTrackingId = %s",
+                     mTrackingId ? mTrackingId->ToString().get() : "None");
+    return {std::move(str)};
+  }
+
+  const TrackInfo& mConfig;
+  layers::ImageContainer* mImageContainer = nullptr;
+  MediaResult* mError = nullptr;
+  layers::KnowsCompositor* mKnowsCompositor = nullptr;
+  media::UseNullDecoder mUseNullDecoder;
+  WrapperSet mWrappers;
+  TrackInfo::TrackType mType = TrackInfo::kUndefinedTrack;
+  OptionSet mOptions = OptionSet(Option::Default);
+  media::VideoFrameRate mRate;
+  Maybe<TrackingId> mTrackingId;
+
+ private:
+  void Set(layers::ImageContainer* aImageContainer) {
+    mImageContainer = aImageContainer;
+  }
+  void Set(MediaResult* aError) { mError = aError; }
+  void Set(UseNullDecoder aUseNullDecoder) {
+    mUseNullDecoder = aUseNullDecoder;
+  }
+  void Set(const WrapperSet& aWrappers) { mWrappers = aWrappers; }
+  void Set(const OptionSet& aOptions) { mOptions = aOptions; }
+  void Set(VideoFrameRate aRate) { mRate = aRate; }
+  void Set(layers::KnowsCompositor* aKnowsCompositor) {
+    if (aKnowsCompositor) {
+      mKnowsCompositor = aKnowsCompositor;
+      MOZ_ASSERT(aKnowsCompositor->IsThreadSafe());
+    }
+  }
+  void Set(TrackInfo::TrackType aType) { mType = aType; }
+  void Set(const Maybe<TrackingId>& aTrackingId) { mTrackingId = aTrackingId; }
+  void Set(const CreateDecoderParams& aParams) {
+    mImageContainer = aParams.mImageContainer;
+    mError = aParams.mError;
+    mKnowsCompositor = aParams.mKnowsCompositor;
+    mUseNullDecoder = aParams.mUseNullDecoder;
+    mWrappers = aParams.mWrappers;
+    mType = aParams.mType;
+    mOptions = aParams.mOptions;
+    mRate = aParams.mRate;
+    mTrackingId = aParams.mTrackingId;
+  }
+  template <typename T1, typename T2, typename... Ts>
+  void Set(T1&& a1, T2&& a2, Ts&&... args) {
+    Set(std::forward<T1>(a1));
+    Set(std::forward<T2>(a2), std::forward<Ts>(args)...);
+  }
+};
+
+struct MOZ_STACK_CLASS SupportDecoderParams final {
+  using Option = media::Option;
+  using OptionSet = media::OptionSet;
+  using UseNullDecoder = media::UseNullDecoder;
+  using WrapperSet = media::WrapperSet;
+  using VideoFrameRate = media::VideoFrameRate;
+
+  explicit SupportDecoderParams(const TrackInfo& aConfig)
+      : mConfig(aConfig), mWrappers(media::GetDefaultWrapperSet(aConfig)) {}
+
+  explicit SupportDecoderParams(const CreateDecoderParams& aParams)
+      : mConfig(aParams.mConfig),
+        mError(aParams.mError),
+        mKnowsCompositor(aParams.mKnowsCompositor),
+        mUseNullDecoder(aParams.mUseNullDecoder),
+        mWrappers(aParams.mWrappers),
+        mOptions(aParams.mOptions),
+        mRate(aParams.mRate) {}
+
+  template <typename T1, typename... Ts>
+  SupportDecoderParams(const TrackInfo& aConfig, T1&& a1, Ts&&... args)
+      : mConfig(aConfig), mWrappers(media::GetDefaultWrapperSet(aConfig)) {
+    Set(std::forward<T1>(a1), std::forward<Ts>(args)...);
+  }
+
+  const nsCString& MimeType() const { return mConfig.mMimeType; }
+
+  const TrackInfo& mConfig;
+  DecoderDoctorDiagnostics* mDiagnostics = nullptr;
+  MediaResult* mError = nullptr;
+  RefPtr<layers::KnowsCompositor> mKnowsCompositor;
+  UseNullDecoder mUseNullDecoder;
+  WrapperSet mWrappers;
+  OptionSet mOptions = OptionSet(Option::Default);
+  VideoFrameRate mRate;
+
+ private:
+  void Set(DecoderDoctorDiagnostics* aDiagnostics) {
+    mDiagnostics = aDiagnostics;
+  }
+  void Set(MediaResult* aError) { mError = aError; }
+  void Set(media::UseNullDecoder aUseNullDecoder) {
+    mUseNullDecoder = aUseNullDecoder;
+  }
+  void Set(const WrapperSet& aWrappers) { mWrappers = aWrappers; }
+  void Set(const media::OptionSet& aOptions) { mOptions = aOptions; }
+  void Set(media::VideoFrameRate aRate) { mRate = aRate; }
+  void Set(layers::KnowsCompositor* aKnowsCompositor) {
+    if (aKnowsCompositor) {
+      mKnowsCompositor = aKnowsCompositor;
+      MOZ_ASSERT(aKnowsCompositor->IsThreadSafe());
+    }
+  }
+
+  template <typename T1, typename T2, typename... Ts>
+  void Set(T1&& a1, T2&& a2, Ts&&... args) {
+    Set(std::forward<T1>(a1));
+    Set(std::forward<T2>(a2), std::forward<Ts>(args)...);
+  }
+};
+
+template <>
+struct MaxEnumValue<::mozilla::CreateDecoderParams::Option> {
+  static constexpr unsigned int value =
+      static_cast<unsigned int>(CreateDecoderParams::Option::SENTINEL);
+};
+
+
+class PlatformDecoderModule {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(PlatformDecoderModule)
+
+  virtual const char* Name() const = 0;
+
+  virtual nsresult Startup() { return NS_OK; }
+
+  virtual media::DecodeSupportSet SupportsMimeType(
+      const nsACString& aMimeType,
+      DecoderDoctorDiagnostics* aDiagnostics) const = 0;
+
+  virtual media::DecodeSupportSet Supports(
+      const SupportDecoderParams& aParams,
+      DecoderDoctorDiagnostics* aDiagnostics) const {
+    const TrackInfo& trackInfo = aParams.mConfig;
+    const media::DecodeSupportSet support =
+        SupportsMimeType(trackInfo.mMimeType, aDiagnostics);
+
+    if (support.isEmpty()) {
+      return support;
+    }
+
+    const auto* videoInfo = trackInfo.GetAsVideoInfo();
+
+    if (!videoInfo) {
+      return media::DecodeSupport::SoftwareDecode;
+    }
+
+    if (!SupportsColorDepth(videoInfo->mColorDepth, aDiagnostics)) {
+      return media::DecodeSupportSet{};
+    }
+    return support;
+  }
+
+  using CreateDecoderPromise = MozPromise<RefPtr<MediaDataDecoder>, MediaResult,
+                                           true>;
+
+ protected:
+  PlatformDecoderModule() = default;
+  virtual ~PlatformDecoderModule() = default;
+
+  friend class MediaChangeMonitor;
+  friend class PDMFactory;
+  friend class EMEDecoderModule;
+  friend class RemoteDecoderModule;
+
+  virtual bool SupportsColorDepth(
+      gfx::ColorDepth aColorDepth,
+      DecoderDoctorDiagnostics* aDiagnostics) const {
+    return aColorDepth == gfx::ColorDepth::COLOR_8;
+  }
+
+  virtual already_AddRefed<MediaDataDecoder> CreateVideoDecoder(
+      const CreateDecoderParams& aParams) = 0;
+
+  virtual already_AddRefed<MediaDataDecoder> CreateAudioDecoder(
+      const CreateDecoderParams& aParams) = 0;
+
+  virtual RefPtr<CreateDecoderPromise> AsyncCreateDecoder(
+      const CreateDecoderParams& aParams);
+};
+
+DDLoggedTypeDeclName(MediaDataDecoder);
+
+class MediaDataDecoder : public DecoderDoctorLifeLogger<MediaDataDecoder> {
+ protected:
+  virtual ~MediaDataDecoder() = default;
+
+ public:
+  using TrackType = TrackInfo::TrackType;
+  using DecodedData = nsTArray<RefPtr<MediaData>>;
+  using InitPromise = MozPromise<TrackType, MediaResult, true>;
+  using DecodePromise = MozPromise<DecodedData, MediaResult, true>;
+  using FlushPromise = MozPromise<bool, MediaResult, true>;
+
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  virtual RefPtr<InitPromise> Init() = 0;
+
+  virtual RefPtr<DecodePromise> Decode(MediaRawData* aSample) = 0;
+
+  virtual bool CanDecodeBatch() const { return false; }
+  virtual RefPtr<DecodePromise> DecodeBatch(
+      nsTArray<RefPtr<MediaRawData>>&& aSamples) {
+    MOZ_CRASH("DecodeBatch not implemented yet");
+    return MediaDataDecoder::DecodePromise::CreateAndReject(
+        NS_ERROR_DOM_MEDIA_DECODE_ERR, __func__);
+  }
+
+  virtual RefPtr<DecodePromise> Drain() = 0;
+
+  virtual RefPtr<FlushPromise> Flush() = 0;
+
+  virtual RefPtr<ShutdownPromise> Shutdown() = 0;
+
+  virtual bool IsHardwareAccelerated(nsACString& aFailureReason) const {
+    return false;
+  }
+
+  virtual nsCString GetDescriptionName() const = 0;
+
+  virtual nsCString GetProcessName() const {
+    nsCString rv = nsCString(XRE_GetProcessTypeString());
+    if (XRE_IsUtilityProcess()) {
+      rv += "+"_ns + mozilla::ipc::GetChildAudioActorName();
+    }
+    return rv;
+  };
+  virtual nsCString GetCodecName() const = 0;
+
+  virtual void SetSeekThreshold(const media::TimeUnit& aTime) {}
+
+  virtual bool SupportDecoderRecycling() const { return false; }
+
+  virtual bool ShouldDecoderAlwaysBeRecycled() const { return false; }
+
+  enum class ConversionRequired {
+    kNeedNone = 0,
+    kNeedAVCC = 1,
+    kNeedAnnexB = 2,
+    kNeedHVCC = 3,
+  };
+
+  virtual ConversionRequired NeedsConversion() const {
+    return ConversionRequired::kNeedNone;
+  }
+
+  MOZ_DEFINE_ENUM_CLASS_WITH_TOSTRING_AT_CLASS_SCOPE(PropertyName,
+                                                     (MaxNumVideoBuffers,
+                                                      MinNumVideoBuffers,
+                                                      MaxNumCurrentImages));
+  using PropertyValue = Variant<uint32_t>;
+  virtual Maybe<PropertyValue> GetDecodeProperty(PropertyName aName) const {
+    return Nothing();
+  }
+};
+
+}  
+
+#endif

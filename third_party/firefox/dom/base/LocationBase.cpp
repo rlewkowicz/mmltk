@@ -1,0 +1,108 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/LocationBase.h"
+
+#include "mozilla/NullPrincipal.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/dom/WindowContext.h"
+#include "nsCOMPtr.h"
+#include "nsContentUtils.h"
+#include "nsDocLoader.h"
+#include "nsDocShellLoadState.h"
+#include "nsError.h"
+#include "nsGlobalWindowInner.h"
+#include "nsIClassifiedChannel.h"
+#include "nsIScriptContext.h"
+#include "nsIScriptSecurityManager.h"
+#include "nsIWebNavigation.h"
+#include "nsNetUtil.h"
+
+namespace mozilla::dom {
+
+static bool IncumbentGlobalHasTransientActivation() {
+  nsGlobalWindowInner* window = nsContentUtils::IncumbentInnerWindow();
+  return window && window->GetWindowContext() && window->GetWindowContext() &&
+         window->GetWindowContext()->HasValidTransientUserGestureActivation();
+}
+
+void LocationBase::Navigate(nsIURI* aURI, nsIPrincipal& aSubjectPrincipal,
+                            ErrorResult& aRv,
+                            NavigationHistoryBehavior aHistoryHandling) {
+  RefPtr<BrowsingContext> navigable = GetBrowsingContext();
+  if (!navigable || navigable->IsDiscarded()) {
+    return;
+  }
+
+  bool needsCompletelyLoadedDocument = !IncumbentGlobalHasTransientActivation();
+
+
+  nsCOMPtr<nsPIDOMWindowInner> incumbent =
+      do_QueryInterface(mozilla::dom::GetIncumbentGlobal());
+  nsCOMPtr<Document> doc = incumbent ? incumbent->GetDoc() : nullptr;
+
+  navigable->Navigate(aURI, doc, aSubjectPrincipal, aRv, aHistoryHandling,
+                      needsCompletelyLoadedDocument);
+}
+
+void LocationBase::SetHref(const nsACString& aHref,
+                           nsIPrincipal& aSubjectPrincipal, ErrorResult& aRv) {
+  DoSetHref(aHref, aSubjectPrincipal, false, aRv);
+}
+
+void LocationBase::DoSetHref(const nsACString& aHref,
+                             nsIPrincipal& aSubjectPrincipal, bool aReplace,
+                             ErrorResult& aRv) {
+  nsCOMPtr<nsIURI> base = GetSourceBaseURL();
+  SetHrefWithBase(aHref, base, aSubjectPrincipal, aReplace, aRv);
+}
+
+void LocationBase::SetHrefWithBase(const nsACString& aHref, nsIURI* aBase,
+                                   nsIPrincipal& aSubjectPrincipal,
+                                   bool aReplace, ErrorResult& aRv) {
+  nsresult result;
+  nsCOMPtr<nsIURI> newUri;
+
+  if (Document* doc = GetEntryDocument()) {
+    result = NS_NewURI(getter_AddRefs(newUri), aHref,
+                       doc->GetDocumentCharacterSet(), aBase);
+  } else {
+    result = NS_NewURI(getter_AddRefs(newUri), aHref, nullptr, aBase);
+  }
+
+  if (NS_FAILED(result) || !newUri) {
+    aRv.ThrowSyntaxError("'"_ns + aHref + "' is not a valid URL."_ns);
+    return;
+  }
+
+  NavigationHistoryBehavior historyHandling = NavigationHistoryBehavior::Auto;
+  if (aReplace) {
+    historyHandling = NavigationHistoryBehavior::Replace;
+  }
+
+  Navigate(newUri, aSubjectPrincipal, aRv, historyHandling);
+}
+
+void LocationBase::Replace(const nsACString& aUrl,
+                           nsIPrincipal& aSubjectPrincipal, ErrorResult& aRv) {
+  DoSetHref(aUrl, aSubjectPrincipal, true, aRv);
+}
+
+nsIURI* LocationBase::GetSourceBaseURL() {
+  Document* doc = GetEntryDocument();
+
+  if (!doc) {
+    if (nsCOMPtr<nsIDocShell> docShell = GetDocShell()) {
+      nsCOMPtr<nsPIDOMWindowOuter> docShellWin =
+          do_QueryInterface(docShell->GetScriptGlobalObject());
+      if (docShellWin) {
+        doc = docShellWin->GetDoc();
+      }
+    }
+  }
+  return doc ? doc->GetBaseURI() : nullptr;
+}
+
+}  

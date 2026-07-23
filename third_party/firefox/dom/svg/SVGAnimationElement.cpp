@@ -1,0 +1,347 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/SVGAnimationElement.h"
+
+#include "mozilla/SMILAnimationController.h"
+#include "mozilla/SMILAnimationFunction.h"
+#include "mozilla/SMILTimeContainer.h"
+#include "mozilla/dom/BindContext.h"
+#include "mozilla/dom/ElementInlines.h"
+#include "mozilla/dom/SVGSVGElement.h"
+#include "mozilla/dom/SVGSwitchElement.h"
+#include "nsAttrValueOrString.h"
+#include "nsContentUtils.h"
+#include "nsIContentInlines.h"
+
+namespace mozilla::dom {
+
+
+NS_IMPL_ADDREF_INHERITED(SVGAnimationElement, SVGAnimationElementBase)
+NS_IMPL_RELEASE_INHERITED(SVGAnimationElement, SVGAnimationElementBase)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(SVGAnimationElement)
+  NS_INTERFACE_MAP_ENTRY(mozilla::dom::SVGTests)
+NS_INTERFACE_MAP_END_INHERITING(SVGAnimationElementBase)
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(SVGAnimationElement, SVGAnimationElementBase,
+                                   mHrefTarget, mTimedElement)
+
+
+SVGAnimationElement::SVGAnimationElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+    : SVGAnimationElementBase(std::move(aNodeInfo)), mHrefTarget(this) {}
+
+nsresult SVGAnimationElement::Init() {
+  nsresult rv = SVGAnimationElementBase::Init();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mTimedElement.SetAnimationElement(this);
+  AnimationFunction().SetAnimationElement(this);
+  mTimedElement.SetTimeClient(&AnimationFunction());
+
+  return NS_OK;
+}
+
+
+Element* SVGAnimationElement::GetTargetElementContent() {
+  if (HasAttr(kNameSpaceID_XLink, nsGkAtoms::href) ||
+      HasAttr(nsGkAtoms::href)) {
+    return mHrefTarget.get();
+  }
+  MOZ_ASSERT(!mHrefTarget.get(),
+             "We shouldn't have a href target "
+             "if we don't have an xlink:href or href attribute");
+
+  return GetParentElement();
+}
+
+bool SVGAnimationElement::GetTargetAttributeName(int32_t* aNamespaceID,
+                                                 nsAtom** aLocalName) const {
+  const nsAttrValue* nameAttr = mAttrs.GetAttr(nsGkAtoms::attributeName);
+
+  if (!nameAttr) return false;
+
+  NS_ASSERTION(nameAttr->Type() == nsAttrValue::eAtom,
+               "attributeName should have been parsed as an atom");
+
+  return NS_SUCCEEDED(nsContentUtils::SplitQName(
+      this, nsDependentAtomString(nameAttr->GetAtomValue()), aNamespaceID,
+      aLocalName));
+}
+
+SMILTimedElement& SVGAnimationElement::TimedElement() { return mTimedElement; }
+
+SVGElement* SVGAnimationElement::GetTargetElement() {
+  FlushAnimations();
+
+  return SVGElement::FromNodeOrNull(GetTargetElementContent());
+}
+
+float SVGAnimationElement::GetStartTime(ErrorResult& aRv) {
+  FlushAnimations();
+
+  SMILTimeValue startTime = mTimedElement.GetStartTime();
+  if (!startTime.IsDefinite()) {
+    aRv.ThrowInvalidStateError("Indefinite start time");
+    return 0.f;
+  }
+
+  return float(double(startTime.GetMillis()) / PR_MSEC_PER_SEC);
+}
+
+float SVGAnimationElement::GetCurrentTimeAsFloat() {
+
+  SMILTimeContainer* root = GetTimeContainer();
+  if (root) {
+    return float(double(root->GetCurrentTimeAsSMILTime()) / PR_MSEC_PER_SEC);
+  }
+
+  return 0.0f;
+}
+
+float SVGAnimationElement::GetSimpleDuration(ErrorResult& aRv) {
+
+  SMILTimeValue simpleDur = mTimedElement.GetSimpleDuration();
+  if (!simpleDur.IsDefinite()) {
+    aRv.ThrowNotSupportedError("Duration is indefinite");
+    return 0.f;
+  }
+
+  return float(double(simpleDur.GetMillis()) / PR_MSEC_PER_SEC);
+}
+
+
+nsresult SVGAnimationElement::BindToTree(BindContext& aContext,
+                                         nsINode& aParent) {
+  MOZ_ASSERT(!mHrefTarget.get(),
+             "Shouldn't have href-target yet (or it should've been cleared)");
+  nsresult rv = SVGAnimationElementBase::BindToTree(aContext, aParent);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (Document* doc = aContext.GetComposedDoc()) {
+    if (SMILAnimationController* controller = doc->GetAnimationController()) {
+      controller->RegisterAnimationElement(this);
+    }
+    const nsAttrValue* href =
+        HasAttr(nsGkAtoms::href)
+            ? mAttrs.GetAttr(nsGkAtoms::href, kNameSpaceID_None)
+            : mAttrs.GetAttr(nsGkAtoms::href, kNameSpaceID_XLink);
+    if (href) {
+      nsAutoString hrefStr;
+      href->ToString(hrefStr);
+
+      UpdateHrefTarget(hrefStr);
+    }
+
+    mTimedElement.BindToTree(*this);
+  }
+
+  mTimedElement.SetIsDisabled(IsDisabled());
+  AnimationNeedsResample();
+
+  return NS_OK;
+}
+
+void SVGAnimationElement::UnbindFromTree(UnbindContext& aContext) {
+  SMILAnimationController* controller = OwnerDoc()->GetAnimationController();
+  if (controller) {
+    controller->UnregisterAnimationElement(this);
+  }
+
+  mHrefTarget.Unlink();
+  mTimedElement.DissolveReferences();
+
+  AnimationNeedsResample();
+
+  SVGAnimationElementBase::UnbindFromTree(aContext);
+}
+
+bool SVGAnimationElement::ParseAttribute(int32_t aNamespaceID,
+                                         nsAtom* aAttribute,
+                                         const nsAString& aValue,
+                                         nsIPrincipal* aMaybeScriptedPrincipal,
+                                         nsAttrValue& aResult) {
+  if (aNamespaceID == kNameSpaceID_None) {
+    if (aAttribute == nsGkAtoms::attributeName) {
+      aResult.ParseAtom(aValue);
+      AnimationNeedsResample();
+      return true;
+    }
+
+    nsresult rv = NS_ERROR_FAILURE;
+
+    bool foundMatch =
+        AnimationFunction().SetAttr(aAttribute, aValue, aResult, &rv);
+
+    if (!foundMatch) {
+      foundMatch =
+          mTimedElement.SetAttr(aAttribute, aValue, aResult, *this, &rv);
+    }
+
+    if (foundMatch) {
+      AnimationNeedsResample();
+      if (NS_FAILED(rv)) {
+        ReportAttributeParseFailure(OwnerDoc(), aAttribute, aValue);
+        return false;
+      }
+      return true;
+    }
+  }
+
+  return SVGAnimationElementBase::ParseAttribute(
+      aNamespaceID, aAttribute, aValue, aMaybeScriptedPrincipal, aResult);
+}
+
+void SVGAnimationElement::AfterSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                                       const nsAttrValue* aValue,
+                                       const nsAttrValue* aOldValue,
+                                       nsIPrincipal* aSubjectPrincipal,
+                                       bool aNotify) {
+  if (!aValue && aNamespaceID == kNameSpaceID_None) {
+    if (AnimationFunction().UnsetAttr(aName) ||
+        mTimedElement.UnsetAttr(aName)) {
+      AnimationNeedsResample();
+    }
+  }
+
+  SVGAnimationElementBase::AfterSetAttr(aNamespaceID, aName, aValue, aOldValue,
+                                        aSubjectPrincipal, aNotify);
+
+  if (SVGTests::IsConditionalProcessingAttribute(aName)) {
+    if (mTimedElement.SetIsDisabled(IsDisabled())) {
+      AnimationNeedsResample();
+    }
+  }
+
+  if (!IsInComposedDoc()) {
+    return;
+  }
+
+  if (!((aNamespaceID == kNameSpaceID_None ||
+         aNamespaceID == kNameSpaceID_XLink) &&
+        aName == nsGkAtoms::href)) {
+    return;
+  }
+
+  if (!aValue) {
+    if (aNamespaceID == kNameSpaceID_None) {
+      mHrefTarget.Unlink();
+      AnimationTargetChanged();
+
+      const nsAttrValue* xlinkHref =
+          mAttrs.GetAttr(nsGkAtoms::href, kNameSpaceID_XLink);
+      if (xlinkHref) {
+        UpdateHrefTarget(nsAttrValueOrString(xlinkHref).String());
+      }
+    } else if (!HasAttr(nsGkAtoms::href)) {
+      mHrefTarget.Unlink();
+      AnimationTargetChanged();
+    }  
+  } else if (!(aNamespaceID == kNameSpaceID_XLink &&
+               HasAttr(nsGkAtoms::href))) {
+    MOZ_ASSERT(aValue->Type() == nsAttrValue::eString ||
+                   aValue->Type() == nsAttrValue::eAtom,
+               "Expected href attribute to be string or atom type");
+    UpdateHrefTarget(nsAttrValueOrString(aValue).String());
+  }  
+}
+
+bool SVGAnimationElement::IsDisabled() {
+  if (!SVGTests::PassesConditionalProcessingTests()) {
+    return true;
+  }
+  nsIContent* child = this;
+  while (nsIContent* parent = child->GetFlattenedTreeParent()) {
+    if (!parent->IsSVGElement()) {
+      return false;
+    }
+    if (auto* svgSwitch = SVGSwitchElement::FromNodeOrNull(parent)) {
+      nsIFrame* frame = svgSwitch->GetPrimaryFrame();
+      if (frame && !frame->HasAnyStateBits(NS_FRAME_FIRST_REFLOW)) {
+        if (child != svgSwitch->GetActiveChild()) {
+          return true;
+        }
+      } else {
+        if (child != SVGTests::FindActiveSwitchChild(svgSwitch)) {
+          return true;
+        }
+      }
+    } else if (auto* svgGraphics = SVGGraphicsElement::FromNode(parent)) {
+      if (!svgGraphics->PassesConditionalProcessingTests()) {
+        return true;
+      }
+    }
+    child = parent;
+  }
+  return false;
+}
+
+
+void SVGAnimationElement::ActivateByHyperlink() {
+  FlushAnimations();
+
+  SMILTimeValue seekTime = mTimedElement.GetHyperlinkTime();
+  if (seekTime.IsDefinite()) {
+    SMILTimeContainer* timeContainer = GetTimeContainer();
+    if (timeContainer) {
+      timeContainer->SetCurrentTime(seekTime.GetMillis());
+      AnimationNeedsResample();
+      FlushAnimations();
+    }
+  } else {
+    BeginElement(IgnoreErrors());
+  }
+}
+
+
+SMILTimeContainer* SVGAnimationElement::GetTimeContainer() {
+  SVGSVGElement* element = SVGContentUtils::GetOuterSVGElement(this);
+
+  if (element) {
+    return element->GetTimedDocumentRoot();
+  }
+
+  return nullptr;
+}
+
+void SVGAnimationElement::BeginElementAt(float offset, ErrorResult& aRv) {
+  FlushAnimations();
+
+  aRv = mTimedElement.BeginElementAt(offset);
+  if (aRv.Failed()) return;
+
+  AnimationNeedsResample();
+  FlushAnimations();
+}
+
+void SVGAnimationElement::EndElementAt(float offset, ErrorResult& aRv) {
+  FlushAnimations();
+
+  aRv = mTimedElement.EndElementAt(offset);
+  if (aRv.Failed()) return;
+
+  AnimationNeedsResample();
+  FlushAnimations();
+}
+
+bool SVGAnimationElement::IsEventAttributeNameInternal(nsAtom* aName) {
+  return nsContentUtils::IsEventAttributeName(aName, EventNameType_SMIL);
+}
+
+void SVGAnimationElement::UpdateHrefTarget(const nsAString& aHrefStr) {
+  if (nsContentUtils::IsLocalRefURL(aHrefStr)) {
+    mHrefTarget.ResetToLocalFragmentID(*this, aHrefStr);
+  } else {
+    mHrefTarget.Unlink();
+  }
+  AnimationTargetChanged();
+}
+
+void SVGAnimationElement::AnimationTargetChanged() {
+  mTimedElement.HandleTargetElementChange(GetTargetElementContent());
+  AnimationNeedsResample();
+}
+
+}  

@@ -1,0 +1,118 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file
+ */
+
+#if !defined(SkSpecialImage_DEFINED)
+#define SkSpecialImage_DEFINED
+
+#include "include/core/SkImageInfo.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkSamplingOptions.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkSize.h"
+#include "include/core/SkSurfaceProps.h"
+
+#include <cstddef>
+#include <cstdint>
+
+class GrRecordingContext;
+class SkBitmap;
+class SkCanvas;
+class SkColorSpace;
+class SkImage;
+class SkMatrix;
+class SkPaint;
+class SkShader;
+enum SkAlphaType : int;
+enum SkColorType : int;
+enum class SkTileMode;
+
+enum {
+    kNeedNewImageUniqueID_SpecialImage = 0
+};
+
+class SkSpecialImage : public SkRefCnt {
+public:
+    typedef void* ReleaseContext;
+    typedef void(*RasterReleaseProc)(void* pixels, ReleaseContext);
+
+    const SkSurfaceProps& props() const { return fProps; }
+
+    int width() const { return fSubset.width(); }
+    int height() const { return fSubset.height(); }
+    SkISize dimensions() const { return { this->width(), this->height() }; }
+    const SkIRect& subset() const { return fSubset; }
+
+    uint32_t uniqueID() const { return fUniqueID; }
+
+    virtual SkISize backingStoreDimensions() const = 0;
+
+    virtual size_t getSize() const = 0;
+
+    bool isExactFit() const { return fSubset == SkIRect::MakeSize(this->backingStoreDimensions()); }
+
+    const SkColorInfo& colorInfo() const { return fColorInfo; }
+    SkAlphaType alphaType() const { return fColorInfo.alphaType(); }
+    SkColorType colorType() const { return fColorInfo.colorType(); }
+    SkColorSpace* getColorSpace() const { return fColorInfo.colorSpace(); }
+
+    void draw(SkCanvas* canvas,
+              SkScalar x, SkScalar y,
+              const SkSamplingOptions& sampling,
+              const SkPaint* paint,
+              bool strict = true) const;
+    void draw(SkCanvas* canvas, SkScalar x, SkScalar y) const {
+        this->draw(canvas, x, y, SkSamplingOptions(), nullptr);
+    }
+
+    sk_sp<SkSpecialImage> makeSubset(const SkIRect& subset) const {
+        SkIRect absolute = subset.makeOffset(this->subset().topLeft());
+        return this->onMakeBackingStoreSubset(absolute);
+    }
+
+    sk_sp<SkSpecialImage> makePixelOutset() const {
+        return this->onMakeBackingStoreSubset(this->subset().makeOutset(1, 1));
+    }
+
+    virtual sk_sp<SkImage> asImage() const = 0;
+
+    virtual sk_sp<SkShader> asShader(SkTileMode,
+                                     const SkSamplingOptions&,
+                                     const SkMatrix& lm,
+                                     bool strict=true) const;
+
+    virtual bool isGaneshBacked() const { return false; }
+    virtual bool isGraphiteBacked() const { return false; }
+
+    virtual GrRecordingContext* getContext() const { return nullptr; }
+
+protected:
+    SkSpecialImage(const SkIRect& subset,
+                   uint32_t uniqueID,
+                   const SkColorInfo&,
+                   const SkSurfaceProps&);
+
+    virtual sk_sp<SkSpecialImage> onMakeBackingStoreSubset(const SkIRect& subset) const = 0;
+
+private:
+    const SkIRect        fSubset;
+    const uint32_t       fUniqueID;
+    const SkColorInfo    fColorInfo;
+    const SkSurfaceProps fProps;
+};
+
+namespace SkSpecialImages {
+
+sk_sp<SkSpecialImage> MakeFromRaster(const SkIRect& subset, sk_sp<SkImage>, const SkSurfaceProps&);
+sk_sp<SkSpecialImage> MakeFromRaster(const SkIRect& subset, const SkBitmap&, const SkSurfaceProps&);
+sk_sp<SkSpecialImage> CopyFromRaster(const SkIRect& subset, const SkBitmap&, const SkSurfaceProps&);
+
+bool AsBitmap(const SkSpecialImage* img, SkBitmap*);
+
+}  
+
+#endif

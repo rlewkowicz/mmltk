@@ -1,0 +1,169 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(OmxDataDecoder_h_)
+#  define OmxDataDecoder_h_
+
+#  include "AudioCompactor.h"
+#  include "ImageContainer.h"
+#  include "MediaInfo.h"
+#  include "OMX_Component.h"
+#  include "OmxPromiseLayer.h"
+#  include "PerformanceRecorder.h"
+#  include "PlatformDecoderModule.h"
+#  include "mozilla/Monitor.h"
+#  include "mozilla/StateWatching.h"
+
+namespace mozilla {
+
+class MediaDataHelper;
+
+typedef OmxPromiseLayer::OmxCommandPromise OmxCommandPromise;
+typedef OmxPromiseLayer::OmxBufferPromise OmxBufferPromise;
+typedef OmxPromiseLayer::OmxBufferFailureHolder OmxBufferFailureHolder;
+typedef OmxPromiseLayer::OmxCommandFailureHolder OmxCommandFailureHolder;
+typedef OmxPromiseLayer::BufferData BufferData;
+typedef OmxPromiseLayer::BUFFERLIST BUFFERLIST;
+
+DDLoggedTypeDeclNameAndBase(OmxDataDecoder, MediaDataDecoder);
+
+class OmxDataDecoder final : public MediaDataDecoder,
+                             public DecoderDoctorLifeLogger<OmxDataDecoder> {
+ protected:
+  virtual ~OmxDataDecoder();
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(OmxDataDecoder, final);
+
+  OmxDataDecoder(const TrackInfo& aTrackInfo,
+                 layers::ImageContainer* aImageContainer,
+                 Maybe<TrackingId> aTrackingId);
+
+  RefPtr<InitPromise> Init() override;
+  RefPtr<DecodePromise> Decode(MediaRawData* aSample) override;
+  RefPtr<DecodePromise> Drain() override;
+  RefPtr<FlushPromise> Flush() override;
+  RefPtr<ShutdownPromise> Shutdown() override;
+
+  nsCString GetDescriptionName() const override { return "omx decoder"_ns; }
+
+  nsCString GetCodecName() const override { return "unknown"_ns; }
+
+  ConversionRequired NeedsConversion() const override {
+    return ConversionRequired::kNeedAnnexB;
+  }
+
+  bool Event(OMX_EVENTTYPE aEvent, OMX_U32 aData1, OMX_U32 aData2);
+
+ protected:
+  void InitializationTask();
+
+  void ResolveInitPromise(StaticString aMethodName);
+
+  void RejectInitPromise(MediaResult aError, StaticString aMethodName);
+
+  void OmxStateRunner();
+
+  void FillAndEmptyBuffers();
+
+  void FillBufferDone(BufferData* aData);
+
+  void FillBufferFailure(OmxBufferFailureHolder aFailureHolder);
+
+  void EmptyBufferDone(BufferData* aData);
+
+  void EmptyBufferFailure(OmxBufferFailureHolder aFailureHolder);
+
+  void NotifyError(
+      OMX_ERRORTYPE aOmxError, const char* aLine,
+      const MediaResult& aError = MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR));
+
+  void ConfigCodec();
+
+  void FillCodecConfigDataToOmx();
+
+  void SendEosBuffer();
+
+  void EndOfStream();
+
+  void PortSettingsChanged();
+
+  void Output(BufferData* aData);
+
+  bool BuffersCanBeReleased(OMX_DIRTYPE aType);
+
+  OMX_DIRTYPE GetPortDirection(uint32_t aPortIndex);
+
+  RefPtr<ShutdownPromise> DoAsyncShutdown();
+
+  RefPtr<FlushPromise> DoFlush();
+
+  void FlushComplete(OMX_COMMANDTYPE aCommandType);
+
+  void FlushFailure(OmxCommandFailureHolder aFailureHolder);
+
+  BUFFERLIST* GetBuffers(OMX_DIRTYPE aType);
+
+  nsresult AllocateBuffers(OMX_DIRTYPE aType);
+
+  nsresult ReleaseBuffers(OMX_DIRTYPE aType);
+
+  BufferData* FindAvailableBuffer(OMX_DIRTYPE aType);
+
+  RefPtr<OmxPromiseLayer::OmxBufferPromise::AllPromiseType>
+  CollectBufferPromises(OMX_DIRTYPE aType);
+
+  RefPtr<TaskQueue> mOmxTaskQueue;
+
+  nsCOMPtr<nsISerialEventTarget> mThread;
+  RefPtr<layers::ImageContainer> mImageContainer;
+
+  WatchManager<OmxDataDecoder> mWatchManager;
+
+  Watchable<OMX_STATETYPE> mOmxState;
+
+  RefPtr<OmxPromiseLayer> mOmxLayer;
+
+  UniquePtr<TrackInfo> mTrackInfo;
+
+  Atomic<bool> mFlushing;
+
+  Atomic<bool> mShuttingDown;
+
+  bool mCheckingInputExhausted;
+
+  MozPromiseHolder<InitPromise> mInitPromise;
+  MozPromiseHolder<DecodePromise> mDecodePromise;
+  MozPromiseHolder<DecodePromise> mDrainPromise;
+  MozPromiseHolder<FlushPromise> mFlushPromise;
+  MozPromiseHolder<ShutdownPromise> mShutdownPromise;
+  DecodedData mDecodedData;
+
+  void CompleteDrain();
+
+  Watchable<int32_t> mPortSettingsChanged;
+
+  nsTArray<RefPtr<MediaRawData>> mMediaRawDatas;
+
+  BUFFERLIST mInPortBuffers;
+
+  BUFFERLIST mOutPortBuffers;
+
+  RefPtr<MediaDataHelper> mMediaDataHelper;
+
+  const Maybe<TrackingId> mTrackingId;
+
+  PerformanceRecorderMulti<DecodeStage> mPerformanceRecorder;
+};
+
+template <class T>
+void InitOmxParameter(T* aParam) {
+  PodZero(aParam);
+  aParam->nSize = sizeof(T);
+  aParam->nVersion.s.nVersionMajor = 1;
+}
+
+}  
+
+#endif /* OmxDataDecoder_h_ */

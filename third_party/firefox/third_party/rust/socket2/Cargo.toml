@@ -1,0 +1,69 @@
+
+[package]
+edition = "2021"
+rust-version = "1.70"
+name = "socket2"
+version = "0.6.3"
+authors = [
+    "Alex Crichton <alex@alexcrichton.com>",
+    "Thomas de Zeeuw <thomasdezeeuw@gmail.com>",
+]
+build = false
+include = [
+    "Cargo.toml",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "README.md",
+    "src/**/*.rs",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = """
+Utilities for handling networking sockets with a maximal amount of configuration
+possible intended.
+"""
+homepage = "https://github.com/rust-lang/socket2"
+documentation = "https://docs.rs/socket2"
+keywords = [
+    "io",
+    "socket",
+    "network",
+]
+categories = [
+    "api-bindings",
+    "network-programming",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-lang/socket2"
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "x86_64-unknown-linux-gnu"
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[package.metadata.playground]
+features = ["all"]
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    "libc::socklen_t",
+    "libc::*::socklen_t",
+    "libc::sa_family_t",
+    "libc::*::sa_family_t",
+]
+
+[features]
+all = []
+
+[lib]
+name = "socket2"
+path = "src/lib.rs"
+
+[dependencies.libc]
+version = "0.2"

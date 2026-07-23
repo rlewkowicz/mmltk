@@ -1,0 +1,31 @@
+// Copyright 2023 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#if !defined(WEBP_UTILS_PALETTE_H_)
+#define WEBP_UTILS_PALETTE_H_
+
+#include "src/webp/types.h"
+
+struct WebPPicture;
+
+typedef enum PaletteSorting {
+  kSortedDefault = 0,
+  kMinimizeDelta = 1,
+  kModifiedZeng = 2,
+  kUnusedPalette = 3,
+  kPaletteSortingNum = 4
+} PaletteSorting;
+
+int SearchColorNoIdx(const uint32_t sorted[], uint32_t color, int num_colors);
+
+void PrepareMapToPalette(const uint32_t palette[], uint32_t num_colors,
+                         uint32_t sorted[], uint32_t idx_map[]);
+
+int GetColorPalette(const struct WebPPicture* const pic,
+                    uint32_t* const palette);
+
+int PaletteSort(PaletteSorting method, const struct WebPPicture* const pic,
+                const uint32_t* const palette_sorted, uint32_t num_colors,
+                uint32_t* const palette);
+
+#endif

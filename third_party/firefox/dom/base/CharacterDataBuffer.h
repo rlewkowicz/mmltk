@@ -1,0 +1,465 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_CharacterDataBuffer_h
+#define mozilla_dom_CharacterDataBuffer_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/StringBuffer.h"
+#include "mozilla/Utf16.h"
+#include "nsISupportsImpl.h"
+#include "nsReadableUtils.h"
+#include "nsString.h"
+
+
+namespace mozilla::dom {
+class CharacterDataBuffer final {
+ private:
+  constexpr static unsigned char kFormFeed = '\f';
+  constexpr static unsigned char kNewLine = '\n';
+  constexpr static unsigned char kCarriageReturn = '\r';
+  constexpr static unsigned char kTab = '\t';
+  constexpr static unsigned char kSpace = ' ';
+  constexpr static unsigned char kNBSP = 0xA0;
+
+ public:
+  static nsresult Init();
+  static void Shutdown();
+
+  CharacterDataBuffer() : m1b(nullptr), mAllBits(0) {
+    MOZ_COUNT_CTOR(CharacterDataBuffer);
+    NS_ASSERTION(sizeof(FragmentBits) == 4, "Bad field packing!");
+  }
+
+  ~CharacterDataBuffer();
+
+  CharacterDataBuffer& operator=(const CharacterDataBuffer& aOther);
+
+  bool Is2b() const { return mState.mIs2b; }
+
+  bool IsBidi() const { return mState.mIsBidi; }
+
+  const char16_t* Get2b() const {
+    MOZ_ASSERT(Is2b(), "not 2b text");
+    return static_cast<char16_t*>(m2b->Data());
+  }
+
+  const char* Get1b() const {
+    NS_ASSERTION(!Is2b(), "not 1b text");
+    return (const char*)m1b;
+  }
+  const unsigned char* GetUnsigned1b() const {
+    NS_ASSERTION(!Is2b(), "not 1b text");
+    return (const unsigned char*)m1b;
+  }
+
+  uint32_t GetLength() const { return mState.mLength; }
+
+#define NS_MAX_CHARACTER_DATA_BUFFER_LENGTH (static_cast<uint32_t>(0x1FFFFFFF))
+
+  bool CanGrowBy(size_t n) const {
+    return n < (1 << 29) && mState.mLength + n < (1 << 29);
+  }
+
+  bool SetTo(const char16_t* aBuffer, uint32_t aLength, bool aUpdateBidi,
+             bool aForce2b);
+
+  bool SetTo(const nsString& aString, bool aUpdateBidi, bool aForce2b) {
+    if (MOZ_UNLIKELY(aString.Length() > NS_MAX_CHARACTER_DATA_BUFFER_LENGTH)) {
+      return false;
+    }
+    if (aForce2b && !aUpdateBidi) {
+      if (StringBuffer* buffer = aString.GetStringBuffer()) {
+        ReleaseBuffer();
+        NS_ADDREF(m2b = buffer);
+        mState.mInHeap = true;
+        mState.mIs2b = true;
+        mState.mLength = aString.Length();
+        return true;
+      }
+    }
+
+    return SetTo(aString.get(), aString.Length(), aUpdateBidi, aForce2b);
+  }
+
+  bool Append(const char16_t* aBuffer, uint32_t aLength, bool aUpdateBidi,
+              bool aForce2b);
+
+  void AppendTo(nsAString& aString) const {
+    if (!AppendTo(aString, fallible)) {
+      aString.AllocFailed(aString.Length() + GetLength());
+    }
+  }
+
+  [[nodiscard]] bool AppendTo(nsAString& aString,
+                              const fallible_t& aFallible) const {
+    if (mState.mIs2b) {
+      if (aString.IsEmpty()) {
+        aString.Assign(m2b, mState.mLength);
+        return true;
+      }
+      return aString.Append(Get2b(), mState.mLength, aFallible);
+    }
+    return AppendASCIItoUTF16(Substring(m1b, mState.mLength), aString,
+                              aFallible);
+  }
+
+  void AppendTo(nsAString& aString, uint32_t aOffset, uint32_t aLength) const {
+    if (!AppendTo(aString, aOffset, aLength, fallible)) {
+      aString.AllocFailed(aString.Length() + aLength);
+    }
+  }
+
+  [[nodiscard]] bool AppendTo(nsAString& aString, uint32_t aOffset,
+                              uint32_t aLength,
+                              const fallible_t& aFallible) const {
+    if (mState.mIs2b) {
+      bool ok = aString.Append(Get2b() + aOffset, aLength, aFallible);
+      if (!ok) {
+        return false;
+      }
+
+      return true;
+    } else {
+      return AppendASCIItoUTF16(Substring(m1b + aOffset, aLength), aString,
+                                aFallible);
+    }
+  }
+
+  void CopyTo(char16_t* aDest, uint32_t aOffset, uint32_t aCount);
+
+  [[nodiscard]] char16_t CharAt(uint32_t aIndex) const {
+    MOZ_ASSERT(aIndex < mState.mLength, "bad index");
+    return mState.mIs2b ? Get2b()[aIndex]
+                        : static_cast<unsigned char>(m1b[aIndex]);
+  }
+  [[nodiscard]] char16_t SafeCharAt(uint32_t aIndex) const {
+    return MOZ_LIKELY(aIndex < mState.mLength) ? CharAt(aIndex)
+                                               : static_cast<char16_t>(0);
+  }
+
+  [[nodiscard]] char16_t FirstChar() const {
+    MOZ_ASSERT(mState.mLength);
+    return CharAt(0u);
+  }
+  [[nodiscard]] char16_t SafeFirstChar() const {
+    return MOZ_LIKELY(mState.mLength) ? FirstChar() : static_cast<char16_t>(0);
+  }
+
+  [[nodiscard]] char16_t LastChar() const {
+    MOZ_ASSERT(mState.mLength);
+    return CharAt(mState.mLength - 1);
+  }
+  [[nodiscard]] char16_t SafeLastChar() const {
+    return MOZ_LIKELY(mState.mLength) ? LastChar() : static_cast<char16_t>(0);
+  }
+
+  inline bool IsHighSurrogateFollowedByLowSurrogateAt(uint32_t aIndex) const {
+    MOZ_ASSERT(aIndex < mState.mLength);
+    if (!mState.mIs2b || aIndex + 1 >= mState.mLength) {
+      return false;
+    }
+    return IsSurrogatePair(Get2b()[aIndex], Get2b()[aIndex + 1]);
+  }
+
+  inline bool IsLowSurrogateFollowingHighSurrogateAt(uint32_t aIndex) const {
+    MOZ_ASSERT(aIndex < mState.mLength);
+    if (!mState.mIs2b || !aIndex) {
+      return false;
+    }
+    return IsSurrogatePair(Get2b()[aIndex - 1], Get2b()[aIndex]);
+  }
+
+  inline char32_t ScalarValueAt(uint32_t aIndex) const {
+    MOZ_ASSERT(aIndex < mState.mLength);
+    if (!mState.mIs2b) {
+      return static_cast<unsigned char>(m1b[aIndex]);
+    }
+    char16_t ch = Get2b()[aIndex];
+    if (!IsSurrogate(ch)) {
+      return ch;
+    }
+    if (aIndex + 1 < mState.mLength && IsHighSurrogate(ch)) {
+      char16_t nextCh = Get2b()[aIndex + 1];
+      if (IsLowSurrogate(nextCh)) {
+        return SurrogateToUCS4(ch, nextCh);
+      }
+    }
+    return 0;
+  }
+
+  void SetBidi(bool aBidi) { mState.mIsBidi = aBidi; }
+
+  struct FragmentBits {
+    uint32_t mInHeap : 1;
+    uint32_t mIs2b : 1;
+    uint32_t mIsBidi : 1;
+    uint32_t mLength : 29;
+  };
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const;
+
+  [[nodiscard]] bool BufferEquals(const CharacterDataBuffer& aOther) const;
+
+  constexpr static uint32_t kNotFound = UINT32_MAX;
+
+  [[nodiscard]] uint32_t FindChar(char16_t aChar, uint32_t aOffset = 0) const {
+    if (aOffset >= GetLength()) {
+      return kNotFound;
+    }
+    if (Is2b()) {
+      const char16_t* end = Get2b() + GetLength();
+      for (const char16_t* ch = Get2b() + aOffset; ch != end; ch++) {
+        if (*ch == aChar) {
+          return ch - Get2b();
+        }
+      }
+      return kNotFound;
+    }
+    if (aChar > 0xFF) {
+      return kNotFound;
+    }
+    const unsigned char* end = GetUnsigned1b() + GetLength();
+    for (const unsigned char* ch = GetUnsigned1b() + aOffset; ch != end; ch++) {
+      if (*ch == aChar) {
+        return ch - GetUnsigned1b();
+      }
+    }
+    return kNotFound;
+  }
+
+  [[nodiscard]] uint32_t RFindChar(char16_t aChar,
+                                   uint32_t aOffset = UINT32_MAX) const {
+    const uint32_t length = GetLength();
+    if (!length) {
+      return kNotFound;
+    }
+    aOffset = std::min(length - 1u, aOffset);
+    if (Is2b()) {
+      const char16_t* end = Get2b() - 1;
+      for (const char16_t* ch = Get2b() + aOffset; ch != end; ch--) {
+        if (*ch == aChar) {
+          return ch - Get2b();
+        }
+      }
+      return kNotFound;
+    }
+    if (aChar > 0xFF) {
+      return kNotFound;
+    }
+    const unsigned char* end = GetUnsigned1b() - 1;
+    for (const unsigned char* ch = GetUnsigned1b() + aOffset; ch != end; ch--) {
+      if (*ch == aChar) {
+        return ch - GetUnsigned1b();
+      }
+    }
+    return kNotFound;
+  }
+
+  enum class WhitespaceOption {
+    NewLineIsSignificant,
+    TreatNBSPAsCollapsible,
+    FormFeedIsSignificant,
+  };
+  using WhitespaceOptions = EnumSet<WhitespaceOption>;
+
+ private:
+  class MOZ_STACK_CLASS AutoWhitespaceChecker final {
+   public:
+    explicit AutoWhitespaceChecker(const WhitespaceOptions& aOptions)
+        : mNBSPIsSignificant(
+              !aOptions.contains(WhitespaceOption::TreatNBSPAsCollapsible)),
+          mFormFeedIsSignificant(
+              aOptions.contains(WhitespaceOption::FormFeedIsSignificant)),
+          mNewLineIsSignificant(
+              aOptions.contains(WhitespaceOption::NewLineIsSignificant)) {}
+
+    [[nodiscard]] bool IsNonWhitespace(char16_t aChar) const {
+      switch (aChar) {
+        case kNBSP:
+          return mNBSPIsSignificant;
+        case kFormFeed:
+          return mFormFeedIsSignificant;
+        case kNewLine:
+          return mNewLineIsSignificant;
+        case kSpace:
+        case kTab:
+        case kCarriageReturn:
+          return false;
+        default:
+          return true;
+      }
+    }
+
+   private:
+    const bool mNBSPIsSignificant;
+    const bool mFormFeedIsSignificant;
+    const bool mNewLineIsSignificant;
+  };
+
+ public:
+  [[nodiscard]] uint32_t FindNonWhitespaceChar(
+      const WhitespaceOptions& aOptions = {}, uint32_t aOffset = 0) const {
+    if (aOffset >= GetLength()) {
+      return kNotFound;
+    }
+    const AutoWhitespaceChecker checker(aOptions);
+    if (Is2b()) {
+      const char16_t* end = Get2b() + GetLength();
+      for (const char16_t* ch = Get2b() + aOffset; ch != end; ch++) {
+        if (checker.IsNonWhitespace(*ch)) {
+          return ch - Get2b();
+        }
+      }
+      return kNotFound;
+    }
+    const unsigned char* end = GetUnsigned1b() + GetLength();
+    for (const unsigned char* ch = GetUnsigned1b() + aOffset; ch != end; ch++) {
+      if (checker.IsNonWhitespace(*ch)) {
+        return ch - GetUnsigned1b();
+      }
+    }
+    return kNotFound;
+  }
+
+  [[nodiscard]] uint32_t RFindNonWhitespaceChar(
+      const WhitespaceOptions& aOptions = {},
+      uint32_t aOffset = UINT32_MAX) const {
+    const uint32_t length = GetLength();
+    if (!length) {
+      return kNotFound;
+    }
+    const AutoWhitespaceChecker checker(aOptions);
+    aOffset = std::min(length - 1u, aOffset);
+    if (Is2b()) {
+      const char16_t* end = Get2b() - 1;
+      for (const char16_t* ch = Get2b() + aOffset; ch != end; ch--) {
+        if (checker.IsNonWhitespace(*ch)) {
+          return ch - Get2b();
+        }
+      }
+      return kNotFound;
+    }
+    const unsigned char* end = GetUnsigned1b() - 1;
+    for (const unsigned char* ch = GetUnsigned1b() + aOffset; ch != end; ch--) {
+      if (checker.IsNonWhitespace(*ch)) {
+        return ch - GetUnsigned1b();
+      }
+    }
+    return kNotFound;
+  }
+
+  [[nodiscard]] uint32_t FindFirstDifferentCharOffset(
+      const nsAString& aStr, uint32_t aOffsetInFragment = 0u) const {
+    return FindFirstDifferentCharOffsetInternal(aStr, aOffsetInFragment);
+  }
+  [[nodiscard]] uint32_t FindFirstDifferentCharOffset(
+      const nsACString& aStr, uint32_t aOffsetInFragment = 0u) const {
+    return FindFirstDifferentCharOffsetInternal(aStr, aOffsetInFragment);
+  }
+
+  [[nodiscard]] uint32_t RFindFirstDifferentCharOffset(
+      const nsAString& aStr, uint32_t aOffsetInFragment = UINT32_MAX) const {
+    return RFindFirstDifferentCharOffsetInternal(aStr, aOffsetInFragment);
+  }
+  [[nodiscard]] uint32_t RFindFirstDifferentCharOffset(
+      const nsACString& aStr, uint32_t aOffsetInFragment = UINT32_MAX) const {
+    return RFindFirstDifferentCharOffsetInternal(aStr, aOffsetInFragment);
+  }
+
+ private:
+  void ReleaseBuffer();
+
+  void UpdateBidiFlag(const char16_t* aBuffer, uint32_t aLength);
+
+  union {
+    StringBuffer* m2b;
+    const char* m1b;  
+  };
+
+  union {
+    uint32_t mAllBits;
+    FragmentBits mState;
+  };
+
+  template <typename nsAXString>
+  [[nodiscard]] uint32_t FindFirstDifferentCharOffsetInternal(
+      const nsAXString& aStr, uint32_t aOffsetInFragment) const {
+    static_assert(std::is_same_v<nsAXString, nsAString> ||
+                  std::is_same_v<nsAXString, nsACString>);
+    MOZ_ASSERT(!aStr.IsEmpty());
+    const uint32_t length = GetLength();
+    MOZ_ASSERT(aOffsetInFragment <= length);
+    if (NS_WARN_IF(aStr.IsEmpty()) || NS_WARN_IF(length <= aOffsetInFragment) ||
+        NS_WARN_IF(length - aOffsetInFragment < aStr.Length())) {
+      return kNotFound;
+    }
+    if (Is2b()) {
+      const auto* ch = aStr.BeginReading();
+      const char16_t* ourCh = Get2b() + aOffsetInFragment;
+      const auto* const end = aStr.EndReading();
+      const char16_t* const ourEnd = Get2b() + length;
+      for (; ch != end && ourCh != ourEnd; ch++, ourCh++) {
+        if (*ch != *ourCh) {
+          return ourCh - Get2b();
+        }
+      }
+      return kNotFound;
+    }
+    const auto* ch = aStr.BeginReading();
+    const char* ourCh = Get1b() + aOffsetInFragment;
+    const auto* const end = aStr.EndReading();
+    const char* ourEnd = Get1b() + length;
+    for (; ch != end && ourCh != ourEnd; ch++, ourCh++) {
+      if (*ch != *ourCh) {
+        return ourCh - Get1b();
+      }
+    }
+    return kNotFound;
+  }
+
+  template <typename nsAXString>
+  [[nodiscard]] uint32_t RFindFirstDifferentCharOffsetInternal(
+      const nsAXString& aStr, uint32_t aOffsetInFragment) const {
+    static_assert(std::is_same_v<nsAXString, nsAString> ||
+                  std::is_same_v<nsAXString, nsACString>);
+    MOZ_ASSERT(!aStr.IsEmpty());
+    const uint32_t length = GetLength();
+    MOZ_ASSERT(aOffsetInFragment <= length);
+    aOffsetInFragment = std::min(length, aOffsetInFragment);
+    if (NS_WARN_IF(aStr.IsEmpty()) || NS_WARN_IF(!aOffsetInFragment) ||
+        NS_WARN_IF(aOffsetInFragment < aStr.Length())) {
+      return kNotFound;
+    }
+    if (Is2b()) {
+      const auto* ch = aStr.EndReading() - 1;
+      const char16_t* ourCh = Get2b() + aOffsetInFragment - 1;
+      const auto* const end = aStr.BeginReading() - 1;
+      const char16_t* const ourEnd = Get2b() - 1;
+      for (; ch != end && ourCh != ourEnd; ch--, ourCh--) {
+        if (*ch != *ourCh) {
+          return ourCh - Get2b();
+        }
+      }
+      return kNotFound;
+    }
+    const auto* ch = aStr.EndReading() - 1;
+    const char* ourCh = Get1b() + aOffsetInFragment - 1;
+    const auto* const end = aStr.BeginReading() - 1;
+    const char* const ourEnd = Get1b() - 1;
+    for (; ch != end && ourCh != ourEnd; ch--, ourCh--) {
+      if (*ch != *ourCh) {
+        return ourCh - Get1b();
+      }
+    }
+    return kNotFound;
+  }
+};
+
+}  
+
+#endif /* mozilla_dom_CharacterDataBuffer_h */

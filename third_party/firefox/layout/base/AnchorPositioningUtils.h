@@ -1,0 +1,308 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef AnchorPositioningUtils_h_
+#define AnchorPositioningUtils_h_
+
+#include "mozilla/Maybe.h"
+#include "mozilla/WritingModes.h"
+#include "nsRect.h"
+
+class nsAtom;
+class nsIFrame;
+
+template <class T>
+class nsTArray;
+
+template <class T>
+class CopyableTArray;
+
+namespace mozilla {
+
+namespace dom {
+class ShadowRoot;
+}
+
+class nsDisplayListBuilder;
+
+struct AnchorPosInfo {
+  nsRect mRect;
+  bool mCompensatesForScroll;
+};
+
+class DistanceToNearestScrollContainer {
+ public:
+  DistanceToNearestScrollContainer() = default;
+  explicit DistanceToNearestScrollContainer(uint32_t aDistance)
+      : mDistance{aDistance} {}
+
+  bool Valid() const { return mDistance != kInvalid; }
+
+  bool operator==(const DistanceToNearestScrollContainer&) const = default;
+  bool operator!=(const DistanceToNearestScrollContainer&) const = default;
+
+ private:
+  static constexpr uint32_t kInvalid = 0;
+  uint32_t mDistance = kInvalid;
+};
+
+struct AnchorPosOffsetData {
+  nsPoint mOrigin;
+  bool mCompensatesForScroll = false;
+  DistanceToNearestScrollContainer mDistanceToNearestScrollContainer;
+};
+
+class ScopedNameRef {
+ public:
+  ScopedNameRef(const nsAtom* aAtom, const StyleCascadeLevel& aTreeScope)
+      : mName(aAtom), mTreeScope(aTreeScope) {}
+
+  const nsAtom* mName = nullptr;
+  StyleCascadeLevel mTreeScope = StyleCascadeLevel::Default();
+};
+
+class nsScopedNameRefHashKey : public PLDHashEntryHdr {
+ public:
+  using KeyType = ScopedNameRef;
+  using KeyTypePointer = const ScopedNameRef*;
+
+  explicit nsScopedNameRefHashKey(const ScopedNameRef* aKey)
+      : mAtom(aKey->mName), mTreeScope(aKey->mTreeScope) {
+    MOZ_ASSERT(aKey);
+    MOZ_ASSERT(aKey->mName);
+  }
+  nsScopedNameRefHashKey(const nsScopedNameRefHashKey& aOther) = delete;
+  nsScopedNameRefHashKey(nsScopedNameRefHashKey&& aOther) = default;
+  ~nsScopedNameRefHashKey() = default;
+
+  KeyType GetKey() const { return ScopedNameRef(mAtom, mTreeScope); }
+  bool KeyEquals(KeyTypePointer aKey) const {
+    return aKey->mName == mAtom.get();
+  }
+
+  static KeyTypePointer KeyToPointer(const KeyType& aKey) { return &aKey; }
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    return MOZ_LIKELY(aKey && aKey->mName) ? aKey->mName->hash() : 0;
+  }
+  enum { ALLOW_MEMMOVE = true };
+
+ private:
+  RefPtr<const nsAtom> mAtom;
+  StyleCascadeLevel mTreeScope;
+};
+
+struct AnchorPosResolutionData {
+  nsSize mSize;
+  Maybe<AnchorPosOffsetData> mOffsetData;
+  StyleCascadeLevel mAnchorTreeScope;
+};
+
+class AnchorPosReferenceData {
+ private:
+  using ResolutionMap =
+      nsBaseHashtable<nsScopedNameRefHashKey,
+                      mozilla::Maybe<AnchorPosResolutionData>,
+                      mozilla::Maybe<AnchorPosResolutionData>>;
+
+ public:
+  struct PositionTryBackup {
+    mozilla::PhysicalAxes mCompensatingForScroll;
+    nsPoint mDefaultScrollShift;
+    nsRect mAdjustedContainingBlock;
+    SideBits mScrollCompensatedSides;
+    nsMargin mInsets;
+  };
+  using Value = mozilla::Maybe<AnchorPosResolutionData>;
+
+  AnchorPosReferenceData() = default;
+  AnchorPosReferenceData(const AnchorPosReferenceData&) = delete;
+  AnchorPosReferenceData(AnchorPosReferenceData&&) = default;
+
+  AnchorPosReferenceData& operator=(const AnchorPosReferenceData&) = delete;
+  AnchorPosReferenceData& operator=(AnchorPosReferenceData&&) = default;
+
+  struct Result {
+    bool mAlreadyResolved;
+    Value* mEntry;
+  };
+
+  Result InsertOrModify(const ScopedNameRef& aKey, bool aNeedOffset);
+  const Value* Lookup(const ScopedNameRef& aKey) const;
+
+  bool IsEmpty() const { return mMap.IsEmpty(); }
+
+  ResolutionMap::const_iterator begin() const { return mMap.cbegin(); }
+  ResolutionMap::const_iterator end() const { return mMap.cend(); }
+
+  void AdjustCompensatingForScroll(const mozilla::PhysicalAxes& aAxes) {
+    mCompensatingForScroll += aAxes;
+  }
+
+  mozilla::PhysicalAxes CompensatingForScrollAxes() const {
+    return mCompensatingForScroll;
+  }
+
+  PositionTryBackup TryPositionWithSameDefaultAnchor() {
+    auto compensatingForScroll = std::exchange(mCompensatingForScroll, {});
+    auto defaultScrollShift = std::exchange(mDefaultScrollShift, {});
+    auto adjustedContainingBlock = std::exchange(mAdjustedContainingBlock, {});
+    auto containingBlockSidesAttachedToAnchor =
+        std::exchange(mScrollCompensatedSides, SideBits::eNone);
+    auto insets = std::exchange(mInsets, nsMargin{});
+    return {compensatingForScroll, defaultScrollShift, adjustedContainingBlock,
+            containingBlockSidesAttachedToAnchor, insets};
+  }
+
+  void UndoTryPositionWithSameDefaultAnchor(PositionTryBackup&& aBackup) {
+    mCompensatingForScroll = aBackup.mCompensatingForScroll;
+    mDefaultScrollShift = aBackup.mDefaultScrollShift;
+    mAdjustedContainingBlock = aBackup.mAdjustedContainingBlock;
+    mScrollCompensatedSides = aBackup.mScrollCompensatedSides;
+    mInsets = aBackup.mInsets;
+  }
+
+  DistanceToNearestScrollContainer mDistanceToDefaultScrollContainer;
+  nsPoint mDefaultScrollShift;
+  nsRect mOriginalContainingBlockRect;
+  nsRect mAdjustedContainingBlock;
+  RefPtr<const nsAtom> mDefaultAnchorName;
+  SideBits mScrollCompensatedSides = SideBits::eNone;
+  nsMargin mInsets;
+
+  StyleCascadeLevel mAnchorTreeScope = StyleCascadeLevel::Default();
+
+ private:
+  ResolutionMap mMap;
+  mozilla::PhysicalAxes mCompensatingForScroll;
+};
+
+struct LastSuccessfulPositionData {
+  RefPtr<const ComputedStyle> mLastStyle;
+  Maybe<uint32_t> mLastIndex;
+  Maybe<uint32_t> mRecordedIndex;
+  bool mTriedAllFallbacks = false;
+};
+
+struct StylePositionArea;
+class WritingMode;
+
+struct AnchorPosDefaultAnchorCache {
+  const nsIFrame* mAnchor = nullptr;
+  const nsIFrame* mScrollContainer = nullptr;
+
+  AnchorPosDefaultAnchorCache() = default;
+  AnchorPosDefaultAnchorCache(const nsIFrame* aAnchor,
+                              const nsIFrame* aScrollContainer);
+};
+
+struct AnchorPosResolutionCache {
+  AnchorPosReferenceData* mReferenceData = nullptr;
+  AnchorPosDefaultAnchorCache mDefaultAnchorCache;
+
+  using PositionTryBackup = AnchorPosReferenceData::PositionTryBackup;
+  PositionTryBackup TryPositionWithSameDefaultAnchor() {
+    return mReferenceData->TryPositionWithSameDefaultAnchor();
+  }
+  void UndoTryPositionWithSameDefaultAnchor(PositionTryBackup&& aBackup) {
+    mReferenceData->UndoTryPositionWithSameDefaultAnchor(std::move(aBackup));
+  }
+
+  using PositionTryFullBackup =
+      std::pair<AnchorPosReferenceData, AnchorPosDefaultAnchorCache>;
+  PositionTryFullBackup TryPositionWithDifferentDefaultAnchor() {
+    auto referenceData = std::move(*mReferenceData);
+    *mReferenceData = {};
+    return std::make_pair(
+        std::move(referenceData),
+        std::exchange(mDefaultAnchorCache, AnchorPosDefaultAnchorCache{}));
+  }
+  void UndoTryPositionWithDifferentDefaultAnchor(
+      PositionTryFullBackup&& aBackup) {
+    *mReferenceData = std::move(aBackup.first);
+    std::exchange(mDefaultAnchorCache, aBackup.second);
+  }
+};
+
+enum class StylePositionTryFallbacksTryTacticKeyword : uint8_t;
+using StylePositionTryFallbacksTryTactic =
+    CopyableTArray<StylePositionTryFallbacksTryTacticKeyword>;
+
+struct AnchorPositioningUtils {
+  static nsIFrame* FindFirstAcceptableAnchor(
+      const ScopedNameRef& aName, const nsIFrame* aPositionedFrame,
+      const nsTArray<nsIFrame*>& aPossibleAnchorFrames);
+
+  static Maybe<nsRect> GetAnchorPosRect(
+      const nsIFrame* aAbsoluteContainingBlock, const nsIFrame* aAnchor,
+      bool aCBRectIsValid);
+
+  static Maybe<AnchorPosInfo> ResolveAnchorPosRect(
+      const nsIFrame* aPositioned, const nsIFrame* aAbsoluteContainingBlock,
+      const ScopedNameRef& aAnchorName, bool aCBRectIsValid,
+      AnchorPosResolutionCache* aResolutionCache);
+
+  static Maybe<nsSize> ResolveAnchorPosSize(
+      const nsIFrame* aPositioned, const ScopedNameRef& aAnchorName,
+      AnchorPosResolutionCache* aResolutionCache);
+
+  static nsRect AdjustAbsoluteContainingBlockRectForPositionArea(
+      const nsRect& aAnchorRect, const nsRect& aCBRect,
+      WritingMode aPositionedWM, WritingMode aCBWM,
+      const StylePositionArea& aPosArea, StylePositionArea* aOutResolvedArea);
+
+  static Maybe<ScopedNameRef> GetUsedAnchorName(
+      const nsIFrame* aPositioned, const ScopedNameRef& aAnchorName);
+
+  enum class ImplicitAnchorKind : uint8_t { None, Popover, PseudoElement };
+  struct ImplicitAnchorResult {
+    nsIFrame* mAnchorFrame = nullptr;
+    ImplicitAnchorKind mKind = ImplicitAnchorKind::None;
+  };
+  static ImplicitAnchorResult GetAnchorPosImplicitAnchor(
+      const nsIFrame* aFrame);
+
+  struct NearestScrollFrameInfo {
+    const nsIFrame* mScrollContainer = nullptr;
+    DistanceToNearestScrollContainer mDistance;
+  };
+  static NearestScrollFrameInfo GetNearestScrollFrame(const nsIFrame* aFrame);
+
+  static nsPoint GetScrollOffsetFor(
+      PhysicalAxes aAxes, const nsIFrame* aPositioned,
+      const AnchorPosDefaultAnchorCache& aDefaultAnchorCache);
+
+  struct ContainingBlockInfo {
+    static ContainingBlockInfo ExplicitCBFrameSize(
+        const nsRect& aContainingBlockRect);
+    static ContainingBlockInfo UseCBFrameSize(const nsIFrame* aPositioned);
+
+    nsRect GetContainingBlockRect() const { return mRect; }
+
+   private:
+    explicit ContainingBlockInfo(const nsRect& aRect) : mRect{aRect} {}
+    nsRect mRect;
+  };
+
+  static bool FitsInContainingBlock(const nsIFrame* aPositioned,
+                                    const AnchorPosReferenceData&);
+
+  static nsIFrame* GetAnchorThatFrameScrollsWith(nsIFrame* aFrame,
+                                                 nsDisplayListBuilder* aBuilder,
+                                                 bool aSkipAsserts = false);
+
+  static bool TriggerLayoutOnOverflow(PresShell*, bool aFirstIteration);
+
+  static StylePositionArea PhysicalizePositionArea(StylePositionArea aPosArea,
+                                                   const nsIFrame* aPositioned);
+
+  static nsRect ReassembleAnchorRect(const nsIFrame* aAnchor,
+                                     const nsIFrame* aContainingBlock);
+
+  static const dom::ShadowRoot* GetShadowRootForTreeScope(
+      const dom::Element& aElement, const StyleCascadeLevel& aTreeScope);
+};
+
+}  
+
+#endif  // AnchorPositioningUtils_h_

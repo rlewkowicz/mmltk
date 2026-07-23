@@ -1,0 +1,61 @@
+// Copyright 2011 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(V8_REGEXP_REGEXP_INTERPRETER_H_)
+#define V8_REGEXP_REGEXP_INTERPRETER_H_
+
+
+#include "irregexp/imported/regexp.h"
+
+namespace v8 {
+namespace internal {
+
+class TrustedByteArray;
+
+namespace regexp {
+
+class V8_EXPORT_PRIVATE IrregexpInterpreter : public AllStatic {
+ public:
+  enum Result {
+    FAILURE = RegExp::kInternalRegExpFailure,
+    SUCCESS = RegExp::kInternalRegExpSuccess,
+    EXCEPTION = RegExp::kInternalRegExpException,
+    RETRY = RegExp::kInternalRegExpRetry,
+    FALLBACK_TO_EXPERIMENTAL = RegExp::kInternalRegExpFallbackToExperimental,
+  };
+
+  static int MatchForCallFromRuntime(Isolate* isolate,
+                                     DirectHandle<IrRegExpData> regexp_data,
+                                     DirectHandle<String> subject_string,
+                                     int* output_registers,
+                                     int output_register_count,
+                                     int start_position);
+
+  static int MatchForCallFromJs(Address subject, int32_t start_position,
+                                Address input_start, Address input_end,
+                                int* output_registers,
+                                int32_t output_register_count,
+                                RegExp::CallOrigin call_origin,
+                                Isolate* isolate, Address regexp_data);
+
+  static Result MatchInternal(Isolate* isolate,
+                              Tagged<TrustedByteArray>* code_array,
+                              Tagged<String>* subject_string,
+                              int* output_registers, int output_register_count,
+                              int total_register_count, int start_position,
+                              RegExp::CallOrigin call_origin,
+                              uint32_t backtrack_limit);
+
+ private:
+  static int Match(Isolate* isolate, Tagged<IrRegExpData> regexp_data,
+                   Tagged<String> subject_string, int* output_registers,
+                   int output_register_count, int start_position,
+                   RegExp::CallOrigin call_origin);
+};
+
+}  
+}  
+}  
+
+#endif

@@ -1,0 +1,21 @@
+
+[package]
+edition = "2018"
+name = "termcolor"
+version = "1.4.1"
+authors = ["Andrew Gallant <jamslam@gmail.com>"]
+description = """
+A simple cross platform library for writing colored text to a terminal.
+"""
+homepage = "https://github.com/BurntSushi/termcolor"
+documentation = "https://docs.rs/termcolor"
+keywords = [
+    "color",
+    "ansi",
+    "console",
+]
+license = "Unlicense OR MIT"
+repository = "https://github.com/BurntSushi/termcolor"
+
+[lib]
+name = "termcolor"

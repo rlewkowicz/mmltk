@@ -1,0 +1,86 @@
+/.claude*/
+/.cache/
+/.agents*/
+/.codex*/
+.vscode/
+
+# Repository-local build, data, and model outputs
+/build/
+/compiled*/
+dataset/
+/outputs*/
+/profiles/
+/artifacts/
+/target/
+/node_modules/
+/.mmltk-data/
+/cleanup/
+/engines/
+
+# Native and CMake build outputs
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+build.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+*.o
+*.obj
+*.lo
+*.a
+*.so
+*.so.*
+*.d
+*.pdb
+*.ilk
+
+# Dependency outputs
+/third_party/firefox/node_modules/
+/third_party/firefox/artifacts/
+
+# Python/cache noise
+__pycache__/
+*.py[cod]
+/python/
+
+# Logs and transient diagnostics
+*.log
+*.log.*
+*.out
+*.err
+*.tmp
+*.bt
+*.dmp
+*.stackdump
+*.trace
+/core
+/core.*
+
+# Large dataset and model artifact formats
+*.jsonl
+*.bin
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.plan
+*.safetensors
+
+# Large archives
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+
+# iced WebAssembly build outputs
+/src/browser/app/dist/
+/src/browser/app/target/
+
+/actionplan.md
+/gui.json
+/log.txt

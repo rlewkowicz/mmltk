@@ -1,0 +1,215 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+#if !defined(GOOGLE_PROTOBUF_METADATA_LITE_H__)
+#define GOOGLE_PROTOBUF_METADATA_LITE_H__
+
+#include <string>
+
+#include "absl/base/optimization.h"
+#include "absl/log/absl_check.h"
+#include "google/protobuf/arena.h"
+#include "google/protobuf/port.h"
+
+#include "google/protobuf/port_def.inc"
+
+#if defined(SWIG)
+#error "You cannot SWIG proto headers"
+#endif
+
+namespace google {
+namespace protobuf {
+
+class UnknownFieldSet;
+
+namespace internal {
+
+class PROTOBUF_EXPORT InternalMetadata {
+ public:
+  constexpr InternalMetadata() : ptr_(0) {}
+  explicit InternalMetadata(Arena* arena) {
+    ptr_ = reinterpret_cast<intptr_t>(arena);
+  }
+
+  template <typename T>
+  void Delete() {
+    if (have_unknown_fields()) {
+      DeleteOutOfLineHelper<T>();
+    }
+  }
+
+  PROTOBUF_NDEBUG_INLINE Arena* arena() const {
+    if (ABSL_PREDICT_FALSE(have_unknown_fields())) {
+      return PtrValue<ContainerBase>()->arena;
+    } else {
+      return PtrValue<Arena>();
+    }
+  }
+
+  PROTOBUF_NDEBUG_INLINE bool have_unknown_fields() const {
+    return HasUnknownFieldsTag();
+  }
+
+  PROTOBUF_NDEBUG_INLINE void* raw_arena_ptr() const {
+    return reinterpret_cast<void*>(ptr_);
+  }
+
+  template <typename T>
+  PROTOBUF_NDEBUG_INLINE const T& unknown_fields(
+      const T& (*default_instance)()) const {
+    if (ABSL_PREDICT_FALSE(have_unknown_fields())) {
+      return PtrValue<Container<T>>()->unknown_fields;
+    } else {
+      return default_instance();
+    }
+  }
+
+  template <typename T>
+  PROTOBUF_NDEBUG_INLINE T* mutable_unknown_fields() {
+    if (ABSL_PREDICT_TRUE(have_unknown_fields())) {
+      return &PtrValue<Container<T>>()->unknown_fields;
+    } else {
+      return mutable_unknown_fields_slow<T>();
+    }
+  }
+
+  template <typename T>
+  PROTOBUF_NDEBUG_INLINE void Swap(InternalMetadata* other) {
+    if (have_unknown_fields() || other->have_unknown_fields()) {
+      DoSwap<T>(other->mutable_unknown_fields<T>());
+    }
+  }
+
+  PROTOBUF_NDEBUG_INLINE void InternalSwap(
+      InternalMetadata* PROTOBUF_RESTRICT other) {
+    std::swap(ptr_, other->ptr_);
+  }
+
+  template <typename T>
+  PROTOBUF_NDEBUG_INLINE void MergeFrom(const InternalMetadata& other) {
+    if (other.have_unknown_fields()) {
+      DoMergeFrom<T>(other.unknown_fields<T>(nullptr));
+    }
+  }
+
+  template <typename T>
+  PROTOBUF_NDEBUG_INLINE void Clear() {
+    if (have_unknown_fields()) {
+      DoClear<T>();
+    }
+  }
+
+ private:
+  intptr_t ptr_;
+
+  static constexpr intptr_t kUnknownFieldsTagMask = 1;
+  static constexpr intptr_t kPtrTagMask = kUnknownFieldsTagMask;
+  static constexpr intptr_t kPtrValueMask = ~kPtrTagMask;
+
+  PROTOBUF_ALWAYS_INLINE bool HasUnknownFieldsTag() const {
+    return ptr_ & kUnknownFieldsTagMask;
+  }
+
+  template <typename U>
+  U* PtrValue() const {
+    if constexpr (std::is_same_v<U, Arena>) {
+      ABSL_DCHECK_EQ(ptr_ & kPtrTagMask, 0);
+      return reinterpret_cast<U*>(ptr_);
+    } else {
+      static_assert(kPtrTagMask == 1);
+      ABSL_DCHECK_EQ(ptr_ & kPtrTagMask, kPtrTagMask);
+      return reinterpret_cast<U*>(ptr_ - kPtrTagMask);
+    }
+  }
+
+  struct ContainerBase {
+    Arena* arena;
+  };
+
+  template <typename T>
+  struct Container : public ContainerBase {
+    T unknown_fields;
+  };
+
+  template <typename T>
+  PROTOBUF_NOINLINE void DeleteOutOfLineHelper() {
+    delete PtrValue<Container<T>>();
+    ptr_ = 0;
+  }
+
+  template <typename T>
+  PROTOBUF_NOINLINE T* mutable_unknown_fields_slow() {
+    Arena* my_arena = arena();
+    Container<T>* container = Arena::Create<Container<T>>(my_arena);
+    ptr_ = reinterpret_cast<intptr_t>(container);
+    ptr_ |= kUnknownFieldsTagMask;
+    container->arena = my_arena;
+    return &(container->unknown_fields);
+  }
+
+
+  template <typename T>
+  PROTOBUF_NOINLINE void DoClear() {
+    mutable_unknown_fields<T>()->Clear();
+  }
+
+  template <typename T>
+  PROTOBUF_NOINLINE void DoMergeFrom(const T& other) {
+    mutable_unknown_fields<T>()->MergeFrom(other);
+  }
+
+  template <typename T>
+  PROTOBUF_NOINLINE void DoSwap(T* other) {
+    mutable_unknown_fields<T>()->Swap(other);
+  }
+
+  void CheckedDestruct();
+};
+
+
+template <>
+PROTOBUF_EXPORT void InternalMetadata::DoClear<std::string>();
+template <>
+PROTOBUF_EXPORT void InternalMetadata::DoMergeFrom<std::string>(
+    const std::string& other);
+template <>
+PROTOBUF_EXPORT void InternalMetadata::DoSwap<std::string>(std::string* other);
+
+extern template PROTOBUF_EXPORT void
+InternalMetadata::DoClear<UnknownFieldSet>();
+extern template PROTOBUF_EXPORT void
+InternalMetadata::DoMergeFrom<UnknownFieldSet>(const UnknownFieldSet& other);
+extern template PROTOBUF_EXPORT void InternalMetadata::DoSwap<UnknownFieldSet>(
+    UnknownFieldSet* other);
+extern template PROTOBUF_EXPORT void
+InternalMetadata::DeleteOutOfLineHelper<UnknownFieldSet>();
+extern template PROTOBUF_EXPORT UnknownFieldSet*
+InternalMetadata::mutable_unknown_fields_slow<UnknownFieldSet>();
+
+class PROTOBUF_EXPORT LiteUnknownFieldSetter {
+ public:
+  explicit LiteUnknownFieldSetter(InternalMetadata* metadata)
+      : metadata_(metadata) {
+    if (metadata->have_unknown_fields()) {
+      buffer_.swap(*metadata->mutable_unknown_fields<std::string>());
+    }
+  }
+  ~LiteUnknownFieldSetter() {
+    if (!buffer_.empty())
+      metadata_->mutable_unknown_fields<std::string>()->swap(buffer_);
+  }
+  std::string* buffer() { return &buffer_; }
+
+ private:
+  InternalMetadata* metadata_;
+  std::string buffer_;
+};
+
+}  
+}  
+}  
+
+#include "google/protobuf/port_undef.inc"
+
+#endif

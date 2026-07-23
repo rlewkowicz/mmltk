@@ -1,0 +1,378 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_DataTransfer_h
+#define mozilla_dom_DataTransfer_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/DataTransferItemList.h"
+#include "mozilla/dom/File.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIClipboard.h"
+#include "nsIDragService.h"
+#include "nsIPrincipal.h"
+#include "nsITransferable.h"
+#include "nsIVariant.h"
+#include "nsString.h"
+#include "nsStringStream.h"
+#include "nsTArray.h"
+
+class nsIClipboardDataSnapshot;
+class nsINode;
+class nsITransferable;
+class nsILoadContext;
+
+namespace mozilla {
+
+class EventStateManager;
+
+namespace dom {
+
+class IPCDataTransfer;
+class DataTransferItem;
+class DataTransferItemList;
+class DOMStringList;
+class Element;
+class FileList;
+class Promise;
+template <typename T>
+class Optional;
+class WindowContext;
+
+#define NS_DATATRANSFER_IID \
+  {0x6c5f90d1, 0xa886, 0x42c8, {0x85, 0x06, 0x10, 0xbe, 0x5c, 0x0d, 0xc6, 0x77}}
+
+class DataTransfer final : public nsISupports, public nsWrapperCache {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_DATATRANSFER_IID)
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(DataTransfer)
+
+  friend class mozilla::EventStateManager;
+
+  enum class Mode : uint8_t {
+    ReadWrite,
+    ReadOnly,
+    Protected,
+  };
+
+ protected:
+  DataTransfer();
+
+  DataTransfer(nsISupports* aParent, EventMessage aEventMessage,
+               const uint32_t aEffectAllowed, bool aCursorState,
+               bool aIsExternal, bool aUserCancelled,
+               bool aIsCrossDomainSubFrameDrop,
+               mozilla::Maybe<nsIClipboard::ClipboardType> aClipboardType,
+               nsCOMPtr<nsIClipboardDataSnapshot> aClipboardDataSnapshot,
+               DataTransferItemList* aItems, Element* aDragImage,
+               uint32_t aDragImageX, uint32_t aDragImageY,
+               bool aShowFailAnimation);
+
+  ~DataTransfer();
+
+  static const char sEffects[8][9];
+
+ public:
+  DataTransfer(nsISupports* aParent, EventMessage aEventMessage,
+               bool aIsExternal,
+               mozilla::Maybe<nsIClipboard::ClipboardType> aClipboardType);
+  DataTransfer(nsISupports* aParent, EventMessage aEventMessage,
+               nsITransferable* aTransferable);
+  DataTransfer(nsISupports* aParent, EventMessage aEventMessage,
+               const nsAString& aString);
+  DataTransfer(nsISupports* aParent, nsIClipboard::ClipboardType aClipboardType,
+               nsIClipboardDataSnapshot* aClipboardDataSnapshot);
+
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  nsISupports* GetParentObject() const { return mParent; }
+
+  void SetParentObject(nsISupports* aNewParent) {
+    MOZ_ASSERT(aNewParent);
+    MOZ_ASSERT(!GetWrapperPreserveColor());
+    mParent = aNewParent;
+  }
+
+  static already_AddRefed<DataTransfer> Constructor(
+      const GlobalObject& aGlobal);
+
+  MOZ_CAN_RUN_SCRIPT
+  static already_AddRefed<DataTransfer> WaitForClipboardDataSnapshotAndCreate(
+      nsPIDOMWindowOuter* aWindow, nsIPrincipal* aSubjectPrincipal);
+
+  void GetDropEffect(nsAString& aDropEffect) {
+    aDropEffect.AssignASCII(sEffects[mDropEffect]);
+  }
+  void SetDropEffect(const nsAString& aDropEffect);
+
+  void GetEffectAllowed(nsAString& aEffectAllowed) {
+    if (mEffectAllowed == nsIDragService::DRAGDROP_ACTION_UNINITIALIZED) {
+      aEffectAllowed.AssignLiteral("uninitialized");
+    } else {
+      aEffectAllowed.AssignASCII(sEffects[mEffectAllowed]);
+    }
+  }
+  void SetEffectAllowed(const nsAString& aEffectAllowed);
+
+  void SetDragImage(Element& aElement, int32_t aX, int32_t aY);
+  void UpdateDragImage(Element& aElement, int32_t aX, int32_t aY);
+
+  void GetTypes(nsTArray<nsString>& aTypes, CallerType aCallerType) const;
+  bool HasType(const nsAString& aType) const;
+  bool HasFile() const;
+
+  void GetData(const nsAString& aFormat, nsAString& aData,
+               nsIPrincipal& aSubjectPrincipal, ErrorResult& aRv) const;
+
+  void SetData(const nsAString& aFormat, const nsAString& aData,
+               nsIPrincipal& aSubjectPrincipal, ErrorResult& aRv);
+
+  void ClearData(const mozilla::dom::Optional<nsAString>& aFormat,
+                 nsIPrincipal& aSubjectPrincipal, mozilla::ErrorResult& aRv);
+
+  already_AddRefed<FileList> GetFiles(nsIPrincipal& aSubjectPrincipal);
+
+  void AddElement(Element& aElement, mozilla::ErrorResult& aRv);
+
+  uint32_t MozItemCount() const;
+
+  void GetMozCursor(nsAString& aCursor) {
+    if (mCursorState) {
+      aCursor.AssignLiteral("default");
+    } else {
+      aCursor.AssignLiteral("auto");
+    }
+  }
+  void SetMozCursor(const nsAString& aCursor);
+
+  already_AddRefed<DOMStringList> MozTypesAt(uint32_t aIndex,
+                                             mozilla::ErrorResult& aRv) const;
+
+  void MozClearDataAt(const nsAString& aFormat, uint32_t aIndex,
+                      mozilla::ErrorResult& aRv);
+
+  void MozSetDataAt(JSContext* aCx, const nsAString& aFormat,
+                    JS::Handle<JS::Value> aData, uint32_t aIndex,
+                    mozilla::ErrorResult& aRv);
+
+  void MozGetDataAt(JSContext* aCx, const nsAString& aFormat, uint32_t aIndex,
+                    JS::MutableHandle<JS::Value> aRetval,
+                    mozilla::ErrorResult& aRv);
+
+  bool MozUserCancelled() const { return mUserCancelled; }
+
+  already_AddRefed<nsINode> GetMozSourceNode();
+
+  already_AddRefed<WindowContext> GetSourceTopWindowContext();
+
+  uint32_t DropEffectInt() const { return mDropEffect; }
+  void SetDropEffectInt(uint32_t aDropEffectInt) {
+    MOZ_RELEASE_ASSERT(aDropEffectInt < std::size(sEffects),
+                       "Bogus drop effect value");
+    mDropEffect = aDropEffectInt;
+  }
+
+  uint32_t EffectAllowedInt() const { return mEffectAllowed; }
+
+  void GetMozTriggeringPrincipalURISpec(nsAString& aPrincipalURISpec);
+
+  nsIPolicyContainer* GetPolicyContainer();
+
+  mozilla::dom::Element* GetDragTarget() const { return mDragTarget; }
+
+  nsresult GetDataAtNoSecurityCheck(const nsAString& aFormat, uint32_t aIndex,
+                                    nsIVariant** aData) const;
+
+  DataTransferItemList* Items() const { return mItems; }
+
+  Mode GetMode() const { return mMode; }
+  void SetMode(Mode aMode);
+
+  bool IsReadOnly() const { return mMode != Mode::ReadWrite; }
+  bool IsProtected() const { return mMode == Mode::Protected; }
+
+  nsITransferable* GetTransferable() const { return mTransferable; }
+  mozilla::Maybe<nsIClipboard::ClipboardType> ClipboardType() const {
+    return mClipboardType;
+  }
+  EventMessage GetEventMessage() const { return mEventMessage; }
+  bool IsCrossDomainSubFrameDrop() const { return mIsCrossDomainSubFrameDrop; }
+
+  already_AddRefed<nsIArray> GetTransferables(nsINode* aDragTarget);
+
+  already_AddRefed<nsIArray> GetTransferables(nsILoadContext* aLoadContext);
+
+  already_AddRefed<nsITransferable> GetTransferable(
+      uint32_t aIndex, nsILoadContext* aLoadContext);
+
+  bool ConvertFromVariant(nsIVariant* aVariant, nsISupports** aSupports,
+                          uint32_t* aLength) const;
+
+  void Disconnect();
+
+  void ClearAll();
+
+  nsresult SetDataWithPrincipal(const nsAString& aFormat, nsIVariant* aData,
+                                uint32_t aIndex, nsIPrincipal* aPrincipal,
+                                bool aHidden = false);
+
+  void SetDataWithPrincipalFromOtherProcess(const nsAString& aFormat,
+                                            nsIVariant* aData, uint32_t aIndex,
+                                            nsIPrincipal* aPrincipal,
+                                            bool aHidden);
+
+  Element* GetDragImage(int32_t* aX, int32_t* aY) const {
+    *aX = mDragImageX;
+    *aY = mDragImageY;
+    return mDragImage;
+  }
+
+  nsresult Clone(nsISupports* aParent, EventMessage aEventMessage,
+                 bool aUserCancelled, bool aIsCrossDomainSubFrameDrop,
+                 DataTransfer** aResult);
+
+  void GetRealFormat(const nsAString& aInFormat, nsAString& aOutFormat) const;
+
+  static bool PrincipalMaySetData(const nsAString& aFormat, nsIVariant* aData,
+                                  nsIPrincipal* aPrincipal);
+
+  void TypesListMayHaveChanged();
+
+  already_AddRefed<DataTransfer> MozCloneForEvent(const nsAString& aEvent,
+                                                  ErrorResult& aRv);
+
+  void SetMozShowFailAnimation(bool aShouldAnimate) {
+    mShowFailAnimation = aShouldAnimate;
+  }
+  bool MozShowFailAnimation() const { return mShowFailAnimation; }
+
+  static void GetExternalTransferableFormats(nsITransferable* aTransferable,
+                                             bool aPlainTextOnly,
+                                             nsTArray<nsCString>* aResult);
+
+  static inline const char* const kKnownFormats[] = {kTextMime,
+                                                     kHTMLMime,
+                                                     kNativeHTMLMime,
+                                                     kRTFMime,
+                                                     kURLMime,
+                                                     kURLDataMime,
+                                                     kURLDescriptionMime,
+                                                     kURLPrivateMime,
+                                                     kPNGImageMime,
+                                                     kJPEGImageMime,
+                                                     kGIFImageMime,
+                                                     kNativeImageMime,
+                                                     kFileMime,
+                                                     kFilePromiseMime,
+                                                     kFilePromiseURLMime,
+                                                     kFilePromiseDestFilename,
+                                                     kFilePromiseDirectoryMime,
+                                                     kMozTextInternal,
+                                                     kHTMLContext,
+                                                     kHTMLInfo,
+                                                     kImageRequestMime,
+                                                     kPDFJSMime};
+
+  already_AddRefed<nsIGlobalObject> GetGlobal() const;
+
+  already_AddRefed<WindowContext> GetWindowContext() const;
+
+  nsIClipboardDataSnapshot* GetClipboardDataSnapshot() const;
+
+  nsIDragSession* GetOwnerDragSession();
+
+  using ParseExternalCustomTypesStringData = std::pair<nsString&&, nsString&&>;
+
+  static void ParseExternalCustomTypesString(
+      mozilla::Span<const char> aString,
+      std::function<void(ParseExternalCustomTypesStringData&&)>&& aCallback);
+
+  void ClearForPaste();
+
+  bool HasPrivateHTMLFlavor() const;
+
+ protected:
+  void GetExternalClipboardFormats(const bool& aPlainTextOnly,
+                                   nsTArray<nsCString>& aResult);
+
+  nsresult CacheExternalData(const char* aFormat, uint32_t aIndex,
+                             nsIPrincipal* aPrincipal, bool aHidden);
+
+  void CacheExternalDragFormats();
+
+  void CacheExternalClipboardFormats(bool aPlainTextOnly);
+
+  void CacheTransferableFormats();
+
+  void CacheExternalData(const nsTArray<nsCString>& aTypes,
+                         nsIPrincipal* aPrincipal);
+
+  FileList* GetFilesInternal(ErrorResult& aRv, nsIPrincipal* aSubjectPrincipal);
+  nsresult GetDataAtInternal(const nsAString& aFormat, uint32_t aIndex,
+                             nsIPrincipal* aSubjectPrincipal,
+                             nsIVariant** aData) const;
+
+  nsresult SetDataAtInternal(const nsAString& aFormat, nsIVariant* aData,
+                             uint32_t aIndex, nsIPrincipal* aSubjectPrincipal);
+
+  friend class BrowserParent;
+  friend class Clipboard;
+
+  void FillAllExternalData();
+
+  void FillInExternalCustomTypes(uint32_t aIndex, nsIPrincipal* aPrincipal);
+
+  void FillInExternalCustomTypes(nsIVariant* aData, uint32_t aIndex,
+                                 nsIPrincipal* aPrincipal);
+
+  void MozClearDataAtHelper(const nsAString& aFormat, uint32_t aIndex,
+                            nsIPrincipal& aSubjectPrincipal,
+                            mozilla::ErrorResult& aRv);
+
+  nsIWidget* GetOwnerWidget();
+
+  nsCOMPtr<nsISupports> mParent;
+
+  nsCOMPtr<nsITransferable> mTransferable;
+
+  uint32_t mDropEffect = nsIDragService::DRAGDROP_ACTION_NONE;
+  uint32_t mEffectAllowed = nsIDragService::DRAGDROP_ACTION_UNINITIALIZED;
+
+  EventMessage mEventMessage;
+
+  bool mCursorState = false;
+
+  Mode mMode;
+
+  bool mIsExternal = false;
+
+  bool mUserCancelled = false;
+
+  bool mIsCrossDomainSubFrameDrop = false;
+
+  mozilla::Maybe<nsIClipboard::ClipboardType> mClipboardType;
+
+  nsCOMPtr<nsIClipboardDataSnapshot> mClipboardDataSnapshot;
+
+  RefPtr<DataTransferItemList> mItems;
+
+  nsCOMPtr<mozilla::dom::Element> mDragTarget;
+
+  nsCOMPtr<mozilla::dom::Element> mDragImage;
+  uint32_t mDragImageX = 0;
+  uint32_t mDragImageY = 0;
+
+  bool mShowFailAnimation = true;
+};
+
+}  
+}  
+
+#endif /* mozilla_dom_DataTransfer_h */

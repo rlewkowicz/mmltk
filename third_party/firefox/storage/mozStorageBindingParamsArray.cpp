@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozStorageBindingParamsArray.h"
+#include "mozStorageBindingParams.h"
+#include "StorageBaseStatementInternal.h"
+
+namespace mozilla {
+namespace storage {
+
+
+BindingParamsArray::BindingParamsArray(
+    StorageBaseStatementInternal* aOwningStatement)
+    : mOwningStatement(aOwningStatement), mLocked(false) {}
+
+void BindingParamsArray::lock() {
+  NS_ASSERTION(mLocked == false, "Array has already been locked!");
+  mLocked = true;
+
+  mOwningStatement = nullptr;
+}
+
+const StorageBaseStatementInternal* BindingParamsArray::getOwner() const {
+  return mOwningStatement;
+}
+
+NS_IMPL_ISUPPORTS(BindingParamsArray, mozIStorageBindingParamsArray)
+
+
+NS_IMETHODIMP
+BindingParamsArray::NewBindingParams(mozIStorageBindingParams** _params) {
+  NS_ENSURE_FALSE(mLocked, NS_ERROR_UNEXPECTED);
+
+  nsCOMPtr<mozIStorageBindingParams> params(
+      mOwningStatement->newBindingParams(this));
+  NS_ENSURE_TRUE(params, NS_ERROR_UNEXPECTED);
+
+  params.forget(_params);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+BindingParamsArray::AddParams(mozIStorageBindingParams* aParameters) {
+  NS_ENSURE_FALSE(mLocked, NS_ERROR_UNEXPECTED);
+
+  BindingParams* params = static_cast<BindingParams*>(aParameters);
+
+  if (params->getOwner() != this) return NS_ERROR_UNEXPECTED;
+
+  mArray.AppendElement(params);
+
+  params->lock();
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+BindingParamsArray::GetLength(uint32_t* _length) {
+  *_length = length();
+  return NS_OK;
+}
+
+}  
+}  

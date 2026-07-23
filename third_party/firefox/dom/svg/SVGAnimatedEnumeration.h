@@ -1,0 +1,108 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGANIMATEDENUMERATION_H_
+#define DOM_SVG_SVGANIMATEDENUMERATION_H_
+
+#include <memory>
+
+#include "DOMSVGAnimatedEnumeration.h"
+#include "mozilla/SMILAttr.h"
+#include "mozilla/dom/SVGElement.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsError.h"
+
+class nsAtom;
+
+namespace mozilla {
+
+class SMILValue;
+
+namespace dom {
+class SVGAnimationElement;
+}  
+
+using SVGEnumValue = uint8_t;
+
+struct SVGEnumMapping {
+  nsStaticAtom* const mKey;
+  const SVGEnumValue mVal;
+};
+
+class SVGAnimatedEnumeration {
+ public:
+  friend class AutoChangeEnumNotifier;
+  using SVGElement = dom::SVGElement;
+
+  void Init(uint8_t aAttrEnum, uint16_t aValue) {
+    MOZ_ASSERT(aAttrEnum < (2 << 6), "aAttrEnum is too large");
+    mAnimVal = mBaseVal = uint8_t(aValue);
+    mAttrEnum = aAttrEnum;
+    mIsAnimated = false;
+    mIsBaseSet = false;
+  }
+
+  bool SetBaseValueAtom(const nsAtom* aValue, SVGElement* aSVGElement);
+  nsAtom* GetBaseValueAtom(SVGElement* aSVGElement);
+  void SetBaseValue(uint16_t aValue, SVGElement* aSVGElement, ErrorResult& aRv);
+  uint16_t GetBaseValue() const { return mBaseVal; }
+
+  void SetAnimValue(uint16_t aValue, SVGElement* aSVGElement);
+  uint16_t GetAnimValue() const { return mAnimVal; }
+  bool IsExplicitlySet() const { return mIsAnimated || mIsBaseSet; }
+
+  already_AddRefed<dom::DOMSVGAnimatedEnumeration> ToDOMAnimatedEnum(
+      SVGElement* aSVGElement);
+
+  std::unique_ptr<SMILAttr> ToSMILAttr(SVGElement* aSVGElement);
+
+ private:
+  SVGEnumValue mAnimVal;
+  SVGEnumValue mBaseVal;
+  uint8_t mAttrEnum : 6;  
+  bool mIsAnimated : 1;
+  bool mIsBaseSet : 1;
+
+  const SVGEnumMapping* GetMapping(SVGElement* aSVGElement);
+
+ public:
+  struct DOMAnimatedEnum final : public dom::DOMSVGAnimatedEnumeration {
+    DOMAnimatedEnum(SVGAnimatedEnumeration* aVal, SVGElement* aSVGElement)
+        : dom::DOMSVGAnimatedEnumeration(aSVGElement), mVal(aVal) {}
+    virtual ~DOMAnimatedEnum();
+
+    SVGAnimatedEnumeration* mVal;  
+
+    using dom::DOMSVGAnimatedEnumeration::SetBaseVal;
+    uint16_t BaseVal() override { return mVal->GetBaseValue(); }
+    void SetBaseVal(uint16_t aBaseVal, ErrorResult& aRv) override {
+      mVal->SetBaseValue(aBaseVal, mSVGElement, aRv);
+    }
+    uint16_t AnimVal() override {
+      mSVGElement->FlushAnimations();
+      return mVal->GetAnimValue();
+    }
+  };
+
+  struct SMILEnum : public SMILAttr {
+   public:
+    SMILEnum(SVGAnimatedEnumeration* aVal, SVGElement* aSVGElement)
+        : mVal(aVal), mSVGElement(aSVGElement) {}
+
+    SVGAnimatedEnumeration* mVal;
+    SVGElement* mSVGElement;
+
+    nsresult ValueFromString(const nsAString& aStr,
+                             const dom::SVGAnimationElement* aSrcElement,
+                             SMILValue& aValue,
+                             bool& aPreventCachingOfSandwich) const override;
+    SMILValue GetBaseValue() const override;
+    void ClearAnimValue() override;
+    nsresult SetAnimValue(const SMILValue& aValue) override;
+  };
+};
+
+}  
+
+#endif  // DOM_SVG_SVGANIMATEDENUMERATION_H_

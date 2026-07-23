@@ -1,0 +1,1439 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_workers_workerprivate_h_
+#define mozilla_dom_workers_workerprivate_h_
+
+#include <bitset>
+
+#include "FontVisibilityProvider.h"
+#include "MainThreadUtils.h"
+#include "ScriptLoader.h"
+#include "js/ContextOptions.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/CondVar.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/OriginTrials.h"
+#include "mozilla/RelativeTimeline.h"
+#include "mozilla/Result.h"
+#include "mozilla/StorageAccess.h"
+#include "mozilla/TargetShutdownTaskSet.h"
+#include "mozilla/ThreadBound.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/ClientSource.h"
+#include "mozilla/dom/FlippedOnce.h"
+#include "mozilla/dom/JSExecutionManager.h"
+#include "mozilla/dom/PRemoteWorkerNonLifeCycleOpControllerChild.h"
+#include "mozilla/dom/RemoteWorkerTypes.h"
+#include "mozilla/dom/Timeout.h"
+#include "mozilla/dom/Worker.h"
+#include "mozilla/dom/WorkerBinding.h"
+#include "mozilla/dom/WorkerCommon.h"
+#include "mozilla/dom/WorkerLoadInfo.h"
+#include "mozilla/dom/WorkerStatus.h"
+#include "mozilla/dom/quota/CheckedUnsafePtr.h"
+#include "mozilla/dom/workerinternals/JSSettings.h"
+#include "mozilla/dom/workerinternals/Queue.h"
+#include "mozilla/ipc/Endpoint.h"
+#include "mozilla/net/NeckoChannelParams.h"
+#include "nsIChannel.h"
+#include "nsIContentPolicy.h"
+#include "nsID.h"
+#include "nsIEventTarget.h"
+#include "nsILoadInfo.h"
+#include "nsRFPService.h"
+#include "nsTObserverArray.h"
+#include "stdint.h"
+
+class nsIContentSecurityPolicy;
+class nsIThreadInternal;
+
+namespace JS {
+struct RuntimeStats;
+class Dispatchable;
+}  
+
+namespace mozilla {
+class ThrottledEventQueue;
+namespace dom {
+
+class PRemoteWorkerDebuggerChild;
+class PRemoteWorkerDebuggerParent;
+class RemoteWorkerChild;
+class RemoteWorkerDebuggerChild;
+class RemoteWorkerNonLifeCycleOpControllerChild;
+
+enum WorkerKind : uint8_t {
+  WorkerKindDedicated,
+  WorkerKindShared,
+  WorkerKindService
+};
+
+class ClientInfo;
+class ClientSource;
+class Function;
+class JSExecutionManager;
+class MessagePort;
+class UniqueMessagePortId;
+class PerformanceStorage;
+class StrongWorkerRef;
+class TimeoutHandler;
+class WorkerControlRunnable;
+class WorkerCSPEventListener;
+class WorkerDebugger;
+class WorkerDebuggerGlobalScope;
+class WorkerErrorReport;
+class WorkerEventTarget;
+class WorkerGlobalScope;
+class WorkerParentRef;
+class WorkerRef;
+class WorkerRunnable;
+class WorkerDebuggeeRunnable;
+class WorkerThread;
+class WorkerThreadRunnable;
+
+class MOZ_CAPABILITY("mutex") SharedMutex {
+  using Mutex = mozilla::Mutex;
+
+  class MOZ_CAPABILITY("mutex") RefCountedMutex final : public Mutex {
+   public:
+    explicit RefCountedMutex(const char* aName) : Mutex(aName) {}
+
+    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(RefCountedMutex)
+
+   private:
+    ~RefCountedMutex() = default;
+  };
+
+  const RefPtr<RefCountedMutex> mMutex;
+
+ public:
+  explicit SharedMutex(const char* aName)
+      : mMutex(new RefCountedMutex(aName)) {}
+
+  SharedMutex(const SharedMutex& aOther) = default;
+
+  operator Mutex&() MOZ_RETURN_CAPABILITY(this) { return *mMutex; }
+
+  operator const Mutex&() const MOZ_RETURN_CAPABILITY(this) { return *mMutex; }
+
+  void Lock() MOZ_CAPABILITY_ACQUIRE() { mMutex->Lock(); }
+  void Unlock() MOZ_CAPABILITY_RELEASE() { mMutex->Unlock(); }
+
+  void AssertCurrentThreadOwns() const
+      MOZ_ASSERT_CAPABILITY(this) MOZ_NO_THREAD_SAFETY_ANALYSIS {
+    mMutex->AssertCurrentThreadOwns();
+  }
+};
+
+nsString ComputeWorkerPrivateId();
+
+class WorkerPrivate final
+    : public RelativeTimeline,
+      public SupportsCheckedUnsafePtr<CheckIf<DiagnosticAssertEnabled>>,
+      public FontVisibilityProvider {
+ public:
+  using CancellationCallback = std::function<void(bool aEverRan)>;
+
+  using TerminationCallback = std::function<void(void)>;
+
+  struct LocationInfo {
+    nsCString mHref;
+    nsCString mProtocol;
+    nsCString mHost;
+    nsCString mHostname;
+    nsCString mPort;
+    nsCString mPathname;
+    nsCString mSearch;
+    nsCString mHash;
+    nsString mOrigin;
+  };
+
+  NS_INLINE_DECL_REFCOUNTING(WorkerPrivate)
+
+  FONT_VISIBILITY_PROVIDER_IMPL
+
+  static already_AddRefed<WorkerPrivate> Constructor(
+      JSContext* aCx, const nsAString& aScriptURL, bool aIsChromeWorker,
+      WorkerKind aWorkerKind, RequestCredentials aRequestCredentials,
+      const WorkerType aWorkerType, const nsAString& aWorkerName,
+      const nsACString& aServiceWorkerScope, WorkerLoadInfo* aLoadInfo,
+      ErrorResult& aRv, nsString aId = u""_ns,
+      CancellationCallback&& aCancellationCallback = {},
+      TerminationCallback&& aTerminationCallback = {},
+      mozilla::ipc::Endpoint<
+          PRemoteWorkerNonLifeCycleOpControllerChild>&& aChildEp =
+          mozilla::ipc::Endpoint<PRemoteWorkerNonLifeCycleOpControllerChild>());
+
+  enum LoadGroupBehavior { InheritLoadGroup, OverrideLoadGroup };
+
+  static nsresult GetLoadInfo(
+      JSContext* aCx, nsPIDOMWindowInner* aWindow, WorkerPrivate* aParent,
+      const nsAString& aScriptURL, const enum WorkerType& aWorkerType,
+      const RequestCredentials& aCredentials, bool aIsChromeWorker,
+      LoadGroupBehavior aLoadGroupBehavior, WorkerKind aWorkerKind,
+      WorkerLoadInfo* aLoadInfo);
+
+  void Traverse(nsCycleCollectionTraversalCallback& aCb);
+
+  void ClearSelfAndParentEventTargetRef() {
+    AssertIsOnParentThread();
+    MOZ_ASSERT(mSelfRef);
+
+    if (mTerminationCallback) {
+      mTerminationCallback();
+      mTerminationCallback = nullptr;
+    }
+
+    mParentEventTargetRef = nullptr;
+    mSelfRef = nullptr;
+  }
+
+  bool Start();
+
+  bool Notify(WorkerStatus aStatus);
+
+  bool Cancel() { return Notify(Canceling); }
+
+  bool Close() MOZ_REQUIRES(mMutex);
+
+  static void OverrideLoadInfoLoadGroup(WorkerLoadInfo& aLoadInfo,
+                                        nsIPrincipal* aPrincipal);
+
+  bool IsDebuggerRegistered() MOZ_NO_THREAD_SAFETY_ANALYSIS {
+    AssertIsOnMainThread();
+
+    return mDebuggerRegistered;  
+  }
+
+  void SetIsDebuggerRegistered(bool aDebuggerRegistered) {
+    AssertIsOnMainThread();
+
+    MutexAutoLock lock(mMutex);
+
+    MOZ_ASSERT(mDebuggerRegistered != aDebuggerRegistered);
+    mDebuggerRegistered = aDebuggerRegistered;
+
+    mCondVar.Notify();
+  }
+
+  void SetIsRunningInBackground();
+  void SetIsPlayingAudio(bool aIsPlayingAudio);
+
+  bool IsPlayingAudio() {
+    AssertIsOnWorkerThread();
+    return mIsPlayingAudio;
+  }
+
+  void SetIsRunningInForeground();
+
+  bool ChangeBackgroundStateInternal(bool aIsBackground);
+  bool ChangePlaybackStateInternal(bool aIsPlayingAudio);
+
+  bool IsRunningInBackground() const { return mIsInBackground; }
+
+  void WaitForIsDebuggerRegistered(bool aDebuggerRegistered) {
+    AssertIsOnParentThread();
+
+    AutoYieldJSThreadExecution yield;
+
+    MOZ_ASSERT(!NS_IsMainThread());
+
+    MutexAutoLock lock(mMutex);
+
+    while (mDebuggerRegistered != aDebuggerRegistered) {
+      mCondVar.Wait();
+    }
+  }
+
+  nsresult SetIsDebuggerReady(bool aReady);
+
+  WorkerDebugger* Debugger() const {
+    AssertIsOnMainThread();
+
+    MOZ_ASSERT(mDebugger);
+    return mDebugger;
+  }
+
+  const OriginTrials& Trials() const { return mLoadInfo.mTrials; }
+
+  void SetDebugger(WorkerDebugger* aDebugger) {
+    AssertIsOnMainThread();
+
+    MOZ_ASSERT(mDebugger != aDebugger);
+    mDebugger = aDebugger;
+  }
+
+  JS::UniqueChars AdoptDefaultLocale() {
+    MOZ_ASSERT(mDefaultLocale,
+               "the default locale must have been successfully set for anyone "
+               "to be trying to adopt it");
+    return std::move(mDefaultLocale);
+  }
+
+  void RunLoopNeverRan();
+
+  MOZ_CAN_RUN_SCRIPT
+  void DoRunLoop(JSContext* aCx);
+
+  void UnrootGlobalScopes();
+
+  MOZ_CAN_RUN_SCRIPT bool InterruptCallback(JSContext* aCx);
+
+  bool IsOnCurrentThread();
+
+  void CloseInternal();
+
+  bool FreezeInternal();
+
+  bool ThawInternal();
+
+  void PropagateStorageAccessPermissionGrantedInternal();
+
+  void TraverseTimeouts(nsCycleCollectionTraversalCallback& aCallback);
+
+  void UnlinkTimeouts();
+
+  bool AddChildWorker(WorkerPrivate& aChildWorker);
+
+  void RemoveChildWorker(WorkerPrivate& aChildWorker);
+
+  void PostMessageToParent(JSContext* aCx, JS::Handle<JS::Value> aMessage,
+                           const Sequence<JSObject*>& aTransferable,
+                           ErrorResult& aRv);
+
+  void PostMessageToParentMessagePort(JSContext* aCx,
+                                      JS::Handle<JS::Value> aMessage,
+                                      const Sequence<JSObject*>& aTransferable,
+                                      ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void EnterDebuggerEventLoop();
+
+  void LeaveDebuggerEventLoop();
+
+  void PostMessageToDebugger(const nsAString& aMessage);
+
+  void SetDebuggerImmediate(Function& aHandler, ErrorResult& aRv);
+
+  void ReportErrorToDebugger(const nsACString& aFilename, uint32_t aLineno,
+                             const nsAString& aMessage);
+
+  bool NotifyInternal(WorkerStatus aStatus);
+
+  void ReportError(JSContext* aCx, JS::ConstUTF8CharsZ aToStringResult,
+                   JSErrorReport* aReport);
+
+  static void ReportErrorToConsole(
+      uint32_t aErrorFlags, const nsCString& aCategory, PropertiesFile aFile,
+      const nsCString& aMessageName,
+      const nsTArray<nsString>& aParams = nsTArray<nsString>(),
+      const mozilla::SourceLocation& aLocation =
+          mozilla::JSCallingLocation::Get());
+
+  int32_t SetTimeout(JSContext* aCx, TimeoutHandler* aHandler, int32_t aTimeout,
+                     bool aIsInterval, Timeout::Reason aReason,
+                     ErrorResult& aRv);
+
+  void ClearTimeout(int32_t aId, Timeout::Reason aReason);
+
+  void UpdateContextOptionsInternal(JSContext* aCx,
+                                    const JS::ContextOptions& aContextOptions);
+
+  void UpdateTimezoneOverrideInternal(JSContext* aCx,
+                                      const nsAString& aTimezone);
+
+  void UpdateLanguagesInternal(const nsTArray<nsString>& aLanguages);
+
+  void UpdateLanguageOverrideInternal(
+      const nsCString& aLanguageOverride,
+      const nsTArray<nsString>& aResolvedLanguages);
+
+  void UpdateJSWorkerMemoryParameterInternal(JSContext* aCx, JSGCParamKey key,
+                                             Maybe<uint32_t> aValue);
+
+  enum WorkerRanOrNot { WorkerNeverRan = 0, WorkerRan };
+
+  void ScheduleDeletion(WorkerRanOrNot aRanOrNot);
+
+  bool CollectRuntimeStats(JS::RuntimeStats* aRtStats, bool aAnonymize);
+
+#ifdef JS_GC_ZEAL
+  void UpdateGCZealInternal(JSContext* aCx, uint8_t aGCZeal,
+                            uint32_t aFrequency);
+#endif
+
+  void SetLowMemoryStateInternal(JSContext* aCx, bool aState);
+
+  void GarbageCollectInternal(JSContext* aCx, bool aShrinking,
+                              bool aCollectChildren);
+
+  void CycleCollectInternal(bool aCollectChildren);
+
+  void OfflineStatusChangeEventInternal(bool aIsOffline);
+
+  void MemoryPressureInternal();
+
+  typedef MozPromise<uint64_t, nsresult, true> JSMemoryUsagePromise;
+  RefPtr<JSMemoryUsagePromise> GetJSMemoryUsage();
+
+  void SetFetchHandlerWasAdded() {
+    MOZ_ASSERT(IsServiceWorker());
+    AssertIsOnWorkerThread();
+    mFetchHandlerWasAdded = true;
+  }
+
+  bool FetchHandlerWasAdded() const {
+    MOZ_ASSERT(IsServiceWorker());
+    AssertIsOnWorkerThread();
+    return mFetchHandlerWasAdded;
+  }
+
+  JSContext* GetJSContext() const MOZ_NO_THREAD_SAFETY_ANALYSIS {
+    AssertIsOnWorkerThread();
+    return mJSContext;
+  }
+
+  WorkerGlobalScope* GlobalScope() const {
+    auto data = mWorkerThreadAccessible.Access();
+    return data->mScope;
+  }
+
+  WorkerDebuggerGlobalScope* DebuggerGlobalScope() const {
+    auto data = mWorkerThreadAccessible.Access();
+    return data->mDebuggerScope;
+  }
+
+  nsIGlobalObject* GetCurrentEventLoopGlobal() const {
+    auto data = mWorkerThreadAccessible.Access();
+    return data->mCurrentEventLoopGlobal;
+  }
+
+  nsICSPEventListener* CSPEventListener() const;
+
+  void SetThread(WorkerThread* aThread);
+
+  void SetWorkerPrivateInWorkerThread(WorkerThread* aThread);
+
+  void ResetWorkerPrivateInWorkerThread();
+
+  bool IsOnWorkerThread() const;
+
+  void AssertIsOnWorkerThread() const
+#ifdef DEBUG
+      ;
+#else
+  {
+  }
+#endif
+
+  void BeginCTypesCall();
+
+  void EndCTypesCall();
+
+  void BeginCTypesCallback();
+
+  void EndCTypesCallback();
+
+  bool ConnectMessagePort(JSContext* aCx, UniqueMessagePortId& aIdentifier);
+
+  WorkerGlobalScope* GetOrCreateGlobalScope(JSContext* aCx);
+
+  WorkerDebuggerGlobalScope* CreateDebuggerGlobalScope(JSContext* aCx);
+
+  bool RegisterBindings(JSContext* aCx, JS::Handle<JSObject*> aGlobal);
+
+  bool RegisterDebuggerBindings(JSContext* aCx, JS::Handle<JSObject*> aGlobal);
+
+  bool OnLine() const {
+    auto data = mWorkerThreadAccessible.Access();
+    return data->mOnLine;
+  }
+
+  void StopSyncLoop(nsIEventTarget* aSyncLoopTarget, nsresult aResult);
+
+  bool MaybeStopSyncLoop(nsIEventTarget* aSyncLoopTarget, nsresult aResult);
+
+  void ShutdownModuleLoader();
+
+  void ClearPreStartRunnables();
+
+  MOZ_CAN_RUN_SCRIPT void ProcessSingleDebuggerRunnable();
+  void ClearDebuggerEventQueue();
+
+  void OnProcessNextEvent();
+
+  void AfterProcessNextEvent();
+
+  void AssertValidSyncLoop(nsIEventTarget* aSyncLoopTarget)
+#ifdef DEBUG
+      ;
+#else
+  {
+  }
+#endif
+
+  void AssertIsNotPotentiallyLastGCCCRunning() {
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+    auto data = mWorkerThreadAccessible.Access();
+    MOZ_DIAGNOSTIC_ASSERT(!data->mIsPotentiallyLastGCCCRunning);
+#endif
+  }
+
+  void SetWorkerScriptExecutedSuccessfully() {
+    AssertIsOnWorkerThread();
+    MOZ_ASSERT(!mWorkerScriptExecutedSuccessfully);
+    mWorkerScriptExecutedSuccessfully = true;
+  }
+
+  bool WorkerScriptExecutedSuccessfully() const {
+    AssertIsOnWorkerThread();
+    return mWorkerScriptExecutedSuccessfully;
+  }
+
+  nsISerialEventTarget* MainThreadEventTargetForMessaging();
+
+  nsresult DispatchToMainThreadForMessaging(
+      nsIRunnable* aRunnable,
+      nsIEventTarget::DispatchFlags aFlags = NS_DISPATCH_NORMAL);
+
+  nsresult DispatchToMainThreadForMessaging(
+      already_AddRefed<nsIRunnable> aRunnable,
+      nsIEventTarget::DispatchFlags aFlags = NS_DISPATCH_NORMAL);
+
+  nsISerialEventTarget* MainThreadEventTarget();
+
+  nsresult DispatchToMainThread(
+      nsIRunnable* aRunnable,
+      nsIEventTarget::DispatchFlags aFlags = NS_DISPATCH_NORMAL);
+
+  nsresult DispatchToMainThread(
+      already_AddRefed<nsIRunnable> aRunnable,
+      nsIEventTarget::DispatchFlags aFlags = NS_DISPATCH_NORMAL);
+
+  nsresult DispatchDebuggeeToMainThread(
+      already_AddRefed<WorkerRunnable> aRunnable,
+      nsIEventTarget::DispatchFlags aFlags = NS_DISPATCH_NORMAL);
+
+  nsISerialEventTarget* ControlEventTarget();
+
+  nsISerialEventTarget* HybridEventTarget();
+
+  void DumpCrashInformation(nsACString& aString);
+
+  ClientType GetClientType() const;
+
+  bool EnsureCSPEventListener();
+
+  void EnsurePerformanceStorage();
+
+  bool GetExecutionGranted() const;
+  void SetExecutionGranted(bool aGranted);
+
+  void ScheduleTimeSliceExpiration(uint32_t aDelay);
+  void CancelTimeSliceExpiration();
+
+  JSExecutionManager* GetExecutionManager() const;
+  void SetExecutionManager(JSExecutionManager* aManager);
+
+  void ExecutionReady();
+
+  PerformanceStorage* GetPerformanceStorage();
+
+  bool IsAcceptingEvents() MOZ_EXCLUDES(mMutex) {
+    AssertIsOnParentThread();
+
+    MutexAutoLock lock(mMutex);
+    return mParentStatus < Canceling;
+  }
+
+  bool IsDead() MOZ_EXCLUDES(mMutex) {
+    MutexAutoLock lock(mMutex);
+    return mStatus == Dead;
+  }
+
+  WorkerStatus ParentStatusProtected() {
+    AssertIsOnParentThread();
+    MutexAutoLock lock(mMutex);
+    return mParentStatus;
+  }
+
+  WorkerStatus ParentStatus() const MOZ_REQUIRES(mMutex) {
+    mMutex.AssertCurrentThreadOwns();
+    return mParentStatus;
+  }
+
+  Worker* ParentEventTargetRef() const {
+    MOZ_DIAGNOSTIC_ASSERT(mParentEventTargetRef);
+    return mParentEventTargetRef;
+  }
+
+  void SetParentEventTargetRef(Worker* aParentEventTargetRef) {
+    MOZ_DIAGNOSTIC_ASSERT(aParentEventTargetRef);
+    MOZ_DIAGNOSTIC_ASSERT(!mParentEventTargetRef);
+    mParentEventTargetRef = aParentEventTargetRef;
+  }
+
+  bool IsSecureContext() const { return mIsSecureContext; }
+
+  TimeStamp CreationTimeStamp() const { return mCreationTimeStamp; }
+
+  DOMHighResTimeStamp CreationTime() const { return mCreationTimeHighRes; }
+
+  DOMHighResTimeStamp TimeStampToDOMHighRes(const TimeStamp& aTimeStamp) const {
+    MOZ_ASSERT(!aTimeStamp.IsNull());
+    TimeDuration duration = aTimeStamp - mCreationTimeStamp;
+    return duration.ToMilliseconds();
+  }
+
+  LocationInfo& GetLocationInfo() { return mLocationInfo; }
+
+  void CopyJSSettings(workerinternals::JSSettings& aSettings) {
+    mozilla::MutexAutoLock lock(mMutex);
+    aSettings = mJSSettings;
+    aSettings.CopyOverrideStrings();
+  }
+
+  void CopyJSRealmOptions(JS::RealmOptions& aOptions) {
+    mozilla::MutexAutoLock lock(mMutex);
+    aOptions = IsChromeWorker() ? mJSSettings.chromeRealmOptions
+                                : mJSSettings.contentRealmOptions;
+  }
+
+  bool IsChromeWorker() const { return mIsChromeWorker; }
+
+  WorkerPrivate* GetParent() const { return mParent; }
+
+  WorkerPrivate* GetTopLevelWorker() const {
+    WorkerPrivate const* wp = this;
+    while (wp->GetParent()) {
+      wp = wp->GetParent();
+    }
+    return const_cast<WorkerPrivate*>(wp);
+  }
+
+  bool IsFrozen() const;
+
+  bool IsFrozenForWorkerThread() const;
+
+  bool IsParentWindowPaused() const {
+    AssertIsOnParentThread();
+    return mParentWindowPaused;
+  }
+
+  void ParentWindowPaused();
+
+  void ParentWindowResumed();
+
+  const nsString& ScriptURL() const { return mScriptURL; }
+
+  const nsString& WorkerName() const { return mWorkerName; }
+  RequestCredentials WorkerCredentials() const { return mCredentialsMode; }
+  enum WorkerType WorkerType() const { return mWorkerType; }
+
+  WorkerKind Kind() const { return mWorkerKind; }
+
+  bool IsDedicatedWorker() const { return mWorkerKind == WorkerKindDedicated; }
+
+  bool IsSharedWorker() const { return mWorkerKind == WorkerKindShared; }
+
+  bool IsServiceWorker() const { return mWorkerKind == WorkerKindService; }
+
+  nsContentPolicyType ContentPolicyType() const {
+    return ContentPolicyType(mWorkerKind);
+  }
+
+  static nsContentPolicyType ContentPolicyType(WorkerKind aWorkerKind) {
+    switch (aWorkerKind) {
+      case WorkerKindDedicated:
+        return nsIContentPolicy::TYPE_INTERNAL_WORKER;
+      case WorkerKindShared:
+        return nsIContentPolicy::TYPE_INTERNAL_SHARED_WORKER;
+      case WorkerKindService:
+        return nsIContentPolicy::TYPE_INTERNAL_SERVICE_WORKER;
+      default:
+        MOZ_ASSERT_UNREACHABLE("Invalid worker type");
+        return nsIContentPolicy::TYPE_INVALID;
+    }
+  }
+
+  nsIScriptContext* GetScriptContext() const {
+    AssertIsOnMainThread();
+    return mLoadInfo.mScriptContext;
+  }
+
+  const nsCString& Domain() const { return mLoadInfo.mDomain; }
+
+  bool IsFromWindow() const { return mLoadInfo.mFromWindow; }
+
+  nsLoadFlags GetLoadFlags() const { return mLoadInfo.mLoadFlags; }
+
+  uint64_t WindowID() const { return mLoadInfo.mWindowID; }
+
+  uint64_t AssociatedBrowsingContextID() const {
+    return mLoadInfo.mAssociatedBrowsingContextID;
+  }
+
+  const nsTArray<nsString>& GetLanguageOverride() const {
+    return mLoadInfo.mLanguageOverride;
+  }
+
+  const nsCString& GetLanguageOverrideLocale() const {
+    return mLoadInfo.mLanguageOverrideLocale;
+  }
+
+  uint64_t ServiceWorkerID() const { return GetServiceWorkerDescriptor().Id(); }
+
+  const nsCString& ServiceWorkerScope() const {
+    return GetServiceWorkerDescriptor().Scope();
+  }
+
+  nsIURI* GetBaseURI() const { return mLoadInfo.mBaseURI; }
+
+  void SetBaseURI(nsIURI* aBaseURI);
+
+  nsIURI* GetResolvedScriptURI() const { return mLoadInfo.mResolvedScriptURI; }
+
+  const nsString& ServiceWorkerCacheName() const {
+    MOZ_DIAGNOSTIC_ASSERT(IsServiceWorker());
+    AssertIsOnMainThread();
+    return mLoadInfo.mServiceWorkerCacheName;
+  }
+
+  const ServiceWorkerDescriptor& GetServiceWorkerDescriptor() const {
+    MOZ_DIAGNOSTIC_ASSERT(IsServiceWorker());
+    MOZ_DIAGNOSTIC_ASSERT(mLoadInfo.mServiceWorkerDescriptor.isSome());
+    return mLoadInfo.mServiceWorkerDescriptor.ref();
+  }
+
+  const ServiceWorkerRegistrationDescriptor&
+  GetServiceWorkerRegistrationDescriptor() const {
+    MOZ_DIAGNOSTIC_ASSERT(IsServiceWorker());
+    MOZ_DIAGNOSTIC_ASSERT(
+        mLoadInfo.mServiceWorkerRegistrationDescriptor.isSome());
+    return mLoadInfo.mServiceWorkerRegistrationDescriptor.ref();
+  }
+
+  const ClientInfo& GetSourceInfo() const {
+    MOZ_DIAGNOSTIC_ASSERT(IsServiceWorker());
+    MOZ_DIAGNOSTIC_ASSERT(mLoadInfo.mSourceInfo.isSome());
+    return mLoadInfo.mSourceInfo.ref();
+  }
+
+  void UpdateServiceWorkerState(ServiceWorkerState aState) {
+    MOZ_DIAGNOSTIC_ASSERT(IsServiceWorker());
+    MOZ_DIAGNOSTIC_ASSERT(mLoadInfo.mServiceWorkerDescriptor.isSome());
+    return mLoadInfo.mServiceWorkerDescriptor.ref().SetState(aState);
+  }
+
+  void UpdateIsOnContentBlockingAllowList(bool aOnContentBlockingAllowList);
+
+  const Maybe<ServiceWorkerDescriptor>& GetParentController() const {
+    return mLoadInfo.mParentController;
+  }
+
+  const ChannelInfo& GetChannelInfo() const { return mLoadInfo.mChannelInfo; }
+
+  void SetChannelInfo(const ChannelInfo& aChannelInfo) {
+    AssertIsOnMainThread();
+    MOZ_ASSERT(!mLoadInfo.mChannelInfo.IsInitialized());
+    MOZ_ASSERT(aChannelInfo.IsInitialized());
+    mLoadInfo.mChannelInfo = aChannelInfo;
+  }
+
+  void InitChannelInfo(nsIChannel* aChannel) {
+    mLoadInfo.mChannelInfo.InitFromChannel(aChannel);
+  }
+
+  void InitChannelInfo(const ChannelInfo& aChannelInfo) {
+    mLoadInfo.mChannelInfo = aChannelInfo;
+  }
+
+  nsIPrincipal* GetPrincipal() const { return mLoadInfo.mPrincipal; }
+
+  nsIPrincipal* GetLoadingPrincipal() const {
+    return mLoadInfo.mLoadingPrincipal;
+  }
+
+  nsIPrincipal* GetPartitionedPrincipal() const {
+    return mLoadInfo.mPartitionedPrincipal;
+  }
+
+  nsIPrincipal* GetEffectiveStoragePrincipal() const;
+
+  nsILoadGroup* GetLoadGroup() const {
+    AssertIsOnMainThread();
+    return mLoadInfo.mLoadGroup;
+  }
+
+  bool UsesSystemPrincipal() const {
+    return GetPrincipal()->IsSystemPrincipal();
+  }
+  const mozilla::ipc::PrincipalInfo& GetPrincipalInfo() const {
+    return *mLoadInfo.mPrincipalInfo;
+  }
+
+  const mozilla::ipc::PrincipalInfo& GetPartitionedPrincipalInfo() const {
+    return *mLoadInfo.mPartitionedPrincipalInfo;
+  }
+
+  const mozilla::ipc::PrincipalInfo& GetEffectiveStoragePrincipalInfo() const;
+
+  already_AddRefed<nsIChannel> ForgetWorkerChannel() {
+    AssertIsOnMainThread();
+    return mLoadInfo.mChannel.forget();
+  }
+
+  nsPIDOMWindowInner* GetWindow() const {
+    AssertIsOnMainThread();
+    return mLoadInfo.mWindow;
+  }
+
+  nsPIDOMWindowInner* GetAncestorWindow() const;
+
+  void EvictFromBFCache();
+
+  nsIContentSecurityPolicy* GetCsp() const {
+    AssertIsOnMainThread();
+    return mLoadInfo.mCSP;
+  }
+
+  nsresult SetCsp(nsIContentSecurityPolicy* aCSP);
+
+  nsresult SetCSPFromHeaderValues(const nsACString& aCSPHeaderValue,
+                                  const nsACString& aCSPReportOnlyHeaderValue);
+
+  void StorePolicyContainerArgsOnClient();
+
+  const mozilla::ipc::CSPInfo& GetCSPInfo() const {
+    return mLoadInfo.mCSPContext->CSPInfo();
+  }
+
+  OffThreadCSPContext* GetCSPContext() const {
+    return mLoadInfo.mCSPContext.get();
+  }
+
+  void UpdateReferrerInfoFromHeader(
+      const nsACString& aReferrerPolicyHeaderValue);
+
+  nsIReferrerInfo* GetReferrerInfo() const { return mLoadInfo.mReferrerInfo; }
+
+  ReferrerPolicy GetReferrerPolicy() const {
+    return mLoadInfo.mReferrerInfo->ReferrerPolicy();
+  }
+
+  void SetReferrerInfo(nsIReferrerInfo* aReferrerInfo) {
+    mLoadInfo.mReferrerInfo = aReferrerInfo;
+  }
+
+  bool XHRParamsAllowed() const { return mLoadInfo.mXHRParamsAllowed; }
+
+  void SetXHRParamsAllowed(bool aAllowed) {
+    mLoadInfo.mXHRParamsAllowed = aAllowed;
+  }
+
+  mozilla::StorageAccess StorageAccess() const {
+    AssertIsOnWorkerThread();
+    if (mLoadInfo.mUsingStorageAccess) {
+      return mozilla::StorageAccess::eAllow;
+    }
+
+    return mLoadInfo.mStorageAccess;
+  }
+
+  bool UseRegularPrincipal() const {
+    AssertIsOnWorkerThread();
+    return mLoadInfo.mUseRegularPrincipal;
+  }
+
+  bool UsingStorageAccess() const {
+    AssertIsOnWorkerThread();
+    return mLoadInfo.mUsingStorageAccess;
+  }
+
+  bool SerialAllowed() const {
+    AssertIsOnWorkerThread();
+    return mLoadInfo.mSerialAllowed;
+  }
+
+  nsICookieJarSettings* CookieJarSettings() const {
+    MOZ_ASSERT(mLoadInfo.mCookieJarSettings);
+    return mLoadInfo.mCookieJarSettings;
+  }
+
+  const net::CookieJarSettingsArgs& CookieJarSettingsArgs() const {
+    MOZ_ASSERT(mLoadInfo.mCookieJarSettings);
+    return mLoadInfo.mCookieJarSettingsArgs;
+  }
+
+  const OriginAttributes& GetOriginAttributes() const {
+    return mLoadInfo.mOriginAttributes;
+  }
+
+  bool IsThirdPartyContext() const { return mLoadInfo.mIsThirdPartyContext; }
+
+  bool IsWatchedByDevTools() const { return mLoadInfo.mWatchedByDevTools; }
+
+  const Maybe<RFPTargetSet>& GetOverriddenFingerprintingSettings() const {
+    return mLoadInfo.mOverriddenFingerprintingSettings;
+  }
+
+  bool IsOn3PCBExceptionList() const {
+    return mLoadInfo.mIsOn3PCBExceptionList;
+  }
+
+  const nsString& TimezoneOverride() const {
+    return mLoadInfo.mTimezoneOverride;
+  }
+
+  RemoteWorkerChild* GetRemoteWorkerController();
+
+  void SetRemoteWorkerController(RemoteWorkerChild* aController);
+
+  RefPtr<GenericPromise> SetServiceWorkerSkipWaitingFlag();
+
+  bool Freeze(const nsPIDOMWindowInner* aWindow);
+
+  bool Thaw(const nsPIDOMWindowInner* aWindow);
+
+  void PropagateStorageAccessPermissionGranted();
+
+  void EnableDebugger();
+
+  void DisableDebugger();
+
+  void BindRemoteWorkerDebuggerChild();
+
+  void CreateRemoteDebuggerEndpoints();
+
+  void SetIsRemoteDebuggerRegistered(const bool& aRegistered);
+
+  void SetIsRemoteDebuggerReady(const bool& aReady);
+
+  void EnableRemoteDebugger();
+
+  void DisableRemoteDebugger();
+
+  void DisableRemoteDebuggerOnWorkerThread(const bool& aForShutdown = false);
+
+  bool UseRemoteDebugger() const { return mUseRemoteDebugger; }
+
+  void SetIsQueued(const bool& aQueued);
+
+  bool IsQueued() const;
+
+  void UpdateWindowIDToDebugger(const uint64_t& aWindowID, const bool& aIsAdd);
+
+  already_AddRefed<WorkerRunnable> MaybeWrapAsWorkerRunnable(
+      already_AddRefed<nsIRunnable> aRunnable);
+
+  bool ProxyReleaseMainThreadObjects();
+
+  void SetLowMemoryState(bool aState);
+
+  void GarbageCollect(bool aShrinking);
+
+  void CycleCollect();
+
+  nsresult SetPrincipalsAndCSPOnMainThread(nsIPrincipal* aPrincipal,
+                                           nsIPrincipal* aPartitionedPrincipal,
+                                           nsILoadGroup* aLoadGroup,
+                                           nsIContentSecurityPolicy* aCsp);
+
+  nsresult SetPrincipalsAndCSPFromChannel(nsIChannel* aChannel);
+
+  bool FinalChannelPrincipalIsValid(nsIChannel* aChannel);
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  bool PrincipalURIMatchesScriptURL();
+#endif
+
+  void UpdateOverridenLoadGroup(nsILoadGroup* aBaseLoadGroup);
+
+  void WorkerScriptLoaded();
+
+  Document* GetDocument() const;
+
+  void MemoryPressure();
+
+  void UpdateContextOptions(const JS::ContextOptions& aContextOptions);
+
+  void UpdateTimezoneOverride(const nsAString& aTimezone);
+
+  void UpdateLanguages(const nsTArray<nsString>& aLanguages);
+
+  void UpdateLanguageOverride(const nsACString& aLanguageOverride,
+                              const nsTArray<nsString>& aResolvedLanguages);
+
+  void UpdateJSWorkerMemoryParameter(JSGCParamKey key, Maybe<uint32_t> value);
+
+#ifdef JS_GC_ZEAL
+  void UpdateGCZeal(uint8_t aGCZeal, uint32_t aFrequency);
+#endif
+
+  void OfflineStatusChangeEvent(bool aIsOffline);
+
+  nsresult Dispatch(already_AddRefed<WorkerRunnable> aRunnable,
+                    nsIEventTarget* aSyncLoopTarget = nullptr);
+
+  nsresult DispatchControlRunnable(
+      already_AddRefed<WorkerRunnable> aWorkerRunnable);
+
+  nsresult DispatchDebuggerRunnable(
+      already_AddRefed<WorkerRunnable> aDebuggerRunnable);
+
+  nsresult DispatchToParent(already_AddRefed<WorkerRunnable> aRunnable);
+
+  bool IsOnParentThread() const;
+  void DebuggerInterruptRequest();
+
+#ifdef DEBUG
+  void AssertIsOnParentThread() const;
+
+  void AssertInnerWindowIsCorrect() const;
+#else
+  void AssertIsOnParentThread() const {}
+
+  void AssertInnerWindowIsCorrect() const {}
+#endif
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  bool PrincipalIsValid() const;
+#endif
+
+  void StartCancelingTimer();
+
+  const nsString& Id();
+
+  const nsID& AgentClusterId() const { return mAgentClusterId; }
+
+  bool IsSharedMemoryAllowed() const;
+
+  bool CrossOriginIsolated() const;
+
+  nsILoadInfo::CrossOriginEmbedderPolicy GetEmbedderPolicy() const;
+
+  mozilla::Result<Ok, nsresult> SetEmbedderPolicy(
+      nsILoadInfo::CrossOriginEmbedderPolicy aPolicy);
+
+  void InheritOwnerEmbedderPolicyOrNull(nsIRequest* aRequest);
+
+  bool MatchEmbedderPolicy(
+      nsILoadInfo::CrossOriginEmbedderPolicy aPolicy) const;
+
+  nsILoadInfo::CrossOriginEmbedderPolicy GetOwnerEmbedderPolicy() const;
+
+  void SetCCCollectedAnything(bool collectedAnything);
+  bool isLastCCCollectedAnything();
+
+  uint32_t GetCurrentTimerNestingLevel() const;
+
+  void IncreaseTopLevelWorkerFinishedRunnableCount() {
+    ++mTopLevelWorkerFinishedRunnableCount;
+  }
+  void DecreaseTopLevelWorkerFinishedRunnableCount() {
+    --mTopLevelWorkerFinishedRunnableCount;
+  }
+  void IncreaseWorkerFinishedRunnableCount() { ++mWorkerFinishedRunnableCount; }
+  void DecreaseWorkerFinishedRunnableCount() { --mWorkerFinishedRunnableCount; }
+
+  void JSAsyncTaskStarted(JS::Dispatchable* aDispatchable);
+  void JSAsyncTaskFinished(JS::Dispatchable* aDispatchable);
+
+  void RunShutdownTasks();
+
+  bool CancelBeforeWorkerScopeConstructed() const {
+    auto data = mWorkerThreadAccessible.Access();
+    return data->mCancelBeforeWorkerScopeConstructed;
+  }
+
+  enum class CCFlag : uint8_t {
+    EligibleForWorkerRef,
+    IneligibleForWorkerRef,
+    EligibleForChildWorker,
+    IneligibleForChildWorker,
+    EligibleForTimeout,
+    IneligibleForTimeout,
+    CheckBackgroundActors,
+  };
+
+  void UpdateCCFlag(const CCFlag);
+
+  bool IsEligibleForCC();
+
+  void AdjustNonblockingCCBackgroundActorCount(int32_t aCount);
+
+  RefPtr<WorkerParentRef> GetWorkerParentRef() const;
+
+  bool MayContinueRunning() {
+    AssertIsOnWorkerThread();
+
+    WorkerStatus status;
+    {
+      MutexAutoLock lock(mMutex);
+      status = mStatus;
+    }
+
+    if (status < Canceling) {
+      return true;
+    }
+
+    return false;
+  }
+
+ private:
+  WorkerPrivate(
+      WorkerPrivate* aParent, const nsAString& aScriptURL, bool aIsChromeWorker,
+      WorkerKind aWorkerKind, RequestCredentials aRequestCredentials,
+      enum WorkerType aWorkerType, const nsAString& aWorkerName,
+      const nsACString& aServiceWorkerScope, WorkerLoadInfo& aLoadInfo,
+      nsString&& aId, const nsID& aAgentClusterId,
+      const nsILoadInfo::CrossOriginOpenerPolicy aAgentClusterOpenerPolicy,
+      CancellationCallback&& aCancellationCallback,
+      TerminationCallback&& aTerminationCallback,
+      mozilla::ipc::Endpoint<PRemoteWorkerNonLifeCycleOpControllerChild>&&
+          aChildEp);
+
+  ~WorkerPrivate();
+
+  struct AgentClusterIdAndCoop {
+    nsID mId;
+    nsILoadInfo::CrossOriginOpenerPolicy mCoop;
+  };
+
+  static AgentClusterIdAndCoop ComputeAgentClusterIdAndCoop(
+      WorkerPrivate* aParent, WorkerKind aWorkerKind, WorkerLoadInfo* aLoadInfo,
+      bool aIsChromeWorker);
+
+  void CancelAllTimeouts();
+
+  enum class ProcessAllControlRunnablesResult {
+    Nothing,
+    MayContinue,
+    Abort
+  };
+
+  ProcessAllControlRunnablesResult ProcessAllControlRunnables() {
+    MutexAutoLock lock(mMutex);
+    return ProcessAllControlRunnablesLocked();
+  }
+
+  ProcessAllControlRunnablesResult ProcessAllControlRunnablesLocked()
+      MOZ_REQUIRES(mMutex);
+
+  void EnableMemoryReporter();
+
+  void DisableMemoryReporter();
+
+  void WaitForWorkerEvents() MOZ_REQUIRES(mMutex);
+
+  already_AddRefed<nsISerialEventTarget> CreateNewSyncLoop(
+      WorkerStatus aFailStatus);
+
+  nsresult RunCurrentSyncLoop();
+
+  nsresult DestroySyncLoop(uint32_t aLoopIndex);
+
+  void InitializeGCTimers();
+
+  enum GCTimerMode { PeriodicTimer = 0, IdleTimer, NoTimer };
+
+  void SetGCTimerMode(GCTimerMode aMode);
+
+ public:
+  void CancelGCTimers() { SetGCTimerMode(NoTimer); }
+
+  void InitializeGlobalReportingEndpoints();
+
+  void SetReportingEndpointsHeader(const nsACString& aHeader);
+
+ private:
+  void ShutdownGCTimers();
+
+  friend class WorkerRef;
+
+  bool AddWorkerRef(WorkerRef* aWorkerRefer, WorkerStatus aFailStatus);
+
+  void RemoveWorkerRef(WorkerRef* aWorkerRef);
+
+  void NotifyWorkerRefs(WorkerStatus aStatus);
+
+  bool HasActiveWorkerRefs();
+
+  friend class WorkerEventTarget;
+
+  nsresult RegisterShutdownTask(nsITargetShutdownTask* aTask);
+
+  nsresult UnregisterShutdownTask(nsITargetShutdownTask* aTask);
+
+  nsresult RegisterDebuggerShutdownTask(nsITargetShutdownTask* aTask);
+
+  nsresult UnregisterDebuggerShutdownTask(nsITargetShutdownTask* aTask);
+
+  nsresult DispatchLockHeld(already_AddRefed<WorkerRunnable> aRunnable,
+                            nsIEventTarget* aSyncLoopTarget,
+                            const MutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(mMutex);
+
+  void DispatchCancelingRunnable();
+
+  UniquePtr<ClientSource> CreateClientSource();
+
+  void EnsureOwnerEmbedderPolicy();
+
+  class EventTarget;
+  friend class EventTarget;
+  friend class AutoSyncLoopHolder;
+
+  class MemoryReporter;
+  friend class MemoryReporter;
+
+  friend class mozilla::dom::WorkerThread;
+
+  SharedMutex mMutex;
+  mozilla::CondVar mCondVar MOZ_GUARDED_BY(mMutex);
+
+  MOZ_NON_OWNING_REF WorkerPrivate* const mParent;
+
+  const nsString mScriptURL;
+
+  const nsString mWorkerName;
+  const RequestCredentials mCredentialsMode;
+  enum WorkerType mWorkerType;
+
+  const WorkerKind mWorkerKind;
+
+  RefPtr<Worker> mParentEventTargetRef;
+  RefPtr<WorkerPrivate> mSelfRef;
+
+  CancellationCallback mCancellationCallback;
+
+  TerminationCallback mTerminationCallback;
+
+  WorkerLoadInfo mLoadInfo;
+  LocationInfo mLocationInfo;
+
+  workerinternals::JSSettings mJSSettings MOZ_GUARDED_BY(mMutex);
+
+  WorkerDebugger* mDebugger;
+
+  workerinternals::Queue<WorkerRunnable*, 4> mControlQueue;
+  workerinternals::Queue<WorkerRunnable*, 4> mDebuggerQueue
+      MOZ_GUARDED_BY(mMutex);
+
+  uint32_t mDispatchingControlRunnables MOZ_GUARDED_BY(mMutex);
+
+  JSContext* mJSContext MOZ_GUARDED_BY(mMutex);
+  RefPtr<WorkerThread> mThread MOZ_GUARDED_BY(mMutex);
+  PRThread* mPRThread;
+
+  RefPtr<ThrottledEventQueue> mMainThreadEventTargetForMessaging;
+  RefPtr<ThrottledEventQueue> mMainThreadEventTarget;
+
+  RefPtr<WorkerEventTarget> mWorkerControlEventTarget;
+  RefPtr<WorkerEventTarget> mWorkerHybridEventTarget;
+
+  RefPtr<ThrottledEventQueue> mMainThreadDebuggeeEventTarget;
+
+  struct SyncLoopInfo {
+    explicit SyncLoopInfo(EventTarget* aEventTarget);
+
+    RefPtr<EventTarget> mEventTarget;
+    nsresult mResult;
+    bool mCompleted;
+#ifdef DEBUG
+    bool mHasRun;
+#endif
+  };
+
+  nsTArray<UniquePtr<SyncLoopInfo>> mSyncLoopStack;
+
+  nsCOMPtr<nsITimer> mCancelingTimer;
+
+  nsCOMPtr<nsIRunnable> mLoadFailedRunnable;
+
+  RefPtr<PerformanceStorage> mPerformanceStorage;
+
+  RefPtr<WorkerCSPEventListener> mCSPEventListener;
+
+  nsTArray<RefPtr<WorkerThreadRunnable>> mPreStartRunnables
+      MOZ_GUARDED_BY(mMutex);
+
+  RefPtr<RemoteWorkerChild> mRemoteWorkerController;
+
+  RefPtr<RemoteWorkerNonLifeCycleOpControllerChild>
+      mRemoteWorkerNonLifeCycleOpController;
+
+  mozilla::ipc::Endpoint<PRemoteWorkerNonLifeCycleOpControllerChild> mChildEp;
+
+  RefPtr<RemoteWorkerDebuggerChild> mRemoteDebugger;
+  mozilla::ipc::Endpoint<PRemoteWorkerDebuggerChild> mDebuggerChildEp;
+  mozilla::ipc::Endpoint<PRemoteWorkerDebuggerParent> mDebuggerParentEp;
+  bool mRemoteDebuggerRegistered MOZ_GUARDED_BY(mMutex);
+  bool mRemoteDebuggerReady MOZ_GUARDED_BY(mMutex);
+  bool mIsQueued;  
+  const bool mUseRemoteDebugger;
+  mozilla::CondVar mDebuggerBindingCondVar MOZ_GUARDED_BY(mMutex);
+  RefPtr<WorkerEventTarget> mWorkerDebuggerEventTarget;
+
+  JS::UniqueChars mDefaultLocale;  
+  TimeStamp mKillTime;
+  WorkerStatus mParentStatus MOZ_GUARDED_BY(mMutex);
+  WorkerStatus mStatus MOZ_GUARDED_BY(mMutex);
+
+  TimeStamp mCreationTimeStamp;
+  DOMHighResTimeStamp mCreationTimeHighRes;
+
+  const nsID mAgentClusterId;
+
+  struct WorkerThreadAccessible {
+    explicit WorkerThreadAccessible(WorkerPrivate* aParent);
+
+    RefPtr<WorkerGlobalScope> mScope;
+    RefPtr<WorkerDebuggerGlobalScope> mDebuggerScope;
+    nsTArray<WorkerPrivate*> mChildWorkers;
+    nsTObserverArray<WorkerRef*> mWorkerRefs;
+
+    nsCOMPtr<nsITimer> mPeriodicGCTimer;
+    nsCOMPtr<nsITimer> mIdleGCTimer;
+
+    RefPtr<MemoryReporter> mMemoryReporter;
+
+    nsCOMPtr<nsIGlobalObject> mCurrentEventLoopGlobal;
+
+    nsCOMPtr<nsITimer> mTSTimer;
+
+    RefPtr<JSExecutionManager> mExecutionManager;
+
+    nsTArray<AutoYieldJSThreadExecution> mYieldJSThreadExecution;
+
+    uint32_t mNumWorkerRefsPreventingShutdownStart;
+    uint32_t mDebuggerEventLoopLevel;
+
+    uint32_t mNonblockingCCBackgroundActorCount;
+
+    uint32_t mErrorHandlerRecursionCount;
+
+    bool mFrozen;
+
+    bool mDebuggerInterruptRequested;
+
+    bool mRunningExpiredTimeouts;
+    bool mPeriodicGCTimerRunning;
+    bool mIdleGCTimerRunning;
+    bool mOnLine;
+    bool mJSThreadExecutionGranted;
+    bool mCCCollectedAnything;
+    FlippedOnce<false> mDeletionScheduled;
+    FlippedOnce<false> mCancelBeforeWorkerScopeConstructed;
+    FlippedOnce<false> mPerformedShutdownAfterLastContentTaskExecuted;
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+    bool mIsPotentiallyLastGCCCRunning = false;
+#endif
+  };
+  ThreadBound<WorkerThreadAccessible> mWorkerThreadAccessible;
+
+  class MOZ_RAII AutoPushEventLoopGlobal {
+   public:
+    AutoPushEventLoopGlobal(WorkerPrivate* aWorkerPrivate, JSContext* aCx);
+    ~AutoPushEventLoopGlobal();
+
+   private:
+    nsCOMPtr<nsIGlobalObject> mOldEventLoopGlobal;
+
+#ifdef DEBUG
+    nsCOMPtr<nsIGlobalObject> mNewEventLoopGlobal;
+#endif
+  };
+  friend class AutoPushEventLoopGlobal;
+
+  uint32_t mPostSyncLoopOperations;
+
+  enum {
+    eDispatchCancelingRunnable = 0x02,
+  };
+
+  bool mParentWindowPaused;
+
+  bool mWorkerScriptExecutedSuccessfully;
+  bool mFetchHandlerWasAdded;
+  bool mMainThreadObjectsForgotten;
+  bool mIsChromeWorker;
+  bool mParentFrozen;
+
+  nsCOMPtr<nsITimer> mDebuggerInterruptTimer MOZ_GUARDED_BY(mMutex);
+
+  const bool mIsSecureContext;
+
+  bool mDebuggerRegistered MOZ_GUARDED_BY(mMutex);
+  mozilla::Atomic<bool> mIsInBackground;
+  bool mIsPlayingAudio{};
+  bool mDebuggerReady;
+  nsTArray<RefPtr<WorkerRunnable>> mDelayedDebuggeeRunnables;
+
+  nsString mId;
+
+  const nsILoadInfo::CrossOriginOpenerPolicy mAgentClusterOpenerPolicy;
+
+  Maybe<nsILoadInfo::CrossOriginEmbedderPolicy> mEmbedderPolicy;
+  Maybe<nsILoadInfo::CrossOriginEmbedderPolicy> mOwnerEmbedderPolicy;
+
+  Atomic<uint32_t> mTopLevelWorkerFinishedRunnableCount;
+  Atomic<uint32_t> mWorkerFinishedRunnableCount;
+
+  HashMap<JS::Dispatchable*, RefPtr<StrongWorkerRef>> mPendingJSAsyncTasks;
+
+  TargetShutdownTaskSet mShutdownTasks MOZ_GUARDED_BY(mMutex);
+  TargetShutdownTaskSet mDebuggerShutdownTasks MOZ_GUARDED_BY(mMutex);
+  bool mShutdownTasksRun MOZ_GUARDED_BY(mMutex) = false;
+
+  bool mCCFlagSaysEligible MOZ_GUARDED_BY(mMutex){true};
+
+  bool mWorkerLoopIsIdle MOZ_GUARDED_BY(mMutex){false};
+
+  RefPtr<WorkerParentRef> mParentRef;
+
+  FontVisibility mFontVisibility;
+};
+
+class AutoSyncLoopHolder {
+  RefPtr<StrongWorkerRef> mWorkerRef;
+  nsCOMPtr<nsISerialEventTarget> mTarget;
+  uint32_t mIndex;
+
+ public:
+  AutoSyncLoopHolder(WorkerPrivate* aWorkerPrivate, WorkerStatus aFailStatus,
+                     const char* const aName = "AutoSyncLoopHolder");
+
+  ~AutoSyncLoopHolder();
+
+  nsresult Run();
+
+  nsISerialEventTarget* GetSerialEventTarget() const;
+};
+
+class WorkerParentRef final {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(WorkerParentRef);
+
+  explicit WorkerParentRef(RefPtr<WorkerPrivate>& aWorkerPrivate);
+
+  const RefPtr<WorkerPrivate>& Private() const;
+
+  void DropWorkerPrivate();
+
+ private:
+  ~WorkerParentRef();
+
+  RefPtr<WorkerPrivate> mWorkerPrivate;
+};
+
+}  
+}  
+
+#endif /* mozilla_dom_workers_workerprivate_h_ */

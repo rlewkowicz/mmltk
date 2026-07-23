@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_ExpressionStatementEmitter_h
+#define frontend_ExpressionStatementEmitter_h
+
+#include "mozilla/Attributes.h"
+
+#include <stdint.h>
+
+#include "frontend/ValueUsage.h"
+
+namespace js {
+namespace frontend {
+
+struct BytecodeEmitter;
+
+class MOZ_STACK_CLASS ExpressionStatementEmitter {
+  BytecodeEmitter* bce_;
+
+#ifdef DEBUG
+  int32_t depth_ = 0;
+#endif
+
+  ValueUsage valueUsage_;
+
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    Expr,
+
+    End
+  };
+  State state_ = State::Start;
+#endif
+
+ public:
+  ExpressionStatementEmitter(BytecodeEmitter* bce, ValueUsage valueUsage);
+
+  [[nodiscard]] bool prepareForExpr(uint32_t beginPos);
+  [[nodiscard]] bool emitEnd();
+};
+
+}  
+}  
+
+#endif /* frontend_ExpressionStatementEmitter_h */

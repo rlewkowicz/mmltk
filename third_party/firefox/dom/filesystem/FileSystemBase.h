@@ -1,0 +1,61 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_FileSystemBase_h
+#define mozilla_dom_FileSystemBase_h
+
+#include "Directory.h"
+#include "nsString.h"
+
+namespace mozilla::dom {
+
+class BlobImpl;
+
+class FileSystemBase {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(FileSystemBase)
+
+  FileSystemBase();
+
+  virtual void Shutdown();
+
+  virtual void SerializeDOMPath(nsAString& aOutput) const = 0;
+
+  virtual already_AddRefed<FileSystemBase> Clone() = 0;
+
+  virtual bool ShouldCreateDirectory() = 0;
+
+  virtual nsIGlobalObject* GetParentObject() const;
+
+  virtual void GetDirectoryName(nsIFile* aFile, nsAString& aRetval,
+                                ErrorResult& aRv) const;
+
+  void GetDOMPath(nsIFile* aFile, nsAString& aRetval, ErrorResult& aRv) const;
+
+  const nsAString& LocalRootPath() const { return mLocalRootPath; }
+
+  bool IsShutdown() const { return mShutdown; }
+
+  virtual bool IsSafeFile(nsIFile* aFile) const;
+
+  virtual bool IsSafeDirectory(Directory* aDir) const;
+
+  bool GetRealPath(BlobImpl* aFile, nsIFile** aPath) const;
+
+  virtual void Unlink() {}
+  virtual void Traverse(nsCycleCollectionTraversalCallback& cb) {}
+
+  void AssertIsOnOwningThread() const;
+
+ protected:
+  virtual ~FileSystemBase();
+
+  nsString mLocalRootPath;
+
+  bool mShutdown;
+};
+
+}  
+
+#endif  // mozilla_dom_FileSystemBase_h

@@ -1,0 +1,352 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "AnimationFrameBuffer.h"
+
+#include <utility>  // for Move
+
+namespace mozilla {
+namespace image {
+
+AnimationFrameRetainedBuffer::AnimationFrameRetainedBuffer(size_t aThreshold,
+                                                           size_t aBatch,
+                                                           size_t aStartFrame)
+    : AnimationFrameBuffer(aBatch, aStartFrame), mThreshold(aThreshold) {
+  size_t minThreshold = 2 * mBatch + 1;
+  if (mThreshold < minThreshold) {
+    mThreshold = minThreshold;
+  }
+
+  mPending = mBatch * 2;
+}
+
+bool AnimationFrameRetainedBuffer::InsertInternal(RefPtr<imgFrame>&& aFrame) {
+  MOZ_ASSERT(!mSizeKnown);
+  MOZ_ASSERT(mFrames.Length() < mThreshold);
+
+  ++mSize;
+  mFrames.AppendElement(std::move(aFrame));
+  MOZ_ASSERT(mSize == mFrames.Length());
+  return mSize < mThreshold;
+}
+
+bool AnimationFrameRetainedBuffer::ResetInternal() {
+  if (mPending > 1 && mSize >= mBatch * 2 + 1) {
+    MOZ_ASSERT(!mSizeKnown);
+    mPending = 1;
+  }
+
+  return false;
+}
+
+bool AnimationFrameRetainedBuffer::MarkComplete(
+    const gfx::IntRect& aFirstFrameRefreshArea) {
+  MOZ_ASSERT(!mSizeKnown);
+  mFirstFrameRefreshArea = aFirstFrameRefreshArea;
+  mSizeKnown = true;
+  mPending = 0;
+  mFrames.Compact();
+  return false;
+}
+
+void AnimationFrameRetainedBuffer::AdvanceInternal() {
+  MOZ_ASSERT(!mFrames.IsEmpty());
+  size_t framesLength = mFrames.Length();
+  MOZ_ASSERT(mGetIndex < framesLength);
+  MOZ_ASSERT_IF(mGetIndex > 0, mFrames[mGetIndex - 1]);
+  MOZ_ASSERT_IF(mGetIndex == 0, mFrames[framesLength - 1]);
+  MOZ_ASSERT(mFrames[mGetIndex]);
+
+  if (!mSizeKnown) {
+    size_t buffered = mPending + framesLength - mGetIndex - 1;
+    if (buffered < mBatch) {
+      mPending += mBatch;
+    }
+  }
+}
+
+imgFrame* AnimationFrameRetainedBuffer::Get(size_t aFrame, bool aForDisplay) {
+  if (mFrames.IsEmpty()) {
+    MOZ_ASSERT_UNREACHABLE("Calling Get() when we have no frames");
+    return nullptr;
+  }
+
+  if (aFrame >= mFrames.Length()) {
+    return nullptr;
+  }
+
+  if (!mFrames[aFrame]) {
+    MOZ_ASSERT_UNREACHABLE("Calling Get() when frame is unavailable");
+    return nullptr;
+  }
+
+  MOZ_ASSERT(aFrame == 0 || mAdvance == 0);
+  return mFrames[aFrame].get();
+}
+
+bool AnimationFrameRetainedBuffer::IsFirstFrameFinished() const {
+  return !mFrames.IsEmpty() && mFrames[0]->IsFinished();
+}
+
+bool AnimationFrameRetainedBuffer::IsLastInsertedFrame(imgFrame* aFrame) const {
+  return !mFrames.IsEmpty() && mFrames.LastElement().get() == aFrame;
+}
+
+void AnimationFrameRetainedBuffer::AddSizeOfExcludingThis(
+    MallocSizeOf aMallocSizeOf, const AddSizeOfCb& aCallback) {
+  size_t i = 0;
+  for (const RefPtr<imgFrame>& frame : mFrames) {
+    ++i;
+    frame->AddSizeOfExcludingThis(aMallocSizeOf,
+                                  [&](AddSizeOfCbData& aMetadata) {
+                                    aMetadata.mIndex = i;
+                                    aCallback(aMetadata);
+                                  });
+  }
+}
+
+AnimationFrameDiscardingQueue::AnimationFrameDiscardingQueue(
+    AnimationFrameRetainedBuffer&& aQueue)
+    : AnimationFrameBuffer(aQueue),
+      mInsertIndex(aQueue.mFrames.Length()),
+      mFirstFrame(aQueue.mFrames[0]) {
+  MOZ_ASSERT(!mSizeKnown);
+  MOZ_ASSERT(!mRedecodeError);
+  MOZ_ASSERT(mInsertIndex > 0);
+  mMayDiscard = true;
+
+  for (size_t i = mGetIndex; i < mInsertIndex; ++i) {
+    MOZ_ASSERT(aQueue.mFrames[i]);
+    mDisplay.push_back(std::move(aQueue.mFrames[i]));
+  }
+}
+
+bool AnimationFrameDiscardingQueue::InsertInternal(RefPtr<imgFrame>&& aFrame) {
+  if (mInsertIndex == mSize) {
+    if (mSizeKnown) {
+      mRedecodeError = true;
+      mPending = 0;
+      return true;
+    }
+    ++mSize;
+  }
+
+  mDisplay.push_back(std::move(aFrame));
+  ++mInsertIndex;
+  MOZ_ASSERT(mInsertIndex <= mSize);
+  return true;
+}
+
+bool AnimationFrameDiscardingQueue::ResetInternal() {
+  mDisplay.clear();
+  mInsertIndex = 0;
+
+  bool restartDecoder = mPending == 0;
+  mPending = 2 * mBatch;
+  return restartDecoder;
+}
+
+bool AnimationFrameDiscardingQueue::MarkComplete(
+    const gfx::IntRect& aFirstFrameRefreshArea) {
+  if (NS_WARN_IF(mInsertIndex != mSize)) {
+    mRedecodeError = true;
+    mPending = 0;
+  }
+
+  mFirstFrameRefreshArea =
+      mRedecodeError ? mFirstFrame->GetRect() : aFirstFrameRefreshArea;
+
+  mInsertIndex = 0;
+  mSizeKnown = true;
+
+  MOZ_ASSERT(mAdvance == 0);
+  return mPending > 0;
+}
+
+void AnimationFrameDiscardingQueue::AdvanceInternal() {
+  MOZ_ASSERT(mGetIndex < mSize);
+
+  MOZ_ASSERT(!mDisplay.empty());
+  MOZ_ASSERT(mDisplay.front());
+  mDisplay.pop_front();
+  MOZ_ASSERT(!mDisplay.empty());
+  MOZ_ASSERT(mDisplay.front());
+
+  if (mDisplay.size() + mPending - 1 < mBatch) {
+    mPending += mBatch;
+  }
+}
+
+imgFrame* AnimationFrameDiscardingQueue::Get(size_t aFrame, bool aForDisplay) {
+  if (aForDisplay && aFrame == 0) {
+    return mFirstFrame.get();
+  }
+
+  if (aFrame >= mSize) {
+    return nullptr;
+  }
+
+  size_t offset;
+  if (aFrame >= mGetIndex) {
+    offset = aFrame - mGetIndex;
+  } else if (!mSizeKnown) {
+    MOZ_ASSERT_UNREACHABLE("Requesting previous frame after we have advanced!");
+    return nullptr;
+  } else {
+    offset = mSize - mGetIndex + aFrame;
+  }
+
+  if (offset >= mDisplay.size()) {
+    return nullptr;
+  }
+
+  MOZ_ASSERT(aFrame == 0 || mAdvance == 0);
+
+  MOZ_ASSERT(mDisplay[offset]);
+  return mDisplay[offset].get();
+}
+
+bool AnimationFrameDiscardingQueue::IsFirstFrameFinished() const {
+  MOZ_ASSERT(mFirstFrame);
+  MOZ_ASSERT(mFirstFrame->IsFinished());
+  return true;
+}
+
+bool AnimationFrameDiscardingQueue::IsLastInsertedFrame(
+    imgFrame* aFrame) const {
+  return !mDisplay.empty() && mDisplay.back().get() == aFrame;
+}
+
+void AnimationFrameDiscardingQueue::AddSizeOfExcludingThis(
+    MallocSizeOf aMallocSizeOf, const AddSizeOfCb& aCallback) {
+  mFirstFrame->AddSizeOfExcludingThis(aMallocSizeOf,
+                                      [&](AddSizeOfCbData& aMetadata) {
+                                        aMetadata.mIndex = 1;
+                                        aCallback(aMetadata);
+                                      });
+
+  size_t i = mGetIndex;
+  for (const RefPtr<imgFrame>& frame : mDisplay) {
+    ++i;
+    if (mSize < i) {
+      i = 1;
+      if (mFirstFrame.get() == frame.get()) {
+        continue;
+      }
+    }
+
+    frame->AddSizeOfExcludingThis(aMallocSizeOf,
+                                  [&](AddSizeOfCbData& aMetadata) {
+                                    aMetadata.mIndex = i;
+                                    aCallback(aMetadata);
+                                  });
+  }
+}
+
+AnimationFrameRecyclingQueue::AnimationFrameRecyclingQueue(
+    AnimationFrameRetainedBuffer&& aQueue)
+    : AnimationFrameDiscardingQueue(std::move(aQueue)),
+      mForceUseFirstFrameRefreshArea(false) {
+  mRecycling = true;
+
+  mFirstFrameRefreshArea = mFirstFrame->GetRect();
+}
+
+void AnimationFrameRecyclingQueue::AddSizeOfExcludingThis(
+    MallocSizeOf aMallocSizeOf, const AddSizeOfCb& aCallback) {
+  AnimationFrameDiscardingQueue::AddSizeOfExcludingThis(aMallocSizeOf,
+                                                        aCallback);
+
+  for (const RecycleEntry& entry : mRecycle) {
+    if (entry.mFrame) {
+      entry.mFrame->AddSizeOfExcludingThis(
+          aMallocSizeOf, [&](AddSizeOfCbData& aMetadata) {
+            aMetadata.mIndex = 0;  
+            aCallback(aMetadata);
+          });
+    }
+  }
+}
+
+void AnimationFrameRecyclingQueue::AdvanceInternal() {
+  MOZ_ASSERT(mGetIndex < mSize);
+
+  MOZ_ASSERT(!mDisplay.empty());
+  MOZ_ASSERT(mDisplay.front());
+
+  if (mGetIndex == 1) {
+    mForceUseFirstFrameRefreshArea = false;
+  }
+
+  RefPtr<imgFrame>& front = mDisplay.front();
+  RecycleEntry newEntry(mForceUseFirstFrameRefreshArea ? mFirstFrameRefreshArea
+                                                       : front->GetDirtyRect());
+
+  newEntry.mFrame = std::move(front);
+
+  mRecycle.push_back(std::move(newEntry));
+  mDisplay.pop_front();
+  MOZ_ASSERT(!mDisplay.empty());
+  MOZ_ASSERT(mDisplay.front());
+
+  if (mDisplay.size() + mPending - 1 < mBatch) {
+    size_t newPending = std::min(mPending + mBatch, mRecycle.size() - 1);
+    if (newPending == 0 && (mDisplay.size() <= 1 || mPending > 0)) {
+      newPending = 1;
+    }
+    mPending = newPending;
+  }
+}
+
+bool AnimationFrameRecyclingQueue::ResetInternal() {
+  for (RefPtr<imgFrame>& frame : mDisplay) {
+    RecycleEntry newEntry(mFirstFrameRefreshArea);
+    newEntry.mFrame = std::move(frame);
+    mRecycle.push_back(std::move(newEntry));
+  }
+
+  return AnimationFrameDiscardingQueue::ResetInternal();
+}
+
+RawAccessFrameRef AnimationFrameRecyclingQueue::RecycleFrame(
+    gfx::IntRect& aRecycleRect) {
+  if (mInsertIndex == 0) {
+    for (RecycleEntry& entry : mRecycle) {
+      entry.mDirtyRect = mFirstFrameRefreshArea;
+    }
+    mForceUseFirstFrameRefreshArea = true;
+  }
+
+  if (mRecycle.empty()) {
+    return RawAccessFrameRef();
+  }
+
+  RawAccessFrameRef recycledFrame;
+  if (mRecycle.front().mFrame) {
+    recycledFrame = mRecycle.front().mFrame->RawAccessRef(
+        gfx::DataSourceSurface::READ_WRITE);
+    mRecycle.pop_front();
+
+    if (recycledFrame) {
+      if (mForceUseFirstFrameRefreshArea) {
+        aRecycleRect = mFirstFrameRefreshArea;
+      } else {
+        aRecycleRect.SetRect(0, 0, 0, 0);
+        for (const RefPtr<imgFrame>& frame : mDisplay) {
+          aRecycleRect = aRecycleRect.Union(frame->GetDirtyRect());
+        }
+        for (const RecycleEntry& entry : mRecycle) {
+          aRecycleRect = aRecycleRect.Union(entry.mDirtyRect);
+        }
+      }
+    }
+  } else {
+    mRecycle.pop_front();
+  }
+
+  return recycledFrame;
+}
+
+}  
+}  

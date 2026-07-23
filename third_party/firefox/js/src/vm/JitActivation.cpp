@@ -1,0 +1,246 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "vm/JitActivation.h"
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT, MOZ_RELEASE_ASSERT
+
+#include <stddef.h>  // size_t
+#include <stdint.h>  // uint8_t, uint32_t
+#include <utility>   // std::move
+
+#include "debugger/DebugAPI.h"        // js::DebugAPI
+#include "jit/Invalidation.h"         // js::jit::Invalidate
+#include "jit/JSJitFrameIter.h"       // js::jit::InlineFrameIterator
+#include "jit/RematerializedFrame.h"  // js::jit::RematerializedFrame
+#include "js/AllocPolicy.h"           // js::ReportOutOfMemory
+#include "vm/EnvironmentObject.h"     // js::DebugEnvironments
+#include "vm/JSContext.h"             // JSContext
+#include "vm/Realm.h"                 // js::AutoRealmUnchecked
+#include "wasm/WasmCode.h"            // js::wasm::Code
+#include "wasm/WasmConstants.h"       // js::wasm::Trap
+#include "wasm/WasmFrameIter.h"  // js::wasm::{RegisterState,StartUnwinding,UnwindState}
+#include "wasm/WasmInstance.h"  // js::wasm::Instance
+#include "wasm/WasmProcess.h"   // js::wasm::LookupCode
+
+#include "vm/Realm-inl.h"  // js::~AutoRealm
+
+class JS_PUBLIC_API JSTracer;
+
+js::jit::JitActivation::JitActivation(JSContext* cx)
+    : Activation(cx, Jit),
+      packedExitFP_(nullptr),
+      encodedWasmExitReason_(0),
+      prevJitActivation_(cx->jitActivation),
+      ionRecovery_(cx),
+      bailoutData_(nullptr),
+      lastProfilingFrame_(nullptr),
+      lastProfilingCallSite_(nullptr) {
+  cx->jitActivation = this;
+  registerProfiling();
+}
+
+js::jit::JitActivation::~JitActivation() {
+  if (isProfiling()) {
+    unregisterProfiling();
+  }
+  cx_->jitActivation = prevJitActivation_;
+
+  MOZ_ASSERT(ionRecovery_.empty());
+
+  MOZ_ASSERT(!bailoutData_);
+
+  MOZ_ASSERT(!isWasmTrapping());
+
+  MOZ_ASSERT_IF(rematerializedFrames_, rematerializedFrames_->empty());
+}
+
+void js::jit::JitActivation::trace(JSTracer* trc) {
+  traceCommon(trc);
+
+  TraceJitFrames(trc, this);
+
+  if (rematerializedFrames_) {
+    for (auto iter = rematerializedFrames_->iter(); !iter.done(); iter.next()) {
+      iter.get().value().trace(trc);
+    }
+  }
+
+  for (RInstructionResults* it = ionRecovery_.begin(); it != ionRecovery_.end();
+       it++) {
+    it->trace(trc);
+  }
+}
+
+void js::jit::JitActivation::setBailoutData(
+    jit::BailoutFrameInfo* bailoutData) {
+  MOZ_ASSERT(!bailoutData_);
+  bailoutData_ = bailoutData;
+}
+
+void js::jit::JitActivation::cleanBailoutData() {
+  MOZ_ASSERT(bailoutData_);
+  bailoutData_ = nullptr;
+}
+
+void js::jit::JitActivation::removeRematerializedFrame(uint8_t* top) {
+  if (!rematerializedFrames_) {
+    return;
+  }
+
+  if (RematerializedFrameTable::Ptr p = rematerializedFrames_->lookup(top)) {
+    rematerializedFrames_->remove(p);
+  }
+}
+
+js::jit::RematerializedFrame* js::jit::JitActivation::getRematerializedFrame(
+    JSContext* cx, const JSJitFrameIter& iter, size_t inlineDepth,
+    IsLeavingFrame leaving) {
+  MOZ_ASSERT(iter.activation() == this);
+  MOZ_ASSERT(iter.isIonScripted());
+
+  if (!rematerializedFrames_) {
+    rematerializedFrames_ = cx->make_unique<RematerializedFrameTable>(cx);
+    if (!rematerializedFrames_) {
+      return nullptr;
+    }
+  }
+
+  uint8_t* top = iter.fp();
+  RematerializedFrameTable::AddPtr p = rematerializedFrames_->lookupForAdd(top);
+  if (!p) {
+    RematerializedFrameVector frames(cx);
+
+    InlineFrameIterator inlineIter(cx, &iter);
+
+    MaybeReadFallback::FallbackConsequence consequence =
+        MaybeReadFallback::Fallback_Invalidate;
+    if (leaving == IsLeavingFrame::Yes) {
+      consequence = MaybeReadFallback::Fallback_DoNothing;
+    }
+    MaybeReadFallback recover(cx, this, &iter, consequence);
+
+    AutoRealmUnchecked ar(cx, iter.script()->realm());
+
+    if (leaving == IsLeavingFrame::No && !iter.checkInvalidation()) {
+      jit::Invalidate(cx, iter.script());
+    }
+
+    if (!RematerializedFrame::RematerializeInlineFrames(cx, top, inlineIter,
+                                                        recover, frames)) {
+      return nullptr;
+    }
+
+    if (!rematerializedFrames_->add(p, top, std::move(frames))) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+
+    DebugEnvironments::unsetPrevUpToDateUntil(cx,
+                                              p->value()[inlineDepth].get());
+  }
+
+  return p->value()[inlineDepth].get();
+}
+
+js::jit::RematerializedFrame* js::jit::JitActivation::lookupRematerializedFrame(
+    uint8_t* top, size_t inlineDepth) {
+  if (!rematerializedFrames_) {
+    return nullptr;
+  }
+  if (RematerializedFrameTable::Ptr p = rematerializedFrames_->lookup(top)) {
+    return inlineDepth < p->value().length() ? p->value()[inlineDepth].get()
+                                             : nullptr;
+  }
+  return nullptr;
+}
+
+void js::jit::JitActivation::removeRematerializedFramesFromDebugger(
+    JSContext* cx, uint8_t* top) {
+  if (!cx->realm()->isDebuggee() || !rematerializedFrames_) {
+    return;
+  }
+  if (RematerializedFrameTable::Ptr p = rematerializedFrames_->lookup(top)) {
+    for (uint32_t i = 0; i < p->value().length(); i++) {
+      DebugAPI::handleUnrecoverableIonBailoutError(cx, p->value()[i].get());
+    }
+    rematerializedFrames_->remove(p);
+  }
+}
+
+bool js::jit::JitActivation::registerIonFrameRecovery(
+    RInstructionResults&& results) {
+  MOZ_ASSERT(!maybeIonFrameRecovery(results.frame()));
+  if (!ionRecovery_.append(std::move(results))) {
+    return false;
+  }
+
+  return true;
+}
+
+js::jit::RInstructionResults* js::jit::JitActivation::maybeIonFrameRecovery(
+    JitFrameLayout* fp) {
+  for (RInstructionResults* it = ionRecovery_.begin(); it != ionRecovery_.end();
+       it++) {
+    if (it->frame() == fp) {
+      return it;
+    }
+  }
+
+  return nullptr;
+}
+
+void js::jit::JitActivation::removeIonFrameRecovery(JitFrameLayout* fp) {
+  RInstructionResults* elem = maybeIonFrameRecovery(fp);
+  if (!elem) {
+    return;
+  }
+
+  ionRecovery_.erase(elem);
+}
+
+void js::jit::JitActivation::startWasmTrap(wasm::Trap trap,
+                                           const wasm::TrapSite& trapSite,
+                                           const wasm::RegisterState& state) {
+  MOZ_ASSERT(!isWasmTrapping());
+
+  bool unwound;
+  wasm::UnwindState unwindState;
+  MOZ_RELEASE_ASSERT(wasm::StartUnwinding(state, &unwindState, &unwound));
+  MOZ_ASSERT_IF(unwound, trap == wasm::Trap::IndirectCallBadSig);
+
+  void* pc = unwindState.pc;
+  const wasm::Frame* fp = wasm::Frame::fromUntaggedWasmExitFP(unwindState.fp);
+
+  const wasm::Code& code = wasm::GetNearestEffectiveInstance(fp)->code();
+  MOZ_RELEASE_ASSERT(&code == wasm::LookupCode(pc));
+
+  setWasmExitFP(fp);
+  wasmTrapData_.emplace();
+  wasmTrapData_->resumePC =
+      ((uint8_t*)state.pc) + jit::WasmTrapInstructionLength;
+  wasmTrapData_->unwoundPC = pc;
+  wasmTrapData_->trap = trap;
+  if (unwound) {
+    wasm::CallSite site;
+    MOZ_ALWAYS_TRUE(code.lookupCallSite(pc, &site));
+    wasmTrapData_->trapSite.bytecodeOffset =
+        wasm::BytecodeOffset(site.bytecodeOffset());
+    wasmTrapData_->trapSite.inlinedCallerOffsets = site.inlinedCallerOffsets();
+  } else {
+    wasmTrapData_->trapSite = trapSite;
+  }
+  wasmTrapData_->failedUnwindSignatureMismatch =
+      !unwound && trap == wasm::Trap::IndirectCallBadSig;
+
+  MOZ_ASSERT(isWasmTrapping());
+}
+
+void js::jit::JitActivation::finishWasmTrap() {
+  MOZ_ASSERT(hasWasmExitFP());
+  MOZ_ASSERT(isWasmTrapping());
+  wasmTrapData_.reset();
+  packedExitFP_ = nullptr;
+  MOZ_ASSERT(!isWasmTrapping());
+}

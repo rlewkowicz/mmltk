@@ -1,0 +1,295 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsPKCS12Blob.h"
+
+#include "mozilla/Assertions.h"
+#include "mozilla/EndianUtils.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_security.h"
+#include "mozpkix/pkixtypes.h"
+#include "nsIFile.h"
+#include "nsIInputStream.h"
+#include "nsIX509CertDB.h"
+#include "nsNetUtil.h"
+#include "nsNSSCertHelper.h"
+#include "nsNSSCertificate.h"
+#include "nsReadableUtils.h"
+#include "nsTArray.h"
+#include "nsThreadUtils.h"
+#include "p12plcy.h"
+#include "ScopedNSSTypes.h"
+#include "secerr.h"
+
+using namespace mozilla;
+extern LazyLogModule gPIPNSSLog;
+
+#define PIP_PKCS12_BUFFER_SIZE 2048
+#define PIP_PKCS12_NOSMARTCARD_EXPORT 4
+#define PIP_PKCS12_RESTORE_FAILED 5
+#define PIP_PKCS12_BACKUP_FAILED 6
+#define PIP_PKCS12_NSS_ERROR 7
+
+nsresult nsPKCS12Blob::ImportFromFile(nsIFile* aFile,
+                                      const nsAString& aPassword,
+                                      uint32_t& aError) {
+  uint32_t passwordBufferLength;
+  UniquePtr<uint8_t[]> passwordBuffer;
+
+  UniquePK11SlotInfo slot(PK11_GetInternalKeySlot());
+  if (!slot) {
+    return NS_ERROR_FAILURE;
+  }
+
+  passwordBuffer = stringToBigEndianBytes(aPassword, passwordBufferLength);
+
+  SECItem unicodePw = {siBuffer, passwordBuffer.get(), passwordBufferLength};
+  UniqueSEC_PKCS12DecoderContext dcx(
+      SEC_PKCS12DecoderStart(&unicodePw, slot.get(), nullptr, nullptr, nullptr,
+                             nullptr, nullptr, nullptr));
+  if (!dcx) {
+    return NS_ERROR_FAILURE;
+  }
+  PRErrorCode nssError;
+  nsresult rv = inputToDecoder(dcx, aFile, nssError);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  if (nssError != 0) {
+    aError = handlePRErrorCode(nssError);
+    return NS_OK;
+  }
+  SECStatus srv = SEC_PKCS12DecoderVerify(dcx.get());
+  if (srv != SECSuccess) {
+    aError = handlePRErrorCode(PR_GetError());
+    return NS_OK;
+  }
+  srv = SEC_PKCS12DecoderValidateBags(dcx.get(), nicknameCollision);
+  if (srv != SECSuccess) {
+    aError = handlePRErrorCode(PR_GetError());
+    return NS_OK;
+  }
+  srv = SEC_PKCS12DecoderImportBags(dcx.get());
+  if (srv != SECSuccess) {
+    aError = handlePRErrorCode(PR_GetError());
+    return NS_OK;
+  }
+  aError = nsIX509CertDB::Success;
+  return NS_OK;
+}
+
+static bool isExtractable(UniqueSECKEYPrivateKey& privKey) {
+  ScopedAutoSECItem value;
+  SECStatus rv = PK11_ReadRawAttribute(PK11_TypePrivKey, privKey.get(),
+                                       CKA_EXTRACTABLE, &value);
+  if (rv != SECSuccess) {
+    return false;
+  }
+
+  bool isExtractable = false;
+  if ((value.len == 1) && value.data) {
+    isExtractable = !!(*(CK_BBOOL*)value.data);
+  }
+  return isExtractable;
+}
+
+nsresult nsPKCS12Blob::ExportToFile(nsIFile* aFile,
+                                    const nsTArray<RefPtr<nsIX509Cert>>& aCerts,
+                                    const nsAString& aPassword,
+                                    uint32_t& aError) {
+  nsCString passwordUtf8 = NS_ConvertUTF16toUTF8(aPassword);
+  uint32_t passwordBufferLength = passwordUtf8.Length();
+  aError = nsIX509CertDB::Success;
+  UniquePtr<unsigned char[]> passwordBuffer(
+      reinterpret_cast<unsigned char*>(ToNewCString(passwordUtf8)));
+  if (!passwordBuffer.get()) {
+    return NS_OK;
+  }
+  UniqueSEC_PKCS12ExportContext ecx(
+      SEC_PKCS12CreateExportContext(nullptr, nullptr, nullptr, nullptr));
+  if (!ecx) {
+    aError = nsIX509CertDB::ERROR_PKCS12_BACKUP_FAILED;
+    return NS_OK;
+  }
+  bool useModernCrypto =
+      StaticPrefs::security_pki_use_modern_crypto_with_pkcs12();
+  SECItem unicodePw = {siBuffer, passwordBuffer.get(), passwordBufferLength};
+  SECStatus srv = SEC_PKCS12AddPasswordIntegrity(
+      ecx.get(), &unicodePw, useModernCrypto ? SEC_OID_SHA256 : SEC_OID_SHA1);
+  if (srv != SECSuccess) {
+    aError = nsIX509CertDB::ERROR_PKCS12_BACKUP_FAILED;
+    return NS_OK;
+  }
+  for (auto& cert : aCerts) {
+    UniqueCERTCertificate nssCert(cert->GetCert());
+    if (!nssCert) {
+      aError = nsIX509CertDB::ERROR_PKCS12_BACKUP_FAILED;
+      return NS_OK;
+    }
+    if (nssCert->slot && !PK11_IsInternal(nssCert->slot)) {
+      UniqueSECKEYPrivateKey privKey(
+          PK11_FindKeyByDERCert(nssCert->slot, nssCert.get(), nullptr));
+      if (privKey && !isExtractable(privKey)) {
+        aError = nsIX509CertDB::ERROR_PKCS12_NOSMARTCARD_EXPORT;
+        continue;
+      }
+    }
+
+    SEC_PKCS12SafeInfo* certSafe;
+    SEC_PKCS12SafeInfo* keySafe = SEC_PKCS12CreateUnencryptedSafe(ecx.get());
+    if (!SEC_PKCS12IsEncryptionAllowed() || PK11_IsFIPS()) {
+      certSafe = keySafe;
+    } else {
+      SECOidTag privAlg =
+          useModernCrypto ? SEC_OID_AES_128_CBC
+                          : SEC_OID_PKCS12_V2_PBE_WITH_SHA1_AND_40_BIT_RC2_CBC;
+      certSafe =
+          SEC_PKCS12CreatePasswordPrivSafe(ecx.get(), &unicodePw, privAlg);
+    }
+    if (!certSafe || !keySafe) {
+      aError = nsIX509CertDB::ERROR_PKCS12_BACKUP_FAILED;
+      return NS_OK;
+    }
+    SECOidTag algorithm =
+        useModernCrypto
+            ? SEC_OID_AES_256_CBC
+            : SEC_OID_PKCS12_V2_PBE_WITH_SHA1_AND_3KEY_TRIPLE_DES_CBC;
+    srv = SEC_PKCS12AddCertAndKey(ecx.get(), certSafe, nullptr, nssCert.get(),
+                                  CERT_GetDefaultCertDB(), keySafe, nullptr,
+                                  true, &unicodePw, algorithm);
+    if (srv != SECSuccess) {
+      aError = nsIX509CertDB::ERROR_PKCS12_BACKUP_FAILED;
+      return NS_OK;
+    }
+  }
+
+  UniquePRFileDesc prFile;
+  PRFileDesc* rawPRFile;
+  nsresult rv = aFile->OpenNSPRFileDesc(PR_RDWR | PR_CREATE_FILE | PR_TRUNCATE,
+                                        0664, &rawPRFile);
+  if (NS_FAILED(rv) || !rawPRFile) {
+    aError = nsIX509CertDB::ERROR_PKCS12_BACKUP_FAILED;
+    return NS_OK;
+  }
+  prFile.reset(rawPRFile);
+  srv = SEC_PKCS12Encode(ecx.get(), writeExportFile, prFile.get());
+  if (srv != SECSuccess) {
+    aError = nsIX509CertDB::ERROR_PKCS12_BACKUP_FAILED;
+  }
+  return NS_OK;
+}
+
+UniquePtr<uint8_t[]> nsPKCS12Blob::stringToBigEndianBytes(
+    const nsAString& uni, uint32_t& bytesLength) {
+  if (uni.IsVoid()) {
+    bytesLength = 0;
+    return nullptr;
+  }
+
+  uint32_t wideLength = uni.Length() + 1;  
+  bytesLength = wideLength * 2;
+  auto buffer = MakeUnique<uint8_t[]>(bytesLength);
+
+  mozilla::NativeEndian::copyAndSwapToBigEndian(
+      buffer.get(), static_cast<const char16_t*>(uni.BeginReading()),
+      wideLength);
+
+  return buffer;
+}
+
+nsresult nsPKCS12Blob::inputToDecoder(UniqueSEC_PKCS12DecoderContext& dcx,
+                                      nsIFile* file, PRErrorCode& nssError) {
+  nssError = 0;
+
+  nsCOMPtr<nsIInputStream> fileStream;
+  nsresult rv = NS_NewLocalFileInputStream(getter_AddRefs(fileStream), file);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  char buf[PIP_PKCS12_BUFFER_SIZE];
+  uint32_t amount;
+  while (true) {
+    rv = fileStream->Read(buf, PIP_PKCS12_BUFFER_SIZE, &amount);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    SECStatus srv =
+        SEC_PKCS12DecoderUpdate(dcx.get(), (unsigned char*)buf, amount);
+    if (srv != SECSuccess) {
+      nssError = PR_GetError();
+      return NS_OK;
+    }
+    if (amount < PIP_PKCS12_BUFFER_SIZE) {
+      break;
+    }
+  }
+  return NS_OK;
+}
+
+SECItem* nsPKCS12Blob::nicknameCollision(SECItem* oldNick, PRBool* cancel,
+                                         void* wincx) {
+  *cancel = false;
+  int count = 1;
+  nsCString nickname;
+  nsAutoString nickFromProp;
+  nsresult rv = GetPIPNSSBundleString("P12DefaultNickname", nickFromProp);
+  if (NS_FAILED(rv)) {
+    return nullptr;
+  }
+  NS_ConvertUTF16toUTF8 nickFromPropC(nickFromProp);
+  while (true) {
+    nickname = nickFromPropC;
+    if (count > 1) {
+      nickname.AppendPrintf(" #%d", count);
+    }
+    UniqueCERTCertificate cert(
+        CERT_FindCertByNickname(CERT_GetDefaultCertDB(), nickname.get()));
+    if (!cert) {
+      break;
+    }
+    count++;
+  }
+  UniqueSECItem newNick(
+      SECITEM_AllocItem(nullptr, nullptr, nickname.Length() + 1));
+  if (!newNick) {
+    return nullptr;
+  }
+  memcpy(newNick->data, nickname.get(), nickname.Length());
+  newNick->data[nickname.Length()] = 0;
+
+  return newNick.release();
+}
+
+void nsPKCS12Blob::writeExportFile(void* arg, const char* buf,
+                                   unsigned long len) {
+  PRFileDesc* file = static_cast<PRFileDesc*>(arg);
+  MOZ_RELEASE_ASSERT(file);
+  PR_Write(file, buf, len);
+}
+
+uint32_t nsPKCS12Blob::handlePRErrorCode(PRErrorCode aPrerr) {
+  MOZ_ASSERT(aPrerr != 0);
+  uint32_t error = nsIX509CertDB::ERROR_UNKNOWN;
+  switch (aPrerr) {
+    case SEC_ERROR_PKCS12_CERT_COLLISION:
+      error = nsIX509CertDB::ERROR_PKCS12_DUPLICATE_DATA;
+      break;
+    // exported from firefox or generated by openssl
+    case SEC_ERROR_INVALID_ARGS:
+    case SEC_ERROR_BAD_PASSWORD:
+      error = nsIX509CertDB::ERROR_BAD_PASSWORD;
+      break;
+    case SEC_ERROR_BAD_DER:
+    case SEC_ERROR_PKCS12_CORRUPT_PFX_STRUCTURE:
+    case SEC_ERROR_PKCS12_INVALID_MAC:
+      error = nsIX509CertDB::ERROR_DECODE_ERROR;
+      break;
+    case SEC_ERROR_PKCS12_DUPLICATE_DATA:
+      error = nsIX509CertDB::ERROR_PKCS12_DUPLICATE_DATA;
+      break;
+  }
+  return error;
+}

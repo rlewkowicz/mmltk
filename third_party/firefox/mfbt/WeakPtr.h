@@ -1,0 +1,259 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+
+#ifndef mozilla_WeakPtr_h
+#define mozilla_WeakPtr_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/RefCounted.h"
+#include "mozilla/RefPtr.h"
+
+#if defined(MOZILLA_INTERNAL_API)
+#  include "mozilla/Assertions.h"
+#  include "nsISupportsImpl.h"
+#  include "nsProxyRelease.h"
+#endif
+
+#if defined(MOZILLA_INTERNAL_API) && \
+    defined(MOZ_THREAD_SAFETY_OWNERSHIP_CHECKS_SUPPORTED)
+
+#  include "mozilla/Maybe.h"
+
+
+#  define MOZ_WEAKPTR_DECLARE_THREAD_SAFETY_CHECK \
+             \
+    Maybe<nsAutoOwningEventTarget> _owningThread;
+#  define MOZ_WEAKPTR_INIT_THREAD_SAFETY_CHECK() \
+    do {                                         \
+      if (p) {                                   \
+        _owningThread.emplace();                 \
+      }                                          \
+    } while (false)
+#  define MOZ_WEAKPTR_ASSERT_THREAD_SAFETY()                  \
+    do {                                                      \
+      MOZ_DIAGNOSTIC_ASSERT(                                  \
+          !_owningThread || _owningThread->IsCurrentThread(), \
+          "WeakPtr accessed from multiple threads");          \
+    } while (false)
+#  define MOZ_WEAKPTR_ASSERT_THREAD_SAFETY_DELEGATED(that) \
+    (that)->AssertThreadSafety();
+#  define MOZ_WEAKPTR_ASSERT_THREAD_SAFETY_DELEGATED_IF(that) \
+    do {                                                      \
+      if (that) {                                             \
+        (that)->AssertThreadSafety();                         \
+      }                                                       \
+    } while (false)
+
+#  define MOZ_WEAKPTR_THREAD_SAFETY_CHECKING 1
+
+#else
+
+#  define MOZ_WEAKPTR_DECLARE_THREAD_SAFETY_CHECK
+#  define MOZ_WEAKPTR_INIT_THREAD_SAFETY_CHECK() \
+    do {                                         \
+    } while (false)
+#  define MOZ_WEAKPTR_ASSERT_THREAD_SAFETY() \
+    do {                                     \
+    } while (false)
+#  define MOZ_WEAKPTR_ASSERT_THREAD_SAFETY_DELEGATED(that) \
+    do {                                                   \
+    } while (false)
+#  define MOZ_WEAKPTR_ASSERT_THREAD_SAFETY_DELEGATED_IF(that) \
+    do {                                                      \
+    } while (false)
+
+#endif
+
+namespace mozilla {
+
+namespace detail {
+
+enum class WeakPtrDestructorBehavior {
+  Normal,
+#ifdef MOZILLA_INTERNAL_API
+  ProxyToMainThread,
+#endif
+};
+
+}  
+
+template <typename T, detail::WeakPtrDestructorBehavior =
+                          detail::WeakPtrDestructorBehavior::Normal>
+class WeakPtr;
+class SupportsWeakPtr;
+
+namespace detail {
+
+class WeakReference : public ::mozilla::RefCounted<WeakReference> {
+ public:
+  explicit WeakReference(const SupportsWeakPtr* p)
+      : mPtr(const_cast<SupportsWeakPtr*>(p)) {
+    MOZ_WEAKPTR_INIT_THREAD_SAFETY_CHECK();
+  }
+
+  SupportsWeakPtr* get() const {
+    MOZ_WEAKPTR_ASSERT_THREAD_SAFETY();
+    return mPtr;
+  }
+
+#ifdef MOZ_REFCOUNTED_LEAK_CHECKING
+  const char* typeName() const { return "WeakReference"; }
+  size_t typeSize() const { return sizeof(*this); }
+#endif
+
+#ifdef MOZ_WEAKPTR_THREAD_SAFETY_CHECKING
+  void AssertThreadSafety() { MOZ_WEAKPTR_ASSERT_THREAD_SAFETY(); }
+#endif
+
+ private:
+  friend class mozilla::SupportsWeakPtr;
+
+  void detach() {
+    MOZ_WEAKPTR_ASSERT_THREAD_SAFETY();
+    mPtr = nullptr;
+  }
+
+  SupportsWeakPtr* MOZ_NON_OWNING_REF mPtr;
+  MOZ_WEAKPTR_DECLARE_THREAD_SAFETY_CHECK
+};
+
+}  
+
+class SupportsWeakPtr {
+  using WeakReference = detail::WeakReference;
+
+ protected:
+  ~SupportsWeakPtr() { DetachWeakPtr(); }
+
+ protected:
+  void DetachWeakPtr() {
+    if (mSelfReferencingWeakReference) {
+      mSelfReferencingWeakReference->detach();
+    }
+  }
+
+ private:
+  WeakReference* SelfReferencingWeakReference() const {
+    if (!mSelfReferencingWeakReference) {
+      mSelfReferencingWeakReference = new WeakReference(this);
+    } else {
+      MOZ_WEAKPTR_ASSERT_THREAD_SAFETY_DELEGATED(mSelfReferencingWeakReference);
+    }
+    return mSelfReferencingWeakReference.get();
+  }
+
+  template <typename U, detail::WeakPtrDestructorBehavior>
+  friend class WeakPtr;
+
+  mutable RefPtr<WeakReference> mSelfReferencingWeakReference;
+};
+
+template <typename T, detail::WeakPtrDestructorBehavior Destruct>
+class WeakPtr {
+  using WeakReference = detail::WeakReference;
+
+ public:
+  WeakPtr& operator=(const WeakPtr& aOther) {
+    MOZ_WEAKPTR_ASSERT_THREAD_SAFETY_DELEGATED_IF(mRef);
+    MOZ_WEAKPTR_ASSERT_THREAD_SAFETY_DELEGATED_IF(aOther.mRef);
+
+    mRef = aOther.mRef;
+    return *this;
+  }
+
+  WeakPtr(const WeakPtr& aOther) {
+    *this = aOther;
+  }
+
+  WeakPtr& operator=(decltype(nullptr)) {
+    MOZ_WEAKPTR_ASSERT_THREAD_SAFETY_DELEGATED_IF(mRef);
+    mRef = nullptr;
+    return *this;
+  }
+
+  WeakPtr& operator=(const T* aOther) {
+    MOZ_WEAKPTR_ASSERT_THREAD_SAFETY_DELEGATED_IF(mRef);
+    if (aOther) {
+      mRef = aOther->SelfReferencingWeakReference();
+    } else {
+      mRef = nullptr;
+    }
+    return *this;
+  }
+
+  MOZ_IMPLICIT WeakPtr(T* aOther) {
+    *this = aOther;
+#ifdef MOZILLA_INTERNAL_API
+    if (Destruct == detail::WeakPtrDestructorBehavior::ProxyToMainThread) {
+      MOZ_ASSERT(NS_IsMainThread(),
+                 "MainThreadWeakPtr makes no sense on non-main threads");
+    }
+#endif
+  }
+
+  explicit WeakPtr(const RefPtr<T>& aOther) : WeakPtr(aOther.get()) {}
+
+  WeakPtr() = default;
+
+  explicit operator bool() const { return !!get(); }
+  T* get() const { return mRef ? static_cast<T*>(mRef->get()) : nullptr; }
+  operator T*() const { return get(); }
+  T& operator*() const { return *get(); }
+  T* operator->() const MOZ_NO_ADDREF_RELEASE_ON_RETURN { return get(); }
+
+#ifdef MOZILLA_INTERNAL_API
+  ~WeakPtr() {
+    if (Destruct == detail::WeakPtrDestructorBehavior::ProxyToMainThread) {
+      if (mRef) {
+        NS_ReleaseOnMainThread("WeakPtr::mRef", mRef.forget());
+      }
+    } else {
+      MOZ_WEAKPTR_ASSERT_THREAD_SAFETY_DELEGATED_IF(mRef);
+    }
+  }
+#endif
+
+ private:
+  friend class SupportsWeakPtr;
+
+  explicit WeakPtr(const RefPtr<WeakReference>& aOther) : mRef(aOther) {}
+
+  RefPtr<WeakReference> mRef;
+};
+
+#ifdef MOZILLA_INTERNAL_API
+
+template <typename T>
+using MainThreadWeakPtr =
+    WeakPtr<T, detail::WeakPtrDestructorBehavior::ProxyToMainThread>;
+
+#endif
+
+#define NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_PTR tmp->DetachWeakPtr();
+
+#define NS_IMPL_CYCLE_COLLECTION_WEAK_PTR(class_, ...) \
+  NS_IMPL_CYCLE_COLLECTION_CLASS(class_)               \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(class_)        \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(__VA_ARGS__)       \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_PTR           \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_END                  \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(class_)      \
+    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(__VA_ARGS__)     \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+#define NS_IMPL_CYCLE_COLLECTION_WEAK_PTR_INHERITED(class_, super_, ...) \
+  NS_IMPL_CYCLE_COLLECTION_CLASS(class_)                                 \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(class_, super_)        \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(__VA_ARGS__)                         \
+    NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_PTR                             \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_END                                    \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(class_, super_)      \
+    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(__VA_ARGS__)                       \
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+}  
+
+#endif /* mozilla_WeakPtr_h */

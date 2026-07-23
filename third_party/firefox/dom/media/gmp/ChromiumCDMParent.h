@@ -1,0 +1,197 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ChromiumCDMParent_h_
+#define ChromiumCDMParent_h_
+
+#include "DecryptJob.h"
+#include "GMPMessageUtils.h"
+#include "ImageContainer.h"
+#include "PlatformDecoderModule.h"
+#include "ReorderQueue.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Span.h"
+#include "mozilla/gmp/PChromiumCDMParent.h"
+#include "nsTHashMap.h"
+
+class ChromiumCDMCallback;
+
+namespace mozilla {
+
+class ErrorResult;
+class MediaRawData;
+class ChromiumCDMProxy;
+
+namespace gmp {
+
+class GMPContentParent;
+
+class ChromiumCDMParent final : public PChromiumCDMParent {
+  friend class PChromiumCDMParent;
+
+ public:
+  typedef MozPromise<bool, MediaResult,  true> InitPromise;
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ChromiumCDMParent, final)
+
+  ChromiumCDMParent(GMPContentParent* aContentParent, uint32_t aPluginId);
+
+  uint32_t PluginId() const { return mPluginId; }
+
+  RefPtr<InitPromise> Init(ChromiumCDMCallback* aCDMCallback,
+                           bool aAllowDistinctiveIdentifier,
+                           bool aAllowPersistentState,
+                           nsIEventTarget* aMainThread);
+
+  void CreateSession(uint32_t aCreateSessionToken,
+                     cdm::SessionType aSessionType,
+                     cdm::InitDataType aInitDataType, uint32_t aPromiseId,
+                     const nsTArray<uint8_t>& aInitData);
+
+  void LoadSession(uint32_t aPromiseId, cdm::SessionType aSessionType,
+                   nsString aSessionId);
+
+  void SetServerCertificate(uint32_t aPromiseId,
+                            const nsTArray<uint8_t>& aCert);
+
+  void UpdateSession(const nsCString& aSessionId, uint32_t aPromiseId,
+                     const nsTArray<uint8_t>& aResponse);
+
+  void CloseSession(const nsCString& aSessionId, uint32_t aPromiseId);
+
+  void RemoveSession(const nsCString& aSessionId, uint32_t aPromiseId);
+
+  void NotifyOutputProtectionStatus(bool aSuccess, uint32_t aLinkMask,
+                                    uint32_t aProtectionMask);
+
+  void GetStatusForPolicy(uint32_t aPromiseId,
+                          const dom::HDCPVersion& aMinHdcpVersion);
+
+  RefPtr<DecryptPromise> Decrypt(MediaRawData* aSample);
+
+  RefPtr<MediaDataDecoder::InitPromise> InitializeVideoDecoder(
+      const gmp::CDMVideoDecoderConfig& aConfig, const VideoInfo& aInfo,
+      RefPtr<layers::ImageContainer> aImageContainer,
+      RefPtr<layers::KnowsCompositor> aKnowsCompositor);
+
+  RefPtr<MediaDataDecoder::DecodePromise> DecryptAndDecodeFrame(
+      MediaRawData* aSample);
+
+  RefPtr<MediaDataDecoder::FlushPromise> FlushVideoDecoder();
+
+  RefPtr<MediaDataDecoder::DecodePromise> Drain();
+
+  RefPtr<ShutdownPromise> ShutdownVideoDecoder();
+
+  void Shutdown();
+
+ protected:
+  ~ChromiumCDMParent() = default;
+
+  ipc::IPCResult Recv__delete__() override;
+  ipc::IPCResult RecvOnResolvePromiseWithKeyStatus(
+      const uint32_t& aPromiseId, const cdm::KeyStatus& aKeyStatus);
+  ipc::IPCResult RecvOnResolveNewSessionPromise(const uint32_t& aPromiseId,
+                                                const nsCString& aSessionId);
+  ipc::IPCResult RecvResolveLoadSessionPromise(const uint32_t& aPromiseId,
+                                               const bool& aSuccessful);
+  ipc::IPCResult RecvOnResolvePromise(const uint32_t& aPromiseId);
+  ipc::IPCResult RecvOnRejectPromise(const uint32_t& aPromiseId,
+                                     const cdm::Exception& aError,
+                                     const uint32_t& aSystemCode,
+                                     const nsCString& aErrorMessage);
+  ipc::IPCResult RecvOnSessionMessage(const nsCString& aSessionId,
+                                      const cdm::MessageType& aMessageType,
+                                      nsTArray<uint8_t>&& aMessage);
+  ipc::IPCResult RecvOnSessionKeysChange(
+      const nsCString& aSessionId, nsTArray<CDMKeyInformation>&& aKeysInfo);
+  ipc::IPCResult RecvOnExpirationChange(const nsCString& aSessionId,
+                                        const double& aSecondsSinceEpoch);
+  ipc::IPCResult RecvOnSessionClosed(const nsCString& aSessionId);
+  ipc::IPCResult RecvOnQueryOutputProtectionStatus();
+  ipc::IPCResult RecvDecryptedShmem(const uint32_t& aId,
+                                    const cdm::Status& aStatus,
+                                    ipc::Shmem&& aData);
+  ipc::IPCResult RecvDecryptedData(const uint32_t& aId,
+                                   const cdm::Status& aStatus,
+                                   nsTArray<uint8_t>&& aData);
+  ipc::IPCResult RecvDecryptFailed(const uint32_t& aId,
+                                   const cdm::Status& aStatus);
+  ipc::IPCResult RecvOnDecoderInitDone(const cdm::Status& aStatus);
+  ipc::IPCResult RecvDecodedShmem(const CDMVideoFrame& aFrame,
+                                  ipc::Shmem&& aShmem);
+  ipc::IPCResult RecvDecodedData(const CDMVideoFrame& aFrame,
+                                 nsTArray<uint8_t>&& aData);
+  ipc::IPCResult RecvDecodeFailed(const cdm::Status& aStatus);
+  ipc::IPCResult RecvShutdown();
+  ipc::IPCResult RecvResetVideoDecoderComplete();
+  ipc::IPCResult RecvDrainComplete();
+  ipc::IPCResult RecvIncreaseShmemPoolSize();
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+  bool SendBufferToCDM(uint32_t aSizeInBytes);
+
+  void ReorderAndReturnOutput(RefPtr<VideoData>&& aFrame);
+
+  void RejectPromise(uint32_t aPromiseId, ErrorResult&& aException,
+                     const nsCString& aErrorMessage);
+
+  void ResolvePromise(uint32_t aPromiseId);
+  void RejectPromiseShutdown(uint32_t aPromiseId);
+  void RejectPromiseWithStateError(uint32_t aPromiseId,
+                                   const nsCString& aErrorMessage);
+
+  void CompleteQueryOutputProtectionStatus(bool aSuccess, uint32_t aLinkMask,
+                                           uint32_t aProtectionMask);
+
+  bool InitCDMInputBuffer(gmp::CDMInputBuffer& aBuffer, MediaRawData* aSample);
+
+  bool PurgeShmems();
+  bool EnsureSufficientShmems(size_t aVideoFrameSize);
+  already_AddRefed<VideoData> CreateVideoFrame(const CDMVideoFrame& aFrame,
+                                               Span<uint8_t> aData);
+
+  const uint32_t mPluginId;
+  GMPContentParent* mContentParent;
+  ChromiumCDMCallback* mCDMCallback = nullptr;
+  nsTHashMap<nsUint32HashKey, uint32_t> mPromiseToCreateSessionToken;
+  nsTArray<RefPtr<DecryptJob>> mDecrypts;
+
+  MozPromiseHolder<InitPromise> mInitPromise;
+
+  MozPromiseHolder<MediaDataDecoder::InitPromise> mInitVideoDecoderPromise;
+  MozPromiseHolder<MediaDataDecoder::DecodePromise> mDecodePromise;
+
+  RefPtr<layers::ImageContainer> mImageContainer;
+  RefPtr<layers::KnowsCompositor> mKnowsCompositor;
+  VideoInfo mVideoInfo;
+  int64_t mLastStreamOffset = 0;
+
+  MozPromiseHolder<MediaDataDecoder::FlushPromise> mFlushDecoderPromise;
+
+  size_t mVideoFrameBufferSize = 0;
+
+  uint32_t mVideoShmemsActive = 0;
+  uint32_t mVideoShmemLimit;
+
+  bool mAwaitingOutputProtectionInformation = false;
+  Maybe<uint32_t> mOutputProtectionLinkMask;
+
+  bool mIsShutdown = false;
+  bool mVideoDecoderInitialized = false;
+  bool mActorDestroyed = false;
+  bool mAbnormalShutdown = false;
+
+  uint32_t mMaxRefFrames = 0;
+  ReorderQueue mReorderQueue;
+
+#ifdef DEBUG
+  const nsCOMPtr<nsISerialEventTarget> mGMPThread;
+#endif
+};
+
+}  
+}  
+
+#endif  // ChromiumCDMParent_h_

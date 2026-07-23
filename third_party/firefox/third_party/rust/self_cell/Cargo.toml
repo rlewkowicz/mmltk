@@ -1,0 +1,18 @@
+
+[package]
+edition = "2018"
+name = "self_cell"
+version = "1.2.0"
+authors = ["Lukas Bergdoll <lukas.bergdoll@gmail.com>"]
+include = ["src/*.rs", "Cargo.toml", "README.md", "LICENSE"]
+description = "Safe-to-use proc-macro-free self-referential structs in stable Rust."
+documentation = "https://docs.rs/self_cell"
+keywords = ["lifetime", "borrowing", "self", "reference", "intrusive"]
+categories = ["rust-patterns", "memory-management"]
+license = "Apache-2.0"
+repository = "https://github.com/Voultapher/self_cell"
+[dependencies.rustversion]
+version = ">=1"
+optional = true
+[features]
+old_rust = ["rustversion"]

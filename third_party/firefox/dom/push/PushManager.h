@@ -1,0 +1,97 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_PushManager_h
+#define mozilla_dom_PushManager_h
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/TypedArray.h"
+#include "nsCOMPtr.h"
+#include "nsWrapperCache.h"
+
+class nsIGlobalObject;
+class nsIPrincipal;
+class nsIPushSubscription;
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+class OwningArrayBufferViewOrArrayBufferOrString;
+class Promise;
+class PushManagerImpl;
+struct PushSubscriptionOptionsInit;
+class WorkerPrivate;
+
+nsresult GetSubscriptionParams(nsIPushSubscription* aSubscription,
+                               nsAString& aEndpoint,
+                               nsTArray<uint8_t>& aRawP256dhKey,
+                               nsTArray<uint8_t>& aAuthSecret,
+                               nsTArray<uint8_t>& aAppServerKey);
+
+class PushManager final : public nsISupports, public nsWrapperCache {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(PushManager)
+
+  enum SubscriptionAction {
+    SubscribeAction,
+    GetSubscriptionAction,
+  };
+
+  PushManager(nsIGlobalObject* aGlobal, PushManagerImpl* aImpl);
+
+  explicit PushManager(const nsAString& aScope);
+
+  nsIGlobalObject* GetParentObject() const { return mGlobal; }
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  static already_AddRefed<PushManager> Constructor(GlobalObject& aGlobal,
+                                                   const nsAString& aScope,
+                                                   ErrorResult& aRv);
+
+  static bool IsEnabled(JSContext* aCx, JSObject* aGlobal);
+
+  already_AddRefed<Promise> PerformSubscriptionActionFromWorker(
+      SubscriptionAction aAction, ErrorResult& aRv);
+
+  already_AddRefed<Promise> PerformSubscriptionActionFromWorker(
+      SubscriptionAction aAction, const PushSubscriptionOptionsInit& aOptions,
+      ErrorResult& aRv);
+
+
+  static void GetSupportedContentEncodings(
+      GlobalObject& aGlobal, JS::MutableHandle<JSObject*> aEncodings,
+      ErrorResult& aRv);
+
+  already_AddRefed<Promise> Subscribe(
+      const PushSubscriptionOptionsInit& aOptions, ErrorResult& aRv);
+
+  already_AddRefed<Promise> GetSubscription(ErrorResult& aRv);
+
+  already_AddRefed<Promise> PermissionState(
+      const PushSubscriptionOptionsInit& aOptions, ErrorResult& aRv);
+
+ private:
+  ~PushManager();
+
+  nsresult NormalizeAppServerKey(
+      const OwningArrayBufferViewOrArrayBufferOrString& aSource,
+      nsTArray<uint8_t>& aAppServerKey);
+
+  nsCOMPtr<nsIGlobalObject> mGlobal;
+  RefPtr<PushManagerImpl> mImpl;
+
+  nsString mScope;
+};
+}  
+}  
+
+#endif  // mozilla_dom_PushManager_h

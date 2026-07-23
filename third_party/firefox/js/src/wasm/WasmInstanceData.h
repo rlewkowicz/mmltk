@@ -1,0 +1,209 @@
+/*
+ * Copyright 2021 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_instance_data_h
+#define wasm_instance_data_h
+
+#include <stdint.h>
+
+#include "NamespaceImports.h"
+
+#include "gc/Pretenuring.h"
+#include "js/Utility.h"
+#include "vm/JSFunction.h"
+#include "wasm/WasmInstance.h"
+#include "wasm/WasmMemory.h"
+#include "wasm/WasmTypeDecls.h"
+
+namespace js {
+namespace wasm {
+
+
+struct ExportArg {
+  uint64_t lo;
+  uint64_t hi;
+};
+
+using ExportFuncPtr = int32_t (*)(ExportArg*, Instance*);
+
+
+struct TypeDefInstanceData {
+  TypeDefInstanceData()
+      : typeDef(nullptr),
+        superTypeVector(nullptr),
+        shape(nullptr),
+        clasp(nullptr) {
+    memset(&cached, 0, sizeof(cached));
+    cached.strukt.allocKind = gc::AllocKind::INVALID;
+  }
+
+  const wasm::TypeDef* typeDef;
+
+  const wasm::SuperTypeVector* superTypeVector;
+
+  GCPtr<Shape*> shape;
+  const JSClass* clasp;
+
+  union {
+    struct {
+      uint32_t payloadOffsetIL;
+      uint32_t totalSizeIL;
+      uint32_t totalSizeOOL;
+      uint32_t oolPointerOffset;
+      gc::AllocKind allocKind;
+    } strukt;
+    struct {
+      uint32_t elemSize;
+    } array;
+  } cached;
+
+  static constexpr size_t offsetOfShape() {
+    return offsetof(TypeDefInstanceData, shape);
+  }
+  static constexpr size_t offsetOfSuperTypeVector() {
+    return offsetof(TypeDefInstanceData, superTypeVector);
+  }
+  static constexpr size_t offsetOfArrayElemSize() {
+    return offsetof(TypeDefInstanceData, cached.array.elemSize);
+  }
+};
+
+struct FuncDefInstanceData {
+  int32_t hotnessCounter;
+};
+
+struct FuncExportInstanceData {
+  GCPtr<JSFunction*> func;
+};
+
+
+struct FuncImportInstanceData {
+  void* code;
+
+  Instance* instance;
+
+  JS::Realm* realm;
+
+  GCPtr<JSObject*> callable;
+  static_assert(sizeof(GCPtr<JSObject*>) == sizeof(void*), "for JIT access");
+
+  bool isFunctionCallBind;
+};
+
+struct MemoryInstanceData {
+  GCPtr<WasmMemoryObject*> memory;
+
+  uint8_t* base;
+
+  uintptr_t boundsCheckLimit;
+
+#ifdef ENABLE_WASM_CUSTOM_PAGE_SIZES
+  uintptr_t boundsCheckLimit16;
+  uintptr_t boundsCheckLimit32;
+  uintptr_t boundsCheckLimit64;
+  uintptr_t boundsCheckLimit128;
+#endif
+
+  bool isShared;
+
+  size_t mappedSize;
+};
+
+
+struct TableInstanceData {
+  uint64_t length;
+
+  void* elements;
+};
+
+
+struct TagInstanceData {
+  GCPtr<WasmTagObject*> object;
+};
+
+
+struct FunctionTableElem {
+  void* code;
+
+  Instance* instance;
+};
+
+struct CallRefMetrics {
+
+  static constexpr size_t NUM_SLOTS = 3;
+  static_assert(NUM_SLOTS >= 1);  
+
+  GCPtr<JSFunction*> targets[NUM_SLOTS];
+  uint32_t counts[NUM_SLOTS];
+  uint32_t countOther;
+
+  static_assert(sizeof(GCPtr<JSFunction*>) == sizeof(void*));
+  static_assert(sizeof(uint32_t) == 4);
+
+  CallRefMetrics() {
+    for (size_t i = 0; i < NUM_SLOTS; i++) {
+      targets[i] = nullptr;
+      counts[i] = 0;
+    }
+    countOther = 0;
+    MOZ_ASSERT(checkInvariants());
+  }
+
+  [[nodiscard]] bool checkInvariants() const {
+    size_t i;
+    for (i = 0; i < NUM_SLOTS; i++) {
+      if (targets[i] == nullptr && counts[i] != 0) {
+        return false;
+      }
+    }
+    for (i = 0; i < NUM_SLOTS; i++) {
+      if (targets[i] == nullptr) {
+        break;
+      }
+    }
+    size_t numUsed = i;
+    for (; i < NUM_SLOTS; i++) {
+      if (targets[i] != nullptr) {
+        return false;
+      }
+    }
+    for (i = 0; i < numUsed; i++) {
+      for (size_t j = i + 1; j < numUsed; j++) {
+        if (targets[j] == targets[i]) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  static size_t offsetOfTarget(size_t n) {
+    MOZ_ASSERT(n < NUM_SLOTS);
+    return offsetof(CallRefMetrics, targets) + n * sizeof(GCPtr<JSFunction*>);
+  }
+  static size_t offsetOfCount(size_t n) {
+    MOZ_ASSERT(n < NUM_SLOTS);
+    return offsetof(CallRefMetrics, counts) + n * sizeof(uint32_t);
+  }
+  static size_t offsetOfCountOther() {
+    return offsetof(CallRefMetrics, countOther);
+  }
+};
+
+}  
+}  
+
+#endif  // wasm_instance_data_h

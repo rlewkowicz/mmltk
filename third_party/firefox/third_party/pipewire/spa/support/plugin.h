@@ -1,0 +1,134 @@
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
+
+#ifndef SPA_PLUGIN_H
+#define SPA_PLUGIN_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <errno.h>
+
+#include <spa/utils/defs.h>
+#include <spa/utils/hook.h>
+#include <spa/utils/dict.h>
+
+#ifndef SPA_API_PLUGIN
+ #ifdef SPA_API_IMPL
+  #define SPA_API_PLUGIN SPA_API_IMPL
+ #else
+  #define SPA_API_PLUGIN static inline
+ #endif
+#endif
+
+
+
+struct spa_handle {
+#define SPA_VERSION_HANDLE	0
+	uint32_t version;
+
+	int (*get_interface) (struct spa_handle *handle, const char *type, void **iface);
+	int (*clear) (struct spa_handle *handle);
+};
+
+SPA_API_PLUGIN int
+spa_handle_get_interface(struct spa_handle *object,
+		const char *type, void **iface)
+{
+	return spa_api_func_r(int, -ENOTSUP, object, get_interface, 0, type, iface);
+}
+SPA_API_PLUGIN int
+spa_handle_clear(struct spa_handle *object)
+{
+	return spa_api_func_r(int, -ENOTSUP, object, clear, 0);
+}
+
+struct spa_interface_info {
+	const char *type;	
+};
+
+struct spa_support {
+	const char *type;	
+	void *data;		
+};
+
+SPA_API_PLUGIN void *spa_support_find(const struct spa_support *support,
+				     uint32_t n_support,
+				     const char *type)
+{
+	uint32_t i;
+	for (i = 0; i < n_support; i++) {
+		if (strcmp(support[i].type, type) == 0)
+			return support[i].data;
+	}
+	return NULL;
+}
+
+#define SPA_SUPPORT_INIT(type,data) ((struct spa_support) { (type), (data) })
+
+struct spa_handle_factory {
+#define SPA_VERSION_HANDLE_FACTORY	1
+	uint32_t version;
+	const char *name;
+	const struct spa_dict *info;
+	size_t (*get_size) (const struct spa_handle_factory *factory,
+			    const struct spa_dict *params);
+
+	int (*init) (const struct spa_handle_factory *factory,
+		     struct spa_handle *handle,
+		     const struct spa_dict *info,
+		     const struct spa_support *support,
+		     uint32_t n_support);
+
+	int (*enum_interface_info) (const struct spa_handle_factory *factory,
+				    const struct spa_interface_info **info,
+				    uint32_t *index);
+};
+
+SPA_API_PLUGIN size_t
+spa_handle_factory_get_size(const struct spa_handle_factory *object,
+		const struct spa_dict *params)
+{
+	return spa_api_func_r(size_t, 0, object, get_size, 1, params);
+}
+SPA_API_PLUGIN int
+spa_handle_factory_init(const struct spa_handle_factory *object,
+		struct spa_handle *handle, const struct spa_dict *info,
+		const struct spa_support *support, uint32_t n_support)
+{
+	return spa_api_func_r(int, -ENOTSUP, object, init, 1, handle, info,
+			support, n_support);
+}
+SPA_API_PLUGIN int
+spa_handle_factory_enum_interface_info(const struct spa_handle_factory *object,
+		const struct spa_interface_info **info, uint32_t *index)
+{
+	return spa_api_func_r(int, -ENOTSUP, object, enum_interface_info, 1,
+			info, index);
+}
+
+typedef int (*spa_handle_factory_enum_func_t) (const struct spa_handle_factory **factory,
+					       uint32_t *index);
+
+#define SPA_HANDLE_FACTORY_ENUM_FUNC_NAME "spa_handle_factory_enum"
+
+int spa_handle_factory_enum(const struct spa_handle_factory **factory, uint32_t *index);
+
+
+
+#define SPA_KEY_FACTORY_NAME		"factory.name"		/**< the name of a factory */
+#define SPA_KEY_FACTORY_AUTHOR		"factory.author"	/**< a comma separated list of factory authors */
+#define SPA_KEY_FACTORY_DESCRIPTION	"factory.description"	/**< description of a factory */
+#define SPA_KEY_FACTORY_USAGE		"factory.usage"		/**< usage of a factory */
+
+#define SPA_KEY_LIBRARY_NAME		"library.name"		/**< the name of a library. This is usually
+								  *  the filename of the plugin without the
+								  *  path or the plugin extension. */
+
+
+#ifdef __cplusplus
+}  
+#endif
+
+#endif /* SPA_PLUGIN_H */

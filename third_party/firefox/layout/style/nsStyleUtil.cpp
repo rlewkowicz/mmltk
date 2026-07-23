@@ -1,0 +1,314 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsStyleUtil.h"
+
+#include "mozilla/ExpandedPrincipal.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/intl/MozLocaleBindings.h"
+#include "mozilla/intl/oxilangtag_ffi_generated.h"
+#include "nsCSSProps.h"
+#include "nsContentUtils.h"
+#include "nsIContent.h"
+#include "nsIContentPolicy.h"
+#include "nsIContentSecurityPolicy.h"
+#include "nsLayoutUtils.h"
+#include "nsPrintfCString.h"
+#include "nsROCSSPrimitiveValue.h"
+#include "nsStyleConsts.h"
+#include "nsStyleStruct.h"
+
+using namespace mozilla;
+
+
+bool nsStyleUtil::DashMatchCompare(const nsAString& aAttributeValue,
+                                   const nsAString& aSelectorValue,
+                                   const nsStringComparator& aComparator) {
+  bool result;
+  uint32_t selectorLen = aSelectorValue.Length();
+  uint32_t attributeLen = aAttributeValue.Length();
+  if (selectorLen > attributeLen) {
+    result = false;
+  } else {
+    nsAString::const_iterator iter;
+    if (selectorLen != attributeLen &&
+        *aAttributeValue.BeginReading(iter).advance(selectorLen) !=
+            char16_t('-')) {
+      result = false;
+    } else {
+      result = StringBeginsWith(aAttributeValue, aSelectorValue, aComparator);
+    }
+  }
+  return result;
+}
+
+bool nsStyleUtil::LangTagCompare(const nsACString& aAttributeValue,
+                                 const nsACString& aSelectorValue) {
+  if (aAttributeValue.IsEmpty() || aSelectorValue.IsEmpty()) {
+    return false;
+  }
+
+  class MOZ_RAII AutoLangTag final {
+   public:
+    AutoLangTag() = delete;
+    AutoLangTag(const AutoLangTag& aOther) = delete;
+    explicit AutoLangTag(const nsACString& aLangTag) {
+      mLangTag = intl::ffi::lang_tag_new(&aLangTag);
+    }
+
+    ~AutoLangTag() {
+      if (mLangTag) {
+        intl::ffi::lang_tag_destroy(mLangTag);
+      }
+    }
+
+    bool IsValid() const { return mLangTag; }
+    operator intl::ffi::LangTag*() const { return mLangTag; }
+
+    void Reset(const nsACString& aLangTag) {
+      if (mLangTag) {
+        intl::ffi::lang_tag_destroy(mLangTag);
+      }
+      mLangTag = intl::ffi::lang_tag_new(&aLangTag);
+    }
+
+   private:
+    intl::ffi::LangTag* mLangTag = nullptr;
+  };
+
+  AutoLangTag langAttr(aAttributeValue);
+
+  nsAutoCString attrTemp;
+  if (!langAttr.IsValid()) {
+    if (aAttributeValue.Contains('_')) {
+      attrTemp = aAttributeValue;
+      attrTemp.ReplaceChar('_', '-');
+      langAttr.Reset(attrTemp);
+    }
+  }
+
+  if (!langAttr.IsValid()) {
+    return false;
+  }
+
+  return intl::ffi::lang_tag_matches(langAttr, &aSelectorValue);
+}
+
+bool nsStyleUtil::ValueIncludes(const nsAString& aValueList,
+                                const nsAString& aValue,
+                                const nsStringComparator& aComparator) {
+  const char16_t *p = aValueList.BeginReading(),
+                 *p_end = aValueList.EndReading();
+
+  while (p < p_end) {
+    while (p != p_end && nsContentUtils::IsHTMLWhitespace(*p)) {
+      ++p;
+    }
+
+    const char16_t* val_start = p;
+
+    while (p != p_end && !nsContentUtils::IsHTMLWhitespace(*p)) {
+      ++p;
+    }
+
+    const char16_t* val_end = p;
+
+    if (val_start < val_end &&
+        aValue.Equals(Substring(val_start, val_end), aComparator)) {
+      return true;
+    }
+
+    ++p;  
+  }
+  return false;
+}
+
+void nsStyleUtil::AppendQuotedCSSString(const nsACString& aString,
+                                        nsACString& aReturn, char aQuoteChar) {
+  MOZ_ASSERT(aQuoteChar == '\'' || aQuoteChar == '"',
+             "CSS strings must be quoted with ' or \"");
+
+  aReturn.Append(aQuoteChar);
+
+  const char* in = aString.BeginReading();
+  const char* const end = aString.EndReading();
+  for (; in != end; in++) {
+    if (*in == '\\' || *in == aQuoteChar) {
+      aReturn.Append('\\');
+    }
+    aReturn.Append(*in);
+  }
+  aReturn.Append(aQuoteChar);
+}
+
+void nsStyleUtil::AppendEscapedCSSIdent(const nsAString& aIdent,
+                                        nsAString& aReturn) {
+
+  const char16_t* in = aIdent.BeginReading();
+  const char16_t* const end = aIdent.EndReading();
+
+  if (in == end) {
+    return;
+  }
+
+  if (*in == '-') {
+    if (in + 1 == end) {
+      aReturn.Append(char16_t('\\'));
+      aReturn.Append(char16_t('-'));
+      return;
+    }
+
+    aReturn.Append(char16_t('-'));
+    ++in;
+  }
+
+  if (in != end && ('0' <= *in && *in <= '9')) {
+    aReturn.AppendPrintf("\\%x ", *in);
+    ++in;
+  }
+
+  for (; in != end; ++in) {
+    char16_t ch = *in;
+    if (ch == 0x00) {
+      aReturn.Append(char16_t(0xFFFD));
+    } else if (ch < 0x20 || 0x7F == ch) {
+      aReturn.AppendPrintf("\\%x ", *in);
+    } else {
+      if (ch < 0x7F && ch != '_' && ch != '-' && (ch < '0' || '9' < ch) &&
+          (ch < 'A' || 'Z' < ch) && (ch < 'a' || 'z' < ch)) {
+        aReturn.Append(char16_t('\\'));
+      }
+      aReturn.Append(ch);
+    }
+  }
+}
+
+float nsStyleUtil::ColorComponentToFloat(uint8_t aAlpha) {
+  float rounded = NS_roundf(float(aAlpha) * 100.0f / 255.0f) / 100.0f;
+  if (FloatToColorComponent(rounded) != aAlpha) {
+    rounded = NS_roundf(float(aAlpha) * 1000.0f / 255.0f) / 1000.0f;
+  }
+  return rounded;
+}
+
+void nsStyleUtil::GetSerializedColorValue(nscolor aColor,
+                                          nsAString& aSerializedColor) {
+  MOZ_ASSERT(aSerializedColor.IsEmpty());
+
+  const bool hasAlpha = NS_GET_A(aColor) != 255;
+  if (hasAlpha) {
+    aSerializedColor.AppendLiteral("rgba(");
+  } else {
+    aSerializedColor.AppendLiteral("rgb(");
+  }
+  aSerializedColor.AppendInt(NS_GET_R(aColor));
+  aSerializedColor.AppendLiteral(", ");
+  aSerializedColor.AppendInt(NS_GET_G(aColor));
+  aSerializedColor.AppendLiteral(", ");
+  aSerializedColor.AppendInt(NS_GET_B(aColor));
+  if (hasAlpha) {
+    aSerializedColor.AppendLiteral(", ");
+    float alpha = nsStyleUtil::ColorComponentToFloat(NS_GET_A(aColor));
+    nsStyleUtil::AppendCSSNumber(alpha, aSerializedColor);
+  }
+  aSerializedColor.AppendLiteral(")");
+}
+
+bool nsStyleUtil::IsSignificantChild(nsIContent* aChild,
+                                     bool aWhitespaceIsSignificant) {
+  bool isText = aChild->IsText();
+
+  if (!isText && !aChild->IsComment() && !aChild->IsProcessingInstruction()) {
+    return true;
+  }
+
+  return isText && aChild->TextLength() != 0 &&
+         (aWhitespaceIsSignificant || !aChild->TextIsOnlyWhitespace());
+}
+
+bool nsStyleUtil::ThreadSafeIsSignificantChild(const nsIContent* aChild,
+                                               bool aWhitespaceIsSignificant) {
+  bool isText = aChild->IsText();
+
+  if (!isText && !aChild->IsComment() && !aChild->IsProcessingInstruction()) {
+    return true;
+  }
+
+  return isText && aChild->TextLength() != 0 &&
+         (aWhitespaceIsSignificant ||
+          !aChild->ThreadSafeTextIsOnlyWhitespace());
+}
+
+static bool ObjectPositionCoordMightCauseOverflow(
+    const LengthPercentage& aCoord) {
+  if (!aCoord.ConvertsToPercentage()) {
+    return !aCoord.ConvertsToLength() || aCoord.ToLengthInCSSPixels() != 0.0f;
+  }
+
+  float percentage = aCoord.ToPercentage();
+  return percentage < 0.0f || percentage > 1.0f;
+}
+
+bool nsStyleUtil::ObjectPropsMightCauseOverflow(
+    const nsStylePosition* aStylePos) {
+  auto objectFit = aStylePos->mObjectFit;
+
+  if (objectFit == StyleObjectFit::Cover || objectFit == StyleObjectFit::None) {
+    return true;
+  }
+
+  const Position& objectPosistion = aStylePos->mObjectPosition;
+  if (ObjectPositionCoordMightCauseOverflow(objectPosistion.horizontal) ||
+      ObjectPositionCoordMightCauseOverflow(objectPosistion.vertical)) {
+    return true;
+  }
+
+  return false;
+}
+
+bool nsStyleUtil::CSPAllowsInlineStyle(
+    dom::Element* aElement, dom::Document* aDocument,
+    nsIPrincipal* aTriggeringPrincipal, uint32_t aLineNumber,
+    uint32_t aColumnNumber, const nsAString& aStyleText, nsresult* aRv) {
+  nsresult rv;
+
+  if (aRv) {
+    *aRv = NS_OK;
+  }
+
+  nsCOMPtr<nsIContentSecurityPolicy> csp =
+      PolicyContainer::GetCSP(aDocument->GetPolicyContainer());
+
+  if (!csp) {
+    return true;
+  }
+
+  if (csp->GetSkipAllowInlineStyleCheck()) {
+    return true;
+  }
+
+  bool isStyleElement = false;
+  nsAutoString nonce;
+  if (aElement && aElement->NodeInfo()->NameAtom() == nsGkAtoms::style) {
+    isStyleElement = true;
+    nsString* cspNonce =
+        static_cast<nsString*>(aElement->GetProperty(nsGkAtoms::nonce));
+    if (cspNonce) {
+      nonce = *cspNonce;
+    }
+  }
+
+  bool allowInlineStyle = true;
+  rv = csp->GetAllowsInline(
+      isStyleElement ? nsIContentSecurityPolicy::STYLE_SRC_ELEM_DIRECTIVE
+                     : nsIContentSecurityPolicy::STYLE_SRC_ATTR_DIRECTIVE,
+      !isStyleElement , nonce,
+      false,              
+      aElement, nullptr,  
+      aStyleText, aLineNumber, aColumnNumber, &allowInlineStyle);
+  NS_ENSURE_SUCCESS(rv, false);
+
+  return allowInlineStyle;
+}

@@ -1,0 +1,313 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "OrientedImage.h"
+
+#include "ImageRegion.h"
+#include "gfx2DGlue.h"
+#include "gfxContext.h"
+#include "gfxDrawable.h"
+#include "gfxPlatform.h"
+#include "gfxUtils.h"
+#include "mozilla/SVGImageContext.h"
+
+using std::swap;
+
+namespace mozilla {
+
+using namespace gfx;
+
+namespace image {
+
+NS_IMETHODIMP
+OrientedImage::GetWidth(int32_t* aWidth) {
+  if (mOrientation.SwapsWidthAndHeight()) {
+    return InnerImage()->GetHeight(aWidth);
+  } else {
+    return InnerImage()->GetWidth(aWidth);
+  }
+}
+
+NS_IMETHODIMP
+OrientedImage::GetHeight(int32_t* aHeight) {
+  if (mOrientation.SwapsWidthAndHeight()) {
+    return InnerImage()->GetWidth(aHeight);
+  } else {
+    return InnerImage()->GetHeight(aHeight);
+  }
+}
+
+nsresult OrientedImage::GetNativeSizes(nsTArray<IntSize>& aNativeSizes) {
+  nsresult rv = InnerImage()->GetNativeSizes(aNativeSizes);
+
+  if (mOrientation.SwapsWidthAndHeight()) {
+    auto i = aNativeSizes.Length();
+    while (i > 0) {
+      --i;
+      swap(aNativeSizes[i].width, aNativeSizes[i].height);
+    }
+  }
+
+  return rv;
+}
+
+NS_IMETHODIMP
+OrientedImage::GetIntrinsicSizeInAppUnits(nsSize* aSize) {
+  nsresult rv = InnerImage()->GetIntrinsicSizeInAppUnits(aSize);
+
+  if (mOrientation.SwapsWidthAndHeight()) {
+    swap(aSize->width, aSize->height);
+  }
+
+  return rv;
+}
+
+AspectRatio OrientedImage::GetIntrinsicRatio() {
+  AspectRatio ratio = InnerImage()->GetIntrinsicRatio();
+  if (ratio && mOrientation.SwapsWidthAndHeight()) {
+    ratio = ratio.Inverted();
+  }
+  return ratio;
+}
+
+already_AddRefed<SourceSurface> OrientedImage::OrientSurface(
+    Orientation aOrientation, SourceSurface* aSurface) {
+  MOZ_ASSERT(aSurface);
+
+  if (aOrientation.IsIdentity()) {
+    return do_AddRef(aSurface);
+  }
+
+  nsIntSize originalSize = aSurface->GetSize();
+  nsIntSize targetSize = originalSize;
+  if (aOrientation.SwapsWidthAndHeight()) {
+    swap(targetSize.width, targetSize.height);
+  }
+
+  auto drawable = MakeRefPtr<gfxSurfaceDrawable>(aSurface, originalSize);
+
+  gfx::SurfaceFormat surfaceFormat = IsOpaque(aSurface->GetFormat())
+                                         ? gfx::SurfaceFormat::OS_RGBX
+                                         : gfx::SurfaceFormat::OS_RGBA;
+
+  RefPtr<DrawTarget> target =
+      gfxPlatform::GetPlatform()->CreateOffscreenContentDrawTarget(
+          targetSize, surfaceFormat);
+  if (!target || !target->IsValid()) {
+    NS_ERROR("Could not create a DrawTarget");
+    return nullptr;
+  }
+
+  gfxContext ctx(target);
+
+  ctx.Multiply(OrientationMatrix(aOrientation, originalSize));
+  gfxUtils::DrawPixelSnapped(&ctx, drawable, SizeDouble(originalSize),
+                             ImageRegion::Create(originalSize), surfaceFormat,
+                             SamplingFilter::LINEAR);
+
+  return target->Snapshot();
+}
+
+NS_IMETHODIMP_(already_AddRefed<SourceSurface>)
+OrientedImage::GetFrame(uint32_t aWhichFrame, uint32_t aFlags) {
+  RefPtr<SourceSurface> innerSurface =
+      InnerImage()->GetFrame(aWhichFrame, aFlags);
+  NS_ENSURE_TRUE(innerSurface, nullptr);
+
+  return OrientSurface(mOrientation, innerSurface);
+}
+
+NS_IMETHODIMP_(already_AddRefed<SourceSurface>)
+OrientedImage::GetFrameAtSize(const IntSize& aSize, uint32_t aWhichFrame,
+                              uint32_t aFlags) {
+  IntSize innerSize = aSize;
+  if (mOrientation.SwapsWidthAndHeight()) {
+    swap(innerSize.width, innerSize.height);
+  }
+  RefPtr<SourceSurface> innerSurface =
+      InnerImage()->GetFrameAtSize(innerSize, aWhichFrame, aFlags);
+  NS_ENSURE_TRUE(innerSurface, nullptr);
+
+  return OrientSurface(mOrientation, innerSurface);
+}
+
+NS_IMETHODIMP_(bool)
+OrientedImage::IsImageContainerAvailable(WindowRenderer* aRenderer,
+                                         uint32_t aFlags) {
+  if (mOrientation.IsIdentity()) {
+    return InnerImage()->IsImageContainerAvailable(aRenderer, aFlags);
+  }
+  return false;
+}
+
+NS_IMETHODIMP_(ImgDrawResult)
+OrientedImage::GetImageProvider(WindowRenderer* aRenderer,
+                                const gfx::IntSize& aSize,
+                                const SVGImageContext& aSVGContext,
+                                const Maybe<ImageIntRegion>& aRegion,
+                                uint32_t aFlags,
+                                WebRenderImageProvider** aProvider) {
+
+  if (mOrientation.IsIdentity()) {
+    return InnerImage()->GetImageProvider(aRenderer, aSize, aSVGContext,
+                                          aRegion, aFlags, aProvider);
+  }
+
+  return ImgDrawResult::NOT_SUPPORTED;
+}
+
+struct MatrixBuilder {
+  explicit MatrixBuilder(bool aInvert) : mInvert(aInvert) {}
+
+  gfxMatrix Build() { return mMatrix; }
+
+  void Scale(gfxFloat aX, gfxFloat aY) {
+    if (mInvert) {
+      mMatrix *= gfxMatrix::Scaling(1.0 / aX, 1.0 / aY);
+    } else {
+      mMatrix.PreScale(aX, aY);
+    }
+  }
+
+  void Rotate(gfxFloat aPhi) {
+    if (mInvert) {
+      mMatrix *= gfxMatrix::Rotation(-aPhi);
+    } else {
+      mMatrix.PreRotate(aPhi);
+    }
+  }
+
+  void Translate(gfxPoint aDelta) {
+    if (mInvert) {
+      mMatrix *= gfxMatrix::Translation(-aDelta);
+    } else {
+      mMatrix.PreTranslate(aDelta);
+    }
+  }
+
+ private:
+  gfxMatrix mMatrix;
+  bool mInvert;
+};
+
+gfxMatrix OrientedImage::OrientationMatrix(Orientation aOrientation,
+                                           const nsIntSize& aSize,
+                                           bool aInvert ) {
+  MatrixBuilder builder(aInvert);
+
+  if (aOrientation.flip == Flip::Horizontal && !aOrientation.flipFirst) {
+    if (aOrientation.SwapsWidthAndHeight()) {
+      builder.Translate(gfxPoint(aSize.height, 0));
+    } else {
+      builder.Translate(gfxPoint(aSize.width, 0));
+    }
+    builder.Scale(-1.0, 1.0);
+  }
+
+  switch (aOrientation.rotation) {
+    case Angle::D0:
+      break;
+    case Angle::D90:
+      builder.Translate(gfxPoint(aSize.height, 0));
+      builder.Rotate(-1.5 * M_PI);
+      break;
+    case Angle::D180:
+      builder.Translate(gfxPoint(aSize.width, aSize.height));
+      builder.Rotate(-1.0 * M_PI);
+      break;
+    case Angle::D270:
+      builder.Translate(gfxPoint(0, aSize.width));
+      builder.Rotate(-0.5 * M_PI);
+      break;
+    default:
+      MOZ_ASSERT(false, "Invalid rotation value");
+  }
+
+  if (aOrientation.flip == Flip::Horizontal && aOrientation.flipFirst) {
+    builder.Translate(gfxPoint(aSize.width, 0.0));
+    builder.Scale(-1.0, 1.0);
+  }
+
+  return builder.Build();
+}
+
+NS_IMETHODIMP_(ImgDrawResult)
+OrientedImage::Draw(gfxContext* aContext, const nsIntSize& aSize,
+                    const ImageRegion& aRegion, uint32_t aWhichFrame,
+                    SamplingFilter aSamplingFilter,
+                    const SVGImageContext& aSVGContext, uint32_t aFlags,
+                    float aOpacity) {
+  if (mOrientation.IsIdentity()) {
+    return InnerImage()->Draw(aContext, aSize, aRegion, aWhichFrame,
+                              aSamplingFilter, aSVGContext, aFlags, aOpacity);
+  }
+
+  nsIntSize size(aSize);
+  if (mOrientation.SwapsWidthAndHeight()) {
+    swap(size.width, size.height);
+  }
+
+  gfxMatrix matrix(OrientationMatrix(size));
+  gfxContextMatrixAutoSaveRestore saveMatrix(aContext);
+  aContext->Multiply(matrix);
+
+  gfxMatrix inverseMatrix(OrientationMatrix(size,  true));
+  ImageRegion region(aRegion);
+  region.TransformBoundsBy(inverseMatrix);
+
+  auto orientViewport = [&](const SVGImageContext& aOldContext) {
+    SVGImageContext context(aOldContext);
+    auto oldViewport = aOldContext.GetViewportSize();
+    if (oldViewport && mOrientation.SwapsWidthAndHeight()) {
+      CSSIntSize newViewport(oldViewport->height, oldViewport->width);
+      context.SetViewportSize(Some(newViewport));
+    }
+    return context;
+  };
+
+  return InnerImage()->Draw(aContext, size, region, aWhichFrame,
+                            aSamplingFilter, orientViewport(aSVGContext),
+                            aFlags, aOpacity);
+}
+
+nsIntSize OrientedImage::OptimalImageSizeForDest(const gfxSize& aDest,
+                                                 uint32_t aWhichFrame,
+                                                 SamplingFilter aSamplingFilter,
+                                                 uint32_t aFlags) {
+  if (!mOrientation.SwapsWidthAndHeight()) {
+    return InnerImage()->OptimalImageSizeForDest(aDest, aWhichFrame,
+                                                 aSamplingFilter, aFlags);
+  }
+
+  gfxSize destSize(aDest.height, aDest.width);
+  nsIntSize innerImageSize(InnerImage()->OptimalImageSizeForDest(
+      destSize, aWhichFrame, aSamplingFilter, aFlags));
+  return nsIntSize(innerImageSize.height, innerImageSize.width);
+}
+
+NS_IMETHODIMP_(nsIntRect)
+OrientedImage::GetImageSpaceInvalidationRect(const nsIntRect& aRect) {
+  nsIntRect rect(InnerImage()->GetImageSpaceInvalidationRect(aRect));
+
+  if (mOrientation.IsIdentity()) {
+    return rect;
+  }
+
+  nsIntSize innerSize;
+  nsresult rv = InnerImage()->GetWidth(&innerSize.width);
+  rv = NS_FAILED(rv) ? rv : InnerImage()->GetHeight(&innerSize.height);
+  if (NS_FAILED(rv)) {
+    return rect;
+  }
+
+  gfxMatrix matrix(OrientationMatrix(innerSize));
+  gfxRect invalidRect(matrix.TransformBounds(
+      gfxRect(rect.X(), rect.Y(), rect.Width(), rect.Height())));
+
+  return IntRect::RoundOut(invalidRect.X(), invalidRect.Y(),
+                           invalidRect.Width(), invalidRect.Height());
+}
+
+}  
+}  

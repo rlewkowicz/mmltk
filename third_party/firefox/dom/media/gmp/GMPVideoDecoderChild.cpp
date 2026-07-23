@@ -1,0 +1,231 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "GMPVideoDecoderChild.h"
+
+#include "GMPContentChild.h"
+#include "GMPPlatform.h"
+#include "GMPVideoEncodedFrameImpl.h"
+#include "GMPVideoi420FrameImpl.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "nsProxyRelease.h"
+#include "nsThreadUtils.h"
+#include "runnable_utils.h"
+
+namespace mozilla::gmp {
+
+GMPVideoDecoderChild::GMPVideoDecoderChild(GMPContentChild* aPlugin)
+    : mPlugin(aPlugin), mVideoDecoder(nullptr) {
+  MOZ_ASSERT(mPlugin);
+}
+
+GMPVideoDecoderChild::~GMPVideoDecoderChild() {
+  if (mVideoDecoder) {
+    mVideoDecoder->DecodingComplete();
+  }
+}
+
+bool GMPVideoDecoderChild::MgrIsOnOwningThread() const {
+  return !mPlugin || mPlugin->GMPMessageLoop() == MessageLoop::current();
+}
+
+void GMPVideoDecoderChild::Init(GMPVideoDecoder* aDecoder) {
+  MOZ_ASSERT(aDecoder,
+             "Cannot initialize video decoder child without a video decoder!");
+  mVideoDecoder = aDecoder;
+}
+
+void GMPVideoDecoderChild::Decoded(GMPVideoi420Frame* aDecodedFrame) {
+  if (!aDecodedFrame) {
+    MOZ_CRASH("Not given a decoded frame!");
+  }
+
+  if (NS_WARN_IF(!mPlugin)) {
+    aDecodedFrame->Destroy();
+    return;
+  }
+
+  MOZ_ASSERT(mPlugin->GMPMessageLoop() == MessageLoop::current());
+
+  auto df = static_cast<GMPVideoi420FrameImpl*>(aDecodedFrame);
+
+  ipc::Shmem inputShmem;
+  if (MgrTakeShmem(GMPSharedMemClass::Encoded, &inputShmem)) {
+    (void)SendReturnShmem(std::move(inputShmem));
+  }
+
+  GMPVideoi420FrameData frameData;
+  ipc::Shmem frameShmem;
+  nsTArray<uint8_t> frameArray;
+
+  if (df->InitFrameData(frameData, frameShmem)) {
+    (void)SendDecodedShmem(frameData, std::move(frameShmem));
+  } else if (df->InitFrameData(frameData, frameArray)) {
+    (void)SendDecodedData(frameData, std::move(frameArray));
+  } else {
+    MOZ_CRASH("Decoded without any frame data!");
+  }
+
+  aDecodedFrame->Destroy();
+}
+
+void GMPVideoDecoderChild::ReceivedDecodedReferenceFrame(
+    const uint64_t aPictureId) {
+  if (NS_WARN_IF(!mPlugin)) {
+    return;
+  }
+
+  MOZ_ASSERT(mPlugin->GMPMessageLoop() == MessageLoop::current());
+
+  SendReceivedDecodedReferenceFrame(aPictureId);
+}
+
+void GMPVideoDecoderChild::ReceivedDecodedFrame(const uint64_t aPictureId) {
+  if (NS_WARN_IF(!mPlugin)) {
+    return;
+  }
+
+  MOZ_ASSERT(mPlugin->GMPMessageLoop() == MessageLoop::current());
+
+  SendReceivedDecodedFrame(aPictureId);
+}
+
+void GMPVideoDecoderChild::InputDataExhausted() {
+  if (NS_WARN_IF(!mPlugin)) {
+    return;
+  }
+
+  MOZ_ASSERT(mPlugin->GMPMessageLoop() == MessageLoop::current());
+
+  SendInputDataExhausted();
+}
+
+void GMPVideoDecoderChild::DrainComplete() {
+  if (!mDrainSelfRef) {
+    MOZ_ASSERT_UNREACHABLE("DrainComplete without Drain!");
+    return;
+  }
+
+  NS_ProxyRelease("GMPVideoDecoderChild::DrainComplete",
+                  GetMainThreadSerialEventTarget(), mDrainSelfRef.forget(),
+                   true);
+
+  if (NS_WARN_IF(!mPlugin)) {
+    return;
+  }
+
+  MOZ_ASSERT(mPlugin->GMPMessageLoop() == MessageLoop::current());
+
+  SendDrainComplete();
+}
+
+void GMPVideoDecoderChild::ResetComplete() {
+  if (!mResetSelfRef) {
+    MOZ_ASSERT_UNREACHABLE("ResetComplete without Reset!");
+    return;
+  }
+
+  NS_ProxyRelease("GMPVideoDecoderChild::ResetComplete",
+                  GetMainThreadSerialEventTarget(), mResetSelfRef.forget(),
+                   true);
+
+  if (NS_WARN_IF(!mPlugin)) {
+    return;
+  }
+
+  MOZ_ASSERT(mPlugin->GMPMessageLoop() == MessageLoop::current());
+
+  SendResetComplete();
+}
+
+void GMPVideoDecoderChild::Error(GMPErr aError) {
+  if (NS_WARN_IF(!mPlugin)) {
+    return;
+  }
+
+  MOZ_ASSERT(mPlugin->GMPMessageLoop() == MessageLoop::current());
+
+  SendError(aError);
+}
+
+mozilla::ipc::IPCResult GMPVideoDecoderChild::RecvInitDecode(
+    const GMPVideoCodec& aCodecSettings, nsTArray<uint8_t>&& aCodecSpecific,
+    const int32_t& aCoreCount) {
+  if (!mVideoDecoder) {
+    return IPC_FAIL(this, "!mVideoDecoder");
+  }
+
+  mVideoDecoder->InitDecode(aCodecSettings, aCodecSpecific.Elements(),
+                            aCodecSpecific.Length(), this, aCoreCount);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult GMPVideoDecoderChild::RecvGiveShmem(
+    ipc::Shmem&& aOutputShmem) {
+  MgrGiveShmem(GMPSharedMemClass::Decoded, std::move(aOutputShmem));
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult GMPVideoDecoderChild::RecvDecode(
+    const GMPVideoEncodedFrameData& aInputFrame, ipc::Shmem&& aInputShmem,
+    const bool& aMissingFrames, nsTArray<uint8_t>&& aCodecSpecificInfo,
+    const int64_t& aRenderTimeMs) {
+  if (!mVideoDecoder) {
+    DeallocShmem(aInputShmem);
+    return IPC_FAIL(this, "!mVideoDecoder");
+  }
+
+  if (!GMPVideoEncodedFrameImpl::CheckFrameData(aInputFrame,
+                                                aInputShmem.Size<uint8_t>())) {
+    DeallocShmem(aInputShmem);
+    return IPC_OK();
+  }
+
+  auto* f =
+      new GMPVideoEncodedFrameImpl(aInputFrame, std::move(aInputShmem), this);
+
+  mVideoDecoder->Decode(f, aMissingFrames, aCodecSpecificInfo.Elements(),
+                        aCodecSpecificInfo.Length(), aRenderTimeMs);
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult GMPVideoDecoderChild::RecvReset() {
+  if (!mVideoDecoder) {
+    return IPC_FAIL(this, "!mVideoDecoder");
+  }
+
+  if (mResetSelfRef) {
+    MOZ_ASSERT_UNREACHABLE("Already has outstanding reset!");
+    return IPC_OK();
+  }
+
+  mResetSelfRef = this;
+  mVideoDecoder->Reset();
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult GMPVideoDecoderChild::RecvDrain() {
+  if (!mVideoDecoder) {
+    return IPC_FAIL(this, "!mVideoDecoder");
+  }
+
+  if (mDrainSelfRef) {
+    MOZ_ASSERT_UNREACHABLE("Already has outstanding drain!");
+    return IPC_OK();
+  }
+
+  mDrainSelfRef = this;
+  mVideoDecoder->Drain();
+
+  return IPC_OK();
+}
+
+void GMPVideoDecoderChild::ActorDestroy(ActorDestroyReason why) {
+  MgrPurgeShmems();
+  mPlugin = nullptr;
+}
+
+}  

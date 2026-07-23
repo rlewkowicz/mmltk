@@ -1,0 +1,966 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/PrototypeDocumentContentSink.h"
+
+#include "js/CompilationAndEvaluation.h"
+#include "js/Utility.h"  // JS::FreePolicy
+#include "js/experimental/JSStencil.h"
+#include "mozAutoDocUpdate.h"
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/LoadInfo.h"
+#include "mozilla/Logging.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/StyleSheetInlines.h"
+#include "mozilla/Try.h"
+#include "mozilla/css/Loader.h"
+#include "mozilla/dom/AutoEntryScript.h"
+#include "mozilla/dom/CDATASection.h"
+#include "mozilla/dom/Comment.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentType.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/HTMLTemplateElement.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/dom/ProcessingInstruction.h"
+#include "mozilla/dom/ScriptLoader.h"
+#include "mozilla/dom/XMLStylesheetProcessingInstruction.h"
+#include "mozilla/dom/nsCSPUtils.h"
+#include "nsCOMPtr.h"
+#include "nsCRT.h"
+#include "nsContentCreatorFunctions.h"
+#include "nsContentPolicyUtils.h"
+#include "nsContentUtils.h"
+#include "nsDocElementCreatedNotificationRunner.h"
+#include "nsError.h"
+#include "nsGkAtoms.h"
+#include "nsHTMLParts.h"
+#include "nsHtml5SVGLoadDispatcher.h"
+#include "nsIChannel.h"
+#include "nsIContent.h"
+#include "nsIContentPolicy.h"
+#include "nsIParser.h"
+#include "nsIScriptContext.h"
+#include "nsIScriptElement.h"
+#include "nsIScriptError.h"
+#include "nsIScriptGlobalObject.h"
+#include "nsIURI.h"
+#include "nsMimeTypes.h"
+#include "nsNameSpaceManager.h"
+#include "nsNetUtil.h"
+#include "nsNodeInfoManager.h"
+#include "nsReadableUtils.h"
+#include "nsRect.h"
+#include "nsTextNode.h"
+#include "nsUnicharUtils.h"
+#include "nsXULElement.h"
+#include "nsXULPrototypeCache.h"
+#include "prtime.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+LazyLogModule PrototypeDocumentContentSink::gLog("PrototypeDocument");
+
+nsresult NS_NewPrototypeDocumentContentSink(nsIContentSink** aResult,
+                                            Document* aDoc, nsIURI* aURI,
+                                            nsISupports* aContainer,
+                                            nsIChannel* aChannel) {
+  MOZ_ASSERT(nullptr != aResult, "null ptr");
+  if (nullptr == aResult) {
+    return NS_ERROR_NULL_POINTER;
+  }
+  RefPtr<PrototypeDocumentContentSink> it = new PrototypeDocumentContentSink();
+
+  nsresult rv = it->Init(aDoc, aURI, aContainer, aChannel);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  it.forget(aResult);
+  return NS_OK;
+}
+
+namespace mozilla::dom {
+
+PrototypeDocumentContentSink::PrototypeDocumentContentSink()
+    : mNextSrcLoadWaiter(nullptr),
+      mCurrentScriptProto(nullptr),
+      mOffThreadCompiling(false),
+      mStillWalking(false),
+      mPendingSheets(0) {}
+
+PrototypeDocumentContentSink::~PrototypeDocumentContentSink() {
+  NS_ASSERTION(
+      mNextSrcLoadWaiter == nullptr,
+      "unreferenced document still waiting for script source to load?");
+}
+
+nsresult PrototypeDocumentContentSink::Init(Document* aDoc, nsIURI* aURI,
+                                            nsISupports* aContainer,
+                                            nsIChannel* aChannel) {
+  MOZ_ASSERT(aDoc, "null ptr");
+  MOZ_ASSERT(aURI, "null ptr");
+
+  mDocument = aDoc;
+
+  mDocument->SetDelayFrameLoaderInitialization(true);
+  mDocument->SetMayStartLayout(false);
+
+  nsresult rv = NS_GetFinalChannelURI(aChannel, getter_AddRefs(mDocumentURI));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mScriptLoader = mDocument->GetScriptLoader();
+
+  return NS_OK;
+}
+
+NS_IMPL_CYCLE_COLLECTION(PrototypeDocumentContentSink, mParser, mDocumentURI,
+                         mDocument, mScriptLoader, mContextStack,
+                         mCurrentPrototype)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(PrototypeDocumentContentSink)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIContentSink)
+  NS_INTERFACE_MAP_ENTRY(nsIContentSink)
+  NS_INTERFACE_MAP_ENTRY(nsIStreamLoaderObserver)
+  NS_INTERFACE_MAP_ENTRY(nsICSSLoaderObserver)
+  NS_INTERFACE_MAP_ENTRY(nsIOffThreadScriptReceiver)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(PrototypeDocumentContentSink)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(PrototypeDocumentContentSink)
+
+
+void PrototypeDocumentContentSink::SetDocumentCharset(
+    NotNull<const Encoding*> aEncoding) {
+  if (mDocument) {
+    mDocument->SetDocumentCharacterSet(aEncoding);
+  }
+}
+
+nsISupports* PrototypeDocumentContentSink::GetTarget() {
+  return ToSupports(mDocument);
+}
+
+bool PrototypeDocumentContentSink::IsScriptExecuting() {
+  if (!mScriptLoader) {
+    MOZ_ASSERT(false, "Can't load prototype docs as data");
+    return false;
+  }
+  return !!mScriptLoader->GetCurrentScript();
+}
+
+NS_IMETHODIMP
+PrototypeDocumentContentSink::SetParser(nsParserBase* aParser) {
+  MOZ_ASSERT(aParser, "Should have a parser here!");
+  mParser = aParser;
+  return NS_OK;
+}
+
+nsIParser* PrototypeDocumentContentSink::GetParser() {
+  return static_cast<nsIParser*>(mParser.get());
+}
+
+void PrototypeDocumentContentSink::ContinueInterruptedParsingIfEnabled() {
+  if (mParser && mParser->IsParserEnabled()) {
+    GetParser()->ContinueInterruptedParsing();
+  }
+}
+
+void PrototypeDocumentContentSink::ContinueInterruptedParsingAsync() {
+  nsCOMPtr<nsIRunnable> ev = NewRunnableMethod(
+      "PrototypeDocumentContentSink::ContinueInterruptedParsingIfEnabled", this,
+      &PrototypeDocumentContentSink::ContinueInterruptedParsingIfEnabled);
+  mDocument->Dispatch(ev.forget());
+}
+
+
+PrototypeDocumentContentSink::ContextStack::ContextStack()
+    : mTop(nullptr), mDepth(0) {}
+
+PrototypeDocumentContentSink::ContextStack::~ContextStack() { Clear(); }
+
+void PrototypeDocumentContentSink::ContextStack::Traverse(
+    nsCycleCollectionTraversalCallback& aCallback, const char* aName,
+    uint32_t aFlags) {
+  aFlags |= CycleCollectionEdgeNameArrayFlag;
+  Entry* current = mTop;
+  while (current) {
+    CycleCollectionNoteChild(aCallback, current->mElement, aName, aFlags);
+    current = current->mNext;
+  }
+}
+
+void PrototypeDocumentContentSink::ContextStack::Clear() {
+  while (mTop) {
+    Entry* doomed = mTop;
+    mTop = mTop->mNext;
+    NS_IF_RELEASE(doomed->mElement);
+    delete doomed;
+  }
+  mDepth = 0;
+}
+
+nsresult PrototypeDocumentContentSink::ContextStack::Push(
+    nsXULPrototypeElement* aPrototype, nsIContent* aElement) {
+  Entry* entry = new Entry;
+  entry->mPrototype = aPrototype;
+  entry->mElement = aElement;
+  NS_IF_ADDREF(entry->mElement);
+  entry->mIndex = 0;
+
+  entry->mNext = mTop;
+  mTop = entry;
+
+  ++mDepth;
+  return NS_OK;
+}
+
+nsresult PrototypeDocumentContentSink::ContextStack::Pop() {
+  if (mDepth == 0) return NS_ERROR_UNEXPECTED;
+
+  Entry* doomed = mTop;
+  mTop = mTop->mNext;
+  --mDepth;
+
+  NS_IF_RELEASE(doomed->mElement);
+  delete doomed;
+  return NS_OK;
+}
+
+nsresult PrototypeDocumentContentSink::ContextStack::Peek(
+    nsXULPrototypeElement** aPrototype, nsIContent** aElement,
+    int32_t* aIndex) {
+  if (mDepth == 0) return NS_ERROR_UNEXPECTED;
+
+  *aPrototype = mTop->mPrototype;
+  *aElement = mTop->mElement;
+  NS_IF_ADDREF(*aElement);
+  *aIndex = mTop->mIndex;
+
+  return NS_OK;
+}
+
+nsresult PrototypeDocumentContentSink::ContextStack::SetTopIndex(
+    int32_t aIndex) {
+  if (mDepth == 0) return NS_ERROR_UNEXPECTED;
+
+  mTop->mIndex = aIndex;
+  return NS_OK;
+}
+
+
+nsresult PrototypeDocumentContentSink::OnPrototypeLoadDone(
+    nsXULPrototypeDocument* aPrototype) {
+  mCurrentPrototype = aPrototype;
+  mDocument->SetPrototypeDocument(aPrototype);
+
+  nsresult rv = PrepareToWalk();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = ResumeWalk();
+
+  return rv;
+}
+
+nsresult PrototypeDocumentContentSink::PrepareToWalk() {
+  MOZ_ASSERT(mCurrentPrototype);
+  nsresult rv;
+
+  mStillWalking = true;
+
+  mDocument->BeginLoad();
+  MOZ_ASSERT(!mDocument->HasChildren());
+
+  nsXULPrototypeElement* proto = mCurrentPrototype->GetRootElement();
+
+  if (!proto) {
+    if (MOZ_LOG_TEST(gLog, LogLevel::Error)) {
+      nsCOMPtr<nsIURI> url = mCurrentPrototype->GetURI();
+
+      nsAutoCString urlspec;
+      rv = url->GetSpec(urlspec);
+      if (NS_FAILED(rv)) return rv;
+
+      MOZ_LOG(gLog, LogLevel::Error,
+              ("prototype: error parsing '%s'", urlspec.get()));
+    }
+
+    return NS_OK;
+  }
+
+  const nsTArray<RefPtr<nsXULPrototypePI> >& processingInstructions =
+      mCurrentPrototype->GetProcessingInstructions();
+
+  uint32_t total = processingInstructions.Length();
+  for (uint32_t i = 0; i < total; ++i) {
+    rv = CreateAndInsertPI(processingInstructions[i], mDocument,
+                            true);
+    if (NS_FAILED(rv)) return rv;
+  }
+
+  RefPtr<Element> root;
+
+  rv = CreateElementFromPrototype(proto, getter_AddRefs(root), nullptr);
+  if (NS_FAILED(rv)) return rv;
+
+  ErrorResult error;
+  mDocument->AppendChildTo(root, false, error);
+  if (error.Failed()) {
+    return error.StealNSResult();
+  }
+
+  mDocument->UpdateDocumentStates(DocumentState::RTL_LOCALE, true);
+
+  nsContentUtils::AddScriptRunner(
+      MakeAndAddRef<nsDocElementCreatedNotificationRunner>(mDocument));
+
+  NS_ASSERTION(mContextStack.Depth() == 0,
+               "something's on the context stack already");
+  if (mContextStack.Depth() != 0) return NS_ERROR_UNEXPECTED;
+
+  rv = mContextStack.Push(proto, root);
+  if (NS_FAILED(rv)) return rv;
+
+  return NS_OK;
+}
+
+nsresult PrototypeDocumentContentSink::CreateAndInsertPI(
+    const nsXULPrototypePI* aProtoPI, nsINode* aParent, bool aInProlog) {
+  MOZ_ASSERT(aProtoPI, "null ptr");
+  MOZ_ASSERT(aParent, "null ptr");
+
+  RefPtr<ProcessingInstruction> node = NS_NewXMLProcessingInstruction(
+      aParent->NodeInfoManager(), aProtoPI->mTarget, aProtoPI->mData);
+
+  nsresult rv;
+  if (aProtoPI->mTarget.EqualsLiteral("xml-stylesheet")) {
+    MOZ_ASSERT(LinkStyle::FromNode(*node),
+               "XML Stylesheet node does not implement LinkStyle!");
+    auto* pi = static_cast<XMLStylesheetProcessingInstruction*>(node.get());
+    rv = InsertXMLStylesheetPI(aProtoPI, aParent, pi);
+  } else {
+    if (aInProlog && aProtoPI->mTarget.EqualsLiteral("csp")) {
+      CSP_ApplyMetaCSPToDoc(*aParent->OwnerDoc(), aProtoPI->mData);
+    }
+
+    ErrorResult error;
+    aParent->AppendChildTo(node->AsContent(), false, error);
+    rv = error.StealNSResult();
+  }
+
+  return rv;
+}
+
+nsresult PrototypeDocumentContentSink::InsertXMLStylesheetPI(
+    const nsXULPrototypePI* aProtoPI, nsINode* aParent,
+    XMLStylesheetProcessingInstruction* aPINode) {
+  aPINode->DisableUpdates();
+  aPINode->OverrideBaseURI(mCurrentPrototype->GetURI());
+
+  ErrorResult rv;
+  aParent->AppendChildTo(aPINode, false, rv);
+  if (rv.Failed()) {
+    return rv.StealNSResult();
+  }
+
+  auto result = aPINode->EnableUpdatesAndUpdateStyleSheet(this);
+  if (result.isErr()) {
+    if (result.unwrapErr() == NS_ERROR_OUT_OF_MEMORY) {
+      return result.unwrapErr();
+    }
+    return NS_OK;
+  }
+
+  auto update = result.unwrap();
+  if (update.ShouldBlock()) {
+    ++mPendingSheets;
+  }
+
+  return NS_OK;
+}
+
+void PrototypeDocumentContentSink::CloseElement(Element* aElement) {
+  if (nsIContent::RequiresDoneAddingChildren(
+          aElement->NodeInfo()->NamespaceID(),
+          aElement->NodeInfo()->NameAtom())) {
+    aElement->DoneAddingChildren(false);
+  }
+
+  if (auto* linkStyle = LinkStyle::FromNode(*aElement)) {
+    auto result = linkStyle->EnableUpdatesAndUpdateStyleSheet(this);
+    if (result.isOk() && result.unwrap().ShouldBlock()) {
+      ++mPendingSheets;
+    }
+    return;
+  }
+
+  if (aElement->IsHTMLElement(nsGkAtoms::script) ||
+      aElement->IsSVGElement(nsGkAtoms::script)) {
+    nsCOMPtr<nsIScriptElement> sele = do_QueryInterface(aElement);
+    MOZ_ASSERT(sele, "Node didn't QI to script.");
+    if (sele->GetScriptIsModule()) {
+      {
+        nsAutoMicroTask mt;
+      }
+      sele->AttemptToExecute(nullptr );
+    }
+  }
+}
+
+nsresult PrototypeDocumentContentSink::ResumeWalk() {
+  nsresult rv = ResumeWalkInternal();
+  if (NS_FAILED(rv)) {
+    nsContentUtils::ReportToConsoleNonLocalized(
+        u"Failed to load document from prototype document."_ns,
+        nsIScriptError::errorFlag, "Prototype Document"_ns, mDocument,
+        SourceLocation{mDocumentURI.get()});
+  }
+  return rv;
+}
+
+nsresult PrototypeDocumentContentSink::ResumeWalkInternal() {
+  MOZ_ASSERT(mStillWalking);
+  nsresult rv;
+  nsCOMPtr<nsIURI> docURI =
+      mCurrentPrototype ? mCurrentPrototype->GetURI() : nullptr;
+
+  while (true) {
+
+    while (mContextStack.Depth() > 0) {
+      nsXULPrototypeElement* proto;
+      nsCOMPtr<nsIContent> element;
+      nsCOMPtr<nsIContent> nodeToPushTo;
+      int32_t indx;  
+      rv = mContextStack.Peek(&proto, getter_AddRefs(element), &indx);
+      if (NS_FAILED(rv)) return rv;
+
+      if (indx >= (int32_t)proto->mChildren.Length()) {
+        if (element) {
+          CloseElement(element->AsElement());
+        }
+        mContextStack.Pop();
+        continue;
+      }
+
+      nodeToPushTo = element;
+      if (auto* templateElement = HTMLTemplateElement::FromNode(element)) {
+        nodeToPushTo = templateElement->Content();
+      }
+
+      nsXULPrototypeNode* childproto = proto->mChildren[indx];
+      mContextStack.SetTopIndex(++indx);
+
+      switch (childproto->mType) {
+        case nsXULPrototypeNode::eType_Element: {
+          auto* protoele = static_cast<nsXULPrototypeElement*>(childproto);
+
+          RefPtr<Element> child;
+          MOZ_TRY(CreateElementFromPrototype(protoele, getter_AddRefs(child),
+                                             nodeToPushTo));
+
+          if (auto* linkStyle = LinkStyle::FromNode(*child)) {
+            linkStyle->DisableUpdates();
+          }
+
+          ErrorResult error;
+          nodeToPushTo->AppendChildTo(child, false, error);
+          if (error.Failed()) {
+            return error.StealNSResult();
+          }
+
+          if (nsIContent::RequiresDoneCreatingElement(
+                  protoele->mNodeInfo->NamespaceID(),
+                  protoele->mNodeInfo->NameAtom())) {
+            child->DoneCreatingElement();
+          }
+
+          if (protoele->mChildren.Length() > 0) {
+            rv = mContextStack.Push(protoele, child);
+            if (NS_FAILED(rv)) return rv;
+          } else {
+            CloseElement(child);
+          }
+        } break;
+
+        case nsXULPrototypeNode::eType_Script: {
+          auto* scriptproto = static_cast<nsXULPrototypeScript*>(childproto);
+          if (scriptproto->mSrcURI) {
+            bool blocked;
+            rv = LoadScript(scriptproto, &blocked);
+
+            if (NS_SUCCEEDED(rv) && blocked) return NS_OK;
+          } else if (scriptproto->HasStencil()) {
+            rv = ExecuteScript(scriptproto);
+            if (NS_FAILED(rv)) return rv;
+          }
+        } break;
+
+        case nsXULPrototypeNode::eType_Text: {
+          nsNodeInfoManager* nim = nodeToPushTo->NodeInfo()->NodeInfoManager();
+          RefPtr<nsTextNode> text = new (nim) nsTextNode(nim);
+
+          auto* textproto = static_cast<nsXULPrototypeText*>(childproto);
+          text->SetText(textproto->mValue, false);
+
+          ErrorResult error;
+          nodeToPushTo->AppendChildTo(text, false, error);
+          if (error.Failed()) {
+            return error.StealNSResult();
+          }
+        } break;
+
+        case nsXULPrototypeNode::eType_PI: {
+          auto* piProto = static_cast<nsXULPrototypePI*>(childproto);
+
+
+          if (piProto->mTarget.EqualsLiteral("xml-stylesheet") ||
+              piProto->mTarget.EqualsLiteral("csp")) {
+            AutoTArray<nsString, 1> params = {piProto->mTarget};
+
+            nsContentUtils::ReportToConsole(
+                nsIScriptError::warningFlag, "XUL Document"_ns, nullptr,
+                PropertiesFile::XUL_PROPERTIES, "PINotInProlog2", params,
+                SourceLocation(docURI.get()));
+          }
+
+          if (nsIContent* parent = element.get()) {
+            rv = CreateAndInsertPI(piProto, parent,  false);
+            NS_ENSURE_SUCCESS(rv, rv);
+          }
+        } break;
+
+        default:
+          MOZ_ASSERT_UNREACHABLE("Unexpected nsXULPrototypeNode::Type");
+      }
+    }
+
+    break;
+  }
+
+  mStillWalking = false;
+  return MaybeDoneWalking();
+}
+
+void PrototypeDocumentContentSink::InitialTranslationCompleted() {
+  MaybeDoneWalking();
+}
+
+nsresult PrototypeDocumentContentSink::MaybeDoneWalking() {
+  if (mPendingSheets > 0 || mStillWalking) {
+    return NS_OK;
+  }
+
+  if (mDocument->HasPendingInitialTranslation()) {
+    mDocument->OnParsingCompleted();
+    return NS_OK;
+  }
+
+  return DoneWalking();
+}
+
+nsresult PrototypeDocumentContentSink::DoneWalking() {
+  MOZ_ASSERT(mPendingSheets == 0, "there are sheets to be loaded");
+  MOZ_ASSERT(!mStillWalking, "walk not done");
+  MOZ_ASSERT(!mDocument->HasPendingInitialTranslation(), "translation pending");
+
+  if (mDocument) {
+    MOZ_ASSERT(mDocument->GetReadyStateEnum() == Document::READYSTATE_LOADING,
+               "Bad readyState");
+    mDocument->SetReadyStateInternal(Document::READYSTATE_INTERACTIVE);
+    mDocument->NotifyPossibleTitleChange(false);
+
+    nsContentUtils::DispatchEventOnlyToChrome(mDocument, mDocument,
+                                              u"MozBeforeInitialXULLayout"_ns,
+                                              CanBubble::eYes, Cancelable::eNo);
+  }
+
+  if (mScriptLoader) {
+    mScriptLoader->ParsingComplete(false);
+    mScriptLoader->DeferCheckpointReached();
+  }
+
+  StartLayout();
+
+  if (mDocumentURI->SchemeIs("chrome") &&
+      nsXULPrototypeCache::GetInstance()->IsEnabled()) {
+    bool isCachedOnDisk;
+    nsXULPrototypeCache::GetInstance()->HasPrototype(mDocumentURI,
+                                                     &isCachedOnDisk);
+    if (!isCachedOnDisk) {
+      if (!mDocument->GetDocumentElement() ||
+          (mDocument->GetDocumentElement()->NodeInfo()->Equals(
+               nsGkAtoms::parsererror) &&
+           mDocument->GetDocumentElement()->NodeInfo()->NamespaceEquals(
+               nsDependentAtomString(nsGkAtoms::nsuri_parsererror)))) {
+        nsXULPrototypeCache::GetInstance()->RemovePrototype(mDocumentURI);
+      } else {
+        nsXULPrototypeCache::GetInstance()->WritePrototype(mCurrentPrototype);
+      }
+    }
+  }
+
+  mDocument->SetDelayFrameLoaderInitialization(false);
+  RefPtr<Document> doc = mDocument;
+  doc->MaybeInitializeFinalizeFrameLoaders();
+
+
+  doc->SetScrollToRef(mDocument->GetDocumentURI());
+
+  doc->EndLoad();
+
+  return NS_OK;
+}
+
+void PrototypeDocumentContentSink::StartLayout() {
+  mDocument->SetMayStartLayout(true);
+  RefPtr<PresShell> presShell = mDocument->GetPresShell();
+  if (presShell && !presShell->DidInitialize()) {
+    nsresult rv = presShell->Initialize();
+    if (NS_FAILED(rv)) {
+      return;
+    }
+  }
+}
+
+NS_IMETHODIMP
+PrototypeDocumentContentSink::StyleSheetLoaded(StyleSheet* aSheet,
+                                               bool aWasDeferred,
+                                               nsresult aStatus) {
+  if (!aWasDeferred) {
+    MOZ_ASSERT(mPendingSheets > 0, "Unexpected StyleSheetLoaded notification");
+
+    --mPendingSheets;
+
+    return MaybeDoneWalking();
+  }
+
+  return NS_OK;
+}
+
+nsresult PrototypeDocumentContentSink::LoadScript(
+    nsXULPrototypeScript* aScriptProto, bool* aBlock) {
+  nsresult rv;
+
+  bool isChromeDoc = mDocumentURI->SchemeIs("chrome");
+
+  if (isChromeDoc && aScriptProto->HasStencil()) {
+    rv = ExecuteScript(aScriptProto);
+
+    *aBlock = false;
+    return NS_OK;
+  }
+
+  bool useXULCache = nsXULPrototypeCache::GetInstance()->IsEnabled();
+
+  if (isChromeDoc && useXULCache) {
+    RefPtr<JS::Stencil> newStencil =
+        nsXULPrototypeCache::GetInstance()->GetStencil(aScriptProto->mSrcURI);
+    if (newStencil) {
+      aScriptProto->Set(newStencil);
+    }
+
+    if (aScriptProto->HasStencil()) {
+      rv = ExecuteScript(aScriptProto);
+
+      *aBlock = false;
+      return NS_OK;
+    }
+  }
+
+  aScriptProto->Set(nullptr);
+
+  NS_ASSERTION(!mCurrentScriptProto,
+               "still loading a script when starting another load?");
+  mCurrentScriptProto = aScriptProto;
+
+  if (isChromeDoc && aScriptProto->mSrcLoading) {
+    mNextSrcLoadWaiter = aScriptProto->mSrcLoadWaiters;
+    aScriptProto->mSrcLoadWaiters = this;
+    NS_ADDREF_THIS();
+  } else {
+    nsCOMPtr<nsILoadGroup> group =
+        mDocument
+            ->GetDocumentLoadGroup();  
+
+    nsCOMPtr<nsIStreamLoader> loader;
+    rv = NS_NewStreamLoader(
+        getter_AddRefs(loader), aScriptProto->mSrcURI,
+        this,       
+        mDocument,  
+        nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_INHERITS_SEC_CONTEXT,
+        nsIContentPolicy::TYPE_INTERNAL_SCRIPT, group);
+
+    if (NS_FAILED(rv)) {
+      mCurrentScriptProto = nullptr;
+      return rv;
+    }
+
+    aScriptProto->mSrcLoading = true;
+  }
+
+  *aBlock = true;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+PrototypeDocumentContentSink::OnStreamComplete(nsIStreamLoader* aLoader,
+                                               nsISupports* context,
+                                               nsresult aStatus,
+                                               uint32_t stringLen,
+                                               const uint8_t* string) {
+  nsCOMPtr<nsIRequest> request;
+  aLoader->GetRequest(getter_AddRefs(request));
+  nsCOMPtr<nsIChannel> channel = do_QueryInterface(request);
+
+#ifdef DEBUG
+  if (NS_FAILED(aStatus)) {
+    if (channel) {
+      nsCOMPtr<nsIURI> uri;
+      channel->GetURI(getter_AddRefs(uri));
+      if (uri) {
+        printf("Failed to load %s\n", uri->GetSpecOrDefault().get());
+      }
+    }
+  }
+#endif
+
+  nsresult rv = aStatus;
+
+  NS_ASSERTION(mCurrentScriptProto && mCurrentScriptProto->mSrcLoading,
+               "script source not loading on unichar stream complete?");
+  if (!mCurrentScriptProto) {
+    return NS_OK;
+  }
+
+  if (NS_SUCCEEDED(aStatus)) {
+    nsCOMPtr<nsIURI> uri = mCurrentScriptProto->mSrcURI;
+
+
+    MOZ_ASSERT(!mOffThreadCompiling,
+               "PrototypeDocument can't load multiple scripts at once");
+
+    UniquePtr<Utf8Unit[], JS::FreePolicy> units;
+    size_t unitsLength = 0;
+
+    rv = ScriptLoader::ConvertToUTF8(channel, string, stringLen, u""_ns,
+                                     mDocument, units, unitsLength);
+    if (NS_SUCCEEDED(rv)) {
+      rv = mCurrentScriptProto->CompileMaybeOffThread(
+          std::move(units), unitsLength, uri, 1, mDocument, this);
+      if (NS_SUCCEEDED(rv) && !mCurrentScriptProto->HasStencil()) {
+        mOffThreadCompiling = true;
+        mDocument->BlockOnload();
+        return NS_OK;
+      }
+    }
+  }
+
+  return OnScriptCompileComplete(mCurrentScriptProto->GetStencil(), rv);
+}
+
+NS_IMETHODIMP
+PrototypeDocumentContentSink::OnScriptCompileComplete(JS::Stencil* aStencil,
+                                                      nsresult aStatus) {
+  if (!mCurrentScriptProto) {
+    return NS_OK;
+  }
+
+  if (aStencil && !mCurrentScriptProto->HasStencil()) {
+    mCurrentScriptProto->Set(aStencil);
+  }
+
+  if (mOffThreadCompiling) {
+    mOffThreadCompiling = false;
+    mDocument->UnblockOnload(false);
+  }
+
+  nsXULPrototypeScript* scriptProto = mCurrentScriptProto;
+  mCurrentScriptProto = nullptr;
+
+  scriptProto->mSrcLoading = false;
+
+  nsresult rv = aStatus;
+  if (NS_SUCCEEDED(rv)) {
+    rv = ExecuteScript(scriptProto);
+
+    bool useXULCache = nsXULPrototypeCache::GetInstance()->IsEnabled();
+
+    if (useXULCache && mDocumentURI->SchemeIs("chrome") &&
+        scriptProto->HasStencil()) {
+      nsXULPrototypeCache::GetInstance()->PutStencil(scriptProto->mSrcURI,
+                                                     scriptProto->GetStencil());
+    }
+  }
+
+  rv = ResumeWalk();
+
+  PrototypeDocumentContentSink** docp = &scriptProto->mSrcLoadWaiters;
+
+  PrototypeDocumentContentSink* doc;
+  while ((doc = *docp) != nullptr) {
+    NS_ASSERTION(doc->mCurrentScriptProto == scriptProto,
+                 "waiting for wrong script to load?");
+    doc->mCurrentScriptProto = nullptr;
+
+    *docp = doc->mNextSrcLoadWaiter;
+    doc->mNextSrcLoadWaiter = nullptr;
+
+    if (aStatus == NS_BINDING_ABORTED && !scriptProto->HasStencil()) {
+      bool block = false;
+      doc->LoadScript(scriptProto, &block);
+      NS_RELEASE(doc);
+      return rv;
+    }
+
+    if (NS_SUCCEEDED(aStatus) && scriptProto->HasStencil()) {
+      doc->ExecuteScript(scriptProto);
+    }
+    doc->ResumeWalk();
+    NS_RELEASE(doc);
+  }
+
+  return rv;
+}
+
+nsresult PrototypeDocumentContentSink::ExecuteScript(
+    nsXULPrototypeScript* aScript) {
+  MOZ_ASSERT(aScript != nullptr, "null ptr");
+  NS_ENSURE_TRUE(aScript, NS_ERROR_NULL_POINTER);
+
+  nsIScriptGlobalObject* scriptGlobalObject;
+  bool aHasHadScriptHandlingObject;
+  scriptGlobalObject =
+      mDocument->GetScriptHandlingObject(aHasHadScriptHandlingObject);
+
+  NS_ENSURE_TRUE(scriptGlobalObject, NS_ERROR_NOT_INITIALIZED);
+
+  nsresult rv;
+  rv = scriptGlobalObject->EnsureScriptEnvironment();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoMicroTask mt;
+
+  AutoEntryScript aes(scriptGlobalObject, "precompiled XUL <script> element");
+  JSContext* cx = aes.cx();
+
+  JS::Rooted<JSScript*> scriptObject(cx);
+  rv = aScript->InstantiateScript(cx, &scriptObject);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  JS::Rooted<JSObject*> global(cx, JS::CurrentGlobalOrNull(cx));
+  NS_ENSURE_TRUE(xpc::Scriptability::Get(global).Allowed(), NS_OK);
+
+  if (!aScript->mOutOfLine) {
+    if (nsCOMPtr<nsIContentSecurityPolicy> csp =
+            PolicyContainer::GetCSP(mDocument->GetPolicyContainer())) {
+      nsAutoJSString content;
+      JS::Rooted<JSString*> decompiled(cx,
+                                       JS_DecompileScript(cx, scriptObject));
+      if (NS_WARN_IF(!decompiled || !content.init(cx, decompiled))) {
+        JS_ClearPendingException(cx);
+      }
+
+      bool allowInlineScript = false;
+      rv = csp->GetAllowsInline(
+          nsIContentSecurityPolicy::SCRIPT_SRC_ELEM_DIRECTIVE,
+           false,  u""_ns,
+           true,
+           nullptr,
+           nullptr,
+           content, aScript->mLineNo,
+           0, &allowInlineScript);
+      if (NS_FAILED(rv) || !allowInlineScript) {
+        return NS_OK;
+      }
+    }
+  }
+
+  JS::Rooted<JS::Value> rval(cx);
+  (void)JS_ExecuteScript(cx, scriptObject, &rval);
+
+  return NS_OK;
+}
+
+nsresult PrototypeDocumentContentSink::CreateElementFromPrototype(
+    nsXULPrototypeElement* aPrototype, Element** aResult, nsIContent* aParent) {
+  MOZ_ASSERT(aPrototype, "null ptr");
+  if (!aPrototype) return NS_ERROR_NULL_POINTER;
+
+  *aResult = nullptr;
+  nsresult rv = NS_OK;
+
+  if (MOZ_LOG_TEST(gLog, LogLevel::Debug)) {
+    MOZ_LOG(
+        gLog, LogLevel::Debug,
+        ("prototype: creating <%s> from prototype",
+         NS_ConvertUTF16toUTF8(aPrototype->mNodeInfo->QualifiedName()).get()));
+  }
+
+  RefPtr<Element> result;
+
+  Document* doc = aParent ? aParent->OwnerDoc() : mDocument.get();
+  if (aPrototype->mNodeInfo->NamespaceEquals(kNameSpaceID_XUL)) {
+    const bool isRoot = !aParent;
+    result = nsXULElement::CreateFromPrototype(aPrototype, doc, isRoot);
+    if (!result) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+  } else {
+    RefPtr<NodeInfo> newNodeInfo = doc->NodeInfoManager()->GetNodeInfo(
+        aPrototype->mNodeInfo->NameAtom(),
+        aPrototype->mNodeInfo->GetPrefixAtom(),
+        aPrototype->mNodeInfo->NamespaceID(), nsINode::ELEMENT_NODE);
+    if (!newNodeInfo) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    const bool isScript =
+        newNodeInfo->Equals(nsGkAtoms::script, kNameSpaceID_XHTML) ||
+        newNodeInfo->Equals(nsGkAtoms::script, kNameSpaceID_SVG);
+    if (aPrototype->mIsAtom &&
+        newNodeInfo->NamespaceID() == kNameSpaceID_XHTML) {
+      rv = NS_NewHTMLElement(getter_AddRefs(result), newNodeInfo.forget(),
+                             FROM_PARSER_NETWORK, aPrototype->mIsAtom);
+    } else {
+      rv = NS_NewElement(getter_AddRefs(result), newNodeInfo.forget(),
+                         FROM_PARSER_NETWORK);
+    }
+    if (NS_FAILED(rv)) return rv;
+
+    rv = AddAttributes(aPrototype, result);
+    if (NS_FAILED(rv)) return rv;
+
+    if (isScript) {
+      nsCOMPtr<nsIScriptElement> sele = do_QueryInterface(result);
+      MOZ_ASSERT(sele, "Node didn't QI to script.");
+      sele->FreezeExecutionAttrs(doc);
+    }
+  }
+
+  if (result->HasAttr(nsGkAtoms::datal10nid)) {
+    mDocument->mL10nProtoElements.InsertOrUpdate(result, RefPtr{aPrototype});
+    result->SetElementCreatedFromPrototypeAndHasUnmodifiedL10n();
+  }
+  result.forget(aResult);
+  return NS_OK;
+}
+
+nsresult PrototypeDocumentContentSink::AddAttributes(
+    nsXULPrototypeElement* aPrototype, Element* aElement) {
+  nsresult rv;
+
+  for (size_t i = 0; i < aPrototype->mAttributes.Length(); ++i) {
+    nsXULPrototypeAttribute* protoattr = &(aPrototype->mAttributes[i]);
+    nsAutoString valueStr;
+    protoattr->mValue.ToString(valueStr);
+
+    rv = aElement->SetAttr(protoattr->mName.NamespaceID(),
+                           protoattr->mName.LocalName(),
+                           protoattr->mName.GetPrefix(), valueStr, false);
+    if (NS_FAILED(rv)) return rv;
+  }
+
+  return NS_OK;
+}
+
+}  

@@ -1,0 +1,102 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_QueueWithSizes_h
+#define mozilla_dom_QueueWithSizes_h
+
+#include <cmath>
+
+#include "jsapi.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/UniquePtr.h"
+#include "nsTArray.h"
+
+namespace mozilla::dom {
+
+
+struct ValueWithSize : LinkedListElement<ValueWithSize> {
+  ValueWithSize(JS::Handle<JS::Value> aValue, double aSize)
+      : mValue(aValue), mSize(aSize) {};
+
+  JS::Heap<JS::Value> mValue;
+  double mSize = 0.0f;
+};
+
+using QueueWithSizes = AutoCleanLinkedList<ValueWithSize>;
+
+inline bool IsNonNegativeNumber(double v) {
+  if (std::isnan(v)) {
+    return false;
+  }
+
+  return !(v < 0);
+}
+
+template <class QueueContainingClass>
+inline void EnqueueValueWithSize(QueueContainingClass aContainer,
+                                 JS::Handle<JS::Value> aValue, double aSize,
+                                 ErrorResult& aRv) {
+  if (!IsNonNegativeNumber(aSize)) {
+    aRv.ThrowRangeError("invalid size");
+    return;
+  }
+
+  if (std::isinf(aSize)) {
+    aRv.ThrowRangeError("Infinite queue size");
+    return;
+  }
+
+  ValueWithSize* valueWithSize = new ValueWithSize(aValue, aSize);
+  aContainer->Queue().insertBack(valueWithSize);
+  aContainer->SetQueueTotalSize(aContainer->QueueTotalSize() + aSize);
+}
+
+template <class QueueContainingClass>
+inline void DequeueValue(JSContext* aCx, QueueContainingClass aContainer,
+                         JS::MutableHandle<JS::Value> aResultValue,
+                         ErrorResult& aRv) {
+  MOZ_ASSERT(!aContainer->Queue().isEmpty());
+
+  UniquePtr<ValueWithSize> valueWithSize(aContainer->Queue().popFirst());
+
+  aContainer->SetQueueTotalSize(aContainer->QueueTotalSize() -
+                                valueWithSize->mSize);
+
+  if (aContainer->QueueTotalSize() < 0) {
+    aContainer->SetQueueTotalSize(0);
+  }
+
+  aResultValue.set(valueWithSize->mValue);
+  if (!JS_WrapValue(aCx, aResultValue)) {
+    aResultValue.setUndefined();
+    aRv.StealExceptionFromJSContext(aCx);
+  }
+}
+
+template <class QueueContainingClass>
+inline void PeekQueueValue(JSContext* aCx, QueueContainingClass aContainer,
+                           JS::MutableHandle<JS::Value> aResultValue,
+                           ErrorResult& aRv) {
+  MOZ_ASSERT(!aContainer->Queue().isEmpty());
+
+  ValueWithSize* valueWithSize = aContainer->Queue().getFirst();
+
+  aResultValue.set(valueWithSize->mValue);
+  if (!JS_WrapValue(aCx, aResultValue)) {
+    aResultValue.setUndefined();
+    aRv.StealExceptionFromJSContext(aCx);
+  }
+}
+
+template <class QueueContainingClass>
+inline void ResetQueue(QueueContainingClass aContainer) {
+
+  aContainer->Queue().clear();
+
+  aContainer->SetQueueTotalSize(0.0);
+}
+
+}  
+
+#endif

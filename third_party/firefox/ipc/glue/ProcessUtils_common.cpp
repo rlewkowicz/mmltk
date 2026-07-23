@@ -1,0 +1,133 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ProcessUtils.h"
+
+#include "mozilla/Preferences.h"
+#include "mozilla/GeckoArgs.h"
+#include "mozilla/dom/RemoteType.h"
+#include "mozilla/ipc/GeckoChildProcessHost.h"
+#include "nsPrintfCString.h"
+
+#include "XPCSelfHostedShmem.h"
+
+namespace mozilla {
+namespace ipc {
+
+SharedPreferenceSerializer::SharedPreferenceSerializer() {
+  MOZ_COUNT_CTOR(SharedPreferenceSerializer);
+}
+
+SharedPreferenceSerializer::~SharedPreferenceSerializer() {
+  MOZ_COUNT_DTOR(SharedPreferenceSerializer);
+}
+
+SharedPreferenceSerializer::SharedPreferenceSerializer(
+    SharedPreferenceSerializer&& aOther)
+    : mPrefMapHandle(std::move(aOther.mPrefMapHandle)),
+      mPrefsHandle(std::move(aOther.mPrefsHandle)) {
+  MOZ_COUNT_CTOR(SharedPreferenceSerializer);
+}
+
+bool SharedPreferenceSerializer::SerializeToSharedMemory(
+    const GeckoProcessType aDestinationProcessType,
+    const nsACString& aDestinationRemoteType) {
+  mPrefMapHandle = Preferences::EnsureSnapshot();
+
+  bool destIsWebContent =
+      aDestinationProcessType == GeckoProcessType_Content &&
+      (StringBeginsWith(aDestinationRemoteType, WEB_REMOTE_TYPE) ||
+       StringBeginsWith(aDestinationRemoteType, PREALLOC_REMOTE_TYPE));
+
+  nsAutoCStringN<1024> prefs;
+  Preferences::SerializePreferences(prefs, destIsWebContent);
+  auto prefsLength = prefs.Length();
+
+  auto handle = shared_memory::Create(prefsLength);
+  if (!handle) {
+    NS_ERROR("failed to create shared memory in the parent");
+    return false;
+  }
+  auto mapping = handle.Map();
+  if (!mapping) {
+    NS_ERROR("failed to map shared memory in the parent");
+    return false;
+  }
+
+  memcpy(mapping.DataAs<char>(), prefs.get(), prefsLength);
+
+  mPrefsHandle = std::move(handle).ToReadOnly();
+  return true;
+}
+
+void SharedPreferenceSerializer::AddSharedPrefCmdLineArgs(
+    mozilla::ipc::GeckoChildProcessHost& procHost,
+    geckoargs::ChildProcessArgs& aExtraOpts) const {
+  auto prefsHandle = GetPrefsHandle().Clone();
+  MOZ_RELEASE_ASSERT(prefsHandle, "failed to clone prefs handle");
+  auto prefMapHandle = GetPrefMapHandle().Clone();
+  MOZ_RELEASE_ASSERT(prefMapHandle, "failed to clone pref map handle");
+
+  geckoargs::sPrefsHandle.Put(std::move(prefsHandle), aExtraOpts);
+  geckoargs::sPrefMapHandle.Put(std::move(prefMapHandle), aExtraOpts);
+}
+
+SharedPreferenceDeserializer::SharedPreferenceDeserializer() {
+  MOZ_COUNT_CTOR(SharedPreferenceDeserializer);
+}
+
+SharedPreferenceDeserializer::~SharedPreferenceDeserializer() {
+  MOZ_COUNT_DTOR(SharedPreferenceDeserializer);
+}
+
+bool SharedPreferenceDeserializer::DeserializeFromSharedMemory(
+    ReadOnlySharedMemoryHandle&& aPrefsHandle,
+    ReadOnlySharedMemoryHandle&& aPrefMapHandle) {
+  if (!aPrefsHandle || !aPrefMapHandle) {
+    return false;
+  }
+
+  mPrefMapHandle = std::move(aPrefMapHandle);
+
+  Preferences::InitSnapshot(mPrefMapHandle);
+
+  mShmem = aPrefsHandle.Map();
+  if (!mShmem) {
+    NS_ERROR("failed to map shared memory in the child");
+    return false;
+  }
+  Preferences::DeserializePreferences(mShmem.DataAs<char>(), mShmem.Size());
+
+  return true;
+}
+
+void ExportSharedJSInit(mozilla::ipc::GeckoChildProcessHost& procHost,
+                        geckoargs::ChildProcessArgs& aExtraOpts) {
+  auto& shmem = xpc::SelfHostedShmem::GetSingleton();
+  auto handle = shmem.Handle().Clone();
+
+  if (!handle) {
+    NS_ERROR("Can't use SelfHosted shared memory handle.");
+    return;
+  }
+
+  geckoargs::sJsInitHandle.Put(std::move(handle), aExtraOpts);
+}
+
+bool ImportSharedJSInit(ReadOnlySharedMemoryHandle&& aJsInitHandle) {
+  if (!aJsInitHandle) {
+    return true;
+  }
+
+  auto& shmem = xpc::SelfHostedShmem::GetSingleton();
+  if (!shmem.InitFromChild(std::move(aJsInitHandle))) {
+    NS_ERROR("failed to open shared memory in the child");
+    return false;
+  }
+
+  return true;
+}
+
+}  
+}  

@@ -1,0 +1,1276 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_OrderedHashTableObject_h
+#define builtin_OrderedHashTableObject_h
+
+
+#include "mozilla/HashFunctions.h"
+#include "mozilla/Likely.h"
+#include "mozilla/Maybe.h"
+
+#include <memory>
+#include <tuple>
+#include <utility>
+
+#include "builtin/SelfHostingDefines.h"
+#include "gc/Barrier.h"
+#include "gc/Zone.h"
+#include "js/GCPolicyAPI.h"
+#include "js/HashTable.h"
+#include "vm/JSContext.h"
+#include "vm/Realm.h"
+
+class JSTracer;
+
+namespace js {
+
+class MapIteratorObject;
+class SetIteratorObject;
+
+namespace detail {
+
+template <class T, class Ops>
+class OrderedHashTableImpl;
+
+class OrderedHashTableObject : public NativeObject {
+  template <class T, class Ops>
+  friend class OrderedHashTableImpl;
+
+  enum Slots {
+    HashTableSlot,
+    DataSlot,
+    DataLengthSlot,
+    DataCapacitySlot,
+    LiveCountSlot,
+    HashShiftSlot,
+    TenuredIteratorsSlot,
+    NurseryIteratorsSlot,
+    HashCodeScramblerSlot,
+    SlotCount
+  };
+
+  inline void* allocateCellBuffer(JSContext* cx, size_t numBytes);
+  inline void freeCellBuffer(JSContext* cx, void* data, size_t numBytes);
+
+ public:
+  static constexpr size_t offsetOfDataLength() {
+    return getFixedSlotOffset(DataLengthSlot);
+  }
+  static constexpr size_t offsetOfData() {
+    return getFixedSlotOffset(DataSlot);
+  }
+  static constexpr size_t offsetOfHashTable() {
+    return getFixedSlotOffset(HashTableSlot);
+  }
+  static constexpr size_t offsetOfHashShift() {
+    return getFixedSlotOffset(HashShiftSlot);
+  }
+  static constexpr size_t offsetOfLiveCount() {
+    return getFixedSlotOffset(LiveCountSlot);
+  }
+  static constexpr size_t offsetOfHashCodeScrambler() {
+    return getFixedSlotOffset(HashCodeScramblerSlot);
+  }
+};
+
+}  
+
+class TableIteratorObject : public NativeObject {
+  template <class T, class Ops>
+  friend class detail::OrderedHashTableImpl;
+
+ public:
+  enum Slots {
+    TargetSlot,
+    KindSlot,
+    IndexSlot,
+    CountSlot,
+    PrevPtrSlot,
+    NextSlot,
+    SlotCount
+  };
+  enum class Kind { Keys, Values, Entries };
+
+  static_assert(TargetSlot == ITERATOR_SLOT_TARGET);
+  static_assert(KindSlot == MAP_SET_ITERATOR_SLOT_ITEM_KIND);
+  static_assert(int32_t(Kind::Keys) == ITEM_KIND_KEY);
+  static_assert(int32_t(Kind::Values) == ITEM_KIND_VALUE);
+  static_assert(int32_t(Kind::Entries) == ITEM_KIND_KEY_AND_VALUE);
+
+ private:
+  uint32_t getIndex() const {
+    return getReservedSlot(IndexSlot).toPrivateUint32();
+  }
+  void setIndex(uint32_t i) {
+    MOZ_ASSERT(isActive());
+    setReservedSlotPrivateUint32Unbarriered(IndexSlot, i);
+  }
+
+  uint32_t getCount() const {
+    return getReservedSlot(CountSlot).toPrivateUint32();
+  }
+  void setCount(uint32_t i) {
+    MOZ_ASSERT(isActive());
+    setReservedSlotPrivateUint32Unbarriered(CountSlot, i);
+  }
+
+  TableIteratorObject** getPrevPtr() const {
+    MOZ_ASSERT(isActive());
+    Value v = getReservedSlot(PrevPtrSlot);
+    return static_cast<TableIteratorObject**>(v.toPrivate());
+  }
+  void setPrevPtr(TableIteratorObject** p) {
+    MOZ_ASSERT(isActive());
+    setReservedSlotPrivateUnbarriered(PrevPtrSlot, p);
+  }
+  TableIteratorObject* getNext() const {
+    MOZ_ASSERT(isActive());
+    Value v = getReservedSlot(NextSlot);
+    return static_cast<TableIteratorObject*>(v.toPrivate());
+  }
+  TableIteratorObject** addressOfNext() {
+    MOZ_ASSERT(isActive());
+    return addressOfFixedSlotPrivatePtr<TableIteratorObject>(NextSlot);
+  }
+  void setNext(TableIteratorObject* p) {
+    MOZ_ASSERT(isActive());
+    setReservedSlotPrivateUnbarriered(NextSlot, p);
+  }
+
+  void link(TableIteratorObject** listp) {
+    MOZ_ASSERT(isActive());
+    TableIteratorObject* next = *listp;
+    setPrevPtr(listp);
+    setNext(next);
+    *listp = this;
+    if (next) {
+      next->setPrevPtr(this->addressOfNext());
+    }
+  }
+
+  void init(detail::OrderedHashTableObject* target, Kind kind,
+            TableIteratorObject** listp) {
+    initReservedSlot(TargetSlot, ObjectValue(*target));
+    setReservedSlotPrivateUint32Unbarriered(KindSlot, uint32_t(kind));
+    setReservedSlotPrivateUint32Unbarriered(IndexSlot, 0);
+    setReservedSlotPrivateUint32Unbarriered(CountSlot, 0);
+    link(listp);
+  }
+
+  void assertActiveIteratorFor(JSObject* target) {
+    MOZ_ASSERT(&getReservedSlot(TargetSlot).toObject() == target);
+    MOZ_ASSERT(*getPrevPtr() == this);
+    MOZ_ASSERT(getNext() != this);
+  }
+
+ protected:
+  bool isActive() const { return getReservedSlot(TargetSlot).isObject(); }
+
+  void finish() {
+    MOZ_ASSERT(isActive());
+    unlink();
+    setReservedSlot(TargetSlot, UndefinedValue());
+  }
+  void unlink() {
+    MOZ_ASSERT(isActive());
+    TableIteratorObject** prevp = getPrevPtr();
+    TableIteratorObject* next = getNext();
+    *prevp = next;
+    if (next) {
+      next->setPrevPtr(prevp);
+    }
+  }
+
+  void updateListAfterMove(TableIteratorObject* old) {
+    MOZ_ASSERT(!IsInsideNursery(old));
+    MOZ_ASSERT(isActive());
+    MOZ_ASSERT(old != this);
+
+    TableIteratorObject** prevp = getPrevPtr();
+    MOZ_ASSERT(*prevp == old);
+    *prevp = this;
+
+    if (TableIteratorObject* next = getNext()) {
+      MOZ_ASSERT(next->getPrevPtr() == old->addressOfNext());
+      next->setPrevPtr(this->addressOfNext());
+    }
+  }
+
+  Kind kind() const {
+    uint32_t i = getReservedSlot(KindSlot).toPrivateUint32();
+    MOZ_ASSERT(i == uint32_t(Kind::Keys) || i == uint32_t(Kind::Values) ||
+               i == uint32_t(Kind::Entries));
+    return Kind(i);
+  }
+
+ public:
+  static constexpr size_t offsetOfTarget() {
+    return getFixedSlotOffset(TargetSlot);
+  }
+  static constexpr size_t offsetOfIndex() {
+    return getFixedSlotOffset(IndexSlot);
+  }
+  static constexpr size_t offsetOfCount() {
+    return getFixedSlotOffset(CountSlot);
+  }
+  static constexpr size_t offsetOfPrevPtr() {
+    return getFixedSlotOffset(PrevPtrSlot);
+  }
+  static constexpr size_t offsetOfNext() {
+    return getFixedSlotOffset(NextSlot);
+  }
+};
+
+namespace detail {
+
+template <class T, class Ops>
+class MOZ_STACK_CLASS OrderedHashTableImpl {
+ public:
+  using Key = typename Ops::KeyType;
+  using MutableKey = std::remove_const_t<Key>;
+  using UnbarrieredKey = typename RemoveBarrier<MutableKey>::Type;
+  using Lookup = typename Ops::Lookup;
+  using HashCodeScrambler = mozilla::HashCodeScrambler;
+  static constexpr size_t SlotCount = OrderedHashTableObject::SlotCount;
+
+  struct alignas(8) Data {
+    T element;
+    Data* chain;
+
+    Data(const T& e, Data* c) : element(e), chain(c) {}
+    Data(T&& e, Data* c) : element(std::move(e)), chain(c) {}
+  };
+
+ private:
+  using Slots = OrderedHashTableObject::Slots;
+  OrderedHashTableObject* const obj;
+
+  bool hasAllocatedBuffer() const {
+    MOZ_ASSERT(hasInitializedSlots());
+    return obj->getReservedSlot(Slots::DataSlot).toPrivate() != nullptr;
+  }
+
+  Data** getHashTable() const {
+    MOZ_ASSERT(hasAllocatedBuffer());
+    Value v = obj->getReservedSlot(Slots::HashTableSlot);
+    return static_cast<Data**>(v.toPrivate());
+  }
+  void setHashTable(Data** table) {
+    obj->setReservedSlotPrivateUnbarriered(Slots::HashTableSlot, table);
+  }
+
+  Data* maybeData() const {
+    Value v = obj->getReservedSlot(Slots::DataSlot);
+    return static_cast<Data*>(v.toPrivate());
+  }
+  Data* getData() const {
+    MOZ_ASSERT(hasAllocatedBuffer());
+    return maybeData();
+  }
+  void setData(Data* data) {
+    obj->setReservedSlotPrivateUnbarriered(Slots::DataSlot, data);
+  }
+
+  uint32_t getDataLength() const {
+    return obj->getReservedSlot(Slots::DataLengthSlot).toPrivateUint32();
+  }
+  void setDataLength(uint32_t length) {
+    obj->setReservedSlotPrivateUint32Unbarriered(Slots::DataLengthSlot, length);
+  }
+
+  uint32_t getDataCapacity() const {
+    return obj->getReservedSlot(Slots::DataCapacitySlot).toPrivateUint32();
+  }
+  void setDataCapacity(uint32_t capacity) {
+    obj->setReservedSlotPrivateUint32Unbarriered(Slots::DataCapacitySlot,
+                                                 capacity);
+  }
+
+  uint32_t getLiveCount() const {
+    return obj->getReservedSlot(Slots::LiveCountSlot).toPrivateUint32();
+  }
+  void setLiveCount(uint32_t liveCount) {
+    obj->setReservedSlotPrivateUint32Unbarriered(Slots::LiveCountSlot,
+                                                 liveCount);
+  }
+
+  uint32_t getHashShift() const {
+    MOZ_ASSERT(hasAllocatedBuffer(),
+               "hash shift is meaningless if there's no hash table");
+    return obj->getReservedSlot(Slots::HashShiftSlot).toPrivateUint32();
+  }
+  void setHashShift(uint32_t hashShift) {
+    obj->setReservedSlotPrivateUint32Unbarriered(Slots::HashShiftSlot,
+                                                 hashShift);
+  }
+
+  TableIteratorObject* getTenuredIterators() const {
+    Value v = obj->getReservedSlot(Slots::TenuredIteratorsSlot);
+    return static_cast<TableIteratorObject*>(v.toPrivate());
+  }
+  void setTenuredIterators(TableIteratorObject* iter) {
+    obj->setReservedSlotPrivateUnbarriered(Slots::TenuredIteratorsSlot, iter);
+  }
+  TableIteratorObject** addressOfTenuredIterators() const {
+    static constexpr size_t slot = Slots::TenuredIteratorsSlot;
+    return obj->addressOfFixedSlotPrivatePtr<TableIteratorObject>(slot);
+  }
+
+  TableIteratorObject* getNurseryIterators() const {
+    Value v = obj->getReservedSlot(Slots::NurseryIteratorsSlot);
+    return static_cast<TableIteratorObject*>(v.toPrivate());
+  }
+  void setNurseryIterators(TableIteratorObject* iter) {
+    obj->setReservedSlotPrivateUnbarriered(Slots::NurseryIteratorsSlot, iter);
+  }
+  TableIteratorObject** addressOfNurseryIterators() const {
+    static constexpr size_t slot = Slots::NurseryIteratorsSlot;
+    return obj->addressOfFixedSlotPrivatePtr<TableIteratorObject>(slot);
+  }
+
+  TableIteratorObject** addressOfIterators(TableIteratorObject* iter) {
+    return IsInsideNursery(iter) ? addressOfNurseryIterators()
+                                 : addressOfTenuredIterators();
+  }
+
+  const HashCodeScrambler* getHashCodeScrambler() const {
+    MOZ_ASSERT(hasAllocatedBuffer());
+    Value v = obj->getReservedSlot(Slots::HashCodeScramblerSlot);
+    return static_cast<const HashCodeScrambler*>(v.toPrivate());
+  }
+  void setHashCodeScrambler(HashCodeScrambler* hcs) {
+    obj->setReservedSlotPrivateUnbarriered(Slots::HashCodeScramblerSlot, hcs);
+  }
+
+  static constexpr uint32_t hashShiftToNumHashBuckets(uint32_t hashShift) {
+    return 1 << (js::kHashNumberBits - hashShift);
+  }
+  static constexpr uint32_t numHashBucketsToDataCapacity(
+      uint32_t numHashBuckets) {
+    return uint32_t(numHashBuckets * FillFactor);
+  }
+
+  static constexpr uint32_t InitialBucketsLog2 = 1;
+  static constexpr uint32_t InitialBuckets = 1 << InitialBucketsLog2;
+  static constexpr uint32_t InitialHashShift =
+      js::kHashNumberBits - InitialBucketsLog2;
+
+  static constexpr double FillFactor = 8.0 / 3.0;
+
+  static constexpr double MinDataFill = 0.25;
+
+  static constexpr uint32_t MinHashShift = 8;
+  static constexpr uint32_t MaxHashBuckets =
+      hashShiftToNumHashBuckets(MinHashShift);  
+  static constexpr uint32_t MaxDataCapacity =
+      numHashBucketsToDataCapacity(MaxHashBuckets);  
+
+  template <typename F>
+  void forEachIterator(F&& f) {
+    TableIteratorObject* next;
+    for (TableIteratorObject* iter = getTenuredIterators(); iter; iter = next) {
+      next = iter->getNext();
+      f(iter);
+    }
+    for (TableIteratorObject* iter = getNurseryIterators(); iter; iter = next) {
+      next = iter->getNext();
+      f(iter);
+    }
+  }
+
+  bool hasInitializedSlots() const {
+    return !obj->getReservedSlot(Slots::DataSlot).isUndefined();
+  }
+
+  static constexpr size_t calcAllocSize(size_t dataCapacity, size_t buckets) {
+    return dataCapacity * sizeof(Data) + sizeof(HashCodeScrambler) +
+           buckets * sizeof(Data*);
+  }
+
+  using AllocationResult =
+      std::tuple<Data*, Data**, HashCodeScrambler*, size_t>;
+  AllocationResult allocateBuffer(JSContext* cx, uint32_t dataCapacity,
+                                  uint32_t buckets) {
+    MOZ_ASSERT(dataCapacity <= MaxDataCapacity);
+    MOZ_ASSERT(buckets <= MaxHashBuckets);
+
+    static_assert(calcAllocSize(MaxDataCapacity, MaxHashBuckets) <= INT32_MAX);
+
+    size_t numBytes = calcAllocSize(dataCapacity, buckets);
+
+    void* buf = obj->allocateCellBuffer(cx, numBytes);
+    if (!buf) {
+      return {};
+    }
+
+    return getBufferParts(buf, numBytes, dataCapacity, buckets);
+  }
+
+  static AllocationResult getBufferParts(void* buf, size_t numBytes,
+                                         uint32_t dataCapacity,
+                                         uint32_t buckets) {
+    static_assert(alignof(Data) % alignof(HashCodeScrambler) == 0,
+                  "Hash code scrambler must be aligned properly");
+    static_assert(alignof(HashCodeScrambler) % alignof(Data*) == 0,
+                  "Hash table entries must be aligned properly");
+
+    auto* data = static_cast<Data*>(buf);
+    auto* hcs = reinterpret_cast<HashCodeScrambler*>(data + dataCapacity);
+    auto** table = reinterpret_cast<Data**>(hcs + 1);
+
+    MOZ_ASSERT(uintptr_t(table + buckets) == uintptr_t(buf) + numBytes);
+
+    return {data, table, hcs, numBytes};
+  }
+
+  [[nodiscard]] bool initBuffer(JSContext* cx) {
+    MOZ_ASSERT(!hasAllocatedBuffer());
+    MOZ_ASSERT(getDataLength() == 0);
+    MOZ_ASSERT(getLiveCount() == 0);
+
+    constexpr uint32_t buckets = InitialBuckets;
+    constexpr uint32_t capacity = uint32_t(buckets * FillFactor);
+
+    auto [dataAlloc, tableAlloc, hcsAlloc, numBytes] =
+        allocateBuffer(cx, capacity, buckets);
+    if (!dataAlloc) {
+      return false;
+    }
+
+    *hcsAlloc = cx->realm()->randomHashCodeScrambler();
+
+    std::uninitialized_fill_n(tableAlloc, buckets, nullptr);
+
+    setHashTable(tableAlloc);
+    setData(dataAlloc);
+    setDataCapacity(capacity);
+    setHashShift(InitialHashShift);
+    setHashCodeScrambler(hcsAlloc);
+    MOZ_ASSERT(hashBuckets() == buckets);
+    return true;
+  }
+
+  void updateHashTableForRekey(Data* entry, HashNumber oldHash,
+                               HashNumber newHash) {
+    uint32_t hashShift = getHashShift();
+    oldHash >>= hashShift;
+    newHash >>= hashShift;
+
+    if (oldHash == newHash) {
+      return;
+    }
+
+    Data** hashTable = getHashTable();
+    Data** ep = &hashTable[oldHash];
+    while (*ep != entry) {
+      ep = &(*ep)->chain;
+    }
+    *ep = entry->chain;
+
+    ep = &hashTable[newHash];
+    while (*ep && *ep > entry) {
+      ep = &(*ep)->chain;
+    }
+    entry->chain = *ep;
+    *ep = entry;
+  }
+
+ public:
+  explicit OrderedHashTableImpl(OrderedHashTableObject* obj) : obj(obj) {}
+
+  void initSlots() {
+    MOZ_ASSERT(!hasInitializedSlots(), "init must be called at most once");
+    setHashTable(nullptr);
+    setData(nullptr);
+    setDataLength(0);
+    setDataCapacity(0);
+    setLiveCount(0);
+    setHashShift(0);
+    setTenuredIterators(nullptr);
+    setNurseryIterators(nullptr);
+    setHashCodeScrambler(nullptr);
+  }
+
+  void maybeMoveBufferOnPromotion(Nursery& nursery) {
+    if (!hasAllocatedBuffer()) {
+      return;
+    }
+
+    Data* oldData = getData();
+    uint32_t dataCapacity = getDataCapacity();
+    uint32_t buckets = hashBuckets();
+
+    size_t numBytes = calcAllocSize(dataCapacity, buckets);
+
+    void* buf = oldData;
+    Nursery::WasBufferMoved result =
+        nursery.maybeMoveBufferOnPromotion(&buf, obj, numBytes);
+    if (result == Nursery::BufferNotMoved) {
+      return;
+    }
+
+
+    auto [data, table, hcs, numBytesUnused] =
+        getBufferParts(buf, numBytes, dataCapacity, buckets);
+
+    auto entryIndex = [=](const Data* entry) {
+      MOZ_ASSERT(entry >= oldData);
+      MOZ_ASSERT(size_t(entry - oldData) < dataCapacity);
+      return entry - oldData;
+    };
+
+    for (uint32_t i = 0, len = getDataLength(); i < len; i++) {
+      if (const Data* chain = data[i].chain) {
+        data[i].chain = data + entryIndex(chain);
+      }
+    }
+    for (uint32_t i = 0; i < buckets; i++) {
+      if (const Data* chain = table[i]) {
+        table[i] = data + entryIndex(chain);
+      }
+    }
+
+    setData(data);
+    setHashTable(table);
+    setHashCodeScrambler(hcs);
+  }
+
+  size_t sizeOfExcludingObject() const {
+    MOZ_ASSERT(obj->isTenured());  
+
+    size_t size = 0;
+    if (hasInitializedSlots() && hasAllocatedBuffer()) {
+      size += gc::GetAllocSize(obj->zone(), getData());
+    }
+    return size;
+  }
+
+  uint32_t count() const { return getLiveCount(); }
+
+  bool has(const Lookup& l) const { return lookup(l) != nullptr; }
+
+  T* get(const Lookup& l) {
+    Data* e = lookup(l);
+    return e ? &e->element : nullptr;
+  }
+
+  template <typename ElementInput>
+  [[nodiscard]] bool put(JSContext* cx, ElementInput&& elementInput) {
+    T element(std::forward<ElementInput>(elementInput));
+    HashNumber h;
+    if (hasAllocatedBuffer()) {
+      h = prepareHash(Ops::getKey(element));
+      if (Data* e = lookup(Ops::getKey(element), h)) {
+        e->element = std::move(element);
+        return true;
+      }
+      if (getDataLength() == getDataCapacity() && !rehashOnFull(cx)) {
+        return false;
+      }
+    } else {
+      if (!initBuffer(cx)) {
+        return false;
+      }
+      h = prepareHash(Ops::getKey(element));
+    }
+    auto [entry, chain] = addEntry(h);
+    new (entry) Data(std::move(element), chain);
+    return true;
+  }
+
+  template <typename ElementInput>
+  [[nodiscard]] T* getOrAdd(JSContext* cx, ElementInput&& element) {
+    HashNumber h;
+    if (hasAllocatedBuffer()) {
+      h = prepareHash(Ops::getKey(element));
+      if (Data* e = lookup(Ops::getKey(element), h)) {
+        return &e->element;
+      }
+      if (getDataLength() == getDataCapacity() && !rehashOnFull(cx)) {
+        return nullptr;
+      }
+    } else {
+      if (!initBuffer(cx)) {
+        return nullptr;
+      }
+      h = prepareHash(Ops::getKey(element));
+    }
+    auto [entry, chain] = addEntry(h);
+    new (entry) Data(std::forward<ElementInput>(element), chain);
+    return &entry->element;
+  }
+
+  bool remove(JSContext* cx, const Lookup& l) {
+
+    Data* e = lookup(l);
+    if (e == nullptr) {
+      return false;
+    }
+
+    MOZ_ASSERT(uint32_t(e - getData()) < getDataCapacity());
+
+    uint32_t liveCount = getLiveCount();
+    liveCount--;
+    setLiveCount(liveCount);
+    Ops::makeEmpty(&e->element);
+
+    uint32_t pos = e - getData();
+    forEachIterator(
+        [this, pos](auto* iter) { IterOps::onRemove(obj, iter, pos); });
+
+    if (hashBuckets() > InitialBuckets &&
+        liveCount < getDataLength() * MinDataFill) {
+      if (!rehash(cx, getHashShift() + 1)) {
+        cx->recoverFromOutOfMemory();
+      }
+    }
+
+    return true;
+  }
+
+  void clear(JSContext* cx) {
+    if (getDataLength() != 0) {
+      destroyData(getData(), getDataLength());
+      setDataLength(0);
+      setLiveCount(0);
+
+      size_t buckets = hashBuckets();
+      std::fill_n(getHashTable(), buckets, nullptr);
+
+      forEachIterator([](auto* iter) { IterOps::onClear(iter); });
+
+      if (buckets > InitialBuckets) {
+        if (!rehash(cx, InitialHashShift)) {
+          cx->recoverFromOutOfMemory();
+        }
+      }
+    }
+
+    MOZ_ASSERT(getDataLength() == 0);
+    MOZ_ASSERT(getLiveCount() == 0);
+  }
+
+  class IterOps {
+    friend class OrderedHashTableImpl;
+
+    static void init(OrderedHashTableObject* table, TableIteratorObject* iter,
+                     TableIteratorObject::Kind kind) {
+      auto** listp = OrderedHashTableImpl(table).addressOfIterators(iter);
+      iter->init(table, kind, listp);
+      seek(table, iter);
+    }
+
+    static void seek(OrderedHashTableObject* table, TableIteratorObject* iter) {
+      iter->assertActiveIteratorFor(table);
+      const Data* data = OrderedHashTableImpl(table).maybeData();
+      uint32_t dataLength = OrderedHashTableImpl(table).getDataLength();
+      uint32_t i = iter->getIndex();
+      while (i < dataLength && Ops::isEmpty(Ops::getKey(data[i].element))) {
+        i++;
+      }
+      iter->setIndex(i);
+    }
+
+    static void onRemove(OrderedHashTableObject* table,
+                         TableIteratorObject* iter, uint32_t j) {
+      iter->assertActiveIteratorFor(table);
+      uint32_t i = iter->getIndex();
+      if (j < i) {
+        iter->setCount(iter->getCount() - 1);
+      }
+      if (j == i) {
+        seek(table, iter);
+      }
+    }
+
+    static void onCompact(TableIteratorObject* iter) {
+      iter->setIndex(iter->getCount());
+    }
+
+    static void onClear(TableIteratorObject* iter) {
+      iter->setIndex(0);
+      iter->setCount(0);
+    }
+
+    template <typename F>
+    static bool next(OrderedHashTableObject* obj, TableIteratorObject* iter,
+                     F&& f) {
+      iter->assertActiveIteratorFor(obj);
+
+      OrderedHashTableImpl table(obj);
+      uint32_t index = iter->getIndex();
+
+      if (index >= table.getDataLength()) {
+        iter->finish();
+        return true;
+      }
+
+      f(iter->kind(), table.getData()[index].element);
+
+      iter->setCount(iter->getCount() + 1);
+      iter->setIndex(index + 1);
+      seek(obj, iter);
+      return false;
+    }
+  };
+
+  template <typename F>
+  [[nodiscard]] bool forEachEntry(F&& f) const {
+    const Data* data = maybeData();
+    uint32_t dataLength = getDataLength();
+#ifdef DEBUG
+    uint32_t liveCount = getLiveCount();
+#endif
+    for (uint32_t i = 0; i < dataLength; i++) {
+      if (!Ops::isEmpty(Ops::getKey(data[i].element))) {
+        if (!f(data[i].element)) {
+          return false;
+        }
+      }
+    }
+    MOZ_ASSERT(maybeData() == data);
+    MOZ_ASSERT(getDataLength() == dataLength);
+    MOZ_ASSERT(getLiveCount() == liveCount);
+    return true;
+  }
+#ifdef DEBUG
+  template <typename F>
+  void forEachEntryUpTo(size_t maxCount, F&& f) const {
+    MOZ_ASSERT(maxCount > 0);
+    const Data* data = maybeData();
+    uint32_t dataLength = getDataLength();
+    uint32_t liveCount = getLiveCount();
+    size_t count = 0;
+    for (uint32_t i = 0; i < dataLength; i++) {
+      if (!Ops::isEmpty(Ops::getKey(data[i].element))) {
+        f(data[i].element);
+        count++;
+        if (count == maxCount) {
+          break;
+        }
+      }
+    }
+    MOZ_ASSERT(maybeData() == data);
+    MOZ_ASSERT(getDataLength() == dataLength);
+    MOZ_ASSERT(getLiveCount() == liveCount);
+  }
+#endif
+
+  void trace(JSTracer* trc) {
+    Data* data = maybeData();
+    if (data) {
+      TraceBufferEdge(trc, &data, "OrderedHashTable data");
+      if (data != maybeData()) {
+        setData(data);
+      }
+    }
+
+    uint32_t dataLength = getDataLength();
+    for (uint32_t i = 0; i < dataLength; i++) {
+      if (!Ops::isEmpty(Ops::getKey(data[i].element))) {
+        Ops::trace(trc, this, i, data[i].element);
+      }
+    }
+  }
+
+  void traceKey(JSTracer* trc, uint32_t index, const Key& key) {
+    MOZ_ASSERT(index < getDataLength());
+    UnbarrieredKey newKey = key;
+    JS::GCPolicy<UnbarrieredKey>::trace(trc, &newKey,
+                                        "OrderedHashTableObject key");
+    if (newKey != key) {
+      rekey(&getData()[index], newKey);
+    }
+  }
+  template <typename Value>
+  void traceValue(JSTracer* trc, Value& value) {
+    JS::GCPolicy<Value>::trace(trc, &value, "OrderedHashMapObject value");
+  }
+
+  void initIterator(TableIteratorObject* iter,
+                    TableIteratorObject::Kind kind) const {
+    IterOps::init(obj, iter, kind);
+  }
+  template <typename F>
+  bool iteratorNext(TableIteratorObject* iter, F&& f) const {
+    return IterOps::next(obj, iter, f);
+  }
+
+  void clearNurseryIterators() {
+    if (TableIteratorObject* iter = getNurseryIterators()) {
+      iter->setPrevPtr(nullptr);
+    }
+    setNurseryIterators(nullptr);
+  }
+  void relinkNurseryIterator(TableIteratorObject* iter) {
+    auto** listp = addressOfIterators(iter);
+    iter->link(listp);
+  }
+
+  void updateIteratorsAfterMove(OrderedHashTableObject* old) {
+    if (TableIteratorObject* iter = getTenuredIterators()) {
+      MOZ_ASSERT(iter->getPrevPtr() ==
+                 OrderedHashTableImpl(old).addressOfTenuredIterators());
+      iter->setPrevPtr(addressOfTenuredIterators());
+    }
+    if (TableIteratorObject* iter = getNurseryIterators()) {
+      MOZ_ASSERT(iter->getPrevPtr() ==
+                 OrderedHashTableImpl(old).addressOfNurseryIterators());
+      iter->setPrevPtr(addressOfNurseryIterators());
+    }
+  }
+
+  bool hasNurseryIterators() const { return getNurseryIterators(); }
+
+  void rekeyOneEntry(const Key& current, const Key& newKey, const T& element) {
+    if (current == newKey) {
+      return;
+    }
+
+    HashNumber currentHash = prepareHash(current);
+    HashNumber newHash = prepareHash(newKey);
+
+    Data* entry = lookup(current, currentHash);
+    MOZ_ASSERT(entry);
+    entry->element = element;
+
+    updateHashTableForRekey(entry, currentHash, newHash);
+  }
+
+  static constexpr size_t offsetOfDataElement() {
+    static_assert(offsetof(Data, element) == 0,
+                  "TableIteratorLoadEntry and TableIteratorAdvance depend on "
+                  "offsetof(Data, element) being 0");
+    return offsetof(Data, element);
+  }
+  static constexpr size_t offsetOfDataChain() { return offsetof(Data, chain); }
+  static constexpr size_t sizeofData() { return sizeof(Data); }
+
+#ifdef DEBUG
+  mozilla::Maybe<HashNumber> hash(const Lookup& l) const {
+    if (!hasAllocatedBuffer()) {
+      return {};
+    }
+    return mozilla::Some(prepareHash(l));
+  }
+#endif
+
+ private:
+  HashNumber prepareHash(const Lookup& l) const {
+    MOZ_ASSERT(hasAllocatedBuffer(),
+               "the hash code scrambler is allocated in the buffer");
+    const HashCodeScrambler& hcs = *getHashCodeScrambler();
+    return mozilla::ScrambleHashCode(Ops::hash(l, hcs));
+  }
+
+  uint32_t hashBuckets() const {
+    return hashShiftToNumHashBuckets(getHashShift());
+  }
+
+  void destroyData(Data* data, uint32_t length) {
+    Data* end = data + length;
+    for (Data* p = data; p != end; p++) {
+      p->~Data();
+    }
+  }
+
+  void freeData(JSContext* cx, Data* data, uint32_t length, uint32_t capacity,
+                uint32_t hashBuckets) {
+    MOZ_ASSERT(data);
+    MOZ_ASSERT(capacity > 0);
+
+    destroyData(data, length);
+
+    size_t numBytes = calcAllocSize(capacity, hashBuckets);
+
+    obj->freeCellBuffer(cx, data, numBytes);
+  }
+
+  Data* lookup(const Lookup& l, HashNumber h) const {
+    MOZ_ASSERT(hasAllocatedBuffer());
+    Data** hashTable = getHashTable();
+    uint32_t hashShift = getHashShift();
+    for (Data* e = hashTable[h >> hashShift]; e; e = e->chain) {
+      if (Ops::match(Ops::getKey(e->element), l)) {
+        return e;
+      }
+    }
+    return nullptr;
+  }
+
+  Data* lookup(const Lookup& l) const {
+    if (getLiveCount() == 0) {
+      return nullptr;
+    }
+    return lookup(l, prepareHash(l));
+  }
+
+  std::tuple<Data*, Data*> addEntry(HashNumber hash) {
+    uint32_t dataLength = getDataLength();
+    MOZ_ASSERT(dataLength < getDataCapacity());
+
+    Data* entry = &getData()[dataLength];
+    setDataLength(dataLength + 1);
+    setLiveCount(getLiveCount() + 1);
+
+    Data** hashTable = getHashTable();
+    hash >>= getHashShift();
+    Data* chain = hashTable[hash];
+    hashTable[hash] = entry;
+
+    return std::make_tuple(entry, chain);
+  }
+
+  void compacted() {
+    forEachIterator([](auto* iter) { IterOps::onCompact(iter); });
+  }
+
+  void rehashInPlace() {
+    Data** hashTable = getHashTable();
+    std::fill_n(hashTable, hashBuckets(), nullptr);
+
+    Data* const data = getData();
+    uint32_t hashShift = getHashShift();
+    Data* wp = data;
+    Data* end = data + getDataLength();
+    for (Data* rp = data; rp != end; rp++) {
+      if (!Ops::isEmpty(Ops::getKey(rp->element))) {
+        HashNumber h = prepareHash(Ops::getKey(rp->element)) >> hashShift;
+        if (rp != wp) {
+          wp->element = std::move(rp->element);
+        }
+        wp->chain = hashTable[h];
+        hashTable[h] = wp;
+        wp++;
+      }
+    }
+    MOZ_ASSERT(wp == data + getLiveCount());
+
+    while (wp != end) {
+      wp->~Data();
+      wp++;
+    }
+    setDataLength(getLiveCount());
+    compacted();
+  }
+
+  [[nodiscard]] bool rehashOnFull(JSContext* cx) {
+    MOZ_ASSERT(getDataLength() == getDataCapacity());
+
+    uint32_t newHashShift = getLiveCount() >= getDataCapacity() * 0.75
+                                ? getHashShift() - 1
+                                : getHashShift();
+    return rehash(cx, newHashShift);
+  }
+
+  [[nodiscard]] bool rehash(JSContext* cx, uint32_t newHashShift) {
+    if (newHashShift == getHashShift()) {
+      rehashInPlace();
+      return true;
+    }
+
+    if (MOZ_UNLIKELY(newHashShift < MinHashShift)) {
+      ReportAllocationOverflow(cx);
+      return false;
+    }
+
+    uint32_t newHashBuckets = hashShiftToNumHashBuckets(newHashShift);
+    uint32_t newCapacity = numHashBucketsToDataCapacity(newHashBuckets);
+
+    auto [newData, newHashTable, newHcs, numBytes] =
+        allocateBuffer(cx, newCapacity, newHashBuckets);
+    if (!newData) {
+      return false;
+    }
+
+    *newHcs = *getHashCodeScrambler();
+
+    std::uninitialized_fill_n(newHashTable, newHashBuckets, nullptr);
+
+    Data* const oldData = getData();
+    const uint32_t oldDataLength = getDataLength();
+
+    Data* wp = newData;
+    Data* end = oldData + oldDataLength;
+    for (Data* p = oldData; p != end; p++) {
+      if (!Ops::isEmpty(Ops::getKey(p->element))) {
+        HashNumber h = prepareHash(Ops::getKey(p->element)) >> newHashShift;
+        new (wp) Data(std::move(p->element), newHashTable[h]);
+        newHashTable[h] = wp;
+        wp++;
+      }
+    }
+    MOZ_ASSERT(wp == newData + getLiveCount());
+
+    freeData(cx, oldData, oldDataLength, getDataCapacity(), hashBuckets());
+
+    setHashTable(newHashTable);
+    setData(newData);
+    setDataLength(getLiveCount());
+    setDataCapacity(newCapacity);
+    setHashShift(newHashShift);
+    setHashCodeScrambler(newHcs);
+    MOZ_ASSERT(hashBuckets() == newHashBuckets);
+
+    compacted();
+    return true;
+  }
+
+  void rekey(Data* entry, const UnbarrieredKey& k) {
+    HashNumber oldHash = prepareHash(Ops::getKey(entry->element));
+    HashNumber newHash = prepareHash(k);
+    reinterpret_cast<UnbarrieredKey&>(Ops::getKeyRef(entry->element)) = k;
+    updateHashTableForRekey(entry, oldHash, newHash);
+  }
+};
+
+}  
+
+class OrderedHashMapObject : public detail::OrderedHashTableObject {};
+
+template <class Key, class Value, class OrderedHashPolicy>
+class MOZ_STACK_CLASS OrderedHashMapImpl {
+ public:
+  class Entry {
+    template <class, class>
+    friend class detail::OrderedHashTableImpl;
+    void operator=(const Entry& rhs) {
+      const_cast<Key&>(key) = rhs.key;
+      value = rhs.value;
+    }
+
+    void operator=(Entry&& rhs) {
+      MOZ_ASSERT(this != &rhs, "self-move assignment is prohibited");
+      const_cast<Key&>(key) = std::move(rhs.key);
+      value = std::move(rhs.value);
+    }
+
+   public:
+    Entry() = default;
+    explicit Entry(const Key& k) : key(k) {}
+    template <typename K, typename V>
+    Entry(K&& k, V&& v) : key(std::forward<K>(k)), value(std::forward<V>(v)) {}
+    Entry(Entry&& rhs) : key(std::move(rhs.key)), value(std::move(rhs.value)) {}
+
+    const Key key{};
+    Value value{};
+
+    static constexpr size_t offsetOfKey() { return offsetof(Entry, key); }
+    static constexpr size_t offsetOfValue() { return offsetof(Entry, value); }
+  };
+
+ private:
+  struct MapOps;
+  using Impl = detail::OrderedHashTableImpl<Entry, MapOps>;
+
+  struct MapOps : OrderedHashPolicy {
+    using KeyType = Key;
+    static void makeEmpty(Entry* e) {
+      OrderedHashPolicy::makeEmpty(const_cast<Key*>(&e->key));
+
+      e->value = Value();
+    }
+    static const Key& getKey(const Entry& e) { return e.key; }
+    static Key& getKeyRef(Entry& e) { return const_cast<Key&>(e.key); }
+    static void trace(JSTracer* trc, Impl* table, uint32_t index,
+                      Entry& entry) {
+      table->traceKey(trc, index, entry.key);
+      table->traceValue(trc, entry.value);
+    }
+  };
+
+  Impl impl;
+
+ public:
+  using Lookup = typename Impl::Lookup;
+  static constexpr size_t SlotCount = Impl::SlotCount;
+
+  explicit OrderedHashMapImpl(OrderedHashMapObject* obj) : impl(obj) {}
+
+  void initSlots() { impl.initSlots(); }
+  uint32_t count() const { return impl.count(); }
+  bool has(const Lookup& key) const { return impl.has(key); }
+  template <typename F>
+  [[nodiscard]] bool forEachEntry(F&& f) const {
+    return impl.forEachEntry(f);
+  }
+#ifdef DEBUG
+  template <typename F>
+  void forEachEntryUpTo(size_t maxCount, F&& f) const {
+    impl.forEachEntryUpTo(maxCount, f);
+  }
+#endif
+  Entry* get(const Lookup& key) { return impl.get(key); }
+  bool remove(JSContext* cx, const Lookup& key) { return impl.remove(cx, key); }
+  void clear(JSContext* cx) { impl.clear(cx); }
+
+  template <typename K, typename V>
+  [[nodiscard]] bool put(JSContext* cx, K&& key, V&& value) {
+    return impl.put(cx, Entry(std::forward<K>(key), std::forward<V>(value)));
+  }
+
+  template <typename K, typename V>
+  [[nodiscard]] Entry* getOrAdd(JSContext* cx, K&& key, V&& value) {
+    return impl.getOrAdd(cx,
+                         Entry(std::forward<K>(key), std::forward<V>(value)));
+  }
+
+#ifdef DEBUG
+  mozilla::Maybe<HashNumber> hash(const Lookup& key) const {
+    return impl.hash(key);
+  }
+#endif
+
+  template <typename GetNewKey>
+  mozilla::Maybe<Key> rekeyOneEntry(Lookup& current, GetNewKey&& getNewKey) {
+    const Entry* e = get(current);
+    if (!e) {
+      return mozilla::Nothing();
+    }
+
+    Key newKey = getNewKey(current);
+    impl.rekeyOneEntry(current, newKey, Entry(newKey, e->value));
+    return mozilla::Some(newKey);
+  }
+
+  void initIterator(MapIteratorObject* iter,
+                    TableIteratorObject::Kind kind) const {
+    impl.initIterator(iter, kind);
+  }
+  template <typename F>
+  bool iteratorNext(MapIteratorObject* iter, F&& f) const {
+    return impl.iteratorNext(iter, f);
+  }
+
+  void clearNurseryIterators() { impl.clearNurseryIterators(); }
+  void relinkNurseryIterator(MapIteratorObject* iter) {
+    impl.relinkNurseryIterator(iter);
+  }
+  void updateIteratorsAfterMove(OrderedHashMapObject* old) {
+    impl.updateIteratorsAfterMove(old);
+  }
+  bool hasNurseryIterators() const { return impl.hasNurseryIterators(); }
+
+  void maybeMoveBufferOnPromotion(Nursery& nursery) {
+    return impl.maybeMoveBufferOnPromotion(nursery);
+  }
+
+  void trace(JSTracer* trc) { impl.trace(trc); }
+
+  static constexpr size_t offsetOfEntryKey() { return Entry::offsetOfKey(); }
+  static constexpr size_t offsetOfImplDataElement() {
+    return Impl::offsetOfDataElement();
+  }
+  static constexpr size_t offsetOfImplDataChain() {
+    return Impl::offsetOfDataChain();
+  }
+  static constexpr size_t sizeofImplData() { return Impl::sizeofData(); }
+
+  size_t sizeOfExcludingObject() const { return impl.sizeOfExcludingObject(); }
+};
+
+class OrderedHashSetObject : public detail::OrderedHashTableObject {};
+
+template <class T, class OrderedHashPolicy>
+class MOZ_STACK_CLASS OrderedHashSetImpl {
+ private:
+  struct SetOps;
+  using Impl = detail::OrderedHashTableImpl<T, SetOps>;
+
+  struct SetOps : OrderedHashPolicy {
+    using KeyType = const T;
+    static const T& getKey(const T& v) { return v; }
+    static T& getKeyRef(T& e) { return e; }
+    static void trace(JSTracer* trc, Impl* table, uint32_t index, T& entry) {
+      table->traceKey(trc, index, entry);
+    }
+  };
+
+  Impl impl;
+
+ public:
+  using Lookup = typename Impl::Lookup;
+  static constexpr size_t SlotCount = Impl::SlotCount;
+
+  explicit OrderedHashSetImpl(OrderedHashSetObject* obj) : impl(obj) {}
+
+  void initSlots() { impl.initSlots(); }
+  uint32_t count() const { return impl.count(); }
+  bool has(const Lookup& value) const { return impl.has(value); }
+  template <typename F>
+  [[nodiscard]] bool forEachEntry(F&& f) const {
+    return impl.forEachEntry(f);
+  }
+#ifdef DEBUG
+  template <typename F>
+  void forEachEntryUpTo(size_t maxCount, F&& f) const {
+    impl.forEachEntryUpTo(maxCount, f);
+  }
+#endif
+  template <typename Input>
+  [[nodiscard]] bool put(JSContext* cx, Input&& value) {
+    return impl.put(cx, std::forward<Input>(value));
+  }
+  bool remove(JSContext* cx, const Lookup& value) {
+    return impl.remove(cx, value);
+  }
+  void clear(JSContext* cx) { impl.clear(cx); }
+
+#ifdef DEBUG
+  mozilla::Maybe<HashNumber> hash(const Lookup& value) const {
+    return impl.hash(value);
+  }
+#endif
+
+  template <typename GetNewKey>
+  mozilla::Maybe<T> rekeyOneEntry(Lookup& current, GetNewKey&& getNewKey) {
+    if (!has(current)) {
+      return mozilla::Nothing();
+    }
+
+    T newKey = getNewKey(current);
+    impl.rekeyOneEntry(current, newKey, newKey);
+    return mozilla::Some(newKey);
+  }
+
+  void initIterator(SetIteratorObject* iter,
+                    TableIteratorObject::Kind kind) const {
+    impl.initIterator(iter, kind);
+  }
+  template <typename F>
+  bool iteratorNext(SetIteratorObject* iter, F&& f) const {
+    return impl.iteratorNext(iter, f);
+  }
+
+  void clearNurseryIterators() { impl.clearNurseryIterators(); }
+  void relinkNurseryIterator(SetIteratorObject* iter) {
+    impl.relinkNurseryIterator(iter);
+  }
+  void updateIteratorsAfterMove(OrderedHashSetObject* old) {
+    impl.updateIteratorsAfterMove(old);
+  }
+  bool hasNurseryIterators() const { return impl.hasNurseryIterators(); }
+
+  void maybeMoveBufferOnPromotion(Nursery& nursery) {
+    return impl.maybeMoveBufferOnPromotion(nursery);
+  }
+
+  void trace(JSTracer* trc) { impl.trace(trc); }
+
+  static constexpr size_t offsetOfEntryKey() { return 0; }
+  static constexpr size_t offsetOfImplDataElement() {
+    return Impl::offsetOfDataElement();
+  }
+  static constexpr size_t offsetOfImplDataChain() {
+    return Impl::offsetOfDataChain();
+  }
+  static constexpr size_t sizeofImplData() { return Impl::sizeofData(); }
+
+  size_t sizeOfExcludingObject() const { return impl.sizeOfExcludingObject(); }
+};
+
+}  
+
+#endif /* builtin_OrderedHashTableObject_h */

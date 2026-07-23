@@ -1,0 +1,273 @@
+/*
+ *  Copyright 2011 The LibYuv Project Authors. All rights reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS. All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+#if !defined(INCLUDE_LIBYUV_ROTATE_H_)
+#define INCLUDE_LIBYUV_ROTATE_H_
+
+#include "libyuv/basic_types.h"
+
+#if defined(__cplusplus)
+namespace libyuv {
+extern "C" {
+#endif
+
+typedef enum RotationMode {
+  kRotate0 = 0,      
+  kRotate90 = 90,    
+  kRotate180 = 180,  
+  kRotate270 = 270,  
+
+  kRotateNone = 0,
+  kRotateClockwise = 90,
+  kRotateCounterClockwise = 270,
+} RotationModeEnum;
+
+LIBYUV_API
+int I420Rotate(const uint8_t* src_y,
+               int src_stride_y,
+               const uint8_t* src_u,
+               int src_stride_u,
+               const uint8_t* src_v,
+               int src_stride_v,
+               uint8_t* dst_y,
+               int dst_stride_y,
+               uint8_t* dst_u,
+               int dst_stride_u,
+               uint8_t* dst_v,
+               int dst_stride_v,
+               int width,
+               int height,
+               enum RotationMode mode);
+
+LIBYUV_API
+int I422Rotate(const uint8_t* src_y,
+               int src_stride_y,
+               const uint8_t* src_u,
+               int src_stride_u,
+               const uint8_t* src_v,
+               int src_stride_v,
+               uint8_t* dst_y,
+               int dst_stride_y,
+               uint8_t* dst_u,
+               int dst_stride_u,
+               uint8_t* dst_v,
+               int dst_stride_v,
+               int width,
+               int height,
+               enum RotationMode mode);
+
+LIBYUV_API
+int I444Rotate(const uint8_t* src_y,
+               int src_stride_y,
+               const uint8_t* src_u,
+               int src_stride_u,
+               const uint8_t* src_v,
+               int src_stride_v,
+               uint8_t* dst_y,
+               int dst_stride_y,
+               uint8_t* dst_u,
+               int dst_stride_u,
+               uint8_t* dst_v,
+               int dst_stride_v,
+               int width,
+               int height,
+               enum RotationMode mode);
+
+LIBYUV_API
+int I010Rotate(const uint16_t* src_y,
+               int src_stride_y,
+               const uint16_t* src_u,
+               int src_stride_u,
+               const uint16_t* src_v,
+               int src_stride_v,
+               uint16_t* dst_y,
+               int dst_stride_y,
+               uint16_t* dst_u,
+               int dst_stride_u,
+               uint16_t* dst_v,
+               int dst_stride_v,
+               int width,
+               int height,
+               enum RotationMode mode);
+
+LIBYUV_API
+int I210Rotate(const uint16_t* src_y,
+               int src_stride_y,
+               const uint16_t* src_u,
+               int src_stride_u,
+               const uint16_t* src_v,
+               int src_stride_v,
+               uint16_t* dst_y,
+               int dst_stride_y,
+               uint16_t* dst_u,
+               int dst_stride_u,
+               uint16_t* dst_v,
+               int dst_stride_v,
+               int width,
+               int height,
+               enum RotationMode mode);
+
+LIBYUV_API
+int I410Rotate(const uint16_t* src_y,
+               int src_stride_y,
+               const uint16_t* src_u,
+               int src_stride_u,
+               const uint16_t* src_v,
+               int src_stride_v,
+               uint16_t* dst_y,
+               int dst_stride_y,
+               uint16_t* dst_u,
+               int dst_stride_u,
+               uint16_t* dst_v,
+               int dst_stride_v,
+               int width,
+               int height,
+               enum RotationMode mode);
+
+LIBYUV_API
+int NV12ToI420Rotate(const uint8_t* src_y,
+                     int src_stride_y,
+                     const uint8_t* src_uv,
+                     int src_stride_uv,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     uint8_t* dst_u,
+                     int dst_stride_u,
+                     uint8_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     enum RotationMode mode);
+
+LIBYUV_API
+int Android420ToI420Rotate(const uint8_t* src_y,
+                           int src_stride_y,
+                           const uint8_t* src_u,
+                           int src_stride_u,
+                           const uint8_t* src_v,
+                           int src_stride_v,
+                           int src_pixel_stride_uv,
+                           uint8_t* dst_y,
+                           int dst_stride_y,
+                           uint8_t* dst_u,
+                           int dst_stride_u,
+                           uint8_t* dst_v,
+                           int dst_stride_v,
+                           int width,
+                           int height,
+                           enum RotationMode rotation);
+
+LIBYUV_API
+int RotatePlane(const uint8_t* src,
+                int src_stride,
+                uint8_t* dst,
+                int dst_stride,
+                int width,
+                int height,
+                enum RotationMode mode);
+
+LIBYUV_API
+void RotatePlane90(const uint8_t* src,
+                   int src_stride,
+                   uint8_t* dst,
+                   int dst_stride,
+                   int width,
+                   int height);
+
+LIBYUV_API
+void RotatePlane180(const uint8_t* src,
+                    int src_stride,
+                    uint8_t* dst,
+                    int dst_stride,
+                    int width,
+                    int height);
+
+LIBYUV_API
+void RotatePlane270(const uint8_t* src,
+                    int src_stride,
+                    uint8_t* dst,
+                    int dst_stride,
+                    int width,
+                    int height);
+
+LIBYUV_API
+int RotatePlane_16(const uint16_t* src,
+                   int src_stride,
+                   uint16_t* dst,
+                   int dst_stride,
+                   int width,
+                   int height,
+                   enum RotationMode mode);
+
+LIBYUV_API
+int SplitRotateUV(const uint8_t* src_uv,
+                  int src_stride_uv,
+                  uint8_t* dst_u,
+                  int dst_stride_u,
+                  uint8_t* dst_v,
+                  int dst_stride_v,
+                  int width,
+                  int height,
+                  enum RotationMode mode);
+
+LIBYUV_API
+void SplitRotateUV90(const uint8_t* src,
+                     int src_stride,
+                     uint8_t* dst_a,
+                     int dst_stride_a,
+                     uint8_t* dst_b,
+                     int dst_stride_b,
+                     int width,
+                     int height);
+
+LIBYUV_API
+void SplitRotateUV180(const uint8_t* src,
+                      int src_stride,
+                      uint8_t* dst_a,
+                      int dst_stride_a,
+                      uint8_t* dst_b,
+                      int dst_stride_b,
+                      int width,
+                      int height);
+
+LIBYUV_API
+void SplitRotateUV270(const uint8_t* src,
+                      int src_stride,
+                      uint8_t* dst_a,
+                      int dst_stride_a,
+                      uint8_t* dst_b,
+                      int dst_stride_b,
+                      int width,
+                      int height);
+
+LIBYUV_API
+void TransposePlane(const uint8_t* src,
+                    int src_stride,
+                    uint8_t* dst,
+                    int dst_stride,
+                    int width,
+                    int height);
+
+LIBYUV_API
+void SplitTransposeUV(const uint8_t* src,
+                      int src_stride,
+                      uint8_t* dst_a,
+                      int dst_stride_a,
+                      uint8_t* dst_b,
+                      int dst_stride_b,
+                      int width,
+                      int height);
+
+#if defined(__cplusplus)
+}  
+}  
+#endif
+
+#endif

@@ -1,0 +1,187 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+#if !defined(GOOGLE_PROTOBUF_ARENAZ_SAMPLER_H__)
+#define GOOGLE_PROTOBUF_ARENAZ_SAMPLER_H__
+
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+
+
+#include "google/protobuf/port_def.inc"
+
+namespace google {
+namespace protobuf {
+namespace internal {
+
+#if defined(PROTOBUF_ARENAZ_SAMPLE)
+struct ThreadSafeArenaStats;
+void RecordAllocateSlow(ThreadSafeArenaStats* info, size_t used,
+                        size_t allocated, size_t wasted);
+struct [[nodiscard]] ThreadSafeArenaStats
+    : public absl::profiling_internal::Sample<ThreadSafeArenaStats> {
+  ThreadSafeArenaStats();
+  ~ThreadSafeArenaStats();
+
+  void PrepareForSampling(int64_t stride)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(init_mu);
+
+  struct BlockStats {
+    std::atomic<int> num_allocations;
+    std::atomic<size_t> bytes_allocated;
+    std::atomic<size_t> bytes_used;
+    std::atomic<size_t> bytes_wasted;
+
+    void PrepareForSampling();
+  };
+
+  static constexpr size_t kBlockHistogramBins = 15;
+  static constexpr size_t kLogMaxSizeForBinZero = 7;
+  static constexpr size_t kMaxSizeForBinZero = (1 << kLogMaxSizeForBinZero);
+  static constexpr size_t kMaxSizeForPenultimateBin =
+      1 << (kLogMaxSizeForBinZero + kBlockHistogramBins - 2);
+  std::array<BlockStats, kBlockHistogramBins> block_histogram;
+
+  std::atomic<size_t> max_block_size;
+  std::atomic<uint64_t> thread_ids;
+
+  static constexpr int kMaxStackDepth = 64;
+  int32_t depth;
+  void* stack[kMaxStackDepth];
+  static void RecordAllocateStats(ThreadSafeArenaStats* info, size_t used,
+                                  size_t allocated, size_t wasted) {
+    if (ABSL_PREDICT_TRUE(info == nullptr)) return;
+    RecordAllocateSlow(info, used, allocated, wasted);
+  }
+
+  static size_t FindBin(size_t bytes);
+
+  static std::pair<size_t, size_t> MinMaxBlockSizeForBin(size_t bin);
+};
+
+struct SamplingState {
+  int64_t next_sample;
+  int64_t sample_stride;
+};
+
+[[nodiscard]] ThreadSafeArenaStats* SampleSlow(SamplingState& sampling_state);
+void UnsampleSlow(ThreadSafeArenaStats* info);
+
+class ThreadSafeArenaStatsHandle {
+ public:
+  explicit ThreadSafeArenaStatsHandle() = default;
+  explicit ThreadSafeArenaStatsHandle(ThreadSafeArenaStats* info)
+      : info_(info) {}
+
+  ~ThreadSafeArenaStatsHandle() {
+    if (ABSL_PREDICT_TRUE(info_ == nullptr)) return;
+    UnsampleSlow(info_);
+  }
+
+  ThreadSafeArenaStatsHandle(ThreadSafeArenaStatsHandle&& other) noexcept
+      : info_(std::exchange(other.info_, nullptr)) {}
+
+  ThreadSafeArenaStatsHandle& operator=(
+      ThreadSafeArenaStatsHandle&& other) noexcept {
+    if (ABSL_PREDICT_FALSE(info_ != nullptr)) {
+      UnsampleSlow(info_);
+    }
+    info_ = std::exchange(other.info_, nullptr);
+    return *this;
+  }
+
+  ThreadSafeArenaStats* MutableStats() { return info_; }
+
+  friend void swap(ThreadSafeArenaStatsHandle& lhs,
+                   ThreadSafeArenaStatsHandle& rhs) noexcept {
+    std::swap(lhs.info_, rhs.info_);
+  }
+
+  friend class ThreadSafeArenaStatsHandlePeer;
+
+ private:
+  ThreadSafeArenaStats* info_ = nullptr;
+};
+
+using ThreadSafeArenazSampler =
+    ::absl::profiling_internal::SampleRecorder<ThreadSafeArenaStats>;
+
+extern PROTOBUF_THREAD_LOCAL SamplingState global_sampling_state;
+
+[[nodiscard]] inline ThreadSafeArenaStatsHandle Sample() {
+  if (ABSL_PREDICT_TRUE(--global_sampling_state.next_sample > 0)) {
+    return ThreadSafeArenaStatsHandle(nullptr);
+  }
+  return ThreadSafeArenaStatsHandle(SampleSlow(global_sampling_state));
+}
+
+#else
+
+using SamplingState = int64_t;
+
+struct ThreadSafeArenaStats {
+  static void RecordAllocateStats(ThreadSafeArenaStats*, size_t ,
+                                  size_t , size_t ) {}
+};
+
+[[nodiscard]] ThreadSafeArenaStats* SampleSlow(SamplingState& next_sample);
+void UnsampleSlow(ThreadSafeArenaStats* info);
+
+class [[nodiscard]] ThreadSafeArenaStatsHandle {
+ public:
+  explicit ThreadSafeArenaStatsHandle() = default;
+  explicit ThreadSafeArenaStatsHandle(ThreadSafeArenaStats*) {}
+
+  void RecordReset() {}
+
+  ThreadSafeArenaStats* MutableStats() { return nullptr; }
+
+  friend void swap(ThreadSafeArenaStatsHandle&, ThreadSafeArenaStatsHandle&) {}
+
+ private:
+  friend class ThreadSafeArenaStatsHandlePeer;
+};
+
+class ThreadSafeArenazSampler {
+ public:
+  void Unregister(ThreadSafeArenaStats*) {}
+  void SetMaxSamples(int32_t) {}
+};
+
+[[nodiscard]] inline ThreadSafeArenaStatsHandle Sample() {
+  return ThreadSafeArenaStatsHandle(nullptr);
+}
+#endif
+
+ThreadSafeArenazSampler& GlobalThreadSafeArenazSampler();
+
+using ThreadSafeArenazConfigListener = void (*)();
+void SetThreadSafeArenazConfigListener(ThreadSafeArenazConfigListener l);
+
+void SetThreadSafeArenazEnabled(bool enabled);
+void SetThreadSafeArenazEnabledInternal(bool enabled);
+
+[[nodiscard]] bool IsThreadSafeArenazEnabled();
+
+void SetThreadSafeArenazSampleParameter(int32_t rate);
+void SetThreadSafeArenazSampleParameterInternal(int32_t rate);
+
+[[nodiscard]] int32_t ThreadSafeArenazSampleParameter();
+
+void SetThreadSafeArenazMaxSamples(int32_t max);
+void SetThreadSafeArenazMaxSamplesInternal(int32_t max);
+
+[[nodiscard]] size_t ThreadSafeArenazMaxSamples();
+
+void SetThreadSafeArenazGlobalNextSample(int64_t next_sample);
+
+}  
+}  
+}  
+
+#include "google/protobuf/port_undef.inc"
+#endif

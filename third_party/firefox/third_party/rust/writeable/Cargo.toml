@@ -1,0 +1,47 @@
+
+[package]
+edition = "2021"
+rust-version = "1.82"
+name = "writeable"
+version = "0.6.2"
+authors = ["The ICU4X Project Developers"]
+build = false
+include = [
+    "data/**/*",
+    "src/**/*",
+    "examples/**/*",
+    "benches/**/*",
+    "tests/**/*",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "build.rs",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "A more efficient alternative to fmt::Display"
+license = "Unicode-3.0"
+repository = "https://github.com/unicode-org/icu4x"
+
+[package.metadata.workspaces]
+independent = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+alloc = []
+default = ["alloc"]
+either = ["dep:either"]
+
+[lib]
+name = "writeable"
+path = "src/lib.rs"
+
+[dependencies.either]
+version = "1.9.0"
+optional = true
+default-features = false

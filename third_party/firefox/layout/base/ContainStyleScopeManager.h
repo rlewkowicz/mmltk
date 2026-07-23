@@ -1,0 +1,116 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(ContainStyleScopeManager_h_)
+#define ContainStyleScopeManager_h_
+
+#include "nsClassHashtable.h"
+#include "nsCounterManager.h"
+#include "nsQuoteList.h"
+#include "nsTHashSet.h"
+
+class nsIContent;
+class nsAtom;
+
+namespace mozilla {
+
+namespace dom {
+class Element;
+}
+
+class ContainStyleScopeManager;
+
+class ContainStyleScope final {
+ public:
+  ContainStyleScope(ContainStyleScopeManager* aManager,
+                    ContainStyleScope* aParent, nsIContent* aContent)
+      : mQuoteList(this),
+        mCounterManager(this),
+        mScopeManager(aManager),
+        mParent(aParent),
+        mContent(aContent) {
+    MOZ_ASSERT(aManager);
+    if (mParent) {
+      mParent->AddChild(this);
+    }
+  }
+
+  ~ContainStyleScope() {
+    if (mParent) {
+      mParent->RemoveChild(this);
+    }
+  }
+
+  nsQuoteList& GetQuoteList() { return mQuoteList; }
+  nsCounterManager& GetCounterManager() { return mCounterManager; }
+  ContainStyleScopeManager& GetScopeManager() { return *mScopeManager; }
+  ContainStyleScope* GetParent() { return mParent; }
+  nsIContent* GetContent() { return mContent; }
+
+  void AddChild(ContainStyleScope* aScope) { mChildren.AppendElement(aScope); }
+  void RemoveChild(ContainStyleScope* aScope) {
+    mChildren.RemoveElement(aScope);
+  }
+  const nsTArray<ContainStyleScope*>& GetChildren() const { return mChildren; }
+
+  void RecalcAllCounters();
+  void RecalcAllQuotes();
+
+  nsGenConNode* GetPrecedingElementInGenConList(nsGenConList*);
+
+ private:
+  nsQuoteList mQuoteList;
+  nsCounterManager mCounterManager;
+
+  ContainStyleScopeManager* mScopeManager;
+
+  ContainStyleScope* mParent;
+  nsTArray<ContainStyleScope*> mChildren;
+
+  nsIContent* mContent;
+};
+
+class ContainStyleScopeManager {
+ public:
+  ContainStyleScopeManager() : mRootScope(this, nullptr, nullptr) {}
+  ContainStyleScope& GetRootScope() { return mRootScope; }
+  ContainStyleScope& GetOrCreateScopeForContent(nsIContent*);
+  ContainStyleScope& GetScopeForContent(nsIContent*);
+
+  void Clear();
+
+  void DestroyScopesFor(nsIFrame*);
+
+  void DestroyScope(ContainStyleScope*);
+
+  bool DestroyCounterNodesFor(nsIFrame*);
+  bool AddCounterChanges(nsIFrame* aNewFrame);
+  nsCounterList* GetOrCreateCounterList(dom::Element&, nsAtom* aCounterName);
+
+  bool CounterDirty(nsAtom* aCounterName);
+  void SetCounterDirty(nsAtom* aCounterName);
+  void RecalcAllCounters();
+  void SetAllCountersDirty();
+
+  bool DestroyQuoteNodesFor(nsIFrame*);
+  nsQuoteList* QuoteListFor(dom::Element&);
+  void RecalcAllQuotes();
+
+#if defined(DEBUG) || 0
+  void DumpCounters();
+#endif
+
+#if defined(ACCESSIBILITY)
+  void GetSpokenCounterText(nsIFrame* aFrame, nsAString& aText);
+#endif
+
+ private:
+  ContainStyleScope mRootScope;
+  nsClassHashtable<nsPtrHashKey<nsIContent>, ContainStyleScope> mScopes;
+  nsTHashSet<RefPtr<nsAtom>> mDirtyCounters;
+};
+
+}  
+
+#endif

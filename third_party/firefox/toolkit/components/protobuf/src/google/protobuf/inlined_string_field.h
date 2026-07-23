@@ -1,0 +1,282 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+#if !defined(GOOGLE_PROTOBUF_INLINED_STRING_FIELD_H__)
+#define GOOGLE_PROTOBUF_INLINED_STRING_FIELD_H__
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <utility>
+
+#include "absl/log/absl_check.h"
+#include "absl/strings/string_view.h"
+#include "google/protobuf/arenastring.h"
+#include "google/protobuf/explicitly_constructed.h"
+#include "google/protobuf/message_lite.h"
+#include "google/protobuf/port.h"
+
+#include "google/protobuf/port_def.inc"
+
+#if defined(SWIG)
+#error "You cannot SWIG proto headers"
+#endif
+
+namespace google {
+namespace protobuf {
+
+class Arena;
+
+namespace internal {
+
+class PROTOBUF_EXPORT InlinedStringField {
+ public:
+  template <typename = void>
+  constexpr InlinedStringField() : str_() {}
+  InlinedStringField(const InlinedStringField&) = delete;
+  InlinedStringField& operator=(const InlinedStringField&) = delete;
+  explicit InlinedStringField(const std::string& default_value);
+  explicit InlinedStringField(Arena* arena);
+  InlinedStringField(Arena* arena, const InlinedStringField& rhs);
+  ~InlinedStringField() {
+    ABSL_DCHECK(!IsLongDonated());
+    Destruct();
+  }
+
+  void Set(absl::string_view value, Arena* arena);
+
+  void Set(std::string&& value, Arena* arena);
+
+  void Set(const char* str, Arena* arena);
+
+  void Set(const char* str, size_t size, Arena* arena);
+
+  template <typename RefWrappedType>
+  void Set(std::reference_wrapper<RefWrappedType> const_string_ref,
+           Arena* arena);
+
+  void SetBytes(absl::string_view value, Arena* arena);
+
+  void SetBytes(std::string&& value, Arena* arena);
+
+  void SetBytes(const char* str, Arena* arena);
+
+  void SetBytes(const void* p, size_t size, Arena* arena);
+
+  template <typename RefWrappedType>
+  void SetBytes(std::reference_wrapper<RefWrappedType> const_string_ref,
+                Arena* arena);
+
+  PROTOBUF_NDEBUG_INLINE void SetNoArena(absl::string_view value);
+  PROTOBUF_NDEBUG_INLINE void SetNoArena(std::string&& value);
+
+  PROTOBUF_NDEBUG_INLINE const std::string& Get() const { return GetNoArena(); }
+  PROTOBUF_NDEBUG_INLINE const std::string& GetNoArena() const;
+
+  std::string* Mutable(Arena* arena);
+
+  std::string* Mutable(std::nullptr_t);
+  std::string* MutableNoCopy(std::nullptr_t);
+
+  void SetAllocated(std::string* value, Arena* arena);
+
+  void SetAllocatedNoArena(std::string* value);
+
+  [[nodiscard]] std::string* Release(Arena* arena);
+  [[nodiscard]] std::string* Release();
+
+  PROTOBUF_NDEBUG_INLINE static void InternalSwap(InlinedStringField* lhs,
+                                                  InlinedStringField* rhs,
+                                                  Arena* arena);
+
+  PROTOBUF_NDEBUG_INLINE void Destroy(Arena* arena) {
+    if (arena == nullptr) {
+      DestroyNoArena();
+    }
+  }
+  PROTOBUF_NDEBUG_INLINE void DestroyNoArena();
+
+  PROTOBUF_NDEBUG_INLINE void ClearToEmpty() { ClearNonDefaultToEmpty(); }
+  PROTOBUF_NDEBUG_INLINE void ClearNonDefaultToEmpty() {
+    get_mutable()->clear();
+  }
+
+  void ClearToDefault(const LazyString& default_value, Arena* arena,
+                      bool donated);
+
+  PROTOBUF_NDEBUG_INLINE std::string* UnsafeMutablePointer();
+
+  static constexpr bool IsDefault() { return false; }
+  static constexpr bool IsDefault(const std::string*) { return false; }
+
+  size_t Capacity() const;
+
+  bool IsDonated() const;
+
+  size_t SpaceUsedExcludingSelfLong() const;
+
+ private:
+  class ScopedCheckInvariants;
+
+  void Destruct() { get_mutable()->~basic_string(); }
+
+  PROTOBUF_NDEBUG_INLINE std::string* get_mutable();
+  PROTOBUF_NDEBUG_INLINE const std::string* get_const() const;
+
+  static constexpr uint64_t kDonatedBit = uint64_t{1} << 48;
+
+  static bool IsDonated(const std::string& str);
+  bool IsLongDonated() const;
+
+  struct StringBuffer {
+    char* ptr;
+    size_t capacity;
+  };
+  static StringBuffer AllocateStringBuffer(Arena& arena, size_t length);
+  static void DonateForInlineStr(std::string* str, StringBuffer buffer,
+                                 size_t length);
+
+  union {
+    std::string str_;
+  };
+
+  std::string* MutableSlow(Arena* arena);
+
+  static void RegisterForDestruction(Arena* arena, std::string* str);
+  static void MaybeRegisterForDestruction(Arena* arena, std::string* str) {
+    if (IsDonated(*str)) return;
+    RegisterForDestruction(arena, str);
+  }
+  static void DestroyArenaString(void* p);
+
+
+  friend google::protobuf::Arena;
+  typedef void InternalArenaConstructable_;
+  typedef void DestructorSkippable_;
+};
+
+inline std::string* InlinedStringField::get_mutable() { return &str_; }
+
+inline const std::string* InlinedStringField::get_const() const {
+  return &str_;
+}
+
+inline InlinedStringField::InlinedStringField(
+    const std::string& default_value) {
+  new (get_mutable()) std::string(default_value);
+}
+
+
+inline InlinedStringField::InlinedStringField(Arena* ) : str_() {}
+
+inline InlinedStringField::InlinedStringField([[maybe_unused]] Arena* arena,
+                                              const InlinedStringField& rhs) {
+  const std::string& src = *rhs.get_const();
+  ::new (static_cast<void*>(&str_)) std::string(src);
+}
+
+inline const std::string& InlinedStringField::GetNoArena() const {
+  return *get_const();
+}
+
+inline void InlinedStringField::SetAllocatedNoArena(std::string* value) {
+  if (value == nullptr) {
+    get_mutable()->clear();
+  } else {
+    get_mutable()->assign(std::move(*value));
+    delete value;
+  }
+}
+
+inline void InlinedStringField::DestroyNoArena() {
+  this->~InlinedStringField();
+}
+
+inline void InlinedStringField::SetNoArena(absl::string_view value) {
+  get_mutable()->assign(value.data(), value.length());
+}
+
+inline void InlinedStringField::SetNoArena(std::string&& value) {
+  get_mutable()->assign(std::move(value));
+}
+
+PROTOBUF_NDEBUG_INLINE void InlinedStringField::InternalSwap(
+    InlinedStringField* lhs, InlinedStringField* rhs, Arena* arena) {
+#if defined(GOOGLE_PROTOBUF_INTERNAL_DONATE_STEAL_INLINE)
+  const bool lhs_donated = lhs->IsDonated();
+  const bool rhs_donated = rhs->IsDonated();
+  lhs->get_mutable()->swap(*rhs->get_mutable());
+  if (arena != nullptr && lhs_donated != rhs_donated) {
+    if (lhs_donated) lhs->RegisterForDestruction(arena, lhs->get_mutable());
+    if (rhs_donated) rhs->RegisterForDestruction(arena, rhs->get_mutable());
+  }
+#else
+  (void)arena;
+  lhs->get_mutable()->swap(*rhs->get_mutable());
+#endif
+}
+
+inline void InlinedStringField::Set(absl::string_view value, Arena* arena) {
+  (void)arena;
+  SetNoArena(value);
+}
+
+inline void InlinedStringField::Set(const char* str, Arena* arena) {
+  Set(absl::string_view(str), arena);
+}
+
+inline void InlinedStringField::Set(const char* str, size_t size,
+                                    Arena* arena) {
+  Set(absl::string_view{str, size}, arena);
+}
+
+inline void InlinedStringField::SetBytes(absl::string_view value,
+                                         Arena* arena) {
+  Set(value, arena);
+}
+
+inline void InlinedStringField::SetBytes(std::string&& value, Arena* arena) {
+  Set(std::move(value), arena);
+}
+
+inline void InlinedStringField::SetBytes(const char* str, Arena* arena) {
+  Set(str, arena);
+}
+
+inline void InlinedStringField::SetBytes(const void* p, size_t size,
+                                         Arena* arena) {
+  Set(static_cast<const char*>(p), size, arena);
+}
+
+template <typename RefWrappedType>
+inline void InlinedStringField::Set(
+    std::reference_wrapper<RefWrappedType> const_string_ref, Arena* arena) {
+  Set(const_string_ref.get(), arena);
+}
+
+template <typename RefWrappedType>
+inline void InlinedStringField::SetBytes(
+    std::reference_wrapper<RefWrappedType> const_string_ref, Arena* arena) {
+  Set(const_string_ref.get(), arena);
+}
+
+inline std::string* InlinedStringField::UnsafeMutablePointer() {
+  return get_mutable();
+}
+
+inline std::string* InlinedStringField::Mutable(std::nullptr_t) {
+  return get_mutable();
+}
+
+inline std::string* InlinedStringField::MutableNoCopy(std::nullptr_t) {
+  return get_mutable();
+}
+
+}  
+}  
+}  
+
+#include "google/protobuf/port_undef.inc"
+
+#endif

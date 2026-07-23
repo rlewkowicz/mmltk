@@ -1,0 +1,314 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_Dictionary_h
+#define mozilla_net_Dictionary_h
+
+#include "nsCOMPtr.h"
+#include "nsICacheEntry.h"
+#include "nsICacheEntryOpenCallback.h"
+#include "nsISupports.h"
+#include "nsICacheStorageService.h"
+#include "nsICacheStorageVisitor.h"
+#include "nsICryptoHash.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIStreamListener.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Vector.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include <vector>
+#include "mozilla/dom/RequestBinding.h"
+#include "mozilla/TimeStamp.h"
+#include "nsTHashMap.h"
+#include "nsHashKeys.h"
+#include "mozilla/net/urlpattern_glue.h"
+
+class nsICacheStorage;
+class nsIIOService;
+class nsILoadContextInfo;
+
+static const uint32_t METADATA_DICTIONARY_VERSION = 1;
+#define META_DICTIONARY_PREFIX "dict:"_ns
+
+namespace mozilla {
+namespace net {
+
+class nsHttpChannel;
+class DictionaryOrigin;
+
+class DictionaryCacheEntry final : public nsICacheEntryOpenCallback,
+                                   public nsIStreamListener {
+  friend class DictionaryOrigin;
+
+ private:
+  ~DictionaryCacheEntry();
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSICACHEENTRYOPENCALLBACK
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+
+  explicit DictionaryCacheEntry(const char* aKey);
+  DictionaryCacheEntry(const nsACString& aKey, const nsACString& aPattern,
+                       nsTArray<nsCString>& aMatchDest, const nsACString& aId,
+                       uint32_t aExpiration = 0,
+                       const Maybe<nsCString>& aHash = Nothing());
+
+  static void ConvertMatchDestToEnumArray(
+      const nsTArray<nsCString>& aMatchDest,
+      nsTArray<dom::RequestDestination>& aMatchEnums);
+
+  bool Match(const nsACString& aFilePath, ExtContentPolicyType aType,
+             uint32_t aNow, uint32_t& aLongest);
+
+  nsresult Prefetch(nsILoadContextInfo* aLoadContextInfo, bool& aShouldSuspend,
+                    const std::function<void(nsresult)>& aFunc);
+
+  nsCString GetHash() const;
+  bool HasHash();
+  void SetHash(const nsACString& aHash);
+
+  void WriteOnHash();
+
+  void SetOrigin(DictionaryOrigin* aOrigin) { mOrigin = aOrigin; }
+
+  const nsCString& GetId() const { return mId; }
+
+  void InUse();
+  void UseCompleted();
+  bool IsReading() const;
+
+  void SetReplacement(DictionaryCacheEntry* aEntry, DictionaryOrigin* aOrigin) {
+    mReplacement = aEntry;
+    mOrigin = aOrigin;
+    if (mReplacement) {
+      mReplacement->mShouldSuspend = true;
+      mReplacement->mBlocked = true;
+    }
+  }
+
+  bool ShouldSuspendUntilCacheRead() const { return mShouldSuspend; }
+
+  void CallbackOnCacheRead(const std::function<void(nsresult)>& aFunc);
+
+  const nsACString& GetURI() const { return mURI; }
+
+  const Vector<uint8_t>& GetDictionary() const;
+
+  void AccumulateHash(const char* aBuf, int32_t aCount);
+  void FinishHash();
+  void FinishHashOnMainThread();
+
+  uint8_t* DictionaryData(size_t* aLength) const;
+
+  bool DictionaryReady() const;
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return mallocSizeOf(this);
+  }
+
+  static nsresult ReadCacheData(nsIInputStream* aInStream, void* aClosure,
+                                const char* aFromSegment, uint32_t aToOffset,
+                                uint32_t aCount, uint32_t* aWriteCount);
+
+  void CleanupOnCacheData(nsresult result);
+
+  void MakeMetadataEntry(nsCString& aNewValue);
+
+  nsresult Write(nsICacheEntry* aEntry);
+
+  nsresult RemoveEntry(nsICacheEntry* aCacheEntry);
+
+  bool ParseMetadata(const char* aSrc);
+
+  void CopyFrom(DictionaryCacheEntry* aOther) {
+    mURI = aOther->mURI;
+    mPattern = aOther->mPattern;
+    mId = aOther->mId;
+    mMatchDest = aOther->mMatchDest;
+  }
+
+  void UnblockAddEntry(DictionaryOrigin* aOrigin);
+
+  const nsCString& GetPattern() const { return mPattern; }
+  void AppendMatchDest(nsACString& aDest) const;
+
+ private:
+  nsCString mURI;
+  uint32_t mExpiration{0};
+
+  nsCString mPattern;
+  nsCString mId;  
+  CopyableTArray<dom::RequestDestination> mMatchDest;
+
+  Maybe<UrlPatternGlue> mCachedPattern;
+
+  nsCString mHash;
+
+  uint32_t mUsers{0};  
+
+  Vector<uint8_t> mDictionaryData;
+
+  Atomic<bool, ReleaseAcquire> mDictionaryDataComplete{false};
+
+  Vector<uint8_t> mPendingDictionaryData;
+
+  nsCOMPtr<nsICryptoHash> mCrypto;
+
+  struct PrefetchRequest {
+    std::function<void(nsresult)> callback;
+    bool isPrivateBrowsing;
+  };
+
+  std::vector<PrefetchRequest> mWaitingPrefetch;
+
+  RefPtr<DictionaryOrigin> mOrigin;
+
+  Atomic<bool, Relaxed> mStopReceived{false};
+  Atomic<bool, Relaxed> mNotCached{false};
+
+  RefPtr<DictionaryCacheEntry> mReplacement;
+
+  bool mShouldSuspend{false};
+
+  bool mBlocked{false};
+
+  nsCString mStoredContentEncoding;
+};
+
+
+class DictionaryCache;
+
+class DictionaryOriginReader final : public nsICacheEntryOpenCallback,
+                                     public nsIStreamListener {
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSICACHEENTRYOPENCALLBACK
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+
+  DictionaryOriginReader() = default;
+
+  void Start(
+      bool aCreate, DictionaryOrigin* aOrigin, nsACString& aKey, nsIURI* aURI,
+      ExtContentPolicyType aType, DictionaryCache* aCache,
+      const std::function<nsresult(bool, DictionaryCacheEntry*)>& aCallback);
+  void FinishMatch();
+
+ private:
+  ~DictionaryOriginReader() = default;
+
+  RefPtr<DictionaryOrigin> mOrigin;
+  nsCOMPtr<nsIURI> mURI;
+  ExtContentPolicyType mType = ExtContentPolicyType::TYPE_INVALID;
+  std::function<nsresult(bool, DictionaryCacheEntry*)> mCallback;
+  RefPtr<DictionaryCache> mCache;
+};
+
+using DictCacheList = nsTArray<RefPtr<DictionaryCacheEntry>>;
+
+class DictionaryOrigin : public nsICacheEntryMetaDataVisitor {
+  friend class DictionaryCache;
+  friend class DictionaryOriginReader;
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSICACHEENTRYMETADATAVISITOR
+
+  DictionaryOrigin(const nsACString& aOrigin, nsICacheEntry* aEntry)
+      : mOrigin(aOrigin), mEntry(aEntry) {}
+
+  void SetCacheEntry(nsICacheEntry* aEntry);
+  nsresult Write(DictionaryCacheEntry* aDictEntry);
+  already_AddRefed<DictionaryCacheEntry> AddEntry(
+      DictionaryCacheEntry* aDictEntry, bool aNewEntry);
+  nsresult RemoveEntry(const nsACString& aKey);
+  void RemoveEntry(DictionaryCacheEntry* aEntry);
+  DictionaryCacheEntry* Match(const nsACString& path,
+                              ExtContentPolicyType aType);
+  void FinishAddEntry(DictionaryCacheEntry* aEntry);
+  void DumpEntries();
+  void Clear();
+  bool IsEmpty() const {
+    return mEntries.IsEmpty() && mPendingEntries.IsEmpty() &&
+           mPendingRemove.IsEmpty() && mWaitingCacheRead.IsEmpty();
+  }
+
+ private:
+  virtual ~DictionaryOrigin() = default;
+
+  nsCString mOrigin;
+  nsCOMPtr<nsICacheEntry> mEntry;
+  DictCacheList mEntries;
+  DictCacheList mPendingEntries;
+  DictCacheList mPendingRemove;
+  bool mDeferredWrites{false};
+
+  nsTArray<RefPtr<DictionaryOriginReader>> mWaitingCacheRead;
+};
+
+class DictionaryCache final : public nsISupports {
+ private:
+  DictionaryCache() {
+    nsresult rv = Init();
+    (void)rv;
+    MOZ_DIAGNOSTIC_ASSERT(NS_SUCCEEDED(rv));
+  }
+  ~DictionaryCache() = default;
+
+  friend class DictionaryOriginReader;
+  friend class DictionaryCacheEntry;
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  static already_AddRefed<DictionaryCache> GetInstance();
+
+  nsresult Init();
+  static void Shutdown();
+
+  nsresult AddEntry(nsIURI* aURI, const nsACString& aKey,
+                    const nsACString& aPattern, nsTArray<nsCString>& aMatchDest,
+                    const nsACString& aId, const Maybe<nsCString>& aHash,
+                    bool aNewEntry, uint32_t aExpiration,
+                    DictionaryCacheEntry** aDictEntry);
+
+  already_AddRefed<DictionaryCacheEntry> AddEntry(
+      nsIURI* aURI, bool aNewEntry, DictionaryCacheEntry* aDictEntry);
+
+  static void RemoveDictionaryOMT(const nsACString& aKey);
+  static void RemoveOriginFor(const nsACString& aKey);
+
+  static void RemoveDictionary(const nsACString& aKey);
+  void RemoveOrigin(const nsACString& aOrigin);
+
+  nsresult RemoveEntry(nsIURI* aURI, const nsACString& aKey);
+
+  static void RemoveDictionariesForOrigin(nsIURI* aURI);
+  static void RemoveAllDictionaries();
+
+  void Clear();
+
+  void GetDictionaryFor(
+      nsIURI* aURI, ExtContentPolicyType aType, nsHttpChannel* aChan,
+      void (*aSuspend)(nsHttpChannel*),
+      const std::function<nsresult(bool, DictionaryCacheEntry*)>& aCallback);
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return mallocSizeOf(this);
+  }
+
+ private:
+  void RemoveOriginForInternal(const nsACString& aKey);
+
+  static StaticRefPtr<nsICacheStorage> sCacheStorage;
+  static Atomic<bool, Relaxed> sShutdown;
+
+  nsTHashMap<nsCStringHashKey, RefPtr<DictionaryOrigin>> mDictionaryCache;
+};
+
+}  
+}  
+
+#endif  // mozilla_net_Dictionary_h

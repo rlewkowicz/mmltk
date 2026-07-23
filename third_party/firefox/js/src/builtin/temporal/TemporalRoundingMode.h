@@ -1,0 +1,366 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_temporal_TemporalRoundingMode_h
+#define builtin_temporal_TemporalRoundingMode_h
+
+#include "mozilla/Assertions.h"
+
+#include <cmath>
+#include <stdint.h>
+
+#include "vm/Int128.h"
+
+namespace js::temporal {
+
+enum class TemporalRoundingMode {
+
+  Ceil,
+
+  Floor,
+
+  Expand,
+
+  Trunc,
+
+
+  HalfCeil,
+
+  HalfFloor,
+
+  HalfExpand,
+
+  HalfTrunc,
+
+  HalfEven,
+};
+
+constexpr auto NegateRoundingMode(TemporalRoundingMode roundingMode) {
+  switch (roundingMode) {
+    case TemporalRoundingMode::Ceil:
+      return TemporalRoundingMode::Floor;
+
+    case TemporalRoundingMode::Floor:
+      return TemporalRoundingMode::Ceil;
+
+    case TemporalRoundingMode::HalfCeil:
+      return TemporalRoundingMode::HalfFloor;
+
+    case TemporalRoundingMode::HalfFloor:
+      return TemporalRoundingMode::HalfCeil;
+
+    case TemporalRoundingMode::Expand:
+    case TemporalRoundingMode::Trunc:
+    case TemporalRoundingMode::HalfExpand:
+    case TemporalRoundingMode::HalfTrunc:
+    case TemporalRoundingMode::HalfEven:
+      return roundingMode;
+  }
+  MOZ_CRASH("invalid rounding mode");
+}
+
+constexpr auto ToPositiveRoundingMode(TemporalRoundingMode roundingMode) {
+  switch (roundingMode) {
+    case TemporalRoundingMode::Ceil:
+    case TemporalRoundingMode::Floor:
+    case TemporalRoundingMode::HalfCeil:
+    case TemporalRoundingMode::HalfFloor:
+    case TemporalRoundingMode::HalfEven:
+      return roundingMode;
+
+    case TemporalRoundingMode::Expand:
+      return TemporalRoundingMode::Ceil;
+
+    case TemporalRoundingMode::Trunc:
+      return TemporalRoundingMode::Floor;
+
+    case TemporalRoundingMode::HalfExpand:
+      return TemporalRoundingMode::HalfCeil;
+
+    case TemporalRoundingMode::HalfTrunc:
+      return TemporalRoundingMode::HalfFloor;
+  }
+  MOZ_CRASH("unexpected rounding mode");
+}
+
+
+constexpr int64_t CeilDiv(int64_t dividend, int64_t divisor) {
+  MOZ_ASSERT(divisor > 0, "negative divisor not supported");
+
+  int64_t quotient = dividend / divisor;
+  int64_t remainder = dividend % divisor;
+
+  if (remainder > 0) {
+    quotient += 1;
+  }
+  return quotient;
+}
+
+constexpr int64_t FloorDiv(int64_t dividend, int64_t divisor) {
+  MOZ_ASSERT(divisor > 0, "negative divisor not supported");
+
+  int64_t quotient = dividend / divisor;
+  int64_t remainder = dividend % divisor;
+
+  if (remainder < 0) {
+    quotient -= 1;
+  }
+  return quotient;
+}
+
+constexpr int64_t ExpandDiv(int64_t dividend, int64_t divisor) {
+  MOZ_ASSERT(divisor > 0, "negative divisor not supported");
+
+  int64_t quotient = dividend / divisor;
+  int64_t remainder = dividend % divisor;
+
+  if (remainder > 0) {
+    quotient += 1;
+  }
+  if (remainder < 0) {
+    quotient -= 1;
+  }
+  return quotient;
+}
+
+constexpr int64_t TruncDiv(int64_t dividend, int64_t divisor) {
+  MOZ_ASSERT(divisor > 0, "negative divisor not supported");
+
+  return dividend / divisor;
+}
+
+inline int64_t HalfCeilDiv(int64_t dividend, int64_t divisor) {
+  MOZ_ASSERT(divisor > 0, "negative divisor not supported");
+
+  int64_t quotient = dividend / divisor;
+  int64_t remainder = dividend % divisor;
+
+  if (remainder > 0 && uint64_t(std::abs(remainder)) * 2 >= uint64_t(divisor)) {
+    quotient += 1;
+  }
+  if (remainder < 0 && uint64_t(std::abs(remainder)) * 2 > uint64_t(divisor)) {
+    quotient -= 1;
+  }
+  return quotient;
+}
+
+inline int64_t HalfFloorDiv(int64_t dividend, int64_t divisor) {
+  MOZ_ASSERT(divisor > 0, "negative divisor not supported");
+
+  int64_t quotient = dividend / divisor;
+  int64_t remainder = dividend % divisor;
+
+  if (remainder < 0 && uint64_t(std::abs(remainder)) * 2 >= uint64_t(divisor)) {
+    quotient -= 1;
+  }
+  if (remainder > 0 && uint64_t(std::abs(remainder)) * 2 > uint64_t(divisor)) {
+    quotient += 1;
+  }
+  return quotient;
+}
+
+inline int64_t HalfExpandDiv(int64_t dividend, int64_t divisor) {
+  MOZ_ASSERT(divisor > 0, "negative divisor not supported");
+
+  int64_t quotient = dividend / divisor;
+  int64_t remainder = dividend % divisor;
+
+  if (uint64_t(std::abs(remainder)) * 2 >= uint64_t(divisor)) {
+    quotient += (dividend > 0) ? 1 : -1;
+  }
+  return quotient;
+}
+
+inline int64_t HalfTruncDiv(int64_t dividend, int64_t divisor) {
+  MOZ_ASSERT(divisor > 0, "negative divisor not supported");
+
+  int64_t quotient = dividend / divisor;
+  int64_t remainder = dividend % divisor;
+
+  if (uint64_t(std::abs(remainder)) * 2 > uint64_t(divisor)) {
+    quotient += (dividend > 0) ? 1 : -1;
+  }
+  return quotient;
+}
+
+inline int64_t HalfEvenDiv(int64_t dividend, int64_t divisor) {
+  MOZ_ASSERT(divisor > 0, "negative divisor not supported");
+
+  int64_t quotient = dividend / divisor;
+  int64_t remainder = dividend % divisor;
+
+  if ((quotient & 1) == 1 &&
+      uint64_t(std::abs(remainder)) * 2 == uint64_t(divisor)) {
+    quotient += (dividend > 0) ? 1 : -1;
+  }
+  if (uint64_t(std::abs(remainder)) * 2 > uint64_t(divisor)) {
+    quotient += (dividend > 0) ? 1 : -1;
+  }
+  return quotient;
+}
+
+inline int64_t Divide(int64_t dividend, int64_t divisor,
+                      TemporalRoundingMode roundingMode) {
+  switch (roundingMode) {
+    case TemporalRoundingMode::Ceil:
+      return CeilDiv(dividend, divisor);
+    case TemporalRoundingMode::Floor:
+      return FloorDiv(dividend, divisor);
+    case TemporalRoundingMode::Expand:
+      return ExpandDiv(dividend, divisor);
+    case TemporalRoundingMode::Trunc:
+      return TruncDiv(dividend, divisor);
+    case TemporalRoundingMode::HalfCeil:
+      return HalfCeilDiv(dividend, divisor);
+    case TemporalRoundingMode::HalfFloor:
+      return HalfFloorDiv(dividend, divisor);
+    case TemporalRoundingMode::HalfExpand:
+      return HalfExpandDiv(dividend, divisor);
+    case TemporalRoundingMode::HalfTrunc:
+      return HalfTruncDiv(dividend, divisor);
+    case TemporalRoundingMode::HalfEven:
+      return HalfEvenDiv(dividend, divisor);
+  }
+  MOZ_CRASH("invalid rounding mode");
+}
+
+inline Int128 CeilDiv(const Int128& dividend, const Int128& divisor) {
+  MOZ_ASSERT(divisor > Int128{0}, "negative divisor not supported");
+
+  auto [quotient, remainder] = dividend.divrem(divisor);
+
+  if (remainder > Int128{0}) {
+    quotient += Int128{1};
+  }
+  return quotient;
+}
+
+inline Int128 FloorDiv(const Int128& dividend, const Int128& divisor) {
+  MOZ_ASSERT(divisor > Int128{0}, "negative divisor not supported");
+
+  auto [quotient, remainder] = dividend.divrem(divisor);
+
+  if (remainder < Int128{0}) {
+    quotient -= Int128{1};
+  }
+  return quotient;
+}
+
+inline Int128 ExpandDiv(const Int128& dividend, const Int128& divisor) {
+  MOZ_ASSERT(divisor > Int128{0}, "negative divisor not supported");
+
+  auto [quotient, remainder] = dividend.divrem(divisor);
+
+  if (remainder > Int128{0}) {
+    quotient += Int128{1};
+  }
+  if (remainder < Int128{0}) {
+    quotient -= Int128{1};
+  }
+  return quotient;
+}
+
+inline Int128 TruncDiv(const Int128& dividend, const Int128& divisor) {
+  MOZ_ASSERT(divisor > Int128{0}, "negative divisor not supported");
+
+  return dividend / divisor;
+}
+
+inline Int128 HalfCeilDiv(const Int128& dividend, const Int128& divisor) {
+  MOZ_ASSERT(divisor > Int128{0}, "negative divisor not supported");
+
+  auto [quotient, remainder] = dividend.divrem(divisor);
+
+  if (remainder > Int128{0} &&
+      Uint128(remainder.abs()) * Uint128{2} >= static_cast<Uint128>(divisor)) {
+    quotient += Int128{1};
+  }
+  if (remainder < Int128{0} &&
+      Uint128(remainder.abs()) * Uint128{2} > static_cast<Uint128>(divisor)) {
+    quotient -= Int128{1};
+  }
+  return quotient;
+}
+
+inline Int128 HalfFloorDiv(const Int128& dividend, const Int128& divisor) {
+  MOZ_ASSERT(divisor > Int128{0}, "negative divisor not supported");
+
+  auto [quotient, remainder] = dividend.divrem(divisor);
+
+  if (remainder < Int128{0} &&
+      Uint128(remainder.abs()) * Uint128{2} >= static_cast<Uint128>(divisor)) {
+    quotient -= Int128{1};
+  }
+  if (remainder > Int128{0} &&
+      Uint128(remainder.abs()) * Uint128{2} > static_cast<Uint128>(divisor)) {
+    quotient += Int128{1};
+  }
+  return quotient;
+}
+
+inline Int128 HalfExpandDiv(const Int128& dividend, const Int128& divisor) {
+  MOZ_ASSERT(divisor > Int128{0}, "negative divisor not supported");
+
+  auto [quotient, remainder] = dividend.divrem(divisor);
+
+  if (Uint128(remainder.abs()) * Uint128{2} >= static_cast<Uint128>(divisor)) {
+    quotient += (dividend > Int128{0}) ? Int128{1} : Int128{-1};
+  }
+  return quotient;
+}
+
+inline Int128 HalfTruncDiv(const Int128& dividend, const Int128& divisor) {
+  MOZ_ASSERT(divisor > Int128{0}, "negative divisor not supported");
+
+  auto [quotient, remainder] = dividend.divrem(divisor);
+
+  if (Uint128(remainder.abs()) * Uint128{2} > static_cast<Uint128>(divisor)) {
+    quotient += (dividend > Int128{0}) ? Int128{1} : Int128{-1};
+  }
+  return quotient;
+}
+
+inline Int128 HalfEvenDiv(const Int128& dividend, const Int128& divisor) {
+  MOZ_ASSERT(divisor > Int128{0}, "negative divisor not supported");
+
+  auto [quotient, remainder] = dividend.divrem(divisor);
+
+  if ((quotient & Int128{1}) == Int128{1} &&
+      Uint128(remainder.abs()) * Uint128{2} == static_cast<Uint128>(divisor)) {
+    quotient += (dividend > Int128{0}) ? Int128{1} : Int128{-1};
+  }
+  if (Uint128(remainder.abs()) * Uint128{2} > static_cast<Uint128>(divisor)) {
+    quotient += (dividend > Int128{0}) ? Int128{1} : Int128{-1};
+  }
+  return quotient;
+}
+
+inline Int128 Divide(const Int128& dividend, const Int128& divisor,
+                     TemporalRoundingMode roundingMode) {
+  switch (roundingMode) {
+    case TemporalRoundingMode::Ceil:
+      return CeilDiv(dividend, divisor);
+    case TemporalRoundingMode::Floor:
+      return FloorDiv(dividend, divisor);
+    case TemporalRoundingMode::Expand:
+      return ExpandDiv(dividend, divisor);
+    case TemporalRoundingMode::Trunc:
+      return TruncDiv(dividend, divisor);
+    case TemporalRoundingMode::HalfCeil:
+      return HalfCeilDiv(dividend, divisor);
+    case TemporalRoundingMode::HalfFloor:
+      return HalfFloorDiv(dividend, divisor);
+    case TemporalRoundingMode::HalfExpand:
+      return HalfExpandDiv(dividend, divisor);
+    case TemporalRoundingMode::HalfTrunc:
+      return HalfTruncDiv(dividend, divisor);
+    case TemporalRoundingMode::HalfEven:
+      return HalfEvenDiv(dividend, divisor);
+  }
+  MOZ_CRASH("invalid rounding mode");
+}
+
+} 
+
+#endif /* builtin_temporal_TemporalRoundingMode_h */

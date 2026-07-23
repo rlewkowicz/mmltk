@@ -1,0 +1,33 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+EXPORTS.mozilla.dom = [
+    "CSPViolationReportBody.h",
+    "DeprecationReportBody.h",
+    "FeaturePolicyViolationReportBody.h",
+    "IntegrityViolationReportBody.h",
+    "Report.h",
+    "ReportBody.h",
+    "ReportDeliver.h",
+    "ReportingHeader.h",
+    "ReportingObserver.h",
+    "ReportingUtils.h",
+]
+
+UNIFIED_SOURCES += [
+    "CSPViolationReportBody.cpp",
+    "DeprecationReportBody.cpp",
+    "FeaturePolicyViolationReportBody.cpp",
+    "IntegrityViolationReportBody.cpp",
+    "Report.cpp",
+    "ReportBody.cpp",
+    "ReportDeliver.cpp",
+    "ReportingHeader.cpp",
+    "ReportingObserver.cpp",
+    "ReportingUtils.cpp",
+]
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+FINAL_LIBRARY = "xul"

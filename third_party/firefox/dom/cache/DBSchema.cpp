@@ -1,0 +1,2899 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/cache/DBSchema.h"
+
+#include "ipc/IPCMessageUtils.h"
+#include "mozIStorageConnection.h"
+#include "mozIStorageFunction.h"
+#include "mozIStorageStatement.h"
+#include "mozStorageHelper.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/ResultExtensions.h"
+#include "mozilla/dom/HeadersBinding.h"
+#include "mozilla/dom/InternalHeaders.h"
+#include "mozilla/dom/InternalResponse.h"
+#include "mozilla/dom/RequestBinding.h"
+#include "mozilla/dom/ResponseBinding.h"
+#include "mozilla/dom/cache/CacheCommon.h"
+#include "mozilla/dom/cache/CacheTypes.h"
+#include "mozilla/dom/cache/FileUtils.h"
+#include "mozilla/dom/cache/SavedTypes.h"
+#include "mozilla/dom/cache/TypeUtils.h"
+#include "mozilla/dom/cache/Types.h"
+#include "mozilla/dom/quota/ResultExtensions.h"
+#include "mozilla/psm/TransportSecurityInfo.h"
+#include "mozilla/storage/Variant.h"
+#include "nsCOMPtr.h"
+#include "nsCharSeparatedTokenizer.h"
+#include "nsComponentManagerUtils.h"
+#include "nsHttp.h"
+#include "nsIContentPolicy.h"
+#include "nsICryptoHash.h"
+#include "nsIURI.h"
+#include "nsNetCID.h"
+#include "nsPrintfCString.h"
+#include "nsTArray.h"
+
+namespace mozilla::dom::cache::db {
+const int32_t kFirstShippedSchemaVersion = 15;
+namespace {
+const int32_t kHackyDowngradeSchemaVersion = 25;
+const int32_t kHackyPaddingSizePresentVersion = 27;
+const int32_t kLatestSchemaVersion = 29;
+const char kTableCaches[] =
+    "CREATE TABLE caches ("
+    "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT "
+    ")";
+
+const char kTableSecurityInfo[] =
+    "CREATE TABLE security_info ("
+    "id INTEGER NOT NULL PRIMARY KEY, "
+    "hash BLOB NOT NULL, "  
+    "data BLOB NOT NULL, "  
+    "refcount INTEGER NOT NULL"
+    ")";
+
+const char kIndexSecurityInfoHash[] =
+    "CREATE INDEX security_info_hash_index ON security_info (hash)";
+
+const char kTableEntries[] =
+    "CREATE TABLE entries ("
+    "id INTEGER NOT NULL PRIMARY KEY, "
+    "request_method TEXT NOT NULL, "
+    "request_url_no_query TEXT NOT NULL, "
+    "request_url_no_query_hash BLOB NOT NULL, "  
+    "request_url_query TEXT NOT NULL, "
+    "request_url_query_hash BLOB NOT NULL, "  
+    "request_referrer TEXT NOT NULL, "
+    "request_headers_guard INTEGER NOT NULL, "
+    "request_mode INTEGER NOT NULL, "
+    "request_credentials INTEGER NOT NULL, "
+    "request_contentpolicytype INTEGER NOT NULL, "
+    "request_cache INTEGER NOT NULL, "
+    "request_body_id TEXT NULL, "
+    "response_type INTEGER NOT NULL, "
+    "response_status INTEGER NOT NULL, "
+    "response_status_text TEXT NOT NULL, "
+    "response_headers_guard INTEGER NOT NULL, "
+    "response_body_id TEXT NULL, "
+    "response_security_info_id INTEGER NULL REFERENCES security_info(id), "
+    "response_principal_info TEXT NOT NULL, "
+    "cache_id INTEGER NOT NULL REFERENCES caches(id) ON DELETE CASCADE, "
+    "request_redirect INTEGER NOT NULL, "
+    "request_referrer_policy INTEGER NOT NULL, "
+    "request_integrity TEXT NOT NULL, "
+    "request_url_fragment TEXT NOT NULL, "
+    "response_padding_size INTEGER NULL, "
+    "request_body_disk_size INTEGER NULL, "
+    "response_body_disk_size INTEGER NULL "
+    ")";
+const char kIndexEntriesRequest[] =
+    "CREATE INDEX entries_request_match_index "
+    "ON entries (cache_id, request_url_no_query_hash, "
+    "request_url_query_hash)";
+
+const char kTableRequestHeaders[] =
+    "CREATE TABLE request_headers ("
+    "name TEXT NOT NULL, "
+    "value TEXT NOT NULL, "
+    "entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE"
+    ")";
+
+const char kTableResponseHeaders[] =
+    "CREATE TABLE response_headers ("
+    "name TEXT NOT NULL, "
+    "value TEXT NOT NULL, "
+    "entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE"
+    ")";
+
+const char kIndexResponseHeadersName[] =
+    "CREATE INDEX response_headers_name_index "
+    "ON response_headers (name)";
+
+const char kTableResponseUrlList[] =
+    "CREATE TABLE response_url_list ("
+    "url TEXT NOT NULL, "
+    "entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE"
+    ")";
+
+const char kTableStorage[] =
+    "CREATE TABLE storage ("
+    "namespace INTEGER NOT NULL, "
+    "key BLOB NULL, "
+    "cache_id INTEGER NOT NULL REFERENCES caches(id), "
+    "PRIMARY KEY(namespace, key) "
+    ")";
+
+const char kTableUsageInfo[] =
+    "CREATE TABLE usage_info ("
+    "id INTEGER NOT NULL PRIMARY KEY, "
+    "total_disk_usage INTEGER NOT NULL "
+    ")";
+
+const char kTriggerEntriesInsert[] =
+    "CREATE TRIGGER entries_insert_trigger "
+    "AFTER INSERT ON entries "
+    "FOR EACH ROW "
+    "BEGIN "
+    "UPDATE usage_info SET total_disk_usage = total_disk_usage + "
+    "ifnull(NEW.request_body_disk_size, 0) + "
+    "ifnull(NEW.response_body_disk_size, 0) "
+    "WHERE usage_info.id = 1; "
+    "END";
+
+const char kTriggerEntriesUpdate[] =
+    "CREATE TRIGGER entries_update_trigger "
+    "AFTER UPDATE ON entries "
+    "FOR EACH ROW "
+    "BEGIN "
+    "UPDATE usage_info SET total_disk_usage = total_disk_usage - "
+    "ifnull(OLD.request_body_disk_size, 0) + "
+    "ifnull(NEW.request_body_disk_size, 0) - "
+    "ifnull(OLD.response_body_disk_size, 0) + "
+    "ifnull(NEW.response_body_disk_size, 0) "
+    "WHERE usage_info.id = 1; "
+    "END";
+
+const char kTriggerEntriesDelete[] =
+    "CREATE TRIGGER entries_delete_trigger "
+    "AFTER DELETE ON entries "
+    "FOR EACH ROW "
+    "BEGIN "
+    "UPDATE usage_info SET total_disk_usage = total_disk_usage - "
+    "ifnull(OLD.request_body_disk_size, 0) - "
+    "ifnull(OLD.response_body_disk_size, 0) "
+    "WHERE usage_info.id = 1; "
+    "END";
+
+
+const uint32_t kMaxEntriesPerStatement = 255;
+
+const uint32_t kPageSize = 4 * 1024;
+
+const uint32_t kGrowthSize = 32 * 1024;
+const uint32_t kGrowthPages = kGrowthSize / kPageSize;
+static_assert(kGrowthSize % kPageSize == 0,
+              "Growth size must be multiple of page size");
+
+const int32_t kMaxFreePages = kGrowthPages;
+
+const uint32_t kWalAutoCheckpointSize = 512 * 1024;
+const uint32_t kWalAutoCheckpointPages = kWalAutoCheckpointSize / kPageSize;
+static_assert(kWalAutoCheckpointSize % kPageSize == 0,
+              "WAL checkpoint size must be multiple of page size");
+
+}  
+
+static_assert(int(HeadersGuardEnum::None) == 0 &&
+                  int(HeadersGuardEnum::Request) == 1 &&
+                  int(HeadersGuardEnum::Request_no_cors) == 2 &&
+                  int(HeadersGuardEnum::Response) == 3 &&
+                  int(HeadersGuardEnum::Immutable) == 4 &&
+                  ContiguousEnumSize<HeadersGuardEnum>::value == 5,
+              "HeadersGuardEnum values are as expected");
+static_assert(int(ReferrerPolicy::_empty) == 0 &&
+                  int(ReferrerPolicy::No_referrer) == 1 &&
+                  int(ReferrerPolicy::No_referrer_when_downgrade) == 2 &&
+                  int(ReferrerPolicy::Origin) == 3 &&
+                  int(ReferrerPolicy::Origin_when_cross_origin) == 4 &&
+                  int(ReferrerPolicy::Unsafe_url) == 5 &&
+                  int(ReferrerPolicy::Same_origin) == 6 &&
+                  int(ReferrerPolicy::Strict_origin) == 7 &&
+                  int(ReferrerPolicy::Strict_origin_when_cross_origin) == 8 &&
+                  ContiguousEnumSize<ReferrerPolicy>::value == 9,
+              "ReferrerPolicy values are as expected");
+static_assert(int(RequestMode::Same_origin) == 0 &&
+                  int(RequestMode::No_cors) == 1 &&
+                  int(RequestMode::Cors) == 2 &&
+                  int(RequestMode::Navigate) == 3 &&
+                  ContiguousEnumSize<RequestMode>::value == 4,
+              "RequestMode values are as expected");
+static_assert(int(RequestCredentials::Omit) == 0 &&
+                  int(RequestCredentials::Same_origin) == 1 &&
+                  int(RequestCredentials::Include) == 2 &&
+                  ContiguousEnumSize<RequestCredentials>::value == 3,
+              "RequestCredentials values are as expected");
+static_assert(int(RequestCache::Default) == 0 &&
+                  int(RequestCache::No_store) == 1 &&
+                  int(RequestCache::Reload) == 2 &&
+                  int(RequestCache::No_cache) == 3 &&
+                  int(RequestCache::Force_cache) == 4 &&
+                  int(RequestCache::Only_if_cached) == 5 &&
+                  ContiguousEnumSize<RequestCache>::value == 6,
+              "RequestCache values are as expected");
+static_assert(int(RequestRedirect::Follow) == 0 &&
+                  int(RequestRedirect::Error) == 1 &&
+                  int(RequestRedirect::Manual) == 2 &&
+                  ContiguousEnumSize<RequestRedirect>::value == 3,
+              "RequestRedirect values are as expected");
+static_assert(int(ResponseType::Basic) == 0 && int(ResponseType::Cors) == 1 &&
+                  int(ResponseType::Default) == 2 &&
+                  int(ResponseType::Error) == 3 &&
+                  int(ResponseType::Opaque) == 4 &&
+                  int(ResponseType::Opaqueredirect) == 5 &&
+                  ContiguousEnumSize<ResponseType>::value == 6,
+              "ResponseType values are as expected");
+
+static_assert(DEFAULT_NAMESPACE == 0 && CHROME_ONLY_NAMESPACE == 1 &&
+                  NUMBER_OF_NAMESPACES == 2,
+              "Namespace values are as expected");
+
+static_assert(
+    nsIContentPolicy::TYPE_INVALID == 0 && nsIContentPolicy::TYPE_OTHER == 1 &&
+        nsIContentPolicy::TYPE_SCRIPT == 2 &&
+        nsIContentPolicy::TYPE_IMAGE == 3 &&
+        nsIContentPolicy::TYPE_STYLESHEET == 4 &&
+        nsIContentPolicy::TYPE_OBJECT == 5 &&
+        nsIContentPolicy::TYPE_DOCUMENT == 6 &&
+        nsIContentPolicy::TYPE_SUBDOCUMENT == 7 &&
+        nsIContentPolicy::TYPE_PING == 10 &&
+        nsIContentPolicy::TYPE_XMLHTTPREQUEST == 11 &&
+        nsIContentPolicy::TYPE_DTD == 13 && nsIContentPolicy::TYPE_FONT == 14 &&
+        nsIContentPolicy::TYPE_MEDIA == 15 &&
+        nsIContentPolicy::TYPE_WEBSOCKET == 16 &&
+        nsIContentPolicy::TYPE_CSP_REPORT == 17 &&
+        nsIContentPolicy::TYPE_XSLT == 18 &&
+        nsIContentPolicy::TYPE_BEACON == 19 &&
+        nsIContentPolicy::TYPE_FETCH == 20 &&
+        nsIContentPolicy::TYPE_IMAGESET == 21 &&
+        nsIContentPolicy::TYPE_WEB_MANIFEST == 22 &&
+        nsIContentPolicy::TYPE_INTERNAL_SCRIPT == 23 &&
+        nsIContentPolicy::TYPE_INTERNAL_WORKER == 24 &&
+        nsIContentPolicy::TYPE_INTERNAL_SHARED_WORKER == 25 &&
+        nsIContentPolicy::TYPE_INTERNAL_EMBED == 26 &&
+        nsIContentPolicy::TYPE_INTERNAL_OBJECT == 27 &&
+        nsIContentPolicy::TYPE_INTERNAL_FRAME == 28 &&
+        nsIContentPolicy::TYPE_INTERNAL_IFRAME == 29 &&
+        nsIContentPolicy::TYPE_INTERNAL_AUDIO == 30 &&
+        nsIContentPolicy::TYPE_INTERNAL_VIDEO == 31 &&
+        nsIContentPolicy::TYPE_INTERNAL_TRACK == 32 &&
+        nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST_ASYNC == 33 &&
+        nsIContentPolicy::TYPE_INTERNAL_EVENTSOURCE == 34 &&
+        nsIContentPolicy::TYPE_INTERNAL_SERVICE_WORKER == 35 &&
+        nsIContentPolicy::TYPE_INTERNAL_SCRIPT_PRELOAD == 36 &&
+        nsIContentPolicy::TYPE_INTERNAL_IMAGE == 37 &&
+        nsIContentPolicy::TYPE_INTERNAL_IMAGE_PRELOAD == 38 &&
+        nsIContentPolicy::TYPE_INTERNAL_STYLESHEET == 39 &&
+        nsIContentPolicy::TYPE_INTERNAL_STYLESHEET_PRELOAD == 40 &&
+        nsIContentPolicy::TYPE_INTERNAL_IMAGE_FAVICON == 41 &&
+        nsIContentPolicy::TYPE_INTERNAL_WORKER_IMPORT_SCRIPTS == 42 &&
+        nsIContentPolicy::TYPE_SAVEAS_DOWNLOAD == 43 &&
+        nsIContentPolicy::TYPE_SPECULATIVE == 44 &&
+        nsIContentPolicy::TYPE_INTERNAL_MODULE == 45 &&
+        nsIContentPolicy::TYPE_INTERNAL_MODULE_PRELOAD == 46 &&
+        nsIContentPolicy::TYPE_INTERNAL_DTD == 47 &&
+        nsIContentPolicy::TYPE_INTERNAL_FORCE_ALLOWED_DTD == 48 &&
+        nsIContentPolicy::TYPE_INTERNAL_AUDIOWORKLET == 49 &&
+        nsIContentPolicy::TYPE_INTERNAL_PAINTWORKLET == 50 &&
+        nsIContentPolicy::TYPE_INTERNAL_FONT_PRELOAD == 51 &&
+        nsIContentPolicy::TYPE_INTERNAL_CHROMEUTILS_COMPILED_SCRIPT == 52 &&
+        nsIContentPolicy::TYPE_INTERNAL_FRAME_MESSAGEMANAGER_SCRIPT == 53 &&
+        nsIContentPolicy::TYPE_INTERNAL_FETCH_PRELOAD == 54 &&
+        nsIContentPolicy::TYPE_UA_FONT == 55 &&
+        nsIContentPolicy::TYPE_WEB_IDENTITY == 57 &&
+        nsIContentPolicy::TYPE_INTERNAL_WORKER_STATIC_MODULE == 58 &&
+        nsIContentPolicy::TYPE_WEB_TRANSPORT == 59 &&
+        nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST_SYNC == 60 &&
+        nsIContentPolicy::TYPE_INTERNAL_EXTERNAL_RESOURCE == 61 &&
+        nsIContentPolicy::TYPE_JSON == 62 &&
+        nsIContentPolicy::TYPE_INTERNAL_JSON_PRELOAD == 63 &&
+        nsIContentPolicy::TYPE_INTERNAL_IMAGE_NOTIFICATION == 64 &&
+        nsIContentPolicy::TYPE_TEXT == 65 &&
+        nsIContentPolicy::TYPE_INTERNAL_TEXT_PRELOAD == 66,
+    "nsContentPolicyType values are as expected");
+
+namespace {
+
+using EntryId = int32_t;
+
+struct IdCount {
+  explicit IdCount(int32_t aId) : mId(aId), mCount(1) {}
+  int32_t mId;
+  int32_t mCount;
+};
+
+using EntryIds = AutoTArray<EntryId, 256>;
+
+static Result<EntryIds, nsresult> QueryAll(mozIStorageConnection& aConn,
+                                           CacheId aCacheId);
+static Result<EntryIds, nsresult> QueryCache(mozIStorageConnection& aConn,
+                                             CacheId aCacheId,
+                                             const CacheRequest& aRequest,
+                                             const CacheQueryParams& aParams,
+                                             uint32_t aMaxResults = UINT32_MAX);
+static Result<bool, nsresult> MatchByVaryHeader(mozIStorageConnection& aConn,
+                                                const CacheRequest& aRequest,
+                                                EntryId entryId);
+static Result<std::tuple<nsTArray<nsID>, AutoTArray<IdCount, 16>, int64_t>,
+              nsresult>
+DeleteEntries(mozIStorageConnection& aConn,
+              const nsTArray<EntryId>& aEntryIdList);
+
+static Result<std::tuple<nsTArray<nsID>, AutoTArray<IdCount, 16>, int64_t>,
+              nsresult>
+DeleteAllCacheEntries(mozIStorageConnection& aConn, CacheId& aCacheId);
+
+static Result<int32_t, nsresult> InsertSecurityInfo(
+    mozIStorageConnection& aConn, nsICryptoHash& aCrypto,
+    nsITransportSecurityInfo* aSecurityInfo);
+static nsresult DeleteSecurityInfo(mozIStorageConnection& aConn, int32_t aId,
+                                   int32_t aCount);
+static nsresult DeleteSecurityInfoList(
+    mozIStorageConnection& aConn,
+    const nsTArray<IdCount>& aDeletedStorageIdList);
+static nsresult InsertEntry(mozIStorageConnection& aConn, CacheId aCacheId,
+                            const CacheRequest& aRequest,
+                            const nsID* aRequestBodyId,
+                            const CacheResponse& aResponse,
+                            const nsID* aResponseBodyId);
+static Result<SavedResponse, nsresult> ReadResponse(
+    mozIStorageConnection& aConn, EntryId aEntryId);
+static Result<SavedRequest, nsresult> ReadRequest(mozIStorageConnection& aConn,
+                                                  EntryId aEntryId);
+
+static void AppendListParamsToQuery(nsACString& aQuery, size_t aLen);
+static nsresult BindListParamsToQuery(mozIStorageStatement& aState,
+                                      const Span<const EntryId>& aEntryIdList);
+static nsresult BindId(mozIStorageStatement& aState, const nsACString& aName,
+                       const nsID* aId);
+static Result<nsID, nsresult> ExtractId(mozIStorageStatement& aState,
+                                        uint32_t aPos);
+static Result<NotNull<nsCOMPtr<mozIStorageStatement>>, nsresult>
+CreateAndBindKeyStatement(mozIStorageConnection& aConn,
+                          const char* aQueryFormat, const nsAString& aKey);
+static Result<nsAutoCString, nsresult> HashCString(nsICryptoHash& aCrypto,
+                                                   const nsACString& aIn);
+Result<int32_t, nsresult> GetEffectiveSchemaVersion(
+    mozIStorageConnection& aConn);
+nsresult Validate(mozIStorageConnection& aConn);
+nsresult Migrate(nsIFile& aDBDir, mozIStorageConnection& aConn);
+}  
+
+class MOZ_RAII AutoDisableForeignKeyChecking {
+ public:
+  explicit AutoDisableForeignKeyChecking(mozIStorageConnection* aConn)
+      : mConn(aConn), mForeignKeyCheckingDisabled(false) {
+    QM_TRY_INSPECT(const auto& state,
+                   quota::CreateAndExecuteSingleStepStatement(
+                       *mConn, "PRAGMA foreign_keys;"_ns),
+                   QM_VOID);
+
+    QM_TRY_INSPECT(const int32_t& mode,
+                   MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetInt32, 0), QM_VOID);
+
+    if (mode) {
+      QM_WARNONLY_TRY(MOZ_TO_RESULT(mConn->ExecuteSimpleSQL(
+                                        "PRAGMA foreign_keys = OFF;"_ns))
+                          .andThen([this](const auto) -> Result<Ok, nsresult> {
+                            mForeignKeyCheckingDisabled = true;
+                            return Ok{};
+                          }));
+    }
+  }
+
+  ~AutoDisableForeignKeyChecking() {
+    if (mForeignKeyCheckingDisabled) {
+      QM_WARNONLY_TRY(QM_TO_RESULT(
+          mConn->ExecuteSimpleSQL("PRAGMA foreign_keys = ON;"_ns)));
+    }
+  }
+
+ private:
+  nsCOMPtr<mozIStorageConnection> mConn;
+  bool mForeignKeyCheckingDisabled;
+};
+
+nsresult CreateOrMigrateSchema(nsIFile& aDBDir, mozIStorageConnection& aConn) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY_UNWRAP(int32_t schemaVersion, GetEffectiveSchemaVersion(aConn));
+
+  if (schemaVersion == kLatestSchemaVersion) {
+    QM_TRY(MOZ_TO_RESULT(Validate(aConn)));
+
+    return NS_OK;
+  }
+
+  AutoDisableForeignKeyChecking restoreForeignKeyChecking(&aConn);
+  mozStorageTransaction trans(&aConn, false,
+                              mozIStorageConnection::TRANSACTION_IMMEDIATE);
+
+  QM_TRY(MOZ_TO_RESULT(trans.Start()));
+
+  const bool migrating = schemaVersion != 0;
+
+  if (migrating) {
+    QM_TRY(MOZ_TO_RESULT(Migrate(aDBDir, aConn)));
+  } else {
+    QM_TRY(
+        MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(nsLiteralCString(kTableCaches))));
+    QM_TRY(MOZ_TO_RESULT(
+        aConn.ExecuteSimpleSQL(nsLiteralCString(kTableSecurityInfo))));
+    QM_TRY(MOZ_TO_RESULT(
+        aConn.ExecuteSimpleSQL(nsLiteralCString(kIndexSecurityInfoHash))));
+    QM_TRY(
+        MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(nsLiteralCString(kTableEntries))));
+    QM_TRY(MOZ_TO_RESULT(
+        aConn.ExecuteSimpleSQL(nsLiteralCString(kIndexEntriesRequest))));
+    QM_TRY(MOZ_TO_RESULT(
+        aConn.ExecuteSimpleSQL(nsLiteralCString(kTableRequestHeaders))));
+    QM_TRY(MOZ_TO_RESULT(
+        aConn.ExecuteSimpleSQL(nsLiteralCString(kTableResponseHeaders))));
+    QM_TRY(MOZ_TO_RESULT(
+        aConn.ExecuteSimpleSQL(nsLiteralCString(kIndexResponseHeadersName))));
+    QM_TRY(MOZ_TO_RESULT(
+        aConn.ExecuteSimpleSQL(nsLiteralCString(kTableResponseUrlList))));
+    QM_TRY(
+        MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(nsLiteralCString(kTableStorage))));
+    QM_TRY(MOZ_TO_RESULT(
+        aConn.ExecuteSimpleSQL(nsLiteralCString(kTableUsageInfo))));
+    QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(
+        nsLiteralCString("INSERT INTO usage_info VALUES(1, 0);"))));
+    QM_TRY(MOZ_TO_RESULT(
+        aConn.ExecuteSimpleSQL(nsLiteralCString(kTriggerEntriesInsert))));
+    QM_TRY(MOZ_TO_RESULT(
+        aConn.ExecuteSimpleSQL(nsLiteralCString(kTriggerEntriesUpdate))));
+    QM_TRY(MOZ_TO_RESULT(
+        aConn.ExecuteSimpleSQL(nsLiteralCString(kTriggerEntriesDelete))));
+    QM_TRY(MOZ_TO_RESULT(aConn.SetSchemaVersion(kLatestSchemaVersion)));
+    QM_TRY_UNWRAP(schemaVersion, GetEffectiveSchemaVersion(aConn));
+  }
+
+  QM_TRY(MOZ_TO_RESULT(Validate(aConn)));
+  QM_TRY(MOZ_TO_RESULT(trans.Commit()));
+
+  if (migrating) {
+
+    QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL("VACUUM"_ns)));
+  }
+
+  return NS_OK;
+}
+
+nsresult InitializeConnection(mozIStorageConnection& aConn) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(nsPrintfCString(
+      "PRAGMA page_size = %u; "
+      "PRAGMA auto_vacuum = INCREMENTAL; "
+      "PRAGMA foreign_keys = ON; ",
+      kPageSize))));
+
+  QM_TRY(QM_OR_ELSE_WARN_IF(
+      MOZ_TO_RESULT(aConn.SetGrowthIncrement(kGrowthSize, ""_ns)),
+      IsSpecificError<NS_ERROR_FILE_TOO_BIG>,
+      ErrToDefaultOk<>));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(nsPrintfCString(
+      "PRAGMA wal_autocheckpoint = %u; "
+      "PRAGMA journal_mode = WAL; ",
+      kWalAutoCheckpointPages))));
+
+#ifdef DEBUG
+  {
+    QM_TRY_INSPECT(const auto& state,
+                   quota::CreateAndExecuteSingleStepStatement(
+                       aConn, "PRAGMA auto_vacuum;"_ns));
+
+    QM_TRY_INSPECT(const int32_t& mode,
+                   MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetInt32, 0));
+
+    QM_TRY(OkIf(mode == 2), NS_ERROR_UNEXPECTED);
+  }
+#endif
+
+  return NS_OK;
+}
+
+Result<CacheId, nsresult> CreateCacheId(mozIStorageConnection& aConn) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY(MOZ_TO_RESULT(
+      aConn.ExecuteSimpleSQL("INSERT INTO caches DEFAULT VALUES;"_ns)));
+
+  QM_TRY_INSPECT(const auto& state,
+                 quota::CreateAndExecuteSingleStepStatement<
+                     quota::SingleStepResult::ReturnNullIfNoResult>(
+                     aConn, "SELECT last_insert_rowid()"_ns));
+
+  QM_TRY(OkIf(state), Err(NS_ERROR_UNEXPECTED));
+
+  QM_TRY_INSPECT(const CacheId& id,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(state, GetInt64, 0));
+
+  return id;
+}
+
+Result<DeletionInfo, nsresult> DeleteCacheId(mozIStorageConnection& aConn,
+                                             CacheId aCacheId) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY_UNWRAP(
+      (auto [deletedBodyIdList, deletedSecurityIdList, deletedPaddingSize]),
+      DeleteAllCacheEntries(aConn, aCacheId));
+
+  QM_TRY(MOZ_TO_RESULT(DeleteSecurityInfoList(aConn, deletedSecurityIdList)));
+
+  QM_TRY_INSPECT(const auto& state,
+                 MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                     nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                     "DELETE FROM caches WHERE id=:id;"_ns));
+
+  QM_TRY(MOZ_TO_RESULT(state->BindInt64ByName("id"_ns, aCacheId)));
+
+  QM_TRY(MOZ_TO_RESULT(state->Execute()));
+
+  return DeletionInfo{std::move(deletedBodyIdList), deletedPaddingSize};
+}
+
+Result<AutoTArray<CacheId, 8>, nsresult> FindOrphanedCacheIds(
+    mozIStorageConnection& aConn) {
+  QM_TRY_INSPECT(const auto& state,
+                 MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                     nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                     "SELECT id FROM caches "
+                     "WHERE id NOT IN (SELECT cache_id from storage);"_ns));
+
+  QM_TRY_RETURN(
+      (quota::CollectElementsWhileHasResultTyped<AutoTArray<CacheId, 8>>(
+          *state, [](auto& stmt) {
+            QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER(stmt, GetInt64, 0));
+          })));
+}
+
+Result<int64_t, nsresult> FindOverallPaddingSize(mozIStorageConnection& aConn) {
+  QM_TRY_INSPECT(const auto& state,
+                 MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                     nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                     "SELECT response_padding_size FROM entries "
+                     "WHERE response_padding_size IS NOT NULL;"_ns));
+
+  int64_t overallPaddingSize = 0;
+
+  QM_TRY(quota::CollectWhileHasResult(
+      *state, [&overallPaddingSize](auto& stmt) -> Result<Ok, nsresult> {
+        QM_TRY_INSPECT(const int64_t& padding_size,
+                       MOZ_TO_RESULT_INVOKE_MEMBER(stmt, GetInt64, 0));
+
+        MOZ_DIAGNOSTIC_ASSERT(padding_size >= 0);
+        MOZ_DIAGNOSTIC_ASSERT(INT64_MAX - padding_size >= overallPaddingSize);
+        overallPaddingSize += padding_size;
+
+        return Ok{};
+      }));
+
+  return overallPaddingSize;
+}
+
+Result<int64_t, nsresult> GetTotalDiskUsage(mozIStorageConnection& aConn) {
+  QM_TRY_INSPECT(
+      const auto& state,
+      quota::CreateAndExecuteSingleStepStatement(
+          aConn, "SELECT total_disk_usage FROM usage_info WHERE id = 1;"_ns));
+
+  QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetInt64, 0));
+}
+
+Result<nsTHashSet<nsID>, nsresult> GetKnownBodyIds(
+    mozIStorageConnection& aConn) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  int32_t numEntries = 0;
+  {
+    QM_TRY_INSPECT(const auto& cnt,
+                   MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                       nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                       "SELECT COUNT(*) FROM entries;"_ns));
+
+    QM_TRY(quota::CollectWhileHasResult(
+        *cnt, [&numEntries](auto& stmt) -> Result<Ok, nsresult> {
+          QM_TRY(MOZ_TO_RESULT(stmt.GetInt32(0, &numEntries)));
+
+          return Ok{};
+        }));
+  }
+
+  nsTHashSet<nsID> idSet(numEntries * 2);
+
+  QM_TRY_INSPECT(
+      const auto& state,
+      MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+          nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+          "SELECT request_body_id, response_body_id FROM entries;"_ns));
+
+  QM_TRY(quota::CollectWhileHasResult(
+      *state, [&idSet](auto& stmt) -> Result<Ok, nsresult> {
+        for (uint32_t i = 0; i < 2; ++i) {
+          QM_TRY_INSPECT(const bool& isNull,
+                         MOZ_TO_RESULT_INVOKE_MEMBER(stmt, GetIsNull, i));
+
+          if (!isNull) {
+            QM_TRY_INSPECT(const auto& id, ExtractId(stmt, i));
+
+            idSet.Insert(id);
+          }
+        }
+
+        return Ok{};
+      }));
+
+  return std::move(idSet);
+}
+
+Result<Maybe<SavedResponse>, nsresult> CacheMatch(
+    mozIStorageConnection& aConn, CacheId aCacheId,
+    const CacheRequest& aRequest, const CacheQueryParams& aParams) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY_INSPECT(const auto& matches,
+                 QueryCache(aConn, aCacheId, aRequest, aParams, 1));
+
+  if (matches.IsEmpty()) {
+    return Maybe<SavedResponse>();
+  }
+
+  QM_TRY_UNWRAP(auto response, ReadResponse(aConn, matches[0]));
+
+  response.mCacheId = aCacheId;
+
+  return Some(std::move(response));
+}
+
+Result<nsTArray<SavedResponse>, nsresult> CacheMatchAll(
+    mozIStorageConnection& aConn, CacheId aCacheId,
+    const Maybe<CacheRequest>& aMaybeRequest, const CacheQueryParams& aParams) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY_INSPECT(
+      const auto& matches, ([&aConn, aCacheId, &aMaybeRequest, &aParams] {
+        if (aMaybeRequest.isNothing()) {
+          QM_TRY_RETURN(QueryAll(aConn, aCacheId));
+        }
+
+        QM_TRY_RETURN(
+            QueryCache(aConn, aCacheId, aMaybeRequest.ref(), aParams));
+      }()));
+
+  QM_TRY_RETURN(TransformIntoNewArrayAbortOnErr(
+      matches,
+      [&aConn, aCacheId](const auto match) -> Result<SavedResponse, nsresult> {
+        QM_TRY_UNWRAP(auto savedResponse, ReadResponse(aConn, match));
+
+        savedResponse.mCacheId = aCacheId;
+        return savedResponse;
+      },
+      fallible));
+}
+
+Result<DeletionInfo, nsresult> CachePut(mozIStorageConnection& aConn,
+                                        CacheId aCacheId,
+                                        const CacheRequest& aRequest,
+                                        const nsID* aRequestBodyId,
+                                        const CacheResponse& aResponse,
+                                        const nsID* aResponseBodyId) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY_INSPECT(
+      const auto& matches,
+      QueryCache(aConn, aCacheId, aRequest,
+                 CacheQueryParams(false, false, false, false, u""_ns)));
+
+  QM_TRY_UNWRAP(
+      (auto [deletedBodyIdList, deletedSecurityIdList, deletedPaddingSize]),
+      DeleteEntries(aConn, matches));
+
+  QM_TRY(MOZ_TO_RESULT(InsertEntry(aConn, aCacheId, aRequest, aRequestBodyId,
+                                   aResponse, aResponseBodyId)));
+
+  QM_TRY(MOZ_TO_RESULT(DeleteSecurityInfoList(aConn, deletedSecurityIdList)));
+
+  return DeletionInfo{std::move(deletedBodyIdList), deletedPaddingSize};
+}
+
+Result<Maybe<DeletionInfo>, nsresult> CacheDelete(
+    mozIStorageConnection& aConn, CacheId aCacheId,
+    const CacheRequest& aRequest, const CacheQueryParams& aParams) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY_INSPECT(const auto& matches,
+                 QueryCache(aConn, aCacheId, aRequest, aParams));
+
+  if (matches.IsEmpty()) {
+    return Maybe<DeletionInfo>();
+  }
+
+  QM_TRY_UNWRAP(
+      (auto [deletedBodyIdList, deletedSecurityIdList, deletedPaddingSize]),
+      DeleteEntries(aConn, matches));
+
+  QM_TRY(MOZ_TO_RESULT(DeleteSecurityInfoList(aConn, deletedSecurityIdList)));
+
+  return Some(DeletionInfo{std::move(deletedBodyIdList), deletedPaddingSize});
+}
+
+Result<nsTArray<SavedRequest>, nsresult> CacheKeys(
+    mozIStorageConnection& aConn, CacheId aCacheId,
+    const Maybe<CacheRequest>& aMaybeRequest, const CacheQueryParams& aParams) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY_INSPECT(
+      const auto& matches, ([&aConn, aCacheId, &aMaybeRequest, &aParams] {
+        if (aMaybeRequest.isNothing()) {
+          QM_TRY_RETURN(QueryAll(aConn, aCacheId));
+        }
+
+        QM_TRY_RETURN(
+            QueryCache(aConn, aCacheId, aMaybeRequest.ref(), aParams));
+      }()));
+
+  QM_TRY_RETURN(TransformIntoNewArrayAbortOnErr(
+      matches,
+      [&aConn, aCacheId](const auto match) -> Result<SavedRequest, nsresult> {
+        QM_TRY_UNWRAP(auto savedRequest, ReadRequest(aConn, match));
+
+        savedRequest.mCacheId = aCacheId;
+        return savedRequest;
+      },
+      fallible));
+}
+
+Result<Maybe<SavedResponse>, nsresult> StorageMatch(
+    mozIStorageConnection& aConn, Namespace aNamespace,
+    const CacheRequest& aRequest, const CacheQueryParams& aParams) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  if (aParams.cacheNameSet()) {
+    QM_TRY_INSPECT(const auto& maybeCacheId,
+                   StorageGetCacheId(aConn, aNamespace, aParams.cacheName()));
+    if (maybeCacheId.isNothing()) {
+      return Maybe<SavedResponse>();
+    }
+
+    return CacheMatch(aConn, maybeCacheId.ref(), aRequest, aParams);
+  }
+
+
+  QM_TRY_INSPECT(const auto& state,
+                 MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                     nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                     "SELECT cache_id FROM storage WHERE "
+                     "namespace=:namespace ORDER BY rowid;"_ns));
+
+  QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("namespace"_ns, aNamespace)));
+
+  QM_TRY_INSPECT(
+      const auto& cacheIdList,
+      (quota::CollectElementsWhileHasResultTyped<AutoTArray<CacheId, 32>>(
+          *state, [](auto& stmt) {
+            QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER(stmt, GetInt64, 0));
+          })));
+
+  for (const auto cacheId : cacheIdList) {
+    QM_TRY_UNWRAP(auto matchedResponse,
+                  CacheMatch(aConn, cacheId, aRequest, aParams));
+
+    if (matchedResponse.isSome()) {
+      return matchedResponse;
+    }
+  }
+
+  return Maybe<SavedResponse>();
+}
+
+Result<Maybe<CacheId>, nsresult> StorageGetCacheId(mozIStorageConnection& aConn,
+                                                   Namespace aNamespace,
+                                                   const nsAString& aKey) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  const char* const query =
+      "SELECT cache_id FROM storage "
+      "WHERE namespace=:namespace AND %s "
+      "ORDER BY rowid;";
+
+  QM_TRY_INSPECT(const auto& state,
+                 CreateAndBindKeyStatement(aConn, query, aKey));
+
+  QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("namespace"_ns, aNamespace)));
+
+  QM_TRY_INSPECT(const bool& hasMoreData,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(*state, ExecuteStep));
+
+  if (!hasMoreData) {
+    return Maybe<CacheId>();
+  }
+
+  QM_TRY_RETURN(
+      MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetInt64, 0).map(Some<CacheId>));
+}
+
+nsresult StoragePutCache(mozIStorageConnection& aConn, Namespace aNamespace,
+                         const nsAString& aKey, CacheId aCacheId) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY_INSPECT(const auto& state,
+                 MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                     nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                     "INSERT INTO storage (namespace, key, cache_id) "
+                     "VALUES (:namespace, :key, :cache_id);"_ns));
+
+  QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("namespace"_ns, aNamespace)));
+  QM_TRY(MOZ_TO_RESULT(state->BindStringAsBlobByName("key"_ns, aKey)));
+  QM_TRY(MOZ_TO_RESULT(state->BindInt64ByName("cache_id"_ns, aCacheId)));
+  QM_TRY(MOZ_TO_RESULT(state->Execute()));
+
+  return NS_OK;
+}
+
+nsresult StorageForgetCache(mozIStorageConnection& aConn, Namespace aNamespace,
+                            const nsAString& aKey) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  const char* const query =
+      "DELETE FROM storage WHERE namespace=:namespace AND %s;";
+
+  QM_TRY_INSPECT(const auto& state,
+                 CreateAndBindKeyStatement(aConn, query, aKey));
+
+  QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("namespace"_ns, aNamespace)));
+
+  QM_TRY(MOZ_TO_RESULT(state->Execute()));
+
+  return NS_OK;
+}
+
+Result<nsTArray<nsString>, nsresult> StorageGetKeys(
+    mozIStorageConnection& aConn, Namespace aNamespace) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY_INSPECT(
+      const auto& state,
+      MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+          nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+          "SELECT key FROM storage WHERE namespace=:namespace ORDER BY rowid;"_ns));
+
+  QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("namespace"_ns, aNamespace)));
+
+  QM_TRY_RETURN(quota::CollectElementsWhileHasResult(*state, [](auto& stmt) {
+    QM_TRY_RETURN(
+        MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(nsString, stmt, GetBlobAsString, 0));
+  }));
+}
+
+namespace {
+
+Result<EntryIds, nsresult> QueryAll(mozIStorageConnection& aConn,
+                                    CacheId aCacheId) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY_INSPECT(
+      const auto& state,
+      MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+          nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+          "SELECT id FROM entries WHERE cache_id=:cache_id ORDER BY id;"_ns));
+
+  QM_TRY(MOZ_TO_RESULT(state->BindInt64ByName("cache_id"_ns, aCacheId)));
+
+  QM_TRY_RETURN((quota::CollectElementsWhileHasResultTyped<EntryIds>(
+      *state, [](auto& stmt) {
+        QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER(stmt, GetInt32, 0));
+      })));
+}
+
+Result<EntryIds, nsresult> QueryCache(mozIStorageConnection& aConn,
+                                      CacheId aCacheId,
+                                      const CacheRequest& aRequest,
+                                      const CacheQueryParams& aParams,
+                                      uint32_t aMaxResults) {
+  MOZ_ASSERT(!NS_IsMainThread());
+  MOZ_DIAGNOSTIC_ASSERT(aMaxResults > 0);
+
+  if (!aParams.ignoreMethod() &&
+      !aRequest.method().LowerCaseEqualsLiteral("get")) {
+    return Result<EntryIds, nsresult>{std::in_place};
+  }
+
+  nsAutoCString query(
+      "SELECT id, COUNT(response_headers.name) AS vary_count, response_type "
+      "FROM entries "
+      "LEFT OUTER JOIN response_headers ON "
+      "entries.id=response_headers.entry_id "
+      "AND response_headers.name='vary' COLLATE NOCASE "
+      "WHERE entries.cache_id=:cache_id "
+      "AND entries.request_url_no_query_hash=:url_no_query_hash ");
+
+  if (!aParams.ignoreSearch()) {
+    query.AppendLiteral("AND entries.request_url_query_hash=:url_query_hash ");
+  }
+
+  query.AppendLiteral("AND entries.request_url_no_query=:url_no_query ");
+
+  if (!aParams.ignoreSearch()) {
+    query.AppendLiteral("AND entries.request_url_query=:url_query ");
+  }
+
+  query.AppendLiteral("GROUP BY entries.id ORDER BY entries.id;");
+
+  QM_TRY_INSPECT(const auto& state, MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                                        nsCOMPtr<mozIStorageStatement>, aConn,
+                                        CreateStatement, query));
+
+  QM_TRY(MOZ_TO_RESULT(state->BindInt64ByName("cache_id"_ns, aCacheId)));
+
+  QM_TRY_INSPECT(const auto& crypto,
+                 MOZ_TO_RESULT_GET_TYPED(nsCOMPtr<nsICryptoHash>,
+                                         MOZ_SELECT_OVERLOAD(do_CreateInstance),
+                                         NS_CRYPTO_HASH_CONTRACTID));
+
+  QM_TRY_INSPECT(const auto& urlWithoutQueryHash,
+                 HashCString(*crypto, aRequest.urlWithoutQuery()));
+
+  QM_TRY(MOZ_TO_RESULT(state->BindUTF8StringAsBlobByName("url_no_query_hash"_ns,
+                                                         urlWithoutQueryHash)));
+
+  if (!aParams.ignoreSearch()) {
+    QM_TRY_INSPECT(const auto& urlQueryHash,
+                   HashCString(*crypto, aRequest.urlQuery()));
+
+    QM_TRY(MOZ_TO_RESULT(
+        state->BindUTF8StringAsBlobByName("url_query_hash"_ns, urlQueryHash)));
+  }
+
+  QM_TRY(MOZ_TO_RESULT(state->BindUTF8StringByName(
+      "url_no_query"_ns, aRequest.urlWithoutQuery())));
+
+  if (!aParams.ignoreSearch()) {
+    QM_TRY(MOZ_TO_RESULT(
+        state->BindUTF8StringByName("url_query"_ns, aRequest.urlQuery())));
+  }
+
+  EntryIds entryIdList;
+
+  QM_TRY(CollectWhile(
+      [&state, &entryIdList, aMaxResults]() -> Result<bool, nsresult> {
+        if (entryIdList.Length() == aMaxResults) {
+          return false;
+        }
+        QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER(state, ExecuteStep));
+      },
+      [&state, &entryIdList, &aParams, &aConn,
+       &aRequest]() -> Result<Ok, nsresult> {
+        QM_TRY_INSPECT(const EntryId& entryId,
+                       MOZ_TO_RESULT_INVOKE_MEMBER(state, GetInt32, 0));
+
+        QM_TRY_INSPECT(const int32_t& varyCount,
+                       MOZ_TO_RESULT_INVOKE_MEMBER(state, GetInt32, 1));
+
+        QM_TRY_INSPECT(const int32_t& responseType,
+                       MOZ_TO_RESULT_INVOKE_MEMBER(state, GetInt32, 2));
+
+        auto ignoreVary =
+            aParams.ignoreVary() ||
+            responseType == static_cast<int>(ResponseType::Opaque);
+
+        if (!ignoreVary && varyCount > 0) {
+          QM_TRY_INSPECT(const bool& matchedByVary,
+                         MatchByVaryHeader(aConn, aRequest, entryId));
+          if (!matchedByVary) {
+            return Ok{};
+          }
+        }
+
+        entryIdList.AppendElement(entryId);
+
+        return Ok{};
+      }));
+
+  return entryIdList;
+}
+
+Result<bool, nsresult> MatchByVaryHeader(mozIStorageConnection& aConn,
+                                         const CacheRequest& aRequest,
+                                         EntryId entryId) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY_INSPECT(
+      const auto& varyValues,
+      ([&aConn, entryId]() -> Result<AutoTArray<nsCString, 8>, nsresult> {
+        QM_TRY_INSPECT(
+            const auto& state,
+            MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                "SELECT value FROM response_headers "
+                "WHERE name='vary' COLLATE NOCASE "
+                "AND entry_id=:entry_id;"_ns));
+
+        QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("entry_id"_ns, entryId)));
+
+        QM_TRY_RETURN((
+            quota::CollectElementsWhileHasResultTyped<AutoTArray<nsCString, 8>>(
+                *state, [](auto& stmt) {
+                  QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                      nsCString, stmt, GetUTF8String, 0));
+                })));
+      }()));
+
+  MOZ_DIAGNOSTIC_ASSERT(!varyValues.IsEmpty());
+
+  QM_TRY_INSPECT(const auto& state,
+                 MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                     nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                     "SELECT name, value FROM request_headers "
+                     "WHERE entry_id=:entry_id;"_ns));
+
+  QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("entry_id"_ns, entryId)));
+
+  RefPtr<InternalHeaders> cachedHeaders =
+      new InternalHeaders(HeadersGuardEnum::None);
+
+  QM_TRY(quota::CollectWhileHasResult(
+      *state, [&cachedHeaders](auto& stmt) -> Result<Ok, nsresult> {
+        QM_TRY_INSPECT(const auto& name,
+                       MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(nsCString, stmt,
+                                                         GetUTF8String, 0));
+        QM_TRY_INSPECT(const auto& value,
+                       MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(nsCString, stmt,
+                                                         GetUTF8String, 1));
+
+        ErrorResult errorResult;
+
+        cachedHeaders->Append(name, value, errorResult);
+        if (errorResult.Failed()) {
+          return Err(errorResult.StealNSResult());
+        }
+
+        return Ok{};
+      }));
+
+  RefPtr<InternalHeaders> queryHeaders =
+      TypeUtils::ToInternalHeaders(aRequest.headers());
+
+  bool varyHeadersMatch = true;
+
+  for (const auto& varyValue : varyValues) {
+    bool bailOut = false;
+    for (const nsACString& header :
+         nsCCharSeparatedTokenizer(varyValue, NS_HTTP_HEADER_SEP).ToRange()) {
+      MOZ_DIAGNOSTIC_ASSERT(!header.EqualsLiteral("*"),
+                            "We should have already caught this in "
+                            "TypeUtils::ToPCacheResponseWithoutBody()");
+
+      ErrorResult errorResult;
+      nsAutoCString queryValue;
+      queryHeaders->Get(header, queryValue, errorResult);
+      if (errorResult.Failed()) {
+        errorResult.SuppressException();
+        MOZ_DIAGNOSTIC_ASSERT(queryValue.IsEmpty());
+      }
+
+      nsAutoCString cachedValue;
+      cachedHeaders->Get(header, cachedValue, errorResult);
+      if (errorResult.Failed()) {
+        errorResult.SuppressException();
+        MOZ_DIAGNOSTIC_ASSERT(cachedValue.IsEmpty());
+      }
+
+      if (queryValue != cachedValue) {
+        varyHeadersMatch = false;
+        bailOut = true;
+        break;
+      }
+    }
+
+    if (bailOut) {
+      break;
+    }
+  }
+
+  return varyHeadersMatch;
+}
+
+static nsresult SelectAndDeleteEntriesInternal(
+    mozIStorageConnection& aConn, const Span<const EntryId>& aEntryIdList,
+    nsTArray<nsID>& aDeletedBodyIdListOut,
+    nsTArray<IdCount>& aDeletedSecurityIdListOut,
+    int64_t& aDeletedPaddingSizeOut) {
+  nsAutoCString query(
+      "SELECT "
+      "request_body_id, "
+      "response_body_id, "
+      "response_security_info_id, "
+      "response_padding_size "
+      "FROM entries WHERE id IN (");
+
+  AppendListParamsToQuery(query, aEntryIdList.Length());
+  query.AppendLiteral(")");
+
+  QM_TRY_INSPECT(const auto& state, MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                                        nsCOMPtr<mozIStorageStatement>, aConn,
+                                        CreateStatement, query));
+
+  QM_TRY(MOZ_TO_RESULT(BindListParamsToQuery(*state, aEntryIdList)));
+
+  int64_t overallPaddingSize = 0;
+
+  QM_TRY(quota::CollectWhileHasResult(
+      *state,
+      [&overallPaddingSize, &aDeletedBodyIdListOut,
+       &aDeletedSecurityIdListOut](auto& stmt) -> Result<Ok, nsresult> {
+        for (uint32_t i = 0; i < 2; ++i) {
+          QM_TRY_INSPECT(const bool& isNull,
+                         MOZ_TO_RESULT_INVOKE_MEMBER(stmt, GetIsNull, i));
+
+          if (!isNull) {
+            QM_TRY_INSPECT(const auto& id, ExtractId(stmt, i));
+
+            aDeletedBodyIdListOut.AppendElement(id);
+          }
+        }
+
+        {  
+          QM_TRY_INSPECT(const bool& isNull,
+                         MOZ_TO_RESULT_INVOKE_MEMBER(stmt, GetIsNull, 2));
+
+          if (!isNull) {
+            QM_TRY_INSPECT(const int32_t& securityId,
+                           MOZ_TO_RESULT_INVOKE_MEMBER(stmt, GetInt32, 2));
+
+            auto foundIt =
+                std::find_if(aDeletedSecurityIdListOut.begin(),
+                             aDeletedSecurityIdListOut.end(),
+                             [securityId](const auto& deletedSecurityId) {
+                               return deletedSecurityId.mId == securityId;
+                             });
+
+            if (foundIt == aDeletedSecurityIdListOut.end()) {
+              aDeletedSecurityIdListOut.AppendElement(IdCount(securityId));
+            } else {
+              foundIt->mCount += 1;
+            }
+          }
+        }
+
+        {
+          QM_TRY_INSPECT(const bool& isNull,
+                         MOZ_TO_RESULT_INVOKE_MEMBER(stmt, GetIsNull, 3));
+
+          if (!isNull) {
+            QM_TRY_INSPECT(const int64_t& paddingSize,
+                           MOZ_TO_RESULT_INVOKE_MEMBER(stmt, GetInt64, 3));
+
+            MOZ_DIAGNOSTIC_ASSERT(paddingSize >= 0);
+            MOZ_DIAGNOSTIC_ASSERT(INT64_MAX - overallPaddingSize >=
+                                  paddingSize);
+            overallPaddingSize += paddingSize;
+          }
+        }
+
+        return Ok{};
+      }));
+
+  aDeletedPaddingSizeOut += overallPaddingSize;
+
+
+  query = "DELETE FROM entries WHERE id IN ("_ns;
+  AppendListParamsToQuery(query, aEntryIdList.Length());
+  query.AppendLiteral(")");
+
+  {
+    QM_TRY_INSPECT(const auto& state, MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                                          nsCOMPtr<mozIStorageStatement>, aConn,
+                                          CreateStatement, query));
+
+    QM_TRY(MOZ_TO_RESULT(BindListParamsToQuery(*state, aEntryIdList)));
+
+    QM_TRY(MOZ_TO_RESULT(state->Execute()));
+  }
+
+  return NS_OK;
+}
+
+static nsresult DeleteEntriesInternal(
+    mozIStorageConnection& aConn, const nsTArray<EntryId>& aEntryIdList,
+    nsTArray<nsID>& aDeletedBodyIdListOut,
+    nsTArray<IdCount>& aDeletedSecurityIdListOut,
+    int64_t& aDeletedPaddingSizeOut, uint32_t aPos, uint32_t aLen) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  if (aEntryIdList.IsEmpty()) {
+    return NS_OK;
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(aPos < aEntryIdList.Length());
+
+  auto remaining = aLen;
+  uint32_t currPos = 0;
+
+  do {
+    auto currLen = std::min(kMaxEntriesPerStatement, remaining);
+
+    SelectAndDeleteEntriesInternal(
+        aConn, Span<const EntryId>(aEntryIdList.Elements() + currPos, currLen),
+        aDeletedBodyIdListOut, aDeletedSecurityIdListOut,
+        aDeletedPaddingSizeOut);
+
+    remaining -= currLen;
+    currPos += currLen;
+
+  } while (remaining > 0);
+
+  return NS_OK;
+}
+
+Result<std::tuple<nsTArray<nsID>, AutoTArray<IdCount, 16>, int64_t>, nsresult>
+DeleteEntries(mozIStorageConnection& aConn,
+              const nsTArray<EntryId>& aEntryIdList) {
+  auto result =
+      std::make_tuple(nsTArray<nsID>{}, AutoTArray<IdCount, 16>{}, int64_t{0});
+
+  QM_TRY(MOZ_TO_RESULT(DeleteEntriesInternal(
+      aConn, aEntryIdList, std::get<0>(result), std::get<1>(result),
+      std::get<2>(result), 0, aEntryIdList.Length())));
+
+  return result;
+}
+
+Result<std::tuple<nsTArray<nsID>, AutoTArray<IdCount, 16>, int64_t>, nsresult>
+DeleteAllCacheEntries(mozIStorageConnection& aConn, CacheId& aCacheId) {
+  auto result =
+      std::make_tuple(nsTArray<nsID>{}, AutoTArray<IdCount, 16>{}, int64_t{0});
+  auto& deletedBodyIdList = std::get<0>(result);
+  auto& deletedSecurityIdList = std::get<1>(result);
+  auto& deletedPaddingSize = std::get<2>(result);
+
+  nsAutoCString query(
+      "SELECT "
+      "request_body_id, "
+      "response_body_id, "
+      "response_security_info_id, "
+      "response_padding_size "
+      "FROM entries WHERE cache_id=:cache_id ORDER BY id;"_ns);
+
+  QM_TRY_INSPECT(const auto& state, MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                                        nsCOMPtr<mozIStorageStatement>, aConn,
+                                        CreateStatement, query));
+
+  QM_TRY(MOZ_TO_RESULT(state->BindInt64ByName("cache_id"_ns, aCacheId)));
+
+  QM_TRY(quota::CollectWhileHasResult(
+      *state,
+      [&deletedPaddingSize, &deletedBodyIdList,
+       &deletedSecurityIdList](auto& stmt) -> Result<Ok, nsresult> {
+        for (uint32_t i = 0; i < 2; ++i) {
+          QM_TRY_INSPECT(const bool& isNull,
+                         MOZ_TO_RESULT_INVOKE_MEMBER(stmt, GetIsNull, i));
+
+          if (!isNull) {
+            QM_TRY_INSPECT(const auto& id, ExtractId(stmt, i));
+
+            deletedBodyIdList.AppendElement(id);
+          }
+        }
+
+        {  
+          QM_TRY_INSPECT(const bool& isNull,
+                         MOZ_TO_RESULT_INVOKE_MEMBER(stmt, GetIsNull, 2));
+
+          if (!isNull) {
+            QM_TRY_INSPECT(const int32_t& securityId,
+                           MOZ_TO_RESULT_INVOKE_MEMBER(stmt, GetInt32, 2));
+
+            auto foundIt = std::find_if(
+                deletedSecurityIdList.begin(), deletedSecurityIdList.end(),
+                [securityId](const auto& deletedSecurityId) {
+                  return deletedSecurityId.mId == securityId;
+                });
+
+            if (foundIt == deletedSecurityIdList.end()) {
+              deletedSecurityIdList.AppendElement(IdCount(securityId));
+            } else {
+              foundIt->mCount += 1;
+            }
+          }
+        }
+
+        {
+          QM_TRY_INSPECT(const bool& isNull,
+                         MOZ_TO_RESULT_INVOKE_MEMBER(stmt, GetIsNull, 3));
+
+          if (!isNull) {
+            QM_TRY_INSPECT(const int64_t& paddingSize,
+                           MOZ_TO_RESULT_INVOKE_MEMBER(stmt, GetInt64, 3));
+
+            MOZ_DIAGNOSTIC_ASSERT(paddingSize >= 0);
+
+            MOZ_DIAGNOSTIC_ASSERT(INT64_MAX - deletedPaddingSize >=
+                                  paddingSize);
+
+            deletedPaddingSize += paddingSize;
+          }
+        }
+
+        return Ok{};
+      }));
+
+
+  query = "DELETE FROM entries WHERE cache_id=:cache_id"_ns;
+
+  {
+    QM_TRY_INSPECT(const auto& state, MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                                          nsCOMPtr<mozIStorageStatement>, aConn,
+                                          CreateStatement, query));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt64ByName("cache_id"_ns, aCacheId)));
+    QM_TRY(MOZ_TO_RESULT(state->Execute()));
+  }
+
+  return result;
+}
+
+Result<int32_t, nsresult> InsertSecurityInfo(
+    mozIStorageConnection& aConn, nsICryptoHash& aCrypto,
+    nsITransportSecurityInfo* aSecurityInfo) {
+  MOZ_DIAGNOSTIC_ASSERT(aSecurityInfo);
+  if (!aSecurityInfo) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  nsCString data;
+  nsresult rv = aSecurityInfo->ToString(data);
+  if (NS_FAILED(rv)) {
+    return Err(rv);
+  }
+
+  QM_TRY_INSPECT(const auto& hash, HashCString(aCrypto, data));
+
+  QM_TRY_INSPECT(
+      const auto& selectStmt,
+      quota::CreateAndExecuteSingleStepStatement<
+          quota::SingleStepResult::ReturnNullIfNoResult>(
+          aConn,
+          "SELECT id, refcount FROM security_info WHERE hash=:hash AND "
+          "data=:data;"_ns,
+          [&hash, &data](auto& state) -> Result<Ok, nsresult> {
+            QM_TRY(MOZ_TO_RESULT(
+                state.BindUTF8StringAsBlobByName("hash"_ns, hash)));
+            QM_TRY(MOZ_TO_RESULT(
+                state.BindUTF8StringAsBlobByName("data"_ns, data)));
+
+            return Ok{};
+          }));
+
+  if (selectStmt) {
+    QM_TRY_INSPECT(const int32_t& id,
+                   MOZ_TO_RESULT_INVOKE_MEMBER(selectStmt, GetInt32, 0));
+    QM_TRY_INSPECT(const int32_t& refcount,
+                   MOZ_TO_RESULT_INVOKE_MEMBER(selectStmt, GetInt32, 1));
+
+    QM_TRY_INSPECT(
+        const auto& state,
+        MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+            nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+            "UPDATE security_info SET refcount=:refcount WHERE id=:id;"_ns));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("refcount"_ns, refcount + 1)));
+    QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("id"_ns, id)));
+    QM_TRY(MOZ_TO_RESULT(state->Execute()));
+
+    return id;
+  }
+
+  QM_TRY_INSPECT(const auto& state,
+                 MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                     nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                     "INSERT INTO security_info (hash, data, refcount) "
+                     "VALUES (:hash, :data, 1);"_ns));
+
+  QM_TRY(MOZ_TO_RESULT(state->BindUTF8StringAsBlobByName("hash"_ns, hash)));
+  QM_TRY(MOZ_TO_RESULT(state->BindUTF8StringAsBlobByName("data"_ns, data)));
+  QM_TRY(MOZ_TO_RESULT(state->Execute()));
+
+  {
+    QM_TRY_INSPECT(const auto& state,
+                   quota::CreateAndExecuteSingleStepStatement(
+                       aConn, "SELECT last_insert_rowid()"_ns));
+
+    QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetInt32, 0));
+  }
+}
+
+nsresult DeleteSecurityInfo(mozIStorageConnection& aConn, int32_t aId,
+                            int32_t aCount) {
+  QM_TRY_INSPECT(
+      const int32_t& refcount, ([&aConn, aId]() -> Result<int32_t, nsresult> {
+        QM_TRY_INSPECT(
+            const auto& state,
+            quota::CreateAndExecuteSingleStepStatement(
+                aConn, "SELECT refcount FROM security_info WHERE id=:id;"_ns,
+                [aId](auto& state) -> Result<Ok, nsresult> {
+                  QM_TRY(MOZ_TO_RESULT(state.BindInt32ByName("id"_ns, aId)));
+                  return Ok{};
+                }));
+
+        QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetInt32, 0));
+      }()));
+
+  MOZ_ASSERT(refcount >= aCount);
+
+  int32_t newCount = refcount - aCount;
+
+  if (newCount == 0) {
+    QM_TRY_INSPECT(const auto& state,
+                   MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                       nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                       "DELETE FROM security_info WHERE id=:id;"_ns));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("id"_ns, aId)));
+    QM_TRY(MOZ_TO_RESULT(state->Execute()));
+
+    return NS_OK;
+  }
+
+  QM_TRY_INSPECT(
+      const auto& state,
+      MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+          nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+          "UPDATE security_info SET refcount=:refcount WHERE id=:id;"_ns));
+
+  QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("refcount"_ns, newCount)));
+  QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("id"_ns, aId)));
+  QM_TRY(MOZ_TO_RESULT(state->Execute()));
+
+  return NS_OK;
+}
+
+nsresult DeleteSecurityInfoList(
+    mozIStorageConnection& aConn,
+    const nsTArray<IdCount>& aDeletedStorageIdList) {
+  for (const auto& deletedStorageId : aDeletedStorageIdList) {
+    QM_TRY(MOZ_TO_RESULT(DeleteSecurityInfo(aConn, deletedStorageId.mId,
+                                            deletedStorageId.mCount)));
+  }
+
+  return NS_OK;
+}
+
+nsresult InsertEntry(mozIStorageConnection& aConn, CacheId aCacheId,
+                     const CacheRequest& aRequest, const nsID* aRequestBodyId,
+                     const CacheResponse& aResponse,
+                     const nsID* aResponseBodyId) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY_INSPECT(const auto& crypto,
+                 MOZ_TO_RESULT_GET_TYPED(nsCOMPtr<nsICryptoHash>,
+                                         MOZ_SELECT_OVERLOAD(do_CreateInstance),
+                                         NS_CRYPTO_HASH_CONTRACTID));
+
+  int32_t securityId = -1;
+  if (aResponse.securityInfo()) {
+    QM_TRY_UNWRAP(securityId,
+                  InsertSecurityInfo(aConn, *crypto, aResponse.securityInfo()));
+  }
+
+  {
+    QM_TRY_INSPECT(const auto& state,
+                   MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                       nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                       "INSERT INTO entries ("
+                       "request_method, "
+                       "request_url_no_query, "
+                       "request_url_no_query_hash, "
+                       "request_url_query, "
+                       "request_url_query_hash, "
+                       "request_url_fragment, "
+                       "request_referrer, "
+                       "request_referrer_policy, "
+                       "request_headers_guard, "
+                       "request_mode, "
+                       "request_credentials, "
+                       "request_contentpolicytype, "
+                       "request_cache, "
+                       "request_redirect, "
+                       "request_integrity, "
+                       "request_body_id, "
+                       "request_body_disk_size, "
+                       "response_type, "
+                       "response_status, "
+                       "response_status_text, "
+                       "response_headers_guard, "
+                       "response_body_id, "
+                       "response_body_disk_size, "
+                       "response_security_info_id, "
+                       "response_principal_info, "
+                       "response_padding_size, "
+                       "cache_id "
+                       ") VALUES ("
+                       ":request_method, "
+                       ":request_url_no_query, "
+                       ":request_url_no_query_hash, "
+                       ":request_url_query, "
+                       ":request_url_query_hash, "
+                       ":request_url_fragment, "
+                       ":request_referrer, "
+                       ":request_referrer_policy, "
+                       ":request_headers_guard, "
+                       ":request_mode, "
+                       ":request_credentials, "
+                       ":request_contentpolicytype, "
+                       ":request_cache, "
+                       ":request_redirect, "
+                       ":request_integrity, "
+                       ":request_body_id, "
+                       ":request_body_disk_size, "
+                       ":response_type, "
+                       ":response_status, "
+                       ":response_status_text, "
+                       ":response_headers_guard, "
+                       ":response_body_id, "
+                       ":response_body_disk_size, "
+                       ":response_security_info_id, "
+                       ":response_principal_info, "
+                       ":response_padding_size, "
+                       ":cache_id "
+                       ");"_ns));
+
+    QM_TRY(MOZ_TO_RESULT(
+        state->BindUTF8StringByName("request_method"_ns, aRequest.method())));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindUTF8StringByName(
+        "request_url_no_query"_ns, aRequest.urlWithoutQuery())));
+
+    QM_TRY_INSPECT(const auto& urlWithoutQueryHash,
+                   HashCString(*crypto, aRequest.urlWithoutQuery()));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindUTF8StringAsBlobByName(
+        "request_url_no_query_hash"_ns, urlWithoutQueryHash)));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindUTF8StringByName("request_url_query"_ns,
+                                                     aRequest.urlQuery())));
+
+    QM_TRY_INSPECT(const auto& urlQueryHash,
+                   HashCString(*crypto, aRequest.urlQuery()));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindUTF8StringAsBlobByName(
+        "request_url_query_hash"_ns, urlQueryHash)));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindUTF8StringByName("request_url_fragment"_ns,
+                                                     aRequest.urlFragment())));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindUTF8StringByName("request_referrer"_ns,
+                                                     aRequest.referrer())));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName(
+        "request_referrer_policy"_ns,
+        static_cast<int32_t>(aRequest.referrerPolicy()))));
+
+    QM_TRY(MOZ_TO_RESULT(
+        state->BindInt32ByName("request_headers_guard"_ns,
+                               static_cast<int32_t>(aRequest.headersGuard()))));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName(
+        "request_mode"_ns, static_cast<int32_t>(aRequest.mode()))));
+
+    QM_TRY(MOZ_TO_RESULT(
+        state->BindInt32ByName("request_credentials"_ns,
+                               static_cast<int32_t>(aRequest.credentials()))));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName(
+        "request_contentpolicytype"_ns,
+        static_cast<int32_t>(aRequest.contentPolicyType()))));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName(
+        "request_cache"_ns, static_cast<int32_t>(aRequest.requestCache()))));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName(
+        "request_redirect"_ns,
+        static_cast<int32_t>(aRequest.requestRedirect()))));
+
+    QM_TRY(MOZ_TO_RESULT(
+        state->BindStringByName("request_integrity"_ns, aRequest.integrity())));
+
+    QM_TRY(MOZ_TO_RESULT(BindId(*state, "request_body_id"_ns, aRequestBodyId)));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt64ByName("request_body_disk_size"_ns,
+                                                aRequest.bodyDiskSize())));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName(
+        "response_type"_ns, static_cast<int32_t>(aResponse.type()))));
+
+    QM_TRY(MOZ_TO_RESULT(
+        state->BindInt32ByName("response_status"_ns, aResponse.status())));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindUTF8StringByName("response_status_text"_ns,
+                                                     aResponse.statusText())));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName(
+        "response_headers_guard"_ns,
+        static_cast<int32_t>(aResponse.headersGuard()))));
+
+    QM_TRY(
+        MOZ_TO_RESULT(BindId(*state, "response_body_id"_ns, aResponseBodyId)));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt64ByName("response_body_disk_size"_ns,
+                                                aResponse.bodyDiskSize())));
+
+    if (!aResponse.securityInfo()) {
+      QM_TRY(
+          MOZ_TO_RESULT(state->BindNullByName("response_security_info_id"_ns)));
+    } else {
+      QM_TRY(MOZ_TO_RESULT(
+          state->BindInt32ByName("response_security_info_id"_ns, securityId)));
+    }
+
+    nsAutoCString serializedInfo;
+    if (aResponse.principalInfo().isSome()) {
+      const mozilla::ipc::PrincipalInfo& principalInfo =
+          aResponse.principalInfo().ref();
+      MOZ_DIAGNOSTIC_ASSERT(principalInfo.type() ==
+                            mozilla::ipc::PrincipalInfo::TContentPrincipalInfo);
+      const mozilla::ipc::ContentPrincipalInfo& cInfo =
+          principalInfo.get_ContentPrincipalInfo();
+
+      serializedInfo.Append(cInfo.spec());
+
+      nsAutoCString suffix;
+      cInfo.attrs().CreateSuffix(suffix);
+      serializedInfo.Append(suffix);
+    }
+
+    QM_TRY(MOZ_TO_RESULT(state->BindUTF8StringByName(
+        "response_principal_info"_ns, serializedInfo)));
+
+    if (aResponse.paddingSize() == InternalResponse::UNKNOWN_PADDING_SIZE) {
+      MOZ_DIAGNOSTIC_ASSERT(aResponse.type() != ResponseType::Opaque);
+      QM_TRY(MOZ_TO_RESULT(state->BindNullByName("response_padding_size"_ns)));
+    } else {
+      MOZ_DIAGNOSTIC_ASSERT(aResponse.paddingSize() >= 0);
+      MOZ_DIAGNOSTIC_ASSERT(aResponse.type() == ResponseType::Opaque);
+
+      QM_TRY(MOZ_TO_RESULT(state->BindInt64ByName("response_padding_size"_ns,
+                                                  aResponse.paddingSize())));
+    }
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt64ByName("cache_id"_ns, aCacheId)));
+
+    QM_TRY(MOZ_TO_RESULT(state->Execute()));
+  }
+
+  QM_TRY_INSPECT(
+      const int32_t& entryId, ([&aConn]() -> Result<int32_t, nsresult> {
+        QM_TRY_INSPECT(const auto& state,
+                       quota::CreateAndExecuteSingleStepStatement(
+                           aConn, "SELECT last_insert_rowid()"_ns));
+
+        QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetInt32, 0));
+      }()));
+
+  {
+    QM_TRY_INSPECT(const auto& state,
+                   MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                       nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                       "INSERT INTO request_headers ("
+                       "name, "
+                       "value, "
+                       "entry_id "
+                       ") VALUES (:name, :value, :entry_id)"_ns));
+
+    for (const auto& requestHeader : aRequest.headers()) {
+      QM_TRY(MOZ_TO_RESULT(
+          state->BindUTF8StringByName("name"_ns, requestHeader.name())));
+
+      QM_TRY(MOZ_TO_RESULT(
+          state->BindUTF8StringByName("value"_ns, requestHeader.value())));
+
+      QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("entry_id"_ns, entryId)));
+
+      QM_TRY(MOZ_TO_RESULT(state->Execute()));
+    }
+  }
+
+  {
+    QM_TRY_INSPECT(const auto& state,
+                   MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                       nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                       "INSERT INTO response_headers ("
+                       "name, "
+                       "value, "
+                       "entry_id "
+                       ") VALUES (:name, :value, :entry_id)"_ns));
+
+    for (const auto& responseHeader : aResponse.headers()) {
+      QM_TRY(MOZ_TO_RESULT(
+          state->BindUTF8StringByName("name"_ns, responseHeader.name())));
+      QM_TRY(MOZ_TO_RESULT(
+          state->BindUTF8StringByName("value"_ns, responseHeader.value())));
+      QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("entry_id"_ns, entryId)));
+      QM_TRY(MOZ_TO_RESULT(state->Execute()));
+    }
+  }
+
+  {
+    QM_TRY_INSPECT(const auto& state,
+                   MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                       nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                       "INSERT INTO response_url_list ("
+                       "url, "
+                       "entry_id "
+                       ") VALUES (:url, :entry_id)"_ns));
+
+    for (const auto& responseUrl : aResponse.urlList()) {
+      QM_TRY(MOZ_TO_RESULT(state->BindUTF8StringByName(
+          "url"_ns, responseUrl->GetSpecOrDefault())));
+      QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("entry_id"_ns, entryId)));
+      QM_TRY(MOZ_TO_RESULT(state->Execute()));
+    }
+  }
+
+  return NS_OK;
+}
+
+Result<HeadersEntry, nsresult> GetHeadersEntryFromStatement(
+    mozIStorageStatement& aStmt) {
+  HeadersEntry header;
+
+  QM_TRY_UNWRAP(header.name(), MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                                   nsCString, aStmt, GetUTF8String, 0));
+  QM_TRY_UNWRAP(header.value(), MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                                    nsCString, aStmt, GetUTF8String, 1));
+
+  return header;
+}
+
+Result<SavedResponse, nsresult> ReadResponse(mozIStorageConnection& aConn,
+                                             EntryId aEntryId) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  SavedResponse savedResponse;
+
+  QM_TRY_INSPECT(
+      const auto& state,
+      quota::CreateAndExecuteSingleStepStatement(
+          aConn,
+          "SELECT "
+          "entries.response_type, "
+          "entries.response_status, "
+          "entries.response_status_text, "
+          "entries.response_headers_guard, "
+          "entries.response_body_id, "
+          "entries.response_principal_info, "
+          "entries.response_padding_size, "
+          "security_info.data, "
+          "entries.request_credentials "
+          "FROM entries "
+          "LEFT OUTER JOIN security_info "
+          "ON entries.response_security_info_id=security_info.id "
+          "WHERE entries.id=:id;"_ns,
+          [aEntryId](auto& state) -> Result<Ok, nsresult> {
+            QM_TRY(MOZ_TO_RESULT(state.BindInt32ByName("id"_ns, aEntryId)));
+
+            return Ok{};
+          }));
+
+  QM_TRY_INSPECT(const int32_t& type,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetInt32, 0));
+  savedResponse.mValue.type() = static_cast<ResponseType>(type);
+
+  QM_TRY_INSPECT(const int32_t& status,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetInt32, 1));
+  savedResponse.mValue.status() = static_cast<uint32_t>(status);
+
+  QM_TRY(MOZ_TO_RESULT(
+      state->GetUTF8String(2, savedResponse.mValue.statusText())));
+
+  QM_TRY_INSPECT(const int32_t& guard,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetInt32, 3));
+  savedResponse.mValue.headersGuard() = static_cast<HeadersGuardEnum>(guard);
+
+  QM_TRY_INSPECT(const bool& nullBody,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetIsNull, 4));
+  savedResponse.mHasBodyId = !nullBody;
+
+  if (savedResponse.mHasBodyId) {
+    QM_TRY_UNWRAP(savedResponse.mBodyId, ExtractId(*state, 4));
+  }
+
+  QM_TRY_INSPECT(const auto& serializedInfo,
+                 MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(nsAutoCString, *state,
+                                                   GetUTF8String, 5));
+
+  savedResponse.mValue.principalInfo() = Nothing();
+  if (!serializedInfo.IsEmpty()) {
+    nsAutoCString specNoSuffix;
+    OriginAttributes attrs;
+    if (!attrs.PopulateFromOrigin(serializedInfo, specNoSuffix)) {
+      NS_WARNING("Something went wrong parsing a serialized principal!");
+      return Err(NS_ERROR_FAILURE);
+    }
+
+    nsCOMPtr<nsIURI> url;
+    QM_TRY(MOZ_TO_RESULT(NS_NewURI(getter_AddRefs(url), specNoSuffix)));
+
+#ifdef DEBUG
+    nsAutoCString scheme;
+    QM_TRY(MOZ_TO_RESULT(url->GetScheme(scheme)));
+
+    MOZ_ASSERT(scheme == "http" || scheme == "https" || scheme == "file");
+#endif
+
+    nsCOMPtr<nsIPrincipal> principal =
+        BasePrincipal::CreateContentPrincipal(url, attrs);
+    if (!principal) {
+      return Err(NS_ERROR_NULL_POINTER);
+    }
+
+    nsCString origin;
+    QM_TRY(MOZ_TO_RESULT(principal->GetOriginNoSuffix(origin)));
+
+    nsCString baseDomain;
+    QM_TRY(MOZ_TO_RESULT(principal->GetBaseDomain(baseDomain)));
+
+    savedResponse.mValue.principalInfo() =
+        Some(mozilla::ipc::ContentPrincipalInfo(attrs, origin, specNoSuffix,
+                                                Nothing(), baseDomain));
+  }
+
+  QM_TRY_INSPECT(const bool& nullPadding,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetIsNull, 6));
+
+  if (nullPadding) {
+    MOZ_DIAGNOSTIC_ASSERT(savedResponse.mValue.type() != ResponseType::Opaque);
+    savedResponse.mValue.paddingSize() = InternalResponse::UNKNOWN_PADDING_SIZE;
+  } else {
+    MOZ_DIAGNOSTIC_ASSERT(savedResponse.mValue.type() == ResponseType::Opaque);
+    QM_TRY_INSPECT(const int64_t& paddingSize,
+                   MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetInt64, 6));
+
+    MOZ_DIAGNOSTIC_ASSERT(paddingSize >= 0);
+    savedResponse.mValue.paddingSize() = paddingSize;
+  }
+
+  nsCString data;
+  QM_TRY(MOZ_TO_RESULT(state->GetBlobAsUTF8String(7, data)));
+  if (!data.IsEmpty()) {
+    nsCOMPtr<nsITransportSecurityInfo> securityInfo;
+    nsresult rv = mozilla::psm::TransportSecurityInfo::Read(
+        data, getter_AddRefs(securityInfo));
+    if (NS_FAILED(rv)) {
+      return Err(rv);
+    }
+    if (!securityInfo) {
+      return Err(NS_ERROR_FAILURE);
+    }
+    savedResponse.mValue.securityInfo() = securityInfo.forget();
+  }
+
+  QM_TRY_INSPECT(const int32_t& credentials,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetInt32, 8));
+  savedResponse.mValue.credentials() =
+      static_cast<RequestCredentials>(credentials);
+
+  {
+    QM_TRY_INSPECT(const auto& state,
+                   MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                       nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                       "SELECT "
+                       "name, "
+                       "value "
+                       "FROM response_headers "
+                       "WHERE entry_id=:entry_id;"_ns));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("entry_id"_ns, aEntryId)));
+
+    QM_TRY_UNWRAP(savedResponse.mValue.headers(),
+                  quota::CollectElementsWhileHasResult(
+                      *state, GetHeadersEntryFromStatement));
+  }
+
+  {
+    QM_TRY_INSPECT(const auto& state,
+                   MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                       nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                       "SELECT "
+                       "url "
+                       "FROM response_url_list "
+                       "WHERE entry_id=:entry_id AND length(url) > 0;"_ns));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("entry_id"_ns, aEntryId)));
+
+    QM_TRY_UNWRAP(
+        savedResponse.mValue.urlList(),
+        quota::CollectElementsWhileHasResult(
+            *state,
+            [](auto& stmt) -> Result<NotNull<RefPtr<nsIURI>>, nsresult> {
+              QM_TRY_INSPECT(const auto& spec,
+                             MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                                 nsCString, stmt, GetUTF8String, 0));
+
+              RefPtr<nsIURI> url;
+              QM_TRY(MOZ_TO_RESULT(NS_NewURI(getter_AddRefs(url), spec)));
+              return WrapNotNull(url);
+            }));
+  }
+
+  return savedResponse;
+}
+
+Result<SavedRequest, nsresult> ReadRequest(mozIStorageConnection& aConn,
+                                           EntryId aEntryId) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  SavedRequest savedRequest;
+
+  QM_TRY_INSPECT(
+      const auto& state,
+      quota::CreateAndExecuteSingleStepStatement<
+          quota::SingleStepResult::ReturnNullIfNoResult>(
+          aConn,
+          "SELECT "
+          "request_method, "
+          "request_url_no_query, "
+          "request_url_query, "
+          "request_url_fragment, "
+          "request_referrer, "
+          "request_referrer_policy, "
+          "request_headers_guard, "
+          "request_mode, "
+          "request_credentials, "
+          "request_contentpolicytype, "
+          "request_cache, "
+          "request_redirect, "
+          "request_integrity, "
+          "request_body_id "
+          "FROM entries "
+          "WHERE id=:id;"_ns,
+          [aEntryId](auto& state) -> Result<Ok, nsresult> {
+            QM_TRY(MOZ_TO_RESULT(state.BindInt32ByName("id"_ns, aEntryId)));
+
+            return Ok{};
+          }));
+
+  QM_TRY(OkIf(state), Err(NS_ERROR_UNEXPECTED));
+
+  QM_TRY(MOZ_TO_RESULT(state->GetUTF8String(0, savedRequest.mValue.method())));
+  QM_TRY(MOZ_TO_RESULT(
+      state->GetUTF8String(1, savedRequest.mValue.urlWithoutQuery())));
+  QM_TRY(
+      MOZ_TO_RESULT(state->GetUTF8String(2, savedRequest.mValue.urlQuery())));
+  QM_TRY(MOZ_TO_RESULT(
+      state->GetUTF8String(3, savedRequest.mValue.urlFragment())));
+  QM_TRY(
+      MOZ_TO_RESULT(state->GetUTF8String(4, savedRequest.mValue.referrer())));
+
+  QM_TRY_INSPECT(const int32_t& referrerPolicy,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(state, GetInt32, 5));
+  savedRequest.mValue.referrerPolicy() =
+      static_cast<ReferrerPolicy>(referrerPolicy);
+
+  QM_TRY_INSPECT(const int32_t& guard,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(state, GetInt32, 6));
+  savedRequest.mValue.headersGuard() = static_cast<HeadersGuardEnum>(guard);
+
+  QM_TRY_INSPECT(const int32_t& mode,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(state, GetInt32, 7));
+  savedRequest.mValue.mode() = static_cast<RequestMode>(mode);
+
+  QM_TRY_INSPECT(const int32_t& credentials,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(state, GetInt32, 8));
+  savedRequest.mValue.credentials() =
+      static_cast<RequestCredentials>(credentials);
+
+  QM_TRY_INSPECT(const int32_t& requestContentPolicyType,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(state, GetInt32, 9));
+  savedRequest.mValue.contentPolicyType() =
+      static_cast<nsContentPolicyType>(requestContentPolicyType);
+
+  QM_TRY_INSPECT(const int32_t& requestCache,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(state, GetInt32, 10));
+  savedRequest.mValue.requestCache() = static_cast<RequestCache>(requestCache);
+
+  QM_TRY_INSPECT(const int32_t& requestRedirect,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(state, GetInt32, 11));
+  savedRequest.mValue.requestRedirect() =
+      static_cast<RequestRedirect>(requestRedirect);
+
+  QM_TRY(MOZ_TO_RESULT(state->GetString(12, savedRequest.mValue.integrity())));
+
+  QM_TRY_INSPECT(const bool& nullBody,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(state, GetIsNull, 13));
+  savedRequest.mHasBodyId = !nullBody;
+  if (savedRequest.mHasBodyId) {
+    QM_TRY_UNWRAP(savedRequest.mBodyId, ExtractId(*state, 13));
+  }
+
+  {
+    QM_TRY_INSPECT(const auto& state,
+                   MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                       nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                       "SELECT "
+                       "name, "
+                       "value "
+                       "FROM request_headers "
+                       "WHERE entry_id=:entry_id;"_ns));
+
+    QM_TRY(MOZ_TO_RESULT(state->BindInt32ByName("entry_id"_ns, aEntryId)));
+
+    QM_TRY_UNWRAP(savedRequest.mValue.headers(),
+                  quota::CollectElementsWhileHasResult(
+                      *state, GetHeadersEntryFromStatement));
+  }
+
+  return savedRequest;
+}
+
+void AppendListParamsToQuery(nsACString& aQuery, size_t aLen) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  aQuery.AppendLiteral("?");
+  for (size_t i = 1; i < aLen; ++i) {
+    aQuery.AppendLiteral(",?");
+  }
+}
+
+nsresult BindListParamsToQuery(mozIStorageStatement& aState,
+                               const Span<const EntryId>& aEntryIdList) {
+  MOZ_ASSERT(!NS_IsMainThread());
+  for (size_t i = 0, n = aEntryIdList.Length(); i < n; ++i) {
+    QM_TRY(MOZ_TO_RESULT(aState.BindInt32ByIndex(i, aEntryIdList[i])));
+  }
+  return NS_OK;
+}
+
+nsresult BindId(mozIStorageStatement& aState, const nsACString& aName,
+                const nsID* aId) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  if (!aId) {
+    QM_TRY(MOZ_TO_RESULT(aState.BindNullByName(aName)));
+    return NS_OK;
+  }
+
+  char idBuf[NSID_LENGTH];
+  aId->ToProvidedString(idBuf);
+  QM_TRY(MOZ_TO_RESULT(
+      aState.BindUTF8StringByName(aName, nsDependentCString(idBuf))));
+
+  return NS_OK;
+}
+
+Result<nsID, nsresult> ExtractId(mozIStorageStatement& aState, uint32_t aPos) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY_INSPECT(const auto& idString,
+                 MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(nsAutoCString, aState,
+                                                   GetUTF8String, aPos));
+
+  nsID id;
+  QM_TRY(OkIf(id.Parse(idString.get())), Err(NS_ERROR_UNEXPECTED));
+
+  return id;
+}
+
+Result<NotNull<nsCOMPtr<mozIStorageStatement>>, nsresult>
+CreateAndBindKeyStatement(mozIStorageConnection& aConn,
+                          const char* const aQueryFormat,
+                          const nsAString& aKey) {
+  MOZ_DIAGNOSTIC_ASSERT(aQueryFormat);
+
+
+  QM_TRY_UNWRAP(
+      auto state,
+      MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+          nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+          nsPrintfCString(aQueryFormat,
+                          aKey.IsEmpty() ? "key IS NULL" : "key=:key")));
+
+  if (!aKey.IsEmpty()) {
+    QM_TRY(MOZ_TO_RESULT(state->BindStringAsBlobByName("key"_ns, aKey)));
+  }
+
+  return WrapNotNull(std::move(state));
+}
+
+Result<nsAutoCString, nsresult> HashCString(nsICryptoHash& aCrypto,
+                                            const nsACString& aIn) {
+  QM_TRY(MOZ_TO_RESULT(aCrypto.Init(nsICryptoHash::SHA1)));
+
+  QM_TRY(MOZ_TO_RESULT(aCrypto.Update(
+      reinterpret_cast<const uint8_t*>(aIn.BeginReading()), aIn.Length())));
+
+  nsAutoCString fullHash;
+  QM_TRY(MOZ_TO_RESULT(aCrypto.Finish(false , fullHash)));
+
+  return Result<nsAutoCString, nsresult>{std::in_place,
+                                         Substring(fullHash, 0, 8)};
+}
+
+}  
+
+nsresult IncrementalVacuum(mozIStorageConnection& aConn) {
+  QM_TRY_INSPECT(const auto& state, quota::CreateAndExecuteSingleStepStatement(
+                                        aConn, "PRAGMA freelist_count;"_ns));
+
+  QM_TRY_INSPECT(const int32_t& freePages,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetInt32, 0));
+
+  if (freePages <= kMaxFreePages) {
+    return NS_OK;
+  }
+
+  const int32_t pagesToRelease = freePages - kMaxFreePages;
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(
+      nsPrintfCString("PRAGMA incremental_vacuum(%d);", pagesToRelease))));
+
+#ifdef DEBUG
+  {
+    QM_TRY_INSPECT(const auto& state,
+                   quota::CreateAndExecuteSingleStepStatement(
+                       aConn, "PRAGMA freelist_count;"_ns));
+
+    QM_TRY_INSPECT(const int32_t& freePages,
+                   MOZ_TO_RESULT_INVOKE_MEMBER(*state, GetInt32, 0));
+
+    MOZ_ASSERT(freePages <= kMaxFreePages);
+  }
+#endif
+
+  return NS_OK;
+}
+
+namespace {
+
+Result<int32_t, nsresult> GetEffectiveSchemaVersion(
+    mozIStorageConnection& aConn) {
+  QM_TRY_INSPECT(const int32_t& schemaVersion,
+                 MOZ_TO_RESULT_INVOKE_MEMBER(aConn, GetSchemaVersion));
+
+  if (schemaVersion == kHackyDowngradeSchemaVersion) {
+    QM_TRY_INSPECT(const bool& hasColumn,
+                   quota::CreateAndExecuteSingleStepStatement<
+                       quota::SingleStepResult::ReturnNullIfNoResult>(
+                       aConn,
+                       "SELECT name FROM pragma_table_info('entries') WHERE "
+                       "name = 'response_padding_size'"_ns));
+
+    if (hasColumn) {
+      return kHackyPaddingSizePresentVersion;
+    }
+  }
+
+  return schemaVersion;
+}
+
+#ifdef DEBUG
+struct Expect {
+  Expect(const char* aName, const char* aType, const char* aSql)
+      : mName(aName), mType(aType), mSql(aSql), mIgnoreSql(false) {}
+
+  Expect(const char* aName, const char* aType)
+      : mName(aName), mType(aType), mIgnoreSql(true) {}
+
+  const nsCString mName;
+  const nsCString mType;
+  const nsCString mSql;
+  const bool mIgnoreSql;
+};
+#endif
+
+nsresult Validate(mozIStorageConnection& aConn) {
+  QM_TRY_INSPECT(const int32_t& schemaVersion,
+                 GetEffectiveSchemaVersion(aConn));
+  QM_TRY(OkIf(schemaVersion == kLatestSchemaVersion), NS_ERROR_FAILURE);
+
+#ifdef DEBUG
+  const Expect expects[] = {
+      Expect("caches", "table", kTableCaches),
+      Expect("sqlite_sequence", "table"),  
+      Expect("security_info", "table", kTableSecurityInfo),
+      Expect("security_info_hash_index", "index", kIndexSecurityInfoHash),
+      Expect("entries", "table", kTableEntries),
+      Expect("entries_request_match_index", "index", kIndexEntriesRequest),
+      Expect("request_headers", "table", kTableRequestHeaders),
+      Expect("response_headers", "table", kTableResponseHeaders),
+      Expect("response_headers_name_index", "index", kIndexResponseHeadersName),
+      Expect("response_url_list", "table", kTableResponseUrlList),
+      Expect("storage", "table", kTableStorage),
+      Expect("sqlite_autoindex_storage_1", "index"),  
+      Expect("usage_info", "table", kTableUsageInfo),
+      Expect("entries_insert_trigger", "trigger", kTriggerEntriesInsert),
+      Expect("entries_update_trigger", "trigger", kTriggerEntriesUpdate),
+      Expect("entries_delete_trigger", "trigger", kTriggerEntriesDelete),
+  };
+
+  QM_TRY_INSPECT(const auto& state,
+                 MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                     nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+                     "SELECT name, type, sql FROM sqlite_master;"_ns));
+
+  QM_TRY(quota::CollectWhileHasResult(
+      *state, [&expects](auto& stmt) -> Result<Ok, nsresult> {
+        QM_TRY_INSPECT(const auto& name,
+                       MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(nsAutoCString, stmt,
+                                                         GetUTF8String, 0));
+        QM_TRY_INSPECT(const auto& type,
+                       MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(nsAutoCString, stmt,
+                                                         GetUTF8String, 1));
+        QM_TRY_INSPECT(const auto& sql,
+                       MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(nsAutoCString, stmt,
+                                                         GetUTF8String, 2));
+
+        bool foundMatch = false;
+        for (const auto& expect : expects) {
+          if (name == expect.mName) {
+            if (type != expect.mType) {
+              NS_WARNING(
+                  nsPrintfCString("Unexpected type for Cache schema entry %s",
+                                  name.get())
+                      .get());
+              return Err(NS_ERROR_FAILURE);
+            }
+
+            if (!expect.mIgnoreSql && sql != expect.mSql) {
+              NS_WARNING(
+                  nsPrintfCString("Unexpected SQL for Cache schema entry %s",
+                                  name.get())
+                      .get());
+              return Err(NS_ERROR_FAILURE);
+            }
+
+            foundMatch = true;
+            break;
+          }
+        }
+
+        if (NS_WARN_IF(!foundMatch)) {
+          NS_WARNING(
+              nsPrintfCString("Unexpected schema entry %s in Cache database",
+                              name.get())
+                  .get());
+          return Err(NS_ERROR_FAILURE);
+        }
+
+        return Ok{};
+      }));
+#endif
+
+  return NS_OK;
+}
+
+
+using MigrationFunc = nsresult (*)(nsIFile&, mozIStorageConnection&, bool&);
+struct Migration {
+  int32_t mFromVersion;
+  MigrationFunc mFunc;
+};
+
+nsresult MigrateFrom15To16(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema);
+nsresult MigrateFrom16To17(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema);
+nsresult MigrateFrom17To18(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema);
+nsresult MigrateFrom18To19(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema);
+nsresult MigrateFrom19To20(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema);
+nsresult MigrateFrom20To21(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema);
+nsresult MigrateFrom21To22(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema);
+nsresult MigrateFrom22To23(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema);
+nsresult MigrateFrom23To24(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema);
+nsresult MigrateFrom24To25(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema);
+nsresult MigrateFrom25To26(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema);
+nsresult MigrateFrom26To27(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema);
+nsresult MigrateFrom27To28(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema);
+nsresult MigrateFrom28To29(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema);
+constexpr Migration sMigrationList[] = {
+    Migration{15, MigrateFrom15To16}, Migration{16, MigrateFrom16To17},
+    Migration{17, MigrateFrom17To18}, Migration{18, MigrateFrom18To19},
+    Migration{19, MigrateFrom19To20}, Migration{20, MigrateFrom20To21},
+    Migration{21, MigrateFrom21To22}, Migration{22, MigrateFrom22To23},
+    Migration{23, MigrateFrom23To24}, Migration{24, MigrateFrom24To25},
+    Migration{25, MigrateFrom25To26}, Migration{26, MigrateFrom26To27},
+    Migration{27, MigrateFrom27To28}, Migration{28, MigrateFrom28To29},
+};
+
+nsresult RewriteEntriesSchema(mozIStorageConnection& aConn) {
+  QM_TRY(
+      MOZ_TO_RESULT(aConn.ExecuteSimpleSQL("PRAGMA writable_schema = ON"_ns)));
+
+  QM_TRY_INSPECT(
+      const auto& state,
+      MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+          nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+          "UPDATE sqlite_master SET sql=:sql WHERE name='entries'"_ns));
+
+  QM_TRY(MOZ_TO_RESULT(state->BindUTF8StringByName(
+      "sql"_ns, nsDependentCString(kTableEntries))));
+  QM_TRY(MOZ_TO_RESULT(state->Execute()));
+
+  QM_TRY(
+      MOZ_TO_RESULT(aConn.ExecuteSimpleSQL("PRAGMA writable_schema = OFF"_ns)));
+
+  return NS_OK;
+}
+
+nsresult Migrate(nsIFile& aDBDir, mozIStorageConnection& aConn) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY_UNWRAP(int32_t currentVersion, GetEffectiveSchemaVersion(aConn));
+
+  bool rewriteSchema = false;
+
+  while (currentVersion < kLatestSchemaVersion) {
+    MOZ_DIAGNOSTIC_ASSERT(currentVersion >= kFirstShippedSchemaVersion);
+
+    for (const auto& migration : sMigrationList) {
+      if (migration.mFromVersion == currentVersion) {
+        bool shouldRewrite = false;
+        QM_TRY(MOZ_TO_RESULT(migration.mFunc(aDBDir, aConn, shouldRewrite)));
+        if (shouldRewrite) {
+          rewriteSchema = true;
+        }
+        break;
+      }
+    }
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+    int32_t lastVersion = currentVersion;
+#endif
+    QM_TRY_UNWRAP(currentVersion, GetEffectiveSchemaVersion(aConn));
+
+    MOZ_DIAGNOSTIC_ASSERT(currentVersion > lastVersion);
+  }
+
+  MOZ_ASSERT(currentVersion == kLatestSchemaVersion);
+
+  nsresult rv = NS_OK;
+  if (rewriteSchema) {
+    rv = RewriteEntriesSchema(aConn);
+  }
+
+  return rv;
+}
+
+nsresult MigrateFrom15To16(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(
+      "ALTER TABLE entries "
+      "ADD COLUMN request_redirect INTEGER NOT NULL DEFAULT 0"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.SetSchemaVersion(16)));
+
+  aRewriteSchema = true;
+
+  return NS_OK;
+}
+
+nsresult MigrateFrom16To17(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(
+      "CREATE TABLE new_entries ("
+      "id INTEGER NOT NULL PRIMARY KEY, "
+      "request_method TEXT NOT NULL, "
+      "request_url_no_query TEXT NOT NULL, "
+      "request_url_no_query_hash BLOB NOT NULL, "
+      "request_url_query TEXT NOT NULL, "
+      "request_url_query_hash BLOB NOT NULL, "
+      "request_referrer TEXT NOT NULL, "
+      "request_headers_guard INTEGER NOT NULL, "
+      "request_mode INTEGER NOT NULL, "
+      "request_credentials INTEGER NOT NULL, "
+      "request_contentpolicytype INTEGER NOT NULL, "
+      "request_cache INTEGER NOT NULL, "
+      "request_body_id TEXT NULL, "
+      "response_type INTEGER NOT NULL, "
+      "response_url TEXT NOT NULL, "
+      "response_status INTEGER NOT NULL, "
+      "response_status_text TEXT NOT NULL, "
+      "response_headers_guard INTEGER NOT NULL, "
+      "response_body_id TEXT NULL, "
+      "response_security_info_id INTEGER NULL REFERENCES security_info(id), "
+      "response_principal_info TEXT NOT NULL, "
+      "cache_id INTEGER NOT NULL REFERENCES caches(id) ON DELETE CASCADE, "
+      "request_redirect INTEGER NOT NULL"
+      ")"_ns)));
+
+  QM_TRY(
+      MOZ_TO_RESULT(aConn.ExecuteSimpleSQL("INSERT INTO new_entries ("
+                                           "id, "
+                                           "request_method, "
+                                           "request_url_no_query, "
+                                           "request_url_no_query_hash, "
+                                           "request_url_query, "
+                                           "request_url_query_hash, "
+                                           "request_referrer, "
+                                           "request_headers_guard, "
+                                           "request_mode, "
+                                           "request_credentials, "
+                                           "request_contentpolicytype, "
+                                           "request_cache, "
+                                           "request_redirect, "
+                                           "request_body_id, "
+                                           "response_type, "
+                                           "response_url, "
+                                           "response_status, "
+                                           "response_status_text, "
+                                           "response_headers_guard, "
+                                           "response_body_id, "
+                                           "response_security_info_id, "
+                                           "response_principal_info, "
+                                           "cache_id "
+                                           ") SELECT "
+                                           "id, "
+                                           "request_method, "
+                                           "request_url_no_query, "
+                                           "request_url_no_query_hash, "
+                                           "request_url_query, "
+                                           "request_url_query_hash, "
+                                           "request_referrer, "
+                                           "request_headers_guard, "
+                                           "request_mode, "
+                                           "request_credentials, "
+                                           "request_contentpolicytype, "
+                                           "request_cache, "
+                                           "request_redirect, "
+                                           "request_body_id, "
+                                           "response_type, "
+                                           "response_url, "
+                                           "response_status, "
+                                           "response_status_text, "
+                                           "response_headers_guard, "
+                                           "response_body_id, "
+                                           "response_security_info_id, "
+                                           "response_principal_info, "
+                                           "cache_id "
+                                           "FROM entries;"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL("DROP TABLE entries;"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(
+      aConn.ExecuteSimpleSQL("ALTER TABLE new_entries RENAME to entries;"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(
+      aConn.ExecuteSimpleSQL(nsDependentCString(kIndexEntriesRequest))));
+
+  QM_TRY_INSPECT(const bool& hasResult,
+                 quota::CreateAndExecuteSingleStepStatement<
+                     quota::SingleStepResult::ReturnNullIfNoResult>(
+                     aConn, "PRAGMA foreign_key_check;"_ns));
+
+  QM_TRY(OkIf(!hasResult), NS_ERROR_FAILURE);
+
+  QM_TRY(MOZ_TO_RESULT(aConn.SetSchemaVersion(17)));
+
+  return NS_OK;
+}
+
+nsresult MigrateFrom17To18(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+
+  static_assert(int(RequestCache::Default) == 0,
+                "This is where the 0 below comes from!");
+  QM_TRY(MOZ_TO_RESULT(
+      aConn.ExecuteSimpleSQL("UPDATE entries SET request_cache = 0 "
+                             "WHERE request_cache = 5;"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.SetSchemaVersion(18)));
+
+  return NS_OK;
+}
+
+nsresult MigrateFrom18To19(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+
+  static_assert(int(nsIContentPolicy::TYPE_DOCUMENT) == 6 &&
+                    int(nsIContentPolicy::TYPE_SUBDOCUMENT) == 7 &&
+                    int(nsIContentPolicy::TYPE_INTERNAL_FRAME) == 28 &&
+                    int(nsIContentPolicy::TYPE_INTERNAL_IFRAME) == 29 &&
+                    int(RequestMode::Navigate) == 3,
+                "This is where the numbers below come from!");
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(
+      "UPDATE entries SET request_mode = 3 "
+      "WHERE request_contentpolicytype IN (6, 7, 28, 29, 8);"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.SetSchemaVersion(19)));
+
+  return NS_OK;
+}
+
+nsresult MigrateFrom19To20(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(
+      "ALTER TABLE entries "
+      "ADD COLUMN request_referrer_policy INTEGER NOT NULL DEFAULT 2"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.SetSchemaVersion(20)));
+
+  aRewriteSchema = true;
+
+  return NS_OK;
+}
+
+nsresult MigrateFrom20To21(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(
+      "CREATE TABLE new_entries ("
+      "id INTEGER NOT NULL PRIMARY KEY, "
+      "request_method TEXT NOT NULL, "
+      "request_url_no_query TEXT NOT NULL, "
+      "request_url_no_query_hash BLOB NOT NULL, "
+      "request_url_query TEXT NOT NULL, "
+      "request_url_query_hash BLOB NOT NULL, "
+      "request_referrer TEXT NOT NULL, "
+      "request_headers_guard INTEGER NOT NULL, "
+      "request_mode INTEGER NOT NULL, "
+      "request_credentials INTEGER NOT NULL, "
+      "request_contentpolicytype INTEGER NOT NULL, "
+      "request_cache INTEGER NOT NULL, "
+      "request_body_id TEXT NULL, "
+      "response_type INTEGER NOT NULL, "
+      "response_status INTEGER NOT NULL, "
+      "response_status_text TEXT NOT NULL, "
+      "response_headers_guard INTEGER NOT NULL, "
+      "response_body_id TEXT NULL, "
+      "response_security_info_id INTEGER NULL REFERENCES security_info(id), "
+      "response_principal_info TEXT NOT NULL, "
+      "cache_id INTEGER NOT NULL REFERENCES caches(id) ON DELETE CASCADE, "
+      "request_redirect INTEGER NOT NULL, "
+      "request_referrer_policy INTEGER NOT NULL"
+      ")"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(
+      "CREATE TABLE response_url_list ("
+      "url TEXT NOT NULL, "
+      "entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE"
+      ")"_ns)));
+
+  QM_TRY(
+      MOZ_TO_RESULT(aConn.ExecuteSimpleSQL("INSERT INTO new_entries ("
+                                           "id, "
+                                           "request_method, "
+                                           "request_url_no_query, "
+                                           "request_url_no_query_hash, "
+                                           "request_url_query, "
+                                           "request_url_query_hash, "
+                                           "request_referrer, "
+                                           "request_headers_guard, "
+                                           "request_mode, "
+                                           "request_credentials, "
+                                           "request_contentpolicytype, "
+                                           "request_cache, "
+                                           "request_redirect, "
+                                           "request_referrer_policy, "
+                                           "request_body_id, "
+                                           "response_type, "
+                                           "response_status, "
+                                           "response_status_text, "
+                                           "response_headers_guard, "
+                                           "response_body_id, "
+                                           "response_security_info_id, "
+                                           "response_principal_info, "
+                                           "cache_id "
+                                           ") SELECT "
+                                           "id, "
+                                           "request_method, "
+                                           "request_url_no_query, "
+                                           "request_url_no_query_hash, "
+                                           "request_url_query, "
+                                           "request_url_query_hash, "
+                                           "request_referrer, "
+                                           "request_headers_guard, "
+                                           "request_mode, "
+                                           "request_credentials, "
+                                           "request_contentpolicytype, "
+                                           "request_cache, "
+                                           "request_redirect, "
+                                           "request_referrer_policy, "
+                                           "request_body_id, "
+                                           "response_type, "
+                                           "response_status, "
+                                           "response_status_text, "
+                                           "response_headers_guard, "
+                                           "response_body_id, "
+                                           "response_security_info_id, "
+                                           "response_principal_info, "
+                                           "cache_id "
+                                           "FROM entries;"_ns)));
+
+  QM_TRY(
+      MOZ_TO_RESULT(aConn.ExecuteSimpleSQL("INSERT INTO response_url_list ("
+                                           "url, "
+                                           "entry_id "
+                                           ") SELECT "
+                                           "response_url, "
+                                           "id "
+                                           "FROM entries;"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL("DROP TABLE entries;"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(
+      aConn.ExecuteSimpleSQL("ALTER TABLE new_entries RENAME to entries;"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(
+      aConn.ExecuteSimpleSQL(nsLiteralCString(kIndexEntriesRequest))));
+
+  QM_TRY_INSPECT(const bool& hasResult,
+                 quota::CreateAndExecuteSingleStepStatement<
+                     quota::SingleStepResult::ReturnNullIfNoResult>(
+                     aConn, "PRAGMA foreign_key_check;"_ns));
+
+  QM_TRY(OkIf(!hasResult), NS_ERROR_FAILURE);
+
+  QM_TRY(MOZ_TO_RESULT(aConn.SetSchemaVersion(21)));
+
+  aRewriteSchema = true;
+
+  return NS_OK;
+}
+
+nsresult MigrateFrom21To22(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(
+      "ALTER TABLE entries "
+      "ADD COLUMN request_integrity TEXT NOT NULL DEFAULT '';"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(
+      aConn.ExecuteSimpleSQL("UPDATE entries SET request_integrity = '';"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.SetSchemaVersion(22)));
+
+  aRewriteSchema = true;
+
+  return NS_OK;
+}
+
+nsresult MigrateFrom22To23(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY(MOZ_TO_RESULT(aConn.SetSchemaVersion(23)));
+
+  return NS_OK;
+}
+
+nsresult MigrateFrom23To24(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(
+      "ALTER TABLE entries "
+      "ADD COLUMN request_url_fragment TEXT NOT NULL DEFAULT ''"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.SetSchemaVersion(24)));
+
+  aRewriteSchema = true;
+
+  return NS_OK;
+}
+
+nsresult MigrateFrom24To25(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY(MOZ_TO_RESULT(aConn.SetSchemaVersion(25)));
+
+  return NS_OK;
+}
+
+nsresult MigrateFrom25To26(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(
+      "ALTER TABLE entries "
+      "ADD COLUMN response_padding_size INTEGER NULL "_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(
+      aConn.ExecuteSimpleSQL("UPDATE entries SET response_padding_size = 0 "
+                             "WHERE response_type = 4"_ns  
+                             )));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.SetSchemaVersion(26)));
+
+  aRewriteSchema = true;
+
+  return NS_OK;
+}
+
+nsresult MigrateFrom26To27(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY(MOZ_TO_RESULT(aConn.SetSchemaVersion(kHackyDowngradeSchemaVersion)));
+
+  return NS_OK;
+}
+
+nsresult MigrateFrom27To28(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY(MOZ_TO_RESULT(
+      aConn.ExecuteSimpleSQL("UPDATE entries SET request_integrity = '' "
+                             "WHERE request_integrity is NULL;"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.SetSchemaVersion(28)));
+
+  return NS_OK;
+}
+
+class BodyDiskSizeGetterFunction final : public mozIStorageFunction {
+ public:
+  explicit BodyDiskSizeGetterFunction(nsCOMPtr<nsIFile> aDBDir)
+      : mDBDir(std::move(aDBDir)), mTotalDiskUsage(0) {}
+
+  NS_DECL_ISUPPORTS
+
+  int64_t TotalDiskUsage() const { return mTotalDiskUsage; }
+
+ private:
+  ~BodyDiskSizeGetterFunction() = default;
+
+  NS_IMETHOD
+  OnFunctionCall(mozIStorageValueArray* aArguments,
+                 nsIVariant** aResult) override {
+    MOZ_ASSERT(aArguments);
+    MOZ_ASSERT(aResult);
+
+
+    uint32_t argc;
+    QM_TRY(MOZ_TO_RESULT(aArguments->GetNumEntries(&argc)));
+
+    if (argc != 1) {
+      NS_WARNING("Don't call me with the wrong number of arguments!");
+      return NS_ERROR_UNEXPECTED;
+    }
+
+    int32_t type;
+    QM_TRY(MOZ_TO_RESULT(aArguments->GetTypeOfIndex(0, &type)));
+
+    if (type == mozIStorageStatement::VALUE_TYPE_NULL) {
+      nsCOMPtr<nsIVariant> result = new mozilla::storage::NullVariant();
+
+      result.forget(aResult);
+      return NS_OK;
+    }
+
+    if (type != mozIStorageStatement::VALUE_TYPE_TEXT) {
+      NS_WARNING("Don't call me with the wrong type of arguments!");
+      return NS_ERROR_UNEXPECTED;
+    }
+
+    QM_TRY_INSPECT(const auto& idString,
+                   MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(nsAutoCString, aArguments,
+                                                     GetUTF8String, 0));
+
+    nsID id{};
+    QM_TRY(OkIf(id.Parse(idString.get())), Err(NS_ERROR_UNEXPECTED));
+
+    QM_TRY_INSPECT(
+        const auto& fileSize,
+        QM_OR_ELSE_WARN_IF(
+            GetBodyDiskSize(*mDBDir, id),
+            ([](const nsresult rv) { return rv == NS_ERROR_FILE_NOT_FOUND; }),
+            (ErrToOk<0, int64_t>)));
+
+    CheckedInt64 totalDiskUsage = mTotalDiskUsage + fileSize;
+    mTotalDiskUsage =
+        totalDiskUsage.isValid() ? totalDiskUsage.value() : INT64_MAX;
+
+    nsCOMPtr<nsIVariant> result =
+        new mozilla::storage::IntegerVariant(fileSize);
+
+    result.forget(aResult);
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIFile> mDBDir;
+  int64_t mTotalDiskUsage;
+};
+
+NS_IMPL_ISUPPORTS(BodyDiskSizeGetterFunction, mozIStorageFunction)
+
+nsresult MigrateFrom28To29(nsIFile& aDBDir, mozIStorageConnection& aConn,
+                           bool& aRewriteSchema) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(
+      "ALTER TABLE entries "
+      "ADD COLUMN request_body_disk_size INTEGER NULL;"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(
+      "ALTER TABLE entries "
+      "ADD COLUMN response_body_disk_size INTEGER NULL;"_ns)));
+
+  RefPtr<BodyDiskSizeGetterFunction> bodyDiskSizeGetter =
+      new BodyDiskSizeGetterFunction(&aDBDir);
+
+  constexpr auto bodyDiskSizeGetterName = "get_body_disk_size"_ns;
+
+  QM_TRY(MOZ_TO_RESULT(
+      aConn.CreateFunction(bodyDiskSizeGetterName, 1, bodyDiskSizeGetter)));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(
+      "UPDATE entries SET "
+      "request_body_disk_size = get_body_disk_size(request_body_id), "
+      "response_body_disk_size = get_body_disk_size(response_body_id);"_ns)));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.RemoveFunction(bodyDiskSizeGetterName)));
+
+  QM_TRY(
+      MOZ_TO_RESULT(aConn.ExecuteSimpleSQL(nsLiteralCString(kTableUsageInfo))));
+
+  QM_TRY_INSPECT(
+      const auto& state,
+      MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+          nsCOMPtr<mozIStorageStatement>, aConn, CreateStatement,
+          "INSERT INTO usage_info VALUES(1, :total_disk_usage);"_ns));
+
+  QM_TRY(MOZ_TO_RESULT(state->BindInt64ByName(
+      "total_disk_usage"_ns, bodyDiskSizeGetter->TotalDiskUsage())));
+
+  QM_TRY(MOZ_TO_RESULT(state->Execute()));
+
+  QM_TRY(MOZ_TO_RESULT(
+      aConn.ExecuteSimpleSQL(nsLiteralCString(kTriggerEntriesInsert))));
+
+  QM_TRY(MOZ_TO_RESULT(
+      aConn.ExecuteSimpleSQL(nsLiteralCString(kTriggerEntriesUpdate))));
+
+  QM_TRY(MOZ_TO_RESULT(
+      aConn.ExecuteSimpleSQL(nsLiteralCString(kTriggerEntriesDelete))));
+
+  QM_TRY(MOZ_TO_RESULT(aConn.SetSchemaVersion(29)));
+
+  aRewriteSchema = true;
+
+  return NS_OK;
+}
+
+}  
+}  

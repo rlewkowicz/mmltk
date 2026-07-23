@@ -1,0 +1,16 @@
+if CONFIG['FFVPX_ASFLAGS']:
+    DIRS += ['x86']
+SharedLibrary('mozavutil')
+SOURCES += ['avsscanf.c', 'avstring.c', 'bprint.c', 'buffer.c', 'channel_layout.c', 'container_fifo.c', 'cpu.c', 'crc.c', 'dict.c', 'error.c', 'eval.c', 'fifo.c', 'fixed_dsp.c', 'float_dsp.c', 'float_scalarproduct.c', 'frame.c', 'hwcontext.c', 'imgutils.c', 'log.c', 'log2_tab.c', 'mastering_display_metadata.c', 'mathematics.c', 'mem.c', 'opt.c', 'parseutils.c', 'pixdesc.c', 'rational.c', 'refstruct.c', 'reverse.c', 'samplefmt.c', 'side_data.c', 'slicethread.c', 'time.c', 'timecode_internal.c', 'tx.c', 'tx_double.c', 'tx_float.c', 'tx_int32.c', 'utils.c']
+if not CONFIG['MOZ_FFVPX_AUDIOONLY']:
+    SOURCES += ['adler32.c', 'base64.c', 'film_grain_params.c', 'hdr_dynamic_metadata.c', 'integer.c', 'intmath.c', 'lls.c', 'pixelutils.c', 'threadmessage.c', 'timecode.c', 'video_enc_params.c']
+    LOCAL_INCLUDES += ['/media/mozva']
+    SOURCES += ['hwcontext_vaapi.c']
+    USE_LIBS += ['mozva']
+EXPORTS.ffvpx += ['tx.h']
+SYMBOLS_FILE = 'avutil.symbols'
+NoVisibilityFlags()
+OS_LIBS += CONFIG['REALTIME_LIBS']
+OS_LIBS += ['m']
+OS_LIBS += CONFIG['LIBATOMIC_LIBS']
+include('../ffvpxcommon.mozbuild')

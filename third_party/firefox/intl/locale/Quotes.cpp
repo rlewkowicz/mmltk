@@ -1,0 +1,83 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Quotes.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/intl/Locale.h"
+#include "nsTHashMap.h"
+#include "nsPrintfCString.h"
+
+using namespace mozilla;
+using namespace mozilla::intl;
+
+namespace {
+struct LangQuotesRec {
+  const char* mLangs;
+  Quotes mQuotes;
+};
+
+#include "cldr-quotes.inc"
+
+static StaticAutoPtr<nsTHashMap<nsCStringHashKey, Quotes>> sQuotesForLang;
+}  
+
+namespace mozilla {
+namespace intl {
+
+const Quotes* QuotesForLang(const nsAtom* aLang) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!sQuotesForLang) {
+    sQuotesForLang = new nsTHashMap<nsCStringHashKey, Quotes>(32);
+    ClearOnShutdown(&sQuotesForLang);
+    for (const auto& i : sLangQuotes) {
+      const char* s = i.mLangs;
+      size_t len;
+      while ((len = strlen(s))) {
+        sQuotesForLang->InsertOrUpdate(nsDependentCString(s, len), i.mQuotes);
+        s += len + 1;
+      }
+    }
+  }
+
+  nsAtomCString langStr(aLang);
+  const Quotes* entry = sQuotesForLang->Lookup(langStr).DataPtrOrNull();
+  if (entry) {
+    return entry;
+  }
+
+  Locale loc;
+  auto result = LocaleParser::TryParse(langStr, loc);
+  if (result.isErr()) {
+    return nullptr;
+  }
+  const Span<const char> langAsSpan = loc.Language().Span();
+  nsAutoCString lang(langAsSpan.data(), langAsSpan.size());
+  const auto langLen = lang.Length();
+  if (loc.Region().Present()) {
+    lang.Append('-');
+    lang.Append(loc.Region().Span());
+    if ((entry = sQuotesForLang->Lookup(lang).DataPtrOrNull())) {
+      return entry;
+    }
+    lang.Truncate(langLen);
+  }
+  if (loc.Script().Present()) {
+    lang.Append('-');
+    lang.Append(loc.Script().Span());
+    if ((entry = sQuotesForLang->Lookup(lang).DataPtrOrNull())) {
+      return entry;
+    }
+    lang.Truncate(langLen);
+  }
+  if ((entry = sQuotesForLang->Lookup(lang).DataPtrOrNull())) {
+    return entry;
+  }
+
+  return nullptr;
+}
+
+}  
+}  

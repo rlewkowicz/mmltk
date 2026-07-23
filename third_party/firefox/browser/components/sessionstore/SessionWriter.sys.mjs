@@ -1,0 +1,281 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const lazy = {};
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  sessionStoreLogger: "resource:///modules/sessionstore/SessionLogger.sys.mjs",
+});
+
+const STATE_CLEAN = "clean";
+const STATE_RECOVERY = "recovery";
+const STATE_UPGRADE_BACKUP = "upgradeBackup";
+const STATE_EMPTY = "empty";
+
+var sessionFileIOMutex = Promise.resolve();
+function lockIOWithMutex() {
+  return new Promise(unlock => {
+    sessionFileIOMutex = sessionFileIOMutex.then(() => {
+      return new Promise(unlock);
+    });
+  });
+}
+
+export const SessionWriter = {
+  init(origin, useOldExtension, paths, prefs = {}) {
+    return SessionWriterInternal.init(origin, useOldExtension, paths, prefs);
+  },
+
+  async write(state, options = {}) {
+    const unlock = await lockIOWithMutex();
+    try {
+      return await SessionWriterInternal.write(state, options);
+    } finally {
+      unlock();
+    }
+  },
+
+  async wipe() {
+    const unlock = await lockIOWithMutex();
+    try {
+      return await SessionWriterInternal.wipe();
+    } finally {
+      unlock();
+    }
+  },
+};
+
+const SessionWriterInternal = {
+  Paths: null,
+
+  state: null,
+
+  useOldExtension: false,
+
+  maxUpgradeBackups: null,
+
+  init(origin, useOldExtension, paths, prefs) {
+    if (!(origin in paths || origin == STATE_EMPTY)) {
+      throw new TypeError("Invalid origin: " + origin);
+    }
+
+    for (let pref of [
+      "maxUpgradeBackups",
+      "maxSerializeBack",
+      "maxSerializeForward",
+    ]) {
+      if (!prefs.hasOwnProperty(pref)) {
+        throw new TypeError(`Missing preference value for ${pref}`);
+      }
+    }
+
+    this.useOldExtension = useOldExtension;
+    this.state = origin;
+    this.Paths = paths;
+    this.maxUpgradeBackups = prefs.maxUpgradeBackups;
+    this.maxSerializeBack = prefs.maxSerializeBack;
+    this.maxSerializeForward = prefs.maxSerializeForward;
+    this.upgradeBackupNeeded = paths.nextUpgradeBackup != paths.upgradeBackup;
+    return { result: true };
+  },
+
+  async write(state, options) {
+    let exn;
+
+    if (options.isFinalWrite) {
+      for (let window of state.windows) {
+        for (let tab of window.tabs) {
+          let lower = 0;
+          let upper = tab.entries.length;
+
+          if (this.maxSerializeBack > -1) {
+            lower = Math.max(lower, tab.index - this.maxSerializeBack - 1);
+          }
+          if (this.maxSerializeForward > -1) {
+            upper = Math.min(upper, tab.index + this.maxSerializeForward);
+          }
+
+          tab.entries = tab.entries.slice(lower, upper);
+          tab.index -= lower;
+        }
+      }
+    }
+
+    try {
+      if (this.state == STATE_CLEAN || this.state == STATE_EMPTY) {
+        await IOUtils.makeDirectory(this.Paths.backups);
+      }
+
+      if (this.state == STATE_CLEAN) {
+        if (!this.useOldExtension) {
+          await IOUtils.move(this.Paths.clean, this.Paths.cleanBackup);
+        } else {
+          let oldCleanPath = this.Paths.clean.replace("jsonlz4", "js");
+          let d = await IOUtils.read(oldCleanPath);
+          await IOUtils.write(this.Paths.cleanBackup, d, { compress: true });
+        }
+      }
+
+      if (options.isFinalWrite) {
+        await IOUtils.writeJSON(this.Paths.clean, state, {
+          tmpPath: this.Paths.clean + ".tmp",
+          compress: true,
+        });
+      } else if (this.state == STATE_RECOVERY) {
+        await IOUtils.writeJSON(this.Paths.recovery, state, {
+          tmpPath: this.Paths.recovery + ".tmp",
+          backupFile: this.Paths.recoveryBackup,
+          compress: true,
+        });
+      } else {
+        await IOUtils.writeJSON(this.Paths.recovery, state, {
+          tmpPath: this.Paths.recovery + ".tmp",
+          compress: true,
+        });
+      }
+    } catch (ex) {
+      lazy.sessionStoreLogger.warn(
+        "SessionWriter.write, Caught exception:",
+        ex
+      );
+      exn = exn || ex;
+    }
+
+    let upgradeBackupComplete = false;
+    if (
+      this.upgradeBackupNeeded &&
+      (this.state == STATE_CLEAN || this.state == STATE_UPGRADE_BACKUP)
+    ) {
+      try {
+        let path =
+          this.state == STATE_CLEAN
+            ? this.Paths.cleanBackup
+            : this.Paths.upgradeBackup;
+        await IOUtils.copy(path, this.Paths.nextUpgradeBackup);
+        this.upgradeBackupNeeded = false;
+        upgradeBackupComplete = true;
+      } catch (ex) {
+        lazy.sessionStoreLogger.warn(
+          "SessionWriter.write, Caught exception doing upgrade backup:",
+          ex
+        );
+        exn = exn || ex;
+      }
+
+      let backups = [];
+
+      try {
+        let children = await IOUtils.getChildren(this.Paths.backups);
+        backups = children.filter(path =>
+          path.startsWith(this.Paths.upgradeBackupPrefix)
+        );
+      } catch (ex) {
+        lazy.sessionStoreLogger.warn(
+          "SessionWriter.write, Caught exception looking for backups:",
+          ex
+        );
+        exn = exn || ex;
+      }
+
+      if (backups.length > this.maxUpgradeBackups) {
+        lazy.sessionStoreLogger.debug(
+          `SessionWriter.write, cleaning up ${backups.length - this.maxUpgradeBackups} backup files`
+        );
+        backups.sort();
+        for (let i = 0; i < backups.length - this.maxUpgradeBackups; i++) {
+          try {
+            await IOUtils.remove(backups[i]);
+          } catch (ex) {
+            lazy.sessionStoreLogger.warn(
+              "SessionWriter.write, exception on removing backup file",
+              ex
+            );
+            exn = exn || ex;
+          }
+        }
+      }
+    }
+
+    if (options.performShutdownCleanup && !exn) {
+
+      await IOUtils.remove(this.Paths.recoveryBackup);
+      await IOUtils.remove(this.Paths.recovery);
+    }
+
+    this.state = STATE_RECOVERY;
+
+    if (exn) {
+      throw exn;
+    }
+
+    return {
+      result: {
+        upgradeBackup: upgradeBackupComplete,
+      },
+    };
+  },
+
+  async wipe() {
+    let exn = null;
+
+    try {
+      await IOUtils.remove(this.Paths.clean);
+      let oldCleanPath = this.Paths.clean.replace("jsonlz4", "js");
+      await IOUtils.remove(oldCleanPath, {
+        ignoreAbsent: true,
+      });
+    } catch (ex) {
+      exn = exn || ex;
+    }
+
+    try {
+      await IOUtils.remove(this.Paths.backups, { recursive: true });
+    } catch (ex) {
+      exn = exn || ex;
+    }
+
+    try {
+      await this._wipeFromDir(PathUtils.profileDir, "sessionstore.bak");
+    } catch (ex) {
+      exn = exn || ex;
+    }
+
+    this.state = STATE_EMPTY;
+    if (exn) {
+      throw exn;
+    }
+
+    return { result: true };
+  },
+
+  async _wipeFromDir(path, prefix) {
+    if (!prefix) {
+      throw new TypeError("Must supply prefix");
+    }
+
+    let exn = null;
+
+    let children = await IOUtils.getChildren(path, {
+      ignoreAbsent: true,
+    });
+    for (let entryPath of children) {
+      if (!PathUtils.filename(entryPath).startsWith(prefix)) {
+        continue;
+      }
+      try {
+        let { type } = await IOUtils.stat(entryPath);
+        if (type == "directory") {
+          continue;
+        }
+        await IOUtils.remove(entryPath);
+      } catch (ex) {
+        exn = exn || ex;
+      }
+    }
+
+    if (exn) {
+      throw exn;
+    }
+  },
+};

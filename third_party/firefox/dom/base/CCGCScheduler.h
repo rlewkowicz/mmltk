@@ -1,0 +1,427 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_CCGCScheduler_h
+#define mozilla_dom_CCGCScheduler_h
+
+#include "js/SliceBudget.h"
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/IdleTaskRunner.h"
+#include "mozilla/MainThreadIdlePeriod.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/ipc/IdleSchedulerChild.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsCycleCollector.h"
+#include "nsJSEnvironment.h"
+
+namespace mozilla {
+
+extern const TimeDuration kOneMinute;
+
+extern const TimeDuration kCCDelay;
+
+extern const TimeDuration kCCSkippableDelay;
+
+extern const TimeDuration kTimeBetweenForgetSkippableCycles;
+
+extern const TimeDuration kForgetSkippableSliceDuration;
+
+extern const TimeDuration kICCIntersliceDelay;
+
+extern const TimeDuration kICCSliceBudget;
+extern const TimeDuration kIdleICCSliceBudget;
+
+extern const TimeDuration kMaxICCDuration;
+
+extern const TimeDuration kCCForced;
+constexpr uint32_t kCCForcedPurpleLimit = 10;
+
+extern const TimeDuration kMaxCCLockedoutTime;
+
+constexpr uint32_t kCCPurpleLimit = 200;
+
+enum class GCRunnerAction {
+  MinorGC,        
+  WaitToMajorGC,  
+  StartMajorGC,   
+  GCSlice,        
+  None
+};
+
+struct GCRunnerStep {
+  GCRunnerAction mAction;
+  JS::GCReason mReason;
+};
+
+enum class CCRunnerAction {
+  None,
+
+  MinorGC,
+
+  ForgetSkippable,
+  CleanupContentUnbinder,
+  CleanupDeferred,
+
+  CycleCollect,
+
+  StopRunning
+};
+
+enum CCRunnerYield { Continue, Yield };
+
+enum CCRunnerForgetSkippableRemoveChildless {
+  KeepChildless = false,
+  RemoveChildless = true
+};
+
+struct CCRunnerStep {
+  CCRunnerAction mAction;
+
+  CCRunnerYield mYield;
+
+  union ActionData {
+    CCRunnerForgetSkippableRemoveChildless mRemoveChildless;
+
+    CCReason mCCReason;
+
+    JS::GCReason mReason;
+
+    MOZ_IMPLICIT ActionData(CCRunnerForgetSkippableRemoveChildless v)
+        : mRemoveChildless(v) {}
+    MOZ_IMPLICIT ActionData(CCReason v) : mCCReason(v) {}
+    MOZ_IMPLICIT ActionData(JS::GCReason v) : mReason(v) {}
+    ActionData() = default;
+  } mParam;
+};
+
+class CCGCScheduler {
+ public:
+  CCGCScheduler()
+      : mAskParentBeforeMajorGC(XRE_IsContentProcess()),
+        mReadyForMajorGC(!mAskParentBeforeMajorGC),
+        mInterruptRequested(false) {}
+
+  bool CCRunnerFired(TimeStamp aDeadline);
+
+
+  void SetActiveIntersliceGCBudget(TimeDuration aDuration) {
+    mActiveIntersliceGCBudget = aDuration;
+  }
+
+
+  TimeDuration GetCCBlockedTime(TimeStamp aNow) const {
+    MOZ_ASSERT(mInIncrementalGC);
+    MOZ_ASSERT(!mCCBlockStart.IsNull());
+    return aNow - mCCBlockStart;
+  }
+
+  bool InIncrementalGC() const { return mInIncrementalGC; }
+
+  TimeStamp GetLastCCEndTime() const { return mLastCCEndTime; }
+
+  bool IsEarlyForgetSkippable(uint32_t aN = kMajorForgetSkippableCalls) const {
+    return mCleanupsSinceLastGC < aN;
+  }
+
+  bool NeedsFullGC() const { return mNeedsFullGC; }
+
+  void PokeGC(JS::GCReason aReason, JSObject* aObj, TimeDuration aDelay = {});
+  void PokeShrinkingGC();
+  void PokeFullGC();
+  void MaybePokeCC(TimeStamp aNow, uint32_t aSuspectedCCObjects);
+  void PokeMinorGC(JS::GCReason aReason);
+
+  void UserIsInactive();
+  void UserIsActive();
+  bool IsUserActive() const { return mUserIsActive; }
+
+  void KillShrinkingGCTimer();
+  void KillFullGCTimer();
+  void KillGCRunner();
+  void KillCCRunner();
+  void KillAllTimersAndRunners();
+
+  JS::SliceBudget CreateGCSliceBudget(mozilla::TimeDuration aDuration,
+                                      bool isIdle, bool isExtended) {
+    mInterruptRequested = false;
+    auto budget = JS::SliceBudget(
+        aDuration, mPreferFasterCollection ? nullptr : &mInterruptRequested);
+    budget.idle = isIdle;
+    budget.extended = isExtended;
+    return budget;
+  }
+
+  void EnsureGCRunner(TimeDuration aDelay = {});
+
+  void EnsureOrResetGCRunner();
+
+  void EnsureCCRunner(TimeDuration aDelay, TimeDuration aBudget);
+
+
+  void SetNeedsFullGC(bool aNeedGC = true) { mNeedsFullGC = aNeedGC; }
+
+  void SetWantMajorGC(JS::GCReason aReason) {
+    MOZ_ASSERT(aReason != JS::GCReason::NO_REASON);
+
+    if (aReason != JS::GCReason::USER_INACTIVE) {
+      mWantAtLeastRegularGC = true;
+    }
+
+    if (aReason == JS::GCReason::DOM_WINDOW_UTILS) {
+      SetNeedsFullGC();
+    }
+
+    switch (aReason) {
+      case JS::GCReason::USER_INACTIVE:
+        mMajorGCReason = aReason;
+        break;
+      case JS::GCReason::FULL_GC_TIMER:
+        if (mMajorGCReason != JS::GCReason::USER_INACTIVE) {
+          mMajorGCReason = aReason;
+        }
+        break;
+      default:
+        if (mMajorGCReason != JS::GCReason::USER_INACTIVE &&
+            mMajorGCReason != JS::GCReason::FULL_GC_TIMER) {
+          mMajorGCReason = aReason;
+        }
+        break;
+    }
+  }
+
+  void SetWantEagerMinorGC(JS::GCReason aReason) {
+    if (mEagerMinorGCReason == JS::GCReason::NO_REASON) {
+      mEagerMinorGCReason = aReason;
+    }
+  }
+
+  void EnsureCCThenGC(CCReason aReason) {
+    MOZ_ASSERT(mCCRunnerState != CCRunnerState::Inactive);
+    MOZ_ASSERT(aReason != CCReason::NO_REASON);
+    mNeedsFullCC = aReason;
+    mNeedsGCAfterCC = true;
+  }
+
+  [[nodiscard]] bool NoteReadyForMajorGC() {
+    if (mMajorGCReason == JS::GCReason::NO_REASON || InIncrementalGC()) {
+      return false;
+    }
+    mReadyForMajorGC = true;
+    return true;
+  }
+
+  void NoteGCBegin(JS::GCReason aReason);
+
+  void NoteGCEnd();
+
+  void NoteWontGC();
+
+  void NoteMinorGCEnd() { mEagerMinorGCReason = JS::GCReason::NO_REASON; }
+
+  void NoteCCBegin();
+
+  void NoteCCEnd(const CycleCollectorResults& aResults, TimeStamp aWhen);
+
+  void NoteGCSliceEnd(TimeStamp aStart, TimeStamp aEnd);
+
+  bool GCRunnerFired(TimeStamp aDeadline);
+  bool GCRunnerFiredDoGC(TimeStamp aDeadline, const GCRunnerStep& aStep);
+
+  using MayGCPromise =
+      MozPromise<bool, mozilla::ipc::ResponseRejectReason, true>;
+
+  static RefPtr<MayGCPromise> MayGCNow(JS::GCReason reason);
+
+  void RunNextCollectorTimer(JS::GCReason aReason,
+                             mozilla::TimeStamp aDeadline);
+
+  void BlockCC(TimeStamp aNow) {
+    MOZ_ASSERT(mInIncrementalGC);
+    MOZ_ASSERT(mCCBlockStart.IsNull());
+    mCCBlockStart = aNow;
+  }
+
+  void UnblockCC() { mCCBlockStart = TimeStamp(); }
+
+  void NoteForgetSkippableComplete(uint32_t aSuspectedCCObjects) {
+    mPreviousSuspectedCount = aSuspectedCCObjects;
+    mCleanupsSinceLastGC++;
+  }
+
+  bool IsCollectingCycles() const { return mIsCollectingCycles; }
+
+  void NoteForgetSkippableOnlyCycle(TimeStamp aNow) {
+    mLastForgetSkippableCycleEndTime = aNow;
+  }
+
+  void Shutdown() {
+    mDidShutdown = true;
+    KillAllTimersAndRunners();
+  }
+
+
+  JS::SliceBudget ComputeCCSliceBudget(TimeStamp aDeadline,
+                                       TimeStamp aCCBeginTime,
+                                       TimeStamp aPrevSliceEndTime,
+                                       TimeStamp aNow,
+                                       bool* aPreferShorterSlices) const;
+
+  JS::SliceBudget ComputeInterSliceGCBudget(TimeStamp aDeadline,
+                                            TimeStamp aNow);
+
+  TimeDuration ComputeMinimumBudgetForRunner(TimeDuration aBaseValue);
+
+  bool ShouldForgetSkippable(uint32_t aSuspectedCCObjects) const {
+    return ((mPreviousSuspectedCount + 100) <= aSuspectedCCObjects) ||
+           mCleanupsSinceLastGC < kMajorForgetSkippableCalls;
+  }
+
+  CCReason IsCCNeeded(TimeStamp aNow, uint32_t aSuspectedCCObjects) const {
+    if (mNeedsFullCC != CCReason::NO_REASON) {
+      return mNeedsFullCC;
+    }
+    if (aSuspectedCCObjects > kCCPurpleLimit) {
+      return CCReason::MANY_SUSPECTED;
+    }
+    if (aSuspectedCCObjects > kCCForcedPurpleLimit && mLastCCEndTime &&
+        aNow - mLastCCEndTime > kCCForced) {
+      return CCReason::TIMED;
+    }
+    return CCReason::NO_REASON;
+  }
+
+  mozilla::CCReason ShouldScheduleCC(TimeStamp aNow,
+                                     uint32_t aSuspectedCCObjects) const;
+
+  bool NeedsGCAfterCC() const {
+    return mCCollectedWaitingForGC > 250 || mCCollectedZonesWaitingForGC > 0 ||
+           mLikelyShortLivingObjectsNeedingGC > 2500 || mNeedsGCAfterCC;
+  }
+
+  bool IsLastEarlyCCTimer(int32_t aCurrentFireCount) const {
+    int32_t numEarlyTimerFires =
+        std::max(int32_t(mCCDelay / kCCSkippableDelay) - 2, 1);
+
+    return aCurrentFireCount >= numEarlyTimerFires;
+  }
+
+  enum class CCRunnerState {
+    Inactive,
+    ReducePurple,
+    CleanupChildless,
+    CleanupContentUnbinder,
+    CleanupDeferred,
+    StartCycleCollection,
+    CycleCollecting,
+    Canceled,
+    NumStates
+  };
+
+  void InitCCRunnerStateMachine(CCRunnerState initialState, CCReason aReason) {
+    if (mCCRunner) {
+      return;
+    }
+
+    MOZ_ASSERT(mCCReason == CCReason::NO_REASON);
+    mCCReason = aReason;
+
+    MOZ_ASSERT(mCCRunnerState == CCRunnerState::Inactive,
+               "DeactivateCCRunner should have been called");
+    mCCRunnerState = initialState;
+
+    if (initialState == CCRunnerState::ReducePurple) {
+      mCCDelay = kCCDelay;
+      mCCRunnerEarlyFireCount = 0;
+    } else if (initialState == CCRunnerState::CycleCollecting) {
+    } else {
+      MOZ_CRASH("Invalid initial state");
+    }
+  }
+
+  void DeactivateCCRunner() {
+    mCCRunnerState = CCRunnerState::Inactive;
+    mCCReason = CCReason::NO_REASON;
+  }
+
+  bool HasMoreIdleGCRunnerWork() const {
+    return mMajorGCReason != JS::GCReason::NO_REASON ||
+           mEagerMajorGCReason != JS::GCReason::NO_REASON ||
+           mEagerMinorGCReason != JS::GCReason::NO_REASON;
+  }
+
+  GCRunnerStep GetNextGCRunnerAction(TimeStamp aDeadline) const;
+
+  CCRunnerStep AdvanceCCRunner(TimeStamp aDeadline, TimeStamp aNow,
+                               uint32_t aSuspectedCCObjects);
+
+  JS::SliceBudget ComputeForgetSkippableBudget(TimeStamp aStartTimeStamp,
+                                               TimeStamp aDeadline);
+
+  bool PreferFasterCollection() const { return mPreferFasterCollection; }
+
+ private:
+
+  bool mInIncrementalGC = false;
+
+  const bool mAskParentBeforeMajorGC;
+
+  bool mHaveAskedParent = false;
+
+  bool mReadyForMajorGC;
+
+  JS::SliceBudget::InterruptRequestFlag mInterruptRequested;
+
+  bool mWantAtLeastRegularGC = false;
+
+  TimeStamp mCCBlockStart;
+
+  bool mDidShutdown = false;
+
+  TimeStamp mLastCCEndTime;
+  TimeStamp mLastForgetSkippableCycleEndTime;
+
+  CCRunnerState mCCRunnerState = CCRunnerState::Inactive;
+  int32_t mCCRunnerEarlyFireCount = 0;
+  TimeDuration mCCDelay = kCCDelay;
+
+  bool mHasRunGC = false;
+
+  mozilla::CCReason mNeedsFullCC = CCReason::NO_REASON;
+  bool mNeedsFullGC = true;
+  bool mNeedsGCAfterCC = false;
+  uint32_t mPreviousSuspectedCount = 0;
+
+  uint32_t mCleanupsSinceLastGC = UINT32_MAX;
+
+  mozilla::Maybe<TimeStamp> mTriggeredGCDeadline;
+
+  RefPtr<IdleTaskRunner> mGCRunner;
+  RefPtr<IdleTaskRunner> mCCRunner;
+  nsITimer* mShrinkingGCTimer = nullptr;
+  nsITimer* mFullGCTimer = nullptr;
+
+  mozilla::CCReason mCCReason = mozilla::CCReason::NO_REASON;
+  JS::GCReason mMajorGCReason = JS::GCReason::NO_REASON;
+  JS::GCReason mEagerMajorGCReason = JS::GCReason::NO_REASON;
+  JS::GCReason mEagerMinorGCReason = JS::GCReason::NO_REASON;
+
+  bool mIsCompactingOnUserInactive = false;
+  bool mIsCollectingCycles = false;
+  bool mUserIsActive = true;
+
+  bool mCurrentCollectionHasSeenNonIdle = false;
+  bool mPreferFasterCollection = false;
+
+ public:
+  uint32_t mCCollectedWaitingForGC = 0;
+  uint32_t mCCollectedZonesWaitingForGC = 0;
+  uint32_t mLikelyShortLivingObjectsNeedingGC = 0;
+
+
+  TimeDuration mActiveIntersliceGCBudget = TimeDuration::FromMilliseconds(5);
+};
+
+}  
+
+#endif  // mozilla_dom_CCGCScheduler_h

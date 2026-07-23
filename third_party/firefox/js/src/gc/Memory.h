@@ -1,0 +1,72 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_Memory_h
+#define gc_Memory_h
+
+#include "mozilla/Atomics.h"
+
+#include <stddef.h>
+
+namespace js {
+namespace gc {
+
+extern mozilla::Atomic<size_t, mozilla::Relaxed> gMappedMemorySizeBytes;
+extern mozilla::Atomic<uint64_t, mozilla::Relaxed> gMappedMemoryOperations;
+
+void InitMemorySubsystem();
+
+void CheckMemorySubsystemOnShutDown();
+
+size_t SystemPageSize();
+
+size_t SystemAddressBits();
+
+size_t VirtualMemoryLimit();
+
+bool UsingScattershotAllocator();
+
+enum class StallAndRetry : bool {
+  No = false,
+  Yes = true,
+};
+
+void* MapAlignedPages(size_t length, size_t alignment,
+                      StallAndRetry stallAndRetry = StallAndRetry::No);
+void UnmapPages(void* region, size_t length);
+
+void MapStack(size_t stackSize);
+
+bool DecommitEnabled();
+
+void DisableDecommit();
+
+bool MarkPagesUnusedSoft(void* region, size_t length);
+
+bool MarkPagesUnusedHard(void* region, size_t length);
+
+void MarkPagesInUseSoft(void* region, size_t length);
+
+[[nodiscard]] bool MarkPagesInUseHard(void* region, size_t length);
+
+size_t GetPageFaultCount();
+
+void* AllocateMappedContent(int fd, size_t offset, size_t length,
+                            size_t alignment);
+
+void DeallocateMappedContent(void* region, size_t length);
+
+void* TestMapAlignedPagesLastDitch(size_t length, size_t alignment);
+
+void ProtectPages(void* region, size_t length);
+void MakePagesReadOnly(void* region, size_t length);
+void UnprotectPages(void* region, size_t length);
+
+void RecordMemoryAlloc(size_t bytes);
+void RecordMemoryFree(size_t bytes);
+
+}  
+}  
+
+#endif /* gc_Memory_h */

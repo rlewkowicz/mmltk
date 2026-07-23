@@ -1,0 +1,15 @@
+[build]
+target = "index.html"
+html_output = "index.html"
+release = true
+dist = "dist"
+public_url = "/"
+filehash = true
+inject_scripts = true
+frozen = true
+locked = true
+minify = "always"
+
+[serve]
+addresses = ["127.0.0.1"]
+open = false

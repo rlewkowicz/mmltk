@@ -1,0 +1,266 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsIGlobalObject_h_
+#define nsIGlobalObject_h_
+
+#include "js/TypeDecls.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/OriginTrials.h"
+#include "mozilla/dom/ClientInfo.h"
+#include "mozilla/dom/ClientState.h"
+#include "mozilla/dom/ServiceWorkerDescriptor.h"
+#include "nsHashKeys.h"
+#include "nsISupports.h"
+#include "nsRFPService.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "nsTHashtable.h"
+
+#define NS_IGLOBALOBJECT_IID \
+  {0x11afa8be, 0xd997, 0x4e07, {0xa6, 0xa3, 0x6f, 0x87, 0x2e, 0xc3, 0xee, 0x7f}}
+
+class nsCycleCollectionTraversalCallback;
+class nsICookieJarSettings;
+class nsIPrincipal;
+class nsIURI;
+class nsPIDOMWindowInner;
+enum class PropertiesFile : uint8_t;
+
+namespace mozilla {
+class DOMEventTargetHelper;
+class GlobalFreezeObserver;
+class GlobalTeardownObserver;
+template <typename V, typename E>
+class Result;
+enum class StorageAccess;
+namespace dom {
+class WorkerGlobalScopeBase;
+class VoidFunction;
+class FontFaceSet;
+class Function;
+class Report;
+class ReportBody;
+class ReportingObserver;
+class ServiceWorker;
+class ServiceWorkerContainer;
+class ServiceWorkerRegistration;
+class ServiceWorkerRegistrationDescriptor;
+class StorageManager;
+class WebTaskSchedulingState;
+enum class CallerType : uint32_t;
+}  
+namespace ipc {
+class PrincipalInfo;
+}  
+}  
+
+namespace JS::loader {
+class ModuleLoaderBase;
+}  
+
+class nsIGlobalObject : public nsISupports {
+ private:
+  nsTArray<nsCString> mHostObjectURIs;
+
+  mozilla::LinkedList<mozilla::GlobalTeardownObserver> mGlobalTeardownObservers;
+  mozilla::LinkedList<mozilla::GlobalFreezeObserver> mGlobalFreezeObservers;
+
+  bool mIsDying;
+
+ protected:
+  bool mIsInnerWindow;
+
+  nsIGlobalObject();
+
+ public:
+  using RTPCallerType = mozilla::RTPCallerType;
+  using RFPTarget = mozilla::RFPTarget;
+  NS_INLINE_DECL_STATIC_IID(NS_IGLOBALOBJECT_IID)
+
+  bool IsDying() const { return mIsDying; }
+
+  bool IsScriptForbidden(JSObject* aCallback,
+                         bool aIsJSImplementedWebIDL = false) const;
+
+  virtual JSObject* GetGlobalJSObject() = 0;
+
+  virtual JSObject* GetGlobalJSObjectPreserveColor() const = 0;
+
+  bool HasJSGlobal() const { return GetGlobalJSObjectPreserveColor(); }
+
+  virtual nsISerialEventTarget* SerialEventTarget() const = 0;
+  virtual nsresult Dispatch(already_AddRefed<nsIRunnable>) const = 0;
+
+  nsIPrincipal* PrincipalOrNull() const;
+
+  void RegisterHostObjectURI(const nsACString& aURI);
+
+  void UnregisterHostObjectURI(const nsACString& aURI);
+
+  void UnlinkObjectsInGlobal();
+  void TraverseObjectsInGlobal(nsCycleCollectionTraversalCallback& aCb);
+
+  void AddGlobalTeardownObserver(mozilla::GlobalTeardownObserver* aObject);
+  void RemoveGlobalTeardownObserver(mozilla::GlobalTeardownObserver* aObject);
+
+  void ForEachGlobalTeardownObserver(
+      const std::function<void(mozilla::GlobalTeardownObserver*,
+                               bool* aDoneOut)>& aFunc) const;
+
+  void AddGlobalFreezeObserver(mozilla::GlobalFreezeObserver* aObserver);
+  void RemoveGlobalFreezeObserver(mozilla::GlobalFreezeObserver* aObserver);
+
+  void ForEachGlobalFreezeObserver(
+      const std::function<void(mozilla::GlobalFreezeObserver*, bool* aDoneOut)>&
+          aFunc) const;
+
+  virtual bool IsInSyncOperation() { return false; }
+
+  virtual void SetWebTaskSchedulingState(
+      mozilla::dom::WebTaskSchedulingState* aState) {}
+  virtual mozilla::dom::WebTaskSchedulingState* GetWebTaskSchedulingState()
+      const {
+    return nullptr;
+  }
+
+  virtual nsIURI* GetBaseURI() const;
+
+  virtual mozilla::Maybe<mozilla::dom::ClientInfo> GetClientInfo() const;
+  virtual mozilla::Maybe<mozilla::dom::ClientState> GetClientState() const;
+
+  virtual mozilla::Maybe<nsID> GetAgentClusterId() const;
+
+  virtual bool CrossOriginIsolated() const { return false; }
+
+  virtual bool IsSharedMemoryAllowed() const { return false; }
+
+  virtual mozilla::Maybe<mozilla::dom::ServiceWorkerDescriptor> GetController()
+      const;
+
+  virtual already_AddRefed<mozilla::dom::ServiceWorkerContainer>
+  GetServiceWorkerContainer();
+
+  virtual RefPtr<mozilla::dom::ServiceWorker> GetOrCreateServiceWorker(
+      const mozilla::dom::ServiceWorkerDescriptor& aDescriptor);
+
+  virtual RefPtr<mozilla::dom::ServiceWorkerRegistration>
+  GetServiceWorkerRegistration(
+      const mozilla::dom::ServiceWorkerRegistrationDescriptor& aDescriptor)
+      const;
+
+  virtual RefPtr<mozilla::dom::ServiceWorkerRegistration>
+  GetOrCreateServiceWorkerRegistration(
+      const mozilla::dom::ServiceWorkerRegistrationDescriptor& aDescriptor);
+
+  virtual mozilla::StorageAccess GetStorageAccess();
+
+  virtual nsICookieJarSettings* GetCookieJarSettings();
+
+  virtual mozilla::OriginTrials Trials() const = 0;
+
+  nsPIDOMWindowInner* GetAsInnerWindow();
+  bool IsInnerWindow() const { return mIsInnerWindow; }
+
+  virtual void TriggerUpdateCCFlag() {}
+
+  void QueueMicrotask(mozilla::dom::VoidFunction& aCallback);
+
+  void RegisterReportingObserver(mozilla::dom::ReportingObserver* aObserver,
+                                 bool aBuffered);
+
+  void UnregisterReportingObserver(mozilla::dom::ReportingObserver* aObserver);
+
+  void BroadcastReport(mozilla::dom::Report* aReport);
+
+  MOZ_CAN_RUN_SCRIPT void NotifyReportingObservers();
+
+  void RemoveReportRecords();
+
+  already_AddRefed<mozilla::dom::Function>
+  GetCountQueuingStrategySizeFunction();
+  void SetCountQueuingStrategySizeFunction(mozilla::dom::Function* aFunction);
+
+  already_AddRefed<mozilla::dom::Function>
+  GetByteLengthQueuingStrategySizeFunction();
+  void SetByteLengthQueuingStrategySizeFunction(
+      mozilla::dom::Function* aFunction);
+
+  virtual bool ShouldResistFingerprinting(RFPTarget aTarget) const = 0;
+
+  bool ShouldResistFingerprinting(mozilla::dom::CallerType aCallerType,
+                                  RFPTarget aTarget) const;
+
+  RTPCallerType GetRTPCallerType() const;
+
+  virtual JS::loader::ModuleLoaderBase* GetModuleLoader(JSContext* aCx) {
+    return nullptr;
+  }
+
+  virtual mozilla::dom::FontFaceSet* GetFonts() { return nullptr; }
+
+  virtual mozilla::Result<mozilla::ipc::PrincipalInfo, nsresult>
+  GetStorageKey();
+  mozilla::Result<bool, nsresult> HasEqualStorageKey(
+      const mozilla::ipc::PrincipalInfo& aStorageKey);
+
+  virtual mozilla::dom::StorageManager* GetStorageManager() { return nullptr; }
+
+  virtual bool IsEligibleForMessaging() { return false; };
+  virtual bool IsBackgroundInternal() const { return false; }
+  virtual mozilla::dom::TimeoutManager* GetTimeoutManager() { return nullptr; }
+  virtual bool IsRunningTimeout() { return false; }
+  virtual bool IsPlayingAudio() { return false; }
+  virtual bool IsSuspended() const { return false; }
+  virtual bool IsFrozen() const { return false; }
+  MOZ_CAN_RUN_SCRIPT
+  virtual bool RunTimeoutHandler(mozilla::dom::Timeout* aTimeout) {
+    return false;
+  }
+  virtual bool HasActiveIndexedDBDatabases() const { return false; }
+  virtual bool HasOpenWebSockets() const { return false; }
+
+  virtual bool IsXPCSandbox() { return false; }
+
+  virtual bool HasScheduledNormalOrHighPriorityWebTasks() const {
+    return false;
+  }
+
+  virtual void UpdateWebSocketCount(int32_t aDelta) {};
+  virtual void UpdateActiveIndexedDBDatabaseCount(int32_t aDelta) {}
+
+  virtual void ReportToConsole(
+      uint32_t aErrorFlags, const nsCString& aCategory, PropertiesFile aFile,
+      const nsCString& aMessageName,
+      const nsTArray<nsString>& aParams = nsTArray<nsString>(),
+      const mozilla::SourceLocation& aLocation =
+          mozilla::JSCallingLocation::Get());
+
+ protected:
+  virtual ~nsIGlobalObject();
+
+  void StartDying() { mIsDying = true; }
+
+  void DisconnectGlobalTeardownObservers();
+  void DisconnectGlobalFreezeObservers();
+  void NotifyGlobalFrozen();
+  void NotifyGlobalThawed();
+
+  size_t ShallowSizeOfExcludingThis(mozilla::MallocSizeOf aSizeOf) const;
+
+ private:
+  void ClearReports();
+
+ private:
+  nsTArray<RefPtr<mozilla::dom::ReportingObserver>> mReportingObservers;
+  nsTArray<RefPtr<mozilla::dom::Report>> mReportBuffer;
+  nsTHashMap<nsString, uint32_t> mReportPerTypeCount;
+
+  RefPtr<mozilla::dom::Function> mCountQueuingStrategySizeFunction;
+
+  RefPtr<mozilla::dom::Function> mByteLengthQueuingStrategySizeFunction;
+};
+
+#endif  // nsIGlobalObject_h_

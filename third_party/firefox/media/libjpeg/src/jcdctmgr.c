@@ -1,0 +1,599 @@
+/*
+ * jcdctmgr.c
+ *
+ * This file was part of the Independent JPEG Group's software:
+ * Copyright (C) 1994-1996, Thomas G. Lane.
+ * libjpeg-turbo Modifications:
+ * Copyright (C) 1999-2006, MIYASAKA Masaru.
+ * Copyright 2009 Pierre Ossman <ossman@cendio.se> for Cendio AB
+ * Copyright (C) 2011, 2014-2015, 2022, 2024, 2026, D. R. Commander.
+ * For conditions of distribution and use, see the accompanying README.ijg
+ * file.
+ *
+ * This file contains the forward-DCT management logic.
+ * This code selects a particular DCT implementation to be used,
+ * and it performs related housekeeping chores including coefficient
+ * quantization.
+ */
+
+#define JPEG_INTERNALS
+#include "jinclude.h"
+#include "jpeglib.h"
+#include "jdct.h"               /* Private declarations for DCT subsystem */
+#include "jsimddct.h"
+
+
+#if defined(DCT_ISLOW_SUPPORTED) || defined(DCT_IFAST_SUPPORTED) || \
+    defined(DCT_FLOAT_SUPPORTED)
+
+
+typedef void (*forward_DCT_method_ptr) (DCTELEM *data);
+typedef void (*float_DCT_method_ptr) (FAST_FLOAT *data);
+
+typedef void (*convsamp_method_ptr) (_JSAMPARRAY sample_data,
+                                     JDIMENSION start_col,
+                                     DCTELEM *workspace);
+typedef void (*float_convsamp_method_ptr) (_JSAMPARRAY sample_data,
+                                           JDIMENSION start_col,
+                                           FAST_FLOAT *workspace);
+
+typedef void (*quantize_method_ptr) (JCOEFPTR coef_block, DCTELEM *divisors,
+                                     DCTELEM *workspace);
+typedef void (*float_quantize_method_ptr) (JCOEFPTR coef_block,
+                                           FAST_FLOAT *divisors,
+                                           FAST_FLOAT *workspace);
+
+METHODDEF(void) quantize(JCOEFPTR, DCTELEM *, DCTELEM *);
+
+typedef struct {
+  struct jpeg_forward_dct pub;  
+
+  forward_DCT_method_ptr dct;
+  convsamp_method_ptr convsamp;
+  quantize_method_ptr quantize;
+
+  DCTELEM *divisors[NUM_QUANT_TBLS];
+
+  DCTELEM *workspace;
+
+#ifdef DCT_FLOAT_SUPPORTED
+  float_DCT_method_ptr float_dct;
+  float_convsamp_method_ptr float_convsamp;
+  float_quantize_method_ptr float_quantize;
+  FAST_FLOAT *float_divisors[NUM_QUANT_TBLS];
+  FAST_FLOAT *float_workspace;
+#endif
+} my_fdct_controller;
+
+typedef my_fdct_controller *my_fdct_ptr;
+
+
+#if BITS_IN_JSAMPLE == 8
+
+
+LOCAL(int)
+flss(UINT16 val)
+{
+  int bit;
+
+  bit = 16;
+
+  if (!val)
+    return 0;
+
+  if (!(val & 0xff00)) {
+    bit -= 8;
+    val <<= 8;
+  }
+  if (!(val & 0xf000)) {
+    bit -= 4;
+    val <<= 4;
+  }
+  if (!(val & 0xc000)) {
+    bit -= 2;
+    val <<= 2;
+  }
+  if (!(val & 0x8000)) {
+    bit -= 1;
+    val <<= 1;
+  }
+
+  return bit;
+}
+
+
+
+LOCAL(int)
+compute_reciprocal(UINT16 divisor, DCTELEM *dtbl)
+{
+  UDCTELEM2 fq, fr;
+  UDCTELEM c;
+  int b, r;
+
+  if (divisor <= 1) {
+    dtbl[DCTSIZE2 * 0] = (DCTELEM)1;                        
+    dtbl[DCTSIZE2 * 1] = (DCTELEM)0;                        
+    dtbl[DCTSIZE2 * 2] = (DCTELEM)1;                        
+    dtbl[DCTSIZE2 * 3] = -(DCTELEM)(sizeof(DCTELEM) * 8);   
+    return 0;
+  }
+
+  b = flss(divisor) - 1;
+  r  = sizeof(DCTELEM) * 8 + b;
+
+  fq = ((UDCTELEM2)1 << r) / divisor;
+  fr = ((UDCTELEM2)1 << r) % divisor;
+
+  c = divisor / 2;                      
+
+  if (fr == 0) {                        
+    fq >>= 1;
+    r--;
+  } else if (fr <= (divisor / 2U)) {    
+    c++;
+  } else {                              
+    fq++;
+  }
+
+  dtbl[DCTSIZE2 * 0] = (DCTELEM)fq;     
+  dtbl[DCTSIZE2 * 1] = (DCTELEM)c;      
+#ifdef WITH_SIMD
+  dtbl[DCTSIZE2 * 2] = (DCTELEM)(1 << (sizeof(DCTELEM) * 8 * 2 - r)); 
+#else
+  dtbl[DCTSIZE2 * 2] = 1;
+#endif
+  dtbl[DCTSIZE2 * 3] = (DCTELEM)r - sizeof(DCTELEM) * 8; 
+
+  if (r <= 16) return 0;
+  else return 1;
+}
+
+#endif
+
+
+
+METHODDEF(void)
+start_pass_fdctmgr(j_compress_ptr cinfo)
+{
+  my_fdct_ptr fdct = (my_fdct_ptr)cinfo->fdct;
+  int ci, qtblno, i;
+  jpeg_component_info *compptr;
+  JQUANT_TBL *qtbl;
+  DCTELEM *dtbl;
+
+  for (ci = 0, compptr = cinfo->comp_info; ci < cinfo->num_components;
+       ci++, compptr++) {
+    qtblno = compptr->quant_tbl_no;
+    if (qtblno < 0 || qtblno >= NUM_QUANT_TBLS ||
+        cinfo->quant_tbl_ptrs[qtblno] == NULL)
+      ERREXIT1(cinfo, JERR_NO_QUANT_TABLE, qtblno);
+    qtbl = cinfo->quant_tbl_ptrs[qtblno];
+    switch (cinfo->dct_method) {
+#ifdef DCT_ISLOW_SUPPORTED
+    case JDCT_ISLOW:
+      if (fdct->divisors[qtblno] == NULL) {
+        fdct->divisors[qtblno] = (DCTELEM *)
+          (*cinfo->mem->alloc_small) ((j_common_ptr)cinfo, JPOOL_IMAGE,
+                                      (DCTSIZE2 * 4) * sizeof(DCTELEM));
+      }
+      dtbl = fdct->divisors[qtblno];
+      for (i = 0; i < DCTSIZE2; i++) {
+#if BITS_IN_JSAMPLE == 8
+#ifdef WITH_SIMD
+        if (!compute_reciprocal(qtbl->quantval[i] << 3, &dtbl[i]) &&
+            fdct->quantize == jsimd_quantize)
+          fdct->quantize = quantize;
+#else
+        compute_reciprocal(qtbl->quantval[i] << 3, &dtbl[i]);
+#endif
+#else
+        dtbl[i] = ((DCTELEM)qtbl->quantval[i]) << 3;
+#endif
+      }
+      break;
+#endif
+#ifdef DCT_IFAST_SUPPORTED
+    case JDCT_IFAST:
+      {
+#define CONST_BITS  14
+        static const INT16 aanscales[DCTSIZE2] = {
+          16384, 22725, 21407, 19266, 16384, 12873,  8867,  4520,
+          22725, 31521, 29692, 26722, 22725, 17855, 12299,  6270,
+          21407, 29692, 27969, 25172, 21407, 16819, 11585,  5906,
+          19266, 26722, 25172, 22654, 19266, 15137, 10426,  5315,
+          16384, 22725, 21407, 19266, 16384, 12873,  8867,  4520,
+          12873, 17855, 16819, 15137, 12873, 10114,  6967,  3552,
+           8867, 12299, 11585, 10426,  8867,  6967,  4799,  2446,
+           4520,  6270,  5906,  5315,  4520,  3552,  2446,  1247
+        };
+        SHIFT_TEMPS
+
+        if (fdct->divisors[qtblno] == NULL) {
+          fdct->divisors[qtblno] = (DCTELEM *)
+            (*cinfo->mem->alloc_small) ((j_common_ptr)cinfo, JPOOL_IMAGE,
+                                        (DCTSIZE2 * 4) * sizeof(DCTELEM));
+        }
+        dtbl = fdct->divisors[qtblno];
+        for (i = 0; i < DCTSIZE2; i++) {
+#if BITS_IN_JSAMPLE == 8
+#ifdef WITH_SIMD
+          if (!compute_reciprocal(
+                DESCALE(MULTIPLY16V16((JLONG)qtbl->quantval[i],
+                                      (JLONG)aanscales[i]),
+                        CONST_BITS - 3), &dtbl[i]) &&
+              fdct->quantize == jsimd_quantize)
+            fdct->quantize = quantize;
+#else
+          compute_reciprocal(
+            DESCALE(MULTIPLY16V16((JLONG)qtbl->quantval[i],
+                                  (JLONG)aanscales[i]),
+                    CONST_BITS-3), &dtbl[i]);
+#endif
+#else
+          dtbl[i] = (DCTELEM)
+            DESCALE(MULTIPLY16V16((JLONG)qtbl->quantval[i],
+                                  (JLONG)aanscales[i]),
+                    CONST_BITS - 3);
+#endif
+        }
+      }
+      break;
+#endif
+#ifdef DCT_FLOAT_SUPPORTED
+    case JDCT_FLOAT:
+      {
+        FAST_FLOAT *fdtbl;
+        int row, col;
+        static const double aanscalefactor[DCTSIZE] = {
+          1.0, 1.387039845, 1.306562965, 1.175875602,
+          1.0, 0.785694958, 0.541196100, 0.275899379
+        };
+
+        if (fdct->float_divisors[qtblno] == NULL) {
+          fdct->float_divisors[qtblno] = (FAST_FLOAT *)
+            (*cinfo->mem->alloc_small) ((j_common_ptr)cinfo, JPOOL_IMAGE,
+                                        DCTSIZE2 * sizeof(FAST_FLOAT));
+        }
+        fdtbl = fdct->float_divisors[qtblno];
+        i = 0;
+        for (row = 0; row < DCTSIZE; row++) {
+          for (col = 0; col < DCTSIZE; col++) {
+            fdtbl[i] = (FAST_FLOAT)
+              (1.0 / (((double)qtbl->quantval[i] *
+                       aanscalefactor[row] * aanscalefactor[col] * 8.0)));
+            i++;
+          }
+        }
+      }
+      break;
+#endif
+    default:
+      ERREXIT(cinfo, JERR_NOT_COMPILED);
+      break;
+    }
+  }
+}
+
+
+
+METHODDEF(void)
+convsamp(_JSAMPARRAY sample_data, JDIMENSION start_col, DCTELEM *workspace)
+{
+  register DCTELEM *workspaceptr;
+  register _JSAMPROW elemptr;
+  register int elemr;
+
+  workspaceptr = workspace;
+  for (elemr = 0; elemr < DCTSIZE; elemr++) {
+    elemptr = sample_data[elemr] + start_col;
+
+#if DCTSIZE == 8                /* unroll the inner loop */
+    *workspaceptr++ = (*elemptr++) - _CENTERJSAMPLE;
+    *workspaceptr++ = (*elemptr++) - _CENTERJSAMPLE;
+    *workspaceptr++ = (*elemptr++) - _CENTERJSAMPLE;
+    *workspaceptr++ = (*elemptr++) - _CENTERJSAMPLE;
+    *workspaceptr++ = (*elemptr++) - _CENTERJSAMPLE;
+    *workspaceptr++ = (*elemptr++) - _CENTERJSAMPLE;
+    *workspaceptr++ = (*elemptr++) - _CENTERJSAMPLE;
+    *workspaceptr++ = (*elemptr++) - _CENTERJSAMPLE;
+#else
+    {
+      register int elemc;
+      for (elemc = DCTSIZE; elemc > 0; elemc--)
+        *workspaceptr++ = (*elemptr++) - _CENTERJSAMPLE;
+    }
+#endif
+  }
+}
+
+
+
+METHODDEF(void)
+quantize(JCOEFPTR coef_block, DCTELEM *divisors, DCTELEM *workspace)
+{
+  int i;
+  DCTELEM temp;
+  JCOEFPTR output_ptr = coef_block;
+
+#if BITS_IN_JSAMPLE == 8
+
+  UDCTELEM recip, corr;
+  int shift;
+  UDCTELEM2 product;
+
+  for (i = 0; i < DCTSIZE2; i++) {
+    temp = workspace[i];
+    recip = divisors[i + DCTSIZE2 * 0];
+    corr =  divisors[i + DCTSIZE2 * 1];
+    shift = divisors[i + DCTSIZE2 * 3];
+
+    if (temp < 0) {
+      temp = -temp;
+      product = (UDCTELEM2)(temp + corr) * recip;
+      product >>= shift + sizeof(DCTELEM) * 8;
+      temp = (DCTELEM)product;
+      temp = -temp;
+    } else {
+      product = (UDCTELEM2)(temp + corr) * recip;
+      product >>= shift + sizeof(DCTELEM) * 8;
+      temp = (DCTELEM)product;
+    }
+    output_ptr[i] = (JCOEF)temp;
+  }
+
+#else
+
+  register DCTELEM qval;
+
+  for (i = 0; i < DCTSIZE2; i++) {
+    qval = divisors[i];
+    temp = workspace[i];
+#ifdef FAST_DIVIDE
+#define DIVIDE_BY(a, b)  a /= b
+#else
+#define DIVIDE_BY(a, b)  if (a >= b) a /= b;  else a = 0
+#endif
+    if (temp < 0) {
+      temp = -temp;
+      temp += qval >> 1;        
+      DIVIDE_BY(temp, qval);
+      temp = -temp;
+    } else {
+      temp += qval >> 1;        
+      DIVIDE_BY(temp, qval);
+    }
+    output_ptr[i] = (JCOEF)temp;
+  }
+
+#endif
+
+}
+
+
+
+METHODDEF(void)
+forward_DCT(j_compress_ptr cinfo, jpeg_component_info *compptr,
+            _JSAMPARRAY sample_data, JBLOCKROW coef_blocks,
+            JDIMENSION start_row, JDIMENSION start_col, JDIMENSION num_blocks)
+{
+  my_fdct_ptr fdct = (my_fdct_ptr)cinfo->fdct;
+  DCTELEM *divisors = fdct->divisors[compptr->quant_tbl_no];
+  DCTELEM *workspace;
+  JDIMENSION bi;
+
+  forward_DCT_method_ptr do_dct = fdct->dct;
+  convsamp_method_ptr do_convsamp = fdct->convsamp;
+  quantize_method_ptr do_quantize = fdct->quantize;
+  workspace = fdct->workspace;
+
+  sample_data += start_row;     
+
+  for (bi = 0; bi < num_blocks; bi++, start_col += DCTSIZE) {
+    (*do_convsamp) (sample_data, start_col, workspace);
+
+    (*do_dct) (workspace);
+
+    (*do_quantize) (coef_blocks[bi], divisors, workspace);
+  }
+}
+
+
+#ifdef DCT_FLOAT_SUPPORTED
+
+METHODDEF(void)
+convsamp_float(_JSAMPARRAY sample_data, JDIMENSION start_col,
+               FAST_FLOAT *workspace)
+{
+  register FAST_FLOAT *workspaceptr;
+  register _JSAMPROW elemptr;
+  register int elemr;
+
+  workspaceptr = workspace;
+  for (elemr = 0; elemr < DCTSIZE; elemr++) {
+    elemptr = sample_data[elemr] + start_col;
+#if DCTSIZE == 8                /* unroll the inner loop */
+    *workspaceptr++ = (FAST_FLOAT)((*elemptr++) - _CENTERJSAMPLE);
+    *workspaceptr++ = (FAST_FLOAT)((*elemptr++) - _CENTERJSAMPLE);
+    *workspaceptr++ = (FAST_FLOAT)((*elemptr++) - _CENTERJSAMPLE);
+    *workspaceptr++ = (FAST_FLOAT)((*elemptr++) - _CENTERJSAMPLE);
+    *workspaceptr++ = (FAST_FLOAT)((*elemptr++) - _CENTERJSAMPLE);
+    *workspaceptr++ = (FAST_FLOAT)((*elemptr++) - _CENTERJSAMPLE);
+    *workspaceptr++ = (FAST_FLOAT)((*elemptr++) - _CENTERJSAMPLE);
+    *workspaceptr++ = (FAST_FLOAT)((*elemptr++) - _CENTERJSAMPLE);
+#else
+    {
+      register int elemc;
+      for (elemc = DCTSIZE; elemc > 0; elemc--)
+        *workspaceptr++ = (FAST_FLOAT)((*elemptr++) - _CENTERJSAMPLE);
+    }
+#endif
+  }
+}
+
+
+METHODDEF(void)
+quantize_float(JCOEFPTR coef_block, FAST_FLOAT *divisors,
+               FAST_FLOAT *workspace)
+{
+  register FAST_FLOAT temp;
+  register int i;
+  register JCOEFPTR output_ptr = coef_block;
+
+  for (i = 0; i < DCTSIZE2; i++) {
+    temp = workspace[i] * divisors[i];
+
+    output_ptr[i] = (JCOEF)((int)(temp + (FAST_FLOAT)16384.5) - 16384);
+  }
+}
+
+
+METHODDEF(void)
+forward_DCT_float(j_compress_ptr cinfo, jpeg_component_info *compptr,
+                  _JSAMPARRAY sample_data, JBLOCKROW coef_blocks,
+                  JDIMENSION start_row, JDIMENSION start_col,
+                  JDIMENSION num_blocks)
+{
+  my_fdct_ptr fdct = (my_fdct_ptr)cinfo->fdct;
+  FAST_FLOAT *divisors = fdct->float_divisors[compptr->quant_tbl_no];
+  FAST_FLOAT *workspace;
+  JDIMENSION bi;
+
+
+  float_DCT_method_ptr do_dct = fdct->float_dct;
+  float_convsamp_method_ptr do_convsamp = fdct->float_convsamp;
+  float_quantize_method_ptr do_quantize = fdct->float_quantize;
+  workspace = fdct->float_workspace;
+
+  sample_data += start_row;     
+
+  for (bi = 0; bi < num_blocks; bi++, start_col += DCTSIZE) {
+    (*do_convsamp) (sample_data, start_col, workspace);
+
+    (*do_dct) (workspace);
+
+    (*do_quantize) (coef_blocks[bi], divisors, workspace);
+  }
+}
+
+#endif /* DCT_FLOAT_SUPPORTED */
+
+
+
+GLOBAL(void)
+_jinit_forward_dct(j_compress_ptr cinfo)
+{
+  my_fdct_ptr fdct;
+  int i;
+
+  if (cinfo->data_precision != BITS_IN_JSAMPLE)
+    ERREXIT1(cinfo, JERR_BAD_PRECISION, cinfo->data_precision);
+
+  fdct = (my_fdct_ptr)
+    (*cinfo->mem->alloc_small) ((j_common_ptr)cinfo, JPOOL_IMAGE,
+                                sizeof(my_fdct_controller));
+  cinfo->fdct = (struct jpeg_forward_dct *)fdct;
+  fdct->pub.start_pass = start_pass_fdctmgr;
+
+  switch (cinfo->dct_method) {
+#ifdef DCT_ISLOW_SUPPORTED
+  case JDCT_ISLOW:
+    fdct->pub._forward_DCT = forward_DCT;
+#ifdef WITH_SIMD
+    if (jsimd_can_fdct_islow())
+      fdct->dct = jsimd_fdct_islow;
+    else
+#endif
+      fdct->dct = _jpeg_fdct_islow;
+    break;
+#endif
+#ifdef DCT_IFAST_SUPPORTED
+  case JDCT_IFAST:
+    fdct->pub._forward_DCT = forward_DCT;
+#ifdef WITH_SIMD
+    if (jsimd_can_fdct_ifast())
+      fdct->dct = jsimd_fdct_ifast;
+    else
+#endif
+      fdct->dct = _jpeg_fdct_ifast;
+    break;
+#endif
+#ifdef DCT_FLOAT_SUPPORTED
+  case JDCT_FLOAT:
+    fdct->pub._forward_DCT = forward_DCT_float;
+#ifdef WITH_SIMD
+    if (jsimd_can_fdct_float())
+      fdct->float_dct = jsimd_fdct_float;
+    else
+#endif
+      fdct->float_dct = jpeg_fdct_float;
+    break;
+#endif
+  default:
+    ERREXIT(cinfo, JERR_NOT_COMPILED);
+    break;
+  }
+
+  switch (cinfo->dct_method) {
+#ifdef DCT_ISLOW_SUPPORTED
+  case JDCT_ISLOW:
+#endif
+#ifdef DCT_IFAST_SUPPORTED
+  case JDCT_IFAST:
+#endif
+#if defined(DCT_ISLOW_SUPPORTED) || defined(DCT_IFAST_SUPPORTED)
+#ifdef WITH_SIMD
+    if (jsimd_can_convsamp())
+      fdct->convsamp = jsimd_convsamp;
+    else
+#endif
+      fdct->convsamp = convsamp;
+#ifdef WITH_SIMD
+    if (jsimd_can_quantize())
+      fdct->quantize = jsimd_quantize;
+    else
+#endif
+      fdct->quantize = quantize;
+    break;
+#endif
+#ifdef DCT_FLOAT_SUPPORTED
+  case JDCT_FLOAT:
+#ifdef WITH_SIMD
+    if (jsimd_can_convsamp_float())
+      fdct->float_convsamp = jsimd_convsamp_float;
+    else
+#endif
+      fdct->float_convsamp = convsamp_float;
+#ifdef WITH_SIMD
+    if (jsimd_can_quantize_float())
+      fdct->float_quantize = jsimd_quantize_float;
+    else
+#endif
+      fdct->float_quantize = quantize_float;
+    break;
+#endif
+  default:
+    ERREXIT(cinfo, JERR_NOT_COMPILED);
+    break;
+  }
+
+#ifdef DCT_FLOAT_SUPPORTED
+  if (cinfo->dct_method == JDCT_FLOAT)
+    fdct->float_workspace = (FAST_FLOAT *)
+      (*cinfo->mem->alloc_small) ((j_common_ptr)cinfo, JPOOL_IMAGE,
+                                  sizeof(FAST_FLOAT) * DCTSIZE2);
+  else
+#endif
+    fdct->workspace = (DCTELEM *)
+      (*cinfo->mem->alloc_small) ((j_common_ptr)cinfo, JPOOL_IMAGE,
+                                  sizeof(DCTELEM) * DCTSIZE2);
+
+  for (i = 0; i < NUM_QUANT_TBLS; i++) {
+    fdct->divisors[i] = NULL;
+#ifdef DCT_FLOAT_SUPPORTED
+    fdct->float_divisors[i] = NULL;
+#endif
+  }
+}
+
+#endif /* defined(DCT_ISLOW_SUPPORTED) || defined(DCT_IFAST_SUPPORTED) ||
+          defined(DCT_FLOAT_SUPPORTED) */

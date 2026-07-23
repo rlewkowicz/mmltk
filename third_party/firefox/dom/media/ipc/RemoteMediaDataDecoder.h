@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef include_dom_media_ipc_RemoteMediaDataDecoder_h
+#define include_dom_media_ipc_RemoteMediaDataDecoder_h
+#include "MediaData.h"
+#include "PlatformDecoderModule.h"
+#include "mozilla/EnumeratedArray.h"
+
+namespace mozilla {
+
+class RemoteDecoderChild;
+class RemoteDecoderManagerChild;
+class RemoteMediaDataDecoder;
+
+DDLoggedTypeCustomNameAndBase(RemoteMediaDataDecoder, RemoteMediaDataDecoder,
+                              MediaDataDecoder);
+
+class RemoteMediaDataDecoder final
+    : public MediaDataDecoder,
+      public DecoderDoctorLifeLogger<RemoteMediaDataDecoder> {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(RemoteMediaDataDecoder, final);
+
+  explicit RemoteMediaDataDecoder(RemoteDecoderChild* aChild);
+
+  RefPtr<InitPromise> Init() override;
+  RefPtr<DecodePromise> Decode(MediaRawData* aSample) override;
+  bool CanDecodeBatch() const override { return true; }
+  RefPtr<DecodePromise> DecodeBatch(
+      nsTArray<RefPtr<MediaRawData>>&& aSamples) override;
+  RefPtr<DecodePromise> Drain() override;
+  RefPtr<FlushPromise> Flush() override;
+  RefPtr<ShutdownPromise> Shutdown() override;
+  bool IsHardwareAccelerated(nsACString& aFailureReason) const override;
+  void SetSeekThreshold(const media::TimeUnit& aTime) override;
+  nsCString GetDescriptionName() const override;
+  nsCString GetProcessName() const override;
+  nsCString GetCodecName() const override;
+  ConversionRequired NeedsConversion() const override;
+  Maybe<PropertyValue> GetDecodeProperty(PropertyName aName) const override;
+  bool ShouldDecoderAlwaysBeRecycled() const override;
+
+ private:
+  ~RemoteMediaDataDecoder();
+
+  RefPtr<RemoteDecoderChild> mChild;
+
+  mutable Mutex mMutex{"RemoteMediaDataDecoder"};
+
+  nsCString mDescription MOZ_GUARDED_BY(mMutex);
+  nsCString mProcessName MOZ_GUARDED_BY(mMutex);
+  nsCString mCodecName MOZ_GUARDED_BY(mMutex);
+  bool mIsHardwareAccelerated MOZ_GUARDED_BY(mMutex);
+  nsCString mHardwareAcceleratedReason MOZ_GUARDED_BY(mMutex);
+  ConversionRequired mConversion MOZ_GUARDED_BY(mMutex);
+  bool mShouldDecoderAlwaysBeRecycled MOZ_GUARDED_BY(mMutex);
+  EnumeratedArray<PropertyName, Maybe<PropertyValue>, sPropertyNameCount>
+      mDecodeProperties MOZ_GUARDED_BY(mMutex);
+};
+
+}  
+
+#endif  // include_dom_media_ipc_RemoteMediaDataDecoder_h

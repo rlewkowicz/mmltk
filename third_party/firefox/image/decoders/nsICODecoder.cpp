@@ -1,0 +1,660 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsICODecoder.h"
+
+#include <utility>
+
+#include "RasterImage.h"
+#include "mozilla/EndianUtils.h"
+#include "mozilla/UniquePtrExtensions.h"
+#include "mozilla/gfx/Swizzle.h"
+
+using namespace mozilla::gfx;
+
+namespace mozilla {
+namespace image {
+
+static const uint32_t ICOHEADERSIZE = 6;
+static const uint32_t BITMAPINFOSIZE = bmp::InfoHeaderLength::WIN_ICO;
+
+
+uint16_t nsICODecoder::GetNumColors() {
+  uint16_t numColors = 0;
+  if (mBPP <= 8) {
+    switch (mBPP) {
+      case 1:
+        numColors = 2;
+        break;
+      case 4:
+        numColors = 16;
+        break;
+      case 8:
+        numColors = 256;
+        break;
+      default:
+        numColors = (uint16_t)-1;
+    }
+  }
+  return numColors;
+}
+
+nsICODecoder::nsICODecoder(RasterImage* aImage)
+    : Decoder(aImage),
+      mLexer(Transition::To(ICOState::HEADER, ICOHEADERSIZE),
+             Transition::TerminateSuccess()),
+      mDirEntry(nullptr),
+      mNumIcons(0),
+      mCurrIcon(0),
+      mBPP(0),
+      mMaskRowSize(0),
+      mCurrMaskLine(0),
+      mIsCursor(false),
+      mHasMaskAlpha(false) {}
+
+nsresult nsICODecoder::FinishInternal() {
+  MOZ_ASSERT(!HasError(), "Shouldn't call FinishInternal after error!");
+
+  return GetFinalStateFromContainedDecoder();
+}
+
+nsresult nsICODecoder::FinishWithErrorInternal() {
+  return GetFinalStateFromContainedDecoder();
+}
+
+nsresult nsICODecoder::GetFinalStateFromContainedDecoder() {
+  if (!mContainedDecoder) {
+    return NS_OK;
+  }
+
+  FlushContainedDecoder();
+
+  mDecodeDone = mContainedDecoder->GetDecodeDone();
+  mProgress |= mContainedDecoder->TakeProgress();
+  mInvalidRect.UnionRect(mInvalidRect, mContainedDecoder->TakeInvalidRect());
+  mCurrentFrame = mContainedDecoder->GetCurrentFrameRef();
+
+  MOZ_ASSERT(!mContainedDecoder->GetFinalizeFrames());
+  if (mCurrentFrame) {
+    mCurrentFrame->FinalizeSurface();
+  }
+
+  nsresult rv =
+      HasError() || mContainedDecoder->HasError() ? NS_ERROR_FAILURE : NS_OK;
+
+  MOZ_ASSERT(NS_FAILED(rv) || !mCurrentFrame || mCurrentFrame->IsFinished());
+  return rv;
+}
+
+LexerTransition<ICOState> nsICODecoder::ReadHeader(const char* aData) {
+  if ((aData[2] != 1) && (aData[2] != 2)) {
+    return Transition::TerminateFailure();
+  }
+  mIsCursor = (aData[2] == 2);
+
+  mNumIcons = LittleEndian::readUint16(aData + 4);
+  if (mNumIcons == 0) {
+    return Transition::TerminateSuccess();  
+  }
+
+  PostHasTransparency();
+
+  return Transition::To(ICOState::DIR_ENTRY, ICODIRENTRYSIZE);
+}
+
+size_t nsICODecoder::FirstResourceOffset() const {
+  MOZ_ASSERT(mNumIcons > 0,
+             "Calling FirstResourceOffset before processing header");
+
+  return ICOHEADERSIZE + static_cast<size_t>(mNumIcons) * ICODIRENTRYSIZE;
+}
+
+LexerTransition<ICOState> nsICODecoder::ReadDirEntry(const char* aData) {
+  mCurrIcon++;
+
+  uint32_t offset = LittleEndian::readUint32(aData + 12);
+  if (offset >= FirstResourceOffset()) {
+    IconDirEntryEx e;
+    e.mWidth = aData[0];
+    e.mHeight = aData[1];
+    e.mColorCount = aData[2];
+    e.mReserved = aData[3];
+    e.mPlanes = LittleEndian::readUint16(aData + 4);
+    e.mBitCount = LittleEndian::readUint16(aData + 6);
+    e.mBytesInRes = LittleEndian::readUint32(aData + 8);
+    e.mImageOffset = offset;
+    e.mSize = OrientedIntSize(e.mWidth, e.mHeight);
+
+    if (e.mBytesInRes > BITMAPINFOSIZE) {
+      mDirEntries.AppendElement(e);
+    }
+  }
+
+  if (mCurrIcon == mNumIcons) {
+    bool needsVerification = false;
+    for (size_t i = 0; !needsVerification && i < mDirEntries.Length(); ++i) {
+      if (mDirEntries[i].mSize.width == 0 || mDirEntries[i].mSize.height == 0) {
+        needsVerification = true;
+        break;
+      }
+      for (size_t j = i + 1; j < mDirEntries.Length(); ++j) {
+        if (mDirEntries[i].mSize == mDirEntries[j].mSize) {
+          needsVerification = true;
+          break;
+        }
+      }
+    }
+
+    if (!needsVerification) {
+      return Transition::To(ICOState::FINISHED_DIR_ENTRY, 0);
+    }
+
+    MOZ_ASSERT(mUnsizedDirEntries.IsEmpty());
+    mUnsizedDirEntries.SwapElements(mDirEntries);
+    return Transition::To(ICOState::ITERATE_UNSIZED_DIR_ENTRY, 0);
+  }
+
+  return Transition::To(ICOState::DIR_ENTRY, ICODIRENTRYSIZE);
+}
+
+LexerTransition<ICOState> nsICODecoder::IterateUnsizedDirEntry() {
+  MOZ_ASSERT(!mUnsizedDirEntries.IsEmpty());
+
+  if (!mDirEntry) {
+    mReturnIterator = mLexer.Clone(*mIterator, SIZE_MAX);
+    if (mReturnIterator.isNothing()) {
+      return Transition::TerminateFailure();
+    }
+  } else {
+    if (mDirEntry->mSize.width > 0 && mDirEntry->mSize.height > 0) {
+      mDirEntries.AppendElement(*mDirEntry);
+    }
+
+    mDirEntry = nullptr;
+    mUnsizedDirEntries.RemoveElementAt(0);
+
+    mIterator = mLexer.Clone(*mReturnIterator, SIZE_MAX);
+    if (mIterator.isNothing()) {
+      MOZ_ASSERT_UNREACHABLE("Cannot re-clone return iterator");
+      return Transition::TerminateFailure();
+    }
+  }
+
+  if (mUnsizedDirEntries.IsEmpty()) {
+    mReturnIterator.reset();
+    mContainedDecoder = nullptr;
+    return Transition::To(ICOState::FINISHED_DIR_ENTRY, 0);
+  }
+
+  mDirEntry = &mUnsizedDirEntries[0];
+  MOZ_ASSERT(static_cast<size_t>(mDirEntry->mImageOffset) >=
+             FirstResourceOffset());
+  size_t offsetToResource =
+      static_cast<size_t>(mDirEntry->mImageOffset) - FirstResourceOffset();
+  return Transition::ToUnbuffered(ICOState::FOUND_RESOURCE,
+                                  ICOState::SKIP_TO_RESOURCE, offsetToResource);
+}
+
+LexerTransition<ICOState> nsICODecoder::FinishDirEntry() {
+  MOZ_ASSERT(!mDirEntry);
+
+  if (mDirEntries.IsEmpty()) {
+    return Transition::TerminateFailure();
+  }
+
+  const Maybe<OrientedIntSize> desiredSize = ExplicitOutputSize();
+
+  int32_t bestDelta = INT32_MIN;
+  IconDirEntryEx* biggestEntry = nullptr;
+
+  for (size_t i = 0; i < mDirEntries.Length(); ++i) {
+    IconDirEntryEx& e = mDirEntries[i];
+    mImageMetadata.AddNativeSize(e.mSize);
+
+    if (!biggestEntry ||
+        (e.mBitCount >= biggestEntry->mBitCount &&
+         e.mSize.width * e.mSize.height >=
+             biggestEntry->mSize.width * biggestEntry->mSize.height)) {
+      biggestEntry = &e;
+
+      if (!desiredSize) {
+        mDirEntry = &e;
+      }
+    }
+
+    if (desiredSize) {
+      int32_t delta = std::min(e.mSize.width - desiredSize->width,
+                               e.mSize.height - desiredSize->height);
+      if (!mDirEntry || (e.mBitCount >= mDirEntry->mBitCount &&
+                         ((bestDelta < 0 && delta >= bestDelta) ||
+                          (delta >= 0 && delta <= bestDelta)))) {
+        mDirEntry = &e;
+        bestDelta = delta;
+      }
+    }
+  }
+
+  MOZ_ASSERT(mDirEntry);
+  MOZ_ASSERT(biggestEntry);
+
+  if (mIsCursor) {
+    mImageMetadata.SetHotspot(biggestEntry->mXHotspot, biggestEntry->mYHotspot);
+  }
+
+  PostSize(biggestEntry->mSize.width, biggestEntry->mSize.height);
+  if (WantsFrameCount()) {
+    PostFrameCount( 1);
+  }
+  if (HasError()) {
+    return Transition::TerminateFailure();
+  }
+
+  if (IsMetadataDecode()) {
+    return Transition::TerminateSuccess();
+  }
+
+  if (mDirEntry->mSize == OutputSize()) {
+    MOZ_ASSERT_IF(desiredSize, mDirEntry->mSize == *desiredSize);
+    MOZ_ASSERT_IF(!desiredSize, mDirEntry->mSize == Size());
+  } else if (OutputSize().width < mDirEntry->mSize.width ||
+             OutputSize().height < mDirEntry->mSize.height) {
+    mDownscaler.emplace(OutputSize().ToUnknownSize());
+  }
+
+  MOZ_ASSERT(static_cast<size_t>(mDirEntry->mImageOffset) >=
+             FirstResourceOffset());
+  size_t offsetToResource = mDirEntry->mImageOffset - FirstResourceOffset();
+  return Transition::ToUnbuffered(ICOState::FOUND_RESOURCE,
+                                  ICOState::SKIP_TO_RESOURCE, offsetToResource);
+}
+
+LexerTransition<ICOState> nsICODecoder::SniffResource(const char* aData) {
+  MOZ_ASSERT(mDirEntry);
+
+
+  bool isPNG =
+      !memcmp(aData, nsPNGDecoder::pngSignatureBytes, PNGSIGNATURESIZE);
+  if (isPNG) {
+    if (mDirEntry->mBytesInRes <= BITMAPINFOSIZE) {
+      if (!IsVerifyingResourceSizes()) {
+        return Transition::TerminateFailure();
+      }
+      mDirEntry->mSize = OrientedIntSize(0, 0);
+      return Transition::To(ICOState::ITERATE_UNSIZED_DIR_ENTRY, 0);
+    }
+
+    Maybe<SourceBufferIterator> containedIterator =
+        mLexer.Clone(*mIterator, mDirEntry->mBytesInRes);
+    if (containedIterator.isNothing()) {
+      if (!IsVerifyingResourceSizes()) {
+        return Transition::TerminateFailure();
+      }
+      mDirEntry->mSize = OrientedIntSize(0, 0);
+      return Transition::To(ICOState::ITERATE_UNSIZED_DIR_ENTRY, 0);
+    }
+
+    bool metadataDecode = mReturnIterator.isSome();
+    Maybe<OrientedIntSize> expectedSize =
+        metadataDecode ? Nothing() : Some(mDirEntry->mSize);
+    mContainedDecoder = DecoderFactory::CreateDecoderForICOResource(
+        DecoderType::PNG, std::move(containedIterator.ref()), WrapNotNull(this),
+        metadataDecode, expectedSize);
+
+    size_t toRead = mDirEntry->mBytesInRes - BITMAPINFOSIZE;
+    return Transition::ToUnbuffered(ICOState::FINISHED_RESOURCE,
+                                    ICOState::READ_RESOURCE, toRead);
+  }
+
+  int32_t bihSize = LittleEndian::readUint32(aData);
+  if (bihSize != static_cast<int32_t>(BITMAPINFOSIZE)) {
+    if (!IsVerifyingResourceSizes()) {
+      return Transition::TerminateFailure();
+    }
+    mDirEntry->mSize = OrientedIntSize(0, 0);
+    return Transition::To(ICOState::ITERATE_UNSIZED_DIR_ENTRY, 0);
+  }
+
+  return ReadBIH(aData);
+}
+
+LexerTransition<ICOState> nsICODecoder::ReadResource() {
+  if (!FlushContainedDecoder()) {
+    if (!IsVerifyingResourceSizes()) {
+      return Transition::TerminateFailure();
+    }
+  }
+
+  return Transition::ContinueUnbuffered(ICOState::READ_RESOURCE);
+}
+
+LexerTransition<ICOState> nsICODecoder::ReadBIH(const char* aData) {
+  MOZ_ASSERT(mDirEntry);
+
+  mBPP = LittleEndian::readUint16(aData + 14);
+
+  uint16_t numColors = GetNumColors();
+  if (numColors == uint16_t(-1)) {
+    if (!IsVerifyingResourceSizes()) {
+      return Transition::TerminateFailure();
+    }
+    mDirEntry->mSize = OrientedIntSize(0, 0);
+    return Transition::To(ICOState::ITERATE_UNSIZED_DIR_ENTRY, 0);
+  }
+
+  MOZ_ASSERT_IF(mBPP > 8, numColors == 0);
+
+  uint32_t dataOffset =
+      bmp::FILE_HEADER_LENGTH + BITMAPINFOSIZE + 4 * numColors;
+
+  Maybe<SourceBufferIterator> containedIterator =
+      mLexer.Clone(*mIterator, mDirEntry->mBytesInRes);
+  if (containedIterator.isNothing()) {
+    if (!IsVerifyingResourceSizes()) {
+      return Transition::TerminateFailure();
+    }
+    mDirEntry->mSize = OrientedIntSize(0, 0);
+    return Transition::To(ICOState::ITERATE_UNSIZED_DIR_ENTRY, 0);
+  }
+
+  bool metadataDecode = mReturnIterator.isSome();
+  Maybe<OrientedIntSize> expectedSize =
+      metadataDecode ? Nothing() : Some(mDirEntry->mSize);
+  mContainedDecoder = DecoderFactory::CreateDecoderForICOResource(
+      DecoderType::BMP, std::move(containedIterator.ref()), WrapNotNull(this),
+      metadataDecode, expectedSize, Some(dataOffset));
+
+  RefPtr<nsBMPDecoder> bmpDecoder =
+      static_cast<nsBMPDecoder*>(mContainedDecoder.get());
+
+  if (!FlushContainedDecoder()) {
+    if (!IsVerifyingResourceSizes()) {
+      return Transition::TerminateFailure();
+    }
+    mDirEntry->mSize = OrientedIntSize(0, 0);
+    return Transition::To(ICOState::ITERATE_UNSIZED_DIR_ENTRY, 0);
+  }
+
+  if (mContainedDecoder->IsMetadataDecode()) {
+    return Transition::To(ICOState::FINISHED_RESOURCE, 0);
+  }
+
+  auto bmpDataLength =
+      CheckedInt<uint32_t>(bmpDecoder->GetCompressedImageSize()) +
+      4 * numColors;
+  auto fullBmpLength = bmpDataLength + BITMAPINFOSIZE;
+  if (!bmpDataLength.isValid() || !fullBmpLength.isValid() ||
+      fullBmpLength.value() > mDirEntry->mBytesInRes) {
+    return Transition::TerminateFailure();
+  }
+  bool hasANDMask = fullBmpLength.value() < mDirEntry->mBytesInRes;
+  ICOState afterBMPState =
+      hasANDMask ? ICOState::PREPARE_FOR_MASK : ICOState::FINISHED_RESOURCE;
+
+  return Transition::ToUnbuffered(afterBMPState, ICOState::READ_RESOURCE,
+                                  bmpDataLength.value());
+}
+
+LexerTransition<ICOState> nsICODecoder::PrepareForMask() {
+  MOZ_ASSERT(mDirEntry);
+
+  if (!FlushContainedDecoder()) {
+    return Transition::TerminateFailure();
+  }
+
+  if (!mContainedDecoder->GetDecodeDone()) {
+    return Transition::TerminateFailure();
+  }
+
+  RefPtr<nsBMPDecoder> bmpDecoder =
+      static_cast<nsBMPDecoder*>(mContainedDecoder.get());
+
+  if (!bmpDecoder->GetImageData() || bmpDecoder->GetImageDataLength() == 0) {
+    return Transition::TerminateFailure();
+  }
+  if (mDownscaler) {
+    if (mDownscaler->TargetSize().width < 0 ||
+        mDownscaler->TargetSize().height < 0 ||
+        bmpDecoder->GetImageDataLength() !=
+            static_cast<size_t>(mDownscaler->TargetSize().width *
+                                mDownscaler->TargetSize().height * 4)) {
+      return Transition::TerminateFailure();
+    }
+  } else {
+    if (mDirEntry->mSize.width < 0 || mDirEntry->mSize.height < 0 ||
+        bmpDecoder->GetImageDataLength() !=
+            static_cast<size_t>(mDirEntry->mSize.width *
+                                mDirEntry->mSize.height * 4)) {
+      return Transition::TerminateFailure();
+    }
+  }
+
+  uint16_t numColors = GetNumColors();
+  MOZ_ASSERT(numColors != uint16_t(-1));
+
+  uint32_t bmpLengthWithHeader =
+      BITMAPINFOSIZE + bmpDecoder->GetCompressedImageSize() + 4 * numColors;
+  MOZ_ASSERT(bmpLengthWithHeader < mDirEntry->mBytesInRes);
+  uint32_t maskLength = mDirEntry->mBytesInRes - bmpLengthWithHeader;
+
+  if (bmpDecoder->HasTransparency()) {
+    return Transition::ToUnbuffered(ICOState::FINISHED_RESOURCE,
+                                    ICOState::SKIP_MASK, maskLength);
+  }
+
+  mMaskRowSize = ((mDirEntry->mSize.width + 31) / 32) * 4;  
+
+  uint32_t expectedLength = mMaskRowSize * mDirEntry->mSize.height;
+  if (maskLength < expectedLength) {
+    return Transition::TerminateFailure();
+  }
+
+  if (mDownscaler) {
+    mMaskBuffer =
+        MakeUniqueFallible<uint8_t[]>(bmpDecoder->GetImageDataLength());
+    if (NS_WARN_IF(!mMaskBuffer)) {
+      return Transition::TerminateFailure();
+    }
+    nsresult rv = mDownscaler->BeginFrame(
+        mDirEntry->mSize.ToUnknownSize(), Nothing(), mMaskBuffer.get(),
+         gfx::SurfaceFormat::B8G8R8A8,
+         true);
+    if (NS_FAILED(rv)) {
+      return Transition::TerminateFailure();
+    }
+  }
+
+  mCurrMaskLine = mDirEntry->mSize.height;
+  return Transition::To(ICOState::READ_MASK_ROW, mMaskRowSize);
+}
+
+LexerTransition<ICOState> nsICODecoder::ReadMaskRow(const char* aData) {
+  MOZ_ASSERT(mDirEntry);
+
+  mCurrMaskLine--;
+
+  uint8_t sawTransparency = 0;
+
+  const uint8_t* mask = reinterpret_cast<const uint8_t*>(aData);
+  const uint8_t* maskRowEnd = mask + mMaskRowSize;
+
+  uint32_t* decoded = nullptr;
+  if (mDownscaler) {
+    memset(mDownscaler->RowBuffer(), 0xFF,
+           mDirEntry->mSize.width * sizeof(uint32_t));
+
+    decoded = reinterpret_cast<uint32_t*>(mDownscaler->RowBuffer());
+  } else {
+    RefPtr<nsBMPDecoder> bmpDecoder =
+        static_cast<nsBMPDecoder*>(mContainedDecoder.get());
+    uint32_t* imageData = bmpDecoder->GetImageData();
+    if (!imageData) {
+      return Transition::TerminateFailure();
+    }
+
+    decoded = imageData + mCurrMaskLine * mDirEntry->mSize.width;
+  }
+
+  MOZ_ASSERT(decoded);
+  uint32_t* decodedRowEnd = decoded + mDirEntry->mSize.width;
+
+  while (mask < maskRowEnd) {
+    uint8_t idx = *mask++;
+    sawTransparency |= idx;
+    for (uint8_t bit = 0x80; bit && decoded < decodedRowEnd; bit >>= 1) {
+      if (idx & bit) {
+        *decoded = 0;
+      }
+      decoded++;
+    }
+  }
+
+  if (mDownscaler) {
+    mDownscaler->CommitRow();
+  }
+
+  if (sawTransparency) {
+    mHasMaskAlpha = true;
+  }
+
+  if (mCurrMaskLine == 0) {
+    return Transition::To(ICOState::FINISH_MASK, 0);
+  }
+
+  return Transition::To(ICOState::READ_MASK_ROW, mMaskRowSize);
+}
+
+LexerTransition<ICOState> nsICODecoder::FinishMask() {
+  if (mDownscaler) {
+    RefPtr<nsBMPDecoder> bmpDecoder =
+        static_cast<nsBMPDecoder*>(mContainedDecoder.get());
+    uint8_t* imageData = reinterpret_cast<uint8_t*>(bmpDecoder->GetImageData());
+    if (!imageData) {
+      return Transition::TerminateFailure();
+    }
+
+    MOZ_ASSERT(mMaskBuffer);
+    MOZ_ASSERT(bmpDecoder->GetImageDataLength() > 0);
+    for (size_t i = 3; i < bmpDecoder->GetImageDataLength(); i += 4) {
+      imageData[i] = mMaskBuffer[i];
+    }
+    int32_t stride = mDownscaler->TargetSize().width * sizeof(uint32_t);
+    DebugOnly<bool> ret =
+        PremultiplyData(imageData, stride, SurfaceFormat::OS_RGBA, imageData,
+                        stride, SurfaceFormat::OS_RGBA,
+                        mDownscaler->TargetSize());
+    MOZ_ASSERT(ret);
+  }
+
+  return Transition::To(ICOState::FINISHED_RESOURCE, 0);
+}
+
+LexerTransition<ICOState> nsICODecoder::FinishResource() {
+  MOZ_ASSERT(mDirEntry);
+
+  if (!FlushContainedDecoder()) {
+    if (!IsVerifyingResourceSizes()) {
+      return Transition::TerminateFailure();
+    }
+    mDirEntry->mSize = OrientedIntSize(0, 0);
+    return Transition::To(ICOState::ITERATE_UNSIZED_DIR_ENTRY, 0);
+  }
+
+  if (!mContainedDecoder->GetDecodeDone()) {
+    if (!IsVerifyingResourceSizes()) {
+      return Transition::TerminateFailure();
+    }
+    mDirEntry->mSize = OrientedIntSize(0, 0);
+    return Transition::To(ICOState::ITERATE_UNSIZED_DIR_ENTRY, 0);
+  }
+
+  if (mContainedDecoder->IsMetadataDecode()) {
+    if (mContainedDecoder->HasSize()) {
+      mDirEntry->mSize = mContainedDecoder->Size();
+    } else {
+      mDirEntry->mSize = OrientedIntSize(0, 0);
+    }
+    return Transition::To(ICOState::ITERATE_UNSIZED_DIR_ENTRY, 0);
+  }
+
+  if (!mContainedDecoder->IsValidICOResource()) {
+    return Transition::TerminateFailure();
+  }
+
+  MOZ_ASSERT_IF(mContainedDecoder->HasSize(),
+                mContainedDecoder->Size() == mDirEntry->mSize);
+
+  return Transition::TerminateSuccess();
+}
+
+LexerResult nsICODecoder::DoDecode(SourceBufferIterator& aIterator,
+                                   IResumable* aOnResume) {
+  MOZ_ASSERT(!HasError(), "Shouldn't call DoDecode after error!");
+
+  return mLexer.Lex(
+      aIterator, aOnResume,
+      [this](ICOState aState, const char* aData, size_t aLength) {
+        switch (aState) {
+          case ICOState::HEADER:
+            return ReadHeader(aData);
+          case ICOState::DIR_ENTRY:
+            return ReadDirEntry(aData);
+          case ICOState::FINISHED_DIR_ENTRY:
+            return FinishDirEntry();
+          case ICOState::ITERATE_UNSIZED_DIR_ENTRY:
+            return IterateUnsizedDirEntry();
+          case ICOState::SKIP_TO_RESOURCE:
+            return Transition::ContinueUnbuffered(ICOState::SKIP_TO_RESOURCE);
+          case ICOState::FOUND_RESOURCE:
+            return Transition::To(ICOState::SNIFF_RESOURCE, BITMAPINFOSIZE);
+          case ICOState::SNIFF_RESOURCE:
+            return SniffResource(aData);
+          case ICOState::READ_RESOURCE:
+            return ReadResource();
+          case ICOState::PREPARE_FOR_MASK:
+            return PrepareForMask();
+          case ICOState::READ_MASK_ROW:
+            return ReadMaskRow(aData);
+          case ICOState::FINISH_MASK:
+            return FinishMask();
+          case ICOState::SKIP_MASK:
+            return Transition::ContinueUnbuffered(ICOState::SKIP_MASK);
+          case ICOState::FINISHED_RESOURCE:
+            return FinishResource();
+          default:
+            MOZ_CRASH("Unknown ICOState");
+        }
+      });
+}
+
+bool nsICODecoder::FlushContainedDecoder() {
+  MOZ_ASSERT(mContainedDecoder);
+
+  bool succeeded = true;
+
+  LexerResult result = mContainedDecoder->Decode();
+  if (result == LexerResult(TerminalState::FAILURE)) {
+    succeeded = false;
+  }
+
+  MOZ_ASSERT(result != LexerResult(Yield::OUTPUT_AVAILABLE),
+             "Unexpected yield");
+
+  if (mContainedDecoder->HasError()) {
+    succeeded = false;
+  }
+
+  if (IsVerifyingResourceSizes()) {
+    mContainedDecoder->TakeProgress();
+    mContainedDecoder->TakeInvalidRect();
+  } else {
+    mProgress |= mContainedDecoder->TakeProgress();
+    mInvalidRect.UnionRect(mInvalidRect, mContainedDecoder->TakeInvalidRect());
+  }
+
+  return succeeded;
+}
+
+}  
+}  

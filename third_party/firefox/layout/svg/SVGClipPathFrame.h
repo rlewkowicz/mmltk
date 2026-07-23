@@ -1,0 +1,101 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_SVGCLIPPATHFRAME_H_
+#define LAYOUT_SVG_SVGCLIPPATHFRAME_H_
+
+#include "gfxMatrix.h"
+#include "mozilla/SVGContainerFrame.h"
+
+class gfxContext;
+
+namespace mozilla {
+class ISVGDisplayableFrame;
+class PresShell;
+}  
+
+nsIFrame* NS_NewSVGClipPathFrame(mozilla::PresShell* aPresShell,
+                                 mozilla::ComputedStyle* aStyle);
+
+namespace mozilla {
+
+class SVGClipPathFrame final : public SVGContainerFrame {
+  friend nsIFrame* ::NS_NewSVGClipPathFrame(mozilla::PresShell* aPresShell,
+                                            ComputedStyle* aStyle);
+
+  using Matrix = gfx::Matrix;
+  using SourceSurface = gfx::SourceSurface;
+  using imgDrawingParams = image::imgDrawingParams;
+
+ protected:
+  explicit SVGClipPathFrame(ComputedStyle* aStyle, nsPresContext* aPresContext)
+      : SVGContainerFrame(aStyle, aPresContext, kClassID),
+        mIsBeingProcessed(false) {
+    AddStateBits(NS_FRAME_IS_NONDISPLAY | NS_STATE_SVG_CLIPPATH_CHILD |
+                 NS_FRAME_MAY_BE_TRANSFORMED);
+  }
+
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(SVGClipPathFrame)
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override {}
+
+
+  void ApplyClipPath(gfxContext& aContext, nsIFrame* aClippedFrame,
+                     const gfxMatrix& aMatrix);
+
+  already_AddRefed<SourceSurface> GetClipMask(
+      gfxContext& aReferenceContext, nsIFrame* aClippedFrame,
+      const gfxMatrix& aMatrix, SourceSurface* aExtraMask = nullptr);
+
+  void PaintClipMask(gfxContext& aMaskContext, nsIFrame* aClippedFrame,
+                     const gfxMatrix& aMatrix, SourceSurface* aExtraMask);
+
+  bool PointIsInsideClipPath(nsIFrame* aClippedFrame, const gfxPoint& aPoint);
+
+  bool IsTrivial(nsIFrame** aSingleChild = nullptr);
+
+  nsresult AttributeChanged(int32_t aNameSpaceID, nsAtom* aAttribute,
+                            AttrModType aModType) override;
+
+#ifdef DEBUG
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+#endif
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override {
+    return MakeFrameName(u"SVGClipPath"_ns, aResult);
+  }
+#endif
+
+  SVGBBox GetBBoxForClipPathFrame(const SVGBBox& aBBox,
+                                  const gfxMatrix& aMatrix,
+                                  SVGBBoxFlags aFlags);
+
+  gfxMatrix GetClipPathTransform(nsIFrame* aClippedFrame);
+
+ private:
+  gfxMatrix GetCanvasTM() override;
+
+  already_AddRefed<DrawTarget> CreateClipMask(gfxContext& aReferenceContext,
+                                              gfx::IntPoint& aOffset);
+
+  void PaintFrameIntoMask(nsIFrame* aFrame, nsIFrame* aClippedFrame,
+                          gfxContext& aTarget);
+
+  void PaintChildren(gfxContext& aMaskContext, nsIFrame* aClippedFrame,
+                     const gfxMatrix& aMatrix);
+
+  bool IsValid();
+
+  gfxMatrix mMatrixForChildren;
+
+  bool mIsBeingProcessed;
+};
+
+}  
+
+#endif  // LAYOUT_SVG_SVGCLIPPATHFRAME_H_

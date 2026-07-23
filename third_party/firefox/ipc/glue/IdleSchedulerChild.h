@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ipc_IdleSchedulerChild_h_
+#define mozilla_ipc_IdleSchedulerChild_h_
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/ipc/PIdleSchedulerChild.h"
+#include "mozilla/ipc/SharedMemoryMapping.h"
+
+class nsIIdlePeriod;
+
+namespace mozilla {
+class IdlePeriodState;
+
+namespace ipc {
+
+class BackgroundChildImpl;
+
+class IdleSchedulerChild final : public PIdleSchedulerChild {
+ public:
+  IdleSchedulerChild() = default;
+
+  NS_INLINE_DECL_REFCOUNTING(IdleSchedulerChild)
+
+  IPCResult RecvIdleTime(uint64_t aId, TimeDuration aBudget);
+
+  void Init(IdlePeriodState* aIdlePeriodState);
+
+  void Disconnect() { mIdlePeriodState = nullptr; }
+
+  void SetActive();
+  bool SetPaused();
+
+  typedef MozPromise<bool, ResponseRejectReason, true> MayGCPromise;
+
+  RefPtr<MayGCPromise> MayGCNow();
+
+  void StartedGC();
+  void DoneGC();
+
+  static IdleSchedulerChild* GetMainThreadIdleScheduler();
+
+ private:
+  ~IdleSchedulerChild();
+
+  friend class BackgroundChildImpl;
+
+  SharedMemoryMapping mActiveCounter;
+
+  IdlePeriodState* mIdlePeriodState = nullptr;
+
+  uint32_t mChildId = 0;
+
+  bool mIsRequestingGC = false;
+  bool mIsDoingGC = false;
+};
+
+}  
+}  
+
+#endif  // mozilla_ipc_IdleSchedulerChild_h_

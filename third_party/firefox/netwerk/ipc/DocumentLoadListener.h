@@ -1,0 +1,370 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_DocumentLoadListener_h
+#define mozilla_net_DocumentLoadListener_h
+
+#include "mozilla/MozPromise.h"
+#include "mozilla/Variant.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/ipc/Endpoint.h"
+#include "mozilla/dom/SessionHistoryEntry.h"
+#include "EarlyHintsService.h"
+#include "mozilla/net/NeckoCommon.h"
+#include "mozilla/net/NeckoParent.h"
+#include "mozilla/net/PDocumentChannelParent.h"
+#include "mozilla/net/ParentChannelListener.h"
+#include "nsDOMNavigationTiming.h"
+#include "nsIBrowser.h"
+#include "nsIChannelEventSink.h"
+#include "nsIEarlyHintObserver.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIMultiPartChannel.h"
+#include "nsIParentChannel.h"
+#include "nsIParentRedirectingChannel.h"
+#include "nsIProgressEventSink.h"
+#include "nsIRedirectResultListener.h"
+
+#define DOCUMENT_LOAD_LISTENER_IID \
+  {0x3b393c56, 0x9e01, 0x11e9, {0xa2, 0xa3, 0x2a, 0x2a, 0xe2, 0xdb, 0xcc, 0xe4}}
+
+namespace mozilla {
+namespace dom {
+class CanonicalBrowsingContext;
+class ParentProcessChannelHandle;
+struct NavigationIsolationOptions;
+}  
+}  
+
+namespace mozilla {
+namespace net {
+
+class LoadInfo;
+
+
+class DocumentLoadListener : public nsIInterfaceRequestor,
+                             public nsIAsyncVerifyRedirectReadyCallback,
+                             public nsIParentChannel,
+                             public nsIChannelEventSink,
+                             public HttpChannelSecurityWarningReporter,
+                             public nsIMultiPartChannelListener,
+                             public nsIProgressEventSink,
+                             public nsIEarlyHintObserver {
+ public:
+  DocumentLoadListener(dom::CanonicalBrowsingContext* aLoadingBrowsingContext,
+                       bool aIsDocumentLoad);
+
+  struct OpenPromiseSucceededType {
+    uint32_t mRedirectFlags;
+    uint32_t mLoadFlags;
+    uint32_t mEarlyHintLinkType;
+    RefPtr<PDocumentChannelParent::RedirectToRealChannelPromise::Private>
+        mPromise;
+  };
+  struct OpenPromiseFailedType {
+    nsresult mStatus;
+    nsresult mLoadGroupStatus;
+    bool mContinueNavigating = false;
+  };
+
+  using OpenPromise =
+      MozPromise<OpenPromiseSucceededType, OpenPromiseFailedType, true>;
+
+  struct ObjectUpgradeHandler : public SupportsWeakPtr {
+    using ObjectUpgradePromise =
+        MozPromise<RefPtr<dom::CanonicalBrowsingContext>, nsresult,
+                   true >;
+
+    virtual RefPtr<ObjectUpgradePromise> UpgradeObjectLoad() = 0;
+  };
+
+ private:
+  RefPtr<OpenPromise> Open(nsDocShellLoadState* aLoadState, LoadInfo* aLoadInfo,
+                           nsLoadFlags aLoadFlags, uint32_t aCacheKey,
+                           const Maybe<uint64_t>& aChannelId,
+                           const TimeStamp& aAsyncOpenTime,
+                           nsDOMNavigationTiming* aTiming,
+                           Maybe<dom::ClientInfo>&& aInfo, bool aUrgentStart,
+                           dom::ContentParent* aContentParent, nsresult* aRv);
+
+ public:
+  RefPtr<OpenPromise> OpenDocument(
+      nsDocShellLoadState* aLoadState, nsLoadFlags aLoadFlags,
+      uint32_t aCacheKey, const Maybe<uint64_t>& aChannelId,
+      const TimeStamp& aAsyncOpenTime, nsDOMNavigationTiming* aTiming,
+      Maybe<dom::ClientInfo>&& aInfo, bool aUriModified,
+      Maybe<bool> aIsEmbeddingBlockedError, dom::ContentParent* aContentParent,
+      nsresult* aRv);
+
+  RefPtr<OpenPromise> OpenObject(
+      nsDocShellLoadState* aLoadState, uint32_t aCacheKey,
+      const Maybe<uint64_t>& aChannelId, const TimeStamp& aAsyncOpenTime,
+      nsDOMNavigationTiming* aTiming, Maybe<dom::ClientInfo>&& aInfo,
+      uint64_t aInnerWindowId, nsLoadFlags aLoadFlags,
+      nsContentPolicyType aContentPolicyType, bool aUrgentStart,
+      dom::ContentParent* aContentParent,
+      ObjectUpgradeHandler* aObjectUpgradeHandler, nsresult* aRv);
+
+  static bool LoadInParent(dom::CanonicalBrowsingContext* aBrowsingContext,
+                           nsDocShellLoadState* aLoadState,
+                           bool aSetNavigating);
+
+  static bool SpeculativeLoadInParent(
+      dom::CanonicalBrowsingContext* aBrowsingContext,
+      nsDocShellLoadState* aLoadState);
+
+  void CleanupParentLoadAttempt();
+
+  RefPtr<OpenPromise> ClaimParentLoad(Maybe<uint64_t> aChannelId);
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSIPARENTCHANNEL
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSIASYNCVERIFYREDIRECTREADYCALLBACK
+  NS_DECL_NSICHANNELEVENTSINK
+  NS_DECL_NSIMULTIPARTCHANNELLISTENER
+  NS_DECL_NSIPROGRESSEVENTSINK
+  NS_DECL_NSIEARLYHINTOBSERVER
+
+  bool ResumeSuspendedChannel(nsIStreamListener* aListener);
+
+  NS_INLINE_DECL_STATIC_IID(DOCUMENT_LOAD_LISTENER_IID)
+
+  void Cancel(const nsresult& aStatusCode, const nsACString& aReason);
+
+  nsIChannel* GetChannel() const { return mChannel; }
+
+  uint32_t GetRedirectChannelId() const { return mRedirectChannelId; }
+
+  nsresult ReportSecurityMessage(const nsAString& aMessageTag,
+                                 const nsAString& aMessageCategory) override {
+    ReportSecurityMessageParams params;
+    params.mMessageTag = aMessageTag;
+    params.mMessageCategory = aMessageCategory;
+    mSecurityWarningFunctions.AppendElement(
+        SecurityWarningFunction{VariantIndex<0>{}, std::move(params)});
+    return NS_OK;
+  }
+
+  nsresult LogBlockedCORSRequest(const nsAString& aMessage,
+                                 const nsACString& aCategory,
+                                 bool aIsWarning) override {
+    LogBlockedCORSRequestParams params;
+    params.mMessage = aMessage;
+    params.mCategory = aCategory;
+    params.mIsWarning = aIsWarning;
+    mSecurityWarningFunctions.AppendElement(
+        SecurityWarningFunction{VariantIndex<1>{}, std::move(params)});
+    return NS_OK;
+  }
+
+  nsresult LogMimeTypeMismatch(const nsACString& aMessageName, bool aWarning,
+                               const nsAString& aURL,
+                               const nsAString& aContentType) override {
+    LogMimeTypeMismatchParams params;
+    params.mMessageName = aMessageName;
+    params.mWarning = aWarning;
+    params.mURL = aURL;
+    params.mContentType = aContentType;
+    mSecurityWarningFunctions.AppendElement(
+        SecurityWarningFunction{VariantIndex<2>{}, std::move(params)});
+    return NS_OK;
+  }
+
+  dom::ContentParent* GetContentParent() const { return mContentParent; }
+
+  base::ProcessId OtherPid() const;
+
+  void CancelEarlyHintPreloads();
+
+  void RegisterEarlyHintLinksAndGetConnectArgs(
+      dom::ContentParentId aCpId, nsTArray<EarlyHintConnectArgs>& aOutLinks);
+
+  void SerializeRedirectData(RedirectToRealChannelArgs& aArgs,
+                             bool aIsCrossProcess, uint32_t aRedirectFlags,
+                             uint32_t aLoadFlags,
+                             nsTArray<EarlyHintConnectArgs>&& aEarlyHints,
+                             uint32_t aEarlyHintLinkType) const;
+
+  uint64_t GetLoadIdentifier() const { return mLoadIdentifier; }
+  uint32_t GetLoadType() const { return mLoadStateLoadType; }
+  bool IsDownload() const { return mIsDownload; }
+  bool IsLoadingJSURI() const { return mIsLoadingJSURI; }
+  nsDOMNavigationTiming* GetTiming() { return mTiming; }
+
+  mozilla::dom::LoadingSessionHistoryInfo* GetLoadingSessionHistoryInfo() {
+    return mLoadingSessionHistoryInfo.get();
+  }
+
+  bool IsDocumentLoad() const { return mIsDocumentLoad; }
+
+  enum ProcessBehavior : uint8_t {
+    PROCESS_BEHAVIOR_DISABLED,
+
+    PROCESS_BEHAVIOR_STANDARD,
+
+    PROCESS_BEHAVIOR_SUBFRAME_ONLY,
+  };
+
+ protected:
+  virtual ~DocumentLoadListener();
+
+ private:
+  RefPtr<OpenPromise> OpenInParent(nsDocShellLoadState* aLoadState,
+                                   bool aSupportsRedirectToRealChannel);
+
+  friend class ParentProcessDocumentOpenInfo;
+
+  void DisconnectListeners(nsresult aStatus, nsresult aLoadGroupStatus,
+                           bool aContinueNavigating = false);
+
+  void TriggerRedirectToRealChannel(
+      dom::CanonicalBrowsingContext* aDestinationBrowsingContext,
+      const Maybe<dom::ContentParent*>& aDestinationProcess);
+
+  void RedirectToRealChannelFinished(nsresult aRv);
+
+  void FinishReplacementChannelSetup(nsresult aResult);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsresult DoOnStartRequest(nsIRequest*);
+
+  MOZ_CAN_RUN_SCRIPT
+  bool MaybeTriggerProcessSwitch(bool* aWillSwitchToRemote);
+
+  MOZ_CAN_RUN_SCRIPT
+  void TriggerProcessSwitch(dom::CanonicalBrowsingContext* aContext,
+                            const dom::NavigationIsolationOptions& aOptions,
+                            bool aIsNewTab = false);
+
+  RefPtr<PDocumentChannelParent::RedirectToRealChannelPromise>
+  RedirectToRealChannel(uint32_t aRedirectFlags, uint32_t aLoadFlags,
+                        const Maybe<dom::ContentParent*>& aDestinationProcess);
+
+  RefPtr<PDocumentChannelParent::RedirectToRealChannelPromise>
+  RedirectToParentProcess(uint32_t aRedirectFlags, uint32_t aLoadFlags);
+
+  dom::CanonicalBrowsingContext* GetLoadingBrowsingContext() const;
+
+  dom::CanonicalBrowsingContext* GetDocumentBrowsingContext() const;
+  dom::CanonicalBrowsingContext* GetTopBrowsingContext() const;
+
+  dom::WindowGlobalParent* GetParentWindowContext() const;
+
+  void AddURIVisit(nsIChannel* aChannel, uint32_t aLoadFlags);
+  bool HasCrossOriginOpenerPolicyMismatch() const;
+  void ApplyPendingFunctions(nsIParentChannel* aChannel) const;
+
+  void Disconnect(bool aContinueNavigating);
+
+
+  bool DocShellWillDisplayContent(nsresult aStatus);
+
+  void FireStateChange(uint32_t aStateFlags, nsresult aStatus);
+
+  bool MaybeHandleLoadErrorWithURIFixup(nsresult aStatus);
+
+
+  struct ReportSecurityMessageParams {
+    nsString mMessageTag;
+    nsString mMessageCategory;
+  };
+
+  struct LogBlockedCORSRequestParams {
+    nsString mMessage;
+    nsCString mCategory;
+    bool mIsWarning;
+  };
+
+  struct LogMimeTypeMismatchParams {
+    nsCString mMessageName;
+    bool mWarning = false;
+    nsString mURL;
+    nsString mContentType;
+  };
+
+  using SecurityWarningFunction =
+      mozilla::Variant<ReportSecurityMessageParams, LogBlockedCORSRequestParams,
+                       LogMimeTypeMismatchParams>;
+  nsTArray<SecurityWarningFunction> mSecurityWarningFunctions;
+
+  nsTArray<StreamListenerFunction> mStreamListenerFunctions;
+
+  nsCOMPtr<nsIChannel> mChannel;
+
+  Maybe<uint64_t> mDocumentChannelId;
+
+  RefPtr<ParentChannelListener> mParentChannelListener;
+
+  nsIURI* GetChannelCreationURI() const;
+
+  RefPtr<nsDOMNavigationTiming> mTiming;
+
+  net::EarlyHintsService mEarlyHintsService;
+
+  WeakPtr<ObjectUpgradeHandler> mObjectUpgradeHandler;
+
+  bool mHaveVisibleRedirect = false;
+
+  nsString mSrcdocData;
+  nsCOMPtr<nsIURI> mBaseURI;
+
+  mozilla::UniquePtr<mozilla::dom::LoadingSessionHistoryInfo>
+      mLoadingSessionHistoryInfo;
+
+  RefPtr<dom::WindowGlobalParent> mParentWindowContext;
+
+  uint32_t mLoadStateExternalLoadFlags = 0;
+  uint32_t mLoadStateInternalLoadFlags = 0;
+  uint32_t mLoadStateLoadType = 0;
+
+  bool mIsDownload = false;
+
+  bool mIsLoadingJSURI = false;
+
+  uint64_t mRedirectChannelId = 0;
+  bool mInitiatedRedirectToRealChannel = false;
+  bool mOldApplyConversion = false;
+  bool mHasCrossOriginOpenerPolicyMismatch = false;
+  bool mIsFinished = false;
+
+  uint64_t mLoadIdentifier = 0;
+
+  Maybe<nsCString> mOriginalUriString;
+
+  bool mSupportsRedirectToRealChannel = true;
+
+  RefPtr<dom::ParentProcessChannelHandle> mParentProcessChannelHandle;
+
+  Maybe<nsCString> mRemoteTypeOverride;
+
+  RefPtr<dom::ContentParent> mContentParent;
+
+  void RejectOpenPromise(nsresult aStatus, nsresult aLoadGroupStatus,
+                         bool aContinueNavigating, StaticString aLocation) {
+    if (!mOpenPromiseResolved && mOpenPromise) {
+      mOpenPromise->Reject(OpenPromiseFailedType({aStatus, aLoadGroupStatus,
+                                                  aContinueNavigating}),
+                           aLocation);
+      mOpenPromiseResolved = true;
+    }
+  }
+  RefPtr<OpenPromise::Private> mOpenPromise;
+  bool mOpenPromiseResolved = false;
+
+  const bool mIsDocumentLoad;
+
+  RefPtr<HTTPSFirstDowngradeData> mHTTPSFirstDowngradeData;
+};
+
+inline nsISupports* ToSupports(DocumentLoadListener* aObj) {
+  return static_cast<nsIInterfaceRequestor*>(aObj);
+}
+
+}  
+}  
+
+#endif  // mozilla_net_DocumentChannelParent_h

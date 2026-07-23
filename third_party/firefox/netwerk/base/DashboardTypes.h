@@ -1,0 +1,121 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_DashboardTypes_h_
+#define mozilla_net_DashboardTypes_h_
+
+#include "ipc/IPCMessageUtils.h"
+#include "ipc/IPCMessageUtilsSpecializations.h"
+#include "nsHttp.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+namespace net {
+
+struct SocketInfo {
+  nsCString host;
+  uint64_t sent;
+  uint64_t received;
+  uint16_t port;
+  bool active;
+  nsCString type;
+  nsCString originAttributesSuffix;
+};
+
+inline bool operator==(const SocketInfo& a, const SocketInfo& b) {
+  return a.host == b.host && a.sent == b.sent && a.received == b.received &&
+         a.port == b.port && a.active == b.active && a.type == b.type &&
+         a.originAttributesSuffix == b.originAttributesSuffix;
+}
+
+struct DnsAndConnectSockets {
+  bool speculative;
+};
+
+struct DNSCacheEntries {
+  nsCString hostname;
+  nsTArray<nsCString> hostaddr;
+  uint16_t family{0};
+  int64_t expiration{0};
+  bool TRR{false};
+  nsCString originAttributesSuffix;
+  nsCString flags;
+  uint16_t resolveType{0};
+};
+
+struct HttpConnInfo {
+  uint32_t ttl;
+  uint32_t rtt;
+  nsString protocolVersion;
+
+  void SetHTTPProtocolVersion(HttpVersion pv);
+};
+
+struct HttpRetParams {
+  nsCString host;
+  CopyableTArray<HttpConnInfo> active;
+  CopyableTArray<HttpConnInfo> idle;
+  CopyableTArray<DnsAndConnectSockets> dnsAndSocks;
+  uint32_t counter;
+  uint16_t port;
+  nsCString httpVersion;
+  bool ssl;
+  nsCString originAttributesSuffix;
+};
+
+struct Http3ConnStats {
+  uint64_t packetsRx;
+  uint64_t dupsRx;
+  uint64_t droppedRx;
+  uint64_t savedDatagrams;
+  uint64_t packetsTx;
+  uint64_t lost;
+  uint64_t lateAck;
+  uint64_t ptoAck;
+  CopyableTArray<uint64_t> ptoCounts;
+  uint64_t wouldBlockRx;
+  uint64_t wouldBlockTx;
+};
+
+struct Http3ConnectionStatsParams {
+  nsCString host;
+  uint16_t port;
+  CopyableTArray<Http3ConnStats> stats;
+};
+
+}  
+}  
+
+namespace IPC {
+
+DEFINE_IPC_SERIALIZER_WITH_FIELDS(mozilla::net::SocketInfo, host, sent,
+                                  received, port, active, type,
+                                  originAttributesSuffix);
+
+DEFINE_IPC_SERIALIZER_WITH_FIELDS(mozilla::net::DNSCacheEntries, hostname,
+                                  hostaddr, family, expiration, TRR,
+                                  originAttributesSuffix, flags, resolveType);
+
+DEFINE_IPC_SERIALIZER_WITH_FIELDS(mozilla::net::DnsAndConnectSockets,
+                                  speculative);
+
+DEFINE_IPC_SERIALIZER_WITH_FIELDS(mozilla::net::HttpConnInfo, ttl, rtt,
+                                  protocolVersion);
+
+DEFINE_IPC_SERIALIZER_WITH_FIELDS(mozilla::net::HttpRetParams, host, active,
+                                  idle, dnsAndSocks, counter, port, httpVersion,
+                                  ssl, originAttributesSuffix);
+
+DEFINE_IPC_SERIALIZER_WITH_FIELDS(mozilla::net::Http3ConnStats, packetsRx,
+                                  dupsRx, droppedRx, savedDatagrams, packetsTx,
+                                  lost, lateAck, ptoAck, ptoCounts,
+                                  wouldBlockRx, wouldBlockTx);
+
+DEFINE_IPC_SERIALIZER_WITH_FIELDS(mozilla::net::Http3ConnectionStatsParams,
+                                  host, port, stats);
+
+}  
+
+#endif  // mozilla_net_DashboardTypes_h_

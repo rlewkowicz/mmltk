@@ -1,0 +1,130 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MediaStreamAudioSourceNode_h_
+#define MediaStreamAudioSourceNode_h_
+
+#include "AudioNode.h"
+#include "AudioNodeEngine.h"
+#include "DOMMediaStream.h"
+#include "PrincipalChangeObserver.h"
+
+namespace mozilla::dom {
+
+class AudioContext;
+struct MediaStreamAudioSourceOptions;
+
+class MediaStreamAudioSourceNodeEngine final : public AudioNodeEngine {
+ public:
+  explicit MediaStreamAudioSourceNodeEngine(AudioNode* aNode)
+      : AudioNodeEngine(aNode), mEnabled(false) {}
+
+  bool IsEnabled() const { return mEnabled; }
+  enum Parameters { ENABLE };
+  void SetInt32Parameter(uint32_t aIndex, int32_t aValue) override {
+    switch (aIndex) {
+      case ENABLE:
+        mEnabled = !!aValue;
+        break;
+      default:
+        NS_ERROR("MediaStreamAudioSourceNodeEngine bad parameter index");
+    }
+  }
+
+ private:
+  bool mEnabled;
+};
+
+class MediaStreamAudioSourceNode
+    : public AudioNode,
+      public PrincipalChangeObserver<MediaStreamTrack> {
+ public:
+  static already_AddRefed<MediaStreamAudioSourceNode> Create(
+      AudioContext& aContext, const MediaStreamAudioSourceOptions& aOptions,
+      ErrorResult& aRv);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(MediaStreamAudioSourceNode,
+                                           AudioNode)
+
+  static already_AddRefed<MediaStreamAudioSourceNode> Constructor(
+      const GlobalObject& aGlobal, AudioContext& aAudioContext,
+      const MediaStreamAudioSourceOptions& aOptions, ErrorResult& aRv) {
+    return Create(aAudioContext, aOptions, aRv);
+  }
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  void DestroyMediaTrack() override;
+
+  uint16_t NumberOfInputs() const override { return 0; }
+
+  DOMMediaStream* GetMediaStream() { return mInputStream; }
+
+  const char* NodeType() const override { return "MediaStreamAudioSourceNode"; }
+
+  virtual const char* CrossOriginErrorString() const {
+    return "MediaStreamAudioSourceNodeCrossOrigin";
+  }
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const override;
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const override;
+
+  void AttachToTrack(AudioStreamTrack* aTrack);
+
+  void DetachFromTrack();
+
+  void AttachToRightTrack(const RefPtr<DOMMediaStream>& aMediaStream,
+                          ErrorResult& aRv);
+
+  void NotifyTrackAdded(const RefPtr<MediaStreamTrack>& aTrack);
+  void NotifyTrackRemoved(const RefPtr<MediaStreamTrack>& aTrack);
+  void NotifyAudible();
+
+  class TrackListener final : public DOMMediaStream::TrackListener {
+   public:
+    NS_DECL_ISUPPORTS_INHERITED
+    NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(TrackListener,
+                                             DOMMediaStream::TrackListener)
+    explicit TrackListener(MediaStreamAudioSourceNode* aNode) : mNode(aNode) {}
+    void NotifyTrackAdded(const RefPtr<MediaStreamTrack>& aTrack) override {
+      mNode->NotifyTrackAdded(aTrack);
+    }
+    void NotifyTrackRemoved(const RefPtr<MediaStreamTrack>& aTrack) override {
+      mNode->NotifyTrackRemoved(aTrack);
+    }
+    void NotifyAudible() override { mNode->NotifyAudible(); }
+
+   private:
+    virtual ~TrackListener() = default;
+    RefPtr<MediaStreamAudioSourceNode> mNode;
+  };
+
+  void PrincipalChanged(MediaStreamTrack* aMediaStreamTrack) override;
+
+  enum TrackChangeBehavior {
+    LockOnTrackPicked,
+    FollowChanges
+  };
+
+ protected:
+  MediaStreamAudioSourceNode(AudioContext* aContext,
+                             TrackChangeBehavior aBehavior);
+  void Init(DOMMediaStream& aMediaStream, ErrorResult& aRv);
+  virtual void Destroy();
+  virtual ~MediaStreamAudioSourceNode();
+
+ private:
+  const TrackChangeBehavior mBehavior;
+  RefPtr<MediaInputPort> mInputPort;
+  RefPtr<DOMMediaStream> mInputStream;
+
+  RefPtr<AudioStreamTrack> mInputTrack;
+  RefPtr<TrackListener> mListener;
+};
+
+}  
+
+#endif

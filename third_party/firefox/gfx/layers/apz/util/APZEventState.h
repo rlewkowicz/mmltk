@@ -1,0 +1,126 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_APZEventState_h
+#define mozilla_layers_APZEventState_h
+
+#include <stdint.h>
+
+#include "ElementStateManager.h"
+#include "Units.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/layers/GeckoContentControllerTypes.h"  // for APZStateChange
+#include "mozilla/layers/ScrollableLayerGuid.h"  // for ScrollableLayerGuid
+#include "mozilla/layers/TouchCounter.h"         // for TouchCounter
+#include "mozilla/RefPtr.h"
+#include "mozilla/StaticPrefs_ui.h"
+#include "nsCOMPtr.h"
+#include "nsISupportsImpl.h"  // for NS_INLINE_DECL_REFCOUNTING
+#include "nsITimer.h"
+#include "nsIWeakReferenceUtils.h"  // for nsWeakPtr
+
+#include <functional>
+
+template <class>
+class nsCOMPtr;
+class nsIContent;
+class nsIWidget;
+
+namespace mozilla {
+
+class PresShell;
+enum class PreventDefaultResult : uint8_t;
+
+namespace layers {
+
+class ElementStateManager;
+
+enum class SynthesizeForTests : bool;  
+
+namespace apz {
+enum class PrecedingPointerDown : bool { NotConsumed, ConsumedByContent };
+enum class SingleTapState : uint8_t;
+}  
+
+typedef std::function<void(uint64_t ,
+                           bool )>
+    ContentReceivedInputBlockCallback;
+
+class APZEventState final {
+  typedef GeckoContentController_APZStateChange APZStateChange;
+  typedef ScrollableLayerGuid::ViewID ViewID;
+
+ public:
+  using PrecedingPointerDown = apz::PrecedingPointerDown;
+
+  APZEventState(nsIWidget* aWidget,
+                ContentReceivedInputBlockCallback&& aCallback);
+
+  NS_INLINE_DECL_REFCOUNTING(APZEventState);
+
+  MOZ_CAN_RUN_SCRIPT
+  void ProcessSingleTap(const CSSPoint& aPoint,
+                        const CSSToLayoutDeviceScale& aScale,
+                        Modifiers aModifiers, int32_t aClickCount,
+                        uint64_t aInputBlockId);
+  MOZ_CAN_RUN_SCRIPT
+  void ProcessLongTap(PresShell* aPresShell, const CSSPoint& aPoint,
+                      const CSSToLayoutDeviceScale& aScale,
+                      Modifiers aModifiers, uint64_t aInputBlockId);
+  MOZ_CAN_RUN_SCRIPT
+  void ProcessLongTapUp(PresShell* aPresShell, const CSSPoint& aPoint,
+                        const CSSToLayoutDeviceScale& aScale,
+                        Modifiers aModifiers);
+  void ProcessTouchEvent(const WidgetTouchEvent& aEvent,
+                         const ScrollableLayerGuid& aGuid,
+                         uint64_t aInputBlockId, nsEventStatus aApzResponse,
+                         nsEventStatus aContentResponse,
+                         nsTArray<TouchBehaviorFlags>&& aAllowedTouchBehaviors);
+  void ProcessWheelEvent(const WidgetWheelEvent& aEvent,
+                         uint64_t aInputBlockId);
+  void ProcessMouseEvent(const WidgetMouseEvent& aEvent,
+                         uint64_t aInputBlockId);
+  void ProcessAPZStateChange(ViewID aViewId, APZStateChange aChange, int aArg,
+                             Maybe<uint64_t> aInputBlockId);
+  void Destroy();
+
+ private:
+  ~APZEventState();
+  void SendPendingTouchPreventedResponse(bool aPreventDefault);
+  MOZ_CAN_RUN_SCRIPT PreventDefaultResult FireContextmenuEvents(
+      PresShell* aPresShell, const CSSPoint& aPoint,
+      const CSSToLayoutDeviceScale& aScale, uint32_t aPointerId,
+      Modifiers aModifiers, const nsCOMPtr<nsIWidget>& aWidget,
+      SynthesizeForTests aSynthesizeForTests);
+  already_AddRefed<nsIWidget> GetWidget() const;
+  already_AddRefed<nsIContent> GetTouchRollup() const;
+  bool MainThreadAgreesEventsAreConsumableByAPZ() const;
+
+ private:
+  nsWeakPtr mWidget;
+  RefPtr<ElementStateManager> mElementStateManager;
+  ContentReceivedInputBlockCallback mContentReceivedInputBlockCallback;
+  TouchCounter mTouchCounter;
+  ScrollableLayerGuid mPendingTouchPreventedGuid;
+  uint64_t mPendingTouchPreventedBlockId;
+  apz::SingleTapState mEndTouchState;
+  PrecedingPointerDown mPrecedingPointerDownState =
+      PrecedingPointerDown::NotConsumed;
+  SynthesizeForTests mLastTouchSynthesizedForTests{false};
+  bool mPendingTouchPreventedResponse = false;
+  bool mFirstTouchCancelled = false;
+  bool mTouchEndCancelled = false;
+  bool mReceivedNonTouchStart = false;
+  bool mTouchStartPrevented = false;
+
+  int32_t mLastTouchIdentifier = 0;
+  nsTArray<TouchBehaviorFlags> mTouchBlockAllowedBehaviors;
+
+  nsWeakPtr mTouchRollup;
+};
+
+}  
+}  
+
+#endif /* mozilla_layers_APZEventState_h */

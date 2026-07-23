@@ -1,0 +1,239 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_SessionStorageManager_h
+#define mozilla_dom_SessionStorageManager_h
+
+#include "StorageObserver.h"
+#include "ipc/EnumSerializer.h"
+#include "mozilla/dom/FlippedOnce.h"
+#include "mozilla/ipc/PBackgroundChild.h"
+#include "mozilla/ipc/PBackgroundParent.h"
+#include "nsClassHashtable.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsHashKeys.h"
+#include "nsIDOMStorageManager.h"
+
+class nsIPrincipal;
+class nsITimer;
+
+namespace mozilla {
+class OriginAttributesPattern;
+
+namespace dom {
+
+class SSCacheCopy;
+
+bool RecvShutdownBackgroundSessionStorageManagers();
+void RecvPropagateBackgroundSessionStorageManager(uint64_t aCurrentTopContextId,
+                                                  uint64_t aTargetTopContextId);
+bool RecvRemoveBackgroundSessionStorageManager(uint64_t aTopContextId);
+
+bool RecvGetSessionStorageData(
+    uint64_t aTopContextId, uint32_t aSizeLimit, bool aCancelSessionStoreTimer,
+    ::mozilla::ipc::PBackgroundParent::GetSessionStorageManagerDataResolver&&
+        aResolver);
+
+bool RecvLoadSessionStorageData(
+    uint64_t aTopContextId,
+    nsTArray<mozilla::dom::SSCacheCopy>&& aCacheCopyList);
+
+bool RecvClearStoragesForOrigin(const nsACString& aOriginAttrs,
+                                const nsACString& aOriginKey);
+
+enum class DomainMatchingMode { PREFIX_MATCH, EXACT_MATCH };
+
+class BrowsingContext;
+class ContentParent;
+class SSSetItemInfo;
+class SSWriteInfo;
+class SessionStorageCache;
+class SessionStorageCacheChild;
+class SessionStorageManagerChild;
+class SessionStorageManagerParent;
+class SessionStorageObserver;
+struct OriginRecord;
+
+class SessionStorageManagerBase {
+ public:
+  SessionStorageManagerBase() = default;
+
+ protected:
+  ~SessionStorageManagerBase() = default;
+
+  struct OriginRecord {
+    OriginRecord() = default;
+    OriginRecord(OriginRecord&&) = default;
+    OriginRecord& operator=(OriginRecord&&) = default;
+    ~OriginRecord();
+
+    RefPtr<SessionStorageCache> mCache;
+
+    FlippedOnce<false> mLoaded;
+  };
+
+  void ClearStoragesInternal(
+      const OriginAttributesPattern& aPattern, const nsACString& aOriginScope,
+      DomainMatchingMode aMode = DomainMatchingMode::PREFIX_MATCH);
+
+  void ClearStoragesForOriginInternal(const nsACString& aOriginAttrs,
+                                      const nsACString& aOriginKey);
+
+  OriginRecord* GetOriginRecord(const nsACString& aOriginAttrs,
+                                const nsACString& aOriginKey,
+                                bool aMakeIfNeeded,
+                                SessionStorageCache* aCloneFrom);
+
+  using OriginKeyHashTable = nsClassHashtable<nsCStringHashKey, OriginRecord>;
+  nsClassHashtable<nsCStringHashKey, OriginKeyHashTable> mOATable;
+};
+
+class SessionStorageManager final : public SessionStorageManagerBase,
+                                    public nsIDOMSessionStorageManager,
+                                    public StorageObserverSink {
+ public:
+  explicit SessionStorageManager(RefPtr<BrowsingContext> aBrowsingContext);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_NSIDOMSTORAGEMANAGER
+  NS_DECL_NSIDOMSESSIONSTORAGEMANAGER
+
+  NS_DECL_CYCLE_COLLECTION_CLASS(SessionStorageManager)
+
+  bool CanLoadData();
+
+  void SetActor(SessionStorageManagerChild* aActor);
+
+  bool ActorExists() const;
+
+  void ClearActor();
+
+  nsresult EnsureManager();
+
+  nsresult LoadData(nsIPrincipal& aPrincipal, SessionStorageCache& aCache);
+
+  void CheckpointData(nsIPrincipal& aPrincipal, SessionStorageCache& aCache);
+
+  nsresult ClearStoragesForOrigin(const nsACString& aOriginAttrs,
+                                  const nsACString& aOriginKey);
+
+ private:
+  ~SessionStorageManager();
+
+  nsresult Observe(const char* aTopic,
+                   const nsAString& aOriginAttributesPattern,
+                   const nsACString& aOriginScope) override;
+
+  nsresult GetSessionStorageCacheHelper(nsIPrincipal* aPrincipal,
+                                        bool aMakeIfNeeded,
+                                        SessionStorageCache* aCloneFrom,
+                                        RefPtr<SessionStorageCache>* aRetVal);
+
+  nsresult GetSessionStorageCacheHelper(const nsACString& aOriginAttrs,
+                                        const nsACString& aOriginKey,
+                                        bool aMakeIfNeeded,
+                                        SessionStorageCache* aCloneFrom,
+                                        RefPtr<SessionStorageCache>* aRetVal);
+
+  void ClearStorages(
+      const OriginAttributesPattern& aPattern, const nsACString& aOriginScope,
+      DomainMatchingMode aMode = DomainMatchingMode::PREFIX_MATCH);
+
+  SessionStorageCacheChild* EnsureCache(nsIPrincipal& aPrincipal,
+                                        const nsACString& aOriginKey,
+                                        SessionStorageCache& aCache);
+
+  void CheckpointDataInternal(nsIPrincipal& aPrincipal,
+                              const nsACString& aOriginKey,
+                              SessionStorageCache& aCache);
+
+  RefPtr<SessionStorageObserver> mObserver;
+
+  RefPtr<BrowsingContext> mBrowsingContext;
+
+  SessionStorageManagerChild* mActor;
+};
+
+class BackgroundSessionStorageManager final : public SessionStorageManagerBase {
+ public:
+  static BackgroundSessionStorageManager* GetOrCreate(uint64_t aTopContextId);
+
+  NS_INLINE_DECL_REFCOUNTING(BackgroundSessionStorageManager);
+
+  static void PropagateManager(uint64_t aCurrentTopContextId,
+                               uint64_t aTargetTopContextId);
+
+  static void RemoveManager(uint64_t aTopContextId);
+
+  static void LoadData(
+      uint64_t aTopContextId,
+      const nsTArray<mozilla::dom::SSCacheCopy>& aCacheCopyList);
+
+  using DataPromise =
+      ::mozilla::ipc::PBackgroundChild::GetSessionStorageManagerDataPromise;
+  static RefPtr<DataPromise> GetData(BrowsingContext* aContext,
+                                     uint32_t aSizeLimit,
+                                     bool aClearSessionStoreTimer = false);
+
+  void GetData(uint32_t aSizeLimit, nsTArray<SSCacheCopy>& aCacheCopyList);
+
+  void CopyDataToContentProcess(const nsACString& aOriginAttrs,
+                                const nsACString& aOriginKey,
+                                nsTArray<SSSetItemInfo>& aData);
+
+  void UpdateData(const nsACString& aOriginAttrs, const nsACString& aOriginKey,
+                  const nsTArray<SSWriteInfo>& aWriteInfos);
+
+  void UpdateData(const nsACString& aOriginAttrs, const nsACString& aOriginKey,
+                  const nsTArray<SSSetItemInfo>& aData);
+
+  void ClearStorages(
+      const OriginAttributesPattern& aPattern, const nsACString& aOriginScope,
+      DomainMatchingMode aMode = DomainMatchingMode::PREFIX_MATCH);
+
+  void ClearStoragesForOrigin(const nsACString& aOriginAttrs,
+                              const nsACString& aOriginKey);
+
+  void SetCurrentBrowsingContextId(uint64_t aBrowsingContextId);
+
+  void MaybeDispatchSessionStoreUpdate();
+
+  void CancelSessionStoreUpdate();
+
+  void AddParticipatingActor(SessionStorageManagerParent* aActor);
+
+  void RemoveParticipatingActor(SessionStorageManagerParent* aActor);
+
+ private:
+  explicit BackgroundSessionStorageManager(uint64_t aBrowsingContextId);
+
+  ~BackgroundSessionStorageManager();
+
+  void MaybeScheduleSessionStoreUpdate();
+
+  void DispatchSessionStoreUpdate();
+
+  uint64_t mCurrentBrowsingContextId;
+
+
+  nsCOMPtr<nsITimer> mSessionStoreCallbackTimer;
+
+  nsTArray<RefPtr<SessionStorageManagerParent>> mParticipatingActors;
+};
+
+}  
+}  
+
+namespace IPC {
+
+template <>
+struct ParamTraits<mozilla::dom::DomainMatchingMode>
+    : public ContiguousEnumSerializerInclusive<
+          mozilla::dom::DomainMatchingMode,
+          mozilla::dom::DomainMatchingMode::PREFIX_MATCH,
+          mozilla::dom::DomainMatchingMode::EXACT_MATCH> {};
+
+}  
+
+#endif  // mozilla_dom_SessionStorageManager_h

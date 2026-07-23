@@ -1,0 +1,173 @@
+// Copyright 2016 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(MOJO_CORE_PORTS_PORT_H_)
+#define MOJO_CORE_PORTS_PORT_H_
+
+#include <map>
+#include <utility>
+#include <vector>
+
+#include "mojo/core/ports/event.h"
+#include "mojo/core/ports/message_queue.h"
+#include "mojo/core/ports/user_data.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/PlatformMutex.h"
+#include "mozilla/RefPtr.h"
+#include "nsISupportsImpl.h"
+
+#if defined(MOZ_TSAN)
+#  define MOZ_USE_SINGLETON_PORT_MUTEX 1
+#endif
+
+#if defined(MOZ_USE_SINGLETON_PORT_MUTEX)
+#  include "mozilla/StaticMutex.h"
+#endif
+
+namespace mojo {
+namespace core {
+namespace ports {
+
+class PortLocker;
+
+namespace detail {
+
+class MOZ_CAPABILITY("mutex") PortMutex
+#if !defined(MOZ_USE_SINGLETON_PORT_MUTEX)
+    : private ::mozilla::detail::MutexImpl
+#endif
+{
+ public:
+  void AssertCurrentThreadOwns() const MOZ_ASSERT_CAPABILITY(this) {
+#if defined(DEBUG)
+    MOZ_ASSERT(mOwningThread == PR_GetCurrentThread());
+#endif
+#if defined(MOZ_USE_SINGLETON_PORT_MUTEX)
+    sSingleton.AssertCurrentThreadOwns();
+#endif
+  }
+
+ private:
+  friend class ::mojo::core::ports::PortLocker;
+
+#if defined(MOZ_USE_SINGLETON_PORT_MUTEX)
+  static ::mozilla::StaticMutex sSingleton;
+#endif
+
+  void Lock() MOZ_CAPABILITY_ACQUIRE() {
+#if defined(MOZ_USE_SINGLETON_PORT_MUTEX)
+    sSingleton.AssertCurrentThreadOwns();
+#else
+    ::mozilla::detail::MutexImpl::lock();
+#endif
+#if defined(DEBUG)
+    mOwningThread = PR_GetCurrentThread();
+#endif
+  }
+  void Unlock() MOZ_CAPABILITY_RELEASE() {
+#if defined(DEBUG)
+    MOZ_ASSERT(mOwningThread == PR_GetCurrentThread());
+    mOwningThread = nullptr;
+#endif
+#if defined(MOZ_USE_SINGLETON_PORT_MUTEX)
+    sSingleton.AssertCurrentThreadOwns();
+#else
+    ::mozilla::detail::MutexImpl::unlock();
+#endif
+  }
+
+#if defined(DEBUG)
+  mozilla::Atomic<PRThread*, mozilla::Relaxed> mOwningThread;
+#endif
+};
+
+}  
+
+class Port {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(Port)
+
+ public:
+  enum State {
+    kUninitialized,
+
+    kReceiving,
+
+    kBuffering,
+
+    kProxying,
+
+    kClosed
+  };
+
+  State state;
+
+  NodeName peer_node_name;
+  PortName peer_port_name;
+
+  NodeName prev_node_name;
+  PortName prev_port_name;
+
+  bool pending_merge_peer;
+
+  uint64_t next_control_sequence_num_to_send;
+  uint64_t next_control_sequence_num_to_receive;
+
+  uint64_t next_sequence_num_to_send;
+
+  uint64_t last_sequence_num_acknowledged;
+
+  uint64_t sequence_num_acknowledge_interval;
+
+  uint64_t last_sequence_num_to_receive;
+
+  uint64_t sequence_num_to_acknowledge;
+
+  MessageQueue message_queue;
+
+  std::vector<std::pair<NodeName, ScopedEvent>> control_message_queue;
+
+  mozilla::UniquePtr<std::pair<NodeName, ScopedEvent>> send_on_proxy_removal;
+
+  RefPtr<UserData> user_data;
+
+  bool remove_proxy_on_last_message;
+
+  bool peer_closed;
+
+  bool peer_lost_unexpectedly;
+
+  Port(uint64_t next_sequence_num_to_send,
+       uint64_t next_sequence_num_to_receive);
+
+  Port(const Port&) = delete;
+  void operator=(const Port&) = delete;
+
+  void AssertLockAcquired() { lock_.AssertCurrentThreadOwns(); }
+
+  bool IsNextEvent(const NodeName& from_node, const Event& event);
+
+  void NextEvent(NodeName* from_node, ScopedEvent* event);
+
+  void BufferEvent(const NodeName& from_node, ScopedEvent event);
+
+  void TakePendingMessages(
+      std::vector<mozilla::UniquePtr<UserMessageEvent>>& messages);
+
+ private:
+  using NodePortPair = std::pair<NodeName, PortName>;
+  using EventQueue = std::vector<mozilla::UniquePtr<Event>>;
+  std::map<NodePortPair, EventQueue> control_event_queues_;
+
+  friend class PortLocker;
+
+  ~Port();
+
+  detail::PortMutex lock_ MOZ_ANNOTATED;
+};
+
+}  
+}  
+}  
+
+#endif
